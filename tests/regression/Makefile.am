@@ -14,6 +14,7 @@ TAP_LOG_DRIVER = env AM_TAP_AWK='$(AWK)' \
 noinst_PROGRAMS = \
 	test_urcu_fork.tap \
 	test_urcu_fork_cxx.tap \
+	test_urcu_ja \
 	rcutorture_urcu_membarrier \
 	rcutorture_urcu_membarrier_cxx \
 	rcutorture_urcu_mb \
@@ -23,7 +24,7 @@ noinst_PROGRAMS = \
 	rcutorture_urcu_qsbr \
 	rcutorture_urcu_qsbr_cxx
 
-noinst_HEADERS = rcutorture.h
+noinst_HEADERS = rcutorture.h test_urcu_ja.h
 
 URCU_COMMON_LIB=$(top_builddir)/src/liburcu-common.la
 URCU_LIB=$(top_builddir)/src/liburcu.la
@@ -38,6 +39,10 @@ test_urcu_fork_tap_LDADD = $(URCU_LIB) $(TAP_LIB)
 
 test_urcu_fork_cxx_tap_SOURCES = test_urcu_fork_cxx.cpp
 test_urcu_fork_cxx_tap_LDADD = $(URCU_LIB) $(TAP_LIB)
+
+test_urcu_ja_SOURCES = test_urcu_ja.c
+test_urcu_ja_CFLAGS = -DRCU_QSBR $(AM_CFLAGS)
+test_urcu_ja_LDADD = $(URCU_QSBR_LIB) $(URCU_CDS_LIB)
 
 rcutorture_urcu_membarrier_SOURCES = urcutorture.c
 rcutorture_urcu_membarrier_CFLAGS = -DRCU_MEMBARRIER $(AM_CFLAGS)
