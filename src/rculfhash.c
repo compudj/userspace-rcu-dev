@@ -2279,6 +2279,11 @@ void cds_lfht_resize_lazy_count(struct cds_lfht *ht, unsigned long size,
 	__cds_lfht_resize_lazy_launch(ht);
 }
 
+const struct rcu_flavor_struct *cds_lfht_rcu_flavor(struct cds_lfht *ht)
+{
+	return ht->flavor;
+}
+
 static void cds_lfht_before_fork(void *priv __attribute__((__unused__)))
 {
 	if (cds_lfht_workqueue_atfork_nesting++)
