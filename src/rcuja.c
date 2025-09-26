@@ -741,12 +741,15 @@ int ja_linear_node_set_nth(const struct cds_ja_type *type,
 	}
 
 	assert(pointers[i] == NULL);
-	rcu_assign_pointer(pointers[i], child_node_flag);
 	/* If we expanded the nr_child, increment it */
 	if (i == nr_child) {
+		uatomic_store(&pointers[i], child_node_flag, CMM_RELAXED);
 		uatomic_store(&values[nr_child], n, CMM_RELAXED);
 		/* store-release: write pointer and value before nr_child */
 		uatomic_store(nr_child_ptr, nr_child + 1, CMM_RELEASE);
+	} else {
+		/* Replacing a NULL pointer. */
+		rcu_assign_pointer(pointers[i], child_node_flag);
 	}
 	shadow_node->nr_child++;
 	dbg_printf("linear set nth: %u child, shadow: %u child, for node %p shadow %p\n",
