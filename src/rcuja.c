@@ -2152,6 +2152,11 @@ int ja_chain_node(struct cds_ja *ja,
 		goto end;
 	}
 	cds_ja_for_each_duplicate(iter_node) {
+		if (found) {
+			/* Node is not last anymore, retry. */
+			ret = -EAGAIN;
+			goto end;
+		}
 		if (iter_node == last_node)
 			found = 1;
 	}
