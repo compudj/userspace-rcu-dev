@@ -318,7 +318,8 @@ uint8_t ja_linear_node_get_nr_child(const struct cds_ja_type *type,
 		struct cds_ja_inode *node)
 {
 	assert(type->type_class == RCU_JA_LINEAR || type->type_class == RCU_JA_POOL);
-	return rcu_dereference(node->u.data[0]);
+	/* load-acquire orders nr_child load before values and pointers */
+	return uatomic_load(&node->u.data[0], CMM_ACQUIRE);
 }
 
 /*
@@ -341,13 +342,12 @@ struct cds_ja_inode_flag *ja_linear_node_get_nth(const struct cds_ja_type *type,
 	assert(type->type_class == RCU_JA_LINEAR || type->type_class == RCU_JA_POOL);
 
 	nr_child = ja_linear_node_get_nr_child(type, node);
-	cmm_smp_rmb();	/* read nr_child before values and pointers */
 	assert(nr_child <= type->max_linear_child);
 	assert(type->type_class != RCU_JA_LINEAR || nr_child >= type->min_child);
 
 	values = &node->u.data[1];
 	for (i = 0; i < nr_child; i++) {
-		if (CMM_LOAD_SHARED(values[i]) == n)
+		if (uatomic_load(&values[i], CMM_RELAXED) == n)
 			break;
 	}
 	if (i >= nr_child) {
@@ -394,8 +394,8 @@ struct cds_ja_inode_flag *ja_linear_node_get_direction(const struct cds_ja_type 
 	for (i = 0; i < nr_child; i++) {
 		unsigned int v;
 
-		v = CMM_LOAD_SHARED(values[i]);
-		ptr = CMM_LOAD_SHARED(pointers[i]);
+		v = uatomic_load(&values[i], CMM_RELAXED);
+		ptr = rcu_dereference(pointers[i]);
 		if (!ptr)
 			continue;
 		if (dir == JA_LEFT) {
@@ -417,7 +417,7 @@ struct cds_ja_inode_flag *ja_linear_node_get_direction(const struct cds_ja_type 
 	assert(match_v >= 0 && match_v < JA_ENTRY_PER_NODE);
 
 	*result_key = (uint8_t) match_v;
-	return rcu_dereference(match_ptr);
+	return match_ptr;
 }
 
 static
@@ -744,14 +744,13 @@ int ja_linear_node_set_nth(const struct cds_ja_type *type,
 	rcu_assign_pointer(pointers[i], child_node_flag);
 	/* If we expanded the nr_child, increment it */
 	if (i == nr_child) {
-		CMM_STORE_SHARED(values[nr_child], n);
-		/* write pointer and value before nr_child */
-		cmm_smp_wmb();
-		CMM_STORE_SHARED(*nr_child_ptr, nr_child + 1);
+		uatomic_store(&values[nr_child], n, CMM_RELAXED);
+		/* store-release: write pointer and value before nr_child */
+		uatomic_store(nr_child_ptr, nr_child + 1, CMM_RELEASE);
 	}
 	shadow_node->nr_child++;
 	dbg_printf("linear set nth: %u child, shadow: %u child, for node %p shadow %p\n",
-		(unsigned int) CMM_LOAD_SHARED(*nr_child_ptr),
+		(unsigned int) uatomic_load(nr_child_ptr, CMM_RELAXED),
 		(unsigned int) shadow_node->nr_child,
 		node, shadow_node);
 
@@ -888,7 +887,7 @@ int ja_linear_node_clear_ptr(const struct cds_ja_type *type,
 	 */
 	shadow_node->nr_child--;
 	dbg_printf("linear clear ptr: %u child, shadow: %u child, for node %p shadow %p\n",
-		(unsigned int) CMM_LOAD_SHARED(*nr_child_ptr),
+		(unsigned int) uatomic_load(nr_child_ptr, CMM_RELAXED),
 		(unsigned int) shadow_node->nr_child,
 		node, shadow_node);
 	return 0;
@@ -2500,7 +2499,7 @@ int ja_unchain_node(struct cds_ja_inode_flag **node_flag_ptr,
 		ret = -EAGAIN;
 		goto end;
 	}
-	CMM_STORE_SHARED(*prev_node_ptr, node->next);
+	uatomic_store(prev_node_ptr, node->next, CMM_RELAXED);
 	/*
 	 * Validate that we indeed removed the node from linked list.
 	 */
