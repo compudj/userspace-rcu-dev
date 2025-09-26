@@ -2317,7 +2317,9 @@ int ja_detach_node(struct cds_ja *ja,
 		struct cds_ja_inode_flag **snapshot,
 		struct cds_ja_inode_flag ***snapshot_ptr,
 		uint8_t *snapshot_n,
-		int nr_snapshot)
+		int nr_snapshot,
+		struct cds_ja_inode_flag *locked_node,
+		struct cds_ja_shadow_node *locked_shadow_node)
 {
 	struct cds_ja_shadow_node *shadow_nodes[JA_MAX_DEPTH];
 	struct cds_ja_inode_flag **node_flag_ptr = NULL,
@@ -2339,14 +2341,17 @@ int ja_detach_node(struct cds_ja *ja,
 	for (i = nr_snapshot - 2; i >= 1; i--) {
 		struct cds_ja_shadow_node *shadow_node;
 
-		shadow_node = rcuja_shadow_lookup_lock(ja->ht,
-					snapshot[i]);
-		if (!shadow_node) {
-			ret = -EAGAIN;
-			goto end;
+		if (snapshot[i] != locked_node) {
+			shadow_node = rcuja_shadow_lookup_lock(ja->ht,
+						snapshot[i]);
+			if (!shadow_node) {
+				ret = -EAGAIN;
+				goto end;
+			}
+		} else {
+			shadow_node = locked_shadow_node;
 		}
 		shadow_nodes[nr_shadow++] = shadow_node;
-
 		/*
 		 * Check if node has been removed between RCU
 		 * lookup and lock acquisition.
@@ -2364,6 +2369,7 @@ int ja_detach_node(struct cds_ja *ja,
 		nr_branch++;
 		if (shadow_node->nr_child > 1 || i == 1) {
 			/* Lock parent and break */
+			assert(snapshot[i - 1] != locked_node);
 			shadow_node = rcuja_shadow_lookup_lock(ja->ht,
 					snapshot[i - 1]);
 			if (!shadow_node) {
@@ -2393,6 +2399,7 @@ int ja_detach_node(struct cds_ja *ja,
 				 * Lock parent's parent, in case we need
 				 * to recompact parent.
 				 */
+				assert(snapshot[i - 2] != locked_node);
 				shadow_node = rcuja_shadow_lookup_lock(ja->ht,
 						snapshot[i - 2]);
 				if (!shadow_node) {
@@ -2450,25 +2457,22 @@ int ja_detach_node(struct cds_ja *ja,
 	rcu_assign_pointer(*parent_node_flag_ptr, iter_node_flag);
 
 end:
-	for (i = 0; i < nr_shadow; i++)
-		rcuja_shadow_unlock(shadow_nodes[i]);
+	for (i = 0; i < nr_shadow; i++) {
+		if (shadow_nodes[i] != locked_shadow_node)
+			rcuja_shadow_unlock(shadow_nodes[i]);
+	}
 	return ret;
 }
 
+/* Called with parent shadow node locked. */
 static
-int ja_unchain_node(struct cds_ja *ja,
-		struct cds_ja_inode_flag *parent_node_flag,
-		struct cds_ja_inode_flag **node_flag_ptr,
+int ja_unchain_node(struct cds_ja_inode_flag **node_flag_ptr,
 		struct cds_ja_inode_flag *node_flag,
 		struct cds_ja_node *node)
 {
-	struct cds_ja_shadow_node *shadow_node;
 	struct cds_ja_node *iter_node, **iter_node_ptr, **prev_node_ptr = NULL;
 	int ret = 0, count = 0, found = 0;
 
-	shadow_node = rcuja_shadow_lookup_lock(ja->ht, parent_node_flag);
-	if (!shadow_node)
-		return -EAGAIN;
 	if (ja_node_ptr(*node_flag_ptr) != ja_node_ptr(node_flag)) {
 		ret = -EAGAIN;
 		goto end;
@@ -2502,7 +2506,6 @@ int ja_unchain_node(struct cds_ja *ja,
 	 */
 	assert(ja_node_ptr(*node_flag_ptr) != (struct cds_ja_inode *) node);
 end:
-	rcuja_shadow_unlock(shadow_node);
 	return ret;
 }
 
@@ -2572,6 +2575,8 @@ retry:
 		return -ENOENT;
 	} else {
 		struct cds_ja_node *iter_node, *match = NULL;
+		struct cds_ja_inode_flag *parent_node_flag;
+		struct cds_ja_shadow_node *parent_shadow_node;
 		int count = 0;
 
 		iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
@@ -2587,6 +2592,21 @@ retry:
 			return -ENOENT;
 		}
 		assert(count > 0);
+
+		/* Perform removal while holding parent node lock. */
+		parent_node_flag = snapshot[nr_snapshot - 1];
+		parent_shadow_node = rcuja_shadow_lookup_lock(ja->ht, parent_node_flag);
+		if (!parent_shadow_node)
+			return -EAGAIN;
+		match = NULL;
+		count = 0;
+		iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
+		cds_ja_for_each_duplicate(iter_node) {
+			dbg_printf("cds_ja_del: compare %p with iter_node %p\n", node, iter_node);
+			if (iter_node == node)
+				match = iter_node;
+			count++;
+		}
 		if (count == 1) {
 			/*
 			 * Removing last of duplicates. Last snapshot
@@ -2595,11 +2615,12 @@ retry:
 			snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
 			snapshot[nr_snapshot++] = node_flag;
 			ret = ja_detach_node(ja, snapshot, snapshot_ptr,
-					snapshot_n, nr_snapshot);
+					snapshot_n, nr_snapshot,
+					parent_node_flag, parent_shadow_node);
 		} else {
-			ret = ja_unchain_node(ja, snapshot[nr_snapshot - 1],
-				node_flag_ptr, node_flag, match);
+			ret = ja_unchain_node(node_flag_ptr, node_flag, match);
 		}
+		rcuja_shadow_unlock(parent_shadow_node);
 	}
 	/*
 	 * Explanation of -ENOENT handling: caused by concurrent delete
