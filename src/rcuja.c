@@ -435,7 +435,7 @@ void ja_linear_node_get_ith_pos(const struct cds_ja_type *type,
 	values = &node->u.data[1];
 	*v = values[i];
 	pointers = (struct cds_ja_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
-	*iter = pointers[i];
+	*iter = rcu_dereference(pointers[i]);
 }
 
 static
