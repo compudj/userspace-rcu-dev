@@ -96,6 +96,8 @@ struct cds_ja_node *cds_ja_lookup_above_equal(struct cds_ja *ja,
  *
  * Returns 0 on success, negative error value on error.
  * A RCU read-side lock should be held across call to this function.
+ * Mutual exclusion between updates (add, add_unique, del) is the user
+ * responsibility.
  */
 int cds_ja_add(struct cds_ja *ja, uint64_t key,
 		struct cds_ja_node *node);
@@ -110,6 +112,8 @@ int cds_ja_add(struct cds_ja *ja, uint64_t key,
  * existing node (acts as a RCU lookup).
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
+ * Mutual exclusion between updates (add, add_unique, del) is the user
+ * responsibility.
  */
 struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, uint64_t key,
 		struct cds_ja_node *node);
@@ -122,6 +126,8 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, uint64_t key,
  *
  * Returns 0 on success, negative error value on error.
  * A RCU read-side lock should be held across call to this function.
+ * Mutual exclusion between updates (add, add_unique, del) is the user
+ * responsibility.
  */
 int cds_ja_del(struct cds_ja *ja, uint64_t key,
 		struct cds_ja_node *node);

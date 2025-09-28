@@ -1455,7 +1455,7 @@ retry:		/* for fallback */
 			new_node_flag = ja_node_flag(new_node, new_type_index);
 		}
 
-		dbg_printf("Recompact inherit lock from %p\n", shadow_node);
+		dbg_printf("Recompact inherit from %p\n", shadow_node);
 		new_shadow_node = rcuja_shadow_set(ja->ht, new_node_flag, shadow_node, ja, level);
 		if (!new_shadow_node) {
 			free_cds_ja_node(ja, new_node);
@@ -1589,18 +1589,8 @@ skip_copy:
 	/* Return pointer to new recompacted node through old_node_flag_ptr */
 	*old_node_flag_ptr = new_node_flag;
 	if (old_node) {
-		int flags;
-
-		flags = RCUJA_SHADOW_CLEAR_FREE_NODE;
-		/*
-		 * It is OK to free the lock associated with a node
-		 * going to NULL, since we are holding the parent lock.
-		 * This synchronizes removal with re-add of that node.
-		 */
-		if (new_type_index == NODE_INDEX_NULL)
-			flags |= RCUJA_SHADOW_CLEAR_FREE_LOCK;
 		ret = rcuja_shadow_clear(ja->ht, old_node_flag, shadow_node,
-				flags);
+				RCUJA_SHADOW_CLEAR_FREE_NODE);
 		assert(!ret);
 	}
 
@@ -1935,14 +1925,7 @@ struct cds_ja_node *cds_ja_lookup_above_equal(struct cds_ja *ja,
 /*
  * We reached an unpopulated node. Create it and the children we need,
  * and then attach the entire branch to the current node. This may
- * trigger recompaction of the current node.  Locks needed: node lock
- * (for add), and, possibly, parent node lock (to update pointer due to
- * node recompaction).
- *
- * First take node lock, check if recompaction is needed, then take
- * parent lock (if needed).  Then we can proceed to create the new
- * branch. Publish the new branch, and release locks.
- * TODO: we currently always take the parent lock even when not needed.
+ * trigger recompaction of the current node.
  *
  * ja_attach_node() ensures that a lookup will _never_ see a branch that
  * leads to a dead-end: before attaching a branch, the entire content of
@@ -1973,30 +1956,23 @@ int ja_attach_node(struct cds_ja *ja,
 
 	assert(!old_node_flag);
 	if (attach_node_flag) {
-		shadow_node = rcuja_shadow_lookup_lock(ja->ht, attach_node_flag);
+		shadow_node = rcuja_shadow_lookup(ja->ht, attach_node_flag);
 		if (!shadow_node) {
 			ret = -EAGAIN;
 			goto end;
 		}
 	}
 	if (parent_attach_node_flag) {
-		parent_shadow_node = rcuja_shadow_lookup_lock(ja->ht,
+		parent_shadow_node = rcuja_shadow_lookup(ja->ht,
 						parent_attach_node_flag);
 		if (!parent_shadow_node) {
 			ret = -EAGAIN;
-			goto unlock_shadow;
+			goto end;
 		}
 	}
 
-	if (old_node_flag_ptr && ja_node_ptr(*old_node_flag_ptr)) {
-		/*
-		 * Target node has been updated between RCU lookup and
-		 * lock acquisition. We need to re-try lookup and
-		 * attach.
-		 */
-		ret = -EAGAIN;
-		goto unlock_parent;
-	}
+	/* Concurrent update prevented by mutual exclusion. */
+	assert(!(old_node_flag_ptr && ja_node_ptr(*old_node_flag_ptr)));
 
 	/*
 	 * Perform a lookup query to handle the case where
@@ -2015,20 +1991,13 @@ int ja_attach_node(struct cds_ja *ja,
 			iter_key);
 		if (lookup_node_flag) {
 			ret = -EEXIST;
-			goto unlock_parent;
+			goto end;
 		}
 	}
 
-	if (attach_node_flag_ptr && ja_node_ptr(*attach_node_flag_ptr) !=
-			ja_node_ptr(attach_node_flag)) {
-		/*
-		 * Target node has been updated between RCU lookup and
-		 * lock acquisition. We need to re-try lookup and
-		 * attach.
-		 */
-		ret = -EAGAIN;
-		goto unlock_parent;
-	}
+	/* Concurrent update prevented by mutual exclusion. */
+	assert(!(attach_node_flag_ptr && ja_node_ptr(*attach_node_flag_ptr) !=
+			ja_node_ptr(attach_node_flag)));
 
 	/* Create new branch, starting from bottom */
 	iter_node_flag = (struct cds_ja_inode_flag *) child_node;
@@ -2088,11 +2057,8 @@ check_error:
 	if (ret) {
 		for (i = 0; i < nr_created_nodes; i++) {
 			int tmpret;
-			int flags;
+			int flags = i ? RCUJA_SHADOW_CLEAR_FREE_NODE : 0;
 
-			flags = RCUJA_SHADOW_CLEAR_FREE_LOCK;
-			if (i)
-				flags |= RCUJA_SHADOW_CLEAR_FREE_NODE;
 			tmpret = rcuja_shadow_clear(ja->ht,
 					created_nodes[i],
 					NULL,
@@ -2100,20 +2066,11 @@ check_error:
 			assert(!tmpret);
 		}
 	}
-unlock_parent:
-	if (parent_shadow_node)
-		rcuja_shadow_unlock(parent_shadow_node);
-unlock_shadow:
-	if (shadow_node)
-		rcuja_shadow_unlock(shadow_node);
 end:
 	return ret;
 }
 
 /*
- * Lock the parent containing the pointer to list of duplicates, and add
- * node to this list. Failure can happen if concurrent update changes
- * the parent before we get the lock. We return -EAGAIN in that case.
  * Return 0 on success, negative error value on failure.
  */
 static
@@ -2128,7 +2085,7 @@ int ja_chain_node(struct cds_ja *ja,
 	struct cds_ja_node *iter_node;
 	int ret = 0, found = 0;
 
-	shadow_node = rcuja_shadow_lookup_lock(ja->ht, parent_node_flag);
+	shadow_node = rcuja_shadow_lookup(ja->ht, parent_node_flag);
 	if (!shadow_node) {
 		return -EAGAIN;
 	}
@@ -2162,7 +2119,6 @@ int ja_chain_node(struct cds_ja *ja,
 	node->next = NULL;
 	rcu_assign_pointer(last_node->next, node);
 end:
-	rcuja_shadow_unlock(shadow_node);
 	return ret;
 }
 
@@ -2287,14 +2243,14 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, uint64_t key,
 
 /*
  * Note: there is no need to lookup the pointer address associated with
- * each node's nth item after taking the lock: it's already been done by
- * cds_ja_del while holding the rcu read-side lock, and our node rules
- * ensure that when a match value -> pointer is found in a node, it is
- * _NEVER_ changed for that node without recompaction, and recompaction
- * reallocates the node.
+ * each node's nth item: it's already been done by cds_ja_del while
+ * holding the rcu read-side lock, and our node rules ensure that when a
+ * match value -> pointer is found in a node, it is _NEVER_ changed for
+ * that node without recompaction, and recompaction reallocates the
+ * node.
  * However, when a child is removed from "linear" nodes, its pointer
- * is set to NULL. We therefore check, while holding the locks, if this
- * pointer is NULL, and return -ENOENT to the caller if it is the case.
+ * is set to NULL. We therefore check if this pointer is NULL, and
+ * return -ENOENT to the caller if it is the case.
  *
  * ja_detach_node() ensures that a lookup will _never_ see a branch that
  * leads to a dead-end: when removing branch, it makes sure to perform
@@ -2331,8 +2287,7 @@ int ja_detach_node(struct cds_ja *ja,
 		struct cds_ja_shadow_node *shadow_node;
 
 		if (snapshot[i] != locked_node) {
-			shadow_node = rcuja_shadow_lookup_lock(ja->ht,
-						snapshot[i]);
+			shadow_node = rcuja_shadow_lookup(ja->ht, snapshot[i]);
 			if (!shadow_node) {
 				ret = -EAGAIN;
 				goto end;
@@ -2341,42 +2296,28 @@ int ja_detach_node(struct cds_ja *ja,
 			shadow_node = locked_shadow_node;
 		}
 		shadow_nodes[nr_shadow++] = shadow_node;
-		/*
-		 * Check if node has been removed between RCU
-		 * lookup and lock acquisition.
-		 */
 		assert(snapshot_ptr[i + 1]);
-		if (ja_node_ptr(*snapshot_ptr[i + 1])
-				!= ja_node_ptr(snapshot[i + 1])) {
-			ret = -ENOENT;
-			goto end;
-		}
+		/* Mutual exclusion prevents concurrent update. */
+		assert(!(ja_node_ptr(*snapshot_ptr[i + 1])
+				!= ja_node_ptr(snapshot[i + 1])));
 
 		assert(shadow_node->nr_child > 0);
 		if (shadow_node->nr_child == 1 && i > 1)
 			nr_clear++;
 		nr_branch++;
 		if (shadow_node->nr_child > 1 || i == 1) {
-			/* Lock parent and break */
 			assert(snapshot[i - 1] != locked_node);
-			shadow_node = rcuja_shadow_lookup_lock(ja->ht,
-					snapshot[i - 1]);
+			shadow_node = rcuja_shadow_lookup(ja->ht, snapshot[i - 1]);
 			if (!shadow_node) {
 				ret = -EAGAIN;
 				goto end;
 			}
 			shadow_nodes[nr_shadow++] = shadow_node;
 
-			/*
-			 * Check if node has been removed between RCU
-			 * lookup and lock acquisition.
-			 */
 			assert(snapshot_ptr[i]);
-			if (ja_node_ptr(*snapshot_ptr[i])
-					!= ja_node_ptr(snapshot[i])) {
-				ret = -ENOENT;
-				goto end;
-			}
+			/* Mutual exclusion prevents concurrent update. */
+			assert(!(ja_node_ptr(*snapshot_ptr[i])
+					!= ja_node_ptr(snapshot[i])));
 
 			node_flag_ptr = snapshot_ptr[i + 1];
 			n = snapshot_n[i + 1];
@@ -2384,12 +2325,8 @@ int ja_detach_node(struct cds_ja *ja,
 			parent_node_flag = snapshot[i];
 
 			if (i > 1) {
-				/*
-				 * Lock parent's parent, in case we need
-				 * to recompact parent.
-				 */
 				assert(snapshot[i - 2] != locked_node);
-				shadow_node = rcuja_shadow_lookup_lock(ja->ht,
+				shadow_node = rcuja_shadow_lookup(ja->ht,
 						snapshot[i - 2]);
 				if (!shadow_node) {
 					ret = -EAGAIN;
@@ -2397,16 +2334,10 @@ int ja_detach_node(struct cds_ja *ja,
 				}
 				shadow_nodes[nr_shadow++] = shadow_node;
 
-				/*
-				 * Check if node has been removed between RCU
-				 * lookup and lock acquisition.
-				 */
 				assert(snapshot_ptr[i - 1]);
-				if (ja_node_ptr(*snapshot_ptr[i - 1])
-						!= ja_node_ptr(snapshot[i - 1])) {
-					ret = -ENOENT;
-					goto end;
-				}
+				/* Mutual exclusion prevents concurrent update. */
+				assert(!(ja_node_ptr(*snapshot_ptr[i - 1])
+						!= ja_node_ptr(snapshot[i - 1])));
 			}
 
 			break;
@@ -2417,16 +2348,14 @@ int ja_detach_node(struct cds_ja *ja,
 	 * At this point, we want to delete all nodes that are about to
 	 * be removed from shadow_nodes (except the last one, which is
 	 * either the root or the parent of the upmost node with 1
-	 * child). OK to free lock here, because RCU read lock is held,
-	 * and free only performed in call_rcu.
+	 * child).
 	 */
 
 	for (i = 0; i < nr_clear; i++) {
 		ret = rcuja_shadow_clear(ja->ht,
 				shadow_nodes[i]->node_flag,
 				shadow_nodes[i],
-				RCUJA_SHADOW_CLEAR_FREE_NODE
-				| RCUJA_SHADOW_CLEAR_FREE_LOCK);
+				RCUJA_SHADOW_CLEAR_FREE_NODE);
 		assert(!ret);
 	}
 
@@ -2446,14 +2375,9 @@ int ja_detach_node(struct cds_ja *ja,
 	rcu_assign_pointer(*parent_node_flag_ptr, iter_node_flag);
 
 end:
-	for (i = 0; i < nr_shadow; i++) {
-		if (shadow_nodes[i] != locked_shadow_node)
-			rcuja_shadow_unlock(shadow_nodes[i]);
-	}
 	return ret;
 }
 
-/* Called with parent shadow node locked. */
 static
 int ja_unchain_node(struct cds_ja_inode_flag **node_flag_ptr,
 		struct cds_ja_inode_flag *node_flag,
@@ -2582,9 +2506,8 @@ retry:
 		}
 		assert(count > 0);
 
-		/* Perform removal while holding parent node lock. */
 		parent_node_flag = snapshot[nr_snapshot - 1];
-		parent_shadow_node = rcuja_shadow_lookup_lock(ja->ht, parent_node_flag);
+		parent_shadow_node = rcuja_shadow_lookup(ja->ht, parent_node_flag);
 		if (!parent_shadow_node)
 			return -EAGAIN;
 		match = NULL;
@@ -2609,7 +2532,6 @@ retry:
 		} else {
 			ret = ja_unchain_node(node_flag_ptr, node_flag, match);
 		}
-		rcuja_shadow_unlock(parent_shadow_node);
 	}
 	/*
 	 * Explanation of -ENOENT handling: caused by concurrent delete
@@ -2738,8 +2660,7 @@ int cds_ja_destroy(struct cds_ja *ja)
 	int ret;
 
 	flavor = cds_lfht_rcu_flavor(ja->ht);
-	rcuja_shadow_prune(ja->ht,
-		RCUJA_SHADOW_CLEAR_FREE_NODE | RCUJA_SHADOW_CLEAR_FREE_LOCK);
+	rcuja_shadow_prune(ja->ht, RCUJA_SHADOW_CLEAR_FREE_NODE);
 	flavor->thread_offline();
 	ret = rcuja_delete_ht(ja->ht);
 	if (ret)
