@@ -20,7 +20,9 @@ DEFINE_URCU_TLS(unsigned long, nr_delnoent);
 DEFINE_URCU_TLS(unsigned long, lookup_fail);
 DEFINE_URCU_TLS(unsigned long, lookup_ok);
 
-struct cds_ja *test_ja;
+static struct cds_ja *test_ja;
+/* Provide mutual exclusion across Judy Array updates. */
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 volatile int test_go, test_stop;
 
@@ -63,8 +65,6 @@ static uint64_t key_mul = 1ULL;
 
 static int add_unique, add_replace;
 
-static pthread_mutex_t rcu_copy_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 static int leak_detection;
 static unsigned long test_nodes_allocated, test_nodes_freed;
 
@@ -97,24 +97,25 @@ static void set_affinity(void)
 #endif /* HAVE_SCHED_SETAFFINITY */
 }
 
-void rcu_copy_mutex_lock(void)
+static
+void mutex_lock_mt(void)
 {
-	int ret;
-	ret = pthread_mutex_lock(&rcu_copy_mutex);
-	if (ret) {
+	if (nr_writers <= 1)
+		return;
+	if (pthread_mutex_lock(&lock)) {
 		perror("Error in pthread mutex lock");
-		exit(-1);
+		abort();
 	}
 }
 
-void rcu_copy_mutex_unlock(void)
+static
+void mutex_unlock_mt(void)
 {
-	int ret;
-
-	ret = pthread_mutex_unlock(&rcu_copy_mutex);
-	if (ret) {
+	if (nr_writers <= 1)
+		return;
+	if (pthread_mutex_unlock(&lock)) {
 		perror("Error in pthread mutex unlock");
-		exit(-1);
+		abort();
 	}
 }
 
@@ -931,7 +932,9 @@ void *test_ja_rw_thr_writer(void *_count)
 			ja_test_node_init(node, key);
 			rcu_read_lock();
 			if (add_unique) {
+				mutex_lock_mt();
 				ret_node = cds_ja_add_unique(test_ja, key, &node->node);
+				mutex_unlock_mt();
 				if (ret_node != &node->node) {
 					free_test_node(node);
 					URCU_TLS(nr_addexist)++;
@@ -941,7 +944,9 @@ void *test_ja_rw_thr_writer(void *_count)
 			} else if (add_replace) {
 				assert(0);	/* not implemented yet. */
 			} else {
+				mutex_lock_mt();
 				ret = cds_ja_add(test_ja, key, &node->node);
+				mutex_unlock_mt();
 				if (ret) {
 					fprintf(stderr, "Error in cds_ja_add: %d\n", ret);
 					free_test_node(node);
@@ -966,7 +971,9 @@ void *test_ja_rw_thr_writer(void *_count)
 			if (ja_node) {
 				node = caa_container_of(ja_node,
 					struct ja_test_node, node);
+				mutex_lock_mt();
 				ret = cds_ja_del(test_ja, key, &node->node);
+				mutex_unlock_mt();
 				if (!ret) {
 					rcu_free_test_node(node);
 					URCU_TLS(nr_del)++;
