@@ -52,17 +52,11 @@ struct cds_ja_inode_flag;
 struct cds_ja_inode;
 
 /*
- * Shadow node contains mutex and call_rcu head associated with a node.
+ * Shadow node contains call_rcu head associated with a node.
  */
 struct cds_ja_shadow_node {
 	struct cds_lfht_node ht_node;	/* hash table node */
 	struct cds_ja_inode_flag *node_flag;	/* reverse mapping and hash table key */
-	/*
-	 * mutual exclusion on all nodes belonging to the same tree
-	 * position (e.g. both nodes before and after recompaction
-	 * use the same lock).
-	 */
-	pthread_mutex_t *lock;
 	unsigned int nr_child;		/* number of children in node */
 	struct rcu_head head;		/* for deferred node and shadow node reclaim */
 	int fallback_removal_count;	/* removals left keeping fallback */
@@ -163,11 +157,8 @@ void rcuja_free_all_children(struct cds_ja_shadow_node *shadow_node,
 		struct cds_ja_inode_flag *node_flag);
 
 __attribute__((visibility("hidden")))
-struct cds_ja_shadow_node *rcuja_shadow_lookup_lock(struct cds_lfht *ht,
+struct cds_ja_shadow_node *rcuja_shadow_lookup(struct cds_lfht *ht,
 		struct cds_ja_inode_flag *node_flag);
-
-__attribute__((visibility("hidden")))
-void rcuja_shadow_unlock(struct cds_ja_shadow_node *shadow_node);
 
 __attribute__((visibility("hidden")))
 struct cds_ja_shadow_node *rcuja_shadow_set(struct cds_lfht *ht,
@@ -178,7 +169,6 @@ struct cds_ja_shadow_node *rcuja_shadow_set(struct cds_lfht *ht,
 /* rcuja_shadow_clear flags */
 enum {
 	RCUJA_SHADOW_CLEAR_FREE_NODE = (1U << 0),
-	RCUJA_SHADOW_CLEAR_FREE_LOCK = (1U << 1),
 };
 
 __attribute__((visibility("hidden")))

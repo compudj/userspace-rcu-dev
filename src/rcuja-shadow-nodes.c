@@ -43,14 +43,13 @@ int match_pointer(struct cds_lfht_node *node, const void *key)
 }
 
 __attribute__((visibility("hidden")))
-struct cds_ja_shadow_node *rcuja_shadow_lookup_lock(struct cds_lfht *ht,
+struct cds_ja_shadow_node *rcuja_shadow_lookup(struct cds_lfht *ht,
 		struct cds_ja_inode_flag *node_flag)
 {
 	struct cds_lfht_iter iter;
 	struct cds_lfht_node *lookup_node;
 	struct cds_ja_shadow_node *shadow_node;
 	const struct rcu_flavor_struct *flavor;
-	int ret;
 
 	flavor = cds_lfht_rcu_flavor(ht);
 	flavor->read_lock();
@@ -64,27 +63,10 @@ struct cds_ja_shadow_node *rcuja_shadow_lookup_lock(struct cds_lfht *ht,
 	}
 	shadow_node = caa_container_of(lookup_node,
 			struct cds_ja_shadow_node, ht_node);
-	dbg_printf("Lock %p\n", shadow_node->lock);
-	ret = pthread_mutex_lock(shadow_node->lock);
-	assert(!ret);
-	if (cds_lfht_is_node_deleted(lookup_node)) {
-		ret = pthread_mutex_unlock(shadow_node->lock);
-		assert(!ret);
-		shadow_node = NULL;
-	}
+	assert(!cds_lfht_is_node_deleted(lookup_node));
 rcu_unlock:
 	flavor->read_unlock();
 	return shadow_node;
-}
-
-__attribute__((visibility("hidden")))
-void rcuja_shadow_unlock(struct cds_ja_shadow_node *shadow_node)
-{
-	int ret;
-
-	dbg_printf("Unlock %p\n", shadow_node->lock);
-	ret = pthread_mutex_unlock(shadow_node->lock);
-	assert(!ret);
 }
 
 __attribute__((visibility("hidden")))
@@ -103,19 +85,9 @@ struct cds_ja_shadow_node *rcuja_shadow_set(struct cds_lfht *ht,
 
 	shadow_node->node_flag = new_node_flag;
 	shadow_node->ja = ja;
-	/*
-	 * Lock can be inherited from previous node at this position.
-	 */
 	if (inherit_from) {
-		shadow_node->lock = inherit_from->lock;
 		shadow_node->level = inherit_from->level;
 	} else {
-		shadow_node->lock = calloc(sizeof(*shadow_node->lock), 1);
-		if (!shadow_node->lock) {
-			free(shadow_node);
-			return NULL;
-		}
-		pthread_mutex_init(shadow_node->lock, NULL);
 		shadow_node->level = level;
 	}
 
@@ -148,27 +120,8 @@ void free_shadow_node_and_node(struct rcu_head *head)
 {
 	struct cds_ja_shadow_node *shadow_node =
 		caa_container_of(head, struct cds_ja_shadow_node, head);
-	free_cds_ja_node(shadow_node->ja, ja_node_ptr(shadow_node->node_flag));
-	free(shadow_node);
-}
-
-static
-void free_shadow_node_and_lock(struct rcu_head *head)
-{
-	struct cds_ja_shadow_node *shadow_node =
-		caa_container_of(head, struct cds_ja_shadow_node, head);
-	free(shadow_node->lock);
-	free(shadow_node);
-}
-
-static
-void free_shadow_node_and_node_and_lock(struct rcu_head *head)
-{
-	struct cds_ja_shadow_node *shadow_node =
-		caa_container_of(head, struct cds_ja_shadow_node, head);
 	assert(shadow_node->level);
 	free_cds_ja_node(shadow_node->ja, ja_node_ptr(shadow_node->node_flag));
-	free(shadow_node->lock);
 	free(shadow_node);
 }
 
@@ -181,8 +134,7 @@ int rcuja_shadow_clear(struct cds_lfht *ht,
 	struct cds_lfht_iter iter;
 	struct cds_lfht_node *lookup_node;
 	const struct rcu_flavor_struct *flavor;
-	int ret, lockret;
-	int lookup_shadow = 0;
+	int ret;
 
 	flavor = cds_lfht_rcu_flavor(ht);
 	flavor->read_lock();
@@ -198,41 +150,18 @@ int rcuja_shadow_clear(struct cds_lfht *ht,
 	if (!shadow_node) {
 		shadow_node = caa_container_of(lookup_node,
 				struct cds_ja_shadow_node, ht_node);
-		lockret = pthread_mutex_lock(shadow_node->lock);
-		assert(!lockret);
-		lookup_shadow = 1;
 	}
 
-	/*
-	 * Holding the mutex across deletion, and by also re-checking if
-	 * the node is deleted with mutex held at lookup ensure that we
-	 * don't let RCU JA use a node being removed.
-	 */
 	ret = cds_lfht_del(ht, lookup_node);
 	if (ret)
-		goto unlock;
+		goto rcu_unlock;
 	if ((flags & RCUJA_SHADOW_CLEAR_FREE_NODE)
 			&& shadow_node->level) {
-		if (flags & RCUJA_SHADOW_CLEAR_FREE_LOCK) {
-			flavor->update_call_rcu(&shadow_node->head,
-				free_shadow_node_and_node_and_lock);
-		} else {
-			flavor->update_call_rcu(&shadow_node->head,
-				free_shadow_node_and_node);
-		}
+		flavor->update_call_rcu(&shadow_node->head,
+			free_shadow_node_and_node);
 	} else {
-		if (flags & RCUJA_SHADOW_CLEAR_FREE_LOCK) {
-			flavor->update_call_rcu(&shadow_node->head,
-				free_shadow_node_and_lock);
-		} else {
-			flavor->update_call_rcu(&shadow_node->head,
-				free_shadow_node);
-		}
-	}
-unlock:
-	if (lookup_shadow) {
-		lockret = pthread_mutex_unlock(shadow_node->lock);
-		assert(!lockret);
+		flavor->update_call_rcu(&shadow_node->head,
+			free_shadow_node);
 	}
 rcu_unlock:
 	flavor->read_unlock();
@@ -241,17 +170,15 @@ rcu_unlock:
 }
 
 /*
- * Delete all shadow nodes and nodes from hash table, along with their
- * associated lock.
+ * Delete all shadow nodes and nodes from hash table.
  */
 __attribute__((visibility("hidden")))
-void rcuja_shadow_prune(struct cds_lfht *ht,
-		unsigned int flags)
+void rcuja_shadow_prune(struct cds_lfht *ht, unsigned int flags)
 {
 	const struct rcu_flavor_struct *flavor;
 	struct cds_ja_shadow_node *shadow_node;
 	struct cds_lfht_iter iter;
-	int ret, lockret;
+	int ret;
 
 	flavor = cds_lfht_rcu_flavor(ht);
 	/*
@@ -260,33 +187,17 @@ void rcuja_shadow_prune(struct cds_lfht *ht,
 	 */
 	flavor->read_lock();
 	cds_lfht_for_each_entry(ht, &iter, shadow_node, ht_node) {
-		lockret = pthread_mutex_lock(shadow_node->lock);
-		assert(!lockret);
-	
 		ret = cds_lfht_del(ht, &shadow_node->ht_node);
 		if (ret)
-			goto unlock;
+			continue;
 		if ((flags & RCUJA_SHADOW_CLEAR_FREE_NODE)
 				&& shadow_node->level) {
-			if (flags & RCUJA_SHADOW_CLEAR_FREE_LOCK) {
-				flavor->update_call_rcu(&shadow_node->head,
-					free_shadow_node_and_node_and_lock);
-			} else {
-				flavor->update_call_rcu(&shadow_node->head,
-					free_shadow_node_and_node);
-			}
+			flavor->update_call_rcu(&shadow_node->head,
+				free_shadow_node_and_node);
 		} else {
-			if (flags & RCUJA_SHADOW_CLEAR_FREE_LOCK) {
-				flavor->update_call_rcu(&shadow_node->head,
-					free_shadow_node_and_lock);
-			} else {
-				flavor->update_call_rcu(&shadow_node->head,
-					free_shadow_node);
-			}
+			flavor->update_call_rcu(&shadow_node->head,
+				free_shadow_node);
 		}
-	unlock:
-		lockret = pthread_mutex_unlock(shadow_node->lock);
-		assert(!lockret);
 	}
 	flavor->read_unlock();
 }
