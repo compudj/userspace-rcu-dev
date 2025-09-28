@@ -63,8 +63,6 @@ extern DECLARE_URCU_TLS(unsigned long, nr_delnoent);
 extern DECLARE_URCU_TLS(unsigned long, lookup_fail);
 extern DECLARE_URCU_TLS(unsigned long, lookup_ok);
 
-extern struct cds_ja *test_ja;
-
 struct ja_test_node {
 	struct cds_ja_node node;
 	uint64_t key;		/* for testing */
