@@ -2147,8 +2147,7 @@ retry:
 	dbg_printf("cds_ja_add attempt: key %" PRIu64 ", node %p\n",
 		key, node);
 	parent2_node_flag = NULL;
-	parent_node_flag =
-		(struct cds_ja_inode_flag *) &ja->root;	/* Use root ptr address as key for mutex */
+	parent_node_flag = (struct cds_ja_inode_flag *) &ja->root;
 	parent_node_flag_ptr = NULL;
 	node_flag = rcu_dereference(ja->root);
 	node_flag_ptr = &ja->root;
@@ -2165,9 +2164,7 @@ retry:
 		parent2_node_flag = parent_node_flag;
 		parent_node_flag = node_flag;
 		parent_node_flag_ptr = node_flag_ptr;
-		node_flag = ja_node_get_nth(node_flag,
-			&node_flag_ptr,
-			iter_key);
+		node_flag = ja_node_get_nth(node_flag, &node_flag_ptr, iter_key);
 	}
 
 	/*
@@ -2183,12 +2180,9 @@ retry:
 		attach_node_flag_ptr = parent_node_flag_ptr;
 		parent_attach_node_flag = parent2_node_flag;
 
-		ret = ja_attach_node(ja, attach_node_flag_ptr,
-				attach_node_flag,
-				parent_attach_node_flag,
-				node_flag_ptr,
-				node_flag,
-				key, i, node);
+		ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
+				parent_attach_node_flag, node_flag_ptr,
+				node_flag, key, i, node);
 	} else {
 		struct cds_ja_node *iter_node, *last_node = NULL;
 
@@ -2209,12 +2203,8 @@ retry:
 		attach_node_flag_ptr = node_flag_ptr;
 		parent_attach_node_flag = parent_node_flag;
 
-		ret = ja_chain_node(ja,
-			parent_attach_node_flag,
-			attach_node_flag_ptr,
-			attach_node_flag,
-			last_node,
-			node);
+		ret = ja_chain_node(ja, parent_attach_node_flag, attach_node_flag_ptr,
+			attach_node_flag, last_node, node);
 	}
 	if (ret == -EAGAIN || ret == -EEXIST)
 		goto retry;
