@@ -1960,26 +1960,6 @@ int ja_attach_node(struct cds_ja *ja,
 	/* Concurrent update prevented by mutual exclusion. */
 	assert(!(old_node_flag_ptr && ja_node_ptr(*old_node_flag_ptr)));
 
-	/*
-	 * Perform a lookup query to handle the case where
-	 * old_node_flag_ptr is NULL. We cannot use it to check if the
-	 * node has been populated between RCU lookup and mutex
-	 * acquisition.
-	 */
-	if (!old_node_flag_ptr) {
-		uint8_t iter_key;
-		struct cds_ja_inode_flag *lookup_node_flag;
-		struct cds_ja_inode_flag **lookup_node_flag_ptr;
-
-		iter_key = (uint8_t) (key >> (JA_BITS_PER_BYTE * (ja->tree_depth - level)));
-		lookup_node_flag = ja_node_get_nth(attach_node_flag,
-			&lookup_node_flag_ptr, iter_key);
-		if (lookup_node_flag) {
-			ret = -EEXIST;
-			goto end;
-		}
-	}
-
 	/* Concurrent update prevented by mutual exclusion. */
 	assert(!(attach_node_flag_ptr && ja_node_ptr(*attach_node_flag_ptr) !=
 			ja_node_ptr(attach_node_flag)));
@@ -2047,7 +2027,6 @@ check_error:
 			assert(!tmpret);
 		}
 	}
-end:
 	return ret;
 }
 
