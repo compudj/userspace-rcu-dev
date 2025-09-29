@@ -2262,9 +2262,7 @@ int ja_detach_node(struct cds_ja *ja,
 		struct cds_ja_inode_flag **snapshot,
 		struct cds_ja_inode_flag ***snapshot_ptr,
 		uint8_t *snapshot_n,
-		int nr_snapshot,
-		struct cds_ja_inode_flag *locked_node,
-		struct cds_ja_shadow_node *locked_shadow_node)
+		int nr_snapshot)
 {
 	struct cds_ja_shadow_node *shadow_nodes[JA_MAX_DEPTH];
 	struct cds_ja_inode_flag **node_flag_ptr = NULL,
@@ -2286,14 +2284,10 @@ int ja_detach_node(struct cds_ja *ja,
 	for (i = nr_snapshot - 2; i >= 1; i--) {
 		struct cds_ja_shadow_node *shadow_node;
 
-		if (snapshot[i] != locked_node) {
-			shadow_node = rcuja_shadow_lookup(ja->ht, snapshot[i]);
-			if (!shadow_node) {
-				ret = -EAGAIN;
-				goto end;
-			}
-		} else {
-			shadow_node = locked_shadow_node;
+		shadow_node = rcuja_shadow_lookup(ja->ht, snapshot[i]);
+		if (!shadow_node) {
+			ret = -EAGAIN;
+			goto end;
 		}
 		shadow_nodes[nr_shadow++] = shadow_node;
 		assert(snapshot_ptr[i + 1]);
@@ -2306,7 +2300,6 @@ int ja_detach_node(struct cds_ja *ja,
 			nr_clear++;
 		nr_branch++;
 		if (shadow_node->nr_child > 1 || i == 1) {
-			assert(snapshot[i - 1] != locked_node);
 			shadow_node = rcuja_shadow_lookup(ja->ht, snapshot[i - 1]);
 			if (!shadow_node) {
 				ret = -EAGAIN;
@@ -2325,7 +2318,6 @@ int ja_detach_node(struct cds_ja *ja,
 			parent_node_flag = snapshot[i];
 
 			if (i > 1) {
-				assert(snapshot[i - 2] != locked_node);
 				shadow_node = rcuja_shadow_lookup(ja->ht,
 						snapshot[i - 2]);
 				if (!shadow_node) {
@@ -2350,7 +2342,6 @@ int ja_detach_node(struct cds_ja *ja,
 	 * either the root or the parent of the upmost node with 1
 	 * child).
 	 */
-
 	for (i = 0; i < nr_clear; i++) {
 		ret = rcuja_shadow_clear(ja->ht,
 				shadow_nodes[i]->node_flag,
@@ -2435,8 +2426,8 @@ int cds_ja_del(struct cds_ja *ja, uint64_t key,
 	struct cds_ja_inode_flag *node_flag;
 	struct cds_ja_inode_flag **prev_node_flag_ptr,
 		**node_flag_ptr;
-	int nr_snapshot;
-	int ret;
+	struct cds_ja_node *iter_node, *match = NULL;
+	int nr_snapshot, ret, count = 0;
 
 	if (caa_unlikely(key > ja->key_max || key == UINT64_MAX))
 		return -EINVAL;
@@ -2486,53 +2477,36 @@ retry:
 		dbg_printf("cds_ja_del: no node found for key %" PRIu64 "\n",
 				key);
 		return -ENOENT;
-	} else {
-		struct cds_ja_node *iter_node, *match = NULL;
-		struct cds_ja_inode_flag *parent_node_flag;
-		struct cds_ja_shadow_node *parent_shadow_node;
-		int count = 0;
-
-		iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
-		cds_ja_for_each_duplicate_rcu(iter_node) {
-			dbg_printf("cds_ja_del: compare %p with iter_node %p\n", node, iter_node);
-			if (iter_node == node)
-				match = iter_node;
-			count++;
-		}
-
-		if (!match) {
-			dbg_printf("cds_ja_del: no node match for node %p key %" PRIu64 "\n", node, key);
-			return -ENOENT;
-		}
-		assert(count > 0);
-
-		parent_node_flag = snapshot[nr_snapshot - 1];
-		parent_shadow_node = rcuja_shadow_lookup(ja->ht, parent_node_flag);
-		if (!parent_shadow_node)
-			return -EAGAIN;
-		match = NULL;
-		count = 0;
-		iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
-		cds_ja_for_each_duplicate(iter_node) {
-			dbg_printf("cds_ja_del: compare %p with iter_node %p\n", node, iter_node);
-			if (iter_node == node)
-				match = iter_node;
-			count++;
-		}
-		if (count == 1) {
-			/*
-			 * Removing last of duplicates. Last snapshot
-			 * does not have a shadow node (external leafs).
-			 */
-			snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
-			snapshot[nr_snapshot++] = node_flag;
-			ret = ja_detach_node(ja, snapshot, snapshot_ptr,
-					snapshot_n, nr_snapshot,
-					parent_node_flag, parent_shadow_node);
-		} else {
-			ret = ja_unchain_node(node_flag_ptr, node_flag, match);
-		}
 	}
+
+	/* Iterate over duplicates. */
+	iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
+	cds_ja_for_each_duplicate_rcu(iter_node) {
+		dbg_printf("cds_ja_del: compare %p with iter_node %p\n", node, iter_node);
+		if (iter_node == node)
+			match = iter_node;
+		count++;
+	}
+
+	if (!match) {
+		dbg_printf("cds_ja_del: no node match for node %p key %" PRIu64 "\n", node, key);
+		return -ENOENT;
+	}
+	assert(count > 0);
+
+	if (count == 1) {
+		/*
+		 * Removing last of duplicates. Last snapshot
+		 * does not have a shadow node (external leafs).
+		 */
+		snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
+		snapshot[nr_snapshot++] = node_flag;
+		ret = ja_detach_node(ja, snapshot, snapshot_ptr,
+				snapshot_n, nr_snapshot);
+	} else {
+		ret = ja_unchain_node(node_flag_ptr, node_flag, match);
+	}
+
 	/*
 	 * Explanation of -ENOENT handling: caused by concurrent delete
 	 * between RCU lookup and actual removal. Need to re-do the
