@@ -1937,35 +1937,24 @@ static
 int ja_attach_node(struct cds_ja *ja,
 		struct cds_ja_inode_flag **attach_node_flag_ptr,
 		struct cds_ja_inode_flag *attach_node_flag,
-		struct cds_ja_inode_flag *parent_attach_node_flag,
 		struct cds_ja_inode_flag **old_node_flag_ptr,
 		struct cds_ja_inode_flag *old_node_flag,
 		uint64_t key,
 		unsigned int level,
 		struct cds_ja_node *child_node)
 {
-	struct cds_ja_shadow_node *shadow_node = NULL, *parent_shadow_node = NULL;
+	struct cds_ja_shadow_node *shadow_node = NULL;
 	struct cds_ja_inode_flag *iter_node_flag, *iter_dest_node_flag,
 				*created_nodes[JA_MAX_DEPTH];
 	int ret, i, nr_created_nodes = 0;
 
-	dbg_printf("Attach node at level %u (old_node_flag %p, attach_node_flag_ptr %p attach_node_flag %p, parent_attach_node_flag %p)\n",
-		level, old_node_flag, attach_node_flag_ptr, attach_node_flag, parent_attach_node_flag);
+	dbg_printf("Attach node at level %u (old_node_flag %p, attach_node_flag_ptr %p attach_node_flag %p)\n",
+		level, old_node_flag, attach_node_flag_ptr, attach_node_flag);
 
 	assert(!old_node_flag);
 	if (attach_node_flag) {
 		shadow_node = rcuja_shadow_lookup(ja->ht, attach_node_flag);
-		if (!shadow_node) {
-			ret = -EAGAIN;
-			goto end;
-		}
-	}
-	if (parent_attach_node_flag) {
-		parent_shadow_node = rcuja_shadow_lookup(ja->ht, parent_attach_node_flag);
-		if (!parent_shadow_node) {
-			ret = -EAGAIN;
-			goto end;
-		}
+		assert(shadow_node);
 	}
 
 	/* Concurrent update prevented by mutual exclusion. */
@@ -2062,21 +2051,9 @@ end:
 	return ret;
 }
 
-/*
- * Return 0 on success, negative error value on failure.
- */
 static
-int ja_chain_node(struct cds_ja *ja,
-		struct cds_ja_inode_flag *parent_node_flag,
-		struct cds_ja_node *last_node,
-		struct cds_ja_node *node)
+void ja_chain_node(struct cds_ja_node *last_node, struct cds_ja_node *node)
 {
-	struct cds_ja_shadow_node *shadow_node;
-
-	shadow_node = rcuja_shadow_lookup(ja->ht, parent_node_flag);
-	if (!shadow_node) {
-		return -EAGAIN;
-	}
 	/*
 	 * Add node to tail of list to ensure that RCU traversals will
 	 * always see either the prior node or the newly added if
@@ -2085,7 +2062,6 @@ int ja_chain_node(struct cds_ja *ja,
 	 */
 	node->next = NULL;
 	rcu_assign_pointer(last_node->next, node);
-	return 0;
 }
 
 static
@@ -2095,7 +2071,7 @@ int _cds_ja_add(struct cds_ja *ja, uint64_t key,
 {
 	unsigned int tree_depth, i;
 	struct cds_ja_inode_flag *attach_node_flag, *parent_node_flag,
-		*parent2_node_flag, *node_flag, *parent_attach_node_flag;
+		*parent2_node_flag, *node_flag;
 	struct cds_ja_inode_flag **attach_node_flag_ptr,
 		**parent_node_flag_ptr, **node_flag_ptr;
 	int ret;
@@ -2140,11 +2116,9 @@ retry:
 
 		attach_node_flag = parent_node_flag;
 		attach_node_flag_ptr = parent_node_flag_ptr;
-		parent_attach_node_flag = parent2_node_flag;
 
 		ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
-				parent_attach_node_flag, node_flag_ptr,
-				node_flag, key, i, node);
+				node_flag_ptr, node_flag, key, i, node);
 	} else {
 		struct cds_ja_node *iter_node, *last_node = NULL;
 
@@ -2161,11 +2135,8 @@ retry:
 		dbg_printf("cds_ja_add duplicate parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
 
-		attach_node_flag = node_flag;
-		attach_node_flag_ptr = node_flag_ptr;
-		parent_attach_node_flag = parent_node_flag;
-
-		ret = ja_chain_node(ja, parent_attach_node_flag, last_node, node);
+		ja_chain_node(last_node, node);
+		ret = 0;
 	}
 	if (ret == -EAGAIN || ret == -EEXIST)
 		goto retry;
