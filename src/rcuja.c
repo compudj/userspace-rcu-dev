@@ -2176,20 +2176,17 @@ int ja_detach_node(struct cds_ja *ja,
 	assert(nr_snapshot == (int)ja->tree_depth + 1);
 
 	/*
-	 * From the last internal level node going up, get the node
-	 * lock, check if the node has only one child left. If it is the
+	 * From the last internal level node going up, lookup the shadow
+	 * node, check if the node has only one child left. If it is the
 	 * case, we continue iterating upward. When we reach a node
-	 * which has more that one child left, we lock the parent, and
+	 * which has more that one child left, we lookup the parent, and
 	 * proceed to the node deletion (removing its children too).
 	 */
 	for (i = nr_snapshot - 2; i >= 1; i--) {
 		struct cds_ja_shadow_node *shadow_node;
 
 		shadow_node = rcuja_shadow_lookup(ja->ht, snapshot[i]);
-		if (!shadow_node) {
-			ret = -EAGAIN;
-			goto end;
-		}
+		assert(shadow_node);
 		shadow_nodes[nr_shadow++] = shadow_node;
 		assert(snapshot_ptr[i + 1]);
 		/* Mutual exclusion prevents concurrent update. */
@@ -2202,10 +2199,7 @@ int ja_detach_node(struct cds_ja *ja,
 		nr_branch++;
 		if (shadow_node->nr_child > 1 || i == 1) {
 			shadow_node = rcuja_shadow_lookup(ja->ht, snapshot[i - 1]);
-			if (!shadow_node) {
-				ret = -EAGAIN;
-				goto end;
-			}
+			assert(shadow_node);
 			shadow_nodes[nr_shadow++] = shadow_node;
 
 			assert(snapshot_ptr[i]);
@@ -2221,10 +2215,7 @@ int ja_detach_node(struct cds_ja *ja,
 			if (i > 1) {
 				shadow_node = rcuja_shadow_lookup(ja->ht,
 						snapshot[i - 2]);
-				if (!shadow_node) {
-					ret = -EAGAIN;
-					goto end;
-				}
+				assert(shadow_node);
 				shadow_nodes[nr_shadow++] = shadow_node;
 
 				assert(snapshot_ptr[i - 1]);
@@ -2271,47 +2262,10 @@ end:
 }
 
 static
-int ja_unchain_node(struct cds_ja_inode_flag **node_flag_ptr,
-		struct cds_ja_inode_flag *node_flag,
+void ja_unchain_node(struct cds_ja_node **prev_node_ptr,
 		struct cds_ja_node *node)
 {
-	struct cds_ja_node *iter_node, **iter_node_ptr, **prev_node_ptr = NULL;
-	int ret = 0, count = 0, found = 0;
-
-	if (ja_node_ptr(*node_flag_ptr) != ja_node_ptr(node_flag)) {
-		ret = -EAGAIN;
-		goto end;
-	}
-	/*
-	 * Find the previous node's next pointer pointing to our node,
-	 * so we can update it. Retry if another thread removed all but
-	 * one of duplicates since check (this check was performed
-	 * without lock). Ensure that the node we are about to remove is
-	 * still in the list (while holding lock). No need for RCU
-	 * traversal here since we hold the lock on the parent.
-	 */
-	iter_node_ptr = (struct cds_ja_node **) node_flag_ptr;
-	iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
-	cds_ja_for_each_duplicate(iter_node) {
-		count++;
-		if (iter_node == node) {
-			prev_node_ptr = iter_node_ptr;
-			found++;
-		}
-		iter_node_ptr = &iter_node->next;
-	}
-	assert(found <= 1);
-	if (!found || count == 1) {
-		ret = -EAGAIN;
-		goto end;
-	}
 	uatomic_store(prev_node_ptr, node->next, CMM_RELAXED);
-	/*
-	 * Validate that we indeed removed the node from linked list.
-	 */
-	assert(ja_node_ptr(*node_flag_ptr) != (struct cds_ja_inode *) node);
-end:
-	return ret;
 }
 
 /*
@@ -2327,7 +2281,7 @@ int cds_ja_del(struct cds_ja *ja, uint64_t key,
 	struct cds_ja_inode_flag *node_flag;
 	struct cds_ja_inode_flag **prev_node_flag_ptr,
 		**node_flag_ptr;
-	struct cds_ja_node *iter_node, *match = NULL;
+	struct cds_ja_node *iter_node, **iter_node_ptr, **prev_node_ptr, *match;
 	int nr_snapshot, ret, count = 0;
 
 	if (caa_unlikely(key > ja->key_max || key == UINT64_MAX))
@@ -2361,9 +2315,7 @@ retry:
 		snapshot_n[nr_snapshot + 1] = iter_key;
 		snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
 		snapshot[nr_snapshot++] = node_flag;
-		node_flag = ja_node_get_nth(node_flag,
-			&node_flag_ptr,
-			iter_key);
+		node_flag = ja_node_get_nth(node_flag, &node_flag_ptr, iter_key);
 		if (node_flag)
 			prev_node_flag_ptr = node_flag_ptr;
 		dbg_printf("cds_ja_del iter key lookup %u finds node_flag %p, prev_node_flag_ptr %p\n",
@@ -2380,15 +2332,26 @@ retry:
 		return -ENOENT;
 	}
 
-	/* Iterate over duplicates. */
+	/*
+	 * Find the previous node's next pointer pointing to our node,
+	 * so we can update it.
+	 */
+	prev_node_ptr = NULL;
+	iter_node_ptr = (struct cds_ja_node **) node_flag_ptr;
 	iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
-	cds_ja_for_each_duplicate_rcu(iter_node) {
-		dbg_printf("cds_ja_del: compare %p with iter_node %p\n", node, iter_node);
-		if (iter_node == node)
-			match = iter_node;
+	count = 0;
+	match = NULL;
+	cds_ja_for_each_duplicate(iter_node) {
 		count++;
+		if (match)
+			continue;
+		dbg_printf("cds_ja_del: compare %p with iter_node %p\n", node, iter_node);
+		if (iter_node == node) {
+			prev_node_ptr = iter_node_ptr;
+			match = iter_node;
+		}
+		iter_node_ptr = &iter_node->next;
 	}
-
 	if (!match) {
 		dbg_printf("cds_ja_del: no node match for node %p key %" PRIu64 "\n", node, key);
 		return -ENOENT;
@@ -2405,7 +2368,8 @@ retry:
 		ret = ja_detach_node(ja, snapshot, snapshot_ptr,
 				snapshot_n, nr_snapshot);
 	} else {
-		ret = ja_unchain_node(node_flag_ptr, node_flag, match);
+		ja_unchain_node(prev_node_ptr, match);
+		ret = 0;
 	}
 
 	/*
