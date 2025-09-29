@@ -1945,12 +1945,10 @@ int ja_attach_node(struct cds_ja *ja,
 		unsigned int level,
 		struct cds_ja_node *child_node)
 {
-	struct cds_ja_shadow_node *shadow_node = NULL,
-			*parent_shadow_node = NULL;
-	struct cds_ja_inode_flag *iter_node_flag, *iter_dest_node_flag;
-	int ret, i;
-	struct cds_ja_inode_flag *created_nodes[JA_MAX_DEPTH];
-	int nr_created_nodes = 0;
+	struct cds_ja_shadow_node *shadow_node = NULL, *parent_shadow_node = NULL;
+	struct cds_ja_inode_flag *iter_node_flag, *iter_dest_node_flag,
+				*created_nodes[JA_MAX_DEPTH];
+	int ret, i, nr_created_nodes = 0;
 
 	dbg_printf("Attach node at level %u (old_node_flag %p, attach_node_flag_ptr %p attach_node_flag %p, parent_attach_node_flag %p)\n",
 		level, old_node_flag, attach_node_flag_ptr, attach_node_flag, parent_attach_node_flag);
@@ -1964,8 +1962,7 @@ int ja_attach_node(struct cds_ja *ja,
 		}
 	}
 	if (parent_attach_node_flag) {
-		parent_shadow_node = rcuja_shadow_lookup(ja->ht,
-						parent_attach_node_flag);
+		parent_shadow_node = rcuja_shadow_lookup(ja->ht, parent_attach_node_flag);
 		if (!parent_shadow_node) {
 			ret = -EAGAIN;
 			goto end;
@@ -1988,8 +1985,7 @@ int ja_attach_node(struct cds_ja *ja,
 
 		iter_key = (uint8_t) (key >> (JA_BITS_PER_BYTE * (ja->tree_depth - level)));
 		lookup_node_flag = ja_node_get_nth(attach_node_flag,
-			&lookup_node_flag_ptr,
-			iter_key);
+			&lookup_node_flag_ptr, iter_key);
 		if (lookup_node_flag) {
 			ret = -EEXIST;
 			goto end;
@@ -2010,10 +2006,8 @@ int ja_attach_node(struct cds_ja *ja,
 		dbg_printf("branch creation level %d, key %u\n",
 				i, (unsigned int) iter_key);
 		iter_dest_node_flag = NULL;
-		ret = ja_node_set_nth(ja, &iter_dest_node_flag,
-			iter_key,
-			iter_node_flag,
-			NULL, i);
+		ret = ja_node_set_nth(ja, &iter_dest_node_flag, iter_key,
+			iter_node_flag, NULL, i);
 		if (ret) {
 			dbg_printf("branch creation error %d\n", ret);
 			goto check_error;
@@ -2037,10 +2031,8 @@ int ja_attach_node(struct cds_ja *ja,
 				level - 1, (unsigned int) iter_key);
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
-		ret = ja_node_set_nth(ja, &iter_dest_node_flag,
-			iter_key,
-			iter_node_flag,
-			shadow_node, level - 1);
+		ret = ja_node_set_nth(ja, &iter_dest_node_flag, iter_key,
+			iter_node_flag, shadow_node, level - 1);
 		if (ret) {
 			dbg_printf("branch publish error %d\n", ret);
 			goto check_error;
@@ -2077,39 +2069,14 @@ end:
 static
 int ja_chain_node(struct cds_ja *ja,
 		struct cds_ja_inode_flag *parent_node_flag,
-		struct cds_ja_inode_flag **node_flag_ptr,
-		struct cds_ja_inode_flag *node_flag,
 		struct cds_ja_node *last_node,
 		struct cds_ja_node *node)
 {
 	struct cds_ja_shadow_node *shadow_node;
-	struct cds_ja_node *iter_node;
-	int ret = 0, found = 0;
 
 	shadow_node = rcuja_shadow_lookup(ja->ht, parent_node_flag);
 	if (!shadow_node) {
 		return -EAGAIN;
-	}
-	/*
-	 * Ensure that previous node is still there at end of list.
-	 */
-	iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
-	if ((struct cds_ja_node *) ja_node_ptr(*node_flag_ptr) != iter_node) {
-		ret = -EAGAIN;
-		goto end;
-	}
-	cds_ja_for_each_duplicate(iter_node) {
-		if (found) {
-			/* Node is not last anymore, retry. */
-			ret = -EAGAIN;
-			goto end;
-		}
-		if (iter_node == last_node)
-			found = 1;
-	}
-	if (!found) {
-		ret = -EAGAIN;
-		goto end;
 	}
 	/*
 	 * Add node to tail of list to ensure that RCU traversals will
@@ -2119,8 +2086,7 @@ int ja_chain_node(struct cds_ja *ja,
 	 */
 	node->next = NULL;
 	rcu_assign_pointer(last_node->next, node);
-end:
-	return ret;
+	return 0;
 }
 
 static
@@ -2129,14 +2095,10 @@ int _cds_ja_add(struct cds_ja *ja, uint64_t key,
 		struct cds_ja_node **unique_node_ret)
 {
 	unsigned int tree_depth, i;
-	struct cds_ja_inode_flag *attach_node_flag,
-		*parent_node_flag,
-		*parent2_node_flag,
-		*node_flag,
-		*parent_attach_node_flag;
+	struct cds_ja_inode_flag *attach_node_flag, *parent_node_flag,
+		*parent2_node_flag, *node_flag, *parent_attach_node_flag;
 	struct cds_ja_inode_flag **attach_node_flag_ptr,
-		**parent_node_flag_ptr,
-		**node_flag_ptr;
+		**parent_node_flag_ptr, **node_flag_ptr;
 	int ret;
 
 	if (caa_unlikely(key > ja->key_max || key == UINT64_MAX)) {
@@ -2204,8 +2166,7 @@ retry:
 		attach_node_flag_ptr = node_flag_ptr;
 		parent_attach_node_flag = parent_node_flag;
 
-		ret = ja_chain_node(ja, parent_attach_node_flag, attach_node_flag_ptr,
-			attach_node_flag, last_node, node);
+		ret = ja_chain_node(ja, parent_attach_node_flag, last_node, node);
 	}
 	if (ret == -EAGAIN || ret == -EEXIST)
 		goto retry;
