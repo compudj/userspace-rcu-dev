@@ -13,8 +13,7 @@ dist_noinst_HEADERS = urcu-die.h urcu-wait.h compat-getcpu.h \
 
 COMPAT = compat_futex.c
 
-RCUJA = rcuja.c rcuja-shadow-nodes.c rcuja-internal.h \
-	murmurhash3-internal.h murmurhash3.c
+RCUJA = rcuja.c rcuja-alloc.c rcuja-internal.h
 
 RCULFHASH = rculfhash.c rculfhash-mm-order.c rculfhash-mm-chunk.c \
 		rculfhash-mm-mmap.c

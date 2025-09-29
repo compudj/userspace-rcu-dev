@@ -48,34 +48,42 @@
  */
 #define JA_FALLBACK_REMOVAL_COUNT	8
 
+#define RCU_JA_ALLOC_ORDER_MAX		12
+
 /* Never declared. Opaque type used to store flagged node pointers. */
 struct cds_ja_inode_flag;
 struct cds_ja_inode;
 
-/*
- * Shadow node contains call_rcu head associated with a node.
- */
-struct cds_ja_shadow_node {
-	struct cds_lfht_node ht_node;	/* hash table node */
-	struct cds_ja_inode_flag *node_flag;	/* reverse mapping and hash table key */
-	unsigned int nr_child;		/* number of children in node */
-	struct rcu_head head;		/* for deferred node and shadow node reclaim */
-	int fallback_removal_count;	/* removals left keeping fallback */
-	int level;			/* level in the tree */
-	struct cds_ja *ja;		/* toplevel judy array */
+struct cds_ja_alloc_arena;
+struct cds_ja_metadata_alloc;
+
+struct cds_ja_metadata {
+	unsigned int nr_child;			/* Number of children in node. */
+	int fallback_removal_count;		/* Removals left keeping fallback. */
+	int level;				/* Level in the tree. */
+};
+
+struct cds_ja_metadata_alloc {
+	union {
+		struct rcu_head rcu_head;			/* For deferred node reclaim. */
+		struct cds_ja_metadata_alloc *free_list_next;	/* Free list next pointer. */
+	};
+	unsigned int alloc_index;
+	struct cds_ja_metadata metadata;
 };
 
 struct cds_ja {
 	struct cds_ja_inode_flag *root;
+	struct cds_ja_metadata root_metadata;
+
 	unsigned int tree_depth;
 	uint64_t key_max;
-	/*
-	 * We use a hash table to associate node keys to their
-	 * respective shadow node. This helps reducing lookup hot path
-	 * cache footprint, especially for very small nodes.
-	 */
-	struct cds_lfht *ht;
 	unsigned long nr_fallback;	/* Number of fallback nodes used */
+
+	const struct rcu_flavor_struct *flavor;
+
+	/* Allocation arenas. */
+	struct cds_ja_alloc_arena *arena_order[RCU_JA_ALLOC_ORDER_MAX + 1];
 
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[JA_ENTRY_PER_NODE];
@@ -154,42 +162,19 @@ __attribute__((visibility("hidden")))
 unsigned long ja_node_type(struct cds_ja_inode_flag *node);
 
 __attribute__((visibility("hidden")))
-void rcuja_free_all_children(struct cds_ja_shadow_node *shadow_node,
-		struct cds_ja_inode_flag *node_flag);
+void cds_ja_free_all_arenas(struct cds_ja *ja);
 
 __attribute__((visibility("hidden")))
-struct cds_ja_shadow_node *rcuja_shadow_lookup(struct cds_lfht *ht,
-		struct cds_ja_inode_flag *node_flag);
+struct cds_ja_metadata *cds_ja_item_to_metadata(void *p);
 
 __attribute__((visibility("hidden")))
-struct cds_ja_shadow_node *rcuja_shadow_set(struct cds_lfht *ht,
-		struct cds_ja_inode_flag *new_node_flag,
-		struct cds_ja_shadow_node *inherit_from,
-		struct cds_ja *ja, int level);
-
-/* rcuja_shadow_clear flags */
-enum {
-	RCUJA_SHADOW_CLEAR_FREE_NODE = (1U << 0),
-};
+void *cds_ja_metadata_to_item(struct cds_ja_metadata *metadata);
 
 __attribute__((visibility("hidden")))
-int rcuja_shadow_clear(struct cds_lfht *ht,
-		struct cds_ja_inode_flag *node_flag,
-		struct cds_ja_shadow_node *shadow_node,
-		unsigned int flags);
+struct cds_ja_metadata *cds_ja_alloc_item(struct cds_ja *ja, size_t item_len_order);
 
 __attribute__((visibility("hidden")))
-void rcuja_shadow_prune(struct cds_lfht *ht,
-		unsigned int flags);
-
-__attribute__((visibility("hidden")))
-struct cds_lfht *rcuja_create_ht(const struct rcu_flavor_struct *flavor);
-
-__attribute__((visibility("hidden")))
-int rcuja_delete_ht(struct cds_lfht *ht);
-
-__attribute__((visibility("hidden")))
-void free_cds_ja_node(struct cds_ja *ja, struct cds_ja_inode *node);
+void cds_ja_free_item(struct cds_ja_metadata *metadata);
 
 /*
  * Iterate through duplicates returned by cds_ja_lookup*()
