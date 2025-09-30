@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include <unistd.h>
 #include <urcu/rculfhash.h>
+#include <assert.h>
 
 /*
  * Number of least significant pointer bits reserved to represent the
