@@ -1162,7 +1162,7 @@ void ja_node_sum_distribution_2d(enum ja_recompact mode,
 			if (mode == JA_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
 				continue;
 			for (bit_i = 0; bit_i < JA_BITS_PER_BYTE; bit_i++) {
-				for (bit_j = 0; bit_j < bit_i; bit_j++) {
+				for (bit_j = bit_i + 1; bit_j < JA_BITS_PER_BYTE; bit_j++) {
 					if (v & (1U << bit_i)) {
 						if (v & (1U << bit_j)) {
 							nr_2d_11[bit_i][bit_j]++;
@@ -1205,7 +1205,7 @@ void ja_node_sum_distribution_2d(enum ja_recompact mode,
 				if (mode == JA_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
 					continue;
 				for (bit_i = 0; bit_i < JA_BITS_PER_BYTE; bit_i++) {
-					for (bit_j = 0; bit_j < bit_i; bit_j++) {
+					for (bit_j = bit_i + 1; bit_j < JA_BITS_PER_BYTE; bit_j++) {
 						if (v & (1U << bit_i)) {
 							if (v & (1U << bit_j)) {
 								nr_2d_11[bit_i][bit_j]++;
@@ -1240,7 +1240,7 @@ void ja_node_sum_distribution_2d(enum ja_recompact mode,
 			if (mode == JA_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
 				continue;
 			for (bit_i = 0; bit_i < JA_BITS_PER_BYTE; bit_i++) {
-				for (bit_j = 0; bit_j < bit_i; bit_j++) {
+				for (bit_j = bit_i + 1; bit_j < JA_BITS_PER_BYTE; bit_j++) {
 					if (i & (1U << bit_i)) {
 						if (i & (1U << bit_j)) {
 							nr_2d_11[bit_i][bit_j]++;
@@ -1270,7 +1270,7 @@ void ja_node_sum_distribution_2d(enum ja_recompact mode,
 
 	if (mode == JA_RECOMPACT_ADD_NEXT || mode == JA_RECOMPACT_ADD_SAME) {
 		for (bit_i = 0; bit_i < JA_BITS_PER_BYTE; bit_i++) {
-			for (bit_j = 0; bit_j < bit_i; bit_j++) {
+			for (bit_j = bit_i + 1; bit_j < JA_BITS_PER_BYTE; bit_j++) {
 				if (n & (1U << bit_i)) {
 					if (n & (1U << bit_j)) {
 						nr_2d_11[bit_i][bit_j]++;
@@ -1297,7 +1297,7 @@ void ja_node_sum_distribution_2d(enum ja_recompact mode,
 	 * truncation error.
 	 */
 	for (bit_i = 0; bit_i < JA_BITS_PER_BYTE; bit_i++) {
-		for (bit_j = 0; bit_j < bit_i; bit_j++) {
+		for (bit_j = bit_i + 1; bit_j < JA_BITS_PER_BYTE; bit_j++) {
 			int distance_to_best[4];
 
 			distance_to_best[0] = ((unsigned int) nr_2d_11[bit_i][bit_j] << 2U) - distrib_nr_child;
