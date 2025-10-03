@@ -1,0 +1,179 @@
+
+RCU Judy Array design: bit selection combinations
+
+Mathieu Desnoyers
+October 3, 2025
+
+This is an extension to the RCU Judy Array design with the following goals:
+
+- Guarantee that only a single cache line is loaded per internal node
+  level (the prior RCU Judy Array implementation has internal nodes that
+  require hitting two cache lines),
+- Use combination bit selection to minimize the number of bits needed to
+  represent the split of up-to-256-values populations into multiple
+  sub-classes (2 to 16).
+- Adapt to modern 64-bit architectures (2025) which have 64 bytes cache lines.
+
+* Combinations
+
+We can calculate the number of combinations for bit selection over
+8-bit as selector to split the node population.
+
+The number of combinations of r = { 2, 3, 4 } items within n=8 items:
+
+          C(n,r) (n=8)     next pow2     nr bits   nr sub-classes
+r=1           8                8            3            2
+r=2          28               32            5            4
+r=3          56               64            6            8
+r=4          70              128            7           16
+
+
+* 32-bit architectures (optimizing for 64 bytes cache lines, common for 2025 hardware)
+
+Note: Older hardware with 32 byte cache lines will hit two cache lines per node in some
+node representations. Our main target is 32-bit compatibility binaries running on current
+hardware (2025).
+
+We need 3 bits to represent the 8 node configurations.
+We want to encode the node configuration and the sub-classes selection in
+the low-order bits (LSB).
+
+node size (bytes)  node size order     max_nr_items         node type              Used LSB
+        8                 3                   1              linear                   3
+       16                 4                   3              linear                   3
+       32                 5                   6              linear                   3
+       64                 6                  12              linear                   3
+      128                 7                  24           2 sub-classes (3-bit)       6
+      256                 8                  48           4 sub-classes (5-bit)       8
+      512                 9                  96           8 sub-classes (6-bit)       9
+     1024                10                 256              pigeon                   3
+
+
+* 64-bit architectures (64 bytes cache lines)
+
+We need 3 bits to represent the 8 node configurations.
+We want to encode the node configuration and the sub-classes selection in
+the low-order bits (LSB).
+
+node size (bytes)  node size order     max_nr_items         node type              Used LSB
+       16                 4                   1              linear                   3
+       32                 5                   3              linear                   3
+       64                 6                   7              linear                   3
+      128                 7                  14           2 sub-classes (3-bit)       6
+      256                 8                  28           4 sub-classes (5-bit)       8
+      512                 9                  56           8 sub-classes (6-bit)       9
+     1024                10                 112          16 sub-classes (7-bit)      10
+     2048                11                 256              pigeon                   3
+
+
+* Computing the best N bits selection to balance 2^N sub-classes:
+
+- Find the bits with highest entropy (split closest to 50% `0` and 50% `1`).
+- For a population of values P.
+- Count bit frequencies: For each bit position (n=0-7), count how many times they
+  are `1` (nr_bit1[n]) across P.
+- Note: our goal is to maximize the Shannon Entropy, but let's rely on something
+  simpler to calculate with integers: minimize the distance to (nr_elem(P) / 2).
+- For each bit position (n=0-7), calculate the distance D between nr_bit1[n]
+  and (nr_elem(P) / 2).
+- Select the best bits: sort the bits by calculated distance D[n].
+- Pick the N bits with the lowest distance D[n].
+
+
+* Detailed listing of C(n,r):
+
+C(8,1):
+{ 0, 1, 2, 3, 4, 5, 6, 7 }
+
+C(8,2):
+{
+    {0, 1}, {0, 2}, {0, 3}, {0, 4}, {0, 5}, {0, 6}, {0, 7},
+    {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6}, {1, 7},
+    {2, 3}, {2, 4}, {2, 5}, {2, 6}, {2, 7},
+    {3, 4}, {3, 5}, {3, 6}, {3, 7},
+    {4, 5}, {4, 6}, {4, 7},
+    {5, 6}, {5, 7},
+    {6, 7}
+}
+
+C(8,3):
+{
+    {0, 1, 2}, {0, 1, 3}, {0, 1, 4}, {0, 1, 5}, {0, 1, 6}, {0, 1, 7},
+    {0, 2, 3}, {0, 2, 4}, {0, 2, 5}, {0, 2, 6}, {0, 2, 7},
+    {0, 3, 4}, {0, 3, 5}, {0, 3, 6}, {0, 3, 7},
+    {0, 4, 5}, {0, 4, 6}, {0, 4, 7},
+    {0, 5, 6}, {0, 5, 7},
+    {0, 6, 7},
+    {1, 2, 3}, {1, 2, 4}, {1, 2, 5}, {1, 2, 6}, {1, 2, 7},
+    {1, 3, 4}, {1, 3, 5}, {1, 3, 6}, {1, 3, 7},
+    {1, 4, 5}, {1, 4, 6}, {1, 4, 7},
+    {1, 5, 6}, {1, 5, 7},
+    {1, 6, 7},
+    {2, 3, 4}, {2, 3, 5}, {2, 3, 6}, {2, 3, 7},
+    {2, 4, 5}, {2, 4, 6}, {2, 4, 7},
+    {2, 5, 6}, {2, 5, 7},
+    {2, 6, 7},
+    {3, 4, 5}, {3, 4, 6}, {3, 4, 7},
+    {3, 5, 6}, {3, 5, 7},
+    {3, 6, 7},
+    {4, 5, 6}, {4, 5, 7},
+    {4, 6, 7},
+    {5, 6, 7}
+}
+
+C(8,4):
+{
+    {0, 1, 2, 3}, {0, 2, 3, 4}, {0, 3, 4, 5}, {0, 4, 5, 6}, {0, 5, 6, 7},
+    {0, 1, 2, 4}, {0, 2, 3, 5}, {0, 3, 4, 6}, {0, 4, 5, 7},
+    {0, 1, 2, 5}, {0, 2, 3, 6}, {0, 3, 4, 7}, {0, 4, 6, 7},
+    {0, 1, 2, 6}, {0, 2, 3, 7}, {0, 3, 5, 6},
+    {0, 1, 2, 7}, {0, 2, 4, 5}, {0, 3, 5, 7},
+    {0, 1, 3, 4}, {0, 2, 4, 6}, {0, 3, 6, 7},
+    {0, 1, 3, 5}, {0, 2, 4, 7}, 
+    {0, 1, 3, 6}, {0, 2, 5, 6}, 
+    {0, 1, 3, 7}, {0, 2, 5, 7}, 
+    {0, 1, 4, 5}, {0, 2, 6, 7}, 
+    {0, 1, 4, 6},  
+    {0, 1, 4, 7},  
+    {0, 1, 5, 6},  
+    {0, 1, 5, 7},  
+    {0, 1, 6, 7},
+    {1, 2, 3, 4}, {2, 3, 4, 5}, {3, 4, 5, 6},
+    {1, 2, 3, 5}, {2, 3, 4, 6}, {3, 4, 5, 7},
+    {1, 2, 3, 6}, {2, 3, 4, 7}, {3, 4, 6, 7},
+    {1, 2, 3, 7}, {2, 3, 5, 6}, {3, 5, 6, 7},
+    {1, 2, 4, 5}, {2, 3, 5, 7}, {4, 5, 6, 7},
+    {1, 2, 4, 6}, {2, 3, 6, 7},
+    {1, 2, 4, 7}, {2, 4, 5, 6},
+    {1, 2, 5, 6}, {2, 4, 5, 7},
+    {1, 2, 5, 7}, {2, 4, 6, 7},
+    {1, 2, 6, 7}, {2, 5, 6, 7},
+    {1, 3, 4, 5},
+    {1, 3, 4, 6},
+    {1, 3, 4, 7},
+    {1, 3, 5, 6},
+    {1, 3, 5, 7},
+    {1, 3, 6, 7},
+    {1, 4, 5, 6},
+    {1, 4, 5, 7},
+    {1, 4, 6, 7},
+    {1, 5, 6, 7}
+}
+
+
+* AI Queries
+
+Used Gemini 2.5 Flash, Gemini 2.5 Pro, GPT-5, Sonnet-4.5 with the following query:
+
+You are an expert programmer 
+I have random number populations including numbers from zero to 255 
+Those numbers are represented as 8 bit integers 
+I want to split those populations into four classes. Those classes are selected to keep the number of items per class as balanced as possible. The selection is done by choosing four bits from the values as selector.
+How can I efficiently compute the best choice of bits for any given population of numbers? 
+
+Gemini 2.5 Flash, GPT-5, and Sonnet-4.5 all recommend a brute-force approach.
+E.g. for 4 bit selection from 8 bits, the complexity is O(N + 256 * 70).
+
+Gemini 2.5 Pro has a different, interesting approach based on calculating the
+entropy of each bit, and select the bits with most entropy.
+
