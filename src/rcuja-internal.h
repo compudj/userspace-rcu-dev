@@ -78,7 +78,7 @@ struct cds_ja {
 	struct cds_ja_metadata root_metadata;
 
 	unsigned int tree_depth;
-	uint64_t key_max;
+	unsigned int key_len;
 	unsigned long nr_fallback;	/* Number of fallback nodes used */
 
 	const struct rcu_flavor_struct *flavor;

@@ -236,8 +236,10 @@ enum ja_recompact {
 };
 
 enum ja_lookup_inequality {
-	JA_LOOKUP_BE,
-	JA_LOOKUP_AE,
+	JA_LOOKUP_GE,
+	JA_LOOKUP_LE,
+	JA_LOOKUP_GT,
+	JA_LOOKUP_LT,
 };
 
 enum ja_direction {
@@ -1741,13 +1743,11 @@ int ja_node_clear_ptr(struct cds_ja *ja,
 	return ret;
 }
 
-struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, uint64_t key)
+struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key)
 {
 	unsigned int tree_depth, i;
 	struct cds_ja_inode_flag *node_flag;
 
-	if (caa_unlikely(key > ja->key_max || key == UINT64_MAX))
-		return NULL;
 	tree_depth = ja->tree_depth;
 	node_flag = rcu_dereference(ja->root);
 
@@ -1758,7 +1758,7 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, uint64_t key)
 	for (i = 1; i < tree_depth; i++) {
 		uint8_t iter_key;
 
-		iter_key = (uint8_t) (key >> (JA_BITS_PER_BYTE * (tree_depth - i - 1)));
+		iter_key = *(key++);
 		node_flag = ja_node_get_nth(node_flag, NULL, iter_key);
 		dbg_printf("cds_ja_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
@@ -1771,20 +1771,20 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, uint64_t key)
 }
 
 static
-struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, uint64_t key,
-		uint64_t *result_key, enum ja_lookup_inequality mode)
+struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, const uint8_t *key,
+		uint8_t *result_key, enum ja_lookup_inequality mode)
 {
 	int tree_depth, level;
 	struct cds_ja_inode_flag *node_flag, *cur_node_depth[JA_MAX_DEPTH];
 	uint8_t cur_key[JA_MAX_DEPTH];
-	uint64_t _result_key = 0;
 	enum ja_direction dir;
+	const uint8_t *iter_key = key;
 
 	switch (mode) {
-	case JA_LOOKUP_BE:
-	case JA_LOOKUP_AE:
-		if (caa_unlikely(key > ja->key_max || key == UINT64_MAX))
-			return NULL;
+	case JA_LOOKUP_GE:
+	case JA_LOOKUP_LE:
+	case JA_LOOKUP_GT:
+	case JA_LOOKUP_LT:
 		break;
 	default:
 		return NULL;
@@ -1801,23 +1801,33 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, uint64_t key,
 		return NULL;
 
 	for (level = 1; level < tree_depth; level++) {
-		uint8_t iter_key;
+		uint8_t key_value;
 
-		iter_key = (uint8_t) (key >> (JA_BITS_PER_BYTE * (tree_depth - level - 1)));
-		node_flag = ja_node_get_nth(node_flag, NULL, iter_key);
+		key_value = *(iter_key++);
+		node_flag = ja_node_get_nth(node_flag, NULL, key_value);
 		if (!ja_node_ptr(node_flag))
 			break;
-		cur_key[level - 1] = iter_key;
+		cur_key[level - 1] = key_value;
 		cur_node_depth[level] = node_flag;
 		dbg_printf("cds_ja_lookup_inequality iter key lookup %u finds node_flag %p\n",
-				(unsigned int) iter_key, node_flag);
+				(unsigned int) key_value, node_flag);
 	}
 
-	if (level == tree_depth) {
-		/* Last level lookup succeded. We got an equal match. */
-		if (result_key)
-			*result_key = key;
-		return (struct cds_ja_node *) node_flag;
+	switch (mode) {
+	case JA_LOOKUP_LE:
+	case JA_LOOKUP_GE:
+		if (level == tree_depth) {
+			/* Last level lookup succeded. We got an equal match. */
+			if (result_key)
+				memcpy(result_key, key, ja->key_len);
+			return (struct cds_ja_node *) node_flag;
+		}
+		break;
+	case JA_LOOKUP_LT:
+	case JA_LOOKUP_GT:
+		break;
+	default:
+		assert(0);
 	}
 
 	/*
@@ -1830,23 +1840,25 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, uint64_t key,
 	 * (recursively).
 	 */
 	switch (mode) {
-	case JA_LOOKUP_BE:
+	case JA_LOOKUP_LE:
+	case JA_LOOKUP_LT:
 		dir = JA_LEFT;
 		break;
-	case JA_LOOKUP_AE:
+	case JA_LOOKUP_GE:
+	case JA_LOOKUP_GT:
 		dir = JA_RIGHT;
 		break;
 	default:
 		assert(0);
 	}
 	for (; level > 0; level--) {
-		uint8_t iter_key;
+		uint8_t key_value;
 
-		iter_key = (uint8_t) (key >> (JA_BITS_PER_BYTE * (tree_depth - level - 1)));
+		key_value = *(--iter_key);
 		node_flag = ja_node_get_leftright(cur_node_depth[level - 1],
-				iter_key, &cur_key[level - 1], dir);
+				key_value, &cur_key[level - 1], dir);
 		dbg_printf("cds_ja_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
-				(unsigned int) iter_key, (unsigned int) cur_key[level - 1],
+				(unsigned int) key_value, (unsigned int) cur_key[level - 1],
 				node_flag);
 		/* If found left/right sibling, find rightmost/leftmost child. */
 		if (ja_node_ptr(node_flag))
@@ -1862,7 +1874,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, uint64_t key,
 
 	/*
 	 * From this point, we are guaranteed to be able to find a
-	 * "below than"/"above than" match. ja_attach_node() and
+	 * "lower than"/"greater than" match. ja_attach_node() and
 	 * ja_detach_node() both guarantee that it is not possible for a
 	 * lookup to reach a dead-end.
 	 */
@@ -1872,10 +1884,12 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, uint64_t key,
 	 * (recursively).
 	 */
 	switch (mode) {
-	case JA_LOOKUP_BE:
+	case JA_LOOKUP_LE:
+	case JA_LOOKUP_LT:
 		dir = JA_RIGHTMOST;
 		break;
-	case JA_LOOKUP_AE:
+	case JA_LOOKUP_GE:
+	case JA_LOOKUP_GT:
 		dir = JA_LEFTMOST;
 		break;
 	default:
@@ -1893,27 +1907,38 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, uint64_t key,
 	assert(level == tree_depth);
 
 	if (result_key) {
-		for (level = 1; level < tree_depth; level++) {
-			_result_key |= ((uint64_t) cur_key[level - 1])
-					<< (JA_BITS_PER_BYTE * (tree_depth - level - 1));
-		}
-		*result_key = _result_key;
+		for (level = 1; level < tree_depth; level++)
+			*(result_key++) = cur_key[level - 1];
 	}
 	return (struct cds_ja_node *) node_flag;
 }
 
-struct cds_ja_node *cds_ja_lookup_below_equal(struct cds_ja *ja,
-		uint64_t key, uint64_t *result_key)
+struct cds_ja_node *cds_ja_lookup_lower_equal(struct cds_ja *ja,
+		const uint8_t *key, uint8_t *result_key)
 {
-	dbg_printf("cds_ja_lookup_below_equal key %" PRIu64 "\n", key);
-	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_BE);
+	dbg_printf("cds_ja_lookup_lower_equal\n");
+	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_LE);
 }
 
-struct cds_ja_node *cds_ja_lookup_above_equal(struct cds_ja *ja,
-		uint64_t key, uint64_t *result_key)
+struct cds_ja_node *cds_ja_lookup_greater_equal(struct cds_ja *ja,
+		const uint8_t *key, uint8_t *result_key)
 {
-	dbg_printf("cds_ja_lookup_above_equal key %" PRIu64 "\n", key);
-	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_AE);
+	dbg_printf("cds_ja_lookup_greater_equal\n");
+	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_GE);
+}
+
+struct cds_ja_node *cds_ja_lookup_lower_than(struct cds_ja *ja,
+		const uint8_t *key, uint8_t *result_key)
+{
+	dbg_printf("cds_ja_lookup_lower_than\n");
+	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_LT);
+}
+
+struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
+		const uint8_t *key, uint8_t *result_key)
+{
+	dbg_printf("cds_ja_lookup_greater_than\n");
+	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_GT);
 }
 
 /*
@@ -1933,7 +1958,7 @@ int ja_attach_node(struct cds_ja *ja,
 		struct cds_ja_inode_flag *attach_node_flag,
 		struct cds_ja_inode_flag **old_node_flag_ptr,
 		struct cds_ja_inode_flag *old_node_flag,
-		uint64_t key,
+		const uint8_t *key,
 		unsigned int level,
 		struct cds_ja_node *child_node)
 {
@@ -1941,6 +1966,7 @@ int ja_attach_node(struct cds_ja *ja,
 	struct cds_ja_inode_flag *iter_node_flag, *iter_dest_node_flag,
 				*created_nodes[JA_MAX_DEPTH];
 	int ret, i, nr_created_nodes = 0;
+	const uint8_t *iter_key = key + ja->key_len;
 
 	dbg_printf("Attach node at level %u (old_node_flag %p, attach_node_flag_ptr %p attach_node_flag %p)\n",
 		level, old_node_flag, attach_node_flag_ptr, attach_node_flag);
@@ -1960,13 +1986,13 @@ int ja_attach_node(struct cds_ja *ja,
 	iter_node_flag = (struct cds_ja_inode_flag *) child_node;
 
 	for (i = ja->tree_depth - 1; i >= (int) level; i--) {
-		uint8_t iter_key;
+		uint8_t key_value;
 
-		iter_key = (uint8_t) (key >> (JA_BITS_PER_BYTE * (ja->tree_depth - i - 1)));
+		key_value = *(--iter_key);
 		dbg_printf("branch creation level %d, key %u\n",
-				i, (unsigned int) iter_key);
+				i, (unsigned int) key_value);
 		iter_dest_node_flag = NULL;
-		ret = ja_node_set_nth(ja, &iter_dest_node_flag, iter_key,
+		ret = ja_node_set_nth(ja, &iter_dest_node_flag, key_value,
 			iter_node_flag, NULL, level - 1);
 		if (ret) {
 			dbg_printf("branch creation error %d\n", ret);
@@ -1984,14 +2010,14 @@ int ja_attach_node(struct cds_ja *ja,
 		 */
 		rcu_assign_pointer(ja->root, iter_node_flag);
 	} else {
-		uint8_t iter_key;
+		uint8_t key_value;
 
-		iter_key = (uint8_t) (key >> (JA_BITS_PER_BYTE * (ja->tree_depth - level)));
+		key_value = *(--iter_key);
 		dbg_printf("publish branch at level %d, key %u\n",
-				level - 1, (unsigned int) iter_key);
+				level - 1, (unsigned int) key_value);
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
-		ret = ja_node_set_nth(ja, &iter_dest_node_flag, iter_key,
+		ret = ja_node_set_nth(ja, &iter_dest_node_flag, key_value,
 			iter_node_flag, metadata, level - 1);
 		if (ret) {
 			dbg_printf("branch publish error %d\n", ret);
@@ -2028,7 +2054,7 @@ void ja_chain_node(struct cds_ja_node *last_node, struct cds_ja_node *node)
 }
 
 static
-int _cds_ja_add(struct cds_ja *ja, uint64_t key,
+int _cds_ja_add(struct cds_ja *ja, const uint8_t *key,
 		struct cds_ja_node *node,
 		struct cds_ja_node **unique_node_ret)
 {
@@ -2037,16 +2063,13 @@ int _cds_ja_add(struct cds_ja *ja, uint64_t key,
 		*parent2_node_flag, *node_flag;
 	struct cds_ja_inode_flag **attach_node_flag_ptr,
 		**parent_node_flag_ptr, **node_flag_ptr;
+	const uint8_t *iter_key = key;
 	int ret;
 
-	if (caa_unlikely(key > ja->key_max || key == UINT64_MAX)) {
-		return -EINVAL;
-	}
 	tree_depth = ja->tree_depth;
 
 retry:
-	dbg_printf("cds_ja_add attempt: key %" PRIu64 ", node %p\n",
-		key, node);
+	dbg_printf("cds_ja_add attempt: node %p\n", node);
 	parent2_node_flag = NULL;
 	parent_node_flag = (struct cds_ja_inode_flag *) &ja->root;
 	parent_node_flag_ptr = NULL;
@@ -2055,17 +2078,17 @@ retry:
 
 	/* Iterate on all internal levels */
 	for (i = 1; i < tree_depth; i++) {
-		uint8_t iter_key;
+		uint8_t key_value;
 
 		if (!ja_node_ptr(node_flag))
 			break;
 		dbg_printf("cds_ja_add iter parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
-		iter_key = (uint8_t) (key >> (JA_BITS_PER_BYTE * (tree_depth - i - 1)));
+		key_value = *(iter_key++);
 		parent2_node_flag = parent_node_flag;
 		parent_node_flag = node_flag;
 		parent_node_flag_ptr = node_flag_ptr;
-		node_flag = ja_node_get_nth(node_flag, &node_flag_ptr, iter_key);
+		node_flag = ja_node_get_nth(node_flag, &node_flag_ptr, key_value);
 	}
 
 	/*
@@ -2107,13 +2130,13 @@ retry:
 	return ret;
 }
 
-int cds_ja_add(struct cds_ja *ja, uint64_t key,
+int cds_ja_add(struct cds_ja *ja, const uint8_t *key,
 		struct cds_ja_node *node)
 {
 	return _cds_ja_add(ja, key, node, NULL);
 }
 
-struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, uint64_t key,
+struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
 		struct cds_ja_node *node)
 {
 	int ret;
@@ -2239,7 +2262,7 @@ void ja_unchain_node(struct cds_ja_node **prev_node_ptr,
 /*
  * Called with RCU read lock held.
  */
-int cds_ja_del(struct cds_ja *ja, uint64_t key,
+int cds_ja_del(struct cds_ja *ja, const uint8_t *key,
 		struct cds_ja_node *node)
 {
 	unsigned int tree_depth, i;
@@ -2251,15 +2274,13 @@ int cds_ja_del(struct cds_ja *ja, uint64_t key,
 		**node_flag_ptr;
 	struct cds_ja_node *iter_node, **iter_node_ptr, **prev_node_ptr, *match;
 	int nr_snapshot, ret, count = 0;
+	const uint8_t *iter_key = key;
 
-	if (caa_unlikely(key > ja->key_max || key == UINT64_MAX))
-		return -EINVAL;
 	tree_depth = ja->tree_depth;
 
 retry:
 	nr_snapshot = 0;
-	dbg_printf("cds_ja_del attempt: key %" PRIu64 ", node %p\n",
-		key, node);
+	dbg_printf("cds_ja_del attempt: node %p\n", node);
 
 	/* snapshot for level 0 is for metadata lookup of root node. */
 	snapshot_n[0] = 0;
@@ -2272,22 +2293,22 @@ retry:
 
 	/* Iterate on all internal levels */
 	for (i = 1; i < tree_depth; i++) {
-		uint8_t iter_key;
+		uint8_t key_value;
 
 		dbg_printf("cds_ja_del iter node_flag %p\n",
 				node_flag);
 		if (!ja_node_ptr(node_flag)) {
 			return -ENOENT;
 		}
-		iter_key = (uint8_t) (key >> (JA_BITS_PER_BYTE * (tree_depth - i - 1)));
-		snapshot_n[nr_snapshot + 1] = iter_key;
+		key_value = *(iter_key++);
+		snapshot_n[nr_snapshot + 1] = key_value;
 		snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
 		snapshot[nr_snapshot++] = node_flag;
-		node_flag = ja_node_get_nth(node_flag, &node_flag_ptr, iter_key);
+		node_flag = ja_node_get_nth(node_flag, &node_flag_ptr, key_value);
 		if (node_flag)
 			prev_node_flag_ptr = node_flag_ptr;
 		dbg_printf("cds_ja_del iter key lookup %u finds node_flag %p, prev_node_flag_ptr %p\n",
-				(unsigned int) iter_key, node_flag,
+				(unsigned int) key_value, node_flag,
 				prev_node_flag_ptr);
 	}
 	/*
@@ -2295,8 +2316,7 @@ retry:
 	 * to remove. Fail if we cannot find it.
 	 */
 	if (!ja_node_ptr(node_flag)) {
-		dbg_printf("cds_ja_del: no node found for key %" PRIu64 "\n",
-				key);
+		dbg_printf("cds_ja_del: no node found for key\n");
 		return -ENOENT;
 	}
 
@@ -2321,7 +2341,7 @@ retry:
 		iter_node_ptr = &iter_node->next;
 	}
 	if (!match) {
-		dbg_printf("cds_ja_del: no node match for node %p key %" PRIu64 "\n", node, key);
+		dbg_printf("cds_ja_del: no node match for node %p key\n", node);
 		return -ENOENT;
 	}
 	assert(count > 0);
@@ -2350,26 +2370,26 @@ retry:
 	return ret;
 }
 
+unsigned int cds_ja_key_len(const struct cds_ja *ja)
+{
+	return ja->key_len;
+}
+
 struct cds_ja *_cds_ja_new(unsigned int key_len,
 		const struct rcu_flavor_struct *flavor)
 {
-	unsigned int key_bits = key_len << JA_LOG2_BITS_PER_BYTE;
 	struct cds_ja *ja;
 
 	ja = calloc(sizeof(*ja), 1);
 	if (!ja)
 		goto ja_error;
 
-	if (key_len < 8) {
-		ja->key_max = (1ULL << key_bits) - 1;
-	} else if (key_len == 8) {
-		ja->key_max = UINT64_MAX;
-	} else {
+	if (!key_len || key_len > 8)
 		goto check_error;
-	}
 
 	/* ja->root is NULL */
 	/* tree_depth 0 is for pointer to root node */
+	ja->key_len = key_len;
 	ja->tree_depth = key_len + 1;
 	assert(ja->tree_depth <= JA_MAX_DEPTH);
 	ja->flavor = flavor;
