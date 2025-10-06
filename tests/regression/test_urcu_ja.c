@@ -42,7 +42,7 @@ unsigned long init_pool_size = DEFAULT_RAND_POOL,
 	write_pool_size = DEFAULT_RAND_POOL;
 int validate_lookup;
 int sanity_test;
-unsigned int key_bits = 32;
+unsigned int key_len = 4;
 
 int count_pipe[2];
 
@@ -204,7 +204,7 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 	printf("        [-O size] Init pool size.\n");
 	printf("        [-V] Validate lookups of init values (use with filled init pool, same lookup range, with different write range).\n");
 	printf("        [-t] Do sanity test.\n");
-	printf("        [-B] Key bits for multithread test (default: 32).\n");
+	printf("        [-B] Key bytes for multithread test (default: 4).\n");
 	printf("        [-m factor] Key multiplication factor.\n");
 	printf("	[-l] Memory leak detection.\n");
 	printf("\n\n");
@@ -237,7 +237,7 @@ end:
 }
 
 static
-int test_8bit_key(void)
+int test_1byte_key(void)
 {
 	int ret;
 	size_t i;
@@ -246,15 +246,15 @@ int test_8bit_key(void)
 	uint64_t ka_test_offset = 5;
 	struct cds_ja_node *ja_node;
 
-	/* Test with 8-bit key */
-	test_ja = cds_ja_new(8);
+	/* Test with 1-byte key */
+	test_ja = cds_ja_new(1);
 	if (!test_ja) {
 		printf("Error allocating judy array.\n");
 		return -1;
 	}
 
 	/* Add keys */
-	printf("Test #1: add keys (8-bit).\n");
+	printf("Test #1: add keys (1-byte).\n");
 	for (key = 0; key < 200; key++) {
 		struct ja_test_node *node = node_alloc();
 
@@ -270,7 +270,7 @@ int test_8bit_key(void)
 	}
 	printf("OK\n");
 
-	printf("Test #2: successful key lookup (8-bit).\n");
+	printf("Test #2: successful key lookup (1-byte).\n");
 	for (key = 0; key < 200; key++) {
 		rcu_read_lock();
 		ja_node = cds_ja_lookup(test_ja, key);
@@ -281,7 +281,7 @@ int test_8bit_key(void)
 		rcu_read_unlock();
 	}
 	printf("OK\n");
-	printf("Test #3: unsuccessful key lookup (8-bit).\n");
+	printf("Test #3: unsuccessful key lookup (1-byte).\n");
 	for (key = 200; key < 240; key++) {
 		rcu_read_lock();
 		ja_node = cds_ja_lookup(test_ja, key);
@@ -294,7 +294,7 @@ int test_8bit_key(void)
 		rcu_read_unlock();
 	}
 	printf("OK\n");
-	printf("Test #4: remove keys (8-bit).\n");
+	printf("Test #4: remove keys (1-byte).\n");
 	for (key = 0; key < 200; key++) {
 		struct ja_test_node *node;
 
@@ -320,7 +320,7 @@ int test_8bit_key(void)
 	}
 	printf("OK\n");
 
-	printf("Test #5: lookup below/above equal (8-bit).\n");
+	printf("Test #5: lookup below/above equal (1-byte).\n");
 
 	for (i = 0; i < CAA_ARRAY_SIZE(ka); i++) {
 		struct ja_test_node *node = node_alloc();
@@ -430,7 +430,7 @@ int test_8bit_key(void)
 }
 
 static
-int test_16bit_key(void)
+int test_2bytes_key(void)
 {
 	int ret;
 	size_t i;
@@ -438,15 +438,15 @@ int test_16bit_key(void)
 	uint64_t ka[] = { 105, 206, 4000, 4111, 59990, 65435 };
 	uint64_t ka_test_offset = 100;
 
-	/* Test with 16-bit key */
-	test_ja = cds_ja_new(16);
+	/* Test with 2-bytes key */
+	test_ja = cds_ja_new(2);
 	if (!test_ja) {
 		printf("Error allocating judy array.\n");
 		return -1;
 	}
 
 	/* Add keys */
-	printf("Test #1: add keys (16-bit).\n");
+	printf("Test #1: add keys (2-byes).\n");
 	for (key = 0; key < 10000; key++) {
 	//for (key = 0; key < 65536; key+=256) {
 		struct ja_test_node *node = node_alloc();
@@ -463,7 +463,7 @@ int test_16bit_key(void)
 	}
 	printf("OK\n");
 
-	printf("Test #2: successful key lookup (16-bit).\n");
+	printf("Test #2: successful key lookup (2-byte).\n");
 	for (key = 0; key < 10000; key++) {
 	//for (key = 0; key < 65536; key+=256) {
 		struct cds_ja_node *ja_node;
@@ -477,7 +477,7 @@ int test_16bit_key(void)
 		rcu_read_unlock();
 	}
 	printf("OK\n");
-	printf("Test #3: unsuccessful key lookup (16-bit).\n");
+	printf("Test #3: unsuccessful key lookup (2-byte).\n");
 	for (key = 11000; key <= 11002; key++) {
 		struct cds_ja_node *ja_node;
 
@@ -492,7 +492,7 @@ int test_16bit_key(void)
 		rcu_read_unlock();
 	}
 	printf("OK\n");
-	printf("Test #4: remove keys (16-bit).\n");
+	printf("Test #4: remove keys (2-byte).\n");
 	for (key = 0; key < 10000; key++) {
 	//for (key = 0; key < 65536; key+=256) {
 		struct cds_ja_node *ja_node;
@@ -520,7 +520,7 @@ int test_16bit_key(void)
 	}
 	printf("OK\n");
 
-	printf("Test #5: lookup below/above equal (16-bit).\n");
+	printf("Test #5: lookup below/above equal (2-byte).\n");
 
 	for (i = 0; i < CAA_ARRAY_SIZE(ka); i++) {
 		struct ja_test_node *node = node_alloc();
@@ -636,27 +636,27 @@ int test_16bit_key(void)
  * nr_dup is number of nodes per key.
  */
 static
-int test_sparse_key(unsigned int bits, int nr_dup)
+int test_sparse_key(unsigned int len, int nr_dup)
 {
 	uint64_t key, max_key;
 	int zerocount, i, ret;
 	struct cds_ja_node *ja_node;
+	unsigned int bits = len * CHAR_BIT;
 
-	if (bits == 64)
+	if (len == 8)
 		max_key = UINT64_MAX;
 	else
 		max_key = (1ULL << bits) - 1;
 
-	printf("Sparse key test begins for %u-bit keys\n", bits);
-	/* Test with 16-bit key */
-	test_ja = cds_ja_new(bits);
+	printf("Sparse key test begins for %u-byte keys\n", len);
+	test_ja = cds_ja_new(len);
 	if (!test_ja) {
 		printf("Error allocating judy array.\n");
 		return -1;
 	}
 
 	/* Add keys */
-	printf("Test #1: add keys (%u-bit).\n", bits);
+	printf("Test #1: add keys (%u-byte).\n", len);
 	for (i = 0; i < nr_dup; i++) {
 		zerocount = 0;
 		for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
@@ -677,7 +677,7 @@ int test_sparse_key(unsigned int bits, int nr_dup)
 	}
 	printf("OK\n");
 
-	printf("Test #2: successful key lookup (%u-bit).\n", bits);
+	printf("Test #2: successful key lookup (%u-byte).\n", len);
 	zerocount = 0;
 	for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
 		int count = 0;
@@ -699,8 +699,8 @@ int test_sparse_key(unsigned int bits, int nr_dup)
 			zerocount++;
 	}
 	printf("OK\n");
-	if (bits > 8) {
-		printf("Test #3: unsuccessful key lookup (%u-bit).\n", bits);
+	if (len > 1) {
+		printf("Test #3: unsuccessful key lookup (%u-byte).\n", len);
 		zerocount = 0;
 		for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
 			rcu_read_lock();
@@ -717,7 +717,7 @@ int test_sparse_key(unsigned int bits, int nr_dup)
 		}
 		printf("OK\n");
 	}
-	printf("Test #4: remove keys (%u-bit).\n", bits);
+	printf("Test #4: remove keys (%u-byte).\n", len);
 	zerocount = 0;
 	for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
 		int count = 0;
@@ -779,20 +779,20 @@ int do_sanity_test(void)
 	printf("Sanity test start.\n");
 
 	for (i = 0; i < 3; i++) {
-		ret = test_8bit_key();
+		ret = test_1byte_key();
 		if (ret) {
 			return ret;
 		}
 		rcu_quiescent_state();
 	}
-	ret = test_16bit_key();
+	ret = test_2bytes_key();
 	if (ret) {
 		return ret;
 	}
 	rcu_quiescent_state();
 
-	/* key bits */
-	for (i = 8; i <= 64; i *= 2) {
+	/* key length (bytes) */
+	for (i = 1; i <= 8; i *= 2) {
 		/* nr of nodes per key */
 		for (j = 1; j < 4; j++) {
 			ret = test_sparse_key(i, j);
@@ -1064,8 +1064,8 @@ int do_mt_test(void)
 	count_reader = malloc(sizeof(*count_reader) * nr_readers);
 	count_writer = malloc(sizeof(*count_writer) * nr_writers);
 
-	printf("Allocating Judy Array for %u-bit keys\n", key_bits);
-	test_ja = cds_ja_new(key_bits);
+	printf("Allocating Judy Array for %u-byte keys\n", key_len);
+	test_ja = cds_ja_new(key_len);
 	if (!test_ja) {
 		printf("Error allocating judy array.\n");
 		ret = -1;
@@ -1241,7 +1241,7 @@ int main(int argc, char **argv)
 			sanity_test = 1;
 			break;
 		case 'B':
-			key_bits = atol(argv[++i]);
+			key_len = atol(argv[++i]);
 			break;
 		case 'm':
 			key_mul = atoll(argv[++i]);
