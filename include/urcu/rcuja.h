@@ -132,20 +132,19 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, uint64_t key,
 int cds_ja_del(struct cds_ja *ja, uint64_t key,
 		struct cds_ja_node *node);
 
-struct cds_ja *_cds_ja_new(unsigned int key_bits,
+struct cds_ja *_cds_ja_new(unsigned int key_len,
 		const struct rcu_flavor_struct *flavor);
 
 /*
  * cds_ja_new - Create a Judy array.
- * @key_bits: Number of bits for key.
+ * @key_len: Key length (in bytes).
  *
- * Returns non-NULL pointer on success, else NULL on error. @key_bits
- * needs to be multiple of 8, either: 8, 16, 24, 32, 40, 48, 56, or 64.
+ * Returns non-NULL pointer on success, else NULL on error.
  */
 static inline
-struct cds_ja *cds_ja_new(unsigned int key_bits)
+struct cds_ja *cds_ja_new(unsigned int key_len)
 {
-	return _cds_ja_new(key_bits, &rcu_flavor);
+	return _cds_ja_new(key_len, &rcu_flavor);
 }
 
 /*
