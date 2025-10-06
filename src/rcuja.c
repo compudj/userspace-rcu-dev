@@ -2349,35 +2349,27 @@ retry:
 	return ret;
 }
 
-struct cds_ja *_cds_ja_new(unsigned int key_bits,
+struct cds_ja *_cds_ja_new(unsigned int key_len,
 		const struct rcu_flavor_struct *flavor)
 {
+	unsigned int key_bits = key_len << JA_LOG2_BITS_PER_BYTE;
 	struct cds_ja *ja;
 
 	ja = calloc(sizeof(*ja), 1);
 	if (!ja)
 		goto ja_error;
 
-	switch (key_bits) {
-	case 8:
-	case 16:
-	case 24:
-	case 32:
-	case 40:
-	case 48:
-	case 56:
+	if (key_len < 8) {
 		ja->key_max = (1ULL << key_bits) - 1;
-		break;
-	case 64:
+	} else if (key_len == 8) {
 		ja->key_max = UINT64_MAX;
-		break;
-	default:
+	} else {
 		goto check_error;
 	}
 
 	/* ja->root is NULL */
 	/* tree_depth 0 is for pointer to root node */
-	ja->tree_depth = (key_bits >> JA_LOG2_BITS_PER_BYTE) + 1;
+	ja->tree_depth = key_len + 1;
 	assert(ja->tree_depth <= JA_MAX_DEPTH);
 	ja->flavor = flavor;
 	return ja;
