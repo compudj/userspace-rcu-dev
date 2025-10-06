@@ -4,6 +4,19 @@ RCU Judy Array design: bit selection combinations
 Mathieu Desnoyers
 October 3, 2025
 
+* Note: After analysis of the generated populations (rcuja_testpop), it
+  appears that aiming for a single cache line hit per node would degrade
+  the functional density (minimizing how many cache lines are required
+  to fit a number of items). On 64-bit, with 1024 node size, a
+  16-subclasses split with sub-classes of size 7 can only fit 79 items
+  populations (at 99% success rate). Compared to this, a 4-subclasses
+  split with sub-classes of size 28 can fit 101 items populations
+  (99% success rate). A 2-subclasses split with sub-classes of size
+  56 (sill a single cache line scan on 64-bit) can fit 105 items
+  populations (at 99% success rate).
+
+  Therefore, the approach discussed below will not be implemented.
+
 This is an extension to the RCU Judy Array design with the following goals:
 
 - Guarantee that only a single cache line is loaded per internal node
