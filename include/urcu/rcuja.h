@@ -45,7 +45,7 @@ void cds_ja_node_init(struct cds_ja_node *node __attribute__((unused)))
 }
 
 /*
- * Note: key UINT64_MAX is reserved internally for iteration.
+ * Note: big endian integers can alias byte array keys.
  */
 
 /*
@@ -58,35 +58,63 @@ void cds_ja_node_init(struct cds_ja_node *node __attribute__((unused)))
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
-struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, uint64_t key);
+struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key);
 
 /*
- * cds_ja_lookup_below_equal - look up first node with key <= @key.
+ * cds_ja_lookup_lower_equal - look up first node with key <= @key.
  * @ja: the Judy array.
  * @key: key to look up.
  * @result_key: key found.
  *
  * Returns the first node of a duplicate chain if a node is present in
- * the tree which has a key below or equal to @key, else returns NULL.
+ * the tree which has a key lower or equal to @key, else returns NULL.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
-struct cds_ja_node *cds_ja_lookup_below_equal(struct cds_ja *ja,
-		uint64_t key, uint64_t *result_key);
+struct cds_ja_node *cds_ja_lookup_lower_equal(struct cds_ja *ja,
+		const uint8_t *key, uint8_t *result_key);
 
 /*
- * cds_ja_lookup_above_equal - look up first node with key >= @key.
+ * cds_ja_lookup_greater_equal - look up first node with key >= @key.
  * @ja: the Judy array.
  * @key: key to look up.
  * @result_key: key found.
  *
  * Returns the first node of a duplicate chain if a node is present in
- * the tree which has a key above or equal to @key, else returns NULL.
+ * the tree which has a key greater or equal to @key, else returns NULL.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
-struct cds_ja_node *cds_ja_lookup_above_equal(struct cds_ja *ja,
-		uint64_t key, uint64_t *result_key);
+struct cds_ja_node *cds_ja_lookup_greater_equal(struct cds_ja *ja,
+		const uint8_t *key, uint8_t *result_key);
+
+/*
+ * cds_ja_lookup_lower_than - look up first node with key < @key.
+ * @ja: the Judy array.
+ * @key: key to look up.
+ * @result_key: key found.
+ *
+ * Returns the first node of a duplicate chain if a node is present in
+ * the tree which has a key lower than @key, else returns NULL.
+ * A RCU read-side lock should be held across call to this function and
+ * use of its return value.
+ */
+struct cds_ja_node *cds_ja_lookup_lower_than(struct cds_ja *ja,
+		const uint8_t *key, uint8_t *result_key);
+
+/*
+ * cds_ja_lookup_greater_than - look up first node with key > @key.
+ * @ja: the Judy array.
+ * @key: key to look up.
+ * @result_key: key found.
+ *
+ * Returns the first node of a duplicate chain if a node is present in
+ * the tree which has a key greater than @key, else returns NULL.
+ * A RCU read-side lock should be held across call to this function and
+ * use of its return value.
+ */
+struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
+		const uint8_t *key, uint8_t *result_key);
 
 /*
  * cds_ja_add - Add @node at @key, allowing duplicates.
@@ -99,7 +127,7 @@ struct cds_ja_node *cds_ja_lookup_above_equal(struct cds_ja *ja,
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
  */
-int cds_ja_add(struct cds_ja *ja, uint64_t key,
+int cds_ja_add(struct cds_ja *ja, const uint8_t *key,
 		struct cds_ja_node *node);
 
 /*
@@ -115,7 +143,7 @@ int cds_ja_add(struct cds_ja *ja, uint64_t key,
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
  */
-struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, uint64_t key,
+struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
 		struct cds_ja_node *node);
 
 /*
@@ -129,7 +157,7 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, uint64_t key,
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
  */
-int cds_ja_del(struct cds_ja *ja, uint64_t key,
+int cds_ja_del(struct cds_ja *ja, const uint8_t *key,
 		struct cds_ja_node *node);
 
 struct cds_ja *_cds_ja_new(unsigned int key_len,
@@ -159,6 +187,8 @@ struct cds_ja *cds_ja_new(unsigned int key_len)
  */
 int cds_ja_destroy(struct cds_ja *ja);
 
+unsigned int cds_ja_key_len(const struct cds_ja *ja);
+
 /*
  * cds_ja_for_each_duplicate_rcu: Iterate through duplicates.
  * @pos: struct cds_ja_node *, start of duplicate list and loop cursor.
@@ -185,40 +215,6 @@ int cds_ja_destroy(struct cds_ja *ja);
 	for (; (pos) != NULL ?						\
 			((p) = rcu_dereference((pos)->next), 1) : 0;	\
 			(pos) = (p))
-
-/*
- * cds_ja_for_each_key_rcu: Iterate over all keys in ascending order.
- * @ja: Judy array on which iteration should be done.
- * @key: Key cursor, needs to be a uint64_t.
- * @pos: struct cds_ja_node *, used as loop cursor.
- *
- * Iterate over all keys of a RCU Judy array (_not_ duplicates) in
- * ascending order.
- * This must be done while rcu_read_lock() is held.
- * Safe against node removal during iteration.
- */
-#define cds_ja_for_each_key_rcu(ja, key, pos)				\
-	for ((key) = 0;							\
-		((key) != UINT64_MAX ?					\
-			((pos) = cds_ja_lookup_above_equal(ja, key, &(key))) : 0); \
-		(key)++)
-
-/*
- * cds_ja_for_each_key_prev_rcu: Iterate over all keys in descending order.
- * @ja: Judy array on which iteration should be done.
- * @key: Key cursor, needs to be a uint64_t.
- * @pos: struct cds_ja_node *, used as loop cursor.
- *
- * Iterate over all keys of a RCU Judy array (_not_ duplicates) in
- * descending order.
- * This must be done while rcu_read_lock() is held.
- * Safe against node removal during iteration.
- */
-#define cds_ja_for_each_key_prev_rcu(ja, key, pos)			\
-	for ((key) = UINT64_MAX - 1;					\
-		((key) != UINT64_MAX ?					\
-			((pos) = cds_ja_lookup_below_equal(ja, key, &(key))) : 0); \
-		(key)--)
 
 #ifdef __cplusplus
 }
