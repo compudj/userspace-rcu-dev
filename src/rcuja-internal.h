@@ -33,7 +33,8 @@
 #define JA_BITS_PER_BYTE	(1U << JA_LOG2_BITS_PER_BYTE)
 
 #define JA_POOL_1D_MASK	((JA_BITS_PER_BYTE - 1) << JA_TYPE_BITS)
-#define JA_POOL_2D_MASK	(JA_POOL_1D_MASK << JA_LOG2_BITS_PER_BYTE)
+/* 2D mask has C(n=8,r=2) = 28 possibilities (fits in 5 bits). */
+#define JA_POOL_2D_MASK	(((1U << 5) - 1) << JA_TYPE_BITS)
 
 #define JA_MAX_DEPTH	9	/* Maximum depth, including leafs */
 
@@ -110,12 +111,10 @@ struct cds_ja_inode_flag *ja_node_flag_pool_1d(struct cds_ja_inode *node,
 
 static inline
 struct cds_ja_inode_flag *ja_node_flag_pool_2d(struct cds_ja_inode *node,
-		unsigned long type, unsigned int bitsel[2])
+		unsigned long type, unsigned int subclass_index)
 {
 	assert(type < (1UL << JA_TYPE_BITS));
-	assert(bitsel[0] < JA_BITS_PER_BYTE);
-	assert(bitsel[1] < JA_BITS_PER_BYTE);
-	return (struct cds_ja_inode_flag *) (((unsigned long) node) | (bitsel[0] << (JA_TYPE_BITS + JA_LOG2_BITS_PER_BYTE)) | (bitsel[1] << JA_TYPE_BITS) | type);
+	return (struct cds_ja_inode_flag *) (((unsigned long) node) | (subclass_index << JA_TYPE_BITS) | type);
 }
 
 /* Hardcoded pool indexes for fast path */
@@ -136,7 +135,7 @@ struct cds_ja_inode *ja_node_ptr(struct cds_ja_inode_flag *node)
 		v &= ~(JA_POOL_1D_MASK | JA_TYPE_MASK);
 		break;
 	case RCU_JA_POOL_IDX_6:
-		v &= ~(JA_POOL_2D_MASK | JA_POOL_1D_MASK | JA_TYPE_MASK);
+		v &= ~(JA_POOL_2D_MASK | JA_TYPE_MASK);
 		break;
 	default:
 		/* RCU_JA_LINEAR or RCU_JA_PIGEON */
