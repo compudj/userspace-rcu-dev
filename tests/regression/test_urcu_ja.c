@@ -13,6 +13,8 @@
 #include <stdint.h>
 #include <endian.h>
 
+#define key_len_split(var)	var, sizeof(var)
+
 DEFINE_URCU_TLS(unsigned int, rand_lookup);
 DEFINE_URCU_TLS(unsigned long, nr_add);
 DEFINE_URCU_TLS(unsigned long, nr_addexist);
@@ -204,21 +206,21 @@ int test_free_all_nodes(struct cds_ja *ja)
 		struct cds_ja_node *ja_node;
 		struct cds_ja_node *tmp_node;
 
-		cds_ja_u64_to_key(ja, key, jakey);
-		ja_node = cds_ja_lookup_greater_equal(ja, jakey, res_jakey);
+		cds_ja_u64_to_key(ja, key, jakey, 0);
+		ja_node = cds_ja_lookup_greater_equal(ja, jakey, 0, res_jakey, NULL);
 		if (!ja_node)
 			break;
 		cds_ja_for_each_duplicate_safe_rcu(ja_node, tmp_node) {
-			ret = cds_ja_del(test_ja, res_jakey, ja_node);
+			ret = cds_ja_del(test_ja, res_jakey, 0, ja_node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n",
-					ret, cds_ja_key_to_u64(ja, res_jakey));
+					ret, cds_ja_key_to_u64(ja, res_jakey, 0));
 				goto end;
 			}
 			/* Alone using Judy array, OK to free now */
 			free_node(ja_node);
 		}
-		key = cds_ja_key_to_u64(ja, res_jakey);
+		key = cds_ja_key_to_u64(ja, res_jakey, 0);
 		if (key == UINT64_MAX)
 			break;
 		key++;
@@ -261,8 +263,8 @@ int test_1byte_key(void)
 
 		ja_test_node_init(node, key);
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ret = cds_ja_add(test_ja, jakey, &node->node);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ret = cds_ja_add(test_ja, key_len_split(jakey), &node->node);
 		rcu_read_unlock();
 		if (ret) {
 			fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
@@ -275,8 +277,8 @@ int test_1byte_key(void)
 	printf("Test #2: successful key lookup (1-byte).\n");
 	for (key = 0; key < 200; key++) {
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup(test_ja, key_len_split(jakey));
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 "\n", key);
 			assert(0);
@@ -287,8 +289,8 @@ int test_1byte_key(void)
 	printf("Test #3: unsuccessful key lookup (1-byte).\n");
 	for (key = 200; key < 240; key++) {
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup(test_ja, key_len_split(jakey));
 		if (ja_node) {
 			fprintf(stderr,
 				"Error unexpected lookup node %" PRIu64 "\n",
@@ -303,22 +305,22 @@ int test_1byte_key(void)
 		struct ja_test_node *node;
 
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup(test_ja, key_len_split(jakey));
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 "\n", key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ret = cds_ja_del(test_ja, jakey, &node->node);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ret = cds_ja_del(test_ja, key_len_split(jakey), &node->node);
 		if (ret) {
 			fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
 			assert(0);
 		}
 		rcu_free_test_node(node);
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup(test_ja, key_len_split(jakey));
 		if (ja_node) {
 			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ja_node);
 			assert(0);
@@ -335,8 +337,8 @@ int test_1byte_key(void)
 		key = ka[i];
 		ja_test_node_init(node, key);
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ret = cds_ja_add(test_ja, jakey, &node->node);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ret = cds_ja_add(test_ja, key_len_split(jakey), &node->node);
 		rcu_read_unlock();
 		if (ret) {
 			fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
@@ -351,17 +353,17 @@ int test_1byte_key(void)
 
 		key = ka[i] + ka_test_offset;
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup_lower_equal(test_ja, jakey, result_key);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup_lower_equal(test_ja, key_len_split(jakey), result_key, NULL);
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup lower equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key) != ka[i]) {
+		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key, 0) != ka[i]) {
 			fprintf(stderr, "Error lookup lower equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key));
+				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key, 0));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -373,17 +375,17 @@ int test_1byte_key(void)
 
 		key = ka[i] - ka_test_offset;
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup_greater_equal(test_ja, jakey, result_key);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup_greater_equal(test_ja, key_len_split(jakey), result_key, NULL);
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup greater equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key) != ka[i]) {
+		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key, 0) != ka[i]) {
 			fprintf(stderr, "Error lookup greater equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key));
+				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key, 0));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -395,30 +397,30 @@ int test_1byte_key(void)
 
 		key = ka[i];	/* without offset */
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup_lower_equal(test_ja, jakey, result_key);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup_lower_equal(test_ja, key_len_split(jakey), result_key, NULL);
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup lower equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key) != ka[i]) {
+		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key, 0) != ka[i]) {
 			fprintf(stderr, "Error lookup lower equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key));
+				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key, 0));
 			assert(0);
 		}
 
-		ja_node = cds_ja_lookup_greater_equal(test_ja, jakey, result_key);
+		ja_node = cds_ja_lookup_greater_equal(test_ja, key_len_split(jakey), result_key, NULL);
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup greater equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key) != ka[i]) {
+		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key, 0) != ka[i]) {
 			fprintf(stderr, "Error lookup greater equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key));
+				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key, 0));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -473,8 +475,8 @@ int test_2bytes_key(void)
 
 		ja_test_node_init(node, key);
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ret = cds_ja_add(test_ja, jakey, &node->node);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ret = cds_ja_add(test_ja, key_len_split(jakey), &node->node);
 		rcu_read_unlock();
 		if (ret) {
 			fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
@@ -490,8 +492,8 @@ int test_2bytes_key(void)
 		struct cds_ja_node *ja_node;
 
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup(test_ja, key_len_split(jakey));
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 "\n", key);
 			assert(0);
@@ -504,8 +506,8 @@ int test_2bytes_key(void)
 		struct cds_ja_node *ja_node;
 
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup(test_ja, key_len_split(jakey));
 		if (ja_node) {
 			fprintf(stderr,
 				"Error unexpected lookup node %" PRIu64 "\n",
@@ -522,20 +524,20 @@ int test_2bytes_key(void)
 		struct ja_test_node *node;
 
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup(test_ja, key_len_split(jakey));
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 "\n", key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		ret = cds_ja_del(test_ja, jakey, &node->node);
+		ret = cds_ja_del(test_ja, key_len_split(jakey), &node->node);
 		if (ret) {
 			fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
 			assert(0);
 		}
 		rcu_free_test_node(node);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		ja_node = cds_ja_lookup(test_ja, key_len_split(jakey));
 		if (ja_node) {
 			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ja_node);
 			assert(0);
@@ -552,8 +554,8 @@ int test_2bytes_key(void)
 		key = ka[i];
 		ja_test_node_init(node, key);
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ret = cds_ja_add(test_ja, jakey, &node->node);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ret = cds_ja_add(test_ja, key_len_split(jakey), &node->node);
 		rcu_read_unlock();
 		if (ret) {
 			fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
@@ -569,17 +571,17 @@ int test_2bytes_key(void)
 
 		key = ka[i] + ka_test_offset;
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup_lower_equal(test_ja, jakey, result_key);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup_lower_equal(test_ja, key_len_split(jakey), result_key, NULL);
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup lower equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key) != ka[i]) {
+		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key, 0) != ka[i]) {
 			fprintf(stderr, "Error lookup lower equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key));
+				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key, 0));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -592,17 +594,17 @@ int test_2bytes_key(void)
 
 		key = ka[i] - ka_test_offset;
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup_greater_equal(test_ja, jakey, result_key);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup_greater_equal(test_ja, key_len_split(jakey), result_key, NULL);
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup greater equal. Cannot find expected key %" PRIu64" greater or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key) != ka[i]) {
+		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key, 0) != ka[i]) {
 			fprintf(stderr, "Error lookup greater equal. Expecting key %" PRIu64 " greater or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key));
+				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key, 0));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -615,30 +617,30 @@ int test_2bytes_key(void)
 
 		key = ka[i];	/* without offset */
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup_lower_equal(test_ja, jakey, result_key);
+		cds_ja_u64_to_key(test_ja, key, key_len_split(jakey));
+		ja_node = cds_ja_lookup_lower_equal(test_ja, key_len_split(jakey), result_key, NULL);
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup lower equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key) != ka[i]) {
+		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key, 0) != ka[i]) {
 			fprintf(stderr, "Error lookup lower equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key));
+				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key, 0));
 			assert(0);
 		}
 
-		ja_node = cds_ja_lookup_greater_equal(test_ja, jakey, result_key);
+		ja_node = cds_ja_lookup_greater_equal(test_ja, key_len_split(jakey), result_key, NULL);
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup greater equal. Cannot find expected key %" PRIu64" greater or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ja_node, struct ja_test_node, node);
-		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key) != ka[i]) {
+		if (node->key != ka[i] || cds_ja_key_to_u64(test_ja, result_key, 0) != ka[i]) {
 			fprintf(stderr, "Error lookup greater equal. Expecting key %" PRIu64 " greater or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key));
+				ka[i], key, node->key, cds_ja_key_to_u64(test_ja, result_key, 0));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -701,8 +703,8 @@ int test_sparse_key(unsigned int len, int nr_dup)
 
 			ja_test_node_init(node, key);
 			rcu_read_lock();
-			cds_ja_u64_to_key(test_ja, key, jakey);
-			ret = cds_ja_add(test_ja, jakey, &node->node);
+			cds_ja_u64_to_key(test_ja, key, jakey, 0);
+			ret = cds_ja_add(test_ja, jakey, 0, &node->node);
 			rcu_read_unlock();
 			if (ret) {
 				fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
@@ -722,8 +724,8 @@ int test_sparse_key(unsigned int len, int nr_dup)
 		int count = 0;
 
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, jakey, 0);
+		ja_node = cds_ja_lookup(test_ja, jakey, 0);
 		if (!ja_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 "\n", key);
 			assert(0);
@@ -746,8 +748,8 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			uint8_t jakey[8];
 
 			rcu_read_lock();
-			cds_ja_u64_to_key(test_ja, key + 42, jakey);
-			ja_node = cds_ja_lookup(test_ja, jakey);
+			cds_ja_u64_to_key(test_ja, key + 42, jakey, 0);
+			ja_node = cds_ja_lookup(test_ja, jakey, 0);
 			if (ja_node) {
 				fprintf(stderr,
 					"Error unexpected lookup node %" PRIu64 "\n",
@@ -767,8 +769,8 @@ int test_sparse_key(unsigned int len, int nr_dup)
 		int count = 0;
 
 		rcu_read_lock();
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, jakey, 0);
+		ja_node = cds_ja_lookup(test_ja, jakey, 0);
 
 		cds_ja_for_each_duplicate_rcu(ja_node) {
 			struct cds_ja_node *test_ja_node;
@@ -777,19 +779,19 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			count++;
 			node = caa_container_of(ja_node,
 				struct ja_test_node, node);
-			ret = cds_ja_del(test_ja, jakey, &node->node);
+			ret = cds_ja_del(test_ja, jakey, 0, &node->node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
 				assert(0);
 			}
 			rcu_free_test_node(node);
-			test_ja_node = cds_ja_lookup(test_ja, jakey);
+			test_ja_node = cds_ja_lookup(test_ja, jakey, 0);
 			if (count < nr_dup && !test_ja_node) {
 				fprintf(stderr, "Error: no node found after deletion of some nodes of a key\n");
 				assert(0);
 			}
 		}
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		ja_node = cds_ja_lookup(test_ja, jakey, 0);
 		if (ja_node) {
 			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ja_node);
 			assert(0);
@@ -908,8 +910,8 @@ void *test_ja_rw_thr_reader(void *_count)
 		/* note: only looking up ulong keys */
 		key = ((unsigned long) rand_r(&URCU_TLS(rand_lookup)) % lookup_pool_size) + lookup_pool_offset;
 		key *= key_mul;
-		cds_ja_u64_to_key(test_ja, key, jakey);
-		ja_node = cds_ja_lookup(test_ja, jakey);
+		cds_ja_u64_to_key(test_ja, key, jakey, 0);
+		ja_node = cds_ja_lookup(test_ja, jakey, 0);
 		if (!ja_node) {
 			if (validate_lookup) {
 				printf("[ERROR] Lookup cannot find initial node.\n");
@@ -978,12 +980,12 @@ void *test_ja_rw_thr_writer(void *_count)
 			/* note: only inserting ulong keys */
 			key = ((unsigned long) rand_r(&URCU_TLS(rand_lookup)) % write_pool_size) + write_pool_offset;
 			key *= key_mul;
-			cds_ja_u64_to_key(test_ja, key, jakey);
+			cds_ja_u64_to_key(test_ja, key, jakey, 0);
 			ja_test_node_init(node, key);
 			rcu_read_lock();
 			if (add_unique) {
 				mutex_lock_mt();
-				ret_node = cds_ja_add_unique(test_ja, jakey, &node->node);
+				ret_node = cds_ja_add_unique(test_ja, jakey, 0, &node->node);
 				mutex_unlock_mt();
 				if (ret_node != &node->node) {
 					free_test_node(node);
@@ -995,7 +997,7 @@ void *test_ja_rw_thr_writer(void *_count)
 				assert(0);	/* not implemented yet. */
 			} else {
 				mutex_lock_mt();
-				ret = cds_ja_add(test_ja, jakey, &node->node);
+				ret = cds_ja_add(test_ja, jakey, 0, &node->node);
 				mutex_unlock_mt();
 				if (ret) {
 					fprintf(stderr, "Error in cds_ja_add: %d\n", ret);
@@ -1014,17 +1016,17 @@ void *test_ja_rw_thr_writer(void *_count)
 			/* note: only deleting ulong keys */
 			key = ((unsigned long) rand_r(&URCU_TLS(rand_lookup)) % write_pool_size) + write_pool_offset;
 			key *= key_mul;
-			cds_ja_u64_to_key(test_ja, key, jakey);
+			cds_ja_u64_to_key(test_ja, key, jakey, 0);
 
 			rcu_read_lock();
 
-			ja_node = cds_ja_lookup(test_ja, jakey);
+			ja_node = cds_ja_lookup(test_ja, jakey, 0);
 			/* Remove first entry */
 			if (ja_node) {
 				node = caa_container_of(ja_node,
 					struct ja_test_node, node);
 				mutex_lock_mt();
-				ret = cds_ja_del(test_ja, jakey, &node->node);
+				ret = cds_ja_del(test_ja, jakey, 0, &node->node);
 				mutex_unlock_mt();
 				if (!ret) {
 					rcu_free_test_node(node);
@@ -1081,10 +1083,10 @@ int do_mt_populate_ja(void)
 		/* note: only inserting ulong keys */
 		key = (unsigned long) iter;
 		key *= key_mul;
-		cds_ja_u64_to_key(test_ja, key, jakey);
+		cds_ja_u64_to_key(test_ja, key, jakey, 0);
 		ja_test_node_init(node, key);
 		rcu_read_lock();
-		ret = cds_ja_add(test_ja, jakey, &node->node);
+		ret = cds_ja_add(test_ja, jakey, 0, &node->node);
 		URCU_TLS(nr_add)++;
 		URCU_TLS(nr_writes)++;
 		rcu_read_unlock();
