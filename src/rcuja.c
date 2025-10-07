@@ -392,6 +392,7 @@ struct cds_ja_inode *_ja_node_mask_ptr(struct cds_ja_inode_flag *node)
 	return (struct cds_ja_inode *) (((unsigned long) node) & JA_PTR_MASK);
 }
 
+static
 unsigned long ja_node_type(struct cds_ja_inode_flag *node)
 {
 	unsigned long type;
