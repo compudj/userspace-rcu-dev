@@ -328,15 +328,31 @@ void ja_node_pool_2d_index(struct cds_ja_inode_flag *node, unsigned int *index)
 	*index = ((unsigned long) node & JA_POOL_2D_MASK) >> JA_TYPE_BITS;
 }
 
-uint64_t cds_ja_key_to_u64(const struct cds_ja *ja, const uint8_t *key)
+static
+size_t ja_key_len(const struct cds_ja *ja, size_t key_len)
 {
-	size_t key_len = ja->key_len;
+	if (!ja->key_len) {
+		/* Variable length Judy Array are not implemented. */
+		return 0;
+	}
+	if (!key_len)
+		return ja->key_len;
+	/* Validate that explicit and implicit key lengths match. */
+	if (key_len != ja->key_len)
+		return 0;
+	return key_len;
+}
+
+uint64_t cds_ja_key_to_u64(const struct cds_ja *ja, const uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ja_key_len(ja, _key_len);
 	union {
 		uint64_t v64;
 		uint8_t array[8];
 	} u;
 
-	assert(key_len <= 8);
+	assert(key_len > 0 && key_len <= 8);
 	u.v64 = 0;
 	/* Copy len LSB. */
 	memcpy(u.array + sizeof(u.array) - key_len , key, key_len);
@@ -344,30 +360,32 @@ uint64_t cds_ja_key_to_u64(const struct cds_ja *ja, const uint8_t *key)
 	return be64toh(u.v64);
 }
 
-void cds_ja_u64_to_key(const struct cds_ja *ja, uint64_t v, uint8_t *key)
+void cds_ja_u64_to_key(const struct cds_ja *ja, uint64_t v, uint8_t *key,
+		size_t _key_len)
 {
-	size_t key_len = ja->key_len;
+	size_t key_len = ja_key_len(ja, _key_len);
 	union {
 		uint64_t v64;
 		uint8_t array[8];
 	} u;
 
-	assert(key_len <= 8);
+	assert(key_len > 0 && key_len <= 8);
 	/* Host endianness to big endian. */
 	u.v64 = htobe64(v);
 	/* Copy len LSB. */
 	memcpy(key, u.array + sizeof(u.array) - key_len , key_len);
 }
 
-uint32_t cds_ja_key_to_u32(const struct cds_ja *ja, const uint8_t *key)
+uint32_t cds_ja_key_to_u32(const struct cds_ja *ja, const uint8_t *key,
+		size_t _key_len)
 {
-	size_t key_len = ja->key_len;
+	size_t key_len = ja_key_len(ja, _key_len);
 	union {
 		uint32_t v32;
 		uint8_t array[4];
 	} u;
 
-	assert(key_len <= 4);
+	assert(key_len > 0 && key_len <= 4);
 	u.v32 = 0;
 	/* Copy len LSB. */
 	memcpy(u.array + sizeof(u.array) - key_len , key, key_len);
@@ -375,15 +393,16 @@ uint32_t cds_ja_key_to_u32(const struct cds_ja *ja, const uint8_t *key)
 	return be32toh(u.v32);
 }
 
-void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key)
+void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key,
+		size_t _key_len)
 {
-	size_t key_len = ja->key_len;
+	size_t key_len = ja_key_len(ja, _key_len);
 	union {
 		uint32_t v32;
 		uint8_t array[4];
 	} u;
 
-	assert(key_len <= 4);
+	assert(key_len > 0 && key_len <= 4);
 	/* Host endianness to big endian. */
 	u.v32 = htobe32(v);
 	/* Copy len LSB. */
@@ -1879,11 +1898,15 @@ int ja_node_clear_ptr(struct cds_ja *ja,
 	return ret;
 }
 
-struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key)
+struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key,
+			size_t _key_len)
 {
 	unsigned int tree_depth, i;
 	struct cds_ja_inode_flag *node_flag;
+	size_t key_len = ja_key_len(ja, _key_len);
 
+	if (!key_len)
+		return NULL;
 	tree_depth = ja->tree_depth;
 	node_flag = rcu_dereference(ja->root);
 
@@ -1907,14 +1930,20 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key)
 }
 
 static
-struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, const uint8_t *key,
-		uint8_t *result_key, enum ja_lookup_inequality mode)
+struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
+		const uint8_t *key, size_t _key_len,
+		uint8_t *result_key, size_t *result_key_len,
+		enum ja_lookup_inequality mode)
 {
 	int tree_depth, level;
 	struct cds_ja_inode_flag *node_flag, *cur_node_depth[JA_MAX_DEPTH];
 	uint8_t cur_key[JA_MAX_DEPTH];
 	enum ja_direction dir;
 	const uint8_t *iter_key = key;
+	size_t key_len = ja_key_len(ja, _key_len);
+
+	if (!key_len)
+		return NULL;
 
 	switch (mode) {
 	case JA_LOOKUP_GE:
@@ -1956,6 +1985,8 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, const uint8_t *k
 			/* Last level lookup succeded. We got an equal match. */
 			if (result_key)
 				memcpy(result_key, key, ja->key_len);
+			if (result_key_len)
+				*result_key_len = ja->key_len;
 			return (struct cds_ja_node *) node_flag;
 		}
 		break;
@@ -2046,35 +2077,46 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja, const uint8_t *k
 		for (level = 1; level < tree_depth; level++)
 			*(result_key++) = cur_key[level - 1];
 	}
+	if (result_key_len)
+		*result_key_len = ja->key_len;
 	return (struct cds_ja_node *) node_flag;
 }
 
 struct cds_ja_node *cds_ja_lookup_lower_equal(struct cds_ja *ja,
-		const uint8_t *key, uint8_t *result_key)
+		const uint8_t *key, size_t key_len,
+		uint8_t *result_key, size_t *result_key_len)
+
 {
 	dbg_printf("cds_ja_lookup_lower_equal\n");
-	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_LE);
+	return cds_ja_lookup_inequality(ja, key, key_len,
+			result_key, result_key_len, JA_LOOKUP_LE);
 }
 
 struct cds_ja_node *cds_ja_lookup_greater_equal(struct cds_ja *ja,
-		const uint8_t *key, uint8_t *result_key)
+		const uint8_t *key, size_t key_len,
+		uint8_t *result_key, size_t *result_key_len)
 {
 	dbg_printf("cds_ja_lookup_greater_equal\n");
-	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_GE);
+	return cds_ja_lookup_inequality(ja, key, key_len,
+		result_key, result_key_len, JA_LOOKUP_GE);
 }
 
 struct cds_ja_node *cds_ja_lookup_lower_than(struct cds_ja *ja,
-		const uint8_t *key, uint8_t *result_key)
+		const uint8_t *key, size_t key_len,
+		uint8_t *result_key, size_t *result_key_len)
 {
 	dbg_printf("cds_ja_lookup_lower_than\n");
-	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_LT);
+	return cds_ja_lookup_inequality(ja, key, key_len,
+		result_key, result_key_len, JA_LOOKUP_LT);
 }
 
 struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
-		const uint8_t *key, uint8_t *result_key)
+		const uint8_t *key, size_t key_len,
+		uint8_t *result_key, size_t *result_key_len)
 {
 	dbg_printf("cds_ja_lookup_greater_than\n");
-	return cds_ja_lookup_inequality(ja, key, result_key, JA_LOOKUP_GT);
+	return cds_ja_lookup_inequality(ja, key, key_len,
+		result_key, result_key_len, JA_LOOKUP_GT);
 }
 
 /*
@@ -2190,7 +2232,8 @@ void ja_chain_node(struct cds_ja_node *last_node, struct cds_ja_node *node)
 }
 
 static
-int _cds_ja_add(struct cds_ja *ja, const uint8_t *key,
+int _cds_ja_add(struct cds_ja *ja,
+		const uint8_t *key, size_t _key_len,
 		struct cds_ja_node *node,
 		struct cds_ja_node **unique_node_ret)
 {
@@ -2200,7 +2243,11 @@ int _cds_ja_add(struct cds_ja *ja, const uint8_t *key,
 	struct cds_ja_inode_flag **attach_node_flag_ptr,
 		**parent_node_flag_ptr, **node_flag_ptr;
 	const uint8_t *iter_key = key;
+	size_t key_len = ja_key_len(ja, _key_len);
 	int ret;
+
+	if (!key_len)
+		return -EINVAL;
 
 	tree_depth = ja->tree_depth;
 
@@ -2266,19 +2313,19 @@ retry:
 	return ret;
 }
 
-int cds_ja_add(struct cds_ja *ja, const uint8_t *key,
+int cds_ja_add(struct cds_ja *ja, const uint8_t *key, size_t key_len,
 		struct cds_ja_node *node)
 {
-	return _cds_ja_add(ja, key, node, NULL);
+	return _cds_ja_add(ja, key, key_len, node, NULL);
 }
 
 struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
-		struct cds_ja_node *node)
+		size_t key_len, struct cds_ja_node *node)
 {
 	int ret;
 	struct cds_ja_node *ret_node;
 
-	ret = _cds_ja_add(ja, key, node, &ret_node);
+	ret = _cds_ja_add(ja, key, key_len, node, &ret_node);
 	if (ret == -EEXIST)
 		return ret_node;
 	else
@@ -2398,7 +2445,7 @@ void ja_unchain_node(struct cds_ja_node **prev_node_ptr,
 /*
  * Called with RCU read lock held.
  */
-int cds_ja_del(struct cds_ja *ja, const uint8_t *key,
+int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t _key_len,
 		struct cds_ja_node *node)
 {
 	unsigned int tree_depth, i;
@@ -2411,6 +2458,10 @@ int cds_ja_del(struct cds_ja *ja, const uint8_t *key,
 	struct cds_ja_node *iter_node, **iter_node_ptr, **prev_node_ptr, *match;
 	int nr_snapshot, ret, count = 0;
 	const uint8_t *iter_key = key;
+	size_t key_len = ja_key_len(ja, _key_len);
+
+	if (!key_len)
+		return -EINVAL;
 
 	tree_depth = ja->tree_depth;
 
