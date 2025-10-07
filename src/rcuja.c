@@ -256,6 +256,19 @@ enum ja_direction {
 	JA_RIGHTMOST,
 };
 
+static
+unsigned long ja_node_pool_1d_bitsel(struct cds_ja_inode_flag *node)
+{
+	return ((unsigned long) node & JA_POOL_1D_MASK) >> JA_TYPE_BITS;
+}
+
+static
+void ja_node_pool_2d_bitsel(struct cds_ja_inode_flag *node, unsigned long *bits)
+{
+	bits[0] = ((unsigned long) node & JA_POOL_2D_MASK) >> (JA_TYPE_BITS + JA_LOG2_BITS_PER_BYTE);
+	bits[1] = ((unsigned long) node & JA_POOL_1D_MASK) >> JA_TYPE_BITS;
+}
+
 uint64_t cds_ja_key_to_u64(const struct cds_ja *ja, const uint8_t *key)
 {
 	size_t key_len = ja->key_len;
