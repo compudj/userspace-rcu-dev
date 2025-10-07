@@ -256,6 +256,40 @@ enum ja_direction {
 	JA_RIGHTMOST,
 };
 
+#define BITMASK_2(a, b)		(1U << (a) | 1U << (b))
+
+/* Combination table C(n=8,r=2) */
+static
+const uint8_t C_n8_r2[] = {
+	BITMASK_2(0, 1), BITMASK_2(0, 2), BITMASK_2(0, 3), BITMASK_2(0, 4), BITMASK_2(0, 5), BITMASK_2(0, 6), BITMASK_2(0, 7),
+	BITMASK_2(1, 2), BITMASK_2(1, 3), BITMASK_2(1, 4), BITMASK_2(1, 5), BITMASK_2(1, 6), BITMASK_2(1, 7),
+	BITMASK_2(2, 3), BITMASK_2(2, 4), BITMASK_2(2, 5), BITMASK_2(2, 6), BITMASK_2(2, 7),
+	BITMASK_2(3, 4), BITMASK_2(3, 5), BITMASK_2(3, 6), BITMASK_2(3, 7),
+	BITMASK_2(4, 5), BITMASK_2(4, 6), BITMASK_2(4, 7),
+	BITMASK_2(5, 6), BITMASK_2(5, 7),
+	BITMASK_2(6, 7)
+};
+
+/* return an index within the combination table C(n=8,r) associated to mask. */
+static inline
+unsigned int mask_to_index_C_n8_r2(uint8_t mask)
+{
+	unsigned int i;
+
+	assert(__builtin_popcount(mask) == 2);
+	for (i = 0; i < CAA_ARRAY_SIZE(C_n8_r2); i++)
+		if (C_n8_r2[i] == mask)
+			return i;
+	abort();
+}
+
+static inline
+uint8_t index_to_mask_C_n8_r2(unsigned int index)
+{
+	assert(index < CAA_ARRAY_SIZE(C_n8_r2));
+	return C_n8_r2[index];
+}
+
 static
 unsigned long ja_node_pool_1d_bitsel(struct cds_ja_inode_flag *node)
 {
