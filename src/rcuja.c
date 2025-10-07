@@ -15,6 +15,7 @@
 #include <string.h>
 #include <assert.h>
 #include <endian.h>
+#include <stdbool.h>
 #include <urcu/rcuja.h>
 #include <urcu/compiler.h>
 #include <urcu/arch.h>
@@ -425,6 +426,12 @@ unsigned long ja_node_type(struct cds_ja_inode_flag *node)
 	type = (unsigned int) (((unsigned long) node & JA_TYPE_MASK) >> JA_INTERNAL_BITS);
 	assert(type < (1UL << JA_TYPE_BITS));
 	return type;
+}
+
+static
+bool ja_node_internal(struct cds_ja_inode_flag *node)
+{
+	return (unsigned long) node & JA_INTERNAL_MASK;
 }
 
 static
@@ -1922,6 +1929,7 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key,
 				(unsigned int) iter_key, node_flag);
 		if (!ja_node_ptr(node_flag))
 			return NULL;
+		assert(i == tree_depth - 1 || ja_node_internal(node_flag));
 	}
 
 	/* Last level lookup succeded. We got an actual match. */
@@ -1975,6 +1983,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		cur_node_depth[level] = node_flag;
 		dbg_printf("cds_ja_lookup_inequality iter key lookup %u finds node_flag %p\n",
 				(unsigned int) key_value, node_flag);
+		assert(level == tree_depth - 1 || ja_node_internal(node_flag));
 	}
 
 	switch (mode) {
@@ -2068,6 +2077,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 				node_flag);
 		if (!ja_node_ptr(node_flag))
 			break;
+		assert(level == tree_depth - 1 || ja_node_internal(node_flag));
 	}
 
 	assert(level == tree_depth);
