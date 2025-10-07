@@ -26,6 +26,12 @@
 #define abs_int(a)	((int) (a) > 0 ? (int) (a) : -((int) (a)))
 #endif
 
+#define CDS_JA_DEFAULT_KEY_LEN		4
+
+struct cds_ja_attr {
+	size_t key_len;
+};
+
 enum cds_ja_type_class {
 	RCU_JA_LINEAR = 0,	/* Type A */
 			/* 32-bit: 1 to 25 children, 8 to 128 bytes */
@@ -2369,23 +2375,46 @@ retry:
 	return ret;
 }
 
-unsigned int cds_ja_key_len(const struct cds_ja *ja)
+size_t cds_ja_key_len(const struct cds_ja *ja)
 {
 	return ja->key_len;
 }
 
-struct cds_ja *_cds_ja_new(unsigned int key_len,
+struct cds_ja_attr *cds_ja_attr_create(void)
+{
+	struct cds_ja_attr *attr = calloc(1, sizeof(struct cds_ja_attr));
+
+	if (!attr)
+		return NULL;
+	attr->key_len = CDS_JA_DEFAULT_KEY_LEN;
+	return attr;
+}
+
+void cds_ja_attr_destroy(struct cds_ja_attr *attr)
+{
+	free(attr);
+}
+
+int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len)
+{
+	if (!key_len || key_len > 8)
+		return -EINVAL;
+	attr->key_len = key_len;
+	return 0;
+}
+
+struct cds_ja *_cds_ja_create(const struct cds_ja_attr *attr,
 		const struct rcu_flavor_struct *flavor)
 {
 	struct cds_ja *ja;
+	size_t key_len = CDS_JA_DEFAULT_KEY_LEN;
 
 	ja = calloc(sizeof(*ja), 1);
 	if (!ja)
-		goto ja_error;
+		return NULL;
 
-	if (!key_len || key_len > 8)
-		goto check_error;
-
+	if (attr)
+		key_len = attr->key_len;
 	/* ja->root is NULL */
 	/* tree_depth 0 is for pointer to root node */
 	ja->key_len = key_len;
@@ -2393,11 +2422,6 @@ struct cds_ja *_cds_ja_new(unsigned int key_len,
 	assert(ja->tree_depth <= JA_MAX_DEPTH);
 	ja->flavor = flavor;
 	return ja;
-
-check_error:
-	free(ja);
-ja_error:
-	return NULL;
 }
 
 static
