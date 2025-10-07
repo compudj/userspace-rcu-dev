@@ -117,19 +117,6 @@ struct cds_ja_inode_flag *ja_node_flag_pool_2d(struct cds_ja_inode *node,
 	return (struct cds_ja_inode_flag *) (((unsigned long) node) | (bitsel[0] << (JA_TYPE_BITS + JA_LOG2_BITS_PER_BYTE)) | (bitsel[1] << JA_TYPE_BITS) | type);
 }
 
-static inline
-unsigned long ja_node_pool_1d_bitsel(struct cds_ja_inode_flag *node)
-{
-	return ((unsigned long) node & JA_POOL_1D_MASK) >> JA_TYPE_BITS;
-}
-
-static inline
-void ja_node_pool_2d_bitsel(struct cds_ja_inode_flag *node, unsigned long *bits)
-{
-	bits[0] = ((unsigned long) node & JA_POOL_2D_MASK) >> (JA_TYPE_BITS + JA_LOG2_BITS_PER_BYTE);
-	bits[1] = ((unsigned long) node & JA_POOL_1D_MASK) >> JA_TYPE_BITS;
-}
-
 /* Hardcoded pool indexes for fast path */
 #define RCU_JA_POOL_IDX_5	5
 #define RCU_JA_POOL_IDX_6	6
