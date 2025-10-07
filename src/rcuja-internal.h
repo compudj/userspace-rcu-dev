@@ -163,9 +163,6 @@ struct cds_ja_inode *ja_node_ptr(struct cds_ja_inode_flag *node)
 }
 
 __attribute__((visibility("hidden")))
-unsigned long ja_node_type(struct cds_ja_inode_flag *node);
-
-__attribute__((visibility("hidden")))
 void cds_ja_free_all_arenas(struct cds_ja *ja);
 
 __attribute__((visibility("hidden")))
