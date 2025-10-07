@@ -19,7 +19,6 @@
 #include <urcu/rculfhash.h>
 #include <assert.h>
 
-
 /*
  * If the internal bit is set in a pointer, it points to an internal
  * Judy array node, else it points to a node outside of the Judy array.
