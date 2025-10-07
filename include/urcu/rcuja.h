@@ -22,6 +22,10 @@
 extern "C" {
 #endif
 
+/* Opaque types forward declarations. */
+struct cds_ja;
+struct cds_ja_attr;
+
 /*
  * Duplicate nodes with the same key are chained into a singly-linked
  * list. The last item of this list has a NULL next pointer.
@@ -29,10 +33,6 @@ extern "C" {
 struct cds_ja_node {
 	struct cds_ja_node *next;
 };
-
-struct cds_ja;
-
-struct cds_ja_attr;
 
 /*
  * cds_ja_node_init - initialize a judy array node
@@ -47,13 +47,14 @@ void cds_ja_node_init(struct cds_ja_node *node __attribute__((unused)))
 }
 
 /*
- * Note: big endian integers can alias byte array keys.
+ * The Judy array keys most significant byte is first, and least
+ * significant byte is last. This corresponds to a big endian integer.
  */
 
 /*
- * cds_ja_lookup - look up by key.
- * @ja: the Judy array.
- * @key: key to look up.
+ * cds_ja_lookup - Look up by key.
+ * @ja: The Judy array.
+ * @key: Key to look up.
  *
  * Returns the first node of a duplicate chain if a match is found, else
  * returns NULL.
@@ -63,10 +64,10 @@ void cds_ja_node_init(struct cds_ja_node *node __attribute__((unused)))
 struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key);
 
 /*
- * cds_ja_lookup_lower_equal - look up first node with key <= @key.
- * @ja: the Judy array.
- * @key: key to look up.
- * @result_key: key found.
+ * cds_ja_lookup_lower_equal - Look up first node with key <= @key.
+ * @ja: The Judy array.
+ * @key: Key to look up.
+ * @result_key: Key found.
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key lower or equal to @key, else returns NULL.
@@ -77,10 +78,10 @@ struct cds_ja_node *cds_ja_lookup_lower_equal(struct cds_ja *ja,
 		const uint8_t *key, uint8_t *result_key);
 
 /*
- * cds_ja_lookup_greater_equal - look up first node with key >= @key.
- * @ja: the Judy array.
- * @key: key to look up.
- * @result_key: key found.
+ * cds_ja_lookup_greater_equal - Look up first node with key >= @key.
+ * @ja: The Judy array.
+ * @key: Key to look up.
+ * @result_key: Key found.
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key greater or equal to @key, else returns NULL.
@@ -91,10 +92,10 @@ struct cds_ja_node *cds_ja_lookup_greater_equal(struct cds_ja *ja,
 		const uint8_t *key, uint8_t *result_key);
 
 /*
- * cds_ja_lookup_lower_than - look up first node with key < @key.
- * @ja: the Judy array.
- * @key: key to look up.
- * @result_key: key found.
+ * cds_ja_lookup_lower_than - Look up first node with key < @key.
+ * @ja: The Judy array.
+ * @key: Key to look up.
+ * @result_key: Key found.
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key lower than @key, else returns NULL.
@@ -105,10 +106,10 @@ struct cds_ja_node *cds_ja_lookup_lower_than(struct cds_ja *ja,
 		const uint8_t *key, uint8_t *result_key);
 
 /*
- * cds_ja_lookup_greater_than - look up first node with key > @key.
- * @ja: the Judy array.
- * @key: key to look up.
- * @result_key: key found.
+ * cds_ja_lookup_greater_than - Look up first node with key > @key.
+ * @ja: The Judy array.
+ * @key: Key to look up.
+ * @result_key: Key found.
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key greater than @key, else returns NULL.
@@ -120,9 +121,9 @@ struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
 
 /*
  * cds_ja_add - Add @node at @key, allowing duplicates.
- * @ja: the Judy array.
- * @key: key at which @node should be added.
- * @node: node to add.
+ * @ja: The Judy array.
+ * @key: Key at which @node should be added.
+ * @node: Node to add.
  *
  * Returns 0 on success, negative error value on error.
  * A RCU read-side lock should be held across call to this function.
@@ -134,9 +135,9 @@ int cds_ja_add(struct cds_ja *ja, const uint8_t *key,
 
 /*
  * cds_ja_add_unique - Add @node at @key, without duplicates.
- * @ja: the Judy array.
- * @key: key at which @node should be added.
- * @node: node to add.
+ * @ja: The Judy array.
+ * @key: Key at which @node should be added.
+ * @node: Node to add.
  *
  * Returns @node if successfully added, else returns the already
  * existing node (acts as a RCU lookup).
@@ -150,9 +151,9 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
 
 /*
  * cds_ja_del - Remove @node at @key.
- * @ja: the Judy array.
- * @key: key at which @node is expected.
- * @node: node to remove.
+ * @ja: The Judy array.
+ * @key: Key at which @node is expected.
+ * @node: Node to remove.
  *
  * Returns 0 on success, negative error value on error.
  * A RCU read-side lock should be held across call to this function.
@@ -167,9 +168,9 @@ struct cds_ja *_cds_ja_create(const struct cds_ja_attr *attr,
 
 /*
  * cds_ja_create - Create a Judy array.
- * @attr: Judy Array attributes.
+ * @attr: Judy array attributes.
  *
- * The @attr pointer is used to specify the Judy Array attributes. If
+ * The @attr pointer is used to specify the Judy array attributes. If
  * NULL, use default attribute values. The @attr can be destroyed
  * by the caller immediately after cds_ja_create() returns. The caller
  * keeps ownership of @attr. Default attributes select a 4 bytes key
@@ -185,7 +186,7 @@ struct cds_ja *cds_ja_create(const struct cds_ja_attr *attr)
 
 /*
  * cds_ja_destroy - Destroy a Judy array.
- * @ja: the Judy array.
+ * @ja: The Judy array.
  *
  * Returns 0 on success, negative error value on error.
  * There should be no more concurrent add, delete, nor look-up performed
@@ -196,55 +197,71 @@ struct cds_ja *cds_ja_create(const struct cds_ja_attr *attr)
 int cds_ja_destroy(struct cds_ja *ja);
 
 /*
- * cds_ja_key_len: Return the key length of a judy array.
+ * cds_ja_key_len - Return the key length of a Judy array.
+ * @ja: The Judy array.
  */
 size_t cds_ja_key_len(const struct cds_ja *ja);
 
 /*
- * cds_ja_attr_create: Create a Judy Array attribute structure.
+ * cds_ja_attr_create - Create a Judy array attribute structure.
  */
 struct cds_ja_attr *cds_ja_attr_create(void);
 
 /*
- * cds_ja_attr_destroy: Destroy a Judy Array attribute structure.
+ * cds_ja_attr_destroy - Destroy a Judy array attribute structure.
+ * @attr: Judy array attributes.
  */
 void cds_ja_attr_destroy(struct cds_ja_attr *attr);
 
 /*
- * cds_ja_attr_set_key_len: Set Judy Array key length attribute.
+ * cds_ja_attr_set_key_len - Set Judy array key length attribute.
+ * @attr: Judy array attributes.
+ * @key_len: Key length.
  */
 int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
 
 /*
- * cds_ja_key_to_u64: Convert a Judy Array key to an unsigned 64-bit integer.
+ * cds_ja_key_to_u64 - Convert a Judy array key to an unsigned 64-bit integer.
+ * @ja: The Judy array.
+ * @key: Key to convert from (input).
  *
- * This helper function expects a Judy Array with a fixed key length <= 8.
+ * This helper function expects a Judy array with a fixed key length <= 8.
  */
 uint64_t cds_ja_key_to_u64(const struct cds_ja *ja, const uint8_t *key);
 
 /*
- * cds_ja_u64_to_key: Convert an unsigned 64-bit integer to a Judy Array key.
+ * cds_ja_u64_to_key - Convert an unsigned 64-bit integer to a Judy array key.
+ * @ja: The Judy array.
+ * @v: Value to convert from.
+ * @key: Key to convert to. Should be at least as large as the Judy array key.
  *
- * This helper function expects a Judy Array with a fixed key length <= 8.
+ * This helper function expects a Judy array with a fixed key length <= 8.
+ * It truncates the most significant bits beyond the Judy array key range.
  */
 void cds_ja_u64_to_key(const struct cds_ja *ja, uint64_t v, uint8_t *key);
 
 /*
- * cds_ja_key_to_u32: Convert a Judy Array key to an unsigned 32-bit integer.
+ * cds_ja_key_to_u32 - Convert a Judy array key to an unsigned 32-bit integer.
+ * @ja: The Judy array.
+ * @key: Key to convert from (input).
  *
- * This helper function expects a Judy Array with a fixed key length <= 4.
+ * This helper function expects a Judy array with a fixed key length <= 4.
  */
 uint32_t cds_ja_key_to_u32(const struct cds_ja *ja, const uint8_t *key);
 
 /*
- * cds_ja_u32_to_key: Convert an unsigned 32-bit integer to a Judy Array key.
+ * cds_ja_u32_to_key - Convert an unsigned 32-bit integer to a Judy array key.
+ * @ja: The Judy array.
+ * @v: Value to convert from.
+ * @key: Key to convert to. Should be at least as large as the Judy array key.
  *
- * This helper function expects a Judy Array with a fixed key length <= 4.
+ * This helper function expects a Judy array with a fixed key length <= 4.
+ * It truncates the most significant bits beyond the Judy array key range.
  */
 void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key);
 
 /*
- * cds_ja_for_each_duplicate_rcu: Iterate through duplicates.
+ * cds_ja_for_each_duplicate_rcu - Iterate through duplicates.
  * @pos: struct cds_ja_node *, start of duplicate list and loop cursor.
  *
  * Iterate through duplicates returned by cds_ja_lookup*()
@@ -257,7 +274,7 @@ void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key);
 	for (; (pos) != NULL; (pos) = rcu_dereference((pos)->next))
 
 /*
- * cds_ja_for_each_duplicate_safe: Iterate through duplicates.
+ * cds_ja_for_each_duplicate_safe - Iterate through duplicates.
  * @pos: struct cds_ja_node *, start of duplicate list and loop cursor.
  * @p: struct cds_ja_node *, temporary pointer to next.
  *
