@@ -319,13 +319,13 @@ unsigned int value_and_bits_to_subclass_index(uint8_t value, const uint8_t *bits
 static
 unsigned long ja_node_pool_1d_bitsel(struct cds_ja_inode_flag *node)
 {
-	return ((unsigned long) node & JA_POOL_1D_MASK) >> JA_TYPE_BITS;
+	return ((unsigned long) node & JA_POOL_1D_MASK) >> (JA_TYPE_BITS + JA_INTERNAL_BITS);
 }
 
 static
 void ja_node_pool_2d_index(struct cds_ja_inode_flag *node, unsigned int *index)
 {
-	*index = ((unsigned long) node & JA_POOL_2D_MASK) >> JA_TYPE_BITS;
+	*index = ((unsigned long) node & JA_POOL_2D_MASK) >> (JA_TYPE_BITS + JA_INTERNAL_BITS);
 }
 
 static
@@ -423,7 +423,7 @@ unsigned long ja_node_type(struct cds_ja_inode_flag *node)
 	if (_ja_node_mask_ptr(node) == NULL) {
 		return NODE_INDEX_NULL;
 	}
-	type = (unsigned int) ((unsigned long) node & JA_TYPE_MASK);
+	type = (unsigned int) (((unsigned long) node & JA_TYPE_MASK) >> JA_INTERNAL_BITS);
 	assert(type < (1UL << JA_TYPE_BITS));
 	return type;
 }
