@@ -256,13 +256,25 @@ enum ja_direction {
 	JA_RIGHTMOST,
 };
 
-#define BITMASK_2(a, b)		(1U << (a) | 1U << (b))
+#define BITMASK_2(a, b)					\
+	{						\
+		.mask = (1U << (a) | 1U << (b)),	\
+		.bit = {				\
+			[0] = (a),			\
+			[1] = (b),			\
+		},					\
+	}
+
+struct combination_table {
+	uint8_t mask;
+	uint8_t bit[2];
+};
 
 /*
  * Combination table C(n=8,r=2) = 28.
  */
 static
-const uint8_t C_n8_r2[] = {
+const struct combination_table C_n8_r2[] = {
 	BITMASK_2(0, 1), BITMASK_2(0, 2), BITMASK_2(0, 3), BITMASK_2(0, 4), BITMASK_2(0, 5), BITMASK_2(0, 6), BITMASK_2(0, 7),
 	BITMASK_2(1, 2), BITMASK_2(1, 3), BITMASK_2(1, 4), BITMASK_2(1, 5), BITMASK_2(1, 6), BITMASK_2(1, 7),
 	BITMASK_2(2, 3), BITMASK_2(2, 4), BITMASK_2(2, 5), BITMASK_2(2, 6), BITMASK_2(2, 7),
@@ -280,36 +292,28 @@ unsigned int mask_to_index_C_n8_r2(uint8_t mask)
 
 	assert(__builtin_popcount(mask) == 2);
 	for (i = 0; i < CAA_ARRAY_SIZE(C_n8_r2); i++)
-		if (C_n8_r2[i] == mask)
+		if (C_n8_r2[i].mask == mask)
 			return i;
 	abort();
 }
 
 static inline
-uint8_t index_to_mask_C_n8_r2(unsigned int index)
+void index_to_bits_C_n8_r2(unsigned int index, uint8_t *bits)
 {
 	assert(index < CAA_ARRAY_SIZE(C_n8_r2));
-	return C_n8_r2[index];
+	bits[0] = C_n8_r2[index].bit[0];
+	bits[1] = C_n8_r2[index].bit[1];
 }
 
 /*
- * Keep only the "mask" bits from value, and move them to LSB to form a
- * subclass index.
+ * Keep only the requested 2 bits from value, and move them to LSB to
+ * form a subclass index.
  */
 static inline
-unsigned int value_and_mask_to_subclass_index(uint8_t value, uint8_t mask)
+unsigned int value_and_bits_to_subclass_index(uint8_t value, const uint8_t *bits)
 {
-	unsigned int subclass_index = 0;
-	int bit, bit_out = 0;
 
-	for (bit = 0; bit < 8; bit++) {
-		if (mask & (1U << bit)) {
-			if (value & (1U << bit))
-				subclass_index |= (1U << bit_out);
-			bit_out++;
-		}
-	}
-	return subclass_index;
+	return (((value >> bits[0]) & 0x1) << 1) | ((value >> bits[1]) & 0x1);
 }
 
 static
@@ -596,11 +600,11 @@ struct cds_ja_inode_flag *ja_pool_node_get_nth(const struct cds_ja_type *type,
 	case 2:
 	{
 		unsigned int C_n8_r2_index, subclass_index;
-		uint8_t mask;
+		uint8_t bits[2];
 
 		ja_node_pool_2d_index(node_flag, &C_n8_r2_index);
-		mask = index_to_mask_C_n8_r2(C_n8_r2_index);
-		subclass_index = value_and_mask_to_subclass_index(n, mask);
+		index_to_bits_C_n8_r2(C_n8_r2_index, bits);
+		subclass_index = value_and_bits_to_subclass_index(n, bits);
 		linear = (struct cds_ja_inode *) &node->u.data[subclass_index << type->pool_size_order];
 		break;
 	}
@@ -915,11 +919,11 @@ int ja_pool_node_set_nth(const struct cds_ja_type *type,
 	case 2:
 	{
 		unsigned int C_n8_r2_index, subclass_index;
-		uint8_t mask;
+		uint8_t bits[2];
 
 		ja_node_pool_2d_index(node_flag, &C_n8_r2_index);
-		mask = index_to_mask_C_n8_r2(C_n8_r2_index);
-		subclass_index = value_and_mask_to_subclass_index(n, mask);
+		index_to_bits_C_n8_r2(C_n8_r2_index, bits);
+		subclass_index = value_and_bits_to_subclass_index(n, bits);
 		linear = (struct cds_ja_inode *) &node->u.data[subclass_index << type->pool_size_order];
 		break;
 	}
@@ -1055,11 +1059,11 @@ int ja_pool_node_clear_ptr(const struct cds_ja_type *type,
 	case 2:
 	{
 		unsigned int C_n8_r2_index, subclass_index;
-		uint8_t mask;
+		uint8_t bits[2];
 
 		ja_node_pool_2d_index(node_flag, &C_n8_r2_index);
-		mask = index_to_mask_C_n8_r2(C_n8_r2_index);
-		subclass_index = value_and_mask_to_subclass_index(n, mask);
+		index_to_bits_C_n8_r2(C_n8_r2_index, bits);
+		subclass_index = value_and_bits_to_subclass_index(n, bits);
 		linear = (struct cds_ja_inode *) &node->u.data[subclass_index << type->pool_size_order];
 		break;
 	}
