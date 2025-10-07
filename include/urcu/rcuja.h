@@ -35,18 +35,6 @@ struct cds_ja_node {
 };
 
 /*
- * cds_ja_node_init - initialize a judy array node
- * @node: the node to initialize.
- *
- * This function is kept to be eventually used for debugging purposes
- * (detection of memory corruption).
- */
-static inline
-void cds_ja_node_init(struct cds_ja_node *node __attribute__((unused)))
-{
-}
-
-/*
  * The Judy array keys most significant byte is first, and least
  * significant byte is last. This corresponds to a big endian integer.
  */

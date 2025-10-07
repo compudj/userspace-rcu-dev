@@ -78,7 +78,6 @@ to_test_node(struct cds_ja_node *node)
 static inline
 void ja_test_node_init(struct ja_test_node *node, uint64_t key)
 {
-	cds_ja_node_init(&node->node);
 	node->key = key;
 }
 
