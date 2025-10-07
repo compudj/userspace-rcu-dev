@@ -32,6 +32,8 @@ struct cds_ja_node {
 
 struct cds_ja;
 
+struct cds_ja_attr;
+
 /*
  * cds_ja_node_init - initialize a judy array node
  * @node: the node to initialize.
@@ -160,19 +162,25 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
 int cds_ja_del(struct cds_ja *ja, const uint8_t *key,
 		struct cds_ja_node *node);
 
-struct cds_ja *_cds_ja_new(unsigned int key_len,
+struct cds_ja *_cds_ja_create(const struct cds_ja_attr *attr,
 		const struct rcu_flavor_struct *flavor);
 
 /*
- * cds_ja_new - Create a Judy array.
- * @key_len: Key length (in bytes).
+ * cds_ja_create - Create a Judy array.
+ * @attr: Judy Array attributes.
+ *
+ * The @attr pointer is used to specify the Judy Array attributes. If
+ * NULL, use default attribute values. The @attr can be destroyed
+ * by the caller immediately after cds_ja_create() returns. The caller
+ * keeps ownership of @attr. Default attributes select a 4 bytes key
+ * length.
  *
  * Returns non-NULL pointer on success, else NULL on error.
  */
 static inline
-struct cds_ja *cds_ja_new(unsigned int key_len)
+struct cds_ja *cds_ja_create(const struct cds_ja_attr *attr)
 {
-	return _cds_ja_new(key_len, &rcu_flavor);
+	return _cds_ja_create(attr, &rcu_flavor);
 }
 
 /*
@@ -187,7 +195,25 @@ struct cds_ja *cds_ja_new(unsigned int key_len)
  */
 int cds_ja_destroy(struct cds_ja *ja);
 
-unsigned int cds_ja_key_len(const struct cds_ja *ja);
+/*
+ * cds_ja_key_len: Return the key length of a judy array.
+ */
+size_t cds_ja_key_len(const struct cds_ja *ja);
+
+/*
+ * cds_ja_attr_create: Create a Judy Array attribute structure.
+ */
+struct cds_ja_attr *cds_ja_attr_create(void);
+
+/*
+ * cds_ja_attr_destroy: Destroy a Judy Array attribute structure.
+ */
+void cds_ja_attr_destroy(struct cds_ja_attr *attr);
+
+/*
+ * cds_ja_attr_set_key_len: Set Judy Array key length attribute.
+ */
+int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
 
 /*
  * cds_ja_for_each_duplicate_rcu: Iterate through duplicates.
