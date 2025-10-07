@@ -43,19 +43,26 @@ struct cds_ja_node {
  * cds_ja_lookup - Look up by key.
  * @ja: The Judy array.
  * @key: Key to look up.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
  *
  * Returns the first node of a duplicate chain if a match is found, else
  * returns NULL.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
-struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key);
+struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t key_len);
 
 /*
  * cds_ja_lookup_lower_equal - Look up first node with key <= @key.
  * @ja: The Judy array.
  * @key: Key to look up.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
  * @result_key: Key found.
+ * @result_key_len: Result key length.
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key lower or equal to @key, else returns NULL.
@@ -63,13 +70,18 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key);
  * use of its return value.
  */
 struct cds_ja_node *cds_ja_lookup_lower_equal(struct cds_ja *ja,
-		const uint8_t *key, uint8_t *result_key);
+		const uint8_t *key, size_t key_len,
+		uint8_t *result_key, size_t *result_key_len);
 
 /*
  * cds_ja_lookup_greater_equal - Look up first node with key >= @key.
  * @ja: The Judy array.
  * @key: Key to look up.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
  * @result_key: Key found.
+ * @result_key_len: Result key length.
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key greater or equal to @key, else returns NULL.
@@ -77,13 +89,18 @@ struct cds_ja_node *cds_ja_lookup_lower_equal(struct cds_ja *ja,
  * use of its return value.
  */
 struct cds_ja_node *cds_ja_lookup_greater_equal(struct cds_ja *ja,
-		const uint8_t *key, uint8_t *result_key);
+		const uint8_t *key, size_t key_len,
+		uint8_t *result_key, size_t *result_key_len);
 
 /*
  * cds_ja_lookup_lower_than - Look up first node with key < @key.
  * @ja: The Judy array.
  * @key: Key to look up.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
  * @result_key: Key found.
+ * @result_key_len: Result key length.
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key lower than @key, else returns NULL.
@@ -91,13 +108,18 @@ struct cds_ja_node *cds_ja_lookup_greater_equal(struct cds_ja *ja,
  * use of its return value.
  */
 struct cds_ja_node *cds_ja_lookup_lower_than(struct cds_ja *ja,
-		const uint8_t *key, uint8_t *result_key);
+		const uint8_t *key, size_t key_len,
+		uint8_t *result_key, size_t *result_key_len);
 
 /*
  * cds_ja_lookup_greater_than - Look up first node with key > @key.
  * @ja: The Judy array.
  * @key: Key to look up.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
  * @result_key: Key found.
+ * @result_key_len: Result key length.
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key greater than @key, else returns NULL.
@@ -105,12 +127,16 @@ struct cds_ja_node *cds_ja_lookup_lower_than(struct cds_ja *ja,
  * use of its return value.
  */
 struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
-		const uint8_t *key, uint8_t *result_key);
+		const uint8_t *key, size_t key_len,
+		uint8_t *result_key, size_t *result_key_len);
 
 /*
  * cds_ja_add - Add @node at @key, allowing duplicates.
  * @ja: The Judy array.
  * @key: Key at which @node should be added.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
  * @node: Node to add.
  *
  * Returns 0 on success, negative error value on error.
@@ -118,13 +144,16 @@ struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
  */
-int cds_ja_add(struct cds_ja *ja, const uint8_t *key,
+int cds_ja_add(struct cds_ja *ja, const uint8_t *key, size_t key_len,
 		struct cds_ja_node *node);
 
 /*
  * cds_ja_add_unique - Add @node at @key, without duplicates.
  * @ja: The Judy array.
  * @key: Key at which @node should be added.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
  * @node: Node to add.
  *
  * Returns @node if successfully added, else returns the already
@@ -135,12 +164,15 @@ int cds_ja_add(struct cds_ja *ja, const uint8_t *key,
  * responsibility.
  */
 struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
-		struct cds_ja_node *node);
+		size_t key_len, struct cds_ja_node *node);
 
 /*
  * cds_ja_del - Remove @node at @key.
  * @ja: The Judy array.
  * @key: Key at which @node is expected.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
  * @node: Node to remove.
  *
  * Returns 0 on success, negative error value on error.
@@ -148,7 +180,7 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
  */
-int cds_ja_del(struct cds_ja *ja, const uint8_t *key,
+int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t key_len,
 		struct cds_ja_node *node);
 
 struct cds_ja *_cds_ja_create(const struct cds_ja_attr *attr,
@@ -212,41 +244,53 @@ int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
  * cds_ja_key_to_u64 - Convert a Judy array key to an unsigned 64-bit integer.
  * @ja: The Judy array.
  * @key: Key to convert from (input).
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 implicitly uses the key length of the Judy array.
  *
  * This helper function expects a Judy array with a fixed key length <= 8.
  */
-uint64_t cds_ja_key_to_u64(const struct cds_ja *ja, const uint8_t *key);
+uint64_t cds_ja_key_to_u64(const struct cds_ja *ja, const uint8_t *key, size_t key_len);
 
 /*
  * cds_ja_u64_to_key - Convert an unsigned 64-bit integer to a Judy array key.
  * @ja: The Judy array.
  * @v: Value to convert from.
- * @key: Key to convert to. Should be at least as large as the Judy array key.
+ * @key: Key to convert to. Should provide enough space to store "key length" bytes.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 implicitly uses the key length of the Judy array.
  *
  * This helper function expects a Judy array with a fixed key length <= 8.
  * It truncates the most significant bits beyond the Judy array key range.
  */
-void cds_ja_u64_to_key(const struct cds_ja *ja, uint64_t v, uint8_t *key);
+void cds_ja_u64_to_key(const struct cds_ja *ja, uint64_t v, uint8_t *key, size_t key_len);
 
 /*
  * cds_ja_key_to_u32 - Convert a Judy array key to an unsigned 32-bit integer.
  * @ja: The Judy array.
  * @key: Key to convert from (input).
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 implicitly uses the key length of the Judy array.
  *
  * This helper function expects a Judy array with a fixed key length <= 4.
  */
-uint32_t cds_ja_key_to_u32(const struct cds_ja *ja, const uint8_t *key);
+uint32_t cds_ja_key_to_u32(const struct cds_ja *ja, const uint8_t *key, size_t key_len);
 
 /*
  * cds_ja_u32_to_key - Convert an unsigned 32-bit integer to a Judy array key.
  * @ja: The Judy array.
  * @v: Value to convert from.
  * @key: Key to convert to. Should be at least as large as the Judy array key.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 implicitly uses the key length of the Judy array.
  *
  * This helper function expects a Judy array with a fixed key length <= 4.
  * It truncates the most significant bits beyond the Judy array key range.
  */
-void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key);
+void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key, size_t key_len);
 
 /*
  * cds_ja_for_each_duplicate_rcu - Iterate through duplicates.
