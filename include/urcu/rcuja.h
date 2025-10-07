@@ -216,6 +216,34 @@ void cds_ja_attr_destroy(struct cds_ja_attr *attr);
 int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
 
 /*
+ * cds_ja_key_to_u64: Convert a Judy Array key to an unsigned 64-bit integer.
+ *
+ * This helper function expects a Judy Array with a fixed key length <= 8.
+ */
+uint64_t cds_ja_key_to_u64(const struct cds_ja *ja, const uint8_t *key);
+
+/*
+ * cds_ja_u64_to_key: Convert an unsigned 64-bit integer to a Judy Array key.
+ *
+ * This helper function expects a Judy Array with a fixed key length <= 8.
+ */
+void cds_ja_u64_to_key(const struct cds_ja *ja, uint64_t v, uint8_t *key);
+
+/*
+ * cds_ja_key_to_u32: Convert a Judy Array key to an unsigned 32-bit integer.
+ *
+ * This helper function expects a Judy Array with a fixed key length <= 4.
+ */
+uint32_t cds_ja_key_to_u32(const struct cds_ja *ja, const uint8_t *key);
+
+/*
+ * cds_ja_u32_to_key: Convert an unsigned 32-bit integer to a Judy Array key.
+ *
+ * This helper function expects a Judy Array with a fixed key length <= 4.
+ */
+void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key);
+
+/*
  * cds_ja_for_each_duplicate_rcu: Iterate through duplicates.
  * @pos: struct cds_ja_node *, start of duplicate list and loop cursor.
  *
