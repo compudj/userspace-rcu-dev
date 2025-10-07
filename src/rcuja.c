@@ -257,7 +257,9 @@ enum ja_direction {
 
 #define BITMASK_2(a, b)		(1U << (a) | 1U << (b))
 
-/* Combination table C(n=8,r=2) */
+/*
+ * Combination table C(n=8,r=2) = 28.
+ */
 static
 const uint8_t C_n8_r2[] = {
 	BITMASK_2(0, 1), BITMASK_2(0, 2), BITMASK_2(0, 3), BITMASK_2(0, 4), BITMASK_2(0, 5), BITMASK_2(0, 6), BITMASK_2(0, 7),
@@ -289,6 +291,26 @@ uint8_t index_to_mask_C_n8_r2(unsigned int index)
 	return C_n8_r2[index];
 }
 
+/*
+ * Keep only the "mask" bits from value, and move them to LSB to form a
+ * subclass index.
+ */
+static inline
+unsigned int value_and_mask_to_subclass_index(uint8_t value, uint8_t mask)
+{
+	unsigned int subclass_index = 0;
+	int bit, bit_out = 0;
+
+	for (bit = 0; bit < 8; bit++) {
+		if (mask & (1U << bit)) {
+			if (value & (1U << bit))
+				subclass_index |= (1U << bit_out);
+			bit_out++;
+		}
+	}
+	return subclass_index;
+}
+
 static
 unsigned long ja_node_pool_1d_bitsel(struct cds_ja_inode_flag *node)
 {
@@ -296,10 +318,9 @@ unsigned long ja_node_pool_1d_bitsel(struct cds_ja_inode_flag *node)
 }
 
 static
-void ja_node_pool_2d_bitsel(struct cds_ja_inode_flag *node, unsigned long *bits)
+void ja_node_pool_2d_index(struct cds_ja_inode_flag *node, unsigned int *index)
 {
-	bits[0] = ((unsigned long) node & JA_POOL_2D_MASK) >> (JA_TYPE_BITS + JA_LOG2_BITS_PER_BYTE);
-	bits[1] = ((unsigned long) node & JA_POOL_1D_MASK) >> JA_TYPE_BITS;
+	*index = ((unsigned long) node & JA_POOL_2D_MASK) >> JA_TYPE_BITS;
 }
 
 uint64_t cds_ja_key_to_u64(const struct cds_ja *ja, const uint8_t *key)
@@ -572,16 +593,13 @@ struct cds_ja_inode_flag *ja_pool_node_get_nth(const struct cds_ja_type *type,
 	}
 	case 2:
 	{
-		unsigned long bitsel[2], index[2], rindex;
+		unsigned int C_n8_r2_index, subclass_index;
+		uint8_t mask;
 
-		ja_node_pool_2d_bitsel(node_flag, bitsel);
-		assert(bitsel[0] < CHAR_BIT);
-		assert(bitsel[1] < CHAR_BIT);
-		index[0] = ((unsigned long) n >> bitsel[0]) & 0x1;
-		index[0] <<= 1;
-		index[1] = ((unsigned long) n >> bitsel[1]) & 0x1;
-		rindex = index[0] | index[1];
-		linear = (struct cds_ja_inode *) &node->u.data[rindex << type->pool_size_order];
+		ja_node_pool_2d_index(node_flag, &C_n8_r2_index);
+		mask = index_to_mask_C_n8_r2(C_n8_r2_index);
+		subclass_index = value_and_mask_to_subclass_index(n, mask);
+		linear = (struct cds_ja_inode *) &node->u.data[subclass_index << type->pool_size_order];
 		break;
 	}
 	default:
@@ -894,16 +912,13 @@ int ja_pool_node_set_nth(const struct cds_ja_type *type,
 	}
 	case 2:
 	{
-		unsigned long bitsel[2], index[2], rindex;
+		unsigned int C_n8_r2_index, subclass_index;
+		uint8_t mask;
 
-		ja_node_pool_2d_bitsel(node_flag, bitsel);
-		assert(bitsel[0] < CHAR_BIT);
-		assert(bitsel[1] < CHAR_BIT);
-		index[0] = ((unsigned long) n >> bitsel[0]) & 0x1;
-		index[0] <<= 1;
-		index[1] = ((unsigned long) n >> bitsel[1]) & 0x1;
-		rindex = index[0] | index[1];
-		linear = (struct cds_ja_inode *) &node->u.data[rindex << type->pool_size_order];
+		ja_node_pool_2d_index(node_flag, &C_n8_r2_index);
+		mask = index_to_mask_C_n8_r2(C_n8_r2_index);
+		subclass_index = value_and_mask_to_subclass_index(n, mask);
+		linear = (struct cds_ja_inode *) &node->u.data[subclass_index << type->pool_size_order];
 		break;
 	}
 	default:
@@ -1037,16 +1052,13 @@ int ja_pool_node_clear_ptr(const struct cds_ja_type *type,
 	}
 	case 2:
 	{
-		unsigned long bitsel[2], index[2], rindex;
+		unsigned int C_n8_r2_index, subclass_index;
+		uint8_t mask;
 
-		ja_node_pool_2d_bitsel(node_flag, bitsel);
-		assert(bitsel[0] < CHAR_BIT);
-		assert(bitsel[1] < CHAR_BIT);
-		index[0] = ((unsigned long) n >> bitsel[0]) & 0x1;
-		index[0] <<= 1;
-		index[1] = ((unsigned long) n >> bitsel[1]) & 0x1;
-		rindex = index[0] | index[1];
-		linear = (struct cds_ja_inode *) &node->u.data[rindex << type->pool_size_order];
+		ja_node_pool_2d_index(node_flag, &C_n8_r2_index);
+		mask = index_to_mask_C_n8_r2(C_n8_r2_index);
+		subclass_index = value_and_mask_to_subclass_index(n, mask);
+		linear = (struct cds_ja_inode *) &node->u.data[subclass_index << type->pool_size_order];
 		break;
 	}
 	default:
@@ -1557,15 +1569,18 @@ retry:		/* for fallback */
 			case 2:
 			{
 				unsigned int node_distrib_bitsel[2];
+				unsigned int subclass_index;
+				uint8_t mask;
 
 				ja_node_sum_distribution_2d(mode,
 					old_type, old_node,
 					n, nullify_node_flag_ptr,
 					node_distrib_bitsel);
-				assert(!((unsigned long) new_node & JA_POOL_1D_MASK));
 				assert(!((unsigned long) new_node & JA_POOL_2D_MASK));
+				mask = (1U << node_distrib_bitsel[0]) | (1U << node_distrib_bitsel[1]);
+				subclass_index = mask_to_index_C_n8_r2(mask);
 				new_node_flag = ja_node_flag_pool_2d(new_node,
-					new_type_index, node_distrib_bitsel);
+					new_type_index, subclass_index);
 				break;
 			}
 			default:
