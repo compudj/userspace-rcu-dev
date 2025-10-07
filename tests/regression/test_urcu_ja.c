@@ -268,10 +268,18 @@ int test_1byte_key(void)
 	uint64_t ka[] = { 5, 17, 100, 222 };
 	uint64_t ka_test_offset = 5;
 	struct cds_ja_node *ja_node;
+	struct cds_ja_attr *attr;
 	uint8_t jakey[1];
 
+	attr = cds_ja_attr_create();
+	if (!attr)
+		abort();
+	if (cds_ja_attr_set_key_len(attr, 1))
+		abort();
+
 	/* Test with 1-byte key */
-	test_ja = cds_ja_new(1);
+	test_ja = cds_ja_create(attr);
+	cds_ja_attr_destroy(attr);
 	if (!test_ja) {
 		printf("Error allocating judy array.\n");
 		return -1;
@@ -471,10 +479,18 @@ int test_2bytes_key(void)
 	uint64_t key;
 	uint64_t ka[] = { 105, 206, 4000, 4111, 59990, 65435 };
 	uint64_t ka_test_offset = 100;
+	struct cds_ja_attr *attr;
 	uint8_t jakey[2];
 
+	attr = cds_ja_attr_create();
+	if (!attr)
+		abort();
+	if (cds_ja_attr_set_key_len(attr, 2))
+		abort();
+
 	/* Test with 2-bytes key */
-	test_ja = cds_ja_new(2);
+	test_ja = cds_ja_create(attr);
+	cds_ja_attr_destroy(attr);
 	if (!test_ja) {
 		printf("Error allocating judy array.\n");
 		return -1;
@@ -685,14 +701,22 @@ int test_sparse_key(unsigned int len, int nr_dup)
 	int zerocount, i, ret;
 	struct cds_ja_node *ja_node;
 	unsigned int bits = len * CHAR_BIT;
+	struct cds_ja_attr *attr;
 
 	if (len == 8)
 		max_key = UINT64_MAX;
 	else
 		max_key = (1ULL << bits) - 1;
 
+	attr = cds_ja_attr_create();
+	if (!attr)
+		abort();
+	if (cds_ja_attr_set_key_len(attr, len))
+		abort();
+
 	printf("Sparse key test begins for %u-byte keys\n", len);
-	test_ja = cds_ja_new(len);
+	test_ja = cds_ja_create(attr);
+	cds_ja_attr_destroy(attr);
 	if (!test_ja) {
 		printf("Error allocating judy array.\n");
 		return -1;
@@ -1119,14 +1143,22 @@ int do_mt_test(void)
 	unsigned long long tot_reads = 0, tot_writes = 0,
 		tot_add = 0, tot_add_exist = 0, tot_remove = 0;
 	unsigned int remain;
+	struct cds_ja_attr *attr;
 
 	tid_reader = malloc(sizeof(*tid_reader) * nr_readers);
 	tid_writer = malloc(sizeof(*tid_writer) * nr_writers);
 	count_reader = malloc(sizeof(*count_reader) * nr_readers);
 	count_writer = malloc(sizeof(*count_writer) * nr_writers);
 
+	attr = cds_ja_attr_create();
+	if (!attr)
+		abort();
+	if (cds_ja_attr_set_key_len(attr, key_len))
+		abort();
+
 	printf("Allocating Judy Array for %u-byte keys\n", key_len);
-	test_ja = cds_ja_new(key_len);
+	test_ja = cds_ja_create(attr);
+	cds_ja_attr_destroy(attr);
 	if (!test_ja) {
 		printf("Error allocating judy array.\n");
 		ret = -1;
