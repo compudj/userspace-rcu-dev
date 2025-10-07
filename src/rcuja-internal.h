@@ -19,21 +19,29 @@
 #include <assert.h>
 
 /*
- * Number of least significant pointer bits reserved to represent the
- * child type.
+ * If the internal bit is set in a pointer, it points to an internal
+ * Judy array node, else it points to a node outside of the Judy array.
+ * This can be used for variable length keys to identify the end of key.
+ */
+#define JA_INTERNAL_BITS	1
+#define JA_INTERNAL_MASK	(1U << 0)
+
+/*
+ * This if followed by a number of bits reserved to represent the child
+ * type.
  */
 #define JA_TYPE_BITS	3
 #define JA_TYPE_MAX_NR	(1UL << JA_TYPE_BITS)
-#define JA_TYPE_MASK	(JA_TYPE_MAX_NR - 1)
-#define JA_PTR_MASK	(~JA_TYPE_MASK)
+#define JA_TYPE_MASK	((JA_TYPE_MAX_NR - 1) << JA_INTERNAL_BITS)
+#define JA_PTR_MASK	(~(JA_TYPE_MASK | JA_INTERNAL_MASK))
 
 #define JA_ENTRY_PER_NODE	256
 #define JA_LOG2_BITS_PER_BYTE	3U
 #define JA_BITS_PER_BYTE	(1U << JA_LOG2_BITS_PER_BYTE)
 
-#define JA_POOL_1D_MASK	((JA_BITS_PER_BYTE - 1) << JA_TYPE_BITS)
+#define JA_POOL_1D_MASK	((JA_BITS_PER_BYTE - 1) << (JA_TYPE_BITS + JA_INTERNAL_BITS))
 /* 2D mask has C(n=8,r=2) = 28 possibilities (fits in 5 bits). */
-#define JA_POOL_2D_MASK	(((1U << 5) - 1) << JA_TYPE_BITS)
+#define JA_POOL_2D_MASK	(((1U << 5) - 1) << (JA_TYPE_BITS + JA_INTERNAL_BITS))
 
 #define JA_MAX_DEPTH	10	/* Maximum depth, including root and leafs */
 
@@ -96,7 +104,9 @@ struct cds_ja_inode_flag *ja_node_flag(struct cds_ja_inode *node,
 		unsigned long type)
 {
 	assert(type < (1UL << JA_TYPE_BITS));
-	return (struct cds_ja_inode_flag *) (((unsigned long) node) | type);
+	return (struct cds_ja_inode_flag *) (((unsigned long) node) |
+		(type << JA_INTERNAL_BITS) |
+		JA_INTERNAL_MASK);
 }
 
 static inline
@@ -105,7 +115,10 @@ struct cds_ja_inode_flag *ja_node_flag_pool_1d(struct cds_ja_inode *node,
 {
 	assert(type < (1UL << JA_TYPE_BITS));
 	assert(bitsel < JA_BITS_PER_BYTE);
-	return (struct cds_ja_inode_flag *) (((unsigned long) node) | (bitsel << JA_TYPE_BITS) | type);
+	return (struct cds_ja_inode_flag *) (((unsigned long) node) |
+		(bitsel << (JA_TYPE_BITS + JA_INTERNAL_BITS)) |
+		(type << JA_INTERNAL_BITS) |
+		JA_INTERNAL_MASK);
 }
 
 static inline
@@ -113,7 +126,10 @@ struct cds_ja_inode_flag *ja_node_flag_pool_2d(struct cds_ja_inode *node,
 		unsigned long type, unsigned int subclass_index)
 {
 	assert(type < (1UL << JA_TYPE_BITS));
-	return (struct cds_ja_inode_flag *) (((unsigned long) node) | (subclass_index << JA_TYPE_BITS) | type);
+	return (struct cds_ja_inode_flag *) (((unsigned long) node) |
+		(subclass_index << (JA_TYPE_BITS + JA_INTERNAL_BITS)) |
+		(type << JA_INTERNAL_BITS) |
+		JA_INTERNAL_MASK);
 }
 
 /* Hardcoded pool indexes for fast path */
@@ -127,14 +143,14 @@ struct cds_ja_inode *ja_node_ptr(struct cds_ja_inode_flag *node)
 	if (!node)
 		return NULL;	/* RCU_JA_NULL */
 	v = (unsigned long) node;
-	type_idx = v & JA_TYPE_MASK;
+	type_idx = (v & JA_TYPE_MASK) >> JA_INTERNAL_BITS;
 
 	switch (type_idx) {
 	case RCU_JA_POOL_IDX_5:
-		v &= ~(JA_POOL_1D_MASK | JA_TYPE_MASK);
+		v &= ~(JA_POOL_1D_MASK | JA_TYPE_MASK | JA_INTERNAL_MASK);
 		break;
 	case RCU_JA_POOL_IDX_6:
-		v &= ~(JA_POOL_2D_MASK | JA_TYPE_MASK);
+		v &= ~(JA_POOL_2D_MASK | JA_TYPE_MASK | JA_INTERNAL_MASK);
 		break;
 	default:
 		/* RCU_JA_LINEAR or RCU_JA_PIGEON */
