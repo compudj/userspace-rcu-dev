@@ -158,7 +158,7 @@ struct cds_ja_inode *ja_node_ptr(struct cds_ja_inode_flag *node)
 	if (!node)
 		return NULL;	/* RCU_JA_NULL */
 	v = (unsigned long) node;
-	type_idx = (v & JA_TYPE_MASK) >> JA_INTERNAL_PTR_TYPE_MASK;
+	type_idx = (v & JA_TYPE_MASK) >> JA_INTERNAL_PTR_TYPE_BITS;
 
 	switch (type_idx) {
 	case RCU_JA_POOL_IDX_5:
