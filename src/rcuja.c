@@ -320,13 +320,13 @@ unsigned int value_and_bits_to_subclass_index(uint8_t value, const uint8_t *bits
 static
 unsigned long ja_node_pool_1d_bitsel(struct cds_ja_inode_flag *node)
 {
-	return ((unsigned long) node & JA_POOL_1D_MASK) >> (JA_TYPE_BITS + JA_INTERNAL_BITS);
+	return ((unsigned long) node & JA_POOL_1D_MASK) >> (JA_TYPE_BITS + JA_INTERNAL_PTR_TYPE_BITS);
 }
 
 static
 void ja_node_pool_2d_index(struct cds_ja_inode_flag *node, unsigned int *index)
 {
-	*index = ((unsigned long) node & JA_POOL_2D_MASK) >> (JA_TYPE_BITS + JA_INTERNAL_BITS);
+	*index = ((unsigned long) node & JA_POOL_2D_MASK) >> (JA_TYPE_BITS + JA_INTERNAL_PTR_TYPE_BITS);
 }
 
 static
@@ -424,7 +424,7 @@ unsigned long ja_node_type(struct cds_ja_inode_flag *node)
 	if (_ja_node_mask_ptr(node) == NULL) {
 		return NODE_INDEX_NULL;
 	}
-	type = (unsigned int) (((unsigned long) node & JA_TYPE_MASK) >> JA_INTERNAL_BITS);
+	type = (unsigned int) (((unsigned long) node & JA_TYPE_MASK) >> JA_INTERNAL_PTR_TYPE_BITS);
 	assert(type < (1UL << JA_TYPE_BITS));
 	return type;
 }
@@ -433,6 +433,12 @@ static
 bool ja_node_internal(struct cds_ja_inode_flag *node)
 {
 	return (unsigned long) node & JA_INTERNAL_MASK;
+}
+
+static
+bool valid_external_node(struct cds_ja_node *node)
+{
+	return !ja_node_internal((struct cds_ja_inode_flag *) node);
 }
 
 static
@@ -2256,7 +2262,7 @@ int _cds_ja_add(struct cds_ja *ja,
 	size_t key_len = ja_key_len(ja, _key_len);
 	int ret;
 
-	if (!key_len)
+	if (!key_len || !valid_external_node(node))
 		return -EINVAL;
 
 	tree_depth = ja->tree_depth;
@@ -2470,7 +2476,7 @@ int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t _key_len,
 	const uint8_t *iter_key = key;
 	size_t key_len = ja_key_len(ja, _key_len);
 
-	if (!key_len)
+	if (!key_len || !valid_external_node(node))
 		return -EINVAL;
 
 	tree_depth = ja->tree_depth;

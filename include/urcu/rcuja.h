@@ -137,7 +137,7 @@ struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
  * @key_len: Key length.
  *           key_len > 0 is an explicit key length.
  *           key_len == 0 use the key length of the Judy array.
- * @node: Node to add.
+ * @node: Node to add. Address should be at least 4-byte aligned.
  *
  * Returns 0 on success, negative error value on error.
  * A RCU read-side lock should be held across call to this function.
@@ -154,7 +154,7 @@ int cds_ja_add(struct cds_ja *ja, const uint8_t *key, size_t key_len,
  * @key_len: Key length.
  *           key_len > 0 is an explicit key length.
  *           key_len == 0 use the key length of the Judy array.
- * @node: Node to add.
+ * @node: Node to add. Address should be at least 4-byte aligned.
  *
  * Returns @node if successfully added, else returns the already
  * existing node (acts as a RCU lookup).
@@ -173,7 +173,7 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
  * @key_len: Key length.
  *           key_len > 0 is an explicit key length.
  *           key_len == 0 use the key length of the Judy array.
- * @node: Node to remove.
+ * @node: Node to remove. Address should be at least 4-byte aligned.
  *
  * Returns 0 on success, negative error value on error.
  * A RCU read-side lock should be held across call to this function.
