@@ -80,55 +80,105 @@ struct cds_ja_type {
  * consumption, since those are rare cases.
  */
 
+/*
+ * The smallest allocation order we can use is 4:
+ * - 1 bit is reserved for internal vs external flag,
+ * - 3 bits are reserved to encode the node type.
+ */
+
+/*
+ * The cds_ja_node contains the compressed node data needed for
+ * read-side. For linear and pool node configurations, it starts with a
+ * byte counting the number of children in the node.  Then, the
+ * node-specific data is placed.
+ * For the pigeon configuration, the number of children is kept in the
+ * metadata associated to node.
+ */
+
+#define DECLARE_LINEAR_NODE(index)								\
+	struct {										\
+		uint8_t nr_child;								\
+		uint8_t child_value[ja_type_## index ##_max_linear_child];			\
+		struct cds_ja_inode_flag *child_ptr[ja_type_## index ##_max_linear_child];	\
+	}
+
+#define DECLARE_POOL_NODE(index)								\
+	struct {										\
+		struct {									\
+			uint8_t nr_child;							\
+			uint8_t child_value[ja_type_## index ##_max_linear_child];		\
+			struct cds_ja_inode_flag *child_ptr[ja_type_## index ##_max_linear_child]; \
+		} linear[1U << ja_type_## index ##_nr_pool_order];				\
+	}
+
 #if (CAA_BITS_PER_LONG < 64)
+
 /* 32-bit pointers */
 enum {
-	ja_type_0_max_child = 1,
-	ja_type_1_max_child = 3,
-	ja_type_2_max_child = 6,
-	ja_type_3_max_child = 12,
-	ja_type_4_max_child = 25,
-	ja_type_5_max_child = 48,
-	ja_type_6_max_child = 92,
-	ja_type_7_max_child = 256,
-	ja_type_8_max_child = 0,	/* NULL */
+	ja_type_0_max_child = 3,
+	ja_type_1_max_child = 6,
+	ja_type_2_max_child = 12,
+	ja_type_3_max_child = 25,
+	ja_type_4_max_child = 48,
+	ja_type_5_max_child = 92,
+	ja_type_6_max_child = 256,
+	ja_type_7_max_child = 0,	/* NULL */
 };
 
 enum {
-	ja_type_0_max_linear_child = 1,
-	ja_type_1_max_linear_child = 3,
-	ja_type_2_max_linear_child = 6,
-	ja_type_3_max_linear_child = 12,
-	ja_type_4_max_linear_child = 25,
-	ja_type_5_max_linear_child = 24,
-	ja_type_6_max_linear_child = 23,
+	ja_type_0_max_linear_child = 3,
+	ja_type_1_max_linear_child = 6,
+	ja_type_2_max_linear_child = 12,
+	ja_type_3_max_linear_child = 25,
+	ja_type_4_max_linear_child = 24,
+	ja_type_5_max_linear_child = 23,
 };
 
 enum {
-	ja_type_5_nr_pool_order = 1,
-	ja_type_6_nr_pool_order = 2,
+	ja_type_4_nr_pool_order = 1,
+	ja_type_5_nr_pool_order = 2,
 };
 
 const struct cds_ja_type ja_types[] = {
-	{ .type_class = RCU_JA_LINEAR, .min_child = 1, .max_child = ja_type_0_max_child, .max_linear_child = ja_type_0_max_linear_child, .order = 3, },
-	{ .type_class = RCU_JA_LINEAR, .min_child = 1, .max_child = ja_type_1_max_child, .max_linear_child = ja_type_1_max_linear_child, .order = 4, },
-	{ .type_class = RCU_JA_LINEAR, .min_child = 3, .max_child = ja_type_2_max_child, .max_linear_child = ja_type_2_max_linear_child, .order = 5, },
-	{ .type_class = RCU_JA_LINEAR, .min_child = 4, .max_child = ja_type_3_max_child, .max_linear_child = ja_type_3_max_linear_child, .order = 6, },
-	{ .type_class = RCU_JA_LINEAR, .min_child = 10, .max_child = ja_type_4_max_child, .max_linear_child = ja_type_4_max_linear_child, .order = 7, },
+	[0] = { .type_class = RCU_JA_LINEAR, .min_child = 1, .max_child = ja_type_0_max_child, .max_linear_child = ja_type_0_max_linear_child, .order = 4, },
+	[1] = { .type_class = RCU_JA_LINEAR, .min_child = 3, .max_child = ja_type_1_max_child, .max_linear_child = ja_type_1_max_linear_child, .order = 5, },
+	[2] = { .type_class = RCU_JA_LINEAR, .min_child = 4, .max_child = ja_type_2_max_child, .max_linear_child = ja_type_2_max_linear_child, .order = 6, },
+	[3] = { .type_class = RCU_JA_LINEAR, .min_child = 10, .max_child = ja_type_3_max_child, .max_linear_child = ja_type_3_max_linear_child, .order = 7, },
 
 	/* Pools may fill sooner than max_child */
+	/* This pool is hardcoded at index 4. See ja_node_ptr(). */
+	[RCU_JA_POOL_IDX_A] = { .type_class = RCU_JA_POOL, .min_child = 20, .max_child = ja_type_4_max_child, .max_linear_child = ja_type_4_max_linear_child, .order = 8, .nr_pool_order = ja_type_4_nr_pool_order, .pool_size_order = 7, },
 	/* This pool is hardcoded at index 5. See ja_node_ptr(). */
-	{ .type_class = RCU_JA_POOL, .min_child = 20, .max_child = ja_type_5_max_child, .max_linear_child = ja_type_5_max_linear_child, .order = 8, .nr_pool_order = ja_type_5_nr_pool_order, .pool_size_order = 7, },
-	/* This pool is hardcoded at index 6. See ja_node_ptr(). */
-	{ .type_class = RCU_JA_POOL, .min_child = 45, .max_child = ja_type_6_max_child, .max_linear_child = ja_type_6_max_linear_child, .order = 9, .nr_pool_order = ja_type_6_nr_pool_order, .pool_size_order = 7, },
+	[RCU_JA_POOL_IDX_B] = { .type_class = RCU_JA_POOL, .min_child = 45, .max_child = ja_type_5_max_child, .max_linear_child = ja_type_5_max_linear_child, .order = 9, .nr_pool_order = ja_type_5_nr_pool_order, .pool_size_order = 7, },
 
 	/*
 	 * Upon node removal below min_child, if child pool is filled
 	 * beyond capacity, we roll back to pigeon.
 	 */
-	{ .type_class = RCU_JA_PIGEON, .min_child = 83, .max_child = ja_type_7_max_child, .order = 10, },
+	[6] = { .type_class = RCU_JA_PIGEON, .min_child = 83, .max_child = ja_type_6_max_child, .order = 10, },
 
-	{ .type_class = RCU_JA_NULL, .min_child = 0, .max_child = ja_type_8_max_child, },
+	[7] = { .type_class = RCU_JA_NULL, .min_child = 0, .max_child = ja_type_7_max_child, },
+};
+
+struct cds_ja_inode {
+	union {
+		/* Linear configuration */
+		DECLARE_LINEAR_NODE(0) conf_0;
+		DECLARE_LINEAR_NODE(1) conf_1;
+		DECLARE_LINEAR_NODE(2) conf_2;
+		DECLARE_LINEAR_NODE(3) conf_3;
+
+		/* Pool configuration */
+		DECLARE_POOL_NODE(4) conf_4;
+		DECLARE_POOL_NODE(5) conf_5;
+
+		/* Pigeon configuration */
+		struct {
+			struct cds_ja_inode_flag *child[ja_type_6_max_child];
+		} conf_6;
+		/* data aliasing nodes for computed accesses */
+		uint8_t data[sizeof(struct cds_ja_inode_flag *) * ja_type_6_max_child];
+	} u;
 };
 #else /* !(CAA_BITS_PER_LONG < 64) */
 /* 64-bit pointers */
@@ -160,61 +210,26 @@ enum {
 };
 
 const struct cds_ja_type ja_types[] = {
-	{ .type_class = RCU_JA_LINEAR, .min_child = 1, .max_child = ja_type_0_max_child, .max_linear_child = ja_type_0_max_linear_child, .order = 4, },
-	{ .type_class = RCU_JA_LINEAR, .min_child = 1, .max_child = ja_type_1_max_child, .max_linear_child = ja_type_1_max_linear_child, .order = 5, },
-	{ .type_class = RCU_JA_LINEAR, .min_child = 3, .max_child = ja_type_2_max_child, .max_linear_child = ja_type_2_max_linear_child, .order = 6, },
-	{ .type_class = RCU_JA_LINEAR, .min_child = 5, .max_child = ja_type_3_max_child, .max_linear_child = ja_type_3_max_linear_child, .order = 7, },
-	{ .type_class = RCU_JA_LINEAR, .min_child = 10, .max_child = ja_type_4_max_child, .max_linear_child = ja_type_4_max_linear_child, .order = 8, },
+	[0] = { .type_class = RCU_JA_LINEAR, .min_child = 1, .max_child = ja_type_0_max_child, .max_linear_child = ja_type_0_max_linear_child, .order = 4, },
+	[1] = { .type_class = RCU_JA_LINEAR, .min_child = 1, .max_child = ja_type_1_max_child, .max_linear_child = ja_type_1_max_linear_child, .order = 5, },
+	[2] = { .type_class = RCU_JA_LINEAR, .min_child = 3, .max_child = ja_type_2_max_child, .max_linear_child = ja_type_2_max_linear_child, .order = 6, },
+	[3] = { .type_class = RCU_JA_LINEAR, .min_child = 5, .max_child = ja_type_3_max_child, .max_linear_child = ja_type_3_max_linear_child, .order = 7, },
+	[4] = { .type_class = RCU_JA_LINEAR, .min_child = 10, .max_child = ja_type_4_max_child, .max_linear_child = ja_type_4_max_linear_child, .order = 8, },
 
 	/* Pools may fill sooner than max_child. */
 	/* This pool is hardcoded at index 5. See ja_node_ptr(). */
-	{ .type_class = RCU_JA_POOL, .min_child = 22, .max_child = ja_type_5_max_child, .max_linear_child = ja_type_5_max_linear_child, .order = 9, .nr_pool_order = ja_type_5_nr_pool_order, .pool_size_order = 8, },
+	[RCU_JA_POOL_IDX_A] = { .type_class = RCU_JA_POOL, .min_child = 22, .max_child = ja_type_5_max_child, .max_linear_child = ja_type_5_max_linear_child, .order = 9, .nr_pool_order = ja_type_5_nr_pool_order, .pool_size_order = 8, },
 	/* This pool is hardcoded at index 6. See ja_node_ptr(). */
-	{ .type_class = RCU_JA_POOL, .min_child = 51, .max_child = ja_type_6_max_child, .max_linear_child = ja_type_6_max_linear_child, .order = 10, .nr_pool_order = ja_type_6_nr_pool_order, .pool_size_order = 8, },
+	[RCU_JA_POOL_IDX_B] = { .type_class = RCU_JA_POOL, .min_child = 51, .max_child = ja_type_6_max_child, .max_linear_child = ja_type_6_max_linear_child, .order = 10, .nr_pool_order = ja_type_6_nr_pool_order, .pool_size_order = 8, },
 
 	/*
 	 * Upon node removal below min_child, if child pool is filled
 	 * beyond capacity, we roll back to pigeon.
 	 */
-	{ .type_class = RCU_JA_PIGEON, .min_child = 95, .max_child = ja_type_7_max_child, .order = 11, },
+	[7] = { .type_class = RCU_JA_PIGEON, .min_child = 95, .max_child = ja_type_7_max_child, .order = 11, },
 
-	{ .type_class = RCU_JA_NULL, .min_child = 0, .max_child = ja_type_8_max_child, },
+	[8] = { .type_class = RCU_JA_NULL, .min_child = 0, .max_child = ja_type_8_max_child, },
 };
-#endif /* !(BITS_PER_LONG < 64) */
-
-static inline __attribute__((unused))
-void static_array_size_check(void)
-{
-	CAA_BUILD_BUG_ON(CAA_ARRAY_SIZE(ja_types) < JA_TYPE_MAX_NR);
-}
-
-/*
- * The cds_ja_node contains the compressed node data needed for
- * read-side. For linear and pool node configurations, it starts with a
- * byte counting the number of children in the node.  Then, the
- * node-specific data is placed.
- * The node mutex, if any is needed, protecting concurrent updated of
- * each node is placed in a separate hash table indexed by node address.
- * For the pigeon configuration, the number of children is also kept in
- * a separate hash table, indexed by node address, because it is only
- * required for updates.
- */
-
-#define DECLARE_LINEAR_NODE(index)								\
-	struct {										\
-		uint8_t nr_child;								\
-		uint8_t child_value[ja_type_## index ##_max_linear_child];			\
-		struct cds_ja_inode_flag *child_ptr[ja_type_## index ##_max_linear_child];	\
-	}
-
-#define DECLARE_POOL_NODE(index)								\
-	struct {										\
-		struct {									\
-			uint8_t nr_child;							\
-			uint8_t child_value[ja_type_## index ##_max_linear_child];		\
-			struct cds_ja_inode_flag *child_ptr[ja_type_## index ##_max_linear_child]; \
-		} linear[1U << ja_type_## index ##_nr_pool_order];				\
-	}
 
 struct cds_ja_inode {
 	union {
@@ -237,6 +252,13 @@ struct cds_ja_inode {
 		uint8_t data[sizeof(struct cds_ja_inode_flag *) * ja_type_7_max_child];
 	} u;
 };
+#endif /* !(BITS_PER_LONG < 64) */
+
+static inline __attribute__((unused))
+void static_array_size_check(void)
+{
+	CAA_BUILD_BUG_ON(CAA_ARRAY_SIZE(ja_types) < JA_TYPE_MAX_NR);
+}
 
 enum ja_recompact {
 	JA_RECOMPACT_ADD_SAME,

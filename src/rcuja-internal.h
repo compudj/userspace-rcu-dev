@@ -46,10 +46,14 @@
 #define JA_MAX_DEPTH	10	/* Maximum depth, including root and leafs */
 
 /*
- * Entry for NULL node is at index 8 of the table. It is never encoded
- * in flags.
+ * Entry for NULL node is at index 7 (32-bit) or 8 (64-bit) of the
+ * table. It is never encoded in flags.
  */
-#define NODE_INDEX_NULL		8
+#if (CAA_BITS_PER_LONG < 64)
+# define NODE_INDEX_NULL		7
+#else
+# define NODE_INDEX_NULL		8
+#endif
 
 /*
  * Number of removals needed on a fallback node before we try to shrink
@@ -134,8 +138,13 @@ struct cds_ja_inode_flag *ja_node_flag_pool_2d(struct cds_ja_inode *node,
 }
 
 /* Hardcoded pool indexes for fast path */
-#define RCU_JA_POOL_IDX_5	5
-#define RCU_JA_POOL_IDX_6	6
+#if (CAA_BITS_PER_LONG < 64)
+# define RCU_JA_POOL_IDX_A	4
+# define RCU_JA_POOL_IDX_B	5
+#else
+# define RCU_JA_POOL_IDX_A	5
+# define RCU_JA_POOL_IDX_B	6
+#endif
 static inline
 struct cds_ja_inode *ja_node_ptr(struct cds_ja_inode_flag *node)
 {
@@ -147,10 +156,10 @@ struct cds_ja_inode *ja_node_ptr(struct cds_ja_inode_flag *node)
 	type_idx = (v & JA_TYPE_MASK) >> JA_INTERNAL_BITS;
 
 	switch (type_idx) {
-	case RCU_JA_POOL_IDX_5:
+	case RCU_JA_POOL_IDX_A:
 		v &= ~(JA_POOL_1D_MASK | JA_TYPE_MASK | JA_INTERNAL_MASK);
 		break;
-	case RCU_JA_POOL_IDX_6:
+	case RCU_JA_POOL_IDX_B:
 		v &= ~(JA_POOL_2D_MASK | JA_TYPE_MASK | JA_INTERNAL_MASK);
 		break;
 	default:
