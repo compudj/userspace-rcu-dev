@@ -2594,7 +2594,7 @@ void cds_ja_attr_destroy(struct cds_ja_attr *attr)
 
 int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len)
 {
-	if (!key_len || key_len > 8)
+	if (!key_len)
 		return -EINVAL;
 	attr->key_len = key_len;
 	return 0;
