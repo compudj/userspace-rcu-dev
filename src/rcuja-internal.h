@@ -43,7 +43,8 @@
 /* 2D mask has C(n=8,r=2) = 28 possibilities (fits in 5 bits). */
 #define JA_POOL_2D_MASK	(((1U << 5) - 1) << (JA_TYPE_BITS + JA_INTERNAL_BITS))
 
-#define JA_MAX_DEPTH	10	/* Maximum depth, including root and leafs */
+#define JA_MAX_KEY_LEN	256			/* Maximum key length supported. */
+#define JA_MAX_DEPTH	(JA_MAX_KEY_LEN + 2)	/* Maximum depth, including root and leafs */
 
 /*
  * Entry for NULL node is at index 7 (32-bit) or 8 (64-bit) of the
@@ -74,7 +75,6 @@ struct cds_ja_metadata {
 	struct cds_ja_node *external_nodes;	/* List of external nodes at this tree location. */
 	unsigned int nr_child;			/* Number of children in node. */
 	int fallback_removal_count;		/* Removals left keeping fallback. */
-	int level;				/* Level in the tree. */
 };
 
 struct cds_ja_metadata_alloc {
@@ -86,19 +86,27 @@ struct cds_ja_metadata_alloc {
 	struct cds_ja_metadata metadata;
 };
 
+struct cds_ja_key_map {
+	bool identity;
+	uint8_t key_to_ordinal[256];
+	uint8_t ordinal_to_key[256];
+};
+
 struct cds_ja {
 	struct cds_ja_inode_flag *root;
 	struct cds_ja_metadata root_metadata;
 
-	unsigned int tree_depth;
+	unsigned int max_tree_depth;
 	unsigned int key_len;
-	unsigned int max_key_len;	/* Maximum key length allowed. 0: no limit. */
+	unsigned int max_key_len;	/* Maximum key length allowed. */
 	unsigned long nr_fallback;	/* Number of fallback nodes used */
 
 	const struct rcu_flavor_struct *flavor;
 
 	/* Allocation arenas. */
 	struct cds_ja_alloc_arena *arena_order[RCU_JA_ALLOC_ORDER_MAX + 1];
+
+	struct cds_ja_key_map key_map;
 
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[JA_ENTRY_PER_NODE];
@@ -205,7 +213,6 @@ void cds_ja_free_item(struct cds_ja_metadata *metadata);
 #define dbg_printf(fmt, args...)				\
 	fprintf(stderr, "[debug rcuja %s()@%s:%u] " fmt,	\
 		__func__, __FILE__, __LINE__, ## args)
-
 #else
 #define dbg_printf(fmt, args...)				\
 do {								\
