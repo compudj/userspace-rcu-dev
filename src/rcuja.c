@@ -28,10 +28,12 @@
 #define abs_int(a)	((int) (a) > 0 ? (int) (a) : -((int) (a)))
 #endif
 
+#define CDS_JA_DEFAULT_MAX_KEY_LEN	0
 #define CDS_JA_DEFAULT_KEY_LEN		4
 
 struct cds_ja_attr {
 	size_t key_len;
+	size_t max_key_len;
 };
 
 enum cds_ja_type_class {
@@ -438,6 +440,18 @@ static
 bool valid_external_node(struct cds_ja_node *node)
 {
 	return !ja_node_internal((struct cds_ja_inode_flag *) node);
+}
+
+static
+bool valid_key_len(struct cds_ja *ja, size_t key_len)
+{
+	size_t max_key_len = ja->max_key_len;
+
+	if (!key_len)
+		return false;
+	if (max_key_len && key_len > max_key_len)
+		return false;
+	return true;
 }
 
 static
@@ -2261,7 +2275,7 @@ int _cds_ja_add(struct cds_ja *ja,
 	size_t key_len = ja_key_len(ja, _key_len);
 	int ret;
 
-	if (!key_len || !valid_external_node(node))
+	if (!valid_external_node(node) || !valid_key_len(ja, key_len))
 		return -EINVAL;
 
 	tree_depth = ja->tree_depth;
@@ -2475,7 +2489,7 @@ int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t _key_len,
 	const uint8_t *iter_key = key;
 	size_t key_len = ja_key_len(ja, _key_len);
 
-	if (!key_len || !valid_external_node(node))
+	if (!valid_external_node(node) || !valid_key_len(ja, key_len))
 		return -EINVAL;
 
 	tree_depth = ja->tree_depth;
@@ -2577,6 +2591,11 @@ size_t cds_ja_key_len(const struct cds_ja *ja)
 	return ja->key_len;
 }
 
+size_t cds_ja_max_key_len(const struct cds_ja *ja)
+{
+	return ja->max_key_len;
+}
+
 struct cds_ja_attr *cds_ja_attr_create(void)
 {
 	struct cds_ja_attr *attr = calloc(1, sizeof(struct cds_ja_attr));
@@ -2584,6 +2603,7 @@ struct cds_ja_attr *cds_ja_attr_create(void)
 	if (!attr)
 		return NULL;
 	attr->key_len = CDS_JA_DEFAULT_KEY_LEN;
+	attr->max_key_len = CDS_JA_DEFAULT_MAX_KEY_LEN;
 	return attr;
 }
 
@@ -2600,21 +2620,32 @@ int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len)
 	return 0;
 }
 
+int cds_ja_attr_set_max_key_len(struct cds_ja_attr *attr, size_t max_key_len)
+{
+	attr->max_key_len = max_key_len;
+	return 0;
+}
+
 struct cds_ja *_cds_ja_create(const struct cds_ja_attr *attr,
 		const struct rcu_flavor_struct *flavor)
 {
 	struct cds_ja *ja;
-	size_t key_len = CDS_JA_DEFAULT_KEY_LEN;
+	size_t key_len = CDS_JA_DEFAULT_KEY_LEN,
+	       max_key_len = CDS_JA_DEFAULT_MAX_KEY_LEN;
 
+	if (attr) {
+		key_len = attr->key_len;
+		max_key_len = attr->max_key_len;
+	}
+	/* ja->root is NULL */
+	/* tree_depth 0 is for pointer to root node */
+	if (max_key_len && key_len > max_key_len)
+		return NULL;
 	ja = calloc(sizeof(*ja), 1);
 	if (!ja)
 		return NULL;
-
-	if (attr)
-		key_len = attr->key_len;
-	/* ja->root is NULL */
-	/* tree_depth 0 is for pointer to root node */
 	ja->key_len = key_len;
+	ja->max_key_len = max_key_len;
 	ja->tree_depth = key_len + 1;
 	assert(ja->tree_depth <= JA_MAX_DEPTH);
 	ja->flavor = flavor;
