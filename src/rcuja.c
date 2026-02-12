@@ -435,6 +435,12 @@ bool ja_node_internal(struct cds_ja_inode_flag *node)
 }
 
 static
+bool valid_external_node(struct cds_ja_node *node)
+{
+	return !ja_node_internal((struct cds_ja_inode_flag *) node);
+}
+
+static
 struct cds_ja_inode *alloc_cds_ja_node(struct cds_ja *ja,
 		const struct cds_ja_type *ja_type,
 		struct cds_ja_metadata **_metadata)
@@ -2255,7 +2261,7 @@ int _cds_ja_add(struct cds_ja *ja,
 	size_t key_len = ja_key_len(ja, _key_len);
 	int ret;
 
-	if (!key_len)
+	if (!key_len || !valid_external_node(node))
 		return -EINVAL;
 
 	tree_depth = ja->tree_depth;
@@ -2469,7 +2475,7 @@ int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t _key_len,
 	const uint8_t *iter_key = key;
 	size_t key_len = ja_key_len(ja, _key_len);
 
-	if (!key_len)
+	if (!key_len || !valid_external_node(node))
 		return -EINVAL;
 
 	tree_depth = ja->tree_depth;
