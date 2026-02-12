@@ -220,6 +220,9 @@ int cds_ja_destroy(struct cds_ja *ja);
 /*
  * cds_ja_key_len - Return the key length of a Judy array.
  * @ja: The Judy array.
+ *
+ * Returns 0 if the Judy array uses variable length keys, > 0
+ * otherwise.
  */
 size_t cds_ja_key_len(const struct cds_ja *ja);
 
@@ -247,7 +250,8 @@ void cds_ja_attr_destroy(struct cds_ja_attr *attr);
 /*
  * cds_ja_attr_set_key_len - Set Judy array key length attribute.
  * @attr: Judy array attributes.
- * @key_len: Key length.
+ * @key_len: Key length. Set to 0 for variable length keys, > 0
+ *           otherwise.
  */
 int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
 
