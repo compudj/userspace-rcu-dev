@@ -223,6 +223,16 @@ int cds_ja_destroy(struct cds_ja *ja);
 size_t cds_ja_key_len(const struct cds_ja *ja);
 
 /*
+ * cds_ja_max_key_len - Return the maximum key length of a Judy array.
+ * @ja: The Judy array.
+ *
+ * Returns 0 if the Judy array has no maximum key length limit, > 0
+ * otherwise.
+ */
+size_t cds_ja_max_key_len(const struct cds_ja *ja);
+
+
+/*
  * cds_ja_attr_create - Create a Judy array attribute structure.
  */
 struct cds_ja_attr *cds_ja_attr_create(void);
@@ -239,6 +249,13 @@ void cds_ja_attr_destroy(struct cds_ja_attr *attr);
  * @key_len: Key length.
  */
 int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
+
+/*
+ * cds_ja_attr_set_max_key_len - Set Judy array max key length attribute.
+ * @attr: Judy array attributes.
+ * @max_key_len: Maximum key length. 0 means no limit.
+ */
+int cds_ja_attr_set_max_key_len(struct cds_ja_attr *attr, size_t max_key_len);
 
 /*
  * cds_ja_key_to_u64 - Convert a Judy array key to an unsigned 64-bit integer.
