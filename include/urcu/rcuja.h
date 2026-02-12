@@ -17,6 +17,7 @@
 #include <urcu-call-rcu.h>
 #include <urcu-flavor.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,10 +50,29 @@ struct cds_ja_node {
  *
  * Returns the first node of a duplicate chain if a match is found, else
  * returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
 struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t key_len);
+
+/*
+ * cds_ja_lookup_partial - Look up by key, find closest partial match.
+ * @ja: The Judy array.
+ * @key: Key to look up.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
+ * @match_len: Length of (partial) match.
+ *
+ * Returns the first node of a duplicate chain if a match is found, else
+ * returns NULL. If no node it found to completely match the key, the
+ * closest ancestor (partial match) is returned.
+ * Return NULL if the key_len is larger than the Judy array max key length.
+ * A RCU read-side lock should be held across call to this function and
+ * use of its return value.
+ */
+struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key, size_t key_len, size_t *match_len);
 
 /*
  * cds_ja_lookup_lower_equal - Look up first node with key <= @key.
@@ -66,6 +86,7 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t 
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key lower or equal to @key, else returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -85,6 +106,7 @@ struct cds_ja_node *cds_ja_lookup_lower_equal(struct cds_ja *ja,
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key greater or equal to @key, else returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -104,6 +126,7 @@ struct cds_ja_node *cds_ja_lookup_greater_equal(struct cds_ja *ja,
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key lower than @key, else returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -123,6 +146,7 @@ struct cds_ja_node *cds_ja_lookup_lower_than(struct cds_ja *ja,
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key greater than @key, else returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -141,6 +165,7 @@ struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
  *
  * Returns 0 on success, negative error value on error.
  * A RCU read-side lock should be held across call to this function.
+ * Return -EINVAL if the key_len is larger than the Judy array max key length.
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
  */
@@ -158,6 +183,7 @@ int cds_ja_add(struct cds_ja *ja, const uint8_t *key, size_t key_len,
  *
  * Returns @node if successfully added, else returns the already
  * existing node (acts as a RCU lookup).
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  * Mutual exclusion between updates (add, add_unique, del) is the user
@@ -176,6 +202,7 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
  * @node: Node to remove.
  *
  * Returns 0 on success, negative error value on error.
+ * Return -EINVAL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function.
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
@@ -220,6 +247,9 @@ int cds_ja_destroy(struct cds_ja *ja);
 /*
  * cds_ja_key_len - Return the key length of a Judy array.
  * @ja: The Judy array.
+ *
+ * Returns 0 if the Judy array uses variable length keys, > 0
+ * otherwise.
  */
 size_t cds_ja_key_len(const struct cds_ja *ja);
 
@@ -227,11 +257,20 @@ size_t cds_ja_key_len(const struct cds_ja *ja);
  * cds_ja_max_key_len - Return the maximum key length of a Judy array.
  * @ja: The Judy array.
  *
- * Returns 0 if the Judy array has no maximum key length limit, > 0
- * otherwise.
+ * Returns the Judy array maximum key length limit.
  */
 size_t cds_ja_max_key_len(const struct cds_ja *ja);
 
+/*
+ * cds_ja_key_map - Return the key map of a Judy array.
+ * @ja: The Judy array.
+ * @key_to_ordinal: Mapping from external key to ordered values. (output)
+ * @ordinal_to_key: Mapping from ordered values to external key. (output)
+ *
+ * Returns -ENOENT if key map is identity function. Populate the output
+ * parameters and return 0 if there is a key mapping.
+ */
+int cds_ja_key_map(struct cds_ja *ja, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key);
 
 /*
  * cds_ja_attr_create - Create a Judy array attribute structure.
@@ -247,7 +286,8 @@ void cds_ja_attr_destroy(struct cds_ja_attr *attr);
 /*
  * cds_ja_attr_set_key_len - Set Judy array key length attribute.
  * @attr: Judy array attributes.
- * @key_len: Key length.
+ * @key_len: Key length. Set to 0 for variable length keys, > 0
+ *           otherwise.
  */
 int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
 
@@ -255,8 +295,18 @@ int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
  * cds_ja_attr_set_max_key_len - Set Judy array max key length attribute.
  * @attr: Judy array attributes.
  * @max_key_len: Maximum key length. 0 means no limit.
+ * Returns 0 if the limit is set successfully, -EINVAL if the requested
+ * limit is larger than the maximum limit.
  */
 int cds_ja_attr_set_max_key_len(struct cds_ja_attr *attr, size_t max_key_len);
+
+/*
+ * cds_ja_attr_set_key_map - Set Judy array key map attribute.
+ * @attr: Judy array attributes.
+ * @key_to_ordinal: Mapping from external key to ordered values.
+ * @ordinal_to_key: Mapping from ordered values to external key.
+ */
+int cds_ja_attr_set_key_map(struct cds_ja_attr *attr, const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key);
 
 /*
  * cds_ja_key_to_u64 - Convert a Judy array key to an unsigned 64-bit integer.
@@ -309,6 +359,8 @@ uint32_t cds_ja_key_to_u32(const struct cds_ja *ja, const uint8_t *key, size_t k
  * It truncates the most significant bits beyond the Judy array key range.
  */
 void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key, size_t key_len);
+
+void cds_ja_show(FILE *out, const struct cds_ja *ja);
 
 /*
  * cds_ja_for_each_duplicate_rcu - Iterate through duplicates.

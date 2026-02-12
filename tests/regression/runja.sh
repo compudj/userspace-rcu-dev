@@ -19,6 +19,8 @@ EXTRA_PARAMS=-v
 
 # sanity test
 ${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} -t ${EXTRA_PARAMS} || exit 1
+${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} -x ${EXTRA_PARAMS} || exit 1
+${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} -y ${EXTRA_PARAMS} || exit 1
 
 # rw test, single key, add and del randomly, 4 threads
 # key range: init, lookup, and update: 0 to 0

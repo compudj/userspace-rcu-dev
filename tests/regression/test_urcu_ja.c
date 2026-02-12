@@ -44,7 +44,7 @@ unsigned long init_pool_size = DEFAULT_RAND_POOL,
 	lookup_pool_size = DEFAULT_RAND_POOL,
 	write_pool_size = DEFAULT_RAND_POOL;
 int validate_lookup;
-int sanity_test;
+int sanity_test, sanity_test_varlen, sanity_test_varlen_string;
 unsigned int key_len = 4;
 
 int count_pipe[2];
@@ -187,6 +187,8 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 	printf("        [-O size] Init pool size.\n");
 	printf("        [-V] Validate lookups of init values (use with filled init pool, same lookup range, with different write range).\n");
 	printf("        [-t] Do sanity test.\n");
+	printf("        [-x] Do variable length sanity test.\n");
+	printf("        [-y] Do variable length string sanity test.\n");
 	printf("        [-B] Key bytes for multithread test (default: 4).\n");
 	printf("        [-m factor] Key multiplication factor.\n");
 	printf("	[-l] Memory leak detection.\n");
@@ -196,37 +198,37 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 static
 int test_free_all_nodes(struct cds_ja *ja)
 {
-	uint64_t key = 0;
-	uint8_t jakey[8];
+	uint8_t jakey[8] = {};
+	bool first = true;
 	int ret = 0;
 
+	cds_ja_show(stderr, ja);
 	rcu_read_lock();
-	for (;;) {
-		uint8_t res_jakey[8];
-		struct cds_ja_node *ja_node;
-		struct cds_ja_node *tmp_node;
 
-		cds_ja_u64_to_key(ja, key, jakey, 0);
-		ja_node = cds_ja_lookup_greater_equal(ja, jakey, 0, res_jakey, NULL);
+	for (;;) {
+		struct cds_ja_node *tmp_node, *ja_node;
+
+		if (first) {
+			ja_node = cds_ja_lookup_greater_equal(ja, jakey, 0, jakey, NULL);
+			first = false;
+		} else
+			ja_node = cds_ja_lookup_greater_than(ja, jakey, 0, jakey, NULL);
 		if (!ja_node)
 			break;
 		cds_ja_for_each_duplicate_safe_rcu(ja_node, tmp_node) {
-			ret = cds_ja_del(test_ja, res_jakey, 0, ja_node);
+			ret = cds_ja_del(test_ja, jakey, 0, ja_node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n",
-					ret, cds_ja_key_to_u64(ja, res_jakey, 0));
+					ret, cds_ja_key_to_u64(ja, jakey, 0));
 				goto end;
 			}
 			/* Alone using Judy array, OK to free now */
 			free_node(ja_node);
 		}
-		key = cds_ja_key_to_u64(ja, res_jakey, 0);
-		if (key == UINT64_MAX)
-			break;
-		key++;
 	}
 end:
 	rcu_read_unlock();
+	cds_ja_show(stderr, ja);
 	return ret;
 }
 
@@ -854,6 +856,494 @@ int do_sanity_test(void)
 	return 0;
 }
 
+/*
+ * nr_dup is number of nodes per key.
+ */
+static
+int test_varlen_sparse_key_add(unsigned int len, int nr_dup)
+{
+	uint64_t key, max_key;
+	int zerocount, i, ret;
+	unsigned int bits = len * CHAR_BIT;
+
+	if (len == 8)
+		max_key = UINT64_MAX;
+	else
+		max_key = (1ULL << bits) - 1;
+
+	/* Add keys */
+	printf("Test #1: add keys (%u-byte).\n", len);
+	for (i = 0; i < nr_dup; i++) {
+		zerocount = 0;
+		for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
+			struct ja_test_node *node = node_alloc();
+			uint8_t jakey[8];
+
+			ja_test_node_init(node, key);
+			rcu_read_lock();
+			cds_ja_u64_to_key(test_ja, key, jakey, len);
+			ret = cds_ja_add(test_ja, jakey, len, &node->node);
+			rcu_read_unlock();
+			if (ret) {
+				fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
+					ret, key);
+				assert(0);
+			}
+			if (key == 0)
+				zerocount++;
+		}
+	}
+	printf("OK\n");
+	return 0;
+}
+
+/*
+ * nr_dup is number of nodes per key.
+ */
+static
+int test_varlen_sparse_key_lookup(unsigned int len, int nr_dup)
+{
+	uint64_t key, max_key;
+	unsigned int bits = len * CHAR_BIT;
+	int zerocount;
+
+	if (len == 8)
+		max_key = UINT64_MAX;
+	else
+		max_key = (1ULL << bits) - 1;
+
+	printf("Test #2: successful key lookup (%u-byte).\n", len);
+	zerocount = 0;
+	for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
+		struct cds_ja_node *ja_node;
+		uint8_t jakey[8];
+		int count = 0;
+
+		rcu_read_lock();
+		cds_ja_u64_to_key(test_ja, key, jakey, len);
+		ja_node = cds_ja_lookup(test_ja, jakey, len);
+		if (!ja_node) {
+			fprintf(stderr, "Error lookup node %" PRIu64 "\n", key);
+			assert(0);
+		}
+		cds_ja_for_each_duplicate_rcu(ja_node) {
+			count++;
+		}
+		if (count != nr_dup) {
+			fprintf(stderr, "Unexpected number of match for key %" PRIu64 ", expected %d, got %d.\n", key, nr_dup, count);
+		}
+		rcu_read_unlock();
+		if (key == 0)
+			zerocount++;
+	}
+	printf("OK\n");
+	return 0;
+}
+
+/*
+ * nr_dup is number of nodes per key.
+ */
+static
+int test_varlen_sparse_key_lookup_fail(unsigned int len)
+{
+	uint64_t key, max_key;
+	int zerocount;
+	unsigned int bits = len * CHAR_BIT;
+
+	if (len == 8)
+		max_key = UINT64_MAX;
+	else
+		max_key = (1ULL << bits) - 1;
+
+	if (len > 1) {
+		printf("Test #3: unsuccessful key lookup (%u-byte).\n", len);
+		zerocount = 0;
+		for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
+			struct cds_ja_node *ja_node;
+			uint8_t jakey[8];
+
+			rcu_read_lock();
+			cds_ja_u64_to_key(test_ja, key + 42, jakey, len);
+			ja_node = cds_ja_lookup(test_ja, jakey, len);
+			if (ja_node) {
+				fprintf(stderr,
+					"Error unexpected lookup node %" PRIu64 "\n",
+					key + 42);
+				assert(0);
+			}
+			rcu_read_unlock();
+			if (key == 0)
+				zerocount++;
+		}
+		printf("OK\n");
+	}
+	return 0;
+}
+
+/*
+ * nr_dup is number of nodes per key.
+ */
+static
+int test_varlen_sparse_key_del(unsigned int len, int nr_dup)
+{
+	uint64_t key, max_key;
+	int zerocount, ret;
+	struct cds_ja_node *ja_node;
+	unsigned int bits = len * CHAR_BIT;
+
+	if (len == 8)
+		max_key = UINT64_MAX;
+	else
+		max_key = (1ULL << bits) - 1;
+
+	printf("Test #4: remove keys (%u-byte).\n", len);
+	zerocount = 0;
+	for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
+		uint8_t jakey[8];
+		int count = 0;
+
+		rcu_read_lock();
+		cds_ja_u64_to_key(test_ja, key, jakey, len);
+		ja_node = cds_ja_lookup(test_ja, jakey, len);
+
+		cds_ja_for_each_duplicate_rcu(ja_node) {
+			struct cds_ja_node *test_ja_node;
+			struct ja_test_node *node;
+
+			count++;
+			node = caa_container_of(ja_node,
+				struct ja_test_node, node);
+			ret = cds_ja_del(test_ja, jakey, len, &node->node);
+			if (ret) {
+				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
+				assert(0);
+			}
+			rcu_free_test_node(node);
+			test_ja_node = cds_ja_lookup(test_ja, jakey, len);
+			if (count < nr_dup && !test_ja_node) {
+				fprintf(stderr, "Error: no node found after deletion of some nodes of a key\n");
+				assert(0);
+			}
+		}
+		ja_node = cds_ja_lookup(test_ja, jakey, len);
+		if (ja_node) {
+			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ja_node);
+			assert(0);
+		}
+		rcu_read_unlock();
+		if (key == 0)
+			zerocount++;
+	}
+	printf("OK\n");
+	return 0;
+}
+
+static
+int do_sanity_test_varlen_dup(int nr_dup)
+{
+	int i, ret;
+	struct cds_ja_attr *attr;
+
+	printf("Variable length key sanity test start.\n");
+
+	attr = cds_ja_attr_create();
+	if (!attr)
+		abort();
+	if (cds_ja_attr_set_key_len(attr, 0))	/* Variable length keys. */
+		abort();
+
+	test_ja = cds_ja_create(attr);
+	cds_ja_attr_destroy(attr);
+	if (!test_ja) {
+		printf("Error allocating judy array.\n");
+		return -1;
+	}
+
+	/* key length (bytes) */
+	for (i = 1; i <= 8; i *= 2) {
+		ret = test_varlen_sparse_key_add(i, nr_dup);
+		if (ret) {
+			return ret;
+		}
+		rcu_quiescent_state();
+	}
+
+	/* key length (bytes) */
+	for (i = 1; i <= 8; i *= 2) {
+		ret = test_varlen_sparse_key_lookup(i, nr_dup);
+		if (ret) {
+			return ret;
+		}
+		rcu_quiescent_state();
+	}
+
+
+	/* key length (bytes) */
+	for (i = 1; i <= 8; i *= 2) {
+		ret = test_varlen_sparse_key_lookup_fail(i);
+		if (ret) {
+			return ret;
+		}
+		rcu_quiescent_state();
+	}
+
+
+	/* key length (bytes) */
+	for (i = 1; i <= 8; i *= 2) {
+		ret = test_varlen_sparse_key_del(i, nr_dup);
+		if (ret) {
+			return ret;
+		}
+		rcu_quiescent_state();
+	}
+
+	ret = test_free_all_nodes(test_ja);
+	if (ret) {
+		fprintf(stderr, "Error freeing all nodes\n");
+		return -1;
+	}
+
+	ret = cds_ja_destroy(test_ja);
+	if (ret) {
+		fprintf(stderr, "Error destroying judy array\n");
+		return -1;
+	}
+	printf("Sanity test ends\n");
+
+	return 0;
+}
+
+static
+int do_sanity_test_varlen(void)
+{
+	int nr_dup;
+
+	for (nr_dup = 1; nr_dup < 4; nr_dup++) {
+		if (do_sanity_test_varlen_dup(nr_dup))
+			return -1;
+	}
+	return 0;
+}
+
+static const char *test_strings[] = {
+	"abc",
+	"abcd",
+	"eee",
+	"eef",
+	"eeeeeeeeeee",
+	"zzz",
+	"zz1",
+	"z",
+	"y",
+	"yy1",
+	"yyy",
+	"abcd",	/* twice */
+	"a",
+	"x",
+	"ffffffffffffffffffffffffffffffffffffffffffffff",
+};
+
+static const char *fail_strings[] = {
+	"abc!",
+	"abcd!",
+	"eee!",
+	"eef!",
+	"eeeeeeeeeee!",
+	"zzzzzzzzzzz!",
+	"zzzzzzzzzz1!",
+	"zzzzzzzzz!",
+	"!abcd",
+	"a!",
+	"x!",
+	"ffffffffffffffffffffffffffffffffffffffffffffff!",
+};
+
+static
+int test_varlen_string_key_add(void)
+{
+	unsigned int i;
+
+	/* Add keys */
+	printf("Test #1: add string keys.\n");
+	for (i = 0; i < CAA_ARRAY_SIZE(test_strings); i++) {
+		const char *string = test_strings[i];
+		struct ja_test_node *node = node_alloc();
+		int ret;
+
+		ja_test_node_init(node, 0);
+		rcu_read_lock();
+		ret = cds_ja_add(test_ja, (uint8_t *) string, strlen(string), &node->node);
+		rcu_read_unlock();
+		if (ret) {
+			fprintf(stderr, "Error (%d) adding node \"%s\"\n",
+				ret, string);
+			assert(0);
+		}
+	}
+	printf("OK\n");
+	return 0;
+}
+
+static
+int test_varlen_string_key_lookup(void)
+{
+	unsigned int i;
+
+	printf("Test #2: successful string key lookup.\n");
+
+	for (i = 0; i < CAA_ARRAY_SIZE(test_strings); i++) {
+		const char *string = test_strings[i];
+		struct cds_ja_node *ja_node;
+		int count = 0;
+
+		rcu_read_lock();
+		ja_node = cds_ja_lookup(test_ja, (uint8_t *) string, strlen(string));
+		if (!ja_node) {
+			fprintf(stderr, "Error lookup node \"%s\"\n", string);
+			assert(0);
+		}
+		cds_ja_for_each_duplicate_rcu(ja_node) {
+			count++;
+		}
+		if (count > 1 && strcmp(string, "abcd") != 0) {
+			fprintf(stderr, "Unexpected number of match for key \"%s\", expected %d, got %d.\n", string, 2, count);
+		}
+		rcu_read_unlock();
+	}
+	printf("OK\n");
+	return 0;
+}
+
+static
+int test_varlen_string_key_lookup_fail(void)
+{
+	unsigned int i;
+
+	printf("Test #2: fail string key lookup.\n");
+
+	for (i = 0; i < CAA_ARRAY_SIZE(fail_strings); i++) {
+		const char *string = fail_strings[i];
+		struct cds_ja_node *ja_node;
+
+		rcu_read_lock();
+		ja_node = cds_ja_lookup(test_ja, (uint8_t *) string, strlen(string));
+		if (ja_node) {
+			fprintf(stderr, "Error unexpected lookup node \"%s\"\n", string);
+			assert(0);
+		}
+		rcu_read_unlock();
+	}
+	printf("OK\n");
+	return 0;
+}
+
+static
+int test_varlen_string_key_del(void)
+{
+	unsigned int i;
+
+	printf("Test #4: remove string keys.\n");
+
+	for (i = 0; i < CAA_ARRAY_SIZE(test_strings); i++) {
+		const char *string = test_strings[i];
+		struct cds_ja_node *ja_node;
+		int count = 0;
+		int ret;
+
+		rcu_read_lock();
+		ja_node = cds_ja_lookup(test_ja, (uint8_t *) string, strlen(string));
+
+		cds_ja_for_each_duplicate_rcu(ja_node) {
+			struct cds_ja_node *test_ja_node;
+			struct ja_test_node *node;
+
+			count++;
+			node = caa_container_of(ja_node,
+				struct ja_test_node, node);
+			ret = cds_ja_del(test_ja, (uint8_t *) string, strlen(string), &node->node);
+			if (ret) {
+				fprintf(stderr, "Error (%d) removing node \"%s\"\n", ret, string);
+				assert(0);
+			}
+			rcu_free_test_node(node);
+			test_ja_node = cds_ja_lookup(test_ja, (uint8_t *) string, strlen(string));
+			if (count < 2 && strcmp(string, "abcd") == 0 && !test_ja_node) {
+				fprintf(stderr, "Error: no node found after deletion of some nodes of a key\n");
+				assert(0);
+			}
+		}
+		ja_node = cds_ja_lookup(test_ja, (uint8_t *) string, strlen(string));
+		if (ja_node) {
+			fprintf(stderr, "Error lookup \"%s\": %p (after delete) failed. Node is not expected.\n", string, ja_node);
+			assert(0);
+		}
+		rcu_read_unlock();
+	}
+	printf("OK\n");
+	return 0;
+}
+
+static
+int do_test_varlen_string(void)
+{
+	int ret;
+	struct cds_ja_attr *attr;
+
+	printf("Variable length string key test start.\n");
+
+	attr = cds_ja_attr_create();
+	if (!attr)
+		abort();
+	if (cds_ja_attr_set_key_len(attr, 0))	/* Variable length keys. */
+		abort();
+
+	test_ja = cds_ja_create(attr);
+	cds_ja_attr_destroy(attr);
+	if (!test_ja) {
+		printf("Error allocating judy array.\n");
+		return -1;
+	}
+
+	ret = test_varlen_string_key_add();
+	if (ret) {
+		return ret;
+	}
+	rcu_quiescent_state();
+
+	ret = test_varlen_string_key_lookup();
+	if (ret) {
+		return ret;
+	}
+	rcu_quiescent_state();
+
+	ret = test_varlen_string_key_lookup_fail();
+	if (ret) {
+		return ret;
+	}
+	rcu_quiescent_state();
+
+	ret = test_varlen_string_key_del();
+	if (ret) {
+		return ret;
+	}
+	rcu_quiescent_state();
+
+	ret = test_free_all_nodes(test_ja);
+	if (ret) {
+		fprintf(stderr, "Error freeing all nodes\n");
+		return -1;
+	}
+
+	ret = cds_ja_destroy(test_ja);
+	if (ret) {
+		fprintf(stderr, "Error destroying judy array\n");
+		return -1;
+	}
+	printf("Sanity test ends\n");
+
+	return 0;
+}
+
 enum urcu_ja_addremove {
 	AR_RANDOM = 0,
 	AR_ADD = 1,
@@ -1304,6 +1794,12 @@ int main(int argc, char **argv)
 		case 't':
 			sanity_test = 1;
 			break;
+		case 'x':
+			sanity_test_varlen = 1;
+			break;
+		case 'y':
+			sanity_test_varlen_string = 1;
+			break;
 		case 'B':
 			key_len = atol(argv[++i]);
 			break;
@@ -1367,6 +1863,10 @@ int main(int argc, char **argv)
 
 	if (sanity_test) {
 		ret = do_sanity_test();
+	} else if (sanity_test_varlen) {
+		ret = do_sanity_test_varlen();
+	} else if (sanity_test_varlen_string) {
+		ret = do_test_varlen_string();
 	} else {
 		ret = do_mt_test();
 	}
