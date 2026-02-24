@@ -211,8 +211,6 @@ struct cds_ja *cds_ja_create(const struct cds_ja_attr *attr)
  * Returns 0 on success, negative error value on error.
  * There should be no more concurrent add, delete, nor look-up performed
  * on the Judy array while it is being destroyed (ensured by the caller).
- * RCU read-side lock should _not_ be held when calling this function,
- * however, QSBR threads need to be online.
  */
 int cds_ja_destroy(struct cds_ja *ja);
 
