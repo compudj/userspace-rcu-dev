@@ -179,6 +179,9 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
  * A RCU read-side lock should be held across call to this function.
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
+ * The caller needs to wait for a grace period (synchronize_rcu or
+ * call_rcu) after a successful cds_ja_del before reclaiming the memory
+ * used by @node.
  */
 int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t key_len,
 		struct cds_ja_node *node);
