@@ -29,7 +29,7 @@
 #define abs_int(a)	((int) (a) > 0 ? (int) (a) : -((int) (a)))
 #endif
 
-#define CDS_JA_DEFAULT_MAX_KEY_LEN	0
+#define CDS_JA_DEFAULT_MAX_KEY_LEN	JA_MAX_KEY_LEN
 #define CDS_JA_DEFAULT_KEY_LEN		0
 
 struct cds_ja_attr {
@@ -1946,20 +1946,20 @@ int ja_node_clear_ptr(struct cds_ja *ja,
 struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key,
 			size_t _key_len)
 {
-	unsigned int tree_depth, i;			//TODO var len
+	unsigned int max_tree_depth, i;			//TODO var len
 	struct cds_ja_inode_flag *node_flag;
 	size_t key_len = ja_key_len(ja, _key_len);
 
 	if (!key_len)
 		return NULL;
-	tree_depth = ja->tree_depth;			//TODO var len
+	max_tree_depth = ja->max_tree_depth;			//TODO var len
 	node_flag = rcu_dereference(ja->root);
 
 	/* level 0: root node */
 	if (!ja_node_ptr(node_flag))
 		return NULL;
 
-	for (i = 1; i < tree_depth; i++) {		//TODO var len
+	for (i = 1; i < max_tree_depth; i++) {		//TODO var len
 		uint8_t iter_key;
 
 		iter_key = *(key++);
@@ -1968,7 +1968,7 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key,
 				(unsigned int) iter_key, node_flag);
 		if (!ja_node_ptr(node_flag))
 			return NULL;
-		assert(i == tree_depth - 1 || ja_node_internal(node_flag));	//TODO var len
+		assert(i == max_tree_depth - 1 || ja_node_internal(node_flag));	//TODO var len
 	}
 
 	/* Last level lookup succeded. We got an actual match. */
@@ -1981,7 +1981,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		uint8_t *result_key, size_t *result_key_len,
 		enum ja_lookup_inequality mode)
 {
-	int tree_depth, level;
+	int max_tree_depth, level;
 	struct cds_ja_inode_flag *node_flag, *cur_node_depth[JA_MAX_DEPTH];	//TODO var len
 	uint8_t cur_key[JA_MAX_DEPTH];	//TODO var len
 	enum ja_direction dir;
@@ -2003,7 +2003,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 
 	memset(cur_node_depth, 0, sizeof(cur_node_depth));
 	memset(cur_key, 0, sizeof(cur_key));
-	tree_depth = ja->tree_depth;	//TODO var len
+	max_tree_depth = ja->max_tree_depth;	//TODO var len
 	node_flag = rcu_dereference(ja->root);
 	cur_node_depth[0] = node_flag;
 
@@ -2011,7 +2011,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	if (!ja_node_ptr(node_flag))
 		return NULL;
 
-	for (level = 1; level < tree_depth; level++) {	//TODO var len
+	for (level = 1; level < max_tree_depth; level++) {	//TODO var len
 		uint8_t key_value;
 
 		key_value = *(iter_key++);
@@ -2022,13 +2022,13 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		cur_node_depth[level] = node_flag;
 		dbg_printf("cds_ja_lookup_inequality iter key lookup %u finds node_flag %p\n",
 				(unsigned int) key_value, node_flag);
-		assert(level == tree_depth - 1 || ja_node_internal(node_flag));	//TODO var len
+		assert(level == max_tree_depth - 1 || ja_node_internal(node_flag));	//TODO var len
 	}
 
 	switch (mode) {
 	case JA_LOOKUP_LE:
 	case JA_LOOKUP_GE:
-		if (level == tree_depth) {	//TODO var len
+		if (level == max_tree_depth) {	//TODO var len
 			/* Last level lookup succeded. We got an equal match. */
 			if (result_key)
 				memcpy(result_key, key, ja->key_len);
@@ -2109,20 +2109,20 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	default:
 		assert(0);
 	}
-	for (; level < tree_depth; level++) {	//TODO var len
+	for (; level < max_tree_depth; level++) {	//TODO var len
 		node_flag = ja_node_get_minmax(node_flag, &cur_key[level - 1], dir);
 		dbg_printf("cds_ja_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) cur_key[level - 1],
 				node_flag);
 		if (!ja_node_ptr(node_flag))
 			break;
-		assert(level == tree_depth - 1 || ja_node_internal(node_flag));	//TODO var len
+		assert(level == max_tree_depth - 1 || ja_node_internal(node_flag));	//TODO var len
 	}
 
-	assert(level == tree_depth);	//TODO var len
+	assert(level == max_tree_depth);	//TODO var len
 
 	if (result_key) {
-		for (level = 1; level < tree_depth; level++)	//TODO var len
+		for (level = 1; level < max_tree_depth; level++)	//TODO var len
 			*(result_key++) = cur_key[level - 1];
 	}
 	if (result_key_len)
@@ -2211,7 +2211,7 @@ int ja_attach_node(struct cds_ja *ja,
 	/* Create new branch, starting from bottom */
 	iter_node_flag = (struct cds_ja_inode_flag *) child_node;
 
-	for (i = ja->tree_depth - 1; i >= (int) level; i--) {	//TODO var len
+	for (i = ja->max_tree_depth - 1; i >= (int) level; i--) {	//TODO var len
 		uint8_t key_value;
 
 		key_value = *(--iter_key);
@@ -2285,7 +2285,7 @@ int _cds_ja_add(struct cds_ja *ja,
 		struct cds_ja_node *node,
 		struct cds_ja_node **unique_node_ret)
 {
-	unsigned int tree_depth, i;	//TODO var len
+	unsigned int max_tree_depth, i;	//TODO var len
 	struct cds_ja_inode_flag *attach_node_flag, *parent_node_flag,
 		*parent2_node_flag, *node_flag;
 	struct cds_ja_inode_flag **attach_node_flag_ptr,
@@ -2297,7 +2297,7 @@ int _cds_ja_add(struct cds_ja *ja,
 	if (!valid_external_node(node) || !valid_key_len(ja, key_len))
 		return -EINVAL;
 
-	tree_depth = ja->tree_depth;	//TODO var len
+	max_tree_depth = ja->max_tree_depth;	//TODO var len
 
 retry:
 	dbg_printf("cds_ja_add attempt: node %p\n", node);
@@ -2308,7 +2308,7 @@ retry:
 	node_flag_ptr = &ja->root;
 
 	/* Iterate on all internal levels */
-	for (i = 1; i < tree_depth; i++) {	//TODO var len
+	for (i = 1; i < max_tree_depth; i++) {	//TODO var len
 		uint8_t key_value;
 
 		if (!ja_node_ptr(node_flag))
@@ -2411,7 +2411,7 @@ int ja_detach_node(struct cds_ja *ja,
 	int ret, i, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
 	uint8_t n = 0;
 
-	assert(nr_snapshot == (int)ja->tree_depth + 1);	//TODO var len
+	assert(nr_snapshot == (int)ja->max_tree_depth + 1);	//TODO var len
 
 	/*
 	 * From the last internal level node going up, lookup the
@@ -2496,7 +2496,7 @@ void ja_unchain_node(struct cds_ja_node **prev_node_ptr,
 int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t _key_len,
 		struct cds_ja_node *node)
 {
-	unsigned int tree_depth, i;				//TODO var len
+	unsigned int max_tree_depth, i;				//TODO var len
 	struct cds_ja_inode_flag *snapshot[JA_MAX_DEPTH];	//TODO var len
 	struct cds_ja_inode_flag **snapshot_ptr[JA_MAX_DEPTH];	//TODO var len
 	uint8_t snapshot_n[JA_MAX_DEPTH];			//TODO var len
@@ -2511,7 +2511,7 @@ int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t _key_len,
 	if (!valid_external_node(node) || !valid_key_len(ja, key_len))
 		return -EINVAL;
 
-	tree_depth = ja->tree_depth;				//TODO var len
+	max_tree_depth = ja->max_tree_depth;				//TODO var len
 
 retry:
 	nr_snapshot = 0;
@@ -2527,7 +2527,7 @@ retry:
 	node_flag_ptr = &ja->root;
 
 	/* Iterate on all internal levels */
-	for (i = 1; i < tree_depth; i++) {			//TODO var len
+	for (i = 1; i < max_tree_depth; i++) {			//TODO var len
 		uint8_t key_value;
 
 		dbg_printf("cds_ja_del iter node_flag %p\n",
@@ -2639,6 +2639,8 @@ int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len)
 
 int cds_ja_attr_set_max_key_len(struct cds_ja_attr *attr, size_t max_key_len)
 {
+	if (max_key_len > JA_MAX_KEY_LEN)
+		return -EINVAL;
 	attr->max_key_len = max_key_len;
 	return 0;
 }
@@ -2655,7 +2657,7 @@ struct cds_ja *_cds_ja_create(const struct cds_ja_attr *attr,
 		max_key_len = attr->max_key_len;
 	}
 	/* ja->root is NULL */
-	/* tree_depth 0 is for pointer to root node */
+	/* max_tree_depth 0 is for pointer to root node */
 	if (max_key_len && key_len > max_key_len)
 		return NULL;
 	ja = calloc(sizeof(*ja), 1);
@@ -2663,8 +2665,8 @@ struct cds_ja *_cds_ja_create(const struct cds_ja_attr *attr,
 		return NULL;
 	ja->key_len = key_len;
 	ja->max_key_len = max_key_len;
-	ja->tree_depth = key_len + 1;		//TODO var len
-	assert(ja->tree_depth <= JA_MAX_DEPTH);	//TODO var len
+	ja->max_tree_depth = max_key_len + 1;
+	assert(ja->max_tree_depth <= JA_MAX_DEPTH);
 	ja->flavor = flavor;
 	return ja;
 }

@@ -230,8 +230,7 @@ size_t cds_ja_key_len(const struct cds_ja *ja);
  * cds_ja_max_key_len - Return the maximum key length of a Judy array.
  * @ja: The Judy array.
  *
- * Returns 0 if the Judy array has no maximum key length limit, > 0
- * otherwise.
+ * Returns the Judy array maximum key length limit.
  */
 size_t cds_ja_max_key_len(const struct cds_ja *ja);
 
@@ -259,6 +258,8 @@ int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
  * cds_ja_attr_set_max_key_len - Set Judy array max key length attribute.
  * @attr: Judy array attributes.
  * @max_key_len: Maximum key length. 0 means no limit.
+ * Returns 0 if the limit is set successfully, -EINVAL if the requested
+ * limit is larger than the maximum limit.
  */
 int cds_ja_attr_set_max_key_len(struct cds_ja_attr *attr, size_t max_key_len);
 

@@ -44,7 +44,8 @@
 /* 2D mask has C(n=8,r=2) = 28 possibilities (fits in 5 bits). */
 #define JA_POOL_2D_MASK	(((1U << 5) - 1) << (JA_TYPE_BITS + JA_INTERNAL_BITS))
 
-#define JA_MAX_DEPTH	10	/* Maximum depth, including root and leafs */
+#define JA_MAX_KEY_LEN	256			/* Maximum key length supported. */
+#define JA_MAX_DEPTH	(JA_MAX_KEY_LEN + 2)	/* Maximum depth, including root and leafs */
 
 /*
  * Entry for NULL node is at index 7 (32-bit) or 8 (64-bit) of the
