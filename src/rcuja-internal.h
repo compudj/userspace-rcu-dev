@@ -92,9 +92,9 @@ struct cds_ja {
 	struct cds_ja_inode_flag *root;
 	struct cds_ja_metadata root_metadata;
 
-	unsigned int tree_depth;
+	unsigned int max_tree_depth;
 	unsigned int key_len;
-	unsigned int max_key_len;	/* Maximum key length allowed. 0: no limit. */
+	unsigned int max_key_len;	/* Maximum key length allowed. */
 	unsigned long nr_fallback;	/* Number of fallback nodes used */
 
 	const struct rcu_flavor_struct *flavor;

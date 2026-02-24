@@ -1946,20 +1946,20 @@ int ja_node_clear_ptr(struct cds_ja *ja,
 struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key,
 			size_t _key_len)
 {
-	unsigned int max_tree_depth, i;			//TODO var len
+	unsigned int max_key_depth, i;
 	struct cds_ja_inode_flag *node_flag;
 	size_t key_len = ja_key_len(ja, _key_len);
 
-	if (!key_len)
+	if (!key_len || key_len > ja->max_key_len)
 		return NULL;
-	max_tree_depth = ja->max_tree_depth;			//TODO var len
+	max_key_depth = key_len + 1;
 	node_flag = rcu_dereference(ja->root);
 
 	/* level 0: root node */
 	if (!ja_node_ptr(node_flag))
 		return NULL;
 
-	for (i = 1; i < max_tree_depth; i++) {		//TODO var len
+	for (i = 1; i < max_key_depth; i++) {
 		uint8_t iter_key;
 
 		iter_key = *(key++);
@@ -1968,7 +1968,14 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key,
 				(unsigned int) iter_key, node_flag);
 		if (!ja_node_ptr(node_flag))
 			return NULL;
-		assert(i == max_tree_depth - 1 || ja_node_internal(node_flag));	//TODO var len
+		/* Found external node. */
+		if (!ja_node_internal(node_flag))
+			break;
+		/* Check for internal node associated with external nodes at last byte of key. */
+		if (i == max_key_depth - 1) {
+			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+			return rcu_dereference(metadata->external_nodes);
+		}
 	}
 
 	/* Last level lookup succeded. We got an actual match. */
