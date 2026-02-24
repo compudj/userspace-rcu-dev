@@ -449,3 +449,52 @@ For the various types of nodes:
 - pigeon hole array (type C)
   - RCU replacement: mutex
   - Entry update: mutex
+
+* Variable length key support
+
+Variable length keys are supported by reserving the lowest bit
+to indicate the difference between an internal vs external node pointer.
+When encountering an external node pointer, this acts as a key terminator.
+
+However, this approach requires supporting scenarios where a given
+key/position has both an internal and one or more external nodes
+associated, in the case where we have a branch at a given key, e.g.
+at key 'G' with the following tree content:
+
+D
+E
+FBC
+FYG
+FYGZ
+
+NODE_N -> internal node
+*      -> external node
+
+                   NODE_0
+                  /   |  \
+                 / D  | E \ F
+                *     *    \
+                          NODE_1
+                         /      \
+                        / B      \ Y
+                       /          \
+                     NODE_2      NODE_3
+                       |        /      \
+                       | C     / G      \ G
+                       *      *        NODE_4
+                                         |
+                                         | Z
+                                         *
+NODE_0: [ (D, *), (E, *), (F, NODE_1)]
+NODE_1: [ (B, NODE_2), (Y, NODE_3) ]
+NODE_2: [ (C, *) ]
+NODE_3: [ (G, NODE_4), (G, *) ]
+NODE_4: [ (Z, *) ]
+
+The approach proposed to handle this scenario is to add an external
+nodes list head to the metadata associated with NODE_4. Therefore, when
+looking for a terminal node at a given tree position, one extra cache
+line needs to be loaded to begin iteration on the external nodes list.
+Note that this cache line does not need to be loaded while traversing
+the internal nodes for every character of the input key, except the
+last.
