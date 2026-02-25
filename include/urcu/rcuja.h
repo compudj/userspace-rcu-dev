@@ -71,7 +71,6 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t 
  */
 struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key, size_t key_len, size_t *match_len);
 
-
 /*
  * cds_ja_lookup_lower_equal - Look up first node with key <= @key.
  * @ja: The Judy array.
