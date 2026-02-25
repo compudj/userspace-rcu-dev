@@ -2382,6 +2382,22 @@ void ja_chain_node(struct cds_ja_node *last_node, struct cds_ja_node *node)
 	rcu_assign_pointer(last_node->next, node);
 }
 
+/*
+ * There are a few cases to cover for add:
+ *
+ * 1) There is already an external node at that key. Chain this new node
+ *    with the existing node (duplicate).
+ * 2) There is already an internal node with associated external node at
+ *    that key. Chain this new node with the existing node (duplicate).
+ * 3) The traversal ends before reaching the end of the lookup key:
+ *    3.1) The last node encountered during traversal is an internal
+ *         node. Attach a new cluster as child of this internal node.
+ *    3.2) The last node encountered during traversal is an external
+ *         node. Need to transform this external node into an internal
+ *         node with associated external node, attach a new cluster as
+ *         child of this internal node, and populate this new internal
+ *         node into the tree to replace the prior external node.
+ */
 static
 int _cds_ja_add(struct cds_ja *ja,
 		const uint8_t *key, size_t _key_len,
