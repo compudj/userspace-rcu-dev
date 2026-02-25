@@ -2152,6 +2152,27 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		/* If found left/right sibling, find rightmost/leftmost child. */
 		if (ja_node_ptr(node_flag))
 			break;
+		/*
+		 * Return external node if trying to find LE/LT
+		 * inequality and encountering an external node when
+		 * going upward.
+		 */
+		if (dir == JA_LEFT) {
+			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(cur_node_depth[level - 1]));
+			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
+
+			if (external_nodes) {
+				if (result_key) {
+					int i;
+
+					for (i = 1; i < level; i++)
+						*(result_key++) = cur_key[i - 1];
+				}
+				if (result_key_len)
+					*result_key_len = level - 1;
+				return external_nodes;
+			}
+		}
 	}
 
 	if (!level) {
@@ -2184,24 +2205,44 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	default:
 		assert(0);
 	}
-	for (; level < max_tree_depth; level++) {	//TODO var len
+	for (; level < key_depth; level++) {
+		/*
+		 * Return external node if trying to find GE/GT
+		 * inequality and encountering an external node when
+		 * going downward.
+		 */
+		if (dir == JA_LEFTMOST) {
+			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
+
+			if (external_nodes) {
+				if (result_key) {
+					int i;
+
+					for (i = 1; i < level; i++)
+						*(result_key++) = cur_key[i - 1];
+				}
+				if (result_key_len)
+					*result_key_len = level - 1;
+				return external_nodes;
+			}
+		}
 		node_flag = ja_node_get_minmax(node_flag, &cur_key[level - 1], dir);
 		dbg_printf("cds_ja_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) cur_key[level - 1],
 				node_flag);
 		if (!ja_node_ptr(node_flag))
 			break;
-		assert(level == max_tree_depth - 1 || ja_node_internal(node_flag));	//TODO var len
 	}
-
-	assert(level == max_tree_depth);	//TODO var len
 
 	if (result_key) {
-		for (level = 1; level < max_tree_depth; level++)	//TODO var len
-			*(result_key++) = cur_key[level - 1];
+		int i;
+
+		for (i = 1; i < level; i++)
+			*(result_key++) = cur_key[i - 1];
 	}
 	if (result_key_len)
-		*result_key_len = ja->key_len;
+		*result_key_len = level - 1;
 	return (struct cds_ja_node *) node_flag;
 }
 
