@@ -1986,16 +1986,14 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t 
 
 struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key, size_t _key_len, size_t *_match_len)
 {
-	struct cds_ja_node *external_nodes, *partial_match_node = NULL;
-	size_t key_len = ja_key_len(ja, _key_len), partial_match_len = 0;
+	struct cds_ja_node *external_nodes, *match_node = NULL;
+	size_t key_len = ja_key_len(ja, _key_len), match_len = 0;
 	struct cds_ja_inode_flag *node_flag;
 	struct cds_ja_metadata *metadata;
 	unsigned int key_depth, i;
 
-	if (!key_len) {
-		*_match_len = 0;
-		return NULL;
-	}
+	if (!key_len)
+		goto end;
 	/* If key_len is larger than max_key_len, return partial match. */
 	if (key_len > ja->max_key_len)
 		key_len = ja->max_key_len;
@@ -2003,10 +2001,8 @@ struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key,
 	node_flag = rcu_dereference(ja->root);
 
 	/* level 0: root node */
-	if (!ja_node_ptr(node_flag)) {
-		*_match_len = 0;
-		return NULL;
-	}
+	if (!ja_node_ptr(node_flag))
+		goto end;
 
 	for (i = 1; i < key_depth; i++) {
 		uint8_t iter_key;
@@ -2016,42 +2012,31 @@ struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key,
 		dbg_printf("cds_ja_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
 
-		if (!ja_node_ptr(node_flag)) {
-			*_match_len = partial_match_len;
-			return partial_match_node;
-		}
+		/* Found no child for this key byte. */
+		if (!ja_node_ptr(node_flag))
+			break;
 		/* Found external node. */
 		if (!ja_node_internal(node_flag)) {
-			*_match_len = i;
-			return (struct cds_ja_node *) node_flag;
+			match_len = i;
+			match_node = (struct cds_ja_node *) node_flag;
+			break;
 		}
-		/* Internal node: keep track of closest external node ancestor. */
+		/*
+		 * Internal node: keep track of closest external node
+		 * ancestor for partial match. This also covers the case
+		 * where the complete match finds an internal node with
+		 * associated external nodes.
+		 */
 		metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
 		external_nodes = rcu_dereference(metadata->external_nodes);
 		if (external_nodes) {
-			partial_match_node = external_nodes;
-			partial_match_len = i;
+			match_len = i;
+			match_node = external_nodes;
 		}
 	}
-
-	/*
-	 * Reached key_depth, check for terminal node: either external
-	 * nodes or internal node associated with external nodes.
-	 */
-	if (ja_node_internal(node_flag)) {
-		struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
-		struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
-
-		if (external_nodes) {
-			*_match_len = key_len;
-			return external_nodes;
-		} else {
-			*_match_len = partial_match_len;
-			return partial_match_node;
-		}
-	}
-	*_match_len = key_len;
-	return (struct cds_ja_node *) node_flag;
+end:
+	*_match_len = match_len;
+	return match_node;
 }
 
 static
