@@ -1943,12 +1943,12 @@ int ja_node_clear_ptr(struct cds_ja *ja,
 	return ret;
 }
 
-struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key,
-			size_t _key_len)
+struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t _key_len)
 {
-	unsigned int key_depth, i;
-	struct cds_ja_inode_flag *node_flag;
 	size_t key_len = ja_key_len(ja, _key_len);
+	struct cds_ja_inode_flag *node_flag;
+	struct cds_ja_metadata *metadata;
+	unsigned int key_depth, i;
 
 	if (!key_len || key_len > ja->max_key_len)
 		return NULL;
@@ -1975,12 +1975,75 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key,
 
 	/*
 	 * Reached key_depth, check for terminal node: either external
- 	 * nodes or internal node associated with external nodes.
+	 * nodes or internal node associated with external nodes.
 	 */
 	if (ja_node_internal(node_flag)) {
 		struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
 		return rcu_dereference(metadata->external_nodes);
 	}
+	return (struct cds_ja_node *) node_flag;
+}
+
+struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key, size_t _key_len, size_t *_match_len)
+{
+	struct cds_ja_node *external_nodes, *partial_match_node = NULL;
+	size_t key_len = ja_key_len(ja, _key_len), partial_match_len = 0;
+	struct cds_ja_inode_flag *node_flag;
+	struct cds_ja_metadata *metadata;
+	unsigned int key_depth, i;
+
+	if (!key_len || key_len > ja->max_key_len)
+		return NULL;
+	key_depth = key_len + 1;
+	node_flag = rcu_dereference(ja->root);
+
+	/* level 0: root node */
+	if (!ja_node_ptr(node_flag))
+		return NULL;
+
+	for (i = 1; i < key_depth; i++) {
+		uint8_t iter_key;
+
+		iter_key = *(key++);
+		node_flag = ja_node_get_nth(node_flag, NULL, iter_key);
+		dbg_printf("cds_ja_lookup iter key lookup %u finds node_flag %p\n",
+				(unsigned int) iter_key, node_flag);
+
+		if (!ja_node_ptr(node_flag)) {
+			*_match_len = partial_match_len;
+			return partial_match_node;
+		}
+		/* Found external node. */
+		if (!ja_node_internal(node_flag)) {
+			*_match_len = i;
+			return (struct cds_ja_node *) node_flag;
+		}
+		/* Internal node: keep track of closest external node ancestor. */
+		metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+		external_nodes = rcu_dereference(metadata->external_nodes);
+		if (external_nodes) {
+			partial_match_node = external_nodes;
+			partial_match_len = i;
+		}
+	}
+
+	/*
+	 * Reached key_depth, check for terminal node: either external
+	 * nodes or internal node associated with external nodes.
+	 */
+	if (ja_node_internal(node_flag)) {
+		struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+		struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
+
+		if (external_nodes) {
+			*_match_len = key_len;
+			return external_nodes;
+		} else {
+			*_match_len = partial_match_len;
+			return partial_match_node;
+		}
+	}
+	*_match_len = key_len;
 	return (struct cds_ja_node *) node_flag;
 }
 
@@ -1990,15 +2053,16 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		uint8_t *result_key, size_t *result_key_len,
 		enum ja_lookup_inequality mode)
 {
-	int max_tree_depth, level;
-	struct cds_ja_inode_flag *node_flag, *cur_node_depth[JA_MAX_DEPTH];	//TODO var len
-	uint8_t cur_key[JA_MAX_DEPTH];	//TODO var len
+	int key_depth, level;
+	struct cds_ja_inode_flag *node_flag, *cur_node_depth[JA_MAX_DEPTH];
+	uint8_t cur_key[JA_MAX_DEPTH];	//TODO: JA_MAX_DEPTH - 1
 	enum ja_direction dir;
 	const uint8_t *iter_key = key;
 	size_t key_len = ja_key_len(ja, _key_len);
 
-	if (!key_len)
+	if (!key_len || key_len > ja->max_key_len)
 		return NULL;
+	key_depth = key_len + 1;
 
 	switch (mode) {
 	case JA_LOOKUP_GE:
@@ -2010,9 +2074,8 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		return NULL;
 	}
 
-	memset(cur_node_depth, 0, sizeof(cur_node_depth));
-	memset(cur_key, 0, sizeof(cur_key));
-	max_tree_depth = ja->max_tree_depth;	//TODO var len
+	memset(cur_node_depth, 0, sizeof(cur_node_depth));	//TODO: len = (key_depth + 1) * sizeof(void *)
+	memset(cur_key, 0, sizeof(cur_key));			//TODO: len = (key_depth)
 	node_flag = rcu_dereference(ja->root);
 	cur_node_depth[0] = node_flag;
 
@@ -2020,18 +2083,21 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	if (!ja_node_ptr(node_flag))
 		return NULL;
 
-	for (level = 1; level < max_tree_depth; level++) {	//TODO var len
+	for (level = 1; level < key_depth; level++) {	//TODO var len
 		uint8_t key_value;
 
 		key_value = *(iter_key++);
 		node_flag = ja_node_get_nth(node_flag, NULL, key_value);
 		if (!ja_node_ptr(node_flag))
 			break;
+		//closest ancestor ?
+		/* Found external node before end of key. */
+		if (i < key_depth - 1 && !ja_node_internal(node_flag))
+			break;
 		cur_key[level - 1] = key_value;
 		cur_node_depth[level] = node_flag;
 		dbg_printf("cds_ja_lookup_inequality iter key lookup %u finds node_flag %p\n",
 				(unsigned int) key_value, node_flag);
-		assert(level == max_tree_depth - 1 || ja_node_internal(node_flag));	//TODO var len
 	}
 
 	switch (mode) {

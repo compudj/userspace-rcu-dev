@@ -55,6 +55,24 @@ struct cds_ja_node {
 struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t key_len);
 
 /*
+ * cds_ja_lookup_partial - Look up by key, find closest partial match.
+ * @ja: The Judy array.
+ * @key: Key to look up.
+ * @key_len: Key length.
+ *           key_len > 0 is an explicit key length.
+ *           key_len == 0 use the key length of the Judy array.
+ * @match_len: Length of (partial) match.
+ *
+ * Returns the first node of a duplicate chain if a match is found, else
+ * returns NULL. If no node it found to completely match the key, the
+ * closest ancestor (partial match) is returned.
+ * A RCU read-side lock should be held across call to this function and
+ * use of its return value.
+ */
+struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key, size_t key_len, size_t *match_len);
+
+
+/*
  * cds_ja_lookup_lower_equal - Look up first node with key <= @key.
  * @ja: The Judy array.
  * @key: Key to look up.
