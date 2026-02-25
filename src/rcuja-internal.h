@@ -76,7 +76,6 @@ struct cds_ja_metadata {
 	struct cds_ja_node *external_nodes;	/* List of external nodes at this tree location. */
 	unsigned int nr_child;			/* Number of children in node. */
 	int fallback_removal_count;		/* Removals left keeping fallback. */
-	int level;				/* Level in the tree. */
 };
 
 struct cds_ja_metadata_alloc {

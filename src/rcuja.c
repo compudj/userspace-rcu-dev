@@ -1031,14 +1031,11 @@ int _ja_node_set_nth(const struct cds_ja_type *type,
 {
 	switch (type->type_class) {
 	case RCU_JA_LINEAR:
-		return ja_linear_node_set_nth(type, node, metadata, n,
-				child_node_flag);
+		return ja_linear_node_set_nth(type, node, metadata, n, child_node_flag);
 	case RCU_JA_POOL:
-		return ja_pool_node_set_nth(type, node, node_flag, metadata, n,
-				child_node_flag);
+		return ja_pool_node_set_nth(type, node, node_flag, metadata, n, child_node_flag);
 	case RCU_JA_PIGEON:
-		return ja_pigeon_node_set_nth(type, node, metadata, n,
-				child_node_flag);
+		return ja_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
 	case RCU_JA_NULL:
 		return -ENOSPC;
 	default:
@@ -1566,8 +1563,7 @@ int ja_node_recompact(enum ja_recompact mode,
 		struct cds_ja_metadata *metadata,
 		struct cds_ja_inode_flag **old_node_flag_ptr, uint8_t n,
 		struct cds_ja_inode_flag *child_node_flag,
-		struct cds_ja_inode_flag **nullify_node_flag_ptr,
-		int level)
+		struct cds_ja_inode_flag **nullify_node_flag_ptr)
 {
 	unsigned int new_type_index;
 	struct cds_ja_inode *new_node;
@@ -1661,12 +1657,8 @@ retry:		/* for fallback */
 		}
 
 		dbg_printf("Recompact inherit from %p\n", metadata);
-		if (metadata) {
+		if (metadata)
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
-			new_metadata->level = metadata->level;
-		} else {
-			new_metadata->level = level;
-		}
 		if (fallback)
 			new_metadata->fallback_removal_count =
 						JA_FALLBACK_REMOVAL_COUNT;
@@ -1880,32 +1872,29 @@ static
 int ja_node_set_nth(struct cds_ja *ja,
 		struct cds_ja_inode_flag **node_flag, uint8_t n,
 		struct cds_ja_inode_flag *child_node_flag,
-		struct cds_ja_metadata *metadata,
-		int level)
+		struct cds_ja_metadata *metadata)
 {
 	int ret;
 	unsigned int type_index;
 	const struct cds_ja_type *type;
 	struct cds_ja_inode *node;
 
-	dbg_printf("ja_node_set_nth for n=%u, node %p\n",
-		(unsigned int) n, ja_node_ptr(*node_flag));
+	dbg_printf("ja_node_set_nth for n=%u, node %p\n", (unsigned int) n, ja_node_ptr(*node_flag));
 
 	node = ja_node_ptr(*node_flag);
 	type_index = ja_node_type(*node_flag);
 	type = &ja_types[type_index];
-	ret = _ja_node_set_nth(type, node, *node_flag, metadata,
-			n, child_node_flag);
+	ret = _ja_node_set_nth(type, node, *node_flag, metadata, n, child_node_flag);
 	switch (ret) {
 	case -ENOSPC:
 		/* Not enough space in node, need to recompact to next type. */
 		ret = ja_node_recompact(JA_RECOMPACT_ADD_NEXT, ja, type_index, type, node,
-				metadata, node_flag, n, child_node_flag, NULL, level);
+					metadata, node_flag, n, child_node_flag, NULL);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ja_node_recompact(JA_RECOMPACT_ADD_SAME, ja, type_index, type, node,
-				metadata, node_flag, n, child_node_flag, NULL, level);
+					metadata, node_flag, n, child_node_flag, NULL);
 		break;
 	}
 	return ret;
@@ -1920,7 +1909,7 @@ int ja_node_clear_ptr(struct cds_ja *ja,
 		struct cds_ja_inode_flag **node_flag_ptr,	/* Pointer to location to nullify */
 		struct cds_ja_inode_flag **parent_node_flag_ptr,	/* Address of parent ptr in its parent */
 		struct cds_ja_metadata *metadata,		/* of parent */
-		uint8_t n, int level)
+		uint8_t n)
 {
 	int ret;
 	unsigned int type_index;
@@ -1938,7 +1927,7 @@ int ja_node_clear_ptr(struct cds_ja *ja,
 		/* Should try recompaction. */
 		ret = ja_node_recompact(JA_RECOMPACT_DEL, ja, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
-				node_flag_ptr, level);
+				node_flag_ptr);
 	}
 	return ret;
 }
@@ -2301,12 +2290,13 @@ int ja_attach_node(struct cds_ja *ja,
 		struct cds_ja_inode_flag **old_node_flag_ptr,
 		struct cds_ja_inode_flag *old_node_flag,
 		const uint8_t *key,
+		size_t key_len,
 		unsigned int level,
 		struct cds_ja_node *child_node)
 {
 	struct cds_ja_metadata *metadata = NULL;
 	struct cds_ja_inode_flag *iter_node_flag, *iter_dest_node_flag,
-				*created_nodes[JA_MAX_DEPTH];	//TODO var len
+				*created_nodes[JA_MAX_DEPTH];
 	int ret, i, nr_created_nodes = 0;
 	const uint8_t *iter_key = key + ja->key_len;
 
@@ -2327,15 +2317,14 @@ int ja_attach_node(struct cds_ja *ja,
 	/* Create new branch, starting from bottom */
 	iter_node_flag = (struct cds_ja_inode_flag *) child_node;
 
-	for (i = ja->max_tree_depth - 1; i >= (int) level; i--) {	//TODO var len
+	for (i = key_len + 1; i >= (int) level; i--) {
 		uint8_t key_value;
 
 		key_value = *(--iter_key);
 		dbg_printf("branch creation level %d, key %u\n",
 				i, (unsigned int) key_value);
 		iter_dest_node_flag = NULL;
-		ret = ja_node_set_nth(ja, &iter_dest_node_flag, key_value,
-			iter_node_flag, NULL, level - 1);
+		ret = ja_node_set_nth(ja, &iter_dest_node_flag, key_value, iter_node_flag, NULL);
 		if (ret) {
 			dbg_printf("branch creation error %d\n", ret);
 			goto check_error;
@@ -2359,8 +2348,7 @@ int ja_attach_node(struct cds_ja *ja,
 				level - 1, (unsigned int) key_value);
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
-		ret = ja_node_set_nth(ja, &iter_dest_node_flag, key_value,
-			iter_node_flag, metadata, level - 1);
+		ret = ja_node_set_nth(ja, &iter_dest_node_flag, key_value, iter_node_flag, metadata);
 		if (ret) {
 			dbg_printf("branch publish error %d\n", ret);
 			goto check_error;
@@ -2451,7 +2439,7 @@ retry:
 		attach_node_flag_ptr = parent_node_flag_ptr;
 
 		ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
-				node_flag_ptr, node_flag, key, i, node);
+				node_flag_ptr, node_flag, key, key_len, i, node);
 	} else {
 		struct cds_ja_node *iter_node, *last_node = NULL;
 
