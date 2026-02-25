@@ -1992,10 +1992,13 @@ struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key,
 	struct cds_ja_metadata *metadata;
 	unsigned int key_depth, i;
 
-	if (!key_len || key_len > ja->max_key_len) {
+	if (!key_len) {
 		*_match_len = 0;
 		return NULL;
 	}
+	/* If key_len is larger than max_key_len, return partial match. */
+	if (key_len > ja->max_key_len)
+		key_len = ja->max_key_len;
 	key_depth = key_len + 1;
 	node_flag = rcu_dereference(ja->root);
 
