@@ -1939,7 +1939,7 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t 
 	struct cds_ja_metadata *metadata;
 	unsigned int key_depth, i;
 
-	if (!key_len || key_len > ja->max_key_len)
+	if (!valid_key_len(ja, key_len))
 		return NULL;
 	key_depth = key_len + 1;
 	node_flag = rcu_dereference(ja->root);
@@ -1980,7 +1980,7 @@ struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key,
 	struct cds_ja_inode_flag *node_flag;
 	unsigned int key_depth, i;
 
-	if (!key_len || key_len > ja->max_key_len)
+	if (!valid_key_len(ja, key_len))
 		goto end;
 	key_depth = key_len + 1;
 	node_flag = rcu_dereference(ja->root);
@@ -2039,7 +2039,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	const uint8_t *iter_key = key;
 	size_t key_len = ja_key_len(ja, _key_len);
 
-	if (!key_len || key_len > ja->max_key_len)
+	if (!valid_key_len(ja, key_len))
 		return NULL;
 	key_depth = key_len + 1;
 
@@ -2344,8 +2344,7 @@ int ja_attach_node(struct cds_ja *ja,
 		uint8_t key_value;
 
 		key_value = *(--iter_key);
-		dbg_printf("publish branch at level %d, key %u\n",
-				level - 1, (unsigned int) key_value);
+		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
 		ret = ja_node_set_nth(ja, &iter_dest_node_flag, key_value, iter_node_flag, metadata);
@@ -2401,7 +2400,7 @@ int _cds_ja_add(struct cds_ja *ja,
 	if (!valid_external_node(node) || !valid_key_len(ja, key_len))
 		return -EINVAL;
 
-	max_tree_depth = ja->max_tree_depth;	//TODO var len
+	key_depth = key_len + 1;
 
 retry:
 	dbg_printf("cds_ja_add attempt: node %p\n", node);
@@ -2411,11 +2410,13 @@ retry:
 	node_flag = rcu_dereference(ja->root);
 	node_flag_ptr = &ja->root;
 
-	/* Iterate on all internal levels */
-	for (i = 1; i < max_tree_depth; i++) {	//TODO var len
+	for (i = 1; i < key_depth; i++) {
 		uint8_t key_value;
 
 		if (!ja_node_ptr(node_flag))
+			break;
+		/* Found external node before end of key. */
+		if (i < key_depth - 1 && !ja_node_internal(node_flag))
 			break;
 		dbg_printf("cds_ja_add iter parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
@@ -2427,9 +2428,10 @@ retry:
 	}
 
 	/*
-	 * We reached either bottom of tree or internal NULL node,
+	 * We reached either end of key, external node, or internal NULL node,
 	 * simply add node to last internal level, or chain it if key is
 	 * already present.
+	 * TODO: ....
 	 */
 	if (!ja_node_ptr(node_flag)) {
 		dbg_printf("cds_ja_add NULL parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
