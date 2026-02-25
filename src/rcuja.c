@@ -1986,10 +1986,9 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t 
 
 struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key, size_t _key_len, size_t *_match_len)
 {
-	struct cds_ja_node *external_nodes, *match_node = NULL;
 	size_t key_len = ja_key_len(ja, _key_len), match_len = 0;
+	struct cds_ja_node *match_node = NULL;
 	struct cds_ja_inode_flag *node_flag;
-	struct cds_ja_metadata *metadata;
 	unsigned int key_depth, i;
 
 	if (!key_len)
@@ -2005,6 +2004,8 @@ struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key,
 		goto end;
 
 	for (i = 1; i < key_depth; i++) {
+		struct cds_ja_node *external_nodes;
+		struct cds_ja_metadata *metadata;
 		uint8_t iter_key;
 
 		iter_key = *(key++);
