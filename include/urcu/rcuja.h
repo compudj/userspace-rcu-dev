@@ -49,6 +49,7 @@ struct cds_ja_node {
  *
  * Returns the first node of a duplicate chain if a match is found, else
  * returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -66,6 +67,7 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t 
  * Returns the first node of a duplicate chain if a match is found, else
  * returns NULL. If no node it found to completely match the key, the
  * closest ancestor (partial match) is returned.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -83,6 +85,7 @@ struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key,
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key lower or equal to @key, else returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -102,6 +105,7 @@ struct cds_ja_node *cds_ja_lookup_lower_equal(struct cds_ja *ja,
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key greater or equal to @key, else returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -121,6 +125,7 @@ struct cds_ja_node *cds_ja_lookup_greater_equal(struct cds_ja *ja,
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key lower than @key, else returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -140,6 +145,7 @@ struct cds_ja_node *cds_ja_lookup_lower_than(struct cds_ja *ja,
  *
  * Returns the first node of a duplicate chain if a node is present in
  * the tree which has a key greater than @key, else returns NULL.
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  */
@@ -158,6 +164,7 @@ struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
  *
  * Returns 0 on success, negative error value on error.
  * A RCU read-side lock should be held across call to this function.
+ * Return -EINVAL if the key_len is larger than the Judy array max key length.
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
  */
@@ -175,6 +182,7 @@ int cds_ja_add(struct cds_ja *ja, const uint8_t *key, size_t key_len,
  *
  * Returns @node if successfully added, else returns the already
  * existing node (acts as a RCU lookup).
+ * Return NULL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function and
  * use of its return value.
  * Mutual exclusion between updates (add, add_unique, del) is the user
@@ -193,6 +201,7 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
  * @node: Node to remove.
  *
  * Returns 0 on success, negative error value on error.
+ * Return -EINVAL if the key_len is larger than the Judy array max key length.
  * A RCU read-side lock should be held across call to this function.
  * Mutual exclusion between updates (add, add_unique, del) is the user
  * responsibility.
