@@ -2624,8 +2624,13 @@ void ja_unchain_node(struct cds_ja_node **prev_node_ptr,
  *         head is an standalone external nodes pointer. The external
  *         nodes list for this key should be removed. Removing an
  *         external nodes list should prune the entire branch leading to
- *         that list so no lookup observe an empty branch. This is done
- *         by ja_detach_node().
+ *         that list so no lookup observe empty internal nodes. This is
+ *         done by ja_detach_node(). Internal nodes are considered empty
+ *         if they have no internal and no external node children, *and*
+ *         their associated list of external nodes is empty. When
+ *         detaching an internal node which has no children, but has
+ *         an associated list of external nodes, it is replaced by a
+ *         pointer to the external nodes.
  *    2.2) The node is within an external nodes list which is associated
  *         with an internal node. Unlink the node from its list, leaving
  *         the external nodes list empty.
