@@ -2614,6 +2614,21 @@ void ja_unchain_node(struct cds_ja_node **prev_node_ptr,
 
 /*
  * Called with RCU read lock held.
+ *
+ * There are a few cases to cover for delete:
+ *
+ * 1) The node belongs to a list of external nodes duplicates with two
+ *    or more items. Remove the node by unlinking it from its list.
+ * 2) There is only one external node within this node's list.
+ *    2.1) The node is within an external nodes list for which the list
+ *         head is an standalone external nodes pointer. The external
+ *         nodes list for this key should be removed. Removing an
+ *         external nodes list should prune the entire branch leading to
+ *         that list so no lookup observe an empty branch. This is done
+ *         by ja_detach_node().
+ *    2.2) The node is within an external nodes list which is associated
+ *         with an internal node. Unlink the node from its list, leaving
+ *         the external nodes list empty.
  */
 int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t _key_len,
 		struct cds_ja_node *node)
