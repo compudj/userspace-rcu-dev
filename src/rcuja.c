@@ -2403,7 +2403,7 @@ int _cds_ja_add(struct cds_ja *ja,
 		struct cds_ja_node *node,
 		struct cds_ja_node **unique_node_ret)
 {
-	unsigned int i, key_depth;	//TODO var len
+	unsigned int i, key_depth;
 	struct cds_ja_inode_flag *attach_node_flag, *parent_node_flag,
 		*parent2_node_flag, *node_flag;
 	struct cds_ja_inode_flag **attach_node_flag_ptr,
@@ -2688,7 +2688,7 @@ int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t _key_len,
 	if (!valid_external_node(node) || !valid_key_len(ja, key_len))
 		return -EINVAL;
 
-	max_tree_depth = ja->max_tree_depth;				//TODO var len
+	key_depth = key_len + 1;
 
 retry:
 	nr_snapshot = 0;
@@ -2704,7 +2704,7 @@ retry:
 	node_flag_ptr = &ja->root;
 
 	/* Iterate on all internal levels */
-	for (i = 1; i < max_tree_depth; i++) {			//TODO var len
+	for (i = 1; i < key_depth; i++) {
 		uint8_t key_value;
 
 		dbg_printf("cds_ja_del iter node_flag %p\n",
@@ -2724,13 +2724,15 @@ retry:
 				prev_node_flag_ptr);
 	}
 	/*
-	 * We reached bottom of tree, try to find the node we are trying
-	 * to remove. Fail if we cannot find it.
+	 * We reached end of key, try to find the node we are trying to
+	 * remove. Fail if we cannot find it.
 	 */
 	if (!ja_node_ptr(node_flag)) {
 		dbg_printf("cds_ja_del: no node found for key\n");
 		return -ENOENT;
 	}
+
+	//TODO: two cases: either external or internal node.
 
 	/*
 	 * Find the previous node's next pointer pointing to our node,
@@ -2759,6 +2761,7 @@ retry:
 	assert(count > 0);
 
 	if (count == 1) {
+		//TODO
 		/*
 		 * Removing last of duplicates. Last snapshot
 		 * does not have metadata (external leafs).
