@@ -2442,40 +2442,76 @@ retry:
 		node_flag = ja_node_get_nth(node_flag, &node_flag_ptr, key_value);
 	}
 
-	/*
-	 * We reached either end of key, external node, or internal NULL node,
-	 * simply add node to last internal level, or chain it if key is
-	 * already present.
-	 * TODO: ....
-	 */
-	if (!ja_node_ptr(node_flag)) {
-		dbg_printf("cds_ja_add NULL parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
-				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
+	if (i == key_depth - 1) {
+		/* Found either an internal or external node at end of key. */
+		if (ja_node_internal(node_flag)) {
+			struct cds_ja_node *external_nodes;
+			struct cds_ja_metadata *metadata;
 
-		attach_node_flag = parent_node_flag;
-		attach_node_flag_ptr = parent_node_flag_ptr;
+			metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+			external_nodes = rcu_dereference(metadata->external_nodes);
+			if (external_nodes) {
+				struct cds_ja_node *iter_node, *last_node = NULL;
 
-		ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
-				node_flag_ptr, node_flag, key, key_len, i, node);
-	} else {
-		struct cds_ja_node *iter_node, *last_node = NULL;
+				if (unique_node_ret) {
+					*unique_node_ret = external_nodes;
+					return -EEXIST;
+				}
+				/* Find last duplicate */
+				iter_node = external_nodes;
+				cds_ja_for_each_duplicate_rcu(iter_node)
+					last_node = iter_node;
 
-		if (unique_node_ret) {
-			*unique_node_ret = (struct cds_ja_node *) ja_node_ptr(node_flag);
-			return -EEXIST;
+				dbg_printf("cds_ja_add duplicate internal parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+						parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
+
+				ja_chain_node(last_node, node);
+				ret = 0;
+			} else {
+				metadata->external_nodes = node;
+				ret = 0;
+			}
+		} else {
+			struct cds_ja_node *iter_node, *last_node = NULL;
+
+			if (unique_node_ret) {
+				*unique_node_ret = (struct cds_ja_node *) ja_node_ptr(node_flag);
+				return -EEXIST;
+			}
+			/* Find last duplicate */
+			iter_node = ja_node_ptr(node_flag);
+			cds_ja_for_each_duplicate_rcu(iter_node)
+				last_node = iter_node;
+
+			dbg_printf("cds_ja_add duplicate external parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+					parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
+
+			ja_chain_node(last_node, node);
+			ret = 0;
 		}
+	} else {
+		/* Found NULL node or external node before end of key. */
+		if (!ja_node_ptr(node_flag)) {
+			dbg_printf("cds_ja_add NULL parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+					parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
 
-		/* Find last duplicate */
-		iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
-		cds_ja_for_each_duplicate_rcu(iter_node)
-			last_node = iter_node;
+			attach_node_flag = parent_node_flag;
+			attach_node_flag_ptr = parent_node_flag_ptr;
 
-		dbg_printf("cds_ja_add duplicate parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
-				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
-
-		ja_chain_node(last_node, node);
-		ret = 0;
+			ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
+					node_flag_ptr, node_flag, key, key_len, i, node);
+		} else {
+			/*
+			 * The last node encountered during traversal is an external node. Need to
+			 * transform this external node into an internal node with associated
+			 * external node, attach a new cluster as child of this internal node, and
+			 * populate this new internal node into the tree to replace the prior
+			 * external node.
+			 */
+			//TODO
+		}
 	}
+
 	if (ret == -EAGAIN || ret == -EEXIST)
 		goto retry;
 
