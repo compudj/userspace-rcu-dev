@@ -1936,7 +1936,6 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t 
 {
 	size_t key_len = ja_key_len(ja, _key_len);
 	struct cds_ja_inode_flag *node_flag;
-	struct cds_ja_metadata *metadata;
 	unsigned int key_depth, i;
 
 	if (!valid_key_len(ja, key_len))
@@ -2034,7 +2033,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 {
 	int key_depth, level;
 	struct cds_ja_inode_flag *node_flag, *cur_node_depth[JA_MAX_DEPTH];
-	uint8_t cur_key[JA_MAX_DEPTH];	//TODO: JA_MAX_DEPTH - 1
+	uint8_t cur_key[JA_MAX_DEPTH - 1];
 	enum ja_direction dir;
 	const uint8_t *iter_key = key;
 	size_t key_len = ja_key_len(ja, _key_len);
@@ -2053,8 +2052,8 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		return NULL;
 	}
 
-	memset(cur_node_depth, 0, sizeof(cur_node_depth));	//TODO: len = (key_depth + 1) * sizeof(void *)
-	memset(cur_key, 0, sizeof(cur_key));			//TODO: len = (key_depth)
+	memset(cur_node_depth, 0, (ja->max_tree_depth + 1) * sizeof(cur_node_depth));
+	memset(cur_key, 0, ja->max_tree_depth * sizeof(cur_key));
 	node_flag = rcu_dereference(ja->root);
 	cur_node_depth[0] = node_flag;
 
@@ -2062,7 +2061,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	if (!ja_node_ptr(node_flag))
 		return NULL;
 
-	for (level = 1; level < key_depth; level++) {	//TODO var len
+	for (level = 1; level < key_depth; level++) {
 		uint8_t key_value;
 
 		key_value = *(iter_key++);
@@ -2194,7 +2193,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	default:
 		assert(0);
 	}
-	for (; level < key_depth; level++) {
+	for (; level < ja->max_tree_depth; level++) {
 		/*
 		 * Return external node if trying to find GE/GT
 		 * inequality and encountering an external node when
@@ -2383,7 +2382,7 @@ void ja_chain_node(struct cds_ja_node *last_node, struct cds_ja_node *node)
 }
 
 /*
- * There are a few cases to cover for add:
+ * There are a few cases to cover for add: TODO
  *
  * 1) There is already an external node at that key. Chain this new node
  *    with the existing node (duplicate).
@@ -2404,7 +2403,7 @@ int _cds_ja_add(struct cds_ja *ja,
 		struct cds_ja_node *node,
 		struct cds_ja_node **unique_node_ret)
 {
-	unsigned int max_tree_depth, i;	//TODO var len
+	unsigned int i, key_depth;	//TODO var len
 	struct cds_ja_inode_flag *attach_node_flag, *parent_node_flag,
 		*parent2_node_flag, *node_flag;
 	struct cds_ja_inode_flag **attach_node_flag_ptr,
@@ -2615,7 +2614,7 @@ void ja_unchain_node(struct cds_ja_node **prev_node_ptr,
 /*
  * Called with RCU read lock held.
  *
- * There are a few cases to cover for delete:
+ * There are a few cases to cover for delete: TODO
  *
  * 1) The node belongs to a list of external nodes duplicates with two
  *    or more items. Remove the node by unlinking it from its list.
