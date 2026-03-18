@@ -1050,10 +1050,11 @@ int _ja_node_set_nth(const struct cds_ja_type *type,
 }
 
 static
-int ja_linear_node_clear_ptr(const struct cds_ja_type *type,
+int ja_linear_node_replace_ptr(const struct cds_ja_type *type,
 		struct cds_ja_inode *node,
 		struct cds_ja_metadata *metadata,
-		struct cds_ja_inode_flag **node_flag_ptr)
+		struct cds_ja_inode_flag **node_flag_ptr,
+		struct cds_ja_inode_flag *newptr)
 {
 	uint8_t nr_child;
 	uint8_t *nr_child_ptr;
@@ -1064,16 +1065,16 @@ int ja_linear_node_clear_ptr(const struct cds_ja_type *type,
 	nr_child = *nr_child_ptr;
 	assert(nr_child <= type->max_linear_child);
 
-	if (type->type_class == RCU_JA_LINEAR) {
+	if (type->type_class == RCU_JA_LINEAR && !newptr) {
 		assert(!metadata->fallback_removal_count);
 		if (metadata->nr_child <= type->min_child) {
 			/* We need to try recompacting the node */
 			return -EFBIG;
 		}
 	}
-	dbg_printf("linear clear ptr: nr_child_ptr %p\n", nr_child_ptr);
+	dbg_printf("linear replace ptr: nr_child_ptr %p\n", nr_child_ptr);
 	assert(*node_flag_ptr != NULL);
-	rcu_assign_pointer(*node_flag_ptr, NULL);
+	rcu_assign_pointer(*node_flag_ptr, newptr);
 	/*
 	 * Value and nr_child are never changed (would cause ABA issue).
 	 * Instead, we leave the pointer to NULL and recompact the node
@@ -1081,32 +1082,36 @@ int ja_linear_node_clear_ptr(const struct cds_ja_type *type,
 	 * value without recompaction though.
 	 * Only update the metadata node accounting.
 	 */
-	metadata->nr_child--;
-	dbg_printf("linear clear ptr: %u child, metadata: %u child, for node %p\n",
+	if (!newptr)
+		metadata->nr_child--;
+	dbg_printf("linear replace ptr: %u child, metadata: %u child, for node %p newptr %p\n",
 		(unsigned int) uatomic_load(nr_child_ptr, CMM_RELAXED),
 		(unsigned int) metadata->nr_child,
-		node);
+		node, newptr);
 	return 0;
 }
 
 static
-int ja_pool_node_clear_ptr(const struct cds_ja_type *type,
+int ja_pool_node_replace_ptr(const struct cds_ja_type *type,
 		struct cds_ja_inode *node,
 		struct cds_ja_inode_flag *node_flag,
 		struct cds_ja_metadata *metadata,
 		struct cds_ja_inode_flag **node_flag_ptr,
-		uint8_t n)
+		uint8_t n,
+		struct cds_ja_inode_flag *newptr)
 {
 	struct cds_ja_inode *linear;
 
 	assert(type->type_class == RCU_JA_POOL);
 
-	if (metadata->fallback_removal_count) {
-		metadata->fallback_removal_count--;
-	} else {
-		/* We should try recompacting the node */
-		if (metadata->nr_child <= type->min_child)
-			return -EFBIG;
+	if (!newptr) {
+		if (metadata->fallback_removal_count) {
+			metadata->fallback_removal_count--;
+		} else {
+			/* We should try recompacting the node */
+			if (metadata->nr_child <= type->min_child)
+				return -EFBIG;
+		}
 	}
 
 	switch (type->nr_pool_order) {
@@ -1136,49 +1141,53 @@ int ja_pool_node_clear_ptr(const struct cds_ja_type *type,
 		assert(0);
 	}
 
-	return ja_linear_node_clear_ptr(type, linear, metadata, node_flag_ptr);
+	return ja_linear_node_replace_ptr(type, linear, metadata, node_flag_ptr, newptr);
 }
 
 static
-int ja_pigeon_node_clear_ptr(const struct cds_ja_type *type,
+int ja_pigeon_node_replace_ptr(const struct cds_ja_type *type,
 		struct cds_ja_metadata *metadata,
-		struct cds_ja_inode_flag **node_flag_ptr)
+		struct cds_ja_inode_flag **node_flag_ptr,
+		struct cds_ja_inode_flag *newptr)
 {
 	assert(type->type_class == RCU_JA_PIGEON);
 
-	if (metadata->fallback_removal_count) {
-		metadata->fallback_removal_count--;
-	} else {
-		/* We should try recompacting the node */
-		if (metadata->nr_child <= type->min_child)
-			return -EFBIG;
+	if (!newptr) {
+		if (metadata->fallback_removal_count) {
+			metadata->fallback_removal_count--;
+		} else {
+			/* We should try recompacting the node */
+			if (metadata->nr_child <= type->min_child)
+				return -EFBIG;
+		}
 	}
-	dbg_printf("ja_pigeon_node_clear_ptr: clearing ptr: %p\n", *node_flag_ptr);
+	dbg_printf("ja_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
 	assert(*node_flag_ptr != NULL);
-	rcu_assign_pointer(*node_flag_ptr, NULL);
-	metadata->nr_child--;
+	rcu_assign_pointer(*node_flag_ptr, newptr);
+	if (!newptr)
+		metadata->nr_child--;
 	return 0;
 }
 
 /*
- * _ja_node_clear_ptr: clear ptr item within a node. Return an error
+ * _ja_node_replace_ptr: replace ptr item within a node. Return an error
  * (negative error value) if it is not found (-ENOENT).
  */
 static
-int _ja_node_clear_ptr(const struct cds_ja_type *type,
+int _ja_node_replace_ptr(const struct cds_ja_type *type,
 		struct cds_ja_inode *node,
 		struct cds_ja_inode_flag *node_flag,
 		struct cds_ja_metadata *metadata,
 		struct cds_ja_inode_flag **node_flag_ptr,
-		uint8_t n)
+		uint8_t n, struct cds_ja_inode *newptr)
 {
 	switch (type->type_class) {
 	case RCU_JA_LINEAR:
-		return ja_linear_node_clear_ptr(type, node, metadata, node_flag_ptr);
+		return ja_linear_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
 	case RCU_JA_POOL:
-		return ja_pool_node_clear_ptr(type, node, node_flag, metadata, node_flag_ptr, n);
+		return ja_pool_node_replace_ptr(type, node, node_flag, metadata, node_flag_ptr, n, newptr);
 	case RCU_JA_PIGEON:
-		return ja_pigeon_node_clear_ptr(type, metadata, node_flag_ptr);
+		return ja_pigeon_node_replace_ptr(type, metadata, node_flag_ptr, newptr);
 	case RCU_JA_NULL:
 		return -ENOENT;
 	default:
@@ -1909,25 +1918,27 @@ int ja_node_set_nth(struct cds_ja *ja,
  * error value otherwise.
  */
 static
-int ja_node_clear_ptr(struct cds_ja *ja,
-		struct cds_ja_inode_flag **node_flag_ptr,	/* Pointer to location to nullify */
+int ja_node_replace_ptr(struct cds_ja *ja,
+		struct cds_ja_inode_flag **node_flag_ptr,		/* Pointer to location to nullify */
 		struct cds_ja_inode_flag **parent_node_flag_ptr,	/* Address of parent ptr in its parent */
-		struct cds_ja_metadata *metadata,		/* of parent */
-		uint8_t n)
+		struct cds_ja_metadata *metadata,			/* of parent */
+		uint8_t n,
+		struct cds_ja_inode_flag *newptr)
 {
 	int ret;
 	unsigned int type_index;
 	const struct cds_ja_type *type;
 	struct cds_ja_inode *node;
 
-	dbg_printf("ja_node_clear_ptr for node %p, target ptr %p\n",
+	dbg_printf("ja_node_replace_ptr for node %p, target ptr %p\n",
 		ja_node_ptr(*parent_node_flag_ptr), node_flag_ptr);
 
 	node = ja_node_ptr(*parent_node_flag_ptr);
 	type_index = ja_node_type(*parent_node_flag_ptr);
 	type = &ja_types[type_index];
-	ret = _ja_node_clear_ptr(type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n);
+	ret = _ja_node_replace_ptr(type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr);
 	if (ret == -EFBIG) {
+		assert(!newptr);
 		/* Should try recompaction. */
 		ret = ja_node_recompact(JA_RECOMPACT_DEL, ja, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
@@ -2585,14 +2596,17 @@ int ja_detach_node(struct cds_ja *ja,
 	struct cds_ja_inode_flag *iter_node_flag;
 	int ret, i, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
 	uint8_t n = 0;
+	struct cds_ja_node *topmost_external_nodes = NULL;
+	bool prev_external_nodes_found = false;
 
 	/*
 	 * From the last internal level node going up, lookup the
 	 * metadata, check if the node has only one child left. If it is
 	 * the case, we continue iterating upward. When we reach a node
-	 * which has more that one child left, we lookup the parent, and
-	 * proceed to the node deletion (removing its children too).
-	//TODO
+	 * which has more that one child left or has an associated
+	 * external node, we lookup the parent, and proceed to the node
+	 * deletion (removing its children too), replacing it with its
+	 * external node pointer (if any).
 	 */
 	for (i = nr_snapshot - 2; i >= 1; i--) {
 		struct cds_ja_metadata *metadata;
@@ -2605,11 +2619,16 @@ int ja_detach_node(struct cds_ja *ja,
 				!= ja_node_ptr(snapshot[i + 1])));
 
 		assert(metadata->nr_child > 0);
-		//TODO: take ext nodes into account
-		if (metadata->nr_child == 1 && i > 1)
+		if (!prev_external_nodes_found && (metadata->nr_child == 1 && i > 1)) {
 			nr_clear++;
+			/*
+			 * Keep track of the external nodes pointer of
+			 * the topmost internal node in the branch.
+			 */
+			topmost_external_nodes = metadata->external_nodes;
+		}
 		nr_branch++;
-		if (metadata->nr_child > 1 || i == 1) {
+		if (prev_external_nodes_found || metadata->nr_child > 1 || i == 1) {
 			if (snapshot[i - 1] != (struct cds_ja_inode_flag *) &ja->root) {
 				metadata = cds_ja_item_to_metadata(ja_node_ptr(snapshot[i - 1]));
 			} else {
@@ -2628,30 +2647,28 @@ int ja_detach_node(struct cds_ja *ja,
 			parent_node_flag = snapshot[i];
 			break;
 		}
+		if (topmost_external_nodes)
+			prev_external_nodes_found = true;
 	}
 
 	/*
 	 * At this point, we want to delete all nodes that are about to
 	 * be removed from metadata_stack (except the last one, which is
-	 * either the root or the parent of the upmost node with 1
+	 * either the root or the parent of the topmost node with 1
 	 * child).
 	 */
 	for (i = 0; i < nr_clear; i++)
 		free_cds_ja_node(ja, cds_ja_metadata_to_item(metadata_stack[i]));
 
-	if (no external nodes) {
-		iter_node_flag = parent_node_flag;
-		/* Remove from parent */
-		ret = ja_node_clear_ptr(ja,
-			node_flag_ptr, 		/* Pointer to location to nullify */
-			&iter_node_flag,	/* Old new parent ptr in its parent */
-			metadata_stack[nr_branch - 1],	/* of parent */
-			n, nr_branch - 1);
-		if (ret)
-			goto end;
-	} else {
-		/* TODO */
-	}
+	iter_node_flag = parent_node_flag;
+	/* Replace within parent */
+	ret = ja_node_replace_ptr(ja,
+		node_flag_ptr, 		/* Pointer to location to nullify */
+		&iter_node_flag,	/* Old new parent ptr in its parent */
+		metadata_stack[nr_branch - 1],	/* of parent */
+		n, nr_branch - 1, topmost_external_nodes);
+	if (ret)
+		goto end;
 
 	dbg_printf("ja_detach_node: publish %p instead of %p\n",
 		iter_node_flag, *parent_node_flag_ptr);
@@ -2672,7 +2689,7 @@ void ja_unchain_node(struct cds_ja_node **prev_node_ptr,
 /*
  * Called with RCU read lock held.
  *
- * There are a few cases to cover for delete: TODO
+ * There are a few cases to cover for delete:
  *
  * 1) The node belongs to a list of external nodes duplicates with two
  *    or more items. Remove the node by unlinking it from its list.
