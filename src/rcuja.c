@@ -2339,7 +2339,7 @@ int ja_attach_node(struct cds_ja *ja,
 	}
 	assert(level > 0);
 
-	/* Chain external node. */
+	/* Chain previous external node into new branch topmost internal node metadata. */
 	if (external_node) {
 		struct cds_ja_node *external_nodes;
 		struct cds_ja_metadata *iter_node_metadata;
