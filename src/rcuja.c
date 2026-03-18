@@ -2281,6 +2281,11 @@ struct cds_ja_node *cds_ja_lookup_greater_than(struct cds_ja *ja,
  * the new branch is populated, thus creating a cluster, before
  * attaching the cluster to the rest of the tree, thus making it visible
  * to lookups.
+ *
+ * @external_node argument is either NULL or a pointer to the external
+ * node we are replacing at the attachment location. We need to chain
+ * this external node in the topmost internal node external node list in
+ * that case.
  */
 static
 int ja_attach_node(struct cds_ja *ja,
@@ -2291,7 +2296,8 @@ int ja_attach_node(struct cds_ja *ja,
 		const uint8_t *key,
 		size_t key_len,
 		unsigned int level,
-		struct cds_ja_node *child_node)
+		struct cds_ja_node *child_node,
+		struct cds_ja_node *external_node)
 {
 	struct cds_ja_metadata *metadata = NULL;
 	struct cds_ja_inode_flag *iter_node_flag, *iter_dest_node_flag,
@@ -2333,7 +2339,16 @@ int ja_attach_node(struct cds_ja *ja,
 	}
 	assert(level > 0);
 
-	/* Publish branch */
+	/* Chain external node. */
+	if (external_node) {
+		struct cds_ja_node *external_nodes;
+		struct cds_ja_metadata *iter_node_metadata;
+
+		iter_node_metadata = cds_ja_item_to_metadata(ja_node_ptr(iter_node_flag));
+		iter_node_metadata->external_nodes = external_node;
+	}
+
+	/* Publish branch. */
 	if (level == 1) {
 		/*
 		 * Attaching to root node.
@@ -2351,9 +2366,7 @@ int ja_attach_node(struct cds_ja *ja,
 			dbg_printf("branch publish error %d\n", ret);
 			goto check_error;
 		}
-		/*
-		 * Attach branch
-		 */
+		/* Attach branch. */
 		rcu_assign_pointer(*attach_node_flag_ptr, iter_dest_node_flag);
 	}
 
@@ -2422,7 +2435,7 @@ retry:
 	parent2_node_flag = NULL;
 	parent_node_flag = (struct cds_ja_inode_flag *) &ja->root;
 	parent_node_flag_ptr = NULL;
-	node_flag = rcu_dereference(ja->root);
+	node_flag = ja->root;
 	node_flag_ptr = &ja->root;
 
 	for (i = 1; i < key_depth; i++) {
@@ -2449,7 +2462,7 @@ retry:
 			struct cds_ja_metadata *metadata;
 
 			metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
-			external_nodes = rcu_dereference(metadata->external_nodes);
+			external_nodes = metadata->external_nodes;
 			if (external_nodes) {
 				struct cds_ja_node *iter_node, *last_node = NULL;
 
@@ -2459,7 +2472,7 @@ retry:
 				}
 				/* Find last duplicate */
 				iter_node = external_nodes;
-				cds_ja_for_each_duplicate_rcu(iter_node)
+				cds_ja_for_each_duplicate(iter_node)
 					last_node = iter_node;
 
 				dbg_printf("cds_ja_add duplicate internal parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
@@ -2480,7 +2493,7 @@ retry:
 			}
 			/* Find last duplicate */
 			iter_node = ja_node_ptr(node_flag);
-			cds_ja_for_each_duplicate_rcu(iter_node)
+			cds_ja_for_each_duplicate(iter_node)
 				last_node = iter_node;
 
 			dbg_printf("cds_ja_add duplicate external parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
@@ -2491,24 +2504,24 @@ retry:
 		}
 	} else {
 		/* Found NULL node or external node before end of key. */
-		if (!ja_node_ptr(node_flag)) {
-			dbg_printf("cds_ja_add NULL parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
-					parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
 
-			attach_node_flag = parent_node_flag;
-			attach_node_flag_ptr = parent_node_flag_ptr;
+		/*
+		 * If the last node encountered during traversal is an external node,
+		 * transform this external node into an internal node with associated
+		 * external node, attach a new cluster as child of this internal node, and
+		 * populate this new internal node into the tree to replace the prior
+		 * external node.
+		 */
 
-			ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
-					node_flag_ptr, node_flag, key, key_len, i, node);
-		} else {
-			/*
-			 * The last node encountered during traversal is an external node. Need to
-			 * transform this external node into an internal node with associated
-			 * external node, attach a new cluster as child of this internal node, and
-			 * populate this new internal node into the tree to replace the prior
-			 * external node.
-			 */
-			//TODO
+		dbg_printf("cds_ja_add NULL or external parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
+
+		attach_node_flag = parent_node_flag;
+		attach_node_flag_ptr = parent_node_flag_ptr;
+
+		ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
+				node_flag_ptr, node_flag, key, key_len, i, node,
+				ja_node_ptr(node_flag));
 		}
 	}
 
@@ -2539,19 +2552,19 @@ struct cds_ja_node *cds_ja_add_unique(struct cds_ja *ja, const uint8_t *key,
 
 /*
  * Note: there is no need to lookup the pointer address associated with
- * each node's nth item: it's already been done by cds_ja_del while
- * holding the rcu read-side lock, and our node rules ensure that when a
- * match value -> pointer is found in a node, it is _NEVER_ changed for
- * that node without recompaction, and recompaction reallocates the
- * node.
- * However, when a child is removed from "linear" nodes, its pointer
- * is set to NULL. We therefore check if this pointer is NULL, and
- * return -ENOENT to the caller if it is the case.
+ * each node's nth item: it's already been done by cds_ja_del, and
+ * cds_ja_del is protected by mutual exclusion of updaters.
  *
  * ja_detach_node() ensures that a lookup will _never_ see a branch that
  * leads to a dead-end: when removing branch, it makes sure to perform
  * the "cut" at the highest node that has only one child, effectively
  * replacing it with a NULL pointer.
+ *
+ * Internal nodes are considered empty if they have no internal and no
+ * external node children, *and* their associated list of external nodes
+ * is empty. When detaching an internal node which has no children, but
+ * has an associated list of external nodes, it is replaced by a pointer
+ * to the external nodes.
  */
 static
 int ja_detach_node(struct cds_ja *ja,
@@ -2560,7 +2573,7 @@ int ja_detach_node(struct cds_ja *ja,
 		uint8_t *snapshot_n,
 		int nr_snapshot)
 {
-	struct cds_ja_metadata *metadata_stack[JA_MAX_DEPTH];	//TODO var len
+	struct cds_ja_metadata *metadata_stack[JA_MAX_DEPTH];
 	struct cds_ja_inode_flag **node_flag_ptr = NULL,
 			*parent_node_flag = NULL,
 			**parent_node_flag_ptr = NULL;
@@ -2568,14 +2581,13 @@ int ja_detach_node(struct cds_ja *ja,
 	int ret, i, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
 	uint8_t n = 0;
 
-	assert(nr_snapshot == (int)ja->max_tree_depth + 1);	//TODO var len
-
 	/*
 	 * From the last internal level node going up, lookup the
 	 * metadata, check if the node has only one child left. If it is
 	 * the case, we continue iterating upward. When we reach a node
 	 * which has more that one child left, we lookup the parent, and
 	 * proceed to the node deletion (removing its children too).
+	//TODO
 	 */
 	for (i = nr_snapshot - 2; i >= 1; i--) {
 		struct cds_ja_metadata *metadata;
@@ -2588,6 +2600,7 @@ int ja_detach_node(struct cds_ja *ja,
 				!= ja_node_ptr(snapshot[i + 1])));
 
 		assert(metadata->nr_child > 0);
+		//TODO: take ext nodes into account
 		if (metadata->nr_child == 1 && i > 1)
 			nr_clear++;
 		nr_branch++;
@@ -2621,15 +2634,19 @@ int ja_detach_node(struct cds_ja *ja,
 	for (i = 0; i < nr_clear; i++)
 		free_cds_ja_node(ja, cds_ja_metadata_to_item(metadata_stack[i]));
 
-	iter_node_flag = parent_node_flag;
-	/* Remove from parent */
-	ret = ja_node_clear_ptr(ja,
-		node_flag_ptr, 		/* Pointer to location to nullify */
-		&iter_node_flag,	/* Old new parent ptr in its parent */
-		metadata_stack[nr_branch - 1],	/* of parent */
-		n, nr_branch - 1);
-	if (ret)
-		goto end;
+	if (no external nodes) {
+		iter_node_flag = parent_node_flag;
+		/* Remove from parent */
+		ret = ja_node_clear_ptr(ja,
+			node_flag_ptr, 		/* Pointer to location to nullify */
+			&iter_node_flag,	/* Old new parent ptr in its parent */
+			metadata_stack[nr_branch - 1],	/* of parent */
+			n, nr_branch - 1);
+		if (ret)
+			goto end;
+	} else {
+		/* 
+	}
 
 	dbg_printf("ja_detach_node: publish %p instead of %p\n",
 		iter_node_flag, *parent_node_flag_ptr);
@@ -2732,47 +2749,83 @@ retry:
 		return -ENOENT;
 	}
 
-	//TODO: two cases: either external or internal node.
+	if (ja_node_internal(node_flag)) {
+		/* Found internal node at end of key. */
+		struct cds_ja_node *external_nodes;
+		struct cds_ja_metadata *metadata;
 
-	/*
-	 * Find the previous node's next pointer pointing to our node,
-	 * so we can update it.
-	 */
-	prev_node_ptr = NULL;
-	iter_node_ptr = (struct cds_ja_node **) node_flag_ptr;
-	iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
-	count = 0;
-	match = NULL;
-	cds_ja_for_each_duplicate(iter_node) {
-		count++;
-		if (match)
-			continue;
-		dbg_printf("cds_ja_del: compare %p with iter_node %p\n", node, iter_node);
-		if (iter_node == node) {
-			prev_node_ptr = iter_node_ptr;
-			match = iter_node;
+		metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+		external_nodes = metadata->external_nodes;
+		if (external_nodes) {
+			/*
+			 * Find the previous node's next pointer pointing to our node,
+			 * so we can update it.
+			 */
+			prev_node_ptr = NULL;
+			iter_node_ptr = (struct cds_ja_node **) &metadata->external_nodes;
+			iter_node = (struct cds_ja_node *) external_nodes;
+			match = NULL;
+			cds_ja_for_each_duplicate(iter_node) {
+				if (match)
+					continue;
+				dbg_printf("cds_ja_del: compare %p with iter_node %p\n", node, iter_node);
+				if (iter_node == node) {
+					prev_node_ptr = iter_node_ptr;
+					match = iter_node;
+				}
+				iter_node_ptr = &iter_node->next;
+			}
+			if (!match) {
+				dbg_printf("cds_ja_del: no node match for node %p key\n", node);
+				return -ENOENT;
+			}
+			ja_unchain_node(prev_node_ptr, match);
+			ret = 0;
+		} else {
+			dbg_printf("cds_ja_del: no metadata external node found for key\n");
+			return -ENOENT;
 		}
-		iter_node_ptr = &iter_node->next;
-	}
-	if (!match) {
-		dbg_printf("cds_ja_del: no node match for node %p key\n", node);
-		return -ENOENT;
-	}
-	assert(count > 0);
-
-	if (count == 1) {
-		//TODO
-		/*
-		 * Removing last of duplicates. Last snapshot
-		 * does not have metadata (external leafs).
-		 */
-		snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
-		snapshot[nr_snapshot++] = node_flag;
-		ret = ja_detach_node(ja, snapshot, snapshot_ptr,
-				snapshot_n, nr_snapshot);
 	} else {
-		ja_unchain_node(prev_node_ptr, match);
-		ret = 0;
+		/* Found external node at end of key. */
+
+		/*
+		 * Find the previous node's next pointer pointing to our node,
+		 * so we can update it.
+		 */
+		prev_node_ptr = NULL;
+		iter_node_ptr = (struct cds_ja_node **) node_flag_ptr;
+		iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
+		count = 0;
+		match = NULL;
+		cds_ja_for_each_duplicate(iter_node) {
+			count++;
+			if (match)
+				continue;
+			dbg_printf("cds_ja_del: compare %p with iter_node %p\n", node, iter_node);
+			if (iter_node == node) {
+				prev_node_ptr = iter_node_ptr;
+				match = iter_node;
+			}
+			iter_node_ptr = &iter_node->next;
+		}
+		if (!match) {
+			dbg_printf("cds_ja_del: no node match for node %p key\n", node);
+			return -ENOENT;
+		}
+		assert(count > 0);
+		if (count == 1) {
+			/*
+			 * Removing last of duplicates. Last snapshot
+			 * does not have metadata (external leafs).
+			 */
+			snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
+			snapshot[nr_snapshot++] = node_flag;
+			ret = ja_detach_node(ja, snapshot, snapshot_ptr,
+					snapshot_n, nr_snapshot);
+		} else {
+			ja_unchain_node(prev_node_ptr, match);
+			ret = 0;
+		}
 	}
 
 	/*
