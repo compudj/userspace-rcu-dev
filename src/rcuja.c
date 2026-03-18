@@ -907,6 +907,7 @@ int ja_linear_node_set_nth(const struct cds_ja_type *type,
 	uint8_t *values, *nr_child_ptr;
 	struct cds_ja_inode_flag **pointers;
 	unsigned int i, unused = 0;
+	bool replace_old_ptr = false;
 
 	assert(type->type_class == RCU_JA_LINEAR || type->type_class == RCU_JA_POOL);
 
@@ -922,9 +923,8 @@ int ja_linear_node_set_nth(const struct cds_ja_type *type,
 	for (i = 0; i < nr_child; i++) {
 		if (values[i] == n) {
 			if (pointers[i])
-				return -EEXIST;
-			else
-				break;
+				replace_old_ptr = true;
+			break;
 		} else {
 			if (!pointers[i])
 				unused++;
@@ -937,18 +937,19 @@ int ja_linear_node_set_nth(const struct cds_ja_type *type,
 			return -ENOSPC;	/* No space left in this node type */
 	}
 
-	assert(pointers[i] == NULL);
 	/* If we expanded the nr_child, increment it */
 	if (i == nr_child) {
+		assert(pointers[i] == NULL);
 		uatomic_store(&pointers[i], child_node_flag, CMM_RELAXED);
 		uatomic_store(&values[nr_child], n, CMM_RELAXED);
 		/* store-release: write pointer and value before nr_child */
 		uatomic_store(nr_child_ptr, nr_child + 1, CMM_RELEASE);
 	} else {
-		/* Replacing a NULL pointer. */
+		/* Replacing a NULL or external node pointer. */
 		rcu_assign_pointer(pointers[i], child_node_flag);
 	}
-	metadata->nr_child++;
+	if (!replace_old_ptr)
+		metadata->nr_child++;
 	dbg_printf("linear set nth: %u child, metadata: %u child, for node %p\n",
 		(unsigned int) uatomic_load(nr_child_ptr, CMM_RELAXED),
 		(unsigned int) metadata->nr_child,
@@ -1007,13 +1008,15 @@ int ja_pigeon_node_set_nth(const struct cds_ja_type *type,
 		struct cds_ja_inode_flag *child_node_flag)
 {
 	struct cds_ja_inode_flag **ptr;
+	bool replace_old_ptr = false;
 
 	assert(type->type_class == RCU_JA_PIGEON);
 	ptr = &((struct cds_ja_inode_flag **) node->u.data)[n];
 	if (*ptr)
-		return -EEXIST;
+		replace_old_ptr = true;
 	rcu_assign_pointer(*ptr, child_node_flag);
-	metadata->nr_child++;
+	if (!replace_old_ptr)
+		metadata->nr_child++;
 	return 0;
 }
 
@@ -1151,6 +1154,7 @@ int ja_pigeon_node_clear_ptr(const struct cds_ja_type *type,
 			return -EFBIG;
 	}
 	dbg_printf("ja_pigeon_node_clear_ptr: clearing ptr: %p\n", *node_flag_ptr);
+	assert(*node_flag_ptr != NULL);
 	rcu_assign_pointer(*node_flag_ptr, NULL);
 	metadata->nr_child--;
 	return 0;
@@ -2395,7 +2399,7 @@ void ja_chain_node(struct cds_ja_node *last_node, struct cds_ja_node *node)
 }
 
 /*
- * There are a few cases to cover for add: TODO
+ * There are a few cases to cover for add:
  *
  * 1) There is already an external node at that key. Chain this new node
  *    with the existing node (duplicate).
