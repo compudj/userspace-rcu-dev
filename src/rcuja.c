@@ -2511,6 +2511,8 @@ retry:
 		 * external node, attach a new cluster as child of this internal node, and
 		 * populate this new internal node into the tree to replace the prior
 		 * external node.
+		 * It's the same for NULL node, only that there is no need to chain any
+		 * external node.
 		 */
 
 		dbg_printf("cds_ja_add NULL or external parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
@@ -2522,7 +2524,6 @@ retry:
 		ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
 				node_flag_ptr, node_flag, key, key_len, i, node,
 				ja_node_ptr(node_flag));
-		}
 	}
 
 	if (ret == -EAGAIN || ret == -EEXIST)
@@ -2645,7 +2646,7 @@ int ja_detach_node(struct cds_ja *ja,
 		if (ret)
 			goto end;
 	} else {
-		/* 
+		/* TODO */
 	}
 
 	dbg_printf("ja_detach_node: publish %p instead of %p\n",
@@ -2690,10 +2691,10 @@ void ja_unchain_node(struct cds_ja_node **prev_node_ptr,
 int cds_ja_del(struct cds_ja *ja, const uint8_t *key, size_t _key_len,
 		struct cds_ja_node *node)
 {
-	unsigned int max_tree_depth, i;				//TODO var len
-	struct cds_ja_inode_flag *snapshot[JA_MAX_DEPTH];	//TODO var len
-	struct cds_ja_inode_flag **snapshot_ptr[JA_MAX_DEPTH];	//TODO var len
-	uint8_t snapshot_n[JA_MAX_DEPTH];			//TODO var len
+	unsigned int i, key_depth;
+	struct cds_ja_inode_flag *snapshot[JA_MAX_DEPTH];
+	struct cds_ja_inode_flag **snapshot_ptr[JA_MAX_DEPTH];
+	uint8_t snapshot_n[JA_MAX_DEPTH];
 	struct cds_ja_inode_flag *node_flag;
 	struct cds_ja_inode_flag **prev_node_flag_ptr,
 		**node_flag_ptr;
