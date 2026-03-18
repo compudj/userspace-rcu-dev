@@ -2067,8 +2067,8 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		return NULL;
 	}
 
-	memset(cur_node_depth, 0, (ja->max_tree_depth + 1) * sizeof(cur_node_depth));
-	memset(cur_key, 0, ja->max_tree_depth * sizeof(cur_key));
+	memset(cur_node_depth, 0, (ja->max_tree_depth + 1) * sizeof(cur_node_depth[0]));
+	memset(cur_key, 0, ja->max_tree_depth * sizeof(cur_key[0]));
 	node_flag = rcu_dereference(ja->root);
 	cur_node_depth[0] = node_flag;
 
@@ -2215,10 +2215,22 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		 * going downward.
 		 */
 		if (dir == JA_LEFTMOST) {
-			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
-			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
+			if (ja_node_internal(node_flag)) {
+				struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+				struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
-			if (external_nodes) {
+				if (external_nodes) {
+					if (result_key) {
+						int i;
+
+						for (i = 1; i < level; i++)
+							*(result_key++) = cur_key[i - 1];
+					}
+					if (result_key_len)
+						*result_key_len = level - 1;
+					return external_nodes;
+				}
+			} else {
 				if (result_key) {
 					int i;
 
@@ -2227,7 +2239,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 				}
 				if (result_key_len)
 					*result_key_len = level - 1;
-				return external_nodes;
+				return (struct cds_ja_node *) ja_node_ptr(node_flag);
 			}
 		}
 		node_flag = ja_node_get_minmax(node_flag, &cur_key[level - 1], dir);
@@ -2323,12 +2335,12 @@ int ja_attach_node(struct cds_ja *ja,
 	dbg_printf("Attach node at level %u (old_node_flag %p, attach_node_flag_ptr %p attach_node_flag %p)\n",
 		level, old_node_flag, attach_node_flag_ptr, attach_node_flag);
 
-	assert(!old_node_flag);
+	assert(!old_node_flag || external_nodes);
 	if (attach_node_flag && level > 1)
 		metadata = cds_ja_item_to_metadata(ja_node_ptr(attach_node_flag));
 
 	/* Concurrent update prevented by mutual exclusion. */
-	assert(!(old_node_flag_ptr && ja_node_ptr(*old_node_flag_ptr)));
+	assert(!(old_node_flag_ptr && (ja_node_ptr(*old_node_flag_ptr) && !external_nodes)));
 
 	/* Concurrent update prevented by mutual exclusion. */
 	assert(!(attach_node_flag_ptr && ja_node_ptr(*attach_node_flag_ptr) !=
@@ -2470,8 +2482,19 @@ retry:
 	}
 
 	if (i == key_depth - 1) {
-		/* Found either an internal or external node at end of key. */
-		if (ja_node_internal(node_flag)) {
+		/* Found either an internal, external node or NULL at end of key. */
+		if (!ja_node_ptr(node_flag)) {
+			dbg_printf("cds_ja_add NULL parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+					parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
+
+			attach_node_flag = parent_node_flag;
+			attach_node_flag_ptr = parent_node_flag_ptr;
+
+			ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
+					node_flag_ptr, node_flag, key, key_len, i, node,
+					NULL);
+
+		} else if (ja_node_internal(node_flag)) {
 			struct cds_ja_node *external_nodes;
 			struct cds_ja_metadata *metadata;
 
