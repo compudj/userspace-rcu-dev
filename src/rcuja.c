@@ -1179,7 +1179,7 @@ int _ja_node_replace_ptr(const struct cds_ja_type *type,
 		struct cds_ja_inode_flag *node_flag,
 		struct cds_ja_metadata *metadata,
 		struct cds_ja_inode_flag **node_flag_ptr,
-		uint8_t n, struct cds_ja_inode *newptr)
+		uint8_t n, struct cds_ja_inode_flag *newptr)
 {
 	switch (type->type_class) {
 	case RCU_JA_LINEAR:
@@ -2208,7 +2208,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	default:
 		assert(0);
 	}
-	for (; level < ja->max_tree_depth; level++) {
+	for (; level < (int) ja->max_tree_depth; level++) {
 		/*
 		 * Return external node if trying to find GE/GT
 		 * inequality and encountering an external node when
@@ -2312,7 +2312,7 @@ int ja_attach_node(struct cds_ja *ja,
 		size_t key_len,
 		unsigned int level,
 		struct cds_ja_node *child_node,
-		struct cds_ja_node *external_node)
+		struct cds_ja_node *external_nodes)
 {
 	struct cds_ja_metadata *metadata = NULL;
 	struct cds_ja_inode_flag *iter_node_flag, *iter_dest_node_flag,
@@ -2355,12 +2355,11 @@ int ja_attach_node(struct cds_ja *ja,
 	assert(level > 0);
 
 	/* Chain previous external node into new branch topmost internal node metadata. */
-	if (external_node) {
-		struct cds_ja_node *external_nodes;
+	if (external_nodes) {
 		struct cds_ja_metadata *iter_node_metadata;
 
 		iter_node_metadata = cds_ja_item_to_metadata(ja_node_ptr(iter_node_flag));
-		iter_node_metadata->external_nodes = external_node;
+		iter_node_metadata->external_nodes = external_nodes;
 	}
 
 	/* Publish branch. */
@@ -2507,7 +2506,7 @@ retry:
 				return -EEXIST;
 			}
 			/* Find last duplicate */
-			iter_node = ja_node_ptr(node_flag);
+			iter_node = (struct cds_ja_node *) ja_node_ptr(node_flag);
 			cds_ja_for_each_duplicate(iter_node)
 				last_node = iter_node;
 
@@ -2538,7 +2537,7 @@ retry:
 
 		ret = ja_attach_node(ja, attach_node_flag_ptr, attach_node_flag,
 				node_flag_ptr, node_flag, key, key_len, i, node,
-				ja_node_ptr(node_flag));
+				(struct cds_ja_node *) ja_node_ptr(node_flag));
 	}
 
 	if (ret == -EAGAIN || ret == -EEXIST)
@@ -2666,7 +2665,7 @@ int ja_detach_node(struct cds_ja *ja,
 		node_flag_ptr, 		/* Pointer to location to nullify */
 		&iter_node_flag,	/* Old new parent ptr in its parent */
 		metadata_stack[nr_branch - 1],	/* of parent */
-		n, nr_branch - 1, topmost_external_nodes);
+		n, (struct cds_ja_inode_flag *) topmost_external_nodes);
 	if (ret)
 		goto end;
 
