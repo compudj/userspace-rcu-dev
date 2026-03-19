@@ -200,6 +200,7 @@ int test_free_all_nodes(struct cds_ja *ja)
 	bool first = true;
 	int ret = 0;
 
+	cds_ja_show(stderr, ja);
 	rcu_read_lock();
 
 	for (;;) {
@@ -212,19 +213,20 @@ int test_free_all_nodes(struct cds_ja *ja)
 			ja_node = cds_ja_lookup_greater_than(ja, jakey, 0, jakey, NULL);
 		if (!ja_node)
 			break;
-		ret = cds_ja_del(test_ja, jakey, 0, ja_node);
-		if (ret) {
-			fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n",
-				ret, cds_ja_key_to_u64(ja, jakey, 0));
-			goto end;
-		}
 		cds_ja_for_each_duplicate_safe_rcu(ja_node, tmp_node) {
+			ret = cds_ja_del(test_ja, jakey, 0, ja_node);
+			if (ret) {
+				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n",
+					ret, cds_ja_key_to_u64(ja, jakey, 0));
+				goto end;
+			}
 			/* Alone using Judy array, OK to free now */
 			free_node(ja_node);
 		}
 	}
 end:
 	rcu_read_unlock();
+	cds_ja_show(stderr, ja);
 	return ret;
 }
 

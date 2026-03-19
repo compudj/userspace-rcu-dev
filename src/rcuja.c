@@ -2523,7 +2523,7 @@ retry:
 				ret = 0;
 			} else {
 				node->next = NULL;
-				metadata->external_nodes = node;
+				rcu_assign_pointer(metadata->external_nodes, node);
 				ret = 0;
 			}
 		} else {
