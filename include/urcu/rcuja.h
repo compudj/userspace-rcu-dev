@@ -17,6 +17,7 @@
 #include <urcu-call-rcu.h>
 #include <urcu-flavor.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -340,6 +341,8 @@ uint32_t cds_ja_key_to_u32(const struct cds_ja *ja, const uint8_t *key, size_t k
  * It truncates the most significant bits beyond the Judy array key range.
  */
 void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key, size_t key_len);
+
+void cds_ja_show(FILE *out, const struct cds_ja *ja);
 
 /*
  * cds_ja_for_each_duplicate_rcu - Iterate through duplicates.

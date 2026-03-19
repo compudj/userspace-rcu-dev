@@ -196,34 +196,32 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 static
 int test_free_all_nodes(struct cds_ja *ja)
 {
-	uint64_t key = 0;
-	uint8_t jakey[8];
+	uint8_t jakey[8] = {};
+	bool first = true;
 	int ret = 0;
 
 	rcu_read_lock();
-	for (;;) {
-		uint8_t res_jakey[8];
-		struct cds_ja_node *ja_node;
-		struct cds_ja_node *tmp_node;
 
-		cds_ja_u64_to_key(ja, key, jakey, 0);
-		ja_node = cds_ja_lookup_greater_equal(ja, jakey, 0, res_jakey, NULL);
+	for (;;) {
+		struct cds_ja_node *tmp_node, *ja_node;
+
+		if (first) {
+			ja_node = cds_ja_lookup_greater_equal(ja, jakey, 0, jakey, NULL);
+			first = false;
+		} else
+			ja_node = cds_ja_lookup_greater_than(ja, jakey, 0, jakey, NULL);
 		if (!ja_node)
 			break;
+		ret = cds_ja_del(test_ja, jakey, 0, ja_node);
+		if (ret) {
+			fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n",
+				ret, cds_ja_key_to_u64(ja, jakey, 0));
+			goto end;
+		}
 		cds_ja_for_each_duplicate_safe_rcu(ja_node, tmp_node) {
-			ret = cds_ja_del(test_ja, res_jakey, 0, ja_node);
-			if (ret) {
-				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n",
-					ret, cds_ja_key_to_u64(ja, res_jakey, 0));
-				goto end;
-			}
 			/* Alone using Judy array, OK to free now */
 			free_node(ja_node);
 		}
-		key = cds_ja_key_to_u64(ja, res_jakey, 0);
-		if (key == UINT64_MAX)
-			break;
-		key++;
 	}
 end:
 	rcu_read_unlock();
@@ -273,6 +271,8 @@ int test_1byte_key(void)
 		}
 	}
 	printf("OK\n");
+
+	cds_ja_show(stderr, test_ja);
 
 	printf("Test #2: successful key lookup (1-byte).\n");
 	for (key = 0; key < 200; key++) {

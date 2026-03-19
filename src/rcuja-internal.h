@@ -195,8 +195,8 @@ void cds_ja_free_item(struct cds_ja_metadata *metadata);
 #define cds_ja_for_each_duplicate(pos)				\
        for (; (pos) != NULL; (pos) = (pos)->next)
 
-//#define DEBUG
-//#define DEBUG_COUNTERS
+#define DEBUG
+#define DEBUG_COUNTERS
 
 #ifdef __linux__
 #include <syscall.h>
@@ -206,7 +206,6 @@ void cds_ja_free_item(struct cds_ja_metadata *metadata);
 #define dbg_printf(fmt, args...)				\
 	fprintf(stderr, "[debug rcuja %s()@%s:%u] " fmt,	\
 		__func__, __FILE__, __LINE__, ## args)
-
 #else
 #define dbg_printf(fmt, args...)				\
 do {								\

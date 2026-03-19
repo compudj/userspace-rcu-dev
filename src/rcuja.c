@@ -754,8 +754,8 @@ struct cds_ja_inode_flag *ja_pigeon_node_get_nth(const struct cds_ja_type *type,
 	assert(type->type_class == RCU_JA_PIGEON);
 	child_node_flag_ptr = &((struct cds_ja_inode_flag **) node->u.data)[n];
 	child_node_flag = rcu_dereference(*child_node_flag_ptr);
-	dbg_printf("ja_pigeon_node_get_nth child_node_flag_ptr %p\n",
-		child_node_flag_ptr);
+	//dbg_printf("ja_pigeon_node_get_nth child_node_flag_ptr %p\n",
+	//	child_node_flag_ptr);
 	if (caa_unlikely(node_flag_ptr))
 		*node_flag_ptr = child_node_flag_ptr;
 	return child_node_flag;
@@ -2094,7 +2094,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	switch (mode) {
 	case JA_LOOKUP_LE:
 	case JA_LOOKUP_GE:
-		if (level == key_depth) {
+		if (level == key_depth - 1) {
 			struct cds_ja_node *external_nodes;
 
 			if (ja_node_internal(node_flag)) {
@@ -2168,11 +2168,11 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 				if (result_key) {
 					int i;
 
-					for (i = 1; i < level; i++)
-						*(result_key++) = cur_key[i - 1];
+					for (i = 0; i < level; i++)
+						*(result_key++) = cur_key[i];
 				}
 				if (result_key_len)
-					*result_key_len = level - 1;
+					*result_key_len = level;
 				return external_nodes;
 			}
 		}
@@ -2181,6 +2181,18 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	if (!level) {
 		/* Reached the root and could not find a left/right sibling. */
 		return NULL;
+	}
+
+	if (!ja_node_internal(node_flag)) {
+		if (result_key) {
+			int i;
+
+			for (i = 0; i < level; i++)
+				*(result_key++) = cur_key[i];
+		}
+		if (result_key_len)
+			*result_key_len = level;
+		return (struct cds_ja_node *) ja_node_ptr(node_flag);
 	}
 
 	level++;
@@ -2210,38 +2222,29 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	}
 	for (; level < (int) ja->max_tree_depth; level++) {
 		/*
-		 * Return external node if trying to find GE/GT
-		 * inequality and encountering an external node when
-		 * going downward.
+		 * Return external node associated to internal node if
+		 * trying to find GE/GT inequality and encountering an
+		 * external node when going downward.
 		 */
-		if (dir == JA_LEFTMOST) {
-			if (ja_node_internal(node_flag)) {
-				struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
-				struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
+		if (dir == JA_LEFTMOST && ja_node_internal(node_flag)) {
+			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
-				if (external_nodes) {
-					if (result_key) {
-						int i;
-
-						for (i = 1; i < level; i++)
-							*(result_key++) = cur_key[i - 1];
-					}
-					if (result_key_len)
-						*result_key_len = level - 1;
-					return external_nodes;
-				}
-			} else {
+			if (external_nodes) {
 				if (result_key) {
 					int i;
 
-					for (i = 1; i < level; i++)
-						*(result_key++) = cur_key[i - 1];
+					for (i = 0; i < level; i++)
+						*(result_key++) = cur_key[i];
 				}
 				if (result_key_len)
-					*result_key_len = level - 1;
-				return (struct cds_ja_node *) ja_node_ptr(node_flag);
+					*result_key_len = level;
+				return external_nodes;
 			}
 		}
+		/* Return external node. */
+		if (!ja_node_internal(node_flag))
+			break;
 		node_flag = ja_node_get_minmax(node_flag, &cur_key[level - 1], dir);
 		dbg_printf("cds_ja_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) cur_key[level - 1],
@@ -2253,11 +2256,11 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	if (result_key) {
 		int i;
 
-		for (i = 1; i < level; i++)
-			*(result_key++) = cur_key[i - 1];
+		for (i = 0; i < level; i++)
+			*(result_key++) = cur_key[i];
 	}
 	if (result_key_len)
-		*result_key_len = level - 1;
+		*result_key_len = level;
 	return (struct cds_ja_node *) node_flag;
 }
 
@@ -2336,7 +2339,9 @@ int ja_attach_node(struct cds_ja *ja,
 		level, old_node_flag, attach_node_flag_ptr, attach_node_flag);
 
 	assert(!old_node_flag || external_nodes);
-	if (attach_node_flag && level > 1)
+	if (level == 0)
+		metadata = &ja->root_metadata;
+	else if (attach_node_flag)
 		metadata = cds_ja_item_to_metadata(ja_node_ptr(attach_node_flag));
 
 	/* Concurrent update prevented by mutual exclusion. */
@@ -2349,7 +2354,7 @@ int ja_attach_node(struct cds_ja *ja,
 	/* Create new branch, starting from bottom */
 	iter_node_flag = (struct cds_ja_inode_flag *) child_node;
 
-	for (i = key_len + 1; i >= (int) level; i--) {
+	for (i = key_len; i > (int) level; i--) {
 		uint8_t key_value;
 
 		key_value = *(--iter_key);
@@ -2364,7 +2369,6 @@ int ja_attach_node(struct cds_ja *ja,
 		created_nodes[nr_created_nodes++] = iter_dest_node_flag;
 		iter_node_flag = iter_dest_node_flag;
 	}
-	assert(level > 0);
 
 	/* Chain previous external node into new branch topmost internal node metadata. */
 	if (external_nodes) {
@@ -2375,7 +2379,7 @@ int ja_attach_node(struct cds_ja *ja,
 	}
 
 	/* Publish branch. */
-	if (level == 1) {
+	if (level == 0) {
 		/*
 		 * Attaching to root node.
 		 */
@@ -2464,13 +2468,13 @@ retry:
 	node_flag = ja->root;
 	node_flag_ptr = &ja->root;
 
-	for (i = 1; i < key_depth; i++) {
+	for (i = 0; i < key_depth; i++) {
 		uint8_t key_value;
 
 		if (!ja_node_ptr(node_flag))
 			break;
-		/* Found external node before end of key. */
-		if (i < key_depth - 1 && !ja_node_internal(node_flag))
+		/* Found external node. */
+		if (!ja_node_internal(node_flag))
 			break;
 		dbg_printf("cds_ja_add iter parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
@@ -2518,6 +2522,7 @@ retry:
 				ja_chain_node(last_node, node);
 				ret = 0;
 			} else {
+				node->next = NULL;
 				metadata->external_nodes = node;
 				ret = 0;
 			}
@@ -3012,4 +3017,68 @@ int cds_ja_destroy(struct cds_ja *ja)
 	free(ja);
 
 	return ret;
+}
+
+static
+void print_indent(FILE *out, int level)
+{
+	int i;
+
+	for (i = 0; i < level; i++)
+		fprintf(out, "	");
+}
+
+static
+void show_node_recursive(FILE *out, const struct cds_ja *ja, struct cds_ja_inode_flag *node_flag, int level)
+{
+	unsigned int key;
+
+	print_indent(out, level);
+	fprintf(out, "Level %d within node %p\n", level, node_flag);
+	for (key = 0; key < 256; key++) {
+		struct cds_ja_inode_flag *child_node_flag;
+
+		child_node_flag = ja_node_get_nth(node_flag, NULL, (uint8_t) key);
+		if (!ja_node_ptr(child_node_flag))
+			continue;
+		/* Found external node before end of key. */
+		if (ja_node_internal(child_node_flag)) {
+			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
+
+			print_indent(out, level);
+			fprintf(out, "Level %d, key value: %u, internal node: %p, nr_children: %u\n",
+				level, key, child_node_flag, metadata->nr_child);
+			if (external_nodes) {
+				print_indent(out, level);
+				fprintf(out, "Level %d, key value: %u, (meta)external node list ptr: %p\n",
+					level, key, external_nodes);
+			}
+			show_node_recursive(out, ja, child_node_flag, level + 1);
+		} else {
+			print_indent(out, level);
+			fprintf(out, "Level %d, key value: %u, external node list ptr: %p\n",
+				level, key, ja_node_ptr(child_node_flag));
+		}
+	}
+
+}
+
+void cds_ja_show(FILE *out, const struct cds_ja *ja)
+{
+	int level = 0;
+	struct cds_ja_inode_flag *node_flag;
+
+	fprintf(out, "Show Judy Array %p\n", ja);
+	fprintf(out, "---------------------------------------------------\n");
+
+	node_flag = rcu_dereference(ja->root);
+
+	/* level 0: root node */
+	if (ja_node_ptr(node_flag)) {
+		print_indent(out, level);
+		fprintf(out, "Level 0: root node %p\n", node_flag);
+		show_node_recursive(out, ja, node_flag, level + 1);
+	}
+	fprintf(out, "---------------------------------------------------\n");
 }
