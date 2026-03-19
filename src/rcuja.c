@@ -2333,7 +2333,7 @@ int ja_attach_node(struct cds_ja *ja,
 	struct cds_ja_inode_flag *iter_node_flag, *iter_dest_node_flag,
 				*created_nodes[JA_MAX_DEPTH];
 	int ret, i, nr_created_nodes = 0;
-	const uint8_t *iter_key = key + ja->key_len;
+	const uint8_t *iter_key = key + key_len;
 
 	dbg_printf("Attach node at level %u (old_node_flag %p, attach_node_flag_ptr %p attach_node_flag %p)\n",
 		level, old_node_flag, attach_node_flag_ptr, attach_node_flag);
