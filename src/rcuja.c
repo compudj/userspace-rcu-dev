@@ -3068,7 +3068,8 @@ void cds_ja_show(FILE *out, const struct cds_ja *ja)
 {
 	int level = 0;
 	struct cds_ja_inode_flag *node_flag;
-
+	//XXX
+	return;
 	fprintf(out, "Show Judy Array %p\n", ja);
 	fprintf(out, "---------------------------------------------------\n");
 

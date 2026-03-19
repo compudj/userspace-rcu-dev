@@ -15,6 +15,12 @@ THREAD_MUL=1
 
 EXTRA_PARAMS=-v
 
+${TESTPROG} $((1*${THREAD_MUL})) $((0*${THREAD_MUL})) ${TIME_UNITS} -V -u -B 8 -m 1717 -k 10000000 -S 10000000 -M 10000000 -N 10000000 -O 10000000 ${EXTRA_PARAMS} || exit 1
+#${TESTPROG} $((4*${THREAD_MUL})) $((0*${THREAD_MUL})) ${TIME_UNITS} -V -u -B 8 -m 1717 -k 1000000 -S 1000000 -M 1000000 -N 1000000 -O 1000000 ${EXTRA_PARAMS} || exit 1
+#${TESTPROG} $((4*${THREAD_MUL})) $((0*${THREAD_MUL})) ${TIME_UNITS} -V -u -B 8 -m 1717 -k 100000 -S 100000 -M 100000 -N 100000 -O 100000 ${EXTRA_PARAMS} || exit 1
+
+exit
+
 # ** test update coherency with single-value table
 
 # sanity test
