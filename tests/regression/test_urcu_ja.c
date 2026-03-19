@@ -274,8 +274,6 @@ int test_1byte_key(void)
 	}
 	printf("OK\n");
 
-	cds_ja_show(stderr, test_ja);
-
 	printf("Test #2: successful key lookup (1-byte).\n");
 	for (key = 0; key < 200; key++) {
 		rcu_read_lock();
