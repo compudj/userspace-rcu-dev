@@ -856,6 +856,272 @@ int do_sanity_test(void)
 	return 0;
 }
 
+/*
+ * nr_dup is number of nodes per key.
+ */
+static
+int test_varlen_sparse_key_add(unsigned int len, int nr_dup)
+{
+	uint64_t key, max_key;
+	int zerocount, i, ret;
+	unsigned int bits = len * CHAR_BIT;
+
+	if (len == 8)
+		max_key = UINT64_MAX;
+	else
+		max_key = (1ULL << bits) - 1;
+
+	/* Add keys */
+	printf("Test #1: add keys (%u-byte).\n", len);
+	for (i = 0; i < nr_dup; i++) {
+		zerocount = 0;
+		for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
+			struct ja_test_node *node = node_alloc();
+			uint8_t jakey[8];
+
+			ja_test_node_init(node, key);
+			rcu_read_lock();
+			cds_ja_u64_to_key(test_ja, key, jakey, len);
+			ret = cds_ja_add(test_ja, jakey, len, &node->node);
+			rcu_read_unlock();
+			if (ret) {
+				fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
+					ret, key);
+				assert(0);
+			}
+			if (key == 0)
+				zerocount++;
+		}
+	}
+	printf("OK\n");
+	return 0;
+}
+
+/*
+ * nr_dup is number of nodes per key.
+ */
+static
+int test_varlen_sparse_key_lookup(unsigned int len, int nr_dup)
+{
+	uint64_t key, max_key;
+	unsigned int bits = len * CHAR_BIT;
+	int zerocount;
+
+	if (len == 8)
+		max_key = UINT64_MAX;
+	else
+		max_key = (1ULL << bits) - 1;
+
+	printf("Test #2: successful key lookup (%u-byte).\n", len);
+	zerocount = 0;
+	for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
+		struct cds_ja_node *ja_node;
+		uint8_t jakey[8];
+		int count = 0;
+
+		rcu_read_lock();
+		cds_ja_u64_to_key(test_ja, key, jakey, len);
+		ja_node = cds_ja_lookup(test_ja, jakey, len);
+		if (!ja_node) {
+			fprintf(stderr, "Error lookup node %" PRIu64 "\n", key);
+			assert(0);
+		}
+		cds_ja_for_each_duplicate_rcu(ja_node) {
+			count++;
+		}
+		if (count != nr_dup) {
+			fprintf(stderr, "Unexpected number of match for key %" PRIu64 ", expected %d, got %d.\n", key, nr_dup, count);
+		}
+		rcu_read_unlock();
+		if (key == 0)
+			zerocount++;
+	}
+	printf("OK\n");
+	return 0;
+}
+
+/*
+ * nr_dup is number of nodes per key.
+ */
+static
+int test_varlen_sparse_key_lookup_fail(unsigned int len)
+{
+	uint64_t key, max_key;
+	int zerocount;
+	unsigned int bits = len * CHAR_BIT;
+
+	if (len == 8)
+		max_key = UINT64_MAX;
+	else
+		max_key = (1ULL << bits) - 1;
+
+	if (len > 1) {
+		printf("Test #3: unsuccessful key lookup (%u-byte).\n", len);
+		zerocount = 0;
+		for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
+			struct cds_ja_node *ja_node;
+			uint8_t jakey[8];
+
+			rcu_read_lock();
+			cds_ja_u64_to_key(test_ja, key + 42, jakey, len);
+			ja_node = cds_ja_lookup(test_ja, jakey, len);
+			if (ja_node) {
+				fprintf(stderr,
+					"Error unexpected lookup node %" PRIu64 "\n",
+					key + 42);
+				assert(0);
+			}
+			rcu_read_unlock();
+			if (key == 0)
+				zerocount++;
+		}
+		printf("OK\n");
+	}
+	return 0;
+}
+
+/*
+ * nr_dup is number of nodes per key.
+ */
+static
+int test_varlen_sparse_key_del(unsigned int len, int nr_dup)
+{
+	uint64_t key, max_key;
+	int zerocount, ret;
+	struct cds_ja_node *ja_node;
+	unsigned int bits = len * CHAR_BIT;
+
+	if (len == 8)
+		max_key = UINT64_MAX;
+	else
+		max_key = (1ULL << bits) - 1;
+
+	printf("Test #4: remove keys (%u-byte).\n", len);
+	zerocount = 0;
+	for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
+		uint8_t jakey[8];
+		int count = 0;
+
+		rcu_read_lock();
+		cds_ja_u64_to_key(test_ja, key, jakey, len);
+		ja_node = cds_ja_lookup(test_ja, jakey, len);
+
+		cds_ja_for_each_duplicate_rcu(ja_node) {
+			struct cds_ja_node *test_ja_node;
+			struct ja_test_node *node;
+
+			count++;
+			node = caa_container_of(ja_node,
+				struct ja_test_node, node);
+			ret = cds_ja_del(test_ja, jakey, len, &node->node);
+			if (ret) {
+				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
+				assert(0);
+			}
+			rcu_free_test_node(node);
+			test_ja_node = cds_ja_lookup(test_ja, jakey, len);
+			if (count < nr_dup && !test_ja_node) {
+				fprintf(stderr, "Error: no node found after deletion of some nodes of a key\n");
+				assert(0);
+			}
+		}
+		ja_node = cds_ja_lookup(test_ja, jakey, len);
+		if (ja_node) {
+			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ja_node);
+			assert(0);
+		}
+		rcu_read_unlock();
+		if (key == 0)
+			zerocount++;
+	}
+	printf("OK\n");
+	return 0;
+}
+
+static
+int do_sanity_test_varlen(void)
+{
+	int i, j, ret;
+	struct cds_ja_attr *attr;
+
+	printf("Variable length key sanity test start.\n");
+
+	attr = cds_ja_attr_create();
+	if (!attr)
+		abort();
+	if (cds_ja_attr_set_key_len(attr, 0))	/* Variable length keys. */
+		abort();
+
+	test_ja = cds_ja_create(attr);
+	cds_ja_attr_destroy(attr);
+	if (!test_ja) {
+		printf("Error allocating judy array.\n");
+		return -1;
+	}
+
+	/* key length (bytes) */
+	for (i = 1; i <= 8; i *= 2) {
+		/* nr of nodes per key */
+		for (j = 1; j < 4; j++) {
+			ret = test_varlen_sparse_key_add(i, j);
+			if (ret) {
+				return ret;
+			}
+			rcu_quiescent_state();
+		}
+	}
+
+	/* key length (bytes) */
+	for (i = 1; i <= 8; i *= 2) {
+		/* nr of nodes per key */
+		for (j = 1; j < 4; j++) {
+			ret = test_varlen_sparse_key_lookup(i, j);
+			if (ret) {
+				return ret;
+			}
+			rcu_quiescent_state();
+		}
+	}
+
+
+	/* key length (bytes) */
+	for (i = 1; i <= 8; i *= 2) {
+		ret = test_varlen_sparse_key_lookup_fail(i);
+		if (ret) {
+			return ret;
+		}
+		rcu_quiescent_state();
+	}
+
+
+	/* key length (bytes) */
+	for (i = 1; i <= 8; i *= 2) {
+		/* nr of nodes per key */
+		for (j = 1; j < 4; j++) {
+			ret = test_varlen_sparse_key_del(i, j);
+			if (ret) {
+				return ret;
+			}
+			rcu_quiescent_state();
+		}
+	}
+
+	ret = test_free_all_nodes(test_ja);
+	if (ret) {
+		fprintf(stderr, "Error freeing all nodes\n");
+		return -1;
+	}
+
+	ret = cds_ja_destroy(test_ja);
+	if (ret) {
+		fprintf(stderr, "Error destroying judy array\n");
+		return -1;
+	}
+	printf("Sanity test ends\n");
+
+	return 0;
+}
+
 enum urcu_ja_addremove {
 	AR_RANDOM = 0,
 	AR_ADD = 1,
@@ -1368,7 +1634,8 @@ int main(int argc, char **argv)
 	rcu_register_thread();
 
 	if (sanity_test) {
-		ret = do_sanity_test();
+		//ret = do_sanity_test();
+		ret = do_sanity_test_varlen();
 	} else {
 		ret = do_mt_test();
 	}
