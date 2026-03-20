@@ -2993,7 +2993,7 @@ struct cds_ft *_cds_ft_create(const struct cds_ft_attr *attr,
 	/* max_tree_depth 0 is for pointer to root node */
 	if (max_key_len && key_len > max_key_len)
 		return NULL;
-	ft = calloc(sizeof(*ft), 1);
+	ft = calloc(1, sizeof(*ft));
 	if (!ft)
 		return NULL;
 	ft->key_len = key_len;
