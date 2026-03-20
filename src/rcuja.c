@@ -1982,7 +1982,7 @@ struct cds_ja_node *cds_ja_lookup(struct cds_ja *ja, const uint8_t *key, size_t 
 	for (i = 1; i < key_depth; i++) {
 		uint8_t iter_key;
 
-		iter_key = *(key++);
+		iter_key = key_to_ordinal(ja, *(key++));
 		node_flag = ja_node_get_nth(node_flag, NULL, iter_key);
 		dbg_printf("cds_ja_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
@@ -2025,7 +2025,7 @@ struct cds_ja_node *cds_ja_lookup_partial(struct cds_ja *ja, const uint8_t *key,
 		struct cds_ja_metadata *metadata;
 		uint8_t iter_key;
 
-		iter_key = *(key++);
+		iter_key = key_to_ordinal(ja, *(key++));
 		node_flag = ja_node_get_nth(node_flag, NULL, iter_key);
 		dbg_printf("cds_ja_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
@@ -2096,7 +2096,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	for (level = 1; level < key_depth; level++) {
 		uint8_t key_value;
 
-		key_value = *(iter_key++);
+		key_value = key_to_ordinal(ja, *(iter_key++));
 		node_flag = ja_node_get_nth(node_flag, NULL, key_value);
 		if (!ja_node_ptr(node_flag))
 			break;
@@ -2163,7 +2163,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	for (; level > 0; level--) {
 		uint8_t key_value;
 
-		key_value = *(--iter_key);
+		key_value = key_to_ordinal(ja, *(--iter_key));
 		node_flag = ja_node_get_leftright(cur_node_depth[level - 1],
 				key_value, &cur_key[level - 1], dir);
 		dbg_printf("cds_ja_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
@@ -2186,7 +2186,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 					int i;
 
 					for (i = 0; i < level; i++)
-						*(result_key++) = cur_key[i];
+						*(result_key++) = ordinal_to_key(ja, cur_key[i]);
 				}
 				if (result_key_len)
 					*result_key_len = level;
@@ -2205,7 +2205,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 			int i;
 
 			for (i = 0; i < level; i++)
-				*(result_key++) = cur_key[i];
+				*(result_key++) = ordinal_to_key(ja, cur_key[i]);
 		}
 		if (result_key_len)
 			*result_key_len = level;
@@ -2252,7 +2252,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 					int i;
 
 					for (i = 0; i < level; i++)
-						*(result_key++) = cur_key[i];
+						*(result_key++) = ordinal_to_key(ja, cur_key[i]);
 				}
 				if (result_key_len)
 					*result_key_len = level;
@@ -2274,7 +2274,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		int i;
 
 		for (i = 0; i < level; i++)
-			*(result_key++) = cur_key[i];
+			*(result_key++) = ordinal_to_key(ja, cur_key[i]);
 	}
 	if (result_key_len)
 		*result_key_len = level;
@@ -2374,7 +2374,7 @@ int ja_attach_node(struct cds_ja *ja,
 	for (i = key_len; i > (int) level; i--) {
 		uint8_t key_value;
 
-		key_value = *(--iter_key);
+		key_value = key_to_ordinal(ja, *(--iter_key));
 		dbg_printf("branch creation level %d, key %u\n",
 				i, (unsigned int) key_value);
 		iter_dest_node_flag = NULL;
@@ -2404,7 +2404,7 @@ int ja_attach_node(struct cds_ja *ja,
 	} else {
 		uint8_t key_value;
 
-		key_value = *(--iter_key);
+		key_value = key_to_ordinal(ja, *(--iter_key));
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
@@ -2495,7 +2495,7 @@ retry:
 			break;
 		dbg_printf("cds_ja_add iter parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
-		key_value = *(iter_key++);
+		key_value = key_to_ordinal(ja, *(iter_key++));
 		parent2_node_flag = parent_node_flag;
 		parent_node_flag = node_flag;
 		parent_node_flag_ptr = node_flag_ptr;
@@ -2795,7 +2795,7 @@ retry:
 		if (!ja_node_ptr(node_flag)) {
 			return -ENOENT;
 		}
-		key_value = *(iter_key++);
+		key_value = key_to_ordinal(ja, *(iter_key++));
 		snapshot_n[nr_snapshot + 1] = key_value;
 		snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
 		snapshot[nr_snapshot++] = node_flag;
