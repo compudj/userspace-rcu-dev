@@ -2179,7 +2179,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
-				assert(!ja->key_len || level <= ja->key_len);
+				assert(!ja->key_len || level <= (int) ja->key_len);
 				if (result_key) {
 					int i;
 
@@ -2202,7 +2202,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	}
 
 	if (!ja_node_internal(node_flag)) {
-		assert(!ja->key_len || level <= ja->key_len);
+		assert(!ja->key_len || level <= (int) ja->key_len);
 		if (result_key) {
 			int i;
 
@@ -2250,7 +2250,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
-				assert(!ja->key_len || level <= ja->key_len);
+				assert(!ja->key_len || level <= (int) ja->key_len);
 				if (result_key) {
 					int i;
 
@@ -2274,7 +2274,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	}
 
 	if (ja_node_ptr(node_flag)) {
-		assert(!ja->key_len || level <= ja->key_len);
+		assert(!ja->key_len || level <= (int) ja->key_len);
 		if (result_key) {
 			int i;
 
