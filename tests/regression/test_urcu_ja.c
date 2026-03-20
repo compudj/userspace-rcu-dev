@@ -44,7 +44,7 @@ unsigned long init_pool_size = DEFAULT_RAND_POOL,
 	lookup_pool_size = DEFAULT_RAND_POOL,
 	write_pool_size = DEFAULT_RAND_POOL;
 int validate_lookup;
-int sanity_test;
+int sanity_test, sanity_test_varlen, sanity_test_varlen_string;
 unsigned int key_len = 4;
 
 int count_pipe[2];
@@ -187,6 +187,8 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 	printf("        [-O size] Init pool size.\n");
 	printf("        [-V] Validate lookups of init values (use with filled init pool, same lookup range, with different write range).\n");
 	printf("        [-t] Do sanity test.\n");
+	printf("        [-x] Do variable length sanity test.\n");
+	printf("        [-y] Do variable length string sanity test.\n");
 	printf("        [-B] Key bytes for multithread test (default: 4).\n");
 	printf("        [-m factor] Key multiplication factor.\n");
 	printf("	[-l] Memory leak detection.\n");
@@ -1794,6 +1796,12 @@ int main(int argc, char **argv)
 		case 't':
 			sanity_test = 1;
 			break;
+		case 'x':
+			sanity_test_varlen = 1;
+			break;
+		case 'y':
+			sanity_test_varlen_string = 1;
+			break;
 		case 'B':
 			key_len = atol(argv[++i]);
 			break;
@@ -1856,8 +1864,10 @@ int main(int argc, char **argv)
 	rcu_register_thread();
 
 	if (sanity_test) {
-		//ret = do_sanity_test();
-		//ret = do_sanity_test_varlen();
+		ret = do_sanity_test();
+	} else if (sanity_test_varlen) {
+		ret = do_sanity_test_varlen();
+	} else if (sanity_test_varlen_string) {
 		ret = do_test_varlen_string();
 	} else {
 		ret = do_mt_test();
