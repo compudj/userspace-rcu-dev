@@ -127,7 +127,7 @@ struct ja_test_node *node_alloc(void)
 {
 	struct ja_test_node *node;
 
-	node = calloc(sizeof(*node), 1);
+	node = calloc(1, sizeof(*node));
 	if (leak_detection && node)
 		uatomic_inc(&test_nodes_allocated);
 	return node;
