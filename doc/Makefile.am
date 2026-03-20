@@ -8,5 +8,5 @@ dist_doc_DATA = rcu-api.md \
 		cds-api.md \
 		solaris-build.md \
 		uatomic-api.md \
-		rcuja-design.txt \
-		rcuja-design-combination.txt
+		fractal-trie-design.txt \
+		fractal-trie-design-combination.txt

@@ -7,8 +7,8 @@ AM_CPPFLAGS += -I$(top_srcdir)/src
 noinst_LIBRARIES = libtap.a
 libtap_a_SOURCES = tap.c tap.h
 
-noinst_PROGRAMS = rcuja_testpop
-rcuja_testpop_SOURCES = rcuja-testpop.c
+noinst_PROGRAMS = fractal_trie_testpop
+fractal_trie_testpop_SOURCES = fractal-trie-testpop.c
 
 dist_check_SCRIPTS = \
 	tap-driver.sh \

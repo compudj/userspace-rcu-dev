@@ -1,10 +1,10 @@
 
-RCU Judy Array design: bit selection combinations
+Fractal Trie design: bit selection combinations
 
 Mathieu Desnoyers
 October 3, 2025
 
-* Note: After analysis of the generated populations (rcuja_testpop), it
+* Note: After analysis of the generated populations (fractal-trie-testpop), it
   appears that aiming for a single cache line hit per node would degrade
   the functional density (minimizing how many cache lines are required
   to fit a number of items). On 64-bit, with 1024 node size, a
@@ -17,10 +17,10 @@ October 3, 2025
 
   Therefore, the approach discussed below will not be implemented.
 
-This is an extension to the RCU Judy Array design with the following goals:
+This is an extension to the Fractal Trie design with the following goals:
 
 - Guarantee that only a single cache line is loaded per internal node
-  level (the prior RCU Judy Array implementation has internal nodes that
+  level (the prior Fractal Trie implementation has internal nodes that
   require hitting two cache lines),
 - Use combination bit selection to minimize the number of bits needed to
   represent the split of up-to-256-values populations into multiple

@@ -13,7 +13,7 @@ dist_noinst_HEADERS = urcu-die.h urcu-wait.h compat-getcpu.h \
 
 COMPAT = compat_futex.c
 
-RCUJA = rcuja.c rcuja-alloc.c rcuja-internal.h
+FRACTAL_TRIE = fractal-trie.c fractal-trie-alloc.c fractal-trie-internal.h
 
 RCULFHASH = rculfhash.c rculfhash-mm-order.c rculfhash-mm-chunk.c \
 		rculfhash-mm-mmap.c
@@ -49,7 +49,7 @@ liburcu_bp_la_SOURCES = urcu-bp.c urcu-pointer.c $(COMPAT)
 liburcu_bp_la_LIBADD = liburcu-common.la
 
 liburcu_cds_la_SOURCES = rculfqueue.c rculfstack.c lfstack.c \
-	workqueue.c workqueue.h $(RCUJA) $(RCULFHASH) $(COMPAT)
+	workqueue.c workqueue.h $(FRACTAL_TRIE) $(RCULFHASH) $(COMPAT)
 liburcu_cds_la_LIBADD = liburcu-common.la
 
 pkgconfigdir = $(libdir)/pkgconfig

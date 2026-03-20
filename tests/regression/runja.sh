@@ -8,7 +8,7 @@
 # 30 seconds per test
 TIME_UNITS=30
 
-TESTPROG=./test_urcu_ja
+TESTPROG=./test_urcu_ft
 
 #thread multiplier
 THREAD_MUL=1

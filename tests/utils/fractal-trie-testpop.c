@@ -1,5 +1,5 @@
 /*
- * rcuja-testpop.c
+ * fractal_trie-testpop.c
  *
  * Userspace RCU library - RCU Judy Array population size test
  *

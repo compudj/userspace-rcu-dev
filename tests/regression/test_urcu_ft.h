@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2009-2025 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-#ifndef _TEST_URCU_JA_H
-#define _TEST_URCU_JA_H
+#ifndef _TEST_URCU_FT_H
+#define _TEST_URCU_FT_H
 
 #include <urcu/config.h>
 #include <stdio.h>
@@ -45,7 +45,7 @@
 #define debug_yield_read()
 #endif
 #include <urcu-qsbr.h>
-#include <urcu/rcuja.h>
+#include <urcu/fractal-trie.h>
 #include <urcu-call-rcu.h>
 
 struct wr_count {
@@ -64,13 +64,13 @@ extern DECLARE_URCU_TLS(unsigned long, lookup_fail);
 extern DECLARE_URCU_TLS(unsigned long, lookup_ok);
 
 struct ja_test_node {
-	struct cds_ja_node node;
+	struct cds_ft_node node;
 	uint64_t key;		/* for testing */
 	struct rcu_head head;	/* delayed reclaim */
 };
 
 static inline struct ja_test_node *
-to_test_node(struct cds_ja_node *node)
+to_test_node(struct cds_ft_node *node)
 {
 	return caa_container_of(node, struct ja_test_node, node);
 }
@@ -143,4 +143,4 @@ extern unsigned int nr_writers;
 void rcu_copy_mutex_lock(void);
 void rcu_copy_mutex_unlock(void);
 
-#endif /* _TEST_URCU_JA_H */
+#endif /* _TEST_URCU_FT_H */
