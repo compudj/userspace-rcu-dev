@@ -261,6 +261,16 @@ size_t cds_ja_key_len(const struct cds_ja *ja);
  */
 size_t cds_ja_max_key_len(const struct cds_ja *ja);
 
+/*
+ * cds_ja_key_map - Return the key map of a Judy array.
+ * @ja: The Judy array.
+ * @key_to_ordinal: Mapping from external key to ordered values. (output)
+ * @ordinal_to_key: Mapping from ordered values to external key. (output)
+ *
+ * Returns -ENOENT if key map is identity function. Populate the output
+ * parameters and return 0 if there is a key mapping.
+ */
+int cds_ja_key_map(struct cds_ja *ja, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key);
 
 /*
  * cds_ja_attr_create - Create a Judy array attribute structure.
@@ -289,6 +299,14 @@ int cds_ja_attr_set_key_len(struct cds_ja_attr *attr, size_t key_len);
  * limit is larger than the maximum limit.
  */
 int cds_ja_attr_set_max_key_len(struct cds_ja_attr *attr, size_t max_key_len);
+
+/*
+ * cds_ja_attr_set_key_map - Set Judy array key map attribute.
+ * @attr: Judy array attributes.
+ * @key_to_ordinal: Mapping from external key to ordered values.
+ * @ordinal_to_key: Mapping from ordered values to external key.
+ */
+int cds_ja_attr_set_key_map(struct cds_ja_attr *attr, const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key);
 
 /*
  * cds_ja_key_to_u64 - Convert a Judy array key to an unsigned 64-bit integer.

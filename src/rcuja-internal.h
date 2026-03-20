@@ -87,6 +87,12 @@ struct cds_ja_metadata_alloc {
 	struct cds_ja_metadata metadata;
 };
 
+struct cds_ja_key_map {
+	bool identity;
+	uint8_t key_to_ordinal[256];
+	uint8_t ordinal_to_key[256];
+};
+
 struct cds_ja {
 	struct cds_ja_inode_flag *root;
 	struct cds_ja_metadata root_metadata;
@@ -100,6 +106,8 @@ struct cds_ja {
 
 	/* Allocation arenas. */
 	struct cds_ja_alloc_arena *arena_order[RCU_JA_ALLOC_ORDER_MAX + 1];
+
+	struct cds_ja_key_map key_map;
 
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[JA_ENTRY_PER_NODE];

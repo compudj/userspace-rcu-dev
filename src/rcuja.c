@@ -35,6 +35,7 @@
 struct cds_ja_attr {
 	size_t key_len;
 	size_t max_key_len;
+	struct cds_ja_key_map key_map;
 };
 
 enum cds_ja_type_class {
@@ -2897,6 +2898,15 @@ size_t cds_ja_max_key_len(const struct cds_ja *ja)
 	return ja->max_key_len;
 }
 
+int cds_ja_key_map(struct cds_ja *ja, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key)
+{
+	if (ja->key_map.identity)
+		return -ENOENT;
+	memcpy(key_to_ordinal, ja->key_map.key_to_ordinal, sizeof(ja->key_map.key_to_ordinal));
+	memcpy(ordinal_to_key, ja->key_map.ordinal_to_key, sizeof(ja->key_map.ordinal_to_key));
+	return 0;
+}
+
 struct cds_ja_attr *cds_ja_attr_create(void)
 {
 	struct cds_ja_attr *attr = calloc(1, sizeof(struct cds_ja_attr));
@@ -2905,6 +2915,7 @@ struct cds_ja_attr *cds_ja_attr_create(void)
 		return NULL;
 	attr->key_len = CDS_JA_DEFAULT_KEY_LEN;
 	attr->max_key_len = CDS_JA_DEFAULT_MAX_KEY_LEN;
+	attr->key_map.identity = true;
 	return attr;
 }
 
@@ -2924,6 +2935,14 @@ int cds_ja_attr_set_max_key_len(struct cds_ja_attr *attr, size_t max_key_len)
 	if (max_key_len > JA_MAX_KEY_LEN)
 		return -EINVAL;
 	attr->max_key_len = max_key_len;
+	return 0;
+}
+
+int cds_ja_attr_set_key_map(struct cds_ja_attr *attr, const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key)
+{
+	attr->key_map.identity = false;
+	memcpy(attr->key_map.key_to_ordinal, key_to_ordinal, sizeof(attr->key_map.key_to_ordinal));
+	memcpy(attr->key_map.ordinal_to_key, ordinal_to_key, sizeof(attr->key_map.ordinal_to_key));
 	return 0;
 }
 
@@ -2950,6 +2969,10 @@ struct cds_ja *_cds_ja_create(const struct cds_ja_attr *attr,
 	ja->max_tree_depth = max_key_len + 1;
 	assert(ja->max_tree_depth <= JA_MAX_DEPTH);
 	ja->flavor = flavor;
+	if (attr)
+		ja->key_map = attr->key_map;
+	else
+		ja->key_map.identity = true;
 	return ja;
 }
 
