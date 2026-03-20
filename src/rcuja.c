@@ -2468,7 +2468,7 @@ retry:
 	node_flag = ja->root;
 	node_flag_ptr = &ja->root;
 
-	for (i = 0; i < key_depth; i++) {
+	for (i = 0; i < key_depth - 1; i++) {
 		uint8_t key_value;
 
 		if (!ja_node_ptr(node_flag))
