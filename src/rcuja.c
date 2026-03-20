@@ -901,16 +901,23 @@ struct cds_ja_inode_flag *ja_node_get_minmax(struct cds_ja_inode_flag *node_flag
 		uint8_t *result_key,
 		enum ja_direction dir)
 {
+	struct cds_ja_inode_flag *ret;
+
 	switch (dir) {
 	case JA_LEFTMOST:
-		return ja_node_get_direction(node_flag,
+		ret = ja_node_get_direction(node_flag,
 				-1, result_key, JA_RIGHT);
+		break;
 	case JA_RIGHTMOST:
-		return ja_node_get_direction(node_flag,
+		ret = ja_node_get_direction(node_flag,
 				JA_ENTRY_PER_NODE, result_key, JA_LEFT);
+		break;
 	default:
 		assert(0);
 	}
+	/* attach/detach semantic guarantees that ja_node_get_minmax cannot return NULL. */
+	assert(ja_node_ptr(ret));
+	return ret;
 }
 
 static
@@ -2069,6 +2076,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	enum ja_direction dir;
 	const uint8_t *iter_key = key;
 	size_t key_len = ja_key_len(ja, _key_len);
+	bool going_up = false;
 
 	if (!valid_key_len(ja, key_len))
 		return NULL;
@@ -2163,19 +2171,13 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	for (; level > 0; level--) {
 		uint8_t key_value;
 
-		key_value = key_to_ordinal(ja, *(--iter_key));
-		node_flag = ja_node_get_leftright(cur_node_depth[level - 1],
-				key_value, &cur_key[level - 1], dir);
-		dbg_printf("cds_ja_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
-				(unsigned int) key_value, (unsigned int) cur_key[level - 1],
-				node_flag);
 		/*
 		 * Return external node if trying to find LE/LT
 		 * inequality and encountering an external node when
 		 * going upward.
 		 */
-		if (dir == JA_LEFT && ja_node_internal(node_flag)) {
-			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+		if (going_up && dir == JA_LEFT && ja_node_internal(cur_node_depth[level - 1])) {
+			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(cur_node_depth[level - 1]));
 			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
@@ -2191,9 +2193,17 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 				return external_nodes;
 			}
 		}
+
+		key_value = key_to_ordinal(ja, *(--iter_key));
+		node_flag = ja_node_get_leftright(cur_node_depth[level - 1],
+				key_value, &cur_key[level - 1], dir);
+		dbg_printf("cds_ja_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
+				(unsigned int) key_value, (unsigned int) cur_key[level - 1],
+				node_flag);
 		/* If found left/right sibling, find rightmost/leftmost child. */
 		if (ja_node_ptr(node_flag))
 			break;
+		going_up = true;
 	}
 
 	if (!level) {
@@ -2269,21 +2279,22 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		dbg_printf("cds_ja_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) cur_key[level - 1],
 				node_flag);
-		if (!ja_node_ptr(node_flag) || !ja_node_internal(node_flag))
+		if (!ja_node_internal(node_flag))
 			break;
 	}
 
-	if (ja_node_ptr(node_flag)) {
-		assert(!ja->key_len || level <= (int) ja->key_len);
-		if (result_key) {
-			int i;
+	assert(!ja->key_len || level <= (int) ja->key_len);
+	if (result_key) {
+		int i;
 
-			for (i = 0; i < level; i++)
-				*(result_key++) = ordinal_to_key(ja, cur_key[i]);
-		}
-		if (result_key_len)
-			*result_key_len = level;
+		for (i = 0; i < level; i++)
+			*(result_key++) = ordinal_to_key(ja, cur_key[i]);
 	}
+	if (result_key_len)
+		*result_key_len = level;
+
+	/* attach/detach semantic guarantees that ja_node_get_minmax cannot return NULL. */
+	assert(ja_node_ptr(node_flag));
 	return (struct cds_ja_node *) node_flag;
 }
 
