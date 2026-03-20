@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2009-2025 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+// SPDX-FileCopyrightText: 2009-2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
