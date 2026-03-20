@@ -3043,7 +3043,7 @@ void show_node_recursive(FILE *out, const struct cds_ja *ja, struct cds_ja_inode
 			continue;
 		/* Found external node before end of key. */
 		if (ja_node_internal(child_node_flag)) {
-			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
+			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(child_node_flag));
 			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			print_indent(out, level);
