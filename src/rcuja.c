@@ -432,6 +432,22 @@ void cds_ja_u32_to_key(const struct cds_ja *ja, uint32_t v, uint8_t *key,
 }
 
 static
+uint8_t key_to_ordinal(const struct cds_ja *ja, uint8_t key)
+{
+	if (caa_likely(ja->key_map.identity))
+		return key;
+	return ja->key_map.key_to_ordinal[key];
+}
+
+static
+uint8_t ordinal_to_key(const struct cds_ja *ja, uint8_t ordinal)
+{
+	if (caa_likely(ja->key_map.identity))
+		return ordinal;
+	return ja->key_map.ordinal_to_key[ordinal];
+}
+
+static
 struct cds_ja_inode *_ja_node_mask_ptr(struct cds_ja_inode_flag *node)
 {
 	return (struct cds_ja_inode *) (((unsigned long) node) & JA_PTR_MASK);
