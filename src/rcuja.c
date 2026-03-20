@@ -2169,19 +2169,17 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		dbg_printf("cds_ja_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
 				(unsigned int) key_value, (unsigned int) cur_key[level - 1],
 				node_flag);
-		/* If found left/right sibling, find rightmost/leftmost child. */
-		if (ja_node_ptr(node_flag))
-			break;
 		/*
 		 * Return external node if trying to find LE/LT
 		 * inequality and encountering an external node when
 		 * going upward.
 		 */
-		if (dir == JA_LEFT) {
-			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(cur_node_depth[level - 1]));
+		if (dir == JA_LEFT && ja_node_internal(node_flag)) {
+			struct cds_ja_metadata *metadata = cds_ja_item_to_metadata(ja_node_ptr(node_flag));
 			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
+				assert(!ja->key_len || level <= ja->key_len);
 				if (result_key) {
 					int i;
 
@@ -2193,6 +2191,9 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 				return external_nodes;
 			}
 		}
+		/* If found left/right sibling, find rightmost/leftmost child. */
+		if (ja_node_ptr(node_flag))
+			break;
 	}
 
 	if (!level) {
@@ -2201,6 +2202,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 	}
 
 	if (!ja_node_internal(node_flag)) {
+		assert(!ja->key_len || level <= ja->key_len);
 		if (result_key) {
 			int i;
 
@@ -2248,6 +2250,7 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 			struct cds_ja_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
+				assert(!ja->key_len || level <= ja->key_len);
 				if (result_key) {
 					int i;
 
@@ -2266,18 +2269,21 @@ struct cds_ja_node *cds_ja_lookup_inequality(struct cds_ja *ja,
 		dbg_printf("cds_ja_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) cur_key[level - 1],
 				node_flag);
-		if (!ja_node_ptr(node_flag))
+		if (!ja_node_ptr(node_flag) || !ja_node_internal(node_flag))
 			break;
 	}
 
-	if (result_key) {
-		int i;
+	if (ja_node_ptr(node_flag)) {
+		assert(!ja->key_len || level <= ja->key_len);
+		if (result_key) {
+			int i;
 
-		for (i = 0; i < level; i++)
-			*(result_key++) = ordinal_to_key(ja, cur_key[i]);
+			for (i = 0; i < level; i++)
+				*(result_key++) = ordinal_to_key(ja, cur_key[i]);
+		}
+		if (result_key_len)
+			*result_key_len = level;
 	}
-	if (result_key_len)
-		*result_key_len = level;
 	return (struct cds_ja_node *) node_flag;
 }
 
