@@ -1129,9 +1129,12 @@ static const char *test_strings[] = {
 	"eee",
 	"eef",
 	"eeeeeeeeeee",
-	"zzzzzzzzzzz",
-	"zzzzzzzzzz1",
-	"zzzzzzzzz",
+	"zzz",
+	"zz1",
+	"z",
+	"y",
+	"yy1",
+	"yyy",
 	"abcd",	/* twice */
 	"a",
 	"x",
@@ -1152,8 +1155,6 @@ static const char *fail_strings[] = {
 	"x!",
 	"ffffffffffffffffffffffffffffffffffffffffffffff!",
 };
-
-
 
 static
 int test_varlen_string_key_add(void)
