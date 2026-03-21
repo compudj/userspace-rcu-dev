@@ -618,11 +618,17 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 			if ((int) v < n && (int) v > match_v) {
 				match_v = v;
 				match_ptr = ptr;
+				/* Found value immediately left of n. */
+				if (match_v == n - 1)
+					break;
 			}
 		} else {
 			if ((int) v > n && (int) v < match_v) {
 				match_v = v;
 				match_ptr = ptr;
+				/* Found value immediately right of n. */
+				if (match_v == n + 1)
+					break;
 			}
 		}
 	}
@@ -744,15 +750,22 @@ struct cds_ft_inode_flag *ft_pool_node_get_direction(const struct cds_ft_type *t
 				if ((int) v < n && (int) v > match_v) {
 					match_v = v;
 					match_node_flag = iter;
+					/* Found value immediately left of n. */
+					if (match_v == n - 1)
+						goto end;
 				}
 			} else {
 				if ((int) v > n && (int) v < match_v) {
 					match_v = v;
 					match_node_flag = iter;
+					/* Found value immediately right of n. */
+					if (match_v == n + 1)
+						goto end;
 				}
 			}
 		}
 	}
+end:
 	if (match_node_flag)
 		*result_key = (uint8_t) match_v;
 	return match_node_flag;
