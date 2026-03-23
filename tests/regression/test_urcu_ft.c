@@ -68,7 +68,7 @@ static uint64_t key_mul = 1ULL;
 
 static int add_unique, add_replace;
 
-static int leak_detection;
+static int leak_detection, show_stats;
 static unsigned long test_nodes_allocated, test_nodes_freed;
 
 static void set_affinity(void)
@@ -192,6 +192,7 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 	printf("        [-B] Key bytes for multithread test (default: 4).\n");
 	printf("        [-m factor] Key multiplication factor.\n");
 	printf("	[-l] Memory leak detection.\n");
+	printf("	[-Z] Show statistics.\n");
 	printf("\n\n");
 }
 
@@ -717,6 +718,9 @@ int test_sparse_key(unsigned int len, int nr_dup)
 	}
 	printf("OK\n");
 
+	if (show_stats)
+		cds_ft_show_stats(test_ja, stderr);
+
 	printf("Test #2: successful key lookup (%u-byte).\n", len);
 	zerocount = 0;
 	for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
@@ -1066,6 +1070,9 @@ int do_sanity_test_varlen_dup(int nr_dup)
 		rcu_quiescent_state();
 	}
 
+	if (show_stats)
+		cds_ft_show_stats(test_ja, stderr);
+
 	/* key length (bytes) */
 	for (i = 1; i <= 8; i *= 2) {
 		ret = test_varlen_sparse_key_lookup(i, nr_dup);
@@ -1307,6 +1314,9 @@ int do_test_varlen_string(void)
 		return ret;
 	}
 	rcu_quiescent_state();
+
+	if (show_stats)
+		cds_ft_show_stats(test_ja, stderr);
 
 	ret = test_varlen_string_key_lookup();
 	if (ret) {
@@ -1587,6 +1597,7 @@ int do_mt_populate_ja(void)
 			assert(0);
 		}
 	}
+
 	return 0;
 }
 
@@ -1625,6 +1636,9 @@ int do_mt_test(void)
 	}
 
 	do_mt_populate_ja();
+
+	if (show_stats)
+		cds_ft_show_stats(test_ja, stderr);
 
 	next_aff = 0;
 
@@ -1672,6 +1686,9 @@ int do_mt_test(void)
 		tot_remove += count_writer[i].remove;
 	}
 	urcu_qsbr_thread_online();
+
+	if (show_stats)
+		cds_ft_show_stats(test_ja, stderr);
 
 	ret = test_free_all_nodes(test_ja);
 	if (ret) {
@@ -1812,6 +1829,9 @@ int main(int argc, char **argv)
 			break;
 		case 'l':
 			leak_detection = 1;
+			break;
+		case 'Z':
+			show_stats = 1;
 			break;
 		}
 	}
