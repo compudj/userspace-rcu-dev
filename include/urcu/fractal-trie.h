@@ -360,7 +360,12 @@ uint32_t cds_ft_key_to_u32(const struct cds_ft *ft, const uint8_t *key, size_t k
  */
 void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key, size_t key_len);
 
-void cds_ft_show(FILE *out, const struct cds_ft *ja);
+/*
+ * cds_ft_show - Print content of the Fractal Trie.
+ * @ft: The Fractal Trie.
+ * @out: File stream output.
+ */
+void cds_ft_show(const struct cds_ft *ft, FILE *out);
 
 /*
  * cds_ft_for_each_duplicate_rcu - Iterate through duplicates.

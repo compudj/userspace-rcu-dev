@@ -3097,7 +3097,7 @@ void print_indent(FILE *out, int level)
 }
 
 static
-void show_node_recursive(FILE *out, const struct cds_ft *ft, struct cds_ft_inode_flag *node_flag, int level)
+void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode_flag *node_flag, int level)
 {
 	unsigned int key;
 
@@ -3122,7 +3122,7 @@ void show_node_recursive(FILE *out, const struct cds_ft *ft, struct cds_ft_inode
 				fprintf(out, "Level %d, key value: %u, (meta)external node list ptr: %p\n",
 					level, key, external_nodes);
 			}
-			show_node_recursive(out, ft, child_node_flag, level + 1);
+			show_node_recursive(ft, out, child_node_flag, level + 1);
 		} else {
 			print_indent(out, level);
 			fprintf(out, "Level %d, key value: %u, external node list ptr: %p\n",
@@ -3132,12 +3132,11 @@ void show_node_recursive(FILE *out, const struct cds_ft *ft, struct cds_ft_inode
 
 }
 
-void cds_ft_show(FILE *out, const struct cds_ft *ft)
+void cds_ft_show(const struct cds_ft *ft, FILE *out)
 {
-	int level = 0;
 	struct cds_ft_inode_flag *node_flag;
-	//XXX
-	return;
+	int level = 0;
+
 	fprintf(out, "Show Fractal Trie %p\n", ft);
 	fprintf(out, "---------------------------------------------------\n");
 
@@ -3147,7 +3146,7 @@ void cds_ft_show(FILE *out, const struct cds_ft *ft)
 	if (ft_node_ptr(node_flag)) {
 		print_indent(out, level);
 		fprintf(out, "Level 0: root node %p\n", node_flag);
-		show_node_recursive(out, ft, node_flag, level + 1);
+		show_node_recursive(ft, out, node_flag, level + 1);
 	}
 	fprintf(out, "---------------------------------------------------\n");
 }

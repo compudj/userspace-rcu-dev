@@ -202,7 +202,6 @@ int test_free_all_nodes(struct cds_ft *ja)
 	bool first = true;
 	int ret = 0;
 
-	cds_ft_show(stderr, ja);
 	rcu_read_lock();
 
 	for (;;) {
@@ -228,7 +227,6 @@ int test_free_all_nodes(struct cds_ft *ja)
 	}
 end:
 	rcu_read_unlock();
-	cds_ft_show(stderr, ja);
 	return ret;
 }
 
