@@ -2426,6 +2426,8 @@ int ft_attach_node(struct cds_ft *ft,
 
 	/* Publish branch. */
 	if (level == 0) {
+		if (!ft_node_ptr(ft->root))
+			metadata->nr_child++;
 		/*
 		 * Attaching to root node.
 		 */
@@ -2745,6 +2747,10 @@ int ft_detach_node(struct cds_ft *ft,
 
 	dbg_printf("ft_detach_node: publish %p instead of %p\n",
 		iter_node_flag, *parent_node_flag_ptr);
+	if (parent_node_flag_ptr == &ft->root) {
+		if (*parent_node_flag_ptr && !iter_node_flag)
+			ft->root_metadata.nr_child--;
+	}
 	/* Update address of parent ptr in its parent */
 	rcu_assign_pointer(*parent_node_flag_ptr, iter_node_flag);
 
