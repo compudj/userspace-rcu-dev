@@ -2084,6 +2084,7 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 {
 	int key_depth, level;
 	struct cds_ft_inode_flag *node_flag, *cur_node_depth[FT_MAX_DEPTH];
+	struct cds_ft_node *ret_node;
 	uint8_t cur_key[FT_MAX_DEPTH - 1];
 	enum ft_direction dir;
 	const uint8_t *iter_key = key;
@@ -2272,16 +2273,8 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
-				assert(!ft->key_len || level <= (int) ft->key_len);
-				if (result_key) {
-					int i;
-
-					for (i = 0; i < level; i++)
-						*(result_key++) = ordinal_to_key(ft, cur_key[i]);
-				}
-				if (result_key_len)
-					*result_key_len = level;
-				return external_nodes;
+				ret_node = external_nodes;
+				goto end;
 			}
 		}
 		/* Return external node. */
@@ -2289,13 +2282,14 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 			break;
 		node_flag = ft_node_get_minmax(node_flag, &cur_key[level - 1], dir);
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
-				(unsigned int) cur_key[level - 1],
-				node_flag);
+				(unsigned int) cur_key[level - 1], node_flag);
 		if (!ft_node_internal(node_flag))
 			break;
 	}
-
-	assert(!ft->key_len || level <= (int) ft->key_len);
+	/* attach/detach semantic guarantees that ft_node_get_minmax cannot return NULL. */
+	assert(ft_node_ptr(node_flag));
+	ret_node = (struct cds_ft_node *) node_flag;
+end:
 	if (result_key) {
 		int i;
 
@@ -2304,10 +2298,7 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 	}
 	if (result_key_len)
 		*result_key_len = level;
-
-	/* attach/detach semantic guarantees that ft_node_get_minmax cannot return NULL. */
-	assert(ft_node_ptr(node_flag));
-	return (struct cds_ft_node *) node_flag;
+	return ret_node;
 }
 
 struct cds_ft_node *cds_ft_lookup_lower_equal(struct cds_ft *ft,
