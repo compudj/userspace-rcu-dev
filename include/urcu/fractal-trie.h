@@ -368,6 +368,13 @@ void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key, size_t
 void cds_ft_show(const struct cds_ft *ft, FILE *out);
 
 /*
+ * cds_ft_show_stats - Print Fractal Trie statistics.
+ * @ft: The Fractal Trie.
+ * @out: File stream output.
+ */
+void cds_ft_show_stats(const struct cds_ft *ft, FILE *out);;;;
+
+/*
  * cds_ft_for_each_duplicate_rcu - Iterate through duplicates.
  * @pos: struct cds_ft_node *, start of duplicate list and loop cursor.
  *

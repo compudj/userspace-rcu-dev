@@ -3155,3 +3155,155 @@ void cds_ft_show(const struct cds_ft *ft, FILE *out)
 	}
 	fprintf(out, "---------------------------------------------------\n");
 }
+
+struct cds_ft_node_stats {
+	uint64_t count;
+	uint64_t distribution[257];
+};
+
+struct cds_ft_stats_level {
+	uint64_t nr_external_nodes;
+	uint64_t nr_metadata_external_nodes;
+	uint64_t nr_duplicate_external_nodes;
+	uint64_t nr_internal_nodes;
+	struct cds_ft_node_stats node_stats[FT_TYPE_MAX_NR];
+	bool has_nodes;
+};
+
+struct cds_ft_stats {
+	struct cds_ft_stats_level level[FT_MAX_DEPTH];
+};
+
+static
+void calc_stats_node(const struct cds_ft *ft, struct cds_ft_inode_flag *node_flag, struct cds_ft_stats *stats, int level)
+{
+	unsigned long node_type = ft_node_type(node_flag);
+	struct cds_ft_node_stats *node_stats = &stats->level[level].node_stats[node_type];
+	const struct cds_ft_metadata *metadata;
+
+	if (node_flag != ft->root)
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+	else
+		metadata = &ft->root_metadata;
+	node_stats->count++;
+	node_stats->distribution[metadata->nr_child]++;
+	stats->level[level].nr_internal_nodes++;
+	stats->level[level].has_nodes = true;
+}
+
+static
+void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_stats *stats, int level)
+{
+	unsigned int key;
+
+	for (key = 0; key < 256; key++) {
+		struct cds_ft_inode_flag *child_node_flag;
+
+		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+		if (!ft_node_ptr(child_node_flag))
+			continue;
+		if (ft_node_internal(child_node_flag)) {
+			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(child_node_flag));
+			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+
+			calc_stats_node(ft, child_node_flag, stats, level);
+			if (external_nodes) {
+				struct cds_ft_node *iter_node;
+				unsigned int count = 0;
+
+				iter_node = external_nodes;
+				cds_ft_for_each_duplicate(iter_node) {
+					if (count++ == 0)
+						stats->level[level].nr_metadata_external_nodes++;
+					else
+						stats->level[level].nr_duplicate_external_nodes++;
+					stats->level[level].has_nodes = true;
+				}
+			}
+			calc_stats_node_recursive(ft, child_node_flag, stats, level + 1);
+		} else {
+			struct cds_ft_node *iter_node;
+			unsigned int count = 0;
+
+			iter_node = (struct cds_ft_node *) ft_node_ptr(child_node_flag);
+			cds_ft_for_each_duplicate(iter_node) {
+				if (count++ == 0)
+					stats->level[level].nr_external_nodes++;
+				else
+					stats->level[level].nr_duplicate_external_nodes++;
+				stats->level[level].has_nodes = true;
+			}
+		}
+	}
+}
+
+static
+void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats *stats)
+{
+	int level;
+
+	fprintf(out, "Fractal Trie (%p) Statistics\n", ft);
+	fprintf(out, "---------------------------------------------------\n");
+	for (level = 0; level < FT_MAX_DEPTH; level++) {
+		const struct cds_ft_stats_level *stats_level = &stats->level[level];
+		unsigned long type;
+
+		if (!stats_level->has_nodes)
+			break;
+		fprintf(out, "Level: %d\n", level);
+		if (stats_level->nr_external_nodes) {
+			print_indent(out, 1);
+			fprintf(out, "External nodes: %" PRIu64 "\n", stats_level->nr_external_nodes);
+		}
+		if (stats_level->nr_metadata_external_nodes) {
+			print_indent(out, 1);
+			fprintf(out, "Metadata external nodes: %" PRIu64 "\n", stats_level->nr_metadata_external_nodes);
+		}
+		if (stats_level->nr_duplicate_external_nodes) {
+			print_indent(out, 1);
+			fprintf(out, "Duplicate external nodes: %" PRIu64 "\n", stats_level->nr_duplicate_external_nodes);
+		}
+		if (stats_level->nr_internal_nodes) {
+			print_indent(out, 1);
+			fprintf(out, "Internal nodes: %" PRIu64 "\n", stats_level->nr_internal_nodes);
+		}
+		for (type = 0; type < FT_TYPE_MAX_NR; type++) {
+			const struct cds_ft_node_stats *node_stats = &stats->level[level].node_stats[type];
+			uint64_t nr_nodes = node_stats->count;
+
+			if (nr_nodes) {
+				unsigned int i;
+				bool first = true;
+
+				print_indent(out, 2);
+				fprintf(out, "Internal node type %lu: %" PRIu64 " (", type, nr_nodes);
+				for (i = 0; i <= 256; i++) {
+					if (node_stats->distribution[i]) {
+						fprintf(out, "%s%u: %" PRIu64,
+							(!first ? ", " : ""), i, node_stats->distribution[i]);
+						first = false;
+					}
+				}
+				fprintf(out, ")\n");
+			}
+		}
+	}
+	fprintf(out, "---------------------------------------------------\n");
+}
+
+void cds_ft_show_stats(const struct cds_ft *ft, FILE *out)
+{
+	struct cds_ft_inode_flag *node_flag;
+	struct cds_ft_stats stats = {};
+	int level = 0;
+
+	node_flag = rcu_dereference(ft->root);
+
+	/* level 0: root node */
+	if (ft_node_ptr(node_flag)) {
+		calc_stats_node(ft, node_flag, &stats, level);
+		calc_stats_node_recursive(ft, node_flag, &stats, level + 1);
+	}
+	do_show_stats(ft, out, &stats);
+}
