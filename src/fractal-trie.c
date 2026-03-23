@@ -3135,7 +3135,6 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 				level, key, ft_node_ptr(child_node_flag));
 		}
 	}
-
 }
 
 void cds_ft_show(const struct cds_ft *ft, FILE *out)
