@@ -140,7 +140,7 @@ void range_destroy(struct cds_ft_alloc_range *range)
 static
 struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft *ft, const char *arena_name, size_t item_len_order)
 {
-	struct cds_ft_alloc_arena *arena = calloc(1, sizeof(struct cds_ft_alloc_arena));
+	struct cds_ft_alloc_arena *arena;
 
 	if (!page_size)
 		page_size = urcu_get_page_len();
@@ -150,8 +150,9 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft *ft, const char *ar
 		errno = EINVAL;
 		return NULL;
 	}
+	arena = calloc(1, sizeof(struct cds_ft_alloc_arena));
 	if (!arena)
-		return NULL;
+		goto error_alloc;
 	arena->ft = ft;
 	arena->item_len_order = item_len_order;
 	arena->max_nr_items_per_range = page_size >> item_len_order;
