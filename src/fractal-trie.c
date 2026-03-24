@@ -939,7 +939,8 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_metadata *metadata,
 		uint8_t n,
-		struct cds_ft_inode_flag *child_node_flag)
+		struct cds_ft_inode_flag *child_node_flag,
+		bool *_replace_old_ptr)
 {
 	uint8_t nr_child;
 	uint8_t *values, *nr_child_ptr;
@@ -992,7 +993,8 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 		(unsigned int) uatomic_load(nr_child_ptr, CMM_RELAXED),
 		(unsigned int) metadata->nr_child,
 		node);
-
+	if (_replace_old_ptr)
+		*_replace_old_ptr = replace_old_ptr;
 	return 0;
 }
 
@@ -1005,6 +1007,8 @@ int ft_pool_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *child_node_flag)
 {
 	struct cds_ft_inode *linear;
+	bool replace_old_ptr = false;
+	int ret;
 
 	assert(type->type_class == FT_POOL);
 
@@ -1035,7 +1039,14 @@ int ft_pool_node_set_nth(const struct cds_ft_type *type,
 		assert(0);
 	}
 
-	return ft_linear_node_set_nth(type, linear, metadata, n, child_node_flag);
+	ret = ft_linear_node_set_nth(type, linear, metadata, n, child_node_flag, &replace_old_ptr);
+	if (ret == 0 && !replace_old_ptr && type->bitmap) {
+		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
+
+		/* Set n in bitmap. */
+		cds_set_bit_relaxed(bitmap->bitmap, n);
+	}
+	return ret;
 }
 
 static
@@ -1053,8 +1064,13 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
 	if (*ptr)
 		replace_old_ptr = true;
 	rcu_assign_pointer(*ptr, child_node_flag);
-	if (!replace_old_ptr)
+	if (!replace_old_ptr) {
+		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
+
+		/* Set n in bitmap. */
+		cds_set_bit_relaxed(bitmap->bitmap, n);
 		metadata->nr_child++;
+	}
 	return 0;
 }
 
@@ -1072,7 +1088,7 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 {
 	switch (type->type_class) {
 	case FT_LINEAR:
-		return ft_linear_node_set_nth(type, node, metadata, n, child_node_flag);
+		return ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL);
 	case FT_POOL:
 		return ft_pool_node_set_nth(type, node, node_flag, metadata, n, child_node_flag);
 	case FT_PIGEON:
@@ -1139,6 +1155,7 @@ int ft_pool_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *newptr)
 {
 	struct cds_ft_inode *linear;
+	int ret;
 
 	assert(type->type_class == FT_POOL);
 
@@ -1179,13 +1196,22 @@ int ft_pool_node_replace_ptr(const struct cds_ft_type *type,
 		assert(0);
 	}
 
-	return ft_linear_node_replace_ptr(type, linear, metadata, node_flag_ptr, newptr);
+	ret = ft_linear_node_replace_ptr(type, linear, metadata, node_flag_ptr, newptr);
+	if (ret == 0 && !newptr && type->bitmap) {
+		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
+
+		/* Clear n in bitmap. */
+		cds_clear_bit_relaxed(bitmap->bitmap, n);
+	}
+	return ret;
 }
 
 static
 int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
+		uint8_t n,
 		struct cds_ft_inode_flag *newptr)
 {
 	assert(type->type_class == FT_PIGEON);
@@ -1202,8 +1228,13 @@ int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
 	dbg_printf("ft_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
 	assert(*node_flag_ptr != NULL);
 	rcu_assign_pointer(*node_flag_ptr, newptr);
-	if (!newptr)
+	if (!newptr) {
+		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
+
+		/* Clear n in bitmap. */
+		cds_clear_bit_relaxed(bitmap->bitmap, n);
 		metadata->nr_child--;
+	}
 	return 0;
 }
 
@@ -1225,7 +1256,7 @@ int _ft_node_replace_ptr(const struct cds_ft_type *type,
 	case FT_POOL:
 		return ft_pool_node_replace_ptr(type, node, node_flag, metadata, node_flag_ptr, n, newptr);
 	case FT_PIGEON:
-		return ft_pigeon_node_replace_ptr(type, metadata, node_flag_ptr, newptr);
+		return ft_pigeon_node_replace_ptr(type, node, metadata, node_flag_ptr, n, newptr);
 	case FT_NULL:
 		return -ENOENT;
 	default:
