@@ -25,6 +25,10 @@
 #include "fractal-trie-internal.h"
 #include "bitmap.h"
 
+#if defined(FEATURE_SIMD_LOOKUP) && (defined(__AVX2__) || defined(__SSE2__))
+# include <immintrin.h>
+#endif
+
 #ifndef abs
 #define abs_int(a)	((int) (a) > 0 ? (int) (a) : -((int) (a)))
 #endif
@@ -545,7 +549,163 @@ uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
  * a value is missing, we return NULL. If a value is there, but its
  * associated pointers is still NULL, we return NULL too.
  */
-#ifdef FEATURE_SWAR_LOOKUP
+
+#if defined(FEATURE_SIMD_LOOKUP) && defined(__AVX2__)
+
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
+	uint8_t *data = &node->u.data[0]; /* data[0] is nr_child */
+	unsigned int phys_idx;
+	uint32_t mask;
+
+	/* Broadcast target byte into a 256-bit vector. */
+	__m256i target = _mm256_set1_epi8(n);
+
+	/* Load and compare first 32 bytes (includes count). */
+	__m256i chunk0 = _mm256_loadu_si256((__m256i*)data);
+	mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk0, target));
+
+	mask &= ~1U; /* Ignore the count byte at index 0. */
+
+	if (mask) {
+		phys_idx = __builtin_ctz(mask);
+		if (caa_likely(phys_idx <= nr_child))
+			goto found;
+	}
+
+	/* Load and compare next 32 bytes (bytes 32-63). */
+	if (nr_child >= 32) {
+		__m256i chunk1 = _mm256_loadu_si256((__m256i*)(data + 32));
+		mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk1, target));
+
+		if (mask) {
+			phys_idx = 32 + __builtin_ctz(mask);
+			if (phys_idx <= nr_child)
+				goto found;
+		}
+	}
+
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+
+found:
+	{
+		/* logical_idx = phys_idx - 1 (because data[0] is nr_child). */
+		unsigned int i = phys_idx - 1;
+		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
+			align_ptr_size(&node->u.data[1] + type->max_linear_child);
+
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = &pointers[i];
+		return rcu_dereference(pointers[i]);
+	}
+}
+
+#elif defined(FEATURE_SIMD_LOOKUP)
+/*
+ * Define a 32-byte vector of unsigned bytes.
+ * GCC will handle the mapping to hardware registers.
+ */
+typedef uint8_t v32u8 __attribute__ ((vector_size (32)));
+
+static inline uint32_t get_bitmask(v32u8 v) {
+#if defined(__AVX2__)
+	/* If compiled with -mavx2, use the 256-bit intrinsic. */
+	return _mm256_movemask_epi8((__m256i)v);
+#elif defined(__SSE2__)
+	/*
+	 * If only -msse2 or -msse4.2, split the 32-byte generic vector
+	 * into two 16-byte moves.
+	 */
+	__m128i low = _mm_loadu_si128((__m128i*)&v);
+	__m128i high = _mm_loadu_si128((__m128i*)((uint8_t*)&v + 16));
+	return _mm_movemask_epi8(low) | (_mm_movemask_epi8(high) << 16);
+#else
+	/* Fallback for non-x86 (ARM/NEON etc.) */
+	uint32_t m = 0;
+
+	for (int i = 0; i<32; i++) {
+		if (((uint8_t*)&v)[i]) {
+			m |= (1U << i);
+		}
+	}
+	return m;
+#endif
+}
+
+static struct cds_ft_inode_flag *ft_linear_node_get_nth(
+		const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
+	uint8_t *data = &node->u.data[0]; /* data[0] is nr_child */
+	unsigned int phys_idx;
+
+	/*
+	 * Broadcast target 'n' into a vector.
+	 * GCC optimizes this to a single broadcast instruction.
+	 */
+	v32u8 target_v = { n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,
+			   n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n };
+
+	/* --- BLOCK 1: Bytes 0-31 (Includes Count) --- */
+	v32u8 chunk0;
+	__builtin_memcpy(&chunk0, data, 32);
+
+	/* Vector comparison: results in 0xFF for match, 0x00 for no match */
+	v32u8 res0 = (chunk0 == target_v);
+
+	/*
+	 * Convert vector result to a bitmask.
+	 * Note: On x86, the compiler will use VPMOVMSKB.
+	 */
+	uint32_t mask0 = get_bitmask(res0);
+
+	mask0 &= ~1U; /* Force ignore of the nr_child byte at index 0. */
+	if (mask0) {
+		phys_idx = __builtin_ctz(mask0);
+		if (phys_idx <= nr_child)
+			goto found;
+	}
+
+	/* --- BLOCK 2: Bytes 32-63 --- */
+	if (nr_child >= 32) {
+		v32u8 chunk1;
+		__builtin_memcpy(&chunk1, data + 32, 32);
+		v32u8 res1 = (chunk1 == target_v);
+
+		uint32_t mask1 = get_bitmask(res1);
+		if (mask1) {
+			phys_idx = 32 + __builtin_ctz(mask1);
+			if (phys_idx <= nr_child)
+				goto found;
+		}
+	}
+
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+
+found:
+	{
+		unsigned int i = phys_idx - 1; /* Convert to logical 0-index */
+		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
+			align_ptr_size(&node->u.data[1] + type->max_linear_child);
+
+		if (caa_unlikely(node_flag_ptr)) *node_flag_ptr = &pointers[i];
+		return rcu_dereference(pointers[i]);
+	}
+}
+
+#elif defined(FEATURE_SWAR_LOOKUP)
 
 /* Generate a mask of 0x01 bytes for the current word size. */
 #define L_ONES (-1UL / 255)
