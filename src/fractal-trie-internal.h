@@ -64,6 +64,13 @@
 
 #define FT_ALLOC_ORDER_MAX		12
 
+#define FT_BITMAP_LEN			32
+
+enum {
+	FT_NO_BITMAP = false,
+	FT_BITMAP = true,
+};
+
 /* Never declared. Opaque type used to store flagged node pointers. */
 struct cds_ft_inode_flag;
 struct cds_ft_inode;
@@ -85,6 +92,33 @@ struct cds_ft_metadata_alloc {
 	unsigned int alloc_index;
 	struct cds_ft_metadata metadata;
 };
+
+struct cds_ft_bitmap {
+	/*
+	 * Bitmap is used by 2D pool and pigeon node configurations
+	 * for ordered traversals. Here are the comparative costs for
+	 * ordered traveral of a node:
+	 *
+	 * - For 2D pool, using the bitmap costs a total of 3 cache line
+	 *   loads and 1 extra TLB hit, compared to a worse case of 5
+	 *   cache line loads without the bitmap.
+	 *
+	 * - For pigeon, using the bitmap costs 2 cache line loads and
+	 *   1 extra TLB hit, compared to 32 cache line loads worse case
+	 *   without the bitmap.
+	 *
+	 *   Bitmap memory use (in bytes) (32-bit)
+	 *                        bitmap size    node size       %
+	 *   2D pool                   32            512       6.2
+	 *   Pigeon                    32           1024       3.1
+	 *
+	 *   Bitmap memory use (in bytes) (64-bit)
+	 *                        bitmap size    node size       %
+	 *   2D pool                   32           1024       3.1
+	 *   Pigeon                    32           2048       1.6
+	 */
+	unsigned long bitmap[FT_BITMAP_LEN / sizeof(unsigned long)];
+} __attribute__((__aligned__(FT_BITMAP_LEN)));
 
 struct cds_ft_key_map {
 	bool identity;
@@ -180,6 +214,9 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 }
 
 __attribute__((visibility("hidden")))
+struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order);
+
+__attribute__((visibility("hidden")))
 void cds_ft_free_all_arenas(struct cds_ft *ja);
 
 __attribute__((visibility("hidden")))
@@ -189,7 +226,7 @@ __attribute__((visibility("hidden")))
 void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata);
 
 __attribute__((visibility("hidden")))
-struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ja, size_t item_len_order);
+struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ja, size_t item_len_order, bool bitmap);
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft_metadata *metadata);

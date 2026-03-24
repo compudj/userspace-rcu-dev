@@ -23,6 +23,8 @@
  *   page_size:             struct cds_ft_alloc_range
  *   page_size + sizeof(struct cds_ft_alloc_range):
  *                          array of nr_items struct cds_ft_metadata_alloc
+ *   2 * page_size - nr_items * sizeof(struct cds_ft_bitmap):
+ *                          reverse array of nr_items struct cds_ft_bitmap (only for 2D pool and pigeon)
  *
  * An allocation arena contains a linked list of allocation ranges.
  */
@@ -57,6 +59,7 @@ struct cds_ft_alloc_arena {
 	struct cds_ft_metadata_alloc *free_list_head;	/* NULL terminated singly-linked list. */
 	pthread_mutex_t lock;
 	char *name;
+	bool bitmap;
 };
 
 static
@@ -89,6 +92,17 @@ struct cds_ft_alloc_range *cds_ft_metadata_to_range(struct cds_ft_metadata *meta
 	return (struct cds_ft_alloc_range *)((char *)(metadata_alloc - index) - sizeof(struct cds_ft_alloc_range));
 }
 
+/*
+ * bitmap array is indexed backwards from range base + (2 * page_size).
+ */
+struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order)
+{
+	void *base = (void *)((unsigned long)p & ~(page_size - 1));
+	size_t index = ((unsigned long)p & (page_size - 1)) >> item_len_order;
+
+	return base + (2 * page_size) - ((index + 1) * sizeof(struct cds_ft_bitmap));
+}
+
 struct cds_ft_metadata *cds_ft_item_to_metadata(void *p)
 {
 	struct cds_ft_alloc_range *range = cds_ft_item_to_range(p);
@@ -109,16 +123,19 @@ void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata)
 }
 
 static
-size_t cds_ft_arena_range_alloc_size(size_t item_len_order)
+size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 {
-	return page_size + sizeof(struct cds_ft_alloc_range) +
-		(page_size >> item_len_order) * sizeof(struct cds_ft_metadata_alloc);
+	if (bitmap)
+		return 2 * page_size;
+	else
+		return page_size + sizeof(struct cds_ft_alloc_range) +
+			(page_size >> item_len_order) * sizeof(struct cds_ft_metadata_alloc);
 }
 
 static
 struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 {
-	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order);
+	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
 	void *ptr = aligned_alloc(page_size, alloc_size);
 	struct cds_ft_alloc_range *range;
 
@@ -138,9 +155,10 @@ void range_destroy(struct cds_ft_alloc_range *range)
 }
 
 static
-struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft *ft, const char *arena_name, size_t item_len_order)
+struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft *ft, const char *arena_name, size_t item_len_order, bool bitmap)
 {
 	struct cds_ft_alloc_arena *arena;
+	size_t max_items_per_range;
 
 	if (!page_size)
 		page_size = urcu_get_page_len();
@@ -150,12 +168,21 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft *ft, const char *ar
 		errno = EINVAL;
 		return NULL;
 	}
+	max_items_per_range = page_size >> item_len_order;
+	/* Ensure that range header, metadata array and bitmaps fit in a page. */
+	if (bitmap && (sizeof(struct cds_ft_alloc_range) +
+			max_items_per_range * (sizeof(struct cds_ft_metadata_alloc) +
+				sizeof(struct cds_ft_bitmap)) > page_size)) {
+		errno = EINVAL;
+		return NULL;
+	}
 	arena = calloc(1, sizeof(struct cds_ft_alloc_arena));
 	if (!arena)
 		goto error_alloc;
 	arena->ft = ft;
 	arena->item_len_order = item_len_order;
-	arena->max_nr_items_per_range = page_size >> item_len_order;
+	arena->max_nr_items_per_range = max_items_per_range;
+	arena->bitmap = bitmap;
 	CDS_INIT_LIST_HEAD(&arena->ranges);
 	if (arena_name) {
 		arena->name = strdup(arena_name);
@@ -202,6 +229,10 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 		p = cds_ft_metadata_to_item(&free_list_head->metadata);
 		memset(p, 0, 1U << arena->item_len_order);
 		memset(&free_list_head->metadata, 0, sizeof(free_list_head->metadata));
+		if (arena->bitmap) {
+			struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(p, arena->item_len_order);
+			memset(bitmap, 0, sizeof(struct cds_ft_bitmap));
+		}
 		pthread_mutex_unlock(&arena->lock);
 		return &free_list_head->metadata;
 	}
@@ -235,7 +266,7 @@ room_left:
 	return &item->metadata;
 }
 
-struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order)
+struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order, bool bitmap)
 {
 	struct cds_ft_alloc_arena **arena_p;
 
@@ -247,7 +278,7 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 	}
 	arena_p = &ft->arena_order[item_len_order];
 	if (!*arena_p) {
-		*arena_p = cds_ft_arena_create(ft, "cds_ft_alloc", item_len_order);
+		*arena_p = cds_ft_arena_create(ft, "cds_ft_alloc", item_len_order, bitmap);
 		if (!*arena_p)
 			return NULL;
 	}
