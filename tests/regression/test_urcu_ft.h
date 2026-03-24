@@ -63,20 +63,20 @@ extern DECLARE_URCU_TLS(unsigned long, nr_delnoent);
 extern DECLARE_URCU_TLS(unsigned long, lookup_fail);
 extern DECLARE_URCU_TLS(unsigned long, lookup_ok);
 
-struct ja_test_node {
+struct ft_test_node {
 	struct cds_ft_node node;
 	uint64_t key;		/* for testing */
 	struct rcu_head head;	/* delayed reclaim */
 };
 
-static inline struct ja_test_node *
+static inline struct ft_test_node *
 to_test_node(struct cds_ft_node *node)
 {
-	return caa_container_of(node, struct ja_test_node, node);
+	return caa_container_of(node, struct ft_test_node, node);
 }
 
 static inline
-void ja_test_node_init(struct ja_test_node *node, uint64_t key)
+void ft_test_node_init(struct ft_test_node *node, uint64_t key)
 {
 	node->key = key;
 }
