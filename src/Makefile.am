@@ -9,11 +9,11 @@ AM_CPPFLAGS += -I$(top_srcdir)/src
 AM_LDFLAGS=-version-info $(URCU_LIBRARY_VERSION) $(LT_NO_UNDEFINED)
 
 dist_noinst_HEADERS = urcu-die.h urcu-wait.h compat-getcpu.h \
-	urcu-utils.h compat-smp.h
+	urcu-utils.h compat-smp.h bitmap.h
 
 COMPAT = compat_futex.c
 
-FRACTAL_TRIE = fractal-trie.c fractal-trie-alloc.c fractal-trie-internal.h
+FRACTAL_TRIE = fractal-trie.c fractal-trie-alloc.c fractal-trie-internal.h bitmap.h
 
 RCULFHASH = rculfhash.c rculfhash-mm-order.c rculfhash-mm-chunk.c \
 		rculfhash-mm-mmap.c

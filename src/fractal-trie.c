@@ -23,6 +23,7 @@
 #include <urcu/uatomic.h>
 
 #include "fractal-trie-internal.h"
+#include "bitmap.h"
 
 #ifndef abs
 #define abs_int(a)	((int) (a) > 0 ? (int) (a) : -((int) (a)))
