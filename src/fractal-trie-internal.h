@@ -18,6 +18,8 @@
 #include <urcu/rculfhash.h>
 #include <assert.h>
 
+#define USE_BITMAP_SCAN
+
 /*
  * If the internal bit is set in a pointer, it points to an internal
  * Fractal Trie node, else it points to a node outside of the Fractal Trie.

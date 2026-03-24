@@ -716,6 +716,7 @@ struct cds_ft_inode *ft_pool_node_get_ith_pool(const struct cds_ft_type *type,
 static
 struct cds_ft_inode_flag *ft_pool_node_get_direction(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag __attribute__((unused)),
 		int n, uint8_t *result_key,
 		enum ft_direction dir)
 {
@@ -725,6 +726,30 @@ struct cds_ft_inode_flag *ft_pool_node_get_direction(const struct cds_ft_type *t
 
 	assert(type->type_class == FT_POOL);
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
+
+#ifdef USE_BITMAP_SCAN
+	if (type->bitmap) {
+		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
+retry:
+		if (dir == FT_LEFT)
+			match_v = cds_find_prev_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n - 1);
+		else
+			match_v = cds_find_next_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n + 1);
+		if (match_v >= 0) {
+			match_node_flag = ft_pool_node_get_nth(type, node, node_flag, NULL, (uint8_t) match_v);
+			/*
+			 * The source of truth is the pointer load from
+			 * get_nth. Continue the bitmap scan if the node
+			 * is not found.
+			 */
+			if (!match_node_flag) {
+				n = match_v;
+				goto retry;
+			}
+		}
+		goto end;
+	}
+#endif
 
 	if (dir == FT_LEFT) {
 		match_v = -1;
@@ -800,11 +825,37 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_direction(const struct cds_ft_type 
 {
 	struct cds_ft_inode_flag **child_node_flag_ptr;
 	struct cds_ft_inode_flag *child_node_flag;
+#ifdef USE_BITMAP_SCAN
+	struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
+#endif
 	int i;
 
 	assert(type->type_class == FT_PIGEON);
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
+#ifdef USE_BITMAP_SCAN
+retry:
+	if (dir == FT_LEFT)
+		i = cds_find_prev_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n - 1);
+	else
+		i = cds_find_next_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n + 1);
+	if (i >= 0) {
+		child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->u.data)[i];
+		child_node_flag = rcu_dereference(*child_node_flag_ptr);
+		if (!child_node_flag) {
+			/*
+			 * The source of truth is the pointer load.
+			 * Continue the bitmap scan if the node is
+			 * not found.
+			 */
+			n = i;
+			goto retry;
+		}
+		dbg_printf("ft_pigeon_node_get child_node_flag %p\n", child_node_flag);
+		*result_key = (uint8_t) i;
+		return child_node_flag;
+	}
+#else
 	if (dir == FT_LEFT) {
 		/* n - 1 is first value left of n */
 		for (i = n - 1; i >= 0; i--) {
@@ -830,6 +881,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_direction(const struct cds_ft_type 
 			}
 		}
 	}
+#endif
 	return NULL;
 }
 
@@ -893,7 +945,7 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	case FT_LINEAR:
 		return ft_linear_node_get_direction(type, node, n, result_key, dir);
 	case FT_POOL:
-		return ft_pool_node_get_direction(type, node, n, result_key, dir);
+		return ft_pool_node_get_direction(type, node, node_flag, n, result_key, dir);
 	case FT_PIGEON:
 		return ft_pigeon_node_get_direction(type, node, n, result_key, dir);
 	default:
