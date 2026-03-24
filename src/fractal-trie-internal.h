@@ -18,7 +18,7 @@
 #include <urcu/rculfhash.h>
 #include <assert.h>
 
-#define USE_BITMAP_SCAN
+#define FEATURE_USE_BITMAP_SCAN
 
 /*
  * If the internal bit is set in a pointer, it points to an internal
@@ -70,7 +70,7 @@
 
 enum {
 	FT_NO_BITMAP = false,
-#ifdef USE_BITMAP_SCAN
+#ifdef FEATURE_USE_BITMAP_SCAN
 	FT_BITMAP = true,
 #else
 	FT_BITMAP = false,

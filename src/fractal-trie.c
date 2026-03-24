@@ -727,7 +727,7 @@ struct cds_ft_inode_flag *ft_pool_node_get_direction(const struct cds_ft_type *t
 	assert(type->type_class == FT_POOL);
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
-#ifdef USE_BITMAP_SCAN
+#ifdef FEATURE_USE_BITMAP_SCAN
 	if (type->bitmap) {
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
 retry:
@@ -825,7 +825,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_direction(const struct cds_ft_type 
 {
 	struct cds_ft_inode_flag **child_node_flag_ptr;
 	struct cds_ft_inode_flag *child_node_flag;
-#ifdef USE_BITMAP_SCAN
+#ifdef FEATURE_USE_BITMAP_SCAN
 	struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
 #endif
 	int i;
@@ -833,7 +833,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_direction(const struct cds_ft_type 
 	assert(type->type_class == FT_PIGEON);
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
-#ifdef USE_BITMAP_SCAN
+#ifdef FEATURE_USE_BITMAP_SCAN
 retry:
 	if (dir == FT_LEFT)
 		i = cds_find_prev_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n - 1);
@@ -1092,7 +1092,7 @@ int ft_pool_node_set_nth(const struct cds_ft_type *type,
 	}
 
 	ret = ft_linear_node_set_nth(type, linear, metadata, n, child_node_flag, &replace_old_ptr);
-#ifdef USE_BITMAP_SCAN
+#ifdef FEATURE_USE_BITMAP_SCAN
 	if (ret == 0 && !replace_old_ptr && type->bitmap) {
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
 
@@ -1119,7 +1119,7 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
 		replace_old_ptr = true;
 	rcu_assign_pointer(*ptr, child_node_flag);
 	if (!replace_old_ptr) {
-#ifdef USE_BITMAP_SCAN
+#ifdef FEATURE_USE_BITMAP_SCAN
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
 
 		/* Set n in bitmap. */
@@ -1253,7 +1253,7 @@ int ft_pool_node_replace_ptr(const struct cds_ft_type *type,
 	}
 
 	ret = ft_linear_node_replace_ptr(type, linear, metadata, node_flag_ptr, newptr);
-#ifdef USE_BITMAP_SCAN
+#ifdef FEATURE_USE_BITMAP_SCAN
 	if (ret == 0 && !newptr && type->bitmap) {
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
 
@@ -1287,7 +1287,7 @@ int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
 	assert(*node_flag_ptr != NULL);
 	rcu_assign_pointer(*node_flag_ptr, newptr);
 	if (!newptr) {
-#ifdef USE_BITMAP_SCAN
+#ifdef FEATURE_USE_BITMAP_SCAN
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
 
 		/* Clear n in bitmap. */
