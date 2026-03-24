@@ -50,7 +50,7 @@ unsigned long init_pool_size = DEFAULT_RAND_POOL,
 	lookup_pool_size = DEFAULT_RAND_POOL,
 	write_pool_size = DEFAULT_RAND_POOL;
 int validate_lookup;
-int sanity_test, sanity_test_varlen, sanity_test_varlen_string, test_dictionary, reverse_sort;
+int sanity_test, sanity_test_varlen, sanity_test_varlen_string, test_dictionary, reverse_sort, torture_test_string;
 unsigned int key_len = 4;
 
 int count_pipe[2];
@@ -201,6 +201,7 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 	printf("	[-Z] Show statistics.\n");
 	printf("	[-D] Dictionary (stdin) test.\n");
 	printf("	[-q] Reverse sort dictionary.\n");
+	printf("	[-o] Torture test strings.\n");
 	printf("\n\n");
 }
 
@@ -1734,6 +1735,20 @@ int check_memory_leaks(void)
 	return 0;
 }
 
+static const char *torture_test_strings[] = {
+	"apple",
+	"apples",
+	"apply",
+	"ball",
+	"bat",
+	"bath",
+	"bathe",
+	"car",
+	"cart",
+	"cat",
+	"dog",
+};
+
 static
 int do_test_dictionary(void)
 {
@@ -1758,31 +1773,50 @@ int do_test_dictionary(void)
 		return -1;
 	}
 
-	printf("Provide input on stdin, one string per line, followed by end of stream (CTRL-D)\n");
+	if (torture_test_string) {
+		size_t i;
 
-	for (;;) {
-		struct ja_test_node *node;
+		for (i = 0; i < CAA_ARRAY_SIZE(torture_test_strings); i++) {
+			const char *string = torture_test_strings[i];
+			struct ja_test_node *node = node_alloc();
 
-		read_len = getline(&line, &len, stdin);
-		if (read_len <= 0)
-			break;
-		/* Skip empty lines. */
-		if (read_len == 1)
-			continue;
-		line[read_len - 1] = '\0';
-		node = node_alloc();
-
-		ja_test_node_init(node, 0);
-		rcu_read_lock();
-		ret = cds_ft_add(test_ja, (uint8_t *) line, strlen(line), &node->node);
-		rcu_read_unlock();
-		if (ret) {
-			fprintf(stderr, "Error (%d) adding node \"%s\"\n",
-				ret, line);
-			assert(0);
+			ja_test_node_init(node, 0);
+			rcu_read_lock();
+			ret = cds_ft_add(test_ja, (uint8_t *) string, strlen(string), &node->node);
+			rcu_read_unlock();
+			if (ret) {
+				fprintf(stderr, "Error (%d) adding node \"%s\"\n",
+					ret, string);
+				assert(0);
+			}
 		}
+	} else {
+		printf("Provide input on stdin, one string per line, followed by end of stream (CTRL-D)\n");
+
+		for (;;) {
+			struct ja_test_node *node;
+
+			read_len = getline(&line, &len, stdin);
+			if (read_len <= 0)
+				break;
+			/* Skip empty lines. */
+			if (read_len == 1)
+				continue;
+			line[read_len - 1] = '\0';
+			node = node_alloc();
+
+			ja_test_node_init(node, 0);
+			rcu_read_lock();
+			ret = cds_ft_add(test_ja, (uint8_t *) line, strlen(line), &node->node);
+			rcu_read_unlock();
+			if (ret) {
+				fprintf(stderr, "Error (%d) adding node \"%s\"\n",
+					ret, line);
+				assert(0);
+			}
+		}
+		free(line);
 	}
-	free(line);
 
 	if (show_stats)
 		cds_ft_show_stats(test_ja, stdout);
@@ -1961,6 +1995,9 @@ int main(int argc, char **argv)
 			break;
 		case 'q':
 			reverse_sort = 1;
+			break;
+		case 'o':
+			torture_test_string = 1;
 			break;
 		}
 	}
