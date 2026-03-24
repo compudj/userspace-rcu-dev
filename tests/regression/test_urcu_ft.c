@@ -208,31 +208,33 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 static
 int test_free_all_nodes(struct cds_ft *ja)
 {
-	uint8_t jakey[8] = {};
+	uint8_t key[8] = {};
+	size_t entry_key_len = 0;
 	bool first = true;
 	int ret = 0;
 
 	rcu_read_lock();
 
 	for (;;) {
-		struct cds_ft_node *tmp_node, *ja_node;
+		struct cds_ft_node *tmp_node, *node;
 
 		if (first) {
-			ja_node = cds_ft_lookup_greater_equal(ja, jakey, 0, jakey, NULL);
+			node = cds_ft_lookup_first(ja, key, &entry_key_len);
 			first = false;
 		} else
-			ja_node = cds_ft_lookup_greater_than(ja, jakey, 0, jakey, NULL);
-		if (!ja_node)
+			node = cds_ft_lookup_greater_than(ja, key, entry_key_len,
+					key, &entry_key_len);
+		if (!node)
 			break;
-		cds_ft_for_each_duplicate_safe_rcu(ja_node, tmp_node) {
-			ret = cds_ft_del(test_ja, jakey, 0, ja_node);
+		cds_ft_for_each_duplicate_safe_rcu(node, tmp_node) {
+			ret = cds_ft_del(test_ja, key, 0, node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n",
-					ret, cds_ft_key_to_u64(ja, jakey, 0));
+					ret, cds_ft_key_to_u64(ja, key, entry_key_len));
 				goto end;
 			}
 			/* Alone using Fractal Trie, OK to free now */
-			free_node(ja_node);
+			free_node(node);
 		}
 	}
 end:
