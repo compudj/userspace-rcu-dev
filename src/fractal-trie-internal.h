@@ -229,6 +229,9 @@ __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_item_to_metadata(void *p);
 
 __attribute__((visibility("hidden")))
+struct cds_ft_metadata *cds_ft_item_to_metadata_fast(void *p, size_t item_len_order);
+
+__attribute__((visibility("hidden")))
 void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata);
 
 __attribute__((visibility("hidden")))

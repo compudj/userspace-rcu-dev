@@ -2110,7 +2110,9 @@ struct cds_ft_node *cds_ft_lookup(struct cds_ft *ft, const uint8_t *key, size_t 
 	 * nodes or internal node associated with external nodes.
 	 */
 	if (ft_node_internal(node_flag)) {
-		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
+							type->order);
 		return rcu_dereference(metadata->external_nodes);
 	}
 	return (struct cds_ft_node *) node_flag;
@@ -2135,6 +2137,7 @@ struct cds_ft_node *cds_ft_lookup_partial(struct cds_ft *ft, const uint8_t *key,
 	for (i = 1; i < key_depth; i++) {
 		struct cds_ft_node *external_nodes;
 		struct cds_ft_metadata *metadata;
+		const struct cds_ft_type *type;
 		uint8_t iter_key;
 
 		iter_key = key_to_ordinal(ft, *(key++));
@@ -2157,7 +2160,8 @@ struct cds_ft_node *cds_ft_lookup_partial(struct cds_ft *ft, const uint8_t *key,
 		 * where the complete match finds an internal node with
 		 * associated external nodes.
 		 */
-		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		type = &ft_types[ft_node_type(node_flag)];
+		metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
 		external_nodes = rcu_dereference(metadata->external_nodes);
 		if (external_nodes) {
 			match_len = i;
@@ -2229,9 +2233,10 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 			struct cds_ft_node *external_nodes;
 
 			if (ft_node_internal(node_flag)) {
+				const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 				struct cds_ft_metadata *metadata;
 
-				metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+				metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
 				external_nodes = rcu_dereference(metadata->external_nodes);
 			} else {
 				external_nodes = (struct cds_ft_node *) node_flag;
@@ -2283,7 +2288,8 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 		 * going upward.
 		 */
 		if (going_up && dir == FT_LEFT && ft_node_internal(cur_node_depth[level - 1])) {
-			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(cur_node_depth[level - 1]));
+			const struct cds_ft_type *type = &ft_types[ft_node_type(cur_node_depth[level - 1])];
+			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(cur_node_depth[level - 1]), type->order);
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
@@ -2362,7 +2368,8 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 		 * external node when going downward.
 		 */
 		if (dir == FT_LEFTMOST && ft_node_internal(node_flag)) {
-			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {

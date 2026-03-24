@@ -103,13 +103,26 @@ struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order)
 	return base + (2 * page_size) - ((index + 1) * sizeof(struct cds_ft_bitmap));
 }
 
+static
+struct cds_ft_metadata *do_cds_ft_item_to_metadata(void *p, size_t item_len_order,
+		struct cds_ft_alloc_range *range)
+{
+	size_t page_offset = (unsigned long) p & (page_size - 1);
+	size_t index = page_offset >> item_len_order;
+
+	return cds_ft_range_get_nth_metadata(range, index);
+}
+
+struct cds_ft_metadata *cds_ft_item_to_metadata_fast(void *p, size_t item_len_order)
+{
+	struct cds_ft_alloc_range *range = cds_ft_item_to_range(p);
+	return do_cds_ft_item_to_metadata(p, item_len_order, range);
+}
+
 struct cds_ft_metadata *cds_ft_item_to_metadata(void *p)
 {
 	struct cds_ft_alloc_range *range = cds_ft_item_to_range(p);
-	size_t page_offset = (unsigned long) p & (page_size - 1);
-	size_t index = page_offset >> range->arena->item_len_order;
-
-	return cds_ft_range_get_nth_metadata(range, index);
+	return do_cds_ft_item_to_metadata(p, range->arena->item_len_order, range);
 }
 
 void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata)
