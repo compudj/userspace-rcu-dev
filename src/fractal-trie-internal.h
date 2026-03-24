@@ -70,7 +70,11 @@
 
 enum {
 	FT_NO_BITMAP = false,
+#ifdef USE_BITMAP_SCAN
 	FT_BITMAP = true,
+#else
+	FT_BITMAP = false,
+#endif
 };
 
 /* Never declared. Opaque type used to store flagged node pointers. */
