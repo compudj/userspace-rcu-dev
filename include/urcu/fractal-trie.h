@@ -155,6 +155,34 @@ struct cds_ft_node *cds_ft_lookup_greater_than(struct cds_ft *ft,
 		uint8_t *result_key, size_t *result_key_len);
 
 /*
+ * cds_ft_lookup_first - Look up node with lowest key.
+ * @ft: The Fractal Trie.
+ * @result_key: Key found.
+ * @result_key_len: Result key length.
+ *
+ * Returns the first node of a duplicate chain if a node is present in
+ * the tree which has the lowest key, else returns NULL.
+ * A RCU read-side lock should be held across call to this function and
+ * use of its return value.
+ */
+struct cds_ft_node *cds_ft_lookup_first(struct cds_ft *ft,
+		uint8_t *result_key, size_t *result_key_len);
+
+/*
+ * cds_ft_lookup_last - Look up node with greatest key.
+ * @ft: The Fractal Trie.
+ * @result_key: Key found.
+ * @result_key_len: Result key length.
+ *
+ * Returns the first node of a duplicate chain if a node is present in
+ * the tree which has the greatest key, else returns NULL.
+ * A RCU read-side lock should be held across call to this function and
+ * use of its return value.
+ */
+struct cds_ft_node *cds_ft_lookup_last(struct cds_ft *ft,
+		uint8_t *result_key, size_t *result_key_len);
+
+/*
  * cds_ft_add - Add @node at @key, allowing duplicates.
  * @ft: The Fractal Trie.
  * @key: Key at which @node should be added.

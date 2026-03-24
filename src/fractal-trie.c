@@ -280,6 +280,12 @@ enum ft_lookup_inequality {
 	FT_LOOKUP_LT,
 };
 
+enum ft_lookup_limit {
+	FT_LOOKUP_LIMIT_NONE,
+	FT_LOOKUP_LIMIT_FIRST,
+	FT_LOOKUP_LIMIT_LAST,
+};
+
 enum ft_direction {
 	FT_LEFT,
 	FT_RIGHT,
@@ -2429,7 +2435,8 @@ static
 struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
 		uint8_t *result_key, size_t *result_key_len,
-		enum ft_lookup_inequality mode)
+		enum ft_lookup_inequality mode,
+		enum ft_lookup_limit limit)
 {
 	int key_depth, level;
 	struct cds_ft_inode_flag *node_flag, *cur_node_depth[FT_MAX_DEPTH];
@@ -2437,11 +2444,23 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 	uint8_t cur_key[FT_MAX_DEPTH - 1];
 	enum ft_direction dir;
 	const uint8_t *iter_key = key;
-	size_t key_len = ft_key_len(ft, _key_len);
+	size_t key_len;
 	bool going_up = false;
 
-	if (!valid_key_len(ft, key_len))
-		return NULL;
+	switch (limit) {
+	case FT_LOOKUP_LIMIT_NONE:
+		key_len = ft_key_len(ft, _key_len);
+		if (!valid_key_len(ft, key_len))
+			return NULL;
+		break;
+	case FT_LOOKUP_LIMIT_FIRST:
+		key_len = 1;
+		break;
+	case FT_LOOKUP_LIMIT_LAST:
+		key_len = ft->max_key_len;
+		break;
+	}
+
 	key_depth = key_len + 1;
 
 	switch (mode) {
@@ -2466,7 +2485,17 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 	for (level = 1; level < key_depth; level++) {
 		uint8_t key_value;
 
-		key_value = key_to_ordinal(ft, *(iter_key++));
+		switch (limit) {
+		case FT_LOOKUP_LIMIT_NONE:
+			key_value = key_to_ordinal(ft, *(iter_key++));
+			break;
+		case FT_LOOKUP_LIMIT_FIRST:
+			key_value = 0x00;
+			break;
+		case FT_LOOKUP_LIMIT_LAST:
+			key_value = 0xff;
+			break;
+		}
 		node_flag = ft_node_get_nth(node_flag, NULL, key_value);
 		if (!ft_node_ptr(node_flag))
 			break;
@@ -2558,7 +2587,17 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 			}
 		}
 
-		key_value = key_to_ordinal(ft, *(--iter_key));
+		switch (limit) {
+		case FT_LOOKUP_LIMIT_NONE:
+			key_value = key_to_ordinal(ft, *(--iter_key));
+			break;
+		case FT_LOOKUP_LIMIT_FIRST:
+			key_value = 0x00;
+			break;
+		case FT_LOOKUP_LIMIT_LAST:
+			key_value = 0xff;
+			break;
+		}
 		node_flag = ft_node_get_leftright(cur_node_depth[level - 1],
 				key_value, &cur_key[level - 1], dir);
 		dbg_printf("cds_ft_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
@@ -2660,7 +2699,7 @@ struct cds_ft_node *cds_ft_lookup_lower_equal(struct cds_ft *ft,
 {
 	dbg_printf("cds_ft_lookup_lower_equal\n");
 	return cds_ft_lookup_inequality(ft, key, key_len,
-			result_key, result_key_len, FT_LOOKUP_LE);
+			result_key, result_key_len, FT_LOOKUP_LE, FT_LOOKUP_LIMIT_NONE);
 }
 
 struct cds_ft_node *cds_ft_lookup_greater_equal(struct cds_ft *ft,
@@ -2669,7 +2708,7 @@ struct cds_ft_node *cds_ft_lookup_greater_equal(struct cds_ft *ft,
 {
 	dbg_printf("cds_ft_lookup_greater_equal\n");
 	return cds_ft_lookup_inequality(ft, key, key_len,
-		result_key, result_key_len, FT_LOOKUP_GE);
+		result_key, result_key_len, FT_LOOKUP_GE, FT_LOOKUP_LIMIT_NONE);
 }
 
 struct cds_ft_node *cds_ft_lookup_lower_than(struct cds_ft *ft,
@@ -2678,7 +2717,7 @@ struct cds_ft_node *cds_ft_lookup_lower_than(struct cds_ft *ft,
 {
 	dbg_printf("cds_ft_lookup_lower_than\n");
 	return cds_ft_lookup_inequality(ft, key, key_len,
-		result_key, result_key_len, FT_LOOKUP_LT);
+		result_key, result_key_len, FT_LOOKUP_LT, FT_LOOKUP_LIMIT_NONE);
 }
 
 struct cds_ft_node *cds_ft_lookup_greater_than(struct cds_ft *ft,
@@ -2687,7 +2726,21 @@ struct cds_ft_node *cds_ft_lookup_greater_than(struct cds_ft *ft,
 {
 	dbg_printf("cds_ft_lookup_greater_than\n");
 	return cds_ft_lookup_inequality(ft, key, key_len,
-		result_key, result_key_len, FT_LOOKUP_GT);
+		result_key, result_key_len, FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE);
+}
+
+struct cds_ft_node *cds_ft_lookup_first(struct cds_ft *ft,
+		uint8_t *result_key, size_t *result_key_len)
+{
+	return cds_ft_lookup_inequality(ft, NULL, 0,
+		result_key, result_key_len, FT_LOOKUP_GE, FT_LOOKUP_LIMIT_FIRST);
+}
+
+struct cds_ft_node *cds_ft_lookup_last(struct cds_ft *ft,
+		uint8_t *result_key, size_t *result_key_len)
+{
+	return cds_ft_lookup_inequality(ft, NULL, 0,
+		result_key, result_key_len, FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);
 }
 
 /*
