@@ -7,11 +7,17 @@
  * Userspace RCU library - Fractal Trie Test Program
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "test_urcu_ft.h"
 #include "debug-yield.h"
 #include <inttypes.h>
 #include <stdint.h>
 #include <endian.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #define key_len_split(var)	var, sizeof(var)
 
@@ -44,7 +50,7 @@ unsigned long init_pool_size = DEFAULT_RAND_POOL,
 	lookup_pool_size = DEFAULT_RAND_POOL,
 	write_pool_size = DEFAULT_RAND_POOL;
 int validate_lookup;
-int sanity_test, sanity_test_varlen, sanity_test_varlen_string;
+int sanity_test, sanity_test_varlen, sanity_test_varlen_string, test_dictionary, reverse_sort;
 unsigned int key_len = 4;
 
 int count_pipe[2];
@@ -193,6 +199,8 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 	printf("        [-m factor] Key multiplication factor.\n");
 	printf("	[-l] Memory leak detection.\n");
 	printf("	[-Z] Show statistics.\n");
+	printf("	[-D] Dictionary (stdin) test.\n");
+	printf("	[-q] Reverse sort dictionary.\n");
 	printf("\n\n");
 }
 
@@ -1726,6 +1734,121 @@ int check_memory_leaks(void)
 	return 0;
 }
 
+static
+int do_test_dictionary(void)
+{
+	struct cds_ft_attr *attr;
+	char *line = NULL;
+	size_t len = 0;
+	ssize_t read_len;
+	int ret;
+
+	printf("Allocating Fractal Trie string keys\n");
+
+	attr = cds_ft_attr_create();
+	if (!attr)
+		abort();
+	if (cds_ft_attr_set_key_len(attr, 0))	/* Variable length keys. */
+		abort();
+
+	test_ja = cds_ft_create(attr);
+	cds_ft_attr_destroy(attr);
+	if (!test_ja) {
+		printf("Error allocating Fractal Trie.\n");
+		return -1;
+	}
+
+	printf("Provide input on stdin, one string per line, followed by end of stream (CTRL-D)\n");
+
+	for (;;) {
+		struct ja_test_node *node;
+
+		read_len = getline(&line, &len, stdin);
+		if (read_len <= 0)
+			break;
+		/* Skip empty lines. */
+		if (read_len == 1)
+			continue;
+		line[read_len - 1] = '\0';
+		node = node_alloc();
+
+		ja_test_node_init(node, 0);
+		rcu_read_lock();
+		ret = cds_ft_add(test_ja, (uint8_t *) line, strlen(line), &node->node);
+		rcu_read_unlock();
+		if (ret) {
+			fprintf(stderr, "Error (%d) adding node \"%s\"\n",
+				ret, line);
+			assert(0);
+		}
+	}
+	free(line);
+
+	if (show_stats)
+		cds_ft_show_stats(test_ja, stdout);
+
+	/* Show sorted output. */
+	printf("%sorted dictionary\n", reverse_sort ? "Reverse S" : "S");
+	printf("---------------------------------\n");
+
+	rcu_read_lock();
+
+	if (!reverse_sort) {
+		uint8_t key[256] = {};
+		size_t entry_key_len = 0;
+		bool first = true;
+
+		for (;;) {
+			struct cds_ft_node *node;
+
+			if (first) {
+				node = cds_ft_lookup_first(test_ja, key, &entry_key_len);
+				first = false;
+			} else
+				node = cds_ft_lookup_greater_than(test_ja, key, entry_key_len, key, &entry_key_len);
+			if (!node)
+				break;
+			cds_ft_for_each_duplicate_rcu(node)
+				printf("%.*s\n", (int) entry_key_len, key);
+		}
+	} else {
+		uint8_t key[256] = {};
+		size_t entry_key_len = 0;
+		bool first = true;
+
+		for (;;) {
+			struct cds_ft_node *node;
+
+			if (first) {
+				node = cds_ft_lookup_last(test_ja, key, &entry_key_len);
+				first = false;
+			} else
+				node = cds_ft_lookup_lower_than(test_ja, key, entry_key_len, key, &entry_key_len);
+			if (!node)
+				break;
+			cds_ft_for_each_duplicate_rcu(node)
+				printf("%.*s\n", (int) entry_key_len, key);
+		}
+	}
+	rcu_read_unlock();
+
+	printf("---------------------------------\n");
+
+	ret = test_free_all_nodes(test_ja);
+	if (ret) {
+		fprintf(stderr, "Error freeing all nodes\n");
+		return -1;
+	}
+
+	ret = cds_ft_destroy(test_ja);
+	if (ret) {
+		fprintf(stderr, "Error destroying Fractal Trie\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int i, a, ret, err;
@@ -1833,6 +1956,12 @@ int main(int argc, char **argv)
 		case 'Z':
 			show_stats = 1;
 			break;
+		case 'D':
+			test_dictionary = 1;
+			break;
+		case 'q':
+			reverse_sort = 1;
+			break;
 		}
 	}
 
@@ -1885,6 +2014,8 @@ int main(int argc, char **argv)
 		ret = do_sanity_test_varlen();
 	} else if (sanity_test_varlen_string) {
 		ret = do_test_varlen_string();
+	} else if (test_dictionary) {
+		ret = do_test_dictionary();
 	} else {
 		ret = do_mt_test();
 	}
