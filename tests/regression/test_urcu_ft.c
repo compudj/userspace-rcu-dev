@@ -208,24 +208,18 @@ printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
 static
 int test_free_all_nodes(struct cds_ft *ft)
 {
-	uint8_t key[8] = {};
+	struct cds_ft_node *node;
 	size_t entry_key_len = 0;
-	bool first = true;
+	uint8_t key[8] = {};
 	int ret = 0;
 
 	rcu_read_lock();
 
-	for (;;) {
-		struct cds_ft_node *tmp_node, *node;
-
-		if (first) {
-			node = cds_ft_lookup_first(ft, key, &entry_key_len);
-			first = false;
-		} else
+	for (node = cds_ft_lookup_first(ft, key, &entry_key_len); node;
 			node = cds_ft_lookup_greater_than(ft, key, entry_key_len,
-					key, &entry_key_len);
-		if (!node)
-			break;
+					key, &entry_key_len)) {
+		struct cds_ft_node *tmp_node;
+
 		cds_ft_for_each_duplicate_safe_rcu(node, tmp_node) {
 			ret = cds_ft_del(test_ft, key, 0, node);
 			if (ret) {
@@ -1832,36 +1826,22 @@ int do_test_dictionary(void)
 	if (!reverse_sort) {
 		uint8_t key[256] = {};
 		size_t entry_key_len = 0;
-		bool first = true;
+		struct cds_ft_node *node;
 
-		for (;;) {
-			struct cds_ft_node *node;
-
-			if (first) {
-				node = cds_ft_lookup_first(test_ft, key, &entry_key_len);
-				first = false;
-			} else
-				node = cds_ft_lookup_greater_than(test_ft, key, entry_key_len, key, &entry_key_len);
-			if (!node)
-				break;
+		for (node = cds_ft_lookup_first(test_ft, key, &entry_key_len); node;
+				node = cds_ft_lookup_greater_than(test_ft, key, entry_key_len,
+						key, &entry_key_len)) {
 			cds_ft_for_each_duplicate_rcu(node)
 				printf("%.*s\n", (int) entry_key_len, key);
 		}
 	} else {
 		uint8_t key[256] = {};
 		size_t entry_key_len = 0;
-		bool first = true;
+		struct cds_ft_node *node;
 
-		for (;;) {
-			struct cds_ft_node *node;
-
-			if (first) {
-				node = cds_ft_lookup_last(test_ft, key, &entry_key_len);
-				first = false;
-			} else
-				node = cds_ft_lookup_lower_than(test_ft, key, entry_key_len, key, &entry_key_len);
-			if (!node)
-				break;
+		for (node = cds_ft_lookup_last(test_ft, key, &entry_key_len); node;
+				node = cds_ft_lookup_lower_than(test_ft, key, entry_key_len,
+						key, &entry_key_len)) {
 			cds_ft_for_each_duplicate_rcu(node)
 				printf("%.*s\n", (int) entry_key_len, key);
 		}
