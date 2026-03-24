@@ -545,6 +545,97 @@ uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
  * a value is missing, we return NULL. If a value is there, but its
  * associated pointers is still NULL, we return NULL too.
  */
+#ifdef FEATURE_SWAR_LOOKUP
+
+/* Generate a mask of 0x01 bytes for the current word size. */
+#define L_ONES (-1UL / 255)
+/* Generate a mask of 0x80 bytes for the current word size. */
+#define L_HIGHS (L_ONES * 0x80)
+
+/*
+ * This function can load beyond nr_child, but always compare with the
+ * nr_child limit if it finds a match. Loading a full word beyond
+ * nr_child is OK because the node is word-aligned and its size is a
+ * multiple of the word-size.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	/* node->u.data is always aligned on sizeof(unsigned long) */
+	unsigned long *data_words = (unsigned long *)node->u.data,
+		first_word = data_words[0], mask = n * L_ONES, xor_res, has_zero;
+	uint8_t nr_child;
+	unsigned int i;
+
+	/* Extract nr_child from the first byte (architecture dependent) */
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	nr_child = (uint8_t)(first_word & 0xFFUL);
+#else
+	nr_child = (uint8_t)(first_word >> ((sizeof(unsigned long) - 1) * 8));
+#endif
+	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
+	assert(type->type_class != FT_LINEAR || nr_child >= type->min_child);
+	assert(nr_child <= type->max_linear_child && nr_child != 0 && nr_child != 255);
+
+	/*
+	 * Prepare the poisoned mask for the first word.
+	 * nr_child != 255, use that value as poison.
+	 * Search the first word using the poisoned mask.
+	 */
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	/* For Little-Endian, nr_child is at the low end of the word. */
+	xor_res = first_word ^ (mask | 0xFFUL);
+	has_zero = (xor_res - L_ONES) & ~xor_res & L_HIGHS;
+	if (has_zero) {
+		i = (__builtin_ctzl(has_zero) >> 3) - 1; // -1 because index 0 is nr_child
+		if (i < nr_child)
+			goto found;
+	}
+#else
+	/* For Big-Endian, nr_child is at the high end of the word. */
+	xor_res = first_word ^ (mask | (0xFFUL << ((sizeof(unsigned long) - 1) * 8)));
+	has_zero = (xor_res - L_ONES) & ~xor_res & L_HIGHS;
+	if (has_zero) {
+		i = (__builtin_clzl(has_zero) >> 3) - 1;
+		if (i < nr_child)
+			goto found;
+	}
+#endif
+
+	/* Search subsequent words using the standard mask. */
+	for (unsigned int w = 1; w * sizeof(unsigned long) <= type->max_linear_child; w++) {
+		xor_res = data_words[w] ^ mask;
+		has_zero = (xor_res - L_ONES) & ~xor_res & L_HIGHS;
+
+		if (has_zero) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+			i = (w * sizeof(unsigned long)) + (__builtin_ctzl(has_zero) >> 3) - 1;
+#else
+			i = (w * sizeof(unsigned long)) + (__builtin_clzl(has_zero) >> 3) - 1;
+#endif
+			if (i < nr_child)
+				goto found;
+		}
+	}
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+
+found:
+	{
+		uint8_t *values = &node->u.data[1];
+		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
+		struct cds_ft_inode_flag *ptr = rcu_dereference(pointers[i]);
+
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = &pointers[i];
+		return ptr;
+	}
+}
+#else
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
@@ -579,6 +670,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		*node_flag_ptr = &pointers[i];
 	return ptr;
 }
+#endif
 
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type *type,

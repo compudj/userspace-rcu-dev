@@ -23,6 +23,7 @@
  */
 #define FEATURE_USE_BITMAP_SCAN
 #define FEATURE_INLINE_LOOKUP
+#define FEATURE_SWAR_LOOKUP
 
 /*
  * If the internal bit is set in a pointer, it points to an internal
