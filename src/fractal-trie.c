@@ -525,13 +525,13 @@ void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 #define __FT_FLOOR_MASK(v, mask)	((v) & ~(mask))
 #define FT_FLOOR(v, align)		__FT_FLOOR_MASK(v, (typeof(v)) (align) - 1)
 
-static
+static inline_lookup
 uint8_t *align_ptr_size(uint8_t *ptr)
 {
 	return (uint8_t *) FT_ALIGN((unsigned long) ptr, sizeof(void *));
 }
 
-static
+static inline_lookup
 uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
 		struct cds_ft_inode *node)
 {
@@ -545,7 +545,7 @@ uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
  * a value is missing, we return NULL. If a value is there, but its
  * associated pointers is still NULL, we return NULL too.
  */
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
@@ -580,7 +580,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 	return ptr;
 }
 
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		int n, uint8_t *result_key,
@@ -644,7 +644,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	return match_ptr;
 }
 
-static
+static inline_lookup
 void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		uint8_t i,
@@ -663,7 +663,7 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 	*iter = rcu_dereference(pointers[i]);
 }
 
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
@@ -703,7 +703,7 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
 	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
-static
+static inline_lookup
 struct cds_ft_inode *ft_pool_node_get_ith_pool(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		uint8_t i)
@@ -713,7 +713,7 @@ struct cds_ft_inode *ft_pool_node_get_ith_pool(const struct cds_ft_type *type,
 		&node->u.data[(unsigned int) i << type->pool_size_order];
 }
 
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_pool_node_get_direction(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag __attribute__((unused)),
@@ -798,7 +798,7 @@ end:
 	return match_node_flag;
 }
 
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
@@ -817,7 +817,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type *type,
 	return child_node_flag;
 }
 
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_pigeon_node_get_direction(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		int n, uint8_t *result_key,
@@ -885,7 +885,7 @@ retry:
 	return NULL;
 }
 
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		uint8_t i)
@@ -897,7 +897,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
  * ft_node_get_nth: get nth item from a node.
  * node_flag is already rcu_dereference'd.
  */
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
@@ -927,7 +927,7 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 	}
 }
 
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_flag,
 		int n, uint8_t *result_key,
 		enum ft_direction dir)
@@ -954,7 +954,7 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	}
 }
 
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_leftright(struct cds_ft_inode_flag *node_flag,
 		unsigned int n, uint8_t *result_key,
 		enum ft_direction dir)
@@ -962,7 +962,7 @@ struct cds_ft_inode_flag *ft_node_get_leftright(struct cds_ft_inode_flag *node_f
 	return ft_node_get_direction(node_flag, n, result_key, dir);
 }
 
-static
+static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_minmax(struct cds_ft_inode_flag *node_flag,
 		uint8_t *result_key,
 		enum ft_direction dir)

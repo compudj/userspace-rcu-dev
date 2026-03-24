@@ -18,7 +18,11 @@
 #include <urcu/rculfhash.h>
 #include <assert.h>
 
+/*
+ * Configuration tweaks. Comment out those defines to disable features.
+ */
 #define FEATURE_USE_BITMAP_SCAN
+#define FEATURE_INLINE_LOOKUP
 
 /*
  * If the internal bit is set in a pointer, it points to an internal
@@ -67,6 +71,12 @@
 #define FT_ALLOC_ORDER_MAX		12
 
 #define FT_BITMAP_LEN			32
+
+#ifdef FEATURE_INLINE_LOOKUP
+#define inline_lookup	inline __attribute__((always_inline))
+#else
+#define inline_lookup
+#endif
 
 enum {
 	FT_NO_BITMAP = false,
