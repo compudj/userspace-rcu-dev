@@ -2539,6 +2539,13 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 		assert(0);
 	}
 
+	/* If we reach end of key, we need to go one level backward. */
+	if (level >= key_depth)
+		level = key_depth - 1;
+
+	/* Ensure iter_key is exactly at the position matching the level we stopped at. */
+	iter_key = key + level;
+
 	/*
 	 * Find highest value left/right of current node.
 	 * Current node is cur_node_depth[level].
@@ -2568,9 +2575,9 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 		 * inequality and encountering an external node when
 		 * going upward.
 		 */
-		if (going_up && dir == FT_LEFT && ft_node_internal(cur_node_depth[level - 1])) {
-			const struct cds_ft_type *type = &ft_types[ft_node_type(cur_node_depth[level - 1])];
-			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(cur_node_depth[level - 1]), type->order);
+		if (going_up && dir == FT_LEFT && ft_node_internal(cur_node_depth[level])) {
+			const struct cds_ft_type *type = &ft_types[ft_node_type(cur_node_depth[level])];
+			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(cur_node_depth[level]), type->order);
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
@@ -2598,6 +2605,10 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 			key_value = 0xff;
 			break;
 		}
+		/*
+		 * Standard sibling lookup. Parent is level - 1. We are
+		 * looking for sibling of the byte at cur_key[level - 1].
+		 */
 		node_flag = ft_node_get_leftright(cur_node_depth[level - 1],
 				key_value, &cur_key[level - 1], dir);
 		dbg_printf("cds_ft_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
