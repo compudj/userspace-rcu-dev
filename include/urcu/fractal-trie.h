@@ -270,7 +270,7 @@ struct cds_ft *cds_ft_create(const struct cds_ft_attr *attr)
  * There should be no more concurrent add, delete, nor look-up performed
  * on the Fractal Trie while it is being destroyed (ensured by the caller).
  */
-int cds_ft_destroy(struct cds_ft *ja);
+int cds_ft_destroy(struct cds_ft *ft);
 
 /*
  * cds_ft_key_len - Return the key length of a Fractal Trie.
@@ -279,7 +279,7 @@ int cds_ft_destroy(struct cds_ft *ja);
  * Returns 0 if the Fractal Trie uses variable length keys, > 0
  * otherwise.
  */
-size_t cds_ft_key_len(const struct cds_ft *ja);
+size_t cds_ft_key_len(const struct cds_ft *ft);
 
 /*
  * cds_ft_max_key_len - Return the maximum key length of a Fractal Trie.
@@ -287,7 +287,7 @@ size_t cds_ft_key_len(const struct cds_ft *ja);
  *
  * Returns the Fractal Trie maximum key length limit.
  */
-size_t cds_ft_max_key_len(const struct cds_ft *ja);
+size_t cds_ft_max_key_len(const struct cds_ft *ft);
 
 /*
  * cds_ft_key_map - Return the key map of a Fractal Trie.
