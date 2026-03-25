@@ -210,18 +210,18 @@ int test_free_all_nodes(struct cds_ft *ft)
 {
 	struct cds_ft_node *node;
 	size_t entry_key_len = 0;
-	uint8_t key[8] = {};
+	uint8_t key[256] = {};
 	int ret = 0;
 
 	rcu_read_lock();
 
-	for (node = cds_ft_lookup_first(ft, key, &entry_key_len); node;
+	for (node = cds_ft_lookup_first(ft, key, sizeof(key), &entry_key_len); node;
 			node = cds_ft_lookup_greater_than(ft, key, entry_key_len,
-					key, &entry_key_len)) {
+					key, sizeof(key), &entry_key_len)) {
 		struct cds_ft_node *tmp_node;
 
 		cds_ft_for_each_duplicate_safe_rcu(node, tmp_node) {
-			ret = cds_ft_del(test_ft, key, 0, node);
+			ret = cds_ft_del(ft, key, entry_key_len, node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n",
 					ret, cds_ft_key_to_u64(ft, key, entry_key_len));
@@ -360,16 +360,16 @@ int test_1byte_key(void)
 		key = ka[i] + ka_test_offset;
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ft_node = cds_ft_lookup_lower_equal(test_ft, key_len_split(ftkey), result_key, NULL);
+		ft_node = cds_ft_lookup_lower_equal(test_ft, key_len_split(ftkey), result_key, sizeof(result_key), NULL);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup lower equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, 0) != ka[i]) {
+		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT) != ka[i]) {
 			fprintf(stderr, "Error lookup lower equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, 0));
+				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -382,16 +382,16 @@ int test_1byte_key(void)
 		key = ka[i] - ka_test_offset;
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ft_node = cds_ft_lookup_greater_equal(test_ft, key_len_split(ftkey), result_key, NULL);
+		ft_node = cds_ft_lookup_greater_equal(test_ft, key_len_split(ftkey), result_key, sizeof(result_key), NULL);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup greater equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, 0) != ka[i]) {
+		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT) != ka[i]) {
 			fprintf(stderr, "Error lookup greater equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, 0));
+				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -404,29 +404,29 @@ int test_1byte_key(void)
 		key = ka[i];	/* without offset */
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ft_node = cds_ft_lookup_lower_equal(test_ft, key_len_split(ftkey), result_key, NULL);
+		ft_node = cds_ft_lookup_lower_equal(test_ft, key_len_split(ftkey), result_key, sizeof(result_key), NULL);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup lower equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, 0) != ka[i]) {
+		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT) != ka[i]) {
 			fprintf(stderr, "Error lookup lower equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, 0));
+				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT));
 			assert(0);
 		}
 
-		ft_node = cds_ft_lookup_greater_equal(test_ft, key_len_split(ftkey), result_key, NULL);
+		ft_node = cds_ft_lookup_greater_equal(test_ft, key_len_split(ftkey), result_key, sizeof(result_key), NULL);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup greater equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, 0) != ka[i]) {
+		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT) != ka[i]) {
 			fprintf(stderr, "Error lookup greater equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, 0));
+				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -578,16 +578,16 @@ int test_2bytes_key(void)
 		key = ka[i] + ka_test_offset;
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ft_node = cds_ft_lookup_lower_equal(test_ft, key_len_split(ftkey), result_key, NULL);
+		ft_node = cds_ft_lookup_lower_equal(test_ft, key_len_split(ftkey), result_key, sizeof(result_key), NULL);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup lower equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, 0) != ka[i]) {
+		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT) != ka[i]) {
 			fprintf(stderr, "Error lookup lower equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, 0));
+				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -601,16 +601,16 @@ int test_2bytes_key(void)
 		key = ka[i] - ka_test_offset;
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ft_node = cds_ft_lookup_greater_equal(test_ft, key_len_split(ftkey), result_key, NULL);
+		ft_node = cds_ft_lookup_greater_equal(test_ft, key_len_split(ftkey), result_key, sizeof(result_key), NULL);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup greater equal. Cannot find expected key %" PRIu64" greater or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, 0) != ka[i]) {
+		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT) != ka[i]) {
 			fprintf(stderr, "Error lookup greater equal. Expecting key %" PRIu64 " greater or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, 0));
+				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -624,29 +624,29 @@ int test_2bytes_key(void)
 		key = ka[i];	/* without offset */
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ft_node = cds_ft_lookup_lower_equal(test_ft, key_len_split(ftkey), result_key, NULL);
+		ft_node = cds_ft_lookup_lower_equal(test_ft, key_len_split(ftkey), result_key, sizeof(result_key), NULL);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup lower equal. Cannot find expected key %" PRIu64" lower or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, 0) != ka[i]) {
+		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT) != ka[i]) {
 			fprintf(stderr, "Error lookup lower equal. Expecting key %" PRIu64 " lower or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, 0));
+				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT));
 			assert(0);
 		}
 
-		ft_node = cds_ft_lookup_greater_equal(test_ft, key_len_split(ftkey), result_key, NULL);
+		ft_node = cds_ft_lookup_greater_equal(test_ft, key_len_split(ftkey), result_key, sizeof(result_key), NULL);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup greater equal. Cannot find expected key %" PRIu64" greater or equal to %" PRIu64 ".\n",
 				ka[i], key);
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, 0) != ka[i]) {
+		if (node->key != ka[i] || cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT) != ka[i]) {
 			fprintf(stderr, "Error lookup greater equal. Expecting key %" PRIu64 " greater or equal to %" PRIu64 ", but found %" PRIu64 "/%" PRIu64" instead.\n",
-				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, 0));
+				ka[i], key, node->key, cds_ft_key_to_u64(test_ft, result_key, CDS_FT_LEN_DEFAULT));
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -709,8 +709,8 @@ int test_sparse_key(unsigned int len, int nr_dup)
 
 			ft_test_node_init(node, key);
 			rcu_read_lock();
-			cds_ft_u64_to_key(test_ft, key, ftkey, 0);
-			ret = cds_ft_add(test_ft, ftkey, 0, &node->node);
+			cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
+			ret = cds_ft_add(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 			rcu_read_unlock();
 			if (ret) {
 				fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
@@ -733,8 +733,8 @@ int test_sparse_key(unsigned int len, int nr_dup)
 		int count = 0;
 
 		rcu_read_lock();
-		cds_ft_u64_to_key(test_ft, key, ftkey, 0);
-		ft_node = cds_ft_lookup(test_ft, ftkey, 0);
+		cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
+		ft_node = cds_ft_lookup(test_ft, ftkey, CDS_FT_LEN_DEFAULT);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 "\n", key);
 			assert(0);
@@ -757,8 +757,8 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			uint8_t ftkey[8];
 
 			rcu_read_lock();
-			cds_ft_u64_to_key(test_ft, key + 42, ftkey, 0);
-			ft_node = cds_ft_lookup(test_ft, ftkey, 0);
+			cds_ft_u64_to_key(test_ft, key + 42, ftkey, CDS_FT_LEN_DEFAULT);
+			ft_node = cds_ft_lookup(test_ft, ftkey, CDS_FT_LEN_DEFAULT);
 			if (ft_node) {
 				fprintf(stderr,
 					"Error unexpected lookup node %" PRIu64 "\n",
@@ -778,8 +778,8 @@ int test_sparse_key(unsigned int len, int nr_dup)
 		int count = 0;
 
 		rcu_read_lock();
-		cds_ft_u64_to_key(test_ft, key, ftkey, 0);
-		ft_node = cds_ft_lookup(test_ft, ftkey, 0);
+		cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
+		ft_node = cds_ft_lookup(test_ft, ftkey, CDS_FT_LEN_DEFAULT);
 
 		cds_ft_for_each_duplicate_rcu(ft_node) {
 			struct cds_ft_node *test_ft_node;
@@ -788,19 +788,19 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			count++;
 			node = caa_container_of(ft_node,
 				struct ft_test_node, node);
-			ret = cds_ft_del(test_ft, ftkey, 0, &node->node);
+			ret = cds_ft_del(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
 				assert(0);
 			}
 			rcu_free_test_node(node);
-			test_ft_node = cds_ft_lookup(test_ft, ftkey, 0);
+			test_ft_node = cds_ft_lookup(test_ft, ftkey, CDS_FT_LEN_DEFAULT);
 			if (count < nr_dup && !test_ft_node) {
 				fprintf(stderr, "Error: no node found after deletion of some nodes of a key\n");
 				assert(0);
 			}
 		}
-		ft_node = cds_ft_lookup(test_ft, ftkey, 0);
+		ft_node = cds_ft_lookup(test_ft, ftkey, CDS_FT_LEN_DEFAULT);
 		if (ft_node) {
 			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ft_node);
 			assert(0);
@@ -1056,8 +1056,7 @@ int do_sanity_test_varlen_dup(int nr_dup)
 	attr = cds_ft_attr_create();
 	if (!attr)
 		abort();
-	if (cds_ft_attr_set_key_len(attr, 0))	/* Variable length keys. */
-		abort();
+	/* Use variable length keys (default). */
 
 	test_ft = cds_ft_create(attr);
 	cds_ft_attr_destroy(attr);
@@ -1304,8 +1303,7 @@ int do_test_varlen_string(void)
 	attr = cds_ft_attr_create();
 	if (!attr)
 		abort();
-	if (cds_ft_attr_set_key_len(attr, 0))	/* Variable length keys. */
-		abort();
+	/* Use variable length keys (default). */
 
 	test_ft = cds_ft_create(attr);
 	cds_ft_attr_destroy(attr);
@@ -1413,8 +1411,8 @@ void *test_ft_rw_thr_reader(void *_count)
 		/* note: only looking up ulong keys */
 		key = ((unsigned long) rand_r(&URCU_TLS(rand_lookup)) % lookup_pool_size) + lookup_pool_offset;
 		key *= key_mul;
-		cds_ft_u64_to_key(test_ft, key, ftkey, 0);
-		ft_node = cds_ft_lookup(test_ft, ftkey, 0);
+		cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
+		ft_node = cds_ft_lookup(test_ft, ftkey, CDS_FT_LEN_DEFAULT);
 		if (!ft_node) {
 			if (validate_lookup) {
 				printf("[ERROR] Lookup cannot find initial node.\n");
@@ -1483,12 +1481,12 @@ void *test_ft_rw_thr_writer(void *_count)
 			/* note: only inserting ulong keys */
 			key = ((unsigned long) rand_r(&URCU_TLS(rand_lookup)) % write_pool_size) + write_pool_offset;
 			key *= key_mul;
-			cds_ft_u64_to_key(test_ft, key, ftkey, 0);
+			cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
 			ft_test_node_init(node, key);
 			rcu_read_lock();
 			if (add_unique) {
 				mutex_lock_mt();
-				ret_node = cds_ft_add_unique(test_ft, ftkey, 0, &node->node);
+				ret_node = cds_ft_add_unique(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 				mutex_unlock_mt();
 				if (ret_node != &node->node) {
 					free_test_node(node);
@@ -1500,7 +1498,7 @@ void *test_ft_rw_thr_writer(void *_count)
 				assert(0);	/* not implemented yet. */
 			} else {
 				mutex_lock_mt();
-				ret = cds_ft_add(test_ft, ftkey, 0, &node->node);
+				ret = cds_ft_add(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 				mutex_unlock_mt();
 				if (ret) {
 					fprintf(stderr, "Error in cds_ft_add: %d\n", ret);
@@ -1519,17 +1517,17 @@ void *test_ft_rw_thr_writer(void *_count)
 			/* note: only deleting ulong keys */
 			key = ((unsigned long) rand_r(&URCU_TLS(rand_lookup)) % write_pool_size) + write_pool_offset;
 			key *= key_mul;
-			cds_ft_u64_to_key(test_ft, key, ftkey, 0);
+			cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
 
 			rcu_read_lock();
 
-			ft_node = cds_ft_lookup(test_ft, ftkey, 0);
+			ft_node = cds_ft_lookup(test_ft, ftkey, CDS_FT_LEN_DEFAULT);
 			/* Remove first entry */
 			if (ft_node) {
 				node = caa_container_of(ft_node,
 					struct ft_test_node, node);
 				mutex_lock_mt();
-				ret = cds_ft_del(test_ft, ftkey, 0, &node->node);
+				ret = cds_ft_del(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 				mutex_unlock_mt();
 				if (!ret) {
 					rcu_free_test_node(node);
@@ -1586,10 +1584,10 @@ int do_mt_populate_ft(void)
 		/* note: only inserting ulong keys */
 		key = (unsigned long) iter;
 		key *= key_mul;
-		cds_ft_u64_to_key(test_ft, key, ftkey, 0);
+		cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
 		ft_test_node_init(node, key);
 		rcu_read_lock();
-		ret = cds_ft_add(test_ft, ftkey, 0, &node->node);
+		ret = cds_ft_add(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 		URCU_TLS(nr_add)++;
 		URCU_TLS(nr_writes)++;
 		rcu_read_unlock();
@@ -1759,8 +1757,7 @@ int do_test_dictionary(void)
 	attr = cds_ft_attr_create();
 	if (!attr)
 		abort();
-	if (cds_ft_attr_set_key_len(attr, 0))	/* Variable length keys. */
-		abort();
+	/* Use variable length keys (default). */
 
 	test_ft = cds_ft_create(attr);
 	cds_ft_attr_destroy(attr);
@@ -1828,9 +1825,9 @@ int do_test_dictionary(void)
 		size_t entry_key_len = 0;
 		struct cds_ft_node *node;
 
-		for (node = cds_ft_lookup_first(test_ft, key, &entry_key_len); node;
+		for (node = cds_ft_lookup_first(test_ft, key, sizeof(key), &entry_key_len); node;
 				node = cds_ft_lookup_greater_than(test_ft, key, entry_key_len,
-						key, &entry_key_len)) {
+						key, sizeof(key), &entry_key_len)) {
 			cds_ft_for_each_duplicate_rcu(node)
 				printf("%.*s\n", (int) entry_key_len, key);
 		}
@@ -1839,9 +1836,9 @@ int do_test_dictionary(void)
 		size_t entry_key_len = 0;
 		struct cds_ft_node *node;
 
-		for (node = cds_ft_lookup_last(test_ft, key, &entry_key_len); node;
+		for (node = cds_ft_lookup_last(test_ft, key, sizeof(key), &entry_key_len); node;
 				node = cds_ft_lookup_lower_than(test_ft, key, entry_key_len,
-						key, &entry_key_len)) {
+						key, sizeof(key), &entry_key_len)) {
 			cds_ft_for_each_duplicate_rcu(node)
 				printf("%.*s\n", (int) entry_key_len, key);
 		}

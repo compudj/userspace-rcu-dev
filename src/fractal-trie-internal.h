@@ -148,9 +148,9 @@ struct cds_ft {
 	struct cds_ft_inode_flag *root;
 	struct cds_ft_metadata root_metadata;
 
-	unsigned int max_tree_depth;
-	unsigned int key_len;
-	unsigned int max_key_len;	/* Maximum key length allowed. */
+	size_t max_tree_depth;
+	size_t key_len;
+	size_t max_key_len;	/* Maximum key length allowed. */
 	unsigned long nr_fallback;	/* Number of fallback nodes used */
 
 	const struct rcu_flavor_struct *flavor;
