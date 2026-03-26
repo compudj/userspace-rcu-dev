@@ -80,7 +80,8 @@ struct cds_ft_node *cds_ft_lookup(struct cds_ft *ft, const uint8_t *key, size_t 
  *
  * Returns the first node of a duplicate chain if a match is found. If no node
  * matches the full key, the closest ancestor (partial match) is returned.
- * Returns NULL if the key_len is invalid for the trie's configuration.
+ * Returns NULL if the trie is empty, or if the key_len is invalid for
+ * the trie's configuration.
  *
  * An RCU read-side lock must be held while calling this function and
  * while accessing the returned node.
@@ -235,7 +236,7 @@ struct cds_ft_node *cds_ft_lookup_last(struct cds_ft *ft,
 		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len);
 
 /*
- * cds_ft_add - Add @node at @key, allowing duplicates.
+ * cds_ft_insert - Insert @node at @key, allowing duplicates.
  * @ft: The Fractal Trie.
  * @key: Key at which @node should be added (may be NULL if @key_len is 0).
  * @key_len: Key length in bytes:
@@ -250,11 +251,11 @@ struct cds_ft_node *cds_ft_lookup_last(struct cds_ft *ft,
  * responsibility.
  * An RCU read-side lock must be held while calling this function.
  */
-int cds_ft_add(struct cds_ft *ft, const uint8_t *key, size_t key_len,
+int cds_ft_insert(struct cds_ft *ft, const uint8_t *key, size_t key_len,
 		struct cds_ft_node *node);
 
 /*
- * cds_ft_add_unique - Add @node at @key, without duplicates.
+ * cds_ft_insert_unique - Insert @node at @key, without duplicates.
  * @ft: The Fractal Trie.
  * @key: Key at which @node should be added (may be NULL if @key_len is 0).
  * @key_len: Key length in bytes:
@@ -269,11 +270,11 @@ int cds_ft_add(struct cds_ft *ft, const uint8_t *key, size_t key_len,
  * responsibility.
  * An RCU read-side lock must be held while calling this function.
  */
-struct cds_ft_node *cds_ft_add_unique(struct cds_ft *ft, const uint8_t *key,
+struct cds_ft_node *cds_ft_insert_unique(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, struct cds_ft_node *node);
 
 /*
- * cds_ft_del - Remove @node at @key.
+ * cds_ft_remove - Remove @node at @key.
  * @ft: The Fractal Trie.
  * @key: Key at which @node is expected (may be NULL if @key_len is 0).
  * @key_len: Key length in bytes:
@@ -287,7 +288,7 @@ struct cds_ft_node *cds_ft_add_unique(struct cds_ft *ft, const uint8_t *key,
  * after success before reclaiming @node memory.
  * An RCU read-side lock must be held while calling this function.
  */
-int cds_ft_del(struct cds_ft *ft, const uint8_t *key, size_t key_len,
+int cds_ft_remove(struct cds_ft *ft, const uint8_t *key, size_t key_len,
 		struct cds_ft_node *node);
 
 struct cds_ft *_cds_ft_create(const struct cds_ft_attr *attr,

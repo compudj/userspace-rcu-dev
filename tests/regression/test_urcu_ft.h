@@ -50,14 +50,14 @@
 
 struct wr_count {
 	unsigned long update_ops;
-	unsigned long add;
-	unsigned long add_exist;
+	unsigned long insert;
+	unsigned long insert_exist;
 	unsigned long remove;
 };
 
 extern DECLARE_URCU_TLS(unsigned int, rand_lookup);
-extern DECLARE_URCU_TLS(unsigned long, nr_add);
-extern DECLARE_URCU_TLS(unsigned long, nr_addexist);
+extern DECLARE_URCU_TLS(unsigned long, nr_insert);
+extern DECLARE_URCU_TLS(unsigned long, nr_insertexist);
 extern DECLARE_URCU_TLS(unsigned long, nr_del);
 extern DECLARE_URCU_TLS(unsigned long, nr_delnoent);
 extern DECLARE_URCU_TLS(unsigned long, lookup_fail);
@@ -91,7 +91,7 @@ extern unsigned long duration;
 extern unsigned long rduration;
 
 extern unsigned long init_populate;
-extern int add_only;
+extern int insert_only;
 
 extern unsigned long init_pool_offset, lookup_pool_offset, write_pool_offset;
 extern unsigned long init_pool_size,

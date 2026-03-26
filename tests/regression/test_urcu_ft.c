@@ -22,10 +22,10 @@
 #define key_len_split(var)	var, sizeof(var)
 
 DEFINE_URCU_TLS(unsigned int, rand_lookup);
-DEFINE_URCU_TLS(unsigned long, nr_add);
-DEFINE_URCU_TLS(unsigned long, nr_addexist);
-DEFINE_URCU_TLS(unsigned long, nr_del);
-DEFINE_URCU_TLS(unsigned long, nr_delnoent);
+DEFINE_URCU_TLS(unsigned long, nr_insert);
+DEFINE_URCU_TLS(unsigned long, nr_insertexist);
+DEFINE_URCU_TLS(unsigned long, nr_remove);
+DEFINE_URCU_TLS(unsigned long, nr_removenoent);
 DEFINE_URCU_TLS(unsigned long, lookup_fail);
 DEFINE_URCU_TLS(unsigned long, lookup_ok);
 
@@ -43,7 +43,7 @@ unsigned long duration;
 unsigned long rduration;
 
 unsigned long init_populate;
-int add_only;
+int insert_only;
 
 unsigned long init_pool_offset, lookup_pool_offset, write_pool_offset;
 unsigned long init_pool_size = DEFAULT_RAND_POOL,
@@ -69,10 +69,10 @@ DEFINE_URCU_TLS(unsigned long long, nr_reads);
 unsigned int nr_readers;
 unsigned int nr_writers;
 
-static unsigned int add_ratio = 50;
+static unsigned int insert_ratio = 50;
 static uint64_t key_mul = 1ULL;
 
-static int add_unique, add_replace;
+static int insert_unique, insert_replace;
 
 static int leak_detection, show_stats;
 static unsigned long test_nodes_allocated, test_nodes_freed;
@@ -183,7 +183,7 @@ void show_usage(char **argv)
 	printf("        [-u] Add unique keys.\n");
 	printf("        [-s] Replace existing keys.\n");
 printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
-	printf("        [-r ratio] Add ratio (in %% of add+removal).\n");
+	printf("        [-r ratio] Add ratio (in %% of insert+removal).\n");
 	printf("        [-k] Populate init nodes.\n");
 	printf("        [-R offset] Lookup pool offset.\n");
 	printf("        [-S offset] Write pool offset.\n");
@@ -221,7 +221,7 @@ int test_free_all_nodes(struct cds_ft *ft)
 		struct cds_ft_node *tmp_node;
 
 		cds_ft_for_each_duplicate_safe_rcu(node, tmp_node) {
-			ret = cds_ft_del(ft, key, entry_key_len, node);
+			ret = cds_ft_remove(ft, key, entry_key_len, node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n",
 					ret, cds_ft_key_to_u64(ft, key, entry_key_len));
@@ -263,17 +263,17 @@ int test_1byte_key(void)
 	}
 
 	/* Add keys */
-	printf("Test #1: add keys (1-byte).\n");
+	printf("Test #1: insert keys (1-byte).\n");
 	for (key = 0; key < 200; key++) {
 		struct ft_test_node *node = node_alloc();
 
 		ft_test_node_init(node, key);
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ret = cds_ft_add(test_ft, key_len_split(ftkey), &node->node);
+		ret = cds_ft_insert(test_ft, key_len_split(ftkey), &node->node);
 		rcu_read_unlock();
 		if (ret) {
-			fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
+			fprintf(stderr, "Error (%d) inserting node %" PRIu64 "\n",
 				ret, key);
 			assert(0);
 		}
@@ -319,7 +319,7 @@ int test_1byte_key(void)
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ret = cds_ft_del(test_ft, key_len_split(ftkey), &node->node);
+		ret = cds_ft_remove(test_ft, key_len_split(ftkey), &node->node);
 		if (ret) {
 			fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
 			assert(0);
@@ -328,7 +328,7 @@ int test_1byte_key(void)
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
 		ft_node = cds_ft_lookup(test_ft, key_len_split(ftkey));
 		if (ft_node) {
-			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ft_node);
+			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after remove) failed. Node is not expected.\n", key, ft_node);
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -344,10 +344,10 @@ int test_1byte_key(void)
 		ft_test_node_init(node, key);
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ret = cds_ft_add(test_ft, key_len_split(ftkey), &node->node);
+		ret = cds_ft_insert(test_ft, key_len_split(ftkey), &node->node);
 		rcu_read_unlock();
 		if (ret) {
-			fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
+			fprintf(stderr, "Error (%d) inserting node %" PRIu64 "\n",
 				ret, key);
 			assert(0);
 		}
@@ -474,7 +474,7 @@ int test_2bytes_key(void)
 	}
 
 	/* Add keys */
-	printf("Test #1: add keys (2-byes).\n");
+	printf("Test #1: insert keys (2-byes).\n");
 	for (key = 0; key < 10000; key++) {
 	//for (key = 0; key < 65536; key+=256) {
 		struct ft_test_node *node = node_alloc();
@@ -482,10 +482,10 @@ int test_2bytes_key(void)
 		ft_test_node_init(node, key);
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ret = cds_ft_add(test_ft, key_len_split(ftkey), &node->node);
+		ret = cds_ft_insert(test_ft, key_len_split(ftkey), &node->node);
 		rcu_read_unlock();
 		if (ret) {
-			fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
+			fprintf(stderr, "Error (%d) inserting node %" PRIu64 "\n",
 				ret, key);
 			assert(0);
 		}
@@ -537,7 +537,7 @@ int test_2bytes_key(void)
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		ret = cds_ft_del(test_ft, key_len_split(ftkey), &node->node);
+		ret = cds_ft_remove(test_ft, key_len_split(ftkey), &node->node);
 		if (ret) {
 			fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
 			assert(0);
@@ -545,7 +545,7 @@ int test_2bytes_key(void)
 		rcu_free_test_node(node);
 		ft_node = cds_ft_lookup(test_ft, key_len_split(ftkey));
 		if (ft_node) {
-			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ft_node);
+			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after remove) failed. Node is not expected.\n", key, ft_node);
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -561,10 +561,10 @@ int test_2bytes_key(void)
 		ft_test_node_init(node, key);
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		ret = cds_ft_add(test_ft, key_len_split(ftkey), &node->node);
+		ret = cds_ft_insert(test_ft, key_len_split(ftkey), &node->node);
 		rcu_read_unlock();
 		if (ret) {
-			fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
+			fprintf(stderr, "Error (%d) inserting node %" PRIu64 "\n",
 				ret, key);
 			assert(0);
 		}
@@ -700,7 +700,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 	}
 
 	/* Add keys */
-	printf("Test #1: add keys (%u-byte).\n", len);
+	printf("Test #1: insert keys (%u-byte).\n", len);
 	for (i = 0; i < nr_dup; i++) {
 		zerocount = 0;
 		for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
@@ -710,10 +710,10 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			ft_test_node_init(node, key);
 			rcu_read_lock();
 			cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
-			ret = cds_ft_add(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
+			ret = cds_ft_insert(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 			rcu_read_unlock();
 			if (ret) {
-				fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
+				fprintf(stderr, "Error (%d) inserting node %" PRIu64 "\n",
 					ret, key);
 				assert(0);
 			}
@@ -788,7 +788,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			count++;
 			node = caa_container_of(ft_node,
 				struct ft_test_node, node);
-			ret = cds_ft_del(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
+			ret = cds_ft_remove(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
 				assert(0);
@@ -796,13 +796,13 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			rcu_free_test_node(node);
 			test_ft_node = cds_ft_lookup(test_ft, ftkey, CDS_FT_LEN_DEFAULT);
 			if (count < nr_dup && !test_ft_node) {
-				fprintf(stderr, "Error: no node found after deletion of some nodes of a key\n");
+				fprintf(stderr, "Error: no node found after removal of some nodes of a key\n");
 				assert(0);
 			}
 		}
 		ft_node = cds_ft_lookup(test_ft, ftkey, CDS_FT_LEN_DEFAULT);
 		if (ft_node) {
-			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ft_node);
+			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after remove) failed. Node is not expected.\n", key, ft_node);
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -867,7 +867,7 @@ int do_sanity_test(void)
  * nr_dup is number of nodes per key.
  */
 static
-int test_varlen_sparse_key_add(unsigned int len, int nr_dup)
+int test_varlen_sparse_key_insert(unsigned int len, int nr_dup)
 {
 	uint64_t key, max_key;
 	int zerocount, i, ret;
@@ -879,7 +879,7 @@ int test_varlen_sparse_key_add(unsigned int len, int nr_dup)
 		max_key = (1ULL << bits) - 1;
 
 	/* Add keys */
-	printf("Test #1: add keys (%u-byte).\n", len);
+	printf("Test #1: insert keys (%u-byte).\n", len);
 	for (i = 0; i < nr_dup; i++) {
 		zerocount = 0;
 		for (key = 0; key <= max_key && (key != 0 || zerocount < 1); key += 1ULL << (bits - 8)) {
@@ -889,10 +889,10 @@ int test_varlen_sparse_key_add(unsigned int len, int nr_dup)
 			ft_test_node_init(node, key);
 			rcu_read_lock();
 			cds_ft_u64_to_key(test_ft, key, ftkey, len);
-			ret = cds_ft_add(test_ft, ftkey, len, &node->node);
+			ret = cds_ft_insert(test_ft, ftkey, len, &node->node);
 			rcu_read_unlock();
 			if (ret) {
-				fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
+				fprintf(stderr, "Error (%d) inserting node %" PRIu64 "\n",
 					ret, key);
 				assert(0);
 			}
@@ -991,7 +991,7 @@ int test_varlen_sparse_key_lookup_fail(unsigned int len)
  * nr_dup is number of nodes per key.
  */
 static
-int test_varlen_sparse_key_del(unsigned int len, int nr_dup)
+int test_varlen_sparse_key_remove(unsigned int len, int nr_dup)
 {
 	uint64_t key, max_key;
 	int zerocount, ret;
@@ -1020,7 +1020,7 @@ int test_varlen_sparse_key_del(unsigned int len, int nr_dup)
 			count++;
 			node = caa_container_of(ft_node,
 				struct ft_test_node, node);
-			ret = cds_ft_del(test_ft, ftkey, len, &node->node);
+			ret = cds_ft_remove(test_ft, ftkey, len, &node->node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node %" PRIu64 "\n", ret, key);
 				assert(0);
@@ -1028,13 +1028,13 @@ int test_varlen_sparse_key_del(unsigned int len, int nr_dup)
 			rcu_free_test_node(node);
 			test_ft_node = cds_ft_lookup(test_ft, ftkey, len);
 			if (count < nr_dup && !test_ft_node) {
-				fprintf(stderr, "Error: no node found after deletion of some nodes of a key\n");
+				fprintf(stderr, "Error: no node found after removal of some nodes of a key\n");
 				assert(0);
 			}
 		}
 		ft_node = cds_ft_lookup(test_ft, ftkey, len);
 		if (ft_node) {
-			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after delete) failed. Node is not expected.\n", key, ft_node);
+			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after remove) failed. Node is not expected.\n", key, ft_node);
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -1067,7 +1067,7 @@ int do_sanity_test_varlen_dup(int nr_dup)
 
 	/* key length (bytes) */
 	for (i = 1; i <= 8; i *= 2) {
-		ret = test_varlen_sparse_key_add(i, nr_dup);
+		ret = test_varlen_sparse_key_insert(i, nr_dup);
 		if (ret) {
 			return ret;
 		}
@@ -1099,7 +1099,7 @@ int do_sanity_test_varlen_dup(int nr_dup)
 
 	/* key length (bytes) */
 	for (i = 1; i <= 8; i *= 2) {
-		ret = test_varlen_sparse_key_del(i, nr_dup);
+		ret = test_varlen_sparse_key_remove(i, nr_dup);
 		if (ret) {
 			return ret;
 		}
@@ -1168,12 +1168,12 @@ static const char *fail_strings[] = {
 };
 
 static
-int test_varlen_string_key_add(void)
+int test_varlen_string_key_insert(void)
 {
 	unsigned int i;
 
 	/* Add keys */
-	printf("Test #1: add string keys.\n");
+	printf("Test #1: insert string keys.\n");
 	for (i = 0; i < CAA_ARRAY_SIZE(test_strings); i++) {
 		const char *string = test_strings[i];
 		struct ft_test_node *node = node_alloc();
@@ -1181,10 +1181,10 @@ int test_varlen_string_key_add(void)
 
 		ft_test_node_init(node, 0);
 		rcu_read_lock();
-		ret = cds_ft_add(test_ft, (uint8_t *) string, strlen(string), &node->node);
+		ret = cds_ft_insert(test_ft, (uint8_t *) string, strlen(string), &node->node);
 		rcu_read_unlock();
 		if (ret) {
-			fprintf(stderr, "Error (%d) adding node \"%s\"\n",
+			fprintf(stderr, "Error (%d) inserting node \"%s\"\n",
 				ret, string);
 			assert(0);
 		}
@@ -1247,7 +1247,7 @@ int test_varlen_string_key_lookup_fail(void)
 }
 
 static
-int test_varlen_string_key_del(void)
+int test_varlen_string_key_remove(void)
 {
 	unsigned int i;
 
@@ -1269,7 +1269,7 @@ int test_varlen_string_key_del(void)
 			count++;
 			node = caa_container_of(ft_node,
 				struct ft_test_node, node);
-			ret = cds_ft_del(test_ft, (uint8_t *) string, strlen(string), &node->node);
+			ret = cds_ft_remove(test_ft, (uint8_t *) string, strlen(string), &node->node);
 			if (ret) {
 				fprintf(stderr, "Error (%d) removing node \"%s\"\n", ret, string);
 				assert(0);
@@ -1277,13 +1277,13 @@ int test_varlen_string_key_del(void)
 			rcu_free_test_node(node);
 			test_ft_node = cds_ft_lookup(test_ft, (uint8_t *) string, strlen(string));
 			if (count < 2 && strcmp(string, "abcd") == 0 && !test_ft_node) {
-				fprintf(stderr, "Error: no node found after deletion of some nodes of a key\n");
+				fprintf(stderr, "Error: no node found after removal of some nodes of a key\n");
 				assert(0);
 			}
 		}
 		ft_node = cds_ft_lookup(test_ft, (uint8_t *) string, strlen(string));
 		if (ft_node) {
-			fprintf(stderr, "Error lookup \"%s\": %p (after delete) failed. Node is not expected.\n", string, ft_node);
+			fprintf(stderr, "Error lookup \"%s\": %p (after remove) failed. Node is not expected.\n", string, ft_node);
 			assert(0);
 		}
 		rcu_read_unlock();
@@ -1312,7 +1312,7 @@ int do_test_varlen_string(void)
 		return -1;
 	}
 
-	ret = test_varlen_string_key_add();
+	ret = test_varlen_string_key_insert();
 	if (ret) {
 		return ret;
 	}
@@ -1333,7 +1333,7 @@ int do_test_varlen_string(void)
 	}
 	rcu_quiescent_state();
 
-	ret = test_varlen_string_key_del();
+	ret = test_varlen_string_key_remove();
 	if (ret) {
 		return ret;
 	}
@@ -1355,29 +1355,29 @@ int do_test_varlen_string(void)
 	return 0;
 }
 
-enum urcu_ft_addremove {
+enum urcu_ft_insertremove {
 	AR_RANDOM = 0,
-	AR_ADD = 1,
+	AR_INSERT = 1,
 	AR_REMOVE = -1,
-};	/* 1: add, -1 remove, 0: random */
+};	/* 1: insert, -1 remove, 0: random */
 
-static enum urcu_ft_addremove addremove; /* 1: add, -1 remove, 0: random */
+static enum urcu_ft_insertremove insertremove; /* 1: insert, -1 remove, 0: random */
 
 static
 void test_ft_rw_sigusr1_handler(int signo __attribute__((unused)))
 {
-	switch (addremove) {
-	case AR_ADD:
+	switch (insertremove) {
+	case AR_INSERT:
 		printf("Add/Remove: random.\n");
-		addremove = AR_RANDOM;
+		insertremove = AR_RANDOM;
 		break;
 	case AR_RANDOM:
 		printf("Add/Remove: remove only.\n");
-		addremove = AR_REMOVE;
+		insertremove = AR_REMOVE;
 		break;
 	case AR_REMOVE:
-		printf("Add/Remove: add only.\n");
-		addremove = AR_ADD;
+		printf("Add/Remove: insert only.\n");
+		insertremove = AR_INSERT;
 		break;
 	}
 }
@@ -1445,9 +1445,9 @@ void *test_ft_rw_thr_reader(void *_count)
 }
 
 static
-int is_add(void)
+int is_insert(void)
 {
-	return ((unsigned int) rand_r(&URCU_TLS(rand_lookup)) % 100) < add_ratio;
+	return ((unsigned int) rand_r(&URCU_TLS(rand_lookup)) % 100) < insert_ratio;
 }
 
 static
@@ -1472,8 +1472,8 @@ void *test_ft_rw_thr_writer(void *_count)
 	cmm_smp_mb();
 
 	for (;;) {
-		if ((addremove == AR_ADD)
-				|| (addremove == AR_RANDOM && is_add())) {
+		if ((insertremove == AR_INSERT)
+				|| (insertremove == AR_RANDOM && is_insert())) {
 			struct ft_test_node *node = node_alloc();
 			struct cds_ft_node *ret_node;
 			uint8_t ftkey[8];
@@ -1484,27 +1484,27 @@ void *test_ft_rw_thr_writer(void *_count)
 			cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
 			ft_test_node_init(node, key);
 			rcu_read_lock();
-			if (add_unique) {
+			if (insert_unique) {
 				mutex_lock_mt();
-				ret_node = cds_ft_add_unique(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
+				ret_node = cds_ft_insert_unique(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 				mutex_unlock_mt();
 				if (ret_node != &node->node) {
 					free_test_node(node);
-					URCU_TLS(nr_addexist)++;
+					URCU_TLS(nr_insertexist)++;
 				} else {
-					URCU_TLS(nr_add)++;
+					URCU_TLS(nr_insert)++;
 				}
-			} else if (add_replace) {
+			} else if (insert_replace) {
 				assert(0);	/* not implemented yet. */
 			} else {
 				mutex_lock_mt();
-				ret = cds_ft_add(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
+				ret = cds_ft_insert(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 				mutex_unlock_mt();
 				if (ret) {
-					fprintf(stderr, "Error in cds_ft_add: %d\n", ret);
+					fprintf(stderr, "Error in cds_ft_insert: %d\n", ret);
 					free_test_node(node);
 				} else {
-					URCU_TLS(nr_add)++;
+					URCU_TLS(nr_insert)++;
 				}
 			}
 			rcu_read_unlock();
@@ -1513,8 +1513,8 @@ void *test_ft_rw_thr_writer(void *_count)
 			struct ft_test_node *node;
 			uint8_t ftkey[8];
 
-			/* May delete */
-			/* note: only deleting ulong keys */
+			/* May remove */
+			/* note: only remove ulong keys */
 			key = ((unsigned long) rand_r(&URCU_TLS(rand_lookup)) % write_pool_size) + write_pool_offset;
 			key *= key_mul;
 			cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
@@ -1527,16 +1527,16 @@ void *test_ft_rw_thr_writer(void *_count)
 				node = caa_container_of(ft_node,
 					struct ft_test_node, node);
 				mutex_lock_mt();
-				ret = cds_ft_del(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
+				ret = cds_ft_remove(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
 				mutex_unlock_mt();
 				if (!ret) {
 					rcu_free_test_node(node);
-					URCU_TLS(nr_del)++;
+					URCU_TLS(nr_remove)++;
 				} else {
-					URCU_TLS(nr_delnoent)++;
+					URCU_TLS(nr_removenoent)++;
 				}
 			} else {
-				URCU_TLS(nr_delnoent)++;
+				URCU_TLS(nr_removenoent)++;
 			}
 			rcu_read_unlock();
 		}
@@ -1554,14 +1554,14 @@ void *test_ft_rw_thr_writer(void *_count)
 
 	printf_verbose("thread_end %s, tid %lu\n",
 			"writer", urcu_get_thread_id());
-	printf_verbose("info id %lx: nr_add %lu, nr_addexist %lu, nr_del %lu, "
-			"nr_delnoent %lu\n", pthread_self(), URCU_TLS(nr_add),
-			URCU_TLS(nr_addexist), URCU_TLS(nr_del),
-			URCU_TLS(nr_delnoent));
+	printf_verbose("info id %lx: nr_insert %lu, nr_insertexist %lu, nr_remove %lu, "
+			"nr_removenoent %lu\n", pthread_self(), URCU_TLS(nr_insert),
+			URCU_TLS(nr_insertexist), URCU_TLS(nr_remove),
+			URCU_TLS(nr_removenoent));
 	count->update_ops = URCU_TLS(nr_writes);
-	count->add = URCU_TLS(nr_add);
-	count->add_exist = URCU_TLS(nr_addexist);
-	count->remove = URCU_TLS(nr_del);
+	count->insert = URCU_TLS(nr_insert);
+	count->insert_exist = URCU_TLS(nr_insertexist);
+	count->remove = URCU_TLS(nr_remove);
 	return ((void*)2);
 }
 
@@ -1587,15 +1587,15 @@ int do_mt_populate_ft(void)
 		cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
 		ft_test_node_init(node, key);
 		rcu_read_lock();
-		ret = cds_ft_add(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
-		URCU_TLS(nr_add)++;
+		ret = cds_ft_insert(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
+		URCU_TLS(nr_insert)++;
 		URCU_TLS(nr_writes)++;
 		rcu_read_unlock();
 		/* Hash table resize only occurs in call_rcu thread */
 		if (!(iter % 100))
 			rcu_quiescent_state();
 		if (ret) {
-			fprintf(stderr, "Error (%d) adding node %" PRIu64 "\n",
+			fprintf(stderr, "Error (%d) inserting node %" PRIu64 "\n",
 				ret, key);
 			assert(0);
 		}
@@ -1614,7 +1614,7 @@ int do_mt_test(void)
 	unsigned long long *count_reader;
 	struct wr_count *count_writer;
 	unsigned long long tot_reads = 0, tot_writes = 0,
-		tot_add = 0, tot_add_exist = 0, tot_remove = 0;
+		tot_insert = 0, tot_insert_exist = 0, tot_remove = 0;
 	unsigned int remain;
 	struct cds_ft_attr *attr;
 
@@ -1684,8 +1684,8 @@ int do_mt_test(void)
 		if (err != 0)
 			exit(1);
 		tot_writes += count_writer[i].update_ops;
-		tot_add += count_writer[i].add;
-		tot_add_exist += count_writer[i].add_exist;
+		tot_insert += count_writer[i].insert;
+		tot_insert_exist += count_writer[i].insert_exist;
 		tot_remove += count_writer[i].remove;
 	}
 	urcu_qsbr_thread_online();
@@ -1775,10 +1775,10 @@ int do_test_dictionary(void)
 
 			ft_test_node_init(node, 0);
 			rcu_read_lock();
-			ret = cds_ft_add(test_ft, (uint8_t *) string, strlen(string), &node->node);
+			ret = cds_ft_insert(test_ft, (uint8_t *) string, strlen(string), &node->node);
 			rcu_read_unlock();
 			if (ret) {
-				fprintf(stderr, "Error (%d) adding node \"%s\"\n",
+				fprintf(stderr, "Error (%d) inserting node \"%s\"\n",
 					ret, string);
 				assert(0);
 			}
@@ -1800,10 +1800,10 @@ int do_test_dictionary(void)
 
 			ft_test_node_init(node, 0);
 			rcu_read_lock();
-			ret = cds_ft_add(test_ft, (uint8_t *) line, strlen(line), &node->node);
+			ret = cds_ft_insert(test_ft, (uint8_t *) line, strlen(line), &node->node);
 			rcu_read_unlock();
 			if (ret) {
-				fprintf(stderr, "Error (%d) adding node \"%s\"\n",
+				fprintf(stderr, "Error (%d) inserting node \"%s\"\n",
 					ret, line);
 				assert(0);
 			}
@@ -1916,7 +1916,7 @@ int main(int argc, char **argv)
 			verbose_mode = 1;
 			break;
 		case 'r':
-			add_ratio = atoi(argv[++i]);
+			insert_ratio = atoi(argv[++i]);
 			break;
 		case 'k':
 			init_populate = 1;
@@ -1958,10 +1958,10 @@ int main(int argc, char **argv)
 			key_mul = atoll(argv[++i]);
 			break;
 		case 'u':
-			add_unique = 1;
+			insert_unique = 1;
 			break;
 		case 's':
-			add_replace = 1;
+			insert_replace = 1;
 			break;
 		case 'l':
 			leak_detection = 1;
@@ -1985,10 +1985,10 @@ int main(int argc, char **argv)
 		duration, nr_readers, nr_writers);
 	printf_verbose("Writer delay : %lu loops.\n", wdelay);
 	printf_verbose("Reader duration : %lu loops.\n", rduration);
-	printf_verbose("Add ratio: %u%%.\n", add_ratio);
+	printf_verbose("Insert ratio: %u%%.\n", insert_ratio);
 	printf_verbose("Mode:%s%s.\n",
-		" add/remove",
-		add_unique ? " uniquify" : ( add_replace ? " replace" : " insert"));
+		" insert/remove",
+		insert_unique ? " uniquify" : ( insert_replace ? " replace" : " insert"));
 	printf_verbose("Key multiplication factor: %" PRIu64 ".\n", key_mul);
 	printf_verbose("Init pool size offset %lu size %lu.\n",
 		init_pool_offset, init_pool_size);

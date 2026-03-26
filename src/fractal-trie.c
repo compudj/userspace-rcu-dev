@@ -2944,7 +2944,7 @@ void ft_chain_node(struct cds_ft_node *last_node, struct cds_ft_node *node)
  *         node into the tree to replace the prior external node.
  */
 static
-int _cds_ft_add(struct cds_ft *ft,
+int _cds_ft_insert(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
 		struct cds_ft_node *node,
 		struct cds_ft_node **unique_node_ret)
@@ -2964,7 +2964,7 @@ int _cds_ft_add(struct cds_ft *ft,
 	key_depth = key_len + 1;
 
 retry:
-	dbg_printf("cds_ft_add attempt: node %p\n", node);
+	dbg_printf("cds_ft_insert attempt: node %p\n", node);
 	parent2_node_flag = NULL;
 	parent_node_flag = (struct cds_ft_inode_flag *) &ft->root;
 	parent_node_flag_ptr = NULL;
@@ -2979,7 +2979,7 @@ retry:
 		/* Found external node. */
 		if (!ft_node_internal(node_flag))
 			break;
-		dbg_printf("cds_ft_add iter parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+		dbg_printf("cds_ft_insert iter parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
 		key_value = key_to_ordinal(ft, *(iter_key++));
 		parent2_node_flag = parent_node_flag;
@@ -2991,7 +2991,7 @@ retry:
 	if (i == key_depth - 1) {
 		/* Found either an internal, external node or NULL at end of key. */
 		if (!ft_node_ptr(node_flag)) {
-			dbg_printf("cds_ft_add NULL parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+			dbg_printf("cds_ft_insert NULL parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 					parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
 
 			attach_node_flag = parent_node_flag;
@@ -3019,7 +3019,7 @@ retry:
 				cds_ft_for_each_duplicate(iter_node)
 					last_node = iter_node;
 
-				dbg_printf("cds_ft_add duplicate internal parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+				dbg_printf("cds_ft_insert duplicate internal parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 						parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
 
 				ft_chain_node(last_node, node);
@@ -3041,7 +3041,7 @@ retry:
 			cds_ft_for_each_duplicate(iter_node)
 				last_node = iter_node;
 
-			dbg_printf("cds_ft_add duplicate external parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+			dbg_printf("cds_ft_insert duplicate external parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 					parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
 
 			ft_chain_node(last_node, node);
@@ -3060,7 +3060,7 @@ retry:
 		 * external node.
 		 */
 
-		dbg_printf("cds_ft_add NULL or external parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+		dbg_printf("cds_ft_insert NULL or external parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
 				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
 
 		attach_node_flag = parent_node_flag;
@@ -3077,19 +3077,19 @@ retry:
 	return ret;
 }
 
-int cds_ft_add(struct cds_ft *ft, const uint8_t *key, size_t key_len,
+int cds_ft_insert(struct cds_ft *ft, const uint8_t *key, size_t key_len,
 		struct cds_ft_node *node)
 {
-	return _cds_ft_add(ft, key, key_len, node, NULL);
+	return _cds_ft_insert(ft, key, key_len, node, NULL);
 }
 
-struct cds_ft_node *cds_ft_add_unique(struct cds_ft *ft, const uint8_t *key,
+struct cds_ft_node *cds_ft_insert_unique(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, struct cds_ft_node *node)
 {
 	int ret;
 	struct cds_ft_node *ret_node;
 
-	ret = _cds_ft_add(ft, key, key_len, node, &ret_node);
+	ret = _cds_ft_insert(ft, key, key_len, node, &ret_node);
 	if (ret == -EEXIST)
 		return ret_node;
 	if (ret)
@@ -3099,8 +3099,8 @@ struct cds_ft_node *cds_ft_add_unique(struct cds_ft *ft, const uint8_t *key,
 
 /*
  * Note: there is no need to lookup the pointer address associated with
- * each node's nth item: it's already been done by cds_ft_del, and
- * cds_ft_del is protected by mutual exclusion of updaters.
+ * each node's nth item: it's already been done by cds_ft_remove, and
+ * cds_ft_remove is protected by mutual exclusion of updaters.
  *
  * ft_detach_node() ensures that a lookup will _never_ see a branch that
  * leads to a dead-end: when removing branch, it makes sure to perform
@@ -3244,7 +3244,7 @@ void ft_unchain_node(struct cds_ft_node **prev_node_ptr,
  *         with an internal node. Unlink the node from its list, leaving
  *         the external nodes list empty.
  */
-int cds_ft_del(struct cds_ft *ft, const uint8_t *key, size_t _key_len,
+int cds_ft_remove(struct cds_ft *ft, const uint8_t *key, size_t _key_len,
 		struct cds_ft_node *node)
 {
 	unsigned int i, key_depth;
@@ -3266,7 +3266,7 @@ int cds_ft_del(struct cds_ft *ft, const uint8_t *key, size_t _key_len,
 
 retry:
 	nr_snapshot = 0;
-	dbg_printf("cds_ft_del attempt: node %p\n", node);
+	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
 	/* snapshot for level 0 is for metadata lookup of root node. */
 	snapshot_n[0] = 0;
@@ -3281,7 +3281,7 @@ retry:
 	for (i = 1; i < key_depth; i++) {
 		uint8_t key_value;
 
-		dbg_printf("cds_ft_del iter node_flag %p\n",
+		dbg_printf("cds_ft_remove iter node_flag %p\n",
 				node_flag);
 		if (!ft_node_ptr(node_flag)) {
 			return -ENOENT;
@@ -3293,7 +3293,7 @@ retry:
 		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
 		if (node_flag)
 			prev_node_flag_ptr = node_flag_ptr;
-		dbg_printf("cds_ft_del iter key lookup %u finds node_flag %p, prev_node_flag_ptr %p\n",
+		dbg_printf("cds_ft_remove iter key lookup %u finds node_flag %p, prev_node_flag_ptr %p\n",
 				(unsigned int) key_value, node_flag,
 				prev_node_flag_ptr);
 	}
@@ -3302,7 +3302,7 @@ retry:
 	 * remove. Fail if we cannot find it.
 	 */
 	if (!ft_node_ptr(node_flag)) {
-		dbg_printf("cds_ft_del: no node found for key\n");
+		dbg_printf("cds_ft_remove: no node found for key\n");
 		return -ENOENT;
 	}
 
@@ -3325,7 +3325,7 @@ retry:
 			cds_ft_for_each_duplicate(iter_node) {
 				if (match)
 					continue;
-				dbg_printf("cds_ft_del: compare %p with iter_node %p\n", node, iter_node);
+				dbg_printf("cds_ft_remove: compare %p with iter_node %p\n", node, iter_node);
 				if (iter_node == node) {
 					prev_node_ptr = iter_node_ptr;
 					match = iter_node;
@@ -3333,13 +3333,13 @@ retry:
 				iter_node_ptr = &iter_node->next;
 			}
 			if (!match) {
-				dbg_printf("cds_ft_del: no node match for node %p key\n", node);
+				dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
 				return -ENOENT;
 			}
 			ft_unchain_node(prev_node_ptr, match);
 			ret = 0;
 		} else {
-			dbg_printf("cds_ft_del: no metadata external node found for key\n");
+			dbg_printf("cds_ft_remove: no metadata external node found for key\n");
 			return -ENOENT;
 		}
 	} else {
@@ -3358,7 +3358,7 @@ retry:
 			count++;
 			if (match)
 				continue;
-			dbg_printf("cds_ft_del: compare %p with iter_node %p\n", node, iter_node);
+			dbg_printf("cds_ft_remove: compare %p with iter_node %p\n", node, iter_node);
 			if (iter_node == node) {
 				prev_node_ptr = iter_node_ptr;
 				match = iter_node;
@@ -3366,7 +3366,7 @@ retry:
 			iter_node_ptr = &iter_node->next;
 		}
 		if (!match) {
-			dbg_printf("cds_ft_del: no node match for node %p key\n", node);
+			dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
 			return -ENOENT;
 		}
 		assert(count > 0);
