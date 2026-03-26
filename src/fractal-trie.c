@@ -505,7 +505,7 @@ bool valid_key_len(struct cds_ft *ft, size_t key_len)
 	size_t max_key_len = ft->max_key_len;
 
 	assert(max_key_len != CDS_FT_MAX_LEN_UNLIMITED);
-	if (key_len > max_key_len)
+	if (key_len == CDS_FT_LEN_ERROR || key_len > max_key_len)
 		return false;
 	return true;
 }
@@ -2343,34 +2343,45 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	return ret;
 }
 
-struct cds_ft_node *cds_ft_lookup(struct cds_ft *ft, const uint8_t *key, size_t _key_len)
+enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft_node **result_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
 	struct cds_ft_inode_flag *node_flag;
+	struct cds_ft_node *found;
 	unsigned int key_depth, i;
 
-	if (!valid_key_len(ft, key_len))
-		return NULL;
+	if (!valid_key_len(ft, key_len)) {
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 	key_depth = key_len + 1;
 	node_flag = rcu_dereference(ft->root);
 
 	/* level 0: root node */
-	if (!ft_node_ptr(node_flag))
-		return NULL;
+	if (!ft_node_ptr(node_flag)) {
+		*result_node = NULL;
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
 	/* Check if root node is external. */
 	if (!ft_node_internal(node_flag)) {
-		/* Return NULL if requested key length is nonzero. */
-		if (key_len)
-			return NULL;
-		/* Return root node. */
-		return (struct cds_ft_node *) node_flag;
+		if (key_len) {
+			*result_node = NULL;
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
+		*result_node = (struct cds_ft_node *) node_flag;
+		return CDS_FT_STATUS_OK;
 	}
 	/*
 	 * Root node is internal, key length 0 requested, return
 	 * metadata external nodes.
 	 */
-	if (!key_len)
-		return rcu_dereference(ft->root_metadata.external_nodes);
+	if (!key_len) {
+		found = rcu_dereference(ft->root_metadata.external_nodes);
+		*result_node = found;
+		return found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+	}
 
 	for (i = 1; i < key_depth; i++) {
 		uint8_t iter_key;
@@ -2379,11 +2390,15 @@ struct cds_ft_node *cds_ft_lookup(struct cds_ft *ft, const uint8_t *key, size_t 
 		node_flag = ft_node_get_nth(node_flag, NULL, iter_key);
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
-		if (!ft_node_ptr(node_flag))
-			return NULL;
+		if (!ft_node_ptr(node_flag)) {
+			*result_node = NULL;
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
 		/* Found external node before end of key. */
-		if (i < key_depth - 1 && !ft_node_internal(node_flag))
-			return NULL;
+		if (i < key_depth - 1 && !ft_node_internal(node_flag)) {
+			*result_node = NULL;
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
 	}
 
 	/*
@@ -2394,12 +2409,17 @@ struct cds_ft_node *cds_ft_lookup(struct cds_ft *ft, const uint8_t *key, size_t 
 		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
 							type->order);
-		return rcu_dereference(metadata->external_nodes);
+		found = rcu_dereference(metadata->external_nodes);
+		*result_node = found;
+		return found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 	}
-	return (struct cds_ft_node *) node_flag;
+	*result_node = (struct cds_ft_node *) node_flag;
+	return CDS_FT_STATUS_OK;
 }
 
-struct cds_ft_node *cds_ft_lookup_partial(struct cds_ft *ft, const uint8_t *key, size_t _key_len, size_t *_match_len)
+enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t *prefix_len,
+		struct cds_ft_node **result_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len), match_len = 0;
 	struct cds_ft_node *match_node = NULL;
@@ -2408,8 +2428,11 @@ struct cds_ft_node *cds_ft_lookup_partial(struct cds_ft *ft, const uint8_t *key,
 	struct cds_ft_metadata *metadata;
 	unsigned int key_depth, i;
 
-	if (!valid_key_len(ft, key_len))
-		goto end;
+	if (!valid_key_len(ft, key_len)) {
+		*prefix_len = 0;
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 	key_depth = key_len + 1;
 	node_flag = rcu_dereference(ft->root);
 
@@ -2459,14 +2482,16 @@ struct cds_ft_node *cds_ft_lookup_partial(struct cds_ft *ft, const uint8_t *key,
 		}
 	}
 end:
-	*_match_len = match_len;
-	return match_node;
+	*prefix_len = match_len;
+	*result_node = match_node;
+	return match_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
 static
-struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
+enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
 		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
+		struct cds_ft_node **result_node,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit)
 {
@@ -2482,8 +2507,10 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 	switch (limit) {
 	case FT_LOOKUP_LIMIT_NONE:
 		key_len = ft_key_len(ft, _key_len);
-		if (!valid_key_len(ft, key_len))
-			return NULL;
+		if (!valid_key_len(ft, key_len)) {
+			*result_node = NULL;
+			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		}
 		break;
 	case FT_LOOKUP_LIMIT_FIRST:
 		key_len = 0;
@@ -2502,7 +2529,7 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 	case FT_LOOKUP_LT:
 		break;
 	default:
-		return NULL;
+		abort();	/* Internal library error. */
 	}
 
 	memset(cur_node_depth, 0, (ft->max_tree_depth + 1) * sizeof(cur_node_depth[0]));
@@ -2511,8 +2538,10 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 	cur_node_depth[0] = node_flag;
 
 	/* level 0: root node */
-	if (!ft_node_ptr(node_flag))
-		return NULL;
+	if (!ft_node_ptr(node_flag)) {
+		*result_node = NULL;
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
 
 	for (level = 1; level < key_depth; level++) {
 		uint8_t key_value;
@@ -2559,12 +2588,13 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 				if (result_key_len)
 					*result_key_len = key_len;
 				if (key_len > result_key_max_len) {
-					errno = E2BIG;
-					return NULL;
+					*result_node = NULL;
+					return CDS_FT_STATUS_OVERFLOW_ERROR;
 				}
-				if (result_key)
-					memmove(result_key, key, key_len);
-				return external_nodes;
+				if (result_key && result_key != key)
+					memcpy(result_key, key, key_len);
+				*result_node = external_nodes;
+				return CDS_FT_STATUS_OK;
 			}
 		}
 		break;
@@ -2621,8 +2651,8 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 				if (result_key_len)
 					*result_key_len = level;
 				if ((size_t) level > result_key_max_len) {
-					errno = E2BIG;
-					return NULL;
+					*result_node = NULL;
+					return CDS_FT_STATUS_OVERFLOW_ERROR;
 				}
 				if (result_key) {
 					int i;
@@ -2630,7 +2660,8 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 					for (i = 0; i < level; i++)
 						*(result_key++) = ordinal_to_key(ft, cur_key[i]);
 				}
-				return external_nodes;
+				*result_node = external_nodes;
+				return CDS_FT_STATUS_OK;
 			}
 		}
 
@@ -2662,7 +2693,8 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 
 	if (!level) {
 		/* Reached the root and could not find a left/right sibling. */
-		return NULL;
+		*result_node = NULL;
+		return CDS_FT_STATUS_NOT_FOUND;
 	}
 
 	if (!ft_node_internal(node_flag)) {
@@ -2670,8 +2702,8 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 		if (result_key_len)
 			*result_key_len = level;
 		if ((size_t) level > result_key_max_len) {
-			errno = E2BIG;
-			return NULL;
+			*result_node = NULL;
+			return CDS_FT_STATUS_OVERFLOW_ERROR;
 		}
 		if (result_key) {
 			int i;
@@ -2679,7 +2711,8 @@ struct cds_ft_node *cds_ft_lookup_inequality(struct cds_ft *ft,
 			for (i = 0; i < level; i++)
 				*(result_key++) = ordinal_to_key(ft, cur_key[i]);
 		}
-		return (struct cds_ft_node *) ft_node_ptr(node_flag);
+		*result_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+		return CDS_FT_STATUS_OK;
 	}
 
 	level++;
@@ -2739,8 +2772,8 @@ end:
 	if (result_key_len)
 		*result_key_len = level;
 	if ((size_t) level > result_key_max_len) {
-		errno = E2BIG;
-		return NULL;
+		*result_node = NULL;
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
 	}
 	if (result_key) {
 		int i;
@@ -2748,58 +2781,71 @@ end:
 		for (i = 0; i < level; i++)
 			*(result_key++) = ordinal_to_key(ft, cur_key[i]);
 	}
-	return ret_node;
+	*result_node = ret_node;
+	return ret_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
-struct cds_ft_node *cds_ft_lookup_lower_equal(struct cds_ft *ft,
+enum cds_ft_status cds_ft_lookup_lower_equal(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
+		struct cds_ft_node **result_node)
 
 {
 	dbg_printf("cds_ft_lookup_lower_equal\n");
 	return cds_ft_lookup_inequality(ft, key, key_len,
-			result_key, result_key_max_len, result_key_len, FT_LOOKUP_LE, FT_LOOKUP_LIMIT_NONE);
+			result_key, result_key_max_len, result_key_len, result_node,
+			FT_LOOKUP_LE, FT_LOOKUP_LIMIT_NONE);
 }
 
-struct cds_ft_node *cds_ft_lookup_greater_equal(struct cds_ft *ft,
+enum cds_ft_status cds_ft_lookup_greater_equal(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
+		struct cds_ft_node **result_node)
 {
 	dbg_printf("cds_ft_lookup_greater_equal\n");
 	return cds_ft_lookup_inequality(ft, key, key_len,
-		result_key, result_key_max_len, result_key_len, FT_LOOKUP_GE, FT_LOOKUP_LIMIT_NONE);
+		result_key, result_key_max_len, result_key_len, result_node,
+		FT_LOOKUP_GE, FT_LOOKUP_LIMIT_NONE);
 }
 
-struct cds_ft_node *cds_ft_lookup_lower_than(struct cds_ft *ft,
+enum cds_ft_status cds_ft_lookup_lower_than(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
+		struct cds_ft_node **result_node)
 {
 	dbg_printf("cds_ft_lookup_lower_than\n");
 	return cds_ft_lookup_inequality(ft, key, key_len,
-		result_key, result_key_max_len, result_key_len, FT_LOOKUP_LT, FT_LOOKUP_LIMIT_NONE);
+		result_key, result_key_max_len, result_key_len, result_node,
+		FT_LOOKUP_LT, FT_LOOKUP_LIMIT_NONE);
 }
 
-struct cds_ft_node *cds_ft_lookup_greater_than(struct cds_ft *ft,
+enum cds_ft_status cds_ft_lookup_greater_than(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
+		struct cds_ft_node **result_node)
 {
 	dbg_printf("cds_ft_lookup_greater_than\n");
 	return cds_ft_lookup_inequality(ft, key, key_len,
-		result_key, result_key_max_len, result_key_len, FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE);
+		result_key, result_key_max_len, result_key_len, result_node,
+		FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE);
 }
 
-struct cds_ft_node *cds_ft_lookup_first(struct cds_ft *ft,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
+enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
+		struct cds_ft_node **result_node)
 {
 	return cds_ft_lookup_inequality(ft, NULL, 0,
-		result_key, result_key_max_len, result_key_len, FT_LOOKUP_GE, FT_LOOKUP_LIMIT_FIRST);
+		result_key, result_key_max_len, result_key_len, result_node,
+		FT_LOOKUP_GE, FT_LOOKUP_LIMIT_FIRST);
 }
 
-struct cds_ft_node *cds_ft_lookup_last(struct cds_ft *ft,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
+enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
+		struct cds_ft_node **result_node)
 {
 	return cds_ft_lookup_inequality(ft, NULL, 0,
-		result_key, result_key_max_len, result_key_len, FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);
+		result_key, result_key_max_len, result_key_len, result_node,
+		FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);
 }
 
 /*
@@ -3077,24 +3123,42 @@ retry:
 	return ret;
 }
 
-int cds_ft_insert(struct cds_ft *ft, const uint8_t *key, size_t key_len,
+enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
 		struct cds_ft_node *node)
 {
-	return _cds_ft_insert(ft, key, key_len, node, NULL);
+	int ret = _cds_ft_insert(ft, key, key_len, node, NULL);
+
+	if (ret == 0)
+		return CDS_FT_STATUS_OK;
+	if (ret == -EINVAL)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	return CDS_FT_STATUS_MEMORY_ERROR;
 }
 
-struct cds_ft_node *cds_ft_insert_unique(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, struct cds_ft_node *node)
+enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft_node *node,
+		struct cds_ft_node **result_node)
 {
 	int ret;
-	struct cds_ft_node *ret_node;
+	struct cds_ft_node *ret_node = NULL;
 
 	ret = _cds_ft_insert(ft, key, key_len, node, &ret_node);
-	if (ret == -EEXIST)
-		return ret_node;
-	if (ret)
-		return NULL;
-	return node;
+	if (ret == -EEXIST) {
+		*result_node = ret_node;
+		return CDS_FT_STATUS_DUPLICATE_FOUND;
+	}
+	if (ret == -EINVAL) {
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	if (ret) {
+		*result_node = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+	*result_node = node;
+	return CDS_FT_STATUS_OK;
 }
 
 /*
@@ -3244,7 +3308,8 @@ void ft_unchain_node(struct cds_ft_node **prev_node_ptr,
  *         with an internal node. Unlink the node from its list, leaving
  *         the external nodes list empty.
  */
-int cds_ft_remove(struct cds_ft *ft, const uint8_t *key, size_t _key_len,
+enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
 		struct cds_ft_node *node)
 {
 	unsigned int i, key_depth;
@@ -3260,7 +3325,7 @@ int cds_ft_remove(struct cds_ft *ft, const uint8_t *key, size_t _key_len,
 	size_t key_len = ft_key_len(ft, _key_len);
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
-		return -EINVAL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 
 	key_depth = key_len + 1;
 
@@ -3284,7 +3349,7 @@ retry:
 		dbg_printf("cds_ft_remove iter node_flag %p\n",
 				node_flag);
 		if (!ft_node_ptr(node_flag)) {
-			return -ENOENT;
+			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		key_value = key_to_ordinal(ft, *(iter_key++));
 		snapshot_n[nr_snapshot + 1] = key_value;
@@ -3303,7 +3368,7 @@ retry:
 	 */
 	if (!ft_node_ptr(node_flag)) {
 		dbg_printf("cds_ft_remove: no node found for key\n");
-		return -ENOENT;
+		return CDS_FT_STATUS_NOT_FOUND;
 	}
 
 	if (ft_node_internal(node_flag)) {
@@ -3334,13 +3399,13 @@ retry:
 			}
 			if (!match) {
 				dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
-				return -ENOENT;
+				return CDS_FT_STATUS_NOT_FOUND;
 			}
 			ft_unchain_node(prev_node_ptr, match);
 			ret = 0;
 		} else {
 			dbg_printf("cds_ft_remove: no metadata external node found for key\n");
-			return -ENOENT;
+			return CDS_FT_STATUS_NOT_FOUND;
 		}
 	} else {
 		/* Found external node at end of key. */
@@ -3367,7 +3432,7 @@ retry:
 		}
 		if (!match) {
 			dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
-			return -ENOENT;
+			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		assert(count > 0);
 		if (count == 1) {
@@ -3392,7 +3457,7 @@ retry:
 	 */
 	if (ret == -EAGAIN || ret == -ENOENT)
 		goto retry;
-	return ret;
+	return ret == 0 ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
 size_t cds_ft_key_len(const struct cds_ft *ft)
@@ -3405,25 +3470,28 @@ size_t cds_ft_max_key_len(const struct cds_ft *ft)
 	return ft->max_key_len;
 }
 
-int cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key)
+enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key)
 {
 	if (ft->key_map.identity)
-		return -ENOENT;
+		return CDS_FT_STATUS_NOT_FOUND;
 	memcpy(key_to_ordinal, ft->key_map.key_to_ordinal, sizeof(ft->key_map.key_to_ordinal));
 	memcpy(ordinal_to_key, ft->key_map.ordinal_to_key, sizeof(ft->key_map.ordinal_to_key));
-	return 0;
+	return CDS_FT_STATUS_OK;
 }
 
-struct cds_ft_attr *cds_ft_attr_create(void)
+enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 {
 	struct cds_ft_attr *attr = calloc(1, sizeof(struct cds_ft_attr));
 
-	if (!attr)
-		return NULL;
+	if (!attr) {
+		*result = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 	attr->key_len = CDS_FT_LEN_DEFAULT;
 	attr->max_key_len = FT_MAX_KEY_LEN;
 	attr->key_map.identity = true;
-	return attr;
+	*result = attr;
+	return CDS_FT_STATUS_OK;
 }
 
 void cds_ft_attr_destroy(struct cds_ft_attr *attr)
@@ -3431,33 +3499,35 @@ void cds_ft_attr_destroy(struct cds_ft_attr *attr)
 	free(attr);
 }
 
-int cds_ft_attr_set_key_len(struct cds_ft_attr *attr, size_t key_len)
+enum cds_ft_status cds_ft_attr_set_key_len(struct cds_ft_attr *attr, size_t key_len)
 {
 	attr->key_len = key_len;
-	return 0;
+	return CDS_FT_STATUS_OK;
 }
 
-int cds_ft_attr_set_max_key_len(struct cds_ft_attr *attr, size_t max_key_len)
+enum cds_ft_status cds_ft_attr_set_max_key_len(struct cds_ft_attr *attr, size_t max_key_len)
 {
 	if (max_key_len == CDS_FT_MAX_LEN_UNLIMITED) {
 		attr->max_key_len = FT_MAX_KEY_LEN;
-		return 0;
+		return CDS_FT_STATUS_OK;
 	}
 	if (max_key_len > FT_MAX_KEY_LEN)
-		return -EINVAL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	attr->max_key_len = max_key_len;
-	return 0;
+	return CDS_FT_STATUS_OK;
 }
 
-int cds_ft_attr_set_key_map(struct cds_ft_attr *attr, const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key)
+enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
+		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key)
 {
 	attr->key_map.identity = false;
 	memcpy(attr->key_map.key_to_ordinal, key_to_ordinal, sizeof(attr->key_map.key_to_ordinal));
 	memcpy(attr->key_map.ordinal_to_key, ordinal_to_key, sizeof(attr->key_map.ordinal_to_key));
-	return 0;
+	return CDS_FT_STATUS_OK;
 }
 
-struct cds_ft *_cds_ft_create(const struct cds_ft_attr *attr,
+enum cds_ft_status _cds_ft_create(const struct cds_ft_attr *attr,
+		struct cds_ft **result_ft,
 		const struct rcu_flavor_struct *flavor)
 {
 	struct cds_ft *ft;
@@ -3470,11 +3540,15 @@ struct cds_ft *_cds_ft_create(const struct cds_ft_attr *attr,
 	}
 	/* ft->root is NULL */
 	/* max_tree_depth 0 is for pointer to root node */
-	if (key_len != CDS_FT_LEN_VARIABLE && key_len > max_key_len)
-		return NULL;
+	if (key_len != CDS_FT_LEN_VARIABLE && key_len > max_key_len) {
+		*result_ft = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 	ft = calloc(1, sizeof(*ft));
-	if (!ft)
-		return NULL;
+	if (!ft) {
+		*result_ft = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 	ft->key_len = key_len;
 	ft->max_key_len = max_key_len;
 	ft->max_tree_depth = max_key_len + 1;
@@ -3484,7 +3558,8 @@ struct cds_ft *_cds_ft_create(const struct cds_ft_attr *attr,
 		ft->key_map = attr->key_map;
 	else
 		ft->key_map.identity = true;
-	return ft;
+	*result_ft = ft;
+	return CDS_FT_STATUS_OK;
 }
 
 static
@@ -3502,14 +3577,13 @@ void print_debug_fallback_distribution(struct cds_ft *ft)
 }
 
 static
-int ft_final_checks(struct cds_ft *ft)
+void ft_final_checks(struct cds_ft *ft)
 {
 	double fallback_ratio;
 	unsigned long na, nf, nr_fallback;
-	int ret = 0;
 
 	if (!ft_debug_counters())
-		return 0;
+		return;
 
 	fallback_ratio = (double) uatomic_read(&ft->nr_fallback);
 	fallback_ratio /= (double) uatomic_read(&ft->nr_nodes_allocated);
@@ -3529,9 +3603,8 @@ int ft_final_checks(struct cds_ft *ft)
 	if (na != nf) {
 		fprintf(stderr, "[error] Fractal Trie leaked %ld nodes. Allocated: %lu, freed: %lu.\n",
 			(long) na - nf, na, nf);
-		ret = -1;
+		abort();
 	}
-	return ret;
 }
 
 /*
@@ -3539,18 +3612,15 @@ int ft_final_checks(struct cds_ft *ft)
  * on the Fractal Trie while it is being destroyed (ensured by the
  * caller).
  */
-int cds_ft_destroy(struct cds_ft *ft)
+void cds_ft_destroy(struct cds_ft *ft)
 {
 	const struct rcu_flavor_struct *flavor = ft->flavor;
-	int ret;
 
 	/* Wait for in-flight call_rcu free to complete. */
 	flavor->barrier();
 	cds_ft_free_all_arenas(ft);
-	ret = ft_final_checks(ft);
+	ft_final_checks(ft);
 	free(ft);
-
-	return ret;
 }
 
 static
@@ -3766,4 +3836,28 @@ void cds_ft_show_stats(const struct cds_ft *ft, FILE *out)
 		calc_stats_node_recursive(ft, node_flag, &stats, level + 1);
 	}
 	do_show_stats(ft, out, &stats);
+}
+
+const char *cds_ft_status_to_string(enum cds_ft_status status)
+{
+	switch (status) {
+	/* Success return codes (>= 0). */
+	case CDS_FT_STATUS_OK:
+		return "Operation completed successfully";
+	case CDS_FT_STATUS_NOT_FOUND:
+		return "No node found";
+	case CDS_FT_STATUS_DUPLICATE_FOUND:
+		return "Duplicate node exists";
+
+	/* Error return codes (< 0). */
+	case CDS_FT_STATUS_INVALID_ARGUMENT_ERROR:
+		return "Invalid argument";
+	case CDS_FT_STATUS_MEMORY_ERROR:
+		return "Memory allocation failure";
+	case CDS_FT_STATUS_OVERFLOW_ERROR:
+		return "Buffer too small for key length";
+
+	default:
+		return "Unknown status value";
+	}
 }
