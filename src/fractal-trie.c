@@ -2691,12 +2691,6 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		going_up = true;
 	}
 
-	if (!level) {
-		/* Reached the root and could not find a left/right sibling. */
-		*result_node = NULL;
-		return CDS_FT_STATUS_NOT_FOUND;
-	}
-
 	if (!ft_node_internal(node_flag)) {
 		assert(ft->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->key_len);
 		if (result_key_len)
