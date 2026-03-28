@@ -2532,7 +2532,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		abort();	/* Internal library error. */
 	}
 
-	memset(cur_node_depth, 0, (ft->max_tree_depth + 1) * sizeof(cur_node_depth[0]));
+	memset(cur_node_depth, 0, ft->max_tree_depth * sizeof(cur_node_depth[0]));
 	memset(cur_key, 0, ft->max_key_len * sizeof(cur_key[0]));
 	node_flag = rcu_dereference(ft->root);
 	cur_node_depth[0] = node_flag;

@@ -52,7 +52,7 @@
 #define FT_POOL_2D_MASK	(((1U << 5) - 1) << (FT_TYPE_BITS + FT_INTERNAL_BITS))
 
 #define FT_MAX_KEY_LEN	256			/* Maximum key length supported. */
-#define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 2)	/* Maximum depth, including root and leafs */
+#define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 1)	/* Maximum depth, including root. */
 
 /*
  * Entry for NULL node is at index 7 (32-bit) or 8 (64-bit) of the
