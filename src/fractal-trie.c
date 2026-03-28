@@ -3179,18 +3179,27 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * is empty. When detaching an internal node which has no children, but
  * has an associated list of external nodes, it is replaced by a pointer
  * to the external nodes.
+ *
+ * During descent, the detach point pointers are updated when:
+ * - A node with nr_child > 1 is encountered (direct termination point
+ *   for the upward walk).
+ * - A single-child node with external_nodes is encountered (triggers
+ *   termination one level above via prev_external_nodes_found).
+ * - Root level (always a termination point via i == 0).
+ *
+ * The last update during top-down descent corresponds to the deepest
+ * level where the bottom-up walk would terminate, so the pre-tracked
+ * pointers always match the termination level.
  */
 static
 int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **snapshot,
-		struct cds_ft_inode_flag ***snapshot_ptr,
 		uint8_t *snapshot_n,
-		int nr_snapshot)
+		int nr_snapshot,
+		struct cds_ft_inode_flag **detach_node_flag_ptr,
+		struct cds_ft_inode_flag **detach_parent_flag_ptr)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
-	struct cds_ft_inode_flag **node_flag_ptr = NULL,
-			*parent_node_flag = NULL,
-			**parent_node_flag_ptr = NULL;
 	struct cds_ft_inode_flag *iter_node_flag;
 	int ret, i, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
 	uint8_t n = 0;
@@ -3211,10 +3220,6 @@ int ft_detach_node(struct cds_ft *ft,
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
 		metadata_stack[nr_metadata++] = metadata;
-		assert(snapshot_ptr[i + 1]);
-		/* Mutual exclusion prevents concurrent update. */
-		assert(!(ft_node_ptr(*snapshot_ptr[i + 1])
-				!= ft_node_ptr(snapshot[i + 1])));
 
 		assert(metadata->nr_child > 0);
 		if (!prev_external_nodes_found && (metadata->nr_child == 1 && i > 0)) {
@@ -3234,15 +3239,7 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 			metadata_stack[nr_metadata++] = metadata;
 
-			assert(snapshot_ptr[i]);
-			/* Mutual exclusion prevents concurrent update. */
-			assert(!(ft_node_ptr(*snapshot_ptr[i])
-					!= ft_node_ptr(snapshot[i])));
-
-			node_flag_ptr = snapshot_ptr[i + 1];
 			n = snapshot_n[i + 1];
-			parent_node_flag_ptr = snapshot_ptr[i];
-			parent_node_flag = snapshot[i];
 			break;
 		}
 		if (topmost_external_nodes)
@@ -3258,10 +3255,10 @@ int ft_detach_node(struct cds_ft *ft,
 	for (i = 0; i < nr_clear; i++)
 		free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
 
-	iter_node_flag = parent_node_flag;
+	iter_node_flag = *detach_parent_flag_ptr;
 	/* Replace within parent */
 	ret = ft_node_replace_ptr(ft,
-		node_flag_ptr, 		/* Pointer to location to nullify */
+		detach_node_flag_ptr,	/* Pointer to location to nullify */
 		&iter_node_flag,	/* Old new parent ptr in its parent */
 		metadata_stack[nr_branch - 1],	/* of parent */
 		n, (struct cds_ft_inode_flag *) topmost_external_nodes);
@@ -3269,13 +3266,13 @@ int ft_detach_node(struct cds_ft *ft,
 		goto end;
 
 	dbg_printf("ft_detach_node: publish %p instead of %p\n",
-		iter_node_flag, *parent_node_flag_ptr);
-	if (parent_node_flag_ptr == &ft->root) {
-		if (*parent_node_flag_ptr && !iter_node_flag)
+		iter_node_flag, *detach_parent_flag_ptr);
+	if (detach_parent_flag_ptr == &ft->root) {
+		if (*detach_parent_flag_ptr && !iter_node_flag)
 			ft->root_metadata.nr_child--;
 	}
 	/* Update address of parent ptr in its parent */
-	rcu_assign_pointer(*parent_node_flag_ptr, iter_node_flag);
+	rcu_assign_pointer(*detach_parent_flag_ptr, iter_node_flag);
 
 end:
 	return ret;
@@ -3317,11 +3314,17 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 {
 	unsigned int i, key_depth;
 	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
-	struct cds_ft_inode_flag **snapshot_ptr[FT_MAX_DEPTH];
 	uint8_t snapshot_n[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *node_flag;
-	struct cds_ft_inode_flag **prev_node_flag_ptr,
-		**node_flag_ptr;
+	struct cds_ft_inode_flag **node_flag_ptr;
+	/*
+	 * Detach point pointers tracked during descent. These are
+	 * updated at potential upward-walk termination points.
+	 */
+	struct cds_ft_inode_flag **detach_node_flag_ptr,
+			**detach_parent_flag_ptr;
+	struct cds_ft_inode_flag **pp_flag_ptr, **p_flag_ptr;
+	bool pending_detach_node;
 	struct cds_ft_node *iter_node, **iter_node_ptr, **prev_node_ptr, *match;
 	int nr_snapshot, ret, count = 0;
 	const uint8_t *iter_key = key;
@@ -3337,28 +3340,70 @@ retry:
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
 	node_flag = rcu_dereference(ft->root);
-	prev_node_flag_ptr = &ft->root;
 	node_flag_ptr = &ft->root;
+
+	/*
+	 * Initialize detach tracking for root level. The root always
+	 * terminates the upward walk (i == 0), so it serves as the
+	 * default detach point. detach_node_flag_ptr is set after the
+	 * first successful get_nth (pending).
+	 */
+	pp_flag_ptr = NULL;
+	p_flag_ptr = &ft->root;
+	detach_parent_flag_ptr = &ft->root;
+	detach_node_flag_ptr = NULL;
+	pending_detach_node = true;
 
 	/* Iterate on all internal levels */
 	for (i = 1; i < key_depth; i++) {
 		uint8_t key_value;
+		const struct cds_ft_metadata *metadata;
 
 		dbg_printf("cds_ft_remove iter node_flag %p\n",
 				node_flag);
 		if (!ft_node_ptr(node_flag)) {
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
+
+		/*
+		 * Track pointers for the detach point during descent.
+		 * Update when encountering a potential upward-walk
+		 * termination point.
+		 */
+		if (i == 1)
+			metadata = &ft->root_metadata;
+		else
+			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		if (metadata->nr_child > 1) {
+			detach_parent_flag_ptr = p_flag_ptr;
+			pending_detach_node = true;
+		} else if (i > 1 && metadata->external_nodes) {
+			/*
+			 * Single-child node with external_nodes: the
+			 * upward walk terminates one level above via
+			 * prev_external_nodes_found, so save the
+			 * pointers from the previous level.
+			 */
+			detach_node_flag_ptr = p_flag_ptr;
+			detach_parent_flag_ptr = pp_flag_ptr;
+			pending_detach_node = false;
+		}
+
 		key_value = key_to_ordinal(ft, *(iter_key++));
 		snapshot_n[nr_snapshot + 1] = key_value;
-		snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
 		snapshot[nr_snapshot++] = node_flag;
 		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
-		if (node_flag)
-			prev_node_flag_ptr = node_flag_ptr;
-		dbg_printf("cds_ft_remove iter key lookup %u finds node_flag %p, prev_node_flag_ptr %p\n",
+		if (node_flag) {
+			pp_flag_ptr = p_flag_ptr;
+			p_flag_ptr = node_flag_ptr;
+			if (pending_detach_node) {
+				detach_node_flag_ptr = node_flag_ptr;
+				pending_detach_node = false;
+			}
+		}
+		dbg_printf("cds_ft_remove iter key lookup %u finds node_flag %p, node_flag_ptr %p\n",
 				(unsigned int) key_value, node_flag,
-				prev_node_flag_ptr);
+				node_flag_ptr);
 	}
 	/*
 	 * We reached end of key, try to find the node we are trying to
@@ -3438,10 +3483,11 @@ retry:
 			 * Removing last of duplicates. Last snapshot
 			 * does not have metadata (external leafs).
 			 */
-			snapshot_ptr[nr_snapshot] = prev_node_flag_ptr;
 			snapshot[nr_snapshot++] = node_flag;
-			ret = ft_detach_node(ft, snapshot, snapshot_ptr,
-					snapshot_n, nr_snapshot);
+			ret = ft_detach_node(ft, snapshot,
+					snapshot_n, nr_snapshot,
+					detach_node_flag_ptr,
+					detach_parent_flag_ptr);
 		} else {
 			ft_unchain_node(prev_node_ptr, match);
 			ret = 0;
