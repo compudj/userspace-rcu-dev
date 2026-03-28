@@ -496,7 +496,7 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
 static
 bool valid_external_node(struct cds_ft_node *node)
 {
-	return !ft_node_internal((struct cds_ft_inode_flag *) node);
+	return node != NULL && !ft_node_internal((struct cds_ft_inode_flag *) node);
 }
 
 static
@@ -3005,6 +3005,9 @@ int _cds_ft_insert(struct cds_ft *ft,
 	int ret;
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
+		return -EINVAL;
+	/* Expect zeroed next pointer. This catches some double-insert misuses. */
+	if (node->next)
 		return -EINVAL;
 
 	key_depth = key_len + 1;

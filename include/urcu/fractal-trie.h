@@ -56,11 +56,30 @@ enum cds_ft_status {
 /*
  * Duplicate nodes with the same key are chained into a singly-linked
  * list. The last item of this list has a NULL next pointer.
+ * The node needs to be zeroed or initialized with cds_ft_node_init
+ * before being inserted into a Fractal Trie.
+ *
+ * Note that removal from a Fractal Trie does _not_ reset node->next,
+ * because it can still be accessed by concurrent RCU readers. After
+ * removal of a node, the user needs to re-initialize the node after
+ * a grace period (e.g. via call_rcu() or synchronize_rcu()) before
+ * being allowed to re-insert it.
+ *
  * This structure is required to be naturally aligned.
  */
 struct cds_ft_node {
 	struct cds_ft_node *next;
 };
+
+/*
+ * cds_ft_node_init - Initialize Fractal Trie node.
+ * @node: The node.
+ */
+static inline
+void cds_ft_node_init(struct cds_ft_node *node)
+{
+	node->next = NULL;
+}
 
 /*
  * The Fractal Trie keys most significant byte is first, and least
