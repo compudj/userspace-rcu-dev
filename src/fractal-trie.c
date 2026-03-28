@@ -2652,6 +2652,46 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		return iter->status;
 	}
 
+	/*
+	 * Fast path: reuse the iterator's cached path from a prior
+	 * traversal when it is still valid and covers the full key
+	 * depth.  This avoids redundant per-level ft_node_get_nth()
+	 * lookups (which are the expensive, cache-miss-prone part of
+	 * the downward walk).  The caller must hold the RCU read-side
+	 * lock continuously for the cached pointers to remain valid.
+	 */
+	if (iter->path_valid && (ssize_t)iter->path_len >= key_depth &&
+			key_depth > 1) {
+		for (level = 1; level < key_depth; level++) {
+			switch (limit) {
+			case FT_LOOKUP_LIMIT_NONE:
+				ordinal_key[level - 1] =
+					key_to_ordinal(ft, input_key[level - 1]);
+				break;
+			case FT_LOOKUP_LIMIT_FIRST:
+				ordinal_key[level - 1] = 0x00;
+				break;
+			case FT_LOOKUP_LIMIT_LAST:
+				ordinal_key[level - 1] = 0xff;
+				break;
+			}
+		}
+		node_flag = iter->path_node[key_depth - 1];
+		/*
+		 * Reconstruct the loop exit value of @level to match
+		 * what the traversal loop would have produced:
+		 *  - key_depth     if last node is internal (loop ran
+		 *                  to completion),
+		 *  - key_depth - 1 if last node is external, NULL, or
+		 *                  the path ended early (loop broke).
+		 */
+		if (ft_node_ptr(node_flag) && ft_node_internal(node_flag))
+			level = key_depth;
+		else
+			level = key_depth - 1;
+		goto post_traversal;
+	}
+
 	for (level = 1; level < key_depth; level++) {
 		uint8_t key_value;
 
@@ -2677,6 +2717,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			break;
 	}
 
+post_traversal:
 	switch (mode) {
 	case FT_LOOKUP_LE:
 	case FT_LOOKUP_GE:
