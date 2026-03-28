@@ -262,6 +262,7 @@ void cds_ft_free_item(struct cds_ft_metadata *metadata);
 
 //#define DEBUG
 //#define DEBUG_COUNTERS
+#define DEBUG_CLEAR_ITER
 
 #ifdef __linux__
 #include <syscall.h>

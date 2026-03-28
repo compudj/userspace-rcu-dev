@@ -292,6 +292,35 @@ enum ft_direction {
 	FT_RIGHTMOST,
 };
 
+/*
+ * Fractal Trie iterator object. Can be used to keep backtracking state
+ * across API calls. Path use for backtracking requires to keep RCU
+ * read-side lock held across calls.
+ *
+ * The iterator lifetime is bound to the Trie. The Trie must not be
+ * destroyed while iterators to that trie exist.
+ *
+ * The @prefix_len is the length of the key prefix within the key for
+ * traversal under a given key prefix. Iterate over the entire Trie when
+ * @prefix_len=0.
+ */
+struct cds_ft_iter {
+	struct cds_ft *ft;		/* Point to the associated Fractal Trie. */
+	enum cds_ft_status status;	/* Iteration status. */
+	bool path_valid;		/* Whether this iterator has a valid path. */
+	size_t path_len;		/* Populated path_node array length. */
+	size_t key_len;			/* Key length of the current node. */
+	size_t prefix_len;		/* Key prefix length. */
+	struct cds_ft_node *node;	/* Current external node. */
+	/*
+	 * Keep a copy of each rcu_dereferenced nodes encountered within
+	 * traversal along with their associated keys, thus forming a
+	 * path for backtracking.
+	 */
+	struct cds_ft_inode_flag *path_node[FT_MAX_DEPTH];
+	uint8_t key[FT_MAX_KEY_LEN];
+};
+
 #define BITMASK_2(a, b)					\
 	{						\
 		.mask = (1U << (a) | 1U << (b)),	\
@@ -2343,35 +2372,53 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	return ret;
 }
 
-enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
+static
+enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
-		struct cds_ft_node **result_node)
+		struct cds_ft_node **result_node,
+		struct cds_ft_iter *iter,
+		size_t *partial_match_len,
+		struct cds_ft_node **partial_result_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
 	struct cds_ft_inode_flag *node_flag;
-	struct cds_ft_node *found;
+	struct cds_ft_node *found = NULL;
 	unsigned int key_depth, i;
+	enum cds_ft_status status;
+	size_t iter_path_len = 0;
+	bool track_partial = (partial_match_len != NULL);
+	size_t match_len = 0;
+	struct cds_ft_node *match_node = NULL;
 
 	if (!valid_key_len(ft, key_len)) {
-		*result_node = NULL;
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		status = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		goto end;
 	}
 	key_depth = key_len + 1;
 	node_flag = rcu_dereference(ft->root);
 
+	if (iter) {
+		iter->path_node[0] = node_flag;
+		iter_path_len = 1;
+	}
+
 	/* level 0: root node */
 	if (!ft_node_ptr(node_flag)) {
-		*result_node = NULL;
-		return CDS_FT_STATUS_NOT_FOUND;
+		status = CDS_FT_STATUS_NOT_FOUND;
+		goto end;
 	}
 	/* Check if root node is external. */
 	if (!ft_node_internal(node_flag)) {
 		if (key_len) {
-			*result_node = NULL;
-			return CDS_FT_STATUS_NOT_FOUND;
+			/* Root is external but key_len > 0: partial match at root. */
+			if (track_partial)
+				match_node = (struct cds_ft_node *) node_flag;
+			status = CDS_FT_STATUS_NOT_FOUND;
+			goto end;
 		}
-		*result_node = (struct cds_ft_node *) node_flag;
-		return CDS_FT_STATUS_OK;
+		found = (struct cds_ft_node *) node_flag;
+		status = CDS_FT_STATUS_OK;
+		goto end;
 	}
 	/*
 	 * Root node is internal, key length 0 requested, return
@@ -2379,8 +2426,16 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 	 */
 	if (!key_len) {
 		found = rcu_dereference(ft->root_metadata.external_nodes);
-		*result_node = found;
-		return found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+		goto end;
+	}
+
+	/* Consider external node in root metadata as possible partial match. */
+	if (track_partial) {
+		struct cds_ft_node *external_nodes = rcu_dereference(ft->root_metadata.external_nodes);
+
+		if (external_nodes)
+			match_node = external_nodes;
 	}
 
 	for (i = 1; i < key_depth; i++) {
@@ -2391,13 +2446,37 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
 		if (!ft_node_ptr(node_flag)) {
-			*result_node = NULL;
-			return CDS_FT_STATUS_NOT_FOUND;
+			status = CDS_FT_STATUS_NOT_FOUND;
+			goto end;
+		}
+		if (iter) {
+			iter->path_node[i] = node_flag;
+			iter_path_len = i + 1;
 		}
 		/* Found external node before end of key. */
 		if (i < key_depth - 1 && !ft_node_internal(node_flag)) {
-			*result_node = NULL;
-			return CDS_FT_STATUS_NOT_FOUND;
+			if (track_partial) {
+				match_len = i;
+				match_node = (struct cds_ft_node *) node_flag;
+			}
+			status = CDS_FT_STATUS_NOT_FOUND;
+			goto end;
+		}
+		/*
+		 * Track partial: internal node with associated external
+		 * nodes is a candidate for closest prefix match.
+		 * Skip the last level. It is handled after the loop.
+		 */
+		if (track_partial && i < key_depth - 1 && ft_node_internal(node_flag)) {
+			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
+					ft_node_ptr(node_flag), type->order);
+			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+
+			if (external_nodes) {
+				match_len = i;
+				match_node = external_nodes;
+			}
 		}
 	}
 
@@ -2410,106 +2489,126 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
 							type->order);
 		found = rcu_dereference(metadata->external_nodes);
-		*result_node = found;
-		return found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+		if (track_partial && found) {
+			match_len = key_len;
+			match_node = found;
+		}
+	} else {
+		found = (struct cds_ft_node *) node_flag;
+		status = CDS_FT_STATUS_OK;
+		if (track_partial) {
+			match_len = key_len;
+			match_node = found;
+		}
 	}
-	*result_node = (struct cds_ft_node *) node_flag;
-	return CDS_FT_STATUS_OK;
+
+end:
+	if (result_node)
+		*result_node = found;
+	if (iter) {
+		iter->node = found;
+		iter->status = status;
+		iter->path_len = iter_path_len;
+		/*
+		 * The path is valid for backtracking when we
+		 * successfully descended into the trie, even if the
+		 * exact key was not found.
+		 */
+		iter->path_valid = (status == CDS_FT_STATUS_OK);
+	}
+	if (track_partial) {
+		*partial_match_len = match_len;
+		*partial_result_node = match_node;
+	}
+	return status;
+}
+
+enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft_node **result_node)
+{
+	return do_cds_ft_lookup(ft, key, key_len, result_node, NULL, NULL, NULL);
+}
+
+enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	return do_cds_ft_lookup(ft, iter->key, iter->key_len, NULL, iter, NULL, NULL);
+}
+
+enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t *match_len,
+		struct cds_ft_node **result_node)
+{
+	struct cds_ft_node *partial_node = NULL;
+	size_t partial_len = 0;
+
+	do_cds_ft_lookup(ft, key, _key_len, NULL, NULL, &partial_len, &partial_node);
+
+	*match_len = partial_len;
+	*result_node = partial_node;
+	return partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
 enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t *prefix_len,
-		struct cds_ft_node **result_node)
+		struct cds_ft_iter *iter)
 {
-	size_t key_len = ft_key_len(ft, _key_len), match_len = 0;
-	struct cds_ft_node *match_node = NULL;
-	struct cds_ft_inode_flag *node_flag;
-	struct cds_ft_node *external_nodes;
-	struct cds_ft_metadata *metadata;
-	unsigned int key_depth, i;
+	struct cds_ft_node *partial_node = NULL;
+	size_t partial_len = 0;
 
-	if (!valid_key_len(ft, key_len)) {
-		*prefix_len = 0;
-		*result_node = NULL;
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	}
-	key_depth = key_len + 1;
-	node_flag = rcu_dereference(ft->root);
+	/*
+	 * Perform the full lookup (populating the iterator path for
+	 * backtracking) while simultaneously tracking the closest
+	 * ancestor with external nodes for partial-match semantics.
+	 */
+	do_cds_ft_lookup(ft, iter->key, iter->key_len, NULL, iter,
+			 &partial_len, &partial_node);
 
-	/* level 0: root node */
-	if (!ft_node_ptr(node_flag))
-		goto end;
-	/* Return root node if external. */
-	if (!ft_node_internal(node_flag)) {
-		match_node = (struct cds_ft_node *) node_flag;
-		goto end;
-	}
-	/* Consider external node in root metadata as possible match. */
-	external_nodes = rcu_dereference(ft->root_metadata.external_nodes);
-	if (external_nodes)
-		match_node = external_nodes;
-
-	for (i = 1; i < key_depth; i++) {
-		const struct cds_ft_type *type;
-		uint8_t iter_key;
-
-		iter_key = key_to_ordinal(ft, *(key++));
-		node_flag = ft_node_get_nth(node_flag, NULL, iter_key);
-		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
-				(unsigned int) iter_key, node_flag);
-
-		/* Found no child for this key byte. */
-		if (!ft_node_ptr(node_flag))
-			break;
-		/* Found external node. */
-		if (!ft_node_internal(node_flag)) {
-			match_len = i;
-			match_node = (struct cds_ft_node *) node_flag;
-			break;
-		}
-		/*
-		 * Internal node: keep track of closest external node
-		 * ancestor for partial match. This also covers the case
-		 * where the complete match finds an internal node with
-		 * associated external nodes.
-		 */
-		type = &ft_types[ft_node_type(node_flag)];
-		metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
-		external_nodes = rcu_dereference(metadata->external_nodes);
-		if (external_nodes) {
-			match_len = i;
-			match_node = external_nodes;
-		}
-	}
-end:
-	*prefix_len = match_len;
-	*result_node = match_node;
-	return match_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+	/*
+	 * Override the iterator's node and status with the partial-match
+	 * result.
+	 */
+	iter->node = partial_node;
+	iter->key_len = partial_len;
+	iter->path_len = partial_len + 1;
+	iter->status = partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+	return iter->status;
 }
 
+/*
+ * Iterator-based inequality lookup. The input key and key_len are read
+ * from @iter (set via cds_ft_iter_set_key). On success the result key,
+ * key length, node, status, and path are written back into @iter so that
+ * subsequent iteration / backtracking calls can reuse the state.
+ *
+ * @limit overrides the key: FT_LOOKUP_LIMIT_FIRST uses key_len 0,
+ * FT_LOOKUP_LIMIT_LAST uses max_key_len.
+ */
 static
 enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node,
+		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit)
 {
 	ssize_t key_depth, level;
-	struct cds_ft_inode_flag *node_flag, *cur_node_depth[FT_MAX_DEPTH];
+	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_node *ret_node;
-	uint8_t cur_key[FT_MAX_KEY_LEN];
+	uint8_t ordinal_key[FT_MAX_KEY_LEN];
 	enum ft_direction dir;
-	const uint8_t *iter_key = key;
+	const uint8_t input_key[FT_MAX_KEY_LEN];
+	const uint8_t *iter_key;
 	size_t key_len;
 	bool going_up = false;
 
 	switch (limit) {
 	case FT_LOOKUP_LIMIT_NONE:
-		key_len = ft_key_len(ft, _key_len);
+		key_len = ft_key_len(ft, iter->key_len);
 		if (!valid_key_len(ft, key_len)) {
-			*result_node = NULL;
-			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+			iter->node = NULL;
+			iter->path_valid = false;
+			iter->status = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+			return iter->status;
 		}
 		break;
 	case FT_LOOKUP_LIMIT_FIRST:
@@ -2532,15 +2631,25 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		abort();	/* Internal library error. */
 	}
 
-	memset(cur_node_depth, 0, ft->max_tree_depth * sizeof(cur_node_depth[0]));
-	memset(cur_key, 0, ft->max_key_len * sizeof(cur_key[0]));
+	/*
+	 * Snapshot the input key so that iter->key can be overwritten
+	 * with the result key without corrupting the input during the
+	 * backtracking phase (which re-reads the input via iter_key).
+	 */
+	memcpy((uint8_t *) input_key, iter->key, key_len);
+	iter_key = input_key;
+
+	memset(ordinal_key, 0, ft->max_key_len * sizeof(ordinal_key[0]));
 	node_flag = rcu_dereference(ft->root);
-	cur_node_depth[0] = node_flag;
+	iter->path_node[0] = node_flag;
 
 	/* level 0: root node */
 	if (!ft_node_ptr(node_flag)) {
-		*result_node = NULL;
-		return CDS_FT_STATUS_NOT_FOUND;
+		iter->node = NULL;
+		iter->path_valid = true;
+		iter->path_len = 1;
+		iter->status = CDS_FT_STATUS_NOT_FOUND;
+		return iter->status;
 	}
 
 	for (level = 1; level < key_depth; level++) {
@@ -2560,8 +2669,8 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		node_flag = ft_node_get_nth(node_flag, NULL, key_value);
 		if (!ft_node_ptr(node_flag))
 			break;
-		cur_key[level - 1] = key_value;
-		cur_node_depth[level] = node_flag;
+		ordinal_key[level - 1] = key_value;
+		iter->path_node[level] = node_flag;
 		dbg_printf("cds_ft_lookup_inequality iter key lookup %u finds node_flag %p\n",
 				(unsigned int) key_value, node_flag);
 		if (!ft_node_internal(node_flag))
@@ -2585,16 +2694,13 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			}
 			if (external_nodes) {
 				/* End of key lookup succeded. We got an equal match. */
-				if (result_key_len)
-					*result_key_len = key_len;
-				if (key_len > result_key_max_len) {
-					*result_node = NULL;
-					return CDS_FT_STATUS_OVERFLOW_ERROR;
-				}
-				if (result_key && result_key != key)
-					memcpy(result_key, key, key_len);
-				*result_node = external_nodes;
-				return CDS_FT_STATUS_OK;
+				iter->key_len = key_len;
+				memcpy(iter->key, input_key, key_len);
+				iter->node = external_nodes;
+				iter->path_valid = true;
+				iter->path_len = level + 1;
+				iter->status = CDS_FT_STATUS_OK;
+				return iter->status;
 			}
 		}
 		break;
@@ -2610,11 +2716,11 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		level = key_depth - 1;
 
 	/* Ensure iter_key is exactly at the position matching the level we stopped at. */
-	iter_key = key + level;
+	iter_key = input_key + level;
 
 	/*
 	 * Find highest value left/right of current node.
-	 * Current node is cur_node_depth[level].
+	 * Current node is iter->path_node[level].
 	 * Start at current level. If we cannot find any key left/right
 	 * of ours, go one level up, seek highest value left/right of
 	 * current (recursively), and when we find one, get the
@@ -2641,27 +2747,23 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		 * inequality and encountering an external node when
 		 * going upward.
 		 */
-		if (going_up && dir == FT_LEFT && ft_node_internal(cur_node_depth[level])) {
-			const struct cds_ft_type *type = &ft_types[ft_node_type(cur_node_depth[level])];
-			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(cur_node_depth[level]), type->order);
+		if (going_up && dir == FT_LEFT && ft_node_internal(iter->path_node[level])) {
+			const struct cds_ft_type *type = &ft_types[ft_node_type(iter->path_node[level])];
+			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(iter->path_node[level]), type->order);
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
-				assert(ft->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->key_len);
-				if (result_key_len)
-					*result_key_len = level;
-				if ((size_t) level > result_key_max_len) {
-					*result_node = NULL;
-					return CDS_FT_STATUS_OVERFLOW_ERROR;
-				}
-				if (result_key) {
-					int i;
+				int j;
 
-					for (i = 0; i < level; i++)
-						*(result_key++) = ordinal_to_key(ft, cur_key[i]);
-				}
-				*result_node = external_nodes;
-				return CDS_FT_STATUS_OK;
+				assert(ft->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->key_len);
+				iter->key_len = level;
+				for (j = 0; j < level; j++)
+					iter->key[j] = ordinal_to_key(ft, ordinal_key[j]);
+				iter->node = external_nodes;
+				iter->path_valid = true;
+				iter->path_len = level + 1;
+				iter->status = CDS_FT_STATUS_OK;
+				return iter->status;
 			}
 		}
 
@@ -2678,35 +2780,34 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		}
 		/*
 		 * Standard sibling lookup. Parent is level - 1. We are
-		 * looking for sibling of the byte at cur_key[level - 1].
+		 * looking for sibling of the byte at ordinal_key[level - 1].
 		 */
-		node_flag = ft_node_get_leftright(cur_node_depth[level - 1],
-				key_value, &cur_key[level - 1], dir);
+		node_flag = ft_node_get_leftright(iter->path_node[level - 1],
+				key_value, &ordinal_key[level - 1], dir);
 		dbg_printf("cds_ft_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
-				(unsigned int) key_value, (unsigned int) cur_key[level - 1],
+				(unsigned int) key_value, (unsigned int) ordinal_key[level - 1],
 				node_flag);
 		/* If found left/right sibling, find rightmost/leftmost child. */
-		if (ft_node_ptr(node_flag))
+		if (ft_node_ptr(node_flag)) {
+			/* Record the sibling in the path. */
+			iter->path_node[level] = node_flag;
 			break;
+		}
 		going_up = true;
 	}
 
 	if (!ft_node_internal(node_flag)) {
-		assert(ft->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->key_len);
-		if (result_key_len)
-			*result_key_len = level;
-		if ((size_t) level > result_key_max_len) {
-			*result_node = NULL;
-			return CDS_FT_STATUS_OVERFLOW_ERROR;
-		}
-		if (result_key) {
-			int i;
+		int j;
 
-			for (i = 0; i < level; i++)
-				*(result_key++) = ordinal_to_key(ft, cur_key[i]);
-		}
-		*result_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
-		return CDS_FT_STATUS_OK;
+		assert(ft->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->key_len);
+		iter->key_len = level;
+		for (j = 0; j < level; j++)
+			iter->key[j] = ordinal_to_key(ft, ordinal_key[j]);
+		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+		iter->path_valid = true;
+		iter->path_len = level + 1;
+		iter->status = CDS_FT_STATUS_OK;
+		return iter->status;
 	}
 
 	level++;
@@ -2753,9 +2854,10 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		/* Return external node. */
 		if (!ft_node_internal(node_flag))
 			break;
-		node_flag = ft_node_get_minmax(node_flag, &cur_key[level - 1], dir);
+		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir);
+		iter->path_node[level] = node_flag;
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
-				(unsigned int) cur_key[level - 1], node_flag);
+				(unsigned int) ordinal_key[level - 1], node_flag);
 		if (!ft_node_internal(node_flag))
 			break;
 	}
@@ -2769,83 +2871,91 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 */
 	assert(level <= (int) ft->max_key_len);
 end:
-	if (result_key_len)
-		*result_key_len = level;
-	if ((size_t) level > result_key_max_len) {
-		*result_node = NULL;
-		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	}
-	if (result_key) {
-		int i;
+	{
+		int j;
 
-		for (i = 0; i < level; i++)
-			*(result_key++) = ordinal_to_key(ft, cur_key[i]);
+		iter->key_len = level;
+		for (j = 0; j < level; j++)
+			iter->key[j] = ordinal_to_key(ft, ordinal_key[j]);
+		iter->node = ret_node;
+		iter->path_valid = true;
+		iter->path_len = level + 1;
+		iter->status = ret_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+		return iter->status;
 	}
-	*result_node = ret_node;
-	return ret_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
-enum cds_ft_status cds_ft_lookup_lower_equal(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node)
-
+/*
+ * Iterator-based inequality lookup public API.
+ * The caller sets the key via cds_ft_iter_set_key() before calling.
+ * On return the iterator holds the result key, key length, node, path,
+ * and status.
+ */
+enum cds_ft_status cds_ft_lookup_le(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
 {
-	dbg_printf("cds_ft_lookup_lower_equal\n");
-	return cds_ft_lookup_inequality(ft, key, key_len,
-			result_key, result_key_max_len, result_key_len, result_node,
+	dbg_printf("cds_ft_lookup_le\n");
+	return cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_LE, FT_LOOKUP_LIMIT_NONE);
 }
 
-enum cds_ft_status cds_ft_lookup_greater_equal(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node)
+enum cds_ft_status cds_ft_lookup_ge(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
 {
-	dbg_printf("cds_ft_lookup_greater_equal\n");
-	return cds_ft_lookup_inequality(ft, key, key_len,
-		result_key, result_key_max_len, result_key_len, result_node,
-		FT_LOOKUP_GE, FT_LOOKUP_LIMIT_NONE);
+	dbg_printf("cds_ft_lookup_ge\n");
+	return cds_ft_lookup_inequality(ft, iter,
+			FT_LOOKUP_GE, FT_LOOKUP_LIMIT_NONE);
 }
 
-enum cds_ft_status cds_ft_lookup_lower_than(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node)
+enum cds_ft_status cds_ft_lookup_lt(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
 {
-	dbg_printf("cds_ft_lookup_lower_than\n");
-	return cds_ft_lookup_inequality(ft, key, key_len,
-		result_key, result_key_max_len, result_key_len, result_node,
-		FT_LOOKUP_LT, FT_LOOKUP_LIMIT_NONE);
+	dbg_printf("cds_ft_lookup_lt\n");
+	return cds_ft_lookup_inequality(ft, iter,
+			FT_LOOKUP_LT, FT_LOOKUP_LIMIT_NONE);
 }
 
-enum cds_ft_status cds_ft_lookup_greater_than(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node)
+enum cds_ft_status cds_ft_lookup_gt(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
 {
-	dbg_printf("cds_ft_lookup_greater_than\n");
-	return cds_ft_lookup_inequality(ft, key, key_len,
-		result_key, result_key_max_len, result_key_len, result_node,
-		FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE);
+	dbg_printf("cds_ft_lookup_gt\n");
+	return cds_ft_lookup_inequality(ft, iter,
+			FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE);
 }
 
 enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node)
+		struct cds_ft_iter *iter)
 {
-	return cds_ft_lookup_inequality(ft, NULL, 0,
-		result_key, result_key_max_len, result_key_len, result_node,
-		FT_LOOKUP_GE, FT_LOOKUP_LIMIT_FIRST);
+	size_t saved_key_len = iter->key_len;
+	enum cds_ft_status status;
+
+	dbg_printf("cds_ft_lookup_first\n");
+	/*
+	 * LIMIT_FIRST overrides key_len to 0 internally.
+	 * Temporarily clear key_len so the iterator state is
+	 * consistent, then restore on error.
+	 */
+	iter->key_len = 0;
+	status = cds_ft_lookup_inequality(ft, iter,
+			FT_LOOKUP_GE, FT_LOOKUP_LIMIT_FIRST);
+	if (status < 0)
+		iter->key_len = saved_key_len;
+	return status;
 }
 
 enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node)
+		struct cds_ft_iter *iter)
 {
-	return cds_ft_lookup_inequality(ft, NULL, 0,
-		result_key, result_key_max_len, result_key_len, result_node,
-		FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);
+	size_t saved_key_len = iter->key_len;
+	enum cds_ft_status status;
+
+	dbg_printf("cds_ft_lookup_last\n");
+	iter->key_len = ft->max_key_len;
+	status = cds_ft_lookup_inequality(ft, iter,
+			FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);
+	if (status < 0)
+		iter->key_len = saved_key_len;
+	return status;
 }
 
 /*
@@ -3904,4 +4014,106 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 	default:
 		return "Unknown status value";
 	}
+}
+
+enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **result_iter)
+{
+	struct cds_ft_iter *iter = calloc(1, sizeof(struct cds_ft_iter));
+
+	if (!iter) {
+		*result_iter = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+	iter->ft = ft;
+	*result_iter = iter;
+	return CDS_FT_STATUS_OK;
+}
+
+void cds_ft_iter_destroy(struct cds_ft_iter *iter)
+{
+	free(iter);
+}
+
+enum cds_ft_status cds_ft_iter_status(const struct cds_ft_iter *iter)
+{
+	return iter->status;
+}
+
+enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
+{
+	*result_key_len = iter->key_len;
+	if (iter->key_len > result_key_max_len)
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
+	memcpy(result_key, iter->key, iter->key_len);
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_iter_get_prefix(struct cds_ft_iter *iter,
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
+{
+	*result_key_len = iter->prefix_len;
+	if (iter->prefix_len > result_key_max_len)
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
+	memcpy(result_key, iter->key, iter->prefix_len);
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *key, size_t key_len)
+{
+	bool subset = false;
+
+	if (key_len > iter->ft->max_key_len)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (key_len <= iter->key_len && !memcmp(key, iter->key, key_len))
+		subset = true;
+	/*
+	 * If new key is a subset of current key, the path stays valid,
+	 * otherwise invalidate the path.
+	 */
+	if (!subset) {
+		memcpy(iter->key, key, key_len);
+		iter->path_valid = false;
+		iter->path_len = 0;
+	} else {
+		iter->path_len = key_len + 1;
+	}
+	iter->key_len = key_len;
+	return CDS_FT_STATUS_OK;
+}
+
+/*
+ * The prefix is a subset of the current key. Set the key before setting
+ * the prefix length.
+ */
+enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t prefix_len)
+{
+	if (prefix_len > iter->key_len)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	iter->prefix_len = prefix_len;
+	return CDS_FT_STATUS_OK;
+}
+
+void cds_ft_iter_reset(struct cds_ft_iter *iter)
+{
+	iter->path_valid = false;
+	iter->status = CDS_FT_STATUS_OK;
+	iter->path_len = 0;
+	iter->key_len = 0;
+	iter->prefix_len = 0;
+#ifdef DEBUG_CLEAR_ITER
+	/* Reset to 0 for debugging. */
+	memset(iter->path_node, 0, sizeof(iter->path_node));
+	memset(iter->key, 0, sizeof(iter->key));
+#endif
+}
+
+void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
+{
+	memcpy(dst, src, sizeof(*dst));
+}
+
+struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
+{
+	return iter->node;
 }

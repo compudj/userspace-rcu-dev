@@ -26,6 +26,7 @@ extern "C" {
 /* Opaque types forward declarations. */
 struct cds_ft;
 struct cds_ft_attr;
+struct cds_ft_iter;
 
 /* Fractal Trie lookup and mutation constants. */
 #define CDS_FT_LEN_DEFAULT		SIZE_MAX
@@ -87,17 +88,11 @@ void cds_ft_node_init(struct cds_ft_node *node)
  */
 
 /*
- * Output pointer convention
- * -------------------------
- * All functions write to their output pointers unconditionally, even
- * on error. On error or not-found, node output pointers are set to
- * NULL. This guarantees that callers can rely on the output pointer
- * value without checking the return status first, which is
- * particularly useful for loop constructs.
+ * Key-based lookup API
  */
 
 /*
- * cds_ft_lookup - Look up a node by key.
+ * cds_ft_lookup_key - Look up a node by key.
  * @ft: The Fractal Trie.
  * @key: Pointer to the key (may be NULL if @key_len is 0).
  * @key_len: Key length in bytes.
@@ -114,21 +109,21 @@ void cds_ft_node_init(struct cds_ft_node *node)
  * An RCU read-side lock must be held while calling this function and
  * while accessing the returned node.
  */
-enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
+enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		struct cds_ft_node **result_node);
 
 /*
- * cds_ft_lookup_partial - Look up by key, find closest partial match.
+ * cds_ft_lookup_partial_key - Look up by key, find closest partial match.
  * @ft: The Fractal Trie.
  * @key: Key to look up (may be NULL if @key_len is 0).
  * @key_len: Key length in bytes:
  * - > 0: Explicit key length (must not exceed trie's max length).
  * - 0: NIL key (zero-length).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
- * @prefix_len: Length of the matching prefix key (output).
- *              The returned node's key is the first @prefix_len
- *              bytes of @key.
+ * @match_len: Length of the matching sub-key (output).
+ *             The returned node's key is the first @match_len
+ *             bytes of @key.
  * @result_node: Node output. Set to the first node of a duplicate chain if
  *               a match is found. If no node matches the full key, set to
  *               the closest ancestor (partial match). Set to NULL if no
@@ -141,215 +136,215 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
  * An RCU read-side lock must be held while calling this function and
  * while accessing the returned node.
  */
+enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t *match_len,
+		struct cds_ft_node **result_node);
+
+/*
+ * Iterator-based lookup API
+ *
+ * These functions use a cds_ft_iter to hold input key, output key,
+ * result node, status, and backtracking state. Set the input key
+ * with cds_ft_iter_set_key() before calling. On return, the iterator
+ * holds the result key (cds_ft_iter_get_key()), result node
+ * (cds_ft_iter_node()), status (cds_ft_iter_status()), and
+ * backtracking path. The status is also returned by the function for
+ * convenience.
+ *
+ * The RCU read-side lock must be held while calling these functions
+ * and while accessing the returned node or reusing the iterator path.
+ */
+
+/*
+ * cds_ft_lookup - Look up a node by key (iterator-based).
+ * @ft: The Fractal Trie.
+ * @iter: Iterator with key set via cds_ft_iter_set_key().
+ *        On return, the iterator holds the result node, status,
+ *        and backtracking path.
+ *
+ * Returns CDS_FT_STATUS_OK on success (match found),
+ * CDS_FT_STATUS_NOT_FOUND if no match, or a negative cds_ft_status
+ * on error. The status is also stored in the iterator
+ * (cds_ft_iter_status()).
+ */
+enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
+		struct cds_ft_iter *iter);
+
+/*
+ * cds_ft_lookup_partial - Look up by key, find closest partial match
+ *                         (iterator-based).
+ * @ft: The Fractal Trie.
+ * @iter: Iterator with key set via cds_ft_iter_set_key().
+ *        On return, the iterator holds the result node, status,
+ *        and backtracking path. The iterator's key length is set to
+ *        the matching sub-key length, and the result node is the
+ *        closest ancestor with external nodes.
+ *
+ * Returns CDS_FT_STATUS_OK on success (match found),
+ * CDS_FT_STATUS_NOT_FOUND if no match, or a negative cds_ft_status
+ * on error. The status is also stored in the iterator
+ * (cds_ft_iter_status()).
+ */
 enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len, size_t *prefix_len,
-		struct cds_ft_node **result_node);
+		struct cds_ft_iter *iter);
 
 /*
- * cds_ft_lookup_lower_equal - Look up first node with key <= @key.
+ * cds_ft_lookup_le - Look up first node with key <= iterator key.
  * @ft: The Fractal Trie.
- * @key: Key to look up (may be NULL if @key_len is 0).
- * @key_len: Key length in bytes:
- * - > 0: Explicit key length (must not exceed trie's max length).
- * - 0: NIL key (zero-length).
- * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
- * @result_key: Found key (output buffer).
- * @result_key_max_len: Size of the @result_key buffer.
- * @result_key_len: Length of the found key (output).
- * @result_node: Node output. Set to the first node of a duplicate chain
- *               if found, or NULL if not found or on error.
+ * @iter: Iterator with key set via cds_ft_iter_set_key().
+ *        On return, the iterator holds the result key, key length,
+ *        node, status, and backtracking path.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
- * no node with key <= @key exists, or a negative cds_ft_status on
- * error.
- *
- * An RCU read-side lock must be held while calling this function and
- * while accessing the returned node.
+ * no node with key <= the iterator key exists, or a negative
+ * cds_ft_status on error. The status is also stored in the iterator
+ * (cds_ft_iter_status()).
  */
-enum cds_ft_status cds_ft_lookup_lower_equal(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node);
+enum cds_ft_status cds_ft_lookup_le(struct cds_ft *ft,
+		struct cds_ft_iter *iter);
 
 /*
- * cds_ft_lookup_greater_equal - Look up first node with key >= @key.
+ * cds_ft_lookup_ge - Look up first node with key >= iterator key.
  * @ft: The Fractal Trie.
- * @key: Key to look up (may be NULL if @key_len is 0).
- * @key_len: Key length in bytes:
- * - > 0: Explicit key length (must not exceed trie's max length).
- * - 0: NIL key (zero-length).
- * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
- * @result_key: Found key (output buffer).
- * @result_key_max_len: Size of the @result_key buffer.
- * @result_key_len: Length of the found key (output).
- * @result_node: Node output. Set to the first node of a duplicate chain
- *               if found, or NULL if not found or on error.
+ * @iter: Iterator with key set via cds_ft_iter_set_key().
+ *        On return, the iterator holds the result key, key length,
+ *        node, status, and backtracking path.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
- * no node with key >= @key exists, or a negative cds_ft_status on
- * error.
- *
- * An RCU read-side lock must be held while calling this function and
- * while accessing the returned node.
+ * no node with key >= the iterator key exists, or a negative
+ * cds_ft_status on error. The status is also stored in the iterator
+ * (cds_ft_iter_status()).
  */
-enum cds_ft_status cds_ft_lookup_greater_equal(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node);
+enum cds_ft_status cds_ft_lookup_ge(struct cds_ft *ft,
+		struct cds_ft_iter *iter);
 
 /*
- * cds_ft_lookup_lower_than - Look up first node with key < @key.
+ * cds_ft_lookup_lt - Look up first node with key < iterator key.
  * @ft: The Fractal Trie.
- * @key: Key to look up (may be NULL if @key_len is 0).
- * @key_len: Key length in bytes:
- * - > 0: Explicit key length (must not exceed trie's max length).
- * - 0: NIL key (zero-length).
- * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
- * @result_key: Found key (output buffer).
- * @result_key_max_len: Size of the @result_key buffer.
- * @result_key_len: Length of the found key (output).
- * @result_node: Node output. Set to the first node of a duplicate chain
- *               if found, or NULL if not found or on error.
+ * @iter: Iterator with key set via cds_ft_iter_set_key().
+ *        On return, the iterator holds the result key, key length,
+ *        node, status, and backtracking path.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
- * no node with key < @key exists, or a negative cds_ft_status on
- * error.
- *
- * An RCU read-side lock must be held while calling this function and
- * while accessing the returned node.
+ * no node with key < the iterator key exists, or a negative
+ * cds_ft_status on error. The status is also stored in the iterator
+ * (cds_ft_iter_status()).
  */
-enum cds_ft_status cds_ft_lookup_lower_than(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node);
+enum cds_ft_status cds_ft_lookup_lt(struct cds_ft *ft,
+		struct cds_ft_iter *iter);
 
 /*
- * cds_ft_lookup_greater_than - Look up first node with key > @key.
+ * cds_ft_lookup_gt - Look up first node with key > iterator key.
  * @ft: The Fractal Trie.
- * @key: Key to look up (may be NULL if @key_len is 0).
- * @key_len: Key length in bytes:
- * - > 0: Explicit key length (must not exceed trie's max length).
- * - 0: NIL key (zero-length).
- * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
- * @result_key: Found key (output buffer).
- * @result_key_max_len: Size of the @result_key buffer.
- * @result_key_len: Length of the found key (output).
- * @result_node: Node output. Set to the first node of a duplicate chain
- *          if found, or NULL if not found or on error.
+ * @iter: Iterator with key set via cds_ft_iter_set_key().
+ *        On return, the iterator holds the result key, key length,
+ *        node, status, and backtracking path.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
- * no node with key > @key exists, or a negative cds_ft_status on
- * error.
- *
- * An RCU read-side lock must be held while calling this function and
- * while accessing the returned node.
+ * no node with key > the iterator key exists, or a negative
+ * cds_ft_status on error. The status is also stored in the iterator
+ * (cds_ft_iter_status()).
  */
-enum cds_ft_status cds_ft_lookup_greater_than(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node);
+enum cds_ft_status cds_ft_lookup_gt(struct cds_ft *ft,
+		struct cds_ft_iter *iter);
 
 /*
- * cds_ft_next - Find the next lexicographical node.
- * Uses the provided key/len as the current position.
+ * cds_ft_lookup_first - Look up the node with the lowest key.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator. On return, holds the result key, key length,
+ *        node, status, and backtracking path.
+ *
+ * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
+ * the trie is empty, or a negative cds_ft_status on error. The
+ * status is also stored in the iterator (cds_ft_iter_status()).
+ */
+enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
+		struct cds_ft_iter *iter);
+
+/*
+ * cds_ft_lookup_last - Look up the node with the greatest key.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator. On return, holds the result key, key length,
+ *        node, status, and backtracking path.
+ *
+ * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
+ * the trie is empty, or a negative cds_ft_status on error. The
+ * status is also stored in the iterator (cds_ft_iter_status()).
+ */
+enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
+		struct cds_ft_iter *iter);
+
+/*
+ * cds_ft_next - Find the next node in lexicographical order.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator positioned at the current node.
+ *        On return, advanced to the next node. The iterator holds
+ *        the result key, key length, node, status, and backtracking
+ *        path.
+ *
+ * Equivalent to cds_ft_lookup_gt().
  */
 static inline
 enum cds_ft_status cds_ft_next(struct cds_ft *ft,
-		uint8_t *key, size_t key_max_len, size_t *key_len,
-		struct cds_ft_node **result_node)
+		struct cds_ft_iter *iter)
 {
-	return cds_ft_lookup_greater_than(ft, key, *key_len, key,
-			key_max_len, key_len, result_node);
+	return cds_ft_lookup_gt(ft, iter);
 }
 
 /*
- * cds_ft_prev - Find the previous lexicographical node.
- * Uses the provided key/len as the current position.
+ * cds_ft_prev - Find the previous node in lexicographical order.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator positioned at the current node.
+ *        On return, moved to the previous node. The iterator holds
+ *        the result key, key length, node, status, and backtracking
+ *        path.
+ *
+ * Equivalent to cds_ft_lookup_lt().
  */
 static inline
 enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
-		uint8_t *key, size_t key_max_len, size_t *key_len,
-		struct cds_ft_node **result_node)
+		struct cds_ft_iter *iter)
 {
-	return cds_ft_lookup_lower_than(ft, key, *key_len, key,
-			key_max_len, key_len, result_node);
+	return cds_ft_lookup_lt(ft, iter);
 }
 
 /*
- * cds_ft_lookup_first - Look up node with lowest key.
- * @ft: The Fractal Trie.
- * @result_key: Found key (output buffer).
- * @result_key_max_len: Size of the @result_key buffer.
- * @result_key_len: Result key length (output).
- * @result_node: Node output. Set to the first node of a duplicate chain
- *               if found, or NULL if the trie is empty or on error.
- *
- * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
- * the trie is empty, or a negative cds_ft_status on error.
- *
- * An RCU read-side lock must be held while calling this function and
- * while accessing the returned node.
- */
-enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node);
-
-/*
- * cds_ft_lookup_last - Look up node with greatest key.
- * @ft: The Fractal Trie.
- * @result_key: Found key (output buffer).
- * @result_key_max_len: Size of the @result_key buffer.
- * @result_key_len: Result key length (output).
- * @result_node: Node output. Set to the first node of a duplicate chain
- *               if found, or NULL if the trie is empty or on error.
- *
- * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
- * the trie is empty, or a negative cds_ft_status on error.
- *
- * An RCU read-side lock must be held while calling this function and
- * while accessing the returned node.
- */
-enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
-		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len,
-		struct cds_ft_node **result_node);
-
-/*
  * cds_ft_for_each - Iterate through all nodes in key order.
- * @ft: The Fractal Trie.
- * @node: struct cds_ft_node *, loop cursor.
- * @key: uint8_t[], key buffer used across iterations.
- * @key_max_len: Size of the @key buffer.
- * @key_len: size_t, tracks the current key length across iterations.
- * @status: enum cds_ft_status, set by each iteration step.
- *          Check (status < 0) after the loop to detect errors.
+ * @ft: The Fractal Trie (struct cds_ft *).
+ * @iter: Iterator (struct cds_ft_iter *), used as loop cursor.
+ *
+ * The iterator holds the current key (cds_ft_iter_get_key()),
+ * node (cds_ft_iter_node()), and status (cds_ft_iter_status()) at
+ * each step. Check (cds_ft_iter_status(iter) < 0) after the loop
+ * to detect errors.
  *
  * An RCU read-side lock must be held while using this macro.
  */
-#define cds_ft_for_each(ft, node, key, key_max_len, key_len, status)	\
-	for ((status) = cds_ft_lookup_first((ft), (key), (key_max_len),	\
-				&(key_len), &(node));			\
-			(node);						\
-			(status) = cds_ft_next((ft), (key),		\
-				(key_max_len), &(key_len), &(node)))
+#define cds_ft_for_each(ft, iter)					\
+	for (cds_ft_lookup_first((ft), (iter));				\
+			cds_ft_iter_node(iter);				\
+			cds_ft_next((ft), (iter)))
 
 /*
  * cds_ft_for_each_reverse - Iterate through all nodes in reverse key order.
- * @ft: The Fractal Trie.
- * @node: struct cds_ft_node *, loop cursor.
- * @key: uint8_t[], key buffer used across iterations.
- * @key_max_len: Size of the @key buffer.
- * @key_len: size_t, tracks the current key length across iterations.
- * @status: enum cds_ft_status, set by each iteration step.
- *          Check (status < 0) after the loop to detect errors.
+ * @ft: The Fractal Trie (struct cds_ft *).
+ * @iter: Iterator (struct cds_ft_iter *), used as loop cursor.
+ *
+ * The iterator holds the current key (cds_ft_iter_get_key()),
+ * node (cds_ft_iter_node()), and status (cds_ft_iter_status()) at
+ * each step. Check (cds_ft_iter_status(iter) < 0) after the loop
+ * to detect errors.
  *
  * An RCU read-side lock must be held while using this macro.
  */
-#define cds_ft_for_each_reverse(ft, node, key, key_max_len, key_len, status) \
-	for ((status) = cds_ft_lookup_last((ft), (key), (key_max_len),	\
-				&(key_len), &(node));			\
-			(node);						\
-			(status) = cds_ft_prev((ft), (key),		\
-				(key_max_len), &(key_len), &(node)))
+#define cds_ft_for_each_reverse(ft, iter)				\
+	for (cds_ft_lookup_last((ft), (iter));				\
+			cds_ft_iter_node(iter);				\
+			cds_ft_prev((ft), (iter)))
+
+/*
+ * Mutation API
+ */
 
 /*
  * cds_ft_insert - Insert @node at @key, allowing duplicates.
@@ -421,6 +416,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		struct cds_ft_node *node);
 
+/*
+ * Trie lifecycle
+ */
+
 enum cds_ft_status _cds_ft_create(const struct cds_ft_attr *attr,
 		struct cds_ft **result_ft,
 		const struct rcu_flavor_struct *flavor);
@@ -458,6 +457,10 @@ enum cds_ft_status cds_ft_create(const struct cds_ft_attr *attr,
 void cds_ft_destroy(struct cds_ft *ft);
 
 /*
+ * Trie properties
+ */
+
+/*
  * cds_ft_key_len - Return the key length of a Fractal Trie.
  * @ft: The Fractal Trie.
  *
@@ -493,6 +496,10 @@ size_t cds_ft_max_key_len(const struct cds_ft *ft);
  * the key map is the identity function.
  */
 enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key);
+
+/*
+ * Attributes
+ */
 
 /*
  * cds_ft_attr_create - Create a Fractal Trie attribute structure.
@@ -550,6 +557,127 @@ enum cds_ft_status cds_ft_attr_set_max_key_len(struct cds_ft_attr *attr, size_t 
  */
 enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
 		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key);
+
+/*
+ * Iterator management
+ *
+ * It is recommended that the user keeps a per-thread pool of
+ * iterators in a TLS variable to minimize memory allocation.
+ */
+
+/*
+ * cds_ft_iter_create - Allocate and initialize an iterator.
+ * @ft: The Fractal Trie this iterator is bound to.
+ * @result_iter: Iterator output. Set to the newly created iterator
+ *               on success, or NULL on error.
+ *
+ * The iterator lifetime is bound to the Trie. The Trie must not be
+ * destroyed while iterators to that trie exist.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
+ * on error.
+ */
+enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **result_iter);
+
+/*
+ * cds_ft_iter_destroy - Free an iterator.
+ * @iter: The iterator to free.
+ */
+void cds_ft_iter_destroy(struct cds_ft_iter *iter);
+
+/*
+ * cds_ft_iter_get_key - Retrieve the current key from an iterator.
+ * @iter: The iterator.
+ * @result_key: Output buffer for the key.
+ * @result_key_max_len: Size of the @result_key buffer.
+ * @result_key_len: Length of the key written (output).
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the buffer is too small.
+ */
+enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len);
+
+/*
+ * cds_ft_iter_get_prefix - Retrieve the current prefix from an iterator.
+ * @iter: The iterator.
+ * @result_key: Output buffer for the prefix.
+ * @result_key_max_len: Size of the @result_key buffer.
+ * @result_key_len: Length of the prefix written (output).
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the buffer is too small.
+ */
+enum cds_ft_status cds_ft_iter_get_prefix(struct cds_ft_iter *iter,
+		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len);
+
+/*
+ * cds_ft_iter_set_key - Set the key for the next lookup operation.
+ * @iter: The iterator.
+ * @key: The key to set.
+ * @key_len: Key length in bytes.
+ *
+ * If the new key is a prefix of the current iterator key, the
+ * internal backtracking path remains valid; otherwise it is
+ * invalidated.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
+ * on error.
+ */
+enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *key, size_t key_len);
+
+/*
+ * cds_ft_iter_set_prefix_len - Set the prefix length for iteration.
+ * @iter: The iterator.
+ * @prefix_len: Length of the key prefix for scoped traversal.
+ *              Must be <= the current key length (set the key first).
+ *              Set to 0 to iterate over the entire trie.
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @prefix_len
+ * exceeds the current key length.
+ */
+enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t prefix_len);
+
+/*
+ * cds_ft_iter_reset - Reset an iterator to its initial state.
+ * @iter: The iterator.
+ *
+ * Clears path, key, prefix, status, and node. The iterator remains
+ * bound to its Fractal Trie.
+ */
+void cds_ft_iter_reset(struct cds_ft_iter *iter);
+
+/*
+ * cds_ft_iter_copy - Copy an iterator's state.
+ * @dst: Destination iterator.
+ * @src: Source iterator.
+ *
+ * Both iterators must be bound to the same Fractal Trie.
+ */
+void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src);
+
+/*
+ * cds_ft_iter_status - Return the status of the last operation on an iterator.
+ * @iter: The iterator.
+ *
+ * Returns the cds_ft_status set by the last lookup or iteration
+ * step performed on this iterator. Check (ret < 0) to detect errors.
+ */
+enum cds_ft_status cds_ft_iter_status(const struct cds_ft_iter *iter);
+
+/*
+ * cds_ft_iter_node - Return the current node from an iterator.
+ * @iter: The iterator.
+ *
+ * Returns the node found by the last lookup, or NULL if the last
+ * lookup found nothing.
+ */
+struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter);
+
+/*
+ * Key conversion helpers
+ */
 
 /*
  * cds_ft_key_to_u64 - Convert a Fractal Trie key to an unsigned 64-bit integer.
@@ -619,6 +747,10 @@ uint32_t cds_ft_key_to_u32(const struct cds_ft *ft, const uint8_t *key, size_t k
 void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key, size_t key_len);
 
 /*
+ * Diagnostics
+ */
+
+/*
  * cds_ft_show - Print content of the Fractal Trie.
  * @ft: The Fractal Trie.
  * @out: File stream output.
@@ -639,6 +771,10 @@ void cds_ft_show_stats(const struct cds_ft *ft, FILE *out);
  * Return a pointer to a const string representing the status.
  */
 const char *cds_ft_status_to_string(enum cds_ft_status status);
+
+/*
+ * Duplicate traversal macros
+ */
 
 /*
  * cds_ft_for_each_duplicate_rcu - Iterate through duplicates.
