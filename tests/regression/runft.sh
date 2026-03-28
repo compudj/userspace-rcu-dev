@@ -13,123 +13,123 @@ TESTPROG=./test_urcu_ft
 #thread multiplier
 THREAD_MUL=1
 
-EXTRA_PARAMS=-v
+EXTRA_PARAMS=--verbose
 
 # ** test update coherency with single-value table
 
 # sanity test
-${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} -t ${EXTRA_PARAMS} || exit 1
-${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} -x ${EXTRA_PARAMS} || exit 1
-${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} -y ${EXTRA_PARAMS} || exit 1
+${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} --sanity-test ${EXTRA_PARAMS} || exit 1
+${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} --sanity-test-varlen ${EXTRA_PARAMS} || exit 1
+${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} --sanity-test-varlen-string ${EXTRA_PARAMS} || exit 1
 
 # rw test, single key, add and del randomly, 4 threads
 # key range: init, lookup, and update: 0 to 0
-${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} -M 1 -N 1 -O 1 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} 0 $((4*${THREAD_MUL})) ${TIME_UNITS} --lookup-pool-size 1 --write-pool-size 1 --init-pool-size 1 ${EXTRA_PARAMS} || exit 1
 
 # rw test, single key, add and del randomly, 2 lookup threads, 2 update threads
 # key range: init, lookup, and update: 0 to 0
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -M 1 -N 1 -O 1 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --lookup-pool-size 1 --write-pool-size 1 --init-pool-size 1 ${EXTRA_PARAMS} || exit 1
 
 # add with duplicates
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 1 -M 10 -N 10 -O 10 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 1 --lookup-pool-size 10 --write-pool-size 10 --init-pool-size 10 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 1 -M 100 -N 100 -O 100 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 1 --lookup-pool-size 100 --write-pool-size 100 --init-pool-size 100 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 1 -M 255 -N 255 -O 255 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 1 --lookup-pool-size 255 --write-pool-size 255 --init-pool-size 255 ${EXTRA_PARAMS} || exit 1
 
 #expected fail (TODO)
-#${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 1 -M 256 -N 256 -O 256 ${EXTRA_PARAMS} || exit 1
+#${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 1 --lookup-pool-size 256 --write-pool-size 256 --init-pool-size 256 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 2 -M 10 -N 10 -O 10 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 2 --lookup-pool-size 10 --write-pool-size 10 --init-pool-size 10 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 2 -M 1000 -N 1000 -O 1000 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 2 --lookup-pool-size 1000 --write-pool-size 1000 --init-pool-size 1000 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 2 -M 65535 -N 65535 -O 65535 ${EXTRA_PARAMS} || exit 1
-
-
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 3 -M 10 -N 10 -O 10 ${EXTRA_PARAMS} || exit 1
-
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 3 -M 65535 -N 65535 -O 65535 ${EXTRA_PARAMS} || exit 1
-
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 3 -M 16777215 -N 16777215 -O 16777215 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 2 --lookup-pool-size 65535 --write-pool-size 65535 --init-pool-size 65535 ${EXTRA_PARAMS} || exit 1
 
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 4 -M 10 -N 10 -O 10 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 3 --lookup-pool-size 10 --write-pool-size 10 --init-pool-size 10 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 4 -M 1000 -N 1000 -O 1000 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 3 --lookup-pool-size 65535 --write-pool-size 65535 --init-pool-size 65535 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 4 -M 1000000 -N 1000000 -O 1000000 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 3 --lookup-pool-size 16777215 --write-pool-size 16777215 --init-pool-size 16777215 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 4 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -B 8 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 4 --lookup-pool-size 10 --write-pool-size 10 --init-pool-size 10 ${EXTRA_PARAMS} || exit 1
+
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 4 --lookup-pool-size 1000 --write-pool-size 1000 --init-pool-size 1000 ${EXTRA_PARAMS} || exit 1
+
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 4 --lookup-pool-size 1000000 --write-pool-size 1000000 --init-pool-size 1000000 ${EXTRA_PARAMS} || exit 1
+
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 4 ${EXTRA_PARAMS} || exit 1
+
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --key-len 8 ${EXTRA_PARAMS} || exit 1
 
 # with node leak detection
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -l -B 4 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --leak-detection --key-len 4 ${EXTRA_PARAMS} || exit 1
 
 
 # add unique
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 1 -M 10 -N 10 -O 10 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 1 --lookup-pool-size 10 --write-pool-size 10 --init-pool-size 10 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 1 -M 100 -N 100 -O 100 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 1 --lookup-pool-size 100 --write-pool-size 100 --init-pool-size 100 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 1 -M 255 -N 255 -O 255 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 1 --lookup-pool-size 255 --write-pool-size 255 --init-pool-size 255 ${EXTRA_PARAMS} || exit 1
 
 #expected fail (TODO)
-#${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 1 -M 256 -N 256 -O 256 ${EXTRA_PARAMS} || exit 1
+#${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 1 --lookup-pool-size 256 --write-pool-size 256 --init-pool-size 256 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 2 -M 10 -N 10 -O 10 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 2 --lookup-pool-size 10 --write-pool-size 10 --init-pool-size 10 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 2 -M 1000 -N 1000 -O 1000 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 2 --lookup-pool-size 1000 --write-pool-size 1000 --init-pool-size 1000 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 2 -M 65535 -N 65535 -O 65535 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 2 --lookup-pool-size 65535 --write-pool-size 65535 --init-pool-size 65535 ${EXTRA_PARAMS} || exit 1
 
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 3 -M 10 -N 10 -O 10 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 3 --lookup-pool-size 10 --write-pool-size 10 --init-pool-size 10 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 3 -M 65535 -N 65535 -O 65535 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 3 --lookup-pool-size 65535 --write-pool-size 65535 --init-pool-size 65535 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 3 -M 16777215 -N 16777215 -O 16777215 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 3 --lookup-pool-size 16777215 --write-pool-size 16777215 --init-pool-size 16777215 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 4 -M 10 -N 10 -O 10 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 4 --lookup-pool-size 10 --write-pool-size 10 --init-pool-size 10 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 4 -M 1000 -N 1000 -O 1000 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 4 --lookup-pool-size 1000 --write-pool-size 1000 --init-pool-size 1000 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 4 -M 1000000 -N 1000000 -O 1000000 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 4 --lookup-pool-size 1000000 --write-pool-size 1000000 --init-pool-size 1000000 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 4 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 4 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -B 8 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --key-len 8 ${EXTRA_PARAMS} || exit 1
 
 # with node leak detection
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -l -B 4 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --leak-detection --key-len 4 ${EXTRA_PARAMS} || exit 1
 
 # removal (0% add), leak detection
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -l -B 4 -k 10000 -M 10000 -N 10000 -O 10000 -r 0 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --leak-detection --key-len 4 --populate --lookup-pool-size 10000 --write-pool-size 10000 --init-pool-size 10000 --insert-ratio 0 ${EXTRA_PARAMS} || exit 1
 
 # vary add ratio, leak detection
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -l -B 4 -k 10000 -M 10000 -N 10000 -O 10000 -r 5 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --leak-detection --key-len 4 --populate --lookup-pool-size 10000 --write-pool-size 10000 --init-pool-size 10000 --insert-ratio 5 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -u -l -B 4 -k 10000 -M 10000 -N 10000 -O 10000 -r 95 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --insert-unique --leak-detection --key-len 4 --populate --lookup-pool-size 10000 --write-pool-size 10000 --init-pool-size 10000 --insert-ratio 95 ${EXTRA_PARAMS} || exit 1
 
 
 # validate lookup of init values
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -V -u -B 4 -k 100 -S 100 -M 100 -N 100 -O 100 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --validate-lookup --insert-unique --key-len 4 --populate --write-pool-offset 100 --lookup-pool-size 100 --write-pool-size 100 --init-pool-size 100 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -V -u -B 4 -k 10000 -S 10000 -M 10000 -N 10000 -O 10000 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --validate-lookup --insert-unique --key-len 4 --populate --write-pool-offset 10000 --lookup-pool-size 10000 --write-pool-size 10000 --init-pool-size 10000 ${EXTRA_PARAMS} || exit 1
 
 # vary key multiplication factor
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -V -u -B 4 -m 17 -k 100 -S 100 -M 100 -N 100 -O 100 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --validate-lookup --insert-unique --key-len 4 --key-mul 17 --populate --write-pool-offset 100 --lookup-pool-size 100 --write-pool-size 100 --init-pool-size 100 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -V -u -B 4 -m 17 -k 10000 -S 10000 -M 10000 -N 10000 -O 10000 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --validate-lookup --insert-unique --key-len 4 --key-mul 17 --populate --write-pool-offset 10000 --lookup-pool-size 10000 --write-pool-size 10000 --init-pool-size 10000 ${EXTRA_PARAMS} || exit 1
 
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -V -u -B 8 -m 1717 -k 100 -S 100 -M 100 -N 100 -O 100 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --validate-lookup --insert-unique --key-len 8 --key-mul 1717 --populate --write-pool-offset 100 --lookup-pool-size 100 --write-pool-size 100 --init-pool-size 100 ${EXTRA_PARAMS} || exit 1
 
-${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} -V -u -B 8 -m 1717 -k 10000 -S 10000 -M 10000 -N 10000 -O 10000 ${EXTRA_PARAMS} || exit 1
+${TESTPROG} $((2*${THREAD_MUL})) $((2*${THREAD_MUL})) ${TIME_UNITS} --validate-lookup --insert-unique --key-len 8 --key-mul 1717 --populate --write-pool-offset 10000 --lookup-pool-size 10000 --write-pool-size 10000 --init-pool-size 10000 ${EXTRA_PARAMS} || exit 1

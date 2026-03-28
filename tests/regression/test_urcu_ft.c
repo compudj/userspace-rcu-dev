@@ -18,6 +18,7 @@
 #include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <getopt.h>
 
 #define key_len_split(var)	var, sizeof(var)
 
@@ -172,37 +173,51 @@ void free_node(struct cds_ft_node *node)
 static
 void show_usage(char **argv)
 {
-	printf("Usage : %s nr_readers nr_writers duration (s)\n", argv[0]);
+	printf("Usage : %s nr_readers nr_writers duration (s) [options]\n", argv[0]);
+	printf("\n");
+	printf("Options:\n");
+	printf("\n");
 #ifdef DEBUG_YIELD
-	printf("        [-r] [-w] (yield reader and/or writer)\n");
+	printf("  --yield-reader                Yield reader.\n");
+	printf("  --yield-writer                Yield writer.\n");
+	printf("\n");
 #endif
-	printf("        [-d delay] (writer period (us))\n");
-	printf("        [-c duration] (reader C.S. duration (in loops))\n");
-	printf("        [-v] (verbose output)\n");
-	printf("        [-a cpu#] [-a cpu#]... (affinity)\n");
-	printf("        [-u] Add unique keys.\n");
-	printf("        [-s] Replace existing keys.\n");
-printf("        [not -u nor -s] Add entries (supports redundant keys).\n");
-	printf("        [-r ratio] Add ratio (in %% of insert+removal).\n");
-	printf("        [-k] Populate init nodes.\n");
-	printf("        [-R offset] Lookup pool offset.\n");
-	printf("        [-S offset] Write pool offset.\n");
-	printf("        [-T offset] Init pool offset.\n");
-	printf("        [-M size] Lookup pool size.\n");
-	printf("        [-N size] Write pool size.\n");
-	printf("        [-O size] Init pool size.\n");
-	printf("        [-V] Validate lookups of init values (use with filled init pool, same lookup range, with different write range).\n");
-	printf("        [-t] Do sanity test.\n");
-	printf("        [-x] Do variable length sanity test.\n");
-	printf("        [-y] Do variable length string sanity test.\n");
-	printf("        [-B] Key bytes for multithread test (default: 4).\n");
-	printf("        [-m factor] Key multiplication factor.\n");
-	printf("	[-l] Memory leak detection.\n");
-	printf("	[-Z] Show statistics.\n");
-	printf("	[-D] Dictionary (stdin) test.\n");
-	printf("	[-q] Reverse sort dictionary.\n");
-	printf("	[-o] Torture test strings.\n");
-	printf("\n\n");
+	printf("  -d, --writer-delay <us>       Writer period (us).\n");
+	printf("  -c, --reader-duration <n>     Reader C.S. duration (in loops).\n");
+	printf("  -v, --verbose                 Verbose output.\n");
+	printf("  -a, --affinity <cpu#>         Set CPU affinity (use multiple times).\n");
+	printf("\n");
+	printf("  -u, --insert-unique           Add unique keys.\n");
+	printf("  -s, --insert-replace          Replace existing keys.\n");
+	printf("      [neither -u nor -s]       Add entries (supports redundant keys).\n");
+	printf("  -r, --insert-ratio <%%>        Insert ratio (in %% of insert+removal).\n");
+	printf("\n");
+	printf("  -k, --populate                Populate init nodes.\n");
+	printf("  -R, --lookup-pool-offset <n>  Lookup pool offset.\n");
+	printf("  -S, --write-pool-offset <n>   Write pool offset.\n");
+	printf("  -T, --init-pool-offset <n>    Init pool offset.\n");
+	printf("  -M, --lookup-pool-size <n>    Lookup pool size.\n");
+	printf("  -N, --write-pool-size <n>     Write pool size.\n");
+	printf("  -O, --init-pool-size <n>      Init pool size.\n");
+	printf("\n");
+	printf("  -V, --validate-lookup         Validate lookups of init values (use with\n");
+	printf("                                filled init pool, same lookup range, with\n");
+	printf("                                different write range).\n");
+	printf("\n");
+	printf("  -t, --sanity-test             Run sanity test.\n");
+	printf("  -x, --sanity-test-varlen      Run variable length sanity test.\n");
+	printf("  -y, --sanity-test-varlen-string\n");
+	printf("                                Run variable length string sanity test.\n");
+	printf("\n");
+	printf("  -B, --key-len <bytes>         Key bytes for multithread test (default: 4).\n");
+	printf("  -m, --key-mul <factor>        Key multiplication factor.\n");
+	printf("\n");
+	printf("  -l, --leak-detection          Memory leak detection.\n");
+	printf("  -Z, --show-stats              Show statistics.\n");
+	printf("  -D, --dictionary              Dictionary (stdin) test.\n");
+	printf("  -q, --reverse-sort            Reverse sort dictionary.\n");
+	printf("  -o, --torture-test-string     Torture test strings.\n");
+	printf("\n");
 }
 
 static
@@ -1839,10 +1854,52 @@ int do_test_dictionary(void)
 	return 0;
 }
 
+/*
+ * Long-only options use values >= 256 to avoid collisions with
+ * single-character option values.
+ */
+enum {
+	OPT_YIELD_READER = 256,
+	OPT_YIELD_WRITER,
+};
+
 int main(int argc, char **argv)
 {
-	int i, a, ret, err;
+	int ret, err, opt;
 	struct sigaction act;
+
+	static struct option long_options[] = {
+		{ "writer-delay",		required_argument,	NULL, 'd' },
+		{ "reader-duration",		required_argument,	NULL, 'c' },
+		{ "verbose",			no_argument,		NULL, 'v' },
+		{ "affinity",			required_argument,	NULL, 'a' },
+		{ "insert-ratio",		required_argument,	NULL, 'r' },
+		{ "populate",			no_argument,		NULL, 'k' },
+		{ "lookup-pool-offset",		required_argument,	NULL, 'R' },
+		{ "write-pool-offset",		required_argument,	NULL, 'S' },
+		{ "init-pool-offset",		required_argument,	NULL, 'T' },
+		{ "lookup-pool-size",		required_argument,	NULL, 'M' },
+		{ "write-pool-size",		required_argument,	NULL, 'N' },
+		{ "init-pool-size",		required_argument,	NULL, 'O' },
+		{ "validate-lookup",		no_argument,		NULL, 'V' },
+		{ "sanity-test",		no_argument,		NULL, 't' },
+		{ "sanity-test-varlen",		no_argument,		NULL, 'x' },
+		{ "sanity-test-varlen-string",	no_argument,		NULL, 'y' },
+		{ "key-len",			required_argument,	NULL, 'B' },
+		{ "key-mul",			required_argument,	NULL, 'm' },
+		{ "insert-unique",		no_argument,		NULL, 'u' },
+		{ "insert-replace",		no_argument,		NULL, 's' },
+		{ "leak-detection",		no_argument,		NULL, 'l' },
+		{ "show-stats",			no_argument,		NULL, 'Z' },
+		{ "dictionary",			no_argument,		NULL, 'D' },
+		{ "reverse-sort",		no_argument,		NULL, 'q' },
+		{ "torture-test-string",	no_argument,		NULL, 'o' },
+#ifdef DEBUG_YIELD
+		{ "yield-reader",		no_argument,		NULL, OPT_YIELD_READER },
+		{ "yield-writer",		no_argument,		NULL, OPT_YIELD_WRITER },
+#endif
+		{ NULL, 0, NULL, 0 },
+	};
 
 	if (argc < 4)
 		goto usage_error;
@@ -1859,62 +1916,47 @@ int main(int argc, char **argv)
 	if (err != 1)
 		goto usage_error;
 
-	for (i = 4; i < argc; i++) {
-		if (argv[i][0] != '-')
-			continue;
-		switch (argv[i][1]) {
-#ifdef DEBUG_YIELD
-		case 'r':
-			yield_active |= YIELD_READ;
-			break;
-		case 'w':
-			yield_active |= YIELD_WRITE;
-			break;
-#endif
-		case 'a':
-			if (argc < i + 2)
-				goto usage_error;
-			a = atoi(argv[++i]);
-			cpu_affinities[next_aff++] = a;
-			use_affinity = 1;
-			printf_verbose("Adding CPU %d affinity\n", a);
+	optind = 4;
+	while ((opt = getopt_long(argc, argv, "d:c:va:r:kR:S:T:M:N:O:Vtxyb:B:m:uslZDqo",
+				  long_options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			wdelay = atol(optarg);
 			break;
 		case 'c':
-			if (argc < i + 2)
-				goto usage_error;
-			rduration = atol(argv[++i]);
-			break;
-		case 'd':
-			if (argc < i + 2)
-				goto usage_error;
-			wdelay = atol(argv[++i]);
+			rduration = atol(optarg);
 			break;
 		case 'v':
 			verbose_mode = 1;
 			break;
+		case 'a':
+			cpu_affinities[next_aff++] = atoi(optarg);
+			use_affinity = 1;
+			printf_verbose("Adding CPU %d affinity\n", atoi(optarg));
+			break;
 		case 'r':
-			insert_ratio = atoi(argv[++i]);
+			insert_ratio = atoi(optarg);
 			break;
 		case 'k':
 			init_populate = 1;
 			break;
 		case 'R':
-			lookup_pool_offset = atol(argv[++i]);
+			lookup_pool_offset = atol(optarg);
 			break;
 		case 'S':
-			write_pool_offset = atol(argv[++i]);
+			write_pool_offset = atol(optarg);
 			break;
 		case 'T':
-			init_pool_offset = atol(argv[++i]);
+			init_pool_offset = atol(optarg);
 			break;
 		case 'M':
-			lookup_pool_size = atol(argv[++i]);
+			lookup_pool_size = atol(optarg);
 			break;
 		case 'N':
-			write_pool_size = atol(argv[++i]);
+			write_pool_size = atol(optarg);
 			break;
 		case 'O':
-			init_pool_size = atol(argv[++i]);
+			init_pool_size = atol(optarg);
 			break;
 		case 'V':
 			validate_lookup = 1;
@@ -1929,10 +1971,10 @@ int main(int argc, char **argv)
 			sanity_test_varlen_string = 1;
 			break;
 		case 'B':
-			key_len = atol(argv[++i]);
+			key_len = atol(optarg);
 			break;
 		case 'm':
-			key_mul = atoll(argv[++i]);
+			key_mul = atoll(optarg);
 			break;
 		case 'u':
 			insert_unique = 1;
@@ -1955,6 +1997,16 @@ int main(int argc, char **argv)
 		case 'o':
 			torture_test_string = 1;
 			break;
+#ifdef DEBUG_YIELD
+		case OPT_YIELD_READER:
+			yield_active |= YIELD_READ;
+			break;
+		case OPT_YIELD_WRITER:
+			yield_active |= YIELD_WRITE;
+			break;
+#endif
+		default:
+			goto usage_error;
 		}
 	}
 
