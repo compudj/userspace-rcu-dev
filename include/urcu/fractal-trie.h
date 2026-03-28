@@ -395,13 +395,11 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 		struct cds_ft_node **result_node);
 
 /*
- * cds_ft_remove - Remove @node at @key.
+ * cds_ft_remove - Remove @node at @iter position.
  * @ft: The Fractal Trie.
- * @key: Key at which @node is expected (may be NULL if @key_len is 0).
- * @key_len: Key length in bytes:
- * - > 0: Explicit key length (must not exceed trie's max length).
- * - 0: NIL key (zero-length).
- * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ * @iter: Iterator position at which @node is expected.
+ *        If the iterator holds a valid path from a prior lookup,
+ *        the remove operation may use it to avoid a full traversal.
  * @node: Node to remove.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
@@ -413,7 +411,7 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * An RCU read-side lock must be held while calling this function.
  */
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
+		struct cds_ft_iter *iter,
 		struct cds_ft_node *node);
 
 /*

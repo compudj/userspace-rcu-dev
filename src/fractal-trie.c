@@ -3419,7 +3419,7 @@ void ft_unchain_node(struct cds_ft_node **prev_node_ptr,
  *         the external nodes list empty.
  */
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
 {
 	unsigned int i, key_depth;
@@ -3437,8 +3437,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	bool pending_detach_node;
 	struct cds_ft_node *iter_node, **iter_node_ptr, **prev_node_ptr, *match;
 	int nr_snapshot, ret, count = 0;
-	const uint8_t *iter_key = key;
-	size_t key_len = ft_key_len(ft, _key_len);
+	const uint8_t *iter_key;
+	size_t key_len = ft_key_len(ft, iter->key_len);
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -3447,6 +3447,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 
 retry:
 	nr_snapshot = 0;
+	iter_key = iter->key;
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
 	node_flag = rcu_dereference(ft->root);
@@ -3611,6 +3612,15 @@ retry:
 	 */
 	if (ret == -EAGAIN || ret == -ENOENT)
 		goto retry;
+
+	/*
+	 * Invalidate the iterator path. The trie structure may have
+	 * changed due to node recompaction during detach, making the
+	 * cached path stale.
+	 */
+	iter->path_valid = false;
+	iter->path_len = 0;
+
 	return ret == 0 ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
@@ -4063,6 +4073,7 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 {
 	bool subset = false;
 
+	key_len = ft_key_len(iter->ft, key_len);
 	if (key_len > iter->ft->max_key_len)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	if (key_len <= iter->key_len && !memcmp(key, iter->key, key_len))

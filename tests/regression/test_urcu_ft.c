@@ -238,14 +238,14 @@ int test_free_all_nodes(struct cds_ft *ft)
 	cds_ft_for_each(ft, iter) {
 		struct cds_ft_node *node = cds_ft_iter_node(iter);
 		struct cds_ft_node *tmp_node;
-		uint8_t key[256];
-		size_t entry_key_len;
-
-		cds_ft_iter_get_key(iter, key, sizeof(key), &entry_key_len);
 
 		cds_ft_for_each_duplicate_safe_rcu(node, tmp_node) {
-			status = cds_ft_remove(ft, key, entry_key_len, node);
+			status = cds_ft_remove(ft, iter, node);
 			if (status) {
+				uint8_t key[256];
+				size_t entry_key_len;
+
+				cds_ft_iter_get_key(iter, key, sizeof(key), &entry_key_len);
 				fprintf(stderr, "Error removing node %" PRIu64 ": %s\n",
 					cds_ft_key_to_u64(ft, key, entry_key_len), cds_ft_status_to_string(status));
 				goto end;
@@ -348,14 +348,15 @@ int test_1byte_key(void)
 
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		status = cds_ft_lookup_key(test_ft, key_len_split(ftkey), &ft_node);
+		cds_ft_iter_set_key(iter, key_len_split(ftkey));
+		status = cds_ft_lookup(test_ft, iter);
+		ft_node = cds_ft_iter_node(iter);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		status = cds_ft_remove(test_ft, key_len_split(ftkey), &node->node);
+		status = cds_ft_remove(test_ft, iter, &node->node);
 		if (status) {
 			fprintf(stderr, "Error removing node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 			assert(0);
@@ -582,13 +583,15 @@ int test_2bytes_key(void)
 
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		status = cds_ft_lookup_key(test_ft, key_len_split(ftkey), &ft_node);
+		cds_ft_iter_set_key(iter, key_len_split(ftkey));
+		status = cds_ft_lookup(test_ft, iter);
+		ft_node = cds_ft_iter_node(iter);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 			assert(0);
 		}
 		node = caa_container_of(ft_node, struct ft_test_node, node);
-		status = cds_ft_remove(test_ft, key_len_split(ftkey), &node->node);
+		status = cds_ft_remove(test_ft, iter, &node->node);
 		if (status) {
 			fprintf(stderr, "Error removing node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 			assert(0);
@@ -743,6 +746,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 	struct cds_ft_node *ft_node;
 	unsigned int bits = len * CHAR_BIT;
 	struct cds_ft_attr *attr;
+	struct cds_ft_iter *iter;
 
 	if (len == 8)
 		max_key = UINT64_MAX;
@@ -761,6 +765,9 @@ int test_sparse_key(unsigned int len, int nr_dup)
 		return -1;
 	}
 	cds_ft_attr_destroy(attr);
+
+	if (cds_ft_iter_create(test_ft, &iter) < 0)
+		abort();
 
 	/* Add keys */
 	printf("Test #1: insert keys (%u-byte).\n", len);
@@ -842,7 +849,9 @@ int test_sparse_key(unsigned int len, int nr_dup)
 
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
-		status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &ft_node);
+		cds_ft_iter_set_key(iter, ftkey, CDS_FT_LEN_DEFAULT);
+		status = cds_ft_lookup(test_ft, iter);
+		ft_node = cds_ft_iter_node(iter);
 
 		cds_ft_for_each_duplicate_rcu(ft_node) {
 			struct cds_ft_node *test_ft_node;
@@ -851,7 +860,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			count++;
 			node = caa_container_of(ft_node,
 				struct ft_test_node, node);
-			status = cds_ft_remove(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
+			status = cds_ft_remove(test_ft, iter, &node->node);
 			if (status) {
 				fprintf(stderr, "Error removing node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 				assert(0);
@@ -873,6 +882,8 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			zerocount++;
 	}
 	printf("OK\n");
+
+	cds_ft_iter_destroy(iter);
 
 	if (test_free_all_nodes(test_ft)) {
 		fprintf(stderr, "Error freeing all nodes\n");
@@ -1059,11 +1070,15 @@ int test_varlen_sparse_key_remove(unsigned int len, int nr_dup)
 	enum cds_ft_status status;
 	struct cds_ft_node *ft_node;
 	unsigned int bits = len * CHAR_BIT;
+	struct cds_ft_iter *iter;
 
 	if (len == 8)
 		max_key = UINT64_MAX;
 	else
 		max_key = (1ULL << bits) - 1;
+
+	if (cds_ft_iter_create(test_ft, &iter) < 0)
+		abort();
 
 	printf("Test #4: remove keys (%u-byte).\n", len);
 	zerocount = 0;
@@ -1073,7 +1088,9 @@ int test_varlen_sparse_key_remove(unsigned int len, int nr_dup)
 
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, ftkey, len);
-		status = cds_ft_lookup_key(test_ft, ftkey, len, &ft_node);
+		cds_ft_iter_set_key(iter, ftkey, len);
+		status = cds_ft_lookup(test_ft, iter);
+		ft_node = cds_ft_iter_node(iter);
 
 		cds_ft_for_each_duplicate_rcu(ft_node) {
 			struct cds_ft_node *test_ft_node;
@@ -1082,7 +1099,7 @@ int test_varlen_sparse_key_remove(unsigned int len, int nr_dup)
 			count++;
 			node = caa_container_of(ft_node,
 				struct ft_test_node, node);
-			status = cds_ft_remove(test_ft, ftkey, len, &node->node);
+			status = cds_ft_remove(test_ft, iter, &node->node);
 			if (status) {
 				fprintf(stderr, "Error removing node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 				assert(0);
@@ -1104,6 +1121,8 @@ int test_varlen_sparse_key_remove(unsigned int len, int nr_dup)
 			zerocount++;
 	}
 	printf("OK\n");
+
+	cds_ft_iter_destroy(iter);
 	return 0;
 }
 
@@ -1308,6 +1327,10 @@ static
 int test_varlen_string_key_remove(void)
 {
 	unsigned int i;
+	struct cds_ft_iter *iter;
+
+	if (cds_ft_iter_create(test_ft, &iter) < 0)
+		abort();
 
 	printf("Test #4: remove string keys.\n");
 
@@ -1318,7 +1341,9 @@ int test_varlen_string_key_remove(void)
 		enum cds_ft_status status;
 
 		rcu_read_lock();
-		status = cds_ft_lookup_key(test_ft, (uint8_t *) string, strlen(string), &ft_node);
+		cds_ft_iter_set_key(iter, (uint8_t *) string, strlen(string));
+		cds_ft_lookup(test_ft, iter);
+		ft_node = cds_ft_iter_node(iter);
 
 		cds_ft_for_each_duplicate_rcu(ft_node) {
 			struct cds_ft_node *test_ft_node;
@@ -1327,7 +1352,7 @@ int test_varlen_string_key_remove(void)
 			count++;
 			node = caa_container_of(ft_node,
 				struct ft_test_node, node);
-			status = cds_ft_remove(test_ft, (uint8_t *) string, strlen(string), &node->node);
+			status = cds_ft_remove(test_ft, iter, &node->node);
 			if (status) {
 				fprintf(stderr, "Error removing node \"%s\": %s\n", string, cds_ft_status_to_string(status));
 				assert(0);
@@ -1347,6 +1372,8 @@ int test_varlen_string_key_remove(void)
 		rcu_read_unlock();
 	}
 	printf("OK\n");
+
+	cds_ft_iter_destroy(iter);
 	return 0;
 }
 
@@ -1509,6 +1536,7 @@ void *test_ft_rw_thr_writer(void *_count)
 	struct wr_count *count = _count;
 	uint64_t key;
 	enum cds_ft_status status;
+	struct cds_ft_iter *iter;
 
 	printf_verbose("thread_begin %s, tid %lu\n",
 			"writer", urcu_get_thread_id());
@@ -1518,6 +1546,9 @@ void *test_ft_rw_thr_writer(void *_count)
 	set_affinity();
 
 	rcu_register_thread();
+
+	if (cds_ft_iter_create(test_ft, &iter) < 0)
+		abort();
 
 	while (!test_go)
 	{
@@ -1577,13 +1608,15 @@ void *test_ft_rw_thr_writer(void *_count)
 
 			rcu_read_lock();
 
-			status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &ft_node);
+			cds_ft_iter_set_key(iter, ftkey, CDS_FT_LEN_DEFAULT);
+			status = cds_ft_lookup(test_ft, iter);
+			ft_node = cds_ft_iter_node(iter);
 			/* Remove first entry */
 			if (ft_node) {
 				node = caa_container_of(ft_node,
 					struct ft_test_node, node);
 				mutex_lock_mt();
-				status = cds_ft_remove(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &node->node);
+				status = cds_ft_remove(test_ft, iter, &node->node);
 				mutex_unlock_mt();
 				if (status == CDS_FT_STATUS_OK) {
 					rcu_free_test_node(node);
@@ -1605,6 +1638,8 @@ void *test_ft_rw_thr_writer(void *_count)
 		if (caa_unlikely((URCU_TLS(nr_writes) & ((1 << 10) - 1)) == 0))
 			rcu_quiescent_state();
 	}
+
+	cds_ft_iter_destroy(iter);
 
 	rcu_unregister_thread();
 
