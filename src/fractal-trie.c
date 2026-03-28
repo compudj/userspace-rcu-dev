@@ -2498,7 +2498,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	ssize_t key_depth, level;
 	struct cds_ft_inode_flag *node_flag, *cur_node_depth[FT_MAX_DEPTH];
 	struct cds_ft_node *ret_node;
-	uint8_t cur_key[FT_MAX_DEPTH - 1];
+	uint8_t cur_key[FT_MAX_KEY_LEN];
 	enum ft_direction dir;
 	const uint8_t *iter_key = key;
 	size_t key_len;
@@ -2533,7 +2533,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	}
 
 	memset(cur_node_depth, 0, (ft->max_tree_depth + 1) * sizeof(cur_node_depth[0]));
-	memset(cur_key, 0, ft->max_tree_depth * sizeof(cur_key[0]));
+	memset(cur_key, 0, ft->max_key_len * sizeof(cur_key[0]));
 	node_flag = rcu_dereference(ft->root);
 	cur_node_depth[0] = node_flag;
 
@@ -2762,6 +2762,12 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	/* attach/detach semantic guarantees that ft_node_get_minmax cannot return NULL. */
 	assert(ft_node_ptr(node_flag));
 	ret_node = (struct cds_ft_node *) node_flag;
+	/*
+	 * The trie should always have external nodes at the
+	 * very last level, so level should never grow large enough to overflow
+	 * max_key_len.
+	 */
+	assert(level <= (int) ft->max_key_len);
 end:
 	if (result_key_len)
 		*result_key_len = level;
