@@ -3203,7 +3203,7 @@ int ft_detach_node(struct cds_ft *ft,
 	 * deletion (removing its children too), replacing it with its
 	 * external node pointer (if any).
 	 */
-	for (i = nr_snapshot - 2; i >= 1; i--) {
+	for (i = nr_snapshot - 2; i >= 0; i--) {
 		struct cds_ft_metadata *metadata;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
@@ -3214,7 +3214,7 @@ int ft_detach_node(struct cds_ft *ft,
 				!= ft_node_ptr(snapshot[i + 1])));
 
 		assert(metadata->nr_child > 0);
-		if (!prev_external_nodes_found && (metadata->nr_child == 1 && i > 1)) {
+		if (!prev_external_nodes_found && (metadata->nr_child == 1 && i > 0)) {
 			nr_clear++;
 			/*
 			 * Keep track of the external nodes pointer of
@@ -3223,8 +3223,8 @@ int ft_detach_node(struct cds_ft *ft,
 			topmost_external_nodes = metadata->external_nodes;
 		}
 		nr_branch++;
-		if (prev_external_nodes_found || metadata->nr_child > 1 || i == 1) {
-			if (snapshot[i - 1] != (struct cds_ft_inode_flag *) &ft->root) {
+		if (prev_external_nodes_found || metadata->nr_child > 1 || i == 0) {
+			if (i > 0) {
 				metadata = cds_ft_item_to_metadata(ft_node_ptr(snapshot[i - 1]));
 			} else {
 				metadata = &ft->root_metadata;
@@ -3333,11 +3333,6 @@ retry:
 	nr_snapshot = 0;
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
-	/* snapshot for level 0 is for metadata lookup of root node. */
-	snapshot_n[0] = 0;
-	snapshot_n[1] = 0;
-	snapshot_ptr[nr_snapshot] = NULL;
-	snapshot[nr_snapshot++] = (struct cds_ft_inode_flag *) &ft->root;
 	node_flag = rcu_dereference(ft->root);
 	prev_node_flag_ptr = &ft->root;
 	node_flag_ptr = &ft->root;
