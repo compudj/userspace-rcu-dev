@@ -2928,10 +2928,15 @@ post_traversal:
 			struct cds_ft_node *external_nodes;
 
 			if (ft_node_internal(node_flag)) {
-				const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 				struct cds_ft_metadata *metadata;
 
-				metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
+				if (level == 0) {
+					metadata = &ft->root_metadata;
+				} else {
+					const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+
+					metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
+				}
 				external_nodes = rcu_dereference(metadata->external_nodes);
 			} else {
 				external_nodes = (struct cds_ft_node *) node_flag;
@@ -3510,7 +3515,10 @@ int _cds_ft_insert(struct cds_ft *ft,
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
 
-			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+			if (i == 0)
+				metadata = &ft->root_metadata;
+			else
+				metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 			external_nodes = metadata->external_nodes;
 			if (external_nodes) {
 				struct cds_ft_node *iter_node, *last_node = NULL;
@@ -3697,7 +3705,10 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
 
-			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+			if (i == 0)
+				metadata = &ft->root_metadata;
+			else
+				metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 			external_nodes = metadata->external_nodes;
 			if (external_nodes) {
 				dbg_printf("_cds_ft_insert_replace: replacing internal metadata chain %p\n",
@@ -4143,7 +4154,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_node *external_nodes;
 		struct cds_ft_metadata *metadata;
 
-		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		if (key_len == 0)
+			metadata = &ft->root_metadata;
+		else
+			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		external_nodes = metadata->external_nodes;
 		if (external_nodes) {
 			/*
