@@ -2964,6 +2964,28 @@ post_traversal:
 	if (level >= key_depth)
 		level = key_depth - 1;
 
+	/*
+	 * For GE/GT: if the descent completed and the node at end-of-key
+	 * is internal, any descendant key is strictly longer and therefore
+	 * strictly greater. Skip backtracking and descend into children
+	 * directly.
+	 *
+	 * For GE, the post-traversal above already returned if the node
+	 * had external_nodes (the equal match). Reaching this point means
+	 * no equal match exists, so descendant keys are the closest >=.
+	 *
+	 * For GT, the skip_eq_external_nodes flag (set below) will
+	 * prevent the minmax descent from returning this node's own
+	 * external_nodes (which are the equal match, not GT).
+	 *
+	 * LE/LT do not need this: their upward backtracking already
+	 * checks external_nodes at each internal node going up, which is
+	 * the correct direction to find shorter (lesser) prefix keys.
+	 */
+	if ((mode == FT_LOOKUP_GT || mode == FT_LOOKUP_GE) &&
+			ft_node_ptr(node_flag) && ft_node_internal(node_flag))
+		goto descend_children;
+
 	/* Ensure iter_key is exactly at the position matching the level we stopped at. */
 	iter_key = input_key + level;
 
@@ -3105,6 +3127,7 @@ post_traversal:
 		return iter->status;
 	}
 
+descend_children:
 	if (!ft_node_internal(node_flag)) {
 		int j;
 
