@@ -3771,6 +3771,11 @@ enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordin
 	return CDS_FT_STATUS_OK;
 }
 
+bool cds_ft_empty(struct cds_ft *ft)
+{
+	return !uatomic_load(&ft->root, CMM_RELAXED);
+}
+
 enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 {
 	struct cds_ft_attr *attr = calloc(1, sizeof(struct cds_ft_attr));

@@ -18,6 +18,7 @@
 #include <urcu-flavor.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -463,6 +464,18 @@ void cds_ft_destroy(struct cds_ft *ft);
 /*
  * Trie properties
  */
+
+/*
+ * cds_ft_empty - Test whether a Fractal Trie contains any nodes.
+ * @ft: The Fractal Trie.
+ *
+ * Returns true if the trie contains no nodes, false otherwise.
+ *
+ * This function uses a relaxed atomic load and does not require
+ * the RCU read-side lock to be held. The result is a snapshot:
+ * concurrent updates may change the emptiness state at any time.
+ */
+bool cds_ft_empty(struct cds_ft *ft);
 
 /*
  * cds_ft_key_len - Return the key length of a Fractal Trie.
