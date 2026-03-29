@@ -4896,6 +4896,7 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 	iter->path_len = 0;
 	iter->key_len = 0;
 	iter->prefix_len = 0;
+	iter->node = NULL;
 #ifdef DEBUG_CLEAR_ITER
 	/* Reset to 0 for debugging. */
 	memset(iter->path_node, 0, sizeof(iter->path_node));
