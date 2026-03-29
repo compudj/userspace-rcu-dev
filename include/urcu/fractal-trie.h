@@ -21,7 +21,9 @@
  * introduce a cycle, ensuring that all lookups and traversals
  * complete in bounded time. Supports exact lookup, partial
  * (prefix) match, ordered iteration, duplicate key chains, and
- * range queries (<=, >=, <, >).
+ * range queries (<=, >=, <, >). A longest-match lookup reports
+ * the deepest trie position matching a prefix of the input key,
+ * even if that position has no external node.
  *
  * Performance characteristics:
  *
@@ -121,6 +123,7 @@ enum cds_ft_status {
 	CDS_FT_STATUS_OK			= 0,	/* Operation completed successfully. */
 	CDS_FT_STATUS_NOT_FOUND			= 1,	/* No node found. */
 	CDS_FT_STATUS_DUPLICATE_FOUND		= 2,	/* Duplicate node exists. */
+	CDS_FT_STATUS_INTERNAL_MATCH		= 3,	/* Match ends at an internal node. */
 
 	/* Error return codes (< 0). */
 	CDS_FT_STATUS_INVALID_ARGUMENT_ERROR	= -1,	/* Invalid argument. */
@@ -215,6 +218,40 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 		struct cds_ft_node **result_node);
 
 /*
+ * cds_ft_lookup_longest_match_key - Find how far the key matches the trie.
+ * @ft: The Fractal Trie.
+ * @key: Key to look up (may be NULL if @key_len is 0).
+ * @key_len: Key length in bytes:
+ * - > 0: Explicit key length (must not exceed trie's max length).
+ * - 0: NIL key (zero-length).
+ * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ * @match_len: Length of the longest matching sub-key (output).
+ *             This is the deepest position in the trie that matches
+ *             a prefix of @key, including internal nodes with no
+ *             external nodes attached. The matching sub-key is the
+ *             first @match_len bytes of @key.
+ * @result_node: Node output. Set to the first node of a duplicate chain
+ *               if the longest match has an external node (status is
+ *               CDS_FT_STATUS_OK). Set to NULL if the longest match
+ *               ends at an internal node (status is
+ *               CDS_FT_STATUS_INTERNAL_MATCH), if no match is found,
+ *               or on error.
+ *
+ * Returns CDS_FT_STATUS_OK if the longest match has an external node.
+ * Returns CDS_FT_STATUS_INTERNAL_MATCH if the longest match ends at
+ * an internal node with no external nodes attached.
+ * Returns CDS_FT_STATUS_NOT_FOUND if no prefix of @key matches any
+ * node in the trie.
+ * Returns a negative cds_ft_status on error.
+ *
+ * An RCU read-side lock must be held while calling this function and
+ * while accessing the returned node.
+ */
+enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t *match_len,
+		struct cds_ft_node **result_node);
+
+/*
  * Iterator-based lookup API
  *
  * These functions use a cds_ft_iter to hold input key, output key,
@@ -260,6 +297,33 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
  * (cds_ft_iter_status()).
  */
 enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
+		struct cds_ft_iter *iter);
+
+/*
+ * cds_ft_lookup_longest_match - Find how far the key matches the trie
+ *                               (iterator-based).
+ * @ft: The Fractal Trie.
+ * @iter: Iterator with key set via cds_ft_iter_set_key().
+ *        On return, the iterator's key length is set to the longest
+ *        matching sub-key length. This is the deepest position in
+ *        the trie that matches a prefix of the input key, including
+ *        internal nodes with no external nodes attached. The result
+ *        node (cds_ft_iter_node()) is set to the first node of a
+ *        duplicate chain if the longest match has an external node
+ *        (status is CDS_FT_STATUS_OK), or NULL if the longest match
+ *        ends at an internal node (status is
+ *        CDS_FT_STATUS_INTERNAL_MATCH). The backtracking path is
+ *        populated.
+ *
+ * Returns CDS_FT_STATUS_OK if the longest match has an external node.
+ * Returns CDS_FT_STATUS_INTERNAL_MATCH if the longest match ends at
+ * an internal node with no external nodes attached.
+ * Returns CDS_FT_STATUS_NOT_FOUND if no prefix of the iterator's key
+ * matches any node in the trie.
+ * Returns a negative cds_ft_status on error.
+ * The status is also stored in the iterator (cds_ft_iter_status()).
+ */
+enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 		struct cds_ft_iter *iter);
 
 /*

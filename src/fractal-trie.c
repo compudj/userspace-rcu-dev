@@ -2369,13 +2369,28 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	return ret;
 }
 
+enum ft_prefix_tracking {
+	FT_PREFIX_TRACK_NONE,		/* No prefix tracking. */
+	FT_PREFIX_TRACK_PARTIAL,	/* Track closest ancestor with external nodes. */
+	FT_PREFIX_TRACK_LONGEST,	/* Track deepest match, even internal-only. */
+};
+
+/*
+ * Sentinel value indicating that prefix tracking never recorded a
+ * match. Used by FT_PREFIX_TRACK_LONGEST to distinguish "empty trie"
+ * from "matched at root with no external nodes" (both have
+ * match_node == NULL, but the latter sets match_len = 0).
+ */
+#define FT_MATCH_LEN_NONE	SIZE_MAX
+
 static
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
-		size_t *partial_match_len,
-		struct cds_ft_node **partial_result_node)
+		enum ft_prefix_tracking tracking,
+		size_t *tracking_match_len,
+		struct cds_ft_node **tracking_match_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
 	struct cds_ft_inode_flag *node_flag;
@@ -2383,8 +2398,9 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	unsigned int key_depth, i;
 	enum cds_ft_status status;
 	size_t iter_path_len = 0;
-	bool track_partial = (partial_match_len != NULL);
-	size_t match_len = 0;
+	bool track = (tracking != FT_PREFIX_TRACK_NONE);
+	bool track_longest = (tracking == FT_PREFIX_TRACK_LONGEST);
+	size_t match_len = track_longest ? FT_MATCH_LEN_NONE : 0;
 	struct cds_ft_node *match_node = NULL;
 
 	if (!valid_key_len(ft, key_len)) {
@@ -2408,13 +2424,19 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	if (!ft_node_internal(node_flag)) {
 		if (key_len) {
 			/* Root is external but key_len > 0: partial match at root. */
-			if (track_partial)
+			if (track) {
+				match_len = 0;
 				match_node = (struct cds_ft_node *) node_flag;
+			}
 			status = CDS_FT_STATUS_NOT_FOUND;
 			goto end;
 		}
 		found = (struct cds_ft_node *) node_flag;
 		status = CDS_FT_STATUS_OK;
+		if (track) {
+			match_len = 0;
+			match_node = found;
+		}
 		goto end;
 	}
 	/*
@@ -2424,15 +2446,25 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	if (!key_len) {
 		found = rcu_dereference(ft->root_metadata.external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+		if (track) {
+			match_len = 0;
+			match_node = found;
+		}
 		goto end;
 	}
 
-	/* Consider external node in root metadata as possible partial match. */
-	if (track_partial) {
+	/*
+	 * Consider external node in root metadata as possible match.
+	 * For longest-match tracking, record the root position even
+	 * when there are no external nodes.
+	 */
+	if (track) {
 		struct cds_ft_node *external_nodes = rcu_dereference(ft->root_metadata.external_nodes);
 
-		if (external_nodes)
+		if (external_nodes || track_longest) {
+			match_len = 0;
 			match_node = external_nodes;
+		}
 	}
 
 	for (i = 1; i < key_depth; i++) {
@@ -2452,7 +2484,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		}
 		/* Found external node before end of key. */
 		if (i < key_depth - 1 && !ft_node_internal(node_flag)) {
-			if (track_partial) {
+			if (track) {
 				match_len = i;
 				match_node = (struct cds_ft_node *) node_flag;
 			}
@@ -2460,17 +2492,19 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			goto end;
 		}
 		/*
-		 * Track partial: internal node with associated external
-		 * nodes is a candidate for closest prefix match.
+		 * Track prefix match at internal node.
+		 * For partial tracking, only record when external nodes
+		 * are present. For longest-match tracking, record the
+		 * position unconditionally.
 		 * Skip the last level. It is handled after the loop.
 		 */
-		if (track_partial && i < key_depth - 1 && ft_node_internal(node_flag)) {
+		if (track && i < key_depth - 1 && ft_node_internal(node_flag)) {
 			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
 					ft_node_ptr(node_flag), type->order);
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
-			if (external_nodes) {
+			if (external_nodes || track_longest) {
 				match_len = i;
 				match_node = external_nodes;
 			}
@@ -2487,14 +2521,14 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 							type->order);
 		found = rcu_dereference(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
-		if (track_partial && found) {
+		if (track && (found || track_longest)) {
 			match_len = key_len;
 			match_node = found;
 		}
 	} else {
 		found = (struct cds_ft_node *) node_flag;
 		status = CDS_FT_STATUS_OK;
-		if (track_partial) {
+		if (track) {
 			match_len = key_len;
 			match_node = found;
 		}
@@ -2514,9 +2548,9 @@ end:
 		 */
 		iter->path_valid = (status == CDS_FT_STATUS_OK);
 	}
-	if (track_partial) {
-		*partial_match_len = match_len;
-		*partial_result_node = match_node;
+	if (track) {
+		*tracking_match_len = match_len;
+		*tracking_match_node = match_node;
 	}
 	return status;
 }
@@ -2525,13 +2559,15 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		struct cds_ft_node **result_node)
 {
-	return do_cds_ft_lookup(ft, key, key_len, result_node, NULL, NULL, NULL);
+	return do_cds_ft_lookup(ft, key, key_len, result_node, NULL,
+				FT_PREFIX_TRACK_NONE, NULL, NULL);
 }
 
 enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
-	return do_cds_ft_lookup(ft, iter->key, iter->key_len, NULL, iter, NULL, NULL);
+	return do_cds_ft_lookup(ft, iter->key, iter->key_len, NULL, iter,
+				FT_PREFIX_TRACK_NONE, NULL, NULL);
 }
 
 enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
@@ -2541,7 +2577,8 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 	struct cds_ft_node *partial_node = NULL;
 	size_t partial_len = 0;
 
-	do_cds_ft_lookup(ft, key, _key_len, NULL, NULL, &partial_len, &partial_node);
+	do_cds_ft_lookup(ft, key, _key_len, NULL, NULL,
+			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node);
 
 	*match_len = partial_len;
 	*result_node = partial_node;
@@ -2560,7 +2597,7 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 	 * ancestor with external nodes for partial-match semantics.
 	 */
 	do_cds_ft_lookup(ft, iter->key, iter->key_len, NULL, iter,
-			 &partial_len, &partial_node);
+			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node);
 
 	/*
 	 * Override the iterator's node and status with the partial-match
@@ -2570,6 +2607,60 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 	iter->key_len = partial_len;
 	iter->path_len = partial_len + 1;
 	iter->status = partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+	return iter->status;
+}
+
+enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t *match_len,
+		struct cds_ft_node **result_node)
+{
+	struct cds_ft_node *match_node = NULL;
+	size_t longest_len = 0;
+	enum cds_ft_status ret;
+
+	ret = do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
+			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node);
+
+	if (ret < 0) {
+		*match_len = 0;
+		*result_node = NULL;
+		return ret;
+	}
+	if (longest_len == FT_MATCH_LEN_NONE) {
+		*match_len = 0;
+		*result_node = NULL;
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	*match_len = longest_len;
+	*result_node = match_node;
+	return match_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_INTERNAL_MATCH;
+}
+
+enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	struct cds_ft_node *match_node = NULL;
+	size_t longest_len = 0;
+	enum cds_ft_status ret;
+
+	ret = do_cds_ft_lookup(ft, iter->key, iter->key_len, NULL, iter,
+			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node);
+
+	if (ret < 0) {
+		iter->node = NULL;
+		iter->status = ret;
+		return ret;
+	}
+	if (longest_len == FT_MATCH_LEN_NONE) {
+		iter->node = NULL;
+		iter->status = CDS_FT_STATUS_NOT_FOUND;
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	iter->node = match_node;
+	iter->key_len = longest_len;
+	iter->path_len = longest_len + 1;
+	iter->status = match_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_INTERNAL_MATCH;
+	iter->path_valid = true;
 	return iter->status;
 }
 
@@ -4602,6 +4693,8 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 		return "No node found";
 	case CDS_FT_STATUS_DUPLICATE_FOUND:
 		return "Duplicate node exists";
+	case CDS_FT_STATUS_INTERNAL_MATCH:
+		return "Match ends at an internal node";
 
 	/* Error return codes (< 0). */
 	case CDS_FT_STATUS_INVALID_ARGUMENT_ERROR:
