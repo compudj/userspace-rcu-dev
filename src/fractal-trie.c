@@ -4014,6 +4014,174 @@ retry:
 	return ret == 0 ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
+enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		struct cds_ft_node **result_node)
+{
+	unsigned int i, key_depth;
+	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
+	uint8_t snapshot_n[FT_MAX_DEPTH];
+	struct cds_ft_inode_flag *node_flag;
+	struct cds_ft_inode_flag **node_flag_ptr;
+	struct cds_ft_inode_flag **detach_node_flag_ptr,
+			**detach_parent_flag_ptr;
+	struct cds_ft_inode_flag **pp_flag_ptr, **p_flag_ptr;
+	bool pending_detach_node;
+	int nr_snapshot, ret;
+	const uint8_t *iter_key;
+	size_t key_len = ft_key_len(ft, iter->key_len);
+
+	if (!valid_key_len(ft, key_len)) {
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+
+	key_depth = key_len + 1;
+
+	/*
+	 * Handle NIL key (key_len == 0) specially to avoid edge cases
+	 * in the detach tracking for root-level external nodes.
+	 */
+	if (!key_len) {
+		node_flag = rcu_dereference(ft->root);
+
+		if (!ft_node_ptr(node_flag)) {
+			*result_node = NULL;
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
+		if (ft_node_internal(node_flag)) {
+			struct cds_ft_node *external_nodes;
+
+			external_nodes = ft->root_metadata.external_nodes;
+			if (!external_nodes) {
+				*result_node = NULL;
+				return CDS_FT_STATUS_NOT_FOUND;
+			}
+			*result_node = external_nodes;
+			rcu_assign_pointer(ft->root_metadata.external_nodes, NULL);
+			return CDS_FT_STATUS_OK;
+		}
+		/*
+		 * Root is a standalone external node for the NIL key.
+		 * Remove it directly.
+		 */
+		*result_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+		rcu_assign_pointer(ft->root, NULL);
+		ft->root_metadata.nr_child--;
+		iter->path_valid = false;
+		iter->path_len = 0;
+		return CDS_FT_STATUS_OK;
+	}
+
+retry:
+	nr_snapshot = 0;
+	iter_key = iter->key;
+	dbg_printf("cds_ft_remove_all attempt\n");
+
+	node_flag = rcu_dereference(ft->root);
+	node_flag_ptr = &ft->root;
+
+	pp_flag_ptr = NULL;
+	p_flag_ptr = &ft->root;
+	detach_parent_flag_ptr = &ft->root;
+	detach_node_flag_ptr = NULL;
+	pending_detach_node = true;
+
+	/* Iterate on all internal levels. */
+	for (i = 1; i < key_depth; i++) {
+		uint8_t key_value;
+		const struct cds_ft_metadata *metadata;
+
+		dbg_printf("cds_ft_remove_all iter node_flag %p\n", node_flag);
+		if (!ft_node_ptr(node_flag)) {
+			*result_node = NULL;
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
+
+		/* Track detach point pointers during descent. */
+		if (i == 1)
+			metadata = &ft->root_metadata;
+		else
+			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		if (metadata->nr_child > 1) {
+			detach_parent_flag_ptr = p_flag_ptr;
+			pending_detach_node = true;
+		} else if (i > 1 && metadata->external_nodes) {
+			detach_node_flag_ptr = p_flag_ptr;
+			detach_parent_flag_ptr = pp_flag_ptr;
+			pending_detach_node = false;
+		}
+
+		key_value = key_to_ordinal(ft, *(iter_key++));
+		snapshot_n[nr_snapshot + 1] = key_value;
+		snapshot[nr_snapshot++] = node_flag;
+		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
+		if (node_flag) {
+			pp_flag_ptr = p_flag_ptr;
+			p_flag_ptr = node_flag_ptr;
+			if (pending_detach_node) {
+				detach_node_flag_ptr = node_flag_ptr;
+				pending_detach_node = false;
+			}
+		}
+		dbg_printf("cds_ft_remove_all iter key lookup %u finds node_flag %p, node_flag_ptr %p\n",
+				(unsigned int) key_value, node_flag, node_flag_ptr);
+	}
+
+	/* Reached end of key. */
+	if (!ft_node_ptr(node_flag)) {
+		dbg_printf("cds_ft_remove_all: no node found for key\n");
+		*result_node = NULL;
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+
+	if (ft_node_internal(node_flag)) {
+		/* Internal node at end of key. Remove all external nodes from metadata. */
+		struct cds_ft_node *external_nodes;
+		struct cds_ft_metadata *metadata;
+
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		external_nodes = metadata->external_nodes;
+		if (!external_nodes) {
+			dbg_printf("cds_ft_remove_all: no metadata external nodes for key\n");
+			*result_node = NULL;
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
+		/*
+		 * Atomically remove the entire chain. The internal
+		 * node itself remains (it still has children). A grace
+		 * period must be observed before reclaiming any node
+		 * in the old chain.
+		 */
+		*result_node = external_nodes;
+		rcu_assign_pointer(metadata->external_nodes, NULL);
+		ret = 0;
+	} else {
+		/*
+		 * External node at end of key. Detach the branch.
+		 * This is the same as removing the last duplicate in
+		 * cds_ft_remove().
+		 */
+		*result_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+		snapshot[nr_snapshot++] = node_flag;
+		ret = ft_detach_node(ft, snapshot,
+				snapshot_n, nr_snapshot,
+				detach_node_flag_ptr,
+				detach_parent_flag_ptr);
+	}
+
+	if (ret == -EAGAIN || ret == -ENOENT)
+		goto retry;
+
+	iter->path_valid = false;
+	iter->path_len = 0;
+
+	if (ret)
+		return CDS_FT_STATUS_NOT_FOUND;
+
+	return CDS_FT_STATUS_OK;
+}
+
 size_t cds_ft_key_len(const struct cds_ft *ft)
 {
 	return ft->key_len;

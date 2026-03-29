@@ -487,6 +487,36 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_node *node);
 
 /*
+ * cds_ft_remove_all - Remove the entire duplicate chain at @iter position.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator position identifying the key.
+ *        If the iterator holds a valid path from a prior lookup,
+ *        the remove operation may use it to avoid a full traversal.
+ * @result_node: Node output. Set to the head of the removed duplicate
+ *               chain on success, or NULL if no node is found or on
+ *               error.
+ *
+ * Removes the key and all associated duplicate nodes from the trie.
+ * On success, *@result_node points to the head of the removed chain;
+ * the caller can traverse it with cds_ft_for_each_duplicate_rcu()
+ * under rcu_read_lock, or reclaim all nodes after a grace period.
+ * A grace period must be observed (e.g., synchronize_rcu, call_rcu)
+ * after success before reclaiming memory of any nodes in the chain.
+ *
+ * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
+ * no node is found at the iterator position, or a negative
+ * cds_ft_status on error.
+ *
+ * Mutual exclusion between updates (insert, insert_unique,
+ * insert_replace, replace, remove, remove_all) is the user's
+ * responsibility.
+ * An RCU read-side lock must be held while calling this function.
+ */
+enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		struct cds_ft_node **result_node);
+
+/*
  * Trie lifecycle
  */
 
