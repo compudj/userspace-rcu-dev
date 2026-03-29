@@ -149,6 +149,8 @@ struct cds_ft_node {
 	struct cds_ft_node *next;
 };
 
+#define cds_ft_entry(ptr, type, member)		caa_container_of(ptr, type, member)
+
 /*
  * cds_ft_node_init - Initialize Fractal Trie node.
  * @node: The node.
