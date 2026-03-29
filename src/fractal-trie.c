@@ -1989,8 +1989,7 @@ unsigned int find_nearest_type_index(unsigned int type_index,
 
 /*
  * ft_node_recompact_add: recompact a node, adding a new child.
- * Return 0 on success, -EAGAIN if need to retry, or other negative
- * error value otherwise.
+ * Return 0 on success or negative error value on error.
  */
 static
 int ft_node_recompact(enum ft_recompact mode,
@@ -2303,8 +2302,7 @@ fallback_toosmall:
 }
 
 /*
- * Return 0 on success, -EAGAIN if need to retry, or other negative
- * error value otherwise.
+ * Return 0 on success or negative error value on error.
  */
 static
 int ft_node_set_nth(struct cds_ft *ft,
@@ -2339,8 +2337,7 @@ int ft_node_set_nth(struct cds_ft *ft,
 }
 
 /*
- * Return 0 on success, -EAGAIN if need to retry, or other negative
- * error value otherwise.
+ * Return 0 on success or negative error value on error.
  */
 static
 int ft_node_replace_ptr(struct cds_ft *ft,
@@ -3250,7 +3247,6 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 	key_depth = key_len + 1;
 
-retry:
 	dbg_printf("cds_ft_insert attempt: node %p\n", node);
 	parent2_node_flag = NULL;
 	parent_node_flag = (struct cds_ft_inode_flag *) &ft->root;
@@ -3358,9 +3354,6 @@ retry:
 				(struct cds_ft_node *) ft_node_ptr(node_flag));
 	}
 
-	if (ret == -EAGAIN || ret == -EEXIST)
-		goto retry;
-
 	return ret;
 }
 
@@ -3438,7 +3431,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 	key_depth = key_len + 1;
 
-retry:
 	dbg_printf("_cds_ft_insert_replace attempt: node %p\n", node);
 	iter_key = key;
 	parent2_node_flag = NULL;
@@ -3519,9 +3511,6 @@ retry:
 				node_flag_ptr, node_flag, key, key_len, i, node,
 				(struct cds_ft_node *) ft_node_ptr(node_flag));
 	}
-
-	if (ret == -EAGAIN)
-		goto retry;
 
 	return ret;
 }
@@ -3835,7 +3824,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 
 	key_depth = key_len + 1;
 
-retry:
 	nr_snapshot = 0;
 	iter_key = iter->key;
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
@@ -3996,12 +3984,10 @@ retry:
 	}
 
 	/*
-	 * Explanation of -ENOENT handling: caused by concurrent delete
-	 * between RCU lookup and actual removal. Need to re-do the
-	 * lookup and removal attempt.
+	 * detach should not replace a NULL pointer because it has been
+	 * found by a mutex-protected traversal within this function.
 	 */
-	if (ret == -EAGAIN || ret == -ENOENT)
-		goto retry;
+	assert(ret != -ENOENT);
 
 	/*
 	 * Invalidate the iterator path. The trie structure may have
@@ -4073,7 +4059,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		return CDS_FT_STATUS_OK;
 	}
 
-retry:
 	nr_snapshot = 0;
 	iter_key = iter->key;
 	dbg_printf("cds_ft_remove_all attempt\n");
@@ -4170,8 +4155,11 @@ retry:
 				detach_parent_flag_ptr);
 	}
 
-	if (ret == -EAGAIN || ret == -ENOENT)
-		goto retry;
+	/*
+	 * detach should not replace a NULL pointer because it has been
+	 * found by a mutex-protected traversal within this function.
+	 */
+	assert(ret != -ENOENT);
 
 	iter->path_valid = false;
 	iter->path_len = 0;
