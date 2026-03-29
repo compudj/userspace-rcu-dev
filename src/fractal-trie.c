@@ -2582,8 +2582,15 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
  * key length, node, status, and path are written back into @iter so that
  * subsequent iteration / backtracking calls can reuse the state.
  *
- * @limit overrides the key: FT_LOOKUP_LIMIT_FIRST uses key_len 0,
- * FT_LOOKUP_LIMIT_LAST uses max_key_len.
+ * @limit overrides the key: FT_LOOKUP_LIMIT_FIRST uses key_len
+ * prefix_len, FT_LOOKUP_LIMIT_LAST uses max_key_len.
+ *
+ * Prefix-scoped traversal: when iter->prefix_len > 0, the traversal
+ * is confined to the subtree rooted at the prefix. Backtracking stops
+ * at the prefix boundary instead of the root. LIMIT_FIRST finds the
+ * smallest key within the prefix subtree. LIMIT_LAST descends using
+ * the actual prefix key bytes followed by 0xFF to find the greatest
+ * key within the prefix subtree.
  */
 static
 enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
@@ -2612,7 +2619,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		}
 		break;
 	case FT_LOOKUP_LIMIT_FIRST:
-		key_len = 0;
+		key_len = iter->prefix_len;
 		break;
 	case FT_LOOKUP_LIMIT_LAST:
 		key_len = ft->max_key_len;
@@ -2669,10 +2676,15 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 					key_to_ordinal(ft, input_key[level - 1]);
 				break;
 			case FT_LOOKUP_LIMIT_FIRST:
-				ordinal_key[level - 1] = 0x00;
+				ordinal_key[level - 1] =
+					key_to_ordinal(ft, input_key[level - 1]);
 				break;
 			case FT_LOOKUP_LIMIT_LAST:
-				ordinal_key[level - 1] = 0xff;
+				if ((size_t) level <= iter->prefix_len)
+					ordinal_key[level - 1] =
+						key_to_ordinal(ft, input_key[level - 1]);
+				else
+					ordinal_key[level - 1] = 0xff;
 				break;
 			}
 		}
@@ -2700,10 +2712,13 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			key_value = key_to_ordinal(ft, *(iter_key++));
 			break;
 		case FT_LOOKUP_LIMIT_FIRST:
-			assert(0);
+			key_value = key_to_ordinal(ft, input_key[level - 1]);
 			break;
 		case FT_LOOKUP_LIMIT_LAST:
-			key_value = 0xff;
+			if ((size_t) level <= iter->prefix_len)
+				key_value = key_to_ordinal(ft, input_key[level - 1]);
+			else
+				key_value = 0xff;
 			break;
 		}
 		node_flag = ft_node_get_nth(node_flag, NULL, key_value);
@@ -2767,6 +2782,11 @@ post_traversal:
 	 * current (recursively), and when we find one, get the
 	 * rightmost/leftmost child of its rightmost/leftmost child
 	 * (recursively).
+	 *
+	 * Prefix-scoped traversal: backtracking stops at
+	 * iter->prefix_len instead of 0, confining the search to the
+	 * prefix subtree. When prefix_len == 0 this is identical to
+	 * the original behavior.
 	 */
 	switch (mode) {
 	case FT_LOOKUP_LE:
@@ -2780,7 +2800,7 @@ post_traversal:
 	default:
 		assert(0);
 	}
-	for (; level > 0; level--) {
+	for (; level > (ssize_t) iter->prefix_len; level--) {
 		uint8_t key_value;
 
 		/*
@@ -2813,10 +2833,13 @@ post_traversal:
 			key_value = key_to_ordinal(ft, *(--iter_key));
 			break;
 		case FT_LOOKUP_LIMIT_FIRST:
-			key_value = 0x00;
+			key_value = key_to_ordinal(ft, input_key[level - 1]);
 			break;
 		case FT_LOOKUP_LIMIT_LAST:
-			key_value = 0xff;
+			if ((size_t) level <= iter->prefix_len)
+				key_value = key_to_ordinal(ft, input_key[level - 1]);
+			else
+				key_value = 0xff;
 			break;
 		}
 		/*
@@ -2835,6 +2858,58 @@ post_traversal:
 			break;
 		}
 		going_up = true;
+	}
+
+	/*
+	 * Prefix-scoped traversal: if backtracking exhausted the
+	 * scope without finding a sibling, handle the prefix
+	 * boundary.
+	 *
+	 * For LE/LT the prefix key itself (shorter than the search
+	 * key) may be the closest match: return its external_nodes
+	 * if present.
+	 *
+	 * For GE/GT no key within the scope satisfies the inequality.
+	 *
+	 * When going_up is false (e.g. LIMIT_FIRST/LIMIT_LAST
+	 * reaching the prefix node without backtracking), we fall
+	 * through to the downward min/max search below.
+	 */
+	if (going_up && level == (ssize_t) iter->prefix_len
+			&& iter->prefix_len > 0) {
+		if (dir == FT_LEFT) {
+			struct cds_ft_inode_flag *pfx_flag =
+				iter->path_node[iter->prefix_len];
+
+			if (ft_node_ptr(pfx_flag) && ft_node_internal(pfx_flag)) {
+				const struct cds_ft_type *type =
+					&ft_types[ft_node_type(pfx_flag)];
+				struct cds_ft_metadata *metadata =
+					cds_ft_item_to_metadata_fast(
+						ft_node_ptr(pfx_flag),
+						type->order);
+				struct cds_ft_node *external_nodes =
+					rcu_dereference(metadata->external_nodes);
+
+				if (external_nodes) {
+					int j;
+
+					iter->key_len = iter->prefix_len;
+					for (j = 0; j < (int) iter->prefix_len; j++)
+						iter->key[j] = ordinal_to_key(ft, ordinal_key[j]);
+					iter->node = external_nodes;
+					iter->path_valid = true;
+					iter->path_len = iter->prefix_len + 1;
+					iter->status = CDS_FT_STATUS_OK;
+					return iter->status;
+				}
+			}
+		}
+		iter->node = NULL;
+		iter->path_valid = true;
+		iter->path_len = iter->prefix_len + 1;
+		iter->status = CDS_FT_STATUS_NOT_FOUND;
+		return iter->status;
 	}
 
 	if (!ft_node_internal(node_flag)) {
@@ -2972,11 +3047,15 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 
 	dbg_printf("cds_ft_lookup_first\n");
 	/*
-	 * LIMIT_FIRST overrides key_len to 0 internally.
-	 * Temporarily clear key_len so the iterator state is
-	 * consistent, then restore on error.
+	 * LIMIT_FIRST sets key_len to prefix_len internally.
+	 * When prefix_len == 0 this corresponds to a traversal of the
+	 * entire trie.
+	 * When prefix_len > 0 it descends through the prefix key
+	 * bytes, then the GE post-traversal returns the prefix key
+	 * itself if it has external_nodes, or the LEFTMOST minmax
+	 * descent finds the smallest descendant.
 	 */
-	iter->key_len = 0;
+	iter->key_len = iter->prefix_len;
 	status = cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_GE, FT_LOOKUP_LIMIT_FIRST);
 	if (status < 0)
@@ -2991,6 +3070,14 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	enum cds_ft_status status;
 
 	dbg_printf("cds_ft_lookup_last\n");
+	/*
+	 * LIMIT_LAST always uses key_len = max_key_len. When
+	 * prefix_len > 0, the traversal uses actual prefix key bytes
+	 * for levels 1..prefix_len then 0xFF for the remaining
+	 * levels, descending as deep as possible along the rightmost
+	 * path within the prefix subtree. LE backtracking (bounded
+	 * at prefix_len) then finds the greatest actual key.
+	 */
 	iter->key_len = ft->max_key_len;
 	status = cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);

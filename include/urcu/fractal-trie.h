@@ -309,7 +309,7 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
 }
 
 /*
- * cds_ft_for_each - Iterate through all nodes in key order.
+ * cds_ft_for_each - Iterate through all (or prefix-scoped) nodes in key order.
  * @ft: The Fractal Trie (struct cds_ft *).
  * @iter: Iterator (struct cds_ft_iter *), used as loop cursor.
  *
@@ -317,6 +317,9 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * node (cds_ft_iter_node()), and status (cds_ft_iter_status()) at
  * each step. Check (cds_ft_iter_status(iter) < 0) after the loop
  * to detect errors.
+ *
+ * Use cds_ft_iter_set_key and cds_ft_iter_set_prefix_len on @iter to
+ * perform prefix-scoped iteration.
  *
  * An RCU read-side lock must be held while using this macro.
  */
@@ -326,7 +329,7 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
 			cds_ft_next((ft), (iter)))
 
 /*
- * cds_ft_for_each_reverse - Iterate through all nodes in reverse key order.
+ * cds_ft_for_each_reverse - Iterate through all (or prefix-scoped) nodes in reverse key order.
  * @ft: The Fractal Trie (struct cds_ft *).
  * @iter: Iterator (struct cds_ft_iter *), used as loop cursor.
  *
@@ -334,6 +337,9 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * node (cds_ft_iter_node()), and status (cds_ft_iter_status()) at
  * each step. Check (cds_ft_iter_status(iter) < 0) after the loop
  * to detect errors.
+ *
+ * Use cds_ft_iter_set_key and cds_ft_iter_set_prefix_len on @iter to
+ * perform prefix-scoped iteration.
  *
  * An RCU read-side lock must be held while using this macro.
  */
