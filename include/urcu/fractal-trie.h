@@ -10,6 +10,79 @@
  *
  * Userspace RCU library - Fractal Trie
  *
+ * A concurrent, RCU-protected ordered trie mapping variable or
+ * fixed-length byte keys to user-defined nodes. Keys are opaque
+ * byte sequences with no reserved or sentinel values; unlike
+ * tries that rely on NUL or other terminal characters, any byte
+ * value may appear at any position in a key. Lookups and
+ * traversals are wait-free under the RCU read-side lock and can
+ * proceed concurrently with mutations. The internal structure is
+ * acyclic by construction: no sequence of concurrent updates can
+ * introduce a cycle, ensuring that all lookups and traversals
+ * complete in bounded time. Supports exact lookup, partial
+ * (prefix) match, ordered iteration, duplicate key chains, and
+ * range queries (<=, >=, <, >).
+ *
+ * Performance characteristics:
+ *
+ * - Lookup: At most 2 cache-line accesses per key byte.
+ * - Ordered traversal: At most 3 cache-line accesses per node.
+ *
+ * Internal node configurations:
+ *
+ * Internal nodes self-adapt to the key population using several
+ * configurations (linear, 1D pool, 2D pool, pigeon), each with
+ * a different indexing strategy suited to its child density.
+ * The appropriate configuration is chosen automatically based
+ * on the number of children. Node sizes are powers of 2 between
+ * 16 bytes and 2048 bytes on 64-bit architectures (1024 bytes
+ * on 32-bit). Mutations use in-place updates when possible to
+ * minimize node recompaction, and hysteresis at size thresholds
+ * prevents repeated recompaction when the child count oscillates
+ * near a boundary.
+ *
+ * The 1D and 2D pool configurations partition the 8-bit key
+ * byte space using one or two bit positions respectively,
+ * distributing children across sub-nodes. This provides a
+ * range of intermediate node sizes between the compact linear
+ * configuration and the full 256-entry pigeon configuration,
+ * allowing memory-efficient representation of medium-density
+ * populations without requiring the full pigeon footprint.
+ * The bit positions are selected to minimize the maximum
+ * sub-node population, using a minimax criterion. The
+ * transition thresholds and worst-case sub-node sizes were
+ * empirically validated by brute-force enumeration of optimal
+ * bit selections across millions of random populations.
+ * Alternative approaches such as Judy use a population bitmap
+ * with a dense child array, which requires recompacting the
+ * array on every insertion or removal. This is incompatible
+ * with wait-free RCU lookups, since a reader could observe a
+ * partially recompacted array. The pool approach avoids this
+ * by using fixed index positions derived from key bits,
+ * allowing children to be added or removed with single-pointer
+ * updates visible atomically to concurrent readers.
+ *
+ * Node type and configuration are encoded in the low bits of
+ * child pointers (tagged pointers), so determining a node's
+ * layout during lookup requires no extra memory access.
+ *
+ * The 2D pool and pigeon configurations use a 32-byte bitmap
+ * to locate populated children via bit scanning, reducing the
+ * number of cache-line accesses needed for ordered traversal.
+ *
+ * Memory layout:
+ *
+ * Per-node metadata is stored in a separate page via a strided
+ * allocator and reached by pointer offset from the node address,
+ * keeping metadata out of the node's cache lines. This avoids
+ * padding overhead within nodes and ensures that lookups and
+ * traversals only touch the data they need. Internal nodes are
+ * reclaimed via RCU (call_rcu), so readers never access freed
+ * memory even for the trie's own internal structure.
+ *
+ * This provides memory efficiency comparable to adaptive radix
+ * tree schemes without requiring user tuning or configuration.
+ *
  * Include this file _after_ including your URCU flavor.
  */
 
