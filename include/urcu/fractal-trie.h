@@ -573,6 +573,22 @@ void cds_ft_destroy(struct cds_ft *ft);
 bool cds_ft_empty(struct cds_ft *ft);
 
 /*
+ * cds_ft_count - Return the number of external nodes in a Fractal Trie.
+ * @ft: The Fractal Trie.
+ *
+ * Returns the total number of external nodes (user-visible nodes)
+ * currently stored in the trie, including duplicates. Each
+ * successful insert increments this count by one; each successful
+ * remove decrements it by one; remove_all decrements it by the
+ * number of nodes in the removed chain.
+ *
+ * This function uses a relaxed atomic load and does not require
+ * the RCU read-side lock to be held. The result is a snapshot:
+ * concurrent updates may change the count at any time.
+ */
+unsigned long cds_ft_count(const struct cds_ft *ft);
+
+/*
  * cds_ft_key_len - Return the key length of a Fractal Trie.
  * @ft: The Fractal Trie.
  *

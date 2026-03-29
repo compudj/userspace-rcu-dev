@@ -150,8 +150,9 @@ struct cds_ft {
 
 	size_t max_tree_depth;
 	size_t key_len;
-	size_t max_key_len;	/* Maximum key length allowed. */
-	unsigned long nr_fallback;	/* Number of fallback nodes used */
+	size_t max_key_len;			/* Maximum key length allowed. */
+	unsigned long nr_external_nodes;	/* Number of external nodes. */
+	unsigned long nr_fallback;		/* Number of fallback nodes used */
 
 	const struct rcu_flavor_struct *flavor;
 
