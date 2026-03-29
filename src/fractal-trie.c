@@ -3158,16 +3158,29 @@ post_traversal:
 		 * trying to find GE/GT inequality and encountering an
 		 * external node when going downward.
 		 */
-		if (dir == FT_LEFTMOST && ft_node_internal(node_flag) &&
-				!skip_eq_external_nodes) {
-			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
-			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+		if (dir == FT_LEFTMOST && ft_node_internal(node_flag)
+				&& !skip_eq_external_nodes) {
+			struct cds_ft_metadata *metadata;
 
-			if (external_nodes) {
-				ret_node = external_nodes;
-				level--;
-				goto end;
+			/*
+			 * At the root level, external_nodes live in
+			 * ft->root_metadata, not in the root node's
+			 * allocation metadata.
+			 */
+			if (node_flag == iter->path_node[0]) {
+				metadata = &ft->root_metadata;
+			} else {
+				const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+				metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
+			}
+			{
+				struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+
+				if (external_nodes) {
+					ret_node = external_nodes;
+					level--;
+					goto end;
+				}
 			}
 		}
 		skip_eq_external_nodes = false;
