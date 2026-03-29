@@ -235,7 +235,7 @@ int test_free_all_nodes(struct cds_ft *ft)
 
 	rcu_read_lock();
 
-	cds_ft_for_each(ft, iter) {
+	cds_ft_for_each_rcu(ft, iter) {
 		struct cds_ft_node *node = cds_ft_iter_node(iter);
 		struct cds_ft_node *tmp_node;
 
@@ -1909,7 +1909,7 @@ int do_test_dictionary(void)
 	rcu_read_lock();
 
 	if (!reverse_sort) {
-		cds_ft_for_each(test_ft, iter) {
+		cds_ft_for_each_rcu(test_ft, iter) {
 			struct cds_ft_node *node = cds_ft_iter_node(iter);
 			uint8_t key[256];
 			size_t entry_key_len;
@@ -1919,7 +1919,7 @@ int do_test_dictionary(void)
 				printf("%.*s\n", (int) entry_key_len, key);
 		}
 	} else {
-		cds_ft_for_each_reverse(test_ft, iter) {
+		cds_ft_for_each_reverse_rcu(test_ft, iter) {
 			struct cds_ft_node *node = cds_ft_iter_node(iter);
 			uint8_t key[256];
 			size_t entry_key_len;
