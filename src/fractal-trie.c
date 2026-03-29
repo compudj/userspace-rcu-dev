@@ -2794,7 +2794,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	const uint8_t input_key[FT_MAX_KEY_LEN];
 	const uint8_t *iter_key;
 	size_t key_len;
-	bool going_up = false;
+	bool going_up = false, skip_eq_external_nodes;
 
 	switch (limit) {
 	case FT_LOOKUP_LIMIT_NONE:
@@ -3126,7 +3126,15 @@ post_traversal:
 	/*
 	 * Find rightmost/leftmost child of rightmost/leftmost child
 	 * (recursively).
+	 *
+	 * skip_eq_external_nodes: when entering the minmax descent
+	 * without backtracking (going_up == false) and the mode is
+	 * strictly GT, the external_nodes at the first node are at the
+	 * same position as the search key — equal, not strictly
+	 * greater. Skip them on the first iteration so the descent
+	 * continues to a proper child.
 	 */
+	skip_eq_external_nodes = (!going_up && mode == FT_LOOKUP_GT);
 	switch (mode) {
 	case FT_LOOKUP_LE:
 	case FT_LOOKUP_LT:
@@ -3145,7 +3153,8 @@ post_traversal:
 		 * trying to find GE/GT inequality and encountering an
 		 * external node when going downward.
 		 */
-		if (dir == FT_LEFTMOST && ft_node_internal(node_flag)) {
+		if (dir == FT_LEFTMOST && ft_node_internal(node_flag) &&
+				!skip_eq_external_nodes) {
 			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
@@ -3156,6 +3165,7 @@ post_traversal:
 				goto end;
 			}
 		}
+		skip_eq_external_nodes = false;
 		/* Return external node. */
 		if (!ft_node_internal(node_flag))
 			break;
