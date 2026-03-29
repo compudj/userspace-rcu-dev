@@ -199,7 +199,7 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft *ft, const char *ar
 	CDS_INIT_LIST_HEAD(&arena->ranges);
 	if (arena_name) {
 		arena->name = strdup(arena_name);
-		if (!arena_name)
+		if (!arena->name)
 			goto error_alloc;
 	}
 	pthread_mutex_init(&arena->lock, NULL);
