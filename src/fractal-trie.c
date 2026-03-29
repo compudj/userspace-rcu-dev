@@ -3403,6 +3403,268 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 }
 
 /*
+ * Insert a node, replacing the entire existing duplicate chain at the
+ * same key if one exists.
+ *
+ * On success, *@old_node_ret is set to the head of the replaced chain
+ * (or NULL if no prior node existed). The caller must wait for a grace
+ * period before reclaiming the old chain.
+ *
+ * Returns 0 on success, -EINVAL on bad arguments, or a negative errno
+ * on memory allocation failure.
+ */
+static
+int _cds_ft_insert_replace(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft_node *node,
+		struct cds_ft_node **old_node_ret)
+{
+	unsigned int i, key_depth;
+	struct cds_ft_inode_flag *attach_node_flag, *parent_node_flag,
+		*parent2_node_flag, *node_flag;
+	struct cds_ft_inode_flag **attach_node_flag_ptr,
+		**parent_node_flag_ptr, **node_flag_ptr;
+	const uint8_t *iter_key;
+	size_t key_len = ft_key_len(ft, _key_len);
+	int ret;
+
+	*old_node_ret = NULL;
+
+	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
+		return -EINVAL;
+	/* Expect zeroed next pointer. */
+	if (node->next)
+		return -EINVAL;
+
+	key_depth = key_len + 1;
+
+retry:
+	dbg_printf("_cds_ft_insert_replace attempt: node %p\n", node);
+	iter_key = key;
+	parent2_node_flag = NULL;
+	parent_node_flag = (struct cds_ft_inode_flag *) &ft->root;
+	parent_node_flag_ptr = NULL;
+	node_flag = ft->root;
+	node_flag_ptr = &ft->root;
+
+	for (i = 0; i < key_depth - 1; i++) {
+		uint8_t key_value;
+
+		if (!ft_node_ptr(node_flag))
+			break;
+		/* Found external node. */
+		if (!ft_node_internal(node_flag))
+			break;
+		dbg_printf("_cds_ft_insert_replace iter parent2_node_flag %p parent_node_flag %p node_flag_ptr %p node_flag %p\n",
+				parent2_node_flag, parent_node_flag, node_flag_ptr, node_flag);
+		key_value = key_to_ordinal(ft, *(iter_key++));
+		parent2_node_flag = parent_node_flag;
+		parent_node_flag = node_flag;
+		parent_node_flag_ptr = node_flag_ptr;
+		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
+	}
+
+	if (i == key_depth - 1) {
+		/* Found either an internal, external node or NULL at end of key. */
+		if (!ft_node_ptr(node_flag)) {
+			/* No existing node. Regular attach. */
+			dbg_printf("_cds_ft_insert_replace NULL at end of key\n");
+
+			attach_node_flag = parent_node_flag;
+			attach_node_flag_ptr = parent_node_flag_ptr;
+
+			ret = ft_attach_node(ft, attach_node_flag_ptr, attach_node_flag,
+					node_flag_ptr, node_flag, key, key_len, i, node,
+					NULL);
+		} else if (ft_node_internal(node_flag)) {
+			struct cds_ft_node *external_nodes;
+			struct cds_ft_metadata *metadata;
+
+			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+			external_nodes = metadata->external_nodes;
+			if (external_nodes) {
+				dbg_printf("_cds_ft_insert_replace: replacing internal metadata chain %p\n",
+						external_nodes);
+				/* Replace entire existing chain. */
+				*old_node_ret = external_nodes;
+				node->next = NULL;
+				rcu_assign_pointer(metadata->external_nodes, node);
+			} else {
+				/* No external nodes yet. Fresh insert. */
+				node->next = NULL;
+				rcu_assign_pointer(metadata->external_nodes, node);
+			}
+			ret = 0;
+		} else {
+			dbg_printf("_cds_ft_insert_replace: replacing external chain %p\n",
+					ft_node_ptr(node_flag));
+			/* External node at end of key. Replace chain. */
+			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(node_flag);
+			node->next = NULL;
+			rcu_assign_pointer(*node_flag_ptr, (struct cds_ft_inode_flag *) node);
+			ret = 0;
+		}
+	} else {
+		/*
+		 * Found NULL node or external node before end of key.
+		 * Attach a new branch, displacing any shorter-key
+		 * external node into the new branch's metadata.
+		 */
+		dbg_printf("_cds_ft_insert_replace: attach before end of key\n");
+
+		attach_node_flag = parent_node_flag;
+		attach_node_flag_ptr = parent_node_flag_ptr;
+
+		ret = ft_attach_node(ft, attach_node_flag_ptr, attach_node_flag,
+				node_flag_ptr, node_flag, key, key_len, i, node,
+				(struct cds_ft_node *) ft_node_ptr(node_flag));
+	}
+
+	if (ret == -EAGAIN)
+		goto retry;
+
+	return ret;
+}
+
+enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft_node *node,
+		struct cds_ft_node **result_node)
+{
+	struct cds_ft_node *old_node = NULL;
+	int ret;
+
+	ret = _cds_ft_insert_replace(ft, key, key_len, node, &old_node);
+	if (ret == -EINVAL) {
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	if (ret) {
+		*result_node = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+	*result_node = old_node;
+	if (old_node)
+		return CDS_FT_STATUS_DUPLICATE_FOUND;
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		struct cds_ft_node *old_node,
+		struct cds_ft_node *new_node)
+{
+	unsigned int i, key_depth;
+	struct cds_ft_inode_flag *node_flag;
+	struct cds_ft_inode_flag **node_flag_ptr;
+	struct cds_ft_node *iter_node, **iter_node_ptr, **prev_node_ptr, *match;
+	const uint8_t *iter_key;
+	size_t key_len = ft_key_len(ft, iter->key_len);
+
+	if (!valid_external_node(old_node) || !valid_external_node(new_node)
+			|| !valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	/* Expect zeroed next pointer on new_node. */
+	if (new_node->next)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+
+	key_depth = key_len + 1;
+	iter_key = iter->key;
+
+	dbg_printf("cds_ft_replace: old_node %p new_node %p\n", old_node, new_node);
+
+	node_flag = rcu_dereference(ft->root);
+	node_flag_ptr = &ft->root;
+
+	/* level 0: root node */
+	if (!ft_node_ptr(node_flag))
+		return CDS_FT_STATUS_NOT_FOUND;
+
+	/*
+	 * Handle NIL key (key_len == 0).
+	 */
+	if (!key_len) {
+		if (!ft_node_internal(node_flag)) {
+			/* Root is a standalone external node. */
+			iter_node_ptr = (struct cds_ft_node **) &ft->root;
+			iter_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+			goto find_and_replace;
+		}
+		/* Root is internal. Check metadata external_nodes. */
+		{
+			struct cds_ft_metadata *metadata = &ft->root_metadata;
+
+			if (!metadata->external_nodes)
+				return CDS_FT_STATUS_NOT_FOUND;
+			iter_node_ptr = (struct cds_ft_node **) &metadata->external_nodes;
+			iter_node = metadata->external_nodes;
+			goto find_and_replace;
+		}
+	}
+
+	/* Traverse internal levels. */
+	for (i = 1; i < key_depth; i++) {
+		uint8_t key_value;
+
+		if (!ft_node_internal(node_flag))
+			return CDS_FT_STATUS_NOT_FOUND;
+		key_value = key_to_ordinal(ft, *(iter_key++));
+		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
+		if (!ft_node_ptr(node_flag))
+			return CDS_FT_STATUS_NOT_FOUND;
+	}
+
+	/* Reached end of key. Locate the duplicate chain. */
+	if (ft_node_internal(node_flag)) {
+		struct cds_ft_metadata *metadata;
+
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		if (!metadata->external_nodes)
+			return CDS_FT_STATUS_NOT_FOUND;
+		iter_node_ptr = (struct cds_ft_node **) &metadata->external_nodes;
+		iter_node = metadata->external_nodes;
+	} else {
+		iter_node_ptr = (struct cds_ft_node **) node_flag_ptr;
+		iter_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+	}
+
+find_and_replace:
+	/*
+	 * Walk the duplicate chain to find old_node and track the
+	 * pointer that references it (prev_node_ptr).
+	 */
+	prev_node_ptr = NULL;
+	match = NULL;
+	cds_ft_for_each_duplicate(iter_node) {
+		if (match)
+			continue;
+		if (iter_node == old_node) {
+			prev_node_ptr = iter_node_ptr;
+			match = iter_node;
+		}
+		iter_node_ptr = &iter_node->next;
+	}
+
+	if (!match)
+		return CDS_FT_STATUS_NOT_FOUND;
+
+	/*
+	 * Splice new_node into the chain in place of old_node.
+	 * new_node inherits old_node's successor. The write barrier
+	 * within rcu_assign_pointer ensures new_node->next is visible
+	 * before the pointer that publishes new_node.
+	 */
+	new_node->next = old_node->next;
+	rcu_assign_pointer(*prev_node_ptr, new_node);
+
+	/*
+	 * The trie structure is unchanged (no recompaction), so the
+	 * iterator path remains valid.
+	 */
+	return CDS_FT_STATUS_OK;
+}
+
+/*
  * Note: there is no need to lookup the pointer address associated with
  * each node's nth item: it's already been done by cds_ft_remove, and
  * cds_ft_remove is protected by mutual exclusion of updaters.

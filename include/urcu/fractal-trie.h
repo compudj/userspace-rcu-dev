@@ -402,6 +402,71 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 		struct cds_ft_node **result_node);
 
 /*
+ * cds_ft_insert_replace - Insert @node at @key, replacing the existing
+ *                         duplicate chain.
+ * @ft: The Fractal Trie.
+ * @key: Key at which @node should be inserted (may be NULL if @key_len is 0).
+ * @key_len: Key length in bytes:
+ * - > 0: Explicit key length (must not exceed trie's max length).
+ * - 0: NIL key (zero-length).
+ * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ * @node: Node to insert.
+ * @result_node: Node output. Set to the head of the previously existing
+ *               duplicate chain if a key match existed, or NULL if no
+ *               previous node existed at this key. Set to NULL on error.
+ *
+ * Atomically inserts @node at @key, replacing any existing duplicate
+ * chain. If a chain was replaced, *@result_node points to the head
+ * of the old chain. A grace period must be observed (e.g.,
+ * synchronize_rcu, call_rcu) after success before reclaiming the old
+ * chain's memory.
+ *
+ * Returns CDS_FT_STATUS_OK on success (node inserted, no prior node
+ * existed). Returns CDS_FT_STATUS_DUPLICATE_FOUND on success when a
+ * prior duplicate chain was replaced (*@result_node is the old head).
+ * Returns a negative cds_ft_status on error.
+ *
+ * Mutual exclusion between updates (insert, insert_unique,
+ * insert_replace, replace, remove, remove_all) is the user's
+ * responsibility.
+ * An RCU read-side lock must be held while calling this function.
+ */
+enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft_node *node,
+		struct cds_ft_node **result_node);
+
+/*
+ * cds_ft_replace - Replace an existing node by a new node at the same key.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator position at which @old_node is expected.
+ *        If the iterator holds a valid path from a prior lookup,
+ *        the replace operation may use it to avoid a full traversal.
+ * @old_node: Node to replace. Must be currently present in the trie.
+ * @new_node: Node to insert in place of @old_node. Must be
+ *            initialized with cds_ft_node_init() before this call.
+ *
+ * Atomically replaces @old_node with @new_node in the duplicate
+ * chain at the iterator's key position. The @new_node inherits the
+ * position of @old_node in the chain. A grace period must be
+ * observed (e.g., synchronize_rcu, call_rcu) after success before
+ * reclaiming @old_node memory.
+ *
+ * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
+ * @old_node is not found at the iterator position, or a negative
+ * cds_ft_status on error.
+ *
+ * Mutual exclusion between updates (insert, insert_unique,
+ * insert_replace, replace, remove, remove_all) is the user's
+ * responsibility.
+ * An RCU read-side lock must be held while calling this function.
+ */
+enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		struct cds_ft_node *old_node,
+		struct cds_ft_node *new_node);
+
+/*
  * cds_ft_remove - Remove @node at @iter position.
  * @ft: The Fractal Trie.
  * @iter: Iterator position at which @node is expected.
