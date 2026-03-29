@@ -3152,6 +3152,7 @@ post_traversal:
 
 			if (external_nodes) {
 				ret_node = external_nodes;
+				level--;
 				goto end;
 			}
 		}
