@@ -3346,10 +3346,19 @@ int ft_attach_node(struct cds_ft *ft,
 
 	/* Chain previous external node into new branch topmost internal node metadata. */
 	if (external_nodes) {
-		struct cds_ft_metadata *iter_node_metadata;
+		if (level == 0) {
+			/*
+			 * The displaced node has a NIL key (depth 0).
+			 * It belongs in root_metadata, not in the
+			 * topmost created node (which is at depth 1).
+			 */
+			metadata->external_nodes = external_nodes;
+		} else {
+			struct cds_ft_metadata *iter_node_metadata;
 
-		iter_node_metadata = cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
-		iter_node_metadata->external_nodes = external_nodes;
+			iter_node_metadata = cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
+			iter_node_metadata->external_nodes = external_nodes;
+		}
 	}
 
 	/* Publish branch. */
