@@ -1014,6 +1014,101 @@ uint32_t cds_ft_key_to_u32(const struct cds_ft *ft, const uint8_t *key, size_t k
 void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key, size_t key_len);
 
 /*
+ * Signed integer key helpers.
+ *
+ * These helpers convert between signed integers and Fractal Trie keys.
+ * The sign bit is flipped so that the big-endian byte ordering used by
+ * the trie preserves the natural signed integer ordering:
+ *
+ *   INT64_MIN  -> 0x0000000000000000   (sorts first)
+ *   -1         -> 0x7FFFFFFFFFFFFFFF
+ *    0         -> 0x8000000000000000
+ *   INT64_MAX  -> 0xFFFFFFFFFFFFFFFF   (sorts last)
+ *
+ * The same principle applies to 32-bit signed integers.
+ *
+ * When the key is narrower than the integer type (e.g. a 2-byte key
+ * representing a signed 16-bit range within a 64-bit integer), the
+ * sign bit is at position (key_len * 8 - 1), not at the MSB of the
+ * full integer type. The key-to-integer helpers sign-extend from the
+ * key's MSB to fill the integer. The integer-to-key helpers flip the
+ * sign bit at the key's MSB and truncate to the key width.
+ */
+
+/*
+ * cds_ft_key_to_s64 - Convert a Fractal Trie key to a signed 64-bit integer.
+ * @ft: The Fractal Trie.
+ * @key: Key to convert from (input). May be NULL if @key_len is 0.
+ * @key_len: Key length in bytes:
+ * - > 0: Explicit key length.
+ * - 0: NIL key (returns 0).
+ * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ *
+ * This helper function expects a Fractal Trie with a fixed key length <= 8.
+ * When the key is narrower than 8 bytes, the result is sign-extended to
+ * 64 bits.
+ *
+ * Returns 0 if @key_len is 0, exceeds 8, or is invalid for this trie's
+ * configuration.
+ */
+int64_t cds_ft_key_to_s64(const struct cds_ft *ft, const uint8_t *key, size_t key_len);
+
+/*
+ * cds_ft_s64_to_key - Convert a signed 64-bit integer to a Fractal Trie key.
+ * @ft: The Fractal Trie.
+ * @v: Value to convert from.
+ * @key: Key to convert to (output). Should provide enough space for the
+ * trie's max key length.
+ * @key_len: Key length in bytes:
+ * - > 0: Explicit key length.
+ * - 0: NIL key (no-op).
+ * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ *
+ * This helper function expects a Fractal Trie with a fixed key length <= 8.
+ * It truncates the most significant bits beyond the Fractal Trie key range.
+ *
+ * No-op if @key_len is 0, exceeds 8, or is invalid for this trie's
+ * configuration.
+ */
+void cds_ft_s64_to_key(const struct cds_ft *ft, int64_t v, uint8_t *key, size_t key_len);
+
+/*
+ * cds_ft_key_to_s32 - Convert a Fractal Trie key to a signed 32-bit integer.
+ * @ft: The Fractal Trie.
+ * @key: Key to convert from (input). May be NULL if @key_len is 0.
+ * @key_len: Key length in bytes:
+ * - > 0: Explicit key length.
+ * - 0: NIL key (returns 0).
+ * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ *
+ * This helper function expects a Fractal Trie with a fixed key length <= 4.
+ * When the key is narrower than 4 bytes, the result is sign-extended to
+ * 32 bits.
+ *
+ * Returns 0 if @key_len is 0, exceeds 4, or is invalid for this trie's
+ * configuration.
+ */
+int32_t cds_ft_key_to_s32(const struct cds_ft *ft, const uint8_t *key, size_t key_len);
+
+/*
+ * cds_ft_s32_to_key - Convert a signed 32-bit integer to a Fractal Trie key.
+ * @ft: The Fractal Trie.
+ * @v: Value to convert from.
+ * @key: Key to convert to (output). Should provide enough space for the
+ * trie's max key length.
+ * @key_len: Key length in bytes:
+ * - > 0: Explicit key length.
+ * - 0: NIL key (no-op).
+ * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ *
+ * This helper function expects a Fractal Trie with a fixed key length <= 4.
+ *
+ * No-op if @key_len is 0, exceeds 4, or is invalid for this trie's
+ * configuration.
+ */
+void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t key_len);
+
+/*
  * Diagnostics
  */
 

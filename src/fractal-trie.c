@@ -481,6 +481,106 @@ void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key,
 	memcpy(key, u.array + sizeof(u.array) - key_len , key_len);
 }
 
+/*
+ * Signed integer key helpers.
+ *
+ * Signed integers need a sign-bit flip (XOR with the MSB of the
+ * key-width value) so that the big-endian byte ordering used by the
+ * Fractal Trie preserves the natural signed ordering.
+ *
+ * When the key is the full width of the integer type (e.g. 8 bytes
+ * for int64_t), the mapping is:
+ *
+ *   INT64_MIN  -> 0x0000000000000000   (sorts first)
+ *   -1         -> 0x7FFFFFFFFFFFFFFF
+ *    0         -> 0x8000000000000000
+ *   INT64_MAX  -> 0xFFFFFFFFFFFFFFFF   (sorts last)
+ *
+ * The same principle applies to 32-bit signed integers.
+ *
+ * When the key is narrower than the integer type (e.g. a 2-byte key
+ * representing a signed 16-bit range within a 64-bit integer), the
+ * sign bit is at position (key_len * 8 - 1), not at the MSB of the
+ * full integer.  The key-to-integer direction therefore sign-extends
+ * from the key's MSB to fill the integer.
+ */
+
+int64_t cds_ft_key_to_s64(const struct cds_ft *ft, const uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	unsigned int shift;
+	uint64_t u;
+
+	assert(key_len <= 8);
+	if (key_len == 0 || key_len > 8)
+		return 0;
+	u = cds_ft_key_to_u64(ft, key, _key_len);
+	shift = key_len * 8;
+	/* Flip sign bit (MSB of key-width value) to recover signed encoding. */
+	u ^= 1ULL << (shift - 1);
+	/* Sign-extend from key width to 64 bits. */
+	if (shift < 64) {
+		uint64_t sign_bit = 1ULL << (shift - 1);
+
+		if (u & sign_bit)
+			u |= ~((1ULL << shift) - 1);
+	}
+	return (int64_t) u;
+}
+
+void cds_ft_s64_to_key(const struct cds_ft *ft, int64_t v, uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	unsigned int shift;
+
+	assert(key_len <= 8);
+	if (key_len == 0 || key_len > 8)
+		return;
+	shift = key_len * 8;
+	/* Flip sign bit so that negative values sort before positive. */
+	cds_ft_u64_to_key(ft, (uint64_t) v ^ ( 1ULL << (shift - 1)), key, _key_len);
+}
+
+int32_t cds_ft_key_to_s32(const struct cds_ft *ft, const uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	unsigned int shift;
+	uint32_t u;
+
+	assert(key_len <= 4);
+	if (key_len == 0 || key_len > 4)
+		return 0;
+	u = cds_ft_key_to_u32(ft, key, _key_len);
+	shift = key_len * 8;
+	/* Flip sign bit (MSB of key-width value) to recover signed encoding. */
+	u ^= 1U << (shift - 1);
+	/* Sign-extend from key width to 32 bits. */
+	if (shift < 32) {
+		uint32_t sign_bit = 1U << (shift - 1);
+
+		if (u & sign_bit)
+			u |= ~((1U << shift) - 1);
+	}
+	return (int32_t) u;
+}
+
+void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	unsigned int shift;
+
+	assert(key_len <= 4);
+	if (key_len == 0 || key_len > 4)
+		return;
+	shift = key_len * 8;
+	/* Flip sign bit so that negative values sort before positive. */
+	cds_ft_u32_to_key(ft, (uint32_t) v ^ (1U << (shift - 1)), key, _key_len);
+}
+
 static
 uint8_t key_to_ordinal(const struct cds_ft *ft, uint8_t key)
 {
