@@ -2431,6 +2431,1220 @@ out:
 
 /* ================================================================== */
 /*                                                                    */
+/*                9. GRAFT, GRAFT_SWAP & DETACH TESTS                 */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Helper: drain every node from @ft without destroying the group.
+ * Returns 0 on success, -1 on error.
+ */
+static int drain_trie(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+	int ret = 0;
+
+	s = cds_ft_iter_create(ft, &iter);
+	if (s < 0)
+		return -1;
+
+	rcu_read_lock();
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
+
+		s = cds_ft_remove_all(ft, iter, &head);
+		if (s < 0) {
+			ret = -1;
+			break;
+		}
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
+			node_free_rcu(to_test_node(head));
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return ret;
+}
+
+/*
+ * Graft basic: populate a staging trie offline, graft it into a live
+ * trie at a prefix, verify all grafted keys are reachable and that
+ * the staging trie is empty afterward.
+ */
+static int test_graft_basic(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long count;
+
+	live = create_varlen_ft(&group);
+	if (cds_ft_create(group, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Phase 1: populate staging offline (no lock needed). */
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		s = cds_ft_insert(staging, (const uint8_t *)"lo", 2, &n1->node);
+		if (s < 0) goto fail;
+		s = cds_ft_insert(staging, (const uint8_t *)"lp", 2, &n2->node);
+		if (s < 0) goto fail;
+	}
+
+	/* Phase 2: graft staging into live at prefix "he". */
+	rcu_read_lock();
+	s = cds_ft_graft(live, (const uint8_t *)"he", 2, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_basic: graft: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Staging should be empty. */
+	if (!cds_ft_empty(staging)) {
+		fprintf(stderr, "graft_basic: staging not empty after graft\n");
+		goto fail;
+	}
+
+	/* Live trie should contain "helo" and "help". */
+	rcu_read_lock();
+	s = cds_ft_lookup_key(live, (const uint8_t *)"helo", 4, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "graft_basic: lookup 'helo': %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	s = cds_ft_lookup_key(live, (const uint8_t *)"help", 4, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "graft_basic: lookup 'help': %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	count = cds_ft_count(live);
+	rcu_read_unlock();
+	if (count != 2) {
+		fprintf(stderr, "graft_basic: live count %lu, expected 2\n", count);
+		goto fail;
+	}
+
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Graft at root: graft an entire staging trie at the root (key_len=0).
+ */
+static int test_graft_at_root(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+
+	live = create_varlen_ft(&group);
+	if (cds_ft_create(group, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	{
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(staging, (const uint8_t *)"abc", 3, &n->node);
+		if (s < 0) goto fail;
+	}
+
+	rcu_read_lock();
+	s = cds_ft_graft(live, NULL, 0, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_at_root: graft: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Key should be "abc" — no prefix prepended. */
+	rcu_read_lock();
+	s = cds_ft_lookup_key(live, (const uint8_t *)"abc", 3, &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "graft_at_root: lookup 'abc': %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Graft into a populated destination returns POPULATED_ERROR.
+ */
+static int test_graft_populated_error(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	enum cds_ft_status s;
+
+	live = create_varlen_ft(&group);
+	if (cds_ft_create(group, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate live at key "ab". */
+	{
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		s = cds_ft_insert(live, (const uint8_t *)"ab", 2, &n->node);
+		rcu_read_unlock();
+		if (s < 0) goto fail;
+	}
+
+	/* Populate staging with something to graft. */
+	{
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(staging, (const uint8_t *)"cd", 2, &n->node);
+		if (s < 0) goto fail;
+	}
+
+	/* Graft staging at "ab" should fail — "ab" is already populated. */
+	rcu_read_lock();
+	s = cds_ft_graft(live, (const uint8_t *)"ab", 2, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_POPULATED_ERROR) {
+		fprintf(stderr, "graft_populated: expected POPULATED_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Staging should still hold its content (graft failed). */
+	if (cds_ft_empty(staging)) {
+		fprintf(stderr, "graft_populated: staging should not be empty after failed graft\n");
+		goto fail;
+	}
+
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Graft with tries from different groups returns INVALID_ARGUMENT_ERROR.
+ */
+static int test_graft_different_group_error(void)
+{
+	struct cds_ft_group *group1, *group2;
+	struct cds_ft *ft1, *ft2;
+	enum cds_ft_status s;
+
+	ft1 = create_varlen_ft(&group1);
+	ft2 = create_varlen_ft(&group2);
+
+	rcu_read_lock();
+	s = cds_ft_graft(ft1, NULL, 0, ft2);
+	rcu_read_unlock();
+
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "graft_different_group: expected INVALID_ARGUMENT_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		cds_ft_destroy(ft2);
+		cds_ft_group_destroy(group2);
+		cds_ft_destroy(ft1);
+		cds_ft_group_destroy(group1);
+		return -1;
+	}
+
+	cds_ft_destroy(ft2);
+	cds_ft_group_destroy(group2);
+	cds_ft_destroy(ft1);
+	cds_ft_group_destroy(group1);
+	return 0;
+}
+
+/*
+ * Graft a trie into itself returns INVALID_ARGUMENT_ERROR.
+ */
+static int test_graft_self_error(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+
+	rcu_read_lock();
+	s = cds_ft_graft(ft, NULL, 0, ft);
+	rcu_read_unlock();
+
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "graft_self: expected INVALID_ARGUMENT_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * Graft that would exceed the group's max key length returns
+ * OVERFLOW_ERROR.
+ */
+static int test_graft_overflow_error(void)
+{
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	enum cds_ft_status s;
+
+	/* Create a group with max_key_len = 4. */
+	if (cds_ft_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_attr_set_max_key_len(attr, 4) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_attr_destroy(attr);
+
+	if (cds_ft_create(group, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Insert a 3-byte key into staging. */
+	{
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(staging, (const uint8_t *)"abc", 3, &n->node);
+		if (s < 0) {
+			node_free(n);
+			goto cleanup;
+		}
+	}
+
+	/*
+	 * Graft staging at a 2-byte prefix: combined length = 2 + 3 = 5,
+	 * which exceeds max_key_len = 4.
+	 */
+	rcu_read_lock();
+	s = cds_ft_graft(live, (const uint8_t *)"XY", 2, staging);
+	rcu_read_unlock();
+
+	if (s != CDS_FT_STATUS_OVERFLOW_ERROR) {
+		fprintf(stderr, "graft_overflow: expected OVERFLOW_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		drain_trie(staging);
+		drain_trie(live);
+		rcu_barrier();
+		cds_ft_destroy(staging);
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Staging should still own its content. */
+	if (cds_ft_empty(staging)) {
+		fprintf(stderr, "graft_overflow: staging empty after failed graft\n");
+		drain_trie(live);
+		drain_trie(staging);
+		rcu_barrier();
+		cds_ft_destroy(staging);
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	drain_trie(staging);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+cleanup:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * graft_swap basic: the swap trie's content replaces whatever is at
+ * the graft point, and the old content moves into the swap trie.
+ */
+static int test_graft_swap_basic(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long count;
+
+	live = create_varlen_ft(&group);
+	if (cds_ft_create(group, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate live with keys under prefix "ab": "abX" and "abY". */
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		n1->value = 1;
+		n2->value = 2;
+		rcu_read_lock();
+		s = cds_ft_insert(live, (const uint8_t *)"abX", 3, &n1->node);
+		if (s < 0) { rcu_read_unlock(); goto fail; }
+		s = cds_ft_insert(live, (const uint8_t *)"abY", 3, &n2->node);
+		if (s < 0) { rcu_read_unlock(); goto fail; }
+		rcu_read_unlock();
+	}
+
+	/* Populate swap with keys that will replace the "ab" subtree. */
+	{
+		struct ft_test_node *n = node_alloc(0);
+
+		n->value = 99;
+		s = cds_ft_insert(swap, (const uint8_t *)"Z", 1, &n->node);
+		if (s < 0) goto fail;
+	}
+
+	/* Swap at prefix "ab". */
+	rcu_read_lock();
+	s = cds_ft_graft_swap(live, (const uint8_t *)"ab", 2, swap);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_basic: swap: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Live should now have "abZ" (value 99), not "abX"/"abY". */
+	rcu_read_lock();
+	s = cds_ft_lookup_key(live, (const uint8_t *)"abZ", 3, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "graft_swap_basic: lookup 'abZ' failed: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	if (to_test_node(found)->value != 99) {
+		fprintf(stderr, "graft_swap_basic: 'abZ' has wrong value\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	s = cds_ft_lookup_key(live, (const uint8_t *)"abX", 3, &found);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "graft_swap_basic: 'abX' should be gone\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+
+	/* Swap trie should now contain the old content: "X" and "Y"
+	 * (prefix "ab" stripped). */
+	if (cds_ft_empty(swap)) {
+		fprintf(stderr, "graft_swap_basic: swap trie is empty, expected old content\n");
+		goto fail;
+	}
+	rcu_read_lock();
+	count = cds_ft_count(swap);
+	rcu_read_unlock();
+	if (count != 2) {
+		fprintf(stderr, "graft_swap_basic: swap count %lu, expected 2\n", count);
+		goto fail;
+	}
+
+	/* After a grace period, drain the old content from swap. */
+	synchronize_rcu();
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * graft_swap into an empty position: the swap trie's content is
+ * grafted and the swap trie becomes empty (nothing was at that key).
+ */
+static int test_graft_swap_into_empty(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+
+	live = create_varlen_ft(&group);
+	if (cds_ft_create(group, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Swap trie has one node. */
+	{
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(swap, (const uint8_t *)"cd", 2, &n->node);
+		if (s < 0) goto fail;
+	}
+
+	/* Swap at prefix "ab" where live is empty. */
+	rcu_read_lock();
+	s = cds_ft_graft_swap(live, (const uint8_t *)"ab", 2, swap);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_into_empty: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Swap should be empty — nothing was at "ab" before. */
+	if (!cds_ft_empty(swap)) {
+		fprintf(stderr, "graft_swap_into_empty: swap trie not empty\n");
+		goto fail;
+	}
+
+	/* Live should contain "abcd". */
+	rcu_read_lock();
+	s = cds_ft_lookup_key(live, (const uint8_t *)"abcd", 4, &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "graft_swap_into_empty: lookup 'abcd': %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * graft_swap at root: exchange the entire trie content.
+ */
+static int test_graft_swap_at_root(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long live_count, swap_count;
+
+	live = create_varlen_ft(&group);
+	if (cds_ft_create(group, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate live with "aa" and "bb". */
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		rcu_read_lock();
+		cds_ft_insert(live, (const uint8_t *)"aa", 2, &n1->node);
+		cds_ft_insert(live, (const uint8_t *)"bb", 2, &n2->node);
+		rcu_read_unlock();
+	}
+
+	/* Populate swap with "xx". */
+	{
+		struct ft_test_node *n = node_alloc(0);
+
+		cds_ft_insert(swap, (const uint8_t *)"xx", 2, &n->node);
+	}
+
+	/* Swap at root. */
+	rcu_read_lock();
+	s = cds_ft_graft_swap(live, NULL, 0, swap);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_at_root: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Live should now have "xx", swap should have "aa" and "bb". */
+	rcu_read_lock();
+	live_count = cds_ft_count(live);
+	swap_count = cds_ft_count(swap);
+	s = cds_ft_lookup_key(live, (const uint8_t *)"xx", 2, &found);
+	rcu_read_unlock();
+
+	if (live_count != 1 || s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "graft_swap_at_root: live should have 'xx' only (count=%lu)\n",
+			live_count);
+		goto fail;
+	}
+	if (swap_count != 2) {
+		fprintf(stderr, "graft_swap_at_root: swap count %lu, expected 2\n",
+			swap_count);
+		goto fail;
+	}
+
+	synchronize_rcu();
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * graft_swap a trie with itself returns INVALID_ARGUMENT_ERROR.
+ */
+static int test_graft_swap_self_error(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+
+	rcu_read_lock();
+	s = cds_ft_graft_swap(ft, NULL, 0, ft);
+	rcu_read_unlock();
+
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "graft_swap_self: expected INVALID_ARGUMENT_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * graft_swap with tries from different groups returns
+ * INVALID_ARGUMENT_ERROR.
+ */
+static int test_graft_swap_different_group_error(void)
+{
+	struct cds_ft_group *group1, *group2;
+	struct cds_ft *ft1, *ft2;
+	enum cds_ft_status s;
+
+	ft1 = create_varlen_ft(&group1);
+	ft2 = create_varlen_ft(&group2);
+
+	rcu_read_lock();
+	s = cds_ft_graft_swap(ft1, NULL, 0, ft2);
+	rcu_read_unlock();
+
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "graft_swap_different_group: expected INVALID_ARGUMENT_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		cds_ft_destroy(ft2);
+		cds_ft_group_destroy(group2);
+		cds_ft_destroy(ft1);
+		cds_ft_group_destroy(group1);
+		return -1;
+	}
+
+	cds_ft_destroy(ft2);
+	cds_ft_group_destroy(group2);
+	cds_ft_destroy(ft1);
+	cds_ft_group_destroy(group1);
+	return 0;
+}
+
+/*
+ * Detach basic: insert nodes sharing a prefix, detach that prefix,
+ * verify the detached trie contains the nodes (with stripped keys)
+ * and the original trie no longer has them.
+ */
+static int test_detach_basic(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft, *detached = NULL;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long count;
+
+	ft = create_varlen_ft(&group);
+
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+		struct ft_test_node *n3 = node_alloc(0);
+
+		n1->value = 10;
+		n2->value = 20;
+		n3->value = 30;
+
+		rcu_read_lock();
+		cds_ft_insert(ft, (const uint8_t *)"abX", 3, &n1->node);
+		cds_ft_insert(ft, (const uint8_t *)"abY", 3, &n2->node);
+		/* A key outside the detach prefix. */
+		cds_ft_insert(ft, (const uint8_t *)"cd",  2, &n3->node);
+		rcu_read_unlock();
+	}
+
+	/* Detach everything under "ab". */
+	rcu_read_lock();
+	s = cds_ft_detach(ft, (const uint8_t *)"ab", 2, &detached);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !detached) {
+		fprintf(stderr, "detach_basic: detach: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Original trie should only have "cd". */
+	rcu_read_lock();
+	count = cds_ft_count(ft);
+	s = cds_ft_lookup_key(ft, (const uint8_t *)"abX", 3, &found);
+	rcu_read_unlock();
+	if (count != 1) {
+		fprintf(stderr, "detach_basic: original count %lu, expected 1\n", count);
+		goto fail;
+	}
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "detach_basic: 'abX' still in original after detach\n");
+		goto fail;
+	}
+
+	/* Detached trie should have "X" and "Y" (prefix "ab" stripped). */
+	rcu_read_lock();
+	count = cds_ft_count(detached);
+	s = cds_ft_lookup_key(detached, (const uint8_t *)"X", 1, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "detach_basic: lookup 'X' in detached: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	if (to_test_node(found)->value != 10) {
+		fprintf(stderr, "detach_basic: 'X' wrong value\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	s = cds_ft_lookup_key(detached, (const uint8_t *)"Y", 1, &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "detach_basic: lookup 'Y' in detached: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+	if (count != 2) {
+		fprintf(stderr, "detach_basic: detached count %lu, expected 2\n", count);
+		goto fail;
+	}
+
+	/* Bulk-removal pattern: grace period, then drain locally. */
+	synchronize_rcu();
+	drain_trie(detached);
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(detached);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	if (detached) {
+		drain_trie(detached);
+		cds_ft_destroy(detached);
+	}
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Detach at root: detach everything from the trie.
+ */
+static int test_detach_at_root(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft, *detached = NULL;
+	enum cds_ft_status s;
+	unsigned long count;
+
+	ft = create_varlen_ft(&group);
+
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		rcu_read_lock();
+		cds_ft_insert(ft, (const uint8_t *)"foo", 3, &n1->node);
+		cds_ft_insert(ft, (const uint8_t *)"bar", 3, &n2->node);
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	s = cds_ft_detach(ft, NULL, 0, &detached);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !detached) {
+		fprintf(stderr, "detach_at_root: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Original should be empty. */
+	if (!cds_ft_empty(ft)) {
+		fprintf(stderr, "detach_at_root: original not empty\n");
+		goto fail;
+	}
+
+	/* Detached should have both nodes with same keys. */
+	rcu_read_lock();
+	count = cds_ft_count(detached);
+	rcu_read_unlock();
+	if (count != 2) {
+		fprintf(stderr, "detach_at_root: detached count %lu, expected 2\n", count);
+		goto fail;
+	}
+
+	synchronize_rcu();
+	drain_trie(detached);
+	rcu_barrier();
+	cds_ft_destroy(detached);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	if (detached) {
+		drain_trie(detached);
+		cds_ft_destroy(detached);
+	}
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Detach at a key with no content returns NOT_FOUND.
+ */
+static int test_detach_not_found(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft, *detached = NULL;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+
+	/* Insert at "foo", detach at "bar" — nothing there. */
+	{
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		cds_ft_insert(ft, (const uint8_t *)"foo", 3, &n->node);
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	s = cds_ft_detach(ft, (const uint8_t *)"bar", 3, &detached);
+	rcu_read_unlock();
+
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "detach_not_found: expected NOT_FOUND, got %s\n",
+			cds_ft_status_to_string(s));
+		if (detached) {
+			drain_trie(detached);
+			cds_ft_destroy(detached);
+		}
+		drain_trie(ft);
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Original trie should still have "foo". */
+	rcu_read_lock();
+	{
+		struct cds_ft_node *found;
+
+		s = cds_ft_lookup_key(ft, (const uint8_t *)"foo", 3, &found);
+		if (s != CDS_FT_STATUS_OK || !found) {
+			fprintf(stderr, "detach_not_found: 'foo' missing after failed detach\n");
+			rcu_read_unlock();
+			drain_trie(ft);
+			rcu_barrier();
+			cds_ft_destroy(ft);
+			cds_ft_group_destroy(group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * Detach, then graft the detached trie back at a different prefix.
+ */
+static int test_detach_then_graft(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft, *detached = NULL;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long count;
+
+	ft = create_varlen_ft(&group);
+
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		n1->value = 1;
+		n2->value = 2;
+
+		rcu_read_lock();
+		cds_ft_insert(ft, (const uint8_t *)"abX", 3, &n1->node);
+		cds_ft_insert(ft, (const uint8_t *)"abY", 3, &n2->node);
+		rcu_read_unlock();
+	}
+
+	/* Detach "ab" subtree. */
+	rcu_read_lock();
+	s = cds_ft_detach(ft, (const uint8_t *)"ab", 2, &detached);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !detached) {
+		fprintf(stderr, "detach_then_graft: detach: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Graft detached content at new prefix "zz". */
+	rcu_read_lock();
+	s = cds_ft_graft(ft, (const uint8_t *)"zz", 2, detached);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "detach_then_graft: graft: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Original "ab*" keys should be gone; "zz*" should exist. */
+	rcu_read_lock();
+	s = cds_ft_lookup_key(ft, (const uint8_t *)"abX", 3, &found);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "detach_then_graft: 'abX' still present\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	s = cds_ft_lookup_key(ft, (const uint8_t *)"zzX", 3, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "detach_then_graft: lookup 'zzX': %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	if (to_test_node(found)->value != 1) {
+		fprintf(stderr, "detach_then_graft: 'zzX' wrong value\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (count != 2) {
+		fprintf(stderr, "detach_then_graft: count %lu, expected 2\n", count);
+		goto fail;
+	}
+
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(detached);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	if (detached) {
+		drain_trie(detached);
+		cds_ft_destroy(detached);
+	}
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Detach on an empty trie returns NOT_FOUND.
+ */
+static int test_detach_empty_trie(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft, *detached = NULL;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+
+	rcu_read_lock();
+	s = cds_ft_detach(ft, NULL, 0, &detached);
+	rcu_read_unlock();
+
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "detach_empty_trie: expected NOT_FOUND, got %s\n",
+			cds_ft_status_to_string(s));
+		if (detached) {
+			cds_ft_destroy(detached);
+		}
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * graft_swap with integer keys encoded as 4-byte big-endian values:
+ * verify the root-level swap (bulk-load) pattern works.
+ *
+ * A variable-length trie is used because fixed-length tries require
+ * the key_len parameter to match the configured length exactly; they
+ * do not accept key_len=0 for root-level operations. The key
+ * conversion helpers are called with an explicit length of 4.
+ */
+static int test_graft_swap_fixed_key(void)
+{
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long count;
+	uint8_t k[4];
+	const size_t klen = 4;
+
+	/*
+	 * Variable-length trie with max_key_len = 4 so that
+	 * root-level swap (key_len = 0) is accepted while key
+	 * values match the 4-byte integer encoding.
+	 */
+	if (cds_ft_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_attr_set_max_key_len(attr, klen) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_attr_destroy(attr);
+
+	if (cds_ft_create(group, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate live with keys 100, 200. */
+	{
+		struct ft_test_node *n1 = node_alloc(100);
+		struct ft_test_node *n2 = node_alloc(200);
+
+		cds_ft_u64_to_key(live, 100, k, klen);
+		rcu_read_lock();
+		s = cds_ft_insert(live, k, klen, &n1->node);
+		if (s < 0) { rcu_read_unlock(); goto fail; }
+		cds_ft_u64_to_key(live, 200, k, klen);
+		s = cds_ft_insert(live, k, klen, &n2->node);
+		if (s < 0) { rcu_read_unlock(); goto fail; }
+		rcu_read_unlock();
+	}
+
+	/* Populate swap with keys 300, 400, 500. */
+	{
+		unsigned int i;
+		uint64_t vals[] = { 300, 400, 500 };
+
+		for (i = 0; i < 3; i++) {
+			struct ft_test_node *n = node_alloc(vals[i]);
+
+			cds_ft_u64_to_key(swap, vals[i], k, klen);
+			s = cds_ft_insert(swap, k, klen, &n->node);
+			if (s < 0) goto fail;
+		}
+	}
+
+	/* Swap at root — exchange everything. */
+	rcu_read_lock();
+	s = cds_ft_graft_swap(live, NULL, 0, swap);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_fixed_key: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Live should have 300, 400, 500. */
+	rcu_read_lock();
+	count = cds_ft_count(live);
+	cds_ft_u64_to_key(live, 300, k, klen);
+	s = cds_ft_lookup_key(live, k, klen, &found);
+	rcu_read_unlock();
+	if (count != 3 || s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_fixed_key: live count %lu, lookup 300: %s\n",
+			count, cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Swap should have 100, 200. */
+	rcu_read_lock();
+	count = cds_ft_count(swap);
+	rcu_read_unlock();
+	if (count != 2) {
+		fprintf(stderr, "graft_swap_fixed_key: swap count %lu, expected 2\n", count);
+		goto fail;
+	}
+
+	synchronize_rcu();
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -2504,6 +3718,25 @@ int main(int argc, char **argv)
 	RUN_TEST(test_double_remove);
 	RUN_TEST(test_order_after_mid_insert);
 	RUN_TEST(test_varlen_string_basic);
+
+	/* 9. Graft, graft_swap & detach */
+	RUN_TEST(test_graft_basic);
+	RUN_TEST(test_graft_at_root);
+	RUN_TEST(test_graft_populated_error);
+	RUN_TEST(test_graft_different_group_error);
+	RUN_TEST(test_graft_self_error);
+	RUN_TEST(test_graft_overflow_error);
+	RUN_TEST(test_graft_swap_basic);
+	RUN_TEST(test_graft_swap_into_empty);
+	RUN_TEST(test_graft_swap_at_root);
+	RUN_TEST(test_graft_swap_self_error);
+	RUN_TEST(test_graft_swap_different_group_error);
+	RUN_TEST(test_graft_swap_fixed_key);
+	RUN_TEST(test_detach_basic);
+	RUN_TEST(test_detach_at_root);
+	RUN_TEST(test_detach_not_found);
+	RUN_TEST(test_detach_empty_trie);
+	RUN_TEST(test_detach_then_graft);
 
 	printf("===========================================================\n");
 	printf("Results: %d passed, %d failed, %d total\n", pass, fail, total);
