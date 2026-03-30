@@ -99,7 +99,7 @@ static void node_free_rcu(struct ft_test_node *n)
 }
 
 /* Free every node reachable through the trie, then destroy the trie. */
-static int drain_and_destroy(struct cds_ft *ft)
+static int drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
 {
 	struct cds_ft_iter *iter;
 	enum cds_ft_status s;
@@ -110,6 +110,7 @@ static int drain_and_destroy(struct cds_ft *ft)
 		fprintf(stderr, "drain_and_destroy: iter_create: %s\n",
 			cds_ft_status_to_string(s));
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -143,6 +144,7 @@ unlock:
 	rcu_barrier();		/* wait for all node_free_rcu callbacks */
 	cds_ft_iter_destroy(iter);
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return ret;
 }
 
@@ -174,28 +176,36 @@ static int leak_check(void)
  * Convenience: create a fixed-length trie with the given key_len.
  * Aborts on failure.
  */
-static struct cds_ft *create_fixed_ft(size_t klen)
+static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_out)
 {
 	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
 	struct cds_ft *ft;
 
 	if (cds_ft_attr_create(&attr) < 0)
 		abort();
 	if (cds_ft_attr_set_key_len(attr, klen) < 0)
 		abort();
-	if (cds_ft_create(attr, &ft) < 0)
+	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_attr_destroy(attr);
+	if (cds_ft_create(group, &ft) < 0)
+		abort();
+	*group_out = group;
 	return ft;
 }
 
 /* Create a variable-length trie (default attributes). */
-static struct cds_ft *create_varlen_ft(void)
+static struct cds_ft *create_varlen_ft(struct cds_ft_group **group_out)
 {
+	struct cds_ft_group *group;
 	struct cds_ft *ft;
 
-	if (cds_ft_create(NULL, &ft) < 0)
+	if (cds_ft_group_create(NULL, &group) < 0)
 		abort();
+	if (cds_ft_create(group, &ft) < 0)
+		abort();
+	*group_out = group;
 	return ft;
 }
 
@@ -253,26 +263,35 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
  */
 static int test_lifecycle_defaults(void)
 {
+	struct cds_ft_group *group;
 	struct cds_ft *ft;
 
-	if (cds_ft_create(NULL, &ft) < 0)
+	if (cds_ft_group_create(NULL, &group) < 0)
 		return -1;
+	if (cds_ft_create(group, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
 	if (cds_ft_key_len(ft) != CDS_FT_LEN_VARIABLE) {
 		fprintf(stderr, "expected variable key length\n");
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	if (!cds_ft_empty(ft)) {
 		fprintf(stderr, "freshly created trie not empty\n");
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	if (cds_ft_count(ft) != 0) {
 		fprintf(stderr, "freshly created trie count != 0\n");
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 }
 
@@ -281,22 +300,26 @@ static int test_lifecycle_defaults(void)
  */
 static int test_lifecycle_fixed_key_lengths(void)
 {
+	struct cds_ft_group *group;
 	unsigned int klen;
 
 	for (klen = 1; klen <= 8; klen++) {
-		struct cds_ft *ft = create_fixed_ft(klen);
+		struct cds_ft *ft = create_fixed_ft(klen, &group);
 
 		if (cds_ft_key_len(ft) != klen) {
 			fprintf(stderr, "key_len mismatch for %u-byte trie\n", klen);
 			cds_ft_destroy(ft);
+			cds_ft_group_destroy(group);
 			return -1;
 		}
 		if (cds_ft_max_key_len(ft) < klen) {
 			fprintf(stderr, "max_key_len < key_len for %u-byte trie\n", klen);
 			cds_ft_destroy(ft);
+			cds_ft_group_destroy(group);
 			return -1;
 		}
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 	}
 	return 0;
 }
@@ -306,14 +329,17 @@ static int test_lifecycle_fixed_key_lengths(void)
  */
 static int test_lifecycle_nil_only_trie(void)
 {
-	struct cds_ft *ft = create_fixed_ft(0);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(0, &group);
 
 	if (cds_ft_key_len(ft) != 0) {
 		fprintf(stderr, "expected key_len == 0\n");
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 }
 
@@ -322,6 +348,7 @@ static int test_lifecycle_nil_only_trie(void)
  */
 static int test_lifecycle_max_key_len(void)
 {
+	struct cds_ft_group *group;
 	struct cds_ft_attr *attr;
 	struct cds_ft *ft;
 
@@ -332,18 +359,24 @@ static int test_lifecycle_max_key_len(void)
 		cds_ft_attr_destroy(attr);
 		return -1;
 	}
-	if (cds_ft_create(attr, &ft) < 0) {
+	if (cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_attr_destroy(attr);
 		return -1;
 	}
 	cds_ft_attr_destroy(attr);
+	if (cds_ft_create(group, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
 
 	if (cds_ft_max_key_len(ft) != 32) {
 		fprintf(stderr, "max_key_len not honoured\n");
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 }
 
@@ -352,6 +385,7 @@ static int test_lifecycle_max_key_len(void)
  */
 static int test_lifecycle_key_map(void)
 {
+	struct cds_ft_group *group;
 	struct cds_ft_attr *attr;
 	struct cds_ft *ft;
 	uint8_t k2o[CDS_FT_KEY_MAP_SIZE], o2k[CDS_FT_KEY_MAP_SIZE];
@@ -376,26 +410,33 @@ static int test_lifecycle_key_map(void)
 		cds_ft_attr_destroy(attr);
 		return -1;
 	}
-	if (cds_ft_create(attr, &ft) < 0) {
+	if (cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_attr_destroy(attr);
 		return -1;
 	}
 	cds_ft_attr_destroy(attr);
+	if (cds_ft_create(group, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
 
 	s = cds_ft_key_map(ft, k2o_out, o2k_out);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "key_map returned unexpected status: %s\n",
 			cds_ft_status_to_string(s));
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	if (memcmp(k2o, k2o_out, sizeof(k2o)) != 0 ||
 	    memcmp(o2k, o2k_out, sizeof(o2k)) != 0) {
 		fprintf(stderr, "key map round-trip mismatch\n");
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 }
 
@@ -412,6 +453,7 @@ static int test_status_to_string(void)
 		CDS_FT_STATUS_INVALID_ARGUMENT_ERROR,
 		CDS_FT_STATUS_MEMORY_ERROR,
 		CDS_FT_STATUS_OVERFLOW_ERROR,
+		CDS_FT_STATUS_BUSY_ERROR,
 	};
 	unsigned int i;
 
@@ -436,7 +478,8 @@ static int test_status_to_string(void)
  */
 static int test_insert_basic(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct ft_test_node *n = node_alloc(42);
 	enum cds_ft_status s;
 
@@ -447,19 +490,20 @@ static int test_insert_basic(void)
 		fprintf(stderr, "insert failed: %s\n", cds_ft_status_to_string(s));
 		node_free(n);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	if (cds_ft_empty(ft)) {
 		fprintf(stderr, "trie empty after insert\n");
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	if (cds_ft_count(ft) != 1) {
 		fprintf(stderr, "count != 1 after single insert\n");
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /*
@@ -468,7 +512,8 @@ static int test_insert_basic(void)
  */
 static int test_insert_unique(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct ft_test_node *n1 = node_alloc(7);
 	struct ft_test_node *n2 = node_alloc(7);
 	struct cds_ft_node *result;
@@ -486,6 +531,7 @@ static int test_insert_unique(void)
 		node_free(n1);
 		node_free(n2);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -496,23 +542,23 @@ static int test_insert_unique(void)
 		fprintf(stderr, "second insert_unique: expected DUPLICATE_FOUND, got %s\n",
 			cds_ft_status_to_string(s));
 		node_free(n2);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	if (result != &n1->node) {
 		fprintf(stderr, "result_node does not point to existing node\n");
 		node_free(n2);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	if (cds_ft_count(ft) != 1) {
 		fprintf(stderr, "count should still be 1\n");
 		node_free(n2);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	node_free(n2);	/* was never inserted */
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /*
@@ -521,7 +567,8 @@ static int test_insert_unique(void)
  */
 static int test_insert_duplicate_chain(void)
 {
-	struct cds_ft *ft = create_fixed_ft(2);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
 	struct ft_test_node *n1 = node_alloc(99);
 	struct ft_test_node *n2 = node_alloc(99);
 	struct cds_ft_node *head;
@@ -543,20 +590,20 @@ static int test_insert_duplicate_chain(void)
 
 	if (count != 2) {
 		fprintf(stderr, "duplicate chain length %d, expected 2\n", count);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	if (cds_ft_count(ft) != 2) {
 		fprintf(stderr, "trie count %lu, expected 2\n", cds_ft_count(ft));
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 fail:
 	fprintf(stderr, "insert/lookup failed: %s\n", cds_ft_status_to_string(s));
 	rcu_read_unlock();
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -566,7 +613,8 @@ fail:
  */
 static int test_insert_replace(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct ft_test_node *n1 = node_alloc(10);
 	struct ft_test_node *n2 = node_alloc(10);
 	struct cds_ft_node *old_head = NULL;
@@ -616,11 +664,11 @@ static int test_insert_replace(void)
 	/* Free old node after grace period. */
 	node_free_rcu(n1);
 	/* n2 is still in the trie; drain_and_destroy frees it. */
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 fail:
 	/* Best-effort cleanup. */
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -629,7 +677,8 @@ fail:
  */
 static int test_count_tracking(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	unsigned long i;
 	int ret = -1;
 
@@ -640,17 +689,17 @@ static int test_count_tracking(void)
 		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
 			rcu_read_unlock();
 			fprintf(stderr, "insert %lu failed\n", i);
-			drain_and_destroy(ft);
+			drain_and_destroy(ft, group);
 			return -1;
 		}
 		rcu_read_unlock();
 	}
 	if (cds_ft_count(ft) != 50) {
 		fprintf(stderr, "count %lu, expected 50\n", cds_ft_count(ft));
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
-	ret = drain_and_destroy(ft);
+	ret = drain_and_destroy(ft, group);
 	return ret;
 }
 
@@ -665,7 +714,8 @@ static int test_count_tracking(void)
  */
 static int test_lookup_exact_hit_miss(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct ft_test_node *n = node_alloc(100);
 	struct cds_ft_node *found;
 	enum cds_ft_status s;
@@ -677,13 +727,13 @@ static int test_lookup_exact_hit_miss(void)
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "lookup hit failed\n");
 		rcu_read_unlock();
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	if (to_test_node(found)->key != 100) {
 		fprintf(stderr, "lookup returned wrong node\n");
 		rcu_read_unlock();
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 
@@ -692,11 +742,11 @@ static int test_lookup_exact_hit_miss(void)
 		fprintf(stderr, "lookup miss: expected NOT_FOUND, got %s (node %p)\n",
 			cds_ft_status_to_string(s), (void *)found);
 		rcu_read_unlock();
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	rcu_read_unlock();
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /*
@@ -704,7 +754,8 @@ static int test_lookup_exact_hit_miss(void)
  */
 static int test_lookup_empty_trie(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct cds_ft_node *found;
 	enum cds_ft_status s;
 
@@ -715,9 +766,11 @@ static int test_lookup_empty_trie(void)
 	if (s != CDS_FT_STATUS_NOT_FOUND || found != NULL) {
 		fprintf(stderr, "lookup on empty trie: expected NOT_FOUND\n");
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 }
 
@@ -728,7 +781,8 @@ static int test_lookup_empty_trie(void)
  */
 static int test_lookup_partial(void)
 {
-	struct cds_ft *ft = create_varlen_ft();
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
 	struct ft_test_node *n1 = node_alloc(0);
 	struct ft_test_node *n2 = node_alloc(0);
 	struct cds_ft_node *found;
@@ -768,11 +822,11 @@ static int test_lookup_partial(void)
 		goto fail;
 	}
 	rcu_read_unlock();
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 fail:
 	rcu_read_unlock();
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -782,7 +836,8 @@ fail:
  */
 static int test_lookup_longest_match(void)
 {
-	struct cds_ft *ft = create_varlen_ft();
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
 	struct ft_test_node *n = node_alloc(0);
 	struct cds_ft_node *found;
 	enum cds_ft_status s;
@@ -825,12 +880,12 @@ static int test_lookup_longest_match(void)
 	}
 
 	rcu_read_unlock();
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 unlock_fail:
 	rcu_read_unlock();
 fail:
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -839,7 +894,8 @@ fail:
  */
 static int test_lookup_relational(void)
 {
-	struct cds_ft *ft = create_fixed_ft(2);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
 	struct cds_ft_iter *iter;
 	uint64_t keys[] = { 100, 200, 300, 400 };
 	unsigned int i;
@@ -847,6 +903,7 @@ static int test_lookup_relational(void)
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -962,9 +1019,9 @@ unlock_out:
 out:
 	cds_ft_iter_destroy(iter);
 	if (ret == 0)
-		ret = drain_and_destroy(ft);
+		ret = drain_and_destroy(ft, group);
 	else
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 	return ret;
 }
 
@@ -973,7 +1030,8 @@ out:
  */
 static int test_lookup_first_last(void)
 {
-	struct cds_ft *ft = create_fixed_ft(2);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
 	struct cds_ft_iter *iter;
 	uint64_t keys[] = { 500, 100, 900, 300 };
 	unsigned int i;
@@ -981,6 +1039,7 @@ static int test_lookup_first_last(void)
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	for (i = 0; i < 4; i++) {
@@ -1026,9 +1085,9 @@ unlock:
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
 	if (ret == 0)
-		ret = drain_and_destroy(ft);
+		ret = drain_and_destroy(ft, group);
 	else
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 	return ret;
 }
 
@@ -1043,7 +1102,8 @@ unlock:
  */
 static int test_iteration_forward_order(void)
 {
-	struct cds_ft *ft = create_fixed_ft(2);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
 	struct cds_ft_iter *iter;
 	/* Insert in deliberately non-sorted order. */
 	uint64_t keys[] = { 500, 100, 300, 900, 200, 700, 400 };
@@ -1053,6 +1113,7 @@ static int test_iteration_forward_order(void)
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
@@ -1076,7 +1137,7 @@ static int test_iteration_forward_order(void)
 				v, prev);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft);
+			drain_and_destroy(ft, group);
 			return -1;
 		}
 		prev = v;
@@ -1088,7 +1149,7 @@ static int test_iteration_forward_order(void)
 		fprintf(stderr, "iteration error: %s\n",
 			cds_ft_status_to_string(cds_ft_iter_status(iter)));
 		cds_ft_iter_destroy(iter);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	cds_ft_iter_destroy(iter);
@@ -1096,10 +1157,10 @@ static int test_iteration_forward_order(void)
 	if (count != sizeof(keys) / sizeof(keys[0])) {
 		fprintf(stderr, "forward iteration: %u nodes, expected %zu\n",
 			count, sizeof(keys) / sizeof(keys[0]));
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /*
@@ -1107,7 +1168,8 @@ static int test_iteration_forward_order(void)
  */
 static int test_iteration_reverse_order(void)
 {
-	struct cds_ft *ft = create_fixed_ft(2);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
 	struct cds_ft_iter *iter;
 	uint64_t keys[] = { 500, 100, 300, 900, 200, 700, 400 };
 	unsigned int i, count = 0;
@@ -1116,6 +1178,7 @@ static int test_iteration_reverse_order(void)
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
@@ -1139,7 +1202,7 @@ static int test_iteration_reverse_order(void)
 				v, prev);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft);
+			drain_and_destroy(ft, group);
 			return -1;
 		}
 		prev = v;
@@ -1150,7 +1213,7 @@ static int test_iteration_reverse_order(void)
 	if (cds_ft_iter_status(iter) < 0) {
 		fprintf(stderr, "reverse iteration error\n");
 		cds_ft_iter_destroy(iter);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	cds_ft_iter_destroy(iter);
@@ -1158,10 +1221,10 @@ static int test_iteration_reverse_order(void)
 	if (count != sizeof(keys) / sizeof(keys[0])) {
 		fprintf(stderr, "reverse iteration: %u nodes, expected %zu\n",
 			count, sizeof(keys) / sizeof(keys[0]));
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /*
@@ -1170,7 +1233,8 @@ static int test_iteration_reverse_order(void)
  */
 static int test_iteration_prefix_scoped(void)
 {
-	struct cds_ft *ft = create_varlen_ft();
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
 	struct cds_ft_iter *iter;
 	const char *words[] = {
 		"apple", "apply", "apt",
@@ -1181,6 +1245,7 @@ static int test_iteration_prefix_scoped(void)
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
@@ -1204,17 +1269,17 @@ static int test_iteration_prefix_scoped(void)
 	if (cds_ft_iter_status(iter) < 0) {
 		fprintf(stderr, "prefix iteration error\n");
 		cds_ft_iter_destroy(iter);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	cds_ft_iter_destroy(iter);
 
 	if (count != 3) {
 		fprintf(stderr, "prefix 'ap': %u keys, expected 3\n", count);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /*
@@ -1222,12 +1287,14 @@ static int test_iteration_prefix_scoped(void)
  */
 static int test_iteration_for_each_entry(void)
 {
-	struct cds_ft *ft = create_fixed_ft(2);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
 	struct cds_ft_iter *iter;
 	unsigned int i, count = 0;
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	for (i = 0; i < 5; i++) {
@@ -1253,10 +1320,10 @@ static int test_iteration_for_each_entry(void)
 
 	if (count != 5) {
 		fprintf(stderr, "for_each_entry: %u nodes, expected 5\n", count);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /*
@@ -1264,17 +1331,20 @@ static int test_iteration_for_each_entry(void)
  */
 static int test_iter_copy(void)
 {
-	struct cds_ft *ft = create_fixed_ft(2);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
 	struct cds_ft_iter *iter_a, *iter_b;
 	unsigned int i;
 
 	if (cds_ft_iter_create(ft, &iter_a) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	if (cds_ft_iter_create(ft, &iter_b) < 0) {
 		cds_ft_iter_destroy(iter_a);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 	for (i = 0; i < 5; i++) {
@@ -1325,12 +1395,12 @@ static int test_iter_copy(void)
 
 	cds_ft_iter_destroy(iter_a);
 	cds_ft_iter_destroy(iter_b);
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 fail:
 	cds_ft_iter_destroy(iter_a);
 	cds_ft_iter_destroy(iter_b);
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -1339,13 +1409,15 @@ fail:
  */
 static int test_iter_reset(void)
 {
-	struct cds_ft *ft = create_fixed_ft(2);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
 	struct cds_ft_iter *iter;
 	struct ft_test_node *n = node_alloc(55);
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		node_free(n);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -1357,7 +1429,7 @@ static int test_iter_reset(void)
 	if (!cds_ft_iter_node(iter)) {
 		rcu_read_unlock();
 		cds_ft_iter_destroy(iter);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 
@@ -1367,12 +1439,12 @@ static int test_iter_reset(void)
 		fprintf(stderr, "iter_reset: node not NULL after reset\n");
 		rcu_read_unlock();
 		cds_ft_iter_destroy(iter);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /* ================================================================== */
@@ -1386,7 +1458,8 @@ static int test_iter_reset(void)
  */
 static int test_replace_node(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct cds_ft_iter *iter;
 	struct ft_test_node *n_old = node_alloc(50);
 	struct ft_test_node *n_new = node_alloc(50);
@@ -1400,6 +1473,7 @@ static int test_replace_node(void)
 		node_free(n_old);
 		node_free(n_new);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -1436,12 +1510,12 @@ static int test_replace_node(void)
 
 	cds_ft_iter_destroy(iter);
 	/* n_new is still in the trie. */
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 fail:
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -1450,7 +1524,8 @@ fail:
  */
 static int test_remove_all(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct cds_ft_iter *iter;
 	struct ft_test_node *n1 = node_alloc(77);
 	struct ft_test_node *n2 = node_alloc(77);
@@ -1463,6 +1538,7 @@ static int test_remove_all(void)
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		node_free(n1); node_free(n2); node_free(n3);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -1525,12 +1601,13 @@ static int test_remove_all(void)
 	cds_ft_iter_destroy(iter);
 	rcu_barrier();
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 
 fail:
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -1540,7 +1617,8 @@ fail:
  */
 static int test_remove_middle_of_chain(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct cds_ft_iter *iter;
 	struct ft_test_node *nodes[3];
 	enum cds_ft_status s;
@@ -1554,6 +1632,7 @@ static int test_remove_middle_of_chain(void)
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		for (i = 0; i < 3; i++) node_free(nodes[i]);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -1598,12 +1677,12 @@ static int test_remove_middle_of_chain(void)
 	node_free_rcu(nodes[1]);
 
 	cds_ft_iter_destroy(iter);
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 fail:
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -1618,10 +1697,11 @@ fail:
  */
 static int test_key_u64_roundtrip(void)
 {
+	struct cds_ft_group *group;
 	unsigned int klen;
 
 	for (klen = 1; klen <= 8; klen++) {
-		struct cds_ft *ft = create_fixed_ft(klen);
+		struct cds_ft *ft = create_fixed_ft(klen, &group);
 		uint64_t max_val = (klen == 8) ? UINT64_MAX
 			: (1ULL << (klen * 8)) - 1;
 		/* Test several values including boundaries. */
@@ -1640,10 +1720,12 @@ static int test_key_u64_roundtrip(void)
 				fprintf(stderr, "u64 roundtrip klen=%u: %" PRIu64 " → %" PRIu64 "\n",
 					klen, vals[i], back);
 				cds_ft_destroy(ft);
+				cds_ft_group_destroy(group);
 				return -1;
 			}
 		}
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 	}
 	return 0;
 }
@@ -1653,10 +1735,11 @@ static int test_key_u64_roundtrip(void)
  */
 static int test_key_u32_roundtrip(void)
 {
+	struct cds_ft_group *group;
 	unsigned int klen;
 
 	for (klen = 1; klen <= 4; klen++) {
-		struct cds_ft *ft = create_fixed_ft(klen);
+		struct cds_ft *ft = create_fixed_ft(klen, &group);
 		uint32_t max_val = (klen == 4) ? UINT32_MAX
 			: (uint32_t)((1ULL << (klen * 8)) - 1);
 		uint32_t vals[] = { 0, 1, max_val / 2, max_val - 1, max_val };
@@ -1674,10 +1757,12 @@ static int test_key_u32_roundtrip(void)
 				fprintf(stderr, "u32 roundtrip klen=%u: %" PRIu32 " → %" PRIu32 "\n",
 					klen, vals[i], back);
 				cds_ft_destroy(ft);
+				cds_ft_group_destroy(group);
 				return -1;
 			}
 		}
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 	}
 	return 0;
 }
@@ -1687,7 +1772,8 @@ static int test_key_u32_roundtrip(void)
  */
 static int test_key_s64_roundtrip(void)
 {
-	struct cds_ft *ft = create_fixed_ft(8);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(8, &group);
 	int64_t vals[] = { INT64_MIN, INT64_MIN + 1, -1, 0, 1,
 			   INT64_MAX - 1, INT64_MAX };
 	unsigned int i;
@@ -1702,10 +1788,12 @@ static int test_key_s64_roundtrip(void)
 			fprintf(stderr, "s64 roundtrip: %" PRId64 " → %" PRId64 "\n",
 				vals[i], back);
 			cds_ft_destroy(ft);
+			cds_ft_group_destroy(group);
 			return -1;
 		}
 	}
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 }
 
@@ -1714,7 +1802,8 @@ static int test_key_s64_roundtrip(void)
  */
 static int test_key_s32_roundtrip(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	int32_t vals[] = { INT32_MIN, INT32_MIN + 1, -1, 0, 1,
 			   INT32_MAX - 1, INT32_MAX };
 	unsigned int i;
@@ -1729,10 +1818,12 @@ static int test_key_s32_roundtrip(void)
 			fprintf(stderr, "s32 roundtrip: %" PRId32 " → %" PRId32 "\n",
 				vals[i], back);
 			cds_ft_destroy(ft);
+			cds_ft_group_destroy(group);
 			return -1;
 		}
 	}
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 }
 
@@ -1742,7 +1833,8 @@ static int test_key_s32_roundtrip(void)
  */
 static int test_key_signed_sort_order(void)
 {
-	struct cds_ft *ft = create_fixed_ft(8);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(8, &group);
 	struct cds_ft_iter *iter;
 	int64_t vals[] = { 0, -1, INT64_MAX, INT64_MIN, 1, -100, 100 };
 	unsigned int i, count = 0;
@@ -1751,6 +1843,7 @@ static int test_key_signed_sort_order(void)
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -1778,7 +1871,7 @@ static int test_key_signed_sort_order(void)
 				v, prev);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft);
+			drain_and_destroy(ft, group);
 			return -1;
 		}
 		prev = v;
@@ -1791,10 +1884,10 @@ static int test_key_signed_sort_order(void)
 	if (count != sizeof(vals) / sizeof(vals[0])) {
 		fprintf(stderr, "signed sort: %u nodes, expected %zu\n",
 			count, sizeof(vals) / sizeof(vals[0]));
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /* ================================================================== */
@@ -1808,7 +1901,8 @@ static int test_key_signed_sort_order(void)
  */
 static int test_nil_key_varlen(void)
 {
-	struct cds_ft *ft = create_varlen_ft();
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
 	struct cds_ft_iter *iter;
 	struct ft_test_node *n_nil = node_alloc(0);
 	struct ft_test_node *n_abc = node_alloc(0);
@@ -1819,6 +1913,7 @@ static int test_nil_key_varlen(void)
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		node_free(n_nil); node_free(n_abc);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -1857,11 +1952,11 @@ static int test_nil_key_varlen(void)
 	}
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 fail:
 	cds_ft_iter_destroy(iter);
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -1877,12 +1972,14 @@ fail:
  */
 static int test_1byte_exhaustive(void)
 {
-	struct cds_ft *ft = create_fixed_ft(1);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(1, &group);
 	struct cds_ft_iter *iter;
 	unsigned int i, count;
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -1897,7 +1994,7 @@ static int test_1byte_exhaustive(void)
 	if (cds_ft_count(ft) != 256) {
 		fprintf(stderr, "1byte exhaustive: count %lu\n", cds_ft_count(ft));
 		cds_ft_iter_destroy(iter);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 
@@ -1919,7 +2016,7 @@ static int test_1byte_exhaustive(void)
 				fprintf(stderr, "1byte order: %" PRIu64 " after %" PRIu64 "\n", v, prev);
 				rcu_read_unlock();
 				cds_ft_iter_destroy(iter);
-				drain_and_destroy(ft);
+				drain_and_destroy(ft, group);
 				return -1;
 			}
 			prev = v;
@@ -1932,12 +2029,12 @@ static int test_1byte_exhaustive(void)
 	if (count != 256) {
 		fprintf(stderr, "1byte iteration: %u nodes\n", count);
 		cds_ft_iter_destroy(iter);
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 		return -1;
 	}
 
 	cds_ft_iter_destroy(iter);
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 }
 
 /*
@@ -1946,7 +2043,8 @@ static int test_1byte_exhaustive(void)
  */
 static int test_prefix_split(void)
 {
-	struct cds_ft *ft = create_varlen_ft();
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
 	struct cds_ft_iter *iter;
 	struct ft_test_node *n1 = node_alloc(0);
 	struct ft_test_node *n2 = node_alloc(0);
@@ -1956,6 +2054,7 @@ static int test_prefix_split(void)
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		node_free(n1); node_free(n2);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -1991,11 +2090,11 @@ static int test_prefix_split(void)
 	rcu_read_unlock();
 
 	cds_ft_iter_destroy(iter);
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 fail:
 	cds_ft_iter_destroy(iter);
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -2004,7 +2103,8 @@ fail:
  */
 static int test_iter_get_key_overflow(void)
 {
-	struct cds_ft *ft = create_varlen_ft();
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
 	struct cds_ft_iter *iter;
 	struct ft_test_node *n = node_alloc(0);
 	enum cds_ft_status s;
@@ -2014,6 +2114,7 @@ static int test_iter_get_key_overflow(void)
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		node_free(n);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -2035,11 +2136,11 @@ static int test_iter_get_key_overflow(void)
 		goto fail;
 	}
 	cds_ft_iter_destroy(iter);
-	return drain_and_destroy(ft);
+	return drain_and_destroy(ft, group);
 
 fail:
 	cds_ft_iter_destroy(iter);
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -2048,12 +2149,14 @@ fail:
  */
 static int test_iter_prefix_len_invalid(void)
 {
-	struct cds_ft *ft = create_varlen_ft();
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
 	struct cds_ft_iter *iter;
 	enum cds_ft_status s;
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -2065,11 +2168,13 @@ static int test_iter_prefix_len_invalid(void)
 			cds_ft_status_to_string(s));
 		cds_ft_iter_destroy(iter);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
 	cds_ft_iter_destroy(iter);
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 }
 
@@ -2078,7 +2183,8 @@ static int test_iter_prefix_len_invalid(void)
  */
 static int test_double_remove(void)
 {
-	struct cds_ft *ft = create_fixed_ft(4);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct cds_ft_iter *iter;
 	struct ft_test_node *n = node_alloc(33);
 	enum cds_ft_status s;
@@ -2087,6 +2193,7 @@ static int test_double_remove(void)
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		node_free(n);
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -2120,11 +2227,12 @@ static int test_double_remove(void)
 	cds_ft_iter_destroy(iter);
 	rcu_barrier();
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return 0;
 
 fail:
 	cds_ft_iter_destroy(iter);
-	drain_and_destroy(ft);
+	drain_and_destroy(ft, group);
 	return -1;
 }
 
@@ -2134,7 +2242,8 @@ fail:
  */
 static int test_order_after_mid_insert(void)
 {
-	struct cds_ft *ft = create_fixed_ft(2);
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
 	struct cds_ft_iter *iter;
 	uint64_t initial[] = { 100, 300, 500, 700 };
 	unsigned int i;
@@ -2142,6 +2251,7 @@ static int test_order_after_mid_insert(void)
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -2202,9 +2312,9 @@ static int test_order_after_mid_insert(void)
 out:
 	cds_ft_iter_destroy(iter);
 	if (ret == 0)
-		ret = drain_and_destroy(ft);
+		ret = drain_and_destroy(ft, group);
 	else
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 	return ret;
 }
 
@@ -2214,7 +2324,8 @@ out:
  */
 static int test_varlen_string_basic(void)
 {
-	struct cds_ft *ft = create_varlen_ft();
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
 	struct cds_ft_iter *iter;
 	/* Strings chosen to share prefixes and exercise internal splits. */
 	const char *words[] = {
@@ -2227,6 +2338,7 @@ static int test_varlen_string_basic(void)
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
 		return -1;
 	}
 
@@ -2296,9 +2408,9 @@ static int test_varlen_string_basic(void)
 out:
 	cds_ft_iter_destroy(iter);
 	if (ret == 0)
-		ret = drain_and_destroy(ft);
+		ret = drain_and_destroy(ft, group);
 	else
-		drain_and_destroy(ft);
+		drain_and_destroy(ft, group);
 	return ret;
 }
 

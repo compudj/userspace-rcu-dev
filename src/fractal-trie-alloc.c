@@ -52,7 +52,7 @@ struct cds_ft_alloc_range {
 };
 
 struct cds_ft_alloc_arena {
-	struct cds_ft *ft;
+	struct cds_ft_group *ft_group;
 	struct cds_list_head ranges;			/* List head of struct cds_ft_alloc_range. */
 	size_t item_len_order;
 	size_t max_nr_items_per_range;
@@ -168,7 +168,8 @@ void range_destroy(struct cds_ft_alloc_range *range)
 }
 
 static
-struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft *ft, const char *arena_name, size_t item_len_order, bool bitmap)
+struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
+		const char *arena_name, size_t item_len_order, bool bitmap)
 {
 	struct cds_ft_alloc_arena *arena;
 	size_t max_items_per_range;
@@ -192,7 +193,7 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft *ft, const char *ar
 	arena = calloc(1, sizeof(struct cds_ft_alloc_arena));
 	if (!arena)
 		goto error_alloc;
-	arena->ft = ft;
+	arena->ft_group = ft_group;
 	arena->item_len_order = item_len_order;
 	arena->max_nr_items_per_range = max_items_per_range;
 	arena->bitmap = bitmap;
@@ -289,9 +290,9 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 		errno = EINVAL;
 		return NULL;
 	}
-	arena_p = &ft->arena_order[item_len_order];
+	arena_p = &ft->group->arena_order[item_len_order];
 	if (!*arena_p) {
-		*arena_p = cds_ft_arena_create(ft, "cds_ft_alloc", item_len_order, bitmap);
+		*arena_p = cds_ft_arena_create(ft->group, "cds_ft_alloc", item_len_order, bitmap);
 		if (!*arena_p)
 			return NULL;
 	}
@@ -318,19 +319,19 @@ void cds_ft_free_item(struct cds_ft_metadata *metadata)
 		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
 	struct cds_ft_alloc_range *range = cds_ft_metadata_to_range(&metadata_alloc->metadata);
 	struct cds_ft_alloc_arena *arena = range->arena;
-	const struct rcu_flavor_struct *flavor = arena->ft->flavor;
+	const struct rcu_flavor_struct *flavor = arena->ft_group->flavor;
 
 	flavor->update_call_rcu(&metadata_alloc->rcu_head, cds_ft_free_item_rcu);
 }
 
-void cds_ft_free_all_arenas(struct cds_ft *ft)
+void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
 {
 	int i;
 
 	for (i = 0; i <= FT_ALLOC_ORDER_MAX; i++) {
-		if (!ft->arena_order[i])
+		if (!ft_group->arena_order[i])
 			continue;
-		cds_ft_arena_destroy(ft->arena_order[i]);
-		ft->arena_order[i] = NULL;
+		cds_ft_arena_destroy(ft_group->arena_order[i]);
+		ft_group->arena_order[i] = NULL;
 	}
 }

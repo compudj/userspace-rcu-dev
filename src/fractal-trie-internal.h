@@ -144,22 +144,25 @@ struct cds_ft_key_map {
 	uint8_t ordinal_to_key[256];
 };
 
-struct cds_ft {
-	struct cds_ft_inode_flag *root;
-	struct cds_ft_metadata root_metadata;
-
+struct cds_ft_group {
 	size_t max_tree_depth;
 	size_t key_len;
-	size_t max_key_len;			/* Maximum key length allowed. */
-	unsigned long nr_external_nodes;	/* Number of external nodes. */
-	unsigned long nr_fallback;		/* Number of fallback nodes used */
-
+	size_t max_key_len;		/* Maximum key length allowed. */
 	const struct rcu_flavor_struct *flavor;
-
 	/* Allocation arenas. */
 	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
-
 	struct cds_ft_key_map key_map;
+	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
+};
+
+
+struct cds_ft {
+	struct cds_ft_group *group;
+
+	struct cds_ft_inode_flag *root;
+	struct cds_ft_metadata root_metadata;
+	unsigned long nr_external_nodes;	/* Number of external nodes. */
+	unsigned long nr_fallback;		/* Number of fallback nodes used */
 
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[FT_ENTRY_PER_NODE];
@@ -236,7 +239,7 @@ __attribute__((visibility("hidden")))
 struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order);
 
 __attribute__((visibility("hidden")))
-void cds_ft_free_all_arenas(struct cds_ft *ja);
+void cds_ft_free_all_arenas(struct cds_ft_group *ft_group);
 
 __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_item_to_metadata(void *p);
@@ -248,7 +251,7 @@ __attribute__((visibility("hidden")))
 void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata);
 
 __attribute__((visibility("hidden")))
-struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ja, size_t item_len_order, bool bitmap);
+struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order, bool bitmap);
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft_metadata *metadata);

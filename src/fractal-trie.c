@@ -396,13 +396,15 @@ void ft_node_pool_2d_index(struct cds_ft_inode_flag *node, unsigned int *index)
 static
 size_t ft_key_len(const struct cds_ft *ft, size_t key_len)
 {
+	struct cds_ft_group *ft_group = ft->group;
+
 	if (key_len == CDS_FT_LEN_DEFAULT) {
-		if (ft->key_len == CDS_FT_LEN_VARIABLE)
+		if (ft_group->key_len == CDS_FT_LEN_VARIABLE)
 			return CDS_FT_LEN_ERROR;
-		return ft->key_len;
+		return ft_group->key_len;
 	}
 	/* Validate that explicit and implicit key lengths match for fixed length Fractal Trie. */
-	if (ft->key_len != CDS_FT_LEN_VARIABLE && key_len != ft->key_len)
+	if (ft_group->key_len != CDS_FT_LEN_VARIABLE && key_len != ft_group->key_len)
 		return CDS_FT_LEN_ERROR;
 	return key_len;
 }
@@ -584,17 +586,17 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key,
 static
 uint8_t key_to_ordinal(const struct cds_ft *ft, uint8_t key)
 {
-	if (caa_likely(ft->key_map.identity))
+	if (caa_likely(ft->group->key_map.identity))
 		return key;
-	return ft->key_map.key_to_ordinal[key];
+	return ft->group->key_map.key_to_ordinal[key];
 }
 
 static
 uint8_t ordinal_to_key(const struct cds_ft *ft, uint8_t ordinal)
 {
-	if (caa_likely(ft->key_map.identity))
+	if (caa_likely(ft->group->key_map.identity))
 		return ordinal;
-	return ft->key_map.ordinal_to_key[ordinal];
+	return ft->group->key_map.ordinal_to_key[ordinal];
 }
 
 static
@@ -631,7 +633,7 @@ bool valid_external_node(struct cds_ft_node *node)
 static
 bool valid_key_len(struct cds_ft *ft, size_t key_len)
 {
-	size_t max_key_len = ft->max_key_len;
+	size_t max_key_len = ft->group->max_key_len;
 
 	assert(max_key_len != CDS_FT_MAX_LEN_UNLIMITED);
 	if (key_len == CDS_FT_LEN_ERROR || key_len > max_key_len)
@@ -2810,7 +2812,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		key_len = iter->prefix_len;
 		break;
 	case FT_LOOKUP_LIMIT_LAST:
-		key_len = ft->max_key_len;
+		key_len = ft->group->max_key_len;
 		break;
 	}
 
@@ -2834,7 +2836,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	memcpy((uint8_t *) input_key, iter->key, key_len);
 	iter_key = input_key;
 
-	memset(ordinal_key, 0, ft->max_key_len * sizeof(ordinal_key[0]));
+	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 	node_flag = rcu_dereference(ft->root);
 	iter->path_node[0] = node_flag;
 
@@ -3031,7 +3033,7 @@ post_traversal:
 			if (external_nodes) {
 				int j;
 
-				assert(ft->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->key_len);
+				assert(ft->group->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->group->key_len);
 				iter->key_len = level;
 				for (j = 0; j < level; j++)
 					iter->key[j] = ordinal_to_key(ft, ordinal_key[j]);
@@ -3131,7 +3133,7 @@ descend_children:
 	if (!ft_node_internal(node_flag)) {
 		int j;
 
-		assert(ft->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->key_len);
+		assert(ft->group->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->group->key_len);
 		iter->key_len = level;
 		for (j = 0; j < level; j++)
 			iter->key[j] = ordinal_to_key(ft, ordinal_key[j]);
@@ -3175,7 +3177,7 @@ descend_children:
 	default:
 		assert(0);
 	}
-	for (; level < (int) ft->max_tree_depth; level++) {
+	for (; level < (int) ft->group->max_tree_depth; level++) {
 		/*
 		 * Return external node associated to internal node if
 		 * trying to find GE/GT inequality and encountering an
@@ -3225,7 +3227,7 @@ descend_children:
 	 * very last level, so level should never grow large enough to overflow
 	 * max_key_len.
 	 */
-	assert(level <= (int) ft->max_key_len);
+	assert(level <= (int) ft->group->max_key_len);
 end:
 	{
 		int j;
@@ -3318,7 +3320,7 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	 * path within the prefix subtree. LE backtracking (bounded
 	 * at prefix_len) then finds the greatest actual key.
 	 */
-	iter->key_len = ft->max_key_len;
+	iter->key_len = ft->group->max_key_len;
 	status = cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);
 	if (status < 0)
@@ -4467,20 +4469,20 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 
 size_t cds_ft_key_len(const struct cds_ft *ft)
 {
-	return ft->key_len;
+	return ft->group->key_len;
 }
 
 size_t cds_ft_max_key_len(const struct cds_ft *ft)
 {
-	return ft->max_key_len;
+	return ft->group->max_key_len;
 }
 
 enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key)
 {
-	if (ft->key_map.identity)
+	if (ft->group->key_map.identity)
 		return CDS_FT_STATUS_NOT_FOUND;
-	memcpy(key_to_ordinal, ft->key_map.key_to_ordinal, sizeof(ft->key_map.key_to_ordinal));
-	memcpy(ordinal_to_key, ft->key_map.ordinal_to_key, sizeof(ft->key_map.ordinal_to_key));
+	memcpy(key_to_ordinal, ft->group->key_map.key_to_ordinal, sizeof(ft->group->key_map.key_to_ordinal));
+	memcpy(ordinal_to_key, ft->group->key_map.ordinal_to_key, sizeof(ft->group->key_map.ordinal_to_key));
 	return CDS_FT_STATUS_OK;
 }
 
@@ -4541,11 +4543,11 @@ enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status _cds_ft_create(const struct cds_ft_attr *attr,
-		struct cds_ft **result_ft,
+enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
+		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor)
 {
-	struct cds_ft *ft;
+	struct cds_ft_group *ft_group;
 	size_t key_len = CDS_FT_LEN_DEFAULT,
 	       max_key_len = FT_MAX_KEY_LEN;
 
@@ -4553,26 +4555,51 @@ enum cds_ft_status _cds_ft_create(const struct cds_ft_attr *attr,
 		key_len = attr->key_len;
 		max_key_len = attr->max_key_len;
 	}
-	/* ft->root is NULL */
 	/* max_tree_depth 0 is for pointer to root node */
 	if (key_len != CDS_FT_LEN_VARIABLE && key_len > max_key_len) {
-		*result_ft = NULL;
+		*result_ft_group = NULL;
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
+	ft_group = calloc(1, sizeof(*ft_group));
+	if (!ft_group) {
+		*result_ft_group = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+	ft_group->key_len = key_len;
+	ft_group->max_key_len = max_key_len;
+	ft_group->max_tree_depth = max_key_len + 1;
+	assert(ft_group->max_tree_depth <= FT_MAX_DEPTH);
+	ft_group->flavor = flavor;
+	if (attr)
+		ft_group->key_map = attr->key_map;
+	else
+		ft_group->key_map.identity = true;
+	*result_ft_group = ft_group;
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
+{
+	if (uatomic_load(&ft_group->nr_ft_instances, CMM_RELAXED) != 0)
+		return CDS_FT_STATUS_BUSY_ERROR;
+	cds_ft_free_all_arenas(ft_group);
+	free(ft_group);
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
+		struct cds_ft **result_ft)
+{
+	struct cds_ft *ft;
+
+	/* ft->root is NULL */
 	ft = calloc(1, sizeof(*ft));
 	if (!ft) {
 		*result_ft = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
-	ft->key_len = key_len;
-	ft->max_key_len = max_key_len;
-	ft->max_tree_depth = max_key_len + 1;
-	assert(ft->max_tree_depth <= FT_MAX_DEPTH);
-	ft->flavor = flavor;
-	if (attr)
-		ft->key_map = attr->key_map;
-	else
-		ft->key_map.identity = true;
+	ft->group = ft_group;
+	uatomic_inc(&ft_group->nr_ft_instances, CMM_RELAXED);
 	*result_ft = ft;
 	return CDS_FT_STATUS_OK;
 }
@@ -4629,12 +4656,12 @@ void ft_final_checks(struct cds_ft *ft)
  */
 void cds_ft_destroy(struct cds_ft *ft)
 {
-	const struct rcu_flavor_struct *flavor = ft->flavor;
+	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 
 	/* Wait for in-flight call_rcu free to complete. */
 	flavor->barrier();
-	cds_ft_free_all_arenas(ft);
 	ft_final_checks(ft);
+	uatomic_dec(&ft->group->nr_ft_instances, CMM_RELAXED);
 	free(ft);
 }
 
@@ -4873,6 +4900,8 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 		return "Memory allocation failure";
 	case CDS_FT_STATUS_OVERFLOW_ERROR:
 		return "Buffer too small for key length";
+	case CDS_FT_STATUS_BUSY_ERROR:
+		return "Resource busy";
 
 	default:
 		return "Unknown status value";
@@ -4927,7 +4956,7 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 	bool subset = false;
 
 	key_len = ft_key_len(iter->ft, key_len);
-	if (key_len > iter->ft->max_key_len)
+	if (key_len > iter->ft->group->max_key_len)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	if (key_len <= iter->key_len && !memcmp(key, iter->key, key_len))
 		subset = true;

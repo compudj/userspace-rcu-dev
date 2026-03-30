@@ -103,6 +103,7 @@ extern "C" {
 struct cds_ft;
 struct cds_ft_attr;
 struct cds_ft_iter;
+struct cds_ft_group;
 
 /* Fractal Trie lookup and mutation constants. */
 #define CDS_FT_LEN_DEFAULT		SIZE_MAX
@@ -129,6 +130,7 @@ enum cds_ft_status {
 	CDS_FT_STATUS_INVALID_ARGUMENT_ERROR	= -1,	/* Invalid argument. */
 	CDS_FT_STATUS_MEMORY_ERROR		= -2,	/* Memory allocation failure. */
 	CDS_FT_STATUS_OVERFLOW_ERROR		= -3,	/* Buffer too small for key length. */
+	CDS_FT_STATUS_BUSY_ERROR		= -4	/* Resource busy. */
 };
 
 /*
@@ -722,9 +724,41 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * Trie lifecycle
  */
 
-enum cds_ft_status _cds_ft_create(const struct cds_ft_attr *attr,
-		struct cds_ft **result_ft,
+enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
+		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor);
+
+/*
+ * cds_ft_group_create - Create a Fractal Trie group.
+ * @attr: Fractal Trie attributes.
+ * @result_ft_group: Fractal Trie group output. Set to the newly created
+ *                   trie group on success, or NULL on error.
+ *
+ * The @attr pointer is used to specify the Fractal Trie attributes. If
+ * NULL, use default attribute values. The @attr can be destroyed
+ * by the caller immediately after cds_ft_group_create() returns. The
+ * caller keeps ownership of @attr. Default attributes select a variable
+ * key length.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
+ * on error.
+ */
+static inline
+enum cds_ft_status cds_ft_group_create(const struct cds_ft_attr *attr,
+		struct cds_ft_group **result_ft_group)
+{
+	return _cds_ft_group_create(attr, result_ft_group, &rcu_flavor);
+}
+
+/*
+ * cds_ft_group_destroy - Destroy a Fractal Trie group.
+ * @ft_group: The Fractal Trie group.
+ *
+ * Return CDS_FT_STATUS_OK on success, or CDS_FT_STATUS_BUSY_ERROR
+ * if it is not possible to destroy the group because trie instances
+ * created from it still exist.
+ */
+enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group);
 
 /*
  * cds_ft_create - Create a Fractal Trie.
@@ -741,12 +775,8 @@ enum cds_ft_status _cds_ft_create(const struct cds_ft_attr *attr,
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
  * on error.
  */
-static inline
-enum cds_ft_status cds_ft_create(const struct cds_ft_attr *attr,
-		struct cds_ft **result_ft)
-{
-	return _cds_ft_create(attr, result_ft, &rcu_flavor);
-}
+enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
+		struct cds_ft **result_ft);
 
 /*
  * cds_ft_destroy - Destroy a Fractal Trie.
