@@ -115,31 +115,20 @@ static int drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
 	}
 
 	rcu_read_lock();
-	for (;;) {
-		struct cds_ft_node *cur, *tmp;
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
 
-		s = cds_ft_lookup_first(ft, iter);
+		s = cds_ft_remove_all(ft, iter, &head);
 		if (s < 0) {
-			fprintf(stderr, "drain_and_destroy: lookup_first: %s\n",
+			fprintf(stderr, "drain_and_destroy: remove_all: %s\n",
 				cds_ft_status_to_string(s));
 			ret = -1;
 			break;
 		}
-		cur = cds_ft_iter_node(iter);
-		if (!cur)
-			break;
-		cds_ft_for_each_duplicate_safe_rcu(cur, tmp) {
-			s = cds_ft_remove(ft, iter, cur);
-			if (s < 0) {
-				fprintf(stderr, "drain_and_destroy: remove: %s\n",
-					cds_ft_status_to_string(s));
-				ret = -1;
-				goto unlock;
-			}
-			node_free_rcu(to_test_node(cur));
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
+			node_free_rcu(to_test_node(head));
 		}
 	}
-unlock:
 	rcu_read_unlock();
 	rcu_barrier();		/* wait for all node_free_rcu callbacks */
 	cds_ft_iter_destroy(iter);
