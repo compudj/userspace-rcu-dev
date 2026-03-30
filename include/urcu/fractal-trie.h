@@ -85,6 +85,53 @@
  * This provides memory efficiency comparable to adaptive radix
  * tree schemes without requiring user tuning or configuration.
  *
+ * Graft, graft-swap, and detach:
+ *
+ * The graft, graft-swap, and detach operations move entire
+ * sub-tries between trie instances within the same group. Each
+ * operation is a single pointer store visible atomically to
+ * concurrent RCU readers: a reader sees either the complete
+ * sub-trie or nothing, never a partial state.
+ *
+ * - Graft (cds_ft_graft) attaches the content of a source trie
+ *   at a key position in a destination trie. The destination
+ *   must have no content at or below the graft point. On
+ *   success the source trie becomes empty and can be reused or
+ *   destroyed.
+ *
+ * - Graft-swap (cds_ft_graft_swap) exchanges the content at a
+ *   key position in a destination trie with the content of
+ *   another trie. Unlike plain graft, the destination does not
+ *   need to be empty at the graft point: any pre-existing
+ *   content is moved into the swap trie. Concurrent readers
+ *   see either the old content or the new content, never an
+ *   empty intermediate state.
+ *
+ * - Detach (cds_ft_detach) removes the sub-structure rooted at
+ *   a key position and returns it as a new, independent trie
+ *   instance whose key lengths are relative to the detach
+ *   point.
+ *
+ * Root-level operations (key_len 0) work with both fixed-length
+ * and variable-length key groups. Non-root operations (key_len
+ * > 0) require a variable-length key group
+ * (CDS_FT_LEN_VARIABLE): in a fixed-length group every key
+ * must equal the group's fixed length, so a shorter prefix
+ * needed to address an interior graft or detach point cannot be
+ * expressed, and the call returns
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
+ *
+ * Together, these operations serve as the transplant, exchange,
+ * and split primitives for bulk operations. A typical bulk-load
+ * pattern populates a staging trie offline — with no RCU or
+ * locking overhead — and then grafts it into the live trie in
+ * a single O(1) step, keeping the writer critical section
+ * minimal regardless of the number of nodes being moved. A
+ * complementary bulk-removal pattern detaches (or graft-swaps)
+ * a sub-trie in O(1), waits for a single grace period, and
+ * then drains the detached trie locally, reducing the cost
+ * from one grace period per node to one grace period total.
+ *
  * Include this file _after_ including your URCU flavor.
  */
 
@@ -130,7 +177,8 @@ enum cds_ft_status {
 	CDS_FT_STATUS_INVALID_ARGUMENT_ERROR	= -1,	/* Invalid argument. */
 	CDS_FT_STATUS_MEMORY_ERROR		= -2,	/* Memory allocation failure. */
 	CDS_FT_STATUS_OVERFLOW_ERROR		= -3,	/* Buffer too small for key length. */
-	CDS_FT_STATUS_BUSY_ERROR		= -4	/* Resource busy. */
+	CDS_FT_STATUS_BUSY_ERROR		= -4,	/* Resource busy. */
+	CDS_FT_STATUS_POPULATED_ERROR		= -5	/* Destination already populated. */
 };
 
 /*
@@ -719,6 +767,219 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node **result_node);
+
+/*
+ * Graft and detach API
+ *
+ * These operations move entire sub-tries between trie instances
+ * within the same group. They appear as single operations to
+ * concurrent RCU readers: a reader sees either the complete sub-trie
+ * or nothing, never a partial state.
+ *
+ * Graft attaches the content of a source trie at a key position in a
+ * destination trie. Detach removes the sub-structure at a key position
+ * and returns it as a new trie instance. These are the transplant and
+ * split primitives for bulk operations.
+ *
+ * Root-level operations (key_len 0) work with both fixed-length and
+ * variable-length key groups. Non-root operations (key_len > 0)
+ * require a variable-length key group (CDS_FT_LEN_VARIABLE), because
+ * a fixed-length group rejects any key whose length differs from the
+ * group's fixed length.
+ *
+ * Efficient bulk-load pattern:
+ *
+ * A common usage is to populate a sub-trie offline and then graft it
+ * into the main trie in a single O(1) operation. Because the source
+ * trie has no concurrent readers or writers during population, no RCU
+ * read-side lock and no mutual exclusion are needed for the inserts.
+ * The graft itself is a single pointer store, so the duration of
+ * writer mutual exclusion on the main trie is minimal — independent
+ * of the number of nodes being grafted. This pattern is well suited
+ * for batch loading, sharding, and periodic bulk updates where
+ * minimizing the writer critical section on the live trie is
+ * important.
+ *
+ *   // Phase 1: populate offline, no locking needed.
+ *   cds_ft_create(group, &staging);
+ *   for each (key, node) in batch:
+ *       cds_ft_insert(staging, key, key_len, node);
+ *
+ *   // Phase 2: graft into the live trie, O(1) under lock.
+ *   lock(&writer_mutex);
+ *   rcu_read_lock();
+ *   cds_ft_graft(live_trie, prefix, prefix_len, staging);
+ *   rcu_read_unlock();
+ *   unlock(&writer_mutex);
+ *   // staging is now empty but still valid; it can be reused
+ *   // for the next batch or destroyed with cds_ft_destroy().
+ *
+ * Both source and destination tries must belong to the same group.
+ * Mutual exclusion between writers on all affected tries is the
+ * caller's responsibility. An RCU read-side lock must be held.
+ * The source trie must not be the same object as the destination trie.
+ *
+ * Efficient bulk-removal pattern:
+ *
+ * Detach (or graft_swap) removes an entire sub-trie from the live
+ * trie in a single O(1) operation. After a single grace period, no
+ * concurrent reader can still hold a reference to any node in the
+ * detached sub-trie. At that point, the detached trie is purely
+ * local: the caller can iterate it and free all external nodes
+ * directly, without observing a grace period for each individual
+ * node. This reduces the cost of removing N nodes from N grace
+ * periods (or N call_rcu callbacks) to a single grace period
+ * followed by a local iteration.
+ *
+ *   // Phase 1: detach from the live trie, O(1) under lock.
+ *   lock(&writer_mutex);
+ *   rcu_read_lock();
+ *   cds_ft_detach(live_trie, prefix, prefix_len, &detached);
+ *   rcu_read_unlock();
+ *   unlock(&writer_mutex);
+ *
+ *   // Phase 2: wait for readers, then drain locally.
+ *   synchronize_rcu();
+ *   // detached is now purely local — no readers can access it.
+ *   while (cds_ft_lookup_first(detached, iter) == CDS_FT_STATUS_OK) {
+ *           struct cds_ft_node *node, *p;
+ *           cds_ft_remove_all(detached, iter, &node);
+ *           cds_ft_for_each_duplicate_safe_rcu(node, p) {
+ *                   free(cds_ft_entry(node, struct my_entry, ft_node));
+ *           }
+ *   }
+ *   cds_ft_destroy(detached);
+ */
+
+/*
+ * cds_ft_graft - Attach a source trie at a key position in the destination.
+ * @dst_ft: Destination Fractal Trie.
+ * @key: Key identifying the graft point (may be NULL if @key_len is 0).
+ * @key_len: Key length in bytes:
+ * - > 0: Explicit key length.
+ * - 0: Graft at the root (NIL prefix).
+ * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ * @src_ft: Source Fractal Trie. Must be in the same group as @dst_ft.
+ *          On success, @src_ft becomes empty. The caller retains
+ *          ownership of the (now empty) @src_ft object.
+ *
+ * Attaches the entire content of @src_ft at the position identified
+ * by @key in @dst_ft as a single operation visible to concurrent RCU
+ * readers. Fails if the destination already has any content (internal
+ * or external nodes) at or below the graft point. On success,
+ * @src_ft is left empty; it remains a valid trie in the group and
+ * can be reused or destroyed.
+ *
+ * The operation validates that @key_len plus the maximum used key
+ * length of @src_ft does not exceed the group's maximum key length.
+ *
+ * Root-level graft (@key_len 0) works with both fixed-length and
+ * variable-length key groups. Non-root graft (@key_len > 0)
+ * requires a variable-length key group (CDS_FT_LEN_VARIABLE).
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_POPULATED_ERROR if the graft point is already
+ * populated (destination has content at or below @key).
+ * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the grafted keys would
+ * exceed the group's maximum key length.
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if the tries are not
+ * in the same group, or if @src_ft is the same object as @dst_ft.
+ * Returns a negative cds_ft_status on other errors.
+ *
+ * Mutual exclusion between writers on both @dst_ft and @src_ft is
+ * the caller's responsibility.
+ * An RCU read-side lock must be held while calling this function.
+ */
+enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft *src_ft);
+
+/*
+ * cds_ft_graft_swap - Swap trie content with content at the graft point.
+ * @dst_ft: Destination Fractal Trie.
+ * @key: Key identifying the graft point (may be NULL if @key_len is 0).
+ * @key_len: Key length in bytes:
+ * - > 0: Explicit key length.
+ * - 0: Graft at the root (NIL prefix).
+ * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ * @swap_ft: Fractal Trie to exchange content with. Must be in the same
+ *           group as @dst_ft. On entry, its content is grafted into
+ *           @dst_ft at @key. On success, it receives the content that
+ *           was previously at @key in @dst_ft, or is empty if the
+ *           graft point had no content. The caller retains ownership.
+ *
+ * Exchanges the content at @key in @dst_ft with the content of
+ * @swap_ft using a single pointer store. Concurrent RCU readers
+ * traversing @dst_ft see either the old content or the new content,
+ * never an empty intermediate state.
+ *
+ * On success, the previous content at the graft point (if any) is
+ * placed into @swap_ft. The caller can check cds_ft_empty(@swap_ft)
+ * to determine whether there was pre-existing content. If @swap_ft
+ * is non-empty, the "Efficient bulk-removal pattern" described above
+ * applies: after a single grace period, the caller can drain
+ * @swap_ft locally without per-node grace periods.
+ *
+ * The operation validates that @key_len plus the maximum used key
+ * length of @swap_ft does not exceed the group's maximum key length.
+ *
+ * Root-level swap (@key_len 0) works with both fixed-length and
+ * variable-length key groups. Non-root swap (@key_len > 0)
+ * requires a variable-length key group (CDS_FT_LEN_VARIABLE).
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the grafted keys would
+ * exceed the group's maximum key length.
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if the tries are not
+ * in the same group, or if @swap_ft is the same object as @dst_ft.
+ * Returns a negative cds_ft_status on other errors.
+ *
+ * Mutual exclusion between writers on both @dst_ft and @swap_ft is
+ * the caller's responsibility.
+ * An RCU read-side lock must be held while calling this function.
+ */
+enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft *swap_ft);
+
+/*
+ * cds_ft_detach - Detach the sub-structure at a key position.
+ * @ft: The Fractal Trie.
+ * @key: Key identifying the detach point (may be NULL if @key_len is 0).
+ * @key_len: Key length in bytes:
+ * - > 0: Explicit key length.
+ * - 0: Detach at the root (detach everything).
+ * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ * @result_ft: Output. On success, set to a new trie containing
+ *             the content that was at @key. The new trie belongs to
+ *             the same group. The caller takes ownership.
+ *
+ * Removes the sub-structure rooted at @key as a single operation
+ * visible to concurrent RCU readers and returns it as a new trie
+ * instance. The new trie supports all normal operations (lookup,
+ * iteration, further detach, graft, destroy). The key lengths
+ * within the detached trie are relative to the detach point
+ * (i.e., the @key prefix is stripped).
+ *
+ * See "Efficient bulk-removal pattern" above for how to drain and
+ * free the detached sub-trie with a single grace period.
+ *
+ * Root-level detach (@key_len 0) works with both fixed-length and
+ * variable-length key groups. Non-root detach (@key_len > 0)
+ * requires a variable-length key group (CDS_FT_LEN_VARIABLE).
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_NOT_FOUND if nothing exists at @key.
+ * Returns a negative cds_ft_status on error (including memory
+ * allocation failure for the result trie).
+ *
+ * Mutual exclusion between writers on @ft is the caller's
+ * responsibility.
+ * An RCU read-side lock must be held while calling this function.
+ */
+enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft **result_ft);
 
 /*
  * Trie lifecycle

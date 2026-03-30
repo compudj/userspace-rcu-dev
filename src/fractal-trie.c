@@ -4382,6 +4382,604 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	return CDS_FT_STATUS_OK;
 }
 
+/*
+ * Graft-point descriptor returned by ft_descend_to_graft_point().
+ */
+struct ft_graft_point {
+	unsigned int depth;		/* Depth reached (0..key_len). */
+	struct cds_ft_inode_flag *nf;	/* Node flag at the graft slot. */
+	struct cds_ft_inode_flag **nfp;	/* Pointer to the graft slot. */
+	struct cds_ft_inode_flag *pnf;	/* Parent node flag. */
+	struct cds_ft_inode_flag **pnfp;/* Pointer to parent in its parent. */
+};
+
+/*
+ * Descend through the trie to the child slot at depth @key_len.
+ * Stops early if the traversal hits NULL or an external node.
+ *
+ * On return, gp->depth is the number of internal levels successfully
+ * traversed (0..key_len).  If gp->depth == key_len, the graft slot
+ * is at gp->nf / gp->nfp.  Otherwise the path was incomplete.
+ *
+ * Used by cds_ft_graft and cds_ft_graft_swap.  cds_ft_detach uses
+ * its own descent loop because it records snapshot state for
+ * ft_detach_node's upward pruning walk.
+ */
+static
+void ft_descend_to_graft_point(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		struct ft_graft_point *gp)
+{
+	unsigned int i;
+	const uint8_t *ik = key;
+
+	gp->nf = rcu_dereference(ft->root);
+	gp->nfp = &ft->root;
+	gp->pnf = NULL;
+	gp->pnfp = NULL;
+
+	for (i = 0; i < key_len; i++) {
+		uint8_t kv;
+
+		if (!ft_node_ptr(gp->nf) || !ft_node_internal(gp->nf))
+			break;
+
+		kv = key_to_ordinal(ft, *(ik++));
+		gp->pnf = gp->nf;
+		gp->pnfp = gp->nfp;
+		gp->nf = ft_node_get_nth(gp->nf, &gp->nfp, kv);
+	}
+	gp->depth = i;
+}
+
+/*
+ * Build a single-child chain of internal nodes for
+ * key[start .. end-1] with @leaf at the bottom.  Returns the topmost
+ * flagged node, or NULL on allocation failure (all nodes freed).
+ */
+static
+struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
+		const uint8_t *key, unsigned int start, unsigned int end,
+		struct cds_ft_inode_flag *leaf)
+{
+	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
+	struct cds_ft_inode_flag *cur = leaf;
+	int nr = 0, j, ret;
+	int i;
+
+	for (i = (int) end - 1; i >= (int) start; i--) {
+		struct cds_ft_inode_flag *dest = NULL;
+		uint8_t kv = key_to_ordinal(ft, key[i]);
+
+		ret = ft_node_set_nth(ft, &dest, kv, cur, NULL);
+		if (ret) {
+			for (j = 0; j < nr; j++)
+				free_cds_ft_node(ft, ft_node_ptr(created[j]));
+			return NULL;
+		}
+		created[nr++] = dest;
+		cur = dest;
+	}
+	return cur;
+}
+
+/*
+ * Store graft_payload at the graft point described by @gp.
+ *
+ * Handles two cases:
+ * - gp->depth == key_len: the slot exists; add via ft_node_set_nth.
+ * - gp->depth < key_len: the path is incomplete; build intermediate
+ *   internal nodes via ft_build_branch, displacing any external node
+ *   on the path into the branch's metadata.
+ *
+ * Return CDS_FT_STATUS_OK on success, CDS_FT_STATUS_POPULATED_ERROR
+ * if the slot is already occupied, CDS_FT_STATUS_MEMORY_ERROR on
+ * allocation failure.
+ */
+static
+enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		struct ft_graft_point *gp,
+		struct cds_ft_inode_flag *graft_payload)
+{
+	if (gp->depth == key_len) {
+		struct cds_ft_metadata *pmeta;
+		struct cds_ft_inode_flag *dest;
+		int ret;
+
+		if (ft_node_ptr(gp->nf))
+			return CDS_FT_STATUS_POPULATED_ERROR;
+
+		pmeta = cds_ft_item_to_metadata(ft_node_ptr(gp->pnf));
+
+		dest = gp->pnf;
+		ret = ft_node_set_nth(ft, &dest,
+			key_to_ordinal(ft, key[key_len - 1]),
+			graft_payload, pmeta);
+		if (ret)
+			return CDS_FT_STATUS_MEMORY_ERROR;
+
+		rcu_assign_pointer(*gp->pnfp, dest);
+	} else {
+		unsigned int i = gp->depth;
+		struct cds_ft_inode_flag *branch;
+		struct cds_ft_node *displaced = NULL;
+
+		if (ft_node_ptr(gp->nf) && !ft_node_internal(gp->nf))
+			displaced = (struct cds_ft_node *)
+				ft_node_ptr(gp->nf);
+
+		branch = ft_build_branch(ft, key, i, key_len, graft_payload);
+		if (!branch)
+			return CDS_FT_STATUS_MEMORY_ERROR;
+
+		if (displaced) {
+			struct cds_ft_metadata *bm =
+				cds_ft_item_to_metadata(
+					ft_node_ptr(branch));
+			bm->external_nodes = displaced;
+		}
+
+		if (displaced) {
+			rcu_assign_pointer(*gp->nfp, branch);
+		} else {
+			struct cds_ft_inode_flag *dest = gp->pnf;
+			struct cds_ft_metadata *pmeta;
+			int ret;
+
+			pmeta = cds_ft_item_to_metadata(
+					ft_node_ptr(gp->pnf));
+
+			ret = ft_node_set_nth(ft, &dest,
+				key_to_ordinal(ft, key[i - 1]),
+				branch, pmeta);
+			if (ret)
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			rcu_assign_pointer(*gp->pnfp, dest);
+		}
+	}
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft *src_ft)
+{
+	struct cds_ft_metadata *src_rmeta;
+	size_t key_len, src_max;
+	enum cds_ft_status status;
+
+	if (!dst_ft || !src_ft || dst_ft == src_ft)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (dst_ft->group != src_ft->group)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+
+	/*
+	 * Root-level graft (key_len == 0) is valid for both
+	 * variable-length and fixed-length groups: it swaps the entire
+	 * root, so no key-length constraint applies.  Bypass
+	 * ft_key_len() which would reject 0 != fixed_len.
+	 */
+	if (_key_len == 0) {
+		key_len = 0;
+	} else {
+		key_len = ft_key_len(dst_ft, _key_len);
+		if (!valid_key_len(dst_ft, key_len) ||
+				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE)
+			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+
+	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
+	if (key_len > 0 && src_max > dst_ft->group->max_key_len - key_len)
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
+
+	src_rmeta = ft_root_metadata(src_ft);
+
+	/* Check if source trie is empty. */
+	if (src_rmeta->nr_child == 0 && !src_rmeta->external_nodes)
+		return CDS_FT_STATUS_OK;
+
+	if (key_len == 0) {
+		struct cds_ft_metadata *dst_rmeta = ft_root_metadata(dst_ft);
+		struct cds_ft_inode *fresh_root;
+		struct cds_ft_metadata *fresh_meta;
+
+		/* Destination must be empty for a root-level graft. */
+		if (dst_rmeta->nr_child != 0 || dst_rmeta->external_nodes)
+			return CDS_FT_STATUS_POPULATED_ERROR;
+
+		/*
+		 * Allocate a fresh empty root for the source before
+		 * swapping, so the source remains a valid trie.
+		 */
+		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], &fresh_meta);
+		if (!fresh_root)
+			return CDS_FT_STATUS_MEMORY_ERROR;
+
+		/*
+		 * Swap root pointers.  The source's root carries all
+		 * metadata (nr_child, external_nodes) with it.
+		 */
+		rcu_assign_pointer(dst_ft->root,
+			rcu_dereference(src_ft->root));
+		src_ft->root = ft_node_flag(fresh_root, 0);
+		goto done;
+	}
+
+	{
+		struct ft_graft_point gp;
+
+		ft_descend_to_graft_point(dst_ft, key, key_len, &gp);
+
+		/*
+		 * The source root node becomes the graft payload.  Its
+		 * metadata.external_nodes (NIL-key entries in the source)
+		 * naturally becomes the entries at depth key_len in the
+		 * destination.  No relocation needed.
+		 */
+		status = ft_store_at_graft_point(dst_ft, key, key_len,
+						  &gp, src_ft->root);
+		if (status != CDS_FT_STATUS_OK)
+			return status;
+	}
+
+	/* Give source a fresh empty root. */
+	{
+		struct cds_ft_inode *fresh_node;
+		struct cds_ft_metadata *fresh_meta;
+
+		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
+		if (!fresh_node) {
+			/*
+			 * The graft has already been published. We cannot
+			 * roll back, but we must leave source in a valid
+			 * state. This should not happen in practice.
+			 */
+			abort();
+		}
+		src_ft->root = ft_node_flag(fresh_node, 0);
+	}
+
+done:
+	{
+		size_t nm = key_len + src_max;
+
+		if (nm > uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED))
+			uatomic_store(&dst_ft->max_used_key_len, nm,
+				      CMM_RELAXED);
+	}
+
+	uatomic_store(&src_ft->max_used_key_len, 0, CMM_RELAXED);
+
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft *swap_ft)
+{
+	size_t key_len, swap_max;
+
+	if (!dst_ft || !swap_ft || dst_ft == swap_ft)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (dst_ft->group != swap_ft->group)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+
+	/*
+	 * Root-level swap (key_len == 0) is valid for both
+	 * variable-length and fixed-length groups.  See cds_ft_graft.
+	 */
+	if (_key_len == 0) {
+		key_len = 0;
+	} else {
+		key_len = ft_key_len(dst_ft, _key_len);
+		if (!valid_key_len(dst_ft, key_len) ||
+				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE)
+			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+
+	swap_max = uatomic_load(&swap_ft->max_used_key_len, CMM_RELAXED);
+	if (key_len > 0 && swap_max > dst_ft->group->max_key_len - key_len)
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
+
+	if (key_len == 0) {
+		/*
+		 * Swap entire tries: exchange root pointers.
+		 * Each root carries its own metadata (nr_child,
+		 * external_nodes), so no relocation is needed.
+		 */
+		struct cds_ft_inode_flag *tmp;
+		size_t dm;
+
+		tmp = rcu_dereference(dst_ft->root);
+		rcu_assign_pointer(dst_ft->root,
+			rcu_dereference(swap_ft->root));
+		swap_ft->root = tmp;
+
+		dm = uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED);
+		if (swap_max > dm)
+			uatomic_store(&dst_ft->max_used_key_len,
+				      swap_max, CMM_RELAXED);
+		uatomic_store(&swap_ft->max_used_key_len, dm,
+			      CMM_RELAXED);
+
+		return CDS_FT_STATUS_OK;
+	}
+
+	{
+		struct ft_graft_point gp;
+		struct cds_ft_metadata *pmeta, *swap_rmeta;
+		struct cds_ft_inode_flag *old_child, *old_swap_root;
+		bool swap_empty;
+
+		ft_descend_to_graft_point(dst_ft, key, key_len, &gp);
+
+		if (gp.depth < key_len) {
+			/*
+			 * Path incomplete: nothing at or below the graft
+			 * point.  swap_ft receives empty content.
+			 * Delegate to graft for intermediate-node creation.
+			 */
+			return cds_ft_graft(dst_ft, key, _key_len, swap_ft);
+		}
+
+		/* Snapshot old content at the graft slot. */
+		old_child = gp.nf;
+
+		old_swap_root = swap_ft->root;
+		swap_rmeta = ft_root_metadata(swap_ft);
+		swap_empty = (swap_rmeta->nr_child == 0
+				&& !swap_rmeta->external_nodes);
+
+		/*
+		 * Atomic store at graft point.  If swap is empty,
+		 * place NULL (removing the subtree); otherwise place
+		 * the swap root node directly.
+		 */
+		rcu_assign_pointer(*gp.nfp,
+			swap_empty ? NULL : old_swap_root);
+
+		/* Update parent nr_child on NULL <-> non-NULL transition. */
+		pmeta = cds_ft_item_to_metadata(ft_node_ptr(gp.pnf));
+		if (!ft_node_ptr(old_child) && !swap_empty)
+			pmeta->nr_child++;
+		else if (ft_node_ptr(old_child) && swap_empty)
+			pmeta->nr_child--;
+
+		/*
+		 * Set up swap_ft to hold old content from the graft
+		 * point.  If old_child is an internal node, it
+		 * becomes swap_ft's root directly (its
+		 * metadata.external_nodes carries the entries at the
+		 * graft key).  Otherwise, allocate a fresh root and
+		 * place any external node chain as NIL-key entries.
+		 */
+		if (ft_node_ptr(old_child)
+				&& ft_node_internal(old_child)) {
+			swap_ft->root = old_child;
+			if (swap_empty)
+				free_cds_ft_node(swap_ft,
+					ft_node_ptr(old_swap_root));
+		} else if (swap_empty) {
+			if (ft_node_ptr(old_child))
+				swap_rmeta->external_nodes =
+					(struct cds_ft_node *)
+					ft_node_ptr(old_child);
+		} else {
+			struct cds_ft_inode *fresh;
+			struct cds_ft_metadata *fresh_meta;
+
+			fresh = alloc_cds_ft_node(swap_ft,
+				&ft_types[0], &fresh_meta);
+			if (!fresh)
+				abort();
+			swap_ft->root = ft_node_flag(fresh, 0);
+			if (ft_node_ptr(old_child))
+				fresh_meta->external_nodes =
+					(struct cds_ft_node *)
+					ft_node_ptr(old_child);
+		}
+
+		{
+			size_t nm = key_len + swap_max;
+			size_t dm = uatomic_load(&dst_ft->max_used_key_len,
+						 CMM_RELAXED);
+			if (nm > dm)
+				uatomic_store(&dst_ft->max_used_key_len, nm,
+					      CMM_RELAXED);
+			uatomic_store(&swap_ft->max_used_key_len,
+				      dm > key_len ? dm - key_len : 0,
+				      CMM_RELAXED);
+		}
+		return CDS_FT_STATUS_OK;
+	}
+}
+
+enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft **result_ft)
+{
+	struct cds_ft *detached;
+	struct cds_ft_inode_flag *child;
+	size_t key_len;
+	enum cds_ft_status status;
+
+	*result_ft = NULL;
+
+	if (!ft)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+
+	/*
+	 * Root-level detach (key_len == 0) is valid for both
+	 * variable-length and fixed-length groups.  See cds_ft_graft.
+	 */
+	if (_key_len == 0) {
+		key_len = 0;
+	} else {
+		key_len = ft_key_len(ft, _key_len);
+		if (!valid_key_len(ft, key_len) ||
+				ft->group->key_len != CDS_FT_LEN_VARIABLE)
+			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+
+	if (key_len == 0) {
+		struct cds_ft_metadata *rmeta = ft_root_metadata(ft);
+		struct cds_ft_inode *fresh_node;
+		struct cds_ft_metadata *fresh_meta;
+
+		/* Check if source trie is empty. */
+		if (rmeta->nr_child == 0 && !rmeta->external_nodes)
+			return CDS_FT_STATUS_NOT_FOUND;
+
+		status = cds_ft_create(ft->group, &detached);
+		if (status != CDS_FT_STATUS_OK)
+			return status;
+
+		/*
+		 * Allocate a fresh empty root for the source trie
+		 * before swapping.
+		 */
+		fresh_node = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
+		if (!fresh_node) {
+			cds_ft_destroy(detached);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+
+		/*
+		 * Move the source root into the detached trie.
+		 * Free the empty root that cds_ft_create allocated for
+		 * the detached trie, and replace it with the source root.
+		 */
+		free_cds_ft_node(detached, ft_node_ptr(detached->root));
+		detached->root = rcu_dereference(ft->root);
+		uatomic_store(&detached->max_used_key_len,
+			      uatomic_load(&ft->max_used_key_len, CMM_RELAXED),
+			      CMM_RELAXED);
+
+		/* Give source a fresh empty root. */
+		rcu_assign_pointer(ft->root, ft_node_flag(fresh_node, 0));
+
+		*result_ft = detached;
+		return CDS_FT_STATUS_OK;
+	}
+
+	/*
+	 * key_len > 0: descent with snapshot tracking for
+	 * ft_detach_node's upward pruning walk.
+	 */
+	{
+		unsigned int i;
+		struct cds_ft_inode_flag *nf;
+		struct cds_ft_inode_flag **nfp;
+		const uint8_t *ik = key;
+
+		struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
+		uint8_t snapshot_n[FT_MAX_DEPTH];
+		int nr_snapshot = 0;
+		struct cds_ft_inode_flag **det_nfp = NULL;
+		struct cds_ft_inode_flag **det_pfp;
+		struct cds_ft_inode_flag **pp_fp, **p_fp;
+		bool pending;
+
+		nf  = rcu_dereference(ft->root);
+		nfp = &ft->root;
+
+		pp_fp   = NULL;
+		p_fp    = &ft->root;
+		det_pfp = &ft->root;
+		pending = true;
+
+		for (i = 1; i <= key_len; i++) {
+			uint8_t kv;
+			const struct cds_ft_metadata *meta;
+
+			if (!ft_node_ptr(nf))
+				return CDS_FT_STATUS_NOT_FOUND;
+			if (!ft_node_internal(nf))
+				return CDS_FT_STATUS_NOT_FOUND;
+
+			meta = cds_ft_item_to_metadata(ft_node_ptr(nf));
+			if (meta->nr_child > 1) {
+				det_pfp = p_fp;
+				pending = true;
+			} else if (i > 1 && meta->external_nodes) {
+				det_nfp = p_fp;
+				det_pfp = pp_fp;
+				pending = false;
+			}
+
+			kv = key_to_ordinal(ft, *(ik++));
+			snapshot_n[nr_snapshot + 1] = kv;
+			snapshot[nr_snapshot++] = nf;
+			nf = ft_node_get_nth(nf, &nfp, kv);
+			if (nf) {
+				pp_fp = p_fp;
+				p_fp  = nfp;
+				if (pending) {
+					det_nfp = nfp;
+					pending = false;
+				}
+			}
+		}
+
+		child = nf;
+
+		if (!ft_node_ptr(child))
+			return CDS_FT_STATUS_NOT_FOUND;
+
+		status = cds_ft_create(ft->group, &detached);
+		if (status != CDS_FT_STATUS_OK)
+			return status;
+
+		/*
+		 * Detach child from the source trie and prune empty
+		 * branches above.  After this, child is no longer
+		 * reachable from the live trie for new readers.
+		 */
+		snapshot[nr_snapshot++] = child;
+		{
+			int ret = ft_detach_node(ft, snapshot, snapshot_n,
+						 nr_snapshot,
+						 det_nfp, det_pfp);
+			assert(ret != -ENOENT);
+			(void) ret;
+		}
+
+		/*
+		 * If the detached child is an internal node, it
+		 * becomes the detached trie's root directly.  Its
+		 * metadata.external_nodes carries the entries at the
+		 * detach key, which become NIL-key entries in the
+		 * detached trie.  Free the empty root that
+		 * cds_ft_create allocated and replace it.
+		 *
+		 * If the child is an external node, place it in the
+		 * detached trie's (empty) root metadata as a NIL-key
+		 * entry.
+		 */
+		if (ft_node_internal(child)) {
+			free_cds_ft_node(detached,
+				ft_node_ptr(detached->root));
+			detached->root = child;
+		} else {
+			struct cds_ft_metadata *dmeta =
+				ft_root_metadata(detached);
+			dmeta->external_nodes =
+				(struct cds_ft_node *) ft_node_ptr(child);
+		}
+		{
+			size_t fm = uatomic_load(&ft->max_used_key_len,
+						 CMM_RELAXED);
+			uatomic_store(&detached->max_used_key_len,
+				      fm > key_len ? fm - key_len : 0,
+				      CMM_RELAXED);
+		}
+
+		*result_ft = detached;
+		return CDS_FT_STATUS_OK;
+	}
+}
+
 size_t cds_ft_key_len(const struct cds_ft *ft)
 {
 	return ft->group->key_len;
@@ -4896,6 +5494,8 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 		return "Buffer too small for key length";
 	case CDS_FT_STATUS_BUSY_ERROR:
 		return "Resource busy";
+	case CDS_FT_STATUS_POPULATED_ERROR:
+		return "Destination already populated";
 
 	default:
 		return "Unknown status value";
