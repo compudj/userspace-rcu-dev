@@ -798,9 +798,9 @@ void cds_ft_destroy(struct cds_ft *ft);
  *
  * Returns true if the trie contains no nodes, false otherwise.
  *
- * This function uses a relaxed atomic load and does not require
- * the RCU read-side lock to be held. The result is a snapshot:
- * concurrent updates may change the emptiness state at any time.
+ * An RCU read-side lock must be held while calling this function.
+ * The result is a snapshot: concurrent updates may change the
+ * emptiness state at any time.
  */
 bool cds_ft_empty(struct cds_ft *ft);
 

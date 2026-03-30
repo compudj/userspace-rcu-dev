@@ -159,8 +159,7 @@ struct cds_ft_group {
 struct cds_ft {
 	struct cds_ft_group *group;
 
-	struct cds_ft_inode_flag *root;
-	struct cds_ft_metadata root_metadata;
+	struct cds_ft_inode_flag *root;		/* Root node (arena-allocated, always present, always internal). */
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
 	unsigned long nr_fallback;		/* Number of fallback nodes used */
 
@@ -255,6 +254,30 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft_metadata *metadata);
+
+/*
+ * Return the metadata of the root node.
+ *
+ * ft->root always points to an arena-allocated internal node, even
+ * when the trie is empty (nr_child == 0).  The node itself may be
+ * replaced by graft or graft-swap, but the invariant on the slot
+ * is maintained across all operations.  Its metadata holds:
+ *   - nr_child:       number of children in the root node.
+ *   - external_nodes: list of NIL-key (key_len == 0) entries.
+ *
+ * The root is a regular internal node whose metadata is accessed the
+ * same way as any other node's.  Its metadata carries the NIL-key
+ * entries, so transplanting a root node between tries is a single
+ * pointer swap with no metadata relocation.
+ *
+ * This function is only meant to be used from update functions, _not_
+ * safe for use by read-side.
+ */
+static inline
+struct cds_ft_metadata *ft_root_metadata(const struct cds_ft *ft)
+{
+	return cds_ft_item_to_metadata(ft_node_ptr(ft->root));
+}
 
 /*
  * Iterate through duplicates returned by cds_ft_lookup*()

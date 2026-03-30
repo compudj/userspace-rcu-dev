@@ -883,8 +883,15 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 	nr_child = (uint8_t)(first_word >> ((sizeof(unsigned long) - 1) * 8));
 #endif
 	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
-	assert(type->type_class != FT_LINEAR || nr_child >= type->min_child);
-	assert(nr_child <= type->max_linear_child && nr_child != 0 && nr_child != 255);
+	assert(type->type_class != FT_LINEAR || nr_child == 0 || nr_child >= type->min_child);
+	assert(nr_child <= type->max_linear_child && nr_child != 255);
+
+	/* Empty node (root with 0 children). */
+	if (caa_unlikely(nr_child == 0)) {
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = NULL;
+		return NULL;
+	}
 
 	/*
 	 * Prepare the poisoned mask for the first word.
@@ -958,7 +965,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 
 	nr_child = ft_linear_node_get_nr_child(type, node);
 	assert(nr_child <= type->max_linear_child);
-	assert(type->type_class != FT_LINEAR || nr_child >= type->min_child);
+	assert(type->type_class != FT_LINEAR || nr_child == 0 || nr_child >= type->min_child);
 
 	values = &node->u.data[1];
 	for (i = 0; i < nr_child; i++) {
@@ -1003,7 +1010,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	nr_child = ft_linear_node_get_nr_child(type, node);
 	cmm_smp_rmb();	/* read nr_child before values and pointers */
 	assert(nr_child <= type->max_linear_child);
-	assert(type->type_class != FT_LINEAR || nr_child >= type->min_child);
+	assert(type->type_class != FT_LINEAR || nr_child == 0 || nr_child >= type->min_child);
 
 	values = &node->u.data[1];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
@@ -2070,13 +2077,18 @@ void ft_node_sum_distribution_2d(enum ft_recompact mode,
 
 static
 unsigned int find_nearest_type_index(unsigned int type_index,
-		unsigned int nr_nodes)
+		unsigned int nr_nodes, bool is_root)
 {
 	const struct cds_ft_type *type;
 
 	assert(type_index != NODE_INDEX_NULL);
-	if (nr_nodes == 0)
-		return NODE_INDEX_NULL;
+	if (nr_nodes == 0) {
+		/*
+		 * The root node is kept alive with 0 children (smallest
+		 * linear type).  All other nodes are pruned.
+		 */
+		return is_root ? 0 : NODE_INDEX_NULL;
+	}
 	for (;;) {
 		type = &ft_types[type_index];
 		if (nr_nodes < type->min_child)
@@ -2102,7 +2114,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **old_node_flag_ptr, uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
-		struct cds_ft_inode_flag **nullify_node_flag_ptr)
+		struct cds_ft_inode_flag **nullify_node_flag_ptr,
+		bool is_root)
 {
 	unsigned int new_type_index;
 	struct cds_ft_inode *new_node;
@@ -2121,7 +2134,7 @@ int ft_node_recompact(enum ft_recompact mode,
 	switch (mode) {
 	case FT_RECOMPACT_ADD_SAME:
 		new_type_index = find_nearest_type_index(old_type_index,
-			metadata->nr_child + 1);
+			metadata->nr_child + 1, false);
 		dbg_printf("Recompact for node with %u children\n",
 			metadata->nr_child + 1);
 		break;
@@ -2131,14 +2144,14 @@ int ft_node_recompact(enum ft_recompact mode,
 			dbg_printf("Recompact for NULL\n");
 		} else {
 			new_type_index = find_nearest_type_index(old_type_index,
-				metadata->nr_child + 1);
+				metadata->nr_child + 1, false);
 			dbg_printf("Recompact for node with %u children\n",
 				metadata->nr_child + 1);
 		}
 		break;
 	case FT_RECOMPACT_DEL:
 		new_type_index = find_nearest_type_index(old_type_index,
-			metadata->nr_child - 1);
+			metadata->nr_child - 1, is_root);
 		dbg_printf("Recompact for node with %u children\n",
 			metadata->nr_child - 1);
 		break;
@@ -2427,12 +2440,14 @@ int ft_node_set_nth(struct cds_ft *ft,
 	case -ENOSPC:
 		/* Not enough space in node, need to recompact to next type. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
-					metadata, node_flag, n, child_node_flag, NULL);
+					metadata, node_flag, n, child_node_flag, NULL,
+					false);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
-					metadata, node_flag, n, child_node_flag, NULL);
+					metadata, node_flag, n, child_node_flag, NULL,
+					false);
 		break;
 	}
 	return ret;
@@ -2447,7 +2462,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		struct cds_ft_inode_flag **parent_node_flag_ptr,	/* Address of parent ptr in its parent */
 		struct cds_ft_metadata *metadata,			/* of parent */
 		uint8_t n,
-		struct cds_ft_inode_flag *newptr)
+		struct cds_ft_inode_flag *newptr,
+		bool is_root)
 {
 	int ret;
 	unsigned int type_index;
@@ -2466,7 +2482,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		/* Should try recompaction. */
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
-				node_flag_ptr);
+				node_flag_ptr, is_root);
 	}
 	return ret;
 }
@@ -2517,36 +2533,15 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		iter_path_len = 1;
 	}
 
-	/* level 0: root node */
-	if (!ft_node_ptr(node_flag)) {
-		status = CDS_FT_STATUS_NOT_FOUND;
-		goto end;
-	}
-	/* Check if root node is external. */
-	if (!ft_node_internal(node_flag)) {
-		if (key_len) {
-			/* Root is external but key_len > 0: partial match at root. */
-			if (track) {
-				match_len = 0;
-				match_node = (struct cds_ft_node *) node_flag;
-			}
-			status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
-		}
-		found = (struct cds_ft_node *) node_flag;
-		status = CDS_FT_STATUS_OK;
-		if (track) {
-			match_len = 0;
-			match_node = found;
-		}
-		goto end;
-	}
 	/*
-	 * Root node is internal, key length 0 requested, return
-	 * metadata external nodes.
+	 * Root is always internal. For key_len == 0, return the root's
+	 * metadata external_nodes (NIL-key entries).
 	 */
 	if (!key_len) {
-		found = rcu_dereference(ft->root_metadata.external_nodes);
+		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
+							type->order);
+		found = rcu_dereference(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track) {
 			match_len = 0;
@@ -2561,7 +2556,10 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	 * when there are no external nodes.
 	 */
 	if (track) {
-		struct cds_ft_node *external_nodes = rcu_dereference(ft->root_metadata.external_nodes);
+		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
+							type->order);
+		struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 		if (external_nodes || track_longest) {
 			match_len = 0;
@@ -2840,13 +2838,26 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	node_flag = rcu_dereference(ft->root);
 	iter->path_node[0] = node_flag;
 
-	/* level 0: root node */
-	if (!ft_node_ptr(node_flag)) {
-		iter->node = NULL;
-		iter->path_valid = true;
-		iter->path_len = 1;
-		iter->status = CDS_FT_STATUS_NOT_FOUND;
-		return iter->status;
+	/* Root is always present and always internal. */
+
+	{
+		unsigned int type_idx = ft_node_type(node_flag);
+		const struct cds_ft_type *type = &ft_types[type_idx];
+
+		/*
+		 * Empty root short-circuit: when the root has no children,
+		 * there is nothing to traverse and no inequality match is
+		 * possible. An empty root is always a type-0 linear node
+		 * with data[0] == 0.
+		 */
+		if (type->type_class == FT_LINEAR &&
+				ft_linear_node_get_nr_child(type, ft_node_ptr(node_flag)) == 0) {
+			iter->node = NULL;
+			iter->path_valid = true;
+			iter->path_len = 1;
+			iter->status = CDS_FT_STATUS_NOT_FOUND;
+			return iter->status;
+		}
 	}
 
 	/*
@@ -2931,14 +2942,9 @@ post_traversal:
 
 			if (ft_node_internal(node_flag)) {
 				struct cds_ft_metadata *metadata;
+				const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 
-				if (level == 0) {
-					metadata = &ft->root_metadata;
-				} else {
-					const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-
-					metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
-				}
+				metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
 				external_nodes = rcu_dereference(metadata->external_nodes);
 			} else {
 				external_nodes = (struct cds_ft_node *) node_flag;
@@ -3185,27 +3191,15 @@ descend_children:
 		 */
 		if (dir == FT_LEFTMOST && ft_node_internal(node_flag)
 				&& !skip_eq_external_nodes) {
-			struct cds_ft_metadata *metadata;
+			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
+					ft_node_ptr(node_flag), type->order);
+			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
-			/*
-			 * At the root level, external_nodes live in
-			 * ft->root_metadata, not in the root node's
-			 * allocation metadata.
-			 */
-			if (node_flag == iter->path_node[0]) {
-				metadata = &ft->root_metadata;
-			} else {
-				const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-				metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
-			}
-			{
-				struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
-
-				if (external_nodes) {
-					ret_node = external_nodes;
-					level--;
-					goto end;
-				}
+			if (external_nodes) {
+				ret_node = external_nodes;
+				level--;
+				goto end;
 			}
 		}
 		skip_eq_external_nodes = false;
@@ -3366,9 +3360,8 @@ int ft_attach_node(struct cds_ft *ft,
 		level, old_node_flag, attach_node_flag_ptr, attach_node_flag);
 
 	assert(!old_node_flag || external_nodes);
-	if (level == 0)
-		metadata = &ft->root_metadata;
-	else if (attach_node_flag)
+	assert(level > 0);	/* Root is always internal; level 0 is handled directly. */
+	if (attach_node_flag)
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(attach_node_flag));
 
 	/* Concurrent update prevented by mutual exclusion. */
@@ -3399,30 +3392,14 @@ int ft_attach_node(struct cds_ft *ft,
 
 	/* Chain previous external node into new branch topmost internal node metadata. */
 	if (external_nodes) {
-		if (level == 0) {
-			/*
-			 * The displaced node has a NIL key (depth 0).
-			 * It belongs in root_metadata, not in the
-			 * topmost created node (which is at depth 1).
-			 */
-			metadata->external_nodes = external_nodes;
-		} else {
-			struct cds_ft_metadata *iter_node_metadata;
+		struct cds_ft_metadata *iter_node_metadata;
 
-			iter_node_metadata = cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
-			iter_node_metadata->external_nodes = external_nodes;
-		}
+		iter_node_metadata = cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
+		iter_node_metadata->external_nodes = external_nodes;
 	}
 
 	/* Publish branch. */
-	if (level == 0) {
-		if (!ft_node_ptr(ft->root))
-			metadata->nr_child++;
-		/*
-		 * Attaching to root node.
-		 */
-		rcu_assign_pointer(ft->root, iter_node_flag);
-	} else {
+	{
 		uint8_t key_value;
 
 		key_value = key_to_ordinal(ft, *(--iter_key));
@@ -3503,7 +3480,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 	dbg_printf("cds_ft_insert attempt: node %p\n", node);
 	parent2_node_flag = NULL;
-	parent_node_flag = (struct cds_ft_inode_flag *) &ft->root;
+	parent_node_flag = NULL;
 	parent_node_flag_ptr = NULL;
 	node_flag = ft->root;
 	node_flag_ptr = &ft->root;
@@ -3542,10 +3519,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
 
-			if (i == 0)
-				metadata = &ft->root_metadata;
-			else
-				metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 			external_nodes = metadata->external_nodes;
 			if (external_nodes) {
 				struct cds_ft_node *iter_node, *last_node = NULL;
@@ -3696,7 +3670,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	dbg_printf("_cds_ft_insert_replace attempt: node %p\n", node);
 	iter_key = key;
 	parent2_node_flag = NULL;
-	parent_node_flag = (struct cds_ft_inode_flag *) &ft->root;
+	parent_node_flag = NULL;
 	parent_node_flag_ptr = NULL;
 	node_flag = ft->root;
 	node_flag_ptr = &ft->root;
@@ -3734,10 +3708,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
 
-			if (i == 0)
-				metadata = &ft->root_metadata;
-			else
-				metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 			external_nodes = metadata->external_nodes;
 			if (external_nodes) {
 				dbg_printf("_cds_ft_insert_replace: replacing internal metadata chain %p\n",
@@ -3836,30 +3807,20 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	node_flag = rcu_dereference(ft->root);
 	node_flag_ptr = &ft->root;
 
-	/* level 0: root node */
-	if (!ft_node_ptr(node_flag))
-		return CDS_FT_STATUS_NOT_FOUND;
+	/* Root is always present and always internal. */
 
 	/*
 	 * Handle NIL key (key_len == 0).
 	 */
 	if (!key_len) {
-		if (!ft_node_internal(node_flag)) {
-			/* Root is a standalone external node. */
-			iter_node_ptr = (struct cds_ft_node **) &ft->root;
-			iter_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
-			goto find_and_replace;
-		}
-		/* Root is internal. Check metadata external_nodes. */
-		{
-			struct cds_ft_metadata *metadata = &ft->root_metadata;
+		struct cds_ft_metadata *metadata;
 
-			if (!metadata->external_nodes)
-				return CDS_FT_STATUS_NOT_FOUND;
-			iter_node_ptr = (struct cds_ft_node **) &metadata->external_nodes;
-			iter_node = metadata->external_nodes;
-			goto find_and_replace;
-		}
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		if (!metadata->external_nodes)
+			return CDS_FT_STATUS_NOT_FOUND;
+		iter_node_ptr = (struct cds_ft_node **) &metadata->external_nodes;
+		iter_node = metadata->external_nodes;
+		goto find_and_replace;
 	}
 
 	/* Traverse internal levels. */
@@ -3994,10 +3955,15 @@ int ft_detach_node(struct cds_ft *ft,
 		if (prev_external_nodes_found || metadata->nr_child > 1 || i == 0) {
 			if (i > 0) {
 				metadata = cds_ft_item_to_metadata(ft_node_ptr(snapshot[i - 1]));
-			} else {
-				metadata = &ft->root_metadata;
 			}
-			metadata_stack[nr_metadata++] = metadata;
+			/*
+			 * When i == 0 we are at the root.  The root's own
+			 * metadata is already in metadata_stack (just pushed
+			 * above); we reuse it as the "parent" metadata for
+			 * the replace_ptr call below.
+			 */
+			if (i > 0)
+				metadata_stack[nr_metadata++] = metadata;
 
 			n = snapshot_n[i + 1];
 			break;
@@ -4009,8 +3975,8 @@ int ft_detach_node(struct cds_ft *ft,
 	/*
 	 * At this point, we want to delete all nodes that are about to
 	 * be removed from metadata_stack (except the last one, which is
-	 * either the root or the parent of the topmost node with 1
-	 * child).
+	 * the parent of the topmost node with 1 child, or the root
+	 * itself when the entire branch goes up to the root).
 	 */
 	for (i = 0; i < nr_clear; i++)
 		free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
@@ -4021,16 +3987,13 @@ int ft_detach_node(struct cds_ft *ft,
 		detach_node_flag_ptr,	/* Pointer to location to nullify */
 		&iter_node_flag,	/* Old new parent ptr in its parent */
 		metadata_stack[nr_branch - 1],	/* of parent */
-		n, (struct cds_ft_inode_flag *) topmost_external_nodes);
+		n, (struct cds_ft_inode_flag *) topmost_external_nodes,
+		detach_parent_flag_ptr == &ft->root);
 	if (ret)
 		goto end;
 
 	dbg_printf("ft_detach_node: publish %p instead of %p\n",
 		iter_node_flag, *detach_parent_flag_ptr);
-	if (detach_parent_flag_ptr == &ft->root) {
-		if (*detach_parent_flag_ptr && !iter_node_flag)
-			ft->root_metadata.nr_child--;
-	}
 	/* Update address of parent ptr in its parent */
 	rcu_assign_pointer(*detach_parent_flag_ptr, iter_node_flag);
 
@@ -4130,10 +4093,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		 * Update when encountering a potential upward-walk
 		 * termination point.
 		 */
-		if (i == 1)
-			metadata = &ft->root_metadata;
-		else
-			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		if (metadata->nr_child > 1) {
 			detach_parent_flag_ptr = p_flag_ptr;
 			pending_detach_node = true;
@@ -4179,10 +4139,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_node *external_nodes;
 		struct cds_ft_metadata *metadata;
 
-		if (key_len == 0)
-			metadata = &ft->root_metadata;
-		else
-			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		external_nodes = metadata->external_nodes;
 		if (external_nodes) {
 			/*
@@ -4299,37 +4256,21 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	key_depth = key_len + 1;
 
 	/*
-	 * Handle NIL key (key_len == 0) specially to avoid edge cases
-	 * in the detach tracking for root-level external nodes.
+	 * Handle NIL key (key_len == 0): root is always internal,
+	 * remove its external_nodes chain.
 	 */
 	if (!key_len) {
-		node_flag = rcu_dereference(ft->root);
+		struct cds_ft_metadata *metadata;
+		struct cds_ft_node *external_nodes;
 
-		if (!ft_node_ptr(node_flag)) {
+		metadata = ft_root_metadata(ft);
+		external_nodes = metadata->external_nodes;
+		if (!external_nodes) {
 			*result_node = NULL;
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
-		if (ft_node_internal(node_flag)) {
-			struct cds_ft_node *external_nodes;
-
-			external_nodes = ft->root_metadata.external_nodes;
-			if (!external_nodes) {
-				*result_node = NULL;
-				return CDS_FT_STATUS_NOT_FOUND;
-			}
-			*result_node = external_nodes;
-			rcu_assign_pointer(ft->root_metadata.external_nodes, NULL);
-			return CDS_FT_STATUS_OK;
-		}
-		/*
-		 * Root is a standalone external node for the NIL key.
-		 * Remove it directly.
-		 */
-		*result_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
-		rcu_assign_pointer(ft->root, NULL);
-		ft->root_metadata.nr_child--;
-		iter->path_valid = false;
-		iter->path_len = 0;
+		*result_node = external_nodes;
+		rcu_assign_pointer(metadata->external_nodes, NULL);
 		return CDS_FT_STATUS_OK;
 	}
 
@@ -4358,10 +4299,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		}
 
 		/* Track detach point pointers during descent. */
-		if (i == 1)
-			metadata = &ft->root_metadata;
-		else
-			metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		if (metadata->nr_child > 1) {
 			detach_parent_flag_ptr = p_flag_ptr;
 			pending_detach_node = true;
@@ -4470,7 +4408,21 @@ enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordin
 
 bool cds_ft_empty(struct cds_ft *ft)
 {
-	return !uatomic_load(&ft->root, CMM_RELAXED);
+	struct cds_ft_inode_flag *root_flag = rcu_dereference(ft->root);
+	struct cds_ft_inode *root_node = ft_node_ptr(root_flag);
+	unsigned int type_idx = ft_node_type(root_flag);
+	const struct cds_ft_type *type = &ft_types[type_idx];
+	struct cds_ft_metadata *rmeta = cds_ft_item_to_metadata(root_node);
+
+	/*
+	 * As a root node special-case, only a type-0 linear node with
+	 * data[0] == 0 represents an empty node.
+	 */
+	if (type->type_class != FT_LINEAR)
+		return false;
+	if (ft_linear_node_get_nr_child(type, root_node) != 0)
+		return false;
+	return !uatomic_load(&rmeta->external_nodes, CMM_RELAXED);
 }
 
 unsigned long cds_ft_count(struct cds_ft *ft)
@@ -4589,14 +4541,41 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		struct cds_ft **result_ft)
 {
 	struct cds_ft *ft;
+	struct cds_ft_inode *root_node;
+	struct cds_ft_metadata *metadata;
+	const struct cds_ft_type *type0 = &ft_types[0];
 
-	/* ft->root is NULL */
 	ft = calloc(1, sizeof(*ft));
 	if (!ft) {
 		*result_ft = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->group = ft_group;
+
+	/*
+	 * Allocate the root node (smallest linear type, initially empty).
+	 *
+	 * ft->root always points to an internal node, even when the
+	 * trie has no entries (nr_child == 0).  This is the one place
+	 * where a node with 0 children is allowed; all other internal
+	 * nodes are pruned when their last child is removed.  The node
+	 * itself may be replaced by graft or graft-swap, but the
+	 * invariant on the slot is maintained across all operations.
+	 *
+	 * The root is a regular internal node whose metadata
+	 * (nr_child, external_nodes) is accessed the same way as any
+	 * other node's.  Its metadata carries the NIL-key entries, so
+	 * transplanting a root node between tries is a single pointer
+	 * swap with no metadata relocation.
+	 */
+	root_node = alloc_cds_ft_node(ft, type0, &metadata);
+	if (!root_node) {
+		free(ft);
+		*result_ft = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+	ft->root = ft_node_flag(root_node, 0);
+
 	uatomic_inc(&ft_group->nr_ft_instances, CMM_RELAXED);
 	*result_ft = ft;
 	return CDS_FT_STATUS_OK;
@@ -4656,6 +4635,8 @@ void cds_ft_destroy(struct cds_ft *ft)
 {
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 
+	/* Free root node. No concurrent readers at this point. */
+	free_cds_ft_node(ft, ft_node_ptr(ft->root));
 	/* Wait for in-flight call_rcu free to complete. */
 	flavor->barrier();
 	ft_final_checks(ft);
@@ -4717,12 +4698,10 @@ void cds_ft_show(const struct cds_ft *ft, FILE *out)
 
 	node_flag = rcu_dereference(ft->root);
 
-	/* level 0: root node */
-	if (ft_node_ptr(node_flag)) {
-		print_indent(out, level);
-		fprintf(out, "Level 0: root node %p\n", node_flag);
-		show_node_recursive(ft, out, node_flag, level + 1);
-	}
+	/* Root is always present and always internal. */
+	print_indent(out, level);
+	fprintf(out, "Level 0: root node %p\n", node_flag);
+	show_node_recursive(ft, out, node_flag, level + 1);
 	fprintf(out, "---------------------------------------------------\n");
 }
 
@@ -4766,16 +4745,14 @@ enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft)
 }
 
 static
-void calc_stats_node(const struct cds_ft *ft, struct cds_ft_inode_flag *node_flag, struct cds_ft_stats *stats, int level)
+void calc_stats_node(const struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_inode_flag *node_flag, struct cds_ft_stats *stats, int level)
 {
 	unsigned long node_type = ft_node_type(node_flag);
 	struct cds_ft_node_stats *node_stats = &stats->level[level].node_stats[node_type];
 	const struct cds_ft_metadata *metadata;
 
-	if (node_flag != ft->root)
-		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-	else
-		metadata = &ft->root_metadata;
+	metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 	node_stats->count++;
 	node_stats->distribution[metadata->nr_child]++;
 	stats->level[level].nr_internal_nodes++;
@@ -4891,11 +4868,9 @@ void cds_ft_show_stats(const struct cds_ft *ft, FILE *out)
 
 	node_flag = rcu_dereference(ft->root);
 
-	/* level 0: root node */
-	if (ft_node_ptr(node_flag)) {
-		calc_stats_node(ft, node_flag, &stats, level);
-		calc_stats_node_recursive(ft, node_flag, &stats, level + 1);
-	}
+	/* Root is always present and always internal. */
+	calc_stats_node(ft, node_flag, &stats, level);
+	calc_stats_node_recursive(ft, node_flag, &stats, level + 1);
 	do_show_stats(ft, out, &stats);
 }
 
