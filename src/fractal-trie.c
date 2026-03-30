@@ -3622,8 +3622,11 @@ int _cds_ft_insert(struct cds_ft *ft,
 				(struct cds_ft_node *) ft_node_ptr(node_flag));
 	}
 
-	if (ret == 0)
+	if (ret == 0) {
 		uatomic_inc(&ft->nr_external_nodes);
+		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
+			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
+	}
 
 	return ret;
 }
@@ -3786,8 +3789,11 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				(struct cds_ft_node *) ft_node_ptr(node_flag));
 	}
 
-	if (ret == 0)
+	if (ret == 0) {
 		uatomic_inc(&ft->nr_external_nodes);
+		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
+			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
+	}
 
 	return ret;
 }
@@ -4477,6 +4483,11 @@ size_t cds_ft_max_key_len(const struct cds_ft *ft)
 	return ft->group->max_key_len;
 }
 
+size_t cds_ft_max_used_key_len(const struct cds_ft *ft)
+{
+	return uatomic_load(&ft->max_used_key_len, CMM_RELAXED);
+}
+
 enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key)
 {
 	if (ft->group->key_map.identity)
@@ -4745,6 +4756,27 @@ struct cds_ft_stats_level {
 struct cds_ft_stats {
 	struct cds_ft_stats_level level[FT_MAX_DEPTH];
 };
+
+enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+	enum cds_ft_status status;
+	size_t max_len = 0;
+
+	status = cds_ft_iter_create(ft, &iter);
+	if (status != CDS_FT_STATUS_OK)
+		return status;
+	cds_ft_for_each_rcu(ft, iter) {
+		if (iter->key_len > max_len)
+			max_len = iter->key_len;
+	}
+	status = cds_ft_iter_status(iter);
+	cds_ft_iter_destroy(iter);
+	if (status < 0)
+		return status;
+	uatomic_store(&ft->max_used_key_len, max_len, CMM_RELAXED);
+	return CDS_FT_STATUS_OK;
+}
 
 static
 void calc_stats_node(const struct cds_ft *ft, struct cds_ft_inode_flag *node_flag, struct cds_ft_stats *stats, int level)

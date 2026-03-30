@@ -844,6 +844,40 @@ size_t cds_ft_key_len(const struct cds_ft *ft);
 size_t cds_ft_max_key_len(const struct cds_ft *ft);
 
 /*
+ * cds_ft_max_used_key_len - Return the maximum key length inserted.
+ * @ft: The Fractal Trie.
+ *
+ * Returns the maximum key length that has been successfully inserted
+ * into this trie instance. This is a conservative (over-)estimate:
+ * it is updated on insert but not decremented on remove or detach.
+ * Use cds_ft_recompute_stats() to obtain the exact value.
+ *
+ * Returns 0 if the trie is empty or has never had a key inserted.
+ *
+ * This function uses a relaxed atomic load and does not require
+ * the RCU read-side lock to be held.
+ */
+size_t cds_ft_max_used_key_len(const struct cds_ft *ft);
+
+/*
+ * cds_ft_recompute_stats - Recompute conservative statistics.
+ * @ft: The Fractal Trie.
+ *
+ * Iterate through the trie to recompute the exact maximum used key
+ * length. The caller must hold the RCU read-side lock (for
+ * iteration) and ensure mutual exclusion with other writers (because
+ * this operation can lower the value, unlike insert which only ever
+ * increases it).
+ *
+ * Typically used after a batch of removals or a detach operation
+ * when the caller needs an accurate max_used_key_len for a
+ * subsequent graft validation.
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ */
+enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft);
+
+/*
  * cds_ft_key_map - Return the key map of a Fractal Trie.
  * @ft: The Fractal Trie.
  * @key_to_ordinal: Mapping from external key to ordered values.
