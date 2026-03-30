@@ -161,7 +161,6 @@ struct cds_ft {
 
 	struct cds_ft_inode_flag *root;
 	struct cds_ft_metadata root_metadata;
-	unsigned long nr_external_nodes;	/* Number of external nodes. */
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
 	unsigned long nr_fallback;		/* Number of fallback nodes used */
 

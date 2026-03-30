@@ -264,6 +264,7 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
 static int test_lifecycle_defaults(void)
 {
 	struct cds_ft_group *group;
+	unsigned long ft_count;
 	struct cds_ft *ft;
 
 	if (cds_ft_group_create(NULL, &group) < 0)
@@ -284,7 +285,10 @@ static int test_lifecycle_defaults(void)
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_count(ft) != 0) {
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 0) {
 		fprintf(stderr, "freshly created trie count != 0\n");
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
@@ -481,6 +485,7 @@ static int test_insert_basic(void)
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct ft_test_node *n = node_alloc(42);
+	unsigned long ft_count;
 	enum cds_ft_status s;
 
 	rcu_read_lock();
@@ -498,7 +503,10 @@ static int test_insert_basic(void)
 		drain_and_destroy(ft, group);
 		return -1;
 	}
-	if (cds_ft_count(ft) != 1) {
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 1) {
 		fprintf(stderr, "count != 1 after single insert\n");
 		drain_and_destroy(ft, group);
 		return -1;
@@ -517,6 +525,7 @@ static int test_insert_unique(void)
 	struct ft_test_node *n1 = node_alloc(7);
 	struct ft_test_node *n2 = node_alloc(7);
 	struct cds_ft_node *result;
+	unsigned long ft_count;
 	enum cds_ft_status s;
 	uint8_t k[4];
 
@@ -551,7 +560,10 @@ static int test_insert_unique(void)
 		drain_and_destroy(ft, group);
 		return -1;
 	}
-	if (cds_ft_count(ft) != 1) {
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 1) {
 		fprintf(stderr, "count should still be 1\n");
 		node_free(n2);
 		drain_and_destroy(ft, group);
@@ -572,6 +584,7 @@ static int test_insert_duplicate_chain(void)
 	struct ft_test_node *n1 = node_alloc(99);
 	struct ft_test_node *n2 = node_alloc(99);
 	struct cds_ft_node *head;
+	unsigned long ft_count;
 	enum cds_ft_status s;
 	int count = 0;
 
@@ -593,8 +606,11 @@ static int test_insert_duplicate_chain(void)
 		drain_and_destroy(ft, group);
 		return -1;
 	}
-	if (cds_ft_count(ft) != 2) {
-		fprintf(stderr, "trie count %lu, expected 2\n", cds_ft_count(ft));
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 2) {
+		fprintf(stderr, "trie count %lu, expected 2\n", ft_count);
 		drain_and_destroy(ft, group);
 		return -1;
 	}
@@ -679,7 +695,7 @@ static int test_count_tracking(void)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_ft(4, &group);
-	unsigned long i;
+	unsigned long i, ft_count;
 	int ret = -1;
 
 	for (i = 0; i < 50; i++) {
@@ -694,8 +710,11 @@ static int test_count_tracking(void)
 		}
 		rcu_read_unlock();
 	}
-	if (cds_ft_count(ft) != 50) {
-		fprintf(stderr, "count %lu, expected 50\n", cds_ft_count(ft));
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 50) {
+		fprintf(stderr, "count %lu, expected 50\n", ft_count);
 		drain_and_destroy(ft, group);
 		return -1;
 	}
@@ -1531,6 +1550,7 @@ static int test_remove_all(void)
 	struct ft_test_node *n2 = node_alloc(77);
 	struct ft_test_node *n3 = node_alloc(77);
 	struct cds_ft_node *old_chain;
+	unsigned long ft_count;
 	enum cds_ft_status s;
 	uint8_t k[4];
 	int chain_len = 0;
@@ -1549,8 +1569,9 @@ static int test_remove_all(void)
 	cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n2->node);
 	cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n3->node);
 
-	if (cds_ft_count(ft) != 3) {
-		fprintf(stderr, "count before remove_all: %lu\n", cds_ft_count(ft));
+	ft_count = cds_ft_count(ft);
+	if (ft_count != 3) {
+		fprintf(stderr, "count before remove_all: %lu\n", ft_count);
 		goto fail;
 	}
 
@@ -1564,8 +1585,9 @@ static int test_remove_all(void)
 		goto fail;
 	}
 
-	if (cds_ft_count(ft) != 0) {
-		fprintf(stderr, "count after remove_all: %lu\n", cds_ft_count(ft));
+	ft_count = cds_ft_count(ft);
+	if (ft_count != 0) {
+		fprintf(stderr, "count after remove_all: %lu\n", ft_count);
 		goto fail;
 	}
 
@@ -1976,6 +1998,7 @@ static int test_1byte_exhaustive(void)
 	struct cds_ft *ft = create_fixed_ft(1, &group);
 	struct cds_ft_iter *iter;
 	unsigned int i, count;
+	unsigned long ft_count;
 
 	if (cds_ft_iter_create(ft, &iter) < 0) {
 		cds_ft_destroy(ft);
@@ -1991,8 +2014,11 @@ static int test_1byte_exhaustive(void)
 		rcu_read_unlock();
 	}
 
-	if (cds_ft_count(ft) != 256) {
-		fprintf(stderr, "1byte exhaustive: count %lu\n", cds_ft_count(ft));
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 256) {
+		fprintf(stderr, "1byte exhaustive: count %lu\n", ft_count);
 		cds_ft_iter_destroy(iter);
 		drain_and_destroy(ft, group);
 		return -1;

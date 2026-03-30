@@ -3462,17 +3462,6 @@ void ft_chain_node(struct cds_ft_node *last_node, struct cds_ft_node *node)
 	rcu_assign_pointer(last_node->next, node);
 }
 
-static
-unsigned long ft_count_duplicate_chain(struct cds_ft_node *head)
-{
-	unsigned long count = 0;
-	struct cds_ft_node *iter_node = head;
-
-	cds_ft_for_each_duplicate(iter_node)
-		count++;
-	return count;
-}
-
 /*
  * There are a few cases to cover for add:
  *
@@ -3623,7 +3612,6 @@ int _cds_ft_insert(struct cds_ft *ft,
 	}
 
 	if (ret == 0) {
-		uatomic_inc(&ft->nr_external_nodes);
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 	}
@@ -3790,7 +3778,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	}
 
 	if (ret == 0) {
-		uatomic_inc(&ft->nr_external_nodes);
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 	}
@@ -3817,12 +3804,6 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 	}
 	*result_node = old_node;
 	if (old_node) {
-		/*
-		 * Subtract the old chain length. The new node (+1) was
-		 * already counted by _cds_ft_insert_replace.
-		 */
-		uatomic_sub(&ft->nr_external_nodes,
-			    ft_count_duplicate_chain(old_node));
 		return CDS_FT_STATUS_DUPLICATE_FOUND;
 	}
 	return CDS_FT_STATUS_OK;
@@ -4290,9 +4271,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	iter->path_valid = false;
 	iter->path_len = 0;
 
-	if (ret == 0)
-		uatomic_dec(&ft->nr_external_nodes);
-
 	return ret == 0 ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
@@ -4341,8 +4319,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			}
 			*result_node = external_nodes;
 			rcu_assign_pointer(ft->root_metadata.external_nodes, NULL);
-			uatomic_sub(&ft->nr_external_nodes,
-				    ft_count_duplicate_chain(external_nodes));
 			return CDS_FT_STATUS_OK;
 		}
 		/*
@@ -4352,8 +4328,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		*result_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
 		rcu_assign_pointer(ft->root, NULL);
 		ft->root_metadata.nr_child--;
-		uatomic_sub(&ft->nr_external_nodes,
-			    ft_count_duplicate_chain(*result_node));
 		iter->path_valid = false;
 		iter->path_len = 0;
 		return CDS_FT_STATUS_OK;
@@ -4467,9 +4441,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	if (ret)
 		return CDS_FT_STATUS_NOT_FOUND;
 
-	uatomic_sub(&ft->nr_external_nodes,
-		    ft_count_duplicate_chain(*result_node));
-
 	return CDS_FT_STATUS_OK;
 }
 
@@ -4502,9 +4473,25 @@ bool cds_ft_empty(struct cds_ft *ft)
 	return !uatomic_load(&ft->root, CMM_RELAXED);
 }
 
-unsigned long cds_ft_count(const struct cds_ft *ft)
+unsigned long cds_ft_count(struct cds_ft *ft)
 {
-	return uatomic_load(&ft->nr_external_nodes, CMM_RELAXED);
+	struct cds_ft_iter *iter;
+	enum cds_ft_status status;
+	unsigned long count = 0;
+
+	status = cds_ft_iter_create(ft, &iter);
+	if (status != CDS_FT_STATUS_OK)
+		return 0;
+	cds_ft_for_each_rcu(ft, iter) {
+		struct cds_ft_node *node = cds_ft_iter_node(iter);
+
+		cds_ft_for_each_duplicate_rcu(node)
+			count++;
+	}
+	if (cds_ft_iter_status(iter) < 0)
+		count = 0;
+	cds_ft_iter_destroy(iter);
+	return count;
 }
 
 enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
