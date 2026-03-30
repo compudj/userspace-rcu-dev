@@ -236,29 +236,23 @@ int test_free_all_nodes(struct cds_ft *ft)
 
 	rcu_read_lock();
 
-	cds_ft_for_each_rcu(ft, iter) {
-		struct cds_ft_node *node = cds_ft_iter_node(iter);
-		struct cds_ft_node *tmp_node;
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp_node;
 
-		cds_ft_for_each_duplicate_safe_rcu(node, tmp_node) {
-			status = cds_ft_remove(ft, iter, node);
-			if (status) {
-				uint8_t key[256];
-				size_t entry_key_len;
+		status = cds_ft_remove_all(ft, iter, &head);
+		if (status) {
+			uint8_t key[256];
+			size_t entry_key_len;
 
-				cds_ft_iter_get_key(iter, key, sizeof(key), &entry_key_len);
-				fprintf(stderr, "Error removing node %" PRIu64 ": %s\n",
-					cds_ft_key_to_u64(ft, key, entry_key_len), cds_ft_status_to_string(status));
-				goto end;
-			}
-			/* Alone using Fractal Trie, OK to free now */
-			free_node(node);
+			cds_ft_iter_get_key(iter, key, sizeof(key), &entry_key_len);
+			fprintf(stderr, "Error removing node %" PRIu64 ": %s\n",
+				cds_ft_key_to_u64(ft, key, entry_key_len), cds_ft_status_to_string(status));
+			goto end;
 		}
-	}
-	if (cds_ft_iter_status(iter) < 0) {
-		fprintf(stderr, "Error iterating on trie: %s\n",
-			cds_ft_status_to_string(cds_ft_iter_status(iter)));
-		goto end;
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp_node) {
+			/* Alone using Fractal Trie, OK to free now */
+			free_node(head);
+		}
 	}
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
