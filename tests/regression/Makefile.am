@@ -15,6 +15,7 @@ noinst_PROGRAMS = \
 	test_urcu_fork.tap \
 	test_urcu_fork_cxx.tap \
 	test_urcu_ft \
+	test_urcu_ft_inv \
 	rcutorture_urcu_membarrier \
 	rcutorture_urcu_membarrier_cxx \
 	rcutorture_urcu_mb \
@@ -43,6 +44,10 @@ test_urcu_fork_cxx_tap_LDADD = $(URCU_LIB) $(TAP_LIB)
 test_urcu_ft_SOURCES = test_urcu_ft.c
 test_urcu_ft_CFLAGS = -DRCU_QSBR $(AM_CFLAGS)
 test_urcu_ft_LDADD = $(URCU_QSBR_LIB) $(URCU_CDS_LIB)
+
+test_urcu_ft_inv_SOURCES = test_urcu_ft_inv.c
+test_urcu_ft_inv_CFLAGS = -DRCU_QSBR $(AM_CFLAGS)
+test_urcu_ft_inv_LDADD = $(URCU_QSBR_LIB) $(URCU_CDS_LIB) $(TAP_LIB)
 
 rcutorture_urcu_membarrier_SOURCES = urcutorture.c
 rcutorture_urcu_membarrier_CFLAGS = -DRCU_MEMBARRIER $(AM_CFLAGS)
