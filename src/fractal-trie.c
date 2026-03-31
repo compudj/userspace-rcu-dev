@@ -4263,7 +4263,14 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	iter->path_valid = false;
 	iter->path_len = 0;
 
-	return ret == 0 ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+	switch (ret) {
+	case 0:
+		return CDS_FT_STATUS_OK;
+	case -ENOMEM:
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	default:
+		abort();
+	}
 }
 
 enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
