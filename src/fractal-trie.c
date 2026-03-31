@@ -4506,6 +4506,30 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 }
 
 /*
+ * Free a chain of internal nodes previously built by ft_build_branch().
+ * Walks down the path using the key to find the next child, freeing the
+ * current node at each step. Safely leaves the bottom-most leaf untouched.
+ */
+static
+void ft_free_branch(struct cds_ft *ft,
+		const uint8_t *key, unsigned int start, unsigned int end,
+		struct cds_ft_inode_flag *top_node)
+{
+	struct cds_ft_inode_flag *cur = top_node;
+	unsigned int i;
+
+	for (i = start; i < end; i++) {
+		struct cds_ft_inode_flag *next_node;
+		uint8_t kv = key_to_ordinal(ft, key[i]);
+
+		assert(ft_node_ptr(cur) && ft_node_internal(cur));
+		next_node = ft_node_get_nth(cur, NULL, kv);
+		free_cds_ft_node(ft, ft_node_ptr(cur));
+		cur = next_node;
+	}
+}
+
+/*
  * Store graft_payload at the graft point described by @gp.
  *
  * Handles two cases:
@@ -4580,9 +4604,10 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 			ret = ft_node_set_nth(ft, &dest,
 				key_to_ordinal(ft, key[i - 1]),
 				branch, &old_recompacted_node, pmeta);
-			if (ret)
+			if (ret) {
+				ft_free_branch(ft, key, i, key_len, branch);
 				return CDS_FT_STATUS_MEMORY_ERROR;
-
+			}
 			rcu_assign_pointer(*gp->pnfp, dest);
 
 			if (old_recompacted_node)
