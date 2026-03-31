@@ -64,6 +64,15 @@
 # define NODE_INDEX_NULL		8
 #endif
 
+/* Hardcoded pool indexes for fast path. */
+#if (CAA_BITS_PER_LONG < 64)
+# define FT_POOL_IDX_A	4
+# define FT_POOL_IDX_B	5
+#else
+# define FT_POOL_IDX_A	5
+# define FT_POOL_IDX_B	6
+#endif
+
 /*
  * Number of removals needed on a fallback node before we try to shrink
  * it.
@@ -168,72 +177,6 @@ struct cds_ft {
 	unsigned long nr_nodes_allocated, nr_nodes_freed;
 };
 
-static inline
-struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
-		unsigned long type)
-{
-	assert(type < (1UL << FT_TYPE_BITS));
-	return (struct cds_ft_inode_flag *) (((unsigned long) node) |
-		(type << FT_INTERNAL_BITS) |
-		FT_INTERNAL_MASK);
-}
-
-static inline
-struct cds_ft_inode_flag *ft_node_flag_pool_1d(struct cds_ft_inode *node,
-		unsigned long type, unsigned long bitsel)
-{
-	assert(type < (1UL << FT_TYPE_BITS));
-	assert(bitsel < FT_BITS_PER_BYTE);
-	return (struct cds_ft_inode_flag *) (((unsigned long) node) |
-		(bitsel << (FT_TYPE_BITS + FT_INTERNAL_BITS)) |
-		(type << FT_INTERNAL_BITS) |
-		FT_INTERNAL_MASK);
-}
-
-static inline
-struct cds_ft_inode_flag *ft_node_flag_pool_2d(struct cds_ft_inode *node,
-		unsigned long type, unsigned int subclass_index)
-{
-	assert(type < (1UL << FT_TYPE_BITS));
-	return (struct cds_ft_inode_flag *) (((unsigned long) node) |
-		(subclass_index << (FT_TYPE_BITS + FT_INTERNAL_BITS)) |
-		(type << FT_INTERNAL_BITS) |
-		FT_INTERNAL_MASK);
-}
-
-/* Hardcoded pool indexes for fast path */
-#if (CAA_BITS_PER_LONG < 64)
-# define FT_POOL_IDX_A	4
-# define FT_POOL_IDX_B	5
-#else
-# define FT_POOL_IDX_A	5
-# define FT_POOL_IDX_B	6
-#endif
-static inline
-struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
-{
-	unsigned long v, type_idx;
-
-	if (!node)
-		return NULL;	/* FT_NULL */
-	v = (unsigned long) node;
-	type_idx = (v & FT_TYPE_MASK) >> FT_INTERNAL_BITS;
-
-	switch (type_idx) {
-	case FT_POOL_IDX_A:
-		v &= ~(FT_POOL_1D_MASK | FT_TYPE_MASK | FT_INTERNAL_MASK);
-		break;
-	case FT_POOL_IDX_B:
-		v &= ~(FT_POOL_2D_MASK | FT_TYPE_MASK | FT_INTERNAL_MASK);
-		break;
-	default:
-		/* FT_LINEAR or FT_PIGEON */
-		v &= FT_PTR_MASK;
-		break;
-	}
-	return (struct cds_ft_inode *) v;
-}
-
 __attribute__((visibility("hidden")))
 struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order);
 
@@ -254,89 +197,6 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft_metadata *metadata);
-
-/*
- * Return the metadata of the root node.
- *
- * ft->root always points to an arena-allocated internal node, even
- * when the trie is empty (nr_child == 0).  The node itself may be
- * replaced by graft or graft-swap, but the invariant on the slot
- * is maintained across all operations.  Its metadata holds:
- *   - nr_child:       number of children in the root node.
- *   - external_nodes: list of NIL-key (key_len == 0) entries.
- *
- * The root is a regular internal node whose metadata is accessed the
- * same way as any other node's.  Its metadata carries the NIL-key
- * entries, so transplanting a root node between tries is a single
- * pointer swap with no metadata relocation.
- *
- * This function is only meant to be used from update functions, _not_
- * safe for use by read-side.
- */
-static inline
-struct cds_ft_metadata *ft_root_metadata(const struct cds_ft *ft)
-{
-	return cds_ft_item_to_metadata(ft_node_ptr(ft->root));
-}
-
-/*
- * Descent cursor — tracks current, parent, and grandparent positions
- * during a key-guided traversal of the trie.
- *
- * Each level stores both the flagged-pointer value (nf / pnf / ppnf)
- * and the address of the slot that holds it (nfp / pnfp / ppnfp).
- * Callers that do not need every field may leave the unused ones
- * NULL; the struct carries the superset so that a single descent
- * helper can serve graft, insert, remove, and detach paths.
- */
-struct ft_descent {
-	unsigned int depth;			/* Levels traversed (0 .. key_len). */
-	struct cds_ft_inode_flag *nf;		/* Current node-flag value. */
-	struct cds_ft_inode_flag **nfp;		/* Slot that holds @nf. */
-	struct cds_ft_inode_flag *pnf;		/* Parent node-flag value. */
-	struct cds_ft_inode_flag **pnfp;	/* Slot that holds @pnf. */
-	struct cds_ft_inode_flag *ppnf;		/* Grandparent node-flag value. */
-	struct cds_ft_inode_flag **ppnfp;	/* Slot that holds @ppnf. */
-};
-
-static inline
-void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
-{
-	d->depth = 0;
-	d->nf    = ft->root;
-	d->nfp   = &ft->root;
-	d->pnf   = NULL;
-	d->pnfp  = NULL;
-	d->ppnf  = NULL;
-	d->ppnfp = NULL;
-}
-
-/*
- * Extended descent state for remove / detach operations.
- * Adds the detach-point bookkeeping used by ft_detach_node()
- * on top of the common descent cursor.
- *
- * During descent, the detach point is updated at potential
- * upward-walk termination points (multi-child nodes, nodes
- * with external_nodes, and the root).  After descent,
- * det_nfp / det_pfp are passed straight to ft_detach_node().
- */
-struct ft_detach_descent {
-	struct ft_descent d;
-	struct cds_ft_inode_flag **det_nfp;	/* Detach-point node slot. */
-	struct cds_ft_inode_flag **det_pfp;	/* Detach-point parent slot. */
-	bool pending;				/* Waiting to capture det_nfp. */
-};
-
-static inline
-void ft_detach_descent_init(struct ft_detach_descent *dd,
-		struct cds_ft *ft)
-{
-	ft_descent_init(&dd->d, ft);
-	dd->det_nfp = NULL;
-	dd->det_pfp = &ft->root;
-	dd->pending = true;
-}
 
 /*
  * Iterate through duplicates returned by cds_ft_lookup*()
