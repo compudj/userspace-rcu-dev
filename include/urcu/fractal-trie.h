@@ -658,7 +658,6 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  *
  * Mutual exclusion between updates (insert, insert_unique, remove) is
  * the user's responsibility.
- * An RCU read-side lock must be held while calling this function.
  */
 enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -684,7 +683,10 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
  *
  * Mutual exclusion between updates (insert, insert_unique, remove) is
  * the user's responsibility.
- * An RCU read-side lock must be held while calling this function.
+ * Pointers to existing nodes returned by this function are only safe to
+ * dereference as long as the writer mutual exclusion is held, or if the
+ * caller wraps the operation in their own RCU read-side critical
+ * section.
  */
 enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -719,7 +721,6 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * Mutual exclusion between updates (insert, insert_unique,
  * insert_replace, replace, remove, remove_all) is the user's
  * responsibility.
- * An RCU read-side lock must be held while calling this function.
  */
 enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -752,7 +753,6 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  * Mutual exclusion between updates (insert, insert_unique,
  * insert_replace, replace, remove, remove_all) is the user's
  * responsibility.
- * An RCU read-side lock must be held while calling this function.
  */
 enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -776,7 +776,6 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  * after success before reclaiming @node memory.
  * Mutual exclusion between updates (insert, insert_unique, remove) is
  * the user's responsibility.
- * An RCU read-side lock must be held while calling this function.
  */
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -809,7 +808,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * Mutual exclusion between updates (insert, insert_unique,
  * insert_replace, replace, remove, remove_all) is the user's
  * responsibility.
- * An RCU read-side lock must be held while calling this function.
  */
 enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -854,9 +852,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *
  *   // Phase 2: graft into the live trie, O(1) under lock.
  *   lock(&writer_mutex);
- *   rcu_read_lock();
  *   cds_ft_graft(live_trie, prefix, prefix_len, staging);
- *   rcu_read_unlock();
  *   unlock(&writer_mutex);
  *   // staging is now empty but still valid; it can be reused
  *   // for the next batch or destroyed with cds_ft_destroy().
@@ -880,9 +876,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *
  *   // Phase 1: detach from the live trie, O(1) under lock.
  *   lock(&writer_mutex);
- *   rcu_read_lock();
  *   cds_ft_detach(live_trie, prefix, prefix_len, &detached);
- *   rcu_read_unlock();
  *   unlock(&writer_mutex);
  *
  *   // Phase 2: wait for readers, then drain locally.
@@ -935,7 +929,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *
  * Mutual exclusion between writers on both @dst_ft and @src_ft is
  * the caller's responsibility.
- * An RCU read-side lock must be held while calling this function.
  */
 enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		const uint8_t *key, size_t key_len,
@@ -983,7 +976,6 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  *
  * Mutual exclusion between writers on both @dst_ft and @swap_ft is
  * the caller's responsibility.
- * An RCU read-side lock must be held while calling this function.
  */
 enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		const uint8_t *key, size_t key_len,
@@ -1022,7 +1014,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  *
  * Mutual exclusion between writers on @ft is the caller's
  * responsibility.
- * An RCU read-side lock must be held while calling this function.
  */
 enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
