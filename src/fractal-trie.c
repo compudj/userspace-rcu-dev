@@ -3833,7 +3833,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 
 	dbg_printf("cds_ft_replace: old_node %p new_node %p\n", old_node, new_node);
 
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft->root;
 	node_flag_ptr = &ft->root;
 
 	/* Root is always present and always internal. */
@@ -4097,7 +4097,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	iter_key = iter->key;
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft->root;
 	node_flag_ptr = &ft->root;
 
 	/*
@@ -4320,7 +4320,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	iter_key = iter->key;
 	dbg_printf("cds_ft_remove_all attempt\n");
 
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft->root;
 	node_flag_ptr = &ft->root;
 
 	pp_flag_ptr = NULL;
@@ -4455,7 +4455,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 	unsigned int i;
 	const uint8_t *ik = key;
 
-	gp->nf = rcu_dereference(ft->root);
+	gp->nf = ft->root;
 	gp->nfp = &ft->root;
 	gp->pnf = NULL;
 	gp->pnfp = NULL;
@@ -4930,7 +4930,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		struct cds_ft_inode_flag **pp_fp, **p_fp;
 		bool pending;
 
-		nf  = rcu_dereference(ft->root);
+		nf  = ft->root;
 		nfp = &ft->root;
 
 		pp_fp   = NULL;
