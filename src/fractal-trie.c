@@ -2119,6 +2119,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		struct cds_ft_inode_flag **old_node_flag_ptr, uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
 		struct cds_ft_inode_flag **nullify_node_flag_ptr,
+		struct cds_ft_inode **old_node_ret,
 		bool is_root)
 {
 	unsigned int new_type_index;
@@ -2338,8 +2339,8 @@ skip_copy:
 
 	/* Return pointer to new recompacted node through old_node_flag_ptr */
 	*old_node_flag_ptr = new_node_flag;
-	if (old_node)
-		free_cds_ft_node(ft, old_node);
+	if (old_node && old_node_ret)
+		*old_node_ret = old_node;
 
 	ret = 0;
 end:
@@ -2427,6 +2428,7 @@ static
 int ft_node_set_nth(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag, uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
+		struct cds_ft_inode **old_node_ret,
 		struct cds_ft_metadata *metadata)
 {
 	int ret;
@@ -2445,13 +2447,13 @@ int ft_node_set_nth(struct cds_ft *ft,
 		/* Not enough space in node, need to recompact to next type. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					false);
+					old_node_ret, false);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					false);
+					old_node_ret, false);
 		break;
 	}
 	return ret;
@@ -2464,6 +2466,7 @@ static
 int ft_node_replace_ptr(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag_ptr,		/* Pointer to location to nullify */
 		struct cds_ft_inode_flag **parent_node_flag_ptr,	/* Address of parent ptr in its parent */
+		struct cds_ft_inode **old_node_ret,
 		struct cds_ft_metadata *metadata,			/* of parent */
 		uint8_t n,
 		struct cds_ft_inode_flag *newptr,
@@ -2486,7 +2489,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		/* Should try recompaction. */
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
-				node_flag_ptr, is_root);
+				node_flag_ptr, old_node_ret, is_root);
 	}
 	return ret;
 }
@@ -3373,6 +3376,7 @@ int ft_attach_node(struct cds_ft *ft,
 	struct cds_ft_metadata *metadata = NULL;
 	struct cds_ft_inode_flag *iter_node_flag, *iter_dest_node_flag,
 				*created_nodes[FT_MAX_DEPTH];
+	struct cds_ft_inode *old_recompacted_node = NULL;
 	int ret, i, nr_created_nodes = 0;
 	const uint8_t *iter_key = key + key_len;
 
@@ -3401,7 +3405,7 @@ int ft_attach_node(struct cds_ft *ft,
 		dbg_printf("branch creation level %d, key %u\n",
 				i, (unsigned int) key_value);
 		iter_dest_node_flag = NULL;
-		ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag, NULL);
+		ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag, NULL, NULL);
 		if (ret) {
 			dbg_printf("branch creation error %d\n", ret);
 			goto check_error;
@@ -3426,13 +3430,18 @@ int ft_attach_node(struct cds_ft *ft,
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
-		ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag, metadata);
+		ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag,
+				&old_recompacted_node, metadata);
 		if (ret) {
 			dbg_printf("branch publish error %d\n", ret);
 			goto check_error;
 		}
-		/* Attach branch. */
+		/* Attach branch (unlink the old node from the trie). */
 		rcu_assign_pointer(*attach_node_flag_ptr, iter_dest_node_flag);
+
+		/* Reclaim safely after unlink.*/
+		if (old_recompacted_node)
+			free_cds_ft_node(ft, old_recompacted_node);
 	}
 
 	/* Success */
@@ -3942,6 +3951,7 @@ int ft_detach_node(struct cds_ft *ft,
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
+	struct cds_ft_inode *old_recompacted_node = NULL;
 	int ret, i, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
 	uint8_t n = 0;
 	struct cds_ft_node *topmost_external_nodes = NULL;
@@ -3997,6 +4007,7 @@ int ft_detach_node(struct cds_ft *ft,
 	ret = ft_node_replace_ptr(ft,
 		detach_node_flag_ptr,	/* Pointer to location to nullify */
 		&iter_node_flag,	/* Old new parent ptr in its parent */
+		&old_recompacted_node,
 		metadata_stack[nr_branch - 1],	/* of parent */
 		n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 		detach_parent_flag_ptr == &ft->root);
@@ -4005,10 +4016,14 @@ int ft_detach_node(struct cds_ft *ft,
 
 	dbg_printf("ft_detach_node: publish %p instead of %p\n",
 		iter_node_flag, *detach_parent_flag_ptr);
+
 	/* Update address of parent ptr in its parent */
 	rcu_assign_pointer(*detach_parent_flag_ptr, iter_node_flag);
-
 end:
+	/* Reclaim safely after replacement.*/
+	if (old_recompacted_node)
+		free_cds_ft_node(ft, old_recompacted_node);
+
 	/*
 	 * At this point, we want to delete all nodes that are about to
 	 * be removed from metadata_stack (except the last one, which is
@@ -4471,7 +4486,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		struct cds_ft_inode_flag *dest = NULL;
 		uint8_t kv = key_to_ordinal(ft, key[i]);
 
-		ret = ft_node_set_nth(ft, &dest, kv, cur, NULL);
+		ret = ft_node_set_nth(ft, &dest, kv, cur, NULL, NULL);
 		if (ret) {
 			for (j = 0; j < nr; j++)
 				free_cds_ft_node(ft, ft_node_ptr(created[j]));
@@ -4502,6 +4517,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		struct ft_graft_point *gp,
 		struct cds_ft_inode_flag *graft_payload)
 {
+	struct cds_ft_inode *old_recompacted_node = NULL;
+
 	if (gp->depth == key_len) {
 		struct cds_ft_metadata *pmeta;
 		struct cds_ft_inode_flag *dest;
@@ -4515,11 +4532,14 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		dest = gp->pnf;
 		ret = ft_node_set_nth(ft, &dest,
 			key_to_ordinal(ft, key[key_len - 1]),
-			graft_payload, pmeta);
+			graft_payload, &old_recompacted_node, pmeta);
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
 		rcu_assign_pointer(*gp->pnfp, dest);
+
+		if (old_recompacted_node)
+			free_cds_ft_node(ft, old_recompacted_node);
 	} else {
 		unsigned int i = gp->depth;
 		struct cds_ft_inode_flag *branch;
@@ -4552,10 +4572,14 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 			ret = ft_node_set_nth(ft, &dest,
 				key_to_ordinal(ft, key[i - 1]),
-				branch, pmeta);
+				branch, &old_recompacted_node, pmeta);
 			if (ret)
 				return CDS_FT_STATUS_MEMORY_ERROR;
+
 			rcu_assign_pointer(*gp->pnfp, dest);
+
+			if (old_recompacted_node)
+				free_cds_ft_node(ft, old_recompacted_node);
 		}
 	}
 	return CDS_FT_STATUS_OK;
