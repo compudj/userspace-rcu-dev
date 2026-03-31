@@ -3992,15 +3992,6 @@ int ft_detach_node(struct cds_ft *ft,
 			prev_external_nodes_found = true;
 	}
 
-	/*
-	 * At this point, we want to delete all nodes that are about to
-	 * be removed from metadata_stack (except the last one, which is
-	 * the parent of the topmost node with 1 child, or the root
-	 * itself when the entire branch goes up to the root).
-	 */
-	for (i = 0; i < nr_clear; i++)
-		free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
-
 	iter_node_flag = *detach_parent_flag_ptr;
 	/* Replace within parent */
 	ret = ft_node_replace_ptr(ft,
@@ -4018,6 +4009,15 @@ int ft_detach_node(struct cds_ft *ft,
 	rcu_assign_pointer(*detach_parent_flag_ptr, iter_node_flag);
 
 end:
+	/*
+	 * At this point, we want to delete all nodes that are about to
+	 * be removed from metadata_stack (except the last one, which is
+	 * the parent of the topmost node with 1 child, or the root
+	 * itself when the entire branch goes up to the root).
+	 */
+	for (i = 0; i < nr_clear; i++)
+		free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
+
 	return ret;
 }
 
