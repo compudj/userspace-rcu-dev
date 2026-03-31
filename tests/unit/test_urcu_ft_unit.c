@@ -42,6 +42,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "tap.h"
+
+#define NR_TESTS 56
+
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
 /* ------------------------------------------------------------------ */
@@ -219,25 +223,18 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
 }
 
 /* ------------------------------------------------------------------ */
-/* Macro: run a test, print PASS/FAIL, accumulate result.             */
+/* Macro: run a test, emit TAP ok/not-ok, skip if filtered out.       */
 /* ------------------------------------------------------------------ */
 
 #define RUN_TEST(fn)							\
 	do {								\
-		if (filter && strcmp(filter, #fn) != 0)			\
+		if (filter && strcmp(filter, #fn) != 0) {		\
+			skip(1, "filtered out: " #fn);			\
 			break;						\
-		leak_reset();						\
-		printf("  %-52s ", #fn);				\
-		fflush(stdout);						\
-		rcu_quiescent_state();					\
-		if ((fn)() == 0 && leak_check() == 0) {			\
-			printf("PASS\n");				\
-			pass++;						\
-		} else {						\
-			printf("FAIL\n");				\
-			fail++;						\
 		}							\
-		total++;						\
+		leak_reset();						\
+		rcu_quiescent_state();					\
+		ok((fn)() == 0 && leak_check() == 0, "%s", #fn);	\
 	} while (0)
 
 /* ================================================================== */
@@ -3652,19 +3649,18 @@ fail:
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
-	int pass = 0, fail = 0, total = 0;
 	int err;
 
 	err = create_all_cpu_call_rcu_data(0);
 	if (err)
-		printf("Per-CPU call_rcu() workers unavailable, using default.\n");
+		diag("Per-CPU call_rcu() workers unavailable, using default.");
 
 	rcu_register_thread();
 
-	printf("Fractal Trie unit tests\n");
-	printf("===========================================================\n");
+	plan_tests(NR_TESTS);
 
 	/* 1. Lifecycle & attributes */
+	diag("Lifecycle & attribute tests");
 	RUN_TEST(test_lifecycle_defaults);
 	RUN_TEST(test_lifecycle_fixed_key_lengths);
 	RUN_TEST(test_lifecycle_nil_only_trie);
@@ -3673,6 +3669,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_status_to_string);
 
 	/* 2. Insert variants */
+	diag("Insert variant tests");
 	RUN_TEST(test_insert_basic);
 	RUN_TEST(test_insert_unique);
 	RUN_TEST(test_insert_duplicate_chain);
@@ -3680,6 +3677,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_count_tracking);
 
 	/* 3. Lookup variants */
+	diag("Lookup variant tests");
 	RUN_TEST(test_lookup_exact_hit_miss);
 	RUN_TEST(test_lookup_empty_trie);
 	RUN_TEST(test_lookup_partial);
@@ -3688,6 +3686,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_first_last);
 
 	/* 4. Iteration */
+	diag("Iteration tests");
 	RUN_TEST(test_iteration_forward_order);
 	RUN_TEST(test_iteration_reverse_order);
 	RUN_TEST(test_iteration_prefix_scoped);
@@ -3696,11 +3695,13 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iter_reset);
 
 	/* 5. Replace & remove_all */
+	diag("Replace & remove_all tests");
 	RUN_TEST(test_replace_node);
 	RUN_TEST(test_remove_all);
 	RUN_TEST(test_remove_middle_of_chain);
 
 	/* 6. Key conversion */
+	diag("Key conversion tests");
 	RUN_TEST(test_key_u64_roundtrip);
 	RUN_TEST(test_key_u32_roundtrip);
 	RUN_TEST(test_key_s64_roundtrip);
@@ -3708,9 +3709,11 @@ int main(int argc, char **argv)
 	RUN_TEST(test_key_signed_sort_order);
 
 	/* 7. NIL key */
+	diag("NIL key tests");
 	RUN_TEST(test_nil_key_varlen);
 
 	/* 8. Boundary / error paths */
+	diag("Boundary / error path tests");
 	RUN_TEST(test_1byte_exhaustive);
 	RUN_TEST(test_prefix_split);
 	RUN_TEST(test_iter_get_key_overflow);
@@ -3720,6 +3723,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_varlen_string_basic);
 
 	/* 9. Graft, graft_swap & detach */
+	diag("Graft, graft_swap & detach tests");
 	RUN_TEST(test_graft_basic);
 	RUN_TEST(test_graft_at_root);
 	RUN_TEST(test_graft_populated_error);
@@ -3738,12 +3742,9 @@ int main(int argc, char **argv)
 	RUN_TEST(test_detach_empty_trie);
 	RUN_TEST(test_detach_then_graft);
 
-	printf("===========================================================\n");
-	printf("Results: %d passed, %d failed, %d total\n", pass, fail, total);
-
 	rcu_barrier();
 	rcu_unregister_thread();
 	free_all_cpu_call_rcu_data();
 
-	return fail ? 1 : 0;
+	return exit_status();
 }
