@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 56
+#define NR_TESTS 62
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -3640,6 +3640,608 @@ fail:
 	return -1;
 }
 
+/*
+ * Graft at root on a fixed-length trie: populate a staging trie
+ * with integer keys, graft it into an empty live trie at root
+ * (key_len=0), and verify all nodes are reachable in the live trie.
+ */
+static int test_fixed_graft_at_root(void)
+{
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long count;
+	uint8_t k[4];
+	const size_t klen = 4;
+
+	if (cds_ft_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_attr_destroy(attr);
+
+	if (cds_ft_create(group, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate staging with keys 10, 20, 30. */
+	{
+		unsigned int i;
+		uint64_t vals[] = { 10, 20, 30 };
+
+		for (i = 0; i < 3; i++) {
+			struct ft_test_node *n = node_alloc(vals[i]);
+
+			cds_ft_u64_to_key(staging, vals[i], k, klen);
+			s = cds_ft_insert(staging, k, klen, &n->node);
+			if (s < 0) goto fail;
+		}
+	}
+
+	/* Graft staging into live at root. */
+	rcu_read_lock();
+	s = cds_ft_graft(live, NULL, 0, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "fixed_graft_at_root: graft: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Staging should be empty. */
+	if (!cds_ft_empty(staging)) {
+		fprintf(stderr, "fixed_graft_at_root: staging not empty after graft\n");
+		goto fail;
+	}
+
+	/* Live should contain all three keys. */
+	rcu_read_lock();
+	count = cds_ft_count(live);
+	cds_ft_u64_to_key(live, 10, k, klen);
+	s = cds_ft_lookup_key(live, k, klen, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "fixed_graft_at_root: lookup 10: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_u64_to_key(live, 30, k, klen);
+	s = cds_ft_lookup_key(live, k, klen, &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "fixed_graft_at_root: lookup 30: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+	if (count != 3) {
+		fprintf(stderr, "fixed_graft_at_root: count %lu, expected 3\n", count);
+		goto fail;
+	}
+
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Non-root graft on a fixed-length trie returns INVALID_ARGUMENT_ERROR.
+ * Fixed-length groups require key_len to match the configured length
+ * exactly; a shorter prefix cannot address an interior graft point.
+ */
+static int test_fixed_graft_nonroot_error(void)
+{
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	enum cds_ft_status s;
+	uint8_t k[4];
+	const size_t klen = 4;
+
+	if (cds_ft_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_attr_destroy(attr);
+
+	if (cds_ft_create(group, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Put one node into staging so it is non-empty. */
+	{
+		struct ft_test_node *n = node_alloc(42);
+
+		cds_ft_u64_to_key(staging, 42, k, klen);
+		s = cds_ft_insert(staging, k, klen, &n->node);
+		if (s < 0) goto fail;
+	}
+
+	/* Attempt a non-root graft (key_len=2 < fixed klen=4). */
+	rcu_read_lock();
+	s = cds_ft_graft(live, (const uint8_t *)"\x00\x01", 2, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "fixed_graft_nonroot: expected INVALID_ARGUMENT_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Staging should still hold its content (graft failed). */
+	if (cds_ft_empty(staging)) {
+		fprintf(stderr, "fixed_graft_nonroot: staging should not be empty\n");
+		goto fail;
+	}
+
+	drain_trie(staging);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * graft_swap at root on a fixed-length trie: exchange the entire
+ * content of two fixed-length tries using a root-level swap.
+ */
+static int test_fixed_graft_swap_at_root(void)
+{
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long count;
+	uint8_t k[4];
+	const size_t klen = 4;
+
+	if (cds_ft_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_attr_destroy(attr);
+
+	if (cds_ft_create(group, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate live with keys 100, 200. */
+	{
+		struct ft_test_node *n1 = node_alloc(100);
+		struct ft_test_node *n2 = node_alloc(200);
+
+		n1->value = 1;
+		n2->value = 2;
+		cds_ft_u64_to_key(live, 100, k, klen);
+		rcu_read_lock();
+		s = cds_ft_insert(live, k, klen, &n1->node);
+		if (s < 0) { rcu_read_unlock(); goto fail; }
+		cds_ft_u64_to_key(live, 200, k, klen);
+		s = cds_ft_insert(live, k, klen, &n2->node);
+		if (s < 0) { rcu_read_unlock(); goto fail; }
+		rcu_read_unlock();
+	}
+
+	/* Populate swap with keys 300, 400, 500. */
+	{
+		unsigned int i;
+		uint64_t vals[] = { 300, 400, 500 };
+
+		for (i = 0; i < 3; i++) {
+			struct ft_test_node *n = node_alloc(vals[i]);
+
+			n->value = vals[i];
+			cds_ft_u64_to_key(swap, vals[i], k, klen);
+			s = cds_ft_insert(swap, k, klen, &n->node);
+			if (s < 0) goto fail;
+		}
+	}
+
+	/* Root-level swap: exchange everything. */
+	rcu_read_lock();
+	s = cds_ft_graft_swap(live, NULL, 0, swap);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "fixed_graft_swap_at_root: swap: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Live should now have 300, 400, 500. */
+	rcu_read_lock();
+	count = cds_ft_count(live);
+	cds_ft_u64_to_key(live, 300, k, klen);
+	s = cds_ft_lookup_key(live, k, klen, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "fixed_graft_swap_at_root: lookup 300: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	if (to_test_node(found)->value != 300) {
+		fprintf(stderr, "fixed_graft_swap_at_root: 300 wrong value\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	/* Key 100 should no longer be in live. */
+	cds_ft_u64_to_key(live, 100, k, klen);
+	s = cds_ft_lookup_key(live, k, klen, &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "fixed_graft_swap_at_root: key 100 still in live\n");
+		goto fail;
+	}
+	if (count != 3) {
+		fprintf(stderr, "fixed_graft_swap_at_root: live count %lu, expected 3\n",
+			count);
+		goto fail;
+	}
+
+	/* Swap should now have 100, 200 (the old live content). */
+	rcu_read_lock();
+	count = cds_ft_count(swap);
+	cds_ft_u64_to_key(swap, 100, k, klen);
+	s = cds_ft_lookup_key(swap, k, klen, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "fixed_graft_swap_at_root: lookup 100 in swap: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	if (to_test_node(found)->value != 1) {
+		fprintf(stderr, "fixed_graft_swap_at_root: 100 wrong value in swap\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+	if (count != 2) {
+		fprintf(stderr, "fixed_graft_swap_at_root: swap count %lu, expected 2\n",
+			count);
+		goto fail;
+	}
+
+	synchronize_rcu();
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Non-root graft_swap on a fixed-length trie returns
+ * INVALID_ARGUMENT_ERROR.
+ */
+static int test_fixed_graft_swap_nonroot_error(void)
+{
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	enum cds_ft_status s;
+	uint8_t k[4];
+	const size_t klen = 4;
+
+	if (cds_ft_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_attr_destroy(attr);
+
+	if (cds_ft_create(group, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate live so the swap point is non-trivial. */
+	{
+		struct ft_test_node *n = node_alloc(0x01020304);
+
+		cds_ft_u64_to_key(live, 0x01020304, k, klen);
+		rcu_read_lock();
+		s = cds_ft_insert(live, k, klen, &n->node);
+		rcu_read_unlock();
+		if (s < 0) goto fail;
+	}
+
+	/* Attempt non-root graft_swap (key_len=2 < fixed klen=4). */
+	rcu_read_lock();
+	s = cds_ft_graft_swap(live, (const uint8_t *)"\x01\x02", 2, swap);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "fixed_graft_swap_nonroot: expected INVALID_ARGUMENT_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Detach at root on a fixed-length trie: populate a trie, detach
+ * everything at root, verify the original is empty and the detached
+ * trie contains all nodes.
+ */
+static int test_fixed_detach_at_root(void)
+{
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft, *detached = NULL;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long count;
+	uint8_t k[4];
+	const size_t klen = 4;
+
+	if (cds_ft_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_attr_destroy(attr);
+
+	if (cds_ft_create(group, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate with keys 5, 10, 15. */
+	{
+		unsigned int i;
+		uint64_t vals[] = { 5, 10, 15 };
+
+		for (i = 0; i < 3; i++) {
+			struct ft_test_node *n = node_alloc(vals[i]);
+
+			n->value = vals[i];
+			cds_ft_u64_to_key(ft, vals[i], k, klen);
+			rcu_read_lock();
+			s = cds_ft_insert(ft, k, klen, &n->node);
+			rcu_read_unlock();
+			if (s < 0) goto fail;
+		}
+	}
+
+	/* Detach everything at root. */
+	rcu_read_lock();
+	s = cds_ft_detach(ft, NULL, 0, &detached);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !detached) {
+		fprintf(stderr, "fixed_detach_at_root: detach: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Original should be empty. */
+	if (!cds_ft_empty(ft)) {
+		fprintf(stderr, "fixed_detach_at_root: original not empty\n");
+		goto fail;
+	}
+
+	/* Detached should have all three nodes with same keys. */
+	rcu_read_lock();
+	count = cds_ft_count(detached);
+	cds_ft_u64_to_key(detached, 5, k, klen);
+	s = cds_ft_lookup_key(detached, k, klen, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "fixed_detach_at_root: lookup 5 in detached: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	if (to_test_node(found)->value != 5) {
+		fprintf(stderr, "fixed_detach_at_root: key 5 wrong value\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_u64_to_key(detached, 15, k, klen);
+	s = cds_ft_lookup_key(detached, k, klen, &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "fixed_detach_at_root: lookup 15 in detached: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+	if (count != 3) {
+		fprintf(stderr, "fixed_detach_at_root: detached count %lu, expected 3\n",
+			count);
+		goto fail;
+	}
+
+	synchronize_rcu();
+	drain_trie(detached);
+	rcu_barrier();
+	cds_ft_destroy(detached);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	if (detached) {
+		drain_trie(detached);
+		cds_ft_destroy(detached);
+	}
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Non-root detach on a fixed-length trie returns
+ * INVALID_ARGUMENT_ERROR.
+ */
+static int test_fixed_detach_nonroot_error(void)
+{
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft, *detached = NULL;
+	enum cds_ft_status s;
+	uint8_t k[4];
+	const size_t klen = 4;
+
+	if (cds_ft_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_attr_destroy(attr);
+
+	if (cds_ft_create(group, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate so there is content to detach. */
+	{
+		struct ft_test_node *n = node_alloc(0xAABBCCDD);
+
+		cds_ft_u64_to_key(ft, 0xAABBCCDD, k, klen);
+		rcu_read_lock();
+		s = cds_ft_insert(ft, k, klen, &n->node);
+		rcu_read_unlock();
+		if (s < 0) goto fail;
+	}
+
+	/* Attempt non-root detach (key_len=2 < fixed klen=4). */
+	rcu_read_lock();
+	s = cds_ft_detach(ft, (const uint8_t *)"\xAA\xBB", 2, &detached);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "fixed_detach_nonroot: expected INVALID_ARGUMENT_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Original trie should still have its node. */
+	if (cds_ft_empty(ft)) {
+		fprintf(stderr, "fixed_detach_nonroot: original should not be empty\n");
+		goto fail;
+	}
+
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	if (detached) {
+		drain_trie(detached);
+		cds_ft_destroy(detached);
+	}
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                           MAIN                                     */
@@ -3736,6 +4338,12 @@ int main(int argc, char **argv)
 	RUN_TEST(test_graft_swap_self_error);
 	RUN_TEST(test_graft_swap_different_group_error);
 	RUN_TEST(test_graft_swap_fixed_key);
+	RUN_TEST(test_fixed_graft_at_root);
+	RUN_TEST(test_fixed_graft_nonroot_error);
+	RUN_TEST(test_fixed_graft_swap_at_root);
+	RUN_TEST(test_fixed_graft_swap_nonroot_error);
+	RUN_TEST(test_fixed_detach_at_root);
+	RUN_TEST(test_fixed_detach_nonroot_error);
 	RUN_TEST(test_detach_basic);
 	RUN_TEST(test_detach_at_root);
 	RUN_TEST(test_detach_not_found);
