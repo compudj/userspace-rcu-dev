@@ -1370,7 +1370,8 @@ struct cds_ft_inode_flag *ft_node_get_leftright(struct cds_ft_inode_flag *node_f
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_minmax(struct cds_ft_inode_flag *node_flag,
 		uint8_t *result_key,
-		enum ft_direction dir)
+		enum ft_direction dir,
+		bool is_root)
 {
 	struct cds_ft_inode_flag *ret;
 
@@ -1386,8 +1387,11 @@ struct cds_ft_inode_flag *ft_node_get_minmax(struct cds_ft_inode_flag *node_flag
 	default:
 		assert(0);
 	}
-	/* attach/detach semantic guarantees that ft_node_get_minmax cannot return NULL. */
-	assert(ft_node_ptr(ret));
+	/*
+	 * attach/detach semantic guarantees that ft_node_get_minmax
+	 * cannot return NULL except when called on an empty root node.
+	 */
+	assert(is_root || ft_node_ptr(ret));
 	return ret;
 }
 
@@ -2852,11 +2856,18 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		 */
 		if (type->type_class == FT_LINEAR &&
 				ft_linear_node_get_nr_child(type, ft_node_ptr(node_flag)) == 0) {
-			iter->node = NULL;
-			iter->path_valid = true;
-			iter->path_len = 1;
-			iter->status = CDS_FT_STATUS_NOT_FOUND;
-			return iter->status;
+
+			/* A NIL key might still be stored directly in the root's metadata. */
+			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
+					ft_node_ptr(node_flag), type->order);
+
+			if (!uatomic_load(&metadata->external_nodes, CMM_RELAXED)) {
+				iter->node = NULL;
+				iter->path_valid = true;
+				iter->path_len = 1;
+				iter->status = CDS_FT_STATUS_NOT_FOUND;
+				return iter->status;
+			}
 		}
 	}
 
@@ -3098,8 +3109,7 @@ post_traversal:
 	 * reaching the prefix node without backtracking), we fall
 	 * through to the downward min/max search below.
 	 */
-	if (going_up && level == (ssize_t) iter->prefix_len
-			&& iter->prefix_len > 0) {
+	if (going_up && level == (ssize_t) iter->prefix_len) {
 		if (dir == FT_LEFT) {
 			struct cds_ft_inode_flag *pfx_flag =
 				iter->path_node[iter->prefix_len];
@@ -3206,7 +3216,17 @@ descend_children:
 		/* Return external node. */
 		if (!ft_node_internal(node_flag))
 			break;
-		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir);
+		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir, level == 1);
+		/*
+		 * If minmax returns NULL, it was an empty root. We found nothing.
+		 */
+		if (caa_unlikely(!ft_node_ptr(node_flag))) {
+			iter->node = NULL;
+			iter->path_valid = true;
+			iter->path_len = level;
+			iter->status = CDS_FT_STATUS_NOT_FOUND;
+			return iter->status;
+		}
 		iter->path_node[level] = node_flag;
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) ordinal_key[level - 1], node_flag);
