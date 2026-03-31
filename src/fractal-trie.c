@@ -1564,8 +1564,6 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 		assert(0);
 		return -EINVAL;
 	}
-
-	return 0;
 }
 
 static
