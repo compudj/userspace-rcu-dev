@@ -5016,7 +5016,15 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						 nr_snapshot,
 						 det_nfp, det_pfp);
 			assert(ret != -ENOENT);
-			(void) ret;
+			if (ret < 0) {
+				/*
+				 * Recompaction failed (-ENOMEM). The
+				 * source trie remains unmodified. Clean
+				 * up the destination trie and abort.
+				 */
+				cds_ft_destroy(detached);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
 		}
 
 		/*
