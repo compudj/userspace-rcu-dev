@@ -29,7 +29,7 @@
 # include <immintrin.h>
 #endif
 
-#ifndef abs
+#ifndef abs_int
 #define abs_int(a)	((int) (a) > 0 ? (int) (a) : -((int) (a)))
 #endif
 
