@@ -5687,7 +5687,14 @@ void cds_ft_iter_invalidate_path(struct cds_ft_iter *iter)
 
 void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 {
-	memcpy(dst, src, sizeof(*dst));
+	dst->status = src->status;
+	dst->path_valid = src->path_valid;
+	dst->path_len = src->path_len;
+	dst->key_len = src->key_len;
+	dst->prefix_len = src->prefix_len;
+	dst->node = src->node;
+	memcpy(dst->path_node, src->path_node, src->path_len * sizeof(dst->path_node[0]));
+	memcpy(dst->key, src->key, src->key_len);
 }
 
 struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
