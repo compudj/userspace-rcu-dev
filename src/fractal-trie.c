@@ -3439,7 +3439,7 @@ int ft_attach_node(struct cds_ft *ft,
 		/* Attach branch (unlink the old node from the trie). */
 		rcu_assign_pointer(*attach_node_flag_ptr, iter_dest_node_flag);
 
-		/* Reclaim safely after unlink.*/
+		/* Reclaim safely after unlink. */
 		if (old_recompacted_node)
 			free_cds_ft_node(ft, old_recompacted_node);
 	}
@@ -4020,19 +4020,20 @@ int ft_detach_node(struct cds_ft *ft,
 	/* Update address of parent ptr in its parent */
 	rcu_assign_pointer(*detach_parent_flag_ptr, iter_node_flag);
 end:
-	/* Reclaim safely after replacement.*/
+	/* Reclaim safely after replacement. */
 	if (old_recompacted_node)
 		free_cds_ft_node(ft, old_recompacted_node);
 
-	/*
-	 * At this point, we want to delete all nodes that are about to
-	 * be removed from metadata_stack (except the last one, which is
-	 * the parent of the topmost node with 1 child, or the root
-	 * itself when the entire branch goes up to the root).
-	 */
-	for (i = 0; i < nr_clear; i++)
-		free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
-
+	if (!ret) {
+		/*
+		 * At this point, we want to delete all nodes that are about to
+		 * be removed from metadata_stack (except the last one, which is
+		 * the parent of the topmost node with 1 child, or the root
+		 * itself when the entire branch goes up to the root).
+		 */
+		for (i = 0; i < nr_clear; i++)
+			free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
+	}
 	return ret;
 }
 
