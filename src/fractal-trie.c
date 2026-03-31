@@ -5680,6 +5680,13 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 #endif
 }
 
+void cds_ft_iter_invalidate_path(struct cds_ft_iter *iter)
+{
+	iter->path_valid = false;
+	iter->path_len = 0;
+	iter->node = NULL;
+}
+
 void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 {
 	memcpy(dst, src, sizeof(*dst));
