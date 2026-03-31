@@ -2796,7 +2796,8 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	struct cds_ft_node *ret_node;
 	uint8_t ordinal_key[FT_MAX_KEY_LEN];
 	enum ft_direction dir;
-	const uint8_t input_key[FT_MAX_KEY_LEN];
+	uint8_t input_key_buf[FT_MAX_KEY_LEN];
+	const uint8_t *input_key;
 	const uint8_t *iter_key;
 	size_t key_len;
 	bool going_up = false, skip_eq_external_nodes;
@@ -2836,7 +2837,8 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 * with the result key without corrupting the input during the
 	 * backtracking phase (which re-reads the input via iter_key).
 	 */
-	memcpy((uint8_t *) input_key, iter->key, key_len);
+	memcpy(input_key_buf, iter->key, key_len);
+	input_key = input_key_buf;
 	iter_key = input_key;
 
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
