@@ -4628,6 +4628,17 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 
 	{
 		struct ft_descent d;
+		struct cds_ft_inode *fresh_node;
+		struct cds_ft_metadata *fresh_meta;
+
+		/*
+		 * Preallocate a fresh empty root for the source trie
+		 * before the point of no return, so we can fail cleanly
+		 * on memory shortage instead of calling abort().
+		 */
+		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
+		if (!fresh_node)
+			return CDS_FT_STATUS_MEMORY_ERROR;
 
 		ft_descend_to_graft_point(dst_ft, key, key_len, &d);
 
@@ -4639,24 +4650,12 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 */
 		status = ft_store_at_graft_point(dst_ft, key, key_len,
 						  &d, src_ft->root);
-		if (status != CDS_FT_STATUS_OK)
+		if (status != CDS_FT_STATUS_OK) {
+			free_cds_ft_node(src_ft, fresh_node);
 			return status;
-	}
-
-	/* Give source a fresh empty root. */
-	{
-		struct cds_ft_inode *fresh_node;
-		struct cds_ft_metadata *fresh_meta;
-
-		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
-		if (!fresh_node) {
-			/*
-			 * The graft has already been published. We cannot
-			 * roll back, but we must leave source in a valid
-			 * state. This should not happen in practice.
-			 */
-			abort();
 		}
+
+		/* Give source a fresh empty root. */
 		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
 	}
 
@@ -4728,7 +4727,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct ft_descent d;
 		struct cds_ft_metadata *pmeta, *swap_rmeta;
 		struct cds_ft_inode_flag *old_child, *old_swap_root;
+		struct cds_ft_inode *fresh = NULL;
+		struct cds_ft_metadata *fresh_meta = NULL;
 		bool swap_empty;
+		bool need_fresh;
 
 		ft_descend_to_graft_point(dst_ft, key, key_len, &d);
 
@@ -4750,6 +4752,23 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				&& !swap_rmeta->external_nodes);
 
 		/*
+		 * A fresh root for swap_ft is needed when old_child
+		 * is not an internal node and the swap trie is not
+		 * empty (i.e. the old swap root is consumed by the
+		 * graft).  Preallocate it here, before the point of
+		 * no return, so we can fail cleanly.
+		 */
+		need_fresh = !(ft_node_ptr(old_child)
+				&& ft_node_internal(old_child))
+			     && !swap_empty;
+		if (need_fresh) {
+			fresh = alloc_cds_ft_node(swap_ft,
+				&ft_types[0], &fresh_meta);
+			if (!fresh)
+				return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+
+		/*
 		 * Atomic store at graft point.  If swap is empty,
 		 * place NULL (removing the subtree); otherwise place
 		 * the swap root node directly.
@@ -4769,8 +4788,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * point.  If old_child is an internal node, it
 		 * becomes swap_ft's root directly (its
 		 * metadata.external_nodes carries the entries at the
-		 * graft key).  Otherwise, allocate a fresh root and
-		 * place any external node chain as NIL-key entries.
+		 * graft key).  Otherwise, use the preallocated fresh
+		 * root and place any external node chain as NIL-key
+		 * entries.
 		 */
 		if (ft_node_ptr(old_child)
 				&& ft_node_internal(old_child)) {
@@ -4784,13 +4804,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 					(struct cds_ft_node *)
 					ft_node_ptr(old_child);
 		} else {
-			struct cds_ft_inode *fresh;
-			struct cds_ft_metadata *fresh_meta;
-
-			fresh = alloc_cds_ft_node(swap_ft,
-				&ft_types[0], &fresh_meta);
-			if (!fresh)
-				abort();
 			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
 			if (ft_node_ptr(old_child))
 				fresh_meta->external_nodes =
