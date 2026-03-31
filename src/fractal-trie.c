@@ -4651,9 +4651,8 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 * Swap root pointers.  The source's root carries all
 		 * metadata (nr_child, external_nodes) with it.
 		 */
-		rcu_assign_pointer(dst_ft->root,
-			rcu_dereference(src_ft->root));
-		src_ft->root = ft_node_flag(fresh_root, 0);
+		rcu_assign_pointer(dst_ft->root, src_ft->root);
+		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
 		goto done;
 	}
 
@@ -4688,7 +4687,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 			 */
 			abort();
 		}
-		src_ft->root = ft_node_flag(fresh_node, 0);
+		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
 	}
 
 done:
@@ -4739,13 +4738,11 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * Each root carries its own metadata (nr_child,
 		 * external_nodes), so no relocation is needed.
 		 */
-		struct cds_ft_inode_flag *tmp;
+		struct cds_ft_inode_flag *tmp = dst_ft->root;
 		size_t dm;
 
-		tmp = rcu_dereference(dst_ft->root);
-		rcu_assign_pointer(dst_ft->root,
-			rcu_dereference(swap_ft->root));
-		swap_ft->root = tmp;
+		rcu_assign_pointer(dst_ft->root, swap_ft->root);
+		rcu_assign_pointer(swap_ft->root, tmp);
 
 		dm = uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED);
 		if (swap_max > dm)
@@ -4807,7 +4804,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		if (ft_node_ptr(old_child)
 				&& ft_node_internal(old_child)) {
-			swap_ft->root = old_child;
+			rcu_assign_pointer(swap_ft->root, old_child);
 			if (swap_empty)
 				free_cds_ft_node(swap_ft,
 					ft_node_ptr(old_swap_root));
@@ -4824,7 +4821,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				&ft_types[0], &fresh_meta);
 			if (!fresh)
 				abort();
-			swap_ft->root = ft_node_flag(fresh, 0);
+			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
 			if (ft_node_ptr(old_child))
 				fresh_meta->external_nodes =
 					(struct cds_ft_node *)
@@ -4902,7 +4899,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		 * the detached trie, and replace it with the source root.
 		 */
 		free_cds_ft_node(detached, ft_node_ptr(detached->root));
-		detached->root = rcu_dereference(ft->root);
+		/* No readers in detached root yet. */
+		detached->root = ft->root;
 		uatomic_store(&detached->max_used_key_len,
 			      uatomic_load(&ft->max_used_key_len, CMM_RELAXED),
 			      CMM_RELAXED);
@@ -5011,6 +5009,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		if (ft_node_internal(child)) {
 			free_cds_ft_node(detached,
 				ft_node_ptr(detached->root));
+			/* No readers in detached root yet. */
 			detached->root = child;
 		} else {
 			struct cds_ft_metadata *dmeta =
