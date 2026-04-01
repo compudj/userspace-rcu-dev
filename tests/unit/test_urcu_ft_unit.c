@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 103
+#define NR_TESTS 111
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -7330,6 +7330,594 @@ static int test_adversarial_replace_churn(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*            12. UNCACHED ITERATOR PATH MODE TESTS                   */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Default path mode is CACHED. get/set roundtrip works. Invalid mode
+ * returns INVALID_ARGUMENT_ERROR.
+ */
+static int test_iter_path_mode_default(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	if (cds_ft_iter_get_path_mode(iter) != CDS_FT_ITER_PATH_CACHED) {
+		fprintf(stderr, "path_mode_default: expected CACHED\n");
+		cds_ft_iter_destroy(iter);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	s = cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "path_mode_default: set UNCACHED: %s\n",
+			cds_ft_status_to_string(s));
+		cds_ft_iter_destroy(iter);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_iter_get_path_mode(iter) != CDS_FT_ITER_PATH_UNCACHED) {
+		fprintf(stderr, "path_mode_default: get after set UNCACHED\n");
+		cds_ft_iter_destroy(iter);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Invalid mode value. */
+	s = cds_ft_iter_set_path_mode(iter, (enum cds_ft_iter_path_mode) 99);
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "path_mode_default: expected error for mode 99, got %s\n",
+			cds_ft_status_to_string(s));
+		cds_ft_iter_destroy(iter);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * Forward iteration in UNCACHED mode, dropping and reacquiring the RCU
+ * read-side lock between each step. Verifies that the iterator produces
+ * the same ascending sequence as CACHED mode.
+ */
+static int test_iter_uncached_forward(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	uint64_t keys[] = { 500, 100, 300, 900, 200, 700, 400 };
+	unsigned int i, count = 0;
+	uint64_t prev = 0;
+	int first = 1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+		struct ft_test_node *n = node_alloc(keys[i]);
+
+		rcu_read_lock();
+		insert_u64(ft, keys[i], n);
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+
+	/* Iterate with explicit per-step RCU lock/unlock. */
+	rcu_read_lock();
+	for (cds_ft_lookup_first(ft, iter);
+	     cds_ft_iter_node(iter);
+	     cds_ft_next(ft, iter)) {
+		uint8_t rk[2];
+		size_t rk_len;
+		uint64_t v;
+
+		cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+		v = cds_ft_key_to_u64(ft, rk, CDS_FT_LEN_DEFAULT);
+		if (!first && v <= prev) {
+			fprintf(stderr, "uncached forward: %" PRIu64 " after %" PRIu64 "\n",
+				v, prev);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		prev = v;
+		first = 0;
+		count++;
+
+		/* Drop and reacquire the lock between steps. */
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	if (cds_ft_iter_status(iter) < 0) {
+		fprintf(stderr, "uncached forward: error: %s\n",
+			cds_ft_status_to_string(cds_ft_iter_status(iter)));
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	cds_ft_iter_destroy(iter);
+
+	if (count != sizeof(keys) / sizeof(keys[0])) {
+		fprintf(stderr, "uncached forward: %u nodes, expected %zu\n",
+			count, sizeof(keys) / sizeof(keys[0]));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Reverse iteration in UNCACHED mode with per-step lock dropping.
+ */
+static int test_iter_uncached_reverse(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	uint64_t keys[] = { 500, 100, 300, 900, 200, 700, 400 };
+	unsigned int i, count = 0;
+	uint64_t prev = UINT64_MAX;
+	int first = 1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+		struct ft_test_node *n = node_alloc(keys[i]);
+
+		rcu_read_lock();
+		insert_u64(ft, keys[i], n);
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+
+	rcu_read_lock();
+	for (cds_ft_lookup_last(ft, iter);
+	     cds_ft_iter_node(iter);
+	     cds_ft_prev(ft, iter)) {
+		uint8_t rk[2];
+		size_t rk_len;
+		uint64_t v;
+
+		cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+		v = cds_ft_key_to_u64(ft, rk, CDS_FT_LEN_DEFAULT);
+		if (!first && v >= prev) {
+			fprintf(stderr, "uncached reverse: %" PRIu64 " after %" PRIu64 "\n",
+				v, prev);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		prev = v;
+		first = 0;
+		count++;
+
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	if (cds_ft_iter_status(iter) < 0) {
+		fprintf(stderr, "uncached reverse: error\n");
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	cds_ft_iter_destroy(iter);
+
+	if (count != sizeof(keys) / sizeof(keys[0])) {
+		fprintf(stderr, "uncached reverse: %u nodes, expected %zu\n",
+			count, sizeof(keys) / sizeof(keys[0]));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Uncached lookup followed by remove, with the RCU lock dropped
+ * between the two operations. This is the pattern that would be
+ * unsafe in CACHED mode without cds_ft_iter_invalidate_path().
+ */
+static int test_iter_uncached_lookup_remove(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *n = node_alloc(42);
+	enum cds_ft_status s;
+	uint8_t k[4];
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		node_free(n);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	cds_ft_u64_to_key(ft, 42, k, CDS_FT_LEN_DEFAULT);
+
+	rcu_read_lock();
+	s = cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n->node);
+	rcu_read_unlock();
+	if (s < 0) {
+		node_free(n);
+		cds_ft_iter_destroy(iter);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+
+	/* Lookup under RCU. */
+	rcu_read_lock();
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	s = cds_ft_lookup(ft, iter);
+	if (s != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+		fprintf(stderr, "uncached lookup_remove: lookup: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+
+	/* Grace period passes — in CACHED mode, the path would be stale. */
+	rcu_quiescent_state();
+
+	/*
+	 * Remove under the writer mutex (simulated). The iterator's
+	 * key is preserved; the path was auto-invalidated by UNCACHED
+	 * mode, so cds_ft_remove will do a fresh top-down traversal.
+	 */
+	rcu_read_lock();
+	s = cds_ft_remove(ft, iter, &n->node);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "uncached lookup_remove: remove: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	node_free_rcu(n);
+	rcu_barrier();
+
+	/* Trie should be empty. */
+	rcu_read_lock();
+	if (!cds_ft_empty(ft)) {
+		fprintf(stderr, "uncached lookup_remove: trie not empty\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+
+	cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * Prefix-scoped iteration in UNCACHED mode.
+ */
+static int test_iter_uncached_prefix_scoped(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	const char *words[] = {
+		"apple", "apply", "apt",
+		"banana", "band",
+		"cat",
+	};
+	unsigned int i, count = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		cds_ft_insert(ft, (const uint8_t *)words[i],
+			      strlen(words[i]), &n->node);
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	cds_ft_iter_set_key(iter, (const uint8_t *)"ap", 2);
+	cds_ft_iter_set_prefix_len(iter, 2);
+
+	rcu_read_lock();
+	for (cds_ft_lookup_first(ft, iter);
+	     cds_ft_iter_node(iter);
+	     cds_ft_next(ft, iter)) {
+		count++;
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	if (cds_ft_iter_status(iter) < 0) {
+		fprintf(stderr, "uncached prefix: error\n");
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	cds_ft_iter_destroy(iter);
+
+	if (count != 3) {
+		fprintf(stderr, "uncached prefix 'ap': %u keys, expected 3\n", count);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Switching from CACHED to UNCACHED invalidates the path. Switching
+ * back to CACHED is safe and re-enables path caching.
+ */
+static int test_iter_path_mode_switch(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	uint64_t keys[] = { 10, 20, 30, 40, 50 };
+	unsigned int count;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+		struct ft_test_node *n = node_alloc(keys[i]);
+
+		rcu_read_lock();
+		insert_u64(ft, keys[i], n);
+		rcu_read_unlock();
+	}
+
+	/* Phase 1: iterate in UNCACHED mode with per-step lock dropping. */
+	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	count = 0;
+	rcu_read_lock();
+	for (cds_ft_lookup_first(ft, iter);
+	     cds_ft_iter_node(iter);
+	     cds_ft_next(ft, iter)) {
+		count++;
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	if (count != 5) {
+		fprintf(stderr, "mode_switch uncached phase: %u nodes, expected 5\n", count);
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Phase 2: switch back to CACHED, iterate normally. */
+	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_CACHED);
+	if (cds_ft_iter_get_path_mode(iter) != CDS_FT_ITER_PATH_CACHED) {
+		fprintf(stderr, "mode_switch: mode not CACHED after switch\n");
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	count = 0;
+	rcu_read_lock();
+	cds_ft_for_each_rcu(ft, iter) {
+		count++;
+	}
+	rcu_read_unlock();
+
+	if (count != 5) {
+		fprintf(stderr, "mode_switch cached phase: %u nodes, expected 5\n", count);
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * iter_copy preserves the path mode of the source iterator.
+ */
+static int test_iter_uncached_copy(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter_a, *iter_b;
+	unsigned int count;
+
+	if (cds_ft_iter_create(ft, &iter_a) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_iter_create(ft, &iter_b) < 0) {
+		cds_ft_iter_destroy(iter_a);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	{
+		struct ft_test_node *n;
+		unsigned int i;
+
+		for (i = 0; i < 5; i++) {
+			n = node_alloc(i * 10);
+			rcu_read_lock();
+			insert_u64(ft, i * 10, n);
+			rcu_read_unlock();
+		}
+	}
+
+	/* Set iter_a to UNCACHED and position it. */
+	cds_ft_iter_set_path_mode(iter_a, CDS_FT_ITER_PATH_UNCACHED);
+
+	rcu_read_lock();
+	cds_ft_lookup_first(ft, iter_a);
+	rcu_read_unlock();
+
+	/* Copy iter_a → iter_b. iter_b should inherit UNCACHED mode. */
+	cds_ft_iter_copy(iter_b, iter_a);
+
+	if (cds_ft_iter_get_path_mode(iter_b) != CDS_FT_ITER_PATH_UNCACHED) {
+		fprintf(stderr, "uncached_copy: copy did not inherit path mode\n");
+		cds_ft_iter_destroy(iter_a);
+		cds_ft_iter_destroy(iter_b);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Continue iterating from iter_b with per-step lock dropping. */
+	count = 0;
+	rcu_read_lock();
+	while (cds_ft_iter_node(iter_b)) {
+		count++;
+		cds_ft_next(ft, iter_b);
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	if (count != 5) {
+		fprintf(stderr, "uncached_copy: %u nodes from copy, expected 5\n", count);
+		cds_ft_iter_destroy(iter_a);
+		cds_ft_iter_destroy(iter_b);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter_a);
+	cds_ft_iter_destroy(iter_b);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Stress test: iterate 256 1-byte keys in UNCACHED mode, dropping
+ * the lock at every step. Exercises all internal node configurations
+ * (linear, pool, pigeon) under the uncached path.
+ */
+static int test_iter_uncached_all_configs(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(1, &group);
+	struct cds_ft_iter *iter;
+	unsigned int i, count;
+	uint64_t prev = 0;
+	int first = 1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 256; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		insert_u64(ft, i, n);
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+
+	count = 0;
+	rcu_read_lock();
+	for (cds_ft_lookup_first(ft, iter);
+	     cds_ft_iter_node(iter);
+	     cds_ft_next(ft, iter)) {
+		uint8_t rk[1];
+		size_t rk_len;
+		uint64_t v;
+
+		cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+		v = cds_ft_key_to_u64(ft, rk, CDS_FT_LEN_DEFAULT);
+		if (!first && v <= prev) {
+			fprintf(stderr, "uncached_all_configs: %" PRIu64 " after %" PRIu64 "\n",
+				v, prev);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		prev = v;
+		first = 0;
+		count++;
+
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	cds_ft_iter_destroy(iter);
+
+	if (count != 256) {
+		fprintf(stderr, "uncached_all_configs: %u nodes, expected 256\n", count);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -7482,6 +8070,17 @@ int main(int argc, char **argv)
 	RUN_TEST(test_adversarial_shared_suffix);
 	RUN_TEST(test_adversarial_longest_match_gaps);
 	RUN_TEST(test_adversarial_replace_churn);
+
+	/* 12. Uncached iterator path mode tests */
+	diag("Uncached iterator path mode tests");
+	RUN_TEST(test_iter_path_mode_default);
+	RUN_TEST(test_iter_uncached_forward);
+	RUN_TEST(test_iter_uncached_reverse);
+	RUN_TEST(test_iter_uncached_lookup_remove);
+	RUN_TEST(test_iter_uncached_prefix_scoped);
+	RUN_TEST(test_iter_path_mode_switch);
+	RUN_TEST(test_iter_uncached_copy);
+	RUN_TEST(test_iter_uncached_all_configs);
 
 	rcu_barrier();
 	rcu_unregister_thread();
