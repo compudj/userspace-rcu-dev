@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <urcu/compiler.h>
+#include <urcu/urcu-poll.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,9 +63,18 @@ struct cds_lfht_iter {
 	 * re-purposed to iterate on a different hash table. This is a
 	 * common programming mistake when performing hash table lookup
 	 * nested in a hash table traversal.
+	 *
+	 * Additionally, it validates that the RCU read-side lock is not
+	 * released between an iterator output and its subsequent use as
+	 * input. A grace period poll state is captured when the iterator
+	 * is populated and checked when the iterator is consumed. If a
+	 * full grace period has elapsed, it means the RCU read-side lock
+	 * was released, which is a programming error.
 	 */
 #ifdef CONFIG_CDS_LFHT_ITER_DEBUG
 	struct cds_lfht *lfht;
+	struct urcu_gp_poll_state poll_state;	/* Debug: RCU grace period poll state */
+	unsigned int is_valid;			/* Debug: set when iter is populated */
 #endif
 };
 

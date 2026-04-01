@@ -379,9 +379,45 @@ static
 void cds_lfht_iter_debug_set_ht(struct cds_lfht *ht, struct cds_lfht_iter *iter)
 {
 	iter->lfht = ht;
+	iter->poll_state = ht->flavor->update_start_poll_synchronize_rcu();
+	iter->is_valid = 1;
 }
 
-#define cds_lfht_iter_debug_assert(...)		urcu_posix_assert(__VA_ARGS__)
+static
+void cds_lfht_iter_debug_rcu_check(struct cds_lfht *ht, struct cds_lfht_iter *iter)
+{
+	urcu_posix_assert(ht == iter->lfht);
+	if (caa_unlikely(!iter->is_valid)) {
+		fprintf(stderr,
+			"[error] cds_lfht iterator used as input without being populated first.\n");
+		abort();
+	}
+	if (caa_unlikely(ht->flavor->update_poll_state_synchronize_rcu(iter->poll_state))) {
+		fprintf(stderr,
+			"[error] RCU read-side lock released between cds_lfht iterator output and input.\n");
+		abort();
+	}
+}
+
+/*
+ * Update the iterator validity after populating it. If the iterator
+ * has content (non-NULL node), mark it as valid and capture the current
+ * RCU grace period poll state. If the node is NULL (not found or end of
+ * traversal), clear the validity flag so that any subsequent misuse is
+ * detected by cds_lfht_iter_debug_rcu_check.
+ */
+static
+void cds_lfht_iter_debug_rcu_gp_snapshot(struct cds_lfht *ht, struct cds_lfht_iter *iter)
+{
+	if (iter->node) {
+		if (!iter->is_valid) {
+			iter->is_valid = 1;
+			iter->poll_state = ht->flavor->update_start_poll_synchronize_rcu();
+		}
+	} else {
+		iter->is_valid = 0;
+	}
+}
 
 #else
 
@@ -391,7 +427,17 @@ void cds_lfht_iter_debug_set_ht(struct cds_lfht *ht __attribute__((__unused__)),
 {
 }
 
-#define cds_lfht_iter_debug_assert(...)
+static
+void cds_lfht_iter_debug_rcu_check(struct cds_lfht *ht __attribute__((__unused__)),
+		struct cds_lfht_iter *iter __attribute__((__unused__)))
+{
+}
+
+static
+void cds_lfht_iter_debug_rcu_gp_snapshot(struct cds_lfht *ht __attribute__((__unused__)),
+		struct cds_lfht_iter *iter __attribute__((__unused__)))
+{
+}
 
 #endif
 
@@ -1130,6 +1176,8 @@ void _cds_lfht_add(struct cds_lfht *ht,
 					.next = iter,
 #ifdef CONFIG_CDS_LFHT_ITER_DEBUG
 					.lfht = ht,
+					.poll_state = ht->flavor->update_start_poll_synchronize_rcu(),
+					.is_valid = 1,
 #endif
 				};
 
@@ -1762,6 +1810,7 @@ void cds_lfht_lookup(struct cds_lfht *ht, unsigned long hash,
 	urcu_posix_assert(!node || !is_bucket(uatomic_load(&node->next)));
 	iter->node = node;
 	iter->next = next;
+	cds_lfht_iter_debug_rcu_gp_snapshot(ht, iter);
 }
 
 void cds_lfht_next_duplicate(struct cds_lfht *ht __attribute__((__unused__)),
@@ -1771,7 +1820,7 @@ void cds_lfht_next_duplicate(struct cds_lfht *ht __attribute__((__unused__)),
 	struct cds_lfht_node *node, *next;
 	unsigned long reverse_hash;
 
-	cds_lfht_iter_debug_assert(ht == iter->lfht);
+	cds_lfht_iter_debug_rcu_check(ht, iter);
 	node = iter->node;
 	reverse_hash = node->reverse_hash;
 	next = iter->next;
@@ -1797,6 +1846,7 @@ void cds_lfht_next_duplicate(struct cds_lfht *ht __attribute__((__unused__)),
 	urcu_posix_assert(!node || !is_bucket(uatomic_load(&node->next)));
 	iter->node = node;
 	iter->next = next;
+	cds_lfht_iter_debug_rcu_gp_snapshot(ht, iter);
 }
 
 void cds_lfht_next(struct cds_lfht *ht __attribute__((__unused__)),
@@ -1804,7 +1854,7 @@ void cds_lfht_next(struct cds_lfht *ht __attribute__((__unused__)),
 {
 	struct cds_lfht_node *node, *next;
 
-	cds_lfht_iter_debug_assert(ht == iter->lfht);
+	cds_lfht_iter_debug_rcu_check(ht, iter);
 	node = clear_flag(iter->next);
 	for (;;) {
 		if (caa_unlikely(is_end(node))) {
@@ -1821,6 +1871,7 @@ void cds_lfht_next(struct cds_lfht *ht __attribute__((__unused__)),
 	urcu_posix_assert(!node || !is_bucket(uatomic_load(&node->next)));
 	iter->node = node;
 	iter->next = next;
+	cds_lfht_iter_debug_rcu_gp_snapshot(ht, iter);
 }
 
 void cds_lfht_first(struct cds_lfht *ht, struct cds_lfht_iter *iter)
@@ -1894,6 +1945,7 @@ int cds_lfht_replace(struct cds_lfht *ht,
 {
 	unsigned long size;
 
+	cds_lfht_iter_debug_rcu_check(ht, old_iter);
 	new_node->reverse_hash = bit_reverse_ulong(hash);
 	if (!old_iter->node)
 		return -ENOENT;
