@@ -1230,26 +1230,17 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 }
 
 static inline_lookup
-struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
+struct cds_ft_inode *ft_pool_get_linear_subnode(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	struct cds_ft_inode *linear;
-
-	assert(type->type_class == FT_POOL);
-
 	switch (type->nr_pool_order) {
 	case 1:
 	{
-		unsigned long bitsel, index;
-
-		bitsel = ft_node_pool_1d_bitsel(node_flag);
-		assert(bitsel < CHAR_BIT);
-		index = ((unsigned long) n >> bitsel) & 0x1;
-		linear = (struct cds_ft_inode *) &node->u.data[index << type->pool_size_order];
-		break;
+		unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
+		unsigned long index = ((unsigned long) n >> bitsel) & 0x1;
+		return (struct cds_ft_inode *) &node->u.data[index << type->pool_size_order];
 	}
 	case 2:
 	{
@@ -1259,13 +1250,22 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
 		ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
 		index_to_bits_C_n8_r2(C_n8_r2_index, bits);
 		subclass_index = value_and_bits_to_subclass_index(n, bits);
-		linear = (struct cds_ft_inode *) &node->u.data[subclass_index << type->pool_size_order];
-		break;
+		return (struct cds_ft_inode *) &node->u.data[subclass_index << type->pool_size_order];
 	}
 	default:
-		linear = NULL;
 		assert(0);
+		return NULL;
 	}
+}
+
+static inline_lookup
+struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	struct cds_ft_inode *linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
 	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
@@ -1628,38 +1628,9 @@ int ft_pool_node_set_nth(const struct cds_ft_type *type,
 		uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag)
 {
-	struct cds_ft_inode *linear;
+	struct cds_ft_inode *linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
 	bool replace_old_ptr = false;
 	int ret;
-
-	assert(type->type_class == FT_POOL);
-
-	switch (type->nr_pool_order) {
-	case 1:
-	{
-		unsigned long bitsel, index;
-
-		bitsel = ft_node_pool_1d_bitsel(node_flag);
-		assert(bitsel < CHAR_BIT);
-		index = ((unsigned long) n >> bitsel) & 0x1;
-		linear = (struct cds_ft_inode *) &node->u.data[index << type->pool_size_order];
-		break;
-	}
-	case 2:
-	{
-		unsigned int C_n8_r2_index, subclass_index;
-		uint8_t bits[2];
-
-		ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
-		index_to_bits_C_n8_r2(C_n8_r2_index, bits);
-		subclass_index = value_and_bits_to_subclass_index(n, bits);
-		linear = (struct cds_ft_inode *) &node->u.data[subclass_index << type->pool_size_order];
-		break;
-	}
-	default:
-		linear = NULL;
-		assert(0);
-	}
 
 	ret = ft_linear_node_set_nth(type, linear, metadata, n, child_node_flag, &replace_old_ptr);
 #ifdef FEATURE_USE_BITMAP_SCAN
@@ -1781,8 +1752,6 @@ int ft_pool_node_replace_ptr(const struct cds_ft_type *type,
 	struct cds_ft_inode *linear;
 	int ret;
 
-	assert(type->type_class == FT_POOL);
-
 	if (!newptr) {
 		if (metadata->fallback_removal_count) {
 			metadata->fallback_removal_count--;
@@ -1793,33 +1762,7 @@ int ft_pool_node_replace_ptr(const struct cds_ft_type *type,
 		}
 	}
 
-	switch (type->nr_pool_order) {
-	case 1:
-	{
-		unsigned long bitsel, index;
-
-		bitsel = ft_node_pool_1d_bitsel(node_flag);
-		assert(bitsel < CHAR_BIT);
-		index = ((unsigned long) n >> bitsel) & type->nr_pool_order;
-		linear = (struct cds_ft_inode *) &node->u.data[index << type->pool_size_order];
-		break;
-	}
-	case 2:
-	{
-		unsigned int C_n8_r2_index, subclass_index;
-		uint8_t bits[2];
-
-		ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
-		index_to_bits_C_n8_r2(C_n8_r2_index, bits);
-		subclass_index = value_and_bits_to_subclass_index(n, bits);
-		linear = (struct cds_ft_inode *) &node->u.data[subclass_index << type->pool_size_order];
-		break;
-	}
-	default:
-		linear = NULL;
-		assert(0);
-	}
-
+	linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
 	ret = ft_linear_node_replace_ptr(type, linear, metadata, node_flag_ptr, newptr);
 #ifdef FEATURE_USE_BITMAP_SCAN
 	if (ret == 0 && !newptr && type->bitmap) {
