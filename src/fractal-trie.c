@@ -92,31 +92,6 @@ struct cds_ft_type {
  * - 3 bits are reserved to encode the node type.
  */
 
-/*
- * The cds_ft_node contains the compressed node data needed for
- * read-side. For linear node and pool sub-nodes, it starts with a byte
- * counting the number of children values (which may have NULL or
- * non-NULL pointers) in the node. Then, the node-specific data is
- * placed. For all configuration, the number of children (with non-NULL
- * pointers) is kept in the metadata associated to node.
- */
-
-#define DECLARE_LINEAR_NODE(index)								\
-	struct {										\
-		uint8_t nr_child;								\
-		uint8_t child_value[ft_type_## index ##_max_linear_child];			\
-		struct cds_ft_inode_flag *child_ptr[ft_type_## index ##_max_linear_child];	\
-	}
-
-#define DECLARE_POOL_NODE(index)								\
-	struct {										\
-		struct {									\
-			uint8_t nr_child;							\
-			uint8_t child_value[ft_type_## index ##_max_linear_child];		\
-			struct cds_ft_inode_flag *child_ptr[ft_type_## index ##_max_linear_child]; \
-		} linear[1U << ft_type_## index ##_nr_pool_order];				\
-	}
-
 #if (CAA_BITS_PER_LONG < 64)
 
 /* 32-bit pointers */
@@ -164,27 +139,6 @@ const struct cds_ft_type ft_types[] = {
 	[6] = { .type_class = FT_PIGEON, .min_child = 83, .max_child = ft_type_6_max_child, .order = 10, .bitmap = FT_BITMAP },
 
 	[7] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_7_max_child, .bitmap = FT_NO_BITMAP },
-};
-
-struct cds_ft_inode {
-	union {
-		/* Linear configuration */
-		DECLARE_LINEAR_NODE(0) conf_0;
-		DECLARE_LINEAR_NODE(1) conf_1;
-		DECLARE_LINEAR_NODE(2) conf_2;
-		DECLARE_LINEAR_NODE(3) conf_3;
-
-		/* Pool configuration */
-		DECLARE_POOL_NODE(4) conf_4;
-		DECLARE_POOL_NODE(5) conf_5;
-
-		/* Pigeon configuration */
-		struct {
-			struct cds_ft_inode_flag *child[ft_type_6_max_child];
-		} conf_6;
-		/* data aliasing nodes for computed accesses */
-		uint8_t data[sizeof(struct cds_ft_inode_flag *) * ft_type_6_max_child];
-	} u;
 };
 #else /* !(CAA_BITS_PER_LONG < 64) */
 /* 64-bit pointers */
@@ -236,29 +190,59 @@ const struct cds_ft_type ft_types[] = {
 
 	[8] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
 };
+#endif /* !(BITS_PER_LONG < 64) */
+
+/*
+ * The cds_ft_inode contains the compressed node data needed for
+ * the read-side traversal. Because the actual layout depends on the
+ * node's type_class (Linear, Pool, or Pigeon), the struct uses a single
+ * pointer-aligned byte array. The allocator sizes this array dynamically
+ * based on the type's order (1 << type->order).
+ *
+ * Crucially, the allocator guarantees that each node is naturally aligned
+ * to its exact size boundary. For example, a node with order 6 (64 bytes)
+ * is guaranteed to be aligned on a 64-byte boundary in memory. This ensures
+ * optimal cache-line alignment, prevents false sharing, and guarantees that
+ * a node never straddles a memory page boundary. This ensures that accessing
+ * a single node hits at most one TLB entry, minimizing read-side latency.
+ *
+ * Memory Layouts by Type Class:
+ *
+ * 1. FT_LINEAR:
+ * - data[0]: nr_child (number of populated slots in this node).
+ * - data[1 .. max_linear_child]: uint8_t keys (child values).
+ * - [Padding] to reach the next pointer-aligned (8-byte/4-byte) boundary.
+ * - Array of (struct cds_ft_inode_flag *) pointers.
+ *
+ * 2. FT_POOL:
+ * - An array of (1 << nr_pool_order) linear sub-nodes.
+ * - Each sub-node has the exact same internal layout as FT_LINEAR.
+ * - Each sub-node is sized and padded to exactly (1 << pool_size_order) bytes,
+ *   allowing O(1) stride access via index << pool_size_order.
+ * - The 'index' of the target sub-node is derived using a value population
+ *   bit-select strategy. Specific bits of the search key (encoded in the
+ *   pointer flag) are evaluated to optimally distribute children and
+ *   minimize collisions within the pool.
+ *
+ * 3. FT_PIGEON:
+ * - A direct, flat array of up to 256 (struct cds_ft_inode_flag *) pointers.
+ * - No nr_child or key arrays are stored inside the node (the key is
+ *   implicit from the pointer's array index).
+ * - Because 'data' is explicitly pointer-aligned, it can be safely cast
+ *   directly to (struct cds_ft_inode_flag **).
+ *
+ * Note: For all configurations, the true total number of children is
+ * strictly maintained in the out-of-line metadata (struct cds_ft_metadata).
+ *
+ * Note on array sizing: The size of this array is the maximum possible
+ * node size (Pigeon: 256 pointers) because C99 don't allow Flexible
+ * Array Members as first fields within a structure.
+ */
 
 struct cds_ft_inode {
-	union {
-		/* Linear configuration */
-		DECLARE_LINEAR_NODE(0) conf_0;
-		DECLARE_LINEAR_NODE(1) conf_1;
-		DECLARE_LINEAR_NODE(2) conf_2;
-		DECLARE_LINEAR_NODE(3) conf_3;
-		DECLARE_LINEAR_NODE(4) conf_4;
-
-		/* Pool configuration */
-		DECLARE_POOL_NODE(5) conf_5;
-		DECLARE_POOL_NODE(6) conf_6;
-
-		/* Pigeon configuration */
-		struct {
-			struct cds_ft_inode_flag *child[ft_type_7_max_child];
-		} conf_7;
-		/* data aliasing nodes for computed accesses */
-		uint8_t data[sizeof(struct cds_ft_inode_flag *) * ft_type_7_max_child];
-	} u;
+	uint8_t data[FT_ENTRY_PER_NODE * sizeof(struct cds_ft_inode_flag *)]
+		__attribute__((__aligned__(sizeof(struct cds_ft_inode_flag *))));
 };
-#endif /* !(BITS_PER_LONG < 64) */
 
 static inline __attribute__((unused))
 void static_array_size_check(void)
@@ -848,7 +832,7 @@ uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
 {
 	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
 	/* load-acquire orders nr_child load before values and pointers */
-	return uatomic_load(&node->u.data[0], CMM_ACQUIRE);
+	return uatomic_load(&node->data[0], CMM_ACQUIRE);
 }
 
 /*
@@ -866,7 +850,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		uint8_t n)
 {
 	uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
-	uint8_t *data = &node->u.data[0]; /* data[0] is nr_child */
+	uint8_t *data = &node->data[0]; /* data[0] is nr_child */
 	unsigned int phys_idx;
 	uint32_t mask;
 
@@ -906,7 +890,7 @@ found:
 		/* logical_idx = phys_idx - 1 (because data[0] is nr_child). */
 		unsigned int i = phys_idx - 1;
 		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
-			align_ptr_size(&node->u.data[1] + type->max_linear_child);
+			align_ptr_size(&node->data[1] + type->max_linear_child);
 
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = &pointers[i];
@@ -953,7 +937,7 @@ static struct cds_ft_inode_flag *ft_linear_node_get_nth(
 		uint8_t n)
 {
 	uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
-	uint8_t *data = &node->u.data[0]; /* data[0] is nr_child */
+	uint8_t *data = &node->data[0]; /* data[0] is nr_child */
 	unsigned int phys_idx;
 
 	/*
@@ -1005,7 +989,7 @@ found:
 	{
 		unsigned int i = phys_idx - 1; /* Convert to logical 0-index */
 		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
-			align_ptr_size(&node->u.data[1] + type->max_linear_child);
+			align_ptr_size(&node->data[1] + type->max_linear_child);
 
 		if (caa_unlikely(node_flag_ptr)) *node_flag_ptr = &pointers[i];
 		return rcu_dereference(pointers[i]);
@@ -1031,8 +1015,8 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	/* node->u.data is always aligned on sizeof(unsigned long) */
-	unsigned long *data_words = (unsigned long *)node->u.data,
+	/* node->data is always aligned on sizeof(unsigned long) */
+	unsigned long *data_words = (unsigned long *)node->data,
 		first_word = data_words[0], mask = n * L_ONES, xor_res, has_zero;
 	uint8_t nr_child;
 	unsigned int i;
@@ -1100,7 +1084,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 
 found:
 	{
-		uint8_t *values = &node->u.data[1];
+		uint8_t *values = &node->data[1];
 		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
 		struct cds_ft_inode_flag *ptr = rcu_dereference(pointers[i]);
 
@@ -1128,7 +1112,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 	assert(nr_child <= type->max_linear_child);
 	assert(type->type_class != FT_LINEAR || nr_child == 0 || nr_child >= type->min_child);
 
-	values = &node->u.data[1];
+	values = &node->data[1];
 	for (i = 0; i < nr_child; i++) {
 		if (uatomic_load(&values[i], CMM_RELAXED) == n)
 			break;
@@ -1173,7 +1157,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	assert(nr_child <= type->max_linear_child);
 	assert(type->type_class != FT_LINEAR || nr_child == 0 || nr_child >= type->min_child);
 
-	values = &node->u.data[1];
+	values = &node->data[1];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
 	for (i = 0; i < nr_child; i++) {
 		unsigned int v;
@@ -1223,7 +1207,7 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
 	assert(i < ft_linear_node_get_nr_child(type, node));
 
-	values = &node->u.data[1];
+	values = &node->data[1];
 	*v = values[i];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
 	*iter = rcu_dereference(pointers[i]);
@@ -1240,7 +1224,7 @@ struct cds_ft_inode *ft_pool_get_linear_subnode(const struct cds_ft_type *type,
 	{
 		unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
 		unsigned long index = ((unsigned long) n >> bitsel) & 0x1;
-		return (struct cds_ft_inode *) &node->u.data[index << type->pool_size_order];
+		return (struct cds_ft_inode *) &node->data[index << type->pool_size_order];
 	}
 	case 2:
 	{
@@ -1250,7 +1234,7 @@ struct cds_ft_inode *ft_pool_get_linear_subnode(const struct cds_ft_type *type,
 		ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
 		index_to_bits_C_n8_r2(C_n8_r2_index, bits);
 		subclass_index = value_and_bits_to_subclass_index(n, bits);
-		return (struct cds_ft_inode *) &node->u.data[subclass_index << type->pool_size_order];
+		return (struct cds_ft_inode *) &node->data[subclass_index << type->pool_size_order];
 	}
 	default:
 		assert(0);
@@ -1276,7 +1260,7 @@ struct cds_ft_inode *ft_pool_node_get_ith_pool(const struct cds_ft_type *type,
 {
 	assert(type->type_class == FT_POOL);
 	return (struct cds_ft_inode *)
-		&node->u.data[(unsigned int) i << type->pool_size_order];
+		&node->data[(unsigned int) i << type->pool_size_order];
 }
 
 static inline_lookup
@@ -1374,7 +1358,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type *type,
 	struct cds_ft_inode_flag *child_node_flag;
 
 	assert(type->type_class == FT_PIGEON);
-	child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->u.data)[n];
+	child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[n];
 	child_node_flag = rcu_dereference(*child_node_flag_ptr);
 	//dbg_printf("ft_pigeon_node_get_nth child_node_flag_ptr %p\n",
 	//	child_node_flag_ptr);
@@ -1406,7 +1390,7 @@ retry:
 	else
 		i = cds_find_next_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n + 1);
 	if (i >= 0) {
-		child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->u.data)[i];
+		child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[i];
 		child_node_flag = rcu_dereference(*child_node_flag_ptr);
 		if (!child_node_flag) {
 			/*
@@ -1425,7 +1409,7 @@ retry:
 	if (dir == FT_LEFT) {
 		/* n - 1 is first value left of n */
 		for (i = n - 1; i >= 0; i--) {
-			child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->u.data)[i];
+			child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[i];
 			child_node_flag = rcu_dereference(*child_node_flag_ptr);
 			if (child_node_flag) {
 				dbg_printf("ft_pigeon_node_get_left child_node_flag %p\n",
@@ -1437,7 +1421,7 @@ retry:
 	} else {
 		/* n + 1 is first value right of n */
 		for (i = n + 1; i < FT_ENTRY_PER_NODE; i++) {
-			child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->u.data)[i];
+			child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[i];
 			child_node_flag = rcu_dereference(*child_node_flag_ptr);
 			if (child_node_flag) {
 				dbg_printf("ft_pigeon_node_get_right child_node_flag %p\n",
@@ -1572,13 +1556,13 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 
 	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
 
-	nr_child_ptr = &node->u.data[0];
+	nr_child_ptr = &node->data[0];
 	dbg_printf("linear set nth: n %u, nr_child_ptr %p\n",
 		(unsigned int) n, nr_child_ptr);
 	nr_child = *nr_child_ptr;
 	assert(nr_child <= type->max_linear_child);
 
-	values = &node->u.data[1];
+	values = &node->data[1];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
 	/* Check if node value is already populated */
 	for (i = 0; i < nr_child; i++) {
@@ -1655,7 +1639,7 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
 	bool replace_old_ptr = false;
 
 	assert(type->type_class == FT_PIGEON);
-	ptr = &((struct cds_ft_inode_flag **) node->u.data)[n];
+	ptr = &((struct cds_ft_inode_flag **) node->data)[n];
 	if (*ptr)
 		replace_old_ptr = true;
 	rcu_assign_pointer(*ptr, child_node_flag);
@@ -1710,7 +1694,7 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 
 	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
 
-	nr_child_ptr = &node->u.data[0];
+	nr_child_ptr = &node->data[0];
 	nr_child = *nr_child_ptr;
 	assert(nr_child <= type->max_linear_child);
 
