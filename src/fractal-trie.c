@@ -303,6 +303,7 @@ struct cds_ft_iter {
 	size_t key_len;			/* Key length of the current node. */
 	size_t prefix_len;		/* Key prefix length. */
 	enum cds_ft_status status;	/* Iteration status. */
+	enum cds_ft_iter_path_mode path_mode;	/* Path caching mode. */
 	bool path_valid;		/* Whether this iterator has a valid path. */
 
 	/*
@@ -324,6 +325,20 @@ struct cds_ft_iter {
 /* Start of the uint8_t key array. */
 #define iter_key(iter) \
 	((uint8_t *)((iter)->data + ((iter)->ft->group->max_tree_depth * sizeof(struct cds_ft_inode_flag *))))
+
+/*
+ * Discard the cached path if the iterator is in uncached mode.
+ * Called at the end of each public iterator-based operation.
+ * Preserves iter->node so the caller can read the result.
+ */
+static inline
+void iter_auto_invalidate_path(struct cds_ft_iter *iter)
+{
+	if (iter->path_mode == CDS_FT_ITER_PATH_UNCACHED) {
+		iter->path_valid = false;
+		iter->path_len = 0;
+	}
+}
 
 #define BITMASK_2(a, b)					\
 	{						\
@@ -2742,6 +2757,7 @@ end:
 		 * exact key was not found.
 		 */
 		iter->path_valid = (status == CDS_FT_STATUS_OK);
+		iter_auto_invalidate_path(iter);
 	}
 	if (track) {
 		*tracking_match_len = match_len;
@@ -2844,18 +2860,20 @@ enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 	if (ret < 0) {
 		iter->node = NULL;
 		iter->status = ret;
-		return ret;
+		goto end;
 	}
 	if (longest_len == FT_MATCH_LEN_NONE) {
 		iter->node = NULL;
 		iter->status = CDS_FT_STATUS_NOT_FOUND;
-		return CDS_FT_STATUS_NOT_FOUND;
+		goto end;
 	}
 	iter->node = match_node;
 	iter->key_len = longest_len;
 	iter->path_len = longest_len + 1;
 	iter->status = match_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_INTERNAL_MATCH;
 	iter->path_valid = true;
+end:
+	iter_auto_invalidate_path(iter);
 	return iter->status;
 }
 
@@ -2901,7 +2919,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			iter->node = NULL;
 			iter->path_valid = false;
 			iter->status = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-			return iter->status;
+			goto end;
 		}
 		break;
 	case FT_LOOKUP_LIMIT_FIRST:
@@ -2961,7 +2979,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 				iter->path_valid = true;
 				iter->path_len = 1;
 				iter->status = CDS_FT_STATUS_NOT_FOUND;
-				return iter->status;
+				goto end;
 			}
 		}
 	}
@@ -3063,7 +3081,7 @@ post_traversal:
 				iter->path_valid = true;
 				iter->path_len = level + 1;
 				iter->status = CDS_FT_STATUS_OK;
-				return iter->status;
+				goto end;
 			}
 		}
 		break;
@@ -3153,7 +3171,7 @@ post_traversal:
 				iter->path_valid = true;
 				iter->path_len = level + 1;
 				iter->status = CDS_FT_STATUS_OK;
-				return iter->status;
+				goto end;
 			}
 		}
 
@@ -3229,7 +3247,7 @@ post_traversal:
 					iter->path_valid = true;
 					iter->path_len = iter->prefix_len + 1;
 					iter->status = CDS_FT_STATUS_OK;
-					return iter->status;
+					goto end;
 				}
 			}
 		}
@@ -3237,7 +3255,7 @@ post_traversal:
 		iter->path_valid = true;
 		iter->path_len = iter->prefix_len + 1;
 		iter->status = CDS_FT_STATUS_NOT_FOUND;
-		return iter->status;
+		goto end;
 	}
 
 descend_children:
@@ -3252,7 +3270,7 @@ descend_children:
 		iter->path_valid = true;
 		iter->path_len = level + 1;
 		iter->status = CDS_FT_STATUS_OK;
-		return iter->status;
+		goto end;
 	}
 
 	level++;
@@ -3304,7 +3322,7 @@ descend_children:
 			if (external_nodes) {
 				ret_node = external_nodes;
 				level--;
-				goto end;
+				goto found_minmax;
 			}
 		}
 		skip_eq_external_nodes = false;
@@ -3320,7 +3338,7 @@ descend_children:
 			iter->path_valid = true;
 			iter->path_len = level;
 			iter->status = CDS_FT_STATUS_NOT_FOUND;
-			return iter->status;
+			goto end;
 		}
 		iter_path_node(iter)[level] = node_flag;
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
@@ -3337,7 +3355,7 @@ descend_children:
 	 * max_key_len.
 	 */
 	assert(level <= (int) ft->group->max_key_len);
-end:
+found_minmax:
 	{
 		int j;
 
@@ -3348,8 +3366,10 @@ end:
 		iter->path_valid = true;
 		iter->path_len = level + 1;
 		iter->status = ret_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
-		return iter->status;
 	}
+end:
+	iter_auto_invalidate_path(iter);
+	return iter->status;
 }
 
 /*
@@ -4046,8 +4066,9 @@ find_and_replace:
 
 	/*
 	 * The trie structure is unchanged (no recompaction), so the
-	 * iterator path remains valid.
+	 * iterator path remains valid in cached mode.
 	 */
+	iter_auto_invalidate_path(iter);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -5652,6 +5673,7 @@ enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **re
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	iter->ft = ft;
+	iter->path_mode = CDS_FT_ITER_PATH_CACHED;
 	*result_iter = iter;
 	return CDS_FT_STATUS_OK;
 }
@@ -5751,6 +5773,7 @@ void cds_ft_iter_invalidate_path(struct cds_ft_iter *iter)
 void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 {
 	dst->status = src->status;
+	dst->path_mode = src->path_mode;
 	dst->path_valid = src->path_valid;
 	dst->path_len = src->path_len;
 	dst->key_len = src->key_len;
@@ -5763,4 +5786,34 @@ void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
 {
 	return iter->node;
+}
+
+enum cds_ft_status cds_ft_iter_set_path_mode(struct cds_ft_iter *iter,
+		enum cds_ft_iter_path_mode mode)
+{
+	switch (mode) {
+	case CDS_FT_ITER_PATH_CACHED:
+		break;
+	case CDS_FT_ITER_PATH_UNCACHED:
+		/*
+		 * Switching to uncached mode: any previously cached
+		 * path may become stale if the caller drops the RCU
+		 * read-side lock, so invalidate it now.
+		 */
+		if (iter->path_mode == CDS_FT_ITER_PATH_CACHED) {
+			iter->path_valid = false;
+			iter->path_len = 0;
+		}
+		break;
+	default:
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	iter->path_mode = mode;
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_iter_path_mode cds_ft_iter_get_path_mode(
+		const struct cds_ft_iter *iter)
+{
+	return iter->path_mode;
 }
