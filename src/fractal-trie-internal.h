@@ -188,14 +188,6 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft_metadata *metadata);
 
-/*
- * Iterate through duplicates returned by cds_ft_lookup*()
- * Receives a struct cds_ft_node * as parameter, which is used as start
- * of duplicate list and loop cursor.
- */
-#define cds_ft_for_each_duplicate(pos)				\
-       for (; (pos) != NULL; (pos) = (pos)->next)
-
 //#define DEBUG
 //#define DEBUG_COUNTERS
 #define DEBUG_CLEAR_ITER

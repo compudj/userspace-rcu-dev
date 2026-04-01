@@ -266,6 +266,14 @@ void static_array_size_check(void)
 	CAA_BUILD_BUG_ON(CAA_ARRAY_SIZE(ft_types) < FT_TYPE_MAX_NR);
 }
 
+/*
+ * Iterate through duplicates returned by cds_ft_lookup*()
+ * Receives a struct cds_ft_node * as parameter, which is used as start
+ * of duplicate list and loop cursor.
+ */
+#define cds_ft_for_each_duplicate(pos)				\
+       for (; (pos) != NULL; (pos) = (pos)->next)
+
 enum ft_recompact {
 	FT_RECOMPACT_ADD_SAME,
 	FT_RECOMPACT_ADD_NEXT,
