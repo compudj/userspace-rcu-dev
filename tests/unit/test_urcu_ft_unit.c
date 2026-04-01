@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 84
+#define NR_TESTS 103
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -5723,6 +5723,1613 @@ static int test_show_smoke(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*     11. ADVERSARIAL KEY & PER-NODE DISTRIBUTION TESTS              */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Adversarial key patterns and per-node child distributions.
+ *
+ * These tests are designed to stress internal node configurations
+ * (linear, 1D pool, 2D pool, pigeon) by constructing key populations
+ * that force transitions through every node type, trigger pool
+ * fallback paths, exercise hysteresis boundaries, and verify
+ * correctness under pathological key distributions.
+ *
+ * The node configuration thresholds on 64-bit are:
+ *   Type 0 LINEAR:  1 child       (16 B)
+ *   Type 1 LINEAR:  1-3 children  (32 B)
+ *   Type 2 LINEAR:  3-7 children  (64 B)
+ *   Type 3 LINEAR:  5-14 children (128 B)
+ *   Type 4 LINEAR:  10-28 children(256 B)
+ *   Type 5 POOL 1D: 22-54 children(512 B)  pool uses 1 bit
+ *   Type 6 POOL 2D: 51-104 children(1024 B) pool uses 2 bits
+ *   Type 7 PIGEON:  95-256 children(2048 B)
+ *
+ * On 32-bit the thresholds differ; the tests use counts that cover
+ * both architectures by targeting the wider 64-bit thresholds.
+ */
+
+/*
+ * Helper: insert a raw byte key of given length into a variable-length trie.
+ */
+static enum cds_ft_status
+insert_raw(struct cds_ft *ft, const uint8_t *key, size_t key_len,
+	   struct ft_test_node *n)
+{
+	return cds_ft_insert(ft, key, key_len, &n->node);
+}
+
+/*
+ * Helper: remove a node by raw key from a variable-length trie.
+ */
+static enum cds_ft_status
+remove_raw(struct cds_ft *ft, struct cds_ft_iter *iter,
+	   const uint8_t *key, size_t key_len, struct ft_test_node *n)
+{
+	enum cds_ft_status s;
+
+	cds_ft_iter_set_key(iter, key, key_len);
+	s = cds_ft_lookup(ft, iter);
+	if (s != CDS_FT_STATUS_OK)
+		return s;
+	return cds_ft_remove(ft, iter, &n->node);
+}
+
+/*
+ * Helper: verify forward iteration yields exactly @expected_count
+ * nodes in strictly ascending key order for a 2-byte fixed trie.
+ */
+static int
+verify_2byte_order(struct cds_ft *ft, struct cds_ft_iter *iter,
+		   unsigned int expected_count)
+{
+	unsigned int count = 0;
+	uint64_t prev = 0;
+	int first = 1;
+
+	rcu_read_lock();
+	cds_ft_for_each_rcu(ft, iter) {
+		uint8_t rk[2];
+		size_t rk_len;
+		uint64_t v;
+
+		cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+		v = cds_ft_key_to_u64(ft, rk, CDS_FT_LEN_DEFAULT);
+		if (!first && v <= prev) {
+			fprintf(stderr, "order violation: %" PRIu64 " after %" PRIu64 "\n",
+				v, prev);
+			rcu_read_unlock();
+			return -1;
+		}
+		prev = v;
+		first = 0;
+		count++;
+	}
+	rcu_read_unlock();
+
+	if (cds_ft_iter_status(iter) < 0) {
+		fprintf(stderr, "iteration error: %s\n",
+			cds_ft_status_to_string(cds_ft_iter_status(iter)));
+		return -1;
+	}
+	if (count != expected_count) {
+		fprintf(stderr, "count mismatch: %u, expected %u\n",
+			count, expected_count);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Helper: verify forward iteration for variable-length trie yields
+ * @expected_count nodes in non-descending lexicographic order.
+ */
+static int
+verify_varlen_order(struct cds_ft *ft, struct cds_ft_iter *iter,
+		    unsigned int expected_count)
+{
+	size_t max_klen = cds_ft_max_key_len(ft);
+	uint8_t *prev_key, *rk;
+	unsigned int count = 0;
+	size_t prev_len = 0;
+	int first = 1;
+	int ret = -1;
+
+	prev_key = (uint8_t *) malloc(max_klen);
+	rk = (uint8_t *) malloc(max_klen);
+	if (!prev_key || !rk) {
+		fprintf(stderr, "verify_varlen_order: malloc failed\n");
+		free(prev_key);
+		free(rk);
+		return -1;
+	}
+
+	rcu_read_lock();
+	cds_ft_for_each_rcu(ft, iter) {
+		size_t rk_len;
+
+		cds_ft_iter_get_key(iter, rk, max_klen, &rk_len);
+		if (!first) {
+			size_t cmp_len = prev_len < rk_len ? prev_len : rk_len;
+			int cmp = memcmp(prev_key, rk, cmp_len);
+
+			if (cmp > 0 || (cmp == 0 && prev_len >= rk_len)) {
+				fprintf(stderr, "varlen order violation at position %u\n", count);
+				rcu_read_unlock();
+				goto out;
+			}
+		}
+		memcpy(prev_key, rk, rk_len);
+		prev_len = rk_len;
+		first = 0;
+		count++;
+	}
+	rcu_read_unlock();
+
+	if (cds_ft_iter_status(iter) < 0)
+		goto out;
+	if (count != expected_count) {
+		fprintf(stderr, "varlen count: %u, expected %u\n",
+			count, expected_count);
+		goto out;
+	}
+	ret = 0;
+out:
+	free(prev_key);
+	free(rk);
+	return ret;
+}
+
+/*
+ * Insert keys sharing a common first byte, all 256 second-byte values.
+ * Forces a single internal node through every configuration: linear
+ * (types 0..4), 1D pool (type 5), 2D pool (type 6), and pigeon
+ * (type 7). Verifies count and sorted iteration.
+ */
+static int test_adversarial_ramp_all_configs(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	unsigned long ft_count;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 256; i++) {
+		struct ft_test_node *n = node_alloc((0xAA << 8) | i);
+
+		n->value = i;
+		rcu_read_lock();
+		if (insert_u64(ft, (0xAA << 8) | i, n) < 0) {
+			fprintf(stderr, "ramp: insert %u failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 256) {
+		fprintf(stderr, "ramp: count %lu, expected 256\n", ft_count);
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	if (verify_2byte_order(ft, iter, 256) < 0) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Keys whose discriminating byte values all have bit 7 set
+ * (values 0x80..0xB5). The 1D pool partitions children based on a
+ * selected bit position; if all children share the same bit value,
+ * one sub-pool is empty and the other overflows, triggering fallback.
+ */
+static int test_adversarial_single_bit_cluster(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	unsigned int nr_keys = 54;	/* 1D pool max_child on 64-bit */
+	unsigned long ft_count;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < nr_keys; i++) {
+		struct ft_test_node *n = node_alloc((0x42 << 8) | (0x80 + i));
+
+		rcu_read_lock();
+		if (insert_u64(ft, (0x42 << 8) | (0x80 + i), n) < 0) {
+			fprintf(stderr, "single_bit_cluster: insert %u failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != nr_keys) {
+		fprintf(stderr, "single_bit_cluster: count %lu, expected %u\n",
+			ft_count, nr_keys);
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	if (verify_2byte_order(ft, iter, nr_keys) < 0) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Keys whose discriminating byte values all have bit 0 set
+ * (i*2+1 for i in [0..103]), adversarial for any pool split on bit 0.
+ * 104 children reach the 2D pool max_child on 64-bit.
+ */
+static int test_adversarial_same_nibble_cluster(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	unsigned int nr_keys = 104;
+	unsigned long ft_count;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < nr_keys; i++) {
+		uint64_t v = (0x77ULL << 8) | (uint64_t)(i * 2 + 1);
+		struct ft_test_node *n = node_alloc(v);
+
+		rcu_read_lock();
+		if (insert_u64(ft, v, n) < 0) {
+			fprintf(stderr, "same_nibble: insert %u failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != nr_keys) {
+		fprintf(stderr, "same_nibble: count %lu, expected %u\n",
+			ft_count, nr_keys);
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	if (verify_2byte_order(ft, iter, nr_keys) < 0) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Keys where bits 0 and 1 are always clear (values i*4 for i in
+ * [0..63]). Any 2D pool split using bits 0 and 1 places all children
+ * in one quadrant.
+ */
+static int test_adversarial_two_bit_cluster(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	unsigned int nr_keys = 64;
+	unsigned long ft_count;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < nr_keys; i++) {
+		uint64_t v = (0x33ULL << 8) | (uint64_t)(i * 4);
+		struct ft_test_node *n = node_alloc(v);
+
+		rcu_read_lock();
+		if (insert_u64(ft, v, n) < 0) {
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != nr_keys) {
+		fprintf(stderr, "two_bit_cluster: count %lu, expected %u\n",
+			ft_count, nr_keys);
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	if (verify_2byte_order(ft, iter, nr_keys) < 0) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Repeatedly insert and remove keys near the linear-to-pool
+ * transition. Insert 30 children (above type 4 max on 64-bit),
+ * remove 10 (below type 5 min), re-insert 10. Repeat 3 cycles.
+ * Verifies that hysteresis-driven recompaction preserves order.
+ */
+static int test_adversarial_transition_oscillation(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *nodes[30];
+	unsigned int i, cycle;
+	unsigned long ft_count;
+	int ret = -1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 30; i++) {
+		nodes[i] = node_alloc((0x50 << 8) | i);
+		rcu_read_lock();
+		if (insert_u64(ft, (0x50 << 8) | i, nodes[i]) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+
+	if (verify_2byte_order(ft, iter, 30) < 0)
+		goto out;
+
+	for (cycle = 0; cycle < 3; cycle++) {
+		for (i = 20; i < 30; i++) {
+			uint8_t k[8];
+
+			cds_ft_u64_to_key(ft, (0x50 << 8) | i, k, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+			cds_ft_lookup(ft, iter);
+			if (cds_ft_remove(ft, iter, &nodes[i]->node) < 0) {
+				rcu_read_unlock();
+				goto out;
+			}
+			rcu_read_unlock();
+			node_free_rcu(nodes[i]);
+		}
+		rcu_barrier();
+
+		rcu_read_lock();
+		ft_count = cds_ft_count(ft);
+		rcu_read_unlock();
+		if (ft_count != 20) {
+			fprintf(stderr, "oscillation: count %lu after removal cycle %u\n",
+				ft_count, cycle);
+			goto out;
+		}
+
+		if (verify_2byte_order(ft, iter, 20) < 0)
+			goto out;
+
+		for (i = 20; i < 30; i++) {
+			nodes[i] = node_alloc((0x50 << 8) | i);
+			rcu_read_lock();
+			if (insert_u64(ft, (0x50 << 8) | i, nodes[i]) < 0) {
+				rcu_read_unlock();
+				goto out;
+			}
+			rcu_read_unlock();
+		}
+
+		if (verify_2byte_order(ft, iter, 30) < 0)
+			goto out;
+	}
+
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Fill a node to 256 children (pigeon), remove every other child
+ * (128 removals), then continue removing until only 1 remains.
+ * Verifies iteration order at each phase, exercising the full
+ * pigeon-to-linear shrink path.
+ */
+static int test_adversarial_sparse_removal(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *nodes[256];
+	unsigned int i, remaining;
+	unsigned long ft_count;
+	int ret = -1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 256; i++) {
+		nodes[i] = node_alloc((0xCC << 8) | i);
+		rcu_read_lock();
+		if (insert_u64(ft, (0xCC << 8) | i, nodes[i]) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+
+	/* Remove even-indexed children. */
+	for (i = 0; i < 256; i += 2) {
+		uint8_t k[8];
+
+		cds_ft_u64_to_key(ft, (0xCC << 8) | i, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		cds_ft_lookup(ft, iter);
+		if (cds_ft_remove(ft, iter, &nodes[i]->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+		node_free_rcu(nodes[i]);
+		nodes[i] = NULL;
+	}
+	rcu_barrier();
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 128) {
+		fprintf(stderr, "sparse_removal: count %lu, expected 128\n", ft_count);
+		goto out;
+	}
+
+	if (verify_2byte_order(ft, iter, 128) < 0)
+		goto out;
+
+	/* Continue removing odd children until 1 remains. */
+	remaining = 128;
+	for (i = 1; remaining > 1; i += 2) {
+		uint8_t k[8];
+
+		if (i >= 256)
+			break;
+		if (!nodes[i])
+			continue;
+
+		cds_ft_u64_to_key(ft, (0xCC << 8) | i, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		cds_ft_lookup(ft, iter);
+		if (cds_ft_remove(ft, iter, &nodes[i]->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+		node_free_rcu(nodes[i]);
+		nodes[i] = NULL;
+		remaining--;
+	}
+	rcu_barrier();
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 1) {
+		fprintf(stderr, "sparse_removal: count %lu at end, expected 1\n", ft_count);
+		goto out;
+	}
+
+	if (verify_2byte_order(ft, iter, 1) < 0)
+		goto out;
+
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Insert variable-length keys composed entirely of 0x00 and 0xFF
+ * bytes at lengths 1..16. These extreme boundary values test the
+ * trie's handling of minimum/maximum byte values at every depth.
+ */
+static int test_adversarial_boundary_bytes(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned int i;
+	unsigned int nr_keys = 0;
+	int ret = -1;
+	uint8_t zero_key[16];
+	uint8_t ff_key[16];
+
+	memset(zero_key, 0x00, sizeof(zero_key));
+	memset(ff_key, 0xFF, sizeof(ff_key));
+
+	ft = create_varlen_ft(&group);
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 1; i <= 16; i++) {
+		struct ft_test_node *nz = node_alloc(i);
+		struct ft_test_node *nf = node_alloc(0xFF00 + i);
+
+		rcu_read_lock();
+		s = insert_raw(ft, zero_key, i, nz);
+		if (s < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		s = insert_raw(ft, ff_key, i, nf);
+		if (s < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+		nr_keys += 2;
+	}
+
+	rcu_read_lock();
+	for (i = 1; i <= 16; i++) {
+		s = cds_ft_lookup_key(ft, zero_key, i, &found);
+		if (s != CDS_FT_STATUS_OK || !found) {
+			fprintf(stderr, "boundary: lookup zero len %u failed\n", i);
+			rcu_read_unlock();
+			goto out;
+		}
+		s = cds_ft_lookup_key(ft, ff_key, i, &found);
+		if (s != CDS_FT_STATUS_OK || !found) {
+			fprintf(stderr, "boundary: lookup ff len %u failed\n", i);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+
+	if (verify_varlen_order(ft, iter, nr_keys) < 0)
+		goto out;
+
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Insert keys that are strict prefixes of each other: {0xAB} (len 1),
+ * {0xAB,0xAB} (len 2), ... up to depth 32. Each key shares a prefix
+ * with all shorter keys, stress-testing variable-length handling,
+ * partial-match logic, and the internal/external node distinction.
+ */
+static int test_adversarial_prefix_nesting(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+	unsigned int i;
+	unsigned int depth = 32;
+	uint8_t key[32];
+	int ret = -1;
+
+	memset(key, 0xAB, sizeof(key));
+
+	ft = create_varlen_ft(&group);
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 1; i <= depth; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		s = insert_raw(ft, key, i, n);
+		rcu_read_unlock();
+		if (s < 0) {
+			fprintf(stderr, "prefix_nesting: insert len %u: %s\n",
+				i, cds_ft_status_to_string(s));
+			goto out;
+		}
+	}
+
+	rcu_read_lock();
+	for (i = 1; i <= depth; i++) {
+		struct cds_ft_node *found;
+
+		s = cds_ft_lookup_key(ft, key, i, &found);
+		if (s != CDS_FT_STATUS_OK || !found) {
+			fprintf(stderr, "prefix_nesting: lookup len %u: %s\n",
+				i, cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+
+	/* Partial lookup from longest key should match at full depth. */
+	rcu_read_lock();
+	{
+		struct cds_ft_node *found;
+		size_t match_len;
+
+		s = cds_ft_lookup_partial_key(ft, key, depth, &match_len, &found);
+		if (s != CDS_FT_STATUS_OK || !found || match_len != depth) {
+			fprintf(stderr, "prefix_nesting: partial match_len %zu, expected %u\n",
+				match_len, depth);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+
+	if (verify_varlen_order(ft, iter, depth) < 0)
+		goto out;
+
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Insert 256 nodes at the same key to build a very long duplicate
+ * chain. Verify chain length, then remove all with remove_all.
+ */
+static int test_adversarial_mass_duplicates(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *head, *tmp;
+	enum cds_ft_status s;
+	unsigned int i, count;
+	unsigned long ft_count;
+	uint8_t k[8];
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	cds_ft_u64_to_key(ft, 0x1234, k, CDS_FT_LEN_DEFAULT);
+
+	for (i = 0; i < 256; i++) {
+		struct ft_test_node *n = node_alloc(0x1234);
+
+		n->value = i;
+		rcu_read_lock();
+		s = cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n->node);
+		rcu_read_unlock();
+		if (s < 0) {
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 256) {
+		fprintf(stderr, "mass_dup: count %lu\n", ft_count);
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	s = cds_ft_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, &head);
+	if (s != CDS_FT_STATUS_OK || !head) {
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	count = 0;
+	cds_ft_for_each_duplicate_rcu(head)
+		count++;
+	rcu_read_unlock();
+
+	if (count != 256) {
+		fprintf(stderr, "mass_dup: chain length %u\n", count);
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	cds_ft_lookup(ft, iter);
+	s = cds_ft_remove_all(ft, iter, &head);
+	if (s != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
+		node_free_rcu(to_test_node(head));
+	}
+	rcu_read_unlock();
+
+	rcu_barrier();
+
+	if (!cds_ft_empty(ft)) {
+		cds_ft_iter_destroy(iter);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * Insert keys with complementary bit patterns 0xAA and 0x55 at every
+ * first-byte prefix (128 prefixes x 2 children each = 256 nodes).
+ * These bit-complement values maximally stress pool bit-selection.
+ */
+static int test_adversarial_alternating_bits(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int prefix, nr_keys = 0;
+	unsigned long ft_count;
+	int ret = -1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (prefix = 0; prefix < 128; prefix++) {
+		struct ft_test_node *na = node_alloc((prefix << 8) | 0xAA);
+		struct ft_test_node *nb = node_alloc((prefix << 8) | 0x55);
+
+		rcu_read_lock();
+		if (insert_u64(ft, (prefix << 8) | 0xAA, na) < 0 ||
+		    insert_u64(ft, (prefix << 8) | 0x55, nb) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+		nr_keys += 2;
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != nr_keys) {
+		fprintf(stderr, "alt_bits: count %lu, expected %u\n",
+			ft_count, nr_keys);
+		goto out;
+	}
+
+	if (verify_2byte_order(ft, iter, nr_keys) < 0)
+		goto out;
+
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Insert 3 keys at the implementation's maximum key length: all-zero,
+ * all-0xFF, and alternating 0xAA/0x55 bytes. Verifies lookup and
+ * sorted iteration at maximum trie depth.
+ *
+ * The maximum key length is not hardcoded; it is discovered at
+ * runtime by creating a default variable-length trie and querying
+ * cds_ft_max_key_len().
+ */
+static int test_adversarial_max_depth(void)
+{
+	struct cds_ft_group *probe_group, *group;
+	struct cds_ft_attr *attr;
+	struct cds_ft *probe_ft, *ft;
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	size_t max_klen;
+	unsigned int i;
+	int ret = -1;
+	uint8_t *key_zero = NULL, *key_ff = NULL, *key_alt = NULL;
+	struct ft_test_node *n1, *n2, *n3;
+
+	/*
+	 * Discover the implementation's maximum key length from a
+	 * default variable-length trie, then tear down the probe.
+	 */
+	if (cds_ft_group_create(NULL, &probe_group) < 0)
+		return -1;
+	if (cds_ft_create(probe_group, &probe_ft) < 0) {
+		cds_ft_group_destroy(probe_group);
+		return -1;
+	}
+	max_klen = cds_ft_max_key_len(probe_ft);
+	cds_ft_destroy(probe_ft);
+	cds_ft_group_destroy(probe_group);
+
+	if (max_klen == 0) {
+		fprintf(stderr, "max_depth: cds_ft_max_key_len returned 0\n");
+		return -1;
+	}
+
+	key_zero = (uint8_t *) calloc(max_klen, 1);
+	key_ff = (uint8_t *) malloc(max_klen);
+	key_alt = (uint8_t *) malloc(max_klen);
+	if (!key_zero || !key_ff || !key_alt)
+		goto out_free_keys;
+
+	memset(key_ff, 0xFF, max_klen);
+	for (i = 0; i < max_klen; i++)
+		key_alt[i] = (i & 1) ? 0x55 : 0xAA;
+
+	if (cds_ft_attr_create(&attr) < 0)
+		goto out_free_keys;
+	if (cds_ft_attr_set_key_len(attr, max_klen) < 0) {
+		cds_ft_attr_destroy(attr);
+		goto out_free_keys;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_attr_destroy(attr);
+		goto out_free_keys;
+	}
+	cds_ft_attr_destroy(attr);
+	if (cds_ft_create(group, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		goto out_free_keys;
+	}
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		goto out_free_keys;
+	}
+
+	n1 = node_alloc(0); n1->value = 1;
+	n2 = node_alloc(0); n2->value = 2;
+	n3 = node_alloc(0); n3->value = 3;
+
+	rcu_read_lock();
+	s = cds_ft_insert(ft, key_zero, max_klen, &n1->node);
+	if (s < 0) { rcu_read_unlock(); goto out; }
+	s = cds_ft_insert(ft, key_ff, max_klen, &n2->node);
+	if (s < 0) { rcu_read_unlock(); goto out; }
+	s = cds_ft_insert(ft, key_alt, max_klen, &n3->node);
+	if (s < 0) { rcu_read_unlock(); goto out; }
+
+	s = cds_ft_lookup_key(ft, key_zero, max_klen, &found);
+	if (s != CDS_FT_STATUS_OK || !found || to_test_node(found)->value != 1) {
+		rcu_read_unlock(); goto out;
+	}
+	s = cds_ft_lookup_key(ft, key_ff, max_klen, &found);
+	if (s != CDS_FT_STATUS_OK || !found || to_test_node(found)->value != 2) {
+		rcu_read_unlock(); goto out;
+	}
+	s = cds_ft_lookup_key(ft, key_alt, max_klen, &found);
+	if (s != CDS_FT_STATUS_OK || !found || to_test_node(found)->value != 3) {
+		rcu_read_unlock(); goto out;
+	}
+	rcu_read_unlock();
+
+	/* Verify sorted order: zero < alt < ff. */
+	{
+		unsigned int count = 0;
+		uint64_t expected_vals[] = { 1, 3, 2 };
+
+		rcu_read_lock();
+		cds_ft_for_each_rcu(ft, iter) {
+			struct cds_ft_node *node = cds_ft_iter_node(iter);
+
+			if (count >= 3) { rcu_read_unlock(); goto out; }
+			if (to_test_node(node)->value != expected_vals[count]) {
+				fprintf(stderr, "max_depth: order[%u] value %" PRIu64 "\n",
+					count, to_test_node(node)->value);
+				rcu_read_unlock();
+				goto out;
+			}
+			count++;
+		}
+		rcu_read_unlock();
+		if (count != 3) goto out;
+	}
+
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+out_free_keys:
+	free(key_zero);
+	free(key_ff);
+	free(key_alt);
+	return ret;
+}
+
+/*
+ * Insert 256 children in strictly descending order (255..0).
+ * Exercises insertion ordering assumptions in node compaction.
+ */
+static int test_adversarial_reverse_insert_order(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	int i;
+	unsigned long ft_count;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 255; i >= 0; i--) {
+		struct ft_test_node *n = node_alloc((0xDD << 8) | i);
+
+		rcu_read_lock();
+		if (insert_u64(ft, (0xDD << 8) | i, n) < 0) {
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 256) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	if (verify_2byte_order(ft, iter, 256) < 0) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Insert 256 children in pseudorandom order (XOR-scrambled with 0xA7).
+ * Non-monotonic insertion pattern exercises recompaction under
+ * irregular growth.
+ */
+static int test_adversarial_xor_scramble_order(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	unsigned long ft_count;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 256; i++) {
+		uint64_t child_byte = i ^ 0xA7;
+		struct ft_test_node *n = node_alloc((0xEE << 8) | child_byte);
+
+		rcu_read_lock();
+		if (insert_u64(ft, (0xEE << 8) | child_byte, n) < 0) {
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 256) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	if (verify_2byte_order(ft, iter, 256) < 0) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Interleaved insert/remove: insert 2, remove 1, repeat 128 times.
+ * Net result is 128 surviving nodes. Each cycle causes recompaction
+ * as the node grows one child at a time.
+ */
+static int test_adversarial_interleaved_grow(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int insert_idx = 0, remove_idx = 0;
+	unsigned int cycle;
+	unsigned long ft_count;
+	struct ft_test_node *remove_nodes[128];
+	int ret = -1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (cycle = 0; cycle < 128; cycle++) {
+		struct ft_test_node *n1, *n2;
+		uint8_t k[8];
+
+		n1 = node_alloc((0xBB << 8) | insert_idx);
+		rcu_read_lock();
+		if (insert_u64(ft, (0xBB << 8) | insert_idx, n1) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+		remove_nodes[cycle] = n1;
+		insert_idx++;
+
+		n2 = node_alloc((0xBB << 8) | insert_idx);
+		rcu_read_lock();
+		if (insert_u64(ft, (0xBB << 8) | insert_idx, n2) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+		insert_idx++;
+
+		cds_ft_u64_to_key(ft, (0xBB << 8) | remove_idx, k,
+				  CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		cds_ft_lookup(ft, iter);
+		if (cds_ft_remove(ft, iter, &remove_nodes[cycle]->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+		node_free_rcu(remove_nodes[cycle]);
+		remove_idx += 2;
+	}
+	rcu_barrier();
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 128) {
+		fprintf(stderr, "interleaved_grow: count %lu, expected 128\n", ft_count);
+		goto out;
+	}
+
+	if (verify_2byte_order(ft, iter, 128) < 0)
+		goto out;
+
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Two clusters with a wide gap: 0x00..0x0F and 0xF0..0xFF.
+ * Relational lookups (le, ge, lt, gt) targeting the gap exercise
+ * the iterator backtracking logic over large unpopulated regions.
+ */
+static int test_adversarial_relational_gap(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(1, &group);
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned int i;
+	uint8_t k[1];
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i <= 0x0F; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		insert_u64(ft, i, n);
+		rcu_read_unlock();
+	}
+	for (i = 0xF0; i <= 0xFF; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		insert_u64(ft, i, n);
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+
+	/* le(0x80) -> 0x0F */
+	cds_ft_u64_to_key(ft, 0x80, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	s = cds_ft_lookup_le(ft, iter);
+	if (s != CDS_FT_STATUS_OK) { rcu_read_unlock(); goto fail; }
+	found = cds_ft_iter_node(iter);
+	if (!found || to_test_node(found)->key != 0x0F) {
+		fprintf(stderr, "relational_gap: le(0x80) key %" PRIu64 "\n",
+			found ? to_test_node(found)->key : (uint64_t)-1);
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* ge(0x80) -> 0xF0 */
+	cds_ft_u64_to_key(ft, 0x80, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	s = cds_ft_lookup_ge(ft, iter);
+	if (s != CDS_FT_STATUS_OK) { rcu_read_unlock(); goto fail; }
+	found = cds_ft_iter_node(iter);
+	if (!found || to_test_node(found)->key != 0xF0) {
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* gt(0x0F) -> 0xF0 */
+	cds_ft_u64_to_key(ft, 0x0F, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	s = cds_ft_lookup_gt(ft, iter);
+	if (s != CDS_FT_STATUS_OK) { rcu_read_unlock(); goto fail; }
+	found = cds_ft_iter_node(iter);
+	if (!found || to_test_node(found)->key != 0xF0) {
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* lt(0xF0) -> 0x0F */
+	cds_ft_u64_to_key(ft, 0xF0, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	s = cds_ft_lookup_lt(ft, iter);
+	if (s != CDS_FT_STATUS_OK) { rcu_read_unlock(); goto fail; }
+	found = cds_ft_iter_node(iter);
+	if (!found || to_test_node(found)->key != 0x0F) {
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * Insert single-bit-set keys (1,2,4,...,128) then fill remaining
+ * values. The initial sparse bit-position coverage creates the
+ * maximally spread population for pool bit-selection, then
+ * gradual fill forces transitions under non-sequential growth.
+ */
+static int test_adversarial_power_of_two_stride(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	unsigned int nr_keys = 0;
+	unsigned long ft_count;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 8; i++) {
+		struct ft_test_node *n = node_alloc((0x11 << 8) | (1 << i));
+
+		rcu_read_lock();
+		if (insert_u64(ft, (0x11 << 8) | (1 << i), n) < 0) {
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+		nr_keys++;
+	}
+
+	for (i = 0; i < 256; i++) {
+		if (i != 0 && (i & (i - 1)) == 0)
+			continue;
+		{
+			struct ft_test_node *n = node_alloc((0x11 << 8) | i);
+
+			rcu_read_lock();
+			if (insert_u64(ft, (0x11 << 8) | i, n) < 0) {
+				rcu_read_unlock();
+				cds_ft_iter_destroy(iter);
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+			rcu_read_unlock();
+			nr_keys++;
+		}
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != nr_keys) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	if (verify_2byte_order(ft, iter, nr_keys) < 0) {
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * 256 variable-length keys sharing a common suffix {0xFF,0xDE,0xAD}
+ * but differing at byte 0. Since the trie indexes MSB-first, shared
+ * suffixes cause early divergence, creating a wide, shallow trie
+ * (256 children at the root node).
+ */
+static int test_adversarial_shared_suffix(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	unsigned long ft_count;
+	int ret = -1;
+
+	ft = create_varlen_ft(&group);
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 256; i++) {
+		uint8_t key[4] = { (uint8_t)i, 0xFF, 0xDE, 0xAD };
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		if (insert_raw(ft, key, 4, n) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 256) goto out;
+
+	if (verify_varlen_order(ft, iter, 256) < 0) goto out;
+
+	rcu_read_lock();
+	{
+		uint8_t key[4] = { 0x42, 0xFF, 0xDE, 0xAD };
+		struct cds_ft_node *found;
+		enum cds_ft_status s;
+
+		s = cds_ft_lookup_key(ft, key, 4, &found);
+		if (s != CDS_FT_STATUS_OK || !found ||
+		    to_test_node(found)->key != 0x42) {
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Deep prefix chain (lengths 1..16, all bytes 0xCC) with intermediate
+ * nodes (lengths 5..10) removed. Tests longest-match lookup across
+ * gaps in the external node population.
+ */
+static int test_adversarial_longest_match_gaps(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+	unsigned int i;
+	uint8_t key[16];
+	struct ft_test_node *nodes[16];
+	int ret = -1;
+
+	memset(key, 0xCC, sizeof(key));
+
+	ft = create_varlen_ft(&group);
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 16; i++) {
+		nodes[i] = node_alloc(i + 1);
+		nodes[i]->value = i + 1;
+		rcu_read_lock();
+		s = insert_raw(ft, key, i + 1, nodes[i]);
+		rcu_read_unlock();
+		if (s < 0) goto out;
+	}
+
+	/* Remove keys of length 5..10 (indices 4..9). */
+	for (i = 4; i <= 9; i++) {
+		rcu_read_lock();
+		s = remove_raw(ft, iter, key, i + 1, nodes[i]);
+		rcu_read_unlock();
+		if (s < 0) goto out;
+		node_free_rcu(nodes[i]);
+		nodes[i] = NULL;
+	}
+	rcu_barrier();
+
+	/* longest_match(key, 16) should find at length 16. */
+	rcu_read_lock();
+	{
+		struct cds_ft_node *found;
+		size_t match_len;
+
+		s = cds_ft_lookup_longest_match_key(ft, key, 16, &match_len, &found);
+		if (s != CDS_FT_STATUS_OK || match_len != 16 || !found) {
+			fprintf(stderr, "longest_match_gaps: full: status=%s, len=%zu\n",
+				cds_ft_status_to_string(s), match_len);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+
+	/*
+	 * longest_match(key, 7): external nodes at 5-7 removed, so
+	 * the result should either be INTERNAL_MATCH (structure exists
+	 * but no external node) or OK at the nearest ancestor (len <= 4).
+	 */
+	rcu_read_lock();
+	{
+		struct cds_ft_node *found;
+		size_t match_len;
+
+		s = cds_ft_lookup_longest_match_key(ft, key, 7, &match_len, &found);
+		if (s < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		if (s == CDS_FT_STATUS_OK && match_len > 4) {
+			fprintf(stderr, "longest_match_gaps: len 7: found at %zu\n",
+				match_len);
+			rcu_read_unlock();
+			goto out;
+		}
+		/* INTERNAL_MATCH at 5..7 is also acceptable. */
+	}
+	rcu_read_unlock();
+
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Use insert_replace to overwrite the same key 128 times. Each
+ * replacement returns the previous node. Verifies the atomic
+ * replacement path under rapid churn.
+ */
+static int test_adversarial_replace_churn(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_node *old_node;
+	enum cds_ft_status s;
+	unsigned int i;
+	uint8_t k[8];
+	unsigned long ft_count;
+
+	cds_ft_u64_to_key(ft, 0xBEEF, k, CDS_FT_LEN_DEFAULT);
+
+	{
+		struct ft_test_node *n = node_alloc(0xBEEF);
+
+		n->value = 0;
+		rcu_read_lock();
+		s = cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n->node);
+		rcu_read_unlock();
+		if (s < 0) {
+			node_free(n);
+			cds_ft_destroy(ft);
+			cds_ft_group_destroy(group);
+			return -1;
+		}
+	}
+
+	for (i = 1; i <= 128; i++) {
+		struct ft_test_node *n = node_alloc(0xBEEF);
+
+		n->value = i;
+		rcu_read_lock();
+		s = cds_ft_insert_replace(ft, k, CDS_FT_LEN_DEFAULT,
+					  &n->node, &old_node);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_DUPLICATE_FOUND || !old_node) {
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		node_free_rcu(to_test_node(old_node));
+	}
+	rcu_barrier();
+
+	rcu_read_lock();
+	ft_count = cds_ft_count(ft);
+	rcu_read_unlock();
+	if (ft_count != 1) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_lock();
+	{
+		struct cds_ft_node *found;
+
+		s = cds_ft_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, &found);
+		if (s != CDS_FT_STATUS_OK || !found ||
+		    to_test_node(found)->value != 128) {
+			rcu_read_unlock();
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -5853,6 +7460,28 @@ int main(int argc, char **argv)
 	RUN_TEST(test_for_each_entry_with_duplicates);
 	RUN_TEST(test_iter_set_key_path_invalidation);
 	RUN_TEST(test_show_smoke);
+
+	/* 11. Adversarial key & per-node distribution tests */
+	diag("Adversarial key & per-node distribution tests");
+	RUN_TEST(test_adversarial_ramp_all_configs);
+	RUN_TEST(test_adversarial_single_bit_cluster);
+	RUN_TEST(test_adversarial_same_nibble_cluster);
+	RUN_TEST(test_adversarial_two_bit_cluster);
+	RUN_TEST(test_adversarial_transition_oscillation);
+	RUN_TEST(test_adversarial_sparse_removal);
+	RUN_TEST(test_adversarial_boundary_bytes);
+	RUN_TEST(test_adversarial_prefix_nesting);
+	RUN_TEST(test_adversarial_mass_duplicates);
+	RUN_TEST(test_adversarial_alternating_bits);
+	RUN_TEST(test_adversarial_max_depth);
+	RUN_TEST(test_adversarial_reverse_insert_order);
+	RUN_TEST(test_adversarial_xor_scramble_order);
+	RUN_TEST(test_adversarial_interleaved_grow);
+	RUN_TEST(test_adversarial_relational_gap);
+	RUN_TEST(test_adversarial_power_of_two_stride);
+	RUN_TEST(test_adversarial_shared_suffix);
+	RUN_TEST(test_adversarial_longest_match_gaps);
+	RUN_TEST(test_adversarial_replace_churn);
 
 	rcu_barrier();
 	rcu_unregister_thread();
