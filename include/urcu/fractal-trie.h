@@ -179,6 +179,18 @@
  * cds_ft_iter_invalidate_path() — the path is discarded
  * automatically after each operation.
  *
+ * Debug validation (URCU_FRACTAL_TRIE_DEBUG_PATH):
+ *
+ * Building with URCU_FRACTAL_TRIE_DEBUG_PATH defined enables run-time
+ * detection of stale cached paths.  Each path population records an RCU
+ * grace-period snapshot (via the flavor's
+ * update_start_poll_synchronize_rcu); each path consumption polls it
+ * (via update_poll_state_synchronize_rcu).  If a full grace period has
+ * elapsed since the path was populated, the cached pointers may
+ * reference freed memory — the program aborts with a diagnostic.
+ * Since struct cds_ft_iter is opaque, this option does not affect the
+ * application ABI — only the library needs to be rebuilt.
+ *
  * CDS_FT_ITER_PATH_UNCACHED:
  *
  * The iterator automatically discards the traversal path after each

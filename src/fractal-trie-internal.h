@@ -239,4 +239,49 @@ int ft_debug_counters(void)
 # define CDS_FT_ASSERT_RCU_READ_LOCKED(ft) do { } while (0)
 #endif
 
+/*
+ * URCU_FRACTAL_TRIE_DEBUG_PATH:
+ *
+ * Define this at build time to enable debug checks that detect use of
+ * an invalid cached iterator path.  When enabled, three complementary
+ * helpers track grace-period state inside the iterator:
+ *
+ *  iter_debug_path_snapshot() — unconditionally captures a fresh
+ *      grace-period poll state via the RCU flavor's
+ *      update_start_poll_synchronize_rcu.  Called once at the entry of
+ *      every fresh-population operation (lookup, longest-match lookup,
+ *      inequality lookup slow path and early exit).  Because it always
+ *      overwrites the snapshot, an iterator that is reused across
+ *      distinct RCU read-side critical sections gets a current baseline.
+ *
+ *  iter_debug_path_check() — polls the existing snapshot via the
+ *      flavor's update_poll_state_synchronize_rcu.  Called at
+ *      continuation entry points that consume a previously populated
+ *      cached path (inequality lookup fast path, replace, remove).  If
+ *      a full grace period has elapsed since the snapshot, the RCU
+ *      read-side lock must have been dropped and the cached path is
+ *      invalid — this is reported and abort() is called.
+ *
+ *  iter_debug_path_update() — invalidates the snapshot when the path
+ *      becomes invalid (node not found / end of traversal).  It never
+ *      captures a new snapshot; the one taken at the operation's entry
+ *      persists as long as the path remains valid, giving a tighter
+ *      detection window.
+ *
+ * The check is probabilistic in one direction: a false return from
+ * poll does not prove the lock was held continuously (the grace period
+ * may simply not have completed yet), but a true return is a definitive
+ * contract violation.  This makes the check useful as a debugging aid
+ * without introducing false positives.
+ *
+ * This option adds fields to struct cds_ft_iter, which is opaque to
+ * applications.  Only the library needs to be rebuilt; the application
+ * ABI is not affected.
+ *
+ * Requires liburcu >= 0.14 for the poll_state_synchronize_rcu APIs
+ * and a struct rcu_flavor_struct that provides
+ * update_start_poll_synchronize_rcu and
+ * update_poll_state_synchronize_rcu function pointers.
+ */
+
 #endif /* _URCU_FT_INTERNAL_H */

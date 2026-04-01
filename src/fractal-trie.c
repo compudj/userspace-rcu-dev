@@ -306,6 +306,11 @@ struct cds_ft_iter {
 	enum cds_ft_iter_path_mode path_mode;	/* Path caching mode. */
 	bool path_valid;		/* Whether this iterator has a valid path. */
 
+#ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
+	struct urcu_gp_poll_state gp_state;	/* GP snapshot when path was populated. */
+	bool gp_state_valid;			/* Whether gp_state holds a meaningful value. */
+#endif
+
 	/*
 	 * Keep a copy of each rcu_dereferenced nodes encountered within
 	 * traversal along with their associated keys, thus forming a
@@ -327,6 +332,123 @@ struct cds_ft_iter {
 	((uint8_t *)((iter)->data + ((iter)->ft->group->max_tree_depth * sizeof(struct cds_ft_inode_flag *))))
 
 /*
+ * Debug helpers for detecting stale cached iterator paths.
+ *
+ * Three entry-point roles mirror the rculfhash pattern:
+ *
+ *  iter_debug_path_snapshot() — unconditionally captures a fresh
+ *      grace-period poll state.  Called at the entry of every
+ *      fresh-population operation (lookup, longest-match lookup, and
+ *      the slow-path / early-exit branches of inequality lookup).
+ *      Because it always overwrites the snapshot, an iterator that is
+ *      reused across RCU read-side critical sections gets a current
+ *      baseline, preventing false positives on the next check.
+ *
+ *  iter_debug_path_check() — polls the existing snapshot.  Called at
+ *      continuation entry points that consume a previously populated
+ *      cached path (inequality fast-path, replace, remove).  If a full
+ *      grace period has elapsed since the snapshot was taken, the RCU
+ *      read-side lock must have been dropped and the cached pointers
+ *      may reference freed memory — the check aborts.
+ *
+ *  iter_debug_path_update() — invalidates the snapshot when the path
+ *      becomes invalid (node not found / end of traversal).  It never
+ *      captures a new snapshot; the one taken at the operation's entry
+ *      point persists as long as the path remains valid, giving a
+ *      tighter detection window.
+ *
+ *  iter_debug_path_clear() — unconditionally resets the snapshot
+ *      validity.  Used by iter_auto_invalidate_path() and by
+ *      operations that structurally modify the trie (replace, remove),
+ *      after which the cached path is stale regardless of RCU state.
+ */
+#ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
+
+/*
+ * Unconditionally capture a fresh grace-period snapshot.  Called at
+ * the entry of fresh-population operations so that any prior stale
+ * state left by iterator reuse is replaced.
+ */
+static inline
+void iter_debug_path_snapshot(struct cds_ft_iter *iter)
+{
+	const struct rcu_flavor_struct *flavor = iter->ft->group->flavor;
+
+	iter->gp_state = flavor->update_start_poll_synchronize_rcu();
+	iter->gp_state_valid = true;
+}
+
+/*
+ * Validate that the RCU read-side lock has been held continuously
+ * since the snapshot was captured.  Called at continuation entry
+ * points before reusing a cached path.
+ */
+static inline
+void iter_debug_path_check(const struct cds_ft_iter *iter)
+{
+	const struct rcu_flavor_struct *flavor = iter->ft->group->flavor;
+
+	if (iter->path_mode != CDS_FT_ITER_PATH_CACHED)
+		return;
+	if (!iter->path_valid)
+		return;
+	if (!iter->gp_state_valid)
+		return;
+	if (caa_unlikely(flavor->update_poll_state_synchronize_rcu(
+				iter->gp_state))) {
+		fprintf(stderr,
+			"[Fatal] Fractal Trie: cached iterator path "
+			"used after a grace period elapsed (RCU "
+			"read-side lock was likely dropped). "
+			"%s:%d\n", __FILE__, __LINE__);
+		abort();
+	}
+}
+
+/*
+ * Update the snapshot validity after populating the iterator.  When
+ * the path is no longer valid (node not found or end of traversal),
+ * clear the snapshot so that any subsequent misuse is detected by
+ * iter_debug_path_check.  When the path is valid, the grace-period
+ * snapshot captured by iter_debug_path_snapshot at the operation's
+ * entry point remains current because the RCU read-side lock must be
+ * held continuously.
+ */
+static inline
+void iter_debug_path_update(struct cds_ft_iter *iter)
+{
+	if (!iter->path_valid)
+		iter->gp_state_valid = false;
+}
+
+static inline
+void iter_debug_path_clear(struct cds_ft_iter *iter)
+{
+	iter->gp_state_valid = false;
+}
+#else
+static inline
+void iter_debug_path_snapshot(struct cds_ft_iter *iter __attribute__((unused)))
+{
+}
+
+static inline
+void iter_debug_path_check(const struct cds_ft_iter *iter __attribute__((unused)))
+{
+}
+
+static inline
+void iter_debug_path_update(struct cds_ft_iter *iter __attribute__((unused)))
+{
+}
+
+static inline
+void iter_debug_path_clear(struct cds_ft_iter *iter __attribute__((unused)))
+{
+}
+#endif
+
+/*
  * Discard the cached path if the iterator is in uncached mode.
  * Called at the end of each public iterator-based operation.
  * Preserves iter->node so the caller can read the result.
@@ -337,6 +459,7 @@ void iter_auto_invalidate_path(struct cds_ft_iter *iter)
 	if (iter->path_mode == CDS_FT_ITER_PATH_UNCACHED) {
 		iter->path_valid = false;
 		iter->path_len = 0;
+		iter_debug_path_clear(iter);
 	}
 }
 
@@ -2639,6 +2762,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	node_flag = rcu_dereference(ft->root);
 
 	if (iter) {
+		iter_debug_path_snapshot(iter);
 		iter_path_node(iter)[0] = node_flag;
 		iter_path_len = 1;
 	}
@@ -2757,6 +2881,7 @@ end:
 		 * exact key was not found.
 		 */
 		iter->path_valid = (status == CDS_FT_STATUS_OK);
+		iter_debug_path_update(iter);
 		iter_auto_invalidate_path(iter);
 	}
 	if (track) {
@@ -2872,6 +2997,7 @@ enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 	iter->path_len = longest_len + 1;
 	iter->status = match_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_INTERNAL_MATCH;
 	iter->path_valid = true;
+	iter_debug_path_snapshot(iter);
 end:
 	iter_auto_invalidate_path(iter);
 	return iter->status;
@@ -2918,6 +3044,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		if (!valid_key_len(ft, key_len)) {
 			iter->node = NULL;
 			iter->path_valid = false;
+			iter_debug_path_update(iter);
 			iter->status = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 			goto end;
 		}
@@ -2977,6 +3104,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			if (!uatomic_load(&metadata->external_nodes, CMM_RELAXED)) {
 				iter->node = NULL;
 				iter->path_valid = true;
+				iter_debug_path_snapshot(iter);
 				iter->path_len = 1;
 				iter->status = CDS_FT_STATUS_NOT_FOUND;
 				goto end;
@@ -2992,6 +3120,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 * the downward walk).  The caller must hold the RCU read-side
 	 * lock continuously for the cached pointers to remain valid.
 	 */
+	iter_debug_path_check(iter);
 	if (iter->path_valid && (ssize_t)iter->path_len >= key_depth &&
 			key_depth > 1) {
 		for (level = 1; level < key_depth; level++) {
@@ -3057,6 +3186,15 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			break;
 	}
 
+	/*
+	 * The slow-path traversal has freshly populated the iterator
+	 * path.  Capture a grace-period snapshot so that subsequent
+	 * check() calls can validate this new path.  The fast path
+	 * (goto post_traversal above) skips this: its cached path was
+	 * already validated by iter_debug_path_check().
+	 */
+	iter_debug_path_snapshot(iter);
+
 post_traversal:
 	switch (mode) {
 	case FT_LOOKUP_LE:
@@ -3079,6 +3217,7 @@ post_traversal:
 				memcpy(iter_key(iter), input_key, key_len);
 				iter->node = external_nodes;
 				iter->path_valid = true;
+				iter_debug_path_update(iter);
 				iter->path_len = level + 1;
 				iter->status = CDS_FT_STATUS_OK;
 				goto end;
@@ -3169,6 +3308,7 @@ post_traversal:
 					iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
 				iter->node = external_nodes;
 				iter->path_valid = true;
+				iter_debug_path_update(iter);
 				iter->path_len = level + 1;
 				iter->status = CDS_FT_STATUS_OK;
 				goto end;
@@ -3245,6 +3385,7 @@ post_traversal:
 						iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
 					iter->node = external_nodes;
 					iter->path_valid = true;
+					iter_debug_path_update(iter);
 					iter->path_len = iter->prefix_len + 1;
 					iter->status = CDS_FT_STATUS_OK;
 					goto end;
@@ -3253,6 +3394,7 @@ post_traversal:
 		}
 		iter->node = NULL;
 		iter->path_valid = true;
+		iter_debug_path_update(iter);
 		iter->path_len = iter->prefix_len + 1;
 		iter->status = CDS_FT_STATUS_NOT_FOUND;
 		goto end;
@@ -3268,6 +3410,7 @@ descend_children:
 			iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
 		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
 		iter->path_valid = true;
+		iter_debug_path_update(iter);
 		iter->path_len = level + 1;
 		iter->status = CDS_FT_STATUS_OK;
 		goto end;
@@ -3336,6 +3479,7 @@ descend_children:
 		if (caa_unlikely(!ft_node_ptr(node_flag))) {
 			iter->node = NULL;
 			iter->path_valid = true;
+			iter_debug_path_update(iter);
 			iter->path_len = level;
 			iter->status = CDS_FT_STATUS_NOT_FOUND;
 			goto end;
@@ -3364,6 +3508,7 @@ found_minmax:
 			iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
 		iter->node = ret_node;
 		iter->path_valid = true;
+		iter_debug_path_update(iter);
 		iter->path_len = level + 1;
 		iter->status = ret_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 	}
@@ -3977,6 +4122,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	 */
 	if (iter->path_valid)
 		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+	iter_debug_path_check(iter);
 
 	if (!valid_external_node(old_node) || !valid_external_node(new_node)
 			|| !valid_key_len(ft, key_len))
@@ -4243,6 +4389,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 */
 	if (iter->path_valid)
 		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+	iter_debug_path_check(iter);
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -4381,6 +4528,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * cached path stale.
 	 */
 	iter->path_valid = false;
+	iter_debug_path_clear(iter);
 	iter->path_len = 0;
 
 	switch (ret) {
@@ -4410,6 +4558,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 */
 	if (iter->path_valid)
 		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+	iter_debug_path_check(iter);
 
 	if (!valid_key_len(ft, key_len)) {
 		*result_node = NULL;
@@ -4513,6 +4662,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	assert(ret != -ENOENT);
 
 	iter->path_valid = false;
+	iter_debug_path_clear(iter);
 	iter->path_len = 0;
 
 	if (ret)
@@ -5724,6 +5874,7 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 	if (!subset) {
 		memcpy(iter_key(iter), key, key_len);
 		iter->path_valid = false;
+		iter_debug_path_clear(iter);
 		iter->path_len = 0;
 	} else {
 		iter->path_len = key_len + 1;
@@ -5747,6 +5898,7 @@ enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t p
 void cds_ft_iter_reset(struct cds_ft_iter *iter)
 {
 	iter->path_valid = false;
+	iter_debug_path_clear(iter);
 	iter->status = CDS_FT_STATUS_OK;
 	iter->path_len = 0;
 	iter->key_len = 0;
@@ -5766,6 +5918,7 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 void cds_ft_iter_invalidate_path(struct cds_ft_iter *iter)
 {
 	iter->path_valid = false;
+	iter_debug_path_clear(iter);
 	iter->path_len = 0;
 	iter->node = NULL;
 }
@@ -5779,6 +5932,10 @@ void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 	dst->key_len = src->key_len;
 	dst->prefix_len = src->prefix_len;
 	dst->node = src->node;
+#ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
+	dst->gp_state = src->gp_state;
+	dst->gp_state_valid = src->gp_state_valid;
+#endif
 	memcpy(iter_path_node(dst), iter_path_node(src), src->path_len * sizeof(struct cds_ft_inode_flag *));
 	memcpy(iter_key(dst), iter_key(src), src->key_len);
 }
@@ -5802,6 +5959,7 @@ enum cds_ft_status cds_ft_iter_set_path_mode(struct cds_ft_iter *iter,
 		 */
 		if (iter->path_mode == CDS_FT_ITER_PATH_CACHED) {
 			iter->path_valid = false;
+			iter_debug_path_clear(iter);
 			iter->path_len = 0;
 		}
 		break;
