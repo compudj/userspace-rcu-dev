@@ -43,6 +43,15 @@ struct cds_ft_alloc_arena;
 
 static size_t page_size;
 
+struct cds_ft_metadata_alloc {
+	union {
+		struct rcu_head rcu_head;			/* For deferred node reclaim. */
+		struct cds_ft_metadata_alloc *free_list_next;	/* Free list next pointer. */
+	};
+	unsigned int alloc_index;
+	struct cds_ft_metadata metadata;
+};
+
 struct cds_ft_alloc_range {
 	struct cds_list_head node;		/* Linked list of ranges. */
 	struct cds_ft_alloc_arena *arena;	/* Backward reference to arena. */

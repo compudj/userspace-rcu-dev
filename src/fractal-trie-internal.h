@@ -103,21 +103,11 @@ struct cds_ft_inode_flag;
 struct cds_ft_inode;
 
 struct cds_ft_alloc_arena;
-struct cds_ft_metadata_alloc;
 
 struct cds_ft_metadata {
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
 	unsigned int nr_child;			/* Number of children in node. */
 	int fallback_removal_count;		/* Removals left keeping fallback. */
-};
-
-struct cds_ft_metadata_alloc {
-	union {
-		struct rcu_head rcu_head;			/* For deferred node reclaim. */
-		struct cds_ft_metadata_alloc *free_list_next;	/* Free list next pointer. */
-	};
-	unsigned int alloc_index;
-	struct cds_ft_metadata metadata;
 };
 
 struct cds_ft_bitmap {
