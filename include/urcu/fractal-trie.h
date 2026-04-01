@@ -705,14 +705,12 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * operations and while accessing the returned entry. See
  * cds_ft_for_each_rcu() for the locking rules for each path mode.
  */
-#define cds_ft_for_each_entry_rcu(ft, iter, pos, member)		\
-	for (cds_ft_lookup_first((ft), (iter)),				\
-			(pos) = cds_ft_entry(cds_ft_iter_node(iter),	\
-				__typeof__(*(pos)), member);		\
-			cds_ft_iter_node(iter) != NULL;			\
-			cds_ft_next((ft), (iter)),			\
-			(pos) = cds_ft_entry(cds_ft_iter_node(iter),	\
-				__typeof__(*(pos)), member))
+#define cds_ft_for_each_entry_rcu(ft, iter, pos, member)			\
+	for (cds_ft_lookup_first((ft), (iter));					\
+			cds_ft_iter_node(iter) != NULL ?			\
+				((pos) = cds_ft_entry(cds_ft_iter_node(iter),	\
+					__typeof__(*(pos)), member), 1) : 0;	\
+			cds_ft_next((ft), (iter)))
 
 /*
  * cds_ft_for_each_reverse_rcu - Iterate through all (or prefix-scoped) nodes in reverse key order.
@@ -757,14 +755,12 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * operations and while accessing the returned entry. See
  * cds_ft_for_each_rcu() for the locking rules for each path mode.
  */
-#define cds_ft_for_each_entry_reverse_rcu(ft, iter, pos, member)	\
-	for (cds_ft_lookup_last((ft), (iter)),				\
-			(pos) = cds_ft_entry(cds_ft_iter_node(iter),	\
-				__typeof__(*(pos)), member);		\
-			cds_ft_iter_node(iter) != NULL;			\
-			cds_ft_prev((ft), (iter)),			\
-			(pos) = cds_ft_entry(cds_ft_iter_node(iter),	\
-				__typeof__(*(pos)), member))
+#define cds_ft_for_each_entry_reverse_rcu(ft, iter, pos, member)		\
+	for (cds_ft_lookup_last((ft), (iter));					\
+			cds_ft_iter_node(iter) != NULL ?			\
+				((pos) = cds_ft_entry(cds_ft_iter_node(iter),	\
+					__typeof__(*(pos)), member), 1) : 0;	\
+			cds_ft_prev((ft), (iter)))
 
 /*
  * Mutation API
