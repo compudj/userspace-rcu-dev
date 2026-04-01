@@ -13,6 +13,7 @@
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include <unistd.h>
 #include <urcu/rculfhash.h>
@@ -222,6 +223,20 @@ int ft_debug_counters(void)
 {
 	return 0;
 }
+#endif
+
+#ifdef URCU_FRACTAL_TRIE_DEBUG_LOCKING
+# define CDS_FT_ASSERT_RCU_READ_LOCKED(ft)                                     \
+	do {                                                                   \
+		if (caa_unlikely(!(ft)->group->flavor->read_ongoing())) {      \
+			fprintf(stderr, "[Fatal] Fractal Trie API violation: " \
+					"RCU read-side lock not held at "      \
+					"%s:%d\n", __FILE__, __LINE__);        \
+			abort();                                               \
+		}                                                              \
+	} while (0)
+#else
+# define CDS_FT_ASSERT_RCU_READ_LOCKED(ft) do { } while (0)
 #endif
 
 #endif /* _URCU_FT_INTERNAL_H */

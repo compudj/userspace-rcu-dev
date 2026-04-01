@@ -2614,6 +2614,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	size_t match_len = track_longest ? FT_MATCH_LEN_NONE : 0;
 	struct cds_ft_node *match_node = NULL;
 
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
 	if (!valid_key_len(ft, key_len)) {
 		status = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 		goto end;
@@ -2889,6 +2891,8 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len;
 	bool going_up = false, skip_eq_external_nodes;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	switch (limit) {
 	case FT_LOOKUP_LIMIT_NONE:
@@ -3947,6 +3951,13 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 
+	/*
+	 * If the iterator has a valid path, the RCU read-side lock must
+	 * be held.
+	 */
+	if (iter->path_valid)
+		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
 	if (!valid_external_node(old_node) || !valid_external_node(new_node)
 			|| !valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -4205,6 +4216,13 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 
+	/*
+	 * If the iterator has a valid path, the RCU read-side lock must
+	 * be held.
+	 */
+	if (iter->path_valid)
+		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 
@@ -4364,6 +4382,13 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	int nr_snapshot, ret;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
+
+	/*
+	 * If the iterator has a valid path, the RCU read-side lock must
+	 * be held.
+	 */
+	if (iter->path_valid)
+		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	if (!valid_key_len(ft, key_len)) {
 		*result_node = NULL;
@@ -5108,11 +5133,19 @@ enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordin
 
 bool cds_ft_empty(struct cds_ft *ft)
 {
-	struct cds_ft_inode_flag *root_flag = rcu_dereference(ft->root);
-	struct cds_ft_inode *root_node = ft_node_ptr(root_flag);
-	unsigned int type_idx = ft_node_type(root_flag);
-	const struct cds_ft_type *type = &ft_types[type_idx];
-	struct cds_ft_metadata *rmeta = cds_ft_item_to_metadata(root_node);
+	struct cds_ft_inode_flag *root_flag;
+	struct cds_ft_inode *root_node;
+	unsigned int type_idx;
+	const struct cds_ft_type *type;
+	struct cds_ft_metadata *rmeta;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	root_flag = rcu_dereference(ft->root);
+	root_node = ft_node_ptr(root_flag);
+	type_idx = ft_node_type(root_flag);
+	type = &ft_types[type_idx];
+	rmeta = cds_ft_item_to_metadata(root_node);
 
 	/*
 	 * As a root node special-case, only a type-0 linear node with
@@ -5130,6 +5163,8 @@ unsigned long cds_ft_count(struct cds_ft *ft)
 	struct cds_ft_iter *iter;
 	enum cds_ft_status status;
 	unsigned long count = 0;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	status = cds_ft_iter_create(ft, &iter);
 	if (status != CDS_FT_STATUS_OK)
