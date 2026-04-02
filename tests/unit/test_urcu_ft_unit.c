@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 118
+#define NR_TESTS 121
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -1213,6 +1213,199 @@ static int test_count_keys_empty(void)
 
 		return ret;
 	}
+}
+
+/*
+ * cds_ft_count_keys_prefix: count keys under a prefix in a varlen trie.
+ * Insert keys at "aa", "ab", "ac", "ba", verify prefix "a" returns 3,
+ * prefix "b" returns 1, prefix "" returns 4, non-existent prefix returns 0.
+ */
+static int test_count_keys_prefix_basic(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct ft_test_node *n1 = node_alloc(0);
+	struct ft_test_node *n2 = node_alloc(0);
+	struct ft_test_node *n3 = node_alloc(0);
+	struct ft_test_node *n4 = node_alloc(0);
+	unsigned long count;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+
+	rcu_read_lock();
+	s = cds_ft_insert(ft, (const uint8_t *)"aa", 2, &n1->node);
+	if (s < 0) goto fail;
+	s = cds_ft_insert(ft, (const uint8_t *)"ab", 2, &n2->node);
+	if (s < 0) goto fail;
+	s = cds_ft_insert(ft, (const uint8_t *)"ac", 2, &n3->node);
+	if (s < 0) goto fail;
+	s = cds_ft_insert(ft, (const uint8_t *)"ba", 2, &n4->node);
+	if (s < 0) goto fail;
+
+	/* Empty prefix: all keys. */
+	count = cds_ft_count_keys_prefix(ft, NULL, 0);
+	if (count != 4) {
+		fprintf(stderr, "prefix_basic: empty prefix count %lu, expected 4\n", count);
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Prefix "a": keys aa, ab, ac. */
+	count = cds_ft_count_keys_prefix(ft, (const uint8_t *)"a", 1);
+	if (count != 3) {
+		fprintf(stderr, "prefix_basic: prefix 'a' count %lu, expected 3\n", count);
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Prefix "b": key ba. */
+	count = cds_ft_count_keys_prefix(ft, (const uint8_t *)"b", 1);
+	if (count != 1) {
+		fprintf(stderr, "prefix_basic: prefix 'b' count %lu, expected 1\n", count);
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Prefix "ab": exact key ab. */
+	count = cds_ft_count_keys_prefix(ft, (const uint8_t *)"ab", 2);
+	if (count != 1) {
+		fprintf(stderr, "prefix_basic: prefix 'ab' count %lu, expected 1\n", count);
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Non-existent prefix "c". */
+	count = cds_ft_count_keys_prefix(ft, (const uint8_t *)"c", 1);
+	if (count != 0) {
+		fprintf(stderr, "prefix_basic: prefix 'c' count %lu, expected 0\n", count);
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_unlock();
+
+	return drain_and_destroy(ft, group);
+
+fail:
+	fprintf(stderr, "prefix_basic: insert failed: %s\n",
+		cds_ft_status_to_string(s));
+	rcu_read_unlock();
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_count_keys_prefix with duplicates: duplicates at the same key
+ * do not inflate the prefix key count.
+ */
+static int test_count_keys_prefix_duplicates(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct ft_test_node *n1 = node_alloc(0);
+	struct ft_test_node *n2 = node_alloc(0);
+	struct ft_test_node *n3 = node_alloc(0);
+	unsigned long count;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+
+	rcu_read_lock();
+	s = cds_ft_insert(ft, (const uint8_t *)"xy", 2, &n1->node);
+	if (s < 0) goto fail;
+	s = cds_ft_insert(ft, (const uint8_t *)"xy", 2, &n2->node);
+	if (s < 0) goto fail;
+	s = cds_ft_insert(ft, (const uint8_t *)"xy", 2, &n3->node);
+	if (s < 0) goto fail;
+
+	count = cds_ft_count_keys_prefix(ft, (const uint8_t *)"x", 1);
+	rcu_read_unlock();
+	if (count != 1) {
+		fprintf(stderr, "prefix_duplicates: prefix 'x' count %lu, expected 1\n", count);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	return drain_and_destroy(ft, group);
+
+fail:
+	fprintf(stderr, "prefix_duplicates: insert failed: %s\n",
+		cds_ft_status_to_string(s));
+	rcu_read_unlock();
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_count_keys_prefix on a fixed-length trie using integer keys.
+ */
+static int test_count_keys_prefix_fixed(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	unsigned long i, count;
+
+	/* Insert 256 keys: 0x00000000 .. 0x000000FF. */
+	for (i = 0; i < 256; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "prefix_fixed: insert %lu failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+	}
+
+	rcu_read_lock();
+	/* Empty prefix: all 256 keys. */
+	count = cds_ft_count_keys_prefix(ft, NULL, 0);
+	if (count != 256) {
+		fprintf(stderr, "prefix_fixed: empty prefix %lu, expected 256\n", count);
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/*
+	 * 1-byte prefix: all 256 keys share the same first 3 bytes
+	 * (big-endian 0x00000000..0x000000FF), so a 1-byte prefix
+	 * of 0x00 should match all 256.
+	 */
+	{
+		uint8_t prefix[1] = { 0x00 };
+
+		count = cds_ft_count_keys_prefix(ft, prefix, 1);
+		if (count != 256) {
+			fprintf(stderr, "prefix_fixed: 1-byte 0x00 prefix %lu, expected 256\n", count);
+			rcu_read_unlock();
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+
+	/* A 1-byte prefix of 0x01 should match nothing. */
+	{
+		uint8_t prefix[1] = { 0x01 };
+
+		count = cds_ft_count_keys_prefix(ft, prefix, 1);
+		if (count != 0) {
+			fprintf(stderr, "prefix_fixed: 1-byte 0x01 prefix %lu, expected 0\n", count);
+			rcu_read_unlock();
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+
+	return drain_and_destroy(ft, group);
 }
 
 /* ================================================================== */
@@ -8467,6 +8660,9 @@ int main(int argc, char **argv)
 	RUN_TEST(test_count_keys_remove_all);
 	RUN_TEST(test_count_keys_replace);
 	RUN_TEST(test_count_keys_graft_detach);
+	RUN_TEST(test_count_keys_prefix_basic);
+	RUN_TEST(test_count_keys_prefix_duplicates);
+	RUN_TEST(test_count_keys_prefix_fixed);
 
 	/* 3. Lookup variants */
 	diag("Lookup variant tests");

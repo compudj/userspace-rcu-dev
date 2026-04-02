@@ -5500,16 +5500,42 @@ bool cds_ft_empty(struct cds_ft *ft)
 	return !uatomic_load(&rmeta->external_nodes, CMM_RELAXED);
 }
 
-unsigned long cds_ft_count_keys(struct cds_ft *ft)
+unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
+		const uint8_t *prefix, size_t prefix_len)
 {
-	struct cds_ft_inode_flag *root_flag;
-	struct cds_ft_metadata *rmeta;
+	struct cds_ft_inode_flag *node_flag;
+	unsigned int i;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
-	root_flag = rcu_dereference(ft->root);
-	rmeta = cds_ft_item_to_metadata(ft_node_ptr(root_flag));
-	return rmeta->nr_keys;
+	if (prefix_len > ft->group->max_key_len)
+		return 0;
+
+	node_flag = rcu_dereference(ft->root);
+
+	for (i = 0; i < prefix_len; i++) {
+		uint8_t kv;
+
+		if (!ft_node_ptr(node_flag) || !ft_node_internal(node_flag))
+			return 0;
+		kv = key_to_ordinal(ft, prefix[i]);
+		node_flag = ft_node_get_nth(node_flag, NULL, kv);
+	}
+
+	if (!ft_node_ptr(node_flag))
+		return 0;
+	if (ft_node_internal(node_flag)) {
+		struct cds_ft_metadata *metadata =
+			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		return metadata->nr_keys;
+	}
+	/* External node: one key (possibly with duplicates). */
+	return 1;
+}
+
+unsigned long cds_ft_count_keys(struct cds_ft *ft)
+{
+	return cds_ft_count_keys_prefix(ft, NULL, 0);
 }
 
 unsigned long cds_ft_count_entries(struct cds_ft *ft)

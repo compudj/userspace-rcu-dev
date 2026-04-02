@@ -1251,6 +1251,23 @@ bool cds_ft_empty(struct cds_ft *ft);
 unsigned long cds_ft_count_keys(struct cds_ft *ft);
 
 /*
+ * cds_ft_count_keys_prefix - Return the number of unique keys under a prefix.
+ * @ft: The Fractal Trie.
+ * @prefix: The key prefix to count under.
+ * @prefix_len: Length of the prefix in bytes. Use 0 to count all keys
+ *              (equivalent to cds_ft_count_keys).
+ *
+ * Returns the number of distinct keys whose key starts with @prefix.
+ * This descends through the trie following the prefix bytes, then reads
+ * the subtree's propagated key counter.
+ *
+ * This function has O(prefix_len) time complexity. The RCU read-side
+ * lock must be held while calling this function.
+ */
+unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
+		const uint8_t *prefix, size_t prefix_len);
+
+/*
  * cds_ft_count_entries - Return the number of external nodes in a Fractal Trie.
  * @ft: The Fractal Trie.
  *
