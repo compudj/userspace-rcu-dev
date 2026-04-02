@@ -3651,59 +3651,126 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
  * expected, potentially yielding NOT_FOUND for a key that should be
  * reachable at that rank.
  *
- * Insert ordering: publish pointer, then increment nr_keys.
+ * Update ordering:
  *
- *   Writer:
- *     W1: rcu_assign_pointer(child, new_node)  [store-release]
- *     W2: uatomic_store(ancestor.nr_keys, ++, CMM_RELEASE)
+ *   Insert: publish pointer (rcu_assign_pointer), then increment
+ *           nr_keys (uatomic_store CMM_RELEASE).
+ *   Remove: decrement nr_keys (uatomic_store CMM_RELEASE), then
+ *           detach pointer (rcu_assign_pointer).
  *
- *   W2 release ensures W1 is visible when W2 becomes visible.
+ * Read-side patterns:
  *
- *   Reader (count-based):
- *     R1: uatomic_load(ancestor.nr_keys, CMM_ACQUIRE)
- *     R2: ft_dereference_acquire(child)         [load-acquire]
+ * Count-based readers traverse the trie both downward and upward.
+ * The read-side ordering of nr_keys vs pointer loads depends on
+ * the traversal pattern, and each pattern interacts differently
+ * with the insert and remove orderings.  Three distinct patterns
+ * arise:
  *
- *   Pairing:  If R1 sees the incremented nr_keys (from W2), the
- *   R1 acquire pairs with the W2 release.  All stores before W2
- *   (including W1, the pointer publication) are visible to R1.
- *   Since R2 is ordered after R1 (by R1 acquire), R2 sees the
- *   published pointer.
+ * Pattern 1 — child pointer, then child's nr_keys
+ *             (downward descent + upward walk):
  *
- *   If R1 sees the old nr_keys (W2 not yet visible), the reader
- *   does not know about the new key.  It skips the subtree —
- *   undercount.
+ *   Reader:
+ *     R1: ft_dereference_acquire(child)        [load-acquire on parent's slot]
+ *     R2: uatomic_load(child.nr_keys, CMM_ACQUIRE)
  *
- * Remove ordering: decrement nr_keys, then detach pointer.
+ *   This is the standard message-passing order.  It occurs whenever
+ *   the reader loads a child pointer from a parent node and then
+ *   reads the child's own nr_keys (ft_child_key_count).  This
+ *   happens in both the downward descent of lookup_nth and the
+ *   upward walk of skip when iterating sibling subtrees.
  *
- *   Writer:
- *     W1: uatomic_store(ancestor.nr_keys, --, CMM_RELEASE)
- *     W2: rcu_assign_pointer(child, NULL)       [store-release]
+ *   Insert:  The new node's nr_keys is initialized before it is
+ *     published via rcu_assign_pointer.  If R1 sees the new child
+ *     (acquire pairs with the publish release), R2 sees the
+ *     initial nr_keys.  If R1 sees NULL (not yet published), the
+ *     reader skips — undercount.
  *
- *   W2 release ensures W1 is visible when W2 becomes visible.
+ *   Remove:  The writer decrements the child's nr_keys before
+ *     detaching a deeper pointer.  At this level the child pointer
+ *     itself is unchanged, so R1 always sees the child.  R2 sees
+ *     either old or decremented nr_keys — both <= actual.
+ *     Undercount holds trivially.
  *
- *   Reader (count-based):
- *     R1: uatomic_load(ancestor.nr_keys, CMM_ACQUIRE)
- *     R2: ft_dereference_acquire(child)         [load-acquire]
+ * Pattern 2 — external_nodes, then child pointers
+ *             (downward descent only):
  *
- *   Pairing:  If R2 sees the detached pointer (NULL from W2), the
- *   R2 acquire pairs with the W2 release.  All stores before W2
- *   (including W1, the nr_keys decrement) are visible.  The key
- *   question is whether R1 also sees W1.  On multi-copy-atomic
- *   architectures (x86 TSO, ARMv8), the R1 acquire orders R1
- *   before R2, and the coherence guarantee ensures R1 observes
- *   at least the state that was globally visible when R2's value
- *   was stored — which includes W1.
+ *   Reader:
+ *     R1: ft_dereference_acquire(metadata->external_nodes)
+ *     R2: ft_dereference_acquire(child)
  *
- *   If R2 sees the old pointer (child still present), the key is
- *   still reachable.  The reader may or may not see the
- *   decremented nr_keys — either way nr_keys <= actual
- *   (undercount).
+ *   At each internal node during downward descent, the reader
+ *   first checks external_nodes (keys at this depth), then
+ *   iterates children.  Both fields belong to the same node.
  *
- *   If R1 sees the decremented nr_keys but R2 sees the old pointer
- *   (child still present), nr_keys < actual — undercount.
+ *   Insert (setting external_nodes):  The writer does
+ *     rcu_assign_pointer(external_nodes, node) then increments
+ *     ancestor nr_keys.  R1 acquire pairs with the publish
+ *     release — if the reader sees the new external_nodes, the
+ *     key is found.  If not, undercount.
  *
- * In summary, regardless of which combination of old/new values
- * the reader observes, nr_keys <= actual reachable keys.
+ *   Remove (clearing external_nodes):  The writer decrements
+ *     nr_keys then rcu_assign_pointer(external_nodes, NULL).
+ *     If R1 sees NULL, the acquire pairs with the release,
+ *     making the nr_keys decrement visible to subsequent reads.
+ *     If R1 sees the old external_nodes, the key is still
+ *     reachable — consistent pre-remove snapshot.
+ *
+ * Pattern 3 — current node's nr_keys, then child pointers
+ *             (skip_forward at_external_nodes case only):
+ *
+ *   Reader:
+ *     R1: uatomic_load(node.nr_keys, CMM_ACQUIRE)
+ *     R2: ft_dereference_acquire(child)
+ *
+ *   This inverted message-passing order occurs only in
+ *   skip_forward when the current position is at an internal
+ *   node's external_nodes: the reader reads the node's nr_keys
+ *   to count remaining keys in the subtree, then iterates
+ *   children.
+ *
+ *   Insert:
+ *     Writer:
+ *       W1: rcu_assign_pointer(child, new_node)  [store-release]
+ *       W2: uatomic_store(node.nr_keys, ++, CMM_RELEASE)
+ *     W2 release ensures W1 is visible when W2 becomes visible.
+ *     If R1 sees the incremented nr_keys (acquire pairs with
+ *     W2 release), all stores before W2 — including W1 — are
+ *     visible.  R2 is ordered after R1 (by R1 acquire), so R2
+ *     sees the published pointer.
+ *     If R1 sees the old nr_keys, the reader does not know about
+ *     the new key — undercount.
+ *
+ *   Remove:
+ *     Writer:
+ *       W1: uatomic_store(node.nr_keys, --, CMM_RELEASE)
+ *       W2: rcu_assign_pointer(child, NULL)      [store-release]
+ *     W2 release ensures W1 is visible when W2 becomes visible.
+ *     If R2 sees the detached pointer (acquire pairs with W2
+ *     release), W1 is visible.  On multi-copy-atomic
+ *     architectures (x86 TSO, ARMv8), R1 acquire orders R1
+ *     before R2, and the coherence guarantee ensures R1 observes
+ *     at least the state that was globally visible when R2's
+ *     value was stored — which includes W1.  So R1 sees the
+ *     decremented nr_keys.
+ *     If R2 sees the old pointer (child still present), the key
+ *     is still reachable.  nr_keys may be old or decremented —
+ *     either way <= actual (undercount).
+ *     If R1 sees the decremented nr_keys but R2 sees the old
+ *     pointer, nr_keys < actual — undercount.
+ *
+ * In all three patterns, regardless of which combination of
+ * old/new values the reader observes, nr_keys <= actual reachable
+ * keys (undercount property).
+ *
+ * The ft_dereference_acquire macro (CMM_ACQUIRE rather than
+ * rcu_dereference) is specifically needed for Pattern 3's remove
+ * case, where the reader loads nr_keys before the pointer at the
+ * same level.  Without acquire on the pointer load, a weakly-
+ * ordered architecture could observe the detached pointer without
+ * the preceding nr_keys decrement, violating the undercount
+ * property.  Patterns 1 and 2 would be safe with rcu_dereference
+ * alone, but all patterns use ft_dereference_acquire uniformly
+ * for simplicity.
  */
 static
 void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
