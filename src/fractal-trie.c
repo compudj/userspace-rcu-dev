@@ -2440,7 +2440,8 @@ retry:		/* for fallback */
 		dbg_printf("Recompact inherit from %p\n", metadata);
 		if (metadata) {
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
-			new_metadata->nr_keys = metadata->nr_keys;
+			uatomic_store(&new_metadata->nr_keys,
+				metadata->nr_keys, CMM_RELAXED);
 		}
 		if (fallback)
 			new_metadata->fallback_removal_count =
@@ -3617,7 +3618,7 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 	for (i = 0; i < nr_snapshot; i++) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
-		m->nr_keys += delta;
+		uatomic_store(&m->nr_keys, m->nr_keys + delta, CMM_RELAXED);
 	}
 }
 
@@ -3690,7 +3691,7 @@ int ft_attach_node(struct cds_ft *ft,
 		{
 			struct cds_ft_metadata *branch_meta =
 				cds_ft_item_to_metadata(ft_node_ptr(iter_dest_node_flag));
-			branch_meta->nr_keys = 1;
+			uatomic_store(&branch_meta->nr_keys, 1, CMM_RELAXED);
 		}
 		created_nodes[nr_created_nodes++] = iter_dest_node_flag;
 		iter_node_flag = iter_dest_node_flag;
@@ -3702,7 +3703,8 @@ int ft_attach_node(struct cds_ft *ft,
 
 		iter_node_metadata = cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
 		iter_node_metadata->external_nodes = external_nodes;
-		iter_node_metadata->nr_keys += 1;
+		uatomic_store(&iter_node_metadata->nr_keys,
+			iter_node_metadata->nr_keys + 1, CMM_RELAXED);
 	}
 
 	/* Publish branch. */
@@ -4660,7 +4662,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		}
 		*result_node = external_nodes;
 		rcu_assign_pointer(metadata->external_nodes, NULL);
-		metadata->nr_keys -= 1;
+		uatomic_store(&metadata->nr_keys, metadata->nr_keys - 1,
+			CMM_RELAXED);
 		return CDS_FT_STATUS_OK;
 	}
 
@@ -4825,7 +4828,8 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			m->nr_keys = subtree_external_count;
+			uatomic_store(&m->nr_keys, subtree_external_count,
+				CMM_RELAXED);
 		}
 		created[nr++] = dest;
 		cur = dest;
@@ -4919,7 +4923,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 				cds_ft_item_to_metadata(
 					ft_node_ptr(branch));
 			bm->external_nodes = displaced;
-			bm->nr_keys += 1;
+			uatomic_store(&bm->nr_keys, bm->nr_keys + 1,
+				CMM_RELAXED);
 		}
 
 		if (displaced) {
@@ -5222,7 +5227,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				swap_rmeta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(old_child);
-				swap_rmeta->nr_keys = old_count;
+				uatomic_store(&swap_rmeta->nr_keys, old_count, CMM_RELAXED);
 			}
 		} else {
 			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
@@ -5230,7 +5235,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				fresh_meta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(old_child);
-				fresh_meta->nr_keys = old_count;
+				uatomic_store(&fresh_meta->nr_keys, old_count, CMM_RELAXED);
 			}
 		}
 
@@ -5433,7 +5438,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				dmeta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(child);
-				dmeta->nr_keys = detached_count;
+				uatomic_store(&dmeta->nr_keys, detached_count, CMM_RELAXED);
 			}
 		}
 		{
@@ -5527,7 +5532,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	if (ft_node_internal(node_flag)) {
 		struct cds_ft_metadata *metadata =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		return metadata->nr_keys;
+		return uatomic_load(&metadata->nr_keys, CMM_RELAXED);
 	}
 	/* External node: one key (possibly with duplicates). */
 	return 1;
@@ -5536,6 +5541,20 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 unsigned long cds_ft_count_keys(struct cds_ft *ft)
 {
 	return cds_ft_count_keys_prefix(ft, NULL, 0);
+}
+
+/*
+ * Count keys in a child node (nr_keys if internal, 1 if external).
+ */
+static inline
+unsigned long ft_child_key_count(struct cds_ft_inode_flag *child)
+{
+	if (ft_node_internal(child)) {
+		struct cds_ft_metadata *m =
+			cds_ft_item_to_metadata(ft_node_ptr(child));
+		return uatomic_load(&m->nr_keys, CMM_RELAXED);
+	}
+	return 1;
 }
 
 /*
@@ -5607,13 +5626,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		while (ft_node_ptr(child)) {
 			unsigned long child_keys;
 
-			if (ft_node_internal(child)) {
-				struct cds_ft_metadata *child_meta =
-					cds_ft_item_to_metadata(ft_node_ptr(child));
-				child_keys = child_meta->nr_keys;
-			} else {
-				child_keys = 1;
-			}
+			child_keys = ft_child_key_count(child);
 
 			if (remaining < child_keys) {
 				/* Target is in this child's subtree. Descend. */
@@ -5704,13 +5717,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		while (ft_node_ptr(child)) {
 			unsigned long child_keys;
 
-			if (ft_node_internal(child)) {
-				struct cds_ft_metadata *child_meta =
-					cds_ft_item_to_metadata(ft_node_ptr(child));
-				child_keys = child_meta->nr_keys;
-			} else {
-				child_keys = 1;
-			}
+			child_keys = ft_child_key_count(child);
 
 			if (remaining < child_keys) {
 				/* Target is in this child's subtree. Descend. */
@@ -5777,20 +5784,6 @@ next_level:
 end:
 	iter_auto_invalidate_path(iter);
 	return iter->status;
-}
-
-/*
- * Count keys in a child node (nr_keys if internal, 1 if external).
- */
-static inline
-unsigned long ft_child_key_count(struct cds_ft_inode_flag *child)
-{
-	if (ft_node_internal(child)) {
-		struct cds_ft_metadata *m =
-			cds_ft_item_to_metadata(ft_node_ptr(child));
-		return m->nr_keys;
-	}
-	return 1;
 }
 
 /*
@@ -5875,7 +5868,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent = iter_path_node(iter)[depth];
 		struct cds_ft_metadata *pmeta =
 			cds_ft_item_to_metadata(ft_node_ptr(parent));
-		unsigned long right_keys = pmeta->nr_keys - 1; /* exclude self */
+		unsigned long right_keys = uatomic_load(&pmeta->nr_keys, CMM_RELAXED) - 1; /* exclude self */
 
 		if (remaining <= right_keys) {
 			/*
