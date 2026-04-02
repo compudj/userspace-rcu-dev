@@ -5779,6 +5779,508 @@ end:
 	return iter->status;
 }
 
+/*
+ * Count keys in a child node (nr_keys if internal, 1 if external).
+ */
+static inline
+unsigned long ft_child_key_count(struct cds_ft_inode_flag *child)
+{
+	if (ft_node_internal(child)) {
+		struct cds_ft_metadata *m =
+			cds_ft_item_to_metadata(ft_node_ptr(child));
+		return m->nr_keys;
+	}
+	return 1;
+}
+
+/*
+ * Re-descend from the root following @key to rebuild the iterator path
+ * and ordinal_key arrays.  Returns the depth reached, or -1 on error.
+ */
+static
+int ft_rebuild_path(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		const uint8_t *key, size_t key_len,
+		uint8_t *ordinal_key)
+{
+	struct cds_ft_inode_flag *node_flag;
+	unsigned int i;
+
+	node_flag = rcu_dereference(ft->root);
+	iter_path_node(iter)[0] = node_flag;
+
+	for (i = 0; i < key_len; i++) {
+		uint8_t ordinal;
+
+		if (!ft_node_ptr(node_flag) || !ft_node_internal(node_flag))
+			return -1;
+
+		ordinal = key_to_ordinal(ft, key[i]);
+		ordinal_key[i] = ordinal;
+		node_flag = ft_node_get_nth(node_flag, NULL, ordinal);
+		if (!ft_node_ptr(node_flag))
+			return -1;
+		iter_path_node(iter)[i + 1] = node_flag;
+	}
+	return (int) key_len;
+}
+
+/*
+ * Skip forward by @n keys from the current iterator position using
+ * local traversal.
+ *
+ * Walks up from the current leaf, at each ancestor counting keys in
+ * rightward siblings until enough are accumulated, then descends into
+ * the target subtree using the lookup_nth algorithm.  Only touches
+ * nodes between the start and end positions, so concurrent mutations
+ * in unrelated key ranges do not affect the result.
+ */
+enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	uint8_t ordinal_key[FT_MAX_KEY_LEN];
+	unsigned long remaining;
+	int depth, level;
+	bool at_external_nodes;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	if (!iter->node)
+		return CDS_FT_STATUS_NOT_FOUND;
+	if (n == 0)
+		return CDS_FT_STATUS_OK;
+
+	iter_debug_path_snapshot(iter);
+
+	/* Rebuild path from root to current key. */
+	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
+			ordinal_key);
+	if (depth < 0)
+		goto not_found;
+
+	remaining = n;
+
+	/*
+	 * Determine whether the current key sits at an internal node's
+	 * external_nodes (variable-length prefix key) or at a leaf child.
+	 */
+	at_external_nodes = ft_node_internal(iter_path_node(iter)[depth]);
+
+	/*
+	 * If at external_nodes of an internal node, all children of that
+	 * node are to the right.  Try to satisfy the skip within them.
+	 */
+	if (at_external_nodes) {
+		struct cds_ft_inode_flag *parent = iter_path_node(iter)[depth];
+		struct cds_ft_metadata *pmeta =
+			cds_ft_item_to_metadata(ft_node_ptr(parent));
+		unsigned long right_keys = pmeta->nr_keys - 1; /* exclude self */
+
+		if (remaining <= right_keys) {
+			/*
+			 * Target is among the children.  Use lookup_nth
+			 * descent within this subtree, skipping the
+			 * external_nodes (already behind us).
+			 */
+			struct cds_ft_inode_flag *child;
+			uint8_t child_key;
+			int pivot = -1;
+
+			remaining--;  /* skip external_nodes key (us) */
+			child = ft_node_get_direction(parent, pivot,
+					&child_key, FT_RIGHT);
+			while (ft_node_ptr(child)) {
+				unsigned long ck = ft_child_key_count(child);
+
+				if (remaining < ck) {
+					ordinal_key[depth] = child_key;
+					iter_path_node(iter)[depth + 1] = child;
+					level = depth + 1;
+					goto descend_forward;
+				}
+				remaining -= ck;
+				pivot = child_key;
+				child = ft_node_get_direction(parent, pivot,
+						&child_key, FT_RIGHT);
+			}
+		}
+		remaining -= right_keys;
+		/* Continue walking up from depth-1. */
+		level = depth;
+	} else {
+		/* At a leaf child: start walking up from the parent. */
+		level = depth;
+	}
+
+	/*
+	 * Walk up: at each ancestor, count keys in rightward siblings
+	 * of the child we came from.
+	 */
+	for (level--; level >= 0; level--) {
+		struct cds_ft_inode_flag *ancestor = iter_path_node(iter)[level];
+		struct cds_ft_inode_flag *child;
+		uint8_t child_key;
+		int pivot;
+
+		if (!ft_node_internal(ancestor))
+			continue;
+
+		pivot = ordinal_key[level];
+		child = ft_node_get_direction(ancestor, pivot,
+				&child_key, FT_RIGHT);
+		while (ft_node_ptr(child)) {
+			unsigned long ck = ft_child_key_count(child);
+
+			if (remaining <= ck) {
+				remaining--;  /* enter this subtree (1-indexed within) */
+				ordinal_key[level] = child_key;
+				iter_path_node(iter)[level + 1] = child;
+				level = level + 1;
+				goto descend_forward;
+			}
+			remaining -= ck;
+			pivot = child_key;
+			child = ft_node_get_direction(ancestor, pivot,
+					&child_key, FT_RIGHT);
+		}
+		/*
+		 * No external_nodes to count going up in forward direction
+		 * (they sort before children, so they're behind us).
+		 */
+	}
+
+	/* Exhausted the trie. */
+not_found:
+	iter->node = NULL;
+	iter->path_valid = true;
+	iter_debug_path_update(iter);
+	iter->path_len = 0;
+	iter->status = CDS_FT_STATUS_NOT_FOUND;
+	goto end;
+
+descend_forward:
+	/*
+	 * We found the subtree containing the target.  Now descend into
+	 * it using the forward lookup_nth algorithm: at each internal
+	 * node, check external_nodes first, then iterate children in
+	 * ascending ordinal order.
+	 */
+	{
+		struct cds_ft_inode_flag *node_flag =
+			iter_path_node(iter)[level];
+
+		for (;;) {
+			struct cds_ft_metadata *metadata;
+			struct cds_ft_inode_flag *child;
+			uint8_t child_key;
+			int pivot;
+
+			if (!ft_node_ptr(node_flag) ||
+			    !ft_node_internal(node_flag))
+				break;
+
+			metadata = cds_ft_item_to_metadata(
+					ft_node_ptr(node_flag));
+
+			if (metadata->external_nodes) {
+				if (remaining == 0) {
+					int j;
+
+					iter->key_len = level;
+					for (j = 0; j < level; j++)
+						iter_key(iter)[j] =
+							ordinal_to_key(ft,
+								ordinal_key[j]);
+					iter->node = metadata->external_nodes;
+					iter->path_valid = true;
+					iter_debug_path_update(iter);
+					iter->path_len = level + 1;
+					iter->status = CDS_FT_STATUS_OK;
+					goto end;
+				}
+				remaining--;
+			}
+
+			pivot = -1;
+			child = ft_node_get_direction(node_flag, pivot,
+					&child_key, FT_RIGHT);
+			while (ft_node_ptr(child)) {
+				unsigned long ck = ft_child_key_count(child);
+
+				if (remaining < ck) {
+					ordinal_key[level] = child_key;
+					level++;
+					iter_path_node(iter)[level] = child;
+					node_flag = child;
+					goto next_forward_level;
+				}
+				remaining -= ck;
+				pivot = child_key;
+				child = ft_node_get_direction(node_flag, pivot,
+						&child_key, FT_RIGHT);
+			}
+			break;
+
+next_forward_level:
+			;
+		}
+
+		/* Reached a leaf. */
+		if (ft_node_ptr(iter_path_node(iter)[level]) &&
+		    !ft_node_internal(iter_path_node(iter)[level]) &&
+		    remaining == 0) {
+			int j;
+
+			iter->key_len = level;
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] =
+					ordinal_to_key(ft, ordinal_key[j]);
+			iter->node = (struct cds_ft_node *)
+				ft_node_ptr(iter_path_node(iter)[level]);
+			iter->path_valid = true;
+			iter_debug_path_update(iter);
+			iter->path_len = level + 1;
+			iter->status = CDS_FT_STATUS_OK;
+			goto end;
+		}
+		goto not_found;
+	}
+
+end:
+	iter_auto_invalidate_path(iter);
+	return iter->status;
+}
+
+/*
+ * Skip backward by @n keys from the current iterator position using
+ * local traversal.
+ *
+ * Walks up from the current leaf, at each ancestor counting keys in
+ * leftward siblings (and external_nodes, which sort before children).
+ * When enough are accumulated, descends into the target subtree using
+ * the reverse lookup_nth_last algorithm.
+ */
+enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	uint8_t ordinal_key[FT_MAX_KEY_LEN];
+	unsigned long remaining;
+	int depth, level;
+	bool at_external_nodes;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	if (!iter->node)
+		return CDS_FT_STATUS_NOT_FOUND;
+	if (n == 0)
+		return CDS_FT_STATUS_OK;
+
+	iter_debug_path_snapshot(iter);
+
+	/* Rebuild path from root to current key. */
+	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
+			ordinal_key);
+	if (depth < 0)
+		goto not_found;
+
+	remaining = n;
+
+	/*
+	 * Determine whether the current key sits at an internal node's
+	 * external_nodes or at a leaf child.
+	 */
+	at_external_nodes = ft_node_internal(iter_path_node(iter)[depth]);
+	(void) at_external_nodes;
+
+	/*
+	 * Whether at external_nodes or at a leaf child, we start the
+	 * upward walk from the same level.  (At external_nodes all
+	 * children are to the right, so there's nothing to the left.)
+	 */
+	level = depth;
+
+	/*
+	 * Walk up: at each ancestor, count keys in leftward siblings
+	 * of the child we came from, plus external_nodes at the ancestor
+	 * (which sort before all children).
+	 */
+	for (level--; level >= 0; level--) {
+		struct cds_ft_inode_flag *ancestor = iter_path_node(iter)[level];
+		struct cds_ft_inode_flag *child;
+		struct cds_ft_metadata *ameta;
+		uint8_t child_key;
+		unsigned long left_keys = 0;
+		int pivot;
+
+		if (!ft_node_internal(ancestor))
+			continue;
+
+		ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
+
+		/* Count leftward siblings. */
+		pivot = ordinal_key[level];
+		child = ft_node_get_direction(ancestor, pivot,
+				&child_key, FT_LEFT);
+		while (ft_node_ptr(child)) {
+			left_keys += ft_child_key_count(child);
+			pivot = child_key;
+			child = ft_node_get_direction(ancestor, pivot,
+					&child_key, FT_LEFT);
+		}
+
+		/* External_nodes at ancestor sort before all children. */
+		if (ameta->external_nodes)
+			left_keys++;
+
+		if (remaining <= left_keys) {
+			/*
+			 * Target is among the leftward siblings or
+			 * external_nodes.  Descend in reverse order:
+			 * iterate leftward siblings from the current
+			 * child in descending ordinal order, then check
+			 * external_nodes last.
+			 */
+			pivot = ordinal_key[level];
+			child = ft_node_get_direction(ancestor, pivot,
+					&child_key, FT_LEFT);
+			while (ft_node_ptr(child)) {
+				unsigned long ck = ft_child_key_count(child);
+
+				if (remaining <= ck) {
+					remaining--;
+					ordinal_key[level] = child_key;
+					iter_path_node(iter)[level + 1] = child;
+					level = level + 1;
+					goto descend_reverse;
+				}
+				remaining -= ck;
+				pivot = child_key;
+				child = ft_node_get_direction(ancestor, pivot,
+						&child_key, FT_LEFT);
+			}
+
+			/* Must be the external_nodes. */
+			if (ameta->external_nodes && remaining == 1) {
+				int j;
+
+				iter->key_len = level;
+				for (j = 0; j < level; j++)
+					iter_key(iter)[j] =
+						ordinal_to_key(ft,
+							ordinal_key[j]);
+				iter->node = ameta->external_nodes;
+				iter->path_valid = true;
+				iter_debug_path_update(iter);
+				iter->path_len = level + 1;
+				iter->status = CDS_FT_STATUS_OK;
+				goto end;
+			}
+			/* Shouldn't happen if left_keys was correct. */
+			goto not_found;
+		}
+		remaining -= left_keys;
+	}
+
+	/* Exhausted the trie. */
+not_found:
+	iter->node = NULL;
+	iter->path_valid = true;
+	iter_debug_path_update(iter);
+	iter->path_len = 0;
+	iter->status = CDS_FT_STATUS_NOT_FOUND;
+	goto end;
+
+descend_reverse:
+	/*
+	 * Descend into the target subtree using the reverse algorithm:
+	 * at each internal node, iterate children in descending ordinal
+	 * order first, then check external_nodes last.
+	 */
+	{
+		struct cds_ft_inode_flag *node_flag =
+			iter_path_node(iter)[level];
+
+		for (;;) {
+			struct cds_ft_metadata *metadata;
+			struct cds_ft_inode_flag *child;
+			uint8_t child_key;
+			int pivot;
+
+			if (!ft_node_ptr(node_flag) ||
+			    !ft_node_internal(node_flag))
+				break;
+
+			metadata = cds_ft_item_to_metadata(
+					ft_node_ptr(node_flag));
+
+			pivot = FT_ENTRY_PER_NODE;
+			child = ft_node_get_direction(node_flag, pivot,
+					&child_key, FT_LEFT);
+			while (ft_node_ptr(child)) {
+				unsigned long ck = ft_child_key_count(child);
+
+				if (remaining < ck) {
+					ordinal_key[level] = child_key;
+					level++;
+					iter_path_node(iter)[level] = child;
+					node_flag = child;
+					goto next_reverse_level;
+				}
+				remaining -= ck;
+				pivot = child_key;
+				child = ft_node_get_direction(node_flag, pivot,
+						&child_key, FT_LEFT);
+			}
+
+			if (metadata->external_nodes && remaining == 0) {
+				int j;
+
+				iter->key_len = level;
+				for (j = 0; j < level; j++)
+					iter_key(iter)[j] =
+						ordinal_to_key(ft,
+							ordinal_key[j]);
+				iter->node = metadata->external_nodes;
+				iter->path_valid = true;
+				iter_debug_path_update(iter);
+				iter->path_len = level + 1;
+				iter->status = CDS_FT_STATUS_OK;
+				goto end;
+			}
+			break;
+
+next_reverse_level:
+			;
+		}
+
+		/* Reached a leaf. */
+		if (ft_node_ptr(iter_path_node(iter)[level]) &&
+		    !ft_node_internal(iter_path_node(iter)[level]) &&
+		    remaining == 0) {
+			int j;
+
+			iter->key_len = level;
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] =
+					ordinal_to_key(ft, ordinal_key[j]);
+			iter->node = (struct cds_ft_node *)
+				ft_node_ptr(iter_path_node(iter)[level]);
+			iter->path_valid = true;
+			iter_debug_path_update(iter);
+			iter->path_len = level + 1;
+			iter->status = CDS_FT_STATUS_OK;
+			goto end;
+		}
+		goto not_found;
+	}
+
+end:
+	iter_auto_invalidate_path(iter);
+	return iter->status;
+}
+
 unsigned long cds_ft_count_entries(struct cds_ft *ft)
 {
 	struct cds_ft_iter *iter;

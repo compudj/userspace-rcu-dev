@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 126
+#define NR_TESTS 131
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -1734,6 +1734,371 @@ static int test_lookup_nth_empty(void)
 
 	cds_ft_iter_destroy(iter);
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * cds_ft_iter_skip_forward: insert keys 0..9, position at key 3,
+ * skip forward 4 → should land on key 7.
+ */
+static int test_iter_skip_forward(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	unsigned long i;
+	enum cds_ft_status s;
+	uint8_t rk[4];
+	size_t rk_len;
+	uint64_t val;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 10; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		insert_u64(ft, i, n);
+		rcu_read_unlock();
+	}
+
+	/* Position at key 3. */
+	rcu_read_lock();
+	s = cds_ft_lookup_nth(ft, iter, 3);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "skip_forward: lookup_nth(3): %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* Skip forward 4 → key 7. */
+	s = cds_ft_iter_skip_forward(ft, iter, 4);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "skip_forward: skip(4): %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+	val = cds_ft_key_to_u64(ft, rk, 4);
+	rcu_read_unlock();
+	if (val != 7) {
+		fprintf(stderr, "skip_forward: got key %lu, expected 7\n",
+			(unsigned long) val);
+		goto fail;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_iter_skip_reverse: insert keys 0..9, position at key 7,
+ * skip reverse 4 → should land on key 3.
+ */
+static int test_iter_skip_reverse(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	unsigned long i;
+	enum cds_ft_status s;
+	uint8_t rk[4];
+	size_t rk_len;
+	uint64_t val;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 10; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		insert_u64(ft, i, n);
+		rcu_read_unlock();
+	}
+
+	/* Position at key 7. */
+	rcu_read_lock();
+	s = cds_ft_lookup_nth(ft, iter, 7);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "skip_reverse: lookup_nth(7): %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* Skip reverse 4 → key 3. */
+	s = cds_ft_iter_skip_reverse(ft, iter, 4);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "skip_reverse: skip(4): %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+	val = cds_ft_key_to_u64(ft, rk, 4);
+	rcu_read_unlock();
+	if (val != 3) {
+		fprintf(stderr, "skip_reverse: got key %lu, expected 3\n",
+			(unsigned long) val);
+		goto fail;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * Skip out-of-range: skip forward beyond the last key returns NOT_FOUND,
+ * skip reverse beyond the first key returns NOT_FOUND.
+ */
+static int test_iter_skip_boundary(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	unsigned long i;
+	enum cds_ft_status s;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 5; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		insert_u64(ft, i, n);
+		rcu_read_unlock();
+	}
+
+	/* Position at key 3, skip forward 5 → out of range (only 1 key after 3). */
+	rcu_read_lock();
+	s = cds_ft_lookup_nth(ft, iter, 3);
+	if (s != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto fail;
+	}
+	s = cds_ft_iter_skip_forward(ft, iter, 5);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "skip_boundary: forward overflow expected NOT_FOUND, got %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* Position at key 1, skip reverse 5 → out of range. */
+	s = cds_ft_lookup_nth(ft, iter, 1);
+	if (s != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto fail;
+	}
+	s = cds_ft_iter_skip_reverse(ft, iter, 5);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "skip_boundary: reverse overflow expected NOT_FOUND, got %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * Skip with duplicates: duplicates share a rank, skip should jump
+ * over entire duplicate groups.
+ */
+static int test_iter_skip_duplicates(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *n1 = node_alloc(10);
+	struct ft_test_node *n2 = node_alloc(10);
+	struct ft_test_node *n3 = node_alloc(20);
+	struct ft_test_node *n4 = node_alloc(30);
+	enum cds_ft_status s;
+	uint8_t rk[4];
+	size_t rk_len;
+	uint64_t val;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		node_free(n1); node_free(n2); node_free(n3); node_free(n4);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	insert_u64(ft, 10, n1);
+	insert_u64(ft, 10, n2);	/* duplicate at key 10 */
+	insert_u64(ft, 20, n3);
+	insert_u64(ft, 30, n4);
+
+	/* 3 unique keys: 10 (rank 0), 20 (rank 1), 30 (rank 2). */
+
+	/* Position at key 10, skip forward 2 → key 30. */
+	s = cds_ft_lookup_nth(ft, iter, 0);
+	if (s != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto fail;
+	}
+	s = cds_ft_iter_skip_forward(ft, iter, 2);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "skip_dup: forward skip: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+	val = cds_ft_key_to_u64(ft, rk, 4);
+	if (val != 30) {
+		fprintf(stderr, "skip_dup: forward got %lu, expected 30\n",
+			(unsigned long) val);
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* Skip reverse 1 from key 30 → key 20. */
+	s = cds_ft_iter_skip_reverse(ft, iter, 1);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "skip_dup: reverse skip: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+	val = cds_ft_key_to_u64(ft, rk, 4);
+	rcu_read_unlock();
+	if (val != 20) {
+		fprintf(stderr, "skip_dup: reverse got %lu, expected 20\n",
+			(unsigned long) val);
+		goto fail;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * Skip on a varlen trie with prefix keys: "a", "ab", "abc", "b".
+ * Position at "a", skip forward 2 → "abc".
+ */
+static int test_iter_skip_varlen(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	struct ft_test_node *na = node_alloc(0);
+	struct ft_test_node *nab = node_alloc(0);
+	struct ft_test_node *nabc = node_alloc(0);
+	struct ft_test_node *nb = node_alloc(0);
+	enum cds_ft_status s;
+	uint8_t rk[8];
+	size_t rk_len;
+
+	ft = create_varlen_ft(&group);
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		node_free(na); node_free(nab); node_free(nabc); node_free(nb);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *)"a", 1, &na->node);
+	cds_ft_insert(ft, (const uint8_t *)"ab", 2, &nab->node);
+	cds_ft_insert(ft, (const uint8_t *)"abc", 3, &nabc->node);
+	cds_ft_insert(ft, (const uint8_t *)"b", 1, &nb->node);
+
+	/* Position at "a" (rank 0), skip forward 2 → "abc" (rank 2). */
+	s = cds_ft_lookup_nth(ft, iter, 0);
+	if (s != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto fail;
+	}
+	s = cds_ft_iter_skip_forward(ft, iter, 2);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "skip_varlen: forward: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+	if (rk_len != 3 || memcmp(rk, "abc", 3) != 0) {
+		fprintf(stderr, "skip_varlen: forward got key_len %zu\n", rk_len);
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* Skip reverse 3 from "abc" (rank 2) → out of range. */
+	s = cds_ft_iter_skip_reverse(ft, iter, 3);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "skip_varlen: reverse overflow expected NOT_FOUND\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* Skip reverse 2 from "abc" → "a". */
+	/* Re-position at "abc" first. */
+	s = cds_ft_lookup_nth(ft, iter, 2);
+	if (s != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto fail;
+	}
+	s = cds_ft_iter_skip_reverse(ft, iter, 2);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "skip_varlen: reverse: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+	rcu_read_unlock();
+	if (rk_len != 1 || rk[0] != 'a') {
+		fprintf(stderr, "skip_varlen: reverse got key_len %zu\n", rk_len);
+		goto fail;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
 }
 
 /* ================================================================== */
@@ -8999,6 +9364,14 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_nth_last);
 	RUN_TEST(test_lookup_nth_duplicates);
 	RUN_TEST(test_lookup_nth_varlen);
+
+	/* Iterator skip tests */
+	diag("Iterator skip tests");
+	RUN_TEST(test_iter_skip_forward);
+	RUN_TEST(test_iter_skip_reverse);
+	RUN_TEST(test_iter_skip_boundary);
+	RUN_TEST(test_iter_skip_duplicates);
+	RUN_TEST(test_iter_skip_varlen);
 
 	/* 3. Lookup variants */
 	diag("Lookup variant tests");

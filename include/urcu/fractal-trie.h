@@ -1303,6 +1303,42 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		unsigned long n);
 
 /*
+ * cds_ft_iter_skip_forward - Skip forward by @n keys from the current position.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator positioned at a valid key.
+ * @n: Number of keys to skip forward. 0 is a no-op.
+ *
+ * Traverses locally from the current position: walks up the trie from
+ * the current leaf counting rightward siblings using per-node key
+ * counters, then descends into the target subtree. Only touches nodes
+ * between the start and end positions, so concurrent mutations in
+ * unrelated key ranges do not affect the result. O(depth) time
+ * complexity. Returns CDS_FT_STATUS_NOT_FOUND if the target is out
+ * of range. The RCU read-side lock must be held.
+ */
+enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n);
+
+/*
+ * cds_ft_iter_skip_reverse - Skip backward by @n keys from the current position.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator positioned at a valid key.
+ * @n: Number of keys to skip backward. 0 is a no-op.
+ *
+ * Traverses locally from the current position: walks up the trie from
+ * the current leaf counting leftward siblings using per-node key
+ * counters, then descends into the target subtree. Only touches nodes
+ * between the start and end positions, so concurrent mutations in
+ * unrelated key ranges do not affect the result. O(depth) time
+ * complexity. Returns CDS_FT_STATUS_NOT_FOUND if @n exceeds the
+ * number of preceding keys. The RCU read-side lock must be held.
+ */
+enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n);
+
+/*
  * cds_ft_count_entries - Return the number of external nodes in a Fractal Trie.
  * @ft: The Fractal Trie.
  *
