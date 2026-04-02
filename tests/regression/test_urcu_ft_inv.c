@@ -57,7 +57,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	8
+#define NR_TESTS	10
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -1689,6 +1689,481 @@ static int inv_nth_first_stability(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 9: skip_forward stability under low-end mutation       */
+/*                                                                    */
+/*   Stable keys in [SKIP_STABLE_BASE, SKIP_STABLE_BASE+COUNT) are   */
+/*   never modified.  A writer churns keys in [0, SKIP_WRITER_RANGE). */
+/*   A reader positions at the first stable key via lookup_nth, then  */
+/*   skip_forwards within the stable range.  Because the local        */
+/*   traversal only touches nodes between the start and end, low-end  */
+/*   mutations must not affect the result.                            */
+/*                                                                    */
+/* ================================================================== */
+
+#define SKIP_STABLE_BASE	512
+#define SKIP_STABLE_COUNT	64
+#define SKIP_WRITER_RANGE	256	/* Writer churn range below stable. */
+#define SKIP_HIGH_WRITER_BASE	1024	/* Writer churn range above stable. */
+
+struct inv_skip_ctx {
+	struct cds_ft *ft;
+	const char *test_name;
+	uint64_t stable_base;
+	uint64_t stable_count;
+};
+
+static void *inv_skip_forward_reader(void *arg)
+{
+	struct inv_skip_ctx *ctx = (struct inv_skip_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+	unsigned int seed;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		enum cds_ft_status s;
+		uint8_t rk[8];
+		size_t rk_len;
+		uint64_t v;
+		unsigned long skip_n;
+
+		rcu_read_lock();
+
+		/*
+		 * Position at a random stable key, then skip forward
+		 * by a random amount within the stable range.
+		 */
+		{
+			uint64_t start_off = (uint64_t)(rand_r(&seed) % ctx->stable_count);
+			uint8_t k[8];
+
+			cds_ft_u64_to_key(ctx->ft, ctx->stable_base + start_off,
+					k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			s = cds_ft_lookup(ctx->ft, iter);
+			if (s != CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				goto next;
+			}
+
+			/* Skip forward within the remaining stable keys. */
+			skip_n = (unsigned long)(rand_r(&seed) %
+				(ctx->stable_count - start_off));
+			if (skip_n == 0) {
+				rcu_read_unlock();
+				goto next;
+			}
+
+			s = cds_ft_iter_skip_forward(ctx->ft, iter, skip_n);
+			if (s != CDS_FT_STATUS_OK) {
+				report_violation(ctx->test_name,
+					"skip_forward(%lu) from %" PRIu64
+					" returned %s (iter #%lu)",
+					skip_n,
+					ctx->stable_base + start_off,
+					cds_ft_status_to_string(s),
+					iters);
+				rcu_read_unlock();
+				goto next;
+			}
+
+			cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+			v = cds_ft_key_to_u64(ctx->ft, rk, CDS_FT_LEN_DEFAULT);
+
+			if (v < ctx->stable_base ||
+			    v >= ctx->stable_base + ctx->stable_count) {
+				report_violation(ctx->test_name,
+					"skip_forward(%lu) from %" PRIu64
+					" landed on %" PRIu64
+					", expected [%" PRIu64 ", %" PRIu64
+					") (iter #%lu)",
+					skip_n,
+					ctx->stable_base + start_off,
+					v, ctx->stable_base,
+					ctx->stable_base + ctx->stable_count,
+					iters);
+			}
+		}
+		rcu_read_unlock();
+
+next:
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_skip_low_writer(void *arg)
+{
+	struct inv_skip_ctx *ctx = (struct inv_skip_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+	pthread_mutex_t *lock = (pthread_mutex_t *)(ctx + 1);
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = (uint64_t)(rand_r(&seed) % SKIP_WRITER_RANGE);
+		int do_insert = rand_r(&seed) & 1;
+
+		rcu_read_lock();
+		if (do_insert) {
+			struct ft_test_node *n = node_alloc(key);
+
+			pthread_mutex_lock(lock);
+			insert_u64(ctx->ft, key, n);
+			pthread_mutex_unlock(lock);
+		} else {
+			struct cds_ft_node *found;
+			uint8_t k[8];
+
+			cds_ft_u64_to_key(ctx->ft, key, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(ctx->ft, iter);
+			found = cds_ft_iter_node(iter);
+			if (found) {
+				struct ft_test_node *tn = to_test_node(found);
+
+				pthread_mutex_lock(lock);
+				if (cds_ft_remove(ctx->ft, iter, &tn->node)
+				    == CDS_FT_STATUS_OK) {
+					node_free_rcu(tn);
+				}
+				pthread_mutex_unlock(lock);
+			}
+		}
+		rcu_read_unlock();
+
+		if ((seed & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_skip_forward_stability(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct timespec t0;
+	struct {
+		struct inv_skip_ctx ctx;
+		pthread_mutex_t lock;
+	} shared;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	shared.ctx.ft = ft;
+	shared.ctx.test_name = "inv_skip_forward_stability";
+	shared.ctx.stable_base = SKIP_STABLE_BASE;
+	shared.ctx.stable_count = SKIP_STABLE_COUNT;
+	pthread_mutex_init(&shared.lock, NULL);
+
+	/* Pre-populate: stable keys (never modified). */
+	rcu_read_lock();
+	for (i = 0; i < SKIP_STABLE_COUNT; i++) {
+		struct ft_test_node *n = node_alloc(SKIP_STABLE_BASE + i);
+		insert_u64(ft, SKIP_STABLE_BASE + i, n);
+	}
+	/* Seed low keys for writer churn. */
+	for (i = 0; i < SKIP_WRITER_RANGE / 2; i++) {
+		struct ft_test_node *n = node_alloc(i);
+		insert_u64(ft, i, n);
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_skip_forward_reader, &shared.ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL, inv_skip_low_writer, &shared.ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&shared.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_skip_forward_stability: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
+/*   INVARIANT 10: skip_reverse stability under high-end mutation     */
+/*                                                                    */
+/*   Same stable key range.  Writer churns keys above.  Reader        */
+/*   positions at a stable key and skip_reverses within the stable    */
+/*   range.  High-end mutations must not affect the result.           */
+/*                                                                    */
+/* ================================================================== */
+
+static void *inv_skip_reverse_reader(void *arg)
+{
+	struct inv_skip_ctx *ctx = (struct inv_skip_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+	unsigned int seed;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		enum cds_ft_status s;
+		uint8_t rk[8];
+		size_t rk_len;
+		uint64_t v;
+		unsigned long skip_n;
+
+		rcu_read_lock();
+
+		{
+			uint64_t start_off = (uint64_t)(rand_r(&seed) % ctx->stable_count);
+			uint8_t k[8];
+
+			cds_ft_u64_to_key(ctx->ft, ctx->stable_base + start_off,
+					k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			s = cds_ft_lookup(ctx->ft, iter);
+			if (s != CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				goto next;
+			}
+
+			/* Skip reverse within the preceding stable keys. */
+			if (start_off == 0) {
+				rcu_read_unlock();
+				goto next;
+			}
+			skip_n = (unsigned long)(rand_r(&seed) % start_off);
+			if (skip_n == 0) {
+				rcu_read_unlock();
+				goto next;
+			}
+
+			s = cds_ft_iter_skip_reverse(ctx->ft, iter, skip_n);
+			if (s != CDS_FT_STATUS_OK) {
+				report_violation(ctx->test_name,
+					"skip_reverse(%lu) from %" PRIu64
+					" returned %s (iter #%lu)",
+					skip_n,
+					ctx->stable_base + start_off,
+					cds_ft_status_to_string(s),
+					iters);
+				rcu_read_unlock();
+				goto next;
+			}
+
+			cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+			v = cds_ft_key_to_u64(ctx->ft, rk, CDS_FT_LEN_DEFAULT);
+
+			if (v < ctx->stable_base ||
+			    v >= ctx->stable_base + ctx->stable_count) {
+				report_violation(ctx->test_name,
+					"skip_reverse(%lu) from %" PRIu64
+					" landed on %" PRIu64
+					", expected [%" PRIu64 ", %" PRIu64
+					") (iter #%lu)",
+					skip_n,
+					ctx->stable_base + start_off,
+					v, ctx->stable_base,
+					ctx->stable_base + ctx->stable_count,
+					iters);
+			}
+		}
+		rcu_read_unlock();
+
+next:
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_skip_high_writer(void *arg)
+{
+	struct inv_skip_ctx *ctx = (struct inv_skip_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+	pthread_mutex_t *lock = (pthread_mutex_t *)(ctx + 1);
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = SKIP_HIGH_WRITER_BASE +
+			(uint64_t)(rand_r(&seed) % SKIP_WRITER_RANGE);
+		int do_insert = rand_r(&seed) & 1;
+
+		rcu_read_lock();
+		if (do_insert) {
+			struct ft_test_node *n = node_alloc(key);
+
+			pthread_mutex_lock(lock);
+			insert_u64(ctx->ft, key, n);
+			pthread_mutex_unlock(lock);
+		} else {
+			struct cds_ft_node *found;
+			uint8_t k[8];
+
+			cds_ft_u64_to_key(ctx->ft, key, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(ctx->ft, iter);
+			found = cds_ft_iter_node(iter);
+			if (found) {
+				struct ft_test_node *tn = to_test_node(found);
+
+				pthread_mutex_lock(lock);
+				if (cds_ft_remove(ctx->ft, iter, &tn->node)
+				    == CDS_FT_STATUS_OK) {
+					node_free_rcu(tn);
+				}
+				pthread_mutex_unlock(lock);
+			}
+		}
+		rcu_read_unlock();
+
+		if ((seed & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_skip_reverse_stability(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct timespec t0;
+	struct {
+		struct inv_skip_ctx ctx;
+		pthread_mutex_t lock;
+	} shared;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	shared.ctx.ft = ft;
+	shared.ctx.test_name = "inv_skip_reverse_stability";
+	shared.ctx.stable_base = SKIP_STABLE_BASE;
+	shared.ctx.stable_count = SKIP_STABLE_COUNT;
+	pthread_mutex_init(&shared.lock, NULL);
+
+	/* Pre-populate: stable keys (never modified). */
+	rcu_read_lock();
+	for (i = 0; i < SKIP_STABLE_COUNT; i++) {
+		struct ft_test_node *n = node_alloc(SKIP_STABLE_BASE + i);
+		insert_u64(ft, SKIP_STABLE_BASE + i, n);
+	}
+	/* Seed high keys for writer churn. */
+	for (i = 0; i < SKIP_WRITER_RANGE / 2; i++) {
+		struct ft_test_node *n = node_alloc(SKIP_HIGH_WRITER_BASE + i);
+		insert_u64(ft, SKIP_HIGH_WRITER_BASE + i, n);
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_skip_reverse_reader, &shared.ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL, inv_skip_high_writer, &shared.ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&shared.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_skip_reverse_stability: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -1727,6 +2202,10 @@ int main(int argc, char **argv)
 	diag("6. Rank-based lookup stability");
 	RUN_TEST(inv_nth_last_stability);
 	RUN_TEST(inv_nth_first_stability);
+
+	diag("7. Iterator skip stability");
+	RUN_TEST(inv_skip_forward_stability);
+	RUN_TEST(inv_skip_reverse_stability);
 
 	rcu_barrier();
 	rcu_unregister_thread();
