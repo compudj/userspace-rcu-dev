@@ -32,8 +32,21 @@
  * Fractal Trie node, else it points to a node outside of the Fractal Trie.
  * This can be used for variable length keys to identify the end of key.
  */
+/*
+ * Pointer tag encoding (bits 0-1):
+ *
+ *   (ptr & 0b11) == 0b00  →  external node (leaf)
+ *   (ptr & 0b01) == 0b01  →  internal node (bit 0 set), bits 1-3 = type index
+ *   (ptr & 0b11) == 0b10  →  compressed path node
+ *
+ * Internal nodes always have bit 0 set; the type index encoding in
+ * bits 1-3 is unchanged.  Compressed nodes use bit 1 only; bits 2+
+ * are the pointer.  External nodes have bits 0-1 clear.
+ */
 #define FT_INTERNAL_BITS	1
 #define FT_INTERNAL_MASK	(1U << 0)
+#define FT_COMPRESSED_MASK	(1U << 1)
+#define FT_TAG_MASK		(FT_COMPRESSED_MASK | FT_INTERNAL_MASK)
 
 /*
  * This if followed by a number of bits reserved to represent the child
@@ -117,6 +130,21 @@ struct cds_ft_metadata {
 						 * during concurrent mutations (see
 						 * ft_propagate_external_count).
 						 */
+};
+
+/*
+ * Compressed path node.  Replaces a chain of single-child internal
+ * nodes with a single node storing the key bytes inline.
+ *
+ * Tagged in the parent's child pointer with FT_COMPRESSED_MASK
+ * (bit 1 set, bit 0 clear).
+ *
+ * Layout: [child pointer] [len] [key_bytes...]
+ */
+struct cds_ft_compressed_node {
+	struct cds_ft_inode_flag *child;	/* Child at end of compressed path. */
+	uint8_t len;				/* Number of key bytes in path (1-255). */
+	uint8_t key_bytes[];			/* Compressed key path (flexible array). */
 };
 
 struct cds_ft_bitmap {

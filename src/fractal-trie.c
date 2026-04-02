@@ -782,6 +782,13 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	if (!node)
 		return NULL;	/* FT_NULL */
 	v = (unsigned long) node;
+
+	/* Compressed nodes only use bits 0-1 for the tag. */
+	if ((v & FT_TAG_MASK) == FT_COMPRESSED_MASK) {
+		v &= ~(unsigned long) FT_TAG_MASK;
+		return (struct cds_ft_inode *) v;
+	}
+
 	type_idx = (v & FT_TYPE_MASK) >> FT_INTERNAL_BITS;
 
 	switch (type_idx) {
@@ -806,6 +813,24 @@ struct cds_ft_inode *_ft_node_mask_ptr(struct cds_ft_inode_flag *node)
 }
 
 static
+bool ft_node_internal(struct cds_ft_inode_flag *node)
+{
+	return (unsigned long) node & FT_INTERNAL_MASK;
+}
+
+static
+bool ft_node_compressed(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
+}
+
+static
+bool ft_node_external(struct cds_ft_inode_flag *node)
+{
+	return node != NULL && ((unsigned long) node & FT_TAG_MASK) == 0;
+}
+
+static
 unsigned long ft_node_type(struct cds_ft_inode_flag *node)
 {
 	unsigned long type;
@@ -813,21 +838,33 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
 	if (_ft_node_mask_ptr(node) == NULL) {
 		return NODE_INDEX_NULL;
 	}
+	/* Compressed nodes don't have a type index. */
+	assert(!ft_node_compressed(node));
 	type = (unsigned int) (((unsigned long) node & FT_TYPE_MASK) >> FT_INTERNAL_BITS);
 	assert(type < (1UL << FT_TYPE_BITS));
 	return type;
 }
 
-static
-bool ft_node_internal(struct cds_ft_inode_flag *node)
+static __attribute__((unused))
+struct cds_ft_inode_flag *ft_compressed_node_flag(
+		struct cds_ft_compressed_node *node)
 {
-	return (unsigned long) node & FT_INTERNAL_MASK;
+	return (struct cds_ft_inode_flag *)
+		(((unsigned long) node) | FT_COMPRESSED_MASK);
+}
+
+static __attribute__((unused))
+struct cds_ft_compressed_node *ft_compressed_node_ptr(
+		struct cds_ft_inode_flag *node)
+{
+	return (struct cds_ft_compressed_node *)
+		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
 }
 
 static
 bool valid_external_node(struct cds_ft_node *node)
 {
-	return node != NULL && !ft_node_internal((struct cds_ft_inode_flag *) node);
+	return node != NULL && ft_node_external((struct cds_ft_inode_flag *) node);
 }
 
 /*
@@ -1612,6 +1649,7 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 	struct cds_ft_inode *node;
 	const struct cds_ft_type *type;
 
+	assert(!ft_node_compressed(node_flag));	/* Phase 2: handle compressed path. */
 	node = ft_node_ptr(node_flag);
 	assert(node != NULL);
 	type_index = ft_node_type(node_flag);
@@ -1642,6 +1680,7 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	struct cds_ft_inode *node;
 	const struct cds_ft_type *type;
 
+	assert(!ft_node_compressed(node_flag));	/* Phase 2: handle compressed path. */
 	node = ft_node_ptr(node_flag);
 	assert(node != NULL);
 	type_index = ft_node_type(node_flag);
@@ -2838,7 +2877,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			iter_path_len = i + 1;
 		}
 		/* Found external node before end of key. */
-		if (i < key_depth - 1 && !ft_node_internal(node_flag)) {
+		if (i < key_depth - 1 && ft_node_external(node_flag)) {
 			if (track) {
 				match_len = i;
 				match_node = (struct cds_ft_node *) node_flag;
@@ -3203,7 +3242,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		iter_path_node(iter)[level] = node_flag;
 		dbg_printf("cds_ft_lookup_inequality iter key lookup %u finds node_flag %p\n",
 				(unsigned int) key_value, node_flag);
-		if (!ft_node_internal(node_flag))
+		if (ft_node_external(node_flag))
 			break;
 	}
 
@@ -3422,7 +3461,7 @@ post_traversal:
 	}
 
 descend_children:
-	if (!ft_node_internal(node_flag)) {
+	if (ft_node_external(node_flag)) {
 		int j;
 
 		assert(ft->group->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->group->key_len);
@@ -3491,7 +3530,7 @@ descend_children:
 		}
 		skip_eq_external_nodes = false;
 		/* Return external node. */
-		if (!ft_node_internal(node_flag))
+		if (ft_node_external(node_flag))
 			break;
 		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir, level == 1);
 		/*
@@ -3508,7 +3547,7 @@ descend_children:
 		iter_path_node(iter)[level] = node_flag;
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) ordinal_key[level - 1], node_flag);
-		if (!ft_node_internal(node_flag))
+		if (ft_node_external(node_flag))
 			break;
 	}
 	/* attach/detach semantic guarantees that ft_node_get_minmax cannot return NULL. */
@@ -4033,7 +4072,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 		if (!ft_node_ptr(d.nf))
 			break;
 		/* Found external node. */
-		if (!ft_node_internal(d.nf))
+		if (ft_node_external(d.nf))
 			break;
 		dbg_printf("cds_ft_insert iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
@@ -4228,7 +4267,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		if (!ft_node_ptr(d.nf))
 			break;
 		/* Found external node. */
-		if (!ft_node_internal(d.nf))
+		if (ft_node_external(d.nf))
 			break;
 		dbg_printf("_cds_ft_insert_replace iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
@@ -4386,7 +4425,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	for (i = 1; i < key_depth; i++) {
 		uint8_t key_value;
 
-		if (!ft_node_internal(node_flag))
+		if (ft_node_external(node_flag))
 			return CDS_FT_STATUS_NOT_FOUND;
 		key_value = key_to_ordinal(ft, *(iter_key++));
 		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
@@ -4958,7 +4997,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 	for (; d->depth < key_len; ) {
 		uint8_t kv;
 
-		if (!ft_node_ptr(d->nf) || !ft_node_internal(d->nf))
+		if (!ft_node_ptr(d->nf) || ft_node_external(d->nf))
 			break;
 
 		snapshot[(*nr_snapshot)++] = d->nf;
@@ -5077,7 +5116,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		struct cds_ft_inode_flag *branch;
 		struct cds_ft_node *displaced = NULL;
 
-		if (ft_node_ptr(d->nf) && !ft_node_internal(d->nf))
+		if (ft_node_ptr(d->nf) && ft_node_external(d->nf))
 			displaced = (struct cds_ft_node *)
 				ft_node_ptr(d->nf);
 
@@ -5511,7 +5550,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 			if (!ft_node_ptr(dd.d.nf))
 				return CDS_FT_STATUS_NOT_FOUND;
-			if (!ft_node_internal(dd.d.nf))
+			if (ft_node_external(dd.d.nf))
 				return CDS_FT_STATUS_NOT_FOUND;
 
 			meta = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
@@ -5689,7 +5728,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	for (i = 0; i < prefix_len; i++) {
 		uint8_t kv;
 
-		if (!ft_node_ptr(node_flag) || !ft_node_internal(node_flag))
+		if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
 			return 0;
 		kv = key_to_ordinal(ft, prefix[i]);
 		node_flag = ft_node_get_nth(node_flag, NULL, kv);
@@ -5722,6 +5761,8 @@ unsigned long ft_child_key_count(struct cds_ft_inode_flag *child)
 			cds_ft_item_to_metadata(ft_node_ptr(child));
 		return uatomic_load(&m->nr_keys, CMM_ACQUIRE);
 	}
+	/* Phase 2: compressed nodes would read their metadata nr_keys. */
+	assert(!ft_node_compressed(child));
 	return 1;
 }
 
@@ -5763,7 +5804,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		uint8_t child_key;
 		int pivot;
 
-		if (!ft_node_ptr(node_flag) || !ft_node_internal(node_flag))
+		if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
 			break;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
@@ -5818,7 +5859,7 @@ next_level:
 	}
 
 	/* Reached a leaf (external node). */
-	if (ft_node_ptr(node_flag) && !ft_node_internal(node_flag) && remaining == 0) {
+	if (ft_node_ptr(node_flag) && ft_node_external(node_flag) && remaining == 0) {
 		iter->key_len = level - 1;
 		{
 			int j;
@@ -5877,7 +5918,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		uint8_t child_key;
 		int pivot;
 
-		if (!ft_node_ptr(node_flag) || !ft_node_internal(node_flag))
+		if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
 			break;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
@@ -5931,7 +5972,7 @@ next_level:
 	}
 
 	/* Reached a leaf (external node). */
-	if (ft_node_ptr(node_flag) && !ft_node_internal(node_flag) && remaining == 0) {
+	if (ft_node_ptr(node_flag) && ft_node_external(node_flag) && remaining == 0) {
 		iter->key_len = level - 1;
 		{
 			int j;
@@ -5977,7 +6018,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 	for (i = 0; i < key_len; i++) {
 		uint8_t ordinal;
 
-		if (!ft_node_ptr(node_flag) || !ft_node_internal(node_flag))
+		if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
 			return -1;
 
 		ordinal = key_to_ordinal(ft, key[i]);
@@ -6088,7 +6129,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 		uint8_t child_key;
 		int pivot;
 
-		if (!ft_node_internal(ancestor))
+		if (ft_node_external(ancestor))
 			continue;
 
 		pivot = ordinal_key[level];
@@ -6142,7 +6183,7 @@ descend_forward:
 			int pivot;
 
 			if (!ft_node_ptr(node_flag) ||
-			    !ft_node_internal(node_flag))
+			    ft_node_external(node_flag))
 				break;
 
 			metadata = cds_ft_item_to_metadata(
@@ -6199,7 +6240,7 @@ next_forward_level:
 
 		/* Reached a leaf. */
 		if (ft_node_ptr(iter_path_node(iter)[level]) &&
-		    !ft_node_internal(iter_path_node(iter)[level]) &&
+		    ft_node_external(iter_path_node(iter)[level]) &&
 		    remaining == 0) {
 			int j;
 
@@ -6285,7 +6326,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		unsigned long left_keys = 0;
 		int pivot;
 
-		if (!ft_node_internal(ancestor))
+		if (ft_node_external(ancestor))
 			continue;
 
 		ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
@@ -6388,7 +6429,7 @@ descend_reverse:
 			int pivot;
 
 			if (!ft_node_ptr(node_flag) ||
-			    !ft_node_internal(node_flag))
+			    ft_node_external(node_flag))
 				break;
 
 			metadata = cds_ft_item_to_metadata(
@@ -6442,7 +6483,7 @@ next_reverse_level:
 
 		/* Reached a leaf. */
 		if (ft_node_ptr(iter_path_node(iter)[level]) &&
-		    !ft_node_internal(iter_path_node(iter)[level]) &&
+		    ft_node_external(iter_path_node(iter)[level]) &&
 		    remaining == 0) {
 			int j;
 
