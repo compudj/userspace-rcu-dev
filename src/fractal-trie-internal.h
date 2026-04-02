@@ -109,6 +109,7 @@ struct cds_ft_metadata {
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
 	unsigned int nr_child;			/* Number of children in node. */
 	int fallback_removal_count;		/* Removals left keeping fallback. */
+	unsigned long nr_keys;			/* Total unique keys in subtree. */
 };
 
 struct cds_ft_bitmap {

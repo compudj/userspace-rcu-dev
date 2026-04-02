@@ -1236,19 +1236,34 @@ void cds_ft_destroy(struct cds_ft *ft);
 bool cds_ft_empty(struct cds_ft *ft);
 
 /*
- * cds_ft_count - Return the number of external nodes in a Fractal Trie.
+ * cds_ft_count_keys - Return the number of unique keys in a Fractal Trie.
+ * @ft: The Fractal Trie.
+ *
+ * Returns the number of distinct keys that have at least one external
+ * node. Duplicates at the same key are counted as one. The count is
+ * maintained via per-node subtree counters propagated upward on each
+ * mutation.
+ *
+ * This function has O(1) time complexity. The RCU read-side lock must
+ * be held while calling this function. Concurrent updates may occur,
+ * so the result is an approximation when updates are in progress.
+ */
+unsigned long cds_ft_count_keys(struct cds_ft *ft);
+
+/*
+ * cds_ft_count_entries - Return the number of external nodes in a Fractal Trie.
  * @ft: The Fractal Trie.
  *
  * Returns the total number of external nodes (user-visible nodes)
- * currently stored in the trie, including duplicates, by iterating
- * over the trie and counting each node in every duplicate chain.
+ * currently stored in the trie, including duplicates. Each node in a
+ * duplicate chain is counted individually.
  *
  * This function has O(n) time complexity where n is the number of
  * external nodes. The RCU read-side lock must be held while calling
  * this function. Concurrent updates may occur during the traversal,
  * so the result is an approximation when updates are in progress.
  */
-unsigned long cds_ft_count(struct cds_ft *ft);
+unsigned long cds_ft_count_entries(struct cds_ft *ft);
 
 /*
  * cds_ft_key_len - Return the key length of a Fractal Trie.

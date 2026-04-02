@@ -2438,8 +2438,10 @@ retry:		/* for fallback */
 		}
 
 		dbg_printf("Recompact inherit from %p\n", metadata);
-		if (metadata)
+		if (metadata) {
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
+			new_metadata->nr_keys = metadata->nr_keys;
+		}
 		if (fallback)
 			new_metadata->fallback_removal_count =
 						FT_FALLBACK_REMOVAL_COUNT;
@@ -3603,6 +3605,23 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 }
 
 /*
+ * Propagate a signed delta to nr_keys through a snapshot
+ * of ancestor internal nodes collected during descent.
+ */
+static
+void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
+		int nr_snapshot, long delta)
+{
+	int i;
+
+	for (i = 0; i < nr_snapshot; i++) {
+		struct cds_ft_metadata *m =
+			cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
+		m->nr_keys += delta;
+	}
+}
+
+/*
  * We reached an unpopulated node. Create it and the children we need,
  * and then attach the entire branch to the current node. This may
  * trigger recompaction of the current node.
@@ -3667,6 +3686,12 @@ int ft_attach_node(struct cds_ft *ft,
 			dbg_printf("branch creation error %d\n", ret);
 			goto check_error;
 		}
+		/* Initialize subtree external count for new branch node. */
+		{
+			struct cds_ft_metadata *branch_meta =
+				cds_ft_item_to_metadata(ft_node_ptr(iter_dest_node_flag));
+			branch_meta->nr_keys = 1;
+		}
 		created_nodes[nr_created_nodes++] = iter_dest_node_flag;
 		iter_node_flag = iter_dest_node_flag;
 	}
@@ -3677,6 +3702,7 @@ int ft_attach_node(struct cds_ft *ft,
 
 		iter_node_metadata = cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
 		iter_node_metadata->external_nodes = external_nodes;
+		iter_node_metadata->nr_keys += 1;
 	}
 
 	/* Publish branch. */
@@ -3821,6 +3847,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 	struct ft_descent d;
 	const uint8_t *iter_key = key;
 	size_t key_len = ft_key_len(ft, _key_len);
+	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
+	int nr_snapshot = 0;
 	int ret;
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
@@ -3844,6 +3872,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 			break;
 		dbg_printf("cds_ft_insert iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
+		snapshot[nr_snapshot++] = d.nf;
 		key_value = key_to_ordinal(ft, *(iter_key++));
 		ft_descent_step(&d, key_value);
 	}
@@ -3857,6 +3886,12 @@ int _cds_ft_insert(struct cds_ft *ft,
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL);
+			if (ret == 0) {
+				/* Refresh snapshot: parent may have been recompacted. */
+				if (nr_snapshot > 0)
+					snapshot[nr_snapshot - 1] = *d.pnfp;
+				ft_propagate_external_count(snapshot, nr_snapshot, 1);
+			}
 
 		} else if (ft_node_internal(d.nf)) {
 			struct cds_ft_node *external_nodes;
@@ -3879,12 +3914,17 @@ int _cds_ft_insert(struct cds_ft *ft,
 				dbg_printf("cds_ft_insert duplicate internal ppnf %p pnf %p nfp %p nf %p\n",
 						d.ppnf, d.pnf, d.nfp, d.nf);
 
+				/* Adding duplicate at existing key: no key count change. */
 				ft_chain_node(last_node, node);
 				ret = 0;
 			} else {
+				/* New key at this internal node. */
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 				ret = 0;
+				/* Include current internal node in propagation. */
+				snapshot[nr_snapshot++] = d.nf;
+				ft_propagate_external_count(snapshot, nr_snapshot, 1);
 			}
 		} else {
 			struct cds_ft_node *iter_node, *last_node = NULL;
@@ -3901,6 +3941,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 			dbg_printf("cds_ft_insert duplicate external ppnf %p pnf %p nfp %p nf %p\n",
 					d.ppnf, d.pnf, d.nfp, d.nf);
 
+			/* Adding duplicate at existing key: no key count change. */
 			ft_chain_node(last_node, node);
 			ret = 0;
 		}
@@ -3923,6 +3964,12 @@ int _cds_ft_insert(struct cds_ft *ft,
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf));
+		if (ret == 0) {
+			/* Refresh snapshot: parent may have been recompacted. */
+			if (nr_snapshot > 0)
+				snapshot[nr_snapshot - 1] = *d.pnfp;
+			ft_propagate_external_count(snapshot, nr_snapshot, 1);
+		}
 	}
 
 	if (ret == 0) {
@@ -3992,6 +4039,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	struct ft_descent d;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, _key_len);
+	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
+	int nr_snapshot = 0;
 	int ret;
 
 	*old_node_ret = NULL;
@@ -4018,6 +4067,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			break;
 		dbg_printf("_cds_ft_insert_replace iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
+		snapshot[nr_snapshot++] = d.nf;
 		key_value = key_to_ordinal(ft, *(iter_key++));
 		ft_descent_step(&d, key_value);
 	}
@@ -4031,6 +4081,11 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL);
+			if (ret == 0) {
+				if (nr_snapshot > 0)
+					snapshot[nr_snapshot - 1] = *d.pnfp;
+				ft_propagate_external_count(snapshot, nr_snapshot, 1);
+			}
 		} else if (ft_node_internal(d.nf)) {
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
@@ -4040,20 +4095,22 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			if (external_nodes) {
 				dbg_printf("_cds_ft_insert_replace: replacing internal metadata chain %p\n",
 						external_nodes);
-				/* Replace entire existing chain. */
+				/* Replace existing chain: key count unchanged. */
 				*old_node_ret = external_nodes;
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 			} else {
-				/* No external nodes yet. Fresh insert. */
+				/* No external nodes yet. New key. */
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
+				snapshot[nr_snapshot++] = d.nf;
+				ft_propagate_external_count(snapshot, nr_snapshot, 1);
 			}
 			ret = 0;
 		} else {
 			dbg_printf("_cds_ft_insert_replace: replacing external chain %p\n",
 					ft_node_ptr(d.nf));
-			/* External node at end of key. Replace chain. */
+			/* External node at end of key. Replace chain: key count unchanged. */
 			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
 			node->next = NULL;
 			rcu_assign_pointer(*d.nfp, (struct cds_ft_inode_flag *) node);
@@ -4070,6 +4127,11 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf));
+		if (ret == 0) {
+			if (nr_snapshot > 0)
+				snapshot[nr_snapshot - 1] = *d.pnfp;
+			ft_propagate_external_count(snapshot, nr_snapshot, 1);
+		}
 	}
 
 	if (ret == 0) {
@@ -4468,6 +4530,14 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			}
 			ft_unchain_node(prev_node_ptr, match);
 			ret = 0;
+			/*
+			 * Propagate -1 only if the key's chain became empty.
+			 * If duplicates remain, the key still exists.
+			 */
+			if (!metadata->external_nodes) {
+				snapshot[nr_snapshot++] = dd.d.nf;
+				ft_propagate_external_count(snapshot, nr_snapshot, -1);
+			}
 		} else {
 			dbg_printf("cds_ft_remove: no metadata external node found for key\n");
 			return CDS_FT_STATUS_NOT_FOUND;
@@ -4504,13 +4574,22 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			/*
 			 * Removing last of duplicates. Last snapshot
 			 * does not have metadata (external leafs).
+			 *
+			 * Propagate -1 before detach, which may free
+			 * internal nodes in the snapshot.
 			 */
+			ft_propagate_external_count(snapshot, nr_snapshot, -1);
 			snapshot[nr_snapshot++] = dd.d.nf;
 			ret = ft_detach_node(ft, snapshot,
 					snapshot_n, nr_snapshot,
 					dd.det_nfp,
 					dd.det_pfp);
+			if (ret) {
+				/* Undo propagation on failure. */
+				ft_propagate_external_count(snapshot, nr_snapshot - 1, 1);
+			}
 		} else {
+			/* Removing duplicate, not last: key count unchanged. */
 			ft_unchain_node(prev_node_ptr, match);
 			ret = 0;
 		}
@@ -4581,6 +4660,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		}
 		*result_node = external_nodes;
 		rcu_assign_pointer(metadata->external_nodes, NULL);
+		metadata->nr_keys -= 1;
 		return CDS_FT_STATUS_OK;
 	}
 
@@ -4638,21 +4718,30 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * period must be observed before reclaiming any node
 		 * in the old chain.
 		 */
+		/* Removing one key (with all its duplicates). */
 		*result_node = external_nodes;
 		rcu_assign_pointer(metadata->external_nodes, NULL);
 		ret = 0;
+		/* Include current internal node in propagation. */
+		snapshot[nr_snapshot++] = dd.d.nf;
+		ft_propagate_external_count(snapshot, nr_snapshot, -1);
 	} else {
 		/*
 		 * External node at end of key. Detach the branch.
-		 * This is the same as removing the last duplicate in
-		 * cds_ft_remove().
+		 * Removing one key (with all its duplicates).
 		 */
 		*result_node = (struct cds_ft_node *) ft_node_ptr(dd.d.nf);
+		/* Propagate before detach to avoid writing freed metadata. */
+		ft_propagate_external_count(snapshot, nr_snapshot, -1);
 		snapshot[nr_snapshot++] = dd.d.nf;
 		ret = ft_detach_node(ft, snapshot,
 				snapshot_n, nr_snapshot,
 				dd.det_nfp,
 				dd.det_pfp);
+		if (ret) {
+			/* Undo propagation on failure. */
+			ft_propagate_external_count(snapshot, nr_snapshot - 1, 1);
+		}
 	}
 
 	/*
@@ -4686,11 +4775,14 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 static
 void ft_descend_to_graft_point(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
-		struct ft_descent *d)
+		struct ft_descent *d,
+		struct cds_ft_inode_flag **snapshot,
+		int *nr_snapshot)
 {
 	const uint8_t *ik = key;
 
 	ft_descent_init(d, ft);
+	*nr_snapshot = 0;
 
 	for (; d->depth < key_len; ) {
 		uint8_t kv;
@@ -4698,6 +4790,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 		if (!ft_node_ptr(d->nf) || !ft_node_internal(d->nf))
 			break;
 
+		snapshot[(*nr_snapshot)++] = d->nf;
 		kv = key_to_ordinal(ft, *(ik++));
 		ft_descent_step(d, kv);
 	}
@@ -4711,7 +4804,8 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 static
 struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		const uint8_t *key, unsigned int start, unsigned int end,
-		struct cds_ft_inode_flag *leaf)
+		struct cds_ft_inode_flag *leaf,
+		unsigned long subtree_external_count)
 {
 	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *cur = leaf;
@@ -4727,6 +4821,11 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 			for (j = 0; j < nr; j++)
 				free_cds_ft_node(ft, ft_node_ptr(created[j]));
 			return NULL;
+		}
+		{
+			struct cds_ft_metadata *m =
+				cds_ft_item_to_metadata(ft_node_ptr(dest));
+			m->nr_keys = subtree_external_count;
 		}
 		created[nr++] = dest;
 		cur = dest;
@@ -4775,7 +4874,8 @@ static
 enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		struct ft_descent *d,
-		struct cds_ft_inode_flag *graft_payload)
+		struct cds_ft_inode_flag *graft_payload,
+		unsigned long graft_external_count)
 {
 	struct cds_ft_inode *old_recompacted_node = NULL;
 
@@ -4809,7 +4909,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 			displaced = (struct cds_ft_node *)
 				ft_node_ptr(d->nf);
 
-		branch = ft_build_branch(ft, key, i, key_len, graft_payload);
+		branch = ft_build_branch(ft, key, i, key_len, graft_payload,
+				graft_external_count);
 		if (!branch)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -4818,6 +4919,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 				cds_ft_item_to_metadata(
 					ft_node_ptr(branch));
 			bm->external_nodes = displaced;
+			bm->nr_keys += 1;
 		}
 
 		if (displaced) {
@@ -4914,6 +5016,9 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		struct ft_descent d;
 		struct cds_ft_inode *fresh_node;
 		struct cds_ft_metadata *fresh_meta;
+		struct cds_ft_inode_flag *graft_snapshot[FT_MAX_DEPTH];
+		int nr_graft_snapshot;
+		unsigned long src_count = src_rmeta->nr_keys;
 
 		/*
 		 * Preallocate a fresh empty root for the source trie
@@ -4924,7 +5029,8 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		if (!fresh_node)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
-		ft_descend_to_graft_point(dst_ft, key, key_len, &d);
+		ft_descend_to_graft_point(dst_ft, key, key_len, &d,
+				graft_snapshot, &nr_graft_snapshot);
 
 		/*
 		 * The source root node becomes the graft payload.  Its
@@ -4933,11 +5039,18 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 * destination.  No relocation needed.
 		 */
 		status = ft_store_at_graft_point(dst_ft, key, key_len,
-						  &d, src_ft->root);
+						  &d, src_ft->root,
+						  src_count);
 		if (status != CDS_FT_STATUS_OK) {
 			free_cds_ft_node(src_ft, fresh_node);
 			return status;
 		}
+
+		/* Refresh snapshot: parent may have been recompacted. */
+		if (nr_graft_snapshot > 0)
+			graft_snapshot[nr_graft_snapshot - 1] = *d.pnfp;
+		ft_propagate_external_count(graft_snapshot, nr_graft_snapshot,
+				(long) src_count);
 
 		/* Give source a fresh empty root. */
 		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
@@ -5013,10 +5126,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *old_child, *old_swap_root;
 		struct cds_ft_inode *fresh = NULL;
 		struct cds_ft_metadata *fresh_meta = NULL;
+		struct cds_ft_inode_flag *graft_snapshot[FT_MAX_DEPTH];
+		int nr_graft_snapshot;
 		bool swap_empty;
 		bool need_fresh;
+		unsigned long old_count, swap_count;
 
-		ft_descend_to_graft_point(dst_ft, key, key_len, &d);
+		ft_descend_to_graft_point(dst_ft, key, key_len, &d,
+				graft_snapshot, &nr_graft_snapshot);
 
 		if (d.depth < key_len) {
 			/*
@@ -5034,6 +5151,18 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		swap_rmeta = ft_root_metadata(swap_ft);
 		swap_empty = (swap_rmeta->nr_child == 0
 				&& !swap_rmeta->external_nodes);
+		swap_count = swap_empty ? 0 : swap_rmeta->nr_keys;
+
+		/* Compute old_count from the content being displaced. */
+		if (ft_node_ptr(old_child) && ft_node_internal(old_child)) {
+			struct cds_ft_metadata *old_meta =
+				cds_ft_item_to_metadata(ft_node_ptr(old_child));
+			old_count = old_meta->nr_keys;
+		} else if (ft_node_ptr(old_child)) {
+			old_count = 1;	/* One key (possibly with duplicates). */
+		} else {
+			old_count = 0;
+		}
 
 		/*
 		 * A fresh root for swap_ft is needed when old_child
@@ -5067,6 +5196,12 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		else if (ft_node_ptr(old_child) && swap_empty)
 			pmeta->nr_child--;
 
+		/* Propagate external node count delta through ancestors. */
+		if (swap_count != old_count)
+			ft_propagate_external_count(graft_snapshot,
+					nr_graft_snapshot,
+					(long) swap_count - (long) old_count);
+
 		/*
 		 * Set up swap_ft to hold old content from the graft
 		 * point.  If old_child is an internal node, it
@@ -5083,16 +5218,20 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				free_cds_ft_node(swap_ft,
 					ft_node_ptr(old_swap_root));
 		} else if (swap_empty) {
-			if (ft_node_ptr(old_child))
+			if (ft_node_ptr(old_child)) {
 				swap_rmeta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(old_child);
+				swap_rmeta->nr_keys = old_count;
+			}
 		} else {
 			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
-			if (ft_node_ptr(old_child))
+			if (ft_node_ptr(old_child)) {
 				fresh_meta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(old_child);
+				fresh_meta->nr_keys = old_count;
+			}
 		}
 
 		{
@@ -5216,54 +5355,86 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		if (!ft_node_ptr(child))
 			return CDS_FT_STATUS_NOT_FOUND;
 
-		status = cds_ft_create(ft->group, &detached);
-		if (status != CDS_FT_STATUS_OK)
-			return status;
-
 		/*
-		 * Detach child from the source trie and prune empty
-		 * branches above.  After this, child is no longer
-		 * reachable from the live trie for new readers.
+		 * Compute the external node count of the subtree
+		 * being detached before it is removed from the trie.
 		 */
-		snapshot[nr_snapshot++] = child;
 		{
-			int ret = ft_detach_node(ft, snapshot, snapshot_n,
-						 nr_snapshot,
-						 dd.det_nfp, dd.det_pfp);
-			assert(ret != -ENOENT);
-			if (ret < 0) {
-				/*
-				 * Recompaction failed (-ENOMEM). The
-				 * source trie remains unmodified. Clean
-				 * up the destination trie and abort.
-				 */
-				cds_ft_destroy(detached);
-				return CDS_FT_STATUS_MEMORY_ERROR;
-			}
-		}
+			unsigned long detached_count;
 
-		/*
-		 * If the detached child is an internal node, it
-		 * becomes the detached trie's root directly.  Its
-		 * metadata.external_nodes carries the entries at the
-		 * detach key, which become NIL-key entries in the
-		 * detached trie.  Free the empty root that
-		 * cds_ft_create allocated and replace it.
-		 *
-		 * If the child is an external node, place it in the
-		 * detached trie's (empty) root metadata as a NIL-key
-		 * entry.
-		 */
-		if (ft_node_internal(child)) {
-			free_cds_ft_node(detached,
-				ft_node_ptr(detached->root));
-			/* No readers in detached root yet. */
-			detached->root = child;
-		} else {
-			struct cds_ft_metadata *dmeta =
-				ft_root_metadata(detached);
-			dmeta->external_nodes =
-				(struct cds_ft_node *) ft_node_ptr(child);
+			if (ft_node_internal(child)) {
+				struct cds_ft_metadata *child_meta =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(child));
+				detached_count = child_meta->nr_keys;
+			} else {
+				detached_count = 1;	/* One key (possibly with duplicates). */
+			}
+
+			status = cds_ft_create(ft->group, &detached);
+			if (status != CDS_FT_STATUS_OK)
+				return status;
+
+			/*
+			 * Propagate count removal through ancestors
+			 * before detach to avoid writing freed metadata.
+			 */
+			ft_propagate_external_count(snapshot, nr_snapshot,
+					-(long) detached_count);
+
+			/*
+			 * Detach child from the source trie and prune
+			 * empty branches above.  After this, child is
+			 * no longer reachable from the live trie for
+			 * new readers.
+			 */
+			snapshot[nr_snapshot++] = child;
+			{
+				int ret = ft_detach_node(ft, snapshot,
+							 snapshot_n,
+							 nr_snapshot,
+							 dd.det_nfp,
+							 dd.det_pfp);
+				assert(ret != -ENOENT);
+				if (ret < 0) {
+					/*
+					 * Recompaction failed (-ENOMEM).
+					 * Undo propagation and abort.
+					 */
+					ft_propagate_external_count(snapshot,
+							nr_snapshot - 1,
+							(long) detached_count);
+					cds_ft_destroy(detached);
+					return CDS_FT_STATUS_MEMORY_ERROR;
+				}
+			}
+
+			/*
+			 * If the detached child is an internal node, it
+			 * becomes the detached trie's root directly.
+			 * Its metadata.external_nodes carries the
+			 * entries at the detach key, which become
+			 * NIL-key entries in the detached trie.  Free
+			 * the empty root that cds_ft_create allocated
+			 * and replace it.
+			 *
+			 * If the child is an external node, place it in
+			 * the detached trie's (empty) root metadata as
+			 * a NIL-key entry.
+			 */
+			if (ft_node_internal(child)) {
+				free_cds_ft_node(detached,
+					ft_node_ptr(detached->root));
+				/* No readers in detached root yet. */
+				detached->root = child;
+			} else {
+				struct cds_ft_metadata *dmeta =
+					ft_root_metadata(detached);
+				dmeta->external_nodes =
+					(struct cds_ft_node *)
+					ft_node_ptr(child);
+				dmeta->nr_keys = detached_count;
+			}
 		}
 		{
 			size_t fm = uatomic_load(&ft->max_used_key_len,
@@ -5329,7 +5500,19 @@ bool cds_ft_empty(struct cds_ft *ft)
 	return !uatomic_load(&rmeta->external_nodes, CMM_RELAXED);
 }
 
-unsigned long cds_ft_count(struct cds_ft *ft)
+unsigned long cds_ft_count_keys(struct cds_ft *ft)
+{
+	struct cds_ft_inode_flag *root_flag;
+	struct cds_ft_metadata *rmeta;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	root_flag = rcu_dereference(ft->root);
+	rmeta = cds_ft_item_to_metadata(ft_node_ptr(root_flag));
+	return rmeta->nr_keys;
+}
+
+unsigned long cds_ft_count_entries(struct cds_ft *ft)
 {
 	struct cds_ft_iter *iter;
 	enum cds_ft_status status;
