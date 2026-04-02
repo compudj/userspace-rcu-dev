@@ -57,7 +57,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	10
+#define NR_TESTS	11
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2164,6 +2164,424 @@ static int inv_skip_reverse_stability(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 11: nr_keys undercount ordering                        */
+/*                                                                    */
+/*   The nr_keys metadata is updated with a specific ordering         */
+/*   relative to pointer publication:                                 */
+/*                                                                    */
+/*     Insert: publish pointer, then increment nr_keys.               */
+/*     Remove: decrement nr_keys, then detach pointer.                */
+/*                                                                    */
+/*   Both produce a transient undercount: nr_keys <= actual reachable */
+/*   keys.  The practical consequence is that lookup_nth(N-1) should  */
+/*   always find a valid key when cds_ft_count_keys returned N > 0,   */
+/*   provided that the actual key population never drops below N      */
+/*   between the two calls.                                           */
+/*                                                                    */
+/*   Insert phase: an insert-only writer ensures the actual count is  */
+/*   monotonically non-decreasing.  If cds_ft_count_keys returns N,   */
+/*   there are at least N reachable keys (undercount), and            */
+/*   lookup_nth(N-1) must succeed.  An overcount bug would cause      */
+/*   N > actual, making lookup_nth(N-1) fail.                         */
+/*                                                                    */
+/*   Remove phase: a remove-only writer ensures the actual count is   */
+/*   monotonically non-increasing.  The reader iterates first         */
+/*   (pointer-based count), then reads count_keys.  With decrement-   */
+/*   before-detach ordering, count_keys can only lag behind (or       */
+/*   equal) the iteration count, so count_keys <= iter_count must     */
+/*   hold.  An overcount bug (detach-before-decrement) would cause    */
+/*   count_keys > iter_count.                                         */
+/*                                                                    */
+/*   A quiescent phase after each concurrent phase verifies that      */
+/*   count_keys equals iteration_count exactly.                       */
+/*                                                                    */
+/* ================================================================== */
+
+static void *inv_nr_keys_undercount_reader(void *arg)
+{
+	struct inv_iter_ctx *ctx = (struct inv_iter_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned long count_keys;
+		enum cds_ft_status s;
+
+		rcu_read_lock();
+
+		count_keys = cds_ft_count_keys(ctx->ft);
+
+		/*
+		 * With an insert-only writer and undercount ordering,
+		 * there are always >= count_keys reachable keys.
+		 * lookup_nth(count_keys - 1) and lookup_nth_last(0)
+		 * through lookup_nth_last(count_keys - 1) must find
+		 * valid keys.
+		 */
+		if (count_keys > 0) {
+			s = cds_ft_lookup_nth(ctx->ft, iter,
+					count_keys - 1);
+			if (s != CDS_FT_STATUS_OK) {
+				report_violation(ctx->test_name,
+					"lookup_nth(%lu) returned %s "
+					"(count_keys %lu, iter #%lu)",
+					count_keys - 1,
+					cds_ft_status_to_string(s),
+					count_keys, iters);
+			}
+			s = cds_ft_lookup_nth_last(ctx->ft, iter,
+					count_keys - 1);
+			if (s != CDS_FT_STATUS_OK) {
+				report_violation(ctx->test_name,
+					"lookup_nth_last(%lu) returned %s "
+					"(count_keys %lu, iter #%lu)",
+					count_keys - 1,
+					cds_ft_status_to_string(s),
+					count_keys, iters);
+			}
+		}
+		rcu_read_unlock();
+
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * Insert-only writer: only adds keys, never removes.
+ * This guarantees that the actual key count is monotonically
+ * non-decreasing, making the undercount invariant testable.
+ */
+static void *inv_nr_keys_undercount_writer(void *arg)
+{
+	struct inv_iter_ctx *ctx = (struct inv_iter_ctx *) arg;
+	unsigned int seed;
+	pthread_mutex_t *lock = (pthread_mutex_t *)(ctx + 1);
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
+		struct ft_test_node *n = node_alloc(key);
+
+		rcu_read_lock();
+		pthread_mutex_lock(lock);
+		insert_u64(ctx->ft, key, n);
+		pthread_mutex_unlock(lock);
+		rcu_read_unlock();
+
+		if ((seed & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * Remove-phase reader: iterate first (pointer-based), then read
+ * count_keys.  With remove-only writer and decrement-before-detach
+ * ordering, count_keys can only decrease between the iteration and
+ * the count_keys read, so count_keys <= iter_count must hold.
+ */
+static void *inv_nr_keys_remove_reader(void *arg)
+{
+	struct inv_iter_ctx *ctx = (struct inv_iter_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned long count_keys, iter_count;
+
+		rcu_read_lock();
+
+		/*
+		 * Iterate first: count reachable keys via pointers.
+		 * Then read count_keys (based on nr_keys metadata).
+		 *
+		 * With a remove-only writer:
+		 * - Each removal decrements nr_keys BEFORE detaching
+		 *   the pointer.
+		 * - Between our iteration and count_keys read, only
+		 *   removals happen (decreasing both values).
+		 * - Removals behind the iterator don't change
+		 *   iter_count (already counted).
+		 * - Removals ahead of the iterator reduce iter_count
+		 *   (missed) AND reduce count_keys (decremented).
+		 * - count_keys can drop further than iter_count
+		 *   (decrement is first step of each removal).
+		 *
+		 * Therefore count_keys <= iter_count must hold.
+		 */
+		iter_count = 0;
+		cds_ft_for_each_rcu(ctx->ft, iter) {
+			iter_count++;
+		}
+
+		count_keys = cds_ft_count_keys(ctx->ft);
+
+		if (count_keys > iter_count) {
+			report_violation(ctx->test_name,
+				"remove phase: count_keys %lu > "
+				"iteration_count %lu (iter #%lu)",
+				count_keys, iter_count, iters);
+		}
+		rcu_read_unlock();
+
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * Remove-only writer: only removes keys, never inserts.
+ */
+static void *inv_nr_keys_remove_writer(void *arg)
+{
+	struct inv_iter_ctx *ctx = (struct inv_iter_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+	pthread_mutex_t *lock = (pthread_mutex_t *)(ctx + 1);
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
+		struct cds_ft_node *found;
+		uint8_t k[8];
+
+		rcu_read_lock();
+		cds_ft_u64_to_key(ctx->ft, key, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_lookup(ctx->ft, iter);
+		found = cds_ft_iter_node(iter);
+		if (found) {
+			struct ft_test_node *tn = to_test_node(found);
+
+			pthread_mutex_lock(lock);
+			if (cds_ft_remove(ctx->ft, iter, &tn->node)
+			    == CDS_FT_STATUS_OK) {
+				node_free_rcu(tn);
+			}
+			pthread_mutex_unlock(lock);
+		}
+		rcu_read_unlock();
+
+		if ((seed & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * Helper: quiescent check that count_keys == iteration_count.
+ * Returns 0 on success, -1 on mismatch.
+ */
+static int quiescent_count_check(struct cds_ft *ft, const char *phase)
+{
+	struct cds_ft_iter *check_iter;
+	unsigned long count_keys, iter_count;
+
+	if (cds_ft_iter_create(ft, &check_iter) < 0)
+		return -1;
+	rcu_read_lock();
+	count_keys = cds_ft_count_keys(ft);
+	iter_count = 0;
+	cds_ft_for_each_rcu(ft, check_iter) {
+		iter_count++;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(check_iter);
+
+	if (count_keys != iter_count) {
+		fprintf(stderr,
+			"inv_nr_keys_undercount: %s quiescent mismatch: "
+			"count_keys %lu != iteration_count %lu\n",
+			phase, count_keys, iter_count);
+		return -1;
+	}
+	return 0;
+}
+
+static int inv_nr_keys_undercount(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct timespec t0;
+	struct {
+		struct inv_iter_ctx ctx;
+		pthread_mutex_t lock;
+	} shared;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	shared.ctx.ft = ft;
+	shared.ctx.key_len = 4;
+	shared.ctx.test_name = "inv_nr_keys_undercount";
+	pthread_mutex_init(&shared.lock, NULL);
+
+	/*
+	 * Phase 1: Insert-only writer.
+	 *
+	 * Pre-populate, then insert-only writers add more keys.
+	 * Readers check: count_keys = N implies lookup_nth(N-1)
+	 * and lookup_nth_last(N-1) succeed.
+	 */
+	rcu_read_lock();
+	for (i = 0; i < WRITER_POOL_SIZE / 2; i++) {
+		struct ft_test_node *n = node_alloc(i);
+		insert_u64(ft, i, n);
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_nr_keys_undercount_reader, &shared.ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL,
+			inv_nr_keys_undercount_writer, &shared.ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS / 2)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr,
+			"inv_nr_keys_undercount: insert phase: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		pthread_mutex_destroy(&shared.lock);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Quiescent check after insert phase. */
+	if (quiescent_count_check(ft, "insert") < 0) {
+		pthread_mutex_destroy(&shared.lock);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/*
+	 * Phase 2: Remove-only writer.
+	 *
+	 * The trie is now populated from phase 1.  Remove-only
+	 * writers drain keys.  Readers iterate first (pointer-based
+	 * count), then read count_keys, and check count_keys <=
+	 * iter_count.
+	 */
+	atomic_store(&violation_count, 0);
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_nr_keys_remove_reader, &shared.ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL,
+			inv_nr_keys_remove_writer, &shared.ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS / 2)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&shared.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr,
+			"inv_nr_keys_undercount: remove phase: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Quiescent check after remove phase. */
+	if (quiescent_count_check(ft, "remove") < 0) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -2206,6 +2624,9 @@ int main(int argc, char **argv)
 	diag("7. Iterator skip stability");
 	RUN_TEST(inv_skip_forward_stability);
 	RUN_TEST(inv_skip_reverse_stability);
+
+	diag("8. nr_keys undercount ordering");
+	RUN_TEST(inv_nr_keys_undercount);
 
 	rcu_barrier();
 	rcu_unregister_thread();
