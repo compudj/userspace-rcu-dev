@@ -974,6 +974,24 @@ uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
 }
 
 /*
+ * Explicit acquire-load for child pointer dereference.
+ *
+ * Count-based readers (lookup_nth, skip, count_keys) need acquire
+ * ordering on child pointer loads to pair with the writer's
+ * rcu_assign_pointer (release) during removal.  This ensures that
+ * if a reader sees a detached pointer, it also sees the preceding
+ * nr_keys decrement (undercount guarantee on weakly-ordered
+ * architectures).
+ *
+ * Current toolchains already compile rcu_dereference (CMM_CONSUME)
+ * as CMM_ACQUIRE; this macro makes the acquire unconditional,
+ * removing the dependency on the URCU_DEREFERENCE_USE_VOLATILE
+ * escape hatch.
+ */
+#define ft_dereference_acquire(p)	\
+	(__typeof__(p)) uatomic_load(&(p), CMM_ACQUIRE)
+
+/*
  * The order in which values and pointers are does does not matter: if
  * a value is missing, we return NULL. If a value is there, but its
  * associated pointers is still NULL, we return NULL too.
@@ -1032,7 +1050,7 @@ found:
 
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = &pointers[i];
-		return rcu_dereference(pointers[i]);
+		return ft_dereference_acquire(pointers[i]);
 	}
 }
 
@@ -1130,7 +1148,7 @@ found:
 			align_ptr_size(&node->data[1] + type->max_linear_child);
 
 		if (caa_unlikely(node_flag_ptr)) *node_flag_ptr = &pointers[i];
-		return rcu_dereference(pointers[i]);
+		return ft_dereference_acquire(pointers[i]);
 	}
 }
 
@@ -1224,7 +1242,7 @@ found:
 	{
 		uint8_t *values = &node->data[1];
 		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
-		struct cds_ft_inode_flag *ptr = rcu_dereference(pointers[i]);
+		struct cds_ft_inode_flag *ptr = ft_dereference_acquire(pointers[i]);
 
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = &pointers[i];
@@ -1261,7 +1279,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		return NULL;
 	}
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
-	ptr = rcu_dereference(pointers[i]);
+	ptr = ft_dereference_acquire(pointers[i]);
 	if (caa_unlikely(node_flag_ptr))
 		*node_flag_ptr = &pointers[i];
 	return ptr;
@@ -1301,7 +1319,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 		unsigned int v;
 
 		v = uatomic_load(&values[i], CMM_RELAXED);
-		ptr = rcu_dereference(pointers[i]);
+		ptr = ft_dereference_acquire(pointers[i]);
 		if (!ptr)
 			continue;
 		if (dir == FT_LEFT) {
@@ -1348,7 +1366,7 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 	values = &node->data[1];
 	*v = values[i];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
-	*iter = rcu_dereference(pointers[i]);
+	*iter = ft_dereference_acquire(pointers[i]);
 }
 
 static inline_lookup
@@ -1497,7 +1515,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type *type,
 
 	assert(type->type_class == FT_PIGEON);
 	child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[n];
-	child_node_flag = rcu_dereference(*child_node_flag_ptr);
+	child_node_flag = ft_dereference_acquire(*child_node_flag_ptr);
 	//dbg_printf("ft_pigeon_node_get_nth child_node_flag_ptr %p\n",
 	//	child_node_flag_ptr);
 	if (caa_unlikely(node_flag_ptr))
@@ -1529,7 +1547,7 @@ retry:
 		i = cds_find_next_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n + 1);
 	if (i >= 0) {
 		child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[i];
-		child_node_flag = rcu_dereference(*child_node_flag_ptr);
+		child_node_flag = ft_dereference_acquire(*child_node_flag_ptr);
 		if (!child_node_flag) {
 			/*
 			 * The source of truth is the pointer load.
@@ -1548,7 +1566,7 @@ retry:
 		/* n - 1 is first value left of n */
 		for (i = n - 1; i >= 0; i--) {
 			child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[i];
-			child_node_flag = rcu_dereference(*child_node_flag_ptr);
+			child_node_flag = ft_dereference_acquire(*child_node_flag_ptr);
 			if (child_node_flag) {
 				dbg_printf("ft_pigeon_node_get_left child_node_flag %p\n",
 					child_node_flag);
@@ -1560,7 +1578,7 @@ retry:
 		/* n + 1 is first value right of n */
 		for (i = n + 1; i < FT_ENTRY_PER_NODE; i++) {
 			child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[i];
-			child_node_flag = rcu_dereference(*child_node_flag_ptr);
+			child_node_flag = ft_dereference_acquire(*child_node_flag_ptr);
 			if (child_node_flag) {
 				dbg_printf("ft_pigeon_node_get_right child_node_flag %p\n",
 					child_node_flag);
@@ -3609,24 +3627,83 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
  * Propagate a signed delta to nr_keys through a snapshot
  * of ancestor internal nodes collected during descent.
  *
- * Ordering with respect to pointer publication/removal:
+ * There are two types of concurrent readers:
  *
- *   Insert: publish pointer (rcu_assign_pointer), then increment nr_keys.
- *   Remove: decrement nr_keys, then detach pointer (rcu_assign_pointer).
+ *  - Pointer-based readers (iteration, key lookup) follow pointers
+ *    with rcu_dereference.  They are not affected by nr_keys and
+ *    always see a structurally consistent trie via RCU.
  *
- * Both orderings produce a transient undercount: during the window
- * between the two steps, nr_keys < the number of actually reachable
- * keys.  This is the conservative direction for count-based readers
- * (lookup_nth, skip, count_keys): they may transiently miss a key at
- * the boundary of a concurrent mutation, but they will never enter a
- * subtree expecting a key that does not exist.
+ *  - Count-based readers (lookup_nth, lookup_nth_last, skip,
+ *    count_keys, count_keys_prefix) read nr_keys to guide their
+ *    descent.  They use ft_dereference_acquire (CMM_ACQUIRE load)
+ *    for both nr_keys loads and child pointer loads, rather than
+ *    rcu_dereference, to obtain the memory ordering described below.
  *
- * The alternative (overcount) would cause count-based readers to
- * descend into a subtree with fewer keys than expected, potentially
- * yielding NOT_FOUND for a key that should be reachable at that rank.
+ * Undercount property:
  *
- * Pointer-based readers (iteration, key lookup) are not affected by
- * nr_keys and always see a structurally consistent trie via RCU.
+ * The update ordering is chosen so that nr_keys transiently
+ * undercounts (nr_keys <= actual reachable keys) rather than
+ * overcounts.  This is the conservative direction for count-based
+ * readers: they may transiently miss a key at the boundary of a
+ * concurrent mutation, but they will never enter a subtree expecting
+ * a key that does not exist.  The alternative (overcount) would cause
+ * count-based readers to descend into a subtree with fewer keys than
+ * expected, potentially yielding NOT_FOUND for a key that should be
+ * reachable at that rank.
+ *
+ * Insert ordering: publish pointer, then increment nr_keys.
+ *
+ *   Writer:
+ *     W1: rcu_assign_pointer(child, new_node)  [store-release]
+ *     W2: uatomic_store(ancestor.nr_keys, ++, CMM_RELEASE)
+ *
+ *   W2 release ensures W1 is visible when W2 becomes visible.
+ *
+ *   Reader (count-based):
+ *     R1: uatomic_load(ancestor.nr_keys, CMM_ACQUIRE)
+ *     R2: ft_dereference_acquire(child)         [load-acquire]
+ *
+ *   Pairing:  If R1 sees the incremented nr_keys (from W2), the
+ *   R1 acquire pairs with the W2 release.  All stores before W2
+ *   (including W1, the pointer publication) are visible to R1.
+ *   Since R2 is ordered after R1 (by R1 acquire), R2 sees the
+ *   published pointer.
+ *
+ *   If R1 sees the old nr_keys (W2 not yet visible), the reader
+ *   does not know about the new key.  It skips the subtree —
+ *   undercount.
+ *
+ * Remove ordering: decrement nr_keys, then detach pointer.
+ *
+ *   Writer:
+ *     W1: uatomic_store(ancestor.nr_keys, --, CMM_RELEASE)
+ *     W2: rcu_assign_pointer(child, NULL)       [store-release]
+ *
+ *   W2 release ensures W1 is visible when W2 becomes visible.
+ *
+ *   Reader (count-based):
+ *     R1: uatomic_load(ancestor.nr_keys, CMM_ACQUIRE)
+ *     R2: ft_dereference_acquire(child)         [load-acquire]
+ *
+ *   Pairing:  If R2 sees the detached pointer (NULL from W2), the
+ *   R2 acquire pairs with the W2 release.  All stores before W2
+ *   (including W1, the nr_keys decrement) are visible.  The key
+ *   question is whether R1 also sees W1.  On multi-copy-atomic
+ *   architectures (x86 TSO, ARMv8), the R1 acquire orders R1
+ *   before R2, and the coherence guarantee ensures R1 observes
+ *   at least the state that was globally visible when R2's value
+ *   was stored — which includes W1.
+ *
+ *   If R2 sees the old pointer (child still present), the key is
+ *   still reachable.  The reader may or may not see the
+ *   decremented nr_keys — either way nr_keys <= actual
+ *   (undercount).
+ *
+ *   If R1 sees the decremented nr_keys but R2 sees the old pointer
+ *   (child still present), nr_keys < actual — undercount.
+ *
+ * In summary, regardless of which combination of old/new values
+ * the reader observes, nr_keys <= actual reachable keys.
  */
 static
 void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
@@ -3637,7 +3714,7 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 	for (i = 0; i < nr_snapshot; i++) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
-		uatomic_store(&m->nr_keys, m->nr_keys + delta, CMM_RELAXED);
+		uatomic_store(&m->nr_keys, m->nr_keys + delta, CMM_RELEASE);
 	}
 }
 
@@ -4549,16 +4626,18 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
 				return CDS_FT_STATUS_NOT_FOUND;
 			}
-			ft_unchain_node(prev_node_ptr, match);
-			ret = 0;
 			/*
-			 * Propagate -1 only if the key's chain became empty.
-			 * If duplicates remain, the key still exists.
+			 * Propagate -1 before unchain if this is the last
+			 * entry in the chain (undercount ordering: decrement
+			 * nr_keys before detaching the pointer).
 			 */
-			if (!metadata->external_nodes) {
+			if (prev_node_ptr == (struct cds_ft_node **) &metadata->external_nodes
+			    && !match->next) {
 				snapshot[nr_snapshot++] = dd.d.nf;
 				ft_propagate_external_count(snapshot, nr_snapshot, -1);
 			}
+			ft_unchain_node(prev_node_ptr, match);
+			ret = 0;
 		} else {
 			dbg_printf("cds_ft_remove: no metadata external node found for key\n");
 			return CDS_FT_STATUS_NOT_FOUND;
@@ -4680,9 +4759,10 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		*result_node = external_nodes;
-		rcu_assign_pointer(metadata->external_nodes, NULL);
+		/* Decrement before detach (undercount ordering). */
 		uatomic_store(&metadata->nr_keys, metadata->nr_keys - 1,
-			CMM_RELAXED);
+			CMM_RELEASE);
+		rcu_assign_pointer(metadata->external_nodes, NULL);
 		return CDS_FT_STATUS_OK;
 	}
 
@@ -4740,13 +4820,15 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * period must be observed before reclaiming any node
 		 * in the old chain.
 		 */
-		/* Removing one key (with all its duplicates). */
+		/*
+		 * Removing one key (with all its duplicates).
+		 * Decrement before detach (undercount ordering).
+		 */
 		*result_node = external_nodes;
-		rcu_assign_pointer(metadata->external_nodes, NULL);
-		ret = 0;
-		/* Include current internal node in propagation. */
 		snapshot[nr_snapshot++] = dd.d.nf;
 		ft_propagate_external_count(snapshot, nr_snapshot, -1);
+		rcu_assign_pointer(metadata->external_nodes, NULL);
+		ret = 0;
 	} else {
 		/*
 		 * External node at end of key. Detach the branch.
@@ -5246,7 +5328,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				swap_rmeta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(old_child);
-				uatomic_store(&swap_rmeta->nr_keys, old_count, CMM_RELAXED);
+				uatomic_store(&swap_rmeta->nr_keys, old_count, CMM_RELEASE);
 			}
 		} else {
 			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
@@ -5254,7 +5336,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				fresh_meta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(old_child);
-				uatomic_store(&fresh_meta->nr_keys, old_count, CMM_RELAXED);
+				uatomic_store(&fresh_meta->nr_keys, old_count, CMM_RELEASE);
 			}
 		}
 
@@ -5535,7 +5617,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	if (prefix_len > ft->group->max_key_len)
 		return 0;
 
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft_dereference_acquire(ft->root);
 
 	for (i = 0; i < prefix_len; i++) {
 		uint8_t kv;
@@ -5551,7 +5633,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	if (ft_node_internal(node_flag)) {
 		struct cds_ft_metadata *metadata =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		return uatomic_load(&metadata->nr_keys, CMM_RELAXED);
+		return uatomic_load(&metadata->nr_keys, CMM_ACQUIRE);
 	}
 	/* External node: one key (possibly with duplicates). */
 	return 1;
@@ -5571,7 +5653,7 @@ unsigned long ft_child_key_count(struct cds_ft_inode_flag *child)
 	if (ft_node_internal(child)) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(child));
-		return uatomic_load(&m->nr_keys, CMM_RELAXED);
+		return uatomic_load(&m->nr_keys, CMM_ACQUIRE);
 	}
 	return 1;
 }
@@ -5604,12 +5686,13 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft_dereference_acquire(ft->root);
 	iter_path_node(iter)[0] = node_flag;
 
 	for (level = 1; ; level++) {
 		struct cds_ft_metadata *metadata;
 		struct cds_ft_inode_flag *child;
+		struct cds_ft_node *ext;
 		uint8_t child_key;
 		int pivot;
 
@@ -5619,7 +5702,8 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 
 		/* Keys at this node's depth come first in ordinal order. */
-		if (metadata->external_nodes) {
+		ext = ft_dereference_acquire(metadata->external_nodes);
+		if (ext) {
 			if (remaining == 0) {
 				/* Found: the key at this node's depth. */
 				iter->key_len = level - 1;
@@ -5629,7 +5713,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 					for (j = 0; j < level - 1; j++)
 						iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
 				}
-				iter->node = metadata->external_nodes;
+				iter->node = ext;
 				iter->path_valid = true;
 				iter_debug_path_update(iter);
 				iter->path_len = level;
@@ -5716,12 +5800,13 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft_dereference_acquire(ft->root);
 	iter_path_node(iter)[0] = node_flag;
 
 	for (level = 1; ; level++) {
 		struct cds_ft_metadata *metadata;
 		struct cds_ft_inode_flag *child;
+		struct cds_ft_node *ext;
 		uint8_t child_key;
 		int pivot;
 
@@ -5751,7 +5836,8 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		}
 
 		/* External_nodes at this depth are the smallest (last in reverse). */
-		if (metadata->external_nodes) {
+		ext = ft_dereference_acquire(metadata->external_nodes);
+		if (ext) {
 			if (remaining == 0) {
 				iter->key_len = level - 1;
 				{
@@ -5760,7 +5846,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 					for (j = 0; j < level - 1; j++)
 						iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
 				}
-				iter->node = metadata->external_nodes;
+				iter->node = ext;
 				iter->path_valid = true;
 				iter_debug_path_update(iter);
 				iter->path_len = level;
@@ -5818,7 +5904,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 	struct cds_ft_inode_flag *node_flag;
 	unsigned int i;
 
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft_dereference_acquire(ft->root);
 	iter_path_node(iter)[0] = node_flag;
 
 	for (i = 0; i < key_len; i++) {
@@ -5887,7 +5973,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent = iter_path_node(iter)[depth];
 		struct cds_ft_metadata *pmeta =
 			cds_ft_item_to_metadata(ft_node_ptr(parent));
-		unsigned long right_keys = uatomic_load(&pmeta->nr_keys, CMM_RELAXED) - 1; /* exclude self */
+		unsigned long right_keys = uatomic_load(&pmeta->nr_keys, CMM_ACQUIRE) - 1; /* exclude self */
 
 		if (remaining <= right_keys) {
 			/*
@@ -5995,7 +6081,12 @@ descend_forward:
 			metadata = cds_ft_item_to_metadata(
 					ft_node_ptr(node_flag));
 
-			if (metadata->external_nodes) {
+			{
+				struct cds_ft_node *ext =
+					ft_dereference_acquire(
+						metadata->external_nodes);
+
+				if (ext) {
 				if (remaining == 0) {
 					int j;
 
@@ -6004,7 +6095,7 @@ descend_forward:
 						iter_key(iter)[j] =
 							ordinal_to_key(ft,
 								ordinal_key[j]);
-					iter->node = metadata->external_nodes;
+					iter->node = ext;
 					iter->path_valid = true;
 					iter_debug_path_update(iter);
 					iter->path_len = level + 1;
@@ -6013,6 +6104,7 @@ descend_forward:
 				}
 				remaining--;
 			}
+			} /* ext scope */
 
 			pivot = -1;
 			child = ft_node_get_direction(node_flag, pivot,
@@ -6143,46 +6235,53 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		}
 
 		/* External_nodes at ancestor sort before all children. */
-		if (ameta->external_nodes)
-			left_keys++;
+		{
+			struct cds_ft_node *a_ext =
+				ft_dereference_acquire(ameta->external_nodes);
 
-		if (remaining <= left_keys) {
-			/*
-			 * Target is among the leftward siblings or
-			 * external_nodes.  Descend in reverse order:
-			 * iterate leftward siblings from the current
-			 * child in descending ordinal order, then check
-			 * external_nodes last.
-			 */
-			pivot = ordinal_key[level];
-			child = ft_node_get_direction(ancestor, pivot,
-					&child_key, FT_LEFT);
-			while (ft_node_ptr(child)) {
-				unsigned long ck = ft_child_key_count(child);
+			if (a_ext)
+				left_keys++;
 
-				if (remaining <= ck) {
-					remaining--;
-					ordinal_key[level] = child_key;
-					iter_path_node(iter)[level + 1] = child;
-					level = level + 1;
-					goto descend_reverse;
-				}
-				remaining -= ck;
-				pivot = child_key;
+			if (remaining <= left_keys) {
+				/*
+				 * Target is among the leftward siblings or
+				 * external_nodes.  Descend in reverse order:
+				 * iterate leftward siblings from the current
+				 * child in descending ordinal order, then
+				 * check external_nodes last.
+				 */
+				pivot = ordinal_key[level];
 				child = ft_node_get_direction(ancestor, pivot,
 						&child_key, FT_LEFT);
-			}
+				while (ft_node_ptr(child)) {
+					unsigned long ck =
+						ft_child_key_count(child);
 
-			/* Must be the external_nodes. */
-			if (ameta->external_nodes && remaining == 1) {
-				int j;
+					if (remaining <= ck) {
+						remaining--;
+						ordinal_key[level] = child_key;
+						iter_path_node(iter)[level + 1]
+							= child;
+						level = level + 1;
+						goto descend_reverse;
+					}
+					remaining -= ck;
+					pivot = child_key;
+					child = ft_node_get_direction(
+							ancestor, pivot,
+							&child_key, FT_LEFT);
+				}
 
-				iter->key_len = level;
-				for (j = 0; j < level; j++)
-					iter_key(iter)[j] =
-						ordinal_to_key(ft,
-							ordinal_key[j]);
-				iter->node = ameta->external_nodes;
+				/* Must be the external_nodes. */
+				if (a_ext && remaining == 1) {
+					int j;
+
+					iter->key_len = level;
+					for (j = 0; j < level; j++)
+						iter_key(iter)[j] =
+							ordinal_to_key(ft,
+								ordinal_key[j]);
+					iter->node = a_ext;
 				iter->path_valid = true;
 				iter_debug_path_update(iter);
 				iter->path_len = level + 1;
@@ -6193,6 +6292,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 			goto not_found;
 		}
 		remaining -= left_keys;
+		}
 	}
 
 	/* Exhausted the trie. */
@@ -6246,7 +6346,12 @@ descend_reverse:
 						&child_key, FT_LEFT);
 			}
 
-			if (metadata->external_nodes && remaining == 0) {
+			{
+				struct cds_ft_node *ext =
+					ft_dereference_acquire(
+						metadata->external_nodes);
+
+				if (ext && remaining == 0) {
 				int j;
 
 				iter->key_len = level;
@@ -6254,12 +6359,13 @@ descend_reverse:
 					iter_key(iter)[j] =
 						ordinal_to_key(ft,
 							ordinal_key[j]);
-				iter->node = metadata->external_nodes;
+				iter->node = ext;
 				iter->path_valid = true;
 				iter_debug_path_update(iter);
 				iter->path_len = level + 1;
 				iter->status = CDS_FT_STATUS_OK;
 				goto end;
+			}
 			}
 			break;
 

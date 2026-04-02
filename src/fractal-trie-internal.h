@@ -110,10 +110,10 @@ struct cds_ft_metadata {
 	unsigned int nr_child;			/* Number of children in node. */
 	int fallback_removal_count;		/* Removals left keeping fallback. */
 	unsigned long nr_keys;			/* Total unique keys in subtree.
-						 * Stored with uatomic_store relaxed,
+						 * Stored with uatomic_store release,
 						 * loaded by updaters without uatomic,
 						 * loaded by readers with uatomic_load
-						 * relaxed. Transiently undercounts
+						 * acquire. Transiently undercounts
 						 * during concurrent mutations (see
 						 * ft_propagate_external_count).
 						 */
