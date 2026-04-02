@@ -5538,6 +5538,247 @@ unsigned long cds_ft_count_keys(struct cds_ft *ft)
 	return cds_ft_count_keys_prefix(ft, NULL, 0);
 }
 
+/*
+ * Lookup the nth key (0-indexed) in forward (smallest-first) order.
+ *
+ * Descends through the trie using per-node nr_keys counters to skip
+ * entire subtrees, yielding O(depth) time complexity rather than
+ * O(n) iteration.
+ *
+ * At each internal node:
+ * 1. If external_nodes are present, they represent the key at this
+ *    depth (shortest in the subtree). If n == 0, found. Else n -= 1.
+ * 2. Iterate children in ascending ordinal order. For each child,
+ *    determine its key count (nr_keys if internal, 1 if external).
+ *    If n < count, descend. Else n -= count and continue.
+ */
+enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	struct cds_ft_inode_flag *node_flag;
+	uint8_t ordinal_key[FT_MAX_KEY_LEN];
+	int level;
+	unsigned long remaining = n;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	iter_debug_path_snapshot(iter);
+	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
+
+	node_flag = rcu_dereference(ft->root);
+	iter_path_node(iter)[0] = node_flag;
+
+	for (level = 1; ; level++) {
+		struct cds_ft_metadata *metadata;
+		struct cds_ft_inode_flag *child;
+		uint8_t child_key;
+		int pivot;
+
+		if (!ft_node_ptr(node_flag) || !ft_node_internal(node_flag))
+			break;
+
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+
+		/* Keys at this node's depth come first in ordinal order. */
+		if (metadata->external_nodes) {
+			if (remaining == 0) {
+				/* Found: the key at this node's depth. */
+				iter->key_len = level - 1;
+				{
+					int j;
+
+					for (j = 0; j < level - 1; j++)
+						iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+				}
+				iter->node = metadata->external_nodes;
+				iter->path_valid = true;
+				iter_debug_path_update(iter);
+				iter->path_len = level;
+				iter->status = CDS_FT_STATUS_OK;
+				goto end;
+			}
+			remaining--;
+		}
+
+		/* Iterate children in ascending ordinal order. */
+		pivot = -1;
+		child = ft_node_get_direction(node_flag, pivot, &child_key, FT_RIGHT);
+		while (ft_node_ptr(child)) {
+			unsigned long child_keys;
+
+			if (ft_node_internal(child)) {
+				struct cds_ft_metadata *child_meta =
+					cds_ft_item_to_metadata(ft_node_ptr(child));
+				child_keys = child_meta->nr_keys;
+			} else {
+				child_keys = 1;
+			}
+
+			if (remaining < child_keys) {
+				/* Target is in this child's subtree. Descend. */
+				ordinal_key[level - 1] = child_key;
+				iter_path_node(iter)[level] = child;
+				node_flag = child;
+				goto next_level;
+			}
+			remaining -= child_keys;
+			pivot = child_key;
+			child = ft_node_get_direction(node_flag, pivot, &child_key, FT_RIGHT);
+		}
+
+		/* Exhausted all children without finding. */
+		break;
+
+next_level:
+		;
+	}
+
+	/* Reached a leaf (external node). */
+	if (ft_node_ptr(node_flag) && !ft_node_internal(node_flag) && remaining == 0) {
+		iter->key_len = level - 1;
+		{
+			int j;
+
+			for (j = 0; j < level - 1; j++)
+				iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+		}
+		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+		iter->path_valid = true;
+		iter_debug_path_update(iter);
+		iter->path_len = level;
+		iter->status = CDS_FT_STATUS_OK;
+		goto end;
+	}
+
+	iter->node = NULL;
+	iter->path_valid = true;
+	iter_debug_path_update(iter);
+	iter->path_len = 0;
+	iter->status = CDS_FT_STATUS_NOT_FOUND;
+
+end:
+	iter_auto_invalidate_path(iter);
+	return iter->status;
+}
+
+/*
+ * Lookup the nth key (0-indexed) in reverse (largest-first) order.
+ *
+ * Same principle as cds_ft_lookup_nth but descends from the right:
+ * at each internal node, iterate children in descending ordinal order
+ * first, then check external_nodes last (they are the smallest key
+ * in the subtree).
+ */
+enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	struct cds_ft_inode_flag *node_flag;
+	uint8_t ordinal_key[FT_MAX_KEY_LEN];
+	int level;
+	unsigned long remaining = n;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	iter_debug_path_snapshot(iter);
+	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
+
+	node_flag = rcu_dereference(ft->root);
+	iter_path_node(iter)[0] = node_flag;
+
+	for (level = 1; ; level++) {
+		struct cds_ft_metadata *metadata;
+		struct cds_ft_inode_flag *child;
+		uint8_t child_key;
+		int pivot;
+
+		if (!ft_node_ptr(node_flag) || !ft_node_internal(node_flag))
+			break;
+
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+
+		/* Iterate children in descending ordinal order first. */
+		pivot = FT_ENTRY_PER_NODE;
+		child = ft_node_get_direction(node_flag, pivot, &child_key, FT_LEFT);
+		while (ft_node_ptr(child)) {
+			unsigned long child_keys;
+
+			if (ft_node_internal(child)) {
+				struct cds_ft_metadata *child_meta =
+					cds_ft_item_to_metadata(ft_node_ptr(child));
+				child_keys = child_meta->nr_keys;
+			} else {
+				child_keys = 1;
+			}
+
+			if (remaining < child_keys) {
+				/* Target is in this child's subtree. Descend. */
+				ordinal_key[level - 1] = child_key;
+				iter_path_node(iter)[level] = child;
+				node_flag = child;
+				goto next_level;
+			}
+			remaining -= child_keys;
+			pivot = child_key;
+			child = ft_node_get_direction(node_flag, pivot, &child_key, FT_LEFT);
+		}
+
+		/* External_nodes at this depth are the smallest (last in reverse). */
+		if (metadata->external_nodes) {
+			if (remaining == 0) {
+				iter->key_len = level - 1;
+				{
+					int j;
+
+					for (j = 0; j < level - 1; j++)
+						iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+				}
+				iter->node = metadata->external_nodes;
+				iter->path_valid = true;
+				iter_debug_path_update(iter);
+				iter->path_len = level;
+				iter->status = CDS_FT_STATUS_OK;
+				goto end;
+			}
+			remaining--;
+		}
+
+		/* Exhausted all children without finding. */
+		break;
+
+next_level:
+		;
+	}
+
+	/* Reached a leaf (external node). */
+	if (ft_node_ptr(node_flag) && !ft_node_internal(node_flag) && remaining == 0) {
+		iter->key_len = level - 1;
+		{
+			int j;
+
+			for (j = 0; j < level - 1; j++)
+				iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+		}
+		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+		iter->path_valid = true;
+		iter_debug_path_update(iter);
+		iter->path_len = level;
+		iter->status = CDS_FT_STATUS_OK;
+		goto end;
+	}
+
+	iter->node = NULL;
+	iter->path_valid = true;
+	iter_debug_path_update(iter);
+	iter->path_len = 0;
+	iter->status = CDS_FT_STATUS_NOT_FOUND;
+
+end:
+	iter_auto_invalidate_path(iter);
+	return iter->status;
+}
+
 unsigned long cds_ft_count_entries(struct cds_ft *ft)
 {
 	struct cds_ft_iter *iter;

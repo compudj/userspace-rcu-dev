@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 121
+#define NR_TESTS 126
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -1405,6 +1405,334 @@ static int test_count_keys_prefix_fixed(void)
 	}
 	rcu_read_unlock();
 
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * cds_ft_lookup_nth: basic forward rank lookup on a fixed-length trie.
+ * Insert keys 0..9, verify lookup_nth(i) returns the ith key in order.
+ */
+static int test_lookup_nth_basic(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	unsigned long i;
+	enum cds_ft_status s;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 10; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "lookup_nth_basic: insert %lu failed\n", i);
+			goto fail;
+		}
+		rcu_read_unlock();
+	}
+
+	/* Verify each rank. */
+	for (i = 0; i < 10; i++) {
+		uint8_t result_key[4];
+		size_t result_key_len;
+		uint64_t val;
+
+		rcu_read_lock();
+		s = cds_ft_lookup_nth(ft, iter, i);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "lookup_nth_basic: nth(%lu): %s\n",
+				i, cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			goto fail;
+		}
+		s = cds_ft_iter_get_key(iter, result_key, sizeof(result_key),
+				&result_key_len);
+		if (s != CDS_FT_STATUS_OK || result_key_len != 4) {
+			fprintf(stderr, "lookup_nth_basic: get_key(%lu): %s len %zu\n",
+				i, cds_ft_status_to_string(s), result_key_len);
+			rcu_read_unlock();
+			goto fail;
+		}
+		val = cds_ft_key_to_u64(ft, result_key, 4);
+		rcu_read_unlock();
+		if (val != i) {
+			fprintf(stderr, "lookup_nth_basic: nth(%lu) got key %lu\n",
+				i, (unsigned long) val);
+			goto fail;
+		}
+	}
+
+	/* Out-of-range should return NOT_FOUND. */
+	rcu_read_lock();
+	s = cds_ft_lookup_nth(ft, iter, 10);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "lookup_nth_basic: nth(10) expected NOT_FOUND, got %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_lookup_nth_last: reverse rank lookup.
+ * nth_last(0) is the largest key, nth_last(9) is the smallest.
+ */
+static int test_lookup_nth_last(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	unsigned long i;
+	enum cds_ft_status s;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 10; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		insert_u64(ft, i, n);
+		rcu_read_unlock();
+	}
+
+	for (i = 0; i < 10; i++) {
+		uint8_t result_key[4];
+		size_t result_key_len;
+		uint64_t val;
+
+		rcu_read_lock();
+		s = cds_ft_lookup_nth_last(ft, iter, i);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "lookup_nth_last: nth_last(%lu): %s\n",
+				i, cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			goto fail;
+		}
+		cds_ft_iter_get_key(iter, result_key, sizeof(result_key),
+				&result_key_len);
+		val = cds_ft_key_to_u64(ft, result_key, 4);
+		rcu_read_unlock();
+		if (val != 9 - i) {
+			fprintf(stderr, "lookup_nth_last: nth_last(%lu) got %lu, expected %lu\n",
+				i, (unsigned long) val, 9 - i);
+			goto fail;
+		}
+	}
+
+	/* Out-of-range. */
+	rcu_read_lock();
+	s = cds_ft_lookup_nth_last(ft, iter, 10);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "lookup_nth_last: nth_last(10) expected NOT_FOUND\n");
+		goto fail;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_lookup_nth with duplicates: duplicates at the same key share
+ * a single rank. The nth lookup returns the head of the duplicate chain.
+ */
+static int test_lookup_nth_duplicates(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *n1 = node_alloc(10);
+	struct ft_test_node *n2 = node_alloc(10);
+	struct ft_test_node *n3 = node_alloc(20);
+	enum cds_ft_status s;
+	uint8_t result_key[4];
+	size_t result_key_len;
+	uint64_t val;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		node_free(n1); node_free(n2); node_free(n3);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	insert_u64(ft, 10, n1);
+	insert_u64(ft, 10, n2);
+	insert_u64(ft, 20, n3);
+
+	/* 2 unique keys: rank 0 = key 10, rank 1 = key 20. */
+	s = cds_ft_lookup_nth(ft, iter, 0);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "lookup_nth_dup: nth(0): %s\n", cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, result_key, sizeof(result_key), &result_key_len);
+	val = cds_ft_key_to_u64(ft, result_key, 4);
+	if (val != 10) {
+		fprintf(stderr, "lookup_nth_dup: nth(0) got %lu, expected 10\n", (unsigned long) val);
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	s = cds_ft_lookup_nth(ft, iter, 1);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "lookup_nth_dup: nth(1): %s\n", cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, result_key, sizeof(result_key), &result_key_len);
+	val = cds_ft_key_to_u64(ft, result_key, 4);
+	if (val != 20) {
+		fprintf(stderr, "lookup_nth_dup: nth(1) got %lu, expected 20\n", (unsigned long) val);
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* Rank 2 should be NOT_FOUND (only 2 unique keys). */
+	s = cds_ft_lookup_nth(ft, iter, 2);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "lookup_nth_dup: nth(2) expected NOT_FOUND\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_lookup_nth on a variable-length trie with prefix keys.
+ * Keys "a", "ab", "abc" test that prefix keys at internal nodes
+ * are correctly ranked.
+ */
+static int test_lookup_nth_varlen(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	struct ft_test_node *n1 = node_alloc(0);
+	struct ft_test_node *n2 = node_alloc(0);
+	struct ft_test_node *n3 = node_alloc(0);
+	enum cds_ft_status s;
+	uint8_t result_key[8];
+	size_t result_key_len;
+
+	ft = create_varlen_ft(&group);
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		node_free(n1); node_free(n2); node_free(n3);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	s = cds_ft_insert(ft, (const uint8_t *)"ab", 2, &n2->node);
+	if (s < 0) goto fail;
+	s = cds_ft_insert(ft, (const uint8_t *)"a", 1, &n1->node);
+	if (s < 0) goto fail;
+	s = cds_ft_insert(ft, (const uint8_t *)"abc", 3, &n3->node);
+	if (s < 0) goto fail;
+
+	/* Order: "a" (rank 0), "ab" (rank 1), "abc" (rank 2). */
+	s = cds_ft_lookup_nth(ft, iter, 0);
+	if (s != CDS_FT_STATUS_OK) goto fail;
+	cds_ft_iter_get_key(iter, result_key, sizeof(result_key), &result_key_len);
+	if (result_key_len != 1 || memcmp(result_key, "a", 1) != 0) {
+		fprintf(stderr, "lookup_nth_varlen: nth(0) key_len %zu\n", result_key_len);
+		rcu_read_unlock();
+		goto fail_nolock;
+	}
+
+	s = cds_ft_lookup_nth(ft, iter, 1);
+	if (s != CDS_FT_STATUS_OK) goto fail;
+	cds_ft_iter_get_key(iter, result_key, sizeof(result_key), &result_key_len);
+	if (result_key_len != 2 || memcmp(result_key, "ab", 2) != 0) {
+		fprintf(stderr, "lookup_nth_varlen: nth(1) key_len %zu\n", result_key_len);
+		rcu_read_unlock();
+		goto fail_nolock;
+	}
+
+	s = cds_ft_lookup_nth(ft, iter, 2);
+	if (s != CDS_FT_STATUS_OK) goto fail;
+	cds_ft_iter_get_key(iter, result_key, sizeof(result_key), &result_key_len);
+	if (result_key_len != 3 || memcmp(result_key, "abc", 3) != 0) {
+		fprintf(stderr, "lookup_nth_varlen: nth(2) key_len %zu\n", result_key_len);
+		rcu_read_unlock();
+		goto fail_nolock;
+	}
+	rcu_read_unlock();
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	rcu_read_unlock();
+fail_nolock:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_lookup_nth on empty trie returns NOT_FOUND.
+ */
+static int test_lookup_nth_empty(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	s = cds_ft_lookup_nth(ft, iter, 0);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "lookup_nth_empty: expected NOT_FOUND, got %s\n",
+			cds_ft_status_to_string(s));
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	cds_ft_iter_destroy(iter);
 	return drain_and_destroy(ft, group);
 }
 
@@ -8663,6 +8991,14 @@ int main(int argc, char **argv)
 	RUN_TEST(test_count_keys_prefix_basic);
 	RUN_TEST(test_count_keys_prefix_duplicates);
 	RUN_TEST(test_count_keys_prefix_fixed);
+
+	/* Rank-based lookup (cds_ft_lookup_nth) tests */
+	diag("Rank-based lookup tests");
+	RUN_TEST(test_lookup_nth_empty);
+	RUN_TEST(test_lookup_nth_basic);
+	RUN_TEST(test_lookup_nth_last);
+	RUN_TEST(test_lookup_nth_duplicates);
+	RUN_TEST(test_lookup_nth_varlen);
 
 	/* 3. Lookup variants */
 	diag("Lookup variant tests");

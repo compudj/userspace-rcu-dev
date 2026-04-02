@@ -1268,6 +1268,41 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 		const uint8_t *prefix, size_t prefix_len);
 
 /*
+ * cds_ft_lookup_nth - Lookup the nth key in forward (smallest-first) order.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator (must be created via cds_ft_iter_create).
+ * @n: 0-indexed rank from the first (smallest) key.
+ *
+ * Finds the key at rank @n in the trie's sorted key order using
+ * per-node key counters to skip entire subtrees. On success the
+ * iterator points to the first external node of the nth key and the
+ * result key is accessible via cds_ft_iter_get_key().
+ *
+ * Returns CDS_FT_STATUS_OK on success or CDS_FT_STATUS_NOT_FOUND if
+ * @n >= the number of keys. O(depth) time complexity.
+ * The RCU read-side lock must be held.
+ */
+enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n);
+
+/*
+ * cds_ft_lookup_nth_last - Lookup the nth key from the last (largest) key.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator (must be created via cds_ft_iter_create).
+ * @n: 0-indexed rank from the last (largest) key. 0 is the largest key.
+ *
+ * Descends from the right (largest children first) using per-node key
+ * counters, so concurrent updates to the low end of the key space do
+ * not affect the traversal. O(depth) time complexity.
+ * Returns CDS_FT_STATUS_NOT_FOUND if @n >= the number of keys.
+ * The RCU read-side lock must be held.
+ */
+enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n);
+
+/*
  * cds_ft_count_entries - Return the number of external nodes in a Fractal Trie.
  * @ft: The Fractal Trie.
  *
