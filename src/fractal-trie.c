@@ -3608,6 +3608,25 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 /*
  * Propagate a signed delta to nr_keys through a snapshot
  * of ancestor internal nodes collected during descent.
+ *
+ * Ordering with respect to pointer publication/removal:
+ *
+ *   Insert: publish pointer (rcu_assign_pointer), then increment nr_keys.
+ *   Remove: decrement nr_keys, then detach pointer (rcu_assign_pointer).
+ *
+ * Both orderings produce a transient undercount: during the window
+ * between the two steps, nr_keys < the number of actually reachable
+ * keys.  This is the conservative direction for count-based readers
+ * (lookup_nth, skip, count_keys): they may transiently miss a key at
+ * the boundary of a concurrent mutation, but they will never enter a
+ * subtree expecting a key that does not exist.
+ *
+ * The alternative (overcount) would cause count-based readers to
+ * descend into a subtree with fewer keys than expected, potentially
+ * yielding NOT_FOUND for a key that should be reachable at that rank.
+ *
+ * Pointer-based readers (iteration, key lookup) are not affected by
+ * nr_keys and always see a structurally consistent trie via RCU.
  */
 static
 void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
