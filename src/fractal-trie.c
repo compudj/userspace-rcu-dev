@@ -5490,11 +5490,16 @@ int ft_detach_node(struct cds_ft *ft,
 	if (ret)
 		goto end;
 
-	dbg_printf("ft_detach_node: publish %p instead of %p\n",
-		iter_node_flag, *detach_parent_flag_ptr);
-
-	/* Update address of parent ptr in its parent */
-	rcu_assign_pointer(*detach_parent_flag_ptr, iter_node_flag);
+	/*
+	 * Update address of parent ptr in its parent.
+	 * Skip for compressed parents: the replacement was already
+	 * published inline above.
+	 */
+	if (!ft_node_compressed(iter_node_flag)) {
+		dbg_printf("ft_detach_node: publish %p instead of %p\n",
+			iter_node_flag, *detach_parent_flag_ptr);
+		rcu_assign_pointer(*detach_parent_flag_ptr, iter_node_flag);
+	}
 end:
 	/* Reclaim safely after replacement. */
 	if (old_recompacted_node)
@@ -5612,6 +5617,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
 			snapshot[nr_snapshot++] = dd.d.nf;
 			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
+			if (ft_node_ptr(dd.d.nf) && dd.pending) {
+				dd.det_nfp = dd.d.nfp;
+				dd.pending = false;
+			}
 			continue;
 		}
 
@@ -5858,6 +5867,10 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
 			snapshot[nr_snapshot++] = dd.d.nf;
 			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
+			if (ft_node_ptr(dd.d.nf) && dd.pending) {
+				dd.det_nfp = dd.d.nfp;
+				dd.pending = false;
+			}
 			continue;
 		}
 
@@ -6769,6 +6782,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
 				snapshot[nr_snapshot++] = dd.d.nf;
 				ft_descent_traverse_compressed(&dd.d, cn, &ik);
+				if (ft_node_ptr(dd.d.nf) && dd.pending) {
+					dd.det_nfp = dd.d.nfp;
+					dd.pending = false;
+				}
 				continue;
 			}
 

@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 141
+#define NR_TESTS 142
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -10132,6 +10132,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compress_remove_prune_through);
 	RUN_TEST(test_compress_varlen_external_nodes);
 	RUN_TEST(test_compress_graft_diverge);
+	RUN_TEST(test_compress_detach_through);
 	RUN_TEST(test_compress_iteration_order);
 	RUN_TEST(test_compress_lookup_nth_through);
 	RUN_TEST(test_compress_nested);
