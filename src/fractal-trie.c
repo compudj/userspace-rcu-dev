@@ -3417,18 +3417,18 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	node_flag = rcu_dereference(ft->root);
 	iter_path_node(iter)[0] = node_flag;
 
-	/* Root is always present and always internal. */
-
-	{
+	/*
+	 * Empty root short-circuit: when the root has no children,
+	 * there is nothing to traverse and no inequality match is
+	 * possible. An empty root is always a type-0 linear node
+	 * with data[0] == 0.  Compressed roots are never empty
+	 * (recompaction replaces emptied compressed roots with
+	 * internal nodes).
+	 */
+	if (!ft_node_compressed(node_flag)) {
 		unsigned int type_idx = ft_node_type(node_flag);
 		const struct cds_ft_type *type = &ft_types[type_idx];
 
-		/*
-		 * Empty root short-circuit: when the root has no children,
-		 * there is nothing to traverse and no inequality match is
-		 * possible. An empty root is always a type-0 linear node
-		 * with data[0] == 0.
-		 */
 		if (type->type_class == FT_LINEAR &&
 				ft_linear_node_get_nr_child(type, ft_node_ptr(node_flag)) == 0) {
 
@@ -5455,14 +5455,38 @@ int ft_detach_node(struct cds_ft *ft,
 	}
 
 	iter_node_flag = *detach_parent_flag_ptr;
-	/* Replace within parent */
-	ret = ft_node_replace_ptr(ft,
-		detach_node_flag_ptr,	/* Pointer to location to nullify */
-		&iter_node_flag,	/* Old new parent ptr in its parent */
-		&old_recompacted_node,
-		metadata_stack[nr_branch - 1],	/* of parent */
-		n, (struct cds_ft_inode_flag *) topmost_external_nodes,
-		detach_parent_flag_ptr == &ft->root);
+	/*
+	 * Replace within parent.  If the parent is a compressed node
+	 * (e.g. compressed root from detach/graft_swap), recompact it
+	 * to an empty linear node so the root is always internal.
+	 */
+	if (ft_node_compressed(iter_node_flag)) {
+		struct cds_ft_inode *fresh;
+		struct cds_ft_metadata *fresh_meta;
+
+		fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
+		if (!fresh) {
+			ret = -ENOMEM;
+			goto end;
+		}
+		if (topmost_external_nodes) {
+			fresh_meta->external_nodes = topmost_external_nodes;
+			uatomic_store(&fresh_meta->nr_keys, 1, CMM_RELAXED);
+		}
+		rcu_assign_pointer(*detach_parent_flag_ptr,
+			ft_node_flag(fresh, 0));
+		free_compressed_node(ft,
+			ft_compressed_node_ptr(iter_node_flag));
+		ret = 0;
+	} else {
+		ret = ft_node_replace_ptr(ft,
+			detach_node_flag_ptr,
+			&iter_node_flag,
+			&old_recompacted_node,
+			metadata_stack[nr_branch - 1],
+			n, (struct cds_ft_inode_flag *) topmost_external_nodes,
+			detach_parent_flag_ptr == &ft->root);
+	}
 	if (ret)
 		goto end;
 
@@ -6075,7 +6099,10 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		if (ft_node_compressed(top_flag))
 			d->pnfp = &ft_compressed_node_ptr(top_flag)->child;
 		else
-			d->pnfp = d->nfp;  /* parent of branch in single-child prefix */
+			/* Single-child internal prefix: find the slot
+			 * holding branch_flag within the prefix node. */
+			ft_node_get_nth(top_flag, &d->pnfp,
+					cn->key_bytes[0]);
 	} else {
 		d->pnfp = d->nfp;  /* branch IS the top, parent is the old parent */
 	}
@@ -6889,6 +6916,14 @@ bool cds_ft_empty(struct cds_ft *ft)
 
 	root_flag = rcu_dereference(ft->root);
 	root_node = ft_node_ptr(root_flag);
+
+	/*
+	 * Compressed root is never empty: recompaction in ft_detach_node
+	 * replaces an emptied compressed root with an internal node.
+	 */
+	if (ft_node_compressed(root_flag))
+		return false;
+
 	type_idx = ft_node_type(root_flag);
 	type = &ft_types[type_idx];
 	rmeta = cds_ft_item_to_metadata(root_node);

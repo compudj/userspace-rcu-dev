@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 131
+#define NR_TESTS 141
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -9310,6 +9310,626 @@ static int test_iter_uncached_all_configs(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*  13. Compressed node corner case tests                             */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Long shared prefix: insert keys that share a long common prefix,
+ * creating a compressed path, then verify lookup, count, and drain.
+ * Uses 4-byte fixed keys where keys 0..9 share a 3-byte prefix.
+ */
+static int test_compress_long_prefix(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	unsigned long i, count;
+
+	rcu_read_lock();
+	for (i = 0; i < 10; i++) {
+		if (insert_u64(ft, i, node_alloc(i)) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compress_long_prefix: insert %lu failed\n", i);
+			rcu_read_unlock();
+			return drain_and_destroy(ft, group) | -1;
+		}
+	}
+	count = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	if (count != 10) {
+		fprintf(stderr, "compress_long_prefix: count %lu != 10\n", count);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	/* Verify all keys are findable. */
+	rcu_read_lock();
+	for (i = 0; i < 10; i++) {
+		struct cds_ft_node *found;
+
+		if (lookup_u64(ft, i, &found) != CDS_FT_STATUS_OK || !found) {
+			fprintf(stderr, "compress_long_prefix: lookup %lu failed\n", i);
+			rcu_read_unlock();
+			return drain_and_destroy(ft, group) | -1;
+		}
+	}
+	rcu_read_unlock();
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Split at early divergence: two keys that share no prefix bytes.
+ * The first insert creates a compressed path; the second diverges
+ * at position 0, splitting the compressed node with no prefix.
+ */
+static int test_compress_split_diverge_early(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_node *found;
+
+	rcu_read_lock();
+	if (insert_u64(ft, 0, node_alloc(0)) != CDS_FT_STATUS_OK ||
+	    insert_u64(ft, 0x01000000ULL, node_alloc(1)) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_split_diverge_early: insert failed\n");
+		rcu_read_unlock();
+		return drain_and_destroy(ft, group) | -1;
+	}
+	if (lookup_u64(ft, 0, &found) != CDS_FT_STATUS_OK || !found ||
+	    lookup_u64(ft, 0x01000000ULL, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_split_diverge_early: lookup failed\n");
+		rcu_read_unlock();
+		return drain_and_destroy(ft, group) | -1;
+	}
+	rcu_read_unlock();
+	if (cds_ft_count_keys(ft) != 2) {
+		fprintf(stderr, "compress_split_diverge_early: count != 2\n");
+		return drain_and_destroy(ft, group) | -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Split at late divergence: two 4-byte keys that share the first 3
+ * bytes.  The split happens at the last byte of the compressed path.
+ */
+static int test_compress_split_diverge_late(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_node *found;
+
+	rcu_read_lock();
+	if (insert_u64(ft, 0, node_alloc(0)) != CDS_FT_STATUS_OK ||
+	    insert_u64(ft, 1, node_alloc(1)) != CDS_FT_STATUS_OK ||
+	    insert_u64(ft, 2, node_alloc(2)) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_split_diverge_late: insert failed\n");
+		rcu_read_unlock();
+		return drain_and_destroy(ft, group) | -1;
+	}
+	/* All three should be findable. */
+	if (lookup_u64(ft, 0, &found) != CDS_FT_STATUS_OK || !found ||
+	    lookup_u64(ft, 1, &found) != CDS_FT_STATUS_OK || !found ||
+	    lookup_u64(ft, 2, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_split_diverge_late: lookup failed\n");
+		rcu_read_unlock();
+		return drain_and_destroy(ft, group) | -1;
+	}
+	rcu_read_unlock();
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Remove through compressed path: insert two keys sharing a prefix,
+ * remove one, verify the other remains.  The compressed path between
+ * root and the branch point should survive the remove.
+ */
+static int test_compress_remove_through(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *n0 = node_alloc(0), *n1 = node_alloc(1);
+	struct cds_ft_node *found;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	insert_u64(ft, 0, n0);
+	insert_u64(ft, 1, n1);
+
+	/* Remove key 0, verify key 1 still present. */
+	{
+		uint8_t k[4];
+
+		cds_ft_u64_to_key(ft, 0, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_lookup(ft, iter);
+	}
+	if (cds_ft_remove(ft, iter, &n0->node) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_remove_through: remove failed\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	node_free_rcu(n0);
+	if (lookup_u64(ft, 1, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_remove_through: lookup 1 failed after remove 0\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	if (lookup_u64(ft, 0, &found) == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_remove_through: key 0 still present\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	if (cds_ft_count_keys(ft) != 1) {
+		fprintf(stderr, "compress_remove_through: count != 1\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Remove causing upward pruning through compressed node:
+ * insert a single key (creates compressed path), then remove it.
+ * ft_detach_node should prune through the compressed node.
+ */
+static int test_compress_remove_prune_through(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *n = node_alloc(42);
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	insert_u64(ft, 42, n);
+	{
+		uint8_t k[4];
+
+		cds_ft_u64_to_key(ft, 42, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_lookup(ft, iter);
+	}
+	if (cds_ft_remove(ft, iter, &n->node) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_remove_prune: remove failed\n");
+		rcu_read_unlock();
+		return drain_and_destroy(ft, group) | -1;
+	}
+	node_free_rcu(n);
+	if (!cds_ft_empty(ft)) {
+		fprintf(stderr, "compress_remove_prune: trie not empty\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Variable-length keys with external_nodes on compressed node:
+ * insert "abc" and "abcdef".  "abc" is a prefix of "abcdef", so
+ * "abc" should be stored as external_nodes at the depth where the
+ * compressed path begins.  Verify lookup, remove of the short key,
+ * and that the long key survives.
+ */
+static int test_compress_varlen_external_nodes(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *n1 = node_alloc(1), *n2 = node_alloc(2);
+	struct cds_ft_node *found;
+	const uint8_t *k1 = (const uint8_t *)"abc";
+	const uint8_t *k2 = (const uint8_t *)"abcdef";
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	if (cds_ft_insert(ft, k1, 3, &n1->node) != CDS_FT_STATUS_OK ||
+	    cds_ft_insert(ft, k2, 6, &n2->node) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_varlen_ext: insert failed\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	/* Both should be findable. */
+	if (cds_ft_lookup_key(ft, k1, 3, &found) != CDS_FT_STATUS_OK || !found ||
+	    cds_ft_lookup_key(ft, k2, 6, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_varlen_ext: lookup failed\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	if (cds_ft_count_keys(ft) != 2) {
+		fprintf(stderr, "compress_varlen_ext: count != 2\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	/* Remove short key, verify long key survives. */
+	cds_ft_iter_set_key(iter, k1, 3);
+	cds_ft_lookup(ft, iter);
+	if (cds_ft_remove(ft, iter, &n1->node) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_varlen_ext: remove short failed\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	node_free_rcu(n1);
+	if (cds_ft_lookup_key(ft, k2, 6, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_varlen_ext: long key gone after short remove\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	if (cds_ft_count_keys(ft) != 1) {
+		fprintf(stderr, "compress_varlen_ext: count != 1 after remove\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Graft into a position that diverges within a compressed path.
+ * Insert "abcdef" (creates compressed path), then graft a subtrie
+ * at "abx" (diverges at third byte of compressed path).
+ * Variable-length keys required for non-root graft.
+ */
+static int test_compress_graft_diverge(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft *src;
+	struct cds_ft_node *found;
+	const uint8_t *k1 = (const uint8_t *)"abcdef";
+	const uint8_t *k_graft = (const uint8_t *)"abx";
+	const uint8_t *k_src = (const uint8_t *)"QR";
+	enum cds_ft_status s;
+
+	if (cds_ft_create(group, &src) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	/* Insert into main trie. */
+	cds_ft_insert(ft, k1, 6, &node_alloc(0)->node);
+
+	/* Insert into source trie (key relative to graft point). */
+	cds_ft_insert(src, k_src, 2, &node_alloc(1)->node);
+
+	/* Graft source at "abx" — diverges at byte 2 of "abcdef" path. */
+	s = cds_ft_graft(ft, k_graft, 3, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_graft_diverge: graft failed: %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		cds_ft_destroy(src);
+		return drain_and_destroy(ft, group) | -1;
+	}
+
+	/* Original key should still exist. */
+	if (cds_ft_lookup_key(ft, k1, 6, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_graft_diverge: lookup original failed\n");
+		rcu_read_unlock();
+		cds_ft_destroy(src);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	/* Grafted key "abxQR" should exist. */
+	{
+		const uint8_t *k_full = (const uint8_t *)"abxQR";
+
+		if (cds_ft_lookup_key(ft, k_full, 5, &found) != CDS_FT_STATUS_OK || !found) {
+			fprintf(stderr, "compress_graft_diverge: lookup grafted key failed\n");
+			rcu_read_unlock();
+			cds_ft_destroy(src);
+			return drain_and_destroy(ft, group) | -1;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_destroy(src);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Detach through compressed path: insert two keys sharing a prefix,
+ * detach one, verify the other remains and the detached subtrie
+ * contains the removed content.
+ */
+static int test_compress_detach_through(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft *detached = NULL;
+	struct cds_ft_node *found;
+	struct ft_test_node *n1 = node_alloc(1), *n2 = node_alloc(2);
+	const uint8_t *k1 = (const uint8_t *)"abcXYZ";
+	const uint8_t *k2 = (const uint8_t *)"abcDEF";
+	const uint8_t *prefix = (const uint8_t *)"abcX";
+
+	rcu_read_lock();
+	cds_ft_insert(ft, k1, 6, &n1->node);
+	cds_ft_insert(ft, k2, 6, &n2->node);
+
+	if (cds_ft_detach(ft, prefix, 4, &detached) != CDS_FT_STATUS_OK || !detached) {
+		fprintf(stderr, "compress_detach_through: detach failed\n");
+		rcu_read_unlock();
+		return drain_and_destroy(ft, group) | -1;
+	}
+	/* k2 should remain, k1 should be in detached (under relative key). */
+	if (cds_ft_lookup_key(ft, k2, 6, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_detach_through: k2 missing after detach\n");
+		rcu_read_unlock();
+		goto fail_detach;
+	}
+	if (cds_ft_lookup_key(ft, k1, 6, &found) == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_detach_through: k1 still in trie\n");
+		rcu_read_unlock();
+		goto fail_detach;
+	}
+	rcu_read_unlock();
+	/* Drain detached trie. */
+	{
+		struct cds_ft_iter *dit;
+
+		cds_ft_iter_create(detached, &dit);
+		rcu_read_lock();
+		while (cds_ft_lookup_first(detached, dit) == CDS_FT_STATUS_OK) {
+			struct cds_ft_node *head, *tmp;
+
+			cds_ft_remove_all(detached, dit, &head);
+			cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+				node_free_rcu(to_test_node(head));
+		}
+		rcu_read_unlock();
+		rcu_barrier();
+		cds_ft_iter_destroy(dit);
+	}
+	cds_ft_destroy(detached);
+	return drain_and_destroy(ft, group);
+fail_detach:
+	rcu_barrier();
+	cds_ft_destroy(detached);
+	return drain_and_destroy(ft, group) | -1;
+}
+
+/*
+ * Iteration order through compressed paths: insert 10 keys with
+ * 4-byte fixed length (0..9), verify forward iteration is sorted.
+ */
+static int test_compress_iteration_order(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	unsigned long i, prev = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	for (i = 0; i < 10; i++)
+		insert_u64(ft, i, node_alloc(i));
+	i = 0;
+	cds_ft_for_each_rcu(ft, iter) {
+		uint8_t k[4];
+		size_t klen;
+		uint64_t val;
+
+		cds_ft_iter_get_key(iter, k, 4, &klen);
+		val = cds_ft_key_to_u64(ft, k, 4);
+		if (i > 0 && val <= prev) {
+			fprintf(stderr, "compress_iteration: order violation at %lu: %lu <= %lu\n",
+				i, (unsigned long)val, (unsigned long)prev);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			return drain_and_destroy(ft, group) | -1;
+		}
+		prev = val;
+		i++;
+	}
+	rcu_read_unlock();
+	if (i != 10) {
+		fprintf(stderr, "compress_iteration: iterated %lu, expected 10\n", i);
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * lookup_nth through compressed paths: insert 10 keys, verify
+ * lookup_nth(0) through lookup_nth(9) and that lookup_nth(10)
+ * returns NOT_FOUND.
+ */
+static int test_compress_lookup_nth_through(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	unsigned long i;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	for (i = 0; i < 10; i++)
+		insert_u64(ft, i, node_alloc(i));
+
+	for (i = 0; i < 10; i++) {
+		if (cds_ft_lookup_nth(ft, iter, i) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compress_nth: nth(%lu) failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			return drain_and_destroy(ft, group) | -1;
+		}
+	}
+	if (cds_ft_lookup_nth(ft, iter, 10) != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "compress_nth: nth(10) should be NOT_FOUND\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Inequality lookups through compressed paths: insert string keys
+ * "apple", "banana", "cherry", verify GE("band") returns "banana",
+ * LE("cat") returns "cherry" ... actually "banana" (cat < cherry).
+ * Uses variable-length keys so compressed paths are exercised
+ * within the key itself, not just in the shared prefix.
+ */
+static int test_compress_inequality_through(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *node;
+	uint8_t rk[32];
+	size_t rklen;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *)"apple", 5, &node_alloc(0)->node);
+	cds_ft_insert(ft, (const uint8_t *)"banana", 6, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *)"cherry", 6, &node_alloc(2)->node);
+
+	/* GE("band") should return "banana". */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"band", 4);
+	if (cds_ft_lookup_ge(ft, iter) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_ineq: ge(band) failed\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	if (rklen != 6 || memcmp(rk, "banana", 6) != 0) {
+		fprintf(stderr, "compress_ineq: ge(band) got len=%zu\n", rklen);
+		rcu_read_unlock();
+		goto fail;
+	}
+
+	/* LE("cat") should return "banana" (banana < cat < cherry). */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"cat", 3);
+	if (cds_ft_lookup_le(ft, iter) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_ineq: le(cat) failed\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	node = cds_ft_iter_node(iter);
+	if (!node) {
+		fprintf(stderr, "compress_ineq: le(cat) no node\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	if (rklen != 6 || memcmp(rk, "banana", 6) != 0) {
+		fprintf(stderr, "compress_ineq: le(cat) got len=%zu key=%.6s\n",
+			rklen, (char *)rk);
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+fail:
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group) | -1;
+}
+
+/*
+ * Nested compressed nodes: use variable-length keys to create a trie
+ * where one compressed path leads to another.  Insert "abcdef" and
+ * "abcxyz" (share "abc" prefix → compressed, then separate compressed
+ * suffixes "def" and "xyz").  Verify lookup, iteration, and removal.
+ */
+static int test_compress_nested(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *n1 = node_alloc(1), *n2 = node_alloc(2);
+	struct cds_ft_node *found;
+	const uint8_t *k1 = (const uint8_t *)"abcdef";
+	const uint8_t *k2 = (const uint8_t *)"abcxyz";
+	unsigned long count = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, k1, 6, &n1->node);
+	cds_ft_insert(ft, k2, 6, &n2->node);
+
+	if (cds_ft_lookup_key(ft, k1, 6, &found) != CDS_FT_STATUS_OK || !found ||
+	    cds_ft_lookup_key(ft, k2, 6, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_nested: lookup failed\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	/* Iterate and count. */
+	cds_ft_for_each_rcu(ft, iter)
+		count++;
+	if (count != 2) {
+		fprintf(stderr, "compress_nested: iterated %lu, expected 2\n", count);
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	/* Remove one, verify other survives. */
+	cds_ft_iter_set_key(iter, k1, 6);
+	cds_ft_lookup(ft, iter);
+	cds_ft_remove(ft, iter, &n1->node);
+	node_free_rcu(n1);
+	if (cds_ft_lookup_key(ft, k2, 6, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_nested: k2 missing after k1 remove\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		return drain_and_destroy(ft, group) | -1;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -9502,6 +10122,19 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iter_path_mode_switch);
 	RUN_TEST(test_iter_uncached_copy);
 	RUN_TEST(test_iter_uncached_all_configs);
+
+	/* 13. Compressed node corner case tests */
+	diag("Compressed node corner case tests");
+	RUN_TEST(test_compress_long_prefix);
+	RUN_TEST(test_compress_split_diverge_early);
+	RUN_TEST(test_compress_split_diverge_late);
+	RUN_TEST(test_compress_remove_through);
+	RUN_TEST(test_compress_remove_prune_through);
+	RUN_TEST(test_compress_varlen_external_nodes);
+	RUN_TEST(test_compress_graft_diverge);
+	RUN_TEST(test_compress_iteration_order);
+	RUN_TEST(test_compress_lookup_nth_through);
+	RUN_TEST(test_compress_nested);
 
 	rcu_barrier();
 	rcu_unregister_thread();
