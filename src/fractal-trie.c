@@ -3100,6 +3100,53 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 	return FT_COMPRESSED_CONTINUE;
 }
 
+/*
+ * Simple compressed node traversal for read-side loops (replace,
+ * count_keys_prefix).  Matches the key against the compressed path,
+ * advances key/index/node_flag, and returns the loop action.
+ *
+ * On NOT_FOUND (mismatch or key shorter), returns FT_COMPRESSED_END
+ * with *not_found set to true.
+ * On full match with external child, returns FT_COMPRESSED_BREAK.
+ * On full match with non-external child, returns FT_COMPRESSED_CONTINUE.
+ */
+static inline
+enum ft_compressed_action ft_traverse_compressed(struct cds_ft *ft,
+		struct cds_ft_inode_flag **node_flag_p,
+		struct cds_ft_inode_flag ***node_flag_ptr_p,
+		const uint8_t **key_p, unsigned int *i_p,
+		unsigned int key_depth, bool *not_found)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
+	const uint8_t *key = *key_p;
+	unsigned int i = *i_p;
+	unsigned int remaining = key_depth - i;
+	unsigned int j;
+
+	if (cn->len > remaining) {
+		*not_found = true;
+		return FT_COMPRESSED_END;
+	}
+	j = ft_match_compressed_key(ft, key, cn, cn->len);
+	if (j < cn->len) {
+		*not_found = true;
+		return FT_COMPRESSED_END;
+	}
+	*key_p = key + cn->len;
+	*i_p = i + cn->len - 1; /* -1: for loop increments */
+	*node_flag_p = cn->child;
+	if (node_flag_ptr_p)
+		*node_flag_ptr_p = &cn->child;
+	if (!ft_node_ptr(cn->child)) {
+		*not_found = true;
+		return FT_COMPRESSED_END;
+	}
+	if (ft_node_external(cn->child))
+		return FT_COMPRESSED_BREAK;
+	return FT_COMPRESSED_CONTINUE;
+}
+
 static
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
@@ -5688,25 +5735,16 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 
 		if (ft_node_external(node_flag))
 			return CDS_FT_STATUS_NOT_FOUND;
-		/* Traverse through compressed nodes. */
 		if (ft_node_compressed(node_flag)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(node_flag);
-			int remaining = key_depth - i;
-			int j;
+			bool nf = false;
+			enum ft_compressed_action act;
 
-			if (cn->len > remaining)
+			act = ft_traverse_compressed(ft, &node_flag,
+				&node_flag_ptr, &iter_key, &i,
+				key_depth, &nf);
+			if (nf)
 				return CDS_FT_STATUS_NOT_FOUND;
-			j = ft_match_compressed_key(ft, iter_key, cn, cn->len);
-			if (j < cn->len)
-				return CDS_FT_STATUS_NOT_FOUND;
-			iter_key += cn->len;
-			i += cn->len - 1; /* -1: for loop increments */
-			node_flag = cn->child;
-			node_flag_ptr = &cn->child;
-			if (!ft_node_ptr(node_flag))
-				return CDS_FT_STATUS_NOT_FOUND;
-			if (ft_node_external(node_flag))
+			if (act == FT_COMPRESSED_BREAK)
 				break;
 			continue;
 		}
@@ -7526,23 +7564,20 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(node_flag);
 			unsigned int remaining = prefix_len - i;
-			unsigned int cmp = cn->len < remaining ? cn->len : remaining;
+			unsigned int cmp = cn->len < remaining ?
+				cn->len : remaining;
 			unsigned int j;
 
-			j = ft_match_compressed_key(ft, &prefix[i], cn, cmp);
+			j = ft_match_compressed_key(ft,
+				&prefix[i], cn, cmp);
 			if (j < cmp)
 				return 0;
 			if (cn->len >= remaining) {
-				/*
-				 * Prefix consumed within compressed path.
-				 * The compressed node's nr_keys covers
-				 * the entire subtree.
-				 */
 				struct cds_ft_metadata *cn_meta =
 					cds_ft_item_to_metadata(
 						(struct cds_ft_inode *) cn);
 				return uatomic_load(&cn_meta->nr_keys,
-						CMM_ACQUIRE);
+					CMM_ACQUIRE);
 			}
 			i += cn->len - 1;
 			node_flag = ft_dereference_acquire(cn->child);
@@ -7898,7 +7933,6 @@ int ft_rebuild_path(struct cds_ft *ft,
 		if (ft_node_external(node_flag))
 			return -1;
 
-		/* Traverse through compressed node. */
 		if (ft_node_compressed(node_flag)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(node_flag);
@@ -7907,13 +7941,15 @@ int ft_rebuild_path(struct cds_ft *ft,
 			if (i + cn->len > key_len)
 				return -1;
 			for (j = 0; j < cn->len; j++) {
-				ordinal = key_to_ordinal(ft, key[i + j]);
-				if (ordinal != cn->key_bytes[j])
+				uint8_t ord = key_to_ordinal(ft,
+							key[i + j]);
+				if (ord != cn->key_bytes[j])
 					return -1;
-				ordinal_key[i + j] = ordinal;
-				iter_path_node(iter)[i + j + 1] = node_flag;
+				ordinal_key[i + j] = ord;
+				iter_path_node(iter)[i + j + 1] =
+					node_flag;
 			}
-			i += cn->len - 1; /* -1 because loop increments */
+			i += cn->len - 1;
 			node_flag = ft_dereference_acquire(cn->child);
 			if (!ft_node_ptr(node_flag))
 				return -1;
