@@ -3391,7 +3391,8 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		 *  - key_depth - 1 if last node is external, NULL, or
 		 *                  the path ended early (loop broke).
 		 */
-		if (ft_node_ptr(node_flag) && ft_node_internal(node_flag))
+		if (ft_node_ptr(node_flag) &&
+		    (ft_node_internal(node_flag) || ft_node_compressed(node_flag)))
 			level = key_depth;
 		else
 			level = key_depth - 1;
@@ -3598,9 +3599,21 @@ post_traversal:
 		 * inequality and encountering an external node when
 		 * going upward.
 		 */
-		if (going_up && dir == FT_LEFT && ft_node_internal(iter_path_node(iter)[level])) {
-			const struct cds_ft_type *type = &ft_types[ft_node_type(iter_path_node(iter)[level])];
-			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(iter_path_node(iter)[level]), type->order);
+		if (going_up && dir == FT_LEFT &&
+		    (ft_node_internal(iter_path_node(iter)[level]) ||
+		     ft_node_compressed(iter_path_node(iter)[level]))) {
+			struct cds_ft_metadata *metadata;
+
+			if (ft_node_compressed(iter_path_node(iter)[level]))
+				metadata = cds_ft_item_to_metadata(
+					ft_node_ptr(iter_path_node(iter)[level]));
+			else {
+				const struct cds_ft_type *type = &ft_types[ft_node_type(iter_path_node(iter)[level])];
+				metadata = cds_ft_item_to_metadata_fast(
+					ft_node_ptr(iter_path_node(iter)[level]),
+					type->order);
+			}
+			{
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			if (external_nodes) {
@@ -3616,6 +3629,7 @@ post_traversal:
 				iter->path_len = level + 1;
 				iter->status = CDS_FT_STATUS_OK;
 				goto end;
+			}
 			}
 		}
 
@@ -3678,13 +3692,20 @@ post_traversal:
 			struct cds_ft_inode_flag *pfx_flag =
 				iter_path_node(iter)[iter->prefix_len];
 
-			if (ft_node_ptr(pfx_flag) && ft_node_internal(pfx_flag)) {
-				const struct cds_ft_type *type =
-					&ft_types[ft_node_type(pfx_flag)];
-				struct cds_ft_metadata *metadata =
-					cds_ft_item_to_metadata_fast(
+			if (ft_node_ptr(pfx_flag) &&
+			    (ft_node_internal(pfx_flag) || ft_node_compressed(pfx_flag))) {
+				struct cds_ft_metadata *metadata;
+
+				if (ft_node_compressed(pfx_flag))
+					metadata = cds_ft_item_to_metadata(
+						ft_node_ptr(pfx_flag));
+				else {
+					const struct cds_ft_type *type =
+						&ft_types[ft_node_type(pfx_flag)];
+					metadata = cds_ft_item_to_metadata_fast(
 						ft_node_ptr(pfx_flag),
 						type->order);
+				}
 				struct cds_ft_node *external_nodes =
 					rcu_dereference(metadata->external_nodes);
 
@@ -6194,7 +6215,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		swap_count = swap_empty ? 0 : swap_rmeta->nr_keys;
 
 		/* Compute old_count from the content being displaced. */
-		if (ft_node_ptr(old_child) && ft_node_internal(old_child)) {
+		if (ft_node_ptr(old_child) &&
+		    (ft_node_internal(old_child) || ft_node_compressed(old_child))) {
 			struct cds_ft_metadata *old_meta =
 				cds_ft_item_to_metadata(ft_node_ptr(old_child));
 			old_count = old_meta->nr_keys;
@@ -6212,7 +6234,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * no return, so we can fail cleanly.
 		 */
 		need_fresh = !(ft_node_ptr(old_child)
-				&& ft_node_internal(old_child))
+				&& (ft_node_internal(old_child)
+				    || ft_node_compressed(old_child)))
 			     && !swap_empty;
 		if (need_fresh) {
 			fresh = alloc_cds_ft_node(swap_ft,
@@ -6252,7 +6275,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * entries.
 		 */
 		if (ft_node_ptr(old_child)
-				&& ft_node_internal(old_child)) {
+				&& (ft_node_internal(old_child)
+				    || ft_node_compressed(old_child))) {
 			rcu_assign_pointer(swap_ft->root, old_child);
 			if (swap_empty)
 				free_cds_ft_node(swap_ft,
@@ -6424,7 +6448,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		{
 			unsigned long detached_count;
 
-			if (ft_node_internal(child)) {
+			if (ft_node_internal(child) ||
+			    ft_node_compressed(child)) {
 				struct cds_ft_metadata *child_meta =
 					cds_ft_item_to_metadata(
 						ft_node_ptr(child));
@@ -6484,7 +6509,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			 * the detached trie's (empty) root metadata as
 			 * a NIL-key entry.
 			 */
-			if (ft_node_internal(child)) {
+			if (ft_node_internal(child) ||
+			    ft_node_compressed(child)) {
 				free_cds_ft_node(detached,
 					ft_node_ptr(detached->root));
 				/* No readers in detached root yet. */
@@ -7867,6 +7893,30 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 					level, key, external_nodes);
 			}
 			show_node_recursive(ft, out, child_node_flag, level + 1);
+		} else if (ft_node_compressed(child_node_flag)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(child_node_flag);
+			struct cds_ft_metadata *metadata =
+				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+
+			print_indent(out, level);
+			fprintf(out, "Level %d, key value: %u, compressed node: %p, path_len: %u, nr_keys: %lu\n",
+				level, key, child_node_flag, (unsigned int) cn->len,
+				uatomic_load(&metadata->nr_keys, CMM_RELAXED));
+			if (external_nodes) {
+				print_indent(out, level);
+				fprintf(out, "Level %d, key value: %u, (meta)external node list ptr: %p\n",
+					level, key, external_nodes);
+			}
+			if (ft_node_ptr(cn->child) &&
+			    (ft_node_internal(cn->child) || ft_node_compressed(cn->child)))
+				show_node_recursive(ft, out, cn->child, level + cn->len);
+			else if (ft_node_ptr(cn->child)) {
+				print_indent(out, level + cn->len);
+				fprintf(out, "Level %d, compressed child: external node list ptr: %p\n",
+					level + (int) cn->len, ft_node_ptr(cn->child));
+			}
 		} else {
 			print_indent(out, level);
 			fprintf(out, "Level %d, key value: %u, external node list ptr: %p\n",
@@ -7977,6 +8027,49 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 				}
 			}
 			calc_stats_node_recursive(ft, child_node_flag, stats, level + 1);
+		} else if (ft_node_compressed(child_node_flag)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(child_node_flag);
+			struct cds_ft_metadata *metadata =
+				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+			int j;
+
+			stats->level[level].nr_internal_nodes++;
+			stats->level[level].has_nodes = true;
+			if (external_nodes) {
+				struct cds_ft_node *iter_node;
+				unsigned int count = 0;
+
+				iter_node = external_nodes;
+				cds_ft_for_each_duplicate(iter_node) {
+					if (count++ == 0)
+						stats->level[level].nr_metadata_external_nodes++;
+					else
+						stats->level[level].nr_duplicate_external_nodes++;
+					stats->level[level].has_nodes = true;
+				}
+			}
+			for (j = 1; j < cn->len; j++) {
+				stats->level[level + j].nr_internal_nodes++;
+				stats->level[level + j].has_nodes = true;
+			}
+			if (ft_node_ptr(cn->child) &&
+			    (ft_node_internal(cn->child) || ft_node_compressed(cn->child)))
+				calc_stats_node_recursive(ft, cn->child, stats, level + cn->len);
+			else if (ft_node_ptr(cn->child)) {
+				struct cds_ft_node *iter_node;
+				unsigned int count = 0;
+
+				iter_node = (struct cds_ft_node *) ft_node_ptr(cn->child);
+				cds_ft_for_each_duplicate(iter_node) {
+					if (count++ == 0)
+						stats->level[level + cn->len].nr_external_nodes++;
+					else
+						stats->level[level + cn->len].nr_duplicate_external_nodes++;
+					stats->level[level + cn->len].has_nodes = true;
+				}
+			}
 		} else {
 			struct cds_ft_node *iter_node;
 			unsigned int count = 0;
