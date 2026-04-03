@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 145
+#define NR_TESTS 146
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -10068,6 +10068,135 @@ static int test_compress_recompact_external_nodes(void)
 	return drain_and_destroy(ft, group);
 }
 
+/*
+ * Cached iterator reuse through compressed paths: exercise the
+ * inequality fast-path with compressed entries in iter_path.
+ *
+ * The fast-path reads iter_path[key_depth - 1] from a prior
+ * lookup's cached path.  When that entry is a compressed node,
+ * the fast-path must fall back to the slow path.  This test
+ * verifies correctness across several reuse patterns:
+ *
+ * 1. GE → LE with same key (mode switch)
+ * 2. GE → GE with shorter prefix (subset optimization)
+ * 3. Exact lookup → GE with shorter key
+ * 4. GE → cds_ft_next (iteration from inequality result)
+ * 5. Repeated identical lookups (idempotent reuse)
+ *
+ * All using a SINGLE shared iterator to exercise path caching.
+ */
+static int test_compress_iter_reuse(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *found;
+	uint8_t rk[32];
+	size_t rklen;
+	int ret = -1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *)"apple", 5, &node_alloc(0)->node);
+	cds_ft_insert(ft, (const uint8_t *)"banana", 6, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *)"cherry", 6, &node_alloc(2)->node);
+
+	/* 1. GE("banana") → LE("banana") with same iterator. */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"banana", 6);
+	if (cds_ft_lookup_ge(ft, iter) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "iter_reuse: ge(banana) failed\n");
+		goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	if (rklen != 6 || memcmp(rk, "banana", 6) != 0) {
+		fprintf(stderr, "iter_reuse: ge(banana) = %.*s\n", (int)rklen, rk);
+		goto out;
+	}
+	/* LE with same key reuses cached path. */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"banana", 6);
+	if (cds_ft_lookup_le(ft, iter) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "iter_reuse: le(banana) after ge failed\n");
+		goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	if (rklen != 6 || memcmp(rk, "banana", 6) != 0) {
+		fprintf(stderr, "iter_reuse: le(banana) = %.*s\n", (int)rklen, rk);
+		goto out;
+	}
+
+	/* 2. GE("banana") → GE("banan") — shorter prefix, subset. */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"banana", 6);
+	cds_ft_lookup_ge(ft, iter);
+	cds_ft_iter_set_key(iter, (const uint8_t *)"banan", 5);
+	if (cds_ft_lookup_ge(ft, iter) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "iter_reuse: ge(banan) after ge(banana) failed\n");
+		goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	if (rklen != 6 || memcmp(rk, "banana", 6) != 0) {
+		fprintf(stderr, "iter_reuse: ge(banan) = %.*s (expect banana)\n",
+			(int)rklen, rk);
+		goto out;
+	}
+
+	/* 3. Exact lookup → GE with shorter key. */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"banana", 6);
+	cds_ft_lookup(ft, iter);
+	cds_ft_iter_set_key(iter, (const uint8_t *)"ban", 3);
+	if (cds_ft_lookup_ge(ft, iter) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "iter_reuse: ge(ban) after lookup(banana) failed\n");
+		goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	if (rklen != 6 || memcmp(rk, "banana", 6) != 0) {
+		fprintf(stderr, "iter_reuse: ge(ban) = %.*s (expect banana)\n",
+			(int)rklen, rk);
+		goto out;
+	}
+
+	/* 4. GE("banana") → cds_ft_next (iterate to next key). */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"banana", 6);
+	cds_ft_lookup_ge(ft, iter);
+	if (cds_ft_next(ft, iter) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "iter_reuse: next after ge(banana) failed\n");
+		goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	if (rklen != 6 || memcmp(rk, "cherry", 6) != 0) {
+		fprintf(stderr, "iter_reuse: next = %.*s (expect cherry)\n",
+			(int)rklen, rk);
+		goto out;
+	}
+
+	/* 5. Repeated identical GE (idempotent). */
+	cds_ft_iter_set_key(iter, (const uint8_t *)"band", 4);
+	cds_ft_lookup_ge(ft, iter);
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	if (rklen != 6 || memcmp(rk, "cherry", 6) != 0) {
+		fprintf(stderr, "iter_reuse: ge(band) first = %.*s\n",
+			(int)rklen, rk);
+		goto out;
+	}
+	cds_ft_iter_set_key(iter, (const uint8_t *)"band", 4);
+	cds_ft_lookup_ge(ft, iter);
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	if (rklen != 6 || memcmp(rk, "cherry", 6) != 0) {
+		fprintf(stderr, "iter_reuse: ge(band) second = %.*s\n",
+			(int)rklen, rk);
+		goto out;
+	}
+
+	ret = 0;
+out:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group) | ret;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                           MAIN                                     */
@@ -10279,6 +10408,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compress_nested);
 	RUN_TEST(test_compress_replace_through);
 	RUN_TEST(test_compress_recompact_external_nodes);
+	RUN_TEST(test_compress_iter_reuse);
 
 	rcu_barrier();
 	rcu_unregister_thread();
