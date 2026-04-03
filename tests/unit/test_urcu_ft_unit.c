@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 146
+#define NR_TESTS 147
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -10197,6 +10197,68 @@ out:
 	return drain_and_destroy(ft, group) | ret;
 }
 
+/*
+ * Graft_swap with key shorter than compressed path: insert "abcdef"
+ * (creates compressed path), then graft_swap at "ab" which is
+ * shorter than the compressed path.  Verifies the compressed path
+ * is split into prefix + suffix, the suffix is swapped into the
+ * source trie, and the original key is accessible in the swap trie
+ * (exercises compressed root lookup in the swapped trie).
+ */
+static int test_compress_graft_swap_key_shorter(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft *swap;
+	struct cds_ft_node *found;
+	const uint8_t *k_src = (const uint8_t *)"QR";
+
+	if (cds_ft_create(group, &swap) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *)"abcdef", 6, &node_alloc(1)->node);
+	cds_ft_insert(swap, k_src, 2, &node_alloc(2)->node);
+
+	/* Graft_swap at "ab" — shorter than compressed path "bcdef". */
+	if (cds_ft_graft_swap(ft, (const uint8_t *)"ab", 2, swap) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_graft_swap_shorter: swap failed\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	/* "abQR" should exist in ft (from swap source). */
+	if (cds_ft_lookup_key(ft, (const uint8_t *)"abQR", 4, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_graft_swap_shorter: abQR not found\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	/* "cdef" should exist in swap trie (relative key). */
+	if (cds_ft_lookup_key(swap, (const uint8_t *)"cdef", 4, &found) != CDS_FT_STATUS_OK || !found) {
+		fprintf(stderr, "compress_graft_swap_shorter: cdef not in swap\n");
+		rcu_read_unlock();
+		goto fail;
+	}
+	if (cds_ft_count_keys(ft) != 1 || cds_ft_count_keys(swap) != 1) {
+		fprintf(stderr, "compress_graft_swap_shorter: counts wrong ft=%lu swap=%lu\n",
+			cds_ft_count_keys(ft), cds_ft_count_keys(swap));
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+	{
+		int r = drain_and_destroy(swap, group);
+		return drain_and_destroy(ft, group) | r;
+	}
+fail:
+	rcu_read_unlock();
+	{
+		int r = drain_and_destroy(swap, group);
+		return drain_and_destroy(ft, group) | r | -1;
+	}
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                           MAIN                                     */
@@ -10409,6 +10471,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compress_replace_through);
 	RUN_TEST(test_compress_recompact_external_nodes);
 	RUN_TEST(test_compress_iter_reuse);
+	RUN_TEST(test_compress_graft_swap_key_shorter);
 
 	rcu_barrier();
 	rcu_unregister_thread();
