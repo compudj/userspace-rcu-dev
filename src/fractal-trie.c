@@ -5938,8 +5938,9 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 }
 
 /*
- * Build a single-child chain of internal nodes for
- * key[start .. end-1] with @leaf at the bottom.  Returns the topmost
+ * Build a branch for key[start .. end-1] with @leaf at the bottom.
+ * When the path is 2+ bytes, a single compressed node is used instead
+ * of a chain of single-child internal nodes.  Returns the topmost
  * flagged node, or NULL on allocation failure (all nodes freed).
  */
 static
@@ -5948,54 +5949,63 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		struct cds_ft_inode_flag *leaf,
 		unsigned long subtree_external_count)
 {
-	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
-	struct cds_ft_inode_flag *cur = leaf;
-	int nr = 0, j, ret;
-	int i;
+	unsigned int path_len = end - start;
 
-	for (i = (int) end - 1; i >= (int) start; i--) {
-		struct cds_ft_inode_flag *dest = NULL;
-		uint8_t kv = key_to_ordinal(ft, key[i]);
+	if (path_len >= 2) {
+		struct cds_ft_compressed_node *cn;
+		struct cds_ft_metadata *cn_meta;
+		unsigned int j;
 
-		ret = ft_node_set_nth(ft, &dest, kv, cur, NULL, NULL);
-		if (ret) {
-			for (j = 0; j < nr; j++)
-				free_cds_ft_node(ft, ft_node_ptr(created[j]));
+		cn = alloc_compressed_node(ft, path_len, &cn_meta);
+		if (!cn)
 			return NULL;
-		}
+		cn->child = leaf;
+		cn->len = path_len;
+		for (j = 0; j < path_len; j++)
+			cn->key_bytes[j] = key_to_ordinal(ft, key[start + j]);
+		cn_meta->nr_child = 1;
+		uatomic_store(&cn_meta->nr_keys, subtree_external_count,
+			CMM_RELAXED);
+		return ft_compressed_node_flag(cn);
+	} else if (path_len == 1) {
+		struct cds_ft_inode_flag *dest = NULL;
+		int ret;
+
+		ret = ft_node_set_nth(ft, &dest,
+				key_to_ordinal(ft, key[start]),
+				leaf, NULL, NULL);
+		if (ret)
+			return NULL;
 		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(dest));
 			uatomic_store(&m->nr_keys, subtree_external_count,
 				CMM_RELAXED);
 		}
-		created[nr++] = dest;
-		cur = dest;
+		return dest;
 	}
-	return cur;
+	/* path_len == 0: leaf is the branch. */
+	return leaf;
 }
 
 /*
- * Free a chain of internal nodes previously built by ft_build_branch().
- * Walks down the path using the key to find the next child, freeing the
- * current node at each step. Safely leaves the bottom-most leaf untouched.
+ * Free a branch previously built by ft_build_branch().
+ * If the top node is compressed, free just the compressed node.
+ * Otherwise, walk down the single internal node freeing it.
+ * The bottom-most leaf is left untouched.
  */
 static
 void ft_free_branch(struct cds_ft *ft,
-		const uint8_t *key, unsigned int start, unsigned int end,
+		const uint8_t *key __attribute__((unused)),
+		unsigned int start __attribute__((unused)),
+		unsigned int end __attribute__((unused)),
 		struct cds_ft_inode_flag *top_node)
 {
-	struct cds_ft_inode_flag *cur = top_node;
-	unsigned int i;
-
-	for (i = start; i < end; i++) {
-		struct cds_ft_inode_flag *next_node;
-		uint8_t kv = key_to_ordinal(ft, key[i]);
-
-		assert(ft_node_ptr(cur) && ft_node_internal(cur));
-		next_node = ft_node_get_nth(cur, NULL, kv);
-		free_cds_ft_node(ft, ft_node_ptr(cur));
-		cur = next_node;
+	if (ft_node_compressed(top_node)) {
+		free_compressed_node(ft,
+			ft_compressed_node_ptr(top_node));
+	} else if (ft_node_internal(top_node)) {
+		free_cds_ft_node(ft, ft_node_ptr(top_node));
 	}
 }
 
