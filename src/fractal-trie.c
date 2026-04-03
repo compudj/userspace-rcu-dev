@@ -3532,25 +3532,83 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 				ordinal_key[level - 1 + j] = ck;
 				iter_path_node(iter)[level + j] = node_flag;
 				if (ck != cn->key_bytes[j]) {
-					/* Mismatch: break for going-up. */
-					level += j;
-					goto post_descent;
+					/*
+					 * Mismatch within compressed path.
+					 *
+					 * If the search byte is on the same
+					 * side as the lookup direction
+					 * (GE+search>compressed or
+					 * LE+search<compressed), the
+					 * subtree has no candidates: go up.
+					 *
+					 * Otherwise, the subtree contains
+					 * candidates: fix ordinal_key,
+					 * walk the rest of the compressed
+					 * path, and descend into the child.
+					 */
+					if ((mode == FT_LOOKUP_GE && ck > cn->key_bytes[j]) ||
+					    (mode == FT_LOOKUP_GT && ck > cn->key_bytes[j]) ||
+					    (mode == FT_LOOKUP_LE && ck < cn->key_bytes[j]) ||
+					    (mode == FT_LOOKUP_LT && ck < cn->key_bytes[j])) {
+						level += j;
+						iter->path_valid = false;
+						iter_debug_path_snapshot(iter);
+						goto going_up;
+					}
+					/* Descend into compressed subtree. */
+					ordinal_key[level - 1 + j] = cn->key_bytes[j];
+					for (j++; j < cn->len; j++) {
+						ordinal_key[level - 1 + j] = cn->key_bytes[j];
+						iter_path_node(iter)[level + j] = node_flag;
+					}
+					level += cn->len - 1;
+					node_flag = ft_dereference_acquire(cn->child);
+					if (!ft_node_ptr(node_flag))
+						break;
+					iter_path_node(iter)[level + 1] = node_flag;
+					skip_eq_external_nodes = false;
+					iter->path_valid = false;
+					iter_debug_path_snapshot(iter);
+					goto descend_children;
 				}
 			}
 			if (cn->len > remaining) {
-				/* Key shorter than compressed path. */
+				/*
+				 * Key shorter than compressed path.
+				 * The key is a prefix of all keys in
+				 * the subtree, so they are all strictly
+				 * greater.  For GE/GT: descend into
+				 * the subtree.  For LE/LT: go up.
+				 */
+				if (mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT) {
+					int k;
+
+					for (k = cmp; k < cn->len; k++) {
+						ordinal_key[level - 1 + k] = cn->key_bytes[k];
+						iter_path_node(iter)[level + k] = node_flag;
+					}
+					level += cn->len - 1;
+					node_flag = ft_dereference_acquire(cn->child);
+					if (!ft_node_ptr(node_flag))
+						break;
+					iter_path_node(iter)[level + 1] = node_flag;
+					skip_eq_external_nodes = false;
+					iter->path_valid = false;
+					iter_debug_path_snapshot(iter);
+					goto descend_children;
+				}
 				level += cmp - 1;
-				goto post_descent;
+				iter->path_valid = false;
+				iter_debug_path_snapshot(iter);
+				goto going_up;
 			}
 			level += cn->len - 1; /* -1: for loop increments */
 			node_flag = ft_dereference_acquire(cn->child);
 			if (!ft_node_ptr(node_flag))
 				break;
 			iter_path_node(iter)[level + 1] = node_flag;
-			if (ft_node_external(node_flag)) {
-				level++;
+			if (ft_node_external(node_flag))
 				break;
-			}
 			continue;
 		}
 
@@ -3656,6 +3714,7 @@ post_traversal:
 			!ft_node_external(node_flag))
 		goto descend_children;
 
+going_up:
 	/* Ensure iter_key is exactly at the position matching the level we stopped at. */
 	iter_key = input_key + level;
 

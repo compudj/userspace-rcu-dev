@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 142
+#define NR_TESTS 143
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -9809,64 +9809,83 @@ static int test_compress_lookup_nth_through(void)
  * Uses variable-length keys so compressed paths are exercised
  * within the key itself, not just in the shared prefix.
  */
+/*
+ * Helper: single inequality lookup with a fresh iterator to avoid
+ * cached-path interactions between tests.
+ */
+static int check_ineq(struct cds_ft *ft, const char *label,
+		const uint8_t *key, size_t key_len,
+		enum cds_ft_status (*fn)(struct cds_ft *, struct cds_ft_iter *),
+		const uint8_t *expect, size_t expect_len)
+{
+	struct cds_ft_iter *iter;
+	uint8_t rk[32];
+	size_t rklen;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		return -1;
+	cds_ft_iter_set_key(iter, key, key_len);
+	if (fn(ft, iter) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compress_ineq: %s: NOT_FOUND\n", label);
+		cds_ft_iter_destroy(iter);
+		return -1;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
+	cds_ft_iter_destroy(iter);
+	if (rklen != expect_len || memcmp(rk, expect, expect_len) != 0) {
+		fprintf(stderr, "compress_ineq: %s: got len=%zu key=%.*s, "
+			"expected len=%zu key=%.*s\n", label,
+			rklen, (int)rklen, rk,
+			expect_len, (int)expect_len, expect);
+		return -1;
+	}
+	return 0;
+}
+
 static int test_compress_inequality_through(void)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_varlen_ft(&group);
-	struct cds_ft_iter *iter;
-	struct cds_ft_node *node;
-	uint8_t rk[32];
-	size_t rklen;
 
-	if (cds_ft_iter_create(ft, &iter) < 0) {
-		cds_ft_destroy(ft);
-		cds_ft_group_destroy(group);
-		return -1;
-	}
 	rcu_read_lock();
 	cds_ft_insert(ft, (const uint8_t *)"apple", 5, &node_alloc(0)->node);
 	cds_ft_insert(ft, (const uint8_t *)"banana", 6, &node_alloc(1)->node);
 	cds_ft_insert(ft, (const uint8_t *)"cherry", 6, &node_alloc(2)->node);
 
-	/* GE("band") should return "banana". */
-	cds_ft_iter_set_key(iter, (const uint8_t *)"band", 4);
-	if (cds_ft_lookup_ge(ft, iter) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "compress_ineq: ge(band) failed\n");
-		rcu_read_unlock();
+	/* GE("band") → "cherry" (band > banana). */
+	if (check_ineq(ft, "ge(band)",
+		    (const uint8_t *)"band", 4, cds_ft_lookup_ge,
+		    (const uint8_t *)"cherry", 6))
 		goto fail;
-	}
-	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
-	if (rklen != 6 || memcmp(rk, "banana", 6) != 0) {
-		fprintf(stderr, "compress_ineq: ge(band) got len=%zu\n", rklen);
-		rcu_read_unlock();
-		goto fail;
-	}
 
-	/* LE("cat") should return "banana" (banana < cat < cherry). */
-	cds_ft_iter_set_key(iter, (const uint8_t *)"cat", 3);
-	if (cds_ft_lookup_le(ft, iter) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "compress_ineq: le(cat) failed\n");
-		rcu_read_unlock();
+	/* LE("band") → "banana" (banana < band). */
+	if (check_ineq(ft, "le(band)",
+		    (const uint8_t *)"band", 4, cds_ft_lookup_le,
+		    (const uint8_t *)"banana", 6))
 		goto fail;
-	}
-	node = cds_ft_iter_node(iter);
-	if (!node) {
-		fprintf(stderr, "compress_ineq: le(cat) no node\n");
-		rcu_read_unlock();
+
+	/* GE("banan") → "banana" (banan < banana). */
+	if (check_ineq(ft, "ge(banan)",
+		    (const uint8_t *)"banan", 5, cds_ft_lookup_ge,
+		    (const uint8_t *)"banana", 6))
 		goto fail;
-	}
-	cds_ft_iter_get_key(iter, rk, sizeof(rk), &rklen);
-	if (rklen != 6 || memcmp(rk, "banana", 6) != 0) {
-		fprintf(stderr, "compress_ineq: le(cat) got len=%zu key=%.6s\n",
-			rklen, (char *)rk);
-		rcu_read_unlock();
+
+	/* GE("banana") exact match. */
+	if (check_ineq(ft, "ge(banana)",
+		    (const uint8_t *)"banana", 6, cds_ft_lookup_ge,
+		    (const uint8_t *)"banana", 6))
 		goto fail;
-	}
+
+	/* LE("banana") exact match. */
+	if (check_ineq(ft, "le(banana)",
+		    (const uint8_t *)"banana", 6, cds_ft_lookup_le,
+		    (const uint8_t *)"banana", 6))
+		goto fail;
+
 	rcu_read_unlock();
-	cds_ft_iter_destroy(iter);
 	return drain_and_destroy(ft, group);
 fail:
-	cds_ft_iter_destroy(iter);
+	rcu_read_unlock();
 	return drain_and_destroy(ft, group) | -1;
 }
 
@@ -10135,6 +10154,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compress_detach_through);
 	RUN_TEST(test_compress_iteration_order);
 	RUN_TEST(test_compress_lookup_nth_through);
+	RUN_TEST(test_compress_inequality_through);
 	RUN_TEST(test_compress_nested);
 
 	rcu_barrier();
