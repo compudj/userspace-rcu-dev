@@ -802,13 +802,30 @@ struct cds_ft_inode_flag *ft_node_flag_pool_2d(struct cds_ft_inode *node,
 		FT_INTERNAL_MASK);
 }
 
+/*
+ * Test whether @node has the external tag (bits 0-1 == 0b00).
+ * This matches both non-NULL external leaf pointers AND NULL,
+ * since NULL has tag bits 0b00.  Callers that need to distinguish
+ * NULL from a valid external node should also check ft_node_ptr().
+ */
+static
+bool ft_node_external(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & FT_TAG_MASK) == 0;
+}
+
 static
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v, type_idx;
 
-	if (!node)
-		return NULL;	/* FT_NULL */
+	/*
+	 * External nodes (including NULL) have tag 0b00: the pointer
+	 * is the raw address.  Return it directly without masking.
+	 */
+	if (ft_node_external(node))
+		return (struct cds_ft_inode *) node;
+
 	v = (unsigned long) node;
 
 	/* Compressed nodes only use bits 0-1 for the tag. */
@@ -850,18 +867,6 @@ static
 bool ft_node_compressed(struct cds_ft_inode_flag *node)
 {
 	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
-}
-
-/*
- * Test whether @node has the external tag (bits 0-1 == 0b00).
- * This matches both non-NULL external leaf pointers AND NULL,
- * since NULL has tag bits 0b00.  Callers that need to distinguish
- * NULL from a valid external node should also check ft_node_ptr().
- */
-static
-bool ft_node_external(struct cds_ft_inode_flag *node)
-{
-	return ((unsigned long) node & FT_TAG_MASK) == 0;
 }
 
 static
