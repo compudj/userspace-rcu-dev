@@ -3479,6 +3479,17 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		}
 		node_flag = iter_path_node(iter)[key_depth - 1];
 		/*
+		 * If the cached path entry is a compressed node, the
+		 * fast path cannot determine the correct loop exit
+		 * state (compressed nodes span multiple levels).
+		 * Fall back to the slow path.
+		 */
+		if (ft_node_compressed(node_flag)) {
+			node_flag = rcu_dereference(ft->root);
+			iter_key = input_key;
+			goto slow_path;
+		}
+		/*
 		 * Reconstruct the loop exit value of @level to match
 		 * what the traversal loop would have produced:
 		 *  - key_depth     if last node is internal (loop ran
@@ -3493,6 +3504,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		goto post_traversal;
 	}
 
+slow_path:
 	for (level = 1; level < key_depth; level++) {
 		uint8_t key_value;
 
@@ -3551,7 +3563,6 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 					    (mode == FT_LOOKUP_LE && ck < cn->key_bytes[j]) ||
 					    (mode == FT_LOOKUP_LT && ck < cn->key_bytes[j])) {
 						level += j;
-						iter->path_valid = false;
 						iter_debug_path_snapshot(iter);
 						goto going_up;
 					}
@@ -3567,7 +3578,6 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 						break;
 					iter_path_node(iter)[level + 1] = node_flag;
 					skip_eq_external_nodes = false;
-					iter->path_valid = false;
 					iter_debug_path_snapshot(iter);
 					goto descend_children;
 				}
@@ -3593,12 +3603,10 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 						break;
 					iter_path_node(iter)[level + 1] = node_flag;
 					skip_eq_external_nodes = false;
-					iter->path_valid = false;
 					iter_debug_path_snapshot(iter);
 					goto descend_children;
 				}
 				level += cmp - 1;
-				iter->path_valid = false;
 				iter_debug_path_snapshot(iter);
 				goto going_up;
 			}
@@ -3636,7 +3644,6 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		if (ft_node_external(node_flag))
 			break;
 	}
-post_descent:
 
 	/*
 	 * The slow-path traversal has freshly populated the iterator
@@ -3964,7 +3971,6 @@ descend_children:
 		if (ft_node_compressed(node_flag)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(node_flag);
-			int j;
 
 			/*
 			 * Check external_nodes at the compressed
@@ -5359,12 +5365,12 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			if (j < cn->len)
 				return CDS_FT_STATUS_NOT_FOUND;
 			iter_key += cn->len;
-			i += cn->len;
+			i += cn->len - 1; /* -1: for loop increments */
 			node_flag = cn->child;
 			node_flag_ptr = &cn->child;
 			if (!ft_node_ptr(node_flag))
 				return CDS_FT_STATUS_NOT_FOUND;
-			if (i >= key_depth)
+			if (ft_node_external(node_flag))
 				break;
 			continue;
 		}
