@@ -4950,20 +4950,58 @@ int _cds_ft_insert(struct cds_ft *ft,
 					continue;
 				}
 				assert(ft_node_ptr(cn->child));
+				/*
+				 * If child is compressed (nested), just
+				 * traverse through and continue — the
+				 * next iteration handles the inner
+				 * compressed node.
+				 */
+				if (ft_node_compressed(cn->child)) {
+					snapshot[nr_snapshot++] = d.nf;
+					ft_descent_traverse_compressed(
+						&d, cn, &iter_key);
+					continue;
+				}
 				if (cn->len == remaining) {
 					snapshot[nr_snapshot++] = d.nf;
 					ft_descent_traverse_compressed(
 						&d, cn, &iter_key);
 					break;
 				}
-				/* cn->len < remaining: decompress. */
+				/*
+				 * cn->len < remaining: key continues
+				 * past the external child.  Build the
+				 * remaining path, move the old external
+				 * to external_nodes, and publish the
+				 * complete subtree atomically at
+				 * cn->child.
+				 */
 				{
-					int dret = ft_decompress_node(ft,
-							d.nfp, d.nf);
-					if (dret)
-						return dret;
-					d.nf = *d.nfp;
-					continue;
+					struct cds_ft_inode_flag *branch;
+					struct cds_ft_metadata *br_meta;
+
+					branch = ft_build_branch(ft, key,
+						d.depth + cn->len, key_len,
+						(struct cds_ft_inode_flag *) node,
+						1);
+					if (!branch)
+						return -ENOMEM;
+					br_meta = cds_ft_item_to_metadata(
+						ft_node_ptr(branch));
+					br_meta->external_nodes =
+						(struct cds_ft_node *)
+						cn->child;
+					uatomic_store(&br_meta->nr_keys,
+						br_meta->nr_keys + 1,
+						CMM_RELAXED);
+					rcu_assign_pointer(cn->child,
+						branch);
+					snapshot[nr_snapshot++] = d.nf;
+					snapshot[nr_snapshot++] = branch;
+					ft_propagate_external_count(
+						snapshot, nr_snapshot, 1);
+					ret = 0;
+					goto insert_done;
 				}
 			}
 			/*
