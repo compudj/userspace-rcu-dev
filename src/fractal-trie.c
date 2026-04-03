@@ -825,10 +825,16 @@ bool ft_node_compressed(struct cds_ft_inode_flag *node)
 	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
 }
 
+/*
+ * Test whether @node has the external tag (bits 0-1 == 0b00).
+ * This matches both non-NULL external leaf pointers AND NULL,
+ * since NULL has tag bits 0b00.  Callers that need to distinguish
+ * NULL from a valid external node should also check ft_node_ptr().
+ */
 static
 bool ft_node_external(struct cds_ft_inode_flag *node)
 {
-	return node != NULL && ((unsigned long) node & FT_TAG_MASK) == 0;
+	return ((unsigned long) node & FT_TAG_MASK) == 0;
 }
 
 static
@@ -6086,7 +6092,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 	for (; d->depth < key_len; ) {
 		uint8_t kv;
 
-		if (!ft_node_ptr(d->nf) || ft_node_external(d->nf))
+		if (ft_node_external(d->nf))
 			break;
 		if (ft_node_compressed(d->nf)) {
 			struct cds_ft_compressed_node *cn =
@@ -6900,7 +6906,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	for (i = 0; i < prefix_len; i++) {
 		uint8_t kv;
 
-		if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
+		if (ft_node_external(node_flag))
 			return 0;
 		if (ft_node_compressed(node_flag)) {
 			struct cds_ft_compressed_node *cn =
@@ -7006,7 +7012,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		uint8_t child_key;
 		int pivot;
 
-		if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
+		if (ft_node_external(node_flag))
 			break;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
@@ -7143,7 +7149,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		uint8_t child_key;
 		int pivot;
 
-		if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
+		if (ft_node_external(node_flag))
 			break;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
@@ -7281,7 +7287,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 	for (i = 0; i < key_len; i++) {
 		uint8_t ordinal;
 
-		if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
+		if (ft_node_external(node_flag))
 			return -1;
 
 		/* Traverse through compressed node. */
@@ -7503,8 +7509,7 @@ descend_forward:
 			uint8_t child_key;
 			int pivot;
 
-			if (!ft_node_ptr(node_flag) ||
-			    ft_node_external(node_flag))
+			if (ft_node_external(node_flag))
 				break;
 
 			metadata = cds_ft_item_to_metadata(
@@ -7814,8 +7819,7 @@ descend_reverse:
 			uint8_t child_key;
 			int pivot;
 
-			if (!ft_node_ptr(node_flag) ||
-			    ft_node_external(node_flag))
+			if (ft_node_external(node_flag))
 				break;
 
 			metadata = cds_ft_item_to_metadata(
