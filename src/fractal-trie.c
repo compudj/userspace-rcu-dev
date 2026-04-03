@@ -895,6 +895,47 @@ struct cds_ft_compressed_node *ft_compressed_node_ptr(
 		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
 }
 
+/*
+ * Compare @cmp key bytes starting at @key against the compressed
+ * node's path.  Returns the number of matching bytes.  A return
+ * value == @cmp means full match; < @cmp means divergence at that
+ * position.
+ */
+static inline
+unsigned int ft_match_compressed_key(struct cds_ft *ft,
+		const uint8_t *key,
+		const struct cds_ft_compressed_node *cn,
+		unsigned int cmp)
+{
+	unsigned int j;
+
+	for (j = 0; j < cmp; j++) {
+		if (key_to_ordinal(ft, key[j]) != cn->key_bytes[j])
+			return j;
+	}
+	return cmp;
+}
+
+/*
+ * Fill ordinal_key and iter_path arrays for every level spanned by
+ * a compressed node.  Used by read-side descent loops (lookup_nth,
+ * minmax, etc.) to record the path through compressed nodes so that
+ * going-up backtracking has valid entries at each level.
+ */
+static inline
+void ft_fill_compressed_path(struct cds_ft_compressed_node *cn,
+		uint8_t *ordinal_key, int base,
+		struct cds_ft_inode_flag **iter_path, int path_base,
+		struct cds_ft_inode_flag *node_flag)
+{
+	int j;
+
+	for (j = 0; j < cn->len; j++) {
+		ordinal_key[base + j] = cn->key_bytes[j];
+		iter_path[path_base + j] = node_flag;
+	}
+}
+
 static
 bool valid_external_node(struct cds_ft_node *node)
 {
@@ -955,6 +996,27 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->pnfp = NULL;
 	d->ppnf = NULL;
 	d->ppnfp = NULL;
+}
+
+/*
+ * Advance descent state through a compressed node on full key match.
+ * Updates parent chain, current pointer, and depth.  The caller is
+ * responsible for snapshot, snapshot_n, and detach tracking before
+ * calling this helper.
+ */
+static inline
+void ft_descent_traverse_compressed(struct ft_descent *d,
+		struct cds_ft_compressed_node *cn,
+		const uint8_t **iter_key)
+{
+	d->ppnf  = d->pnf;
+	d->ppnfp = d->pnfp;
+	d->pnf   = d->nf;
+	d->pnfp  = d->nfp;
+	d->nf    = cn->child;
+	d->nfp   = &cn->child;
+	d->depth += cn->len;
+	*iter_key += cn->len;
 }
 
 /*
@@ -3871,10 +3933,8 @@ descend_children:
 			 * returns NULL for siblings, causing the
 			 * going-up walk to continue ascending).
 			 */
-			for (j = 0; j < cn->len; j++) {
-				ordinal_key[level - 1 + j] = cn->key_bytes[j];
-				iter_path_node(iter)[level + j] = node_flag;
-			}
+			ft_fill_compressed_path(cn, ordinal_key, level - 1,
+				iter_path_node(iter), level, node_flag);
 			level += cn->len - 1;
 			node_flag = ft_dereference_acquire(cn->child);
 			if (!ft_node_ptr(node_flag))
@@ -4784,17 +4844,12 @@ int _cds_ft_insert(struct cds_ft *ft,
 		if (ft_node_compressed(d.nf)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(d.nf);
-			int remaining = key_depth - 1 - d.depth;
-			int cmp = cn->len < remaining ? cn->len : remaining;
-			int j, match = 1;
+			unsigned int remaining = key_depth - 1 - d.depth;
+			unsigned int cmp = cn->len < remaining ? cn->len : remaining;
+			unsigned int j;
 
-			for (j = 0; j < cmp; j++) {
-				if (key_to_ordinal(ft, iter_key[j]) != cn->key_bytes[j]) {
-					match = 0;
-					break;
-				}
-			}
-			if (match && cn->len <= remaining) {
+			j = ft_match_compressed_key(ft, iter_key, cn, cmp);
+			if (j == cmp && cn->len <= remaining) {
 				/*
 				 * Full match: traverse through if the
 				 * child is internal.  If the child is
@@ -4804,14 +4859,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 				if (ft_node_ptr(cn->child) &&
 				    ft_node_internal(cn->child)) {
 					snapshot[nr_snapshot++] = d.nf;
-					iter_key += cn->len;
-					d.ppnf = d.pnf;
-					d.ppnfp = d.pnfp;
-					d.pnf = d.nf;
-					d.pnfp = d.nfp;
-					d.nf = cn->child;
-					d.nfp = &cn->child;
-					d.depth += cn->len;
+					ft_descent_traverse_compressed(
+						&d, cn, &iter_key);
 					continue;
 				}
 				/* Child is NULL/external: decompress. */
@@ -4829,7 +4878,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 			 * the compressed node directly instead of
 			 * decompressing the entire path.
 			 */
-			if (!match) {
+			if (j < cmp) {
 				int dret = ft_split_compressed_insert(ft,
 					d.nfp, d.nf, iter_key, remaining,
 					j, node);
@@ -5061,26 +5110,15 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				ft_compressed_node_ptr(d.nf);
 			int remaining = key_depth - 1 - d.depth;
 			int cmp = cn->len < remaining ? cn->len : remaining;
-			int j, match = 1;
+			int j;
 
-			for (j = 0; j < cmp; j++) {
-				if (key_to_ordinal(ft, iter_key[j]) != cn->key_bytes[j]) {
-					match = 0;
-					break;
-				}
-			}
-			if (match && cn->len <= remaining &&
+			j = ft_match_compressed_key(ft, iter_key, cn, cmp);
+			if (j == cmp && cn->len <= remaining &&
 			    ft_node_ptr(cn->child) &&
 			    ft_node_internal(cn->child)) {
 				snapshot[nr_snapshot++] = d.nf;
-				iter_key += cn->len;
-				d.ppnf = d.pnf;
-				d.ppnfp = d.pnfp;
-				d.pnf = d.nf;
-				d.pnfp = d.nfp;
-				d.nf = cn->child;
-				d.nfp = &cn->child;
-				d.depth += cn->len;
+				ft_descent_traverse_compressed(
+					&d, cn, &iter_key);
 				continue;
 			}
 			{
@@ -5258,10 +5296,9 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 
 			if (cn->len > remaining)
 				return CDS_FT_STATUS_NOT_FOUND;
-			for (j = 0; j < cn->len; j++) {
-				if (key_to_ordinal(ft, iter_key[j]) != cn->key_bytes[j])
-					return CDS_FT_STATUS_NOT_FOUND;
-			}
+			j = ft_match_compressed_key(ft, iter_key, cn, cn->len);
+			if (j < cn->len)
+				return CDS_FT_STATUS_NOT_FOUND;
 			iter_key += cn->len;
 			i += cn->len;
 			node_flag = cn->child;
@@ -5538,16 +5575,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			unsigned int cmp = cn->len < remaining ?
 				cn->len : remaining;
 			unsigned int j;
-			bool match = true;
 
-			for (j = 0; j < cmp; j++) {
-				if (key_to_ordinal(ft, iter_key[j]) !=
-				    cn->key_bytes[j]) {
-					match = false;
-					break;
-				}
-			}
-			if (!match || cn->len > remaining ||
+			j = ft_match_compressed_key(ft, iter_key, cn, cmp);
+			if (j < cmp || cn->len > remaining ||
 			    !ft_node_ptr(cn->child))
 				return CDS_FT_STATUS_NOT_FOUND;
 			/*
@@ -5557,14 +5587,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_detach_descent_track(&dd, cn_meta);
 			snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
 			snapshot[nr_snapshot++] = dd.d.nf;
-			iter_key += cn->len;
-			dd.d.ppnf = dd.d.pnf;
-			dd.d.ppnfp = dd.d.pnfp;
-			dd.d.pnf = dd.d.nf;
-			dd.d.pnfp = dd.d.nfp;
-			dd.d.nf = cn->child;
-			dd.d.nfp = &cn->child;
-			dd.d.depth += cn->len;
+			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
 			continue;
 		}
 
@@ -5796,16 +5819,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			unsigned int cmp = cn->len < remaining ?
 				cn->len : remaining;
 			unsigned int j;
-			bool match = true;
 
-			for (j = 0; j < cmp; j++) {
-				if (key_to_ordinal(ft, iter_key[j]) !=
-				    cn->key_bytes[j]) {
-					match = false;
-					break;
-				}
-			}
-			if (!match || cn->len > remaining ||
+			j = ft_match_compressed_key(ft, iter_key, cn, cmp);
+			if (j < cmp || cn->len > remaining ||
 			    !ft_node_ptr(cn->child)) {
 				*result_node = NULL;
 				return CDS_FT_STATUS_NOT_FOUND;
@@ -5817,14 +5833,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			ft_detach_descent_track(&dd, cn_meta);
 			snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
 			snapshot[nr_snapshot++] = dd.d.nf;
-			iter_key += cn->len;
-			dd.d.ppnf = dd.d.pnf;
-			dd.d.ppnfp = dd.d.pnfp;
-			dd.d.pnf = dd.d.nf;
-			dd.d.pnfp = dd.d.nfp;
-			dd.d.nf = cn->child;
-			dd.d.nfp = &cn->child;
-			dd.d.depth += cn->len;
+			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
 			continue;
 		}
 
@@ -6132,27 +6141,15 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 				ft_compressed_node_ptr(d->nf);
 			int remaining = key_len - d->depth;
 			int cmp = cn->len < remaining ? cn->len : remaining;
-			int j, match = 1;
+			int j;
 
-			for (j = 0; j < cmp; j++) {
-				if (key_to_ordinal(ft, ik[j]) != cn->key_bytes[j]) {
-					match = 0;
-					break;
-				}
-			}
-			if (match && cn->len <= remaining) {
+			j = ft_match_compressed_key(ft, ik, cn, cmp);
+			if (j == cmp && cn->len <= remaining) {
 				snapshot[(*nr_snapshot)++] = d->nf;
-				ik += cn->len;
-				d->ppnf = d->pnf;
-				d->ppnfp = d->pnfp;
-				d->pnf = d->nf;
-				d->pnfp = d->nfp;
-				d->nf = cn->child;
-				d->nfp = &cn->child;
-				d->depth += cn->len;
+				ft_descent_traverse_compressed(d, cn, &ik);
 				continue;
 			}
-			if (!match) {
+			if (j < cmp) {
 				/*
 				 * Divergence: split compressed node
 				 * at the mismatch point.
@@ -6744,15 +6741,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 				snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
 				snapshot[nr_snapshot++] = dd.d.nf;
-
-				ik += cn->len;
-				dd.d.ppnf = dd.d.pnf;
-				dd.d.ppnfp = dd.d.pnfp;
-				dd.d.pnf = dd.d.nf;
-				dd.d.pnfp = dd.d.nfp;
-				dd.d.nf = cn->child;
-				dd.d.nfp = &cn->child;
-				dd.d.depth += cn->len;
+				ft_descent_traverse_compressed(&dd.d, cn, &ik);
 				continue;
 			}
 
@@ -6940,10 +6929,9 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 			unsigned int cmp = cn->len < remaining ? cn->len : remaining;
 			unsigned int j;
 
-			for (j = 0; j < cmp; j++) {
-				if (key_to_ordinal(ft, prefix[i + j]) != cn->key_bytes[j])
-					return 0;
-			}
+			j = ft_match_compressed_key(ft, &prefix[i], cn, cmp);
+			if (j < cmp)
+				return 0;
 			if (cn->len >= remaining) {
 				/*
 				 * Prefix consumed within compressed path.
@@ -7073,12 +7061,9 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		if (ft_node_compressed(node_flag)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(node_flag);
-			int j;
 
-			for (j = 0; j < cn->len; j++) {
-				ordinal_key[level - 1 + j] = cn->key_bytes[j];
-				iter_path_node(iter)[level + j] = node_flag;
-			}
+			ft_fill_compressed_path(cn, ordinal_key, level - 1,
+				iter_path_node(iter), level, node_flag);
 			level += cn->len - 1;
 			node_flag = ft_dereference_acquire(cn->child);
 			if (!ft_node_ptr(node_flag))
@@ -7195,14 +7180,10 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 					ft_child_key_count(cn->child);
 
 				if (remaining < child_keys) {
-					int j;
-
-					for (j = 0; j < cn->len; j++) {
-						ordinal_key[level - 1 + j] =
-							cn->key_bytes[j];
-						iter_path_node(iter)[level + j] =
-							node_flag;
-					}
+					ft_fill_compressed_path(cn,
+						ordinal_key, level - 1,
+						iter_path_node(iter), level,
+						node_flag);
 					level += cn->len - 1;
 					node_flag = ft_dereference_acquire(
 							cn->child);
