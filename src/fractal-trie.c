@@ -4642,6 +4642,11 @@ error:
  * this external node in the topmost internal node external node list in
  * that case.
  */
+static struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
+		const uint8_t *key, unsigned int start, unsigned int end,
+		struct cds_ft_inode_flag *leaf,
+		unsigned long subtree_external_count);
+
 static
 int ft_attach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attach_node_flag_ptr,
@@ -4944,50 +4949,20 @@ int _cds_ft_insert(struct cds_ft *ft,
 						&d, cn, &iter_key);
 					continue;
 				}
-				/*
-				 * Child is external.  NULL child cannot
-				 * happen: compressed nodes are always
-				 * created with a non-NULL leaf child.
-				 */
 				assert(ft_node_ptr(cn->child));
 				if (cn->len == remaining) {
-					/*
-					 * Key ends at the compressed child:
-					 * handle as end-of-key duplicate.
-					 * Traverse through to let the
-					 * post-loop external-node handling
-					 * chain or reject the duplicate.
-					 */
 					snapshot[nr_snapshot++] = d.nf;
 					ft_descent_traverse_compressed(
 						&d, cn, &iter_key);
 					break;
 				}
-				/*
-				 * Key continues past the compressed
-				 * child: wrap the external leaf in a
-				 * fresh internal node so ft_attach_node
-				 * has a parent to work with.  Move the
-				 * leaf to external_nodes of the new node.
-				 */
+				/* cn->len < remaining: decompress. */
 				{
-					struct cds_ft_inode *fresh;
-					struct cds_ft_metadata *fresh_meta;
-
-					fresh = alloc_cds_ft_node(ft,
-						&ft_types[0], &fresh_meta);
-					if (!fresh)
-						return -ENOMEM;
-					fresh_meta->external_nodes =
-						(struct cds_ft_node *)
-						ft_node_ptr(cn->child);
-					uatomic_store(&fresh_meta->nr_keys,
-						1, CMM_RELAXED);
-					rcu_assign_pointer(cn->child,
-						ft_node_flag(fresh, 0));
-					snapshot[nr_snapshot++] = d.nf;
-					ft_descent_traverse_compressed(
-						&d, cn, &iter_key);
+					int dret = ft_decompress_node(ft,
+							d.nfp, d.nf);
+					if (dret)
+						return dret;
+					d.nf = *d.nfp;
 					continue;
 				}
 			}
