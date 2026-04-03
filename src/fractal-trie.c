@@ -901,6 +901,16 @@ struct cds_ft_compressed_node *ft_compressed_node_ptr(
 }
 
 /*
+ * Return codes for compressed node traversal helpers.
+ * Used to tell callers which loop control action to take.
+ */
+enum ft_compressed_action {
+	FT_COMPRESSED_CONTINUE,	/* Continue loop iteration. */
+	FT_COMPRESSED_BREAK,	/* Break from loop. */
+	FT_COMPRESSED_END,	/* Jump to function end (status set). */
+};
+
+/*
  * Compare @cmp key bytes starting at @key against the compressed
  * node's path.  Returns the number of matching bytes.  A return
  * value == @cmp means full match; < @cmp means divergence at that
@@ -2958,6 +2968,138 @@ enum ft_prefix_tracking {
  */
 #define FT_MATCH_LEN_NONE	SIZE_MAX
 
+/*
+ * Handle a compressed node during exact lookup descent.
+ *
+ * Compares key bytes against the compressed path, tracks
+ * partial/longest match if requested, advances key/index/node_flag
+ * past the compressed path, and fills iter_path entries.
+ *
+ * Returns FT_COMPRESSED_CONTINUE to continue the loop,
+ * FT_COMPRESSED_BREAK to break, or FT_COMPRESSED_END to jump to
+ * the function's end label (with *status_ret and *found_ret set).
+ */
+static
+enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
+		struct cds_ft_inode_flag **node_flag_p,
+		const uint8_t **key_p, unsigned int *i_p,
+		unsigned int key_depth,
+		struct cds_ft_iter *iter, size_t *iter_path_len_p,
+		bool track, bool track_longest,
+		size_t *match_len_p, struct cds_ft_node **match_node_p,
+		struct cds_ft_node **found_ret,
+		enum cds_ft_status *status_ret)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	const uint8_t *key = *key_p;
+	unsigned int i = *i_p;
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
+	int remaining_key = key_depth - 1 - i;
+	int cmp_len = cn->len < remaining_key ? cn->len : remaining_key;
+	int j;
+
+	/* Check external_nodes at the compressed node's depth. */
+	if (track) {
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+		struct cds_ft_node *ext =
+			rcu_dereference(cn_meta->external_nodes);
+
+		if (ext || track_longest) {
+			*match_len_p = i;
+			*match_node_p = ext;
+		}
+	}
+
+	for (j = 0; j < cmp_len; j++) {
+		if (key_to_ordinal(ft, key[j]) != cn->key_bytes[j]) {
+			if (track && track_longest) {
+				*match_len_p = i + j;
+				*match_node_p = NULL;
+			}
+			*status_ret = CDS_FT_STATUS_NOT_FOUND;
+			return FT_COMPRESSED_END;
+		}
+		if (track && track_longest) {
+			*match_len_p = i + j + 1;
+			*match_node_p = NULL;
+		}
+	}
+	if (cn->len > remaining_key) {
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+
+		*found_ret = rcu_dereference(cn_meta->external_nodes);
+		*status_ret = *found_ret ? CDS_FT_STATUS_OK :
+				CDS_FT_STATUS_NOT_FOUND;
+		if (track && (*found_ret || track_longest)) {
+			*match_len_p = i;
+			*match_node_p = *found_ret;
+		}
+		return FT_COMPRESSED_END;
+	}
+
+	/* Advance past the compressed path. */
+	key += cn->len;
+	if (iter) {
+		int k;
+
+		for (k = 1; k <= cn->len; k++)
+			iter_path_node(iter)[i + k] =
+				(struct cds_ft_inode_flag *)
+				ft_compressed_node_flag(cn);
+	}
+	i += cn->len;
+	node_flag = ft_dereference_acquire(cn->child);
+	if (!ft_node_ptr(node_flag)) {
+		*status_ret = CDS_FT_STATUS_NOT_FOUND;
+		return FT_COMPRESSED_END;
+	}
+	if (iter) {
+		iter_path_node(iter)[i] = node_flag;
+		*iter_path_len_p = i + 1;
+	}
+
+	*node_flag_p = node_flag;
+	*key_p = key;
+	*i_p = i;
+
+	if (i >= key_depth)
+		return FT_COMPRESSED_BREAK;
+
+	/*
+	 * External child before end of key: record for partial
+	 * tracking, set NOT_FOUND, and tell the caller to end.
+	 */
+	if (i < key_depth - 1 && ft_node_external(node_flag)) {
+		if (track) {
+			*match_len_p = i;
+			*match_node_p = (struct cds_ft_node *) node_flag;
+		}
+		*status_ret = CDS_FT_STATUS_NOT_FOUND;
+		return FT_COMPRESSED_END;
+	}
+
+	/*
+	 * Track prefix match at the child node (the node after the
+	 * compressed path) so callers that skip the normal tracking
+	 * code via continue don't miss it.
+	 */
+	if (track && i < key_depth - 1 && !ft_node_external(node_flag)) {
+		struct cds_ft_metadata *metadata =
+			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		struct cds_ft_node *ext =
+			rcu_dereference(metadata->external_nodes);
+
+		if (ext || track_longest) {
+			*match_len_p = i;
+			*match_node_p = ext;
+		}
+	}
+
+	return FT_COMPRESSED_CONTINUE;
+}
+
 static
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
@@ -3032,15 +3174,26 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 		/*
 		 * Compressed node at current position (e.g. compressed
-		 * root from detach/graft_swap): handle before the
-		 * normal ft_node_get_nth dispatch which cannot handle
-		 * compressed nodes.  Decrement i because no key byte
-		 * was consumed at this level (unlike the normal path
-		 * where ft_node_get_nth consumes one).
+		 * root or compressed child from ft_node_get_nth).
 		 */
 		if (ft_node_compressed(node_flag)) {
+			enum ft_compressed_action act;
+
+			/*
+			 * Compressed root: decrement i (no key byte
+			 * consumed at this level).
+			 */
 			i--;
-			goto handle_compressed;
+			act = ft_lookup_compressed(ft, &node_flag, &key, &i,
+				key_depth, iter, &iter_path_len,
+				track, track_longest,
+				&match_len, &match_node, &found, &status);
+			if (act == FT_COMPRESSED_END)
+				goto end;
+			if (act == FT_COMPRESSED_BREAK)
+				break;
+			/* CONTINUE: loop back for the child node. */
+			continue;
 		}
 
 		iter_key = key_to_ordinal(ft, *(key++));
@@ -3055,113 +3208,18 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			iter_path_node(iter)[i] = node_flag;
 			iter_path_len = i + 1;
 		}
-		/*
-		 * Compressed child returned by ft_node_get_nth:
-		 * compare remaining key bytes with the compressed
-		 * path.  If they match, skip ahead to the child at
-		 * the end.  Track external_nodes at the compressed
-		 * node's entry depth for prefix matching.
-		 */
 		if (ft_node_compressed(node_flag)) {
-handle_compressed:
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(node_flag);
-			int remaining_key = key_depth - 1 - i;
-			int cmp_len = cn->len < remaining_key ? cn->len : remaining_key;
-			int j;
+			enum ft_compressed_action act;
 
-			/* Check external_nodes at the compressed node's depth. */
-			if (track) {
-				struct cds_ft_metadata *cn_meta =
-					cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) cn);
-				struct cds_ft_node *ext =
-					rcu_dereference(cn_meta->external_nodes);
-
-				if (ext || track_longest) {
-					match_len = i;
-					match_node = ext;
-				}
-			}
-
-			for (j = 0; j < cmp_len; j++) {
-				if (key_to_ordinal(ft, key[j]) != cn->key_bytes[j]) {
-					/*
-					 * Mismatch within compressed path.
-					 * For longest-match tracking, record
-					 * the position up to (but not including)
-					 * the mismatch byte.
-					 */
-					if (track && track_longest) {
-						match_len = i + j;
-						match_node = NULL;
-					}
-					status = CDS_FT_STATUS_NOT_FOUND;
-					goto end;
-				}
-				/*
-				 * For longest-match tracking, advance the
-				 * match position as we match each compressed
-				 * byte.
-				 */
-				if (track && track_longest) {
-					match_len = i + j + 1;
-					match_node = NULL;
-				}
-			}
-			if (cn->len > remaining_key) {
-				/*
-				 * Key ends within the compressed path.
-				 * Check external_nodes at the compressed
-				 * node's entry depth — they represent keys
-				 * that terminate here.
-				 */
-				struct cds_ft_metadata *cn_meta2 =
-					cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) cn);
-				found = rcu_dereference(cn_meta2->external_nodes);
-				status = found ? CDS_FT_STATUS_OK :
-						 CDS_FT_STATUS_NOT_FOUND;
-				if (track && (found || track_longest)) {
-					match_len = i;
-					match_node = found;
-				}
+			act = ft_lookup_compressed(ft, &node_flag, &key, &i,
+				key_depth, iter, &iter_path_len,
+				track, track_longest,
+				&match_len, &match_node, &found, &status);
+			if (act == FT_COMPRESSED_END)
 				goto end;
-			}
-			/*
-			 * Skip past the compressed path.
-			 * key advances by cn->len (compressed bytes consumed).
-			 * i advances by cn->len (to the child's depth).
-			 * The for loop's i++ will advance one more, so the
-			 * code after this block and the subsequent iteration
-			 * see the child at i and the next level at i+1.
-			 */
-			key += cn->len;
-			if (iter) {
-				/*
-				 * Fill intermediate path entries with the
-				 * compressed node flag so the going-up
-				 * backtracking can skip over them.
-				 */
-				int k;
-
-				for (k = 1; k <= cn->len; k++)
-					iter_path_node(iter)[i + k] = (struct cds_ft_inode_flag *)
-						ft_compressed_node_flag(cn);
-			}
-			i += cn->len;
-			node_flag = ft_dereference_acquire(cn->child);
-			if (!ft_node_ptr(node_flag)) {
-				status = CDS_FT_STATUS_NOT_FOUND;
-				goto end;
-			}
-			if (iter) {
-				iter_path_node(iter)[i] = node_flag;
-				iter_path_len = i + 1;
-			}
-			if (i >= key_depth)
+			if (act == FT_COMPRESSED_BREAK)
 				break;
-			/* Fall through to handle the child node below. */
+			/* CONTINUE: fall through to child handling. */
 		}
 		/* Found external node before end of key. */
 		if (i < key_depth - 1 && ft_node_external(node_flag)) {
