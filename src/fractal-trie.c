@@ -2657,6 +2657,7 @@ retry:		/* for fallback */
 		dbg_printf("Recompact inherit from %p\n", metadata);
 		if (metadata) {
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
+			new_metadata->external_nodes = metadata->external_nodes;
 			uatomic_store(&new_metadata->nr_keys,
 				metadata->nr_keys, CMM_RELAXED);
 		}
