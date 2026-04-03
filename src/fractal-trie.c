@@ -4126,6 +4126,227 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 }
 
 /*
+ * Split a compressed node during insert when the new key diverges
+ * from the compressed path at position @diverge_pos.
+ *
+ * Builds the following structure bottom-up:
+ *
+ *   [prefix compressed/internal] → [branch internal]
+ *                                    ├─ old_ordinal → [suffix compressed/internal] → old_child
+ *                                    └─ new_ordinal → [new branch compressed/internal] → new_leaf
+ *
+ * If diverge_pos == 0, no prefix is needed.  If the suffix or new
+ * branch is 0 bytes, the child is placed directly.  If 1 byte, a
+ * single-child internal node is used.  If >= 2 bytes, a compressed
+ * node is created.
+ *
+ * The old compressed node's external_nodes (if any) are preserved
+ * at the prefix level (or the branch if no prefix).
+ *
+ * Publishes the result at @parent_slot via rcu_assign_pointer and
+ * frees the old compressed node.  Returns 0 on success, -ENOMEM
+ * on allocation failure (compressed node left in place).
+ */
+static
+int ft_split_compressed_insert(struct cds_ft *ft,
+		struct cds_ft_inode_flag **parent_slot,
+		struct cds_ft_inode_flag *compressed_flag,
+		const uint8_t *iter_key,	/* key bytes at compressed node's depth */
+		unsigned int remaining_key,	/* key bytes remaining from compressed depth */
+		unsigned int diverge_pos,	/* position within compressed path */
+		struct cds_ft_node *child_node)	/* new external node to insert */
+{
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
+	struct cds_ft_metadata *cn_meta =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	struct cds_ft_inode_flag *old_suffix_flag, *new_branch_flag;
+	struct cds_ft_inode_flag *branch_flag, *top_flag;
+	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
+	int nr_created = 0;
+	unsigned int suffix_len = cn->len - diverge_pos - 1;
+	unsigned int new_len = remaining_key - diverge_pos - 1;
+	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
+	uint8_t new_ordinal = key_to_ordinal(ft, iter_key[diverge_pos]);
+	unsigned long old_child_nr_keys;
+	int ret;
+
+	/* Compute old child's nr_keys for the new nodes. */
+	if (ft_node_internal(cn->child) || ft_node_compressed(cn->child)) {
+		struct cds_ft_metadata *cm =
+			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
+		old_child_nr_keys = cm->nr_keys;
+	} else if (ft_node_ptr(cn->child)) {
+		old_child_nr_keys = 1;	/* external leaf */
+	} else {
+		old_child_nr_keys = 0;
+	}
+
+	/* 1. Build old suffix → old child. */
+	if (suffix_len >= 2) {
+		struct cds_ft_compressed_node *sfx;
+		struct cds_ft_metadata *sfx_meta;
+
+		sfx = alloc_compressed_node(ft, suffix_len, &sfx_meta);
+		if (!sfx) goto error;
+		sfx->child = cn->child;
+		sfx->len = suffix_len;
+		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1], suffix_len);
+		sfx_meta->nr_child = 1;
+		uatomic_store(&sfx_meta->nr_keys, old_child_nr_keys, CMM_RELAXED);
+		old_suffix_flag = ft_compressed_node_flag(sfx);
+		created[nr_created++] = old_suffix_flag;
+	} else if (suffix_len == 1) {
+		struct cds_ft_inode_flag *dest = NULL;
+
+		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[diverge_pos + 1],
+				cn->child, NULL, NULL);
+		if (ret) goto error;
+		{
+			struct cds_ft_metadata *m =
+				cds_ft_item_to_metadata(ft_node_ptr(dest));
+			uatomic_store(&m->nr_keys, old_child_nr_keys, CMM_RELAXED);
+		}
+		old_suffix_flag = dest;
+		created[nr_created++] = dest;
+	} else {
+		/* suffix_len == 0: old child directly. */
+		old_suffix_flag = cn->child;
+	}
+
+	/* 2. Build new branch → new leaf. */
+	if (new_len >= 2) {
+		struct cds_ft_compressed_node *nb;
+		struct cds_ft_metadata *nb_meta;
+
+		nb = alloc_compressed_node(ft, new_len, &nb_meta);
+		if (!nb) goto error;
+		nb->child = (struct cds_ft_inode_flag *) child_node;
+		nb->len = new_len;
+		{
+			unsigned int k;
+
+			for (k = 0; k < new_len; k++)
+				nb->key_bytes[k] = key_to_ordinal(ft, iter_key[diverge_pos + 1 + k]);
+		}
+		nb_meta->nr_child = 1;
+		uatomic_store(&nb_meta->nr_keys, 1, CMM_RELAXED);
+		new_branch_flag = ft_compressed_node_flag(nb);
+		created[nr_created++] = new_branch_flag;
+	} else if (new_len == 1) {
+		struct cds_ft_inode_flag *dest = NULL;
+
+		ret = ft_node_set_nth(ft, &dest,
+				key_to_ordinal(ft, iter_key[diverge_pos + 1]),
+				(struct cds_ft_inode_flag *) child_node, NULL, NULL);
+		if (ret) goto error;
+		{
+			struct cds_ft_metadata *m =
+				cds_ft_item_to_metadata(ft_node_ptr(dest));
+			uatomic_store(&m->nr_keys, 1, CMM_RELAXED);
+		}
+		new_branch_flag = dest;
+		created[nr_created++] = dest;
+	} else {
+		/* new_len == 0: child_node directly. */
+		new_branch_flag = (struct cds_ft_inode_flag *) child_node;
+	}
+
+	/* 3. Build branch node with both children. */
+	{
+		struct cds_ft_inode_flag *dest = NULL;
+		struct cds_ft_metadata *branch_meta;
+
+		/* First child: old direction. */
+		ret = ft_node_set_nth(ft, &dest, old_ordinal, old_suffix_flag, NULL, NULL);
+		if (ret) goto error;
+		created[nr_created++] = dest;
+		branch_flag = dest;
+
+		/* Second child: new direction. */
+		{
+			struct cds_ft_inode *old_recompacted = NULL;
+
+			branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+			ret = ft_node_set_nth(ft, &dest, new_ordinal, new_branch_flag,
+					&old_recompacted, branch_meta);
+			if (ret) goto error;
+			if (old_recompacted) {
+				free_cds_ft_node(ft, old_recompacted);
+				/* Update created entry to the recompacted node. */
+				created[nr_created - 1] = dest;
+			}
+		}
+
+		branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+		uatomic_store(&branch_meta->nr_keys, old_child_nr_keys + 1,
+				CMM_RELAXED);
+		branch_flag = dest;
+	}
+
+	/* 4. Build prefix → branch (if needed). */
+	if (diverge_pos >= 2) {
+		struct cds_ft_compressed_node *pfx;
+		struct cds_ft_metadata *pfx_meta;
+
+		pfx = alloc_compressed_node(ft, diverge_pos, &pfx_meta);
+		if (!pfx) goto error;
+		pfx->child = branch_flag;
+		pfx->len = diverge_pos;
+		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
+		pfx_meta->nr_child = 1;
+		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys + 1, CMM_RELAXED);
+		if (cn_meta->external_nodes)
+			pfx_meta->external_nodes = cn_meta->external_nodes;
+		top_flag = ft_compressed_node_flag(pfx);
+		created[nr_created++] = top_flag;
+	} else if (diverge_pos == 1) {
+		struct cds_ft_inode_flag *dest = NULL;
+		struct cds_ft_metadata *pfx_meta;
+
+		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
+				branch_flag, NULL, NULL);
+		if (ret) goto error;
+		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys + 1, CMM_RELAXED);
+		if (cn_meta->external_nodes)
+			pfx_meta->external_nodes = cn_meta->external_nodes;
+		top_flag = dest;
+		created[nr_created++] = dest;
+	} else {
+		/* diverge_pos == 0: branch IS the top. */
+		struct cds_ft_metadata *branch_meta =
+			cds_ft_item_to_metadata(ft_node_ptr(branch_flag));
+		uatomic_store(&branch_meta->nr_keys, cn_meta->nr_keys + 1,
+				CMM_RELAXED);
+		if (cn_meta->external_nodes)
+			branch_meta->external_nodes = cn_meta->external_nodes;
+		top_flag = branch_flag;
+	}
+
+	/* 5. Publish the split structure, replacing the compressed node. */
+	rcu_assign_pointer(*parent_slot, top_flag);
+
+	/* 6. Free the old compressed node. */
+	free_compressed_node(ft, cn);
+
+	return 0;
+
+error:
+	{
+		int i;
+
+		for (i = 0; i < nr_created; i++) {
+			if (ft_node_compressed(created[i]))
+				free_compressed_node(ft,
+					ft_compressed_node_ptr(created[i]));
+			else
+				free_cds_ft_node(ft, ft_node_ptr(created[i]));
+		}
+	}
+	return -ENOMEM;
+}
+
+/*
  * Decompress a compressed node back into a chain of single-child
  * internal nodes.  Called when a mutation (insert, remove) encounters
  * a compressed node during descent.
@@ -4505,12 +4726,10 @@ int _cds_ft_insert(struct cds_ft *ft,
 			}
 			if (match && cn->len <= remaining) {
 				/*
-				 * Full match AND the child is internal:
-				 * traverse through.  If the child is NULL
-				 * or external, we need to attach below
-				 * the compressed node, which requires
-				 * decompressing it (ft_attach_node expects
-				 * an internal parent).
+				 * Full match: traverse through if the
+				 * child is internal.  If the child is
+				 * NULL/external, decompress (ft_attach_node
+				 * expects an internal parent).
 				 */
 				if (ft_node_ptr(cn->child) &&
 				    ft_node_internal(cn->child)) {
@@ -4525,11 +4744,47 @@ int _cds_ft_insert(struct cds_ft *ft,
 					d.depth += cn->len;
 					continue;
 				}
-				/* Child is NULL/external: fall through to decompress. */
+				/* Child is NULL/external: decompress. */
+				{
+					int dret = ft_decompress_node(ft,
+							d.nfp, d.nf);
+					if (dret)
+						return dret;
+					d.nf = *d.nfp;
+					continue;
+				}
 			}
-			/* Divergence, key shorter, or non-internal child: decompress. */
+			/*
+			 * Key diverges within compressed path: split
+			 * the compressed node directly instead of
+			 * decompressing the entire path.
+			 */
+			if (!match) {
+				int dret = ft_split_compressed_insert(ft,
+					d.nfp, d.nf, iter_key, remaining,
+					j, node);
+				if (dret)
+					return dret;
+				/*
+				 * Split succeeded.  The split function
+				 * already set nr_keys on the new top node.
+				 * Propagate +1 to ancestors only (NOT the
+				 * split top itself).
+				 */
+				ft_propagate_external_count(snapshot,
+						nr_snapshot, 1);
+				ret = 0;
+				goto insert_done;
+			}
+			/*
+			 * Key shorter than compressed path: the key
+			 * terminates within the path.  Decompress and
+			 * let the normal end-of-key handling deal with
+			 * it.
+			 */
 			{
-				int dret = ft_decompress_node(ft, d.nfp, d.nf);
+				int dret = ft_decompress_node(ft,
+						d.nfp, d.nf);
 				if (dret)
 					return dret;
 				d.nf = *d.nfp;
@@ -4638,6 +4893,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 		}
 	}
 
+insert_done:
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
@@ -6455,6 +6711,29 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 			remaining--;
 		}
 
+		/*
+		 * Compressed node: single-child path, traverse
+		 * directly to the child.
+		 */
+		if (ft_node_compressed(node_flag)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(node_flag);
+			int j;
+
+			for (j = 0; j < cn->len; j++) {
+				ordinal_key[level - 1 + j] = cn->key_bytes[j];
+				iter_path_node(iter)[level + j] = node_flag;
+			}
+			level += cn->len - 1;
+			node_flag = ft_dereference_acquire(cn->child);
+			if (!ft_node_ptr(node_flag))
+				break;
+			iter_path_node(iter)[level] = node_flag;
+			if (ft_node_external(node_flag))
+				break;
+			continue;
+		}
+
 		/* Iterate children in ascending ordinal order. */
 		pivot = -1;
 		child = ft_node_get_direction(node_flag, pivot, &child_key, FT_RIGHT);
@@ -6547,6 +6826,43 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 
+		/*
+		 * Compressed node: single-child path.  In reverse,
+		 * process child first (larger keys), then
+		 * external_nodes (smallest = last).
+		 */
+		if (ft_node_compressed(node_flag)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(node_flag);
+
+			if (ft_node_ptr(cn->child)) {
+				unsigned long child_keys =
+					ft_child_key_count(cn->child);
+
+				if (remaining < child_keys) {
+					int j;
+
+					for (j = 0; j < cn->len; j++) {
+						ordinal_key[level - 1 + j] =
+							cn->key_bytes[j];
+						iter_path_node(iter)[level + j] =
+							node_flag;
+					}
+					level += cn->len - 1;
+					node_flag = ft_dereference_acquire(
+							cn->child);
+					if (!ft_node_ptr(node_flag))
+						break;
+					iter_path_node(iter)[level] = node_flag;
+					if (ft_node_external(node_flag))
+						break;
+					continue;
+				}
+				remaining -= child_keys;
+			}
+			goto check_ext_nth_last;
+		}
+
 		/* Iterate children in descending ordinal order first. */
 		pivot = FT_ENTRY_PER_NODE;
 		child = ft_node_get_direction(node_flag, pivot, &child_key, FT_LEFT);
@@ -6567,6 +6883,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 			child = ft_node_get_direction(node_flag, pivot, &child_key, FT_LEFT);
 		}
 
+check_ext_nth_last:
 		/* External_nodes at this depth are the smallest (last in reverse). */
 		ext = ft_dereference_acquire(metadata->external_nodes);
 		if (ext) {
@@ -6715,14 +7032,17 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	remaining = n;
 
 	/*
-	 * Determine whether the current key sits at an internal node's
-	 * external_nodes (variable-length prefix key) or at a leaf child.
+	 * Determine whether the current key sits at an internal or
+	 * compressed node's external_nodes (variable-length prefix key)
+	 * or at a leaf child.
 	 */
-	at_external_nodes = ft_node_internal(iter_path_node(iter)[depth]);
+	at_external_nodes = ft_node_internal(iter_path_node(iter)[depth]) ||
+			ft_node_compressed(iter_path_node(iter)[depth]);
 
 	/*
-	 * If at external_nodes of an internal node, all children of that
-	 * node are to the right.  Try to satisfy the skip within them.
+	 * If at external_nodes of an internal/compressed node, all
+	 * children of that node are to the right.  Try to satisfy the
+	 * skip within them.
 	 */
 	if (at_external_nodes) {
 		struct cds_ft_inode_flag *parent = iter_path_node(iter)[depth];
@@ -6736,26 +7056,52 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 			 * descent within this subtree, skipping the
 			 * external_nodes (already behind us).
 			 */
-			struct cds_ft_inode_flag *child;
-			uint8_t child_key;
-			int pivot = -1;
-
 			remaining--;  /* skip external_nodes key (us) */
-			child = ft_node_get_direction(parent, pivot,
-					&child_key, FT_RIGHT);
-			while (ft_node_ptr(child)) {
-				unsigned long ck = ft_child_key_count(child);
 
+			if (ft_node_compressed(parent)) {
+				struct cds_ft_compressed_node *cn =
+					ft_compressed_node_ptr(parent);
+				unsigned long ck;
+				int j;
+
+				if (!ft_node_ptr(cn->child))
+					goto skip_fwd_walk_up;
+				ck = ft_child_key_count(cn->child);
 				if (remaining < ck) {
-					ordinal_key[depth] = child_key;
-					iter_path_node(iter)[depth + 1] = child;
-					level = depth + 1;
+					for (j = 0; j < cn->len; j++) {
+						ordinal_key[depth + j] =
+							cn->key_bytes[j];
+						if (j > 0)
+							iter_path_node(iter)[depth + j]
+								= parent;
+					}
+					level = depth + cn->len;
+					iter_path_node(iter)[level] =
+						cn->child;
 					goto descend_forward;
 				}
 				remaining -= ck;
-				pivot = child_key;
+			} else {
+				struct cds_ft_inode_flag *child;
+				uint8_t child_key;
+				int pivot = -1;
+
 				child = ft_node_get_direction(parent, pivot,
 						&child_key, FT_RIGHT);
+				while (ft_node_ptr(child)) {
+					unsigned long ck = ft_child_key_count(child);
+
+					if (remaining < ck) {
+						ordinal_key[depth] = child_key;
+						iter_path_node(iter)[depth + 1] = child;
+						level = depth + 1;
+						goto descend_forward;
+					}
+					remaining -= ck;
+					pivot = child_key;
+					child = ft_node_get_direction(parent, pivot,
+							&child_key, FT_RIGHT);
+				}
 			}
 		}
 		remaining -= right_keys;
@@ -6766,6 +7112,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 		level = depth;
 	}
 
+skip_fwd_walk_up:
 	/*
 	 * Walk up: at each ancestor, count keys in rightward siblings
 	 * of the child we came from.
@@ -6777,6 +7124,11 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 		int pivot;
 
 		if (ft_node_external(ancestor))
+			continue;
+		/*
+		 * Compressed path levels have no siblings: skip.
+		 */
+		if (ft_node_compressed(ancestor))
 			continue;
 
 		pivot = ordinal_key[level];
@@ -6860,6 +7212,32 @@ descend_forward:
 				remaining--;
 			}
 			} /* ext scope */
+
+			/*
+			 * Compressed node: traverse directly to child.
+			 */
+			if (ft_node_compressed(node_flag)) {
+				struct cds_ft_compressed_node *cn =
+					ft_compressed_node_ptr(node_flag);
+				int j;
+
+				for (j = 0; j < cn->len; j++) {
+					ordinal_key[level + j] =
+						cn->key_bytes[j];
+					if (j > 0)
+						iter_path_node(iter)[level + j]
+							= node_flag;
+				}
+				level += cn->len;
+				node_flag = ft_dereference_acquire(
+						cn->child);
+				if (!ft_node_ptr(node_flag))
+					break;
+				iter_path_node(iter)[level] = node_flag;
+				if (ft_node_external(node_flag))
+					break;
+				continue;
+			}
 
 			pivot = -1;
 			child = ft_node_get_direction(node_flag, pivot,
@@ -6947,10 +7325,11 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	remaining = n;
 
 	/*
-	 * Determine whether the current key sits at an internal node's
-	 * external_nodes or at a leaf child.
+	 * Determine whether the current key sits at an internal or
+	 * compressed node's external_nodes or at a leaf child.
 	 */
-	at_external_nodes = ft_node_internal(iter_path_node(iter)[depth]);
+	at_external_nodes = ft_node_internal(iter_path_node(iter)[depth]) ||
+			ft_node_compressed(iter_path_node(iter)[depth]);
 	(void) at_external_nodes;
 
 	/*
@@ -6975,6 +7354,44 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 
 		if (ft_node_external(ancestor))
 			continue;
+		/*
+		 * Skip intermediate compressed path levels (same
+		 * compressed node at adjacent levels).  At the entry
+		 * level, only external_nodes matter (no siblings).
+		 */
+		if (ft_node_compressed(ancestor)) {
+			if (level > 0 &&
+			    iter_path_node(iter)[level - 1] == ancestor)
+				continue;
+			ameta = cds_ft_item_to_metadata(
+					ft_node_ptr(ancestor));
+			{
+				struct cds_ft_node *a_ext =
+					ft_dereference_acquire(
+						ameta->external_nodes);
+
+				if (a_ext) {
+					if (remaining == 1) {
+						int j;
+
+						iter->key_len = level;
+						for (j = 0; j < level; j++)
+							iter_key(iter)[j] =
+								ordinal_to_key(ft,
+									ordinal_key[j]);
+						iter->node = a_ext;
+						iter->path_valid = true;
+						iter_debug_path_update(iter);
+						iter->path_len = level + 1;
+						iter->status =
+							CDS_FT_STATUS_OK;
+						goto end;
+					}
+					remaining--;
+				}
+			}
+			continue;
+		}
 
 		ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
 
@@ -7082,6 +7499,44 @@ descend_reverse:
 			metadata = cds_ft_item_to_metadata(
 					ft_node_ptr(node_flag));
 
+			/*
+			 * Compressed node: single child first (largest
+			 * keys in reverse), then external_nodes last.
+			 */
+			if (ft_node_compressed(node_flag)) {
+				struct cds_ft_compressed_node *cn =
+					ft_compressed_node_ptr(node_flag);
+
+				if (ft_node_ptr(cn->child)) {
+					unsigned long ck =
+						ft_child_key_count(cn->child);
+
+					if (remaining < ck) {
+						int j;
+
+						for (j = 0; j < cn->len; j++) {
+							ordinal_key[level + j] =
+								cn->key_bytes[j];
+							if (j > 0)
+								iter_path_node(iter)[level + j]
+									= node_flag;
+						}
+						level += cn->len;
+						node_flag = ft_dereference_acquire(
+								cn->child);
+						if (!ft_node_ptr(node_flag))
+							break;
+						iter_path_node(iter)[level] =
+							node_flag;
+						if (ft_node_external(node_flag))
+							break;
+						continue;
+					}
+					remaining -= ck;
+				}
+				goto check_ext_descend_reverse;
+			}
+
 			pivot = FT_ENTRY_PER_NODE;
 			child = ft_node_get_direction(node_flag, pivot,
 					&child_key, FT_LEFT);
@@ -7101,6 +7556,7 @@ descend_reverse:
 						&child_key, FT_LEFT);
 			}
 
+check_ext_descend_reverse:
 			{
 				struct cds_ft_node *ext =
 					ft_dereference_acquire(
