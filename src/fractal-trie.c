@@ -4558,75 +4558,6 @@ error:
 }
 
 /*
- * Decompress a compressed node back into a chain of single-child
- * internal nodes.  Called when a mutation (insert, remove) encounters
- * a compressed node during descent.
- *
- * Builds the chain bottom-up from the compressed node's child,
- * preserves external_nodes and nr_keys from the compressed node's
- * metadata, and atomically publishes the chain at @parent_slot via
- * rcu_assign_pointer.  The old compressed node is freed immediately
- * (arena memory remains valid for concurrent readers).
- *
- * On success, *@parent_slot points to the chain's topmost internal
- * node and the function returns 0.  On allocation failure, the
- * compressed node is left in place and -ENOMEM is returned.
- */
-static
-int ft_decompress_node(struct cds_ft *ft,
-		struct cds_ft_inode_flag **parent_slot,
-		struct cds_ft_inode_flag *compressed_flag)
-{
-	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
-	struct cds_ft_metadata *cn_meta =
-		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
-	struct cds_ft_inode_flag *iter_node_flag;
-	struct cds_ft_inode_flag *iter_dest_node_flag;
-	struct cds_ft_inode_flag *created_nodes[FT_MAX_DEPTH];
-	int nr_created = 0, i, ret;
-
-	/* Build chain bottom-up from the compressed node's child. */
-	iter_node_flag = cn->child;
-
-	for (i = cn->len - 1; i >= 0; i--) {
-		iter_dest_node_flag = NULL;
-		ret = ft_node_set_nth(ft, &iter_dest_node_flag,
-				cn->key_bytes[i], iter_node_flag, NULL, NULL);
-		if (ret)
-			goto error;
-
-		{
-			struct cds_ft_metadata *m =
-				cds_ft_item_to_metadata(ft_node_ptr(iter_dest_node_flag));
-			uatomic_store(&m->nr_keys, cn_meta->nr_keys, CMM_RELAXED);
-		}
-
-		created_nodes[nr_created++] = iter_dest_node_flag;
-		iter_node_flag = iter_dest_node_flag;
-	}
-
-	/* Preserve external_nodes in the topmost chain node. */
-	if (cn_meta->external_nodes) {
-		struct cds_ft_metadata *top_meta =
-			cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
-		top_meta->external_nodes = cn_meta->external_nodes;
-	}
-
-	/* Publish the chain, replacing the compressed node. */
-	rcu_assign_pointer(*parent_slot, iter_node_flag);
-
-	/* Free the old compressed node after publication. */
-	free_compressed_node(ft, cn);
-
-	return 0;
-
-error:
-	for (i = 0; i < nr_created; i++)
-		free_cds_ft_node(ft, ft_node_ptr(created_nodes[i]));
-	return -ENOMEM;
-}
-
-/*
  * We reached an unpopulated node. Create it and the children we need,
  * and then attach the entire branch to the current node. This may
  * trigger recompaction of the current node.
@@ -4688,8 +4619,7 @@ int ft_attach_node(struct cds_ft *ft,
 		/*
 		 * Compressed path: replace chain of single-child nodes
 		 * with a single compressed node storing the key bytes
-		 * inline.  Mutations that later encounter this compressed
-		 * node will decompress it via ft_decompress_node().
+		 * inline.
 		 */
 		uint8_t path_len = (uint8_t)(key_len - level);
 		struct cds_ft_compressed_node *cn;
@@ -5433,20 +5363,246 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			int j;
 
 			j = ft_match_compressed_key(ft, iter_key, cn, cmp);
-			if (j == cmp && cn->len <= remaining &&
-			    ft_node_ptr(cn->child) &&
-			    ft_node_internal(cn->child)) {
+			if (j == cmp && cn->len <= remaining) {
+				/*
+				 * Full match: traverse through if child
+				 * is internal or compressed.
+				 */
+				if (ft_node_ptr(cn->child) &&
+				    (ft_node_internal(cn->child) ||
+				     ft_node_compressed(cn->child))) {
+					snapshot[nr_snapshot++] = d.nf;
+					ft_descent_traverse_compressed(
+						&d, cn, &iter_key);
+					continue;
+				}
+				/*
+				 * Child is external (or NULL).  Traverse
+				 * through and break: the post-loop code
+				 * handles end-of-key (cn->len == remaining)
+				 * and before-end-of-key (cn->len < remaining).
+				 */
+				assert(ft_node_ptr(cn->child));
 				snapshot[nr_snapshot++] = d.nf;
 				ft_descent_traverse_compressed(
 					&d, cn, &iter_key);
-				continue;
+				if (cn->len < remaining) {
+					/*
+					 * Key continues past external child.
+					 * Build remaining path inline.
+					 */
+					struct cds_ft_inode_flag *branch;
+					struct cds_ft_metadata *br_meta;
+
+					branch = ft_build_branch(ft, key,
+						d.depth, key_len,
+						(struct cds_ft_inode_flag *) node,
+						1);
+					if (!branch)
+						return -ENOMEM;
+					br_meta = cds_ft_item_to_metadata(
+						ft_node_ptr(branch));
+					br_meta->external_nodes =
+						(struct cds_ft_node *)
+						cn->child;
+					uatomic_store(&br_meta->nr_keys,
+						br_meta->nr_keys + 1,
+						CMM_RELAXED);
+					rcu_assign_pointer(cn->child,
+						branch);
+					snapshot[nr_snapshot++] = branch;
+					ft_propagate_external_count(
+						snapshot, nr_snapshot, 1);
+					ret = 0;
+					goto insert_replace_done;
+				}
+				break;
 			}
-			{
-				int dret = ft_decompress_node(ft, d.nfp, d.nf);
+			/*
+			 * Key diverges within compressed path:
+			 * split the compressed node.
+			 */
+			if (j < cmp) {
+				int dret = ft_split_compressed_insert(ft,
+					d.nfp, d.nf, iter_key, remaining,
+					j, node);
 				if (dret)
 					return dret;
-				d.nf = *d.nfp;
-				continue;
+				ft_propagate_external_count(snapshot,
+						nr_snapshot, 1);
+				ret = 0;
+				goto insert_replace_done;
+			}
+			/*
+			 * Key shorter than compressed path:
+			 * split into prefix → junction → suffix.
+			 */
+			{
+				struct cds_ft_compressed_node *cn2 =
+					ft_compressed_node_ptr(d.nf);
+				struct cds_ft_metadata *cn_meta =
+					cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) cn2);
+				unsigned int suffix_len = cn->len - remaining - 1;
+				struct cds_ft_inode_flag *suffix_flag;
+				struct cds_ft_inode_flag *jct_flag;
+				struct cds_ft_inode_flag *top_flag;
+				struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
+				int nr_created = 0;
+				unsigned long child_nr_keys;
+
+				if (!ft_node_external(cn->child)) {
+					struct cds_ft_metadata *cm =
+						cds_ft_item_to_metadata(
+							ft_node_ptr(cn->child));
+					child_nr_keys = cm->nr_keys;
+				} else if (ft_node_ptr(cn->child)) {
+					child_nr_keys = 1;
+				} else {
+					child_nr_keys = 0;
+				}
+
+				/* Build suffix → old child. */
+				if (suffix_len >= 2) {
+					struct cds_ft_compressed_node *sfx;
+					struct cds_ft_metadata *sfx_meta;
+
+					sfx = alloc_compressed_node(ft,
+						suffix_len, &sfx_meta);
+					if (!sfx)
+						return -ENOMEM;
+					sfx->child = cn->child;
+					sfx->len = suffix_len;
+					memcpy(sfx->key_bytes,
+						&cn->key_bytes[remaining + 1],
+						suffix_len);
+					sfx_meta->nr_child = 1;
+					uatomic_store(&sfx_meta->nr_keys,
+						child_nr_keys, CMM_RELAXED);
+					suffix_flag = ft_compressed_node_flag(sfx);
+					created[nr_created++] = suffix_flag;
+				} else if (suffix_len == 1) {
+					struct cds_ft_inode_flag *dest = NULL;
+
+					if (ft_node_set_nth(ft, &dest,
+						    cn->key_bytes[remaining + 1],
+						    cn->child, NULL, NULL))
+						goto key_shorter_replace_error;
+					{
+						struct cds_ft_metadata *m =
+							cds_ft_item_to_metadata(
+								ft_node_ptr(dest));
+						uatomic_store(&m->nr_keys,
+							child_nr_keys,
+							CMM_RELAXED);
+					}
+					suffix_flag = dest;
+					created[nr_created++] = dest;
+				} else {
+					suffix_flag = cn->child;
+				}
+
+				/* Junction: internal node with suffix child. */
+				{
+					struct cds_ft_inode_flag *dest = NULL;
+					struct cds_ft_metadata *jct_meta;
+
+					if (ft_node_set_nth(ft, &dest,
+						    cn->key_bytes[remaining],
+						    suffix_flag, NULL, NULL))
+						goto key_shorter_replace_error;
+					jct_meta = cds_ft_item_to_metadata(
+							ft_node_ptr(dest));
+					uatomic_store(&jct_meta->nr_keys,
+						child_nr_keys, CMM_RELAXED);
+					jct_flag = dest;
+					created[nr_created++] = dest;
+				}
+
+				/* Prefix → junction. */
+				if (remaining >= 2) {
+					struct cds_ft_compressed_node *pfx;
+					struct cds_ft_metadata *pfx_meta;
+
+					pfx = alloc_compressed_node(ft,
+						remaining, &pfx_meta);
+					if (!pfx)
+						goto key_shorter_replace_error;
+					pfx->child = jct_flag;
+					pfx->len = remaining;
+					memcpy(pfx->key_bytes,
+						cn->key_bytes, remaining);
+					pfx_meta->nr_child = 1;
+					uatomic_store(&pfx_meta->nr_keys,
+						cn_meta->nr_keys,
+						CMM_RELAXED);
+					if (cn_meta->external_nodes)
+						pfx_meta->external_nodes =
+							cn_meta->external_nodes;
+					top_flag = ft_compressed_node_flag(pfx);
+					created[nr_created++] = top_flag;
+				} else {
+					struct cds_ft_inode_flag *dest = NULL;
+					struct cds_ft_metadata *pfx_meta;
+
+					if (ft_node_set_nth(ft, &dest,
+						    cn->key_bytes[0],
+						    jct_flag, NULL, NULL))
+						goto key_shorter_replace_error;
+					pfx_meta = cds_ft_item_to_metadata(
+							ft_node_ptr(dest));
+					uatomic_store(&pfx_meta->nr_keys,
+						cn_meta->nr_keys,
+						CMM_RELAXED);
+					if (cn_meta->external_nodes)
+						pfx_meta->external_nodes =
+							cn_meta->external_nodes;
+					top_flag = dest;
+					created[nr_created++] = dest;
+				}
+
+				/* Publish and store new key at junction. */
+				rcu_assign_pointer(*d.nfp, top_flag);
+				{
+					struct cds_ft_metadata *jct_meta =
+						cds_ft_item_to_metadata(
+							ft_node_ptr(jct_flag));
+					node->next = NULL;
+					rcu_assign_pointer(
+						jct_meta->external_nodes,
+						node);
+				}
+				if (top_flag != jct_flag)
+					snapshot[nr_snapshot++] = top_flag;
+				snapshot[nr_snapshot++] = jct_flag;
+				ft_propagate_external_count(snapshot,
+						nr_snapshot, 1);
+				{
+					struct cds_ft_metadata *jct_meta =
+						cds_ft_item_to_metadata(
+							ft_node_ptr(jct_flag));
+					uatomic_store(&jct_meta->nr_keys,
+						child_nr_keys + 1,
+						CMM_RELAXED);
+				}
+				free_compressed_node(ft, cn2);
+				ret = 0;
+				goto insert_replace_done;
+
+			key_shorter_replace_error:
+				{
+					int k;
+
+					for (k = 0; k < nr_created; k++) {
+						if (ft_node_compressed(created[k]))
+							free_compressed_node(ft,
+								ft_compressed_node_ptr(created[k]));
+						else
+							free_cds_ft_node(ft,
+								ft_node_ptr(created[k]));
+					}
+				}
+				return -ENOMEM;
 			}
 		}
 		dbg_printf("_cds_ft_insert_replace iter ppnf %p pnf %p nfp %p nf %p\n",
@@ -5518,6 +5674,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		}
 	}
 
+insert_replace_done:
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
