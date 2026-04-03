@@ -5871,6 +5871,195 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 }
 
 /*
+ * Split a compressed node during graft when the key diverges at
+ * position @diverge_pos within the compressed path.
+ *
+ * Builds: [prefix] -> [branch] -> old_suffix -> old_child
+ *
+ * Unlike ft_split_compressed_insert, this does NOT create the graft
+ * side.  Instead, it sets up the descent state so that
+ * ft_store_at_graft_point can attach the graft payload to the
+ * branch's empty slot for the key ordinal at the divergence point.
+ *
+ * On success, updates @d to point to the empty slot in the branch
+ * node, adds new nodes to @snapshot, and returns 0.
+ */
+static
+int ft_split_compressed_graft(struct cds_ft *ft,
+		struct ft_descent *d,
+		const uint8_t *iter_key,
+		unsigned int diverge_pos,
+		struct cds_ft_inode_flag **snapshot,
+		int *nr_snapshot)
+{
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
+	struct cds_ft_metadata *cn_meta =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	struct cds_ft_inode_flag *old_suffix_flag;
+	struct cds_ft_inode_flag *branch_flag, *top_flag;
+	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
+	int nr_created = 0;
+	unsigned int suffix_len = cn->len - diverge_pos - 1;
+	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
+	unsigned long old_child_nr_keys;
+	int ret;
+
+	/* Compute old child's nr_keys. */
+	if (ft_node_internal(cn->child) || ft_node_compressed(cn->child)) {
+		struct cds_ft_metadata *cm =
+			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
+		old_child_nr_keys = cm->nr_keys;
+	} else if (ft_node_ptr(cn->child)) {
+		old_child_nr_keys = 1;
+	} else {
+		old_child_nr_keys = 0;
+	}
+
+	/* 1. Build old suffix -> old child. */
+	if (suffix_len >= 2) {
+		struct cds_ft_compressed_node *sfx;
+		struct cds_ft_metadata *sfx_meta;
+
+		sfx = alloc_compressed_node(ft, suffix_len, &sfx_meta);
+		if (!sfx) goto error;
+		sfx->child = cn->child;
+		sfx->len = suffix_len;
+		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1],
+			suffix_len);
+		sfx_meta->nr_child = 1;
+		uatomic_store(&sfx_meta->nr_keys, old_child_nr_keys,
+			CMM_RELAXED);
+		old_suffix_flag = ft_compressed_node_flag(sfx);
+		created[nr_created++] = old_suffix_flag;
+	} else if (suffix_len == 1) {
+		struct cds_ft_inode_flag *dest = NULL;
+
+		ret = ft_node_set_nth(ft, &dest,
+				cn->key_bytes[diverge_pos + 1],
+				cn->child, NULL, NULL);
+		if (ret) goto error;
+		{
+			struct cds_ft_metadata *m =
+				cds_ft_item_to_metadata(ft_node_ptr(dest));
+			uatomic_store(&m->nr_keys, old_child_nr_keys,
+				CMM_RELAXED);
+		}
+		old_suffix_flag = dest;
+		created[nr_created++] = dest;
+	} else {
+		old_suffix_flag = cn->child;
+	}
+
+	/* 2. Build branch node with old direction only. */
+	{
+		struct cds_ft_inode_flag *dest = NULL;
+		struct cds_ft_metadata *branch_meta;
+
+		ret = ft_node_set_nth(ft, &dest, old_ordinal,
+				old_suffix_flag, NULL, NULL);
+		if (ret) goto error;
+		created[nr_created++] = dest;
+		branch_flag = dest;
+
+		branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+		uatomic_store(&branch_meta->nr_keys, old_child_nr_keys,
+			CMM_RELAXED);
+	}
+
+	/* 3. Build prefix -> branch (if needed). */
+	if (diverge_pos >= 2) {
+		struct cds_ft_compressed_node *pfx;
+		struct cds_ft_metadata *pfx_meta;
+
+		pfx = alloc_compressed_node(ft, diverge_pos, &pfx_meta);
+		if (!pfx) goto error;
+		pfx->child = branch_flag;
+		pfx->len = diverge_pos;
+		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
+		pfx_meta->nr_child = 1;
+		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys,
+			CMM_RELAXED);
+		if (cn_meta->external_nodes)
+			pfx_meta->external_nodes = cn_meta->external_nodes;
+		top_flag = ft_compressed_node_flag(pfx);
+		created[nr_created++] = top_flag;
+	} else if (diverge_pos == 1) {
+		struct cds_ft_inode_flag *dest = NULL;
+		struct cds_ft_metadata *pfx_meta;
+
+		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
+				branch_flag, NULL, NULL);
+		if (ret) goto error;
+		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys,
+			CMM_RELAXED);
+		if (cn_meta->external_nodes)
+			pfx_meta->external_nodes = cn_meta->external_nodes;
+		top_flag = dest;
+		created[nr_created++] = dest;
+	} else {
+		/* diverge_pos == 0: branch IS the top. */
+		struct cds_ft_metadata *branch_meta =
+			cds_ft_item_to_metadata(ft_node_ptr(branch_flag));
+		uatomic_store(&branch_meta->nr_keys, cn_meta->nr_keys,
+			CMM_RELAXED);
+		if (cn_meta->external_nodes)
+			branch_meta->external_nodes = cn_meta->external_nodes;
+		top_flag = branch_flag;
+	}
+
+	/* 4. Publish the split structure. */
+	rcu_assign_pointer(*d->nfp, top_flag);
+
+	/* 5. Add new path nodes to snapshot for nr_keys propagation. */
+	if (top_flag != branch_flag)
+		snapshot[(*nr_snapshot)++] = top_flag;
+	snapshot[(*nr_snapshot)++] = branch_flag;
+
+	/*
+	 * 6. Set descent state: branch has an empty slot for the
+	 * key's ordinal at the divergence point.
+	 */
+	d->ppnf = d->pnf;
+	d->ppnfp = d->pnfp;
+	d->pnf = branch_flag;
+	if (top_flag != branch_flag) {
+		if (ft_node_compressed(top_flag))
+			d->pnfp = &ft_compressed_node_ptr(top_flag)->child;
+		else
+			d->pnfp = d->nfp;  /* parent of branch in single-child prefix */
+	} else {
+		d->pnfp = d->nfp;  /* branch IS the top, parent is the old parent */
+	}
+	{
+		uint8_t new_ordinal = key_to_ordinal(ft, iter_key[diverge_pos]);
+
+		d->nf = ft_node_get_nth(branch_flag, &d->nfp, new_ordinal);
+		/* nf should be NULL: the branch only has the old direction. */
+	}
+	d->depth += diverge_pos + 1;
+
+	/* 7. Free old compressed node. */
+	free_compressed_node(ft, cn);
+
+	return 0;
+
+error:
+	{
+		int i;
+
+		for (i = 0; i < nr_created; i++) {
+			if (ft_node_compressed(created[i]))
+				free_compressed_node(ft,
+					ft_compressed_node_ptr(created[i]));
+			else
+				free_cds_ft_node(ft, ft_node_ptr(created[i]));
+		}
+	}
+	return -ENOMEM;
+}
+
+/*
  * Descend through the trie to the child slot at depth @key_len.
  * Stops early if the traversal hits NULL or an external node.
  *
@@ -5924,7 +6113,22 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 				d->depth += cn->len;
 				continue;
 			}
-			/* Divergence: decompress, then retry. */
+			if (!match) {
+				/*
+				 * Divergence: split compressed node
+				 * at the mismatch point.
+				 */
+				if (ft_split_compressed_graft(ft, d,
+						ik, j, snapshot,
+						nr_snapshot))
+					break;
+				ik += j + 1;
+				break;
+			}
+			/*
+			 * Key shorter than compressed path:
+			 * decompress, then retry descent.
+			 */
 			if (ft_decompress_node(ft, d->nfp, d->nf))
 				break;
 			d->nf = *d->nfp;
