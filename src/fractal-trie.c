@@ -4139,7 +4139,17 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 {
 	int i;
 
-	for (i = 0; i < nr_snapshot; i++) {
+	/*
+	 * Propagate bottom-up: deepest ancestor first, root last.
+	 * snapshot[0] is the shallowest (root), snapshot[nr_snapshot-1]
+	 * is the deepest.  By incrementing bottom-up with CMM_RELEASE,
+	 * a reader that acquires a parent's nr_keys and sees the new
+	 * value is guaranteed (via release/acquire ordering) to also
+	 * see the child's incremented value.  This preserves the
+	 * undercount invariant: at every node, nr_keys <= sum of
+	 * children's nr_keys + external_nodes.
+	 */
+	for (i = nr_snapshot - 1; i >= 0; i--) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
 		uatomic_store(&m->nr_keys, m->nr_keys + delta, CMM_RELEASE);
