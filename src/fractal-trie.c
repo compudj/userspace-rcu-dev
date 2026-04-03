@@ -24,6 +24,33 @@
 #include "urcu-utils.h"
 
 #include "fractal-trie-internal.h"
+
+#ifdef FT_DELAY_INJECT
+#include <unistd.h>
+#include <stdlib.h>
+enum ft_delay_mode ft_delay_mode = FT_DELAY_NONE;
+unsigned int ft_delay_us = 1;
+
+static void __attribute__((constructor))
+ft_delay_init(void)
+{
+	const char *mode = getenv("FT_DELAY_MODE");
+	const char *us = getenv("FT_DELAY_US");
+
+	if (mode) {
+		if (!strcmp(mode, "writer"))
+			ft_delay_mode = FT_DELAY_WRITER;
+		else if (!strcmp(mode, "reader"))
+			ft_delay_mode = FT_DELAY_READER;
+		else if (!strcmp(mode, "both"))
+			ft_delay_mode = FT_DELAY_BOTH;
+		else if (!strcmp(mode, "random"))
+			ft_delay_mode = FT_DELAY_RANDOM;
+	}
+	if (us)
+		ft_delay_us = (unsigned int) atoi(us);
+}
+#endif
 #include "bitmap.h"
 
 #if defined(FEATURE_SIMD_LOOKUP) && (defined(__AVX2__) || defined(__SSE2__))
@@ -3501,6 +3528,7 @@ post_descent:
 	iter_debug_path_snapshot(iter);
 
 post_traversal:
+	ft_delay_reader();
 	switch (mode) {
 	case FT_LOOKUP_LE:
 	case FT_LOOKUP_GE:
@@ -3598,6 +3626,7 @@ post_traversal:
 	for (; level > (ssize_t) iter->prefix_len; level--) {
 		uint8_t key_value;
 
+		ft_delay_reader();
 		/*
 		 * Return external node if trying to find LE/LT
 		 * inequality and encountering an external node when
@@ -4142,6 +4171,13 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 	int i;
 
 	/*
+	 * Delay injection: widen the window between the publish
+	 * (rcu_assign_pointer) that preceded this call and the
+	 * nr_keys propagation below.
+	 */
+	ft_delay_writer();
+
+	/*
 	 * Propagate bottom-up: deepest ancestor first, root last.
 	 * snapshot[0] is the shallowest (root), snapshot[nr_snapshot-1]
 	 * is the deepest.  By incrementing bottom-up with CMM_RELEASE,
@@ -4155,6 +4191,7 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
 		uatomic_store(&m->nr_keys, m->nr_keys + delta, CMM_RELEASE);
+		ft_delay_writer();
 	}
 }
 
@@ -6992,6 +7029,8 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 
 	node_flag = ft_dereference_acquire(ft->root);
 	iter_path_node(iter)[0] = node_flag;
+
+	ft_delay_reader();
 
 	for (level = 1; ; level++) {
 		struct cds_ft_metadata *metadata;

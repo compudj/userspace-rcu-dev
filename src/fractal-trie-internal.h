@@ -261,6 +261,49 @@ int ft_debug_counters(void)
 }
 #endif
 
+/*
+ * Delay injection for race condition testing.  When enabled via
+ * FT_DELAY_INJECT, inserts a usleep at critical points to widen
+ * race windows between concurrent readers and writers.
+ *
+ * Injection sites:
+ *   FT_DELAY_WRITER  - writer side (between publish and propagation)
+ *   FT_DELAY_READER  - reader side (during descent/backtracking)
+ *   FT_DELAY_BOTH    - both sides
+ *   FT_DELAY_RANDOM  - randomly per call (50% chance each site)
+ */
+enum ft_delay_mode {
+	FT_DELAY_NONE    = 0,
+	FT_DELAY_WRITER  = (1 << 0),
+	FT_DELAY_READER  = (1 << 1),
+	FT_DELAY_BOTH    = FT_DELAY_WRITER | FT_DELAY_READER,
+	FT_DELAY_RANDOM  = (1 << 2),
+};
+
+#ifdef FT_DELAY_INJECT
+extern enum ft_delay_mode ft_delay_mode;
+extern unsigned int ft_delay_us;
+
+static inline
+void ft_delay_writer(void)
+{
+	if ((ft_delay_mode & FT_DELAY_WRITER) ||
+	    ((ft_delay_mode & FT_DELAY_RANDOM) && (rand() & 1)))
+		usleep(ft_delay_us);
+}
+
+static inline
+void ft_delay_reader(void)
+{
+	if ((ft_delay_mode & FT_DELAY_READER) ||
+	    ((ft_delay_mode & FT_DELAY_RANDOM) && (rand() & 1)))
+		usleep(ft_delay_us);
+}
+#else
+static inline void ft_delay_writer(void) { }
+static inline void ft_delay_reader(void) { }
+#endif
+
 #ifdef URCU_FRACTAL_TRIE_DEBUG_LOCKING
 # define CDS_FT_ASSERT_RCU_READ_LOCKED(ft)                                     \
 	do {                                                                   \
