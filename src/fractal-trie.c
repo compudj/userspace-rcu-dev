@@ -5156,6 +5156,139 @@ struct cds_ft_inode_flag *ft_detach_descent_step(
  *         child of this internal node, and populate this new internal
  *         node into the tree to replace the prior external node.
  */
+
+/*
+ * Handle a compressed node during insert descent.
+ *
+ * Full match + internal/compressed child: traverse through.
+ * Full match + external child at end of key: break for duplicate handling.
+ * Full match + external child, key continues: build branch inline.
+ * Key diverges: split via ft_split_compressed_insert.
+ * Key shorter: split via ft_split_compressed_key_shorter.
+ *
+ * Returns CONTINUE, BREAK, or END (with ret set via *ret_p).
+ * On END, the caller should goto insert_done.
+ * On error, returns END with *ret_p < 0.
+ */
+static
+enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
+		struct ft_descent *d, const uint8_t **iter_key_p,
+		const uint8_t *key, size_t key_len,
+		unsigned int key_depth,
+		struct cds_ft_node *node,
+		struct cds_ft_node **unique_node_ret,
+		struct cds_ft_inode_flag **snapshot, int *nr_snapshot_p,
+		int *ret_p)
+{
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
+	unsigned int remaining = key_depth - 1 - d->depth;
+	unsigned int cmp = cn->len < remaining ? cn->len : remaining;
+	unsigned int j;
+
+	j = ft_match_compressed_key(ft, *iter_key_p, cn, cmp);
+	if (j == cmp && cn->len <= remaining) {
+		/* Full match: traverse through if child is internal
+		 * or compressed. */
+		if (ft_node_ptr(cn->child) &&
+		    (ft_node_internal(cn->child) ||
+		     ft_node_compressed(cn->child))) {
+			snapshot[(*nr_snapshot_p)++] = d->nf;
+			ft_descent_traverse_compressed(d, cn, iter_key_p);
+			return FT_COMPRESSED_CONTINUE;
+		}
+		assert(ft_node_ptr(cn->child));
+		if (cn->len == remaining) {
+			/* Key ends at external child: duplicate. */
+			snapshot[(*nr_snapshot_p)++] = d->nf;
+			ft_descent_traverse_compressed(d, cn, iter_key_p);
+			return FT_COMPRESSED_BREAK;
+		}
+		/* Key continues past external child: build branch. */
+		{
+			struct cds_ft_inode_flag *branch;
+			struct cds_ft_metadata *br_meta;
+
+			branch = ft_build_branch(ft, key,
+				d->depth + cn->len, key_len,
+				(struct cds_ft_inode_flag *) node, 1);
+			if (!branch) {
+				*ret_p = -ENOMEM;
+				return FT_COMPRESSED_END;
+			}
+			br_meta = cds_ft_item_to_metadata(
+				ft_node_ptr(branch));
+			br_meta->external_nodes =
+				(struct cds_ft_node *) cn->child;
+			uatomic_store(&br_meta->nr_keys,
+				br_meta->nr_keys + 1, CMM_RELAXED);
+			rcu_assign_pointer(cn->child, branch);
+			snapshot[(*nr_snapshot_p)++] = d->nf;
+			snapshot[(*nr_snapshot_p)++] = branch;
+			ft_propagate_external_count(snapshot,
+				*nr_snapshot_p, 1);
+			*ret_p = 0;
+			return FT_COMPRESSED_END;
+		}
+	}
+	/* Key diverges: split. */
+	if (j < cmp) {
+		int dret = ft_split_compressed_insert(ft,
+			d->nfp, d->nf, *iter_key_p, remaining,
+			j, node);
+		if (dret) {
+			*ret_p = dret;
+			return FT_COMPRESSED_END;
+		}
+		ft_propagate_external_count(snapshot,
+			*nr_snapshot_p, 1);
+		*ret_p = 0;
+		return FT_COMPRESSED_END;
+	}
+	/* Key shorter: split into prefix → junction → suffix. */
+	{
+		struct cds_ft_inode_flag *top_flag, *jct_flag;
+		int sret;
+
+		sret = ft_split_compressed_key_shorter(ft,
+			d->nf, remaining, &top_flag, &jct_flag);
+		if (sret) {
+			*ret_p = sret;
+			return FT_COMPRESSED_END;
+		}
+		rcu_assign_pointer(*d->nfp, top_flag);
+		{
+			struct cds_ft_metadata *jct_meta =
+				cds_ft_item_to_metadata(
+					ft_node_ptr(jct_flag));
+			if (unique_node_ret &&
+			    jct_meta->external_nodes) {
+				*unique_node_ret =
+					jct_meta->external_nodes;
+				*ret_p = -EEXIST;
+				return FT_COMPRESSED_END;
+			}
+			node->next = NULL;
+			rcu_assign_pointer(
+				jct_meta->external_nodes, node);
+		}
+		if (top_flag != jct_flag)
+			snapshot[(*nr_snapshot_p)++] = top_flag;
+		snapshot[(*nr_snapshot_p)++] = jct_flag;
+		ft_propagate_external_count(snapshot,
+			*nr_snapshot_p, 1);
+		{
+			struct cds_ft_metadata *jct_meta =
+				cds_ft_item_to_metadata(
+					ft_node_ptr(jct_flag));
+			uatomic_store(&jct_meta->nr_keys,
+				jct_meta->nr_keys + 1, CMM_RELAXED);
+		}
+		free_compressed_node(ft, ft_compressed_node_ptr(d->nf));
+		*ret_p = 0;
+		return FT_COMPRESSED_END;
+	}
+}
+
 static
 int _cds_ft_insert(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
@@ -5197,150 +5330,17 @@ int _cds_ft_insert(struct cds_ft *ft,
 		 * at this point and restart.
 		 */
 		if (ft_node_compressed(d.nf)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(d.nf);
-			unsigned int remaining = key_depth - 1 - d.depth;
-			unsigned int cmp = cn->len < remaining ? cn->len : remaining;
-			unsigned int j;
+			enum ft_compressed_action act;
 
-			j = ft_match_compressed_key(ft, iter_key, cn, cmp);
-			if (j == cmp && cn->len <= remaining) {
-				/*
-				 * Full match: traverse through if the
-				 * child is internal.  If the child is
-				 * NULL/external, decompress (ft_attach_node
-				 * expects an internal parent).
-				 */
-				if (ft_node_ptr(cn->child) &&
-				    ft_node_internal(cn->child)) {
-					snapshot[nr_snapshot++] = d.nf;
-					ft_descent_traverse_compressed(
-						&d, cn, &iter_key);
-					continue;
-				}
-				assert(ft_node_ptr(cn->child));
-				/*
-				 * If child is compressed (nested), just
-				 * traverse through and continue — the
-				 * next iteration handles the inner
-				 * compressed node.
-				 */
-				if (ft_node_compressed(cn->child)) {
-					snapshot[nr_snapshot++] = d.nf;
-					ft_descent_traverse_compressed(
-						&d, cn, &iter_key);
-					continue;
-				}
-				if (cn->len == remaining) {
-					snapshot[nr_snapshot++] = d.nf;
-					ft_descent_traverse_compressed(
-						&d, cn, &iter_key);
-					break;
-				}
-				/*
-				 * cn->len < remaining: key continues
-				 * past the external child.  Build the
-				 * remaining path, move the old external
-				 * to external_nodes, and publish the
-				 * complete subtree atomically at
-				 * cn->child.
-				 */
-				{
-					struct cds_ft_inode_flag *branch;
-					struct cds_ft_metadata *br_meta;
-
-					branch = ft_build_branch(ft, key,
-						d.depth + cn->len, key_len,
-						(struct cds_ft_inode_flag *) node,
-						1);
-					if (!branch)
-						return -ENOMEM;
-					br_meta = cds_ft_item_to_metadata(
-						ft_node_ptr(branch));
-					br_meta->external_nodes =
-						(struct cds_ft_node *)
-						cn->child;
-					uatomic_store(&br_meta->nr_keys,
-						br_meta->nr_keys + 1,
-						CMM_RELAXED);
-					rcu_assign_pointer(cn->child,
-						branch);
-					snapshot[nr_snapshot++] = d.nf;
-					snapshot[nr_snapshot++] = branch;
-					ft_propagate_external_count(
-						snapshot, nr_snapshot, 1);
-					ret = 0;
-					goto insert_done;
-				}
-			}
-			/*
-			 * Key diverges within compressed path: split
-			 * the compressed node directly instead of
-			 * decompressing the entire path.
-			 */
-			if (j < cmp) {
-				int dret = ft_split_compressed_insert(ft,
-					d.nfp, d.nf, iter_key, remaining,
-					j, node);
-				if (dret)
-					return dret;
-				/*
-				 * Split succeeded.  The split function
-				 * already set nr_keys on the new top node.
-				 * Propagate +1 to ancestors only (NOT the
-				 * split top itself).
-				 */
-				ft_propagate_external_count(snapshot,
-						nr_snapshot, 1);
-				ret = 0;
+			act = ft_insert_compressed(ft, &d, &iter_key,
+				key, key_len, key_depth, node,
+				unique_node_ret, snapshot, &nr_snapshot,
+				&ret);
+			if (act == FT_COMPRESSED_END)
 				goto insert_done;
-			}
-			/*
-			 * Key shorter than compressed path: split
-			 * into prefix → junction → suffix.
-			 */
-			{
-				struct cds_ft_inode_flag *top_flag, *jct_flag;
-				int sret;
-
-				sret = ft_split_compressed_key_shorter(ft,
-					d.nf, remaining, &top_flag, &jct_flag);
-				if (sret)
-					return sret;
-				rcu_assign_pointer(*d.nfp, top_flag);
-				{
-					struct cds_ft_metadata *jct_meta =
-						cds_ft_item_to_metadata(
-							ft_node_ptr(jct_flag));
-					if (unique_node_ret &&
-					    jct_meta->external_nodes) {
-						*unique_node_ret =
-							jct_meta->external_nodes;
-						return -EEXIST;
-					}
-					node->next = NULL;
-					rcu_assign_pointer(
-						jct_meta->external_nodes,
-						node);
-				}
-				if (top_flag != jct_flag)
-					snapshot[nr_snapshot++] = top_flag;
-				snapshot[nr_snapshot++] = jct_flag;
-				ft_propagate_external_count(snapshot,
-						nr_snapshot, 1);
-				{
-					struct cds_ft_metadata *jct_meta =
-						cds_ft_item_to_metadata(
-							ft_node_ptr(jct_flag));
-					uatomic_store(&jct_meta->nr_keys,
-						jct_meta->nr_keys + 1,
-						CMM_RELAXED);
-				}
-				free_compressed_node(ft,
-					ft_compressed_node_ptr(d.nf));
-				ret = 0;
-				goto insert_done;
-			}
+			if (act == FT_COMPRESSED_BREAK)
+				break;
+			continue;
 		}
 		dbg_printf("cds_ft_insert iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
@@ -5538,123 +5538,17 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		if (ft_node_external(d.nf))
 			break;
 		if (ft_node_compressed(d.nf)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(d.nf);
-			int remaining = key_depth - 1 - d.depth;
-			int cmp = cn->len < remaining ? cn->len : remaining;
-			int j;
+			enum ft_compressed_action act;
 
-			j = ft_match_compressed_key(ft, iter_key, cn, cmp);
-			if (j == cmp && cn->len <= remaining) {
-				/*
-				 * Full match: traverse through if child
-				 * is internal or compressed.
-				 */
-				if (ft_node_ptr(cn->child) &&
-				    (ft_node_internal(cn->child) ||
-				     ft_node_compressed(cn->child))) {
-					snapshot[nr_snapshot++] = d.nf;
-					ft_descent_traverse_compressed(
-						&d, cn, &iter_key);
-					continue;
-				}
-				/*
-				 * Child is external (or NULL).  Traverse
-				 * through and break: the post-loop code
-				 * handles end-of-key (cn->len == remaining)
-				 * and before-end-of-key (cn->len < remaining).
-				 */
-				assert(ft_node_ptr(cn->child));
-				snapshot[nr_snapshot++] = d.nf;
-				ft_descent_traverse_compressed(
-					&d, cn, &iter_key);
-				if (cn->len < remaining) {
-					/*
-					 * Key continues past external child.
-					 * Build remaining path inline.
-					 */
-					struct cds_ft_inode_flag *branch;
-					struct cds_ft_metadata *br_meta;
-
-					branch = ft_build_branch(ft, key,
-						d.depth, key_len,
-						(struct cds_ft_inode_flag *) node,
-						1);
-					if (!branch)
-						return -ENOMEM;
-					br_meta = cds_ft_item_to_metadata(
-						ft_node_ptr(branch));
-					br_meta->external_nodes =
-						(struct cds_ft_node *)
-						cn->child;
-					uatomic_store(&br_meta->nr_keys,
-						br_meta->nr_keys + 1,
-						CMM_RELAXED);
-					rcu_assign_pointer(cn->child,
-						branch);
-					snapshot[nr_snapshot++] = branch;
-					ft_propagate_external_count(
-						snapshot, nr_snapshot, 1);
-					ret = 0;
-					goto insert_replace_done;
-				}
+			act = ft_insert_compressed(ft, &d, &iter_key,
+				key, key_len, key_depth, node,
+				NULL, snapshot, &nr_snapshot,
+				&ret);
+			if (act == FT_COMPRESSED_END)
+				goto insert_replace_done;
+			if (act == FT_COMPRESSED_BREAK)
 				break;
-			}
-			/*
-			 * Key diverges within compressed path:
-			 * split the compressed node.
-			 */
-			if (j < cmp) {
-				int dret = ft_split_compressed_insert(ft,
-					d.nfp, d.nf, iter_key, remaining,
-					j, node);
-				if (dret)
-					return dret;
-				ft_propagate_external_count(snapshot,
-						nr_snapshot, 1);
-				ret = 0;
-				goto insert_replace_done;
-			}
-			/*
-			 * Key shorter than compressed path: split
-			 * into prefix → junction → suffix.
-			 */
-			{
-				struct cds_ft_inode_flag *top_flag, *jct_flag;
-				int sret;
-
-				sret = ft_split_compressed_key_shorter(ft,
-					d.nf, remaining, &top_flag, &jct_flag);
-				if (sret)
-					return sret;
-				rcu_assign_pointer(*d.nfp, top_flag);
-				{
-					struct cds_ft_metadata *jct_meta =
-						cds_ft_item_to_metadata(
-							ft_node_ptr(jct_flag));
-					node->next = NULL;
-					rcu_assign_pointer(
-						jct_meta->external_nodes,
-						node);
-				}
-				if (top_flag != jct_flag)
-					snapshot[nr_snapshot++] = top_flag;
-				snapshot[nr_snapshot++] = jct_flag;
-				ft_propagate_external_count(snapshot,
-						nr_snapshot, 1);
-				{
-					struct cds_ft_metadata *jct_meta =
-						cds_ft_item_to_metadata(
-							ft_node_ptr(jct_flag));
-					uatomic_store(&jct_meta->nr_keys,
-						jct_meta->nr_keys + 1,
-						CMM_RELAXED);
-				}
-				free_compressed_node(ft,
-					ft_compressed_node_ptr(d.nf));
-				ret = 0;
-				goto insert_replace_done;
-			}
+			continue;
 		}
 		dbg_printf("_cds_ft_insert_replace iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
