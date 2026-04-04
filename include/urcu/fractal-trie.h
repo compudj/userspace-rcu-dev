@@ -72,6 +72,34 @@
  * to locate populated children via bit scanning, reducing the
  * number of cache-line accesses needed for ordered traversal.
  *
+ * Prefix compression (path compaction):
+ *
+ * Chains of single-child internal nodes are automatically
+ * replaced with compressed path nodes that store the key bytes
+ * inline with a direct child pointer. This is similar to the
+ * path compaction used in Patricia tries and adaptive radix
+ * trees (ART). A compressed node replaces N single-child
+ * internal nodes with a single allocation storing N key bytes,
+ * reducing both memory usage and traversal time for tries with
+ * long shared prefixes.
+ *
+ * Compressed nodes are created transparently during insert when
+ * a chain of two or more single-child levels would otherwise be
+ * built. All mutation operations (insert, remove, graft, detach)
+ * handle compressed nodes without decompressing them: inserts
+ * split compressed paths at the divergence or key-endpoint,
+ * removes traverse through them, and grafts split or traverse
+ * as needed. Read-side operations (lookup, inequality, iteration,
+ * skip, count) traverse compressed paths in O(1) per compressed
+ * byte with no extra memory accesses beyond the single compressed
+ * node.
+ *
+ * Prefix compression is enabled by default and can be disabled
+ * at compile time with -DNO_FEATURE_FT_COMPRESS for a simpler
+ * trie with no path compaction. The pointer tag encoding uses
+ * bit 1 for the compressed flag (0b10), orthogonal to the
+ * internal flag in bit 0 (0b01), and the external tag (0b00).
+ *
  * Memory layout:
  *
  * Per-node metadata is stored in a separate page via a strided
