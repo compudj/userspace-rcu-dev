@@ -814,6 +814,20 @@ bool ft_node_external(struct cds_ft_inode_flag *node)
 	return ((unsigned long) node & FT_TAG_MASK) == 0;
 }
 
+#ifdef FEATURE_FT_COMPRESS
+static
+bool ft_node_compressed(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
+}
+#else
+static
+bool ft_node_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
+{
+	return false;
+}
+#endif
+
 static
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
@@ -828,8 +842,7 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 
 	v = (unsigned long) node;
 
-	/* Compressed nodes only use bits 0-1 for the tag. */
-	if ((v & FT_TAG_MASK) == FT_COMPRESSED_MASK) {
+	if (ft_node_compressed(node)) {
 		v &= ~(unsigned long) FT_TAG_MASK;
 		return (struct cds_ft_inode *) v;
 	}
@@ -862,20 +875,6 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
 {
 	return (unsigned long) node & FT_INTERNAL_MASK;
 }
-
-#ifdef FEATURE_FT_COMPRESS
-static
-bool ft_node_compressed(struct cds_ft_inode_flag *node)
-{
-	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
-}
-#else
-static
-bool ft_node_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
-{
-	return false;
-}
-#endif
 
 static
 unsigned long ft_node_type(struct cds_ft_inode_flag *node)
