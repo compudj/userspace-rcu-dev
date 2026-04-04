@@ -866,7 +866,11 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
 static
 bool ft_node_compressed(struct cds_ft_inode_flag *node)
 {
+#ifdef FEATURE_FT_COMPRESS
 	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
+#else
+	return false;
+#endif
 }
 
 static
@@ -4874,6 +4878,7 @@ int ft_attach_node(struct cds_ft *ft,
 	/* Create new branch, starting from bottom */
 	iter_node_flag = (struct cds_ft_inode_flag *) child_node;
 
+#ifdef FEATURE_FT_COMPRESS
 	if (key_len - level >= 2) {
 		/*
 		 * Compressed path: replace chain of single-child nodes
@@ -4907,7 +4912,9 @@ int ft_attach_node(struct cds_ft *ft,
 		iter_node_flag = ft_compressed_node_flag(cn);
 		created_nodes[nr_created_nodes++] = iter_node_flag;
 		iter_key = key + level;
-	} else {
+	} else
+#endif /* FEATURE_FT_COMPRESS */
+	{
 		for (i = key_len; i > (int) level; i--) {
 			uint8_t key_value;
 
@@ -6817,6 +6824,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 {
 	unsigned int path_len = end - start;
 
+#ifdef FEATURE_FT_COMPRESS
 	if (path_len >= 2) {
 		struct cds_ft_compressed_node *cn;
 		struct cds_ft_metadata *cn_meta;
@@ -6833,22 +6841,43 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		uatomic_store(&cn_meta->nr_keys, subtree_external_count,
 			CMM_RELAXED);
 		return ft_compressed_node_flag(cn);
-	} else if (path_len == 1) {
-		struct cds_ft_inode_flag *dest = NULL;
-		int ret;
+	} else
+#endif /* FEATURE_FT_COMPRESS */
+	if (path_len >= 1) {
+		struct cds_ft_inode_flag *cur = leaf;
+		int i;
 
-		ret = ft_node_set_nth(ft, &dest,
-				key_to_ordinal(ft, key[start]),
-				leaf, NULL, NULL);
-		if (ret)
-			return NULL;
-		{
-			struct cds_ft_metadata *m =
-				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			uatomic_store(&m->nr_keys, subtree_external_count,
-				CMM_RELAXED);
+		for (i = (int) end - 1; i >= (int) start; i--) {
+			struct cds_ft_inode_flag *dest = NULL;
+			int ret;
+
+			ret = ft_node_set_nth(ft, &dest,
+				key_to_ordinal(ft, key[i]),
+				cur, NULL, NULL);
+			if (ret) {
+				/* Free chain built so far (excluding leaf). */
+				while (cur != leaf) {
+					struct cds_ft_inode_flag *next;
+					uint8_t kv = key_to_ordinal(ft, key[i + 1]);
+
+					next = ft_node_get_nth(cur, NULL, kv);
+					free_cds_ft_node(ft, ft_node_ptr(cur));
+					cur = next;
+					i++;
+				}
+				return NULL;
+			}
+			{
+				struct cds_ft_metadata *m =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(dest));
+				uatomic_store(&m->nr_keys,
+					subtree_external_count,
+					CMM_RELAXED);
+			}
+			cur = dest;
 		}
-		return dest;
+		return cur;
 	}
 	/* path_len == 0: leaf is the branch. */
 	return leaf;

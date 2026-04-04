@@ -97,6 +97,18 @@
 
 #define FT_BITMAP_LEN			32
 
+/*
+ * FEATURE_FT_COMPRESS: enable prefix compression (path compaction).
+ * When enabled, chains of single-child internal nodes are replaced
+ * with compressed path nodes.  Disabling compiles out all compressed
+ * node handling, producing a simpler trie with no path compaction.
+ *
+ * Enabled by default.  Disable with -DNO_FEATURE_FT_COMPRESS.
+ */
+#ifndef NO_FEATURE_FT_COMPRESS
+# define FEATURE_FT_COMPRESS
+#endif
+
 #ifdef FEATURE_INLINE_LOOKUP
 #define inline_lookup	inline __attribute__((always_inline))
 #else
