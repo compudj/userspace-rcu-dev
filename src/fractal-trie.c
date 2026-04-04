@@ -863,15 +863,19 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
 	return (unsigned long) node & FT_INTERNAL_MASK;
 }
 
+#ifdef FEATURE_FT_COMPRESS
 static
 bool ft_node_compressed(struct cds_ft_inode_flag *node)
 {
-#ifdef FEATURE_FT_COMPRESS
 	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
-#else
-	return false;
-#endif
 }
+#else
+static
+bool ft_node_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
+{
+	return false;
+}
+#endif
 
 static
 unsigned long ft_node_type(struct cds_ft_inode_flag *node)
@@ -4841,6 +4845,56 @@ static struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		struct cds_ft_inode_flag *leaf,
 		unsigned long subtree_external_count);
 
+/*
+ * Try to create a compressed path for a chain of single-child nodes.
+ * Returns the compressed node flag on success, NULL if compression
+ * is not applicable (path too short) or disabled, -ENOMEM cast to
+ * pointer on allocation failure.
+ */
+#ifdef FEATURE_FT_COMPRESS
+static
+struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, unsigned int level,
+		struct cds_ft_inode_flag *child,
+		struct cds_ft_node *external_nodes)
+{
+	uint8_t path_len = (uint8_t)(key_len - level);
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_metadata *cn_meta;
+	int j;
+
+	if (path_len < 2)
+		return NULL;
+	cn = alloc_compressed_node(ft, path_len, &cn_meta);
+	if (!cn)
+		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
+	cn->child = child;
+	cn->len = path_len;
+	for (j = 0; j < path_len; j++)
+		cn->key_bytes[j] = key_to_ordinal(ft, key[level + j]);
+	cn_meta->nr_child = 1;
+	uatomic_store(&cn_meta->nr_keys, 1, CMM_RELAXED);
+	if (external_nodes) {
+		cn_meta->external_nodes = external_nodes;
+		uatomic_store(&cn_meta->nr_keys,
+			cn_meta->nr_keys + 1, CMM_RELAXED);
+	}
+	return ft_compressed_node_flag(cn);
+}
+#else
+static inline
+struct cds_ft_inode_flag *ft_try_compress_chain(
+		struct cds_ft *ft __attribute__((unused)),
+		const uint8_t *key __attribute__((unused)),
+		size_t key_len __attribute__((unused)),
+		unsigned int level __attribute__((unused)),
+		struct cds_ft_inode_flag *child __attribute__((unused)),
+		struct cds_ft_node *external_nodes __attribute__((unused)))
+{
+	return NULL;
+}
+#endif
+
 static
 int ft_attach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attach_node_flag_ptr,
@@ -4878,43 +4932,22 @@ int ft_attach_node(struct cds_ft *ft,
 	/* Create new branch, starting from bottom */
 	iter_node_flag = (struct cds_ft_inode_flag *) child_node;
 
-#ifdef FEATURE_FT_COMPRESS
-	if (key_len - level >= 2) {
-		/*
-		 * Compressed path: replace chain of single-child nodes
-		 * with a single compressed node storing the key bytes
-		 * inline.
-		 */
-		uint8_t path_len = (uint8_t)(key_len - level);
-		struct cds_ft_compressed_node *cn;
-		struct cds_ft_metadata *cn_meta;
-		int j;
+	{
+		struct cds_ft_inode_flag *compressed;
 
-		cn = alloc_compressed_node(ft, path_len, &cn_meta);
-		if (!cn) {
+		compressed = ft_try_compress_chain(ft, key, key_len,
+			level, iter_node_flag, external_nodes);
+		if (compressed == (void *) (long) -ENOMEM) {
 			ret = -ENOMEM;
 			goto check_error;
 		}
-		cn->child = iter_node_flag;
-		cn->len = path_len;
-		for (j = 0; j < path_len; j++)
-			cn->key_bytes[j] = key_to_ordinal(ft, key[level + j]);
-
-		cn_meta->nr_child = 1;
-		uatomic_store(&cn_meta->nr_keys, 1, CMM_RELAXED);
-
-		if (external_nodes) {
-			cn_meta->external_nodes = external_nodes;
-			uatomic_store(&cn_meta->nr_keys,
-				cn_meta->nr_keys + 1, CMM_RELAXED);
+		if (compressed) {
+			iter_node_flag = compressed;
+			created_nodes[nr_created_nodes++] = iter_node_flag;
+			iter_key = key + level;
 		}
-
-		iter_node_flag = ft_compressed_node_flag(cn);
-		created_nodes[nr_created_nodes++] = iter_node_flag;
-		iter_key = key + level;
-	} else
-#endif /* FEATURE_FT_COMPRESS */
-	{
+	}
+	if (!ft_node_compressed(iter_node_flag)) {
 		for (i = key_len; i > (int) level; i--) {
 			uint8_t key_value;
 
@@ -6823,26 +6856,20 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		unsigned long subtree_external_count)
 {
 	unsigned int path_len = end - start;
+	struct cds_ft_inode_flag *compressed;
 
-#ifdef FEATURE_FT_COMPRESS
-	if (path_len >= 2) {
-		struct cds_ft_compressed_node *cn;
-		struct cds_ft_metadata *cn_meta;
-		unsigned int j;
+	compressed = ft_try_compress_chain(ft, key, end, start,
+		leaf, NULL);
+	if (compressed == (void *) (long) -ENOMEM)
+		return NULL;
+	if (compressed) {
+		struct cds_ft_metadata *m =
+			cds_ft_item_to_metadata(ft_node_ptr(compressed));
 
-		cn = alloc_compressed_node(ft, path_len, &cn_meta);
-		if (!cn)
-			return NULL;
-		cn->child = leaf;
-		cn->len = path_len;
-		for (j = 0; j < path_len; j++)
-			cn->key_bytes[j] = key_to_ordinal(ft, key[start + j]);
-		cn_meta->nr_child = 1;
-		uatomic_store(&cn_meta->nr_keys, subtree_external_count,
+		uatomic_store(&m->nr_keys, subtree_external_count,
 			CMM_RELAXED);
-		return ft_compressed_node_flag(cn);
-	} else
-#endif /* FEATURE_FT_COMPRESS */
+		return compressed;
+	}
 	if (path_len >= 1) {
 		struct cds_ft_inode_flag *cur = leaf;
 		int i;
@@ -6855,7 +6882,6 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 				key_to_ordinal(ft, key[i]),
 				cur, NULL, NULL);
 			if (ret) {
-				/* Free chain built so far (excluding leaf). */
 				while (cur != leaf) {
 					struct cds_ft_inode_flag *next;
 					uint8_t kv = key_to_ordinal(ft, key[i + 1]);
