@@ -5210,7 +5210,11 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		const uint8_t *iter_key,	/* key bytes at compressed node's depth */
 		unsigned int remaining_key,	/* key bytes remaining from compressed depth */
 		unsigned int diverge_pos,	/* position within compressed path */
-		struct cds_ft_node *child_node)	/* new external node to insert */
+		struct cds_ft_node *child_node,	/* new external node to insert */
+		unsigned int node_depth,	/* depth of the compressed node */
+		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int nr_snapshot)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
 	struct cds_ft_metadata *cn_meta =
@@ -5382,7 +5386,49 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	/* 5. Publish the split structure, replacing the compressed node. */
 	rcu_assign_pointer(*parent_slot, top_flag);
 
-	/* 6. Free the old compressed node. */
+	/* 6. Propagate density: -1 for old compressed, +1 for each new node. */
+	if (snapshot) {
+		int ci;
+		/*
+		 * Created nodes and their depths (bottom-up order):
+		 *   old_suffix at node_depth + diverge_pos + 1 (if suffix_len > 0)
+		 *   new_branch at node_depth + diverge_pos + 1
+		 *   branch at node_depth + diverge_pos
+		 *   prefix at node_depth (if diverge_pos > 0)
+		 *
+		 * The created[] array tracks them in creation order.
+		 * Use a simpler approach: net = nr_created - 1 (one old
+		 * node destroyed, nr_created new ones).
+		 *
+		 * Propagate -1 for the old compressed node, then +1 for
+		 * each new node.  Approximate depths for the new nodes
+		 * based on the split structure.
+		 */
+		ft_propagate_node_density(snapshot, snapshot_depth,
+			nr_snapshot, node_depth, -1);
+		for (ci = 0; ci < nr_created; ci++) {
+			unsigned int new_depth;
+
+			/*
+			 * Approximate depth assignment:
+			 * - Last created = topmost (prefix or branch)
+			 * - Second to last = branch (if prefix exists)
+			 * - Others = deeper nodes
+			 */
+			if (ci == nr_created - 1 && diverge_pos > 0)
+				new_depth = node_depth;	/* prefix */
+			else if (ci == nr_created - 1 ||
+				 (ci == nr_created - 2 && diverge_pos > 0))
+				new_depth = node_depth + diverge_pos; /* branch */
+			else
+				new_depth = node_depth + diverge_pos + 1;
+			ft_propagate_node_density(snapshot,
+				snapshot_depth, nr_snapshot,
+				new_depth, 1);
+		}
+	}
+
+	/* 7. Free the old compressed node. */
 	free_compressed_node(ft, cn);
 
 	return 0;
@@ -6079,6 +6125,10 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 				*nr_snapshot_p, d->nf, d->depth);
 			ft_snapshot_push(snapshot, snapshot_depth,
 				*nr_snapshot_p, branch, d->depth + cn->len);
+			/* Propagate density for the new branch node. */
+			ft_propagate_node_density(snapshot,
+				snapshot_depth, *nr_snapshot_p,
+				d->depth + cn->len, 1);
 			ft_propagate_external_count(snapshot,
 				*nr_snapshot_p, 1);
 			*ret_p = 0;
@@ -6089,7 +6139,8 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 	if (j < cmp) {
 		int dret = ft_split_compressed_insert(ft,
 			d->nfp, d->nf, *iter_key_p, remaining,
-			j, node);
+			j, node, d->depth,
+			snapshot, snapshot_depth, *nr_snapshot_p);
 		if (dret) {
 			*ret_p = dret;
 			return FT_COMPRESSED_END;
@@ -6132,6 +6183,28 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 		ft_snapshot_push(snapshot, snapshot_depth,
 			*nr_snapshot_p, jct_flag,
 			d->depth + remaining);
+		/*
+		 * Density: old compressed (-1), new top (+1 if
+		 * prefix exists), new junction (+1), new suffix
+		 * (+1 if suffix_len > 0).  Propagate net change.
+		 */
+		ft_propagate_node_density(snapshot, snapshot_depth,
+			*nr_snapshot_p, d->depth, -1);
+		if (top_flag != jct_flag)
+			ft_propagate_node_density(snapshot,
+				snapshot_depth, *nr_snapshot_p,
+				d->depth, 1);
+		ft_propagate_node_density(snapshot, snapshot_depth,
+			*nr_snapshot_p, d->depth + remaining, 1);
+		/* Suffix node (if created) is deeper than junction. */
+		{
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(d->nf);
+			if (cn->len > remaining + 1)
+				ft_propagate_node_density(snapshot,
+					snapshot_depth, *nr_snapshot_p,
+					d->depth + remaining + 1, 1);
+		}
 		ft_propagate_external_count(snapshot,
 			*nr_snapshot_p, 1);
 		{
@@ -7052,7 +7125,17 @@ int ft_detach_node(struct cds_ft *ft,
 			struct cds_ft_inode_flag *replacement =
 				topmost_external_nodes ?
 				(struct cds_ft_inode_flag *) topmost_external_nodes : NULL;
+			int si;
 
+			/* Propagate density -1 for the freed collapsed node. */
+			for (si = nr_snapshot - 1; si >= 0; si--) {
+				if (snapshot[si] == iter_node_flag) {
+					ft_propagate_node_density(
+						snapshot, snapshot_depth,
+						si, snapshot_depth[si], -1);
+					break;
+				}
+			}
 			rcu_assign_pointer(*detach_parent_flag_ptr, replacement);
 			free_collapsed_node(ft, col);
 		}
@@ -7817,6 +7900,28 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	ft_snapshot_push(snapshot, snapshot_depth,
 		*nr_snapshot, branch_flag, d->depth + diverge_pos);
 
+	/* 5b. Density: old compressed (-1), new nodes (+1 each). */
+	ft_propagate_node_density(snapshot, snapshot_depth,
+		*nr_snapshot, d->depth, -1);
+	{
+		int ci;
+
+		for (ci = 0; ci < nr_created; ci++) {
+			unsigned int new_depth;
+
+			if (ci == nr_created - 1 && diverge_pos > 0)
+				new_depth = d->depth;
+			else if (ci == nr_created - 1 ||
+				 (ci == nr_created - 2 && diverge_pos > 0))
+				new_depth = d->depth + diverge_pos;
+			else
+				new_depth = d->depth + diverge_pos + 1;
+			ft_propagate_node_density(snapshot,
+				snapshot_depth, *nr_snapshot,
+				new_depth, 1);
+		}
+	}
+
 	/*
 	 * 6. Set descent state: branch has an empty slot for the
 	 * key's ordinal at the divergence point.
@@ -8112,6 +8217,14 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	rcu_assign_pointer(*d->nfp, prefix_flag);
 	ft_snapshot_push(snapshot, snapshot_depth,
 		*nr_snapshot, prefix_flag, d->depth);
+
+	/* Density: old compressed (-1), new prefix (+1), new suffix (+1). */
+	ft_propagate_node_density(snapshot, snapshot_depth,
+		*nr_snapshot, d->depth, -1);
+	ft_propagate_node_density(snapshot, snapshot_depth,
+		*nr_snapshot, d->depth, 1);	/* prefix */
+	ft_propagate_node_density(snapshot, snapshot_depth,
+		*nr_snapshot, d->depth + remaining, 1); /* suffix */
 
 	d->ppnf = d->pnf;
 	d->ppnfp = d->pnfp;
