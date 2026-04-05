@@ -828,6 +828,20 @@ bool ft_node_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
 }
 #endif
 
+#ifdef FEATURE_FT_COLLAPSE
+static
+bool ft_node_collapsed(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & FT_TAG_MASK) == FT_COLLAPSED_MASK;
+}
+#else
+static
+bool ft_node_collapsed(struct cds_ft_inode_flag *node __attribute__((unused)))
+{
+	return false;
+}
+#endif
+
 static
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
@@ -843,6 +857,11 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	v = (unsigned long) node;
 
 	if (ft_node_compressed(node)) {
+		v &= ~(unsigned long) FT_TAG_MASK;
+		return (struct cds_ft_inode *) v;
+	}
+
+	if (ft_node_collapsed(node)) {
 		v &= ~(unsigned long) FT_TAG_MASK;
 		return (struct cds_ft_inode *) v;
 	}
@@ -905,6 +924,59 @@ struct cds_ft_compressed_node *ft_compressed_node_ptr(
 {
 	return (struct cds_ft_compressed_node *)
 		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
+}
+
+static
+struct cds_ft_inode_flag *ft_collapsed_node_flag(
+		struct cds_ft_collapsed_node *node)
+{
+	return (struct cds_ft_inode_flag *)
+		(((unsigned long) node) | FT_COLLAPSED_MASK);
+}
+
+static
+struct cds_ft_collapsed_node *ft_collapsed_node_ptr(
+		struct cds_ft_inode_flag *node)
+{
+	return (struct cds_ft_collapsed_node *)
+		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
+}
+
+/* Collapsed node accessors. */
+
+static inline
+uint8_t *ft_collapsed_suffix(struct cds_ft_collapsed_node *cn,
+		unsigned int i)
+{
+	return ((uint8_t *) cn) + (cn->data[i] & FT_COLLAPSED_OFFSET_MASK);
+}
+
+static inline
+unsigned int ft_collapsed_suffix_len(struct cds_ft_collapsed_node *cn,
+		unsigned int i)
+{
+	unsigned int start = cn->data[i] & FT_COLLAPSED_OFFSET_MASK;
+	unsigned int end;
+
+	if (i == 0)
+		end = FT_COLLAPSED_SCAN_ZONE_SIZE;
+	else
+		end = cn->data[i - 1] & FT_COLLAPSED_OFFSET_MASK;
+	return end - start;
+}
+
+static inline
+struct cds_ft_inode_flag **ft_collapsed_ptrs(struct cds_ft_collapsed_node *cn)
+{
+	return (struct cds_ft_inode_flag **)
+		(((uint8_t *) cn) + FT_COLLAPSED_SCAN_ZONE_SIZE);
+}
+
+static inline
+bool ft_collapsed_entry_dead(struct cds_ft_collapsed_node *cn,
+		unsigned int i)
+{
+	return cn->data[i] & FT_COLLAPSED_TOMBSTONE;
 }
 
 /*
@@ -1155,6 +1227,61 @@ void free_compressed_node(struct cds_ft *ft,
 	cds_ft_free_item(metadata);
 	if (ft_debug_counters() && node)
 		uatomic_inc(&ft->nr_nodes_freed);
+}
+
+/*
+ * Collapsed node order: 7 (128B) or 8 (256B).
+ * Order 7 gives 8 pointer slots, order 8 gives 24.
+ */
+enum {
+	FT_COLLAPSED_ORDER_SMALL = 7,	/* 128B: max 8 entries */
+	FT_COLLAPSED_ORDER_LARGE = 8,	/* 256B: max 24 entries */
+	FT_COLLAPSED_MAX_ENTRIES_SMALL = ((1 << FT_COLLAPSED_ORDER_SMALL) - FT_COLLAPSED_SCAN_ZONE_SIZE)
+					/ sizeof(struct cds_ft_inode_flag *),
+	FT_COLLAPSED_MAX_ENTRIES_LARGE = ((1 << FT_COLLAPSED_ORDER_LARGE) - FT_COLLAPSED_SCAN_ZONE_SIZE)
+					/ sizeof(struct cds_ft_inode_flag *),
+};
+
+static
+struct cds_ft_collapsed_node *alloc_collapsed_node(struct cds_ft *ft,
+		unsigned int order,
+		struct cds_ft_metadata **_metadata)
+{
+	struct cds_ft_metadata *metadata;
+	struct cds_ft_collapsed_node *cn;
+
+	assert(order == FT_COLLAPSED_ORDER_SMALL || order == FT_COLLAPSED_ORDER_LARGE);
+	metadata = cds_ft_alloc_item(ft, order, false);
+	if (!metadata)
+		return NULL;
+	cn = (struct cds_ft_collapsed_node *) cds_ft_metadata_to_item(metadata);
+	memset(cn, 0, FT_COLLAPSED_SCAN_ZONE_SIZE);
+	if (ft_debug_counters())
+		uatomic_inc(&ft->nr_nodes_allocated);
+	*_metadata = metadata;
+	return cn;
+}
+
+static
+void free_collapsed_node(struct cds_ft *ft,
+		struct cds_ft_collapsed_node *node)
+{
+	struct cds_ft_metadata *metadata =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
+
+	cds_ft_free_item(metadata);
+	if (ft_debug_counters() && node)
+		uatomic_inc(&ft->nr_nodes_freed);
+}
+
+/*
+ * Maximum number of entries for a collapsed node of the given order.
+ */
+static inline
+unsigned int ft_collapsed_max_entries(unsigned int order)
+{
+	return ((1U << order) - FT_COLLAPSED_SCAN_ZONE_SIZE)
+		/ sizeof(struct cds_ft_inode_flag *);
 }
 
 #define __FT_ALIGN_MASK(v, mask)	(((v) + (mask)) & ~(mask))

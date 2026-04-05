@@ -33,20 +33,24 @@
  * This can be used for variable length keys to identify the end of key.
  */
 /*
- * Pointer tag encoding (bits 0-1):
+ * Pointer tag encoding (bits 0-2):
  *
- *   (ptr & 0b11) == 0b00  →  external node (leaf)
- *   (ptr & 0b01) == 0b01  →  internal node (bit 0 set), bits 1-3 = type index
- *   (ptr & 0b11) == 0b10  →  compressed path node
+ *   (ptr & 0b111) == 0b000  →  external node (leaf) or NULL
+ *   (ptr & 0b001) == 0b001  →  internal node (bit 0 set), bits 1-3 = type index
+ *   (ptr & 0b111) == 0b010  →  compressed path node
+ *   (ptr & 0b111) == 0b110  →  collapsed subtree node
  *
  * Internal nodes always have bit 0 set; the type index encoding in
- * bits 1-3 is unchanged.  Compressed nodes use bit 1 only; bits 2+
- * are the pointer.  External nodes have bits 0-1 clear.
+ * bits 1-3 is unchanged.  Compressed and collapsed nodes use bits 1-2
+ * with bit 0 clear.  External nodes have bits 0-2 clear.
+ * Both compressed and collapsed nodes are >= 16-byte aligned
+ * (strided allocator minimum order 4), so bits 0-3 are available.
  */
 #define FT_INTERNAL_BITS	1
 #define FT_INTERNAL_MASK	(1U << 0)
 #define FT_COMPRESSED_MASK	(1U << 1)
-#define FT_TAG_MASK		(FT_COMPRESSED_MASK | FT_INTERNAL_MASK)
+#define FT_COLLAPSED_MASK	((1U << 2) | (1U << 1))	/* 0b110 */
+#define FT_TAG_MASK		(FT_COLLAPSED_MASK | FT_INTERNAL_MASK)	/* 0b111 */
 
 /*
  * This if followed by a number of bits reserved to represent the child
@@ -109,6 +113,18 @@
 # define FEATURE_FT_COMPRESS
 #endif
 
+/*
+ * FEATURE_FT_COLLAPSE: enable collapsed subtree nodes.
+ * When enabled, sparse subtrees can be replaced with a single
+ * cache-line-sized node storing variable-length key suffixes and
+ * child pointers, eliminating multiple levels of pointer chasing.
+ *
+ * Enabled by default.  Disable with -DNO_FEATURE_FT_COLLAPSE.
+ */
+#ifndef NO_FEATURE_FT_COLLAPSE
+# define FEATURE_FT_COLLAPSE
+#endif
+
 #ifdef FEATURE_INLINE_LOOKUP
 #define inline_lookup	inline __attribute__((always_inline))
 #else
@@ -157,6 +173,43 @@ struct cds_ft_compressed_node {
 	struct cds_ft_inode_flag *child;	/* Child at end of compressed path. */
 	uint8_t len;				/* Number of key bytes in path (1-255). */
 	uint8_t key_bytes[];			/* Compressed key path (flexible array). */
+};
+
+/*
+ * Collapsed subtree node.  Replaces a sparse subtree with a single
+ * node storing variable-length key suffixes and child pointers.
+ *
+ * Tagged in the parent's child pointer with FT_COLLAPSED_MASK
+ * (bits 1-2 set, bit 0 clear = 0b110).
+ *
+ * Two-zone layout (node allocation >= 128 bytes, cache-line aligned):
+ *
+ *   Zone 1 (scan zone, bytes 0-63 = 1 cache line):
+ *     [nr_entries] [offset_0] [offset_1] ... → ← ... [suffix_1] [suffix_0]
+ *     Offset array grows left-to-right; suffix data grows right-to-left.
+ *
+ *   Zone 2 (pointer zone, bytes 64+):
+ *     [ptr_0] [ptr_1] ... [ptr_{nr_entries-1}]
+ *     Child pointers (struct cds_ft_inode_flag *), any node type.
+ *
+ * entry_offset[i] encoding (uint8_t):
+ *   bit 7 (0x80) = tombstone marker (1 = dead entry, 0 = live)
+ *   bits 0-6     = byte offset from start of node to entry i's suffix
+ *
+ * Suffix length derivation:
+ *   Entry 0: suffix_len = 64 - (offset[0] & 0x7F)
+ *   Entry i (i > 0): suffix_len = (offset[i-1] & 0x7F) - (offset[i] & 0x7F)
+ *
+ * Lookup: scan zone 1 (1 cache line) to find matching suffix, then
+ * load ptr[i] from zone 2 (1 cache line).  Total: 2 cache-line loads.
+ */
+#define FT_COLLAPSED_SCAN_ZONE_SIZE	64
+#define FT_COLLAPSED_TOMBSTONE		0x80
+#define FT_COLLAPSED_OFFSET_MASK	0x7F
+
+struct cds_ft_collapsed_node {
+	uint8_t nr_entries;			/* Number of entries (including dead). */
+	uint8_t data[];				/* Offset array + suffix data (zone 1). */
 };
 
 struct cds_ft_bitmap {
