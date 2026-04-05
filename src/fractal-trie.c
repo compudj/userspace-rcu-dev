@@ -3236,6 +3236,134 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 	return FT_COMPRESSED_CONTINUE;
 }
 
+#ifdef FEATURE_FT_COLLAPSE
+/*
+ * Collapsed node lookup helper for do_cds_ft_lookup.
+ *
+ * Scans the collapsed node's entries for a suffix that matches the
+ * remaining lookup key.  On match, advances key/index/node_flag past
+ * the matched suffix and returns CONTINUE or BREAK.  On no match,
+ * returns END with NOT_FOUND status.
+ *
+ * The caller decrements i before calling (same as compressed root
+ * handling) when the collapsed node is encountered at the current
+ * position rather than as a child of ft_node_get_nth.
+ */
+static
+enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
+		struct cds_ft_inode_flag **node_flag_p,
+		const uint8_t **key_p, unsigned int *i_p,
+		unsigned int key_depth,
+		struct cds_ft_iter *iter, size_t *iter_path_len_p,
+		bool track, bool track_longest,
+		size_t *match_len_p, struct cds_ft_node **match_node_p,
+		struct cds_ft_node **found_ret,
+		enum cds_ft_status *status_ret)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	const uint8_t *key = *key_p;
+	unsigned int i = *i_p;
+	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn);
+	unsigned int remaining_key = key_depth - 1 - i;
+	unsigned int e;
+
+	/* Check external_nodes at the collapsed node's depth. */
+	if (track) {
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+		struct cds_ft_node *ext =
+			rcu_dereference(cn_meta->external_nodes);
+
+		if (ext || track_longest) {
+			*match_len_p = i;
+			*match_node_p = ext;
+		}
+	}
+
+	/* Scan entries for a matching suffix. */
+	for (e = 0; e < cn->nr_entries; e++) {
+		unsigned int slen;
+		uint8_t *suffix;
+		unsigned int j;
+		bool match;
+
+		if (ft_collapsed_entry_dead(cn, e))
+			continue;
+		slen = ft_collapsed_suffix_len(cn, e);
+		if (slen > remaining_key)
+			continue;
+		suffix = ft_collapsed_suffix(cn, e);
+		match = true;
+		for (j = 0; j < slen; j++) {
+			if (key_to_ordinal(ft, key[j]) != suffix[j]) {
+				match = false;
+				break;
+			}
+		}
+		if (!match)
+			continue;
+
+		/* Match found. Advance past the suffix. */
+		key += slen;
+		if (iter) {
+			unsigned int k;
+
+			for (k = 1; k <= slen; k++)
+				iter_path_node(iter)[i + k] =
+					(struct cds_ft_inode_flag *)
+					ft_collapsed_node_flag(cn);
+		}
+		i += slen;
+		node_flag = ft_dereference_acquire(ptrs[e]);
+		if (!ft_node_ptr(node_flag)) {
+			*status_ret = CDS_FT_STATUS_NOT_FOUND;
+			return FT_COMPRESSED_END;
+		}
+		if (iter) {
+			iter_path_node(iter)[i] = node_flag;
+			*iter_path_len_p = i + 1;
+		}
+
+		*node_flag_p = node_flag;
+		*key_p = key;
+		*i_p = i;
+
+		if (i >= key_depth)
+			return FT_COMPRESSED_BREAK;
+
+		/* External child before end of key. */
+		if (i < key_depth - 1 && ft_node_external(node_flag)) {
+			if (track) {
+				*match_len_p = i;
+				*match_node_p = (struct cds_ft_node *) node_flag;
+			}
+			*status_ret = CDS_FT_STATUS_NOT_FOUND;
+			return FT_COMPRESSED_END;
+		}
+
+		/* Track prefix match at child node. */
+		if (track && i < key_depth - 1 && !ft_node_external(node_flag)) {
+			struct cds_ft_metadata *metadata =
+				cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+			struct cds_ft_node *ext =
+				rcu_dereference(metadata->external_nodes);
+
+			if (ext || track_longest) {
+				*match_len_p = i;
+				*match_node_p = ext;
+			}
+		}
+
+		return FT_COMPRESSED_CONTINUE;
+	}
+
+	/* No matching suffix found. */
+	*status_ret = CDS_FT_STATUS_NOT_FOUND;
+	return FT_COMPRESSED_END;
+}
+#endif /* FEATURE_FT_COLLAPSE */
+
 /*
  * Simple compressed node traversal for read-side loops (replace,
  * count_keys_prefix).  Matches the key against the compressed path,
@@ -3379,6 +3507,25 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			continue;
 		}
 
+		/*
+		 * Collapsed node at current position (e.g. collapsed
+		 * root or collapsed child from ft_node_get_nth).
+		 */
+		if (ft_node_collapsed(node_flag)) {
+			enum ft_compressed_action act;
+
+			i--;
+			act = ft_lookup_collapsed(ft, &node_flag, &key, &i,
+				key_depth, iter, &iter_path_len,
+				track, track_longest,
+				&match_len, &match_node, &found, &status);
+			if (act == FT_COMPRESSED_END)
+				goto end;
+			if (act == FT_COMPRESSED_BREAK)
+				break;
+			continue;
+		}
+
 		iter_key = key_to_ordinal(ft, *(key++));
 		node_flag = ft_node_get_nth(node_flag, NULL, iter_key);
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
@@ -3395,6 +3542,19 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			enum ft_compressed_action act;
 
 			act = ft_lookup_compressed(ft, &node_flag, &key, &i,
+				key_depth, iter, &iter_path_len,
+				track, track_longest,
+				&match_len, &match_node, &found, &status);
+			if (act == FT_COMPRESSED_END)
+				goto end;
+			if (act == FT_COMPRESSED_BREAK)
+				break;
+			/* CONTINUE: fall through to child handling. */
+		}
+		if (ft_node_collapsed(node_flag)) {
+			enum ft_compressed_action act;
+
+			act = ft_lookup_collapsed(ft, &node_flag, &key, &i,
 				key_depth, iter, &iter_path_len,
 				track, track_longest,
 				&match_len, &match_node, &found, &status);
@@ -3448,6 +3608,15 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			match_node = found;
 		}
 	} else if (ft_node_compressed(node_flag)) {
+		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(
+							ft_node_ptr(node_flag));
+		found = rcu_dereference(metadata->external_nodes);
+		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+		if (track && (found || track_longest)) {
+			match_len = key_len;
+			match_node = found;
+		}
+	} else if (ft_node_collapsed(node_flag)) {
 		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(
 							ft_node_ptr(node_flag));
 		found = rcu_dereference(metadata->external_nodes);
