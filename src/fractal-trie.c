@@ -6673,6 +6673,62 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			}
 			continue;
 		}
+		if (ft_node_collapsed(dd.d.nf)) {
+			struct cds_ft_collapsed_node *col =
+				ft_collapsed_node_ptr(dd.d.nf);
+			const struct cds_ft_metadata *col_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) col);
+			struct cds_ft_inode_flag **cptrs =
+				ft_collapsed_ptrs(col);
+			unsigned int remaining = key_len - dd.d.depth;
+			unsigned int e;
+			bool found = false;
+
+			for (e = 0; e < col->nr_entries; e++) {
+				unsigned int slen, j;
+				uint8_t *suffix;
+				bool match;
+
+				if (ft_collapsed_entry_dead(col, e))
+					continue;
+				slen = ft_collapsed_suffix_len(col, e);
+				if (slen > remaining)
+					continue;
+				suffix = ft_collapsed_suffix(col, e);
+				match = true;
+				for (j = 0; j < slen; j++) {
+					if (key_to_ordinal(ft, iter_key[j]) != suffix[j]) {
+						match = false;
+						break;
+					}
+				}
+				if (!match)
+					continue;
+				if (!ft_node_ptr(cptrs[e]))
+					return CDS_FT_STATUS_NOT_FOUND;
+				ft_detach_descent_track(&dd, col_meta);
+				snapshot_n[nr_snapshot + 1] = suffix[0];
+				snapshot[nr_snapshot++] = dd.d.nf;
+				dd.d.ppnf  = dd.d.pnf;
+				dd.d.ppnfp = dd.d.pnfp;
+				dd.d.pnf   = dd.d.nf;
+				dd.d.pnfp  = dd.d.nfp;
+				dd.d.nf    = ft_dereference_acquire(cptrs[e]);
+				dd.d.nfp   = &cptrs[e];
+				dd.d.depth += slen;
+				iter_key += slen;
+				if (ft_node_ptr(dd.d.nf) && dd.pending) {
+					dd.det_nfp = dd.d.nfp;
+					dd.pending = false;
+				}
+				found = true;
+				break;
+			}
+			if (!found)
+				return CDS_FT_STATUS_NOT_FOUND;
+			continue;
+		}
 
 		/*
 		 * Track pointers for the detach point during descent.
@@ -6909,10 +6965,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				*result_node = NULL;
 				return CDS_FT_STATUS_NOT_FOUND;
 			}
-			/*
-			 * Full match with non-NULL child: traverse
-			 * through without decompressing.
-			 */
 			ft_detach_descent_track(&dd, cn_meta);
 			snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
 			snapshot[nr_snapshot++] = dd.d.nf;
@@ -6920,6 +6972,66 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			if (ft_node_ptr(dd.d.nf) && dd.pending) {
 				dd.det_nfp = dd.d.nfp;
 				dd.pending = false;
+			}
+			continue;
+		}
+		if (ft_node_collapsed(dd.d.nf)) {
+			struct cds_ft_collapsed_node *col =
+				ft_collapsed_node_ptr(dd.d.nf);
+			const struct cds_ft_metadata *col_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) col);
+			struct cds_ft_inode_flag **cptrs =
+				ft_collapsed_ptrs(col);
+			unsigned int remaining = key_len - dd.d.depth;
+			unsigned int e;
+			bool found = false;
+
+			for (e = 0; e < col->nr_entries; e++) {
+				unsigned int slen, j;
+				uint8_t *suffix;
+				bool match;
+
+				if (ft_collapsed_entry_dead(col, e))
+					continue;
+				slen = ft_collapsed_suffix_len(col, e);
+				if (slen > remaining)
+					continue;
+				suffix = ft_collapsed_suffix(col, e);
+				match = true;
+				for (j = 0; j < slen; j++) {
+					if (key_to_ordinal(ft, iter_key[j]) != suffix[j]) {
+						match = false;
+						break;
+					}
+				}
+				if (!match)
+					continue;
+				if (!ft_node_ptr(cptrs[e])) {
+					*result_node = NULL;
+					return CDS_FT_STATUS_NOT_FOUND;
+				}
+				ft_detach_descent_track(&dd, col_meta);
+				snapshot_n[nr_snapshot + 1] = suffix[0];
+				snapshot[nr_snapshot++] = dd.d.nf;
+				dd.d.ppnf  = dd.d.pnf;
+				dd.d.ppnfp = dd.d.pnfp;
+				dd.d.pnf   = dd.d.nf;
+				dd.d.pnfp  = dd.d.nfp;
+				dd.d.nf    = ft_dereference_acquire(cptrs[e]);
+				dd.d.nfp   = &cptrs[e];
+				dd.d.depth += slen;
+				iter_key += slen;
+				if (ft_node_ptr(dd.d.nf) && dd.pending) {
+					dd.det_nfp = dd.d.nfp;
+					dd.pending = false;
+				}
+				found = true;
+				break;
+			}
+			if (!found) {
+				*result_node = NULL;
+				return CDS_FT_STATUS_NOT_FOUND;
 			}
 			continue;
 		}
@@ -7259,17 +7371,57 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 			 * Key shorter than compressed path: split
 			 * into prefix → suffix at the key endpoint.
 			 * The graft point is at the junction.
-			 *
-			 * For cds_ft_graft: ft_store_at_graft_point
-			 * sees the suffix as populated → POPULATED_ERROR.
-			 * For cds_ft_graft_swap: the swap replaces the
-			 * prefix's child (suffix) with the source root.
 			 */
 			if (ft_split_compressed_graft_key_shorter(
 					ft, d, remaining,
 					snapshot, nr_snapshot))
 				break;
 			break;
+		}
+		if (ft_node_collapsed(d->nf)) {
+			struct cds_ft_collapsed_node *col =
+				ft_collapsed_node_ptr(d->nf);
+			struct cds_ft_inode_flag **cptrs =
+				ft_collapsed_ptrs(col);
+			unsigned int remaining = key_len - d->depth;
+			unsigned int e;
+			bool found = false;
+
+			for (e = 0; e < col->nr_entries; e++) {
+				unsigned int slen, j;
+				uint8_t *suffix;
+				bool match;
+
+				if (ft_collapsed_entry_dead(col, e))
+					continue;
+				slen = ft_collapsed_suffix_len(col, e);
+				if (slen > remaining)
+					continue;
+				suffix = ft_collapsed_suffix(col, e);
+				match = true;
+				for (j = 0; j < slen; j++) {
+					if (key_to_ordinal(ft, ik[j]) != suffix[j]) {
+						match = false;
+						break;
+					}
+				}
+				if (!match)
+					continue;
+				snapshot[(*nr_snapshot)++] = d->nf;
+				d->ppnf  = d->pnf;
+				d->ppnfp = d->pnfp;
+				d->pnf   = d->nf;
+				d->pnfp  = d->nfp;
+				d->nf    = ft_dereference_acquire(cptrs[e]);
+				d->nfp   = &cptrs[e];
+				d->depth += slen;
+				ik += slen;
+				found = true;
+				break;
+			}
+			if (!found)
+				break; /* Graft point: no matching entry. */
+			continue;
 		}
 
 		snapshot[(*nr_snapshot)++] = d->nf;
@@ -7998,6 +8150,62 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					dd.det_nfp = dd.d.nfp;
 					dd.pending = false;
 				}
+				continue;
+			}
+			if (ft_node_collapsed(dd.d.nf)) {
+				struct cds_ft_collapsed_node *col =
+					ft_collapsed_node_ptr(dd.d.nf);
+				const struct cds_ft_metadata *col_meta =
+					cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) col);
+				struct cds_ft_inode_flag **cptrs =
+					ft_collapsed_ptrs(col);
+				unsigned int remaining = key_len - dd.d.depth;
+				unsigned int e;
+				bool found = false;
+
+				for (e = 0; e < col->nr_entries; e++) {
+					unsigned int slen, j;
+					uint8_t *suffix;
+					bool match;
+
+					if (ft_collapsed_entry_dead(col, e))
+						continue;
+					slen = ft_collapsed_suffix_len(col, e);
+					if (slen > remaining)
+						continue;
+					suffix = ft_collapsed_suffix(col, e);
+					match = true;
+					for (j = 0; j < slen; j++) {
+						if (key_to_ordinal(ft, ik[j]) != suffix[j]) {
+							match = false;
+							break;
+						}
+					}
+					if (!match)
+						continue;
+					if (!ft_node_ptr(cptrs[e]))
+						return CDS_FT_STATUS_NOT_FOUND;
+					ft_detach_descent_track(&dd, col_meta);
+					snapshot_n[nr_snapshot + 1] = suffix[0];
+					snapshot[nr_snapshot++] = dd.d.nf;
+					dd.d.ppnf  = dd.d.pnf;
+					dd.d.ppnfp = dd.d.pnfp;
+					dd.d.pnf   = dd.d.nf;
+					dd.d.pnfp  = dd.d.nfp;
+					dd.d.nf    = ft_dereference_acquire(cptrs[e]);
+					dd.d.nfp   = &cptrs[e];
+					dd.d.depth += slen;
+					ik += slen;
+					if (ft_node_ptr(dd.d.nf) && dd.pending) {
+						dd.det_nfp = dd.d.nfp;
+						dd.pending = false;
+					}
+					found = true;
+					break;
+				}
+				if (!found)
+					return CDS_FT_STATUS_NOT_FOUND;
 				continue;
 			}
 
