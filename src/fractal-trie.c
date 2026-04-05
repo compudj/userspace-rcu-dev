@@ -5763,7 +5763,10 @@ int ft_attach_node(struct cds_ft *ft,
 		size_t key_len,
 		unsigned int level,
 		struct cds_ft_node *child_node,
-		struct cds_ft_node *external_nodes)
+		struct cds_ft_node *external_nodes,
+		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int nr_snapshot)
 {
 	struct cds_ft_metadata *metadata = NULL;
 	struct cds_ft_inode_flag *iter_node_flag, *iter_dest_node_flag,
@@ -5857,6 +5860,33 @@ int ft_attach_node(struct cds_ft *ft,
 		/* Reclaim safely after unlink. */
 		if (old_recompacted_node)
 			free_cds_ft_node(ft, old_recompacted_node);
+	}
+
+	/*
+	 * Propagate node density for each created traversable node.
+	 * The snapshot contains ancestors with their depths.
+	 */
+	if (snapshot) {
+		int cn_idx;
+
+		for (cn_idx = 0; cn_idx < nr_created_nodes; cn_idx++) {
+			unsigned int node_depth;
+
+			if (ft_node_compressed(created_nodes[cn_idx])) {
+				/* Compressed node sits at depth 'level'. */
+				node_depth = level;
+			} else {
+				/*
+				 * Internal nodes created bottom-up:
+				 * created_nodes[0] at key_len,
+				 * created_nodes[1] at key_len-1, etc.
+				 */
+				node_depth = key_len - cn_idx;
+			}
+			ft_propagate_node_density(snapshot,
+				snapshot_depth, nr_snapshot,
+				node_depth, 1);
+		}
 	}
 
 	/* Success */
@@ -6384,7 +6414,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
-					NULL);
+					NULL,
+					snapshot, snapshot_depth, nr_snapshot);
 			if (ret == 0) {
 				/* Refresh snapshot: parent may have been recompacted. */
 				if (nr_snapshot > 0)
@@ -6463,7 +6494,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
-				(struct cds_ft_node *) ft_node_ptr(d.nf));
+				(struct cds_ft_node *) ft_node_ptr(d.nf),
+				snapshot, snapshot_depth, nr_snapshot);
 		if (ret == 0) {
 			/* Refresh snapshot: parent may have been recompacted. */
 			if (nr_snapshot > 0)
@@ -6641,7 +6673,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
-					NULL);
+					NULL,
+					snapshot, snapshot_depth, nr_snapshot);
 			if (ret == 0) {
 				if (nr_snapshot > 0)
 					snapshot[nr_snapshot - 1] = *d.pnfp;
@@ -6688,7 +6721,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
-				(struct cds_ft_node *) ft_node_ptr(d.nf));
+				(struct cds_ft_node *) ft_node_ptr(d.nf),
+				snapshot, snapshot_depth, nr_snapshot);
 		if (ret == 0) {
 			if (nr_snapshot > 0)
 				snapshot[nr_snapshot - 1] = *d.pnfp;
@@ -6899,6 +6933,7 @@ find_and_replace:
 static
 int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
 		uint8_t *snapshot_n,
 		int nr_snapshot,
 		struct cds_ft_inode_flag **detach_node_flag_ptr,
@@ -7052,13 +7087,20 @@ end:
 
 	if (!ret) {
 		/*
-		 * At this point, we want to delete all nodes that are about to
-		 * be removed from metadata_stack (except the last one, which is
-		 * the parent of the topmost node with 1 child, or the root
-		 * itself when the entire branch goes up to the root).
+		 * Propagate density -1 for each freed node, then free it.
+		 * The freed nodes are at snapshot positions
+		 * [nr_snapshot - 1 - nr_branch .. nr_snapshot - 1 - nr_branch + nr_clear - 1].
+		 * Each snapshot entry has a known depth in snapshot_depth[].
 		 */
-		for (i = 0; i < nr_clear; i++)
+		for (i = 0; i < nr_clear; i++) {
+			int snap_idx = nr_snapshot - 1 - nr_branch + i;
+
+			if (snap_idx >= 0 && snap_idx < nr_snapshot)
+				ft_propagate_node_density(snapshot,
+					snapshot_depth, snap_idx,
+					snapshot_depth[snap_idx], -1);
 			free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
+		}
 	}
 	return ret;
 }
@@ -7341,7 +7383,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_snapshot_push(snapshot, snapshot_depth,
 			nr_snapshot, dd.d.nf, dd.d.depth);
 			ret = ft_detach_node(ft, snapshot,
-					snapshot_n, nr_snapshot,
+					snapshot_depth, snapshot_n,
+					nr_snapshot,
 					dd.det_nfp,
 					dd.det_pfp);
 			if (ret) {
@@ -7599,7 +7642,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_snapshot_push(snapshot, snapshot_depth,
 			nr_snapshot, dd.d.nf, dd.d.depth);
 		ret = ft_detach_node(ft, snapshot,
-				snapshot_n, nr_snapshot,
+				snapshot_depth, snapshot_n,
+				nr_snapshot,
 				dd.det_nfp,
 				dd.det_pfp);
 		if (ret) {
@@ -8787,6 +8831,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				nr_snapshot, child, key_len);
 			{
 				int ret = ft_detach_node(ft, snapshot,
+							 snapshot_depth,
 							 snapshot_n,
 							 nr_snapshot,
 							 dd.det_nfp,
