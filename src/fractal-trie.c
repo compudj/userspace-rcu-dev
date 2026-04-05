@@ -8966,6 +8966,53 @@ int ft_rebuild_path(struct cds_ft *ft,
 			iter_path_node(iter)[i + 1] = node_flag;
 			continue;
 		}
+		if (ft_node_collapsed(node_flag)) {
+			struct cds_ft_collapsed_node *cn =
+				ft_collapsed_node_ptr(node_flag);
+			struct cds_ft_inode_flag **ptrs =
+				ft_collapsed_ptrs(cn);
+			unsigned int remaining = key_len - i;
+			unsigned int e;
+			bool found = false;
+
+			for (e = 0; e < cn->nr_entries; e++) {
+				unsigned int slen, j;
+				uint8_t *suffix;
+				bool match;
+
+				if (ft_collapsed_entry_dead(cn, e))
+					continue;
+				slen = ft_collapsed_suffix_len(cn, e);
+				if (slen > remaining)
+					continue;
+				suffix = ft_collapsed_suffix(cn, e);
+				match = true;
+				for (j = 0; j < slen; j++) {
+					uint8_t ord = key_to_ordinal(ft,
+								key[i + j]);
+					if (ord != suffix[j]) {
+						match = false;
+						break;
+					}
+					ordinal_key[i + j] = ord;
+					iter_path_node(iter)[i + j + 1] =
+						(struct cds_ft_inode_flag *)
+						ft_collapsed_node_flag(cn);
+				}
+				if (!match)
+					continue;
+				i += slen - 1;
+				node_flag = ft_dereference_acquire(ptrs[e]);
+				if (!ft_node_ptr(node_flag))
+					return -1;
+				iter_path_node(iter)[i + 1] = node_flag;
+				found = true;
+				break;
+			}
+			if (!found)
+				return -1;
+			continue;
+		}
 
 		ordinal = key_to_ordinal(ft, key[i]);
 		ordinal_key[i] = ordinal;
@@ -9107,6 +9154,20 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 					goto descend_forward;
 				}
 				remaining -= ck;
+			} else if (ft_node_collapsed(parent)) {
+				/* Walk collapsed entries in ascending suffix order. */
+				enum ft_compressed_action act;
+				int lv = depth;
+
+				act = ft_lookup_nth_collapsed(
+					&parent, &lv, ordinal_key,
+					iter, &remaining);
+				if (act == FT_COMPRESSED_CONTINUE ||
+				    act == FT_COMPRESSED_BREAK) {
+					level = lv + 1;
+					iter_path_node(iter)[level] = parent;
+					goto descend_forward;
+				}
 			} else {
 				struct cds_ft_inode_flag *child;
 				uint8_t child_key;
@@ -9152,9 +9213,10 @@ skip_fwd_walk_up:
 		if (ft_node_external(ancestor))
 			continue;
 		/*
-		 * Compressed path levels have no siblings: skip.
+		 * Compressed/collapsed path levels have no siblings: skip.
 		 */
-		if (ft_node_compressed(ancestor))
+		if (ft_node_compressed(ancestor) ||
+		    ft_node_collapsed(ancestor))
 			continue;
 
 		pivot = ordinal_key[level];
@@ -9244,6 +9306,16 @@ descend_forward:
 				act = ft_skip_forward_compressed(
 					&node_flag, &level,
 					ordinal_key, iter);
+				if (act == FT_COMPRESSED_BREAK)
+					break;
+				continue;
+			}
+			if (ft_node_collapsed(node_flag)) {
+				enum ft_compressed_action act;
+
+				act = ft_lookup_nth_collapsed(
+					&node_flag, &level,
+					ordinal_key, iter, &remaining);
 				if (act == FT_COMPRESSED_BREAK)
 					break;
 				continue;
@@ -9425,7 +9497,8 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		 * compressed node at adjacent levels).  At the entry
 		 * level, only external_nodes matter (no siblings).
 		 */
-		if (ft_node_compressed(ancestor)) {
+		if (ft_node_compressed(ancestor) ||
+		    ft_node_collapsed(ancestor)) {
 			if (level > 0 &&
 			    iter_path_node(iter)[level - 1] == ancestor)
 				continue;
@@ -9570,6 +9643,18 @@ descend_reverse:
 				act = ft_skip_reverse_compressed(
 					&node_flag, &level, &remaining,
 					ordinal_key, iter);
+				if (act == FT_COMPRESSED_BREAK)
+					break;
+				if (act == FT_COMPRESSED_END)
+					goto check_ext_descend_reverse;
+				continue;
+			}
+			if (ft_node_collapsed(node_flag)) {
+				enum ft_compressed_action act;
+
+				act = ft_lookup_nth_last_collapsed(
+					&node_flag, &level,
+					ordinal_key, iter, &remaining);
 				if (act == FT_COMPRESSED_BREAK)
 					break;
 				if (act == FT_COMPRESSED_END)
