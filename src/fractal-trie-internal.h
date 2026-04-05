@@ -50,7 +50,8 @@
 #define FT_INTERNAL_MASK	(1U << 0)
 #define FT_COMPRESSED_MASK	(1U << 1)
 #define FT_COLLAPSED_MASK	((1U << 2) | (1U << 1))	/* 0b110 */
-#define FT_TAG_MASK		(FT_COLLAPSED_MASK | FT_INTERNAL_MASK)	/* 0b111 */
+#define FT_TAG_MASK		(FT_COMPRESSED_MASK | FT_INTERNAL_MASK)	/* 0b011 — for compressed ptr unmasking */
+#define FT_TAG_MASK_WIDE	(FT_COLLAPSED_MASK | FT_INTERNAL_MASK)	/* 0b111 — for collapsed ptr unmasking and type checks */
 
 /*
  * This if followed by a number of bits reserved to represent the child
