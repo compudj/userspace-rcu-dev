@@ -3982,6 +3982,178 @@ out_break:
 	return FT_COMPRESSED_BREAK;
 }
 
+#ifdef FEATURE_FT_COLLAPSE
+/*
+ * Collapsed node handling for cds_ft_lookup_inequality (slow path).
+ *
+ * Scans all entries for the best match given the inequality mode:
+ *   exact match → fill path, CONTINUE into child
+ *   no exact, nearest in direction → fill path, DESCEND_CHILDREN
+ *   no match in direction → GOING_UP
+ */
+static
+enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
+		struct cds_ft_inode_flag **node_flag_p,
+		int *level_p, unsigned int key_depth,
+		enum ft_lookup_inequality mode,
+		enum ft_lookup_limit limit,
+		const uint8_t **iter_key_p,
+		const uint8_t *input_key,
+		struct cds_ft_iter *iter,
+		uint8_t *ordinal_key,
+		bool *skip_eq_external_nodes_p)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn);
+	int level = *level_p;
+	unsigned int remaining = key_depth - level;
+	unsigned int e;
+	int best_match = -1;	/* index of best directional match */
+
+	for (e = 0; e < cn->nr_entries; e++) {
+		unsigned int slen, j, cmp;
+		uint8_t *suffix;
+		int cmp_result = 0;	/* 0 = equal so far */
+
+		if (ft_collapsed_entry_dead(cn, e))
+			continue;
+		if (!ft_node_ptr(ptrs[e]))
+			continue;
+		slen = ft_collapsed_suffix_len(cn, e);
+		suffix = ft_collapsed_suffix(cn, e);
+		cmp = slen < remaining ? slen : remaining;
+
+		/* Compare suffix against lookup key. */
+		for (j = 0; j < cmp; j++) {
+			uint8_t ck;
+
+			switch (limit) {
+			case FT_LOOKUP_LIMIT_NONE:
+				ck = key_to_ordinal(ft, (*iter_key_p)[j]);
+				break;
+			case FT_LOOKUP_LIMIT_FIRST:
+				ck = key_to_ordinal(ft, input_key[level - 1 + j]);
+				break;
+			case FT_LOOKUP_LIMIT_LAST:
+				if ((size_t)(level + j) <= iter->prefix_len)
+					ck = key_to_ordinal(ft, input_key[level - 1 + j]);
+				else
+					ck = 0xff;
+				break;
+			default:
+				ck = 0;
+				assert(0);
+			}
+			if (ck < suffix[j]) {
+				cmp_result = -1;
+				break;
+			}
+			if (ck > suffix[j]) {
+				cmp_result = 1;
+				break;
+			}
+		}
+		if (cmp_result == 0) {
+			if (slen <= remaining) {
+				/* Full suffix match. Descend into child. */
+				unsigned int k;
+
+				for (k = 0; k < slen; k++) {
+					ordinal_key[level - 1 + k] = suffix[k];
+					iter_path_node(iter)[level + k] = node_flag;
+				}
+				level += slen - 1;
+				node_flag = ft_dereference_acquire(ptrs[e]);
+				if (!ft_node_ptr(node_flag)) {
+					*node_flag_p = node_flag;
+					*level_p = level;
+					return FT_COMPRESSED_BREAK;
+				}
+				iter_path_node(iter)[level + 1] = node_flag;
+				if (ft_node_external(node_flag)) {
+					*node_flag_p = node_flag;
+					*level_p = level;
+					return FT_COMPRESSED_BREAK;
+				}
+				*node_flag_p = node_flag;
+				*level_p = level;
+				return FT_COMPRESSED_CONTINUE;
+			}
+			/* Suffix longer than remaining key (key is shorter). */
+			if (mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT) {
+				cmp_result = -1; /* treat as key < suffix */
+			} else {
+				cmp_result = 1; /* treat as key > suffix */
+			}
+		}
+
+		/*
+		 * Track best directional match:
+		 * GE/GT: want smallest suffix > key → cmp_result < 0 (key < suffix)
+		 * LE/LT: want largest suffix < key → cmp_result > 0 (key > suffix)
+		 */
+		if ((mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT) && cmp_result < 0) {
+			if (best_match < 0)
+				best_match = (int)e;
+			else {
+				/* Keep the smallest. */
+				uint8_t *bs = ft_collapsed_suffix(cn, (unsigned)best_match);
+				unsigned int bl = ft_collapsed_suffix_len(cn, (unsigned)best_match);
+				unsigned int mc = bl < slen ? bl : slen;
+				int r = memcmp(suffix, bs, mc);
+
+				if (r < 0 || (r == 0 && slen < bl))
+					best_match = (int)e;
+			}
+		} else if ((mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) && cmp_result > 0) {
+			if (best_match < 0)
+				best_match = (int)e;
+			else {
+				/* Keep the largest. */
+				uint8_t *bs = ft_collapsed_suffix(cn, (unsigned)best_match);
+				unsigned int bl = ft_collapsed_suffix_len(cn, (unsigned)best_match);
+				unsigned int mc = bl < slen ? bl : slen;
+				int r = memcmp(suffix, bs, mc);
+
+				if (r > 0 || (r == 0 && slen > bl))
+					best_match = (int)e;
+			}
+		}
+	}
+
+	if (best_match >= 0) {
+		/* Descend into the best directional match. */
+		unsigned int slen = ft_collapsed_suffix_len(cn, (unsigned)best_match);
+		uint8_t *suffix = ft_collapsed_suffix(cn, (unsigned)best_match);
+		unsigned int k;
+
+		for (k = 0; k < slen; k++) {
+			ordinal_key[level - 1 + k] = suffix[k];
+			iter_path_node(iter)[level + k] = node_flag;
+		}
+		level += slen - 1;
+		node_flag = ft_dereference_acquire(ptrs[best_match]);
+		if (!ft_node_ptr(node_flag)) {
+			*node_flag_p = node_flag;
+			*level_p = level;
+			return FT_COMPRESSED_BREAK;
+		}
+		iter_path_node(iter)[level + 1] = node_flag;
+		*skip_eq_external_nodes_p = false;
+		*node_flag_p = node_flag;
+		*level_p = level;
+		iter_debug_path_snapshot(iter);
+		return FT_COMPRESSED_DESCEND_CHILDREN;
+	}
+
+	/* No match in the requested direction. */
+	*level_p = level - 1;
+	iter_debug_path_snapshot(iter);
+	return FT_COMPRESSED_GOING_UP;
+}
+#endif /* FEATURE_FT_COLLAPSE */
+
 enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
@@ -4111,7 +4283,8 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		 * state (compressed nodes span multiple levels).
 		 * Fall back to the slow path.
 		 */
-		if (ft_node_compressed(node_flag)) {
+		if (ft_node_compressed(node_flag) ||
+		    ft_node_collapsed(node_flag)) {
 			node_flag = rcu_dereference(ft->root);
 			iter_key = input_key;
 			goto slow_path;
@@ -4139,6 +4312,21 @@ slow_path:
 			enum ft_compressed_action act;
 
 			act = ft_inequality_compressed(ft, &node_flag,
+				&level, key_depth, mode, limit,
+				&iter_key, input_key, iter,
+				ordinal_key, &skip_eq_external_nodes);
+			if (act == FT_COMPRESSED_GOING_UP)
+				goto going_up;
+			if (act == FT_COMPRESSED_DESCEND_CHILDREN)
+				goto descend_children;
+			if (act == FT_COMPRESSED_BREAK)
+				break;
+			continue;
+		}
+		if (ft_node_collapsed(node_flag)) {
+			enum ft_compressed_action act;
+
+			act = ft_inequality_collapsed(ft, &node_flag,
 				&level, key_depth, mode, limit,
 				&iter_key, input_key, iter,
 				ordinal_key, &skip_eq_external_nodes);
@@ -4295,7 +4483,8 @@ going_up:
 		    !ft_node_external(iter_path_node(iter)[level])) {
 			struct cds_ft_metadata *metadata;
 
-			if (ft_node_compressed(iter_path_node(iter)[level]))
+			if (ft_node_compressed(iter_path_node(iter)[level]) ||
+			    ft_node_collapsed(iter_path_node(iter)[level]))
 				metadata = cds_ft_item_to_metadata(
 					ft_node_ptr(iter_path_node(iter)[level]));
 			else {
@@ -4539,6 +4728,84 @@ descend_children:
 			if (ft_node_external(node_flag))
 				break;
 			/* Continue descent from the child. */
+			continue;
+		}
+		if (ft_node_collapsed(node_flag)) {
+			struct cds_ft_collapsed_node *col =
+				ft_collapsed_node_ptr(node_flag);
+			struct cds_ft_inode_flag **cptrs =
+				ft_collapsed_ptrs(col);
+			unsigned int best = UINT_MAX, e;
+
+			/*
+			 * Check external_nodes at the collapsed
+			 * node's depth (for LEFTMOST/GE/GT).
+			 */
+			if (dir == FT_LEFTMOST) {
+				struct cds_ft_metadata *col_meta =
+					cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) col);
+				struct cds_ft_node *ext =
+					rcu_dereference(
+						col_meta->external_nodes);
+
+				if (ext && !skip_eq_external_nodes) {
+					ret_node = ext;
+					level--;
+					goto found_minmax;
+				}
+			}
+			/*
+			 * Find the min/max entry by suffix and
+			 * descend into it.
+			 */
+			for (e = 0; e < col->nr_entries; e++) {
+				if (ft_collapsed_entry_dead(col, e))
+					continue;
+				if (!ft_node_ptr(cptrs[e]))
+					continue;
+				if (best == UINT_MAX) {
+					best = e;
+					continue;
+				}
+				{
+					uint8_t *sa = ft_collapsed_suffix(col, best);
+					unsigned int la = ft_collapsed_suffix_len(col, best);
+					uint8_t *sb = ft_collapsed_suffix(col, e);
+					unsigned int lb = ft_collapsed_suffix_len(col, e);
+					unsigned int mc = la < lb ? la : lb;
+					int r = memcmp(sb, sa, mc);
+
+					if (dir == FT_LEFTMOST) {
+						if (r < 0 || (r == 0 && lb < la))
+							best = e;
+					} else {
+						if (r > 0 || (r == 0 && lb > la))
+							best = e;
+					}
+				}
+			}
+			if (best == UINT_MAX)
+				break;
+			{
+				unsigned int slen = ft_collapsed_suffix_len(col, best);
+				uint8_t *suffix = ft_collapsed_suffix(col, best);
+				unsigned int k;
+
+				for (k = 0; k < slen; k++) {
+					ordinal_key[level - 1 + k] = suffix[k];
+					iter_path_node(iter)[level + k] =
+						ft_collapsed_node_flag(col);
+				}
+				level += slen - 1;
+				node_flag = ft_dereference_acquire(cptrs[best]);
+				if (!ft_node_ptr(node_flag))
+					break;
+				iter_path_node(iter)[level] = node_flag;
+				if (ft_node_external(node_flag))
+					break;
+			}
+			skip_eq_external_nodes = false;
 			continue;
 		}
 		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir, level == 1);
