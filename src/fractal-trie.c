@@ -1291,6 +1291,17 @@ unsigned int ft_collapsed_max_entries(unsigned int order)
 #define __FT_FLOOR_MASK(v, mask)	((v) & ~(mask))
 #define FT_FLOOR(v, align)		__FT_FLOOR_MASK(v, (typeof(v)) (align) - 1)
 
+/*
+ * Push a node and its depth onto the snapshot stack.
+ * Used to maintain the parallel snapshot_depth[] array alongside
+ * snapshot[] for local node density propagation.
+ */
+#define ft_snapshot_push(snap, snap_depth, nr, node_flag, depth)	\
+	do {								\
+		(snap_depth)[(nr)] = (depth);				\
+		(snap)[(nr)++] = (node_flag);				\
+	} while (0)
+
 static inline_lookup
 uint8_t *align_ptr_size(uint8_t *ptr)
 {
@@ -5121,6 +5132,56 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 }
 
 /*
+ * ft_propagate_node_density: update the local node density counters
+ * in ancestors when a traversable node (internal, compressed, or
+ * collapsed) is created or destroyed at the given depth.
+ *
+ * @snapshot: array of flagged node pointers from shallowest (root,
+ *            index 0) to deepest (index nr_snapshot-1).
+ * @snapshot_depth: parallel array of actual trie depths for each
+ *                  snapshot entry.
+ * @nr_snapshot: number of entries in the snapshot.
+ * @node_depth: depth of the created/destroyed node (0 = root).
+ * @delta: +1 for creation, -1 for destruction.
+ *
+ * Updates counter[0] (cumulative sum) at all ancestors within the
+ * 6-level window, and counter[j] (per-level) at the appropriate
+ * ancestor.  Cost: at most 11 writes (6 ancestors, each updating
+ * counter[0], plus 5 of them also updating counter[j]).
+ *
+ * Only called from the write-side (mutex-held).
+ */
+static
+void ft_propagate_node_density(struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int nr_snapshot, unsigned int node_depth, long delta)
+{
+	int i;
+
+	for (i = nr_snapshot - 1; i >= 0; i--) {
+		struct cds_ft_metadata *m;
+		unsigned int distance;
+
+		if (!ft_node_ptr(snapshot[i]))
+			continue;
+		if (snapshot_depth[i] >= node_depth)
+			continue;
+		distance = node_depth - snapshot_depth[i];
+		if (distance > FT_NODE_DENSITY_DEPTH)
+			break;	/* Further ancestors are too far away. */
+
+		m = cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
+
+		/* Always update the cumulative sum (counter[0]). */
+		m->nr_nodes_at_depth[0] += delta;
+
+		/* Update the per-level counter if distance > 1. */
+		if (distance >= 2)
+			m->nr_nodes_at_depth[distance - 1] += delta;
+	}
+}
+
+/*
  * Split a compressed node during insert when the new key diverges
  * from the compressed path at position @diverge_pos.
  *
@@ -6058,6 +6119,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	const uint8_t *iter_key = key;
 	size_t key_len = ft_key_len(ft, _key_len);
 	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
+	unsigned int snapshot_depth[FT_MAX_DEPTH];
 	int nr_snapshot = 0;
 	int ret;
 

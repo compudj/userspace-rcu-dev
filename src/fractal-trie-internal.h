@@ -159,6 +159,27 @@ struct cds_ft_metadata {
 						 * during concurrent mutations (see
 						 * ft_propagate_external_count).
 						 */
+
+	/*
+	 * Local node density counters: count of traversable nodes
+	 * (internal + compressed + collapsed) within a bounded window
+	 * of 6 levels below this node.  External nodes are excluded
+	 * (already tracked by nr_keys).
+	 *
+	 * nr_nodes_at_depth[0] = total traversable nodes at levels
+	 *                        +1 through +6 (cumulative sum).
+	 *                        This is the pre-filter value for
+	 *                        collapse decisions.
+	 * nr_nodes_at_depth[j] = nodes at level +(j+1), for j = 1..5.
+	 *
+	 * Level +1 count = [0] - [1] - [2] - [3] - [4] - [5].
+	 *
+	 * Updated by ft_propagate_node_density() on every traversable
+	 * node creation/destruction.  Bounded propagation: only 6
+	 * ancestors are updated, cost O(6) per mutation.
+	 */
+#define FT_NODE_DENSITY_DEPTH	6
+	unsigned long nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
 };
 
 /*
