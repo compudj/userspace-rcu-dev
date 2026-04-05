@@ -5489,6 +5489,8 @@ int ft_split_compressed_to_collapsed(struct cds_ft *ft,
 	if (total_scan > FT_COLLAPSED_SCAN_ZONE_SIZE)
 		return 1;	/* Fall back to split. */
 
+	dbg_printf("COLLAPSED: diverge=%u old_slen=%u new_slen=%u\n",
+		diverge_pos, old_suffix_len, new_suffix_len);
 	col = alloc_collapsed_node(ft, FT_COLLAPSED_ORDER_LARGE, &col_meta);
 	if (!col)
 		return -ENOMEM;
@@ -6151,7 +6153,7 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 		 *    a collapsed suffix — requiring a split that's not
 		 *    yet implemented.
 		 */
-		if (0 && min_slen >= 3 &&
+		if (min_slen >= 3 &&
 		    ft->group->key_len != CDS_FT_LEN_VARIABLE) {
 			dret = ft_split_compressed_to_collapsed(ft,
 				d->nfp, d->nf, *iter_key_p, remaining,
@@ -6313,68 +6315,90 @@ int _cds_ft_insert(struct cds_ft *ft,
 			unsigned int remaining = key_depth - 1 - d.depth;
 			unsigned int e;
 			bool found_entry = false;
+			int prefix_match_entry = -1;
+			unsigned int prefix_match_len = 0;
 
 			for (e = 0; e < col->nr_entries; e++) {
 				unsigned int slen, j;
 				uint8_t *suffix;
-				bool match;
 
 				if (ft_collapsed_entry_dead(col, e))
 					continue;
 				slen = ft_collapsed_suffix_len(col, e);
-				if (slen > remaining)
-					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = true;
-				for (j = 0; j < slen; j++) {
-					if (key_to_ordinal(ft, iter_key[j]) != suffix[j]) {
-						match = false;
-						break;
-					}
-				}
-				if (!match)
-					continue;
 
-				/* Match: traverse through. */
-				ft_snapshot_push(snapshot, snapshot_depth,
-				nr_snapshot, d.nf, d.depth);
-				d.ppnf  = d.pnf;
-				d.ppnfp = d.pnfp;
-				d.pnf   = d.nf;
-				d.pnfp  = d.nfp;
-				d.nf    = ft_dereference_acquire(cptrs[e]);
-				d.nfp   = &cptrs[e];
-				d.depth += slen;
-				iter_key += slen;
-				found_entry = true;
-				break;
+				/* Check for prefix match. */
+				for (j = 0; j < slen && j < remaining; j++) {
+					if (key_to_ordinal(ft, iter_key[j]) != suffix[j])
+						break;
+				}
+				if (j == 0)
+					continue; /* No prefix overlap. */
+
+				if (j == slen && slen <= remaining) {
+					/* Full suffix match: traverse through. */
+					ft_snapshot_push(snapshot, snapshot_depth,
+						nr_snapshot, d.nf, d.depth);
+					d.ppnf  = d.pnf;
+					d.ppnfp = d.pnfp;
+					d.pnf   = d.nf;
+					d.pnfp  = d.nfp;
+					d.nf    = ft_dereference_acquire(cptrs[e]);
+					d.nfp   = &cptrs[e];
+					d.depth += slen;
+					iter_key += slen;
+					found_entry = true;
+					break;
+				}
+				/*
+				 * Partial prefix match: the new key shares
+				 * j bytes with this entry's suffix but diverges
+				 * after that.  Record the best (longest) prefix
+				 * match for possible entry splitting.
+				 */
+				if (j > prefix_match_len) {
+					prefix_match_entry = (int) e;
+					prefix_match_len = j;
+				}
 			}
 			if (found_entry)
 				continue;
 			/*
-			 * No matching entry.  Add new entry in-place
-			 * to the collapsed node if space is available.
+			 * Partial prefix match: explode the collapsed node
+			 * to avoid creating conflicting entries.
+			 * Fall through to the explode-or-break path which
+			 * converts to an internal node, then the normal
+			 * insert logic handles the remaining key.
+			 */
+			if (prefix_match_entry >= 0)
+				goto collapsed_explode;
+			/*
+			 * No matching entry.  Check for space.
 			 */
 			{
 				unsigned int new_slen = remaining;
-				unsigned int header_end = 1 + col->nr_entries + 1; /* +1 for new offset */
+				unsigned int header_end = 1 + col->nr_entries + 1;
 				unsigned int cur_suffix_start;
 				uint8_t *new_suffix_pos;
 				struct cds_ft_inode_flag *branch;
 				unsigned int k;
 
-				/* Compute where existing suffixes start. */
 				if (col->nr_entries > 0)
 					cur_suffix_start = col->data[col->nr_entries - 1] & FT_COLLAPSED_OFFSET_MASK;
 				else
 					cur_suffix_start = FT_COLLAPSED_SCAN_ZONE_SIZE;
 
-				/* Check scan zone and pointer zone space. */
 				if (header_end + new_slen > cur_suffix_start ||
-				    col->nr_entries >= ft_collapsed_max_entries(FT_COLLAPSED_ORDER_LARGE)) {
+				    col->nr_entries >= ft_collapsed_max_entries(FT_COLLAPSED_ORDER_LARGE))
+					goto collapsed_explode;
+				goto collapsed_inplace_add;
+
+			collapsed_explode:
+				if (1) {
 					/*
-					 * Collapsed node full: explode into an
-					 * internal node.  Create a fresh internal
+					 * Collapsed node full or has prefix
+					 * conflict: explode into an internal
+					 * node.  Create a fresh internal
 					 * node, populate it with all entries from
 					 * the collapsed node, then continue with
 					 * the normal insert path.
@@ -6452,6 +6476,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 					continue;
 				}
 
+			collapsed_inplace_add:
 				/*
 				 * Build child for the new entry.  The suffix
 				 * covers key bytes from d.depth to key_len.
