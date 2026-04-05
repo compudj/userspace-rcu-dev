@@ -3411,6 +3411,67 @@ enum ft_compressed_action ft_traverse_compressed(struct cds_ft *ft,
 	return FT_COMPRESSED_CONTINUE;
 }
 
+#ifdef FEATURE_FT_COLLAPSE
+/*
+ * Simple collapsed node traversal for read-side descent loops
+ * (replace, count_keys_prefix).  Scans entries for a suffix that
+ * matches the remaining key, advances key/index/node_flag, and
+ * returns the loop action.
+ */
+static
+enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
+		struct cds_ft_inode_flag **node_flag_p,
+		struct cds_ft_inode_flag ***node_flag_ptr_p,
+		const uint8_t **key_p, unsigned int *i_p,
+		unsigned int key_depth, bool *not_found)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn);
+	const uint8_t *key = *key_p;
+	unsigned int i = *i_p;
+	unsigned int remaining = key_depth - i;
+	unsigned int e;
+
+	for (e = 0; e < cn->nr_entries; e++) {
+		unsigned int slen, j;
+		uint8_t *suffix;
+		bool match;
+
+		if (ft_collapsed_entry_dead(cn, e))
+			continue;
+		slen = ft_collapsed_suffix_len(cn, e);
+		if (slen > remaining)
+			continue;
+		suffix = ft_collapsed_suffix(cn, e);
+		match = true;
+		for (j = 0; j < slen; j++) {
+			if (key_to_ordinal(ft, key[j]) != suffix[j]) {
+				match = false;
+				break;
+			}
+		}
+		if (!match)
+			continue;
+
+		*key_p = key + slen;
+		*i_p = i + slen - 1;
+		*node_flag_p = ft_dereference_acquire(ptrs[e]);
+		if (node_flag_ptr_p)
+			*node_flag_ptr_p = &ptrs[e];
+		if (!ft_node_ptr(ptrs[e])) {
+			*not_found = true;
+			return FT_COMPRESSED_END;
+		}
+		if (ft_node_external(ptrs[e]))
+			return FT_COMPRESSED_BREAK;
+		return FT_COMPRESSED_CONTINUE;
+	}
+	*not_found = true;
+	return FT_COMPRESSED_END;
+}
+#endif /* FEATURE_FT_COLLAPSE */
+
 static
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
@@ -6018,6 +6079,19 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 				break;
 			continue;
 		}
+		if (ft_node_collapsed(node_flag)) {
+			bool nf = false;
+			enum ft_compressed_action act;
+
+			act = ft_traverse_collapsed(ft, &node_flag,
+				&node_flag_ptr, &iter_key, &i,
+				key_depth, &nf);
+			if (nf)
+				return CDS_FT_STATUS_NOT_FOUND;
+			if (act == FT_COMPRESSED_BREAK)
+				break;
+			continue;
+		}
 		key_value = key_to_ordinal(ft, *(iter_key++));
 		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
 		if (!ft_node_ptr(node_flag))
@@ -7866,6 +7940,80 @@ enum ft_compressed_action ft_count_prefix_compressed(struct cds_ft *ft,
 	return FT_COMPRESSED_CONTINUE;
 }
 
+#ifdef FEATURE_FT_COLLAPSE
+/*
+ * Collapsed node handling for cds_ft_count_keys_prefix.
+ * Scan entries for a suffix that matches the remaining prefix bytes.
+ * If prefix ends within a collapsed suffix span, return the child's nr_keys.
+ * If no match, return 0.
+ */
+static
+enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft *ft,
+		struct cds_ft_inode_flag **node_flag_p,
+		unsigned int *i_p, const uint8_t *prefix,
+		size_t prefix_len, unsigned long *count_ret)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	unsigned int i = *i_p;
+	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn);
+	unsigned int remaining = prefix_len - i;
+	unsigned int e;
+
+	for (e = 0; e < cn->nr_entries; e++) {
+		unsigned int slen, j;
+		uint8_t *suffix;
+		bool match;
+
+		if (ft_collapsed_entry_dead(cn, e))
+			continue;
+		slen = ft_collapsed_suffix_len(cn, e);
+
+		if (slen >= remaining) {
+			/* Suffix covers the rest of the prefix — compare. */
+			suffix = ft_collapsed_suffix(cn, e);
+			match = true;
+			for (j = 0; j < remaining; j++) {
+				if (key_to_ordinal(ft, prefix[i + j]) != suffix[j]) {
+					match = false;
+					break;
+				}
+			}
+			if (!match)
+				continue;
+			/* Prefix ends within or at this entry's span. */
+			if (!ft_node_external(ptrs[e])) {
+				struct cds_ft_metadata *m =
+					cds_ft_item_to_metadata(ft_node_ptr(ptrs[e]));
+				*count_ret = uatomic_load(&m->nr_keys, CMM_ACQUIRE);
+			} else if (ft_node_ptr(ptrs[e])) {
+				*count_ret = 1;
+			} else {
+				*count_ret = 0;
+			}
+			return FT_COMPRESSED_END;
+		}
+		/* Suffix is shorter than remaining prefix — check prefix. */
+		suffix = ft_collapsed_suffix(cn, e);
+		match = true;
+		for (j = 0; j < slen; j++) {
+			if (key_to_ordinal(ft, prefix[i + j]) != suffix[j]) {
+				match = false;
+				break;
+			}
+		}
+		if (!match)
+			continue;
+		/* Full suffix match, continue descent into child. */
+		*i_p = i + slen - 1;
+		*node_flag_p = ft_dereference_acquire(ptrs[e]);
+		return FT_COMPRESSED_CONTINUE;
+	}
+	*count_ret = 0;
+	return FT_COMPRESSED_END;
+}
+#endif /* FEATURE_FT_COLLAPSE */
+
 unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 		const uint8_t *prefix, size_t prefix_len)
 {
@@ -7895,6 +8043,17 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 				return count;
 			continue;
 		}
+		if (ft_node_collapsed(node_flag)) {
+			enum ft_compressed_action act;
+			unsigned long count;
+
+			act = ft_count_prefix_collapsed(ft,
+				&node_flag, &i, prefix,
+				prefix_len, &count);
+			if (act == FT_COMPRESSED_END)
+				return count;
+			continue;
+		}
 		kv = key_to_ordinal(ft, prefix[i]);
 		node_flag = ft_node_get_nth(node_flag, NULL, kv);
 	}
@@ -7910,6 +8069,11 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		return uatomic_load(&cn_meta->nr_keys, CMM_ACQUIRE);
+	}
+	if (ft_node_collapsed(node_flag)) {
+		struct cds_ft_metadata *col_meta =
+			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		return uatomic_load(&col_meta->nr_keys, CMM_ACQUIRE);
 	}
 	/* External node: one key (possibly with duplicates). */
 	return 1;
@@ -7973,6 +8137,102 @@ enum ft_compressed_action ft_lookup_nth_compressed(
 	*level_p = level;
 	return FT_COMPRESSED_CONTINUE;
 }
+
+#ifdef FEATURE_FT_COLLAPSE
+/*
+ * Collapsed node handling for cds_ft_lookup_nth.
+ *
+ * Scans collapsed entries in ascending suffix order, accumulating
+ * key counts.  When the target nth key falls within an entry's
+ * subtree, fills ordinal_key and iter_path for the suffix, advances
+ * node_flag to the entry's child, and returns CONTINUE.
+ *
+ * Returns BREAK if the target overflows all entries (shouldn't
+ * happen in a consistent trie).
+ */
+static
+enum ft_compressed_action ft_lookup_nth_collapsed(
+		struct cds_ft_inode_flag **node_flag_p,
+		int *level_p, uint8_t *ordinal_key,
+		struct cds_ft_iter *iter,
+		unsigned long *remaining_p)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	int level = *level_p;
+	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn);
+	unsigned int nr = cn->nr_entries;
+	bool visited[FT_COLLAPSED_MAX_ENTRIES_LARGE];
+	unsigned int i, best, steps;
+
+	memset(visited, 0, nr * sizeof(visited[0]));
+
+	/*
+	 * Walk entries in ascending suffix order (selection sort style).
+	 * N is small (≤ 24), all in 1 cache line.
+	 */
+	for (steps = 0; steps < nr; steps++) {
+		unsigned long child_keys;
+		unsigned int slen;
+		uint8_t *suffix;
+
+		/* Find the smallest unvisited live entry. */
+		best = UINT_MAX;
+		for (i = 0; i < nr; i++) {
+			if (visited[i] || ft_collapsed_entry_dead(cn, i))
+				continue;
+			if (best == UINT_MAX) {
+				best = i;
+				continue;
+			}
+			/* Compare suffixes lexicographically. */
+			{
+				uint8_t *sa = ft_collapsed_suffix(cn, best);
+				unsigned int la = ft_collapsed_suffix_len(cn, best);
+				uint8_t *sb = ft_collapsed_suffix(cn, i);
+				unsigned int lb = ft_collapsed_suffix_len(cn, i);
+				unsigned int cmp = la < lb ? la : lb;
+				int r = memcmp(sb, sa, cmp);
+
+				if (r < 0 || (r == 0 && lb < la))
+					best = i;
+			}
+		}
+		if (best == UINT_MAX)
+			break;
+		visited[best] = true;
+
+		if (!ft_node_ptr(ptrs[best]))
+			continue;
+		child_keys = ft_child_key_count(ptrs[best]);
+		if (*remaining_p < child_keys) {
+			/* Target is in this entry's subtree. */
+			slen = ft_collapsed_suffix_len(cn, best);
+			suffix = ft_collapsed_suffix(cn, best);
+			{
+				unsigned int k;
+
+				for (k = 0; k < slen; k++) {
+					ordinal_key[level - 1 + k] = suffix[k];
+					iter_path_node(iter)[level + k] =
+						ft_collapsed_node_flag(cn);
+				}
+			}
+			level += slen - 1;
+			node_flag = ft_dereference_acquire(ptrs[best]);
+			if (ft_node_ptr(node_flag))
+				iter_path_node(iter)[level + 1] = node_flag;
+			*node_flag_p = node_flag;
+			*level_p = level;
+			if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
+				return FT_COMPRESSED_BREAK;
+			return FT_COMPRESSED_CONTINUE;
+		}
+		*remaining_p -= child_keys;
+	}
+	return FT_COMPRESSED_BREAK;
+}
+#endif /* FEATURE_FT_COLLAPSE */
 
 /*
  * Lookup the nth key (0-indexed) in forward (smallest-first) order.
@@ -8046,6 +8306,16 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 
 			act = ft_lookup_nth_compressed(&node_flag,
 				&level, ordinal_key, iter);
+			if (act == FT_COMPRESSED_BREAK)
+				break;
+			continue;
+		}
+		if (ft_node_collapsed(node_flag)) {
+			enum ft_compressed_action act;
+
+			act = ft_lookup_nth_collapsed(&node_flag,
+				&level, ordinal_key, iter,
+				&remaining);
 			if (act == FT_COMPRESSED_BREAK)
 				break;
 			continue;
@@ -8159,6 +8429,91 @@ enum ft_compressed_action ft_lookup_nth_last_compressed(
 	return FT_COMPRESSED_END;
 }
 
+#ifdef FEATURE_FT_COLLAPSE
+/*
+ * Collapsed node handling for cds_ft_lookup_nth_last.
+ * Same as ft_lookup_nth_collapsed but walks entries in descending
+ * suffix order.  Returns END if all entries exhausted (caller
+ * should check external_nodes).
+ */
+static
+enum ft_compressed_action ft_lookup_nth_last_collapsed(
+		struct cds_ft_inode_flag **node_flag_p,
+		int *level_p, uint8_t *ordinal_key,
+		struct cds_ft_iter *iter,
+		unsigned long *remaining_p)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	int level = *level_p;
+	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn);
+	unsigned int nr = cn->nr_entries;
+	bool visited[FT_COLLAPSED_MAX_ENTRIES_LARGE];
+	unsigned int i, best, steps;
+
+	memset(visited, 0, nr * sizeof(visited[0]));
+
+	for (steps = 0; steps < nr; steps++) {
+		unsigned long child_keys;
+		unsigned int slen;
+		uint8_t *suffix;
+
+		/* Find the largest unvisited live entry. */
+		best = UINT_MAX;
+		for (i = 0; i < nr; i++) {
+			if (visited[i] || ft_collapsed_entry_dead(cn, i))
+				continue;
+			if (best == UINT_MAX) {
+				best = i;
+				continue;
+			}
+			{
+				uint8_t *sa = ft_collapsed_suffix(cn, best);
+				unsigned int la = ft_collapsed_suffix_len(cn, best);
+				uint8_t *sb = ft_collapsed_suffix(cn, i);
+				unsigned int lb = ft_collapsed_suffix_len(cn, i);
+				unsigned int cmp = la < lb ? la : lb;
+				int r = memcmp(sb, sa, cmp);
+
+				if (r > 0 || (r == 0 && lb > la))
+					best = i;
+			}
+		}
+		if (best == UINT_MAX)
+			break;
+		visited[best] = true;
+
+		if (!ft_node_ptr(ptrs[best]))
+			continue;
+		child_keys = ft_child_key_count(ptrs[best]);
+		if (*remaining_p < child_keys) {
+			slen = ft_collapsed_suffix_len(cn, best);
+			suffix = ft_collapsed_suffix(cn, best);
+			{
+				unsigned int k;
+
+				for (k = 0; k < slen; k++) {
+					ordinal_key[level - 1 + k] = suffix[k];
+					iter_path_node(iter)[level + k] =
+						ft_collapsed_node_flag(cn);
+				}
+			}
+			level += slen - 1;
+			node_flag = ft_dereference_acquire(ptrs[best]);
+			if (ft_node_ptr(node_flag))
+				iter_path_node(iter)[level + 1] = node_flag;
+			*node_flag_p = node_flag;
+			*level_p = level;
+			if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
+				return FT_COMPRESSED_BREAK;
+			return FT_COMPRESSED_CONTINUE;
+		}
+		*remaining_p -= child_keys;
+	}
+	return FT_COMPRESSED_END;
+}
+#endif /* FEATURE_FT_COLLAPSE */
+
 /*
  * Lookup the nth key (0-indexed) in reverse (largest-first) order.
  *
@@ -8202,6 +8557,19 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 			act = ft_lookup_nth_last_compressed(
 				&node_flag, &level, &remaining,
 				ordinal_key, iter);
+			if (act == FT_COMPRESSED_BREAK)
+				break;
+			if (act == FT_COMPRESSED_END)
+				goto check_ext_nth_last;
+			continue;
+		}
+		if (ft_node_collapsed(node_flag)) {
+			enum ft_compressed_action act;
+
+			/* Reuse nth helper in reverse: walk entries largest-first. */
+			act = ft_lookup_nth_last_collapsed(
+				&node_flag, &level, ordinal_key,
+				iter, &remaining);
 			if (act == FT_COMPRESSED_BREAK)
 				break;
 			if (act == FT_COMPRESSED_END)
