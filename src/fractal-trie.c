@@ -5988,23 +5988,11 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 			return FT_COMPRESSED_END;
 		}
 	}
-	/* Key diverges: split (try collapsed first if enabled). */
+	/* Key diverges: split. */
 	if (j < cmp) {
-		int dret;
-
-#ifdef FEATURE_FT_COLLAPSE
-		dret = ft_split_compressed_to_collapsed(ft,
+		int dret = ft_split_compressed_insert(ft,
 			d->nfp, d->nf, *iter_key_p, remaining,
 			j, node);
-		if (dret == 1)
-			dret = ft_split_compressed_insert(ft,
-				d->nfp, d->nf, *iter_key_p, remaining,
-				j, node);
-#else
-		dret = ft_split_compressed_insert(ft,
-			d->nfp, d->nf, *iter_key_p, remaining,
-			j, node);
-#endif
 		if (dret) {
 			*ret_p = dret;
 			return FT_COMPRESSED_END;
