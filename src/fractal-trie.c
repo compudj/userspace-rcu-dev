@@ -6135,9 +6135,37 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 			return FT_COMPRESSED_END;
 		}
 	}
-	/* Key diverges: split. */
+	/* Key diverges: split (try collapsed if suffixes are long enough). */
 	if (j < cmp) {
-		int dret = ft_split_compressed_insert(ft,
+		int dret;
+		unsigned int old_slen = cn->len - j;
+		unsigned int new_slen = remaining - j;
+		unsigned int min_slen = old_slen < new_slen ? old_slen : new_slen;
+
+#ifdef FEATURE_FT_COLLAPSE
+		/*
+		 * Only create collapsed when:
+		 * 1. Both suffixes are >= 3 bytes (saves enough levels).
+		 * 2. Fixed-length keys only. Variable-length keys allow
+		 *    detach/graft at any prefix, which may fall within
+		 *    a collapsed suffix — requiring a split that's not
+		 *    yet implemented.
+		 */
+		if (0 && min_slen >= 3 &&
+		    ft->group->key_len != CDS_FT_LEN_VARIABLE) {
+			dret = ft_split_compressed_to_collapsed(ft,
+				d->nfp, d->nf, *iter_key_p, remaining,
+				j, node);
+			if (dret == 0)
+				goto split_done;
+			/* dret == 1: didn't fit scan zone. dret < 0: alloc fail. */
+			if (dret < 0 && dret != 1) {
+				*ret_p = dret;
+				return FT_COMPRESSED_END;
+			}
+		}
+#endif
+		dret = ft_split_compressed_insert(ft,
 			d->nfp, d->nf, *iter_key_p, remaining,
 			j, node, d->depth,
 			snapshot, snapshot_depth, *nr_snapshot_p);
@@ -6145,6 +6173,9 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 			*ret_p = dret;
 			return FT_COMPRESSED_END;
 		}
+#ifdef FEATURE_FT_COLLAPSE
+	split_done:
+#endif
 		ft_propagate_external_count(snapshot,
 			*nr_snapshot_p, 1);
 		*ret_p = 0;
