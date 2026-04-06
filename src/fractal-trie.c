@@ -11432,8 +11432,14 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			print_indent(out, level);
-			fprintf(out, "Level %d, key value: %u, internal node: %p, nr_children: %u\n",
-				level, key, child_node_flag, metadata->nr_child);
+			fprintf(out, "Level %d, key value: %u, internal node: %p, nr_children: %u, density: [%lu %lu %lu %lu %lu %lu]\n",
+				level, key, child_node_flag, metadata->nr_child,
+				metadata->nr_nodes_at_depth[0],
+				metadata->nr_nodes_at_depth[1],
+				metadata->nr_nodes_at_depth[2],
+				metadata->nr_nodes_at_depth[3],
+				metadata->nr_nodes_at_depth[4],
+				metadata->nr_nodes_at_depth[5]);
 			if (external_nodes) {
 				print_indent(out, level);
 				fprintf(out, "Level %d, key value: %u, (meta)external node list ptr: %p\n",
@@ -11448,9 +11454,15 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			print_indent(out, level);
-			fprintf(out, "Level %d, key value: %u, compressed node: %p, path_len: %u, nr_keys: %lu\n",
+			fprintf(out, "Level %d, key value: %u, compressed node: %p, path_len: %u, nr_keys: %lu, density: [%lu %lu %lu %lu %lu %lu]\n",
 				level, key, child_node_flag, (unsigned int) cn->len,
-				uatomic_load(&metadata->nr_keys, CMM_RELAXED));
+				uatomic_load(&metadata->nr_keys, CMM_RELAXED),
+				metadata->nr_nodes_at_depth[0],
+				metadata->nr_nodes_at_depth[1],
+				metadata->nr_nodes_at_depth[2],
+				metadata->nr_nodes_at_depth[3],
+				metadata->nr_nodes_at_depth[4],
+				metadata->nr_nodes_at_depth[5]);
 			if (external_nodes) {
 				print_indent(out, level);
 				fprintf(out, "Level %d, key value: %u, (meta)external node list ptr: %p\n",
@@ -11483,8 +11495,19 @@ void cds_ft_show(const struct cds_ft *ft, FILE *out)
 	node_flag = rcu_dereference(ft->root);
 
 	/* Root is always present and always internal. */
-	print_indent(out, level);
-	fprintf(out, "Level 0: root node %p\n", node_flag);
+	{
+		struct cds_ft_metadata *rm = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+
+		print_indent(out, level);
+		fprintf(out, "Level 0: root node %p, density: [%lu %lu %lu %lu %lu %lu]\n",
+			node_flag,
+			rm->nr_nodes_at_depth[0],
+			rm->nr_nodes_at_depth[1],
+			rm->nr_nodes_at_depth[2],
+			rm->nr_nodes_at_depth[3],
+			rm->nr_nodes_at_depth[4],
+			rm->nr_nodes_at_depth[5]);
+	}
 	show_node_recursive(ft, out, node_flag, level + 1);
 	fprintf(out, "---------------------------------------------------\n");
 }
