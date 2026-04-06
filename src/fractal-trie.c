@@ -5132,6 +5132,65 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 }
 
 /*
+ * ft_init_node_density: set a node's density counter[0] by counting
+ * traversable children within 6 levels.  Simple walk of immediate
+ * children plus their counter[0] values (shifted by child distance).
+ *
+ * Only sets counter[0] (cumulative sum).  Per-level counters [1..5]
+ * are not maintained by this function.
+ */
+static
+void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
+{
+	struct cds_ft_inode *node;
+	struct cds_ft_metadata *meta;
+	unsigned int key;
+	unsigned long total = 0;
+
+	if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
+		return;
+	if (ft_node_compressed(node_flag)) {
+		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
+		struct cds_ft_metadata *cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+
+		/* Compressed child at distance cn->len. */
+		if (ft_node_ptr(cn->child) && !ft_node_external(cn->child)) {
+			struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(cn->child));
+
+			if (cn->len <= FT_NODE_DENSITY_DEPTH) {
+				total++;	/* child node itself */
+				/* Add child's subtree within window. */
+				if (cn->len < FT_NODE_DENSITY_DEPTH)
+					total += cm->nr_nodes_at_depth[0]; /* approximate */
+			}
+		}
+		cn_meta->nr_nodes_at_depth[0] = total;
+		return;
+	}
+	/* Internal node: walk children. */
+	node = ft_node_ptr(node_flag);
+	meta = cds_ft_item_to_metadata(node);
+
+	for (key = 0; key < 256; key++) {
+		struct cds_ft_inode_flag *child = ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+
+		if (!ft_node_ptr(child))
+			continue;
+		if (ft_node_external(child))
+			continue;
+		total++;	/* child at distance 1 */
+		{
+			struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
+			/* Child's counter[0] covers its +1 through +6. From parent: +2 through +7. */
+			/* We want +2 through +6 = child[0] minus child's +7 level. */
+			/* Approximate: just add child[0] (slightly overcounts). */
+			total += cm->nr_nodes_at_depth[0];
+		}
+	}
+	meta->nr_nodes_at_depth[0] = total;
+}
+
+/*
  * ft_propagate_node_density: update the local node density counters
  * in ancestors when a traversable node (internal, compressed, or
  * collapsed) is created or destroyed at the given depth.
@@ -6223,17 +6282,24 @@ int ft_attach_node(struct cds_ft *ft,
 	 * The snapshot contains ancestors with their depths.
 	 */
 	/*
-	 * Propagate density: the new branch adds nr_created_nodes
-	 * traversable nodes below depth level.  Propagate the total
-	 * count at the branch entry depth so that only ancestors
-	 * ABOVE level are updated.  This avoids the asymmetry where
-	 * the detach path (which has a fuller snapshot including
-	 * intermediate nodes) would decrement nodes that were never
-	 * incremented during creation.
+	 * Initialize density counters bottom-up for each created node.
+	 * Since nodes were created bottom-up, child counters are set
+	 * before parent.  Then propagate the top node's density to
+	 * snapshot ancestors.
 	 */
-	if (snapshot && nr_created_nodes > 0) {
-		ft_propagate_node_density(snapshot, snapshot_depth,
-			nr_snapshot, level, (long) nr_created_nodes);
+	if (nr_created_nodes > 0) {
+		int cn_idx;
+
+		for (cn_idx = 0; cn_idx < nr_created_nodes; cn_idx++)
+			ft_init_node_density(created_nodes[cn_idx]);
+		if (snapshot) {
+			struct cds_ft_metadata *top_meta =
+				cds_ft_item_to_metadata(
+					ft_node_ptr(created_nodes[nr_created_nodes - 1]));
+			ft_propagate_node_density(snapshot, snapshot_depth,
+				nr_snapshot, level,
+				(long)(1 + top_meta->nr_nodes_at_depth[0]));
+		}
 	}
 
 	/* Success */
