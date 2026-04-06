@@ -5301,33 +5301,17 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag *child;
 
 	/* Quick pre-filter. */
-	if (nr_child < 2 || nr_child > FT_COLLAPSE_NR_CHILD_MAX) {
-		if (nr_child >= 2)
-			fprintf(stderr, "COLLAPSE reject depth=%u: nr_child=%u > max=%u\n",
-				node_depth, nr_child, FT_COLLAPSE_NR_CHILD_MAX);
+	if (nr_child < 2 || nr_child > FT_COLLAPSE_NR_CHILD_MAX)
 		return NULL;
-	}
 	if (ft->group->key_len == CDS_FT_LEN_VARIABLE)
 		return NULL;
 
 	/* Density checks: enough structure below to justify collapse? */
-	if (metadata->nr_nodes_at_depth[0] < FT_COLLAPSE_DENSITY_MIN) {
-		fprintf(stderr, "COLLAPSE reject depth=%u nr_child=%u: density=%lu < min=%u\n",
-			node_depth, nr_child,
-			metadata->nr_nodes_at_depth[0], FT_COLLAPSE_DENSITY_MIN);
+	if (metadata->nr_nodes_at_depth[0] < FT_COLLAPSE_DENSITY_MIN)
 		return NULL;
-	}
 	/* Ratio check: at least DENSITY_RATIO nodes per child path. */
-	if (metadata->nr_nodes_at_depth[0] < nr_child * FT_COLLAPSE_DENSITY_RATIO) {
-		fprintf(stderr, "COLLAPSE reject depth=%u nr_child=%u: density=%lu < ratio=%u*%u=%u\n",
-			node_depth, nr_child,
-			metadata->nr_nodes_at_depth[0],
-			nr_child, FT_COLLAPSE_DENSITY_RATIO,
-			nr_child * FT_COLLAPSE_DENSITY_RATIO);
+	if (metadata->nr_nodes_at_depth[0] < nr_child * FT_COLLAPSE_DENSITY_RATIO)
 		return NULL;
-	}
-	fprintf(stderr, "COLLAPSE candidate depth=%u nr_child=%u density=%lu\n",
-		node_depth, nr_child, metadata->nr_nodes_at_depth[0]);
 
 	/*
 	 * Phase 1: minimum scan zone cost check.
@@ -5465,13 +5449,9 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				min_slen = slen;
 		}
 		if (min_slen < FT_COLLAPSE_SUFFIX_MIN) {
-			fprintf(stderr, "COLLAPSE reject depth=%u: min_slen=%u < %u (entries=%u)\n",
-				node_depth, min_slen, FT_COLLAPSE_SUFFIX_MIN, col->nr_entries);
 			free_collapsed_node(ft, col);
 			return NULL;
 		}
-		fprintf(stderr, "COLLAPSE SUCCESS depth=%u entries=%u min_slen=%u\n",
-			node_depth, col->nr_entries, min_slen);
 	}
 
 	col_meta->nr_child = col->nr_entries;
