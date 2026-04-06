@@ -5265,10 +5265,10 @@ void ft_propagate_node_density(struct cds_ft_inode_flag **snapshot,
  * FT_COLLAPSE_DENSITY_RATIO: minimum ratio of density to nr_child.
  *   Ensures the subtree has long chains (many nodes per child path).
  */
-#define FT_COLLAPSE_DENSITY_MIN		8
-#define FT_COLLAPSE_NR_CHILD_MAX	8
-#define FT_COLLAPSE_SUFFIX_MIN		3
-#define FT_COLLAPSE_DENSITY_RATIO	2
+#define FT_COLLAPSE_DENSITY_MIN		2
+#define FT_COLLAPSE_NR_CHILD_MAX	16
+#define FT_COLLAPSE_SUFFIX_MIN		2
+#define FT_COLLAPSE_DENSITY_RATIO	1
 
 /*
  * ft_try_collapse_at_node: attempt to collapse the subtree rooted at
@@ -11473,7 +11473,23 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 		if (!ft_node_ptr(child_node_flag))
 			continue;
 		/* Found external node before end of key. */
-		if (ft_node_internal(child_node_flag)) {
+		if (ft_node_collapsed(child_node_flag)) {
+			struct cds_ft_collapsed_node *col =
+				ft_collapsed_node_ptr(child_node_flag);
+			struct cds_ft_metadata *col_meta =
+				cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+
+			print_indent(out, level);
+			fprintf(out, "Level %d, key value: %u, COLLAPSED node: %p, nr_entries: %u, nr_keys: %lu, density: [%lu %lu %lu %lu %lu %lu]\n",
+				level, key, child_node_flag, col->nr_entries,
+				uatomic_load(&col_meta->nr_keys, CMM_RELAXED),
+				col_meta->nr_nodes_at_depth[0],
+				col_meta->nr_nodes_at_depth[1],
+				col_meta->nr_nodes_at_depth[2],
+				col_meta->nr_nodes_at_depth[3],
+				col_meta->nr_nodes_at_depth[4],
+				col_meta->nr_nodes_at_depth[5]);
+		} else if (ft_node_internal(child_node_flag)) {
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(child_node_flag));
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
@@ -11624,6 +11640,12 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key);
 		if (!ft_node_ptr(child_node_flag))
 			continue;
+		if (ft_node_collapsed(child_node_flag)) {
+			/* Skip collapsed nodes in stats for now. */
+			stats->level[level].nr_internal_nodes++;
+			stats->level[level].has_nodes = true;
+			continue;
+		}
 		if (ft_node_internal(child_node_flag)) {
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(child_node_flag));
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
