@@ -6238,6 +6238,100 @@ int ft_attach_node(struct cds_ft *ft,
 
 		key_value = key_to_ordinal(ft, *(--iter_key));
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
+
+#ifdef FEATURE_FT_COLLAPSE
+		/*
+		 * If the parent is a collapsed node, explode it to an
+		 * internal node before attaching the new branch.
+		 * ft_node_set_nth only works on internal nodes.
+		 */
+		if (attach_node_flag &&
+		    ft_node_collapsed(attach_node_flag)) {
+			struct cds_ft_collapsed_node *col =
+				ft_collapsed_node_ptr(attach_node_flag);
+			struct cds_ft_metadata *col_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) col);
+			struct cds_ft_inode_flag **cptrs =
+				ft_collapsed_ptrs(col);
+			struct cds_ft_inode_flag *internal_flag = NULL;
+			struct cds_ft_metadata *int_meta;
+			unsigned int ee;
+
+			for (ee = 0; ee < col->nr_entries; ee++) {
+				uint8_t *sfx;
+				unsigned int slen2;
+				struct cds_ft_inode_flag *child;
+				int eret;
+
+				if (ft_collapsed_entry_dead(col, ee))
+					continue;
+				sfx = ft_collapsed_suffix(col, ee);
+				slen2 = ft_collapsed_suffix_len(col, ee);
+				child = cptrs[ee];
+				if (!ft_node_ptr(child))
+					continue;
+
+				if (slen2 > 1) {
+					struct cds_ft_compressed_node *wrap;
+					struct cds_ft_metadata *wrap_meta;
+					unsigned int wk;
+
+					wrap = alloc_compressed_node(ft,
+						slen2 - 1, &wrap_meta);
+					if (!wrap) {
+						ret = -ENOMEM;
+						goto check_error;
+					}
+					wrap->child = child;
+					wrap->len = slen2 - 1;
+					for (wk = 0; wk < slen2 - 1; wk++)
+						wrap->key_bytes[wk] =
+							sfx[wk + 1];
+					wrap_meta->nr_child = 1;
+					if (!ft_node_external(child)) {
+						struct cds_ft_metadata *cm =
+							cds_ft_item_to_metadata(
+								ft_node_ptr(child));
+						uatomic_store(
+							&wrap_meta->nr_keys,
+							cm->nr_keys,
+							CMM_RELAXED);
+					} else {
+						uatomic_store(
+							&wrap_meta->nr_keys,
+							ft_node_ptr(child) ? 1 : 0,
+							CMM_RELAXED);
+					}
+					child = ft_compressed_node_flag(wrap);
+				}
+				eret = ft_node_set_nth(ft, &internal_flag,
+					sfx[0], child, NULL,
+					internal_flag ?
+					cds_ft_item_to_metadata(
+						ft_node_ptr(internal_flag)) :
+					NULL);
+				if (eret) {
+					ret = -ENOMEM;
+					goto check_error;
+				}
+			}
+			if (internal_flag) {
+				int_meta = cds_ft_item_to_metadata(
+					ft_node_ptr(internal_flag));
+				uatomic_store(&int_meta->nr_keys,
+					col_meta->nr_keys, CMM_RELAXED);
+				int_meta->external_nodes =
+					col_meta->external_nodes;
+				rcu_assign_pointer(*attach_node_flag_ptr,
+					internal_flag);
+				attach_node_flag = internal_flag;
+				metadata = int_meta;
+				free_collapsed_node(ft, col);
+			}
+		}
+#endif
+
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
 		ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag,
@@ -6983,6 +7077,10 @@ insert_done:
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
+#ifdef FEATURE_FT_COLLAPSE
+		ft_check_collapse_on_remove(ft, snapshot, snapshot_depth,
+			nr_snapshot);
+#endif
 	}
 
 	return ret;
