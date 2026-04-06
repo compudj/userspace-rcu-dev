@@ -5438,14 +5438,22 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	{
 		unsigned int e;
 		unsigned int min_slen = UINT_MAX;
+		bool has_long_suffix = false;
 
 		for (e = 0; e < col->nr_entries; e++) {
 			unsigned int slen = ft_collapsed_suffix_len(col, e);
 
 			if (slen < min_slen)
 				min_slen = slen;
+			if (slen >= FT_COLLAPSE_SUFFIX_MIN)
+				has_long_suffix = true;
 		}
-		if (min_slen < FT_COLLAPSE_SUFFIX_MIN) {
+		/*
+		 * Require at least one entry with a multi-byte suffix.
+		 * Entries with slen=1 (direct external children) are
+		 * allowed as long as other entries save levels.
+		 */
+		if (!has_long_suffix) {
 			free_collapsed_node(ft, col);
 			return NULL;
 		}
