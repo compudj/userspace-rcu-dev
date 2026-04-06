@@ -5173,11 +5173,18 @@ void ft_propagate_node_density(struct cds_ft_inode_flag **snapshot,
 		m = cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
 
 		/* Always update the cumulative sum (counter[0]). */
-		m->nr_nodes_at_depth[0] += delta;
+		if (delta < 0 && m->nr_nodes_at_depth[0] < (unsigned long) -delta)
+			m->nr_nodes_at_depth[0] = 0;
+		else
+			m->nr_nodes_at_depth[0] += delta;
 
 		/* Update the per-level counter if distance > 1. */
-		if (distance >= 2)
-			m->nr_nodes_at_depth[distance - 1] += delta;
+		if (distance >= 2) {
+			if (delta < 0 && m->nr_nodes_at_depth[distance - 1] < (unsigned long) -delta)
+				m->nr_nodes_at_depth[distance - 1] = 0;
+			else
+				m->nr_nodes_at_depth[distance - 1] += delta;
+		}
 	}
 }
 
@@ -5235,17 +5242,33 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag *child;
 
 	/* Quick pre-filter. */
-	if (nr_child < 2 || nr_child > FT_COLLAPSE_NR_CHILD_MAX)
+	if (nr_child < 2 || nr_child > FT_COLLAPSE_NR_CHILD_MAX) {
+		if (nr_child >= 2)
+			fprintf(stderr, "COLLAPSE reject depth=%u: nr_child=%u > max=%u\n",
+				node_depth, nr_child, FT_COLLAPSE_NR_CHILD_MAX);
 		return NULL;
+	}
 	if (ft->group->key_len == CDS_FT_LEN_VARIABLE)
 		return NULL;
 
 	/* Density checks: enough structure below to justify collapse? */
-	if (metadata->nr_nodes_at_depth[0] < FT_COLLAPSE_DENSITY_MIN)
+	if (metadata->nr_nodes_at_depth[0] < FT_COLLAPSE_DENSITY_MIN) {
+		fprintf(stderr, "COLLAPSE reject depth=%u nr_child=%u: density=%lu < min=%u\n",
+			node_depth, nr_child,
+			metadata->nr_nodes_at_depth[0], FT_COLLAPSE_DENSITY_MIN);
 		return NULL;
+	}
 	/* Ratio check: at least DENSITY_RATIO nodes per child path. */
-	if (metadata->nr_nodes_at_depth[0] < nr_child * FT_COLLAPSE_DENSITY_RATIO)
+	if (metadata->nr_nodes_at_depth[0] < nr_child * FT_COLLAPSE_DENSITY_RATIO) {
+		fprintf(stderr, "COLLAPSE reject depth=%u nr_child=%u: density=%lu < ratio=%u*%u=%u\n",
+			node_depth, nr_child,
+			metadata->nr_nodes_at_depth[0],
+			nr_child, FT_COLLAPSE_DENSITY_RATIO,
+			nr_child * FT_COLLAPSE_DENSITY_RATIO);
 		return NULL;
+	}
+	fprintf(stderr, "COLLAPSE candidate depth=%u nr_child=%u density=%lu\n",
+		node_depth, nr_child, metadata->nr_nodes_at_depth[0]);
 
 	/*
 	 * Phase 1: minimum scan zone cost check.
@@ -5383,9 +5406,13 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				min_slen = slen;
 		}
 		if (min_slen < FT_COLLAPSE_SUFFIX_MIN) {
+			fprintf(stderr, "COLLAPSE reject depth=%u: min_slen=%u < %u (entries=%u)\n",
+				node_depth, min_slen, FT_COLLAPSE_SUFFIX_MIN, col->nr_entries);
 			free_collapsed_node(ft, col);
 			return NULL;
 		}
+		fprintf(stderr, "COLLAPSE SUCCESS depth=%u entries=%u min_slen=%u\n",
+			node_depth, col->nr_entries, min_slen);
 	}
 
 	col_meta->nr_child = col->nr_entries;
@@ -5691,46 +5718,22 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	/* 5. Publish the split structure, replacing the compressed node. */
 	rcu_assign_pointer(*parent_slot, top_flag);
 
-	/* 6. Propagate density: -1 for old compressed, +1 for each new node. */
+	/*
+	 * 6. Density: the split replaced 1 compressed node at
+	 * node_depth with nr_created new nodes.  Rather than
+	 * propagating individual +1/-1 to the snapshot (which
+	 * misses newly created intermediate nodes), propagate
+	 * the net change: +nr_created - 1 at node_depth.
+	 * The newly created nodes' internal counters will be
+	 * built up incrementally by subsequent mutations.
+	 */
 	if (snapshot) {
-		int ci;
-		/*
-		 * Created nodes and their depths (bottom-up order):
-		 *   old_suffix at node_depth + diverge_pos + 1 (if suffix_len > 0)
-		 *   new_branch at node_depth + diverge_pos + 1
-		 *   branch at node_depth + diverge_pos
-		 *   prefix at node_depth (if diverge_pos > 0)
-		 *
-		 * The created[] array tracks them in creation order.
-		 * Use a simpler approach: net = nr_created - 1 (one old
-		 * node destroyed, nr_created new ones).
-		 *
-		 * Propagate -1 for the old compressed node, then +1 for
-		 * each new node.  Approximate depths for the new nodes
-		 * based on the split structure.
-		 */
-		ft_propagate_node_density(snapshot, snapshot_depth,
-			nr_snapshot, node_depth, -1);
-		for (ci = 0; ci < nr_created; ci++) {
-			unsigned int new_depth;
+		long net = (long) nr_created - 1;
 
-			/*
-			 * Approximate depth assignment:
-			 * - Last created = topmost (prefix or branch)
-			 * - Second to last = branch (if prefix exists)
-			 * - Others = deeper nodes
-			 */
-			if (ci == nr_created - 1 && diverge_pos > 0)
-				new_depth = node_depth;	/* prefix */
-			else if (ci == nr_created - 1 ||
-				 (ci == nr_created - 2 && diverge_pos > 0))
-				new_depth = node_depth + diverge_pos; /* branch */
-			else
-				new_depth = node_depth + diverge_pos + 1;
+		if (net != 0)
 			ft_propagate_node_density(snapshot,
 				snapshot_depth, nr_snapshot,
-				new_depth, 1);
-		}
+				node_depth, net);
 	}
 
 	/* 7. Free the old compressed node. */
@@ -6219,27 +6222,18 @@ int ft_attach_node(struct cds_ft *ft,
 	 * Propagate node density for each created traversable node.
 	 * The snapshot contains ancestors with their depths.
 	 */
-	if (snapshot) {
-		int cn_idx;
-
-		for (cn_idx = 0; cn_idx < nr_created_nodes; cn_idx++) {
-			unsigned int node_depth;
-
-			if (ft_node_compressed(created_nodes[cn_idx])) {
-				/* Compressed node sits at depth 'level'. */
-				node_depth = level;
-			} else {
-				/*
-				 * Internal nodes created bottom-up:
-				 * created_nodes[0] at key_len,
-				 * created_nodes[1] at key_len-1, etc.
-				 */
-				node_depth = key_len - cn_idx;
-			}
-			ft_propagate_node_density(snapshot,
-				snapshot_depth, nr_snapshot,
-				node_depth, 1);
-		}
+	/*
+	 * Propagate density: the new branch adds nr_created_nodes
+	 * traversable nodes below depth level.  Propagate the total
+	 * count at the branch entry depth so that only ancestors
+	 * ABOVE level are updated.  This avoids the asymmetry where
+	 * the detach path (which has a fuller snapshot including
+	 * intermediate nodes) would decrement nodes that were never
+	 * incremented during creation.
+	 */
+	if (snapshot && nr_created_nodes > 0) {
+		ft_propagate_node_density(snapshot, snapshot_depth,
+			nr_snapshot, level, (long) nr_created_nodes);
 	}
 
 	/* Success */
@@ -6529,26 +6523,23 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 			*nr_snapshot_p, jct_flag,
 			d->depth + remaining);
 		/*
-		 * Density: old compressed (-1), new top (+1 if
-		 * prefix exists), new junction (+1), new suffix
-		 * (+1 if suffix_len > 0).  Propagate net change.
+		 * Density: net = new nodes - old compressed.
+		 * Count: junction(1) + prefix(if exists) + suffix(if len>1)
+		 * minus old compressed(1).
 		 */
-		ft_propagate_node_density(snapshot, snapshot_depth,
-			*nr_snapshot_p, d->depth, -1);
-		if (top_flag != jct_flag)
-			ft_propagate_node_density(snapshot,
-				snapshot_depth, *nr_snapshot_p,
-				d->depth, 1);
-		ft_propagate_node_density(snapshot, snapshot_depth,
-			*nr_snapshot_p, d->depth + remaining, 1);
-		/* Suffix node (if created) is deeper than junction. */
 		{
+			long net = 0;	/* junction replaces compressed: net 0 */
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(d->nf);
+
+			if (top_flag != jct_flag)
+				net++;	/* prefix added */
 			if (cn->len > remaining + 1)
+				net++;	/* suffix added */
+			if (net != 0)
 				ft_propagate_node_density(snapshot,
 					snapshot_depth, *nr_snapshot_p,
-					d->depth + remaining + 1, 1);
+					d->depth, net);
 		}
 		ft_propagate_external_count(snapshot,
 			*nr_snapshot_p, 1);
@@ -7543,15 +7534,22 @@ end:
 		 * [nr_snapshot - 1 - nr_branch .. nr_snapshot - 1 - nr_branch + nr_clear - 1].
 		 * Each snapshot entry has a known depth in snapshot_depth[].
 		 */
-		for (i = 0; i < nr_clear; i++) {
-			int snap_idx = nr_snapshot - 1 - nr_branch + i;
+		/*
+		 * Propagate density: -nr_clear at the topmost freed
+		 * node's depth.  Use the snapshot entry just above the
+		 * pruned branch as the propagation base.
+		 */
+		if (nr_clear > 0) {
+			int top_idx = nr_snapshot - 1 - nr_branch;
 
-			if (snap_idx >= 0 && snap_idx < nr_snapshot)
+			if (top_idx >= 0 && top_idx < nr_snapshot)
 				ft_propagate_node_density(snapshot,
-					snapshot_depth, snap_idx,
-					snapshot_depth[snap_idx], -1);
-			free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
+					snapshot_depth, top_idx,
+					snapshot_depth[top_idx],
+					(long) -nr_clear);
 		}
+		for (i = 0; i < nr_clear; i++)
+			free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
 	}
 	return ret;
 }
@@ -8275,27 +8273,10 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	ft_snapshot_push(snapshot, snapshot_depth,
 		*nr_snapshot, branch_flag, d->depth + diverge_pos);
 
-	/* 5b. Density: old compressed (-1), new nodes (+1 each). */
-	ft_propagate_node_density(snapshot, snapshot_depth,
-		*nr_snapshot, d->depth, -1);
-	{
-		int ci;
-
-		for (ci = 0; ci < nr_created; ci++) {
-			unsigned int new_depth;
-
-			if (ci == nr_created - 1 && diverge_pos > 0)
-				new_depth = d->depth;
-			else if (ci == nr_created - 1 ||
-				 (ci == nr_created - 2 && diverge_pos > 0))
-				new_depth = d->depth + diverge_pos;
-			else
-				new_depth = d->depth + diverge_pos + 1;
-			ft_propagate_node_density(snapshot,
-				snapshot_depth, *nr_snapshot,
-				new_depth, 1);
-		}
-	}
+	/* 5b. Density: net = nr_created - 1 at the split depth. */
+	if (nr_created > 1)
+		ft_propagate_node_density(snapshot, snapshot_depth,
+			*nr_snapshot, d->depth, (long) nr_created - 1);
 
 	/*
 	 * 6. Set descent state: branch has an empty slot for the
@@ -8593,13 +8574,9 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	ft_snapshot_push(snapshot, snapshot_depth,
 		*nr_snapshot, prefix_flag, d->depth);
 
-	/* Density: old compressed (-1), new prefix (+1), new suffix (+1). */
+	/* Density: net = +1 (old compressed → prefix + suffix = 2 nodes, net +1). */
 	ft_propagate_node_density(snapshot, snapshot_depth,
-		*nr_snapshot, d->depth, -1);
-	ft_propagate_node_density(snapshot, snapshot_depth,
-		*nr_snapshot, d->depth, 1);	/* prefix */
-	ft_propagate_node_density(snapshot, snapshot_depth,
-		*nr_snapshot, d->depth + remaining, 1); /* suffix */
+		*nr_snapshot, d->depth, 1);
 
 	d->ppnf = d->pnf;
 	d->ppnfp = d->pnfp;
