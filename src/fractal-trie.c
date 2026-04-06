@@ -5303,9 +5303,6 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	/* Quick pre-filter. */
 	if (nr_child < 2 || nr_child > FT_COLLAPSE_NR_CHILD_MAX)
 		return NULL;
-	if (ft->group->key_len == CDS_FT_LEN_VARIABLE)
-		return NULL;
-
 	/* Density checks: enough structure below to justify collapse? */
 	if (metadata->nr_nodes_at_depth[0] < FT_COLLAPSE_DENSITY_MIN)
 		return NULL;
