@@ -5384,10 +5384,10 @@ void ft_propagate_node_density(struct cds_ft_inode_flag **snapshot,
  * FT_COLLAPSE_DENSITY_RATIO: minimum ratio of density to nr_child.
  *   Ensures the subtree has long chains (many nodes per child path).
  */
-#define FT_COLLAPSE_DENSITY_MIN		2
+#define FT_COLLAPSE_DENSITY_MIN		1
 #define FT_COLLAPSE_NR_CHILD_MAX	16
 #define FT_COLLAPSE_SUFFIX_MIN		2
-#define FT_COLLAPSE_DENSITY_RATIO	1
+#define FT_COLLAPSE_DENSITY_RATIO	0
 
 /*
  * ft_try_collapse_at_node: attempt to collapse the subtree rooted at
@@ -5422,12 +5422,31 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	/* Quick pre-filter. */
 	if (nr_child < 2 || nr_child > FT_COLLAPSE_NR_CHILD_MAX)
 		return NULL;
-	/* Density checks: enough structure below to justify collapse? */
-	if (metadata->nr_nodes_at_depth[0] < FT_COLLAPSE_DENSITY_MIN)
-		return NULL;
-	/* Ratio check: at least DENSITY_RATIO nodes per child path. */
-	if (metadata->nr_nodes_at_depth[0] < nr_child * FT_COLLAPSE_DENSITY_RATIO)
-		return NULL;
+	/*
+	 * Density check: count actual traversable children rather than
+	 * relying on nr_nodes_at_depth[0], which only tracks 6 levels
+	 * and is often 0 for deep tries (e.g. file paths with long
+	 * compressed chains).  The count of non-external children is
+	 * cheap since nr_child is bounded by NR_CHILD_MAX (≤ 16).
+	 */
+	{
+		unsigned int nr_traversable = 0;
+		uint8_t ck;
+		int pv = -1;
+		struct cds_ft_inode_flag *c;
+
+		c = ft_node_get_direction(node_flag, pv, &ck, FT_RIGHT);
+		while (ft_node_ptr(c)) {
+			if (!ft_node_external(c))
+				nr_traversable++;
+			pv = ck;
+			c = ft_node_get_direction(node_flag, pv, &ck, FT_RIGHT);
+		}
+		if (nr_traversable < FT_COLLAPSE_DENSITY_MIN)
+			return NULL;
+		if (nr_traversable < nr_child * FT_COLLAPSE_DENSITY_RATIO)
+			return NULL;
+	}
 
 	/*
 	 * Phase 1: minimum scan zone cost check.
@@ -5586,14 +5605,9 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 }
 
 /*
- * ft_check_collapse_on_remove: after a remove, check if any ancestor
- * in the snapshot should be collapsed.  Called after nr_keys
- * propagation.
- *
- * Walks the snapshot from deepest to shallowest.  For each internal
- * node whose density counter suggests collapse, attempts the
- * conversion.  Only the FIRST eligible ancestor is collapsed (to
- * avoid cascading collapses in a single mutation).
+ * ft_check_collapse_on_remove: after a remove/detach/graft, check if
+ * any ancestor in the snapshot should be collapsed.  Walks from
+ * deepest to shallowest, collapses the first eligible.
  */
 static
 void ft_check_collapse_on_remove(struct cds_ft *ft,
@@ -5615,30 +5629,28 @@ void ft_check_collapse_on_remove(struct cds_ft *ft,
 		col_flag = ft_try_collapse_at_node(ft, node_flag,
 				snapshot_depth[i]);
 		if (col_flag) {
-			/*
-			 * Find the slot in the parent that points to
-			 * this node, and replace it with the collapsed node.
-			 */
 			struct cds_ft_inode_flag *parent = snapshot[i - 1];
 			struct cds_ft_inode_flag **parent_slot = NULL;
 
 			if (ft_node_internal(parent)) {
-				/* Find the slot by searching parent's children. */
 				uint8_t child_key;
 				int pivot = -1;
 				struct cds_ft_inode_flag *c;
 
-				c = ft_node_get_direction(parent, pivot, &child_key, FT_RIGHT);
+				c = ft_node_get_direction(parent, pivot,
+					&child_key, FT_RIGHT);
 				while (ft_node_ptr(c)) {
 					struct cds_ft_inode_flag **slot = NULL;
 
-					ft_node_get_nth(parent, &slot, child_key);
+					ft_node_get_nth(parent, &slot,
+						child_key);
 					if (slot && *slot == node_flag) {
 						parent_slot = slot;
 						break;
 					}
 					pivot = child_key;
-					c = ft_node_get_direction(parent, pivot, &child_key, FT_RIGHT);
+					c = ft_node_get_direction(parent, pivot,
+						&child_key, FT_RIGHT);
 				}
 			} else if (ft_node_compressed(parent)) {
 				struct cds_ft_compressed_node *cn =
@@ -5661,17 +5673,147 @@ void ft_check_collapse_on_remove(struct cds_ft *ft,
 			}
 
 			if (!parent_slot) {
-				/* Couldn't find parent slot, skip. */
 				free_collapsed_node(ft,
 					ft_collapsed_node_ptr(col_flag));
 				continue;
 			}
 
 			rcu_assign_pointer(*parent_slot, col_flag);
-			/* The old internal node is freed after grace period. */
 			free_cds_ft_node(ft, ft_node_ptr(node_flag));
-			return; /* Only collapse one per mutation. */
+			return;
 		}
+	}
+}
+
+/*
+ * ft_check_collapse_on_path: after a mutation, walk the key path from
+ * root to leaf through the LIVE trie, evaluating each internal node
+ * for collapse.  This sees all nodes including freshly created
+ * junctions from compressed splits, which may not be in the snapshot.
+ *
+ * Collects (node, parent_slot, depth) pairs for all eligible nodes,
+ * then collapses the deepest one (favoring terminal-like nodes that
+ * give JudyL-style early termination).
+ */
+static
+void ft_check_collapse_on_path(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len)
+{
+	struct cds_ft_inode_flag *node_flag;
+	struct cds_ft_inode_flag **parent_slot;
+	struct cds_ft_inode_flag *best_node = NULL;
+	struct cds_ft_inode_flag **best_parent_slot = NULL;
+	unsigned int best_depth = 0;
+	const uint8_t *ik = key;
+	unsigned int depth = 0;
+
+	node_flag = rcu_dereference(ft->root);
+	parent_slot = &ft->root;
+
+	while (depth < key_len + 1) {
+		if (!ft_node_ptr(node_flag))
+			break;
+		if (ft_node_external(node_flag))
+			break;
+		if (ft_node_compressed(node_flag)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(node_flag);
+			unsigned int remaining = key_len - depth;
+			unsigned int cmp = cn->len < remaining ?
+				cn->len : remaining;
+			unsigned int j;
+
+			for (j = 0; j < cmp; j++) {
+				if (key_to_ordinal(ft, ik[j]) !=
+				    cn->key_bytes[j])
+					break;
+			}
+			if (j < cmp)
+				break; /* Mismatch within compressed. */
+			parent_slot = &cn->child;
+			node_flag = ft_dereference_acquire(cn->child);
+			depth += cn->len;
+			ik += cn->len;
+			continue;
+		}
+		if (ft_node_collapsed(node_flag)) {
+			struct cds_ft_collapsed_node *col =
+				ft_collapsed_node_ptr(node_flag);
+			struct cds_ft_inode_flag **cptrs =
+				ft_collapsed_ptrs(col);
+			unsigned int remaining = key_len - depth;
+			unsigned int e;
+			bool found = false;
+
+			for (e = 0; e < col->nr_entries; e++) {
+				unsigned int slen, j;
+				uint8_t *suffix;
+
+				if (ft_collapsed_entry_dead(col, e))
+					continue;
+				slen = ft_collapsed_suffix_len(col, e);
+				if (slen > remaining)
+					continue;
+				suffix = ft_collapsed_suffix(col, e);
+				for (j = 0; j < slen; j++) {
+					if (key_to_ordinal(ft, ik[j]) !=
+					    suffix[j])
+						break;
+				}
+				if (j == slen) {
+					parent_slot = &cptrs[e];
+					node_flag = ft_dereference_acquire(
+						cptrs[e]);
+					depth += slen;
+					ik += slen;
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				break;
+			continue;
+		}
+		/* Internal node: evaluate for collapse (skip root). */
+		if (depth > 0) {
+			struct cds_ft_inode_flag *col_flag;
+
+			col_flag = ft_try_collapse_at_node(ft, node_flag,
+					depth);
+			if (col_flag) {
+				/*
+				 * Record as candidate.  Keep the deepest
+				 * (last found) since we walk root→leaf.
+				 * Free any previously recorded candidate.
+				 */
+				if (best_node)
+					free_collapsed_node(ft,
+						ft_collapsed_node_ptr(
+							best_node));
+				best_node = col_flag;
+				best_parent_slot = parent_slot;
+				best_depth = depth;
+			}
+		}
+		{
+			uint8_t kv = key_to_ordinal(ft, *(ik++));
+			struct cds_ft_inode_flag **slot = NULL;
+
+			ft_node_get_nth(node_flag, &slot, kv);
+			if (!slot || !ft_node_ptr(*slot))
+				break;
+			parent_slot = slot;
+			node_flag = ft_dereference_acquire(*slot);
+			depth++;
+		}
+	}
+
+	if (best_node) {
+		struct cds_ft_inode_flag *old =
+			*best_parent_slot;
+
+		rcu_assign_pointer(*best_parent_slot, best_node);
+		free_cds_ft_node(ft, ft_node_ptr(old));
 	}
 }
 #endif /* FEATURE_FT_COLLAPSE */
@@ -5709,7 +5851,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		unsigned int node_depth,	/* depth of the compressed node */
 		struct cds_ft_inode_flag **snapshot,
 		unsigned int *snapshot_depth,
-		int nr_snapshot)
+		int *nr_snapshot_p)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
 	struct cds_ft_metadata *cn_meta =
@@ -5882,21 +6024,43 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	rcu_assign_pointer(*parent_slot, top_flag);
 
 	/*
-	 * 6. Density: the split replaced 1 compressed node at
-	 * node_depth with nr_created new nodes.  Rather than
-	 * propagating individual +1/-1 to the snapshot (which
-	 * misses newly created intermediate nodes), propagate
-	 * the net change: +nr_created - 1 at node_depth.
-	 * The newly created nodes' internal counters will be
-	 * built up incrementally by subsequent mutations.
+	 * 6. Density: propagate each new node at its actual depth.
+	 *
+	 * The old compressed node at node_depth is replaced by the
+	 * prefix (or junction if diverge_pos == 0): net 0 at
+	 * node_depth.  The junction, old suffix, and new branch
+	 * are NEW nodes at deeper depths.
+	 *
+	 * This is critical for long compressed paths (e.g. file
+	 * paths): when diverge_pos is large, the junction is deep
+	 * and its density must reach ancestors near the junction
+	 * depth, not the compressed node's original depth.
 	 */
 	if (snapshot) {
-		long net = (long) nr_created - 1;
+		unsigned int junction_depth = node_depth + diverge_pos;
+		int nr_snapshot = *nr_snapshot_p;
 
-		if (net != 0)
+		/*
+		 * Junction: new node at junction_depth.
+		 * If diverge_pos == 0, the junction replaces the old
+		 * compressed node at node_depth (net 0).
+		 */
+		if (diverge_pos > 0)
 			ft_propagate_node_density(snapshot,
 				snapshot_depth, nr_snapshot,
-				node_depth, net);
+				junction_depth, 1);
+		/* Old suffix at junction_depth + 1 (if it exists). */
+		if (suffix_len > 0)
+			ft_propagate_node_density(snapshot,
+				snapshot_depth, nr_snapshot,
+				junction_depth + 1, 1);
+		/* New branch at junction_depth + 1 (if it exists). */
+		if (new_len > 0)
+			ft_propagate_node_density(snapshot,
+				snapshot_depth, nr_snapshot,
+				junction_depth + 1, 1);
+
+		(void) nr_snapshot_p; /* Snapshot not extended here. */
 	}
 
 	/* 7. Free the old compressed node. */
@@ -6732,7 +6896,7 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 		dret = ft_split_compressed_insert(ft,
 			d->nfp, d->nf, *iter_key_p, remaining,
 			j, node, d->depth,
-			snapshot, snapshot_depth, *nr_snapshot_p);
+			snapshot, snapshot_depth, nr_snapshot_p);
 		if (dret) {
 			*ret_p = dret;
 			return FT_COMPRESSED_END;
