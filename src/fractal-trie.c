@@ -11779,10 +11779,72 @@ void print_indent(FILE *out, int level)
 		fprintf(out, "	");
 }
 
-static
+static void show_node_recursive(const struct cds_ft *ft, FILE *out,
+		struct cds_ft_inode_flag *node_flag, int level);
+
+static void show_collapsed_node(const struct cds_ft *ft, FILE *out,
+		struct cds_ft_inode_flag *node_flag, int level)
+{
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_metadata *col_meta =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col);
+	struct cds_ft_node *external_nodes = rcu_dereference(col_meta->external_nodes);
+	unsigned int e;
+
+	print_indent(out, level);
+	fprintf(out, "Level %d, COLLAPSED node: %p, nr_entries: %u, nr_keys: %lu, density: [%lu %lu %lu %lu %lu %lu]\n",
+		level, node_flag, col->nr_entries,
+		uatomic_load(&col_meta->nr_keys, CMM_RELAXED),
+		col_meta->nr_nodes_at_depth[0],
+		col_meta->nr_nodes_at_depth[1],
+		col_meta->nr_nodes_at_depth[2],
+		col_meta->nr_nodes_at_depth[3],
+		col_meta->nr_nodes_at_depth[4],
+		col_meta->nr_nodes_at_depth[5]);
+	if (external_nodes) {
+		print_indent(out, level);
+		fprintf(out, "Level %d, (meta)external node list ptr: %p\n",
+			level, external_nodes);
+	}
+	for (e = 0; e < col->nr_entries; e++) {
+		unsigned int slen = ft_collapsed_suffix_len(col, e);
+		uint8_t *suffix = ft_collapsed_suffix(col, e);
+		struct cds_ft_inode_flag *child;
+		unsigned int k;
+
+		if (ft_collapsed_entry_dead(col, e))
+			continue;
+		child = ft_dereference_acquire(ptrs[e]);
+		print_indent(out, level);
+		fprintf(out, "  entry[%u]: suffix=[", e);
+		for (k = 0; k < slen; k++)
+			fprintf(out, "%s%u", k ? "," : "", suffix[k]);
+		fprintf(out, "] (len=%u), child=%p", slen, child);
+		if (ft_node_ptr(child)) {
+			if (ft_node_external(child))
+				fprintf(out, " (external)");
+			else if (ft_node_internal(child))
+				fprintf(out, " (internal)");
+			else if (ft_node_compressed(child))
+				fprintf(out, " (compressed)");
+			else if (ft_node_collapsed(child))
+				fprintf(out, " (collapsed)");
+		}
+		fprintf(out, "\n");
+		if (ft_node_ptr(child) && !ft_node_external(child))
+			show_node_recursive(ft, out, child, level + slen);
+	}
+}
+
 void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode_flag *node_flag, int level)
 {
 	unsigned int key;
+
+	if (ft_node_collapsed(node_flag)) {
+		show_collapsed_node(ft, out, node_flag, level);
+		return;
+	}
 
 	print_indent(out, level);
 	fprintf(out, "Level %d within node %p\n", level, node_flag);
@@ -11792,23 +11854,10 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key);
 		if (!ft_node_ptr(child_node_flag))
 			continue;
-		/* Found external node before end of key. */
 		if (ft_node_collapsed(child_node_flag)) {
-			struct cds_ft_collapsed_node *col =
-				ft_collapsed_node_ptr(child_node_flag);
-			struct cds_ft_metadata *col_meta =
-				cds_ft_item_to_metadata((struct cds_ft_inode *) col);
-
 			print_indent(out, level);
-			fprintf(out, "Level %d, key value: %u, COLLAPSED node: %p, nr_entries: %u, nr_keys: %lu, density: [%lu %lu %lu %lu %lu %lu]\n",
-				level, key, child_node_flag, col->nr_entries,
-				uatomic_load(&col_meta->nr_keys, CMM_RELAXED),
-				col_meta->nr_nodes_at_depth[0],
-				col_meta->nr_nodes_at_depth[1],
-				col_meta->nr_nodes_at_depth[2],
-				col_meta->nr_nodes_at_depth[3],
-				col_meta->nr_nodes_at_depth[4],
-				col_meta->nr_nodes_at_depth[5]);
+			fprintf(out, "Level %d, key value: %u ->\n", level, key);
+			show_collapsed_node(ft, out, child_node_flag, level + 1);
 		} else if (ft_node_internal(child_node_flag)) {
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(child_node_flag));
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
@@ -11950,9 +11999,76 @@ void calc_stats_node(const struct cds_ft *ft __attribute__((unused)),
 
 static
 void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_stats *stats, int level);
+
+static
+void calc_stats_collapsed(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_stats *stats, int level)
+{
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_metadata *col_meta =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col);
+	struct cds_ft_node *external_nodes = rcu_dereference(col_meta->external_nodes);
+	unsigned int e;
+
+	stats->level[level].nr_internal_nodes++;
+	stats->level[level].has_nodes = true;
+	if (external_nodes) {
+		struct cds_ft_node *iter_node;
+		unsigned int count = 0;
+
+		iter_node = external_nodes;
+		cds_ft_for_each_duplicate(iter_node) {
+			if (count++ == 0)
+				stats->level[level].nr_metadata_external_nodes++;
+			else
+				stats->level[level].nr_duplicate_external_nodes++;
+			stats->level[level].has_nodes = true;
+		}
+	}
+	for (e = 0; e < col->nr_entries; e++) {
+		unsigned int slen, j;
+		struct cds_ft_inode_flag *child;
+
+		if (ft_collapsed_entry_dead(col, e))
+			continue;
+		slen = ft_collapsed_suffix_len(col, e);
+		child = ft_dereference_acquire(cptrs[e]);
+		for (j = 1; j < slen; j++) {
+			stats->level[level + j].nr_internal_nodes++;
+			stats->level[level + j].has_nodes = true;
+		}
+		if (ft_node_ptr(child) && !ft_node_external(child))
+			calc_stats_node_recursive(ft, child,
+				stats, level + slen);
+		else if (ft_node_ptr(child)) {
+			struct cds_ft_node *iter_node;
+			unsigned int count = 0;
+
+			iter_node = (struct cds_ft_node *) ft_node_ptr(child);
+			cds_ft_for_each_duplicate(iter_node) {
+				if (count++ == 0)
+					stats->level[level + slen].nr_external_nodes++;
+				else
+					stats->level[level + slen].nr_duplicate_external_nodes++;
+				stats->level[level + slen].has_nodes = true;
+			}
+		}
+	}
+}
+
+static
+void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_stats *stats, int level)
 {
 	unsigned int key;
+
+	if (ft_node_collapsed(node_flag)) {
+		calc_stats_collapsed(ft, node_flag, stats, level);
+		return;
+	}
 
 	for (key = 0; key < 256; key++) {
 		struct cds_ft_inode_flag *child_node_flag;
@@ -11961,9 +12077,8 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 		if (!ft_node_ptr(child_node_flag))
 			continue;
 		if (ft_node_collapsed(child_node_flag)) {
-			/* Skip collapsed nodes in stats for now. */
-			stats->level[level].nr_internal_nodes++;
-			stats->level[level].has_nodes = true;
+			calc_stats_collapsed(ft, child_node_flag,
+				stats, level);
 			continue;
 		}
 		if (ft_node_internal(child_node_flag)) {
