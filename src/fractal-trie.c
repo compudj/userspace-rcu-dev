@@ -3282,16 +3282,23 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 	unsigned int e;
 
 	/* Check external_nodes at the collapsed node's depth. */
-	if (track) {
+	{
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 		struct cds_ft_node *ext =
 			rcu_dereference(cn_meta->external_nodes);
 
-		if (ext || track_longest) {
+		if (track && (ext || track_longest)) {
 			*match_len_p = i;
 			*match_node_p = ext;
 		}
+		/*
+		 * Key ends at the collapsed node's depth: break out
+		 * of the main loop so the terminal check handles
+		 * external_nodes with proper iterator path setup.
+		 */
+		if (remaining_key == 0)
+			return FT_COMPRESSED_BREAK;
 	}
 
 	/* Scan entries for a matching suffix. */
@@ -4547,6 +4554,117 @@ going_up:
 		 * (compressed or external entries from compressed path
 		 * traversal have no siblings).
 		 */
+#ifdef FEATURE_FT_COLLAPSE
+		if (ft_node_collapsed(iter_path_node(iter)[level - 1])) {
+			/*
+			 * Collapsed node: entries ARE siblings. Find the
+			 * entry level (where the collapsed node pointer
+			 * starts in the path) and search for the next
+			 * entry in the inequality direction.
+			 */
+			struct cds_ft_collapsed_node *col =
+				ft_collapsed_node_ptr(
+					iter_path_node(iter)[level - 1]);
+			struct cds_ft_inode_flag **cptrs =
+				ft_collapsed_ptrs(col);
+			int entry_depth = level - 1;
+			int best_sibling = -1;
+			unsigned int e;
+
+			/* Walk back to the collapsed node's entry depth. */
+			while (entry_depth > 0 &&
+			       iter_path_node(iter)[entry_depth - 1] ==
+			       iter_path_node(iter)[level - 1])
+				entry_depth--;
+
+			/* Search for the next entry in direction @dir. */
+			for (e = 0; e < col->nr_entries; e++) {
+				uint8_t *suffix;
+				unsigned int slen, mc;
+				int r;
+
+				if (ft_collapsed_entry_dead(col, e))
+					continue;
+				if (!ft_node_ptr(cptrs[e]))
+					continue;
+				suffix = ft_collapsed_suffix(col, e);
+				slen = ft_collapsed_suffix_len(col, e);
+
+				/*
+				 * Compare entry suffix vs ordinal_key.
+				 * The suffix starts at ordinal_key[entry_depth - 1]
+				 * and spans (level - entry_depth + 1) bytes.
+				 */
+				{
+				unsigned int cur_len = (unsigned)(level - entry_depth + 1);
+
+				mc = slen < cur_len ? slen : cur_len;
+				r = memcmp(suffix, &ordinal_key[entry_depth - 1],
+					   mc);
+				if (r == 0) {
+					if (slen == cur_len)
+						r = 0; /* exact current entry */
+					else if (slen < cur_len)
+						r = -1;
+					else
+						r = 1;
+				}
+				}
+				if (r == 0)
+					continue; /* same entry */
+
+				if (dir == FT_RIGHT && r > 0) {
+					if (best_sibling < 0)
+						best_sibling = (int)e;
+					else {
+						uint8_t *bs = ft_collapsed_suffix(
+							col, (unsigned)best_sibling);
+						unsigned int bl = ft_collapsed_suffix_len(
+							col, (unsigned)best_sibling);
+						unsigned int mc2 = bl < slen ? bl : slen;
+						int r2 = memcmp(suffix, bs, mc2);
+						if (r2 < 0 || (r2 == 0 && slen < bl))
+							best_sibling = (int)e;
+					}
+				} else if (dir == FT_LEFT && r < 0) {
+					if (best_sibling < 0)
+						best_sibling = (int)e;
+					else {
+						uint8_t *bs = ft_collapsed_suffix(
+							col, (unsigned)best_sibling);
+						unsigned int bl = ft_collapsed_suffix_len(
+							col, (unsigned)best_sibling);
+						unsigned int mc2 = bl < slen ? bl : slen;
+						int r2 = memcmp(suffix, bs, mc2);
+						if (r2 > 0 || (r2 == 0 && slen > bl))
+							best_sibling = (int)e;
+					}
+				}
+			}
+			if (best_sibling >= 0) {
+				unsigned int slen = ft_collapsed_suffix_len(
+					col, (unsigned)best_sibling);
+				uint8_t *suffix = ft_collapsed_suffix(
+					col, (unsigned)best_sibling);
+				unsigned int k;
+
+				for (k = 0; k < slen; k++) {
+					ordinal_key[entry_depth - 1 + k] = suffix[k];
+					iter_path_node(iter)[entry_depth + k] =
+						iter_path_node(iter)[level - 1];
+				}
+				level = entry_depth - 1 + slen;
+				node_flag = ft_dereference_acquire(
+					cptrs[best_sibling]);
+				iter_path_node(iter)[level + 1] = node_flag;
+				break;
+			}
+			/* No sibling entry found, continue going up. */
+			level = entry_depth + 1;
+			going_up = true;
+			continue;
+		}
+#endif
 		if (!ft_node_internal(iter_path_node(iter)[level - 1])) {
 			going_up = true;
 			continue;
@@ -4692,7 +4810,6 @@ descend_children:
 				goto found_minmax;
 			}
 		}
-		skip_eq_external_nodes = false;
 		/* Return external node. */
 		if (ft_node_external(node_flag))
 			break;
@@ -4740,6 +4857,7 @@ descend_children:
 			iter_path_node(iter)[level] = node_flag;
 			if (ft_node_external(node_flag))
 				break;
+			skip_eq_external_nodes = false;
 			/* Continue descent from the child. */
 			continue;
 		}
@@ -4821,6 +4939,7 @@ descend_children:
 			skip_eq_external_nodes = false;
 			continue;
 		}
+		skip_eq_external_nodes = false;
 		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir, level == 1);
 		/*
 		 * If minmax returns NULL, it was an empty root. We found nothing.
@@ -6590,22 +6709,14 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 
 #ifdef FEATURE_FT_COLLAPSE
 		/*
-		 * Only create collapsed when:
-		 * 1. Both suffixes are >= 3 bytes (saves enough levels).
-		 * 2. Fixed-length keys only. Variable-length keys allow
-		 *    detach/graft at any prefix, which may fall within
-		 *    a collapsed suffix — requiring a split that's not
-		 *    yet implemented.
+		 * Eagerly create collapsed node when both suffixes
+		 * are long enough.  This creates JudyL-like terminal
+		 * nodes during initial build rather than waiting for
+		 * the collapse-on-remove path.  Prefix conflicts
+		 * during subsequent inserts are handled by the
+		 * explode path.
 		 */
-		/*
-		 * Eager creation disabled: the compressed-to-collapsed
-		 * conversion on insert regresses because prefix conflicts
-		 * cause frequent explodes.  Collapsed nodes are instead
-		 * created via the collapse-on-remove path when density
-		 * counters indicate a subtree has become sparse.
-		 */
-		if (0 && min_slen >= 3 &&
-		    ft->group->key_len != CDS_FT_LEN_VARIABLE) {
+		if (0 && min_slen >= FT_COLLAPSE_SUFFIX_MIN) {
 			dret = ft_split_compressed_to_collapsed(ft,
 				d->nfp, d->nf, *iter_key_p, remaining,
 				j, node);
@@ -9370,9 +9481,24 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					if (ft_collapsed_entry_dead(col, e))
 						continue;
 					slen = ft_collapsed_suffix_len(col, e);
-					if (slen > remaining)
-						continue;
 					suffix = ft_collapsed_suffix(col, e);
+					/*
+					 * Partial prefix match (detach prefix
+					 * falls within this suffix): explode the
+					 * collapsed node and restart descent.
+					 */
+					if (slen > remaining) {
+						match = true;
+						for (j = 0; j < remaining; j++) {
+							if (key_to_ordinal(ft, ik[j]) != suffix[j]) {
+								match = false;
+								break;
+							}
+						}
+						if (match)
+							goto detach_collapsed_explode;
+						continue;
+					}
 					match = true;
 					for (j = 0; j < slen; j++) {
 						if (key_to_ordinal(ft, ik[j]) != suffix[j]) {
@@ -9406,6 +9532,73 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				if (!found)
 					return CDS_FT_STATUS_NOT_FOUND;
 				continue;
+
+			detach_collapsed_explode:
+				/*
+				 * Detach prefix falls within a collapsed
+				 * entry suffix.  Explode the collapsed node
+				 * into internal+compressed nodes and restart
+				 * the descent from this depth.
+				 */
+				{
+					struct cds_ft_inode_flag *internal_flag = NULL;
+					struct cds_ft_metadata *int_meta;
+					unsigned int ee;
+					int eret;
+
+					for (ee = 0; ee < col->nr_entries; ee++) {
+						uint8_t *sfx;
+						unsigned int slen2;
+						struct cds_ft_inode_flag *child2;
+
+						if (ft_collapsed_entry_dead(col, ee))
+							continue;
+						sfx = ft_collapsed_suffix(col, ee);
+						slen2 = ft_collapsed_suffix_len(col, ee);
+						child2 = cptrs[ee];
+						if (!ft_node_ptr(child2))
+							continue;
+						if (slen2 > 1) {
+							struct cds_ft_compressed_node *wrap;
+							struct cds_ft_metadata *wrap_meta;
+							unsigned int wk;
+
+							wrap = alloc_compressed_node(ft, slen2 - 1, &wrap_meta);
+							if (!wrap)
+								return CDS_FT_STATUS_MEMORY_ERROR;
+							wrap->child = child2;
+							wrap->len = slen2 - 1;
+							for (wk = 0; wk < slen2 - 1; wk++)
+								wrap->key_bytes[wk] = sfx[wk + 1];
+							wrap_meta->nr_child = 1;
+							if (!ft_node_external(child2)) {
+								struct cds_ft_metadata *cm =
+									cds_ft_item_to_metadata(ft_node_ptr(child2));
+								uatomic_store(&wrap_meta->nr_keys, cm->nr_keys, CMM_RELAXED);
+							} else {
+								uatomic_store(&wrap_meta->nr_keys,
+									ft_node_ptr(child2) ? 1 : 0, CMM_RELAXED);
+							}
+							child2 = ft_compressed_node_flag(wrap);
+						}
+						eret = ft_node_set_nth(ft, &internal_flag,
+							sfx[0], child2, NULL,
+							internal_flag ? cds_ft_item_to_metadata(ft_node_ptr(internal_flag)) : NULL);
+						if (eret)
+							return CDS_FT_STATUS_MEMORY_ERROR;
+					}
+					if (!internal_flag)
+						return CDS_FT_STATUS_MEMORY_ERROR;
+					int_meta = cds_ft_item_to_metadata(ft_node_ptr(internal_flag));
+					uatomic_store(&int_meta->nr_keys, col_meta->nr_keys, CMM_RELAXED);
+					int_meta->external_nodes = col_meta->external_nodes;
+
+					rcu_assign_pointer(*dd.d.nfp, internal_flag);
+					free_collapsed_node(ft, col);
+
+					dd.d.nf = internal_flag;
+					continue; /* Restart descent from this depth. */
+				}
 			}
 
 			meta = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
@@ -10579,17 +10772,26 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 				}
 				remaining -= ck;
 			} else if (ft_node_collapsed(parent)) {
-				/* Walk collapsed entries in ascending suffix order. */
+				/*
+				 * Walk collapsed entries in ascending suffix
+				 * order.  ft_lookup_nth_collapsed fills the
+				 * iter path and ordinal_key through the
+				 * matched suffix — don't overwrite them.
+				 */
 				enum ft_compressed_action act;
 				int lv = depth;
 
 				act = ft_lookup_nth_collapsed(
 					&parent, &lv, ordinal_key,
 					iter, &remaining);
-				if (act == FT_COMPRESSED_CONTINUE ||
-				    act == FT_COMPRESSED_BREAK) {
+				if (act == FT_COMPRESSED_BREAK) {
+					/* Leaf at path[lv]. */
+					level = lv;
+					goto descend_forward;
+				}
+				if (act == FT_COMPRESSED_CONTINUE) {
+					/* Non-leaf child at path[lv+1]. */
 					level = lv + 1;
-					iter_path_node(iter)[level] = parent;
 					goto descend_forward;
 				}
 			} else {
