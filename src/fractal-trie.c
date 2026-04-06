@@ -7553,6 +7553,10 @@ int ft_detach_node(struct cds_ft *ft,
 			metadata_stack[nr_branch - 1],
 			n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 			detach_parent_flag_ptr == &ft->root);
+		/* Recompute density on the (potentially recompacted) parent. */
+		if (!ret && ft_node_ptr(iter_node_flag) &&
+		    ft_node_internal(iter_node_flag))
+			ft_init_node_density(iter_node_flag);
 	}
 	if (ret)
 		goto end;
@@ -7596,6 +7600,17 @@ end:
 		}
 		for (i = 0; i < nr_clear; i++)
 			free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
+		/*
+		 * Recompute density on the surviving parent node.
+		 * The detach may have removed children, changing the
+		 * local subtree structure.
+		 */
+		{
+			struct cds_ft_inode_flag *parent = *detach_parent_flag_ptr;
+
+			if (ft_node_ptr(parent) && ft_node_internal(parent))
+				ft_init_node_density(parent);
+		}
 	}
 	return ret;
 }
