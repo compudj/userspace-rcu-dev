@@ -769,8 +769,11 @@ uint8_t ordinal_to_key(const struct cds_ft *ft, uint8_t ordinal)
  * ft_key_match_ordinals: compare @len bytes of raw key data against
  * an ordinal array.  Returns true if all bytes match.
  *
- * Fast path: when the key map is identity (the common case), uses
- * memcmp instead of per-byte key_to_ordinal calls.
+ * Fast path: when the key map is identity (the common case),
+ * compares raw bytes directly without key_to_ordinal table
+ * lookups.  Uses an inline loop instead of memcmp to avoid a
+ * PLT function call for the short comparisons typical of
+ * compressed paths (2-8 bytes) and collapsed suffixes.
  */
 static inline_lookup
 bool ft_key_match_ordinals(const struct cds_ft *ft,
@@ -779,8 +782,13 @@ bool ft_key_match_ordinals(const struct cds_ft *ft,
 {
 	unsigned int j;
 
-	if (caa_likely(ft->group->key_map.identity))
-		return memcmp(key, ordinals, len) == 0;
+	if (caa_likely(ft->group->key_map.identity)) {
+		for (j = 0; j < len; j++) {
+			if (key[j] != ordinals[j])
+				return false;
+		}
+		return true;
+	}
 
 	for (j = 0; j < len; j++) {
 		if (ft->group->key_map.key_to_ordinal[key[j]] != ordinals[j])
