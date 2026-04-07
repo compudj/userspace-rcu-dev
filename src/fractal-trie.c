@@ -4577,12 +4577,95 @@ going_up:
 			       iter_path_node(iter)[level - 1])
 				entry_depth--;
 
-			/* Search for the next entry in direction @dir. */
+			/*
+			 * Search for the next collapsed entry (sibling)
+			 * in the inequality direction.
+			 *
+			 * Path layout: path[entry_depth] = collapsed
+			 * node (from parent dispatch).
+			 * path[entry_depth+1..entry_depth+slen] =
+			 * collapsed_node_flag (from handler).
+			 * Suffix in ordinal_key[entry_depth..
+			 * entry_depth+slen-1].
+			 *
+			 * First, identify the current entry by finding
+			 * the entry whose suffix is a prefix of
+			 * ordinal_key[entry_depth..].  Then find the
+			 * nearest sibling in @dir.
+			 */
+			/*
+			 * Find the current entry by suffix match, then
+			 * determine if we're still within the collapsed
+			 * entry's span or past it (in the child's subtree).
+			 */
+			{
+			int current_entry = -1;
+			unsigned int cur_slen = 0;
+
+			for (e = 0; e < col->nr_entries; e++) {
+				uint8_t *suffix;
+				unsigned int slen, j2;
+				bool match2;
+
+				if (ft_collapsed_entry_dead(col, e))
+					continue;
+				suffix = ft_collapsed_suffix(col, e);
+				slen = ft_collapsed_suffix_len(col, e);
+				match2 = true;
+				for (j2 = 0; j2 < slen; j2++) {
+					if (suffix[j2] != ordinal_key[entry_depth + j2]) {
+						match2 = false;
+						break;
+					}
+				}
+				if (match2) {
+					current_entry = (int)e;
+					cur_slen = slen;
+					break;
+				}
+			}
+
+			/*
+			 * If we're past the current entry's suffix (in
+			 * the child's subtree), check the child node
+			 * for siblings first.  The path at the child's
+			 * depth was overwritten by the handler, so we
+			 * recover the child from cptrs[current_entry].
+			 */
+			if (current_entry >= 0 &&
+			    level > (int)(entry_depth + cur_slen)) {
+				struct cds_ft_inode_flag *child_flag =
+					ft_dereference_acquire(
+						cptrs[current_entry]);
+
+				if (ft_node_ptr(child_flag) &&
+				    ft_node_internal(child_flag)) {
+					uint8_t sib_key;
+
+					node_flag = ft_node_get_leftright(
+						child_flag,
+						ordinal_key[entry_depth + cur_slen],
+						&sib_key, dir);
+					if (ft_node_ptr(node_flag)) {
+						ordinal_key[entry_depth + cur_slen] =
+							sib_key;
+						level = entry_depth + cur_slen + 1;
+						iter_path_node(iter)[level] =
+							node_flag;
+						break;
+					}
+				}
+				/* No child sibling: fall through to
+				 * collapsed sibling search below. */
+			}
+
 			for (e = 0; e < col->nr_entries; e++) {
 				uint8_t *suffix;
 				unsigned int slen, mc;
 				int r;
 
+				if ((int)e == current_entry)
+					continue;
 				if (ft_collapsed_entry_dead(col, e))
 					continue;
 				if (!ft_node_ptr(cptrs[e]))
@@ -4590,28 +4673,21 @@ going_up:
 				suffix = ft_collapsed_suffix(col, e);
 				slen = ft_collapsed_suffix_len(col, e);
 
-				/*
-				 * Compare entry suffix vs ordinal_key.
-				 * The suffix starts at ordinal_key[entry_depth - 1]
-				 * and spans (level - entry_depth + 1) bytes.
-				 */
-				{
-				unsigned int cur_len = (unsigned)(level - entry_depth + 1);
-
-				mc = slen < cur_len ? slen : cur_len;
-				r = memcmp(suffix, &ordinal_key[entry_depth - 1],
-					   mc);
-				if (r == 0) {
-					if (slen == cur_len)
-						r = 0; /* exact current entry */
-					else if (slen < cur_len)
-						r = -1;
-					else
+				if (current_entry >= 0) {
+					uint8_t *cs = ft_collapsed_suffix(
+						col, (unsigned)current_entry);
+					mc = slen < cur_slen ? slen : cur_slen;
+					r = memcmp(suffix, cs, mc);
+					if (r == 0)
+						r = (slen > cur_slen) ? 1 :
+						    (slen < cur_slen) ? -1 : 0;
+				} else {
+					mc = slen;
+					r = memcmp(suffix,
+						&ordinal_key[entry_depth], mc);
+					if (r == 0)
 						r = 1;
 				}
-				}
-				if (r == 0)
-					continue; /* same entry */
 
 				if (dir == FT_RIGHT && r > 0) {
 					if (best_sibling < 0)
@@ -4641,6 +4717,7 @@ going_up:
 					}
 				}
 			}
+			}
 			if (best_sibling >= 0) {
 				unsigned int slen = ft_collapsed_suffix_len(
 					col, (unsigned)best_sibling);
@@ -4648,15 +4725,23 @@ going_up:
 					col, (unsigned)best_sibling);
 				unsigned int k;
 
+				/*
+				 * Fill ordinal_key and path for the
+				 * sibling entry, matching the convention
+				 * used by the internal node sibling code:
+				 * ordinal_key up to level-1, path[level]
+				 * = child node.
+				 */
 				for (k = 0; k < slen; k++) {
-					ordinal_key[entry_depth - 1 + k] = suffix[k];
-					iter_path_node(iter)[entry_depth + k] =
-						iter_path_node(iter)[level - 1];
+					ordinal_key[entry_depth + k] = suffix[k];
+					if (k > 0)
+						iter_path_node(iter)[entry_depth + k] =
+							iter_path_node(iter)[level - 1];
 				}
-				level = entry_depth - 1 + slen;
+				level = entry_depth + slen;
 				node_flag = ft_dereference_acquire(
 					cptrs[best_sibling]);
-				iter_path_node(iter)[level + 1] = node_flag;
+				iter_path_node(iter)[level] = node_flag;
 				break;
 			}
 			/* No sibling entry found, continue going up. */
@@ -7361,8 +7446,7 @@ insert_done:
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 #ifdef FEATURE_FT_COLLAPSE
-		ft_check_collapse_on_remove(ft, snapshot, snapshot_depth,
-			nr_snapshot);
+		ft_check_collapse_on_path(ft, key, key_len);
 #endif
 	}
 
