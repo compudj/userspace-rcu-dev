@@ -1918,48 +1918,74 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
  * ft_node_get_nth: get nth item from a node.
  * node_flag is already rcu_dereference'd.
  */
+/*
+ * Tag-to-type_class table: maps bits 0-3 of a tagged pointer
+ * directly to the type_class, bypassing the ft_types[] struct
+ * load for the dispatch decision.  16 bytes, always in L1.
+ *
+ * Eliminates a dependent load chain from the critical path:
+ * tag bits → ft_types[] address computation → struct load.
+ * Instead: tag bits → single byte load from small table.
+ *
+ * Initialized at startup by ft_init_tag_to_class().
+ */
+static uint8_t ft_tag_to_class[16];
+
+static void __attribute__((constructor))
+ft_init_tag_to_class(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 16; i++) {
+		if (!(i & FT_INTERNAL_MASK)) {
+			/* External, compressed, or collapsed. */
+			ft_tag_to_class[i] = FT_NULL;
+		} else {
+			unsigned int type_idx = (i >> FT_INTERNAL_BITS) & 0x7;
+
+			ft_tag_to_class[i] = ft_types[type_idx].type_class;
+		}
+	}
+}
+
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	unsigned int type_index;
+	unsigned long tag = (unsigned long) node_flag & 0xF;
+	uint8_t tc = ft_tag_to_class[tag];
 	struct cds_ft_inode *node;
-	const struct cds_ft_type *type;
 
-	/*
-	 * Compressed node: the compressed path replaces a chain of
-	 * single-child nodes.  It should not be reached via
-	 * ft_node_get_nth — callers handle compressed nodes directly
-	 * in their descent loops.  If somehow reached (e.g., from
-	 * going-up backtracking), return NULL to indicate no match.
-	 */
-	if (ft_node_compressed(node_flag)) {
+	if (caa_unlikely(tc == FT_NULL)) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
 		return NULL;
 	}
-	node = ft_node_ptr(node_flag);
-	assert(node != NULL);
-	type_index = ft_node_type(node_flag);
-	type = &ft_types[type_index];
 
-	switch (type->type_class) {
-	case FT_LINEAR:
+	node = ft_node_ptr(node_flag);
+
+	/*
+	 * Dispatch on type_class from the tag table.
+	 * Pigeon needs no ft_types[] access (direct indexed).
+	 * Linear/pool defer ft_types[] load to their handlers.
+	 */
+	if (tc == FT_PIGEON)
+		return ft_pigeon_node_get_nth(NULL, node,
+				node_flag_ptr, n);
+
+	{
+		unsigned int type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
+		const struct cds_ft_type *type = &ft_types[type_index];
+
+		if (tc == FT_POOL)
+			return ft_pool_node_get_nth(type, node, node_flag,
+					node_flag_ptr, n);
+		if (tc == FT_LINEAR_WIDE)
+			return ft_linear_wide_node_get_nth(type, node,
+					node_flag_ptr, n);
 		return ft_linear_node_get_nth(type, node,
 				node_flag_ptr, n);
-	case FT_LINEAR_WIDE:
-		return ft_linear_wide_node_get_nth(type, node,
-				node_flag_ptr, n);
-	case FT_POOL:
-		return ft_pool_node_get_nth(type, node, node_flag,
-				node_flag_ptr, n);
-	case FT_PIGEON:
-		return ft_pigeon_node_get_nth(type, node,
-				node_flag_ptr, n);
-	default:
-		assert(0);
-		return (void *) -1UL;
 	}
 }
 
