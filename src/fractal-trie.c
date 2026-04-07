@@ -5475,13 +5475,151 @@ void ft_propagate_node_density(struct cds_ft_inode_flag **snapshot,
 #define FT_COLLAPSE_DENSITY_RATIO	0
 
 /*
+ * ft_collapse_walk_subtree: recursively enumerate paths from @walk,
+ * appending suffix bytes to @suffix_buf.  Each leaf (external node)
+ * or depth-limited node becomes a separate entry in the collapsed
+ * node.  Multi-child internal nodes are recursed into, forking
+ * separate entries per child path.
+ *
+ * Returns 0 on success, -1 if the collapsed node can't fit all
+ * paths (too many entries or scan zone overflow).  On failure the
+ * caller must discard the entire collapsed node — partial results
+ * are not usable.
+ */
+static
+int ft_collapse_walk_subtree(struct cds_ft *ft,
+		struct cds_ft_inode_flag *walk,
+		uint8_t *suffix_buf, unsigned int slen,
+		unsigned int max_depth,
+		struct cds_ft_collapsed_node *col,
+		struct cds_ft_inode_flag **col_ptrs,
+		unsigned int max_entries)
+{
+	while (slen < max_depth) {
+		if (!ft_node_ptr(walk))
+			return -1;
+
+		/* Leaf: emit terminal entry. */
+		if (ft_node_external(walk))
+			goto emit_entry;
+
+		/* Compressed: absorb path bytes. */
+		if (ft_node_compressed(walk)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(walk);
+			unsigned int j;
+
+			if (slen + cn->len > max_depth)
+				goto emit_entry; /* Would exceed depth. */
+			for (j = 0; j < cn->len; j++)
+				suffix_buf[slen++] = cn->key_bytes[j];
+			walk = ft_dereference_acquire(cn->child);
+			continue;
+		}
+
+		/* Already-collapsed: emit intermediate entry. */
+		if (ft_node_collapsed(walk))
+			goto emit_entry;
+
+		/* Internal node. */
+		if (ft_node_internal(walk)) {
+			struct cds_ft_metadata *wm =
+				cds_ft_item_to_metadata(ft_node_ptr(walk));
+
+			if (wm->nr_child == 1) {
+				/* Single child: extend by 1 byte. */
+				uint8_t wk;
+				struct cds_ft_inode_flag *wc;
+
+				wc = ft_node_get_minmax(walk, &wk,
+					FT_LEFTMOST, false);
+				if (!ft_node_ptr(wc))
+					return -1;
+				suffix_buf[slen++] = wk;
+				walk = wc;
+				continue;
+			}
+
+			/*
+			 * Multi-child: recurse into each child.
+			 * Each child path becomes a separate entry.
+			 *
+			 * If this internal node has external_nodes
+			 * (variable-length keys ending at this depth),
+			 * don't recurse — emit an intermediate entry
+			 * pointing to this node to preserve the
+			 * external_nodes.
+			 */
+			if (wm->external_nodes)
+				goto emit_entry;
+			{
+				uint8_t ck;
+				int pv = -1;
+				struct cds_ft_inode_flag *c;
+
+				c = ft_node_get_direction(walk, pv,
+					&ck, FT_RIGHT);
+				while (ft_node_ptr(c)) {
+					suffix_buf[slen] = ck;
+					if (ft_collapse_walk_subtree(ft,
+							c, suffix_buf,
+							slen + 1,
+							max_depth,
+							col, col_ptrs,
+							max_entries))
+						return -1;
+					pv = ck;
+					c = ft_node_get_direction(walk,
+						pv, &ck, FT_RIGHT);
+				}
+			}
+			return 0;
+		}
+		return -1; /* Unknown node type. */
+	}
+
+	/* Depth limit reached: emit intermediate entry. */
+emit_entry:
+	{
+		unsigned int entry_idx = col->nr_entries;
+		unsigned int suffix_start;
+		uint8_t *suffix_pos;
+
+		if (slen == 0)
+			return -1;
+		if (entry_idx >= max_entries)
+			return -1;
+		if (entry_idx == 0)
+			suffix_start = FT_COLLAPSED_SCAN_ZONE_SIZE;
+		else
+			suffix_start = col->data[entry_idx - 1]
+				& FT_COLLAPSED_OFFSET_MASK;
+		if (1 + entry_idx + 1 + slen > suffix_start)
+			return -1;
+
+		suffix_pos = ((uint8_t *) col) + suffix_start - slen;
+		memcpy(suffix_pos, suffix_buf, slen);
+		col->data[entry_idx] = (uint8_t)(suffix_pos
+			- (uint8_t *) col);
+		col_ptrs[entry_idx] = walk;
+		col->nr_entries++;
+		return 0;
+	}
+}
+
+/*
  * ft_try_collapse_at_node: attempt to collapse the subtree rooted at
  * the given node into a collapsed node.  The node must be internal.
  *
- * Scans the immediate children, building collapsed entries.  Each
- * child that is a single-path chain (compressed or single-child
- * internal) contributes one entry with extended suffix.  Multi-child
- * subtrees contribute one short entry (first byte only, child = subtree).
+ * Recursively enumerates paths through the subtree (up to
+ * FT_NODE_DENSITY_DEPTH levels deep), forking at multi-child
+ * internal nodes.  Each path to a leaf (external node) becomes a
+ * terminal entry with a full suffix.  Paths that hit the depth
+ * limit, an already-collapsed node, or a NULL pointer become
+ * intermediate entries.
+ *
+ * All-or-nothing: if any path can't fit in the scan zone, the
+ * entire collapse is aborted and the subtree is left untouched.
  *
  * Returns the collapsed node flag on success, NULL if the subtree
  * doesn't fit or collapsing is not beneficial.
@@ -5496,52 +5634,23 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	struct cds_ft_collapsed_node *col;
 	struct cds_ft_metadata *col_meta;
 	struct cds_ft_inode_flag **col_ptrs;
-	unsigned int type_index = ft_node_type(node_flag);
-	const struct cds_ft_type *type = &ft_types[type_index];
 	unsigned int nr_child = metadata->nr_child;
-	unsigned int scan_used, max_entries;
+	unsigned int max_entries;
 	uint8_t child_key;
 	int pivot;
 	struct cds_ft_inode_flag *child;
+	uint8_t suffix_buf[FT_COLLAPSED_SCAN_ZONE_SIZE];
 
-	/* Quick pre-filter. */
-	if (nr_child < 2 || nr_child > FT_COLLAPSE_NR_CHILD_MAX)
-		return NULL;
-	/*
-	 * Density check: count actual traversable children rather than
-	 * relying on nr_nodes_at_depth[0], which only tracks 6 levels
-	 * and is often 0 for deep tries (e.g. file paths with long
-	 * compressed chains).  The count of non-external children is
-	 * cheap since nr_child is bounded by NR_CHILD_MAX (≤ 16).
-	 */
-	{
-		unsigned int nr_traversable = 0;
-		uint8_t ck;
-		int pv = -1;
-		struct cds_ft_inode_flag *c;
-
-		c = ft_node_get_direction(node_flag, pv, &ck, FT_RIGHT);
-		while (ft_node_ptr(c)) {
-			if (!ft_node_external(c))
-				nr_traversable++;
-			pv = ck;
-			c = ft_node_get_direction(node_flag, pv, &ck, FT_RIGHT);
-		}
-		if (nr_traversable < FT_COLLAPSE_DENSITY_MIN)
-			return NULL;
-		if (nr_traversable < nr_child * FT_COLLAPSE_DENSITY_RATIO)
-			return NULL;
-	}
-
-	/*
-	 * Phase 1: minimum scan zone cost check.
-	 * Each child needs at least 1 offset byte + 1 suffix byte.
-	 */
-	scan_used = 1 + nr_child + nr_child;
-	if (scan_used > FT_COLLAPSED_SCAN_ZONE_SIZE)
+	/* Quick pre-filter: need at least 2 children. */
+	if (nr_child < 2)
 		return NULL;
 
 	max_entries = ft_collapsed_max_entries(FT_COLLAPSED_ORDER_LARGE);
+
+	/*
+	 * If immediate children already exceed max entries, the
+	 * recursive walk can only produce more.  Skip early.
+	 */
 	if (nr_child > max_entries)
 		return NULL;
 
@@ -5552,100 +5661,77 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	col_ptrs = ft_collapsed_ptrs(col);
 
 	/*
-	 * Phase 2: scan children in ordinal order, build entries
-	 * with greedy suffix extension.  Each entry starts with the
-	 * child's ordinal key byte, then extends through single-child
-	 * chains (compressed paths or single-child internal nodes).
+	 * Try recursive leaf-path enumeration, progressively
+	 * reducing the max depth from FT_NODE_DENSITY_DEPTH down
+	 * to 2.  At each depth, the walk enumerates all paths and
+	 * emits terminal entries for leaves reached within the
+	 * depth, or intermediate entries for deeper subtrees.
+	 *
+	 * Deeper walks produce more terminal entries (better for
+	 * lookups) but need more scan zone space.  Shallower walks
+	 * produce fewer intermediate entries that still save hops.
+	 *
+	 * The per-level density counters gate each attempt: if the
+	 * total node count within the candidate depth exceeds
+	 * max_entries, skip that depth (the walk would overflow).
 	 */
-	pivot = -1;
-	child = ft_node_get_direction(node_flag, pivot, &child_key, FT_RIGHT);
-	while (ft_node_ptr(child)) {
-		unsigned int entry_idx = col->nr_entries;
-		unsigned int suffix_start, suffix_budget;
-		uint8_t *suffix_pos;
-		struct cds_ft_inode_flag *walk = child;
-		unsigned int slen = 0;
+	{
+		int try_depth;
+		bool found = false;
 
-		if (entry_idx >= max_entries) {
-			free_collapsed_node(ft, col);
-			return NULL;
-		}
+		for (try_depth = FT_NODE_DENSITY_DEPTH;
+		     try_depth >= 2; try_depth--) {
+			bool walk_ok = true;
 
-		/* Compute available suffix space. */
-		if (entry_idx == 0)
-			suffix_start = FT_COLLAPSED_SCAN_ZONE_SIZE;
-		else
-			suffix_start = col->data[entry_idx - 1] & FT_COLLAPSED_OFFSET_MASK;
-		/* Reserve space for offset byte + at least 1 suffix byte. */
-		if (1 + entry_idx + 1 + 1 > suffix_start) {
-			free_collapsed_node(ft, col);
-			return NULL;
-		}
-		suffix_budget = suffix_start - (1 + entry_idx + 1);
-
-		/*
-		 * Build suffix: start with the child ordinal, then
-		 * greedily extend through single-child chains.
-		 * Write suffix right-to-left into the scan zone.
-		 *
-		 * Use a temporary buffer, then copy into the scan zone
-		 * (since we write right-to-left but build left-to-right).
-		 */
-		{
-			uint8_t suffix_buf[FT_COLLAPSED_SCAN_ZONE_SIZE];
-
-			suffix_buf[slen++] = child_key;
-
-			while (slen < suffix_budget) {
-				if (ft_node_compressed(walk)) {
-					struct cds_ft_compressed_node *cn =
-						ft_compressed_node_ptr(walk);
-					unsigned int j;
-
-					if (slen + cn->len > suffix_budget)
-						break; /* Can't fit full compressed path. */
-					for (j = 0; j < cn->len; j++)
-						suffix_buf[slen++] = cn->key_bytes[j];
-					walk = ft_dereference_acquire(cn->child);
-					if (!ft_node_ptr(walk))
-						break;
-					continue;
-				}
-				if (ft_node_internal(walk)) {
-					struct cds_ft_metadata *wm =
-						cds_ft_item_to_metadata(ft_node_ptr(walk));
-
-					if (wm->nr_child != 1)
-						break; /* Branching: stop. */
-					/* Single child: extend by 1 byte. */
-					{
-						uint8_t wk;
-						struct cds_ft_inode_flag *wc;
-
-						wc = ft_node_get_minmax(walk, &wk,
-							FT_LEFTMOST, false);
-						if (!ft_node_ptr(wc))
-							break;
-						suffix_buf[slen++] = wk;
-						walk = wc;
-					}
-					continue;
-				}
-				/* External, collapsed, or other: stop. */
-				break;
+			/*
+			 * Use density counter as a hint to skip depths
+			 * that clearly won't fit.  counter[0] counts
+			 * nodes within 6 levels; per-level counters
+			 * give finer resolution.  Since counters may be
+			 * stale (undercounted), treat them as a lower
+			 * bound — only skip when the counter EXCEEDS
+			 * max_entries.
+			 */
+			if (try_depth <= (int) FT_NODE_DENSITY_DEPTH &&
+			    metadata->nr_nodes_at_depth[0] > max_entries) {
+				/*
+				 * Even the aggregate count exceeds
+				 * capacity.  Try a shallower depth.
+				 */
+				continue;
 			}
 
-			/* Write suffix right-to-left into scan zone. */
-			suffix_pos = ((uint8_t *) col) + suffix_start - slen;
-			memcpy(suffix_pos, suffix_buf, slen);
+			/* Reset collapsed node for this attempt. */
+			memset(col, 0, FT_COLLAPSED_SCAN_ZONE_SIZE);
+			col->nr_entries = 0;
+
+			pivot = -1;
+			child = ft_node_get_direction(node_flag, pivot,
+				&child_key, FT_RIGHT);
+			while (ft_node_ptr(child)) {
+				suffix_buf[0] = child_key;
+				if (ft_collapse_walk_subtree(ft, child,
+						suffix_buf, 1,
+						(unsigned int) try_depth,
+						col, col_ptrs,
+						max_entries)) {
+					walk_ok = false;
+					break;
+				}
+				pivot = child_key;
+				child = ft_node_get_direction(node_flag,
+					pivot, &child_key, FT_RIGHT);
+			}
+			if (walk_ok && col->nr_entries >= 2) {
+				found = true;
+				break;
+			}
 		}
 
-		col->data[entry_idx] = (uint8_t)(suffix_pos - (uint8_t *) col);
-		col_ptrs[entry_idx] = walk; /* Child at end of extended suffix. */
-		col->nr_entries++;
-
-		pivot = child_key;
-		child = ft_node_get_direction(node_flag, pivot, &child_key, FT_RIGHT);
+		if (!found) {
+			free_collapsed_node(ft, col);
+			return NULL;
+		}
 	}
 
 	if (col->nr_entries < 2) {
@@ -5654,28 +5740,16 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	}
 
 	/*
-	 * Post-check: verify that the minimum suffix length across
-	 * all entries meets the threshold.  Short suffixes don't save
-	 * enough levels to justify the collapsed scan overhead.
+	 * Post-check: require at least one entry with slen >= 2.
 	 */
 	{
 		unsigned int e;
-		unsigned int min_slen = UINT_MAX;
 		bool has_long_suffix = false;
 
 		for (e = 0; e < col->nr_entries; e++) {
-			unsigned int slen = ft_collapsed_suffix_len(col, e);
-
-			if (slen < min_slen)
-				min_slen = slen;
-			if (slen >= FT_COLLAPSE_SUFFIX_MIN)
+			if (ft_collapsed_suffix_len(col, e) >= FT_COLLAPSE_SUFFIX_MIN)
 				has_long_suffix = true;
 		}
-		/*
-		 * Require at least one entry with a multi-byte suffix.
-		 * Entries with slen=1 (direct external children) are
-		 * allowed as long as other entries save levels.
-		 */
 		if (!has_long_suffix) {
 			free_collapsed_node(ft, col);
 			return NULL;
@@ -7457,7 +7531,8 @@ insert_done:
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 #ifdef FEATURE_FT_COLLAPSE
-		ft_check_collapse_on_path(ft, key, key_len);
+		if (key_len > 0)
+			ft_check_collapse_on_path(ft, key, key_len);
 #endif
 	}
 
