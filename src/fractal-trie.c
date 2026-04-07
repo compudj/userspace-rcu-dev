@@ -753,7 +753,7 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key,
 	cds_ft_u32_to_key(ft, (uint32_t) v ^ (1U << (shift - 1)), key, _key_len);
 }
 
-static
+static inline_lookup
 uint8_t key_to_ordinal(const struct cds_ft *ft, uint8_t key)
 {
 	if (caa_likely(ft->group->key_map.identity))
@@ -761,7 +761,7 @@ uint8_t key_to_ordinal(const struct cds_ft *ft, uint8_t key)
 	return ft->group->key_map.key_to_ordinal[key];
 }
 
-static
+static inline_lookup
 uint8_t ordinal_to_key(const struct cds_ft *ft, uint8_t ordinal)
 {
 	if (caa_likely(ft->group->key_map.identity))
@@ -808,14 +808,14 @@ struct cds_ft_inode_flag *ft_node_flag_pool_2d(struct cds_ft_inode *node,
  * since NULL has tag bits 0b00.  Callers that need to distinguish
  * NULL from a valid external node should also check ft_node_ptr().
  */
-static
+static inline_lookup
 bool ft_node_external(struct cds_ft_inode_flag *node)
 {
 	return ((unsigned long) node & FT_TAG_MASK) == 0;
 }
 
 #ifdef FEATURE_FT_COMPRESS
-static
+static inline_lookup
 bool ft_node_compressed(struct cds_ft_inode_flag *node)
 {
 	return ((unsigned long) node & FT_TAG_MASK_WIDE) == FT_COMPRESSED_MASK;
@@ -829,7 +829,7 @@ bool ft_node_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
 #endif
 
 #ifdef FEATURE_FT_COLLAPSE
-static
+static inline_lookup
 bool ft_node_collapsed(struct cds_ft_inode_flag *node)
 {
 	return ((unsigned long) node & FT_TAG_MASK_WIDE) == FT_COLLAPSED_MASK;
@@ -842,7 +842,7 @@ bool ft_node_collapsed(struct cds_ft_inode_flag *node __attribute__((unused)))
 }
 #endif
 
-static
+static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v, type_idx;
@@ -889,13 +889,13 @@ struct cds_ft_inode *_ft_node_mask_ptr(struct cds_ft_inode_flag *node)
 	return (struct cds_ft_inode *) (((unsigned long) node) & FT_PTR_MASK);
 }
 
-static
+static inline_lookup
 bool ft_node_internal(struct cds_ft_inode_flag *node)
 {
 	return (unsigned long) node & FT_INTERNAL_MASK;
 }
 
-static
+static inline_lookup
 unsigned long ft_node_type(struct cds_ft_inode_flag *node)
 {
 	unsigned long type;
@@ -919,7 +919,7 @@ struct cds_ft_inode_flag *ft_compressed_node_flag(
 		(((unsigned long) node) | FT_COMPRESSED_MASK);
 }
 
-static
+static inline_lookup
 struct cds_ft_compressed_node *ft_compressed_node_ptr(
 		struct cds_ft_inode_flag *node)
 {
@@ -935,7 +935,7 @@ struct cds_ft_inode_flag *ft_collapsed_node_flag(
 		(((unsigned long) node) | FT_COLLAPSED_MASK);
 }
 
-static
+static inline_lookup
 struct cds_ft_collapsed_node *ft_collapsed_node_ptr(
 		struct cds_ft_inode_flag *node)
 {
@@ -3128,7 +3128,7 @@ enum ft_prefix_tracking {
  * FT_COMPRESSED_BREAK to break, or FT_COMPRESSED_END to jump to
  * the function's end label (with *status_ret and *found_ret set).
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag_p,
 		const uint8_t **key_p, unsigned int *i_p,
@@ -3262,7 +3262,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
  * handling) when the collapsed node is encountered at the current
  * position rather than as a child of ft_node_get_nth.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag_p,
 		const uint8_t **key_p, unsigned int *i_p,
