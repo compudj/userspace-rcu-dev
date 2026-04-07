@@ -4578,6 +4578,21 @@ going_up:
 				entry_depth--;
 
 			/*
+			 * Compute the ordinal_key base for suffix data.
+			 * When the parent is compressed, the collapsed
+			 * handler's first write is at entry_depth, and
+			 * ordinal_key starts at entry_depth-1.  When
+			 * the parent is internal (dispatch), the first
+			 * write is at entry_depth+1, and ordinal_key
+			 * starts at entry_depth.
+			 */
+			{
+			int suffix_base = entry_depth;
+			if (entry_depth > 0 &&
+			    ft_node_compressed(iter_path_node(iter)[entry_depth - 1]))
+				suffix_base = entry_depth - 1;
+
+			/*
 			 * Search for the next collapsed entry (sibling)
 			 * in the inequality direction.
 			 *
@@ -4613,7 +4628,7 @@ going_up:
 				slen = ft_collapsed_suffix_len(col, e);
 				match2 = true;
 				for (j2 = 0; j2 < slen; j2++) {
-					if (suffix[j2] != ordinal_key[entry_depth + j2]) {
+					if (suffix[j2] != ordinal_key[suffix_base + j2]) {
 						match2 = false;
 						break;
 					}
@@ -4633,7 +4648,7 @@ going_up:
 			 * recover the child from cptrs[current_entry].
 			 */
 			if (current_entry >= 0 &&
-			    level > (int)(entry_depth + cur_slen)) {
+			    level > (int)(suffix_base + cur_slen)) {
 				struct cds_ft_inode_flag *child_flag =
 					ft_dereference_acquire(
 						cptrs[current_entry]);
@@ -4644,12 +4659,12 @@ going_up:
 
 					node_flag = ft_node_get_leftright(
 						child_flag,
-						ordinal_key[entry_depth + cur_slen],
+						ordinal_key[suffix_base + cur_slen],
 						&sib_key, dir);
 					if (ft_node_ptr(node_flag)) {
-						ordinal_key[entry_depth + cur_slen] =
+						ordinal_key[suffix_base + cur_slen] =
 							sib_key;
-						level = entry_depth + cur_slen + 1;
+						level = suffix_base + cur_slen + 1;
 						iter_path_node(iter)[level] =
 							node_flag;
 						break;
@@ -4684,7 +4699,7 @@ going_up:
 				} else {
 					mc = slen;
 					r = memcmp(suffix,
-						&ordinal_key[entry_depth], mc);
+						&ordinal_key[suffix_base], mc);
 					if (r == 0)
 						r = 1;
 				}
@@ -4733,12 +4748,12 @@ going_up:
 				 * = child node.
 				 */
 				for (k = 0; k < slen; k++) {
-					ordinal_key[entry_depth + k] = suffix[k];
+					ordinal_key[suffix_base + k] = suffix[k];
 					if (k > 0)
-						iter_path_node(iter)[entry_depth + k] =
+						iter_path_node(iter)[suffix_base + k] =
 							iter_path_node(iter)[level - 1];
 				}
-				level = entry_depth + slen;
+				level = suffix_base + slen;
 				node_flag = ft_dereference_acquire(
 					cptrs[best_sibling]);
 				iter_path_node(iter)[level] = node_flag;
@@ -4748,6 +4763,7 @@ going_up:
 			level = entry_depth + 1;
 			going_up = true;
 			continue;
+		} /* suffix_base scope */
 		}
 #endif
 		if (!ft_node_internal(iter_path_node(iter)[level - 1])) {
