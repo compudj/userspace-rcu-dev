@@ -766,8 +766,12 @@ uint8_t ordinal_to_key(const struct cds_ft *ft, uint8_t ordinal)
 }
 
 /*
- * ft_key_match_ordinals: compare @len bytes of raw key data against
- * an ordinal array.  Returns true if all bytes match.
+ * ft_key_cmp_ordinals: compare @len bytes of raw key data against
+ * an ordinal array.  Returns 0 if equal, <0 if key < ordinals,
+ * >0 if key > ordinals (memcmp semantics).
+ *
+ * If @mismatch_pos is non-NULL, stores the index of the first
+ * mismatching byte (undefined on full match).
  *
  * Fast path: when the key map is identity (the common case),
  * compares raw bytes directly without key_to_ordinal table
@@ -776,25 +780,33 @@ uint8_t ordinal_to_key(const struct cds_ft *ft, uint8_t ordinal)
  * compressed paths (2-8 bytes) and collapsed suffixes.
  */
 static inline_lookup
-bool ft_key_match_ordinals(const struct cds_ft *ft,
+int ft_key_cmp_ordinals(const struct cds_ft *ft,
 		const uint8_t *key, const uint8_t *ordinals,
-		unsigned int len)
+		unsigned int len, unsigned int *mismatch_pos)
 {
 	unsigned int j;
 
 	if (caa_likely(ft->group->key_map.identity)) {
 		for (j = 0; j < len; j++) {
-			if (key[j] != ordinals[j])
-				return false;
+			if (key[j] != ordinals[j]) {
+				if (mismatch_pos)
+					*mismatch_pos = j;
+				return (int)key[j] - (int)ordinals[j];
+			}
 		}
-		return true;
+		return 0;
 	}
 
 	for (j = 0; j < len; j++) {
-		if (ft->group->key_map.key_to_ordinal[key[j]] != ordinals[j])
-			return false;
+		uint8_t mapped = ft->group->key_map.key_to_ordinal[key[j]];
+
+		if (mapped != ordinals[j]) {
+			if (mismatch_pos)
+				*mismatch_pos = j;
+			return (int)mapped - (int)ordinals[j];
+		}
 	}
-	return true;
+	return 0;
 }
 
 static
@@ -1033,12 +1045,10 @@ unsigned int ft_match_compressed_key(struct cds_ft *ft,
 		const struct cds_ft_compressed_node *cn,
 		unsigned int cmp)
 {
-	unsigned int j;
+	unsigned int pos;
 
-	for (j = 0; j < cmp; j++) {
-		if (key_to_ordinal(ft, key[j]) != cn->key_bytes[j])
-			return j;
-	}
+	if (ft_key_cmp_ordinals(ft, key, cn->key_bytes, cmp, &pos) != 0)
+		return pos;
 	return cmp;
 }
 
@@ -3085,21 +3095,21 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 		}
 	}
 
-	if (caa_likely(!track_longest)) {
-		/* Fast path: no per-byte tracking needed. */
-		if (!ft_key_match_ordinals(ft, key, cn->key_bytes, cmp_len)) {
+	{
+		unsigned int mpos;
+		int cmp = ft_key_cmp_ordinals(ft, key, cn->key_bytes,
+				cmp_len, &mpos);
+
+		if (cmp != 0) {
+			if (track_longest) {
+				*match_len_p = i + mpos;
+				*match_node_p = NULL;
+			}
 			*status_ret = CDS_FT_STATUS_NOT_FOUND;
 			return FT_COMPRESSED_END;
 		}
-	} else {
-		for (j = 0; j < cmp_len; j++) {
-			if (key_to_ordinal(ft, key[j]) != cn->key_bytes[j]) {
-				*match_len_p = i + j;
-				*match_node_p = NULL;
-				*status_ret = CDS_FT_STATUS_NOT_FOUND;
-				return FT_COMPRESSED_END;
-			}
-			*match_len_p = i + j + 1;
+		if (track_longest) {
+			*match_len_p = i + cmp_len;
 			*match_node_p = NULL;
 		}
 	}
@@ -3243,7 +3253,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 		if (slen > remaining_key)
 			continue;
 		suffix = ft_collapsed_suffix(cn, e);
-		match = ft_key_match_ordinals(ft, key, suffix, slen);
+		match = (ft_key_cmp_ordinals(ft, key, suffix, slen, NULL) == 0);
 		if (!match)
 			continue;
 
@@ -3387,7 +3397,7 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
 		if (slen > remaining)
 			continue;
 		suffix = ft_collapsed_suffix(cn, e);
-		match = ft_key_match_ordinals(ft, key, suffix, slen);
+		match = (ft_key_cmp_ordinals(ft, key, suffix, slen, NULL) == 0);
 		if (!match)
 			continue;
 
@@ -7233,12 +7243,16 @@ int _cds_ft_insert(struct cds_ft *ft,
 				suffix = ft_collapsed_suffix(col, e);
 
 				/* Check for prefix match. */
-				for (j = 0; j < slen && j < remaining; j++) {
-					if (key_to_ordinal(ft, iter_key[j]) != suffix[j])
-						break;
+				{
+					unsigned int cmp_len = slen < remaining ? slen : remaining;
+
+					if (ft_key_cmp_ordinals(ft, iter_key, suffix, cmp_len, &j) != 0) {
+						if (j == 0)
+							continue; /* No prefix overlap. */
+					} else {
+						j = cmp_len; /* Full match up to cmp_len. */
+					}
 				}
-				if (j == 0)
-					continue; /* No prefix overlap. */
 
 				if (j == slen && slen <= remaining) {
 					/* Full suffix match: traverse through. */
@@ -7623,13 +7637,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = true;
-				for (j = 0; j < slen; j++) {
-					if (key_to_ordinal(ft, iter_key[j]) != suffix[j]) {
-						match = false;
-						break;
-					}
-				}
+				match = (ft_key_cmp_ordinals(ft, iter_key, suffix, slen, NULL) == 0);
 				if (!match)
 					continue;
 				ft_snapshot_push(snapshot, snapshot_depth,
@@ -8259,13 +8267,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = true;
-				for (j = 0; j < slen; j++) {
-					if (key_to_ordinal(ft, iter_key[j]) != suffix[j]) {
-						match = false;
-						break;
-					}
-				}
+				match = (ft_key_cmp_ordinals(ft, iter_key, suffix, slen, NULL) == 0);
 				if (!match)
 					continue;
 				if (!ft_node_ptr(cptrs[e]))
@@ -8571,13 +8573,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = true;
-				for (j = 0; j < slen; j++) {
-					if (key_to_ordinal(ft, iter_key[j]) != suffix[j]) {
-						match = false;
-						break;
-					}
-				}
+				match = (ft_key_cmp_ordinals(ft, iter_key, suffix, slen, NULL) == 0);
 				if (!match)
 					continue;
 				if (!ft_node_ptr(cptrs[e])) {
@@ -8992,13 +8988,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = true;
-				for (j = 0; j < slen; j++) {
-					if (key_to_ordinal(ft, ik[j]) != suffix[j]) {
-						match = false;
-						break;
-					}
-				}
+				match = (ft_key_cmp_ordinals(ft, ik, suffix, slen, NULL) == 0);
 				if (!match)
 					continue;
 				ft_snapshot_push(snapshot, snapshot_depth,
@@ -9791,24 +9781,11 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					 * collapsed node and restart descent.
 					 */
 					if (slen > remaining) {
-						match = true;
-						for (j = 0; j < remaining; j++) {
-							if (key_to_ordinal(ft, ik[j]) != suffix[j]) {
-								match = false;
-								break;
-							}
-						}
-						if (match)
+						if (ft_key_cmp_ordinals(ft, ik, suffix, remaining, NULL) == 0)
 							goto detach_collapsed_explode;
 						continue;
 					}
-					match = true;
-					for (j = 0; j < slen; j++) {
-						if (key_to_ordinal(ft, ik[j]) != suffix[j]) {
-							match = false;
-							break;
-						}
-					}
+					match = (ft_key_cmp_ordinals(ft, ik, suffix, slen, NULL) == 0);
 					if (!match)
 						continue;
 					if (!ft_node_ptr(cptrs[e]))
