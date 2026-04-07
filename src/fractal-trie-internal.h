@@ -195,31 +195,50 @@ struct cds_ft_compressed_node {
  *
  * Two-zone layout (node allocation >= 128 bytes, cache-line aligned):
  *
- *   Zone 1 (scan zone, bytes 0-63 = 1 cache line):
+ *   Zone 1 (scan zone, variable size: 64, 128, or 256 bytes):
  *     [nr_entries] [offset_0] [offset_1] ... → ← ... [suffix_1] [suffix_0]
  *     Offset array grows left-to-right; suffix data grows right-to-left.
+ *     Scan zone size encoded in bits 6-7 of nr_entries.
  *
- *   Zone 2 (pointer zone, bytes 64+):
+ *   Zone 2 (pointer zone, starts at scan zone end):
  *     [ptr_0] [ptr_1] ... [ptr_{nr_entries-1}]
  *     Child pointers (struct cds_ft_inode_flag *), any node type.
+ *
+ * nr_entries encoding (uint8_t):
+ *   bits 7-6 = scan zone size selector:
+ *     00 = 64B  (1 cache line, FT_COLLAPSED_SCAN_64)
+ *     01 = 128B (2 cache lines, FT_COLLAPSED_SCAN_128)
+ *     10 = 256B (4 cache lines, FT_COLLAPSED_SCAN_256)
+ *     11 = reserved
+ *   bits 5-0 = entry count (max 63)
  *
  * entry_offset[i] encoding (uint8_t):
  *   bit 7 (0x80) = tombstone marker (1 = dead entry, 0 = live)
  *   bits 0-6     = byte offset from start of node to entry i's suffix
+ *                  (for 256B scan zone, full 8-bit offset without tombstone)
  *
  * Suffix length derivation:
- *   Entry 0: suffix_len = 64 - (offset[0] & 0x7F)
- *   Entry i (i > 0): suffix_len = (offset[i-1] & 0x7F) - (offset[i] & 0x7F)
+ *   Entry 0: suffix_len = scan_zone_size - (offset[0] & offset_mask)
+ *   Entry i: suffix_len = (offset[i-1] & offset_mask) - (offset[i] & offset_mask)
  *
- * Lookup: scan zone 1 (1 cache line) to find matching suffix, then
- * load ptr[i] from zone 2 (1 cache line).  Total: 2 cache-line loads.
+ * Lookup: scan zone 1 to find matching suffix, then
+ * load ptr[i] from zone 2.
  */
-#define FT_COLLAPSED_SCAN_ZONE_SIZE	64
+#define FT_COLLAPSED_SCAN_64		0	/* bits 7-6 = 00 */
+#define FT_COLLAPSED_SCAN_128		1	/* bits 7-6 = 01 */
+#define FT_COLLAPSED_SCAN_256		2	/* bits 7-6 = 10 */
+#define FT_COLLAPSED_SCAN_SHIFT		6
+#define FT_COLLAPSED_NR_ENTRIES_MASK	0x3F
+
 #define FT_COLLAPSED_TOMBSTONE		0x80
 #define FT_COLLAPSED_OFFSET_MASK	0x7F
 
+/* Legacy define for code that uses the 64B scan zone size directly. */
+#define FT_COLLAPSED_SCAN_ZONE_SIZE	64
+
 struct cds_ft_collapsed_node {
-	uint8_t nr_entries;			/* Number of entries (including dead). */
+	uint8_t nr_entries;			/* Bits 7-6: scan zone selector.
+						 * Bits 5-0: entry count. */
 	uint8_t data[];				/* Offset array + suffix data (zone 1). */
 };
 

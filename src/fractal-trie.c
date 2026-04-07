@@ -1025,24 +1025,52 @@ struct cds_ft_collapsed_node *ft_collapsed_node_ptr(
 
 /* Collapsed node accessors. */
 
+static const unsigned int ft_collapsed_scan_sizes[] = {
+	[FT_COLLAPSED_SCAN_64]  = 64,
+	[FT_COLLAPSED_SCAN_128] = 128,
+	[FT_COLLAPSED_SCAN_256] = 256,
+};
+
+static inline
+unsigned int ft_collapsed_nr_entries(struct cds_ft_collapsed_node *cn)
+{
+	return cn->nr_entries & FT_COLLAPSED_NR_ENTRIES_MASK;
+}
+
+static inline
+unsigned int ft_collapsed_scan_zone_size(struct cds_ft_collapsed_node *cn)
+{
+	return ft_collapsed_scan_sizes[cn->nr_entries >> FT_COLLAPSED_SCAN_SHIFT];
+}
+
+static inline
+unsigned int ft_collapsed_offset_mask(struct cds_ft_collapsed_node *cn)
+{
+	/* 64B/128B scan zones: 7-bit offsets (bit 7 = tombstone). */
+	/* 256B scan zone: full 8-bit offsets (no tombstone). */
+	return (cn->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) >= FT_COLLAPSED_SCAN_256
+		? 0xFF : FT_COLLAPSED_OFFSET_MASK;
+}
+
 static inline
 uint8_t *ft_collapsed_suffix(struct cds_ft_collapsed_node *cn,
 		unsigned int i)
 {
-	return ((uint8_t *) cn) + (cn->data[i] & FT_COLLAPSED_OFFSET_MASK);
+	return ((uint8_t *) cn) + (cn->data[i] & ft_collapsed_offset_mask(cn));
 }
 
 static inline
 unsigned int ft_collapsed_suffix_len(struct cds_ft_collapsed_node *cn,
 		unsigned int i)
 {
-	unsigned int start = cn->data[i] & FT_COLLAPSED_OFFSET_MASK;
+	unsigned int mask = ft_collapsed_offset_mask(cn);
+	unsigned int start = cn->data[i] & mask;
 	unsigned int end;
 
 	if (i == 0)
-		end = FT_COLLAPSED_SCAN_ZONE_SIZE;
+		end = ft_collapsed_scan_zone_size(cn);
 	else
-		end = cn->data[i - 1] & FT_COLLAPSED_OFFSET_MASK;
+		end = cn->data[i - 1] & mask;
 	assert(end >= start);
 	return end - start;
 }
@@ -1051,13 +1079,16 @@ static inline
 struct cds_ft_inode_flag **ft_collapsed_ptrs(struct cds_ft_collapsed_node *cn)
 {
 	return (struct cds_ft_inode_flag **)
-		(((uint8_t *) cn) + FT_COLLAPSED_SCAN_ZONE_SIZE);
+		(((uint8_t *) cn) + ft_collapsed_scan_zone_size(cn));
 }
 
 static inline
 bool ft_collapsed_entry_dead(struct cds_ft_collapsed_node *cn,
 		unsigned int i)
 {
+	/* 256B scan zone uses full 8-bit offsets — no tombstone bit. */
+	if ((cn->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) >= FT_COLLAPSED_SCAN_256)
+		return false;	/* TODO: need alternate tombstone scheme for 256B. */
 	return cn->data[i] & FT_COLLAPSED_TOMBSTONE;
 }
 
