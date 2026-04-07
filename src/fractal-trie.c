@@ -765,6 +765,30 @@ uint8_t ordinal_to_key(const struct cds_ft *ft, uint8_t ordinal)
 	return ft->group->key_map.ordinal_to_key[ordinal];
 }
 
+/*
+ * ft_key_match_ordinals: compare @len bytes of raw key data against
+ * an ordinal array.  Returns true if all bytes match.
+ *
+ * Fast path: when the key map is identity (the common case), uses
+ * memcmp instead of per-byte key_to_ordinal calls.
+ */
+static inline_lookup
+bool ft_key_match_ordinals(const struct cds_ft *ft,
+		const uint8_t *key, const uint8_t *ordinals,
+		unsigned int len)
+{
+	unsigned int j;
+
+	if (caa_likely(ft->group->key_map.identity))
+		return memcmp(key, ordinals, len) == 0;
+
+	for (j = 0; j < len; j++) {
+		if (ft->group->key_map.key_to_ordinal[key[j]] != ordinals[j])
+			return false;
+	}
+	return true;
+}
+
 static
 struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 		unsigned long type)
@@ -3053,16 +3077,20 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 		}
 	}
 
-	for (j = 0; j < cmp_len; j++) {
-		if (key_to_ordinal(ft, key[j]) != cn->key_bytes[j]) {
-			if (track && track_longest) {
-				*match_len_p = i + j;
-				*match_node_p = NULL;
-			}
+	if (caa_likely(!track_longest)) {
+		/* Fast path: no per-byte tracking needed. */
+		if (!ft_key_match_ordinals(ft, key, cn->key_bytes, cmp_len)) {
 			*status_ret = CDS_FT_STATUS_NOT_FOUND;
 			return FT_COMPRESSED_END;
 		}
-		if (track && track_longest) {
+	} else {
+		for (j = 0; j < cmp_len; j++) {
+			if (key_to_ordinal(ft, key[j]) != cn->key_bytes[j]) {
+				*match_len_p = i + j;
+				*match_node_p = NULL;
+				*status_ret = CDS_FT_STATUS_NOT_FOUND;
+				return FT_COMPRESSED_END;
+			}
 			*match_len_p = i + j + 1;
 			*match_node_p = NULL;
 		}
@@ -3207,13 +3235,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 		if (slen > remaining_key)
 			continue;
 		suffix = ft_collapsed_suffix(cn, e);
-		match = true;
-		for (j = 0; j < slen; j++) {
-			if (key_to_ordinal(ft, key[j]) != suffix[j]) {
-				match = false;
-				break;
-			}
-		}
+		match = ft_key_match_ordinals(ft, key, suffix, slen);
 		if (!match)
 			continue;
 
@@ -3357,13 +3379,7 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
 		if (slen > remaining)
 			continue;
 		suffix = ft_collapsed_suffix(cn, e);
-		match = true;
-		for (j = 0; j < slen; j++) {
-			if (key_to_ordinal(ft, key[j]) != suffix[j]) {
-				match = false;
-				break;
-			}
-		}
+		match = ft_key_match_ordinals(ft, key, suffix, slen);
 		if (!match)
 			continue;
 
