@@ -3441,24 +3441,24 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 	unsigned int remaining_key = key_depth - 1 - i;
 	unsigned int e;
 
-	/* Check external_nodes at the collapsed node's depth. */
-	{
+	/*
+	 * Check external_nodes only when needed: for prefix
+	 * tracking or when the key ends at this depth.  Avoid
+	 * loading the metadata cache line during normal lookups
+	 * that traverse through the collapsed node.
+	 */
+	if (remaining_key == 0)
+		return FT_COMPRESSED_BREAK;
+	if (track) {
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 		struct cds_ft_node *ext =
 			rcu_dereference(cn_meta->external_nodes);
 
-		if (track && (ext || track_longest)) {
+		if (ext || track_longest) {
 			*match_len_p = i;
 			*match_node_p = ext;
 		}
-		/*
-		 * Key ends at the collapsed node's depth: break out
-		 * of the main loop so the terminal check handles
-		 * external_nodes with proper iterator path setup.
-		 */
-		if (remaining_key == 0)
-			return FT_COMPRESSED_BREAK;
 	}
 
 	/* Scan entries for a matching suffix. */
