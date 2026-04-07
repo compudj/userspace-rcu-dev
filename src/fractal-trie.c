@@ -6970,6 +6970,155 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 	}
 }
 
+#ifdef FEATURE_FT_COLLAPSE
+/*
+ * ft_explode_entries: rebuild a trie from a range of collapsed node
+ * entries [start, end).  Entries must be sorted by suffix.
+ * @suffix_offset: number of leading suffix bytes already consumed
+ * by parent levels.
+ *
+ * Returns the root of the rebuilt sub-trie, or NULL on error.
+ *
+ * For a single entry: creates a compressed path to the child.
+ * For multiple entries sharing the same byte at suffix_offset:
+ * groups them and recursively builds a sub-trie for each group.
+ * Different first bytes get separate children of a new internal node.
+ *
+ * Recursion depth bounded by max suffix length (FT_NODE_DENSITY_DEPTH).
+ */
+static
+struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
+		struct cds_ft_collapsed_node *col,
+		struct cds_ft_inode_flag **cptrs,
+		unsigned int start, unsigned int end,
+		unsigned int suffix_offset)
+{
+	unsigned int count = end - start;
+
+	if (count == 0)
+		return NULL;
+
+	if (count == 1) {
+		unsigned int e = start;
+		unsigned int slen = ft_collapsed_suffix_len(col, e);
+		uint8_t *sfx = ft_collapsed_suffix(col, e);
+		struct cds_ft_inode_flag *child = cptrs[e];
+
+		if (slen <= suffix_offset)
+			return child;
+
+		{
+			unsigned int rlen = slen - suffix_offset;
+			struct cds_ft_compressed_node *cn;
+			struct cds_ft_metadata *cn_meta;
+
+			cn = alloc_compressed_node(ft, rlen, &cn_meta);
+			if (!cn)
+				return NULL;
+			cn->child = child;
+			cn->len = rlen;
+			memcpy(cn->key_bytes, sfx + suffix_offset, rlen);
+			cn_meta->nr_child = 1;
+			if (!ft_node_external(child) && ft_node_ptr(child)) {
+				struct cds_ft_metadata *cm =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(child));
+				uatomic_store(&cn_meta->nr_keys,
+					cm->nr_keys, CMM_RELAXED);
+			} else {
+				uatomic_store(&cn_meta->nr_keys,
+					ft_node_ptr(child) ? 1 : 0,
+					CMM_RELAXED);
+			}
+			return ft_compressed_node_flag(cn);
+		}
+	}
+
+	/* Multiple entries: group by byte at suffix_offset. */
+	{
+		struct cds_ft_inode_flag *internal_flag = NULL;
+		unsigned int i = start;
+		unsigned long total_keys = 0;
+
+		while (i < end) {
+			uint8_t *sfx_i = ft_collapsed_suffix(col, i);
+			unsigned int slen_i = ft_collapsed_suffix_len(col, i);
+			uint8_t first;
+			unsigned int group_end;
+			struct cds_ft_inode_flag *sub;
+
+			if (slen_i <= suffix_offset) {
+				/* Entry is a leaf at this depth. */
+				/* Should not happen with sorted entries. */
+				i++;
+				continue;
+			}
+
+			first = sfx_i[suffix_offset];
+			group_end = i + 1;
+
+			while (group_end < end) {
+				uint8_t *sfx_g =
+					ft_collapsed_suffix(col, group_end);
+				unsigned int slen_g =
+					ft_collapsed_suffix_len(col, group_end);
+
+				if (slen_g <= suffix_offset ||
+				    sfx_g[suffix_offset] != first)
+					break;
+				group_end++;
+			}
+
+			sub = ft_explode_entries(ft, col, cptrs,
+					i, group_end,
+					suffix_offset + 1);
+			if (!sub)
+				return NULL;
+
+			{
+				struct cds_ft_inode *old_recompacted = NULL;
+				int ret;
+
+				ret = ft_node_set_nth(ft, &internal_flag,
+					first, sub, &old_recompacted,
+					internal_flag ?
+						cds_ft_item_to_metadata(
+							ft_node_ptr(internal_flag))
+						: NULL);
+				if (ret)
+					return NULL;
+				if (old_recompacted)
+					free_cds_ft_node(ft, old_recompacted);
+			}
+
+			/* Accumulate key counts. */
+			if (ft_node_ptr(sub)) {
+				if (ft_node_external(sub))
+					total_keys += 1;
+				else {
+					struct cds_ft_metadata *sm =
+						cds_ft_item_to_metadata(
+							ft_node_ptr(sub));
+					total_keys += uatomic_load(
+						&sm->nr_keys, CMM_RELAXED);
+				}
+			}
+
+			i = group_end;
+		}
+
+		if (internal_flag) {
+			struct cds_ft_metadata *im =
+				cds_ft_item_to_metadata(
+					ft_node_ptr(internal_flag));
+			uatomic_store(&im->nr_keys, total_keys,
+				CMM_RELAXED);
+		}
+		return internal_flag;
+	}
+}
+#endif /* FEATURE_FT_COLLAPSE */
+
 static
 int _cds_ft_insert(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
@@ -7111,85 +7260,38 @@ int _cds_ft_insert(struct cds_ft *ft,
 				goto collapsed_inplace_add;
 
 			collapsed_explode:
-				if (1) {
+				{
 					/*
 					 * Collapsed node full or has prefix
-					 * conflict: explode into an internal
-					 * node.  Create a fresh internal
-					 * node, populate it with all entries from
-					 * the collapsed node, then continue with
-					 * the normal insert path.
+					 * conflict: explode into internal +
+					 * compressed nodes.  Uses recursive
+					 * trie rebuild to handle entries that
+					 * may share first suffix bytes.
 					 */
-					struct cds_ft_inode_flag *internal_flag = NULL;
-					struct cds_ft_metadata *int_meta;
+					struct cds_ft_inode_flag *internal_flag;
 					struct cds_ft_metadata *col_meta =
 						cds_ft_item_to_metadata(
 							(struct cds_ft_inode *) col);
-					unsigned int ee;
-					int eret;
 
-					/* Set nth for each live entry's first suffix byte. */
-					for (ee = 0; ee < col->nr_entries; ee++) {
-						uint8_t *sfx;
-						unsigned int slen2;
-						struct cds_ft_inode_flag *child;
-
-						if (ft_collapsed_entry_dead(col, ee))
-							continue;
-						sfx = ft_collapsed_suffix(col, ee);
-						slen2 = ft_collapsed_suffix_len(col, ee);
-						child = cptrs[ee];
-						if (!ft_node_ptr(child))
-							continue;
-
-						if (slen2 > 1) {
-							/* Wrap remaining suffix in compressed node. */
-							struct cds_ft_compressed_node *wrap;
-							struct cds_ft_metadata *wrap_meta;
-							unsigned int wk;
-
-							wrap = alloc_compressed_node(ft, slen2 - 1, &wrap_meta);
-							if (!wrap) {
-								ret = -ENOMEM;
-								goto insert_done;
-							}
-							wrap->child = child;
-							wrap->len = slen2 - 1;
-							for (wk = 0; wk < slen2 - 1; wk++)
-								wrap->key_bytes[wk] = sfx[wk + 1];
-							wrap_meta->nr_child = 1;
-							if (!ft_node_external(child)) {
-								struct cds_ft_metadata *cm =
-									cds_ft_item_to_metadata(ft_node_ptr(child));
-								uatomic_store(&wrap_meta->nr_keys, cm->nr_keys, CMM_RELAXED);
-							} else {
-								uatomic_store(&wrap_meta->nr_keys, ft_node_ptr(child) ? 1 : 0, CMM_RELAXED);
-							}
-							child = ft_compressed_node_flag(wrap);
-						}
-						eret = ft_node_set_nth(ft, &internal_flag,
-							sfx[0], child, NULL,
-							internal_flag ? cds_ft_item_to_metadata(ft_node_ptr(internal_flag)) : NULL);
-						if (eret) {
-							ret = -ENOMEM;
-							goto insert_done;
-						}
-					}
+					internal_flag = ft_explode_entries(ft,
+						col, cptrs,
+						0, col->nr_entries, 0);
 					if (!internal_flag) {
 						ret = -ENOMEM;
 						goto insert_done;
 					}
-					int_meta = cds_ft_item_to_metadata(ft_node_ptr(internal_flag));
-					uatomic_store(&int_meta->nr_keys, col_meta->nr_keys, CMM_RELAXED);
-					int_meta->external_nodes = col_meta->external_nodes;
+					{
+						struct cds_ft_metadata *int_meta =
+							cds_ft_item_to_metadata(
+								ft_node_ptr(internal_flag));
+						int_meta->external_nodes =
+							col_meta->external_nodes;
+					}
 
-					/* Publish the internal node in place of the collapsed node. */
 					rcu_assign_pointer(*d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
 
-					/* Re-descend: the new internal node is now d.nf. */
 					d.nf = internal_flag;
-					/* Continue normal insert loop. */
 					continue;
 				}
 
@@ -9694,70 +9796,27 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				continue;
 
 			detach_collapsed_explode:
-				/*
-				 * Detach prefix falls within a collapsed
-				 * entry suffix.  Explode the collapsed node
-				 * into internal+compressed nodes and restart
-				 * the descent from this depth.
-				 */
 				{
-					struct cds_ft_inode_flag *internal_flag = NULL;
-					struct cds_ft_metadata *int_meta;
-					unsigned int ee;
-					int eret;
+					struct cds_ft_inode_flag *internal_flag;
 
-					for (ee = 0; ee < col->nr_entries; ee++) {
-						uint8_t *sfx;
-						unsigned int slen2;
-						struct cds_ft_inode_flag *child2;
-
-						if (ft_collapsed_entry_dead(col, ee))
-							continue;
-						sfx = ft_collapsed_suffix(col, ee);
-						slen2 = ft_collapsed_suffix_len(col, ee);
-						child2 = cptrs[ee];
-						if (!ft_node_ptr(child2))
-							continue;
-						if (slen2 > 1) {
-							struct cds_ft_compressed_node *wrap;
-							struct cds_ft_metadata *wrap_meta;
-							unsigned int wk;
-
-							wrap = alloc_compressed_node(ft, slen2 - 1, &wrap_meta);
-							if (!wrap)
-								return CDS_FT_STATUS_MEMORY_ERROR;
-							wrap->child = child2;
-							wrap->len = slen2 - 1;
-							for (wk = 0; wk < slen2 - 1; wk++)
-								wrap->key_bytes[wk] = sfx[wk + 1];
-							wrap_meta->nr_child = 1;
-							if (!ft_node_external(child2)) {
-								struct cds_ft_metadata *cm =
-									cds_ft_item_to_metadata(ft_node_ptr(child2));
-								uatomic_store(&wrap_meta->nr_keys, cm->nr_keys, CMM_RELAXED);
-							} else {
-								uatomic_store(&wrap_meta->nr_keys,
-									ft_node_ptr(child2) ? 1 : 0, CMM_RELAXED);
-							}
-							child2 = ft_compressed_node_flag(wrap);
-						}
-						eret = ft_node_set_nth(ft, &internal_flag,
-							sfx[0], child2, NULL,
-							internal_flag ? cds_ft_item_to_metadata(ft_node_ptr(internal_flag)) : NULL);
-						if (eret)
-							return CDS_FT_STATUS_MEMORY_ERROR;
-					}
+					internal_flag = ft_explode_entries(ft,
+						col, cptrs,
+						0, col->nr_entries, 0);
 					if (!internal_flag)
 						return CDS_FT_STATUS_MEMORY_ERROR;
-					int_meta = cds_ft_item_to_metadata(ft_node_ptr(internal_flag));
-					uatomic_store(&int_meta->nr_keys, col_meta->nr_keys, CMM_RELAXED);
-					int_meta->external_nodes = col_meta->external_nodes;
+					{
+						struct cds_ft_metadata *int_meta =
+							cds_ft_item_to_metadata(
+								ft_node_ptr(internal_flag));
+						int_meta->external_nodes =
+							col_meta->external_nodes;
+					}
 
 					rcu_assign_pointer(*dd.d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
 
 					dd.d.nf = internal_flag;
-					continue; /* Restart descent from this depth. */
+					continue;
 				}
 			}
 
