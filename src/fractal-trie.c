@@ -4682,10 +4682,34 @@ going_up:
 			 * starts at entry_depth.
 			 */
 			{
+			/*
+			 * suffix_base: the ordinal_key position where
+			 * collapsed suffix data starts.  Normally
+			 * entry_depth, except when the collapsed node is
+			 * a direct child of a compressed node (no
+			 * intermediate internal dispatch).  In that case,
+			 * the compressed handler wrote ordinal_key one
+			 * position earlier: suffix_base = entry_depth - 1.
+			 *
+			 * Detect by checking if ordinal_key[entry_depth-1]
+			 * matches any entry's first suffix byte — if so,
+			 * the compressed handler wrote the suffix start
+			 * there (direct transition).
+			 */
 			int suffix_base = entry_depth;
 			if (entry_depth > 0 &&
-			    ft_node_compressed(iter_path_node(iter)[entry_depth - 1]))
-				suffix_base = entry_depth - 1;
+			    ft_node_compressed(iter_path_node(iter)[entry_depth - 1])) {
+				unsigned int te;
+				for (te = 0; te < ft_collapsed_nr_entries(col); te++) {
+					if (ft_collapsed_entry_dead(col, te))
+						continue;
+					if (ft_collapsed_suffix(col, te)[0] ==
+					    ordinal_key[entry_depth - 1]) {
+						suffix_base = entry_depth - 1;
+						break;
+					}
+				}
+			}
 
 			/*
 			 * Search for the next collapsed entry (sibling)
