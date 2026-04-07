@@ -3439,7 +3439,7 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
 }
 #endif /* FEATURE_FT_COLLAPSE */
 
-static
+static inline_lookup
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
 		struct cds_ft_node **result_node,
