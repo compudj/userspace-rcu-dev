@@ -3515,43 +3515,41 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * Compressed node at current position (e.g. compressed
 		 * root or compressed child from ft_node_get_nth).
 		 */
-		if (ft_node_compressed(node_flag)) {
-			enum ft_compressed_action act;
-
-			/*
-			 * Compressed root: decrement i (no key byte
-			 * consumed at this level).
-			 */
-			i--;
-			act = ft_lookup_compressed(ft, &node_flag, &key, &i,
-				key_depth, iter, &iter_path_len,
-				track, track_longest,
-				&match_len, &match_node, &found, &status);
-			if (act == FT_COMPRESSED_END)
-				goto end;
-			if (act == FT_COMPRESSED_BREAK)
-				break;
-			/* CONTINUE: loop back for the child node. */
-			continue;
-		}
-
 		/*
-		 * Collapsed node at current position (e.g. collapsed
-		 * root or collapsed child from ft_node_get_nth).
+		 * Non-internal nodes at this position (compressed or
+		 * collapsed) need special handling.  Internal (bit 0
+		 * set) is the common case — skip directly to the
+		 * key dispatch below.
 		 */
-		if (ft_node_collapsed(node_flag)) {
-			enum ft_compressed_action act;
+		if (caa_unlikely(!ft_node_internal(node_flag))) {
+			if (ft_node_compressed(node_flag)) {
+				enum ft_compressed_action act;
 
-			i--;
-			act = ft_lookup_collapsed(ft, &node_flag, &key, &i,
-				key_depth, iter, &iter_path_len,
-				track, track_longest,
-				&match_len, &match_node, &found, &status);
-			if (act == FT_COMPRESSED_END)
-				goto end;
-			if (act == FT_COMPRESSED_BREAK)
-				break;
-			continue;
+				i--;
+				act = ft_lookup_compressed(ft, &node_flag, &key, &i,
+					key_depth, iter, &iter_path_len,
+					track, track_longest,
+					&match_len, &match_node, &found, &status);
+				if (act == FT_COMPRESSED_END)
+					goto end;
+				if (act == FT_COMPRESSED_BREAK)
+					break;
+				continue;
+			}
+			if (ft_node_collapsed(node_flag)) {
+				enum ft_compressed_action act;
+
+				i--;
+				act = ft_lookup_collapsed(ft, &node_flag, &key, &i,
+					key_depth, iter, &iter_path_len,
+					track, track_longest,
+					&match_len, &match_node, &found, &status);
+				if (act == FT_COMPRESSED_END)
+					goto end;
+				if (act == FT_COMPRESSED_BREAK)
+					break;
+				continue;
+			}
 		}
 
 		iter_key = key_to_ordinal(ft, *(key++));
@@ -3566,7 +3564,26 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			iter_path_node(iter)[i] = node_flag;
 			iter_path_len = i + 1;
 		}
-		if (ft_node_compressed(node_flag)) {
+		/*
+		 * Dispatch child type.  Internal (bit 0 set) is the
+		 * common case — check it first with a single test.
+		 * Compressed, collapsed, and external are rare and
+		 * handled in the else branch.
+		 */
+		if (caa_likely(ft_node_internal(node_flag))) {
+			/* Internal: track prefix match if requested. */
+			if (track && i < key_depth - 1) {
+				const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+				struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
+						ft_node_ptr(node_flag), type->order);
+				struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+
+				if (external_nodes || track_longest) {
+					match_len = i;
+					match_node = external_nodes;
+				}
+			}
+		} else if (ft_node_compressed(node_flag)) {
 			enum ft_compressed_action act;
 
 			act = ft_lookup_compressed(ft, &node_flag, &key, &i,
@@ -3577,9 +3594,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				goto end;
 			if (act == FT_COMPRESSED_BREAK)
 				break;
-			/* CONTINUE: fall through to child handling. */
-		}
-		if (ft_node_collapsed(node_flag)) {
+		} else if (ft_node_collapsed(node_flag)) {
 			enum ft_compressed_action act;
 
 			act = ft_lookup_collapsed(ft, &node_flag, &key, &i,
@@ -3590,33 +3605,15 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				goto end;
 			if (act == FT_COMPRESSED_BREAK)
 				break;
-			/* CONTINUE: fall through to child handling. */
-		}
-		/* Found external node before end of key. */
-		if (i < key_depth - 1 && ft_node_external(node_flag)) {
-			if (track) {
-				match_len = i;
-				match_node = (struct cds_ft_node *) node_flag;
-			}
-			status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
-		}
-		/*
-		 * Track prefix match at internal node.
-		 * For partial tracking, only record when external nodes
-		 * are present. For longest-match tracking, record the
-		 * position unconditionally.
-		 * Skip the last level. It is handled after the loop.
-		 */
-		if (track && i < key_depth - 1 && ft_node_internal(node_flag)) {
-			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
-					ft_node_ptr(node_flag), type->order);
-			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
-
-			if (external_nodes || track_longest) {
-				match_len = i;
-				match_node = external_nodes;
+		} else {
+			/* External node before end of key. */
+			if (i < key_depth - 1) {
+				if (track) {
+					match_len = i;
+					match_node = (struct cds_ft_node *) node_flag;
+				}
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
 			}
 		}
 	}
