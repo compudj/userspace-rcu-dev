@@ -1593,7 +1593,7 @@ found:
 		return ptr;
 	}
 }
-#else
+#elif !defined(FEATURE_ADAPTIVE_LOOKUP)
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
@@ -1629,6 +1629,166 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 	return ptr;
 }
 #endif
+
+#ifdef FEATURE_ADAPTIVE_LOOKUP
+/*
+ * Adaptive lookup: bytewise for small nodes (<=7 children),
+ * SWAR for medium (8-15), SIMD for large (16+).
+ *
+ * The bytewise scan beats SWAR/SIMD for small nodes because
+ * SWAR/SIMD have setup overhead (broadcast, load, compare)
+ * that only pays off with enough entries to amortize.
+ */
+
+/* SWAR constants. */
+#define L_ONES_A (-1UL / 255)
+#define L_HIGHS_A (L_ONES_A * 0x80)
+
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
+		const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, uint8_t nr_child)
+{
+	unsigned long *data_words = (unsigned long *)node->data;
+	unsigned long mask = n * L_ONES_A, xor_res, has_zero;
+	unsigned long first_word = data_words[0];
+	unsigned int i;
+
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	xor_res = first_word ^ (mask | 0xFFUL);
+	has_zero = (xor_res - L_ONES_A) & ~xor_res & L_HIGHS_A;
+	if (has_zero) {
+		i = (__builtin_ctzl(has_zero) >> 3) - 1;
+		if (i < nr_child)
+			goto found;
+	}
+#else
+	xor_res = first_word ^ (mask | (0xFFUL << ((sizeof(unsigned long) - 1) * 8)));
+	has_zero = (xor_res - L_ONES_A) & ~xor_res & L_HIGHS_A;
+	if (has_zero) {
+		i = (__builtin_clzl(has_zero) >> 3) - 1;
+		if (i < nr_child)
+			goto found;
+	}
+#endif
+	for (unsigned int w = 1; w * sizeof(unsigned long) <= type->max_linear_child; w++) {
+		xor_res = data_words[w] ^ mask;
+		has_zero = (xor_res - L_ONES_A) & ~xor_res & L_HIGHS_A;
+		if (has_zero) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+			i = (w * sizeof(unsigned long)) + (__builtin_ctzl(has_zero) >> 3) - 1;
+#else
+			i = (w * sizeof(unsigned long)) + (__builtin_clzl(has_zero) >> 3) - 1;
+#endif
+			if (i < nr_child)
+				goto found;
+		}
+	}
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+found:
+	{
+		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
+			align_ptr_size(&node->data[1] + type->max_linear_child);
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = &pointers[i];
+		return ft_dereference_acquire(pointers[i]);
+	}
+}
+
+#if defined(__SSE2__)
+#include <immintrin.h>
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
+		const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, uint8_t nr_child)
+{
+	uint8_t *data = &node->data[0];
+	__m128i target = _mm_set1_epi8(n);
+	__m128i chunk;
+	unsigned int mask, phys_idx;
+
+	chunk = _mm_loadu_si128((__m128i *)data);
+	mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
+	mask &= ~1U; /* Ignore nr_child byte at index 0. */
+	if (mask) {
+		phys_idx = __builtin_ctz(mask);
+		if (phys_idx <= nr_child)
+			goto found;
+	}
+	if (nr_child >= 16) {
+		chunk = _mm_loadu_si128((__m128i *)(data + 16));
+		mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
+		if (mask) {
+			phys_idx = 16 + __builtin_ctz(mask);
+			if (phys_idx <= nr_child)
+				goto found;
+		}
+	}
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+found:
+	{
+		unsigned int i = phys_idx - 1;
+		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
+			align_ptr_size(&node->data[1] + type->max_linear_child);
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = &pointers[i];
+		return ft_dereference_acquire(pointers[i]);
+	}
+}
+#endif /* __SSE2__ */
+
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
+
+	if (nr_child == 0) {
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = NULL;
+		return NULL;
+	}
+#if defined(__SSE2__)
+	if (type->max_linear_child >= 16)
+		return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n, nr_child);
+#endif
+	if (type->max_linear_child >= sizeof(unsigned long))
+		return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n, nr_child);
+
+	/* Small node: bytewise scan. */
+	{
+		uint8_t *values = &node->data[1];
+		unsigned int i;
+
+		for (i = 0; i < nr_child; i++) {
+			if (uatomic_load(&values[i], CMM_RELAXED) == n)
+				break;
+		}
+		if (i >= nr_child) {
+			if (caa_unlikely(node_flag_ptr))
+				*node_flag_ptr = NULL;
+			return NULL;
+		}
+		{
+			struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
+				align_ptr_size(&values[type->max_linear_child]);
+			if (caa_unlikely(node_flag_ptr))
+				*node_flag_ptr = &pointers[i];
+			return ft_dereference_acquire(pointers[i]);
+		}
+	}
+}
+#endif /* FEATURE_ADAPTIVE_LOOKUP */
 
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type *type,
