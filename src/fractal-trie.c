@@ -2047,24 +2047,24 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 
 	/*
 	 * Dispatch on type_class from the tag table.
-	 * Pigeon needs no ft_types[] access (direct indexed).
-	 * Linear/pool defer ft_types[] load to their handlers.
+	 * Linear (bytewise scan) is the most common type in
+	 * byte-indexed tries — check it first to minimize
+	 * branch mispredictions on mixed-type workloads.
 	 */
-	if (tc == FT_PIGEON)
-		return ft_pigeon_node_get_nth(NULL, node,
-				node_flag_ptr, n);
-
 	{
 		unsigned int type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
 		const struct cds_ft_type *type = &ft_types[type_index];
 
-		if (tc == FT_POOL)
-			return ft_pool_node_get_nth(type, node, node_flag,
+		if (caa_likely(tc == FT_LINEAR))
+			return ft_linear_node_get_nth(type, node,
 					node_flag_ptr, n);
 		if (tc == FT_LINEAR_WIDE)
 			return ft_linear_wide_node_get_nth(type, node,
 					node_flag_ptr, n);
-		return ft_linear_node_get_nth(type, node,
+		if (tc == FT_POOL)
+			return ft_pool_node_get_nth(type, node, node_flag,
+					node_flag_ptr, n);
+		return ft_pigeon_node_get_nth(NULL, node,
 				node_flag_ptr, n);
 	}
 }
