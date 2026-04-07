@@ -5387,6 +5387,31 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 		cn_meta->nr_nodes_at_depth[0] = total;
 		return;
 	}
+	if (ft_node_collapsed(node_flag)) {
+		struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
+		struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+		unsigned int e;
+
+		for (e = 0; e < col->nr_entries; e++) {
+			unsigned int slen;
+			struct cds_ft_inode_flag *child;
+
+			if (ft_collapsed_entry_dead(col, e))
+				continue;
+			slen = ft_collapsed_suffix_len(col, e);
+			child = ft_collapsed_ptrs(col)[e];
+			if (!ft_node_ptr(child) || ft_node_external(child))
+				continue;
+			if (slen <= FT_NODE_DENSITY_DEPTH) {
+				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
+				total++;
+				if (slen < FT_NODE_DENSITY_DEPTH)
+					total += cm->nr_nodes_at_depth[0];
+			}
+		}
+		col_meta->nr_nodes_at_depth[0] = total;
+		return;
+	}
 	/* Internal node: walk children. */
 	node = ft_node_ptr(node_flag);
 	meta = cds_ft_item_to_metadata(node);
@@ -5700,22 +5725,14 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			bool walk_ok = true;
 
 			/*
-			 * Use density counter as a hint to skip depths
-			 * that clearly won't fit.  counter[0] counts
-			 * nodes within 6 levels; per-level counters
-			 * give finer resolution.  Since counters may be
-			 * stale (undercounted), treat them as a lower
-			 * bound — only skip when the counter EXCEEDS
-			 * max_entries.
+			 * Use density counters to skip depths that
+			 * won't fit.  counter[0] is the aggregate
+			 * count of traversable nodes within 6 levels.
+			 * If it exceeds max_entries, no depth will
+			 * fit — bail out entirely.
 			 */
-			if (try_depth <= (int) FT_NODE_DENSITY_DEPTH &&
-			    metadata->nr_nodes_at_depth[0] > max_entries) {
-				/*
-				 * Even the aggregate count exceeds
-				 * capacity.  Try a shallower depth.
-				 */
-				continue;
-			}
+			if (metadata->nr_nodes_at_depth[0] > max_entries)
+				break;
 
 			/* Reset collapsed node for this attempt. */
 			memset(col, 0, FT_COLLAPSED_SCAN_ZONE_SIZE);
@@ -5881,6 +5898,12 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			if (col_flag) {
 				rcu_assign_pointer(*parent_slot, col_flag);
 				free_cds_ft_node(ft, ft_node_ptr(node_flag));
+				/*
+				 * Recompute density for the new collapsed
+				 * node: the absorbed intermediate nodes are
+				 * gone, only entries' children remain.
+				 */
+				ft_init_node_density(col_flag);
 				node_flag = col_flag;
 				/* Restart loop: collapsed handler above
 				 * will descend into the matching entry. */
@@ -6120,6 +6143,17 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * and its density must reach ancestors near the junction
 	 * depth, not the compressed node's original depth.
 	 */
+	/*
+	 * Initialize density counters on all created nodes, bottom-up
+	 * (children first so parents see correct child counters).
+	 */
+	{
+		int ci;
+
+		for (ci = 0; ci < nr_created; ci++)
+			ft_init_node_density(created[ci]);
+	}
+
 	if (snapshot) {
 		unsigned int junction_depth = node_depth + diverge_pos;
 		int nr_snapshot = *nr_snapshot_p;
@@ -6504,7 +6538,11 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		uatomic_store(&cn_meta->nr_keys,
 			cn_meta->nr_keys + 1, CMM_RELAXED);
 	}
-	return ft_compressed_node_flag(cn);
+	{
+		struct cds_ft_inode_flag *cflag = ft_compressed_node_flag(cn);
+		ft_init_node_density(cflag);
+		return cflag;
+	}
 }
 #else
 static inline
@@ -7120,7 +7158,12 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 					ft_node_ptr(child) ? 1 : 0,
 					CMM_RELAXED);
 			}
-			return ft_compressed_node_flag(cn);
+			{
+				struct cds_ft_inode_flag *cflag =
+					ft_compressed_node_flag(cn);
+				ft_init_node_density(cflag);
+				return cflag;
+			}
 		}
 	}
 
@@ -7203,6 +7246,7 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 					ft_node_ptr(internal_flag));
 			uatomic_store(&im->nr_keys, total_keys,
 				CMM_RELAXED);
+			ft_init_node_density(internal_flag);
 		}
 		return internal_flag;
 	}
@@ -7377,6 +7421,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 						int_meta->external_nodes =
 							col_meta->external_nodes;
 					}
+					ft_init_node_density(internal_flag);
 
 					rcu_assign_pointer(*d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
@@ -9902,6 +9947,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						int_meta->external_nodes =
 							col_meta->external_nodes;
 					}
+					ft_init_node_density(internal_flag);
 
 					rcu_assign_pointer(*dd.d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
