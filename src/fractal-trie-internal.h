@@ -224,9 +224,10 @@ struct cds_ft_compressed_node {
  * Lookup: scan zone 1 to find matching suffix, then
  * load ptr[i] from zone 2.
  */
-#define FT_COLLAPSED_SCAN_64		0	/* bits 7-6 = 00 */
-#define FT_COLLAPSED_SCAN_128		1	/* bits 7-6 = 01 */
-#define FT_COLLAPSED_SCAN_256		2	/* bits 7-6 = 10 */
+#define FT_COLLAPSED_SCAN_32		0	/* bits 7-6 = 00 */
+#define FT_COLLAPSED_SCAN_64		1	/* bits 7-6 = 01 */
+#define FT_COLLAPSED_SCAN_128		2	/* bits 7-6 = 10 */
+#define FT_COLLAPSED_SCAN_256		3	/* bits 7-6 = 11 */
 #define FT_COLLAPSED_SCAN_SHIFT		6
 #define FT_COLLAPSED_NR_ENTRIES_MASK	0x3F
 
