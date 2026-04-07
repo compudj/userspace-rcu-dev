@@ -66,20 +66,40 @@ struct cds_ft_attr {
 };
 
 enum cds_ft_type_class {
-	FT_LINEAR = 0,	/* Type A */
-			/* 32-bit: 1 to 25 children, 8 to 128 bytes */
-			/* 64-bit: 1 to 28 children, 16 to 256 bytes */
-	FT_POOL = 1,	/* Type B */
-			/* 32-bit: 26 to 100 children, 256 to 512 bytes */
-			/* 64-bit: 29 to 112 children, 512 to 1024 bytes */
-	FT_PIGEON = 2,	/* Type C */
-			/* 32-bit: 101 to 256 children, 1024 bytes */
-			/* 64-bit: 113 to 256 children, 2048 bytes */
+	FT_LINEAR = 0,		/* Small linear: bytewise scan */
+	FT_LINEAR_WIDE = 1,	/* Large linear: SWAR or SIMD scan */
+	FT_POOL = 2,		/* Pool: 1D/2D subnode dispatch */
+	FT_PIGEON = 3,		/* Pigeon: direct indexed */
 	/* Leaf nodes are implicit from their height in the tree */
 	FT_NR_TYPES,
 
 	FT_NULL,	/* not an encoded type, but keeps code regular */
 };
+
+#define ft_type_is_linear(tc)	((tc) == FT_LINEAR || (tc) == FT_LINEAR_WIDE)
+
+/*
+ * FT_WIDE_LINEAR_THRESHOLD: max_linear_child threshold for
+ * FT_LINEAR_WIDE.  Used to assign type_class in ft_types[].
+ */
+#ifndef FT_SIMD_LINEAR_THRESHOLD
+#define FT_SIMD_LINEAR_THRESHOLD	7
+#endif
+#ifndef FT_SWAR_LINEAR_THRESHOLD
+#define FT_SWAR_LINEAR_THRESHOLD	14
+#endif
+#if defined(__SSE2__)
+#define FT_WIDE_LINEAR_THRESHOLD	FT_SIMD_LINEAR_THRESHOLD
+#else
+#define FT_WIDE_LINEAR_THRESHOLD	FT_SWAR_LINEAR_THRESHOLD
+#endif
+
+/*
+ * Macro to select FT_LINEAR or FT_LINEAR_WIDE based on the
+ * type's max_linear_child at compile time.
+ */
+#define FT_LINEAR_CLASS(mlc) \
+	((mlc) >= FT_WIDE_LINEAR_THRESHOLD ? FT_LINEAR_WIDE : FT_LINEAR)
 
 struct cds_ft_type {
 	enum cds_ft_type_class type_class;
@@ -145,10 +165,10 @@ enum {
 };
 
 const struct cds_ft_type ft_types[] = {
-	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
-	[1] = { .type_class = FT_LINEAR, .min_child = 3, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP },
-	[2] = { .type_class = FT_LINEAR, .min_child = 4, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP },
-	[3] = { .type_class = FT_LINEAR, .min_child = 10, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP },
+	[0] = { .type_class = FT_LINEAR_CLASS(ft_type_0_max_linear_child), .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
+	[1] = { .type_class = FT_LINEAR_CLASS(ft_type_1_max_linear_child), .min_child = 3, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP },
+	[2] = { .type_class = FT_LINEAR_CLASS(ft_type_2_max_linear_child), .min_child = 4, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP },
+	[3] = { .type_class = FT_LINEAR_CLASS(ft_type_3_max_linear_child), .min_child = 10, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP },
 
 	/* Pools may fill sooner than max_child */
 	/* This pool is hardcoded at index 4. See ft_node_ptr(). */
@@ -194,11 +214,11 @@ enum {
 };
 
 const struct cds_ft_type ft_types[] = {
-	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
-	[1] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP },
-	[2] = { .type_class = FT_LINEAR, .min_child = 3, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP },
-	[3] = { .type_class = FT_LINEAR, .min_child = 5, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP },
-	[4] = { .type_class = FT_LINEAR, .min_child = 10, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_linear_child, .order = 8, .bitmap = FT_NO_BITMAP },
+	[0] = { .type_class = FT_LINEAR_CLASS(ft_type_0_max_linear_child), .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
+	[1] = { .type_class = FT_LINEAR_CLASS(ft_type_1_max_linear_child), .min_child = 1, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP },
+	[2] = { .type_class = FT_LINEAR_CLASS(ft_type_2_max_linear_child), .min_child = 3, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP },
+	[3] = { .type_class = FT_LINEAR_CLASS(ft_type_3_max_linear_child), .min_child = 5, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP },
+	[4] = { .type_class = FT_LINEAR_CLASS(ft_type_4_max_linear_child), .min_child = 10, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_linear_child, .order = 8, .bitmap = FT_NO_BITMAP },
 
 	/* Pools may fill sooner than max_child. */
 	/* This pool is hardcoded at index 5. See ft_node_ptr(). */
@@ -1370,7 +1390,7 @@ static inline_lookup
 uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
 		struct cds_ft_inode *node)
 {
-	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 	/* load-acquire orders nr_child load before values and pointers */
 	return uatomic_load(&node->data[0], CMM_ACQUIRE);
 }
@@ -1412,12 +1432,7 @@ uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
  * Tunable via -DFT_SIMD_LINEAR_THRESHOLD=N and
  * -DFT_SWAR_LINEAR_THRESHOLD=N at compile time.
  */
-#ifndef FT_SIMD_LINEAR_THRESHOLD
-#define FT_SIMD_LINEAR_THRESHOLD	7
-#endif
-#ifndef FT_SWAR_LINEAR_THRESHOLD
-#define FT_SWAR_LINEAR_THRESHOLD	14
-#endif
+/* FT_SIMD/SWAR/WIDE_LINEAR_THRESHOLD defined near ft_types[]. */
 
 /* SWAR constants. */
 #define L_ONES_A (-1UL / 255)
@@ -1524,8 +1539,49 @@ found:
 }
 #endif /* __SSE2__ */
 
+/*
+ * ft_linear_node_get_nth: bytewise scan for small linear nodes
+ * (FT_LINEAR, max_linear_child < threshold).
+ */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
+	uint8_t *values = &node->data[1];
+	unsigned int i;
+
+	if (nr_child == 0) {
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = NULL;
+		return NULL;
+	}
+	for (i = 0; i < nr_child; i++) {
+		if (uatomic_load(&values[i], CMM_RELAXED) == n)
+			break;
+	}
+	if (i >= nr_child) {
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = NULL;
+		return NULL;
+	}
+	{
+		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
+			align_ptr_size(&values[type->max_linear_child]);
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = &pointers[i];
+		return ft_dereference_acquire(pointers[i]);
+	}
+}
+
+/*
+ * ft_linear_wide_node_get_nth: SWAR or SIMD scan for large linear
+ * nodes (FT_LINEAR_WIDE, max_linear_child >= threshold).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
@@ -1537,52 +1593,11 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 			*node_flag_ptr = NULL;
 		return NULL;
 	}
-	/*
-	 * Dispatch based on node type capacity.  The data layout
-	 * starts with nr_child (1 byte) followed by the key array
-	 * (max_linear_child bytes), so the total scan area is
-	 * max_linear_child + 1 bytes.
-	 *
-	 * Use SIMD when the scan area rounded up to the next
-	 * power-of-two fits in a SIMD register:
-	 *   SSE2:  roundup(max_linear_child + 1) <= 16
-	 *          → max_linear_child >= 7  (8 rounds to 8, fits in 16)
-	 *
-	 * SWAR for non-SIMD platforms at the same default
-	 * threshold.  The break-even depends on setup overhead
-	 * vs loop iterations, not on word size.  Tune with
-	 * -DFT_SWAR_LINEAR_THRESHOLD=N.
-	 */
 #if defined(__SSE2__)
-	if (type->max_linear_child >= FT_SIMD_LINEAR_THRESHOLD)
-		return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n, nr_child);
+	return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n, nr_child);
 #else
-	if (type->max_linear_child >= FT_SWAR_LINEAR_THRESHOLD)
-		return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n, nr_child);
+	return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n, nr_child);
 #endif
-
-	/* Small node: bytewise scan. */
-	{
-		uint8_t *values = &node->data[1];
-		unsigned int i;
-
-		for (i = 0; i < nr_child; i++) {
-			if (uatomic_load(&values[i], CMM_RELAXED) == n)
-				break;
-		}
-		if (i >= nr_child) {
-			if (caa_unlikely(node_flag_ptr))
-				*node_flag_ptr = NULL;
-			return NULL;
-		}
-		{
-			struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
-				align_ptr_size(&values[type->max_linear_child]);
-			if (caa_unlikely(node_flag_ptr))
-				*node_flag_ptr = &pointers[i];
-			return ft_dereference_acquire(pointers[i]);
-		}
-	}
 }
 
 static inline_lookup
@@ -1598,7 +1613,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	unsigned int i;
 	int match_v;
 
-	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
 	if (dir == FT_LEFT) {
@@ -1610,7 +1625,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	nr_child = ft_linear_node_get_nr_child(type, node);
 	cmm_smp_rmb();	/* read nr_child before values and pointers */
 	assert(nr_child <= type->max_linear_child);
-	assert(type->type_class != FT_LINEAR || nr_child == 0 || nr_child >= type->min_child);
+	assert(!ft_type_is_linear(type->type_class) || nr_child == 0 || nr_child >= type->min_child);
 
 	values = &node->data[1];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
@@ -1659,7 +1674,7 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 	uint8_t *values;
 	struct cds_ft_inode_flag **pointers;
 
-	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 	assert(i < ft_linear_node_get_nr_child(type, node));
 
 	values = &node->data[1];
@@ -1705,7 +1720,8 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
 		uint8_t n)
 {
 	struct cds_ft_inode *linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
-	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n);
+	/* Pool subnodes are always large enough for wide scan. */
+	return ft_linear_wide_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
 static inline_lookup
@@ -1932,6 +1948,9 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 	case FT_LINEAR:
 		return ft_linear_node_get_nth(type, node,
 				node_flag_ptr, n);
+	case FT_LINEAR_WIDE:
+		return ft_linear_wide_node_get_nth(type, node,
+				node_flag_ptr, n);
 	case FT_POOL:
 		return ft_pool_node_get_nth(type, node, node_flag,
 				node_flag_ptr, n);
@@ -1967,6 +1986,7 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 
 	switch (type->type_class) {
 	case FT_LINEAR:
+	case FT_LINEAR_WIDE:
 		return ft_linear_node_get_direction(type, node, n, result_key, dir);
 	case FT_POOL:
 		return ft_pool_node_get_direction(type, node, node_flag, n, result_key, dir);
@@ -2028,7 +2048,7 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 	unsigned int i, unused = 0;
 	bool replace_old_ptr = false;
 
-	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 
 	nr_child_ptr = &node->data[0];
 	dbg_printf("linear set nth: n %u, nr_child_ptr %p\n",
@@ -2143,6 +2163,7 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 {
 	switch (type->type_class) {
 	case FT_LINEAR:
+	case FT_LINEAR_WIDE:
 		return ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL);
 	case FT_POOL:
 		return ft_pool_node_set_nth(type, node, node_flag, metadata, n, child_node_flag);
@@ -2166,13 +2187,13 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 	uint8_t nr_child;
 	uint8_t *nr_child_ptr;
 
-	assert(type->type_class == FT_LINEAR || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 
 	nr_child_ptr = &node->data[0];
 	nr_child = *nr_child_ptr;
 	assert(nr_child <= type->max_linear_child);
 
-	if (type->type_class == FT_LINEAR && !newptr) {
+	if (ft_type_is_linear(type->type_class) && !newptr) {
 		assert(!metadata->fallback_removal_count);
 		if (metadata->nr_child <= type->min_child) {
 			/* We need to try recompacting the node */
@@ -2281,6 +2302,7 @@ int _ft_node_replace_ptr(const struct cds_ft_type *type,
 {
 	switch (type->type_class) {
 	case FT_LINEAR:
+	case FT_LINEAR_WIDE:
 		return ft_linear_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
 	case FT_POOL:
 		return ft_pool_node_replace_ptr(type, node, node_flag, metadata, node_flag_ptr, n, newptr);
@@ -2316,6 +2338,7 @@ unsigned int ft_node_sum_distribution_1d(enum ft_recompact mode,
 
 	switch (type->type_class) {
 	case FT_LINEAR:
+	case FT_LINEAR_WIDE:
 	{
 		uint8_t nr_child =
 			ft_linear_node_get_nr_child(type, node);
@@ -2454,6 +2477,7 @@ void ft_node_sum_distribution_2d(enum ft_recompact mode,
 
 	switch (type->type_class) {
 	case FT_LINEAR:
+	case FT_LINEAR_WIDE:
 	{
 		uint8_t nr_child =
 			ft_linear_node_get_nr_child(type, node);
@@ -2795,6 +2819,7 @@ retry:		/* for fallback */
 
 	switch (old_type->type_class) {
 	case FT_LINEAR:
+	case FT_LINEAR_WIDE:
 	{
 		uint8_t nr_child =
 			ft_linear_node_get_nr_child(old_type, old_node);
@@ -4192,7 +4217,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		unsigned int type_idx = ft_node_type(node_flag);
 		const struct cds_ft_type *type = &ft_types[type_idx];
 
-		if (type->type_class == FT_LINEAR &&
+		if (ft_type_is_linear(type->type_class) &&
 				ft_linear_node_get_nr_child(type, ft_node_ptr(node_flag)) == 0) {
 
 			/* A NIL key might still be stored directly in the root's metadata. */
@@ -10022,7 +10047,7 @@ bool cds_ft_empty(struct cds_ft *ft)
 	 * As a root node special-case, only a type-0 linear node with
 	 * data[0] == 0 represents an empty node.
 	 */
-	if (type->type_class != FT_LINEAR)
+	if (!ft_type_is_linear(type->type_class))
 		return false;
 	if (ft_linear_node_get_nr_child(type, root_node) != 0)
 		return false;
