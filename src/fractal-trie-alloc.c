@@ -134,6 +134,12 @@ struct cds_ft_metadata *cds_ft_item_to_metadata(void *p)
 	return do_cds_ft_item_to_metadata(p, range->arena->item_len_order, range);
 }
 
+size_t cds_ft_item_order(void *p)
+{
+	struct cds_ft_alloc_range *range = cds_ft_item_to_range(p);
+	return range->arena->item_len_order;
+}
+
 void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata)
 {
 	struct cds_ft_metadata_alloc *metadata_alloc =

@@ -5669,18 +5669,34 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	if (nr_child < 2)
 		return NULL;
 
-	max_entries = ft_collapsed_max_entries(FT_COLLAPSED_ORDER_LARGE);
-
 	/*
-	 * If immediate children already exceed max entries, the
-	 * recursive walk can only produce more.  Skip early.
+	 * Select collapsed node size based on density counters.
+	 * Use the small (128B, ≤8 entries) allocation when the
+	 * subtree has few enough nodes, large (256B, ≤24 entries)
+	 * otherwise.  Saves memory for small collapses.
 	 */
-	if (nr_child > max_entries)
-		return NULL;
+	{
+		unsigned long density = metadata->nr_nodes_at_depth[0];
+		unsigned int order;
 
-	col = alloc_collapsed_node(ft, FT_COLLAPSED_ORDER_LARGE, &col_meta);
-	if (!col)
-		return NULL;
+		if (density <= ft_collapsed_max_entries(FT_COLLAPSED_ORDER_SMALL))
+			order = FT_COLLAPSED_ORDER_SMALL;
+		else if (density <= ft_collapsed_max_entries(FT_COLLAPSED_ORDER_LARGE))
+			order = FT_COLLAPSED_ORDER_LARGE;
+		else
+			return NULL;
+
+		max_entries = ft_collapsed_max_entries(order);
+		if (nr_child > max_entries)
+			order = FT_COLLAPSED_ORDER_LARGE;
+		max_entries = ft_collapsed_max_entries(order);
+		if (nr_child > max_entries)
+			return NULL;
+
+		col = alloc_collapsed_node(ft, order, &col_meta);
+		if (!col)
+			return NULL;
+	}
 
 	col_ptrs = ft_collapsed_ptrs(col);
 
@@ -7376,7 +7392,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 					cur_suffix_start = FT_COLLAPSED_SCAN_ZONE_SIZE;
 
 				if (header_end + new_slen > cur_suffix_start ||
-				    col->nr_entries >= ft_collapsed_max_entries(FT_COLLAPSED_ORDER_LARGE))
+				    col->nr_entries >= ft_collapsed_max_entries(
+					cds_ft_item_order(col)))
 					goto collapsed_explode;
 				goto collapsed_inplace_add;
 
