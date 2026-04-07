@@ -3246,22 +3246,24 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 		}
 	}
 
-	{
+	if (track_longest) {
 		unsigned int mpos;
 		int cmp = ft_key_cmp_ordinals(ft, key, cn->key_bytes,
 				cmp_len, &mpos);
 
 		if (cmp != 0) {
-			if (track_longest) {
-				*match_len_p = i + mpos;
-				*match_node_p = NULL;
-			}
+			*match_len_p = i + mpos;
+			*match_node_p = NULL;
 			*status_ret = CDS_FT_STATUS_NOT_FOUND;
 			return FT_COMPRESSED_END;
 		}
-		if (track_longest) {
-			*match_len_p = i + cmp_len;
-			*match_node_p = NULL;
+		*match_len_p = i + cmp_len;
+		*match_node_p = NULL;
+	} else {
+		if (ft_key_cmp_ordinals(ft, key, cn->key_bytes,
+				cmp_len, NULL) != 0) {
+			*status_ret = CDS_FT_STATUS_NOT_FOUND;
+			return FT_COMPRESSED_END;
 		}
 	}
 	if (cn->len > remaining_key) {
@@ -3657,6 +3659,16 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * set) is the common case — skip directly to the
 		 * key dispatch below.
 		 */
+		/*
+		 * Non-internal nodes need special handling.
+		 * Internal (bit 0 set) is the common case.
+		 *
+		 * This single check handles both:
+		 * - compressed/collapsed from previous iteration's
+		 *   get_nth result
+		 * - compressed/collapsed/external from compressed
+		 *   or collapsed handler output
+		 */
 		if (caa_unlikely(!ft_node_internal(node_flag))) {
 			if (ft_node_compressed(node_flag)) {
 				enum ft_compressed_action act;
@@ -3686,6 +3698,15 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					break;
 				continue;
 			}
+			/*
+			 * External or NULL at loop top: the previous
+			 * get_nth returned a non-internal, non-compressed,
+			 * non-collapsed child.  This shouldn't happen in
+			 * the normal flow (external is caught post-get_nth).
+			 * Handle as not-found for robustness.
+			 */
+			status = CDS_FT_STATUS_NOT_FOUND;
+			goto end;
 		}
 
 		iter_key = key_to_ordinal(ft, *(key++));
@@ -3701,55 +3722,38 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			iter_path_len = i + 1;
 		}
 		/*
-		 * Dispatch child type.  Internal (bit 0 set) is the
-		 * common case — check it first with a single test.
-		 * Compressed, collapsed, and external are rare and
-		 * handled in the else branch.
+		 * External child before end of key: the key is
+		 * longer than this branch.
 		 */
-		if (caa_likely(ft_node_internal(node_flag))) {
-			/* Internal: track prefix match if requested. */
-			if (track && i < key_depth - 1) {
-				const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-				struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
-						ft_node_ptr(node_flag), type->order);
-				struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
-
-				if (external_nodes || track_longest) {
-					match_len = i;
-					match_node = external_nodes;
-				}
+		if (caa_unlikely(ft_node_external(node_flag)) &&
+		    i < key_depth - 1) {
+			if (track) {
+				match_len = i;
+				match_node = (struct cds_ft_node *) node_flag;
 			}
-		} else if (ft_node_compressed(node_flag)) {
-			enum ft_compressed_action act;
+			status = CDS_FT_STATUS_NOT_FOUND;
+			goto end;
+		}
+		/*
+		 * Track prefix match on the child node.  Only
+		 * evaluated when tracking is requested — dead-code
+		 * eliminated for cds_ft_lookup_key (track=false).
+		 * The ft_node_internal check here is only reached
+		 * by track=true callers; for track=false the
+		 * compiler eliminates the entire block, leaving
+		 * just one ft_node_internal check per iteration
+		 * (at the loop top).
+		 */
+		if (track && caa_likely(ft_node_internal(node_flag))
+		    && i < key_depth - 1) {
+			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
+					ft_node_ptr(node_flag), type->order);
+			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
-			act = ft_lookup_compressed(ft, &node_flag, &key, &i,
-				key_depth, iter, &iter_path_len,
-				track, track_longest,
-				&match_len, &match_node, &found, &status);
-			if (act == FT_COMPRESSED_END)
-				goto end;
-			if (act == FT_COMPRESSED_BREAK)
-				break;
-		} else if (ft_node_collapsed(node_flag)) {
-			enum ft_compressed_action act;
-
-			act = ft_lookup_collapsed(ft, &node_flag, &key, &i,
-				key_depth, iter, &iter_path_len,
-				track, track_longest,
-				&match_len, &match_node, &found, &status);
-			if (act == FT_COMPRESSED_END)
-				goto end;
-			if (act == FT_COMPRESSED_BREAK)
-				break;
-		} else {
-			/* External node before end of key. */
-			if (i < key_depth - 1) {
-				if (track) {
-					match_len = i;
-					match_node = (struct cds_ft_node *) node_flag;
-				}
-				status = CDS_FT_STATUS_NOT_FOUND;
-				goto end;
+			if (external_nodes || track_longest) {
+				match_len = i;
+				match_node = external_nodes;
 			}
 		}
 	}
