@@ -5494,26 +5494,14 @@ void ft_propagate_node_density(struct cds_ft_inode_flag **snapshot,
 
 #ifdef FEATURE_FT_COLLAPSE
 /*
- * Collapse thresholds.
+ * Collapse threshold.
  *
- * FT_COLLAPSE_DENSITY_MIN: minimum nr_nodes_at_depth[0] (total
- *   traversable nodes within 6 levels).  Must be high enough that
- *   the subtree has deep chains worth collapsing.
- *
- * FT_COLLAPSE_NR_CHILD_MAX: maximum nr_child for collapse.  Limits
- *   the scan zone entry count for fast lookups.
- *
- * FT_COLLAPSE_SUFFIX_MIN: minimum suffix length per entry after
- *   greedy extension.  Entries with shorter suffixes don't save
- *   enough levels to offset the 2-cache-line scan cost.
- *
- * FT_COLLAPSE_DENSITY_RATIO: minimum ratio of density to nr_child.
- *   Ensures the subtree has long chains (many nodes per child path).
+ * FT_COLLAPSE_SUFFIX_MIN: minimum suffix length for at least one
+ *   entry after recursive path enumeration.  Entries with slen=1
+ *   (single ordinal byte) don't save any traversal hops over a
+ *   normal internal node dispatch.
  */
-#define FT_COLLAPSE_DENSITY_MIN		1
-#define FT_COLLAPSE_NR_CHILD_MAX	16
 #define FT_COLLAPSE_SUFFIX_MIN		2
-#define FT_COLLAPSE_DENSITY_RATIO	0
 
 /*
  * ft_collapse_walk_subtree: recursively enumerate paths from @walk,
