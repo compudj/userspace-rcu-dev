@@ -1026,6 +1026,7 @@ struct cds_ft_collapsed_node *ft_collapsed_node_ptr(
 /* Collapsed node accessors. */
 
 static const unsigned int ft_collapsed_scan_sizes[] = {
+	[FT_COLLAPSED_SCAN_32]  = 32,
 	[FT_COLLAPSED_SCAN_64]  = 64,
 	[FT_COLLAPSED_SCAN_128] = 128,
 	[FT_COLLAPSED_SCAN_256] = 256,
@@ -1364,20 +1365,27 @@ void free_compressed_node(struct cds_ft *ft,
 /*
  * Collapsed node configurations:
  *
- *   Config  Alloc  Scan   Ptrs  Max entries  slen requirement
- *   SMALL   128B   64B    64B   8            slen >= 2 (SUFFIX_MIN)
- *   WIDE    256B   128B   128B  16           slen >= 3
- *   MEDIUM  256B   64B    192B  24           slen >= 2 (SUFFIX_MIN)
- *   XLARGE  512B   256B   256B  32           slen >= 5
+ *   Config  Alloc  Scan   Ptrs  Max entries  CL loads  slen req
+ *   TINY    64B    32B    32B   4            1         slen >= 2
+ *   SMALL   128B   64B    64B   8            2         slen >= 2
+ *   WIDE    256B   128B   128B  16           3         slen >= 3
+ *   MEDIUM  256B   64B    192B  24           2         slen >= 2
+ *   XLARGE  512B   256B   256B  32           5         slen >= 5
  *
- * Select smallest allocation fitting the density.  Within an
- * allocation, prefer wider scan zone if suffix quality allows.
+ * TINY is special: scan zone + pointers share a single cache line.
+ * Lookup costs 1 CL load (vs 2 for SMALL/MEDIUM).  Selected via
+ * post-walk compaction when entries fit in the 32B scan budget.
+ *
+ * Select smallest allocation fitting the density.  Walk with 64B
+ * scan zone, then compact to TINY or upgrade to wider zone if
+ * suffix quality allows.
  *
  * Cache-line guarantee: each entry's slen must justify the scan
  * zone's cache-line cost.  slen >= (scan_zone_size / 64) + 1
  * for ALL live entries (worst-case bound, not average).
  */
 enum {
+	FT_COLLAPSED_ORDER_TINY   = 6,	/* 64B alloc */
 	FT_COLLAPSED_ORDER_SMALL  = 7,	/* 128B alloc */
 	FT_COLLAPSED_ORDER_MEDIUM = 8,	/* 256B alloc */
 	FT_COLLAPSED_ORDER_XLARGE = 9,	/* 512B alloc */
@@ -5585,6 +5593,7 @@ static inline
 unsigned int ft_collapsed_min_slen(unsigned int scan_sel)
 {
 	static const unsigned int min_slen[] = {
+		[FT_COLLAPSED_SCAN_32]  = 2,	/* <1 CL: slen >= 2 (SUFFIX_MIN) */
 		[FT_COLLAPSED_SCAN_64]  = 2,	/* 1 CL: slen >= 2 */
 		[FT_COLLAPSED_SCAN_128] = 3,	/* 2 CL: slen >= 3 */
 		[FT_COLLAPSED_SCAN_256] = 5,	/* 4 CL: slen >= 5 */
@@ -5609,6 +5618,7 @@ struct ft_collapsed_config {
 };
 
 static const struct ft_collapsed_config ft_collapsed_configs[] = {
+	{ FT_COLLAPSED_ORDER_TINY,   FT_COLLAPSED_SCAN_32  },	/* 64B,  32B scan,  4 ptrs (1 CL) */
 	{ FT_COLLAPSED_ORDER_SMALL,  FT_COLLAPSED_SCAN_64  },	/* 128B, 64B scan,  8 ptrs */
 	{ FT_COLLAPSED_ORDER_MEDIUM, FT_COLLAPSED_SCAN_128 },	/* 256B, 128B scan, 16 ptrs */
 	{ FT_COLLAPSED_ORDER_MEDIUM, FT_COLLAPSED_SCAN_64  },	/* 256B, 64B scan,  24 ptrs */
@@ -5873,6 +5883,15 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			}
 		}
 
+		/*
+		 * TODO: for very sparse subtrees (density ≤ 4, TINY
+		 * candidates), a deeper walk beyond the density counter
+		 * horizon could capture longer suffix chains.  Needs a
+		 * node-visit cutoff that doesn't produce incomplete
+		 * results when it fires mid-walk through a multi-child
+		 * internal node.
+		 */
+
 		if (!found || ft_collapsed_nr_entries(col) < 2) {
 			free_collapsed_node(ft, col);
 			return NULL;
@@ -5907,84 +5926,103 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			}
 
 			/*
-			 * Try wider scan zones.  Check widest first:
-			 * the entry count must fit the pointer budget
-			 * of the wider zone, and every suffix must
-			 * justify the extra cache-line loads.
+			 * Try to reformat into a better scan zone.
+			 *
+			 * TINY compaction (checked first): if entries
+			 * fit in 32B scan budget, compact to order 6.
+			 * Saves 1 CL load (scan+ptrs in 1 cache line).
+			 *
+			 * Wider zones: if all suffixes justify the
+			 * extra CL loads, upgrade to 128B or 256B scan
+			 * within the same allocation order.
 			 */
-			if (order >= FT_COLLAPSED_ORDER_XLARGE &&
-			    min_slen_seen >= ft_collapsed_min_slen(FT_COLLAPSED_SCAN_256) &&
-			    nr <= ft_collapsed_max_entries(order, FT_COLLAPSED_SCAN_256))
-				best_scan_sel = FT_COLLAPSED_SCAN_256;
-			else if (order >= FT_COLLAPSED_ORDER_MEDIUM &&
-				 min_slen_seen >= ft_collapsed_min_slen(FT_COLLAPSED_SCAN_128) &&
-				 nr <= ft_collapsed_max_entries(order, FT_COLLAPSED_SCAN_128))
-				best_scan_sel = FT_COLLAPSED_SCAN_128;
-
-			/*
-			 * Upgrade: copy entries from the 64B-scan node
-			 * to a new node with the wider scan zone within
-			 * the same allocation order.
-			 */
-			if (best_scan_sel != FT_COLLAPSED_SCAN_64) {
-				struct cds_ft_collapsed_node *wide;
-				struct cds_ft_metadata *wide_meta;
-				struct cds_ft_inode_flag **wide_ptrs;
-				unsigned int wide_scan_sz =
-					ft_collapsed_scan_sizes[best_scan_sel];
+			{
+				unsigned int best_order = order;
 				unsigned int old_scan_sz =
 					FT_COLLAPSED_SCAN_ZONE_SIZE;
 				unsigned int suffix_start, total_suffix;
+				unsigned int header_end;
 
-				wide = alloc_collapsed_node(ft, order,
-					best_scan_sel, &wide_meta);
-				if (!wide)
-					goto skip_upgrade;
-				wide_ptrs = ft_collapsed_ptrs(wide);
-
-				/*
-				 * Copy suffix data: suffixes grow leftward
-				 * from scan zone end.  Shift them to the
-				 * new (larger) scan zone boundary.
-				 */
 				if (nr > 0)
 					suffix_start = col->data[nr - 1]
 						& FT_COLLAPSED_OFFSET_MASK;
 				else
 					suffix_start = old_scan_sz;
 				total_suffix = old_scan_sz - suffix_start;
+				header_end = 1 + nr;
 
-				memcpy(((uint8_t *) wide) + wide_scan_sz - total_suffix,
-				       ((uint8_t *) col) + suffix_start,
-				       total_suffix);
-
-				/*
-				 * Copy and adjust offsets: each offset
-				 * shifts by (wide_scan_sz - old_scan_sz).
-				 */
-				{
-					unsigned int shift =
-						wide_scan_sz - old_scan_sz;
-					for (e = 0; e < nr; e++)
-						wide->data[e] =
-							(col->data[e]
-							 & FT_COLLAPSED_OFFSET_MASK)
-							+ shift;
+				/* TINY: 32B scan, order 6 (64B alloc). */
+				if (nr <= ft_collapsed_max_entries(
+					    FT_COLLAPSED_ORDER_TINY,
+					    FT_COLLAPSED_SCAN_32) &&
+				    header_end + total_suffix <= 32) {
+					best_scan_sel = FT_COLLAPSED_SCAN_32;
+					best_order = FT_COLLAPSED_ORDER_TINY;
 				}
+				/* 256B scan within same order. */
+				else if (order >= FT_COLLAPSED_ORDER_XLARGE &&
+					 min_slen_seen >= ft_collapsed_min_slen(
+						FT_COLLAPSED_SCAN_256) &&
+					 nr <= ft_collapsed_max_entries(order,
+						FT_COLLAPSED_SCAN_256))
+					best_scan_sel = FT_COLLAPSED_SCAN_256;
+				/* 128B scan within same order. */
+				else if (order >= FT_COLLAPSED_ORDER_MEDIUM &&
+					 min_slen_seen >= ft_collapsed_min_slen(
+						FT_COLLAPSED_SCAN_128) &&
+					 nr <= ft_collapsed_max_entries(order,
+						FT_COLLAPSED_SCAN_128))
+					best_scan_sel = FT_COLLAPSED_SCAN_128;
 
-				/* Copy pointers. */
-				memcpy(wide_ptrs, col_ptrs,
-				       nr * sizeof(*wide_ptrs));
+				if (best_scan_sel != FT_COLLAPSED_SCAN_64) {
+					struct cds_ft_collapsed_node *new_col;
+					struct cds_ft_metadata *new_meta;
+					struct cds_ft_inode_flag **new_ptrs;
+					unsigned int new_scan_sz =
+						ft_collapsed_scan_sizes[best_scan_sel];
 
-				ft_collapsed_set_nr_entries(wide, nr);
+					new_col = alloc_collapsed_node(ft,
+						best_order, best_scan_sel,
+						&new_meta);
+					if (!new_col)
+						goto skip_reformat;
+					new_ptrs = ft_collapsed_ptrs(new_col);
 
-				/* Replace: free old, use wide. */
-				free_collapsed_node(ft, col);
-				col = wide;
-				col_meta = wide_meta;
-				col_ptrs = wide_ptrs;
+					/*
+					 * Copy suffix data: shift from old
+					 * scan zone end to new scan zone end.
+					 */
+					memcpy(((uint8_t *) new_col) +
+						new_scan_sz - total_suffix,
+					       ((uint8_t *) col) + suffix_start,
+					       total_suffix);
+
+					/*
+					 * Adjust offsets by the scan zone
+					 * size difference (may be negative
+					 * for compaction to TINY).
+					 */
+					{
+						int shift = (int) new_scan_sz
+							  - (int) old_scan_sz;
+						for (e = 0; e < nr; e++)
+							new_col->data[e] =
+								(col->data[e]
+								 & FT_COLLAPSED_OFFSET_MASK)
+								+ shift;
+					}
+
+					memcpy(new_ptrs, col_ptrs,
+					       nr * sizeof(*new_ptrs));
+					ft_collapsed_set_nr_entries(new_col, nr);
+
+					free_collapsed_node(ft, col);
+					col = new_col;
+					col_meta = new_meta;
+					col_ptrs = new_ptrs;
+				}
+			skip_reformat:;
 			}
-		skip_upgrade:;
 		}
 
 		if (ft_debug_counters())
@@ -12487,6 +12525,7 @@ struct cds_ft_stats_level {
 	uint64_t nr_internal_nodes;
 	uint64_t nr_compressed_nodes;
 	uint64_t nr_collapsed_nodes;
+	uint64_t nr_collapsed_scan32;
 	uint64_t nr_collapsed_scan64;
 	uint64_t nr_collapsed_scan128;
 	uint64_t nr_collapsed_scan256;
@@ -12553,6 +12592,9 @@ void calc_stats_collapsed(const struct cds_ft *ft,
 	stats->level[level].nr_internal_nodes++;
 	stats->level[level].nr_collapsed_nodes++;
 	switch (col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) {
+	case FT_COLLAPSED_SCAN_32:
+		stats->level[level].nr_collapsed_scan32++;
+		break;
 	case FT_COLLAPSED_SCAN_64:
 		stats->level[level].nr_collapsed_scan64++;
 		break;
@@ -12748,8 +12790,10 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 		if (stats_level->nr_collapsed_nodes) {
 			print_indent(out, 1);
 			fprintf(out, "Collapsed nodes: %" PRIu64
-				" (64B: %" PRIu64 ", 128B: %" PRIu64 ", 256B: %" PRIu64 ")\n",
+				" (32B: %" PRIu64 ", 64B: %" PRIu64
+				", 128B: %" PRIu64 ", 256B: %" PRIu64 ")\n",
 				stats_level->nr_collapsed_nodes,
+				stats_level->nr_collapsed_scan32,
 				stats_level->nr_collapsed_scan64,
 				stats_level->nr_collapsed_scan128,
 				stats_level->nr_collapsed_scan256);
