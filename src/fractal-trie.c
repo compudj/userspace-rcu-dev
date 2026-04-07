@@ -5680,8 +5680,13 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			struct cds_ft_metadata *wm =
 				cds_ft_item_to_metadata(ft_node_ptr(walk));
 
-			if (wm->nr_child == 1) {
-				/* Single child: extend by 1 byte. */
+			/*
+			 * Single child: extend by 1 byte.  But if
+			 * this node has external_nodes (a key ends
+			 * at this depth), emit an intermediate entry
+			 * to preserve them — can't skip past.
+			 */
+			if (wm->nr_child == 1 && !wm->external_nodes) {
 				uint8_t wk;
 				struct cds_ft_inode_flag *wc;
 
@@ -5845,6 +5850,12 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		 * Try recursive leaf-path enumeration,
 		 * progressively reducing the max depth from
 		 * FT_NODE_DENSITY_DEPTH down to 2.
+		 *
+		 * The walk depth is bounded by FT_NODE_DENSITY_DEPTH
+		 * (6 levels) to stay within the density counter
+		 * horizon.  Collapsed suffixes spanning more than 6
+		 * levels would break density counter propagation and
+		 * explode reconstruction.
 		 */
 		for (try_depth = FT_NODE_DENSITY_DEPTH;
 		     try_depth >= 2; try_depth--) {
@@ -5882,15 +5893,6 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				break;
 			}
 		}
-
-		/*
-		 * TODO: for very sparse subtrees (density ≤ 4, TINY
-		 * candidates), a deeper walk beyond the density counter
-		 * horizon could capture longer suffix chains.  Needs a
-		 * node-visit cutoff that doesn't produce incomplete
-		 * results when it fires mid-walk through a multi-child
-		 * internal node.
-		 */
 
 		if (!found || ft_collapsed_nr_entries(col) < 2) {
 			free_collapsed_node(ft, col);
