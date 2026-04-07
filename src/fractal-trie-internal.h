@@ -233,8 +233,11 @@ struct cds_ft_compressed_node {
 #define FT_COLLAPSED_TOMBSTONE		0x80
 #define FT_COLLAPSED_OFFSET_MASK	0x7F
 
-/* Legacy define for code that uses the 64B scan zone size directly. */
+/* Default scan zone size (64B, 1 cache line). */
 #define FT_COLLAPSED_SCAN_ZONE_SIZE	64
+
+/* Maximum scan zone size across all selectors (for stack buffers). */
+#define FT_COLLAPSED_SCAN_ZONE_MAX	256
 
 struct cds_ft_collapsed_node {
 	uint8_t nr_entries;			/* Bits 7-6: scan zone selector.
