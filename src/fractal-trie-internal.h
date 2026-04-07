@@ -113,15 +113,6 @@
 #ifndef NO_FEATURE_FT_COMPRESS
 # define FEATURE_FT_COMPRESS
 #endif
-
-/*
- * FEATURE_FT_COLLAPSE: enable collapsed subtree nodes.
- * When enabled, sparse subtrees can be replaced with a single
- * cache-line-sized node storing variable-length key suffixes and
- * child pointers, eliminating multiple levels of pointer chasing.
- *
- * Enabled by default.  Disable with -DNO_FEATURE_FT_COLLAPSE.
- */
 #ifndef NO_FEATURE_FT_COLLAPSE
 # define FEATURE_FT_COLLAPSE
 #endif

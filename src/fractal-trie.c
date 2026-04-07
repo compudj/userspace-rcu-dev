@@ -12112,6 +12112,8 @@ struct cds_ft_stats_level {
 	uint64_t nr_metadata_external_nodes;
 	uint64_t nr_duplicate_external_nodes;
 	uint64_t nr_internal_nodes;
+	uint64_t nr_compressed_nodes;
+	uint64_t nr_collapsed_nodes;
 	struct cds_ft_node_stats node_stats[FT_TYPE_MAX_NR];
 	bool has_nodes;
 };
@@ -12173,6 +12175,7 @@ void calc_stats_collapsed(const struct cds_ft *ft,
 	unsigned int e;
 
 	stats->level[level].nr_internal_nodes++;
+	stats->level[level].nr_collapsed_nodes++;
 	stats->level[level].has_nodes = true;
 	if (external_nodes) {
 		struct cds_ft_node *iter_node;
@@ -12197,6 +12200,7 @@ void calc_stats_collapsed(const struct cds_ft *ft,
 		child = ft_dereference_acquire(cptrs[e]);
 		for (j = 1; j < slen; j++) {
 			stats->level[level + j].nr_internal_nodes++;
+			stats->level[level + j].nr_compressed_nodes++;
 			stats->level[level + j].has_nodes = true;
 		}
 		if (ft_node_ptr(child) && !ft_node_external(child))
@@ -12268,6 +12272,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 			int j;
 
 			stats->level[level].nr_internal_nodes++;
+			stats->level[level].nr_compressed_nodes++;
 			stats->level[level].has_nodes = true;
 			if (external_nodes) {
 				struct cds_ft_node *iter_node;
@@ -12284,6 +12289,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 			}
 			for (j = 1; j < cn->len; j++) {
 				stats->level[level + j].nr_internal_nodes++;
+				stats->level[level + j].nr_compressed_nodes++;
 				stats->level[level + j].has_nodes = true;
 			}
 			if (ft_node_ptr(cn->child) &&
@@ -12347,6 +12353,14 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 		if (stats_level->nr_internal_nodes) {
 			print_indent(out, 1);
 			fprintf(out, "Internal nodes: %" PRIu64 "\n", stats_level->nr_internal_nodes);
+		}
+		if (stats_level->nr_compressed_nodes) {
+			print_indent(out, 1);
+			fprintf(out, "Compressed nodes: %" PRIu64 "\n", stats_level->nr_compressed_nodes);
+		}
+		if (stats_level->nr_collapsed_nodes) {
+			print_indent(out, 1);
+			fprintf(out, "Collapsed nodes: %" PRIu64 "\n", stats_level->nr_collapsed_nodes);
 		}
 		for (type = 0; type < FT_TYPE_MAX_NR; type++) {
 			const struct cds_ft_node_stats *node_stats = &stats->level[level].node_stats[type];
