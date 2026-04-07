@@ -1632,13 +1632,23 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 
 #ifdef FEATURE_ADAPTIVE_LOOKUP
 /*
- * Adaptive lookup: bytewise for small nodes (<=7 children),
- * SWAR for medium (8-15), SIMD for large (16+).
+ * Adaptive lookup: dispatch bytewise, SWAR, or SIMD based on
+ * the node type's max_linear_child.
  *
- * The bytewise scan beats SWAR/SIMD for small nodes because
- * SWAR/SIMD have setup overhead (broadcast, load, compare)
- * that only pays off with enough entries to amortize.
+ * The thresholds define the minimum max_linear_child for each
+ * strategy.  The data layout starts with nr_child (1 byte)
+ * followed by key entries, so a 16-byte SSE2 load covers
+ * 15 key entries and an 8-byte SWAR word covers 7.
+ *
+ * Tunable via -DFT_SIMD_LINEAR_THRESHOLD=N and
+ * -DFT_SWAR_LINEAR_THRESHOLD=N at compile time.
  */
+#ifndef FT_SIMD_LINEAR_THRESHOLD
+#define FT_SIMD_LINEAR_THRESHOLD	7
+#endif
+#ifndef FT_SWAR_LINEAR_THRESHOLD
+#define FT_SWAR_LINEAR_THRESHOLD	14
+#endif
 
 /* SWAR constants. */
 #define L_ONES_A (-1UL / 255)
@@ -1758,12 +1768,29 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 			*node_flag_ptr = NULL;
 		return NULL;
 	}
+	/*
+	 * Dispatch based on node type capacity.  The data layout
+	 * starts with nr_child (1 byte) followed by the key array
+	 * (max_linear_child bytes), so the total scan area is
+	 * max_linear_child + 1 bytes.
+	 *
+	 * Use SIMD when the scan area rounded up to the next
+	 * power-of-two fits in a SIMD register:
+	 *   SSE2:  roundup(max_linear_child + 1) <= 16
+	 *          → max_linear_child >= 7  (8 rounds to 8, fits in 16)
+	 *
+	 * SWAR for non-SIMD platforms at the same default
+	 * threshold.  The break-even depends on setup overhead
+	 * vs loop iterations, not on word size.  Tune with
+	 * -DFT_SWAR_LINEAR_THRESHOLD=N.
+	 */
 #if defined(__SSE2__)
-	if (type->max_linear_child >= 16)
+	if (type->max_linear_child >= FT_SIMD_LINEAR_THRESHOLD)
 		return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n, nr_child);
-#endif
-	if (type->max_linear_child >= sizeof(unsigned long))
+#else
+	if (type->max_linear_child >= FT_SWAR_LINEAR_THRESHOLD)
 		return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n, nr_child);
+#endif
 
 	/* Small node: bytewise scan. */
 	{
