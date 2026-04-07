@@ -5690,95 +5690,16 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 }
 
 /*
- * ft_check_collapse_on_remove: after a remove/detach/graft, check if
- * any ancestor in the snapshot should be collapsed.  Walks from
- * deepest to shallowest, collapses the first eligible.
- */
-static
-void ft_check_collapse_on_remove(struct cds_ft *ft,
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth,
-		int nr_snapshot)
-{
-	int i;
-
-	for (i = nr_snapshot - 1; i >= 1; i--) {
-		struct cds_ft_inode_flag *node_flag = snapshot[i];
-		struct cds_ft_inode_flag *col_flag;
-
-		if (!ft_node_ptr(node_flag))
-			continue;
-		if (!ft_node_internal(node_flag))
-			continue;
-
-		col_flag = ft_try_collapse_at_node(ft, node_flag,
-				snapshot_depth[i]);
-		if (col_flag) {
-			struct cds_ft_inode_flag *parent = snapshot[i - 1];
-			struct cds_ft_inode_flag **parent_slot = NULL;
-
-			if (ft_node_internal(parent)) {
-				uint8_t child_key;
-				int pivot = -1;
-				struct cds_ft_inode_flag *c;
-
-				c = ft_node_get_direction(parent, pivot,
-					&child_key, FT_RIGHT);
-				while (ft_node_ptr(c)) {
-					struct cds_ft_inode_flag **slot = NULL;
-
-					ft_node_get_nth(parent, &slot,
-						child_key);
-					if (slot && *slot == node_flag) {
-						parent_slot = slot;
-						break;
-					}
-					pivot = child_key;
-					c = ft_node_get_direction(parent, pivot,
-						&child_key, FT_RIGHT);
-				}
-			} else if (ft_node_compressed(parent)) {
-				struct cds_ft_compressed_node *cn =
-					ft_compressed_node_ptr(parent);
-				if (cn->child == node_flag)
-					parent_slot = &cn->child;
-			} else if (ft_node_collapsed(parent)) {
-				struct cds_ft_collapsed_node *col2 =
-					ft_collapsed_node_ptr(parent);
-				struct cds_ft_inode_flag **cptrs =
-					ft_collapsed_ptrs(col2);
-				unsigned int e;
-
-				for (e = 0; e < col2->nr_entries; e++) {
-					if (cptrs[e] == node_flag) {
-						parent_slot = &cptrs[e];
-						break;
-					}
-				}
-			}
-
-			if (!parent_slot) {
-				free_collapsed_node(ft,
-					ft_collapsed_node_ptr(col_flag));
-				continue;
-			}
-
-			rcu_assign_pointer(*parent_slot, col_flag);
-			free_cds_ft_node(ft, ft_node_ptr(node_flag));
-			return;
-		}
-	}
-}
-
-/*
  * ft_check_collapse_on_path: after a mutation, walk the key path from
  * root to leaf through the LIVE trie, evaluating each internal node
  * for collapse.  This sees all nodes including freshly created
  * junctions from compressed splits, which may not be in the snapshot.
  *
- * Collects (node, parent_slot, depth) pairs for all eligible nodes,
- * then collapses the deepest one (favoring terminal-like nodes that
- * give JudyL-style early termination).
+ * Collapses are applied immediately top-down: when an internal node
+ * qualifies, it is replaced with a collapsed node before continuing
+ * deeper.  The walk then descends into the collapsed node's matching
+ * entry, naturally handling multi-level collapse without a separate
+ * collection pass.
  */
 static
 void ft_check_collapse_on_path(struct cds_ft *ft,
@@ -5786,9 +5707,6 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 {
 	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_inode_flag **parent_slot;
-	struct cds_ft_inode_flag *best_node = NULL;
-	struct cds_ft_inode_flag **best_parent_slot = NULL;
-	unsigned int best_depth = 0;
 	const uint8_t *ik = key;
 	unsigned int depth = 0;
 
@@ -5814,7 +5732,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 					break;
 			}
 			if (j < cmp)
-				break; /* Mismatch within compressed. */
+				break;
 			parent_slot = &cn->child;
 			node_flag = ft_dereference_acquire(cn->child);
 			depth += cn->len;
@@ -5859,25 +5777,24 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				break;
 			continue;
 		}
-		/* Internal node: evaluate for collapse (skip root). */
+		/*
+		 * Internal node: try to collapse (skip root).
+		 * Apply immediately and restart the loop — the
+		 * new collapsed node will be handled by the
+		 * collapsed branch above on the next iteration.
+		 */
 		if (depth > 0) {
 			struct cds_ft_inode_flag *col_flag;
 
 			col_flag = ft_try_collapse_at_node(ft, node_flag,
 					depth);
 			if (col_flag) {
-				/*
-				 * Record as candidate.  Keep the deepest
-				 * (last found) since we walk root→leaf.
-				 * Free any previously recorded candidate.
-				 */
-				if (best_node)
-					free_collapsed_node(ft,
-						ft_collapsed_node_ptr(
-							best_node));
-				best_node = col_flag;
-				best_parent_slot = parent_slot;
-				best_depth = depth;
+				rcu_assign_pointer(*parent_slot, col_flag);
+				free_cds_ft_node(ft, ft_node_ptr(node_flag));
+				node_flag = col_flag;
+				/* Restart loop: collapsed handler above
+				 * will descend into the matching entry. */
+				continue;
 			}
 		}
 		{
@@ -5891,14 +5808,6 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			node_flag = ft_dereference_acquire(*slot);
 			depth++;
 		}
-	}
-
-	if (best_node) {
-		struct cds_ft_inode_flag *old =
-			*best_parent_slot;
-
-		rcu_assign_pointer(*best_parent_slot, best_node);
-		free_cds_ft_node(ft, ft_node_ptr(old));
 	}
 }
 #endif /* FEATURE_FT_COLLAPSE */
@@ -8388,8 +8297,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	switch (ret) {
 	case 0:
 #ifdef FEATURE_FT_COLLAPSE
-		ft_check_collapse_on_remove(ft, snapshot, snapshot_depth,
-			nr_snapshot);
+		ft_check_collapse_on_path(ft, iter_key, key_len);
 #endif
 		return CDS_FT_STATUS_OK;
 	case -ENOMEM:
@@ -8642,7 +8550,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 
 #ifdef FEATURE_FT_COLLAPSE
-	ft_check_collapse_on_remove(ft, snapshot, snapshot_depth, nr_snapshot);
+	ft_check_collapse_on_path(ft, iter_key, key_len);
 #endif
 	return CDS_FT_STATUS_OK;
 }
@@ -9417,6 +9325,10 @@ done:
 
 	uatomic_store(&src_ft->max_used_key_len, 0, CMM_RELAXED);
 
+#ifdef FEATURE_FT_COLLAPSE
+	if (key_len > 0)
+		ft_check_collapse_on_path(dst_ft, key, key_len);
+#endif
 	return CDS_FT_STATUS_OK;
 }
 
@@ -9957,8 +9869,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 		*result_ft = detached;
 #ifdef FEATURE_FT_COLLAPSE
-		ft_check_collapse_on_remove(ft, snapshot, snapshot_depth,
-			nr_snapshot);
+		ft_check_collapse_on_path(ft, key, key_len);
 #endif
 		return CDS_FT_STATUS_OK;
 	}
