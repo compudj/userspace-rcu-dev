@@ -1175,11 +1175,12 @@ static const unsigned int ft_collapsed_scan_sizes[] = {
 static inline
 unsigned int ft_collapsed_nr_entries(struct cds_ft_collapsed_node *cn)
 {
-	return cn->nr_entries & FT_COLLAPSED_NR_ENTRIES_MASK;
+	return uatomic_load(&cn->nr_entries, CMM_ACQUIRE) & FT_COLLAPSED_NR_ENTRIES_MASK;
 }
 
 /*
  * Set the entry count, preserving the scan zone selector in bits 6-7.
+ * Writer-only (not published to readers).
  */
 static inline
 void ft_collapsed_set_nr_entries(struct cds_ft_collapsed_node *cn,
@@ -1190,13 +1191,15 @@ void ft_collapsed_set_nr_entries(struct cds_ft_collapsed_node *cn,
 }
 
 /*
- * Publish an incremented entry count (atomic store for readers).
- * Preserves the scan zone selector in bits 6-7.
+ * Publish an incremented entry count with store-release ordering.
+ * Ensures readers (via load-acquire in ft_collapsed_nr_entries) see
+ * the fully written suffix, offset, and pointer data before seeing
+ * the incremented count.  Preserves the scan zone selector in bits 6-7.
  */
 static inline
 void ft_collapsed_publish_inc_nr_entries(struct cds_ft_collapsed_node *cn)
 {
-	CMM_STORE_SHARED(cn->nr_entries, cn->nr_entries + 1);
+	uatomic_store(&cn->nr_entries, cn->nr_entries + 1, CMM_RELEASE);
 }
 
 static inline
@@ -8067,7 +8070,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 				cptrs[col_nr] = branch;
 
 				/* Publish: increment nr_entries (atomic store). */
-				cmm_smp_wmb();
+				/* Store-release in publish_inc ensures
+				 * readers see suffix/offset/pointer data. */
 				ft_collapsed_publish_inc_nr_entries(col);
 
 				{
