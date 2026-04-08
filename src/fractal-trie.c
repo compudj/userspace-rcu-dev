@@ -3268,7 +3268,9 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 	}
 	if (cn->len > remaining_key) {
 		struct cds_ft_metadata *cn_meta =
-			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+			cds_ft_item_to_metadata_fast(
+				(struct cds_ft_inode *) cn,
+				ft_compressed_order(cn->len));
 
 		*found_ret = rcu_dereference(cn_meta->external_nodes);
 		*status_ret = *found_ret ? CDS_FT_STATUS_OK :
@@ -3773,8 +3775,12 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			match_node = found;
 		}
 	} else if (ft_node_compressed(node_flag)) {
-		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(
-							ft_node_ptr(node_flag));
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(node_flag);
+		struct cds_ft_metadata *metadata =
+			cds_ft_item_to_metadata_fast(
+				(struct cds_ft_inode *) cn,
+				ft_compressed_order(cn->len));
 		found = rcu_dereference(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
@@ -3782,8 +3788,11 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			match_node = found;
 		}
 	} else if (ft_node_collapsed(node_flag)) {
-		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(
-							ft_node_ptr(node_flag));
+		struct cds_ft_metadata *metadata =
+			cds_ft_item_to_metadata_fast(
+				ft_node_ptr(node_flag),
+				cds_ft_item_order(
+					(struct cds_ft_inode *) ft_collapsed_node_ptr(node_flag)));
 		found = rcu_dereference(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
