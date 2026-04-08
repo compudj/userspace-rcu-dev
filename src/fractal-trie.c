@@ -2123,7 +2123,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type *type,
 	struct cds_ft_inode_flag **child_node_flag_ptr;
 	struct cds_ft_inode_flag *child_node_flag;
 
-	assert(type->type_class == FT_PIGEON);
+	assert(!type || type->type_class == FT_PIGEON);
 	child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[n];
 	child_node_flag = ft_dereference_acquire(*child_node_flag_ptr);
 	//dbg_printf("ft_pigeon_node_get_nth child_node_flag_ptr %p\n",
