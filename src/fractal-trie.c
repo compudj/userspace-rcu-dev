@@ -5050,16 +5050,13 @@ going_up:
 			}
 
 			/*
-			 * current_entry == -1: the search key doesn't
-			 * match any entry in this collapsed node (e.g.
-			 * key outside the node's range).  Skip the
-			 * sibling search and continue going up.
+			 * The current entry must always be found: the
+			 * suffix is immutable, and the downward walk
+			 * wrote it to ordinal_key.  If not found, there
+			 * is a bug in suffix_base computation or
+			 * ordinal_key was corrupted.
 			 */
-			if (current_entry < 0) {
-				level = entry_depth + 1;
-				going_up = true;
-				continue;
-			}
+			assert(current_entry >= 0);
 
 			/*
 			 * If we're past the current entry's suffix (in
