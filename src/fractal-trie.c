@@ -805,10 +805,63 @@ int ft_key_cmp_ordinals(const uint8_t *key, const uint8_t *ordinals,
 	unsigned int j;
 
 	if (caa_likely(km->identity)) {
+		/*
+		 * Word-at-a-time equality check for the common
+		 * identity key map.  Compare full words where
+		 * possible, byte loop for the tail.  No special
+		 * padding or bounds tracking needed.
+		 *
+		 * When mismatch_pos is needed (longest-match
+		 * tracking), fall back to the byte loop to find
+		 * the exact position.
+		 */
+		if (!mismatch_pos) {
+			j = 0;
+			while (j + sizeof(unsigned long) <= len) {
+				unsigned long k, o;
+
+				__builtin_memcpy(&k, key + j,
+					sizeof(unsigned long));
+				__builtin_memcpy(&o, ordinals + j,
+					sizeof(unsigned long));
+				if (k != o)
+					return 1;
+				j += sizeof(unsigned long);
+			}
+			/*
+			 * Tail: re-read the last sizeof(long) bytes
+			 * of both arrays (overlapping with the already-
+			 * confirmed equal region).  One word compare
+			 * covers any tail length.
+			 *
+			 * Only possible when len >= sizeof(long) so
+			 * the backwards offset doesn't go negative.
+			 * For shorter comparisons (the word loop never
+			 * ran), fall back to a byte cascade.
+			 */
+			if (j < len) {
+				if (len >= sizeof(unsigned long)) {
+					unsigned long k, o;
+					unsigned int tail = len -
+						sizeof(unsigned long);
+
+					__builtin_memcpy(&k, key + tail,
+						sizeof(unsigned long));
+					__builtin_memcpy(&o, ordinals + tail,
+						sizeof(unsigned long));
+					if (k != o)
+						return 1;
+				} else {
+					for (; j < len; j++)
+						if (key[j] != ordinals[j])
+							return 1;
+				}
+			}
+			return 0;
+		}
 		for (j = 0; j < len; j++) {
 			if (key[j] != ordinals[j]) {
-				if (mismatch_pos)
-					*mismatch_pos = j;
+				*mismatch_pos = j;
 				return (int)key[j] - (int)ordinals[j];
 			}
 		}
