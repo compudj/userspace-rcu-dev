@@ -167,8 +167,8 @@ struct cds_ft_metadata {
 	 * node creation/destruction.  Bounded propagation: only N
 	 * ancestors are updated, cost O(N) per mutation.
 	 *
-	 * 16 levels covers typical key depths (DNS names, file paths)
-	 * and allows collapsed nodes to skip up to 16 trie levels.
+	 * 6 levels covers typical collapsed node depth and allows
+	 * precise density tracking for collapse decisions.
 	 */
 #define FT_NODE_DENSITY_DEPTH	6
 	unsigned long nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
