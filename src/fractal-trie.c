@@ -7144,6 +7144,12 @@ static struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child,
 		unsigned long nr_keys);
 
+static struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
+		struct cds_ft_collapsed_node *col,
+		struct cds_ft_inode_flag **cptrs,
+		unsigned int start, unsigned int end,
+		unsigned int suffix_offset);
+
 static
 int ft_attach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attach_node_flag_ptr,
@@ -7253,70 +7259,28 @@ int ft_attach_node(struct cds_ft *ft,
 					(struct cds_ft_inode *) col);
 			struct cds_ft_inode_flag **cptrs =
 				ft_collapsed_ptrs(col);
-			struct cds_ft_inode_flag *internal_flag = NULL;
+			struct cds_ft_inode_flag *internal_flag;
 			struct cds_ft_metadata *int_meta;
-			unsigned int ee;
 
-			for (ee = 0; ee < ft_collapsed_nr_entries(col); ee++) {
-				uint8_t *sfx;
-				unsigned int slen2;
-				struct cds_ft_inode_flag *child;
-				int eret;
-
-				if (ft_collapsed_entry_dead(col, ee))
-					continue;
-				sfx = ft_collapsed_suffix(col, ee);
-				slen2 = ft_collapsed_suffix_len(col, ee);
-				child = cptrs[ee];
-				if (!ft_node_ptr(child))
-					continue;
-
-				if (slen2 > 1) {
-					unsigned long child_nr_keys;
-
-					if (!ft_node_external(child)) {
-						struct cds_ft_metadata *cm =
-							cds_ft_item_to_metadata(
-								ft_node_ptr(child));
-						child_nr_keys = uatomic_load(
-							&cm->nr_keys,
-							CMM_RELAXED);
-					} else {
-						child_nr_keys =
-							ft_node_ptr(child) ? 1 : 0;
-					}
-					child = ft_build_ordinal_chain(ft,
-						sfx + 1, slen2 - 1,
-						child, child_nr_keys);
-					if (!child) {
-						ret = -ENOMEM;
-						goto check_error;
-					}
-				}
-				eret = ft_node_set_nth(ft, &internal_flag,
-					sfx[0], child, NULL,
-					internal_flag ?
-					cds_ft_item_to_metadata(
-						ft_node_ptr(internal_flag)) :
-					NULL);
-				if (eret) {
-					ret = -ENOMEM;
-					goto check_error;
-				}
+			internal_flag = ft_explode_entries(ft,
+				col, cptrs,
+				0, ft_collapsed_nr_entries(col), 0);
+			if (!internal_flag) {
+				ret = -ENOMEM;
+				goto check_error;
 			}
-			if (internal_flag) {
-				int_meta = cds_ft_item_to_metadata(
-					ft_node_ptr(internal_flag));
-				uatomic_store(&int_meta->nr_keys,
-					col_meta->nr_keys, CMM_RELAXED);
-				int_meta->external_nodes =
-					col_meta->external_nodes;
-				rcu_assign_pointer(*attach_node_flag_ptr,
-					internal_flag);
-				attach_node_flag = internal_flag;
-				metadata = int_meta;
-				free_collapsed_node(ft, col);
-			}
+			int_meta = cds_ft_item_to_metadata(
+				ft_node_ptr(internal_flag));
+			uatomic_store(&int_meta->nr_keys,
+				col_meta->nr_keys, CMM_RELAXED);
+			int_meta->external_nodes =
+				col_meta->external_nodes;
+			ft_init_node_density(internal_flag);
+			rcu_assign_pointer(*attach_node_flag_ptr,
+				internal_flag);
+			attach_node_flag = internal_flag;
+			metadata = int_meta;
+			free_collapsed_node(ft, col);
 		}
 #endif
 
@@ -8231,7 +8195,7 @@ insert_done:
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 #ifdef FEATURE_FT_COLLAPSE
-		if (key_len > 0)
+		if (key_len > 0 && !ft->skip_collapse)
 			ft_check_collapse_on_path(ft, key, key_len);
 #endif
 	}
