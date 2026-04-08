@@ -822,94 +822,130 @@ static inline void ft_ordinals_to_key(uint8_t *dst, const uint8_t *ordinals,
 }
 
 /*
- * ft_key_cmp_ordinals: compare @len bytes of ordinal data from two
- * sources.  Both @a and @b must be in ordinal space.  Returns 0 if
- * equal, non-zero otherwise.
+ * Byte-swap an unsigned long for lexicographic word comparison on
+ * little-endian.  On big-endian this is a no-op: natural word order
+ * already matches memory (lexicographic) order.
+ */
+static inline unsigned long ft_bswap_long(unsigned long v)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if __SIZEOF_LONG__ == 8
+	return __builtin_bswap64(v);
+#else
+	return __builtin_bswap32(v);
+#endif
+#else
+	return v;
+#endif
+}
+
+/*
+ * Given two mismatching words loaded from position @base, compute the
+ * mismatch byte index (stored in *@mismatch_pos when non-NULL) and
+ * return the signed lexicographic comparison result (<0, >0).
  *
- * If @mismatch_pos is non-NULL, stores the index of the first
- * mismatching byte (undefined on full match) and the return value
- * encodes the signed difference at that position.
+ * When @mismatch_pos is NULL the compiler eliminates the bitscan.
+ * When non-NULL the bswap is shared with the cardinality path.
+ */
+static inline_lookup
+int ft_word_mismatch(unsigned long va, unsigned long vb,
+		unsigned int base, unsigned int *mismatch_pos)
+{
+	if (mismatch_pos) {
+		unsigned long diff = va ^ vb;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+		*mismatch_pos = base + (unsigned int)__builtin_ctzl(diff) / 8;
+#else
+		*mismatch_pos = base + (unsigned int)__builtin_clzl(diff) / 8;
+#endif
+	}
+	va = ft_bswap_long(va);
+	vb = ft_bswap_long(vb);
+	return va < vb ? -1 : 1;
+}
+
+/*
+ * ft_key_cmp_ordinals: compare @len bytes of ordinal data from two
+ * sources.  Both @a and @b must be in ordinal space.
+ *
+ * Returns 0 when equal.  When unequal, the sign encodes lexicographic
+ * order (<0 means a < b, >0 means a > b).
+ *
+ * If @mismatch_pos is non-NULL, it receives the index of the first
+ * mismatching byte on inequality (undefined on full match).  This
+ * also gates the bitscan instruction; callers that only need
+ * equality should pass NULL so the compiler eliminates it.
+ *
+ * All three use-cases (equality, mismatch position, signed
+ * cardinality) share the same word-at-a-time loop body.  Since this
+ * function is force-inlined, the @mismatch_pos check is
+ * constant-folded at each call site.
  */
 static inline_lookup
 int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 		unsigned int len, unsigned int remaining_key,
 		unsigned int *mismatch_pos)
 {
-	unsigned int j;
+	unsigned int j = 0;
+
+	/* Main loop: full-word comparison. */
+	while (j + sizeof(unsigned long) <= len) {
+		unsigned long va, vb;
+
+		__builtin_memcpy(&va, a + j, sizeof(unsigned long));
+		__builtin_memcpy(&vb, b + j, sizeof(unsigned long));
+		if (va != vb)
+			return ft_word_mismatch(va, vb, j, mismatch_pos);
+		j += sizeof(unsigned long);
+	}
 
 	/*
-	 * Word-at-a-time equality check.  Compare full words where
-	 * possible, byte loop for the tail.  No special padding or
-	 * bounds tracking needed.
+	 * Tail: 0 to sizeof(long)-1 bytes remain.
 	 *
-	 * When mismatch_pos is needed (longest-match tracking), fall
-	 * back to the byte loop to find the exact position.
+	 * When len >= sizeof(long), re-read the last word of both
+	 * arrays (overlap with confirmed-equal bytes is harmless).
+	 *
+	 * When remaining_key >= sizeof(long), read a full word from
+	 * each at position 0 — the extra bytes beyond @len are
+	 * valid memory, masked out before comparison.
+	 *
+	 * Otherwise fall back to byte-by-byte.
 	 */
-	if (!mismatch_pos) {
-		j = 0;
-		while (j + sizeof(unsigned long) <= len) {
+	if (j < len) {
+		if (len >= sizeof(unsigned long)) {
 			unsigned long va, vb;
+			unsigned int tail = len - sizeof(unsigned long);
 
-			__builtin_memcpy(&va, a + j,
+			__builtin_memcpy(&va, a + tail,
 				sizeof(unsigned long));
-			__builtin_memcpy(&vb, b + j,
+			__builtin_memcpy(&vb, b + tail,
 				sizeof(unsigned long));
 			if (va != vb)
-				return 1;
-			j += sizeof(unsigned long);
-		}
-		/*
-		 * Tail: 0 to sizeof(long)-1 bytes remain.
-		 *
-		 * When len >= sizeof(long), re-read the last
-		 * word of both arrays (overlap with confirmed
-		 * equal bytes is harmless for equality).
-		 *
-		 * When remaining_key >= sizeof(long), read a
-		 * full word from each at position 0 — the
-		 * extra bytes are valid, masked out.
-		 *
-		 * Otherwise byte-by-byte.
-		 */
-		if (j < len) {
-			if (len >= sizeof(unsigned long)) {
-				unsigned long va, vb;
-				unsigned int tail = len -
-					sizeof(unsigned long);
+				return ft_word_mismatch(va, vb, tail,
+							mismatch_pos);
+		} else if (remaining_key >= sizeof(unsigned long)) {
+			unsigned long va, vb, mask;
 
-				__builtin_memcpy(&va, a + tail,
-					sizeof(unsigned long));
-				__builtin_memcpy(&vb, b + tail,
-					sizeof(unsigned long));
-				if (va != vb)
-					return 1;
-			} else if (remaining_key >=
-					sizeof(unsigned long)) {
-				unsigned long va, vb, mask;
-
-				__builtin_memcpy(&va, a,
-					sizeof(unsigned long));
-				__builtin_memcpy(&vb, b,
-					sizeof(unsigned long));
+			__builtin_memcpy(&va, a, sizeof(unsigned long));
+			__builtin_memcpy(&vb, b, sizeof(unsigned long));
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-				mask = (1UL << (len * 8)) - 1;
+			mask = (1UL << (len * 8)) - 1;
 #else
-				mask = ~((1UL << ((sizeof(unsigned long) - len) * 8)) - 1);
+			mask = ~((1UL << ((sizeof(unsigned long) - len) * 8)) - 1);
 #endif
-				if ((va ^ vb) & mask)
-					return 1;
-			} else {
-				for (; j < len; j++)
-					if (a[j] != b[j])
-						return 1;
+			va &= mask;
+			vb &= mask;
+			if (va != vb)
+				return ft_word_mismatch(va, vb, 0,
+							mismatch_pos);
+		} else {
+			for (; j < len; j++) {
+				if (a[j] != b[j]) {
+					if (mismatch_pos)
+						*mismatch_pos = j;
+					return (int)a[j] - (int)b[j];
+				}
 			}
-		}
-		return 0;
-	}
-	for (j = 0; j < len; j++) {
-		if (a[j] != b[j]) {
-			*mismatch_pos = j;
-			return (int)a[j] - (int)b[j];
 		}
 	}
 	return 0;
