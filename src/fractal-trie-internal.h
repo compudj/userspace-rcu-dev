@@ -301,8 +301,6 @@ struct cds_ft {
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
 	unsigned long nr_fallback;		/* Number of fallback nodes used */
 
-	bool skip_collapse;			/* Debug: skip ft_check_collapse_on_path */
-
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[FT_ENTRY_PER_NODE];
 	unsigned long nr_nodes_allocated, nr_nodes_freed;

@@ -8178,7 +8178,7 @@ insert_done:
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 #ifdef FEATURE_FT_COLLAPSE
-		if (key_len > 0 && !ft->skip_collapse)
+		if (key_len > 0)
 			ft_check_collapse_on_path(ft, key, key_len);
 #endif
 	}
