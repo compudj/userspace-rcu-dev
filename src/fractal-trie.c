@@ -4175,6 +4175,65 @@ end:
 }
 
 /*
+ * ft_collapsed_find_nearest: scan a collapsed node's entries for the
+ * nearest live entry in @dir relative to entry @ref_entry.
+ *
+ * Compares each candidate's suffix against @ref_entry's suffix to
+ * determine direction.  Skips @ref_entry itself, dead (tombstoned)
+ * entries, and NULL-pointer entries.
+ *
+ * Returns the index of the nearest entry, or -1 if none found.
+ */
+static int ft_collapsed_find_nearest(
+		struct cds_ft_collapsed_node *col,
+		struct cds_ft_inode_flag **cptrs,
+		unsigned int ref_entry,
+		enum ft_direction dir)
+{
+	uint8_t *ref_suffix = ft_collapsed_suffix(col, ref_entry);
+	unsigned int ref_slen = ft_collapsed_suffix_len(col, ref_entry);
+	int best = -1;
+	unsigned int e;
+
+	for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+		uint8_t *suffix;
+		unsigned int slen, mc;
+		int r;
+
+		if (e == ref_entry)
+			continue;
+		if (ft_collapsed_entry_dead(col, e))
+			continue;
+		if (!ft_node_ptr(cptrs[e]))
+			continue;
+		suffix = ft_collapsed_suffix(col, e);
+		slen = ft_collapsed_suffix_len(col, e);
+
+		mc = slen < ref_slen ? slen : ref_slen;
+		r = ft_key_cmp_ordinals(suffix, ref_suffix, mc, mc, true, NULL);
+		if (r == 0)
+			r = (slen > ref_slen) ? 1 : (slen < ref_slen) ? -1 : 0;
+
+		if ((dir == FT_RIGHT && r > 0) ||
+		    (dir == FT_LEFT && r < 0)) {
+			if (best < 0) {
+				best = (int)e;
+			} else {
+				uint8_t *bs = ft_collapsed_suffix(col, (unsigned)best);
+				unsigned int bl = ft_collapsed_suffix_len(col, (unsigned)best);
+				unsigned int mc2 = bl < slen ? bl : slen;
+				int r2 = ft_key_cmp_ordinals(suffix, bs, mc2, mc2, true, NULL);
+
+				if ((dir == FT_RIGHT && (r2 < 0 || (r2 == 0 && slen < bl))) ||
+				    (dir == FT_LEFT && (r2 > 0 || (r2 == 0 && slen > bl))))
+					best = (int)e;
+			}
+		}
+	}
+	return best;
+}
+
+/*
  * Iterator-based inequality lookup. The input key and key_len are read
  * from @iter (set via cds_ft_iter_set_key). On success the result key,
  * key length, node, status, and path are written back into @iter so that
@@ -4929,7 +4988,6 @@ going_up:
 			struct cds_ft_inode_flag **cptrs =
 				ft_collapsed_ptrs(col);
 			int entry_depth = level - 1;
-			int best_sibling = -1;
 			unsigned int e;
 
 			/* Walk back to the collapsed node's entry depth. */
@@ -4939,29 +4997,12 @@ going_up:
 				entry_depth--;
 
 			/*
-			 * Compute the ordinal_key base for suffix data.
-			 * When the parent is compressed, the collapsed
-			 * handler's first write is at entry_depth, and
-			 * ordinal_key starts at entry_depth-1.  When
-			 * the parent is internal (dispatch), the first
-			 * write is at entry_depth+1, and ordinal_key
-			 * starts at entry_depth.
-			 */
-			{
-			/*
 			 * suffix_base: the ordinal_key position where
 			 * collapsed suffix data starts.  Normally
 			 * entry_depth, except when the collapsed node is
-			 * a direct child of a compressed node (no
-			 * intermediate internal dispatch).  In that case,
-			 * the compressed handler wrote ordinal_key one
-			 * position earlier: suffix_base = entry_depth - 1.
-			 *
-			 * Detect by checking if ordinal_key[entry_depth-1]
-			 * matches any entry's first suffix byte — if so,
-			 * the compressed handler wrote the suffix start
-			 * there (direct transition).
+			 * a direct child of a compressed node.
 			 */
+			{
 			int suffix_base = entry_depth;
 			if (entry_depth > 0 &&
 			    ft_node_compressed(iter_path_node(iter)[entry_depth - 1])) {
@@ -4977,38 +5018,21 @@ going_up:
 				}
 			}
 
-			/*
-			 * Search for the next collapsed entry (sibling)
-			 * in the inequality direction.
-			 *
-			 * Path layout: path[entry_depth] = collapsed
-			 * node (from parent dispatch).
-			 * path[entry_depth+1..entry_depth+slen] =
-			 * collapsed_node_flag (from handler).
-			 * Suffix in ordinal_key[entry_depth..
-			 * entry_depth+slen-1].
-			 *
-			 * First, identify the current entry by finding
-			 * the entry whose suffix is a prefix of
-			 * ordinal_key[entry_depth..].  Then find the
-			 * nearest sibling in @dir.
-			 */
-			/*
-			 * Find the current entry by suffix match, then
-			 * determine if we're still within the collapsed
-			 * entry's span or past it (in the child's subtree).
-			 */
 			{
-			int current_entry = -1;
+			int current_entry = -1, best;
 			unsigned int cur_slen = 0;
 
+			/*
+			 * Find the current entry by suffix match.
+			 * Don't skip dead/tombstoned entries: the suffix
+			 * data is immutable and we need the position even
+			 * if a concurrent writer tombstoned the entry.
+			 */
 			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
 				uint8_t *suffix;
 				unsigned int slen, j2;
 				bool match2;
 
-				if (ft_collapsed_entry_dead(col, e))
-					continue;
 				suffix = ft_collapsed_suffix(col, e);
 				slen = ft_collapsed_suffix_len(col, e);
 				match2 = true;
@@ -5028,12 +5052,9 @@ going_up:
 			/*
 			 * If we're past the current entry's suffix (in
 			 * the child's subtree), check the child node
-			 * for siblings first.  The path at the child's
-			 * depth was overwritten by the handler, so we
-			 * recover the child from cptrs[current_entry].
+			 * for siblings first.
 			 */
-			if (current_entry >= 0 &&
-			    level > (int)(suffix_base + cur_slen)) {
+			if (level > (int)(suffix_base + cur_slen)) {
 				struct cds_ft_inode_flag *child_flag =
 					ft_dereference_acquire(
 						cptrs[current_entry]);
@@ -5055,83 +5076,19 @@ going_up:
 						break;
 					}
 				}
-				/* No child sibling: fall through to
-				 * collapsed sibling search below. */
 			}
 
-			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
-				uint8_t *suffix;
-				unsigned int slen, mc;
-				int r;
+			/* Find the nearest live sibling in @dir. */
+			best = ft_collapsed_find_nearest(col, cptrs,
+				(unsigned)current_entry, dir);
 
-				if ((int)e == current_entry)
-					continue;
-				if (ft_collapsed_entry_dead(col, e))
-					continue;
-				if (!ft_node_ptr(cptrs[e]))
-					continue;
-				suffix = ft_collapsed_suffix(col, e);
-				slen = ft_collapsed_suffix_len(col, e);
-
-				if (current_entry >= 0) {
-					uint8_t *cs = ft_collapsed_suffix(
-						col, (unsigned)current_entry);
-					mc = slen < cur_slen ? slen : cur_slen;
-					r = memcmp(suffix, cs, mc);
-					if (r == 0)
-						r = (slen > cur_slen) ? 1 :
-						    (slen < cur_slen) ? -1 : 0;
-				} else {
-					mc = slen;
-					r = memcmp(suffix,
-						&ordinal_key[suffix_base], mc);
-					if (r == 0)
-						r = 1;
-				}
-
-				if (dir == FT_RIGHT && r > 0) {
-					if (best_sibling < 0)
-						best_sibling = (int)e;
-					else {
-						uint8_t *bs = ft_collapsed_suffix(
-							col, (unsigned)best_sibling);
-						unsigned int bl = ft_collapsed_suffix_len(
-							col, (unsigned)best_sibling);
-						unsigned int mc2 = bl < slen ? bl : slen;
-						int r2 = memcmp(suffix, bs, mc2);
-						if (r2 < 0 || (r2 == 0 && slen < bl))
-							best_sibling = (int)e;
-					}
-				} else if (dir == FT_LEFT && r < 0) {
-					if (best_sibling < 0)
-						best_sibling = (int)e;
-					else {
-						uint8_t *bs = ft_collapsed_suffix(
-							col, (unsigned)best_sibling);
-						unsigned int bl = ft_collapsed_suffix_len(
-							col, (unsigned)best_sibling);
-						unsigned int mc2 = bl < slen ? bl : slen;
-						int r2 = memcmp(suffix, bs, mc2);
-						if (r2 > 0 || (r2 == 0 && slen > bl))
-							best_sibling = (int)e;
-					}
-				}
-			}
-			}
-			if (best_sibling >= 0) {
+			if (best >= 0) {
 				unsigned int slen = ft_collapsed_suffix_len(
-					col, (unsigned)best_sibling);
+					col, (unsigned)best);
 				uint8_t *suffix = ft_collapsed_suffix(
-					col, (unsigned)best_sibling);
+					col, (unsigned)best);
 				unsigned int k;
 
-				/*
-				 * Fill ordinal_key and path for the
-				 * sibling entry, matching the convention
-				 * used by the internal node sibling code:
-				 * ordinal_key up to level-1, path[level]
-				 * = child node.
-				 */
 				for (k = 0; k < slen; k++) {
 					ordinal_key[suffix_base + k] = suffix[k];
 					if (k > 0)
@@ -5140,14 +5097,15 @@ going_up:
 				}
 				level = suffix_base + slen;
 				node_flag = ft_dereference_acquire(
-					cptrs[best_sibling]);
+					cptrs[best]);
 				iter_path_node(iter)[level] = node_flag;
 				break;
 			}
-			/* No sibling entry found, continue going up. */
+			/* No match found, continue going up. */
 			level = entry_depth + 1;
 			going_up = true;
 			continue;
+		} /* current_entry scope */
 		} /* suffix_base scope */
 		}
 #endif
