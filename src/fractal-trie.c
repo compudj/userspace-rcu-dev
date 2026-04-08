@@ -1286,6 +1286,9 @@ bool valid_key_len(struct cds_ft *ft, size_t key_len)
 	return true;
 }
 
+static inline uint8_t ft_linear_encode_nr_child(unsigned int nr_child,
+		const struct cds_ft_type *type);
+
 static
 struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 		const struct cds_ft_type *ft_type,
@@ -1299,6 +1302,16 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 		return NULL;
 	}
 	p = cds_ft_metadata_to_item(metadata);
+	/*
+	 * Initialize data[0] with the ptr_offset encoding in the
+	 * high bits (nr_child = 0 in the low bits).  This makes
+	 * the pointer offset available from the first read,
+	 * before any child is inserted.
+	 */
+	if (ft_type_is_linear(ft_type->type_class) ||
+	    ft_type->type_class == FT_POOL)
+		((struct cds_ft_inode *) p)->data[0] =
+			ft_linear_encode_nr_child(0, ft_type);
 	if (ft_debug_counters())
 		uatomic_inc(&ft->nr_nodes_allocated);
 	*_metadata = metadata;
@@ -1466,13 +1479,61 @@ uint8_t *align_ptr_size(uint8_t *ptr)
 	return (uint8_t *) FT_ALIGN((unsigned long) ptr, sizeof(void *));
 }
 
+/*
+ * Linear node data[0] encoding:
+ *   bits 0-4: nr_child (max 25)
+ *   bits 5-7: pointer array offset / 8
+ *
+ * The pointer offset encodes where the child pointer array starts
+ * within the node, precomputed from max_linear_child at node
+ * creation.  This eliminates the ft_types[] load and alignment
+ * computation from the lookup hot path — the offset is extracted
+ * from the same byte as nr_child with a shift.
+ */
+#define FT_LINEAR_NR_CHILD_MASK		0x1F
+#define FT_LINEAR_PTR_OFFSET_SHIFT	5
+
 static inline_lookup
-uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
+uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type
+		__attribute__((unused)),
 		struct cds_ft_inode *node)
 {
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 	/* load-acquire orders nr_child load before values and pointers */
-	return uatomic_load(&node->data[0], CMM_ACQUIRE);
+	return uatomic_load(&node->data[0], CMM_ACQUIRE)
+		& FT_LINEAR_NR_CHILD_MASK;
+}
+
+/*
+ * Extract the pointer array base from node->data[0] high bits.
+ * @raw: the acquire-loaded data[0] byte (containing both
+ *       nr_child and ptr_offset).
+ * Returns the pointer array as a struct cds_ft_inode_flag **,
+ * suitable for indexing by child position.
+ */
+static inline_lookup
+struct cds_ft_inode_flag **ft_linear_pointers(
+		struct cds_ft_inode *node, uint8_t raw)
+{
+	unsigned int byte_offset = (raw >> FT_LINEAR_PTR_OFFSET_SHIFT)
+		<< __builtin_ctz(sizeof(void *));
+	return (struct cds_ft_inode_flag **)
+		((uint8_t *) node + byte_offset);
+}
+
+/*
+ * Encode nr_child and pointer offset into data[0].
+ */
+static inline
+uint8_t ft_linear_encode_nr_child(unsigned int nr_child,
+		const struct cds_ft_type *type)
+{
+	unsigned int ptr_offset = FT_ALIGN(
+		1 + type->max_linear_child, sizeof(void *));
+	unsigned int slots = ptr_offset / sizeof(void *);
+
+	assert(nr_child <= FT_LINEAR_NR_CHILD_MASK);
+	assert(slots < (1U << (8 - FT_LINEAR_PTR_OFFSET_SHIFT)));
+	return (uint8_t)((slots << FT_LINEAR_PTR_OFFSET_SHIFT) | nr_child);
 }
 
 /*
@@ -1520,10 +1581,9 @@ uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
 
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
-		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, uint8_t nr_child)
+		uint8_t n, uint8_t nr_child, uint8_t raw)
 {
 	unsigned long *data_words = (unsigned long *)node->data;
 	unsigned long mask = n * L_ONES_A, xor_res, has_zero;
@@ -1547,7 +1607,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
 			goto found;
 	}
 #endif
-	for (unsigned int w = 1; w * sizeof(unsigned long) <= type->max_linear_child; w++) {
+	for (unsigned int w = 1; w * sizeof(unsigned long) < ((raw >> FT_LINEAR_PTR_OFFSET_SHIFT) << __builtin_ctz(sizeof(void *))); w++) {
 		xor_res = data_words[w] ^ mask;
 		has_zero = (xor_res - L_ONES_A) & ~xor_res & L_HIGHS_A;
 		if (has_zero) {
@@ -1565,8 +1625,8 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
 	return NULL;
 found:
 	{
-		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
-			align_ptr_size(&node->data[1] + type->max_linear_child);
+		struct cds_ft_inode_flag **pointers =
+			ft_linear_pointers(node, raw);
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = &pointers[i];
 		return ft_dereference_acquire(pointers[i]);
@@ -1577,10 +1637,9 @@ found:
 #include <immintrin.h>
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
-		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, uint8_t nr_child)
+		uint8_t n, uint8_t nr_child, uint8_t raw)
 {
 	uint8_t *data = &node->data[0];
 	__m128i target = _mm_set1_epi8(n);
@@ -1610,8 +1669,8 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
 found:
 	{
 		unsigned int i = phys_idx - 1;
-		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
-			align_ptr_size(&node->data[1] + type->max_linear_child);
+		struct cds_ft_inode_flag **pointers =
+			ft_linear_pointers(node, raw);
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = &pointers[i];
 		return ft_dereference_acquire(pointers[i]);
@@ -1629,7 +1688,8 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
+	uint8_t raw = uatomic_load(&node->data[0], CMM_ACQUIRE);
+	uint8_t nr_child = raw & FT_LINEAR_NR_CHILD_MASK;
 	uint8_t *values = &node->data[1];
 	unsigned int i;
 
@@ -1648,8 +1708,8 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		return NULL;
 	}
 	{
-		struct cds_ft_inode_flag **pointers = (struct cds_ft_inode_flag **)
-			align_ptr_size(&values[type->max_linear_child]);
+		struct cds_ft_inode_flag **pointers =
+			ft_linear_pointers(node, raw);
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = &pointers[i];
 		return ft_dereference_acquire(pointers[i]);
@@ -1666,7 +1726,8 @@ struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type *
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
+	uint8_t raw = uatomic_load(&node->data[0], CMM_ACQUIRE);
+	uint8_t nr_child = raw & FT_LINEAR_NR_CHILD_MASK;
 
 	if (nr_child == 0) {
 		if (caa_unlikely(node_flag_ptr))
@@ -1674,9 +1735,9 @@ struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type *
 		return NULL;
 	}
 #if defined(__SSE2__)
-	return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n, nr_child);
+	return ft_linear_node_get_nth_simd(node, node_flag_ptr, n, nr_child, raw);
 #else
-	return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n, nr_child);
+	return ft_linear_node_get_nth_swar(node, node_flag_ptr, n, nr_child, raw);
 #endif
 }
 
@@ -2159,7 +2220,7 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 	nr_child_ptr = &node->data[0];
 	dbg_printf("linear set nth: n %u, nr_child_ptr %p\n",
 		(unsigned int) n, nr_child_ptr);
-	nr_child = *nr_child_ptr;
+	nr_child = *nr_child_ptr & FT_LINEAR_NR_CHILD_MASK;
 	assert(nr_child <= type->max_linear_child);
 
 	values = &node->data[1];
@@ -2187,8 +2248,11 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 		assert(pointers[i] == NULL);
 		uatomic_store(&pointers[i], child_node_flag, CMM_RELAXED);
 		uatomic_store(&values[nr_child], n, CMM_RELAXED);
-		/* store-release: write pointer and value before nr_child */
-		uatomic_store(nr_child_ptr, nr_child + 1, CMM_RELEASE);
+		/* store-release: write pointer and value before nr_child.
+		 * Preserve the ptr_offset high bits. */
+		uatomic_store(nr_child_ptr,
+			ft_linear_encode_nr_child(nr_child + 1, type),
+			CMM_RELEASE);
 	} else {
 		/* Replacing a NULL or external node pointer. */
 		rcu_assign_pointer(pointers[i], child_node_flag);
@@ -2296,7 +2360,7 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 
 	nr_child_ptr = &node->data[0];
-	nr_child = *nr_child_ptr;
+	nr_child = *nr_child_ptr & FT_LINEAR_NR_CHILD_MASK;
 	assert(nr_child <= type->max_linear_child);
 
 	if (ft_type_is_linear(type->type_class) && !newptr) {
