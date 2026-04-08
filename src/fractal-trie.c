@@ -840,16 +840,23 @@ static inline unsigned long ft_bswap_long(unsigned long v)
 }
 
 /*
- * Given two mismatching words loaded from position @base, compute the
- * mismatch byte index (stored in *@mismatch_pos when non-NULL) and
- * return the signed lexicographic comparison result (<0, >0).
+ * Given two mismatching words loaded from position @base, return the
+ * appropriate non-zero result.
  *
- * When @mismatch_pos is NULL the compiler eliminates the bitscan.
- * When non-NULL the bswap is shared with the cardinality path.
+ * When @signed_cmp is true, byte-swap on little-endian to get
+ * lexicographic word order, then return <0 or >0.
+ * When @signed_cmp is false, return 1 (unequal, sign unspecified).
+ *
+ * When @mismatch_pos is non-NULL, store the index of the first
+ * differing byte using ctz/clz on the XOR of the two words.
+ *
+ * Both checks are constant-folded when the function is inlined with
+ * literal arguments.
  */
 static inline_lookup
 int ft_word_mismatch(unsigned long va, unsigned long vb,
-		unsigned int base, unsigned int *mismatch_pos)
+		unsigned int base, bool signed_cmp,
+		unsigned int *mismatch_pos)
 {
 	if (mismatch_pos) {
 		unsigned long diff = va ^ vb;
@@ -859,32 +866,38 @@ int ft_word_mismatch(unsigned long va, unsigned long vb,
 		*mismatch_pos = base + (unsigned int)__builtin_clzl(diff) / 8;
 #endif
 	}
-	va = ft_bswap_long(va);
-	vb = ft_bswap_long(vb);
-	return va < vb ? -1 : 1;
+	if (signed_cmp) {
+		va = ft_bswap_long(va);
+		vb = ft_bswap_long(vb);
+		return va < vb ? -1 : 1;
+	}
+	return 1;
 }
 
 /*
  * ft_key_cmp_ordinals: compare @len bytes of ordinal data from two
  * sources.  Both @a and @b must be in ordinal space.
  *
- * Returns 0 when equal.  When unequal, the sign encodes lexicographic
- * order (<0 means a < b, >0 means a > b).
+ * Returns 0 when equal, non-zero when unequal.
  *
- * If @mismatch_pos is non-NULL, it receives the index of the first
- * mismatching byte on inequality (undefined on full match).  This
- * also gates the bitscan instruction; callers that only need
- * equality should pass NULL so the compiler eliminates it.
+ * @signed_cmp: when true, the return value encodes lexicographic
+ *   order (<0 means a < b, >0 means a > b).  When false, any
+ *   non-zero value may be returned (allows the compiler to
+ *   eliminate the bswap).
+ *
+ * @mismatch_pos: when non-NULL, receives the index of the first
+ *   mismatching byte (undefined on full match).  Gates the
+ *   bitscan instruction.
  *
  * All three use-cases (equality, mismatch position, signed
  * cardinality) share the same word-at-a-time loop body.  Since this
- * function is force-inlined, the @mismatch_pos check is
- * constant-folded at each call site.
+ * function is force-inlined, both @signed_cmp and @mismatch_pos
+ * checks are constant-folded at each call site.
  */
 static inline_lookup
 int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 		unsigned int len, unsigned int remaining_key,
-		unsigned int *mismatch_pos)
+		bool signed_cmp, unsigned int *mismatch_pos)
 {
 	unsigned int j = 0;
 
@@ -895,7 +908,8 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 		__builtin_memcpy(&va, a + j, sizeof(unsigned long));
 		__builtin_memcpy(&vb, b + j, sizeof(unsigned long));
 		if (va != vb)
-			return ft_word_mismatch(va, vb, j, mismatch_pos);
+			return ft_word_mismatch(va, vb, j,
+						signed_cmp, mismatch_pos);
 		j += sizeof(unsigned long);
 	}
 
@@ -922,6 +936,7 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 				sizeof(unsigned long));
 			if (va != vb)
 				return ft_word_mismatch(va, vb, tail,
+							signed_cmp,
 							mismatch_pos);
 		} else if (remaining_key >= sizeof(unsigned long)) {
 			unsigned long va, vb, mask;
@@ -937,13 +952,16 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 			vb &= mask;
 			if (va != vb)
 				return ft_word_mismatch(va, vb, 0,
+							signed_cmp,
 							mismatch_pos);
 		} else {
 			for (; j < len; j++) {
 				if (a[j] != b[j]) {
 					if (mismatch_pos)
 						*mismatch_pos = j;
-					return (int)a[j] - (int)b[j];
+					if (signed_cmp)
+						return (int)a[j] - (int)b[j];
+					return 1;
 				}
 			}
 		}
@@ -1276,7 +1294,7 @@ unsigned int ft_match_compressed_key(struct cds_ft *ft,
 {
 	unsigned int pos;
 
-	if (ft_key_cmp_ordinals(key, cn->key_bytes, cmp, cmp, &pos) != 0)
+	if (ft_key_cmp_ordinals(key, cn->key_bytes, cmp, cmp, false, &pos) != 0)
 		return pos;
 	return cmp;
 }
@@ -3449,7 +3467,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 	if (track_longest) {
 		unsigned int mpos;
 		int cmp = ft_key_cmp_ordinals(key, cn->key_bytes,
-				cmp_len, remaining_key, &mpos);
+				cmp_len, remaining_key, false, &mpos);
 
 		if (cmp != 0) {
 			*match_len_p = i + mpos;
@@ -3461,7 +3479,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 		*match_node_p = NULL;
 	} else {
 		if (ft_key_cmp_ordinals(key, cn->key_bytes,
-				cmp_len, remaining_key, NULL) != 0) {
+				cmp_len, remaining_key, false, NULL) != 0) {
 			*status_ret = CDS_FT_STATUS_NOT_FOUND;
 			return FT_COMPRESSED_END;
 		}
@@ -3613,7 +3631,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 		if (slen > remaining_key)
 			continue;
 		suffix = ((uint8_t *) cn) + start;
-		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, NULL) == 0);
+		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, false, NULL) == 0);
 		if (!match)
 			continue;
 
@@ -3757,7 +3775,7 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
 		if (slen > remaining)
 			continue;
 		suffix = ft_collapsed_suffix(cn, e);
-		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, NULL) == 0);
+		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, false, NULL) == 0);
 		if (!match)
 			continue;
 
@@ -7911,7 +7929,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				{
 					unsigned int cmp_len = slen < remaining ? slen : remaining;
 
-					if (ft_key_cmp_ordinals(iter_key, suffix, cmp_len, cmp_len, &j) != 0) {
+					if (ft_key_cmp_ordinals(iter_key, suffix, cmp_len, cmp_len, false, &j) != 0) {
 						if (j == 0)
 							continue; /* No prefix overlap. */
 					} else {
@@ -8308,7 +8326,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, NULL) == 0);
+				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, false, NULL) == 0);
 				if (!match)
 					continue;
 				ft_snapshot_push(snapshot, snapshot_depth,
@@ -8938,7 +8956,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, NULL) == 0);
+				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, false, NULL) == 0);
 				if (!match)
 					continue;
 				if (!ft_node_ptr(cptrs[e]))
@@ -9244,7 +9262,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, NULL) == 0);
+				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, false, NULL) == 0);
 				if (!match)
 					continue;
 				if (!ft_node_ptr(cptrs[e])) {
@@ -9659,7 +9677,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, NULL) == 0);
+				match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, false, NULL) == 0);
 				if (!match)
 					continue;
 				ft_snapshot_push(snapshot, snapshot_depth,
@@ -10467,11 +10485,11 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					 * collapsed node and restart descent.
 					 */
 					if (slen > remaining) {
-						if (ft_key_cmp_ordinals(ik, suffix, remaining, remaining, NULL) == 0)
+						if (ft_key_cmp_ordinals(ik, suffix, remaining, remaining, false, NULL) == 0)
 							goto detach_collapsed_explode;
 						continue;
 					}
-					match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, NULL) == 0);
+					match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, false, NULL) == 0);
 					if (!match)
 						continue;
 					if (!ft_node_ptr(cptrs[e]))
