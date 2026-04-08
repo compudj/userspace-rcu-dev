@@ -5963,8 +5963,20 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 		if (ft_node_compressed(walk)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(walk);
+			struct cds_ft_metadata *cn_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) cn);
 			unsigned int j;
 
+			/*
+			 * If a prefix key ends at this compressed
+			 * node's depth (external_nodes is set), emit
+			 * an intermediate entry to preserve it.
+			 * Absorbing the compressed path would skip
+			 * past the prefix entry.
+			 */
+			if (cn_meta->external_nodes)
+				goto emit_entry;
 			if (slen + cn->len > max_depth)
 				goto emit_entry; /* Would exceed depth. */
 			for (j = 0; j < cn->len; j++)
