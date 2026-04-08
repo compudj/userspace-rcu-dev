@@ -5050,6 +5050,18 @@ going_up:
 			}
 
 			/*
+			 * current_entry == -1: the search key doesn't
+			 * match any entry in this collapsed node (e.g.
+			 * key outside the node's range).  Skip the
+			 * sibling search and continue going up.
+			 */
+			if (current_entry < 0) {
+				level = entry_depth + 1;
+				going_up = true;
+				continue;
+			}
+
+			/*
 			 * If we're past the current entry's suffix (in
 			 * the child's subtree), check the child node
 			 * for siblings first.
