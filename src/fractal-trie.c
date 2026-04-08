@@ -4216,63 +4216,85 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft *ft,
 	int level = *level_p;
 	int remaining = key_depth - level;
 	int cmp = cn->len < remaining ? cn->len : remaining;
-	const uint8_t *iter_key = *iter_key_p;
+	const uint8_t *cmp_key;
+	uint8_t last_key_buf[FT_MAX_KEY_LEN];
+	unsigned int mpos = 0;
+	int cmp_result;
 	int j;
 
-	for (j = 0; j < cmp; j++) {
-		uint8_t ck;
+	/* Build contiguous comparison key for this limit mode. */
+	switch (limit) {
+	case FT_LOOKUP_LIMIT_NONE:
+		cmp_key = *iter_key_p;
+		break;
+	case FT_LOOKUP_LIMIT_FIRST:
+		cmp_key = input_key + level - 1;
+		break;
+	case FT_LOOKUP_LIMIT_LAST: {
+		unsigned int prefix_bytes = 0;
 
-		switch (limit) {
-		case FT_LOOKUP_LIMIT_NONE:
-			ck = *(iter_key++);
-			break;
-		case FT_LOOKUP_LIMIT_FIRST:
-			ck = input_key[level - 1 + j];
-			break;
-		case FT_LOOKUP_LIMIT_LAST:
-			if ((size_t)(level + j) <= iter->prefix_len)
-				ck = input_key[level - 1 + j];
-			else
-				ck = 0xff;
-			break;
-		default:
-			ck = 0;
-			assert(0);
+		if ((size_t)level <= iter->prefix_len) {
+			prefix_bytes = iter->prefix_len - level + 1;
+			if (prefix_bytes > (unsigned int)cmp)
+				prefix_bytes = cmp;
+			memcpy(last_key_buf, input_key + level - 1,
+				prefix_bytes);
 		}
-		ordinal_key[level - 1 + j] = ck;
+		if (prefix_bytes < (unsigned int)cmp)
+			memset(last_key_buf + prefix_bytes, 0xff,
+				cmp - prefix_bytes);
+		cmp_key = last_key_buf;
+		break;
+	}
+	default:
+		cmp_key = NULL;
+		assert(0);
+	}
+
+	cmp_result = ft_key_cmp_ordinals(cmp_key, cn->key_bytes, cmp, cmp,
+					true, &mpos);
+
+	/* Fill ordinal_key and iter_path for the matched prefix. */
+	for (j = 0; j < (cmp_result ? (int)mpos : cmp); j++) {
+		ordinal_key[level - 1 + j] = cmp_key[j];
 		iter_path_node(iter)[level + j] = node_flag;
-		if (ck != cn->key_bytes[j]) {
-			/*
-			 * Mismatch: go up or descend based on
-			 * direction relative to mode.
-			 */
-			if ((mode == FT_LOOKUP_GE && ck > cn->key_bytes[j]) ||
-			    (mode == FT_LOOKUP_GT && ck > cn->key_bytes[j]) ||
-			    (mode == FT_LOOKUP_LE && ck < cn->key_bytes[j]) ||
-			    (mode == FT_LOOKUP_LT && ck < cn->key_bytes[j])) {
-				*level_p = level + j;
-				*iter_key_p = iter_key;
-				iter_debug_path_snapshot(iter);
-				return FT_COMPRESSED_GOING_UP;
-			}
-			/* Descend into compressed subtree. */
-			ordinal_key[level - 1 + j] = cn->key_bytes[j];
-			for (j++; j < cn->len; j++) {
-				ordinal_key[level - 1 + j] = cn->key_bytes[j];
-				iter_path_node(iter)[level + j] = node_flag;
-			}
-			level += cn->len - 1;
-			node_flag = ft_dereference_acquire(cn->child);
-			if (!ft_node_ptr(node_flag))
-				goto out_break;
-			iter_path_node(iter)[level + 1] = node_flag;
-			*skip_eq_external_nodes_p = false;
-			*node_flag_p = node_flag;
-			*level_p = level;
-			*iter_key_p = iter_key;
+	}
+	/* Advance iter_key for LIMIT_NONE. */
+	if (limit == FT_LOOKUP_LIMIT_NONE)
+		*iter_key_p += (cmp_result ? mpos + 1 : cmp);
+
+	if (cmp_result) {
+		/*
+		 * Mismatch at position mpos.  Check direction
+		 * relative to the lookup mode.
+		 *
+		 * key > path at mismatch: GE/GT go up, LE/LT descend.
+		 * key < path at mismatch: GE/GT descend, LE/LT go up.
+		 */
+		ordinal_key[level - 1 + mpos] = cmp_key[mpos];
+		iter_path_node(iter)[level + mpos] = node_flag;
+		if ((cmp_result > 0 && (mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT)) ||
+		    (cmp_result < 0 && (mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT))) {
+			*level_p = level + mpos;
 			iter_debug_path_snapshot(iter);
-			return FT_COMPRESSED_DESCEND_CHILDREN;
+			return FT_COMPRESSED_GOING_UP;
 		}
+		/* Descend into compressed subtree. */
+		ordinal_key[level - 1 + mpos] = cn->key_bytes[mpos];
+		for (j = mpos + 1; j < cn->len; j++) {
+			ordinal_key[level - 1 + j] = cn->key_bytes[j];
+			iter_path_node(iter)[level + j] = node_flag;
+		}
+		level += cn->len - 1;
+		node_flag = ft_dereference_acquire(cn->child);
+		if (!ft_node_ptr(node_flag))
+			goto out_break;
+		iter_path_node(iter)[level + 1] = node_flag;
+		*skip_eq_external_nodes_p = false;
+		*node_flag_p = node_flag;
+		*level_p = level;
+		iter_debug_path_snapshot(iter);
+		return FT_COMPRESSED_DESCEND_CHILDREN;
 	}
 
 	if (cn->len > remaining) {
@@ -4292,12 +4314,10 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft *ft,
 			*skip_eq_external_nodes_p = false;
 			*node_flag_p = node_flag;
 			*level_p = level;
-			*iter_key_p = iter_key;
 			iter_debug_path_snapshot(iter);
 			return FT_COMPRESSED_DESCEND_CHILDREN;
 		}
 		*level_p = level + cmp - 1;
-		*iter_key_p = iter_key;
 		iter_debug_path_snapshot(iter);
 		return FT_COMPRESSED_GOING_UP;
 	}
@@ -4313,13 +4333,11 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft *ft,
 
 	*node_flag_p = node_flag;
 	*level_p = level;
-	*iter_key_p = iter_key;
 	return FT_COMPRESSED_CONTINUE;
 
 out_break:
 	*node_flag_p = node_flag;
 	*level_p = level;
-	*iter_key_p = iter_key;
 	return FT_COMPRESSED_BREAK;
 }
 
@@ -4353,9 +4371,11 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 	int best_match = -1;	/* index of best directional match */
 
 	for (e = 0; e < ft_collapsed_nr_entries(cn); e++) {
-		unsigned int slen, j, cmp;
+		unsigned int slen, cmp;
 		uint8_t *suffix;
-		int cmp_result = 0;	/* 0 = equal so far */
+		const uint8_t *cmp_key;
+		uint8_t last_key_buf[FT_MAX_KEY_LEN];
+		int cmp_result;
 
 		if (ft_collapsed_entry_dead(cn, e))
 			continue;
@@ -4365,36 +4385,36 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 		suffix = ft_collapsed_suffix(cn, e);
 		cmp = slen < remaining ? slen : remaining;
 
-		/* Compare suffix against lookup key. */
-		for (j = 0; j < cmp; j++) {
-			uint8_t ck;
+		/* Build contiguous comparison key for this limit mode. */
+		switch (limit) {
+		case FT_LOOKUP_LIMIT_NONE:
+			cmp_key = *iter_key_p;
+			break;
+		case FT_LOOKUP_LIMIT_FIRST:
+			cmp_key = input_key + level - 1;
+			break;
+		case FT_LOOKUP_LIMIT_LAST: {
+			unsigned int prefix_bytes = 0;
 
-			switch (limit) {
-			case FT_LOOKUP_LIMIT_NONE:
-				ck = (*iter_key_p)[j];
-				break;
-			case FT_LOOKUP_LIMIT_FIRST:
-				ck = input_key[level - 1 + j];
-				break;
-			case FT_LOOKUP_LIMIT_LAST:
-				if ((size_t)(level + j) <= iter->prefix_len)
-					ck = input_key[level - 1 + j];
-				else
-					ck = 0xff;
-				break;
-			default:
-				ck = 0;
-				assert(0);
+			if ((size_t)level <= iter->prefix_len) {
+				prefix_bytes = iter->prefix_len - level + 1;
+				if (prefix_bytes > cmp)
+					prefix_bytes = cmp;
+				memcpy(last_key_buf, input_key + level - 1,
+					prefix_bytes);
 			}
-			if (ck < suffix[j]) {
-				cmp_result = -1;
-				break;
-			}
-			if (ck > suffix[j]) {
-				cmp_result = 1;
-				break;
-			}
+			if (prefix_bytes < cmp)
+				memset(last_key_buf + prefix_bytes, 0xff,
+					cmp - prefix_bytes);
+			cmp_key = last_key_buf;
+			break;
 		}
+		default:
+			cmp_key = NULL;
+			assert(0);
+		}
+		cmp_result = ft_key_cmp_ordinals(cmp_key, suffix, cmp, cmp,
+						true, NULL);
 		if (cmp_result == 0) {
 			if (slen <= remaining) {
 				/* Full suffix match. Descend into child. */
@@ -4455,7 +4475,8 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 				uint8_t *bs = ft_collapsed_suffix(cn, (unsigned)best_match);
 				unsigned int bl = ft_collapsed_suffix_len(cn, (unsigned)best_match);
 				unsigned int mc = bl < slen ? bl : slen;
-				int r = memcmp(suffix, bs, mc);
+				int r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
+							true, NULL);
 
 				if (r < 0 || (r == 0 && slen < bl))
 					best_match = (int)e;
@@ -4468,7 +4489,8 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 				uint8_t *bs = ft_collapsed_suffix(cn, (unsigned)best_match);
 				unsigned int bl = ft_collapsed_suffix_len(cn, (unsigned)best_match);
 				unsigned int mc = bl < slen ? bl : slen;
-				int r = memcmp(suffix, bs, mc);
+				int r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
+							true, NULL);
 
 				if (r > 0 || (r == 0 && slen > bl))
 					best_match = (int)e;
