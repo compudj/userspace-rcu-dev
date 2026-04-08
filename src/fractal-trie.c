@@ -1060,16 +1060,30 @@ void ft_collapsed_publish_inc_nr_entries(struct cds_ft_collapsed_node *cn)
 static inline
 unsigned int ft_collapsed_scan_zone_size(struct cds_ft_collapsed_node *cn)
 {
-	return ft_collapsed_scan_sizes[cn->nr_entries >> FT_COLLAPSED_SCAN_SHIFT];
+	/* 32 << selector: selector 0=32B, 1=64B, 2=128B, 3=256B. */
+	return 32U << (cn->nr_entries >> FT_COLLAPSED_SCAN_SHIFT);
 }
 
 static inline
 unsigned int ft_collapsed_offset_mask(struct cds_ft_collapsed_node *cn)
 {
-	/* 64B/128B scan zones: 7-bit offsets (bit 7 = tombstone). */
-	/* 256B scan zone: full 8-bit offsets (no tombstone). */
-	return (cn->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) >= FT_COLLAPSED_SCAN_256
-		? 0xFF : FT_COLLAPSED_OFFSET_MASK;
+	/*
+	 * Branchless offset mask from the scan zone selector.
+	 *
+	 * Selectors 0-2 (32B/64B/128B): 7-bit offsets, bit 7 is
+	 * the tombstone marker.  Mask = 0x7F.
+	 *
+	 * Selector 3 (256B): full 8-bit offsets (byte range 0-255
+	 * needs all bits).  No tombstone bit.  Mask = 0xFF.
+	 *
+	 * Branchless: selector 3 has both bits set (binary 11).
+	 * (sel >> 1) & sel & 1 is 1 only for sel=3, 0 otherwise.
+	 * OR that into bit 7 of the base mask 0x7F.
+	 */
+	unsigned int sel = cn->nr_entries >> FT_COLLAPSED_SCAN_SHIFT;
+
+	return FT_COLLAPSED_OFFSET_MASK |
+		(((sel >> 1) & sel & 1) << 7);
 }
 
 static inline
