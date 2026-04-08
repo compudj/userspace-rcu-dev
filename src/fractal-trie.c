@@ -6846,6 +6846,11 @@ struct cds_ft_inode_flag *ft_try_compress_chain(
 }
 #endif
 
+static struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
+		const uint8_t *ordinals, unsigned int len,
+		struct cds_ft_inode_flag *child,
+		unsigned long nr_keys);
+
 static
 int ft_attach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attach_node_flag_ptr,
@@ -6974,37 +6979,26 @@ int ft_attach_node(struct cds_ft *ft,
 					continue;
 
 				if (slen2 > 1) {
-					struct cds_ft_compressed_node *wrap;
-					struct cds_ft_metadata *wrap_meta;
-					unsigned int wk;
+					unsigned long child_nr_keys;
 
-					wrap = alloc_compressed_node(ft,
-						slen2 - 1, &wrap_meta);
-					if (!wrap) {
-						ret = -ENOMEM;
-						goto check_error;
-					}
-					wrap->child = child;
-					wrap->len = slen2 - 1;
-					for (wk = 0; wk < slen2 - 1; wk++)
-						wrap->key_bytes[wk] =
-							sfx[wk + 1];
-					wrap_meta->nr_child = 1;
 					if (!ft_node_external(child)) {
 						struct cds_ft_metadata *cm =
 							cds_ft_item_to_metadata(
 								ft_node_ptr(child));
-						uatomic_store(
-							&wrap_meta->nr_keys,
-							cm->nr_keys,
+						child_nr_keys = uatomic_load(
+							&cm->nr_keys,
 							CMM_RELAXED);
 					} else {
-						uatomic_store(
-							&wrap_meta->nr_keys,
-							ft_node_ptr(child) ? 1 : 0,
-							CMM_RELAXED);
+						child_nr_keys =
+							ft_node_ptr(child) ? 1 : 0;
 					}
-					child = ft_compressed_node_flag(wrap);
+					child = ft_build_ordinal_chain(ft,
+						sfx + 1, slen2 - 1,
+						child, child_nr_keys);
+					if (!child) {
+						ret = -ENOMEM;
+						goto check_error;
+					}
 				}
 				eret = ft_node_set_nth(ft, &internal_flag,
 					sfx[0], child, NULL,
@@ -7386,6 +7380,77 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 	}
 }
 
+/*
+ * ft_build_ordinal_chain: create a chain of nodes from an array of
+ * ordinal bytes (already mapped, not raw key bytes).  Uses a
+ * compressed node if FEATURE_FT_COMPRESS is enabled, otherwise
+ * builds a chain of single-child internal nodes.
+ *
+ * Returns the chain's root flag, or NULL on allocation failure.
+ */
+static
+struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
+		const uint8_t *ordinals, unsigned int len,
+		struct cds_ft_inode_flag *child,
+		unsigned long nr_keys)
+{
+#ifdef FEATURE_FT_COMPRESS
+	if (len >= 2) {
+		struct cds_ft_compressed_node *cn;
+		struct cds_ft_metadata *cn_meta;
+		struct cds_ft_inode_flag *cflag;
+
+		cn = alloc_compressed_node(ft, len, &cn_meta);
+		if (!cn)
+			return NULL;
+		cn->child = child;
+		cn->len = len;
+		memcpy(cn->key_bytes, ordinals, len);
+		cn_meta->nr_child = 1;
+		uatomic_store(&cn_meta->nr_keys, nr_keys, CMM_RELAXED);
+		cflag = ft_compressed_node_flag(cn);
+		ft_init_node_density(cflag);
+		return cflag;
+	}
+#endif
+	{
+		struct cds_ft_inode_flag *cur = child;
+		int i;
+
+		for (i = (int) len - 1; i >= 0; i--) {
+			struct cds_ft_inode_flag *dest = NULL;
+			int ret;
+
+			ret = ft_node_set_nth(ft, &dest, ordinals[i],
+				cur, NULL, NULL);
+			if (ret) {
+				/* Cleanup on failure. */
+				while (cur != child) {
+					struct cds_ft_inode_flag *next;
+
+					next = ft_node_get_nth(cur, NULL,
+						ordinals[i + 1]);
+					free_cds_ft_node(ft, ft_node_ptr(cur));
+					cur = next;
+					i++;
+				}
+				return NULL;
+			}
+			{
+				struct cds_ft_metadata *m =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(dest));
+				uatomic_store(&m->nr_keys, nr_keys,
+					CMM_RELAXED);
+				m->nr_child = 1;
+			}
+			cur = dest;
+		}
+		ft_init_node_density(cur);
+		return cur;
+	}
+}
+
 #ifdef FEATURE_FT_COLLAPSE
 /*
  * ft_explode_entries: rebuild a trie from a range of collapsed node
@@ -7419,40 +7484,22 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		unsigned int slen = ft_collapsed_suffix_len(col, e);
 		uint8_t *sfx = ft_collapsed_suffix(col, e);
 		struct cds_ft_inode_flag *child = cptrs[e];
+		unsigned long child_nr_keys;
 
 		if (slen <= suffix_offset)
 			return child;
 
-		{
-			unsigned int rlen = slen - suffix_offset;
-			struct cds_ft_compressed_node *cn;
-			struct cds_ft_metadata *cn_meta;
-
-			cn = alloc_compressed_node(ft, rlen, &cn_meta);
-			if (!cn)
-				return NULL;
-			cn->child = child;
-			cn->len = rlen;
-			memcpy(cn->key_bytes, sfx + suffix_offset, rlen);
-			cn_meta->nr_child = 1;
-			if (!ft_node_external(child) && ft_node_ptr(child)) {
-				struct cds_ft_metadata *cm =
-					cds_ft_item_to_metadata(
-						ft_node_ptr(child));
-				uatomic_store(&cn_meta->nr_keys,
-					cm->nr_keys, CMM_RELAXED);
-			} else {
-				uatomic_store(&cn_meta->nr_keys,
-					ft_node_ptr(child) ? 1 : 0,
-					CMM_RELAXED);
-			}
-			{
-				struct cds_ft_inode_flag *cflag =
-					ft_compressed_node_flag(cn);
-				ft_init_node_density(cflag);
-				return cflag;
-			}
+		if (!ft_node_external(child) && ft_node_ptr(child)) {
+			struct cds_ft_metadata *cm =
+				cds_ft_item_to_metadata(ft_node_ptr(child));
+			child_nr_keys = uatomic_load(&cm->nr_keys,
+				CMM_RELAXED);
+		} else {
+			child_nr_keys = ft_node_ptr(child) ? 1 : 0;
 		}
+		return ft_build_ordinal_chain(ft,
+			sfx + suffix_offset, slen - suffix_offset,
+			child, child_nr_keys);
 	}
 
 	/* Multiple entries: group by byte at suffix_offset. */
