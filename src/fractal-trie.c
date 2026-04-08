@@ -7246,41 +7246,23 @@ int ft_attach_node(struct cds_ft *ft,
 
 #ifdef FEATURE_FT_COLLAPSE
 		/*
-		 * If the parent is a collapsed node, explode it to an
-		 * internal node before attaching the new branch.
-		 * ft_node_set_nth only works on internal nodes.
+		 * If the parent is a collapsed node, publish the
+		 * branch directly at the entry's child pointer.
+		 * The collapsed entry's suffix already covers the
+		 * path from the collapsed node to the child depth
+		 * — only the child itself changes.
+		 *
+		 * Exploding the collapsed node and using
+		 * ft_node_set_nth would attach at the wrong depth
+		 * (last suffix byte vs. first-byte level),
+		 * overwriting sibling entries that share the same
+		 * first suffix byte.
 		 */
 		if (attach_node_flag &&
 		    ft_node_collapsed(attach_node_flag)) {
-			struct cds_ft_collapsed_node *col =
-				ft_collapsed_node_ptr(attach_node_flag);
-			struct cds_ft_metadata *col_meta =
-				cds_ft_item_to_metadata(
-					(struct cds_ft_inode *) col);
-			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col);
-			struct cds_ft_inode_flag *internal_flag;
-			struct cds_ft_metadata *int_meta;
-
-			internal_flag = ft_explode_entries(ft,
-				col, cptrs,
-				0, ft_collapsed_nr_entries(col), 0);
-			if (!internal_flag) {
-				ret = -ENOMEM;
-				goto check_error;
-			}
-			int_meta = cds_ft_item_to_metadata(
-				ft_node_ptr(internal_flag));
-			uatomic_store(&int_meta->nr_keys,
-				col_meta->nr_keys, CMM_RELAXED);
-			int_meta->external_nodes =
-				col_meta->external_nodes;
-			ft_init_node_density(internal_flag);
-			rcu_assign_pointer(*attach_node_flag_ptr,
-				internal_flag);
-			attach_node_flag = internal_flag;
-			metadata = int_meta;
-			free_collapsed_node(ft, col);
+			rcu_assign_pointer(*old_node_flag_ptr,
+				iter_node_flag);
+			goto publish_done;
 		}
 #endif
 
@@ -7299,6 +7281,7 @@ int ft_attach_node(struct cds_ft *ft,
 		if (old_recompacted_node)
 			free_cds_ft_node(ft, old_recompacted_node);
 	}
+publish_done:
 
 	/*
 	 * Propagate node density for each created traversable node.
