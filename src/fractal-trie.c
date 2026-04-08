@@ -787,112 +787,129 @@ uint8_t ordinal_to_key(const struct cds_ft *ft, uint8_t ordinal)
 }
 
 /*
- * ft_key_cmp_ordinals: compare @len bytes of raw key data against
- * an ordinal array.  Returns 0 if equal, <0 if key < ordinals,
- * >0 if key > ordinals (memcmp semantics).
+ * Bulk key-to-ordinal conversion.  Converts @len external key bytes
+ * into ordinals in @dst.  Identity maps short-circuit to memcpy.
+ */
+static inline void ft_key_to_ordinals(uint8_t *dst, const uint8_t *key,
+		size_t len, const struct cds_ft_key_map *km)
+{
+	size_t i;
+
+	if (caa_likely(km->identity)) {
+		memcpy(dst, key, len);
+		return;
+	}
+	for (i = 0; i < len; i++)
+		dst[i] = km->key_to_ordinal[key[i]];
+}
+
+/*
+ * Bulk ordinal-to-key conversion.  Converts @len ordinals in @src
+ * back to external key bytes in @dst.  Identity maps short-circuit
+ * to memcpy.
+ */
+static inline void ft_ordinals_to_key(uint8_t *dst, const uint8_t *ordinals,
+		size_t len, const struct cds_ft_key_map *km)
+{
+	size_t i;
+
+	if (caa_likely(km->identity)) {
+		memcpy(dst, ordinals, len);
+		return;
+	}
+	for (i = 0; i < len; i++)
+		dst[i] = km->ordinal_to_key[ordinals[i]];
+}
+
+/*
+ * ft_key_cmp_ordinals: compare @len bytes of ordinal data from two
+ * sources.  Both @a and @b must be in ordinal space.  Returns 0 if
+ * equal, non-zero otherwise.
  *
  * If @mismatch_pos is non-NULL, stores the index of the first
- * mismatching byte (undefined on full match).
- *
- * The @km pointer is cached by the caller to avoid the
- * ft->group->key_map pointer chase per call.
+ * mismatching byte (undefined on full match) and the return value
+ * encodes the signed difference at that position.
  */
 static inline_lookup
-int ft_key_cmp_ordinals(const uint8_t *key, const uint8_t *ordinals,
+int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 		unsigned int len, unsigned int remaining_key,
-		unsigned int *mismatch_pos,
-		const struct cds_ft_key_map *km)
+		unsigned int *mismatch_pos)
 {
 	unsigned int j;
 
-	if (caa_likely(km->identity)) {
-		/*
-		 * Word-at-a-time equality check for the common
-		 * identity key map.  Compare full words where
-		 * possible, byte loop for the tail.  No special
-		 * padding or bounds tracking needed.
-		 *
-		 * When mismatch_pos is needed (longest-match
-		 * tracking), fall back to the byte loop to find
-		 * the exact position.
-		 */
-		if (!mismatch_pos) {
-			j = 0;
-			while (j + sizeof(unsigned long) <= len) {
-				unsigned long k, o;
+	/*
+	 * Word-at-a-time equality check.  Compare full words where
+	 * possible, byte loop for the tail.  No special padding or
+	 * bounds tracking needed.
+	 *
+	 * When mismatch_pos is needed (longest-match tracking), fall
+	 * back to the byte loop to find the exact position.
+	 */
+	if (!mismatch_pos) {
+		j = 0;
+		while (j + sizeof(unsigned long) <= len) {
+			unsigned long va, vb;
 
-				__builtin_memcpy(&k, key + j,
-					sizeof(unsigned long));
-				__builtin_memcpy(&o, ordinals + j,
-					sizeof(unsigned long));
-				if (k != o)
-					return 1;
-				j += sizeof(unsigned long);
-			}
-			/*
-			 * Tail: 0 to sizeof(long)-1 bytes remain.
-			 *
-			 * When len >= sizeof(long), re-read the last
-			 * word of both arrays (overlap with confirmed
-			 * equal bytes is harmless for equality).
-			 *
-			 * When remaining_key >= sizeof(long), read a
-			 * full word from each at position 0 — the
-			 * extra key bytes are valid, masked out.
-			 *
-			 * Otherwise byte-by-byte.
-			 */
-			if (j < len) {
-				if (len >= sizeof(unsigned long)) {
-					unsigned long k, o;
-					unsigned int tail = len -
-						sizeof(unsigned long);
-
-					__builtin_memcpy(&k, key + tail,
-						sizeof(unsigned long));
-					__builtin_memcpy(&o, ordinals + tail,
-						sizeof(unsigned long));
-					if (k != o)
-						return 1;
-				} else if (remaining_key >=
-						sizeof(unsigned long)) {
-					unsigned long k, o, mask;
-
-					__builtin_memcpy(&k, key,
-						sizeof(unsigned long));
-					__builtin_memcpy(&o, ordinals,
-						sizeof(unsigned long));
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-					mask = (1UL << (len * 8)) - 1;
-#else
-					mask = ~((1UL << ((sizeof(unsigned long) - len) * 8)) - 1);
-#endif
-					if ((k ^ o) & mask)
-						return 1;
-				} else {
-					for (; j < len; j++)
-						if (key[j] != ordinals[j])
-							return 1;
-				}
-			}
-			return 0;
+			__builtin_memcpy(&va, a + j,
+				sizeof(unsigned long));
+			__builtin_memcpy(&vb, b + j,
+				sizeof(unsigned long));
+			if (va != vb)
+				return 1;
+			j += sizeof(unsigned long);
 		}
-		for (j = 0; j < len; j++) {
-			if (key[j] != ordinals[j]) {
-				*mismatch_pos = j;
-				return (int)key[j] - (int)ordinals[j];
+		/*
+		 * Tail: 0 to sizeof(long)-1 bytes remain.
+		 *
+		 * When len >= sizeof(long), re-read the last
+		 * word of both arrays (overlap with confirmed
+		 * equal bytes is harmless for equality).
+		 *
+		 * When remaining_key >= sizeof(long), read a
+		 * full word from each at position 0 — the
+		 * extra bytes are valid, masked out.
+		 *
+		 * Otherwise byte-by-byte.
+		 */
+		if (j < len) {
+			if (len >= sizeof(unsigned long)) {
+				unsigned long va, vb;
+				unsigned int tail = len -
+					sizeof(unsigned long);
+
+				__builtin_memcpy(&va, a + tail,
+					sizeof(unsigned long));
+				__builtin_memcpy(&vb, b + tail,
+					sizeof(unsigned long));
+				if (va != vb)
+					return 1;
+			} else if (remaining_key >=
+					sizeof(unsigned long)) {
+				unsigned long va, vb, mask;
+
+				__builtin_memcpy(&va, a,
+					sizeof(unsigned long));
+				__builtin_memcpy(&vb, b,
+					sizeof(unsigned long));
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+				mask = (1UL << (len * 8)) - 1;
+#else
+				mask = ~((1UL << ((sizeof(unsigned long) - len) * 8)) - 1);
+#endif
+				if ((va ^ vb) & mask)
+					return 1;
+			} else {
+				for (; j < len; j++)
+					if (a[j] != b[j])
+						return 1;
 			}
 		}
 		return 0;
 	}
-
 	for (j = 0; j < len; j++) {
-		uint8_t mapped = km->key_to_ordinal[key[j]];
-
-		if (mapped != ordinals[j]) {
-			if (mismatch_pos)
-				*mismatch_pos = j;
-			return (int)mapped - (int)ordinals[j];
+		if (a[j] != b[j]) {
+			*mismatch_pos = j;
+			return (int)a[j] - (int)b[j];
 		}
 	}
 	return 0;
@@ -1223,7 +1240,7 @@ unsigned int ft_match_compressed_key(struct cds_ft *ft,
 {
 	unsigned int pos;
 
-	if (ft_key_cmp_ordinals(key, cn->key_bytes, cmp, cmp, &pos, &ft->group->key_map) != 0)
+	if (ft_key_cmp_ordinals(key, cn->key_bytes, cmp, cmp, &pos) != 0)
 		return pos;
 	return cmp;
 }
@@ -3370,8 +3387,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 		bool track, bool track_longest,
 		size_t *match_len_p, struct cds_ft_node **match_node_p,
 		struct cds_ft_node **found_ret,
-		enum cds_ft_status *status_ret,
-		const struct cds_ft_key_map *km)
+		enum cds_ft_status *status_ret)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	const uint8_t *key = *key_p;
@@ -3397,7 +3413,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 	if (track_longest) {
 		unsigned int mpos;
 		int cmp = ft_key_cmp_ordinals(key, cn->key_bytes,
-				cmp_len, remaining_key, &mpos, km);
+				cmp_len, remaining_key, &mpos);
 
 		if (cmp != 0) {
 			*match_len_p = i + mpos;
@@ -3409,7 +3425,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 		*match_node_p = NULL;
 	} else {
 		if (ft_key_cmp_ordinals(key, cn->key_bytes,
-				cmp_len, remaining_key, NULL, km) != 0) {
+				cmp_len, remaining_key, NULL) != 0) {
 			*status_ret = CDS_FT_STATUS_NOT_FOUND;
 			return FT_COMPRESSED_END;
 		}
@@ -3513,8 +3529,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 		bool track, bool track_longest,
 		size_t *match_len_p, struct cds_ft_node **match_node_p,
 		struct cds_ft_node **found_ret,
-		enum cds_ft_status *status_ret,
-		const struct cds_ft_key_map *km)
+		enum cds_ft_status *status_ret)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	const uint8_t *key = *key_p;
@@ -3562,7 +3577,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 		if (slen > remaining_key)
 			continue;
 		suffix = ((uint8_t *) cn) + start;
-		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, NULL, &ft->group->key_map) == 0);
+		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, NULL) == 0);
 		if (!match)
 			continue;
 
@@ -3685,8 +3700,7 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag_p,
 		struct cds_ft_inode_flag ***node_flag_ptr_p,
 		const uint8_t **key_p, unsigned int *i_p,
-		unsigned int key_depth, bool *not_found,
-		const struct cds_ft_key_map *km)
+		unsigned int key_depth, bool *not_found)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
@@ -3707,7 +3721,7 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
 		if (slen > remaining)
 			continue;
 		suffix = ft_collapsed_suffix(cn, e);
-		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, NULL, &ft->group->key_map) == 0);
+		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, NULL) == 0);
 		if (!match)
 			continue;
 
@@ -3746,7 +3760,6 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	size_t iter_path_len = 0;
 	bool track = (tracking != FT_PREFIX_TRACK_NONE);
 	bool track_longest = (tracking == FT_PREFIX_TRACK_LONGEST);
-	const struct cds_ft_key_map *km = &ft->group->key_map;
 	size_t match_len = track_longest ? FT_MATCH_LEN_NONE : 0;
 	struct cds_ft_node *match_node = NULL;
 
@@ -3830,8 +3843,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				act = ft_lookup_compressed(ft, &node_flag, &key, &i,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
-					&match_len, &match_node, &found, &status,
-					km);
+					&match_len, &match_node, &found, &status);
 				if (act == FT_COMPRESSED_END)
 					goto end;
 				if (act == FT_COMPRESSED_BREAK)
@@ -3845,8 +3857,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				act = ft_lookup_collapsed(ft, &node_flag, &key, &i,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
-					&match_len, &match_node, &found, &status,
-					km);
+					&match_len, &match_node, &found, &status);
 				if (act == FT_COMPRESSED_END)
 					goto end;
 				if (act == FT_COMPRESSED_BREAK)
@@ -3864,7 +3875,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			goto end;
 		}
 
-		iter_key = key_to_ordinal(*(key++), km);
+		iter_key = *(key++);
 		node_flag = ft_node_get_nth(node_flag, NULL, iter_key);
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
@@ -3985,10 +3996,14 @@ end:
 }
 
 enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
+		const uint8_t *key, size_t _key_len,
 		struct cds_ft_node **result_node)
 {
-	return do_cds_ft_lookup(ft, key, key_len, result_node, NULL,
+	size_t key_len = ft_key_len(ft, _key_len);
+	uint8_t ordinals[FT_MAX_KEY_LEN];
+
+	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
+	return do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
 				FT_PREFIX_TRACK_NONE, NULL, NULL);
 }
 
@@ -4005,8 +4020,11 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 {
 	struct cds_ft_node *partial_node = NULL;
 	size_t partial_len = 0;
+	size_t key_len = ft_key_len(ft, _key_len);
+	uint8_t ordinals[FT_MAX_KEY_LEN];
 
-	do_cds_ft_lookup(ft, key, _key_len, NULL, NULL,
+	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
+	do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
 			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node);
 
 	*match_len = partial_len;
@@ -4040,14 +4058,17 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 }
 
 enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len, size_t *match_len,
+		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
 {
 	struct cds_ft_node *match_node = NULL;
 	size_t longest_len = 0;
 	enum cds_ft_status ret;
+	size_t key_len = ft_key_len(ft, _key_len);
+	uint8_t ordinals[FT_MAX_KEY_LEN];
 
-	ret = do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
+	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
+	ret = do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
 			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node);
 
 	if (ret < 0) {
@@ -4149,14 +4170,14 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft *ft,
 
 		switch (limit) {
 		case FT_LOOKUP_LIMIT_NONE:
-			ck = key_to_ordinal(*(iter_key++), &ft->group->key_map);
+			ck = *(iter_key++);
 			break;
 		case FT_LOOKUP_LIMIT_FIRST:
-			ck = key_to_ordinal(input_key[level - 1 + j], &ft->group->key_map);
+			ck = input_key[level - 1 + j];
 			break;
 		case FT_LOOKUP_LIMIT_LAST:
 			if ((size_t)(level + j) <= iter->prefix_len)
-				ck = key_to_ordinal(input_key[level - 1 + j], &ft->group->key_map);
+				ck = input_key[level - 1 + j];
 			else
 				ck = 0xff;
 			break;
@@ -4296,14 +4317,14 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 
 			switch (limit) {
 			case FT_LOOKUP_LIMIT_NONE:
-				ck = key_to_ordinal((*iter_key_p)[j], &ft->group->key_map);
+				ck = (*iter_key_p)[j];
 				break;
 			case FT_LOOKUP_LIMIT_FIRST:
-				ck = key_to_ordinal(input_key[level - 1 + j], &ft->group->key_map);
+				ck = input_key[level - 1 + j];
 				break;
 			case FT_LOOKUP_LIMIT_LAST:
 				if ((size_t)(level + j) <= iter->prefix_len)
-					ck = key_to_ordinal(input_key[level - 1 + j], &ft->group->key_map);
+					ck = input_key[level - 1 + j];
 				else
 					ck = 0xff;
 				break;
@@ -4542,16 +4563,16 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			switch (limit) {
 			case FT_LOOKUP_LIMIT_NONE:
 				ordinal_key[level - 1] =
-					key_to_ordinal(input_key[level - 1], &ft->group->key_map);
+					input_key[level - 1];
 				break;
 			case FT_LOOKUP_LIMIT_FIRST:
 				ordinal_key[level - 1] =
-					key_to_ordinal(input_key[level - 1], &ft->group->key_map);
+					input_key[level - 1];
 				break;
 			case FT_LOOKUP_LIMIT_LAST:
 				if ((size_t) level <= iter->prefix_len)
 					ordinal_key[level - 1] =
-						key_to_ordinal(input_key[level - 1], &ft->group->key_map);
+						input_key[level - 1];
 				else
 					ordinal_key[level - 1] = 0xff;
 				break;
@@ -4622,14 +4643,14 @@ slow_path:
 
 		switch (limit) {
 		case FT_LOOKUP_LIMIT_NONE:
-			key_value = key_to_ordinal(*(iter_key++), &ft->group->key_map);
+			key_value = *(iter_key++);
 			break;
 		case FT_LOOKUP_LIMIT_FIRST:
-			key_value = key_to_ordinal(input_key[level - 1], &ft->group->key_map);
+			key_value = input_key[level - 1];
 			break;
 		case FT_LOOKUP_LIMIT_LAST:
 			if ((size_t) level <= iter->prefix_len)
-				key_value = key_to_ordinal(input_key[level - 1], &ft->group->key_map);
+				key_value = input_key[level - 1];
 			else
 				key_value = 0xff;
 			break;
@@ -4783,7 +4804,7 @@ going_up:
 				assert(ft->group->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->group->key_len);
 				iter->key_len = level;
 				for (j = 0; j < level; j++)
-					iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+					iter_key(iter)[j] = ordinal_key[j];
 				iter->node = external_nodes;
 				iter->path_valid = true;
 				iter_debug_path_update(iter);
@@ -4796,14 +4817,14 @@ going_up:
 
 		switch (limit) {
 		case FT_LOOKUP_LIMIT_NONE:
-			key_value = key_to_ordinal(*(--iter_key), &ft->group->key_map);
+			key_value = *(--iter_key);
 			break;
 		case FT_LOOKUP_LIMIT_FIRST:
-			key_value = key_to_ordinal(input_key[level - 1], &ft->group->key_map);
+			key_value = input_key[level - 1];
 			break;
 		case FT_LOOKUP_LIMIT_LAST:
 			if ((size_t) level <= iter->prefix_len)
-				key_value = key_to_ordinal(input_key[level - 1], &ft->group->key_map);
+				key_value = input_key[level - 1];
 			else
 				key_value = 0xff;
 			break;
@@ -5110,7 +5131,7 @@ going_up:
 
 					iter->key_len = iter->prefix_len;
 					for (j = 0; j < (int) iter->prefix_len; j++)
-						iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+						iter_key(iter)[j] = ordinal_key[j];
 					iter->node = external_nodes;
 					iter->path_valid = true;
 					iter_debug_path_update(iter);
@@ -5135,7 +5156,7 @@ descend_children:
 		assert(ft->group->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->group->key_len);
 		iter->key_len = level;
 		for (j = 0; j < level; j++)
-			iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+			iter_key(iter)[j] = ordinal_key[j];
 		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
 		iter->path_valid = true;
 		iter_debug_path_update(iter);
@@ -5359,7 +5380,7 @@ found_minmax:
 
 		iter->key_len = level;
 		for (j = 0; j < level; j++)
-			iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+			iter_key(iter)[j] = ordinal_key[j];
 		iter->node = ret_node;
 		iter->path_valid = true;
 		iter_debug_path_update(iter);
@@ -6306,7 +6327,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			unsigned int j;
 
 			for (j = 0; j < cmp; j++) {
-				if (key_to_ordinal(ik[j], &ft->group->key_map) !=
+				if (ik[j] !=
 				    cn->key_bytes[j])
 					break;
 			}
@@ -6338,7 +6359,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
 				for (j = 0; j < slen; j++) {
-					if (key_to_ordinal(ik[j], &ft->group->key_map) !=
+					if (ik[j] !=
 					    suffix[j])
 						break;
 				}
@@ -6383,7 +6404,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			}
 		}
 		{
-			uint8_t kv = key_to_ordinal(*(ik++), &ft->group->key_map);
+			uint8_t kv = *(ik++);
 			struct cds_ft_inode_flag **slot = NULL;
 
 			ft_node_get_nth(node_flag, &slot, kv);
@@ -6442,7 +6463,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	unsigned int suffix_len = cn->len - diverge_pos - 1;
 	unsigned int new_len = remaining_key - diverge_pos - 1;
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
-	uint8_t new_ordinal = key_to_ordinal(iter_key[diverge_pos], &ft->group->key_map);
+	uint8_t new_ordinal = iter_key[diverge_pos];
 	unsigned long old_child_nr_keys;
 	int ret;
 
@@ -6502,7 +6523,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 			unsigned int k;
 
 			for (k = 0; k < new_len; k++)
-				nb->key_bytes[k] = key_to_ordinal(iter_key[diverge_pos + 1 + k], &ft->group->key_map);
+				nb->key_bytes[k] = iter_key[diverge_pos + 1 + k];
 		}
 		nb_meta->nr_child = 1;
 		uatomic_store(&nb_meta->nr_keys, 1, CMM_RELAXED);
@@ -6512,7 +6533,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		struct cds_ft_inode_flag *dest = NULL;
 
 		ret = ft_node_set_nth(ft, &dest,
-				key_to_ordinal(iter_key[diverge_pos + 1], &ft->group->key_map),
+				iter_key[diverge_pos + 1],
 				(struct cds_ft_inode_flag *) child_node, NULL, NULL);
 		if (ret) goto error;
 		{
@@ -6748,7 +6769,7 @@ int ft_split_compressed_to_collapsed(struct cds_ft *ft,
 	 */
 	suffix_pos -= new_suffix_len;
 	for (k = 0; k < new_suffix_len; k++)
-		suffix_pos[k] = key_to_ordinal(iter_key[diverge_pos + k], &ft->group->key_map);
+		suffix_pos[k] = iter_key[diverge_pos + k];
 	col->data[1] = (uint8_t)(suffix_pos - (uint8_t *) col);
 	col_ptrs[1] = (struct cds_ft_inode_flag *) child_node;
 
@@ -7002,7 +7023,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	cn->child = child;
 	cn->len = path_len;
 	for (j = 0; j < path_len; j++)
-		cn->key_bytes[j] = key_to_ordinal(key[level + j], &ft->group->key_map);
+		cn->key_bytes[j] = key[level + j];
 	cn_meta->nr_child = 1;
 	uatomic_store(&cn_meta->nr_keys, 1, CMM_RELAXED);
 	if (external_nodes) {
@@ -7094,7 +7115,7 @@ int ft_attach_node(struct cds_ft *ft,
 		for (i = key_len; i > (int) level; i--) {
 			uint8_t key_value;
 
-			key_value = key_to_ordinal(*(--iter_key), &ft->group->key_map);
+			key_value = *(--iter_key);
 			dbg_printf("branch creation level %d, key %u\n",
 					i, (unsigned int) key_value);
 			iter_dest_node_flag = NULL;
@@ -7126,7 +7147,7 @@ int ft_attach_node(struct cds_ft *ft,
 	{
 		uint8_t key_value;
 
-		key_value = key_to_ordinal(*(--iter_key), &ft->group->key_map);
+		key_value = *(--iter_key);
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
 
 #ifdef FEATURE_FT_COLLAPSE
@@ -7774,14 +7795,16 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 
 static
 int _cds_ft_insert(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *_key, size_t _key_len,
 		struct cds_ft_node *node,
 		struct cds_ft_node **unique_node_ret)
 {
 	unsigned int key_depth;
 	struct ft_descent d;
-	const uint8_t *iter_key = key;
 	size_t key_len = ft_key_len(ft, _key_len);
+	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
+	const uint8_t *key = ordinal_buf;
+	const uint8_t *iter_key;
 	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
 	unsigned int snapshot_depth[FT_MAX_DEPTH]; /* parallel depth tracking */
 	int nr_snapshot = 0;
@@ -7789,6 +7812,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
+	ft_key_to_ordinals(ordinal_buf, _key, key_len, &ft->group->key_map);
+	iter_key = key;
 	/* Expect zeroed next pointer. This catches some double-insert misuses. */
 	if (node->next)
 		return -EINVAL;
@@ -7850,7 +7875,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				{
 					unsigned int cmp_len = slen < remaining ? slen : remaining;
 
-					if (ft_key_cmp_ordinals(iter_key, suffix, cmp_len, cmp_len, &j, &ft->group->key_map) != 0) {
+					if (ft_key_cmp_ordinals(iter_key, suffix, cmp_len, cmp_len, &j) != 0) {
 						if (j == 0)
 							continue; /* No prefix overlap. */
 					} else {
@@ -7980,7 +8005,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				/* Write suffix (grows leftward from existing suffixes). */
 				new_suffix_pos = ((uint8_t *) col) + cur_suffix_start - new_slen;
 				for (k = 0; k < new_slen; k++)
-					new_suffix_pos[k] = key_to_ordinal(iter_key[k], &ft->group->key_map);
+					new_suffix_pos[k] = iter_key[k];
 
 				/* Set offset for new entry. */
 				col->data[col_nr] = (uint8_t)(new_suffix_pos - (uint8_t *) col);
@@ -8011,7 +8036,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				d.ppnf, d.pnf, d.nfp, d.nf);
 		ft_snapshot_push(snapshot, snapshot_depth,
 			nr_snapshot, d.nf, d.depth);
-		key_value = key_to_ordinal(*(iter_key++), &ft->group->key_map);
+		key_value = *(iter_key++);
 		ft_descent_step(&d, key_value);
 	}
 
@@ -8177,7 +8202,7 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  */
 static
 int _cds_ft_insert_replace(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *_key, size_t _key_len,
 		struct cds_ft_node *node,
 		struct cds_ft_node **old_node_ret)
 {
@@ -8185,6 +8210,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	struct ft_descent d;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, _key_len);
+	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
+	const uint8_t *key = ordinal_buf;
 	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
 	unsigned int snapshot_depth[FT_MAX_DEPTH];
 	int nr_snapshot = 0;
@@ -8194,6 +8221,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
+	ft_key_to_ordinals(ordinal_buf, _key, key_len, &ft->group->key_map);
 	/* Expect zeroed next pointer. */
 	if (node->next)
 		return -EINVAL;
@@ -8244,7 +8272,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, NULL, &ft->group->key_map) == 0);
+				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, NULL) == 0);
 				if (!match)
 					continue;
 				ft_snapshot_push(snapshot, snapshot_depth,
@@ -8268,7 +8296,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				d.ppnf, d.pnf, d.nfp, d.nf);
 		ft_snapshot_push(snapshot, snapshot_depth,
 			nr_snapshot, d.nf, d.depth);
-		key_value = key_to_ordinal(*(iter_key++), &ft->group->key_map);
+		key_value = *(iter_key++);
 		ft_descent_step(&d, key_value);
 	}
 
@@ -8446,15 +8474,14 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 
 			act = ft_traverse_collapsed(ft, &node_flag,
 				&node_flag_ptr, &iter_key, &i,
-				key_depth, &nf,
-				&ft->group->key_map);
+				key_depth, &nf);
 			if (nf)
 				return CDS_FT_STATUS_NOT_FOUND;
 			if (act == FT_COMPRESSED_BREAK)
 				break;
 			continue;
 		}
-		key_value = key_to_ordinal(*(iter_key++), &ft->group->key_map);
+		key_value = *(iter_key++);
 		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
 		if (!ft_node_ptr(node_flag))
 			return CDS_FT_STATUS_NOT_FOUND;
@@ -8875,7 +8902,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, NULL, &ft->group->key_map) == 0);
+				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, NULL) == 0);
 				if (!match)
 					continue;
 				if (!ft_node_ptr(cptrs[e]))
@@ -8912,7 +8939,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
 		ft_detach_descent_track(&dd, metadata);
 
-		key_value = key_to_ordinal(*(iter_key++), &ft->group->key_map);
+		key_value = *(iter_key++);
 		snapshot_n[nr_snapshot + 1] = key_value;
 		ft_snapshot_push(snapshot, snapshot_depth,
 			nr_snapshot, dd.d.nf, dd.d.depth);
@@ -9181,7 +9208,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, NULL, &ft->group->key_map) == 0);
+				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, NULL) == 0);
 				if (!match)
 					continue;
 				if (!ft_node_ptr(cptrs[e])) {
@@ -9218,7 +9245,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
 		ft_detach_descent_track(&dd, metadata);
 
-		key_value = key_to_ordinal(*(iter_key++), &ft->group->key_map);
+		key_value = *(iter_key++);
 		snapshot_n[nr_snapshot + 1] = key_value;
 		ft_snapshot_push(snapshot, snapshot_depth,
 			nr_snapshot, dd.d.nf, dd.d.depth);
@@ -9475,7 +9502,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		d->pnfp = d->nfp;  /* branch IS the top, parent is the old parent */
 	}
 	{
-		uint8_t new_ordinal = key_to_ordinal(iter_key[diverge_pos], &ft->group->key_map);
+		uint8_t new_ordinal = iter_key[diverge_pos];
 
 		d->nf = ft_node_get_nth(branch_flag, &d->nfp, new_ordinal);
 		/* nf should be NULL: the branch only has the old direction. */
@@ -9596,7 +9623,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, e);
-				match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, NULL, &ft->group->key_map) == 0);
+				match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, NULL) == 0);
 				if (!match)
 					continue;
 				ft_snapshot_push(snapshot, snapshot_depth,
@@ -9619,7 +9646,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 
 		ft_snapshot_push(snapshot, snapshot_depth,
 			*nr_snapshot, d->nf, d->depth);
-		kv = key_to_ordinal(*(ik++), &ft->group->key_map);
+		kv = *(ik++);
 		ft_descent_step(d, kv);
 	}
 }
@@ -9802,12 +9829,12 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 			int ret;
 
 			ret = ft_node_set_nth(ft, &dest,
-				key_to_ordinal(key[i], &ft->group->key_map),
+				key[i],
 				cur, NULL, NULL);
 			if (ret) {
 				while (cur != leaf) {
 					struct cds_ft_inode_flag *next;
-					uint8_t kv = key_to_ordinal(key[i + 1], &ft->group->key_map);
+					uint8_t kv = key[i + 1];
 
 					next = ft_node_get_nth(cur, NULL, kv);
 					free_cds_ft_node(ft, ft_node_ptr(cur));
@@ -9887,7 +9914,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		dest = d->pnf;
 		ret = ft_node_set_nth(ft, &dest,
-			key_to_ordinal(key[key_len - 1], &ft->group->key_map),
+			key[key_len - 1],
 			graft_payload, &old_recompacted_node, pmeta);
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
@@ -9930,7 +9957,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 					ft_node_ptr(d->pnf));
 
 			ret = ft_node_set_nth(ft, &dest,
-				key_to_ordinal(key[i - 1], &ft->group->key_map),
+				key[i - 1],
 				branch, &old_recompacted_node, pmeta);
 			if (ret) {
 				ft_free_branch(ft, key, i, key_len, branch);
@@ -9946,7 +9973,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 }
 
 enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *_key, size_t _key_len,
 		struct cds_ft *src_ft)
 {
 	struct cds_ft_metadata *src_rmeta;
@@ -9972,6 +9999,11 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE)
 			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
+
+	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
+	const uint8_t *key = ordinal_buf;
+
+	ft_key_to_ordinals(ordinal_buf, _key, key_len, &dst_ft->group->key_map);
 
 	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
 	if (key_len > 0 && src_max > dst_ft->group->max_key_len - key_len)
@@ -10074,7 +10106,7 @@ done:
 }
 
 enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *_key, size_t _key_len,
 		struct cds_ft *swap_ft)
 {
 	size_t key_len, swap_max;
@@ -10096,6 +10128,11 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE)
 			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
+
+	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
+	const uint8_t *key = ordinal_buf;
+
+	ft_key_to_ordinals(ordinal_buf, _key, key_len, &dst_ft->group->key_map);
 
 	swap_max = uatomic_load(&swap_ft->max_used_key_len, CMM_RELAXED);
 	if (key_len > 0 && swap_max > dst_ft->group->max_key_len - key_len)
@@ -10252,7 +10289,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 }
 
 enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *_key, size_t _key_len,
 		struct cds_ft **result_ft)
 {
 	struct cds_ft *detached;
@@ -10277,6 +10314,11 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				ft->group->key_len != CDS_FT_LEN_VARIABLE)
 			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
+
+	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
+	const uint8_t *key = ordinal_buf;
+
+	ft_key_to_ordinals(ordinal_buf, _key, key_len, &ft->group->key_map);
 
 	if (key_len == 0) {
 		struct cds_ft_metadata *rmeta = ft_root_metadata(ft);
@@ -10389,11 +10431,11 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					 * collapsed node and restart descent.
 					 */
 					if (slen > remaining) {
-						if (ft_key_cmp_ordinals(ik, suffix, remaining, remaining, NULL, &ft->group->key_map) == 0)
+						if (ft_key_cmp_ordinals(ik, suffix, remaining, remaining, NULL) == 0)
 							goto detach_collapsed_explode;
 						continue;
 					}
-					match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, NULL, &ft->group->key_map) == 0);
+					match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, NULL) == 0);
 					if (!match)
 						continue;
 					if (!ft_node_ptr(cptrs[e]))
@@ -10450,7 +10492,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			meta = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
 			ft_detach_descent_track(&dd, meta);
 
-			kv = key_to_ordinal(*(ik++), &ft->group->key_map);
+			kv = *(ik++);
 			snapshot_n[nr_snapshot + 1] = kv;
 			ft_snapshot_push(snapshot, snapshot_depth,
 			nr_snapshot, dd.d.nf, dd.d.depth);
@@ -10693,7 +10735,7 @@ enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft *ft,
 			suffix = ft_collapsed_suffix(cn, e);
 			match = true;
 			for (j = 0; j < remaining; j++) {
-				if (key_to_ordinal(prefix[i + j], &ft->group->key_map) != suffix[j]) {
+				if (prefix[i + j] != suffix[j]) {
 					match = false;
 					break;
 				}
@@ -10716,7 +10758,7 @@ enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft *ft,
 		suffix = ft_collapsed_suffix(cn, e);
 		match = true;
 		for (j = 0; j < slen; j++) {
-			if (key_to_ordinal(prefix[i + j], &ft->group->key_map) != suffix[j]) {
+			if (prefix[i + j] != suffix[j]) {
 				match = false;
 				break;
 			}
@@ -10734,15 +10776,18 @@ enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft *ft,
 #endif /* FEATURE_FT_COLLAPSE */
 
 unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
-		const uint8_t *prefix, size_t prefix_len)
+		const uint8_t *_prefix, size_t prefix_len)
 {
 	struct cds_ft_inode_flag *node_flag;
 	unsigned int i;
+	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
+	const uint8_t *prefix = ordinal_buf;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	if (prefix_len > ft->group->max_key_len)
 		return 0;
+	ft_key_to_ordinals(ordinal_buf, _prefix, prefix_len, &ft->group->key_map);
 
 	node_flag = ft_dereference_acquire(ft->root);
 
@@ -10773,7 +10818,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 				return count;
 			continue;
 		}
-		kv = key_to_ordinal(prefix[i], &ft->group->key_map);
+		kv = prefix[i];
 		node_flag = ft_node_get_nth(node_flag, NULL, kv);
 	}
 
@@ -11013,7 +11058,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 					int j;
 
 					for (j = 0; j < level - 1; j++)
-						iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+						iter_key(iter)[j] = ordinal_key[j];
 				}
 				iter->node = ext;
 				iter->path_valid = true;
@@ -11079,7 +11124,7 @@ next_level:
 			int j;
 
 			for (j = 0; j < level - 1; j++)
-				iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+				iter_key(iter)[j] = ordinal_key[j];
 		}
 		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
 		iter->path_valid = true;
@@ -11336,7 +11381,7 @@ check_ext_nth_last:
 					int j;
 
 					for (j = 0; j < level - 1; j++)
-						iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+						iter_key(iter)[j] = ordinal_key[j];
 				}
 				iter->node = ext;
 				iter->path_valid = true;
@@ -11362,7 +11407,7 @@ next_level:
 			int j;
 
 			for (j = 0; j < level - 1; j++)
-				iter_key(iter)[j] = ordinal_to_key(ft, ordinal_key[j]);
+				iter_key(iter)[j] = ordinal_key[j];
 		}
 		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
 		iter->path_valid = true;
@@ -11413,8 +11458,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 			if (i + cn->len > key_len)
 				return -1;
 			for (j = 0; j < cn->len; j++) {
-				uint8_t ord = key_to_ordinal(
-							key[i + j], &ft->group->key_map);
+				uint8_t ord = key[i + j];
 				if (ord != cn->key_bytes[j])
 					return -1;
 				ordinal_key[i + j] = ord;
@@ -11450,8 +11494,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 				suffix = ft_collapsed_suffix(cn, e);
 				match = true;
 				for (j = 0; j < slen; j++) {
-					uint8_t ord = key_to_ordinal(
-								key[i + j], &ft->group->key_map);
+					uint8_t ord = key[i + j];
 					if (ord != suffix[j]) {
 						match = false;
 						break;
@@ -11476,7 +11519,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 			continue;
 		}
 
-		ordinal = key_to_ordinal(key[i], &ft->group->key_map);
+		ordinal = key[i];
 		ordinal_key[i] = ordinal;
 		node_flag = ft_node_get_nth(node_flag, NULL, ordinal);
 		if (!ft_node_ptr(node_flag))
@@ -11851,9 +11894,7 @@ descend_forward:
 
 					iter->key_len = level;
 					for (j = 0; j < level; j++)
-						iter_key(iter)[j] =
-							ordinal_to_key(ft,
-								ordinal_key[j]);
+						iter_key(iter)[j] = ordinal_key[j];
 					iter->node = ext;
 					iter->path_valid = true;
 					iter_debug_path_update(iter);
@@ -11918,8 +11959,7 @@ next_forward_level:
 
 			iter->key_len = level;
 			for (j = 0; j < level; j++)
-				iter_key(iter)[j] =
-					ordinal_to_key(ft, ordinal_key[j]);
+				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = (struct cds_ft_node *)
 				ft_node_ptr(iter_path_node(iter)[level]);
 			iter->path_valid = true;
@@ -12079,9 +12119,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 
 						iter->key_len = level;
 						for (j = 0; j < level; j++)
-							iter_key(iter)[j] =
-								ordinal_to_key(ft,
-									ordinal_key[j]);
+							iter_key(iter)[j] = ordinal_key[j];
 						iter->node = a_ext;
 						iter->path_valid = true;
 						iter_debug_path_update(iter);
@@ -12174,9 +12212,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 
 							iter->key_len = level;
 							for (j = 0; j < level; j++)
-								iter_key(iter)[j] =
-									ordinal_to_key(ft,
-										ordinal_key[j]);
+								iter_key(iter)[j] = ordinal_key[j];
 							iter->node = a_ext;
 							iter->path_valid = true;
 							iter_debug_path_update(iter);
@@ -12248,9 +12284,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 
 					iter->key_len = level;
 					for (j = 0; j < level; j++)
-						iter_key(iter)[j] =
-							ordinal_to_key(ft,
-								ordinal_key[j]);
+						iter_key(iter)[j] = ordinal_key[j];
 					iter->node = a_ext;
 				iter->path_valid = true;
 				iter_debug_path_update(iter);
@@ -12351,9 +12385,7 @@ check_ext_descend_reverse:
 
 				iter->key_len = level;
 				for (j = 0; j < level; j++)
-					iter_key(iter)[j] =
-						ordinal_to_key(ft,
-							ordinal_key[j]);
+					iter_key(iter)[j] = ordinal_key[j];
 				iter->node = ext;
 				iter->path_valid = true;
 				iter_debug_path_update(iter);
@@ -12376,8 +12408,7 @@ next_reverse_level:
 
 			iter->key_len = level;
 			for (j = 0; j < level; j++)
-				iter_key(iter)[j] =
-					ordinal_to_key(ft, ordinal_key[j]);
+				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = (struct cds_ft_node *)
 				ft_node_ptr(iter_path_node(iter)[level]);
 			iter->path_valid = true;
@@ -13172,7 +13203,8 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
 	*result_key_len = iter->key_len;
 	if (iter->key_len > result_key_max_len)
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	memcpy(result_key, iter_key(iter), iter->key_len);
+	ft_ordinals_to_key(result_key, iter_key(iter), iter->key_len,
+			&iter->ft->group->key_map);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -13182,25 +13214,29 @@ enum cds_ft_status cds_ft_iter_get_prefix(struct cds_ft_iter *iter,
 	*result_key_len = iter->prefix_len;
 	if (iter->prefix_len > result_key_max_len)
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	memcpy(result_key, iter_key(iter), iter->prefix_len);
+	ft_ordinals_to_key(result_key, iter_key(iter), iter->prefix_len,
+			&iter->ft->group->key_map);
 	return CDS_FT_STATUS_OK;
 }
 
 enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *key, size_t key_len)
 {
+	const struct cds_ft_key_map *km = &iter->ft->group->key_map;
 	bool subset = false;
+	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
 
 	key_len = ft_key_len(iter->ft, key_len);
 	if (key_len > iter->ft->group->max_key_len)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (key_len <= iter->key_len && !memcmp(key, iter_key(iter), key_len))
+	ft_key_to_ordinals(ordinal_buf, key, key_len, km);
+	if (key_len <= iter->key_len && !memcmp(ordinal_buf, iter_key(iter), key_len))
 		subset = true;
 	/*
 	 * If new key is a subset of current key, the path stays valid,
 	 * otherwise invalidate the path.
 	 */
 	if (!subset) {
-		memcpy(iter_key(iter), key, key_len);
+		memcpy(iter_key(iter), ordinal_buf, key_len);
 		iter->path_valid = false;
 		iter_debug_path_clear(iter);
 		iter->path_len = 0;
