@@ -5859,6 +5859,17 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	/*
 	 * Select collapsed node configuration using density counters.
 	 *
+	 * Cost/benefit gate: density must exceed nr_child by a
+	 * factor of 1.5.  Each collapsed entry adds scan overhead
+	 * (tombstone check, offset compute, suffix compare) that
+	 * must be offset by saving pointer chases.  density[0]
+	 * counts traversable nodes absorbed; nr_child is roughly
+	 * the number of entries.  When the ratio is too low (e.g.
+	 * subtree is mostly compressed paths that each cost only
+	 * 1 pointer chase), the collapsed scan overhead exceeds
+	 * the savings.
+	 *
+	 * Steps:
 	 * 1. Density → allocation order (smallest that fits).
 	 * 2. Walk with 64B scan zone (most restrictive scan budget,
 	 *    most generous pointer count for the allocation).
@@ -5870,6 +5881,17 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	 */
 	{
 		unsigned long density = metadata->nr_nodes_at_depth[0];
+
+		/*
+		 * Skip collapse if the subtree doesn't have enough
+		 * intermediate nodes per child to justify the per-entry
+		 * scan cost.  density < nr_child * factor means the
+		 * subtree is mostly direct paths (compressed or
+		 * single-hop) that are cheaper uncollapsed.
+		 */
+		/* density * 2 < nr_child * 3 is equivalent to density < nr_child * 1.5 */
+		if (density * 2 < (unsigned long) nr_child * 3)
+			return NULL;
 		unsigned int order;
 		int try_depth;
 		bool found = false;
