@@ -5734,12 +5734,41 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 }
 
 /*
- * ft_init_node_density: set a node's density counter[0] by counting
- * traversable children within 6 levels.  Simple walk of immediate
- * children plus their counter[0] values (shifted by child distance).
+ * Compute the precise density contribution of a child node to its
+ * parent.  The child is at @distance levels below the parent.
  *
- * Only sets counter[0] (cumulative sum).  Per-level counters [1..5]
- * are not maintained by this function.
+ * The child's nr_nodes_at_depth[0] covers levels child+1 through
+ * child+DEPTH.  From the parent's perspective, those are at levels
+ * parent+(distance+1) through parent+(distance+DEPTH).  The parent's
+ * window ends at parent+DEPTH, so levels beyond that must be
+ * subtracted.  The excess is the sum of per-level counters at
+ * child levels (DEPTH - distance + 1) through DEPTH, stored in
+ * nr_nodes_at_depth[DEPTH - distance] through nr_nodes_at_depth[DEPTH - 1].
+ */
+static inline unsigned long ft_child_density_contribution(
+		struct cds_ft_metadata *cm, unsigned int distance)
+{
+	unsigned long contrib = 1;	/* the child node itself */
+	unsigned int j;
+
+	if (distance >= FT_NODE_DENSITY_DEPTH)
+		return contrib;
+	contrib += cm->nr_nodes_at_depth[0];
+	/* Subtract levels that overflow the parent's window. */
+	for (j = FT_NODE_DENSITY_DEPTH - distance; j < FT_NODE_DENSITY_DEPTH; j++)
+		contrib -= cm->nr_nodes_at_depth[j];
+	return contrib;
+}
+
+/*
+ * ft_init_node_density: set a node's density counter[0] by counting
+ * traversable children within FT_NODE_DENSITY_DEPTH levels.
+ *
+ * Uses ft_child_density_contribution() for precise window correction
+ * at each child distance.
+ *
+ * Only sets counter[0] (cumulative sum).  Per-level counters [1..N-1]
+ * are maintained by ft_propagate_node_density().
  */
 static
 void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
@@ -5755,15 +5784,10 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
 		struct cds_ft_metadata *cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
-		/* Compressed child at distance cn->len. */
 		if (ft_node_ptr(cn->child) && !ft_node_external(cn->child)) {
-			struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(cn->child));
-
 			if (cn->len <= FT_NODE_DENSITY_DEPTH) {
-				total++;	/* child node itself */
-				/* Add child's subtree within window. */
-				if (cn->len < FT_NODE_DENSITY_DEPTH)
-					total += cm->nr_nodes_at_depth[0]; /* approximate */
+				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(cn->child));
+				total += ft_child_density_contribution(cm, cn->len);
 			}
 		}
 		cn_meta->nr_nodes_at_depth[0] = total;
@@ -5786,15 +5810,13 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 				continue;
 			if (slen <= FT_NODE_DENSITY_DEPTH) {
 				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
-				total++;
-				if (slen < FT_NODE_DENSITY_DEPTH)
-					total += cm->nr_nodes_at_depth[0];
+				total += ft_child_density_contribution(cm, slen);
 			}
 		}
 		col_meta->nr_nodes_at_depth[0] = total;
 		return;
 	}
-	/* Internal node: walk children. */
+	/* Internal node: walk children (at distance 1). */
 	node = ft_node_ptr(node_flag);
 	meta = cds_ft_item_to_metadata(node);
 
@@ -5805,13 +5827,9 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 			continue;
 		if (ft_node_external(child))
 			continue;
-		total++;	/* child at distance 1 */
 		{
 			struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
-			/* Child's counter[0] covers its +1 through +6. From parent: +2 through +7. */
-			/* We want +2 through +6 = child[0] minus child's +7 level. */
-			/* Approximate: just add child[0] (slightly overcounts). */
-			total += cm->nr_nodes_at_depth[0];
+			total += ft_child_density_contribution(cm, 1);
 		}
 	}
 	meta->nr_nodes_at_depth[0] = total;
@@ -10559,6 +10577,39 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			 */
 			ft_propagate_external_count(snapshot, nr_snapshot,
 					-(long) detached_count);
+
+			/*
+			 * Propagate density removal for the detached
+			 * subtree.  The child's contribution to each
+			 * ancestor within the density window must be
+			 * subtracted.  Use ft_child_density_contribution
+			 * which accounts for the window shift precisely
+			 * using per-level counters.
+			 */
+			if (!ft_node_external(child)) {
+				struct cds_ft_metadata *child_meta =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(child));
+				int si;
+
+				for (si = nr_snapshot - 1; si >= 0; si--) {
+					struct cds_ft_metadata *am;
+					unsigned int distance;
+
+					if (!ft_node_ptr(snapshot[si]))
+						continue;
+					if (snapshot_depth[si] >= key_len)
+						continue;
+					distance = key_len - snapshot_depth[si];
+					if (distance > FT_NODE_DENSITY_DEPTH)
+						break;
+					am = cds_ft_item_to_metadata(
+						ft_node_ptr(snapshot[si]));
+					am->nr_nodes_at_depth[0] -=
+						ft_child_density_contribution(
+							child_meta, distance);
+				}
+			}
 
 			/*
 			 * Detach child from the source trie and prune
