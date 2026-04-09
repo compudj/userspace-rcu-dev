@@ -4263,9 +4263,9 @@ static int ft_collapsed_find_nearest(
 		struct cds_ft_collapsed_node *col,
 		struct cds_ft_inode_flag **cptrs,
 		unsigned int ref_entry,
+		unsigned int nr_e,
 		enum ft_direction dir)
 {
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
 	uint8_t ref_data = ft_collapsed_load_data(col, ref_entry);
 	uint8_t *ref_suffix = ft_collapsed_suffix_d(col, ref_data, nr_e);
 	unsigned int ref_slen = ft_collapsed_suffix_len_d(col, ref_data, ref_entry, nr_e);
@@ -5184,7 +5184,7 @@ going_up:
 
 			/* Find the nearest live sibling in @dir. */
 			best = ft_collapsed_find_nearest(col, cptrs,
-				(unsigned)current_entry, dir);
+				(unsigned)current_entry, col_nr_e, dir);
 
 			if (best >= 0) {
 				uint8_t best_d = ft_collapsed_load_data(col, (unsigned)best);
