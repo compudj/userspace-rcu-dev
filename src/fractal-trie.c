@@ -890,55 +890,89 @@ int ft_word_mismatch(unsigned long va, unsigned long vb,
  *   bitscan instruction.
  *
  * All three use-cases (equality, mismatch position, signed
- * cardinality) share the same word-at-a-time loop body.  Since this
+ * cardinality) share the same comparison logic.  Since this
  * function is force-inlined, both @signed_cmp and @mismatch_pos
  * checks are constant-folded at each call site.
+ *
+ * Dispatch is ordered by frequency: short keys (< 8 bytes) are the
+ * most common case in trie traversal (collapsed suffixes, compressed
+ * paths), followed by medium keys, then long keys where SIMD helps.
  */
+
+/*
+ * Helper: resolve a mismatch found at byte position @pos by
+ * loading a full word from each array at that position and
+ * delegating to ft_word_mismatch.  The word load is safe because
+ * @remaining_key guarantees enough readable memory.
+ */
+static inline_lookup
+int ft_byte_mismatch(const uint8_t *a, const uint8_t *b,
+		unsigned int pos, bool signed_cmp,
+		unsigned int *mismatch_pos)
+{
+	if (mismatch_pos)
+		*mismatch_pos = pos;
+	if (signed_cmp)
+		return (int)a[pos] - (int)b[pos];
+	return 1;
+}
+
+#if defined(__AVX2__)
+#ifndef FT_IMMINTRIN_INCLUDED
+#define FT_IMMINTRIN_INCLUDED
+#include <immintrin.h>
+#endif
+#endif
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Helper: given a non-zero 32-bit mismatch mask from an AVX2
+ * comparison starting at @base, resolve the first differing byte.
+ */
+static inline_lookup
+int ft_avx2_mismatch(const uint8_t *a, const uint8_t *b,
+		unsigned int base, unsigned int mask,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	unsigned int pos = base + (unsigned int)__builtin_ctz(mask);
+
+	return ft_byte_mismatch(a, b, pos, signed_cmp, mismatch_pos);
+}
+#endif /* __AVX2__ && !FT_NO_SIMD_CMP */
+
+#if defined(__SSE2__)
+#ifndef FT_IMMINTRIN_INCLUDED
+#define FT_IMMINTRIN_INCLUDED
+#include <immintrin.h>
+#endif
+#endif
+#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Helper: given a non-zero 16-bit mismatch mask from an SSE2
+ * comparison starting at @base, resolve the first differing byte.
+ */
+static inline_lookup
+int ft_sse2_mismatch(const uint8_t *a, const uint8_t *b,
+		unsigned int base, unsigned int mask,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	unsigned int pos = base + (unsigned int)__builtin_ctz(mask);
+
+	return ft_byte_mismatch(a, b, pos, signed_cmp, mismatch_pos);
+}
+#endif /* __SSE2__ */
+
 static inline_lookup
 int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 		unsigned int len, unsigned int remaining_key,
 		bool signed_cmp, unsigned int *mismatch_pos)
 {
-	unsigned int j = 0;
-
-	/* Main loop: full-word comparison. */
-	while (j + sizeof(unsigned long) <= len) {
-		unsigned long va, vb;
-
-		__builtin_memcpy(&va, a + j, sizeof(unsigned long));
-		__builtin_memcpy(&vb, b + j, sizeof(unsigned long));
-		if (va != vb)
-			return ft_word_mismatch(va, vb, j,
-						signed_cmp, mismatch_pos);
-		j += sizeof(unsigned long);
-	}
-
 	/*
-	 * Tail: 0 to sizeof(long)-1 bytes remain.
-	 *
-	 * When len >= sizeof(long), re-read the last word of both
-	 * arrays (overlap with confirmed-equal bytes is harmless).
-	 *
-	 * When remaining_key >= sizeof(long), read a full word from
-	 * each at position 0 — the extra bytes beyond @len are
-	 * valid memory, masked out before comparison.
-	 *
-	 * Otherwise fall back to byte-by-byte.
+	 * Short keys (< 8 bytes): most common case in trie traversal.
+	 * Use a single word compare when the remaining key guarantees
+	 * enough readable memory, otherwise byte-by-byte.
 	 */
-	if (j < len) {
-		if (len >= sizeof(unsigned long)) {
-			unsigned long va, vb;
-			unsigned int tail = len - sizeof(unsigned long);
-
-			__builtin_memcpy(&va, a + tail,
-				sizeof(unsigned long));
-			__builtin_memcpy(&vb, b + tail,
-				sizeof(unsigned long));
-			if (va != vb)
-				return ft_word_mismatch(va, vb, tail,
-							signed_cmp,
-							mismatch_pos);
-		} else if (remaining_key >= sizeof(unsigned long)) {
+	if (len < sizeof(unsigned long)) {
+		if (remaining_key >= sizeof(unsigned long)) {
 			unsigned long va, vb, mask;
 
 			__builtin_memcpy(&va, a, sizeof(unsigned long));
@@ -955,18 +989,140 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 							signed_cmp,
 							mismatch_pos);
 		} else {
-			for (; j < len; j++) {
-				if (a[j] != b[j]) {
-					if (mismatch_pos)
-						*mismatch_pos = j;
-					if (signed_cmp)
-						return (int)a[j] - (int)b[j];
-					return 1;
-				}
+			unsigned int j;
+
+			for (j = 0; j < len; j++) {
+				if (a[j] != b[j])
+					return ft_byte_mismatch(a, b, j,
+							signed_cmp,
+							mismatch_pos);
 			}
 		}
+		return 0;
 	}
-	return 0;
+
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+	/*
+	 * Long keys (>= 32 bytes): AVX2 loop, 32 bytes at a time.
+	 * Tail: overlap-read the last 32 bytes.
+	 */
+	if (len >= 32) {
+		unsigned int j = 0;
+
+		while (j + 32 <= len) {
+			__m256i va = _mm256_loadu_si256(
+					(const __m256i *)(a + j));
+			__m256i vb = _mm256_loadu_si256(
+					(const __m256i *)(b + j));
+			__m256i eq = _mm256_cmpeq_epi8(va, vb);
+			unsigned int mask = (unsigned int)
+				_mm256_movemask_epi8(eq);
+
+			if (mask != 0xFFFFFFFFU)
+				return ft_avx2_mismatch(a, b, j,
+							~mask, signed_cmp,
+							mismatch_pos);
+			j += 32;
+		}
+		/* Overlapping tail: re-read last 32 bytes. */
+		if (j < len) {
+			unsigned int tail = len - 32;
+			__m256i va = _mm256_loadu_si256(
+					(const __m256i *)(a + tail));
+			__m256i vb = _mm256_loadu_si256(
+					(const __m256i *)(b + tail));
+			__m256i eq = _mm256_cmpeq_epi8(va, vb);
+			unsigned int mask = (unsigned int)
+				_mm256_movemask_epi8(eq);
+
+			if (mask != 0xFFFFFFFFU)
+				return ft_avx2_mismatch(a, b, tail,
+							~mask, signed_cmp,
+							mismatch_pos);
+		}
+		return 0;
+	}
+#endif /* __AVX2__ */
+
+#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+	/*
+	 * Medium-long keys (>= 16 bytes): SSE2 loop, 16 bytes at a
+	 * time.  Tail: overlap-read the last 16 bytes.
+	 */
+	if (len >= 16) {
+		unsigned int j = 0;
+
+		while (j + 16 <= len) {
+			__m128i va = _mm_loadu_si128(
+					(const __m128i *)(a + j));
+			__m128i vb = _mm_loadu_si128(
+					(const __m128i *)(b + j));
+			__m128i eq = _mm_cmpeq_epi8(va, vb);
+			unsigned int mask = (unsigned int)
+				_mm_movemask_epi8(eq);
+
+			if (mask != 0xFFFFU)
+				return ft_sse2_mismatch(a, b, j,
+							~mask & 0xFFFF,
+							signed_cmp,
+							mismatch_pos);
+			j += 16;
+		}
+		/* Overlapping tail: re-read last 16 bytes. */
+		if (j < len) {
+			unsigned int tail = len - 16;
+			__m128i va = _mm_loadu_si128(
+					(const __m128i *)(a + tail));
+			__m128i vb = _mm_loadu_si128(
+					(const __m128i *)(b + tail));
+			__m128i eq = _mm_cmpeq_epi8(va, vb);
+			unsigned int mask = (unsigned int)
+				_mm_movemask_epi8(eq);
+
+			if (mask != 0xFFFFU)
+				return ft_sse2_mismatch(a, b, tail,
+							~mask & 0xFFFF,
+							signed_cmp,
+							mismatch_pos);
+		}
+		return 0;
+	}
+#endif /* __SSE2__ */
+
+	/*
+	 * Medium keys (8 to 15 bytes, or >= 16 without SIMD):
+	 * word-at-a-time loop.  Tail: overlap-read the last word
+	 * (len >= 8 guarantees this is safe).
+	 */
+	{
+		unsigned int j = 0;
+
+		while (j + sizeof(unsigned long) <= len) {
+			unsigned long va, vb;
+
+			__builtin_memcpy(&va, a + j, sizeof(unsigned long));
+			__builtin_memcpy(&vb, b + j, sizeof(unsigned long));
+			if (va != vb)
+				return ft_word_mismatch(va, vb, j,
+							signed_cmp,
+							mismatch_pos);
+			j += sizeof(unsigned long);
+		}
+		if (j < len) {
+			unsigned long va, vb;
+			unsigned int tail = len - sizeof(unsigned long);
+
+			__builtin_memcpy(&va, a + tail,
+				sizeof(unsigned long));
+			__builtin_memcpy(&vb, b + tail,
+				sizeof(unsigned long));
+			if (va != vb)
+				return ft_word_mismatch(va, vb, tail,
+							signed_cmp,
+							mismatch_pos);
+		}
+		return 0;
+	}
 }
 
 static
@@ -1835,7 +1991,6 @@ found:
 }
 
 #if defined(__SSE2__)
-#include <immintrin.h>
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
 		struct cds_ft_inode *node,
