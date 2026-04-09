@@ -917,6 +917,8 @@ int ft_byte_mismatch(const uint8_t *a, const uint8_t *b,
 	return 1;
 }
 
+#if 0 /* AVX2 comparison — available but not used: SSE2 is sufficient
+       * for typical key lengths and avoids an extra dispatch branch. */
 #if defined(__AVX2__)
 #ifndef FT_IMMINTRIN_INCLUDED
 #define FT_IMMINTRIN_INCLUDED
@@ -938,6 +940,7 @@ int ft_avx2_mismatch(const uint8_t *a, const uint8_t *b,
 	return ft_byte_mismatch(a, b, pos, signed_cmp, mismatch_pos);
 }
 #endif /* __AVX2__ && !FT_NO_SIMD_CMP */
+#endif /* AVX2 comparison disabled */
 
 #if defined(__SSE2__)
 #ifndef FT_IMMINTRIN_INCLUDED
@@ -1067,6 +1070,7 @@ int ft_cmp_sse2(const uint8_t *a, const uint8_t *b,
 }
 #endif /* __SSE2__ && !FT_NO_SIMD_CMP */
 
+#if 0 /* AVX2 comparison — see ft_avx2_mismatch above. */
 #if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
 /* Compare len >= 32 bytes using AVX2 + overlapping 32-byte tail. */
 static inline_lookup
@@ -1103,14 +1107,16 @@ int ft_cmp_avx2(const uint8_t *a, const uint8_t *b,
 	return 0;
 }
 #endif /* __AVX2__ && !FT_NO_SIMD_CMP */
+#endif /* AVX2 comparison disabled */
 
 /*
- * ft_key_cmp_ordinals: short-key-first dispatch.
+ * ft_key_cmp_ordinals: compare @len bytes in ordinal space.
  *
- * Used by collapsed suffix comparisons where len is typically 1-6
- * but can reach ~60 bytes via ft_split_compressed_to_collapsed.
- * Dispatch: < 8 (hot), >= 16 (SSE2), >= 8 (word).
- * No AVX2 — collapsed suffixes rarely exceed 16 bytes, never 32.
+ * Dispatch in natural increasing order:
+ *   < 8:  tiny (masked word or byte-by-byte) — hot for collapsed
+ *         suffixes and short compressed paths
+ *   < 16: word-at-a-time + overlapping tail
+ *   >= 16: SSE2 loop + overlapping 16-byte tail
  */
 static inline_lookup
 int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
@@ -1120,38 +1126,15 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 	if (len < sizeof(unsigned long))
 		return ft_cmp_tiny(a, b, len, remaining_key,
 				   signed_cmp, mismatch_pos);
+	if (len < 16)
+		return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
 #if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
-	if (len >= 16)
-		return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
-#endif
+	return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
+#else
 	return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
+#endif
 }
 
-/*
- * ft_key_cmp_ordinals_long: long-key-optimized dispatch.
- *
- * Used by compressed path comparisons where len is typically 10-30+.
- * Dispatch: >= 16 (SSE2, hot), >= 8 (word), < 8 (tiny).
- * Dispatch: >= 32 (AVX2), >= 16 (SSE2, hot), >= 8 (word), < 8 (tiny).
- */
-static inline_lookup
-int ft_key_cmp_ordinals_long(const uint8_t *a, const uint8_t *b,
-		unsigned int len, unsigned int remaining_key,
-		bool signed_cmp, unsigned int *mismatch_pos)
-{
-#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
-	if (len >= 32)
-		return ft_cmp_avx2(a, b, len, signed_cmp, mismatch_pos);
-#endif
-#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
-	if (len >= 16)
-		return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
-#endif
-	if (len >= sizeof(unsigned long))
-		return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
-	return ft_cmp_tiny(a, b, len, remaining_key,
-			   signed_cmp, mismatch_pos);
-}
 
 static
 struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
@@ -1525,7 +1508,7 @@ unsigned int ft_match_compressed_key(struct cds_ft *ft,
 {
 	unsigned int pos;
 
-	if (ft_key_cmp_ordinals_long(key, cn->key_bytes, cmp, cmp, false, &pos) != 0)
+	if (ft_key_cmp_ordinals(key, cn->key_bytes, cmp, cmp, false, &pos) != 0)
 		return pos;
 	return cmp;
 }
@@ -3696,7 +3679,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 
 	if (track_longest) {
 		unsigned int mpos;
-		int cmp = ft_key_cmp_ordinals_long(key, cn->key_bytes,
+		int cmp = ft_key_cmp_ordinals(key, cn->key_bytes,
 				cmp_len, remaining_key, false, &mpos);
 
 		if (cmp != 0) {
@@ -3708,7 +3691,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 		*match_len_p = i + cmp_len;
 		*match_node_p = NULL;
 	} else {
-		if (ft_key_cmp_ordinals_long(key, cn->key_bytes,
+		if (ft_key_cmp_ordinals(key, cn->key_bytes,
 				cmp_len, remaining_key, false, NULL) != 0) {
 			*status_ret = CDS_FT_STATUS_NOT_FOUND;
 			return FT_COMPRESSED_END;
@@ -4553,7 +4536,7 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft *ft,
 		assert(0);
 	}
 
-	cmp_result = ft_key_cmp_ordinals_long(cmp_key, cn->key_bytes, cmp, cmp,
+	cmp_result = ft_key_cmp_ordinals(cmp_key, cn->key_bytes, cmp, cmp,
 					true, &mpos);
 
 	/* Fill ordinal_key and iter_path for the matched prefix. */
