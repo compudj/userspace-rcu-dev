@@ -1215,6 +1215,9 @@ void ft_collapsed_set_nr_entries(struct cds_ft_collapsed_node *cn,
 static inline
 void ft_collapsed_publish_inc_nr_entries(struct cds_ft_collapsed_node *cn)
 {
+	/* Verify increment does not overflow into scan zone selector bits. */
+	assert((cn->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) ==
+	       ((uint8_t)(cn->nr_entries + 1) >> FT_COLLAPSED_SCAN_SHIFT));
 	uatomic_store(&cn->nr_entries, cn->nr_entries + 1, CMM_RELEASE);
 }
 
