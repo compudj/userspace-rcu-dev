@@ -3620,8 +3620,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 	unsigned int nr_e = ft_collapsed_nr_entries(cn);
 	unsigned int scan_sz = ft_collapsed_scan_zone_size(nr_e);
 	unsigned int off_mask = ft_collapsed_offset_mask(nr_e);
-	struct cds_ft_inode_flag **ptrs = (struct cds_ft_inode_flag **)
-		(((uint8_t *) cn) + scan_sz);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn, nr_e);
 	unsigned int remaining_key = key_depth - 1 - i;
 	unsigned int e;
 
@@ -3655,6 +3654,10 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
 		if (data_e & (off_mask ^ 0xFF))
 			continue;	/* tombstone (only for non-256B zones) */
 		start = data_e & off_mask;
+		/*
+		 * Previous entry's data byte is immutable once published,
+		 * so loading it without caching is safe.
+		 */
 		end = (e == 0) ? scan_sz : (ft_collapsed_load_data(cn, e - 1) & off_mask);
 		slen = end - start;
 		if (slen > remaining_key)
@@ -4659,7 +4662,14 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len;
 	bool going_up = false, skip_eq_external_nodes;
-	/* 0 means unset (collapsed nodes always have >= 1 entry). */
+	/*
+	 * Cache nr_entries from the downward collapsed walk so the
+	 * going-up handler uses the same acquire-loaded snapshot.
+	 * 0 means unset (collapsed nodes always have >= 1 entry by
+	 * construction).  Consumed and reset to 0 after use, so
+	 * collapsed nodes encountered at higher levels during
+	 * going-up get a fresh load.
+	 */
 	unsigned int cached_col_nr_e = 0;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
@@ -5040,6 +5050,11 @@ going_up:
 			struct cds_ft_collapsed_node *col =
 				ft_collapsed_node_ptr(
 					iter_path_node(iter)[level - 1]);
+			/*
+			 * Use cached nr_entries from the downward walk
+			 * when available; fresh load for collapsed
+			 * nodes encountered at higher levels.
+			 */
 			unsigned int col_nr_e = cached_col_nr_e ?
 				cached_col_nr_e :
 				ft_collapsed_nr_entries(col);
@@ -11853,7 +11868,14 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	unsigned long remaining;
 	int depth, level;
 	bool at_external_nodes;
-	/* 0 means unset (collapsed nodes always have >= 1 entry). */
+	/*
+	 * Cache nr_entries from the downward collapsed walk so the
+	 * going-up handler uses the same acquire-loaded snapshot.
+	 * 0 means unset (collapsed nodes always have >= 1 entry by
+	 * construction).  Consumed and reset to 0 after use, so
+	 * collapsed nodes encountered at higher levels during
+	 * going-up get a fresh load.
+	 */
 	unsigned int cached_col_nr_e = 0;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
@@ -12011,6 +12033,11 @@ skip_fwd_walk_up:
 			{
 				struct cds_ft_collapsed_node *col =
 					ft_collapsed_node_ptr(ancestor);
+				/*
+				 * Use cached nr_entries from the downward
+				 * walk when available; fresh load for
+				 * collapsed nodes at higher levels.
+				 */
 				unsigned int nr_e = cached_col_nr_e ?
 					cached_col_nr_e :
 					ft_collapsed_nr_entries(col);
