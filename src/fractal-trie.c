@@ -5096,26 +5096,21 @@ going_up:
 			 * suffix_base: the ordinal_key position where
 			 * collapsed suffix data starts.  Normally
 			 * entry_depth, except when the collapsed node is
-			 * a direct child of a compressed node.
+			 * a direct child of a compressed node (no
+			 * intermediate internal dispatch).  In that case,
+			 * the compressed handler wrote ordinal_key one
+			 * position earlier.
+			 *
+			 * Detect by checking the cached iter_path: if
+			 * the parent is compressed, suffix_base is one
+			 * earlier.  No entry scan needed — the iter_path
+			 * is stable (set during the downward walk).
 			 */
 			{
 			int suffix_base = entry_depth;
 			if (entry_depth > 0 &&
-			    ft_node_compressed(iter_path_node(iter)[entry_depth - 1])) {
-				unsigned int te;
-
-				for (te = 0; te < col_nr_e; te++) {
-					uint8_t data_te = ft_collapsed_load_data(col, te);
-
-					if (ft_collapsed_entry_dead_d(data_te, col_nr_e))
-						continue;
-					if (ft_collapsed_suffix_d(col, data_te, col_nr_e)[0] ==
-					    ordinal_key[entry_depth - 1]) {
-						suffix_base = entry_depth - 1;
-						break;
-					}
-				}
-			}
+			    ft_node_compressed(iter_path_node(iter)[entry_depth - 1]))
+				suffix_base = entry_depth - 1;
 
 			{
 			int current_entry = -1, best;
