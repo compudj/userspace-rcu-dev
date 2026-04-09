@@ -10303,6 +10303,36 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		ft_propagate_external_count(graft_snapshot, nr_graft_snapshot,
 				(long) src_count);
 
+		/*
+		 * Propagate density addition for the grafted subtree.
+		 * The source root's density contribution must be added
+		 * to each ancestor within the density window.
+		 */
+		if (!ft_node_external(src_ft->root)) {
+			struct cds_ft_metadata *graft_meta =
+				cds_ft_item_to_metadata(
+					ft_node_ptr(src_ft->root));
+			int si;
+
+			for (si = nr_graft_snapshot - 1; si >= 0; si--) {
+				struct cds_ft_metadata *am;
+				unsigned int distance;
+
+				if (!ft_node_ptr(graft_snapshot[si]))
+					continue;
+				if (graft_snapshot_depth[si] >= key_len)
+					continue;
+				distance = key_len - graft_snapshot_depth[si];
+				if (distance > FT_NODE_DENSITY_DEPTH)
+					break;
+				am = cds_ft_item_to_metadata(
+					ft_node_ptr(graft_snapshot[si]));
+				am->nr_nodes_at_depth[0] +=
+					ft_child_density_contribution(
+						graft_meta, distance);
+			}
+		}
+
 		/* Give source a fresh empty root. */
 		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
 	}
@@ -10461,6 +10491,55 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			ft_propagate_external_count(graft_snapshot,
 					nr_graft_snapshot,
 					(long) swap_count - (long) old_count);
+
+		/*
+		 * Propagate density delta for the swapped subtrees.
+		 * Subtract the old child's contribution and add the
+		 * new (swap) child's contribution at each ancestor
+		 * within the density window.
+		 */
+		{
+			struct cds_ft_metadata *old_meta = NULL, *new_meta = NULL;
+			int si;
+
+			if (!ft_node_external(old_child) && ft_node_ptr(old_child))
+				old_meta = cds_ft_item_to_metadata(
+						ft_node_ptr(old_child));
+			if (!swap_empty && !ft_node_external(old_swap_root))
+				new_meta = cds_ft_item_to_metadata(
+						ft_node_ptr(old_swap_root));
+
+			if (old_meta || new_meta) {
+				for (si = nr_graft_snapshot - 1; si >= 0; si--) {
+					struct cds_ft_metadata *am;
+					unsigned int distance;
+					unsigned long add = 0, sub = 0;
+
+					if (!ft_node_ptr(graft_snapshot[si]))
+						continue;
+					if (graft_snapshot_depth[si] >= key_len)
+						continue;
+					distance = key_len -
+						graft_snapshot_depth[si];
+					if (distance > FT_NODE_DENSITY_DEPTH)
+						break;
+					am = cds_ft_item_to_metadata(
+						ft_node_ptr(graft_snapshot[si]));
+					if (old_meta)
+						sub = ft_child_density_contribution(
+							old_meta, distance);
+					if (new_meta)
+						add = ft_child_density_contribution(
+							new_meta, distance);
+					if (add >= sub)
+						am->nr_nodes_at_depth[0] += add - sub;
+					else if (am->nr_nodes_at_depth[0] >= sub - add)
+						am->nr_nodes_at_depth[0] -= sub - add;
+					else
+						am->nr_nodes_at_depth[0] = 0;
+				}
+			}
+		}
 
 		/*
 		 * Set up swap_ft to hold old content from the graft
