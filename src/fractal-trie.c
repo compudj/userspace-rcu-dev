@@ -4487,7 +4487,7 @@ static int ft_collapsed_find_nearest(
 static
 enum ft_compressed_action ft_inequality_compressed(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag_p,
-		int *level_p, unsigned int key_depth,
+		ssize_t *level_p, ssize_t key_depth,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
 		const uint8_t **iter_key_p,
@@ -4638,7 +4638,7 @@ out_break:
 static
 enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag_p,
-		int *level_p, unsigned int key_depth,
+		ssize_t *level_p, ssize_t key_depth,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
 		const uint8_t **iter_key_p,
