@@ -8094,10 +8094,15 @@ int _cds_ft_insert(struct cds_ft *ft,
 							goto insert_done;
 						}
 					}
-					uatomic_store(&col->data[tombstone_reuse],
-						col->data[tombstone_reuse] &
-						~FT_COLLAPSED_TOMBSTONE,
-						CMM_RELAXED);
+					/*
+					 * Clear tombstone.  256B zones don't use
+					 * tombstones (the bit overlaps offsets).
+					 */
+					if ((col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) < FT_COLLAPSED_SCAN_256)
+						uatomic_store(&col->data[tombstone_reuse],
+							col->data[tombstone_reuse] &
+							~FT_COLLAPSED_TOMBSTONE,
+							CMM_RELAXED);
 					rcu_assign_pointer(
 						cptrs[tombstone_reuse], branch);
 					{
@@ -8847,9 +8852,16 @@ int ft_detach_node(struct cds_ft *ft,
 						topmost_external_nodes);
 				} else {
 					rcu_assign_pointer(cptrs[e], NULL);
-					uatomic_store(&col->data[e],
-						col->data[e] | FT_COLLAPSED_TOMBSTONE,
-						CMM_RELAXED);
+					/*
+					 * Set tombstone.  256B zones don't use
+					 * tombstones (the bit overlaps offsets).
+					 * For 256B, readers rely on the NULL
+					 * pointer check instead.
+					 */
+					if ((col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) < FT_COLLAPSED_SCAN_256)
+						uatomic_store(&col->data[e],
+							col->data[e] | FT_COLLAPSED_TOMBSTONE,
+							CMM_RELAXED);
 					col_meta->nr_child--;
 				}
 				break;
