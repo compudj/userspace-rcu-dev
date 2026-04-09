@@ -6336,6 +6336,12 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		 * Require at least one entry with slen >= SUFFIX_MIN.
 		 * Then try to upgrade to a wider scan zone within the
 		 * same allocation order if suffix quality allows.
+		 *
+		 * This node was freshly built by
+		 * ft_collapse_walk_subtree from an internal node's
+		 * live children — no tombstoned entries exist.
+		 * The reformat below therefore copies all entries
+		 * without tombstone filtering.
 		 */
 		{
 			unsigned int e, nr;
@@ -6348,6 +6354,10 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				uint8_t data_e = ft_collapsed_load_data(col, e);
 				unsigned int slen =
 					ft_collapsed_suffix_len(col, data_e, e, nr);
+
+				/* Fresh node: no tombstones expected. */
+				assert(!ft_collapsed_entry_dead(data_e, nr));
+
 				if (slen < min_slen_seen)
 					min_slen_seen = slen;
 				if (slen >= FT_COLLAPSE_SUFFIX_MIN)
