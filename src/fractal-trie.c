@@ -3767,7 +3767,9 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
 	unsigned int remaining = key_depth - i;
 	unsigned int e;
 
-	for (e = 0; e < ft_collapsed_nr_entries(cn); e++) {
+	unsigned int nr_e = ft_collapsed_nr_entries(cn);
+
+	for (e = 0; e < nr_e; e++) {
 		unsigned int slen, j;
 		uint8_t *suffix;
 		bool match;
@@ -4195,7 +4197,9 @@ static int ft_collapsed_find_nearest(
 	int best = -1;
 	unsigned int e;
 
-	for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+	unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+	for (e = 0; e < nr_e; e++) {
 		uint8_t *suffix;
 		unsigned int slen, mc;
 		int r;
@@ -4432,7 +4436,9 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 	unsigned int e;
 	int best_match = -1;	/* index of best directional match */
 
-	for (e = 0; e < ft_collapsed_nr_entries(cn); e++) {
+	unsigned int nr_e = ft_collapsed_nr_entries(cn);
+
+	for (e = 0; e < nr_e; e++) {
 		unsigned int slen, cmp;
 		uint8_t *suffix;
 		const uint8_t *cmp_key;
@@ -5007,7 +5013,9 @@ going_up:
 			if (entry_depth > 0 &&
 			    ft_node_compressed(iter_path_node(iter)[entry_depth - 1])) {
 				unsigned int te;
-				for (te = 0; te < ft_collapsed_nr_entries(col); te++) {
+				unsigned int nr_te = ft_collapsed_nr_entries(col);
+
+				for (te = 0; te < nr_te; te++) {
 					if (ft_collapsed_entry_dead(col, te))
 						continue;
 					if (ft_collapsed_suffix(col, te)[0] ==
@@ -5028,7 +5036,9 @@ going_up:
 			 * data is immutable and we need the position even
 			 * if a concurrent writer tombstoned the entry.
 			 */
-			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+			unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+			for (e = 0; e < nr_e; e++) {
 				uint8_t *suffix;
 				unsigned int slen, j2;
 				bool match2;
@@ -5343,7 +5353,9 @@ descend_children:
 			 * Find the min/max entry by suffix and
 			 * descend into it.
 			 */
-			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+			unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+			for (e = 0; e < nr_e; e++) {
 				if (ft_collapsed_entry_dead(col, e))
 					continue;
 				if (!ft_node_ptr(cptrs[e]))
@@ -5768,7 +5780,9 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 		struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) col);
 		unsigned int e;
 
-		for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+		unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+		for (e = 0; e < nr_e; e++) {
 			unsigned int slen;
 			struct cds_ft_inode_flag *child;
 
@@ -6424,7 +6438,9 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			unsigned int e;
 			bool found = false;
 
-			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+			unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+			for (e = 0; e < nr_e; e++) {
 				unsigned int slen, j;
 				uint8_t *suffix;
 
@@ -7885,7 +7901,9 @@ int _cds_ft_insert(struct cds_ft *ft,
 			int prefix_match_entry = -1;
 			unsigned int prefix_match_len = 0;
 
-			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+			unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+			for (e = 0; e < nr_e; e++) {
 				unsigned int slen, j;
 				uint8_t *suffix;
 
@@ -8349,7 +8367,9 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			unsigned int e;
 			bool found_entry = false;
 
-			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+			unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+			for (e = 0; e < nr_e; e++) {
 				unsigned int slen, j;
 				uint8_t *suffix;
 				bool match;
@@ -8752,7 +8772,9 @@ int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col);
 		unsigned int e;
 
-		for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+		unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+		for (e = 0; e < nr_e; e++) {
 			if (&cptrs[e] == detach_node_flag_ptr) {
 				if (topmost_external_nodes) {
 					rcu_assign_pointer(cptrs[e],
@@ -8975,7 +8997,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			unsigned int e;
 			bool found = false;
 
-			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+			unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+			for (e = 0; e < nr_e; e++) {
 				unsigned int slen, j;
 				uint8_t *suffix;
 				bool match;
@@ -9281,7 +9305,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			unsigned int e;
 			bool found = false;
 
-			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+			unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+			for (e = 0; e < nr_e; e++) {
 				unsigned int slen, j;
 				uint8_t *suffix;
 				bool match;
@@ -9696,7 +9722,9 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 			unsigned int e;
 			bool found = false;
 
-			for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+			unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+			for (e = 0; e < nr_e; e++) {
 				unsigned int slen, j;
 				uint8_t *suffix;
 				bool match;
@@ -10500,7 +10528,9 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				unsigned int e;
 				bool found = false;
 
-				for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+				unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+				for (e = 0; e < nr_e; e++) {
 					unsigned int slen, j;
 					uint8_t *suffix;
 					bool match;
@@ -10838,7 +10868,9 @@ enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft *ft,
 	unsigned int remaining = prefix_len - i;
 	unsigned int e;
 
-	for (e = 0; e < ft_collapsed_nr_entries(cn); e++) {
+	unsigned int nr_e = ft_collapsed_nr_entries(cn);
+
+	for (e = 0; e < nr_e; e++) {
 		unsigned int slen, j;
 		uint8_t *suffix;
 		bool match;
@@ -11598,7 +11630,9 @@ int ft_rebuild_path(struct cds_ft *ft,
 			unsigned int e;
 			bool found = false;
 
-			for (e = 0; e < ft_collapsed_nr_entries(cn); e++) {
+			unsigned int nr_e = ft_collapsed_nr_entries(cn);
+
+			for (e = 0; e < nr_e; e++) {
 				unsigned int slen, j;
 				uint8_t *suffix;
 				bool match;
@@ -11870,7 +11904,9 @@ skip_fwd_walk_up:
 				 * Find current entry, then count all
 				 * entries with larger suffixes.
 				 */
-				for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+				unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+				for (e = 0; e < nr_e; e++) {
 					unsigned int slen;
 					uint8_t *suffix;
 					unsigned long ck;
@@ -12267,7 +12303,9 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 				unsigned int e;
 
 				/* Count leftward entries first. */
-				for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+				unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+				for (e = 0; e < nr_e; e++) {
 					unsigned int slen;
 					uint8_t *suffix;
 					unsigned long ck;
@@ -12810,7 +12848,9 @@ static void show_collapsed_node(const struct cds_ft *ft, FILE *out,
 		fprintf(out, "Level %d, (meta)external node list ptr: %p\n",
 			level, external_nodes);
 	}
-	for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+	unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+	for (e = 0; e < nr_e; e++) {
 		unsigned int slen = ft_collapsed_suffix_len(col, e);
 		uint8_t *suffix = ft_collapsed_suffix(col, e);
 		struct cds_ft_inode_flag *child;
@@ -13039,7 +13079,9 @@ void calc_stats_collapsed(const struct cds_ft *ft,
 			stats->level[level].has_nodes = true;
 		}
 	}
-	for (e = 0; e < ft_collapsed_nr_entries(col); e++) {
+	unsigned int nr_e = ft_collapsed_nr_entries(col);
+
+	for (e = 0; e < nr_e; e++) {
 		unsigned int slen, j;
 		struct cds_ft_inode_flag *child;
 
