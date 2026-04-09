@@ -3662,7 +3662,6 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
 	int remaining_key = key_depth - 1 - i;
 	int cmp_len = cn->len < remaining_key ? cn->len : remaining_key;
-	int j;
 
 	/* Check external_nodes at the compressed node's depth. */
 	if (track) {
@@ -3983,7 +3982,7 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
 	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn, nr_e);
 
 	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-		unsigned int slen, j;
+		unsigned int slen;
 		uint8_t *suffix;
 		bool match;
 		uint8_t data_e = ft_collapsed_load_data(cn, e);
@@ -6176,21 +6175,6 @@ unsigned int ft_collapsed_min_slen(unsigned int scan_sel)
  *   1. density fits in max_entries
  *   2. all suffix lengths >= min_slen (checked post-walk)
  */
-struct ft_collapsed_config {
-	unsigned int order;
-	unsigned int scan_sel;
-};
-
-static const struct ft_collapsed_config ft_collapsed_configs[] = {
-	{ FT_COLLAPSED_ORDER_TINY,   FT_COLLAPSED_SCAN_32  },	/* 64B,  32B scan,  4 ptrs (1 CL) */
-	{ FT_COLLAPSED_ORDER_SMALL,  FT_COLLAPSED_SCAN_64  },	/* 128B, 64B scan,  8 ptrs */
-	{ FT_COLLAPSED_ORDER_MEDIUM, FT_COLLAPSED_SCAN_128 },	/* 256B, 128B scan, 16 ptrs */
-	{ FT_COLLAPSED_ORDER_MEDIUM, FT_COLLAPSED_SCAN_64  },	/* 256B, 64B scan,  24 ptrs */
-	{ FT_COLLAPSED_ORDER_XLARGE, FT_COLLAPSED_SCAN_256 },	/* 512B, 256B scan, 32 ptrs */
-};
-
-#define FT_COLLAPSED_NR_CONFIGS \
-	(sizeof(ft_collapsed_configs) / sizeof(ft_collapsed_configs[0]))
 
 /*
  * ft_collapse_walk_subtree: recursively enumerate paths from @walk,
@@ -6362,7 +6346,7 @@ emit_entry:
 static
 struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag *node_flag,
-		unsigned int node_depth)
+		unsigned int node_depth __attribute__((unused)))
 {
 	struct cds_ft_inode *node = ft_node_ptr(node_flag);
 	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
@@ -8681,7 +8665,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
 				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen, j;
+				unsigned int slen;
 				uint8_t *suffix;
 				bool match;
 
@@ -9319,7 +9303,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 
 			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
 				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen, j;
+				unsigned int slen;
 				uint8_t *suffix;
 				bool match;
 
@@ -9628,7 +9612,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 
 			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
 				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen, j;
+				unsigned int slen;
 				uint8_t *suffix;
 				bool match;
 
@@ -10046,7 +10030,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 
 			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
 				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen, j;
+				unsigned int slen;
 				uint8_t *suffix;
 				bool match;
 
@@ -10932,7 +10916,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 				for (e = 0; e < ft_collapsed_count(nr_e); e++) {
 					uint8_t data_e = ft_collapsed_load_data(col, e);
-					unsigned int slen, j;
+					unsigned int slen;
 					uint8_t *suffix;
 					bool match;
 
@@ -13276,7 +13260,7 @@ static void show_collapsed_node(const struct cds_ft *ft, FILE *out,
 	unsigned int e;
 
 	print_indent(out, level);
-	fprintf(out, "Level %d, COLLAPSED node: %p, nr_entries: %u, scan=%uB, order=%u, nr_keys: %lu, density: ",
+	fprintf(out, "Level %d, COLLAPSED node: %p, nr_entries: %u, scan=%uB, order=%zu, nr_keys: %lu, density: ",
 		level, node_flag, ft_collapsed_count(nr_e),
 		ft_collapsed_scan_zone_size(nr_e),
 		cds_ft_item_order(col),
