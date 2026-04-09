@@ -1235,7 +1235,7 @@ static inline
 uint8_t *ft_collapsed_suffix(struct cds_ft_collapsed_node *cn,
 		unsigned int i)
 {
-	return ((uint8_t *) cn) + (cn->data[i] & ft_collapsed_offset_mask(cn));
+	return ((uint8_t *) cn) + (uatomic_load(&cn->data[i], CMM_RELAXED) & ft_collapsed_offset_mask(cn));
 }
 
 static inline
@@ -1243,13 +1243,13 @@ unsigned int ft_collapsed_suffix_len(struct cds_ft_collapsed_node *cn,
 		unsigned int i)
 {
 	unsigned int mask = ft_collapsed_offset_mask(cn);
-	unsigned int start = cn->data[i] & mask;
+	unsigned int start = uatomic_load(&cn->data[i], CMM_RELAXED) & mask;
 	unsigned int end;
 
 	if (i == 0)
 		end = ft_collapsed_scan_zone_size(cn);
 	else
-		end = cn->data[i - 1] & mask;
+		end = uatomic_load(&cn->data[i - 1], CMM_RELAXED) & mask;
 	assert(end >= start);
 	return end - start;
 }
@@ -1268,7 +1268,7 @@ bool ft_collapsed_entry_dead(struct cds_ft_collapsed_node *cn,
 	/* 256B scan zone uses full 8-bit offsets — no tombstone bit. */
 	if ((cn->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) >= FT_COLLAPSED_SCAN_256)
 		return false;	/* TODO: need alternate tombstone scheme for 256B. */
-	return cn->data[i] & FT_COLLAPSED_TOMBSTONE;
+	return uatomic_load(&cn->data[i], CMM_RELAXED) & FT_COLLAPSED_TOMBSTONE;
 }
 
 /*
@@ -7944,7 +7944,11 @@ int _cds_ft_insert(struct cds_ft *ft,
 			if (prefix_match_entry >= 0)
 				goto collapsed_explode;
 			/*
-			 * No matching entry.  Check for space.
+			 * No matching entry.  First check for a
+			 * tombstoned entry with the same suffix that
+			 * we can reuse.  This avoids creating duplicate
+			 * suffixes which would confuse the going-up
+			 * inequality backtracking.
 			 */
 			{
 				unsigned int new_slen = remaining;
@@ -7954,6 +7958,28 @@ int _cds_ft_insert(struct cds_ft *ft,
 				uint8_t *new_suffix_pos;
 				struct cds_ft_inode_flag *branch;
 				unsigned int k;
+				int tombstone_reuse = -1;
+
+				for (k = 0; k < col_nr; k++) {
+					uint8_t *ts_suffix;
+					unsigned int ts_slen;
+
+					if (!ft_collapsed_entry_dead(col, k))
+						continue;
+					ts_slen = ft_collapsed_suffix_len(col, k);
+					if (ts_slen != new_slen)
+						continue;
+					ts_suffix = ft_collapsed_suffix(col, k);
+					if (ft_key_cmp_ordinals(iter_key, ts_suffix,
+							new_slen, new_slen,
+							false, NULL) == 0) {
+						tombstone_reuse = (int)k;
+						break;
+					}
+				}
+
+				if (tombstone_reuse >= 0)
+					goto collapsed_tombstone_reuse;
 
 				if (col_nr > 0)
 					cur_suffix_start = col->data[col_nr - 1] & ft_collapsed_offset_mask(col);
@@ -7966,6 +7992,44 @@ int _cds_ft_insert(struct cds_ft *ft,
 					col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT))
 					goto collapsed_explode;
 				goto collapsed_inplace_add;
+
+			collapsed_tombstone_reuse:
+				{
+					/*
+					 * Reuse tombstoned entry: clear the
+					 * tombstone and write the new child.
+					 * The suffix data is already correct.
+					 */
+					if (d.depth + new_slen == key_len) {
+						branch = (struct cds_ft_inode_flag *) node;
+					} else {
+						branch = ft_build_branch(ft, key,
+							d.depth + new_slen, key_len,
+							(struct cds_ft_inode_flag *) node, 1);
+						if (!branch) {
+							ret = -ENOMEM;
+							goto insert_done;
+						}
+					}
+					uatomic_store(&col->data[tombstone_reuse],
+						col->data[tombstone_reuse] &
+						~FT_COLLAPSED_TOMBSTONE,
+						CMM_RELAXED);
+					rcu_assign_pointer(
+						cptrs[tombstone_reuse], branch);
+					{
+						struct cds_ft_metadata *col_meta =
+							cds_ft_item_to_metadata(
+								(struct cds_ft_inode *) col);
+						col_meta->nr_child++;
+					}
+					ft_snapshot_push(snapshot, snapshot_depth,
+					nr_snapshot, d.nf, d.depth);
+					ft_propagate_external_count(
+						snapshot, nr_snapshot, 1);
+					ret = 0;
+					goto insert_done;
+				}
 
 			collapsed_explode:
 				{
@@ -8696,7 +8760,9 @@ int ft_detach_node(struct cds_ft *ft,
 						topmost_external_nodes);
 				} else {
 					rcu_assign_pointer(cptrs[e], NULL);
-					col->data[e] |= FT_COLLAPSED_TOMBSTONE;
+					uatomic_store(&col->data[e],
+						col->data[e] | FT_COLLAPSED_TOMBSTONE,
+						CMM_RELAXED);
 					col_meta->nr_child--;
 				}
 				break;
