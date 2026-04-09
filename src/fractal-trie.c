@@ -4615,9 +4615,6 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 		uint8_t *suffix = ft_collapsed_suffix(cn, best_match_data, nr_e);
 		unsigned int k;
 
-		if (caa_unlikely(ft_debug_counters()))
-			usleep(1);
-
 		for (k = 0; k < slen; k++) {
 			ordinal_key[level - 1 + k] = suffix[k];
 			iter_path_node(iter)[level + k] = node_flag;
@@ -5462,9 +5459,6 @@ descend_children:
 				unsigned int slen = ft_collapsed_suffix_len(col, best_d, best, col_nr_e);
 				uint8_t *suffix = ft_collapsed_suffix(col, best_d, col_nr_e);
 				unsigned int k;
-
-				if (caa_unlikely(ft_debug_counters()))
-					usleep(1);
 
 				for (k = 0; k < slen; k++) {
 					ordinal_key[level - 1 + k] = suffix[k];
