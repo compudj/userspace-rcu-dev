@@ -1922,6 +1922,50 @@ uint8_t ft_linear_encode_nr_child(unsigned int nr_child,
  * removing the dependency on the URCU_DEREFERENCE_USE_VOLATILE
  * escape hatch.
  */
+/*
+ * Selective prefetch: dereference a child pointer and prefetch the
+ * target node.  Use on read-side hot paths where the loaded pointer
+ * will be immediately traversed.
+ *
+ * Skip prefetch for pool nodes (type 4-5) and pigeon nodes (type 6):
+ * - Pool nodes encode subclass indices in pointer bits 4-8,
+ *   offsetting the raw pointer by up to 496 bytes from the actual
+ *   node — the prefetch would fetch a wrong cache line.
+ * - Pigeon nodes are 2KB direct-indexed arrays (256 pointers);
+ *   the dispatch byte selects a random position across 32 cache
+ *   lines, so prefetching the base is almost always useless.
+ *
+ * Linear nodes (type 0-3) are small and benefit from prefetch.
+ * Compressed/collapsed/external nodes (bit 0 clear) always benefit.
+ *
+ * The skip check tests: internal flag (bit 0) AND type high bit
+ * (bit 3) both set → type >= 4 (pool or pigeon).  One AND + CMP.
+ */
+#define FT_TYPE_HIGH_BIT	(1UL << (FT_TYPE_BITS - 1 + FT_INTERNAL_BITS))
+#define FT_PREFETCH_SKIP_MASK	(FT_TYPE_HIGH_BIT | FT_INTERNAL_MASK)
+
+static inline void ft_maybe_prefetch(const void *ptr)
+{
+	if (((unsigned long)ptr & FT_PREFETCH_SKIP_MASK) != FT_PREFETCH_SKIP_MASK)
+		__builtin_prefetch(ptr);
+}
+
+#define ft_dereference_prefetch(p)		\
+	({							\
+		__typeof__(p) __ft_tmp = rcu_dereference(p);	\
+		ft_maybe_prefetch(__ft_tmp);			\
+		__ft_tmp;					\
+	})
+
+#define ft_dereference_acquire_prefetch(p)	\
+	({							\
+		__typeof__(p) __ft_tmp =			\
+			(__typeof__(p)) uatomic_load(&(p),	\
+						     CMM_ACQUIRE); \
+		ft_maybe_prefetch(__ft_tmp);			\
+		__ft_tmp;					\
+	})
+
 #define ft_dereference_acquire(p)	\
 	(__typeof__(p)) uatomic_load(&(p), CMM_ACQUIRE)
 
@@ -3722,7 +3766,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft_inode_flag **node_f
 				ft_compressed_node_flag(cn);
 	}
 	i += cn->len;
-	node_flag = ft_dereference_acquire(cn->child);
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
 	if (!ft_node_ptr(node_flag)) {
 		*status_ret = CDS_FT_STATUS_NOT_FOUND;
 		return FT_COMPRESSED_END;
@@ -3860,7 +3904,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_fl
 					ft_collapsed_node_flag(cn);
 		}
 		i += slen;
-		node_flag = ft_dereference_acquire(ptrs[e]);
+		node_flag = ft_dereference_acquire_prefetch(ptrs[e]);
 		if (!ft_node_ptr(node_flag)) {
 			*status_ret = CDS_FT_STATUS_NOT_FOUND;
 			return FT_COMPRESSED_END;
@@ -3996,7 +4040,7 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_
 
 		*key_p = key + slen;
 		*i_p = i + slen - 1;
-		*node_flag_p = ft_dereference_acquire(ptrs[e]);
+		*node_flag_p = ft_dereference_acquire_prefetch(ptrs[e]);
 		if (node_flag_ptr_p)
 			*node_flag_ptr_p = &ptrs[e];
 		if (!ft_node_ptr(ptrs[e])) {
@@ -4039,7 +4083,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		goto end;
 	}
 	key_depth = key_len + 1;
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft_dereference_prefetch(ft->root);
 
 	if (iter) {
 		iter_debug_path_snapshot(iter);
@@ -4566,7 +4610,7 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **no
 			iter_path_node(iter)[level + j] = node_flag;
 		}
 		level += cn->len - 1;
-		node_flag = ft_dereference_acquire(cn->child);
+		node_flag = ft_dereference_acquire_prefetch(cn->child);
 		if (!ft_node_ptr(node_flag))
 			goto out_break;
 		iter_path_node(iter)[level + 1] = node_flag;
@@ -4587,7 +4631,7 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **no
 				iter_path_node(iter)[level + k] = node_flag;
 			}
 			level += cn->len - 1;
-			node_flag = ft_dereference_acquire(cn->child);
+			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			if (!ft_node_ptr(node_flag))
 				goto out_break;
 			iter_path_node(iter)[level + 1] = node_flag;
@@ -4604,7 +4648,7 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **no
 
 	/* Full match: advance past compressed path. */
 	level += cn->len - 1; /* -1: for loop increments */
-	node_flag = ft_dereference_acquire(cn->child);
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
 	if (!ft_node_ptr(node_flag))
 		goto out_break;
 	iter_path_node(iter)[level + 1] = node_flag;
@@ -4722,7 +4766,7 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **nod
 				 */
 				if (slen == 1)
 					iter_path_node(iter)[level - 1] = node_flag;
-				node_flag = ft_dereference_acquire(ptrs[e]);
+				node_flag = ft_dereference_acquire_prefetch(ptrs[e]);
 				if (!ft_node_ptr(node_flag)) {
 					*node_flag_p = node_flag;
 					*level_p = level;
@@ -4802,7 +4846,7 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **nod
 		assert(level < (int) key_depth);
 		if (slen == 1)
 			iter_path_node(iter)[level - 1] = node_flag;
-		node_flag = ft_dereference_acquire(ptrs[best_match]);
+		node_flag = ft_dereference_acquire_prefetch(ptrs[best_match]);
 		if (!ft_node_ptr(node_flag)) {
 			*node_flag_p = node_flag;
 			*level_p = level;
@@ -4891,7 +4935,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	iter_key = input_key;
 
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft_dereference_prefetch(ft->root);
 	iter_path_node(iter)[0] = node_flag;
 
 	/*
@@ -4963,7 +5007,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		 */
 		if (ft_node_compressed(node_flag) ||
 		    ft_node_collapsed(node_flag)) {
-			node_flag = rcu_dereference(ft->root);
+			node_flag = ft_dereference_prefetch(ft->root);
 			iter_key = input_key;
 			goto slow_path;
 		}
@@ -5358,7 +5402,7 @@ going_up:
 				}
 				level = suffix_base + slen;
 				assert(level < key_depth);
-				node_flag = ft_dereference_acquire(
+				node_flag = ft_dereference_acquire_prefetch(
 					cptrs[best]);
 				iter_path_node(iter)[level] = node_flag;
 				break;
@@ -5557,7 +5601,7 @@ descend_children:
 			ft_fill_compressed_path(cn, ordinal_key, level - 1,
 				iter_path_node(iter), level, node_flag);
 			level += cn->len - 1;
-			node_flag = ft_dereference_acquire(cn->child);
+			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			if (!ft_node_ptr(node_flag))
 				break;
 			iter_path_node(iter)[level] = node_flag;
@@ -5646,7 +5690,7 @@ descend_children:
 				}
 				level += slen - 1;
 				assert(level < key_depth);
-				node_flag = ft_dereference_acquire(cptrs[best]);
+				node_flag = ft_dereference_acquire_prefetch(cptrs[best]);
 				if (!ft_node_ptr(node_flag))
 					break;
 				iter_path_node(iter)[level + 1] = node_flag;
@@ -6676,7 +6720,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 	const uint8_t *ik = key;
 	unsigned int depth = 0;
 
-	node_flag = rcu_dereference(ft->root);
+	node_flag = ft_dereference_prefetch(ft->root);
 	parent_slot = &ft->root;
 
 	while (depth < key_len + 1) {
@@ -6700,7 +6744,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			if (j < cmp)
 				break;
 			parent_slot = &cn->child;
-			node_flag = ft_dereference_acquire(cn->child);
+			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			depth += cn->len;
 			ik += cn->len;
 			continue;
@@ -6734,7 +6778,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				}
 				if (j == slen) {
 					parent_slot = &cptrs[e];
-					node_flag = ft_dereference_acquire(
+					node_flag = ft_dereference_acquire_prefetch(
 						cptrs[e]);
 					depth += slen;
 					ik += slen;
@@ -6780,7 +6824,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			if (!slot || !ft_node_ptr(*slot))
 				break;
 			parent_slot = slot;
-			node_flag = ft_dereference_acquire(*slot);
+			node_flag = ft_dereference_acquire_prefetch(*slot);
 			depth++;
 		}
 	}
@@ -11121,7 +11165,7 @@ enum ft_compressed_action ft_count_prefix_compressed(
 		return FT_COMPRESSED_END;
 	}
 	*i_p = i + cn->len - 1;
-	*node_flag_p = ft_dereference_acquire(cn->child);
+	*node_flag_p = ft_dereference_acquire_prefetch(cn->child);
 	return FT_COMPRESSED_CONTINUE;
 }
 
@@ -11192,7 +11236,7 @@ enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **n
 			continue;
 		/* Full suffix match, continue descent into child. */
 		*i_p = i + slen - 1;
-		*node_flag_p = ft_dereference_acquire(ptrs[e]);
+		*node_flag_p = ft_dereference_acquire_prefetch(ptrs[e]);
 		return FT_COMPRESSED_CONTINUE;
 	}
 	*count_ret = 0;
@@ -11214,7 +11258,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 		return 0;
 	ft_key_to_ordinals(ordinal_buf, _prefix, prefix_len, &ft->group->key_map);
 
-	node_flag = ft_dereference_acquire(ft->root);
+	node_flag = ft_dereference_acquire_prefetch(ft->root);
 
 	for (i = 0; i < prefix_len; i++) {
 		uint8_t kv;
@@ -11310,7 +11354,7 @@ enum ft_compressed_action ft_lookup_nth_compressed(
 	ft_fill_compressed_path(cn, ordinal_key, level - 1,
 		iter_path_node(iter), level, node_flag);
 	level += cn->len - 1;
-	node_flag = ft_dereference_acquire(cn->child);
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
 	if (!ft_node_ptr(node_flag)) {
 		*node_flag_p = node_flag;
 		*level_p = level;
@@ -11413,7 +11457,7 @@ enum ft_compressed_action ft_lookup_nth_collapsed(
 						ft_collapsed_node_flag(cn);
 				}
 			}
-			node_flag = ft_dereference_acquire(ptrs[best]);
+			node_flag = ft_dereference_acquire_prefetch(ptrs[best]);
 			if (!ft_node_ptr(node_flag) || ft_node_external(node_flag)) {
 				level += slen;
 				if (ft_node_ptr(node_flag))
@@ -11462,7 +11506,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 
-	node_flag = ft_dereference_acquire(ft->root);
+	node_flag = ft_dereference_acquire_prefetch(ft->root);
 	iter_path_node(iter)[0] = node_flag;
 
 	ft_delay_reader();
@@ -11610,7 +11654,7 @@ enum ft_compressed_action ft_lookup_nth_last_compressed(
 				iter_path_node(iter), level,
 				node_flag);
 			level += cn->len - 1;
-			node_flag = ft_dereference_acquire(cn->child);
+			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			if (!ft_node_ptr(node_flag)) {
 				*node_flag_p = node_flag;
 				*level_p = level;
@@ -11706,7 +11750,7 @@ enum ft_compressed_action ft_lookup_nth_last_collapsed(
 						ft_collapsed_node_flag(cn);
 				}
 			}
-			node_flag = ft_dereference_acquire(ptrs[best]);
+			node_flag = ft_dereference_acquire_prefetch(ptrs[best]);
 			if (!ft_node_ptr(node_flag) || ft_node_external(node_flag)) {
 				level += slen;
 				if (ft_node_ptr(node_flag))
@@ -11749,7 +11793,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 
-	node_flag = ft_dereference_acquire(ft->root);
+	node_flag = ft_dereference_acquire_prefetch(ft->root);
 	iter_path_node(iter)[0] = node_flag;
 
 	for (level = 1; ; level++) {
@@ -11882,7 +11926,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 	struct cds_ft_inode_flag *node_flag;
 	unsigned int i;
 
-	node_flag = ft_dereference_acquire(ft->root);
+	node_flag = ft_dereference_acquire_prefetch(ft->root);
 	iter_path_node(iter)[0] = node_flag;
 
 	for (i = 0; i < key_len; i++) {
@@ -11907,7 +11951,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 					node_flag;
 			}
 			i += cn->len - 1;
-			node_flag = ft_dereference_acquire(cn->child);
+			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			if (!ft_node_ptr(node_flag))
 				return -1;
 			iter_path_node(iter)[i + 1] = node_flag;
@@ -11950,7 +11994,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 				if (!match)
 					continue;
 				i += slen - 1;
-				node_flag = ft_dereference_acquire(ptrs[e]);
+				node_flag = ft_dereference_acquire_prefetch(ptrs[e]);
 				if (!ft_node_ptr(node_flag))
 					return -1;
 				iter_path_node(iter)[i + 1] = node_flag;
@@ -12000,7 +12044,7 @@ enum ft_compressed_action ft_skip_forward_compressed(
 			iter_path_node(iter)[level + j] = node_flag;
 	}
 	level += cn->len;
-	node_flag = ft_dereference_acquire(cn->child);
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
 	if (!ft_node_ptr(node_flag)) {
 		*node_flag_p = node_flag;
 		*level_p = level;
@@ -12477,7 +12521,7 @@ enum ft_compressed_action ft_skip_reverse_compressed(
 						= node_flag;
 			}
 			level += cn->len;
-			node_flag = ft_dereference_acquire(cn->child);
+			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			if (!ft_node_ptr(node_flag)) {
 				*node_flag_p = node_flag;
 				*level_p = level;
