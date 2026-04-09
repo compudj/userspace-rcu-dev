@@ -1321,10 +1321,18 @@ unsigned int ft_collapsed_suffix_len(struct cds_ft_collapsed_node *cn,
 }
 
 static inline
-struct cds_ft_inode_flag **ft_collapsed_ptrs(struct cds_ft_collapsed_node *cn)
+struct cds_ft_inode_flag **ft_collapsed_ptrs_nr(struct cds_ft_collapsed_node *cn,
+		unsigned int nr_entries)
 {
 	return (struct cds_ft_inode_flag **)
-		(((uint8_t *) cn) + ft_collapsed_scan_zone_size(cn));
+		(((uint8_t *) cn) + ft_collapsed_scan_zone_size_nr(nr_entries));
+}
+
+static inline
+struct cds_ft_inode_flag **ft_collapsed_ptrs(struct cds_ft_collapsed_node *cn)
+{
+	return ft_collapsed_ptrs_nr(cn,
+		uatomic_load(&cn->nr_entries, CMM_RELAXED));
 }
 
 static inline
@@ -3826,13 +3834,12 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn);
 	const uint8_t *key = *key_p;
 	unsigned int i = *i_p;
 	unsigned int remaining = key_depth - i;
 	unsigned int e;
-
 	unsigned int nr_e = ft_collapsed_nr_entries(cn);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs_nr(cn, nr_e);
 
 	for (e = 0; e < nr_e; e++) {
 		unsigned int slen, j;
@@ -4501,14 +4508,13 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn);
 	int level = *level_p;
 	unsigned int remaining = key_depth - level;
 	unsigned int e;
 	int best_match = -1;	/* index of best directional match */
 	uint8_t best_match_data = 0;
-
 	unsigned int nr_e = ft_collapsed_nr_entries(cn);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs_nr(cn, nr_e);
 
 	for (e = 0; e < nr_e; e++) {
 		unsigned int slen, cmp;
@@ -5074,8 +5080,9 @@ going_up:
 			struct cds_ft_collapsed_node *col =
 				ft_collapsed_node_ptr(
 					iter_path_node(iter)[level - 1]);
+			unsigned int col_nr_e = ft_collapsed_nr_entries(col);
 			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col);
+				ft_collapsed_ptrs_nr(col, col_nr_e);
 			int entry_depth = level - 1;
 			unsigned int e;
 
@@ -5096,14 +5103,13 @@ going_up:
 			if (entry_depth > 0 &&
 			    ft_node_compressed(iter_path_node(iter)[entry_depth - 1])) {
 				unsigned int te;
-				unsigned int nr_te = ft_collapsed_nr_entries(col);
 
-				for (te = 0; te < nr_te; te++) {
+				for (te = 0; te < col_nr_e; te++) {
 					uint8_t data_te = ft_collapsed_load_data(col, te);
 
-					if (ft_collapsed_entry_dead_d(data_te, nr_te))
+					if (ft_collapsed_entry_dead_d(data_te, col_nr_e))
 						continue;
-					if (ft_collapsed_suffix_d(col, data_te, nr_te)[0] ==
+					if (ft_collapsed_suffix_d(col, data_te, col_nr_e)[0] ==
 					    ordinal_key[entry_depth - 1]) {
 						suffix_base = entry_depth - 1;
 						break;
@@ -5121,16 +5127,14 @@ going_up:
 			 * data is immutable and we need the position even
 			 * if a concurrent writer tombstoned the entry.
 			 */
-			unsigned int nr_e = ft_collapsed_nr_entries(col);
-
-			for (e = 0; e < nr_e; e++) {
+			for (e = 0; e < col_nr_e; e++) {
 				uint8_t *suffix;
 				unsigned int slen, j2;
 				bool match2;
 				uint8_t data_e = ft_collapsed_load_data(col, e);
 
-				suffix = ft_collapsed_suffix_d(col, data_e, nr_e);
-				slen = ft_collapsed_suffix_len_d(col, data_e, e, nr_e);
+				suffix = ft_collapsed_suffix_d(col, data_e, col_nr_e);
+				slen = ft_collapsed_suffix_len_d(col, data_e, e, col_nr_e);
 				match2 = true;
 				for (j2 = 0; j2 < slen; j2++) {
 					if (suffix[j2] != ordinal_key[suffix_base + j2]) {
@@ -5190,9 +5194,9 @@ going_up:
 			if (best >= 0) {
 				uint8_t best_d = ft_collapsed_load_data(col, (unsigned)best);
 				unsigned int slen = ft_collapsed_suffix_len_d(
-					col, best_d, (unsigned)best, nr_e);
+					col, best_d, (unsigned)best, col_nr_e);
 				uint8_t *suffix = ft_collapsed_suffix_d(
-					col, best_d, nr_e);
+					col, best_d, col_nr_e);
 				unsigned int k;
 
 				for (k = 0; k < slen; k++) {
@@ -5414,8 +5418,9 @@ descend_children:
 		if (ft_node_collapsed(node_flag)) {
 			struct cds_ft_collapsed_node *col =
 				ft_collapsed_node_ptr(node_flag);
+			unsigned int col_nr_e = ft_collapsed_nr_entries(col);
 			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col);
+				ft_collapsed_ptrs_nr(col, col_nr_e);
 			unsigned int best = UINT_MAX, e;
 
 			/*
@@ -5440,13 +5445,12 @@ descend_children:
 			 * Find the min/max entry by suffix and
 			 * descend into it.
 			 */
-			unsigned int nr_e = ft_collapsed_nr_entries(col);
 			uint8_t best_d = 0;
 
-			for (e = 0; e < nr_e; e++) {
+			for (e = 0; e < col_nr_e; e++) {
 				uint8_t data_e = ft_collapsed_load_data(col, e);
 
-				if (ft_collapsed_entry_dead_d(data_e, nr_e))
+				if (ft_collapsed_entry_dead_d(data_e, col_nr_e))
 					continue;
 				if (!ft_node_ptr(cptrs[e]))
 					continue;
@@ -5456,10 +5460,10 @@ descend_children:
 					continue;
 				}
 				{
-					uint8_t *sa = ft_collapsed_suffix_d(col, best_d, nr_e);
-					unsigned int la = ft_collapsed_suffix_len_d(col, best_d, best, nr_e);
-					uint8_t *sb = ft_collapsed_suffix_d(col, data_e, nr_e);
-					unsigned int lb = ft_collapsed_suffix_len_d(col, data_e, e, nr_e);
+					uint8_t *sa = ft_collapsed_suffix_d(col, best_d, col_nr_e);
+					unsigned int la = ft_collapsed_suffix_len_d(col, best_d, best, col_nr_e);
+					uint8_t *sb = ft_collapsed_suffix_d(col, data_e, col_nr_e);
+					unsigned int lb = ft_collapsed_suffix_len_d(col, data_e, e, col_nr_e);
 					unsigned int mc = la < lb ? la : lb;
 					int r = memcmp(sb, sa, mc);
 
@@ -5479,8 +5483,8 @@ descend_children:
 			if (best == UINT_MAX)
 				break;
 			{
-				unsigned int slen = ft_collapsed_suffix_len_d(col, best_d, best, nr_e);
-				uint8_t *suffix = ft_collapsed_suffix_d(col, best_d, nr_e);
+				unsigned int slen = ft_collapsed_suffix_len_d(col, best_d, best, col_nr_e);
+				uint8_t *suffix = ft_collapsed_suffix_d(col, best_d, col_nr_e);
 				unsigned int k;
 
 				if (caa_unlikely(ft_debug_counters()))
