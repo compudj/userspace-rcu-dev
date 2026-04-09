@@ -796,7 +796,11 @@ static inline void ft_key_to_ordinals(uint8_t *dst, const uint8_t *key,
 	size_t i;
 
 	if (caa_likely(km->identity)) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#pragma GCC diagnostic ignored "-Wrestrict"
 		memcpy(dst, key, len);
+#pragma GCC diagnostic pop
 		return;
 	}
 	for (i = 0; i < len; i++)
@@ -1501,8 +1505,7 @@ enum ft_compressed_action {
  * position.
  */
 static inline
-unsigned int ft_match_compressed_key(struct cds_ft *ft,
-		const uint8_t *key,
+unsigned int ft_match_compressed_key(const uint8_t *key,
 		const struct cds_ft_compressed_node *cn,
 		unsigned int cmp)
 {
@@ -1975,7 +1978,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
 			goto found;
 	}
 #endif
-	for (unsigned int w = 1; w * sizeof(unsigned long) < ((raw >> FT_LINEAR_PTR_OFFSET_SHIFT) << __builtin_ctz(sizeof(void *))); w++) {
+	for (unsigned int w = 1; w * sizeof(unsigned long) < (unsigned long)((raw >> FT_LINEAR_PTR_OFFSET_SHIFT) << __builtin_ctz(sizeof(void *))); w++) {
 		xor_res = data_words[w] ^ mask;
 		has_zero = (xor_res - L_ONES_A) & ~xor_res & L_HIGHS_A;
 		if (has_zero) {
@@ -2050,7 +2053,7 @@ found:
  * (FT_LINEAR, max_linear_child < threshold).
  */
 static inline_lookup
-struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
+struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type __attribute__((unused)) *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
@@ -2088,7 +2091,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
  * nodes (FT_LINEAR_WIDE, max_linear_child >= threshold).
  */
 static inline_lookup
-struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type *type,
+struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type __attribute__((unused)) *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
@@ -2328,7 +2331,7 @@ end:
 }
 
 static inline_lookup
-struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type *type,
+struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type __attribute__((unused)) *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
@@ -2543,8 +2546,7 @@ struct cds_ft_inode_flag *ft_node_get_leftright(struct cds_ft_inode_flag *node_f
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_minmax(struct cds_ft_inode_flag *node_flag,
 		uint8_t *result_key,
-		enum ft_direction dir,
-		bool is_root)
+		enum ft_direction dir)
 {
 	struct cds_ft_inode_flag *ret;
 
@@ -2721,14 +2723,12 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		struct cds_ft_inode_flag *newptr)
 {
-	uint8_t nr_child;
 	uint8_t *nr_child_ptr;
 
 	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 
 	nr_child_ptr = &node->data[0];
-	nr_child = *nr_child_ptr & FT_LINEAR_NR_CHILD_MASK;
-	assert(nr_child <= type->max_linear_child);
+	assert((*nr_child_ptr & FT_LINEAR_NR_CHILD_MASK) <= type->max_linear_child);
 
 	if (ft_type_is_linear(type->type_class) && !newptr) {
 		assert(!metadata->fallback_removal_count);
@@ -3247,7 +3247,7 @@ int ft_node_recompact(enum ft_recompact mode,
 	struct cds_ft_inode *new_node;
 	struct cds_ft_metadata *new_metadata;
 	const struct cds_ft_type *new_type;
-	struct cds_ft_inode_flag *new_node_flag;
+	struct cds_ft_inode_flag *new_node_flag = NULL;
 	int ret;
 	int fallback = 0;
 
@@ -3646,8 +3646,7 @@ enum ft_prefix_tracking {
  * the function's end label (with *status_ret and *found_ret set).
  */
 static inline_lookup
-enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
-		struct cds_ft_inode_flag **node_flag_p,
+enum ft_compressed_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag_p,
 		const uint8_t **key_p, unsigned int *i_p,
 		unsigned int key_depth,
 		struct cds_ft_iter *iter, size_t *iter_path_len_p,
@@ -3787,14 +3786,13 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft *ft,
  * position rather than as a child of ft_node_get_nth.
  */
 static inline_lookup
-enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
-		struct cds_ft_inode_flag **node_flag_p,
+enum ft_compressed_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_p,
 		const uint8_t **key_p, unsigned int *i_p,
 		unsigned int key_depth,
 		struct cds_ft_iter *iter, size_t *iter_path_len_p,
 		bool track, bool track_longest,
 		size_t *match_len_p, struct cds_ft_node **match_node_p,
-		struct cds_ft_node **found_ret,
+		struct cds_ft_node __attribute__((unused)) **found_ret,
 		enum cds_ft_status *status_ret)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
@@ -3922,7 +3920,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft *ft,
  * On full match with non-external child, returns FT_COMPRESSED_CONTINUE.
  */
 static inline
-enum ft_compressed_action ft_traverse_compressed(struct cds_ft *ft,
+enum ft_compressed_action ft_traverse_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		struct cds_ft_inode_flag ***node_flag_ptr_p,
 		const uint8_t **key_p, unsigned int *i_p,
@@ -3939,7 +3937,7 @@ enum ft_compressed_action ft_traverse_compressed(struct cds_ft *ft,
 		*not_found = true;
 		return FT_COMPRESSED_END;
 	}
-	j = ft_match_compressed_key(ft, key, cn, cn->len);
+	j = ft_match_compressed_key(key, cn, cn->len);
 	if (j < cn->len) {
 		*not_found = true;
 		return FT_COMPRESSED_END;
@@ -3966,8 +3964,7 @@ enum ft_compressed_action ft_traverse_compressed(struct cds_ft *ft,
  * returns the loop action.
  */
 static
-enum ft_compressed_action ft_traverse_collapsed(struct cds_ft *ft,
-		struct cds_ft_inode_flag **node_flag_p,
+enum ft_compressed_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_flag_p,
 		struct cds_ft_inode_flag ***node_flag_ptr_p,
 		const uint8_t **key_p, unsigned int *i_p,
 		unsigned int key_depth, bool *not_found)
@@ -4112,7 +4109,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				enum ft_compressed_action act;
 
 				i--;
-				act = ft_lookup_compressed(ft, &node_flag, &key, &i,
+				act = ft_lookup_compressed(&node_flag, &key, &i,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
 					&match_len, &match_node, &found, &status);
@@ -4126,7 +4123,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				enum ft_compressed_action act;
 
 				i--;
-				act = ft_lookup_collapsed(ft, &node_flag, &key, &i,
+				act = ft_lookup_collapsed(&node_flag, &key, &i,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
 					&match_len, &match_node, &found, &status);
@@ -4484,8 +4481,7 @@ static int ft_collapsed_find_nearest(
  * subtree (DESCEND_CHILDREN).
  */
 static
-enum ft_compressed_action ft_inequality_compressed(struct cds_ft *ft,
-		struct cds_ft_inode_flag **node_flag_p,
+enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **node_flag_p,
 		ssize_t *level_p, ssize_t key_depth,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
@@ -4545,7 +4541,7 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft *ft,
 	}
 	/* Advance iter_key for LIMIT_NONE. */
 	if (limit == FT_LOOKUP_LIMIT_NONE)
-		*iter_key_p += (cmp_result ? mpos + 1 : cmp);
+		*iter_key_p += (cmp_result ? mpos + 1 : (unsigned int)cmp);
 
 	if (cmp_result) {
 		/*
@@ -4635,8 +4631,7 @@ out_break:
  *   no match in direction → GOING_UP
  */
 static
-enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
-		struct cds_ft_inode_flag **node_flag_p,
+enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_flag_p,
 		ssize_t *level_p, ssize_t key_depth,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
@@ -4828,7 +4823,7 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft *ft,
 }
 #endif /* FEATURE_FT_COLLAPSE */
 
-enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
+static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit)
@@ -4841,7 +4836,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	uint8_t input_key_buf[FT_MAX_KEY_LEN];
 	const uint8_t *input_key;
 	const uint8_t *iter_key;
-	size_t key_len;
+	size_t key_len = 0;
 	bool going_up = false, skip_eq_external_nodes;
 	/*
 	 * Cache nr_entries from the downward collapsed walk so the
@@ -4994,7 +4989,7 @@ slow_path:
 		if (ft_node_compressed(node_flag)) {
 			enum ft_compressed_action act;
 
-			act = ft_inequality_compressed(ft, &node_flag,
+			act = ft_inequality_compressed(&node_flag,
 				&level, key_depth, mode, limit,
 				&iter_key, input_key, iter,
 				ordinal_key, &skip_eq_external_nodes);
@@ -5011,7 +5006,7 @@ slow_path:
 
 			cached_col_nr_e = ft_collapsed_nr_entries(
 				ft_collapsed_node_ptr(node_flag));
-			act = ft_inequality_collapsed(ft, &node_flag,
+			act = ft_inequality_collapsed(&node_flag,
 				&level, key_depth, mode, limit,
 				&iter_key, input_key, iter,
 				ordinal_key, &skip_eq_external_nodes,
@@ -5325,7 +5320,7 @@ going_up:
 
 				if (ft_node_ptr(child_flag) &&
 				    ft_node_internal(child_flag)) {
-					uint8_t sib_key;
+					uint8_t sib_key = 0;
 
 					node_flag = ft_node_get_leftright(
 						child_flag,
@@ -5662,7 +5657,7 @@ descend_children:
 			continue;
 		}
 		skip_eq_external_nodes = false;
-		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir, level == 1);
+		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir);
 		/*
 		 * If minmax returns NULL, it was an empty root. We found nothing.
 		 */
@@ -6247,11 +6242,11 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			 * to preserve them — can't skip past.
 			 */
 			if (wm->nr_child == 1 && !wm->external_nodes) {
-				uint8_t wk;
+				uint8_t wk = 0;
 				struct cds_ft_inode_flag *wc;
 
 				wc = ft_node_get_minmax(walk, &wk,
-					FT_LEFTMOST, false);
+					FT_LEFTMOST);
 				if (!ft_node_ptr(wc))
 					return -1;
 				suffix_buf[slen++] = wk;
@@ -6272,7 +6267,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			if (wm->external_nodes)
 				goto emit_entry;
 			{
-				uint8_t ck;
+				uint8_t ck = 0;
 				int pv = -1;
 				struct cds_ft_inode_flag *c;
 
@@ -6355,7 +6350,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag **col_ptrs;
 	unsigned int nr_child = metadata->nr_child;
 	unsigned int max_entries;
-	uint8_t child_key;
+	uint8_t child_key = 0;
 	int pivot;
 	struct cds_ft_inode_flag *child;
 	uint8_t suffix_buf[FT_COLLAPSED_SCAN_ZONE_MAX];
@@ -7741,7 +7736,7 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 	unsigned int cmp = cn->len < remaining ? cn->len : remaining;
 	unsigned int j;
 
-	j = ft_match_compressed_key(ft, *iter_key_p, cn, cmp);
+	j = ft_match_compressed_key(*iter_key_p, cn, cmp);
 	if (j == cmp && cn->len <= remaining) {
 		/* Full match: traverse through if child is internal,
 		 * compressed, or collapsed. */
@@ -7880,12 +7875,12 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 		 */
 		{
 			long net = 0;	/* junction replaces compressed: net 0 */
-			struct cds_ft_compressed_node *cn =
+			struct cds_ft_compressed_node *cn2 =
 				ft_compressed_node_ptr(d->nf);
 
 			if (top_flag != jct_flag)
 				net++;	/* prefix added */
-			if (cn->len > remaining + 1)
+			if (cn2->len > remaining + 1)
 				net++;	/* suffix added */
 			if (net != 0)
 				ft_propagate_node_density(snapshot,
@@ -8247,6 +8242,16 @@ int _cds_ft_insert(struct cds_ft *ft,
 			 * converts to an internal node, then the normal
 			 * insert logic handles the remaining key.
 			 */
+			{
+				unsigned int new_slen;
+				unsigned int col_nr;
+				unsigned int header_end;
+				unsigned int cur_suffix_start;
+				uint8_t *new_suffix_pos;
+				struct cds_ft_inode_flag *branch;
+				unsigned int k;
+				int tombstone_reuse;
+
 			if (prefix_match_entry >= 0)
 				goto collapsed_explode;
 			/*
@@ -8256,15 +8261,10 @@ int _cds_ft_insert(struct cds_ft *ft,
 			 * suffixes which would confuse the going-up
 			 * inequality backtracking.
 			 */
-			{
-				unsigned int new_slen = remaining;
-				unsigned int col_nr = ft_collapsed_nr_entries(col);
-				unsigned int header_end = 1 + ft_collapsed_count(col_nr) + 1;
-				unsigned int cur_suffix_start;
-				uint8_t *new_suffix_pos;
-				struct cds_ft_inode_flag *branch;
-				unsigned int k;
-				int tombstone_reuse = -1;
+				new_slen = remaining;
+				col_nr = ft_collapsed_nr_entries(col);
+				header_end = 1 + ft_collapsed_count(col_nr) + 1;
+				tombstone_reuse = -1;
 
 				for (k = 0; k < ft_collapsed_count(col_nr); k++) {
 					uint8_t data_k = ft_collapsed_load_data(col, k);
@@ -8862,7 +8862,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			bool nf = false;
 			enum ft_compressed_action act;
 
-			act = ft_traverse_compressed(ft, &node_flag,
+			act = ft_traverse_compressed(&node_flag,
 				&node_flag_ptr, &iter_key, &i,
 				key_depth, &nf);
 			if (nf)
@@ -8875,7 +8875,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			bool nf = false;
 			enum ft_compressed_action act;
 
-			act = ft_traverse_collapsed(ft, &node_flag,
+			act = ft_traverse_collapsed(&node_flag,
 				&node_flag_ptr, &iter_key, &i,
 				key_depth, &nf);
 			if (nf)
@@ -9268,7 +9268,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				cn->len : remaining;
 			unsigned int j;
 
-			j = ft_match_compressed_key(ft, iter_key, cn, cmp);
+			j = ft_match_compressed_key(iter_key, cn, cmp);
 			if (j < cmp || cn->len > remaining ||
 			    !ft_node_ptr(cn->child))
 				return CDS_FT_STATUS_NOT_FOUND;
@@ -9305,7 +9305,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				uint8_t data_e = ft_collapsed_load_data(col, e);
 				unsigned int slen;
 				uint8_t *suffix;
-				bool match;
+				bool match2;
 
 				if (ft_collapsed_entry_dead(data_e, nr_e))
 					continue;
@@ -9313,8 +9313,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				if (slen > remaining)
 					continue;
 				suffix = ft_collapsed_suffix(col, data_e, nr_e);
-				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, false, NULL) == 0);
-				if (!match)
+				match2 = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, false, NULL) == 0);
+				if (!match2)
 					continue;
 				if (!ft_node_ptr(cptrs[e]))
 					return CDS_FT_STATUS_NOT_FOUND;
@@ -9579,7 +9579,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				cn->len : remaining;
 			unsigned int j;
 
-			j = ft_match_compressed_key(ft, iter_key, cn, cmp);
+			j = ft_match_compressed_key(iter_key, cn, cmp);
 			if (j < cmp || cn->len > remaining ||
 			    !ft_node_ptr(cn->child)) {
 				*result_node = NULL;
@@ -9985,7 +9985,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 			int cmp = cn->len < remaining ? cn->len : remaining;
 			int j;
 
-			j = ft_match_compressed_key(ft, ik, cn, cmp);
+			j = ft_match_compressed_key(ik, cn, cmp);
 			if (j == cmp && cn->len <= remaining) {
 				ft_snapshot_push(snapshot, snapshot_depth,
 				*nr_snapshot, d->nf, d->depth);
@@ -11202,7 +11202,7 @@ bool cds_ft_empty(struct cds_ft *ft)
  * compressed node (count written to *count_ret).
  */
 static
-enum ft_compressed_action ft_count_prefix_compressed(struct cds_ft *ft,
+enum ft_compressed_action ft_count_prefix_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		unsigned int *i_p, const uint8_t *prefix,
 		size_t prefix_len, unsigned long *count_ret)
@@ -11215,7 +11215,7 @@ enum ft_compressed_action ft_count_prefix_compressed(struct cds_ft *ft,
 	unsigned int cmp = cn->len < remaining ? cn->len : remaining;
 	unsigned int j;
 
-	j = ft_match_compressed_key(ft, &prefix[i], cn, cmp);
+	j = ft_match_compressed_key(&prefix[i], cn, cmp);
 	if (j < cmp) {
 		*count_ret = 0;
 		return FT_COMPRESSED_END;
@@ -11241,8 +11241,7 @@ enum ft_compressed_action ft_count_prefix_compressed(struct cds_ft *ft,
  * If no match, return 0.
  */
 static
-enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft *ft,
-		struct cds_ft_inode_flag **node_flag_p,
+enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **node_flag_p,
 		unsigned int *i_p, const uint8_t *prefix,
 		size_t prefix_len, unsigned long *count_ret)
 {
@@ -11334,7 +11333,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 			enum ft_compressed_action act;
 			unsigned long count;
 
-			act = ft_count_prefix_compressed(ft,
+			act = ft_count_prefix_compressed(
 				&node_flag, &i, prefix,
 				prefix_len, &count);
 			if (act == FT_COMPRESSED_END)
@@ -11345,7 +11344,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 			enum ft_compressed_action act;
 			unsigned long count;
 
-			act = ft_count_prefix_collapsed(ft,
+			act = ft_count_prefix_collapsed(
 				&node_flag, &i, prefix,
 				prefix_len, &count);
 			if (act == FT_COMPRESSED_END)
@@ -11580,7 +11579,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		struct cds_ft_metadata *metadata;
 		struct cds_ft_inode_flag *child;
 		struct cds_ft_node *ext;
-		uint8_t child_key;
+		uint8_t child_key = 0;
 		int pivot;
 
 		if (ft_node_external(node_flag))
@@ -11865,7 +11864,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		struct cds_ft_metadata *metadata;
 		struct cds_ft_inode_flag *child;
 		struct cds_ft_node *ext;
-		uint8_t child_key;
+		uint8_t child_key = 0;
 		int pivot;
 
 		if (ft_node_external(node_flag))
@@ -12142,7 +12141,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 {
 	uint8_t ordinal_key[FT_MAX_KEY_LEN];
 	unsigned long remaining;
-	int depth, level;
+	int depth, level = 0;
 	bool at_external_nodes;
 	/*
 	 * Cache nr_entries from the downward collapsed walk so the
@@ -12248,7 +12247,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 				}
 			} else {
 				struct cds_ft_inode_flag *child;
-				uint8_t child_key;
+				uint8_t child_key = 0;
 				int pivot = -1;
 
 				child = ft_node_get_direction(parent, pivot,
@@ -12285,7 +12284,7 @@ skip_fwd_walk_up:
 	for (level--; level >= 0; level--) {
 		struct cds_ft_inode_flag *ancestor = iter_path_node(iter)[level];
 		struct cds_ft_inode_flag *child;
-		uint8_t child_key;
+		uint8_t child_key = 0;
 		int pivot;
 
 		if (ft_node_external(ancestor))
@@ -12445,7 +12444,7 @@ descend_forward:
 		for (;;) {
 			struct cds_ft_metadata *metadata;
 			struct cds_ft_inode_flag *child;
-			uint8_t child_key;
+			uint8_t child_key = 0;
 			int pivot;
 
 			if (ft_node_external(node_flag))
@@ -12665,7 +12664,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		struct cds_ft_inode_flag *ancestor = iter_path_node(iter)[level];
 		struct cds_ft_inode_flag *child;
 		struct cds_ft_metadata *ameta;
-		uint8_t child_key;
+		uint8_t child_key = 0;
 		unsigned long left_keys = 0;
 		int pivot;
 
@@ -12896,7 +12895,7 @@ descend_reverse:
 		for (;;) {
 			struct cds_ft_metadata *metadata;
 			struct cds_ft_inode_flag *child;
-			uint8_t child_key;
+			uint8_t child_key = 0;
 			int pivot;
 
 			if (ft_node_external(node_flag))
