@@ -7063,139 +7063,6 @@ error:
 	return -ENOMEM;
 }
 
-#ifdef FEATURE_FT_COLLAPSE
-/*
- * ft_split_compressed_to_collapsed: replace a compressed node with a
- * collapsed node containing 2 entries — the old compressed path and
- * the new diverging key.
- *
- * If diverge_pos > 0, a prefix compressed node is created for the
- * shared portion, with the collapsed node as its child.
- *
- * Returns 0 on success, -ENOMEM on allocation failure, or 1 if the
- * suffixes don't fit in the scan zone (caller should fall back to
- * ft_split_compressed_insert).
- */
-static
-int ft_split_compressed_to_collapsed(struct cds_ft *ft,
-		struct cds_ft_inode_flag **parent_slot,
-		struct cds_ft_inode_flag *compressed_flag,
-		const uint8_t *iter_key,
-		unsigned int remaining_key,
-		unsigned int diverge_pos,
-		struct cds_ft_node *child_node)
-{
-	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
-	struct cds_ft_metadata *cn_meta =
-		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
-	struct cds_ft_collapsed_node *col;
-	struct cds_ft_metadata *col_meta;
-	struct cds_ft_inode_flag **col_ptrs;
-	unsigned int old_suffix_len = cn->len - diverge_pos;
-	unsigned int new_suffix_len = remaining_key - diverge_pos;
-	unsigned int total_scan;
-	struct cds_ft_inode_flag *col_flag, *top_flag;
-	unsigned long old_child_nr_keys;
-	uint8_t *suffix_pos;
-	unsigned int k;
-
-	/* Check that both suffixes + header + 2 offsets fit in scan zone. */
-	total_scan = 1 + 2 + old_suffix_len + new_suffix_len;
-	if (total_scan > FT_COLLAPSED_SCAN_ZONE_SIZE)
-		return 1;	/* Fall back to split. */
-
-	dbg_printf("COLLAPSED: diverge=%u old_slen=%u new_slen=%u\n",
-		diverge_pos, old_suffix_len, new_suffix_len);
-	col = alloc_collapsed_node(ft, FT_COLLAPSED_ORDER_MEDIUM, FT_COLLAPSED_SCAN_64, &col_meta);
-	if (!col)
-		return -ENOMEM;
-
-	col_ptrs = ft_collapsed_ptrs(col,
-		uatomic_load(&col->nr_entries, CMM_RELAXED));
-
-	/* Compute old child's nr_keys. */
-	if (!ft_node_external(cn->child)) {
-		struct cds_ft_metadata *cm =
-			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
-		old_child_nr_keys = cm->nr_keys;
-	} else if (ft_node_ptr(cn->child)) {
-		old_child_nr_keys = 1;
-	} else {
-		old_child_nr_keys = 0;
-	}
-
-	/*
-	 * Entry 0 (first added, rightmost in scan zone):
-	 * old compressed suffix from diverge_pos onward.
-	 */
-	suffix_pos = ((uint8_t *) col) + ft_collapsed_scan_zone_size(uatomic_load(&col->nr_entries, CMM_RELAXED)) - old_suffix_len;
-	memcpy(suffix_pos, &cn->key_bytes[diverge_pos], old_suffix_len);
-	col->data[0] = (uint8_t)(suffix_pos - (uint8_t *) col);
-	col_ptrs[0] = cn->child;
-
-	/*
-	 * Entry 1 (second added, to the left of entry 0):
-	 * new key suffix from diverge_pos onward.
-	 */
-	suffix_pos -= new_suffix_len;
-	for (k = 0; k < new_suffix_len; k++)
-		suffix_pos[k] = iter_key[diverge_pos + k];
-	col->data[1] = (uint8_t)(suffix_pos - (uint8_t *) col);
-	col_ptrs[1] = (struct cds_ft_inode_flag *) child_node;
-
-	ft_collapsed_set_nr_entries(col, 2);
-	col_meta->nr_child = 2;
-	uatomic_store(&col_meta->nr_keys, old_child_nr_keys + 1, CMM_RELAXED);
-
-	col_flag = ft_collapsed_node_flag(col);
-
-	/* Build prefix if diverge_pos > 0. */
-	if (diverge_pos >= 2) {
-		struct cds_ft_compressed_node *pfx;
-		struct cds_ft_metadata *pfx_meta;
-
-		pfx = alloc_compressed_node(ft, diverge_pos, &pfx_meta);
-		if (!pfx) {
-			free_collapsed_node(ft, col);
-			return -ENOMEM;
-		}
-		pfx->child = col_flag;
-		pfx->len = diverge_pos;
-		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
-		pfx_meta->nr_child = 1;
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys + 1, CMM_RELAXED);
-		if (cn_meta->external_nodes)
-			pfx_meta->external_nodes = cn_meta->external_nodes;
-		top_flag = ft_compressed_node_flag(pfx);
-	} else if (diverge_pos == 1) {
-		struct cds_ft_inode_flag *dest = NULL;
-		struct cds_ft_metadata *pfx_meta;
-		int ret;
-
-		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				col_flag, NULL, NULL);
-		if (ret) {
-			free_collapsed_node(ft, col);
-			return -ENOMEM;
-		}
-		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys + 1, CMM_RELAXED);
-		if (cn_meta->external_nodes)
-			pfx_meta->external_nodes = cn_meta->external_nodes;
-		top_flag = dest;
-	} else {
-		/* diverge_pos == 0: collapsed IS the top. */
-		uatomic_store(&col_meta->nr_keys, cn_meta->nr_keys + 1, CMM_RELAXED);
-		if (cn_meta->external_nodes)
-			col_meta->external_nodes = cn_meta->external_nodes;
-		top_flag = col_flag;
-	}
-
-	rcu_assign_pointer(*parent_slot, top_flag);
-	free_compressed_node(ft, cn);
-	return 0;
-}
-#endif /* FEATURE_FT_COLLAPSE */
 
 /*
  * Split a compressed node when the insert key is shorter than the
@@ -7707,6 +7574,156 @@ struct cds_ft_inode_flag *ft_detach_descent_step(
  */
 
 /*
+ * ft_insert_compressed_past_child: key continues past a compressed
+ * node's external child.  Build a branch below the child and propagate
+ * density / external count through the snapshot.
+ *
+ * Returns 0 on success, -ENOMEM on allocation failure.
+ */
+static
+int ft_insert_compressed_past_child(struct cds_ft *ft,
+		struct ft_descent *d,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft_compressed_node *cn,
+		struct cds_ft_node *node,
+		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int *nr_snapshot_p)
+{
+	struct cds_ft_inode_flag *branch;
+	struct cds_ft_metadata *br_meta;
+
+	branch = ft_build_branch(ft, key,
+		d->depth + cn->len, key_len,
+		(struct cds_ft_inode_flag *) node, 1);
+	if (!branch)
+		return -ENOMEM;
+	br_meta = cds_ft_item_to_metadata(ft_node_ptr(branch));
+	br_meta->external_nodes = (struct cds_ft_node *) cn->child;
+	uatomic_store(&br_meta->nr_keys,
+		br_meta->nr_keys + 1, CMM_RELAXED);
+	rcu_assign_pointer(cn->child, branch);
+	ft_snapshot_push(snapshot, snapshot_depth,
+		*nr_snapshot_p, d->nf, d->depth);
+	ft_snapshot_push(snapshot, snapshot_depth,
+		*nr_snapshot_p, branch, d->depth + cn->len);
+	/* Propagate density for the new branch node. */
+	ft_propagate_node_density(snapshot,
+		snapshot_depth, *nr_snapshot_p,
+		d->depth + cn->len, 1);
+	ft_propagate_external_count(snapshot,
+		*nr_snapshot_p, 1);
+	return 0;
+}
+
+/*
+ * ft_insert_compressed_diverge: key diverges from the compressed path
+ * at position @j.  Split the compressed node and insert the new key.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+static
+int ft_insert_compressed_diverge(struct cds_ft *ft,
+		struct ft_descent *d,
+		const uint8_t *iter_key,
+		unsigned int remaining, unsigned int j,
+		struct cds_ft_node *node,
+		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int *nr_snapshot_p)
+{
+	int dret;
+
+	dret = ft_split_compressed_insert(ft,
+		d->nfp, d->nf, iter_key, remaining,
+		j, node, d->depth,
+		snapshot, snapshot_depth, nr_snapshot_p);
+	if (dret)
+		return dret;
+	ft_propagate_external_count(snapshot,
+		*nr_snapshot_p, 1);
+	return 0;
+}
+
+/*
+ * ft_insert_compressed_key_shorter: key ends before the compressed
+ * path.  Split the compressed node into prefix -> junction -> suffix,
+ * then attach the new external node at the junction.
+ *
+ * Returns 0 on success, -EEXIST if duplicate detected (with
+ * *unique_node_ret set), or negative errno on failure.
+ */
+static
+int ft_insert_compressed_key_shorter(struct cds_ft *ft,
+		struct ft_descent *d,
+		unsigned int remaining,
+		struct cds_ft_node *node,
+		struct cds_ft_node **unique_node_ret,
+		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int *nr_snapshot_p)
+{
+	struct cds_ft_inode_flag *top_flag, *jct_flag;
+	int sret;
+
+	sret = ft_split_compressed_key_shorter(ft,
+		d->nf, remaining, &top_flag, &jct_flag);
+	if (sret)
+		return sret;
+	rcu_assign_pointer(*d->nfp, top_flag);
+	{
+		struct cds_ft_metadata *jct_meta =
+			cds_ft_item_to_metadata(
+				ft_node_ptr(jct_flag));
+		if (unique_node_ret &&
+		    jct_meta->external_nodes) {
+			*unique_node_ret =
+				jct_meta->external_nodes;
+			return -EEXIST;
+		}
+		node->next = NULL;
+		rcu_assign_pointer(
+			jct_meta->external_nodes, node);
+	}
+	if (top_flag != jct_flag)
+		ft_snapshot_push(snapshot, snapshot_depth,
+			*nr_snapshot_p, top_flag, d->depth);
+	ft_snapshot_push(snapshot, snapshot_depth,
+		*nr_snapshot_p, jct_flag,
+		d->depth + remaining);
+	/*
+	 * Density: net = new nodes - old compressed.
+	 * Count: junction(1) + prefix(if exists) + suffix(if len>1)
+	 * minus old compressed(1).
+	 */
+	{
+		long net = 0;	/* junction replaces compressed: net 0 */
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(d->nf);
+
+		if (top_flag != jct_flag)
+			net++;	/* prefix added */
+		if (cn->len > remaining + 1)
+			net++;	/* suffix added */
+		if (net != 0)
+			ft_propagate_node_density(snapshot,
+				snapshot_depth, *nr_snapshot_p,
+				d->depth, net);
+	}
+	ft_propagate_external_count(snapshot,
+		*nr_snapshot_p, 1);
+	{
+		struct cds_ft_metadata *jct_meta =
+			cds_ft_item_to_metadata(
+				ft_node_ptr(jct_flag));
+		uatomic_store(&jct_meta->nr_keys,
+			jct_meta->nr_keys + 1, CMM_RELAXED);
+	}
+	free_compressed_node(ft, ft_compressed_node_ptr(d->nf));
+	return 0;
+}
+
+/*
  * Handle a compressed node during insert descent.
  *
  * Full match + internal/compressed child: traverse through.
@@ -7758,148 +7775,23 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 			return FT_COMPRESSED_BREAK;
 		}
 		/* Key continues past external child: build branch. */
-		{
-			struct cds_ft_inode_flag *branch;
-			struct cds_ft_metadata *br_meta;
-
-			branch = ft_build_branch(ft, key,
-				d->depth + cn->len, key_len,
-				(struct cds_ft_inode_flag *) node, 1);
-			if (!branch) {
-				*ret_p = -ENOMEM;
-				return FT_COMPRESSED_END;
-			}
-			br_meta = cds_ft_item_to_metadata(
-				ft_node_ptr(branch));
-			br_meta->external_nodes =
-				(struct cds_ft_node *) cn->child;
-			uatomic_store(&br_meta->nr_keys,
-				br_meta->nr_keys + 1, CMM_RELAXED);
-			rcu_assign_pointer(cn->child, branch);
-			ft_snapshot_push(snapshot, snapshot_depth,
-				*nr_snapshot_p, d->nf, d->depth);
-			ft_snapshot_push(snapshot, snapshot_depth,
-				*nr_snapshot_p, branch, d->depth + cn->len);
-			/* Propagate density for the new branch node. */
-			ft_propagate_node_density(snapshot,
-				snapshot_depth, *nr_snapshot_p,
-				d->depth + cn->len, 1);
-			ft_propagate_external_count(snapshot,
-				*nr_snapshot_p, 1);
-			*ret_p = 0;
-			return FT_COMPRESSED_END;
-		}
+		*ret_p = ft_insert_compressed_past_child(ft, d, key,
+			key_len, cn, node, snapshot, snapshot_depth,
+			nr_snapshot_p);
+		return FT_COMPRESSED_END;
 	}
-	/* Key diverges: split (try collapsed if suffixes are long enough). */
 	if (j < cmp) {
-		int dret;
-		unsigned int old_slen = cn->len - j;
-		unsigned int new_slen = remaining - j;
-		unsigned int min_slen = old_slen < new_slen ? old_slen : new_slen;
-
-#ifdef FEATURE_FT_COLLAPSE
-		/*
-		 * Eagerly create collapsed node when both suffixes
-		 * are long enough.  This creates JudyL-like terminal
-		 * nodes during initial build rather than waiting for
-		 * the collapse-on-remove path.  Prefix conflicts
-		 * during subsequent inserts are handled by the
-		 * explode path.
-		 */
-		if (0 && min_slen >= FT_COLLAPSE_SUFFIX_MIN) {
-			dret = ft_split_compressed_to_collapsed(ft,
-				d->nfp, d->nf, *iter_key_p, remaining,
-				j, node);
-			if (dret == 0)
-				goto split_done;
-			/* dret == 1: didn't fit scan zone. dret < 0: alloc fail. */
-			if (dret < 0 && dret != 1) {
-				*ret_p = dret;
-				return FT_COMPRESSED_END;
-			}
-		}
-#endif
-		dret = ft_split_compressed_insert(ft,
-			d->nfp, d->nf, *iter_key_p, remaining,
-			j, node, d->depth,
+		/* Key diverges: split at position j. */
+		*ret_p = ft_insert_compressed_diverge(ft, d,
+			*iter_key_p, remaining, j, node,
 			snapshot, snapshot_depth, nr_snapshot_p);
-		if (dret) {
-			*ret_p = dret;
-			return FT_COMPRESSED_END;
-		}
-#ifdef FEATURE_FT_COLLAPSE
-	split_done:
-#endif
-		ft_propagate_external_count(snapshot,
-			*nr_snapshot_p, 1);
-		*ret_p = 0;
 		return FT_COMPRESSED_END;
 	}
-	/* Key shorter: split into prefix → junction → suffix. */
-	{
-		struct cds_ft_inode_flag *top_flag, *jct_flag;
-		int sret;
-
-		sret = ft_split_compressed_key_shorter(ft,
-			d->nf, remaining, &top_flag, &jct_flag);
-		if (sret) {
-			*ret_p = sret;
-			return FT_COMPRESSED_END;
-		}
-		rcu_assign_pointer(*d->nfp, top_flag);
-		{
-			struct cds_ft_metadata *jct_meta =
-				cds_ft_item_to_metadata(
-					ft_node_ptr(jct_flag));
-			if (unique_node_ret &&
-			    jct_meta->external_nodes) {
-				*unique_node_ret =
-					jct_meta->external_nodes;
-				*ret_p = -EEXIST;
-				return FT_COMPRESSED_END;
-			}
-			node->next = NULL;
-			rcu_assign_pointer(
-				jct_meta->external_nodes, node);
-		}
-		if (top_flag != jct_flag)
-			ft_snapshot_push(snapshot, snapshot_depth,
-				*nr_snapshot_p, top_flag, d->depth);
-		ft_snapshot_push(snapshot, snapshot_depth,
-			*nr_snapshot_p, jct_flag,
-			d->depth + remaining);
-		/*
-		 * Density: net = new nodes - old compressed.
-		 * Count: junction(1) + prefix(if exists) + suffix(if len>1)
-		 * minus old compressed(1).
-		 */
-		{
-			long net = 0;	/* junction replaces compressed: net 0 */
-			struct cds_ft_compressed_node *cn2 =
-				ft_compressed_node_ptr(d->nf);
-
-			if (top_flag != jct_flag)
-				net++;	/* prefix added */
-			if (cn2->len > remaining + 1)
-				net++;	/* suffix added */
-			if (net != 0)
-				ft_propagate_node_density(snapshot,
-					snapshot_depth, *nr_snapshot_p,
-					d->depth, net);
-		}
-		ft_propagate_external_count(snapshot,
-			*nr_snapshot_p, 1);
-		{
-			struct cds_ft_metadata *jct_meta =
-				cds_ft_item_to_metadata(
-					ft_node_ptr(jct_flag));
-			uatomic_store(&jct_meta->nr_keys,
-				jct_meta->nr_keys + 1, CMM_RELAXED);
-		}
-		free_compressed_node(ft, ft_compressed_node_ptr(d->nf));
-		*ret_p = 0;
-		return FT_COMPRESSED_END;
-	}
+	/* Key shorter: split into prefix -> junction -> suffix. */
+	*ret_p = ft_insert_compressed_key_shorter(ft, d, remaining,
+		node, unique_node_ret, snapshot, snapshot_depth,
+		nr_snapshot_p);
+	return FT_COMPRESSED_END;
 }
 
 /*
