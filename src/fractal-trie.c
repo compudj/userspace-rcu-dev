@@ -6430,9 +6430,33 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		 * subtree is mostly direct paths (compressed or
 		 * single-hop) that are cheaper uncollapsed.
 		 */
-		/* density * 2 < nr_child * 3 is equivalent to density < nr_child * 1.5 */
-		if (density * 2 < (unsigned long) nr_child * 3)
-			return NULL;
+		/*
+		 * Weighted density: a traversable node at distance k
+		 * saves k pointer chases when absorbed into a collapsed
+		 * suffix.  Weight each depth level accordingly:
+		 *
+		 *   nodes_at_dist_1 = d[0] - sum(d[1..5])
+		 *   weighted = nodes_at_dist_1 * 1
+		 *            + d[1]*2 + d[2]*3 + d[3]*4 + d[4]*5 + d[5]*6
+		 *
+		 * Simplifies to: d[0] + d[1] + 2*d[2] + ... + 5*d[5]
+		 *
+		 * Compare to nr_child (total children including external
+		 * leaves).  External children contribute 0 to weighted
+		 * density but 1 to nr_child, so they act as a scan-cost
+		 * penalty.  Collapse when the weighted hop savings from
+		 * traversable children outweigh the scan cost of all
+		 * entries.
+		 */
+		{
+			unsigned long weighted = density;
+			unsigned int j;
+
+			for (j = 1; j < FT_NODE_DENSITY_DEPTH; j++)
+				weighted += j * metadata->nr_nodes_at_depth[j];
+			if (weighted < (unsigned long) nr_child)
+				return NULL;
+		}
 		unsigned int order;
 		int try_depth;
 		bool found = false;
