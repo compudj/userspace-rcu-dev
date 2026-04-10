@@ -6042,34 +6042,34 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
  * alone, but all patterns use ft_dereference_acquire uniformly
  * for simplicity.
  */
+/*
+ * ft_propagate_external_count_parent: propagate nr_keys delta
+ * from @start up to the root via metadata->parent pointers.
+ * instead of a pre-built snapshot array.
+ *
+ * @start: deepest internal/compressed/collapsed node on the path
+ *         (the node where the external was attached, or the
+ *         deepest ancestor with metadata).  Must not be an
+ *         external node or NULL.
+ * @delta: +1 for insert, -1 for remove.
+ *
+ * Same ordering guarantees as the snapshot-based variant:
+ * bottom-up CMM_RELEASE stores preserve the undercount invariant.
+ */
 static
-void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
-		int nr_snapshot, long delta)
+void ft_propagate_external_count_parent(struct cds_ft_inode_flag *start,
+		long delta)
 {
-	int i;
+	struct cds_ft_inode_flag *cur = start;
 
-	/*
-	 * Delay injection: widen the window between the publish
-	 * (rcu_assign_pointer) that preceded this call and the
-	 * nr_keys propagation below.
-	 */
 	ft_delay_writer();
 
-	/*
-	 * Propagate bottom-up: deepest ancestor first, root last.
-	 * snapshot[0] is the shallowest (root), snapshot[nr_snapshot-1]
-	 * is the deepest.  By incrementing bottom-up with CMM_RELEASE,
-	 * a reader that acquires a parent's nr_keys and sees the new
-	 * value is guaranteed (via release/acquire ordering) to also
-	 * see the child's incremented value.  This preserves the
-	 * undercount invariant: at every node, nr_keys <= sum of
-	 * children's nr_keys + external_nodes.
-	 */
-	for (i = nr_snapshot - 1; i >= 0; i--) {
+	while (cur) {
 		struct cds_ft_metadata *m =
-			cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
+			cds_ft_item_to_metadata(ft_node_ptr(cur));
 		uatomic_store(&m->nr_keys, m->nr_keys + delta, CMM_RELEASE);
 		ft_delay_writer();
+		cur = m->parent;
 	}
 }
 
@@ -7803,8 +7803,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	ft_propagate_node_density(snapshot,
 		snapshot_depth, *nr_snapshot_p,
 		d->depth + cn->len, 1);
-	ft_propagate_external_count(snapshot,
-		*nr_snapshot_p, 1);
+	ft_propagate_external_count_parent(branch, 1);
 	return 0;
 }
 
@@ -7833,8 +7832,7 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 	if (dret)
 		return dret;
 	ft_set_parent(*d->nfp, d->pnf);
-	ft_propagate_external_count(snapshot,
-		*nr_snapshot_p, 1);
+	ft_propagate_external_count_parent(d->pnf, 1);
 	return 0;
 }
 
@@ -7904,8 +7902,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 				snapshot_depth, *nr_snapshot_p,
 				d->depth, net);
 	}
-	ft_propagate_external_count(snapshot,
-		*nr_snapshot_p, 1);
+	ft_propagate_external_count_parent(jct_flag, 1);
 	{
 		struct cds_ft_metadata *jct_meta =
 			cds_ft_item_to_metadata(
@@ -8423,10 +8420,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 								(struct cds_ft_inode *) col);
 						col_meta->nr_child++;
 					}
-					ft_snapshot_push(snapshot, snapshot_depth,
-					nr_snapshot, d.nf, d.depth);
-					ft_propagate_external_count(
-						snapshot, nr_snapshot, 1);
+					ft_propagate_external_count_parent(d.nf, 1);
 					ret = 0;
 					goto insert_done;
 				}
@@ -8515,9 +8509,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				}
 
 				/* Propagate. */
-				ft_snapshot_push(snapshot, snapshot_depth,
-				nr_snapshot, d.nf, d.depth);
-				ft_propagate_external_count(snapshot, nr_snapshot, 1);
+				ft_propagate_external_count_parent(d.nf, 1);
 				ret = 0;
 				goto insert_done;
 			}
@@ -8540,12 +8532,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL,
 					snapshot, snapshot_depth, nr_snapshot);
-			if (ret == 0) {
-				/* Refresh snapshot: parent may have been recompacted. */
-				if (nr_snapshot > 0)
-					snapshot[nr_snapshot - 1] = *d.pnfp;
-				ft_propagate_external_count(snapshot, nr_snapshot, 1);
-			}
+			if (ret == 0)
+				ft_propagate_external_count_parent(*d.pnfp, 1);
 
 		} else if (!ft_node_external(d.nf)) {
 			struct cds_ft_node *external_nodes;
@@ -8576,10 +8564,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 				ret = 0;
-				/* Include current internal node in propagation. */
-				ft_snapshot_push(snapshot, snapshot_depth,
-				nr_snapshot, d.nf, d.depth);
-				ft_propagate_external_count(snapshot, nr_snapshot, 1);
+				ft_propagate_external_count_parent(d.nf, 1);
 			}
 		} else {
 			struct cds_ft_node *iter_node, *last_node = NULL;
@@ -8620,12 +8605,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf),
 				snapshot, snapshot_depth, nr_snapshot);
-		if (ret == 0) {
-			/* Refresh snapshot: parent may have been recompacted. */
-			if (nr_snapshot > 0)
-				snapshot[nr_snapshot - 1] = *d.pnfp;
-			ft_propagate_external_count(snapshot, nr_snapshot, 1);
-		}
+		if (ret == 0)
+			ft_propagate_external_count_parent(*d.pnfp, 1);
 	}
 
 insert_done:
@@ -8803,11 +8784,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL,
 					snapshot, snapshot_depth, nr_snapshot);
-			if (ret == 0) {
-				if (nr_snapshot > 0)
-					snapshot[nr_snapshot - 1] = *d.pnfp;
-				ft_propagate_external_count(snapshot, nr_snapshot, 1);
-			}
+			if (ret == 0)
+				ft_propagate_external_count_parent(*d.pnfp, 1);
 		} else if (!ft_node_external(d.nf)) {
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
@@ -8825,9 +8803,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				/* No external nodes yet. New key. */
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
-				ft_snapshot_push(snapshot, snapshot_depth,
-				nr_snapshot, d.nf, d.depth);
-				ft_propagate_external_count(snapshot, nr_snapshot, 1);
+				ft_propagate_external_count_parent(d.nf, 1);
 			}
 			ret = 0;
 		} else {
@@ -8851,11 +8827,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf),
 				snapshot, snapshot_depth, nr_snapshot);
-		if (ret == 0) {
-			if (nr_snapshot > 0)
-				snapshot[nr_snapshot - 1] = *d.pnfp;
-			ft_propagate_external_count(snapshot, nr_snapshot, 1);
-		}
+		if (ret == 0)
+			ft_propagate_external_count_parent(*d.pnfp, 1);
 	}
 
 insert_replace_done:
@@ -9498,9 +9471,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 */
 			if (prev_node_ptr == (struct cds_ft_node **) &metadata->external_nodes
 			    && !match->next) {
-				ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
-				ft_propagate_external_count(snapshot, nr_snapshot, -1);
+				ft_propagate_external_count_parent(dd.d.nf, -1);
 			}
 			ft_unchain_node(prev_node_ptr, match);
 			ret = 0;
@@ -9544,7 +9515,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * Propagate -1 before detach, which may free
 			 * internal nodes in the snapshot.
 			 */
-			ft_propagate_external_count(snapshot, nr_snapshot, -1);
+			ft_propagate_external_count_parent(
+				snapshot[nr_snapshot - 1], -1);
 			ft_snapshot_push(snapshot, snapshot_depth,
 			nr_snapshot, dd.d.nf, dd.d.depth);
 			ret = ft_detach_node(ft, snapshot,
@@ -9554,7 +9526,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					dd.det_pfp);
 			if (ret) {
 				/* Undo propagation on failure. */
-				ft_propagate_external_count(snapshot, nr_snapshot - 1, 1);
+				ft_propagate_external_count_parent(
+					snapshot[nr_snapshot - 2], 1);
 			}
 		} else {
 			/* Removing duplicate, not last: key count unchanged. */
@@ -9791,9 +9764,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * Decrement before detach (undercount ordering).
 		 */
 		*result_node = external_nodes;
-		ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
-		ft_propagate_external_count(snapshot, nr_snapshot, -1);
+		ft_propagate_external_count_parent(dd.d.nf, -1);
 		rcu_assign_pointer(metadata->external_nodes, NULL);
 		ret = 0;
 	} else {
@@ -9803,7 +9774,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 */
 		*result_node = (struct cds_ft_node *) ft_node_ptr(dd.d.nf);
 		/* Propagate before detach to avoid writing freed metadata. */
-		ft_propagate_external_count(snapshot, nr_snapshot, -1);
+		ft_propagate_external_count_parent(
+			snapshot[nr_snapshot - 1], -1);
 		ft_snapshot_push(snapshot, snapshot_depth,
 			nr_snapshot, dd.d.nf, dd.d.depth);
 		ret = ft_detach_node(ft, snapshot,
@@ -9813,7 +9785,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				dd.det_pfp);
 		if (ret) {
 			/* Undo propagation on failure. */
-			ft_propagate_external_count(snapshot, nr_snapshot - 1, 1);
+			ft_propagate_external_count_parent(
+				snapshot[nr_snapshot - 2], 1);
 		}
 	}
 
@@ -10594,10 +10567,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 			return status;
 		}
 
-		/* Refresh snapshot: parent may have been recompacted. */
-		if (nr_graft_snapshot > 0)
-			graft_snapshot[nr_graft_snapshot - 1] = *d.pnfp;
-		ft_propagate_external_count(graft_snapshot, nr_graft_snapshot,
+		ft_propagate_external_count_parent(*d.pnfp,
 				(long) src_count);
 
 		/*
@@ -10787,8 +10757,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 
 		/* Propagate external node count delta through ancestors. */
 		if (swap_count != old_count)
-			ft_propagate_external_count(graft_snapshot,
-					nr_graft_snapshot,
+			ft_propagate_external_count_parent(d.pnf,
 					(long) swap_count - (long) old_count);
 
 		/*
@@ -11133,8 +11102,9 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			 * Propagate count removal through ancestors
 			 * before detach to avoid writing freed metadata.
 			 */
-			ft_propagate_external_count(snapshot, nr_snapshot,
-					-(long) detached_count);
+			ft_propagate_external_count_parent(
+				snapshot[nr_snapshot - 1],
+				-(long) detached_count);
 
 			/*
 			 * Propagate density removal for the detached
@@ -11190,9 +11160,9 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					 * Recompaction failed (-ENOMEM).
 					 * Undo propagation and abort.
 					 */
-					ft_propagate_external_count(snapshot,
-							nr_snapshot - 1,
-							(long) detached_count);
+					ft_propagate_external_count_parent(
+						snapshot[nr_snapshot - 2],
+						(long) detached_count);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
