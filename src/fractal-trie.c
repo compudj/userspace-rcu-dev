@@ -7136,10 +7136,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		unsigned int remaining_key,	/* key bytes remaining from compressed depth */
 		unsigned int diverge_pos,	/* position within compressed path */
 		struct cds_ft_node *child_node,	/* new external node to insert */
-		unsigned int node_depth,	/* depth of the compressed node */
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth,
-		int *nr_snapshot_p)
+		unsigned int node_depth)	/* depth of the compressed node */
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
 	struct cds_ft_metadata *cn_meta =
@@ -7631,10 +7628,7 @@ int ft_attach_node(struct cds_ft *ft,
 		size_t key_len,
 		unsigned int level,
 		struct cds_ft_node *child_node,
-		struct cds_ft_node *external_nodes,
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth,
-		int nr_snapshot)
+		struct cds_ft_node *external_nodes)
 {
 	struct cds_ft_metadata *metadata = NULL;
 	struct cds_ft_inode_flag *iter_node_flag, *iter_dest_node_flag,
@@ -7906,10 +7900,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		struct ft_descent *d,
 		const uint8_t *key, size_t key_len,
 		struct cds_ft_compressed_node *cn,
-		struct cds_ft_node *node,
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth,
-		int *nr_snapshot_p)
+		struct cds_ft_node *node)
 {
 	struct cds_ft_inode_flag *branch;
 	struct cds_ft_metadata *br_meta;
@@ -7943,17 +7934,13 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 		struct ft_descent *d,
 		const uint8_t *iter_key,
 		unsigned int remaining, unsigned int j,
-		struct cds_ft_node *node,
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth,
-		int *nr_snapshot_p)
+		struct cds_ft_node *node)
 {
 	int dret;
 
 	dret = ft_split_compressed_insert(ft,
 		d->nfp, d->nf, iter_key, remaining,
-		j, node, d->depth,
-		snapshot, snapshot_depth, nr_snapshot_p);
+		j, node, d->depth);
 	if (dret)
 		return dret;
 	ft_set_parent(*d->nfp, d->pnf);
@@ -7974,10 +7961,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		struct ft_descent *d,
 		unsigned int remaining,
 		struct cds_ft_node *node,
-		struct cds_ft_node **unique_node_ret,
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth,
-		int *nr_snapshot_p)
+		struct cds_ft_node **unique_node_ret)
 {
 	struct cds_ft_inode_flag *top_flag, *jct_flag;
 	int sret;
@@ -8085,21 +8069,18 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 		}
 		/* Key continues past external child: build branch. */
 		*ret_p = ft_insert_compressed_past_child(ft, d, key,
-			key_len, cn, node, snapshot, snapshot_depth,
-			nr_snapshot_p);
+			key_len, cn, node);
 		return FT_COMPRESSED_END;
 	}
 	if (j < cmp) {
 		/* Key diverges: split at position j. */
 		*ret_p = ft_insert_compressed_diverge(ft, d,
-			*iter_key_p, remaining, j, node,
-			snapshot, snapshot_depth, nr_snapshot_p);
+			*iter_key_p, remaining, j, node);
 		return FT_COMPRESSED_END;
 	}
 	/* Key shorter: split into prefix -> junction -> suffix. */
 	*ret_p = ft_insert_compressed_key_shorter(ft, d, remaining,
-		node, unique_node_ret, snapshot, snapshot_depth,
-		nr_snapshot_p);
+		node, unique_node_ret);
 	return FT_COMPRESSED_END;
 }
 
@@ -8648,8 +8629,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
-					NULL,
-					snapshot, snapshot_depth, nr_snapshot);
+					NULL);
 			if (ret == 0)
 				ft_propagate_external_count_parent(*d.pnfp, 1);
 
@@ -8721,8 +8701,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
-				(struct cds_ft_node *) ft_node_ptr(d.nf),
-				snapshot, snapshot_depth, nr_snapshot);
+				(struct cds_ft_node *) ft_node_ptr(d.nf));
 		if (ret == 0)
 			ft_propagate_external_count_parent(*d.pnfp, 1);
 	}
@@ -8900,8 +8879,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
-					NULL,
-					snapshot, snapshot_depth, nr_snapshot);
+					NULL);
 			if (ret == 0)
 				ft_propagate_external_count_parent(*d.pnfp, 1);
 		} else if (!ft_node_external(d.nf)) {
@@ -8943,8 +8921,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
-				(struct cds_ft_node *) ft_node_ptr(d.nf),
-				snapshot, snapshot_depth, nr_snapshot);
+				(struct cds_ft_node *) ft_node_ptr(d.nf));
 		if (ret == 0)
 			ft_propagate_external_count_parent(*d.pnfp, 1);
 	}
@@ -9396,12 +9373,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
 {
-	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
-	unsigned int snapshot_depth[FT_MAX_DEPTH]; /*pl*/
-	uint8_t snapshot_n[FT_MAX_DEPTH];
 	struct ft_detach_descent dd;
 	struct cds_ft_node *iter_node, **iter_node_ptr, **prev_node_ptr, *match;
-	int nr_snapshot, ret, count = 0;
+	int ret, count = 0;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 
@@ -9416,7 +9390,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 
-	nr_snapshot = 0;
 	iter_key = iter_key(iter);
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
@@ -9459,9 +9432,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * through without decompressing.
 			 */
 			ft_detach_descent_track(&dd, cn_meta);
-			snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
-			ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
 			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
 			if (ft_node_ptr(dd.d.nf) && dd.pending) {
 				dd.det_nfp = dd.d.nfp;
@@ -9501,9 +9471,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				if (!ft_node_ptr(cptrs[e]))
 					return CDS_FT_STATUS_NOT_FOUND;
 				ft_detach_descent_track(&dd, col_meta);
-				snapshot_n[nr_snapshot + 1] = suffix[0];
-				ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
 				dd.d.ppnf  = dd.d.pnf;
 				dd.d.ppnfp = dd.d.pnfp;
 				dd.d.pnf   = dd.d.nf;
@@ -9533,9 +9500,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		ft_detach_descent_track(&dd, metadata);
 
 		key_value = *(iter_key++);
-		snapshot_n[nr_snapshot + 1] = key_value;
-		ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
 		ft_detach_descent_step(&dd, key_value);
 		dbg_printf("cds_ft_remove iter key lookup %u finds nf %p, nfp %p\n",
 				(unsigned int) key_value, dd.d.nf,
@@ -9679,11 +9643,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node **result_node)
 {
-	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
-	unsigned int snapshot_depth[FT_MAX_DEPTH]; /*pl*/
-	uint8_t snapshot_n[FT_MAX_DEPTH];
 	struct ft_detach_descent dd;
-	int nr_snapshot, ret;
+	int ret;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 
@@ -9722,7 +9683,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		return CDS_FT_STATUS_OK;
 	}
 
-	nr_snapshot = 0;
 	iter_key = iter_key(iter);
 	dbg_printf("cds_ft_remove_all attempt\n");
 
@@ -9763,9 +9723,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				return CDS_FT_STATUS_NOT_FOUND;
 			}
 			ft_detach_descent_track(&dd, cn_meta);
-			snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
-			ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
 			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
 			if (ft_node_ptr(dd.d.nf) && dd.pending) {
 				dd.det_nfp = dd.d.nfp;
@@ -9807,9 +9764,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					return CDS_FT_STATUS_NOT_FOUND;
 				}
 				ft_detach_descent_track(&dd, col_meta);
-				snapshot_n[nr_snapshot + 1] = suffix[0];
-				ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
 				dd.d.ppnf  = dd.d.pnf;
 				dd.d.ppnfp = dd.d.pnfp;
 				dd.d.pnf   = dd.d.nf;
@@ -9837,9 +9791,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_detach_descent_track(&dd, metadata);
 
 		key_value = *(iter_key++);
-		snapshot_n[nr_snapshot + 1] = key_value;
-		ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
 		ft_detach_descent_step(&dd, key_value);
 		dbg_printf("cds_ft_remove_all iter key lookup %u finds nf %p, nfp %p\n",
 				(unsigned int) key_value, dd.d.nf, dd.d.nfp);
@@ -9933,10 +9884,7 @@ static
 int ft_split_compressed_graft(struct cds_ft *ft,
 		struct ft_descent *d,
 		const uint8_t *iter_key,
-		unsigned int diverge_pos,
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth,
-		int *nr_snapshot)
+		unsigned int diverge_pos)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
 	struct cds_ft_metadata *cn_meta =
@@ -10120,14 +10068,10 @@ error:
  * traversed (0..key_len).  If d->depth == key_len, the graft slot
  * is at d->nf / d->nfp.  Otherwise the path was incomplete.
  *
- * Used by cds_ft_graft and cds_ft_graft_swap.  cds_ft_detach uses
- * its own descent loop because it records snapshot state for
- * ft_detach_node's upward pruning walk.
+ * Used by cds_ft_graft, cds_ft_graft_swap, and cds_ft_detach.
  */
 static int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
-		struct ft_descent *d, unsigned int remaining,
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth, int *nr_snapshot);
+		struct ft_descent *d, unsigned int remaining);
 
 static
 void ft_descend_to_graft_point(struct cds_ft *ft,
@@ -10167,9 +10111,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 				 * at the mismatch point.
 				 */
 				if (ft_split_compressed_graft(ft, d,
-						ik, j, snapshot,
-						snapshot_depth,
-						nr_snapshot))
+						ik, j))
 					break;
 				ik += j + 1;
 				break;
@@ -10180,9 +10122,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 			 * The graft point is at the junction.
 			 */
 			if (ft_split_compressed_graft_key_shorter(
-					ft, d, remaining,
-					snapshot, snapshot_depth,
-					nr_snapshot))
+					ft, d, remaining))
 				break;
 			break;
 		}
@@ -10251,10 +10191,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 static
 int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		struct ft_descent *d,
-		unsigned int remaining,
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth,
-		int *nr_snapshot)
+		unsigned int remaining)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
 	struct cds_ft_metadata *cn_meta =
@@ -11037,11 +10974,6 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		struct ft_detach_descent dd;
 		const uint8_t *ik = key;
 
-		struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
-		unsigned int snapshot_depth[FT_MAX_DEPTH];
-		uint8_t snapshot_n[FT_MAX_DEPTH];
-		int nr_snapshot = 0;
-
 		ft_detach_descent_init(&dd, ft);
 
 		for (; dd.d.depth < key_len; ) {
@@ -11060,10 +10992,6 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						(struct cds_ft_inode *) cn);
 
 				ft_detach_descent_track(&dd, cn_meta);
-
-				snapshot_n[nr_snapshot + 1] = cn->key_bytes[0];
-				ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
 				ft_descent_traverse_compressed(&dd.d, cn, &ik);
 				if (ft_node_ptr(dd.d.nf) && dd.pending) {
 					dd.det_nfp = dd.d.nfp;
@@ -11111,9 +11039,6 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					if (!ft_node_ptr(cptrs[e]))
 						return CDS_FT_STATUS_NOT_FOUND;
 					ft_detach_descent_track(&dd, col_meta);
-					snapshot_n[nr_snapshot + 1] = suffix[0];
-					ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
 					dd.d.ppnf  = dd.d.pnf;
 					dd.d.ppnfp = dd.d.pnfp;
 					dd.d.pnf   = dd.d.nf;
@@ -11164,9 +11089,6 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			ft_detach_descent_track(&dd, meta);
 
 			kv = *(ik++);
-			snapshot_n[nr_snapshot + 1] = kv;
-			ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
 			ft_detach_descent_step(&dd, kv);
 		}
 
