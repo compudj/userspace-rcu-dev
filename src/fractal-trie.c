@@ -3713,7 +3713,8 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft_inode_flag **node_f
 		bool track, bool track_longest,
 		size_t *match_len_p, struct cds_ft_node **match_node_p,
 		struct cds_ft_node **found_ret,
-		enum cds_ft_status *status_ret)
+		enum cds_ft_status *status_ret,
+		bool candidate)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	const uint8_t *key = *key_p;
@@ -3735,24 +3736,30 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft_inode_flag **node_f
 		}
 	}
 
-	if (track_longest) {
-		unsigned int mpos;
-		int cmp = ft_key_cmp_ordinals(key, cn->key_bytes,
-				cmp_len, remaining_key, false, &mpos);
+	/*
+	 * In candidate mode, skip key comparison — just advance past
+	 * the compressed path.  The caller verifies the key at the leaf.
+	 */
+	if (!candidate) {
+		if (track_longest) {
+			unsigned int mpos;
+			int cmp = ft_key_cmp_ordinals(key, cn->key_bytes,
+					cmp_len, remaining_key, false, &mpos);
 
-		if (cmp != 0) {
-			*match_len_p = i + mpos;
+			if (cmp != 0) {
+				*match_len_p = i + mpos;
+				*match_node_p = NULL;
+				*status_ret = CDS_FT_STATUS_NOT_FOUND;
+				return FT_COMPRESSED_END;
+			}
+			*match_len_p = i + cmp_len;
 			*match_node_p = NULL;
-			*status_ret = CDS_FT_STATUS_NOT_FOUND;
-			return FT_COMPRESSED_END;
-		}
-		*match_len_p = i + cmp_len;
-		*match_node_p = NULL;
-	} else {
-		if (ft_key_cmp_ordinals(key, cn->key_bytes,
-				cmp_len, remaining_key, false, NULL) != 0) {
-			*status_ret = CDS_FT_STATUS_NOT_FOUND;
-			return FT_COMPRESSED_END;
+		} else {
+			if (ft_key_cmp_ordinals(key, cn->key_bytes,
+					cmp_len, remaining_key, false, NULL) != 0) {
+				*status_ret = CDS_FT_STATUS_NOT_FOUND;
+				return FT_COMPRESSED_END;
+			}
 		}
 	}
 	if (cn->len > remaining_key) {
@@ -4072,6 +4079,12 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_
 }
 #endif /* FEATURE_FT_COLLAPSE */
 
+/*
+ * @candidate: when true, skip key comparison at compressed nodes
+ * during traversal (patricia-like mode).  The returned node is a
+ * candidate that must be verified by the caller against their
+ * stored key.  Constant-folded at each call site.
+ */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
@@ -4079,7 +4092,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
-		struct cds_ft_node **tracking_match_node)
+		struct cds_ft_node **tracking_match_node,
+		bool candidate)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
 	struct cds_ft_inode_flag *node_flag;
@@ -4172,7 +4186,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				act = ft_lookup_compressed(&node_flag, &key, &i,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
-					&match_len, &match_node, &found, &status);
+					&match_len, &match_node, &found, &status,
+					candidate);
 				if (act == FT_COMPRESSED_END)
 					goto end;
 				if (act == FT_COMPRESSED_BREAK)
@@ -4333,14 +4348,39 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 
 	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
 	return do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
-				FT_PREFIX_TRACK_NONE, NULL, NULL);
+				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+}
+
+/*
+ * cds_ft_lookup_candidate_key - Fast candidate lookup.
+ *
+ * Skips key comparison at compressed nodes during traversal,
+ * returning a candidate node that may not be an exact match.
+ * The caller MUST verify the returned node's key matches the
+ * lookup key.  If it does not match, the key is not in the trie.
+ *
+ * This is faster than cds_ft_lookup_key for workloads with long
+ * compressed paths (e.g. reverse DNS, file paths) because it
+ * eliminates per-node key comparisons, doing a single verification
+ * at the end instead.
+ */
+enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft_node **result_node)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	uint8_t ordinals[FT_MAX_KEY_LEN];
+
+	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
+	return do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
+				FT_PREFIX_TRACK_NONE, NULL, NULL, true);
 }
 
 enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
 	return do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
-				FT_PREFIX_TRACK_NONE, NULL, NULL);
+				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
 }
 
 enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
@@ -4354,7 +4394,8 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 
 	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
 	do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
-			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node);
+			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node,
+			 false);
 
 	*match_len = partial_len;
 	*result_node = partial_node;
@@ -4373,7 +4414,8 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 	 * ancestor with external nodes for partial-match semantics.
 	 */
 	do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
-			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node);
+			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node,
+			 false);
 
 	/*
 	 * Override the iterator's node and status with the partial-match
@@ -4398,7 +4440,8 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
 
 	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
 	ret = do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
-			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node);
+			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node,
+			       false);
 
 	if (ret < 0) {
 		*match_len = 0;
@@ -4423,7 +4466,8 @@ enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 	enum cds_ft_status ret;
 
 	ret = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
-			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node);
+			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node,
+			       false);
 
 	if (ret < 0) {
 		iter->node = NULL;

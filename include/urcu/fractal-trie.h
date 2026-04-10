@@ -413,6 +413,31 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 		struct cds_ft_node **result_node);
 
 /*
+ * cds_ft_lookup_candidate_key - Fast candidate lookup by key.
+ * @ft: The Fractal Trie.
+ * @key: Pointer to the key (may be NULL if @key_len is 0).
+ * @key_len: Key length in bytes (same semantics as cds_ft_lookup_key).
+ * @result_node: Candidate node output. Set to a node if a candidate is
+ *               found, or NULL if not found or on error.
+ *
+ * Faster than cds_ft_lookup_key: skips key comparison at compressed
+ * nodes during traversal.  The returned node is a CANDIDATE that may
+ * not be an exact match.  The caller MUST compare the returned node's
+ * key against the lookup key to confirm.  If the keys do not match,
+ * the lookup key is not in the trie.
+ *
+ * Returns CDS_FT_STATUS_OK on success (candidate found),
+ * CDS_FT_STATUS_NOT_FOUND if no candidate, or a negative cds_ft_status
+ * on error.
+ *
+ * An RCU read-side lock must be held while calling this function and
+ * while accessing the returned node.
+ */
+enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft_node **result_node);
+
+/*
  * cds_ft_lookup_partial_key - Look up by key, find closest partial match.
  * @ft: The Fractal Trie.
  * @key: Key to look up (may be NULL if @key_len is 0).
