@@ -136,6 +136,19 @@ struct cds_ft_inode;
 
 struct cds_ft_alloc_arena;
 
+/*
+ * Extended density counters: lazily allocated when any compact
+ * uint16_t counter would overflow FT_DENSITY_COMPACT_MAX.
+ * Once allocated (monotonic promotion), never demoted back.
+ * Write-side only (mutex-held), no RCU publish concerns.
+ */
+#define FT_NODE_DENSITY_DEPTH	6
+#define FT_DENSITY_COMPACT_MAX	UINT16_MAX
+
+struct cds_ft_density_extended {
+	unsigned long nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
+};
+
 struct cds_ft_metadata {
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
 	unsigned int nr_child;			/* Number of children in node. */
@@ -169,9 +182,16 @@ struct cds_ft_metadata {
 	 *
 	 * 6 levels covers typical collapsed node depth and allows
 	 * precise density tracking for collapse decisions.
+	 *
+	 * Compact representation: uses uint16_t counters inline
+	 * (12 bytes for 6 counters vs 48 bytes for unsigned long).
+	 * When any counter exceeds FT_DENSITY_COMPACT_MAX, a
+	 * separate cds_ft_density_extended struct is lazily
+	 * allocated and density_ext points to it (monotonic
+	 * promotion, never demoted back to compact).
 	 */
-#define FT_NODE_DENSITY_DEPTH	6
-	unsigned long nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
+	struct cds_ft_density_extended *density_ext;	/* NULL = compact uint16_t mode. */
+	uint16_t nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
 };
 
 /*
