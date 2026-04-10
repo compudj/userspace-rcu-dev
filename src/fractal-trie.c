@@ -1306,6 +1306,20 @@ struct cds_ft_collapsed_node *ft_collapsed_node_ptr(
 		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK_WIDE);
 }
 
+/*
+ * ft_set_parent: set the parent pointer in child's metadata.
+ * Skips NULL and external (leaf) nodes which have no metadata.
+ * Write-side only (mutex-held).
+ */
+static
+void ft_set_parent(struct cds_ft_inode_flag *child_nf,
+		struct cds_ft_inode_flag *parent_nf)
+{
+	if (ft_node_external(child_nf))
+		return;
+	cds_ft_item_to_metadata(ft_node_ptr(child_nf))->parent = parent_nf;
+}
+
 /* Collapsed node accessors. */
 
 static const unsigned int ft_collapsed_scan_sizes[] = {
@@ -2732,20 +2746,28 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 		uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag)
 {
+	int ret;
+
 	switch (type->type_class) {
 	case FT_LINEAR:
 	case FT_LINEAR_WIDE:
-		return ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL);
+		ret = ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL);
+		break;
 	case FT_POOL:
-		return ft_pool_node_set_nth(type, node, node_flag, metadata, n, child_node_flag);
+		ret = ft_pool_node_set_nth(type, node, node_flag, metadata, n, child_node_flag);
+		break;
 	case FT_PIGEON:
-		return ft_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
+		ret = ft_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
+		break;
 	case FT_NULL:
 		return -ENOSPC;
 	default:
 		assert(0);
 		return -EINVAL;
 	}
+	if (!ret)
+		ft_set_parent(child_node_flag, node_flag);
+	return ret;
 }
 
 static
@@ -2869,22 +2891,28 @@ int _ft_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		uint8_t n, struct cds_ft_inode_flag *newptr)
 {
+	int ret;
+
 	switch (type->type_class) {
 	case FT_LINEAR:
 	case FT_LINEAR_WIDE:
-		return ft_linear_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
+		ret = ft_linear_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
+		break;
 	case FT_POOL:
-		return ft_pool_node_replace_ptr(type, node, node_flag, metadata, node_flag_ptr, n, newptr);
+		ret = ft_pool_node_replace_ptr(type, node, node_flag, metadata, node_flag_ptr, n, newptr);
+		break;
 	case FT_PIGEON:
-		return ft_pigeon_node_replace_ptr(type, node, metadata, node_flag_ptr, n, newptr);
+		ret = ft_pigeon_node_replace_ptr(type, node, metadata, node_flag_ptr, n, newptr);
+		break;
 	case FT_NULL:
 		return -ENOENT;
 	default:
 		assert(0);
 		return -EINVAL;
 	}
-
-	return 0;
+	if (!ret)
+		ft_set_parent(newptr, node_flag);
+	return ret;
 }
 
 /*
@@ -3368,6 +3396,7 @@ retry:		/* for fallback */
 
 		dbg_printf("Recompact inherit from %p\n", metadata);
 		if (metadata) {
+			new_metadata->parent = metadata->parent;
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
 			new_metadata->external_nodes = metadata->external_nodes;
 			uatomic_store(&new_metadata->nr_keys,
@@ -6796,7 +6825,14 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	uatomic_store(&col_meta->nr_keys, metadata->nr_keys, CMM_RELAXED);
 	col_meta->external_nodes = metadata->external_nodes;
 
-	return ft_collapsed_node_flag(col);
+	{
+		struct cds_ft_inode_flag *col_flag = ft_collapsed_node_flag(col);
+		unsigned int e;
+
+		for (e = 0; e < col_meta->nr_child; e++)
+			ft_set_parent(col_ptrs[e], col_flag);
+		return col_flag;
+	}
 }
 
 /*
@@ -6817,6 +6853,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 {
 	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_inode_flag **parent_slot;
+	struct cds_ft_inode_flag *parent_nf = NULL;
 	const uint8_t *ik = key;
 	unsigned int depth = 0;
 
@@ -6844,6 +6881,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			if (j < cmp)
 				break;
 			parent_slot = &cn->child;
+			parent_nf = node_flag;
 			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			depth += cn->len;
 			ik += cn->len;
@@ -6878,6 +6916,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				}
 				if (j == slen) {
 					parent_slot = &cptrs[e];
+					parent_nf = node_flag;
 					node_flag = ft_dereference_acquire_prefetch(
 						cptrs[e]);
 					depth += slen;
@@ -6902,6 +6941,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			col_flag = ft_try_collapse_at_node(ft, node_flag,
 					depth);
 			if (col_flag) {
+				ft_set_parent(col_flag, parent_nf);
 				rcu_assign_pointer(*parent_slot, col_flag);
 				free_cds_ft_node(ft, ft_node_ptr(node_flag));
 				/*
@@ -6924,6 +6964,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			if (!slot || !ft_node_ptr(*slot))
 				break;
 			parent_slot = slot;
+			parent_nf = node_flag;
 			node_flag = ft_dereference_acquire_prefetch(*slot);
 			depth++;
 		}
@@ -7004,6 +7045,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		sfx_meta->nr_child = 1;
 		uatomic_store(&sfx_meta->nr_keys, old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
+		ft_set_parent(cn->child, old_suffix_flag);
 		created[nr_created++] = old_suffix_flag;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -7108,6 +7150,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		top_flag = ft_compressed_node_flag(pfx);
+		ft_set_parent(branch_flag, top_flag);
 		created[nr_created++] = top_flag;
 	} else if (diverge_pos == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -7267,6 +7310,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		uatomic_store(&sfx_meta->nr_keys, child_nr_keys,
 			CMM_RELAXED);
 		suffix_flag = ft_compressed_node_flag(sfx);
+		ft_set_parent(cn->child, suffix_flag);
 		created[nr_created++] = suffix_flag;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -7319,6 +7363,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		top_flag = ft_compressed_node_flag(pfx);
+		ft_set_parent(jct_flag, top_flag);
 		created[nr_created++] = top_flag;
 	} else {
 		/* remaining == 1 */
@@ -7414,6 +7459,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	}
 	{
 		struct cds_ft_inode_flag *cflag = ft_compressed_node_flag(cn);
+		ft_set_parent(child, cflag);
 		ft_init_node_density(cflag);
 		return cflag;
 	}
@@ -7553,6 +7599,7 @@ int ft_attach_node(struct cds_ft *ft,
 		 */
 		if (attach_node_flag &&
 		    ft_node_collapsed(attach_node_flag)) {
+			ft_set_parent(iter_node_flag, attach_node_flag);
 			rcu_assign_pointer(*old_node_flag_ptr,
 				iter_node_flag);
 			goto publish_done;
@@ -7746,6 +7793,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	br_meta->external_nodes = (struct cds_ft_node *) cn->child;
 	uatomic_store(&br_meta->nr_keys,
 		br_meta->nr_keys + 1, CMM_RELAXED);
+	ft_set_parent(branch, d->nf);
 	rcu_assign_pointer(cn->child, branch);
 	ft_snapshot_push(snapshot, snapshot_depth,
 		*nr_snapshot_p, d->nf, d->depth);
@@ -7784,6 +7832,7 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 		snapshot, snapshot_depth, nr_snapshot_p);
 	if (dret)
 		return dret;
+	ft_set_parent(*d->nfp, d->pnf);
 	ft_propagate_external_count(snapshot,
 		*nr_snapshot_p, 1);
 	return 0;
@@ -7814,6 +7863,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		d->nf, remaining, &top_flag, &jct_flag);
 	if (sret)
 		return sret;
+	ft_set_parent(top_flag, d->pnf);
 	rcu_assign_pointer(*d->nfp, top_flag);
 	{
 		struct cds_ft_metadata *jct_meta =
@@ -7967,6 +8017,7 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		cn_meta->nr_child = 1;
 		uatomic_store(&cn_meta->nr_keys, nr_keys, CMM_RELAXED);
 		cflag = ft_compressed_node_flag(cn);
+		ft_set_parent(child, cflag);
 		ft_init_node_density(cflag);
 		return cflag;
 	}
@@ -8363,6 +8414,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 							col->data[tombstone_reuse] &
 							~FT_COLLAPSED_TOMBSTONE,
 							CMM_RELAXED);
+					ft_set_parent(branch, d.nf);
 					rcu_assign_pointer(
 						cptrs[tombstone_reuse], branch);
 					{
@@ -8409,6 +8461,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 					}
 					ft_init_node_density(internal_flag);
 
+					ft_set_parent(internal_flag, d.pnf);
 					rcu_assign_pointer(*d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
 
@@ -8447,6 +8500,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 				/* Set pointer. */
 				cptrs[ft_collapsed_count(col_nr)] = branch;
+				ft_set_parent(branch, d.nf);
 
 				/* Publish: increment nr_entries (atomic store). */
 				/* Store-release in publish_inc ensures
@@ -9081,6 +9135,9 @@ int ft_detach_node(struct cds_ft *ft,
 			ret = -ENOMEM;
 			goto end;
 		}
+		fresh_meta->parent = cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) ft_compressed_node_ptr(
+				iter_node_flag))->parent;
 		if (topmost_external_nodes) {
 			fresh_meta->external_nodes = topmost_external_nodes;
 			uatomic_store(&fresh_meta->nr_keys, 1, CMM_RELAXED);
@@ -9840,6 +9897,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		uatomic_store(&sfx_meta->nr_keys, old_child_nr_keys,
 			CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
+		ft_set_parent(cn->child, old_suffix_flag);
 		created[nr_created++] = old_suffix_flag;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -9892,6 +9950,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		top_flag = ft_compressed_node_flag(pfx);
+		ft_set_parent(branch_flag, top_flag);
 		created[nr_created++] = top_flag;
 	} else if (diverge_pos == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -9919,6 +9978,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	}
 
 	/* 4. Publish the split structure. */
+	ft_set_parent(top_flag, d->pnf);
 	rcu_assign_pointer(*d->nfp, top_flag);
 
 	/* 5. Add new path nodes to snapshot for nr_keys propagation. */
@@ -10157,6 +10217,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		uatomic_store(&sfx_meta->nr_keys, child_nr_keys,
 			CMM_RELAXED);
 		suffix_flag = ft_compressed_node_flag(sfx);
+		ft_set_parent(cn->child, suffix_flag);
 	} else {
 		struct cds_ft_inode_flag *dest = NULL;
 		int ret;
@@ -10197,6 +10258,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		prefix_flag = ft_compressed_node_flag(pfx);
+		ft_set_parent(suffix_flag, prefix_flag);
 	} else {
 		/* prefix_len == 1 */
 		struct cds_ft_inode_flag *dest = NULL;
@@ -10222,6 +10284,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	}
 
 	/* Publish and set descent state. */
+	ft_set_parent(prefix_flag, d->pnf);
 	rcu_assign_pointer(*d->nfp, prefix_flag);
 	ft_snapshot_push(snapshot, snapshot_depth,
 		*nr_snapshot, prefix_flag, d->depth);
@@ -10400,6 +10463,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		}
 
 		if (displaced) {
+			ft_set_parent(branch, d->pnf);
 			rcu_assign_pointer(*d->nfp, branch);
 		} else {
 			struct cds_ft_inode_flag *dest = d->pnf;
@@ -10709,6 +10773,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * place NULL (removing the subtree); otherwise place
 		 * the swap root node directly.
 		 */
+		if (!swap_empty)
+			ft_set_parent(old_swap_root, d.pnf);
 		rcu_assign_pointer(*d.nfp,
 			swap_empty ? NULL : old_swap_root);
 
@@ -10782,6 +10848,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * entries.
 		 */
 		if (!ft_node_external(old_child)) {
+			/* Clear parent: old_child is now a root. */
+			cds_ft_item_to_metadata(
+				ft_node_ptr(old_child))->parent = NULL;
 			rcu_assign_pointer(swap_ft->root, old_child);
 			if (swap_empty)
 				free_cds_ft_node(swap_ft,
@@ -10881,6 +10950,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		free_cds_ft_node(detached, ft_node_ptr(detached->root));
 		/* No readers in detached root yet. */
 		detached->root = ft->root;
+		/* Clear parent: this node is now a root. */
+		cds_ft_item_to_metadata(ft_node_ptr(detached->root))->parent = NULL;
 		uatomic_store(&detached->max_used_key_len,
 			      uatomic_load(&ft->max_used_key_len, CMM_RELAXED),
 			      CMM_RELAXED);
@@ -11014,6 +11085,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					}
 					ft_init_node_density(internal_flag);
 
+					ft_set_parent(internal_flag, dd.d.pnf);
 					rcu_assign_pointer(*dd.d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
 
@@ -11144,6 +11216,9 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					ft_node_ptr(detached->root));
 				/* No readers in detached root yet. */
 				detached->root = child;
+				/* Clear parent: this node is now a root. */
+				cds_ft_item_to_metadata(
+					ft_node_ptr(child))->parent = NULL;
 			} else {
 				struct cds_ft_metadata *dmeta =
 					ft_root_metadata(detached);

@@ -150,6 +150,13 @@ struct cds_ft_density_extended {
 };
 
 struct cds_ft_metadata {
+	struct cds_ft_inode_flag *parent;	/* Tagged pointer to parent node (write-side only).
+						 * NULL for the root node.
+						 * Not published with rcu_assign_pointer:
+						 * maintained exclusively under the mutation
+						 * mutex.  Not safe for read-side use due to
+						 * RCU lifetime concerns.
+						 */
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
 	unsigned int nr_child;			/* Number of children in node. */
 	int fallback_removal_count;		/* Removals left keeping fallback. */
