@@ -1950,10 +1950,26 @@ static inline void ft_maybe_prefetch(const void *ptr)
 		__builtin_prefetch(ptr);
 }
 
+/*
+ * ft_dereference_prefetch: for tagged FT node pointers (may have
+ * pool/pigeon subclass bits).  Uses ft_maybe_prefetch to skip
+ * pool/pigeon types.
+ *
+ * ft_dereference_prefetch_external: for plain (non-tagged) pointers
+ * like external_nodes.  Direct prefetch, no tag check needed.
+ */
 #define ft_dereference_prefetch(p)		\
 	({							\
 		__typeof__(p) __ft_tmp = rcu_dereference(p);	\
 		ft_maybe_prefetch(__ft_tmp);			\
+		__ft_tmp;					\
+	})
+
+#define ft_dereference_prefetch_external(p)	\
+	({							\
+		__typeof__(p) __ft_tmp = rcu_dereference(p);	\
+		if (__ft_tmp)					\
+			__builtin_prefetch(__ft_tmp);		\
 		__ft_tmp;					\
 	})
 
@@ -3711,7 +3727,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft_inode_flag **node_f
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 		struct cds_ft_node *ext =
-			rcu_dereference(cn_meta->external_nodes);
+			ft_dereference_prefetch_external(cn_meta->external_nodes);
 
 		if (ext || track_longest) {
 			*match_len_p = i;
@@ -3745,7 +3761,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft_inode_flag **node_f
 				(struct cds_ft_inode *) cn,
 				ft_compressed_order(cn->len));
 
-		*found_ret = rcu_dereference(cn_meta->external_nodes);
+		*found_ret = ft_dereference_prefetch_external(cn_meta->external_nodes);
 		*status_ret = *found_ret ? CDS_FT_STATUS_OK :
 				CDS_FT_STATUS_NOT_FOUND;
 		if (track && (*found_ret || track_longest)) {
@@ -3805,7 +3821,7 @@ enum ft_compressed_action ft_lookup_compressed(struct cds_ft_inode_flag **node_f
 		struct cds_ft_metadata *metadata =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		struct cds_ft_node *ext =
-			rcu_dereference(metadata->external_nodes);
+			ft_dereference_prefetch_external(metadata->external_nodes);
 
 		if (ext || track_longest) {
 			*match_len_p = i;
@@ -3862,7 +3878,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_fl
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 		struct cds_ft_node *ext =
-			rcu_dereference(cn_meta->external_nodes);
+			ft_dereference_prefetch_external(cn_meta->external_nodes);
 
 		if (ext || track_longest) {
 			*match_len_p = i;
@@ -3936,7 +3952,7 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_fl
 			struct cds_ft_metadata *metadata =
 				cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 			struct cds_ft_node *ext =
-				rcu_dereference(metadata->external_nodes);
+				ft_dereference_prefetch_external(metadata->external_nodes);
 
 			if (ext || track_longest) {
 				*match_len_p = i;
@@ -4099,7 +4115,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
 							type->order);
-		found = rcu_dereference(metadata->external_nodes);
+		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track) {
 			match_len = 0;
@@ -4117,7 +4133,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
 							type->order);
-		struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+		struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
 		if (external_nodes || track_longest) {
 			match_len = 0;
@@ -4228,7 +4244,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
 					ft_node_ptr(node_flag), type->order);
-			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+			struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
 			if (external_nodes || track_longest) {
 				match_len = i;
@@ -4245,7 +4261,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
 							type->order);
-		found = rcu_dereference(metadata->external_nodes);
+		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
 			match_len = key_len;
@@ -4258,7 +4274,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			cds_ft_item_to_metadata_fast(
 				(struct cds_ft_inode *) cn,
 				ft_compressed_order(cn->len));
-		found = rcu_dereference(metadata->external_nodes);
+		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
 			match_len = key_len;
@@ -4270,7 +4286,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				ft_node_ptr(node_flag),
 				cds_ft_item_order(
 					(struct cds_ft_inode *) ft_collapsed_node_ptr(node_flag)));
-		found = rcu_dereference(metadata->external_nodes);
+		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
 			match_len = key_len;
@@ -5111,11 +5127,11 @@ post_traversal:
 				const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 
 				metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
-				external_nodes = rcu_dereference(metadata->external_nodes);
+				external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 			} else if (ft_node_compressed(node_flag)) {
 				struct cds_ft_metadata *metadata =
 					cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-				external_nodes = rcu_dereference(metadata->external_nodes);
+				external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 			} else {
 				external_nodes = (struct cds_ft_node *) node_flag;
 			}
@@ -5219,7 +5235,7 @@ going_up:
 					type->order);
 			}
 			{
-			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+			struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
 			if (external_nodes) {
 				int j;
@@ -5467,7 +5483,7 @@ going_up:
 						type->order);
 				}
 				struct cds_ft_node *external_nodes =
-					rcu_dereference(metadata->external_nodes);
+					ft_dereference_prefetch_external(metadata->external_nodes);
 
 				if (external_nodes) {
 					int j;
@@ -5552,7 +5568,7 @@ descend_children:
 			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
 					ft_node_ptr(node_flag), type->order);
-			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+			struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
 			if (external_nodes) {
 				ret_node = external_nodes;
