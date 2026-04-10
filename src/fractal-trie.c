@@ -6073,6 +6073,81 @@ void ft_propagate_external_count(struct cds_ft_inode_flag **snapshot,
 }
 
 /*
+ * Compact density counter accessors.
+ *
+ * ft_density_get: read counter[idx] from compact or extended storage.
+ * ft_density_promote: allocate extended storage, copy compact values.
+ * ft_density_set: write counter[idx], promoting to extended on overflow.
+ * ft_density_add: saturating add (clamped at 0 on underflow).
+ * ft_density_sub: saturating subtract (clamped at 0 on underflow).
+ * ft_density_free: free extended storage (called on node reclaim).
+ *
+ * All write-side only (mutex-held).
+ */
+static inline
+unsigned long ft_density_get(const struct cds_ft_metadata *m, unsigned int idx)
+{
+	if (caa_unlikely(m->density_ext != NULL))
+		return m->density_ext->nr_nodes_at_depth[idx];
+	return m->nr_nodes_at_depth[idx];
+}
+
+static
+void ft_density_promote(struct cds_ft_metadata *m)
+{
+	struct cds_ft_density_extended *ext;
+	unsigned int i;
+
+	ext = calloc(1, sizeof(*ext));
+	if (!ext)
+		abort();
+	for (i = 0; i < FT_NODE_DENSITY_DEPTH; i++)
+		ext->nr_nodes_at_depth[i] = m->nr_nodes_at_depth[i];
+	m->density_ext = ext;
+}
+
+static inline
+void ft_density_set(struct cds_ft_metadata *m, unsigned int idx, unsigned long val)
+{
+	if (caa_unlikely(m->density_ext != NULL)) {
+		m->density_ext->nr_nodes_at_depth[idx] = val;
+		return;
+	}
+	if (caa_unlikely(val > FT_DENSITY_COMPACT_MAX)) {
+		ft_density_promote(m);
+		m->density_ext->nr_nodes_at_depth[idx] = val;
+		return;
+	}
+	m->nr_nodes_at_depth[idx] = (uint16_t) val;
+}
+
+static inline
+void ft_density_add(struct cds_ft_metadata *m, unsigned int idx, long delta)
+{
+	unsigned long val = ft_density_get(m, idx);
+
+	assert(delta >= 0 || val >= (unsigned long) -delta);
+	val += delta;
+	ft_density_set(m, idx, val);
+}
+
+static inline
+void ft_density_sub(struct cds_ft_metadata *m, unsigned int idx, unsigned long sub)
+{
+	unsigned long val = ft_density_get(m, idx);
+
+	assert(val >= sub);
+	ft_density_set(m, idx, val - sub);
+}
+
+static inline
+void ft_density_free(struct cds_ft_metadata *m)
+{
+	free(m->density_ext);
+	m->density_ext = NULL;
+}
+
+/*
  * Compute the precise density contribution of a child node to its
  * parent.  The child is at @distance levels below the parent.
  *
@@ -6092,10 +6167,10 @@ static inline unsigned long ft_child_density_contribution(
 
 	if (distance >= FT_NODE_DENSITY_DEPTH)
 		return contrib;
-	contrib += cm->nr_nodes_at_depth[0];
+	contrib += ft_density_get(cm, 0);
 	/* Subtract levels that overflow the parent's window. */
 	for (j = FT_NODE_DENSITY_DEPTH - distance; j < FT_NODE_DENSITY_DEPTH; j++)
-		contrib -= cm->nr_nodes_at_depth[j];
+		contrib -= ft_density_get(cm, j);
 	return contrib;
 }
 
@@ -6129,7 +6204,7 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 				total += ft_child_density_contribution(cm, cn->len);
 			}
 		}
-		cn_meta->nr_nodes_at_depth[0] = total;
+		ft_density_set(cn_meta, 0, total);
 		return;
 	}
 	if (ft_node_collapsed(node_flag)) {
@@ -6155,7 +6230,7 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 				total += ft_child_density_contribution(cm, slen);
 			}
 		}
-		col_meta->nr_nodes_at_depth[0] = total;
+		ft_density_set(col_meta, 0, total);
 		return;
 	}
 	/* Internal node: walk children (at distance 1). */
@@ -6174,7 +6249,7 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 			total += ft_child_density_contribution(cm, 1);
 		}
 	}
-	meta->nr_nodes_at_depth[0] = total;
+	ft_density_set(meta, 0, total);
 }
 
 /*
@@ -6219,18 +6294,11 @@ void ft_propagate_node_density(struct cds_ft_inode_flag **snapshot,
 		m = cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
 
 		/* Always update the cumulative sum (counter[0]). */
-		if (delta < 0 && m->nr_nodes_at_depth[0] < (unsigned long) -delta)
-			m->nr_nodes_at_depth[0] = 0;
-		else
-			m->nr_nodes_at_depth[0] += delta;
+		ft_density_add(m, 0, delta);
 
 		/* Update the per-level counter if distance > 1. */
-		if (distance >= 2) {
-			if (delta < 0 && m->nr_nodes_at_depth[distance - 1] < (unsigned long) -delta)
-				m->nr_nodes_at_depth[distance - 1] = 0;
-			else
-				m->nr_nodes_at_depth[distance - 1] += delta;
-		}
+		if (distance >= 2)
+			ft_density_add(m, distance - 1, delta);
 	}
 }
 
@@ -6487,7 +6555,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	 *    with the wider scan zone.  No re-walk needed.
 	 */
 	{
-		unsigned long density = metadata->nr_nodes_at_depth[0];
+		unsigned long density = ft_density_get(metadata, 0);
 
 		/*
 		 * Skip collapse if the subtree doesn't have enough
@@ -6519,7 +6587,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			unsigned int j;
 
 			for (j = 1; j < FT_NODE_DENSITY_DEPTH; j++)
-				weighted += j * metadata->nr_nodes_at_depth[j];
+				weighted += j * ft_density_get(metadata, j);
 			if (weighted < (unsigned long) nr_child)
 				return NULL;
 		}
@@ -6567,7 +6635,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		     try_depth >= 2; try_depth--) {
 			bool walk_ok = true;
 
-			if (metadata->nr_nodes_at_depth[0] > max_entries)
+			if (ft_density_get(metadata, 0) > max_entries)
 				break;
 
 			/* Reset for this depth attempt. */
@@ -7557,7 +7625,7 @@ publish_done:
 					ft_node_ptr(created_nodes[nr_created_nodes - 1]));
 			ft_propagate_node_density(snapshot, snapshot_depth,
 				nr_snapshot, level,
-				(long)(1 + top_meta->nr_nodes_at_depth[0]));
+				(long)(1 + ft_density_get(top_meta, 0)));
 		}
 	}
 
@@ -10520,9 +10588,9 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 					break;
 				am = cds_ft_item_to_metadata(
 					ft_node_ptr(graft_snapshot[si]));
-				am->nr_nodes_at_depth[0] +=
+				ft_density_add(am, 0,
 					ft_child_density_contribution(
-						graft_meta, distance);
+						graft_meta, distance));
 			}
 		}
 
@@ -10725,11 +10793,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 						add = ft_child_density_contribution(
 							new_meta, distance);
 					if (add >= sub)
-						am->nr_nodes_at_depth[0] += add - sub;
-					else if (am->nr_nodes_at_depth[0] >= sub - add)
-						am->nr_nodes_at_depth[0] -= sub - add;
+						ft_density_add(am, 0, add - sub);
 					else
-						am->nr_nodes_at_depth[0] = 0;
+						ft_density_sub(am, 0, sub - add);
 				}
 			}
 		}
@@ -11053,9 +11119,9 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						break;
 					am = cds_ft_item_to_metadata(
 						ft_node_ptr(snapshot[si]));
-					am->nr_nodes_at_depth[0] -=
+					ft_density_sub(am, 0,
 						ft_child_density_contribution(
-							child_meta, distance);
+							child_meta, distance));
 				}
 			}
 
@@ -13238,7 +13304,7 @@ static void print_density(FILE *out, const struct cds_ft_metadata *m)
 	fprintf(out, "[");
 	for (i = 0; i < FT_NODE_DENSITY_DEPTH; i++) {
 		if (i) fprintf(out, " ");
-		fprintf(out, "%lu", m->nr_nodes_at_depth[i]);
+		fprintf(out, "%lu", ft_density_get(m, i));
 	}
 	fprintf(out, "]");
 }

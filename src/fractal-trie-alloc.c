@@ -322,6 +322,10 @@ void cds_ft_free_item_rcu(struct rcu_head *rcu_head)
 	struct cds_ft_alloc_arena *arena =
 		cds_ft_metadata_to_range(&metadata_alloc->metadata)->arena;
 
+	/* Free lazily-allocated extended density counters. */
+	free(metadata_alloc->metadata.density_ext);
+	metadata_alloc->metadata.density_ext = NULL;
+
 	pthread_mutex_lock(&arena->lock);
 	metadata_alloc->free_list_next = arena->free_list_head;
 	arena->free_list_head = metadata_alloc;
