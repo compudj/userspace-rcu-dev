@@ -2546,6 +2546,98 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 	}
 }
 
+/*
+ * ft_node_find_child: reverse lookup — given a parent internal node and
+ * a child pointer, find the key byte and slot that lead to that child.
+ *
+ * Returns true if found, with *n_ret set to the key byte and *slot_ret
+ * set to a pointer to the slot (cds_ft_inode_flag **) within the parent.
+ * Returns false if the child is not found (should not happen on a
+ * well-formed trie).
+ *
+ * Only handles internal node types (linear, pool, pigeon).
+ * Compressed and collapsed parents are handled separately by callers.
+ * Write-side only (mutex-held).
+ */
+static
+bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag *child_nf,
+		uint8_t *n_ret,
+		struct cds_ft_inode_flag ***slot_ret)
+{
+	struct cds_ft_inode *node = ft_node_ptr(parent_nf);
+	unsigned int type_index = ft_node_type(parent_nf);
+	const struct cds_ft_type *type = &ft_types[type_index];
+
+	switch (type->type_class) {
+	case FT_LINEAR:
+	case FT_LINEAR_WIDE:
+	{
+		uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
+		unsigned int i;
+
+		for (i = 0; i < nr_child; i++) {
+			struct cds_ft_inode_flag *iter;
+			uint8_t v;
+
+			ft_linear_node_get_ith_pos(type, node, i, &v, &iter);
+			if (iter == child_nf) {
+				*n_ret = v;
+				if (slot_ret)
+					ft_node_get_nth(parent_nf, slot_ret, v);
+				return true;
+			}
+		}
+		return false;
+	}
+	case FT_POOL:
+	{
+		unsigned int pool_nr;
+
+		for (pool_nr = 0; pool_nr < (1U << type->nr_pool_order); pool_nr++) {
+			struct cds_ft_inode *pool =
+				ft_pool_node_get_ith_pool(type, node, pool_nr);
+			uint8_t nr_child = ft_linear_node_get_nr_child(type, pool);
+			unsigned int j;
+
+			for (j = 0; j < nr_child; j++) {
+				struct cds_ft_inode_flag *iter;
+				uint8_t v;
+
+				ft_linear_node_get_ith_pos(type, pool, j, &v, &iter);
+				if (iter == child_nf) {
+					*n_ret = v;
+					if (slot_ret)
+						ft_node_get_nth(parent_nf, slot_ret, v);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+	case FT_PIGEON:
+	{
+		unsigned int i;
+
+		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
+			struct cds_ft_inode_flag *iter;
+
+			iter = ft_pigeon_node_get_ith_pos(type, node, i);
+			if (iter == child_nf) {
+				*n_ret = (uint8_t) i;
+				if (slot_ret)
+					ft_node_get_nth(parent_nf, slot_ret, i);
+				return true;
+			}
+		}
+		return false;
+	}
+	default:
+		assert(0);
+		return false;
+	}
+}
+
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_flag,
 		int n, uint8_t *result_key,
@@ -9031,92 +9123,104 @@ find_and_replace:
 }
 
 /*
- * Note: there is no need to lookup the pointer address associated with
- * each node's nth item: it's already been done by cds_ft_remove, and
- * cds_ft_remove is protected by mutual exclusion of updaters.
+ * ft_detach_node: detach a node from the trie and prune empty
+ * single-child ancestors above it.
  *
- * ft_detach_node() ensures that a lookup will _never_ see a branch that
- * leads to a dead-end: when removing branch, it makes sure to perform
- * the "cut" at the highest node that has only one child, effectively
- * replacing it with a NULL pointer.
+ * Walks upward from the parent of the detached node via
+ * metadata->parent pointers.  Prunes single-child ancestors until
+ * reaching a node with multiple children, external nodes, or the
+ * root.  The pruned branch is replaced by the topmost external
+ * nodes found during the walk (or NULL).
  *
- * Internal nodes are considered empty if they have no internal and no
- * external node children, *and* their associated list of external nodes
- * is empty. When detaching an internal node which has no children, but
- * has an associated list of external nodes, it is replaced by a pointer
- * to the external nodes.
- *
- * During descent, the detach point pointers are updated when:
- * - A node with nr_child > 1 is encountered (direct termination point
- *   for the upward walk).
- * - A single-child node with external_nodes is encountered (triggers
- *   termination one level above via prev_external_nodes_found).
- * - Root level (always a termination point via i == 0).
- *
- * The last update during top-down descent corresponds to the deepest
- * level where the bottom-up walk would terminate, so the pre-tracked
- * pointers always match the termination level.
+ * @detach_node_flag_ptr: slot in parent pointing to the detached node.
+ * @detach_parent_flag_ptr: slot in grandparent pointing to the parent.
+ * @detach_depth: trie depth of the detached node.
  */
 static
 int ft_detach_node(struct cds_ft *ft,
-		struct cds_ft_inode_flag **snapshot,
-		unsigned int *snapshot_depth,
-		uint8_t *snapshot_n,
-		int nr_snapshot,
 		struct cds_ft_inode_flag **detach_node_flag_ptr,
-		struct cds_ft_inode_flag **detach_parent_flag_ptr)
+		struct cds_ft_inode_flag **detach_parent_flag_ptr,
+		unsigned int detach_depth)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
 	struct cds_ft_inode *old_recompacted_node = NULL;
-	int ret, i, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
+	int ret, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
 	uint8_t n = 0;
 	struct cds_ft_node *topmost_external_nodes = NULL;
 	bool prev_external_nodes_found = false;
+	struct cds_ft_inode_flag *cur;
+	unsigned int cur_depth;
 
 	/*
-	 * From the last internal level node going up, lookup the
-	 * metadata, check if the node has only one child left. If it is
-	 * the case, we continue iterating upward. When we reach a node
-	 * which has more that one child left or has an associated
-	 * external node, we lookup the parent, and proceed to the node
-	 * deletion (removing its children too), replacing it with its
-	 * external node pointer (if any).
+	 * Walk upward from the parent of the detached node via
+	 * metadata->parent.  At each ancestor, check if it has only
+	 * one child left.  If so, mark it for pruning and continue.
+	 * Stop when reaching a multi-child node, a node with
+	 * external_nodes, or the root (parent == NULL).
 	 */
-	for (i = nr_snapshot - 2; i >= 0; i--) {
-		struct cds_ft_metadata *metadata;
+	cur = *detach_parent_flag_ptr;
+	cur_depth = detach_depth - ft_parent_depth_span(cur, *detach_node_flag_ptr);
 
-		metadata = cds_ft_item_to_metadata(ft_node_ptr(snapshot[i]));
+	while (cur) {
+		struct cds_ft_metadata *metadata;
+		bool is_root;
+
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(cur));
 		metadata_stack[nr_metadata++] = metadata;
+		is_root = (metadata->parent == NULL);
 
 		assert(metadata->nr_child > 0);
-		if (!prev_external_nodes_found && (metadata->nr_child == 1 && i > 0)) {
+		if (!prev_external_nodes_found && (metadata->nr_child == 1 && !is_root)) {
 			nr_clear++;
-			/*
-			 * Keep track of the external nodes pointer of
-			 * the topmost internal node in the branch.
-			 */
 			topmost_external_nodes = metadata->external_nodes;
 		}
 		nr_branch++;
-		if (prev_external_nodes_found || metadata->nr_child > 1 || i == 0) {
-			if (i > 0) {
-				metadata = cds_ft_item_to_metadata(ft_node_ptr(snapshot[i - 1]));
+		if (prev_external_nodes_found || metadata->nr_child > 1 || is_root) {
+			if (!is_root) {
+				struct cds_ft_metadata *parent_meta =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(metadata->parent));
+				metadata_stack[nr_metadata++] = parent_meta;
 			}
 			/*
-			 * When i == 0 we are at the root.  The root's own
-			 * metadata is already in metadata_stack (just pushed
-			 * above); we reuse it as the "parent" metadata for
-			 * the replace_ptr call below.
+			 * Find the key byte for replace_ptr.  Only needed
+			 * for internal parents (compressed/collapsed are
+			 * handled separately below).
 			 */
-			if (i > 0)
-				metadata_stack[nr_metadata++] = metadata;
-
-			n = snapshot_n[i + 1];
+			if (!ft_node_compressed(cur) && !ft_node_collapsed(cur))
+				ft_node_find_child(cur, *detach_node_flag_ptr,
+					&n, NULL);
 			break;
 		}
 		if (topmost_external_nodes)
 			prev_external_nodes_found = true;
+
+		/*
+		 * Walk up: the current node becomes the child,
+		 * update detach pointers to prune at this level.
+		 */
+		{
+			struct cds_ft_inode_flag *parent_nf = metadata->parent;
+
+			if (!parent_nf)
+				break;
+			/*
+			 * Find the slot in the grandparent pointing to
+			 * cur, which becomes the new detach_parent_flag_ptr.
+			 * Find the slot in cur pointing to its child (the
+			 * previous level), which becomes detach_node_flag_ptr.
+			 */
+			detach_node_flag_ptr = detach_parent_flag_ptr;
+			if (is_root)
+				detach_parent_flag_ptr = &ft->root;
+			else {
+				ft_node_find_child(parent_nf, cur, NULL,
+					&detach_parent_flag_ptr);
+			}
+			cur_depth -= ft_parent_depth_span(parent_nf, cur);
+			cur = parent_nf;
+		}
 	}
 
 	iter_node_flag = *detach_parent_flag_ptr;
@@ -9193,18 +9297,11 @@ int ft_detach_node(struct cds_ft *ft,
 			struct cds_ft_inode_flag *replacement =
 				topmost_external_nodes ?
 				(struct cds_ft_inode_flag *) topmost_external_nodes : NULL;
-			int si;
 
 			/* Propagate density -1 for the freed collapsed node. */
-			for (si = nr_snapshot - 1; si >= 0; si--) {
-				if (snapshot[si] == iter_node_flag) {
-					ft_propagate_node_density_parent(
-						snapshot[si],
-						snapshot_depth[si],
-						snapshot_depth[si], -1);
-					break;
-				}
-			}
+			ft_propagate_node_density_parent(
+				iter_node_flag, cur_depth,
+				cur_depth, -1);
 			rcu_assign_pointer(*detach_parent_flag_ptr, replacement);
 			free_collapsed_node(ft, col);
 		}
@@ -9243,28 +9340,19 @@ end:
 
 	if (!ret) {
 		/*
-		 * Propagate density -1 for each freed node, then free it.
-		 * The freed nodes are at snapshot positions
-		 * [nr_snapshot - 1 - nr_branch .. nr_snapshot - 1 - nr_branch + nr_clear - 1].
-		 * Each snapshot entry has a known depth in snapshot_depth[].
+		 * Propagate density: -nr_clear at the surviving parent's
+		 * depth (where the pruned nodes were children).
 		 */
-		/*
-		 * Propagate density: -nr_clear at the topmost freed
-		 * node's depth.  Use the snapshot entry just above the
-		 * pruned branch as the propagation base.
-		 */
-		if (nr_clear > 0) {
-			int top_idx = nr_snapshot - 1 - nr_branch;
+		if (nr_clear > 0)
+			ft_propagate_node_density_parent(cur, cur_depth,
+				cur_depth, (long) -nr_clear);
+		{
+			int ci;
 
-			if (top_idx >= 0 && top_idx < nr_snapshot)
-				ft_propagate_node_density_parent(
-					snapshot[top_idx],
-					snapshot_depth[top_idx],
-					snapshot_depth[top_idx],
-					(long) -nr_clear);
+			for (ci = 0; ci < nr_clear; ci++)
+				free_cds_ft_node(ft,
+					cds_ft_metadata_to_item(metadata_stack[ci]));
 		}
-		for (i = 0; i < nr_clear; i++)
-			free_cds_ft_node(ft, cds_ft_metadata_to_item(metadata_stack[i]));
 		/*
 		 * Density on the surviving parent is updated
 		 * incrementally by ft_propagate_node_density above;
@@ -9543,19 +9631,14 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * Propagate -1 before detach, which may free
 			 * internal nodes in the snapshot.
 			 */
-			ft_propagate_external_count_parent(
-				snapshot[nr_snapshot - 1], -1);
-			ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
-			ret = ft_detach_node(ft, snapshot,
-					snapshot_depth, snapshot_n,
-					nr_snapshot,
+			ft_propagate_external_count_parent(dd.d.pnf, -1);
+			ret = ft_detach_node(ft,
 					dd.det_nfp,
-					dd.det_pfp);
+					dd.det_pfp,
+					dd.d.depth);
 			if (ret) {
 				/* Undo propagation on failure. */
-				ft_propagate_external_count_parent(
-					snapshot[nr_snapshot - 2], 1);
+				ft_propagate_external_count_parent(dd.d.pnf, 1);
 			}
 		} else {
 			/* Removing duplicate, not last: key count unchanged. */
@@ -9802,19 +9885,14 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 */
 		*result_node = (struct cds_ft_node *) ft_node_ptr(dd.d.nf);
 		/* Propagate before detach to avoid writing freed metadata. */
-		ft_propagate_external_count_parent(
-			snapshot[nr_snapshot - 1], -1);
-		ft_snapshot_push(snapshot, snapshot_depth,
-			nr_snapshot, dd.d.nf, dd.d.depth);
-		ret = ft_detach_node(ft, snapshot,
-				snapshot_depth, snapshot_n,
-				nr_snapshot,
+		ft_propagate_external_count_parent(dd.d.pnf, -1);
+		ret = ft_detach_node(ft,
 				dd.det_nfp,
-				dd.det_pfp);
+				dd.det_pfp,
+				dd.d.depth);
 		if (ret) {
 			/* Undo propagation on failure. */
-			ft_propagate_external_count_parent(
-				snapshot[nr_snapshot - 2], 1);
+			ft_propagate_external_count_parent(dd.d.pnf, 1);
 		}
 	}
 
@@ -11121,40 +11199,44 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			 * Propagate count removal through ancestors
 			 * before detach to avoid writing freed metadata.
 			 */
-			ft_propagate_external_count_parent(
-				snapshot[nr_snapshot - 1],
+			ft_propagate_external_count_parent(dd.d.pnf,
 				-(long) detached_count);
 
 			/*
 			 * Propagate density removal for the detached
-			 * subtree.  The child's contribution to each
-			 * ancestor within the density window must be
-			 * subtracted.  Use ft_child_density_contribution
-			 * which accounts for the window shift precisely
-			 * using per-level counters.
+			 * subtree.  Walk up from the child's parent via
+			 * metadata->parent, subtracting the child's
+			 * density contribution at each ancestor within
+			 * the 6-level window.
 			 */
 			if (!ft_node_external(child)) {
 				struct cds_ft_metadata *child_meta =
 					cds_ft_item_to_metadata(
 						ft_node_ptr(child));
-				int si;
+				struct cds_ft_inode_flag *anc = child;
+				unsigned int anc_depth = key_len;
 
-				for (si = nr_snapshot - 1; si >= 0; si--) {
+				while (anc) {
 					struct cds_ft_metadata *am;
 					unsigned int distance;
+					struct cds_ft_inode_flag *parent_nf;
 
-					if (!ft_node_ptr(snapshot[si]))
-						continue;
-					if (snapshot_depth[si] >= key_len)
-						continue;
-					distance = key_len - snapshot_depth[si];
-					if (distance > FT_NODE_DENSITY_DEPTH)
-						break;
 					am = cds_ft_item_to_metadata(
-						ft_node_ptr(snapshot[si]));
-					ft_density_sub(am, 0,
-						ft_child_density_contribution(
-							child_meta, distance));
+						ft_node_ptr(anc));
+					parent_nf = am->parent;
+					if (!parent_nf)
+						break;
+					if (anc_depth < key_len) {
+						distance = key_len - anc_depth;
+						if (distance > FT_NODE_DENSITY_DEPTH)
+							break;
+						ft_density_sub(am, 0,
+							ft_child_density_contribution(
+								child_meta, distance));
+					}
+					anc_depth -= ft_parent_depth_span(
+						parent_nf, anc);
+					anc = parent_nf;
 				}
 			}
 
@@ -11164,15 +11246,11 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			 * no longer reachable from the live trie for
 			 * new readers.
 			 */
-			ft_snapshot_push(snapshot, snapshot_depth,
-				nr_snapshot, child, key_len);
 			{
-				int ret = ft_detach_node(ft, snapshot,
-							 snapshot_depth,
-							 snapshot_n,
-							 nr_snapshot,
+				int ret = ft_detach_node(ft,
 							 dd.det_nfp,
-							 dd.det_pfp);
+							 dd.det_pfp,
+							 key_len);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*
@@ -11180,7 +11258,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					 * Undo propagation and abort.
 					 */
 					ft_propagate_external_count_parent(
-						snapshot[nr_snapshot - 2],
+						dd.d.pnf,
 						(long) detached_count);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
