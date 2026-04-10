@@ -1214,64 +1214,35 @@ bool ft_node_collapsed(struct cds_ft_inode_flag *node __attribute__((unused)))
 #endif
 
 /*
- * Branchless pointer unmasking via lookup table.
+ * Pointer unmasking via computed mask.
  *
- * Bits 0-3 of a tagged node pointer fully determine the mask
- * needed to extract the raw address:
+ * Derive the address mask directly from the tag bits, exploiting
+ * the fact that each node type's allocation order equals 4 + type_idx
+ * (i.e. type 0 is 16-byte aligned, type 1 is 32-byte aligned, etc.).
  *
- *   0b0000, 0b0100, 0b1000, 0b1100:
- *       external (bits 0-1 == 00) — no masking (~0).
- *   0b0010: compressed (bits 0-2 == 010) — clear bits 0-1.
- *   0b0110: collapsed  (bits 0-2 == 110) — clear bits 0-2.
- *   0bXXX1: internal (bit 0 set) — mask depends on type index
- *       (bits 1-3).  Linear/pigeon: clear bits 0-3.
- *       Pool A/B: clear more bits for subnode index.
- *   0b1010, 0b1110: unreachable (compressed/collapsed nodes are
- *       16-byte aligned, so bit 3 is always 0).  Mapped to ~0
- *       as a safe don't-care.
+ * Bit 0 set (internal node):
+ *   type_idx = (v >> 1) & 7.  Alignment is 1 << (4 + type_idx),
+ *   so clearing the low (4 + type_idx) bits yields the base address.
+ *   This subsumes pool sub-index bits which sit below the alignment
+ *   boundary.  Mask: ~((16UL << type_idx) - 1).
  *
- * One indexed load + one AND.  Zero branches.
+ * Bit 0 clear (external / compressed / collapsed):
+ *   External nodes are >= 8-byte aligned (bits 0-2 zero).
+ *   Compressed/collapsed are >= 16-byte aligned, tagged in bits 1-2.
+ *   Clearing the low 3 bits is sufficient for all three.
+ *   Mask: ~7UL.
  */
-/*
- * Build the table using FT_POOL_IDX_A/B so it's correct for
- * both 32-bit (pool A=4, B=5) and 64-bit (pool A=5, B=6).
- * Internal types that are neither pool A nor B use FT_PTR_MASK.
- */
-#define _FT_POOL_A_TAG	((FT_POOL_IDX_A << FT_INTERNAL_BITS) | FT_INTERNAL_MASK)
-#define _FT_POOL_B_TAG	((FT_POOL_IDX_B << FT_INTERNAL_BITS) | FT_INTERNAL_MASK)
-#define _FT_POOL_A_MASK	~(unsigned long)(FT_POOL_1D_MASK | FT_TYPE_MASK | FT_INTERNAL_MASK)
-#define _FT_POOL_B_MASK	~(unsigned long)(FT_POOL_2D_MASK | FT_TYPE_MASK | FT_INTERNAL_MASK)
-
-#define _FT_IMASK(tag) \
-	((tag) == _FT_POOL_A_TAG ? _FT_POOL_A_MASK : \
-	 (tag) == _FT_POOL_B_TAG ? _FT_POOL_B_MASK : \
-	 (unsigned long) FT_PTR_MASK)
-
-static const unsigned long ft_ptr_mask_table[16] = {
-	[0x0] = ~0UL,					/* external */
-	[0x1] = _FT_IMASK(0x1),			/* internal type 0 */
-	[0x2] = ~(unsigned long) FT_TAG_MASK,		/* compressed */
-	[0x3] = _FT_IMASK(0x3),			/* internal type 1 */
-	[0x4] = ~0UL,					/* external */
-	[0x5] = _FT_IMASK(0x5),			/* internal type 2 */
-	[0x6] = ~(unsigned long) FT_TAG_MASK_WIDE,	/* collapsed */
-	[0x7] = _FT_IMASK(0x7),			/* internal type 3 */
-	[0x8] = ~0UL,					/* external */
-	[0x9] = _FT_IMASK(0x9),			/* internal type 4 */
-	[0xA] = ~0UL,					/* external */
-	[0xB] = _FT_IMASK(0xB),			/* internal type 5 */
-	[0xC] = ~0UL,					/* external */
-	[0xD] = _FT_IMASK(0xD),			/* internal type 6 */
-	[0xE] = ~0UL,					/* external */
-	[0xF] = _FT_IMASK(0xF),			/* internal type 7 */
-};
-
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
+	unsigned long mask;
 
-	return (struct cds_ft_inode *) (v & ft_ptr_mask_table[v & 0xF]);
+	if (v & FT_INTERNAL_MASK)
+		mask = ~((16UL << ((v >> 1) & 7)) - 1);
+	else
+		mask = ~7UL;
+	return (struct cds_ft_inode *) (v & mask);
 }
 
 static
