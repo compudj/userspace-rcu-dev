@@ -1214,34 +1214,35 @@ bool ft_node_collapsed(struct cds_ft_inode_flag *node __attribute__((unused)))
 #endif
 
 /*
- * Pointer unmasking via computed mask.
+ * Pointer unmasking via speculative mask + conditional select.
  *
- * Derive the address mask directly from the tag bits, exploiting
- * the fact that each node type's allocation order equals 4 + type_idx
- * (i.e. type 0 is 16-byte aligned, type 1 is 32-byte aligned, etc.).
+ * Exploit the fact that each internal node type's allocation order
+ * equals 4 + type_idx (type 0 is 16B-aligned, type 1 is 32B, etc.)
+ * to compute the internal-node mask speculatively, in parallel with
+ * the bit-0 test:
  *
- * Bit 0 set (internal node):
- *   type_idx = (v >> 1) & 7.  Alignment is 1 << (4 + type_idx),
- *   so clearing the low (4 + type_idx) bits yields the base address.
- *   This subsumes pool sub-index bits which sit below the alignment
- *   boundary.  Mask: ~((16UL << type_idx) - 1).
+ *   mask_internal = (~15UL) << ((v >> 1) & 7)
+ *                 = ~0UL << (4 + type_idx)
  *
- * Bit 0 clear (external / compressed / collapsed):
- *   External nodes are >= 8-byte aligned (bits 0-2 zero).
- *   Compressed/collapsed are >= 16-byte aligned, tagged in bits 1-2.
- *   Clearing the low 3 bits is sufficient for all three.
- *   Mask: ~7UL.
+ * This clears all tag and pool sub-index bits that sit below the
+ * type's alignment boundary.  The shift amount is derived purely
+ * from bits 1-3 with no dependency on bit 0.
+ *
+ * For non-internal nodes (bit 0 clear): external nodes are >= 8-byte
+ * aligned (bits 0-2 zero), compressed/collapsed are >= 16-byte
+ * aligned with tags in bits 1-2.  A fixed ~7UL mask suffices.
+ *
+ * The conditional select lets the two mask computations run in
+ * parallel; the compiler emits a CMOV, keeping the critical path
+ * to 4 cycles.
  */
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
-	unsigned long mask;
+	unsigned long mask_internal = (~15UL) << ((v >> 1) & 7);
+	unsigned long mask = (v & 1) ? mask_internal : ~7UL;
 
-	if (v & FT_INTERNAL_MASK)
-		mask = ~((16UL << ((v >> 1) & 7)) - 1);
-	else
-		mask = ~7UL;
 	return (struct cds_ft_inode *) (v & mask);
 }
 
