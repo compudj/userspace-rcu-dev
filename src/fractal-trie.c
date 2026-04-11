@@ -7603,6 +7603,9 @@ error:
 			if (ft_node_compressed(created[i]))
 				free_compressed_node(ft,
 					ft_compressed_node_ptr(created[i]));
+			else if (ft_node_skip_compressed(created[i]))
+				free_compressed_node(ft,
+					ft_skip_to_compressed(created[i]));
 			else
 				free_cds_ft_node(ft, ft_node_ptr(created[i]));
 		}
@@ -7903,7 +7906,8 @@ int ft_attach_node(struct cds_ft *ft,
 			iter_key = key + level;
 		}
 	}
-	if (!ft_node_compressed(iter_node_flag)) {
+	if (!ft_node_compressed(iter_node_flag) &&
+	    !ft_node_skip_compressed(iter_node_flag)) {
 		for (i = key_len; i > (int) level; i--) {
 			uint8_t key_value;
 
@@ -8853,19 +8857,15 @@ int _cds_ft_insert(struct cds_ft *ft,
 		key_value = *(iter_key++);
 		ft_descent_step(&d, key_value);
 		/*
-		 * Skip-compressed pointer: resolve and advance past
-		 * the compressed path encoded in the pointer.
+		 * Skip-compressed pointer: convert back to the
+		 * underlying compressed node flag so the compressed
+		 * handler at the loop top can detect key divergence
+		 * and split.  Mutation paths must NOT blindly skip
+		 * past compressed paths.
 		 */
-		if (ft_node_skip_compressed(d.nf)) {
-			unsigned int skip = ft_skip_len(d.nf);
-			unsigned int remaining = key_depth - 1 - d.depth;
-
-			if (skip > remaining)
-				break;
-			d.nf = ft_skip_child_ptr(d.nf);
-			iter_key += skip;
-			d.depth += skip;
-		}
+		if (ft_node_skip_compressed(d.nf))
+			d.nf = ft_compressed_node_flag(
+				ft_skip_to_compressed(d.nf));
 	}
 
 	if (d.depth == key_depth - 1) {
@@ -9116,16 +9116,9 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			nr_snapshot, d.nf, d.depth);
 		key_value = *(iter_key++);
 		ft_descent_step(&d, key_value);
-		if (ft_node_skip_compressed(d.nf)) {
-			unsigned int skip = ft_skip_len(d.nf);
-			unsigned int remaining = key_depth - 1 - d.depth;
-
-			if (skip > remaining)
-				break;
-			d.nf = ft_skip_child_ptr(d.nf);
-			iter_key += skip;
-			d.depth += skip;
-		}
+		if (ft_node_skip_compressed(d.nf))
+			d.nf = ft_compressed_node_flag(
+				ft_skip_to_compressed(d.nf));
 	}
 
 	if (d.depth == key_depth - 1) {
@@ -9463,7 +9456,8 @@ int ft_detach_node(struct cds_ft *ft,
 	 * (e.g. compressed root from detach/graft_swap), recompact it
 	 * to an empty linear node so the root is always internal.
 	 */
-	if (ft_node_compressed(iter_node_flag)) {
+	if (ft_node_compressed(iter_node_flag) ||
+	    ft_node_skip_compressed(iter_node_flag)) {
 		struct cds_ft_inode *fresh;
 		struct cds_ft_metadata *fresh_meta;
 
@@ -9562,6 +9556,7 @@ int ft_detach_node(struct cds_ft *ft,
 	 * already published inline above.
 	 */
 	if (!ft_node_compressed(iter_node_flag) &&
+	    !ft_node_skip_compressed(iter_node_flag) &&
 	    !ft_node_collapsed(iter_node_flag)) {
 		dbg_printf("ft_detach_node: publish %p instead of %p\n",
 			iter_node_flag, *detach_parent_flag_ptr);
@@ -9761,22 +9756,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		dbg_printf("cds_ft_remove iter key lookup %u finds nf %p, nfp %p\n",
 				(unsigned int) key_value, dd.d.nf,
 				dd.d.nfp);
-		/*
-		 * Skip-compressed pointer: resolve the skip and
-		 * advance the key past the compressed path.
-		 * The compressed node is transparent - treat its
-		 * child as the result of the descent step.
-		 */
-		if (ft_node_skip_compressed(dd.d.nf)) {
-			unsigned int skip = ft_skip_len(dd.d.nf);
-			unsigned int remaining = key_len - dd.d.depth;
-
-			if (skip > remaining)
-				return CDS_FT_STATUS_NOT_FOUND;
-			dd.d.nf = ft_skip_child_ptr(dd.d.nf);
-			iter_key += skip;
-			dd.d.depth += skip;
-		}
+		if (ft_node_skip_compressed(dd.d.nf))
+			dd.d.nf = ft_compressed_node_flag(
+				ft_skip_to_compressed(dd.d.nf));
 	}
 	/*
 	 * We reached end of key, try to find the node we are trying to
@@ -10068,18 +10050,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_detach_descent_step(&dd, key_value);
 		dbg_printf("cds_ft_remove_all iter key lookup %u finds nf %p, nfp %p\n",
 				(unsigned int) key_value, dd.d.nf, dd.d.nfp);
-		if (ft_node_skip_compressed(dd.d.nf)) {
-			unsigned int skip = ft_skip_len(dd.d.nf);
-			unsigned int remaining = key_len - dd.d.depth;
-
-			if (skip > remaining) {
-				*result_node = NULL;
-				return CDS_FT_STATUS_NOT_FOUND;
-			}
-			dd.d.nf = ft_skip_child_ptr(dd.d.nf);
-			iter_key += skip;
-			dd.d.depth += skip;
-		}
+		if (ft_node_skip_compressed(dd.d.nf))
+			dd.d.nf = ft_compressed_node_flag(
+				ft_skip_to_compressed(dd.d.nf));
 	}
 
 	/* Reached end of key. */
@@ -10313,6 +10286,8 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	if (top_flag != branch_flag) {
 		if (ft_node_compressed(top_flag))
 			d->pnfp = &ft_compressed_node_ptr(top_flag)->child;
+		else if (ft_node_skip_compressed(top_flag))
+			d->pnfp = &ft_skip_to_compressed(top_flag)->child;
 		else
 			/* Single-child internal prefix: find the slot
 			 * holding branch_flag within the prefix node. */
@@ -10342,6 +10317,9 @@ error:
 			if (ft_node_compressed(created[i]))
 				free_compressed_node(ft,
 					ft_compressed_node_ptr(created[i]));
+			else if (ft_node_skip_compressed(created[i]))
+				free_compressed_node(ft,
+					ft_skip_to_compressed(created[i]));
 			else
 				free_cds_ft_node(ft, ft_node_ptr(created[i]));
 		}
@@ -11381,16 +11359,9 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 			kv = *(ik++);
 			ft_detach_descent_step(&dd, kv);
-			if (ft_node_skip_compressed(dd.d.nf)) {
-				unsigned int skip = ft_skip_len(dd.d.nf);
-				unsigned int remaining = key_len - dd.d.depth;
-
-				if (skip > remaining)
-					return CDS_FT_STATUS_NOT_FOUND;
-				dd.d.nf = ft_skip_child_ptr(dd.d.nf);
-				ik += skip;
-				dd.d.depth += skip;
-			}
+			if (ft_node_skip_compressed(dd.d.nf))
+				dd.d.nf = ft_compressed_node_flag(
+					ft_skip_to_compressed(dd.d.nf));
 		}
 
 		child = dd.d.nf;
