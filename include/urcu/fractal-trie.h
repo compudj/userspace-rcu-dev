@@ -276,6 +276,9 @@ struct cds_ft_group;
 #define CDS_FT_MAX_LEN_UNLIMITED	SIZE_MAX
 #define CDS_FT_KEY_MAP_SIZE		256
 
+/* Fractal Trie group flags. */
+#define CDS_FT_FLAG_SKIP_COMPRESSED	(1U << 0)	/* Skip compressed nodes on candidate lookup fast path. */
+
 /*
  * Status codes returned by Fractal Trie operations.
  *
@@ -1537,6 +1540,18 @@ enum cds_ft_status cds_ft_attr_set_max_key_len(struct cds_ft_attr *attr, size_t 
  */
 enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
 		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key);
+
+/*
+ * cds_ft_attr_set_flags - Set Fractal Trie group flags.
+ * @attr: Fractal Trie attributes.
+ * @flags: Combination of CDS_FT_FLAG_* constants.
+ *
+ * Flags are set at group creation time and cannot be changed afterwards.
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ */
+enum cds_ft_status cds_ft_attr_set_flags(struct cds_ft_attr *attr,
+		unsigned int flags);
 
 /*
  * Iterator management
