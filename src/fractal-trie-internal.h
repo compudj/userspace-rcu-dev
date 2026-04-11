@@ -183,6 +183,12 @@ struct cds_ft_metadata {
 						 * mutex.  Not safe for read-side use due to
 						 * RCU lifetime concerns.
 						 */
+	struct cds_ft_inode_flag **skip_slot;	/* Address of the slot holding the skip pointer
+						 * for this compressed node (write-side only).
+						 * NULL when the node is not published as a
+						 * skip pointer.  Used to update the skip
+						 * pointer when cn->child changes (recompact).
+						 */
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
 	unsigned int nr_child;			/* Number of children in node. */
 	int fallback_removal_count;		/* Removals left keeping fallback. */
