@@ -1379,10 +1379,10 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
 	struct cds_ft_inode_flag *parent;
 
 	if (ft_node_external(child))
-		parent = ((struct cds_ft_node *) child)->_ft_parent;
+		parent = rcu_dereference(((struct cds_ft_node *) child)->_ft_parent);
 	else
-		parent = cds_ft_item_to_metadata(
-			ft_node_ptr(child))->parent;
+		parent = rcu_dereference(cds_ft_item_to_metadata(
+			ft_node_ptr(child))->parent);
 	return ft_compressed_node_ptr(parent);
 }
 
@@ -1485,15 +1485,21 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 	if (ft_node_skip_compressed(child_nf)) {
 		struct cds_ft_compressed_node *cn =
 			ft_skip_to_compressed(child_nf);
-		cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) cn)->parent = parent_nf;
+		rcu_assign_pointer(
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) cn)->parent,
+			parent_nf);
 		return;
 	}
 	if (ft_node_external(child_nf)) {
-		((struct cds_ft_node *) child_nf)->_ft_parent = parent_nf;
+		rcu_assign_pointer(
+			((struct cds_ft_node *) child_nf)->_ft_parent,
+			parent_nf);
 		return;
 	}
-	cds_ft_item_to_metadata(ft_node_ptr(child_nf))->parent = parent_nf;
+	rcu_assign_pointer(
+		cds_ft_item_to_metadata(ft_node_ptr(child_nf))->parent,
+		parent_nf);
 }
 
 /* Collapsed node accessors. */
@@ -3842,12 +3848,18 @@ skip_copy:
 			uatomic_inc(&ft->node_fallback_count_distribution[new_metadata->nr_child]);
 	}
 
-	/* Return pointer to new recompacted node through old_node_flag_ptr */
-	*old_node_flag_ptr = new_node_flag;
 	/*
 	 * Inherit the old node's parent pointer so upward walks
 	 * (density propagation, ft_skip_to_compressed) can find
 	 * the parent from the new node.
+	 *
+	 * If the recompacted node was the child of a compressed
+	 * node published as a skip pointer, update the skip
+	 * pointer BEFORE updating cn->child.  This ensures
+	 * candidate readers (which follow the skip pointer)
+	 * see the new child before exact/inequality readers
+	 * (which follow cn->child) do.  The old child remains
+	 * alive until after a grace period.
 	 */
 	if (old_node) {
 		struct cds_ft_metadata *old_meta =
@@ -3855,16 +3867,7 @@ skip_copy:
 		struct cds_ft_inode_flag *old_parent = old_meta->parent;
 
 		new_metadata->parent = old_parent;
-		/*
-		 * If the recompacted node was the child of a compressed
-		 * node published as a skip pointer, update the skip
-		 * pointer to encode the new child address.
-		 *
-		 * The old node's metadata->parent points to the
-		 * compressed node (as a compressed flag).  The
-		 * compressed node's metadata->skip_slot holds the slot
-		 * address of the skip pointer in the grandparent.
-		 */
+
 		if (old_parent && ft_node_compressed(old_parent)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(old_parent);
@@ -3879,6 +3882,8 @@ skip_copy:
 						new_node_flag, cn->len));
 		}
 	}
+	/* Return pointer to new recompacted node through old_node_flag_ptr */
+	*old_node_flag_ptr = new_node_flag;
 	if (old_node && old_node_ret)
 		*old_node_ret = old_node;
 
@@ -8177,13 +8182,11 @@ int ft_attach_node(struct cds_ft *ft,
 			dbg_printf("branch publish error %d\n", ret);
 			goto check_error;
 		}
-		/* Attach branch (unlink the old node from the trie). */
-		rcu_assign_pointer(*attach_node_flag_ptr, iter_dest_node_flag);
-
 		/*
 		 * If the publish target is cn->child and the compressed
 		 * node is published as a skip pointer, update the skip
-		 * pointer to encode the new child.
+		 * pointer BEFORE cn->child so candidate readers see the
+		 * new child before exact/inequality readers do.
 		 */
 		if (old_recompacted_node && attach_node_flag &&
 		    ft_node_compressed(attach_node_flag)) {
@@ -8197,8 +8200,11 @@ int ft_attach_node(struct cds_ft *ft,
 			    ft_node_skip_compressed(*cn_meta->skip_slot))
 				rcu_assign_pointer(*cn_meta->skip_slot,
 					ft_skip_compressed_flag(
-						cn->child, cn->len));
+						iter_dest_node_flag,
+						cn->len));
 		}
+		/* Attach branch (unlink the old node from the trie). */
+		rcu_assign_pointer(*attach_node_flag_ptr, iter_dest_node_flag);
 
 		/* Reclaim safely after unlink. */
 		if (old_recompacted_node)
