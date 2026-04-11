@@ -6929,12 +6929,12 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			goto emit_entry;
 
 		/*
-		 * Skip-compressed: do not absorb — the compressed
-		 * path is free on the lookup fast path.  Emit as
-		 * intermediate entry to preserve the skip pointer.
+		 * Skip-compressed: follow to underlying compressed
+		 * node so its path bytes are absorbed normally.
 		 */
 		if (ft_node_skip_compressed(walk))
-			goto emit_entry;
+			walk = ft_compressed_node_flag(
+				ft_skip_to_compressed(walk));
 
 		/* Compressed: absorb path bytes. */
 		if (ft_node_compressed(walk)) {
@@ -7398,8 +7398,16 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag *col_flag = ft_collapsed_node_flag(col);
 		unsigned int e;
 
-		for (e = 0; e < col_meta->nr_child; e++)
+		for (e = 0; e < col_meta->nr_child; e++) {
 			ft_set_parent(col_ptrs[e], col_flag);
+			if (ft_node_skip_compressed(col_ptrs[e])) {
+				struct cds_ft_compressed_node *scn =
+					ft_skip_to_compressed(col_ptrs[e]);
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) scn)->skip_slot =
+					&col_ptrs[e];
+			}
+		}
 		return col_flag;
 	}
 }
@@ -7484,10 +7492,14 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 						break;
 				}
 				if (j == slen) {
+					struct cds_ft_inode_flag *entry_child;
+					entry_child = ft_dereference_acquire_prefetch(cptrs[e]);
+					if (ft_node_skip_compressed(entry_child))
+						entry_child = ft_compressed_node_flag(
+							ft_skip_to_compressed(entry_child));
 					parent_slot = &cptrs[e];
 					parent_nf = node_flag;
-					node_flag = ft_dereference_acquire_prefetch(
-						cptrs[e]);
+					node_flag = entry_child;
 					depth += slen;
 					ik += slen;
 					found = true;
@@ -7512,6 +7524,18 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			if (col_flag) {
 				ft_set_parent(col_flag, parent_nf);
 				rcu_assign_pointer(*parent_slot, col_flag);
+				if (ft_node_compressed(parent_nf)) {
+					struct cds_ft_compressed_node *pcn =
+						ft_compressed_node_ptr(parent_nf);
+					struct cds_ft_metadata *pcn_meta =
+						cds_ft_item_to_metadata(
+							(struct cds_ft_inode *) pcn);
+					if (pcn_meta->skip_slot)
+						rcu_assign_pointer(
+							*pcn_meta->skip_slot,
+							ft_skip_compressed_flag(
+								col_flag, pcn->len));
+				}
 				free_cds_ft_node(ft, ft_node_ptr(node_flag));
 				/*
 				 * Recompute density for the new collapsed
@@ -7528,13 +7552,14 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 		{
 			uint8_t kv = *(ik++);
 			struct cds_ft_inode_flag **slot = NULL;
+			struct cds_ft_inode_flag *child;
 
-			ft_node_get_nth(node_flag, &slot, kv);
-			if (!slot || !ft_node_ptr(*slot))
+			child = ft_node_get_nth(node_flag, &slot, kv);
+			if (!slot || !ft_node_ptr(child))
 				break;
 			parent_slot = slot;
 			parent_nf = node_flag;
-			node_flag = ft_dereference_acquire_prefetch(*slot);
+			node_flag = child;
 			depth++;
 		}
 	}
@@ -9187,7 +9212,7 @@ insert_done:
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 #ifdef FEATURE_FT_COLLAPSE
-		if (key_len > 0 && !ft_group_skip_compressed(ft->group))
+		if (key_len > 0)
 			ft_check_collapse_on_path(ft, key, key_len);
 #endif
 	}
@@ -10107,8 +10132,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	switch (ret) {
 	case 0:
 #ifdef FEATURE_FT_COLLAPSE
-		if (!ft_group_skip_compressed(ft->group))
-			ft_check_collapse_on_path(ft, iter_key, key_len);
+		ft_check_collapse_on_path(ft, iter_key, key_len);
 #endif
 		return CDS_FT_STATUS_OK;
 	case -ENOMEM:
@@ -10340,8 +10364,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 
 #ifdef FEATURE_FT_COLLAPSE
-	if (!ft_group_skip_compressed(ft->group))
-		ft_check_collapse_on_path(ft, iter_key, key_len);
+	ft_check_collapse_on_path(ft, iter_key, key_len);
 #endif
 	return CDS_FT_STATUS_OK;
 }
@@ -11139,7 +11162,7 @@ done:
 	uatomic_store(&src_ft->max_used_key_len, 0, CMM_RELAXED);
 
 #ifdef FEATURE_FT_COLLAPSE
-	if (key_len > 0 && !ft_group_skip_compressed(dst_ft->group))
+	if (key_len > 0)
 		ft_check_collapse_on_path(dst_ft, key, key_len);
 #endif
 	return CDS_FT_STATUS_OK;
@@ -11716,8 +11739,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 		*result_ft = detached;
 #ifdef FEATURE_FT_COLLAPSE
-		if (!ft_group_skip_compressed(ft->group))
-			ft_check_collapse_on_path(ft, key, key_len);
+		ft_check_collapse_on_path(ft, key, key_len);
 #endif
 		return CDS_FT_STATUS_OK;
 	}
