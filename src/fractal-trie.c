@@ -1365,22 +1365,51 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 /*
  * ft_skip_to_compressed: recover the compressed node from a skip
  * pointer by following the child's parent back-pointer.
- * Write-side or slow read path only.
+ *
+ * For internal/compressed/collapsed children: uses metadata->parent.
+ * For external (leaf) children: uses cds_ft_node._ft_parent.
+ *
+ * Write-side or exact lookup path only.
  */
 static inline
 struct cds_ft_compressed_node *ft_skip_to_compressed(
 		struct cds_ft_inode_flag *skip_ptr)
 {
 	struct cds_ft_inode_flag *child = ft_skip_child_ptr(skip_ptr);
-	struct cds_ft_metadata *child_meta =
-		cds_ft_item_to_metadata(ft_node_ptr(child));
-	return ft_compressed_node_ptr(child_meta->parent);
+	struct cds_ft_inode_flag *parent;
+
+	if (ft_node_external(child))
+		parent = ((struct cds_ft_node *) child)->_ft_parent;
+	else
+		parent = cds_ft_item_to_metadata(
+			ft_node_ptr(child))->parent;
+	return ft_compressed_node_ptr(parent);
 }
 
 static inline
 bool ft_group_skip_compressed(const struct cds_ft_group *group)
 {
 	return group->flags & CDS_FT_FLAG_SKIP_COMPRESSED;
+}
+
+/*
+ * ft_flag_to_metadata: get the metadata for any node flag, including
+ * skip-compressed pointers.  For skip pointers, returns the
+ * compressed node's metadata.  For all others, returns
+ * cds_ft_item_to_metadata(ft_node_ptr(nf)).
+ *
+ * Caller must ensure nf is not NULL and not external.
+ */
+static inline
+struct cds_ft_metadata *ft_flag_to_metadata(struct cds_ft_inode_flag *nf)
+{
+	if (ft_node_skip_compressed(nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_skip_to_compressed(nf);
+		return cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) cn);
+	}
+	return cds_ft_item_to_metadata(ft_node_ptr(nf));
 }
 
 /*
@@ -1398,8 +1427,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 		struct cds_ft_inode_flag *cflag)
 {
 	if (ft_group_skip_compressed(ft->group) &&
-	    cn->len <= FT_SKIP_LEN_MAX &&
-	    !ft_node_external(cn->child)) {
+	    cn->len <= FT_SKIP_LEN_MAX) {
 		return ft_skip_compressed_flag(cn->child, cn->len);
 	}
 	return cflag;
@@ -1407,12 +1435,18 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 
 /*
  * ft_set_parent: set the parent pointer in child's metadata.
- * Skips NULL and external (leaf) nodes which have no metadata.
+ * Skips NULL children.
+ *
+ * External (leaf) nodes: sets cds_ft_node._ft_parent.
  *
  * For skip-compressed pointers: the skip pointer represents a
  * compressed node in the tree.  Set the compressed node's parent
  * (not the compressed node's child's parent, which is the
  * compressed node itself and was set at creation time).
+ *
+ * Skip-compressed must be checked before external: a skip pointer
+ * whose child is external has low tag bits == 0, which would match
+ * ft_node_external on the raw value.
  *
  * Write-side only (mutex-held).
  */
@@ -1420,13 +1454,17 @@ static
 void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *parent_nf)
 {
-	if (ft_node_external(child_nf))
+	if (!child_nf)
 		return;
 	if (ft_node_skip_compressed(child_nf)) {
 		struct cds_ft_compressed_node *cn =
 			ft_skip_to_compressed(child_nf);
 		cds_ft_item_to_metadata(
 			(struct cds_ft_inode *) cn)->parent = parent_nf;
+		return;
+	}
+	if (ft_node_external(child_nf)) {
+		((struct cds_ft_node *) child_nf)->_ft_parent = parent_nf;
 		return;
 	}
 	cds_ft_item_to_metadata(ft_node_ptr(child_nf))->parent = parent_nf;
@@ -6535,7 +6573,36 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 	unsigned int key;
 	unsigned long total = 0;
 
-	if (!ft_node_ptr(node_flag) || ft_node_external(node_flag))
+	if (!ft_node_ptr(node_flag))
+		return;
+	/*
+	 * Skip-compressed: initialize density on the underlying
+	 * compressed node.  Must check before ft_node_external
+	 * because a skip pointer with an external child has low
+	 * tag bits == 0.
+	 */
+	if (ft_node_skip_compressed(node_flag)) {
+		struct cds_ft_compressed_node *cn =
+			ft_skip_to_compressed(node_flag);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) cn);
+		struct cds_ft_inode_flag *child =
+			ft_skip_child_ptr(node_flag);
+
+		if (ft_node_ptr(child) && !ft_node_external(child)) {
+			if (cn->len <= FT_NODE_DENSITY_DEPTH) {
+				struct cds_ft_metadata *cm =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(child));
+				total += ft_child_density_contribution(
+					cm, cn->len);
+			}
+		}
+		ft_density_set(cn_meta, 0, total);
+		return;
+	}
+	if (ft_node_external(node_flag))
 		return;
 	if (ft_node_compressed(node_flag)) {
 		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
@@ -6688,12 +6755,12 @@ void ft_propagate_node_density_parent(struct cds_ft_inode_flag *start,
 		if (distance > FT_NODE_DENSITY_DEPTH)
 			break;
 
-		m = cds_ft_item_to_metadata(ft_node_ptr(cur));
+		m = ft_flag_to_metadata(cur);
 		ft_density_add(m, 0, delta);
 		if (distance >= 2)
 			ft_density_add(m, distance - 1, delta);
 next:
-		m = cds_ft_item_to_metadata(ft_node_ptr(cur));
+		m = ft_flag_to_metadata(cur);
 		parent = m->parent;
 		if (!parent)
 			break;
@@ -7494,6 +7561,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		nb_meta->nr_child = 1;
 		uatomic_store(&nb_meta->nr_keys, 1, CMM_RELAXED);
 		new_branch_flag = ft_compressed_node_flag(nb);
+		ft_set_parent(nb->child, new_branch_flag);
 		new_branch_flag = ft_publish_compressed(ft, nb, new_branch_flag);
 		created[nr_created++] = new_branch_flag;
 	} else if (new_len == 1) {
@@ -8055,7 +8123,7 @@ publish_done:
 
 		for (cn_idx = 0; cn_idx < nr_created_nodes; cn_idx++)
 			ft_init_node_density(created_nodes[cn_idx]);
-		top_meta = cds_ft_item_to_metadata(ft_node_ptr(top_node));
+		top_meta = ft_flag_to_metadata(top_node);
 		ft_propagate_node_density_parent(top_node, level,
 			level, (long)(1 + ft_density_get(top_meta, 0)));
 	}

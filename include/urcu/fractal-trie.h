@@ -370,6 +370,14 @@ enum cds_ft_iter_path_mode {
  */
 struct cds_ft_node {
 	struct cds_ft_node *next;
+	/*
+	 * Parent pointer used by CDS_FT_FLAG_SKIP_COMPRESSED to recover
+	 * the compressed node from a skip pointer when the child is an
+	 * external (leaf) node.  Written by the mutation side
+	 * (mutex-held); read by exact lookup and write-side paths.
+	 * Not accessed on the candidate lookup fast path.
+	 */
+	void *_ft_parent;
 };
 
 #define cds_ft_entry(ptr, type, member)		caa_container_of(ptr, type, member)
@@ -382,6 +390,7 @@ static inline
 void cds_ft_node_init(struct cds_ft_node *node)
 {
 	node->next = NULL;
+	node->_ft_parent = NULL;
 }
 
 /*
