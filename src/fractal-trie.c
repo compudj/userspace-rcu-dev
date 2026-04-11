@@ -5918,8 +5918,18 @@ going_up:
 				iter_path_node(iter)[level] = node_flag;
 				break;
 			}
-			/* No match found, continue going up. */
+			/* No match found, continue going up.
+			 *
+			 * Reset iter_key to match the new level.
+			 * The collapsed handler jumped level back from
+			 * within the entry's suffix span to
+			 * entry_depth + 1.  iter_key must point to
+			 * ordinal_key + entry_depth so the next
+			 * *(--iter_key) at level entry_depth reads the
+			 * correct key byte.
+			 */
 			level = entry_depth + 1;
+			iter_key = ordinal_key + entry_depth;
 			going_up = true;
 			continue;
 		} /* current_entry scope */
