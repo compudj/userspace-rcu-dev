@@ -5196,6 +5196,9 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **nod
 			*level_p = level;
 			return FT_COMPRESSED_BREAK;
 		}
+		if (ft_node_skip_compressed(node_flag))
+			node_flag = ft_compressed_node_flag(
+				ft_skip_to_compressed(node_flag));
 		iter_path_node(iter)[level + 1] = node_flag;
 		*skip_eq_external_nodes_p = false;
 		*node_flag_p = node_flag;
@@ -5714,6 +5717,10 @@ going_up:
 					ft_dereference_acquire(
 						cptrs[current_entry]);
 
+				if (ft_node_skip_compressed(child_flag))
+					child_flag = ft_compressed_node_flag(
+						ft_skip_to_compressed(
+							child_flag));
 				if (ft_node_ptr(child_flag) &&
 				    ft_node_internal(child_flag)) {
 					uint8_t sib_key = 0;
@@ -5723,6 +5730,12 @@ going_up:
 						ordinal_key[suffix_base + cur_slen],
 						&sib_key, dir);
 					if (ft_node_ptr(node_flag)) {
+						if (ft_node_skip_compressed(
+								node_flag))
+							node_flag =
+								ft_compressed_node_flag(
+								ft_skip_to_compressed(
+								node_flag));
 						ordinal_key[suffix_base + cur_slen] =
 							sib_key;
 						level = suffix_base + cur_slen + 1;
@@ -5756,6 +5769,10 @@ going_up:
 				assert(level < key_depth);
 				node_flag = ft_dereference_acquire_prefetch(
 					cptrs[best]);
+				if (ft_node_skip_compressed(node_flag))
+					node_flag = ft_compressed_node_flag(
+						ft_skip_to_compressed(
+							node_flag));
 				iter_path_node(iter)[level] = node_flag;
 				break;
 			}
@@ -5778,6 +5795,9 @@ going_up:
 				node_flag);
 		/* If found left/right sibling, find rightmost/leftmost child. */
 		if (ft_node_ptr(node_flag)) {
+			if (ft_node_skip_compressed(node_flag))
+				node_flag = ft_compressed_node_flag(
+					ft_skip_to_compressed(node_flag));
 			/* Record the sibling in the path. */
 			iter_path_node(iter)[level] = node_flag;
 			break;
@@ -5916,6 +5936,12 @@ descend_children:
 		if (ft_node_external(node_flag))
 			break;
 		/*
+		 * Skip-compressed: convert to compressed flag.
+		 */
+		if (ft_node_skip_compressed(node_flag))
+			node_flag = ft_compressed_node_flag(
+				ft_skip_to_compressed(node_flag));
+		/*
 		 * Compressed node: traverse through the compressed
 		 * path to reach the child.  Fill ordinal_key and
 		 * iter path as we go.
@@ -6045,6 +6071,9 @@ descend_children:
 				node_flag = ft_dereference_acquire_prefetch(cptrs[best]);
 				if (!ft_node_ptr(node_flag))
 					break;
+				if (ft_node_skip_compressed(node_flag))
+					node_flag = ft_compressed_node_flag(
+						ft_skip_to_compressed(node_flag));
 				iter_path_node(iter)[level + 1] = node_flag;
 				if (ft_node_external(node_flag))
 					break;
@@ -6065,6 +6094,9 @@ descend_children:
 			iter->status = CDS_FT_STATUS_NOT_FOUND;
 			goto end;
 		}
+		if (ft_node_skip_compressed(node_flag))
+			node_flag = ft_compressed_node_flag(
+				ft_skip_to_compressed(node_flag));
 		iter_path_node(iter)[level] = node_flag;
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) ordinal_key[level - 1], node_flag);
