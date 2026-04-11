@@ -63,6 +63,7 @@ struct cds_ft_attr {
 	size_t key_len;
 	size_t max_key_len;
 	struct cds_ft_key_map key_map;
+	unsigned int flags;
 };
 
 enum cds_ft_type_class {
@@ -1240,6 +1241,20 @@ static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
+
+	/*
+	 * Clear the top FT_SKIP_LEN_BITS (7 bits).
+	 * Executed as `shl $7` + `shr $7` to save instruction cache
+	 * bytes compared to a 10-byte `movabs` for FT_ADDR_MASK.
+	 * The 2-cycle latency is completely hidden by the superscalar
+	 * execution of the mask generation below.
+	 */
+	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
+
+	/*
+	 * Compute masks branchlessly using ILP.
+	 * mask_internal generation runs in parallel with the bit 0 test.
+	 */
 	unsigned long mask_internal = (~15UL) << ((v >> 1) & 7);
 	unsigned long mask = (v & 1) ? mask_internal : ~7UL;
 
@@ -1249,7 +1264,10 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 static
 struct cds_ft_inode *_ft_node_mask_ptr(struct cds_ft_inode_flag *node)
 {
-	return (struct cds_ft_inode *) (((unsigned long) node) & FT_PTR_MASK);
+	unsigned long v = (unsigned long) node;
+
+	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
+	return (struct cds_ft_inode *) (v & FT_PTR_MASK);
 }
 
 static inline_lookup
@@ -1306,9 +1324,96 @@ struct cds_ft_collapsed_node *ft_collapsed_node_ptr(
 		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK_WIDE);
 }
 
+/* Skip-compressed pointer helpers. */
+
+static inline
+bool ft_node_skip_compressed(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node >> FT_SKIP_LEN_SHIFT) != 0;
+}
+
+static inline
+unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
+{
+	return (unsigned long) node >> FT_SKIP_LEN_SHIFT;
+}
+
+/*
+ * ft_skip_child_ptr: extract the child tagged pointer from a skip
+ * pointer by clearing the skip-length bits.
+ */
+static inline
+struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
+{
+	return (struct cds_ft_inode_flag *) ((unsigned long) node & FT_ADDR_MASK);
+}
+
+/*
+ * ft_skip_compressed_flag: encode a skip pointer from a child pointer
+ * and the compressed path length.
+ */
+static
+struct cds_ft_inode_flag *ft_skip_compressed_flag(
+		struct cds_ft_inode_flag *child, unsigned int len)
+{
+	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
+	return (struct cds_ft_inode_flag *)
+		((unsigned long) child |
+		 ((unsigned long) len << FT_SKIP_LEN_SHIFT));
+}
+
+/*
+ * ft_skip_to_compressed: recover the compressed node from a skip
+ * pointer by following the child's parent back-pointer.
+ * Write-side or slow read path only.
+ */
+static inline
+struct cds_ft_compressed_node *ft_skip_to_compressed(
+		struct cds_ft_inode_flag *skip_ptr)
+{
+	struct cds_ft_inode_flag *child = ft_skip_child_ptr(skip_ptr);
+	struct cds_ft_metadata *child_meta =
+		cds_ft_item_to_metadata(ft_node_ptr(child));
+	return ft_compressed_node_ptr(child_meta->parent);
+}
+
+static inline
+bool ft_group_skip_compressed(const struct cds_ft_group *group)
+{
+	return group->flags & CDS_FT_FLAG_SKIP_COMPRESSED;
+}
+
+/*
+ * ft_publish_compressed: convert a compressed node flag to a skip
+ * pointer if skip-compressed mode is enabled, the path length fits,
+ * and the child has metadata (is not external).
+ *
+ * Call AFTER ft_set_parent and ft_init_node_density have been done
+ * with the real compressed flag (@cflag).  The returned value is
+ * what should be published/stored in parent child slots.
+ */
+static
+struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
+		struct cds_ft_compressed_node *cn,
+		struct cds_ft_inode_flag *cflag)
+{
+	if (ft_group_skip_compressed(ft->group) &&
+	    cn->len <= FT_SKIP_LEN_MAX &&
+	    !ft_node_external(cn->child)) {
+		return ft_skip_compressed_flag(cn->child, cn->len);
+	}
+	return cflag;
+}
+
 /*
  * ft_set_parent: set the parent pointer in child's metadata.
  * Skips NULL and external (leaf) nodes which have no metadata.
+ *
+ * For skip-compressed pointers: the skip pointer represents a
+ * compressed node in the tree.  Set the compressed node's parent
+ * (not the compressed node's child's parent, which is the
+ * compressed node itself and was set at creation time).
+ *
  * Write-side only (mutex-held).
  */
 static
@@ -1317,6 +1422,13 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 {
 	if (ft_node_external(child_nf))
 		return;
+	if (ft_node_skip_compressed(child_nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_skip_to_compressed(child_nf);
+		cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) cn)->parent = parent_nf;
+		return;
+	}
 	cds_ft_item_to_metadata(ft_node_ptr(child_nf))->parent = parent_nf;
 }
 
@@ -1932,8 +2044,12 @@ uint8_t ft_linear_encode_nr_child(unsigned int nr_child,
 
 static inline void ft_maybe_prefetch(const void *ptr)
 {
-	if (((unsigned long)ptr & FT_PREFETCH_SKIP_MASK) != FT_PREFETCH_SKIP_MASK)
-		__builtin_prefetch(ptr);
+	unsigned long v = (unsigned long) ptr;
+
+	/* Clear skip-compressed length bits. */
+	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
+	if ((v & FT_PREFETCH_SKIP_MASK) != FT_PREFETCH_SKIP_MASK)
+		__builtin_prefetch((const void *) v);
 }
 
 /*
@@ -4196,6 +4312,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	size_t iter_path_len = 0;
 	bool track = (tracking != FT_PREFIX_TRACK_NONE);
 	bool track_longest = (tracking == FT_PREFIX_TRACK_LONGEST);
+	bool skip_compressed = ft_group_skip_compressed(ft->group);
 	size_t match_len = track_longest ? FT_MATCH_LEN_NONE : 0;
 	struct cds_ft_node *match_node = NULL;
 
@@ -4262,6 +4379,42 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * key dispatch below.
 		 */
 		/*
+		 * Skip-compressed pointer at loop top: resolve the
+		 * skip before type dispatch.  This handles skip
+		 * pointers returned by collapsed entry children or
+		 * by ft_node_get_nth in the previous iteration.
+		 */
+		if (skip_compressed &&
+		    caa_unlikely(ft_node_skip_compressed(node_flag))) {
+			unsigned int skip = ft_skip_len(node_flag);
+			int remaining = key_depth - 1 - i;
+
+			if (!candidate) {
+				struct cds_ft_compressed_node *cn =
+					ft_skip_to_compressed(node_flag);
+				int cmp_len = (int) skip < remaining ?
+					(int) skip : remaining;
+
+				if (ft_key_cmp_ordinals(key, cn->key_bytes,
+						cmp_len, remaining,
+						false, NULL) != 0) {
+					status = CDS_FT_STATUS_NOT_FOUND;
+					goto end;
+				}
+			}
+			if ((int) skip > remaining) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			key += skip;
+			i += skip;
+			node_flag = ft_skip_child_ptr(node_flag);
+			if (iter) {
+				iter_path_node(iter)[i] = node_flag;
+				iter_path_len = i + 1;
+			}
+		}
+		/*
 		 * Non-internal nodes need special handling.
 		 * Internal (bit 0 set) is the common case.
 		 *
@@ -4319,6 +4472,41 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		if (!ft_node_ptr(node_flag)) {
 			status = CDS_FT_STATUS_NOT_FOUND;
 			goto end;
+		}
+		/*
+		 * Skip-compressed pointer: the child slot encodes a
+		 * compressed path that can be skipped on the fast path.
+		 */
+		if (skip_compressed && caa_unlikely(ft_node_skip_compressed(node_flag))) {
+			unsigned int skip = ft_skip_len(node_flag);
+			int remaining = key_depth - 1 - i;
+
+			if (!candidate) {
+				struct cds_ft_compressed_node *cn =
+					ft_skip_to_compressed(node_flag);
+				int cmp_len = (int) skip < remaining ?
+					(int) skip : remaining;
+
+				if (ft_key_cmp_ordinals(key, cn->key_bytes,
+						cmp_len, remaining,
+						false, NULL) != 0) {
+					status = CDS_FT_STATUS_NOT_FOUND;
+					goto end;
+				}
+			}
+			if ((int) skip > remaining) {
+				/*
+				 * Key is shorter than compressed path.
+				 * In non-skip mode this would check
+				 * external_nodes at the compressed node;
+				 * for now, treat as not-found.
+				 */
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			key += skip;
+			i += skip;
+			node_flag = ft_skip_child_ptr(node_flag);
 		}
 		if (iter) {
 			iter_path_node(iter)[i] = node_flag;
@@ -6318,6 +6506,10 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 			child = ft_collapsed_ptrs(col, nr_e)[e];
 			if (!ft_node_ptr(child) || ft_node_external(child))
 				continue;
+			if (ft_node_skip_compressed(child)) {
+				/* Zero cache line cost on lookup. */
+				continue;
+			}
 			if (slen <= FT_NODE_DENSITY_DEPTH) {
 				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
 				total += ft_child_density_contribution(cm, slen);
@@ -6336,6 +6528,17 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 		if (!ft_node_ptr(child))
 			continue;
 		if (ft_node_external(child))
+			continue;
+		/*
+		 * Skip-compressed pointer: the compressed node is
+		 * never accessed on the lookup fast path (zero cache
+		 * line cost).  Contribute negative weight proportional
+		 * to the skip length — longer compressed paths are
+		 * more valuable to preserve, and collapsing their
+		 * parent would replace free skip traversal with a
+		 * costly collapsed suffix scan.
+		 */
+		if (ft_node_skip_compressed(child))
 			continue;
 		{
 			struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
@@ -6507,6 +6710,14 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 		if (ft_node_external(walk))
 			goto emit_entry;
 
+		/*
+		 * Skip-compressed: do not absorb — the compressed
+		 * path is free on the lookup fast path.  Emit as
+		 * intermediate entry to preserve the skip pointer.
+		 */
+		if (ft_node_skip_compressed(walk))
+			goto emit_entry;
+
 		/* Compressed: absorb path bytes. */
 		if (ft_node_compressed(walk)) {
 			struct cds_ft_compressed_node *cn =
@@ -6665,6 +6876,23 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	/* Quick pre-filter: need at least 2 children. */
 	if (nr_child < 2)
 		return NULL;
+
+	/*
+	 * Skip-compressed children are free on the lookup fast path
+	 * (zero cache line cost).  Collapsing a node that has any
+	 * skip-compressed children would replace those free paths
+	 * with costly collapsed suffix scans — never profitable.
+	 */
+	if (ft_group_skip_compressed(ft->group)) {
+		unsigned int k;
+
+		for (k = 0; k < 256; k++) {
+			struct cds_ft_inode_flag *c =
+				ft_node_get_nth(node_flag, NULL, (uint8_t) k);
+			if (ft_node_skip_compressed(c))
+				return NULL;
+		}
+	}
 
 	/*
 	 * Select collapsed node configuration using density counters.
@@ -7177,6 +7405,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		uatomic_store(&sfx_meta->nr_keys, old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
 		ft_set_parent(cn->child, old_suffix_flag);
+		old_suffix_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
 		created[nr_created++] = old_suffix_flag;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -7214,6 +7443,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		nb_meta->nr_child = 1;
 		uatomic_store(&nb_meta->nr_keys, 1, CMM_RELAXED);
 		new_branch_flag = ft_compressed_node_flag(nb);
+		new_branch_flag = ft_publish_compressed(ft, nb, new_branch_flag);
 		created[nr_created++] = new_branch_flag;
 	} else if (new_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -7282,6 +7512,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(branch_flag, top_flag);
+		top_flag = ft_publish_compressed(ft, pfx, top_flag);
 		created[nr_created++] = top_flag;
 	} else if (diverge_pos == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -7440,6 +7671,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			CMM_RELAXED);
 		suffix_flag = ft_compressed_node_flag(sfx);
 		ft_set_parent(cn->child, suffix_flag);
+		suffix_flag = ft_publish_compressed(ft, sfx, suffix_flag);
 		created[nr_created++] = suffix_flag;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -7493,6 +7725,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(jct_flag, top_flag);
+		top_flag = ft_publish_compressed(ft, pfx, top_flag);
 		created[nr_created++] = top_flag;
 	} else {
 		/* remaining == 1 */
@@ -7590,7 +7823,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		struct cds_ft_inode_flag *cflag = ft_compressed_node_flag(cn);
 		ft_set_parent(child, cflag);
 		ft_init_node_density(cflag);
-		return cflag;
+		return ft_publish_compressed(ft, cn, cflag);
 	}
 }
 #else
@@ -8115,7 +8348,7 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		cflag = ft_compressed_node_flag(cn);
 		ft_set_parent(child, cflag);
 		ft_init_node_density(cflag);
-		return cflag;
+		return ft_publish_compressed(ft, cn, cflag);
 	}
 #endif
 	{
@@ -8619,6 +8852,20 @@ int _cds_ft_insert(struct cds_ft *ft,
 			nr_snapshot, d.nf, d.depth);
 		key_value = *(iter_key++);
 		ft_descent_step(&d, key_value);
+		/*
+		 * Skip-compressed pointer: resolve and advance past
+		 * the compressed path encoded in the pointer.
+		 */
+		if (ft_node_skip_compressed(d.nf)) {
+			unsigned int skip = ft_skip_len(d.nf);
+			unsigned int remaining = key_depth - 1 - d.depth;
+
+			if (skip > remaining)
+				break;
+			d.nf = ft_skip_child_ptr(d.nf);
+			iter_key += skip;
+			d.depth += skip;
+		}
 	}
 
 	if (d.depth == key_depth - 1) {
@@ -8711,7 +8958,7 @@ insert_done:
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 #ifdef FEATURE_FT_COLLAPSE
-		if (key_len > 0)
+		if (key_len > 0 && !ft_group_skip_compressed(ft->group))
 			ft_check_collapse_on_path(ft, key, key_len);
 #endif
 	}
@@ -8869,6 +9116,16 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			nr_snapshot, d.nf, d.depth);
 		key_value = *(iter_key++);
 		ft_descent_step(&d, key_value);
+		if (ft_node_skip_compressed(d.nf)) {
+			unsigned int skip = ft_skip_len(d.nf);
+			unsigned int remaining = key_depth - 1 - d.depth;
+
+			if (skip > remaining)
+				break;
+			d.nf = ft_skip_child_ptr(d.nf);
+			iter_key += skip;
+			d.depth += skip;
+		}
 	}
 
 	if (d.depth == key_depth - 1) {
@@ -9504,6 +9761,22 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		dbg_printf("cds_ft_remove iter key lookup %u finds nf %p, nfp %p\n",
 				(unsigned int) key_value, dd.d.nf,
 				dd.d.nfp);
+		/*
+		 * Skip-compressed pointer: resolve the skip and
+		 * advance the key past the compressed path.
+		 * The compressed node is transparent - treat its
+		 * child as the result of the descent step.
+		 */
+		if (ft_node_skip_compressed(dd.d.nf)) {
+			unsigned int skip = ft_skip_len(dd.d.nf);
+			unsigned int remaining = key_len - dd.d.depth;
+
+			if (skip > remaining)
+				return CDS_FT_STATUS_NOT_FOUND;
+			dd.d.nf = ft_skip_child_ptr(dd.d.nf);
+			iter_key += skip;
+			dd.d.depth += skip;
+		}
 	}
 	/*
 	 * We reached end of key, try to find the node we are trying to
@@ -9629,7 +9902,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	switch (ret) {
 	case 0:
 #ifdef FEATURE_FT_COLLAPSE
-		ft_check_collapse_on_path(ft, iter_key, key_len);
+		if (!ft_group_skip_compressed(ft->group))
+			ft_check_collapse_on_path(ft, iter_key, key_len);
 #endif
 		return CDS_FT_STATUS_OK;
 	case -ENOMEM:
@@ -9794,6 +10068,18 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_detach_descent_step(&dd, key_value);
 		dbg_printf("cds_ft_remove_all iter key lookup %u finds nf %p, nfp %p\n",
 				(unsigned int) key_value, dd.d.nf, dd.d.nfp);
+		if (ft_node_skip_compressed(dd.d.nf)) {
+			unsigned int skip = ft_skip_len(dd.d.nf);
+			unsigned int remaining = key_len - dd.d.depth;
+
+			if (skip > remaining) {
+				*result_node = NULL;
+				return CDS_FT_STATUS_NOT_FOUND;
+			}
+			dd.d.nf = ft_skip_child_ptr(dd.d.nf);
+			iter_key += skip;
+			dd.d.depth += skip;
+		}
 	}
 
 	/* Reached end of key. */
@@ -9861,7 +10147,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 
 #ifdef FEATURE_FT_COLLAPSE
-	ft_check_collapse_on_path(ft, iter_key, key_len);
+	if (!ft_group_skip_compressed(ft->group))
+		ft_check_collapse_on_path(ft, iter_key, key_len);
 #endif
 	return CDS_FT_STATUS_OK;
 }
@@ -9925,6 +10212,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 			CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
 		ft_set_parent(cn->child, old_suffix_flag);
+		old_suffix_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
 		created[nr_created++] = old_suffix_flag;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -9978,6 +10266,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(branch_flag, top_flag);
+		top_flag = ft_publish_compressed(ft, pfx, top_flag);
 		created[nr_created++] = top_flag;
 	} else if (diverge_pos == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -10228,6 +10517,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 			CMM_RELAXED);
 		suffix_flag = ft_compressed_node_flag(sfx);
 		ft_set_parent(cn->child, suffix_flag);
+		suffix_flag = ft_publish_compressed(ft, sfx, suffix_flag);
 	} else {
 		struct cds_ft_inode_flag *dest = NULL;
 		int ret;
@@ -10269,6 +10559,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		prefix_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(suffix_flag, prefix_flag);
+		prefix_flag = ft_publish_compressed(ft, pfx, prefix_flag);
 	} else {
 		/* prefix_len == 1 */
 		struct cds_ft_inode_flag *dest = NULL;
@@ -10650,7 +10941,7 @@ done:
 	uatomic_store(&src_ft->max_used_key_len, 0, CMM_RELAXED);
 
 #ifdef FEATURE_FT_COLLAPSE
-	if (key_len > 0)
+	if (key_len > 0 && !ft_group_skip_compressed(dst_ft->group))
 		ft_check_collapse_on_path(dst_ft, key, key_len);
 #endif
 	return CDS_FT_STATUS_OK;
@@ -11090,6 +11381,16 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 			kv = *(ik++);
 			ft_detach_descent_step(&dd, kv);
+			if (ft_node_skip_compressed(dd.d.nf)) {
+				unsigned int skip = ft_skip_len(dd.d.nf);
+				unsigned int remaining = key_len - dd.d.depth;
+
+				if (skip > remaining)
+					return CDS_FT_STATUS_NOT_FOUND;
+				dd.d.nf = ft_skip_child_ptr(dd.d.nf);
+				ik += skip;
+				dd.d.depth += skip;
+			}
 		}
 
 		child = dd.d.nf;
@@ -11227,7 +11528,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 		*result_ft = detached;
 #ifdef FEATURE_FT_COLLAPSE
-		ft_check_collapse_on_path(ft, key, key_len);
+		if (!ft_group_skip_compressed(ft->group))
+			ft_check_collapse_on_path(ft, key, key_len);
 #endif
 		return CDS_FT_STATUS_OK;
 	}
@@ -13170,6 +13472,13 @@ enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
+enum cds_ft_status cds_ft_attr_set_flags(struct cds_ft_attr *attr,
+		unsigned int flags)
+{
+	attr->flags = flags;
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
 		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor)
@@ -13197,10 +13506,12 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
 	ft_group->max_tree_depth = max_key_len + 1;
 	assert(ft_group->max_tree_depth <= FT_MAX_DEPTH);
 	ft_group->flavor = flavor;
-	if (attr)
+	if (attr) {
 		ft_group->key_map = attr->key_map;
-	else
+		ft_group->flags = attr->flags;
+	} else {
 		ft_group->key_map.identity = true;
+	}
 	*result_ft_group = ft_group;
 	return CDS_FT_STATUS_OK;
 }

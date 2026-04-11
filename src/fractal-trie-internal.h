@@ -60,6 +60,32 @@
 #define FT_TYPE_MASK	((FT_TYPE_MAX_NR - 1) << FT_INTERNAL_BITS)
 #define FT_PTR_MASK	(~(FT_TYPE_MASK | FT_INTERNAL_MASK))
 
+/*
+ * Skip-compressed pointer encoding.
+ *
+ * When CDS_FT_FLAG_SKIP_COMPRESSED is set, compressed node pointers
+ * are replaced by "skip pointers" that point directly to the
+ * compressed node's child, skipping the compressed node on the read
+ * fast path (candidate lookup).
+ *
+ * Encoding: bits 57-63 of the pointer store the compressed path
+ * length (1-127).  These bits are always zero for normal userspace
+ * pointers (safe on x86-64 including LA57, and ARM64).  A non-zero
+ * value in bits 57-63 identifies a skip pointer.
+ *
+ * The compressed node remains allocated (for key bytes, inequality
+ * lookup, exact lookup) and is accessible via the child node's
+ * metadata->parent pointer.
+ *
+ * Compressed paths longer than FT_SKIP_LEN_MAX keep the traditional
+ * compressed node pointer (no skip optimization).
+ */
+#define FT_SKIP_LEN_SHIFT	57
+#define FT_SKIP_LEN_BITS	7
+#define FT_SKIP_LEN_MAX	((1U << FT_SKIP_LEN_BITS) - 1)	/* 127 */
+#define FT_SKIP_LEN_MASK	(((unsigned long) FT_SKIP_LEN_MAX) << FT_SKIP_LEN_SHIFT)
+#define FT_ADDR_MASK		((1UL << FT_SKIP_LEN_SHIFT) - 1)
+
 #define FT_ENTRY_PER_NODE	256
 #define FT_LOG2_BITS_PER_BYTE	3U
 #define FT_BITS_PER_BYTE	(1U << FT_LOG2_BITS_PER_BYTE)
@@ -313,6 +339,7 @@ struct cds_ft_group {
 	size_t max_tree_depth;
 	size_t key_len;
 	size_t max_key_len;		/* Maximum key length allowed. */
+	unsigned int flags;		/* CDS_FT_FLAG_* creation-time flags. */
 	const struct rcu_flavor_struct *flavor;
 	/* Allocation arenas. */
 	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
