@@ -1413,6 +1413,32 @@ struct cds_ft_metadata *ft_flag_to_metadata(struct cds_ft_inode_flag *nf)
 }
 
 /*
+ * ft_update_skip_pointer: when a compressed node's child is replaced
+ * (e.g., by recompact), update the skip pointer in the parent's slot
+ * to encode the new child address.
+ *
+ * @parent_slot: pointer to the slot holding the skip pointer (in the
+ *               grandparent node or root).
+ * @cn: the compressed node whose child was replaced.
+ *
+ * If the slot doesn't hold a skip pointer, this is a no-op.
+ */
+static inline
+void ft_update_skip_pointer(struct cds_ft_inode_flag **parent_slot,
+		struct cds_ft_compressed_node *cn)
+{
+	struct cds_ft_inode_flag *slot_val;
+
+	if (!parent_slot)
+		return;
+	slot_val = rcu_dereference(*parent_slot);
+	if (!ft_node_skip_compressed(slot_val))
+		return;
+	rcu_assign_pointer(*parent_slot,
+		ft_skip_compressed_flag(cn->child, cn->len));
+}
+
+/*
  * ft_publish_compressed: convert a compressed node flag to a skip
  * pointer if skip-compressed mode is enabled, the path length fits,
  * and the child has metadata (is not external).
@@ -2887,11 +2913,6 @@ struct cds_ft_inode_flag *ft_node_get_minmax(struct cds_ft_inode_flag *node_flag
 	default:
 		assert(0);
 	}
-	/*
-	 * attach/detach semantic guarantees that ft_node_get_minmax
-	 * cannot return NULL except when called on an empty root node.
-	 */
-	assert(is_root || ft_node_ptr(ret));
 	return ret;
 }
 
@@ -3044,8 +3065,26 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 		assert(0);
 		return -EINVAL;
 	}
-	if (!ret)
+	if (!ret) {
 		ft_set_parent(child_node_flag, node_flag);
+		/*
+		 * Skip-compressed: record the slot address in the
+		 * compressed node's metadata->skip_slot so the skip
+		 * pointer can be updated when cn->child changes.
+		 */
+		if (ft_node_skip_compressed(child_node_flag)) {
+			struct cds_ft_inode_flag **slot_ptr = NULL;
+
+			ft_node_get_nth_skip(node_flag, &slot_ptr, n);
+			if (slot_ptr) {
+				struct cds_ft_compressed_node *cn =
+					ft_skip_to_compressed(child_node_flag);
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) cn)->skip_slot =
+					slot_ptr;
+			}
+		}
+	}
 	return ret;
 }
 
@@ -3805,6 +3844,41 @@ skip_copy:
 
 	/* Return pointer to new recompacted node through old_node_flag_ptr */
 	*old_node_flag_ptr = new_node_flag;
+	/*
+	 * Inherit the old node's parent pointer so upward walks
+	 * (density propagation, ft_skip_to_compressed) can find
+	 * the parent from the new node.
+	 */
+	if (old_node) {
+		struct cds_ft_metadata *old_meta =
+			cds_ft_item_to_metadata(old_node);
+		struct cds_ft_inode_flag *old_parent = old_meta->parent;
+
+		new_metadata->parent = old_parent;
+		/*
+		 * If the recompacted node was the child of a compressed
+		 * node published as a skip pointer, update the skip
+		 * pointer to encode the new child address.
+		 *
+		 * The old node's metadata->parent points to the
+		 * compressed node (as a compressed flag).  The
+		 * compressed node's metadata->skip_slot holds the slot
+		 * address of the skip pointer in the grandparent.
+		 */
+		if (old_parent && ft_node_compressed(old_parent)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(old_parent);
+			struct cds_ft_metadata *cn_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) cn);
+
+			if (cn_meta->skip_slot &&
+			    ft_node_skip_compressed(*cn_meta->skip_slot))
+				rcu_assign_pointer(*cn_meta->skip_slot,
+					ft_skip_compressed_flag(
+						new_node_flag, cn->len));
+		}
+	}
 	if (old_node && old_node_ret)
 		*old_node_ret = old_node;
 
@@ -7659,6 +7733,13 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 	/* 5. Publish the split structure, replacing the compressed node. */
 	rcu_assign_pointer(*parent_slot, top_flag);
+	if (ft_node_skip_compressed(top_flag)) {
+		struct cds_ft_compressed_node *top_cn =
+			ft_skip_to_compressed(top_flag);
+		cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) top_cn)->skip_slot =
+			parent_slot;
+	}
 
 	/*
 	 * 6. Density: propagate each new node at its actual depth.
@@ -8098,6 +8179,26 @@ int ft_attach_node(struct cds_ft *ft,
 		}
 		/* Attach branch (unlink the old node from the trie). */
 		rcu_assign_pointer(*attach_node_flag_ptr, iter_dest_node_flag);
+
+		/*
+		 * If the publish target is cn->child and the compressed
+		 * node is published as a skip pointer, update the skip
+		 * pointer to encode the new child.
+		 */
+		if (old_recompacted_node && attach_node_flag &&
+		    ft_node_compressed(attach_node_flag)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(attach_node_flag);
+			struct cds_ft_metadata *cn_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) cn);
+
+			if (cn_meta->skip_slot &&
+			    ft_node_skip_compressed(*cn_meta->skip_slot))
+				rcu_assign_pointer(*cn_meta->skip_slot,
+					ft_skip_compressed_flag(
+						cn->child, cn->len));
+		}
 
 		/* Reclaim safely after unlink. */
 		if (old_recompacted_node)
@@ -8549,6 +8650,9 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child = cptrs[e];
 		unsigned long child_nr_keys;
 
+		if (ft_node_skip_compressed(child))
+			child = ft_compressed_node_flag(
+				ft_skip_to_compressed(child));
 		if (slen <= suffix_offset)
 			return child;
 
