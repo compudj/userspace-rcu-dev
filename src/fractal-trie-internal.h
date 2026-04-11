@@ -75,10 +75,37 @@
  *
  * The compressed node remains allocated (for key bytes, inequality
  * lookup, exact lookup) and is accessible via the child node's
- * metadata->parent pointer.
+ * metadata->parent pointer (or cds_ft_node._ft_parent for external
+ * children).
  *
  * Compressed paths longer than FT_SKIP_LEN_MAX keep the traditional
  * compressed node pointer (no skip optimization).
+ *
+ * Dual-pointer RCU publication:
+ *
+ * A skip pointer and cn->child are two views of the same child
+ * pointer.  When cn->child is replaced (recompact, attach), both
+ * must be updated.  The update order is:
+ *
+ *   1. rcu_assign_pointer(*skip_slot, new_skip_ptr)
+ *   2. rcu_assign_pointer(cn->child, new_child)  [or *parent_slot]
+ *
+ * Skip pointer first ensures candidate readers (which follow the
+ * skip pointer) immediately see the new child.  Exact and
+ * inequality readers (which follow cn->child via the compressed
+ * handler) see the old child until step 2.  The old child remains
+ * alive until after a grace period.
+ *
+ * Between steps 1 and 2, the two reader paths see different but
+ * individually consistent tree states (old vs. new subtree).  No
+ * reader sees a freed node.  This is the standard RCU guarantee:
+ * concurrent readers may observe pre-mutation or post-mutation
+ * state, never a mix of both within a single traversal.
+ *
+ * The child's metadata->parent (and cds_ft_node._ft_parent for
+ * external nodes) is read by ft_skip_to_compressed on the read
+ * side and written by ft_set_parent on the write side.  Both use
+ * rcu_dereference / rcu_assign_pointer for proper ordering.
  */
 #define FT_SKIP_LEN_SHIFT	57
 #define FT_SKIP_LEN_BITS	7
