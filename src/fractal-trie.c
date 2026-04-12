@@ -1413,6 +1413,18 @@ struct cds_ft_metadata *ft_flag_to_metadata(struct cds_ft_inode_flag *nf)
 }
 
 /*
+ * ft_skip_to_compressed_meta: shorthand to get the compressed node's
+ * metadata from a skip pointer.
+ */
+static inline
+struct cds_ft_metadata *ft_skip_to_compressed_meta(
+		struct cds_ft_inode_flag *skip_ptr)
+{
+	return cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) ft_skip_to_compressed(skip_ptr));
+}
+
+/*
  * ft_update_skip_pointer: when a compressed node's child is replaced
  * (e.g., by recompact), update the skip pointer in the parent's slot
  * to encode the new child address.
@@ -3882,6 +3894,101 @@ skip_copy:
 						new_node_flag, cn->len));
 		}
 	}
+	/*
+	 * Redirect skip_slot for children that are skip pointers.
+	 *
+	 * Children were copied value-for-value from the old node to the
+	 * new node.  Any child that is a skip pointer still has its
+	 * compressed node's skip_slot pointing to the old node's child
+	 * slot—which will be freed after a grace period.  Redirect
+	 * skip_slot to the corresponding slot in the new node.
+	 */
+	if (ft_group_skip_compressed(ft->group)) {
+		switch (new_type->type_class) {
+		case FT_LINEAR:
+		case FT_LINEAR_WIDE:
+		{
+			uint8_t nc = ft_linear_node_get_nr_child(new_type,
+					new_node);
+			unsigned int i;
+
+			for (i = 0; i < nc; i++) {
+				struct cds_ft_inode_flag *iter;
+				uint8_t v;
+
+				ft_linear_node_get_ith_pos(new_type,
+						new_node, i, &v, &iter);
+				if (iter && ft_node_skip_compressed(iter)) {
+					struct cds_ft_inode_flag **slot;
+
+					ft_node_get_nth_skip(new_node_flag,
+							&slot, v);
+					ft_skip_to_compressed_meta(iter)->skip_slot =
+						slot;
+				}
+			}
+			break;
+		}
+		case FT_POOL:
+		{
+			unsigned int pool_nr;
+
+			for (pool_nr = 0;
+			     pool_nr < (1U << new_type->nr_pool_order);
+			     pool_nr++) {
+				struct cds_ft_inode *pool =
+					ft_pool_node_get_ith_pool(new_type,
+						new_node, pool_nr);
+				uint8_t nc = ft_linear_node_get_nr_child(
+						new_type, pool);
+				unsigned int j;
+
+				for (j = 0; j < nc; j++) {
+					struct cds_ft_inode_flag *iter;
+					uint8_t v;
+
+					ft_linear_node_get_ith_pos(new_type,
+							pool, j, &v, &iter);
+					if (iter &&
+					    ft_node_skip_compressed(iter)) {
+						struct cds_ft_inode_flag **slot;
+
+						ft_node_get_nth_skip(
+							new_node_flag,
+							&slot, v);
+						ft_skip_to_compressed_meta(
+							iter)->skip_slot =
+							slot;
+					}
+				}
+			}
+			break;
+		}
+		case FT_PIGEON:
+		{
+			unsigned int i;
+
+			for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
+				struct cds_ft_inode_flag *iter;
+
+				iter = ft_pigeon_node_get_ith_pos(new_type,
+						new_node, i);
+				if (iter && ft_node_skip_compressed(iter)) {
+					struct cds_ft_inode_flag **slot;
+
+					ft_node_get_nth_skip(new_node_flag,
+							&slot, i);
+					ft_skip_to_compressed_meta(
+						iter)->skip_slot = slot;
+				}
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
 	/* Return pointer to new recompacted node through old_node_flag_ptr */
 	*old_node_flag_ptr = new_node_flag;
 	if (old_node && old_node_ret)
