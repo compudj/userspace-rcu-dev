@@ -1451,6 +1451,38 @@ void ft_update_skip_pointer(struct cds_ft_inode_flag **parent_slot,
 }
 
 /*
+ * ft_publish_to_parent: atomically publish @new_child into @parent_slot.
+ *
+ * If the parent is a compressed node, also update the skip pointer
+ * at *skip_slot (if one exists) BEFORE writing *parent_slot.  This
+ * ensures candidate readers (which follow the skip pointer) see the
+ * new child before exact/inequality readers (which follow cn->child).
+ *
+ * Centralizes the dual-pointer RCU publication pattern so every
+ * write to cn->child automatically maintains the skip pointer.
+ */
+static
+void ft_publish_to_parent(struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **parent_slot,
+		struct cds_ft_inode_flag *new_child)
+{
+	if (parent_nf && ft_node_compressed(parent_nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(parent_nf);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) cn);
+
+		if (cn_meta->skip_slot &&
+		    ft_node_skip_compressed(*cn_meta->skip_slot))
+			rcu_assign_pointer(*cn_meta->skip_slot,
+				ft_skip_compressed_flag(
+					new_child, cn->len));
+	}
+	rcu_assign_pointer(*parent_slot, new_child);
+}
+
+/*
  * ft_publish_compressed: convert a compressed node flag to a skip
  * pointer if skip-compressed mode is enabled, the path length fits,
  * and the child has metadata (is not external).
@@ -6899,7 +6931,16 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 		unsigned int e;
 
 		for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-			if (cptrs[e] == child_nf) {
+			struct cds_ft_inode_flag *entry = cptrs[e];
+
+			/*
+			 * Collapsed entries may hold skip pointers.
+			 * Resolve to compressed flag before comparing.
+			 */
+			if (ft_node_skip_compressed(entry))
+				entry = ft_compressed_node_flag(
+					ft_skip_to_compressed(entry));
+			if (entry == child_nf) {
 				uint8_t data_e =
 					ft_collapsed_load_data(col, e);
 				return ft_collapsed_suffix_len(
@@ -7639,19 +7680,8 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 					depth);
 			if (col_flag) {
 				ft_set_parent(col_flag, parent_nf, NULL);
-				rcu_assign_pointer(*parent_slot, col_flag);
-				if (ft_node_compressed(parent_nf)) {
-					struct cds_ft_compressed_node *pcn =
-						ft_compressed_node_ptr(parent_nf);
-					struct cds_ft_metadata *pcn_meta =
-						cds_ft_item_to_metadata(
-							(struct cds_ft_inode *) pcn);
-					if (pcn_meta->skip_slot)
-						rcu_assign_pointer(
-							*pcn_meta->skip_slot,
-							ft_skip_compressed_flag(
-								col_flag, pcn->len));
-				}
+				ft_publish_to_parent(parent_nf,
+					parent_slot, col_flag);
 				free_cds_ft_node(ft, ft_node_ptr(node_flag));
 				/*
 				 * Recompute density for the new collapsed
@@ -7727,6 +7757,18 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	uint8_t new_ordinal = iter_key[diverge_pos];
 	unsigned long old_child_nr_keys;
 	int ret;
+
+	/*
+	 * Compute cn_parent_depth BEFORE building new nodes.
+	 * Building the suffix reparents cn->child, which breaks
+	 * ft_skip_to_compressed (used by ft_parent_depth_span)
+	 * for skip pointers that encode cn->child.
+	 */
+	unsigned int junction_depth = node_depth + diverge_pos;
+	struct cds_ft_inode_flag *cn_parent = cn_meta->parent;
+	unsigned int cn_parent_depth = cn_parent ?
+		node_depth - ft_parent_depth_span(cn_parent,
+			compressed_flag) : 0;
 
 	/* Compute old child's nr_keys for the new nodes. */
 	if (!ft_node_external(cn->child)) {
@@ -7886,18 +7928,6 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 			branch_meta->external_nodes = cn_meta->external_nodes;
 		top_flag = branch_flag;
 	}
-
-	/*
-	 * Compute cn_parent_depth BEFORE publishing.  After publish,
-	 * *parent_slot holds the new top_flag and the old compressed
-	 * node is no longer reachable from the parent's entries.
-	 * ft_parent_depth_span would fail to find it.
-	 */
-	unsigned int junction_depth = node_depth + diverge_pos;
-	struct cds_ft_inode_flag *cn_parent = cn_meta->parent;
-	unsigned int cn_parent_depth = cn_parent ?
-		node_depth - ft_parent_depth_span(cn_parent,
-			compressed_flag) : 0;
 
 	/* 5. Publish the split structure, replacing the compressed node. */
 	rcu_assign_pointer(*parent_slot, top_flag);
@@ -8333,29 +8363,12 @@ int ft_attach_node(struct cds_ft *ft,
 			dbg_printf("branch publish error %d\n", ret);
 			goto check_error;
 		}
-		/*
-		 * If the publish target is cn->child and the compressed
-		 * node is published as a skip pointer, update the skip
-		 * pointer BEFORE cn->child so candidate readers see the
-		 * new child before exact/inequality readers do.
+		/* Attach branch (unlink the old node from the trie).
+		 * ft_publish_to_parent handles skip pointer update
+		 * if the attach target is a compressed node's child.
 		 */
-		if (old_recompacted_node && attach_node_flag &&
-		    ft_node_compressed(attach_node_flag)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(attach_node_flag);
-			struct cds_ft_metadata *cn_meta =
-				cds_ft_item_to_metadata(
-					(struct cds_ft_inode *) cn);
-
-			if (cn_meta->skip_slot &&
-			    ft_node_skip_compressed(*cn_meta->skip_slot))
-				rcu_assign_pointer(*cn_meta->skip_slot,
-					ft_skip_compressed_flag(
-						iter_dest_node_flag,
-						cn->len));
-		}
-		/* Attach branch (unlink the old node from the trie). */
-		rcu_assign_pointer(*attach_node_flag_ptr, iter_dest_node_flag);
+		ft_publish_to_parent(attach_node_flag,
+			attach_node_flag_ptr, iter_dest_node_flag);
 
 		/* Reclaim safely after unlink. */
 		if (old_recompacted_node)
@@ -8529,7 +8542,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	uatomic_store(&br_meta->nr_keys,
 		br_meta->nr_keys + 1, CMM_RELAXED);
 	ft_set_parent(branch, d->nf, NULL);
-	rcu_assign_pointer(cn->child, branch);
+	ft_publish_to_parent(d->nf, &cn->child, branch);
 	/* Propagate density for the new branch node. */
 	ft_propagate_node_density_parent(branch,
 		d->depth + cn->len, d->depth + cn->len, 1);
@@ -8585,7 +8598,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	if (sret)
 		return sret;
 	ft_set_parent(top_flag, d->pnf, d->nfp);
-	rcu_assign_pointer(*d->nfp, top_flag);
+	ft_publish_to_parent(d->pnf, d->nfp, top_flag);
 	{
 		struct cds_ft_metadata *jct_meta =
 			cds_ft_item_to_metadata(
@@ -9190,7 +9203,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 					ft_init_node_density(internal_flag);
 
 					ft_set_parent(internal_flag, d.pnf, NULL);
-					rcu_assign_pointer(*d.nfp, internal_flag);
+					ft_publish_to_parent(d.pnf,
+						d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
 
 					d.nf = internal_flag;
@@ -10653,7 +10667,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 
 	/* 4. Publish the split structure. */
 	ft_set_parent(top_flag, d->pnf, d->nfp);
-	rcu_assign_pointer(*d->nfp, top_flag);
+	ft_publish_to_parent(d->pnf, d->nfp, top_flag);
 
 	/* 5. Density: net = nr_created - 1 at the split depth. */
 	if (nr_created > 1)
@@ -10953,7 +10967,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 
 	/* Publish and set descent state. */
 	ft_set_parent(prefix_flag, d->pnf, d->nfp);
-	rcu_assign_pointer(*d->nfp, prefix_flag);
+	ft_publish_to_parent(d->pnf, d->nfp, prefix_flag);
 
 	/* Density: net = +1 (old compressed → prefix + suffix = 2 nodes, net +1). */
 	ft_propagate_node_density_parent(prefix_flag, d->depth, d->depth, 1);
@@ -11129,7 +11143,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		if (displaced) {
 			ft_set_parent(branch, d->pnf, NULL);
-			rcu_assign_pointer(*d->nfp, branch);
+			ft_publish_to_parent(d->pnf, d->nfp, branch);
 		} else {
 			struct cds_ft_inode_flag *dest = d->pnf;
 			struct cds_ft_metadata *pmeta;
@@ -11437,7 +11451,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		if (!swap_empty)
 			ft_set_parent(old_swap_root, d.pnf, NULL);
-		rcu_assign_pointer(*d.nfp,
+		ft_publish_to_parent(d.pnf, d.nfp,
 			swap_empty ? NULL : old_swap_root);
 
 		/* Update parent nr_child on NULL <-> non-NULL transition. */
@@ -11735,7 +11749,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					ft_init_node_density(internal_flag);
 
 					ft_set_parent(internal_flag, dd.d.pnf, NULL);
-					rcu_assign_pointer(*dd.d.nfp, internal_flag);
+					ft_publish_to_parent(dd.d.pnf,
+						dd.d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
 
 					dd.d.nf = internal_flag;
