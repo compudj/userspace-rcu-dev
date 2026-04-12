@@ -8832,9 +8832,16 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child = cptrs[e];
 		unsigned long child_nr_keys;
 
-		if (ft_node_skip_compressed(child))
+		if (ft_node_skip_compressed(child)) {
+			/*
+			 * Clear skip_slot: the collapsed node (and its
+			 * entry slots) will be freed after the explode.
+			 */
+			ft_skip_to_compressed_meta(child)->skip_slot =
+				NULL;
 			child = ft_compressed_node_flag(
 				ft_skip_to_compressed(child));
+		}
 		if (slen <= suffix_offset)
 			return child;
 
