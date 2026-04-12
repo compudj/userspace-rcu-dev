@@ -7407,6 +7407,33 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 					(struct cds_ft_inode *) scn)->skip_slot =
 					&col_ptrs[e];
 			}
+			/*
+			 * Re-publish compressed entries as skip pointers.
+			 *
+			 * The collapse walk resolves skip pointers to
+			 * compressed flags (ft_collapse_walk_subtree),
+			 * so entries store compressed_flag.
+			 * But the compressed node's skip_slot still
+			 * points to the old parent (internal node) slot,
+			 * which is freed when the collapse publishes.
+			 * Convert the entry back to a skip pointer and
+			 * redirect skip_slot to the collapsed entry slot,
+			 * preserving the skip-compressed optimization for
+			 * lookups through this entry while preventing
+			 * use-after-free.
+			 */
+			if (ft_node_compressed(col_ptrs[e]) &&
+			    ft_group_skip_compressed(ft->group)) {
+				struct cds_ft_compressed_node *cn =
+					ft_compressed_node_ptr(col_ptrs[e]);
+				if (cn->len <= FT_SKIP_LEN_MAX) {
+					col_ptrs[e] = ft_skip_compressed_flag(
+						cn->child, cn->len);
+					cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) cn)->skip_slot =
+						&col_ptrs[e];
+				}
+			}
 		}
 		return col_flag;
 	}
@@ -8840,6 +8867,17 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 		if (!ft_node_ptr(d.nf))
 			break;
+		/*
+		 * Resolve skip-compressed pointer.  Can appear after
+		 * descending through a collapsed entry whose child was
+		 * later split/recompacted, or after a collapse publish
+		 * updated the parent's skip pointer.  Convert to the
+		 * underlying compressed flag so the compressed handler
+		 * below processes it correctly.
+		 */
+		if (ft_node_skip_compressed(d.nf))
+			d.nf = ft_compressed_node_flag(
+				ft_skip_to_compressed(d.nf));
 		/* Found external node. */
 		if (ft_node_external(d.nf))
 			break;
@@ -9313,6 +9351,10 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 		if (!ft_node_ptr(d.nf))
 			break;
+		/* Resolve skip-compressed (e.g. from collapsed entry). */
+		if (ft_node_skip_compressed(d.nf))
+			d.nf = ft_compressed_node_flag(
+				ft_skip_to_compressed(d.nf));
 		if (ft_node_external(d.nf))
 			break;
 		if (ft_node_compressed(d.nf)) {
@@ -9915,6 +9957,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		if (!ft_node_ptr(dd.d.nf)) {
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
+		/* Resolve skip-compressed (e.g. from collapsed entry). */
+		if (ft_node_skip_compressed(dd.d.nf))
+			dd.d.nf = ft_compressed_node_flag(
+				ft_skip_to_compressed(dd.d.nf));
 
 		/*
 		 * Compressed node: compare remaining key bytes with
@@ -10608,6 +10654,10 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 
 		if (ft_node_external(d->nf))
 			break;
+		/* Resolve skip-compressed (e.g. from collapsed entry). */
+		if (ft_node_skip_compressed(d->nf))
+			d->nf = ft_compressed_node_flag(
+				ft_skip_to_compressed(d->nf));
 		if (ft_node_compressed(d->nf)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(d->nf);
