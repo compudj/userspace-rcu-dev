@@ -7771,6 +7771,18 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		top_flag = branch_flag;
 	}
 
+	/*
+	 * Compute cn_parent_depth BEFORE publishing.  After publish,
+	 * *parent_slot holds the new top_flag and the old compressed
+	 * node is no longer reachable from the parent's entries.
+	 * ft_parent_depth_span would fail to find it.
+	 */
+	unsigned int junction_depth = node_depth + diverge_pos;
+	struct cds_ft_inode_flag *cn_parent = cn_meta->parent;
+	unsigned int cn_parent_depth = cn_parent ?
+		node_depth - ft_parent_depth_span(cn_parent,
+			compressed_flag) : 0;
+
 	/* 5. Publish the split structure, replacing the compressed node. */
 	rcu_assign_pointer(*parent_slot, top_flag);
 	if (ft_node_skip_compressed(top_flag)) {
@@ -7806,11 +7818,6 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	}
 
 	{
-		unsigned int junction_depth = node_depth + diverge_pos;
-		struct cds_ft_inode_flag *cn_parent = cn_meta->parent;
-		unsigned int cn_parent_depth = cn_parent ?
-			node_depth - ft_parent_depth_span(cn_parent,
-				compressed_flag) : 0;
 
 		/*
 		 * Junction: new node at junction_depth.
