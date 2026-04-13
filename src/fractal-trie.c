@@ -1397,6 +1397,42 @@ bool ft_group_skip_compressed(const struct cds_ft_group *group)
 {
 	return group->flags & CDS_FT_FLAG_SKIP_COMPRESSED;
 }
+
+/*
+ * ft_set_skip_slot: encode the skip pointer slot address as a uint16_t
+ * byte offset from the parent node.  When parent is NULL (root's
+ * child), the offset is unused — ft_get_skip_slot recovers &ft->root.
+ */
+static inline
+void ft_set_skip_slot(struct cds_ft_metadata *meta,
+		struct cds_ft_inode_flag **slot)
+{
+	if (!slot || !meta->parent) {
+		meta->skip_slot_offset = 0;
+		return;
+	}
+	meta->skip_slot_offset = (uint16_t)((char *) slot -
+		(char *) ft_node_ptr(meta->parent));
+}
+
+/*
+ * ft_get_skip_slot: recover the skip pointer slot address from the
+ * stored offset.  Returns NULL if skip_slot_offset is 0 and parent
+ * is non-NULL (slot was never set).
+ *
+ * @ft is needed for the root case (parent == NULL).
+ */
+static inline
+struct cds_ft_inode_flag **ft_get_skip_slot(const struct cds_ft_metadata *meta,
+		struct cds_ft *ft)
+{
+	if (!meta->parent)
+		return &ft->root;
+	if (!meta->skip_slot_offset)
+		return NULL;
+	return (struct cds_ft_inode_flag **)
+		((char *) ft_node_ptr(meta->parent) + meta->skip_slot_offset);
+}
 #else
 static inline
 bool ft_node_skip_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
@@ -1483,7 +1519,8 @@ void ft_update_skip_pointer(struct cds_ft_inode_flag **parent_slot,
  * write to cn->child automatically maintains the skip pointer.
  */
 static
-void ft_publish_to_parent(struct cds_ft_inode_flag *parent_nf,
+void ft_publish_to_parent(struct cds_ft *ft,
+		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child)
 {
@@ -1495,11 +1532,15 @@ void ft_publish_to_parent(struct cds_ft_inode_flag *parent_nf,
 				(struct cds_ft_inode *) cn);
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		if (cn_meta->skip_slot &&
-		    ft_node_skip_compressed(*cn_meta->skip_slot))
-			rcu_assign_pointer(*cn_meta->skip_slot,
-				ft_skip_compressed_flag(
-					new_child, cn->len));
+		{
+			struct cds_ft_inode_flag **skip_slot =
+				ft_get_skip_slot(cn_meta, ft);
+			if (skip_slot &&
+			    ft_node_skip_compressed(*skip_slot))
+				rcu_assign_pointer(*skip_slot,
+					ft_skip_compressed_flag(
+						new_child, cn->len));
+		}
 #endif
 	}
 	rcu_assign_pointer(*parent_slot, new_child);
@@ -1569,8 +1610,7 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
 		rcu_assign_pointer(cn_meta->parent, parent_nf);
-		if (slot)
-			cn_meta->skip_slot = slot;
+		ft_set_skip_slot(cn_meta, slot);
 		return;
 	}
 #endif
@@ -3994,10 +4034,12 @@ skip_copy:
 			struct cds_ft_metadata *cn_meta =
 				cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) cn);
+			struct cds_ft_inode_flag **skip_slot =
+				ft_get_skip_slot(cn_meta, ft);
 
-			if (cn_meta->skip_slot &&
-			    ft_node_skip_compressed(*cn_meta->skip_slot))
-				rcu_assign_pointer(*cn_meta->skip_slot,
+			if (skip_slot &&
+			    ft_node_skip_compressed(*skip_slot))
+				rcu_assign_pointer(*skip_slot,
 					ft_skip_compressed_flag(
 						new_node_flag, cn->len));
 		}
@@ -8019,7 +8061,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				unsigned int ai;
 
 				ft_set_parent(col_flag, parent_nf, NULL);
-				ft_publish_to_parent(parent_nf,
+				ft_publish_to_parent(ft, parent_nf,
 					parent_slot, col_flag);
 				/*
 				 * Free intermediate nodes absorbed by the
@@ -8718,7 +8760,7 @@ int ft_attach_node(struct cds_ft *ft,
 		 * ft_publish_to_parent handles skip pointer update
 		 * if the attach target is a compressed node's child.
 		 */
-		ft_publish_to_parent(attach_node_flag,
+		ft_publish_to_parent(ft, attach_node_flag,
 			attach_node_flag_ptr, iter_dest_node_flag);
 
 		/* Reclaim safely after unlink. */
@@ -8894,7 +8936,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	uatomic_store(&br_meta->nr_keys,
 		br_meta->nr_keys + 1, CMM_RELAXED);
 	ft_set_parent(branch, d->nf, NULL);
-	ft_publish_to_parent(d->nf, &cn->child, branch);
+	ft_publish_to_parent(ft, d->nf, &cn->child, branch);
 	/* Propagate density for the new branch node. */
 	ft_propagate_node_density_parent(branch,
 		d->depth + cn->len, d->depth + cn->len,
@@ -8951,7 +8993,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	if (sret)
 		return sret;
 	ft_set_parent(top_flag, d->pnf, d->nfp);
-	ft_publish_to_parent(d->pnf, d->nfp, top_flag);
+	ft_publish_to_parent(ft, d->pnf, d->nfp, top_flag);
 	{
 		struct cds_ft_metadata *jct_meta =
 			cds_ft_item_to_metadata(
@@ -9188,8 +9230,8 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 			 * Clear skip_slot: the collapsed node (and its
 			 * entry slots) will be freed after the explode.
 			 */
-			ft_skip_to_compressed_meta(child)->skip_slot =
-				NULL;
+			ft_skip_to_compressed_meta(child)->skip_slot_offset =
+				0;
 			child = ft_compressed_node_flag(
 				ft_skip_to_compressed(child));
 		}
@@ -9579,7 +9621,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 					ft_init_node_density(internal_flag);
 
 					ft_set_parent(internal_flag, d.pnf, NULL);
-					ft_publish_to_parent(d.pnf,
+					ft_publish_to_parent(ft, d.pnf,
 						d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
 
@@ -11114,7 +11156,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 
 	/* 4. Publish the split structure. */
 	ft_set_parent(top_flag, d->pnf, d->nfp);
-	ft_publish_to_parent(d->pnf, d->nfp, top_flag);
+	ft_publish_to_parent(ft, d->pnf, d->nfp, top_flag);
 
 	/* 5. Density: net footprint of created nodes minus old compressed. */
 	{
@@ -11420,7 +11462,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 
 	/* Publish and set descent state. */
 	ft_set_parent(prefix_flag, d->pnf, d->nfp);
-	ft_publish_to_parent(d->pnf, d->nfp, prefix_flag);
+	ft_publish_to_parent(ft, d->pnf, d->nfp, prefix_flag);
 
 	/* Density: net footprint (old compressed → prefix + suffix). */
 	{
@@ -11611,7 +11653,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		if (displaced) {
 			ft_set_parent(branch, d->pnf, NULL);
-			ft_publish_to_parent(d->pnf, d->nfp, branch);
+			ft_publish_to_parent(ft, d->pnf, d->nfp, branch);
 		} else {
 			struct cds_ft_inode_flag *dest = d->pnf;
 			struct cds_ft_metadata *pmeta;
@@ -11921,7 +11963,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		if (!swap_empty)
 			ft_set_parent(old_swap_root, d.pnf, NULL);
-		ft_publish_to_parent(d.pnf, d.nfp,
+		ft_publish_to_parent(dst_ft, d.pnf, d.nfp,
 			swap_empty ? NULL : old_swap_root);
 
 		/* Update parent nr_child on NULL <-> non-NULL transition. */
@@ -12223,7 +12265,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					ft_init_node_density(internal_flag);
 
 					ft_set_parent(internal_flag, dd.d.pnf, NULL);
-					ft_publish_to_parent(dd.d.pnf,
+					ft_publish_to_parent(ft, dd.d.pnf,
 						dd.d.nfp, internal_flag);
 					free_collapsed_node(ft, col);
 

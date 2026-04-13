@@ -234,27 +234,25 @@ struct cds_ft_density_extended {
 
 /*
  * Struct layout is ordered for minimal padding:
- *   - 8-byte fields first (pointers, unsigned long)
- *   - 8-byte density union
- *   - 2-byte and 1-byte fields packed together at the end
- *   - 4 bytes tail padding (struct aligned to 8)
+ *   - 8-byte fields first (parent, external_nodes, nr_keys)
+ *   - 8-byte density union (density_ext ptr / uint8_t[6] counters)
+ *   - 2-byte and 1-byte fields packed at the end (nr_child,
+ *     skip_slot_offset, fallback_removal_count, density_extended,
+ *     alloc_index)
  *
- * Note: call_rcu overwrites the first 16 bytes of this struct
- * (parent + skip_slot or parent + external_nodes) when the node
- * is freed.  Fields accessed in the RCU callback (density_extended,
- * density_ext) must remain beyond byte 16 of the struct.
+ * In cds_ft_metadata_alloc, this struct shares a union with
+ * rcu_head (16 bytes) and free_list_next (8 bytes).  call_rcu
+ * overwrites the first 16 bytes of the union (parent +
+ * external_nodes) when the node is freed.  All fields accessed
+ * in the RCU callback (density_extended, density_ext) and
+ * alloc_index must remain beyond byte 16 of the struct.
  */
 struct cds_ft_metadata {
+	/* 8-byte aligned fields first. */
 	struct cds_ft_inode_flag *parent;	/*
 						 * Tagged pointer to parent node (write-side only).
 						 * NULL for the root node.
 						 */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	struct cds_ft_inode_flag **skip_slot;	/*
-						 * Address of the slot holding the skip pointer
-						 * for this compressed node (write-side only).
-						 */
-#endif
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
 	unsigned long nr_keys;			/* Total unique keys in subtree.
 						 * Stored with uatomic_store release,
@@ -272,7 +270,19 @@ struct cds_ft_metadata {
 		struct cds_ft_density_extended *density_ext;
 		uint8_t nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
 	};
+
+	/* Small fields packed together. */
 	uint16_t nr_child;			/* Number of children in node (max 256). */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	uint16_t skip_slot_offset;		/*
+						 * Byte offset of the skip pointer slot from
+						 * ft_node_ptr(parent).  Used to update the
+						 * skip pointer when cn->child changes.
+						 * When parent == NULL (root's child), the
+						 * skip slot is &ft->root, recovered from
+						 * context.  Write-side only.
+						 */
+#endif
 	uint8_t fallback_removal_count;		/* Removals left keeping fallback. */
 	uint8_t density_extended;		/*
 						 * 0 = compact uint8_t mode,
