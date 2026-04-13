@@ -173,7 +173,9 @@ static
 struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 {
 	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
-	void *ptr = aligned_alloc(page_size, alloc_size);
+	/* Round up to page_size for aligned_alloc (C11 requires size to be a multiple of alignment). */
+	size_t alloc_size_aligned = (alloc_size + page_size - 1) & ~(page_size - 1);
+	void *ptr = aligned_alloc(page_size, alloc_size_aligned);
 	struct cds_ft_alloc_range *range;
 
 	memset(ptr, 0, alloc_size);

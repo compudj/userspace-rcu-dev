@@ -1414,7 +1414,9 @@ static inline
 void ft_set_skip_slot(struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag **slot)
 {
-	if (!slot || !meta->parent) {
+	if (!slot)
+		return;	/* Slot unknown — preserve existing offset. */
+	if (!meta->parent) {
 		meta->skip_slot_offset = 0;
 		return;
 	}
