@@ -3887,6 +3887,9 @@ retry:		/* for fallback */
 		dbg_printf("Recompact inherit from %p\n", metadata);
 		if (metadata) {
 			new_metadata->parent = metadata->parent;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			new_metadata->skip_slot_offset = metadata->skip_slot_offset;
+#endif
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
 			new_metadata->external_nodes = metadata->external_nodes;
 			ft_nr_keys_store(new_metadata,
@@ -4033,6 +4036,9 @@ skip_copy:
 		struct cds_ft_inode_flag *old_parent = old_meta->parent;
 
 		new_metadata->parent = old_parent;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		new_metadata->skip_slot_offset = old_meta->skip_slot_offset;
+#endif
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (old_parent && ft_node_compressed(old_parent)) {
@@ -10348,9 +10354,15 @@ int ft_detach_node(struct cds_ft *ft,
 			ret = -ENOMEM;
 			goto end;
 		}
-		fresh_meta->parent = cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) ft_compressed_node_ptr(
-				iter_node_flag))->parent;
+		{
+			struct cds_ft_metadata *src_meta = cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) ft_compressed_node_ptr(
+					iter_node_flag));
+			fresh_meta->parent = src_meta->parent;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			fresh_meta->skip_slot_offset = src_meta->skip_slot_offset;
+#endif
+		}
 		if (topmost_external_nodes) {
 			fresh_meta->external_nodes = topmost_external_nodes;
 			ft_nr_keys_store(fresh_meta, 1, CMM_RELAXED);
@@ -12101,8 +12113,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		if (!ft_node_external(old_child)) {
 			/* Clear parent: old_child is now a root. */
-			cds_ft_item_to_metadata(
-				ft_node_ptr(old_child))->parent = NULL;
+			{
+				struct cds_ft_metadata *m = cds_ft_item_to_metadata(
+					ft_node_ptr(old_child));
+				m->parent = NULL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				m->skip_slot_offset = 0;
+#endif
+			}
 			rcu_assign_pointer(swap_ft->root, old_child);
 			if (swap_empty)
 				free_cds_ft_node(swap_ft,
@@ -12203,7 +12221,14 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		/* No readers in detached root yet. */
 		detached->root = ft->root;
 		/* Clear parent: this node is now a root. */
-		cds_ft_item_to_metadata(ft_node_ptr(detached->root))->parent = NULL;
+		{
+			struct cds_ft_metadata *m = cds_ft_item_to_metadata(
+				ft_node_ptr(detached->root));
+			m->parent = NULL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			m->skip_slot_offset = 0;
+#endif
+		}
 		uatomic_store(&detached->max_used_key_len,
 			      uatomic_load(&ft->max_used_key_len, CMM_RELAXED),
 			      CMM_RELAXED);
@@ -12458,8 +12483,14 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				/* No readers in detached root yet. */
 				detached->root = child;
 				/* Clear parent: this node is now a root. */
-				cds_ft_item_to_metadata(
-					ft_node_ptr(child))->parent = NULL;
+				{
+					struct cds_ft_metadata *m = cds_ft_item_to_metadata(
+						ft_node_ptr(child));
+					m->parent = NULL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+					m->skip_slot_offset = 0;
+#endif
+				}
 			} else {
 				struct cds_ft_metadata *dmeta =
 					ft_root_metadata(detached);
