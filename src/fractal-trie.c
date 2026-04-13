@@ -6766,9 +6766,6 @@ void ft_density_add(struct cds_ft_metadata *m, unsigned int idx, long delta)
 {
 	unsigned long val = ft_density_get(m, idx);
 
-	if (delta < 0 && val < (unsigned long) -delta)
-		fprintf(stderr, "DENSITY ADD UNDERFLOW: idx=%u val=%lu delta=%ld\n",
-			idx, val, delta);
 	assert(delta >= 0 || val >= (unsigned long) -delta);
 	val += delta;
 	ft_density_set(m, idx, val);
@@ -6779,13 +6776,6 @@ void ft_density_sub(struct cds_ft_metadata *m, unsigned int idx, unsigned long s
 {
 	unsigned long val = ft_density_get(m, idx);
 
-	if (val < sub) {
-		void *bt[10];
-		int nbt = backtrace(bt, 10);
-		fprintf(stderr, "DENSITY UNDERFLOW: idx=%u val=%lu sub=%lu\n",
-			idx, val, sub);
-		backtrace_symbols_fd(bt, nbt, 2);
-	}
 	assert(val >= sub);
 	ft_density_set(m, idx, val - sub);
 }
@@ -11191,6 +11181,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 
 		uatomic_store(&m->nr_keys, subtree_external_count,
 			CMM_RELAXED);
+		ft_init_node_density(compressed);
 		return compressed;
 	}
 	if (path_len >= 1) {
@@ -11224,6 +11215,13 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 					subtree_external_count,
 					CMM_RELAXED);
 			}
+			/*
+			 * Initialize density: this node's child (cur)
+			 * may be the graft payload with an existing
+			 * subtree.  Bottom-up order ensures child
+			 * density is set before parent.
+			 */
+			ft_init_node_density(dest);
 			cur = dest;
 		}
 		return cur;
@@ -11478,17 +11476,11 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 					break;
 				am = cds_ft_item_to_metadata(
 					ft_node_ptr(graft_snapshot[si]));
-				{
-					unsigned long contrib =
-						ft_child_density_contribution(
-							graft_meta, distance,
-							ft_node_readside_footprint(
-								src_ft->root));
-					fprintf(stderr, "GRAFT DENSITY: si=%d depth=%u dist=%u am.d0=%lu contrib=%lu\n",
-						si, graft_snapshot_depth[si], distance,
-						ft_density_get(am, 0), contrib);
-					ft_density_add(am, 0, (long) contrib);
-				}
+				ft_density_add(am, 0,
+					(long) ft_child_density_contribution(
+						graft_meta, distance,
+						ft_node_readside_footprint(
+							src_ft->root)));
 			}
 		}
 
@@ -12015,19 +12007,6 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						distance = key_len - anc_depth;
 						if (distance > FT_NODE_DENSITY_DEPTH)
 							break;
-						{
-							unsigned long contrib = ft_child_density_contribution(
-								child_meta, distance,
-								ft_node_readside_footprint(child));
-							unsigned long d0 = ft_density_get(am, 0);
-							if (d0 < contrib)
-								fprintf(stderr, "DETACH BUG: dist=%u anc_depth=%u kl=%u d0=%lu contrib=%lu child_fp=%u child.d0=%lu child.d[%u]=%lu\n",
-									distance, anc_depth, key_len, d0, contrib,
-									ft_node_readside_footprint(child),
-									ft_density_get(child_meta, 0),
-									FT_NODE_DENSITY_DEPTH - distance,
-									ft_density_get(child_meta, FT_NODE_DENSITY_DEPTH - distance));
-						}
 						ft_density_sub(am, 0,
 							ft_child_density_contribution(
 								child_meta, distance,
