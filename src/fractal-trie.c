@@ -1237,6 +1237,13 @@ bool ft_node_collapsed(struct cds_ft_inode_flag *node __attribute__((unused)))
  * parallel; the compiler emits a CMOV, keeping the critical path
  * to 4 cycles.
  */
+/* Forward declarations for nr_keys helpers (defined after density accessors). */
+static inline bool ft_density_is_extended(const struct cds_ft_metadata *m);
+static void ft_density_promote(struct cds_ft_metadata *m);
+static inline unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m);
+static inline unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m);
+static inline void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo);
+
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
@@ -3882,8 +3889,8 @@ retry:		/* for fallback */
 			new_metadata->parent = metadata->parent;
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
 			new_metadata->external_nodes = metadata->external_nodes;
-			uatomic_store(&new_metadata->nr_keys,
-				metadata->nr_keys, CMM_RELAXED);
+			ft_nr_keys_store(new_metadata,
+				ft_nr_keys_get(metadata), CMM_RELAXED);
 		}
 		if (fallback)
 			new_metadata->fallback_removal_count =
@@ -6830,37 +6837,6 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
  * for simplicity.
  */
 /*
- * ft_propagate_external_count_parent: propagate nr_keys delta
- * from @start up to the root via metadata->parent pointers.
- * instead of a pre-built snapshot array.
- *
- * @start: deepest internal/compressed/collapsed node on the path
- *         (the node where the external was attached, or the
- *         deepest ancestor with metadata).  Must not be an
- *         external node or NULL.
- * @delta: +1 for insert, -1 for remove.
- *
- * Same ordering guarantees as the snapshot-based variant:
- * bottom-up CMM_RELEASE stores preserve the undercount invariant.
- */
-static
-void ft_propagate_external_count_parent(struct cds_ft_inode_flag *start,
-		long delta)
-{
-	struct cds_ft_inode_flag *cur = start;
-
-	ft_delay_writer();
-
-	while (cur) {
-		struct cds_ft_metadata *m =
-			cds_ft_item_to_metadata(ft_node_ptr(cur));
-		uatomic_store(&m->nr_keys, m->nr_keys + delta, CMM_RELEASE);
-		ft_delay_writer();
-		cur = m->parent;
-	}
-}
-
-/*
  * Compact density counter accessors.
  *
  * ft_density_get: read counter[idx] from compact or extended storage.
@@ -6873,9 +6849,15 @@ void ft_propagate_external_count_parent(struct cds_ft_inode_flag *start,
  * All write-side only (mutex-held).
  */
 static inline
+bool ft_density_is_extended(const struct cds_ft_metadata *m)
+{
+	return m->nr_keys == UINT32_MAX;
+}
+
+static inline
 unsigned long ft_density_get(const struct cds_ft_metadata *m, unsigned int idx)
 {
-	if (caa_unlikely(m->density_extended))
+	if (caa_unlikely(ft_density_is_extended(m)))
 		return m->density_ext->nr_nodes_at_depth[idx];
 	return m->nr_nodes_at_depth[idx];
 }
@@ -6891,14 +6873,67 @@ void ft_density_promote(struct cds_ft_metadata *m)
 		abort();
 	for (i = 0; i < FT_NODE_DENSITY_DEPTH; i++)
 		ext->nr_nodes_at_depth[i] = m->nr_nodes_at_depth[i];
+	ext->nr_keys = m->nr_keys;
+	/*
+	 * Store density_ext pointer into the union first, then
+	 * publish via nr_keys = UINT32_MAX with release.  Readers
+	 * doing acquire-load on nr_keys that see UINT32_MAX are
+	 * guaranteed to see the valid density_ext pointer.
+	 */
 	m->density_ext = ext;
-	m->density_extended = 1;
+	uatomic_store(&m->nr_keys, UINT32_MAX, CMM_RELEASE);
+}
+
+/*
+ * ft_nr_keys_get: read nr_keys from compact or extended storage.
+ * Write-side only (non-atomic read under mutex).
+ */
+static inline
+unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m)
+{
+	if (caa_unlikely(ft_density_is_extended(m)))
+		return m->density_ext->nr_keys;
+	return m->nr_keys;
+}
+
+/*
+ * ft_nr_keys_load: read nr_keys with acquire semantics.
+ * Read-side safe (concurrent with writers).
+ */
+static inline
+unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
+{
+	uint32_t val = uatomic_load(&m->nr_keys, CMM_ACQUIRE);
+
+	if (caa_unlikely(val == UINT32_MAX))
+		return uatomic_load(&m->density_ext->nr_keys, CMM_ACQUIRE);
+	return val;
+}
+
+/*
+ * ft_nr_keys_store: write nr_keys with specified memory order.
+ * If compact and val would reach UINT32_MAX, promotes first.
+ * Write-side only (mutex-held).
+ */
+static inline
+void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo)
+{
+	if (caa_unlikely(ft_density_is_extended(m))) {
+		uatomic_store(&m->density_ext->nr_keys, val, mo);
+		return;
+	}
+	if (caa_unlikely(val >= UINT32_MAX)) {
+		ft_density_promote(m);
+		uatomic_store(&m->density_ext->nr_keys, val, mo);
+		return;
+	}
+	uatomic_store(&m->nr_keys, (uint32_t) val, mo);
 }
 
 static inline
 void ft_density_set(struct cds_ft_metadata *m, unsigned int idx, unsigned long val)
 {
-	if (caa_unlikely(m->density_extended)) {
+	if (caa_unlikely(ft_density_is_extended(m))) {
 		m->density_ext->nr_nodes_at_depth[idx] = val;
 		return;
 	}
@@ -6932,9 +6967,37 @@ void ft_density_sub(struct cds_ft_metadata *m, unsigned int idx, unsigned long s
 static inline
 void ft_density_free(struct cds_ft_metadata *m)
 {
-	if (m->density_extended) {
+	if (ft_density_is_extended(m))
 		free(m->density_ext);
-		m->density_extended = 0;
+}
+
+/*
+ * ft_propagate_external_count_parent: propagate nr_keys delta
+ * from @start up to the root via metadata->parent pointers.
+ *
+ * @start: deepest internal/compressed/collapsed node on the path
+ *         (the node where the external was attached, or the
+ *         deepest ancestor with metadata).  Must not be an
+ *         external node or NULL.
+ * @delta: +1 for insert, -1 for remove.
+ *
+ * Same ordering guarantees as the snapshot-based variant:
+ * bottom-up CMM_RELEASE stores preserve the undercount invariant.
+ */
+static
+void ft_propagate_external_count_parent(struct cds_ft_inode_flag *start,
+		long delta)
+{
+	struct cds_ft_inode_flag *cur = start;
+
+	ft_delay_writer();
+
+	while (cur) {
+		struct cds_ft_metadata *m =
+			cds_ft_item_to_metadata(ft_node_ptr(cur));
+		ft_nr_keys_store(m, ft_nr_keys_get(m) + delta, CMM_RELEASE);
+		ft_delay_writer();
+		cur = m->parent;
 	}
 }
 
@@ -7886,7 +7949,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 
 		best_meta->nr_child = ft_collapsed_count(
 			ft_collapsed_nr_entries(best_col));
-		uatomic_store(&best_meta->nr_keys, metadata->nr_keys,
+		ft_nr_keys_store(best_meta, ft_nr_keys_get(metadata),
 			CMM_RELAXED);
 		best_meta->external_nodes = metadata->external_nodes;
 
@@ -8164,7 +8227,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	if (!ft_node_external(cn->child)) {
 		struct cds_ft_metadata *cm =
 			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
-		old_child_nr_keys = cm->nr_keys;
+		old_child_nr_keys = ft_nr_keys_get(cm);
 	} else if (ft_node_ptr(cn->child)) {
 		old_child_nr_keys = 1;	/* external leaf */
 	} else {
@@ -8182,7 +8245,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1], suffix_len);
 		sfx_meta->nr_child = 1;
-		uatomic_store(&sfx_meta->nr_keys, old_child_nr_keys, CMM_RELAXED);
+		ft_nr_keys_store(sfx_meta, old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
 		ft_set_parent(cn->child, old_suffix_flag, NULL);
 		old_suffix_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
@@ -8196,7 +8259,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			uatomic_store(&m->nr_keys, old_child_nr_keys, CMM_RELAXED);
+			ft_nr_keys_store(m, old_child_nr_keys, CMM_RELAXED);
 		}
 		old_suffix_flag = dest;
 		created[nr_created++] = dest;
@@ -8221,7 +8284,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 				nb->key_bytes[k] = iter_key[diverge_pos + 1 + k];
 		}
 		nb_meta->nr_child = 1;
-		uatomic_store(&nb_meta->nr_keys, 1, CMM_RELAXED);
+		ft_nr_keys_store(nb_meta, 1, CMM_RELAXED);
 		new_branch_flag = ft_compressed_node_flag(nb);
 		ft_set_parent(nb->child, new_branch_flag, NULL);
 		new_branch_flag = ft_publish_compressed(ft, nb, new_branch_flag);
@@ -8236,7 +8299,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			uatomic_store(&m->nr_keys, 1, CMM_RELAXED);
+			ft_nr_keys_store(m, 1, CMM_RELAXED);
 		}
 		new_branch_flag = dest;
 		created[nr_created++] = dest;
@@ -8272,7 +8335,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		}
 
 		branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		uatomic_store(&branch_meta->nr_keys, old_child_nr_keys + 1,
+		ft_nr_keys_store(branch_meta, old_child_nr_keys + 1,
 				CMM_RELAXED);
 		branch_flag = dest;
 	}
@@ -8288,7 +8351,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		pfx->len = diverge_pos;
 		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
 		pfx_meta->nr_child = 1;
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys + 1, CMM_RELAXED);
+		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		top_flag = ft_compressed_node_flag(pfx);
@@ -8303,7 +8366,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 				branch_flag, NULL, NULL);
 		if (ret) goto error;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys + 1, CMM_RELAXED);
+		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
 		top_flag = dest;
@@ -8312,7 +8375,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		/* diverge_pos == 0: branch IS the top. */
 		struct cds_ft_metadata *branch_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(branch_flag));
-		uatomic_store(&branch_meta->nr_keys, cn_meta->nr_keys + 1,
+		ft_nr_keys_store(branch_meta, ft_nr_keys_get(cn_meta) + 1,
 				CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			branch_meta->external_nodes = cn_meta->external_nodes;
@@ -8430,7 +8493,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	if (!ft_node_external(cn->child)) {
 		struct cds_ft_metadata *cm =
 			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
-		child_nr_keys = cm->nr_keys;
+		child_nr_keys = ft_nr_keys_get(cm);
 	} else if (ft_node_ptr(cn->child)) {
 		child_nr_keys = 1;
 	} else {
@@ -8449,7 +8512,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		memcpy(sfx->key_bytes, &cn->key_bytes[remaining + 1],
 			suffix_len);
 		sfx_meta->nr_child = 1;
-		uatomic_store(&sfx_meta->nr_keys, child_nr_keys,
+		ft_nr_keys_store(sfx_meta, child_nr_keys,
 			CMM_RELAXED);
 		suffix_flag = ft_compressed_node_flag(sfx);
 		ft_set_parent(cn->child, suffix_flag, NULL);
@@ -8465,7 +8528,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			uatomic_store(&m->nr_keys, child_nr_keys,
+			ft_nr_keys_store(m, child_nr_keys,
 				CMM_RELAXED);
 		}
 		suffix_flag = dest;
@@ -8484,7 +8547,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			suffix_flag, NULL, NULL);
 		if (ret) goto error;
 		jct_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		uatomic_store(&jct_meta->nr_keys, child_nr_keys,
+		ft_nr_keys_store(jct_meta, child_nr_keys,
 			CMM_RELAXED);
 		jct_flag = dest;
 		created[nr_created++] = dest;
@@ -8501,7 +8564,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		pfx->len = remaining;
 		memcpy(pfx->key_bytes, cn->key_bytes, remaining);
 		pfx_meta->nr_child = 1;
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys,
+		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
@@ -8518,7 +8581,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			jct_flag, NULL, NULL);
 		if (ret) goto error;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys,
+		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
@@ -8595,11 +8658,11 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	for (j = 0; j < path_len; j++)
 		cn->key_bytes[j] = key[level + j];
 	cn_meta->nr_child = 1;
-	uatomic_store(&cn_meta->nr_keys, 1, CMM_RELAXED);
+	ft_nr_keys_store(cn_meta, 1, CMM_RELAXED);
 	if (external_nodes) {
 		cn_meta->external_nodes = external_nodes;
-		uatomic_store(&cn_meta->nr_keys,
-			cn_meta->nr_keys + 1, CMM_RELAXED);
+		ft_nr_keys_store(cn_meta,
+			ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
 	}
 	{
 		struct cds_ft_inode_flag *cflag = ft_compressed_node_flag(cn);
@@ -8702,7 +8765,7 @@ int ft_attach_node(struct cds_ft *ft,
 			{
 				struct cds_ft_metadata *branch_meta =
 					cds_ft_item_to_metadata(ft_node_ptr(iter_dest_node_flag));
-				uatomic_store(&branch_meta->nr_keys, 1, CMM_RELAXED);
+				ft_nr_keys_store(branch_meta, 1, CMM_RELAXED);
 			}
 			created_nodes[nr_created_nodes++] = iter_dest_node_flag;
 			iter_node_flag = iter_dest_node_flag;
@@ -8713,8 +8776,8 @@ int ft_attach_node(struct cds_ft *ft,
 
 			iter_node_metadata = cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
 			iter_node_metadata->external_nodes = external_nodes;
-			uatomic_store(&iter_node_metadata->nr_keys,
-				iter_node_metadata->nr_keys + 1, CMM_RELAXED);
+			ft_nr_keys_store(iter_node_metadata,
+				ft_nr_keys_get(iter_node_metadata) + 1, CMM_RELAXED);
 		}
 	}
 
@@ -8933,8 +8996,8 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		return -ENOMEM;
 	br_meta = cds_ft_item_to_metadata(ft_node_ptr(branch));
 	br_meta->external_nodes = (struct cds_ft_node *) cn->child;
-	uatomic_store(&br_meta->nr_keys,
-		br_meta->nr_keys + 1, CMM_RELAXED);
+	ft_nr_keys_store(br_meta,
+		ft_nr_keys_get(br_meta) + 1, CMM_RELAXED);
 	ft_set_parent(branch, d->nf, NULL);
 	ft_publish_to_parent(ft, d->nf, &cn->child, branch);
 	/* Propagate density for the new branch node. */
@@ -9040,8 +9103,8 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		struct cds_ft_metadata *jct_meta =
 			cds_ft_item_to_metadata(
 				ft_node_ptr(jct_flag));
-		uatomic_store(&jct_meta->nr_keys,
-			jct_meta->nr_keys + 1, CMM_RELAXED);
+		ft_nr_keys_store(jct_meta,
+			ft_nr_keys_get(jct_meta) + 1, CMM_RELAXED);
 	}
 	free_compressed_node(ft, ft_compressed_node_ptr(d->nf));
 	return 0;
@@ -9142,7 +9205,7 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		cn->len = len;
 		memcpy(cn->key_bytes, ordinals, len);
 		cn_meta->nr_child = 1;
-		uatomic_store(&cn_meta->nr_keys, nr_keys, CMM_RELAXED);
+		ft_nr_keys_store(cn_meta, nr_keys, CMM_RELAXED);
 		cflag = ft_compressed_node_flag(cn);
 		ft_set_parent(child, cflag, NULL);
 		ft_init_node_density(cflag);
@@ -9176,7 +9239,7 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 				struct cds_ft_metadata *m =
 					cds_ft_item_to_metadata(
 						ft_node_ptr(dest));
-				uatomic_store(&m->nr_keys, nr_keys,
+				ft_nr_keys_store(m, nr_keys,
 					CMM_RELAXED);
 				m->nr_child = 1;
 			}
@@ -9242,8 +9305,7 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		if (!ft_node_external(child) && ft_node_ptr(child)) {
 			struct cds_ft_metadata *cm =
 				cds_ft_item_to_metadata(ft_node_ptr(child));
-			child_nr_keys = uatomic_load(&cm->nr_keys,
-				CMM_RELAXED);
+			child_nr_keys = ft_nr_keys_get(cm);
 		} else {
 			child_nr_keys = ft_node_ptr(child) ? 1 : 0;
 		}
@@ -9319,8 +9381,7 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 					struct cds_ft_metadata *sm =
 						cds_ft_item_to_metadata(
 							ft_node_ptr(sub));
-					total_keys += uatomic_load(
-						&sm->nr_keys, CMM_RELAXED);
+					total_keys += ft_nr_keys_get(sm);
 				}
 			}
 
@@ -9331,7 +9392,7 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 			struct cds_ft_metadata *im =
 				cds_ft_item_to_metadata(
 					ft_node_ptr(internal_flag));
-			uatomic_store(&im->nr_keys, total_keys,
+			ft_nr_keys_store(im, total_keys,
 				CMM_RELAXED);
 			ft_init_node_density(internal_flag);
 		}
@@ -10292,7 +10353,7 @@ int ft_detach_node(struct cds_ft *ft,
 				iter_node_flag))->parent;
 		if (topmost_external_nodes) {
 			fresh_meta->external_nodes = topmost_external_nodes;
-			uatomic_store(&fresh_meta->nr_keys, 1, CMM_RELAXED);
+			ft_nr_keys_store(fresh_meta, 1, CMM_RELAXED);
 		}
 		rcu_assign_pointer(*detach_parent_flag_ptr,
 			ft_node_flag(fresh, 0));
@@ -10825,7 +10886,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		}
 		*result_node = external_nodes;
 		/* Decrement before detach (undercount ordering). */
-		uatomic_store(&metadata->nr_keys, metadata->nr_keys - 1,
+		ft_nr_keys_store(metadata, ft_nr_keys_get(metadata) - 1,
 			CMM_RELEASE);
 		rcu_assign_pointer(metadata->external_nodes, NULL);
 		return CDS_FT_STATUS_OK;
@@ -11050,7 +11111,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	if (!ft_node_external(cn->child)) {
 		struct cds_ft_metadata *cm =
 			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
-		old_child_nr_keys = cm->nr_keys;
+		old_child_nr_keys = ft_nr_keys_get(cm);
 	} else if (ft_node_ptr(cn->child)) {
 		old_child_nr_keys = 1;
 	} else {
@@ -11069,7 +11130,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1],
 			suffix_len);
 		sfx_meta->nr_child = 1;
-		uatomic_store(&sfx_meta->nr_keys, old_child_nr_keys,
+		ft_nr_keys_store(sfx_meta, old_child_nr_keys,
 			CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
 		ft_set_parent(cn->child, old_suffix_flag, NULL);
@@ -11085,7 +11146,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			uatomic_store(&m->nr_keys, old_child_nr_keys,
+			ft_nr_keys_store(m, old_child_nr_keys,
 				CMM_RELAXED);
 		}
 		old_suffix_flag = dest;
@@ -11106,7 +11167,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		branch_flag = dest;
 
 		branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		uatomic_store(&branch_meta->nr_keys, old_child_nr_keys,
+		ft_nr_keys_store(branch_meta, old_child_nr_keys,
 			CMM_RELAXED);
 	}
 
@@ -11121,7 +11182,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		pfx->len = diverge_pos;
 		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
 		pfx_meta->nr_child = 1;
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys,
+		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
@@ -11137,7 +11198,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 				branch_flag, NULL, NULL);
 		if (ret) goto error;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys,
+		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
@@ -11147,7 +11208,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		/* diverge_pos == 0: branch IS the top. */
 		struct cds_ft_metadata *branch_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(branch_flag));
-		uatomic_store(&branch_meta->nr_keys, cn_meta->nr_keys,
+		ft_nr_keys_store(branch_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			branch_meta->external_nodes = cn_meta->external_nodes;
@@ -11370,7 +11431,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	if (!ft_node_external(cn->child)) {
 		struct cds_ft_metadata *cm =
 			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
-		child_nr_keys = cm->nr_keys;
+		child_nr_keys = ft_nr_keys_get(cm);
 	} else if (ft_node_ptr(cn->child)) {
 		child_nr_keys = 1;
 	} else {
@@ -11389,7 +11450,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		memcpy(sfx->key_bytes, &cn->key_bytes[remaining],
 			suffix_len);
 		sfx_meta->nr_child = 1;
-		uatomic_store(&sfx_meta->nr_keys, child_nr_keys,
+		ft_nr_keys_store(sfx_meta, child_nr_keys,
 			CMM_RELAXED);
 		suffix_flag = ft_compressed_node_flag(sfx);
 		ft_set_parent(cn->child, suffix_flag, NULL);
@@ -11405,7 +11466,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			uatomic_store(&m->nr_keys, child_nr_keys,
+			ft_nr_keys_store(m, child_nr_keys,
 				CMM_RELAXED);
 		}
 		suffix_flag = dest;
@@ -11429,7 +11490,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		pfx->len = prefix_len;
 		memcpy(pfx->key_bytes, cn->key_bytes, prefix_len);
 		pfx_meta->nr_child = 1;
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys,
+		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
@@ -11453,7 +11514,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 			return -1;
 		}
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		uatomic_store(&pfx_meta->nr_keys, cn_meta->nr_keys,
+		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		if (cn_meta->external_nodes)
 			pfx_meta->external_nodes = cn_meta->external_nodes;
@@ -11513,7 +11574,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(compressed));
 
-		uatomic_store(&m->nr_keys, subtree_external_count,
+		ft_nr_keys_store(m, subtree_external_count,
 			CMM_RELAXED);
 		ft_init_node_density(compressed);
 		return compressed;
@@ -11545,7 +11606,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 				struct cds_ft_metadata *m =
 					cds_ft_item_to_metadata(
 						ft_node_ptr(dest));
-				uatomic_store(&m->nr_keys,
+				ft_nr_keys_store(m,
 					subtree_external_count,
 					CMM_RELAXED);
 			}
@@ -11647,7 +11708,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 				cds_ft_item_to_metadata(
 					ft_node_ptr(branch));
 			bm->external_nodes = displaced;
-			uatomic_store(&bm->nr_keys, bm->nr_keys + 1,
+			ft_nr_keys_store(bm, ft_nr_keys_get(bm) + 1,
 				CMM_RELAXED);
 		}
 
@@ -11754,7 +11815,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *graft_snapshot[FT_MAX_DEPTH];
 		unsigned int graft_snapshot_depth[FT_MAX_DEPTH];
 		int nr_graft_snapshot;
-		unsigned long src_count = src_rmeta->nr_keys;
+		unsigned long src_count = ft_nr_keys_get(src_rmeta);
 
 		/*
 		 * Preallocate a fresh empty root for the source trie
@@ -11928,13 +11989,13 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		swap_rmeta = ft_root_metadata(swap_ft);
 		swap_empty = (swap_rmeta->nr_child == 0
 				&& !swap_rmeta->external_nodes);
-		swap_count = swap_empty ? 0 : swap_rmeta->nr_keys;
+		swap_count = swap_empty ? 0 : ft_nr_keys_get(swap_rmeta);
 
 		/* Compute old_count from the content being displaced. */
 		if (!ft_node_external(old_child)) {
 			struct cds_ft_metadata *old_meta =
 				cds_ft_item_to_metadata(ft_node_ptr(old_child));
-			old_count = old_meta->nr_keys;
+			old_count = ft_nr_keys_get(old_meta);
 		} else if (ft_node_ptr(old_child)) {
 			old_count = 1;	/* One key (possibly with duplicates). */
 		} else {
@@ -12051,7 +12112,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				swap_rmeta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(old_child);
-				uatomic_store(&swap_rmeta->nr_keys, old_count, CMM_RELEASE);
+				ft_nr_keys_store(swap_rmeta, old_count, CMM_RELEASE);
 			}
 		} else {
 			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
@@ -12059,7 +12120,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				fresh_meta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(old_child);
-				uatomic_store(&fresh_meta->nr_keys, old_count, CMM_RELEASE);
+				ft_nr_keys_store(fresh_meta, old_count, CMM_RELEASE);
 			}
 		}
 
@@ -12297,7 +12358,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				struct cds_ft_metadata *child_meta =
 					cds_ft_item_to_metadata(
 						ft_node_ptr(child));
-				detached_count = child_meta->nr_keys;
+				detached_count = ft_nr_keys_get(child_meta);
 			} else {
 				detached_count = 1;	/* One key (possibly with duplicates). */
 			}
@@ -12405,7 +12466,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				dmeta->external_nodes =
 					(struct cds_ft_node *)
 					ft_node_ptr(child);
-				uatomic_store(&dmeta->nr_keys, detached_count, CMM_RELAXED);
+				ft_nr_keys_store(dmeta, detached_count, CMM_RELAXED);
 			}
 		}
 		{
@@ -12514,7 +12575,7 @@ enum ft_compressed_action ft_count_prefix_compressed(
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
 
-		*count_ret = uatomic_load(&cn_meta->nr_keys, CMM_ACQUIRE);
+		*count_ret = ft_nr_keys_load(cn_meta);
 		return FT_COMPRESSED_END;
 	}
 	*i_p = i + cn->len - 1;
@@ -12568,7 +12629,7 @@ enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **n
 			if (!ft_node_external(ptrs[e])) {
 				struct cds_ft_metadata *m =
 					cds_ft_item_to_metadata(ft_node_ptr(ptrs[e]));
-				*count_ret = uatomic_load(&m->nr_keys, CMM_ACQUIRE);
+				*count_ret = ft_nr_keys_load(m);
 			} else if (ft_node_ptr(ptrs[e])) {
 				*count_ret = 1;
 			} else {
@@ -12667,17 +12728,17 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	if (ft_node_internal(node_flag)) {
 		struct cds_ft_metadata *metadata =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		return uatomic_load(&metadata->nr_keys, CMM_ACQUIRE);
+		return ft_nr_keys_load(metadata);
 	}
 	if (ft_node_compressed(node_flag)) {
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		return uatomic_load(&cn_meta->nr_keys, CMM_ACQUIRE);
+		return ft_nr_keys_load(cn_meta);
 	}
 	if (ft_node_collapsed(node_flag)) {
 		struct cds_ft_metadata *col_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		return uatomic_load(&col_meta->nr_keys, CMM_ACQUIRE);
+		return ft_nr_keys_load(col_meta);
 	}
 	/* External node: one key (possibly with duplicates). */
 	return 1;
@@ -12697,7 +12758,7 @@ unsigned long ft_child_key_count(struct cds_ft_inode_flag *child)
 	if (!ft_node_external(child)) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(child));
-		return uatomic_load(&m->nr_keys, CMM_ACQUIRE);
+		return ft_nr_keys_load(m);
 	}
 	return 1;
 }
@@ -13528,7 +13589,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent = iter_path_node(iter)[depth];
 		struct cds_ft_metadata *pmeta =
 			cds_ft_item_to_metadata(ft_node_ptr(parent));
-		unsigned long right_keys = uatomic_load(&pmeta->nr_keys, CMM_ACQUIRE) - 1; /* exclude self */
+		unsigned long right_keys = ft_nr_keys_load(pmeta) - 1; /* exclude self */
 
 		if (remaining <= right_keys) {
 			/*
@@ -14628,7 +14689,7 @@ static void show_collapsed_node(const struct cds_ft *ft, FILE *out,
 		level, node_flag, ft_collapsed_count(nr_e),
 		ft_collapsed_scan_zone_size(nr_e),
 		cds_ft_item_order(col),
-		uatomic_load(&col_meta->nr_keys, CMM_RELAXED));
+		ft_nr_keys_get(col_meta));
 	print_density(out, col_meta);
 	fprintf(out, "\n");
 	if (external_nodes) {
@@ -14714,7 +14775,7 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 			print_indent(out, level);
 			fprintf(out, "Level %d, key value: %u, compressed node: %p, path_len: %u, nr_keys: %lu, density: ",
 				level, key, child_node_flag, (unsigned int) cn->len,
-				uatomic_load(&metadata->nr_keys, CMM_RELAXED));
+				ft_nr_keys_get(metadata));
 			print_density(out, metadata);
 			fprintf(out, "\n");
 			if (external_nodes) {

@@ -335,10 +335,8 @@ void cds_ft_free_item_rcu(struct rcu_head *rcu_head)
 		cds_ft_metadata_to_range(&metadata_alloc->metadata)->arena;
 
 	/* Free lazily-allocated extended density counters. */
-	if (metadata_alloc->metadata.density_extended) {
+	if (metadata_alloc->metadata.nr_keys == UINT32_MAX)
 		free(metadata_alloc->metadata.density_ext);
-		metadata_alloc->metadata.density_extended = 0;
-	}
 
 	pthread_mutex_lock(&arena->lock);
 	metadata_alloc->free_list_next = arena->free_list_head;
