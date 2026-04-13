@@ -1909,8 +1909,10 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 	    ft_type->type_class == FT_POOL)
 		((struct cds_ft_inode *) p)->data[0] =
 			ft_linear_encode_nr_child(0, ft_type);
-	if (ft_debug_counters())
+	if (ft_debug_counters()) {
 		uatomic_inc(&ft->nr_nodes_allocated);
+		uatomic_inc(&ft->nr_internal_alloc);
+	}
 	*_metadata = metadata;
 	return p;
 }
@@ -1921,8 +1923,10 @@ void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
 
 	cds_ft_free_item(metadata);
-	if (ft_debug_counters() && node)
+	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
+		uatomic_inc(&ft->nr_internal_freed);
+	}
 }
 
 /*
@@ -1989,8 +1993,10 @@ struct cds_ft_compressed_node *alloc_compressed_node(struct cds_ft *ft,
 	if (!metadata)
 		return NULL;
 	p = cds_ft_metadata_to_item(metadata);
-	if (ft_debug_counters())
+	if (ft_debug_counters()) {
 		uatomic_inc(&ft->nr_nodes_allocated);
+		uatomic_inc(&ft->nr_compressed_alloc);
+	}
 	*_metadata = metadata;
 	return p;
 }
@@ -2003,8 +2009,10 @@ void free_compressed_node(struct cds_ft *ft,
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 
 	cds_ft_free_item(metadata);
-	if (ft_debug_counters() && node)
+	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
+		uatomic_inc(&ft->nr_compressed_freed);
+	}
 }
 
 /*
@@ -2059,8 +2067,10 @@ struct cds_ft_collapsed_node *alloc_collapsed_node(struct cds_ft *ft,
 	memset(cn, 0, scan_sz);
 	/* Set scan zone selector in bits 6-7 of nr_entries (count starts at 0). */
 	cn->nr_entries = scan_sel << FT_COLLAPSED_SCAN_SHIFT;
-	if (ft_debug_counters())
+	if (ft_debug_counters()) {
 		uatomic_inc(&ft->nr_nodes_allocated);
+		uatomic_inc(&ft->nr_collapsed_alloc);
+	}
 	*_metadata = metadata;
 	return cn;
 }
@@ -2073,8 +2083,10 @@ void free_collapsed_node(struct cds_ft *ft,
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 
 	cds_ft_free_item(metadata);
-	if (ft_debug_counters() && node)
+	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
+		uatomic_inc(&ft->nr_collapsed_freed);
+	}
 }
 
 /*
@@ -14200,7 +14212,18 @@ void ft_final_checks(struct cds_ft *ft)
 	if (na != nf) {
 		fprintf(stderr, "[error] Fractal Trie leaked %ld nodes. Allocated: %lu, freed: %lu.\n",
 			(long) na - nf, na, nf);
-		abort();
+		fprintf(stderr, "  internal: alloc=%lu freed=%lu leaked=%ld\n",
+			uatomic_read(&ft->nr_internal_alloc),
+			uatomic_read(&ft->nr_internal_freed),
+			(long)(uatomic_read(&ft->nr_internal_alloc) - uatomic_read(&ft->nr_internal_freed)));
+		fprintf(stderr, "  compressed: alloc=%lu freed=%lu leaked=%ld\n",
+			uatomic_read(&ft->nr_compressed_alloc),
+			uatomic_read(&ft->nr_compressed_freed),
+			(long)(uatomic_read(&ft->nr_compressed_alloc) - uatomic_read(&ft->nr_compressed_freed)));
+		fprintf(stderr, "  collapsed: alloc=%lu freed=%lu leaked=%ld\n",
+			uatomic_read(&ft->nr_collapsed_alloc),
+			uatomic_read(&ft->nr_collapsed_freed),
+			(long)(uatomic_read(&ft->nr_collapsed_alloc) - uatomic_read(&ft->nr_collapsed_freed)));
 	}
 }
 
