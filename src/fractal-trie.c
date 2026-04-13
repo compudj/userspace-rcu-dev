@@ -5714,6 +5714,11 @@ slow_path:
 				goto descend_children;
 			if (act == FT_COMPRESSED_BREAK)
 				break;
+			if (level + 1 >= key_depth) {
+				level++;
+				skip_eq_external_nodes = false;
+				goto descend_children;
+			}
 			continue;
 		}
 		if (ft_node_collapsed(node_flag)) {
@@ -5734,6 +5739,18 @@ slow_path:
 				goto descend_children;
 			if (act == FT_COMPRESSED_BREAK)
 				break;
+			/*
+			 * CONTINUE: the suffix advanced level.  If the
+			 * for-loop increment would push level past
+			 * key_depth, descend into the child to find
+			 * the min/max leaf rather than exiting the
+			 * loop with a non-leaf node.
+			 */
+			if (level + 1 >= key_depth) {
+				level++;
+				skip_eq_external_nodes = false;
+				goto descend_children;
+			}
 			continue;
 		}
 
