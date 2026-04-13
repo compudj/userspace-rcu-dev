@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include <unistd.h>
 #include <urcu/rculfhash.h>
+#include <urcu/arch.h>
 #include <assert.h>
 
 /*
@@ -166,6 +167,35 @@
 #endif
 #ifndef NO_FEATURE_FT_COLLAPSE
 # define FEATURE_FT_COLLAPSE
+#endif
+
+/*
+ * Skip-compressed pointers encode the compressed path length in the
+ * high bits of pointers (bits 57-63).  This requires architectures
+ * where those bits are guaranteed zero for userspace pointers.
+ *
+ * Enabled by default on:
+ *   - x86-64: bits 48-63 (or 57-63 with LA57) are zero for userspace.
+ *   - aarch64: bits 48-63 (or 52-63 with LVA) are zero for userspace.
+ *
+ * Must be individually evaluated for each new architecture
+ * (e.g. s390x has full 64-bit virtual addresses, mips64/ppc64/riscv64
+ * vary by implementation).
+ *
+ * Requires FEATURE_FT_COMPRESS (skip-compressed is meaningless
+ * without compressed nodes).
+ *
+ * Override with -DNO_FEATURE_FT_SKIP_COMPRESSED to force-disable.
+ */
+#ifdef NO_FEATURE_FT_COMPRESS
+# ifndef NO_FEATURE_FT_SKIP_COMPRESSED
+#  define NO_FEATURE_FT_SKIP_COMPRESSED
+# endif
+#endif
+#ifndef NO_FEATURE_FT_SKIP_COMPRESSED
+# if defined(URCU_ARCH_AMD64) || defined(URCU_ARCH_AARCH64)
+#  define FEATURE_FT_SKIP_COMPRESSED
+# endif
 #endif
 
 #ifdef FEATURE_INLINE_LOOKUP
