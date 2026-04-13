@@ -44,12 +44,23 @@ struct cds_ft_alloc_arena;
 static size_t page_size;
 
 struct cds_ft_metadata_alloc {
+	/*
+	 * rcu_head and free_list_next are only used when the node is
+	 * being freed or on the free list.  metadata is only used when
+	 * the node is allocated.  They share the same memory.
+	 *
+	 * call_rcu writes 16 bytes into rcu_head, corrupting the first
+	 * 16 bytes of metadata (parent, skip_slot).  Fields accessed
+	 * in the RCU callback (density_extended, density_ext) and
+	 * alloc_index are beyond the rcu_head footprint and remain
+	 * valid.  alloc_index lives in cds_ft_metadata's tail padding
+	 * at offset 44 — see the field's comment there.
+	 */
 	union {
-		struct rcu_head rcu_head;			/* For deferred node reclaim. */
-		struct cds_ft_metadata_alloc *free_list_next;	/* Free list next pointer. */
+		struct rcu_head rcu_head;
+		struct cds_ft_metadata_alloc *free_list_next;
+		struct cds_ft_metadata metadata;
 	};
-	unsigned int alloc_index;
-	struct cds_ft_metadata metadata;
 };
 
 struct cds_ft_alloc_range {
@@ -96,7 +107,7 @@ struct cds_ft_alloc_range *cds_ft_metadata_to_range(struct cds_ft_metadata *meta
 {
 	struct cds_ft_metadata_alloc *metadata_alloc =
 		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
-	size_t index = metadata_alloc->alloc_index;
+	size_t index = metadata->alloc_index;
 
 	return (struct cds_ft_alloc_range *)((char *)(metadata_alloc - index) - sizeof(struct cds_ft_alloc_range));
 }
@@ -142,9 +153,7 @@ size_t cds_ft_item_order(void *p)
 
 void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata)
 {
-	struct cds_ft_metadata_alloc *metadata_alloc =
-		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
-	size_t index = metadata_alloc->alloc_index;
+	size_t index = metadata->alloc_index;
 	struct cds_ft_alloc_range *range = cds_ft_metadata_to_range(metadata);
 
 	return cds_ft_range_get_nth_item(range, index);
@@ -254,10 +263,13 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 
 	/* Return head of free list. */
 	if (free_list_head) {
+		uint16_t saved_alloc_index = free_list_head->metadata.alloc_index;
+
 		arena->free_list_head = free_list_head->free_list_next;
 		p = cds_ft_metadata_to_item(&free_list_head->metadata);
 		memset(p, 0, 1U << arena->item_len_order);
 		memset(&free_list_head->metadata, 0, sizeof(free_list_head->metadata));
+		free_list_head->metadata.alloc_index = saved_alloc_index;
 		if (arena->bitmap) {
 			struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(p, arena->item_len_order);
 			memset(bitmap, 0, sizeof(struct cds_ft_bitmap));
@@ -290,7 +302,7 @@ room_left:
 	/* First range in list has room left. */
 	item_index = range->next_unused++;
 	item = &range->metadata[item_index];
-	item->alloc_index = item_index;
+	item->metadata.alloc_index = item_index;
 	pthread_mutex_unlock(&arena->lock);
 	return &item->metadata;
 }
@@ -323,8 +335,10 @@ void cds_ft_free_item_rcu(struct rcu_head *rcu_head)
 		cds_ft_metadata_to_range(&metadata_alloc->metadata)->arena;
 
 	/* Free lazily-allocated extended density counters. */
-	free(metadata_alloc->metadata.density_ext);
-	metadata_alloc->metadata.density_ext = NULL;
+	if (metadata_alloc->metadata.density_extended) {
+		free(metadata_alloc->metadata.density_ext);
+		metadata_alloc->metadata.density_extended = 0;
+	}
 
 	pthread_mutex_lock(&arena->lock);
 	metadata_alloc->free_list_next = arena->free_list_head;
