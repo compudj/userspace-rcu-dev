@@ -10174,6 +10174,17 @@ int ft_detach_node(struct cds_ft *ft,
 		}
 		ret = 0;
 	} else {
+		/*
+		 * Save the old child before replace overwrites it.
+		 * If the detach point is above the actual removed
+		 * node (multi-child ancestor), there may be
+		 * intermediate single-child nodes between the
+		 * detach point and the removed external that need
+		 * freeing.
+		 */
+		struct cds_ft_inode_flag *old_detach_child =
+			*detach_node_flag_ptr;
+
 		ret = ft_node_replace_ptr(ft,
 			detach_node_flag_ptr,
 			&iter_node_flag,
@@ -10185,6 +10196,56 @@ int ft_detach_node(struct cds_ft *ft,
 		 * Density is updated incrementally by
 		 * ft_propagate_node_density; no full recount needed.
 		 */
+		if (!ret) {
+			/*
+			 * Free intermediate empty nodes between the
+			 * detach point and the removed external.
+			 * After ft_node_replace_ptr NULLed the slot,
+			 * old_detach_child is unreachable.  Walk down
+			 * freeing nodes that have nr_child == 0 and
+			 * no external_nodes (truly empty).  Stop at
+			 * any node that still has children or content.
+			 */
+			struct cds_ft_inode_flag *walk_nf = old_detach_child;
+
+			while (ft_node_ptr(walk_nf) &&
+			       !ft_node_external(walk_nf)) {
+				struct cds_ft_inode_flag *next = NULL;
+
+				if (ft_node_compressed(walk_nf) ||
+				    ft_node_skip_compressed(walk_nf)) {
+					struct cds_ft_compressed_node *cn;
+					struct cds_ft_metadata *cm;
+
+					if (ft_node_skip_compressed(walk_nf))
+						cn = ft_skip_to_compressed(walk_nf);
+					else
+						cn = ft_compressed_node_ptr(walk_nf);
+					cm = cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) cn);
+					if (cm->nr_child > 0 ||
+					    cm->external_nodes)
+						break;
+					next = cn->child;
+					free_compressed_node(ft, cn);
+				} else if (ft_node_collapsed(walk_nf)) {
+					break;
+				} else {
+					/* Internal node. */
+					struct cds_ft_inode *inode =
+						ft_node_ptr(walk_nf);
+					struct cds_ft_metadata *m =
+						cds_ft_item_to_metadata(inode);
+
+					if (m->nr_child > 0 ||
+					    m->external_nodes)
+						break;
+					free_cds_ft_node(ft, inode);
+					break; /* nr_child==0: no child to follow */
+				}
+				walk_nf = next;
+			}
+		}
 	}
 	if (ret)
 		goto end;
@@ -14300,7 +14361,6 @@ void ft_final_checks(struct cds_ft *ft)
 
 	na = uatomic_read(&ft->nr_nodes_allocated);
 	nf = uatomic_read(&ft->nr_nodes_freed);
-	dbg_printf("Nodes allocated: %lu, Nodes freed: %lu.\n", na, nf);
 	if (nr_fallback)
 		print_debug_fallback_distribution(ft);
 
