@@ -392,7 +392,7 @@ int test_1byte_key(void)
 
 	for (i = 0; i < CAA_ARRAY_SIZE(ka); i++) {
 		struct ft_test_node *node;
-		uint8_t result_key[1];
+		uint8_t result_key[8];
 		size_t result_key_len;
 
 		key = ka[i] + ka_test_offset;
@@ -418,7 +418,7 @@ int test_1byte_key(void)
 
 	for (i = 0; i < CAA_ARRAY_SIZE(ka); i++) {
 		struct ft_test_node *node;
-		uint8_t result_key[1];
+		uint8_t result_key[8];
 		size_t result_key_len;
 
 		key = ka[i] - ka_test_offset;
@@ -444,7 +444,7 @@ int test_1byte_key(void)
 
 	for (i = 0; i < CAA_ARRAY_SIZE(ka); i++) {
 		struct ft_test_node *node;
-		uint8_t result_key[1];
+		uint8_t result_key[8];
 		size_t result_key_len;
 
 		key = ka[i];	/* without offset */
@@ -633,7 +633,7 @@ int test_2bytes_key(void)
 	for (i = 0; i < CAA_ARRAY_SIZE(ka); i++) {
 		struct cds_ft_node *ft_node;
 		struct ft_test_node *node;
-		uint8_t result_key[2];
+		uint8_t result_key[8];
 		size_t result_key_len;
 
 		key = ka[i] + ka_test_offset;
@@ -660,7 +660,7 @@ int test_2bytes_key(void)
 	for (i = 0; i < CAA_ARRAY_SIZE(ka); i++) {
 		struct cds_ft_node *ft_node;
 		struct ft_test_node *node;
-		uint8_t result_key[2];
+		uint8_t result_key[8];
 		size_t result_key_len;
 
 		key = ka[i] - ka_test_offset;
@@ -687,7 +687,7 @@ int test_2bytes_key(void)
 	for (i = 0; i < CAA_ARRAY_SIZE(ka); i++) {
 		struct cds_ft_node *ft_node;
 		struct ft_test_node *node;
-		uint8_t result_key[2];
+		uint8_t result_key[8];
 		size_t result_key_len;
 
 		key = ka[i];	/* without offset */
