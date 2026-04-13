@@ -230,80 +230,85 @@ struct cds_ft_alloc_arena;
 
 struct cds_ft_density_extended {
 	unsigned long nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
+	unsigned long nr_keys;			/* Full-width nr_keys when compact
+						 * uint16_t overflows UINT16_MAX.
+						 */
 };
 
 /*
- * Struct layout is ordered for minimal padding:
- *   - 8-byte fields first (parent, external_nodes, nr_keys)
+ * Struct layout (32 bytes, zero internal padding):
+ *   - 8-byte fields: parent, external_nodes
  *   - 8-byte density union (density_ext ptr / uint8_t[6] counters)
- *   - 2-byte and 1-byte fields packed at the end (nr_child,
- *     skip_slot_offset, fallback_removal_count, density_extended,
- *     alloc_index)
+ *   - 4-byte packed bitfield (nr_child, skip_slot_offset,
+ *     fallback_removal_count, density_extended, alloc_index)
+ *   - 4-byte nr_keys (uint32_t)
  *
  * In cds_ft_metadata_alloc, this struct shares a union with
  * rcu_head (16 bytes) and free_list_next (8 bytes).  call_rcu
  * overwrites the first 16 bytes of the union (parent +
- * external_nodes) when the node is freed.  All fields accessed
- * in the RCU callback (density_extended, density_ext) and
- * alloc_index must remain beyond byte 16 of the struct.
+ * external_nodes) when the node is freed.  All fields at
+ * offset >= 16 (density union, packed bitfield, nr_keys)
+ * must remain beyond the rcu_head footprint.
+ *
+ * nr_keys == UINT32_MAX is the sentinel indicating that both
+ * the density counters and nr_keys have been promoted to the
+ * extended struct (density_ext).  This is the sole discriminator
+ * for the density union: no separate flag is needed.
+ *
+ * Publication ordering: the writer stores the density_ext
+ * pointer into the union BEFORE storing UINT32_MAX into nr_keys
+ * with release semantics.  A reader that loads nr_keys with
+ * acquire and sees UINT32_MAX is guaranteed to see the valid
+ * density_ext pointer.  Promotion is monotonic (never demoted).
  */
 struct cds_ft_metadata {
-	/* 8-byte aligned fields first. */
+	/* 8-byte aligned fields. */
 	struct cds_ft_inode_flag *parent;	/*
 						 * Tagged pointer to parent node (write-side only).
 						 * NULL for the root node.
 						 */
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
-	unsigned long nr_keys;			/* Total unique keys in subtree.
-						 * Stored with uatomic_store release,
-						 * loaded by readers with uatomic_load acquire.
-						 */
 
 	/*
-	 * Local node density counters (write-side only).
+	 * Local node density counters and nr_keys (compact/extended).
 	 *
-	 * Compact: uint8_t[6] inline (density_extended == 0).
-	 * Extended: density_ext pointer (density_extended == 1).
-	 * Promotion is monotonic (never demoted).
+	 * Compact (nr_keys < UINT32_MAX):
+	 *   uint8_t[6] density counters inline, nr_keys in uint32_t.
+	 * Extended (nr_keys == UINT32_MAX):
+	 *   density_ext pointer to struct holding full unsigned long
+	 *   density counters and nr_keys.
+	 *
+	 * Promotion triggered when any density counter > 255 or
+	 * nr_keys would reach UINT32_MAX.
 	 */
 	union {
 		struct cds_ft_density_extended *density_ext;
 		uint8_t nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
 	};
 
-	/* Small fields packed together. */
-	uint16_t nr_child;			/* Number of children in node (max 256). */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	uint16_t skip_slot_offset;		/*
-						 * Byte offset of the skip pointer slot from
-						 * ft_node_ptr(parent).  Used to update the
-						 * skip pointer when cn->child changes.
-						 * When parent == NULL (root's child), the
-						 * skip slot is &ft->root, recovered from
-						 * context.  Write-side only.
-						 */
-#endif
-	uint8_t fallback_removal_count;		/* Removals left keeping fallback. */
-	uint8_t density_extended;		/*
-						 * 0 = compact uint8_t mode,
-						 * 1 = density_ext pointer valid.
-						 */
 	/*
-	 * alloc_index: arena allocator field, logically belongs to
-	 * cds_ft_metadata_alloc but is placed here to fill the 4 bytes
-	 * of tail padding (offsets 44-47) that would otherwise be wasted
-	 * for struct alignment.
+	 * Packed bitfield — small fields in a single uint32_t.
 	 *
-	 * This field is live across allocated/free transitions:
-	 * it must survive call_rcu, which overwrites the first 16 bytes
-	 * of the metadata/rcu_head union.  At offset 44, it is safely
-	 * beyond the rcu_head footprint.
-	 *
-	 * Accessed by the arena allocator via metadata pointer —
-	 * cds_ft_metadata_to_range() and cds_ft_metadata_to_item()
-	 * read this to locate the item within its arena range.
+	 * nr_child:               9 bits (max 256)
+	 * skip_slot_offset:       8 bits (byte_offset / 8 from parent
+	 *                         node; ifdef-gated, 0 when disabled)
+	 * fallback_removal_count: 4 bits (max 8)
+	 * alloc_index:            8 bits (arena range index, max 256)
+	 *                        -- 29 bits used, 3 spare
 	 */
-	uint16_t alloc_index;
+	uint32_t nr_child:9;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	uint32_t skip_slot_offset:8;
+#endif
+	uint32_t fallback_removal_count:4;
+	uint32_t alloc_index:8;
+
+	/*
+	 * Total unique keys in subtree.
+	 * Stored with uatomic_store release, loaded with acquire.
+	 * UINT32_MAX is a sentinel meaning "promoted to density_ext".
+	 */
+	uint32_t nr_keys;
 };
 
 /*
