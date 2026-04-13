@@ -1941,6 +1941,41 @@ unsigned int ft_compressed_order(uint8_t path_len)
 	return (unsigned int) order;
 }
 
+/*
+ * ft_node_readside_footprint: return the read-side memory footprint
+ * of a traversable node, in 16-byte units.
+ *
+ * Skip-compressed nodes return 0: the reader never loads the
+ * compressed node — the skip length is encoded in the pointer's
+ * high bits, so traversal is free.
+ *
+ * For other types, returns the arena allocation size (1 << order)
+ * in 16-byte units: (1 << order) / 16 = 1 << (order - 4).
+ *
+ * Write-side only (may chase parent pointers for skip resolution).
+ */
+static
+unsigned int ft_node_readside_footprint(struct cds_ft_inode_flag *node_flag)
+{
+	unsigned int order;
+
+	if (ft_node_skip_compressed(node_flag))
+		return 0;
+	if (ft_node_compressed(node_flag)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(node_flag);
+		order = ft_compressed_order(cn->len);
+	} else if (ft_node_collapsed(node_flag)) {
+		order = cds_ft_item_order(
+			(void *) ft_collapsed_node_ptr(node_flag));
+	} else {
+		/* Internal: linear, pool, or pigeon. */
+		order = ft_types[ft_node_type(node_flag)].order;
+	}
+	assert(order >= 4);
+	return 1U << (order - 4);
+}
+
 static
 struct cds_ft_compressed_node *alloc_compressed_node(struct cds_ft *ft,
 		uint8_t path_len,
@@ -5305,6 +5340,7 @@ out_break:
 static
 enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_flag_p,
 		ssize_t *level_p, ssize_t key_depth,
+		ssize_t max_tree_depth,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
 		const uint8_t **iter_key_p,
@@ -5380,7 +5416,7 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **nod
 					iter_path_node(iter)[level + k] = node_flag;
 				}
 				level += slen - 1;
-				assert(level < (int) key_depth);
+				assert(level < (int) max_tree_depth);
 				/*
 				 * Ensure path[level] has the collapsed flag
 				 * so the going-up loop can detect the
@@ -5474,7 +5510,7 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **nod
 			iter_path_node(iter)[level + k] = node_flag;
 		}
 		level += slen - 1;
-		assert(level < (int) key_depth);
+		assert(level < (int) max_tree_depth);
 		if (slen == 1)
 			iter_path_node(iter)[level - 1] = node_flag;
 		node_flag = ft_dereference_acquire_prefetch(ptrs[best_match]);
@@ -5686,7 +5722,9 @@ slow_path:
 			cached_col_nr_e = ft_collapsed_nr_entries(
 				ft_collapsed_node_ptr(node_flag));
 			act = ft_inequality_collapsed(&node_flag,
-				&level, key_depth, mode, limit,
+				&level, key_depth,
+				ft->group->max_tree_depth,
+				mode, limit,
 				&iter_key, input_key, iter,
 				ordinal_key, &skip_eq_external_nodes,
 				cached_col_nr_e);
@@ -5859,7 +5897,7 @@ going_up:
 			if (external_nodes) {
 				int j;
 
-				assert(ft->group->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->group->key_len);
+				assert(level <= (int) ft->group->max_key_len);
 				iter->key_len = level;
 				for (j = 0; j < level; j++)
 					iter_key(iter)[j] = ordinal_key[j];
@@ -6013,7 +6051,7 @@ going_up:
 						ordinal_key[suffix_base + cur_slen] =
 							sib_key;
 						level = suffix_base + cur_slen + 1;
-						assert(level < key_depth);
+						assert(level < (ssize_t) ft->group->max_tree_depth);
 						iter_path_node(iter)[level] =
 							node_flag;
 						break;
@@ -6040,7 +6078,7 @@ going_up:
 							iter_path_node(iter)[level - 1];
 				}
 				level = suffix_base + slen;
-				assert(level < key_depth);
+				assert(level < (ssize_t) ft->group->max_tree_depth);
 				node_flag = ft_dereference_acquire_prefetch(
 					cptrs[best]);
 				if (ft_node_skip_compressed(node_flag))
@@ -6149,7 +6187,7 @@ descend_children:
 	if (ft_node_external(node_flag)) {
 		int j;
 
-		assert(ft->group->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->group->key_len);
+		assert(level <= (int) ft->group->max_key_len);
 		iter->key_len = level;
 		for (j = 0; j < level; j++)
 			iter_key(iter)[j] = ordinal_key[j];
@@ -6348,7 +6386,7 @@ descend_children:
 						ft_collapsed_node_flag(col);
 				}
 				level += slen - 1;
-				assert(level < key_depth);
+				assert(level < (ssize_t) ft->group->max_tree_depth);
 				node_flag = ft_dereference_acquire_prefetch(cptrs[best]);
 				if (!ft_node_ptr(node_flag))
 					break;
@@ -6390,7 +6428,7 @@ descend_children:
 	 * max_key_len.
 	 */
 	assert(level <= (int) ft->group->max_key_len);
-	assert(ft->group->key_len == CDS_FT_LEN_VARIABLE || level <= (int) ft->group->key_len);
+	assert(level <= (int) ft->group->max_key_len);
 found_minmax:
 	{
 		int j;
@@ -6728,6 +6766,9 @@ void ft_density_add(struct cds_ft_metadata *m, unsigned int idx, long delta)
 {
 	unsigned long val = ft_density_get(m, idx);
 
+	if (delta < 0 && val < (unsigned long) -delta)
+		fprintf(stderr, "DENSITY ADD UNDERFLOW: idx=%u val=%lu delta=%ld\n",
+			idx, val, delta);
 	assert(delta >= 0 || val >= (unsigned long) -delta);
 	val += delta;
 	ft_density_set(m, idx, val);
@@ -6738,6 +6779,13 @@ void ft_density_sub(struct cds_ft_metadata *m, unsigned int idx, unsigned long s
 {
 	unsigned long val = ft_density_get(m, idx);
 
+	if (val < sub) {
+		void *bt[10];
+		int nbt = backtrace(bt, 10);
+		fprintf(stderr, "DENSITY UNDERFLOW: idx=%u val=%lu sub=%lu\n",
+			idx, val, sub);
+		backtrace_symbols_fd(bt, nbt, 2);
+	}
 	assert(val >= sub);
 	ft_density_set(m, idx, val - sub);
 }
@@ -6751,48 +6799,83 @@ void ft_density_free(struct cds_ft_metadata *m)
 
 /*
  * Compute the precise density contribution of a child node to its
- * parent.  The child is at @distance levels below the parent.
+ * parent's density[0].  The child is at @distance levels below
+ * the parent.
+ * @child_footprint: the child's read-side footprint in 16B units.
  *
- * The child's nr_nodes_at_depth[0] covers levels child+1 through
- * child+DEPTH.  From the parent's perspective, those are at levels
- * parent+(distance+1) through parent+(distance+DEPTH).  The parent's
- * window ends at parent+DEPTH, so levels beyond that must be
- * subtracted.  The excess is the sum of per-level counters at
- * child levels (DEPTH - distance + 1) through DEPTH, stored in
- * nr_nodes_at_depth[DEPTH - distance] through nr_nodes_at_depth[DEPTH - 1].
+ * With cumulative density counters (density[j] = footprint at
+ * levels j+1..DEPTH), the contribution visible within the
+ * parent's window is:
+ *   child_footprint + density[0] - density[DEPTH - distance]
+ *
+ * density[0] covers the child's full subtree.
+ * density[DEPTH - distance] is the overflow beyond the parent's
+ * window, subtracted in one operation.
  */
 static inline unsigned long ft_child_density_contribution(
-		struct cds_ft_metadata *cm, unsigned int distance)
+		struct cds_ft_metadata *cm, unsigned int distance,
+		unsigned int child_footprint)
 {
-	unsigned long contrib = 1;	/* the child node itself */
-	unsigned int j;
-
 	if (distance >= FT_NODE_DENSITY_DEPTH)
-		return contrib;
-	contrib += ft_density_get(cm, 0);
-	/* Subtract levels that overflow the parent's window. */
-	for (j = FT_NODE_DENSITY_DEPTH - distance; j < FT_NODE_DENSITY_DEPTH; j++)
-		contrib -= ft_density_get(cm, j);
-	return contrib;
+		return child_footprint;
+	return child_footprint
+		+ ft_density_get(cm, 0)
+		- ft_density_get(cm, FT_NODE_DENSITY_DEPTH - distance);
 }
 
 /*
- * ft_init_node_density: set a node's density counter[0] by counting
+ * ft_child_density_contribution_all: compute the contribution of a
+ * child node to ALL cumulative density levels of its parent.
+ *
+ * For parent.density[j] (cumulative: levels j+1..DEPTH):
+ *   j < distance: child_fp + child.density[0] - child.density[DEPTH-D]
+ *                  (child itself + subtree within window)
+ *   j >= distance: child.density[j-D] - child.density[DEPTH-D]
+ *                  (subtree only, child is outside range j+1..DEPTH)
+ *
+ * Accumulates into @accum[0..DEPTH-1].
+ */
+static inline void ft_child_density_contribution_all(
+		struct cds_ft_metadata *cm, unsigned int distance,
+		unsigned int child_footprint,
+		unsigned long *accum)
+{
+	unsigned int j;
+
+	if (distance >= FT_NODE_DENSITY_DEPTH) {
+		/* Child beyond window: only its own footprint visible. */
+		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
+			accum[j] += child_footprint;
+		return;
+	}
+	{
+		unsigned long overflow =
+			ft_density_get(cm, FT_NODE_DENSITY_DEPTH - distance);
+
+		for (j = 0; j < distance; j++)
+			accum[j] += child_footprint
+				+ ft_density_get(cm, 0) - overflow;
+		for (j = distance; j < FT_NODE_DENSITY_DEPTH; j++)
+			accum[j] += ft_density_get(cm, j - distance)
+				- overflow;
+	}
+}
+
+/*
+ * ft_init_node_density: set all cumulative density counters
+ * [0..DEPTH-1] for a node by computing contributions from
  * traversable children within FT_NODE_DENSITY_DEPTH levels.
  *
- * Uses ft_child_density_contribution() for precise window correction
- * at each child distance.
- *
- * Only sets counter[0] (cumulative sum).  Per-level counters [1..N-1]
- * are maintained by ft_propagate_node_density_parent().
+ * density[j] = total read-side footprint (16B units) of all
+ * traversable nodes at levels j+1 through DEPTH below this node.
  */
 static
 void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 {
 	struct cds_ft_inode *node;
 	struct cds_ft_metadata *meta;
-	unsigned int key;
-	unsigned long total = 0;
+	unsigned int key, j;
+	unsigned long accum[FT_NODE_DENSITY_DEPTH] = { 0 };
 
 	if (!ft_node_ptr(node_flag))
 		return;
@@ -6816,11 +6899,14 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 				struct cds_ft_metadata *cm =
 					cds_ft_item_to_metadata(
 						ft_node_ptr(child));
-				total += ft_child_density_contribution(
-					cm, cn->len);
+				ft_child_density_contribution_all(
+					cm, cn->len,
+					ft_node_readside_footprint(child),
+					accum);
 			}
 		}
-		ft_density_set(cn_meta, 0, total);
+		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
+			ft_density_set(cn_meta, j, accum[j]);
 		return;
 	}
 	if (ft_node_external(node_flag))
@@ -6832,10 +6918,13 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 		if (ft_node_ptr(cn->child) && !ft_node_external(cn->child)) {
 			if (cn->len <= FT_NODE_DENSITY_DEPTH) {
 				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(cn->child));
-				total += ft_child_density_contribution(cm, cn->len);
+				ft_child_density_contribution_all(cm, cn->len,
+					ft_node_readside_footprint(cn->child),
+					accum);
 			}
 		}
-		ft_density_set(cn_meta, 0, total);
+		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
+			ft_density_set(cn_meta, j, accum[j]);
 		return;
 	}
 	if (ft_node_collapsed(node_flag)) {
@@ -6856,16 +6945,17 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 			child = ft_collapsed_ptrs(col, nr_e)[e];
 			if (!ft_node_ptr(child) || ft_node_external(child))
 				continue;
-			if (ft_node_skip_compressed(child)) {
-				/* Zero cache line cost on lookup. */
+			if (ft_node_skip_compressed(child))
 				continue;
-			}
 			if (slen <= FT_NODE_DENSITY_DEPTH) {
 				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
-				total += ft_child_density_contribution(cm, slen);
+				ft_child_density_contribution_all(cm, slen,
+					ft_node_readside_footprint(child),
+					accum);
 			}
 		}
-		ft_density_set(col_meta, 0, total);
+		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
+			ft_density_set(col_meta, j, accum[j]);
 		return;
 	}
 	/* Internal node: walk children (at distance 1). */
@@ -6879,23 +6969,17 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 			continue;
 		if (ft_node_external(child))
 			continue;
-		/*
-		 * Skip-compressed pointer: the compressed node is
-		 * never accessed on the lookup fast path (zero cache
-		 * line cost).  Contribute negative weight proportional
-		 * to the skip length — longer compressed paths are
-		 * more valuable to preserve, and collapsing their
-		 * parent would replace free skip traversal with a
-		 * costly collapsed suffix scan.
-		 */
 		if (ft_node_skip_compressed(child))
 			continue;
 		{
 			struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
-			total += ft_child_density_contribution(cm, 1);
+			ft_child_density_contribution_all(cm, 1,
+				ft_node_readside_footprint(child),
+				accum);
 		}
 	}
-	ft_density_set(meta, 0, total);
+	for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
+		ft_density_set(meta, j, accum[j]);
 }
 
 /*
@@ -6986,9 +7070,17 @@ void ft_propagate_node_density_parent(struct cds_ft_inode_flag *start,
 			break;
 
 		m = ft_flag_to_metadata(cur);
-		ft_density_add(m, 0, delta);
-		if (distance >= 2)
-			ft_density_add(m, distance - 1, delta);
+		/*
+		 * Cumulative density: density[j] = footprint at
+		 * levels j+1..DEPTH.  A node at @distance
+		 * contributes to all density[0..distance-1].
+		 */
+		{
+			unsigned int j;
+
+			for (j = 0; j < distance; j++)
+				ft_density_add(m, j, delta);
+		}
 next:
 		m = ft_flag_to_metadata(cur);
 		parent = m->parent;
@@ -7051,17 +7143,34 @@ unsigned int ft_collapsed_min_slen(unsigned int scan_sel)
  * paths (too many entries or scan zone overflow).  On failure the
  * caller must discard the entire collapsed node — partial results
  * are not usable.
+ *
+ * @absorbed_footprint: accumulated read-side footprint (in 16B
+ *   units) of every node consumed by the walk.  Updated on each
+ *   absorption; not touched on emit_entry.  The caller should
+ *   initialize this to 0 before the first call, and add the
+ *   decision-point node's own footprint separately.
+ * @branch_depth: number of multi-child branching points traversed
+ *   from the decision point (passed by value).
+ * @max_branch_depth: maximum branching depth before emitting.
+ *   Only multi-child internal and collapsed nodes increment this.
+ *   Compressed paths (which add to slen but not branching) are
+ *   free — bounded only by max_slen.
  */
 static
 int ft_collapse_walk_subtree(struct cds_ft *ft,
 		struct cds_ft_inode_flag *walk,
 		uint8_t *suffix_buf, unsigned int slen,
-		unsigned int max_depth,
+		unsigned int max_slen,
 		struct cds_ft_collapsed_node *col,
 		struct cds_ft_inode_flag **col_ptrs,
-		unsigned int max_entries)
+		unsigned int max_entries,
+		unsigned int *absorbed_footprint,
+		unsigned int branch_depth,
+		unsigned int max_branch_depth)
 {
-	while (slen < max_depth) {
+	while (slen < max_slen) {
+		struct cds_ft_inode_flag *orig_walk = walk;
+
 		if (!ft_node_ptr(walk))
 			return -1;
 
@@ -7070,12 +7179,15 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			goto emit_entry;
 
 		/*
-		 * Skip-compressed: follow to underlying compressed
-		 * node so its path bytes are absorbed normally.
+		 * Skip-compressed: emit as intermediate entry.
+		 * The skip path is free on the candidate fast path
+		 * (0 CL — skip length in pointer bits).  Absorbing
+		 * would add suffix bytes (scan cost) for no read-side
+		 * gain.  Subtrees below the skip are collapsed at
+		 * their own level via nested collapsed absorption.
 		 */
 		if (ft_node_skip_compressed(walk))
-			walk = ft_compressed_node_flag(
-				ft_skip_to_compressed(walk));
+			goto emit_entry;
 
 		/* Compressed: absorb path bytes. */
 		if (ft_node_compressed(walk)) {
@@ -7095,17 +7207,83 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			 */
 			if (cn_meta->external_nodes)
 				goto emit_entry;
-			if (slen + cn->len > max_depth)
-				goto emit_entry; /* Would exceed depth. */
+			if (slen + cn->len > max_slen)
+				goto emit_entry; /* Would exceed suffix buffer. */
+			*absorbed_footprint +=
+				ft_node_readside_footprint(orig_walk);
 			for (j = 0; j < cn->len; j++)
 				suffix_buf[slen++] = cn->key_bytes[j];
 			walk = ft_dereference_acquire(cn->child);
 			continue;
 		}
 
-		/* Already-collapsed: emit intermediate entry. */
-		if (ft_node_collapsed(walk))
-			goto emit_entry;
+		/*
+		 * Already-collapsed: absorb by iterating its
+		 * entries, prepending each suffix to suffix_buf,
+		 * and recursing into each entry's child.
+		 * Same logic as multi-child internal, but dispatch
+		 * is on collapsed entries rather than key bytes.
+		 *
+		 * If the collapsed node has external_nodes, emit
+		 * to preserve prefix keys at this depth.
+		 */
+		if (ft_node_collapsed(walk)) {
+			struct cds_ft_collapsed_node *col_child =
+				ft_collapsed_node_ptr(walk);
+			struct cds_ft_metadata *col_child_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) col_child);
+			unsigned int col_child_nr_e =
+				ft_collapsed_nr_entries(col_child);
+			struct cds_ft_inode_flag **col_child_ptrs =
+				ft_collapsed_ptrs(col_child,
+					col_child_nr_e);
+			unsigned int e;
+
+			if (col_child_meta->external_nodes)
+				goto emit_entry;
+			if (branch_depth >= max_branch_depth)
+				goto emit_entry;
+			*absorbed_footprint +=
+				ft_node_readside_footprint(walk);
+			for (e = 0; e < ft_collapsed_count(col_child_nr_e); e++) {
+				uint8_t data_e =
+					ft_collapsed_load_data(col_child, e);
+				unsigned int child_slen;
+				uint8_t *child_suffix;
+				struct cds_ft_inode_flag *child_ptr;
+				unsigned int k;
+
+				if (ft_collapsed_entry_dead(data_e,
+						col_child_nr_e))
+					continue;
+				child_ptr = col_child_ptrs[e];
+				if (!ft_node_ptr(child_ptr))
+					continue;
+				child_slen = ft_collapsed_suffix_len(
+					col_child, data_e, e,
+					col_child_nr_e);
+				child_suffix = ft_collapsed_suffix(
+					col_child, data_e,
+					col_child_nr_e);
+
+				if (slen + child_slen > max_slen)
+					return -1;
+				for (k = 0; k < child_slen; k++)
+					suffix_buf[slen + k] = child_suffix[k];
+				if (ft_collapse_walk_subtree(ft,
+						child_ptr, suffix_buf,
+						slen + child_slen,
+						max_slen,
+						col, col_ptrs,
+						max_entries,
+						absorbed_footprint,
+						branch_depth + 1,
+						max_branch_depth))
+					return -1;
+			}
+			return 0;
+		}
 
 		/* Internal node. */
 		if (ft_node_internal(walk)) {
@@ -7126,6 +7304,8 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 					FT_LEFTMOST);
 				if (!ft_node_ptr(wc))
 					return -1;
+				*absorbed_footprint +=
+					ft_node_readside_footprint(walk);
 				suffix_buf[slen++] = wk;
 				walk = wc;
 				continue;
@@ -7143,6 +7323,10 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			 */
 			if (wm->external_nodes)
 				goto emit_entry;
+			if (branch_depth >= max_branch_depth)
+				goto emit_entry;
+			*absorbed_footprint +=
+				ft_node_readside_footprint(walk);
 			{
 				uint8_t ck = 0;
 				int pv = -1;
@@ -7155,9 +7339,12 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 					if (ft_collapse_walk_subtree(ft,
 							c, suffix_buf,
 							slen + 1,
-							max_depth,
+							max_slen,
 							col, col_ptrs,
-							max_entries))
+							max_entries,
+							absorbed_footprint,
+							branch_depth + 1,
+							max_branch_depth))
 						return -1;
 					pv = ck;
 					c = ft_node_get_direction(walk,
@@ -7202,157 +7389,195 @@ emit_entry:
  * ft_try_collapse_at_node: attempt to collapse the subtree rooted at
  * the given node into a collapsed node.  The node must be internal.
  *
- * Recursively enumerates paths through the subtree (up to
- * FT_NODE_DENSITY_DEPTH levels deep), forking at multi-child
- * internal nodes.  Each path to a leaf (external node) becomes a
- * terminal entry with a full suffix.  Paths that hit the depth
- * limit, an already-collapsed node, or a NULL pointer become
- * intermediate entries.
+ * Tries all feasible (order, scan_sel) configurations and picks the
+ * one that maximizes the read-side footprint ratio:
+ *   ratio = absorbed_footprint / collapsed_footprint
  *
- * All-or-nothing: if any path can't fit in the scan zone, the
- * entire collapse is aborted and the subtree is left untouched.
+ * absorbed_footprint: total read-side bytes (in 16B units) of every
+ *   node consumed by the walk, plus the decision-point node itself.
+ * collapsed_footprint: allocation size of the collapsed candidate
+ *   (in 16B units).
  *
- * Returns the collapsed node flag on success, NULL if the subtree
- * doesn't fit or collapsing is not beneficial.
+ * Selection by cross-multiplication (no FP, no division):
+ *   candidate A beats B when  A.absorbed * B.collapsed
+ *                            > B.absorbed * A.collapsed
+ *
+ * Only accepts candidates where ratio > 1 (absorbed > collapsed).
+ *
+ * No density pre-filter: every internal node with >= 2 children is
+ * evaluated.  Walks self-limit via scan zone capacity.
+ *
+ * Returns the collapsed node flag on success, NULL if no configuration
+ * improves cache footprint.
  */
 static
 struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag *node_flag,
-		unsigned int node_depth __attribute__((unused)))
+		unsigned int node_depth)
 {
 	struct cds_ft_inode *node = ft_node_ptr(node_flag);
 	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
-	struct cds_ft_collapsed_node *col;
-	struct cds_ft_metadata *col_meta;
-	struct cds_ft_inode_flag **col_ptrs;
 	unsigned int nr_child = metadata->nr_child;
-	unsigned int max_entries;
 	uint8_t child_key = 0;
 	int pivot;
 	struct cds_ft_inode_flag *child;
 	uint8_t suffix_buf[FT_COLLAPSED_SCAN_ZONE_MAX];
 
-	/* Quick pre-filter: need at least 2 children. */
+	/* Need at least 2 children. */
 	if (nr_child < 2)
 		return NULL;
 
 	/*
-	 * Skip-compressed children are free on the lookup fast path
-	 * (zero cache line cost).  Collapsing a node that has any
-	 * skip-compressed children would replace those free paths
-	 * with costly collapsed suffix scans — never profitable.
+	 * Quick footprint pre-filter: the subtree's total
+	 * read-side footprint (in 16B units) plus the decision
+	 * point must exceed the smallest collapsed allocation
+	 * (TINY = 64B = 4 units).  Avoids entering the config
+	 * loop when no config can possibly win.
 	 */
-	/*
-	 * Select collapsed node configuration using density counters.
-	 *
-	 * Cost/benefit gate: density must exceed nr_child by a
-	 * factor of 1.5.  Each collapsed entry adds scan overhead
-	 * (tombstone check, offset compute, suffix compare) that
-	 * must be offset by saving pointer chases.  density[0]
-	 * counts traversable nodes absorbed; nr_child is roughly
-	 * the number of entries.  When the ratio is too low (e.g.
-	 * subtree is mostly compressed paths that each cost only
-	 * 1 pointer chase), the collapsed scan overhead exceeds
-	 * the savings.
-	 *
-	 * Steps:
-	 * 1. Density → allocation order (smallest that fits).
-	 * 2. Walk with 64B scan zone (most restrictive scan budget,
-	 *    most generous pointer count for the allocation).
-	 * 3. Post-walk: compute min suffix length across all entries.
-	 * 4. If min_slen qualifies for a wider scan zone within the
-	 *    same allocation AND the entry count fits the wider zone's
-	 *    pointer budget, upgrade by copying entries to a new node
-	 *    with the wider scan zone.  No re-walk needed.
-	 */
+	if (ft_density_get(metadata, 0)
+	    + ft_node_readside_footprint(node_flag)
+	    <= (1U << (FT_COLLAPSED_ORDER_TINY - 4)))
+		return NULL;
+
 	{
-		unsigned long density = ft_density_get(metadata, 0);
+		/*
+		 * Footprint of the decision-point node itself: it will
+		 * be freed if any collapse succeeds.
+		 */
+		unsigned int decision_fp = ft_node_readside_footprint(node_flag);
 
 		/*
-		 * Skip collapse if the subtree doesn't have enough
-		 * intermediate nodes per child to justify the per-entry
-		 * scan cost.  density < nr_child * factor means the
-		 * subtree is mostly direct paths (compressed or
-		 * single-hop) that are cheaper uncollapsed.
+		 * max_walk_slen: maximum suffix length.  Bounded by
+		 * remaining trie depth and the suffix buffer size.
+		 * Compressed paths consume slen but not branch depth.
+		 * The inequality lookup assertions use max_tree_depth,
+		 * so longer suffixes are safe.
 		 */
-		/*
-		 * Weighted density: a traversable node at distance k
-		 * saves k pointer chases when absorbed into a collapsed
-		 * suffix.  Weight each depth level accordingly:
-		 *
-		 *   nodes_at_dist_1 = d[0] - sum(d[1..5])
-		 *   weighted = nodes_at_dist_1 * 1
-		 *            + d[1]*2 + d[2]*3 + d[3]*4 + d[4]*5 + d[5]*6
-		 *
-		 * Simplifies to: d[0] + d[1] + 2*d[2] + ... + 5*d[5]
-		 *
-		 * Compare to nr_child (total children including external
-		 * leaves).  External children contribute 0 to weighted
-		 * density but 1 to nr_child, so they act as a scan-cost
-		 * penalty.  Collapse when the weighted hop savings from
-		 * traversable children outweigh the scan cost of all
-		 * entries.
-		 */
-		{
-			unsigned long weighted = density;
-			unsigned int j;
-
-			for (j = 1; j < FT_NODE_DENSITY_DEPTH; j++)
-				weighted += j * ft_density_get(metadata, j);
-			if (weighted < (unsigned long) nr_child)
-				return NULL;
-		}
-		unsigned int order;
-		int try_depth;
-		bool found = false;
-
-		if (density <= ft_collapsed_max_entries(FT_COLLAPSED_ORDER_SMALL, FT_COLLAPSED_SCAN_64))
-			order = FT_COLLAPSED_ORDER_SMALL;
-		else if (density <= ft_collapsed_max_entries(FT_COLLAPSED_ORDER_MEDIUM, FT_COLLAPSED_SCAN_64))
-			order = FT_COLLAPSED_ORDER_MEDIUM;
-		else if (density <= ft_collapsed_max_entries(FT_COLLAPSED_ORDER_XLARGE, FT_COLLAPSED_SCAN_256))
-			order = FT_COLLAPSED_ORDER_XLARGE;
+		unsigned int max_walk_slen;
+		if (ft->group->max_tree_depth > node_depth + 1)
+			max_walk_slen = ft->group->max_tree_depth
+				- node_depth - 1;
 		else
 			return NULL;
-
-		max_entries = ft_collapsed_max_entries(order, FT_COLLAPSED_SCAN_64);
-		if (nr_child > max_entries)
-			order = FT_COLLAPSED_ORDER_MEDIUM;
-		max_entries = ft_collapsed_max_entries(order, FT_COLLAPSED_SCAN_64);
-		if (nr_child > max_entries)
-			order = FT_COLLAPSED_ORDER_XLARGE;
-		max_entries = ft_collapsed_max_entries(order, FT_COLLAPSED_SCAN_64);
-		if (nr_child > max_entries)
-			return NULL;
-
-		col = alloc_collapsed_node(ft, order, FT_COLLAPSED_SCAN_64, &col_meta);
-		if (!col)
-			return NULL;
-		col_ptrs = ft_collapsed_ptrs(col,
-			uatomic_load(&col->nr_entries, CMM_RELAXED));
+		if (max_walk_slen > FT_COLLAPSED_SCAN_ZONE_MAX)
+			max_walk_slen = FT_COLLAPSED_SCAN_ZONE_MAX;
 
 		/*
-		 * Try recursive leaf-path enumeration,
-		 * progressively reducing the max depth from
-		 * FT_NODE_DENSITY_DEPTH down to 2.
-		 *
-		 * The walk depth is bounded by FT_NODE_DENSITY_DEPTH
-		 * (6 levels) to stay within the density counter
-		 * horizon.  Collapsed suffixes spanning more than 6
-		 * levels would break density counter propagation and
-		 * explode reconstruction.
+		 * max_branch_depth: limits combinatorial explosion
+		 * from multi-child nodes.  Compressed paths are free
+		 * (they don't add entries).  Only multi-child internal
+		 * and collapsed nodes count as branching points.
 		 */
-		for (try_depth = FT_NODE_DENSITY_DEPTH;
-		     try_depth >= 2; try_depth--) {
-			bool walk_ok = true;
+		unsigned int max_branch_depth = FT_NODE_DENSITY_DEPTH;
 
-			if (ft_density_get(metadata, 0) > max_entries)
-				break;
+		/* Best candidate tracking. */
+		struct cds_ft_collapsed_node *best_col = NULL;
+		struct cds_ft_metadata *best_meta = NULL;
+		struct cds_ft_inode_flag **best_ptrs = NULL;
+		unsigned int best_absorbed = 0;
+		unsigned int best_collapsed = 1;	/* denominator for first comparison */
 
-			/* Reset for this depth attempt. */
-			memset(col->data, 0,
-				ft_collapsed_scan_zone_size(uatomic_load(&col->nr_entries, CMM_RELAXED)) - 1);
-			ft_collapsed_set_nr_entries(col, 0);
+		/*
+		 * All valid (order, scan_sel) configurations.
+		 * Ordered small-to-large: smaller allocations are tried
+		 * first so that equal-ratio candidates prefer the
+		 * smallest footprint.
+		 */
+		static const struct {
+			unsigned int order;
+			unsigned int scan_sel;
+		} configs[] = {
+			{ FT_COLLAPSED_ORDER_TINY,   FT_COLLAPSED_SCAN_32 },
+			{ FT_COLLAPSED_ORDER_SMALL,  FT_COLLAPSED_SCAN_64 },
+			{ FT_COLLAPSED_ORDER_MEDIUM, FT_COLLAPSED_SCAN_64 },
+			{ FT_COLLAPSED_ORDER_MEDIUM, FT_COLLAPSED_SCAN_128 },
+			{ FT_COLLAPSED_ORDER_XLARGE, FT_COLLAPSED_SCAN_64 },
+			{ FT_COLLAPSED_ORDER_XLARGE, FT_COLLAPSED_SCAN_256 },
+		};
+		unsigned int nr_configs = sizeof(configs) / sizeof(configs[0]);
+		unsigned int ci;
+
+		/*
+		 * Cache cumulative density for depth-aware filtering.
+		 * density[k] = footprint at levels k+1..DEPTH.
+		 */
+		unsigned long density_total = ft_density_get(metadata, 0);
+
+		for (ci = 0; ci < nr_configs; ci++) {
+			unsigned int order = configs[ci].order;
+			unsigned int scan_sel = configs[ci].scan_sel;
+			unsigned int collapsed_fp = 1U << (order - 4);
+			unsigned int max_entries =
+				ft_collapsed_max_entries(order, scan_sel);
+			struct cds_ft_collapsed_node *col;
+			struct cds_ft_metadata *col_meta;
+			struct cds_ft_inode_flag **col_ptrs;
+			unsigned int absorbed;
+			bool walk_ok;
+
+			if (max_entries < 2)
+				continue;
+
+			/*
+			 * Per-config footprint gate using cumulative
+			 * density.
+			 *
+			 * Total check: the full subtree + decision
+			 * point must exceed this config's allocation.
+			 */
+			if (density_total + decision_fp <= collapsed_fp)
+				continue;
+
+			/*
+			 * Depth-aware check: for configs with few
+			 * entries (TINY/SMALL), the walk can only
+			 * explore shallow branching.  Check that the
+			 * shallow footprint alone justifies this
+			 * config.
+			 *
+			 * density[0] - density[k] = footprint at
+			 * levels 1..k (reachable within k branching
+			 * levels).
+			 *
+			 * Effective depth heuristic based on max_entries:
+			 *   <= 4 entries: ~2 branching levels
+			 *   <= 8 entries: ~3 branching levels
+			 *   <= 24 entries: ~4 branching levels
+			 *   > 24 entries: use total (deep enough)
+			 */
+			{
+				unsigned int eff_depth;
+				unsigned long reachable_fp;
+
+				if (max_entries <= 4)
+					eff_depth = 2;
+				else if (max_entries <= 8)
+					eff_depth = 3;
+				else if (max_entries <= 24)
+					eff_depth = 4;
+				else
+					eff_depth = FT_NODE_DENSITY_DEPTH;
+
+				if (eff_depth < FT_NODE_DENSITY_DEPTH)
+					reachable_fp = density_total
+						- ft_density_get(metadata,
+							eff_depth);
+				else
+					reachable_fp = density_total;
+				if (reachable_fp + decision_fp
+				    <= collapsed_fp)
+					continue;
+			}
+
+			col = alloc_collapsed_node(ft, order, scan_sel,
+				&col_meta);
+			if (!col)
+				continue;
+			col_ptrs = ft_collapsed_ptrs(col,
+				uatomic_load(&col->nr_entries, CMM_RELAXED));
+
+			absorbed = decision_fp;
+			walk_ok = true;
 
 			pivot = -1;
 			child = ft_node_get_direction(node_flag,
@@ -7361,9 +7586,12 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				suffix_buf[0] = child_key;
 				if (ft_collapse_walk_subtree(ft,
 						child, suffix_buf, 1,
-						(unsigned int) try_depth,
+						max_walk_slen,
 						col, col_ptrs,
-						max_entries)) {
+						max_entries,
+						&absorbed,
+						0, /* branch_depth */
+						max_branch_depth)) {
 					walk_ok = false;
 					break;
 				}
@@ -7372,200 +7600,113 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 					node_flag, pivot,
 					&child_key, FT_RIGHT);
 			}
-			if (walk_ok &&
-			    ft_collapsed_count(ft_collapsed_nr_entries(col)) >= 2) {
-				found = true;
-				break;
-			}
-		}
 
-		if (!found || ft_collapsed_count(ft_collapsed_nr_entries(col)) < 2) {
-			free_collapsed_node(ft, col);
-			return NULL;
-		}
-
-		/*
-		 * Post-check and scan zone upgrade.
-		 *
-		 * Compute min suffix length across all entries.
-		 * Require at least one entry with slen >= SUFFIX_MIN.
-		 * Then try to upgrade to a wider scan zone within the
-		 * same allocation order if suffix quality allows.
-		 *
-		 * This node was freshly built by
-		 * ft_collapse_walk_subtree from an internal node's
-		 * live children — no tombstoned entries exist.
-		 * The reformat below therefore copies all entries
-		 * without tombstone filtering.
-		 */
-		{
-			unsigned int e, nr;
-			unsigned int min_slen_seen = UINT_MAX;
-			bool has_long_suffix = false;
-			unsigned int best_scan_sel = FT_COLLAPSED_SCAN_64;
-
-			nr = ft_collapsed_nr_entries(col);
-			for (e = 0; e < ft_collapsed_count(nr); e++) {
-				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen =
-					ft_collapsed_suffix_len(col, data_e, e, nr);
-
-				/* Fresh node: no tombstones expected. */
-				assert(!ft_collapsed_entry_dead(data_e, nr));
-
-				if (slen < min_slen_seen)
-					min_slen_seen = slen;
-				if (slen >= FT_COLLAPSE_SUFFIX_MIN)
-					has_long_suffix = true;
-			}
-			if (!has_long_suffix) {
+			if (!walk_ok ||
+			    ft_collapsed_count(
+				ft_collapsed_nr_entries(col)) < 2) {
 				free_collapsed_node(ft, col);
-				return NULL;
+				continue;
 			}
 
 			/*
-			 * Try to reformat into a better scan zone.
-			 *
-			 * TINY compaction (checked first): if entries
-			 * fit in 32B scan budget, compact to order 6.
-			 * Saves 1 CL load (scan+ptrs in 1 cache line).
-			 *
-			 * Wider zones: if all suffixes justify the
-			 * extra CL loads, upgrade to 128B or 256B scan
-			 * within the same allocation order.
+			 * Suffix-min check: require at least one
+			 * entry with slen >= FT_COLLAPSE_SUFFIX_MIN.
 			 */
 			{
-				unsigned int best_order = order;
-				unsigned int old_scan_sz =
-					FT_COLLAPSED_SCAN_ZONE_SIZE;
-				unsigned int suffix_start, total_suffix;
-				unsigned int header_end;
+				unsigned int nr =
+					ft_collapsed_nr_entries(col);
+				unsigned int e;
+				bool has_long_suffix = false;
 
-				if (ft_collapsed_count(nr) > 0)
-					suffix_start = col->data[ft_collapsed_count(nr) - 1]
-						& FT_COLLAPSED_OFFSET_MASK;
-				else
-					suffix_start = old_scan_sz;
-				total_suffix = old_scan_sz - suffix_start;
-				header_end = 1 + ft_collapsed_count(nr);
+				for (e = 0; e < ft_collapsed_count(nr); e++) {
+					uint8_t data_e =
+						ft_collapsed_load_data(col, e);
+					unsigned int sl =
+						ft_collapsed_suffix_len(
+							col, data_e, e, nr);
 
-				/* TINY: 32B scan, order 6 (64B alloc). */
-				if (ft_collapsed_count(nr) <= ft_collapsed_max_entries(
-					    FT_COLLAPSED_ORDER_TINY,
-					    FT_COLLAPSED_SCAN_32) &&
-				    header_end + total_suffix <= 32) {
-					best_scan_sel = FT_COLLAPSED_SCAN_32;
-					best_order = FT_COLLAPSED_ORDER_TINY;
+					if (sl >= FT_COLLAPSE_SUFFIX_MIN)
+						has_long_suffix = true;
 				}
-				/* 256B scan within same order. */
-				else if (order >= FT_COLLAPSED_ORDER_XLARGE &&
-					 min_slen_seen >= ft_collapsed_min_slen(
-						FT_COLLAPSED_SCAN_256) &&
-					 ft_collapsed_count(nr) <= ft_collapsed_max_entries(order,
-						FT_COLLAPSED_SCAN_256))
-					best_scan_sel = FT_COLLAPSED_SCAN_256;
-				/* 128B scan within same order. */
-				else if (order >= FT_COLLAPSED_ORDER_MEDIUM &&
-					 min_slen_seen >= ft_collapsed_min_slen(
-						FT_COLLAPSED_SCAN_128) &&
-					 ft_collapsed_count(nr) <= ft_collapsed_max_entries(order,
-						FT_COLLAPSED_SCAN_128))
-					best_scan_sel = FT_COLLAPSED_SCAN_128;
-
-				if (best_scan_sel != FT_COLLAPSED_SCAN_64) {
-					struct cds_ft_collapsed_node *new_col;
-					struct cds_ft_metadata *new_meta;
-					struct cds_ft_inode_flag **new_ptrs;
-					unsigned int new_scan_sz =
-						ft_collapsed_scan_sizes[best_scan_sel];
-
-					new_col = alloc_collapsed_node(ft,
-						best_order, best_scan_sel,
-						&new_meta);
-					if (!new_col)
-						goto skip_reformat;
-					new_ptrs = ft_collapsed_ptrs(new_col,
-						uatomic_load(&new_col->nr_entries, CMM_RELAXED));
-
-					/*
-					 * Copy suffix data: shift from old
-					 * scan zone end to new scan zone end.
-					 */
-					memcpy(((uint8_t *) new_col) +
-						new_scan_sz - total_suffix,
-					       ((uint8_t *) col) + suffix_start,
-					       total_suffix);
-
-					/*
-					 * Adjust offsets by the scan zone
-					 * size difference (may be negative
-					 * for compaction to TINY).
-					 */
-					{
-						int shift = (int) new_scan_sz
-							  - (int) old_scan_sz;
-						for (e = 0; e < ft_collapsed_count(nr); e++)
-							new_col->data[e] =
-								(col->data[e]
-								 & FT_COLLAPSED_OFFSET_MASK)
-								+ shift;
-					}
-
-					memcpy(new_ptrs, col_ptrs,
-					       ft_collapsed_count(nr) * sizeof(*new_ptrs));
-					ft_collapsed_set_nr_entries(new_col, ft_collapsed_count(nr));
-
+				if (!has_long_suffix) {
 					free_collapsed_node(ft, col);
-					col = new_col;
-					col_meta = new_meta;
-					col_ptrs = new_ptrs;
+					continue;
 				}
-			skip_reformat:;
+			}
+
+			/*
+			 * Footprint ratio check: absorbed > collapsed
+			 * (ratio > 1) and this candidate beats the
+			 * current best.  Cross-multiply to avoid
+			 * division.
+			 */
+			if (absorbed > collapsed_fp &&
+			    (unsigned long) absorbed * best_collapsed >
+			    (unsigned long) best_absorbed * collapsed_fp) {
+				if (best_col)
+					free_collapsed_node(ft, best_col);
+				best_col = col;
+				best_meta = col_meta;
+				best_ptrs = col_ptrs;
+				best_absorbed = absorbed;
+				best_collapsed = collapsed_fp;
+			} else {
+				free_collapsed_node(ft, col);
 			}
 		}
+
+		if (!best_col)
+			return NULL;
 
 		if (ft_debug_counters())
-			fprintf(stderr, "COLLAPSE: order=%u scan=%uB entries=%u\n",
-				order,
-				ft_collapsed_scan_zone_size(uatomic_load(&col->nr_entries, CMM_RELAXED)),
-				ft_collapsed_count(ft_collapsed_nr_entries(col)));
-	}
+			fprintf(stderr, "COLLAPSE: order=%u scan=%uB entries=%u "
+				"fp_ratio=%.2f (absorbed=%u collapsed=%u)\n",
+				(unsigned int) cds_ft_item_order(best_col),
+				ft_collapsed_scan_zone_size(
+					uatomic_load(&best_col->nr_entries,
+						CMM_RELAXED)),
+				ft_collapsed_count(
+					ft_collapsed_nr_entries(best_col)),
+				(double) best_absorbed / best_collapsed,
+				best_absorbed, best_collapsed);
 
-	col_meta->nr_child = ft_collapsed_count(ft_collapsed_nr_entries(col));
-	uatomic_store(&col_meta->nr_keys, metadata->nr_keys, CMM_RELAXED);
-	col_meta->external_nodes = metadata->external_nodes;
+		best_meta->nr_child = ft_collapsed_count(
+			ft_collapsed_nr_entries(best_col));
+		uatomic_store(&best_meta->nr_keys, metadata->nr_keys,
+			CMM_RELAXED);
+		best_meta->external_nodes = metadata->external_nodes;
 
-	{
-		struct cds_ft_inode_flag *col_flag = ft_collapsed_node_flag(col);
-		unsigned int e;
+		{
+			struct cds_ft_inode_flag *col_flag =
+				ft_collapsed_node_flag(best_col);
+			unsigned int e;
 
-		for (e = 0; e < col_meta->nr_child; e++) {
-			/*
-			 * Re-publish compressed entries as skip pointers.
-			 *
-			 * The collapse walk resolves skip pointers to
-			 * compressed flags (ft_collapse_walk_subtree),
-			 * so entries store compressed_flag.  Convert back
-			 * to skip pointer to preserve the optimization.
-			 *
-			 * ft_set_parent then sets both parent and
-			 * skip_slot for the compressed node, pointing
-			 * skip_slot to &col_ptrs[e].  This prevents
-			 * use-after-free: the old parent's slot is freed
-			 * when the collapse publishes.
-			 */
-			if (ft_node_compressed(col_ptrs[e]) &&
-			    ft_group_skip_compressed(ft->group)) {
-				struct cds_ft_compressed_node *cn =
-					ft_compressed_node_ptr(col_ptrs[e]);
-				if (cn->len <= FT_SKIP_LEN_MAX)
-					col_ptrs[e] = ft_skip_compressed_flag(
-						cn->child, cn->len);
+			for (e = 0; e < best_meta->nr_child; e++) {
+				/*
+				 * Re-publish compressed entries as skip
+				 * pointers.
+				 *
+				 * The collapse walk resolves skip pointers
+				 * to compressed flags, so entries store
+				 * compressed_flag.  Convert back to skip
+				 * pointer to preserve the optimization.
+				 */
+				if (ft_node_compressed(best_ptrs[e]) &&
+				    ft_group_skip_compressed(ft->group)) {
+					struct cds_ft_compressed_node *cn =
+						ft_compressed_node_ptr(
+							best_ptrs[e]);
+					if (cn->len <= FT_SKIP_LEN_MAX)
+						best_ptrs[e] =
+							ft_skip_compressed_flag(
+								cn->child,
+								cn->len);
+				}
+				ft_set_parent(best_ptrs[e], col_flag,
+					&best_ptrs[e]);
 			}
-			ft_set_parent(col_ptrs[e], col_flag,
-				&col_ptrs[e]);
+			return col_flag;
 		}
-		return col_flag;
 	}
 }
 
@@ -7965,15 +8106,18 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		 */
 		if (diverge_pos > 0 && cn_parent)
 			ft_propagate_node_density_parent(cn_parent,
-				cn_parent_depth, junction_depth, 1);
+				cn_parent_depth, junction_depth,
+				(long) ft_node_readside_footprint(branch_flag));
 		/* Old suffix at junction_depth + 1 (if it exists). */
 		if (suffix_len > 0 && cn_parent)
 			ft_propagate_node_density_parent(cn_parent,
-				cn_parent_depth, junction_depth + 1, 1);
+				cn_parent_depth, junction_depth + 1,
+				(long) ft_node_readside_footprint(old_suffix_flag));
 		/* New branch at junction_depth + 1 (if it exists). */
 		if (new_len > 0 && cn_parent)
 			ft_propagate_node_density_parent(cn_parent,
-				cn_parent_depth, junction_depth + 1, 1);
+				cn_parent_depth, junction_depth + 1,
+				(long) ft_node_readside_footprint(new_branch_flag));
 	}
 
 	/* 7. Free the old compressed node. */
@@ -8396,7 +8540,8 @@ publish_done:
 			ft_init_node_density(created_nodes[cn_idx]);
 		top_meta = ft_flag_to_metadata(top_node);
 		ft_propagate_node_density_parent(top_node, level,
-			level, (long)(1 + ft_density_get(top_meta, 0)));
+			level, (long)(ft_node_readside_footprint(top_node)
+				+ ft_density_get(top_meta, 0)));
 	}
 
 	/* Success */
@@ -8545,7 +8690,8 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	ft_publish_to_parent(d->nf, &cn->child, branch);
 	/* Propagate density for the new branch node. */
 	ft_propagate_node_density_parent(branch,
-		d->depth + cn->len, d->depth + cn->len, 1);
+		d->depth + cn->len, d->depth + cn->len,
+		(long) ft_node_readside_footprint(branch));
 	ft_propagate_external_count_parent(branch, 1);
 	return 0;
 }
@@ -8614,22 +8760,31 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 			jct_meta->external_nodes, node);
 	}
 	/*
-	 * Density: net = new nodes - old compressed.
-	 * Count: junction(1) + prefix(if exists) + suffix(if len>1)
-	 * minus old compressed(1).
+	 * Density: net footprint = new nodes - old compressed.
+	 * Junction replaces old compressed (footprint delta may
+	 * differ if types differ).  Prefix and suffix add footprint.
 	 */
 	{
-		long net = 0;	/* junction replaces compressed: net 0 */
+		long net_fp = 0;
 		struct cds_ft_compressed_node *cn =
 			ft_compressed_node_ptr(d->nf);
 
+		/* Junction replaces old compressed: net = jct - old. */
+		net_fp += (long) ft_node_readside_footprint(jct_flag)
+			- (long) ft_node_readside_footprint(d->nf);
 		if (top_flag != jct_flag)
-			net++;	/* prefix added */
-		if (cn->len > remaining + 1)
-			net++;	/* suffix added */
-		if (net != 0)
+			net_fp += (long) ft_node_readside_footprint(top_flag);
+		if (cn->len > remaining + 1) {
+			uint8_t suffix_key = cn->key_bytes[remaining];
+			struct cds_ft_inode_flag *suffix_flag =
+				ft_node_get_nth(jct_flag, NULL, suffix_key);
+			if (ft_node_ptr(suffix_flag))
+				net_fp += (long) ft_node_readside_footprint(
+					suffix_flag);
+		}
+		if (net_fp != 0)
 			ft_propagate_node_density_parent(jct_flag,
-				d->depth + remaining, d->depth, net);
+				d->depth + remaining, d->depth, net_fp);
 	}
 	ft_propagate_external_count_parent(jct_flag, 1);
 	{
@@ -9929,10 +10084,12 @@ int ft_detach_node(struct cds_ft *ft,
 				topmost_external_nodes ?
 				(struct cds_ft_inode_flag *) topmost_external_nodes : NULL;
 
-			/* Propagate density -1 for the freed collapsed node. */
+			/* Propagate density for the freed collapsed node. */
 			ft_propagate_node_density_parent(
 				iter_node_flag, cur_depth,
-				cur_depth, -1);
+				cur_depth,
+				-(long) ft_node_readside_footprint(
+					iter_node_flag));
 			rcu_assign_pointer(*detach_parent_flag_ptr, replacement);
 			free_collapsed_node(ft, col);
 		}
@@ -9972,18 +10129,26 @@ end:
 
 	if (!ret) {
 		/*
-		 * Propagate density: -nr_clear at the surviving parent's
-		 * depth (where the pruned nodes were children).
+		 * Propagate density: sum of pruned node footprints
+		 * at the surviving parent's depth.
 		 */
-		if (nr_clear > 0)
-			ft_propagate_node_density_parent(cur, cur_depth,
-				cur_depth, (long) -nr_clear);
-		{
+		if (nr_clear > 0) {
+			long pruned_fp = 0;
 			int ci;
 
+			for (ci = 0; ci < nr_clear; ci++) {
+				void *item = cds_ft_metadata_to_item(
+					metadata_stack[ci]);
+				unsigned int order = cds_ft_item_order(item);
+
+				pruned_fp += 1UL << (order - 4);
+			}
+			ft_propagate_node_density_parent(cur, cur_depth,
+				cur_depth, -pruned_fp);
 			for (ci = 0; ci < nr_clear; ci++)
 				free_cds_ft_node(ft,
-					cds_ft_metadata_to_item(metadata_stack[ci]));
+					cds_ft_metadata_to_item(
+						metadata_stack[ci]));
 		}
 		/*
 		 * Density on the surviving parent is updated
@@ -10669,11 +10834,17 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	ft_set_parent(top_flag, d->pnf, d->nfp);
 	ft_publish_to_parent(d->pnf, d->nfp, top_flag);
 
-	/* 5. Density: net = nr_created - 1 at the split depth. */
-	if (nr_created > 1)
-		ft_propagate_node_density_parent(branch_flag,
-			d->depth + diverge_pos, d->depth,
-			(long) nr_created - 1);
+	/* 5. Density: net footprint of created nodes minus old compressed. */
+	{
+		long net_fp = -(long) ft_node_readside_footprint(d->nf);
+		int ci;
+
+		for (ci = 0; ci < nr_created; ci++)
+			net_fp += (long) ft_node_readside_footprint(created[ci]);
+		if (net_fp != 0)
+			ft_propagate_node_density_parent(branch_flag,
+				d->depth + diverge_pos, d->depth, net_fp);
+	}
 
 	/*
 	 * 6. Set descent state: branch has an empty slot for the
@@ -10969,8 +11140,15 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	ft_set_parent(prefix_flag, d->pnf, d->nfp);
 	ft_publish_to_parent(d->pnf, d->nfp, prefix_flag);
 
-	/* Density: net = +1 (old compressed → prefix + suffix = 2 nodes, net +1). */
-	ft_propagate_node_density_parent(prefix_flag, d->depth, d->depth, 1);
+	/* Density: net footprint (old compressed → prefix + suffix). */
+	{
+		long net_fp = (long) ft_node_readside_footprint(prefix_flag)
+			+ (long) ft_node_readside_footprint(suffix_flag)
+			- (long) ft_node_readside_footprint(d->nf);
+		if (net_fp != 0)
+			ft_propagate_node_density_parent(prefix_flag,
+				d->depth, d->depth, net_fp);
+	}
 
 	d->ppnf = d->pnf;
 	d->ppnfp = d->pnfp;
@@ -11300,9 +11478,17 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 					break;
 				am = cds_ft_item_to_metadata(
 					ft_node_ptr(graft_snapshot[si]));
-				ft_density_add(am, 0,
-					ft_child_density_contribution(
-						graft_meta, distance));
+				{
+					unsigned long contrib =
+						ft_child_density_contribution(
+							graft_meta, distance,
+							ft_node_readside_footprint(
+								src_ft->root));
+					fprintf(stderr, "GRAFT DENSITY: si=%d depth=%u dist=%u am.d0=%lu contrib=%lu\n",
+						si, graft_snapshot_depth[si], distance,
+						ft_density_get(am, 0), contrib);
+					ft_density_add(am, 0, (long) contrib);
+				}
 			}
 		}
 
@@ -11501,10 +11687,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 						ft_node_ptr(graft_snapshot[si]));
 					if (old_meta)
 						sub = ft_child_density_contribution(
-							old_meta, distance);
+							old_meta, distance,
+							ft_node_readside_footprint(
+								old_child));
 					if (new_meta)
 						add = ft_child_density_contribution(
-							new_meta, distance);
+							new_meta, distance,
+							ft_node_readside_footprint(
+								old_swap_root));
 					if (add >= sub)
 						ft_density_add(am, 0, add - sub);
 					else
@@ -11825,9 +12015,24 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						distance = key_len - anc_depth;
 						if (distance > FT_NODE_DENSITY_DEPTH)
 							break;
+						{
+							unsigned long contrib = ft_child_density_contribution(
+								child_meta, distance,
+								ft_node_readside_footprint(child));
+							unsigned long d0 = ft_density_get(am, 0);
+							if (d0 < contrib)
+								fprintf(stderr, "DETACH BUG: dist=%u anc_depth=%u kl=%u d0=%lu contrib=%lu child_fp=%u child.d0=%lu child.d[%u]=%lu\n",
+									distance, anc_depth, key_len, d0, contrib,
+									ft_node_readside_footprint(child),
+									ft_density_get(child_meta, 0),
+									FT_NODE_DENSITY_DEPTH - distance,
+									ft_density_get(child_meta, FT_NODE_DENSITY_DEPTH - distance));
+						}
 						ft_density_sub(am, 0,
 							ft_child_density_contribution(
-								child_meta, distance));
+								child_meta, distance,
+								ft_node_readside_footprint(
+									child)));
 					}
 					anc_depth -= ft_parent_depth_span(
 						parent_nf, anc);
