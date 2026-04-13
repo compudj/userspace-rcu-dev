@@ -4515,6 +4515,24 @@ enum ft_compressed_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_fl
 	*status_ret = CDS_FT_STATUS_NOT_FOUND;
 	return FT_COMPRESSED_END;
 }
+#else
+static inline_lookup
+enum ft_compressed_action ft_lookup_collapsed(
+		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
+		const uint8_t **key_p __attribute__((unused)),
+		unsigned int *i_p __attribute__((unused)),
+		unsigned int key_depth __attribute__((unused)),
+		struct cds_ft_iter *iter __attribute__((unused)),
+		size_t *iter_path_len_p __attribute__((unused)),
+		bool track __attribute__((unused)),
+		bool track_longest __attribute__((unused)),
+		size_t *match_len_p __attribute__((unused)),
+		struct cds_ft_node **match_node_p __attribute__((unused)),
+		struct cds_ft_node **found_ret __attribute__((unused)),
+		enum cds_ft_status *status_ret __attribute__((unused)))
+{
+	return FT_COMPRESSED_END;
+}
 #endif /* FEATURE_FT_COLLAPSE */
 
 /*
@@ -4623,6 +4641,18 @@ enum ft_compressed_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_
 		return FT_COMPRESSED_CONTINUE;
 	}
 	*not_found = true;
+	return FT_COMPRESSED_END;
+}
+#else
+static
+enum ft_compressed_action ft_traverse_collapsed(
+		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
+		struct cds_ft_inode_flag ***node_flag_ptr_p __attribute__((unused)),
+		const uint8_t **key_p __attribute__((unused)),
+		unsigned int *i_p __attribute__((unused)),
+		unsigned int key_depth __attribute__((unused)),
+		bool *not_found __attribute__((unused)))
+{
 	return FT_COMPRESSED_END;
 }
 #endif /* FEATURE_FT_COLLAPSE */
@@ -5545,6 +5575,24 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **nod
 	/* No match in the requested direction. */
 	*level_p = level - 1;
 	iter_debug_path_snapshot(iter);
+	return FT_COMPRESSED_GOING_UP;
+}
+#else
+static
+enum ft_compressed_action ft_inequality_collapsed(
+		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
+		ssize_t *level_p __attribute__((unused)),
+		ssize_t key_depth __attribute__((unused)),
+		ssize_t max_tree_depth __attribute__((unused)),
+		enum ft_lookup_inequality mode __attribute__((unused)),
+		enum ft_lookup_limit limit __attribute__((unused)),
+		const uint8_t **iter_key_p __attribute__((unused)),
+		const uint8_t *input_key __attribute__((unused)),
+		struct cds_ft_iter *iter __attribute__((unused)),
+		uint8_t *ordinal_key __attribute__((unused)),
+		bool *skip_eq_external_nodes_p __attribute__((unused)),
+		unsigned int nr_e __attribute__((unused)))
+{
 	return FT_COMPRESSED_GOING_UP;
 }
 #endif /* FEATURE_FT_COLLAPSE */
@@ -9106,6 +9154,18 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		return internal_flag;
 	}
 }
+#else
+static
+struct cds_ft_inode_flag *ft_explode_entries(
+		struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_collapsed_node *col __attribute__((unused)),
+		struct cds_ft_inode_flag **cptrs __attribute__((unused)),
+		unsigned int start __attribute__((unused)),
+		unsigned int end __attribute__((unused)),
+		unsigned int suffix_offset __attribute__((unused)))
+{
+	return NULL;
+}
 #endif /* FEATURE_FT_COLLAPSE */
 
 static
@@ -12297,6 +12357,17 @@ enum ft_compressed_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **n
 	*count_ret = 0;
 	return FT_COMPRESSED_END;
 }
+#else
+static
+enum ft_compressed_action ft_count_prefix_collapsed(
+		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
+		unsigned int *i_p __attribute__((unused)),
+		const uint8_t *prefix __attribute__((unused)),
+		size_t prefix_len __attribute__((unused)),
+		unsigned long *count_ret __attribute__((unused)))
+{
+	return FT_COMPRESSED_END;
+}
 #endif /* FEATURE_FT_COLLAPSE */
 
 unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
@@ -12533,6 +12604,18 @@ enum ft_compressed_action ft_lookup_nth_collapsed(
 		}
 		*remaining_p -= child_keys;
 	}
+	return FT_COMPRESSED_BREAK;
+}
+#else
+static
+enum ft_compressed_action ft_lookup_nth_collapsed(
+		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
+		int *level_p __attribute__((unused)),
+		uint8_t *ordinal_key __attribute__((unused)),
+		struct cds_ft_iter *iter __attribute__((unused)),
+		unsigned long *remaining_p __attribute__((unused)),
+		unsigned int nr __attribute__((unused)))
+{
 	return FT_COMPRESSED_BREAK;
 }
 #endif /* FEATURE_FT_COLLAPSE */
@@ -12830,6 +12913,18 @@ enum ft_compressed_action ft_lookup_nth_last_collapsed(
 		}
 		*remaining_p -= child_keys;
 	}
+	return FT_COMPRESSED_END;
+}
+#else
+static
+enum ft_compressed_action ft_lookup_nth_last_collapsed(
+		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
+		int *level_p __attribute__((unused)),
+		uint8_t *ordinal_key __attribute__((unused)),
+		struct cds_ft_iter *iter __attribute__((unused)),
+		unsigned long *remaining_p __attribute__((unused)),
+		unsigned int nr __attribute__((unused)))
+{
 	return FT_COMPRESSED_END;
 }
 #endif /* FEATURE_FT_COLLAPSE */
