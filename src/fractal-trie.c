@@ -7676,14 +7676,23 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			}
 
 			/*
-			 * Suffix-min check: require at least one
-			 * entry with slen >= FT_COLLAPSE_SUFFIX_MIN.
+			 * Suffix-min checks:
+			 * 1. At least one entry with slen >= SUFFIX_MIN.
+			 * 2. ALL entries meet the per-config min_slen.
+			 *    This bounds the CL-per-byte cost: wider
+			 *    scan zones (more CL loads) require longer
+			 *    suffixes to justify the cost.  Prevents
+			 *    e.g. XLARGE/SCAN_256 (5 CL) from being
+			 *    used for short 2-byte suffixes.
 			 */
 			{
 				unsigned int nr =
 					ft_collapsed_nr_entries(col);
 				unsigned int e;
 				bool has_long_suffix = false;
+				unsigned int cfg_min_slen =
+					ft_collapsed_min_slen(scan_sel);
+				bool all_meet_min = true;
 
 				for (e = 0; e < ft_collapsed_count(nr); e++) {
 					uint8_t data_e =
@@ -7694,8 +7703,10 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 
 					if (sl >= FT_COLLAPSE_SUFFIX_MIN)
 						has_long_suffix = true;
+					if (sl < cfg_min_slen)
+						all_meet_min = false;
 				}
-				if (!has_long_suffix) {
+				if (!has_long_suffix || !all_meet_min) {
 					free_collapsed_node(ft, col);
 					continue;
 				}
