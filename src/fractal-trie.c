@@ -1494,11 +1494,13 @@ void ft_publish_to_parent(struct cds_ft_inode_flag *parent_nf,
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (cn_meta->skip_slot &&
 		    ft_node_skip_compressed(*cn_meta->skip_slot))
 			rcu_assign_pointer(*cn_meta->skip_slot,
 				ft_skip_compressed_flag(
 					new_child, cn->len));
+#endif
 	}
 	rcu_assign_pointer(*parent_slot, new_child);
 }
@@ -1559,6 +1561,7 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 {
 	if (!child_nf)
 		return;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (ft_node_skip_compressed(child_nf)) {
 		struct cds_ft_compressed_node *cn =
 			ft_skip_to_compressed(child_nf);
@@ -1570,6 +1573,7 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 			cn_meta->skip_slot = slot;
 		return;
 	}
+#endif
 	if (ft_node_external(child_nf)) {
 		rcu_assign_pointer(
 			((struct cds_ft_node *) child_nf)->_ft_parent,
@@ -3983,6 +3987,7 @@ skip_copy:
 
 		new_metadata->parent = old_parent;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (old_parent && ft_node_compressed(old_parent)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(old_parent);
@@ -3996,6 +4001,7 @@ skip_copy:
 					ft_skip_compressed_flag(
 						new_node_flag, cn->len));
 		}
+#endif
 	}
 	/*
 	 * Reparent children to the new node.
@@ -6827,7 +6833,7 @@ void ft_propagate_external_count_parent(struct cds_ft_inode_flag *start,
 static inline
 unsigned long ft_density_get(const struct cds_ft_metadata *m, unsigned int idx)
 {
-	if (caa_unlikely(m->density_ext != NULL))
+	if (caa_unlikely(m->density_extended))
 		return m->density_ext->nr_nodes_at_depth[idx];
 	return m->nr_nodes_at_depth[idx];
 }
@@ -6844,12 +6850,13 @@ void ft_density_promote(struct cds_ft_metadata *m)
 	for (i = 0; i < FT_NODE_DENSITY_DEPTH; i++)
 		ext->nr_nodes_at_depth[i] = m->nr_nodes_at_depth[i];
 	m->density_ext = ext;
+	m->density_extended = 1;
 }
 
 static inline
 void ft_density_set(struct cds_ft_metadata *m, unsigned int idx, unsigned long val)
 {
-	if (caa_unlikely(m->density_ext != NULL)) {
+	if (caa_unlikely(m->density_extended)) {
 		m->density_ext->nr_nodes_at_depth[idx] = val;
 		return;
 	}
@@ -6858,7 +6865,7 @@ void ft_density_set(struct cds_ft_metadata *m, unsigned int idx, unsigned long v
 		m->density_ext->nr_nodes_at_depth[idx] = val;
 		return;
 	}
-	m->nr_nodes_at_depth[idx] = (uint16_t) val;
+	m->nr_nodes_at_depth[idx] = (uint8_t) val;
 }
 
 static inline
@@ -6883,8 +6890,10 @@ void ft_density_sub(struct cds_ft_metadata *m, unsigned int idx, unsigned long s
 static inline
 void ft_density_free(struct cds_ft_metadata *m)
 {
-	free(m->density_ext);
-	m->density_ext = NULL;
+	if (m->density_extended) {
+		free(m->density_ext);
+		m->density_extended = 0;
+	}
 }
 
 /*
@@ -9173,6 +9182,7 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child = cptrs[e];
 		unsigned long child_nr_keys;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (ft_node_skip_compressed(child)) {
 			/*
 			 * Clear skip_slot: the collapsed node (and its
@@ -9183,6 +9193,7 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 			child = ft_compressed_node_flag(
 				ft_skip_to_compressed(child));
 		}
+#endif
 		if (slen <= suffix_offset)
 			return child;
 

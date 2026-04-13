@@ -226,68 +226,74 @@ struct cds_ft_alloc_arena;
  * Write-side only (mutex-held), no RCU publish concerns.
  */
 #define FT_NODE_DENSITY_DEPTH	6
-#define FT_DENSITY_COMPACT_MAX	UINT16_MAX
+#define FT_DENSITY_COMPACT_MAX	UINT8_MAX
 
 struct cds_ft_density_extended {
 	unsigned long nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
 };
 
+/*
+ * Struct layout is ordered for minimal padding:
+ *   - 8-byte fields first (pointers, unsigned long)
+ *   - 8-byte density union
+ *   - 2-byte and 1-byte fields packed together at the end
+ *   - 4 bytes tail padding (struct aligned to 8)
+ *
+ * Note: call_rcu overwrites the first 16 bytes of this struct
+ * (parent + skip_slot or parent + external_nodes) when the node
+ * is freed.  Fields accessed in the RCU callback (density_extended,
+ * density_ext) must remain beyond byte 16 of the struct.
+ */
 struct cds_ft_metadata {
-	struct cds_ft_inode_flag *parent;	/* Tagged pointer to parent node (write-side only).
+	struct cds_ft_inode_flag *parent;	/*
+						 * Tagged pointer to parent node (write-side only).
 						 * NULL for the root node.
-						 * Not published with rcu_assign_pointer:
-						 * maintained exclusively under the mutation
-						 * mutex.  Not safe for read-side use due to
-						 * RCU lifetime concerns.
 						 */
-	struct cds_ft_inode_flag **skip_slot;	/* Address of the slot holding the skip pointer
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	struct cds_ft_inode_flag **skip_slot;	/*
+						 * Address of the slot holding the skip pointer
 						 * for this compressed node (write-side only).
-						 * NULL when the node is not published as a
-						 * skip pointer.  Used to update the skip
-						 * pointer when cn->child changes (recompact).
 						 */
+#endif
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
-	unsigned int nr_child;			/* Number of children in node. */
-	int fallback_removal_count;		/* Removals left keeping fallback. */
 	unsigned long nr_keys;			/* Total unique keys in subtree.
 						 * Stored with uatomic_store release,
-						 * loaded by updaters without uatomic,
-						 * loaded by readers with uatomic_load
-						 * acquire. Transiently undercounts
-						 * during concurrent mutations (see
-						 * ft_propagate_external_count).
+						 * loaded by readers with uatomic_load acquire.
 						 */
 
 	/*
-	 * Local node density counters: count of traversable nodes
-	 * (internal + compressed + collapsed) within a bounded window
-	 * of FT_NODE_DENSITY_DEPTH levels below this node.  External
-	 * nodes are excluded (already tracked by nr_keys).
+	 * Local node density counters (write-side only).
 	 *
-	 * nr_nodes_at_depth[0] = total traversable nodes at levels
-	 *                        +1 through +N (cumulative sum).
-	 *                        This is the pre-filter value for
-	 *                        collapse decisions.
-	 * nr_nodes_at_depth[j] = nodes at level +(j+1), for j = 1..N-1.
-	 *
-	 * Level +1 count = [0] - sum([1]..[N-1]).
-	 *
-	 * Updated by ft_propagate_node_density() on every traversable
-	 * node creation/destruction.  Bounded propagation: only N
-	 * ancestors are updated, cost O(N) per mutation.
-	 *
-	 * 6 levels covers typical collapsed node depth and allows
-	 * precise density tracking for collapse decisions.
-	 *
-	 * Compact representation: uses uint16_t counters inline
-	 * (12 bytes for 6 counters vs 48 bytes for unsigned long).
-	 * When any counter exceeds FT_DENSITY_COMPACT_MAX, a
-	 * separate cds_ft_density_extended struct is lazily
-	 * allocated and density_ext points to it (monotonic
-	 * promotion, never demoted back to compact).
+	 * Compact: uint8_t[6] inline (density_extended == 0).
+	 * Extended: density_ext pointer (density_extended == 1).
+	 * Promotion is monotonic (never demoted).
 	 */
-	struct cds_ft_density_extended *density_ext;	/* NULL = compact uint16_t mode. */
-	uint16_t nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
+	union {
+		struct cds_ft_density_extended *density_ext;
+		uint8_t nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
+	};
+	uint16_t nr_child;			/* Number of children in node (max 256). */
+	uint8_t fallback_removal_count;		/* Removals left keeping fallback. */
+	uint8_t density_extended;		/*
+						 * 0 = compact uint8_t mode,
+						 * 1 = density_ext pointer valid.
+						 */
+	/*
+	 * alloc_index: arena allocator field, logically belongs to
+	 * cds_ft_metadata_alloc but is placed here to fill the 4 bytes
+	 * of tail padding (offsets 44-47) that would otherwise be wasted
+	 * for struct alignment.
+	 *
+	 * This field is live across allocated/free transitions:
+	 * it must survive call_rcu, which overwrites the first 16 bytes
+	 * of the metadata/rcu_head union.  At offset 44, it is safely
+	 * beyond the rcu_head footprint.
+	 *
+	 * Accessed by the arena allocator via metadata pointer —
+	 * cds_ft_metadata_to_range() and cds_ft_metadata_to_item()
+	 * read this to locate the item within its arena range.
+	 */
+	uint16_t alloc_index;
 };
 
 /*
