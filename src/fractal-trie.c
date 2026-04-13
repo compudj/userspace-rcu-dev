@@ -7170,19 +7170,27 @@ next:
 #define FT_COLLAPSE_SUFFIX_MIN		2
 
 /*
- * Minimum suffix length per scan zone size to maintain strict
- * cache-line load upper bounds.  Every live entry must satisfy:
- *   slen >= (scan_zone_size / 64) + 1
- * This is a WORST-CASE bound, not an average.
+ * Minimum suffix length per scan zone size to ensure the collapsed
+ * lookup CL cost never exceeds the worst-case uncollapsed cost.
+ *
+ * Uncollapsed: each key byte traverses one internal node, costing
+ * at most 2 CL loads (node dispatch + child pointer chase).
+ * For S key bytes: worst-case uncollapsed cost = 2S CL.
+ *
+ * Collapsed: scan zone CL + 1 pointer CL per lookup.
+ *
+ * Bound: scan_CL + 1 <= 2S  →  S >= ceil((scan_CL + 1) / 2).
+ * Floor at FT_COLLAPSE_SUFFIX_MIN (2) since 1-byte suffixes
+ * don't save over a direct dispatch.
  */
 static inline
 unsigned int ft_collapsed_min_slen(unsigned int scan_sel)
 {
 	static const unsigned int min_slen[] = {
-		[FT_COLLAPSED_SCAN_32]  = 2,	/* <1 CL: slen >= 2 (SUFFIX_MIN) */
-		[FT_COLLAPSED_SCAN_64]  = 2,	/* 1 CL: slen >= 2 */
-		[FT_COLLAPSED_SCAN_128] = 3,	/* 2 CL: slen >= 3 */
-		[FT_COLLAPSED_SCAN_256] = 5,	/* 4 CL: slen >= 5 */
+		[FT_COLLAPSED_SCAN_32]  = 2,	/* 1 CL total: S >= 1, floor 2 */
+		[FT_COLLAPSED_SCAN_64]  = 2,	/* 2 CL total: S >= 1, floor 2 */
+		[FT_COLLAPSED_SCAN_128] = 2,	/* 3 CL total: S >= 2, floor 2 */
+		[FT_COLLAPSED_SCAN_256] = 3,	/* 5 CL total: S >= 3 */
 	};
 	return min_slen[scan_sel];
 }
