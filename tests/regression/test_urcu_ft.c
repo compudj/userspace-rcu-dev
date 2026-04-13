@@ -371,6 +371,7 @@ int test_1byte_key(void)
 		rcu_read_unlock();
 	}
 	printf("OK\n");
+	rcu_quiescent_state();
 
 	printf("Test #5: lookup lower/greater equal (1-byte).\n");
 
@@ -485,6 +486,7 @@ int test_1byte_key(void)
 	}
 
 	printf("OK\n");
+	rcu_quiescent_state();
 
 	cds_ft_iter_destroy(iter);
 
@@ -492,6 +494,7 @@ int test_1byte_key(void)
 		fprintf(stderr, "Error freeing all nodes\n");
 		return -1;
 	}
+	rcu_quiescent_state();
 
 	cds_ft_destroy(test_ft);
 	cds_ft_group_destroy(test_ft_group);
@@ -611,6 +614,7 @@ int test_2bytes_key(void)
 		rcu_read_unlock();
 	}
 	printf("OK\n");
+	rcu_quiescent_state();
 
 	printf("Test #5: lookup lower/greater equal (2-byte).\n");
 
@@ -728,6 +732,7 @@ int test_2bytes_key(void)
 	}
 
 	printf("OK\n");
+	rcu_quiescent_state();
 
 	cds_ft_iter_destroy(iter);
 
@@ -735,6 +740,7 @@ int test_2bytes_key(void)
 		fprintf(stderr, "Error freeing all nodes\n");
 		return -1;
 	}
+	rcu_quiescent_state();
 
 	cds_ft_destroy(test_ft);
 	cds_ft_group_destroy(test_ft_group);
@@ -894,6 +900,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 			zerocount++;
 	}
 	printf("OK\n");
+	rcu_quiescent_state();
 
 	cds_ft_iter_destroy(iter);
 
@@ -901,6 +908,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 		fprintf(stderr, "Error freeing all nodes\n");
 		return -1;
 	}
+	rcu_quiescent_state();
 
 	cds_ft_destroy(test_ft);
 	cds_ft_group_destroy(test_ft_group);

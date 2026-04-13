@@ -391,6 +391,9 @@ struct cds_ft {
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[FT_ENTRY_PER_NODE];
 	unsigned long nr_nodes_allocated, nr_nodes_freed;
+	unsigned long nr_internal_alloc, nr_internal_freed;
+	unsigned long nr_compressed_alloc, nr_compressed_freed;
+	unsigned long nr_collapsed_alloc, nr_collapsed_freed;
 };
 
 __attribute__((visibility("hidden")))
