@@ -1242,6 +1242,7 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
 	 * Clear the top FT_SKIP_LEN_BITS (7 bits).
 	 * Executed as `shl $7` + `shr $7` to save instruction cache
@@ -1250,6 +1251,7 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	 * execution of the mask generation below.
 	 */
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
+#endif
 
 	/*
 	 * Compute masks branchlessly using ILP.
@@ -1326,6 +1328,7 @@ struct cds_ft_collapsed_node *ft_collapsed_node_ptr(
 
 /* Skip-compressed pointer helpers. */
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 static inline
 bool ft_node_skip_compressed(struct cds_ft_inode_flag *node)
 {
@@ -1391,6 +1394,19 @@ bool ft_group_skip_compressed(const struct cds_ft_group *group)
 {
 	return group->flags & CDS_FT_FLAG_SKIP_COMPRESSED;
 }
+#else
+static inline
+bool ft_node_skip_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
+{
+	return false;
+}
+
+static inline
+bool ft_group_skip_compressed(const struct cds_ft_group *group __attribute__((unused)))
+{
+	return false;
+}
+#endif /* FEATURE_FT_SKIP_COMPRESSED */
 
 /*
  * ft_flag_to_metadata: get the metadata for any node flag, including
@@ -1412,6 +1428,7 @@ struct cds_ft_metadata *ft_flag_to_metadata(struct cds_ft_inode_flag *nf)
 	return cds_ft_item_to_metadata(ft_node_ptr(nf));
 }
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 /*
  * ft_skip_to_compressed_meta: shorthand to get the compressed node's
  * metadata from a skip pointer.
@@ -1423,6 +1440,7 @@ struct cds_ft_metadata *ft_skip_to_compressed_meta(
 	return cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) ft_skip_to_compressed(skip_ptr));
 }
+#endif
 
 /*
  * ft_update_skip_pointer: when a compressed node's child is replaced
@@ -14341,6 +14359,10 @@ enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
 enum cds_ft_status cds_ft_attr_set_flags(struct cds_ft_attr *attr,
 		unsigned int flags)
 {
+#ifndef FEATURE_FT_SKIP_COMPRESSED
+	if (flags & CDS_FT_FLAG_SKIP_COMPRESSED)
+		return CDS_FT_STATUS_ERROR;
+#endif
 	attr->flags = flags;
 	return CDS_FT_STATUS_OK;
 }
