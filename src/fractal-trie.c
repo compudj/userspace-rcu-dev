@@ -1242,23 +1242,24 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
 
-#ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
-	 * Clear the top FT_SKIP_LEN_BITS (7 bits).
-	 * Executed as `shl $7` + `shr $7` to save instruction cache
-	 * bytes compared to a 10-byte `movabs` for FT_ADDR_MASK.
-	 * The 2-cycle latency is completely hidden by the superscalar
-	 * execution of the mask generation below.
-	 */
-	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
-#endif
-
-	/*
-	 * Compute masks branchlessly using ILP.
-	 * mask_internal generation runs in parallel with the bit 0 test.
+	 * Compute mask from the original pointer: the skip-compressed
+	 * length bits (57-63) don't affect bits 0-3 used for type
+	 * dispatch, so this runs in parallel with the ADDR_MASK AND
+	 * below (full ILP).
 	 */
 	unsigned long mask_internal = (~15UL) << ((v >> 1) & 7);
 	unsigned long mask = (v & 1) ? mask_internal : ~7UL;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * Clear the top FT_SKIP_LEN_BITS (7 bits).  In a hot loop
+	 * the compiler hoists FT_ADDR_MASK into a register, making
+	 * this a single 1-cycle AND that runs in parallel with the
+	 * mask chain above.
+	 */
+	v &= FT_ADDR_MASK;
+#endif
 
 	return (struct cds_ft_inode *) (v & mask);
 }
@@ -1268,7 +1269,9 @@ struct cds_ft_inode *_ft_node_mask_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
+#endif
 	return (struct cds_ft_inode *) (v & FT_PTR_MASK);
 }
 
@@ -2239,8 +2242,10 @@ static inline void ft_maybe_prefetch(const void *ptr)
 {
 	unsigned long v = (unsigned long) ptr;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 	/* Clear skip-compressed length bits. */
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
+#endif
 	if ((v & FT_PREFETCH_SKIP_MASK) != FT_PREFETCH_SKIP_MASK)
 		__builtin_prefetch((const void *) v);
 }
