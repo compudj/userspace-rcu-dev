@@ -1467,12 +1467,14 @@ bool ft_group_skip_compressed(const struct cds_ft_group *group __attribute__((un
 static inline
 struct cds_ft_metadata *ft_flag_to_metadata(struct cds_ft_inode_flag *nf)
 {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (ft_node_skip_compressed(nf)) {
 		struct cds_ft_compressed_node *cn =
 			ft_skip_to_compressed(nf);
 		return cds_ft_item_to_metadata(
 			(struct cds_ft_inode *) cn);
 	}
+#endif
 	return cds_ft_item_to_metadata(ft_node_ptr(nf));
 }
 
@@ -2974,7 +2976,8 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 
 			ft_linear_node_get_ith_pos(type, node, i, &v, &iter);
 			if (iter == child_nf) {
-				*n_ret = v;
+				if (n_ret)
+					*n_ret = v;
 				if (slot_ret)
 					ft_node_get_nth(parent_nf, slot_ret, v);
 				return true;
@@ -2998,7 +3001,8 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 
 				ft_linear_node_get_ith_pos(type, pool, j, &v, &iter);
 				if (iter == child_nf) {
-					*n_ret = v;
+					if (n_ret)
+						*n_ret = v;
 					if (slot_ret)
 						ft_node_get_nth(parent_nf, slot_ret, v);
 					return true;
@@ -3016,7 +3020,8 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 
 			iter = ft_pigeon_node_get_ith_pos(type, node, i);
 			if (iter == child_nf) {
-				*n_ret = (uint8_t) i;
+				if (n_ret)
+					*n_ret = (uint8_t) i;
 				if (slot_ret)
 					ft_node_get_nth(parent_nf, slot_ret, i);
 				return true;
@@ -8140,7 +8145,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				 * see the new path; actual frees are
 				 * deferred via call_rcu.
 				 */
-				for (ai = 0; ai < nr_col_absorbed; ai++)
+					for (ai = 0; ai < nr_col_absorbed; ai++)
 					ft_free_absorbed_node(ft,
 						col_absorbed[ai]);
 				free_cds_ft_node(ft, ft_node_ptr(node_flag));
