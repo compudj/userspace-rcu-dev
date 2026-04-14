@@ -10275,6 +10275,29 @@ int ft_detach_node(struct cds_ft *ft,
 	unsigned int cur_depth;
 
 	/*
+	 * Check the node being replaced (the child at detach_node_flag_ptr)
+	 * for external_nodes.  After the child's last internal child was
+	 * removed (triggering this detach), the child may still hold
+	 * variable-length key entries that must be preserved.
+	 */
+	{
+		struct cds_ft_inode_flag *detach_child = *detach_node_flag_ptr;
+
+		if (ft_node_ptr(detach_child) && !ft_node_external(detach_child)) {
+			struct cds_ft_metadata *child_meta;
+			if (ft_node_internal(detach_child))
+				child_meta = cds_ft_item_to_metadata(ft_node_ptr(detach_child));
+			else if (ft_node_compressed(detach_child))
+				child_meta = cds_ft_item_to_metadata(
+					(struct cds_ft_inode *)ft_compressed_node_ptr(detach_child));
+			else
+				child_meta = NULL;
+			if (child_meta && child_meta->external_nodes)
+				topmost_external_nodes = child_meta->external_nodes;
+		}
+	}
+
+	/*
 	 * Walk upward from the parent of the detached node via
 	 * metadata->parent.  At each ancestor, check if it has only
 	 * one child left.  If so, mark it for pruning and continue.
@@ -10293,12 +10316,11 @@ int ft_detach_node(struct cds_ft *ft,
 		is_root = (metadata->parent == NULL);
 
 		assert(metadata->nr_child > 0);
-		if (!prev_external_nodes_found && (metadata->nr_child == 1 && !is_root)) {
+		if (!prev_external_nodes_found && (metadata->nr_child == 1 && !metadata->external_nodes && !is_root)) {
 			nr_clear++;
-			topmost_external_nodes = metadata->external_nodes;
 		}
 		nr_branch++;
-		if (prev_external_nodes_found || metadata->nr_child > 1 || is_root) {
+		if (prev_external_nodes_found || metadata->nr_child > 1 || metadata->external_nodes || is_root) {
 			if (!is_root) {
 				struct cds_ft_metadata *parent_meta =
 					cds_ft_item_to_metadata(
@@ -10347,38 +10369,59 @@ int ft_detach_node(struct cds_ft *ft,
 
 	iter_node_flag = *detach_parent_flag_ptr;
 	/*
-	 * Replace within parent.  If the parent is a compressed node
-	 * (e.g. compressed root from detach/graft_swap), recompact it
-	 * to an empty linear node so the root is always internal.
+	 * Replace within parent.  If the parent is a compressed node:
+	 *
+	 * If topmost_external_nodes is set, the child below the
+	 * compressed node has variable-length key entries.  Keep the
+	 * compressed node (its path is needed for lookups) and replace
+	 * cn->child with the external node directly.
+	 *
+	 * Otherwise, replace the compressed node with a fresh internal
+	 * node (e.g. compressed root from detach/graft_swap must remain
+	 * internal).
 	 */
 	if (ft_node_compressed(iter_node_flag) ||
 	    ft_node_skip_compressed(iter_node_flag)) {
-		struct cds_ft_inode *fresh;
-		struct cds_ft_metadata *fresh_meta;
-
-		fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
-		if (!fresh) {
-			ret = -ENOMEM;
-			goto end;
-		}
-		{
-			struct cds_ft_metadata *src_meta = cds_ft_item_to_metadata(
-				(struct cds_ft_inode *) ft_compressed_node_ptr(
-					iter_node_flag));
-			fresh_meta->parent = src_meta->parent;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-			fresh_meta->skip_slot_offset = src_meta->skip_slot_offset;
-#endif
-		}
 		if (topmost_external_nodes) {
-			fresh_meta->external_nodes = topmost_external_nodes;
-			ft_nr_keys_store(fresh_meta, 1, CMM_RELAXED);
+			/*
+			 * Keep compressed node, replace child with
+			 * external_nodes.  The compressed path is
+			 * preserved for lookups to traverse.
+			 */
+			struct cds_ft_compressed_node *cn;
+
+			if (ft_node_skip_compressed(iter_node_flag))
+				cn = ft_skip_to_compressed(iter_node_flag);
+			else
+				cn = ft_compressed_node_ptr(iter_node_flag);
+			ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
+				&cn->child,
+				(struct cds_ft_inode_flag *) topmost_external_nodes);
+			ret = 0;
+		} else {
+			struct cds_ft_inode *fresh;
+			struct cds_ft_metadata *fresh_meta;
+
+			fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
+			if (!fresh) {
+				ret = -ENOMEM;
+				goto end;
+			}
+			{
+				struct cds_ft_metadata *src_meta = cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) ft_compressed_node_ptr(
+						iter_node_flag));
+				fresh_meta->parent = src_meta->parent;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				fresh_meta->skip_slot_offset = src_meta->skip_slot_offset;
+#endif
+			}
+			rcu_assign_pointer(*detach_parent_flag_ptr,
+				ft_node_flag(fresh, 0));
+			free_compressed_node(ft,
+				ft_compressed_node_ptr(iter_node_flag));
+			ret = 0;
 		}
-		rcu_assign_pointer(*detach_parent_flag_ptr,
-			ft_node_flag(fresh, 0));
-		free_compressed_node(ft,
-			ft_compressed_node_ptr(iter_node_flag));
-		ret = 0;
 	} else if (ft_node_collapsed(iter_node_flag)) {
 		/*
 		 * Collapsed parent: tombstone the entry pointing to
