@@ -11056,6 +11056,17 @@ int ft_detach_node(struct cds_ft *ft,
 					ft_density_get(old_detach_cm, j);
 		}
 
+		/*
+		 * When a stale parent pointer causes the walk to
+		 * advance detach_node_flag_ptr to the same address
+		 * as detach_parent_flag_ptr, redirect to &ft->root.
+		 * This happens when a node's parent points to a
+		 * freed (recompacted) root.
+		 */
+		if (detach_node_flag_ptr == detach_parent_flag_ptr) {
+			detach_parent_flag_ptr = &ft->root;
+			iter_node_flag = ft->root;
+		}
 		ret = ft_node_replace_ptr(ft,
 			detach_node_flag_ptr,
 			&iter_node_flag,
