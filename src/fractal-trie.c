@@ -9167,8 +9167,10 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 			return FT_COMPRESSED_CONTINUE;
 		}
 		if (!ft_node_ptr(cn->child)) {
-			fprintf(stderr, "BUG: cn->child NULL, cn=%p cn->len=%u depth=%u\n",
-				cn, cn->len, d->depth);
+			struct cds_ft_metadata *cn_meta =
+				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+			fprintf(stderr, "BUG: cn->child NULL, cn=%p cn->len=%u depth=%u external_nodes=%p nr_child=%u\n",
+				cn, cn->len, d->depth, cn_meta->external_nodes, (unsigned)cn_meta->nr_child);
 			abort();
 		}
 		if (cn->len == remaining) {
@@ -9316,15 +9318,17 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 				ft_skip_to_compressed(child));
 		}
 #endif
+		if (!ft_node_ptr(child))
+			return NULL;	/* Tombstoned entry — no subtree. */
 		if (slen <= suffix_offset)
 			return child;
 
-		if (!ft_node_external(child) && ft_node_ptr(child)) {
+		if (!ft_node_external(child)) {
 			struct cds_ft_metadata *cm =
 				cds_ft_item_to_metadata(ft_node_ptr(child));
 			child_nr_keys = ft_nr_keys_get(cm);
 		} else {
-			child_nr_keys = ft_node_ptr(child) ? 1 : 0;
+			child_nr_keys = 1;
 		}
 		return ft_build_ordinal_chain(ft,
 			sfx + suffix_offset, slen - suffix_offset,
@@ -9371,8 +9375,10 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 			sub = ft_explode_entries(ft, col, cptrs,
 					i, group_end,
 					suffix_offset + 1);
-			if (!sub)
-				return NULL;
+			if (!sub) {
+				i = group_end;
+				continue;	/* Skip tombstoned/empty group. */
+			}
 
 			{
 				struct cds_ft_inode *old_recompacted = NULL;
