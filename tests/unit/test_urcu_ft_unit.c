@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 161
+#define NR_TESTS 162
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -11517,6 +11517,135 @@ static int test_density_collapse_explode(void)
 	return 0;
 }
 
+/*
+ * Density counter verification: remove through compressed paths.
+ *
+ * Build a trie with compressed paths (long shared prefixes), split
+ * them by inserting divergent keys, then remove keys one at a time.
+ * Removals traverse through compressed nodes and cause subtrees
+ * under compressed paths to shrink, testing density propagation
+ * when compressed children lose subtree content.
+ *
+ * Uses 8-byte fixed keys for deep compressed paths.
+ */
+static int test_density_remove_through_compress(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(8, &group);
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+	unsigned int i;
+
+	/*
+	 * Keys share a 6-byte prefix (bytes 0-5 = 0), diverge at
+	 * byte 6, creating a compressed path of length 6 from the
+	 * root's child to the divergence point.
+	 */
+	uint64_t keys[] = {
+		0x0000000000000100ULL,	/* diverge at byte 6 = 0x01, byte 7 = 0x00 */
+		0x0000000000000200ULL,	/* diverge at byte 6 = 0x02 */
+		0x0000000000000300ULL,	/* diverge at byte 6 = 0x03 */
+		0x0000000000000101ULL,	/* same byte 6 as [0], diverge at byte 7 */
+		0x0000000000000102ULL,	/* same byte 6 as [0], diverge at byte 7 */
+		0x0000000000000201ULL,	/* same byte 6 as [1], diverge at byte 7 */
+		/* A key that diverges early (byte 0) to trigger root recompact. */
+		0x0100000000000000ULL,
+		/* Another key diverging at byte 3 (mid-compressed-path split). */
+		0x0000000100000000ULL,
+	};
+	unsigned int nkeys = sizeof(keys) / sizeof(keys[0]);
+
+	s = cds_ft_iter_create(ft, &iter);
+	if (s < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Insert all keys, verifying after each. */
+	rcu_read_lock();
+	for (i = 0; i < nkeys; i++) {
+		s = insert_u64(ft, keys[i], node_alloc(keys[i]));
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "density_rm_compress: insert %u (0x%016" PRIx64 ") failed: %s\n",
+				i, keys[i], cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		s = cds_ft_verify(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "density_rm_compress: structural verify failed after insert %u\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		s = cds_ft_verify_density(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "density_rm_compress: density mismatch after insert %u\n", i);
+			cds_ft_show(ft, stderr);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+
+	/* Remove keys one at a time, verifying after each. */
+	for (i = 0; i < nkeys; i++) {
+		uint8_t k[8];
+		struct cds_ft_node *removed;
+
+		cds_ft_u64_to_key(ft, keys[i], k, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		s = cds_ft_lookup(ft, iter);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "density_rm_compress: lookup key %u for remove failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		removed = cds_ft_iter_node(iter);
+		s = cds_ft_remove(ft, iter, removed);
+		if (s < 0) {
+			fprintf(stderr, "density_rm_compress: remove key %u failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		node_free_rcu(to_test_node(removed));
+
+		s = cds_ft_verify(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "density_rm_compress: structural verify failed after remove %u\n", i);
+			cds_ft_show(ft, stderr);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		s = cds_ft_verify_density(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "density_rm_compress: density mismatch after remove %u\n", i);
+			cds_ft_show(ft, stderr);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+	rcu_barrier();
+	cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                           MAIN                                     */
@@ -11753,6 +11882,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_density_graft_detach);
 	RUN_TEST(test_density_recompact_full);
 	RUN_TEST(test_density_collapse_explode);
+	RUN_TEST(test_density_remove_through_compress);
 
 	rcu_barrier();
 	rcu_unregister_thread();
