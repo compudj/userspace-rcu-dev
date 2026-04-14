@@ -9105,41 +9105,23 @@ int ft_attach_node(struct cds_ft *ft,
 			iter_node_flag = compressed;
 			created_nodes[nr_created_nodes++] = iter_node_flag;
 			iter_key = key + compress_level;
-			if (external_nodes) {
-				/*
-				 * Compressed node starts at level+1.
-				 * Create an internal node at @level
-				 * dispatching on key[level], holding
-				 * external_nodes.  The compressed node
-				 * is its child.
-				 */
-				uint8_t kv = *(--iter_key);
-
-				iter_dest_node_flag = NULL;
-				ret = ft_node_set_nth(ft, &iter_dest_node_flag,
-					kv, iter_node_flag, NULL, NULL,
-					level);
-				if (ret)
-					goto check_error;
-				{
-					struct cds_ft_metadata *wr =
-						cds_ft_item_to_metadata(
-							ft_node_ptr(iter_dest_node_flag));
-					ft_metadata_set_external_nodes(iter_dest_node_flag, wr, external_nodes);
-					ft_nr_keys_store(wr, 2, CMM_RELAXED);
-				}
-				created_nodes[nr_created_nodes++] =
-					iter_dest_node_flag;
-				iter_node_flag = iter_dest_node_flag;
-				/* external_nodes handled; prevent
-				 * double-set in the loop below. */
-				external_nodes = NULL;
-			}
+			/*
+			 * When external_nodes exist, compress_level = level + 1.
+			 * iter_key points to key + level + 1.  The loop below
+			 * runs one iteration to create an internal node at
+			 * @level that dispatches on key[level] with the
+			 * compressed node as child.  The loop then places
+			 * external_nodes on this internal node.
+			 */
 		}
 	}
-	if (!ft_node_compressed(iter_node_flag) &&
-	    !ft_node_skip_compressed(iter_node_flag)) {
-		for (i = key_len; i > (int) level; i--) {
+	if ((!ft_node_compressed(iter_node_flag) &&
+	     !ft_node_skip_compressed(iter_node_flag)) ||
+	    external_nodes) {
+		for (i = (ft_node_compressed(iter_node_flag) ||
+			  ft_node_skip_compressed(iter_node_flag)) ?
+				(int) level + 1 : (int) key_len;
+		     i > (int) level; i--) {
 			uint8_t key_value;
 
 			key_value = *(--iter_key);
