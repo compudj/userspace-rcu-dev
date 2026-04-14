@@ -10428,6 +10428,14 @@ int ft_detach_node(struct cds_ft *ft,
 			ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes);
+			/*
+			 * Set the external's _ft_parent so that
+			 * ft_skip_to_compressed can recover the
+			 * compressed node from the skip pointer.
+			 */
+			ft_set_parent(
+				(struct cds_ft_inode_flag *) topmost_external_nodes,
+				ft_compressed_node_flag(cn), &cn->child);
 			nr_clear = 0;
 			ret = 0;
 		} else {
