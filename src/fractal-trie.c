@@ -10166,7 +10166,14 @@ int _cds_ft_insert(struct cds_ft *ft,
 						struct cds_ft_metadata *int_meta =
 							cds_ft_item_to_metadata(
 								ft_node_ptr(internal_flag));
-						ft_metadata_set_external_nodes(internal_flag, int_meta, col_meta->external_nodes);
+						if (col_meta->external_nodes) {
+							ft_metadata_set_external_nodes(
+								internal_flag, int_meta,
+								col_meta->external_nodes);
+							ft_nr_keys_store(int_meta,
+								ft_nr_keys_get(int_meta) + 1,
+								CMM_RELAXED);
+						}
 					}
 					ft_init_node_density(internal_flag);
 
@@ -11055,17 +11062,6 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 		struct cds_ft_inode_flag *old_detach_child =
 			*detach_node_flag_ptr;
-		/*
-		 * Stale parent pointer: the upward walk followed
-		 * a freed parent and set both pointers to the same
-		 * address.  Redirect to the live root.
-		 */
-		if (detach_node_flag_ptr == detach_parent_flag_ptr) {
-			iter_node_flag = ft->root;
-			detach_parent_flag_ptr = &ft->root;
-			ft_node_find_child(ft->root, old_detach_child,
-				&n, &detach_node_flag_ptr);
-		}
 		/*
 		 * Capture old child's density info before replace.
 		 * Needed for per-level density propagation below.
@@ -13077,7 +13073,14 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						struct cds_ft_metadata *int_meta =
 							cds_ft_item_to_metadata(
 								ft_node_ptr(internal_flag));
-						ft_metadata_set_external_nodes(internal_flag, int_meta, col_meta->external_nodes);
+						if (col_meta->external_nodes) {
+							ft_metadata_set_external_nodes(
+								internal_flag, int_meta,
+								col_meta->external_nodes);
+							ft_nr_keys_store(int_meta,
+								ft_nr_keys_get(int_meta) + 1,
+								CMM_RELAXED);
+						}
 					}
 					ft_init_node_density(internal_flag);
 
