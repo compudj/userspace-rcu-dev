@@ -7336,11 +7336,16 @@ next:
 
 static inline
 void ft_record_absorbed(struct cds_ft_inode_flag **absorbed,
+		unsigned int *absorbed_depths,
 		unsigned int *nr_absorbed,
-		struct cds_ft_inode_flag *node_flag)
+		struct cds_ft_inode_flag *node_flag,
+		unsigned int node_depth)
 {
-	if (*nr_absorbed < FT_COLLAPSE_ABSORBED_MAX)
-		absorbed[(*nr_absorbed)++] = node_flag;
+	if (*nr_absorbed < FT_COLLAPSE_ABSORBED_MAX) {
+		absorbed[*nr_absorbed] = node_flag;
+		absorbed_depths[*nr_absorbed] = node_depth;
+		(*nr_absorbed)++;
+	}
 }
 
 /*
@@ -7400,6 +7405,8 @@ unsigned int ft_collapsed_min_slen(unsigned int scan_sel)
  *   decision-point node's own footprint separately.
  * @absorbed: array to record absorbed node flags for later freeing.
  *   May be NULL to skip recording.
+ * @absorbed_depths: parallel array of slen values (depth offset from
+ *   the decision point) for each absorbed node.
  * @nr_absorbed: count of entries in @absorbed.
  * @branch_depth: number of multi-child branching points traversed
  *   from the decision point (passed by value).
@@ -7418,6 +7425,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 		unsigned int max_entries,
 		unsigned int *absorbed_footprint,
 		struct cds_ft_inode_flag **absorbed,
+		unsigned int *absorbed_depths,
 		unsigned int *nr_absorbed,
 		unsigned int branch_depth,
 		unsigned int max_branch_depth)
@@ -7465,7 +7473,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 				goto emit_entry; /* Would exceed suffix buffer. */
 			*absorbed_footprint +=
 				ft_node_readside_footprint(orig_walk);
-			ft_record_absorbed(absorbed, nr_absorbed, orig_walk);
+			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, orig_walk, slen);
 			for (j = 0; j < cn->len; j++)
 				suffix_buf[slen++] = cn->key_bytes[j];
 			walk = ft_dereference_acquire(cn->child);
@@ -7501,7 +7509,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 				goto emit_entry;
 			*absorbed_footprint +=
 				ft_node_readside_footprint(walk);
-			ft_record_absorbed(absorbed, nr_absorbed, walk);
+			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
 			for (e = 0; e < ft_collapsed_count(col_child_nr_e); e++) {
 				uint8_t data_e =
 					ft_collapsed_load_data(col_child, e);
@@ -7534,7 +7542,8 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 						col, col_ptrs,
 						max_entries,
 						absorbed_footprint,
-						absorbed, nr_absorbed,
+						absorbed, absorbed_depths,
+						nr_absorbed,
 						branch_depth + 1,
 						max_branch_depth))
 					return -1;
@@ -7563,7 +7572,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 					return -1;
 				*absorbed_footprint +=
 					ft_node_readside_footprint(walk);
-				ft_record_absorbed(absorbed, nr_absorbed, walk);
+				ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
 				suffix_buf[slen++] = wk;
 				walk = wc;
 				continue;
@@ -7585,7 +7594,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 				goto emit_entry;
 			*absorbed_footprint +=
 				ft_node_readside_footprint(walk);
-			ft_record_absorbed(absorbed, nr_absorbed, walk);
+			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
 			{
 				uint8_t ck = 0;
 				int pv = -1;
@@ -7602,7 +7611,8 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 							col, col_ptrs,
 							max_entries,
 							absorbed_footprint,
-							absorbed, nr_absorbed,
+							absorbed, absorbed_depths,
+							nr_absorbed,
 							branch_depth + 1,
 							max_branch_depth))
 						return -1;
@@ -7682,6 +7692,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag *node_flag,
 		unsigned int node_depth,
 		struct cds_ft_inode_flag **absorbed_out,
+		unsigned int *absorbed_depths_out,
 		unsigned int *nr_absorbed_out)
 {
 	struct cds_ft_inode *node = ft_node_ptr(node_flag);
@@ -7755,7 +7766,9 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		 * the winning config's absorbed nodes.
 		 */
 		struct cds_ft_inode_flag *absorbed_cur[FT_COLLAPSE_ABSORBED_MAX];
+		unsigned int absorbed_depths_cur[FT_COLLAPSE_ABSORBED_MAX];
 		struct cds_ft_inode_flag *absorbed_best[FT_COLLAPSE_ABSORBED_MAX];
+		unsigned int absorbed_depths_best[FT_COLLAPSE_ABSORBED_MAX];
 		unsigned int nr_absorbed_cur;
 		unsigned int nr_absorbed_best = 0;
 
@@ -7873,7 +7886,8 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 						col, col_ptrs,
 						max_entries,
 						&absorbed,
-						absorbed_cur, &nr_absorbed_cur,
+						absorbed_cur, absorbed_depths_cur,
+						&nr_absorbed_cur,
 						0, /* branch_depth */
 						max_branch_depth)) {
 					walk_ok = false;
@@ -7947,6 +7961,8 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				best_collapsed = collapsed_fp;
 				memcpy(absorbed_best, absorbed_cur,
 					nr_absorbed_cur * sizeof(absorbed_best[0]));
+				memcpy(absorbed_depths_best, absorbed_depths_cur,
+					nr_absorbed_cur * sizeof(absorbed_depths_best[0]));
 				nr_absorbed_best = nr_absorbed_cur;
 			} else {
 				free_collapsed_node(ft, col);
@@ -8005,6 +8021,8 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			}
 			memcpy(absorbed_out, absorbed_best,
 				nr_absorbed_best * sizeof(absorbed_out[0]));
+			memcpy(absorbed_depths_out, absorbed_depths_best,
+				nr_absorbed_best * sizeof(absorbed_depths_out[0]));
 			*nr_absorbed_out = nr_absorbed_best;
 			return col_flag;
 		}
@@ -8137,12 +8155,16 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 		if (depth > 0) {
 			struct cds_ft_inode_flag *col_flag;
 			struct cds_ft_inode_flag *col_absorbed[FT_COLLAPSE_ABSORBED_MAX];
+			unsigned int col_absorbed_depths[FT_COLLAPSE_ABSORBED_MAX];
 			unsigned int nr_col_absorbed;
 
 			col_flag = ft_try_collapse_at_node(ft, node_flag,
-					depth, col_absorbed, &nr_col_absorbed);
+					depth, col_absorbed, col_absorbed_depths,
+					&nr_col_absorbed);
 			if (col_flag) {
 				unsigned int ai;
+				unsigned int old_decision_fp =
+					ft_node_readside_footprint(node_flag);
 
 				ft_set_parent(col_flag, parent_nf, NULL);
 				ft_publish_to_parent(ft, parent_nf,
@@ -8153,9 +8175,9 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				 * see the new path; actual frees are
 				 * deferred via call_rcu.
 				 */
-					for (ai = 0; ai < nr_col_absorbed; ai++)
-						ft_free_absorbed_node(ft,
-							col_absorbed[ai]);
+				for (ai = 0; ai < nr_col_absorbed; ai++)
+					ft_free_absorbed_node(ft,
+						col_absorbed[ai]);
 				free_cds_ft_node(ft, ft_node_ptr(node_flag));
 				/*
 				 * Recompute density for the new collapsed
@@ -8163,6 +8185,34 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				 * gone, only entries' children remain.
 				 */
 				ft_init_node_density(col_flag);
+				/*
+				 * Propagate density changes to ancestors:
+				 *
+				 * 1. The collapsed node replaces the old
+				 *    decision point at the same depth.
+				 * 2. Each absorbed node's footprint must be
+				 *    subtracted from ancestors at its depth.
+				 */
+				{
+					long fp_delta;
+
+					/* Decision point → collapsed node. */
+					fp_delta = (long) ft_node_readside_footprint(
+							col_flag)
+						 - (long) old_decision_fp;
+					if (fp_delta != 0)
+						ft_propagate_node_density_parent(
+							col_flag, depth,
+							depth, fp_delta);
+
+					/* Subtract each absorbed node. */
+					for (ai = 0; ai < nr_col_absorbed; ai++)
+						ft_propagate_node_density_parent(
+							col_flag, depth,
+							depth + col_absorbed_depths[ai],
+							-(long) ft_node_readside_footprint(
+								col_absorbed[ai]));
+				}
 				node_flag = col_flag;
 				/* Restart loop: collapsed handler above
 				 * will descend into the matching entry. */
