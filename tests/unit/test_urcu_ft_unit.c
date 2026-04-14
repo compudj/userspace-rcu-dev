@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 163
+#define NR_TESTS 164
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -11811,6 +11811,187 @@ fail_nounlock:
 	return -1;
 }
 
+/*
+ * Stress test: random insert/remove with integrity and density
+ * verification after every mutation.
+ *
+ * Uses a deterministic PRNG (xorshift32) for reproducibility.
+ * Variable-length keys exercise compress, split, collapse, explode,
+ * and recompact paths.  Keys are 1-6 bytes, drawn from a small
+ * alphabet to maximize prefix sharing and structural transitions.
+ */
+
+static uint32_t xorshift32(uint32_t *state)
+{
+	uint32_t x = *state;
+
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	*state = x;
+	return x;
+}
+
+#define STRESS_MAX_KEYS		200
+#define STRESS_KEY_MAX_LEN	6
+#define STRESS_OPS		600
+
+static int test_density_stress(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+	uint32_t rng = 0xdeadbeef;	/* fixed seed */
+	unsigned int op;
+
+	/*
+	 * Track inserted keys so we can remove them.
+	 * Each slot: key bytes + length + node pointer.
+	 */
+	struct {
+		uint8_t key[STRESS_KEY_MAX_LEN];
+		size_t len;
+		struct ft_test_node *node;
+		bool live;
+	} keys[STRESS_MAX_KEYS];
+	unsigned int nr_live = 0;
+	unsigned int nr_keys = 0;
+
+	memset(keys, 0, sizeof(keys));
+
+	ft = create_varlen_ft(&group);
+	s = cds_ft_iter_create(ft, &iter);
+	if (s < 0) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	for (op = 0; op < STRESS_OPS; op++) {
+		uint32_t r = xorshift32(&rng);
+		/*
+		 * Bias: insert when few keys, remove when many,
+		 * 50/50 in the middle.
+		 */
+		bool do_insert = (nr_live < 10) ||
+			(nr_live < STRESS_MAX_KEYS && (r & 1));
+
+		if (do_insert && nr_keys < STRESS_MAX_KEYS) {
+			/* Generate a random key: 1-6 bytes from {0..5}. */
+			unsigned int slot = nr_keys;
+			unsigned int klen = 1 + (xorshift32(&rng) % STRESS_KEY_MAX_LEN);
+			unsigned int k;
+
+			for (k = 0; k < klen; k++)
+				keys[slot].key[k] = (uint8_t)(xorshift32(&rng) % 6);
+			keys[slot].len = klen;
+			keys[slot].node = node_alloc(slot);
+			keys[slot].live = true;
+
+			s = cds_ft_insert(ft, keys[slot].key, klen,
+					  &keys[slot].node->node);
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "stress: insert op %u slot %u failed: %s\n",
+					op, slot, cds_ft_status_to_string(s));
+				goto fail;
+			}
+			nr_keys++;
+			nr_live++;
+		} else if (nr_live > 0) {
+			/* Remove a random live key. */
+			unsigned int pick = xorshift32(&rng) % nr_keys;
+			unsigned int i;
+			struct cds_ft_node *removed;
+
+			/* Find next live key from pick. */
+			for (i = 0; i < nr_keys; i++) {
+				unsigned int idx = (pick + i) % nr_keys;
+
+				if (!keys[idx].live)
+					continue;
+				cds_ft_iter_set_key(iter, keys[idx].key,
+						    keys[idx].len);
+				s = cds_ft_lookup(ft, iter);
+				if (s != CDS_FT_STATUS_OK) {
+					fprintf(stderr, "stress: lookup for remove op %u slot %u failed\n",
+						op, idx);
+					goto fail;
+				}
+				removed = cds_ft_iter_node(iter);
+				s = cds_ft_remove(ft, iter, removed);
+				if (s < 0) {
+					fprintf(stderr, "stress: remove op %u slot %u failed\n",
+						op, idx);
+					goto fail;
+				}
+				node_free_rcu(keys[idx].node);
+				keys[idx].live = false;
+				nr_live--;
+				break;
+			}
+		}
+
+		/* Verify after every mutation. */
+		s = cds_ft_verify(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "stress: structural verify failed at op %u "
+				"(nr_live=%u, seed=0xdeadbeef)\n", op, nr_live);
+			cds_ft_show(ft, stderr);
+			goto fail;
+		}
+		s = cds_ft_verify_density(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "stress: density verify failed at op %u "
+				"(nr_live=%u, seed=0xdeadbeef)\n", op, nr_live);
+			cds_ft_show(ft, stderr);
+			goto fail;
+		}
+	}
+	rcu_read_unlock();
+
+	/* Drain remaining keys. */
+	rcu_read_lock();
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
+
+		s = cds_ft_remove_all(ft, iter, &head);
+		if (s < 0) {
+			fprintf(stderr, "stress: final drain failed\n");
+			goto fail;
+		}
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
+			node_free_rcu(to_test_node(head));
+		}
+	}
+	rcu_read_unlock();
+
+	/* Verify empty trie. */
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "stress: structural verify after drain failed\n");
+		goto fail_nounlock;
+	}
+	s = cds_ft_verify_density(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "stress: density verify after drain failed\n");
+		goto fail_nounlock;
+	}
+
+	rcu_barrier();
+	cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	rcu_read_unlock();
+fail_nounlock:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                           MAIN                                     */
@@ -12049,6 +12230,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_density_collapse_explode);
 	RUN_TEST(test_density_remove_through_compress);
 	RUN_TEST(test_density_graft_swap);
+	RUN_TEST(test_density_stress);
 
 	rcu_barrier();
 	rcu_unregister_thread();

@@ -8626,21 +8626,10 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	rcu_assign_pointer(*parent_slot, top_flag);
 
 	/*
-	 * 6. Density: propagate each new node at its actual depth.
-	 *
-	 * The old compressed node at node_depth is replaced by the
-	 * prefix (or junction if diverge_pos == 0): net 0 at
-	 * node_depth.  The junction, old suffix, and new branch
-	 * are NEW nodes at deeper depths.
-	 *
-	 * This is critical for long compressed paths (e.g. file
-	 * paths): when diverge_pos is large, the junction is deep
-	 * and its density must reach ancestors near the junction
-	 * depth, not the compressed node's original depth.
-	 */
-	/*
-	 * Initialize density counters on all created nodes, bottom-up
-	 * (children first so parents see correct child counters).
+	 * 6. Density: initialize created nodes bottom-up, then
+	 * propagate the per-level contribution change from the old
+	 * compressed node to the new top node (prefix, junction, or
+	 * branch depending on diverge_pos) to all ancestors.
 	 */
 	{
 		int ci;
@@ -8649,28 +8638,10 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 			ft_init_node_density(created[ci]);
 	}
 
-	{
-
-		/*
-		 * Junction: new node at junction_depth.
-		 * If diverge_pos == 0, the junction replaces the old
-		 * compressed node at node_depth (net 0).
-		 */
-		if (diverge_pos > 0 && cn_parent)
-			ft_propagate_node_density_parent(cn_parent,
-				cn_parent_depth, junction_depth,
-				(long) ft_node_readside_footprint(branch_flag));
-		/* Old suffix at junction_depth + 1 (if it exists). */
-		if (suffix_len > 0 && cn_parent)
-			ft_propagate_node_density_parent(cn_parent,
-				cn_parent_depth, junction_depth + 1,
-				(long) ft_node_readside_footprint(old_suffix_flag));
-		/* New branch at junction_depth + 1 (if it exists). */
-		if (new_len > 0 && cn_parent)
-			ft_propagate_node_density_parent(cn_parent,
-				cn_parent_depth, junction_depth + 1,
-				(long) ft_node_readside_footprint(new_branch_flag));
-	}
+	/*
+	 * Density propagation is done by the caller after ft_set_parent
+	 * establishes the top node's parent pointer.
+	 */
 
 	/* 7. Free the old compressed node. */
 	free_compressed_node(ft, cn);
@@ -9268,6 +9239,18 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 		struct cds_ft_node *node)
 {
 	int dret;
+	/* Save old compressed node's density before split frees it. */
+	unsigned long old_cn_density[FT_NODE_DENSITY_DEPTH];
+	unsigned int old_cn_fp = ft_node_readside_footprint(d->nf);
+	{
+		struct cds_ft_metadata *old_meta =
+			cds_ft_item_to_metadata(
+				ft_node_ptr(d->nf));
+		unsigned int di;
+
+		for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
+			old_cn_density[di] = ft_density_get(old_meta, di);
+	}
 
 	dret = ft_split_compressed_insert(ft,
 		d->nfp, d->nf, iter_key, remaining,
@@ -9275,6 +9258,22 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 	if (dret)
 		return dret;
 	ft_set_parent(*d->nfp, d->pnf, d->nfp);
+
+	/*
+	 * Propagate per-level density change: old compressed node
+	 * replaced by the new top node at the same depth.
+	 */
+	{
+		struct cds_ft_inode_flag *top = *d->nfp;
+
+		ft_propagate_density_replace(
+			top, d->depth,
+			old_cn_density, old_cn_fp,
+			ft_flag_to_metadata(top),
+			ft_node_readside_footprint(top),
+			NULL, 0);
+	}
+
 	ft_propagate_external_count_parent(d->pnf, 1);
 	return 0;
 }
