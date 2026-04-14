@@ -1477,9 +1477,50 @@ bool ft_node_skip_compressed(struct cds_ft_inode_flag *node __attribute__((unuse
 }
 
 static inline
+unsigned int ft_skip_len(struct cds_ft_inode_flag *node __attribute__((unused)))
+{
+	return 0;
+}
+
+static inline
+struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
+{
+	return node;
+}
+
+static
+struct cds_ft_inode_flag *ft_skip_compressed_flag(
+		struct cds_ft_inode_flag *child,
+		unsigned int len __attribute__((unused)))
+{
+	return child;
+}
+
+static inline
+struct cds_ft_compressed_node *ft_skip_to_compressed(
+		struct cds_ft_inode_flag *skip_ptr)
+{
+	return ft_compressed_node_ptr(skip_ptr);
+}
+
+static inline
 bool ft_group_skip_compressed(const struct cds_ft_group *group __attribute__((unused)))
 {
 	return false;
+}
+
+static inline
+void ft_set_skip_slot(struct cds_ft_metadata *meta __attribute__((unused)),
+		struct cds_ft_inode_flag **slot __attribute__((unused)))
+{
+}
+
+static inline
+struct cds_ft_inode_flag **ft_get_skip_slot(
+		const struct cds_ft_metadata *meta __attribute__((unused)),
+		struct cds_ft *ft __attribute__((unused)))
+{
+	return NULL;
 }
 #endif /* FEATURE_FT_SKIP_COMPRESSED */
 
@@ -15241,7 +15282,7 @@ enum cds_ft_status cds_ft_attr_set_flags(struct cds_ft_attr *attr,
 {
 #ifndef FEATURE_FT_SKIP_COMPRESSED
 	if (flags & CDS_FT_FLAG_SKIP_COMPRESSED)
-		return CDS_FT_STATUS_ERROR;
+		return CDS_FT_STATUS_NOT_SUPPORTED;
 #endif
 	attr->flags = flags;
 	return CDS_FT_STATUS_OK;
@@ -16383,6 +16424,8 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 		return "Destination already populated";
 	case CDS_FT_STATUS_INTEGRITY_ERROR:
 		return "Integrity verification failure";
+	case CDS_FT_STATUS_NOT_SUPPORTED:
+		return "Feature not compiled in";
 
 	default:
 		return "Unknown status value";

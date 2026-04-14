@@ -298,7 +298,8 @@ enum cds_ft_status {
 	CDS_FT_STATUS_OVERFLOW_ERROR		= -3,	/* Buffer too small for key length. */
 	CDS_FT_STATUS_BUSY_ERROR		= -4,	/* Resource busy. */
 	CDS_FT_STATUS_POPULATED_ERROR		= -5,	/* Destination already populated. */
-	CDS_FT_STATUS_INTEGRITY_ERROR		= -6	/* Integrity verification failure. */
+	CDS_FT_STATUS_INTEGRITY_ERROR		= -6,	/* Integrity verification failure. */
+	CDS_FT_STATUS_NOT_SUPPORTED		= -7	/* Feature not compiled in. */
 };
 
 /*
