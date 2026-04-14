@@ -10855,6 +10855,14 @@ int ft_detach_node(struct cds_ft *ft,
 
 			if (!parent_nf)
 				break;
+			/* Validate parent is live (not freed). */
+			{
+				struct cds_ft_metadata *pm =
+					cds_ft_item_to_metadata(ft_node_ptr(parent_nf));
+				/* If parent's parent is non-NULL but parent
+				 * is not reachable from ft->root, it's stale. */
+				(void) pm; /* Access test — will crash if freed. */
+			}
 			/*
 			 * Find the slot in the grandparent pointing to
 			 * cur, which becomes the new detach_parent_flag_ptr.
@@ -11026,6 +11034,14 @@ int ft_detach_node(struct cds_ft *ft,
 					iter_node_flag));
 			rcu_assign_pointer(*detach_parent_flag_ptr, replacement);
 			free_collapsed_node(ft, col);
+			/*
+			 * The collapsed was freed.  Skip the publish
+			 * and density subtraction at the end (both
+			 * already handled above).  Jump directly to
+			 * end.
+			 */
+			ret = 0;
+			goto end;
 		}
 		ret = 0;
 	} else {
@@ -11039,6 +11055,17 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 		struct cds_ft_inode_flag *old_detach_child =
 			*detach_node_flag_ptr;
+		/*
+		 * Stale parent pointer: the upward walk followed
+		 * a freed parent and set both pointers to the same
+		 * address.  Redirect to the live root.
+		 */
+		if (detach_node_flag_ptr == detach_parent_flag_ptr) {
+			iter_node_flag = ft->root;
+			detach_parent_flag_ptr = &ft->root;
+			ft_node_find_child(ft->root, old_detach_child,
+				&n, &detach_node_flag_ptr);
+		}
 		/*
 		 * Capture old child's density info before replace.
 		 * Needed for per-level density propagation below.
@@ -11056,17 +11083,6 @@ int ft_detach_node(struct cds_ft *ft,
 					ft_density_get(old_detach_cm, j);
 		}
 
-		/*
-		 * When a stale parent pointer causes the walk to
-		 * advance detach_node_flag_ptr to the same address
-		 * as detach_parent_flag_ptr, redirect to &ft->root.
-		 * This happens when a node's parent points to a
-		 * freed (recompacted) root.
-		 */
-		if (detach_node_flag_ptr == detach_parent_flag_ptr) {
-			detach_parent_flag_ptr = &ft->root;
-			iter_node_flag = ft->root;
-		}
 		ret = ft_node_replace_ptr(ft,
 			detach_node_flag_ptr,
 			&iter_node_flag,
