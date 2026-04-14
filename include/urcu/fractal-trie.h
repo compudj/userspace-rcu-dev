@@ -297,7 +297,8 @@ enum cds_ft_status {
 	CDS_FT_STATUS_MEMORY_ERROR		= -2,	/* Memory allocation failure. */
 	CDS_FT_STATUS_OVERFLOW_ERROR		= -3,	/* Buffer too small for key length. */
 	CDS_FT_STATUS_BUSY_ERROR		= -4,	/* Resource busy. */
-	CDS_FT_STATUS_POPULATED_ERROR		= -5	/* Destination already populated. */
+	CDS_FT_STATUS_POPULATED_ERROR		= -5,	/* Destination already populated. */
+	CDS_FT_STATUS_INTEGRITY_ERROR		= -6	/* Integrity verification failure. */
 };
 
 /*
@@ -1899,6 +1900,32 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t 
 /*
  * Diagnostics
  */
+
+/*
+ * cds_ft_verify - Verify integrity of the entire Fractal Trie.
+ * @ft: The Fractal Trie.
+ * @out: File stream for diagnostic output on failure (may be NULL
+ *       to suppress output).
+ *
+ * Recursively walks every internal, compressed, and collapsed node
+ * starting from the root, checking that:
+ * - nr_child matches the actual count of non-NULL child slots.
+ * - nr_keys equals the sum of children's nr_keys plus the count
+ *   of unique keys from local external node chains.
+ * - Parent pointers of children point back to the correct parent.
+ * - Compressed node invariants (len >= 1, no external_nodes on
+ *   the compressed node itself).
+ * - Collapsed node invariants (live entries consistent).
+ *
+ * Density counters are not verified: they are maintained
+ * incrementally and serve as a heuristic for collapse decisions.
+ *
+ * Must be called with mutual exclusion wrt updaters.
+ *
+ * Returns CDS_FT_STATUS_OK if the trie passes all checks, or
+ * CDS_FT_STATUS_INTEGRITY_ERROR on integrity violation.
+ */
+enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
 
 /*
  * cds_ft_show - Print content of the Fractal Trie.
