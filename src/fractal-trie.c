@@ -9419,15 +9419,27 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		br_meta = cds_ft_item_to_metadata(ft_node_ptr(branch));
 		ft_metadata_set_external_nodes(branch, br_meta,
 			(struct cds_ft_node *) cn->child);
-		ft_nr_keys_store(br_meta, 2, CMM_RELAXED);
+		/*
+		 * Count only the pre-existing key (old external from
+		 * the compressed child).  The new key's +1 is added
+		 * by ft_propagate_external_count_parent below.
+		 */
+		ft_nr_keys_store(br_meta, 1, CMM_RELAXED);
 		ft_init_node_density(branch);
 	}
 	ft_set_parent(branch, d->nf, &cn->child);
 	ft_publish_to_parent(ft, d->nf, &cn->child, branch);
-	/* Propagate density for the new branch node. */
-	ft_propagate_node_density_parent(branch,
-		d->depth + cn->len, d->depth + cn->len,
-		(long) ft_node_readside_footprint(branch));
+	/*
+	 * Propagate density: the old child was an external (zero
+	 * footprint, zero density).  The new branch has its own
+	 * footprint plus subtree density from ft_init_node_density.
+	 * Use ft_propagate_density_replace to propagate the full
+	 * density profile, not just the node's own footprint.
+	 */
+	ft_propagate_density_replace(branch, d->depth + cn->len,
+		NULL, 0,
+		br_meta, ft_node_readside_footprint(branch),
+		NULL, 0);
 	ft_propagate_external_count_parent(branch, 1);
 	return 0;
 }
