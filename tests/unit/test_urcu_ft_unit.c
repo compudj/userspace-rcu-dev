@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 162
+#define NR_TESTS 163
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -11646,6 +11646,171 @@ static int test_density_remove_through_compress(void)
 	return 0;
 }
 
+/*
+ * Density counter verification: graft-swap.
+ *
+ * Exercises cds_ft_graft_swap with density verification on both
+ * the destination and swap tries before and after each swap.
+ *
+ * Phase 1: swap into empty destination slot.
+ * Phase 2: swap replacing existing content.
+ * Phase 3: swap at root level.
+ */
+static int test_density_graft_swap(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	enum cds_ft_status s;
+	unsigned int i;
+
+	if (cds_ft_group_create(NULL, &group) < 0)
+		return -1;
+	if (cds_ft_create(group, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	/* Populate live trie with keys under prefix "a". */
+	for (i = 0; i < 5; i++) {
+		uint8_t k[2] = { 'a', (uint8_t)('0' + i) };
+
+		s = cds_ft_insert(live, k, 2, &node_alloc(0xa030 + i)->node);
+		if (s < 0) goto fail;
+	}
+
+	/* Populate swap trie with keys (become "x" + key after swap). */
+	for (i = 0; i < 3; i++) {
+		uint8_t k[2] = { 'b', (uint8_t)('0' + i) };
+
+		s = cds_ft_insert(swap, k, 2, &node_alloc(0xb030 + i)->node);
+		if (s < 0) goto fail;
+	}
+
+	/*
+	 * Phase 1: graft swap content into live at prefix "x".
+	 * Use cds_ft_graft (not graft_swap) for the initial graft
+	 * into an empty slot, because graft_swap assumes the slot
+	 * already exists in the parent node.
+	 */
+	s = cds_ft_graft(live, (const uint8_t *)"x", 1, swap);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "density_graft_swap: phase 1 swap failed: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail_nounlock;
+	}
+
+	s = cds_ft_verify(live, stderr);
+	if (s < 0) {
+		fprintf(stderr, "density_graft_swap: live phase 1 structural failed\n");
+		goto fail_nounlock;
+	}
+	s = cds_ft_verify_density(live, stderr);
+	if (s < 0) {
+		fprintf(stderr, "density_graft_swap: live phase 1 density failed\n");
+		cds_ft_show(live, stderr);
+		goto fail_nounlock;
+	}
+	s = cds_ft_verify_density(swap, stderr);
+	if (s < 0) {
+		fprintf(stderr, "density_graft_swap: swap phase 1 density failed\n");
+		cds_ft_show(swap, stderr);
+		goto fail_nounlock;
+	}
+
+	/*
+	 * Phase 2: populate swap with new content, then swap again at "x".
+	 * This replaces live's "x" subtree with the new swap content;
+	 * the old "x" content moves into swap.
+	 */
+	rcu_read_lock();
+	for (i = 0; i < 4; i++) {
+		uint8_t k[2] = { 'c', (uint8_t)('0' + i) };
+
+		s = cds_ft_insert(swap, k, 2, &node_alloc(0xc030 + i)->node);
+		if (s < 0) goto fail;
+	}
+	rcu_read_unlock();
+
+	s = cds_ft_graft_swap(live, (const uint8_t *)"x", 1, swap);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "density_graft_swap: phase 2 swap failed: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail_nounlock;
+	}
+
+	s = cds_ft_verify(live, stderr);
+	if (s < 0) {
+		fprintf(stderr, "density_graft_swap: live phase 2 structural failed\n");
+		goto fail_nounlock;
+	}
+	s = cds_ft_verify_density(live, stderr);
+	if (s < 0) {
+		fprintf(stderr, "density_graft_swap: live phase 2 density failed\n");
+		cds_ft_show(live, stderr);
+		goto fail_nounlock;
+	}
+	s = cds_ft_verify_density(swap, stderr);
+	if (s < 0) {
+		fprintf(stderr, "density_graft_swap: swap phase 2 density failed (old content)\n");
+		cds_ft_show(swap, stderr);
+		goto fail_nounlock;
+	}
+
+	/*
+	 * Phase 3: root-level graft-swap.  Exchange entire live trie
+	 * content with swap trie content.
+	 */
+	s = cds_ft_graft_swap(live, NULL, 0, swap);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "density_graft_swap: phase 3 root swap failed: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail_nounlock;
+	}
+
+	s = cds_ft_verify(live, stderr);
+	if (s < 0) {
+		fprintf(stderr, "density_graft_swap: live phase 3 structural failed\n");
+		goto fail_nounlock;
+	}
+	s = cds_ft_verify_density(live, stderr);
+	if (s < 0) {
+		fprintf(stderr, "density_graft_swap: live phase 3 density failed\n");
+		cds_ft_show(live, stderr);
+		goto fail_nounlock;
+	}
+	s = cds_ft_verify_density(swap, stderr);
+	if (s < 0) {
+		fprintf(stderr, "density_graft_swap: swap phase 3 density failed\n");
+		cds_ft_show(swap, stderr);
+		goto fail_nounlock;
+	}
+
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	rcu_read_unlock();
+fail_nounlock:
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                           MAIN                                     */
@@ -11883,6 +12048,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_density_recompact_full);
 	RUN_TEST(test_density_collapse_explode);
 	RUN_TEST(test_density_remove_through_compress);
+	RUN_TEST(test_density_graft_swap);
 
 	rcu_barrier();
 	rcu_unregister_thread();
