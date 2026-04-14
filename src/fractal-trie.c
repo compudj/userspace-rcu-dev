@@ -1962,6 +1962,7 @@ struct ft_detach_descent {
 	struct ft_descent d;
 	struct cds_ft_inode_flag **det_nfp;	/* Detach-point node slot. */
 	struct cds_ft_inode_flag **det_pfp;	/* Detach-point parent slot. */
+	unsigned int det_depth;			/* Depth of *det_nfp when captured. */
 	bool pending;				/* Waiting to capture det_nfp. */
 };
 
@@ -1972,6 +1973,7 @@ void ft_detach_descent_init(struct ft_detach_descent *dd,
 	ft_descent_init(&dd->d, ft);
 	dd->det_nfp = NULL;
 	dd->det_pfp = &ft->root;
+	dd->det_depth = 0;
 	dd->pending = true;
 }
 
@@ -8394,6 +8396,34 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 						col_absorbed[ai]);
 				free_cds_ft_node(ft, ft_node_ptr(node_flag));
 				/*
+				 * Update parent pointers on the collapsed
+				 * entries' children to point to the new
+				 * collapsed node.  Without this, subsequent
+				 * density propagation from children would
+				 * follow stale parent pointers.
+				 */
+				{
+					struct cds_ft_collapsed_node *_col =
+						ft_collapsed_node_ptr(col_flag);
+					unsigned int _nr_e =
+						ft_collapsed_nr_entries(_col);
+					struct cds_ft_inode_flag **_cptrs =
+						ft_collapsed_ptrs(_col, _nr_e);
+					unsigned int _e;
+
+					for (_e = 0; _e < ft_collapsed_count(_nr_e); _e++) {
+						uint8_t _data = ft_collapsed_load_data(_col, _e);
+
+						if (ft_collapsed_entry_dead(_data, _nr_e))
+							continue;
+						if (!ft_node_ptr(_cptrs[_e]) ||
+						    ft_node_external(_cptrs[_e]))
+							continue;
+						ft_set_parent(_cptrs[_e], col_flag,
+							&_cptrs[_e]);
+					}
+				}
+				/*
 				 * Recompute density for the new collapsed
 				 * node: the absorbed intermediate nodes are
 				 * gone, only entries' children remain.
@@ -9223,9 +9253,10 @@ publish_done:
 		for (cn_idx = 0; cn_idx < nr_created_nodes; cn_idx++)
 			ft_init_node_density(created_nodes[cn_idx]);
 		top_meta = ft_flag_to_metadata(top_node);
-		ft_propagate_node_density_parent(top_node, level,
-			level, (long)(ft_node_readside_footprint(top_node)
-				+ ft_density_get(top_meta, 0)));
+		ft_propagate_density_replace(top_node, level,
+			NULL, 0,
+			top_meta, ft_node_readside_footprint(top_node),
+			NULL, 0);
 	}
 
 	/* Success */
@@ -9304,6 +9335,7 @@ void ft_detach_descent_track(struct ft_detach_descent *dd,
 		 */
 		dd->det_nfp = dd->d.nfp;
 		dd->det_pfp = dd->d.pnfp;
+		dd->det_depth = dd->d.depth;
 		dd->pending = false;
 	}
 }
@@ -9322,6 +9354,7 @@ struct cds_ft_inode_flag *ft_detach_descent_step(
 	nf = ft_descent_step(&dd->d, key_value);
 	if (nf && dd->pending) {
 		dd->det_nfp = dd->d.nfp;
+		dd->det_depth = dd->d.depth;
 		dd->pending = false;
 	}
 	return nf;
@@ -10922,7 +10955,27 @@ int ft_detach_node(struct cds_ft *ft,
 		 * Collapsed parent: tombstone the entry pointing to
 		 * the detached child, and set the child pointer to
 		 * the topmost_external_nodes (or NULL).
+		 *
+		 * Capture the detached child's density for per-level
+		 * subtraction below (same as the non-collapsed path).
 		 */
+		{
+			struct cds_ft_inode_flag *detach_child =
+				*detach_node_flag_ptr;
+
+			if (ft_node_ptr(detach_child) &&
+			    !ft_node_external(detach_child)) {
+				unsigned int j;
+
+				old_detach_cm = cds_ft_item_to_metadata(
+					ft_node_ptr(detach_child));
+				old_detach_fp = ft_node_readside_footprint(
+					detach_child);
+				for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
+					old_detach_density[j] =
+						ft_density_get(old_detach_cm, j);
+			}
+		}
 		struct cds_ft_collapsed_node *col =
 			ft_collapsed_node_ptr(iter_node_flag);
 		struct cds_ft_metadata *col_meta =
@@ -11197,6 +11250,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
 			if (ft_node_ptr(dd.d.nf) && dd.pending) {
 				dd.det_nfp = dd.d.nfp;
+				dd.det_depth = dd.d.depth;
 				dd.pending = false;
 			}
 			continue;
@@ -11361,7 +11415,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ret = ft_detach_node(ft,
 					dd.det_nfp,
 					dd.det_pfp,
-					dd.d.depth);
+					dd.det_depth);
 			if (ret) {
 				/* Undo propagation on failure. */
 				ft_propagate_external_count_parent(dd.d.pnf, 1);
@@ -11488,6 +11542,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
 			if (ft_node_ptr(dd.d.nf) && dd.pending) {
 				dd.det_nfp = dd.d.nfp;
+				dd.det_depth = dd.d.depth;
 				dd.pending = false;
 			}
 			continue;
@@ -11602,7 +11657,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ret = ft_detach_node(ft,
 				dd.det_nfp,
 				dd.det_pfp,
-				dd.d.depth);
+				dd.det_depth);
 		if (ret) {
 			/* Undo propagation on failure. */
 			ft_propagate_external_count_parent(dd.d.pnf, 1);
@@ -13031,7 +13086,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				int ret = ft_detach_node(ft,
 							 dd.det_nfp,
 							 dd.det_pfp,
-							 key_len);
+							 dd.det_depth);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*
