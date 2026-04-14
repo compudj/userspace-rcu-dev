@@ -8396,33 +8396,10 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 						col_absorbed[ai]);
 				free_cds_ft_node(ft, ft_node_ptr(node_flag));
 				/*
-				 * Update parent pointers on the collapsed
-				 * entries' children to point to the new
-				 * collapsed node.  Without this, subsequent
-				 * density propagation from children would
-				 * follow stale parent pointers.
+				 * Entry reparenting (parent + skip_slot) was
+				 * already done inside ft_try_collapse_at_node
+				 * after skip-compressed conversion.
 				 */
-				{
-					struct cds_ft_collapsed_node *_col =
-						ft_collapsed_node_ptr(col_flag);
-					unsigned int _nr_e =
-						ft_collapsed_nr_entries(_col);
-					struct cds_ft_inode_flag **_cptrs =
-						ft_collapsed_ptrs(_col, _nr_e);
-					unsigned int _e;
-
-					for (_e = 0; _e < ft_collapsed_count(_nr_e); _e++) {
-						uint8_t _data = ft_collapsed_load_data(_col, _e);
-
-						if (ft_collapsed_entry_dead(_data, _nr_e))
-							continue;
-						if (!ft_node_ptr(_cptrs[_e]) ||
-						    ft_node_external(_cptrs[_e]))
-							continue;
-						ft_set_parent(_cptrs[_e], col_flag,
-							&_cptrs[_e]);
-					}
-				}
 				/*
 				 * Recompute density for the new collapsed
 				 * node: the absorbed intermediate nodes are
