@@ -10862,14 +10862,6 @@ int ft_detach_node(struct cds_ft *ft,
 
 			if (!parent_nf)
 				break;
-			/* Validate parent is live (not freed). */
-			{
-				struct cds_ft_metadata *pm =
-					cds_ft_item_to_metadata(ft_node_ptr(parent_nf));
-				/* If parent's parent is non-NULL but parent
-				 * is not reachable from ft->root, it's stale. */
-				(void) pm; /* Access test — will crash if freed. */
-			}
 			/*
 			 * Find the slot in the grandparent pointing to
 			 * cur, which becomes the new detach_parent_flag_ptr.
@@ -11042,11 +11034,11 @@ int ft_detach_node(struct cds_ft *ft,
 			rcu_assign_pointer(*detach_parent_flag_ptr, replacement);
 			free_collapsed_node(ft, col);
 			/*
-			 * The collapsed was freed.  Skip the publish
-			 * and density subtraction at the end (both
-			 * already handled above).  Jump directly to
-			 * end.
+			 * The collapsed was freed.  Prevent the
+			 * density subtraction at the end from
+			 * accessing the freed iter_node_flag.
 			 */
+			old_detach_cm = NULL;
 			ret = 0;
 			goto end;
 		}

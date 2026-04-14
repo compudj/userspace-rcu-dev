@@ -350,11 +350,34 @@ void cds_ft_free_item(struct cds_ft_metadata *metadata)
 {
 	struct cds_ft_metadata_alloc *metadata_alloc =
 		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
-	struct cds_ft_alloc_range *range = cds_ft_metadata_to_range(&metadata_alloc->metadata);
-	struct cds_ft_alloc_arena *arena = range->arena;
-	const struct rcu_flavor_struct *flavor = arena->ft_group->flavor;
+#ifdef FT_IMMEDIATE_FREE
+	/*
+	 * Immediate free for use-after-free detection.
+	 * Free extended density, then poison the metadata
+	 * and node data so any subsequent access crashes
+	 * deterministically.  Do NOT return to the free list.
+	 */
+	if (metadata_alloc->metadata.nr_keys == UINT32_MAX)
+		free(metadata_alloc->metadata.density_ext);
+	{
+		struct cds_ft_alloc_range *range =
+			cds_ft_metadata_to_range(metadata);
+		struct cds_ft_alloc_arena *arena = range->arena;
+		size_t item_len = 1UL << arena->item_len_order;
+		void *item = cds_ft_metadata_to_item(metadata);
 
-	flavor->update_call_rcu(&metadata_alloc->rcu_head, cds_ft_free_item_rcu);
+		memset(item, 0xfe, item_len);
+		memset(metadata_alloc, 0xfe, sizeof(*metadata_alloc));
+	}
+#else
+	{
+		struct cds_ft_alloc_range *range = cds_ft_metadata_to_range(&metadata_alloc->metadata);
+		struct cds_ft_alloc_arena *arena = range->arena;
+		const struct rcu_flavor_struct *flavor = arena->ft_group->flavor;
+
+		flavor->update_call_rcu(&metadata_alloc->rcu_head, cds_ft_free_item_rcu);
+	}
+#endif
 }
 
 void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
