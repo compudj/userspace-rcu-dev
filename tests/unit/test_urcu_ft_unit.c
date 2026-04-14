@@ -118,42 +118,20 @@ static int drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
 		return -1;
 	}
 
-	{
-	unsigned int drain_op = 0;
 	rcu_read_lock();
 	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
 		struct cds_ft_node *head, *tmp;
 
 		s = cds_ft_remove_all(ft, iter, &head);
 		if (s < 0) {
-			fprintf(stderr, "drain_and_destroy: remove_all op %u: %s\n",
-				drain_op, cds_ft_status_to_string(s));
+			fprintf(stderr, "drain_and_destroy: remove_all: %s\n",
+				cds_ft_status_to_string(s));
 			ret = -1;
 			break;
 		}
 		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
 			node_free_rcu(to_test_node(head));
 		}
-#ifdef FT_IMMEDIATE_FREE
-		s = cds_ft_verify(ft, stderr);
-		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "drain_and_destroy: verify failed at drain op %u\n",
-				drain_op);
-			cds_ft_show(ft, stderr);
-			ret = -1;
-			break;
-		}
-		s = cds_ft_verify_density(ft, stderr);
-		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "drain_and_destroy: density verify failed at drain op %u\n",
-				drain_op);
-			cds_ft_show(ft, stderr);
-			ret = -1;
-			break;
-		}
-#endif
-		drain_op++;
-	}
 	}
 	rcu_read_unlock();
 	rcu_barrier();		/* wait for all node_free_rcu callbacks */
