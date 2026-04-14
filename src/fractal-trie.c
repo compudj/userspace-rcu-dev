@@ -1243,6 +1243,8 @@ static void ft_density_promote(struct cds_ft_metadata *m);
 static inline unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m);
 static inline unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m);
 static inline void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo);
+static void ft_propagate_node_density_parent(struct cds_ft_inode_flag *start,
+		unsigned int start_depth, unsigned int node_depth, long delta);
 
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
@@ -3798,7 +3800,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		struct cds_ft_inode_flag *child_node_flag,
 		struct cds_ft_inode_flag **nullify_node_flag_ptr,
 		struct cds_ft_inode **old_node_ret,
-		bool is_root)
+		bool is_root,
+		unsigned int node_depth)
 {
 	unsigned int new_type_index;
 	struct cds_ft_inode *new_node;
@@ -4157,6 +4160,18 @@ skip_copy:
 	if (old_node && old_node_ret)
 		*old_node_ret = old_node;
 
+	/*
+	 * Propagate footprint change to ancestors when the node
+	 * changes type.  Density tracks readside footprint, not
+	 * hop count — a type change alters the footprint.
+	 */
+	if (old_type->order != new_type->order) {
+		long fp_delta = (long) (1U << (new_type->order - 4))
+			      - (long) (1U << (old_type->order - 4));
+		ft_propagate_node_density_parent(new_node_flag,
+			node_depth, node_depth, fp_delta);
+	}
+
 	ret = 0;
 end:
 	return ret;
@@ -4244,7 +4259,8 @@ int ft_node_set_nth(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag, uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
 		struct cds_ft_inode **old_node_ret,
-		struct cds_ft_metadata *metadata)
+		struct cds_ft_metadata *metadata,
+		unsigned int node_depth)
 {
 	int ret;
 	unsigned int type_index;
@@ -4262,13 +4278,13 @@ int ft_node_set_nth(struct cds_ft *ft,
 		/* Not enough space in node, need to recompact to next type. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					old_node_ret, false);
+					old_node_ret, false, node_depth);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					old_node_ret, false);
+					old_node_ret, false, node_depth);
 		break;
 	}
 	return ret;
@@ -4285,7 +4301,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		struct cds_ft_metadata *metadata,			/* of parent */
 		uint8_t n,
 		struct cds_ft_inode_flag *newptr,
-		bool is_root)
+		bool is_root,
+		unsigned int node_depth)
 {
 	int ret;
 	unsigned int type_index;
@@ -4304,7 +4321,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		/* Should try recompaction. */
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
-				node_flag_ptr, old_node_ret, is_root);
+				node_flag_ptr, old_node_ret, is_root, node_depth);
 	}
 	return ret;
 }
@@ -7271,7 +7288,8 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
  * @start: deepest ancestor with metadata on the path.
  * @start_depth: trie depth of @start.
  * @node_depth: depth of the created/destroyed node.
- * @delta: +1 for creation, -1 for destruction.
+ * @delta: readside footprint change in 16-byte units (positive for
+ *   creation/growth, negative for destruction/shrinkage).
  *
  * Only called from the write-side (mutex-held).
  */
@@ -8333,7 +8351,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		struct cds_ft_inode_flag *dest = NULL;
 
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[diverge_pos + 1],
-				cn->child, NULL, NULL);
+				cn->child, NULL, NULL, junction_depth + 1);
 		if (ret) goto error;
 		{
 			struct cds_ft_metadata *m =
@@ -8373,7 +8391,8 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 		ret = ft_node_set_nth(ft, &dest,
 				iter_key[diverge_pos + 1],
-				(struct cds_ft_inode_flag *) child_node, NULL, NULL);
+				(struct cds_ft_inode_flag *) child_node, NULL, NULL,
+				junction_depth + 1);
 		if (ret) goto error;
 		{
 			struct cds_ft_metadata *m =
@@ -8393,7 +8412,8 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		struct cds_ft_metadata *branch_meta;
 
 		/* First child: old direction. */
-		ret = ft_node_set_nth(ft, &dest, old_ordinal, old_suffix_flag, NULL, NULL);
+		ret = ft_node_set_nth(ft, &dest, old_ordinal, old_suffix_flag, NULL, NULL,
+				junction_depth);
 		if (ret) goto error;
 		created[nr_created++] = dest;
 		branch_flag = dest;
@@ -8404,7 +8424,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 			branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 			ret = ft_node_set_nth(ft, &dest, new_ordinal, new_branch_flag,
-					&old_recompacted, branch_meta);
+					&old_recompacted, branch_meta, junction_depth);
 			if (ret) goto error;
 			if (old_recompacted) {
 				free_cds_ft_node(ft, old_recompacted);
@@ -8442,7 +8462,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		struct cds_ft_metadata *pfx_meta;
 
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				branch_flag, NULL, NULL);
+				branch_flag, NULL, NULL, node_depth);
 		if (ret) goto error;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
@@ -8555,7 +8575,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		struct cds_ft_inode_flag *compressed_flag,
 		unsigned int remaining,
 		struct cds_ft_inode_flag **top_ret,
-		struct cds_ft_inode_flag **jct_ret)
+		struct cds_ft_inode_flag **jct_ret,
+		unsigned int node_depth)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
 	struct cds_ft_metadata *cn_meta =
@@ -8602,7 +8623,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining + 1],
-			cn->child, NULL, NULL);
+			cn->child, NULL, NULL,
+			node_depth + remaining + 1);
 		if (ret) goto error;
 		{
 			struct cds_ft_metadata *m =
@@ -8623,7 +8645,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining],
-			suffix_flag, NULL, NULL);
+			suffix_flag, NULL, NULL,
+			node_depth + remaining);
 		if (ret) goto error;
 		jct_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(jct_meta, child_nr_keys,
@@ -8657,7 +8680,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		struct cds_ft_metadata *pfx_meta;
 
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-			jct_flag, NULL, NULL);
+			jct_flag, NULL, NULL, node_depth);
 		if (ret) goto error;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
@@ -8767,13 +8790,15 @@ struct cds_ft_inode_flag *ft_try_compress_chain(
 static struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		const uint8_t *ordinals, unsigned int len,
 		struct cds_ft_inode_flag *child,
-		unsigned long nr_keys);
+		unsigned long nr_keys,
+		unsigned int base_depth);
 
 static struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		struct cds_ft_collapsed_node *col,
 		struct cds_ft_inode_flag **cptrs,
 		unsigned int start, unsigned int end,
-		unsigned int suffix_offset);
+		unsigned int suffix_offset,
+		unsigned int collapse_depth);
 
 static
 int ft_attach_node(struct cds_ft *ft,
@@ -8836,7 +8861,8 @@ int ft_attach_node(struct cds_ft *ft,
 			dbg_printf("branch creation level %d, key %u\n",
 					i, (unsigned int) key_value);
 			iter_dest_node_flag = NULL;
-			ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag, NULL, NULL);
+			ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag, NULL, NULL,
+					i - 1);
 			if (ret) {
 				dbg_printf("branch creation error %d\n", ret);
 				goto check_error;
@@ -8893,7 +8919,7 @@ int ft_attach_node(struct cds_ft *ft,
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
 		ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag,
-				&old_recompacted_node, metadata);
+				&old_recompacted_node, metadata, level - 1);
 		if (ret) {
 			dbg_printf("branch publish error %d\n", ret);
 			goto check_error;
@@ -9131,7 +9157,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	int sret;
 
 	sret = ft_split_compressed_key_shorter(ft,
-		d->nf, remaining, &top_flag, &jct_flag);
+		d->nf, remaining, &top_flag, &jct_flag, d->depth);
 	if (sret)
 		return sret;
 	ft_set_parent(top_flag, d->pnf, d->nfp);
@@ -9275,7 +9301,8 @@ static
 struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		const uint8_t *ordinals, unsigned int len,
 		struct cds_ft_inode_flag *child,
-		unsigned long nr_keys)
+		unsigned long nr_keys,
+		unsigned int base_depth)
 {
 #ifdef FEATURE_FT_COMPRESS
 	if (len >= 2) {
@@ -9306,7 +9333,7 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 			int ret;
 
 			ret = ft_node_set_nth(ft, &dest, ordinals[i],
-				cur, NULL, NULL);
+				cur, NULL, NULL, base_depth + i);
 			if (ret) {
 				/* Cleanup on failure. */
 				while (cur != child) {
@@ -9356,7 +9383,8 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		struct cds_ft_collapsed_node *col,
 		struct cds_ft_inode_flag **cptrs,
 		unsigned int start, unsigned int end,
-		unsigned int suffix_offset)
+		unsigned int suffix_offset,
+		unsigned int collapse_depth)
 {
 	unsigned int count = end - start;
 	unsigned int nr_e = ft_collapsed_nr_entries(col);
@@ -9398,7 +9426,8 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		}
 		return ft_build_ordinal_chain(ft,
 			sfx + suffix_offset, slen - suffix_offset,
-			child, child_nr_keys);
+			child, child_nr_keys,
+			collapse_depth + suffix_offset);
 	}
 
 	/* Multiple entries: group by byte at suffix_offset. */
@@ -9440,7 +9469,8 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 
 			sub = ft_explode_entries(ft, col, cptrs,
 					i, group_end,
-					suffix_offset + 1);
+					suffix_offset + 1,
+					collapse_depth);
 			if (!sub) {
 				i = group_end;
 				continue;	/* Skip tombstoned/empty group. */
@@ -9455,7 +9485,8 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 					internal_flag ?
 						cds_ft_item_to_metadata(
 							ft_node_ptr(internal_flag))
-						: NULL);
+						: NULL,
+					collapse_depth + suffix_offset);
 				if (ret)
 					return NULL;
 				if (old_recompacted)
@@ -9496,7 +9527,8 @@ struct cds_ft_inode_flag *ft_explode_entries(
 		struct cds_ft_inode_flag **cptrs __attribute__((unused)),
 		unsigned int start __attribute__((unused)),
 		unsigned int end __attribute__((unused)),
-		unsigned int suffix_offset __attribute__((unused)))
+		unsigned int suffix_offset __attribute__((unused)),
+		unsigned int collapse_depth __attribute__((unused)))
 {
 	return NULL;
 }
@@ -9756,7 +9788,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 					internal_flag = ft_explode_entries(ft,
 						col, cptrs,
-						0, ft_collapsed_count(ft_collapsed_nr_entries(col)), 0);
+						0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
+						0, d.depth);
 					if (!internal_flag) {
 						ret = -ENOMEM;
 						goto insert_done;
@@ -10596,7 +10629,8 @@ int ft_detach_node(struct cds_ft *ft,
 			&old_recompacted_node,
 			metadata_stack[nr_branch - 1],
 			n, (struct cds_ft_inode_flag *) topmost_external_nodes,
-			detach_parent_flag_ptr == &ft->root);
+			detach_parent_flag_ptr == &ft->root,
+			cur_depth);
 		/*
 		 * Density is updated incrementally by
 		 * ft_propagate_node_density; no full recount needed.
@@ -11301,7 +11335,8 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 
 		ret = ft_node_set_nth(ft, &dest,
 				cn->key_bytes[diverge_pos + 1],
-				cn->child, NULL, NULL);
+				cn->child, NULL, NULL,
+				d->depth + diverge_pos + 1);
 		if (ret) goto error;
 		{
 			struct cds_ft_metadata *m =
@@ -11321,7 +11356,8 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		struct cds_ft_metadata *branch_meta;
 
 		ret = ft_node_set_nth(ft, &dest, old_ordinal,
-				old_suffix_flag, NULL, NULL);
+				old_suffix_flag, NULL, NULL,
+				d->depth + diverge_pos);
 		if (ret) goto error;
 		created[nr_created++] = dest;
 		branch_flag = dest;
@@ -11355,7 +11391,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		struct cds_ft_metadata *pfx_meta;
 
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				branch_flag, NULL, NULL);
+				branch_flag, NULL, NULL, d->depth);
 		if (ret) goto error;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
@@ -11621,7 +11657,8 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining],
-			cn->child, NULL, NULL);
+			cn->child, NULL, NULL,
+			d->depth + remaining);
 		if (ret) return -1;
 		{
 			struct cds_ft_metadata *m =
@@ -11664,7 +11701,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		int ret;
 
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-			suffix_flag, NULL, NULL);
+			suffix_flag, NULL, NULL, d->depth);
 		if (ret) {
 			if (ft_node_compressed(suffix_flag))
 				free_compressed_node(ft,
@@ -11749,7 +11786,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 
 			ret = ft_node_set_nth(ft, &dest,
 				key[i],
-				cur, NULL, NULL);
+				cur, NULL, NULL, i);
 			if (ret) {
 				while (cur != leaf) {
 					struct cds_ft_inode_flag *next;
@@ -11841,7 +11878,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		dest = d->pnf;
 		ret = ft_node_set_nth(ft, &dest,
 			key[key_len - 1],
-			graft_payload, &old_recompacted_node, pmeta);
+			graft_payload, &old_recompacted_node, pmeta,
+			d->depth - 1);
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -11885,7 +11923,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 			ret = ft_node_set_nth(ft, &dest,
 				key[i - 1],
-				branch, &old_recompacted_node, pmeta);
+				branch, &old_recompacted_node, pmeta,
+				d->depth - 1);
 			if (ret) {
 				ft_free_branch(ft, key, i, key_len, branch);
 				return CDS_FT_STATUS_MEMORY_ERROR;
@@ -12486,7 +12525,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 					internal_flag = ft_explode_entries(ft,
 						col, cptrs,
-						0, ft_collapsed_count(ft_collapsed_nr_entries(col)), 0);
+						0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
+						0, dd.d.depth);
 					if (!internal_flag)
 						return CDS_FT_STATUS_MEMORY_ERROR;
 					{
