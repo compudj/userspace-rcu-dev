@@ -1928,6 +1928,22 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t 
 enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
 
 /*
+ * cds_ft_verify_density - Verify density counters of the entire Fractal Trie.
+ * @ft: The Fractal Trie.
+ * @out: File stream for diagnostic output on failure (may be NULL).
+ *
+ * Recursively recomputes every node's density counters from its
+ * children and compares with the stored values.  Reports all nodes
+ * with mismatches (does not stop at the first).
+ *
+ * Must be called with mutual exclusion wrt updaters.
+ *
+ * Returns CDS_FT_STATUS_OK if all density counters match, or
+ * CDS_FT_STATUS_INTEGRITY_ERROR if any mismatch is found.
+ */
+enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft, FILE *out);
+
+/*
  * cds_ft_show - Print content of the Fractal Trie.
  * @ft: The Fractal Trie.
  * @out: File stream output.

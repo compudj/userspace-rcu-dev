@@ -1237,14 +1237,18 @@ bool ft_node_collapsed(struct cds_ft_inode_flag *node __attribute__((unused)))
  * parallel; the compiler emits a CMOV, keeping the critical path
  * to 4 cycles.
  */
-/* Forward declarations for nr_keys helpers (defined after density accessors). */
+/* Forward declarations for density and nr_keys helpers (defined after density accessors). */
 static inline bool ft_density_is_extended(const struct cds_ft_metadata *m);
 static void ft_density_promote(struct cds_ft_metadata *m);
+static inline unsigned long ft_density_get(const struct cds_ft_metadata *m, unsigned int idx);
+static inline void ft_density_set(struct cds_ft_metadata *m, unsigned int idx, unsigned long val);
 static inline unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m);
 static inline unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m);
 static inline void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo);
 static void ft_propagate_node_density_parent(struct cds_ft_inode_flag *start,
 		unsigned int start_depth, unsigned int node_depth, long delta);
+static unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag *child_nf);
 
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
@@ -3896,12 +3900,23 @@ retry:		/* for fallback */
 
 		dbg_printf("Recompact inherit from %p\n", metadata);
 		if (metadata) {
+			unsigned int di;
+
 			new_metadata->parent = metadata->parent;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			new_metadata->skip_slot_offset = metadata->skip_slot_offset;
 #endif
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
 			new_metadata->external_nodes = metadata->external_nodes;
+			/*
+			 * Copy density counters before nr_keys: nr_keys
+			 * is the compact/extended discriminator and
+			 * ft_density_set may promote to extended, so the
+			 * values must be written first.
+			 */
+			for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
+				ft_density_set(new_metadata, di,
+					ft_density_get(metadata, di));
 			ft_nr_keys_store(new_metadata,
 				ft_nr_keys_get(metadata), CMM_RELAXED);
 		}
@@ -4164,12 +4179,36 @@ skip_copy:
 	 * Propagate footprint change to ancestors when the node
 	 * changes type.  Density tracks readside footprint, not
 	 * hop count — a type change alters the footprint.
+	 *
+	 * When recompacting to NULL, new_node_flag is NULL and has
+	 * no metadata to walk from.  Use the old metadata's parent
+	 * chain instead, with a negative delta equal to the old
+	 * footprint.
 	 */
-	if (old_type->order != new_type->order) {
+	if (new_type_index != NODE_INDEX_NULL &&
+	    old_type->order != new_type->order) {
 		long fp_delta = (long) (1U << (new_type->order - 4))
 			      - (long) (1U << (old_type->order - 4));
 		ft_propagate_node_density_parent(new_node_flag,
 			node_depth, node_depth, fp_delta);
+	} else if (new_type_index == NODE_INDEX_NULL &&
+		   old_type_index != NODE_INDEX_NULL && metadata) {
+		/*
+		 * Node disappears entirely: subtract its full density
+		 * contribution (own footprint + subtree density[0])
+		 * from ancestors.
+		 */
+		long fp_delta = -((long) (1U << (old_type->order - 4))
+				+ (long) ft_density_get(metadata, 0));
+		struct cds_ft_inode_flag *parent = metadata->parent;
+
+		if (parent) {
+			unsigned int parent_depth =
+				node_depth - ft_parent_depth_span(parent,
+					*old_node_flag_ptr);
+			ft_propagate_node_density_parent(parent,
+				parent_depth, node_depth, fp_delta);
+		}
 	}
 
 	ret = 0;
@@ -10623,6 +10662,27 @@ int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag *old_detach_child =
 			*detach_node_flag_ptr;
 
+		/*
+		 * Before replacing: collect the removed child's density
+		 * contribution for propagation below.
+		 */
+		unsigned long detach_child_density = 0;
+
+		{
+			struct cds_ft_inode_flag *removed_child =
+				*detach_node_flag_ptr;
+
+			if (ft_node_ptr(removed_child) &&
+			    !ft_node_external(removed_child)) {
+				struct cds_ft_metadata *rm =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(removed_child));
+				detach_child_density = (unsigned long)
+					ft_node_readside_footprint(removed_child)
+					+ ft_density_get(rm, 0);
+			}
+		}
+
 		ret = ft_node_replace_ptr(ft,
 			detach_node_flag_ptr,
 			&iter_node_flag,
@@ -10632,9 +10692,19 @@ int ft_detach_node(struct cds_ft *ft,
 			detach_parent_flag_ptr == &ft->root,
 			cur_depth);
 		/*
-		 * Density is updated incrementally by
-		 * ft_propagate_node_density; no full recount needed.
+		 * Propagate density removal for the detached child.
+		 * The child (and its subtree) was removed from the
+		 * surviving parent; subtract its full contribution.
+		 * Use iter_node_flag which points to the surviving
+		 * parent after any recompact.
 		 */
+		if (!ret && detach_child_density > 0) {
+			unsigned int child_depth = cur_depth + 1;
+
+			ft_propagate_node_density_parent(
+				iter_node_flag, cur_depth,
+				child_depth, -(long) detach_child_density);
+		}
 		if (!ret) {
 			/*
 			 * Free intermediate empty nodes between the
@@ -10706,35 +10776,11 @@ end:
 	if (old_recompacted_node)
 		free_cds_ft_node(ft, old_recompacted_node);
 
-	if (!ret) {
-		/*
-		 * Propagate density: sum of pruned node footprints
-		 * at the surviving parent's depth.
-		 */
-		if (nr_clear > 0) {
-			long pruned_fp = 0;
-			int ci;
-
-			for (ci = 0; ci < nr_clear; ci++) {
-				void *item = cds_ft_metadata_to_item(
-					metadata_stack[ci]);
-				unsigned int order = cds_ft_item_order(item);
-
-				pruned_fp += 1UL << (order - 4);
-			}
-			ft_propagate_node_density_parent(cur, cur_depth,
-				cur_depth, -pruned_fp);
-			for (ci = 0; ci < nr_clear; ci++)
-				free_cds_ft_node(ft,
-					cds_ft_metadata_to_item(
-						metadata_stack[ci]));
-		}
-		/*
-		 * Density on the surviving parent is updated
-		 * incrementally by ft_propagate_node_density above;
-		 * no full recount needed.
-		 */
-	}
+	/*
+	 * Note: the pruned nodes' density contribution was already
+	 * subtracted above (before ft_node_replace_ptr), as the full
+	 * contribution of the detached child at cur_depth + 1.
+	 */
 	return ret;
 }
 
@@ -12048,34 +12094,24 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 
 		/*
 		 * Propagate density addition for the grafted subtree.
-		 * The source root's density contribution must be added
-		 * to each ancestor within the density window.
+		 *
+		 * Use ft_propagate_node_density_parent from the grafted
+		 * node's live parent chain (set by ft_store_at_graft_point)
+		 * instead of the snapshot, because the snapshot may reference
+		 * pre-recompact nodes that are no longer live.
+		 *
+		 * The delta is the grafted node's total readside contribution:
+		 * its own footprint plus its subtree density (density[0]).
 		 */
 		if (!ft_node_external(src_ft->root)) {
 			struct cds_ft_metadata *graft_meta =
 				cds_ft_item_to_metadata(
 					ft_node_ptr(src_ft->root));
-			int si;
 
-			for (si = nr_graft_snapshot - 1; si >= 0; si--) {
-				struct cds_ft_metadata *am;
-				unsigned int distance;
-
-				if (!ft_node_ptr(graft_snapshot[si]))
-					continue;
-				if (graft_snapshot_depth[si] >= key_len)
-					continue;
-				distance = key_len - graft_snapshot_depth[si];
-				if (distance > FT_NODE_DENSITY_DEPTH)
-					break;
-				am = cds_ft_item_to_metadata(
-					ft_node_ptr(graft_snapshot[si]));
-				ft_density_add(am, 0,
-					(long) ft_child_density_contribution(
-						graft_meta, distance,
-						ft_node_readside_footprint(
-							src_ft->root)));
-			}
+			ft_propagate_node_density_parent(
+				src_ft->root, key_len, key_len,
+				(long)(ft_node_readside_footprint(src_ft->root)
+					+ ft_density_get(graft_meta, 0)));
 		}
 
 		/* Give source a fresh empty root. */
@@ -12240,52 +12276,34 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 
 		/*
 		 * Propagate density delta for the swapped subtrees.
-		 * Subtract the old child's contribution and add the
-		 * new (swap) child's contribution at each ancestor
-		 * within the density window.
+		 *
+		 * Use ft_propagate_node_density_parent from the live
+		 * parent chain instead of the snapshot, because the
+		 * snapshot may reference pre-recompact nodes.
+		 *
+		 * Subtract the old child's full contribution, then
+		 * add the new child's full contribution.
 		 */
 		{
-			struct cds_ft_metadata *old_meta = NULL, *new_meta = NULL;
-			int si;
-
-			if (!ft_node_external(old_child) && ft_node_ptr(old_child))
-				old_meta = cds_ft_item_to_metadata(
+			if (!ft_node_external(old_child) && ft_node_ptr(old_child)) {
+				struct cds_ft_metadata *old_meta =
+					cds_ft_item_to_metadata(
 						ft_node_ptr(old_child));
-			if (!swap_empty && !ft_node_external(old_swap_root))
-				new_meta = cds_ft_item_to_metadata(
+
+				ft_propagate_node_density_parent(
+					old_child, key_len, key_len,
+					-((long) ft_node_readside_footprint(old_child)
+					  + (long) ft_density_get(old_meta, 0)));
+			}
+			if (!swap_empty && !ft_node_external(old_swap_root)) {
+				struct cds_ft_metadata *new_meta =
+					cds_ft_item_to_metadata(
 						ft_node_ptr(old_swap_root));
 
-			if (old_meta || new_meta) {
-				for (si = nr_graft_snapshot - 1; si >= 0; si--) {
-					struct cds_ft_metadata *am;
-					unsigned int distance;
-					unsigned long add = 0, sub = 0;
-
-					if (!ft_node_ptr(graft_snapshot[si]))
-						continue;
-					if (graft_snapshot_depth[si] >= key_len)
-						continue;
-					distance = key_len -
-						graft_snapshot_depth[si];
-					if (distance > FT_NODE_DENSITY_DEPTH)
-						break;
-					am = cds_ft_item_to_metadata(
-						ft_node_ptr(graft_snapshot[si]));
-					if (old_meta)
-						sub = ft_child_density_contribution(
-							old_meta, distance,
-							ft_node_readside_footprint(
-								old_child));
-					if (new_meta)
-						add = ft_child_density_contribution(
-							new_meta, distance,
-							ft_node_readside_footprint(
-								old_swap_root));
-					if (add >= sub)
-						ft_density_add(am, 0, add - sub);
-					else
-						ft_density_sub(am, 0, sub - add);
-				}
+				ft_propagate_node_density_parent(
+					old_swap_root, key_len, key_len,
+					(long) ft_node_readside_footprint(old_swap_root)
+					+ (long) ft_density_get(new_meta, 0));
 			}
 		}
 
@@ -12586,46 +12604,6 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			 */
 			ft_propagate_external_count_parent(dd.d.pnf,
 				-(long) detached_count);
-
-			/*
-			 * Propagate density removal for the detached
-			 * subtree.  Walk up from the child's parent via
-			 * metadata->parent, subtracting the child's
-			 * density contribution at each ancestor within
-			 * the 6-level window.
-			 */
-			if (!ft_node_external(child)) {
-				struct cds_ft_metadata *child_meta =
-					cds_ft_item_to_metadata(
-						ft_node_ptr(child));
-				struct cds_ft_inode_flag *anc = child;
-				unsigned int anc_depth = key_len;
-
-				while (anc) {
-					struct cds_ft_metadata *am;
-					unsigned int distance;
-					struct cds_ft_inode_flag *parent_nf;
-
-					am = cds_ft_item_to_metadata(
-						ft_node_ptr(anc));
-					parent_nf = am->parent;
-					if (!parent_nf)
-						break;
-					if (anc_depth < key_len) {
-						distance = key_len - anc_depth;
-						if (distance > FT_NODE_DENSITY_DEPTH)
-							break;
-						ft_density_sub(am, 0,
-							ft_child_density_contribution(
-								child_meta, distance,
-								ft_node_readside_footprint(
-									child)));
-					}
-					anc_depth -= ft_parent_depth_span(
-						parent_nf, anc);
-					anc = parent_nf;
-				}
-			}
 
 			/*
 			 * Detach child from the source trie and prune
@@ -15147,6 +15125,160 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	unsigned long root_nr_keys = 0;
 
 	if (ft_verify_node_recursive(ft, out, root, NULL, 0, &root_nr_keys))
+		return CDS_FT_STATUS_INTEGRITY_ERROR;
+	return CDS_FT_STATUS_OK;
+}
+
+/*
+ * ft_verify_density_recursive: walk the trie bottom-up, recompute
+ * density counters from children, compare with stored values.
+ *
+ * Returns the number of nodes with density mismatches (0 = clean).
+ * Prints diagnostics to @out when non-NULL.
+ */
+static
+int ft_verify_density_recursive(const struct cds_ft *ft, FILE *out,
+		struct cds_ft_inode_flag *node_flag,
+		unsigned int depth)
+{
+	int errors = 0;
+
+	if (ft_node_compressed(node_flag)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(node_flag);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+		unsigned long accum[FT_NODE_DENSITY_DEPTH] = { 0 };
+		unsigned int j;
+
+		if (ft_node_ptr(cn->child) && !ft_node_external(cn->child)) {
+			errors += ft_verify_density_recursive(ft, out,
+					cn->child, depth + cn->len);
+			if (cn->len <= FT_NODE_DENSITY_DEPTH) {
+				struct cds_ft_metadata *cm =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(cn->child));
+				ft_child_density_contribution_all(
+					cm, cn->len,
+					ft_node_readside_footprint(cn->child),
+					accum);
+			}
+		}
+		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++) {
+			unsigned long stored = ft_density_get(cn_meta, j);
+
+			if (stored != accum[j]) {
+				if (out)
+					fprintf(out, "ft_verify_density: depth %u: compressed node %p "
+						"density[%u] mismatch: stored %lu, computed %lu\n",
+						depth, node_flag, j, stored, accum[j]);
+				errors++;
+				break;	/* one message per node */
+			}
+		}
+		return errors;
+	}
+
+	if (ft_node_collapsed(node_flag)) {
+		struct cds_ft_collapsed_node *col =
+			ft_collapsed_node_ptr(node_flag);
+		struct cds_ft_metadata *col_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+		unsigned int nr_e = ft_collapsed_nr_entries(col);
+		struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
+		unsigned long accum[FT_NODE_DENSITY_DEPTH] = { 0 };
+		unsigned int e, j;
+
+		for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+			uint8_t data_e = ft_collapsed_load_data(col, e);
+			unsigned int slen;
+			struct cds_ft_inode_flag *child;
+
+			if (ft_collapsed_entry_dead(data_e, nr_e))
+				continue;
+			child = ptrs[e];
+			slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+			if (!ft_node_ptr(child) || ft_node_external(child))
+				continue;
+			{
+				struct cds_ft_inode_flag *child_resolved = child;
+
+				if (ft_node_skip_compressed(child))
+					child_resolved = ft_compressed_node_flag(
+						ft_skip_to_compressed(child));
+				errors += ft_verify_density_recursive(ft, out,
+						child_resolved,
+						depth + slen);
+				if (slen <= FT_NODE_DENSITY_DEPTH) {
+					struct cds_ft_metadata *cm =
+						cds_ft_item_to_metadata(
+							ft_node_ptr(child_resolved));
+					ft_child_density_contribution_all(
+						cm, slen,
+						ft_node_readside_footprint(child_resolved),
+						accum);
+				}
+			}
+		}
+		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++) {
+			unsigned long stored = ft_density_get(col_meta, j);
+
+			if (stored != accum[j]) {
+				if (out)
+					fprintf(out, "ft_verify_density: depth %u: collapsed node %p "
+						"density[%u] mismatch: stored %lu, computed %lu\n",
+						depth, node_flag, j, stored, accum[j]);
+				errors++;
+				break;
+			}
+		}
+		return errors;
+	}
+
+	/* Internal node. */
+	{
+		struct cds_ft_metadata *metadata =
+			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		unsigned long accum[FT_NODE_DENSITY_DEPTH] = { 0 };
+		unsigned int key, j;
+
+		for (key = 0; key < 256; key++) {
+			struct cds_ft_inode_flag *child =
+				ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+
+			if (!ft_node_ptr(child) || ft_node_external(child))
+				continue;
+			errors += ft_verify_density_recursive(ft, out,
+					child, depth + 1);
+			{
+				struct cds_ft_metadata *cm =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(child));
+				ft_child_density_contribution_all(
+					cm, 1,
+					ft_node_readside_footprint(child),
+					accum);
+			}
+		}
+		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++) {
+			unsigned long stored = ft_density_get(metadata, j);
+
+			if (stored != accum[j]) {
+				if (out)
+					fprintf(out, "ft_verify_density: depth %u: internal node %p "
+						"density[%u] mismatch: stored %lu, computed %lu\n",
+						depth, node_flag, j, stored, accum[j]);
+				errors++;
+				break;
+			}
+		}
+		return errors;
+	}
+}
+
+enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft, FILE *out)
+{
+	if (ft_verify_density_recursive(ft, out, ft->root, 0) > 0)
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
 	return CDS_FT_STATUS_OK;
 }
