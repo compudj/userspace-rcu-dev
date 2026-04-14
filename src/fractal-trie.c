@@ -8175,6 +8175,17 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				 * see the new path; actual frees are
 				 * deferred via call_rcu.
 				 */
+				/*
+				 * Save absorbed footprints before freeing
+				 * (writer is not an RCU reader — cannot
+				 * access freed nodes after call_rcu).
+				 */
+				unsigned int col_absorbed_fps[FT_COLLAPSE_ABSORBED_MAX];
+				for (ai = 0; ai < nr_col_absorbed; ai++)
+					col_absorbed_fps[ai] =
+						ft_node_readside_footprint(
+							col_absorbed[ai]);
+
 				for (ai = 0; ai < nr_col_absorbed; ai++)
 					ft_free_absorbed_node(ft,
 						col_absorbed[ai]);
@@ -8186,17 +8197,14 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				 */
 				ft_init_node_density(col_flag);
 				/*
-				 * Propagate density changes to ancestors:
+				 * Propagate density changes to ancestors.
 				 *
-				 * 1. The collapsed node replaces the old
-				 *    decision point at the same depth.
-				 * 2. Each absorbed node's footprint must be
-				 *    subtracted from ancestors at its depth.
+				 * 1. Collapsed node replaces decision point.
+				 * 2. Each absorbed node's footprint removed.
 				 */
 				{
 					long fp_delta;
 
-					/* Decision point → collapsed node. */
 					fp_delta = (long) ft_node_readside_footprint(
 							col_flag)
 						 - (long) old_decision_fp;
@@ -8205,13 +8213,13 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 							col_flag, depth,
 							depth, fp_delta);
 
-					/* Subtract each absorbed node. */
-					for (ai = 0; ai < nr_col_absorbed; ai++)
-						ft_propagate_node_density_parent(
-							col_flag, depth,
-							depth + col_absorbed_depths[ai],
-							-(long) ft_node_readside_footprint(
-								col_absorbed[ai]));
+					for (ai = 0; ai < nr_col_absorbed; ai++) {
+						if (col_absorbed_fps[ai])
+							ft_propagate_node_density_parent(
+								col_flag, depth,
+								depth + col_absorbed_depths[ai],
+								-(long) col_absorbed_fps[ai]);
+					}
 				}
 				node_flag = col_flag;
 				/* Restart loop: collapsed handler above
