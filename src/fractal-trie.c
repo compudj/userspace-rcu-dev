@@ -8146,8 +8146,8 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				 * deferred via call_rcu.
 				 */
 					for (ai = 0; ai < nr_col_absorbed; ai++)
-					ft_free_absorbed_node(ft,
-						col_absorbed[ai]);
+						ft_free_absorbed_node(ft,
+							col_absorbed[ai]);
 				free_cds_ft_node(ft, ft_node_ptr(node_flag));
 				/*
 				 * Recompute density for the new collapsed
@@ -9166,7 +9166,11 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 			ft_descent_traverse_compressed(d, cn, iter_key_p);
 			return FT_COMPRESSED_CONTINUE;
 		}
-		assert(ft_node_ptr(cn->child));
+		if (!ft_node_ptr(cn->child)) {
+			fprintf(stderr, "BUG: cn->child NULL, cn=%p cn->len=%u depth=%u\n",
+				cn, cn->len, d->depth);
+			abort();
+		}
 		if (cn->len == remaining) {
 			/* Key ends at external child: duplicate. */
 			ft_snapshot_push(snapshot, snapshot_depth,
@@ -10358,7 +10362,16 @@ int ft_detach_node(struct cds_ft *ft,
 			detach_node_flag_ptr = detach_parent_flag_ptr;
 			if (is_root)
 				detach_parent_flag_ptr = &ft->root;
-			else {
+			else if (ft_node_compressed(parent_nf) ||
+				 ft_node_skip_compressed(parent_nf)) {
+				struct cds_ft_compressed_node *pcn;
+
+				if (ft_node_skip_compressed(parent_nf))
+					pcn = ft_skip_to_compressed(parent_nf);
+				else
+					pcn = ft_compressed_node_ptr(parent_nf);
+				detach_parent_flag_ptr = &pcn->child;
+			} else {
 				ft_node_find_child(parent_nf, cur, NULL,
 					&detach_parent_flag_ptr);
 			}
