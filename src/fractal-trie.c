@@ -10384,9 +10384,12 @@ int ft_detach_node(struct cds_ft *ft,
 	    ft_node_skip_compressed(iter_node_flag)) {
 		if (topmost_external_nodes) {
 			/*
-			 * Keep compressed node, replace child with
-			 * external_nodes.  The compressed path is
-			 * preserved for lookups to traverse.
+			 * Keep the compressed node — its path is needed
+			 * for lookups to reach the correct depth.
+			 * Replace cn->child with the external node.
+			 * cn->child pointing to an external is valid:
+			 * it means a key terminates at the compressed
+			 * path's end.
 			 */
 			struct cds_ft_compressed_node *cn;
 
@@ -10397,6 +10400,7 @@ int ft_detach_node(struct cds_ft *ft,
 			ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes);
+			nr_clear = 0;
 			ret = 0;
 		} else {
 			struct cds_ft_inode *fresh;
