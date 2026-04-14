@@ -10786,6 +10786,12 @@ int ft_detach_node(struct cds_ft *ft,
 	bool prev_external_nodes_found = false;
 	struct cds_ft_inode_flag *cur;
 	unsigned int cur_depth;
+	/*
+	 * Save the original detach child before the upward walk may
+	 * shift detach_node_flag_ptr to a higher level.  Used for the
+	 * free-intermediate walk below.
+	 */
+	struct cds_ft_inode_flag *orig_detach_child = *detach_node_flag_ptr;
 
 	/*
 	 * Check the node being replaced (the child at detach_node_flag_ptr)
@@ -10862,27 +10868,55 @@ int ft_detach_node(struct cds_ft *ft,
 
 			if (!parent_nf)
 				break;
+#ifdef FT_IMMEDIATE_FREE
+			{
+				unsigned char *_p = (unsigned char *) ft_node_ptr(parent_nf);
+				if (*_p == 0xfe) {
+					fprintf(stderr, "ft_detach_node: stale parent detected! "
+						"cur=%p cur_depth=%u parent_nf=%p (poisoned) "
+						"detach_depth=%u nr_clear=%d\n",
+						cur, cur_depth, parent_nf,
+						detach_depth, nr_clear);
+					abort();
+				}
+			}
+#endif
 			/*
 			 * Find the slot in the grandparent pointing to
 			 * cur, which becomes the new detach_parent_flag_ptr.
 			 * Find the slot in cur pointing to its child (the
 			 * previous level), which becomes detach_node_flag_ptr.
 			 */
-			detach_node_flag_ptr = detach_parent_flag_ptr;
-			if (is_root)
-				detach_parent_flag_ptr = &ft->root;
-			else if (ft_node_compressed(parent_nf) ||
-				 ft_node_skip_compressed(parent_nf)) {
-				struct cds_ft_compressed_node *pcn;
+			{
+				struct cds_ft_inode_flag **new_parent_flag_ptr;
 
-				if (ft_node_skip_compressed(parent_nf))
-					pcn = ft_skip_to_compressed(parent_nf);
-				else
-					pcn = ft_compressed_node_ptr(parent_nf);
-				detach_parent_flag_ptr = &pcn->child;
-			} else {
-				ft_node_find_child(parent_nf, cur, NULL,
-					&detach_parent_flag_ptr);
+				if (is_root)
+					new_parent_flag_ptr = &ft->root;
+				else if (ft_node_compressed(parent_nf) ||
+					 ft_node_skip_compressed(parent_nf)) {
+					struct cds_ft_compressed_node *pcn;
+
+					if (ft_node_skip_compressed(parent_nf))
+						pcn = ft_skip_to_compressed(parent_nf);
+					else
+						pcn = ft_compressed_node_ptr(parent_nf);
+					new_parent_flag_ptr = &pcn->child;
+				} else {
+					ft_node_find_child(parent_nf, cur, NULL,
+						&new_parent_flag_ptr);
+				}
+				/*
+				 * If the resolved grandparent slot is the
+				 * same as the current detach_parent_flag_ptr,
+				 * stop: advancing would put both pointers at
+				 * the same slot, breaking the replace which
+				 * assumes detach_node_flag_ptr is WITHIN
+				 * iter_node_flag's child array.
+				 */
+				if (new_parent_flag_ptr == detach_parent_flag_ptr)
+					break;
+				detach_node_flag_ptr = detach_parent_flag_ptr;
+				detach_parent_flag_ptr = new_parent_flag_ptr;
 			}
 			cur_depth -= ft_parent_depth_span(parent_nf, cur);
 			cur = parent_nf;
@@ -10890,6 +10924,42 @@ int ft_detach_node(struct cds_ft *ft,
 	}
 
 	iter_node_flag = *detach_parent_flag_ptr;
+
+	/*
+	 * Capture and propagate the detached child's density BEFORE
+	 * any structural changes (replace, free).  At this point all
+	 * parent pointers in the ancestor chain are still valid.
+	 * After the replace / free-intermediate steps below, freed
+	 * nodes may poison metadata and make the parent walk unsafe.
+	 */
+	{
+		struct cds_ft_inode_flag *detach_child_nf =
+			*detach_node_flag_ptr;
+
+		if (ft_node_ptr(detach_child_nf) &&
+		    !ft_node_external(detach_child_nf)) {
+			unsigned int j;
+
+			old_detach_cm = cds_ft_item_to_metadata(
+				ft_node_ptr(detach_child_nf));
+			old_detach_fp = ft_node_readside_footprint(
+				detach_child_nf);
+			for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
+				old_detach_density[j] =
+					ft_density_get(old_detach_cm, j);
+			ft_propagate_density_replace(
+				NULL, cur_depth + 1,
+				old_detach_density, old_detach_fp,
+				NULL, 0,
+				iter_node_flag, cur_depth);
+		}
+		/*
+		 * Mark as already propagated so the end-of-function
+		 * path does not propagate again.
+		 */
+		old_detach_cm = NULL;
+	}
+
 	/*
 	 * Replace within parent.  If the parent is a compressed node:
 	 *
@@ -10963,26 +11033,9 @@ int ft_detach_node(struct cds_ft *ft,
 		 * the detached child, and set the child pointer to
 		 * the topmost_external_nodes (or NULL).
 		 *
-		 * Capture the detached child's density for per-level
-		 * subtraction below (same as the non-collapsed path).
+		 * Density was already propagated above (before
+		 * structural changes).
 		 */
-		{
-			struct cds_ft_inode_flag *detach_child =
-				*detach_node_flag_ptr;
-
-			if (ft_node_ptr(detach_child) &&
-			    !ft_node_external(detach_child)) {
-				unsigned int j;
-
-				old_detach_cm = cds_ft_item_to_metadata(
-					ft_node_ptr(detach_child));
-				old_detach_fp = ft_node_readside_footprint(
-					detach_child);
-				for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
-					old_detach_density[j] =
-						ft_density_get(old_detach_cm, j);
-			}
-		}
 		struct cds_ft_collapsed_node *col =
 			ft_collapsed_node_ptr(iter_node_flag);
 		struct cds_ft_metadata *col_meta =
@@ -11045,31 +11098,17 @@ int ft_detach_node(struct cds_ft *ft,
 		ret = 0;
 	} else {
 		/*
-		 * Save the old child before replace overwrites it.
-		 * If the detach point is above the actual removed
-		 * node (multi-child ancestor), there may be
-		 * intermediate single-child nodes between the
-		 * detach point and the removed external that need
-		 * freeing.
+		 * Density was already propagated above (before
+		 * structural changes).
+		 *
+		 * Use orig_detach_child (saved before the upward walk)
+		 * for the free-intermediate walk.  When the walk elevated
+		 * detach_node_flag_ptr, *detach_node_flag_ptr equals
+		 * iter_node_flag (the parent we are about to modify).
+		 * Freeing iter_node_flag would corrupt the trie.
+		 * orig_detach_child always points to the actual child
+		 * subtree that needs freeing.
 		 */
-		struct cds_ft_inode_flag *old_detach_child =
-			*detach_node_flag_ptr;
-		/*
-		 * Capture old child's density info before replace.
-		 * Needed for per-level density propagation below.
-		 */
-		if (ft_node_ptr(old_detach_child) &&
-		    !ft_node_external(old_detach_child)) {
-			unsigned int j;
-
-			old_detach_cm = cds_ft_item_to_metadata(
-				ft_node_ptr(old_detach_child));
-			old_detach_fp = ft_node_readside_footprint(
-				old_detach_child);
-			for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
-				old_detach_density[j] =
-					ft_density_get(old_detach_cm, j);
-		}
 
 		ret = ft_node_replace_ptr(ft,
 			detach_node_flag_ptr,
@@ -11093,7 +11132,7 @@ int ft_detach_node(struct cds_ft *ft,
 			{
 				struct cds_ft_inode_flag *to_free[FT_MAX_DEPTH];
 				int nr_to_free = 0, fi;
-				struct cds_ft_inode_flag *walk_nf = old_detach_child;
+				struct cds_ft_inode_flag *walk_nf = orig_detach_child;
 
 				while (ft_node_ptr(walk_nf) &&
 				       !ft_node_external(walk_nf) &&
@@ -11186,17 +11225,9 @@ end:
 		free_cds_ft_node(ft, old_recompacted_node);
 
 	/*
-	 * Propagate per-level density removal for the detached child.
-	 * The child was at cur_depth + 1 and has been freed.  Use
-	 * parent mode: start from the surviving parent (iter_node_flag)
-	 * at cur_depth.
+	 * Density was already propagated before structural changes
+	 * (above), while parent pointers were still valid.
 	 */
-	if (!ret && old_detach_cm)
-		ft_propagate_density_replace(
-			NULL, cur_depth + 1,
-			old_detach_density, old_detach_fp,
-			NULL, 0,
-			iter_node_flag, cur_depth);
 	return ret;
 }
 
@@ -15580,6 +15611,18 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 					metadata->parent);
 			return -1;
 		}
+#ifdef FT_IMMEDIATE_FREE
+		/* Check parent target is not poisoned (freed). */
+		if (metadata->parent) {
+			unsigned char *p = (unsigned char *) ft_node_ptr(metadata->parent);
+			if (*p == 0xfe) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: internal node %p parent %p points to freed (poisoned) node\n",
+						depth, node_flag, metadata->parent);
+				return -1;
+			}
+		}
+#endif
 		/* Count external nodes attached to this node's metadata. */
 		if (external_nodes) {
 			local_keys = 1;	/* One unique key position. */

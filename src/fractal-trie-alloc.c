@@ -352,10 +352,23 @@ void cds_ft_free_item(struct cds_ft_metadata *metadata)
 		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
 #ifdef FT_IMMEDIATE_FREE
 	/*
-	 * Immediate free for use-after-free detection.
-	 * Free extended density, then poison the metadata
-	 * and node data so any subsequent access crashes
-	 * deterministically.  Do NOT return to the free list.
+	 * Immediate free for use-after-free detection by mutation
+	 * code.  Poisons metadata and node data so any subsequent
+	 * access crashes deterministically.  Do NOT return to the
+	 * free list.
+	 *
+	 * IMPORTANT: this mode is only safe for single-threaded
+	 * mutation testing WITHOUT concurrent RCU readers.
+	 *
+	 * The item data poison would corrupt concurrent exact
+	 * lookups (which only traverse item data and never touch
+	 * metadata).  The metadata poison would additionally
+	 * corrupt concurrent inequality lookups, iteration, and
+	 * skip-compressed traversal, which read metadata fields
+	 * (parent, external_nodes, nr_keys) on the read-side.
+	 *
+	 * Use this mode exclusively for validating that mutation
+	 * paths do not access freed memory.
 	 */
 	if (metadata_alloc->metadata.nr_keys == UINT32_MAX)
 		free(metadata_alloc->metadata.density_ext);
