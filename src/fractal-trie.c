@@ -4870,6 +4870,13 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					iter_path_node(iter)[i] = node_flag;
 					iter_path_len = i + 1;
 				}
+				/*
+				 * If the skip's child is external and
+				 * we've consumed the full key, exit the
+				 * loop to the terminal check below.
+				 */
+				if (ft_node_external(node_flag))
+					break;
 			}
 		}
 		/*
@@ -4913,12 +4920,13 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				continue;
 			}
 			/*
-			 * External or NULL at loop top: the previous
-			 * get_nth returned a non-internal, non-compressed,
-			 * non-collapsed child.  This shouldn't happen in
-			 * the normal flow (external is caught post-get_nth).
-			 * Handle as not-found for robustness.
+			 * External or NULL at loop top.  Can happen when
+			 * a compressed node's cn->child is an external
+			 * node (key terminates at the compressed path
+			 * end).  Break to the post-loop terminal handler.
 			 */
+			if (ft_node_external(node_flag))
+				break;
 			status = CDS_FT_STATUS_NOT_FOUND;
 			goto end;
 		}
@@ -10406,9 +10414,10 @@ int ft_detach_node(struct cds_ft *ft,
 			 * Keep the compressed node — its path is needed
 			 * for lookups to reach the correct depth.
 			 * Replace cn->child with the external node.
-			 * cn->child pointing to an external is valid:
-			 * it means a key terminates at the compressed
-			 * path's end.
+			 *
+			 * Compressed nodes can have an external child
+			 * (cn->child pointing to an external node) but
+			 * must NOT have metadata->external_nodes set.
 			 */
 			struct cds_ft_compressed_node *cn;
 

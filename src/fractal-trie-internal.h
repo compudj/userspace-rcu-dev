@@ -315,6 +315,14 @@ struct cds_ft_metadata {
  * Compressed path node.  Replaces a chain of single-child internal
  * nodes with a single node storing the key bytes inline.
  *
+ * cn->child can point to any node type: internal, compressed,
+ * collapsed, or external.  An external child means a key terminates
+ * at the end of the compressed path.  However, the compressed node's
+ * metadata->external_nodes must NOT be used — variable-length key
+ * entries belong on internal or collapsed nodes (which can have
+ * metadata->external_nodes), or as child pointer of a compressed
+ * or collapsed node.
+ *
  * Tagged in the parent's child pointer with FT_COMPRESSED_MASK
  * (bit 1 set, bit 0 clear).
  *
