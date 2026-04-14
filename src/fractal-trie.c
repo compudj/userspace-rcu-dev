@@ -11949,20 +11949,28 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		top_flag = branch_flag;
 	}
 
-	/* 4. Publish the split structure. */
-	ft_set_parent(top_flag, d->pnf, d->nfp);
-	ft_publish_to_parent(ft, d->pnf, d->nfp, top_flag);
-
-	/* 5. Density: net footprint of created nodes minus old compressed. */
+	/* 4. Initialize density on created nodes and save old profile. */
 	{
-		long net_fp = -(long) ft_node_readside_footprint(d->nf);
+		unsigned long old_cn_density[FT_NODE_DENSITY_DEPTH];
+		unsigned int old_cn_fp = ft_node_readside_footprint(d->nf);
+		unsigned int di;
 		int ci;
 
+		for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
+			old_cn_density[di] = ft_density_get(cn_meta, di);
 		for (ci = 0; ci < nr_created; ci++)
-			net_fp += (long) ft_node_readside_footprint(created[ci]);
-		if (net_fp != 0)
-			ft_propagate_node_density_parent(branch_flag,
-				d->depth + diverge_pos, d->depth, net_fp);
+			ft_init_node_density(created[ci]);
+
+		/* 5. Publish the split structure. */
+		ft_set_parent(top_flag, d->pnf, d->nfp);
+		ft_publish_to_parent(ft, d->pnf, d->nfp, top_flag);
+
+		/* 6. Propagate per-level density replacement. */
+		ft_propagate_density_replace(top_flag, d->depth,
+			old_cn_density, old_cn_fp,
+			ft_flag_to_metadata(top_flag),
+			ft_node_readside_footprint(top_flag),
+			NULL, 0);
 	}
 
 	/*
@@ -12307,14 +12315,22 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	ft_set_parent(prefix_flag, d->pnf, d->nfp);
 	ft_publish_to_parent(ft, d->pnf, d->nfp, prefix_flag);
 
-	/* Density: net footprint (old compressed → prefix + suffix). */
+	/* Density: init created nodes and propagate replacement profile. */
 	{
-		long net_fp = (long) ft_node_readside_footprint(prefix_flag)
-			+ (long) ft_node_readside_footprint(suffix_flag)
-			- (long) ft_node_readside_footprint(d->nf);
-		if (net_fp != 0)
-			ft_propagate_node_density_parent(prefix_flag,
-				d->depth, d->depth, net_fp);
+		unsigned long old_cn_density[FT_NODE_DENSITY_DEPTH];
+		unsigned int old_cn_fp = ft_node_readside_footprint(d->nf);
+		unsigned int di;
+
+		for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
+			old_cn_density[di] = ft_density_get(cn_meta, di);
+		ft_init_node_density(suffix_flag);
+		ft_init_node_density(prefix_flag);
+
+		ft_propagate_density_replace(prefix_flag, d->depth,
+			old_cn_density, old_cn_fp,
+			ft_flag_to_metadata(prefix_flag),
+			ft_node_readside_footprint(prefix_flag),
+			NULL, 0);
 	}
 
 	d->ppnf = d->pnf;
