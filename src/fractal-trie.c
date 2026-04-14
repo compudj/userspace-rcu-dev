@@ -14868,6 +14868,289 @@ void cds_ft_destroy(struct cds_ft *ft)
 	free(ft);
 }
 
+/*
+ * Integrity verification.
+ *
+ * ft_verify_node_recursive: recursively verify structural invariants
+ * starting at @node_flag (which may be internal, compressed, or
+ * collapsed).  Returns 0 on success, -1 on first detected error
+ * (with details printed to @out).  Must be called with mutual
+ * exclusion wrt updaters.
+ *
+ * Checks performed:
+ * - nr_child matches the actual count of non-NULL child slots.
+ * - nr_keys equals the sum of children's nr_keys plus the count
+ *   of unique keys from external node chains attached to this node.
+ * - Parent pointers of children point back to the correct parent.
+ * - Compressed node invariants (len > 0, no external_nodes).
+ * - Collapsed node invariants (live entries consistent).
+ *
+ * Density counters are not verified: they are maintained
+ * incrementally and serve as a heuristic for collapse decisions.
+ *
+ * @ft: the Fractal Trie (for group/flag access).
+ * @out: file stream for diagnostic output (may be NULL to suppress).
+ * @node_flag: tagged pointer to the node being verified.
+ * @expected_parent: tagged pointer that the node's metadata->parent
+ *                   should match (NULL for root).
+ * @depth: current depth (used for diagnostics).
+ * @out_nr_keys: output — total nr_keys in the subtree rooted here
+ *               (written on success for parent aggregation).
+ */
+static
+int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag *expected_parent,
+		unsigned int depth,
+		unsigned long *out_nr_keys)
+{
+	/* --- Compressed node --- */
+	if (ft_node_compressed(node_flag)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(node_flag);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+		struct cds_ft_node *external_nodes = cn_meta->external_nodes;
+		unsigned long child_nr_keys = 0;
+		unsigned long local_keys = 0;
+		unsigned long stored_nr_keys;
+
+		/* Compressed path must have length >= 1. */
+		if (cn->len < 1) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: compressed node %p has len %u < 1\n",
+					depth, node_flag, (unsigned int) cn->len);
+			return -1;
+		}
+		/* Parent pointer check. */
+		if (cn_meta->parent != expected_parent) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: compressed node %p parent mismatch: "
+					"expected %p, got %p\n",
+					depth, node_flag, expected_parent, cn_meta->parent);
+			return -1;
+		}
+		/* nr_child must be 0 or 1. */
+		if (cn_meta->nr_child > 1) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: compressed node %p nr_child %u > 1\n",
+					depth, node_flag, cn_meta->nr_child);
+			return -1;
+		}
+		/* Compressed nodes must not carry external_nodes. */
+		if (external_nodes) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: compressed node %p has external_nodes %p (forbidden)\n",
+					depth, node_flag, external_nodes);
+			return -1;
+		}
+		/* Recurse into the child. */
+		if (ft_node_ptr(cn->child)) {
+			if (ft_node_external(cn->child)) {
+				/* External child at end of compressed path. */
+				local_keys = 1;	/* One unique key. */
+			} else {
+				/* Internal/compressed/collapsed child. */
+				if (ft_verify_node_recursive(ft, out, cn->child,
+						node_flag, depth + cn->len,
+						&child_nr_keys))
+					return -1;
+			}
+		}
+		/* Verify nr_keys. */
+		stored_nr_keys = ft_nr_keys_get(cn_meta);
+		if (stored_nr_keys != child_nr_keys + local_keys) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: compressed node %p nr_keys mismatch: "
+					"stored %lu, computed %lu (children %lu + local %lu)\n",
+					depth, node_flag, stored_nr_keys,
+					child_nr_keys + local_keys,
+					child_nr_keys, local_keys);
+			return -1;
+		}
+		*out_nr_keys = stored_nr_keys;
+		return 0;
+	}
+
+	/* --- Collapsed node --- */
+	if (ft_node_collapsed(node_flag)) {
+		struct cds_ft_collapsed_node *col =
+			ft_collapsed_node_ptr(node_flag);
+		struct cds_ft_metadata *col_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+		unsigned int nr_e = ft_collapsed_nr_entries(col);
+		struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
+		struct cds_ft_node *external_nodes = col_meta->external_nodes;
+		unsigned long total_child_keys = 0;
+		unsigned long local_keys = 0;
+		unsigned int live_children = 0;
+		unsigned int e;
+
+		/* Parent pointer check. */
+		if (col_meta->parent != expected_parent) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: collapsed node %p parent mismatch: "
+					"expected %p, got %p\n",
+					depth, node_flag, expected_parent,
+					col_meta->parent);
+			return -1;
+		}
+		/* Count external nodes attached to this collapsed node's metadata. */
+		if (external_nodes) {
+			local_keys = 1;	/* One unique key position. */
+		}
+		/* Walk each collapsed entry. */
+		for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+			uint8_t data_e = ft_collapsed_load_data(col, e);
+			unsigned int slen;
+			struct cds_ft_inode_flag *child;
+
+			if (ft_collapsed_entry_dead(data_e, nr_e))
+				continue;
+			child = ptrs[e];
+			slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+			if (!ft_node_ptr(child))
+				continue;
+			live_children++;
+			if (ft_node_external(child)) {
+				total_child_keys += 1;
+			} else {
+				struct cds_ft_inode_flag *child_resolved = child;
+				unsigned long sub_keys = 0;
+
+				if (ft_node_skip_compressed(child))
+					child_resolved = ft_compressed_node_flag(
+						ft_skip_to_compressed(child));
+				if (ft_verify_node_recursive(ft, out, child_resolved,
+						node_flag, depth + slen,
+						&sub_keys))
+					return -1;
+				total_child_keys += sub_keys;
+			}
+		}
+		/* Verify nr_child. */
+		if (col_meta->nr_child != live_children) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: collapsed node %p nr_child mismatch: "
+					"stored %u, counted %u\n",
+					depth, node_flag, col_meta->nr_child,
+					live_children);
+			return -1;
+		}
+		/* Verify nr_keys. */
+		{
+			unsigned long stored_nr_keys = ft_nr_keys_get(col_meta);
+
+			if (stored_nr_keys != total_child_keys + local_keys) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: collapsed node %p nr_keys mismatch: "
+						"stored %lu, computed %lu (children %lu + local %lu)\n",
+						depth, node_flag, stored_nr_keys,
+						total_child_keys + local_keys,
+						total_child_keys, local_keys);
+				return -1;
+			}
+			*out_nr_keys = stored_nr_keys;
+		}
+		return 0;
+	}
+
+	/* --- Internal node (linear, pool, pigeon) --- */
+	{
+		struct cds_ft_inode *node = ft_node_ptr(node_flag);
+		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
+		struct cds_ft_node *external_nodes = metadata->external_nodes;
+		unsigned long total_child_keys = 0;
+		unsigned long local_keys = 0;
+		unsigned int counted_children = 0;
+		unsigned int key;
+
+		/* Parent pointer check (root has NULL parent). */
+		if (metadata->parent != expected_parent) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: internal node %p parent mismatch: "
+					"expected %p, got %p\n",
+					depth, node_flag, expected_parent,
+					metadata->parent);
+			return -1;
+		}
+		/* Count external nodes attached to this node's metadata. */
+		if (external_nodes) {
+			local_keys = 1;	/* One unique key position. */
+		}
+		/* Walk all 256 child slots. */
+		for (key = 0; key < 256; key++) {
+			struct cds_ft_inode_flag *child =
+				ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+
+			if (!ft_node_ptr(child))
+				continue;
+			counted_children++;
+			if (ft_node_external(child)) {
+				total_child_keys += 1;
+			} else {
+				unsigned long sub_keys = 0;
+
+				if (ft_verify_node_recursive(ft, out, child,
+						node_flag, depth + 1,
+						&sub_keys))
+					return -1;
+				total_child_keys += sub_keys;
+			}
+		}
+		/* Verify nr_child. */
+		if (metadata->nr_child != counted_children) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: internal node %p nr_child mismatch: "
+					"stored %u, counted %u\n",
+					depth, node_flag, metadata->nr_child,
+					counted_children);
+			return -1;
+		}
+		/* Verify nr_keys. */
+		{
+			unsigned long stored_nr_keys = ft_nr_keys_get(metadata);
+
+			if (stored_nr_keys != total_child_keys + local_keys) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: internal node %p nr_keys mismatch: "
+						"stored %lu, computed %lu (children %lu + local %lu)\n",
+						depth, node_flag, stored_nr_keys,
+						total_child_keys + local_keys,
+						total_child_keys, local_keys);
+				return -1;
+			}
+			*out_nr_keys = stored_nr_keys;
+		}
+		return 0;
+	}
+}
+
+/*
+ * cds_ft_verify - Verify integrity of the entire Fractal Trie.
+ *
+ * Recursively walks every internal, compressed, and collapsed node
+ * starting from the root, checking that nr_child, nr_keys, and
+ * parent pointers are self-consistent.
+ *
+ * Must be called with mutual exclusion wrt updaters.
+ *
+ * @out: file stream for diagnostic output on failure (may be NULL
+ *       to suppress output).
+ *
+ * Returns CDS_FT_STATUS_OK if the trie passes all checks, or
+ * CDS_FT_STATUS_INTEGRITY_ERROR on integrity violation.
+ */
+enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
+{
+	struct cds_ft_inode_flag *root = ft->root;
+	unsigned long root_nr_keys = 0;
+
+	if (ft_verify_node_recursive(ft, out, root, NULL, 0, &root_nr_keys))
+		return CDS_FT_STATUS_INTEGRITY_ERROR;
+	return CDS_FT_STATUS_OK;
+}
+
 static
 void print_indent(FILE *out, int level)
 {
@@ -15390,6 +15673,8 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 		return "Resource busy";
 	case CDS_FT_STATUS_POPULATED_ERROR:
 		return "Destination already populated";
+	case CDS_FT_STATUS_INTEGRITY_ERROR:
+		return "Integrity verification failure";
 
 	default:
 		return "Unknown status value";

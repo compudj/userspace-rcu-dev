@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 148
+#define NR_TESTS 156
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -10439,6 +10439,648 @@ fail:
 
 /* ================================================================== */
 /*                                                                    */
+/*  15. Integrity verification tests                                  */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Verify empty trie passes integrity check.
+ */
+static int test_verify_empty(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	enum cds_ft_status s;
+
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_empty: verify failed: %s\n",
+			cds_ft_status_to_string(s));
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * Insert keys one at a time into a single trie level, growing through
+ * all internal node configurations (linear, linear_wide, 1D pool,
+ * 2D pool, pigeon).  Verify integrity after every insert.
+ */
+static int test_verify_recompact_grow(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	unsigned int i;
+
+	rcu_read_lock();
+	for (i = 0; i < 256; i++) {
+		enum cds_ft_status s;
+
+		s = insert_u64(ft, (0xAA << 8) | i, node_alloc((0xAA << 8) | i));
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_recompact_grow: insert %u failed: %s\n",
+				i, cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		s = cds_ft_verify(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_recompact_grow: verify failed after insert %u: %s\n",
+				i, cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Fill a node to 256 children (pigeon), then remove keys one at a
+ * time, shrinking through pigeon -> 2D pool -> 1D pool -> linear.
+ * Verify integrity after every removal.
+ */
+static int test_verify_recompact_shrink(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	enum cds_ft_status s;
+
+	s = cds_ft_iter_create(ft, &iter);
+	if (s < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Fill to pigeon. */
+	rcu_read_lock();
+	for (i = 0; i < 256; i++) {
+		s = insert_u64(ft, (0xBB << 8) | i,
+			       node_alloc((0xBB << 8) | i));
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_recompact_shrink: insert %u failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_recompact_shrink: verify after fill failed\n");
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Remove one at a time, verifying after each. */
+	rcu_read_lock();
+	for (i = 0; i < 256; i++) {
+		uint8_t k[8];
+		struct cds_ft_node *removed;
+
+		cds_ft_u64_to_key(ft, (0xBB << 8) | i, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		s = cds_ft_lookup(ft, iter);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_recompact_shrink: lookup %u failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		removed = cds_ft_iter_node(iter);
+		s = cds_ft_remove(ft, iter, removed);
+		if (s < 0) {
+			fprintf(stderr, "verify_recompact_shrink: remove %u failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		node_free_rcu(to_test_node(removed));
+
+		s = cds_ft_verify(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_recompact_shrink: verify failed after remove %u\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+	rcu_barrier();
+	cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * Insert keys that share a long common prefix, creating compressed
+ * path nodes.  Verify integrity after each insert.  Then remove
+ * them one at a time (triggering compress merge-back) and verify
+ * after each removal.
+ */
+static int test_verify_compress_split(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	unsigned long i;
+	enum cds_ft_status s;
+
+	s = cds_ft_iter_create(ft, &iter);
+	if (s < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/*
+	 * Insert keys 0..9 — on a 4-byte fixed trie these share a
+	 * 3-byte prefix of zeros, producing compressed path nodes.
+	 */
+	rcu_read_lock();
+	for (i = 0; i < 10; i++) {
+		s = insert_u64(ft, i, node_alloc(i));
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_compress_split: insert %lu failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		s = cds_ft_verify(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_compress_split: verify after insert %lu failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+
+	/*
+	 * Insert a key that diverges at byte 0 — splits the compressed
+	 * path at the beginning.
+	 */
+	s = insert_u64(ft, 0x01000000ULL, node_alloc(0x01000000ULL));
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_compress_split: divergent insert failed\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_compress_split: verify after divergent insert failed\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/*
+	 * Insert a key that diverges at byte 2 — splits within the
+	 * compressed path.
+	 */
+	s = insert_u64(ft, 0x00000100ULL, node_alloc(0x00000100ULL));
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_compress_split: mid-split insert failed\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_compress_split: verify after mid-split insert failed\n");
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Now remove all keys, verifying after each. */
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
+
+		s = cds_ft_remove_all(ft, iter, &head);
+		if (s < 0) {
+			fprintf(stderr, "verify_compress_split: remove failed\n");
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
+			node_free_rcu(to_test_node(head));
+		}
+		s = cds_ft_verify(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_compress_split: verify after remove failed\n");
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+	rcu_barrier();
+	cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * Variable-length keys with prefix-terminating external nodes on
+ * internal nodes.  Insert "a", "ab", "abc" — "a" terminates at an
+ * internal node's external_nodes list, testing nr_keys counting for
+ * the local_keys path.
+ */
+static int test_verify_varlen_prefix_keys(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	enum cds_ft_status s;
+
+	rcu_read_lock();
+	s = cds_ft_insert(ft, (const uint8_t *)"a", 1,
+			  &node_alloc(0x61)->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: insert 'a' failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: verify after 'a' failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	s = cds_ft_insert(ft, (const uint8_t *)"ab", 2,
+			  &node_alloc(0x6162)->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: insert 'ab' failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: verify after 'ab' failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	s = cds_ft_insert(ft, (const uint8_t *)"abc", 3,
+			  &node_alloc(0x616263)->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: insert 'abc' failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: verify after 'abc' failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Add a duplicate at "a" — should not change nr_keys. */
+	s = cds_ft_insert(ft, (const uint8_t *)"a", 1,
+			  &node_alloc(0x61)->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: insert dup 'a' failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: verify after dup 'a' failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* NIL key (zero-length). */
+	s = cds_ft_insert(ft, NULL, 0, &node_alloc(0)->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: insert NIL failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_varlen: verify after NIL failed\n");
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_unlock();
+
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Graft and detach: build a subtrie, graft it, verify, detach it,
+ * verify both the source and the detached trie.
+ */
+static int test_verify_graft_detach(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging, *detached;
+	enum cds_ft_status s;
+	unsigned int i;
+
+	if (cds_ft_group_create(NULL, &group) < 0)
+		return -1;
+	if (cds_ft_create(group, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate staging with keys "xa", "xb", "xc". */
+	rcu_read_lock();
+	s = cds_ft_insert(staging, (const uint8_t *)"a", 1,
+			  &node_alloc(0x61)->node);
+	if (s < 0) goto fail;
+	s = cds_ft_insert(staging, (const uint8_t *)"b", 1,
+			  &node_alloc(0x62)->node);
+	if (s < 0) goto fail;
+	s = cds_ft_insert(staging, (const uint8_t *)"c", 1,
+			  &node_alloc(0x63)->node);
+	if (s < 0) goto fail;
+	rcu_read_unlock();
+
+	s = cds_ft_verify(staging, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_graft_detach: staging verify failed\n");
+		goto fail_nounlock;
+	}
+
+	/* Put some keys into live. */
+	rcu_read_lock();
+	for (i = 0; i < 5; i++) {
+		uint8_t k[2] = { 'y', (uint8_t)('a' + i) };
+
+		s = cds_ft_insert(live, k, 2, &node_alloc(0x7961 + i)->node);
+		if (s < 0) goto fail;
+	}
+	rcu_read_unlock();
+
+	s = cds_ft_verify(live, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_graft_detach: live pre-graft verify failed\n");
+		goto fail_nounlock;
+	}
+
+	/* Graft staging into live at prefix "x". */
+	s = cds_ft_graft(live, (const uint8_t *)"x", 1, staging);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_graft_detach: graft failed: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail_nounlock;
+	}
+
+	s = cds_ft_verify(live, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_graft_detach: live post-graft verify failed\n");
+		goto fail_nounlock;
+	}
+
+	/* Detach the "x" subtrie. */
+	s = cds_ft_detach(live, (const uint8_t *)"x", 1, &detached);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_graft_detach: detach failed: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail_nounlock;
+	}
+
+	s = cds_ft_verify(live, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_graft_detach: live post-detach verify failed\n");
+		drain_and_destroy(detached, group);
+		goto fail_nounlock;
+	}
+	s = cds_ft_verify(detached, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_graft_detach: detached verify failed\n");
+		drain_and_destroy(detached, group);
+		goto fail_nounlock;
+	}
+
+	if (drain_and_destroy(detached, group))
+		goto fail_nounlock;
+	cds_ft_destroy(staging);	/* empty after graft */
+	return drain_and_destroy(live, group);
+
+fail:
+	rcu_read_unlock();
+fail_nounlock:
+	cds_ft_destroy(staging);
+	drain_and_destroy(live, group);
+	return -1;
+}
+
+/*
+ * Compressed nested: two layers of compressed paths (8-byte keys where
+ * keys share long prefixes but diverge at multiple levels).
+ * Exercises nested compressed node creation/destruction with verify
+ * at each step.
+ */
+static int test_verify_compress_nested(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(8, &group);
+	enum cds_ft_status s;
+
+	rcu_read_lock();
+	/* First key: 7 bytes of zeros + 0x01 — creates compressed path. */
+	s = insert_u64(ft, 0x01ULL, node_alloc(0x01));
+	if (s != CDS_FT_STATUS_OK) goto fail;
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) goto fail;
+
+	/* Second key: diverges at byte 6 — splits deep in the path. */
+	s = insert_u64(ft, 0x0101ULL, node_alloc(0x0101));
+	if (s != CDS_FT_STATUS_OK) goto fail;
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) goto fail;
+
+	/* Third key: diverges at byte 0 — splits at the top. */
+	s = insert_u64(ft, 0x0100000000000000ULL,
+		       node_alloc(0x0100000000000000ULL));
+	if (s != CDS_FT_STATUS_OK) goto fail;
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) goto fail;
+
+	/* Fourth key: shares prefix with first two but diverges mid-path. */
+	s = insert_u64(ft, 0x0001ULL, node_alloc(0x0001));
+	if (s != CDS_FT_STATUS_OK) goto fail;
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) goto fail;
+
+	rcu_read_unlock();
+	return drain_and_destroy(ft, group);
+
+fail:
+	fprintf(stderr, "verify_compress_nested: failed\n");
+	rcu_read_unlock();
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * Oscillation: repeatedly insert and remove keys at a node type
+ * boundary, triggering repeated recompaction across the hysteresis
+ * threshold.  Verify integrity at each step.
+ */
+static int test_verify_oscillation(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(2, &group);
+	struct cds_ft_iter *iter;
+	unsigned int round, i;
+	enum cds_ft_status s;
+	/*
+	 * On 64-bit: type boundary at max_child=14 (linear) with
+	 * min_child=10 for the next type.  Insert 14, remove down to
+	 * 10, repeat.
+	 */
+	unsigned int hi = 14, lo = 10;
+
+	s = cds_ft_iter_create(ft, &iter);
+	if (s < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Initial fill to hi. */
+	rcu_read_lock();
+	for (i = 0; i < hi; i++) {
+		s = insert_u64(ft, (0xCC << 8) | i,
+			       node_alloc((0xCC << 8) | i));
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_oscillation: initial insert %u failed\n", i);
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+
+	s = cds_ft_verify(ft, stderr);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "verify_oscillation: initial verify failed\n");
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	for (round = 0; round < 5; round++) {
+		/* Remove from hi down to lo. */
+		rcu_read_lock();
+		for (i = hi; i > lo; i--) {
+			uint8_t k[8];
+			struct cds_ft_node *removed;
+
+			cds_ft_u64_to_key(ft, (0xCC << 8) | (i - 1), k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+			s = cds_ft_lookup(ft, iter);
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "verify_oscillation: lookup %u failed round %u\n",
+					i - 1, round);
+				rcu_read_unlock();
+				cds_ft_iter_destroy(iter);
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+			removed = cds_ft_iter_node(iter);
+			s = cds_ft_remove(ft, iter, removed);
+			if (s < 0) {
+				fprintf(stderr, "verify_oscillation: remove %u failed round %u\n",
+					i - 1, round);
+				rcu_read_unlock();
+				cds_ft_iter_destroy(iter);
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+			node_free_rcu(to_test_node(removed));
+		}
+		rcu_read_unlock();
+
+		s = cds_ft_verify(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_oscillation: verify after shrink round %u failed\n",
+				round);
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+
+		/* Re-insert from lo back to hi. */
+		rcu_read_lock();
+		for (i = lo; i < hi; i++) {
+			s = insert_u64(ft, (0xCC << 8) | i,
+				       node_alloc((0xCC << 8) | i));
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "verify_oscillation: re-insert %u failed round %u\n",
+					i, round);
+				rcu_read_unlock();
+				cds_ft_iter_destroy(iter);
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+		}
+		rcu_read_unlock();
+
+		s = cds_ft_verify(ft, stderr);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "verify_oscillation: verify after grow round %u failed\n",
+				round);
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -10654,6 +11296,17 @@ int main(int argc, char **argv)
 	/* 14. Skip-compressed unit tests */
 	diag("Skip-compressed unit tests");
 	RUN_TEST(test_skip_compressed_unit);
+
+	/* 15. Integrity verification tests */
+	diag("Integrity verification tests");
+	RUN_TEST(test_verify_empty);
+	RUN_TEST(test_verify_recompact_grow);
+	RUN_TEST(test_verify_recompact_shrink);
+	RUN_TEST(test_verify_compress_split);
+	RUN_TEST(test_verify_varlen_prefix_keys);
+	RUN_TEST(test_verify_graft_detach);
+	RUN_TEST(test_verify_compress_nested);
+	RUN_TEST(test_verify_oscillation);
 
 	rcu_barrier();
 	rcu_unregister_thread();
