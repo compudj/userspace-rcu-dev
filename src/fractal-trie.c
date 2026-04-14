@@ -11066,52 +11066,87 @@ int ft_detach_node(struct cds_ft *ft,
 			cur_depth);
 		if (!ret) {
 			/*
-			 * Free intermediate empty nodes between the
-			 * detach point and the removed external.
-			 * After ft_node_replace_ptr NULLed the slot,
-			 * old_detach_child is unreachable.  Walk down
-			 * freeing nodes that have nr_child == 0 and
-			 * no external_nodes (truly empty).  Stop at
-			 * any node that still has children or content.
+			 * Free the old detach subtree.  After
+			 * ft_node_replace_ptr replaced it, the entire
+			 * single-child chain from old_detach_child
+			 * down is unreachable.  Collect nodes first,
+			 * then free after the walk completes (avoids
+			 * use-after-free during traversal).
+			 * topmost_external_nodes (if any) was already
+			 * saved and published at the replacement point.
 			 */
-			struct cds_ft_inode_flag *walk_nf = old_detach_child;
+			{
+				struct cds_ft_inode_flag *to_free[FT_MAX_DEPTH];
+				int nr_to_free = 0, fi;
+				struct cds_ft_inode_flag *walk_nf = old_detach_child;
 
-			while (ft_node_ptr(walk_nf) &&
-			       !ft_node_external(walk_nf)) {
-				struct cds_ft_inode_flag *next = NULL;
+				while (ft_node_ptr(walk_nf) &&
+				       !ft_node_external(walk_nf) &&
+				       nr_to_free < FT_MAX_DEPTH) {
+					struct cds_ft_inode_flag *next = NULL;
 
-				if (ft_node_compressed(walk_nf) ||
-				    ft_node_skip_compressed(walk_nf)) {
-					struct cds_ft_compressed_node *cn;
-					struct cds_ft_metadata *cm;
+					if (ft_node_compressed(walk_nf) ||
+					    ft_node_skip_compressed(walk_nf)) {
+						struct cds_ft_compressed_node *cn;
+						struct cds_ft_metadata *cm;
 
-					if (ft_node_skip_compressed(walk_nf))
-						cn = ft_skip_to_compressed(walk_nf);
-					else
-						cn = ft_compressed_node_ptr(walk_nf);
-					cm = cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) cn);
-					if (cm->nr_child > 0 ||
-					    cm->external_nodes)
+						if (ft_node_skip_compressed(walk_nf))
+							cn = ft_skip_to_compressed(walk_nf);
+						else
+							cn = ft_compressed_node_ptr(walk_nf);
+						cm = cds_ft_item_to_metadata(
+							(struct cds_ft_inode *) cn);
+						/*
+						 * When nr_clear == 0, stop at
+						 * nodes with content (they're
+						 * still reachable).  When
+						 * nr_clear > 0, the upward
+						 * pruning made the entire chain
+						 * unreachable — free everything.
+						 */
+						if (!nr_clear &&
+						    (cm->nr_child > 0 ||
+						     cm->external_nodes))
+							break;
+						next = cn->child;
+					} else if (ft_node_collapsed(walk_nf)) {
 						break;
-					next = cn->child;
-					free_compressed_node(ft, cn);
-				} else if (ft_node_collapsed(walk_nf)) {
-					break;
-				} else {
-					/* Internal node. */
-					struct cds_ft_inode *inode =
-						ft_node_ptr(walk_nf);
-					struct cds_ft_metadata *m =
-						cds_ft_item_to_metadata(inode);
+					} else {
+						struct cds_ft_metadata *m =
+							cds_ft_item_to_metadata(
+								ft_node_ptr(walk_nf));
 
-					if (m->nr_child > 0 ||
-					    m->external_nodes)
-						break;
-					free_cds_ft_node(ft, inode);
-					break; /* nr_child==0: no child to follow */
+						if (!nr_clear &&
+						    (m->nr_child > 0 ||
+						     m->external_nodes))
+							break;
+						if (m->nr_child == 1) {
+							unsigned int key;
+
+							for (key = 0; key < 256; key++) {
+								next = ft_node_get_nth(
+									walk_nf, NULL,
+									(uint8_t) key);
+								if (ft_node_ptr(next))
+									break;
+							}
+						} else if (m->nr_child > 1) {
+							break;
+						}
+					}
+					to_free[nr_to_free++] = walk_nf;
+					walk_nf = next;
 				}
-				walk_nf = next;
+				for (fi = 0; fi < nr_to_free; fi++) {
+					if (ft_node_compressed(to_free[fi]) ||
+					    ft_node_skip_compressed(to_free[fi]))
+						free_compressed_node(ft,
+							ft_compressed_node_ptr(
+								to_free[fi]));
+					else
+						free_cds_ft_node(ft,
+							ft_node_ptr(to_free[fi]));
+				}
 			}
 		}
 	}
