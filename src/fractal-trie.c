@@ -7173,50 +7173,67 @@ static inline void ft_child_density_contribution_all_snapshot(
 }
 
 /*
- * ft_propagate_density_replace: walk up the parent chain from @start
- * and update density at each ancestor to account for replacing an
- * old child with a new child at depth @child_depth.
+ * ft_propagate_density_replace: walk up the parent chain and update
+ * density at each ancestor to account for replacing an old child
+ * with a new child at depth @child_depth.
  *
  * Either or both of @old_density / @new_meta may be NULL:
  *   old_density != NULL, new_meta == NULL  → subtraction only (detach)
  *   old_density == NULL, new_meta != NULL  → addition only (graft)
  *   both non-NULL                          → replacement (collapse, explode, graft-swap)
  *
- * @start: node to start walking from (at @start_depth).
- * @start_depth: depth of @start.
+ * Two starting modes:
+ *   @start != NULL: start from the child node and walk to its parent
+ *     first (normal mode — used when the child still exists).
+ *   @start == NULL: start directly from @first_anc at @first_anc_depth
+ *     (parent mode — used when the child has been freed and only the
+ *     surviving parent is available).
+ *
+ * @start: child node to start walking from (may be NULL).
  * @child_depth: depth of the old/new child being replaced.
  * @old_density: saved density array of the old child (may be NULL).
  * @old_fp: footprint of the old child (ignored if @old_density is NULL).
  * @new_meta: live metadata of the new child (may be NULL).
  * @new_fp: footprint of the new child (ignored if @new_meta is NULL).
+ * @first_anc: first ancestor to update (used when @start is NULL).
+ * @first_anc_depth: depth of @first_anc (used when @start is NULL).
  */
 static
 void ft_propagate_density_replace(
 		struct cds_ft_inode_flag *start,
-		unsigned int start_depth,
 		unsigned int child_depth,
 		const unsigned long *old_density,
 		unsigned int old_fp,
 		struct cds_ft_metadata *new_meta,
-		unsigned int new_fp)
+		unsigned int new_fp,
+		struct cds_ft_inode_flag *first_anc,
+		unsigned int first_anc_depth)
 {
-	struct cds_ft_inode_flag *anc = start;
-	unsigned int anc_depth = start_depth;
+	struct cds_ft_inode_flag *anc;
+	unsigned int anc_depth;
+
+	if (start) {
+		struct cds_ft_metadata *sm = ft_flag_to_metadata(start);
+
+		anc = sm->parent;
+		if (!anc)
+			return;
+		anc_depth = child_depth
+			- ft_parent_depth_span(anc, start);
+	} else {
+		anc = first_anc;
+		anc_depth = first_anc_depth;
+	}
 
 	while (anc) {
 		struct cds_ft_metadata *am = ft_flag_to_metadata(anc);
-		struct cds_ft_inode_flag *parent = am->parent;
-		unsigned int distance, j;
+		unsigned int distance = child_depth - anc_depth;
+		unsigned int j;
 		unsigned long old_c[FT_NODE_DENSITY_DEPTH] = { 0 };
 		unsigned long new_c[FT_NODE_DENSITY_DEPTH] = { 0 };
 
-		if (!parent)
-			break;
-		anc_depth -= ft_parent_depth_span(parent, anc);
-		distance = child_depth - anc_depth;
 		if (distance > FT_NODE_DENSITY_DEPTH)
 			break;
-		am = ft_flag_to_metadata(parent);
 		if (old_density)
 			ft_child_density_contribution_all_snapshot(
 				old_density, distance, old_fp, old_c);
@@ -7231,7 +7248,14 @@ void ft_propagate_density_replace(
 			else if (delta < 0)
 				ft_density_sub(am, j, (unsigned long) -delta);
 		}
-		anc = parent;
+		{
+			struct cds_ft_inode_flag *parent = am->parent;
+
+			if (!parent)
+				break;
+			anc_depth -= ft_parent_depth_span(parent, anc);
+			anc = parent;
+		}
 	}
 }
 
@@ -8350,11 +8374,12 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				 */
 				ft_init_node_density(col_flag);
 				ft_propagate_density_replace(
-					col_flag, depth, depth,
+					col_flag, depth,
 					old_density, old_fp,
 					cds_ft_item_to_metadata(
 						ft_node_ptr(col_flag)),
-					ft_node_readside_footprint(col_flag));
+					ft_node_readside_footprint(col_flag),
+					NULL, 0);
 				node_flag = col_flag;
 				/* Restart loop: collapsed handler above
 				 * will descend into the matching entry. */
@@ -9940,11 +9965,12 @@ int _cds_ft_insert(struct cds_ft *ft,
 					free_collapsed_node(ft, col);
 
 					ft_propagate_density_replace(
-						internal_flag, d.depth, d.depth,
+						internal_flag, d.depth,
 						old_col_density, old_col_fp,
 						cds_ft_item_to_metadata(
 							ft_node_ptr(internal_flag)),
-						ft_node_readside_footprint(internal_flag));
+						ft_node_readside_footprint(internal_flag),
+						NULL, 0);
 
 					d.nf = internal_flag;
 					continue;
@@ -10862,41 +10888,16 @@ end:
 
 	/*
 	 * Propagate per-level density removal for the detached child.
-	 * The child was at cur_depth + 1.  The surviving parent
-	 * (iter_node_flag) is at cur_depth.  Since the child no longer
-	 * exists, start propagation from the parent directly rather
-	 * than using ft_propagate_density_replace (which starts from
-	 * the child).
+	 * The child was at cur_depth + 1 and has been freed.  Use
+	 * parent mode: start from the surviving parent (iter_node_flag)
+	 * at cur_depth.
 	 */
-	if (!ret && old_detach_cm) {
-		struct cds_ft_inode_flag *anc = iter_node_flag;
-		unsigned int anc_depth = cur_depth;
-		unsigned int child_depth = cur_depth + 1;
-
-		while (anc) {
-			struct cds_ft_metadata *am = ft_flag_to_metadata(anc);
-			unsigned int distance = child_depth - anc_depth;
-			unsigned int j;
-			unsigned long contrib[FT_NODE_DENSITY_DEPTH] = { 0 };
-
-			if (distance > FT_NODE_DENSITY_DEPTH)
-				break;
-			ft_child_density_contribution_all_snapshot(
-				old_detach_density, distance,
-				old_detach_fp, contrib);
-			for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++) {
-				if (contrib[j])
-					ft_density_sub(am, j, contrib[j]);
-			}
-			{
-				struct cds_ft_inode_flag *parent = am->parent;
-				if (!parent)
-					break;
-				anc_depth -= ft_parent_depth_span(parent, anc);
-				anc = parent;
-			}
-		}
-	}
+	if (!ret && old_detach_cm)
+		ft_propagate_density_replace(
+			NULL, cur_depth + 1,
+			old_detach_density, old_detach_fp,
+			NULL, 0,
+			iter_node_flag, cur_depth);
 	return ret;
 }
 
@@ -12214,11 +12215,12 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 */
 		if (!ft_node_external(src_ft->root))
 			ft_propagate_density_replace(
-				src_ft->root, key_len, key_len,
+				src_ft->root, key_len,
 				NULL, 0,
 				cds_ft_item_to_metadata(
 					ft_node_ptr(src_ft->root)),
-				ft_node_readside_footprint(src_ft->root));
+				ft_node_readside_footprint(src_ft->root),
+				NULL, 0);
 
 		/* Give source a fresh empty root. */
 		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
@@ -12410,21 +12412,19 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			}
 			if (old_fp_snap || new_cm) {
 				/*
-				 * old_swap_root has its parent set to d.pnf,
-				 * so the walk starts from the right place.
-				 * If swap is empty, use d.pnf as the start
-				 * since there's no new child to walk from.
+				 * Normal mode when new child exists
+				 * (old_swap_root has parent set to d.pnf).
+				 * Parent mode when swap is empty (child
+				 * freed, start from surviving parent d.pnf).
 				 */
-				struct cds_ft_inode_flag *walk_start =
-					new_cm ? old_swap_root : d.pnf;
-				unsigned int walk_depth =
-					new_cm ? key_len : key_len - 1;
-
 				ft_propagate_density_replace(
-					walk_start, walk_depth, key_len,
+					new_cm ? old_swap_root : NULL,
+					key_len,
 					old_fp_snap ? old_snap : NULL,
 					old_fp_snap,
-					new_cm, new_fp_snap);
+					new_cm, new_fp_snap,
+					new_cm ? NULL : d.pnf,
+					new_cm ? 0 : key_len - 1);
 			}
 		}
 
@@ -12698,11 +12698,11 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 					ft_propagate_density_replace(
 						internal_flag, dd.d.depth,
-						dd.d.depth,
 						old_col_density, old_col_fp,
 						cds_ft_item_to_metadata(
 							ft_node_ptr(internal_flag)),
-						ft_node_readside_footprint(internal_flag));
+						ft_node_readside_footprint(internal_flag),
+						NULL, 0);
 
 					dd.d.nf = internal_flag;
 					continue;
