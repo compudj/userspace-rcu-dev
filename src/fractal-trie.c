@@ -7435,12 +7435,22 @@ void ft_init_node_density(const struct cds_ft *ft,
 				continue;
 			slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
 			child = ft_collapsed_ptrs(col, nr_e)[e];
-			if (!ft_node_ptr(child) || ft_node_external(child))
+			if (!ft_node_ptr(child))
 				continue;
+			/*
+			 * Resolve skip-compressed before the external
+			 * check: a skip pointer with an external child
+			 * falsely matches ft_node_external, losing the
+			 * density contribution of the subtree the
+			 * compressed node represents.
+			 */
 			if (ft_node_skip_compressed(child))
+				child = ft_compressed_node_flag(
+					ft_skip_to_compressed(child));
+			if (ft_node_external(child))
 				continue;
 			if (slen <= FT_NODE_DENSITY_DEPTH) {
-				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
+				struct cds_ft_metadata *cm = ft_flag_to_metadata(child);
 				ft_child_density_contribution_all(cm, slen,
 					ft_node_readside_footprint(ft, child),
 					accum);
@@ -10854,15 +10864,19 @@ int ft_detach_node(struct cds_ft *ft,
 	{
 		struct cds_ft_inode_flag *detach_child = *detach_node_flag_ptr;
 
+		/*
+		 * Resolve skip-compressed before type checks: a skip
+		 * pointer with an external child has low bits == 0,
+		 * falsely matching ft_node_external and skipping the
+		 * external_nodes preservation entirely.
+		 */
+		if (ft_node_skip_compressed(detach_child))
+			detach_child = ft_compressed_node_flag(
+				ft_skip_to_compressed(detach_child));
+
 		if (ft_node_ptr(detach_child) && !ft_node_external(detach_child)) {
-			struct cds_ft_metadata *child_meta;
-			if (ft_node_internal(detach_child))
-				child_meta = cds_ft_item_to_metadata(ft_node_ptr(detach_child));
-			else if (ft_node_compressed(detach_child))
-				child_meta = cds_ft_item_to_metadata(
-					(struct cds_ft_inode *)ft_compressed_node_ptr(detach_child));
-			else
-				child_meta = NULL;
+			struct cds_ft_metadata *child_meta =
+				ft_flag_to_metadata(detach_child);
 			if (child_meta && child_meta->external_nodes)
 				topmost_external_nodes = child_meta->external_nodes;
 		}
@@ -10993,10 +11007,10 @@ int ft_detach_node(struct cds_ft *ft,
 		 * a skip pointer whose encoded child is external has
 		 * low tag bits == 0, which falsely matches
 		 * ft_node_external, causing the entire density
-		 * subtraction to be skipped.  The detached subtree's
-		 * full density profile (captured in the compressed
-		 * node's density counters) must be subtracted from
-		 * ancestors; without it, ancestors retain stale
+		 * subtraction to be skipped.  This loses the density
+		 * profile of the subtree the compressed node replaced
+		 * (not the compressed node's own zero contribution);
+		 * without the subtraction, ancestors retain stale
 		 * density from nodes that no longer exist below them.
 		 */
 		if (ft_node_skip_compressed(detach_child_nf))
@@ -15850,24 +15864,24 @@ int ft_verify_density_recursive(const struct cds_ft *ft, FILE *out,
 				continue;
 			child = ptrs[e];
 			slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-			if (!ft_node_ptr(child) || ft_node_external(child))
+			if (!ft_node_ptr(child))
+				continue;
+			/* Resolve skip-compressed: see ft_init_node_density. */
+			if (ft_node_skip_compressed(child))
+				child = ft_compressed_node_flag(
+					ft_skip_to_compressed(child));
+			if (ft_node_external(child))
 				continue;
 			{
-				struct cds_ft_inode_flag *child_resolved = child;
-
-				if (ft_node_skip_compressed(child))
-					child_resolved = ft_compressed_node_flag(
-						ft_skip_to_compressed(child));
 				errors += ft_verify_density_recursive(ft, out,
-						child_resolved,
+						child,
 						depth + slen);
 				if (slen <= FT_NODE_DENSITY_DEPTH) {
 					struct cds_ft_metadata *cm =
-						cds_ft_item_to_metadata(
-							ft_node_ptr(child_resolved));
+						ft_flag_to_metadata(child);
 					ft_child_density_contribution_all(
 						cm, slen,
-						ft_node_readside_footprint(ft, child_resolved),
+						ft_node_readside_footprint(ft, child),
 						accum);
 				}
 			}
