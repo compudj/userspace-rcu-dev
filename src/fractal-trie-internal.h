@@ -290,8 +290,9 @@ struct cds_ft_metadata {
 	 * Packed bitfield — small fields in a single uint32_t.
 	 *
 	 * nr_child:               9 bits (max 256)
-	 * skip_slot_offset:       8 bits (byte_offset / 8 from parent
-	 *                         node; ifdef-gated, 0 when disabled)
+	 * skip_slot_offset:       8 bits (byte_offset / sizeof(void *)
+	 *                         from parent node; ifdef-gated, 0 when
+	 *                         disabled)
 	 * fallback_removal_count: 4 bits (max 8)
 	 * alloc_index:            8 bits (arena range index, max 256)
 	 *                        -- 29 bits used, 3 spare
