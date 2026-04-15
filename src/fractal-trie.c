@@ -2105,16 +2105,20 @@ unsigned int ft_compressed_order(uint8_t path_len)
  * Write-side only (may chase parent pointers for skip resolution).
  */
 static
-unsigned int ft_node_readside_footprint(struct cds_ft_inode_flag *node_flag)
+unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag)
 {
 	unsigned int order;
 
-	if (ft_node_skip_compressed(node_flag))
-		return 0;
 	if (ft_node_compressed(node_flag)) {
 		struct cds_ft_compressed_node *cn =
 			ft_compressed_node_ptr(node_flag);
+		if (ft_group_skip_compressed(ft->group) &&
+		    cn->len <= FT_SKIP_LEN_MAX)
+			return 0;
 		order = ft_compressed_order(cn->len);
+	} else if (ft_node_skip_compressed(node_flag)) {
+		return 0;
 	} else if (ft_node_collapsed(node_flag)) {
 		order = cds_ft_item_order(
 			(void *) ft_collapsed_node_ptr(node_flag));
@@ -4235,44 +4239,64 @@ skip_copy:
 		}
 	}
 
-	/* Return pointer to new recompacted node through old_node_flag_ptr */
-	*old_node_flag_ptr = new_node_flag;
-	if (old_node && old_node_ret)
-		*old_node_ret = old_node;
-
 	/*
-	 * Propagate footprint change to ancestors when the node
-	 * changes type.  Density tracks readside footprint, not
-	 * hop count — a type change alters the footprint.
-	 *
-	 * When recompacting to NULL, new_node_flag is NULL and has
-	 * no metadata to walk from.  Use the old metadata's parent
-	 * chain instead, with a negative delta equal to the old
-	 * footprint.
+	 * Save old flag before overwriting: the parent (e.g. a collapsed
+	 * node) still holds this value in its child slots, so
+	 * ft_parent_depth_span needs it to find the entry.
 	 */
-	if (new_type_index != NODE_INDEX_NULL &&
-	    old_type->order != new_type->order) {
-		long fp_delta = (long) (1U << (new_type->order - 4))
-			      - (long) (1U << (old_type->order - 4));
-		ft_propagate_node_density_parent(new_node_flag,
-			node_depth, node_depth, fp_delta);
-	} else if (new_type_index == NODE_INDEX_NULL &&
-		   old_type_index != NODE_INDEX_NULL && metadata) {
-		/*
-		 * Node disappears entirely: subtract its full density
-		 * contribution (own footprint + subtree density[0])
-		 * from ancestors.
-		 */
-		long fp_delta = -((long) (1U << (old_type->order - 4))
-				+ (long) ft_density_get(metadata, 0));
-		struct cds_ft_inode_flag *parent = metadata->parent;
+	{
+		struct cds_ft_inode_flag *old_flag = *old_node_flag_ptr;
 
-		if (parent) {
-			unsigned int parent_depth =
-				node_depth - ft_parent_depth_span(parent,
-					*old_node_flag_ptr);
-			ft_propagate_node_density_parent(parent,
-				parent_depth, node_depth, fp_delta);
+		/* Return pointer to new recompacted node through old_node_flag_ptr */
+		*old_node_flag_ptr = new_node_flag;
+		if (old_node && old_node_ret)
+			*old_node_ret = old_node;
+
+		/*
+		 * Propagate footprint change to ancestors when the node
+		 * changes type.  Density tracks readside footprint, not
+		 * hop count — a type change alters the footprint.
+		 *
+		 * Walk from the old metadata's parent using old_flag for
+		 * the depth span calculation: the parent's child slot
+		 * still holds old_flag (the caller publishes the new
+		 * pointer later).
+		 *
+		 * When recompacting to NULL, use old metadata's parent
+		 * chain with a negative delta equal to the old footprint.
+		 */
+		if (new_type_index != NODE_INDEX_NULL &&
+		    old_type_index != NODE_INDEX_NULL && metadata &&
+		    old_type->order != new_type->order) {
+			long fp_delta = (long) (1U << (new_type->order - 4))
+				      - (long) (1U << (old_type->order - 4));
+			struct cds_ft_inode_flag *parent = metadata->parent;
+
+			if (parent) {
+				unsigned int parent_depth =
+					node_depth - ft_parent_depth_span(parent,
+						old_flag);
+				ft_propagate_node_density_parent(parent,
+					parent_depth, node_depth, fp_delta);
+			}
+		} else if (new_type_index == NODE_INDEX_NULL &&
+			   old_type_index != NODE_INDEX_NULL && metadata) {
+			/*
+			 * Node disappears entirely: subtract its full density
+			 * contribution (own footprint + subtree density[0])
+			 * from ancestors.
+			 */
+			long fp_delta = -((long) (1U << (old_type->order - 4))
+					+ (long) ft_density_get(metadata, 0));
+			struct cds_ft_inode_flag *parent = metadata->parent;
+
+			if (parent) {
+				unsigned int parent_depth =
+					node_depth - ft_parent_depth_span(parent,
+						old_flag);
+				ft_propagate_node_density_parent(parent,
+					parent_depth, node_depth, fp_delta);
+			}
 		}
 	}
 
@@ -7337,7 +7361,8 @@ void ft_propagate_density_replace(
  * traversable nodes at levels j+1 through DEPTH below this node.
  */
 static
-void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
+void ft_init_node_density(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag)
 {
 	struct cds_ft_inode *node;
 	struct cds_ft_metadata *meta;
@@ -7368,7 +7393,7 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 						ft_node_ptr(child));
 				ft_child_density_contribution_all(
 					cm, cn->len,
-					ft_node_readside_footprint(child),
+					ft_node_readside_footprint(ft, child),
 					accum);
 			}
 		}
@@ -7386,7 +7411,7 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 			if (cn->len <= FT_NODE_DENSITY_DEPTH) {
 				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(cn->child));
 				ft_child_density_contribution_all(cm, cn->len,
-					ft_node_readside_footprint(cn->child),
+					ft_node_readside_footprint(ft, cn->child),
 					accum);
 			}
 		}
@@ -7417,7 +7442,7 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 			if (slen <= FT_NODE_DENSITY_DEPTH) {
 				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
 				ft_child_density_contribution_all(cm, slen,
-					ft_node_readside_footprint(child),
+					ft_node_readside_footprint(ft, child),
 					accum);
 			}
 		}
@@ -7436,12 +7461,10 @@ void ft_init_node_density(struct cds_ft_inode_flag *node_flag)
 			continue;
 		if (ft_node_external(child))
 			continue;
-		if (ft_node_skip_compressed(child))
-			continue;
 		{
 			struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
 			ft_child_density_contribution_all(cm, 1,
-				ft_node_readside_footprint(child),
+				ft_node_readside_footprint(ft, child),
 				accum);
 		}
 	}
@@ -7715,7 +7738,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			if (slen + cn->len > max_slen)
 				goto emit_entry; /* Would exceed suffix buffer. */
 			*absorbed_footprint +=
-				ft_node_readside_footprint(orig_walk);
+				ft_node_readside_footprint(ft, orig_walk);
 			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, orig_walk, slen);
 			for (j = 0; j < cn->len; j++)
 				suffix_buf[slen++] = cn->key_bytes[j];
@@ -7751,7 +7774,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			if (branch_depth >= max_branch_depth)
 				goto emit_entry;
 			*absorbed_footprint +=
-				ft_node_readside_footprint(walk);
+				ft_node_readside_footprint(ft, walk);
 			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
 			for (e = 0; e < ft_collapsed_count(col_child_nr_e); e++) {
 				uint8_t data_e =
@@ -7814,7 +7837,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 				if (!ft_node_ptr(wc))
 					return -1;
 				*absorbed_footprint +=
-					ft_node_readside_footprint(walk);
+					ft_node_readside_footprint(ft, walk);
 				ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
 				suffix_buf[slen++] = wk;
 				walk = wc;
@@ -7836,7 +7859,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 			if (branch_depth >= max_branch_depth)
 				goto emit_entry;
 			*absorbed_footprint +=
-				ft_node_readside_footprint(walk);
+				ft_node_readside_footprint(ft, walk);
 			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
 			{
 				uint8_t ck = 0;
@@ -7960,7 +7983,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	 * loop when no config can possibly win.
 	 */
 	if (ft_density_get(metadata, 0)
-	    + ft_node_readside_footprint(node_flag)
+	    + ft_node_readside_footprint(ft, node_flag)
 	    <= (1U << (FT_COLLAPSED_ORDER_TINY - 4)))
 		return NULL;
 
@@ -7969,7 +7992,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		 * Footprint of the decision-point node itself: it will
 		 * be freed if any collapse succeeds.
 		 */
-		unsigned int decision_fp = ft_node_readside_footprint(node_flag);
+		unsigned int decision_fp = ft_node_readside_footprint(ft, node_flag);
 
 		/*
 		 * max_walk_slen: maximum suffix length.  Bounded by
@@ -8411,7 +8434,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				 * and footprint before freeing.
 				 */
 				unsigned int old_fp =
-					ft_node_readside_footprint(node_flag);
+					ft_node_readside_footprint(ft, node_flag);
 				unsigned long old_density[FT_NODE_DENSITY_DEPTH];
 				{
 					struct cds_ft_metadata *old_meta =
@@ -8446,13 +8469,13 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				 * node: the absorbed intermediate nodes are
 				 * gone, only entries' children remain.
 				 */
-				ft_init_node_density(col_flag);
+				ft_init_node_density(ft, col_flag);
 				ft_propagate_density_replace(
 					col_flag, depth,
 					old_density, old_fp,
 					cds_ft_item_to_metadata(
 						ft_node_ptr(col_flag)),
-					ft_node_readside_footprint(col_flag),
+					ft_node_readside_footprint(ft, col_flag),
 					NULL, 0);
 				node_flag = col_flag;
 				/* Restart loop: collapsed handler above
@@ -8757,7 +8780,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		int ci;
 
 		for (ci = 0; ci < nr_created; ci++)
-			ft_init_node_density(created[ci]);
+			ft_init_node_density(ft, created[ci]);
 	}
 
 	/*
@@ -8986,7 +9009,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		int ci;
 
 		for (ci = 0; ci < nr_created; ci++)
-			ft_init_node_density(created[ci]);
+			ft_init_node_density(ft, created[ci]);
 	}
 
 	*top_ret = top_flag;
@@ -9064,7 +9087,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	{
 		struct cds_ft_inode_flag *cflag = ft_compressed_node_flag(cn);
 		ft_set_parent(child, cflag, &cn->child);
-		ft_init_node_density(cflag);
+		ft_init_node_density(ft, cflag);
 		return ft_publish_compressed(ft, cn, cflag);
 	}
 }
@@ -9269,11 +9292,11 @@ publish_done:
 		struct cds_ft_metadata *top_meta;
 
 		for (cn_idx = 0; cn_idx < nr_created_nodes; cn_idx++)
-			ft_init_node_density(created_nodes[cn_idx]);
+			ft_init_node_density(ft, created_nodes[cn_idx]);
 		top_meta = ft_flag_to_metadata(top_node);
 		ft_propagate_density_replace(top_node, level,
 			NULL, 0,
-			top_meta, ft_node_readside_footprint(top_node),
+			top_meta, ft_node_readside_footprint(ft, top_node),
 			NULL, 0);
 	}
 
@@ -9443,7 +9466,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		 * by ft_propagate_external_count_parent below.
 		 */
 		ft_nr_keys_store(br_meta, 1, CMM_RELAXED);
-		ft_init_node_density(branch);
+		ft_init_node_density(ft, branch);
 	}
 	ft_set_parent(branch, d->nf, &cn->child);
 	ft_publish_to_parent(ft, d->nf, &cn->child, branch);
@@ -9456,7 +9479,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	 */
 	ft_propagate_density_replace(branch, d->depth + cn->len,
 		NULL, 0,
-		br_meta, ft_node_readside_footprint(branch),
+		br_meta, ft_node_readside_footprint(ft, branch),
 		NULL, 0);
 	ft_propagate_external_count_parent(branch, 1);
 	return 0;
@@ -9478,7 +9501,7 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 	int dret;
 	/* Save old compressed node's density before split frees it. */
 	unsigned long old_cn_density[FT_NODE_DENSITY_DEPTH];
-	unsigned int old_cn_fp = ft_node_readside_footprint(d->nf);
+	unsigned int old_cn_fp = ft_node_readside_footprint(ft, d->nf);
 	{
 		struct cds_ft_metadata *old_meta =
 			cds_ft_item_to_metadata(
@@ -9507,7 +9530,7 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 			top, d->depth,
 			old_cn_density, old_cn_fp,
 			ft_flag_to_metadata(top),
-			ft_node_readside_footprint(top),
+			ft_node_readside_footprint(ft, top),
 			NULL, 0);
 	}
 
@@ -9534,7 +9557,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	int sret;
 	/* Save old compressed density before split frees it. */
 	unsigned long old_cn_density[FT_NODE_DENSITY_DEPTH];
-	unsigned int old_cn_fp = ft_node_readside_footprint(d->nf);
+	unsigned int old_cn_fp = ft_node_readside_footprint(ft, d->nf);
 	{
 		struct cds_ft_metadata *old_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(d->nf));
@@ -9590,7 +9613,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		top_flag, d->depth,
 		old_cn_density, old_cn_fp,
 		ft_flag_to_metadata(top_flag),
-		ft_node_readside_footprint(top_flag),
+		ft_node_readside_footprint(ft, top_flag),
 		NULL, 0);
 	ft_propagate_external_count_parent(jct_flag, 1);
 skip_key_count_propagation:
@@ -9703,7 +9726,7 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		ft_nr_keys_store(cn_meta, nr_keys, CMM_RELAXED);
 		cflag = ft_compressed_node_flag(cn);
 		ft_set_parent(child, cflag, NULL);
-		ft_init_node_density(cflag);
+		ft_init_node_density(ft, cflag);
 		return ft_publish_compressed(ft, cn, cflag);
 	}
 #endif
@@ -9740,7 +9763,7 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 			}
 			cur = dest;
 		}
-		ft_init_node_density(cur);
+		ft_init_node_density(ft, cur);
 		return cur;
 	}
 }
@@ -9897,7 +9920,7 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 					ft_node_ptr(internal_flag));
 			ft_nr_keys_store(im, total_keys,
 				CMM_RELAXED);
-			ft_init_node_density(internal_flag);
+			ft_init_node_density(ft, internal_flag);
 		}
 		return internal_flag;
 	}
@@ -10175,7 +10198,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 					 */
 					unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
 					unsigned int old_col_fp =
-						ft_node_readside_footprint(d.nf);
+						ft_node_readside_footprint(ft, d.nf);
 					{
 						unsigned int di;
 
@@ -10205,7 +10228,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 								CMM_RELAXED);
 						}
 					}
-					ft_init_node_density(internal_flag);
+					ft_init_node_density(ft, internal_flag);
 
 					ft_set_parent(internal_flag, d.pnf, d.nfp);
 					ft_publish_to_parent(ft, d.pnf,
@@ -10217,7 +10240,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 						old_col_density, old_col_fp,
 						cds_ft_item_to_metadata(
 							ft_node_ptr(internal_flag)),
-						ft_node_readside_footprint(internal_flag),
+						ft_node_readside_footprint(ft, internal_flag),
 						NULL, 0);
 
 					d.nf = internal_flag;
@@ -10972,7 +10995,7 @@ int ft_detach_node(struct cds_ft *ft,
 
 			old_detach_cm = cds_ft_item_to_metadata(
 				ft_node_ptr(detach_child_nf));
-			old_detach_fp = ft_node_readside_footprint(
+			old_detach_fp = ft_node_readside_footprint(ft,
 				detach_child_nf);
 			for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
 				old_detach_density[j] =
@@ -11112,7 +11135,7 @@ int ft_detach_node(struct cds_ft *ft,
 			ft_propagate_node_density_parent(
 				iter_node_flag, cur_depth,
 				cur_depth,
-				-(long) ft_node_readside_footprint(
+				-(long) ft_node_readside_footprint(ft,
 					iter_node_flag));
 			rcu_assign_pointer(*detach_parent_flag_ptr, replacement);
 			free_collapsed_node(ft, col);
@@ -11970,14 +11993,14 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	/* 4. Initialize density on created nodes and save old profile. */
 	{
 		unsigned long old_cn_density[FT_NODE_DENSITY_DEPTH];
-		unsigned int old_cn_fp = ft_node_readside_footprint(d->nf);
+		unsigned int old_cn_fp = ft_node_readside_footprint(ft, d->nf);
 		unsigned int di;
 		int ci;
 
 		for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
 			old_cn_density[di] = ft_density_get(cn_meta, di);
 		for (ci = 0; ci < nr_created; ci++)
-			ft_init_node_density(created[ci]);
+			ft_init_node_density(ft, created[ci]);
 
 		/* 5. Publish the split structure. */
 		ft_set_parent(top_flag, d->pnf, d->nfp);
@@ -11987,7 +12010,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		ft_propagate_density_replace(top_flag, d->depth,
 			old_cn_density, old_cn_fp,
 			ft_flag_to_metadata(top_flag),
-			ft_node_readside_footprint(top_flag),
+			ft_node_readside_footprint(ft, top_flag),
 			NULL, 0);
 	}
 
@@ -12336,18 +12359,18 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	/* Density: init created nodes and propagate replacement profile. */
 	{
 		unsigned long old_cn_density[FT_NODE_DENSITY_DEPTH];
-		unsigned int old_cn_fp = ft_node_readside_footprint(d->nf);
+		unsigned int old_cn_fp = ft_node_readside_footprint(ft, d->nf);
 		unsigned int di;
 
 		for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
 			old_cn_density[di] = ft_density_get(cn_meta, di);
-		ft_init_node_density(suffix_flag);
-		ft_init_node_density(prefix_flag);
+		ft_init_node_density(ft, suffix_flag);
+		ft_init_node_density(ft, prefix_flag);
 
 		ft_propagate_density_replace(prefix_flag, d->depth,
 			old_cn_density, old_cn_fp,
 			ft_flag_to_metadata(prefix_flag),
-			ft_node_readside_footprint(prefix_flag),
+			ft_node_readside_footprint(ft, prefix_flag),
 			NULL, 0);
 	}
 
@@ -12392,7 +12415,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 
 		ft_nr_keys_store(m, subtree_external_count,
 			CMM_RELAXED);
-		ft_init_node_density(compressed);
+		ft_init_node_density(ft, compressed);
 		return compressed;
 	}
 	if (path_len >= 1) {
@@ -12432,7 +12455,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 			 * subtree.  Bottom-up order ensures child
 			 * density is set before parent.
 			 */
-			ft_init_node_density(dest);
+			ft_init_node_density(ft, dest);
 			cur = dest;
 		}
 		return cur;
@@ -12675,7 +12698,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 				NULL, 0,
 				cds_ft_item_to_metadata(
 					ft_node_ptr(src_ft->root)),
-				ft_node_readside_footprint(src_ft->root),
+				ft_node_readside_footprint(src_ft, src_ft->root),
 				NULL, 0);
 
 		/* Give source a fresh empty root. */
@@ -12857,14 +12880,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 						ft_node_ptr(old_child));
 				unsigned int di;
 
-				old_fp_snap = ft_node_readside_footprint(old_child);
+				old_fp_snap = ft_node_readside_footprint(dst_ft, old_child);
 				for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
 					old_snap[di] = ft_density_get(old_cm, di);
 			}
 			if (!swap_empty && !ft_node_external(old_swap_root)) {
 				new_cm = cds_ft_item_to_metadata(
 						ft_node_ptr(old_swap_root));
-				new_fp_snap = ft_node_readside_footprint(old_swap_root);
+				new_fp_snap = ft_node_readside_footprint(dst_ft, old_swap_root);
 			}
 			if (old_fp_snap || new_cm) {
 				/*
@@ -13123,7 +13146,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					 */
 					unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
 					unsigned int old_col_fp =
-						ft_node_readside_footprint(dd.d.nf);
+						ft_node_readside_footprint(ft, dd.d.nf);
 					{
 						unsigned int di;
 
@@ -13151,7 +13174,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 								CMM_RELAXED);
 						}
 					}
-					ft_init_node_density(internal_flag);
+					ft_init_node_density(ft, internal_flag);
 
 					ft_set_parent(internal_flag, dd.d.pnf, dd.d.nfp);
 					ft_publish_to_parent(ft, dd.d.pnf,
@@ -13163,7 +13186,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						old_col_density, old_col_fp,
 						cds_ft_item_to_metadata(
 							ft_node_ptr(internal_flag)),
-						ft_node_readside_footprint(internal_flag),
+						ft_node_readside_footprint(ft, internal_flag),
 						NULL, 0);
 
 					dd.d.nf = internal_flag;
@@ -15777,7 +15800,7 @@ int ft_verify_density_recursive(const struct cds_ft *ft, FILE *out,
 						ft_node_ptr(cn->child));
 				ft_child_density_contribution_all(
 					cm, cn->len,
-					ft_node_readside_footprint(cn->child),
+					ft_node_readside_footprint(ft, cn->child),
 					accum);
 			}
 		}
@@ -15832,7 +15855,7 @@ int ft_verify_density_recursive(const struct cds_ft *ft, FILE *out,
 							ft_node_ptr(child_resolved));
 					ft_child_density_contribution_all(
 						cm, slen,
-						ft_node_readside_footprint(child_resolved),
+						ft_node_readside_footprint(ft, child_resolved),
 						accum);
 				}
 			}
@@ -15873,7 +15896,7 @@ int ft_verify_density_recursive(const struct cds_ft *ft, FILE *out,
 						ft_node_ptr(child));
 				ft_child_density_contribution_all(
 					cm, 1,
-					ft_node_readside_footprint(child),
+					ft_node_readside_footprint(ft, child),
 					accum);
 			}
 		}
