@@ -178,6 +178,8 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	void *ptr = aligned_alloc(page_size, alloc_size_aligned);
 	struct cds_ft_alloc_range *range;
 
+	if (!ptr)
+		return NULL;
 	memset(ptr, 0, alloc_size);
 	range = (struct cds_ft_alloc_range *) (ptr + page_size);
 	range->arena = arena;
