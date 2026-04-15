@@ -10217,8 +10217,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 					}
 					{
 						struct cds_ft_metadata *int_meta =
-							cds_ft_item_to_metadata(
-								ft_node_ptr(internal_flag));
+							ft_flag_to_metadata(internal_flag);
 						if (col_meta->external_nodes) {
 							ft_metadata_set_external_nodes(
 								internal_flag, int_meta,
@@ -12411,7 +12410,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		return NULL;
 	if (compressed) {
 		struct cds_ft_metadata *m =
-			cds_ft_item_to_metadata(ft_node_ptr(compressed));
+			ft_flag_to_metadata(compressed);
 
 		ft_nr_keys_store(m, subtree_external_count,
 			CMM_RELAXED);
@@ -12545,8 +12544,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		if (displaced) {
 			struct cds_ft_metadata *bm =
-				cds_ft_item_to_metadata(
-					ft_node_ptr(branch));
+				ft_flag_to_metadata(branch);
 			ft_metadata_set_external_nodes(branch, bm, displaced);
 			ft_nr_keys_store(bm, ft_nr_keys_get(bm) + 1,
 				CMM_RELAXED);
@@ -13163,8 +13161,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						return CDS_FT_STATUS_MEMORY_ERROR;
 					{
 						struct cds_ft_metadata *int_meta =
-							cds_ft_item_to_metadata(
-								ft_node_ptr(internal_flag));
+							ft_flag_to_metadata(internal_flag);
 						if (col_meta->external_nodes) {
 							ft_metadata_set_external_nodes(
 								internal_flag, int_meta,
