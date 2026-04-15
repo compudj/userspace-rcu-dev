@@ -33,6 +33,7 @@
 #include <string.h>
 #include <urcu/fractal-trie.h>
 #include <urcu/list.h>
+#include <urcu/uatomic.h>
 #include "fractal-trie-internal.h"
 #include "urcu-utils.h"
 
@@ -319,6 +320,7 @@ room_left:
 struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order, bool bitmap)
 {
 	struct cds_ft_alloc_arena **arena_p;
+	struct cds_ft_alloc_arena *arena;
 
 	if (!page_size)
 		page_size = urcu_get_page_len();
@@ -327,12 +329,21 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 		return NULL;
 	}
 	arena_p = &ft->group->arena_order[item_len_order];
-	if (!*arena_p) {
-		*arena_p = cds_ft_arena_create(ft->group, "cds_ft_alloc", item_len_order, bitmap);
-		if (!*arena_p)
-			return NULL;
+	arena = uatomic_load(arena_p, CMM_ACQUIRE);
+	if (caa_unlikely(!arena)) {
+		pthread_mutex_lock(&ft->group->arena_lock);
+		arena = *arena_p;
+		if (!arena) {
+			arena = cds_ft_arena_create(ft->group, "cds_ft_alloc", item_len_order, bitmap);
+			if (!arena) {
+				pthread_mutex_unlock(&ft->group->arena_lock);
+				return NULL;
+			}
+			uatomic_store(arena_p, arena, CMM_RELEASE);
+		}
+		pthread_mutex_unlock(&ft->group->arena_lock);
 	}
-	return cds_ft_arena_alloc(*arena_p);
+	return cds_ft_arena_alloc(arena);
 }
 
 static

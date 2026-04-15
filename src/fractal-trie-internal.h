@@ -459,6 +459,7 @@ struct cds_ft_group {
 	const struct rcu_flavor_struct *flavor;
 	/* Allocation arenas. */
 	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
+	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
 };

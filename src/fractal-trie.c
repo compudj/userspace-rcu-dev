@@ -15387,6 +15387,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
 	ft_group->max_tree_depth = max_key_len + 1;
 	assert(ft_group->max_tree_depth <= FT_MAX_DEPTH);
 	ft_group->flavor = flavor;
+	pthread_mutex_init(&ft_group->arena_lock, NULL);
 	if (attr) {
 		ft_group->key_map = attr->key_map;
 		ft_group->flags = attr->flags;
@@ -15402,6 +15403,7 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 	if (uatomic_load(&ft_group->nr_ft_instances, CMM_RELAXED) != 0)
 		return CDS_FT_STATUS_BUSY_ERROR;
 	cds_ft_free_all_arenas(ft_group);
+	pthread_mutex_destroy(&ft_group->arena_lock);
 	free(ft_group);
 	return CDS_FT_STATUS_OK;
 }
