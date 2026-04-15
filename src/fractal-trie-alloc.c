@@ -205,6 +205,11 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	if (!page_size)
 		page_size = urcu_get_page_len();
 
+	/* Reject page sizes larger than the compile-time maximum. */
+	if (page_size > (1UL << FT_MAX_PAGE_ORDER)) {
+		errno = EINVAL;
+		return NULL;
+	}
 	/* item_len must be no larger than page_size. */
 	if ((1UL << item_len_order) > page_size) {
 		errno = EINVAL;

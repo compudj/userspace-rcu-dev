@@ -146,11 +146,34 @@
 
 /*
  * Number of removals needed on a fallback node before we try to shrink
- * it.
+ * it.  Derived from FT_FALLBACK_REMOVAL_BITS to always use the full
+ * range of the bitfield.
  */
-#define FT_FALLBACK_REMOVAL_COUNT	8
+#define FT_FALLBACK_REMOVAL_BITS	3
+#define FT_FALLBACK_REMOVAL_COUNT	((1U << FT_FALLBACK_REMOVAL_BITS) - 1)
 
 #define FT_ALLOC_ORDER_MAX		12
+#define FT_ALLOC_ORDER_MIN		4	/* Minimum item size: 16 bytes. */
+
+/*
+ * Maximum page size order supported per architecture.  Used to size the
+ * alloc_index bitfield so that the maximum number of items per range
+ * (page_size >> FT_ALLOC_ORDER_MIN) fits without truncation.
+ *
+ * A runtime check in cds_ft_arena_create() rejects page sizes larger
+ * than (1 << FT_MAX_PAGE_ORDER).
+ */
+#if defined(URCU_ARCH_AMD64)
+# define FT_MAX_PAGE_ORDER	12	/* x86-64: 4 KiB pages. */
+#elif defined(URCU_ARCH_AARCH64)
+# define FT_MAX_PAGE_ORDER	16	/* ARM64: up to 64 KiB pages. */
+#elif defined(URCU_ARCH_PPC64)
+# define FT_MAX_PAGE_ORDER	16	/* POWER: up to 64 KiB pages. */
+#else
+# define FT_MAX_PAGE_ORDER	16	/* Conservative default: 64 KiB. */
+#endif
+
+#define FT_ALLOC_INDEX_BITS	(FT_MAX_PAGE_ORDER - FT_ALLOC_ORDER_MIN)
 
 #define FT_BITMAP_LEN			32
 
@@ -293,16 +316,16 @@ struct cds_ft_metadata {
 	 * skip_slot_offset:       8 bits (byte_offset / sizeof(void *)
 	 *                         from parent node; ifdef-gated, 0 when
 	 *                         disabled)
-	 * fallback_removal_count: 4 bits (max 8)
-	 * alloc_index:            8 bits (arena range index, max 256)
-	 *                        -- 29 bits used, 3 spare
+	 * fallback_removal_count: 3 bits (max 7)
+	 * alloc_index:            FT_ALLOC_INDEX_BITS (architecture-dependent,
+	 *                         sized for max page_size >> FT_ALLOC_ORDER_MIN)
 	 */
 	uint32_t nr_child:9;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	uint32_t skip_slot_offset:8;
 #endif
-	uint32_t fallback_removal_count:4;
-	uint32_t alloc_index:8;
+	uint32_t fallback_removal_count:FT_FALLBACK_REMOVAL_BITS;
+	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
 
 	/*
 	 * Total unique keys in subtree.
