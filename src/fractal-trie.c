@@ -299,6 +299,16 @@ void static_array_size_check(void)
 	 * 2048 / sizeof(void *) = 256 slots, max index 255.
 	 */
 	CAA_BUILD_BUG_ON((1U << 11) / sizeof(void *) > 256);
+	/*
+	 * Metadata packed bitfield must fit in a uint32_t.
+	 * Layout: nr_child(9) + [skip_slot_offset(8)] +
+	 *         fallback_removal(3) + alloc_index(FT_ALLOC_INDEX_BITS).
+	 */
+	CAA_BUILD_BUG_ON(9 + FT_FALLBACK_REMOVAL_BITS + FT_ALLOC_INDEX_BITS
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		+ 8
+#endif
+		> 32);
 }
 
 /*
