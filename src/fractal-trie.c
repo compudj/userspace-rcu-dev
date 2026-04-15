@@ -293,6 +293,12 @@ static inline __attribute__((unused))
 void static_array_size_check(void)
 {
 	CAA_BUILD_BUG_ON(CAA_ARRAY_SIZE(ft_types) < FT_TYPE_MAX_NR);
+	/*
+	 * skip_slot_offset is 8 bits and stores byte_offset / sizeof(void *).
+	 * Ensure the largest node (pigeon, 2^11 = 2048 bytes) fits:
+	 * 2048 / sizeof(void *) = 256 slots, max index 255.
+	 */
+	CAA_BUILD_BUG_ON((1U << 11) / sizeof(void *) > 256);
 }
 
 /*
@@ -1433,9 +1439,14 @@ bool ft_group_skip_compressed(const struct cds_ft_group *group)
 }
 
 /*
- * ft_set_skip_slot: encode the skip pointer slot address as a uint16_t
- * byte offset from the parent node.  When parent is NULL (root's
- * child), the offset is unused — ft_get_skip_slot recovers &ft->root.
+ * ft_set_skip_slot: encode the skip pointer slot address as a
+ * pointer-stride offset from the parent node.  The raw byte offset
+ * is divided by sizeof(void *) (always 8 on 64-bit) so that the
+ * 8-bit field can cover the full pigeon node (2048 bytes / 8 = 256
+ * slots, max index 255).
+ *
+ * When parent is NULL (root's child), the offset is unused —
+ * ft_get_skip_slot recovers &ft->root.
  */
 static inline
 void ft_set_skip_slot(struct cds_ft_metadata *meta,
@@ -1447,14 +1458,14 @@ void ft_set_skip_slot(struct cds_ft_metadata *meta,
 		meta->skip_slot_offset = 0;
 		return;
 	}
-	meta->skip_slot_offset = (uint16_t)((char *) slot -
-		(char *) ft_node_ptr(meta->parent));
+	meta->skip_slot_offset = (unsigned int)((char *) slot -
+		(char *) ft_node_ptr(meta->parent)) / sizeof(void *);
 }
 
 /*
  * ft_get_skip_slot: recover the skip pointer slot address from the
- * stored offset.  Returns NULL if skip_slot_offset is 0 and parent
- * is non-NULL (slot was never set).
+ * stored pointer-stride offset.  Returns NULL if skip_slot_offset
+ * is 0 and parent is non-NULL (slot was never set).
  *
  * @ft is needed for the root case (parent == NULL).
  */
@@ -1467,7 +1478,8 @@ struct cds_ft_inode_flag **ft_get_skip_slot(const struct cds_ft_metadata *meta,
 	if (!meta->skip_slot_offset)
 		return NULL;
 	return (struct cds_ft_inode_flag **)
-		((char *) ft_node_ptr(meta->parent) + meta->skip_slot_offset);
+		((char *) ft_node_ptr(meta->parent) +
+		 (unsigned int) meta->skip_slot_offset * sizeof(void *));
 }
 #else
 static inline
