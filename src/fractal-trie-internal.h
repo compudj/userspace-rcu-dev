@@ -367,7 +367,7 @@ struct cds_ft_compressed_node {
  *
  * Two-zone layout (node allocation >= 128 bytes, cache-line aligned):
  *
- *   Zone 1 (scan zone, variable size: 64, 128, or 256 bytes):
+ *   Zone 1 (scan zone, variable size: 32, 64, 128, or 256 bytes):
  *     [nr_entries] [offset_0] [offset_1] ... → ← ... [suffix_1] [suffix_0]
  *     Offset array grows left-to-right; suffix data grows right-to-left.
  *     Scan zone size encoded in bits 6-7 of nr_entries.
@@ -378,10 +378,10 @@ struct cds_ft_compressed_node {
  *
  * nr_entries encoding (uint8_t):
  *   bits 7-6 = scan zone size selector:
- *     00 = 64B  (1 cache line, FT_COLLAPSED_SCAN_64)
- *     01 = 128B (2 cache lines, FT_COLLAPSED_SCAN_128)
- *     10 = 256B (4 cache lines, FT_COLLAPSED_SCAN_256)
- *     11 = reserved
+ *     00 = 32B  (half cache line, FT_COLLAPSED_SCAN_32)
+ *     01 = 64B  (1 cache line, FT_COLLAPSED_SCAN_64)
+ *     10 = 128B (2 cache lines, FT_COLLAPSED_SCAN_128)
+ *     11 = 256B (4 cache lines, FT_COLLAPSED_SCAN_256)
  *   bits 5-0 = entry count (max 63)
  *
  * entry_offset[i] encoding (uint8_t):
