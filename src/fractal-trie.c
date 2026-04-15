@@ -10636,7 +10636,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			/* External node at end of key. Replace chain: key count unchanged. */
 			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
 			node->next = NULL;
-			rcu_assign_pointer(*d.nfp, (struct cds_ft_inode_flag *) node);
+			ft_publish_to_parent(ft, d.pnf, d.nfp,
+				(struct cds_ft_inode_flag *) node);
 			ret = 0;
 		}
 	} else {
@@ -11099,22 +11100,22 @@ int ft_detach_node(struct cds_ft *ft,
 		} else {
 			struct cds_ft_inode *fresh;
 			struct cds_ft_metadata *fresh_meta;
+			struct cds_ft_metadata *src_meta;
 
 			fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
 			if (!fresh) {
 				ret = -ENOMEM;
 				goto end;
 			}
-			{
-				struct cds_ft_metadata *src_meta = cds_ft_item_to_metadata(
-					(struct cds_ft_inode *) ft_compressed_node_ptr(
-						iter_node_flag));
-				fresh_meta->parent = src_meta->parent;
+			src_meta = cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) ft_compressed_node_ptr(
+					iter_node_flag));
+			fresh_meta->parent = src_meta->parent;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-				fresh_meta->skip_slot_offset = src_meta->skip_slot_offset;
+			fresh_meta->skip_slot_offset = src_meta->skip_slot_offset;
 #endif
-			}
-			rcu_assign_pointer(*detach_parent_flag_ptr,
+			ft_publish_to_parent(ft, src_meta->parent,
+				detach_parent_flag_ptr,
 				ft_node_flag(fresh, 0));
 			free_compressed_node(ft,
 				ft_compressed_node_ptr(iter_node_flag));
