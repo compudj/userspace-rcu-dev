@@ -10988,12 +10988,27 @@ int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag *detach_child_nf =
 			*detach_node_flag_ptr;
 
+		/*
+		 * Resolve skip-compressed before the external check:
+		 * a skip pointer whose encoded child is external has
+		 * low tag bits == 0, which falsely matches
+		 * ft_node_external, causing the entire density
+		 * subtraction to be skipped.  The detached subtree's
+		 * full density profile (captured in the compressed
+		 * node's density counters) must be subtracted from
+		 * ancestors; without it, ancestors retain stale
+		 * density from nodes that no longer exist below them.
+		 */
+		if (ft_node_skip_compressed(detach_child_nf))
+			detach_child_nf = ft_compressed_node_flag(
+				ft_skip_to_compressed(detach_child_nf));
+
 		if (ft_node_ptr(detach_child_nf) &&
 		    !ft_node_external(detach_child_nf)) {
 			unsigned int j;
 
-			old_detach_cm = cds_ft_item_to_metadata(
-				ft_node_ptr(detach_child_nf));
+			old_detach_cm = ft_flag_to_metadata(
+				detach_child_nf);
 			old_detach_fp = ft_node_readside_footprint(ft,
 				detach_child_nf);
 			for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
