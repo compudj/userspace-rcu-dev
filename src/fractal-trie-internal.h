@@ -302,18 +302,16 @@ struct cds_ft_density_extended {
 
 /*
  * Struct layout (32 bytes, zero internal padding):
- *   - 8-byte fields: parent, external_nodes
- *   - 8-byte density union (density_ext ptr / uint8_t[6] counters)
- *   - 4-byte packed bitfield (nr_child, skip_slot_offset,
- *     fallback_removal_count, density_extended, alloc_index)
- *   - 4-byte nr_keys (uint32_t)
+ *   offset  0: 8-byte parent pointer
+ *   offset  8: 8-byte external_nodes pointer
+ *   offset 16: 8-byte density union (density_ext ptr / uint8_t[6])
+ *   offset 24: 4-byte packed bitfield (nr_child, skip_slot_offset,
+ *              fallback_removal_count, alloc_index)
+ *   offset 28: 4-byte nr_keys (uint32_t)
  *
- * In cds_ft_metadata_alloc, this struct shares a union with
- * rcu_head (16 bytes) and free_list_next (8 bytes).  call_rcu
- * overwrites the first 16 bytes of the union (parent +
- * external_nodes) when the node is freed.  All fields at
- * offset >= 16 (density union, packed bitfield, nr_keys)
- * must remain beyond the rcu_head footprint.
+ * In cds_ft_metadata_alloc, rcu_head is a separate field placed
+ * before the metadata union — no overlap with metadata fields.
+ * All metadata fields remain valid throughout the RCU grace period.
  *
  * nr_keys == UINT32_MAX is the sentinel indicating that both
  * the density counters and nr_keys have been promoted to the
