@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 165
+#define NR_TESTS 166
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -624,6 +624,168 @@ static int test_insert_duplicate_chain(void)
 fail:
 	fprintf(stderr, "insert/lookup failed: %s\n", cds_ft_status_to_string(s));
 	rcu_read_unlock();
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * Head-promotion in a duplicate chain: after removing the head, the new
+ * head's prev must point to the parent (was the old head, a cds_ft_node).
+ * This verifies the transfer-of-prev logic in ft_unchain_node.
+ *
+ * Also exercises successive head removals and a non-head removal, ensuring
+ * prev remains consistent across the doubly-linked chain.
+ */
+static int test_dup_chain_head_promotion(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct ft_test_node *n[4];
+	struct cds_ft_node *found;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	uint8_t k[4];
+	void *parent;
+	int i;
+
+	for (i = 0; i < 4; i++)
+		n[i] = node_alloc(42);
+
+	cds_ft_u64_to_key(ft, 42, k, CDS_FT_LEN_DEFAULT);
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		goto fail;
+
+	rcu_read_lock();
+	for (i = 0; i < 4; i++) {
+		s = cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n[i]->node);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr,
+				"dup_chain_head_promotion: insert %d: %s\n",
+				i, cds_ft_status_to_string(s));
+			goto fail_rcu;
+		}
+	}
+
+	/* Snapshot the parent pointer from the current head's prev. */
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	found = cds_ft_iter_node(iter);
+	if (found != &n[0]->node) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: expected n[0] as head, got %p\n",
+			found);
+		goto fail_rcu;
+	}
+	parent = n[0]->node.prev;
+	if (!parent) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: head prev is NULL\n");
+		goto fail_rcu;
+	}
+
+	/*
+	 * Remove the head (n[0]).  n[1] should become the new head with
+	 * prev == parent (was n[0], a cds_ft_node, before promotion).
+	 */
+	s = cds_ft_remove(ft, iter, &n[0]->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: remove n[0]: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail_rcu;
+	}
+
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	found = cds_ft_iter_node(iter);
+	if (found != &n[1]->node) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: expected n[1] as new head, got %p\n",
+			found);
+		goto fail_rcu;
+	}
+	if (n[1]->node.prev != parent) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: n[1] prev %p != parent %p\n",
+			n[1]->node.prev, parent);
+		goto fail_rcu;
+	}
+	/* n[2] and n[3] are non-head; their prev should point back into the chain. */
+	if (n[2]->node.prev != &n[1]->node) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: n[2] prev %p != n[1] %p\n",
+			n[2]->node.prev, &n[1]->node);
+		goto fail_rcu;
+	}
+	if (n[3]->node.prev != &n[2]->node) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: n[3] prev %p != n[2] %p\n",
+			n[3]->node.prev, &n[2]->node);
+		goto fail_rcu;
+	}
+
+	/* Remove a non-head in the middle (n[2]). */
+	s = cds_ft_remove(ft, iter, &n[2]->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: remove n[2]: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail_rcu;
+	}
+	/* n[3]'s prev should now point to n[1] (its new predecessor). */
+	if (n[3]->node.prev != &n[1]->node) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: n[3] prev after mid-remove %p != n[1] %p\n",
+			n[3]->node.prev, &n[1]->node);
+		goto fail_rcu;
+	}
+
+	/* Remove the new head (n[1]).  n[3] should promote. */
+	s = cds_ft_remove(ft, iter, &n[1]->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: remove n[1]: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail_rcu;
+	}
+	if (n[3]->node.prev != parent) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: n[3] prev after second promotion %p != parent %p\n",
+			n[3]->node.prev, parent);
+		goto fail_rcu;
+	}
+
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	found = cds_ft_iter_node(iter);
+	if (found != &n[3]->node) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: expected n[3] as final head, got %p\n",
+			found);
+		goto fail_rcu;
+	}
+
+	/* Remove the last remaining node (n[3]). */
+	s = cds_ft_remove(ft, iter, &n[3]->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"dup_chain_head_promotion: remove n[3]: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail_rcu;
+	}
+	rcu_read_unlock();
+
+	cds_ft_iter_destroy(iter);
+	for (i = 0; i < 4; i++)
+		call_rcu(&n[i]->head, node_free_rcu_cb);
+	return drain_and_destroy(ft, group);
+
+fail_rcu:
+	rcu_read_unlock();
+fail:
+	if (iter)
+		cds_ft_iter_destroy(iter);
 	drain_and_destroy(ft, group);
 	return -1;
 }
@@ -12110,6 +12272,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_insert_basic);
 	RUN_TEST(test_insert_unique);
 	RUN_TEST(test_insert_duplicate_chain);
+	RUN_TEST(test_dup_chain_head_promotion);
 	RUN_TEST(test_insert_replace);
 	RUN_TEST(test_count_tracking);
 
