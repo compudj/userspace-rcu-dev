@@ -8800,7 +8800,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	}
 
 	/* 5. Publish the split structure, replacing the compressed node. */
-	rcu_assign_pointer(*parent_slot, top_flag);
+	ft_publish_to_parent(ft, cn_meta->parent, parent_slot, top_flag);
 
 	/*
 	 * 6. Density: initialize created nodes bottom-up, then
@@ -11188,7 +11188,8 @@ int ft_detach_node(struct cds_ft *ft,
 				cur_depth,
 				-(long) ft_node_readside_footprint(ft,
 					iter_node_flag));
-			rcu_assign_pointer(*detach_parent_flag_ptr, replacement);
+			ft_publish_to_parent(ft, col_meta->parent,
+				detach_parent_flag_ptr, replacement);
 			free_collapsed_node(ft, col);
 			/*
 			 * The collapsed was freed.  Prevent the
@@ -11319,9 +11320,13 @@ int ft_detach_node(struct cds_ft *ft,
 	if (!ft_node_compressed(iter_node_flag) &&
 	    !ft_node_skip_compressed(iter_node_flag) &&
 	    !ft_node_collapsed(iter_node_flag)) {
+		struct cds_ft_metadata *iter_meta =
+			cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
+
 		dbg_printf("ft_detach_node: publish %p instead of %p\n",
 			iter_node_flag, *detach_parent_flag_ptr);
-		rcu_assign_pointer(*detach_parent_flag_ptr, iter_node_flag);
+		ft_publish_to_parent(ft, iter_meta->parent,
+			detach_parent_flag_ptr, iter_node_flag);
 	}
 end:
 	/* Reclaim safely after replacement. */
@@ -12576,7 +12581,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
-		rcu_assign_pointer(*d->pnfp, dest);
+		ft_publish_to_parent(ft, pmeta->parent, d->pnfp, dest);
 
 		if (old_recompacted_node)
 			free_cds_ft_node(ft, old_recompacted_node);
@@ -12621,7 +12626,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 				ft_free_branch(ft, key, i, key_len, branch);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
-			rcu_assign_pointer(*d->pnfp, dest);
+			ft_publish_to_parent(ft, pmeta->parent,
+				d->pnfp, dest);
 
 			if (old_recompacted_node)
 				free_cds_ft_node(ft, old_recompacted_node);
