@@ -252,10 +252,15 @@ struct cds_ft_alloc_arena;
 #define FT_DENSITY_COMPACT_MAX	UINT8_MAX
 
 struct cds_ft_density_extended {
-	unsigned long nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
-	unsigned long nr_keys;			/* Full-width nr_keys when compact
-						 * uint16_t overflows UINT16_MAX.
+	union {
+		struct {
+			unsigned long nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
+			unsigned long nr_keys;	/* Full-width nr_keys when compact
+						 * uint32_t overflows UINT32_MAX.
 						 */
+		};
+		struct cds_ft_density_extended *next;	/* Free-list linkage (pool). */
+	};
 };
 
 /*
@@ -471,6 +476,15 @@ struct cds_ft {
 	struct cds_ft_inode_flag *root;		/* Root node (arena-allocated, always present, always internal). */
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
 	unsigned long nr_fallback;		/* Number of fallback nodes used */
+
+	/*
+	 * Pre-allocated pool for density promotion (compact → extended).
+	 * Topped up at mutation entry (where -ENOMEM can be returned),
+	 * drawn from in ft_density_promote (after point of no return).
+	 * Write-side only — no synchronization needed.
+	 */
+	struct cds_ft_density_extended *density_pool;
+	unsigned int density_pool_count;
 
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[FT_ENTRY_PER_NODE];
