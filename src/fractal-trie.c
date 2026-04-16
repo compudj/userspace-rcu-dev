@@ -11446,6 +11446,15 @@ end:
  * to skip over node.
  * In both cases, if node->next exists, its prev pointer inherits
  * node->prev (either the parent pointer or the predecessor node).
+ *
+ * Ordering: next_node->prev is updated BEFORE the pointer publication
+ * (*head_slot or prev_node->next).  If we published first, a concurrent
+ * reader following the new head via a skip-compressed pointer could call
+ * ft_skip_to_compressed and read the stale prev pointing to @node (the
+ * node being removed, a cds_ft_node rather than the flagged parent),
+ * returning a garbage compressed-node pointer.  rcu_assign_pointer on
+ * the publication provides release semantics pairing with the reader's
+ * rcu_dereference of child->prev.
  */
 static
 void ft_unchain_node(struct cds_ft_node **head_slot,
@@ -11453,17 +11462,17 @@ void ft_unchain_node(struct cds_ft_node **head_slot,
 {
 	struct cds_ft_node *next_node = node->next;
 
+	if (next_node)
+		next_node->prev = node->prev;
 	if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
 		/* Non-head: prev is a cds_ft_node. */
 		struct cds_ft_node *prev_node =
 			(struct cds_ft_node *) node->prev;
-		uatomic_store(&prev_node->next, next_node, CMM_RELAXED);
+		rcu_assign_pointer(prev_node->next, next_node);
 	} else {
 		/* Head: prev is parent (flagged internal node pointer). */
-		uatomic_store(head_slot, next_node, CMM_RELAXED);
+		rcu_assign_pointer(*head_slot, next_node);
 	}
-	if (next_node)
-		next_node->prev = node->prev;
 }
 
 /*
