@@ -276,8 +276,32 @@ struct cds_ft_group;
 #define CDS_FT_MAX_LEN_UNLIMITED	SIZE_MAX
 #define CDS_FT_KEY_MAP_SIZE		256
 
-/* Fractal Trie group flags. */
-#define CDS_FT_FLAG_SKIP_COMPRESSED	(1U << 0)	/* Skip compressed nodes on candidate lookup fast path. */
+/*
+ * Fractal Trie group flags.
+ *
+ * CDS_FT_FLAG_SKIP_COMPRESSED: encode compressed path lengths in
+ * the high bits of pointers, allowing the candidate lookup fast
+ * path to skip compressed nodes entirely.
+ *
+ * The number of available high bits, and thus the maximum
+ * compressed path length that can be skip-encoded, is architecture-
+ * dependent (see FT_SKIP_LEN_BITS / FT_SKIP_LEN_MAX in
+ * fractal-trie-internal.h).  Compressed paths longer than the
+ * architecture limit fall back to traditional compressed node
+ * pointers transparently.
+ *
+ * Architecture requirement: the pointer bits used by the encoding
+ * must be zero for userspace pointers.  cds_ft_attr_set_flags()
+ * returns NOT_SUPPORTED on architectures where this cannot be
+ * guaranteed.
+ *
+ * Caller requirement: external node pointers (struct cds_ft_node *)
+ * stored in the trie must not carry metadata in their upper bits.
+ * Pointer authentication (AArch64 PAC) or memory tagging (MTE)
+ * signatures must be stripped before the pointer is passed to the
+ * trie insertion API.
+ */
+#define CDS_FT_FLAG_SKIP_COMPRESSED	(1U << 0)
 
 /*
  * Status codes returned by Fractal Trie operations.
