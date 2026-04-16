@@ -9132,7 +9132,8 @@ error:
 static struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		const uint8_t *key, unsigned int start, unsigned int end,
 		struct cds_ft_inode_flag *leaf,
-		unsigned long subtree_external_count);
+		unsigned long subtree_external_count,
+		bool has_external_nodes);
 
 /*
  * Try to create a compressed path for a chain of single-child nodes.
@@ -9534,7 +9535,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 
 		inner = ft_build_branch(ft, key,
 			br_start + 1, key_len,
-			(struct cds_ft_inode_flag *) node, 1);
+			(struct cds_ft_inode_flag *) node, 1, false);
 		if (!inner)
 			return -ENOMEM;
 		ret = ft_node_set_nth(ft, &dest, key[br_start],
@@ -10236,7 +10237,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 					} else {
 						branch = ft_build_branch(ft, key,
 							d.depth + new_slen, key_len,
-							(struct cds_ft_inode_flag *) node, 1);
+							(struct cds_ft_inode_flag *) node,
+							1, false);
 						if (!branch) {
 							ret = -ENOMEM;
 							goto insert_done;
@@ -10347,7 +10349,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 				} else {
 					branch = ft_build_branch(ft, key,
 						d.depth + new_slen, key_len,
-						(struct cds_ft_inode_flag *) node, 1);
+						(struct cds_ft_inode_flag *) node,
+						1, false);
 					if (!branch) {
 						ret = -ENOMEM;
 						goto insert_done;
@@ -12563,37 +12566,73 @@ static
 struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		const uint8_t *key, unsigned int start, unsigned int end,
 		struct cds_ft_inode_flag *leaf,
-		unsigned long subtree_external_count)
+		unsigned long subtree_external_count,
+		bool has_external_nodes)
 {
-	unsigned int path_len = end - start;
-	struct cds_ft_inode_flag *compressed;
+	/*
+	 * When the caller will attach external_nodes to the top,
+	 * the top must be an internal node (compressed nodes cannot
+	 * carry metadata->external_nodes).  Bias compression to start
+	 * one byte deeper so an internal node is created at `start`.
+	 */
+	unsigned int compress_start = has_external_nodes ? start + 1 : start;
+	struct cds_ft_inode_flag *cur = leaf;
+	int loop_top, i;
 
-	compressed = ft_try_compress_chain(ft, key, end, start,
-		leaf, NULL);
-	if (compressed == (void *) (long) -ENOMEM)
-		return NULL;
-	if (compressed) {
-		struct cds_ft_metadata *m =
-			ft_flag_to_metadata(compressed);
+	if (start == end)
+		return leaf;	/* path_len == 0. */
 
-		ft_nr_keys_store(ft, m, subtree_external_count,
-			CMM_RELAXED);
-		ft_init_node_density(ft, compressed);
-		return compressed;
+	/* Try compression over [compress_start, end). */
+	if (end >= compress_start + 2) {
+		struct cds_ft_inode_flag *compressed;
+
+		compressed = ft_try_compress_chain(ft, key, end,
+			compress_start, leaf, NULL);
+		if (compressed == (void *) (long) -ENOMEM)
+			return NULL;
+		if (compressed) {
+			struct cds_ft_metadata *m =
+				ft_flag_to_metadata(compressed);
+
+			ft_nr_keys_store(ft, m,
+				subtree_external_count, CMM_RELAXED);
+			ft_init_node_density(ft, compressed);
+			cur = compressed;
+			if (!has_external_nodes)
+				return cur;
+			/*
+			 * has_external_nodes: fall through to create
+			 * an internal node at `start` wrapping the
+			 * compressed chunk.
+			 */
+		}
 	}
-	if (path_len >= 1) {
-		struct cds_ft_inode_flag *cur = leaf;
-		int i;
 
-		for (i = (int) end - 1; i >= (int) start; i--) {
-			struct cds_ft_inode_flag *dest = NULL;
-			int ret;
+	/*
+	 * Create internal nodes from loop_top down to start.
+	 *   Compression succeeded: only need an internal at `start`
+	 *     (compress_start == start + 1, loop_top == start).
+	 *   No compression:        create internal nodes for each
+	 *     byte in [start, end).
+	 */
+	loop_top = (cur != leaf) ? (int) compress_start - 1 : (int) end - 1;
+	for (i = loop_top; i >= (int) start; i--) {
+		struct cds_ft_inode_flag *dest = NULL;
+		int ret;
 
-			ret = ft_node_set_nth(ft, &dest,
-				key[i],
-				cur, NULL, NULL, i);
-			if (ret) {
-				while (cur != leaf) {
+		ret = ft_node_set_nth(ft, &dest, key[i], cur,
+			NULL, NULL, i);
+		if (ret) {
+			/*
+			 * Free the created internal chain and, if
+			 * present, the compressed chunk at the bottom.
+			 */
+			while (cur != leaf) {
+				if (ft_node_compressed(cur)) {
+					free_compressed_node(ft,
+						ft_compressed_node_ptr(cur));
+					cur = leaf;
+				} else {
 					struct cds_ft_inode_flag *next;
 					uint8_t kv = key[i + 1];
 
@@ -12602,29 +12641,22 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 					cur = next;
 					i++;
 				}
-				return NULL;
 			}
-			{
-				struct cds_ft_metadata *m =
-					cds_ft_item_to_metadata(
-						ft_node_ptr(dest));
-				ft_nr_keys_store(ft, m,
-					subtree_external_count,
-					CMM_RELAXED);
-			}
-			/*
-			 * Initialize density: this node's child (cur)
-			 * may be the graft payload with an existing
-			 * subtree.  Bottom-up order ensures child
-			 * density is set before parent.
-			 */
-			ft_init_node_density(ft, dest);
-			cur = dest;
+			return NULL;
 		}
-		return cur;
+		ft_nr_keys_store(ft,
+			cds_ft_item_to_metadata(ft_node_ptr(dest)),
+			subtree_external_count, CMM_RELAXED);
+		/*
+		 * Initialize density: this node's child (cur) may be
+		 * the graft payload with an existing subtree.
+		 * Bottom-up order ensures child density is set before
+		 * parent.
+		 */
+		ft_init_node_density(ft, dest);
+		cur = dest;
 	}
-	/* path_len == 0: leaf is the branch. */
-	return leaf;
+	return cur;
 }
 
 /*
@@ -12702,7 +12734,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 				ft_node_ptr(d->nf);
 
 		branch = ft_build_branch(ft, key, i, key_len, graft_payload,
-				graft_external_count);
+				graft_external_count, displaced != NULL);
 		if (!branch)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
