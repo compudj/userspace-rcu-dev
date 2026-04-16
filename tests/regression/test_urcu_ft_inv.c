@@ -1232,6 +1232,18 @@ static void *inv_relational_reader(void *arg)
 			}
 		}
 
+		/*
+		 * The iterator's cached path holds RCU-protected
+		 * pointers that are only valid while the RCU read-side
+		 * lock is held continuously.  Invalidate the cache on
+		 * exit so the iter is never in a stale state outside a
+		 * critical section: QSBR makes rcu_read_lock/unlock
+		 * no-ops, so the rcu_quiescent_state() below is the
+		 * real grace-period boundary that a cached path would
+		 * cross.
+		 */
+		cds_ft_iter_invalidate_path(iter);
+
 		rcu_read_unlock();
 
 		checks++;
