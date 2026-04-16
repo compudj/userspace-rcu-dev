@@ -16,6 +16,7 @@
 #include <assert.h>
 #include <endian.h>
 #include <stdbool.h>
+#include <sys/mman.h>
 #include <urcu/fractal-trie.h>
 #include <urcu/compiler.h>
 #include <urcu/arch.h>
@@ -15417,11 +15418,45 @@ enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
+/*
+ * Validate that the pointer bits used by the skip-compressed encoding
+ * are outside the kernel's virtual address range.  Attempt to mmap a
+ * page at the encoding boundary; if the mapping succeeds or returns
+ * EEXIST the bit is within the VA range and skip-compressed cannot be
+ * used safely.  ENOMEM (address beyond TASK_SIZE) confirms the bit is
+ * available.
+ *
+ * Called once from cds_ft_attr_set_flags when CDS_FT_FLAG_SKIP_COMPRESSED
+ * is requested.
+ */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+static
+bool ft_skip_compressed_validate(void)
+{
+	void *p;
+
+	p = mmap((void *)(1UL << FT_SKIP_LEN_SHIFT), urcu_get_page_len(),
+		 PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+		 -1, 0);
+	if (p == MAP_FAILED) {
+		/* ENOMEM: address outside VA range — safe to use. */
+		return true;
+	}
+	/* Mapping succeeded: the bit is within the VA range. */
+	munmap(p, urcu_get_page_len());
+	return false;
+}
+#endif
+
 enum cds_ft_status cds_ft_attr_set_flags(struct cds_ft_attr *attr,
 		unsigned int flags)
 {
 #ifndef FEATURE_FT_SKIP_COMPRESSED
 	if (flags & CDS_FT_FLAG_SKIP_COMPRESSED)
+		return CDS_FT_STATUS_NOT_SUPPORTED;
+#else
+	if ((flags & CDS_FT_FLAG_SKIP_COMPRESSED) &&
+	    !ft_skip_compressed_validate())
 		return CDS_FT_STATUS_NOT_SUPPORTED;
 #endif
 	attr->flags = flags;

@@ -69,18 +69,34 @@
  * compressed node's child, skipping the compressed node on the read
  * fast path (candidate lookup).
  *
- * Encoding: bits 57-63 of the pointer store the compressed path
- * length (1-127).  These bits are always zero for normal userspace
- * pointers (safe on x86-64 including LA57, and ARM64).  A non-zero
- * value in bits 57-63 identifies a skip pointer.
+ * Encoding: the high bits of a pointer (starting at FT_SKIP_LEN_SHIFT)
+ * store the compressed path length.  These bits must be zero in normal
+ * userspace pointers.  A non-zero value identifies a skip pointer.
+ * The number of available bits (FT_SKIP_LEN_BITS) and thus the
+ * maximum encodable path length (FT_SKIP_LEN_MAX) are architecture-
+ * dependent.  Compressed paths longer than FT_SKIP_LEN_MAX keep the
+ * traditional compressed node pointer (no skip optimization).
+ *
+ * Per-architecture parameters:
+ *   x86-64:    shift=57, bits=7, max path=127  (LA57: 57-bit VA)
+ *   AArch64:   shift=56, bits=8, max path=255  (LVA: 52-bit VA)
+ *   PPC64:     shift=56, bits=8, max path=255  (Radix: 52-bit VA)
+ *   riscv64:   shift=56, bits=8, max path=255  (Sv57: 57-bit VA)
+ *   MIPS64:    shift=56, bits=8, max path=255  (48-bit VA)
+ *   LoongArch: shift=56, bits=8, max path=255  (48-bit VA)
+ *
+ * New architectures can be added by defining FT_SKIP_LEN_SHIFT and
+ * FT_SKIP_LEN_BITS below, enabling FEATURE_FT_SKIP_COMPRESSED in
+ * the architecture gate, and verifying that userspace pointers have
+ * the selected bits clear.  Architectures with fewer available high
+ * bits can still benefit from skip-compressed with a smaller
+ * FT_SKIP_LEN_BITS; the fallback to traditional compressed pointers
+ * handles longer paths transparently.
  *
  * The compressed node remains allocated (for key bytes, inequality
  * lookup, exact lookup) and is accessible via the child node's
  * metadata->parent pointer (or cds_ft_node._ft_parent for external
  * children).
- *
- * Compressed paths longer than FT_SKIP_LEN_MAX keep the traditional
- * compressed node pointer (no skip optimization).
  *
  * Dual-pointer RCU publication:
  *
@@ -108,11 +124,33 @@
  * side and written by ft_set_parent on the write side.  Both use
  * rcu_dereference / rcu_assign_pointer for proper ordering.
  */
-#define FT_SKIP_LEN_SHIFT	57
-#define FT_SKIP_LEN_BITS	7
-#define FT_SKIP_LEN_MAX	((1U << FT_SKIP_LEN_BITS) - 1)	/* 127 */
-#define FT_SKIP_LEN_MASK	(((unsigned long) FT_SKIP_LEN_MAX) << FT_SKIP_LEN_SHIFT)
-#define FT_ADDR_MASK		((1UL << FT_SKIP_LEN_SHIFT) - 1)
+
+/* Per-architecture skip-length encoding parameters (64-bit only). */
+#if defined(URCU_ARCH_AMD64)
+# define FT_SKIP_LEN_SHIFT	57	/* Bits 57-63 (7 bits). LA57: 57-bit VA. */
+# define FT_SKIP_LEN_BITS	7
+#elif defined(URCU_ARCH_AARCH64)
+# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). LVA: 52-bit VA. */
+# define FT_SKIP_LEN_BITS	8
+#elif defined(URCU_ARCH_PPC64)
+# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). Radix: 52-bit VA. */
+# define FT_SKIP_LEN_BITS	8
+#elif defined(URCU_ARCH_RISCV) && CAA_BITS_PER_LONG >= 64
+# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). Sv57: 57-bit VA. */
+# define FT_SKIP_LEN_BITS	8
+#elif defined(URCU_ARCH_MIPS) && CAA_BITS_PER_LONG >= 64
+# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). 48-bit VA. */
+# define FT_SKIP_LEN_BITS	8
+#elif defined(URCU_ARCH_LOONGARCH)
+# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). 48-bit VA. */
+# define FT_SKIP_LEN_BITS	8
+#endif
+
+#ifdef FT_SKIP_LEN_BITS
+# define FT_SKIP_LEN_MAX	((1U << FT_SKIP_LEN_BITS) - 1)
+# define FT_SKIP_LEN_MASK	(((unsigned long) FT_SKIP_LEN_MAX) << FT_SKIP_LEN_SHIFT)
+# define FT_ADDR_MASK		((1UL << FT_SKIP_LEN_SHIFT) - 1)
+#endif
 
 #define FT_ENTRY_PER_NODE	256
 #define FT_LOG2_BITS_PER_BYTE	3U
@@ -197,13 +235,12 @@
  * high bits of pointers (bits 57-63).  This requires architectures
  * where those bits are guaranteed zero for userspace pointers.
  *
- * Enabled by default on:
- *   - x86-64: bits 48-63 (or 57-63 with LA57) are zero for userspace.
- *   - aarch64: bits 48-63 (or 52-63 with LVA) are zero for userspace.
+ * Enabled on architectures that define FT_SKIP_LEN_BITS (see
+ * per-architecture encoding parameters above).  A runtime
+ * validation (mmap probe) at flag-set time rejects the feature
+ * if the encoding bits fall within the kernel's VA range.
  *
- * Must be individually evaluated for each new architecture
- * (e.g. s390x has full 64-bit virtual addresses, mips64/ppc64/riscv64
- * vary by implementation).
+ * Not supported on s390x (full 64-bit virtual addresses).
  *
  * Requires FEATURE_FT_COMPRESS (skip-compressed is meaningless
  * without compressed nodes).
@@ -216,7 +253,7 @@
 # endif
 #endif
 #ifndef NO_FEATURE_FT_SKIP_COMPRESSED
-# if defined(URCU_ARCH_AMD64) || defined(URCU_ARCH_AARCH64)
+# if defined(FT_SKIP_LEN_BITS)
 #  define FEATURE_FT_SKIP_COMPRESSED
 # endif
 #endif
