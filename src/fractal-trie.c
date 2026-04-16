@@ -1250,6 +1250,8 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
 		abort();
 	}
 	metadata->external_nodes = external_nodes;
+	if (external_nodes)
+		external_nodes->prev = node_flag;
 }
 
 /*
@@ -1424,7 +1426,8 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
  * pointer by following the child's parent back-pointer.
  *
  * For internal/compressed/collapsed children: uses metadata->parent.
- * For external (leaf) children: uses cds_ft_node._ft_parent.
+ * For external (leaf) children: uses cds_ft_node.prev (which points
+ * to the parent for the head of a duplicate chain).
  *
  * Write-side or exact lookup path only.
  */
@@ -1436,7 +1439,7 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
 	struct cds_ft_inode_flag *parent;
 
 	if (ft_node_external(child))
-		parent = rcu_dereference(((struct cds_ft_node *) child)->_ft_parent);
+		parent = rcu_dereference(((struct cds_ft_node *) child)->prev);
 	else
 		parent = rcu_dereference(cds_ft_item_to_metadata(
 			ft_node_ptr(child))->parent);
@@ -1673,7 +1676,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
  * ft_set_parent: set the parent pointer in child's metadata.
  * Skips NULL children.
  *
- * External (leaf) nodes: sets cds_ft_node._ft_parent.
+ * External (leaf) nodes: sets cds_ft_node.prev (head of duplicate chain).
  *
  * For skip-compressed pointers: the skip pointer represents a
  * compressed node in the tree.  Set the compressed node's parent
@@ -1718,7 +1721,7 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 #endif
 	if (ft_node_external(child_nf)) {
 		rcu_assign_pointer(
-			((struct cds_ft_node *) child_nf)->_ft_parent,
+			((struct cds_ft_node *) child_nf)->prev,
 			parent_nf);
 		return;
 	}
@@ -9402,7 +9405,11 @@ void ft_chain_node(struct cds_ft_node *last_node, struct cds_ft_node *node)
 	 * always see either the prior node or the newly added if
 	 * executed concurrently with a sequence of add followed by del
 	 * on the same key. Safe against concurrent RCU read traversals.
+	 *
+	 * The prev pointer is write-side only (mutex-held), so a plain
+	 * store is sufficient.
 	 */
+	node->prev = last_node;
 	node->next = NULL;
 	rcu_assign_pointer(last_node->next, node);
 }
@@ -9672,12 +9679,12 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 
 			while (last->next)
 				last = last->next;
-			node->next = NULL;
-			rcu_assign_pointer(last->next, node);
+			ft_chain_node(last, node);
 			/* Skip ft_propagate_external_count_parent below:
 			 * duplicate at existing key, no new unique key. */
 			goto skip_key_count_propagation;
 		}
+		node->prev = jct_flag;
 		node->next = NULL;
 		rcu_assign_pointer(
 			jct_meta->external_nodes, node);
@@ -10039,8 +10046,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 		return -EINVAL;
 	ft_key_to_ordinals(ordinal_buf, _key, key_len, &ft->group->key_map);
 	iter_key = key;
-	/* Expect zeroed next pointer. This catches some double-insert misuses. */
-	if (node->next)
+	/* Expect zeroed prev/next pointers. This catches some double-insert misuses. */
+	if (node->prev || node->next)
 		return -EINVAL;
 	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH))
 		return -ENOMEM;
@@ -10431,6 +10438,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				ret = 0;
 			} else {
 				/* New key at this internal node. */
+				node->prev = d.nf;
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 				ret = 0;
@@ -10562,8 +10570,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
 	ft_key_to_ordinals(ordinal_buf, _key, key_len, &ft->group->key_map);
-	/* Expect zeroed next pointer. */
-	if (node->next)
+	/* Expect zeroed prev/next pointers. */
+	if (node->prev || node->next)
 		return -EINVAL;
 	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH))
 		return -ENOMEM;
@@ -10681,10 +10689,12 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						external_nodes);
 				/* Replace existing chain: key count unchanged. */
 				*old_node_ret = external_nodes;
+				node->prev = d.nf;
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 			} else {
 				/* No external nodes yet. New key. */
+				node->prev = d.nf;
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 				ft_propagate_external_count_parent(ft, d.nf, 1);
@@ -10695,6 +10705,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					ft_node_ptr(d.nf));
 			/* External node at end of key. Replace chain: key count unchanged. */
 			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
+			node->prev = d.pnf;
 			node->next = NULL;
 			ft_publish_to_parent(ft, d.pnf, d.nfp,
 				(struct cds_ft_inode_flag *) node);
@@ -10756,7 +10767,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	unsigned int i, key_depth;
 	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_inode_flag **node_flag_ptr;
-	struct cds_ft_node *iter_node, **iter_node_ptr, **prev_node_ptr, *match;
+	struct cds_ft_node *iter_node, **head_slot, *match;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 
@@ -10771,8 +10782,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	if (!valid_external_node(old_node) || !valid_external_node(new_node)
 			|| !valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	/* Expect zeroed next pointer on new_node. */
-	if (new_node->next)
+	/* Expect zeroed next and prev pointers on new_node. */
+	if (new_node->next || new_node->prev)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 
 	key_depth = key_len + 1;
@@ -10794,7 +10805,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		if (!metadata->external_nodes)
 			return CDS_FT_STATUS_NOT_FOUND;
-		iter_node_ptr = (struct cds_ft_node **) &metadata->external_nodes;
+		head_slot = (struct cds_ft_node **) &metadata->external_nodes;
 		iter_node = metadata->external_nodes;
 		goto find_and_replace;
 	}
@@ -10844,28 +10855,21 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		if (!metadata->external_nodes)
 			return CDS_FT_STATUS_NOT_FOUND;
-		iter_node_ptr = (struct cds_ft_node **) &metadata->external_nodes;
+		head_slot = (struct cds_ft_node **) &metadata->external_nodes;
 		iter_node = metadata->external_nodes;
 	} else {
-		iter_node_ptr = (struct cds_ft_node **) node_flag_ptr;
+		head_slot = (struct cds_ft_node **) node_flag_ptr;
 		iter_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
 	}
 
 find_and_replace:
-	/*
-	 * Walk the duplicate chain to find old_node and track the
-	 * pointer that references it (prev_node_ptr).
-	 */
-	prev_node_ptr = NULL;
+	/* Walk the duplicate chain to find old_node. */
 	match = NULL;
 	cds_ft_for_each_duplicate(iter_node) {
-		if (match)
-			continue;
 		if (iter_node == old_node) {
-			prev_node_ptr = iter_node_ptr;
 			match = iter_node;
+			break;
 		}
-		iter_node_ptr = &iter_node->next;
 	}
 
 	if (!match)
@@ -10873,12 +10877,24 @@ find_and_replace:
 
 	/*
 	 * Splice new_node into the chain in place of old_node.
-	 * new_node inherits old_node's successor. The write barrier
-	 * within rcu_assign_pointer ensures new_node->next is visible
-	 * before the pointer that publishes new_node.
+	 * new_node inherits old_node's prev and next pointers.
+	 * The write barrier within rcu_assign_pointer ensures
+	 * new_node->next is visible before the pointer that
+	 * publishes new_node.
 	 */
+	new_node->prev = old_node->prev;
 	new_node->next = old_node->next;
-	rcu_assign_pointer(*prev_node_ptr, new_node);
+	if (new_node->next)
+		new_node->next->prev = new_node;
+	if (ft_node_external((struct cds_ft_inode_flag *) old_node->prev)) {
+		/* Non-head: update predecessor's next pointer. */
+		struct cds_ft_node *prev_node =
+			(struct cds_ft_node *) old_node->prev;
+		rcu_assign_pointer(prev_node->next, new_node);
+	} else {
+		/* Head: update the head slot. */
+		rcu_assign_pointer(*head_slot, new_node);
+	}
 
 	/*
 	 * The trie structure is unchanged (no recompaction), so the
@@ -11148,7 +11164,7 @@ int ft_detach_node(struct cds_ft *ft,
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes);
 			/*
-			 * Set the external's _ft_parent so that
+			 * Set the external's prev so that
 			 * ft_skip_to_compressed can recover the
 			 * compressed node from the skip pointer.
 			 */
@@ -11390,11 +11406,38 @@ end:
 	return ret;
 }
 
+/*
+ * ft_unchain_node: remove @node from its duplicate chain using prev/next.
+ *
+ * @head_slot: address of the pointer that holds the head of the chain
+ *             (e.g. &metadata->external_nodes or the parent's child slot).
+ *             Only used when @node is the head of the chain.
+ * @node:      the node to remove.
+ *
+ * For head nodes (node->prev is a flagged internal pointer): updates
+ * *head_slot to point to node->next.
+ * For non-head nodes (node->prev is a cds_ft_node): updates prev->next
+ * to skip over node.
+ * In both cases, if node->next exists, its prev pointer inherits
+ * node->prev (either the parent pointer or the predecessor node).
+ */
 static
-void ft_unchain_node(struct cds_ft_node **prev_node_ptr,
+void ft_unchain_node(struct cds_ft_node **head_slot,
 		struct cds_ft_node *node)
 {
-	uatomic_store(prev_node_ptr, node->next, CMM_RELAXED);
+	struct cds_ft_node *next_node = node->next;
+
+	if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
+		/* Non-head: prev is a cds_ft_node. */
+		struct cds_ft_node *prev_node =
+			(struct cds_ft_node *) node->prev;
+		uatomic_store(&prev_node->next, next_node, CMM_RELAXED);
+	} else {
+		/* Head: prev is parent (flagged internal node pointer). */
+		uatomic_store(head_slot, next_node, CMM_RELAXED);
+	}
+	if (next_node)
+		next_node->prev = node->prev;
 }
 
 /*
@@ -11425,7 +11468,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_node *node)
 {
 	struct ft_detach_descent dd;
-	struct cds_ft_node *iter_node, **iter_node_ptr, **prev_node_ptr, *match;
+	struct cds_ft_node *iter_node, *match;
 	int ret, count = 0;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
@@ -11580,23 +11623,15 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
 		external_nodes = metadata->external_nodes;
 		if (external_nodes) {
-			/*
-			 * Find the previous node's next pointer pointing to our node,
-			 * so we can update it.
-			 */
-			prev_node_ptr = NULL;
-			iter_node_ptr = (struct cds_ft_node **) &metadata->external_nodes;
+			/* Find our node in the duplicate chain. */
 			iter_node = (struct cds_ft_node *) external_nodes;
 			match = NULL;
 			cds_ft_for_each_duplicate(iter_node) {
-				if (match)
-					continue;
 				dbg_printf("cds_ft_remove: compare %p with iter_node %p\n", node, iter_node);
 				if (iter_node == node) {
-					prev_node_ptr = iter_node_ptr;
 					match = iter_node;
+					break;
 				}
-				iter_node_ptr = &iter_node->next;
 			}
 			if (!match) {
 				dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
@@ -11607,11 +11642,11 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * entry in the chain (undercount ordering: decrement
 			 * nr_keys before detaching the pointer).
 			 */
-			if (prev_node_ptr == (struct cds_ft_node **) &metadata->external_nodes
+			if (!ft_node_external((struct cds_ft_inode_flag *) match->prev)
 			    && !match->next) {
 				ft_propagate_external_count_parent(ft, dd.d.nf, -1);
 			}
-			ft_unchain_node(prev_node_ptr, match);
+			ft_unchain_node((struct cds_ft_node **) &metadata->external_nodes, match);
 			ret = 0;
 		} else {
 			dbg_printf("cds_ft_remove: no metadata external node found for key\n");
@@ -11621,24 +11656,17 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		/* Found external node at end of key. */
 
 		/*
-		 * Find the previous node's next pointer pointing to our node,
-		 * so we can update it.
+		 * Find our node in the duplicate chain and count
+		 * total entries to decide detach vs unchain.
 		 */
-		prev_node_ptr = NULL;
-		iter_node_ptr = (struct cds_ft_node **) dd.d.nfp;
 		iter_node = (struct cds_ft_node *) ft_node_ptr(dd.d.nf);
 		count = 0;
 		match = NULL;
 		cds_ft_for_each_duplicate(iter_node) {
 			count++;
-			if (match)
-				continue;
 			dbg_printf("cds_ft_remove: compare %p with iter_node %p\n", node, iter_node);
-			if (iter_node == node) {
-				prev_node_ptr = iter_node_ptr;
+			if (!match && iter_node == node)
 				match = iter_node;
-			}
-			iter_node_ptr = &iter_node->next;
 		}
 		if (!match) {
 			dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
@@ -11664,7 +11692,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			}
 		} else {
 			/* Removing duplicate, not last: key count unchanged. */
-			ft_unchain_node(prev_node_ptr, match);
+			ft_unchain_node((struct cds_ft_node **) dd.d.nfp, match);
 			ret = 0;
 		}
 	}
