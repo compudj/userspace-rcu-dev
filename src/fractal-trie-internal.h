@@ -95,8 +95,8 @@
  *
  * The compressed node remains allocated (for key bytes, inequality
  * lookup, exact lookup) and is accessible via the child node's
- * metadata->parent pointer (or cds_ft_node._ft_parent for external
- * children).
+ * metadata->parent pointer (or cds_ft_node.prev for the head of
+ * an external duplicate chain).
  *
  * Dual-pointer RCU publication:
  *
@@ -119,10 +119,10 @@
  * concurrent readers may observe pre-mutation or post-mutation
  * state, never a mix of both within a single traversal.
  *
- * The child's metadata->parent (and cds_ft_node._ft_parent for
- * external nodes) is read by ft_skip_to_compressed on the read
- * side and written by ft_set_parent on the write side.  Both use
- * rcu_dereference / rcu_assign_pointer for proper ordering.
+ * The child's metadata->parent (and cds_ft_node.prev for the head
+ * of an external duplicate chain) is read by ft_skip_to_compressed
+ * on the read side and written by ft_set_parent on the write side.
+ * Both use rcu_dereference / rcu_assign_pointer for proper ordering.
  */
 
 /* Per-architecture skip-length encoding parameters (64-bit only). */

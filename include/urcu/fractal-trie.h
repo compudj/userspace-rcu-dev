@@ -381,10 +381,20 @@ enum cds_ft_iter_path_mode {
 };
 
 /*
- * Duplicate nodes with the same key are chained into a singly-linked
+ * Duplicate nodes with the same key are chained into a doubly-linked
  * list. The last item of this list has a NULL next pointer.
  * The node needs to be zeroed or initialized with cds_ft_node_init
  * before being inserted into a Fractal Trie.
+ *
+ * The first node's prev pointer points to the parent internal node
+ * (a flagged pointer distinguishable via ft_node_external() returning
+ * false). Non-head nodes' prev pointers point to the preceding
+ * cds_ft_node in the duplicate chain.
+ *
+ * The prev pointer is only used by the write side (mutex-held) and
+ * the exact lookup path (ft_skip_to_compressed). It is not accessed
+ * on the candidate lookup fast path. RCU readers only follow next
+ * pointers.
  *
  * Note that removal from a Fractal Trie does _not_ reset node->next,
  * because it can still be accessed by concurrent RCU readers. After
@@ -395,15 +405,17 @@ enum cds_ft_iter_path_mode {
  * This structure is required to be naturally aligned.
  */
 struct cds_ft_node {
-	struct cds_ft_node *next;
 	/*
-	 * Parent pointer used by CDS_FT_FLAG_SKIP_COMPRESSED to recover
-	 * the compressed node from a skip pointer when the child is an
-	 * external (leaf) node.  Written by the mutation side
+	 * prev pointer: for the head of the duplicate chain, this points
+	 * to the parent internal node (flagged pointer, used by
+	 * CDS_FT_FLAG_SKIP_COMPRESSED to recover the compressed node
+	 * from a skip pointer). For non-head duplicates, this points to
+	 * the preceding cds_ft_node. Written by the mutation side
 	 * (mutex-held); read by exact lookup and write-side paths.
 	 * Not accessed on the candidate lookup fast path.
 	 */
-	void *_ft_parent;
+	void *prev;
+	struct cds_ft_node *next;
 };
 
 #define cds_ft_entry(ptr, type, member)		caa_container_of(ptr, type, member)
@@ -415,8 +427,8 @@ struct cds_ft_node {
 static inline
 void cds_ft_node_init(struct cds_ft_node *node)
 {
+	node->prev = NULL;
 	node->next = NULL;
-	node->_ft_parent = NULL;
 }
 
 /*
