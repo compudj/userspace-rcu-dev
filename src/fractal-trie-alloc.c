@@ -109,8 +109,11 @@ struct cds_ft_alloc_range *cds_ft_metadata_to_range(struct cds_ft_metadata *meta
 	struct cds_ft_metadata_alloc *metadata_alloc =
 		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
 	size_t index = metadata->alloc_index;
+	struct cds_ft_alloc_range *range;
 
-	return (struct cds_ft_alloc_range *)((char *)(metadata_alloc - index) - sizeof(struct cds_ft_alloc_range));
+	range = (struct cds_ft_alloc_range *)((char *)(metadata_alloc - index) - sizeof(struct cds_ft_alloc_range));
+	assert(index < range->arena->max_nr_items_per_range);
+	return range;
 }
 
 /*
