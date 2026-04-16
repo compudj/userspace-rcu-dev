@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 164
+#define NR_TESTS 165
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -3940,6 +3940,75 @@ static int test_graft_basic(void)
 	rcu_read_unlock();
 	if (count != 2) {
 		fprintf(stderr, "graft_basic: live count %lu, expected 2\n", count);
+		goto fail;
+	}
+
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Reproducer: graft where the descent stops at an external leaf at depth <
+ * key_len, with path_len = key_len - depth >= 2 so ft_build_branch may
+ * return a compressed node.  With a displaced external, the caller then
+ * calls ft_metadata_set_external_nodes on a compressed node, which aborts.
+ */
+static int test_graft_displaced_external_compressed(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	enum cds_ft_status s;
+
+	live = create_varlen_ft(&group);
+	if (cds_ft_create(group, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/*
+	 * Insert "ab" into live so that at depth 2 we have an external
+	 * node.  Descent for a longer "ab..." key will stop at this
+	 * external.
+	 */
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		s = cds_ft_insert(live, (const uint8_t *)"ab", 2, &n1->node);
+		if (s < 0) goto fail;
+	}
+
+	/* Populate staging with a single entry. */
+	{
+		struct ft_test_node *n2 = node_alloc(0);
+		s = cds_ft_insert(staging, (const uint8_t *)"x", 1, &n2->node);
+		if (s < 0) goto fail;
+	}
+
+	/*
+	 * Graft staging into live at "abcd" (key_len=4).  Descent stops
+	 * at depth 2 (external "ab"), path_len = 2 — triggers the
+	 * compressed-branch path.
+	 */
+	rcu_read_lock();
+	s = cds_ft_graft(live, (const uint8_t *)"abcd", 4, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"graft_displaced_external_compressed: graft: %s\n",
+			cds_ft_status_to_string(s));
 		goto fail;
 	}
 
@@ -12122,6 +12191,7 @@ int main(int argc, char **argv)
 	/* 9. Graft, graft_swap & detach */
 	diag("Graft, graft_swap & detach tests");
 	RUN_TEST(test_graft_basic);
+	RUN_TEST(test_graft_displaced_external_compressed);
 	RUN_TEST(test_graft_at_root);
 	RUN_TEST(test_graft_populated_error);
 	RUN_TEST(test_graft_different_group_error);
