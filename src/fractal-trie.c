@@ -9329,8 +9329,8 @@ int ft_attach_node(struct cds_ft *ft,
 		if (attach_node_flag &&
 		    ft_node_collapsed(attach_node_flag)) {
 			ft_set_parent(iter_node_flag, attach_node_flag, old_node_flag_ptr);
-			rcu_assign_pointer(*old_node_flag_ptr,
-				iter_node_flag);
+			ft_publish_to_parent(ft, attach_node_flag,
+				old_node_flag_ptr, iter_node_flag);
 			goto publish_done;
 		}
 #endif
@@ -10252,8 +10252,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 							~FT_COLLAPSED_TOMBSTONE,
 							CMM_RELAXED);
 					ft_set_parent(branch, d.nf, &cptrs[tombstone_reuse]);
-					rcu_assign_pointer(
-						cptrs[tombstone_reuse], branch);
+					ft_publish_to_parent(ft, d.nf,
+						&cptrs[tombstone_reuse], branch);
 					{
 						struct cds_ft_metadata *col_meta =
 							cds_ft_item_to_metadata(
@@ -11218,11 +11218,24 @@ int ft_detach_node(struct cds_ft *ft,
 		for (e = 0; e < ft_collapsed_count(nr_e); e++) {
 			if (&cptrs[e] == detach_node_flag_ptr) {
 				if (topmost_external_nodes) {
-					rcu_assign_pointer(cptrs[e],
+					/*
+					 * Reparent the external chain head to
+					 * the collapsed node before publishing.
+					 * Without this, topmost_external_nodes->prev
+					 * would keep pointing to the detached
+					 * (about-to-be-freed) subtree node.
+					 */
+					ft_set_parent(
+						(struct cds_ft_inode_flag *)
+						topmost_external_nodes,
+						iter_node_flag, &cptrs[e]);
+					ft_publish_to_parent(ft, iter_node_flag,
+						&cptrs[e],
 						(struct cds_ft_inode_flag *)
 						topmost_external_nodes);
 				} else {
-					rcu_assign_pointer(cptrs[e], NULL);
+					ft_publish_to_parent(ft, iter_node_flag,
+						&cptrs[e], NULL);
 					/*
 					 * Set tombstone.  256B zones don't use
 					 * tombstones (the bit overlaps offsets).
@@ -11254,6 +11267,16 @@ int ft_detach_node(struct cds_ft *ft,
 				cur_depth,
 				-(long) ft_node_readside_footprint(ft,
 					iter_node_flag));
+			/*
+			 * Reparent the external chain head (if any) to the
+			 * collapsed node's parent before the collapsed node
+			 * is freed.  Otherwise replacement->prev would point
+			 * to the collapsed node about to be freed.
+			 */
+			if (replacement)
+				ft_set_parent(replacement,
+					col_meta->parent,
+					detach_parent_flag_ptr);
 			ft_publish_to_parent(ft, col_meta->parent,
 				detach_parent_flag_ptr, replacement);
 			free_collapsed_node(ft, col);
