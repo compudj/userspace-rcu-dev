@@ -45,20 +45,8 @@ struct cds_ft_alloc_arena;
 static size_t page_size;
 
 struct cds_ft_metadata_alloc {
-	/*
-	 * rcu_head and free_list_next are only used when the node is
-	 * being freed or on the free list.  metadata is only used when
-	 * the node is allocated.  They share the same memory.
-	 *
-	 * call_rcu writes 16 bytes into rcu_head, corrupting the first
-	 * 16 bytes of metadata (parent, skip_slot).  Fields accessed
-	 * in the RCU callback (density_extended, density_ext) and
-	 * alloc_index are beyond the rcu_head footprint and remain
-	 * valid.  alloc_index lives in cds_ft_metadata's tail padding
-	 * at offset 44 — see the field's comment there.
-	 */
+	struct rcu_head rcu_head;
 	union {
-		struct rcu_head rcu_head;
 		struct cds_ft_metadata_alloc *free_list_next;
 		struct cds_ft_metadata metadata;
 	};
@@ -357,7 +345,7 @@ void cds_ft_free_item_rcu(struct rcu_head *rcu_head)
 	struct cds_ft_alloc_arena *arena =
 		cds_ft_metadata_to_range(&metadata_alloc->metadata)->arena;
 
-	/* Free lazily-allocated extended density counters. */
+	/* Free extended density counters. */
 	if (metadata_alloc->metadata.nr_keys == UINT32_MAX)
 		free(metadata_alloc->metadata.density_ext);
 
