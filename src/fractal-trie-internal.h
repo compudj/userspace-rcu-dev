@@ -12,6 +12,7 @@
  */
 
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -690,5 +691,52 @@ static inline void ft_delay_reader(void) { }
  * update_start_poll_synchronize_rcu and
  * update_poll_state_synchronize_rcu function pointers.
  */
+
+/*
+ * Tracepoint node-kind identifiers.
+ *
+ * These values are exposed as an LTTng-UST enumeration in src/ft_tp.h
+ * (via the LTTNG_UST_TRACEPOINT_ENUM declaration which references
+ * these C enum labels).  Keeping both in the same enum guarantees the
+ * C side and the trace-metadata side cannot drift out of sync.
+ *
+ * Labels are designed to describe the underlying structure without
+ * requiring the reader to know the build's pointer width:
+ *   - LINEAR/LINEAR_WIDE: total node size in bytes (= 2^order).
+ *   - POOL_<dim>D_<bytes>: dimensionality (1D = single sub-array,
+ *     2D = matrix of sub-arrays) and total node size in bytes.
+ *     POOL_1D_512 (a 64-bit POOL_IDX_A) is structurally distinct
+ *     from POOL_2D_512 (a 32-bit POOL_IDX_B) even though both have
+ *     the same byte size.
+ *   - PIGEON: 256-entry direct table; the byte size depends on
+ *     pointer width (1024 on 32-bit, 2048 on 64-bit).
+ *   - COLLAPSED: single label; the scan-size variant requires reading
+ *     the node header and is intentionally not exposed in this enum.
+ *
+ * The superset listed here covers every variant realizable by any
+ * 32-bit or 64-bit build configuration; a given build may not emit
+ * all of them.
+ */
+enum ft_tp_node_kind {
+	FT_TP_NODE_NULL			=  0,
+	FT_TP_NODE_EXTERNAL		=  1,
+	FT_TP_NODE_SKIP_COMPRESSED	=  2,
+	FT_TP_NODE_COMPRESSED		=  3,
+	FT_TP_NODE_COLLAPSED		=  4,
+	FT_TP_NODE_LINEAR_16		=  5,
+	FT_TP_NODE_LINEAR_32		=  6,
+	FT_TP_NODE_LINEAR_64		=  7,
+	FT_TP_NODE_LINEAR_128		=  8,
+	FT_TP_NODE_LINEAR_WIDE_64	=  9,
+	FT_TP_NODE_LINEAR_WIDE_128	= 10,
+	FT_TP_NODE_LINEAR_WIDE_256	= 11,
+	FT_TP_NODE_POOL_1D_256		= 12,
+	FT_TP_NODE_POOL_1D_512		= 13,
+	FT_TP_NODE_POOL_2D_512		= 14,
+	FT_TP_NODE_POOL_2D_1024		= 15,
+	FT_TP_NODE_PIGEON_1024		= 16,
+	FT_TP_NODE_PIGEON_2048		= 17,
+	FT_TP_NODE_UNKNOWN		= 18,
+};
 
 #endif /* _URCU_FT_INTERNAL_H */
