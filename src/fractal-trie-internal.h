@@ -713,6 +713,11 @@ static inline void ft_delay_reader(void) { }
  *   - COLLAPSED: single label; the scan-size variant requires reading
  *     the node header and is intentionally not exposed in this enum.
  *
+ * Skip-compression is an orthogonal property (a skip-compressed
+ * pointer can point to any underlying node type), so it is not
+ * encoded in this enum.  Tracepoints that emit node_kind expose a
+ * companion "skip_compressed" boolean field alongside it.
+ *
  * The superset listed here covers every variant realizable by any
  * 32-bit or 64-bit build configuration; a given build may not emit
  * all of them.
@@ -720,23 +725,22 @@ static inline void ft_delay_reader(void) { }
 enum ft_tp_node_kind {
 	FT_TP_NODE_NULL			=  0,
 	FT_TP_NODE_EXTERNAL		=  1,
-	FT_TP_NODE_SKIP_COMPRESSED	=  2,
-	FT_TP_NODE_COMPRESSED		=  3,
-	FT_TP_NODE_COLLAPSED		=  4,
-	FT_TP_NODE_LINEAR_16		=  5,
-	FT_TP_NODE_LINEAR_32		=  6,
-	FT_TP_NODE_LINEAR_64		=  7,
-	FT_TP_NODE_LINEAR_128		=  8,
-	FT_TP_NODE_LINEAR_WIDE_64	=  9,
-	FT_TP_NODE_LINEAR_WIDE_128	= 10,
-	FT_TP_NODE_LINEAR_WIDE_256	= 11,
-	FT_TP_NODE_POOL_1D_256		= 12,
-	FT_TP_NODE_POOL_1D_512		= 13,
-	FT_TP_NODE_POOL_2D_512		= 14,
-	FT_TP_NODE_POOL_2D_1024		= 15,
-	FT_TP_NODE_PIGEON_1024		= 16,
-	FT_TP_NODE_PIGEON_2048		= 17,
-	FT_TP_NODE_UNKNOWN		= 18,
+	FT_TP_NODE_COMPRESSED		=  2,
+	FT_TP_NODE_COLLAPSED		=  3,
+	FT_TP_NODE_LINEAR_16		=  4,
+	FT_TP_NODE_LINEAR_32		=  5,
+	FT_TP_NODE_LINEAR_64		=  6,
+	FT_TP_NODE_LINEAR_128		=  7,
+	FT_TP_NODE_LINEAR_WIDE_64	=  8,
+	FT_TP_NODE_LINEAR_WIDE_128	=  9,
+	FT_TP_NODE_LINEAR_WIDE_256	= 10,
+	FT_TP_NODE_POOL_1D_256		= 11,
+	FT_TP_NODE_POOL_1D_512		= 12,
+	FT_TP_NODE_POOL_2D_512		= 13,
+	FT_TP_NODE_POOL_2D_1024		= 14,
+	FT_TP_NODE_PIGEON_1024		= 15,
+	FT_TP_NODE_PIGEON_2048		= 16,
+	FT_TP_NODE_UNKNOWN		= 17,
 };
 
 #endif /* _URCU_FT_INTERNAL_H */

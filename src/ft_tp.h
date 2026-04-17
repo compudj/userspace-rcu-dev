@@ -40,7 +40,8 @@
 #define _FT_TP_H_HELPERS
 #include "fractal-trie-internal.h"
 struct cds_ft_inode_flag;
-int ft_tp_node_kind(struct cds_ft_inode_flag *nf);
+uint16_t ft_tp_node_kind(struct cds_ft_inode_flag *nf);
+uint16_t ft_tp_node_skip_len(struct cds_ft_inode_flag *nf);
 #endif
 
 #undef LTTNG_UST_TRACEPOINT_PROVIDER
@@ -110,7 +111,6 @@ LTTNG_UST_TRACEPOINT_ENUM(ft_tp, ft_tp_node_kind,
 	LTTNG_UST_TP_ENUM_VALUES(
 		lttng_ust_field_enum_value("NULL",		FT_TP_NODE_NULL)
 		lttng_ust_field_enum_value("EXTERNAL",		FT_TP_NODE_EXTERNAL)
-		lttng_ust_field_enum_value("SKIP_COMPRESSED",	FT_TP_NODE_SKIP_COMPRESSED)
 		lttng_ust_field_enum_value("COMPRESSED",	FT_TP_NODE_COMPRESSED)
 		lttng_ust_field_enum_value("COLLAPSED",		FT_TP_NODE_COLLAPSED)
 		lttng_ust_field_enum_value("LINEAR_16",		FT_TP_NODE_LINEAR_16)
@@ -140,7 +140,7 @@ LTTNG_UST_TRACEPOINT_EVENT_CLASS(ft_tp, ft_key_event_class,
 		size_t, key_len
 	),
 	LTTNG_UST_TP_FIELDS(
-		lttng_ust_field_sequence_hex(uint8_t, key, key, size_t, key_len)
+		lttng_ust_field_sequence_hex(uint8_t, key, key, unsigned int, key_len)
 	)
 )
 
@@ -286,8 +286,10 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, ineq_going_up_step,
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_integer(int, level, level)
 		lttng_ust_field_integer_hex(uintptr_t, path_entry, (uintptr_t) path_entry)
-		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, int, path_entry_kind,
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, uint16_t, path_entry_kind,
 			ft_tp_node_kind((struct cds_ft_inode_flag *) path_entry))
+		lttng_ust_field_integer(uint16_t, path_entry_skip_len,
+			ft_tp_node_skip_len((struct cds_ft_inode_flag *) path_entry))
 		lttng_ust_field_integer(int, found_sibling, found_sibling)
 		lttng_ust_field_integer(uint8_t, ord_key, ord_key)
 	)
@@ -319,8 +321,10 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, fastpath_enter,
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_enum(ft_tp, ft_lookup_mode, int, mode, mode)
 		lttng_ust_field_integer_hex(uintptr_t, node_flag, (uintptr_t) node_flag)
-		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, int, node_kind,
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, uint16_t, node_kind,
 			ft_tp_node_kind((struct cds_ft_inode_flag *) node_flag))
+		lttng_ust_field_integer(uint16_t, skip_len,
+			ft_tp_node_skip_len((struct cds_ft_inode_flag *) node_flag))
 		lttng_ust_field_integer(int, level_after, level_after)
 	)
 )
@@ -335,8 +339,10 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, post_traversal,
 		lttng_ust_field_enum(ft_tp, ft_lookup_mode, int, mode, mode)
 		lttng_ust_field_integer(int, level, level)
 		lttng_ust_field_integer_hex(uintptr_t, node_flag, (uintptr_t) node_flag)
-		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, int, node_kind,
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, uint16_t, node_kind,
 			ft_tp_node_kind((struct cds_ft_inode_flag *) node_flag))
+		lttng_ust_field_integer(uint16_t, skip_len,
+			ft_tp_node_skip_len((struct cds_ft_inode_flag *) node_flag))
 	)
 )
 
@@ -364,8 +370,10 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, slowpath_step,
 		lttng_ust_field_integer(int, level, level)
 		lttng_ust_field_integer(uint8_t, key_value, key_value)
 		lttng_ust_field_integer_hex(uintptr_t, node_flag, (uintptr_t) node_flag)
-		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, int, node_kind,
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, uint16_t, node_kind,
 			ft_tp_node_kind((struct cds_ft_inode_flag *) node_flag))
+		lttng_ust_field_integer(uint16_t, skip_len,
+			ft_tp_node_skip_len((struct cds_ft_inode_flag *) node_flag))
 		lttng_ust_field_integer(int, broke, broke)
 	)
 )

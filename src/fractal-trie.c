@@ -1895,18 +1895,43 @@ static const uint8_t ft_tp_kind_table[FT_TP_KIND_TABLE_MASK + 1] = {
 #endif
 };
 
-int ft_tp_node_kind(struct cds_ft_inode_flag *nf)
+uint16_t ft_tp_node_kind(struct cds_ft_inode_flag *nf)
 {
 	uint8_t kind;
 
 	if (!nf)
 		return FT_TP_NODE_NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * Skip-compression is orthogonal to the underlying node type: a
+	 * skip pointer still points to a real child (external, internal,
+	 * collapsed, ...).  Strip the skip-length bits so the dispatch
+	 * table sees the underlying child's tag bits; the companion
+	 * ft_tp_node_skip_len() field exposes the skip length separately.
+	 */
 	if (ft_node_skip_compressed(nf))
-		return FT_TP_NODE_SKIP_COMPRESSED;
+		nf = ft_skip_child_ptr(nf);
 #endif
 	kind = ft_tp_kind_table[(unsigned long) nf & FT_TP_KIND_TABLE_MASK];
 	return kind ? kind : FT_TP_NODE_UNKNOWN;
+}
+
+/*
+ * Return the number of key bytes the skip pointer covers (i.e. the
+ * length of the skipped compressed path).  Zero means "not a skip
+ * pointer".  The value fits in a uint16_t since FT_SKIP_LEN_MAX is at
+ * most 255 on any supported architecture.
+ */
+uint16_t ft_tp_node_skip_len(struct cds_ft_inode_flag *nf)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (!nf || !ft_node_skip_compressed(nf))
+		return 0;
+	return (uint16_t) ft_skip_len(nf);
+#else
+	(void) nf;
+	return 0;
+#endif
 }
 #endif /* FT_ENABLE_TRACING */
 
