@@ -17216,11 +17216,10 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 	bool subset = false;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
 
-	FT_TP(iter_set_key_enter, (const void *) iter->ft, (const void *) iter,
-		key, key_len,
-		(int) iter->key_len, (int) iter->path_len);
-
 	key_len = ft_key_len(iter->ft, key_len);
+	FT_TP(iter_set_key_enter, (const void *) iter->ft, (const void *) iter,
+		key, key_len == CDS_FT_LEN_ERROR ? 0 : key_len,
+		(int) iter->key_len, (int) iter->path_len);
 	if (key_len > iter->ft->group->max_key_len)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	ft_key_to_ordinals(ordinal_buf, key, key_len, km);
