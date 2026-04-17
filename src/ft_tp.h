@@ -136,11 +136,35 @@ LTTNG_UST_TRACEPOINT_ENUM(ft_tp, ft_tp_node_kind,
 
 LTTNG_UST_TRACEPOINT_EVENT_CLASS(ft_tp, ft_key_event_class,
 	LTTNG_UST_TP_ARGS(
+		const void *, ft,
 		const uint8_t *, key,
 		size_t, key_len
 	),
 	LTTNG_UST_TP_FIELDS(
-		lttng_ust_field_sequence_hex(uint8_t, key, key, unsigned int, key_len)
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_sequence_hex(uint8_t, key, key, size_t, key_len)
+	)
+)
+
+/*
+ * Iter-keyed class for public APIs that act through an iterator.
+ * ft is emitted alongside iter even though iter is bound to ft at
+ * creation time: flight-recorder snapshots are finite and the
+ * iter_create event linking iter -> ft may have scrolled out of the
+ * ring buffer by the time the snapshot is taken, so emitting ft
+ * in each event keeps every event self-contained.
+ */
+LTTNG_UST_TRACEPOINT_EVENT_CLASS(ft_tp, ft_iter_key_event_class,
+	LTTNG_UST_TP_ARGS(
+		const void *, ft,
+		const void *, iter,
+		const uint8_t *, key,
+		size_t, key_len
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_integer_hex(uintptr_t, iter, (uintptr_t) iter)
+		lttng_ust_field_sequence_hex(uint8_t, key, key, size_t, key_len)
 	)
 )
 
@@ -159,6 +183,22 @@ LTTNG_UST_TRACEPOINT_EVENT_CLASS(ft_tp, ft_node_event_class,
 	),
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_integer_hex(uintptr_t, node, (uintptr_t) node)
+	)
+)
+
+/*
+ * Iter lifecycle/state class: every event carries both ft and iter
+ * so that flight-recorder snapshots remain self-contained even when
+ * the iter_create event has rotated out of the ring buffer.
+ */
+LTTNG_UST_TRACEPOINT_EVENT_CLASS(ft_tp, ft_iter_event_class,
+	LTTNG_UST_TP_ARGS(
+		const void *, ft,
+		const void *, iter
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_integer_hex(uintptr_t, iter, (uintptr_t) iter)
 	)
 )
 
@@ -399,31 +439,39 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, violation,
  */
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
 	insert_enter,
-	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+	LTTNG_UST_TP_ARGS(const void *, ft, const uint8_t *, key, size_t, key_len))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
 	insert_unique_enter,
-	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+	LTTNG_UST_TP_ARGS(const void *, ft, const uint8_t *, key, size_t, key_len))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
 	insert_replace_enter,
-	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+	LTTNG_UST_TP_ARGS(const void *, ft, const uint8_t *, key, size_t, key_len))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
-	remove_enter,
-	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
-LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
-	replace_enter,
-	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
-LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
-	lookup_enter,
-	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+	lookup_key_enter,
+	LTTNG_UST_TP_ARGS(const void *, ft, const uint8_t *, key, size_t, key_len))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
 	graft_enter,
-	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+	LTTNG_UST_TP_ARGS(const void *, ft, const uint8_t *, key, size_t, key_len))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
 	graft_swap_enter,
-	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+	LTTNG_UST_TP_ARGS(const void *, ft, const uint8_t *, key, size_t, key_len))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
 	detach_enter,
-	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+	LTTNG_UST_TP_ARGS(const void *, ft, const uint8_t *, key, size_t, key_len))
+
+/* Iter-keyed public APIs: emit both ft and iter for snapshot safety. */
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_iter_key_event_class, ft_tp,
+	remove_enter,
+	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter,
+		const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_iter_key_event_class, ft_tp,
+	replace_enter,
+	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter,
+		const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_iter_key_event_class, ft_tp,
+	lookup_enter,
+	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter,
+		const uint8_t *, key, size_t, key_len))
 
 /* Public API exits (status enum). */
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
@@ -452,6 +500,9 @@ LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
 	LTTNG_UST_TP_ARGS(int, status))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
 	lookup_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	lookup_key_exit,
 	LTTNG_UST_TP_ARGS(int, status))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
 	lookup_nth_exit,
@@ -508,28 +559,32 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, count_prefix,
 	)
 )
 
-/* Iterator lifecycle / state events. */
-LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+/* Iterator lifecycle / state events: (ft, iter) pair on every event. */
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_iter_event_class, ft_tp,
 	iter_create,
-	LTTNG_UST_TP_ARGS(const void *, node))
-LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_iter_event_class, ft_tp,
 	iter_destroy,
-	LTTNG_UST_TP_ARGS(const void *, node))
-LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_iter_event_class, ft_tp,
 	iter_invalidate_path,
-	LTTNG_UST_TP_ARGS(const void *, node))
-LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_iter_event_class, ft_tp,
 	iter_reset,
-	LTTNG_UST_TP_ARGS(const void *, node))
+	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter))
 
 LTTNG_UST_TRACEPOINT_EVENT(ft_tp, iter_set_key_enter,
 	LTTNG_UST_TP_ARGS(
+		const void *, ft,
+		const void *, iter,
 		const uint8_t *, key,
 		size_t, key_len,
 		int, prev_key_len,
 		int, prev_path_len
 	),
 	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_integer_hex(uintptr_t, iter, (uintptr_t) iter)
 		lttng_ust_field_sequence_hex(uint8_t, key, key, size_t, key_len)
 		lttng_ust_field_integer(int, prev_key_len, prev_key_len)
 		lttng_ust_field_integer(int, prev_path_len, prev_path_len)
@@ -537,17 +592,27 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, iter_set_key_enter,
 )
 LTTNG_UST_TRACEPOINT_EVENT(ft_tp, iter_set_key_exit,
 	LTTNG_UST_TP_ARGS(
+		const void *, ft,
+		const void *, iter,
 		int, subset,
 		int, path_len
 	),
 	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_integer_hex(uintptr_t, iter, (uintptr_t) iter)
 		lttng_ust_field_integer(int, subset, subset)
 		lttng_ust_field_integer(int, path_len, path_len)
 	)
 )
 LTTNG_UST_TRACEPOINT_EVENT(ft_tp, iter_set_prefix_len,
-	LTTNG_UST_TP_ARGS(int, prefix_len),
+	LTTNG_UST_TP_ARGS(
+		const void *, ft,
+		const void *, iter,
+		int, prefix_len
+	),
 	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_integer_hex(uintptr_t, iter, (uintptr_t) iter)
 		lttng_ust_field_integer(int, prefix_len, prefix_len)
 	)
 )
