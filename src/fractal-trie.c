@@ -17186,7 +17186,14 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 		iter->path_valid = false;
 		iter_debug_path_clear(iter);
 		iter->path_len = 0;
-	} else {
+	} else if (iter->path_len > key_len + 1) {
+		/*
+		 * Subset key reuses the existing path, but a prior
+		 * lookup that returned NOT_FOUND may have truncated
+		 * path_len below the previous key_len.  Only shrink
+		 * path_len down to the new key's depth; never extend
+		 * it past what was actually validated.
+		 */
 		iter->path_len = key_len + 1;
 	}
 	iter->key_len = key_len;
