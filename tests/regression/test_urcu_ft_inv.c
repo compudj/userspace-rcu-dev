@@ -40,6 +40,14 @@
 #include <urcu/fractal-trie.h>
 #include <urcu-call-rcu.h>
 
+#ifdef FT_ENABLE_TRACING
+#include "../../src/ft_tp.h"
+#define FT_TEST_TP(name, ...) \
+	lttng_ust_tracepoint(ft_tp, name, ##__VA_ARGS__)
+#else
+#define FT_TEST_TP(name, ...) do {} while (0)
+#endif
+
 #include <assert.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -1226,9 +1234,20 @@ static void *inv_relational_reader(void *arg)
 			cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
 			found_val = cds_ft_key_to_u64(ctx->ft, rk, CDS_FT_LEN_DEFAULT);
 			if (found_val < key) {
+				FT_TEST_TP(violation, key, found_val);
 				report_violation(ctx->test_name,
 					"lookup_ge(%" PRIu64 ") returned %" PRIu64,
 					key, found_val);
+#ifdef FT_ENABLE_TRACING
+				/*
+				 * Exit immediately so an LTTng trigger armed
+				 * on ft_tp:violation can snapshot and stop
+				 * the session with the ring-buffer tail
+				 * reflecting the failure context, without
+				 * additional mutations flooding the buffer.
+				 */
+				_exit(99);
+#endif
 			}
 		}
 

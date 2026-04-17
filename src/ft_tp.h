@@ -1,0 +1,638 @@
+// SPDX-FileCopyrightText: 2026 EfficiOS Inc.
+// SPDX-License-Identifier: MIT
+
+/*
+ * LTTng-UST tracepoint provider for Fractal Trie debugging.
+ *
+ * This header is only active when the library is built with
+ * -DFT_ENABLE_TRACING.  Without that define, ft_tp.c is empty and
+ * fractal-trie.c's FT_TP() macro expands to a no-op, so the library
+ * has no lttng-ust dependency in default builds.
+ *
+ * To enable: rebuild with CFLAGS including -DFT_ENABLE_TRACING and
+ * link with -llttng-ust -llttng-ust-common.
+ *
+ * Keys appear in tracepoint payloads as byte sequences
+ * (lttng_ust_field_sequence_hex) — the trie is byte-oriented and
+ * keys may have arbitrary length.
+ *
+ * Inequality-lookup mode, operation status, and compressed-handler
+ * action are exposed as LTTng-UST enumerations so trace viewers
+ * display the symbolic name rather than a raw integer.
+ */
+
+#ifdef FT_ENABLE_TRACING
+
+/*
+ * Helpers (struct/enum/function forward decls) are guarded separately
+ * so they are only processed once, even though tracepoint-event.h
+ * re-reads this header multiple times.  File-scope C declarations
+ * are not legal in all re-read contexts.
+ *
+ * The ft_tp_node_kind enum lives in fractal-trie-internal.h so the
+ * C-side return values and the LTTng enum values below cannot drift
+ * apart.  ft_tp_node_kind() is defined in fractal-trie.c where
+ * ft_types[] and the tag-bit helpers are visible; callers pass node
+ * pointers and the kind field is computed in the tracepoint field
+ * expressions below, not by the caller.
+ */
+#ifndef _FT_TP_H_HELPERS
+#define _FT_TP_H_HELPERS
+#include "fractal-trie-internal.h"
+struct cds_ft_inode_flag;
+int ft_tp_node_kind(struct cds_ft_inode_flag *nf);
+#endif
+
+#undef LTTNG_UST_TRACEPOINT_PROVIDER
+#define LTTNG_UST_TRACEPOINT_PROVIDER ft_tp
+
+#undef LTTNG_UST_TRACEPOINT_INCLUDE
+#define LTTNG_UST_TRACEPOINT_INCLUDE "./ft_tp.h"
+
+#if !defined(_FT_TP_H) || defined(LTTNG_UST_TRACEPOINT_HEADER_MULTI_READ)
+#define _FT_TP_H
+
+#include <lttng/tracepoint.h>
+#include <stdint.h>
+
+/*
+ * Enumerations for human-readable trace output.
+ */
+
+LTTNG_UST_TRACEPOINT_ENUM(ft_tp, ft_lookup_mode,
+	LTTNG_UST_TP_ENUM_VALUES(
+		lttng_ust_field_enum_value("FT_LOOKUP_GE", 0)
+		lttng_ust_field_enum_value("FT_LOOKUP_LE", 1)
+		lttng_ust_field_enum_value("FT_LOOKUP_GT", 2)
+		lttng_ust_field_enum_value("FT_LOOKUP_LT", 3)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_ENUM(ft_tp, ft_status,
+	LTTNG_UST_TP_ENUM_VALUES(
+		lttng_ust_field_enum_value("OK",				 0)
+		lttng_ust_field_enum_value("NOT_FOUND",				 1)
+		lttng_ust_field_enum_value("DUPLICATE_FOUND",			 2)
+		lttng_ust_field_enum_value("INTERNAL_MATCH",			 3)
+		lttng_ust_field_enum_value("INVALID_ARGUMENT_ERROR",		-1)
+		lttng_ust_field_enum_value("MEMORY_ERROR",			-2)
+		lttng_ust_field_enum_value("OVERFLOW_ERROR",			-3)
+		lttng_ust_field_enum_value("BUSY_ERROR",			-4)
+		lttng_ust_field_enum_value("POPULATED_ERROR",			-5)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_ENUM(ft_tp, ft_compressed_action,
+	LTTNG_UST_TP_ENUM_VALUES(
+		lttng_ust_field_enum_value("CONTINUE",		0)
+		lttng_ust_field_enum_value("BREAK",		1)
+		lttng_ust_field_enum_value("END",		2)
+		lttng_ust_field_enum_value("GOING_UP",		3)
+		lttng_ust_field_enum_value("DESCEND_CHILDREN",	4)
+	)
+)
+
+/*
+ * Node-kind enum: maps a tagged cds_ft_inode_flag pointer to a
+ * symbolic label that encodes both the structural class and the
+ * specific size variant.  See ft_tp_node_kind() in fractal-trie.c
+ * for the mapping.  Values must stay in sync with the C-side enum
+ * defined alongside the helper.
+ *
+ * Internal labels are <class>_<size_in_bytes>; size = 2^order
+ * where order is the ft_types[i].order field.  Collapsed labels
+ * encode the scan-size variant.  The exact labels realized in a
+ * trace depend on build-time configuration (32-bit vs 64-bit,
+ * SIMD threshold for LINEAR vs LINEAR_WIDE); the full superset
+ * is listed here so the same provider metadata works on any build.
+ */
+LTTNG_UST_TRACEPOINT_ENUM(ft_tp, ft_tp_node_kind,
+	LTTNG_UST_TP_ENUM_VALUES(
+		lttng_ust_field_enum_value("NULL",		FT_TP_NODE_NULL)
+		lttng_ust_field_enum_value("EXTERNAL",		FT_TP_NODE_EXTERNAL)
+		lttng_ust_field_enum_value("SKIP_COMPRESSED",	FT_TP_NODE_SKIP_COMPRESSED)
+		lttng_ust_field_enum_value("COMPRESSED",	FT_TP_NODE_COMPRESSED)
+		lttng_ust_field_enum_value("COLLAPSED",		FT_TP_NODE_COLLAPSED)
+		lttng_ust_field_enum_value("LINEAR_16",		FT_TP_NODE_LINEAR_16)
+		lttng_ust_field_enum_value("LINEAR_32",		FT_TP_NODE_LINEAR_32)
+		lttng_ust_field_enum_value("LINEAR_64",		FT_TP_NODE_LINEAR_64)
+		lttng_ust_field_enum_value("LINEAR_128",	FT_TP_NODE_LINEAR_128)
+		lttng_ust_field_enum_value("LINEAR_WIDE_64",	FT_TP_NODE_LINEAR_WIDE_64)
+		lttng_ust_field_enum_value("LINEAR_WIDE_128",	FT_TP_NODE_LINEAR_WIDE_128)
+		lttng_ust_field_enum_value("LINEAR_WIDE_256",	FT_TP_NODE_LINEAR_WIDE_256)
+		lttng_ust_field_enum_value("POOL_1D_256",	FT_TP_NODE_POOL_1D_256)
+		lttng_ust_field_enum_value("POOL_1D_512",	FT_TP_NODE_POOL_1D_512)
+		lttng_ust_field_enum_value("POOL_2D_512",	FT_TP_NODE_POOL_2D_512)
+		lttng_ust_field_enum_value("POOL_2D_1024",	FT_TP_NODE_POOL_2D_1024)
+		lttng_ust_field_enum_value("PIGEON_1024",	FT_TP_NODE_PIGEON_1024)
+		lttng_ust_field_enum_value("PIGEON_2048",	FT_TP_NODE_PIGEON_2048)
+		lttng_ust_field_enum_value("UNKNOWN",		FT_TP_NODE_UNKNOWN)
+	)
+)
+
+/*
+ * Event classes for common signatures to avoid boilerplate.
+ */
+
+LTTNG_UST_TRACEPOINT_EVENT_CLASS(ft_tp, ft_key_event_class,
+	LTTNG_UST_TP_ARGS(
+		const uint8_t *, key,
+		size_t, key_len
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_sequence_hex(uint8_t, key, key, size_t, key_len)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT_CLASS(ft_tp, ft_status_event_class,
+	LTTNG_UST_TP_ARGS(
+		int, status
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_enum(ft_tp, ft_status, int, status, status)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT_CLASS(ft_tp, ft_node_event_class,
+	LTTNG_UST_TP_ARGS(
+		const void *, node
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, node, (uintptr_t) node)
+	)
+)
+
+/*
+ * Compressed-node mutation events.
+ */
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, compressed_publish,
+	LTTNG_UST_TP_ARGS(
+		const void *, cn,
+		unsigned int, len,
+		const void *, child,
+		const void *, parent
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, cn, (uintptr_t) cn)
+		lttng_ust_field_integer(unsigned int, len, len)
+		lttng_ust_field_integer_hex(uintptr_t, child, (uintptr_t) child)
+		lttng_ust_field_integer_hex(uintptr_t, parent, (uintptr_t) parent)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, compressed_split,
+	LTTNG_UST_TP_ARGS(
+		const char *, kind,
+		const void *, old_cn,
+		unsigned int, old_len,
+		const void *, new_top,
+		unsigned int, diverge_pos
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_string(kind, kind)
+		lttng_ust_field_integer_hex(uintptr_t, old_cn, (uintptr_t) old_cn)
+		lttng_ust_field_integer(unsigned int, old_len, old_len)
+		lttng_ust_field_integer_hex(uintptr_t, new_top, (uintptr_t) new_top)
+		lttng_ust_field_integer(unsigned int, diverge_pos, diverge_pos)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+	compressed_free,
+	LTTNG_UST_TP_ARGS(const void *, node))
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, publish_to_parent,
+	LTTNG_UST_TP_ARGS(
+		const void *, parent_nf,
+		const void *, slot,
+		const void *, old_child,
+		const void *, new_child
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, parent_nf, (uintptr_t) parent_nf)
+		lttng_ust_field_integer_hex(uintptr_t, slot, (uintptr_t) slot)
+		lttng_ust_field_integer_hex(uintptr_t, old_child, (uintptr_t) old_child)
+		lttng_ust_field_integer_hex(uintptr_t, new_child, (uintptr_t) new_child)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, split_compressed_insert_enter,
+	LTTNG_UST_TP_ARGS(
+		const void *, cn,
+		unsigned int, len,
+		unsigned int, diverge_pos
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, cn, (uintptr_t) cn)
+		lttng_ust_field_integer(unsigned int, len, len)
+		lttng_ust_field_integer(unsigned int, diverge_pos, diverge_pos)
+	)
+)
+
+/*
+ * Inequality lookup events.
+ */
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, ineq_enter,
+	LTTNG_UST_TP_ARGS(
+		int, mode,
+		const uint8_t *, key,
+		size_t, key_len
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_enum(ft_tp, ft_lookup_mode, int, mode, mode)
+		lttng_ust_field_sequence_hex(uint8_t, key, key, size_t, key_len)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, ineq_compressed_enter,
+	LTTNG_UST_TP_ARGS(
+		const void *, cn,
+		int, level,
+		int, mode
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, cn, (uintptr_t) cn)
+		lttng_ust_field_integer(int, level, level)
+		lttng_ust_field_enum(ft_tp, ft_lookup_mode, int, mode, mode)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, ineq_compressed,
+	LTTNG_UST_TP_ARGS(
+		const void *, cn,
+		int, level,
+		int, cmp_result,
+		unsigned int, mpos,
+		int, action
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, cn, (uintptr_t) cn)
+		lttng_ust_field_integer(int, level, level)
+		lttng_ust_field_integer(int, cmp_result, cmp_result)
+		lttng_ust_field_integer(unsigned int, mpos, mpos)
+		lttng_ust_field_enum(ft_tp, ft_compressed_action, int, action, action)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, ineq_going_up_step,
+	LTTNG_UST_TP_ARGS(
+		int, level,
+		const void *, path_entry,
+		int, found_sibling,
+		uint8_t, ord_key
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(int, level, level)
+		lttng_ust_field_integer_hex(uintptr_t, path_entry, (uintptr_t) path_entry)
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, int, path_entry_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) path_entry))
+		lttng_ust_field_integer(int, found_sibling, found_sibling)
+		lttng_ust_field_integer(uint8_t, ord_key, ord_key)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, ineq_result,
+	LTTNG_UST_TP_ARGS(
+		int, mode,
+		const uint8_t *, query,
+		size_t, query_len,
+		const uint8_t *, result,
+		size_t, result_len,
+		int, status
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_enum(ft_tp, ft_lookup_mode, int, mode, mode)
+		lttng_ust_field_sequence_hex(uint8_t, query, query, size_t, query_len)
+		lttng_ust_field_sequence_hex(uint8_t, result, result, size_t, result_len)
+		lttng_ust_field_enum(ft_tp, ft_status, int, status, status)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, fastpath_enter,
+	LTTNG_UST_TP_ARGS(
+		int, mode,
+		const void *, node_flag,
+		int, level_after
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_enum(ft_tp, ft_lookup_mode, int, mode, mode)
+		lttng_ust_field_integer_hex(uintptr_t, node_flag, (uintptr_t) node_flag)
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, int, node_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) node_flag))
+		lttng_ust_field_integer(int, level_after, level_after)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, post_traversal,
+	LTTNG_UST_TP_ARGS(
+		int, mode,
+		int, level,
+		const void *, node_flag
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_enum(ft_tp, ft_lookup_mode, int, mode, mode)
+		lttng_ust_field_integer(int, level, level)
+		lttng_ust_field_integer_hex(uintptr_t, node_flag, (uintptr_t) node_flag)
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, int, node_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) node_flag))
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, slowpath_enter,
+	LTTNG_UST_TP_ARGS(
+		int, mode,
+		int, path_valid,
+		int, path_len
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_enum(ft_tp, ft_lookup_mode, int, mode, mode)
+		lttng_ust_field_integer(int, path_valid, path_valid)
+		lttng_ust_field_integer(int, path_len, path_len)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, slowpath_step,
+	LTTNG_UST_TP_ARGS(
+		int, level,
+		uint8_t, key_value,
+		const void *, node_flag,
+		int, broke
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(int, level, level)
+		lttng_ust_field_integer(uint8_t, key_value, key_value)
+		lttng_ust_field_integer_hex(uintptr_t, node_flag, (uintptr_t) node_flag)
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, int, node_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) node_flag))
+		lttng_ust_field_integer(int, broke, broke)
+	)
+)
+
+/*
+ * Test violation event.  query/returned are user-facing u64 values
+ * already decoded by cds_ft_key_to_u64() in the test; not raw key
+ * byte sequences.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, violation,
+	LTTNG_UST_TP_ARGS(
+		uint64_t, query,
+		uint64_t, returned
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(uint64_t, query, query)
+		lttng_ust_field_integer(uint64_t, returned, returned)
+	)
+)
+
+/*
+ * Public API entries with key byte-sequence.
+ */
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
+	insert_enter,
+	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
+	insert_unique_enter,
+	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
+	insert_replace_enter,
+	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
+	remove_enter,
+	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
+	replace_enter,
+	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
+	lookup_enter,
+	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
+	graft_enter,
+	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
+	graft_swap_enter,
+	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_key_event_class, ft_tp,
+	detach_enter,
+	LTTNG_UST_TP_ARGS(const uint8_t *, key, size_t, key_len))
+
+/* Public API exits (status enum). */
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	insert_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	insert_unique_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	insert_replace_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	remove_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	replace_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	graft_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	graft_swap_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	detach_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	lookup_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	lookup_nth_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	lookup_nth_last_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	iter_skip_forward_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	iter_skip_reverse_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+
+/*
+ * Rank/skip ops — the "n" parameter is a numeric count, not a key.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, lookup_nth_enter,
+	LTTNG_UST_TP_ARGS(unsigned long, nth),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(unsigned long, nth, nth)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, lookup_nth_last_enter,
+	LTTNG_UST_TP_ARGS(unsigned long, nth),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(unsigned long, nth, nth)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, iter_skip_forward_enter,
+	LTTNG_UST_TP_ARGS(unsigned long, skip),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(unsigned long, skip, skip)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, iter_skip_reverse_enter,
+	LTTNG_UST_TP_ARGS(unsigned long, skip),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(unsigned long, skip, skip)
+	)
+)
+
+/* Counting ops. */
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, count_entries,
+	LTTNG_UST_TP_ARGS(unsigned long, count),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(unsigned long, count, count)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, count_prefix,
+	LTTNG_UST_TP_ARGS(unsigned long, count),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(unsigned long, count, count)
+	)
+)
+
+/* Iterator lifecycle / state events. */
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+	iter_create,
+	LTTNG_UST_TP_ARGS(const void *, node))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+	iter_destroy,
+	LTTNG_UST_TP_ARGS(const void *, node))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+	iter_invalidate_path,
+	LTTNG_UST_TP_ARGS(const void *, node))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+	iter_reset,
+	LTTNG_UST_TP_ARGS(const void *, node))
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, iter_set_key_enter,
+	LTTNG_UST_TP_ARGS(
+		const uint8_t *, key,
+		size_t, key_len,
+		int, prev_key_len,
+		int, prev_path_len
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_sequence_hex(uint8_t, key, key, size_t, key_len)
+		lttng_ust_field_integer(int, prev_key_len, prev_key_len)
+		lttng_ust_field_integer(int, prev_path_len, prev_path_len)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, iter_set_key_exit,
+	LTTNG_UST_TP_ARGS(
+		int, subset,
+		int, path_len
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(int, subset, subset)
+		lttng_ust_field_integer(int, path_len, path_len)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, iter_set_prefix_len,
+	LTTNG_UST_TP_ARGS(int, prefix_len),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(int, prefix_len, prefix_len)
+	)
+)
+
+/* Internal mutation primitives. */
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, attach_node_enter,
+	LTTNG_UST_TP_ARGS(
+		const void *, attach_node,
+		const void *, old_node,
+		unsigned int, level
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, attach_node, (uintptr_t) attach_node)
+		lttng_ust_field_integer_hex(uintptr_t, old_node, (uintptr_t) old_node)
+		lttng_ust_field_integer(unsigned int, level, level)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	attach_node_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, detach_node_enter,
+	LTTNG_UST_TP_ARGS(
+		const void *, detach_node,
+		unsigned int, depth
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, detach_node, (uintptr_t) detach_node)
+		lttng_ust_field_integer(unsigned int, depth, depth)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_status_event_class, ft_tp,
+	detach_node_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, node_recompact,
+	LTTNG_UST_TP_ARGS(
+		const void *, old_node,
+		const void *, new_node,
+		int, new_type
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, old_node, (uintptr_t) old_node)
+		lttng_ust_field_integer_hex(uintptr_t, new_node, (uintptr_t) new_node)
+		lttng_ust_field_integer(int, new_type, new_type)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, chain_node,
+	LTTNG_UST_TP_ARGS(
+		const void *, last_node,
+		const void *, node
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, last_node, (uintptr_t) last_node)
+		lttng_ust_field_integer_hex(uintptr_t, node, (uintptr_t) node)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, unchain_node,
+	LTTNG_UST_TP_ARGS(
+		const void *, head_slot,
+		const void *, node,
+		int, was_head
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, head_slot, (uintptr_t) head_slot)
+		lttng_ust_field_integer_hex(uintptr_t, node, (uintptr_t) node)
+		lttng_ust_field_integer(int, was_head, was_head)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, set_parent,
+	LTTNG_UST_TP_ARGS(
+		const void *, child,
+		const void *, parent
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, child, (uintptr_t) child)
+		lttng_ust_field_integer_hex(uintptr_t, parent, (uintptr_t) parent)
+	)
+)
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, metadata_set_external_nodes,
+	LTTNG_UST_TP_ARGS(
+		const void *, node,
+		const void *, external_nodes
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, node, (uintptr_t) node)
+		lttng_ust_field_integer_hex(uintptr_t, external_nodes, (uintptr_t) external_nodes)
+	)
+)
+
+#endif /* _FT_TP_H */
+
+#include <lttng/tracepoint-event.h>
+
+#endif /* FT_ENABLE_TRACING */

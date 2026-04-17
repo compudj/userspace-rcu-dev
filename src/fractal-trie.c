@@ -26,6 +26,31 @@
 
 #include "fractal-trie-internal.h"
 
+#ifdef FT_ENABLE_TRACING
+#include "ft_tp.h"
+#define FT_TP(name, ...) lttng_ust_tracepoint(ft_tp, name, ##__VA_ARGS__)
+/*
+ * Emit a tracepoint with a key byte-sequence payload (LTTng's
+ * sequence_hex field).  When tracing is disabled, the arguments are
+ * discarded by the FT_TP no-op expansion, so no code is emitted.
+ */
+#define FT_TP_KEY(name, keybuf, keylen)					\
+	FT_TP(name, (keybuf), (keylen))
+#define FT_TP_ITER_KEY(name, iter)					\
+	FT_TP_KEY(name, iter_key(iter), (iter)->key_len)
+/*
+ * enum ft_tp_node_kind (node-kind identifiers) lives in
+ * fractal-trie-internal.h so the C side and the LTTng enum in
+ * src/ft_tp.h reference a single definition.  ft_tp_node_kind()
+ * below maps a tagged cds_ft_inode_flag pointer to one of those
+ * values.
+ */
+#else
+#define FT_TP(name, ...)			do {} while (0)
+#define FT_TP_KEY(name, keybuf, keylen)		do {} while (0)
+#define FT_TP_ITER_KEY(name, iter)		do {} while (0)
+#endif
+
 #ifdef FT_DELAY_INJECT
 #include <unistd.h>
 #include <stdlib.h>
@@ -1252,6 +1277,8 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
 	metadata->external_nodes = external_nodes;
 	if (external_nodes)
 		external_nodes->prev = node_flag;
+	FT_TP(metadata_set_external_nodes, (const void *) node_flag,
+		(const void *) external_nodes);
 }
 
 /*
@@ -1648,6 +1675,10 @@ void ft_publish_to_parent(struct cds_ft *ft,
 		}
 #endif
 	}
+	FT_TP(publish_to_parent, (const void *) parent_nf,
+		(const void *) parent_slot,
+		(const void *) *parent_slot,
+		(const void *) new_child);
 	rcu_assign_pointer(*parent_slot, new_child);
 }
 
@@ -1707,6 +1738,7 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 {
 	if (!child_nf)
 		return;
+	FT_TP(set_parent, (const void *) child_nf, (const void *) parent_nf);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (ft_node_skip_compressed(child_nf)) {
 		struct cds_ft_compressed_node *cn =
@@ -1760,6 +1792,123 @@ unsigned int ft_collapsed_count(unsigned int nr_entries)
 {
 	return nr_entries & FT_COLLAPSED_NR_ENTRIES_MASK;
 }
+
+#ifdef FT_ENABLE_TRACING
+/*
+ * Map a tagged cds_ft_inode_flag pointer to a symbolic node-kind
+ * value (enum ft_tp_node_kind, defined in fractal-trie-internal.h
+ * and exposed as the LTTng enum ft_tp_node_kind in src/ft_tp.h).
+ * Uses a single 16-entry compile-time dispatch table indexed by the
+ * type-selecting bits of the pointer, so the runtime helper reduces
+ * to a NULL/skip check plus one table load.
+ */
+
+/*
+ * Single dispatch table indexed by the low 4 bits of a tagged
+ * cds_ft_inode_flag pointer — exactly the bits that select the node
+ * type:
+ *   - bit 0      = FT_INTERNAL_MASK (1 = internal node)
+ *   - bits 1..3  = type index (when internal) or class selector
+ *                  (when not: 00=external, 01=compressed, 11=collapsed)
+ *
+ * Compressed and collapsed nodes are 16-byte aligned, so bit 3 is
+ * guaranteed zero for them.  External nodes need only 8-byte
+ * alignment (low 3 bits = 000), so bit 3 may be either value — both
+ * [0b0000] and [0b1000] map to EXTERNAL.
+ *
+ * Skip-compressed pointers are special-cased before the table lookup
+ * (the only exception); the table itself is a pure pointer-bits
+ * dispatch.
+ *
+ * Slot value 0 (FT_TP_NODE_NULL) doubles as a "no entry" sentinel
+ * that resolves to FT_TP_NODE_UNKNOWN; NULL pointers are caught by
+ * the explicit nf != NULL check before any table access.
+ */
+#define FT_TP_KIND_TABLE_MASK	0xFU
+
+/* Pointer-bits encoding for internal-node type index `idx` (0..7). */
+#define FT_TP_INTERNAL_TAG(idx)	\
+	(((unsigned int) (idx) << FT_INTERNAL_BITS) | FT_INTERNAL_MASK)
+
+/*
+ * Compile-time pickers that map a single ft_types[] entry's sizing
+ * parameters to an FT_TP_NODE_* constant.  All arguments are integer
+ * constant expressions (sizing enums and order constants), so each
+ * conditional collapses to one constant during compilation.
+ */
+#define _FT_TP_KIND_LINEAR_NARROW(ord) (			\
+	(ord) == 4 ? FT_TP_NODE_LINEAR_16 :			\
+	(ord) == 5 ? FT_TP_NODE_LINEAR_32 :			\
+	(ord) == 6 ? FT_TP_NODE_LINEAR_64 :			\
+	(ord) == 7 ? FT_TP_NODE_LINEAR_128 :			\
+	FT_TP_NODE_UNKNOWN)
+#define _FT_TP_KIND_LINEAR_WIDE(ord) (				\
+	(ord) == 6 ? FT_TP_NODE_LINEAR_WIDE_64 :		\
+	(ord) == 7 ? FT_TP_NODE_LINEAR_WIDE_128 :		\
+	(ord) == 8 ? FT_TP_NODE_LINEAR_WIDE_256 :		\
+	FT_TP_NODE_UNKNOWN)
+#define FT_TP_KIND_LINEAR(mlc, ord)				\
+	(FT_LINEAR_CLASS(mlc) == FT_LINEAR_WIDE			\
+		? _FT_TP_KIND_LINEAR_WIDE(ord)			\
+		: _FT_TP_KIND_LINEAR_NARROW(ord))
+#define FT_TP_KIND_POOL(npo, ord) (				\
+	(npo) == 1 && (ord) == 8 ? FT_TP_NODE_POOL_1D_256 :	\
+	(npo) == 1 && (ord) == 9 ? FT_TP_NODE_POOL_1D_512 :	\
+	(npo) == 2 && (ord) == 9 ? FT_TP_NODE_POOL_2D_512 :	\
+	(npo) == 2 && (ord) == 10 ? FT_TP_NODE_POOL_2D_1024 :	\
+	FT_TP_NODE_UNKNOWN)
+#define FT_TP_KIND_PIGEON(ord) (				\
+	(ord) == 10 ? FT_TP_NODE_PIGEON_1024 :			\
+	(ord) == 11 ? FT_TP_NODE_PIGEON_2048 :			\
+	FT_TP_NODE_UNKNOWN)
+
+static const uint8_t ft_tp_kind_table[FT_TP_KIND_TABLE_MASK + 1] = {
+	/* External: low 3 bits = 000; bit 3 unconstrained. */
+	[0x0]				= FT_TP_NODE_EXTERNAL,
+	[0x8]				= FT_TP_NODE_EXTERNAL,
+	/* Compressed: low 3 bits = 010, bit 3 = 0 (16-byte aligned). */
+	[FT_COMPRESSED_MASK]		= FT_TP_NODE_COMPRESSED,
+	/* Collapsed: low 3 bits = 110, bit 3 = 0 (16-byte aligned). */
+	[FT_COLLAPSED_MASK]		= FT_TP_NODE_COLLAPSED,
+	/*
+	 * Internal nodes: bit 0 set, bits 1..3 = type index.  Each
+	 * arch-specific ft_types[] is mapped via FT_TP_KIND_*().
+	 */
+#if (CAA_BITS_PER_LONG < 64)
+	[FT_TP_INTERNAL_TAG(0)]			= FT_TP_KIND_LINEAR(ft_type_0_max_linear_child, 4),
+	[FT_TP_INTERNAL_TAG(1)]			= FT_TP_KIND_LINEAR(ft_type_1_max_linear_child, 5),
+	[FT_TP_INTERNAL_TAG(2)]			= FT_TP_KIND_LINEAR(ft_type_2_max_linear_child, 6),
+	[FT_TP_INTERNAL_TAG(3)]			= FT_TP_KIND_LINEAR(ft_type_3_max_linear_child, 7),
+	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_A)]	= FT_TP_KIND_POOL(ft_type_4_nr_pool_order, 8),
+	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_B)]	= FT_TP_KIND_POOL(ft_type_5_nr_pool_order, 9),
+	[FT_TP_INTERNAL_TAG(6)]			= FT_TP_KIND_PIGEON(10),
+	/* idx 7 = NODE_INDEX_NULL: never encoded in a pointer. */
+#else
+	[FT_TP_INTERNAL_TAG(0)]			= FT_TP_KIND_LINEAR(ft_type_0_max_linear_child, 4),
+	[FT_TP_INTERNAL_TAG(1)]			= FT_TP_KIND_LINEAR(ft_type_1_max_linear_child, 5),
+	[FT_TP_INTERNAL_TAG(2)]			= FT_TP_KIND_LINEAR(ft_type_2_max_linear_child, 6),
+	[FT_TP_INTERNAL_TAG(3)]			= FT_TP_KIND_LINEAR(ft_type_3_max_linear_child, 7),
+	[FT_TP_INTERNAL_TAG(4)]			= FT_TP_KIND_LINEAR(ft_type_4_max_linear_child, 8),
+	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_A)]	= FT_TP_KIND_POOL(ft_type_5_nr_pool_order, 9),
+	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_B)]	= FT_TP_KIND_POOL(ft_type_6_nr_pool_order, 10),
+	[FT_TP_INTERNAL_TAG(7)]			= FT_TP_KIND_PIGEON(11),
+#endif
+};
+
+int ft_tp_node_kind(struct cds_ft_inode_flag *nf)
+{
+	uint8_t kind;
+
+	if (!nf)
+		return FT_TP_NODE_NULL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(nf))
+		return FT_TP_NODE_SKIP_COMPRESSED;
+#endif
+	kind = ft_tp_kind_table[(unsigned long) nf & FT_TP_KIND_TABLE_MASK];
+	return kind ? kind : FT_TP_NODE_UNKNOWN;
+}
+#endif /* FT_ENABLE_TRACING */
 
 /*
  * Set the entry count, preserving the scan zone selector in bits 6-7.
@@ -2184,6 +2333,7 @@ void free_compressed_node(struct cds_ft *ft,
 	struct cds_ft_metadata *metadata =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 
+	FT_TP(compressed_free, (const void *) node);
 	cds_ft_free_item(metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
@@ -4273,6 +4423,9 @@ skip_copy:
 	{
 		struct cds_ft_inode_flag *old_flag = *old_node_flag_ptr;
 
+		FT_TP(node_recompact, (const void *) old_flag,
+			(const void *) new_node_flag, (int) new_type_index);
+
 		/* Return pointer to new recompacted node through old_node_flag_ptr */
 		*old_node_flag_ptr = new_node_flag;
 		if (old_node && old_node_ret)
@@ -5260,10 +5413,14 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 {
 	size_t key_len = ft_key_len(ft, _key_len);
 	uint8_t ordinals[FT_MAX_KEY_LEN];
+	enum cds_ft_status status;
 
+	FT_TP_KEY(lookup_enter, key, _key_len);
 	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
-	return do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
+	status = do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
 				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+	FT_TP(lookup_exit, (int) status);
+	return status;
 }
 
 /*
@@ -5294,8 +5451,13 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
-	return do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
+	enum cds_ft_status status;
+
+	FT_TP_ITER_KEY(lookup_enter, iter);
+	status = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
 				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+	FT_TP(lookup_exit, (int) status);
+	return status;
 }
 
 enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
@@ -5521,6 +5683,8 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **no
 	int cmp_result;
 	int j;
 
+	FT_TP(ineq_compressed_enter, (const void *) cn, level, (int) mode);
+
 	/* Build contiguous comparison key for this limit mode. */
 	switch (limit) {
 	case FT_LOOKUP_LIMIT_NONE:
@@ -5576,6 +5740,8 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **no
 		    (cmp_result < 0 && (mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT))) {
 			*level_p = level + mpos;
 			iter_debug_path_snapshot(iter);
+			FT_TP(ineq_compressed, (const void *) cn, level,
+				cmp_result, mpos, (int) FT_COMPRESSED_GOING_UP);
 			return FT_COMPRESSED_GOING_UP;
 		}
 		/* Descend into compressed subtree. */
@@ -5593,6 +5759,9 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **no
 		*node_flag_p = node_flag;
 		*level_p = level;
 		iter_debug_path_snapshot(iter);
+		FT_TP(ineq_compressed, (const void *) cn, level,
+			cmp_result, mpos,
+			(int) FT_COMPRESSED_DESCEND_CHILDREN);
 		return FT_COMPRESSED_DESCEND_CHILDREN;
 	}
 
@@ -5614,10 +5783,16 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **no
 			*node_flag_p = node_flag;
 			*level_p = level;
 			iter_debug_path_snapshot(iter);
+			FT_TP(ineq_compressed, (const void *) cn, level,
+				cmp_result, (unsigned int) cmp,
+				(int) FT_COMPRESSED_DESCEND_CHILDREN);
 			return FT_COMPRESSED_DESCEND_CHILDREN;
 		}
 		*level_p = level + cmp - 1;
 		iter_debug_path_snapshot(iter);
+		FT_TP(ineq_compressed, (const void *) cn, level,
+			cmp_result, (unsigned int) cmp,
+			(int) FT_COMPRESSED_GOING_UP);
 		return FT_COMPRESSED_GOING_UP;
 	}
 
@@ -5632,11 +5807,17 @@ enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **no
 
 	*node_flag_p = node_flag;
 	*level_p = level;
+	FT_TP(ineq_compressed, (const void *) cn, level,
+		cmp_result, (unsigned int) cmp,
+		(int) FT_COMPRESSED_CONTINUE);
 	return FT_COMPRESSED_CONTINUE;
 
 out_break:
 	*node_flag_p = node_flag;
 	*level_p = level;
+	FT_TP(ineq_compressed, (const void *) cn, level,
+		cmp_result, (unsigned int) cmp,
+		(int) FT_COMPRESSED_BREAK);
 	return FT_COMPRESSED_BREAK;
 }
 
@@ -5934,6 +6115,8 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	input_key = input_key_buf;
 	iter_key = input_key;
 
+	FT_TP(ineq_enter, (int) mode, input_key, key_len);
+
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 	node_flag = ft_dereference_prefetch(ft->root);
 	iter_path_node(iter)[0] = node_flag;
@@ -6024,10 +6207,14 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			level = key_depth;
 		else
 			level = key_depth - 1;
+		FT_TP(fastpath_enter, (int) mode,
+			(const void *) node_flag, (int) level);
 		goto post_traversal;
 	}
 
 slow_path:
+	FT_TP(slowpath_enter, (int) mode, (int) iter->path_valid,
+		(int) iter->path_len);
 	for (level = 1; level < key_depth; level++) {
 		uint8_t key_value;
 
@@ -6099,10 +6286,15 @@ slow_path:
 			break;
 		}
 		node_flag = ft_node_get_nth(node_flag, NULL, key_value);
-		if (!ft_node_ptr(node_flag))
+		if (!ft_node_ptr(node_flag)) {
+			FT_TP(slowpath_step, (int) level, key_value,
+				(const void *) node_flag, 1);
 			break;
+		}
 		ordinal_key[level - 1] = key_value;
 		iter_path_node(iter)[level] = node_flag;
+		FT_TP(slowpath_step, (int) level, key_value,
+			(const void *) node_flag, 0);
 		dbg_printf("cds_ft_lookup_inequality iter key lookup %u finds node_flag %p\n",
 				(unsigned int) key_value, node_flag);
 		if (ft_node_external(node_flag))
@@ -6119,6 +6311,8 @@ slow_path:
 	iter_debug_path_snapshot(iter);
 
 post_traversal:
+	FT_TP(post_traversal, (int) mode, (int) level,
+		(const void *) node_flag);
 	ft_delay_reader();
 	switch (mode) {
 	case FT_LOOKUP_LE:
@@ -6454,6 +6648,9 @@ going_up:
 		}
 #endif
 		if (!ft_node_internal(iter_path_node(iter)[level - 1])) {
+			FT_TP(ineq_going_up_step, level,
+				(const void *) iter_path_node(iter)[level - 1],
+				0, (uint8_t) key_value);
 			going_up = true;
 			continue;
 		}
@@ -6466,8 +6663,14 @@ going_up:
 		if (ft_node_ptr(node_flag)) {
 			/* Record the sibling in the path. */
 			iter_path_node(iter)[level] = node_flag;
+			FT_TP(ineq_going_up_step, level,
+				(const void *) iter_path_node(iter)[level - 1],
+				1, ordinal_key[level - 1]);
 			break;
 		}
+		FT_TP(ineq_going_up_step, level,
+			(const void *) iter_path_node(iter)[level - 1],
+			0, (uint8_t) key_value);
 		going_up = true;
 	}
 
@@ -6790,6 +6993,11 @@ found_minmax:
 		iter->status = ret_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 	}
 end:
+	FT_TP(ineq_result, (int) mode,
+		input_key, key_len,
+		iter->node ? iter_key(iter) : NULL,
+		iter->node ? iter->key_len : 0,
+		(int) iter->status);
 	iter_auto_invalidate_path(iter);
 	return iter->status;
 }
@@ -8616,6 +8824,9 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
 	struct cds_ft_metadata *cn_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+
+	FT_TP(split_compressed_insert_enter, (const void *) cn,
+		cn->len, diverge_pos);
 	struct cds_ft_inode_flag *old_suffix_flag, *new_branch_flag;
 	struct cds_ft_inode_flag *branch_flag, *top_flag;
 	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
@@ -8849,6 +9060,8 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	}
 
 	/* 5. Publish the split structure, replacing the compressed node. */
+	FT_TP(compressed_split, "insert", (const void *) cn, cn->len,
+		(const void *) top_flag, diverge_pos);
 	ft_publish_to_parent(ft, cn_meta->parent, parent_slot, top_flag);
 
 	/*
@@ -9093,6 +9306,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			ft_init_node_density(ft, created[ci]);
 	}
 
+	FT_TP(compressed_split, "key_shorter", (const void *) cn, cn->len,
+		(const void *) top_flag, remaining);
 	*top_ret = top_flag;
 	*jct_ret = jct_flag;
 	return 0;
@@ -9170,6 +9385,8 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		struct cds_ft_inode_flag *cflag = ft_compressed_node_flag(cn);
 		ft_set_parent(child, cflag, &cn->child);
 		ft_init_node_density(ft, cflag);
+		FT_TP(compressed_publish, (const void *) cn, cn->len,
+			(const void *) cn->child, NULL);
 		return ft_publish_compressed(ft, cn, cflag);
 	}
 }
@@ -9218,6 +9435,9 @@ int ft_attach_node(struct cds_ft *ft,
 	struct cds_ft_inode *old_recompacted_node = NULL;
 	int ret, i, nr_created_nodes = 0;
 	const uint8_t *iter_key = key + key_len;
+
+	FT_TP(attach_node_enter, (const void *) attach_node_flag,
+		(const void *) old_node_flag, level);
 
 	dbg_printf("Attach node at level %u (old_node_flag %p, attach_node_flag_ptr %p attach_node_flag %p)\n",
 		level, old_node_flag, attach_node_flag_ptr, attach_node_flag);
@@ -9395,12 +9615,14 @@ check_error:
 				free_cds_ft_node(ft, ft_node_ptr(created_nodes[i]));
 		}
 	}
+	FT_TP(attach_node_exit, (int) ret);
 	return ret;
 }
 
 static
 void ft_chain_node(struct cds_ft_node *last_node, struct cds_ft_node *node)
 {
+	FT_TP(chain_node, (const void *) last_node, (const void *) node);
 	/*
 	 * Add node to tail of list to ensure that RCU traversals will
 	 * always see either the prior node or the newly added if
@@ -10506,12 +10728,20 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		struct cds_ft_node *node)
 {
-	int ret = _cds_ft_insert(ft, key, key_len, node, NULL);
+	int ret;
 
-	if (ret == 0)
+	FT_TP_KEY(insert_enter, key, key_len);
+	ret = _cds_ft_insert(ft, key, key_len, node, NULL);
+
+	if (ret == 0) {
+		FT_TP(insert_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
-	if (ret == -EINVAL)
+	}
+	if (ret == -EINVAL) {
+		FT_TP(insert_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	FT_TP(insert_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 	return CDS_FT_STATUS_MEMORY_ERROR;
 }
 
@@ -10523,20 +10753,25 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 	int ret;
 	struct cds_ft_node *ret_node = NULL;
 
+	FT_TP_KEY(insert_unique_enter, key, key_len);
 	ret = _cds_ft_insert(ft, key, key_len, node, &ret_node);
 	if (ret == -EEXIST) {
 		*result_node = ret_node;
+		FT_TP(insert_unique_exit, (int) CDS_FT_STATUS_DUPLICATE_FOUND);
 		return CDS_FT_STATUS_DUPLICATE_FOUND;
 	}
 	if (ret == -EINVAL) {
 		*result_node = NULL;
+		FT_TP(insert_unique_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 	if (ret) {
 		*result_node = NULL;
+		FT_TP(insert_unique_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	*result_node = node;
+	FT_TP(insert_unique_exit, (int) CDS_FT_STATUS_OK);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -10746,19 +10981,24 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 	struct cds_ft_node *old_node = NULL;
 	int ret;
 
+	FT_TP_KEY(insert_replace_enter, key, key_len);
 	ret = _cds_ft_insert_replace(ft, key, key_len, node, &old_node);
 	if (ret == -EINVAL) {
 		*result_node = NULL;
+		FT_TP(insert_replace_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 	if (ret) {
 		*result_node = NULL;
+		FT_TP(insert_replace_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	*result_node = old_node;
 	if (old_node) {
+		FT_TP(insert_replace_exit, (int) CDS_FT_STATUS_DUPLICATE_FOUND);
 		return CDS_FT_STATUS_DUPLICATE_FOUND;
 	}
+	FT_TP(insert_replace_exit, (int) CDS_FT_STATUS_OK);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -10773,6 +11013,9 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	struct cds_ft_node *iter_node, **head_slot, *match;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
+	enum cds_ft_status s;
+
+	FT_TP_ITER_KEY(replace_enter, iter);
 
 	/*
 	 * If the iterator has a valid path, the RCU read-side lock must
@@ -10783,11 +11026,17 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	iter_debug_path_check(iter);
 
 	if (!valid_external_node(old_node) || !valid_external_node(new_node)
-			|| !valid_key_len(ft, key_len))
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+			|| !valid_key_len(ft, key_len)) {
+		s = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		FT_TP(replace_exit, (int) s);
+		return s;
+	}
 	/* Expect zeroed next and prev pointers on new_node. */
-	if (new_node->next || new_node->prev)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (new_node->next || new_node->prev) {
+		s = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		FT_TP(replace_exit, (int) s);
+		return s;
+	}
 
 	key_depth = key_len + 1;
 	iter_key = iter_key(iter);
@@ -10806,8 +11055,11 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		struct cds_ft_metadata *metadata;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		if (!metadata->external_nodes)
-			return CDS_FT_STATUS_NOT_FOUND;
+		if (!metadata->external_nodes) {
+			s = CDS_FT_STATUS_NOT_FOUND;
+			FT_TP(replace_exit, (int) s);
+			return s;
+		}
 		head_slot = (struct cds_ft_node **) &metadata->external_nodes;
 		iter_node = metadata->external_nodes;
 		goto find_and_replace;
@@ -10817,8 +11069,11 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	for (i = 1; i < key_depth; i++) {
 		uint8_t key_value;
 
-		if (ft_node_external(node_flag))
-			return CDS_FT_STATUS_NOT_FOUND;
+		if (ft_node_external(node_flag)) {
+			s = CDS_FT_STATUS_NOT_FOUND;
+			FT_TP(replace_exit, (int) s);
+			return s;
+		}
 		if (ft_node_compressed(node_flag)) {
 			bool nf = false;
 			enum ft_compressed_action act;
@@ -10826,8 +11081,11 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			act = ft_traverse_compressed(&node_flag,
 				&node_flag_ptr, &iter_key, &i,
 				key_depth, &nf);
-			if (nf)
-				return CDS_FT_STATUS_NOT_FOUND;
+			if (nf) {
+				s = CDS_FT_STATUS_NOT_FOUND;
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
 			if (act == FT_COMPRESSED_BREAK)
 				break;
 			continue;
@@ -10839,16 +11097,22 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			act = ft_traverse_collapsed(&node_flag,
 				&node_flag_ptr, &iter_key, &i,
 				key_depth, &nf);
-			if (nf)
-				return CDS_FT_STATUS_NOT_FOUND;
+			if (nf) {
+				s = CDS_FT_STATUS_NOT_FOUND;
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
 			if (act == FT_COMPRESSED_BREAK)
 				break;
 			continue;
 		}
 		key_value = *(iter_key++);
 		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
-		if (!ft_node_ptr(node_flag))
-			return CDS_FT_STATUS_NOT_FOUND;
+		if (!ft_node_ptr(node_flag)) {
+			s = CDS_FT_STATUS_NOT_FOUND;
+			FT_TP(replace_exit, (int) s);
+			return s;
+		}
 	}
 
 	/* Reached end of key. Locate the duplicate chain. */
@@ -10856,8 +11120,11 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		struct cds_ft_metadata *metadata;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		if (!metadata->external_nodes)
-			return CDS_FT_STATUS_NOT_FOUND;
+		if (!metadata->external_nodes) {
+			s = CDS_FT_STATUS_NOT_FOUND;
+			FT_TP(replace_exit, (int) s);
+			return s;
+		}
 		head_slot = (struct cds_ft_node **) &metadata->external_nodes;
 		iter_node = metadata->external_nodes;
 	} else {
@@ -10875,8 +11142,11 @@ find_and_replace:
 		}
 	}
 
-	if (!match)
-		return CDS_FT_STATUS_NOT_FOUND;
+	if (!match) {
+		s = CDS_FT_STATUS_NOT_FOUND;
+		FT_TP(replace_exit, (int) s);
+		return s;
+	}
 
 	/*
 	 * Splice new_node into the chain in place of old_node.
@@ -10904,7 +11174,9 @@ find_and_replace:
 	 * iterator path remains valid in cached mode.
 	 */
 	iter_auto_invalidate_path(iter);
-	return CDS_FT_STATUS_OK;
+	s = CDS_FT_STATUS_OK;
+	FT_TP(replace_exit, (int) s);
+	return s;
 }
 
 /*
@@ -10946,6 +11218,8 @@ int ft_detach_node(struct cds_ft *ft,
 	 * free-intermediate walk below.
 	 */
 	struct cds_ft_inode_flag *orig_detach_child = *detach_node_flag_ptr;
+
+	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
 
 	/*
 	 * Check the node being replaced (the child at detach_node_flag_ptr)
@@ -11429,6 +11703,7 @@ end:
 	 * Density was already propagated before structural changes
 	 * (above), while parent pointers were still valid.
 	 */
+	FT_TP(detach_node_exit, (int) ret);
 	return ret;
 }
 
@@ -11462,6 +11737,8 @@ void ft_unchain_node(struct cds_ft_node **head_slot,
 {
 	struct cds_ft_node *next_node = node->next;
 
+	FT_TP(unchain_node, (const void *) head_slot, (const void *) node,
+		!ft_node_external((struct cds_ft_inode_flag *) node->prev));
 	if (next_node)
 		next_node->prev = node->prev;
 	if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
@@ -11508,6 +11785,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 
+	FT_TP_KEY(remove_enter, iter_key(iter), key_len);
+
 	/*
 	 * If the iterator has a valid path, the RCU read-side lock must
 	 * be held.
@@ -11516,10 +11795,14 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 	iter_debug_path_check(iter);
 
-	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
+	if (!valid_external_node(node) || !valid_key_len(ft, key_len)) {
+		FT_TP(remove_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH))
+	}
+	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH)) {
+		FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 
 	iter_key = iter_key(iter);
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
@@ -11534,6 +11817,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		dbg_printf("cds_ft_remove iter nf %p\n",
 				dd.d.nf);
 		if (!ft_node_ptr(dd.d.nf)) {
+			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		/* Resolve skip-compressed (e.g. from collapsed entry). */
@@ -11560,8 +11844,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 
 			j = ft_match_compressed_key(iter_key, cn, cmp);
 			if (j < cmp || cn->len > remaining ||
-			    !ft_node_ptr(cn->child))
+			    !ft_node_ptr(cn->child)) {
+				FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 				return CDS_FT_STATUS_NOT_FOUND;
+			}
 			/*
 			 * Full match with non-NULL child: traverse
 			 * through without decompressing.
@@ -11604,8 +11890,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				match2 = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, false, NULL) == 0);
 				if (!match2)
 					continue;
-				if (!ft_node_ptr(cptrs[e]))
+				if (!ft_node_ptr(cptrs[e])) {
+					FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 					return CDS_FT_STATUS_NOT_FOUND;
+				}
 				ft_detach_descent_track(&dd, col_meta);
 				dd.d.ppnf  = dd.d.pnf;
 				dd.d.ppnfp = dd.d.pnfp;
@@ -11622,8 +11910,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				found = true;
 				break;
 			}
-			if (!found)
+			if (!found) {
+				FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 				return CDS_FT_STATUS_NOT_FOUND;
+			}
 			continue;
 		}
 
@@ -11647,6 +11937,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 */
 	if (!ft_node_ptr(dd.d.nf)) {
 		dbg_printf("cds_ft_remove: no node found for key\n");
+		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 
@@ -11670,6 +11961,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			}
 			if (!match) {
 				dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
+				FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 				return CDS_FT_STATUS_NOT_FOUND;
 			}
 			/*
@@ -11685,6 +11977,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ret = 0;
 		} else {
 			dbg_printf("cds_ft_remove: no metadata external node found for key\n");
+			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 	} else {
@@ -11705,6 +11998,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		}
 		if (!match) {
 			dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
+			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		assert(count > 0);
@@ -11752,8 +12046,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 #ifdef FEATURE_FT_COLLAPSE
 		ft_check_collapse_on_path(ft, iter_key, key_len);
 #endif
+		FT_TP(remove_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	case -ENOMEM:
+		FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	default:
 		abort();
@@ -12792,10 +13088,16 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 	size_t key_len, src_max;
 	enum cds_ft_status status;
 
-	if (!dst_ft || !src_ft || dst_ft == src_ft)
+	FT_TP_KEY(graft_enter, _key, _key_len);
+
+	if (!dst_ft || !src_ft || dst_ft == src_ft) {
+		FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (dst_ft->group != src_ft->group)
+	}
+	if (dst_ft->group != src_ft->group) {
+		FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 
 	/*
 	 * Root-level graft (key_len == 0) is valid for both
@@ -12808,8 +13110,10 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 	} else {
 		key_len = ft_key_len(dst_ft, _key_len);
 		if (!valid_key_len(dst_ft, key_len) ||
-				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE)
+				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE) {
+			FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		}
 	}
 
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
@@ -12818,16 +13122,22 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 	ft_key_to_ordinals(ordinal_buf, _key, key_len, &dst_ft->group->key_map);
 
 	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
-	if (key_len > 0 && src_max > dst_ft->group->max_key_len - key_len)
+	if (key_len > 0 && src_max > dst_ft->group->max_key_len - key_len) {
+		FT_TP(graft_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	if (ft_density_pool_ensure(dst_ft, FT_MAX_DEPTH))
+	}
+	if (ft_density_pool_ensure(dst_ft, FT_MAX_DEPTH)) {
+		FT_TP(graft_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 
 	src_rmeta = ft_root_metadata(src_ft);
 
 	/* Check if source trie is empty. */
-	if (src_rmeta->nr_child == 0 && !src_rmeta->external_nodes)
+	if (src_rmeta->nr_child == 0 && !src_rmeta->external_nodes) {
+		FT_TP(graft_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
+	}
 
 	if (key_len == 0) {
 		struct cds_ft_metadata *dst_rmeta = ft_root_metadata(dst_ft);
@@ -12835,16 +13145,20 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		struct cds_ft_metadata *fresh_meta;
 
 		/* Destination must be empty for a root-level graft. */
-		if (dst_rmeta->nr_child != 0 || dst_rmeta->external_nodes)
+		if (dst_rmeta->nr_child != 0 || dst_rmeta->external_nodes) {
+			FT_TP(graft_exit, (int) CDS_FT_STATUS_POPULATED_ERROR);
 			return CDS_FT_STATUS_POPULATED_ERROR;
+		}
 
 		/*
 		 * Allocate a fresh empty root for the source before
 		 * swapping, so the source remains a valid trie.
 		 */
 		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], &fresh_meta);
-		if (!fresh_root)
+		if (!fresh_root) {
+			FT_TP(graft_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
 
 		/*
 		 * Swap root pointers.  The source's root carries all
@@ -12870,8 +13184,10 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 * on memory shortage instead of calling abort().
 		 */
 		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
-		if (!fresh_node)
+		if (!fresh_node) {
+			FT_TP(graft_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
 
 		ft_descend_to_graft_point(dst_ft, key, key_len, &d,
 				graft_snapshot, graft_snapshot_depth,
@@ -12888,6 +13204,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 						  src_count);
 		if (status != CDS_FT_STATUS_OK) {
 			free_cds_ft_node(src_ft, fresh_node);
+			FT_TP(graft_exit, (int) status);
 			return status;
 		}
 
@@ -12926,6 +13243,7 @@ done:
 	if (key_len > 0)
 		ft_check_collapse_on_path(dst_ft, key, key_len);
 #endif
+	FT_TP(graft_exit, (int) CDS_FT_STATUS_OK);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -12935,10 +13253,16 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 {
 	size_t key_len, swap_max;
 
-	if (!dst_ft || !swap_ft || dst_ft == swap_ft)
+	FT_TP_KEY(graft_swap_enter, _key, _key_len);
+
+	if (!dst_ft || !swap_ft || dst_ft == swap_ft) {
+		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (dst_ft->group != swap_ft->group)
+	}
+	if (dst_ft->group != swap_ft->group) {
+		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 
 	/*
 	 * Root-level swap (key_len == 0) is valid for both
@@ -12949,8 +13273,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	} else {
 		key_len = ft_key_len(dst_ft, _key_len);
 		if (!valid_key_len(dst_ft, key_len) ||
-				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE)
+				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE) {
+			FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		}
 	}
 
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
@@ -12959,10 +13285,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	ft_key_to_ordinals(ordinal_buf, _key, key_len, &dst_ft->group->key_map);
 
 	swap_max = uatomic_load(&swap_ft->max_used_key_len, CMM_RELAXED);
-	if (key_len > 0 && swap_max > dst_ft->group->max_key_len - key_len)
+	if (key_len > 0 && swap_max > dst_ft->group->max_key_len - key_len) {
+		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	if (ft_density_pool_ensure(dst_ft, FT_MAX_DEPTH))
+	}
+	if (ft_density_pool_ensure(dst_ft, FT_MAX_DEPTH)) {
+		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 
 	if (key_len == 0) {
 		/*
@@ -12983,6 +13313,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		uatomic_store(&swap_ft->max_used_key_len, dm,
 			      CMM_RELAXED);
 
+		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
 
@@ -13004,12 +13335,15 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				&nr_graft_snapshot);
 
 		if (d.depth < key_len) {
+			enum cds_ft_status s;
 			/*
 			 * Path incomplete: nothing at or below the graft
 			 * point.  swap_ft receives empty content.
 			 * Delegate to graft for intermediate-node creation.
 			 */
-			return cds_ft_graft(dst_ft, key, _key_len, swap_ft);
+			s = cds_ft_graft(dst_ft, key, _key_len, swap_ft);
+			FT_TP(graft_swap_exit, (int) s);
+			return s;
 		}
 
 		/* Snapshot old content at the graft slot. */
@@ -13043,8 +13377,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (need_fresh) {
 			fresh = alloc_cds_ft_node(swap_ft,
 				&ft_types[0], &fresh_meta);
-			if (!fresh)
+			if (!fresh) {
+				FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
 		}
 
 		/*
@@ -13166,6 +13502,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				      dm > key_len ? dm - key_len : 0,
 				      CMM_RELAXED);
 		}
+		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
 }
@@ -13179,10 +13516,14 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 	size_t key_len;
 	enum cds_ft_status status;
 
+	FT_TP_KEY(detach_enter, _key, _key_len);
+
 	*result_ft = NULL;
 
-	if (!ft)
+	if (!ft) {
+		FT_TP(detach_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 
 	/*
 	 * Root-level detach (key_len == 0) is valid for both
@@ -13193,8 +13534,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 	} else {
 		key_len = ft_key_len(ft, _key_len);
 		if (!valid_key_len(ft, key_len) ||
-				ft->group->key_len != CDS_FT_LEN_VARIABLE)
+				ft->group->key_len != CDS_FT_LEN_VARIABLE) {
+			FT_TP(detach_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		}
 	}
 
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
@@ -13202,8 +13545,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 	ft_key_to_ordinals(ordinal_buf, _key, key_len, &ft->group->key_map);
 
-	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH))
+	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH)) {
+		FT_TP(detach_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 
 	if (key_len == 0) {
 		struct cds_ft_metadata *rmeta = ft_root_metadata(ft);
@@ -13211,12 +13556,16 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		struct cds_ft_metadata *fresh_meta;
 
 		/* Check if source trie is empty. */
-		if (rmeta->nr_child == 0 && !rmeta->external_nodes)
+		if (rmeta->nr_child == 0 && !rmeta->external_nodes) {
+			FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
+		}
 
 		status = cds_ft_create(ft->group, &detached);
-		if (status != CDS_FT_STATUS_OK)
+		if (status != CDS_FT_STATUS_OK) {
+			FT_TP(detach_exit, (int) status);
 			return status;
+		}
 
 		/*
 		 * Allocate a fresh empty root for the source trie
@@ -13225,6 +13574,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		fresh_node = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
 		if (!fresh_node) {
 			cds_ft_destroy(detached);
+			FT_TP(detach_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 
@@ -13253,6 +13603,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		rcu_assign_pointer(ft->root, ft_node_flag(fresh_node, 0));
 
 		*result_ft = detached;
+		FT_TP(detach_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
 
@@ -13270,10 +13621,14 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			uint8_t kv;
 			const struct cds_ft_metadata *meta;
 
-			if (!ft_node_ptr(dd.d.nf))
+			if (!ft_node_ptr(dd.d.nf)) {
+				FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 				return CDS_FT_STATUS_NOT_FOUND;
-			if (ft_node_external(dd.d.nf))
+			}
+			if (ft_node_external(dd.d.nf)) {
+				FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 				return CDS_FT_STATUS_NOT_FOUND;
+			}
 			if (ft_node_compressed(dd.d.nf)) {
 				struct cds_ft_compressed_node *cn =
 					ft_compressed_node_ptr(dd.d.nf);
@@ -13326,8 +13681,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, false, NULL) == 0);
 					if (!match)
 						continue;
-					if (!ft_node_ptr(cptrs[e]))
+					if (!ft_node_ptr(cptrs[e])) {
+						FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 						return CDS_FT_STATUS_NOT_FOUND;
+					}
 					ft_detach_descent_track(&dd, col_meta);
 					dd.d.ppnf  = dd.d.pnf;
 					dd.d.ppnfp = dd.d.pnfp;
@@ -13344,8 +13701,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					found = true;
 					break;
 				}
-				if (!found)
+				if (!found) {
+					FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 					return CDS_FT_STATUS_NOT_FOUND;
+				}
 				continue;
 
 			detach_collapsed_explode:
@@ -13370,8 +13729,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						col, cptrs,
 						0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
 						0, dd.d.depth);
-					if (!internal_flag)
+					if (!internal_flag) {
+						FT_TP(detach_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 						return CDS_FT_STATUS_MEMORY_ERROR;
+					}
 					{
 						struct cds_ft_metadata *int_meta =
 							ft_flag_to_metadata(internal_flag);
@@ -13413,8 +13774,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 		child = dd.d.nf;
 
-		if (!ft_node_ptr(child))
+		if (!ft_node_ptr(child)) {
+			FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
+		}
 
 		/*
 		 * Compute the external node count of the subtree
@@ -13433,8 +13796,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			}
 
 			status = cds_ft_create(ft->group, &detached);
-			if (status != CDS_FT_STATUS_OK)
+			if (status != CDS_FT_STATUS_OK) {
+				FT_TP(detach_exit, (int) status);
 				return status;
+			}
 
 			/*
 			 * Propagate count removal through ancestors
@@ -13464,6 +13829,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						dd.d.pnf,
 						(long) detached_count);
 					cds_ft_destroy(detached);
+					FT_TP(detach_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
 			}
@@ -13516,6 +13882,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 #ifdef FEATURE_FT_COLLAPSE
 		ft_check_collapse_on_path(ft, key, key_len);
 #endif
+		FT_TP(detach_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
 }
@@ -13718,11 +14085,14 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	unsigned int i;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
 	const uint8_t *prefix = ordinal_buf;
+	unsigned long count;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
-	if (prefix_len > ft->group->max_key_len)
-		return 0;
+	if (prefix_len > ft->group->max_key_len) {
+		count = 0;
+		goto out;
+	}
 	ft_key_to_ordinals(ordinal_buf, _prefix, prefix_len, &ft->group->key_map);
 
 	node_flag = ft_dereference_acquire_prefetch(ft->root);
@@ -13730,53 +14100,61 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	for (i = 0; i < prefix_len; i++) {
 		uint8_t kv;
 
-		if (ft_node_external(node_flag))
-			return 0;
+		if (ft_node_external(node_flag)) {
+			count = 0;
+			goto out;
+		}
 		if (ft_node_compressed(node_flag)) {
 			enum ft_compressed_action act;
-			unsigned long count;
 
 			act = ft_count_prefix_compressed(
 				&node_flag, &i, prefix,
 				prefix_len, &count);
 			if (act == FT_COMPRESSED_END)
-				return count;
+				goto out;
 			continue;
 		}
 		if (ft_node_collapsed(node_flag)) {
 			enum ft_compressed_action act;
-			unsigned long count;
 
 			act = ft_count_prefix_collapsed(
 				&node_flag, &i, prefix,
 				prefix_len, &count);
 			if (act == FT_COMPRESSED_END)
-				return count;
+				goto out;
 			continue;
 		}
 		kv = prefix[i];
 		node_flag = ft_node_get_nth(node_flag, NULL, kv);
 	}
 
-	if (!ft_node_ptr(node_flag))
-		return 0;
+	if (!ft_node_ptr(node_flag)) {
+		count = 0;
+		goto out;
+	}
 	if (ft_node_internal(node_flag)) {
 		struct cds_ft_metadata *metadata =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		return ft_nr_keys_load(metadata);
+		count = ft_nr_keys_load(metadata);
+		goto out;
 	}
 	if (ft_node_compressed(node_flag)) {
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		return ft_nr_keys_load(cn_meta);
+		count = ft_nr_keys_load(cn_meta);
+		goto out;
 	}
 	if (ft_node_collapsed(node_flag)) {
 		struct cds_ft_metadata *col_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		return ft_nr_keys_load(col_meta);
+		count = ft_nr_keys_load(col_meta);
+		goto out;
 	}
 	/* External node: one key (possibly with duplicates). */
-	return 1;
+	count = 1;
+out:
+	FT_TP(count_prefix, count);
+	return count;
 }
 
 unsigned long cds_ft_count_keys(struct cds_ft *ft)
@@ -13984,6 +14362,8 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 	int level;
 	unsigned long remaining = n;
 
+	FT_TP(lookup_nth_enter, n);
+
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	iter_debug_path_snapshot(iter);
@@ -14102,6 +14482,7 @@ next_level:
 
 end:
 	iter_auto_invalidate_path(iter);
+	FT_TP(lookup_nth_exit, (int) iter->status);
 	return iter->status;
 }
 
@@ -14287,6 +14668,8 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 	int level;
 	unsigned long remaining = n;
 
+	FT_TP(lookup_nth_last_enter, n);
+
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	iter_debug_path_snapshot(iter);
@@ -14409,6 +14792,7 @@ next_level:
 
 end:
 	iter_auto_invalidate_path(iter);
+	FT_TP(lookup_nth_last_exit, (int) iter->status);
 	return iter->status;
 }
 
@@ -14591,12 +14975,18 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 */
 	unsigned int cached_col_nr_e = 0;
 
+	FT_TP(iter_skip_forward_enter, n);
+
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
-	if (!iter->node)
+	if (!iter->node) {
+		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 		return CDS_FT_STATUS_NOT_FOUND;
-	if (n == 0)
+	}
+	if (n == 0) {
+		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
+	}
 
 	iter_debug_path_snapshot(iter);
 
@@ -14984,6 +15374,7 @@ next_forward_level:
 
 end:
 	iter_auto_invalidate_path(iter);
+	FT_TP(iter_skip_forward_exit, (int) iter->status);
 	return iter->status;
 }
 
@@ -15062,12 +15453,18 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	int depth, level;
 	bool at_external_nodes;
 
+	FT_TP(iter_skip_reverse_enter, n);
+
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
-	if (!iter->node)
+	if (!iter->node) {
+		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 		return CDS_FT_STATUS_NOT_FOUND;
-	if (n == 0)
+	}
+	if (n == 0) {
+		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
+	}
 
 	iter_debug_path_snapshot(iter);
 
@@ -15437,6 +15834,7 @@ next_reverse_level:
 
 end:
 	iter_auto_invalidate_path(iter);
+	FT_TP(iter_skip_reverse_exit, (int) iter->status);
 	return iter->status;
 }
 
@@ -15449,8 +15847,10 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft)
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	status = cds_ft_iter_create(ft, &iter);
-	if (status != CDS_FT_STATUS_OK)
+	if (status != CDS_FT_STATUS_OK) {
+		FT_TP(count_entries, (unsigned long) 0);
 		return 0;
+	}
 	cds_ft_for_each_rcu(ft, iter) {
 		struct cds_ft_node *node = cds_ft_iter_node(iter);
 
@@ -15460,6 +15860,7 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft)
 	if (cds_ft_iter_status(iter) < 0)
 		count = 0;
 	cds_ft_iter_destroy(iter);
+	FT_TP(count_entries, count);
 	return count;
 }
 
@@ -16724,11 +17125,13 @@ enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **re
 	iter->ft = ft;
 	iter->path_mode = CDS_FT_ITER_PATH_CACHED;
 	*result_iter = iter;
+	FT_TP(iter_create, (const void *) *result_iter);
 	return CDS_FT_STATUS_OK;
 }
 
 void cds_ft_iter_destroy(struct cds_ft_iter *iter)
 {
+	FT_TP(iter_destroy, (const void *) iter);
 	free(iter);
 }
 
@@ -16765,6 +17168,9 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 	bool subset = false;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
 
+	FT_TP(iter_set_key_enter, key, key_len,
+		(int) iter->key_len, (int) iter->path_len);
+
 	key_len = ft_key_len(iter->ft, key_len);
 	if (key_len > iter->ft->group->max_key_len)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -16784,6 +17190,7 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 		iter->path_len = key_len + 1;
 	}
 	iter->key_len = key_len;
+	FT_TP(iter_set_key_exit, (int) subset, (int) iter->path_len);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -16793,14 +17200,18 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
  */
 enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t prefix_len)
 {
-	if (prefix_len > iter->key_len)
+	if (prefix_len > iter->key_len) {
+		FT_TP(iter_set_prefix_len, (int) prefix_len);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 	iter->prefix_len = prefix_len;
+	FT_TP(iter_set_prefix_len, (int) prefix_len);
 	return CDS_FT_STATUS_OK;
 }
 
 void cds_ft_iter_reset(struct cds_ft_iter *iter)
 {
+	FT_TP(iter_reset, (const void *) iter);
 	iter->path_valid = false;
 	iter_debug_path_clear(iter);
 	iter->status = CDS_FT_STATUS_OK;
@@ -16821,6 +17232,7 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 
 void cds_ft_iter_invalidate_path(struct cds_ft_iter *iter)
 {
+	FT_TP(iter_invalidate_path, (const void *) iter);
 	iter->path_valid = false;
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
