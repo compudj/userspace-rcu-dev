@@ -33,11 +33,32 @@
  * Emit a tracepoint with a key byte-sequence payload (LTTng's
  * sequence_hex field).  When tracing is disabled, the arguments are
  * discarded by the FT_TP no-op expansion, so no code is emitted.
+ *
+ * FT_TP_KEY_RESOLVED: caller has already resolved keylen to a real
+ *   byte count (e.g. from ft_key_len() or iter->key_len).
+ *
+ * FT_TP_KEY: user-facing sentinel values (CDS_FT_LEN_DEFAULT ==
+ *   SIZE_MAX, etc.) must be resolved via ft_key_len(ft_, keylen)
+ *   before the sequence field reads keylen bytes from keybuf, or
+ *   the sequence reader would attempt to serialize SIZE_MAX bytes.
+ *   On resolution failure (LEN_ERROR), the key sequence is empty.
  */
-#define FT_TP_KEY(name, keybuf, keylen)					\
-	FT_TP(name, (keybuf), (keylen))
+#define FT_TP_KEY_RESOLVED(name, ft_, keybuf, keylen)			\
+	FT_TP(name, (const void *) (ft_), (keybuf), (keylen))
+#define FT_TP_KEY(name, ft_, keybuf, keylen)				\
+	do {								\
+		size_t _tp_klen = ft_key_len((ft_), (keylen));		\
+		FT_TP_KEY_RESOLVED(name, (ft_), (keybuf),		\
+			_tp_klen == CDS_FT_LEN_ERROR ? 0 : _tp_klen);	\
+	} while (0)
+/*
+ * FT_TP_ITER_KEY: emit an iter-keyed key event.  Uses the resolved
+ * iter->key_len; ft is carried alongside iter for snapshot safety
+ * (iter_create may have already scrolled out of a flight recorder).
+ */
 #define FT_TP_ITER_KEY(name, iter)					\
-	FT_TP_KEY(name, iter_key(iter), (iter)->key_len)
+	FT_TP(name, (const void *) (iter)->ft, (const void *) (iter),	\
+		iter_key(iter), (iter)->key_len)
 /*
  * enum ft_tp_node_kind (node-kind identifiers) lives in
  * fractal-trie-internal.h so the C side and the LTTng enum in
@@ -47,7 +68,8 @@
  */
 #else
 #define FT_TP(name, ...)			do {} while (0)
-#define FT_TP_KEY(name, keybuf, keylen)		do {} while (0)
+#define FT_TP_KEY_RESOLVED(name, ft_, keybuf, keylen)	do {} while (0)
+#define FT_TP_KEY(name, ft_, keybuf, keylen)	do {} while (0)
 #define FT_TP_ITER_KEY(name, iter)		do {} while (0)
 #endif
 
@@ -5440,11 +5462,11 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 	uint8_t ordinals[FT_MAX_KEY_LEN];
 	enum cds_ft_status status;
 
-	FT_TP_KEY(lookup_enter, key, _key_len);
+	FT_TP_KEY(lookup_key_enter, ft, key, _key_len);
 	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
 	status = do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
 				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
-	FT_TP(lookup_exit, (int) status);
+	FT_TP(lookup_key_exit, (int) status);
 	return status;
 }
 
@@ -10755,7 +10777,7 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
 {
 	int ret;
 
-	FT_TP_KEY(insert_enter, key, key_len);
+	FT_TP_KEY(insert_enter, ft, key, key_len);
 	ret = _cds_ft_insert(ft, key, key_len, node, NULL);
 
 	if (ret == 0) {
@@ -10778,7 +10800,7 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 	int ret;
 	struct cds_ft_node *ret_node = NULL;
 
-	FT_TP_KEY(insert_unique_enter, key, key_len);
+	FT_TP_KEY(insert_unique_enter, ft, key, key_len);
 	ret = _cds_ft_insert(ft, key, key_len, node, &ret_node);
 	if (ret == -EEXIST) {
 		*result_node = ret_node;
@@ -11006,7 +11028,7 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 	struct cds_ft_node *old_node = NULL;
 	int ret;
 
-	FT_TP_KEY(insert_replace_enter, key, key_len);
+	FT_TP_KEY(insert_replace_enter, ft, key, key_len);
 	ret = _cds_ft_insert_replace(ft, key, key_len, node, &old_node);
 	if (ret == -EINVAL) {
 		*result_node = NULL;
@@ -11810,7 +11832,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 
-	FT_TP_KEY(remove_enter, iter_key(iter), key_len);
+	FT_TP(remove_enter, (const void *) ft, (const void *) iter,
+		iter_key(iter), key_len);
 
 	/*
 	 * If the iterator has a valid path, the RCU read-side lock must
@@ -13113,7 +13136,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 	size_t key_len, src_max;
 	enum cds_ft_status status;
 
-	FT_TP_KEY(graft_enter, _key, _key_len);
+	FT_TP_KEY(graft_enter, dst_ft, _key, _key_len);
 
 	if (!dst_ft || !src_ft || dst_ft == src_ft) {
 		FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
@@ -13278,7 +13301,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 {
 	size_t key_len, swap_max;
 
-	FT_TP_KEY(graft_swap_enter, _key, _key_len);
+	FT_TP_KEY(graft_swap_enter, dst_ft, _key, _key_len);
 
 	if (!dst_ft || !swap_ft || dst_ft == swap_ft) {
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
@@ -13541,7 +13564,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 	size_t key_len;
 	enum cds_ft_status status;
 
-	FT_TP_KEY(detach_enter, _key, _key_len);
+	FT_TP_KEY(detach_enter, ft, _key, _key_len);
 
 	*result_ft = NULL;
 
@@ -17150,13 +17173,13 @@ enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **re
 	iter->ft = ft;
 	iter->path_mode = CDS_FT_ITER_PATH_CACHED;
 	*result_iter = iter;
-	FT_TP(iter_create, (const void *) *result_iter);
+	FT_TP(iter_create, (const void *) ft, (const void *) *result_iter);
 	return CDS_FT_STATUS_OK;
 }
 
 void cds_ft_iter_destroy(struct cds_ft_iter *iter)
 {
-	FT_TP(iter_destroy, (const void *) iter);
+	FT_TP(iter_destroy, (const void *) iter->ft, (const void *) iter);
 	free(iter);
 }
 
@@ -17193,7 +17216,8 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 	bool subset = false;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
 
-	FT_TP(iter_set_key_enter, key, key_len,
+	FT_TP(iter_set_key_enter, (const void *) iter->ft, (const void *) iter,
+		key, key_len,
 		(int) iter->key_len, (int) iter->path_len);
 
 	key_len = ft_key_len(iter->ft, key_len);
@@ -17222,7 +17246,8 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 		iter->path_len = key_len + 1;
 	}
 	iter->key_len = key_len;
-	FT_TP(iter_set_key_exit, (int) subset, (int) iter->path_len);
+	FT_TP(iter_set_key_exit, (const void *) iter->ft, (const void *) iter,
+		(int) subset, (int) iter->path_len);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -17233,17 +17258,19 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t prefix_len)
 {
 	if (prefix_len > iter->key_len) {
-		FT_TP(iter_set_prefix_len, (int) prefix_len);
+		FT_TP(iter_set_prefix_len, (const void *) iter->ft,
+			(const void *) iter, (int) prefix_len);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 	iter->prefix_len = prefix_len;
-	FT_TP(iter_set_prefix_len, (int) prefix_len);
+	FT_TP(iter_set_prefix_len, (const void *) iter->ft,
+		(const void *) iter, (int) prefix_len);
 	return CDS_FT_STATUS_OK;
 }
 
 void cds_ft_iter_reset(struct cds_ft_iter *iter)
 {
-	FT_TP(iter_reset, (const void *) iter);
+	FT_TP(iter_reset, (const void *) iter->ft, (const void *) iter);
 	iter->path_valid = false;
 	iter_debug_path_clear(iter);
 	iter->status = CDS_FT_STATUS_OK;
@@ -17264,7 +17291,7 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 
 void cds_ft_iter_invalidate_path(struct cds_ft_iter *iter)
 {
-	FT_TP(iter_invalidate_path, (const void *) iter);
+	FT_TP(iter_invalidate_path, (const void *) iter->ft, (const void *) iter);
 	iter->path_valid = false;
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
