@@ -250,6 +250,34 @@ LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
 	LTTNG_UST_TP_ARGS(const void *, node))
 
 /*
+ * root_publish: the trie's ft->root slot has been updated.
+ *
+ * Emitted at every site that writes ft->root, including the
+ * initial cds_ft_alloc() assignment, all graft/swap/detach paths
+ * that rcu_assign_pointer(ft->root, ...), and implicitly from
+ * ft_publish_to_parent() when parent_nf is NULL (indicating a
+ * root-slot publish, which has no structural parent node).
+ *
+ * The root_kind field lets a consumer distinguish the kind of
+ * the new root (internal, compressed, collapsed, external) in
+ * the same enum as tree_edge_set's parent_kind/child_kind, so
+ * the consumer can tag the root node correctly without having
+ * to observe a separate event.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, root_publish,
+	LTTNG_UST_TP_ARGS(
+		const void *, ft,
+		const void *, root
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_integer_hex(uintptr_t, root, (uintptr_t) root)
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, uint16_t, root_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) root))
+	)
+)
+
+/*
  * Collapsed-node entry (re)publish.
  *
  * A collapsed node stores up to 256 entries, each with a variable-

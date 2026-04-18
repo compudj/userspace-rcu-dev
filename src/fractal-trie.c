@@ -1716,6 +1716,14 @@ void ft_publish_to_parent(struct cds_ft *ft,
 		(const void *) parent_slot,
 		(const void *) *parent_slot,
 		(const void *) new_child);
+	/*
+	 * When parent_slot points at ft->root, emit root_publish so
+	 * consumers can track the top of the trie through root
+	 * rewrites that have no structural parent node.
+	 */
+	if (parent_slot == &ft->root)
+		FT_TP(root_publish, (const void *) ft,
+			(const void *) new_child);
 	rcu_assign_pointer(*parent_slot, new_child);
 }
 
@@ -13325,7 +13333,11 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 * metadata (nr_child, external_nodes) with it.
 		 */
 		rcu_assign_pointer(dst_ft->root, src_ft->root);
+		FT_TP(root_publish, (const void *) dst_ft,
+			(const void *) dst_ft->root);
 		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
+		FT_TP(root_publish, (const void *) src_ft,
+			(const void *) src_ft->root);
 		goto done;
 	}
 
@@ -13386,6 +13398,8 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 
 		/* Give source a fresh empty root. */
 		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
+		FT_TP(root_publish, (const void *) src_ft,
+			(const void *) src_ft->root);
 	}
 
 done:
@@ -13464,7 +13478,11 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		size_t dm;
 
 		rcu_assign_pointer(dst_ft->root, swap_ft->root);
+		FT_TP(root_publish, (const void *) dst_ft,
+			(const void *) dst_ft->root);
 		rcu_assign_pointer(swap_ft->root, tmp);
+		FT_TP(root_publish, (const void *) swap_ft,
+			(const void *) swap_ft->root);
 
 		dm = uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED);
 		if (swap_max > dm)
@@ -13631,6 +13649,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 #endif
 			}
 			rcu_assign_pointer(swap_ft->root, old_child);
+			FT_TP(root_publish, (const void *) swap_ft,
+				(const void *) swap_ft->root);
 			if (swap_empty)
 				free_cds_ft_node(swap_ft,
 					ft_node_ptr(old_swap_root));
@@ -13643,6 +13663,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			}
 		} else {
 			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
+			FT_TP(root_publish, (const void *) swap_ft,
+				(const void *) swap_ft->root);
 			if (ft_node_ptr(old_child)) {
 				ft_metadata_set_external_nodes(ft_node_flag(fresh, 0), fresh_meta,
 					(struct cds_ft_node *)
@@ -13746,6 +13768,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		free_cds_ft_node(detached, ft_node_ptr(detached->root));
 		/* No readers in detached root yet. */
 		detached->root = ft->root;
+		FT_TP(root_publish, (const void *) detached,
+			(const void *) detached->root);
 		/* Clear parent: this node is now a root. */
 		{
 			struct cds_ft_metadata *m = cds_ft_item_to_metadata(
@@ -13761,6 +13785,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 		/* Give source a fresh empty root. */
 		rcu_assign_pointer(ft->root, ft_node_flag(fresh_node, 0));
+		FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
 		*result_ft = detached;
 		FT_TP(detach_exit, (int) CDS_FT_STATUS_OK);
@@ -14012,6 +14037,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 					ft_node_ptr(detached->root));
 				/* No readers in detached root yet. */
 				detached->root = child;
+				FT_TP(root_publish, (const void *) detached,
+					(const void *) detached->root);
 				/* Clear parent: this node is now a root. */
 				{
 					struct cds_ft_metadata *m = cds_ft_item_to_metadata(
@@ -16202,6 +16229,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->root = ft_node_flag(root_node, 0);
+	FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
 	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH)) {
 		free_cds_ft_node(ft, root_node);
