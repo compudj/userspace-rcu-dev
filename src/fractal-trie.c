@@ -16776,7 +16776,8 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 	}
 }
 
-void cds_ft_show(const struct cds_ft *ft, FILE *out)
+static
+void show_pretty(const struct cds_ft *ft, FILE *out)
 {
 	struct cds_ft_inode_flag *node_flag;
 	int level = 0;
@@ -16797,6 +16798,242 @@ void cds_ft_show(const struct cds_ft *ft, FILE *out)
 	}
 	show_node_recursive(ft, out, node_flag, level + 1);
 	fprintf(out, "---------------------------------------------------\n");
+}
+
+/*
+ * JSON emitter: walks the same trie structure as show_pretty() and
+ * produces a JSON document describing it.  The output has no trailing
+ * newline, so it can be embedded into other JSON contexts if desired.
+ *
+ * Schema summary:
+ *   Root:     { "ft": "0xPTR", "root": <node> }
+ *   Internal: { "ptr", "kind", "level", "nr_child", "density",
+ *               "external_nodes"?, "children": [ {"key_byte", "child"} ] }
+ *   Compressed: { "ptr", "kind": "COMPRESSED", "level", "path_len",
+ *                 "key_bytes", "external_nodes"?, "child" }
+ *   Collapsed:  { "ptr", "kind": "COLLAPSED", "level", "scan_zone_size",
+ *                 "external_nodes"?, "entries": [{"suffix", "child"}] }
+ *   External:   { "ptr", "kind": "EXTERNAL", "level" }
+ */
+
+static void json_emit_node(const struct cds_ft *ft, FILE *out,
+		struct cds_ft_inode_flag *node_flag, int level);
+
+/*
+ * Return a symbolic name for an internal-node type index.  Mirrors
+ * the ft_tp_node_kind enum labels but is always compiled in (not
+ * gated on FT_ENABLE_TRACING) since the JSON output is a supported
+ * interface independent of tracing.
+ */
+static
+const char *internal_type_name(unsigned int type_index)
+{
+	if (type_index >= sizeof(ft_types) / sizeof(ft_types[0]))
+		return "UNKNOWN";
+	{
+		unsigned int cls = ft_types[type_index].type_class;
+		unsigned int order = ft_types[type_index].order;
+		unsigned int npo = ft_types[type_index].nr_pool_order;
+
+		switch (cls) {
+		case FT_LINEAR:
+			switch (order) {
+			case 4: return "LINEAR_16";
+			case 5: return "LINEAR_32";
+			case 6: return "LINEAR_64";
+			case 7: return "LINEAR_128";
+			}
+			break;
+		case FT_LINEAR_WIDE:
+			switch (order) {
+			case 6: return "LINEAR_WIDE_64";
+			case 7: return "LINEAR_WIDE_128";
+			case 8: return "LINEAR_WIDE_256";
+			}
+			break;
+		case FT_POOL:
+			if (npo == 1 && order == 8)	return "POOL_1D_256";
+			if (npo == 1 && order == 9)	return "POOL_1D_512";
+			if (npo == 2 && order == 9)	return "POOL_2D_512";
+			if (npo == 2 && order == 10)	return "POOL_2D_1024";
+			break;
+		case FT_PIGEON:
+			switch (order) {
+			case 10: return "PIGEON_1024";
+			case 11: return "PIGEON_2048";
+			}
+			break;
+		}
+	}
+	return "UNKNOWN";
+}
+
+static
+void json_emit_density(FILE *out, const struct cds_ft_metadata *m)
+{
+	int i;
+
+	fprintf(out, "[");
+	for (i = 0; i < FT_NODE_DENSITY_DEPTH; i++) {
+		if (i) fprintf(out, ",");
+		fprintf(out, "%lu", ft_density_get(m, i));
+	}
+	fprintf(out, "]");
+}
+
+static
+void json_emit_collapsed(const struct cds_ft *ft, FILE *out,
+		struct cds_ft_inode_flag *node_flag, int level)
+{
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_metadata *col_meta =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+	unsigned int nr_e = ft_collapsed_nr_entries(col);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
+	struct cds_ft_node *external_nodes = rcu_dereference(col_meta->external_nodes);
+	unsigned int count = ft_collapsed_count(nr_e);
+	unsigned int e, printed = 0;
+
+	fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"COLLAPSED\",\"level\":%d,"
+		"\"scan_zone_size\":%u,\"nr_entries\":%u",
+		node_flag, level, ft_collapsed_scan_zone_size(nr_e), count);
+	if (external_nodes)
+		fprintf(out, ",\"external_nodes\":\"%p\"",
+			(void *) external_nodes);
+	fprintf(out, ",\"entries\":[");
+	for (e = 0; e < count; e++) {
+		uint8_t data_e = ft_collapsed_load_data(col, e);
+		unsigned int slen;
+		uint8_t *suffix;
+		struct cds_ft_inode_flag *child;
+		unsigned int k;
+
+		if (ft_collapsed_entry_dead(data_e, nr_e))
+			continue;
+		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		child = ft_dereference_acquire(ptrs[e]);
+		if (printed++) fprintf(out, ",");
+		fprintf(out, "{\"suffix\":[");
+		for (k = 0; k < slen; k++) {
+			if (k) fprintf(out, ",");
+			fprintf(out, "%u", suffix[k]);
+		}
+		fprintf(out, "],\"child\":");
+		if (ft_node_ptr(child))
+			json_emit_node(ft, out, child, level + slen);
+		else
+			fprintf(out, "null");
+		fprintf(out, "}");
+	}
+	fprintf(out, "]}");
+}
+
+static
+void json_emit_node(const struct cds_ft *ft, FILE *out,
+		struct cds_ft_inode_flag *node_flag, int level)
+{
+	if (!node_flag || !ft_node_ptr(node_flag)) {
+		fprintf(out, "null");
+		return;
+	}
+	if (ft_node_external(node_flag)) {
+		fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"EXTERNAL\","
+			"\"level\":%d}", node_flag, level);
+		return;
+	}
+	if (ft_node_compressed(node_flag)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(node_flag);
+		struct cds_ft_metadata *metadata =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+		struct cds_ft_node *external_nodes =
+			rcu_dereference(metadata->external_nodes);
+		unsigned int j;
+
+		fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"COMPRESSED\","
+			"\"level\":%d,\"path_len\":%u,\"nr_keys\":%lu,"
+			"\"density\":",
+			node_flag, level, (unsigned int) cn->len,
+			ft_nr_keys_get(metadata));
+		json_emit_density(out, metadata);
+		fprintf(out, ",\"key_bytes\":[");
+		for (j = 0; j < cn->len; j++) {
+			if (j) fprintf(out, ",");
+			fprintf(out, "%u", cn->key_bytes[j]);
+		}
+		fprintf(out, "]");
+		if (external_nodes)
+			fprintf(out, ",\"external_nodes\":\"%p\"",
+				(void *) external_nodes);
+		fprintf(out, ",\"child\":");
+		if (ft_node_ptr(cn->child))
+			json_emit_node(ft, out, cn->child, level + cn->len);
+		else
+			fprintf(out, "null");
+		fprintf(out, "}");
+		return;
+	}
+	if (ft_node_collapsed(node_flag)) {
+		json_emit_collapsed(ft, out, node_flag, level);
+		return;
+	}
+	/* Internal. */
+	{
+		struct cds_ft_metadata *metadata =
+			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		struct cds_ft_node *external_nodes =
+			rcu_dereference(metadata->external_nodes);
+		unsigned int type_index = ft_node_type(node_flag);
+		unsigned int key, printed = 0;
+
+		fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"%s\",\"level\":%d,"
+			"\"nr_child\":%u,\"density\":",
+			node_flag, internal_type_name(type_index), level,
+			metadata->nr_child);
+		json_emit_density(out, metadata);
+		if (external_nodes)
+			fprintf(out, ",\"external_nodes\":\"%p\"",
+				(void *) external_nodes);
+		fprintf(out, ",\"children\":[");
+		for (key = 0; key < 256; key++) {
+			struct cds_ft_inode_flag *child;
+
+			child = ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+			if (!ft_node_ptr(child))
+				continue;
+			if (printed++) fprintf(out, ",");
+			fprintf(out, "{\"key_byte\":%u,\"child\":", key);
+			json_emit_node(ft, out, child, level + 1);
+			fprintf(out, "}");
+		}
+		fprintf(out, "]}");
+	}
+}
+
+static
+void show_json(const struct cds_ft *ft, FILE *out)
+{
+	struct cds_ft_inode_flag *node_flag;
+
+	node_flag = rcu_dereference(ft->root);
+	fprintf(out, "{\"ft\":\"%p\",\"root\":", ft);
+	json_emit_node(ft, out, node_flag, 0);
+	fprintf(out, "}\n");
+}
+
+void cds_ft_show(const struct cds_ft *ft, FILE *out,
+		enum cds_ft_show_format fmt)
+{
+	switch (fmt) {
+	case CDS_FT_SHOW_JSON:
+		show_json(ft, out);
+		break;
+	case CDS_FT_SHOW_PRETTY:
+	default:
+		show_pretty(ft, out);
+		break;
+	}
 }
 
 struct cds_ft_node_stats {

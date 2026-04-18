@@ -136,14 +136,14 @@ static int drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
 		s = cds_ft_verify(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "drain_and_destroy: verify failed\n");
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			ret = -1;
 			break;
 		}
 		s = cds_ft_verify_density(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "drain_and_destroy: density verify failed\n");
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			ret = -1;
 			break;
 		}
@@ -7353,7 +7353,8 @@ static int test_show_smoke(void)
 		return -1;
 	}
 
-	cds_ft_show(ft, devnull);
+	cds_ft_show(ft, devnull, CDS_FT_SHOW_PRETTY);
+	cds_ft_show(ft, devnull, CDS_FT_SHOW_JSON);
 	cds_ft_show_stats(ft, devnull);
 	fclose(devnull);
 
@@ -11350,7 +11351,7 @@ static int test_density_compress_split(void)
 		s = cds_ft_verify_density(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_compress_split: mismatch after insert key %lu\n", i);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			rcu_read_unlock();
 			drain_and_destroy(ft, group);
 			return -1;
@@ -11368,7 +11369,7 @@ static int test_density_compress_split(void)
 	s = cds_ft_verify_density(ft, stderr);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "density_compress_split: mismatch after divergent insert\n");
-		cds_ft_show(ft, stderr);
+		cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 		rcu_read_unlock();
 		drain_and_destroy(ft, group);
 		return -1;
@@ -11385,7 +11386,7 @@ static int test_density_compress_split(void)
 	s = cds_ft_verify_density(ft, stderr);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "density_compress_split: mismatch after mid-split insert\n");
-		cds_ft_show(ft, stderr);
+		cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 		rcu_read_unlock();
 		drain_and_destroy(ft, group);
 		return -1;
@@ -11430,7 +11431,7 @@ static int test_density_compress_nested(void)
 	return drain_and_destroy(ft, group);
 
 mismatch:
-	cds_ft_show(ft, stderr);
+	cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 fail:
 	rcu_read_unlock();
 	drain_and_destroy(ft, group);
@@ -11502,7 +11503,7 @@ static int test_density_graft_detach(void)
 	s = cds_ft_verify_density(live, stderr);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "density_graft_detach: live post-graft verify failed\n");
-		cds_ft_show(live, stderr);
+		cds_ft_show(live, stderr, CDS_FT_SHOW_PRETTY);
 		goto fail_nounlock;
 	}
 
@@ -11515,14 +11516,14 @@ static int test_density_graft_detach(void)
 	s = cds_ft_verify_density(live, stderr);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "density_graft_detach: live post-detach verify failed\n");
-		cds_ft_show(live, stderr);
+		cds_ft_show(live, stderr, CDS_FT_SHOW_PRETTY);
 		drain_and_destroy(detached, group);
 		goto fail_nounlock;
 	}
 	s = cds_ft_verify_density(detached, stderr);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "density_graft_detach: detached verify failed\n");
-		cds_ft_show(detached, stderr);
+		cds_ft_show(detached, stderr, CDS_FT_SHOW_PRETTY);
 		drain_and_destroy(detached, group);
 		goto fail_nounlock;
 	}
@@ -11574,7 +11575,7 @@ static int test_density_recompact_full(void)
 		s = cds_ft_verify_density(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_recompact_full: mismatch after insert %u\n", i);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
 			drain_and_destroy(ft, group);
@@ -11612,7 +11613,7 @@ static int test_density_recompact_full(void)
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_recompact_full: mismatch after remove %u (remaining: %u)\n",
 				i, 255 - i);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
 			drain_and_destroy(ft, group);
@@ -11705,7 +11706,7 @@ static int test_density_collapse_explode(void)
 		s = cds_ft_verify_density(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_collapse: density mismatch after insert %u\n", i);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
 			drain_and_destroy(ft, group);
@@ -11740,7 +11741,7 @@ static int test_density_collapse_explode(void)
 		s = cds_ft_verify(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_collapse: structural verify failed after remove %u\n", i);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
 			drain_and_destroy(ft, group);
@@ -11749,7 +11750,7 @@ static int test_density_collapse_explode(void)
 		s = cds_ft_verify_density(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_collapse: density mismatch after remove %u\n", i);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
 			drain_and_destroy(ft, group);
@@ -11832,7 +11833,7 @@ static int test_density_remove_through_compress(void)
 		s = cds_ft_verify_density(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_rm_compress: density mismatch after insert %u\n", i);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
 			drain_and_destroy(ft, group);
@@ -11869,7 +11870,7 @@ static int test_density_remove_through_compress(void)
 		s = cds_ft_verify(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_rm_compress: structural verify failed after remove %u\n", i);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
 			drain_and_destroy(ft, group);
@@ -11878,7 +11879,7 @@ static int test_density_remove_through_compress(void)
 		s = cds_ft_verify_density(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_rm_compress: density mismatch after remove %u\n", i);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			rcu_read_unlock();
 			cds_ft_iter_destroy(iter);
 			drain_and_destroy(ft, group);
@@ -11960,13 +11961,13 @@ static int test_density_graft_swap(void)
 	s = cds_ft_verify_density(live, stderr);
 	if (s < 0) {
 		fprintf(stderr, "density_graft_swap: live phase 1 density failed\n");
-		cds_ft_show(live, stderr);
+		cds_ft_show(live, stderr, CDS_FT_SHOW_PRETTY);
 		goto fail_nounlock;
 	}
 	s = cds_ft_verify_density(swap, stderr);
 	if (s < 0) {
 		fprintf(stderr, "density_graft_swap: swap phase 1 density failed\n");
-		cds_ft_show(swap, stderr);
+		cds_ft_show(swap, stderr, CDS_FT_SHOW_PRETTY);
 		goto fail_nounlock;
 	}
 
@@ -11999,13 +12000,13 @@ static int test_density_graft_swap(void)
 	s = cds_ft_verify_density(live, stderr);
 	if (s < 0) {
 		fprintf(stderr, "density_graft_swap: live phase 2 density failed\n");
-		cds_ft_show(live, stderr);
+		cds_ft_show(live, stderr, CDS_FT_SHOW_PRETTY);
 		goto fail_nounlock;
 	}
 	s = cds_ft_verify_density(swap, stderr);
 	if (s < 0) {
 		fprintf(stderr, "density_graft_swap: swap phase 2 density failed (old content)\n");
-		cds_ft_show(swap, stderr);
+		cds_ft_show(swap, stderr, CDS_FT_SHOW_PRETTY);
 		goto fail_nounlock;
 	}
 
@@ -12028,13 +12029,13 @@ static int test_density_graft_swap(void)
 	s = cds_ft_verify_density(live, stderr);
 	if (s < 0) {
 		fprintf(stderr, "density_graft_swap: live phase 3 density failed\n");
-		cds_ft_show(live, stderr);
+		cds_ft_show(live, stderr, CDS_FT_SHOW_PRETTY);
 		goto fail_nounlock;
 	}
 	s = cds_ft_verify_density(swap, stderr);
 	if (s < 0) {
 		fprintf(stderr, "density_graft_swap: swap phase 3 density failed\n");
-		cds_ft_show(swap, stderr);
+		cds_ft_show(swap, stderr, CDS_FT_SHOW_PRETTY);
 		goto fail_nounlock;
 	}
 
@@ -12184,14 +12185,14 @@ static int test_density_stress(void)
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "stress: structural verify failed at op %u "
 				"(nr_live=%u, seed=0xdeadbeef)\n", op, nr_live);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			goto fail;
 		}
 		s = cds_ft_verify_density(ft, stderr);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "stress: density verify failed at op %u "
 				"(nr_live=%u, seed=0xdeadbeef)\n", op, nr_live);
-			cds_ft_show(ft, stderr);
+			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
 			goto fail;
 		}
 	}

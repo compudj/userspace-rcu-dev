@@ -1981,11 +1981,34 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
 enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft, FILE *out);
 
 /*
+ * cds_ft_show_format - Output format for cds_ft_show().
+ *
+ * CDS_FT_SHOW_PRETTY: human-readable indented text, suitable for
+ *   debugging printouts.  Emits level headers, node kinds, density
+ *   counters, and per-edge key-byte values.
+ * CDS_FT_SHOW_JSON:   machine-readable JSON tree.  The root document
+ *   is an object with "ft" (pointer) and "root" (node).  Each node
+ *   carries "ptr", "kind", "level", optional "nr_child", "density",
+ *   and a "children" array whose entries are
+ *   {"key_byte": N, "child": <node>}.  Compressed nodes additionally
+ *   carry "path_len" and "child"; collapsed nodes carry "entries":
+ *   [{"suffix": [...], "child": <node>}, ...].  External nodes carry
+ *   just "ptr" and "kind".  Intended for programmatic consumption
+ *   (visualizers, test assertions).
+ */
+enum cds_ft_show_format {
+	CDS_FT_SHOW_PRETTY,
+	CDS_FT_SHOW_JSON,
+};
+
+/*
  * cds_ft_show - Print content of the Fractal Trie.
  * @ft: The Fractal Trie.
  * @out: File stream output.
+ * @fmt: Output format (see enum cds_ft_show_format).
  */
-void cds_ft_show(const struct cds_ft *ft, FILE *out);
+void cds_ft_show(const struct cds_ft *ft, FILE *out,
+		enum cds_ft_show_format fmt);
 
 /*
  * cds_ft_show_stats - Print Fractal Trie statistics.
