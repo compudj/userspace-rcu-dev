@@ -360,9 +360,13 @@ def consume_trace(args, m):
             except (KeyError, TypeError):
                 pass
             child = int(pf['child'])
-            info['child_life'] = (
-                m.birth(child, ts) if child else None
-            )
+            if child:
+                child_kind = enum_label(pf['child_kind'])
+                cl = m.birth(child, ts, child_kind)
+                m.set_kind(cl, child_kind)
+                info['child_life'] = cl
+            else:
+                info['child_life'] = None
             # parent is NULL at creation time and non-NULL on
             # re-emissions from ft_publish_to_parent.  Record it
             # so derive_levels can bridge cn's level from its
@@ -416,7 +420,12 @@ def consume_trace(args, m):
                 info['entries'].pop(idx, None)
             else:
                 child = int(pf['child'])
-                child_life = m.birth(child, ts) if child else None
+                if child:
+                    child_kind = enum_label(pf['child_kind'])
+                    child_life = m.birth(child, ts, child_kind)
+                    m.set_kind(child_life, child_kind)
+                else:
+                    child_life = None
                 info['entries'][idx] = {
                     'suffix': [int(b) for b in pf['suffix']],
                     'child_life': child_life,

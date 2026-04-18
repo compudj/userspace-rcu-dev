@@ -8827,6 +8827,22 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				ft_publish_to_parent(ft, parent_nf,
 					parent_slot, col_flag);
 				/*
+				 * Collapse installs the new collapsed node
+				 * in the parent's slot via direct publish,
+				 * bypassing ft_node_set_nth.  Emit the
+				 * structural edge so trace consumers see the
+				 * parent -> collapsed attachment.  When
+				 * parent_nf is NULL, the slot is &ft->root
+				 * and root_publish already fires from inside
+				 * ft_publish_to_parent.
+				 */
+				if (parent_nf && depth >= 1)
+					FT_TP(tree_edge_set, (const void *) ft,
+						(const void *) parent_nf,
+						(unsigned int) (depth - 1),
+						(uint8_t) key[depth - 1],
+						(const void *) col_flag);
+				/*
 				 * Free intermediate nodes absorbed by the
 				 * collapse.  Done after publish so readers
 				 * see the new path; actual frees are
@@ -10596,6 +10612,24 @@ int _cds_ft_insert(struct cds_ft *ft,
 					ft_set_parent(branch, d.nf, &cptrs[tombstone_reuse]);
 					ft_publish_to_parent(ft, d.nf,
 						&cptrs[tombstone_reuse], branch);
+					/*
+					 * Re-emit collapsed_entry so consumers
+					 * see the revived entry and its new child
+					 * (the suffix is unchanged — the entry
+					 * was previously tombstoned).
+					 */
+					FT_TP(collapsed_entry,
+						(const void *) ft_collapsed_node_flag(col),
+						(unsigned int) tombstone_reuse,
+						ft_collapsed_suffix(col,
+							col->data[tombstone_reuse],
+							col->nr_entries),
+						ft_collapsed_suffix_len(col,
+							col->data[tombstone_reuse] &
+							~FT_COLLAPSED_TOMBSTONE,
+							tombstone_reuse,
+							col->nr_entries),
+						(const void *) branch, 0);
 					{
 						struct cds_ft_metadata *col_meta =
 							cds_ft_item_to_metadata(
