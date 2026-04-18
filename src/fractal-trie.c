@@ -1696,6 +1696,19 @@ void ft_publish_to_parent(struct cds_ft *ft,
 						new_child, cn->len));
 		}
 #endif
+		/*
+		 * Re-emit compressed_publish so consumers tracking
+		 * cn -> child relationships pick up the new subtree
+		 * attached under this compressed node.  The initial
+		 * creation-time compressed_publish event has
+		 * parent = NULL (the compressed node is not yet
+		 * attached); here we report cn_meta->parent since the
+		 * compressed node is already in the trie.
+		 */
+		FT_TP(compressed_publish, (const void *) cn, cn->len,
+			cn->key_bytes,
+			(const void *) new_child,
+			(const void *) cn_meta->parent);
 	}
 	FT_TP(publish_to_parent, (const void *) parent_nf,
 		(const void *) parent_slot,
@@ -4641,6 +4654,11 @@ int ft_node_set_nth(struct cds_ft *ft,
 					old_node_ret, false, node_depth);
 		break;
 	}
+	if (ret == 0)
+		FT_TP(tree_edge_set, (const void *) ft,
+			(const void *) *node_flag,
+			(unsigned int) node_depth, (uint8_t) n,
+			(const void *) child_node_flag);
 	return ret;
 }
 
@@ -4677,6 +4695,11 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 				metadata, parent_node_flag_ptr, n, NULL,
 				node_flag_ptr, old_node_ret, is_root, node_depth);
 	}
+	if (ret == 0)
+		FT_TP(tree_edge_set, (const void *) ft,
+			(const void *) *parent_node_flag_ptr,
+			(unsigned int) node_depth, (uint8_t) n,
+			(const void *) newptr);
 	return ret;
 }
 
@@ -8253,6 +8276,11 @@ emit_entry:
 			- (uint8_t *) col);
 		col_ptrs[entry_idx] = walk;
 		ft_collapsed_set_nr_entries(col, entry_idx + 1);
+		FT_TP(collapsed_entry, (const void *) col, entry_idx,
+			suffix_buf, slen, (const void *) walk, 0);
+		FT_TP(collapsed_publish, (const void *) col, entry_idx + 1,
+			ft_collapsed_scan_zone_size(
+				uatomic_load(&col->nr_entries, CMM_RELAXED)));
 		return 0;
 	}
 }
@@ -9433,6 +9461,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		ft_set_parent(child, cflag, &cn->child);
 		ft_init_node_density(ft, cflag);
 		FT_TP(compressed_publish, (const void *) cn, cn->len,
+			cn->key_bytes,
 			(const void *) cn->child, NULL);
 		return ft_publish_compressed(ft, cn, cflag);
 	}
@@ -9599,6 +9628,17 @@ int ft_attach_node(struct cds_ft *ft,
 			ft_set_parent(iter_node_flag, attach_node_flag, old_node_flag_ptr);
 			ft_publish_to_parent(ft, attach_node_flag,
 				old_node_flag_ptr, iter_node_flag);
+			/*
+			 * Collapsed-parent attach bypasses ft_node_set_nth
+			 * (see comment above), so emit the structural edge
+			 * directly.  The collapsed node sits at level-1
+			 * and dispatches on key_value to iter_node_flag.
+			 */
+			FT_TP(tree_edge_set, (const void *) ft,
+				(const void *) attach_node_flag,
+				(unsigned int) (level - 1),
+				(uint8_t) key_value,
+				(const void *) iter_node_flag);
 			goto publish_done;
 		}
 #endif
@@ -10641,7 +10681,24 @@ int _cds_ft_insert(struct cds_ft *ft,
 				/* Publish: increment nr_entries (atomic store). */
 				/* Store-release in publish_inc ensures
 				 * readers see suffix/offset/pointer data. */
+				{
+					unsigned int _tp_idx =
+						ft_collapsed_count(col_nr);
+					FT_TP(collapsed_entry,
+						(const void *) col,
+						_tp_idx,
+						iter_key, new_slen,
+						(const void *) branch, 0);
+				}
 				ft_collapsed_publish_inc_nr_entries(col);
+				FT_TP(collapsed_publish,
+					(const void *) col,
+					ft_collapsed_count(
+						uatomic_load(&col->nr_entries,
+							CMM_RELAXED)),
+					ft_collapsed_scan_zone_size(
+						uatomic_load(&col->nr_entries,
+							CMM_RELAXED)));
 
 				{
 					struct cds_ft_metadata *col_meta =
@@ -11570,6 +11627,10 @@ int ft_detach_node(struct cds_ft *ft,
 						uatomic_store(&col->data[e],
 							col->data[e] | FT_COLLAPSED_TOMBSTONE,
 							CMM_RELAXED);
+					FT_TP(collapsed_entry,
+						(const void *) col, e,
+						(const uint8_t *) NULL, 0U,
+						(const void *) NULL, 1);
 					col_meta->nr_child--;
 				}
 				break;
