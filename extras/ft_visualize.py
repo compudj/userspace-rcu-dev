@@ -278,22 +278,39 @@ def consume_trace(args, m):
             if not parent:
                 continue
 
-            # Lifetime reset on level conflict.  Internal-node frees
-            # are not traced in all paths, so a pointer can
-            # legitimately be reused at a different depth without
-            # a kill event in between.  When the new parent_level
-            # disagrees with the recorded level for that pointer,
-            # end the old lifetime and start fresh — this preserves
-            # the invariant that each lifetime has exactly one
-            # trie-level over its life.
+            # Lifetime reset on level conflict for INTERNAL-kind
+            # parents only.  Internal-node frees aren't traced in
+            # all paths, so a pointer can legitimately be reused at
+            # a different depth without a kill event in between;
+            # the conflict reset closes the gap.
+            #
+            # Compressed and collapsed parents are intentionally
+            # exempted: the library emits tree_edge_set with
+            # parent_kind=COMPRESSED (or COLLAPSED) at different
+            # parent_level values during a single node's lifetime
+            # (e.g. when structural replaces happen against slots
+            # inside a compressed node's cn->child scope — the
+            # parent_level reported is a depth inside the compressed
+            # path, not the compressed node's own trie-level).
+            # Killing on that signal would wipe the compressed node
+            # out of the graph prematurely.
+            is_internal_parent = not (
+                parent_kind in ('COMPRESSED', 'COLLAPSED'))
             existing = m.cur_life.get(parent)
-            if existing is not None:
+            if existing is not None and is_internal_parent:
                 prev_lvl = m.nodes[existing].get('level')
                 if prev_lvl is not None and prev_lvl != parent_level:
                     m.kill(parent)
             p_life = m.birth(parent, ts, parent_kind)
             m.set_kind(p_life, parent_kind)
-            m.set_level(p_life, parent_level, force=True)
+            if is_internal_parent:
+                m.set_level(p_life, parent_level, force=True)
+            else:
+                # For compressed/collapsed parents, only seed the
+                # level if unset; rely on other paths (derive_levels,
+                # tree_edge_set where the parent is a CHILD) for
+                # authoritative level attribution.
+                m.set_level(p_life, parent_level)
 
             if child:
                 existing_c = m.cur_life.get(child)
