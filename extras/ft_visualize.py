@@ -146,6 +146,10 @@ class Model:
         # life_id is a unique integer; nodes dict is keyed by it.
         self.cur_life = {}
         self.next_life = 0
+        # Most recent root_publish target (life_id) — authoritative
+        # root pointer for the filtered FT.  Populated by
+        # consume_trace() on every root_publish event.
+        self.last_root_life = None
         # life_id -> {'ptr': int, 'created_ts': int, 'kind': str,
         #             'level': int|None, 'meta': dict}
         self.nodes = {}
@@ -236,8 +240,8 @@ def consume_trace(args, m):
                 if c is not None:
                     cpu_ft[c] = args.ft
             return ok
-        # tree_edge_set carries ft directly.
-        if name == 'ft_tp:tree_edge_set':
+        # tree_edge_set and root_publish carry ft directly.
+        if name in ('ft_tp:tree_edge_set', 'ft_tp:root_publish'):
             return int(pf['ft']) == args.ft
         # Structural events without explicit ft: attribute by CPU.
         attr = cpu_ft.get(cpu(ev))
@@ -371,6 +375,21 @@ def consume_trace(args, m):
 
         elif name in ('ft_tp:compressed_free', 'ft_tp:collapsed_free'):
             m.kill(int(pf['node']))
+
+        elif name == 'ft_tp:root_publish':
+            # ft->root was rewritten.  The value IS the root, so it
+            # is at level 0 and is the authoritative root for JSON
+            # rendering / root-finding.  Seed kind/level; override
+            # the "picked by descendant count" heuristic by keeping
+            # the most recent root_publish within the --ft filter.
+            root = int(pf['root'])
+            if not root:
+                continue
+            root_kind = enum_label(pf['root_kind'])
+            rlid = m.birth(root, ts, root_kind)
+            m.set_kind(rlid, root_kind)
+            m.set_level(rlid, 0, force=True)
+            m.last_root_life = rlid
 
         elif name == 'ft_tp:collapsed_publish':
             col = int(pf['col'])
@@ -557,36 +576,39 @@ def model_to_json(m, ft_ptr):
     root are not included — this matches the authoritative dump
     which only walks from `ft->root`.
     """
-    roots = [lid for lid, n in m.nodes.items() if n.get('level') == 0]
-    if not roots:
-        return {
-            'ft': _fmt_ptr(ft_ptr) if ft_ptr else None,
-            'root': None,
-            'note': 'no level-0 node found in model',
-        }
+    # Prefer the last root_publish event's target (authoritative).
+    root_lid = m.last_root_life if m.last_root_life in m.nodes else None
+    if root_lid is None:
+        # Fallback: pick the level-0 lifetime with most descendants.
+        roots = [lid for lid, n in m.nodes.items() if n.get('level') == 0]
+        if not roots:
+            return {
+                'ft': _fmt_ptr(ft_ptr) if ft_ptr else None,
+                'root': None,
+                'note': 'no level-0 node found in model',
+            }
 
-    # Pick the root with the most reachable descendants.
-    def count_reachable(start):
-        seen = set([start])
-        q = [start]
-        while q:
-            cur = q.pop()
-            for (p, _kb), c in m.edges.items():
-                if p == cur and c not in seen:
-                    seen.add(c); q.append(c)
-            info = m.cnodes.get(cur)
-            if info and info.get('child_life') not in seen:
-                if info['child_life'] is not None:
-                    seen.add(info['child_life']); q.append(info['child_life'])
-            colinfo = m.cols.get(cur)
-            if colinfo:
-                for e in colinfo['entries'].values():
-                    ch = e.get('child_life')
-                    if ch is not None and ch not in seen:
-                        seen.add(ch); q.append(ch)
-        return len(seen)
+        def count_reachable(start):
+            seen = set([start])
+            q = [start]
+            while q:
+                cur = q.pop()
+                for (p, _kb), c in m.edges.items():
+                    if p == cur and c not in seen:
+                        seen.add(c); q.append(c)
+                info = m.cnodes.get(cur)
+                if info and info.get('child_life') not in seen:
+                    if info['child_life'] is not None:
+                        seen.add(info['child_life']); q.append(info['child_life'])
+                colinfo = m.cols.get(cur)
+                if colinfo:
+                    for e in colinfo['entries'].values():
+                        ch = e.get('child_life')
+                        if ch is not None and ch not in seen:
+                            seen.add(ch); q.append(ch)
+            return len(seen)
 
-    root_lid = max(roots, key=count_reachable)
+        root_lid = max(roots, key=count_reachable)
     visited = set()
 
     def node_to_json(lid):
