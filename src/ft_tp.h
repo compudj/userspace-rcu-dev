@@ -220,6 +220,8 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, compressed_publish,
 		lttng_ust_field_sequence_hex(uint8_t, key_bytes, key_bytes,
 			unsigned int, len)
 		lttng_ust_field_integer_hex(uintptr_t, child, (uintptr_t) child)
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, uint16_t, child_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) child))
 		lttng_ust_field_integer_hex(uintptr_t, parent, (uintptr_t) parent)
 	)
 )
@@ -306,6 +308,8 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, collapsed_entry,
 		lttng_ust_field_sequence_hex(uint8_t, suffix, suffix,
 			unsigned int, suffix_len)
 		lttng_ust_field_integer_hex(uintptr_t, child, (uintptr_t) child)
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, uint16_t, child_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) child))
 		lttng_ust_field_integer(uint8_t, dead, dead)
 	)
 )
