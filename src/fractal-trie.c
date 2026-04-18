@@ -2468,6 +2468,7 @@ void free_collapsed_node(struct cds_ft *ft,
 	struct cds_ft_metadata *metadata =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 
+	FT_TP(collapsed_free, (const void *) node);
 	cds_ft_free_item(metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);

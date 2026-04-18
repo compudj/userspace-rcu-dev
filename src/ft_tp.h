@@ -245,6 +245,10 @@ LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
 	compressed_free,
 	LTTNG_UST_TP_ARGS(const void *, node))
 
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
+	collapsed_free,
+	LTTNG_UST_TP_ARGS(const void *, node))
+
 /*
  * Collapsed-node entry (re)publish.
  *
