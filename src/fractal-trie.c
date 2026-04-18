@@ -10747,8 +10747,15 @@ int _cds_ft_insert(struct cds_ft *ft,
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL);
-			if (ret == 0)
+			if (ret == 0) {
 				ft_propagate_external_count_parent(ft, *d.pnfp, 1);
+				if (d.depth >= 2)
+					FT_TP(tree_edge_set, (const void *) ft,
+						(const void *) d.ppnf,
+						(unsigned int) (d.depth - 2),
+						(uint8_t) key[d.depth - 2],
+						(const void *) *d.pnfp);
+			}
 
 		} else if (ft_node_compressed(d.nf)) {
 			/*
@@ -10828,8 +10835,15 @@ int _cds_ft_insert(struct cds_ft *ft,
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf));
-		if (ret == 0)
+		if (ret == 0) {
 			ft_propagate_external_count_parent(ft, *d.pnfp, 1);
+			if (d.depth >= 2)
+				FT_TP(tree_edge_set, (const void *) ft,
+					(const void *) d.ppnf,
+					(unsigned int) (d.depth - 2),
+					(uint8_t) key[d.depth - 2],
+					(const void *) *d.pnfp);
+		}
 	}
 
 insert_done:
@@ -11025,8 +11039,15 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL);
-			if (ret == 0)
+			if (ret == 0) {
 				ft_propagate_external_count_parent(ft, *d.pnfp, 1);
+				if (d.depth >= 2)
+					FT_TP(tree_edge_set, (const void *) ft,
+						(const void *) d.ppnf,
+						(unsigned int) (d.depth - 2),
+						(uint8_t) key[d.depth - 2],
+						(const void *) *d.pnfp);
+			}
 		} else if (ft_node_compressed(d.nf)) {
 			/*
 			 * Key ends at a compressed node's depth.
@@ -11081,8 +11102,15 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf));
-		if (ret == 0)
+		if (ret == 0) {
 			ft_propagate_external_count_parent(ft, *d.pnfp, 1);
+			if (d.depth >= 2)
+				FT_TP(tree_edge_set, (const void *) ft,
+					(const void *) d.ppnf,
+					(unsigned int) (d.depth - 2),
+					(uint8_t) key[d.depth - 2],
+					(const void *) *d.pnfp);
+		}
 	}
 
 insert_replace_done:
