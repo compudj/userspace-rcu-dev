@@ -9138,6 +9138,22 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	/* 5. Publish the split structure, replacing the compressed node. */
 	FT_TP(compressed_split, "insert", (const void *) cn, cn->len,
 		(const void *) top_flag, diverge_pos);
+	/*
+	 * Compressed-split replaces the compressed node in its parent's
+	 * slot via a direct ft_publish_to_parent call, bypassing
+	 * ft_node_set_nth.  Emit tree_edge_set explicitly so consumers
+	 * see the (parent, key_byte, top_flag) structural edge.  The
+	 * compressed node sits at node_depth; iter_key points at the
+	 * key bytes starting at that depth, so iter_key[-1] is the
+	 * parent's key_byte that led to the compressed node (safe for
+	 * node_depth >= 1, which always holds since compressed nodes
+	 * are never at the root).
+	 */
+	FT_TP(tree_edge_set, (const void *) ft,
+		(const void *) cn_meta->parent,
+		(unsigned int) (node_depth - 1),
+		(uint8_t) iter_key[-1],
+		(const void *) top_flag);
 	ft_publish_to_parent(ft, cn_meta->parent, parent_slot, top_flag);
 
 	/*
