@@ -210,12 +210,15 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, compressed_publish,
 	LTTNG_UST_TP_ARGS(
 		const void *, cn,
 		unsigned int, len,
+		const uint8_t *, key_bytes,
 		const void *, child,
 		const void *, parent
 	),
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_integer_hex(uintptr_t, cn, (uintptr_t) cn)
 		lttng_ust_field_integer(unsigned int, len, len)
+		lttng_ust_field_sequence_hex(uint8_t, key_bytes, key_bytes,
+			unsigned int, len)
 		lttng_ust_field_integer_hex(uintptr_t, child, (uintptr_t) child)
 		lttng_ust_field_integer_hex(uintptr_t, parent, (uintptr_t) parent)
 	)
@@ -241,6 +244,92 @@ LTTNG_UST_TRACEPOINT_EVENT(ft_tp, compressed_split,
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(ft_tp, ft_node_event_class, ft_tp,
 	compressed_free,
 	LTTNG_UST_TP_ARGS(const void *, node))
+
+/*
+ * Collapsed-node entry (re)publish.
+ *
+ * A collapsed node stores up to 256 entries, each with a variable-
+ * length byte suffix and a child pointer.  Rather than emit the
+ * entire entry table in a single event (which cannot easily
+ * accommodate the nested variable-length suffixes), a separate
+ * event per entry is emitted whenever a slot is installed or its
+ * child pointer changes.  Consumers accumulate the state keyed by
+ * (col, entry_idx).
+ *
+ * `dead` is 0 for a live entry (install / update) and non-zero
+ * for an entry being logically removed.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, collapsed_entry,
+	LTTNG_UST_TP_ARGS(
+		const void *, col,
+		unsigned int, entry_idx,
+		const uint8_t *, suffix,
+		unsigned int, suffix_len,
+		const void *, child,
+		uint8_t, dead
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, col, (uintptr_t) col)
+		lttng_ust_field_integer(unsigned int, entry_idx, entry_idx)
+		lttng_ust_field_sequence_hex(uint8_t, suffix, suffix,
+			unsigned int, suffix_len)
+		lttng_ust_field_integer_hex(uintptr_t, child, (uintptr_t) child)
+		lttng_ust_field_integer(uint8_t, dead, dead)
+	)
+)
+
+/*
+ * Collapsed-node scan metadata.  Emitted when a collapsed node is
+ * first populated (so consumers can know its scan_zone and initial
+ * nr_entries) and whenever nr_entries changes.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, collapsed_publish,
+	LTTNG_UST_TP_ARGS(
+		const void *, col,
+		unsigned int, nr_entries,
+		unsigned int, scan_zone_size
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, col, (uintptr_t) col)
+		lttng_ust_field_integer(unsigned int, nr_entries, nr_entries)
+		lttng_ust_field_integer(unsigned int, scan_zone_size, scan_zone_size)
+	)
+)
+
+/*
+ * Structural edge change: a parent node's child slot at ordinal
+ * byte `key_byte` is now `child`.  Fired after ft_node_set_nth()
+ * and ft_node_replace_ptr() succeed — these are the functions
+ * where the real (parent, key_byte, child, parent_level) is
+ * unambiguously known.  child == NULL means the slot was cleared
+ * (detach / removal).  This is the tracepoint a consumer should
+ * consume to reconstruct the trie topology; publish_to_parent is
+ * a lower-level event about the underlying publish primitive and
+ * its parent_nf is tied to skip-pointer bookkeeping, not the
+ * structural parent.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(ft_tp, tree_edge_set,
+	LTTNG_UST_TP_ARGS(
+		const void *, ft,
+		const void *, parent,
+		unsigned int, parent_level,
+		uint8_t, key_byte,
+		const void *, child
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_integer_hex(uintptr_t, parent, (uintptr_t) parent)
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, uint16_t, parent_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) parent))
+		lttng_ust_field_integer(unsigned int, parent_level, parent_level)
+		lttng_ust_field_integer(uint8_t, key_byte, key_byte)
+		lttng_ust_field_integer_hex(uintptr_t, child, (uintptr_t) child)
+		lttng_ust_field_enum(ft_tp, ft_tp_node_kind, uint16_t, child_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) child))
+		lttng_ust_field_integer(uint16_t, child_skip_len,
+			ft_tp_node_skip_len((struct cds_ft_inode_flag *) child))
+	)
+)
 
 LTTNG_UST_TRACEPOINT_EVENT(ft_tp, publish_to_parent,
 	LTTNG_UST_TP_ARGS(
