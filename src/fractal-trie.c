@@ -1705,7 +1705,9 @@ void ft_publish_to_parent(struct cds_ft *ft,
 		 * attached); here we report cn_meta->parent since the
 		 * compressed node is already in the trie.
 		 */
-		FT_TP(compressed_publish, (const void *) cn, cn->len,
+		FT_TP(compressed_publish,
+			(const void *) ft_compressed_node_flag(cn),
+			cn->len,
 			cn->key_bytes,
 			(const void *) new_child,
 			(const void *) cn_meta->parent);
@@ -2393,7 +2395,7 @@ void free_compressed_node(struct cds_ft *ft,
 	struct cds_ft_metadata *metadata =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 
-	FT_TP(compressed_free, (const void *) node);
+	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(node));
 	cds_ft_free_item(metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
@@ -2468,7 +2470,7 @@ void free_collapsed_node(struct cds_ft *ft,
 	struct cds_ft_metadata *metadata =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 
-	FT_TP(collapsed_free, (const void *) node);
+	FT_TP(collapsed_free, (const void *) ft_collapsed_node_flag(node));
 	cds_ft_free_item(metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
@@ -8277,9 +8279,11 @@ emit_entry:
 			- (uint8_t *) col);
 		col_ptrs[entry_idx] = walk;
 		ft_collapsed_set_nr_entries(col, entry_idx + 1);
-		FT_TP(collapsed_entry, (const void *) col, entry_idx,
+		FT_TP(collapsed_entry,
+			(const void *) ft_collapsed_node_flag(col), entry_idx,
 			suffix_buf, slen, (const void *) walk, 0);
-		FT_TP(collapsed_publish, (const void *) col, entry_idx + 1,
+		FT_TP(collapsed_publish,
+			(const void *) ft_collapsed_node_flag(col), entry_idx + 1,
 			ft_collapsed_scan_zone_size(
 				uatomic_load(&col->nr_entries, CMM_RELAXED)));
 		return 0;
@@ -9477,7 +9481,9 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		struct cds_ft_inode_flag *cflag = ft_compressed_node_flag(cn);
 		ft_set_parent(child, cflag, &cn->child);
 		ft_init_node_density(ft, cflag);
-		FT_TP(compressed_publish, (const void *) cn, cn->len,
+		FT_TP(compressed_publish,
+			(const void *) ft_compressed_node_flag(cn),
+			cn->len,
 			cn->key_bytes,
 			(const void *) cn->child, NULL);
 		return ft_publish_compressed(ft, cn, cflag);
@@ -10702,14 +10708,14 @@ int _cds_ft_insert(struct cds_ft *ft,
 					unsigned int _tp_idx =
 						ft_collapsed_count(col_nr);
 					FT_TP(collapsed_entry,
-						(const void *) col,
+						(const void *) ft_collapsed_node_flag(col),
 						_tp_idx,
 						iter_key, new_slen,
 						(const void *) branch, 0);
 				}
 				ft_collapsed_publish_inc_nr_entries(col);
 				FT_TP(collapsed_publish,
-					(const void *) col,
+					(const void *) ft_collapsed_node_flag(col),
 					ft_collapsed_count(
 						uatomic_load(&col->nr_entries,
 							CMM_RELAXED)),
@@ -11673,7 +11679,7 @@ int ft_detach_node(struct cds_ft *ft,
 							col->data[e] | FT_COLLAPSED_TOMBSTONE,
 							CMM_RELAXED);
 					FT_TP(collapsed_entry,
-						(const void *) col, e,
+						(const void *) ft_collapsed_node_flag(col), e,
 						(const uint8_t *) NULL, 0U,
 						(const void *) NULL, 1);
 					col_meta->nr_child--;
