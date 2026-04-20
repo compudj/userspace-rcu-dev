@@ -128,6 +128,23 @@ enum cds_ft_type_class {
 #define ft_type_is_linear(tc)	((tc) == FT_LINEAR || (tc) == FT_LINEAR_WIDE)
 
 /*
+ * FT_HAVE_EFFICIENT_UNALIGNED_ACCESS: architectures where unaligned
+ * loads that stay within a single cacheline have no measurable
+ * overhead vs aligned loads.  Required for the SIMD/SWAR linear
+ * node scans, which read the key array starting at node->data[1]
+ * (not pointer-aligned).  Nodes are aligned to their size (>=64),
+ * so a 16- or 32-byte scan at data+1 stays within one cacheline by
+ * construction.
+ *
+ * On strict-alignment architectures, FT_LINEAR_WIDE is disabled and
+ * all linear nodes fall back to the bytewise scan.
+ */
+#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) \
+	|| (defined(__powerpc64__) && defined(__LITTLE_ENDIAN__))
+#define FT_HAVE_EFFICIENT_UNALIGNED_ACCESS
+#endif
+
+/*
  * FT_WIDE_LINEAR_THRESHOLD: max_linear_child threshold for
  * FT_LINEAR_WIDE.  Used to assign type_class in ft_types[].
  */
@@ -137,10 +154,18 @@ enum cds_ft_type_class {
 #ifndef FT_SWAR_LINEAR_THRESHOLD
 #define FT_SWAR_LINEAR_THRESHOLD	14
 #endif
-#if defined(__SSE2__)
-#define FT_WIDE_LINEAR_THRESHOLD	FT_SIMD_LINEAR_THRESHOLD
+#if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+#  if defined(__SSE2__)
+#    define FT_WIDE_LINEAR_THRESHOLD	FT_SIMD_LINEAR_THRESHOLD
+#  else
+#    define FT_WIDE_LINEAR_THRESHOLD	FT_SWAR_LINEAR_THRESHOLD
+#  endif
 #else
-#define FT_WIDE_LINEAR_THRESHOLD	FT_SWAR_LINEAR_THRESHOLD
+/*
+ * max_linear_child <= 31 (FT_LINEAR_NR_CHILD_MASK), so threshold 32
+ * forces FT_LINEAR_CLASS() to always pick FT_LINEAR (bytewise scan).
+ */
+#  define FT_WIDE_LINEAR_THRESHOLD	32
 #endif
 
 /*
@@ -2692,58 +2717,103 @@ static inline void ft_maybe_prefetch(const void *ptr)
  * the node type's max_linear_child.
  *
  * The thresholds define the minimum max_linear_child for each
- * strategy.  The data layout starts with nr_child (1 byte)
- * followed by key entries, so a 16-byte SSE2 load covers
- * 15 key entries and an 8-byte SWAR word covers 7.
+ * strategy.  The key array starts at node->data[1] (data[0] holds
+ * nr_child and the pointer offset).  SIMD/SWAR scanners load from
+ * data+1 using unaligned loads; a 16-byte SSE2 load covers 16 key
+ * entries and an 8-byte SWAR word covers 8.
+ *
+ * Nodes are aligned to their size (>=64 bytes), so a scan of
+ * 1 + max_linear_child <= 32 bytes starting at data+1 stays within
+ * a single cacheline by construction.
  *
  * Tunable via -DFT_SIMD_LINEAR_THRESHOLD=N and
  * -DFT_SWAR_LINEAR_THRESHOLD=N at compile time.
  */
 /* FT_SIMD/SWAR/WIDE_LINEAR_THRESHOLD defined near ft_types[]. */
 
+#if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+
 /* SWAR constants. */
 #define L_ONES_A (-1UL / 255)
 #define L_HIGHS_A (L_ONES_A * 0x80)
 
+/* SWAR "byte == target" probe; returns a has_zero bitmap. */
+static inline_lookup
+unsigned long ft_swar_byteq(unsigned long word, unsigned long target_ones)
+{
+	unsigned long xor_res = word ^ target_ones;
+	return (xor_res - L_ONES_A) & ~xor_res & L_HIGHS_A;
+}
+
+/* Position of the first matching byte within the word. */
+static inline_lookup
+unsigned int ft_swar_match_idx(unsigned long has_zero)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	return (unsigned int)(__builtin_ctzl(has_zero) >> 3);
+#else
+	return (unsigned int)(__builtin_clzl(has_zero) >> 3);
+#endif
+}
+
+/*
+ * Scan values[0..nr_child) for byte @n, using word-at-a-time SWAR
+ * with an overlapping tail for nr_child >= sizeof(long), and a
+ * single masked word for nr_child < sizeof(long).  The scan covers
+ * exactly the valid key range, so every returned index is
+ * guaranteed < nr_child.
+ */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, uint8_t nr_child, uint8_t raw)
 {
-	unsigned long *data_words = (unsigned long *)node->data;
-	unsigned long mask = n * L_ONES_A, xor_res, has_zero;
-	unsigned long first_word = data_words[0];
+	uint8_t *values = &node->data[1];
+	unsigned long target_ones = n * L_ONES_A;
+	unsigned long word, has_zero;
 	unsigned int i;
+	const unsigned int word_sz = sizeof(unsigned long);
 
+	if (nr_child < word_sz) {
+		/*
+		 * Masked single-word load: values[] is padded to
+		 * sizeof(void *) >= word_sz on strict-align archs
+		 * (gated by FT_HAVE_EFFICIENT_UNALIGNED_ACCESS),
+		 * so this is always a safe in-node read.
+		 */
+		__builtin_memcpy(&word, values, word_sz);
+		has_zero = ft_swar_byteq(word, target_ones);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-	xor_res = first_word ^ (mask | 0xFFUL);
-	has_zero = (xor_res - L_ONES_A) & ~xor_res & L_HIGHS_A;
-	if (has_zero) {
-		i = (__builtin_ctzl(has_zero) >> 3) - 1;
-		if (i < nr_child)
-			goto found;
-	}
+		has_zero &= (1UL << ((unsigned long)nr_child * 8)) - 1;
 #else
-	xor_res = first_word ^ (mask | (0xFFUL << ((sizeof(unsigned long) - 1) * 8)));
-	has_zero = (xor_res - L_ONES_A) & ~xor_res & L_HIGHS_A;
-	if (has_zero) {
-		i = (__builtin_clzl(has_zero) >> 3) - 1;
-		if (i < nr_child)
-			goto found;
-	}
+		has_zero &= ~0UL << (((unsigned long)(word_sz - nr_child)) * 8);
 #endif
-	for (unsigned int w = 1; w * sizeof(unsigned long) < (unsigned long)((raw >> FT_LINEAR_PTR_OFFSET_SHIFT) << __builtin_ctz(sizeof(void *))); w++) {
-		xor_res = data_words[w] ^ mask;
-		has_zero = (xor_res - L_ONES_A) & ~xor_res & L_HIGHS_A;
 		if (has_zero) {
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-			i = (w * sizeof(unsigned long)) + (__builtin_ctzl(has_zero) >> 3) - 1;
-#else
-			i = (w * sizeof(unsigned long)) + (__builtin_clzl(has_zero) >> 3) - 1;
-#endif
-			if (i < nr_child)
+			i = ft_swar_match_idx(has_zero);
+			goto found;
+		}
+	} else {
+		unsigned int j = 0;
+
+		while (j + word_sz <= nr_child) {
+			__builtin_memcpy(&word, values + j, word_sz);
+			has_zero = ft_swar_byteq(word, target_ones);
+			if (has_zero) {
+				i = j + ft_swar_match_idx(has_zero);
 				goto found;
+			}
+			j += word_sz;
+		}
+		if (j < nr_child) {
+			unsigned int tail = nr_child - word_sz;
+
+			__builtin_memcpy(&word, values + tail, word_sz);
+			has_zero = ft_swar_byteq(word, target_ones);
+			if (has_zero) {
+				i = tail + ft_swar_match_idx(has_zero);
+				goto found;
+			}
 		}
 	}
 	if (caa_unlikely(node_flag_ptr))
@@ -2760,32 +2830,45 @@ found:
 }
 
 #if defined(__SSE2__)
+/*
+ * Scan values[0..nr_child) for byte @n using SSE2 + overlapping
+ * 16-byte tail.  For nr_child <= 16, mask the movemask bits beyond
+ * nr_child; for nr_child > 16, the second load overlaps with the
+ * first so every bit we inspect corresponds to an index in
+ * [0, nr_child).
+ */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, uint8_t nr_child, uint8_t raw)
 {
-	uint8_t *data = &node->data[0];
+	uint8_t *values = &node->data[1];
 	__m128i target = _mm_set1_epi8(n);
 	__m128i chunk;
 	unsigned int mask, phys_idx;
 
-	chunk = _mm_loadu_si128((__m128i *)data);
+	chunk = _mm_loadu_si128((__m128i *)values);
 	mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
-	mask &= ~1U; /* Ignore nr_child byte at index 0. */
-	if (mask) {
-		phys_idx = __builtin_ctz(mask);
-		if (phys_idx <= nr_child)
+	if (nr_child <= 16) {
+		mask &= (1U << nr_child) - 1;
+		if (mask) {
+			phys_idx = __builtin_ctz(mask);
 			goto found;
-	}
-	if (nr_child >= 16) {
-		chunk = _mm_loadu_si128((__m128i *)(data + 16));
+		}
+	} else {
+		unsigned int tail;
+
+		if (mask) {
+			phys_idx = __builtin_ctz(mask);
+			goto found;
+		}
+		tail = nr_child - 16;
+		chunk = _mm_loadu_si128((__m128i *)(values + tail));
 		mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
 		if (mask) {
-			phys_idx = 16 + __builtin_ctz(mask);
-			if (phys_idx <= nr_child)
-				goto found;
+			phys_idx = tail + __builtin_ctz(mask);
+			goto found;
 		}
 	}
 	if (caa_unlikely(node_flag_ptr))
@@ -2793,15 +2876,16 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
 	return NULL;
 found:
 	{
-		unsigned int i = phys_idx - 1;
 		struct cds_ft_inode_flag **pointers =
 			ft_linear_pointers(node, raw);
 		if (caa_unlikely(node_flag_ptr))
-			*node_flag_ptr = &pointers[i];
-		return ft_dereference_acquire(pointers[i]);
+			*node_flag_ptr = &pointers[phys_idx];
+		return ft_dereference_acquire(pointers[phys_idx]);
 	}
 }
 #endif /* __SSE2__ */
+
+#endif /* FT_HAVE_EFFICIENT_UNALIGNED_ACCESS */
 
 /*
  * ft_linear_node_get_nth: bytewise scan for small linear nodes
@@ -2847,10 +2931,11 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type __attr
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type __attribute__((unused)) *type,
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		struct cds_ft_inode *node __attribute__((unused)),
+		struct cds_ft_inode_flag ***node_flag_ptr __attribute__((unused)),
+		uint8_t n __attribute__((unused)))
 {
+#if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
 	uint8_t raw = uatomic_load(&node->data[0], CMM_ACQUIRE);
 	uint8_t nr_child = raw & FT_LINEAR_NR_CHILD_MASK;
 
@@ -2859,10 +2944,17 @@ struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type _
 			*node_flag_ptr = NULL;
 		return NULL;
 	}
-#if defined(__SSE2__)
+#  if defined(__SSE2__)
 	return ft_linear_node_get_nth_simd(node, node_flag_ptr, n, nr_child, raw);
-#else
+#  else
 	return ft_linear_node_get_nth_swar(node, node_flag_ptr, n, nr_child, raw);
+#  endif
+#else
+	/*
+	 * Unreachable: on strict-alignment archs FT_WIDE_LINEAR_THRESHOLD=32
+	 * prevents any type from being classified as FT_LINEAR_WIDE.
+	 */
+	abort();
 #endif
 }
 
