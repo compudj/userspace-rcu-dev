@@ -212,10 +212,10 @@ def list_lifetimes(trace_dir):
             dur = '-'
         vpid_s = str(e['vpid']) if e['vpid'] is not None else '?'
         if e['violations']:
-            # Show each violation timestamp relative to the lifetime
-            # begin, so the user can see where in the run it fired.
-            vs = ",".join(f"+{(v - e['begin']) / 1e9:.6f}s"
-                          for v in e['violations'])
+            # Absolute wall-clock timestamp for each violation, so
+            # the user can grep the raw trace (babeltrace2 output
+            # uses the same format) to pinpoint the failing event.
+            vs = ",".join(_ts_str(v) for v in e['violations'])
         else:
             vs = '-'
         print(f"{vpid_s:<8} {hex(e['group']):<20} {hex(e['ft']):<20} "
