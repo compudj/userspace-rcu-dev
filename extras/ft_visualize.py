@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 """
 Reconstruct a GraphViz snapshot of a Fractal Trie from an LTTng-UST
-ft_tp trace.
+cds_ft trace.
 
 Replays the authoritative structural events (tree_edge_set,
 compressed_publish, collapsed_publish, collapsed_entry) plus node
@@ -51,13 +51,30 @@ Rendering:
   Node colour/shape by kind: internal=yellow box, compressed=green
   diamond, collapsed=purple hexagon, external=blue ellipse.
 
+Trace session setup:
+    Always enable the vpid context so pointers from different
+    processes don't alias each other — the script needs it to
+    scope (group, ft) tuples to a single process:
+
+        lttng create <session>
+        lttng enable-event --userspace 'cds_ft:*'
+        lttng add-context --userspace --type vpid
+        lttng start
+
 Usage:
-    ft_visualize.py TRACE_DIR [--ft PTR] [--until TS] > trie.dot
-    dot -Tsvg trie.dot -o trie.svg
-    ft_visualize.py TRACE_DIR --ft 0x... -o trie.svg
-    ft_visualize.py TRACE_DIR --ft 0x... -o trie.png
+    # Discover (vpid, group, ft) triples + their lifetimes:
+    ft_visualize.py TRACE_DIR --list
+
+    # Reconstruct a specific trie (all four args required):
+    ft_visualize.py TRACE_DIR --vpid N --group 0x.. --ft 0x.. \
+        --begin HH:MM:SS.nnnnnnnnn --end HH:MM:SS.nnnnnnnnn -o trie.svg
+
+    # Render without graphviz:
+    ft_visualize.py TRACE_DIR --vpid N --group 0x.. --ft 0x.. \
+        --format json > trie.json
 """
 import argparse
+import datetime
 import io
 import os
 import shutil
@@ -128,13 +145,109 @@ def _parse_time(s):
     sys.exit(f"error: cannot parse time spec: {s!r}")
 
 
+def _ts_str(ns):
+    """Format a ns-since-epoch timestamp as local HH:MM:SS.nnnnnnnnn
+    (the same format babeltrace2 prints at the start of each event)."""
+    sec, n = divmod(int(ns), 1_000_000_000)
+    t = datetime.datetime.fromtimestamp(sec)
+    return f"{t.strftime('%H:%M:%S')}.{n:09d}"
+
+
+def list_lifetimes(trace_dir):
+    """Walk the trace once and print every (group, ft) lifetime as
+    [group, ft, begin, end, duration].  Unmatched create events (ft
+    still alive at trace end) are reported with end='(open)'.
+    """
+    import bt2
+    # (ft_ptr, vpid, instance) -> dict(group, begin_ns, end_ns)
+    ft_instances = []
+    open_ft = {}  # (vpid, ft_ptr) -> index of current open entry
+    # vpid -> list of violation timestamps (ns).  Violations are test
+    # invariant failures; attributing them to a specific ft requires
+    # matching by vpid and time range (violation payload carries no ft).
+    violations = {}
+    it = bt2.TraceCollectionMessageIterator(trace_dir)
+    for msg in it:
+        if not isinstance(msg, bt2._EventMessageConst):
+            continue
+        ev = msg.event
+        name = ev.name
+        pf = ev.payload_field
+        try:
+            ts = msg.default_clock_snapshot.ns_from_origin
+        except Exception:
+            ts = msg.default_clock_snapshot.value
+        vpid = _event_vpid(ev)
+        if name == 'cds_ft:ft_create':
+            ft = int(pf['ft'])
+            group = int(pf['ft_group'])
+            ft_instances.append({'ft': ft, 'group': group, 'vpid': vpid,
+                                 'begin': ts, 'end': None})
+            open_ft[(vpid, ft)] = len(ft_instances) - 1
+        elif name == 'cds_ft:ft_destroy':
+            ft = int(pf['ft'])
+            key = (vpid, ft)
+            if key in open_ft:
+                ft_instances[open_ft.pop(key)]['end'] = ts
+        elif name == 'cds_ft:violation':
+            violations.setdefault(vpid, []).append(ts)
+    # Annotate each lifetime with violations that fired in the same
+    # vpid during its interval.
+    for e in ft_instances:
+        vlist = violations.get(e['vpid'], [])
+        end = e['end'] if e['end'] is not None else float('inf')
+        e['violations'] = [v for v in vlist if e['begin'] <= v <= end]
+    # Sort by vpid then group then begin
+    ft_instances.sort(key=lambda e: (e['vpid'] or 0, e['group'], e['begin']))
+    header = (f"{'vpid':<8} {'group':<20} {'ft':<20} {'begin':<20} "
+              f"{'end':<20} {'duration':<12} violations")
+    print(header)
+    print("-" * len(header))
+    for e in ft_instances:
+        begin = _ts_str(e['begin'])
+        end = _ts_str(e['end']) if e['end'] is not None else '(open)'
+        if e['end'] is not None:
+            dur = f"{(e['end'] - e['begin']) / 1e9:.6f}s"
+        else:
+            dur = '-'
+        vpid_s = str(e['vpid']) if e['vpid'] is not None else '?'
+        if e['violations']:
+            # Show each violation timestamp relative to the lifetime
+            # begin, so the user can see where in the run it fired.
+            vs = ",".join(f"+{(v - e['begin']) / 1e9:.6f}s"
+                          for v in e['violations'])
+        else:
+            vs = '-'
+        print(f"{vpid_s:<8} {hex(e['group']):<20} {hex(e['ft']):<20} "
+              f"{begin:<20} {end:<20} {dur:<12} {vs}")
+    if any(e['vpid'] is None for e in ft_instances):
+        print()
+        print("note: some events have no vpid.  For unambiguous")
+        print("      disambiguation across processes, enable the vpid")
+        print("      context at trace-session setup:")
+        print("          lttng add-context --userspace --type vpid")
+
+
+def _event_vpid(ev):
+    """Extract vpid from an event's common context, if present."""
+    try:
+        return int(ev.common_context_field['vpid'])
+    except Exception:
+        pass
+    try:
+        return int(ev.context_field['vpid'])
+    except Exception:
+        pass
+    return None
+
+
 PUBLIC_ENTER = {
-    'ft_tp:insert_enter', 'ft_tp:insert_unique_enter',
-    'ft_tp:insert_replace_enter', 'ft_tp:lookup_key_enter',
-    'ft_tp:graft_enter', 'ft_tp:graft_swap_enter',
-    'ft_tp:detach_enter', 'ft_tp:remove_enter',
-    'ft_tp:replace_enter', 'ft_tp:lookup_enter',
-    'ft_tp:iter_create',
+    'cds_ft:insert_enter', 'cds_ft:insert_unique_enter',
+    'cds_ft:insert_replace_enter', 'cds_ft:lookup_key_enter',
+    'cds_ft:graft_enter', 'cds_ft:graft_swap_enter',
+    'cds_ft:detach_enter', 'cds_ft:remove_enter',
+    'cds_ft:replace_enter', 'cds_ft:lookup_enter',
+    'cds_ft:iter_create',
 }
 
 
@@ -150,6 +263,11 @@ class Model:
         # root pointer for the filtered FT.  Populated by
         # consume_trace() on every root_publish event.
         self.last_root_life = None
+        # Per-ft last root_publish (ft_ptr -> root life_id).  When
+        # the scope covers a whole cds_ft_group, multiple ft's
+        # publish roots; this map lets model_to_json pick the right
+        # one for a specific --ft target.
+        self.last_root_per_ft = {}
         # life_id -> {'ptr': int, 'created_ts': int, 'kind': str,
         #             'level': int|None, 'meta': dict}
         self.nodes = {}
@@ -222,6 +340,53 @@ class Model:
 
 def consume_trace(args, m):
     cpu_ft = {}
+    # Filter events by the reconstruction scope.  Scope is the set of
+    # ft pointers that belong to --group, because graft / graft_swap
+    # can move subtrees across ft's within the group (events for those
+    # nodes may be tagged with either ft).  The mapping ft -> group is
+    # learned from cds_ft:ft_create events collected in a pre-scan.
+    #
+    # Both --group and --ft are required when filtering.  --group
+    # scopes event acceptance; --ft identifies which ft's root_publish
+    # to walk from in the reconstructed model.  They must be consistent
+    # (ft must belong to the named group).  The --begin/--end options
+    # disambiguate when an ft pointer is reused across generations.
+    ft_group_set = set()
+    ft_to_group = {}   # (vpid, ft) -> group
+    if (args.ft is not None or args.group is not None
+            or args.vpid is not None):
+        if args.ft is None or args.group is None or args.vpid is None:
+            sys.exit("error: --vpid, --group and --ft must be provided "
+                     "together (or omit all three to disable filtering)")
+        pre_it = bt2.TraceCollectionMessageIterator(args.trace_dir,
+            begin=_parse_time(args.begin) if args.begin else None,
+            end=_parse_time(args.end) if args.end else None)
+        for pmsg in pre_it:
+            if not isinstance(pmsg, bt2._EventMessageConst):
+                continue
+            pev = pmsg.event
+            if pev.name != 'cds_ft:ft_create':
+                continue
+            pvpid = _event_vpid(pev)
+            try:
+                ft = int(pev.payload_field['ft'])
+                group = int(pev.payload_field['ft_group'])
+            except Exception:
+                continue
+            ft_to_group[(pvpid, ft)] = group
+        # Validate consistency of --vpid, --ft and --group.
+        seen_group = ft_to_group.get((args.vpid, args.ft))
+        if seen_group is None:
+            sys.exit(f"error: no cds_ft:ft_create for vpid={args.vpid} "
+                     f"ft={args.ft:#x} in the --begin/--end window; "
+                     "widen the range or run with --list to find the "
+                     "right triple")
+        if seen_group != args.group:
+            sys.exit(f"error: ft {args.ft:#x} in vpid {args.vpid} "
+                     f"belongs to group {seen_group:#x}, not --group "
+                     f"{args.group:#x}")
+        ft_group_set = {ft for (vpid, ft), g in ft_to_group.items()
+                        if vpid == args.vpid and g == args.group}
 
     def cpu(ev):
         try:
@@ -230,23 +395,28 @@ def consume_trace(args, m):
             return None
 
     def ft_filter(ev, name, pf):
-        """Return True to include this event given --ft filter."""
-        if args.ft is None:
+        """Return True to include this event given the scope filter."""
+        if not ft_group_set:
             return True
+        # First: must be from the target vpid.  Events from other
+        # processes can never describe nodes in our trie even if
+        # the pointer happens to collide.
+        if _event_vpid(ev) != args.vpid:
+            return False
         if name in PUBLIC_ENTER:
-            ok = int(pf['ft']) == args.ft
+            ok = int(pf['ft']) in ft_group_set
             if ok:
                 c = cpu(ev)
                 if c is not None:
-                    cpu_ft[c] = args.ft
+                    cpu_ft[c] = int(pf['ft'])
             return ok
         # tree_edge_set and root_publish carry ft directly.
-        if name in ('ft_tp:tree_edge_set', 'ft_tp:root_publish'):
-            return int(pf['ft']) == args.ft
+        if name in ('cds_ft:tree_edge_set', 'cds_ft:root_publish'):
+            return int(pf['ft']) in ft_group_set
         # Structural events without explicit ft: attribute by CPU.
         attr = cpu_ft.get(cpu(ev))
         if attr is not None:
-            return attr == args.ft
+            return attr in ft_group_set
         return True  # unattributed; let it through
 
     it = bt2.TraceCollectionMessageIterator(args.trace_dir,
@@ -272,7 +442,7 @@ def consume_trace(args, m):
         if not ft_filter(ev, name, pf):
             continue
 
-        if name == 'ft_tp:tree_edge_set':
+        if name == 'cds_ft:tree_edge_set':
             parent = int(pf['parent'])
             key_byte = int(pf['key_byte'])
             child = int(pf['child'])
@@ -317,35 +487,31 @@ def consume_trace(args, m):
                 m.set_level(p_life, parent_level)
 
             if child:
-                existing_c = m.cur_life.get(child)
-                if existing_c is not None:
-                    prev_clvl = m.nodes[existing_c].get('level')
-                    if prev_clvl is not None and prev_clvl != parent_level + 1:
-                        m.kill(child)
+                # Do NOT kill on child-level conflict: graft and
+                # graft_swap move a subtree to a new depth, so the
+                # same logical node can legitimately appear at a
+                # different level.  Killing here would wipe the
+                # edges that were emitted while the subtree still
+                # lived in the source trie.  Internal-node pointer
+                # reuse at a different level without a free event
+                # is a theoretical risk but has no observed trigger.
                 c_life = m.birth(child, ts, child_kind)
                 m.set_kind(c_life, child_kind)
                 m.set_level(c_life, parent_level + 1, force=True)
-                # Slot replacement: if the same (parent, key_byte)
-                # previously held a different child lifetime, that
-                # child has been removed from the trie — end its
-                # lifetime so its collected state doesn't accumulate
-                # across generations.  (Compressed/collapsed nodes
-                # have no explicit free event, so this is the only
-                # way to bound their lifetime in the consumer.)
-                prev = m.edges.get((p_life, key_byte))
-                if prev is not None and prev != c_life:
-                    prev_node = m.nodes.get(prev)
-                    if prev_node:
-                        m.kill(prev_node['ptr'])
+                # Slot replacement: rewire the edge to the new child.
+                # We deliberately do NOT kill the previous child's
+                # lifetime here — in graft / graft_swap, a slot
+                # reassignment can mean the previous child moved to
+                # another ft in the same cds_ft_group rather than
+                # being freed.  Killing would wipe its still-valid
+                # outgoing edges.  Real frees come through dedicated
+                # events (compressed_free, collapsed_free, and
+                # node_recompact of the old_node).
                 m.edges[(p_life, key_byte)] = c_life
             else:
-                prev = m.edges.pop((p_life, key_byte), None)
-                if prev is not None:
-                    prev_node = m.nodes.get(prev)
-                    if prev_node:
-                        m.kill(prev_node['ptr'])
+                m.edges.pop((p_life, key_byte), None)
 
-        elif name == 'ft_tp:compressed_publish':
+        elif name == 'cds_ft:compressed_publish':
             cn = int(pf['cn'])
             if not cn:
                 continue
@@ -377,10 +543,10 @@ def consume_trace(args, m):
             if parent:
                 info['parent_life'] = m.birth(parent, ts)
 
-        elif name in ('ft_tp:compressed_free', 'ft_tp:collapsed_free'):
+        elif name in ('cds_ft:compressed_free', 'cds_ft:collapsed_free'):
             m.kill(int(pf['node']))
 
-        elif name == 'ft_tp:root_publish':
+        elif name == 'cds_ft:root_publish':
             # ft->root was rewritten.  The value IS the root, so it
             # is at level 0 and is the authoritative root for JSON
             # rendering / root-finding.  Seed kind/level; override
@@ -394,8 +560,9 @@ def consume_trace(args, m):
             m.set_kind(rlid, root_kind)
             m.set_level(rlid, 0, force=True)
             m.last_root_life = rlid
+            m.last_root_per_ft[int(pf['ft'])] = rlid
 
-        elif name == 'ft_tp:collapsed_publish':
+        elif name == 'cds_ft:collapsed_publish':
             col = int(pf['col'])
             if not col:
                 continue
@@ -406,7 +573,7 @@ def consume_trace(args, m):
             info['nr_entries'] = int(pf['nr_entries'])
             info['scan_zone_size'] = int(pf['scan_zone_size'])
 
-        elif name == 'ft_tp:collapsed_entry':
+        elif name == 'cds_ft:collapsed_entry':
             col = int(pf['col'])
             if not col:
                 continue
@@ -432,7 +599,7 @@ def consume_trace(args, m):
                     'dead': False,
                 }
 
-        elif name == 'ft_tp:node_recompact':
+        elif name == 'cds_ft:node_recompact':
             # Recompact allocates a new node at a different address
             # and frees the old one; children are carried over
             # (the library doesn't re-fire tree_edge_set for each
@@ -508,15 +675,15 @@ def consume_trace(args, m):
         # would overwrite the correct value.  Traversal events are
         # used only to fill in `kind` for lifetimes that haven't
         # yet been touched by a structural event.
-        elif name in ('ft_tp:slowpath_step', 'ft_tp:post_traversal',
-                      'ft_tp:fastpath_enter'):
+        elif name in ('cds_ft:slowpath_step', 'cds_ft:post_traversal',
+                      'cds_ft:fastpath_enter'):
             ptr = int(pf['node_flag'])
             if not ptr:
                 continue
             lid = m.birth(ptr, ts)
             m.set_kind(lid, enum_label(pf['node_kind']))
 
-        elif name == 'ft_tp:ineq_going_up_step':
+        elif name == 'cds_ft:ineq_going_up_step':
             ptr = int(pf['path_entry'])
             if not ptr:
                 continue
@@ -585,8 +752,14 @@ def model_to_json(m, ft_ptr):
     root are not included — this matches the authoritative dump
     which only walks from `ft->root`.
     """
-    # Prefer the last root_publish event's target (authoritative).
-    root_lid = m.last_root_life if m.last_root_life in m.nodes else None
+    # Prefer the last root_publish event's target for the requested
+    # ft (authoritative).  Fall back to the global last root when
+    # no --ft was specified or no per-ft root was seen.
+    root_lid = None
+    if ft_ptr is not None:
+        root_lid = m.last_root_per_ft.get(ft_ptr)
+    if root_lid is None or root_lid not in m.nodes:
+        root_lid = m.last_root_life if m.last_root_life in m.nodes else None
     if root_lid is None:
         # Fallback: pick the level-0 lifetime with most descendants.
         roots = [lid for lid, n in m.nodes.items() if n.get('level') == 0]
@@ -678,7 +851,19 @@ def _fmt_ptr(p):
     return f'{p:#x}' if isinstance(p, int) else p
 
 
-def emit_dot(m, out):
+def _key_label(kb, ascii_mode):
+    """Format a key byte for edge labels.  When ascii_mode is set
+    and the byte is printable ASCII, append the character."""
+    if ascii_mode and 0x20 <= kb <= 0x7E:
+        # Escape characters that would break DOT string syntax.
+        c = chr(kb)
+        if c in ('"', '\\'):
+            c = '\\' + c
+        return f"{kb:#04x} '{c}'"
+    return f"{kb:#04x}"
+
+
+def emit_dot(m, out, ascii_mode=False):
     w = out.write
 
     # Build the set of lifetimes actually referenced by surviving
@@ -721,14 +906,14 @@ def emit_dot(m, out):
         w(f'      "lvl_anchor_{lvl}" [shape=plaintext, label="", '
           f'width=0, height=0];\n')
         for lid in sorted(by_level[lvl], key=lambda x: m.nodes[x]['ptr']):
-            _emit_node(m, lid, w)
+            _emit_node(m, lid, w, ascii_mode)
         w('    }\n  }\n')
 
     if None in by_level:
         w('  subgraph "cluster_unknown" {\n')
         w('    label="level unknown"; style="dotted"; color="gray70";\n')
         for lid in sorted(by_level[None], key=lambda x: m.nodes[x]['ptr']):
-            _emit_node(m, lid, w)
+            _emit_node(m, lid, w, ascii_mode)
         w('  }\n')
 
     if len(sorted_levels) > 1:
@@ -741,7 +926,7 @@ def emit_dot(m, out):
         if p_life not in m.nodes or c_life not in m.nodes:
             continue
         w(f'  "n{p_life}" -> "n{c_life}" [color=black, penwidth=1.6, '
-          f'arrowsize=0.9, label="{kb:#04x}"];\n')
+          f'arrowsize=0.9, label="{_key_label(kb, ascii_mode)}"];\n')
 
     # Compressed: compressed -> child (precise descent, solid) plus
     # parent-of-compressed -> child (skip, dashed).
@@ -776,7 +961,7 @@ def emit_dot(m, out):
     w('}\n')
 
 
-def _emit_node(m, lid, w):
+def _emit_node(m, lid, w, ascii_mode=False):
     n = m.nodes[lid]
     parts = [f'{n["ptr"]:#x}', n['kind']]
     lvl = n['level']
@@ -787,7 +972,11 @@ def _emit_node(m, lid, w):
         parts.append(f'plen={cn["len"]}')
         kb = cn.get('key_bytes')
         if kb:
-            parts.append('k=' + ','.join(f'{b:02x}' for b in kb))
+            if ascii_mode and all(0x20 <= b <= 0x7E for b in kb):
+                s = ''.join(chr(b) for b in kb).replace('\\', '\\\\').replace('"', '\\"')
+                parts.append(f'k=\\"{s}\\"')
+            else:
+                parts.append('k=' + ','.join(f'{b:02x}' for b in kb))
     col = m.cols.get(lid)
     if col:
         parts.append(f'ne={col["nr_entries"]}')
@@ -805,8 +994,21 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('trace_dir', help='Path to an LTTng CTF trace directory')
+    p.add_argument('--vpid', type=int, default=None,
+                   help='Process ID the target trie lives in.  Required '
+                        'alongside --group and --ft.  Requires the trace '
+                        'session to have been started with '
+                        '"lttng add-context --userspace --type vpid".')
+    p.add_argument('--group', type=lambda x: int(x, 0), default=None,
+                   help='cds_ft_group pointer for the target trie.  '
+                        'All FTs in the group are accepted during '
+                        'reconstruction (graft/graft_swap is bounded '
+                        'to a group, so the group is the natural scope).')
     p.add_argument('--ft', type=lambda x: int(x, 0), default=None,
-                   help='Filter to a specific FT pointer')
+                   help='FT pointer for the target trie.  Must belong '
+                        'to --group and live in --vpid.  Used to pick '
+                        'the root (from cds_ft:root_publish events on '
+                        'this ft) for model_to_json output.')
     p.add_argument('--begin', default=None,
                    help='Replay start time.  Accepts seconds since epoch '
                         '(float) or "YYYY-MM-DD hh:mm:ss[.nnnnnnnnn]".  '
@@ -819,7 +1021,21 @@ def main():
                    help='Output file (extension picks format)')
     p.add_argument('--format', default=None,
                    help='Override format (svg, png, pdf, dot)')
+    p.add_argument('--ascii', action='store_true',
+                   help="On key-byte edge labels, show the printable "
+                        "ASCII character in addition to the hex byte "
+                        "(e.g. \"0x61 'a'\").  Useful for tries keyed "
+                        "on strings or paths.")
+    p.add_argument('--list', action='store_true',
+                   help='List every (group, ft, begin, end) lifetime '
+                        'observed in the trace and exit.  Use the values '
+                        'as --group / --ft / --begin / --end to scope a '
+                        'subsequent reconstruction.')
     args = p.parse_args()
+
+    if args.list:
+        list_lifetimes(args.trace_dir)
+        return
 
     fmt = args.format
     if fmt is None and args.output is not None:
@@ -848,7 +1064,7 @@ def main():
         return
 
     buf = io.StringIO()
-    emit_dot(m, buf)
+    emit_dot(m, buf, ascii_mode=args.ascii)
     dot_text = buf.getvalue()
 
     if fmt == 'dot':
