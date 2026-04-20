@@ -1741,6 +1741,25 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 		struct cds_ft_compressed_node *cn,
 		struct cds_ft_inode_flag *cflag)
 {
+	/*
+	 * Emit creation-time compressed_publish so trace consumers
+	 * learn the cn->child binding for every newly-allocated
+	 * compressed node, regardless of which creation path built
+	 * it (ft_build_compressed_node, compressed-split sfx/pfx/nb,
+	 * graft-split suffix/prefix).  parent is NULL here: the cn
+	 * is about to be returned to the caller for attachment;
+	 * cn_meta->parent is still unset.  A subsequent
+	 * ft_publish_to_parent / ft_node_set_nth on the slot that
+	 * holds this cn fires tree_edge_set (with the cn as child),
+	 * which — paired with this event — gives the consumer both
+	 * ends: the parent->cn edge and the cn->child edge.
+	 */
+	FT_TP(compressed_publish,
+		(const void *) ft_compressed_node_flag(cn),
+		cn->len,
+		cn->key_bytes,
+		(const void *) cn->child,
+		(const void *) NULL);
 	if (ft_group_skip_compressed(ft->group) &&
 	    cn->len <= FT_SKIP_LEN_MAX) {
 		return ft_skip_compressed_flag(cn->child, cn->len);
@@ -9505,11 +9524,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		struct cds_ft_inode_flag *cflag = ft_compressed_node_flag(cn);
 		ft_set_parent(child, cflag, &cn->child);
 		ft_init_node_density(ft, cflag);
-		FT_TP(compressed_publish,
-			(const void *) ft_compressed_node_flag(cn),
-			cn->len,
-			cn->key_bytes,
-			(const void *) cn->child, NULL);
+		/* compressed_publish emitted by ft_publish_compressed. */
 		return ft_publish_compressed(ft, cn, cflag);
 	}
 }
