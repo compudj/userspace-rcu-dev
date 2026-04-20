@@ -1090,6 +1090,35 @@ def _key_label(kb, ascii_mode):
     return f"{kb:#04x}"
 
 
+def _key_sequence_label(kbs, ascii_mode):
+    """Format a sequence of key bytes for an edge label.  Hex
+    values are grouped together on the first row; the ASCII
+    spelling (when ascii_mode) goes on a second row below — one
+    row per representation, not interleaved byte-by-byte.
+
+    Non-printable bytes are rendered as '.' in the ASCII row,
+    keeping byte positions aligned.  If no byte is printable, the
+    ASCII row is omitted.
+    """
+    if not kbs:
+        return ''
+    hex_part = ' '.join(f'{b:#04x}' for b in kbs)
+    if not ascii_mode:
+        return hex_part
+    if not any(0x20 <= b <= 0x7E for b in kbs):
+        return hex_part
+    chars = []
+    for b in kbs:
+        if 0x20 <= b <= 0x7E:
+            c = chr(b)
+            if c in ('"', '\\'):
+                c = '\\' + c
+            chars.append(c)
+        else:
+            chars.append('.')
+    return f"{hex_part}\\n'{''.join(chars)}'"
+
+
 def emit_dot(m, out, ascii_mode=False):
     w = out.write
 
@@ -1207,8 +1236,16 @@ def emit_dot(m, out, ascii_mode=False):
             continue
         # Precise.  dir=both mirrors the cn->child / child->cn
         # (child's parent back-pointer points to cn in both modes).
+        # Label carries the full absorbed path byte-by-byte so the
+        # reader can trace the lookup without cross-referencing
+        # the cn's internal k= field (which now omits key_bytes).
+        key_bytes = info.get('key_bytes')
+        if key_bytes:
+            cn_edge_label = _key_sequence_label(key_bytes, ascii_mode)
+        else:
+            cn_edge_label = f'path {info["len"]}B'
         w(f'  "n{lid}" -> "n{ch}" [color=black, penwidth=1.4, '
-          f'arrowsize=0.9, dir=both, label="path {info["len"]}B", '
+          f'arrowsize=0.9, dir=both, label="{cn_edge_label}", '
           f'fontcolor="#404040"];\n')
         cn_is_direct_child = any(c_life == lid
                                  for c_life in m.edges.values())
@@ -1271,7 +1308,12 @@ def emit_dot(m, out, ascii_mode=False):
               f'label="parent", fontcolor="#808080", '
               f'constraint=false];\n')
 
-    # Collapsed entries: collapsed -> child per live entry.
+    # Collapsed entries: collapsed -> child per live entry.  The
+    # edge label pairs the entry index with the full absorbed
+    # sub-key — every byte the walker consumes between the
+    # collapsed node and the external leaf — so a reader can
+    # trace the lookup path without cross-referencing the
+    # authoritative cds_ft_show(JSON) dump.
     for lid, info in m.cols.items():
         if lid not in m.nodes:
             continue
@@ -1279,9 +1321,15 @@ def emit_dot(m, out, ascii_mode=False):
             ch = e.get('child_life')
             if ch is None or ch not in m.nodes:
                 continue
+            suffix = e.get('suffix') or []
+            if suffix:
+                label = (f'[{idx}] '
+                         f'{_key_sequence_label(suffix, ascii_mode)}')
+            else:
+                label = f'[{idx}] +0B'
             w(f'  "n{lid}" -> "n{ch}" [color=black, penwidth=1.3, '
               f'arrowsize=0.9, dir=both, '
-              f'label="[{idx}] +{len(e["suffix"])}B", '
+              f'label="{label}", '
               f'fontcolor="#404040"];\n')
 
     w('}\n')
@@ -1296,13 +1344,9 @@ def _emit_node(m, lid, w, ascii_mode=False):
     cn = m.cnodes.get(lid)
     if cn:
         parts.append(f'plen={cn["len"]}')
-        kb = cn.get('key_bytes')
-        if kb:
-            if ascii_mode and all(0x20 <= b <= 0x7E for b in kb):
-                s = ''.join(chr(b) for b in kb).replace('\\', '\\\\').replace('"', '\\"')
-                parts.append(f'k=\\"{s}\\"')
-            else:
-                parts.append('k=' + ','.join(f'{b:02x}' for b in kb))
+        # key_bytes intentionally omitted here — they're shown on
+        # the cn -> child edge label, matching the way collapsed
+        # entry suffixes are rendered on the col -> entry edge.
     col = m.cols.get(lid)
     if col:
         parts.append(f'ne={col["nr_entries"]}')
