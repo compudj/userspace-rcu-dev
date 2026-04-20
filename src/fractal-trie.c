@@ -13256,6 +13256,12 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		if (displaced) {
 			ft_set_parent(branch, d->pnf, d->nfp);
 			ft_publish_to_parent(ft, d->pnf, d->nfp, branch);
+			if (i >= 1)
+				FT_TP(tree_edge_set, (const void *) ft,
+					(const void *) d->pnf,
+					(unsigned int) (i - 1),
+					(uint8_t) key[i - 1],
+					(const void *) branch);
 		} else {
 			struct cds_ft_inode_flag *dest = d->pnf;
 			struct cds_ft_metadata *pmeta;
@@ -13604,6 +13610,19 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			ft_set_parent(old_swap_root, d.pnf, d.nfp);
 		ft_publish_to_parent(dst_ft, d.pnf, d.nfp,
 			swap_empty ? NULL : old_swap_root);
+		/*
+		 * graft_swap replaces the subtree at key_len in dst_ft
+		 * via ft_publish_to_parent directly; no ft_node_set_nth
+		 * call, so no tree_edge_set fires for the outer edit.
+		 * Emit the structural edge for consumers.
+		 */
+		if (d.depth >= 1)
+			FT_TP(tree_edge_set, (const void *) dst_ft,
+				(const void *) d.pnf,
+				(unsigned int) (d.depth - 1),
+				(uint8_t) _key[d.depth - 1],
+				(const void *) (swap_empty ? NULL :
+					old_swap_root));
 
 		/* Update parent nr_child on NULL <-> non-NULL transition. */
 		pmeta = cds_ft_item_to_metadata(ft_node_ptr(d.pnf));
