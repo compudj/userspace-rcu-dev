@@ -1156,7 +1156,16 @@ def emit_dot(m, out, ascii_mode=False):
           f'arrowsize=0.9, label="{_key_label(kb, ascii_mode)}"];\n')
 
     # Compressed: compressed -> child (precise descent, solid) plus
-    # parent-of-compressed -> child (skip, dashed).
+    # parent-of-compressed -> child (skip, dashed, skip-mode only).
+    #
+    # The dashed edge represents the actual skip-compressed fast
+    # path: the parent's slot holds a skip pointer whose low bits
+    # point at cn->child, bypassing cn.  In non-skip mode the
+    # parent's slot holds cn itself and there is no skip fast path,
+    # so the dashed edge must not render.  Detection: in non-skip
+    # mode cn appears as a c_life in m.edges (tree_edge_set with
+    # skip_len=0); in skip mode cn is never a c_life, and the
+    # edge from parent lands on cn->child (interposed, skip_len>0).
     for lid, info in m.cnodes.items():
         ch = info.get('child_life')
         if ch is None or ch not in m.nodes or lid not in m.nodes:
@@ -1165,13 +1174,25 @@ def emit_dot(m, out, ascii_mode=False):
         w(f'  "n{lid}" -> "n{ch}" [color=black, penwidth=1.4, '
           f'arrowsize=0.9, label="path {info["len"]}B", '
           f'fontcolor="#404040"];\n')
-        # Candidate skip: find all edges where this cn is a child.
+        cn_is_direct_child = any(c_life == lid
+                                 for c_life in m.edges.values())
+        if cn_is_direct_child:
+            continue
+        # Skip mode: recover the parent from cn_info (set_parent
+        # seeds parent_life / parent_ptr when the slot holds a
+        # skip pointer) or from edges whose child is cn->child.
+        skip_parents = set()
+        gp = info.get('parent_life')
+        if gp is not None and gp in m.nodes and gp != lid:
+            skip_parents.add(gp)
         for (p_life, _kb), c_life in m.edges.items():
-            if c_life == lid:
-                w(f'  "n{p_life}" -> "n{ch}" [style=dashed, color="#2060a0", '
-                  f'penwidth=1.2, arrowsize=0.9, '
-                  f'label="skip {info["len"]}B", fontcolor="#2060a0", '
-                  f'constraint=false];\n')
+            if c_life == ch and p_life != lid and p_life in m.nodes:
+                skip_parents.add(p_life)
+        for p_life in skip_parents:
+            w(f'  "n{p_life}" -> "n{ch}" [style=dashed, color="#2060a0", '
+              f'penwidth=1.2, arrowsize=0.9, '
+              f'label="skip {info["len"]}B", fontcolor="#2060a0", '
+              f'constraint=false];\n')
 
     # Collapsed entries: collapsed -> child per live entry.
     for lid, info in m.cols.items():
