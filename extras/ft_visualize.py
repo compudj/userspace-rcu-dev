@@ -1214,28 +1214,43 @@ def emit_dot(m, out, ascii_mode=False):
                                  for c_life in m.edges.values())
         if cn_is_direct_child:
             continue
-        # Skip mode: recover the parent from cn_info (set_parent
-        # seeds parent_life / parent_ptr when the slot holds a
-        # skip pointer) or from edges whose child is cn->child.
-        # Prefer the current lifetime of cn_info['parent_ptr']
-        # over the life_id stored on cn_info, which can go stale
-        # across rebirths of the same address.
-        skip_parents = set()
-        gp_ptr = info.get('parent_ptr')
-        if gp_ptr is not None:
-            cur = m.cur_life.get(gp_ptr)
-            if cur is not None and cur in m.nodes and cur != lid:
-                skip_parents.add(cur)
-        gp = info.get('parent_life')
-        if gp is not None and gp in m.nodes and gp != lid:
-            skip_parents.add(gp)
-        for (p_life, _kb), c_life in m.edges.items():
+        # Skip mode: collect (parent_life, slot_kb) pairs — the
+        # slot_kb is the key byte under which the parent selects
+        # the skip pointer, i.e. the first byte consumed by the
+        # walk that reaches cn->child.  m.edges is authoritative
+        # for slot_kb; the grey back-arrow and the dashed skip
+        # share the same set of (parent, slot_kb) pairs.
+        skip_slots = set()
+        for (p_life, kb), c_life in m.edges.items():
             if c_life == ch and p_life != lid and p_life in m.nodes:
-                skip_parents.add(p_life)
-        for p_life in skip_parents:
+                skip_slots.add((p_life, kb))
+        # Fallback: if m.edges has no edge to cn->child from a
+        # distinct parent (rare — happens when the edge got torn
+        # down before the snapshot window), use cn_info's
+        # parent_ptr / parent_life so the cn still renders with
+        # a back-arrow.  No slot_kb available in this fallback.
+        if not skip_slots:
+            gp_ptr = info.get('parent_ptr')
+            fallback_parent = None
+            if gp_ptr is not None:
+                cur = m.cur_life.get(gp_ptr)
+                if cur is not None and cur in m.nodes and cur != lid:
+                    fallback_parent = cur
+            if fallback_parent is None:
+                gp = info.get('parent_life')
+                if gp is not None and gp in m.nodes and gp != lid:
+                    fallback_parent = gp
+            if fallback_parent is not None:
+                skip_slots.add((fallback_parent, None))
+        for p_life, slot_kb in skip_slots:
+            if slot_kb is not None:
+                skip_label = (f'{_key_label(slot_kb, ascii_mode)}'
+                              f' skip {info["len"]}B')
+            else:
+                skip_label = f'skip {info["len"]}B'
             w(f'  "n{p_life}" -> "n{ch}" [style=dashed, color="#2060a0", '
               f'penwidth=1.2, arrowsize=0.9, '
-              f'label="skip {info["len"]}B", fontcolor="#2060a0", '
+              f'label="{skip_label}", fontcolor="#2060a0", '
               f'constraint=false];\n')
         # Back-pointer: in skip-compressed mode the parent slot
         # holds a skip pointer (parent -> cn_child), so there is
@@ -1246,7 +1261,11 @@ def emit_dot(m, out, ascii_mode=False):
         # is not distorted.  In non-skip mode the parent's slot
         # points at cn directly, so the back-arrow would duplicate
         # the forward solid edge's information and is skipped.
-        for p_life in skip_parents:
+        seen_back = set()
+        for p_life, _slot_kb in skip_slots:
+            if p_life in seen_back:
+                continue
+            seen_back.add(p_life)
             w(f'  "n{lid}" -> "n{p_life}" [color="#808080", '
               f'penwidth=0.8, arrowsize=0.7, style=solid, '
               f'label="parent", fontcolor="#808080", '
