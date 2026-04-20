@@ -449,8 +449,22 @@ def consume_trace(args, m):
             parent_level = int(pf['parent_level'])
             parent_kind = enum_label(pf['parent_kind'])
             child_kind = enum_label(pf['child_kind'])
+            try:
+                child_skip_len = int(pf['child_skip_len'])
+            except Exception:
+                child_skip_len = 0
             if not parent:
                 continue
+            # Skip-compressed pointer: the `child` raw value encodes
+            # the compressed path length in its high bits; the real
+            # child address sits in the low 57 bits (64-bit).  Mask
+            # it so subsequent m.birth / m.edges use the true child
+            # pointer (same lifetime as the compressed node reached
+            # via other events).  Without this, a skip edge creates
+            # a phantom lifetime for the skip-tagged value that's
+            # never connected to anything.
+            if child and child_skip_len:
+                child = child & ((1 << 57) - 1)
 
             # Lifetime reset on level conflict for INTERNAL-kind
             # parents only.  Internal-node frees aren't traced in
@@ -526,13 +540,16 @@ def consume_trace(args, m):
             except (KeyError, TypeError):
                 pass
             child = int(pf['child'])
+            old_child_life = info.get('child_life')
             if child:
                 child_kind = enum_label(pf['child_kind'])
                 cl = m.birth(child, ts, child_kind)
                 m.set_kind(cl, child_kind)
                 info['child_life'] = cl
+                info['child_ptr'] = child
             else:
                 info['child_life'] = None
+                info['child_ptr'] = None
             # parent is NULL at creation time and non-NULL on
             # re-emissions from ft_publish_to_parent.  Record it
             # so derive_levels can bridge cn's level from its
@@ -542,6 +559,31 @@ def consume_trace(args, m):
             parent = int(pf['parent'])
             if parent:
                 info['parent_life'] = m.birth(parent, ts)
+                info['parent_ptr'] = parent
+            # Skip-compressed mode: when this cn's child changes,
+            # the grandparent's skip slot is updated in place to
+            # point at the new child — no tree_edge_set fires.
+            # Rewrite any m.edges entry at the grandparent (parent
+            # of this cn) that still resolves to the old child
+            # life, so the consumer's view of the tree stays in
+            # sync with the new skip target.  Done AFTER the
+            # parent_life update so the current compressed_publish
+            # event's parent pointer is used for the rewrite.
+            gp_life = info.get('parent_life')
+            if (gp_life is not None and old_child_life is not None
+                    and info.get('child_life') is not None
+                    and old_child_life != info['child_life']):
+                for key in list(m.edges):
+                    if m.edges[key] != old_child_life:
+                        continue
+                    if key[0] != gp_life:
+                        continue
+                    m.edges[key] = info['child_life']
+            # parent can legitimately be NULL (creation-time publish
+            # from ft_publish_compressed before the cn is attached).
+            # Don't overwrite a previously-known parent_ptr.
+            elif 'parent_ptr' not in info:
+                info['parent_ptr'] = None
 
         elif name in ('cds_ft:compressed_free', 'cds_ft:collapsed_free'):
             m.kill(int(pf['node']))
@@ -641,8 +683,10 @@ def consume_trace(args, m):
                     for info in m.cnodes.values():
                         if info.get('child_life') == old_life:
                             info['child_life'] = new_life
+                            info['child_ptr'] = new
                         if info.get('parent_life') == old_life:
                             info['parent_life'] = new_life
+                            info['parent_ptr'] = new
                     for cinfo in m.cols.values():
                         for e in cinfo['entries'].values():
                             if e.get('child_life') == old_life:
@@ -829,14 +873,33 @@ def model_to_json(m, ft_ptr):
                 if not e.get('dead')
             ]
             return out
-        # Internal node.
+        # Internal node.  When skip-compressed mode is active, an
+        # m.edges entry (lid, kb) -> C may logically represent
+        # "parent -> compressed_cn -> C", with the compressed node
+        # never appearing as a tree_edge_set child (the slot holds
+        # a skip pointer encoding the compressed path).  Detect
+        # this by looking for a cn whose parent pointer matches
+        # `lid`'s pointer and whose child pointer matches C's
+        # pointer — compare by ptr, not life_id, because lifetimes
+        # can be reborn after kills while the logical node (and
+        # its cn->child binding) persists.
+        parent_ptr = n['ptr']
         children = []
         for (p, kb), c in sorted(m.edges.items()):
             if p != lid:
                 continue
+            c_node = m.nodes.get(c)
+            c_ptr = c_node['ptr'] if c_node else None
+            interposed = None
+            for cn_lid, cn_info in m.cnodes.items():
+                if (cn_info.get('parent_ptr') == parent_ptr
+                        and cn_info.get('child_ptr') == c_ptr):
+                    interposed = cn_lid
+                    break
             children.append({
                 'key_byte': kb,
-                'child': node_to_json(c),
+                'child': node_to_json(interposed) if interposed
+                         is not None else node_to_json(c),
             })
         out['children'] = children
         return out
