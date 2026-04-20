@@ -41,9 +41,9 @@
 #include <urcu-call-rcu.h>
 
 #ifdef FT_ENABLE_TRACING
-#include "../../src/ft_tp.h"
+#include "../../src/cds_ft_tp.h"
 #define FT_TEST_TP(name, ...) \
-	lttng_ust_tracepoint(ft_tp, name, ##__VA_ARGS__)
+	lttng_ust_tracepoint(cds_ft, name, ##__VA_ARGS__)
 #else
 #define FT_TEST_TP(name, ...) do {} while (0)
 #endif
@@ -1241,7 +1241,7 @@ static void *inv_relational_reader(void *arg)
 #ifdef FT_ENABLE_TRACING
 				/*
 				 * Exit immediately so an LTTng trigger armed
-				 * on ft_tp:violation can snapshot and stop
+				 * on cds_ft:violation can snapshot and stop
 				 * the session with the ring-buffer tail
 				 * reflecting the failure context, without
 				 * additional mutations flooding the buffer.

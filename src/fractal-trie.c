@@ -27,8 +27,8 @@
 #include "fractal-trie-internal.h"
 
 #ifdef FT_ENABLE_TRACING
-#include "ft_tp.h"
-#define FT_TP(name, ...) lttng_ust_tracepoint(ft_tp, name, ##__VA_ARGS__)
+#include "cds_ft_tp.h"
+#define FT_TP(name, ...) lttng_ust_tracepoint(cds_ft, name, ##__VA_ARGS__)
 /*
  * Emit a tracepoint with a key byte-sequence payload (LTTng's
  * sequence_hex field).  When tracing is disabled, the arguments are
@@ -62,7 +62,7 @@
 /*
  * enum ft_tp_node_kind (node-kind identifiers) lives in
  * fractal-trie-internal.h so the C side and the LTTng enum in
- * src/ft_tp.h reference a single definition.  ft_tp_node_kind()
+ * src/cds_ft_tp.h reference a single definition.  ft_tp_node_kind()
  * below maps a tagged cds_ft_inode_flag pointer to one of those
  * values.
  */
@@ -1842,7 +1842,7 @@ unsigned int ft_collapsed_count(unsigned int nr_entries)
 /*
  * Map a tagged cds_ft_inode_flag pointer to a symbolic node-kind
  * value (enum ft_tp_node_kind, defined in fractal-trie-internal.h
- * and exposed as the LTTng enum ft_tp_node_kind in src/ft_tp.h).
+ * and exposed as the LTTng enum ft_tp_node_kind in src/cds_ft_tp.h).
  * Uses a single 16-entry compile-time dispatch table indexed by the
  * type-selecting bits of the pointer, so the runtime helper reduces
  * to a NULL/skip check plus one table load.
@@ -16212,6 +16212,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
 		ft_group->key_map.identity = true;
 	}
 	*result_ft_group = ft_group;
+	FT_TP(group_create, (const void *) ft_group);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -16219,6 +16220,7 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 {
 	if (uatomic_load(&ft_group->nr_ft_instances, CMM_RELAXED) != 0)
 		return CDS_FT_STATUS_BUSY_ERROR;
+	FT_TP(group_destroy, (const void *) ft_group);
 	cds_ft_free_all_arenas(ft_group);
 	pthread_mutex_destroy(&ft_group->arena_lock);
 	free(ft_group);
@@ -16274,6 +16276,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 
 	uatomic_inc(&ft_group->nr_ft_instances, CMM_RELAXED);
 	*result_ft = ft;
+	FT_TP(ft_create, (const void *) ft, (const void *) ft_group);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -16341,6 +16344,7 @@ void cds_ft_destroy(struct cds_ft *ft)
 {
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 
+	FT_TP(ft_destroy, (const void *) ft);
 	/* Free root node. No concurrent readers at this point. */
 	free_cds_ft_node(ft, ft_node_ptr(ft->root));
 	/* Wait for in-flight call_rcu free to complete. */
