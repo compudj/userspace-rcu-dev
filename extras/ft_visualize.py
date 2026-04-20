@@ -1148,12 +1148,47 @@ def emit_dot(m, out, ascii_mode=False):
         w(' -> '.join(f'"lvl_anchor_{l}"' for l in sorted_levels))
         w(';\n  edge [style=solid];\n')
 
-    # Precise structural edges.
+    # Precise structural edges.  dir=both surfaces the back-pointer
+    # that every internal child keeps to its parent (ft_meta->parent,
+    # cn_meta->parent, col_meta->parent), so one line represents both
+    # the forward slot pointer and the reverse back-pointer.
+    #
+    # Skip-mode edges are elided here and rendered further down as
+    # dashed-blue skip overlays instead: in skip mode the parent
+    # slot holds a skip pointer whose low bits point at cn->child,
+    # so the m.edges entry (p_life, kb) -> cn_child is physically a
+    # skip, not a direct structural edge.  Drawing it solid would
+    # double-render every skip as a long, level-spanning black arrow.
+    skip_edge_keys = set()
+    for cn_lid, cn_info in m.cnodes.items():
+        gp_ptr = cn_info.get('parent_ptr')
+        ch_ptr = cn_info.get('child_ptr')
+        if gp_ptr is None or ch_ptr is None:
+            continue
+        # This cn is interposed (skip mode) only when the parent's
+        # slot does NOT directly point at the cn itself; scan below
+        # uses cn_is_direct_child, mirror the same check here.
+        if any(cl == cn_lid for cl in m.edges.values()):
+            continue
+        # Compare by pointer, not life_id: cn_info's parent_life
+        # / child_life can refer to earlier lifetimes than the one
+        # m.edges currently holds after a rebirth.  The ptr is
+        # stable across rebirths and is what the DOT edge emits.
+        for (p_life, kb), c_life in m.edges.items():
+            p_node = m.nodes.get(p_life)
+            c_node = m.nodes.get(c_life)
+            if p_node is None or c_node is None:
+                continue
+            if p_node['ptr'] == gp_ptr and c_node['ptr'] == ch_ptr:
+                skip_edge_keys.add((p_life, kb))
     for (p_life, kb), c_life in sorted(m.edges.items()):
         if p_life not in m.nodes or c_life not in m.nodes:
             continue
+        if (p_life, kb) in skip_edge_keys:
+            continue
         w(f'  "n{p_life}" -> "n{c_life}" [color=black, penwidth=1.6, '
-          f'arrowsize=0.9, label="{_key_label(kb, ascii_mode)}"];\n')
+          f'arrowsize=0.9, dir=both, '
+          f'label="{_key_label(kb, ascii_mode)}"];\n')
 
     # Compressed: compressed -> child (precise descent, solid) plus
     # parent-of-compressed -> child (skip, dashed, skip-mode only).
@@ -1170,9 +1205,10 @@ def emit_dot(m, out, ascii_mode=False):
         ch = info.get('child_life')
         if ch is None or ch not in m.nodes or lid not in m.nodes:
             continue
-        # Precise.
+        # Precise.  dir=both mirrors the cn->child / child->cn
+        # (child's parent back-pointer points to cn in both modes).
         w(f'  "n{lid}" -> "n{ch}" [color=black, penwidth=1.4, '
-          f'arrowsize=0.9, label="path {info["len"]}B", '
+          f'arrowsize=0.9, dir=both, label="path {info["len"]}B", '
           f'fontcolor="#404040"];\n')
         cn_is_direct_child = any(c_life == lid
                                  for c_life in m.edges.values())
@@ -1181,7 +1217,15 @@ def emit_dot(m, out, ascii_mode=False):
         # Skip mode: recover the parent from cn_info (set_parent
         # seeds parent_life / parent_ptr when the slot holds a
         # skip pointer) or from edges whose child is cn->child.
+        # Prefer the current lifetime of cn_info['parent_ptr']
+        # over the life_id stored on cn_info, which can go stale
+        # across rebirths of the same address.
         skip_parents = set()
+        gp_ptr = info.get('parent_ptr')
+        if gp_ptr is not None:
+            cur = m.cur_life.get(gp_ptr)
+            if cur is not None and cur in m.nodes and cur != lid:
+                skip_parents.add(cur)
         gp = info.get('parent_life')
         if gp is not None and gp in m.nodes and gp != lid:
             skip_parents.add(gp)
@@ -1193,6 +1237,20 @@ def emit_dot(m, out, ascii_mode=False):
               f'penwidth=1.2, arrowsize=0.9, '
               f'label="skip {info["len"]}B", fontcolor="#2060a0", '
               f'constraint=false];\n')
+        # Back-pointer: in skip-compressed mode the parent slot
+        # holds a skip pointer (parent -> cn_child), so there is
+        # no forward parent -> cn pointer — the only parent link
+        # the cn carries is cn_meta->parent (child -> parent).
+        # Render it as a thin grey back-arrow with constraint=false
+        # so the cn doesn't visually look orphaned and the layout
+        # is not distorted.  In non-skip mode the parent's slot
+        # points at cn directly, so the back-arrow would duplicate
+        # the forward solid edge's information and is skipped.
+        for p_life in skip_parents:
+            w(f'  "n{lid}" -> "n{p_life}" [color="#808080", '
+              f'penwidth=0.8, arrowsize=0.7, style=solid, '
+              f'label="parent", fontcolor="#808080", '
+              f'constraint=false];\n')
 
     # Collapsed entries: collapsed -> child per live entry.
     for lid, info in m.cols.items():
@@ -1203,7 +1261,8 @@ def emit_dot(m, out, ascii_mode=False):
             if ch is None or ch not in m.nodes:
                 continue
             w(f'  "n{lid}" -> "n{ch}" [color=black, penwidth=1.3, '
-              f'arrowsize=0.9, label="[{idx}] +{len(e["suffix"])}B", '
+              f'arrowsize=0.9, dir=both, '
+              f'label="[{idx}] +{len(e["suffix"])}B", '
               f'fontcolor="#404040"];\n')
 
     w('}\n')
