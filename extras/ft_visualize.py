@@ -328,14 +328,89 @@ class Model:
         events that observe it at a different level (e.g. a
         traversal reporting the post-skip level of a compressed
         node) must not overwrite the true structural level.
+
+        When force=True and the level actually changes, propagate
+        the new level through descendants (edges, compressed
+        child, collapsed entries).  graft / graft_swap and
+        root_publish transplant an entire subtree to a new depth
+        without emitting per-edge tree_edge_set events for the
+        carried-over children, so the depth invariant must be
+        re-derived on the receiving side.
         """
         if lid is None or level is None or level < 0:
             return
         n = self.nodes.get(lid)
         if n is None:
             return
-        if force or n.get('level') is None:
+        prev = n.get('level')
+        if force or prev is None:
             n['level'] = level
+            if force and prev != level:
+                self._propagate_level(lid, set([lid]))
+
+    def _propagate_level(self, lid, visited):
+        """Push the current level of `lid` down to its descendants.
+
+        Called after a force-update changes a lifetime's level.
+        Respects skip-compressed interposition: an edge whose
+        (parent_ptr, child_ptr) matches a cn's (parent_ptr,
+        child_ptr) has that cn at parent_level+1 and the stored
+        child at parent_level+1+cn.len.
+        """
+        n = self.nodes.get(lid)
+        if n is None:
+            return
+        level = n.get('level')
+        if level is None:
+            return
+        parent_ptr = n['ptr']
+        for (p_life, _kb), c_life in list(self.edges.items()):
+            if p_life != lid or c_life in visited:
+                continue
+            c_node = self.nodes.get(c_life)
+            if c_node is None:
+                continue
+            interposed_cn_lid = None
+            interposed_len = 0
+            for cn_lid, cn_info in self.cnodes.items():
+                if (cn_info.get('parent_ptr') == parent_ptr
+                        and cn_info.get('child_ptr') == c_node['ptr']):
+                    interposed_cn_lid = cn_lid
+                    interposed_len = cn_info.get('len', 0)
+                    break
+            if interposed_cn_lid is not None:
+                cn_n = self.nodes.get(interposed_cn_lid)
+                if cn_n is not None and interposed_cn_lid not in visited:
+                    cn_n['level'] = level + 1
+                    visited.add(interposed_cn_lid)
+                visited.add(c_life)
+                c_node['level'] = level + 1 + interposed_len
+                self._propagate_level(c_life, visited)
+            else:
+                visited.add(c_life)
+                c_node['level'] = level + 1
+                self._propagate_level(c_life, visited)
+        cn_info = self.cnodes.get(lid)
+        if cn_info is not None:
+            child_life = cn_info.get('child_life')
+            if child_life is not None and child_life not in visited:
+                child_node = self.nodes.get(child_life)
+                if child_node is not None:
+                    visited.add(child_life)
+                    child_node['level'] = level + cn_info.get('len', 0)
+                    self._propagate_level(child_life, visited)
+        col_info = self.cols.get(lid)
+        if col_info is not None:
+            for e in col_info.get('entries', {}).values():
+                ch = e.get('child_life')
+                if ch is None or ch in visited:
+                    continue
+                ch_node = self.nodes.get(ch)
+                if ch_node is None:
+                    continue
+                visited.add(ch)
+                ch_node['level'] = level + 1
+                self._propagate_level(ch, visited)
 
 
 def consume_trace(args, m):
@@ -732,6 +807,18 @@ def consume_trace(args, m):
             new = int(pf['new_node'])
             if old and new:
                 old_life = m.cur_life.get(old)
+                # `new` is a freshly allocated node.  If the
+                # reconstructor still holds a prior lifetime at
+                # that address, the library must have freed it
+                # before allocating again — the trace does not
+                # carry an explicit free for every such release.
+                # Kill the stale lifetime so this recompact's
+                # carried-over edges are not wiped later by a
+                # parent-level-conflict check on the reborn node.
+                existing_new = m.cur_life.get(new)
+                if (existing_new is not None
+                        and existing_new != old_life):
+                    m.kill(new)
                 new_life = m.birth(new, ts)
                 if old_life is not None and new_life is not None:
                     # Outgoing edges: move from old_life to new_life
