@@ -14,5 +14,5 @@
 #ifdef FT_ENABLE_TRACING
 #define LTTNG_UST_TRACEPOINT_CREATE_PROBES
 #define LTTNG_UST_TRACEPOINT_DEFINE
-#include "ft_tp.h"
+#include "cds_ft_tp.h"
 #endif
