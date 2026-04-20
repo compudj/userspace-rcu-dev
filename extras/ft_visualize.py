@@ -511,7 +511,13 @@ def consume_trace(args, m):
                 # is a theoretical risk but has no observed trigger.
                 c_life = m.birth(child, ts, child_kind)
                 m.set_kind(c_life, child_kind)
-                m.set_level(c_life, parent_level + 1, force=True)
+                # With skip-compressed, the child's real depth is
+                # parent_level + 1 + skip_len: the slot at `key`
+                # holds a skip pointer whose skip_len bytes are
+                # absorbed by the virtual compressed node before
+                # the real child's level.
+                m.set_level(c_life,
+                    parent_level + 1 + child_skip_len, force=True)
                 # Slot replacement: rewire the edge to the new child.
                 # We deliberately do NOT kill the previous child's
                 # lifetime here — in graft / graft_swap, a slot
@@ -524,6 +530,77 @@ def consume_trace(args, m):
                 m.edges[(p_life, key_byte)] = c_life
             else:
                 m.edges.pop((p_life, key_byte), None)
+
+            # Skip-compressed: when the slot at (parent, key)
+            # carries a skip pointer (child_skip_len > 0), the
+            # compressed node referenced by the skip is attached
+            # to `parent` at `key_byte`.  The underlying child
+            # pointer is the compressed's cn->child (after mask).
+            # We don't know the compressed node's own pointer from
+            # tree_edge_set alone, but any cn whose child_ptr and
+            # path_len match this event's (raw_child, skip_len)
+            # is the one logically at this slot.  Seed its
+            # parent_ptr so model_to_json can interpose it without
+            # waiting for the re-publish compressed_publish (which
+            # fires only AFTER the auth snapshot in typical
+            # insert-then-dump sequences).
+            if child_skip_len:
+                for cn_lid, cn_info in m.cnodes.items():
+                    if (cn_info.get('len') == child_skip_len
+                            and cn_info.get('child_ptr') == child):
+                        cn_info['parent_ptr'] = parent
+                        cn_info['parent_life'] = p_life
+                        break
+
+        elif name == 'cds_ft:set_parent':
+            # Mirror ft_set_parent: the child's parent is recorded
+            # in the child's metadata.  For skip-compressed mode
+            # the event's `child` is a skip pointer whose high
+            # bits encode the compressed path length and whose low
+            # bits point at the compressed's cn->child (not at the
+            # compressed itself).  The library's ft_set_parent
+            # maps the skip pointer to the underlying compressed
+            # (via ft_skip_to_compressed) and stores `parent` in
+            # the cn's metadata.  We mirror that by reverse-
+            # looking up the cn: any cn whose child_ptr equals
+            # the masked pointer is the one whose parent is
+            # being set.  This seeds cn's parent_ptr/parent_life
+            # well before the late re-publish that would
+            # otherwise carry the same info.
+            child = int(pf['child'])
+            parent = int(pf['parent'])
+            if not child or not parent:
+                continue
+            # Only act when the child is either a known COMPRESSED
+            # lifetime (non-skip case) OR a skip pointer (high bits
+            # encode skip_len).  Plain internal/external children
+            # carry their own parent back-pointer and don't need
+            # cn-parent lookup.
+            raw_child = child & ((1 << 57) - 1)
+            has_skip = child != raw_child
+            target_cn = None
+            if has_skip:
+                # Skip pointer: find cn whose child_ptr == raw_child.
+                for cn_lid, cn_info in m.cnodes.items():
+                    if cn_info.get('child_ptr') == raw_child:
+                        target_cn = cn_lid
+                        break
+            else:
+                # Non-skip: cn directly if it's a known COMPRESSED.
+                c_life = m.cur_life.get(raw_child)
+                if c_life is not None and m.nodes.get(
+                        c_life, {}).get('kind') == 'COMPRESSED':
+                    target_cn = c_life
+            if target_cn is None:
+                continue
+            info = m.cnodes.get(target_cn)
+            if info is None:
+                continue
+            p_life = m.cur_life.get(parent)
+            if p_life is None:
+                p_life = m.birth(parent, ts)
+            info['parent_life'] = p_life
+            info['parent_ptr'] = parent
 
         elif name == 'cds_ft:compressed_publish':
             cn = int(pf['cn'])
