@@ -3630,17 +3630,14 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 		bool *_replace_old_ptr)
 {
 	uint8_t nr_child;
-	uint8_t *values, *nr_child_ptr;
+	uint8_t *values;
 	struct cds_ft_inode_flag **pointers;
 	unsigned int i, unused = 0;
 	bool replace_old_ptr = false;
 
 	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 
-	nr_child_ptr = &node->data[0];
-	dbg_printf("linear set nth: n %u, nr_child_ptr %p\n",
-		(unsigned int) n, nr_child_ptr);
-	nr_child = *nr_child_ptr & FT_LINEAR_NR_CHILD_MASK;
+	nr_child = ft_linear_node_get_nr_child(type, node);
 	assert(nr_child <= type->max_linear_child);
 
 	values = &node->data[1];
@@ -3685,15 +3682,11 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 		}
 		/*
 		 * Release on the pointer: values above happen-before the
-		 * reader's acquire on pointers[i].  The nr_child release
-		 * below is a second synchronization path for readers that
-		 * still bound their scan by nr_child; both are consistent.
+		 * reader's acquire on pointers[i].  Readers derive
+		 * nr_child from values[] via sentinel scan, so the
+		 * pointer release is the sole synchronization surface.
 		 */
 		rcu_assign_pointer(pointers[i], child_node_flag);
-		assert(nr_child + 1 <= FT_LINEAR_NR_CHILD_MASK);
-		uatomic_store(nr_child_ptr,
-			(uint8_t)(nr_child + 1),
-			CMM_RELEASE);
 	} else {
 		/* Replacing a NULL or external node pointer. */
 		rcu_assign_pointer(pointers[i], child_node_flag);
@@ -3701,7 +3694,7 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 	if (!replace_old_ptr)
 		metadata->nr_child++;
 	dbg_printf("linear set nth: %u child, metadata: %u child, for node %p\n",
-		(unsigned int) uatomic_load(nr_child_ptr, CMM_RELAXED),
+		(unsigned int) ft_linear_node_get_nr_child(type, node),
 		(unsigned int) metadata->nr_child,
 		node);
 	if (_replace_old_ptr)
@@ -3808,12 +3801,8 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		struct cds_ft_inode_flag *newptr)
 {
-	uint8_t *nr_child_ptr;
-
 	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
-
-	nr_child_ptr = &node->data[0];
-	assert((*nr_child_ptr & FT_LINEAR_NR_CHILD_MASK) <= type->max_linear_child);
+	assert(ft_linear_node_get_nr_child(type, node) <= type->max_linear_child);
 
 	if (ft_type_is_linear(type->type_class) && !newptr) {
 		assert(!metadata->fallback_removal_count);
@@ -3822,20 +3811,20 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 			return -EFBIG;
 		}
 	}
-	dbg_printf("linear replace ptr: nr_child_ptr %p\n", nr_child_ptr);
+	dbg_printf("linear replace ptr: node %p\n", node);
 	assert(*node_flag_ptr != NULL);
 	rcu_assign_pointer(*node_flag_ptr, newptr);
 	/*
-	 * Value and nr_child are never changed (would cause ABA issue).
-	 * Instead, we leave the pointer to NULL and recompact the node
-	 * once in a while. It is allowed to set a NULL pointer to a new
-	 * value without recompaction though.
-	 * Only update the metadata node accounting.
+	 * Value is never changed (would cause ABA issue).  Instead,
+	 * we leave the pointer to NULL and recompact the node once
+	 * in a while.  It is allowed to set a NULL pointer to a new
+	 * value without recompaction though.  Only update the
+	 * metadata node accounting.
 	 */
 	if (!newptr)
 		metadata->nr_child--;
 	dbg_printf("linear replace ptr: %u child, metadata: %u child, for node %p newptr %p\n",
-		(unsigned int) uatomic_load(nr_child_ptr, CMM_RELAXED),
+		(unsigned int) ft_linear_node_get_nr_child(type, node),
 		(unsigned int) metadata->nr_child,
 		node, newptr);
 	return 0;
