@@ -2565,14 +2565,38 @@ uint8_t *align_ptr_size(uint8_t *ptr)
  */
 #define FT_LINEAR_NR_CHILD_MASK		0x1F
 
+/*
+ * Derive nr_child by scanning values[] for the first sentinel.
+ *
+ * Padding and never-touched slots hold bytes equal to values[0]
+ * (maintained by the first-insert memset).  Real key positions
+ * i > 0 hold values distinct from values[0] (linear-node
+ * distinctness).  The first position i >= 1 where values[i]
+ * matches values[0] is therefore the count of slots that have
+ * been written at some point -- the "touched count" that used
+ * to live in data[0] low bits.
+ *
+ * Edge case: a fresh (never-inserted, calloc'd) node has
+ * values[0] = values[1] = 0, so derive returns 1 rather than
+ * 0.  Callers that specifically distinguish "empty" from
+ * "one-touched" must use ft_linear_node_is_empty(), which
+ * scans the pointer array for any non-NULL slot -- the
+ * read-side equivalent of "no live children".
+ */
 static inline_lookup
-uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type
-		__attribute__((unused)),
+uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
 		struct cds_ft_inode *node)
 {
-	/* load-acquire orders nr_child load before values and pointers */
-	return uatomic_load(&node->data[0], CMM_ACQUIRE)
-		& FT_LINEAR_NR_CHILD_MASK;
+	uint8_t *values = &node->data[1];
+	uint8_t v0 = uatomic_load(&values[0], CMM_RELAXED);
+	unsigned int max_lc = type->max_linear_child;
+	unsigned int i;
+
+	for (i = 1; i < max_lc; i++) {
+		if (uatomic_load(&values[i], CMM_RELAXED) == v0)
+			return (uint8_t)i;
+	}
+	return (uint8_t)max_lc;
 }
 
 /*
@@ -2588,6 +2612,29 @@ struct cds_ft_inode_flag **ft_linear_pointers(
 		FT_ALIGN(1 + type->max_linear_child, sizeof(void *));
 	return (struct cds_ft_inode_flag **)
 		((uint8_t *) node + byte_offset);
+}
+
+/*
+ * Read-side test for "this linear node has no live children" --
+ * scan the pointer array for any non-NULL slot.  Avoids depending
+ * on metadata->nr_child (write-side accounting) from the read
+ * side.  O(max_linear_child) pointer loads, which for the only
+ * expected caller (type[0] root empty-check) is one or three
+ * depending on the tier.
+ */
+static inline_lookup
+bool ft_linear_node_is_empty(const struct cds_ft_type *type,
+		struct cds_ft_inode *node)
+{
+	struct cds_ft_inode_flag **pointers = ft_linear_pointers(node, type);
+	unsigned int max_lc = type->max_linear_child;
+	unsigned int i;
+
+	for (i = 0; i < max_lc; i++) {
+		if (uatomic_load(&pointers[i], CMM_RELAXED) != NULL)
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -6381,7 +6428,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		const struct cds_ft_type *type = &ft_types[type_idx];
 
 		if (ft_type_is_linear(type->type_class) &&
-				ft_linear_node_get_nr_child(type, ft_node_ptr(node_flag)) == 0) {
+				ft_linear_node_is_empty(type, ft_node_ptr(node_flag))) {
 
 			/* A NIL key might still be stored directly in the root's metadata. */
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
@@ -14338,12 +14385,17 @@ bool cds_ft_empty(struct cds_ft *ft)
 	rmeta = cds_ft_item_to_metadata(root_node);
 
 	/*
-	 * As a root node special-case, only a type-0 linear node with
-	 * data[0] == 0 represents an empty node.
+	 * A linear root with no live children and no external node
+	 * represents an empty trie.  Use the pointer-array scan
+	 * (ft_linear_node_is_empty) rather than the derive-via-sentinel
+	 * nr_child: the latter over-reports "1" on a freshly-calloc'd
+	 * root where values[0] == values[1] == 0.  Going through the
+	 * pointer array is also read-side-safe (the metadata nr_child
+	 * counter is write-side accounting).
 	 */
 	if (!ft_type_is_linear(type->type_class))
 		return false;
-	if (ft_linear_node_get_nr_child(type, root_node) != 0)
+	if (!ft_linear_node_is_empty(type, root_node))
 		return false;
 	return !uatomic_load(&rmeta->external_nodes, CMM_RELAXED);
 }
