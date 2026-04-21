@@ -2714,9 +2714,11 @@ static inline void ft_maybe_prefetch(const void *ptr)
  */
 /* FT_SIMD/SWAR/WIDE_LINEAR_THRESHOLD defined near ft_types[]. */
 
-#if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-
-/* SWAR constants. */
+/*
+ * SWAR constants.  Pure bit-manipulation helpers below operate on
+ * a word that the caller has already loaded -- no unaligned-access
+ * dependency, so they live outside the UNALIGNED gate.
+ */
 #define L_ONES_A (-1UL / 255)
 #define L_HIGHS_A (L_ONES_A * 0x80)
 
@@ -2738,6 +2740,8 @@ unsigned int ft_swar_match_idx(unsigned long has_zero)
 	return (unsigned int)(__builtin_clzl(has_zero) >> 3);
 #endif
 }
+
+#if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
 
 /*
  * Scan values[0..nr_child) for byte @n, using word-at-a-time SWAR
@@ -2914,9 +2918,7 @@ found:
  * is gated off there; the generic type-parameterized scanner handles
  * that tier.
  */
-#if CAA_BITS_PER_LONG >= 64 \
-	&& defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS) \
-	&& defined(__SSE2__)
+#if CAA_BITS_PER_LONG >= 64 && defined(__SSE2__)
 #define FT_USE_SPECIALIZED_SCAN
 
 /*
@@ -3009,6 +3011,12 @@ struct cds_ft_inode_flag *ft_linear_scan_8(
 /*
  * scan_16: SSE2 16-byte cmpeq over values at &node->data[0].
  * Covers ptr_offset=16 types (type_index 3 on 64-bit tier-2).
+ *
+ * Uses an aligned load: the arena allocator places items at offsets
+ * that are multiples of the item size (item_len_order), so a
+ * ptr_offset=16 type lives in a 128-byte node that is 128-byte
+ * aligned -- more than enough for a 16-byte aligned load at
+ * &data[0].
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_16(
@@ -3018,7 +3026,7 @@ struct cds_ft_inode_flag *ft_linear_scan_16(
 {
 	uint8_t *values = &node->data[0];
 	__m128i target = _mm_set1_epi8((char) n);
-	__m128i chunk = _mm_loadu_si128((const __m128i *) values);
+	__m128i chunk = _mm_load_si128((const __m128i *) values);
 	unsigned int mask = (unsigned int) _mm_movemask_epi8(
 			_mm_cmpeq_epi8(chunk, target));
 	struct cds_ft_inode_flag **pointers;
@@ -3059,8 +3067,8 @@ struct cds_ft_inode_flag *ft_linear_scan_32(
 
 	{
 		__m128i target = _mm_set1_epi8((char) n);
-		__m128i lo = _mm_loadu_si128((const __m128i *) values);
-		__m128i hi = _mm_loadu_si128((const __m128i *) (values + 16));
+		__m128i lo = _mm_load_si128((const __m128i *) values);
+		__m128i hi = _mm_load_si128((const __m128i *) (values + 16));
 		unsigned int mask_lo = (unsigned int) _mm_movemask_epi8(
 				_mm_cmpeq_epi8(lo, target));
 		unsigned int mask_hi = (unsigned int) _mm_movemask_epi8(
