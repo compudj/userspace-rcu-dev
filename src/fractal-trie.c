@@ -2957,6 +2957,22 @@ struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type *
 {
 #if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
 #  if defined(__SSE2__)
+	/*
+	 * Types with max_linear_child <= sizeof(unsigned long) have a
+	 * values+padding region (ptr_offset) that fits in one SWAR
+	 * word.  A 16-byte SIMD load on those types would over-read
+	 * into the first pointer byte(s) and the pointer-dereference
+	 * path would need an explicit bound-check to stay within the
+	 * pointer array.  Use SWAR instead -- a single word covers
+	 * values+padding exactly, no over-read, no post-check
+	 * required on the match path.
+	 *
+	 * The branch is on a compile-time-constant type->max_linear_child
+	 * (from the per-type dispatcher's constant &ft_types[N]), so the
+	 * dead arm is pruned by the compiler.
+	 */
+	if (type->max_linear_child <= sizeof(unsigned long))
+		return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n);
 	return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n);
 #  else
 	return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n);
