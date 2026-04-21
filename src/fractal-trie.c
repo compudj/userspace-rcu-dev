@@ -3643,35 +3643,67 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 #ifdef FT_USE_SPECIALIZED_SCAN
 	/*
 	 * Per-type dispatch on type_index (no ft_types[] field load).
-	 * Ordered hottest-first: deep trie leaf nodes are overwhelmingly
-	 * type[0] (single-slot), so `caa_likely(type_index == 0)` picks
-	 * the shortest scan_1 path with a single predicted-taken branch.
 	 *
 	 * 64-bit tier-2 layout (validated at cds_ft_group_create time):
 	 *   0:  max_lc=1,  ptr_offset=8   -> scan_1 (bytewise)
 	 *   1:  max_lc=3,  ptr_offset=8   -> scan_3 (bytewise unrolled)
 	 *   2:  max_lc=7,  ptr_offset=8   -> scan_8 (SWAR)
 	 *   3:  max_lc=14, ptr_offset=16  -> scan_16 (SSE2)
-	 *   4:  max_lc=28, ptr_offset=32  -> scan_32 (AVX2/dual-SSE2)
+	 *   4:  max_lc=28, ptr_offset=32  -> scan_32 (dual-SSE2)
 	 *   5:  POOL_A (1D)               -> pool_scan_1d
 	 *   6:  POOL_B (2D)               -> pool_scan_2d
 	 *   7:  PIGEON                    -> pigeon
+	 *
+	 * Hybrid shape: caa_likely gate on the two most frequent linear
+	 * types, switch/jump-table on the rest.
+	 *
+	 * Measured distribution over bench_comprehensive
+	 * (u32d/u32s/u64d/u64s/dns/dict/paths, ~1.2B total dispatches):
+	 *   type_index  1 (scan_3)   46.4%  <-- dominant
+	 *   type_index  0 (scan_1)   21.6%
+	 *   type_index  2 (scan_8)   16.8%
+	 *   type_index  3 (scan_16)   9.5%
+	 *   type_index  7 (pigeon)    4.3%
+	 *   type_index  4 (scan_32)   1.2%
+	 *   type_index 5/6 (pools)   <0.2%
+	 *
+	 * Types 1 and 0 cover 68% of dispatches.  Short-circuiting them
+	 * with explicit predicted-not-taken branches keeps the hot path
+	 * to 1-2 branches, and lets the compiler emit a jump-table for
+	 * the remaining six cases.
+	 */
+	if (caa_likely(type_index == 1))
+		return ft_linear_scan_3(node, node_flag_ptr, n);
+	/*
+	 * Conditional on "not type 1", type 0 is the mode of the
+	 * remaining distribution (~40% of arrivals at this point).
+	 * caa_likely arranges scan_1 on the fall-through for better
+	 * icache locality; even when the runtime target isn't exactly
+	 * type 0, the layout cost is a single jump for the other paths.
 	 */
 	if (caa_likely(type_index == 0))
 		return ft_linear_scan_1(node, node_flag_ptr, n);
-	if (type_index == 1)
-		return ft_linear_scan_3(node, node_flag_ptr, n);
-	if (type_index == 2)
+	switch (type_index) {
+	case 2:
 		return ft_linear_scan_8(node, node_flag_ptr, n);
-	if (type_index == 3)
+	case 3:
 		return ft_linear_scan_16(node, node_flag_ptr, n);
-	if (type_index == 4)
+	case 4:
 		return ft_linear_scan_32(node, node_flag_ptr, n);
-	if (type_index == 5)
+	case 5:
 		return ft_pool_scan_1d(node, node_flag, node_flag_ptr, n);
-	if (type_index == 6)
+	case 6:
 		return ft_pool_scan_2d(node, node_flag, node_flag_ptr, n);
-	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n);
+	case 7:
+		return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n);
+	default:
+		/*
+		 * type_index is a 3-bit field masked from tag above, so
+		 * values outside 0..7 cannot occur.  Telling the compiler
+		 * lets it drop the switch-table bound check.
+		 */
+		__builtin_unreachable();
+	}
 #else
 	{
 	unsigned int bit = 1U << type_index;
