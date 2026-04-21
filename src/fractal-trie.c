@@ -3660,7 +3660,23 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 	if (i == nr_child) {
 		assert(pointers[i] == NULL);
 		uatomic_store(&pointers[i], child_node_flag, CMM_RELAXED);
-		uatomic_store(&values[nr_child], n, CMM_RELAXED);
+		if (nr_child == 0) {
+			/*
+			 * First insert: fill values[] and the alignment
+			 * padding with the first key.  values[0] is
+			 * invariant for the node's lifetime, so this
+			 * initialization holds forever.  Readers scanning
+			 * past nr_child hit bytes equal to values[0];
+			 * when target == values[0], ctz preempts at
+			 * position 0 (real match); when target !=
+			 * values[0], the padding cannot match.  Removes
+			 * the target-0 mispredict that happened when
+			 * padding defaulted to zero.
+			 */
+			memset(values, n, (uint8_t *)pointers - values);
+		} else {
+			uatomic_store(&values[nr_child], n, CMM_RELAXED);
+		}
 		/* store-release: write pointer and value before nr_child.
 		 * Preserve the ptr_offset high bits. */
 		uatomic_store(nr_child_ptr,
