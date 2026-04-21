@@ -3037,8 +3037,15 @@ struct cds_ft_inode_flag *ft_linear_scan_16(
 }
 
 /*
- * scan_32: AVX2 32-byte cmpeq if available, else dual SSE2.
+ * scan_32: dual SSE2 16-byte cmpeq, combined into a 32-bit mask.
  * Covers ptr_offset=32 types (type_index 4, POOL_A/B subnodes).
+ *
+ * We intentionally do not use the 32-byte AVX2 path: measurements on
+ * Zen4 showed it ~8% slower than dual SSE2 on u64d (no gain on any
+ * other workload).  The likely cause is AVX-SSE transition penalties
+ * when the rest of the dispatcher (scan_16, scan_8) stays on xmm --
+ * two pipelined 16-byte xmm loads match one ymm load in throughput
+ * without the transition cost.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_32(
@@ -3050,15 +3057,6 @@ struct cds_ft_inode_flag *ft_linear_scan_32(
 	struct cds_ft_inode_flag **pointers;
 	unsigned int mask, i;
 
-#if defined(__AVX2__)
-	{
-		__m256i target = _mm256_set1_epi8((char) n);
-		__m256i chunk = _mm256_loadu_si256((const __m256i *) values);
-
-		mask = (unsigned int) _mm256_movemask_epi8(
-				_mm256_cmpeq_epi8(chunk, target));
-	}
-#else
 	{
 		__m128i target = _mm_set1_epi8((char) n);
 		__m128i lo = _mm_loadu_si128((const __m128i *) values);
@@ -3070,7 +3068,6 @@ struct cds_ft_inode_flag *ft_linear_scan_32(
 
 		mask = mask_lo | (mask_hi << 16);
 	}
-#endif
 	if (!mask) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
