@@ -9529,17 +9529,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	unsigned long old_child_nr_keys;
 	int ret;
 
-	/*
-	 * Compute cn_parent_depth BEFORE building new nodes.
-	 * Building the suffix reparents cn->child, which breaks
-	 * ft_skip_to_compressed (used by ft_parent_depth_span)
-	 * for skip pointers that encode cn->child.
-	 */
 	unsigned int junction_depth = node_depth + diverge_pos;
-	struct cds_ft_inode_flag *cn_parent = cn_meta->parent;
-	unsigned int cn_parent_depth = cn_parent ?
-		node_depth - ft_parent_depth_span(cn_parent,
-			compressed_flag) : 0;
 
 	/* Compute old child's nr_keys for the new nodes. */
 	if (!ft_node_external(cn->child)) {
