@@ -2926,6 +2926,260 @@ found:
 #define FT_POOL_SIZE_ORDER	7
 #endif
 
+/*
+ * FT_USE_SPECIALIZED_SCAN: 64-bit tier-2 layout is power-of-two in
+ * ptr_offset per type_index:
+ *   type_index 0..2: ptr_offset=8   (SWAR 8-byte)
+ *   type_index 3:    ptr_offset=16  (SIMD 16-byte)
+ *   type_index 4:    ptr_offset=32  (SIMD 32-byte)
+ *   type_index 5..6: pool subnodes, ptr_offset=32 (SIMD 32-byte)
+ *   type_index 7:    pigeon (dense)
+ *
+ * Each scanner uses a compile-time-constant scan width equal to the
+ * ptr_offset.  Scanning the whole values+padding region is safe: real
+ * slots hold values distinct from values[0] (linear distinctness
+ * invariant), padding bytes all equal values[0] (first-insert memset
+ * or post-copy sweep), so a match at a padding byte can only occur
+ * when target == values[0] -- and ctz picks position 0 first because
+ * values[0] itself matches.  No post-check is needed.
+ *
+ * 32-bit tier has non-power-of-two ptr_offsets, so this optimization
+ * is gated off there; the generic type-parameterized scanner handles
+ * that tier.
+ */
+#if CAA_BITS_PER_LONG >= 64 \
+	&& defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS) \
+	&& defined(__SSE2__)
+#define FT_USE_SPECIALIZED_SCAN
+
+/*
+ * scan_1: bytewise scan for the single-slot type (type_index 0,
+ * max_linear_child=1 on 64-bit tier-2).  At one slot the SWAR
+ * dependency chain (imul / xor / sub / and / and / tzcnt / load)
+ * costs more than a single compare-and-load.  ptr_offset is 8.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_scan_1(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	uint8_t *values = &node->data[0];
+	struct cds_ft_inode_flag **pointers;
+
+	if (values[0] != n) {
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = NULL;
+		return NULL;
+	}
+	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 8);
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = &pointers[0];
+	return ft_dereference_acquire(pointers[0]);
+}
+
+/*
+ * scan_3: bytewise scan for the 3-slot type (type_index 1,
+ * max_linear_child=3 on 64-bit tier-2).  Three independent
+ * load+compare pairs pipeline in parallel and beat the SWAR
+ * dependency chain at this size.  ptr_offset is 8.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_scan_3(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	uint8_t *values = &node->data[0];
+	struct cds_ft_inode_flag **pointers;
+	unsigned int i;
+
+	for (i = 0; i < 3; i++) {
+		if (values[i] == n) {
+			pointers = (struct cds_ft_inode_flag **)
+					((uint8_t *) node + 8);
+			if (caa_unlikely(node_flag_ptr))
+				*node_flag_ptr = &pointers[i];
+			return ft_dereference_acquire(pointers[i]);
+		}
+	}
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+}
+
+/*
+ * scan_8: SWAR byteq over an 8-byte word at &node->data[0].
+ * Covers ptr_offset=8 types with max_linear_child > 3
+ * (type_index 2 on 64-bit tier-2).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_scan_8(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	uint8_t *values = &node->data[0];
+	unsigned long target_ones = (unsigned long) n * L_ONES_A;
+	unsigned long word, has_zero;
+	struct cds_ft_inode_flag **pointers;
+	unsigned int i;
+
+	__builtin_memcpy(&word, values, sizeof(unsigned long));
+	has_zero = ft_swar_byteq(word, target_ones);
+	if (!has_zero) {
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = NULL;
+		return NULL;
+	}
+	i = ft_swar_match_idx(has_zero);
+	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 8);
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = &pointers[i];
+	return ft_dereference_acquire(pointers[i]);
+}
+
+/*
+ * scan_16: SSE2 16-byte cmpeq over values at &node->data[0].
+ * Covers ptr_offset=16 types (type_index 3 on 64-bit tier-2).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_scan_16(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	uint8_t *values = &node->data[0];
+	__m128i target = _mm_set1_epi8((char) n);
+	__m128i chunk = _mm_loadu_si128((const __m128i *) values);
+	unsigned int mask = (unsigned int) _mm_movemask_epi8(
+			_mm_cmpeq_epi8(chunk, target));
+	struct cds_ft_inode_flag **pointers;
+	unsigned int i;
+
+	if (!mask) {
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = NULL;
+		return NULL;
+	}
+	i = (unsigned int) __builtin_ctz(mask);
+	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 16);
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = &pointers[i];
+	return ft_dereference_acquire(pointers[i]);
+}
+
+/*
+ * scan_32: AVX2 32-byte cmpeq if available, else dual SSE2.
+ * Covers ptr_offset=32 types (type_index 4, POOL_A/B subnodes).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_linear_scan_32(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	uint8_t *values = &node->data[0];
+	struct cds_ft_inode_flag **pointers;
+	unsigned int mask, i;
+
+#if defined(__AVX2__)
+	{
+		__m256i target = _mm256_set1_epi8((char) n);
+		__m256i chunk = _mm256_loadu_si256((const __m256i *) values);
+
+		mask = (unsigned int) _mm256_movemask_epi8(
+				_mm256_cmpeq_epi8(chunk, target));
+	}
+#else
+	{
+		__m128i target = _mm_set1_epi8((char) n);
+		__m128i lo = _mm_loadu_si128((const __m128i *) values);
+		__m128i hi = _mm_loadu_si128((const __m128i *) (values + 16));
+		unsigned int mask_lo = (unsigned int) _mm_movemask_epi8(
+				_mm_cmpeq_epi8(lo, target));
+		unsigned int mask_hi = (unsigned int) _mm_movemask_epi8(
+				_mm_cmpeq_epi8(hi, target));
+
+		mask = mask_lo | (mask_hi << 16);
+	}
+#endif
+	if (!mask) {
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = NULL;
+		return NULL;
+	}
+	i = (unsigned int) __builtin_ctz(mask);
+	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 32);
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = &pointers[i];
+	return ft_dereference_acquire(pointers[i]);
+}
+
+/*
+ * Pool dispatch: compute subnode offset from the node_flag-encoded
+ * bitsel / 2D index, then delegate to scan_32 (all pool subnodes
+ * have ptr_offset=32 on 64-bit).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_pool_scan_1d(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
+	unsigned long index = ((unsigned long) n >> bitsel) & 0x1;
+	struct cds_ft_inode *subnode = (struct cds_ft_inode *)
+			&node->data[index << FT_POOL_SIZE_ORDER];
+
+	return ft_linear_scan_32(subnode, node_flag_ptr, n);
+}
+
+static inline_lookup
+struct cds_ft_inode_flag *ft_pool_scan_2d(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	unsigned int C_n8_r2_index, subclass_index;
+	uint8_t bits[2];
+	struct cds_ft_inode *subnode;
+
+	ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
+	index_to_bits_C_n8_r2(C_n8_r2_index, bits);
+	subclass_index = value_and_bits_to_subclass_index(n, bits);
+	subnode = (struct cds_ft_inode *)
+			&node->data[subclass_index << FT_POOL_SIZE_ORDER];
+	return ft_linear_scan_32(subnode, node_flag_ptr, n);
+}
+
+/*
+ * Runtime validation of ft_types[] ptr_offset layout assumed by the
+ * specialized scanners.  Called from cds_ft_group_create at init.
+ * Not a static assert because ft_types[].max_linear_child is a
+ * struct member read, which gcc doesn't treat as an integer constant
+ * expression.
+ */
+static inline __attribute__((unused))
+void ft_specialized_scan_layout_assert(void)
+{
+	assert(FT_ALIGN(ft_types[0].max_linear_child, sizeof(void *)) == 8);
+	assert(FT_ALIGN(ft_types[1].max_linear_child, sizeof(void *)) == 8);
+	assert(FT_ALIGN(ft_types[2].max_linear_child, sizeof(void *)) == 8);
+	assert(FT_ALIGN(ft_types[3].max_linear_child, sizeof(void *)) == 16);
+	assert(FT_ALIGN(ft_types[4].max_linear_child, sizeof(void *)) == 32);
+	assert(FT_ALIGN(ft_types[FT_POOL_IDX_A].max_linear_child,
+				sizeof(void *)) == 32);
+	assert(FT_ALIGN(ft_types[FT_POOL_IDX_B].max_linear_child,
+				sizeof(void *)) == 32);
+	assert(FT_POOL_IDX_A == 5);
+	assert(FT_POOL_IDX_B == 6);
+	assert(ft_types[7].type_class == FT_PIGEON);
+}
+
+#endif /* FT_USE_SPECIALIZED_SCAN */
 
 /*
  * ft_linear_node_get_nth: bytewise scan for small linear nodes
@@ -3434,6 +3688,40 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 
 	node = ft_node_ptr(node_flag);
 	type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
+
+#ifdef FT_USE_SPECIALIZED_SCAN
+	/*
+	 * Per-type dispatch on type_index (no ft_types[] field load).
+	 * Ordered hottest-first: deep trie leaf nodes are overwhelmingly
+	 * type[0] (single-slot), so `caa_likely(type_index == 0)` picks
+	 * the shortest scan_1 path with a single predicted-taken branch.
+	 *
+	 * 64-bit tier-2 layout (validated at cds_ft_group_create time):
+	 *   0:  max_lc=1,  ptr_offset=8   -> scan_1 (bytewise)
+	 *   1:  max_lc=3,  ptr_offset=8   -> scan_3 (bytewise unrolled)
+	 *   2:  max_lc=7,  ptr_offset=8   -> scan_8 (SWAR)
+	 *   3:  max_lc=14, ptr_offset=16  -> scan_16 (SSE2)
+	 *   4:  max_lc=28, ptr_offset=32  -> scan_32 (AVX2/dual-SSE2)
+	 *   5:  POOL_A (1D)               -> pool_scan_1d
+	 *   6:  POOL_B (2D)               -> pool_scan_2d
+	 *   7:  PIGEON                    -> pigeon
+	 */
+	if (caa_likely(type_index == 0))
+		return ft_linear_scan_1(node, node_flag_ptr, n);
+	if (type_index == 1)
+		return ft_linear_scan_3(node, node_flag_ptr, n);
+	if (type_index == 2)
+		return ft_linear_scan_8(node, node_flag_ptr, n);
+	if (type_index == 3)
+		return ft_linear_scan_16(node, node_flag_ptr, n);
+	if (type_index == 4)
+		return ft_linear_scan_32(node, node_flag_ptr, n);
+	if (type_index == 5)
+		return ft_pool_scan_1d(node, node_flag, node_flag_ptr, n);
+	if (type_index == 6)
+		return ft_pool_scan_2d(node, node_flag, node_flag_ptr, n);
+	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n);
+#else
 	{
 	unsigned int bit = 1U << type_index;
 	/*
@@ -3458,6 +3746,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	}
 	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n);
 	}
+#endif
 }
 
 /*
@@ -16541,6 +16830,9 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
 	size_t key_len = CDS_FT_LEN_DEFAULT,
 	       max_key_len = FT_MAX_KEY_LEN;
 
+#ifdef FT_USE_SPECIALIZED_SCAN
+	ft_specialized_scan_layout_assert();
+#endif
 	if (attr) {
 		key_len = attr->key_len;
 		max_key_len = attr->max_key_len;
