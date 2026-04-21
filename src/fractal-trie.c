@@ -2914,6 +2914,20 @@ found:
 #endif /* FT_HAVE_EFFICIENT_UNALIGNED_ACCESS */
 
 /*
+ * Pool-shape specialized scanners for the lookup hot path.
+ * nr_pool_order and pool_size_order are encoded in the function
+ * identity rather than loaded from ft_types[]: nr_pool_order is
+ * implicit (_1d / _2d), and pool_size_order is identical across
+ * both pools in each tier (8 on 64-bit, 7 on 32-bit).
+ */
+#if CAA_BITS_PER_LONG >= 64
+#define FT_POOL_SIZE_ORDER	8
+#else
+#define FT_POOL_SIZE_ORDER	7
+#endif
+
+
+/*
  * ft_linear_node_get_nth: bytewise scan for small linear nodes
  * (FT_LINEAR, max_linear_child < threshold).
  */
@@ -3070,8 +3084,7 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 }
 
 static inline_lookup
-struct cds_ft_inode *ft_pool_get_linear_subnode(const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
+unsigned int ft_pool_subnode_index(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *node_flag,
 		uint8_t n)
 {
@@ -3079,23 +3092,31 @@ struct cds_ft_inode *ft_pool_get_linear_subnode(const struct cds_ft_type *type,
 	case 1:
 	{
 		unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
-		unsigned long index = ((unsigned long) n >> bitsel) & 0x1;
-		return (struct cds_ft_inode *) &node->data[index << type->pool_size_order];
+		return (unsigned int) (((unsigned long) n >> bitsel) & 0x1);
 	}
 	case 2:
 	{
-		unsigned int C_n8_r2_index, subclass_index;
+		unsigned int C_n8_r2_index;
 		uint8_t bits[2];
 
 		ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
 		index_to_bits_C_n8_r2(C_n8_r2_index, bits);
-		subclass_index = value_and_bits_to_subclass_index(n, bits);
-		return (struct cds_ft_inode *) &node->data[subclass_index << type->pool_size_order];
+		return value_and_bits_to_subclass_index(n, bits);
 	}
 	default:
 		assert(0);
-		return NULL;
+		return 0;
 	}
+}
+
+static inline_lookup
+struct cds_ft_inode *ft_pool_get_linear_subnode(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag,
+		uint8_t n)
+{
+	unsigned int index = ft_pool_subnode_index(type, node_flag, n);
+	return (struct cds_ft_inode *) &node->data[index << type->pool_size_order];
 }
 
 static inline_lookup
@@ -3110,21 +3131,9 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
 	return ft_linear_wide_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
-/*
- * Pool-shape specialized scanners for the lookup hot path.
- * nr_pool_order and pool_size_order are encoded in the function
- * identity rather than loaded from ft_types[]: nr_pool_order is
- * implicit (_1d / _2d), and pool_size_order is identical across
- * both pools in each tier (8 on 64-bit, 7 on 32-bit).
- */
-#if CAA_BITS_PER_LONG >= 64
-#define FT_POOL_SIZE_ORDER	8
-#else
-#define FT_POOL_SIZE_ORDER	7
-#endif
-
 static inline_lookup
 struct cds_ft_inode_flag *ft_pool_node_get_nth_1d(
+		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
@@ -3135,11 +3144,12 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth_1d(
 	struct cds_ft_inode *linear = (struct cds_ft_inode *)
 			&node->data[index << FT_POOL_SIZE_ORDER];
 
-	return ft_linear_wide_node_get_nth(NULL, linear, node_flag_ptr, n);
+	return ft_linear_wide_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
 static inline_lookup
 struct cds_ft_inode_flag *ft_pool_node_get_nth_2d(
+		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
@@ -3154,7 +3164,7 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth_2d(
 	subclass_index = value_and_bits_to_subclass_index(n, bits);
 	linear = (struct cds_ft_inode *)
 			&node->data[subclass_index << FT_POOL_SIZE_ORDER];
-	return ft_linear_wide_node_get_nth(NULL, linear, node_flag_ptr, n);
+	return ft_linear_wide_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
 static inline_lookup
@@ -3413,7 +3423,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 {
 	unsigned long tag = (unsigned long) node_flag & 0xF;
 	struct cds_ft_inode *node;
-	unsigned int type_index, bit;
+	unsigned int type_index;
 
 	/* External / compressed / collapsed: internal flag clear. */
 	if (caa_unlikely(!(tag & FT_INTERNAL_MASK))) {
@@ -3424,8 +3434,8 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 
 	node = ft_node_ptr(node_flag);
 	type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
-	bit = 1U << type_index;
-
+	{
+	unsigned int bit = 1U << type_index;
 	/*
 	 * Linear (bytewise scan) is the most common type in
 	 * byte-indexed tries — predicted-taken fast path.  Pool
@@ -3434,19 +3444,20 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 * ft_types[] field load on the pool path.
 	 */
 	if (caa_likely(bit & FT_MASK_LINEAR))
-		return ft_linear_node_get_nth(NULL, node,
+		return ft_linear_node_get_nth(&ft_types[type_index], node,
 				node_flag_ptr, n);
 	if (bit & FT_MASK_LINEAR_WIDE)
-		return ft_linear_wide_node_get_nth(NULL, node,
+		return ft_linear_wide_node_get_nth(&ft_types[type_index], node,
 				node_flag_ptr, n);
 	if (bit & FT_MASK_POOL) {
 		if (bit & (1U << FT_POOL_IDX_A))
-			return ft_pool_node_get_nth_1d(node, node_flag,
-					node_flag_ptr, n);
-		return ft_pool_node_get_nth_2d(node, node_flag,
-				node_flag_ptr, n);
+			return ft_pool_node_get_nth_1d(&ft_types[type_index],
+					node, node_flag, node_flag_ptr, n);
+		return ft_pool_node_get_nth_2d(&ft_types[type_index],
+				node, node_flag, node_flag_ptr, n);
 	}
 	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n);
+	}
 }
 
 /*
@@ -3643,7 +3654,8 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_metadata *metadata,
 		uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
-		bool *_replace_old_ptr)
+		bool *_replace_old_ptr,
+		bool is_init)
 {
 	uint8_t nr_child;
 	uint8_t *values;
@@ -3653,11 +3665,39 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 
 	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 
+	values = &node->data[0];
+	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
+
+	/*
+	 * is_init: caller guarantees this is the first set_nth on a
+	 * freshly-allocated (unpublished) (sub)node.  No concurrent
+	 * readers can observe the node yet, so the bulk memset and
+	 * pointer store are race-free -- no release needed.  The
+	 * publication of this node to its parent (rcu_assign_pointer
+	 * on the parent slot) provides the single release barrier
+	 * that makes all these stores visible to readers.  Establishes
+	 * the padding = values[0] = n invariant; slot 0 is adopted for
+	 * the first inserted byte.
+	 */
+	if (is_init) {
+		assert(pointers[0] == NULL);
+		memset(values, n, (uint8_t *)pointers - values);
+		pointers[0] = child_node_flag;
+		metadata->nr_child++;
+		if (_replace_old_ptr)
+			*_replace_old_ptr = false;
+		return 0;
+	}
+
+	/*
+	 * Non-init path: node is touched (post-init or post-recompact).
+	 * Derive slot count (monotonic, grows on append, never shrinks
+	 * on delete) from the sentinel scan.  metadata->nr_child (live
+	 * count) diverges from slot count after deletes.
+	 */
 	nr_child = ft_linear_node_get_nr_child(type, node);
 	assert(nr_child <= type->max_linear_child);
 
-	values = &node->data[0];
-	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
 	/* Check if node value is already populated */
 	for (i = 0; i < nr_child; i++) {
 		if (values[i] == n) {
@@ -3679,23 +3719,7 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 	/* If we expanded the nr_child, increment it */
 	if (i == nr_child) {
 		assert(pointers[i] == NULL);
-		if (nr_child == 0) {
-			/*
-			 * First insert: fill values[] and the alignment
-			 * padding with the first key.  values[0] is
-			 * invariant for the node's lifetime, so this
-			 * initialization holds forever.  Readers scanning
-			 * past nr_child hit bytes equal to values[0];
-			 * when target == values[0], ctz preempts at
-			 * position 0 (real match); when target !=
-			 * values[0], the padding cannot match.  Removes
-			 * the target-0 mispredict that happened when
-			 * padding defaulted to zero.
-			 */
-			memset(values, n, (uint8_t *)pointers - values);
-		} else {
-			uatomic_store(&values[nr_child], n, CMM_RELAXED);
-		}
+		uatomic_store(&values[nr_child], n, CMM_RELAXED);
 		/*
 		 * Release on the pointer: values above happen-before the
 		 * reader's acquire on pointers[i].  Readers derive
@@ -3724,13 +3748,14 @@ int ft_pool_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		uint8_t n,
-		struct cds_ft_inode_flag *child_node_flag)
+		struct cds_ft_inode_flag *child_node_flag,
+		bool is_init)
 {
 	struct cds_ft_inode *linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
 	bool replace_old_ptr = false;
 	int ret;
 
-	ret = ft_linear_node_set_nth(type, linear, metadata, n, child_node_flag, &replace_old_ptr);
+	ret = ft_linear_node_set_nth(type, linear, metadata, n, child_node_flag, &replace_old_ptr, is_init);
 #ifdef FEATURE_USE_BITMAP_SCAN
 	if (ret == 0 && !replace_old_ptr && type->bitmap) {
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
@@ -3772,6 +3797,11 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
 /*
  * _ft_node_set_nth: set nth item within a node. Return an error
  * (negative error value) if it is already there.
+ *
+ * @is_init: caller guarantees this is the first set_nth on a
+ * freshly-allocated unpublished (sub)node.  Used by recompact to
+ * adopt the first inserted byte as values[0].  Ignored for
+ * FT_PIGEON (dense 256-slot array, no reserved slot).
  */
 static
 int _ft_node_set_nth(const struct cds_ft_type *type,
@@ -3779,17 +3809,18 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		uint8_t n,
-		struct cds_ft_inode_flag *child_node_flag)
+		struct cds_ft_inode_flag *child_node_flag,
+		bool is_init)
 {
 	int ret;
 
 	switch (type->type_class) {
 	case FT_LINEAR:
 	case FT_LINEAR_WIDE:
-		ret = ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL);
+		ret = ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL, is_init);
 		break;
 	case FT_POOL:
-		ret = ft_pool_node_set_nth(type, node, node_flag, metadata, n, child_node_flag);
+		ret = ft_pool_node_set_nth(type, node, node_flag, metadata, n, child_node_flag, is_init);
 		break;
 	case FT_PIGEON:
 		ret = ft_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
@@ -4347,6 +4378,17 @@ int ft_node_recompact(enum ft_recompact mode,
 	struct cds_ft_inode_flag *new_node_flag = NULL;
 	int ret;
 	int fallback = 0;
+	/*
+	 * Track which (sub)nodes within new_node have received their
+	 * first child via is_init=true.  For FT_LINEAR/FT_LINEAR_WIDE:
+	 * `new_linear_init_done` is the single flag.  For FT_POOL:
+	 * `new_pool_init_done` is a bitmap indexed by subnode index
+	 * (at most 4 subnodes on current tiers, uint32_t is generous).
+	 * Subnodes not touched during copy are pre-initialized in a
+	 * post-copy sweep with the lowest byte routing to them.
+	 */
+	bool new_linear_init_done = false;
+	uint32_t new_pool_init_done = 0;
 
 	/*
 	 * Need to find nearest type index even for ADD_SAME, because
@@ -4467,6 +4509,34 @@ retry:		/* for fallback */
 	if (new_type_index == NODE_INDEX_NULL)
 		goto skip_copy;
 
+/*
+ * Derive is_init for a set_nth call into the freshly-allocated
+ * new_node / pool subnode.  Updates init-done state so the next
+ * call for the same (sub)node returns false.
+ */
+#define RECOMPACT_IS_INIT(byte_value) ({				\
+	bool __is_init = false;						\
+	switch (new_type->type_class) {					\
+	case FT_LINEAR:							\
+	case FT_LINEAR_WIDE:						\
+		__is_init = !new_linear_init_done;			\
+		new_linear_init_done = true;				\
+		break;							\
+	case FT_POOL:							\
+	{								\
+		unsigned int __idx = ft_pool_subnode_index(new_type,	\
+			new_node_flag, (byte_value));			\
+		uint32_t __bit = 1U << __idx;				\
+		__is_init = !(new_pool_init_done & __bit);		\
+		new_pool_init_done |= __bit;				\
+		break;							\
+	}								\
+	default:							\
+		break;  /* FT_PIGEON, FT_NULL: is_init irrelevant */	\
+	}								\
+	__is_init;							\
+})
+
 	switch (old_type->type_class) {
 	case FT_LINEAR:
 	case FT_LINEAR_WIDE:
@@ -4485,7 +4555,7 @@ retry:		/* for fallback */
 			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
 				continue;
 			ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
-					new_metadata, v, iter);
+					new_metadata, v, iter, RECOMPACT_IS_INIT(v));
 			if (new_type->type_class == FT_POOL && ret) {
 				goto fallback_toosmall;
 			}
@@ -4516,7 +4586,7 @@ retry:		/* for fallback */
 				if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
 					continue;
 				ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
-						new_metadata, v, iter);
+						new_metadata, v, iter, RECOMPACT_IS_INIT(v));
 				if (new_type->type_class == FT_POOL
 						&& ret) {
 					goto fallback_toosmall;
@@ -4543,7 +4613,7 @@ retry:		/* for fallback */
 			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
 				continue;
 			ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
-					new_metadata, i, iter);
+					new_metadata, i, iter, RECOMPACT_IS_INIT((uint8_t)i));
 			if (new_type->type_class == FT_POOL && ret) {
 				goto fallback_toosmall;
 			}
@@ -4561,12 +4631,53 @@ skip_copy:
 	if (mode == FT_RECOMPACT_ADD_NEXT || mode == FT_RECOMPACT_ADD_SAME) {
 		/* add node */
 		ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
-				new_metadata, n, child_node_flag);
+				new_metadata, n, child_node_flag,
+				RECOMPACT_IS_INIT(n));
 		if (new_type->type_class == FT_POOL && ret) {
 			goto fallback_toosmall;
 		}
 		assert(!ret);
 	}
+
+	/*
+	 * Post-copy sweep: for FT_POOL new_type, pre-initialize any
+	 * subnode that received no children during the copy.  Readers
+	 * must not observe an unpublished subnode in zero-init state --
+	 * the sentinel scan would return a phantom slot count (see
+	 * ft_linear_node_get_direction's nr_child >= min_child assert).
+	 * Iterating 0..255 in order gives the lowest byte routing to
+	 * each still-untouched subnode, which becomes that subnode's
+	 * reserved values[0].
+	 */
+	if (new_type_index != NODE_INDEX_NULL
+			&& new_type->type_class == FT_POOL) {
+		unsigned int nr_subnodes = 1U << new_type->nr_pool_order;
+		unsigned int n_byte;
+
+		for (n_byte = 0; n_byte < 256; n_byte++) {
+			unsigned int idx = ft_pool_subnode_index(
+					new_type, new_node_flag, (uint8_t)n_byte);
+			uint32_t bit = 1U << idx;
+			struct cds_ft_inode *subnode;
+			uint8_t *values;
+			struct cds_ft_inode_flag **pointers;
+
+			if (new_pool_init_done & bit)
+				continue;
+			subnode = ft_pool_get_linear_subnode(new_type,
+					new_node, new_node_flag, (uint8_t)n_byte);
+			values = &subnode->data[0];
+			pointers = (struct cds_ft_inode_flag **)
+				align_ptr_size(&values[new_type->max_linear_child]);
+			memset(values, (uint8_t)n_byte,
+				(uint8_t *)pointers - values);
+			new_pool_init_done |= bit;
+			if (__builtin_popcount(new_pool_init_done) == (int)nr_subnodes)
+				break;
+		}
+	}
+
+#undef RECOMPACT_IS_INIT
 
 	if (fallback) {
 		dbg_printf("Using fallback for %u children, node type index: %u, mode %s\n",
@@ -4868,7 +4979,14 @@ int ft_node_set_nth(struct cds_ft *ft,
 	node = ft_node_ptr(*node_flag);
 	type_index = ft_node_type(*node_flag);
 	type = &ft_types[type_index];
-	ret = _ft_node_set_nth(type, node, *node_flag, metadata, n, child_node_flag);
+	/*
+	 * Top-level entry: target node is always a published internal
+	 * node (descent end-point or compressed-split destination),
+	 * never a freshly-allocated unpublished node.  Pass is_init =
+	 * false; fresh-init cases funnel here via -ENOSPC / -ERANGE to
+	 * ft_node_recompact, which uses is_init internally.
+	 */
+	ret = _ft_node_set_nth(type, node, *node_flag, metadata, n, child_node_flag, false);
 	switch (ret) {
 	case -ENOSPC:
 		/* Not enough space in node, need to recompact to next type. */
