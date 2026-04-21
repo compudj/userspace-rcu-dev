@@ -3630,7 +3630,6 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 	/* If we expanded the nr_child, increment it */
 	if (i == nr_child) {
 		assert(pointers[i] == NULL);
-		uatomic_store(&pointers[i], child_node_flag, CMM_RELAXED);
 		if (nr_child == 0) {
 			/*
 			 * First insert: fill values[] and the alignment
@@ -3648,7 +3647,13 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 		} else {
 			uatomic_store(&values[nr_child], n, CMM_RELAXED);
 		}
-		/* store-release: write pointer and value before nr_child. */
+		/*
+		 * Release on the pointer: values above happen-before the
+		 * reader's acquire on pointers[i].  The nr_child release
+		 * below is a second synchronization path for readers that
+		 * still bound their scan by nr_child; both are consistent.
+		 */
+		rcu_assign_pointer(pointers[i], child_node_flag);
 		assert(nr_child + 1 <= FT_LINEAR_NR_CHILD_MASK);
 		uatomic_store(nr_child_ptr,
 			(uint8_t)(nr_child + 1),
