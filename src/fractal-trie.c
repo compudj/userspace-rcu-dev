@@ -115,29 +115,27 @@ struct cds_ft_attr {
 };
 
 enum cds_ft_type_class {
-	FT_LINEAR = 0,		/* Small linear: bytewise scan */
-	FT_LINEAR_WIDE = 1,	/* Large linear: SWAR or SIMD scan */
+	FT_LINEAR = 0,		/* Linear: per-type specialized scan */
 	FT_POOL = 2,		/* Pool: 1D/2D subnode dispatch */
 	FT_PIGEON = 3,		/* Pigeon: direct indexed */
 	/* Leaf nodes are implicit from their height in the tree */
-	FT_NR_TYPES,
+	FT_NR_TYPES = 4,
 
 	FT_NULL,	/* not an encoded type, but keeps code regular */
 };
 
-#define ft_type_is_linear(tc)	((tc) == FT_LINEAR || (tc) == FT_LINEAR_WIDE)
+#define ft_type_is_linear(tc)	((tc) == FT_LINEAR)
 
 /*
  * FT_HAVE_EFFICIENT_UNALIGNED_ACCESS: architectures where unaligned
  * loads that stay within a single cacheline have no measurable
  * overhead vs aligned loads.  Required for the SIMD/SWAR linear
- * node scans, which read the key array starting at node->data[1]
- * (not pointer-aligned).  Nodes are aligned to their size (>=64),
- * so a 16- or 32-byte scan at data+1 stays within one cacheline by
- * construction.
+ * node scans that load the values+padding region as one word.
+ * Nodes are aligned to their size (>=64), so 16- or 32-byte scans
+ * stay within one cacheline by construction.
  *
- * On strict-alignment architectures, FT_LINEAR_WIDE is disabled and
- * all linear nodes fall back to the bytewise scan.
+ * On strict-alignment architectures, all linear nodes fall back to
+ * the bytewise scan.
  */
 #if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) \
 	|| (defined(__powerpc64__) && defined(__LITTLE_ENDIAN__))
@@ -145,35 +143,12 @@ enum cds_ft_type_class {
 #endif
 
 /*
- * FT_WIDE_LINEAR_THRESHOLD: max_linear_child threshold for
- * FT_LINEAR_WIDE.  Used to assign type_class in ft_types[].
+ * Display-only threshold used by internal_type_name()/tracepoint
+ * labels to classify a linear type as "narrow" or "wide" in JSON
+ * output.  Not consulted by the scanner dispatch (which is purely
+ * per type_index).
  */
-#ifndef FT_SIMD_LINEAR_THRESHOLD
-#define FT_SIMD_LINEAR_THRESHOLD	7
-#endif
-#ifndef FT_SWAR_LINEAR_THRESHOLD
-#define FT_SWAR_LINEAR_THRESHOLD	14
-#endif
-#if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-#  if defined(__SSE2__)
-#    define FT_WIDE_LINEAR_THRESHOLD	FT_SIMD_LINEAR_THRESHOLD
-#  else
-#    define FT_WIDE_LINEAR_THRESHOLD	FT_SWAR_LINEAR_THRESHOLD
-#  endif
-#else
-/*
- * max_linear_child <= 31 (FT_LINEAR_NR_CHILD_MASK), so threshold 32
- * forces FT_LINEAR_CLASS() to always pick FT_LINEAR (bytewise scan).
- */
-#  define FT_WIDE_LINEAR_THRESHOLD	32
-#endif
-
-/*
- * Macro to select FT_LINEAR or FT_LINEAR_WIDE based on the
- * type's max_linear_child at compile time.
- */
-#define FT_LINEAR_CLASS(mlc) \
-	((mlc) >= FT_WIDE_LINEAR_THRESHOLD ? FT_LINEAR_WIDE : FT_LINEAR)
+#define FT_WIDE_LINEAR_DISPLAY_THRESHOLD	7
 
 struct cds_ft_type {
 	enum cds_ft_type_class type_class;
@@ -239,10 +214,10 @@ enum {
 };
 
 const struct cds_ft_type ft_types[] = {
-	[0] = { .type_class = FT_LINEAR_CLASS(ft_type_0_max_linear_child), .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
-	[1] = { .type_class = FT_LINEAR_CLASS(ft_type_1_max_linear_child), .min_child = 3, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP },
-	[2] = { .type_class = FT_LINEAR_CLASS(ft_type_2_max_linear_child), .min_child = 4, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP },
-	[3] = { .type_class = FT_LINEAR_CLASS(ft_type_3_max_linear_child), .min_child = 10, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP },
+	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
+	[1] = { .type_class = FT_LINEAR, .min_child = 3, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP },
+	[2] = { .type_class = FT_LINEAR, .min_child = 4, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP },
+	[3] = { .type_class = FT_LINEAR, .min_child = 10, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP },
 
 	/* Pools may fill sooner than max_child */
 	/* This pool is hardcoded at index 4. See ft_node_ptr(). */
@@ -288,11 +263,11 @@ enum {
 };
 
 const struct cds_ft_type ft_types[] = {
-	[0] = { .type_class = FT_LINEAR_CLASS(ft_type_0_max_linear_child), .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
-	[1] = { .type_class = FT_LINEAR_CLASS(ft_type_1_max_linear_child), .min_child = 1, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP },
-	[2] = { .type_class = FT_LINEAR_CLASS(ft_type_2_max_linear_child), .min_child = 3, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP },
-	[3] = { .type_class = FT_LINEAR_CLASS(ft_type_3_max_linear_child), .min_child = 5, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP },
-	[4] = { .type_class = FT_LINEAR_CLASS(ft_type_4_max_linear_child), .min_child = 10, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_linear_child, .order = 8, .bitmap = FT_NO_BITMAP },
+	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
+	[1] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP },
+	[2] = { .type_class = FT_LINEAR, .min_child = 3, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP },
+	[3] = { .type_class = FT_LINEAR, .min_child = 5, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP },
+	[4] = { .type_class = FT_LINEAR, .min_child = 10, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_linear_child, .order = 8, .bitmap = FT_NO_BITMAP },
 
 	/* Pools may fill sooner than max_child. */
 	/* This pool is hardcoded at index 5. See ft_node_ptr(). */
@@ -1937,7 +1912,7 @@ unsigned int ft_collapsed_count(unsigned int nr_entries)
 	(ord) == 8 ? FT_TP_NODE_LINEAR_WIDE_256 :		\
 	FT_TP_NODE_UNKNOWN)
 #define FT_TP_KIND_LINEAR(mlc, ord)				\
-	(FT_LINEAR_CLASS(mlc) == FT_LINEAR_WIDE			\
+	((mlc) >= FT_WIDE_LINEAR_DISPLAY_THRESHOLD		\
 		? _FT_TP_KIND_LINEAR_WIDE(ord)			\
 		: _FT_TP_KIND_LINEAR_NARROW(ord))
 #define FT_TP_KIND_POOL(npo, ord) (				\
@@ -2558,14 +2533,6 @@ uint8_t *align_ptr_size(uint8_t *ptr)
 }
 
 /*
- * Linear node data[0] encoding: nr_child (0..max_linear_child <= 31).
- * The pointer-array offset is derived from type->max_linear_child at
- * scanner call sites, which fold it to a literal via the compile-time
- * constant &ft_types[N] passed by the dispatcher.
- */
-#define FT_LINEAR_NR_CHILD_MASK		0x1F
-
-/*
  * Derive nr_child by scanning values[] for the first sentinel.
  *
  * Padding and never-touched slots hold bytes equal to values[0]
@@ -3182,8 +3149,13 @@ void ft_specialized_scan_layout_assert(void)
 #endif /* FT_USE_SPECIALIZED_SCAN */
 
 /*
- * ft_linear_node_get_nth: bytewise scan for small linear nodes
- * (FT_LINEAR, max_linear_child < threshold).
+ * Generic linear node scanner used by the non-specialized dispatch
+ * fallback (32-bit, strict-alignment architectures, or when
+ * FT_USE_SPECIALIZED_SCAN is unavailable) and by the pool subnode
+ * dispatch.  Switches between bytewise, SWAR, and SIMD based on
+ * max_linear_child; the branch is on a compile-time-constant
+ * type->max_linear_child from the dispatcher's &ft_types[N], so the
+ * compiler prunes the dead arm at each call site.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
@@ -3191,66 +3163,41 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	uint8_t *values = &node->data[0];
-	const unsigned int max_lc = type->max_linear_child;
-	unsigned int i;
-
-	for (i = 0; i < max_lc; i++) {
-		if (uatomic_load(&values[i], CMM_RELAXED) == n)
-			break;
-	}
-	if (i >= max_lc) {
-		if (caa_unlikely(node_flag_ptr))
-			*node_flag_ptr = NULL;
-		return NULL;
-	}
-	{
-		struct cds_ft_inode_flag **pointers =
-			ft_linear_pointers(node, type);
-		if (caa_unlikely(node_flag_ptr))
-			*node_flag_ptr = &pointers[i];
-		return ft_dereference_acquire(pointers[i]);
-	}
-}
-
-/*
- * ft_linear_wide_node_get_nth: SWAR or SIMD scan for large linear
- * nodes (FT_LINEAR_WIDE, max_linear_child >= threshold).
- */
-static inline_lookup
-struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type *type __attribute__((unused)),
-		struct cds_ft_inode *node __attribute__((unused)),
-		struct cds_ft_inode_flag ***node_flag_ptr __attribute__((unused)),
-		uint8_t n __attribute__((unused)))
-{
-#if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-#  if defined(__SSE2__)
+#if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS) && defined(__SSE2__)
 	/*
 	 * Types with max_linear_child <= sizeof(unsigned long) have a
 	 * values+padding region (ptr_offset) that fits in one SWAR
-	 * word.  A 16-byte SIMD load on those types would over-read
-	 * into the first pointer byte(s) and the pointer-dereference
-	 * path would need an explicit bound-check to stay within the
-	 * pointer array.  Use SWAR instead -- a single word covers
-	 * values+padding exactly, no over-read, no post-check
-	 * required on the match path.
-	 *
-	 * The branch is on a compile-time-constant type->max_linear_child
-	 * (from the per-type dispatcher's constant &ft_types[N]), so the
-	 * dead arm is pruned by the compiler.
+	 * word; a 16-byte SIMD load would over-read into the pointer
+	 * array.  SWAR handles them; SIMD handles the rest.
 	 */
 	if (type->max_linear_child <= sizeof(unsigned long))
 		return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n);
 	return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n);
-#  else
+#elif defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
 	return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n);
-#  endif
 #else
-	/*
-	 * Unreachable: on strict-alignment archs FT_WIDE_LINEAR_THRESHOLD=32
-	 * prevents any type from being classified as FT_LINEAR_WIDE.
-	 */
-	abort();
+	{
+		uint8_t *values = &node->data[0];
+		const unsigned int max_lc = type->max_linear_child;
+		unsigned int i;
+
+		for (i = 0; i < max_lc; i++) {
+			if (uatomic_load(&values[i], CMM_RELAXED) == n)
+				break;
+		}
+		if (i >= max_lc) {
+			if (caa_unlikely(node_flag_ptr))
+				*node_flag_ptr = NULL;
+			return NULL;
+		}
+		{
+			struct cds_ft_inode_flag **pointers =
+				ft_linear_pointers(node, type);
+			if (caa_unlikely(node_flag_ptr))
+				*node_flag_ptr = &pointers[i];
+			return ft_dereference_acquire(pointers[i]);
+		}
+	}
 #endif
 }
 
@@ -3382,7 +3329,7 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
 {
 	struct cds_ft_inode *linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
 	/* Pool subnodes are always large enough for wide scan. */
-	return ft_linear_wide_node_get_nth(type, linear, node_flag_ptr, n);
+	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
 static inline_lookup
@@ -3398,7 +3345,7 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth_1d(
 	struct cds_ft_inode *linear = (struct cds_ft_inode *)
 			&node->data[index << FT_POOL_SIZE_ORDER];
 
-	return ft_linear_wide_node_get_nth(type, linear, node_flag_ptr, n);
+	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
 static inline_lookup
@@ -3418,7 +3365,7 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth_2d(
 	subclass_index = value_and_bits_to_subclass_index(n, bits);
 	linear = (struct cds_ft_inode *)
 			&node->data[subclass_index << FT_POOL_SIZE_ORDER];
-	return ft_linear_wide_node_get_nth(type, linear, node_flag_ptr, n);
+	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
 static inline_lookup
@@ -3640,7 +3587,6 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
 #endif
 
 #define FT_MASK_LINEAR      FT_MASK_CLASS(FT_LINEAR)
-#define FT_MASK_LINEAR_WIDE FT_MASK_CLASS(FT_LINEAR_WIDE)
 #define FT_MASK_POOL        FT_MASK_CLASS(FT_POOL)
 
 /*
@@ -3734,9 +3680,6 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	if (caa_likely(bit & FT_MASK_LINEAR))
 		return ft_linear_node_get_nth(&ft_types[type_index], node,
 				node_flag_ptr, n);
-	if (bit & FT_MASK_LINEAR_WIDE)
-		return ft_linear_wide_node_get_nth(&ft_types[type_index], node,
-				node_flag_ptr, n);
 	if (bit & FT_MASK_POOL) {
 		if (bit & (1U << FT_POOL_IDX_A))
 			return ft_pool_node_get_nth_1d(&ft_types[type_index],
@@ -3794,7 +3737,6 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 
 	switch (type->type_class) {
 	case FT_LINEAR:
-	case FT_LINEAR_WIDE:
 	{
 		uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
 		unsigned int i;
@@ -3888,7 +3830,6 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 
 	switch (type->type_class) {
 	case FT_LINEAR:
-	case FT_LINEAR_WIDE:
 		child = ft_linear_node_get_direction(type, node, n, result_key, dir);
 		break;
 	case FT_POOL:
@@ -4105,7 +4046,6 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 
 	switch (type->type_class) {
 	case FT_LINEAR:
-	case FT_LINEAR_WIDE:
 		ret = ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL, is_init);
 		break;
 	case FT_POOL:
@@ -4251,7 +4191,6 @@ int _ft_node_replace_ptr(const struct cds_ft_type *type,
 
 	switch (type->type_class) {
 	case FT_LINEAR:
-	case FT_LINEAR_WIDE:
 		ret = ft_linear_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
 		break;
 	case FT_POOL:
@@ -4291,7 +4230,6 @@ unsigned int ft_node_sum_distribution_1d(enum ft_recompact mode,
 
 	switch (type->type_class) {
 	case FT_LINEAR:
-	case FT_LINEAR_WIDE:
 	{
 		uint8_t nr_child =
 			ft_linear_node_get_nr_child(type, node);
@@ -4430,7 +4368,6 @@ void ft_node_sum_distribution_2d(enum ft_recompact mode,
 
 	switch (type->type_class) {
 	case FT_LINEAR:
-	case FT_LINEAR_WIDE:
 	{
 		uint8_t nr_child =
 			ft_linear_node_get_nr_child(type, node);
@@ -4669,7 +4606,7 @@ int ft_node_recompact(enum ft_recompact mode,
 	int fallback = 0;
 	/*
 	 * Track which (sub)nodes within new_node have received their
-	 * first child via is_init=true.  For FT_LINEAR/FT_LINEAR_WIDE:
+	 * first child via is_init=true.  For FT_LINEAR:
 	 * `new_linear_init_done` is the single flag.  For FT_POOL:
 	 * `new_pool_init_done` is a bitmap indexed by subnode index
 	 * (at most 4 subnodes on current tiers, uint32_t is generous).
@@ -4807,7 +4744,6 @@ retry:		/* for fallback */
 	bool __is_init = false;						\
 	switch (new_type->type_class) {					\
 	case FT_LINEAR:							\
-	case FT_LINEAR_WIDE:						\
 		__is_init = !new_linear_init_done;			\
 		new_linear_init_done = true;				\
 		break;							\
@@ -4828,7 +4764,6 @@ retry:		/* for fallback */
 
 	switch (old_type->type_class) {
 	case FT_LINEAR:
-	case FT_LINEAR_WIDE:
 	{
 		uint8_t nr_child =
 			ft_linear_node_get_nr_child(old_type, old_node);
@@ -5029,7 +4964,6 @@ skip_copy:
 	{
 		switch (new_type->type_class) {
 		case FT_LINEAR:
-		case FT_LINEAR_WIDE:
 		{
 			uint8_t nc = ft_linear_node_get_nr_child(new_type,
 					new_node);
@@ -17663,20 +17597,19 @@ const char *internal_type_name(unsigned int type_index)
 
 		switch (cls) {
 		case FT_LINEAR:
+		{
+			unsigned int mlc = ft_types[type_index].max_linear_child;
+			bool wide = mlc >= FT_WIDE_LINEAR_DISPLAY_THRESHOLD;
+
 			switch (order) {
 			case 4: return "LINEAR_16";
 			case 5: return "LINEAR_32";
-			case 6: return "LINEAR_64";
-			case 7: return "LINEAR_128";
-			}
-			break;
-		case FT_LINEAR_WIDE:
-			switch (order) {
-			case 6: return "LINEAR_WIDE_64";
-			case 7: return "LINEAR_WIDE_128";
+			case 6: return wide ? "LINEAR_WIDE_64" : "LINEAR_64";
+			case 7: return wide ? "LINEAR_WIDE_128" : "LINEAR_128";
 			case 8: return "LINEAR_WIDE_256";
 			}
 			break;
+		}
 		case FT_POOL:
 			if (npo == 1 && order == 8)	return "POOL_1D_256";
 			if (npo == 1 && order == 9)	return "POOL_1D_512";
