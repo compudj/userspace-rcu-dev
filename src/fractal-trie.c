@@ -3082,6 +3082,53 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
 	return ft_linear_wide_node_get_nth(type, linear, node_flag_ptr, n);
 }
 
+/*
+ * Pool-shape specialized scanners for the lookup hot path.
+ * nr_pool_order and pool_size_order are encoded in the function
+ * identity rather than loaded from ft_types[]: nr_pool_order is
+ * implicit (_1d / _2d), and pool_size_order is identical across
+ * both pools in each tier (8 on 64-bit, 7 on 32-bit).
+ */
+#if CAA_BITS_PER_LONG >= 64
+#define FT_POOL_SIZE_ORDER	8
+#else
+#define FT_POOL_SIZE_ORDER	7
+#endif
+
+static inline_lookup
+struct cds_ft_inode_flag *ft_pool_node_get_nth_1d(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
+	unsigned long index = ((unsigned long) n >> bitsel) & 0x1;
+	struct cds_ft_inode *linear = (struct cds_ft_inode *)
+			&node->data[index << FT_POOL_SIZE_ORDER];
+
+	return ft_linear_wide_node_get_nth(NULL, linear, node_flag_ptr, n);
+}
+
+static inline_lookup
+struct cds_ft_inode_flag *ft_pool_node_get_nth_2d(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n)
+{
+	unsigned int C_n8_r2_index, subclass_index;
+	uint8_t bits[2];
+	struct cds_ft_inode *linear;
+
+	ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
+	index_to_bits_C_n8_r2(C_n8_r2_index, bits);
+	subclass_index = value_and_bits_to_subclass_index(n, bits);
+	linear = (struct cds_ft_inode *)
+			&node->data[subclass_index << FT_POOL_SIZE_ORDER];
+	return ft_linear_wide_node_get_nth(NULL, linear, node_flag_ptr, n);
+}
+
 static inline_lookup
 struct cds_ft_inode *ft_pool_node_get_ith_pool(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
@@ -3276,34 +3323,54 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
  * ft_node_get_nth: get nth item from a node.
  * node_flag is already rcu_dereference'd.
  */
+
 /*
- * Tag-to-type_class table: maps bits 0-3 of a tagged pointer
- * directly to the type_class, bypassing the ft_types[] struct
- * load for the dispatch decision.  16 bytes, always in L1.
- *
- * Eliminates a dependent load chain from the critical path:
- * tag bits → ft_types[] address computation → struct load.
- * Instead: tag bits → single byte load from small table.
- *
- * Initialized at startup by ft_init_tag_to_class().
+ * Compile-time bitmasks indexed by type_index: for each class,
+ * the set of type_index values whose ft_types[] entry has that
+ * class.  Dispatching via `(1U << type_index) & FT_MASK_X` keeps
+ * the check in ALU ops only.  Each bit is derived from
+ * ft_types[i].type_class directly, so an ft_types[] edit
+ * (reclassification, new type) updates the masks automatically.
  */
-static uint8_t ft_tag_to_class[16];
+#define FT_TC_BIT(n, tc) \
+	(ft_types[(n)].type_class == (tc) ? (1U << (n)) : 0)
 
+#if CAA_BITS_PER_LONG < 64
+#define FT_MASK_CLASS(tc) \
+	(FT_TC_BIT(0, tc) | FT_TC_BIT(1, tc) | FT_TC_BIT(2, tc) | \
+	 FT_TC_BIT(3, tc) | FT_TC_BIT(4, tc) | FT_TC_BIT(5, tc) | \
+	 FT_TC_BIT(6, tc))
+#else
+#define FT_MASK_CLASS(tc) \
+	(FT_TC_BIT(0, tc) | FT_TC_BIT(1, tc) | FT_TC_BIT(2, tc) | \
+	 FT_TC_BIT(3, tc) | FT_TC_BIT(4, tc) | FT_TC_BIT(5, tc) | \
+	 FT_TC_BIT(6, tc) | FT_TC_BIT(7, tc))
+#endif
+
+#define FT_MASK_LINEAR      FT_MASK_CLASS(FT_LINEAR)
+#define FT_MASK_LINEAR_WIDE FT_MASK_CLASS(FT_LINEAR_WIDE)
+#define FT_MASK_POOL        FT_MASK_CLASS(FT_POOL)
+
+/*
+ * The pool dispatch routes POOL_IDX_A to ft_pool_node_get_nth_1d
+ * and everything else in FT_MASK_POOL to ft_pool_node_get_nth_2d,
+ * with FT_POOL_SIZE_ORDER hardcoded per tier.  ft_types[].field
+ * is not a constant expression in gcc's strict sense, so the
+ * layout checks run once at library load via a constructor.
+ * If the ft_types[] layout changes (pool swap, added pool type,
+ * different pool_size_order) the assertions fire before any
+ * lookup runs.
+ */
 static void __attribute__((constructor))
-ft_init_tag_to_class(void)
+ft_check_pool_dispatch_assumptions(void)
 {
-	unsigned int i;
-
-	for (i = 0; i < 16; i++) {
-		if (!(i & FT_INTERNAL_MASK)) {
-			/* External, compressed, or collapsed. */
-			ft_tag_to_class[i] = FT_NULL;
-		} else {
-			unsigned int type_idx = (i >> FT_INTERNAL_BITS) & 0x7;
-
-			ft_tag_to_class[i] = ft_types[type_idx].type_class;
-		}
-	}
+	assert(ft_types[FT_POOL_IDX_A].type_class == FT_POOL);
+	assert(ft_types[FT_POOL_IDX_B].type_class == FT_POOL);
+	assert(ft_types[FT_POOL_IDX_A].nr_pool_order == 1);
+	assert(ft_types[FT_POOL_IDX_B].nr_pool_order == 2);
+	assert(ft_types[FT_POOL_IDX_A].pool_size_order == FT_POOL_SIZE_ORDER);
+	assert(ft_types[FT_POOL_IDX_B].pool_size_order == FT_POOL_SIZE_ORDER);
+	assert((FT_MASK_POOL & ~((1U << FT_POOL_IDX_A) | (1U << FT_POOL_IDX_B))) == 0);
 }
 
 static inline_lookup
@@ -3317,39 +3384,41 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		uint8_t n)
 {
 	unsigned long tag = (unsigned long) node_flag & 0xF;
-	uint8_t tc = ft_tag_to_class[tag];
 	struct cds_ft_inode *node;
+	unsigned int type_index, bit;
 
-	if (caa_unlikely(tc == FT_NULL)) {
+	/* External / compressed / collapsed: internal flag clear. */
+	if (caa_unlikely(!(tag & FT_INTERNAL_MASK))) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
 		return NULL;
 	}
 
 	node = ft_node_ptr(node_flag);
+	type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
+	bit = 1U << type_index;
 
 	/*
-	 * Dispatch on type_class from the tag table.
 	 * Linear (bytewise scan) is the most common type in
-	 * byte-indexed tries — check it first to minimize
-	 * branch mispredictions on mixed-type workloads.
+	 * byte-indexed tries — predicted-taken fast path.  Pool
+	 * dispatch discriminates POOL_IDX_A (1D) from POOL_IDX_B (2D)
+	 * to let each subnode scanner inline a fixed pool shape; no
+	 * ft_types[] field load on the pool path.
 	 */
-	{
-		unsigned int type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
-		const struct cds_ft_type *type = &ft_types[type_index];
-
-		if (caa_likely(tc == FT_LINEAR))
-			return ft_linear_node_get_nth(type, node,
+	if (caa_likely(bit & FT_MASK_LINEAR))
+		return ft_linear_node_get_nth(NULL, node,
+				node_flag_ptr, n);
+	if (bit & FT_MASK_LINEAR_WIDE)
+		return ft_linear_wide_node_get_nth(NULL, node,
+				node_flag_ptr, n);
+	if (bit & FT_MASK_POOL) {
+		if (bit & (1U << FT_POOL_IDX_A))
+			return ft_pool_node_get_nth_1d(node, node_flag,
 					node_flag_ptr, n);
-		if (tc == FT_LINEAR_WIDE)
-			return ft_linear_wide_node_get_nth(type, node,
-					node_flag_ptr, n);
-		if (tc == FT_POOL)
-			return ft_pool_node_get_nth(type, node, node_flag,
-					node_flag_ptr, n);
-		return ft_pigeon_node_get_nth(NULL, node,
+		return ft_pool_node_get_nth_2d(node, node_flag,
 				node_flag_ptr, n);
 	}
+	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n);
 }
 
 /*
