@@ -6080,13 +6080,20 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 		struct cds_ft_node **result_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
-	uint8_t ordinals[FT_MAX_KEY_LEN];
+	const struct cds_ft_key_map *km = &ft->group->key_map;
 	enum cds_ft_status status;
 
 	FT_TP_KEY(lookup_key_enter, ft, key, _key_len);
-	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
-	status = do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
-				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+	if (caa_likely(km->identity)) {
+		status = do_cds_ft_lookup(ft, key, key_len, result_node, NULL,
+					FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+	} else {
+		uint8_t ordinals[FT_MAX_KEY_LEN];
+
+		ft_key_to_ordinals(ordinals, key, key_len, km);
+		status = do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
+					FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+	}
 	FT_TP(lookup_key_exit, (int) status);
 	return status;
 }
@@ -6109,11 +6116,25 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 		struct cds_ft_node **result_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
-	uint8_t ordinals[FT_MAX_KEY_LEN];
+	const struct cds_ft_key_map *km = &ft->group->key_map;
 
-	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
-	return do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
-				FT_PREFIX_TRACK_NONE, NULL, NULL, true);
+	/*
+	 * Identity key-map fast path: the ordinals[] buffer would be
+	 * a byte-for-byte copy of @key; skip the 256-byte stack
+	 * allocation and the entry memcpy by passing the caller's
+	 * key directly to the descent.  Common case -- non-identity
+	 * maps are only set up for key_maps that reorder bytes.
+	 */
+	if (caa_likely(km->identity))
+		return do_cds_ft_lookup(ft, key, key_len, result_node, NULL,
+					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
+	{
+		uint8_t ordinals[FT_MAX_KEY_LEN];
+
+		ft_key_to_ordinals(ordinals, key, key_len, km);
+		return do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
+					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
+	}
 }
 
 enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
@@ -6135,12 +6156,20 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 	struct cds_ft_node *partial_node = NULL;
 	size_t partial_len = 0;
 	size_t key_len = ft_key_len(ft, _key_len);
-	uint8_t ordinals[FT_MAX_KEY_LEN];
+	const struct cds_ft_key_map *km = &ft->group->key_map;
 
-	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
-	do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
-			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node,
-			 false);
+	if (caa_likely(km->identity)) {
+		do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
+				 FT_PREFIX_TRACK_PARTIAL, &partial_len,
+				 &partial_node, false);
+	} else {
+		uint8_t ordinals[FT_MAX_KEY_LEN];
+
+		ft_key_to_ordinals(ordinals, key, key_len, km);
+		do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
+				 FT_PREFIX_TRACK_PARTIAL, &partial_len,
+				 &partial_node, false);
+	}
 
 	*match_len = partial_len;
 	*result_node = partial_node;
@@ -6181,12 +6210,20 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
 	size_t longest_len = 0;
 	enum cds_ft_status ret;
 	size_t key_len = ft_key_len(ft, _key_len);
-	uint8_t ordinals[FT_MAX_KEY_LEN];
+	const struct cds_ft_key_map *km = &ft->group->key_map;
 
-	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
-	ret = do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
-			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node,
-			       false);
+	if (caa_likely(km->identity)) {
+		ret = do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
+				       FT_PREFIX_TRACK_LONGEST, &longest_len,
+				       &match_node, false);
+	} else {
+		uint8_t ordinals[FT_MAX_KEY_LEN];
+
+		ft_key_to_ordinals(ordinals, key, key_len, km);
+		ret = do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
+				       FT_PREFIX_TRACK_LONGEST, &longest_len,
+				       &match_node, false);
+	}
 
 	if (ret < 0) {
 		*match_len = 0;
@@ -10964,8 +11001,9 @@ int _cds_ft_insert(struct cds_ft *ft,
 	unsigned int key_depth;
 	struct ft_descent d;
 	size_t key_len = ft_key_len(ft, _key_len);
+	const struct cds_ft_key_map *km = &ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
-	const uint8_t *key = ordinal_buf;
+	const uint8_t *key;
 	const uint8_t *iter_key;
 	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
 	unsigned int snapshot_depth[FT_MAX_DEPTH]; /* parallel depth tracking */
@@ -10974,7 +11012,12 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
-	ft_key_to_ordinals(ordinal_buf, _key, key_len, &ft->group->key_map);
+	if (caa_likely(km->identity)) {
+		key = _key;
+	} else {
+		ft_key_to_ordinals(ordinal_buf, _key, key_len, km);
+		key = ordinal_buf;
+	}
 	iter_key = key;
 	/* Expect zeroed prev/next pointers. This catches some double-insert misuses. */
 	if (node->prev || node->next)
@@ -11552,8 +11595,9 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	struct ft_descent d;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, _key_len);
+	const struct cds_ft_key_map *km = &ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
-	const uint8_t *key = ordinal_buf;
+	const uint8_t *key;
 	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
 	unsigned int snapshot_depth[FT_MAX_DEPTH];
 	int nr_snapshot = 0;
@@ -11563,7 +11607,12 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
-	ft_key_to_ordinals(ordinal_buf, _key, key_len, &ft->group->key_map);
+	if (caa_likely(km->identity)) {
+		key = _key;
+	} else {
+		ft_key_to_ordinals(ordinal_buf, _key, key_len, km);
+		key = ordinal_buf;
+	}
 	/* Expect zeroed prev/next pointers. */
 	if (node->prev || node->next)
 		return -EINVAL;
@@ -13897,10 +13946,16 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		}
 	}
 
+	const struct cds_ft_key_map *km = &dst_ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
-	const uint8_t *key = ordinal_buf;
+	const uint8_t *key;
 
-	ft_key_to_ordinals(ordinal_buf, _key, key_len, &dst_ft->group->key_map);
+	if (caa_likely(km->identity)) {
+		key = _key;
+	} else {
+		ft_key_to_ordinals(ordinal_buf, _key, key_len, km);
+		key = ordinal_buf;
+	}
 
 	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
 	if (key_len > 0 && src_max > dst_ft->group->max_key_len - key_len) {
@@ -14066,10 +14121,16 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		}
 	}
 
+	const struct cds_ft_key_map *km = &dst_ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
-	const uint8_t *key = ordinal_buf;
+	const uint8_t *key;
 
-	ft_key_to_ordinals(ordinal_buf, _key, key_len, &dst_ft->group->key_map);
+	if (caa_likely(km->identity)) {
+		key = _key;
+	} else {
+		ft_key_to_ordinals(ordinal_buf, _key, key_len, km);
+		key = ordinal_buf;
+	}
 
 	swap_max = uatomic_load(&swap_ft->max_used_key_len, CMM_RELAXED);
 	if (key_len > 0 && swap_max > dst_ft->group->max_key_len - key_len) {
@@ -14348,10 +14409,16 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		}
 	}
 
+	const struct cds_ft_key_map *km = &ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
-	const uint8_t *key = ordinal_buf;
+	const uint8_t *key;
 
-	ft_key_to_ordinals(ordinal_buf, _key, key_len, &ft->group->key_map);
+	if (caa_likely(km->identity)) {
+		key = _key;
+	} else {
+		ft_key_to_ordinals(ordinal_buf, _key, key_len, km);
+		key = ordinal_buf;
+	}
 
 	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH)) {
 		FT_TP(detach_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
@@ -14901,8 +14968,9 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 {
 	struct cds_ft_inode_flag *node_flag;
 	unsigned int i;
+	const struct cds_ft_key_map *km = &ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
-	const uint8_t *prefix = ordinal_buf;
+	const uint8_t *prefix;
 	unsigned long count;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
@@ -14911,7 +14979,12 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 		count = 0;
 		goto out;
 	}
-	ft_key_to_ordinals(ordinal_buf, _prefix, prefix_len, &ft->group->key_map);
+	if (caa_likely(km->identity)) {
+		prefix = _prefix;
+	} else {
+		ft_key_to_ordinals(ordinal_buf, _prefix, prefix_len, km);
+		prefix = ordinal_buf;
+	}
 
 	node_flag = ft_dereference_acquire_prefetch(ft->root);
 
@@ -18229,6 +18302,7 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 	const struct cds_ft_key_map *km = &iter->ft->group->key_map;
 	bool subset = false;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
+	const uint8_t *key_ordinals;
 
 	key_len = ft_key_len(iter->ft, key_len);
 	FT_TP(iter_set_key_enter, (const void *) iter->ft, (const void *) iter,
@@ -18236,15 +18310,20 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 		(int) iter->key_len, (int) iter->path_len);
 	if (key_len > iter->ft->group->max_key_len)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	ft_key_to_ordinals(ordinal_buf, key, key_len, km);
-	if (key_len <= iter->key_len && !memcmp(ordinal_buf, iter_key(iter), key_len))
+	if (caa_likely(km->identity)) {
+		key_ordinals = key;
+	} else {
+		ft_key_to_ordinals(ordinal_buf, key, key_len, km);
+		key_ordinals = ordinal_buf;
+	}
+	if (key_len <= iter->key_len && !memcmp(key_ordinals, iter_key(iter), key_len))
 		subset = true;
 	/*
 	 * If new key is a subset of current key, the path stays valid,
 	 * otherwise invalidate the path.
 	 */
 	if (!subset) {
-		memcpy(iter_key(iter), ordinal_buf, key_len);
+		memcpy(iter_key(iter), key_ordinals, key_len);
 		iter->path_valid = false;
 		iter_debug_path_clear(iter);
 		iter->path_len = 0;
