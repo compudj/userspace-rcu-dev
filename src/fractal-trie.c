@@ -2737,38 +2737,40 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
 		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, uint8_t nr_child)
+		uint8_t n)
 {
 	uint8_t *values = &node->data[1];
 	unsigned long target_ones = n * L_ONES_A;
 	unsigned long word, has_zero;
 	unsigned int i;
 	const unsigned int word_sz = sizeof(unsigned long);
+	const unsigned int max_lc = type->max_linear_child;
 
-	if (nr_child < word_sz) {
+	if (max_lc < word_sz) {
 		/*
 		 * Single-word load: values[] is padded to
 		 * sizeof(void *) >= word_sz on strict-align archs
 		 * (gated by FT_HAVE_EFFICIENT_UNALIGNED_ACCESS),
-		 * so this is always a safe in-node read.  Reject
-		 * matches in the trailing garbage slots with
-		 * `i < nr_child` instead of masking has_zero --
-		 * garbage matches are rare (~(word_sz-nr_child)/256
-		 * per call), so the predicted-taken branch on real
-		 * matches is cheaper than paying the mask uops on
-		 * every call.
+		 * so this is always a safe in-node read.  The
+		 * post-ctz bound `i < max_lc` rejects matches in
+		 * pointer bytes that the load over-reads;  matches
+		 * in sentinel / padding bytes (= values[0]) can
+		 * only occur when target == values[0], in which
+		 * case ctz picks position 0 first.  Deleted-slot
+		 * matches within [0, max_lc) are rejected at the
+		 * pointer dereference (NULL) by the caller.
 		 */
 		__builtin_memcpy(&word, values, word_sz);
 		has_zero = ft_swar_byteq(word, target_ones);
 		if (has_zero) {
 			i = ft_swar_match_idx(has_zero);
-			if (caa_likely(i < nr_child))
+			if (caa_likely(i < max_lc))
 				goto found;
 		}
 	} else {
 		unsigned int j = 0;
 
-		while (j + word_sz <= nr_child) {
+		while (j + word_sz <= max_lc) {
 			__builtin_memcpy(&word, values + j, word_sz);
 			has_zero = ft_swar_byteq(word, target_ones);
 			if (has_zero) {
@@ -2777,8 +2779,8 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
 			}
 			j += word_sz;
 		}
-		if (j < nr_child) {
-			unsigned int tail = nr_child - word_sz;
+		if (j < max_lc) {
+			unsigned int tail = max_lc - word_sz;
 
 			__builtin_memcpy(&word, values + tail, word_sz);
 			has_zero = ft_swar_byteq(word, target_ones);
@@ -2817,19 +2819,20 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
 		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, uint8_t nr_child)
+		uint8_t n)
 {
 	uint8_t *values = &node->data[1];
+	const unsigned int max_lc = type->max_linear_child;
 	__m128i target = _mm_set1_epi8(n);
 	__m128i chunk;
 	unsigned int mask, phys_idx;
 
 	chunk = _mm_loadu_si128((__m128i *)values);
 	mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
-	if (nr_child <= 16) {
+	if (max_lc <= 16) {
 		if (mask) {
 			phys_idx = __builtin_ctz(mask);
-			if (caa_likely(phys_idx < nr_child))
+			if (caa_likely(phys_idx < max_lc))
 				goto found;
 		}
 	} else {
@@ -2839,7 +2842,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
 			phys_idx = __builtin_ctz(mask);
 			goto found;
 		}
-		tail = nr_child - 16;
+		tail = max_lc - 16;
 		chunk = _mm_loadu_si128((__m128i *)(values + tail));
 		mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
 		if (mask) {
@@ -2873,21 +2876,15 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	uint8_t nr_child = uatomic_load(&node->data[0], CMM_ACQUIRE)
-			& FT_LINEAR_NR_CHILD_MASK;
 	uint8_t *values = &node->data[1];
+	const unsigned int max_lc = type->max_linear_child;
 	unsigned int i;
 
-	if (nr_child == 0) {
-		if (caa_unlikely(node_flag_ptr))
-			*node_flag_ptr = NULL;
-		return NULL;
-	}
-	for (i = 0; i < nr_child; i++) {
+	for (i = 0; i < max_lc; i++) {
 		if (uatomic_load(&values[i], CMM_RELAXED) == n)
 			break;
 	}
-	if (i >= nr_child) {
+	if (i >= max_lc) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
 		return NULL;
@@ -2912,18 +2909,10 @@ struct cds_ft_inode_flag *ft_linear_wide_node_get_nth(const struct cds_ft_type *
 		uint8_t n __attribute__((unused)))
 {
 #if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-	uint8_t nr_child = uatomic_load(&node->data[0], CMM_ACQUIRE)
-			& FT_LINEAR_NR_CHILD_MASK;
-
-	if (nr_child == 0) {
-		if (caa_unlikely(node_flag_ptr))
-			*node_flag_ptr = NULL;
-		return NULL;
-	}
 #  if defined(__SSE2__)
-	return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n, nr_child);
+	return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n);
 #  else
-	return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n, nr_child);
+	return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n);
 #  endif
 #else
 	/*
