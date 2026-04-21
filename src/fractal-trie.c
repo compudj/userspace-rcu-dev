@@ -2587,7 +2587,7 @@ static inline_lookup
 uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
 		struct cds_ft_inode *node)
 {
-	uint8_t *values = &node->data[1];
+	uint8_t *values = &node->data[0];
 	uint8_t v0 = uatomic_load(&values[0], CMM_RELAXED);
 	unsigned int max_lc = type->max_linear_child;
 	unsigned int i;
@@ -2609,7 +2609,7 @@ struct cds_ft_inode_flag **ft_linear_pointers(
 		struct cds_ft_inode *node, const struct cds_ft_type *type)
 {
 	unsigned int byte_offset =
-		FT_ALIGN(1 + type->max_linear_child, sizeof(void *));
+		FT_ALIGN(type->max_linear_child, sizeof(void *));
 	return (struct cds_ft_inode_flag **)
 		((uint8_t *) node + byte_offset);
 }
@@ -2786,7 +2786,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	uint8_t *values = &node->data[1];
+	uint8_t *values = &node->data[0];
 	unsigned long target_ones = n * L_ONES_A;
 	unsigned long word, has_zero;
 	unsigned int i;
@@ -2868,7 +2868,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	uint8_t *values = &node->data[1];
+	uint8_t *values = &node->data[0];
 	const unsigned int max_lc = type->max_linear_child;
 	__m128i target = _mm_set1_epi8(n);
 	__m128i chunk;
@@ -2923,7 +2923,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n)
 {
-	uint8_t *values = &node->data[1];
+	uint8_t *values = &node->data[0];
 	const unsigned int max_lc = type->max_linear_child;
 	unsigned int i;
 
@@ -2997,7 +2997,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	assert(nr_child <= type->max_linear_child);
 	assert(!ft_type_is_linear(type->type_class) || nr_child == 0 || nr_child >= type->min_child);
 
-	values = &node->data[1];
+	values = &node->data[0];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
 	for (i = 0; i < nr_child; i++) {
 		unsigned int v;
@@ -3047,7 +3047,7 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 	assert(i < ft_linear_node_get_nr_child(type, node));
 
-	values = &node->data[1];
+	values = &node->data[0];
 	*v = values[i];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
 	*iter = ft_dereference_acquire(pointers[i]);
@@ -3640,7 +3640,7 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 	nr_child = ft_linear_node_get_nr_child(type, node);
 	assert(nr_child <= type->max_linear_child);
 
-	values = &node->data[1];
+	values = &node->data[0];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
 	/* Check if node value is already populated */
 	for (i = 0; i < nr_child; i++) {
