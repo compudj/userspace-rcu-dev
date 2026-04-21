@@ -4866,35 +4866,66 @@ skip_copy:
 	 * must not observe an unpublished subnode in zero-init state --
 	 * the sentinel scan would return a phantom slot count (see
 	 * ft_linear_node_get_direction's nr_child >= min_child assert).
-	 * Iterating 0..255 in order gives the lowest byte routing to
-	 * each still-untouched subnode, which becomes that subnode's
-	 * reserved values[0].
+	 *
+	 * For each untouched subnode, derive the lowest byte routing to
+	 * it by inverting the pool dispatch -- O(nr_subnodes) rather
+	 * than O(256).  The reserved byte becomes that subnode's
+	 * values[0]; any real insert of that byte later adopts slot 0.
 	 */
 	if (new_type_index != NODE_INDEX_NULL
 			&& new_type->type_class == FT_POOL) {
 		unsigned int nr_subnodes = 1U << new_type->nr_pool_order;
-		unsigned int n_byte;
+		unsigned int idx;
+		uint8_t bits_2d[2] = { 0, 0 };
 
-		for (n_byte = 0; n_byte < 256; n_byte++) {
-			unsigned int idx = ft_pool_subnode_index(
-					new_type, new_node_flag, (uint8_t)n_byte);
+		if (new_type->nr_pool_order == 2) {
+			unsigned int C_n8_r2_index;
+
+			ft_node_pool_2d_index(new_node_flag, &C_n8_r2_index);
+			index_to_bits_C_n8_r2(C_n8_r2_index, bits_2d);
+		}
+		for (idx = 0; idx < nr_subnodes; idx++) {
 			uint32_t bit = 1U << idx;
+			uint8_t reserved;
 			struct cds_ft_inode *subnode;
 			uint8_t *values;
 			struct cds_ft_inode_flag **pointers;
 
 			if (new_pool_init_done & bit)
 				continue;
+
+			/*
+			 * Invert the routing: compute the lowest byte whose
+			 * subnode-index equals idx.  Any byte routing to idx
+			 * works; lowest is the cheap choice and happens to
+			 * equal (idx << bitsel) / (positional bit composition)
+			 * with all other bits zero.
+			 */
+			if (new_type->nr_pool_order == 1) {
+				unsigned long bitsel = ft_node_pool_1d_bitsel(
+						new_node_flag);
+				reserved = (uint8_t)(idx << bitsel);
+			} else {
+				/*
+				 * POOL_2D: subnode index bit layout is
+				 *   high bit <- bits_2d[0] position
+				 *   low  bit <- bits_2d[1] position
+				 * (see value_and_bits_to_subclass_index).
+				 */
+				reserved = (uint8_t)(((idx >> 1) & 1) << bits_2d[0])
+					 | (uint8_t)((idx & 1) << bits_2d[1]);
+			}
+			assert(ft_pool_subnode_index(new_type,
+					new_node_flag, reserved) == idx);
+
 			subnode = ft_pool_get_linear_subnode(new_type,
-					new_node, new_node_flag, (uint8_t)n_byte);
+					new_node, new_node_flag, reserved);
 			values = &subnode->data[0];
 			pointers = (struct cds_ft_inode_flag **)
 				align_ptr_size(&values[new_type->max_linear_child]);
-			memset(values, (uint8_t)n_byte,
+			memset(values, reserved,
 				(uint8_t *)pointers - values);
 			new_pool_init_done |= bit;
-			if (__builtin_popcount(new_pool_init_done) == (int)nr_subnodes)
-				break;
 		}
 	}
 
