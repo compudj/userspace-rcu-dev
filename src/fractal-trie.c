@@ -2777,21 +2777,23 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
 
 	if (nr_child < word_sz) {
 		/*
-		 * Masked single-word load: values[] is padded to
+		 * Single-word load: values[] is padded to
 		 * sizeof(void *) >= word_sz on strict-align archs
 		 * (gated by FT_HAVE_EFFICIENT_UNALIGNED_ACCESS),
-		 * so this is always a safe in-node read.
+		 * so this is always a safe in-node read.  Reject
+		 * matches in the trailing garbage slots with
+		 * `i < nr_child` instead of masking has_zero --
+		 * garbage matches are rare (~(word_sz-nr_child)/256
+		 * per call), so the predicted-taken branch on real
+		 * matches is cheaper than paying the mask uops on
+		 * every call.
 		 */
 		__builtin_memcpy(&word, values, word_sz);
 		has_zero = ft_swar_byteq(word, target_ones);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-		has_zero &= (1UL << ((unsigned long)nr_child * 8)) - 1;
-#else
-		has_zero &= ~0UL << (((unsigned long)(word_sz - nr_child)) * 8);
-#endif
 		if (has_zero) {
 			i = ft_swar_match_idx(has_zero);
-			goto found;
+			if (caa_likely(i < nr_child))
+				goto found;
 		}
 	} else {
 		unsigned int j = 0;
@@ -2832,10 +2834,13 @@ found:
 #if defined(__SSE2__)
 /*
  * Scan values[0..nr_child) for byte @n using SSE2 + overlapping
- * 16-byte tail.  For nr_child <= 16, mask the movemask bits beyond
- * nr_child; for nr_child > 16, the second load overlaps with the
- * first so every bit we inspect corresponds to an index in
- * [0, nr_child).
+ * 16-byte tail.  For nr_child <= 16, reject matches in the
+ * trailing garbage slots with `phys_idx < nr_child` (garbage
+ * matches are rare, typically < 10/256 per call, so the
+ * predicted-taken branch on real matches is cheaper than
+ * unconditionally masking movemask).  For nr_child > 16, the
+ * second load overlaps with the first so every bit inspected
+ * corresponds to an index in [0, nr_child).
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
@@ -2851,10 +2856,10 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
 	chunk = _mm_loadu_si128((__m128i *)values);
 	mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
 	if (nr_child <= 16) {
-		mask &= (1U << nr_child) - 1;
 		if (mask) {
 			phys_idx = __builtin_ctz(mask);
-			goto found;
+			if (caa_likely(phys_idx < nr_child))
+				goto found;
 		}
 	} else {
 		unsigned int tail;
