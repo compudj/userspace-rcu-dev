@@ -2739,6 +2739,51 @@ static inline void ft_maybe_prefetch(const void *ptr)
 	(__typeof__(p)) uatomic_load(&(p), CMM_ACQUIRE)
 
 /*
+ * Per-caller prefetch hint for ft_node_get_nth_skip / ft_node_get_nth
+ * and the underlying scanners.  Compile-time constant at each call
+ * site — the switch inside ft_maybe_prefetch_hint folds away, leaving
+ * a single prefetch (or none) per caller.
+ *
+ *   FT_PF_NONE: no prefetch.
+ *   FT_PF_DATA: prefetch child's data (node body).  Right for candidate
+ *               lookup and non-skip exact lookup that traverse the
+ *               returned child's data next.
+ *
+ * Future hint variants (META, BITMAP_META) would target a child's
+ * metadata / bitmap cache lines respectively — deferred until
+ * cds_ft_item_to_metadata_fast / cds_ft_item_to_bitmap are inlinable
+ * (currently cross-TU calls).
+ */
+enum ft_pf_target {
+	FT_PF_NONE,
+	FT_PF_DATA,
+};
+
+static inline __attribute__((always_inline))
+void ft_maybe_prefetch_hint(const void *ptr, enum ft_pf_target hint)
+{
+	if (hint == FT_PF_DATA)
+		ft_maybe_prefetch(ptr);
+}
+
+#define ft_dereference_acquire_prefetch_hint(p, hint)			\
+	({								\
+		__typeof__(p) __ft_tmp =				\
+			(__typeof__(p)) uatomic_load(&(p),		\
+						     CMM_ACQUIRE);	\
+		ft_maybe_prefetch_hint(__ft_tmp, (hint));		\
+		__ft_tmp;						\
+	})
+
+#define ft_dereference_prefetch_hint(p, hint)				\
+	({								\
+		__typeof__(p) __ft_tmp = rcu_dereference(p);		\
+		ft_maybe_prefetch_hint(__ft_tmp, (hint));		\
+		__ft_tmp;						\
+	})
+
+
+/*
  * The order in which values and pointers are does does not matter: if
  * a value is missing, we return NULL. If a value is there, but its
  * associated pointers is still NULL, we return NULL too.
@@ -2805,7 +2850,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_swar(
 		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	uint8_t *values = &node->data[0];
 	unsigned long target_ones = n * L_ONES_A;
@@ -2867,7 +2912,7 @@ found:
 			ft_linear_pointers(node, type);
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = &pointers[i];
-		return ft_dereference_acquire(pointers[i]);
+		return ft_dereference_acquire_prefetch_hint(pointers[i], pf_hint);
 	}
 }
 
@@ -2887,7 +2932,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth_simd(
 		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	uint8_t *values = &node->data[0];
 	const unsigned int max_lc = type->max_linear_child;
@@ -2927,7 +2972,7 @@ found:
 			ft_linear_pointers(node, type);
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = &pointers[phys_idx];
-		return ft_dereference_acquire(pointers[phys_idx]);
+		return ft_dereference_acquire_prefetch_hint(pointers[phys_idx], pf_hint);
 	}
 }
 #endif /* __SSE2__ */
@@ -2981,7 +3026,7 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_1(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	uint8_t *values = &node->data[0];
 	struct cds_ft_inode_flag **pointers;
@@ -2994,7 +3039,7 @@ struct cds_ft_inode_flag *ft_linear_scan_1(
 	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 8);
 	if (caa_unlikely(node_flag_ptr))
 		*node_flag_ptr = &pointers[0];
-	return ft_dereference_acquire(pointers[0]);
+	return ft_dereference_acquire_prefetch_hint(pointers[0], pf_hint);
 }
 
 /*
@@ -3007,7 +3052,7 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_3(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	uint8_t *values = &node->data[0];
 	struct cds_ft_inode_flag **pointers;
@@ -3019,7 +3064,7 @@ struct cds_ft_inode_flag *ft_linear_scan_3(
 					((uint8_t *) node + 8);
 			if (caa_unlikely(node_flag_ptr))
 				*node_flag_ptr = &pointers[i];
-			return ft_dereference_acquire(pointers[i]);
+			return ft_dereference_acquire_prefetch_hint(pointers[i], pf_hint);
 		}
 	}
 	if (caa_unlikely(node_flag_ptr))
@@ -3036,7 +3081,7 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_8(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	uint8_t *values = &node->data[0];
 	unsigned long target_ones = (unsigned long) n * L_ONES_A;
@@ -3055,7 +3100,7 @@ struct cds_ft_inode_flag *ft_linear_scan_8(
 	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 8);
 	if (caa_unlikely(node_flag_ptr))
 		*node_flag_ptr = &pointers[i];
-	return ft_dereference_acquire(pointers[i]);
+	return ft_dereference_acquire_prefetch_hint(pointers[i], pf_hint);
 }
 
 /*
@@ -3072,7 +3117,7 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_16(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	uint8_t *values = &node->data[0];
 	__m128i target = _mm_set1_epi8((char) n);
@@ -3091,7 +3136,7 @@ struct cds_ft_inode_flag *ft_linear_scan_16(
 	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 16);
 	if (caa_unlikely(node_flag_ptr))
 		*node_flag_ptr = &pointers[i];
-	return ft_dereference_acquire(pointers[i]);
+	return ft_dereference_acquire_prefetch_hint(pointers[i], pf_hint);
 }
 
 /*
@@ -3109,7 +3154,7 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_32(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	uint8_t *values = &node->data[0];
 	struct cds_ft_inode_flag **pointers;
@@ -3135,7 +3180,7 @@ struct cds_ft_inode_flag *ft_linear_scan_32(
 	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 32);
 	if (caa_unlikely(node_flag_ptr))
 		*node_flag_ptr = &pointers[i];
-	return ft_dereference_acquire(pointers[i]);
+	return ft_dereference_acquire_prefetch_hint(pointers[i], pf_hint);
 }
 
 /*
@@ -3148,14 +3193,14 @@ struct cds_ft_inode_flag *ft_pool_scan_1d(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
 	unsigned long index = ((unsigned long) n >> bitsel) & 0x1;
 	struct cds_ft_inode *subnode = (struct cds_ft_inode *)
 			&node->data[index << FT_POOL_SIZE_ORDER];
 
-	return ft_linear_scan_32(subnode, node_flag_ptr, n);
+	return ft_linear_scan_32(subnode, node_flag_ptr, n, pf_hint);
 }
 
 static inline_lookup
@@ -3163,7 +3208,7 @@ struct cds_ft_inode_flag *ft_pool_scan_2d(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	unsigned int C_n8_r2_index, subclass_index;
 	uint8_t bits[2];
@@ -3174,7 +3219,7 @@ struct cds_ft_inode_flag *ft_pool_scan_2d(
 	subclass_index = value_and_bits_to_subclass_index(n, bits);
 	subnode = (struct cds_ft_inode *)
 			&node->data[subclass_index << FT_POOL_SIZE_ORDER];
-	return ft_linear_scan_32(subnode, node_flag_ptr, n);
+	return ft_linear_scan_32(subnode, node_flag_ptr, n, pf_hint);
 }
 
 /*
@@ -3216,7 +3261,7 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 #if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS) && defined(__SSE2__)
 	/*
@@ -3226,10 +3271,10 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 	 * array.  SWAR handles them; SIMD handles the rest.
 	 */
 	if (type->max_linear_child <= sizeof(unsigned long))
-		return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n);
-	return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n);
+		return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n, pf_hint);
+	return ft_linear_node_get_nth_simd(type, node, node_flag_ptr, n, pf_hint);
 #elif defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-	return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n);
+	return ft_linear_node_get_nth_swar(type, node, node_flag_ptr, n, pf_hint);
 #else
 	{
 		uint8_t *values = &node->data[0];
@@ -3250,7 +3295,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 				ft_linear_pointers(node, type);
 			if (caa_unlikely(node_flag_ptr))
 				*node_flag_ptr = &pointers[i];
-			return ft_dereference_acquire(pointers[i]);
+			return ft_dereference_acquire_prefetch_hint(pointers[i], pf_hint);
 		}
 	}
 #endif
@@ -3380,11 +3425,11 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	struct cds_ft_inode *linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
 	/* Pool subnodes are always large enough for wide scan. */
-	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n);
+	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n, pf_hint);
 }
 
 static inline_lookup
@@ -3393,14 +3438,14 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth_1d(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
 	unsigned long index = ((unsigned long) n >> bitsel) & 0x1;
 	struct cds_ft_inode *linear = (struct cds_ft_inode *)
 			&node->data[index << FT_POOL_SIZE_ORDER];
 
-	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n);
+	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n, pf_hint);
 }
 
 static inline_lookup
@@ -3409,7 +3454,7 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth_2d(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	unsigned int C_n8_r2_index, subclass_index;
 	uint8_t bits[2];
@@ -3420,7 +3465,7 @@ struct cds_ft_inode_flag *ft_pool_node_get_nth_2d(
 	subclass_index = value_and_bits_to_subclass_index(n, bits);
 	linear = (struct cds_ft_inode *)
 			&node->data[subclass_index << FT_POOL_SIZE_ORDER];
-	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n);
+	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n, pf_hint);
 }
 
 static inline_lookup
@@ -3456,7 +3501,7 @@ retry:
 		else
 			match_v = cds_find_next_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n + 1);
 		if (match_v >= 0) {
-			match_node_flag = ft_pool_node_get_nth(type, node, node_flag, NULL, (uint8_t) match_v);
+			match_node_flag = ft_pool_node_get_nth(type, node, node_flag, NULL, (uint8_t) match_v, FT_PF_NONE);
 			/*
 			 * The source of truth is the pointer load from
 			 * get_nth. Continue the bitmap scan if the node
@@ -3522,14 +3567,14 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type __attribute__((unused)) *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	struct cds_ft_inode_flag **child_node_flag_ptr;
 	struct cds_ft_inode_flag *child_node_flag;
 
 	assert(!type || type->type_class == FT_PIGEON);
 	child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[n];
-	child_node_flag = ft_dereference_acquire(*child_node_flag_ptr);
+	child_node_flag = ft_dereference_acquire_prefetch_hint(*child_node_flag_ptr, pf_hint);
 	//dbg_printf("ft_pigeon_node_get_nth child_node_flag_ptr %p\n",
 	//	child_node_flag_ptr);
 	if (caa_unlikely(node_flag_ptr))
@@ -3610,7 +3655,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
 		struct cds_ft_inode *node,
 		uint8_t i)
 {
-	return ft_pigeon_node_get_nth(type, node, NULL, i);
+	return ft_pigeon_node_get_nth(type, node, NULL, i, FT_PF_NONE);
 }
 
 /*
@@ -3674,7 +3719,7 @@ static inline_lookup
  */
 struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	unsigned long tag = (unsigned long) node_flag & 0xF;
 	struct cds_ft_inode *node;
@@ -3723,7 +3768,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 * the remaining six cases.
 	 */
 	if (caa_likely(type_index == 1))
-		return ft_linear_scan_3(node, node_flag_ptr, n);
+		return ft_linear_scan_3(node, node_flag_ptr, n, pf_hint);
 	/*
 	 * Conditional on "not type 1", type 0 is the mode of the
 	 * remaining distribution (~40% of arrivals at this point).
@@ -3732,20 +3777,20 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 * type 0, the layout cost is a single jump for the other paths.
 	 */
 	if (caa_likely(type_index == 0))
-		return ft_linear_scan_1(node, node_flag_ptr, n);
+		return ft_linear_scan_1(node, node_flag_ptr, n, pf_hint);
 	switch (type_index) {
 	case 2:
-		return ft_linear_scan_8(node, node_flag_ptr, n);
+		return ft_linear_scan_8(node, node_flag_ptr, n, pf_hint);
 	case 3:
-		return ft_linear_scan_16(node, node_flag_ptr, n);
+		return ft_linear_scan_16(node, node_flag_ptr, n, pf_hint);
 	case 4:
-		return ft_linear_scan_32(node, node_flag_ptr, n);
+		return ft_linear_scan_32(node, node_flag_ptr, n, pf_hint);
 	case 5:
-		return ft_pool_scan_1d(node, node_flag, node_flag_ptr, n);
+		return ft_pool_scan_1d(node, node_flag, node_flag_ptr, n, pf_hint);
 	case 6:
-		return ft_pool_scan_2d(node, node_flag, node_flag_ptr, n);
+		return ft_pool_scan_2d(node, node_flag, node_flag_ptr, n, pf_hint);
 	case 7:
-		return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n);
+		return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
 	default:
 		/*
 		 * type_index is a 3-bit field masked from tag above, so
@@ -3766,15 +3811,15 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 */
 	if (caa_likely(bit & FT_MASK_LINEAR))
 		return ft_linear_node_get_nth(&ft_types[type_index], node,
-				node_flag_ptr, n);
+				node_flag_ptr, n, pf_hint);
 	if (bit & FT_MASK_POOL) {
 		if (bit & (1U << FT_POOL_IDX_A))
 			return ft_pool_node_get_nth_1d(&ft_types[type_index],
-					node, node_flag, node_flag_ptr, n);
+					node, node_flag, node_flag_ptr, n, pf_hint);
 		return ft_pool_node_get_nth_2d(&ft_types[type_index],
-				node, node_flag, node_flag_ptr, n);
+				node, node_flag, node_flag_ptr, n, pf_hint);
 	}
-	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n);
+	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
 	}
 #endif
 }
@@ -3788,11 +3833,11 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
 	struct cds_ft_inode_flag *child;
 
-	child = ft_node_get_nth_skip(node_flag, node_flag_ptr, n);
+	child = ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
 	if (ft_node_skip_compressed(child))
 		child = ft_compressed_node_flag(
 			ft_skip_to_compressed(child));
@@ -3837,7 +3882,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 				if (n_ret)
 					*n_ret = v;
 				if (slot_ret)
-					ft_node_get_nth(parent_nf, slot_ret, v);
+					ft_node_get_nth(parent_nf, slot_ret, v, FT_PF_NONE);
 				return true;
 			}
 		}
@@ -3862,7 +3907,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 					if (n_ret)
 						*n_ret = v;
 					if (slot_ret)
-						ft_node_get_nth(parent_nf, slot_ret, v);
+						ft_node_get_nth(parent_nf, slot_ret, v, FT_PF_NONE);
 					return true;
 				}
 			}
@@ -3881,7 +3926,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 				if (n_ret)
 					*n_ret = (uint8_t) i;
 				if (slot_ret)
-					ft_node_get_nth(parent_nf, slot_ret, i);
+					ft_node_get_nth(parent_nf, slot_ret, i, FT_PF_NONE);
 				return true;
 			}
 		}
@@ -5103,7 +5148,7 @@ skip_copy:
 				if (!iter)
 					continue;
 				ft_node_get_nth_skip(new_node_flag,
-						&slot, v);
+						&slot, v, FT_PF_NONE);
 				ft_set_parent(iter, new_node_flag, slot);
 			}
 			break;
@@ -5132,7 +5177,7 @@ skip_copy:
 					if (!iter)
 						continue;
 					ft_node_get_nth_skip(
-						new_node_flag, &slot, v);
+						new_node_flag, &slot, v, FT_PF_NONE);
 					ft_set_parent(iter,
 						new_node_flag, slot);
 				}
@@ -5152,7 +5197,7 @@ skip_copy:
 				if (!iter)
 					continue;
 				ft_node_get_nth_skip(new_node_flag,
-						&slot, i);
+						&slot, i, FT_PF_NONE);
 				ft_set_parent(iter, new_node_flag, slot);
 			}
 			break;
@@ -5345,7 +5390,7 @@ int ft_node_set_nth(struct cds_ft *ft,
 		struct cds_ft_inode_flag **slot_ptr = NULL;
 
 		if (ft_node_skip_compressed(child_node_flag))
-			ft_node_get_nth_skip(*node_flag, &slot_ptr, n);
+			ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
 		ft_set_parent(child_node_flag, *node_flag, slot_ptr);
 		break;
 	}
@@ -6035,8 +6080,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 		iter_key = *(key++);
 		node_flag = (candidate || !skip_compressed) ?
-			ft_node_get_nth_skip(node_flag, NULL, iter_key) :
-			ft_node_get_nth(node_flag, NULL, iter_key);
+			ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_NONE) :
+			ft_node_get_nth(node_flag, NULL, iter_key, FT_PF_NONE);
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
 		if (!ft_node_ptr(node_flag)) {
@@ -7109,7 +7154,7 @@ slow_path:
 		 * must be set regardless of whether descent continues.
 		 */
 		ordinal_key[level - 1] = key_value;
-		node_flag = ft_node_get_nth(node_flag, NULL, key_value);
+		node_flag = ft_node_get_nth(node_flag, NULL, key_value, FT_PF_NONE);
 		if (!ft_node_ptr(node_flag)) {
 			FT_TP(slowpath_step, (int) level, key_value,
 				(const void *) node_flag, 1);
@@ -8566,7 +8611,7 @@ void ft_init_node_density(struct cds_ft *ft,
 	meta = cds_ft_item_to_metadata(node);
 
 	for (key = 0; key < 256; key++) {
-		struct cds_ft_inode_flag *child = ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+		struct cds_ft_inode_flag *child = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 
 		if (!ft_node_ptr(child))
 			continue;
@@ -9623,7 +9668,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			struct cds_ft_inode_flag **slot = NULL;
 			struct cds_ft_inode_flag *child;
 
-			child = ft_node_get_nth(node_flag, &slot, kv);
+			child = ft_node_get_nth(node_flag, &slot, kv, FT_PF_NONE);
 			if (!slot || !ft_node_ptr(child))
 				break;
 			parent_slot = slot;
@@ -10513,7 +10558,7 @@ struct cds_ft_inode_flag *ft_descent_step(struct ft_descent *d,
 	d->ppnfp = d->pnfp;
 	d->pnf   = d->nf;
 	d->pnfp  = d->nfp;
-	d->nf    = ft_node_get_nth(d->pnf, &d->nfp, key_value);
+	d->nf    = ft_node_get_nth(d->pnf, &d->nfp, key_value, FT_PF_NONE);
 	d->depth++;
 	return d->nf;
 }
@@ -10916,7 +10961,7 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 					struct cds_ft_inode_flag *next;
 
 					next = ft_node_get_nth(cur, NULL,
-						ordinals[i + 1]);
+						ordinals[i + 1], FT_PF_NONE);
 					free_cds_ft_node(ft, ft_node_ptr(cur));
 					cur = next;
 					i++;
@@ -12044,7 +12089,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			continue;
 		}
 		key_value = *(iter_key++);
-		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value);
+		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value, FT_PF_NONE);
 		if (!ft_node_ptr(node_flag)) {
 			s = CDS_FT_STATUS_NOT_FOUND;
 			FT_TP(replace_exit, (int) s);
@@ -12592,7 +12637,7 @@ int ft_detach_node(struct cds_ft *ft,
 							for (key = 0; key < 256; key++) {
 								next = ft_node_get_nth(
 									walk_nf, NULL,
-									(uint8_t) key);
+									(uint8_t) key, FT_PF_NONE);
 								if (ft_node_ptr(next))
 									break;
 							}
@@ -13443,14 +13488,14 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 			/* Single-child internal prefix: find the slot
 			 * holding branch_flag within the prefix node. */
 			ft_node_get_nth(top_flag, &d->pnfp,
-					cn->key_bytes[0]);
+					cn->key_bytes[0], FT_PF_NONE);
 	} else {
 		d->pnfp = d->nfp;  /* branch IS the top, parent is the old parent */
 	}
 	{
 		uint8_t new_ordinal = iter_key[diverge_pos];
 
-		d->nf = ft_node_get_nth(branch_flag, &d->nfp, new_ordinal);
+		d->nf = ft_node_get_nth(branch_flag, &d->nfp, new_ordinal, FT_PF_NONE);
 		/* nf should be NULL: the branch only has the old direction. */
 	}
 	d->depth += diverge_pos + 1;
@@ -13794,7 +13839,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		d->pnfp = &ft_compressed_node_ptr(prefix_flag)->child;
 	else
 		ft_node_get_nth(prefix_flag, &d->pnfp,
-				cn->key_bytes[0]);
+				cn->key_bytes[0], FT_PF_NONE);
 	d->nf = suffix_flag;
 	d->nfp = d->pnfp;
 	d->depth += remaining;
@@ -13883,7 +13928,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 					struct cds_ft_inode_flag *next;
 					uint8_t kv = key[i + 1];
 
-					next = ft_node_get_nth(cur, NULL, kv);
+					next = ft_node_get_nth(cur, NULL, kv, FT_PF_NONE);
 					free_cds_ft_node(ft, ft_node_ptr(cur));
 					cur = next;
 					i++;
@@ -15288,7 +15333,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 			continue;
 		}
 		kv = prefix[i];
-		node_flag = ft_node_get_nth(node_flag, NULL, kv);
+		node_flag = ft_node_get_nth(node_flag, NULL, kv, FT_PF_NONE);
 	}
 
 	if (!ft_node_ptr(node_flag)) {
@@ -16057,7 +16102,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 
 		ordinal = key[i];
 		ordinal_key[i] = ordinal;
-		node_flag = ft_node_get_nth(node_flag, NULL, ordinal);
+		node_flag = ft_node_get_nth(node_flag, NULL, ordinal, FT_PF_NONE);
 		if (!ft_node_ptr(node_flag))
 			return -1;
 		iter_path_node(iter)[i + 1] = node_flag;
@@ -17570,7 +17615,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		/* Walk all 256 child slots. */
 		for (key = 0; key < 256; key++) {
 			struct cds_ft_inode_flag *child =
-				ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+				ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 
 			if (!ft_node_ptr(child))
 				continue;
@@ -17755,7 +17800,7 @@ int ft_verify_density_recursive(const struct cds_ft *ft, FILE *out,
 
 		for (key = 0; key < 256; key++) {
 			struct cds_ft_inode_flag *child =
-				ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+				ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 
 			if (!ft_node_ptr(child) || ft_node_external(child))
 				continue;
@@ -17888,7 +17933,7 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 	for (key = 0; key < 256; key++) {
 		struct cds_ft_inode_flag *child_node_flag;
 
-		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 		if (!ft_node_ptr(child_node_flag))
 			continue;
 		if (ft_node_collapsed(child_node_flag)) {
@@ -18166,7 +18211,7 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 		for (key = 0; key < 256; key++) {
 			struct cds_ft_inode_flag *child;
 
-			child = ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+			child = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 			if (!ft_node_ptr(child))
 				continue;
 			if (printed++) fprintf(out, ",");
@@ -18357,7 +18402,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 	for (key = 0; key < 256; key++) {
 		struct cds_ft_inode_flag *child_node_flag;
 
-		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key);
+		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 		if (!ft_node_ptr(child_node_flag))
 			continue;
 		if (ft_node_collapsed(child_node_flag)) {
