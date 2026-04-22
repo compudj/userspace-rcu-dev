@@ -328,8 +328,14 @@ struct cds_ft_density_extended {
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
 	struct cds_ft_inode_flag *parent;	/*
-						 * Tagged pointer to parent node (write-side only).
-						 * NULL for the root node.
+						 * Tagged pointer to parent node.  NULL at
+						 * the root node and during the brief window
+						 * between a detach / graft_swap clearing the
+						 * link and the new placement completing.
+						 * Written by the mutation side via
+						 * rcu_assign_pointer; read by the read side
+						 * (ft_skip_to_compressed, ft_get_parent_rcu)
+						 * via rcu_dereference.
 						 */
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
 

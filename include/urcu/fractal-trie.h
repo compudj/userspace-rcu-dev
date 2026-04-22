@@ -392,10 +392,11 @@ enum cds_ft_iter_path_mode {
  * false). Non-head nodes' prev pointers point to the preceding
  * cds_ft_node in the duplicate chain.
  *
- * The prev pointer is only used by the write side (mutex-held) and
- * the exact lookup path (ft_skip_to_compressed). It is not accessed
- * on the candidate lookup fast path. RCU readers only follow next
- * pointers.
+ * The prev pointer is written by the mutation side (mutex-held) and
+ * read by the write side and by the read side (exact lookup via
+ * ft_skip_to_compressed, ordered-traversal parent-pointer walk via
+ * ft_get_parent_rcu).  It is not accessed on the candidate lookup
+ * fast path — RCU candidate readers only follow next pointers.
  *
  * Note that removal from a Fractal Trie does _not_ reset node->next,
  * because it can still be accessed by concurrent RCU readers. After
@@ -410,9 +411,11 @@ struct cds_ft_node {
 	 * prev pointer: for the head of the duplicate chain, this points
 	 * to the parent internal node (flagged pointer, used by
 	 * CDS_FT_FLAG_SKIP_COMPRESSED to recover the compressed node
-	 * from a skip pointer). For non-head duplicates, this points to
-	 * the preceding cds_ft_node. Written by the mutation side
-	 * (mutex-held); read by exact lookup and write-side paths.
+	 * from a skip pointer, and by the ordered-traversal upward walk
+	 * to reach the parent without consulting a cached iterator
+	 * path). For non-head duplicates, this points to the preceding
+	 * cds_ft_node. Written by the mutation side via
+	 * rcu_assign_pointer; read on the read side via rcu_dereference.
 	 * Not accessed on the candidate lookup fast path.
 	 */
 	void *prev;

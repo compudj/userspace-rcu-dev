@@ -1482,7 +1482,8 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
  * For external (leaf) children: uses cds_ft_node.prev (which points
  * to the parent for the head of a duplicate chain).
  *
- * Write-side or exact lookup path only.
+ * Read-side safe (rcu_dereference on both fields).  Callers must be
+ * in an RCU read-side critical section (or QSBR equivalent).
  */
 static inline
 struct cds_ft_compressed_node *ft_skip_to_compressed(
@@ -1497,6 +1498,45 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
 		parent = rcu_dereference(cds_ft_item_to_metadata(
 			ft_node_ptr(child))->parent);
 	return ft_compressed_node_ptr(parent);
+}
+
+/*
+ * ft_get_parent_rcu: read the parent pointer of @node via
+ * rcu_dereference.
+ *
+ * For external (leaf) nodes: returns cds_ft_node.prev.  @node must
+ * be the head of its duplicate chain (non-head duplicates' prev
+ * points to the preceding node in the chain, not to the parent).
+ * Iterators and lookups maintain this invariant by convention —
+ * iter->node always refers to the chain head.
+ *
+ * For internal/compressed/collapsed nodes: returns metadata->parent.
+ *
+ * Returns NULL when @node is at the root position, or when @node
+ * has been orphaned by a concurrent detach / graft_swap that
+ * cleared its parent link.  A read-side parent-pointer walk that
+ * observes NULL terminates cleanly in either case.
+ *
+ * Read-side safe; the caller must be in an RCU read-side critical
+ * section (or QSBR equivalent).
+ *
+ * An assertion verifies the returned parent is never external: an
+ * external result would mean the caller passed a non-head duplicate
+ * chain entry (whose prev points at the preceding duplicate, not
+ * at the parent).
+ */
+static inline
+struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft_inode_flag *node)
+{
+	struct cds_ft_inode_flag *parent;
+
+	if (ft_node_external(node))
+		parent = rcu_dereference(((struct cds_ft_node *) node)->prev);
+	else
+		parent = rcu_dereference(cds_ft_item_to_metadata(
+			ft_node_ptr(node))->parent);
+	assert(!parent || !ft_node_external(parent));
+	return parent;
 }
 
 static inline
