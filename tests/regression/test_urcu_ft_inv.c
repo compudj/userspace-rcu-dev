@@ -267,13 +267,21 @@ static void report_violation(const char *test, const char *fmt, ...)
 static void report_violation(const char *test, const char *fmt, ...)
 {
 	va_list ap;
+	char msg[256];
 
 	atomic_fetch_add(&violation_count, 1);
 	va_start(ap, fmt);
-	fprintf(stderr, "[VIOLATION] %s: ", test);
-	vfprintf(stderr, fmt, ap);
-	fprintf(stderr, "\n");
+	vsnprintf(msg, sizeof(msg), fmt, ap);
 	va_end(ap);
+	fprintf(stderr, "[VIOLATION] %s: %s\n", test, msg);
+	FT_TEST_TP(inv_violation, test, msg);
+	/*
+	 * Abort on first violation so lttng-ust snapshot captures the
+	 * in-memory ring buffer up to the moment of the fault.  Useful
+	 * when running under `lttng record-snapshot` tracing.
+	 */
+	if (getenv("FT_INV_ABORT_ON_VIOLATION"))
+		abort();
 }
 
 /* ------------------------------------------------------------------ */
