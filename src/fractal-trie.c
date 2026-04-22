@@ -2741,29 +2741,116 @@ static inline void ft_maybe_prefetch(const void *ptr)
 /*
  * Per-caller prefetch hint for ft_node_get_nth_skip / ft_node_get_nth
  * and the underlying scanners.  Compile-time constant at each call
- * site — the switch inside ft_maybe_prefetch_hint folds away, leaving
- * a single prefetch (or none) per caller.
+ * site — the branches inside ft_maybe_prefetch_hint fold away, leaving
+ * at most a single prefetch per caller.
  *
- *   FT_PF_NONE: no prefetch.
- *   FT_PF_DATA: prefetch child's data (node body).  Right for candidate
- *               lookup and non-skip exact lookup that traverse the
- *               returned child's data next.
+ *   FT_PF_NONE:        no prefetch.
+ *   FT_PF_DATA:        prefetch child's data (node body).  Right for
+ *                      candidate lookup and non-skip exact lookup
+ *                      that traverse the returned child's data next.
+ *   FT_PF_META:        prefetch child's metadata cache line.  Right
+ *                      for inequality / lookup_nth / count_keys,
+ *                      which read metadata->external_nodes /
+ *                      metadata->nr_keys before further descent.
+ *                      For external children, prefetches the node
+ *                      body instead (no FT metadata exists).  For
+ *                      compressed / collapsed children, skips —
+ *                      their own handlers prefetch cn->child /
+ *                      col->data.
+ *   FT_PF_BITMAP_META: same as META plus prefetches the bitmap
+ *                      cache line for pool-2D / pigeon children
+ *                      (used by ordered get_direction traversal).
  *
- * Future hint variants (META, BITMAP_META) would target a child's
- * metadata / bitmap cache lines respectively — deferred until
- * cds_ft_item_to_metadata_fast / cds_ft_item_to_bitmap are inlinable
- * (currently cross-TU calls).
+ * The item's alloc order is derived from the tag bits directly
+ * (type_index + FT_ALLOC_ORDER_MIN) without loading ft_types[],
+ * and the node base address is derived from the tagged pointer via
+ * alignment masking (bits below the order are all zero because
+ * allocations are order-aligned, and the pool subclass bits in
+ * [4, order) are cleared along with the type tag).
  */
 enum ft_pf_target {
 	FT_PF_NONE,
 	FT_PF_DATA,
+	FT_PF_META,
+	FT_PF_BITMAP_META,
 };
+
+static inline __attribute__((always_inline))
+void ft_prefetch_child_meta(const void *ptr)
+{
+	unsigned long v = (unsigned long) ptr;
+
+	if (!v)
+		return;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
+#endif
+	if ((v & FT_INTERNAL_MASK) == 0) {
+		/*
+		 * External (bits 0-2 == 0): no FT metadata.  Prefetch the
+		 * node body, which the META-hint caller typically reads
+		 * next (user_data / ->next for the duplicate chain).
+		 * Compressed / collapsed children: their handlers
+		 * prefetch their own targets; skip here.
+		 */
+		if ((v & FT_TAG_MASK_WIDE) == 0)
+			__builtin_prefetch((const void *) v);
+		return;
+	}
+	{
+		size_t order = ((v & FT_TYPE_MASK) >> FT_INTERNAL_BITS)
+				+ FT_ALLOC_ORDER_MIN;
+		unsigned long align_mask = ~((1UL << order) - 1UL);
+		void *node = (void *) (v & align_mask);
+
+		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
+	}
+}
+
+static inline __attribute__((always_inline))
+void ft_prefetch_child_bitmap_meta(const void *ptr)
+{
+	unsigned long v = (unsigned long) ptr;
+
+	if (!v)
+		return;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
+#endif
+	if ((v & FT_INTERNAL_MASK) == 0) {
+		if ((v & FT_TAG_MASK_WIDE) == 0)
+			__builtin_prefetch((const void *) v);
+		return;
+	}
+	{
+		unsigned int type_index = (v & FT_TYPE_MASK) >> FT_INTERNAL_BITS;
+		size_t order = type_index + FT_ALLOC_ORDER_MIN;
+		unsigned long align_mask = ~((1UL << order) - 1UL);
+		void *node = (void *) (v & align_mask);
+
+		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
+		/* Pool-2D and pigeon are the bitmap types (type_index >= IDX_B). */
+		if (type_index >= FT_POOL_IDX_B)
+			__builtin_prefetch(cds_ft_item_to_bitmap(node, order));
+	}
+}
 
 static inline __attribute__((always_inline))
 void ft_maybe_prefetch_hint(const void *ptr, enum ft_pf_target hint)
 {
-	if (hint == FT_PF_DATA)
+	switch (hint) {
+	case FT_PF_NONE:
+		break;
+	case FT_PF_DATA:
 		ft_maybe_prefetch(ptr);
+		break;
+	case FT_PF_META:
+		ft_prefetch_child_meta(ptr);
+		break;
+	case FT_PF_BITMAP_META:
+		ft_prefetch_child_bitmap_meta(ptr);
+		break;
+	}
 }
 
 #define ft_dereference_acquire_prefetch_hint(p, hint)			\
