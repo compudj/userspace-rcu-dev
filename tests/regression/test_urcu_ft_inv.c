@@ -216,7 +216,7 @@ static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_o
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
-	if (cds_ft_create(group, &ft) < 0)
+	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
 	*group_out = group;
 	return ft;
@@ -1035,7 +1035,7 @@ static void *inv_graft_swap_writer(void *arg)
 
 	rcu_register_thread();
 
-	if (cds_ft_create(ctx->group, &swap) < 0)
+	if (cds_ft_create(ctx->group, NULL, &swap) < 0)
 		abort();
 
 	/* Prepare the first swap trie with range B keys. */
@@ -1116,7 +1116,7 @@ static int inv_graft_swap_atomicity(void)
 		return -1;
 	}
 	cds_ft_group_attr_destroy(attr);
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}

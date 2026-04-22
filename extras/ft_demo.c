@@ -169,9 +169,9 @@ int main(void)
 		return 1;
 	if (make_group(&col_group, 0) < 0)
 		return 1;
-	if (cds_ft_create(dns_group, &dns_ft) != CDS_FT_STATUS_OK)
+	if (cds_ft_create(dns_group, NULL, &dns_ft) != CDS_FT_STATUS_OK)
 		return 1;
-	if (cds_ft_create(col_group, &col_ft) != CDS_FT_STATUS_OK)
+	if (cds_ft_create(col_group, NULL, &col_ft) != CDS_FT_STATUS_OK)
 		return 1;
 
 	dns_nodes = calloc(NR_DNS_KEYS, sizeof(*dns_nodes));

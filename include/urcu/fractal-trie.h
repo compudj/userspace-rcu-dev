@@ -264,6 +264,7 @@ extern "C" {
 
 /* Opaque types forward declarations. */
 struct cds_ft;
+struct cds_ft_attr;
 struct cds_ft_group_attr;
 struct cds_ft_iter;
 struct cds_ft_group;
@@ -1081,7 +1082,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * important.
  *
  *   // Phase 1: populate offline, no locking needed.
- *   cds_ft_create(group, &staging);
+ *   cds_ft_create(group, NULL, &staging);
  *   for each (key, node) in batch:
  *       cds_ft_insert(staging, key, key_len, node);
  *
@@ -1296,20 +1297,20 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group);
 
 /*
  * cds_ft_create - Create a Fractal Trie.
- * @attr: Fractal Trie attributes.
+ * @ft_group: The Fractal Trie group.
+ * @attr: Per-instance Fractal Trie attributes (may be NULL for defaults).
  * @result_ft: Fractal Trie output. Set to the newly created trie on
  *          success, or NULL on error.
  *
- * The @attr pointer is used to specify the Fractal Trie attributes. If
- * NULL, use default attribute values. The @attr can be destroyed
- * by the caller immediately after cds_ft_create() returns. The caller
- * keeps ownership of @attr. Default attributes select a variable key
- * length.
+ * If @attr is NULL, defaults are used (exclusive = false).  The @attr
+ * can be destroyed by the caller immediately after cds_ft_create()
+ * returns; the caller keeps ownership of @attr.
  *
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
  * on error.
  */
 enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
+		const struct cds_ft_attr *attr,
 		struct cds_ft **result_ft);
 
 /*
@@ -1599,6 +1600,40 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  */
 enum cds_ft_status cds_ft_group_attr_set_flags(struct cds_ft_group_attr *attr,
 		unsigned int flags);
+
+/*
+ * cds_ft_attr_create - Create a per-instance Fractal Trie attribute
+ *                      structure.
+ * @result: Attribute output. Set to the newly created attribute
+ *          structure on success, or NULL on error.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
+ * on error.
+ */
+enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result);
+
+/*
+ * cds_ft_attr_destroy - Destroy a per-instance Fractal Trie attribute
+ *                       structure.
+ * @attr: Fractal Trie attributes.
+ */
+void cds_ft_attr_destroy(struct cds_ft_attr *attr);
+
+/*
+ * cds_ft_attr_set_exclusive - Set the exclusive access discipline
+ *                             attribute.
+ * @attr: Fractal Trie attributes.
+ * @exclusive: true if the trie will be accessed under exclusive
+ *             discipline (single-threaded or mutex-protected, no
+ *             concurrent RCU readers); false if concurrent RCU
+ *             readers are permitted.
+ *
+ * Default: false (concurrent RCU readers permitted).
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ */
+enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
+		bool exclusive);
 
 /*
  * Iterator management

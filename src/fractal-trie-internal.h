@@ -514,6 +514,16 @@ struct cds_ft {
 	unsigned long nr_fallback;		/* Number of fallback nodes used */
 
 	/*
+	 * Access discipline. When true, access is serialized
+	 * externally (single-threaded or mutex-protected) and no
+	 * concurrent RCU readers exist; mutation operations that
+	 * would otherwise require a grace period to re-parent a
+	 * subtree (graft, graft_swap) may skip synchronize_rcu().
+	 * When false, concurrent RCU readers are permitted.
+	 */
+	bool exclusive;
+
+	/*
 	 * Pre-allocated pool for density promotion (compact → extended).
 	 * Topped up at mutation entry (where -ENOMEM can be returned),
 	 * drawn from in ft_density_promote (after point of no return).
