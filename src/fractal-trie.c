@@ -6166,9 +6166,12 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		}
 
 		iter_key = *(key++);
-		node_flag = (candidate || !skip_compressed) ?
-			ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_NONE) :
-			ft_node_get_nth(node_flag, NULL, iter_key, FT_PF_NONE);
+		if (candidate)
+			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_DATA);
+		else if (!skip_compressed)
+			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_NONE);
+		else
+			node_flag = ft_node_get_nth(node_flag, NULL, iter_key, FT_PF_NONE);
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
 		if (!ft_node_ptr(node_flag)) {
