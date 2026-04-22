@@ -6396,11 +6396,12 @@ static int ft_collapsed_find_nearest(
 	uint8_t ref_data = ft_collapsed_load_data(col, ref_entry);
 	uint8_t *ref_suffix = ft_collapsed_suffix(col, ref_data, nr_e);
 	unsigned int ref_slen = ft_collapsed_suffix_len(col, ref_data, ref_entry, nr_e);
+	unsigned int count = ft_collapsed_count(nr_e);
 	int best = -1;
 	uint8_t best_data = 0;
 	unsigned int e;
 
-	for (e = 0; e < nr_e; e++) {
+	for (e = 0; e < count; e++) {
 		uint8_t *suffix;
 		unsigned int slen, mc;
 		int r;
