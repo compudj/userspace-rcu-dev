@@ -65,7 +65,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	11
+#define NR_TESTS	12
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2613,6 +2613,296 @@ static int inv_nr_keys_undercount(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 9: Ordered traversal never escapes its trie            */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Invariant: an ordered traversal on trie T (cds_ft_lookup_first /
+ * _last / _gt / _lt) must never return a key that belongs to a
+ * different trie.  Specifically, a concurrent graft from T to S
+ * followed by the reader continuing its traversal must not cause the
+ * reader to land in S's ancestor chain and return keys from S's
+ * namespace ("jumping out of the trie").
+ *
+ * Setup:
+ *   Two tries T and S in the same group, variable-length keys.
+ *   T is pre-populated with two key families:
+ *     - "T" + 2-byte index  (the mobile family, moved by the writer)
+ *     - "B" + 2-byte index  (the anchor family, stays in T)
+ *   S is pre-populated with:
+ *     - "S" + 2-byte index  (S's native namespace)
+ *   S reserves the "X" prefix as the landing slot for T's mobile
+ *   content during the cycle.
+ *
+ * Writer (one thread, mutex-serialised):
+ *   phase 1: detach "T" from T  (yields detached trie D, concurrent)
+ *            graft  D into S at "X"  (graft syncs because D is concurrent)
+ *   phase 2: detach "X" from S  (yields detached trie D', concurrent)
+ *            graft  D' back into T at "T"  (graft syncs)
+ *
+ * Readers (NR_READERS_DEFAULT threads):
+ *   alternate forward (lookup_first → lookup_gt chain) and reverse
+ *   (lookup_last → lookup_lt chain) iteration on T, and check that
+ *   every returned key has first byte 'T' or 'B'.  Any other prefix
+ *   ('S', 'X', or anything else) means the reader followed a stale
+ *   parent pointer into S's subtree — the jump-out bug.
+ */
+
+#define ESCAPE_POOL_PER_PREFIX	64
+
+struct inv_no_escape_ctx {
+	struct cds_ft *T;
+	struct cds_ft *S;
+	struct cds_ft_group *group;
+	pthread_mutex_t lock;
+	const char *test_name;
+};
+
+static void inv_no_escape_populate(struct cds_ft *ft, uint8_t prefix,
+		uint64_t value_base)
+{
+	unsigned int i;
+
+	for (i = 0; i < ESCAPE_POOL_PER_PREFIX; i++) {
+		uint8_t key[3] = { prefix, (uint8_t)(i >> 8), (uint8_t)(i & 0xff) };
+		struct ft_test_node *n = node_alloc(value_base + i);
+
+		if (cds_ft_insert(ft, key, 3, &n->node) < 0) {
+			node_free(n);
+			return;
+		}
+	}
+}
+
+static void *inv_no_escape_reader(void *arg)
+{
+	struct inv_no_escape_ctx *ctx = (struct inv_no_escape_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+
+	if (cds_ft_iter_create(ctx->T, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		bool reverse = (iters & 1) != 0;
+		enum cds_ft_status s;
+		unsigned int count = 0;
+		/*
+		 * Safety limit: a well-formed traversal of T sees at most
+		 * 2 * ESCAPE_POOL_PER_PREFIX keys (T* + B* families).
+		 * A much larger count signals the reader is looping
+		 * through a much larger structure than T (e.g. S's
+		 * contents after jumping out).
+		 */
+		const unsigned int max_count = ESCAPE_POOL_PER_PREFIX * 8;
+
+		rcu_read_lock();
+
+		if (reverse)
+			s = cds_ft_lookup_last(ctx->T, iter);
+		else
+			s = cds_ft_lookup_first(ctx->T, iter);
+
+		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
+			uint8_t k[16];
+			size_t kl;
+
+			cds_ft_iter_get_key(iter, k, sizeof(k), &kl);
+
+			if (kl == 0 || (k[0] != 'T' && k[0] != 'B')) {
+				report_violation(ctx->test_name,
+					"reader on T saw key prefix 0x%02x (len %zu) "
+					"— not in T or B namespace (iter #%lu, %s)",
+					kl > 0 ? (unsigned int) k[0] : 0u, kl, iters,
+					reverse ? "reverse" : "forward");
+				break;
+			}
+
+			if (reverse)
+				s = cds_ft_lookup_lt(ctx->T, iter);
+			else
+				s = cds_ft_lookup_gt(ctx->T, iter);
+		}
+		if (count >= max_count) {
+			report_violation(ctx->test_name,
+				"ordered traversal returned >= %u keys — suspected "
+				"escape into S's content (iter #%lu, %s)",
+				max_count, iters, reverse ? "reverse" : "forward");
+		}
+
+		rcu_read_unlock();
+
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_no_escape_writer(void *arg)
+{
+	struct inv_no_escape_ctx *ctx = (struct inv_no_escape_ctx *) arg;
+
+	rcu_register_thread();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft *D;
+		enum cds_ft_status s;
+
+		/* Phase 1: detach T's "T*" content, graft into S at "X". */
+		pthread_mutex_lock(&ctx->lock);
+		s = cds_ft_detach(ctx->T, (const uint8_t *)"T", 1, &D);
+		if (s == CDS_FT_STATUS_OK) {
+			enum cds_ft_status gs =
+				cds_ft_graft(ctx->S, (const uint8_t *)"X", 1, D);
+			if (gs == CDS_FT_STATUS_OK) {
+				cds_ft_destroy(D);
+			} else {
+				fprintf(stderr,
+					"inv_no_escape writer: graft T->S failed: %s\n",
+					cds_ft_status_to_string(gs));
+				pthread_mutex_unlock(&ctx->lock);
+				drain_trie_local(D);
+				rcu_barrier();
+				cds_ft_destroy(D);
+				continue;
+			}
+		}
+		pthread_mutex_unlock(&ctx->lock);
+
+		rcu_quiescent_state();
+
+		/* Phase 2: detach S's "X*" content, graft back into T at "T". */
+		pthread_mutex_lock(&ctx->lock);
+		s = cds_ft_detach(ctx->S, (const uint8_t *)"X", 1, &D);
+		if (s == CDS_FT_STATUS_OK) {
+			enum cds_ft_status gs =
+				cds_ft_graft(ctx->T, (const uint8_t *)"T", 1, D);
+			if (gs == CDS_FT_STATUS_OK) {
+				cds_ft_destroy(D);
+			} else {
+				fprintf(stderr,
+					"inv_no_escape writer: graft S->T failed: %s\n",
+					cds_ft_status_to_string(gs));
+				pthread_mutex_unlock(&ctx->lock);
+				drain_trie_local(D);
+				rcu_barrier();
+				cds_ft_destroy(D);
+				continue;
+			}
+		}
+		pthread_mutex_unlock(&ctx->lock);
+
+		rcu_quiescent_state();
+	}
+
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_ordered_no_escape_graft(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft *T, *S;
+	struct inv_no_escape_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writer;
+	unsigned int i;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(gattr, 16) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	if (cds_ft_group_create(gattr, &group) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(gattr);
+
+	if (cds_ft_create(group, NULL, &T) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &S) < 0) {
+		cds_ft_destroy(T);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Populate: T gets "T*" + "B*", S gets "S*" (leaves "X*" slot for writer). */
+	rcu_read_lock();
+	inv_no_escape_populate(T, 'T', 0);
+	inv_no_escape_populate(T, 'B', 10000);
+	inv_no_escape_populate(S, 'S', 100000);
+	rcu_read_unlock();
+
+	ctx.T = T;
+	ctx.S = S;
+	ctx.group = group;
+	pthread_mutex_init(&ctx.lock, NULL);
+	ctx.test_name = "inv_ordered_no_escape_graft";
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_no_escape_reader, &ctx);
+	pthread_create(&writer, NULL, inv_no_escape_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	pthread_join(writer, NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_ordered_no_escape_graft: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+
+	drain_trie_local(T);
+	drain_trie_local(S);
+	rcu_barrier();
+	cds_ft_destroy(T);
+	cds_ft_destroy(S);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -2658,6 +2948,9 @@ int main(int argc, char **argv)
 
 	diag("8. nr_keys undercount ordering");
 	RUN_TEST(inv_nr_keys_undercount);
+
+	diag("9. Ordered traversal never escapes its trie");
+	RUN_TEST(inv_ordered_no_escape_graft);
 
 	rcu_barrier();
 	rcu_unregister_thread();
