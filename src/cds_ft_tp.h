@@ -871,6 +871,38 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, metadata_set_external_nodes,
 	)
 )
 
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, inv_violation,
+	LTTNG_UST_TP_ARGS(
+		const char *, test_name,
+		const char *, message
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_string(test, test_name)
+		lttng_ust_field_string(msg, message)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, collapsed_suffix_len_bad,
+	LTTNG_UST_TP_ARGS(
+		const void *, col,
+		unsigned int, i,
+		unsigned int, nr_entries,
+		unsigned int, start,
+		unsigned int, end,
+		uint8_t, data_i,
+		uint8_t, data_prev
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, col, (uintptr_t) col)
+		lttng_ust_field_integer(unsigned int, i, i)
+		lttng_ust_field_integer(unsigned int, nr_entries, nr_entries)
+		lttng_ust_field_integer(unsigned int, start, start)
+		lttng_ust_field_integer(unsigned int, end, end)
+		lttng_ust_field_integer(uint8_t, data_i, data_i)
+		lttng_ust_field_integer(uint8_t, data_prev, data_prev)
+	)
+)
+
 #endif /* _FT_TP_H */
 
 #include <lttng/tracepoint-event.h>

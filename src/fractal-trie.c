@@ -2143,6 +2143,12 @@ unsigned int ft_collapsed_suffix_len(struct cds_ft_collapsed_node *cn,
 		end = ft_collapsed_scan_zone_size(nr_entries);
 	else
 		end = ft_collapsed_load_data(cn, i - 1) & mask;
+	if (end < start) {
+		FT_TP(collapsed_suffix_len_bad,
+			(const void *) cn, i, nr_entries,
+			start, end, data_i,
+			i == 0 ? 0 : ft_collapsed_load_data(cn, i - 1));
+	}
 	assert(end >= start);
 	return end - start;
 }
