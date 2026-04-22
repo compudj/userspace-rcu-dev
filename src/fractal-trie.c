@@ -7094,13 +7094,20 @@ slow_path:
 				key_value = 0xff;
 			break;
 		}
+		/*
+		 * Record ordinal_key[level - 1] BEFORE the NULL-break so the
+		 * going-up phase has the dispatch byte even for a dead-end
+		 * descent.  The parent-pointer walk keys off ordinal_key
+		 * (iter_key desyncs once level steps by span > 1), so this
+		 * must be set regardless of whether descent continues.
+		 */
+		ordinal_key[level - 1] = key_value;
 		node_flag = ft_node_get_nth(node_flag, NULL, key_value);
 		if (!ft_node_ptr(node_flag)) {
 			FT_TP(slowpath_step, (int) level, key_value,
 				(const void *) node_flag, 1);
 			break;
 		}
-		ordinal_key[level - 1] = key_value;
 		iter_path_node(iter)[level] = node_flag;
 		FT_TP(slowpath_step, (int) level, key_value,
 			(const void *) node_flag, 0);
