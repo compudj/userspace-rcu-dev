@@ -264,7 +264,7 @@ extern "C" {
 
 /* Opaque types forward declarations. */
 struct cds_ft;
-struct cds_ft_attr;
+struct cds_ft_group_attr;
 struct cds_ft_iter;
 struct cds_ft_group;
 
@@ -291,7 +291,7 @@ struct cds_ft_group;
  * pointers transparently.
  *
  * Architecture requirement: the pointer bits used by the encoding
- * must be zero for userspace pointers.  cds_ft_attr_set_flags()
+ * must be zero for userspace pointers.  cds_ft_group_attr_set_flags()
  * returns NOT_SUPPORTED on architectures where this cannot be
  * guaranteed.
  *
@@ -1258,7 +1258,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * Trie lifecycle
  */
 
-enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
+enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor);
 
@@ -1278,7 +1278,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
  * on error.
  */
 static inline
-enum cds_ft_status cds_ft_group_create(const struct cds_ft_attr *attr,
+enum cds_ft_status cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		struct cds_ft_group **result_ft_group)
 {
 	return _cds_ft_group_create(attr, result_ft_group, &rcu_flavor);
@@ -1532,23 +1532,23 @@ enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordin
  */
 
 /*
- * cds_ft_attr_create - Create a Fractal Trie attribute structure.
+ * cds_ft_group_attr_create - Create a Fractal Trie attribute structure.
  * @result: Attribute output. Set to the newly created attribute
  *          structure on success, or NULL on error.
  *
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
  * on error.
  */
-enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result);
+enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result);
 
 /*
- * cds_ft_attr_destroy - Destroy a Fractal Trie attribute structure.
+ * cds_ft_group_attr_destroy - Destroy a Fractal Trie attribute structure.
  * @attr: Fractal Trie attributes.
  */
-void cds_ft_attr_destroy(struct cds_ft_attr *attr);
+void cds_ft_group_attr_destroy(struct cds_ft_group_attr *attr);
 
 /*
- * cds_ft_attr_set_key_len - Set Fractal Trie key length attribute.
+ * cds_ft_group_attr_set_key_len - Set Fractal Trie key length attribute.
  * @attr: Fractal Trie attributes.
  * @key_len: Key length.
  * - CDS_FT_LEN_VARIABLE for variable length keys.
@@ -1558,10 +1558,10 @@ void cds_ft_attr_destroy(struct cds_ft_attr *attr);
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
  * on error.
  */
-enum cds_ft_status cds_ft_attr_set_key_len(struct cds_ft_attr *attr, size_t key_len);
+enum cds_ft_status cds_ft_group_attr_set_key_len(struct cds_ft_group_attr *attr, size_t key_len);
 
 /*
- * cds_ft_attr_set_max_key_len - Set the maximum key length attribute.
+ * cds_ft_group_attr_set_max_key_len - Set the maximum key length attribute.
  * @attr: Fractal Trie attributes.
  * @max_key_len: Maximum key length in bytes:
  * - n > 0: Limits keys to a maximum of n bytes.
@@ -1572,10 +1572,10 @@ enum cds_ft_status cds_ft_attr_set_key_len(struct cds_ft_attr *attr, size_t key_
  * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @max_key_len
  * exceeds implementation-defined limits.
  */
-enum cds_ft_status cds_ft_attr_set_max_key_len(struct cds_ft_attr *attr, size_t max_key_len);
+enum cds_ft_status cds_ft_group_attr_set_max_key_len(struct cds_ft_group_attr *attr, size_t max_key_len);
 
 /*
- * cds_ft_attr_set_key_map - Set Fractal Trie key map attribute.
+ * cds_ft_group_attr_set_key_map - Set Fractal Trie key map attribute.
  * @attr: Fractal Trie attributes.
  * @key_to_ordinal: Mapping from external key to ordered values.
  *                  (caller-provided array of CDS_FT_KEY_MAP_SIZE elements)
@@ -1585,11 +1585,11 @@ enum cds_ft_status cds_ft_attr_set_max_key_len(struct cds_ft_attr *attr, size_t 
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
  * on error.
  */
-enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
+enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key);
 
 /*
- * cds_ft_attr_set_flags - Set Fractal Trie group flags.
+ * cds_ft_group_attr_set_flags - Set Fractal Trie group flags.
  * @attr: Fractal Trie attributes.
  * @flags: Combination of CDS_FT_FLAG_* constants.
  *
@@ -1597,7 +1597,7 @@ enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
  *
  * Returns CDS_FT_STATUS_OK on success.
  */
-enum cds_ft_status cds_ft_attr_set_flags(struct cds_ft_attr *attr,
+enum cds_ft_status cds_ft_group_attr_set_flags(struct cds_ft_group_attr *attr,
 		unsigned int flags);
 
 /*

@@ -205,17 +205,17 @@ static int leak_check(void)
 
 static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_out)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
-	if (cds_ft_attr_set_key_len(attr, klen) < 0)
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, &ft) < 0)
 		abort();
 	*group_out = group;
@@ -1093,7 +1093,7 @@ static void *inv_graft_swap_writer(void *arg)
 
 static int inv_graft_swap_atomicity(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *live;
 	struct inv_graft_ctx ctx;
@@ -1105,17 +1105,17 @@ static int inv_graft_swap_atomicity(void)
 	 * Variable-length trie with max_key_len=4 so root-level
 	 * graft_swap (key_len=0) is accepted.
 	 */
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_max_key_len(attr, 4) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_max_key_len(attr, 4) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
