@@ -14019,6 +14019,17 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_OK;
 	}
 
+	/*
+	 * If src_ft permits concurrent RCU readers, drain them before
+	 * re-parenting its content into dst_ft: a reader inside src_ft
+	 * that followed src_ft's parent pointers after the re-parent
+	 * would escape into dst_ft's ancestor chain ("jumping out of
+	 * the trie").  Exclusive sources carry no such readers, so the
+	 * sync is skipped.
+	 */
+	if (!src_ft->exclusive)
+		src_ft->group->flavor->update_synchronize_rcu();
+
 	if (key_len == 0) {
 		struct cds_ft_metadata *dst_rmeta = ft_root_metadata(dst_ft);
 		struct cds_ft_inode *fresh_root;
@@ -14194,6 +14205,15 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		struct cds_ft_inode_flag *tmp = dst_ft->root;
 		size_t dm;
+		bool dst_was_exclusive = dst_ft->exclusive;
+
+		/*
+		 * Drain concurrent readers of either side before
+		 * re-parenting, to prevent readers in either trie from
+		 * following parent pointers across the swap boundary.
+		 */
+		if (!swap_ft->exclusive || !dst_ft->exclusive)
+			dst_ft->group->flavor->update_synchronize_rcu();
 
 		rcu_assign_pointer(dst_ft->root, swap_ft->root);
 		FT_TP(root_publish, (const void *) dst_ft,
@@ -14208,6 +14228,13 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				      swap_max, CMM_RELAXED);
 		uatomic_store(&swap_ft->max_used_key_len, dm,
 			      CMM_RELAXED);
+
+		/*
+		 * swap_ft now holds what was dst_ft's content; inherit
+		 * dst_ft's prior access discipline.  dst_ft keeps its
+		 * own discipline.
+		 */
+		swap_ft->exclusive = dst_was_exclusive;
 
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
@@ -14278,6 +14305,20 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		}
+
+		/*
+		 * If swap_ft permits concurrent RCU readers, drain them
+		 * before re-parenting old_swap_root into dst_ft: a reader
+		 * inside swap_ft that followed old_swap_root's parent
+		 * pointer after the re-parent would escape into dst_ft's
+		 * ancestor chain ("jumping out of the trie").  Exclusive
+		 * swap sources carry no such readers.  The displaced old
+		 * content gets its root parent cleared to NULL before
+		 * moving to swap_ft, so readers on the dst side stop
+		 * cleanly at the root and need no separate drain here.
+		 */
+		if (!swap_empty && !swap_ft->exclusive)
+			swap_ft->group->flavor->update_synchronize_rcu();
 
 		/*
 		 * Atomic store at graft point.  If swap is empty,
@@ -14415,6 +14456,12 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				      dm > key_len ? dm - key_len : 0,
 				      CMM_RELAXED);
 		}
+		/*
+		 * swap_ft now holds content displaced from dst_ft;
+		 * inherit dst_ft's access discipline for that content.
+		 * dst_ft keeps its own discipline.
+		 */
+		swap_ft->exclusive = dst_ft->exclusive;
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
@@ -14485,6 +14532,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			FT_TP(detach_exit, (int) status);
 			return status;
 		}
+		/* Detached trie inherits the source's access discipline. */
+		detached->exclusive = ft->exclusive;
 
 		/*
 		 * Allocate a fresh empty root for the source trie
@@ -14722,6 +14771,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				FT_TP(detach_exit, (int) status);
 				return status;
 			}
+			/* Detached trie inherits the source's access discipline. */
+			detached->exclusive = ft->exclusive;
 
 			/*
 			 * Propagate count removal through ancestors
@@ -16913,6 +16964,24 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 {
 	attr->exclusive = exclusive;
 	return CDS_FT_STATUS_OK;
+}
+
+void cds_ft_make_exclusive(struct cds_ft *ft)
+{
+	if (ft->exclusive)
+		return;
+	ft->group->flavor->update_synchronize_rcu();
+	ft->exclusive = true;
+}
+
+void cds_ft_make_concurrent(struct cds_ft *ft)
+{
+	ft->exclusive = false;
+}
+
+bool cds_ft_is_exclusive(const struct cds_ft *ft)
+{
+	return ft->exclusive;
 }
 
 enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,

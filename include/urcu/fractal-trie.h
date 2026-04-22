@@ -1636,6 +1636,49 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 		bool exclusive);
 
 /*
+ * cds_ft_make_exclusive - Transition a Fractal Trie to exclusive
+ *                         access discipline.
+ * @ft: The Fractal Trie.
+ *
+ * Blocks in synchronize_rcu() to drain any in-flight RCU readers,
+ * then marks the trie as exclusive.  Subsequent graft / graft_swap
+ * operations with this trie as source skip their internal
+ * synchronize_rcu().
+ *
+ * The caller asserts that no new RCU readers will enter the trie
+ * after this call returns (e.g. single-threaded access, or
+ * mutex-protected access without RCU readers) until a matching
+ * cds_ft_make_concurrent() call, if any.
+ *
+ * No-op if the trie is already exclusive.
+ */
+void cds_ft_make_exclusive(struct cds_ft *ft);
+
+/*
+ * cds_ft_make_concurrent - Transition a Fractal Trie to concurrent
+ *                          access discipline.
+ * @ft: The Fractal Trie.
+ *
+ * Marks the trie as permitting concurrent RCU readers.  Cheap:
+ * does not block.  Typically called before publishing the trie
+ * handle to reader threads.
+ *
+ * After this call, graft / graft_swap operations with this trie as
+ * source will internally synchronize_rcu() to drain readers before
+ * re-parenting the content into another trie.
+ */
+void cds_ft_make_concurrent(struct cds_ft *ft);
+
+/*
+ * cds_ft_is_exclusive - Query the access discipline of a Fractal Trie.
+ * @ft: The Fractal Trie.
+ *
+ * Returns true if the trie is currently in exclusive discipline,
+ * false if concurrent RCU readers are permitted.
+ */
+bool cds_ft_is_exclusive(const struct cds_ft *ft);
+
+/*
  * Iterator management
  *
  * It is recommended that the user keeps a per-thread pool of
