@@ -14411,11 +14411,15 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * entries.
 		 */
 		if (!ft_node_external(old_child)) {
-			/* Clear parent: old_child is now a root. */
+			/*
+			 * Clear parent: old_child is now a root.  Use
+			 * rcu_assign_pointer so read-side parent-pointer
+			 * walks see a single atomic transition.
+			 */
 			{
 				struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 					ft_node_ptr(old_child));
-				m->parent = NULL;
+				rcu_assign_pointer(m->parent, NULL);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				m->skip_slot_offset = 0;
 #endif
@@ -14556,11 +14560,15 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		detached->root = ft->root;
 		FT_TP(root_publish, (const void *) detached,
 			(const void *) detached->root);
-		/* Clear parent: this node is now a root. */
+		/*
+		 * Clear parent: this node is now a root.  Use
+		 * rcu_assign_pointer so read-side parent-pointer walks
+		 * see a single atomic transition.
+		 */
 		{
 			struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 				ft_node_ptr(detached->root));
-			m->parent = NULL;
+			rcu_assign_pointer(m->parent, NULL);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			m->skip_slot_offset = 0;
 #endif
@@ -14827,11 +14835,16 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				detached->root = child;
 				FT_TP(root_publish, (const void *) detached,
 					(const void *) detached->root);
-				/* Clear parent: this node is now a root. */
+				/*
+				 * Clear parent: this node is now a root.
+				 * Use rcu_assign_pointer so read-side
+				 * parent-pointer walks see a single atomic
+				 * transition.
+				 */
 				{
 					struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 						ft_node_ptr(child));
-					m->parent = NULL;
+					rcu_assign_pointer(m->parent, NULL);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					m->skip_slot_offset = 0;
 #endif
