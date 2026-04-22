@@ -44,7 +44,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 166
+#define NR_TESTS 173
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -12242,6 +12242,387 @@ fail_nounlock:
 
 /* ================================================================== */
 /*                                                                    */
+/*         17. EXCLUSIVE ACCESS DISCIPLINE TESTS                      */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Default access discipline is concurrent (exclusive = false) when
+ * attr is NULL.
+ */
+static int test_exclusive_default_is_concurrent(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = 0;
+
+	ft = create_varlen_ft(&group);
+	if (cds_ft_is_exclusive(ft)) {
+		fprintf(stderr, "exclusive_default_is_concurrent: expected concurrent\n");
+		ret = -1;
+	}
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * cds_ft_attr_set_exclusive(true) + cds_ft_create with that attr
+ * produces an exclusive trie.
+ */
+static int test_exclusive_attr_set_true(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft_attr *attr;
+	struct cds_ft *ft;
+	int ret = 0;
+
+	if (cds_ft_group_create(NULL, &group) < 0)
+		return -1;
+	if (cds_ft_attr_create(&attr) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_attr_set_exclusive(attr, true) < 0) {
+		cds_ft_attr_destroy(attr);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, attr, &ft) < 0) {
+		cds_ft_attr_destroy(attr);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	cds_ft_attr_destroy(attr);
+	if (!cds_ft_is_exclusive(ft)) {
+		fprintf(stderr, "exclusive_attr_set_true: expected exclusive\n");
+		ret = -1;
+	}
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * cds_ft_make_exclusive / cds_ft_make_concurrent round-trips; also
+ * exercises the idempotent exclusive → exclusive case (no-op).
+ */
+static int test_exclusive_make_transitions(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = 0;
+
+	ft = create_varlen_ft(&group);
+	if (cds_ft_is_exclusive(ft)) {
+		ret = -1;
+		goto end;
+	}
+	cds_ft_make_exclusive(ft);
+	if (!cds_ft_is_exclusive(ft)) {
+		ret = -1;
+		goto end;
+	}
+	/* Idempotent: already exclusive, should stay exclusive without syncing. */
+	cds_ft_make_exclusive(ft);
+	if (!cds_ft_is_exclusive(ft)) {
+		ret = -1;
+		goto end;
+	}
+	cds_ft_make_concurrent(ft);
+	if (cds_ft_is_exclusive(ft)) {
+		ret = -1;
+		goto end;
+	}
+	cds_ft_make_exclusive(ft);
+	if (!cds_ft_is_exclusive(ft)) {
+		ret = -1;
+		goto end;
+	}
+end:
+	if (ret)
+		fprintf(stderr, "exclusive_make_transitions: wrong state\n");
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * cds_ft_detach inherits the source's exclusive flag, in both
+ * directions.
+ */
+static int test_exclusive_detach_inherit(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *excl_src, *conc_src, *det_from_excl, *det_from_conc;
+	struct ft_test_node *n;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	/* Build two sources with different disciplines. */
+	excl_src = create_varlen_ft(&group);
+	cds_ft_make_exclusive(excl_src);
+	if (cds_ft_create(group, NULL, &conc_src) < 0)
+		goto out_excl;
+
+	/* Populate both so root-level detach has content to move. */
+	n = node_alloc(0);
+	s = cds_ft_insert(excl_src, (const uint8_t *)"a", 1, &n->node);
+	if (s < 0) { node_free(n); goto out_both; }
+	n = node_alloc(0);
+	s = cds_ft_insert(conc_src, (const uint8_t *)"a", 1, &n->node);
+	if (s < 0) { node_free(n); goto out_both; }
+
+	s = cds_ft_detach(excl_src, NULL, 0, &det_from_excl);
+	if (s != CDS_FT_STATUS_OK)
+		goto out_both;
+	if (!cds_ft_is_exclusive(det_from_excl)) {
+		fprintf(stderr, "detach_inherit: exclusive source → detached not exclusive\n");
+		goto out_det_excl;
+	}
+
+	s = cds_ft_detach(conc_src, NULL, 0, &det_from_conc);
+	if (s != CDS_FT_STATUS_OK)
+		goto out_det_excl;
+	if (cds_ft_is_exclusive(det_from_conc)) {
+		fprintf(stderr, "detach_inherit: concurrent source → detached exclusive\n");
+		drain_trie(det_from_conc);
+		rcu_barrier();
+		cds_ft_destroy(det_from_conc);
+		goto out_det_excl;
+	}
+
+	ret = 0;
+	drain_trie(det_from_conc);
+	rcu_barrier();
+	cds_ft_destroy(det_from_conc);
+out_det_excl:
+	drain_trie(det_from_excl);
+	rcu_barrier();
+	cds_ft_destroy(det_from_excl);
+out_both:
+	drain_trie(conc_src);
+	rcu_barrier();
+	cds_ft_destroy(conc_src);
+out_excl:
+	drain_trie(excl_src);
+	rcu_barrier();
+	cds_ft_destroy(excl_src);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Populate-then-graft workflow with an exclusive staging trie.
+ * Staging stays exclusive (no internal sync on graft); content
+ * correctly migrates into the concurrent live trie.
+ */
+static int test_exclusive_graft_from_exclusive(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft_attr *attr;
+	struct cds_ft *live, *staging;
+	struct cds_ft_node *found;
+	struct ft_test_node *n1, *n2;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	live = create_varlen_ft(&group);
+	if (cds_ft_attr_create(&attr) < 0)
+		goto out_live;
+	cds_ft_attr_set_exclusive(attr, true);
+	if (cds_ft_create(group, attr, &staging) < 0) {
+		cds_ft_attr_destroy(attr);
+		goto out_live;
+	}
+	cds_ft_attr_destroy(attr);
+
+	if (!cds_ft_is_exclusive(staging) || cds_ft_is_exclusive(live)) {
+		fprintf(stderr, "graft_from_exclusive: wrong initial state\n");
+		goto out_both;
+	}
+
+	n1 = node_alloc(0);
+	s = cds_ft_insert(staging, (const uint8_t *)"lo", 2, &n1->node);
+	if (s < 0) { node_free(n1); goto out_both; }
+	n2 = node_alloc(0);
+	s = cds_ft_insert(staging, (const uint8_t *)"lp", 2, &n2->node);
+	if (s < 0) { node_free(n2); goto out_both; }
+
+	rcu_read_lock();
+	s = cds_ft_graft(live, (const uint8_t *)"he", 2, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK)
+		goto out_both;
+	if (!cds_ft_empty(staging))
+		goto out_both;
+	rcu_read_lock();
+	s = cds_ft_lookup_key(live, (const uint8_t *)"helo", 4, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		rcu_read_unlock();
+		goto out_both;
+	}
+	s = cds_ft_lookup_key(live, (const uint8_t *)"help", 4, &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !found)
+		goto out_both;
+
+	/* Discipline flags are unchanged by graft. */
+	if (!cds_ft_is_exclusive(staging) || cds_ft_is_exclusive(live)) {
+		fprintf(stderr, "graft_from_exclusive: post-graft state changed\n");
+		goto out_both;
+	}
+	ret = 0;
+out_both:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+out_live:
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Root-level graft_swap: swap inherits dst's pre-swap exclusive
+ * state; dst keeps its own discipline.  Exercises both combinations
+ * (exclusive dst, concurrent swap) and vice versa.
+ */
+static int test_exclusive_graft_swap_inherit_root(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *swp;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	/* Case 1: dst exclusive, swp concurrent — swp becomes exclusive. */
+	dst = create_varlen_ft(&group);
+	cds_ft_make_exclusive(dst);
+	if (cds_ft_create(group, NULL, &swp) < 0)
+		goto out_case1_dst_only;
+	/* Populate dst so swap has content to exchange. */
+	{
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(dst, (const uint8_t *)"x", 1, &n->node);
+		if (s < 0) { node_free(n); goto out_case1; }
+	}
+	rcu_read_lock();
+	s = cds_ft_graft_swap(dst, NULL, 0, swp);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK)
+		goto out_case1;
+	if (!cds_ft_is_exclusive(dst) || !cds_ft_is_exclusive(swp)) {
+		fprintf(stderr, "graft_swap_inherit_root: case 1 bad state\n");
+		goto out_case1;
+	}
+	drain_trie(dst);
+	drain_trie(swp);
+	rcu_barrier();
+	cds_ft_destroy(swp);
+out_case1_dst_only:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+
+	/* Case 2: dst concurrent, swp exclusive — swp becomes concurrent. */
+	dst = create_varlen_ft(&group);
+	{
+		struct cds_ft_attr *attr;
+		if (cds_ft_attr_create(&attr) < 0)
+			goto out_case2_dst_only;
+		cds_ft_attr_set_exclusive(attr, true);
+		if (cds_ft_create(group, attr, &swp) < 0) {
+			cds_ft_attr_destroy(attr);
+			goto out_case2_dst_only;
+		}
+		cds_ft_attr_destroy(attr);
+	}
+	{
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(dst, (const uint8_t *)"y", 1, &n->node);
+		if (s < 0) { node_free(n); goto out_case2; }
+	}
+	rcu_read_lock();
+	s = cds_ft_graft_swap(dst, NULL, 0, swp);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK)
+		goto out_case2;
+	if (cds_ft_is_exclusive(dst) || cds_ft_is_exclusive(swp)) {
+		fprintf(stderr, "graft_swap_inherit_root: case 2 bad state\n");
+		goto out_case2;
+	}
+	ret = 0;
+out_case2:
+	drain_trie(dst);
+	drain_trie(swp);
+	rcu_barrier();
+	cds_ft_destroy(swp);
+out_case2_dst_only:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+
+out_case1:
+	drain_trie(dst);
+	drain_trie(swp);
+	rcu_barrier();
+	cds_ft_destroy(swp);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
+/*
+ * Non-root graft_swap at a prefix: swap inherits dst's exclusive
+ * state (the displaced subtree came from dst).
+ */
+static int test_exclusive_graft_swap_inherit_non_root(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *swp;
+	struct ft_test_node *n;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	/* dst exclusive with content at "he*"; swp concurrent with content "*". */
+	dst = create_varlen_ft(&group);
+	cds_ft_make_exclusive(dst);
+	n = node_alloc(0);
+	s = cds_ft_insert(dst, (const uint8_t *)"helo", 4, &n->node);
+	if (s < 0) { node_free(n); goto out_dst; }
+
+	if (cds_ft_create(group, NULL, &swp) < 0)
+		goto out_dst;
+	n = node_alloc(0);
+	s = cds_ft_insert(swp, (const uint8_t *)"lx", 2, &n->node);
+	if (s < 0) { node_free(n); goto out_both; }
+
+	rcu_read_lock();
+	s = cds_ft_graft_swap(dst, (const uint8_t *)"he", 2, swp);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK)
+		goto out_both;
+
+	/* dst still exclusive; swp inherited dst's pre-swap exclusive = true. */
+	if (!cds_ft_is_exclusive(dst) || !cds_ft_is_exclusive(swp)) {
+		fprintf(stderr, "graft_swap_inherit_non_root: bad state\n");
+		goto out_both;
+	}
+	ret = 0;
+out_both:
+	drain_trie(swp);
+	rcu_barrier();
+	cds_ft_destroy(swp);
+out_dst:
+	drain_trie(dst);
+	rcu_barrier();
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -12481,6 +12862,16 @@ int main(int argc, char **argv)
 	RUN_TEST(test_density_remove_through_compress);
 	RUN_TEST(test_density_graft_swap);
 	RUN_TEST(test_density_stress);
+
+	/* 17. Exclusive access discipline tests */
+	diag("Exclusive access discipline tests");
+	RUN_TEST(test_exclusive_default_is_concurrent);
+	RUN_TEST(test_exclusive_attr_set_true);
+	RUN_TEST(test_exclusive_make_transitions);
+	RUN_TEST(test_exclusive_detach_inherit);
+	RUN_TEST(test_exclusive_graft_from_exclusive);
+	RUN_TEST(test_exclusive_graft_swap_inherit_root);
+	RUN_TEST(test_exclusive_graft_swap_inherit_non_root);
 
 	rcu_barrier();
 	rcu_unregister_thread();
