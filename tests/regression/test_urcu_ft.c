@@ -273,22 +273,22 @@ int test_1byte_key(void)
 	uint64_t ka[] = { 5, 17, 100, 222 };
 	uint64_t ka_test_offset = 5;
 	struct cds_ft_node *ft_node;
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_iter *iter;
 	uint8_t ftkey[1];
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
-	if (cds_ft_attr_set_key_len(attr, 1) < 0)
+	if (cds_ft_group_attr_set_key_len(attr, 1) < 0)
 		abort();
 
 	/* Test with 1-byte key */
 	if (cds_ft_group_create(attr, &test_ft_group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		printf("Error allocating Fractal Trie group.\n");
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(test_ft_group, &test_ft) < 0) {
 		cds_ft_group_destroy(test_ft_group);
 		printf("Error allocating Fractal Trie.\n");
@@ -509,22 +509,22 @@ int test_2bytes_key(void)
 	uint64_t key;
 	uint64_t ka[] = { 105, 206, 4000, 4111, 59990, 65435 };
 	uint64_t ka_test_offset = 100;
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_iter *iter;
 	uint8_t ftkey[2];
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
-	if (cds_ft_attr_set_key_len(attr, 2) < 0)
+	if (cds_ft_group_attr_set_key_len(attr, 2) < 0)
 		abort();
 
 	/* Test with 2-bytes key */
 	if (cds_ft_group_create(attr, &test_ft_group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		printf("Error allocating Fractal Trie group.\n");
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(test_ft_group, &test_ft) < 0) {
 		cds_ft_group_destroy(test_ft_group);
 		printf("Error allocating Fractal Trie.\n");
@@ -758,7 +758,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 	enum cds_ft_status status;
 	struct cds_ft_node *ft_node;
 	unsigned int bits = len * CHAR_BIT;
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_iter *iter;
 
 	if (len == 8)
@@ -766,18 +766,18 @@ int test_sparse_key(unsigned int len, int nr_dup)
 	else
 		max_key = (1ULL << bits) - 1;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
-	if (cds_ft_attr_set_key_len(attr, len) < 0)
+	if (cds_ft_group_attr_set_key_len(attr, len) < 0)
 		abort();
 
 	printf("Sparse key test begins for %u-byte keys\n", len);
 	if (cds_ft_group_create(attr, &test_ft_group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		printf("Error allocating Fractal Trie group.\n");
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(test_ft_group, &test_ft) < 0) {
 		cds_ft_group_destroy(test_ft_group);
 		printf("Error allocating Fractal Trie.\n");
@@ -1151,20 +1151,20 @@ static
 int do_sanity_test_varlen_dup(int nr_dup)
 {
 	int i, ret;
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 
 	printf("Variable length key sanity test start.\n");
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
 	/* Use variable length keys (default). */
 
 	if (cds_ft_group_create(attr, &test_ft_group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		printf("Error allocating Fractal Trie group.\n");
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(test_ft_group, &test_ft) < 0) {
 		cds_ft_group_destroy(test_ft_group);
 		printf("Error allocating Fractal Trie.\n");
@@ -1408,20 +1408,20 @@ static
 int do_test_varlen_string(void)
 {
 	int ret;
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 
 	printf("Variable length string key test start.\n");
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
 	/* Use variable length keys (default). */
 
 	if (cds_ft_group_create(attr, &test_ft_group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		printf("Error allocating Fractal Trie group.\n");
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(test_ft_group, &test_ft) < 0) {
 		cds_ft_group_destroy(test_ft_group);
 		printf("Error allocating Fractal Trie.\n");
@@ -1740,26 +1740,26 @@ int do_mt_test(void)
 	unsigned long long tot_reads = 0, tot_writes = 0,
 		tot_insert = 0, tot_insert_exist = 0, tot_remove = 0;
 	unsigned int remain;
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 
 	tid_reader = malloc(sizeof(*tid_reader) * nr_readers);
 	tid_writer = malloc(sizeof(*tid_writer) * nr_writers);
 	count_reader = malloc(sizeof(*count_reader) * nr_readers);
 	count_writer = malloc(sizeof(*count_writer) * nr_writers);
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
-	if (cds_ft_attr_set_key_len(attr, key_len) < 0)
+	if (cds_ft_group_attr_set_key_len(attr, key_len) < 0)
 		abort();
 
 	printf("Allocating Fractal Trie for %u-byte keys\n", key_len);
 	if (cds_ft_group_create(attr, &test_ft_group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		printf("Error allocating Fractal Trie group.\n");
 		ret = -1;
 		goto end;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(test_ft_group, &test_ft) < 0) {
 		cds_ft_group_destroy(test_ft_group);
 		printf("Error allocating Fractal Trie.\n");
@@ -1871,7 +1871,7 @@ static const char *torture_test_strings[] = {
 static
 int do_test_dictionary(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_iter *iter;
 	char *line = NULL;
 	size_t len = 0;
@@ -1880,16 +1880,16 @@ int do_test_dictionary(void)
 
 	printf("Allocating Fractal Trie string keys\n");
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
 	/* Use variable length keys (default). */
 
 	if (cds_ft_group_create(attr, &test_ft_group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		printf("Error allocating Fractal Trie group.\n");
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(test_ft_group, &test_ft) < 0) {
 		cds_ft_group_destroy(test_ft_group);
 		printf("Error allocating Fractal Trie.\n");

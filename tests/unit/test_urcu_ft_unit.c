@@ -187,17 +187,17 @@ static int leak_check(void)
  */
 static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_out)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
-	if (cds_ft_attr_set_key_len(attr, klen) < 0)
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, &ft) < 0)
 		abort();
 	*group_out = group;
@@ -352,26 +352,26 @@ static int test_lifecycle_nil_only_trie(void)
 }
 
 /*
- * Exercise cds_ft_attr_set_max_key_len.
+ * Exercise cds_ft_group_attr_set_max_key_len.
  */
 static int test_lifecycle_max_key_len(void)
 {
 	struct cds_ft_group *group;
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft *ft;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
 	/* Variable-length keys with a 32-byte maximum. */
-	if (cds_ft_attr_set_max_key_len(attr, 32) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_max_key_len(attr, 32) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
@@ -394,7 +394,7 @@ static int test_lifecycle_max_key_len(void)
 static int test_lifecycle_key_map(void)
 {
 	struct cds_ft_group *group;
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft *ft;
 	uint8_t k2o[CDS_FT_KEY_MAP_SIZE], o2k[CDS_FT_KEY_MAP_SIZE];
 	uint8_t k2o_out[CDS_FT_KEY_MAP_SIZE], o2k_out[CDS_FT_KEY_MAP_SIZE];
@@ -407,22 +407,22 @@ static int test_lifecycle_key_map(void)
 		o2k[i] = (uint8_t)(255 - i);
 	}
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_key_len(attr, 1) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_key_len(attr, 1) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	s = cds_ft_attr_set_key_map(attr, k2o, o2k);
+	s = cds_ft_group_attr_set_key_map(attr, k2o, o2k);
 	if (s < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
@@ -4386,23 +4386,23 @@ static int test_graft_self_error(void)
  */
 static int test_graft_overflow_error(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *live, *staging;
 	enum cds_ft_status s;
 
 	/* Create a group with max_key_len = 4. */
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_max_key_len(attr, 4) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_max_key_len(attr, 4) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &live) < 0) {
 		cds_ft_group_destroy(group);
@@ -5165,7 +5165,7 @@ static int test_detach_empty_trie(void)
  */
 static int test_graft_swap_fixed_key(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *live, *swap;
 	struct cds_ft_node *found;
@@ -5179,17 +5179,17 @@ static int test_graft_swap_fixed_key(void)
 	 * root-level swap (key_len = 0) is accepted while key
 	 * values match the 4-byte integer encoding.
 	 */
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_max_key_len(attr, klen) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_max_key_len(attr, klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &live) < 0) {
 		cds_ft_group_destroy(group);
@@ -5287,7 +5287,7 @@ fail:
  */
 static int test_fixed_graft_at_root(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *live, *staging;
 	struct cds_ft_node *found;
@@ -5296,17 +5296,17 @@ static int test_fixed_graft_at_root(void)
 	uint8_t k[4];
 	const size_t klen = 4;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &live) < 0) {
 		cds_ft_group_destroy(group);
@@ -5396,24 +5396,24 @@ fail:
  */
 static int test_fixed_graft_nonroot_error(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *live, *staging;
 	enum cds_ft_status s;
 	uint8_t k[4];
 	const size_t klen = 4;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &live) < 0) {
 		cds_ft_group_destroy(group);
@@ -5473,7 +5473,7 @@ fail:
  */
 static int test_fixed_graft_swap_at_root(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *live, *swap;
 	struct cds_ft_node *found;
@@ -5482,17 +5482,17 @@ static int test_fixed_graft_swap_at_root(void)
 	uint8_t k[4];
 	const size_t klen = 4;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &live) < 0) {
 		cds_ft_group_destroy(group);
@@ -5624,24 +5624,24 @@ fail:
  */
 static int test_fixed_graft_swap_nonroot_error(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *live, *swap;
 	enum cds_ft_status s;
 	uint8_t k[4];
 	const size_t klen = 4;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &live) < 0) {
 		cds_ft_group_destroy(group);
@@ -5698,7 +5698,7 @@ fail:
  */
 static int test_fixed_detach_at_root(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft, *detached = NULL;
 	struct cds_ft_node *found;
@@ -5707,17 +5707,17 @@ static int test_fixed_detach_at_root(void)
 	uint8_t k[4];
 	const size_t klen = 4;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &ft) < 0) {
 		cds_ft_group_destroy(group);
@@ -5813,24 +5813,24 @@ fail:
  */
 static int test_fixed_detach_nonroot_error(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft, *detached = NULL;
 	enum cds_ft_status s;
 	uint8_t k[4];
 	const size_t klen = 4;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &ft) < 0) {
 		cds_ft_group_destroy(group);
@@ -6398,23 +6398,23 @@ static int test_group_destroy_busy_error(void)
  */
 static int test_graft_swap_overflow_error(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *live, *swap;
 	enum cds_ft_status s;
 
 	/* max_key_len = 4. */
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_max_key_len(attr, 4) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_max_key_len(attr, 4) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &live) < 0) {
 		cds_ft_group_destroy(group);
@@ -6632,23 +6632,23 @@ static int test_insert_replace_no_existing(void)
  */
 static int test_insert_exceeds_max_key_len(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	struct ft_test_node *n;
 	enum cds_ft_status s;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_max_key_len(attr, 4) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_max_key_len(attr, 4) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &ft) < 0) {
 		cds_ft_group_destroy(group);
@@ -6684,24 +6684,24 @@ static int test_insert_exceeds_max_key_len(void)
  */
 static int test_graft_detach_len_default(void)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft, *other, *detached = NULL;
 	enum cds_ft_status s;
 	uint8_t k[4];
 	const size_t klen = 4;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	if (cds_ft_attr_set_key_len(attr, klen) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 
 	if (cds_ft_create(group, &ft) < 0) {
 		cds_ft_group_destroy(group);
@@ -8262,7 +8262,7 @@ out:
 static int test_adversarial_max_depth(void)
 {
 	struct cds_ft_group *probe_group, *group;
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft *probe_ft, *ft;
 	struct cds_ft_iter *iter;
 	struct cds_ft_node *found;
@@ -8302,17 +8302,17 @@ static int test_adversarial_max_depth(void)
 	for (i = 0; i < max_klen; i++)
 		key_alt[i] = (i & 1) ? 0x55 : 0xAA;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		goto out_free_keys;
-	if (cds_ft_attr_set_key_len(attr, max_klen) < 0) {
-		cds_ft_attr_destroy(attr);
+	if (cds_ft_group_attr_set_key_len(attr, max_klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
 		goto out_free_keys;
 	}
 	if (cds_ft_group_create(attr, &group) < 0) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		goto out_free_keys;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		goto out_free_keys;
@@ -10516,17 +10516,17 @@ fail:
 /* Create a variable-length trie with CDS_FT_FLAG_SKIP_COMPRESSED. */
 static struct cds_ft *create_skip_compressed_ft(struct cds_ft_group **group_out)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
-	cds_ft_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
-	cds_ft_attr_set_flags(attr, CDS_FT_FLAG_SKIP_COMPRESSED);
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_flags(attr, CDS_FT_FLAG_SKIP_COMPRESSED);
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, &ft) < 0)
 		abort();
 	*group_out = group;

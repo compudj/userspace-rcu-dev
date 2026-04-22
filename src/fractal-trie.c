@@ -107,7 +107,7 @@ ft_delay_init(void)
 
 #define CDS_FT_LEN_ERROR		SIZE_MAX
 
-struct cds_ft_attr {
+struct cds_ft_group_attr {
 	size_t key_len;
 	size_t max_key_len;
 	struct cds_ft_key_map key_map;
@@ -16795,9 +16795,9 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft)
 	return count;
 }
 
-enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
+enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 {
-	struct cds_ft_attr *attr = calloc(1, sizeof(struct cds_ft_attr));
+	struct cds_ft_group_attr *attr = calloc(1, sizeof(struct cds_ft_group_attr));
 
 	if (!attr) {
 		*result = NULL;
@@ -16810,18 +16810,18 @@ enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 	return CDS_FT_STATUS_OK;
 }
 
-void cds_ft_attr_destroy(struct cds_ft_attr *attr)
+void cds_ft_group_attr_destroy(struct cds_ft_group_attr *attr)
 {
 	free(attr);
 }
 
-enum cds_ft_status cds_ft_attr_set_key_len(struct cds_ft_attr *attr, size_t key_len)
+enum cds_ft_status cds_ft_group_attr_set_key_len(struct cds_ft_group_attr *attr, size_t key_len)
 {
 	attr->key_len = key_len;
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_attr_set_max_key_len(struct cds_ft_attr *attr, size_t max_key_len)
+enum cds_ft_status cds_ft_group_attr_set_max_key_len(struct cds_ft_group_attr *attr, size_t max_key_len)
 {
 	if (max_key_len == CDS_FT_MAX_LEN_UNLIMITED) {
 		attr->max_key_len = FT_MAX_KEY_LEN;
@@ -16833,7 +16833,7 @@ enum cds_ft_status cds_ft_attr_set_max_key_len(struct cds_ft_attr *attr, size_t 
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
+enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key)
 {
 	attr->key_map.identity = false;
@@ -16850,7 +16850,7 @@ enum cds_ft_status cds_ft_attr_set_key_map(struct cds_ft_attr *attr,
  * used safely.  ENOMEM (address beyond TASK_SIZE) confirms the bit is
  * available.
  *
- * Called once from cds_ft_attr_set_flags when CDS_FT_FLAG_SKIP_COMPRESSED
+ * Called once from cds_ft_group_attr_set_flags when CDS_FT_FLAG_SKIP_COMPRESSED
  * is requested.
  */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -16872,7 +16872,7 @@ bool ft_skip_compressed_validate(void)
 }
 #endif
 
-enum cds_ft_status cds_ft_attr_set_flags(struct cds_ft_attr *attr,
+enum cds_ft_status cds_ft_group_attr_set_flags(struct cds_ft_group_attr *attr,
 		unsigned int flags)
 {
 #ifndef FEATURE_FT_SKIP_COMPRESSED
@@ -16887,7 +16887,7 @@ enum cds_ft_status cds_ft_attr_set_flags(struct cds_ft_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status _cds_ft_group_create(const struct cds_ft_attr *attr,
+enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor)
 {

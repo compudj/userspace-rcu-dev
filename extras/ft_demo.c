@@ -98,18 +98,18 @@ static const char *col_keys[] = {
 
 static int make_group(struct cds_ft_group **group_out, unsigned int flags)
 {
-	struct cds_ft_attr *attr;
+	struct cds_ft_group_attr *attr;
 
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
-	cds_ft_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	if (flags)
-		cds_ft_attr_set_flags(attr, flags);
+		cds_ft_group_attr_set_flags(attr, flags);
 	if (cds_ft_group_create(attr, group_out) != CDS_FT_STATUS_OK) {
-		cds_ft_attr_destroy(attr);
+		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
-	cds_ft_attr_destroy(attr);
+	cds_ft_group_attr_destroy(attr);
 	return 0;
 }
 
