@@ -198,7 +198,7 @@ static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_o
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
-	if (cds_ft_create(group, &ft) < 0)
+	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
 	*group_out = group;
 	return ft;
@@ -212,7 +212,7 @@ static struct cds_ft *create_varlen_ft(struct cds_ft_group **group_out)
 
 	if (cds_ft_group_create(NULL, &group) < 0)
 		abort();
-	if (cds_ft_create(group, &ft) < 0)
+	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
 	*group_out = group;
 	return ft;
@@ -273,7 +273,7 @@ static int test_lifecycle_defaults(void)
 
 	if (cds_ft_group_create(NULL, &group) < 0)
 		return -1;
-	if (cds_ft_create(group, &ft) < 0) {
+	if (cds_ft_create(group, NULL, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
@@ -372,7 +372,7 @@ static int test_lifecycle_max_key_len(void)
 		return -1;
 	}
 	cds_ft_group_attr_destroy(attr);
-	if (cds_ft_create(group, &ft) < 0) {
+	if (cds_ft_create(group, NULL, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
@@ -423,7 +423,7 @@ static int test_lifecycle_key_map(void)
 		return -1;
 	}
 	cds_ft_group_attr_destroy(attr);
-	if (cds_ft_create(group, &ft) < 0) {
+	if (cds_ft_create(group, NULL, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
@@ -1234,7 +1234,7 @@ static int test_count_keys_graft_detach(void)
 	unsigned long keys;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -4049,7 +4049,7 @@ static int test_graft_basic(void)
 	unsigned long count;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -4135,7 +4135,7 @@ static int test_graft_displaced_external_compressed(void)
 	enum cds_ft_status s;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -4202,7 +4202,7 @@ static int test_graft_at_root(void)
 	enum cds_ft_status s;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -4261,7 +4261,7 @@ static int test_graft_populated_error(void)
 	enum cds_ft_status s;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -4404,11 +4404,11 @@ static int test_graft_overflow_error(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -4487,7 +4487,7 @@ static int test_graft_swap_basic(void)
 	unsigned long count;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &swap) < 0) {
+	if (cds_ft_create(group, NULL, &swap) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -4595,7 +4595,7 @@ static int test_graft_swap_into_empty(void)
 	enum cds_ft_status s;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &swap) < 0) {
+	if (cds_ft_create(group, NULL, &swap) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -4664,7 +4664,7 @@ static int test_graft_swap_at_root(void)
 	unsigned long live_count, swap_count;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &swap) < 0) {
+	if (cds_ft_create(group, NULL, &swap) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -5191,11 +5191,11 @@ static int test_graft_swap_fixed_key(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &swap) < 0) {
+	if (cds_ft_create(group, NULL, &swap) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -5308,11 +5308,11 @@ static int test_fixed_graft_at_root(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -5415,11 +5415,11 @@ static int test_fixed_graft_nonroot_error(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -5494,11 +5494,11 @@ static int test_fixed_graft_swap_at_root(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &swap) < 0) {
+	if (cds_ft_create(group, NULL, &swap) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -5643,11 +5643,11 @@ static int test_fixed_graft_swap_nonroot_error(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &swap) < 0) {
+	if (cds_ft_create(group, NULL, &swap) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -5719,7 +5719,7 @@ static int test_fixed_detach_at_root(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &ft) < 0) {
+	if (cds_ft_create(group, NULL, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
@@ -5832,7 +5832,7 @@ static int test_fixed_detach_nonroot_error(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &ft) < 0) {
+	if (cds_ft_create(group, NULL, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
@@ -6366,7 +6366,7 @@ static int test_group_destroy_busy_error(void)
 
 	if (cds_ft_group_create(NULL, &group) < 0)
 		return -1;
-	if (cds_ft_create(group, &ft) < 0) {
+	if (cds_ft_create(group, NULL, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
@@ -6416,11 +6416,11 @@ static int test_graft_swap_overflow_error(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &swap) < 0) {
+	if (cds_ft_create(group, NULL, &swap) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -6650,7 +6650,7 @@ static int test_insert_exceeds_max_key_len(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &ft) < 0) {
+	if (cds_ft_create(group, NULL, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
@@ -6703,11 +6703,11 @@ static int test_graft_detach_len_default(void)
 	}
 	cds_ft_group_attr_destroy(attr);
 
-	if (cds_ft_create(group, &ft) < 0) {
+	if (cds_ft_create(group, NULL, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &other) < 0) {
+	if (cds_ft_create(group, NULL, &other) < 0) {
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -6785,7 +6785,7 @@ static int test_graft_empty_source(void)
 	unsigned long count;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &empty_src) < 0) {
+	if (cds_ft_create(group, NULL, &empty_src) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -6855,7 +6855,7 @@ static int test_graft_reuse_after_drain(void)
 	struct cds_ft *detached = NULL;
 
 	live = create_varlen_ft(&group);
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -6963,7 +6963,7 @@ static int test_multiple_tries_same_group(void)
 	unsigned long c1, c2;
 
 	ft1 = create_varlen_ft(&group);
-	if (cds_ft_create(group, &ft2) < 0) {
+	if (cds_ft_create(group, NULL, &ft2) < 0) {
 		cds_ft_destroy(ft1);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -8279,7 +8279,7 @@ static int test_adversarial_max_depth(void)
 	 */
 	if (cds_ft_group_create(NULL, &probe_group) < 0)
 		return -1;
-	if (cds_ft_create(probe_group, &probe_ft) < 0) {
+	if (cds_ft_create(probe_group, NULL, &probe_ft) < 0) {
 		cds_ft_group_destroy(probe_group);
 		return -1;
 	}
@@ -8313,7 +8313,7 @@ static int test_adversarial_max_depth(void)
 		goto out_free_keys;
 	}
 	cds_ft_group_attr_destroy(attr);
-	if (cds_ft_create(group, &ft) < 0) {
+	if (cds_ft_create(group, NULL, &ft) < 0) {
 		cds_ft_group_destroy(group);
 		goto out_free_keys;
 	}
@@ -9855,7 +9855,7 @@ static int test_compress_graft_diverge(void)
 	const uint8_t *k_src = (const uint8_t *)"QR";
 	enum cds_ft_status s;
 
-	if (cds_ft_create(group, &src) < 0) {
+	if (cds_ft_create(group, NULL, &src) < 0) {
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -10461,7 +10461,7 @@ static int test_compress_graft_swap_key_shorter(void)
 	struct cds_ft_node *found;
 	const uint8_t *k_src = (const uint8_t *)"QR";
 
-	if (cds_ft_create(group, &swap) < 0) {
+	if (cds_ft_create(group, NULL, &swap) < 0) {
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -10527,7 +10527,7 @@ static struct cds_ft *create_skip_compressed_ft(struct cds_ft_group **group_out)
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
-	if (cds_ft_create(group, &ft) < 0)
+	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
 	*group_out = group;
 	return ft;
@@ -11066,11 +11066,11 @@ static int test_verify_graft_detach(void)
 
 	if (cds_ft_group_create(NULL, &group) < 0)
 		return -1;
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -11450,11 +11450,11 @@ static int test_density_graft_detach(void)
 
 	if (cds_ft_group_create(NULL, &group) < 0)
 		return -1;
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &staging) < 0) {
+	if (cds_ft_create(group, NULL, &staging) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;
@@ -11913,11 +11913,11 @@ static int test_density_graft_swap(void)
 
 	if (cds_ft_group_create(NULL, &group) < 0)
 		return -1;
-	if (cds_ft_create(group, &live) < 0) {
+	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_create(group, &swap) < 0) {
+	if (cds_ft_create(group, NULL, &swap) < 0) {
 		cds_ft_destroy(live);
 		cds_ft_group_destroy(group);
 		return -1;

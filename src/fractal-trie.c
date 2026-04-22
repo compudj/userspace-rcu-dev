@@ -114,6 +114,10 @@ struct cds_ft_group_attr {
 	unsigned int flags;
 };
 
+struct cds_ft_attr {
+	bool exclusive;
+};
+
 enum cds_ft_type_class {
 	FT_LINEAR = 0,		/* Linear: per-type specialized scan */
 	FT_POOL = 2,		/* Pool: 1D/2D subnode dispatch */
@@ -14476,7 +14480,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 
-		status = cds_ft_create(ft->group, &detached);
+		status = cds_ft_create(ft->group, NULL, &detached);
 		if (status != CDS_FT_STATUS_OK) {
 			FT_TP(detach_exit, (int) status);
 			return status;
@@ -14713,7 +14717,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				detached_count = 1;	/* One key (possibly with duplicates). */
 			}
 
-			status = cds_ft_create(ft->group, &detached);
+			status = cds_ft_create(ft->group, NULL, &detached);
 			if (status != CDS_FT_STATUS_OK) {
 				FT_TP(detach_exit, (int) status);
 				return status;
@@ -16887,6 +16891,30 @@ enum cds_ft_status cds_ft_group_attr_set_flags(struct cds_ft_group_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
+enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
+{
+	struct cds_ft_attr *attr = calloc(1, sizeof(struct cds_ft_attr));
+
+	if (!attr) {
+		*result = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+	*result = attr;
+	return CDS_FT_STATUS_OK;
+}
+
+void cds_ft_attr_destroy(struct cds_ft_attr *attr)
+{
+	free(attr);
+}
+
+enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
+		bool exclusive)
+{
+	attr->exclusive = exclusive;
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor)
@@ -16941,6 +16969,7 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 }
 
 enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
+		const struct cds_ft_attr *attr,
 		struct cds_ft **result_ft)
 {
 	struct cds_ft *ft;
@@ -16954,6 +16983,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->group = ft_group;
+	if (attr)
+		ft->exclusive = attr->exclusive;
 
 	/*
 	 * Allocate the root node (smallest linear type, initially empty).
