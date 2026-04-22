@@ -14059,17 +14059,6 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_OK;
 	}
 
-	/*
-	 * If src_ft permits concurrent RCU readers, drain them before
-	 * re-parenting its content into dst_ft: a reader inside src_ft
-	 * that followed src_ft's parent pointers after the re-parent
-	 * would escape into dst_ft's ancestor chain ("jumping out of
-	 * the trie").  Exclusive sources carry no such readers, so the
-	 * sync is skipped.
-	 */
-	if (!src_ft->exclusive)
-		src_ft->group->flavor->update_synchronize_rcu();
-
 	if (key_len == 0) {
 		struct cds_ft_metadata *dst_rmeta = ft_root_metadata(dst_ft);
 		struct cds_ft_inode *fresh_root;
@@ -14092,6 +14081,12 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		}
 
 		/*
+		 * Root-level graft: the source's root becomes the
+		 * destination's root with no parent-pointer change
+		 * (both are root positions with parent == NULL).  No
+		 * "jump out" window, so no internal synchronize_rcu is
+		 * required for this path.
+		 *
 		 * Swap root pointers.  The source's root carries all
 		 * metadata (nr_child, external_nodes) with it.
 		 */
@@ -14112,6 +14107,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		unsigned int graft_snapshot_depth[FT_MAX_DEPTH];
 		int nr_graft_snapshot;
 		unsigned long src_count = ft_nr_keys_get(src_rmeta);
+		struct cds_ft_inode_flag *old_src_root;
 
 		/*
 		 * Preallocate a fresh empty root for the source trie
@@ -14129,15 +14125,52 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 				&nr_graft_snapshot);
 
 		/*
-		 * The source root node becomes the graft payload.  Its
+		 * "Jump out" prevention: a reader that has descended
+		 * into src_ft's root subtree would, once the subtree's
+		 * parent pointer is flipped to point into dst_ft,
+		 * observe dst_ft's ancestor chain when backtracking via
+		 * parent pointers.
+		 *
+		 * Correct ordering:
+		 *   1. Unlink the old root from src_ft (publish a fresh
+		 *      empty root) so no new reader can descend into
+		 *      the payload via src_ft.
+		 *   2. synchronize_rcu() drains readers that were
+		 *      inside the payload before the unlink.
+		 *   3. Re-parent and publish under dst_ft.  No reader
+		 *      is present to observe the parent flip.
+		 *
+		 * Exclusive sources carry no RCU readers, so the sync
+		 * is skipped in that case.
+		 */
+		old_src_root = src_ft->root;
+		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
+		FT_TP(root_publish, (const void *) src_ft,
+			(const void *) src_ft->root);
+
+		if (!src_ft->exclusive)
+			src_ft->group->flavor->update_synchronize_rcu();
+
+		/*
+		 * The source's old root becomes the graft payload.  Its
 		 * metadata.external_nodes (NIL-key entries in the source)
 		 * naturally becomes the entries at depth key_len in the
 		 * destination.  No relocation needed.
 		 */
 		status = ft_store_at_graft_point(dst_ft, key, key_len,
-						  &d, src_ft->root,
+						  &d, old_src_root,
 						  src_count);
 		if (status != CDS_FT_STATUS_OK) {
+			/*
+			 * Roll back: restore old root in src_ft.  A
+			 * second grace period drains readers that may
+			 * have observed fresh_node before freeing it.
+			 */
+			rcu_assign_pointer(src_ft->root, old_src_root);
+			FT_TP(root_publish, (const void *) src_ft,
+				(const void *) src_ft->root);
+			if (!src_ft->exclusive)
+				src_ft->group->flavor->update_synchronize_rcu();
 			free_cds_ft_node(src_ft, fresh_node);
 			FT_TP(graft_exit, (int) status);
 			return status;
@@ -14150,19 +14183,14 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 * Propagate per-level density addition for the grafted
 		 * subtree (add-only: no old child to subtract).
 		 */
-		if (!ft_node_external(src_ft->root))
+		if (!ft_node_external(old_src_root))
 			ft_propagate_density_replace(dst_ft,
-				src_ft->root, key_len,
+				old_src_root, key_len,
 				NULL, 0,
 				cds_ft_item_to_metadata(
-					ft_node_ptr(src_ft->root)),
-				ft_node_readside_footprint(src_ft, src_ft->root),
+					ft_node_ptr(old_src_root)),
+				ft_node_readside_footprint(src_ft, old_src_root),
 				NULL, 0);
-
-		/* Give source a fresh empty root. */
-		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
-		FT_TP(root_publish, (const void *) src_ft,
-			(const void *) src_ft->root);
 	}
 
 done:
@@ -14330,13 +14358,24 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		}
 
 		/*
-		 * A fresh root for swap_ft is needed when old_child
-		 * is not an internal node and the swap trie is not
-		 * empty (i.e. the old swap root is consumed by the
-		 * graft).  Preallocate it here, before the point of
-		 * no return, so we can fail cleanly.
+		 * A fresh empty root for swap_ft is needed in all
+		 * non-empty swap cases.  Two consumers:
+		 *   (i)  The upcoming unlink-before-sync step uses it
+		 *        as the intermediate value of swap_ft->root
+		 *        so that old_swap_root is no longer reachable
+		 *        from swap before we change its parent pointer.
+		 *   (ii) When old_child is external (the non-internal
+		 *        case), old_child becomes a list of
+		 *        external_nodes on fresh's metadata, and
+		 *        swap_ft->root stays as fresh at the end.
+		 * When old_child is an internal node, the final step
+		 * overwrites swap_ft->root with old_child and frees
+		 * fresh.
+		 *
+		 * Preallocate here, before the point of no return, so
+		 * we can fail cleanly on memory shortage.
 		 */
-		need_fresh = ft_node_external(old_child) && !swap_empty;
+		need_fresh = !swap_empty;
 		if (need_fresh) {
 			fresh = alloc_cds_ft_node(swap_ft,
 				&ft_types[0], &fresh_meta);
@@ -14347,18 +14386,37 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		}
 
 		/*
-		 * If swap_ft permits concurrent RCU readers, drain them
-		 * before re-parenting old_swap_root into dst_ft: a reader
-		 * inside swap_ft that followed old_swap_root's parent
-		 * pointer after the re-parent would escape into dst_ft's
-		 * ancestor chain ("jumping out of the trie").  Exclusive
-		 * swap sources carry no such readers.  The displaced old
-		 * content gets its root parent cleared to NULL before
-		 * moving to swap_ft, so readers on the dst side stop
-		 * cleanly at the root and need no separate drain here.
+		 * "Jump out" prevention: a reader inside swap_ft that
+		 * has descended into old_swap_root's subtree would,
+		 * once old_swap_root's parent pointer is flipped to
+		 * point into dst_ft, observe dst_ft's ancestor chain
+		 * when backtracking via parent pointers.
+		 *
+		 * Correct ordering (non-empty swap):
+		 *   1. Unlink old_swap_root from swap_ft (install
+		 *      fresh as swap_ft's root) so no new reader can
+		 *      descend into old_swap_root via swap.
+		 *   2. synchronize_rcu() drains readers that were
+		 *      inside old_swap_root before the unlink.
+		 *   3. Re-parent and publish under dst_ft.  No reader
+		 *      is present to observe the parent flip.
+		 *
+		 * Consequence: readers on swap_ft briefly see an empty
+		 * trie between steps 1 and the final installation of
+		 * old_child (below).  This is a weaker atomicity than
+		 * what the cached-path implementation provided, but
+		 * preserves the "never jump out of the trie" invariant
+		 * which matters for the parent-pointer backtracking
+		 * read path.
 		 */
-		if (!swap_empty && !swap_ft->exclusive)
-			swap_ft->group->flavor->update_synchronize_rcu();
+		if (!swap_empty) {
+			rcu_assign_pointer(swap_ft->root,
+				ft_node_flag(fresh, 0));
+			FT_TP(root_publish, (const void *) swap_ft,
+				(const void *) swap_ft->root);
+			if (!swap_ft->exclusive)
+				swap_ft->group->flavor->update_synchronize_rcu();
+		}
 
 		/*
 		 * Atomic store at graft point.  If swap is empty,
@@ -14443,12 +14501,16 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 
 		/*
 		 * Set up swap_ft to hold old content from the graft
-		 * point.  If old_child is an internal node, it
-		 * becomes swap_ft's root directly (its
-		 * metadata.external_nodes carries the entries at the
-		 * graft key).  Otherwise, use the preallocated fresh
-		 * root and place any external node chain as NIL-key
-		 * entries.
+		 * point.  For non-empty swap, swap_ft->root was already
+		 * set to @fresh above (as part of the unlink-before-
+		 * sync step).  We now either overwrite it with old_child
+		 * (when old_child is an internal node — @fresh becomes
+		 * unused and is freed) or attach old_child as
+		 * external_nodes on @fresh.
+		 *
+		 * For empty swap, swap_ft->root stays as old_swap_root
+		 * (swap's original empty root) and old_child attaches
+		 * there as external_nodes.
 		 */
 		if (!ft_node_external(old_child)) {
 			/*
@@ -14470,6 +14532,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			if (swap_empty)
 				free_cds_ft_node(swap_ft,
 					ft_node_ptr(old_swap_root));
+			else
+				free_cds_ft_node(swap_ft, fresh);
 		} else if (swap_empty) {
 			if (ft_node_ptr(old_child)) {
 				ft_metadata_set_external_nodes(old_swap_root, swap_rmeta,
@@ -14478,9 +14542,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				ft_nr_keys_store(dst_ft, swap_rmeta, old_count, CMM_RELEASE);
 			}
 		} else {
-			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
-			FT_TP(root_publish, (const void *) swap_ft,
-				(const void *) swap_ft->root);
+			/* swap_ft->root is already @fresh from the unlink step. */
 			if (ft_node_ptr(old_child)) {
 				ft_metadata_set_external_nodes(ft_node_flag(fresh, 0), fresh_meta,
 					(struct cds_ft_node *)
