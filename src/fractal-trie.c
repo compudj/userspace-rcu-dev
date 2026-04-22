@@ -11615,15 +11615,11 @@ int _cds_ft_insert(struct cds_ft *ft,
 				/* Publish: increment nr_entries (atomic store). */
 				/* Store-release in publish_inc ensures
 				 * readers see suffix/offset/pointer data. */
-				{
-					unsigned int _tp_idx =
-						ft_collapsed_count(col_nr);
-					FT_TP(collapsed_entry,
-						(const void *) ft_collapsed_node_flag(col),
-						_tp_idx,
-						iter_key, new_slen,
-						(const void *) branch, 0);
-				}
+				FT_TP(collapsed_entry,
+					(const void *) ft_collapsed_node_flag(col),
+					ft_collapsed_count(col_nr),
+					iter_key, new_slen,
+					(const void *) branch, 0);
 				ft_collapsed_publish_inc_nr_entries(col);
 				FT_TP(collapsed_publish,
 					(const void *) ft_collapsed_node_flag(col),
