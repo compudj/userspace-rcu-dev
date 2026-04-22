@@ -4113,6 +4113,19 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
  * freshly-allocated unpublished (sub)node.  Used by recompact to
  * adopt the first inserted byte as values[0].  Ignored for
  * FT_PIGEON (dense 256-slot array, no reserved slot).
+ *
+ * This helper does NOT set @child_node_flag's parent pointer.  The
+ * caller is responsible for ft_set_parent once @node is in a state
+ * where linking it from @child's parent pointer is safe:
+ *
+ *   - Regular in-place insert: ft_node_set_nth does ft_set_parent
+ *     right after this returns, since @node is already published
+ *     and fully valid.
+ *   - Recompact child-copy: new_node is UNPUBLISHED and being built
+ *     slot by slot; linking children's parent pointers to new_node
+ *     mid-build would expose transient nr_child < min_child to
+ *     parent-pointer readers.  Recompact's post-copy reparent loop
+ *     performs ft_set_parent after the whole new_node is assembled.
  */
 static
 int _ft_node_set_nth(const struct cds_ft_type *type,
@@ -4140,13 +4153,6 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 	default:
 		assert(0);
 		return -EINVAL;
-	}
-	if (!ret) {
-		struct cds_ft_inode_flag **slot_ptr = NULL;
-
-		if (ft_node_skip_compressed(child_node_flag))
-			ft_node_get_nth_skip(node_flag, &slot_ptr, n);
-		ft_set_parent(child_node_flag, node_flag, slot_ptr);
 	}
 	return ret;
 }
@@ -5323,6 +5329,20 @@ int ft_node_set_nth(struct cds_ft *ft,
 	 */
 	ret = _ft_node_set_nth(type, node, *node_flag, metadata, n, child_node_flag, false);
 	switch (ret) {
+	case 0:
+	{
+		/*
+		 * In-place insert succeeded on the published target node.
+		 * Safe to link child -> target via parent pointer now:
+		 * target is already fully valid to readers.
+		 */
+		struct cds_ft_inode_flag **slot_ptr = NULL;
+
+		if (ft_node_skip_compressed(child_node_flag))
+			ft_node_get_nth_skip(*node_flag, &slot_ptr, n);
+		ft_set_parent(child_node_flag, *node_flag, slot_ptr);
+		break;
+	}
 	case -ENOSPC:
 		/* Not enough space in node, need to recompact to next type. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
