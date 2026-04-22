@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <urcu/list.h>
 #include <urcu/rculfhash.h>
 #include <urcu/arch.h>
 #include <assert.h>
@@ -546,17 +547,105 @@ struct cds_ft {
 	unsigned long nr_collapsed_alloc, nr_collapsed_freed;
 };
 
+/*
+ * Allocator layout (see fractal-trie-alloc.c for the full picture).
+ *
+ * Each 2*page_size range holds the items array (page 0), then the
+ * per-range header (struct cds_ft_alloc_range) followed by the
+ * per-item metadata array (page 1).  Optional bitmap array grows
+ * backward from (range base + 2*page_size) on 2D-pool / pigeon arenas.
+ *
+ * The two cache lines most often prefetched from a tagged child
+ * pointer — the item's metadata and (for bitmap types) its bitmap —
+ * are derivable with pure pointer arithmetic given the item's order.
+ * The helpers below live in this header so that the prefetch-hint
+ * path can compute their addresses inline, without a cross-TU call
+ * into fractal-trie-alloc.c.
+ *
+ * struct cds_ft_alloc_arena remains opaque here: only out-of-line
+ * slow paths (cds_ft_item_to_metadata, cds_ft_item_order,
+ * cds_ft_metadata_to_item) need its fields, and those stay in
+ * fractal-trie-alloc.c.
+ */
+struct cds_ft_alloc_arena;
+
+struct cds_ft_metadata_alloc {
+	struct rcu_head rcu_head;
+	union {
+		struct cds_ft_metadata_alloc *free_list_next;
+		struct cds_ft_metadata metadata;
+	};
+};
+
+struct cds_ft_alloc_range {
+	struct cds_list_head node;			/* Linked list of ranges. */
+	struct cds_ft_alloc_arena *arena;		/* Backward reference to arena. */
+	size_t next_unused;
+
+	struct cds_ft_metadata_alloc metadata[];
+};
+
+/*
+ * Architectures with a fixed kernel page size: declare the size as a
+ * compile-time constant so cds_ft_get_page_size() folds away, and the
+ * mask/shift arithmetic in the inline helpers below collapses into
+ * immediate operands.  Runtime validation in cds_ft_arena_create()
+ * rejects a mismatched kernel page size.
+ */
+#if defined(URCU_ARCH_X86) || defined(URCU_ARCH_S390)
+# define FT_PAGE_SIZE_FIXED	4096UL
+#endif
+
 __attribute__((visibility("hidden")))
-struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order);
+extern size_t cds_ft_page_size;
+
+static inline size_t cds_ft_get_page_size(void)
+{
+#ifdef FT_PAGE_SIZE_FIXED
+	return FT_PAGE_SIZE_FIXED;
+#else
+	return cds_ft_page_size;
+#endif
+}
+
+static inline
+struct cds_ft_alloc_range *cds_ft_item_to_range(void *p)
+{
+	size_t pg = cds_ft_get_page_size();
+	void *base = (void *)((unsigned long) p & ~(pg - 1));
+
+	return (struct cds_ft_alloc_range *) ((char *) base + pg);
+}
+
+static inline
+struct cds_ft_metadata *cds_ft_item_to_metadata_fast(void *p, size_t item_len_order)
+{
+	struct cds_ft_alloc_range *range = cds_ft_item_to_range(p);
+	size_t page_offset = (unsigned long) p & (cds_ft_get_page_size() - 1);
+	size_t index = page_offset >> item_len_order;
+
+	return &range->metadata[index].metadata;
+}
+
+/*
+ * bitmap array is indexed backwards from range base + (2 * page_size).
+ */
+static inline
+struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order)
+{
+	size_t pg = cds_ft_get_page_size();
+	void *base = (void *)((unsigned long) p & ~(pg - 1));
+	size_t index = ((unsigned long) p & (pg - 1)) >> item_len_order;
+
+	return (struct cds_ft_bitmap *) ((char *) base + (2 * pg) -
+			((index + 1) * sizeof(struct cds_ft_bitmap)));
+}
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_all_arenas(struct cds_ft_group *ft_group);
 
 __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_item_to_metadata(void *p);
-
-__attribute__((visibility("hidden")))
-struct cds_ft_metadata *cds_ft_item_to_metadata_fast(void *p, size_t item_len_order);
 
 __attribute__((visibility("hidden")))
 size_t cds_ft_item_order(void *p);
