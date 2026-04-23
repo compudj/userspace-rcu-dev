@@ -14965,6 +14965,34 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			 * a NIL-key entry.
 			 */
 			if (!ft_node_external(child)) {
+				/*
+				 * Drain source-trie readers that entered
+				 * before ft_detach_node published the unlink
+				 * and may still hold pointers into @child's
+				 * subtree.  Without this grace period, such a
+				 * reader's going-up walk can observe the
+				 * @child.parent = NULL store published below
+				 * while its @cur_nf is still a node inside the
+				 * subtree, break out of its walk as if it had
+				 * reached @ft's root, and return a spurious
+				 * result drawn from the now-detached internal
+				 * pointer chain -- the escape that the
+				 * inv_ordered_no_escape_graft invariant guards
+				 * against.  Skip for exclusive sources: those
+				 * carry no RCU readers by construction.
+				 *
+				 * This grace period mirrors the one graft
+				 * performs between unlink-from-source and
+				 * reparent-into-destination.  A subsequent
+				 * graft of @detached will sync again; callers
+				 * that chain detach-then-graft pay two GPs in
+				 * the concurrent case and can coalesce them
+				 * via make_exclusive on @detached before the
+				 * graft, or via a future update_poll_state
+				 * coalescing optimisation on the library side.
+				 */
+				if (!ft->exclusive)
+					ft->group->flavor->update_synchronize_rcu();
 				free_cds_ft_node(detached,
 					ft_node_ptr(detached->root));
 				/* No readers in detached root yet. */
