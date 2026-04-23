@@ -3160,9 +3160,15 @@ struct cds_ft_inode_flag *ft_linear_scan_3(
 }
 
 /*
- * scan_8: SWAR byteq over an 8-byte word at &node->data[0].
- * Covers ptr_offset=8 types with max_linear_child > 3
- * (type_index 2 on 64-bit tier-2).
+ * scan_8: SSE2 8-byte cmpeq over values at &node->data[0].  Covers
+ * ptr_offset=8 types with max_linear_child > 3 (type_index 2 on
+ * 64-bit tier-2).
+ *
+ * _mm_loadl_epi64 zero-extends: bytes 8..15 of the xmm register are
+ * zero, so the upper-lane cmpeqb compares the splatted target byte
+ * against zero.  Masking the movemask result with 0xFF drops those
+ * bits (they can only be set when n == 0, in which case ctz still
+ * picks an index < 8 from the real-value lane).
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_8(
@@ -3171,19 +3177,19 @@ struct cds_ft_inode_flag *ft_linear_scan_8(
 		uint8_t n, enum ft_pf_target pf_hint)
 {
 	uint8_t *values = &node->data[0];
-	unsigned long target_ones = (unsigned long) n * L_ONES_A;
-	unsigned long word, has_zero;
+	__m128i target = _mm_set1_epi8((char) n);
+	__m128i chunk = _mm_loadl_epi64((const __m128i *) values);
+	unsigned int mask = (unsigned int) _mm_movemask_epi8(
+			_mm_cmpeq_epi8(chunk, target)) & 0xFFU;
 	struct cds_ft_inode_flag **pointers;
 	unsigned int i;
 
-	__builtin_memcpy(&word, values, sizeof(unsigned long));
-	has_zero = ft_swar_byteq(word, target_ones);
-	if (!has_zero) {
+	if (!mask) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
 		return NULL;
 	}
-	i = ft_swar_match_idx(has_zero);
+	i = (unsigned int) __builtin_ctz(mask);
 	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 8);
 	if (caa_unlikely(node_flag_ptr))
 		*node_flag_ptr = &pointers[i];
