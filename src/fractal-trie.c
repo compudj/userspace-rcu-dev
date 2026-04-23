@@ -3236,12 +3236,14 @@ struct cds_ft_inode_flag *ft_linear_scan_16(
  * scan_32: dual SSE2 16-byte cmpeq, combined into a 32-bit mask.
  * Covers ptr_offset=32 types (type_index 4, POOL_A/B subnodes).
  *
- * We intentionally do not use the 32-byte AVX2 path: measurements on
- * Zen4 showed it ~8% slower than dual SSE2 on u64d (no gain on any
- * other workload).  The likely cause is AVX-SSE transition penalties
- * when the rest of the dispatcher (scan_16, scan_8) stays on xmm --
- * two pipelined 16-byte xmm loads match one ymm load in throughput
- * without the transition cost.
+ * A single-op AVX2 vpcmpeqb/vpmovmskb on ymm was remeasured under a
+ * full -mavx2 build (VEX everywhere, no AVX-SSE transition) on Zen3+
+ * (Rembrandt) and Zen4: arith mean +1.1% slower across 14 workload
+ * cells, with +3-8% regressions on exact-lookup integer workloads.
+ * The critical-path bottleneck is pmovmskb: on ymm it is 4c latency
+ * (single-op), while the dual-xmm path issues two 3c pmovmskb's that
+ * pipeline in parallel for the same effective latency with lower
+ * backend port pressure.  Stay on dual SSE2.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_32(
