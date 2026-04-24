@@ -16470,6 +16470,116 @@ end:
 }
 
 /*
+ * Match a compressed node's path bytes against @key starting at @i
+ * and step past it.  On success, fills ordinal_key + iter_path
+ * across the compressed span, advances *i_p so the caller's
+ * for-loop increment lands on the next byte after the span,
+ * updates *node_flag_p to cn->child, and returns
+ * FT_COMPRESSED_CONTINUE.  On any mismatch (key shorter than the
+ * compressed path, byte-mismatch, or NULL child) returns
+ * FT_COMPRESSED_END.
+ */
+static
+enum ft_compressed_action ft_rebuild_path_compressed(
+		struct cds_ft_inode_flag **node_flag_p,
+		unsigned int *i_p,
+		const uint8_t *key, size_t key_len,
+		uint8_t *ordinal_key,
+		struct cds_ft_iter *iter)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
+	unsigned int i = *i_p;
+	unsigned int j;
+
+	if (i + cn->len > key_len)
+		return FT_COMPRESSED_END;
+	for (j = 0; j < cn->len; j++) {
+		uint8_t ord = key[i + j];
+
+		if (ord != cn->key_bytes[j])
+			return FT_COMPRESSED_END;
+		ordinal_key[i + j] = ord;
+		iter_path_node(iter)[i + j + 1] = node_flag;
+	}
+	i += cn->len - 1;
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	if (!ft_node_ptr(node_flag))
+		return FT_COMPRESSED_END;
+	iter_path_node(iter)[i + 1] = node_flag;
+	*node_flag_p = node_flag;
+	*i_p = i;
+	return FT_COMPRESSED_CONTINUE;
+}
+
+/*
+ * Match a collapsed node's entries against @key starting at @i.
+ * Scans entries for a suffix match against key[i..], filling
+ * ordinal_key + iter_path across the matched suffix span.  On hit,
+ * advances *i_p past the matched span, follows the entry's child
+ * (resolving skip-compressed if needed) into *node_flag_p, and
+ * returns FT_COMPRESSED_CONTINUE.  Returns FT_COMPRESSED_END if no
+ * entry's suffix matches or the matched child is NULL.
+ */
+static
+enum ft_compressed_action ft_rebuild_path_collapsed(
+		struct cds_ft_inode_flag **node_flag_p,
+		unsigned int *i_p,
+		const uint8_t *key, size_t key_len,
+		uint8_t *ordinal_key,
+		struct cds_ft_iter *iter)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	struct cds_ft_collapsed_node *cn = ft_collapsed_node_ptr(node_flag);
+	unsigned int nr_e = ft_collapsed_nr_entries(cn);
+	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(cn, nr_e);
+	unsigned int i = *i_p;
+	unsigned int remaining = key_len - i;
+	unsigned int e;
+
+	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+		unsigned int slen, j;
+		uint8_t *suffix;
+		bool match;
+		uint8_t data_e = ft_collapsed_load_data(cn, e);
+
+		if (ft_collapsed_entry_dead(data_e, nr_e))
+			continue;
+		slen = ft_collapsed_suffix_len(cn, data_e, e, nr_e);
+		if (slen > remaining)
+			continue;
+		suffix = ft_collapsed_suffix(cn, data_e, nr_e);
+		match = true;
+		for (j = 0; j < slen; j++) {
+			uint8_t ord = key[i + j];
+
+			if (ord != suffix[j]) {
+				match = false;
+				break;
+			}
+			ordinal_key[i + j] = ord;
+			iter_path_node(iter)[i + j + 1] =
+				(struct cds_ft_inode_flag *)
+				ft_collapsed_node_flag(cn);
+		}
+		if (!match)
+			continue;
+		i += slen - 1;
+		node_flag = ft_dereference_acquire_prefetch(ptrs[e]);
+		if (!ft_node_ptr(node_flag))
+			return FT_COMPRESSED_END;
+		if (ft_node_skip_compressed(node_flag))
+			node_flag = ft_compressed_node_flag(
+				ft_skip_to_compressed(node_flag));
+		iter_path_node(iter)[i + 1] = node_flag;
+		*node_flag_p = node_flag;
+		*i_p = i;
+		return FT_COMPRESSED_CONTINUE;
+	}
+	return FT_COMPRESSED_END;
+}
+
+/*
  * Re-descend from the root following @key to rebuild the iterator path
  * and ordinal_key arrays.  Returns the depth reached, or -1 on error.
  */
@@ -16492,76 +16602,23 @@ int ft_rebuild_path(struct cds_ft *ft,
 			return -1;
 
 		if (ft_node_compressed(node_flag)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(node_flag);
-			unsigned int j;
+			enum ft_compressed_action act;
 
-			if (i + cn->len > key_len)
+			act = ft_rebuild_path_compressed(&node_flag, &i,
+				key, key_len, ordinal_key, iter);
+			if (act == FT_COMPRESSED_END)
 				return -1;
-			for (j = 0; j < cn->len; j++) {
-				uint8_t ord = key[i + j];
-				if (ord != cn->key_bytes[j])
-					return -1;
-				ordinal_key[i + j] = ord;
-				iter_path_node(iter)[i + j + 1] =
-					node_flag;
-			}
-			i += cn->len - 1;
-			node_flag = ft_dereference_acquire_prefetch(cn->child);
-			if (!ft_node_ptr(node_flag))
-				return -1;
-			iter_path_node(iter)[i + 1] = node_flag;
+			assert(act == FT_COMPRESSED_CONTINUE);
 			continue;
 		}
 		if (ft_node_collapsed(node_flag)) {
-			struct cds_ft_collapsed_node *cn =
-				ft_collapsed_node_ptr(node_flag);
-			unsigned int nr_e = ft_collapsed_nr_entries(cn);
-			struct cds_ft_inode_flag **ptrs =
-				ft_collapsed_ptrs(cn, nr_e);
-			unsigned int remaining = key_len - i;
-			unsigned int e;
-			bool found = false;
+			enum ft_compressed_action act;
 
-			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-				unsigned int slen, j;
-				uint8_t *suffix;
-				bool match;
-				uint8_t data_e = ft_collapsed_load_data(cn, e);
-
-				if (ft_collapsed_entry_dead(data_e, nr_e))
-					continue;
-				slen = ft_collapsed_suffix_len(cn, data_e, e, nr_e);
-				if (slen > remaining)
-					continue;
-				suffix = ft_collapsed_suffix(cn, data_e, nr_e);
-				match = true;
-				for (j = 0; j < slen; j++) {
-					uint8_t ord = key[i + j];
-					if (ord != suffix[j]) {
-						match = false;
-						break;
-					}
-					ordinal_key[i + j] = ord;
-					iter_path_node(iter)[i + j + 1] =
-						(struct cds_ft_inode_flag *)
-						ft_collapsed_node_flag(cn);
-				}
-				if (!match)
-					continue;
-				i += slen - 1;
-				node_flag = ft_dereference_acquire_prefetch(ptrs[e]);
-				if (!ft_node_ptr(node_flag))
-					return -1;
-				if (ft_node_skip_compressed(node_flag))
-					node_flag = ft_compressed_node_flag(
-						ft_skip_to_compressed(node_flag));
-				iter_path_node(iter)[i + 1] = node_flag;
-				found = true;
-				break;
-			}
-			if (!found)
+			act = ft_rebuild_path_collapsed(&node_flag, &i,
+				key, key_len, ordinal_key, iter);
+			if (act == FT_COMPRESSED_END)
 				return -1;
+			assert(act == FT_COMPRESSED_CONTINUE);
 			continue;
 		}
 
