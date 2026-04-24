@@ -2296,7 +2296,7 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
  * responsible for snapshot, snapshot_n, and detach tracking before
  * calling this helper.
  */
-static inline
+static inline_lookup
 void ft_descent_traverse_compressed(struct ft_descent *d,
 		struct cds_ft_compressed_node *cn,
 		const uint8_t **iter_key)
@@ -6562,7 +6562,8 @@ end:
  * On success, *@best_child receives the validated child pointer.
  */
 #ifdef FEATURE_FT_COLLAPSE
-static int ft_collapsed_find_nearest(
+static inline_lookup
+int ft_collapsed_find_nearest(
 		struct cds_ft_collapsed_node *col,
 		struct cds_ft_inode_flag **cptrs,
 		unsigned int ref_entry,
@@ -6656,7 +6657,7 @@ static int ft_collapsed_find_nearest(
  * whether to backtrack (GOING_UP) or descend into the compressed
  * subtree (DESCEND_CHILDREN).
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_inequality_compressed(struct cds_ft_inode_flag **node_flag_p,
 		ssize_t *level_p, ssize_t key_depth,
 		enum ft_lookup_inequality mode,
@@ -6825,7 +6826,7 @@ out_break:
  *   no exact, nearest in direction → fill path, DESCEND_CHILDREN
  *   no match in direction → GOING_UP
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_flag_p,
 		ssize_t *level_p, ssize_t key_depth,
 		ssize_t max_tree_depth __attribute__((unused)),
@@ -7024,7 +7025,7 @@ enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **nod
 	return FT_COMPRESSED_GOING_UP;
 }
 #else
-static
+static inline_lookup
 enum ft_compressed_action ft_inequality_collapsed(
 		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
 		ssize_t *level_p __attribute__((unused)),
@@ -7058,7 +7059,7 @@ enum ft_compressed_action ft_inequality_collapsed(
  * the child is external (descent is done), otherwise
  * FT_COMPRESSED_CONTINUE.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_inequality_minmax_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		ssize_t *level_p,
@@ -7143,7 +7144,7 @@ enum ft_compressed_action ft_inequality_minmax_compressed(
  * *going_up_p), FT_COMPRESSED_BREAK when the selected child is
  * external, FT_COMPRESSED_CONTINUE otherwise.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_inequality_minmax_collapsed(
 		struct cds_ft_inode_flag **node_flag_p,
 		ssize_t *level_p,
@@ -7289,7 +7290,7 @@ enum ft_compressed_action ft_inequality_minmax_collapsed(
  * at ordinal_key + entry_depth, sets *going_up_p = true, clears
  * *cached_col_nr_e_p, and returns FT_COMPRESSED_CONTINUE.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_inequality_going_up_collapsed(
 		struct cds_ft_inode_flag **node_flag_p,
 		ssize_t *level_p,
@@ -7461,7 +7462,7 @@ enum ft_compressed_action ft_inequality_going_up_collapsed(
 	return FT_COMPRESSED_CONTINUE;
 }
 #else
-static
+static inline_lookup
 enum ft_compressed_action ft_inequality_minmax_collapsed(
 		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
 		ssize_t *level_p __attribute__((unused)),
@@ -7476,7 +7477,7 @@ enum ft_compressed_action ft_inequality_minmax_collapsed(
 	return FT_COMPRESSED_GOING_UP;
 }
 
-static
+static inline_lookup
 enum ft_compressed_action ft_inequality_going_up_collapsed(
 		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
 		ssize_t *level_p __attribute__((unused)),
@@ -15980,7 +15981,7 @@ enum ft_compressed_action ft_lookup_nth_compressed(
  * Returns BREAK if the target overflows all entries (shouldn't
  * happen in a consistent trie).
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_lookup_nth_collapsed(
 		struct cds_ft_inode_flag **node_flag_p,
 		int *level_p, uint8_t *ordinal_key,
@@ -16078,7 +16079,7 @@ enum ft_compressed_action ft_lookup_nth_collapsed(
 	return FT_COMPRESSED_BREAK;
 }
 #else
-static
+static inline_lookup
 enum ft_compressed_action ft_lookup_nth_collapsed(
 		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
 		int *level_p __attribute__((unused)),
@@ -16299,7 +16300,7 @@ enum ft_compressed_action ft_lookup_nth_last_compressed(
  * suffix order.  Returns END if all entries exhausted (caller
  * should check external_nodes).
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_lookup_nth_last_collapsed(
 		struct cds_ft_inode_flag **node_flag_p,
 		int *level_p, uint8_t *ordinal_key,
@@ -16391,7 +16392,7 @@ enum ft_compressed_action ft_lookup_nth_last_collapsed(
 	return FT_COMPRESSED_END;
 }
 #else
-static
+static inline_lookup
 enum ft_compressed_action ft_lookup_nth_last_collapsed(
 		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
 		int *level_p __attribute__((unused)),
@@ -16560,7 +16561,7 @@ end:
  * compressed path, byte-mismatch, or NULL child) returns
  * FT_COMPRESSED_END.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_rebuild_path_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		unsigned int *i_p,
@@ -16602,7 +16603,7 @@ enum ft_compressed_action ft_rebuild_path_compressed(
  * returns FT_COMPRESSED_CONTINUE.  Returns FT_COMPRESSED_END if no
  * entry's suffix matches or the matched child is NULL.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_rebuild_path_collapsed(
 		struct cds_ft_inode_flag **node_flag_p,
 		unsigned int *i_p,
@@ -16664,7 +16665,7 @@ enum ft_compressed_action ft_rebuild_path_collapsed(
  * Re-descend from the root following @key to rebuild the iterator path
  * and ordinal_key arrays.  Returns the depth reached, or -1 on error.
  */
-static
+static inline_lookup
 int ft_rebuild_path(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		const uint8_t *key, size_t key_len,
@@ -16723,7 +16724,7 @@ int ft_rebuild_path(struct cds_ft *ft,
  * Returns FT_COMPRESSED_CONTINUE on success, FT_COMPRESSED_BREAK if
  * the child pointer is NULL or is an external (leaf) node.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_skip_forward_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		int *level_p, uint8_t *ordinal_key,
@@ -16769,7 +16770,7 @@ enum ft_compressed_action ft_skip_forward_compressed(
  * descend_forward.  Otherwise returns FT_COMPRESSED_CONTINUE for
  * the caller to keep walking up.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_skip_forward_walk_up_collapsed(
 		struct cds_ft_inode_flag *ancestor,
 		int *level_p,
@@ -17236,7 +17237,7 @@ end:
  * or FT_COMPRESSED_END to signal the caller to fall through to
  * check_ext_descend_reverse (remaining updated, child keys exhausted).
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_skip_reverse_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		int *level_p, unsigned long *remaining_p,
@@ -17292,7 +17293,7 @@ enum ft_compressed_action ft_skip_reverse_compressed(
  * has been written and *iter_status_p set to OK.  Otherwise returns
  * FT_COMPRESSED_CONTINUE for the caller to keep walking up.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_skip_reverse_walk_up_compressed(
 		struct cds_ft_inode_flag *ancestor,
 		int level,
@@ -17340,7 +17341,7 @@ enum ft_compressed_action ft_skip_reverse_walk_up_compressed(
  * on match returns FT_COMPRESSED_END with the iter written and
  * *iter_status_p set to OK.  Otherwise returns FT_COMPRESSED_CONTINUE.
  */
-static
+static inline_lookup
 enum ft_compressed_action ft_skip_reverse_walk_up_collapsed(
 		struct cds_ft_inode_flag *ancestor,
 		int *level_p,
