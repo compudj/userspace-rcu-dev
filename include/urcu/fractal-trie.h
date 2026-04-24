@@ -1691,6 +1691,25 @@ void cds_ft_make_concurrent(struct cds_ft *ft);
 bool cds_ft_is_exclusive(const struct cds_ft *ft);
 
 /*
+ * cds_ft_excl_validate_enabled - Query whether the optional
+ *                                access-discipline validator is
+ *                                compiled into the library.
+ *
+ * Returns true if the library was built with -DFEATURE_FT_EXCL_VALIDATE,
+ * in which case writer/writer conflicts (any mode) and writer/reader
+ * conflicts (exclusive mode) are detected at the public API boundary
+ * and abort() the process with a violation report.
+ *
+ * Returns false if the validator is compiled out (the default); the
+ * validator helpers are then no-ops.
+ *
+ * Primarily intended for tests: a negative test that deliberately
+ * violates the contract can query this accessor and SKIP itself when
+ * the validator is absent.
+ */
+bool cds_ft_excl_validate_enabled(void);
+
+/*
  * Iterator management
  *
  * It is recommended that the user keeps a per-thread pool of
