@@ -37,14 +37,18 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "tap.h"
 
-#define NR_TESTS 173
+#define NR_TESTS 175
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -12624,6 +12628,176 @@ out_dst:
 	return ret;
 }
 
+/* ------------------------------------------------------------------ */
+/* Negative tests for the FEATURE_FT_EXCL_VALIDATE validator.         */
+/*                                                                    */
+/* Each provocation runs in a forked child where two threads          */
+/* deliberately violate the access-discipline contract on the same    */
+/* trie.  When the validator is compiled into the library the child   */
+/* aborts with SIGABRT; when it is absent the test is a no-op that    */
+/* diag's the skip reason and passes.                                 */
+/* ------------------------------------------------------------------ */
+
+#define FT_EXCL_NEG_ITERATIONS		(200 * 1000)
+
+struct excl_neg_ctx {
+	struct cds_ft *ft;
+	pthread_barrier_t *start;
+	unsigned int seed_bump;
+};
+
+static void *excl_neg_writer(void *arg)
+{
+	struct excl_neg_ctx *ctx = (struct excl_neg_ctx *) arg;
+	unsigned int i;
+
+	rcu_register_thread();
+	pthread_barrier_wait(ctx->start);
+	for (i = 0; i < FT_EXCL_NEG_ITERATIONS; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		uint8_t key[4];
+		unsigned int k = i ^ ctx->seed_bump;
+
+		key[0] = (uint8_t) k;
+		key[1] = (uint8_t) (k >> 8);
+		key[2] = (uint8_t) ctx->seed_bump;
+		key[3] = 0;
+		if (cds_ft_insert(ctx->ft, key, 4, &n->node) != CDS_FT_STATUS_OK)
+			node_free(n);
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *excl_neg_reader(void *arg)
+{
+	struct excl_neg_ctx *ctx = (struct excl_neg_ctx *) arg;
+	unsigned int i;
+
+	rcu_register_thread();
+	pthread_barrier_wait(ctx->start);
+	for (i = 0; i < FT_EXCL_NEG_ITERATIONS; i++) {
+		struct cds_ft_node *found;
+		uint8_t key[4] = { 0 };
+
+		rcu_read_lock();
+		(void) cds_ft_lookup_key(ctx->ft, key, 4, &found);
+		rcu_read_unlock();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * In the forked child: two writers racing on the same trie trip the
+ * writer/writer CAS.  Works in both concurrent and exclusive mode.
+ */
+__attribute__((noreturn))
+static void excl_neg_writer_writer_child(void)
+{
+	struct cds_ft_group *group;
+	struct excl_neg_ctx ctx_a, ctx_b;
+	pthread_barrier_t start;
+	pthread_t t_a, t_b;
+
+	/* Don't clutter the test harness with the validator's abort msg. */
+	(void) freopen("/dev/null", "w", stderr);
+	alarm(30);
+	ctx_a.ft = ctx_b.ft = create_varlen_ft(&group);
+	pthread_barrier_init(&start, NULL, 2);
+	ctx_a.start = ctx_b.start = &start;
+	ctx_a.seed_bump = 0x1111;
+	ctx_b.seed_bump = 0x2222;
+	pthread_create(&t_a, NULL, excl_neg_writer, &ctx_a);
+	pthread_create(&t_b, NULL, excl_neg_writer, &ctx_b);
+	pthread_join(t_a, NULL);
+	pthread_join(t_b, NULL);
+	/* Should not reach here — the validator should have abort()'d. */
+	_exit(42);
+}
+
+/*
+ * In the forked child on an exclusive-mode trie: a reader and a
+ * writer racing on the same trie trip the exclusive-mode
+ * reader/writer check.
+ */
+__attribute__((noreturn))
+static void excl_neg_excl_reader_writer_child(void)
+{
+	struct cds_ft_group *group;
+	struct excl_neg_ctx ctx_r, ctx_w;
+	pthread_barrier_t start;
+	pthread_t t_r, t_w;
+
+	(void) freopen("/dev/null", "w", stderr);
+	alarm(30);
+	ctx_r.ft = ctx_w.ft = create_varlen_ft(&group);
+	cds_ft_make_exclusive(ctx_r.ft);
+	pthread_barrier_init(&start, NULL, 2);
+	ctx_r.start = ctx_w.start = &start;
+	ctx_r.seed_bump = 0;
+	ctx_w.seed_bump = 0x3333;
+	pthread_create(&t_r, NULL, excl_neg_reader, &ctx_r);
+	pthread_create(&t_w, NULL, excl_neg_writer, &ctx_w);
+	pthread_join(t_r, NULL);
+	pthread_join(t_w, NULL);
+	_exit(42);
+}
+
+static int excl_neg_expect_sigabrt(void (*child_fn)(void))
+{
+	pid_t pid;
+	int status;
+
+	pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "excl_neg: fork failed\n");
+		return -1;
+	}
+	if (pid == 0) {
+		child_fn();
+		_exit(42);	/* unreachable */
+	}
+	if (waitpid(pid, &status, 0) != pid) {
+		fprintf(stderr, "excl_neg: waitpid failed\n");
+		return -1;
+	}
+	if (!WIFSIGNALED(status)) {
+		fprintf(stderr,
+			"excl_neg: child exited normally (code %d), "
+			"expected SIGABRT\n",
+			WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		return -1;
+	}
+	if (WTERMSIG(status) != SIGABRT) {
+		fprintf(stderr,
+			"excl_neg: child killed by signal %d, expected SIGABRT\n",
+			WTERMSIG(status));
+		return -1;
+	}
+	return 0;
+}
+
+static int test_excl_validate_writer_writer(void)
+{
+	if (!cds_ft_excl_validate_enabled()) {
+		diag("FEATURE_FT_EXCL_VALIDATE not compiled in; "
+			"writer/writer provocation is a no-op");
+		return 0;
+	}
+	return excl_neg_expect_sigabrt(excl_neg_writer_writer_child);
+}
+
+static int test_excl_validate_excl_reader_writer(void)
+{
+	if (!cds_ft_excl_validate_enabled()) {
+		diag("FEATURE_FT_EXCL_VALIDATE not compiled in; "
+			"exclusive reader/writer provocation is a no-op");
+		return 0;
+	}
+	return excl_neg_expect_sigabrt(excl_neg_excl_reader_writer_child);
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                           MAIN                                     */
@@ -12875,6 +13049,11 @@ int main(int argc, char **argv)
 	RUN_TEST(test_exclusive_graft_from_exclusive);
 	RUN_TEST(test_exclusive_graft_swap_inherit_root);
 	RUN_TEST(test_exclusive_graft_swap_inherit_non_root);
+
+	/* 18. FEATURE_FT_EXCL_VALIDATE negative tests (SKIP if absent) */
+	diag("Exclusive-access validator tests");
+	RUN_TEST(test_excl_validate_writer_writer);
+	RUN_TEST(test_excl_validate_excl_reader_writer);
 
 	rcu_barrier();
 	rcu_unregister_thread();

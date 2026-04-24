@@ -17568,6 +17568,15 @@ bool cds_ft_is_exclusive(const struct cds_ft *ft)
 	return ft->exclusive;
 }
 
+bool cds_ft_excl_validate_enabled(void)
+{
+#ifdef FEATURE_FT_EXCL_VALIDATE
+	return true;
+#else
+	return false;
+#endif
+}
+
 enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor)
