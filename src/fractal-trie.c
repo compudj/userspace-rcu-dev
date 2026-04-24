@@ -14266,7 +14266,9 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		struct ft_descent *d,
 		struct cds_ft_inode_flag *graft_payload,
-		unsigned long graft_external_count)
+		unsigned long graft_external_count,
+		struct cds_ft_inode_flag **attached_nf,
+		unsigned int *attached_depth)
 {
 	struct cds_ft_inode *old_recompacted_node = NULL;
 
@@ -14292,6 +14294,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		if (old_recompacted_node)
 			free_cds_ft_node(ft, old_recompacted_node);
+		*attached_nf = graft_payload;
+		*attached_depth = key_len;
 	} else {
 		unsigned int i = d->depth;
 		struct cds_ft_inode_flag *branch;
@@ -14345,6 +14349,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 			if (old_recompacted_node)
 				free_cds_ft_node(ft, old_recompacted_node);
 		}
+		*attached_nf = branch;
+		*attached_depth = d->depth;
 	}
 	return CDS_FT_STATUS_OK;
 }
@@ -14512,9 +14518,14 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 * naturally becomes the entries at depth key_len in the
 		 * destination.  No relocation needed.
 		 */
+		struct cds_ft_inode_flag *attached_nf = NULL;
+		unsigned int attached_depth = 0;
+
 		status = ft_store_at_graft_point(dst_ft, key, key_len,
 						  &d, old_src_root,
-						  src_count);
+						  src_count,
+						  &attached_nf,
+						  &attached_depth);
 		if (status != CDS_FT_STATUS_OK) {
 			/*
 			 * Roll back: restore old root in src_ft.  A
@@ -14535,16 +14546,23 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 				(long) src_count);
 
 		/*
-		 * Propagate per-level density addition for the grafted
-		 * subtree (add-only: no old child to subtract).
+		 * Propagate per-level density addition for the node
+		 * actually attached at the graft point (add-only: no
+		 * old child to subtract).  attached_nf is either the
+		 * graft payload (direct attach) or the top of the
+		 * branch built by ft_build_branch (ancestors above the
+		 * branch top are what need updating; the branch's own
+		 * internals already have their density initialized by
+		 * ft_build_branch, and walking from attached_nf skips
+		 * the node itself).
 		 */
-		if (!ft_node_external(old_src_root))
+		if (!ft_node_external(attached_nf))
 			ft_propagate_density_replace(dst_ft,
-				old_src_root, key_len,
+				attached_nf, attached_depth,
 				NULL, 0,
 				cds_ft_item_to_metadata(
-					ft_node_ptr(old_src_root)),
-				ft_node_readside_footprint(src_ft, old_src_root),
+					ft_node_ptr(attached_nf)),
+				ft_node_readside_footprint(dst_ft, attached_nf),
 				NULL, 0);
 	}
 
