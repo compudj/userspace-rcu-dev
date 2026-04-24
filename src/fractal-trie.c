@@ -673,8 +673,7 @@ uint64_t cds_ft_key_to_u64(const struct cds_ft *ft, const uint8_t *key,
 		uint8_t array[8];
 	} u;
 
-	assert(key_len <= 8);
-	if (key_len > 8)
+	if (key_len == CDS_FT_LEN_ERROR || key_len > 8)
 		return 0;
 	u.v64 = 0;
 	/* Copy len LSB. */
@@ -692,8 +691,7 @@ void cds_ft_u64_to_key(const struct cds_ft *ft, uint64_t v, uint8_t *key,
 		uint8_t array[8];
 	} u;
 
-	assert(key_len <= 8);
-	if (key_len > 8)
+	if (key_len == CDS_FT_LEN_ERROR || key_len > 8)
 		return;
 	/* Host endianness to big endian. */
 	u.v64 = htobe64(v);
@@ -710,8 +708,7 @@ uint32_t cds_ft_key_to_u32(const struct cds_ft *ft, const uint8_t *key,
 		uint8_t array[4];
 	} u;
 
-	assert(key_len <= 4);
-	if (key_len > 4)
+	if (key_len == CDS_FT_LEN_ERROR || key_len > 4)
 		return 0;
 	u.v32 = 0;
 	/* Copy len LSB. */
@@ -729,8 +726,7 @@ void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key,
 		uint8_t array[4];
 	} u;
 
-	assert(key_len <= 4);
-	if (key_len > 4)
+	if (key_len == CDS_FT_LEN_ERROR || key_len > 4)
 		return;
 	/* Host endianness to big endian. */
 	u.v32 = htobe32(v);
