@@ -12529,6 +12529,199 @@ find_and_replace:
  * @detach_parent_flag_ptr: slot in grandparent pointing to the parent.
  * @detach_depth: trie depth of the detached node.
  */
+
+/*
+ * Replace a compressed (or skip-compressed) parent in
+ * ft_detach_node's structural-change phase.
+ *
+ * Two sub-cases:
+ *
+ *   - The detached child carried external_nodes that must be
+ *     promoted to the compressed node's child slot
+ *     (@topmost_external_nodes != NULL): keep the compressed node
+ *     (its path is needed for lookups) and replace cn->child with
+ *     the external chain head.  Reset *nr_clear so the
+ *     free-intermediate walk does not run later.
+ *
+ *   - Otherwise: the compressed parent is no longer needed.
+ *     Allocate a fresh empty internal, inherit parent + skip slot
+ *     metadata, publish it in place of the compressed node, and
+ *     free the compressed.  Returns -ENOMEM if the fresh
+ *     allocation failed.
+ */
+static
+int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
+		struct cds_ft_inode_flag *iter_node_flag,
+		struct cds_ft_inode_flag **detach_parent_flag_ptr,
+		struct cds_ft_node *topmost_external_nodes,
+		int *nr_clear)
+{
+	if (topmost_external_nodes) {
+		/*
+		 * Keep the compressed node — its path is needed for
+		 * lookups to reach the correct depth.  Replace
+		 * cn->child with the external node.
+		 *
+		 * Compressed nodes can have an external child
+		 * (cn->child pointing to an external node) but must
+		 * NOT have metadata->external_nodes set.
+		 */
+		struct cds_ft_compressed_node *cn;
+
+		if (ft_node_skip_compressed(iter_node_flag))
+			cn = ft_skip_to_compressed(iter_node_flag);
+		else
+			cn = ft_compressed_node_ptr(iter_node_flag);
+		ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
+			&cn->child,
+			(struct cds_ft_inode_flag *) topmost_external_nodes);
+		/*
+		 * Set the external's prev so that ft_skip_to_compressed
+		 * can recover the compressed node from the skip pointer.
+		 */
+		ft_set_parent(
+			(struct cds_ft_inode_flag *) topmost_external_nodes,
+			ft_compressed_node_flag(cn), &cn->child);
+		*nr_clear = 0;
+		return 0;
+	}
+	{
+		struct cds_ft_inode *fresh;
+		struct cds_ft_metadata *fresh_meta;
+		struct cds_ft_metadata *src_meta;
+
+		fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
+		if (!fresh)
+			return -ENOMEM;
+		src_meta = cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) ft_compressed_node_ptr(
+				iter_node_flag));
+		fresh_meta->parent = src_meta->parent;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		fresh_meta->skip_slot_offset = src_meta->skip_slot_offset;
+#endif
+		ft_publish_to_parent(ft, src_meta->parent,
+			detach_parent_flag_ptr,
+			ft_node_flag(fresh, 0));
+		free_compressed_node(ft,
+			ft_compressed_node_ptr(iter_node_flag));
+	}
+	return 0;
+}
+
+/*
+ * Replace a collapsed parent in ft_detach_node's structural-change
+ * phase.  See the long comment in the caller for the three
+ * sub-cases (A: tombstone the entry, B: repurpose with promoted
+ * externals, C: replace col with col.external_nodes in
+ * grandparent's slot).
+ *
+ * Always returns success (the caller's existing post-publish skip
+ * for collapsed iter_node_flag also covers sub-case C, where col
+ * is freed: ft_node_collapsed inspects only the pointer's tag bits
+ * and does not access the freed memory).
+ */
+static
+void ft_detach_node_replace_collapsed_parent(struct cds_ft *ft,
+		struct cds_ft_inode_flag *iter_node_flag,
+		struct cds_ft_inode_flag **detach_parent_flag_ptr,
+		struct cds_ft_inode_flag **detach_node_flag_ptr,
+		struct cds_ft_node *topmost_external_nodes,
+		unsigned int cur_depth)
+{
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(iter_node_flag);
+	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) col);
+	unsigned int nr_e = ft_collapsed_nr_entries(col);
+	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
+	unsigned int e;
+
+	/*
+	 * Sub-case C: last-entry detach on a collapsed with its own
+	 * external_nodes and no promoted chain from the detached
+	 * child.  Replace col directly with col.external_nodes in
+	 * grandparent's slot.
+	 */
+	if (col_meta->nr_child == 1 && !topmost_external_nodes
+			&& col_meta->external_nodes) {
+		struct cds_ft_node *ext = col_meta->external_nodes;
+
+		/*
+		 * Propagate density for col (about to be freed).
+		 * This mirrors the propagation path in the former
+		 * nr_child == 0 branch.
+		 */
+		ft_propagate_node_density_parent(ft,
+			iter_node_flag, cur_depth, cur_depth,
+			-(long) ft_node_readside_footprint(ft,
+				iter_node_flag));
+
+		/*
+		 * Reparent ext to col's parent before publishing.
+		 * Otherwise ext->prev would keep pointing at col, which
+		 * is about to be freed.
+		 */
+		ft_set_parent((struct cds_ft_inode_flag *) ext,
+			col_meta->parent, detach_parent_flag_ptr);
+		ft_publish_to_parent(ft, col_meta->parent,
+			detach_parent_flag_ptr,
+			(struct cds_ft_inode_flag *) ext);
+		free_collapsed_node(ft, col);
+		return;
+	}
+
+	/*
+	 * Sub-cases A and B: tombstone (A) or repurpose (B) the
+	 * detached entry.  nr_child stays >= 1 in both.
+	 */
+	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+		if (&cptrs[e] != detach_node_flag_ptr)
+			continue;
+		if (topmost_external_nodes) {
+			/*
+			 * Sub-case B: repurpose entry with the promoted
+			 * external chain head.  nr_child unchanged; col
+			 * stays live.
+			 *
+			 * Reparent the external chain head to col before
+			 * publishing: otherwise topmost_external_nodes->prev
+			 * would keep pointing to the (about-to-be-freed)
+			 * detached subtree root.
+			 */
+			ft_set_parent(
+				(struct cds_ft_inode_flag *) topmost_external_nodes,
+				iter_node_flag, &cptrs[e]);
+			ft_publish_to_parent(ft, iter_node_flag,
+				&cptrs[e],
+				(struct cds_ft_inode_flag *) topmost_external_nodes);
+		} else {
+			/*
+			 * Sub-case A: tombstone entry.  Only reached when
+			 * col.nr_child > 1, so nr_child-- leaves col >= 1
+			 * (guarded by sub-case C above).
+			 */
+			assert(col_meta->nr_child > 1);
+			ft_publish_to_parent(ft, iter_node_flag,
+				&cptrs[e], NULL);
+			/*
+			 * Set tombstone.  256B zones don't use tombstones
+			 * (the bit overlaps offsets).  For 256B, readers
+			 * rely on the NULL pointer check instead.
+			 */
+			if ((col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) < FT_COLLAPSED_SCAN_256)
+				uatomic_store(&col->data[e],
+					col->data[e] | FT_COLLAPSED_TOMBSTONE,
+					CMM_RELAXED);
+			FT_TP(collapsed_entry,
+				(const void *) ft_collapsed_node_flag(col), e,
+				(const uint8_t *) NULL, 0U,
+				(const void *) NULL, 1);
+			col_meta->nr_child--;
+		}
+		break;
+	}
+}
+
 static
 int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **detach_node_flag_ptr,
@@ -12757,59 +12950,11 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	if (ft_node_compressed(iter_node_flag) ||
 	    ft_node_skip_compressed(iter_node_flag)) {
-		if (topmost_external_nodes) {
-			/*
-			 * Keep the compressed node — its path is needed
-			 * for lookups to reach the correct depth.
-			 * Replace cn->child with the external node.
-			 *
-			 * Compressed nodes can have an external child
-			 * (cn->child pointing to an external node) but
-			 * must NOT have metadata->external_nodes set.
-			 */
-			struct cds_ft_compressed_node *cn;
-
-			if (ft_node_skip_compressed(iter_node_flag))
-				cn = ft_skip_to_compressed(iter_node_flag);
-			else
-				cn = ft_compressed_node_ptr(iter_node_flag);
-			ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
-				&cn->child,
-				(struct cds_ft_inode_flag *) topmost_external_nodes);
-			/*
-			 * Set the external's prev so that
-			 * ft_skip_to_compressed can recover the
-			 * compressed node from the skip pointer.
-			 */
-			ft_set_parent(
-				(struct cds_ft_inode_flag *) topmost_external_nodes,
-				ft_compressed_node_flag(cn), &cn->child);
-			nr_clear = 0;
-			ret = 0;
-		} else {
-			struct cds_ft_inode *fresh;
-			struct cds_ft_metadata *fresh_meta;
-			struct cds_ft_metadata *src_meta;
-
-			fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
-			if (!fresh) {
-				ret = -ENOMEM;
-				goto end;
-			}
-			src_meta = cds_ft_item_to_metadata(
-				(struct cds_ft_inode *) ft_compressed_node_ptr(
-					iter_node_flag));
-			fresh_meta->parent = src_meta->parent;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-			fresh_meta->skip_slot_offset = src_meta->skip_slot_offset;
-#endif
-			ft_publish_to_parent(ft, src_meta->parent,
-				detach_parent_flag_ptr,
-				ft_node_flag(fresh, 0));
-			free_compressed_node(ft,
-				ft_compressed_node_ptr(iter_node_flag));
-			ret = 0;
-		}
+		ret = ft_detach_node_replace_compressed_parent(ft,
+			iter_node_flag, detach_parent_flag_ptr,
+			topmost_external_nodes, &nr_clear);
+		if (ret)
+			goto end;
 	} else if (ft_node_collapsed(iter_node_flag)) {
 		/*
 		 * Collapsed parent.  The upward walk stopped here for
@@ -12819,9 +12964,10 @@ int ft_detach_node(struct cds_ft *ft,
 		 *
 		 * A collapsed with nr_child == 0 would be a dead-end
 		 * under ordered traversal -- an invariant violation.
-		 * The three sub-cases below ensure nr_child stays >= 1
-		 * *quiescently* at all times a reader can observe col
-		 * in the trie:
+		 * The three sub-cases handled in
+		 * ft_detach_node_replace_collapsed_parent ensure
+		 * nr_child stays >= 1 *quiescently* at all times a
+		 * reader can observe col in the trie:
 		 *
 		 *   A. col.nr_child > 1: tombstone the one entry being
 		 *      detached.  nr_child-- leaves nr_child >= 1; col
@@ -12866,111 +13012,9 @@ int ft_detach_node(struct cds_ft *ft,
 		 * Density was already propagated above (before
 		 * structural changes).
 		 */
-		struct cds_ft_collapsed_node *col =
-			ft_collapsed_node_ptr(iter_node_flag);
-		struct cds_ft_metadata *col_meta =
-			cds_ft_item_to_metadata((struct cds_ft_inode *) col);
-		unsigned int e;
-
-		unsigned int nr_e = ft_collapsed_nr_entries(col);
-		struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
-
-		/*
-		 * Sub-case C: last-entry detach on a collapsed with
-		 * its own external_nodes and no promoted chain from
-		 * the detached child.  Replace col directly with
-		 * col.external_nodes in grandparent's slot.
-		 */
-		if (col_meta->nr_child == 1 && !topmost_external_nodes
-				&& col_meta->external_nodes) {
-			struct cds_ft_node *ext = col_meta->external_nodes;
-
-			/*
-			 * Propagate density for col (about to be freed).
-			 * This mirrors the propagation path in the former
-			 * nr_child == 0 branch.
-			 */
-			ft_propagate_node_density_parent(ft,
-				iter_node_flag, cur_depth, cur_depth,
-				-(long) ft_node_readside_footprint(ft,
-					iter_node_flag));
-
-			/*
-			 * Reparent ext to col's parent before publishing.
-			 * Otherwise ext->prev would keep pointing at col,
-			 * which is about to be freed.
-			 */
-			ft_set_parent((struct cds_ft_inode_flag *) ext,
-				col_meta->parent, detach_parent_flag_ptr);
-			ft_publish_to_parent(ft, col_meta->parent,
-				detach_parent_flag_ptr,
-				(struct cds_ft_inode_flag *) ext);
-			free_collapsed_node(ft, col);
-			/*
-			 * col was freed.  Prevent the density
-			 * subtraction at the end from accessing the
-			 * freed iter_node_flag.
-			 */
-			old_detach_cm = NULL;
-			ret = 0;
-			goto end;
-		}
-
-		/*
-		 * Sub-cases A and B: tombstone (A) or repurpose (B)
-		 * the detached entry.  nr_child stays >= 1 in both.
-		 */
-		for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-			if (&cptrs[e] == detach_node_flag_ptr) {
-				if (topmost_external_nodes) {
-					/*
-					 * Sub-case B: repurpose entry with
-					 * the promoted external chain head.
-					 * nr_child unchanged; col stays live.
-					 *
-					 * Reparent the external chain head
-					 * to col before publishing: otherwise
-					 * topmost_external_nodes->prev would
-					 * keep pointing to the (about-to-be-
-					 * freed) detached subtree root.
-					 */
-					ft_set_parent(
-						(struct cds_ft_inode_flag *)
-						topmost_external_nodes,
-						iter_node_flag, &cptrs[e]);
-					ft_publish_to_parent(ft, iter_node_flag,
-						&cptrs[e],
-						(struct cds_ft_inode_flag *)
-						topmost_external_nodes);
-				} else {
-					/*
-					 * Sub-case A: tombstone entry.  Only
-					 * reached when col.nr_child > 1, so
-					 * nr_child-- leaves col >= 1 (guarded
-					 * by sub-case C above).
-					 */
-					assert(col_meta->nr_child > 1);
-					ft_publish_to_parent(ft, iter_node_flag,
-						&cptrs[e], NULL);
-					/*
-					 * Set tombstone.  256B zones don't use
-					 * tombstones (the bit overlaps offsets).
-					 * For 256B, readers rely on the NULL
-					 * pointer check instead.
-					 */
-					if ((col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) < FT_COLLAPSED_SCAN_256)
-						uatomic_store(&col->data[e],
-							col->data[e] | FT_COLLAPSED_TOMBSTONE,
-							CMM_RELAXED);
-					FT_TP(collapsed_entry,
-						(const void *) ft_collapsed_node_flag(col), e,
-						(const uint8_t *) NULL, 0U,
-						(const void *) NULL, 1);
-					col_meta->nr_child--;
-				}
-				break;
-			}
-		}
+		ft_detach_node_replace_collapsed_parent(ft, iter_node_flag,
+			detach_parent_flag_ptr, detach_node_flag_ptr,
+			topmost_external_nodes, cur_depth);
 		ret = 0;
 	} else {
 		/*
