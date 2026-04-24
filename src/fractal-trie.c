@@ -17392,10 +17392,11 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 /*
  * Validate that the pointer bits used by the skip-compressed encoding
  * are outside the kernel's virtual address range.  Attempt to mmap a
- * page at the encoding boundary; if the mapping succeeds or returns
- * EEXIST the bit is within the VA range and skip-compressed cannot be
- * used safely.  ENOMEM (address beyond TASK_SIZE) confirms the bit is
- * available.
+ * page at the encoding boundary; if the mapping succeeds or fails
+ * with EEXIST the bit is within the VA range and skip-compressed
+ * cannot be used safely.  Only ENOMEM (address beyond TASK_SIZE)
+ * confirms the bit is available; any other failure (EPERM, EINVAL,
+ * EAGAIN, seccomp, ...) is treated conservatively as unavailable.
  *
  * Called once from cds_ft_group_attr_set_flags when CDS_FT_FLAG_SKIP_COMPRESSED
  * is requested.
@@ -17410,8 +17411,8 @@ bool ft_skip_compressed_validate(void)
 		 PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
 		 -1, 0);
 	if (p == MAP_FAILED) {
-		/* ENOMEM: address outside VA range — safe to use. */
-		return true;
+		/* Only ENOMEM proves the address is outside the VA range. */
+		return errno == ENOMEM;
 	}
 	/* Mapping succeeded: the bit is within the VA range. */
 	munmap(p, urcu_get_page_len());
