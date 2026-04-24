@@ -7852,14 +7852,26 @@ descend_children:
 				/*
 				 * Invariant violation: a reachable
 				 * compressed node always has a non-NULL
-				 * child.  Empty compresseds are pruned
-				 * (replaced in parent's slot by their
-				 * external_nodes or the entire branch
-				 * detached).  NULL here means a writer
-				 * published a compressed without wiring
-				 * its child, or cleared cn->child while
-				 * the compressed was still reachable --
-				 * either way a bug.
+				 * child, *even transiently*.  cn->child
+				 * is wired before the compressed is
+				 * published to its parent's slot and is
+				 * never cleared in place (empty
+				 * compresseds are pruned by replacing
+				 * the parent's slot with the compressed's
+				 * external_nodes, or by detaching the
+				 * whole branch -- either way the
+				 * compressed itself is no longer
+				 * reachable when it becomes empty).
+				 *
+				 * Unlike the collapsed empty-scan case
+				 * and the internal minmax == NULL case
+				 * (both transiently observable and
+				 * handled via going_up above/below),
+				 * there is no race window in which a
+				 * reachable compressed has cn->child ==
+				 * NULL.  Observing NULL here is a real
+				 * bug: abort loudly instead of silently
+				 * propagating a corrupt node_flag.
 				 */
 				fprintf(stderr,
 					"BUG: cds_ft_lookup_inequality minmax: "
@@ -7955,8 +7967,30 @@ descend_children:
 					}
 				}
 			}
-			if (best == UINT_MAX)
-				break;
+			if (best == UINT_MAX) {
+				/*
+				 * Transiently empty collapsed: a racing
+				 * writer's sub-case A sequence (NULL the
+				 * cptrs slot, then set the tombstone bit)
+				 * can leave every entry observed as
+				 * either dead-bit-set or cptrs==NULL at
+				 * the moment we scanned them, even though
+				 * the node is not quiescently empty
+				 * (sub-case A guards nr_child > 1, and
+				 * sub-cases B/C handle the last-entry
+				 * case without tombstoning).  Treat as
+				 * "empty at this step" and let going_up
+				 * find the next sibling in @dir at a
+				 * higher level.  Back level one step so
+				 * iter_path[level] is the collapsed flag
+				 * the prior iter recorded (going_up uses
+				 * iter_path[level] and iter_path[level-1]
+				 * and needs both valid).
+				 */
+				level--;
+				going_up = true;
+				goto going_up;
+			}
 			{
 				unsigned int slen = ft_collapsed_suffix_len(col, best_d, best, col_nr_e);
 				uint8_t *suffix = ft_collapsed_suffix(col, best_d, col_nr_e);
@@ -7983,15 +8017,23 @@ descend_children:
 		skip_eq_external_nodes = false;
 		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir);
 		/*
-		 * If minmax returns NULL, it was an empty root. We found nothing.
+		 * Transiently empty internal/pool/pigeon: a reader may
+		 * observe every slot of a reachable internal node as
+		 * NULL in the narrow window between a writer's per-slot
+		 * detach and the upward walk's slot-replace at a higher
+		 * ancestor.  Quiescently, reachable internal nodes have
+		 * nr_child >= 1 (the upward walk prunes single-child
+		 * chains wholesale and replaces at the first multi-child
+		 * ancestor, so a slot-emptied internal is never left in
+		 * place).  Treat as "empty at this step" and let
+		 * going_up find the next sibling at a higher level.
+		 * Back level one step so iter_path[level] holds the
+		 * parent the prior iter recorded.
 		 */
 		if (caa_unlikely(!ft_node_ptr(node_flag))) {
-			iter->node = NULL;
-			iter->path_valid = true;
-			iter_debug_path_update(iter);
-			iter->path_len = level;
-			iter->status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
+			level--;
+			going_up = true;
+			goto going_up;
 		}
 		iter_path_node(iter)[level] = node_flag;
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
@@ -7999,7 +8041,16 @@ descend_children:
 		if (ft_node_external(node_flag))
 			break;
 	}
-	/* attach/detach semantic guarantees that ft_node_get_minmax cannot return NULL. */
+	/*
+	 * Every break path in the descent loop sets node_flag to a
+	 * validated external (compressed-branch external child,
+	 * collapsed-branch best_child that turned out external, or
+	 * minmax-branch external return).  Transiently-empty
+	 * intermediate steps (see collapsed best == UINT_MAX and
+	 * non-root minmax == NULL above) do not reach this assert
+	 * -- they jump to going_up and re-enter the search at a
+	 * higher level.
+	 */
 	assert(ft_node_ptr(node_flag));
 	ret_node = (struct cds_ft_node *) node_flag;
 	/*
@@ -12624,7 +12675,8 @@ int ft_detach_node(struct cds_ft *ft,
 		 * A collapsed with nr_child == 0 would be a dead-end
 		 * under ordered traversal -- an invariant violation.
 		 * The three sub-cases below ensure nr_child stays >= 1
-		 * at all times a reader can observe col in the trie:
+		 * *quiescently* at all times a reader can observe col
+		 * in the trie:
 		 *
 		 *   A. col.nr_child > 1: tombstone the one entry being
 		 *      detached.  nr_child-- leaves nr_child >= 1; col
@@ -12642,7 +12694,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 *      grandparent's slot with col.external_nodes.
 		 *      col is freed; grandparent now points directly
 		 *      at col's NIL-key chain.  col is never observed
-		 *      with nr_child == 0.
+		 *      quiescently with nr_child == 0.
 		 *
 		 * The remaining case (nr_child == 1 AND no external
 		 * anywhere) is handled earlier by the upward walk:
@@ -12651,6 +12703,20 @@ int ft_detach_node(struct cds_ft *ft,
 		 * is replaced via ft_node_replace_ptr, and col is
 		 * freed via the free-intermediate walk without ever
 		 * being iter_node_flag here.
+		 *
+		 * Reader-side transient exception: a reader's entry
+		 * scan is not atomic, and sub-case A writes cptrs[e] =
+		 * NULL *before* setting the tombstone bit.  With the
+		 * right interleaving, a reader can observe every entry
+		 * as dead-bit-set or NULL-pointer simultaneously --
+		 * even though at no wall-clock instant were all entries
+		 * quiescently dead.  cds_ft_lookup_inequality treats
+		 * this as "empty at this step" and backs out via
+		 * going_up to find the next sibling at a higher level;
+		 * it does NOT abort.  Abort here is reserved for the
+		 * compressed-child-NULL case, where the invariant
+		 * holds even transiently (cn->child is set before the
+		 * compressed is published and never cleared in place).
 		 *
 		 * Density was already propagated above (before
 		 * structural changes).
