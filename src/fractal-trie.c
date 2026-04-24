@@ -10663,6 +10663,42 @@ static struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		unsigned int suffix_offset,
 		unsigned int collapse_depth);
 
+/*
+ * Publish a freshly-created branch under a collapsed parent in
+ * ft_attach_node's publish phase.
+ *
+ * The collapsed entry's suffix already covers the path from the
+ * collapsed node to the child depth — only the child itself
+ * changes.  Exploding the collapsed node and using ft_node_set_nth
+ * would attach at the wrong depth (last suffix byte vs. first-byte
+ * level), overwriting sibling entries that share the same first
+ * suffix byte; instead, write the branch directly at the entry's
+ * child-pointer slot.
+ *
+ * Collapsed-parent attach bypasses ft_node_set_nth, so emit the
+ * structural edge tracepoint inline: the collapsed node sits at
+ * level - 1 and dispatches on key_value to iter_node_flag.
+ */
+#ifdef FEATURE_FT_COLLAPSE
+static
+void ft_attach_node_publish_collapsed_parent(struct cds_ft *ft,
+		struct cds_ft_inode_flag *attach_node_flag,
+		struct cds_ft_inode_flag **old_node_flag_ptr,
+		struct cds_ft_inode_flag *iter_node_flag,
+		unsigned int level __attribute__((unused)),
+		uint8_t key_value __attribute__((unused)))
+{
+	ft_set_parent(iter_node_flag, attach_node_flag, old_node_flag_ptr);
+	ft_publish_to_parent(ft, attach_node_flag,
+		old_node_flag_ptr, iter_node_flag);
+	FT_TP(tree_edge_set, (const void *) ft,
+		(const void *) attach_node_flag,
+		(unsigned int) (level - 1),
+		(uint8_t) key_value,
+		(const void *) iter_node_flag);
+}
+#endif /* FEATURE_FT_COLLAPSE */
+
 static
 int ft_attach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attach_node_flag_ptr,
@@ -10780,35 +10816,12 @@ int ft_attach_node(struct cds_ft *ft,
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
 
 #ifdef FEATURE_FT_COLLAPSE
-		/*
-		 * If the parent is a collapsed node, publish the
-		 * branch directly at the entry's child pointer.
-		 * The collapsed entry's suffix already covers the
-		 * path from the collapsed node to the child depth
-		 * — only the child itself changes.
-		 *
-		 * Exploding the collapsed node and using
-		 * ft_node_set_nth would attach at the wrong depth
-		 * (last suffix byte vs. first-byte level),
-		 * overwriting sibling entries that share the same
-		 * first suffix byte.
-		 */
+		/* Collapsed parent: bypass ft_node_set_nth (see helper). */
 		if (attach_node_flag &&
 		    ft_node_collapsed(attach_node_flag)) {
-			ft_set_parent(iter_node_flag, attach_node_flag, old_node_flag_ptr);
-			ft_publish_to_parent(ft, attach_node_flag,
-				old_node_flag_ptr, iter_node_flag);
-			/*
-			 * Collapsed-parent attach bypasses ft_node_set_nth
-			 * (see comment above), so emit the structural edge
-			 * directly.  The collapsed node sits at level-1
-			 * and dispatches on key_value to iter_node_flag.
-			 */
-			FT_TP(tree_edge_set, (const void *) ft,
-				(const void *) attach_node_flag,
-				(unsigned int) (level - 1),
-				(uint8_t) key_value,
-				(const void *) iter_node_flag);
+			ft_attach_node_publish_collapsed_parent(ft,
+				attach_node_flag, old_node_flag_ptr,
+				iter_node_flag, level, key_value);
 			goto publish_done;
 		}
 #endif
