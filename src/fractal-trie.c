@@ -2187,6 +2187,7 @@ enum ft_compressed_action {
 	FT_COMPRESSED_END,		/* Jump to function end (status set). */
 	FT_COMPRESSED_GOING_UP,		/* Jump to going_up backtracking. */
 	FT_COMPRESSED_DESCEND_CHILDREN,	/* Jump to descend_children. */
+	FT_COMPRESSED_FOUND_MINMAX,	/* Jump to found_minmax label. */
 };
 
 /*
@@ -7042,6 +7043,455 @@ enum ft_compressed_action ft_inequality_collapsed(
 }
 #endif /* FEATURE_FT_COLLAPSE */
 
+/*
+ * Handle a compressed node during the inequality minmax descent.
+ *
+ * On LEFTMOST (GE/GT) descent, check external_nodes at the
+ * compressed node's entry depth first; if present and not
+ * suppressed, return FT_COMPRESSED_FOUND_MINMAX with *ret_node_p
+ * set and *level_p decremented by one, so the caller can jump
+ * straight to found_minmax.
+ *
+ * Otherwise fill ordinal_key and iter_path across every level
+ * spanned by the compressed path, advance @level to the span's
+ * end, and step to cn->child.  Returns FT_COMPRESSED_BREAK when
+ * the child is external (descent is done), otherwise
+ * FT_COMPRESSED_CONTINUE.
+ */
+static
+enum ft_compressed_action ft_inequality_minmax_compressed(
+		struct cds_ft_inode_flag **node_flag_p,
+		ssize_t *level_p,
+		struct cds_ft_node **ret_node_p,
+		bool *skip_eq_external_nodes_p,
+		struct cds_ft_iter *iter,
+		uint8_t *ordinal_key,
+		enum ft_direction dir)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
+	ssize_t level = *level_p;
+
+	if (dir == FT_LEFTMOST) {
+		struct cds_ft_metadata *cn_meta = cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) cn);
+		struct cds_ft_node *ext = rcu_dereference(cn_meta->external_nodes);
+
+		if (ext && !*skip_eq_external_nodes_p) {
+			*ret_node_p = ext;
+			*level_p = level - 1;
+			return FT_COMPRESSED_FOUND_MINMAX;
+		}
+	}
+	/*
+	 * Fill ordinal_key and path entries for every level spanned
+	 * by the compressed path.  The going-up code needs a valid
+	 * entry at each level to call ft_node_get_direction (which
+	 * returns NULL for siblings, causing the going-up walk to
+	 * continue ascending).
+	 */
+	ft_fill_compressed_path(cn, ordinal_key, level - 1,
+		iter_path_node(iter), level, node_flag);
+	level += cn->len - 1;
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	if (!ft_node_ptr(node_flag)) {
+		/*
+		 * Invariant violation: a reachable compressed node always
+		 * has a non-NULL child, *even transiently*.  cn->child is
+		 * wired before the compressed is published to its parent's
+		 * slot and is never cleared in place (empty compresseds
+		 * are pruned by replacing the parent's slot with the
+		 * compressed's external_nodes, or by detaching the whole
+		 * branch -- either way the compressed itself is no longer
+		 * reachable when it becomes empty).
+		 *
+		 * Unlike the collapsed empty-scan case and the internal
+		 * minmax == NULL case (both transiently observable and
+		 * handled via going_up above/below), there is no race
+		 * window in which a reachable compressed has cn->child ==
+		 * NULL.  Observing NULL here is a real bug: abort loudly
+		 * instead of silently propagating a corrupt node_flag.
+		 */
+		fprintf(stderr,
+			"BUG: cds_ft_lookup_inequality minmax: "
+			"compressed %p has NULL child\n",
+			(const void *) node_flag);
+		abort();
+	}
+	iter_path_node(iter)[level] = node_flag;
+	*node_flag_p = node_flag;
+	*level_p = level;
+	if (ft_node_external(node_flag))
+		return FT_COMPRESSED_BREAK;
+	*skip_eq_external_nodes_p = false;
+	return FT_COMPRESSED_CONTINUE;
+}
+
+#ifdef FEATURE_FT_COLLAPSE
+/*
+ * Handle a collapsed node during the inequality minmax descent.
+ *
+ * On LEFTMOST (GE/GT) descent, check external_nodes at the
+ * collapsed node's depth first.  Otherwise scan entries for the
+ * min/max suffix in @dir, update ordinal_key and iter_path with
+ * the selected suffix, advance @level across the suffix span,
+ * and step to the selected child.
+ *
+ * Returns FT_COMPRESSED_FOUND_MINMAX on external-at-entry-depth
+ * hit (with *ret_node_p / *level_p set), FT_COMPRESSED_GOING_UP
+ * on transiently-empty collapsed (decrements @level and sets
+ * *going_up_p), FT_COMPRESSED_BREAK when the selected child is
+ * external, FT_COMPRESSED_CONTINUE otherwise.
+ */
+static
+enum ft_compressed_action ft_inequality_minmax_collapsed(
+		struct cds_ft_inode_flag **node_flag_p,
+		ssize_t *level_p,
+		struct cds_ft_node **ret_node_p,
+		bool *skip_eq_external_nodes_p,
+		bool *going_up_p,
+		struct cds_ft_iter *iter,
+		uint8_t *ordinal_key,
+		enum ft_direction dir,
+		ssize_t max_tree_depth __attribute__((unused)))
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
+	ssize_t level = *level_p;
+	unsigned int col_nr_e;
+	struct cds_ft_inode_flag **cptrs;
+	unsigned int best, e;
+	uint8_t best_d;
+	struct cds_ft_inode_flag *best_child;
+
+	if (dir == FT_LEFTMOST) {
+		struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) col);
+		struct cds_ft_node *ext = rcu_dereference(col_meta->external_nodes);
+
+		if (ext && !*skip_eq_external_nodes_p) {
+			*ret_node_p = ext;
+			*level_p = level - 1;
+			return FT_COMPRESSED_FOUND_MINMAX;
+		}
+	}
+	/*
+	 * Find the min/max entry by suffix and descend.
+	 *
+	 * Race-free pointer selection: each candidate entry is
+	 * filtered by (dead-bit clear AND cptrs non-NULL) at scan
+	 * time, and we SAVE the cptrs value (@best_child) alongside
+	 * @best so the descent uses the same pointer the scan
+	 * validated.  No re-read of cptrs[best] later.
+	 */
+	col_nr_e = ft_collapsed_nr_entries(col);
+	cptrs = ft_collapsed_ptrs(col, col_nr_e);
+	best = UINT_MAX;
+	best_d = 0;
+	best_child = NULL;
+
+	for (e = 0; e < ft_collapsed_count(col_nr_e); e++) {
+		uint8_t data_e = ft_collapsed_load_data(col, e);
+		struct cds_ft_inode_flag *entry;
+
+		if (ft_collapsed_entry_dead(data_e, col_nr_e))
+			continue;
+		entry = ft_dereference_acquire(cptrs[e]);
+		if (!ft_node_ptr(entry))
+			continue;
+		if (best == UINT_MAX) {
+			best = e;
+			best_d = data_e;
+			best_child = entry;
+			continue;
+		}
+		{
+			uint8_t *sa = ft_collapsed_suffix(col, best_d, col_nr_e);
+			unsigned int la = ft_collapsed_suffix_len(col, best_d, best, col_nr_e);
+			uint8_t *sb = ft_collapsed_suffix(col, data_e, col_nr_e);
+			unsigned int lb = ft_collapsed_suffix_len(col, data_e, e, col_nr_e);
+			unsigned int mc = la < lb ? la : lb;
+			int r = memcmp(sb, sa, mc);
+
+			if (dir == FT_LEFTMOST) {
+				if (r < 0 || (r == 0 && lb < la)) {
+					best = e;
+					best_d = data_e;
+					best_child = entry;
+				}
+			} else {
+				if (r > 0 || (r == 0 && lb > la)) {
+					best = e;
+					best_d = data_e;
+					best_child = entry;
+				}
+			}
+		}
+	}
+	if (best == UINT_MAX) {
+		/*
+		 * Transiently empty collapsed: a racing writer's
+		 * sub-case A sequence (NULL the cptrs slot, then set
+		 * the tombstone bit) can leave every entry observed as
+		 * either dead-bit-set or cptrs==NULL at the moment we
+		 * scanned them, even though the node is not quiescently
+		 * empty (sub-case A guards nr_child > 1, and sub-cases
+		 * B/C handle the last-entry case without tombstoning).
+		 * Treat as "empty at this step" and let going_up find
+		 * the next sibling in @dir at a higher level.  Back
+		 * level one step so iter_path[level] is the collapsed
+		 * flag the prior iter recorded (going_up uses
+		 * iter_path[level] and iter_path[level-1] and needs
+		 * both valid).
+		 */
+		*level_p = level - 1;
+		*going_up_p = true;
+		return FT_COMPRESSED_GOING_UP;
+	}
+	{
+		unsigned int slen = ft_collapsed_suffix_len(col, best_d, best, col_nr_e);
+		uint8_t *suffix = ft_collapsed_suffix(col, best_d, col_nr_e);
+		unsigned int k;
+
+		for (k = 0; k < slen; k++) {
+			ordinal_key[level - 1 + k] = suffix[k];
+			iter_path_node(iter)[level + k] =
+				ft_collapsed_node_flag(col);
+		}
+		level += slen - 1;
+		assert(level < max_tree_depth);
+		node_flag = best_child;
+		if (ft_node_skip_compressed(node_flag))
+			node_flag = ft_compressed_node_flag(
+				ft_skip_to_compressed(node_flag));
+		iter_path_node(iter)[level + 1] = node_flag;
+		*node_flag_p = node_flag;
+		*level_p = level;
+		if (ft_node_external(node_flag))
+			return FT_COMPRESSED_BREAK;
+	}
+	*skip_eq_external_nodes_p = false;
+	return FT_COMPRESSED_CONTINUE;
+}
+
+/*
+ * Handle the collapsed-node branch of cds_ft_lookup_inequality's
+ * going-up (sibling-search) phase.  When the path's parent at
+ * level-1 is a collapsed node, its entries *are* the siblings, so
+ * the regular ft_node_get_leftright does not apply — scan the
+ * collapsed entries in @dir for the nearest live sibling of the
+ * current entry.
+ *
+ * On success (sibling found) updates @level, *node_flag_p,
+ * iter_path_node, and ordinal_key; returns FT_COMPRESSED_BREAK.
+ *
+ * Otherwise resets @level to entry_depth + 1, points *iter_key_p
+ * at ordinal_key + entry_depth, sets *going_up_p = true, clears
+ * *cached_col_nr_e_p, and returns FT_COMPRESSED_CONTINUE.
+ */
+static
+enum ft_compressed_action ft_inequality_going_up_collapsed(
+		struct cds_ft_inode_flag **node_flag_p,
+		ssize_t *level_p,
+		const uint8_t **iter_key_p,
+		bool *going_up_p,
+		unsigned int *cached_col_nr_e_p,
+		struct cds_ft_iter *iter,
+		uint8_t *ordinal_key,
+		enum ft_direction dir,
+		ssize_t max_tree_depth __attribute__((unused)))
+{
+	ssize_t level = *level_p;
+	struct cds_ft_collapsed_node *col =
+		ft_collapsed_node_ptr(iter_path_node(iter)[level - 1]);
+	/*
+	 * Use cached nr_entries from the downward walk when
+	 * available; fresh load for collapsed nodes encountered at
+	 * higher levels.
+	 */
+	unsigned int col_nr_e = *cached_col_nr_e_p ?
+		*cached_col_nr_e_p : ft_collapsed_nr_entries(col);
+	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, col_nr_e);
+	int entry_depth = level - 1;
+	int suffix_base;
+	int current_entry = -1, best;
+	unsigned int cur_slen = 0;
+	unsigned int e;
+	struct cds_ft_inode_flag *best_child = NULL;
+
+	*cached_col_nr_e_p = 0;
+
+	/* Walk back to the collapsed node's entry depth. */
+	while (entry_depth > 0 &&
+	       iter_path_node(iter)[entry_depth - 1] ==
+	       iter_path_node(iter)[level - 1])
+		entry_depth--;
+
+	/*
+	 * suffix_base: the ordinal_key position where collapsed
+	 * suffix data starts.  Normally entry_depth, except when the
+	 * collapsed node is a direct child of a compressed node (no
+	 * intermediate internal dispatch).  In that case, the
+	 * compressed handler wrote ordinal_key one position earlier.
+	 */
+	suffix_base = entry_depth;
+	if (entry_depth > 0 &&
+	    ft_node_compressed(iter_path_node(iter)[entry_depth - 1]))
+		suffix_base = entry_depth - 1;
+
+	/*
+	 * Find the current entry by suffix match.  Don't skip
+	 * dead/tombstoned entries: the suffix data is immutable and
+	 * we need the position even if a concurrent writer
+	 * tombstoned the entry.
+	 */
+	for (e = 0; e < ft_collapsed_count(col_nr_e); e++) {
+		uint8_t *suffix;
+		unsigned int slen, j2;
+		bool match2;
+		uint8_t data_e = ft_collapsed_load_data(col, e);
+
+		suffix = ft_collapsed_suffix(col, data_e, col_nr_e);
+		slen = ft_collapsed_suffix_len(col, data_e, e, col_nr_e);
+		match2 = true;
+		for (j2 = 0; j2 < slen; j2++) {
+			if (suffix[j2] != ordinal_key[suffix_base + j2]) {
+				match2 = false;
+				break;
+			}
+		}
+		if (match2) {
+			current_entry = (int) e;
+			cur_slen = slen;
+			break;
+		}
+	}
+
+	/*
+	 * The current entry must always be found: the suffix is
+	 * immutable, and the downward walk wrote it to ordinal_key.
+	 * If not found, there is a bug in suffix_base computation or
+	 * ordinal_key was corrupted.
+	 */
+	assert(current_entry >= 0);
+
+	/*
+	 * If we're past the current entry's suffix (in the child's
+	 * subtree), check the child node for siblings first.
+	 */
+	if (level > (ssize_t)(suffix_base + cur_slen)) {
+		struct cds_ft_inode_flag *child_flag =
+			ft_dereference_acquire(cptrs[current_entry]);
+
+		if (ft_node_skip_compressed(child_flag))
+			child_flag = ft_compressed_node_flag(
+				ft_skip_to_compressed(child_flag));
+		if (ft_node_ptr(child_flag) && ft_node_internal(child_flag)) {
+			struct cds_ft_inode_flag *node_flag;
+			uint8_t sib_key = 0;
+
+			node_flag = ft_node_get_leftright(child_flag,
+				ordinal_key[suffix_base + cur_slen],
+				&sib_key, dir);
+			if (ft_node_ptr(node_flag)) {
+				ordinal_key[suffix_base + cur_slen] = sib_key;
+				level = suffix_base + cur_slen + 1;
+				assert(level < max_tree_depth);
+				iter_path_node(iter)[level] = node_flag;
+				*node_flag_p = node_flag;
+				*level_p = level;
+				return FT_COMPRESSED_BREAK;
+			}
+		}
+	}
+
+	/*
+	 * Find the nearest live sibling in @dir.
+	 *
+	 * Race-free pointer selection: find_nearest filters
+	 * candidates by (dead-bit clear AND cptrs non-NULL) at scan
+	 * time and returns the cptrs value it validated via
+	 * @best_child.  Use that value directly here rather than
+	 * re-reading cptrs[best]: a concurrent writer's sub-case A
+	 * NULLs cptrs[e] *before* setting the tombstone bit, so the
+	 * re-read window can return NULL while the scan-time check
+	 * observed live.
+	 */
+	best = ft_collapsed_find_nearest(col, cptrs,
+		(unsigned) current_entry, col_nr_e, dir, &best_child);
+
+	if (best >= 0) {
+		uint8_t best_d = ft_collapsed_load_data(col, (unsigned) best);
+		unsigned int slen = ft_collapsed_suffix_len(
+			col, best_d, (unsigned) best, col_nr_e);
+		uint8_t *suffix = ft_collapsed_suffix(col, best_d, col_nr_e);
+		struct cds_ft_inode_flag *node_flag;
+		unsigned int k;
+
+		for (k = 0; k < slen; k++) {
+			ordinal_key[suffix_base + k] = suffix[k];
+			if (k > 0)
+				iter_path_node(iter)[suffix_base + k] =
+					iter_path_node(iter)[level - 1];
+		}
+		level = suffix_base + slen;
+		assert(level < max_tree_depth);
+		node_flag = best_child;
+		if (ft_node_skip_compressed(node_flag))
+			node_flag = ft_compressed_node_flag(
+				ft_skip_to_compressed(node_flag));
+		iter_path_node(iter)[level] = node_flag;
+		*node_flag_p = node_flag;
+		*level_p = level;
+		return FT_COMPRESSED_BREAK;
+	}
+
+	/*
+	 * No match found, continue going up.
+	 *
+	 * Reset iter_key to match the new level.  The collapsed
+	 * handler jumped level back from within the entry's suffix
+	 * span to entry_depth + 1.  iter_key must point to
+	 * ordinal_key + entry_depth so the next *(--iter_key) at
+	 * level entry_depth reads the correct key byte.
+	 */
+	*level_p = entry_depth + 1;
+	*iter_key_p = ordinal_key + entry_depth;
+	*going_up_p = true;
+	return FT_COMPRESSED_CONTINUE;
+}
+#else
+static
+enum ft_compressed_action ft_inequality_minmax_collapsed(
+		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
+		ssize_t *level_p __attribute__((unused)),
+		struct cds_ft_node **ret_node_p __attribute__((unused)),
+		bool *skip_eq_external_nodes_p __attribute__((unused)),
+		bool *going_up_p __attribute__((unused)),
+		struct cds_ft_iter *iter __attribute__((unused)),
+		uint8_t *ordinal_key __attribute__((unused)),
+		enum ft_direction dir __attribute__((unused)),
+		ssize_t max_tree_depth __attribute__((unused)))
+{
+	return FT_COMPRESSED_GOING_UP;
+}
+
+static
+enum ft_compressed_action ft_inequality_going_up_collapsed(
+		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
+		ssize_t *level_p __attribute__((unused)),
+		const uint8_t **iter_key_p __attribute__((unused)),
+		bool *going_up_p __attribute__((unused)),
+		unsigned int *cached_col_nr_e_p __attribute__((unused)),
+		struct cds_ft_iter *iter __attribute__((unused)),
+		uint8_t *ordinal_key __attribute__((unused)),
+		enum ft_direction dir __attribute__((unused)),
+		ssize_t max_tree_depth __attribute__((unused)))
+{
+	return FT_COMPRESSED_CONTINUE;
+}
+#endif /* FEATURE_FT_COLLAPSE */
+
 static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
@@ -7474,196 +7924,19 @@ going_up:
 		 * (compressed or external entries from compressed path
 		 * traversal have no siblings).
 		 */
-#ifdef FEATURE_FT_COLLAPSE
 		if (ft_node_collapsed(iter_path_node(iter)[level - 1])) {
-			/*
-			 * Collapsed node: entries ARE siblings. Find the
-			 * entry level (where the collapsed node pointer
-			 * starts in the path) and search for the next
-			 * entry in the inequality direction.
-			 */
-			struct cds_ft_collapsed_node *col =
-				ft_collapsed_node_ptr(
-					iter_path_node(iter)[level - 1]);
-			/*
-			 * Use cached nr_entries from the downward walk
-			 * when available; fresh load for collapsed
-			 * nodes encountered at higher levels.
-			 */
-			unsigned int col_nr_e = cached_col_nr_e ?
-				cached_col_nr_e :
-				ft_collapsed_nr_entries(col);
-			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col, col_nr_e);
-			int entry_depth = level - 1;
-			unsigned int e;
+			enum ft_compressed_action act;
 
-			cached_col_nr_e = 0;
-
-			/* Walk back to the collapsed node's entry depth. */
-			while (entry_depth > 0 &&
-			       iter_path_node(iter)[entry_depth - 1] ==
-			       iter_path_node(iter)[level - 1])
-				entry_depth--;
-
-			/*
-			 * suffix_base: the ordinal_key position where
-			 * collapsed suffix data starts.  Normally
-			 * entry_depth, except when the collapsed node is
-			 * a direct child of a compressed node (no
-			 * intermediate internal dispatch).  In that case,
-			 * the compressed handler wrote ordinal_key one
-			 * position earlier.
-			 *
-			 * Detect by checking the cached iter_path: if
-			 * the parent is compressed, suffix_base is one
-			 * earlier.  No entry scan needed — the iter_path
-			 * is stable (set during the downward walk).
-			 */
-			{
-			int suffix_base = entry_depth;
-			if (entry_depth > 0 &&
-			    ft_node_compressed(iter_path_node(iter)[entry_depth - 1]))
-				suffix_base = entry_depth - 1;
-
-			{
-			int current_entry = -1, best;
-			unsigned int cur_slen = 0;
-
-			/*
-			 * Find the current entry by suffix match.
-			 * Don't skip dead/tombstoned entries: the suffix
-			 * data is immutable and we need the position even
-			 * if a concurrent writer tombstoned the entry.
-			 */
-			for (e = 0; e < ft_collapsed_count(col_nr_e); e++) {
-				uint8_t *suffix;
-				unsigned int slen, j2;
-				bool match2;
-				uint8_t data_e = ft_collapsed_load_data(col, e);
-
-				suffix = ft_collapsed_suffix(col, data_e, col_nr_e);
-				slen = ft_collapsed_suffix_len(col, data_e, e, col_nr_e);
-				match2 = true;
-				for (j2 = 0; j2 < slen; j2++) {
-					if (suffix[j2] != ordinal_key[suffix_base + j2]) {
-						match2 = false;
-						break;
-					}
-				}
-				if (match2) {
-					current_entry = (int)e;
-					cur_slen = slen;
-					break;
-				}
-			}
-
-			/*
-			 * The current entry must always be found: the
-			 * suffix is immutable, and the downward walk
-			 * wrote it to ordinal_key.  If not found, there
-			 * is a bug in suffix_base computation or
-			 * ordinal_key was corrupted.
-			 */
-			assert(current_entry >= 0);
-
-			/*
-			 * If we're past the current entry's suffix (in
-			 * the child's subtree), check the child node
-			 * for siblings first.
-			 */
-			if (level > (int)(suffix_base + cur_slen)) {
-				struct cds_ft_inode_flag *child_flag =
-					ft_dereference_acquire(
-						cptrs[current_entry]);
-
-				if (ft_node_skip_compressed(child_flag))
-					child_flag = ft_compressed_node_flag(
-						ft_skip_to_compressed(
-							child_flag));
-				if (ft_node_ptr(child_flag) &&
-				    ft_node_internal(child_flag)) {
-					uint8_t sib_key = 0;
-
-					node_flag = ft_node_get_leftright(
-						child_flag,
-						ordinal_key[suffix_base + cur_slen],
-						&sib_key, dir);
-					if (ft_node_ptr(node_flag)) {
-						ordinal_key[suffix_base + cur_slen] =
-							sib_key;
-						level = suffix_base + cur_slen + 1;
-						assert(level < (ssize_t) ft->group->max_tree_depth);
-						iter_path_node(iter)[level] =
-							node_flag;
-						break;
-					}
-				}
-			}
-
-			/*
-			 * Find the nearest live sibling in @dir.
-			 *
-			 * Race-free pointer selection: find_nearest
-			 * filters candidates by (dead-bit clear AND
-			 * cptrs non-NULL) at scan time and returns the
-			 * cptrs value it validated via @best_child.
-			 * Use that value directly here rather than
-			 * re-reading cptrs[best]: a concurrent writer's
-			 * sub-case A NULLs cptrs[e] *before* setting the
-			 * tombstone bit, so the re-read window can return
-			 * NULL while the scan-time check observed live.
-			 */
-			{
-			struct cds_ft_inode_flag *best_child = NULL;
-
-			best = ft_collapsed_find_nearest(col, cptrs,
-				(unsigned)current_entry, col_nr_e, dir,
-				&best_child);
-
-			if (best >= 0) {
-				uint8_t best_d = ft_collapsed_load_data(col, (unsigned)best);
-				unsigned int slen = ft_collapsed_suffix_len(
-					col, best_d, (unsigned)best, col_nr_e);
-				uint8_t *suffix = ft_collapsed_suffix(
-					col, best_d, col_nr_e);
-				unsigned int k;
-
-				for (k = 0; k < slen; k++) {
-					ordinal_key[suffix_base + k] = suffix[k];
-					if (k > 0)
-						iter_path_node(iter)[suffix_base + k] =
-							iter_path_node(iter)[level - 1];
-				}
-				level = suffix_base + slen;
-				assert(level < (ssize_t) ft->group->max_tree_depth);
-				node_flag = best_child;
-				if (ft_node_skip_compressed(node_flag))
-					node_flag = ft_compressed_node_flag(
-						ft_skip_to_compressed(
-							node_flag));
-				iter_path_node(iter)[level] = node_flag;
+			act = ft_inequality_going_up_collapsed(
+				&node_flag, &level, &iter_key,
+				&going_up, &cached_col_nr_e,
+				iter, ordinal_key, dir,
+				(ssize_t) ft->group->max_tree_depth);
+			if (act == FT_COMPRESSED_BREAK)
 				break;
-			}
-			}
-			/* No match found, continue going up.
-			 *
-			 * Reset iter_key to match the new level.
-			 * The collapsed handler jumped level back from
-			 * within the entry's suffix span to
-			 * entry_depth + 1.  iter_key must point to
-			 * ordinal_key + entry_depth so the next
-			 * *(--iter_key) at level entry_depth reads the
-			 * correct key byte.
-			 */
-			level = entry_depth + 1;
-			iter_key = ordinal_key + entry_depth;
-			going_up = true;
+			assert(act == FT_COMPRESSED_CONTINUE);
 			continue;
-		} /* current_entry scope */
-		} /* suffix_base scope */
 		}
-#endif
 		if (!ft_node_internal(iter_path_node(iter)[level - 1])) {
 			FT_TP(ineq_going_up_step, level,
 				(const void *) iter_path_node(iter)[level - 1],
@@ -7833,203 +8106,34 @@ descend_children:
 		 * iter path as we go.
 		 */
 		if (ft_node_compressed(node_flag)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(node_flag);
+			enum ft_compressed_action act;
 
-			/*
-			 * Check external_nodes at the compressed
-			 * node's entry depth (for LEFTMOST/GE/GT).
-			 */
-			if (dir == FT_LEFTMOST) {
-				struct cds_ft_metadata *cn_meta =
-					cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) cn);
-				struct cds_ft_node *ext =
-					rcu_dereference(
-						cn_meta->external_nodes);
-
-				if (ext && !skip_eq_external_nodes) {
-					ret_node = ext;
-					level--;
-					goto found_minmax;
-				}
-			}
-			/*
-			 * Fill ordinal_key and path entries for every
-			 * level spanned by the compressed path.  The
-			 * going-up code needs a valid entry at each
-			 * level to call ft_node_get_direction (which
-			 * returns NULL for siblings, causing the
-			 * going-up walk to continue ascending).
-			 */
-			ft_fill_compressed_path(cn, ordinal_key, level - 1,
-				iter_path_node(iter), level, node_flag);
-			level += cn->len - 1;
-			node_flag = ft_dereference_acquire_prefetch(cn->child);
-			if (!ft_node_ptr(node_flag)) {
-				/*
-				 * Invariant violation: a reachable
-				 * compressed node always has a non-NULL
-				 * child, *even transiently*.  cn->child
-				 * is wired before the compressed is
-				 * published to its parent's slot and is
-				 * never cleared in place (empty
-				 * compresseds are pruned by replacing
-				 * the parent's slot with the compressed's
-				 * external_nodes, or by detaching the
-				 * whole branch -- either way the
-				 * compressed itself is no longer
-				 * reachable when it becomes empty).
-				 *
-				 * Unlike the collapsed empty-scan case
-				 * and the internal minmax == NULL case
-				 * (both transiently observable and
-				 * handled via going_up above/below),
-				 * there is no race window in which a
-				 * reachable compressed has cn->child ==
-				 * NULL.  Observing NULL here is a real
-				 * bug: abort loudly instead of silently
-				 * propagating a corrupt node_flag.
-				 */
-				fprintf(stderr,
-					"BUG: cds_ft_lookup_inequality minmax: "
-					"compressed %p has NULL child\n",
-					(const void *) node_flag);
-				abort();
-			}
-			iter_path_node(iter)[level] = node_flag;
-			if (ft_node_external(node_flag))
+			act = ft_inequality_minmax_compressed(
+				&node_flag, &level, &ret_node,
+				&skip_eq_external_nodes,
+				iter, ordinal_key, dir);
+			if (act == FT_COMPRESSED_FOUND_MINMAX)
+				goto found_minmax;
+			if (act == FT_COMPRESSED_BREAK)
 				break;
-			skip_eq_external_nodes = false;
-			/* Continue descent from the child. */
+			assert(act == FT_COMPRESSED_CONTINUE);
 			continue;
 		}
 		if (ft_node_collapsed(node_flag)) {
-			struct cds_ft_collapsed_node *col =
-				ft_collapsed_node_ptr(node_flag);
-			unsigned int col_nr_e;
-			struct cds_ft_inode_flag **cptrs;
-			unsigned int best, e;
-			uint8_t best_d;
-			struct cds_ft_inode_flag *best_child;
+			enum ft_compressed_action act;
 
-			/*
-			 * Check external_nodes at the collapsed
-			 * node's depth (for LEFTMOST/GE/GT).
-			 */
-			if (dir == FT_LEFTMOST) {
-				struct cds_ft_metadata *col_meta =
-					cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) col);
-				struct cds_ft_node *ext =
-					rcu_dereference(
-						col_meta->external_nodes);
-
-				if (ext && !skip_eq_external_nodes) {
-					ret_node = ext;
-					level--;
-					goto found_minmax;
-				}
-			}
-			/*
-			 * Find the min/max entry by suffix and descend.
-			 *
-			 * Race-free pointer selection: each candidate
-			 * entry is filtered by (dead-bit clear AND
-			 * cptrs non-NULL) at scan time, and we SAVE
-			 * the cptrs value (@best_child) alongside @best
-			 * so the descent uses the same pointer the scan
-			 * validated.  No re-read of cptrs[best] later.
-			 */
-			col_nr_e = ft_collapsed_nr_entries(col);
-			cptrs = ft_collapsed_ptrs(col, col_nr_e);
-			best = UINT_MAX;
-			best_d = 0;
-			best_child = NULL;
-
-			for (e = 0; e < ft_collapsed_count(col_nr_e); e++) {
-				uint8_t data_e = ft_collapsed_load_data(col, e);
-				struct cds_ft_inode_flag *entry;
-
-				if (ft_collapsed_entry_dead(data_e, col_nr_e))
-					continue;
-				entry = ft_dereference_acquire(cptrs[e]);
-				if (!ft_node_ptr(entry))
-					continue;
-				if (best == UINT_MAX) {
-					best = e;
-					best_d = data_e;
-					best_child = entry;
-					continue;
-				}
-				{
-					uint8_t *sa = ft_collapsed_suffix(col, best_d, col_nr_e);
-					unsigned int la = ft_collapsed_suffix_len(col, best_d, best, col_nr_e);
-					uint8_t *sb = ft_collapsed_suffix(col, data_e, col_nr_e);
-					unsigned int lb = ft_collapsed_suffix_len(col, data_e, e, col_nr_e);
-					unsigned int mc = la < lb ? la : lb;
-					int r = memcmp(sb, sa, mc);
-
-					if (dir == FT_LEFTMOST) {
-						if (r < 0 || (r == 0 && lb < la)) {
-							best = e;
-							best_d = data_e;
-							best_child = entry;
-						}
-					} else {
-						if (r > 0 || (r == 0 && lb > la)) {
-							best = e;
-							best_d = data_e;
-							best_child = entry;
-						}
-					}
-				}
-			}
-			if (best == UINT_MAX) {
-				/*
-				 * Transiently empty collapsed: a racing
-				 * writer's sub-case A sequence (NULL the
-				 * cptrs slot, then set the tombstone bit)
-				 * can leave every entry observed as
-				 * either dead-bit-set or cptrs==NULL at
-				 * the moment we scanned them, even though
-				 * the node is not quiescently empty
-				 * (sub-case A guards nr_child > 1, and
-				 * sub-cases B/C handle the last-entry
-				 * case without tombstoning).  Treat as
-				 * "empty at this step" and let going_up
-				 * find the next sibling in @dir at a
-				 * higher level.  Back level one step so
-				 * iter_path[level] is the collapsed flag
-				 * the prior iter recorded (going_up uses
-				 * iter_path[level] and iter_path[level-1]
-				 * and needs both valid).
-				 */
-				level--;
-				going_up = true;
+			act = ft_inequality_minmax_collapsed(
+				&node_flag, &level, &ret_node,
+				&skip_eq_external_nodes, &going_up,
+				iter, ordinal_key, dir,
+				(ssize_t) ft->group->max_tree_depth);
+			if (act == FT_COMPRESSED_FOUND_MINMAX)
+				goto found_minmax;
+			if (act == FT_COMPRESSED_GOING_UP)
 				goto going_up;
-			}
-			{
-				unsigned int slen = ft_collapsed_suffix_len(col, best_d, best, col_nr_e);
-				uint8_t *suffix = ft_collapsed_suffix(col, best_d, col_nr_e);
-				unsigned int k;
-
-				for (k = 0; k < slen; k++) {
-					ordinal_key[level - 1 + k] = suffix[k];
-					iter_path_node(iter)[level + k] =
-						ft_collapsed_node_flag(col);
-				}
-				level += slen - 1;
-				assert(level < (ssize_t) ft->group->max_tree_depth);
-				node_flag = best_child;
-				if (ft_node_skip_compressed(node_flag))
-					node_flag = ft_compressed_node_flag(
-						ft_skip_to_compressed(node_flag));
-				iter_path_node(iter)[level + 1] = node_flag;
-				if (ft_node_external(node_flag))
-					break;
-			}
-			skip_eq_external_nodes = false;
+			if (act == FT_COMPRESSED_BREAK)
+				break;
+			assert(act == FT_COMPRESSED_CONTINUE);
 			continue;
 		}
 		skip_eq_external_nodes = false;
