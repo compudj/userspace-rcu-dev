@@ -1745,6 +1745,10 @@ void ft_publish_to_parent(struct cds_ft *ft,
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
 
+		/* Consumed via FEATURE_FT_SKIP_COMPRESSED and FT_TP only. */
+		(void) cn;
+		(void) cn_meta;
+
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		{
 			struct cds_ft_inode_flag **skip_slot =
@@ -1860,6 +1864,9 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot)
 {
+#ifndef FEATURE_FT_SKIP_COMPRESSED
+	(void) slot;	/* only used to record the skip-compressed slot */
+#endif
 	if (!child_nf)
 		return;
 	FT_TP(set_parent, (const void *) child_nf, (const void *) parent_nf);
@@ -2525,6 +2532,7 @@ enum {
 				     / sizeof(struct cds_ft_inode_flag *),
 };
 
+#ifdef FEATURE_FT_COLLAPSE
 static
 struct cds_ft_collapsed_node *alloc_collapsed_node(struct cds_ft *ft,
 		unsigned int order, unsigned int scan_sel,
@@ -2548,6 +2556,7 @@ struct cds_ft_collapsed_node *alloc_collapsed_node(struct cds_ft *ft,
 	*_metadata = metadata;
 	return cn;
 }
+#endif /* FEATURE_FT_COLLAPSE */
 
 static
 void free_collapsed_node(struct cds_ft *ft,
@@ -6567,6 +6576,7 @@ end:
  * Returns the index of the nearest entry, or -1 if none found.
  * On success, *@best_child receives the validated child pointer.
  */
+#ifdef FEATURE_FT_COLLAPSE
 static int ft_collapsed_find_nearest(
 		struct cds_ft_collapsed_node *col,
 		struct cds_ft_inode_flag **cptrs,
@@ -6631,6 +6641,7 @@ static int ft_collapsed_find_nearest(
 		*best_child = saved_best_child;
 	return best;
 }
+#endif /* FEATURE_FT_COLLAPSE */
 
 /*
  * Iterator-based inequality lookup. The input key and key_len are read
@@ -6832,7 +6843,7 @@ out_break:
 static
 enum ft_compressed_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_flag_p,
 		ssize_t *level_p, ssize_t key_depth,
-		ssize_t max_tree_depth,
+		ssize_t max_tree_depth __attribute__((unused)),
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
 		const uint8_t **iter_key_p,
@@ -10506,7 +10517,7 @@ static
 struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, unsigned int level,
 		struct cds_ft_inode_flag *child,
-		struct cds_ft_node *external_nodes)
+		struct cds_ft_node *external_nodes __attribute__((unused)))
 {
 	uint8_t path_len = (uint8_t)(key_len - level);
 	struct cds_ft_compressed_node *cn;
@@ -10548,11 +10559,13 @@ struct cds_ft_inode_flag *ft_try_compress_chain(
 }
 #endif
 
+#ifdef FEATURE_FT_COLLAPSE
 static struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		const uint8_t *ordinals, unsigned int len,
 		struct cds_ft_inode_flag *child,
 		unsigned long nr_keys,
 		unsigned int base_depth);
+#endif
 
 static struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		struct cds_ft_collapsed_node *col,
@@ -10730,7 +10743,9 @@ int ft_attach_node(struct cds_ft *ft,
 		if (old_recompacted_node)
 			free_cds_ft_node(ft, old_recompacted_node);
 	}
+#ifdef FEATURE_FT_COLLAPSE
 publish_done:
+#endif
 
 	/*
 	 * Propagate node density for each created traversable node.
@@ -11166,6 +11181,7 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
  *
  * Returns the chain's root flag, or NULL on allocation failure.
  */
+#ifdef FEATURE_FT_COLLAPSE
 static
 struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		const uint8_t *ordinals, unsigned int len,
@@ -11230,6 +11246,7 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		return cur;
 	}
 }
+#endif /* FEATURE_FT_COLLAPSE */
 
 #ifdef FEATURE_FT_COLLAPSE
 /*
