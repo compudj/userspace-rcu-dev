@@ -21,6 +21,7 @@
 #include <urcu/rculfhash.h>
 #include <urcu/arch.h>
 #include <urcu/call-rcu.h>
+#include <urcu/uatomic.h>
 #include <assert.h>
 
 /*
@@ -260,6 +261,19 @@
 #  define FEATURE_FT_SKIP_COMPRESSED
 # endif
 #endif
+
+/*
+ * FEATURE_FT_EXCL_VALIDATE: runtime validation of the access-discipline
+ * contract (writer/writer exclusion in all modes; additionally
+ * writer/reader exclusion in exclusive mode).  Writers claim a
+ * per-trie owner via atomic CAS at the public API boundary; in
+ * exclusive mode readers are counted too and a concurrent writer
+ * (or a reader concurrent with a writer) aborts the process with a
+ * violation report.  In concurrent mode readers are no-ops because
+ * RCU already permits them to overlap with a single writer.
+ *
+ * Off by default (zero overhead).  Enable with -DFEATURE_FT_EXCL_VALIDATE.
+ */
 
 #ifdef FEATURE_INLINE_LOOKUP
 #define inline_lookup	inline __attribute__((always_inline))
@@ -531,6 +545,21 @@ struct cds_ft {
 	 */
 	bool exclusive;
 
+#ifdef FEATURE_FT_EXCL_VALIDATE
+	/*
+	 * Access-discipline validator state.  @excl_owner holds the
+	 * pthread_self() of the thread currently inside a writer API
+	 * (claimed via atomic CAS), or 0 when no writer is active.
+	 * @excl_writer_depth is a reentry depth counter, accessed only
+	 * by the owning thread.  @excl_nr_readers counts readers that
+	 * are currently inside a reader API on an exclusive-mode trie;
+	 * concurrent-mode readers do not touch it (RCU handles them).
+	 */
+	unsigned long excl_owner;
+	unsigned long excl_writer_depth;
+	unsigned long excl_nr_readers;
+#endif
+
 	/*
 	 * Pre-allocated pool for density promotion (compact → extended).
 	 * Topped up at mutation entry (where -ENOMEM can be returned),
@@ -547,6 +576,115 @@ struct cds_ft {
 	unsigned long nr_compressed_alloc, nr_compressed_freed;
 	unsigned long nr_collapsed_alloc, nr_collapsed_freed;
 };
+
+/*
+ * Access-discipline validator.  See FEATURE_FT_EXCL_VALIDATE above.
+ *
+ * The four functions form two nested pairs: ft_excl_writer_enter /
+ * _exit around every writer API body, and ft_excl_reader_enter /
+ * _exit around every reader API body.  The CDS_FT_SCOPED_{READER,
+ * WRITER}(ft) macros wrap the pair in a GCC cleanup-attribute
+ * variable so any return path in the body automatically runs the
+ * matching _exit.
+ *
+ * When FEATURE_FT_EXCL_VALIDATE is off the helpers are empty and
+ * the compiler inlines them away.
+ */
+#ifdef FEATURE_FT_EXCL_VALIDATE
+
+__attribute__((noreturn, format(printf, 1, 2)))
+void ft_excl_abort(const char *fmt, ...);
+
+static inline
+void ft_excl_writer_enter(struct cds_ft *ft)
+{
+	unsigned long self = (unsigned long) pthread_self();
+	unsigned long prev;
+
+	prev = uatomic_cmpxchg(&ft->excl_owner, 0, self);
+	if (prev != 0) {
+		if (prev == self) {
+			/* Reentry from the same thread (e.g. graft_swap
+			 * delegating to graft). */
+			ft->excl_writer_depth++;
+			return;
+		}
+		ft_excl_abort("cds_ft=%p: writer conflict — owner 0x%lx, entering thread 0x%lx\n",
+			(void *) ft, prev, self);
+	}
+	ft->excl_writer_depth = 1;
+	if (ft->exclusive) {
+		unsigned long nr = uatomic_load(&ft->excl_nr_readers, CMM_ACQUIRE);
+
+		if (nr != 0)
+			ft_excl_abort("cds_ft=%p: writer 0x%lx entering with %lu concurrent exclusive-mode reader(s)\n",
+				(void *) ft, self, nr);
+	}
+}
+
+static inline
+void ft_excl_writer_exit(struct cds_ft *ft)
+{
+	if (--ft->excl_writer_depth == 0)
+		uatomic_store(&ft->excl_owner, 0, CMM_RELEASE);
+}
+
+static inline
+void ft_excl_reader_enter(struct cds_ft *ft)
+{
+	unsigned long owner;
+
+	if (!ft->exclusive)
+		return;
+	uatomic_add(&ft->excl_nr_readers, 1);
+	owner = uatomic_load(&ft->excl_owner, CMM_ACQUIRE);
+	if (owner != 0 && owner != (unsigned long) pthread_self())
+		ft_excl_abort("cds_ft=%p: reader 0x%lx entering with writer 0x%lx active (exclusive mode)\n",
+			(void *) ft, (unsigned long) pthread_self(), owner);
+}
+
+static inline
+void ft_excl_reader_exit(struct cds_ft *ft)
+{
+	if (!ft->exclusive)
+		return;
+	uatomic_sub(&ft->excl_nr_readers, 1);
+}
+
+#else /* !FEATURE_FT_EXCL_VALIDATE */
+
+static inline void ft_excl_writer_enter(struct cds_ft *ft) { (void) ft; }
+static inline void ft_excl_writer_exit(struct cds_ft *ft)  { (void) ft; }
+static inline void ft_excl_reader_enter(struct cds_ft *ft) { (void) ft; }
+static inline void ft_excl_reader_exit(struct cds_ft *ft)  { (void) ft; }
+
+#endif /* FEATURE_FT_EXCL_VALIDATE */
+
+static inline
+void ft_excl_writer_scope_exit(struct cds_ft **ft) { ft_excl_writer_exit(*ft); }
+static inline
+void ft_excl_reader_scope_exit(struct cds_ft **ft) { ft_excl_reader_exit(*ft); }
+
+/*
+ * Two-level token-paste so __COUNTER__ is expanded before the
+ * concatenation, producing a unique variable name for every use.
+ * This allows multiple CDS_FT_SCOPED_* per function body (e.g. the
+ * two-ft graft / graft_swap paths).
+ */
+#define CDS_FT_CAT2_(a, b) a ## b
+#define CDS_FT_CAT_(a, b) CDS_FT_CAT2_(a, b)
+
+#define CDS_FT_SCOPED_WRITER(ft)					\
+	struct cds_ft *CDS_FT_CAT_(_ft_excl_scope_, __COUNTER__)	\
+		__attribute__((unused,					\
+			cleanup(ft_excl_writer_scope_exit))) =		\
+		(ft_excl_writer_enter(ft), (ft))
+
+#define CDS_FT_SCOPED_READER(ft)					\
+	struct cds_ft *CDS_FT_CAT_(_ft_excl_scope_, __COUNTER__)	\
+		__attribute__((unused,					\
+			cleanup(ft_excl_reader_scope_exit))) =		\
+		(ft_excl_reader_enter(ft), (ft))
 
 /*
  * Allocator layout (see fractal-trie-alloc.c for the full picture).

@@ -107,6 +107,22 @@ ft_delay_init(void)
 
 #define CDS_FT_LEN_ERROR		SIZE_MAX
 
+#ifdef FEATURE_FT_EXCL_VALIDATE
+#include <stdarg.h>
+__attribute__((noreturn, format(printf, 1, 2)))
+void ft_excl_abort(const char *fmt, ...)
+{
+	va_list ap;
+
+	fprintf(stderr, "FT access-discipline violation: ");
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fflush(stderr);
+	abort();
+}
+#endif
+
 struct cds_ft_group_attr {
 	size_t key_len;
 	size_t max_key_len;
@@ -6332,6 +6348,7 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 	enum cds_ft_status status;
 
+	CDS_FT_SCOPED_READER(ft);
 	FT_TP_KEY(lookup_key_enter, ft, key, _key_len);
 	if (caa_likely(km->identity)) {
 		status = do_cds_ft_lookup(ft, key, key_len, result_node, NULL,
@@ -6367,6 +6384,7 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, _key_len);
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 
+	CDS_FT_SCOPED_READER(ft);
 	/*
 	 * Identity key-map fast path: the ordinals[] buffer would be
 	 * a byte-for-byte copy of @key; skip the 256-byte stack
@@ -6391,6 +6409,7 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 {
 	enum cds_ft_status status;
 
+	CDS_FT_SCOPED_READER(ft);
 	FT_TP_ITER_KEY(lookup_enter, iter);
 	status = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
 				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
@@ -6407,6 +6426,7 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, _key_len);
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 
+	CDS_FT_SCOPED_READER(ft);
 	if (caa_likely(km->identity)) {
 		do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
 				 FT_PREFIX_TRACK_PARTIAL, &partial_len,
@@ -6431,6 +6451,7 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 	struct cds_ft_node *partial_node = NULL;
 	size_t partial_len = 0;
 
+	CDS_FT_SCOPED_READER(ft);
 	/*
 	 * Perform the full lookup (populating the iterator path for
 	 * backtracking) while simultaneously tracking the closest
@@ -6461,6 +6482,7 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, _key_len);
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 
+	CDS_FT_SCOPED_READER(ft);
 	if (caa_likely(km->identity)) {
 		ret = do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
 				       FT_PREFIX_TRACK_LONGEST, &longest_len,
@@ -6496,6 +6518,7 @@ enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 	size_t longest_len = 0;
 	enum cds_ft_status ret;
 
+	CDS_FT_SCOPED_READER(ft);
 	ret = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
 			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node,
 			       false);
@@ -8088,6 +8111,7 @@ end:
 enum cds_ft_status cds_ft_lookup_le(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_le\n");
 	return cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_LE, FT_LOOKUP_LIMIT_NONE);
@@ -8096,6 +8120,7 @@ enum cds_ft_status cds_ft_lookup_le(struct cds_ft *ft,
 enum cds_ft_status cds_ft_lookup_ge(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_ge\n");
 	return cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_GE, FT_LOOKUP_LIMIT_NONE);
@@ -8104,6 +8129,7 @@ enum cds_ft_status cds_ft_lookup_ge(struct cds_ft *ft,
 enum cds_ft_status cds_ft_lookup_lt(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_lt\n");
 	return cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_LT, FT_LOOKUP_LIMIT_NONE);
@@ -8112,6 +8138,7 @@ enum cds_ft_status cds_ft_lookup_lt(struct cds_ft *ft,
 enum cds_ft_status cds_ft_lookup_gt(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_gt\n");
 	return cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE);
@@ -8123,6 +8150,7 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	size_t saved_key_len = iter->key_len;
 	enum cds_ft_status status;
 
+	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_first\n");
 	/*
 	 * LIMIT_FIRST sets key_len to prefix_len internally.
@@ -8147,6 +8175,7 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	size_t saved_key_len = iter->key_len;
 	enum cds_ft_status status;
 
+	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_last\n");
 	/*
 	 * LIMIT_LAST always uses key_len = max_key_len. When
@@ -11903,6 +11932,7 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
 {
 	int ret;
 
+	CDS_FT_SCOPED_WRITER(ft);
 	FT_TP_KEY(insert_enter, ft, key, key_len);
 	ret = _cds_ft_insert(ft, key, key_len, node, NULL);
 
@@ -11926,6 +11956,7 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 	int ret;
 	struct cds_ft_node *ret_node = NULL;
 
+	CDS_FT_SCOPED_WRITER(ft);
 	FT_TP_KEY(insert_unique_enter, ft, key, key_len);
 	ret = _cds_ft_insert(ft, key, key_len, node, &ret_node);
 	if (ret == -EEXIST) {
@@ -12174,6 +12205,7 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 	struct cds_ft_node *old_node = NULL;
 	int ret;
 
+	CDS_FT_SCOPED_WRITER(ft);
 	FT_TP_KEY(insert_replace_enter, ft, key, key_len);
 	ret = _cds_ft_insert_replace(ft, key, key_len, node, &old_node);
 	if (ret == -EINVAL) {
@@ -12208,6 +12240,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, iter->key_len);
 	enum cds_ft_status s;
 
+	CDS_FT_SCOPED_WRITER(ft);
 	FT_TP_ITER_KEY(replace_enter, iter);
 
 	/*
@@ -13047,6 +13080,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 
+	CDS_FT_SCOPED_WRITER(ft);
 	FT_TP(remove_enter, (const void *) ft, (const void *) iter,
 		iter_key(iter), key_len);
 
@@ -13328,6 +13362,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 
+	CDS_FT_SCOPED_WRITER(ft);
 	/*
 	 * If the iterator has a valid path, the RCU read-side lock must
 	 * be held.
@@ -14374,6 +14409,9 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 
+	CDS_FT_SCOPED_WRITER(dst_ft);
+	CDS_FT_SCOPED_WRITER(src_ft);
+
 	/*
 	 * Root-level graft (key_len == 0) is valid for both
 	 * variable-length and fixed-length groups: it swaps the entire
@@ -14601,6 +14639,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
+
+	CDS_FT_SCOPED_WRITER(dst_ft);
+	CDS_FT_SCOPED_WRITER(swap_ft);
 
 	/*
 	 * Root-level swap (key_len == 0) is valid for both
@@ -14963,6 +15004,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		FT_TP(detach_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
+
+	CDS_FT_SCOPED_WRITER(ft);
 
 	/*
 	 * Root-level detach (key_len == 0) is valid for both
@@ -15425,6 +15468,7 @@ bool cds_ft_empty(struct cds_ft *ft)
 	const struct cds_ft_type *type;
 	struct cds_ft_metadata *rmeta;
 
+	CDS_FT_SCOPED_READER(ft);
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	root_flag = rcu_dereference(ft->root);
@@ -15599,6 +15643,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	const uint8_t *prefix;
 	unsigned long count;
 
+	CDS_FT_SCOPED_READER(ft);
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	if (prefix_len > ft->group->max_key_len) {
@@ -15879,6 +15924,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 	int level;
 	unsigned long remaining = n;
 
+	CDS_FT_SCOPED_READER(ft);
 	FT_TP(lookup_nth_enter, n);
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
@@ -16185,6 +16231,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 	int level;
 	unsigned long remaining = n;
 
+	CDS_FT_SCOPED_READER(ft);
 	FT_TP(lookup_nth_last_enter, n);
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
@@ -16492,6 +16539,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 */
 	unsigned int cached_col_nr_e = 0;
 
+	CDS_FT_SCOPED_READER(ft);
 	FT_TP(iter_skip_forward_enter, n);
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
@@ -16970,6 +17018,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	int depth, level;
 	bool at_external_nodes;
 
+	CDS_FT_SCOPED_READER(ft);
 	FT_TP(iter_skip_reverse_enter, n);
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
@@ -17361,6 +17410,7 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft)
 	enum cds_ft_status status;
 	unsigned long count = 0;
 
+	CDS_FT_SCOPED_READER(ft);
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	status = cds_ft_iter_create(ft, &iter);
@@ -17500,6 +17550,7 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 
 void cds_ft_make_exclusive(struct cds_ft *ft)
 {
+	CDS_FT_SCOPED_WRITER(ft);
 	if (ft->exclusive)
 		return;
 	ft->group->flavor->update_synchronize_rcu();
@@ -17508,6 +17559,7 @@ void cds_ft_make_exclusive(struct cds_ft *ft)
 
 void cds_ft_make_concurrent(struct cds_ft *ft)
 {
+	CDS_FT_SCOPED_WRITER(ft);
 	ft->exclusive = false;
 }
 
@@ -18588,6 +18640,7 @@ enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft)
 	enum cds_ft_status status;
 	size_t max_len = 0;
 
+	CDS_FT_SCOPED_WRITER(ft);
 	status = cds_ft_iter_create(ft, &iter);
 	if (status != CDS_FT_STATUS_OK)
 		return status;
@@ -18925,6 +18978,7 @@ enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **re
 	size_t key_size  = max_key_len * sizeof(uint8_t);
 	struct cds_ft_iter *iter = calloc(1, sizeof(*iter) + path_size + key_size);
 
+	CDS_FT_SCOPED_READER(ft);
 	if (!iter) {
 		*result_iter = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;
