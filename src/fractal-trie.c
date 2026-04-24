@@ -13956,6 +13956,126 @@ error:
 static int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		struct ft_descent *d, unsigned int remaining);
 
+/*
+ * Handle a compressed node in ft_descend_to_graft_point's descent
+ * loop.  Three sub-cases:
+ *
+ *   - Exact / shorter-or-equal match (j == cmp && cn->len <=
+ *     remaining): snapshot the compressed node, traverse it and
+ *     return FT_COMPRESSED_CONTINUE so the caller continues the
+ *     descent.
+ *
+ *   - Divergence (j < cmp): split the compressed node at the
+ *     mismatch point.  Whether or not the split succeeded, the
+ *     graft point has been identified; advance *ik_p past the
+ *     diverged byte (only on split success) and return
+ *     FT_COMPRESSED_BREAK so the caller exits the descent loop.
+ *
+ *   - Key shorter than the compressed path: split into
+ *     prefix -> suffix at the key endpoint.  The graft point is
+ *     the prefix/suffix boundary.  Return FT_COMPRESSED_BREAK in
+ *     either outcome.
+ */
+static
+enum ft_compressed_action ft_descend_to_graft_point_compressed(
+		struct cds_ft *ft,
+		struct ft_descent *d,
+		const uint8_t **ik_p,
+		size_t key_len,
+		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int *nr_snapshot)
+{
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
+	const uint8_t *ik = *ik_p;
+	int remaining = key_len - d->depth;
+	int cmp = cn->len < remaining ? cn->len : remaining;
+	int j = ft_match_compressed_key(ik, cn, cmp);
+
+	if (j == cmp && cn->len <= remaining) {
+		ft_snapshot_push(snapshot, snapshot_depth,
+			*nr_snapshot, d->nf, d->depth);
+		ft_descent_traverse_compressed(d, cn, &ik);
+		*ik_p = ik;
+		return FT_COMPRESSED_CONTINUE;
+	}
+	if (j < cmp) {
+		/* Divergence: split compressed node at the mismatch point. */
+		if (ft_split_compressed_graft(ft, d, ik, j))
+			return FT_COMPRESSED_BREAK;
+		*ik_p = ik + j + 1;
+		return FT_COMPRESSED_BREAK;
+	}
+	/*
+	 * Key shorter than compressed path: split into prefix ->
+	 * suffix at the key endpoint.  The graft point is at the
+	 * junction.
+	 */
+	(void) ft_split_compressed_graft_key_shorter(ft, d, remaining);
+	return FT_COMPRESSED_BREAK;
+}
+
+/*
+ * Handle a collapsed node in ft_descend_to_graft_point's descent
+ * loop.  Scans entries for a suffix match against
+ * key[d->depth..key_len-1] (slen <= remaining only — no partial
+ * prefix split is performed here).
+ *
+ * On match: snapshot the collapsed node, advance d and *ik_p past
+ * the matched span, return FT_COMPRESSED_CONTINUE so the caller
+ * continues the descent.  On no-match: return FT_COMPRESSED_BREAK,
+ * leaving d at the collapsed node so the caller's
+ * ft_store_at_graft_point sees it as the graft point.
+ */
+static
+enum ft_compressed_action ft_descend_to_graft_point_collapsed(
+		struct ft_descent *d,
+		const uint8_t **ik_p,
+		size_t key_len,
+		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int *nr_snapshot)
+{
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(d->nf);
+	unsigned int nr_e = ft_collapsed_nr_entries(col);
+	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
+	const uint8_t *ik = *ik_p;
+	unsigned int remaining = key_len - d->depth;
+	unsigned int e;
+
+	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+		uint8_t data_e = ft_collapsed_load_data(col, e);
+		unsigned int slen;
+		uint8_t *suffix;
+		bool match;
+
+		if (ft_collapsed_entry_dead(data_e, nr_e))
+			continue;
+		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		if (slen > remaining)
+			continue;
+		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		match = (ft_key_cmp_ordinals(ik, suffix, slen, slen,
+					     false, NULL) == 0);
+		if (!match)
+			continue;
+		ft_snapshot_push(snapshot, snapshot_depth,
+			*nr_snapshot, d->nf, d->depth);
+		d->ppnf  = d->pnf;
+		d->ppnfp = d->pnfp;
+		d->pnf   = d->nf;
+		d->pnfp  = d->nfp;
+		d->nf    = ft_dereference_acquire(cptrs[e]);
+		d->nfp   = &cptrs[e];
+		d->depth += slen;
+		ik += slen;
+		*ik_p = ik;
+		return FT_COMPRESSED_CONTINUE;
+	}
+	/* Graft point: no matching entry. */
+	return FT_COMPRESSED_BREAK;
+}
+
 static
 void ft_descend_to_graft_point(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -13979,81 +14099,25 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 			d->nf = ft_compressed_node_flag(
 				ft_skip_to_compressed(d->nf));
 		if (ft_node_compressed(d->nf)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(d->nf);
-			int remaining = key_len - d->depth;
-			int cmp = cn->len < remaining ? cn->len : remaining;
-			int j;
+			enum ft_compressed_action act;
 
-			j = ft_match_compressed_key(ik, cn, cmp);
-			if (j == cmp && cn->len <= remaining) {
-				ft_snapshot_push(snapshot, snapshot_depth,
-				*nr_snapshot, d->nf, d->depth);
-				ft_descent_traverse_compressed(d, cn, &ik);
-				continue;
-			}
-			if (j < cmp) {
-				/*
-				 * Divergence: split compressed node
-				 * at the mismatch point.
-				 */
-				if (ft_split_compressed_graft(ft, d,
-						ik, j))
-					break;
-				ik += j + 1;
+			act = ft_descend_to_graft_point_compressed(ft, d,
+				&ik, key_len, snapshot, snapshot_depth,
+				nr_snapshot);
+			if (act == FT_COMPRESSED_BREAK)
 				break;
-			}
-			/*
-			 * Key shorter than compressed path: split
-			 * into prefix → suffix at the key endpoint.
-			 * The graft point is at the junction.
-			 */
-			if (ft_split_compressed_graft_key_shorter(
-					ft, d, remaining))
-				break;
-			break;
+			assert(act == FT_COMPRESSED_CONTINUE);
+			continue;
 		}
 		if (ft_node_collapsed(d->nf)) {
-			struct cds_ft_collapsed_node *col =
-				ft_collapsed_node_ptr(d->nf);
-			unsigned int remaining = key_len - d->depth;
-			unsigned int e;
-			bool found = false;
+			enum ft_compressed_action act;
 
-			unsigned int nr_e = ft_collapsed_nr_entries(col);
-			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col, nr_e);
-
-			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen;
-				uint8_t *suffix;
-				bool match;
-
-				if (ft_collapsed_entry_dead(data_e, nr_e))
-					continue;
-				slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-				if (slen > remaining)
-					continue;
-				suffix = ft_collapsed_suffix(col, data_e, nr_e);
-				match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, false, NULL) == 0);
-				if (!match)
-					continue;
-				ft_snapshot_push(snapshot, snapshot_depth,
-				*nr_snapshot, d->nf, d->depth);
-				d->ppnf  = d->pnf;
-				d->ppnfp = d->pnfp;
-				d->pnf   = d->nf;
-				d->pnfp  = d->nfp;
-				d->nf    = ft_dereference_acquire(cptrs[e]);
-				d->nfp   = &cptrs[e];
-				d->depth += slen;
-				ik += slen;
-				found = true;
+			act = ft_descend_to_graft_point_collapsed(d, &ik,
+				key_len, snapshot, snapshot_depth,
+				nr_snapshot);
+			if (act == FT_COMPRESSED_BREAK)
 				break;
-			}
-			if (!found)
-				break; /* Graft point: no matching entry. */
+			assert(act == FT_COMPRESSED_CONTINUE);
 			continue;
 		}
 
