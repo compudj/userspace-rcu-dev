@@ -15096,6 +15096,148 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	}
 }
 
+/*
+ * Handle a collapsed node in cds_ft_detach's descent loop.  Scans
+ * entries for a suffix match against key[dd->d.depth..key_len-1]:
+ *
+ *   - Exact / shorter-or-equal suffix match: advance dd and *ik_p
+ *     past the matched span, return CDS_FT_STATUS_OK so the caller
+ *     continues the descent loop.
+ *
+ *   - Partial-prefix match (collapsed entry's suffix is longer than
+ *     the remaining key but matches as a prefix): explode the
+ *     collapsed node into internals so the detach point lands on a
+ *     real internal-node boundary, install the result in dd->d.nf,
+ *     return CDS_FT_STATUS_OK so the caller's next iteration
+ *     re-dispatches via the regular internal-node path.
+ *
+ *   - No match found, or matched entry has a NULL pointer slot:
+ *     return CDS_FT_STATUS_NOT_FOUND.
+ *
+ *   - Allocation failure during explode: return
+ *     CDS_FT_STATUS_MEMORY_ERROR.
+ */
+static
+enum cds_ft_status ft_detach_descent_collapsed(struct cds_ft *ft,
+		struct ft_detach_descent *dd,
+		const uint8_t **ik_p,
+		size_t key_len)
+{
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(dd->d.nf);
+	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) col);
+	unsigned int remaining = key_len - dd->d.depth;
+	unsigned int nr_e = ft_collapsed_nr_entries(col);
+	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
+	const uint8_t *ik = *ik_p;
+	bool need_explode = false;
+	bool found = false;
+	unsigned int e;
+
+	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+		uint8_t data_e = ft_collapsed_load_data(col, e);
+		unsigned int slen;
+		uint8_t *suffix;
+		bool match;
+
+		if (ft_collapsed_entry_dead(data_e, nr_e))
+			continue;
+		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		/*
+		 * Partial prefix match (detach prefix falls within
+		 * this suffix): explode the collapsed node and
+		 * restart descent.
+		 */
+		if (slen > remaining) {
+			if (ft_key_cmp_ordinals(ik, suffix, remaining,
+						remaining, false, NULL) == 0) {
+				need_explode = true;
+				break;
+			}
+			continue;
+		}
+		match = (ft_key_cmp_ordinals(ik, suffix, slen, slen,
+					     false, NULL) == 0);
+		if (!match)
+			continue;
+		if (!ft_node_ptr(cptrs[e]))
+			return CDS_FT_STATUS_NOT_FOUND;
+		ft_detach_descent_track(dd, col_meta);
+		dd->d.ppnf  = dd->d.pnf;
+		dd->d.ppnfp = dd->d.pnfp;
+		dd->d.pnf   = dd->d.nf;
+		dd->d.pnfp  = dd->d.nfp;
+		dd->d.nf    = ft_dereference_acquire(cptrs[e]);
+		dd->d.nfp   = &cptrs[e];
+		dd->d.depth += slen;
+		ik += slen;
+		if (ft_node_ptr(dd->d.nf) && dd->pending) {
+			dd->det_nfp = dd->d.nfp;
+			dd->pending = false;
+		}
+		*ik_p = ik;
+		found = true;
+		break;
+	}
+	if (!found && !need_explode)
+		return CDS_FT_STATUS_NOT_FOUND;
+	if (found)
+		return CDS_FT_STATUS_OK;
+
+	/*
+	 * Partial-prefix match: explode the collapsed node into
+	 * internals.  After explode, the freshly published internal
+	 * subtree carries the same external_nodes (if any) that the
+	 * collapsed node held, and density propagation reflects the
+	 * footprint change.  dd->d.nf points at the new internal so
+	 * the caller's next iteration re-dispatches via the regular
+	 * internal-node path.
+	 */
+	{
+		struct cds_ft_inode_flag *internal_flag;
+		unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
+		unsigned int old_col_fp =
+			ft_node_readside_footprint(ft, dd->d.nf);
+		unsigned int di;
+
+		for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
+			old_col_density[di] = ft_density_get(col_meta, di);
+
+		internal_flag = ft_explode_entries(ft, col, cptrs,
+			0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
+			0, dd->d.depth);
+		if (!internal_flag)
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		{
+			struct cds_ft_metadata *int_meta =
+				ft_flag_to_metadata(internal_flag);
+
+			if (col_meta->external_nodes) {
+				ft_metadata_set_external_nodes(internal_flag,
+					int_meta, col_meta->external_nodes);
+				ft_nr_keys_store(ft, int_meta,
+					ft_nr_keys_get(int_meta) + 1,
+					CMM_RELAXED);
+			}
+		}
+		ft_init_node_density(ft, internal_flag);
+
+		ft_set_parent(internal_flag, dd->d.pnf, dd->d.nfp);
+		ft_publish_to_parent(ft, dd->d.pnf, dd->d.nfp, internal_flag);
+		free_collapsed_node(ft, col);
+
+		ft_propagate_density_replace(ft, internal_flag,
+			dd->d.depth, old_col_density, old_col_fp,
+			cds_ft_item_to_metadata(ft_node_ptr(internal_flag)),
+			ft_node_readside_footprint(ft, internal_flag),
+			NULL, 0);
+
+		dd->d.nf = internal_flag;
+	}
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		const uint8_t *_key, size_t _key_len,
 		struct cds_ft **result_ft)
@@ -15259,124 +15401,15 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				continue;
 			}
 			if (ft_node_collapsed(dd.d.nf)) {
-				struct cds_ft_collapsed_node *col =
-					ft_collapsed_node_ptr(dd.d.nf);
-				const struct cds_ft_metadata *col_meta =
-					cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) col);
-				unsigned int remaining = key_len - dd.d.depth;
-				unsigned int e;
-				bool found = false;
+				enum cds_ft_status s;
 
-				unsigned int nr_e = ft_collapsed_nr_entries(col);
-				struct cds_ft_inode_flag **cptrs =
-					ft_collapsed_ptrs(col, nr_e);
-
-				for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-					uint8_t data_e = ft_collapsed_load_data(col, e);
-					unsigned int slen;
-					uint8_t *suffix;
-					bool match;
-
-					if (ft_collapsed_entry_dead(data_e, nr_e))
-						continue;
-					slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-					suffix = ft_collapsed_suffix(col, data_e, nr_e);
-					/*
-					 * Partial prefix match (detach prefix
-					 * falls within this suffix): explode the
-					 * collapsed node and restart descent.
-					 */
-					if (slen > remaining) {
-						if (ft_key_cmp_ordinals(ik, suffix, remaining, remaining, false, NULL) == 0)
-							goto detach_collapsed_explode;
-						continue;
-					}
-					match = (ft_key_cmp_ordinals(ik, suffix, slen, slen, false, NULL) == 0);
-					if (!match)
-						continue;
-					if (!ft_node_ptr(cptrs[e])) {
-						FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-						return CDS_FT_STATUS_NOT_FOUND;
-					}
-					ft_detach_descent_track(&dd, col_meta);
-					dd.d.ppnf  = dd.d.pnf;
-					dd.d.ppnfp = dd.d.pnfp;
-					dd.d.pnf   = dd.d.nf;
-					dd.d.pnfp  = dd.d.nfp;
-					dd.d.nf    = ft_dereference_acquire(cptrs[e]);
-					dd.d.nfp   = &cptrs[e];
-					dd.d.depth += slen;
-					ik += slen;
-					if (ft_node_ptr(dd.d.nf) && dd.pending) {
-						dd.det_nfp = dd.d.nfp;
-						dd.pending = false;
-					}
-					found = true;
-					break;
-				}
-				if (!found) {
-					FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-					return CDS_FT_STATUS_NOT_FOUND;
+				s = ft_detach_descent_collapsed(ft, &dd, &ik,
+						key_len);
+				if (s != CDS_FT_STATUS_OK) {
+					FT_TP(detach_exit, (int) s);
+					return s;
 				}
 				continue;
-
-			detach_collapsed_explode:
-				{
-					struct cds_ft_inode_flag *internal_flag;
-					/*
-					 * Save collapsed node's density and
-					 * footprint before explode frees it.
-					 */
-					unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
-					unsigned int old_col_fp =
-						ft_node_readside_footprint(ft, dd.d.nf);
-					{
-						unsigned int di;
-
-						for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
-							old_col_density[di] =
-								ft_density_get(col_meta, di);
-					}
-
-					internal_flag = ft_explode_entries(ft,
-						col, cptrs,
-						0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
-						0, dd.d.depth);
-					if (!internal_flag) {
-						FT_TP(detach_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
-						return CDS_FT_STATUS_MEMORY_ERROR;
-					}
-					{
-						struct cds_ft_metadata *int_meta =
-							ft_flag_to_metadata(internal_flag);
-						if (col_meta->external_nodes) {
-							ft_metadata_set_external_nodes(
-								internal_flag, int_meta,
-								col_meta->external_nodes);
-							ft_nr_keys_store(ft, int_meta,
-								ft_nr_keys_get(int_meta) + 1,
-								CMM_RELAXED);
-						}
-					}
-					ft_init_node_density(ft, internal_flag);
-
-					ft_set_parent(internal_flag, dd.d.pnf, dd.d.nfp);
-					ft_publish_to_parent(ft, dd.d.pnf,
-						dd.d.nfp, internal_flag);
-					free_collapsed_node(ft, col);
-
-					ft_propagate_density_replace(ft,
-						internal_flag, dd.d.depth,
-						old_col_density, old_col_fp,
-						cds_ft_item_to_metadata(
-							ft_node_ptr(internal_flag)),
-						ft_node_readside_footprint(ft, internal_flag),
-						NULL, 0);
-
-					dd.d.nf = internal_flag;
-					continue;
-				}
 			}
 
 			meta = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
