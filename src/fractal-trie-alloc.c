@@ -121,7 +121,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	if (!ptr)
 		return NULL;
 	memset(ptr, 0, alloc_size);
-	range = (struct cds_ft_alloc_range *) (ptr + cds_ft_page_size);
+	range = (struct cds_ft_alloc_range *) ((char *) ptr + cds_ft_page_size);
 	range->arena = arena;
 	return range;
 }
@@ -129,7 +129,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 static
 void range_destroy(struct cds_ft_alloc_range *range)
 {
-	void *p = (void *) range - cds_ft_page_size;
+	void *p = (char *) range - cds_ft_page_size;
 
 	cds_list_del(&range->node);
 	free(p);
