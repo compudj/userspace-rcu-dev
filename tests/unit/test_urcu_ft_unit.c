@@ -10342,7 +10342,6 @@ static int test_compress_iter_reuse(void)
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_varlen_ft(&group);
 	struct cds_ft_iter *iter;
-	struct cds_ft_node *found;
 	uint8_t rk[32];
 	size_t rklen;
 	int ret = -1;
