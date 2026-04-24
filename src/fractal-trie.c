@@ -12552,9 +12552,41 @@ int ft_detach_node(struct cds_ft *ft,
 		}
 	} else if (ft_node_collapsed(iter_node_flag)) {
 		/*
-		 * Collapsed parent: tombstone the entry pointing to
-		 * the detached child, and set the child pointer to
-		 * the topmost_external_nodes (or NULL).
+		 * Collapsed parent.  The upward walk stopped here for
+		 * one of: col.nr_child > 1, col.external_nodes is set,
+		 * or a descendant's external_nodes was propagated up
+		 * (topmost_external_nodes non-NULL).
+		 *
+		 * A collapsed with nr_child == 0 would be a dead-end
+		 * under ordered traversal -- an invariant violation.
+		 * The three sub-cases below ensure nr_child stays >= 1
+		 * at all times a reader can observe col in the trie:
+		 *
+		 *   A. col.nr_child > 1: tombstone the one entry being
+		 *      detached.  nr_child-- leaves nr_child >= 1; col
+		 *      remains live with fewer entries.
+		 *
+		 *   B. col.nr_child == 1 AND topmost_external_nodes
+		 *      (detached child had external_nodes to promote):
+		 *      repurpose the entry -- cptrs[e] becomes the
+		 *      promoted external chain head.  nr_child stays at
+		 *      1; col's own external_nodes (if any) is
+		 *      unchanged.  No tombstone, no nr_child decrement.
+		 *
+		 *   C. col.nr_child == 1 AND col.external_nodes (no
+		 *      topmost_external_nodes): replace col in its
+		 *      grandparent's slot with col.external_nodes.
+		 *      col is freed; grandparent now points directly
+		 *      at col's NIL-key chain.  col is never observed
+		 *      with nr_child == 0.
+		 *
+		 * The remaining case (nr_child == 1 AND no external
+		 * anywhere) is handled earlier by the upward walk:
+		 * col is marked for prune (nr_clear++), the whole
+		 * single-child chain up to col's non-prunable ancestor
+		 * is replaced via ft_node_replace_ptr, and col is
+		 * freed via the free-intermediate walk without ever
+		 * being iter_node_flag here.
 		 *
 		 * Density was already propagated above (before
 		 * structural changes).
@@ -12568,15 +12600,64 @@ int ft_detach_node(struct cds_ft *ft,
 		unsigned int nr_e = ft_collapsed_nr_entries(col);
 		struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
 
+		/*
+		 * Sub-case C: last-entry detach on a collapsed with
+		 * its own external_nodes and no promoted chain from
+		 * the detached child.  Replace col directly with
+		 * col.external_nodes in grandparent's slot.
+		 */
+		if (col_meta->nr_child == 1 && !topmost_external_nodes
+				&& col_meta->external_nodes) {
+			struct cds_ft_node *ext = col_meta->external_nodes;
+
+			/*
+			 * Propagate density for col (about to be freed).
+			 * This mirrors the propagation path in the former
+			 * nr_child == 0 branch.
+			 */
+			ft_propagate_node_density_parent(ft,
+				iter_node_flag, cur_depth, cur_depth,
+				-(long) ft_node_readside_footprint(ft,
+					iter_node_flag));
+
+			/*
+			 * Reparent ext to col's parent before publishing.
+			 * Otherwise ext->prev would keep pointing at col,
+			 * which is about to be freed.
+			 */
+			ft_set_parent((struct cds_ft_inode_flag *) ext,
+				col_meta->parent, detach_parent_flag_ptr);
+			ft_publish_to_parent(ft, col_meta->parent,
+				detach_parent_flag_ptr,
+				(struct cds_ft_inode_flag *) ext);
+			free_collapsed_node(ft, col);
+			/*
+			 * col was freed.  Prevent the density
+			 * subtraction at the end from accessing the
+			 * freed iter_node_flag.
+			 */
+			old_detach_cm = NULL;
+			ret = 0;
+			goto end;
+		}
+
+		/*
+		 * Sub-cases A and B: tombstone (A) or repurpose (B)
+		 * the detached entry.  nr_child stays >= 1 in both.
+		 */
 		for (e = 0; e < ft_collapsed_count(nr_e); e++) {
 			if (&cptrs[e] == detach_node_flag_ptr) {
 				if (topmost_external_nodes) {
 					/*
-					 * Reparent the external chain head to
-					 * the collapsed node before publishing.
-					 * Without this, topmost_external_nodes->prev
-					 * would keep pointing to the detached
-					 * (about-to-be-freed) subtree node.
+					 * Sub-case B: repurpose entry with
+					 * the promoted external chain head.
+					 * nr_child unchanged; col stays live.
+					 *
+					 * Reparent the external chain head
+					 * to col before publishing: otherwise
+					 * topmost_external_nodes->prev would
+					 * keep pointing to the (about-to-be-
+					 * freed) detached subtree root.
 					 */
 					ft_set_parent(
 						(struct cds_ft_inode_flag *)
@@ -12587,6 +12668,13 @@ int ft_detach_node(struct cds_ft *ft,
 						(struct cds_ft_inode_flag *)
 						topmost_external_nodes);
 				} else {
+					/*
+					 * Sub-case A: tombstone entry.  Only
+					 * reached when col.nr_child > 1, so
+					 * nr_child-- leaves col >= 1 (guarded
+					 * by sub-case C above).
+					 */
+					assert(col_meta->nr_child > 1);
 					ft_publish_to_parent(ft, iter_node_flag,
 						&cptrs[e], NULL);
 					/*
@@ -12607,44 +12695,6 @@ int ft_detach_node(struct cds_ft *ft,
 				}
 				break;
 			}
-		}
-		/*
-		 * If all entries are dead, replace the collapsed node
-		 * with the topmost_external_nodes (or NULL) in the
-		 * grandparent.
-		 */
-		if (col_meta->nr_child == 0) {
-			struct cds_ft_inode_flag *replacement =
-				topmost_external_nodes ?
-				(struct cds_ft_inode_flag *) topmost_external_nodes : NULL;
-
-			/* Propagate density for the freed collapsed node. */
-			ft_propagate_node_density_parent(ft,
-				iter_node_flag, cur_depth,
-				cur_depth,
-				-(long) ft_node_readside_footprint(ft,
-					iter_node_flag));
-			/*
-			 * Reparent the external chain head (if any) to the
-			 * collapsed node's parent before the collapsed node
-			 * is freed.  Otherwise replacement->prev would point
-			 * to the collapsed node about to be freed.
-			 */
-			if (replacement)
-				ft_set_parent(replacement,
-					col_meta->parent,
-					detach_parent_flag_ptr);
-			ft_publish_to_parent(ft, col_meta->parent,
-				detach_parent_flag_ptr, replacement);
-			free_collapsed_node(ft, col);
-			/*
-			 * The collapsed was freed.  Prevent the
-			 * density subtraction at the end from
-			 * accessing the freed iter_node_flag.
-			 */
-			old_detach_cm = NULL;
-			ret = 0;
-			goto end;
 		}
 		ret = 0;
 	} else {
