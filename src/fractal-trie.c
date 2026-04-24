@@ -13179,6 +13179,112 @@ void ft_unchain_node(struct cds_ft_node **head_slot,
  *         with an internal node. Unlink the node from its list, leaving
  *         the external nodes list empty.
  */
+/*
+ * Handle a compressed node in cds_ft_remove / cds_ft_remove_all's
+ * descent loop.  Match the remaining key bytes against the
+ * compressed path:
+ *
+ *   - Divergence (j < cmp), key shorter than the compressed path
+ *     (cn->len > remaining), or NULL child: the key is not
+ *     present.  Return CDS_FT_STATUS_NOT_FOUND.
+ *
+ *   - Full match with non-NULL child: track the detach point,
+ *     traverse through the compressed span, refresh the pending
+ *     detach pointer if needed, and return CDS_FT_STATUS_OK so
+ *     the caller continues the descent.
+ */
+static
+enum cds_ft_status ft_remove_descent_compressed(
+		struct ft_detach_descent *dd,
+		const uint8_t **iter_key_p,
+		size_t key_len)
+{
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(dd->d.nf);
+	const struct cds_ft_metadata *cn_meta = cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) cn);
+	unsigned int remaining = key_len - dd->d.depth;
+	unsigned int cmp = cn->len < remaining ? cn->len : remaining;
+	unsigned int j;
+
+	j = ft_match_compressed_key(*iter_key_p, cn, cmp);
+	if (j < cmp || cn->len > remaining || !ft_node_ptr(cn->child))
+		return CDS_FT_STATUS_NOT_FOUND;
+
+	ft_detach_descent_track(dd, cn_meta);
+	ft_descent_traverse_compressed(&dd->d, cn, iter_key_p);
+	if (ft_node_ptr(dd->d.nf) && dd->pending) {
+		dd->det_nfp = dd->d.nfp;
+		dd->det_depth = dd->d.depth;
+		dd->pending = false;
+	}
+	return CDS_FT_STATUS_OK;
+}
+
+/*
+ * Handle a collapsed node in cds_ft_remove / cds_ft_remove_all's
+ * descent loop.  Scan entries for a suffix match against
+ * key[dd->d.depth..key_len-1]; only entries with slen <= remaining
+ * are considered (no partial-prefix explode here, since remove
+ * targets an exact key).
+ *
+ * On match: track the detach point, advance dd and *iter_key_p
+ * past the matched span, refresh the pending detach pointer if
+ * needed, and return CDS_FT_STATUS_OK so the caller continues
+ * the descent.  On no-match (or match with NULL pointer slot):
+ * return CDS_FT_STATUS_NOT_FOUND.
+ */
+static
+enum cds_ft_status ft_remove_descent_collapsed(
+		struct ft_detach_descent *dd,
+		const uint8_t **iter_key_p,
+		size_t key_len)
+{
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(dd->d.nf);
+	const struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) col);
+	unsigned int remaining = key_len - dd->d.depth;
+	unsigned int nr_e = ft_collapsed_nr_entries(col);
+	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
+	const uint8_t *iter_key = *iter_key_p;
+	unsigned int e;
+
+	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+		uint8_t data_e = ft_collapsed_load_data(col, e);
+		unsigned int slen;
+		uint8_t *suffix;
+		bool match;
+
+		if (ft_collapsed_entry_dead(data_e, nr_e))
+			continue;
+		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		if (slen > remaining)
+			continue;
+		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen,
+					     false, NULL) == 0);
+		if (!match)
+			continue;
+		if (!ft_node_ptr(cptrs[e]))
+			return CDS_FT_STATUS_NOT_FOUND;
+		ft_detach_descent_track(dd, col_meta);
+		dd->d.ppnf  = dd->d.pnf;
+		dd->d.ppnfp = dd->d.pnfp;
+		dd->d.pnf   = dd->d.nf;
+		dd->d.pnfp  = dd->d.nfp;
+		dd->d.nf    = ft_dereference_acquire(cptrs[e]);
+		dd->d.nfp   = &cptrs[e];
+		dd->d.depth += slen;
+		iter_key += slen;
+		if (ft_node_ptr(dd->d.nf) && dd->pending) {
+			dd->det_nfp = dd->d.nfp;
+			dd->pending = false;
+		}
+		*iter_key_p = iter_key;
+		return CDS_FT_STATUS_OK;
+	}
+	return CDS_FT_STATUS_NOT_FOUND;
+}
+
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
@@ -13238,87 +13344,24 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		 * is not present.
 		 */
 		if (ft_node_compressed(dd.d.nf)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(dd.d.nf);
-			const struct cds_ft_metadata *cn_meta =
-				cds_ft_item_to_metadata(
-					(struct cds_ft_inode *) cn);
-			unsigned int remaining = key_len - dd.d.depth;
-			unsigned int cmp = cn->len < remaining ?
-				cn->len : remaining;
-			unsigned int j;
+			enum cds_ft_status s;
 
-			j = ft_match_compressed_key(iter_key, cn, cmp);
-			if (j < cmp || cn->len > remaining ||
-			    !ft_node_ptr(cn->child)) {
-				FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-				return CDS_FT_STATUS_NOT_FOUND;
-			}
-			/*
-			 * Full match with non-NULL child: traverse
-			 * through without decompressing.
-			 */
-			ft_detach_descent_track(&dd, cn_meta);
-			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
-			if (ft_node_ptr(dd.d.nf) && dd.pending) {
-				dd.det_nfp = dd.d.nfp;
-				dd.det_depth = dd.d.depth;
-				dd.pending = false;
+			s = ft_remove_descent_compressed(&dd, &iter_key,
+							 key_len);
+			if (s != CDS_FT_STATUS_OK) {
+				FT_TP(remove_exit, (int) s);
+				return s;
 			}
 			continue;
 		}
 		if (ft_node_collapsed(dd.d.nf)) {
-			struct cds_ft_collapsed_node *col =
-				ft_collapsed_node_ptr(dd.d.nf);
-			const struct cds_ft_metadata *col_meta =
-				cds_ft_item_to_metadata(
-					(struct cds_ft_inode *) col);
-			unsigned int remaining = key_len - dd.d.depth;
-			unsigned int e;
-			bool found = false;
+			enum cds_ft_status s;
 
-			unsigned int nr_e = ft_collapsed_nr_entries(col);
-			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col, nr_e);
-
-			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen;
-				uint8_t *suffix;
-				bool match2;
-
-				if (ft_collapsed_entry_dead(data_e, nr_e))
-					continue;
-				slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-				if (slen > remaining)
-					continue;
-				suffix = ft_collapsed_suffix(col, data_e, nr_e);
-				match2 = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, false, NULL) == 0);
-				if (!match2)
-					continue;
-				if (!ft_node_ptr(cptrs[e])) {
-					FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-					return CDS_FT_STATUS_NOT_FOUND;
-				}
-				ft_detach_descent_track(&dd, col_meta);
-				dd.d.ppnf  = dd.d.pnf;
-				dd.d.ppnfp = dd.d.pnfp;
-				dd.d.pnf   = dd.d.nf;
-				dd.d.pnfp  = dd.d.nfp;
-				dd.d.nf    = ft_dereference_acquire(cptrs[e]);
-				dd.d.nfp   = &cptrs[e];
-				dd.d.depth += slen;
-				iter_key += slen;
-				if (ft_node_ptr(dd.d.nf) && dd.pending) {
-					dd.det_nfp = dd.d.nfp;
-					dd.pending = false;
-				}
-				found = true;
-				break;
-			}
-			if (!found) {
-				FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-				return CDS_FT_STATUS_NOT_FOUND;
+			s = ft_remove_descent_collapsed(&dd, &iter_key,
+							key_len);
+			if (s != CDS_FT_STATUS_OK) {
+				FT_TP(remove_exit, (int) s);
+				return s;
 			}
 			continue;
 		}
@@ -13534,83 +13577,24 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * is not present.
 		 */
 		if (ft_node_compressed(dd.d.nf)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(dd.d.nf);
-			const struct cds_ft_metadata *cn_meta =
-				cds_ft_item_to_metadata(
-					(struct cds_ft_inode *) cn);
-			unsigned int remaining = key_len - dd.d.depth;
-			unsigned int cmp = cn->len < remaining ?
-				cn->len : remaining;
-			unsigned int j;
+			enum cds_ft_status s;
 
-			j = ft_match_compressed_key(iter_key, cn, cmp);
-			if (j < cmp || cn->len > remaining ||
-			    !ft_node_ptr(cn->child)) {
+			s = ft_remove_descent_compressed(&dd, &iter_key,
+							 key_len);
+			if (s != CDS_FT_STATUS_OK) {
 				*result_node = NULL;
-				return CDS_FT_STATUS_NOT_FOUND;
-			}
-			ft_detach_descent_track(&dd, cn_meta);
-			ft_descent_traverse_compressed(&dd.d, cn, &iter_key);
-			if (ft_node_ptr(dd.d.nf) && dd.pending) {
-				dd.det_nfp = dd.d.nfp;
-				dd.det_depth = dd.d.depth;
-				dd.pending = false;
+				return s;
 			}
 			continue;
 		}
 		if (ft_node_collapsed(dd.d.nf)) {
-			struct cds_ft_collapsed_node *col =
-				ft_collapsed_node_ptr(dd.d.nf);
-			const struct cds_ft_metadata *col_meta =
-				cds_ft_item_to_metadata(
-					(struct cds_ft_inode *) col);
-			unsigned int remaining = key_len - dd.d.depth;
-			unsigned int e;
-			bool found = false;
+			enum cds_ft_status s;
 
-			unsigned int nr_e = ft_collapsed_nr_entries(col);
-			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col, nr_e);
-
-			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen;
-				uint8_t *suffix;
-				bool match;
-
-				if (ft_collapsed_entry_dead(data_e, nr_e))
-					continue;
-				slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-				if (slen > remaining)
-					continue;
-				suffix = ft_collapsed_suffix(col, data_e, nr_e);
-				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, false, NULL) == 0);
-				if (!match)
-					continue;
-				if (!ft_node_ptr(cptrs[e])) {
-					*result_node = NULL;
-					return CDS_FT_STATUS_NOT_FOUND;
-				}
-				ft_detach_descent_track(&dd, col_meta);
-				dd.d.ppnf  = dd.d.pnf;
-				dd.d.ppnfp = dd.d.pnfp;
-				dd.d.pnf   = dd.d.nf;
-				dd.d.pnfp  = dd.d.nfp;
-				dd.d.nf    = ft_dereference_acquire(cptrs[e]);
-				dd.d.nfp   = &cptrs[e];
-				dd.d.depth += slen;
-				iter_key += slen;
-				if (ft_node_ptr(dd.d.nf) && dd.pending) {
-					dd.det_nfp = dd.d.nfp;
-					dd.pending = false;
-				}
-				found = true;
-				break;
-			}
-			if (!found) {
+			s = ft_remove_descent_collapsed(&dd, &iter_key,
+							key_len);
+			if (s != CDS_FT_STATUS_OK) {
 				*result_node = NULL;
-				return CDS_FT_STATUS_NOT_FOUND;
+				return s;
 			}
 			continue;
 		}
