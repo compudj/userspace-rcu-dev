@@ -16621,6 +16621,126 @@ enum ft_compressed_action ft_skip_forward_compressed(
 }
 
 /*
+ * Handle a collapsed ancestor in cds_ft_iter_skip_forward's walk-up
+ * loop.  Skips intermediate path levels (same collapsed node at
+ * adjacent levels).  At the entry level, scans entries to the right
+ * of the current key's suffix and counts their keys.  When the
+ * target falls within a rightward entry's subtree, fills
+ * ordinal_key + iter_path across the suffix span, advances *level_p
+ * and returns FT_COMPRESSED_BREAK so the caller can goto
+ * descend_forward.  Otherwise returns FT_COMPRESSED_CONTINUE for
+ * the caller to keep walking up.
+ */
+static
+enum ft_compressed_action ft_skip_forward_walk_up_collapsed(
+		struct cds_ft_inode_flag *ancestor,
+		int *level_p,
+		int depth,
+		unsigned long *remaining_p,
+		unsigned int *cached_col_nr_e_p,
+		uint8_t *ordinal_key,
+		struct cds_ft_iter *iter)
+{
+	int level = *level_p;
+	struct cds_ft_collapsed_node *col;
+	unsigned int nr_e;
+	struct cds_ft_inode_flag **cptrs;
+	unsigned int e;
+
+	/* Skip intermediate levels (same node at adjacent levels). */
+	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
+		return FT_COMPRESSED_CONTINUE;
+
+	col = ft_collapsed_node_ptr(ancestor);
+	/*
+	 * Use cached nr_entries from the downward walk when
+	 * available; fresh load for collapsed nodes at higher levels.
+	 */
+	nr_e = *cached_col_nr_e_p ? *cached_col_nr_e_p :
+		ft_collapsed_nr_entries(col);
+	cptrs = ft_collapsed_ptrs(col, nr_e);
+
+	*cached_col_nr_e_p = 0;
+
+	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+		unsigned int slen;
+		uint8_t *suffix;
+		unsigned long ck;
+		bool is_current;
+		uint8_t data_e = ft_collapsed_load_data(col, e);
+
+		if (ft_collapsed_entry_dead(data_e, nr_e))
+			continue;
+		if (!ft_node_ptr(cptrs[e]))
+			continue;
+		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+
+		/*
+		 * Check if this is the current entry by comparing
+		 * suffix to ordinal_key.
+		 */
+		is_current = true;
+		{
+			unsigned int j;
+			unsigned int cmp = slen;
+
+			for (j = 0; j < cmp; j++) {
+				if (suffix[j] != ordinal_key[level + j]) {
+					is_current = false;
+					break;
+				}
+			}
+		}
+		if (is_current)
+			continue;
+
+		/*
+		 * Check if this entry is to the right (suffix > current
+		 * key's suffix).
+		 */
+		{
+			unsigned int j;
+			unsigned int cur_slen = depth - level;
+			unsigned int cmp = slen < cur_slen ? slen : cur_slen;
+			int r = 0;
+
+			for (j = 0; j < cmp; j++) {
+				if (suffix[j] > ordinal_key[level + j]) {
+					r = 1;
+					break;
+				}
+				if (suffix[j] < ordinal_key[level + j]) {
+					r = -1;
+					break;
+				}
+			}
+			if (r == 0 && slen > cur_slen)
+				r = 1;
+			if (r <= 0)
+				continue;
+		}
+		ck = ft_child_key_count(cptrs[e]);
+		if (*remaining_p <= ck) {
+			unsigned int k;
+
+			(*remaining_p)--;
+			for (k = 0; k < slen; k++) {
+				ordinal_key[level + k] = suffix[k];
+				if (k > 0)
+					iter_path_node(iter)[level + k + 1] = ancestor;
+			}
+			level += slen;
+			iter_path_node(iter)[level] = cptrs[e];
+			*level_p = level;
+			return FT_COMPRESSED_BREAK;
+		}
+		*remaining_p -= ck;
+	}
+	return FT_COMPRESSED_CONTINUE;
+}
+
+/*
  * Skip forward by @n keys from the current iterator position using
  * local traversal.
  *
@@ -16802,100 +16922,14 @@ skip_fwd_walk_up:
 		 * entries to the right and count their keys.
 		 */
 		if (ft_node_collapsed(ancestor)) {
-			/* Skip if this is an intermediate level. */
-			if (level > 0 &&
-			    iter_path_node(iter)[level - 1] == ancestor)
-				continue;
-			/* Entry level: scan rightward entries. */
-			{
-				struct cds_ft_collapsed_node *col =
-					ft_collapsed_node_ptr(ancestor);
-				/*
-				 * Use cached nr_entries from the downward
-				 * walk when available; fresh load for
-				 * collapsed nodes at higher levels.
-				 */
-				unsigned int nr_e = cached_col_nr_e ?
-					cached_col_nr_e :
-					ft_collapsed_nr_entries(col);
-				struct cds_ft_inode_flag **cptrs =
-					ft_collapsed_ptrs(col, nr_e);
-				unsigned int e;
+			enum ft_compressed_action act;
 
-				cached_col_nr_e = 0;
-
-				for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-					unsigned int slen;
-					uint8_t *suffix;
-					unsigned long ck;
-					bool is_current;
-					uint8_t data_e = ft_collapsed_load_data(col, e);
-
-					if (ft_collapsed_entry_dead(data_e, nr_e))
-						continue;
-					if (!ft_node_ptr(cptrs[e]))
-						continue;
-					slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-					suffix = ft_collapsed_suffix(col, data_e, nr_e);
-
-					/* Check if this is the current entry
-					 * by comparing suffix to ordinal_key. */
-					is_current = true;
-					{
-						unsigned int j;
-						unsigned int cmp = slen;
-
-						for (j = 0; j < cmp; j++) {
-							if (suffix[j] != ordinal_key[level + j]) {
-								is_current = false;
-								break;
-							}
-						}
-					}
-					if (is_current)
-						continue;
-
-					/* Check if this entry is to the right
-					 * (suffix > current key's suffix). */
-					{
-						unsigned int j;
-						unsigned int cur_slen = depth - level;
-						unsigned int cmp = slen < cur_slen ? slen : cur_slen;
-						int r = 0;
-
-						for (j = 0; j < cmp; j++) {
-							if (suffix[j] > ordinal_key[level + j]) {
-								r = 1;
-								break;
-							}
-							if (suffix[j] < ordinal_key[level + j]) {
-								r = -1;
-								break;
-							}
-						}
-						if (r == 0 && slen > cur_slen)
-							r = 1;
-						if (r <= 0)
-							continue;
-					}
-					ck = ft_child_key_count(cptrs[e]);
-					if (remaining <= ck) {
-						remaining--;
-						{
-							unsigned int k;
-							for (k = 0; k < slen; k++) {
-								ordinal_key[level + k] = suffix[k];
-								if (k > 0)
-									iter_path_node(iter)[level + k + 1] = ancestor;
-							}
-						}
-						level += slen;
-						iter_path_node(iter)[level] = cptrs[e];
-						goto descend_forward;
-					}
-					remaining -= ck;
-				}
-			}
+			act = ft_skip_forward_walk_up_collapsed(ancestor,
+				&level, depth, &remaining,
+				&cached_col_nr_e, ordinal_key, iter);
+			if (act == FT_COMPRESSED_BREAK)
+				goto descend_forward;
+			assert(act == FT_COMPRESSED_CONTINUE);
 			continue;
 		}
 
@@ -17110,6 +17144,165 @@ enum ft_compressed_action ft_skip_reverse_compressed(
 }
 
 /*
+ * Handle a compressed ancestor in cds_ft_iter_skip_reverse's walk-up
+ * loop.  Skips intermediate path levels (same compressed node at
+ * adjacent levels).  At the entry level, the only candidate is the
+ * compressed node's external_nodes (which sort before all children
+ * — i.e. leftward of the current key); count or claim it.
+ *
+ * Returns FT_COMPRESSED_END when the external_nodes match: the iter
+ * has been written and *iter_status_p set to OK.  Otherwise returns
+ * FT_COMPRESSED_CONTINUE for the caller to keep walking up.
+ */
+static
+enum ft_compressed_action ft_skip_reverse_walk_up_compressed(
+		struct cds_ft_inode_flag *ancestor,
+		int level,
+		unsigned long *remaining_p,
+		uint8_t *ordinal_key,
+		struct cds_ft_iter *iter)
+{
+	struct cds_ft_metadata *ameta;
+	struct cds_ft_node *a_ext;
+
+	/* Skip intermediate compressed path levels. */
+	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
+		return FT_COMPRESSED_CONTINUE;
+
+	ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
+	a_ext = ft_dereference_acquire(ameta->external_nodes);
+	if (a_ext) {
+		if (*remaining_p == 1) {
+			int j;
+
+			iter->key_len = level;
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+			iter->node = a_ext;
+			iter->path_valid = true;
+			iter_debug_path_update(iter);
+			iter->path_len = level + 1;
+			iter->status = CDS_FT_STATUS_OK;
+			return FT_COMPRESSED_END;
+		}
+		(*remaining_p)--;
+	}
+	return FT_COMPRESSED_CONTINUE;
+}
+
+/*
+ * Handle a collapsed ancestor in cds_ft_iter_skip_reverse's walk-up
+ * loop.  Skips intermediate levels (same collapsed node at adjacent
+ * levels).  At the entry level, scans entries to the left of the
+ * current key's suffix and counts their keys; when the target falls
+ * within a leftward entry's subtree, fills ordinal_key + iter_path
+ * across the suffix span, advances *level_p and returns
+ * FT_COMPRESSED_BREAK so the caller can goto descend_reverse.
+ * Then checks the collapsed node's external_nodes (smallest key);
+ * on match returns FT_COMPRESSED_END with the iter written and
+ * *iter_status_p set to OK.  Otherwise returns FT_COMPRESSED_CONTINUE.
+ */
+static
+enum ft_compressed_action ft_skip_reverse_walk_up_collapsed(
+		struct cds_ft_inode_flag *ancestor,
+		int *level_p,
+		int depth,
+		unsigned long *remaining_p,
+		uint8_t *ordinal_key,
+		struct cds_ft_iter *iter)
+{
+	int level = *level_p;
+	struct cds_ft_collapsed_node *col;
+	unsigned int nr_e;
+	struct cds_ft_inode_flag **cptrs;
+	struct cds_ft_metadata *col_meta;
+	struct cds_ft_node *a_ext;
+	unsigned int e;
+
+	/* Skip intermediate levels. */
+	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
+		return FT_COMPRESSED_CONTINUE;
+
+	col = ft_collapsed_node_ptr(ancestor);
+	nr_e = ft_collapsed_nr_entries(col);
+	cptrs = ft_collapsed_ptrs(col, nr_e);
+	col_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+
+	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+		unsigned int slen;
+		uint8_t *suffix;
+		unsigned long ck;
+		uint8_t data_e = ft_collapsed_load_data(col, e);
+
+		if (ft_collapsed_entry_dead(data_e, nr_e))
+			continue;
+		if (!ft_node_ptr(cptrs[e]))
+			continue;
+		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+
+		/* Check if suffix < current key. */
+		{
+			unsigned int j;
+			unsigned int cur_slen = depth - level;
+			unsigned int cmp = slen < cur_slen ? slen : cur_slen;
+			int r = 0;
+
+			for (j = 0; j < cmp; j++) {
+				if (suffix[j] < ordinal_key[level + j]) {
+					r = -1;
+					break;
+				}
+				if (suffix[j] > ordinal_key[level + j]) {
+					r = 1;
+					break;
+				}
+			}
+			if (r == 0 && slen < cur_slen)
+				r = -1;
+			if (r >= 0)
+				continue;
+		}
+		ck = ft_child_key_count(cptrs[e]);
+		if (*remaining_p <= ck) {
+			unsigned int k;
+
+			(*remaining_p)--;
+			for (k = 0; k < slen; k++) {
+				ordinal_key[level + k] = suffix[k];
+				if (k > 0)
+					iter_path_node(iter)[level + k + 1] = ancestor;
+			}
+			level += slen;
+			iter_path_node(iter)[level] = cptrs[e];
+			*level_p = level;
+			return FT_COMPRESSED_BREAK;
+		}
+		*remaining_p -= ck;
+	}
+
+	/* Then check external_nodes (smallest key). */
+	a_ext = ft_dereference_acquire(col_meta->external_nodes);
+	if (a_ext) {
+		if (*remaining_p == 1) {
+			int j;
+
+			iter->key_len = level;
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+			iter->node = a_ext;
+			iter->path_valid = true;
+			iter_debug_path_update(iter);
+			iter->path_len = level + 1;
+			iter->status = CDS_FT_STATUS_OK;
+			return FT_COMPRESSED_END;
+		}
+		(*remaining_p)--;
+	}
+	return FT_COMPRESSED_CONTINUE;
+}
+
+/*
  * Skip backward by @n keys from the current iterator position using
  * local traversal.
  *
@@ -17186,128 +17379,26 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		 * level, only external_nodes matter (no siblings).
 		 */
 		if (ft_node_compressed(ancestor)) {
-			if (level > 0 &&
-			    iter_path_node(iter)[level - 1] == ancestor)
-				continue;
-			ameta = cds_ft_item_to_metadata(
-					ft_node_ptr(ancestor));
-			{
-				struct cds_ft_node *a_ext =
-					ft_dereference_acquire(
-						ameta->external_nodes);
+			enum ft_compressed_action act;
 
-				if (a_ext) {
-					if (remaining == 1) {
-						int j;
-
-						iter->key_len = level;
-						for (j = 0; j < level; j++)
-							iter_key(iter)[j] = ordinal_key[j];
-						iter->node = a_ext;
-						iter->path_valid = true;
-						iter_debug_path_update(iter);
-						iter->path_len = level + 1;
-						iter->status =
-							CDS_FT_STATUS_OK;
-						goto end;
-					}
-					remaining--;
-				}
-			}
+			act = ft_skip_reverse_walk_up_compressed(ancestor,
+				level, &remaining, ordinal_key, iter);
+			if (act == FT_COMPRESSED_END)
+				goto end;
+			assert(act == FT_COMPRESSED_CONTINUE);
 			continue;
 		}
 		if (ft_node_collapsed(ancestor)) {
-			/* Skip intermediate levels. */
-			if (level > 0 &&
-			    iter_path_node(iter)[level - 1] == ancestor)
-				continue;
-			/* Entry level: count leftward entries. */
-			{
-				struct cds_ft_collapsed_node *col =
-					ft_collapsed_node_ptr(ancestor);
-				unsigned int nr_e = ft_collapsed_nr_entries(col);
-				struct cds_ft_inode_flag **cptrs =
-					ft_collapsed_ptrs(col, nr_e);
-				struct cds_ft_metadata *col_meta =
-					cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) col);
-				unsigned int e;
+			enum ft_compressed_action act;
 
-				for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-					unsigned int slen;
-					uint8_t *suffix;
-					unsigned long ck;
-					uint8_t data_e = ft_collapsed_load_data(col, e);
-
-					if (ft_collapsed_entry_dead(data_e, nr_e))
-						continue;
-					if (!ft_node_ptr(cptrs[e]))
-						continue;
-					slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-					suffix = ft_collapsed_suffix(col, data_e, nr_e);
-
-					/* Check if suffix < current key. */
-					{
-						unsigned int j;
-						unsigned int cur_slen = depth - level;
-						unsigned int cmp = slen < cur_slen ? slen : cur_slen;
-						int r = 0;
-
-						for (j = 0; j < cmp; j++) {
-							if (suffix[j] < ordinal_key[level + j]) {
-								r = -1;
-								break;
-							}
-							if (suffix[j] > ordinal_key[level + j]) {
-								r = 1;
-								break;
-							}
-						}
-						if (r == 0 && slen < cur_slen)
-							r = -1;
-						if (r >= 0)
-							continue;
-					}
-					ck = ft_child_key_count(cptrs[e]);
-					if (remaining <= ck) {
-						remaining--;
-						{
-							unsigned int k;
-							for (k = 0; k < slen; k++) {
-								ordinal_key[level + k] = suffix[k];
-								if (k > 0)
-									iter_path_node(iter)[level + k + 1] = ancestor;
-							}
-						}
-						level += slen;
-						iter_path_node(iter)[level] = cptrs[e];
-						goto descend_reverse;
-					}
-					remaining -= ck;
-				}
-				/* Then check external_nodes (smallest key). */
-				{
-					struct cds_ft_node *a_ext =
-						ft_dereference_acquire(
-							col_meta->external_nodes);
-					if (a_ext) {
-						if (remaining == 1) {
-							int j;
-
-							iter->key_len = level;
-							for (j = 0; j < level; j++)
-								iter_key(iter)[j] = ordinal_key[j];
-							iter->node = a_ext;
-							iter->path_valid = true;
-							iter_debug_path_update(iter);
-							iter->path_len = level + 1;
-							iter->status = CDS_FT_STATUS_OK;
-							goto end;
-						}
-						remaining--;
-					}
-				}
-			}
+			act = ft_skip_reverse_walk_up_collapsed(ancestor,
+				&level, depth, &remaining,
+				ordinal_key, iter);
+			if (act == FT_COMPRESSED_BREAK)
+				goto descend_reverse;
+			if (act == FT_COMPRESSED_END)
+				goto end;
+			assert(act == FT_COMPRESSED_CONTINUE);
 			continue;
 		}
 
