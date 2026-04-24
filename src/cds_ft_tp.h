@@ -103,9 +103,9 @@ LTTNG_UST_TRACEPOINT_ENUM(cds_ft, ft_compressed_action,
  * Internal labels are <class>_<size_in_bytes>; size = 2^order
  * where order is the ft_types[i].order field.  Collapsed labels
  * encode the scan-size variant.  The exact labels realized in a
- * trace depend on build-time configuration (32-bit vs 64-bit,
- * SIMD threshold for LINEAR vs LINEAR_WIDE); the full superset
- * is listed here so the same provider metadata works on any build.
+ * trace depend on build-time configuration (32-bit vs 64-bit); the
+ * full superset is listed here so the same provider metadata works
+ * on any build.
  */
 LTTNG_UST_TRACEPOINT_ENUM(cds_ft, ft_tp_node_kind,
 	LTTNG_UST_TP_ENUM_VALUES(
@@ -117,9 +117,7 @@ LTTNG_UST_TRACEPOINT_ENUM(cds_ft, ft_tp_node_kind,
 		lttng_ust_field_enum_value("LINEAR_32",		FT_TP_NODE_LINEAR_32)
 		lttng_ust_field_enum_value("LINEAR_64",		FT_TP_NODE_LINEAR_64)
 		lttng_ust_field_enum_value("LINEAR_128",	FT_TP_NODE_LINEAR_128)
-		lttng_ust_field_enum_value("LINEAR_WIDE_64",	FT_TP_NODE_LINEAR_WIDE_64)
-		lttng_ust_field_enum_value("LINEAR_WIDE_128",	FT_TP_NODE_LINEAR_WIDE_128)
-		lttng_ust_field_enum_value("LINEAR_WIDE_256",	FT_TP_NODE_LINEAR_WIDE_256)
+		lttng_ust_field_enum_value("LINEAR_256",	FT_TP_NODE_LINEAR_256)
 		lttng_ust_field_enum_value("POOL_1D_256",	FT_TP_NODE_POOL_1D_256)
 		lttng_ust_field_enum_value("POOL_1D_512",	FT_TP_NODE_POOL_1D_512)
 		lttng_ust_field_enum_value("POOL_2D_512",	FT_TP_NODE_POOL_2D_512)
