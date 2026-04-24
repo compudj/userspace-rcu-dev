@@ -8481,8 +8481,14 @@ void ft_density_sub(struct cds_ft *ft, struct cds_ft_metadata *m, unsigned int i
 {
 	unsigned long val = ft_density_get(m, idx);
 
-	if (val < sub) {
-		/* Density underflow: clamp to 0. See TODO. */
+	/*
+	 * Density underflow breaks the core counter invariant. Assert
+	 * loudly in debug builds; clamp to 0 in release builds so a
+	 * broken invariant does not wrap into a giant counter and
+	 * silently corrupt subsequent density math.
+	 */
+	assert(val >= sub);
+	if (caa_unlikely(val < sub)) {
 		ft_density_set(ft, m, idx, 0);
 		return;
 	}
