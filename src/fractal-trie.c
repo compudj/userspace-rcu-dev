@@ -11276,6 +11276,341 @@ enum ft_compressed_action ft_insert_compressed(struct cds_ft *ft,
 }
 
 /*
+ * Handle a collapsed node in _cds_ft_insert's descent loop.
+ *
+ * Two passes over the collapsed entries:
+ *
+ *   Pass 1 — full-suffix match scan: for each live entry, compare
+ *     its suffix prefix-by-prefix against the remaining key.  On
+ *     full suffix match (j == slen && slen <= remaining): snapshot,
+ *     advance d and *iter_key_p past the matched span, return
+ *     FT_COMPRESSED_CONTINUE so the caller continues the descent.
+ *     Track the longest partial-prefix match (suffix shares a
+ *     non-zero prefix with the key but diverges before slen) for
+ *     the explode decision below.
+ *
+ *   Pass 2 — outcome dispatch (no full match found):
+ *     - prefix_match_entry >= 0: go to collapsed_explode (a
+ *       partial-prefix conflict means the new key cannot be added
+ *       in-place without creating ambiguous suffixes).
+ *     - tombstone with identical suffix exists: revive it
+ *       (clear the tombstone bit, install the new child); set
+ *       *ret_p = 0 and return FT_COMPRESSED_END so the caller goes
+ *       to insert_done.
+ *     - in-place fit: append a new entry; *ret_p = 0,
+ *       FT_COMPRESSED_END.
+ *     - no fit (header/suffix collision OR max entries reached):
+ *       goto collapsed_explode.
+ *
+ *   collapsed_explode: convert the collapsed node to internal +
+ *     compressed via ft_explode_entries, propagate density, set
+ *     d->nf = internal_flag, return FT_COMPRESSED_CONTINUE so the
+ *     caller's next iteration re-dispatches via the regular
+ *     internal-node path.  On allocation failure: *ret_p = -ENOMEM,
+ *     FT_COMPRESSED_END.
+ *
+ *   ft_build_branch failures during tombstone-reuse / in-place-add
+ *   paths: *ret_p = -ENOMEM, FT_COMPRESSED_END.
+ */
+static
+enum ft_compressed_action ft_insert_collapsed(struct cds_ft *ft,
+		struct ft_descent *d, const uint8_t **iter_key_p,
+		const uint8_t *key, size_t key_len,
+		unsigned int key_depth,
+		struct cds_ft_node *node,
+		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int *nr_snapshot_p,
+		int *ret_p)
+{
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(d->nf);
+	unsigned int remaining = key_depth - 1 - d->depth;
+	unsigned int nr_e = ft_collapsed_nr_entries(col);
+	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
+	const uint8_t *iter_key = *iter_key_p;
+	int prefix_match_entry = -1;
+	unsigned int prefix_match_len = 0;
+	unsigned int new_slen;
+	unsigned int col_nr;
+	unsigned int header_end;
+	unsigned int cur_suffix_start;
+	uint8_t *new_suffix_pos;
+	struct cds_ft_inode_flag *branch;
+	unsigned int e, k;
+	int tombstone_reuse;
+
+	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
+		uint8_t data_e = ft_collapsed_load_data(col, e);
+		unsigned int slen, j;
+		uint8_t *suffix;
+
+		if (ft_collapsed_entry_dead(data_e, nr_e))
+			continue;
+		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+
+		/* Check for prefix match. */
+		{
+			unsigned int cmp_len = slen < remaining ? slen : remaining;
+
+			if (ft_key_cmp_ordinals(iter_key, suffix, cmp_len, cmp_len, false, &j) != 0) {
+				if (j == 0)
+					continue; /* No prefix overlap. */
+			} else {
+				j = cmp_len; /* Full match up to cmp_len. */
+			}
+		}
+
+		if (j == slen && slen <= remaining) {
+			/* Full suffix match: traverse through. */
+			ft_snapshot_push(snapshot, snapshot_depth,
+				*nr_snapshot_p, d->nf, d->depth);
+			d->ppnf  = d->pnf;
+			d->ppnfp = d->pnfp;
+			d->pnf   = d->nf;
+			d->pnfp  = d->nfp;
+			d->nf    = ft_dereference_acquire(cptrs[e]);
+			d->nfp   = &cptrs[e];
+			d->depth += slen;
+			iter_key += slen;
+			*iter_key_p = iter_key;
+			return FT_COMPRESSED_CONTINUE;
+		}
+		/*
+		 * Partial prefix match: the new key shares j bytes
+		 * with this entry's suffix but diverges after that.
+		 * Record the best (longest) prefix match for possible
+		 * entry splitting.
+		 */
+		if (j > prefix_match_len) {
+			prefix_match_entry = (int) e;
+			prefix_match_len = j;
+		}
+	}
+	/*
+	 * Partial prefix match: explode the collapsed node to
+	 * avoid creating conflicting entries.  Fall through to the
+	 * explode-or-break path which converts to an internal node,
+	 * then the normal insert logic handles the remaining key.
+	 */
+	if (prefix_match_entry >= 0)
+		goto collapsed_explode;
+
+	/*
+	 * No matching entry.  First check for a tombstoned entry
+	 * with the same suffix that we can reuse.  This avoids
+	 * creating duplicate suffixes which would confuse the
+	 * going-up inequality backtracking.
+	 */
+	new_slen = remaining;
+	col_nr = ft_collapsed_nr_entries(col);
+	header_end = 1 + ft_collapsed_count(col_nr) + 1;
+	tombstone_reuse = -1;
+
+	for (k = 0; k < ft_collapsed_count(col_nr); k++) {
+		uint8_t data_k = ft_collapsed_load_data(col, k);
+		uint8_t *ts_suffix;
+		unsigned int ts_slen;
+
+		if (!ft_collapsed_entry_dead(data_k, col_nr))
+			continue;
+		ts_slen = ft_collapsed_suffix_len(col, data_k, k, col_nr);
+		if (ts_slen != new_slen)
+			continue;
+		ts_suffix = ft_collapsed_suffix(col, data_k, col_nr);
+		if (ft_key_cmp_ordinals(iter_key, ts_suffix,
+				new_slen, new_slen,
+				false, NULL) == 0) {
+			tombstone_reuse = (int) k;
+			break;
+		}
+	}
+
+	if (tombstone_reuse >= 0)
+		goto collapsed_tombstone_reuse;
+
+	if (ft_collapsed_count(col_nr) > 0)
+		cur_suffix_start = col->data[ft_collapsed_count(col_nr) - 1] & ft_collapsed_offset_mask(col_nr);
+	else
+		cur_suffix_start = ft_collapsed_scan_zone_size(col_nr);
+
+	if (header_end + new_slen > cur_suffix_start ||
+	    ft_collapsed_count(col_nr) >= ft_collapsed_max_entries(
+		cds_ft_item_order(col),
+		col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT))
+		goto collapsed_explode;
+	goto collapsed_inplace_add;
+
+collapsed_tombstone_reuse:
+	/*
+	 * Reuse tombstoned entry: clear the tombstone and write
+	 * the new child.  The suffix data is already correct.
+	 */
+	if (d->depth + new_slen == key_len) {
+		branch = (struct cds_ft_inode_flag *) node;
+	} else {
+		branch = ft_build_branch(ft, key,
+			d->depth + new_slen, key_len,
+			(struct cds_ft_inode_flag *) node,
+			1, false);
+		if (!branch) {
+			*ret_p = -ENOMEM;
+			return FT_COMPRESSED_END;
+		}
+	}
+	/*
+	 * Clear tombstone.  256B zones don't use tombstones (the
+	 * bit overlaps offsets).
+	 */
+	if ((col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) < FT_COLLAPSED_SCAN_256)
+		uatomic_store(&col->data[tombstone_reuse],
+			col->data[tombstone_reuse] & ~FT_COLLAPSED_TOMBSTONE,
+			CMM_RELAXED);
+	ft_set_parent(branch, d->nf, &cptrs[tombstone_reuse]);
+	ft_publish_to_parent(ft, d->nf,
+		&cptrs[tombstone_reuse], branch);
+	/*
+	 * Re-emit collapsed_entry so consumers see the revived
+	 * entry and its new child (the suffix is unchanged — the
+	 * entry was previously tombstoned).
+	 */
+	FT_TP(collapsed_entry,
+		(const void *) ft_collapsed_node_flag(col),
+		(unsigned int) tombstone_reuse,
+		ft_collapsed_suffix(col,
+			col->data[tombstone_reuse],
+			col->nr_entries),
+		ft_collapsed_suffix_len(col,
+			col->data[tombstone_reuse] & ~FT_COLLAPSED_TOMBSTONE,
+			tombstone_reuse,
+			col->nr_entries),
+		(const void *) branch, 0);
+	{
+		struct cds_ft_metadata *col_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+		col_meta->nr_child++;
+	}
+	ft_propagate_external_count_parent(ft, d->nf, 1);
+	*ret_p = 0;
+	return FT_COMPRESSED_END;
+
+collapsed_explode:
+	{
+		/*
+		 * Collapsed node full or has prefix conflict: explode
+		 * into internal + compressed nodes.  Uses recursive
+		 * trie rebuild to handle entries that may share first
+		 * suffix bytes.
+		 */
+		struct cds_ft_inode_flag *internal_flag;
+		struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) col);
+		/*
+		 * Save collapsed node's density and footprint before
+		 * explode frees it.
+		 */
+		unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
+		unsigned int old_col_fp = ft_node_readside_footprint(ft, d->nf);
+		unsigned int di;
+
+		for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
+			old_col_density[di] = ft_density_get(col_meta, di);
+
+		internal_flag = ft_explode_entries(ft, col, cptrs,
+			0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
+			0, d->depth);
+		if (!internal_flag) {
+			*ret_p = -ENOMEM;
+			return FT_COMPRESSED_END;
+		}
+		{
+			struct cds_ft_metadata *int_meta =
+				ft_flag_to_metadata(internal_flag);
+
+			if (col_meta->external_nodes) {
+				ft_metadata_set_external_nodes(internal_flag,
+					int_meta, col_meta->external_nodes);
+				ft_nr_keys_store(ft, int_meta,
+					ft_nr_keys_get(int_meta) + 1,
+					CMM_RELAXED);
+			}
+		}
+		ft_init_node_density(ft, internal_flag);
+
+		ft_set_parent(internal_flag, d->pnf, d->nfp);
+		ft_publish_to_parent(ft, d->pnf, d->nfp, internal_flag);
+		free_collapsed_node(ft, col);
+
+		ft_propagate_density_replace(ft, internal_flag, d->depth,
+			old_col_density, old_col_fp,
+			cds_ft_item_to_metadata(ft_node_ptr(internal_flag)),
+			ft_node_readside_footprint(ft, internal_flag),
+			NULL, 0);
+
+		d->nf = internal_flag;
+		return FT_COMPRESSED_CONTINUE;
+	}
+
+collapsed_inplace_add:
+	/*
+	 * Build child for the new entry.  The suffix covers key
+	 * bytes from d->depth to key_len.  If suffix IS the full
+	 * remaining key, the child is the external node directly.
+	 * Otherwise, wrap remaining bytes in a compressed path.
+	 */
+	if (d->depth + new_slen == key_len) {
+		branch = (struct cds_ft_inode_flag *) node;
+	} else {
+		branch = ft_build_branch(ft, key,
+			d->depth + new_slen, key_len,
+			(struct cds_ft_inode_flag *) node,
+			1, false);
+		if (!branch) {
+			*ret_p = -ENOMEM;
+			return FT_COMPRESSED_END;
+		}
+	}
+
+	/* Write suffix (grows leftward from existing suffixes). */
+	new_suffix_pos = ((uint8_t *) col) + cur_suffix_start - new_slen;
+	for (k = 0; k < new_slen; k++)
+		new_suffix_pos[k] = iter_key[k];
+
+	/* Set offset for new entry. */
+	col->data[ft_collapsed_count(col_nr)] = (uint8_t)(new_suffix_pos - (uint8_t *) col);
+
+	/* Set pointer. */
+	cptrs[ft_collapsed_count(col_nr)] = branch;
+	ft_set_parent(branch, d->nf, &cptrs[ft_collapsed_count(col_nr)]);
+
+	/*
+	 * Publish: increment nr_entries (atomic store).  Store-
+	 * release in publish_inc ensures readers see suffix /
+	 * offset / pointer data.
+	 */
+	FT_TP(collapsed_entry,
+		(const void *) ft_collapsed_node_flag(col),
+		ft_collapsed_count(col_nr),
+		iter_key, new_slen,
+		(const void *) branch, 0);
+	ft_collapsed_publish_inc_nr_entries(col);
+	FT_TP(collapsed_publish,
+		(const void *) ft_collapsed_node_flag(col),
+		ft_collapsed_count(uatomic_load(&col->nr_entries, CMM_RELAXED)),
+		ft_collapsed_scan_zone_size(uatomic_load(&col->nr_entries, CMM_RELAXED)));
+
+	{
+		struct cds_ft_metadata *col_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+		col_meta->nr_child++;
+	}
+
+	ft_propagate_external_count_parent(ft, d->nf, 1);
+	*ret_p = 0;
+	return FT_COMPRESSED_END;
+}
+
+/*
  * ft_build_ordinal_chain: create a chain of nodes from an array of
  * ordinal bytes (already mapped, not raw key bytes).  Uses a
  * compressed node if FEATURE_FT_COMPRESS is enabled, otherwise
@@ -11600,325 +11935,16 @@ int _cds_ft_insert(struct cds_ft *ft,
 			continue;
 		}
 		if (ft_node_collapsed(d.nf)) {
-			struct cds_ft_collapsed_node *col =
-				ft_collapsed_node_ptr(d.nf);
-			unsigned int remaining = key_depth - 1 - d.depth;
-			unsigned int e;
-			bool found_entry = false;
-			int prefix_match_entry = -1;
-			unsigned int prefix_match_len = 0;
+			enum ft_compressed_action act;
 
-			unsigned int nr_e = ft_collapsed_nr_entries(col);
-			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col, nr_e);
-
-			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen, j;
-				uint8_t *suffix;
-
-				if (ft_collapsed_entry_dead(data_e, nr_e))
-					continue;
-				slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-				suffix = ft_collapsed_suffix(col, data_e, nr_e);
-
-				/* Check for prefix match. */
-				{
-					unsigned int cmp_len = slen < remaining ? slen : remaining;
-
-					if (ft_key_cmp_ordinals(iter_key, suffix, cmp_len, cmp_len, false, &j) != 0) {
-						if (j == 0)
-							continue; /* No prefix overlap. */
-					} else {
-						j = cmp_len; /* Full match up to cmp_len. */
-					}
-				}
-
-				if (j == slen && slen <= remaining) {
-					/* Full suffix match: traverse through. */
-					ft_snapshot_push(snapshot, snapshot_depth,
-						nr_snapshot, d.nf, d.depth);
-					d.ppnf  = d.pnf;
-					d.ppnfp = d.pnfp;
-					d.pnf   = d.nf;
-					d.pnfp  = d.nfp;
-					d.nf    = ft_dereference_acquire(cptrs[e]);
-					d.nfp   = &cptrs[e];
-					d.depth += slen;
-					iter_key += slen;
-					found_entry = true;
-					break;
-				}
-				/*
-				 * Partial prefix match: the new key shares
-				 * j bytes with this entry's suffix but diverges
-				 * after that.  Record the best (longest) prefix
-				 * match for possible entry splitting.
-				 */
-				if (j > prefix_match_len) {
-					prefix_match_entry = (int) e;
-					prefix_match_len = j;
-				}
-			}
-			if (found_entry)
-				continue;
-			/*
-			 * Partial prefix match: explode the collapsed node
-			 * to avoid creating conflicting entries.
-			 * Fall through to the explode-or-break path which
-			 * converts to an internal node, then the normal
-			 * insert logic handles the remaining key.
-			 */
-			{
-				unsigned int new_slen;
-				unsigned int col_nr;
-				unsigned int header_end;
-				unsigned int cur_suffix_start;
-				uint8_t *new_suffix_pos;
-				struct cds_ft_inode_flag *branch;
-				unsigned int k;
-				int tombstone_reuse;
-
-			if (prefix_match_entry >= 0)
-				goto collapsed_explode;
-			/*
-			 * No matching entry.  First check for a
-			 * tombstoned entry with the same suffix that
-			 * we can reuse.  This avoids creating duplicate
-			 * suffixes which would confuse the going-up
-			 * inequality backtracking.
-			 */
-				new_slen = remaining;
-				col_nr = ft_collapsed_nr_entries(col);
-				header_end = 1 + ft_collapsed_count(col_nr) + 1;
-				tombstone_reuse = -1;
-
-				for (k = 0; k < ft_collapsed_count(col_nr); k++) {
-					uint8_t data_k = ft_collapsed_load_data(col, k);
-					uint8_t *ts_suffix;
-					unsigned int ts_slen;
-
-					if (!ft_collapsed_entry_dead(data_k, col_nr))
-						continue;
-					ts_slen = ft_collapsed_suffix_len(col, data_k, k, col_nr);
-					if (ts_slen != new_slen)
-						continue;
-					ts_suffix = ft_collapsed_suffix(col, data_k, col_nr);
-					if (ft_key_cmp_ordinals(iter_key, ts_suffix,
-							new_slen, new_slen,
-							false, NULL) == 0) {
-						tombstone_reuse = (int)k;
-						break;
-					}
-				}
-
-				if (tombstone_reuse >= 0)
-					goto collapsed_tombstone_reuse;
-
-				if (ft_collapsed_count(col_nr) > 0)
-					cur_suffix_start = col->data[ft_collapsed_count(col_nr) - 1] & ft_collapsed_offset_mask(col_nr);
-				else
-					cur_suffix_start = ft_collapsed_scan_zone_size(col_nr);
-
-				if (header_end + new_slen > cur_suffix_start ||
-				    ft_collapsed_count(col_nr) >= ft_collapsed_max_entries(
-					cds_ft_item_order(col),
-					col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT))
-					goto collapsed_explode;
-				goto collapsed_inplace_add;
-
-			collapsed_tombstone_reuse:
-				{
-					/*
-					 * Reuse tombstoned entry: clear the
-					 * tombstone and write the new child.
-					 * The suffix data is already correct.
-					 */
-					if (d.depth + new_slen == key_len) {
-						branch = (struct cds_ft_inode_flag *) node;
-					} else {
-						branch = ft_build_branch(ft, key,
-							d.depth + new_slen, key_len,
-							(struct cds_ft_inode_flag *) node,
-							1, false);
-						if (!branch) {
-							ret = -ENOMEM;
-							goto insert_done;
-						}
-					}
-					/*
-					 * Clear tombstone.  256B zones don't use
-					 * tombstones (the bit overlaps offsets).
-					 */
-					if ((col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) < FT_COLLAPSED_SCAN_256)
-						uatomic_store(&col->data[tombstone_reuse],
-							col->data[tombstone_reuse] &
-							~FT_COLLAPSED_TOMBSTONE,
-							CMM_RELAXED);
-					ft_set_parent(branch, d.nf, &cptrs[tombstone_reuse]);
-					ft_publish_to_parent(ft, d.nf,
-						&cptrs[tombstone_reuse], branch);
-					/*
-					 * Re-emit collapsed_entry so consumers
-					 * see the revived entry and its new child
-					 * (the suffix is unchanged — the entry
-					 * was previously tombstoned).
-					 */
-					FT_TP(collapsed_entry,
-						(const void *) ft_collapsed_node_flag(col),
-						(unsigned int) tombstone_reuse,
-						ft_collapsed_suffix(col,
-							col->data[tombstone_reuse],
-							col->nr_entries),
-						ft_collapsed_suffix_len(col,
-							col->data[tombstone_reuse] &
-							~FT_COLLAPSED_TOMBSTONE,
-							tombstone_reuse,
-							col->nr_entries),
-						(const void *) branch, 0);
-					{
-						struct cds_ft_metadata *col_meta =
-							cds_ft_item_to_metadata(
-								(struct cds_ft_inode *) col);
-						col_meta->nr_child++;
-					}
-					ft_propagate_external_count_parent(ft, d.nf, 1);
-					ret = 0;
-					goto insert_done;
-				}
-
-			collapsed_explode:
-				{
-					/*
-					 * Collapsed node full or has prefix
-					 * conflict: explode into internal +
-					 * compressed nodes.  Uses recursive
-					 * trie rebuild to handle entries that
-					 * may share first suffix bytes.
-					 */
-					struct cds_ft_inode_flag *internal_flag;
-					struct cds_ft_metadata *col_meta =
-						cds_ft_item_to_metadata(
-							(struct cds_ft_inode *) col);
-
-					/*
-					 * Save collapsed node's density and
-					 * footprint before explode frees it.
-					 */
-					unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
-					unsigned int old_col_fp =
-						ft_node_readside_footprint(ft, d.nf);
-					{
-						unsigned int di;
-
-						for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
-							old_col_density[di] =
-								ft_density_get(col_meta, di);
-					}
-
-					internal_flag = ft_explode_entries(ft,
-						col, cptrs,
-						0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
-						0, d.depth);
-					if (!internal_flag) {
-						ret = -ENOMEM;
-						goto insert_done;
-					}
-					{
-						struct cds_ft_metadata *int_meta =
-							ft_flag_to_metadata(internal_flag);
-						if (col_meta->external_nodes) {
-							ft_metadata_set_external_nodes(
-								internal_flag, int_meta,
-								col_meta->external_nodes);
-							ft_nr_keys_store(ft, int_meta,
-								ft_nr_keys_get(int_meta) + 1,
-								CMM_RELAXED);
-						}
-					}
-					ft_init_node_density(ft, internal_flag);
-
-					ft_set_parent(internal_flag, d.pnf, d.nfp);
-					ft_publish_to_parent(ft, d.pnf,
-						d.nfp, internal_flag);
-					free_collapsed_node(ft, col);
-
-					ft_propagate_density_replace(ft,
-						internal_flag, d.depth,
-						old_col_density, old_col_fp,
-						cds_ft_item_to_metadata(
-							ft_node_ptr(internal_flag)),
-						ft_node_readside_footprint(ft, internal_flag),
-						NULL, 0);
-
-					d.nf = internal_flag;
-					continue;
-				}
-
-			collapsed_inplace_add:
-				/*
-				 * Build child for the new entry.  The suffix
-				 * covers key bytes from d.depth to key_len.
-				 * If suffix IS the full remaining key, the
-				 * child is the external node directly.
-				 * Otherwise, wrap remaining bytes in a
-				 * compressed path.
-				 */
-				if (d.depth + new_slen == key_len) {
-					branch = (struct cds_ft_inode_flag *) node;
-				} else {
-					branch = ft_build_branch(ft, key,
-						d.depth + new_slen, key_len,
-						(struct cds_ft_inode_flag *) node,
-						1, false);
-					if (!branch) {
-						ret = -ENOMEM;
-						goto insert_done;
-					}
-				}
-
-				/* Write suffix (grows leftward from existing suffixes). */
-				new_suffix_pos = ((uint8_t *) col) + cur_suffix_start - new_slen;
-				for (k = 0; k < new_slen; k++)
-					new_suffix_pos[k] = iter_key[k];
-
-				/* Set offset for new entry. */
-				col->data[ft_collapsed_count(col_nr)] = (uint8_t)(new_suffix_pos - (uint8_t *) col);
-
-				/* Set pointer. */
-				cptrs[ft_collapsed_count(col_nr)] = branch;
-				ft_set_parent(branch, d.nf, &cptrs[ft_collapsed_count(col_nr)]);
-
-				/* Publish: increment nr_entries (atomic store). */
-				/* Store-release in publish_inc ensures
-				 * readers see suffix/offset/pointer data. */
-				FT_TP(collapsed_entry,
-					(const void *) ft_collapsed_node_flag(col),
-					ft_collapsed_count(col_nr),
-					iter_key, new_slen,
-					(const void *) branch, 0);
-				ft_collapsed_publish_inc_nr_entries(col);
-				FT_TP(collapsed_publish,
-					(const void *) ft_collapsed_node_flag(col),
-					ft_collapsed_count(
-						uatomic_load(&col->nr_entries,
-							CMM_RELAXED)),
-					ft_collapsed_scan_zone_size(
-						uatomic_load(&col->nr_entries,
-							CMM_RELAXED)));
-
-				{
-					struct cds_ft_metadata *col_meta =
-						cds_ft_item_to_metadata(
-							(struct cds_ft_inode *) col);
-					col_meta->nr_child++;
-				}
-
-				/* Propagate. */
-				ft_propagate_external_count_parent(ft, d.nf, 1);
-				ret = 0;
+			act = ft_insert_collapsed(ft, &d, &iter_key,
+				key, key_len, key_depth, node,
+				snapshot, snapshot_depth,
+				&nr_snapshot, &ret);
+			if (act == FT_COMPRESSED_END)
 				goto insert_done;
-			}
+			assert(act == FT_COMPRESSED_CONTINUE);
+			continue;
 		}
 		dbg_printf("cds_ft_insert iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
