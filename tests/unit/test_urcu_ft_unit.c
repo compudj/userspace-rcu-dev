@@ -12348,10 +12348,13 @@ end:
 }
 
 /*
- * cds_ft_detach inherits the source's exclusive flag, in both
- * directions.
+ * cds_ft_detach returns the detached trie in exclusive mode
+ * regardless of the source's access discipline: no external handle
+ * to the detached trie exists at return, and the detach path has
+ * already drained any in-flight readers of the moved subtree, so
+ * no concurrent reader can be inside it.
  */
-static int test_exclusive_detach_inherit(void)
+static int test_exclusive_detach_always_exclusive(void)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *excl_src, *conc_src, *det_from_excl, *det_from_conc;
@@ -12377,15 +12380,15 @@ static int test_exclusive_detach_inherit(void)
 	if (s != CDS_FT_STATUS_OK)
 		goto out_both;
 	if (!cds_ft_is_exclusive(det_from_excl)) {
-		fprintf(stderr, "detach_inherit: exclusive source → detached not exclusive\n");
+		fprintf(stderr, "detach_always_exclusive: exclusive source → detached not exclusive\n");
 		goto out_det_excl;
 	}
 
 	s = cds_ft_detach(conc_src, NULL, 0, &det_from_conc);
 	if (s != CDS_FT_STATUS_OK)
 		goto out_det_excl;
-	if (cds_ft_is_exclusive(det_from_conc)) {
-		fprintf(stderr, "detach_inherit: concurrent source → detached exclusive\n");
+	if (!cds_ft_is_exclusive(det_from_conc)) {
+		fprintf(stderr, "detach_always_exclusive: concurrent source → detached not exclusive\n");
 		drain_trie(det_from_conc);
 		rcu_barrier();
 		cds_ft_destroy(det_from_conc);
@@ -12868,7 +12871,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_exclusive_default_is_concurrent);
 	RUN_TEST(test_exclusive_attr_set_true);
 	RUN_TEST(test_exclusive_make_transitions);
-	RUN_TEST(test_exclusive_detach_inherit);
+	RUN_TEST(test_exclusive_detach_always_exclusive);
 	RUN_TEST(test_exclusive_graft_from_exclusive);
 	RUN_TEST(test_exclusive_graft_swap_inherit_root);
 	RUN_TEST(test_exclusive_graft_swap_inherit_non_root);

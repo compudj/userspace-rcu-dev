@@ -1246,6 +1246,15 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  * variable-length key groups. Non-root detach (@key_len > 0)
  * requires a variable-length key group (CDS_FT_LEN_VARIABLE).
  *
+ * The returned trie is in exclusive mode: no RCU reader can be
+ * inside it at return (the handle is freshly returned, and any
+ * in-flight reader of the moved subtree has been drained by the
+ * detach path itself).  A subsequent graft of the detached trie
+ * therefore skips its internal synchronize_rcu(), coalescing
+ * detach+graft into a single grace period.  Callers that publish
+ * the detached trie to concurrent readers must call
+ * cds_ft_make_concurrent() first.
+ *
  * Returns CDS_FT_STATUS_OK on success.
  * Returns CDS_FT_STATUS_NOT_FOUND if nothing exists at @key.
  * Returns a negative cds_ft_status on error (including memory

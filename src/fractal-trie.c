@@ -15011,8 +15011,16 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			FT_TP(detach_exit, (int) status);
 			return status;
 		}
-		/* Detached trie inherits the source's access discipline. */
-		detached->exclusive = ft->exclusive;
+		/*
+		 * The detached trie is returned exclusive: no external
+		 * handle to @detached existed before this call, so no
+		 * RCU reader can be inside it at return.  A subsequent
+		 * graft of @detached therefore skips its synchronize_rcu,
+		 * coalescing the detach+graft pair to a single grace
+		 * period.  Callers that publish @detached to concurrent
+		 * readers must call cds_ft_make_concurrent first.
+		 */
+		detached->exclusive = true;
 
 		/*
 		 * Allocate a fresh empty root for the source trie
@@ -15254,8 +15262,16 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				FT_TP(detach_exit, (int) status);
 				return status;
 			}
-			/* Detached trie inherits the source's access discipline. */
-			detached->exclusive = ft->exclusive;
+			/*
+			 * The detached trie is returned exclusive: the
+			 * synchronize_rcu below drains in-flight readers of
+			 * the source before publishing @child as @detached's
+			 * root, so no RCU reader is inside @detached at
+			 * return.  Callers that publish @detached to
+			 * concurrent readers must call cds_ft_make_concurrent
+			 * first.
+			 */
+			detached->exclusive = true;
 
 			/*
 			 * Propagate count removal through ancestors
@@ -15320,15 +15336,14 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 				 * against.  Skip for exclusive sources: those
 				 * carry no RCU readers by construction.
 				 *
-				 * This grace period mirrors the one graft
-				 * performs between unlink-from-source and
-				 * reparent-into-destination.  A subsequent
-				 * graft of @detached will sync again; callers
-				 * that chain detach-then-graft pay two GPs in
-				 * the concurrent case and can coalesce them
-				 * via make_exclusive on @detached before the
-				 * graft, or via a future update_poll_state
-				 * coalescing optimisation on the library side.
+				 * After this grace period, no reader holds a
+				 * pointer into @child's subtree; combined with
+				 * @detached being a fresh handle, @detached has
+				 * no concurrent readers and is returned in
+				 * exclusive mode.  A subsequent graft of
+				 * @detached therefore skips its own GP,
+				 * coalescing detach+graft to a single grace
+				 * period.
 				 */
 				if (!ft->exclusive)
 					ft->group->flavor->update_synchronize_rcu();
