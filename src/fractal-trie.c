@@ -361,12 +361,16 @@ static inline __attribute__((unused))
 void static_array_size_check(void)
 {
 	CAA_BUILD_BUG_ON(CAA_ARRAY_SIZE(ft_types) < FT_TYPE_MAX_NR);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
 	 * skip_slot_offset is 8 bits and stores byte_offset / sizeof(void *).
 	 * Ensure the largest node (pigeon, 2^11 = 2048 bytes) fits:
-	 * 2048 / sizeof(void *) = 256 slots, max index 255.
+	 * 2048 / sizeof(void *) = 256 slots, max index 255.  Only enabled
+	 * on 64-bit architectures, where sizeof(void *) == 8 and the
+	 * quotient is exactly 256.
 	 */
 	CAA_BUILD_BUG_ON((1U << 11) / sizeof(void *) > 256);
+#endif
 	/*
 	 * Metadata packed bitfield must fit in a uint32_t.
 	 * Layout: nr_child(9) + [skip_slot_offset(8)] +

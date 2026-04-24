@@ -154,6 +154,16 @@
 # define FT_SKIP_LEN_MAX	((1U << FT_SKIP_LEN_BITS) - 1)
 # define FT_SKIP_LEN_MASK	(((unsigned long) FT_SKIP_LEN_MAX) << FT_SKIP_LEN_SHIFT)
 # define FT_ADDR_MASK		((1UL << FT_SKIP_LEN_SHIFT) - 1)
+#else
+/*
+ * Fallback on architectures without skip-compressed support (notably
+ * 32-bit).  FEATURE_FT_SKIP_COMPRESSED is also undefined in that
+ * case, so call sites guarded by ft_group_skip_compressed() short-
+ * circuit before evaluating FT_SKIP_LEN_MAX; the fallback value
+ * keeps those expressions type-correct at compile time without
+ * changing runtime behavior.
+ */
+# define FT_SKIP_LEN_MAX	0U
 #endif
 
 #define FT_ENTRY_PER_NODE	256
