@@ -6533,14 +6533,24 @@ end:
  * determine direction.  Skips @ref_entry itself, dead (tombstoned)
  * entries, and NULL-pointer entries.
  *
+ * Race-free pointer selection: each candidate entry is filtered by
+ * (dead-bit clear AND cptrs non-NULL) at scan time, and we SAVE the
+ * cptrs value into *@best_child so the caller uses the same pointer
+ * the scan validated.  Otherwise a concurrent writer's sub-case-A
+ * detach (which writes NULL to cptrs[e] and *then* sets the dead
+ * bit) can leave the caller re-reading cptrs[best] and observing
+ * NULL, with no easy way to recover.
+ *
  * Returns the index of the nearest entry, or -1 if none found.
+ * On success, *@best_child receives the validated child pointer.
  */
 static int ft_collapsed_find_nearest(
 		struct cds_ft_collapsed_node *col,
 		struct cds_ft_inode_flag **cptrs,
 		unsigned int ref_entry,
 		unsigned int nr_e,
-		enum ft_direction dir)
+		enum ft_direction dir,
+		struct cds_ft_inode_flag **best_child)
 {
 	uint8_t ref_data = ft_collapsed_load_data(col, ref_entry);
 	uint8_t *ref_suffix = ft_collapsed_suffix(col, ref_data, nr_e);
@@ -6548,6 +6558,7 @@ static int ft_collapsed_find_nearest(
 	unsigned int count = ft_collapsed_count(nr_e);
 	int best = -1;
 	uint8_t best_data = 0;
+	struct cds_ft_inode_flag *saved_best_child = NULL;
 	unsigned int e;
 
 	for (e = 0; e < count; e++) {
@@ -6555,12 +6566,14 @@ static int ft_collapsed_find_nearest(
 		unsigned int slen, mc;
 		int r;
 		uint8_t data_e = ft_collapsed_load_data(col, e);
+		struct cds_ft_inode_flag *entry;
 
 		if (e == ref_entry)
 			continue;
 		if (ft_collapsed_entry_dead(data_e, nr_e))
 			continue;
-		if (!ft_node_ptr(cptrs[e]))
+		entry = ft_dereference_acquire(cptrs[e]);
+		if (!ft_node_ptr(entry))
 			continue;
 		suffix = ft_collapsed_suffix(col, data_e, nr_e);
 		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
@@ -6575,6 +6588,7 @@ static int ft_collapsed_find_nearest(
 			if (best < 0) {
 				best = (int)e;
 				best_data = data_e;
+				saved_best_child = entry;
 			} else {
 				uint8_t *bs = ft_collapsed_suffix(col, best_data, nr_e);
 				unsigned int bl = ft_collapsed_suffix_len(col, best_data, (unsigned)best, nr_e);
@@ -6585,10 +6599,13 @@ static int ft_collapsed_find_nearest(
 				    (dir == FT_LEFT && (r2 > 0 || (r2 == 0 && slen > bl)))) {
 					best = (int)e;
 					best_data = data_e;
+					saved_best_child = entry;
 				}
 			}
 		}
 	}
+	if (best >= 0)
+		*best_child = saved_best_child;
 	return best;
 }
 
@@ -7566,9 +7583,25 @@ going_up:
 				}
 			}
 
-			/* Find the nearest live sibling in @dir. */
+			/*
+			 * Find the nearest live sibling in @dir.
+			 *
+			 * Race-free pointer selection: find_nearest
+			 * filters candidates by (dead-bit clear AND
+			 * cptrs non-NULL) at scan time and returns the
+			 * cptrs value it validated via @best_child.
+			 * Use that value directly here rather than
+			 * re-reading cptrs[best]: a concurrent writer's
+			 * sub-case A NULLs cptrs[e] *before* setting the
+			 * tombstone bit, so the re-read window can return
+			 * NULL while the scan-time check observed live.
+			 */
+			{
+			struct cds_ft_inode_flag *best_child = NULL;
+
 			best = ft_collapsed_find_nearest(col, cptrs,
-				(unsigned)current_entry, col_nr_e, dir);
+				(unsigned)current_entry, col_nr_e, dir,
+				&best_child);
 
 			if (best >= 0) {
 				uint8_t best_d = ft_collapsed_load_data(col, (unsigned)best);
@@ -7586,14 +7619,14 @@ going_up:
 				}
 				level = suffix_base + slen;
 				assert(level < (ssize_t) ft->group->max_tree_depth);
-				node_flag = ft_dereference_acquire_prefetch(
-					cptrs[best]);
+				node_flag = best_child;
 				if (ft_node_skip_compressed(node_flag))
 					node_flag = ft_compressed_node_flag(
 						ft_skip_to_compressed(
 							node_flag));
 				iter_path_node(iter)[level] = node_flag;
 				break;
+			}
 			}
 			/* No match found, continue going up.
 			 *
@@ -7815,8 +7848,25 @@ descend_children:
 				iter_path_node(iter), level, node_flag);
 			level += cn->len - 1;
 			node_flag = ft_dereference_acquire_prefetch(cn->child);
-			if (!ft_node_ptr(node_flag))
-				break;
+			if (!ft_node_ptr(node_flag)) {
+				/*
+				 * Invariant violation: a reachable
+				 * compressed node always has a non-NULL
+				 * child.  Empty compresseds are pruned
+				 * (replaced in parent's slot by their
+				 * external_nodes or the entire branch
+				 * detached).  NULL here means a writer
+				 * published a compressed without wiring
+				 * its child, or cleared cn->child while
+				 * the compressed was still reachable --
+				 * either way a bug.
+				 */
+				fprintf(stderr,
+					"BUG: cds_ft_lookup_inequality minmax: "
+					"compressed %p has NULL child\n",
+					(const void *) node_flag);
+				abort();
+			}
 			iter_path_node(iter)[level] = node_flag;
 			if (ft_node_external(node_flag))
 				break;
@@ -7827,10 +7877,11 @@ descend_children:
 		if (ft_node_collapsed(node_flag)) {
 			struct cds_ft_collapsed_node *col =
 				ft_collapsed_node_ptr(node_flag);
-			unsigned int col_nr_e = ft_collapsed_nr_entries(col);
-			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col, col_nr_e);
-			unsigned int best = UINT_MAX, e;
+			unsigned int col_nr_e;
+			struct cds_ft_inode_flag **cptrs;
+			unsigned int best, e;
+			uint8_t best_d;
+			struct cds_ft_inode_flag *best_child;
 
 			/*
 			 * Check external_nodes at the collapsed
@@ -7851,21 +7902,34 @@ descend_children:
 				}
 			}
 			/*
-			 * Find the min/max entry by suffix and
-			 * descend into it.
+			 * Find the min/max entry by suffix and descend.
+			 *
+			 * Race-free pointer selection: each candidate
+			 * entry is filtered by (dead-bit clear AND
+			 * cptrs non-NULL) at scan time, and we SAVE
+			 * the cptrs value (@best_child) alongside @best
+			 * so the descent uses the same pointer the scan
+			 * validated.  No re-read of cptrs[best] later.
 			 */
-			uint8_t best_d = 0;
+			col_nr_e = ft_collapsed_nr_entries(col);
+			cptrs = ft_collapsed_ptrs(col, col_nr_e);
+			best = UINT_MAX;
+			best_d = 0;
+			best_child = NULL;
 
 			for (e = 0; e < ft_collapsed_count(col_nr_e); e++) {
 				uint8_t data_e = ft_collapsed_load_data(col, e);
+				struct cds_ft_inode_flag *entry;
 
 				if (ft_collapsed_entry_dead(data_e, col_nr_e))
 					continue;
-				if (!ft_node_ptr(cptrs[e]))
+				entry = ft_dereference_acquire(cptrs[e]);
+				if (!ft_node_ptr(entry))
 					continue;
 				if (best == UINT_MAX) {
 					best = e;
 					best_d = data_e;
+					best_child = entry;
 					continue;
 				}
 				{
@@ -7880,11 +7944,13 @@ descend_children:
 						if (r < 0 || (r == 0 && lb < la)) {
 							best = e;
 							best_d = data_e;
+							best_child = entry;
 						}
 					} else {
 						if (r > 0 || (r == 0 && lb > la)) {
 							best = e;
 							best_d = data_e;
+							best_child = entry;
 						}
 					}
 				}
@@ -7903,9 +7969,7 @@ descend_children:
 				}
 				level += slen - 1;
 				assert(level < (ssize_t) ft->group->max_tree_depth);
-				node_flag = ft_dereference_acquire_prefetch(cptrs[best]);
-				if (!ft_node_ptr(node_flag))
-					break;
+				node_flag = best_child;
 				if (ft_node_skip_compressed(node_flag))
 					node_flag = ft_compressed_node_flag(
 						ft_skip_to_compressed(node_flag));
