@@ -162,14 +162,6 @@ enum cds_ft_type_class {
 #define FT_HAVE_EFFICIENT_UNALIGNED_ACCESS
 #endif
 
-/*
- * Display-only threshold used by internal_type_name()/tracepoint
- * labels to classify a linear type as "narrow" or "wide" in JSON
- * output.  Not consulted by the scanner dispatch (which is purely
- * per type_index).
- */
-#define FT_WIDE_LINEAR_DISPLAY_THRESHOLD	7
-
 struct cds_ft_type {
 	enum cds_ft_type_class type_class;
 	uint16_t min_child;		/* minimum number of children: 1 to 256 */
@@ -1967,21 +1959,13 @@ unsigned int ft_collapsed_count(unsigned int nr_entries)
  * constant expressions (sizing enums and order constants), so each
  * conditional collapses to one constant during compilation.
  */
-#define _FT_TP_KIND_LINEAR_NARROW(ord) (			\
+#define FT_TP_KIND_LINEAR(ord) (				\
 	(ord) == 4 ? FT_TP_NODE_LINEAR_16 :			\
 	(ord) == 5 ? FT_TP_NODE_LINEAR_32 :			\
 	(ord) == 6 ? FT_TP_NODE_LINEAR_64 :			\
 	(ord) == 7 ? FT_TP_NODE_LINEAR_128 :			\
+	(ord) == 8 ? FT_TP_NODE_LINEAR_256 :			\
 	FT_TP_NODE_UNKNOWN)
-#define _FT_TP_KIND_LINEAR_WIDE(ord) (				\
-	(ord) == 6 ? FT_TP_NODE_LINEAR_WIDE_64 :		\
-	(ord) == 7 ? FT_TP_NODE_LINEAR_WIDE_128 :		\
-	(ord) == 8 ? FT_TP_NODE_LINEAR_WIDE_256 :		\
-	FT_TP_NODE_UNKNOWN)
-#define FT_TP_KIND_LINEAR(mlc, ord)				\
-	((mlc) >= FT_WIDE_LINEAR_DISPLAY_THRESHOLD		\
-		? _FT_TP_KIND_LINEAR_WIDE(ord)			\
-		: _FT_TP_KIND_LINEAR_NARROW(ord))
 #define FT_TP_KIND_POOL(npo, ord) (				\
 	(npo) == 1 && (ord) == 8 ? FT_TP_NODE_POOL_1D_256 :	\
 	(npo) == 1 && (ord) == 9 ? FT_TP_NODE_POOL_1D_512 :	\
@@ -2006,20 +1990,20 @@ static const uint8_t ft_tp_kind_table[FT_TP_KIND_TABLE_MASK + 1] = {
 	 * arch-specific ft_types[] is mapped via FT_TP_KIND_*().
 	 */
 #if (CAA_BITS_PER_LONG < 64)
-	[FT_TP_INTERNAL_TAG(0)]			= FT_TP_KIND_LINEAR(ft_type_0_max_linear_child, 4),
-	[FT_TP_INTERNAL_TAG(1)]			= FT_TP_KIND_LINEAR(ft_type_1_max_linear_child, 5),
-	[FT_TP_INTERNAL_TAG(2)]			= FT_TP_KIND_LINEAR(ft_type_2_max_linear_child, 6),
-	[FT_TP_INTERNAL_TAG(3)]			= FT_TP_KIND_LINEAR(ft_type_3_max_linear_child, 7),
+	[FT_TP_INTERNAL_TAG(0)]			= FT_TP_KIND_LINEAR(4),
+	[FT_TP_INTERNAL_TAG(1)]			= FT_TP_KIND_LINEAR(5),
+	[FT_TP_INTERNAL_TAG(2)]			= FT_TP_KIND_LINEAR(6),
+	[FT_TP_INTERNAL_TAG(3)]			= FT_TP_KIND_LINEAR(7),
 	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_A)]	= FT_TP_KIND_POOL(ft_type_4_nr_pool_order, 8),
 	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_B)]	= FT_TP_KIND_POOL(ft_type_5_nr_pool_order, 9),
 	[FT_TP_INTERNAL_TAG(6)]			= FT_TP_KIND_PIGEON(10),
 	/* idx 7 = NODE_INDEX_NULL: never encoded in a pointer. */
 #else
-	[FT_TP_INTERNAL_TAG(0)]			= FT_TP_KIND_LINEAR(ft_type_0_max_linear_child, 4),
-	[FT_TP_INTERNAL_TAG(1)]			= FT_TP_KIND_LINEAR(ft_type_1_max_linear_child, 5),
-	[FT_TP_INTERNAL_TAG(2)]			= FT_TP_KIND_LINEAR(ft_type_2_max_linear_child, 6),
-	[FT_TP_INTERNAL_TAG(3)]			= FT_TP_KIND_LINEAR(ft_type_3_max_linear_child, 7),
-	[FT_TP_INTERNAL_TAG(4)]			= FT_TP_KIND_LINEAR(ft_type_4_max_linear_child, 8),
+	[FT_TP_INTERNAL_TAG(0)]			= FT_TP_KIND_LINEAR(4),
+	[FT_TP_INTERNAL_TAG(1)]			= FT_TP_KIND_LINEAR(5),
+	[FT_TP_INTERNAL_TAG(2)]			= FT_TP_KIND_LINEAR(6),
+	[FT_TP_INTERNAL_TAG(3)]			= FT_TP_KIND_LINEAR(7),
+	[FT_TP_INTERNAL_TAG(4)]			= FT_TP_KIND_LINEAR(8),
 	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_A)]	= FT_TP_KIND_POOL(ft_type_5_nr_pool_order, 9),
 	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_B)]	= FT_TP_KIND_POOL(ft_type_6_nr_pool_order, 10),
 	[FT_TP_INTERNAL_TAG(7)]			= FT_TP_KIND_PIGEON(11),
@@ -2919,7 +2903,7 @@ void ft_maybe_prefetch_hint(const void *ptr, enum ft_pf_target hint)
  * Tunable via -DFT_SIMD_LINEAR_THRESHOLD=N and
  * -DFT_SWAR_LINEAR_THRESHOLD=N at compile time.
  */
-/* FT_SIMD/SWAR/WIDE_LINEAR_THRESHOLD defined near ft_types[]. */
+/* FT_SIMD/SWAR_LINEAR_THRESHOLD defined near ft_types[]. */
 
 /*
  * SWAR constants.  Pure bit-manipulation helpers below operate on
@@ -18442,19 +18426,14 @@ const char *internal_type_name(unsigned int type_index)
 
 		switch (cls) {
 		case FT_LINEAR:
-		{
-			unsigned int mlc = ft_types[type_index].max_linear_child;
-			bool wide = mlc >= FT_WIDE_LINEAR_DISPLAY_THRESHOLD;
-
 			switch (order) {
 			case 4: return "LINEAR_16";
 			case 5: return "LINEAR_32";
-			case 6: return wide ? "LINEAR_WIDE_64" : "LINEAR_64";
-			case 7: return wide ? "LINEAR_WIDE_128" : "LINEAR_128";
-			case 8: return "LINEAR_WIDE_256";
+			case 6: return "LINEAR_64";
+			case 7: return "LINEAR_128";
+			case 8: return "LINEAR_256";
 			}
 			break;
-		}
 		case FT_POOL:
 			if (npo == 1 && order == 8)	return "POOL_1D_256";
 			if (npo == 1 && order == 9)	return "POOL_1D_512";

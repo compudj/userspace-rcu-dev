@@ -29,8 +29,8 @@
  * Tries:
  *
  *   dns trie — skip-compressed group, DNS-reverse-ish keys,
- *              exercises LINEAR / LINEAR_WIDE / COMPRESSED /
- *              EXTERNAL with skip-compressed fast-path pointers.
+ *              exercises LINEAR / COMPRESSED / EXTERNAL with
+ *              skip-compressed fast-path pointers.
  *
  *   col trie — non-skip group, "NNNN<branch><3-byte-suffix>"
  *              keys.  Skip-compressed mode inhibits collapse (its
