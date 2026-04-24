@@ -12089,6 +12089,16 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 	return CDS_FT_STATUS_OK;
 }
 
+/* Defined later (alongside ft_descend_to_graft_point's helpers). */
+static
+enum ft_compressed_action ft_descent_step_collapsed(
+		struct ft_descent *d,
+		const uint8_t **ik_p,
+		size_t key_len,
+		struct cds_ft_inode_flag **snapshot,
+		unsigned int *snapshot_depth,
+		int *nr_snapshot);
+
 /*
  * Insert a node, replacing the entire existing duplicate chain at the
  * same key if one exists.
@@ -12165,47 +12175,15 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			continue;
 		}
 		if (ft_node_collapsed(d.nf)) {
-			struct cds_ft_collapsed_node *col =
-				ft_collapsed_node_ptr(d.nf);
-			unsigned int remaining = key_depth - 1 - d.depth;
-			unsigned int e;
-			bool found_entry = false;
+			enum ft_compressed_action act;
 
-			unsigned int nr_e = ft_collapsed_nr_entries(col);
-			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col, nr_e);
-
-			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-				uint8_t data_e = ft_collapsed_load_data(col, e);
-				unsigned int slen;
-				uint8_t *suffix;
-				bool match;
-
-				if (ft_collapsed_entry_dead(data_e, nr_e))
-					continue;
-				slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-				if (slen > remaining)
-					continue;
-				suffix = ft_collapsed_suffix(col, data_e, nr_e);
-				match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen, false, NULL) == 0);
-				if (!match)
-					continue;
-				ft_snapshot_push(snapshot, snapshot_depth,
-				nr_snapshot, d.nf, d.depth);
-				d.ppnf  = d.pnf;
-				d.ppnfp = d.pnfp;
-				d.pnf   = d.nf;
-				d.pnfp  = d.nfp;
-				d.nf    = ft_dereference_acquire(cptrs[e]);
-				d.nfp   = &cptrs[e];
-				d.depth += slen;
-				iter_key += slen;
-				found_entry = true;
+			act = ft_descent_step_collapsed(&d, &iter_key,
+				key_len, snapshot, snapshot_depth,
+				&nr_snapshot);
+			if (act == FT_COMPRESSED_BREAK)
 				break;
-			}
-			if (found_entry)
-				continue;
-			break;
+			assert(act == FT_COMPRESSED_CONTINUE);
+			continue;
 		}
 		dbg_printf("_cds_ft_insert_replace iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
@@ -14045,19 +14023,24 @@ enum ft_compressed_action ft_descend_to_graft_point_compressed(
 }
 
 /*
- * Handle a collapsed node in ft_descend_to_graft_point's descent
- * loop.  Scans entries for a suffix match against
- * key[d->depth..key_len-1] (slen <= remaining only — no partial
- * prefix split is performed here).
+ * Match a single collapsed-entry suffix against key[d->depth..key_len-1]
+ * and step into the matched child.  Mirrors ft_descent_step (single-
+ * byte step) and ft_descent_traverse_compressed (multi-byte compressed
+ * step) for the collapsed-node case.
  *
- * On match: snapshot the collapsed node, advance d and *ik_p past
- * the matched span, return FT_COMPRESSED_CONTINUE so the caller
- * continues the descent.  On no-match: return FT_COMPRESSED_BREAK,
- * leaving d at the collapsed node so the caller's
- * ft_store_at_graft_point sees it as the graft point.
+ * Only entries with slen <= remaining are considered (no partial-
+ * prefix split is performed here — callers that need an explode
+ * handle that case before calling this helper).  On match: snapshot
+ * the collapsed node, advance d and *ik_p past the matched span,
+ * return FT_COMPRESSED_CONTINUE.  On no-match: return
+ * FT_COMPRESSED_BREAK, leaving d at the collapsed node so the
+ * caller can decide what that means in its phase (graft point,
+ * insert-replace key terminus, ...).
+ *
+ * Used by ft_descend_to_graft_point and _cds_ft_insert_replace.
  */
 static
-enum ft_compressed_action ft_descend_to_graft_point_collapsed(
+enum ft_compressed_action ft_descent_step_collapsed(
 		struct ft_descent *d,
 		const uint8_t **ik_p,
 		size_t key_len,
@@ -14141,7 +14124,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 		if (ft_node_collapsed(d->nf)) {
 			enum ft_compressed_action act;
 
-			act = ft_descend_to_graft_point_collapsed(d, &ik,
+			act = ft_descent_step_collapsed(d, &ik,
 				key_len, snapshot, snapshot_depth,
 				nr_snapshot);
 			if (act == FT_COMPRESSED_BREAK)
