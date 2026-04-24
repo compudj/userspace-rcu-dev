@@ -20,6 +20,7 @@
 #include <urcu/list.h>
 #include <urcu/rculfhash.h>
 #include <urcu/arch.h>
+#include <urcu/call-rcu.h>
 #include <assert.h>
 
 /*
