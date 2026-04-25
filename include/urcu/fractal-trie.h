@@ -116,9 +116,14 @@
  * Graft, graft-swap, and detach:
  *
  * The graft, graft-swap, and detach operations move entire
- * sub-tries between trie instances within the same group. Each
- * operation is a single pointer store visible atomically to
- * concurrent RCU readers: a reader sees either the complete
+ * sub-tries between trie instances within the same group. The
+ * write-side cost is more than a pointer store — descent to the
+ * graft/detach point, key-count propagation up the destination's
+ * ancestors, allocation of the result-trie wrapper for detach,
+ * metadata fix-up, and (in detach with concurrent readers
+ * possible) one synchronize_rcu before the dependent reclamation.
+ * What concurrent readers see, however, is published by a single
+ * atomic pointer update: a reader observes either the complete
  * sub-trie or nothing, never a partial state.
  *
  * - Graft (cds_ft_graft) attaches the content of a source trie
@@ -159,6 +164,38 @@
  * a sub-trie in O(1), waits for a single grace period, and
  * then drains the detached trie locally, reducing the cost
  * from one grace period per node to one grace period total.
+ *
+ * Reader contract:
+ *
+ * Every read-side operation (lookup, traversal, iteration,
+ * count, ...) must satisfy the discipline matching the trie's
+ * mode:
+ *
+ *   Concurrent mode (default):
+ *     - the RCU read-side lock is held by the caller for the
+ *       duration of the read, OR
+ *     - the caller guarantees mutual exclusion against concurrent
+ *       mutations on this trie (e.g. by holding a lock that
+ *       serialises all mutations).
+ *
+ *   Exclusive mode:
+ *     - the caller guarantees mutual exclusion against any
+ *       concurrent access on this trie.  Exclusive-mode mutations
+ *       skip RCU synchronisation primitives (synchronize_rcu,
+ *       call_rcu) on the assumption that there are no concurrent
+ *       readers, so holding the RCU read-side lock on its own
+ *       does not protect against use-after-free in this mode.
+ *
+ * The library never calls rcu_read_lock() on the caller's behalf.
+ * If FEATURE_FT_EXCL_VALIDATE is compiled in, the library
+ * *validates* the discipline above (writer/writer exclusion in
+ * any mode; reader/writer exclusion in exclusive mode) and aborts
+ * on violation — it does not enforce the discipline.  Compliance
+ * is the caller's responsibility.
+ *
+ * Per-function comments below that say "the RCU read-side lock
+ * must be held" describe the concurrent-mode case; in exclusive
+ * mode the caller's mutual exclusion replaces that requirement.
  *
  * Iterator Lifecycle and RCU Locking:
  *
@@ -1077,12 +1114,14 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * into the main trie in a single O(1) operation. Because the source
  * trie has no concurrent readers or writers during population, no RCU
  * read-side lock and no mutual exclusion are needed for the inserts.
- * The graft itself is a single pointer store, so the duration of
- * writer mutual exclusion on the main trie is minimal — independent
- * of the number of nodes being grafted. This pattern is well suited
- * for batch loading, sharding, and periodic bulk updates where
- * minimizing the writer critical section on the live trie is
- * important.
+ * Concurrent RCU readers see the graft published by a single atomic
+ * pointer update — either the pre-graft state or the post-graft state,
+ * never a partial view — so the duration of writer mutual exclusion on
+ * the main trie is short and bounded (independent of the number of
+ * nodes being grafted, modulo the O(depth) descent and key-count
+ * propagation). This pattern is well suited for batch loading,
+ * sharding, and periodic bulk updates where minimizing the writer
+ * critical section on the live trie is important.
  *
  *   // Phase 1: populate offline, no locking needed.
  *   cds_ft_create(group, NULL, &staging);
@@ -1188,9 +1227,10 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  *           graft point had no content. The caller retains ownership.
  *
  * Exchanges the content at @key in @dst_ft with the content of
- * @swap_ft using a single pointer store. Concurrent RCU readers
- * traversing @dst_ft see either the old content or the new content,
- * never an empty intermediate state.
+ * @swap_ft.  Concurrent RCU readers traversing @dst_ft observe
+ * the swap published by a single atomic pointer update: they see
+ * either the old content or the new content, never an empty
+ * intermediate state.
  *
  * On success, the previous content at the graft point (if any) is
  * placed into @swap_ft. The caller can check cds_ft_empty(@swap_ft)
@@ -1608,7 +1648,12 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  *
  * Flags are set at group creation time and cannot be changed afterwards.
  *
- * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_NOT_SUPPORTED if a requested flag is unavailable on
+ * the host: CDS_FT_FLAG_SKIP_COMPRESSED requires both build-time
+ * support (FEATURE_FT_SKIP_COMPRESSED) and a runtime mmap probe
+ * confirming the kernel does not use the encoding bits in
+ * userspace virtual addresses.
  */
 enum cds_ft_status cds_ft_group_attr_set_flags(struct cds_ft_group_attr *attr,
 		unsigned int flags);
@@ -1890,11 +1935,15 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter);
  * - 0: NIL key (returns 0).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * This helper function expects a Fractal Trie with a fixed key length <= 8.
- * For fixed-length tries, it behaves as a big-endian conversion of the
- * configured number of bytes.
+ * Works whenever the resolved @key_len falls in [1..8]: fixed-length
+ * tries with a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length) and variable-length tries (pass an
+ * explicit length).  Behaves as a big-endian conversion over that
+ * many bytes.
  *
- * Returns 0 if @key_len exceeds 8 or is invalid for this trie's configuration.
+ * Returns 0 if the resolved @key_len exceeds 8 or is invalid for
+ * this trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a
+ * variable-length trie).
  */
 uint64_t cds_ft_key_to_u64(const struct cds_ft *ft, const uint8_t *key, size_t key_len);
 
@@ -1909,10 +1958,15 @@ uint64_t cds_ft_key_to_u64(const struct cds_ft *ft, const uint8_t *key, size_t k
  * - 0: NIL key (no-op).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * This helper function expects a Fractal Trie with a fixed key length <= 8.
- * It truncates the most significant bits beyond the Fractal Trie key range.
+ * Works whenever the resolved @key_len falls in [1..8]: fixed-length
+ * tries with a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length) and variable-length tries (pass an
+ * explicit length).  Truncates the most significant bits beyond the
+ * key range.
  *
- * No-op if @key_len exceeds 8 or is invalid for this trie's configuration.
+ * No-op if the resolved @key_len exceeds 8 or is invalid for this
+ * trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a variable-length
+ * trie).
  */
 void cds_ft_u64_to_key(const struct cds_ft *ft, uint64_t v, uint8_t *key, size_t key_len);
 
@@ -1925,9 +1979,14 @@ void cds_ft_u64_to_key(const struct cds_ft *ft, uint64_t v, uint8_t *key, size_t
  * - 0: NIL key (returns 0).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * This helper function expects a Fractal Trie with a fixed key length <= 4.
+ * Works whenever the resolved @key_len falls in [1..4]: fixed-length
+ * tries with a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length) and variable-length tries (pass an
+ * explicit length).
  *
- * Returns 0 if @key_len exceeds 4 or is invalid for this trie's configuration.
+ * Returns 0 if the resolved @key_len exceeds 4 or is invalid for
+ * this trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a
+ * variable-length trie).
  */
 uint32_t cds_ft_key_to_u32(const struct cds_ft *ft, const uint8_t *key, size_t key_len);
 
@@ -1942,9 +2001,15 @@ uint32_t cds_ft_key_to_u32(const struct cds_ft *ft, const uint8_t *key, size_t k
  * - 0: NIL key (no-op).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * This helper function expects a Fractal Trie with a fixed key length <= 4.
+ * Works whenever the resolved @key_len falls in [1..4]: fixed-length
+ * tries with a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length) and variable-length tries (pass an
+ * explicit length).  Truncates the most significant bits beyond the
+ * key range.
  *
- * No-op if @key_len exceeds 4 or is invalid for this trie's configuration.
+ * No-op if the resolved @key_len exceeds 4 or is invalid for this
+ * trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a variable-length
+ * trie).
  */
 void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key, size_t key_len);
 
@@ -1979,12 +2044,15 @@ void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key, size_t
  * - 0: NIL key (returns 0).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * This helper function expects a Fractal Trie with a fixed key length <= 8.
- * When the key is narrower than 8 bytes, the result is sign-extended to
- * 64 bits.
+ * Works whenever the resolved @key_len falls in [1..8]: fixed-length
+ * tries with a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length) and variable-length tries (pass an
+ * explicit length).  When the key is narrower than 8 bytes the
+ * result is sign-extended to 64 bits.
  *
- * Returns 0 if @key_len is 0, exceeds 8, or is invalid for this trie's
- * configuration.
+ * Returns 0 if the resolved @key_len is 0, exceeds 8, or is invalid
+ * for this trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a
+ * variable-length trie).
  */
 int64_t cds_ft_key_to_s64(const struct cds_ft *ft, const uint8_t *key, size_t key_len);
 
@@ -1999,11 +2067,15 @@ int64_t cds_ft_key_to_s64(const struct cds_ft *ft, const uint8_t *key, size_t ke
  * - 0: NIL key (no-op).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * This helper function expects a Fractal Trie with a fixed key length <= 8.
- * It truncates the most significant bits beyond the Fractal Trie key range.
+ * Works whenever the resolved @key_len falls in [1..8]: fixed-length
+ * tries with a configured length <= 8 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length) and variable-length tries (pass an
+ * explicit length).  Truncates the most significant bits beyond the
+ * key range.
  *
- * No-op if @key_len is 0, exceeds 8, or is invalid for this trie's
- * configuration.
+ * No-op if the resolved @key_len is 0, exceeds 8, or is invalid for
+ * this trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a
+ * variable-length trie).
  */
 void cds_ft_s64_to_key(const struct cds_ft *ft, int64_t v, uint8_t *key, size_t key_len);
 
@@ -2016,12 +2088,15 @@ void cds_ft_s64_to_key(const struct cds_ft *ft, int64_t v, uint8_t *key, size_t 
  * - 0: NIL key (returns 0).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * This helper function expects a Fractal Trie with a fixed key length <= 4.
- * When the key is narrower than 4 bytes, the result is sign-extended to
- * 32 bits.
+ * Works whenever the resolved @key_len falls in [1..4]: fixed-length
+ * tries with a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length) and variable-length tries (pass an
+ * explicit length).  When the key is narrower than 4 bytes the
+ * result is sign-extended to 32 bits.
  *
- * Returns 0 if @key_len is 0, exceeds 4, or is invalid for this trie's
- * configuration.
+ * Returns 0 if the resolved @key_len is 0, exceeds 4, or is invalid
+ * for this trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a
+ * variable-length trie).
  */
 int32_t cds_ft_key_to_s32(const struct cds_ft *ft, const uint8_t *key, size_t key_len);
 
@@ -2036,10 +2111,14 @@ int32_t cds_ft_key_to_s32(const struct cds_ft *ft, const uint8_t *key, size_t ke
  * - 0: NIL key (no-op).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  *
- * This helper function expects a Fractal Trie with a fixed key length <= 4.
+ * Works whenever the resolved @key_len falls in [1..4]: fixed-length
+ * tries with a configured length <= 4 (pass CDS_FT_LEN_DEFAULT or a
+ * matching explicit length) and variable-length tries (pass an
+ * explicit length).
  *
- * No-op if @key_len is 0, exceeds 4, or is invalid for this trie's
- * configuration.
+ * No-op if the resolved @key_len is 0, exceeds 4, or is invalid for
+ * this trie's configuration (e.g. CDS_FT_LEN_DEFAULT on a
+ * variable-length trie).
  */
 void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t key_len);
 
