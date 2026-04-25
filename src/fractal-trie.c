@@ -11693,9 +11693,16 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 					CMM_RELAXED);
 				m->nr_child = 1;
 			}
+			/*
+			 * Initialize density for each newly-created node in
+			 * the chain.  Build is bottom-up (cur is the child
+			 * already initialized in the previous iteration), so
+			 * each dest's density propagates from cur's already
+			 * up-to-date counters.
+			 */
+			ft_init_node_density(ft, dest);
 			cur = dest;
 		}
-		ft_init_node_density(ft, cur);
 		return cur;
 	}
 }
