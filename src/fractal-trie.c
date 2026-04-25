@@ -6375,6 +6375,8 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 	enum cds_ft_status status;
 
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP_KEY(lookup_key_enter, ft, key, _key_len);
 	if (caa_likely(km->identity)) {
@@ -6411,6 +6413,8 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, _key_len);
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	CDS_FT_SCOPED_READER(ft);
 	/*
 	 * Identity key-map fast path: the ordinals[] buffer would be
@@ -6453,6 +6457,11 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, _key_len);
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 
+	if (!valid_key_len(ft, key_len)) {
+		*match_len = 0;
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 	CDS_FT_SCOPED_READER(ft);
 	if (caa_likely(km->identity)) {
 		do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
@@ -6509,6 +6518,11 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, _key_len);
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 
+	if (!valid_key_len(ft, key_len)) {
+		*match_len = 0;
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 	CDS_FT_SCOPED_READER(ft);
 	if (caa_likely(km->identity)) {
 		ret = do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
