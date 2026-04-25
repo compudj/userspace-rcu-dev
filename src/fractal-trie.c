@@ -2422,7 +2422,7 @@ void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 {
 	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
 
-	cds_ft_free_item(metadata);
+	cds_ft_free_item(ft, metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
 		uatomic_inc(&ft->nr_internal_freed);
@@ -2513,7 +2513,7 @@ void free_compressed_node(struct cds_ft *ft,
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 
 	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(node));
-	cds_ft_free_item(metadata);
+	cds_ft_free_item(ft, metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
 		uatomic_inc(&ft->nr_compressed_freed);
@@ -2590,7 +2590,7 @@ void free_collapsed_node(struct cds_ft *ft,
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 
 	FT_TP(collapsed_free, (const void *) ft_collapsed_node_flag(node));
-	cds_ft_free_item(metadata);
+	cds_ft_free_item(ft, metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
 		uatomic_inc(&ft->nr_collapsed_freed);
