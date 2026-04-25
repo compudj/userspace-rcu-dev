@@ -1673,6 +1673,24 @@ struct cds_ft_metadata *ft_flag_to_metadata(struct cds_ft_inode_flag *nf)
 	return cds_ft_item_to_metadata(ft_node_ptr(nf));
 }
 
+/*
+ * If @nf is a skip-compressed pointer, return the underlying
+ * compressed node's flag pointer.  Otherwise return @nf unchanged.
+ *
+ * Use to "see through" the skip-compressed encoding when about to
+ * inspect or recurse into the underlying compressed node.  No-op for
+ * non-skip pointers; on archs without FEATURE_FT_SKIP_COMPRESSED the
+ * check is constant-folded to false and the call collapses to a copy.
+ */
+static inline
+struct cds_ft_inode_flag *ft_resolve_skip_compressed(
+		struct cds_ft_inode_flag *nf)
+{
+	if (ft_node_skip_compressed(nf))
+		return ft_compressed_node_flag(ft_skip_to_compressed(nf));
+	return nf;
+}
+
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 /*
  * ft_skip_to_compressed_meta: shorthand to get the compressed node's
@@ -3964,9 +3982,7 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 	struct cds_ft_inode_flag *child;
 
 	child = ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
-	if (ft_node_skip_compressed(child))
-		child = ft_compressed_node_flag(
-			ft_skip_to_compressed(child));
+	child = ft_resolve_skip_compressed(child);
 	return child;
 }
 
@@ -4100,9 +4116,7 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 		assert(0);
 		return (void *) -1UL;
 	}
-	if (ft_node_skip_compressed(child))
-		child = ft_compressed_node_flag(
-			ft_skip_to_compressed(child));
+	child = ft_resolve_skip_compressed(child);
 	return child;
 }
 
@@ -5834,9 +5848,7 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 			*status_ret = CDS_FT_STATUS_NOT_FOUND;
 			return FT_DESCENT_END;
 		}
-		if (ft_node_skip_compressed(node_flag))
-			node_flag = ft_compressed_node_flag(
-				ft_skip_to_compressed(node_flag));
+		node_flag = ft_resolve_skip_compressed(node_flag);
 		if (iter) {
 			iter_path_node(iter)[i] = node_flag;
 			*iter_path_len_p = i + 1;
@@ -5987,9 +5999,7 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 		{
 			struct cds_ft_inode_flag *child =
 				ft_dereference_acquire_prefetch(ptrs[e]);
-			if (ft_node_skip_compressed(child))
-				child = ft_compressed_node_flag(
-					ft_skip_to_compressed(child));
+			child = ft_resolve_skip_compressed(child);
 			*node_flag_p = child;
 		}
 		if (node_flag_ptr_p)
@@ -6941,9 +6951,7 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 					*level_p = level;
 					return FT_DESCENT_BREAK;
 				}
-				if (ft_node_skip_compressed(node_flag))
-					node_flag = ft_compressed_node_flag(
-						ft_skip_to_compressed(node_flag));
+				node_flag = ft_resolve_skip_compressed(node_flag);
 				iter_path_node(iter)[level + 1] = node_flag;
 				if (ft_node_external(node_flag)) {
 					*node_flag_p = node_flag;
@@ -7024,9 +7032,7 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 			*level_p = level;
 			return FT_DESCENT_BREAK;
 		}
-		if (ft_node_skip_compressed(node_flag))
-			node_flag = ft_compressed_node_flag(
-				ft_skip_to_compressed(node_flag));
+		node_flag = ft_resolve_skip_compressed(node_flag);
 		iter_path_node(iter)[level + 1] = node_flag;
 		*skip_eq_external_nodes_p = false;
 		*node_flag_p = node_flag;
@@ -7278,9 +7284,7 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 		level += slen - 1;
 		assert(level < max_tree_depth);
 		node_flag = best_child;
-		if (ft_node_skip_compressed(node_flag))
-			node_flag = ft_compressed_node_flag(
-				ft_skip_to_compressed(node_flag));
+		node_flag = ft_resolve_skip_compressed(node_flag);
 		iter_path_node(iter)[level + 1] = node_flag;
 		*node_flag_p = node_flag;
 		*level_p = level;
@@ -7400,9 +7404,7 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 		struct cds_ft_inode_flag *child_flag =
 			ft_dereference_acquire(cptrs[current_entry]);
 
-		if (ft_node_skip_compressed(child_flag))
-			child_flag = ft_compressed_node_flag(
-				ft_skip_to_compressed(child_flag));
+		child_flag = ft_resolve_skip_compressed(child_flag);
 		if (ft_node_ptr(child_flag) && ft_node_internal(child_flag)) {
 			struct cds_ft_inode_flag *node_flag;
 			uint8_t sib_key = 0;
@@ -7454,9 +7456,7 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 		level = suffix_base + slen;
 		assert(level < max_tree_depth);
 		node_flag = best_child;
-		if (ft_node_skip_compressed(node_flag))
-			node_flag = ft_compressed_node_flag(
-				ft_skip_to_compressed(node_flag));
+		node_flag = ft_resolve_skip_compressed(node_flag);
 		iter_path_node(iter)[level] = node_flag;
 		*node_flag_p = node_flag;
 		*level_p = level;
@@ -8114,9 +8114,7 @@ descend_children:
 		/*
 		 * Skip-compressed: convert to compressed flag.
 		 */
-		if (ft_node_skip_compressed(node_flag))
-			node_flag = ft_compressed_node_flag(
-				ft_skip_to_compressed(node_flag));
+		node_flag = ft_resolve_skip_compressed(node_flag);
 		/*
 		 * Compressed node: traverse through the compressed
 		 * path to reach the child.  Fill ordinal_key and
@@ -8954,9 +8952,7 @@ void ft_init_node_density(struct cds_ft *ft,
 			 * density contribution of the subtree the
 			 * compressed node represents.
 			 */
-			if (ft_node_skip_compressed(child))
-				child = ft_compressed_node_flag(
-					ft_skip_to_compressed(child));
+			child = ft_resolve_skip_compressed(child);
 			if (ft_node_external(child))
 				continue;
 			if (slen <= FT_NODE_DENSITY_DEPTH) {
@@ -9031,9 +9027,7 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 			 * Collapsed entries may hold skip pointers.
 			 * Resolve to compressed flag before comparing.
 			 */
-			if (ft_node_skip_compressed(entry))
-				entry = ft_compressed_node_flag(
-					ft_skip_to_compressed(entry));
+			entry = ft_resolve_skip_compressed(entry);
 			if (entry == child_nf) {
 				uint8_t data_e =
 					ft_collapsed_load_data(col, e);
@@ -9924,9 +9918,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				if (j == slen) {
 					struct cds_ft_inode_flag *entry_child;
 					entry_child = ft_dereference_acquire_prefetch(cptrs[e]);
-					if (ft_node_skip_compressed(entry_child))
-						entry_child = ft_compressed_node_flag(
-							ft_skip_to_compressed(entry_child));
+					entry_child = ft_resolve_skip_compressed(entry_child);
 					parent_slot = &cptrs[e];
 					parent_nf = node_flag;
 					node_flag = entry_child;
@@ -11931,9 +11923,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 		 * underlying compressed flag so the compressed handler
 		 * below processes it correctly.
 		 */
-		if (ft_node_skip_compressed(d.nf))
-			d.nf = ft_compressed_node_flag(
-				ft_skip_to_compressed(d.nf));
+		d.nf = ft_resolve_skip_compressed(d.nf);
 		/* Found external node. */
 		if (ft_node_external(d.nf))
 			break;
@@ -12218,9 +12208,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		if (!ft_node_ptr(d.nf))
 			break;
 		/* Resolve skip-compressed (e.g. from collapsed entry). */
-		if (ft_node_skip_compressed(d.nf))
-			d.nf = ft_compressed_node_flag(
-				ft_skip_to_compressed(d.nf));
+		d.nf = ft_resolve_skip_compressed(d.nf);
 		if (ft_node_external(d.nf))
 			break;
 		if (ft_node_compressed(d.nf)) {
@@ -12805,9 +12793,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 * falsely matching ft_node_external and skipping the
 		 * external_nodes preservation entirely.
 		 */
-		if (ft_node_skip_compressed(detach_child))
-			detach_child = ft_compressed_node_flag(
-				ft_skip_to_compressed(detach_child));
+		detach_child = ft_resolve_skip_compressed(detach_child);
 
 		if (ft_node_ptr(detach_child) && !ft_node_external(detach_child)) {
 			struct cds_ft_metadata *child_meta =
@@ -12948,9 +12934,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 * without the subtraction, ancestors retain stale
 		 * density from nodes that no longer exist below them.
 		 */
-		if (ft_node_skip_compressed(detach_child_nf))
-			detach_child_nf = ft_compressed_node_flag(
-				ft_skip_to_compressed(detach_child_nf));
+		detach_child_nf = ft_resolve_skip_compressed(detach_child_nf);
 
 		if (ft_node_ptr(detach_child_nf) &&
 		    !ft_node_external(detach_child_nf)) {
@@ -13416,9 +13400,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		/* Resolve skip-compressed (e.g. from collapsed entry). */
-		if (ft_node_skip_compressed(dd.d.nf))
-			dd.d.nf = ft_compressed_node_flag(
-				ft_skip_to_compressed(dd.d.nf));
+		dd.d.nf = ft_resolve_skip_compressed(dd.d.nf);
 
 		/*
 		 * Compressed node: compare remaining key bytes with
@@ -14165,9 +14147,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 		if (ft_node_external(d->nf))
 			break;
 		/* Resolve skip-compressed (e.g. from collapsed entry). */
-		if (ft_node_skip_compressed(d->nf))
-			d->nf = ft_compressed_node_flag(
-				ft_skip_to_compressed(d->nf));
+		d->nf = ft_resolve_skip_compressed(d->nf);
 		if (ft_node_compressed(d->nf)) {
 			enum ft_descent_action act;
 
@@ -15882,9 +15862,7 @@ enum ft_descent_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **node
 		{
 			struct cds_ft_inode_flag *child =
 				ft_dereference_acquire_prefetch(ptrs[e]);
-			if (ft_node_skip_compressed(child))
-				child = ft_compressed_node_flag(
-					ft_skip_to_compressed(child));
+			child = ft_resolve_skip_compressed(child);
 			*node_flag_p = child;
 		}
 		return FT_DESCENT_CONTINUE;
@@ -16729,9 +16707,7 @@ enum ft_descent_action ft_rebuild_path_collapsed(
 		node_flag = ft_dereference_acquire_prefetch(ptrs[e]);
 		if (!ft_node_ptr(node_flag))
 			return FT_DESCENT_END;
-		if (ft_node_skip_compressed(node_flag))
-			node_flag = ft_compressed_node_flag(
-				ft_skip_to_compressed(node_flag));
+		node_flag = ft_resolve_skip_compressed(node_flag);
 		iter_path_node(iter)[i + 1] = node_flag;
 		*node_flag_p = node_flag;
 		*i_p = i;
@@ -18341,12 +18317,9 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 		if (ft_node_external(child)) {
 			total_child_keys += 1;
 		} else {
-			struct cds_ft_inode_flag *child_resolved = child;
+			struct cds_ft_inode_flag *child_resolved = ft_resolve_skip_compressed(child);
 			unsigned long sub_keys = 0;
 
-			if (ft_node_skip_compressed(child))
-				child_resolved = ft_compressed_node_flag(
-					ft_skip_to_compressed(child));
 			if (ft_verify_node_recursive(ft, out, child_resolved,
 					node_flag, depth + slen,
 					&sub_keys))
@@ -18585,9 +18558,7 @@ int ft_verify_density_collapsed(const struct cds_ft *ft, FILE *out,
 		if (!ft_node_ptr(child))
 			continue;
 		/* Resolve skip-compressed: see ft_init_node_density. */
-		if (ft_node_skip_compressed(child))
-			child = ft_compressed_node_flag(
-				ft_skip_to_compressed(child));
+		child = ft_resolve_skip_compressed(child);
 		if (ft_node_external(child))
 			continue;
 		errors += ft_verify_density_recursive(ft, out,
