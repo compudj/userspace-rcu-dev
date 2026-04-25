@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 175
+#define NR_TESTS 176
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -12716,6 +12716,64 @@ static void excl_neg_writer_writer_child(void)
 }
 
 /*
+ * Concurrent-mode reader that does NOT hold the RCU read-side lock
+ * across the trie API call.  In QSBR a registered thread is online
+ * by default and read_ongoing() returns true; calling
+ * rcu_thread_offline() before the loop forces read_ongoing() to
+ * report false so the validator's mutex-claim path is exercised.
+ *
+ * No actual UAF risk: the writer thread stays online and never
+ * reaches a quiescent state inside the FT API, so call_rcu
+ * callbacks are deferred and no node is freed before the validator
+ * aborts the process on the first reader/writer overlap.
+ */
+static void *excl_neg_reader_no_rcu(void *arg)
+{
+	struct excl_neg_ctx *ctx = (struct excl_neg_ctx *) arg;
+	unsigned int i;
+
+	rcu_register_thread();
+	rcu_thread_offline();
+	pthread_barrier_wait(ctx->start);
+	for (i = 0; i < FT_EXCL_NEG_ITERATIONS; i++) {
+		struct cds_ft_node *found;
+		uint8_t key[4] = { 0 };
+
+		(void) cds_ft_lookup_key(ctx->ft, key, 4, &found);
+	}
+	rcu_thread_online();
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * In the forked child on a concurrent-mode trie: a reader that did
+ * not take the RCU read-side lock racing with a writer trips the
+ * generalised reader/writer check.
+ */
+__attribute__((noreturn))
+static void excl_neg_concurrent_reader_writer_child(void)
+{
+	struct cds_ft_group *group;
+	struct excl_neg_ctx ctx_r, ctx_w;
+	pthread_barrier_t start;
+	pthread_t t_r, t_w;
+
+	(void) freopen("/dev/null", "w", stderr);
+	alarm(30);
+	ctx_r.ft = ctx_w.ft = create_varlen_ft(&group);
+	pthread_barrier_init(&start, NULL, 2);
+	ctx_r.start = ctx_w.start = &start;
+	ctx_r.seed_bump = 0;
+	ctx_w.seed_bump = 0x4444;
+	pthread_create(&t_r, NULL, excl_neg_reader_no_rcu, &ctx_r);
+	pthread_create(&t_w, NULL, excl_neg_writer, &ctx_w);
+	pthread_join(t_r, NULL);
+	pthread_join(t_w, NULL);
+	_exit(42);
+}
+
+/*
  * In the forked child on an exclusive-mode trie: a reader and a
  * writer racing on the same trie trip the exclusive-mode
  * reader/writer check.
@@ -12795,6 +12853,17 @@ static int test_excl_validate_excl_reader_writer(void)
 		return 0;
 	}
 	return excl_neg_expect_sigabrt(excl_neg_excl_reader_writer_child);
+}
+
+static int test_excl_validate_concurrent_reader_writer_no_rcu(void)
+{
+	if (!cds_ft_excl_validate_enabled()) {
+		diag("FEATURE_FT_EXCL_VALIDATE not compiled in; "
+			"concurrent reader/writer (no RCU read lock) "
+			"provocation is a no-op");
+		return 0;
+	}
+	return excl_neg_expect_sigabrt(excl_neg_concurrent_reader_writer_child);
 }
 
 /* ================================================================== */
@@ -13053,6 +13122,7 @@ int main(int argc, char **argv)
 	diag("Exclusive-access validator tests");
 	RUN_TEST(test_excl_validate_writer_writer);
 	RUN_TEST(test_excl_validate_excl_reader_writer);
+	RUN_TEST(test_excl_validate_concurrent_reader_writer_no_rcu);
 
 	rcu_barrier();
 	rcu_unregister_thread();
