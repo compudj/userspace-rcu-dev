@@ -18677,6 +18677,28 @@ enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft, FILE *out)
 	return CDS_FT_STATUS_OK;
 }
 
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+/*
+ * Hook called from CDS_FT_SCOPED_WRITER's scope-exit, before the
+ * writer claim is released.  Runs both verifiers; on any mismatch,
+ * abort after letting both finish so we get the full diagnostic.
+ */
+void ft_writer_scope_verify(struct cds_ft *ft)
+{
+	bool fail = false;
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		fail = true;
+	if (cds_ft_verify_density(ft, stderr) != CDS_FT_STATUS_OK)
+		fail = true;
+	if (fail) {
+		fprintf(stderr, "FT verify-at-mutation: invariant violation on ft=%p\n",
+			(void *) ft);
+		abort();
+	}
+}
+#endif
+
 static
 void print_indent(FILE *out, int level)
 {
