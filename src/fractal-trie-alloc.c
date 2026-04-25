@@ -297,28 +297,75 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 	return cds_ft_arena_alloc(arena);
 }
 
+/*
+ * Synchronous free body shared by the call_rcu callback and the
+ * exclusive-mode fast path.  Frees the extended density counters,
+ * then either poisons the slot (FT_IMMEDIATE_FREE testing mode) or
+ * returns the slot to the arena free list.
+ */
+static
+void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
+{
+	struct cds_ft_metadata_alloc *metadata_alloc =
+		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
+
+	/* Free extended density counters. */
+	if (metadata_alloc->metadata.nr_keys == UINT32_MAX)
+		free(metadata_alloc->metadata.density_ext);
+#ifdef FT_IMMEDIATE_FREE
+	/*
+	 * Immediate-free testing mode: poison metadata and node data
+	 * so any subsequent access crashes deterministically and the
+	 * slot is never reused.  See cds_ft_free_item() docstring for
+	 * the safety constraints.
+	 */
+	{
+		struct cds_ft_alloc_range *range =
+			cds_ft_metadata_to_range(metadata);
+		struct cds_ft_alloc_arena *arena = range->arena;
+		size_t item_len = 1UL << arena->item_len_order;
+		void *item = cds_ft_metadata_to_item(metadata);
+
+		memset(item, 0xfe, item_len);
+		memset(metadata_alloc, 0xfe, sizeof(*metadata_alloc));
+	}
+#else
+	{
+		struct cds_ft_alloc_arena *arena =
+			cds_ft_metadata_to_range(metadata)->arena;
+
+		pthread_mutex_lock(&arena->lock);
+		metadata_alloc->free_list_next = arena->free_list_head;
+		arena->free_list_head = metadata_alloc;
+		pthread_mutex_unlock(&arena->lock);
+	}
+#endif
+}
+
 static
 void cds_ft_free_item_rcu(struct rcu_head *rcu_head)
 {
 	struct cds_ft_metadata_alloc *metadata_alloc =
 		caa_container_of(rcu_head, struct cds_ft_metadata_alloc, rcu_head);
-	struct cds_ft_alloc_arena *arena =
-		cds_ft_metadata_to_range(&metadata_alloc->metadata)->arena;
-
-	/* Free extended density counters. */
-	if (metadata_alloc->metadata.nr_keys == UINT32_MAX)
-		free(metadata_alloc->metadata.density_ext);
-
-	pthread_mutex_lock(&arena->lock);
-	metadata_alloc->free_list_next = arena->free_list_head;
-	arena->free_list_head = metadata_alloc;
-	pthread_mutex_unlock(&arena->lock);
+	cds_ft_do_free_item(&metadata_alloc->metadata);
 }
 
-void cds_ft_free_item(struct cds_ft_metadata *metadata)
+/*
+ * Release a metadata slot back to its arena.
+ *
+ * Concurrent-mode tries defer the actual freelist push by call_rcu
+ * so concurrent RCU readers cannot dereference a slot the writer
+ * has just unlinked.  Exclusive-mode tries forbid concurrent
+ * readers (cds_ft_make_exclusive() drains pre-existing readers via
+ * synchronize_rcu before flipping the flag), so the slot can be
+ * pushed back synchronously and reused immediately by the next
+ * allocation, avoiding the call_rcu round-trip.
+ *
+ * FT_IMMEDIATE_FREE testing mode poisons every slot in either
+ * mode (see cds_ft_do_free_item).
+ */
+void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata)
 {
-	struct cds_ft_metadata_alloc *metadata_alloc =
-		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
 #ifdef FT_IMMEDIATE_FREE
 	/*
 	 * Immediate free for use-after-free detection by mutation
@@ -339,21 +386,16 @@ void cds_ft_free_item(struct cds_ft_metadata *metadata)
 	 * Use this mode exclusively for validating that mutation
 	 * paths do not access freed memory.
 	 */
-	if (metadata_alloc->metadata.nr_keys == UINT32_MAX)
-		free(metadata_alloc->metadata.density_ext);
-	{
+	(void) ft;
+	cds_ft_do_free_item(metadata);
+#else
+	if (ft->exclusive) {
+		cds_ft_do_free_item(metadata);
+	} else {
+		struct cds_ft_metadata_alloc *metadata_alloc =
+			caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
 		struct cds_ft_alloc_range *range =
 			cds_ft_metadata_to_range(metadata);
-		struct cds_ft_alloc_arena *arena = range->arena;
-		size_t item_len = 1UL << arena->item_len_order;
-		void *item = cds_ft_metadata_to_item(metadata);
-
-		memset(item, 0xfe, item_len);
-		memset(metadata_alloc, 0xfe, sizeof(*metadata_alloc));
-	}
-#else
-	{
-		struct cds_ft_alloc_range *range = cds_ft_metadata_to_range(&metadata_alloc->metadata);
 		struct cds_ft_alloc_arena *arena = range->arena;
 		const struct rcu_flavor_struct *flavor = arena->ft_group->flavor;
 

@@ -833,7 +833,7 @@ __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order, bool bitmap);
 
 __attribute__((visibility("hidden")))
-void cds_ft_free_item(struct cds_ft_metadata *metadata);
+void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
 
 //#define DEBUG
 //#define DEBUG_COUNTERS
