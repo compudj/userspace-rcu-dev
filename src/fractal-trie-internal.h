@@ -285,6 +285,23 @@
  * Off by default (zero overhead).  Enable with -DFEATURE_FT_EXCL_VALIDATE.
  */
 
+/*
+ * FEATURE_FT_VERIFY_AT_MUTATION: walk the entire trie at the exit of
+ * every public write API (insert / remove / replace / graft / detach)
+ * and run cds_ft_verify and cds_ft_verify_density.  On any invariant
+ * mismatch, print a diagnostic to stderr and abort the process.
+ *
+ * Catches structural / nr_keys / parent-pointer / density regressions
+ * at the mutation that introduced them, instead of via downstream
+ * symptoms.  The recursive walk is O(N) per mutation, so this is for
+ * testing / debugging only.
+ *
+ * Off by default (zero overhead).  Enable with -DFEATURE_FT_VERIFY_AT_MUTATION.
+ */
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+void ft_writer_scope_verify(struct cds_ft *ft);
+#endif
+
 #ifdef FEATURE_INLINE_LOOKUP
 #define inline_lookup	inline __attribute__((always_inline))
 #else
@@ -671,7 +688,17 @@ static inline void ft_excl_reader_exit(struct cds_ft *ft)  { (void) ft; }
 #endif /* FEATURE_FT_EXCL_VALIDATE */
 
 static inline
-void ft_excl_writer_scope_exit(struct cds_ft **ft) { ft_excl_writer_exit(*ft); }
+void ft_excl_writer_scope_exit(struct cds_ft **ft)
+{
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+	/*
+	 * Verify before releasing the writer claim so a concurrent
+	 * writer cannot start mutating while we walk the trie.
+	 */
+	ft_writer_scope_verify(*ft);
+#endif
+	ft_excl_writer_exit(*ft);
+}
 static inline
 void ft_excl_reader_scope_exit(struct cds_ft **ft) { ft_excl_reader_exit(*ft); }
 
