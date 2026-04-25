@@ -188,10 +188,21 @@
  *
  * The library never calls rcu_read_lock() on the caller's behalf.
  * If FEATURE_FT_EXCL_VALIDATE is compiled in, the library
- * *validates* the discipline above (writer/writer exclusion in
- * any mode; reader/writer exclusion in exclusive mode) and aborts
- * on violation — it does not enforce the discipline.  Compliance
- * is the caller's responsibility.
+ * *validates* the discipline above and aborts on violation — it
+ * does not enforce the discipline.  Compliance is the caller's
+ * responsibility.  The validator catches:
+ *
+ *   - writer/writer overlap in any mode;
+ *   - reader/writer overlap in exclusive mode;
+ *   - reader/writer overlap in concurrent mode for readers that did
+ *     not hold the RCU read-side lock at entry (i.e. readers
+ *     asserting the mutex-claim path).  Readers that did hold the
+ *     RCU read-side lock are permitted to overlap with a single
+ *     writer.
+ *
+ * Detection in concurrent mode is point-in-time: a reader that
+ * holds neither the RCU read-side lock nor an external mutex but
+ * does not overlap with any writer in this run is not detected.
  *
  * Per-function comments below that say "the RCU read-side lock
  * must be held" describe the concurrent-mode case; in exclusive

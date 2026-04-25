@@ -274,13 +274,27 @@
 
 /*
  * FEATURE_FT_EXCL_VALIDATE: runtime validation of the access-discipline
- * contract (writer/writer exclusion in all modes; additionally
- * writer/reader exclusion in exclusive mode).  Writers claim a
- * per-trie owner via atomic CAS at the public API boundary; in
- * exclusive mode readers are counted too and a concurrent writer
- * (or a reader concurrent with a writer) aborts the process with a
- * violation report.  In concurrent mode readers are no-ops because
- * RCU already permits them to overlap with a single writer.
+ * contract.  Writers claim a per-trie owner via atomic CAS at the
+ * public API boundary; writer/writer overlap aborts the process with
+ * a violation report.
+ *
+ * Reader validation depends on the trie mode:
+ *
+ *   Exclusive mode: readers are counted; a writer entering with any
+ *   reader present (or a reader entering with a writer present)
+ *   aborts.
+ *
+ *   Concurrent mode: a well-formed reader either holds the RCU
+ *   read-side lock or guarantees external mutual exclusion against
+ *   mutators.  At reader entry the validator queries the RCU flavor's
+ *   read_ongoing(); if true the reader is RCU-protected and may
+ *   overlap with a single writer (no-op).  If false the reader is
+ *   asserting the mutex-claim path and is treated like an
+ *   exclusive-mode reader: a concurrent writer aborts.  The
+ *   validator only catches the deterministic case where the bad
+ *   interleaving actually occurs in this run; a reader that holds
+ *   neither protection but does not overlap with any writer cannot
+ *   be detected from a single observation.
  *
  * Off by default (zero overhead).  Enable with -DFEATURE_FT_EXCL_VALIDATE.
  */
@@ -607,16 +621,30 @@ struct cds_ft {
 /*
  * Access-discipline validator.  See FEATURE_FT_EXCL_VALIDATE above.
  *
- * The four functions form two nested pairs: ft_excl_writer_enter /
- * _exit around every writer API body, and ft_excl_reader_enter /
- * _exit around every reader API body.  The CDS_FT_SCOPED_{READER,
- * WRITER}(ft) macros wrap the pair in a GCC cleanup-attribute
- * variable so any return path in the body automatically runs the
- * matching _exit.
+ * The helpers form two nested pairs: ft_excl_writer_enter / _exit
+ * around every writer API body, and ft_excl_reader_enter /
+ * ft_excl_reader_scope_exit around every reader API body.  The
+ * CDS_FT_SCOPED_{READER,WRITER}(ft) macros wrap the pair in a GCC
+ * cleanup-attribute variable so any return path in the body
+ * automatically runs the matching _exit.
+ *
+ * Reader entry returns a per-call scope (struct ft_excl_reader_scope)
+ * that records whether the reader claimed the trie's reader counter.
+ * In concurrent mode a reader that holds the RCU read-side lock at
+ * entry does NOT claim (it may safely overlap a writer); a reader
+ * that does not is treated like an exclusive-mode reader and claims.
  *
  * When FEATURE_FT_EXCL_VALIDATE is off the helpers are empty and
  * the compiler inlines them away.
  */
+
+struct ft_excl_reader_scope {
+	struct cds_ft *ft;
+#ifdef FEATURE_FT_EXCL_VALIDATE
+	bool claimed;	/* true iff we incremented ft->excl_nr_readers. */
+#endif
+};
+
 #ifdef FEATURE_FT_EXCL_VALIDATE
 
 __attribute__((noreturn, format(printf, 1, 2)))
@@ -626,7 +654,7 @@ static inline
 void ft_excl_writer_enter(struct cds_ft *ft)
 {
 	unsigned long self = (unsigned long) pthread_self();
-	unsigned long prev;
+	unsigned long prev, nr;
 
 	prev = uatomic_cmpxchg(&ft->excl_owner, 0, self);
 	if (prev != 0) {
@@ -640,13 +668,18 @@ void ft_excl_writer_enter(struct cds_ft *ft)
 			(void *) ft, prev, self);
 	}
 	ft->excl_writer_depth = 1;
-	if (ft->exclusive) {
-		unsigned long nr = uatomic_load(&ft->excl_nr_readers, CMM_ACQUIRE);
-
-		if (nr != 0)
-			ft_excl_abort("cds_ft=%p: writer 0x%lx entering with %lu concurrent exclusive-mode reader(s)\n",
-				(void *) ft, self, nr);
-	}
+	/*
+	 * A non-zero reader count means a reader is asserting mutual
+	 * exclusion against us: in exclusive mode every reader claims;
+	 * in concurrent mode only readers that did not hold the RCU
+	 * read-side lock at entry claim.  Either way, overlap is a
+	 * contract violation.
+	 */
+	nr = uatomic_load(&ft->excl_nr_readers, CMM_ACQUIRE);
+	if (nr != 0)
+		ft_excl_abort("cds_ft=%p: writer 0x%lx entering with %lu concurrent reader(s) (%s mode)\n",
+			(void *) ft, self, nr,
+			ft->exclusive ? "exclusive" : "concurrent without RCU read-side lock");
 }
 
 static inline
@@ -657,33 +690,56 @@ void ft_excl_writer_exit(struct cds_ft *ft)
 }
 
 static inline
-void ft_excl_reader_enter(struct cds_ft *ft)
+struct ft_excl_reader_scope ft_excl_reader_enter(struct cds_ft *ft)
 {
+	struct ft_excl_reader_scope scope = { .ft = ft, .claimed = false };
 	unsigned long owner;
 
-	if (!ft->exclusive)
-		return;
+	if (!ft->exclusive) {
+		/*
+		 * Concurrent mode: a well-formed reader either holds
+		 * the RCU read-side lock or guarantees external mutual
+		 * exclusion against mutators.  RCU-protected readers
+		 * may overlap a single writer, so they're a no-op here.
+		 * Mutex-claim readers fall through and are validated
+		 * just like exclusive-mode readers.
+		 */
+		if (ft->group->flavor->read_ongoing())
+			return scope;
+	}
+	scope.claimed = true;
 	uatomic_add(&ft->excl_nr_readers, 1);
 	owner = uatomic_load(&ft->excl_owner, CMM_ACQUIRE);
 	if (owner != 0 && owner != (unsigned long) pthread_self())
-		ft_excl_abort("cds_ft=%p: reader 0x%lx entering with writer 0x%lx active (exclusive mode)\n",
-			(void *) ft, (unsigned long) pthread_self(), owner);
+		ft_excl_abort("cds_ft=%p: reader 0x%lx entering with writer 0x%lx active (%s mode)\n",
+			(void *) ft, (unsigned long) pthread_self(), owner,
+			ft->exclusive ? "exclusive" : "concurrent without RCU read-side lock");
+	return scope;
 }
 
 static inline
-void ft_excl_reader_exit(struct cds_ft *ft)
+void ft_excl_reader_exit_scope(const struct ft_excl_reader_scope *scope)
 {
-	if (!ft->exclusive)
-		return;
-	uatomic_sub(&ft->excl_nr_readers, 1);
+	if (scope->claimed)
+		uatomic_sub(&scope->ft->excl_nr_readers, 1);
 }
 
 #else /* !FEATURE_FT_EXCL_VALIDATE */
 
 static inline void ft_excl_writer_enter(struct cds_ft *ft) { (void) ft; }
 static inline void ft_excl_writer_exit(struct cds_ft *ft)  { (void) ft; }
-static inline void ft_excl_reader_enter(struct cds_ft *ft) { (void) ft; }
-static inline void ft_excl_reader_exit(struct cds_ft *ft)  { (void) ft; }
+static inline
+struct ft_excl_reader_scope ft_excl_reader_enter(struct cds_ft *ft)
+{
+	struct ft_excl_reader_scope scope = { .ft = ft };
+
+	return scope;
+}
+static inline
+void ft_excl_reader_exit_scope(const struct ft_excl_reader_scope *scope)
+{
+	(void) scope;
+}
 
 #endif /* FEATURE_FT_EXCL_VALIDATE */
 
@@ -700,7 +756,10 @@ void ft_excl_writer_scope_exit(struct cds_ft **ft)
 	ft_excl_writer_exit(*ft);
 }
 static inline
-void ft_excl_reader_scope_exit(struct cds_ft **ft) { ft_excl_reader_exit(*ft); }
+void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
+{
+	ft_excl_reader_exit_scope(scope);
+}
 
 /*
  * Two-level token-paste so __COUNTER__ is expanded before the
@@ -718,10 +777,10 @@ void ft_excl_reader_scope_exit(struct cds_ft **ft) { ft_excl_reader_exit(*ft); }
 		(ft_excl_writer_enter(ft), (ft))
 
 #define CDS_FT_SCOPED_READER(ft)					\
-	struct cds_ft *CDS_FT_CAT_(_ft_excl_scope_, __COUNTER__)	\
+	struct ft_excl_reader_scope CDS_FT_CAT_(_ft_excl_scope_, __COUNTER__) \
 		__attribute__((unused,					\
 			cleanup(ft_excl_reader_scope_exit))) =		\
-		(ft_excl_reader_enter(ft), (ft))
+		ft_excl_reader_enter(ft)
 
 /*
  * Allocator layout (see fractal-trie-alloc.c for the full picture).
