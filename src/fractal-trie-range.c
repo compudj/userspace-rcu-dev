@@ -358,6 +358,122 @@ enum cds_ft_status cds_ft_range_merge(struct cds_ft_range *dst,
 	return CDS_FT_STATUS_OK;
 }
 
+/*
+ * Drain all entries with start in [q_a, q_b) from @src_lk into
+ * @dst_lk.  Per entry: remove the duplicate chain from src, re-init
+ * each node, insert into dst.  Lazy-creates dst_lk on first match
+ * (via @ensure_dst_lk_cb); leaves dst_lk untouched if src_lk has no
+ * matches in the window.
+ *
+ * Caller holds src's writer mutex (and dst's, if dst is reachable
+ * to other writers).  Caller is also the RCU reader for src walks.
+ */
+/*
+ * Caller must hold the RCU read-side lock and src's writer mutex
+ * (and dst's, if dst is reachable to other writers) for the
+ * duration of this call.
+ */
+static
+enum cds_ft_status drain_subrange_into(struct cds_ft *src_lk,
+		struct cds_ft **dst_lk_p,
+		uint64_t q_a, uint64_t q_b,
+		struct cds_ft_group *dst_group)
+{
+	struct cds_ft_iter *it;
+	uint8_t key[8];
+	enum cds_ft_status s;
+
+	s = cds_ft_iter_create(src_lk, &it);
+	if (s < 0)
+		return s;
+
+	encode_u64_be(key, q_a);
+	s = cds_ft_iter_set_key(it, key, 8);
+	if (s < 0)
+		goto out;
+
+	for (;;) {
+		struct cds_ft_node *head, *tmp;
+		uint8_t cur_key[8];
+		size_t cur_key_len = 0;
+		uint64_t cur_v;
+
+		s = cds_ft_lookup_ge(src_lk, it);
+		if (s == CDS_FT_STATUS_NOT_FOUND) {
+			s = CDS_FT_STATUS_OK;
+			break;
+		}
+		if (s < 0)
+			break;
+		(void) cds_ft_iter_get_key(it, cur_key, sizeof(cur_key),
+				&cur_key_len);
+		cur_v = decode_u64_be(cur_key);
+		if (cur_v >= q_b) {
+			s = CDS_FT_STATUS_OK;
+			break;
+		}
+
+		s = cds_ft_remove_all(src_lk, it, &head);
+		if (s < 0)
+			break;
+
+		if (!*dst_lk_p) {
+			s = cds_ft_create(dst_group, NULL, dst_lk_p);
+			if (s < 0)
+				break;
+		}
+
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
+			cds_ft_node_init(head);
+			s = cds_ft_insert(*dst_lk_p, cur_key, 8, head);
+			if (s < 0)
+				goto out;
+		}
+	}
+out:
+	cds_ft_iter_destroy(it);
+	return s;
+}
+
+enum cds_ft_status cds_ft_range_detach_subrange(struct cds_ft_range *src,
+		uint64_t q_a, uint64_t q_b,
+		struct cds_ft_range **result)
+{
+	struct cds_ft_range *new_idx;
+	unsigned int k;
+	enum cds_ft_status s;
+
+	if (!src || !result)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	*result = NULL;
+	if (q_b <= q_a)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+
+	new_idx = (struct cds_ft_range *) calloc(1, sizeof(*new_idx));
+	if (!new_idx)
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	new_idx->group = src->group;
+
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *src_lk = rcu_dereference(src->level[k]);
+
+		if (!src_lk || cds_ft_empty(src_lk))
+			continue;
+		s = drain_subrange_into(src_lk,
+				(struct cds_ft **) &new_idx->level[k],
+				q_a, q_b, src->group);
+		if (s < 0)
+			goto err;
+	}
+
+	*result = new_idx;
+	return CDS_FT_STATUS_OK;
+
+err:
+	cds_ft_range_destroy(new_idx);
+	return s;
+}
+
 enum cds_ft_status cds_ft_range_detach(struct cds_ft_range *src,
 		struct cds_ft_range **result)
 {
@@ -419,6 +535,43 @@ void cds_ft_range_make_exclusive(struct cds_ft_range *ftr)
 		if (trie)
 			cds_ft_make_exclusive(trie);
 	}
+}
+
+enum cds_ft_status cds_ft_range_walk(struct cds_ft_range *ftr,
+		cds_ft_range_walk_callback cb, void *user_data)
+{
+	unsigned int k;
+
+	if (!ftr || !cb)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *trie = rcu_dereference(ftr->level[k]);
+		struct cds_ft_iter *iter;
+		enum cds_ft_status s;
+
+		if (!trie || cds_ft_empty(trie))
+			continue;
+		s = cds_ft_iter_create(trie, &iter);
+		if (s < 0)
+			return s;
+		cds_ft_for_each_rcu(trie, iter) {
+			struct cds_ft_node *head = cds_ft_iter_node(iter);
+
+			cds_ft_for_each_duplicate_rcu(head) {
+				struct cds_ft_range_node *rn = cds_ft_range_entry(
+						head,
+						struct cds_ft_range_node,
+						ft_node);
+				s = cb(rn, user_data);
+				if (s < 0) {
+					cds_ft_iter_destroy(iter);
+					return s;
+				}
+			}
+		}
+		cds_ft_iter_destroy(iter);
+	}
+	return CDS_FT_STATUS_OK;
 }
 
 bool cds_ft_range_empty(struct cds_ft_range *ftr)

@@ -47,7 +47,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 14
+#define NR_TESTS 15
 
 /* ------------------------------------------------------------------ */
 /* Group helper                                                       */
@@ -1848,7 +1848,185 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* Test 14: concurrent reader + writer                                */
+/* Test 14: detach_subrange + walk                                    */
+/* ------------------------------------------------------------------ */
+
+struct walk_ctx {
+	uint64_t *ids;
+	size_t *count;
+	size_t cap;
+};
+
+static enum cds_ft_status walk_collect_cb(struct cds_ft_range_node *node,
+		void *user_data)
+{
+	struct walk_ctx *ctx = (struct walk_ctx *) user_data;
+	struct rec *r = caa_container_of(node, struct rec, node);
+
+	if (*ctx->count >= ctx->cap)
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
+	ctx->ids[(*ctx->count)++] = r->id;
+	return CDS_FT_STATUS_OK;
+}
+
+static int test_detach_subrange_walk(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft_range *src = NULL, *spilled = NULL;
+	const size_t N = 2000;
+	struct rec **recs = NULL;
+	uint64_t *got_ids = NULL, *want_ids = NULL;
+	int ret = -1;
+
+	group = make_group();
+	if (cds_ft_range_create(group, NULL, &src) < 0)
+		goto out;
+	recs = (struct rec **) calloc(N, sizeof(*recs));
+	got_ids = (uint64_t *) calloc(N, sizeof(*got_ids));
+	want_ids = (uint64_t *) calloc(N, sizeof(*want_ids));
+	if (!recs || !got_ids || !want_ids)
+		goto out;
+
+	/* Build src with starts spread over [0, 2^32). */
+	prng_seed(0xdef1);
+	for (size_t i = 0; i < N; i++) {
+		uint64_t a = prng() & ((1ULL << 32) - 1);
+		uint64_t L = 1 + (prng() & ((1ULL << 14) - 1));
+		recs[i] = rec_alloc(a, a + L, i);
+		if (cds_ft_range_insert(src, a, a + L, &recs[i]->node) < 0)
+			goto out;
+	}
+
+	/* Walk: collect every id, compare against population count. */
+	{
+		size_t count = 0;
+		struct walk_ctx ctx = { got_ids, &count, N };
+		rcu_read_lock();
+		if (cds_ft_range_walk(src, walk_collect_cb, &ctx) < 0) {
+			rcu_read_unlock();
+			fprintf(stderr, "walk failed\n");
+			goto out;
+		}
+		rcu_read_unlock();
+		if (count != N) {
+			fprintf(stderr, "walk visited %zu, expected %zu\n",
+				count, N);
+			goto out;
+		}
+	}
+
+	/* Detach subrange [2^30, 2^31).  Compute the expected set
+	 * client-side to compare. */
+	uint64_t q_a = 1ULL << 30;
+	uint64_t q_b = 1ULL << 31;
+	size_t want_n = 0;
+	for (size_t i = 0; i < N; i++) {
+		if (recs[i]->start >= q_a && recs[i]->start < q_b)
+			want_ids[want_n++] = i;
+	}
+
+	rcu_read_lock();
+	if (cds_ft_range_detach_subrange(src, q_a, q_b, &spilled) < 0) {
+		rcu_read_unlock();
+		fprintf(stderr, "detach_subrange failed\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	cds_ft_range_make_concurrent(spilled);
+
+	rcu_read_lock();
+	if (cds_ft_range_count_entries(spilled) != want_n) {
+		fprintf(stderr,
+			"spilled count %lu != want %zu\n",
+			cds_ft_range_count_entries(spilled), want_n);
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_range_count_entries(src) != N - want_n) {
+		fprintf(stderr,
+			"src count %lu != %zu after spill\n",
+			cds_ft_range_count_entries(src), N - want_n);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+
+	/* Walk the spilled index, verify every collected id has start in
+	 * [q_a, q_b) and matches the expected set. */
+	{
+		size_t count = 0;
+		struct walk_ctx ctx = { got_ids, &count, N };
+		rcu_read_lock();
+		if (cds_ft_range_walk(spilled, walk_collect_cb, &ctx) < 0) {
+			rcu_read_unlock();
+			fprintf(stderr, "spilled walk failed\n");
+			goto out;
+		}
+		rcu_read_unlock();
+		if (count != want_n) {
+			fprintf(stderr,
+				"spilled walk visited %zu, expected %zu\n",
+				count, want_n);
+			goto out;
+		}
+		for (size_t i = 0; i < count; i++) {
+			struct rec *r = recs[got_ids[i]];
+			if (r->start < q_a || r->start >= q_b) {
+				fprintf(stderr,
+					"spilled id=%" PRIu64
+					" has start %" PRIu64 " outside [q_a, q_b)\n",
+					got_ids[i], r->start);
+				goto out;
+			}
+		}
+		qsort(got_ids, count, sizeof(*got_ids), u64_cmp);
+		qsort(want_ids, want_n, sizeof(*want_ids), u64_cmp);
+		if (memcmp(got_ids, want_ids, count * sizeof(*got_ids)) != 0) {
+			fprintf(stderr, "spilled id-set mismatch\n");
+			goto out;
+		}
+	}
+
+	/* Round-trip: merge spilled back into src.  src should regain
+	 * the full population and spilled should be empty. */
+	if (cds_ft_range_merge(src, spilled) < 0) {
+		fprintf(stderr, "round-trip merge failed\n");
+		goto out;
+	}
+	rcu_read_lock();
+	if (!cds_ft_range_empty(spilled)) {
+		fprintf(stderr, "spilled not empty after round-trip\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_range_count_entries(src) != N) {
+		fprintf(stderr,
+			"round-trip src count %lu != %zu\n",
+			cds_ft_range_count_entries(src), N);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+
+	ret = 0;
+out:
+	if (spilled) {
+		drain_all(spilled);
+		cds_ft_range_destroy(spilled);
+	}
+	if (src) {
+		drain_all(src);
+		cds_ft_range_destroy(src);
+	}
+	cds_ft_group_destroy(group);
+	free(recs);
+	free(got_ids);
+	free(want_ids);
+	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 15: concurrent reader + writer                                */
 /* ------------------------------------------------------------------ */
 
 #define CONCURRENT_DURATION_MS	1500
@@ -2044,6 +2222,7 @@ int main(void)
 	RUN_TEST(test_entering_leaving);
 	RUN_TEST(test_count);
 	RUN_TEST(test_merge_detach);
+	RUN_TEST(test_detach_subrange_walk);
 	/* Concurrent test is the slowest; run last. */
 	RUN_TEST(test_concurrent);
 

@@ -294,6 +294,93 @@ enum cds_ft_status cds_ft_range_detach(
 		struct cds_ft_range **result);
 
 /*
+ * cds_ft_range_detach_subrange - Detach ranges whose start lies in
+ *     [q_a, q_b) from @src into a newly-created range index.
+ * @src: Source range index.
+ * @q_a: Start window lower bound (inclusive).
+ * @q_b: Start window upper bound (exclusive).  Must be > @q_a.
+ * @result: Output handle for the newly-created index.
+ *
+ * Predicate: only ranges with start in [q_a, q_b) are moved.
+ * Ranges whose start lies outside the window stay in @src,
+ * regardless of where their end lies.  In particular, a range
+ * spanning the right boundary (start before q_b, end after q_b)
+ * goes with the result if its start is < q_b; a range spanning
+ * the left boundary (start before q_a, end inside the window)
+ * stays in @src.
+ *
+ * Useful as a "spill" primitive for tiered storage: extract a
+ * time-bounded sub-region of an in-memory index, serialise the
+ * detached index to disk via the user's preferred format, then
+ * destroy it.  The reverse path (load from disk) is the existing
+ * cds_ft_range_merge.
+ *
+ * On success @src no longer contains any range with start in
+ * [q_a, q_b), and *@result owns a new range index sharing @src's
+ * cds_ft_group.  Each per-level cds_ft in the returned index is
+ * in EXCLUSIVE mode (matching cds_ft_range_detach semantics);
+ * call cds_ft_range_make_concurrent before exposing it to RCU
+ * readers.
+ *
+ * Mutual exclusion on @src is the caller's responsibility.  The
+ * caller must also hold the RCU read-side lock for the duration
+ * of the call (the implementation walks @src's per-level tries
+ * with cached-path iterators).
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for NULL pointers
+ * or invalid window (q_b <= q_a).
+ * Returns CDS_FT_STATUS_MEMORY_ERROR on allocation failure.
+ * Returns a negative status on per-level transfer failure (partial
+ * state).
+ */
+enum cds_ft_status cds_ft_range_detach_subrange(
+		struct cds_ft_range *src,
+		uint64_t q_a, uint64_t q_b,
+		struct cds_ft_range **result);
+
+/*
+ * cds_ft_range_walk_callback - Callback type for cds_ft_range_walk.
+ * @node: The current cds_ft_range_node.  Caller can recover its
+ *        containing user record via cds_ft_range_entry().
+ * @user_data: Opaque value passed through from the caller.
+ *
+ * Returning a negative cds_ft_status aborts the walk and propagates
+ * that status back to the caller of cds_ft_range_walk.  Returning
+ * any non-negative value continues the walk.
+ */
+typedef enum cds_ft_status (*cds_ft_range_walk_callback)(
+		struct cds_ft_range_node *node, void *user_data);
+
+/*
+ * cds_ft_range_walk - Invoke @cb on every range stored in @ftr.
+ * @ftr: The range index.
+ * @cb: User callback (see cds_ft_range_walk_callback).
+ * @user_data: Opaque value passed through to @cb.
+ *
+ * Walks all per-level tries in level order.  Visit order within a
+ * level is the trie's sorted-by-start order; visit order across
+ * levels is by ascending length class.  No structural guarantee
+ * about cross-level interleaving (use cds_ft_range_lookup_overlap
+ * if a global ordering is required).
+ *
+ * The RCU read-side lock must be held by the caller for the
+ * duration of the walk.  The callback may inspect node fields and
+ * the containing user record but must not mutate the index;
+ * mutation during walk is undefined.
+ *
+ * Useful as a serialisation helper: callers writing the index to
+ * disk (or any other one-shot pass over all entries) can
+ * implement their format inside the callback without manually
+ * walking each per-level trie.
+ *
+ * Returns CDS_FT_STATUS_OK on a complete walk, or whatever
+ * negative status the callback returned to abort.
+ */
+enum cds_ft_status cds_ft_range_walk(struct cds_ft_range *ftr,
+		cds_ft_range_walk_callback cb, void *user_data);
+
+/*
  * cds_ft_range_make_concurrent - Mark every populated per-level
  *                                trie as concurrent-mode.
  * @ftr: The range index.
