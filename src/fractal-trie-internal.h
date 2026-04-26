@@ -610,6 +610,19 @@ struct cds_ft {
 	struct cds_ft_density_extended *density_pool;
 	unsigned int density_pool_count;
 
+	/*
+	 * Collapse acceptance threshold, expressed as a percentage of
+	 * the candidate collapsed-node footprint that the absorbed
+	 * subtree footprint must exceed for the collapse to fire.  100
+	 * (CDS_FT_COLLAPSE_THRESHOLD_DEFAULT) reproduces the historical
+	 * "absorbed > collapsed" gate.  Larger values demand a bigger
+	 * footprint win before collapsing; UINT_MAX
+	 * (CDS_FT_COLLAPSE_THRESHOLD_DISABLED) disables collapse on
+	 * this trie entirely.  Loaded with relaxed atomics on the write
+	 * path so it can be retuned on a live trie under writers.
+	 */
+	unsigned int collapse_threshold_pct;
+
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[FT_ENTRY_PER_NODE];
 	unsigned long nr_nodes_allocated, nr_nodes_freed;
