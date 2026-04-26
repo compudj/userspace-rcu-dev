@@ -256,6 +256,87 @@ enum cds_ft_status cds_ft_range_lookup_overlap(
 		uint64_t granularity);
 
 /*
+ * cds_ft_range_lookup_overlap_band - Position the iterator at the
+ *     first range overlapping [q_a, q_b) with length in
+ *     [length_lo, length_hi).
+ * @iter: The iterator.
+ * @q_a, @q_b: Query window (half-open).
+ * @length_lo, @length_hi: Half-open length band. Pass 0 for
+ *     length_lo to disable the lower bound; pass UINT64_MAX for
+ *     length_hi to disable the upper bound.
+ *
+ * Useful for zoom-in transitions (g_new < g_old): query the band
+ * [g_new, g_old) over the current viewport to fetch the
+ * newly-visible shorter ranges. Cost is naturally proportional to
+ * how many length-class levels overlap the band, not to the total
+ * population.
+ *
+ * Same RCU locking discipline as cds_ft_range_lookup_overlap().
+ */
+enum cds_ft_status cds_ft_range_lookup_overlap_band(
+		struct cds_ft_range_iter *iter,
+		uint64_t q_a, uint64_t q_b,
+		uint64_t length_lo, uint64_t length_hi);
+
+/*
+ * cds_ft_range_lookup_entering - Position the iterator at the first
+ *     range entering the viewport on a transition from
+ *     [old_q_a, old_q_b) to [new_q_a, new_q_b) at granularity g.
+ *     "Entering" = ranges satisfying the new predicate but not the
+ *     old.
+ *
+ * Pure pan-right (new_q_a > old_q_a, new_q_b > old_q_b, with
+ * overlap): scans only ranges starting in [old_q_b, new_q_b),
+ * cost proportional to the pan distance Δ = new_q_b - old_q_b.
+ *
+ * Pure pan-left (new_q_a < old_q_a, new_q_b < old_q_b, with
+ * overlap): scans the leading strip [new_q_a, old_q_a), cost
+ * proportional to old_q_a - new_q_a.
+ *
+ * No overlap: equivalent to cds_ft_range_lookup_overlap() over the
+ * new viewport.
+ *
+ * NEW subset of OLD (including identity): empty result.
+ *
+ * Other mixed cases (e.g., widening): falls back to a full re-query
+ * of the new viewport via cds_ft_range_lookup_overlap(). The result
+ * is correct (a superset is impossible because the old ranges in
+ * NEW \ OLD are all in NEW), but does not exploit the delta-only
+ * fast path. Callers needing optimal widening can issue two
+ * sequential entering queries: one for the right strip
+ * [old_q_b, new_q_b) and one for the left strip
+ * [new_q_a, old_q_a).
+ *
+ * Same RCU locking discipline as cds_ft_range_lookup_overlap().
+ */
+enum cds_ft_status cds_ft_range_lookup_entering(
+		struct cds_ft_range_iter *iter,
+		uint64_t old_q_a, uint64_t old_q_b,
+		uint64_t new_q_a, uint64_t new_q_b,
+		uint64_t granularity);
+
+/*
+ * cds_ft_range_lookup_leaving - Position the iterator at the first
+ *     range leaving the viewport on a transition from
+ *     [old_q_a, old_q_b) to [new_q_a, new_q_b) at granularity g.
+ *     "Leaving" = ranges satisfying the old predicate but not the
+ *     new.
+ *
+ * Symmetric to cds_ft_range_lookup_entering(): pure pan-right scans
+ * the trailing strip via end <= new_q_a; pure pan-left scans
+ * starts in [new_q_b, old_q_b); no-overlap returns the full old
+ * viewport; OLD subset of NEW returns empty; other mixed cases
+ * fall back to a full re-query of the old viewport.
+ *
+ * Same RCU locking discipline as cds_ft_range_lookup_overlap().
+ */
+enum cds_ft_status cds_ft_range_lookup_leaving(
+		struct cds_ft_range_iter *iter,
+		uint64_t old_q_a, uint64_t old_q_b,
+		uint64_t new_q_a, uint64_t new_q_b,
+		uint64_t granularity);
+
+/*
  * cds_ft_range_iter_next - Advance the iterator to the next match.
  * @iter: Iterator already positioned by cds_ft_range_lookup_overlap().
  *

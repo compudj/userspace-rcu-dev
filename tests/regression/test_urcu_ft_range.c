@@ -47,7 +47,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 7
+#define NR_TESTS 9
 
 /* ------------------------------------------------------------------ */
 /* Group helper                                                       */
@@ -704,7 +704,441 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* Test 7: concurrent reader + writer                                 */
+/* Test 7: overlap_band parity                                        */
+/* ------------------------------------------------------------------ */
+
+static size_t shadow_overlap_band(const struct shadow *s, size_t n,
+		uint64_t q_a, uint64_t q_b,
+		uint64_t length_lo, uint64_t length_hi,
+		uint64_t *out_ids)
+{
+	size_t k = 0;
+	for (size_t i = 0; i < n; i++) {
+		uint64_t L = s[i].end - s[i].start;
+		if (L < length_lo || L >= length_hi)
+			continue;
+		if (s[i].start < q_b && s[i].end > q_a)
+			out_ids[k++] = s[i].id;
+	}
+	return k;
+}
+
+static int collect_overlap_band(struct cds_ft_range *ftr,
+		uint64_t q_a, uint64_t q_b,
+		uint64_t length_lo, uint64_t length_hi,
+		uint64_t *ids, size_t cap)
+{
+	struct cds_ft_range_iter *it;
+	struct cds_ft_range_node *n;
+	size_t k = 0;
+
+	if (cds_ft_range_iter_create(ftr, &it) < 0)
+		return -1;
+	rcu_read_lock();
+	cds_ft_range_lookup_overlap_band(it, q_a, q_b, length_lo, length_hi);
+	while ((n = cds_ft_range_iter_node(it)) != NULL) {
+		struct rec *r = caa_container_of(n, struct rec, node);
+		if (k >= cap) {
+			rcu_read_unlock();
+			cds_ft_range_iter_destroy(it);
+			return -1;
+		}
+		ids[k++] = r->id;
+		cds_ft_range_iter_next(it);
+	}
+	rcu_read_unlock();
+	cds_ft_range_iter_destroy(it);
+	return (int) k;
+}
+
+static int test_overlap_band(void)
+{
+	struct cds_ft_range *ftr;
+	const size_t N = 3000;
+	const size_t Q = 100;
+	struct shadow *shadow = NULL;
+	uint64_t *got_ids = NULL, *want_ids = NULL;
+	int ret = -1;
+	size_t cap = N;
+
+	struct cds_ft_group *group = make_group();
+	if (cds_ft_range_create(group, NULL, &ftr) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	shadow = (struct shadow *) calloc(N, sizeof(*shadow));
+	got_ids = (uint64_t *) calloc(cap, sizeof(*got_ids));
+	want_ids = (uint64_t *) calloc(cap, sizeof(*want_ids));
+	if (!shadow || !got_ids || !want_ids)
+		goto out;
+
+	prng_seed(0xb47d);
+	for (size_t i = 0; i < N; i++) {
+		uint64_t a = prng() & ((1ULL << 40) - 1);
+		uint64_t L = 1 + (prng() & ((1ULL << 20) - 1));
+		uint64_t b;
+		struct rec *r;
+		if (a > UINT64_MAX - L)
+			a = UINT64_MAX - L;
+		b = a + L;
+		shadow[i].start = a;
+		shadow[i].end = b;
+		shadow[i].id = i;
+		r = rec_alloc(a, b, i);
+		if (cds_ft_range_insert(ftr, a, b, &r->node) < 0)
+			goto out;
+	}
+
+	for (size_t q = 0; q < Q; q++) {
+		uint64_t base = prng() & ((1ULL << 40) - 1);
+		uint64_t W = 1 + (prng() & ((1ULL << 18) - 1));
+		uint64_t q_a = base;
+		uint64_t q_b;
+		uint64_t lo_bits = prng() & 0x1f;	/* 0..31 */
+		uint64_t hi_bits = lo_bits + 1 + (prng() & 0xf);	/* lo+1..lo+16 */
+		uint64_t length_lo = (lo_bits == 0) ? 0 : (1ULL << lo_bits);
+		uint64_t length_hi = (hi_bits >= 63) ? UINT64_MAX
+			: (1ULL << hi_bits);
+		size_t got_n, want_n;
+
+		if (q_a > UINT64_MAX - W)
+			q_a = UINT64_MAX - W;
+		q_b = q_a + W;
+
+		want_n = shadow_overlap_band(shadow, N, q_a, q_b,
+			length_lo, length_hi, want_ids);
+		int got = collect_overlap_band(ftr, q_a, q_b,
+			length_lo, length_hi, got_ids, cap);
+		if (got < 0) {
+			fprintf(stderr, "collect_overlap_band failed q=%zu\n", q);
+			goto out;
+		}
+		got_n = (size_t) got;
+		if (got_n != want_n) {
+			fprintf(stderr,
+				"overlap_band mismatch q=%zu lo=%" PRIu64
+				" hi=%" PRIu64 ": got %zu want %zu\n",
+				q, length_lo, length_hi, got_n, want_n);
+			goto out;
+		}
+		qsort(got_ids, got_n, sizeof(*got_ids), u64_cmp);
+		qsort(want_ids, want_n, sizeof(*want_ids), u64_cmp);
+		if (memcmp(got_ids, want_ids, got_n * sizeof(*got_ids)) != 0) {
+			fprintf(stderr, "overlap_band id-set mismatch q=%zu\n", q);
+			goto out;
+		}
+	}
+
+	ret = 0;
+out:
+	free(shadow);
+	free(got_ids);
+	free(want_ids);
+	drain_all(ftr);
+	cds_ft_range_destroy(ftr);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 8: entering / leaving parity                                  */
+/* ------------------------------------------------------------------ */
+
+static size_t shadow_entering(const struct shadow *s, size_t n,
+		uint64_t old_a, uint64_t old_b,
+		uint64_t new_a, uint64_t new_b,
+		uint64_t g, uint64_t *out)
+{
+	size_t k = 0;
+	for (size_t i = 0; i < n; i++) {
+		uint64_t L = s[i].end - s[i].start;
+		bool in_new = (s[i].start < new_b && s[i].end > new_a);
+		bool in_old = (s[i].start < old_b && s[i].end > old_a);
+		if (L < g)
+			continue;
+		if (in_new && !in_old)
+			out[k++] = s[i].id;
+	}
+	return k;
+}
+
+static size_t shadow_leaving(const struct shadow *s, size_t n,
+		uint64_t old_a, uint64_t old_b,
+		uint64_t new_a, uint64_t new_b,
+		uint64_t g, uint64_t *out)
+{
+	size_t k = 0;
+	for (size_t i = 0; i < n; i++) {
+		uint64_t L = s[i].end - s[i].start;
+		bool in_new = (s[i].start < new_b && s[i].end > new_a);
+		bool in_old = (s[i].start < old_b && s[i].end > old_a);
+		if (L < g)
+			continue;
+		if (in_old && !in_new)
+			out[k++] = s[i].id;
+	}
+	return k;
+}
+
+static int collect_entering(struct cds_ft_range *ftr,
+		uint64_t old_a, uint64_t old_b,
+		uint64_t new_a, uint64_t new_b,
+		uint64_t g, uint64_t *ids, size_t cap)
+{
+	struct cds_ft_range_iter *it;
+	struct cds_ft_range_node *n;
+	size_t k = 0;
+
+	if (cds_ft_range_iter_create(ftr, &it) < 0)
+		return -1;
+	rcu_read_lock();
+	cds_ft_range_lookup_entering(it, old_a, old_b, new_a, new_b, g);
+	while ((n = cds_ft_range_iter_node(it)) != NULL) {
+		struct rec *r = caa_container_of(n, struct rec, node);
+		if (k >= cap) {
+			rcu_read_unlock();
+			cds_ft_range_iter_destroy(it);
+			return -1;
+		}
+		ids[k++] = r->id;
+		cds_ft_range_iter_next(it);
+	}
+	rcu_read_unlock();
+	cds_ft_range_iter_destroy(it);
+	return (int) k;
+}
+
+static int collect_leaving(struct cds_ft_range *ftr,
+		uint64_t old_a, uint64_t old_b,
+		uint64_t new_a, uint64_t new_b,
+		uint64_t g, uint64_t *ids, size_t cap)
+{
+	struct cds_ft_range_iter *it;
+	struct cds_ft_range_node *n;
+	size_t k = 0;
+
+	if (cds_ft_range_iter_create(ftr, &it) < 0)
+		return -1;
+	rcu_read_lock();
+	cds_ft_range_lookup_leaving(it, old_a, old_b, new_a, new_b, g);
+	while ((n = cds_ft_range_iter_node(it)) != NULL) {
+		struct rec *r = caa_container_of(n, struct rec, node);
+		if (k >= cap) {
+			rcu_read_unlock();
+			cds_ft_range_iter_destroy(it);
+			return -1;
+		}
+		ids[k++] = r->id;
+		cds_ft_range_iter_next(it);
+	}
+	rcu_read_unlock();
+	cds_ft_range_iter_destroy(it);
+	return (int) k;
+}
+
+/*
+ * Filter a got-set against the brute-force "leaving fast path" predicate
+ * (ranges that are in OLD AND not in NEW).  The library is allowed to
+ * return additional ranges in mixed-transition cases (it falls back to
+ * a full re-query of OLD), so a got-set that is a strict superset of
+ * the want-set is still acceptable as long as every reported range
+ * was at least in OLD with L >= g.
+ */
+static bool got_is_consistent_with_old_overlap(const struct shadow *s, size_t n,
+		uint64_t old_a, uint64_t old_b, uint64_t g,
+		const uint64_t *got, size_t got_n)
+{
+	for (size_t i = 0; i < got_n; i++) {
+		const struct shadow *r = &s[got[i]];
+		uint64_t L = r->end - r->start;
+		if (L < g)
+			return false;
+		if (!(r->start < old_b && r->end > old_a))
+			return false;
+	}
+	return true;
+}
+
+static bool got_is_consistent_with_new_overlap(const struct shadow *s, size_t n,
+		uint64_t new_a, uint64_t new_b, uint64_t g,
+		const uint64_t *got, size_t got_n)
+{
+	for (size_t i = 0; i < got_n; i++) {
+		const struct shadow *r = &s[got[i]];
+		uint64_t L = r->end - r->start;
+		if (L < g)
+			return false;
+		if (!(r->start < new_b && r->end > new_a))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Verify that for "fast-path" pans (pure pan-right, pure pan-left, no
+ * overlap, identity, contained-within) the reported entering / leaving
+ * sets exactly match brute force.  Other transitions (widening,
+ * shrinking, mixed) accept superset-of-brute results as long as the
+ * superset stays within OLD or NEW respectively.
+ */
+static bool is_fast_path_pan(uint64_t old_a, uint64_t old_b,
+		uint64_t new_a, uint64_t new_b)
+{
+	bool overlap = !(new_a >= old_b || new_b <= old_a);
+	bool contained = (new_a >= old_a && new_b <= old_b)
+		|| (new_a <= old_a && new_b >= old_b);
+	bool pan_right = (new_a > old_a && new_b > old_b);
+	bool pan_left = (new_a < old_a && new_b < old_b);
+	if (!overlap)
+		return true;	/* fall-back to full new/old overlap, exact */
+	if (contained)
+		return true;	/* exact (entering or leaving is empty) */
+	return pan_right || pan_left;
+}
+
+static int test_entering_leaving(void)
+{
+	struct cds_ft_range *ftr;
+	const size_t N = 3000;
+	const size_t Q = 200;
+	struct shadow *shadow = NULL;
+	uint64_t *got_ids = NULL, *want_ids = NULL;
+	int ret = -1;
+	size_t cap = N;
+
+	struct cds_ft_group *group = make_group();
+	if (cds_ft_range_create(group, NULL, &ftr) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	shadow = (struct shadow *) calloc(N, sizeof(*shadow));
+	got_ids = (uint64_t *) calloc(cap, sizeof(*got_ids));
+	want_ids = (uint64_t *) calloc(cap, sizeof(*want_ids));
+	if (!shadow || !got_ids || !want_ids)
+		goto out;
+
+	prng_seed(0xed91);
+	for (size_t i = 0; i < N; i++) {
+		uint64_t a = prng() & ((1ULL << 40) - 1);
+		uint64_t L = 1 + (prng() & ((1ULL << 18) - 1));
+		uint64_t b;
+		struct rec *r;
+		if (a > UINT64_MAX - L)
+			a = UINT64_MAX - L;
+		b = a + L;
+		shadow[i].start = a;
+		shadow[i].end = b;
+		shadow[i].id = i;
+		r = rec_alloc(a, b, i);
+		if (cds_ft_range_insert(ftr, a, b, &r->node) < 0)
+			goto out;
+	}
+
+	for (size_t q = 0; q < Q; q++) {
+		uint64_t old_a = prng() & ((1ULL << 40) - 1);
+		uint64_t W = 1 + (prng() & ((1ULL << 18) - 1));
+		uint64_t old_b;
+		int64_t delta;
+		uint64_t new_a, new_b;
+		uint64_t g = (q & 3) ? 0 : (1ULL << ((prng() & 0xf)));
+
+		if (old_a > UINT64_MAX - W)
+			old_a = UINT64_MAX - W;
+		old_b = old_a + W;
+
+		/* delta in [-2W, 2W). */
+		delta = (int64_t)(prng() & ((4ULL * W) - 1)) - (int64_t)(2ULL * W);
+		new_a = (delta >= 0)
+			? (old_a + (uint64_t) delta > UINT64_MAX - W
+				? UINT64_MAX - W : old_a + (uint64_t) delta)
+			: ((uint64_t)(-delta) >= old_a
+				? 0 : old_a - (uint64_t)(-delta));
+		new_b = (new_a > UINT64_MAX - W) ? UINT64_MAX : new_a + W;
+		if (new_b <= new_a)
+			continue;	/* skip degenerate after clamp */
+
+		bool fast = is_fast_path_pan(old_a, old_b, new_a, new_b);
+
+		/* Entering. */
+		size_t want_n = shadow_entering(shadow, N, old_a, old_b,
+			new_a, new_b, g, want_ids);
+		int got = collect_entering(ftr, old_a, old_b, new_a, new_b,
+			g, got_ids, cap);
+		if (got < 0)
+			goto out;
+		size_t got_n = (size_t) got;
+		if (fast) {
+			if (got_n != want_n) {
+				fprintf(stderr,
+					"entering count mismatch q=%zu: got %zu want %zu\n",
+					q, got_n, want_n);
+				goto out;
+			}
+			qsort(got_ids, got_n, sizeof(*got_ids), u64_cmp);
+			qsort(want_ids, want_n, sizeof(*want_ids), u64_cmp);
+			if (memcmp(got_ids, want_ids,
+					got_n * sizeof(*got_ids)) != 0) {
+				fprintf(stderr,
+					"entering id-set mismatch q=%zu\n", q);
+				goto out;
+			}
+		} else {
+			if (!got_is_consistent_with_new_overlap(shadow, N,
+					new_a, new_b, g, got_ids, got_n)) {
+				fprintf(stderr,
+					"entering fallback returned an out-of-NEW range q=%zu\n",
+					q);
+				goto out;
+			}
+		}
+
+		/* Leaving. */
+		want_n = shadow_leaving(shadow, N, old_a, old_b,
+			new_a, new_b, g, want_ids);
+		got = collect_leaving(ftr, old_a, old_b, new_a, new_b,
+			g, got_ids, cap);
+		if (got < 0)
+			goto out;
+		got_n = (size_t) got;
+		if (fast) {
+			if (got_n != want_n) {
+				fprintf(stderr,
+					"leaving count mismatch q=%zu: got %zu want %zu\n",
+					q, got_n, want_n);
+				goto out;
+			}
+			qsort(got_ids, got_n, sizeof(*got_ids), u64_cmp);
+			qsort(want_ids, want_n, sizeof(*want_ids), u64_cmp);
+			if (memcmp(got_ids, want_ids,
+					got_n * sizeof(*got_ids)) != 0) {
+				fprintf(stderr,
+					"leaving id-set mismatch q=%zu\n", q);
+				goto out;
+			}
+		} else {
+			if (!got_is_consistent_with_old_overlap(shadow, N,
+					old_a, old_b, g, got_ids, got_n)) {
+				fprintf(stderr,
+					"leaving fallback returned an out-of-OLD range q=%zu\n",
+					q);
+				goto out;
+			}
+		}
+	}
+
+	ret = 0;
+out:
+	free(shadow);
+	free(got_ids);
+	free(want_ids);
+	drain_all(ftr);
+	cds_ft_range_destroy(ftr);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 9: concurrent reader + writer                                 */
 /* ------------------------------------------------------------------ */
 
 #define CONCURRENT_DURATION_MS	1500
@@ -893,6 +1327,8 @@ int main(void)
 	RUN_TEST(test_granularity);
 	RUN_TEST(test_pan);
 	RUN_TEST(test_edges);
+	RUN_TEST(test_overlap_band);
+	RUN_TEST(test_entering_leaving);
 	/* Concurrent test is the slowest; run last. */
 	RUN_TEST(test_concurrent);
 

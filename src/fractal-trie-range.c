@@ -45,25 +45,58 @@ struct cds_ft_range_attr {
 /*
  * Per-iterator state.
  *
- * The iterator walks per-level cds_ft tries in increasing-k order,
- * starting at the granularity-derived k_min. Within each level it
- * scans trie keys in [scan_lo, scan_hi), where scan_hi is q_b
- * (exclusive) and scan_lo accounts for the maximum range length at
- * that level (a range whose start is in [q_a - 2^k, q_a) may still
- * extend into the query window).
+ * The iterator walks per-level cds_ft tries in increasing-k order
+ * over [k_min, k_max].  Within each level it scans trie keys in
+ * [scan_lo, scan_hi), determined by one of two strategies:
  *
- * Within each trie key position, we walk the duplicate chain (ranges
- * sharing the same start) and filter by end > q_a.
+ *   HALO: per-level [max(0, halo_q_a - 2^k), halo_q_b).  Used by
+ *         overlap-style scans that must cover ranges starting up to
+ *         one cell-width before the query window so they can reach
+ *         into it.  This is the natural shape for lookup_overlap and
+ *         the leading/trailing strip variants used by entering /
+ *         leaving when filtering on the end position.
+ *
+ *   FIXED: same [scan_start_lo, scan_start_hi) at every level, with
+ *          no halo.  Used when the start position itself defines
+ *          membership (entering pan-right: start in
+ *          [old_q_b, new_q_b); leaving pan-left: start in
+ *          [new_q_b, old_q_b)).
+ *
+ * Within each trie key position, the duplicate chain is walked and
+ * each entry is admitted iff:
+ *   end_floor < end <= end_ceil  &&  length_lo <= L < length_hi
+ * (with end_ceil = UINT64_MAX and length_hi = UINT64_MAX denoting
+ * no upper bound).
  */
+enum cds_ft_range_scan {
+	CDS_FT_RANGE_SCAN_HALO,
+	CDS_FT_RANGE_SCAN_FIXED,
+};
+
 struct cds_ft_range_iter {
 	struct cds_ft_range *ftr;
-	uint64_t q_a, q_b;
-	uint64_t granularity;
+
+	/* Per-range filter. */
+	uint64_t end_floor;		/* require: end > end_floor */
+	uint64_t end_ceil;		/* require: end <= end_ceil; UINT64_MAX = unrestricted */
+	uint64_t length_lo;		/* require: L >= length_lo (granularity floor) */
+	uint64_t length_hi;		/* require: L < length_hi; UINT64_MAX = unrestricted */
+
+	/* Scan window. */
+	enum cds_ft_range_scan scan_strategy;
+	uint64_t halo_q_a, halo_q_b;	/* HALO mode: per-level [halo_q_a - 2^k, halo_q_b) */
+	uint64_t scan_start_lo;		/* FIXED mode: per-level [scan_start_lo, scan_start_hi) */
+	uint64_t scan_start_hi;
+
+	/* Level range to visit (inclusive). */
+	unsigned int k_min, k_max;
 	unsigned int level;
-	uint64_t scan_lo, scan_hi;	/* current level's window */
-	struct cds_ft_iter *ft_iter;	/* iter into ftr->level[level], or NULL */
-	struct cds_ft_node *chain_pos;	/* current dup-chain node, NULL when between trie keys */
-	struct cds_ft_range_node *current;	/* match yielded to the caller, or NULL */
+
+	/* Active scan state. */
+	uint64_t scan_lo, scan_hi;
+	struct cds_ft_iter *ft_iter;
+	struct cds_ft_node *chain_pos;
+	struct cds_ft_range_node *current;
 	bool exhausted;
 };
 
@@ -318,14 +351,45 @@ struct cds_ft_range_node *cds_ft_range_iter_node(
 	return iter->current;
 }
 
+/*
+ * Compute scan_lo, scan_hi for the iterator's current level based on
+ * its scan strategy.
+ */
 static inline
-uint64_t scan_lo_for(uint64_t q_a, unsigned int k)
+void compute_scan_window(struct cds_ft_range_iter *iter)
 {
-	uint64_t halo = level_max_len(k);
+	if (iter->scan_strategy == CDS_FT_RANGE_SCAN_HALO) {
+		uint64_t halo = level_max_len(iter->level);
+		iter->scan_lo = (iter->halo_q_a > halo)
+			? iter->halo_q_a - halo : 0;
+		iter->scan_hi = iter->halo_q_b;
+	} else {
+		iter->scan_lo = iter->scan_start_lo;
+		iter->scan_hi = iter->scan_start_hi;
+	}
+}
 
-	if (q_a > halo)
-		return q_a - halo;
-	return 0;
+/*
+ * Filter predicate applied per range during the chain walk.
+ * Returns true when the range satisfies all of the iterator's
+ * end / length bounds and should be yielded to the caller.
+ */
+static inline
+bool range_passes_filter(struct cds_ft_range_iter *iter,
+		const struct cds_ft_range_node *rn)
+{
+	uint64_t L;
+
+	if (rn->end <= iter->end_floor)
+		return false;
+	if (rn->end > iter->end_ceil)
+		return false;
+	L = rn->end - rn->start;
+	if (L < iter->length_lo)
+		return false;
+	if (L >= iter->length_hi)
+		return false;
+	return true;
 }
 
 /*
@@ -413,11 +477,7 @@ enum cds_ft_status advance_to_match(struct cds_ft_range_iter *iter)
 					iter->chain_pos,
 					struct cds_ft_range_node, ft_node);
 
-			/* Overlap: rn->end > q_a (rn->start < q_b is enforced
-			 * by the per-level scan window). Granularity:
-			 * (rn->end - rn->start) >= granularity. */
-			if (rn->end > iter->q_a
-					&& (rn->end - rn->start) >= iter->granularity) {
+			if (range_passes_filter(iter, rn)) {
 				iter->current = rn;
 				return CDS_FT_STATUS_OK;
 			}
@@ -444,10 +504,10 @@ enum cds_ft_status advance_to_match(struct cds_ft_range_iter *iter)
 			release_level_iter(iter);
 		}
 
-		/* Phase C: advance to next non-empty level. */
+		/* Phase C: advance to next non-empty level (within k_min..k_max). */
 		for (;;) {
 			iter->level++;
-			if (iter->level >= CDS_FT_RANGE_NR_LEVELS) {
+			if (iter->level > iter->k_max) {
 				iter->current = NULL;
 				iter->exhausted = true;
 				return CDS_FT_STATUS_NOT_FOUND;
@@ -455,8 +515,7 @@ enum cds_ft_status advance_to_match(struct cds_ft_range_iter *iter)
 			if (rcu_dereference(ftr->level[iter->level]))
 				break;
 		}
-		iter->scan_lo = scan_lo_for(iter->q_a, iter->level);
-		iter->scan_hi = iter->q_b;
+		compute_scan_window(iter);
 
 		/* Phase D: seek into the new level. */
 		{
@@ -480,12 +539,60 @@ enum cds_ft_status advance_to_match(struct cds_ft_range_iter *iter)
 	}
 }
 
+/*
+ * Largest level whose ranges might satisfy length < length_hi.
+ * Level k holds L in (2^(k-1), 2^k]: skip k iff 2^(k-1) >= length_hi.
+ * Returns NR_LEVELS - 1 when length_hi == UINT64_MAX (no upper bound).
+ */
+static inline
+unsigned int max_level_for_length_hi(uint64_t length_hi)
+{
+	if (length_hi == UINT64_MAX || length_hi > (1ULL << (CDS_FT_RANGE_NR_LEVELS - 1)))
+		return CDS_FT_RANGE_NR_LEVELS - 1;
+	if (length_hi <= 1)
+		return 0;
+	/* Smallest k with 2^k >= length_hi. */
+	return 64u - (unsigned int) __builtin_clzll(length_hi - 1);
+}
+
+/*
+ * Set iter->level so that the next advance_to_match() Phase C land
+ * on @k_min. Phase C does iter->level++ before checking, so we set
+ * level = k_min - 1 (with unsigned underflow when k_min == 0).
+ */
+static inline
+void prime_level(struct cds_ft_range_iter *iter, unsigned int k_min)
+{
+	iter->level = (k_min == 0) ? UINT_MAX : (k_min - 1);
+}
+
+/*
+ * Common iterator-bound setup shared by all entry points.  Resets
+ * scan state, clears current/exhausted, primes the level walker.
+ * Returns CDS_FT_STATUS_OK if the configured level range is
+ * non-empty, CDS_FT_STATUS_NOT_FOUND otherwise (caller short-
+ * circuits without scanning).
+ */
+static
+enum cds_ft_status iter_begin(struct cds_ft_range_iter *iter)
+{
+	release_level_iter(iter);
+	iter->current = NULL;
+	iter->exhausted = false;
+	if (iter->k_min > iter->k_max) {
+		iter->exhausted = true;
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	prime_level(iter, iter->k_min);
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status cds_ft_range_lookup_overlap(
 		struct cds_ft_range_iter *iter,
 		uint64_t q_a, uint64_t q_b,
 		uint64_t granularity)
 {
-	unsigned int k_min;
+	enum cds_ft_status s;
 
 	if (!iter)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -495,34 +602,239 @@ enum cds_ft_status cds_ft_range_lookup_overlap(
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 
-	release_level_iter(iter);
-	iter->q_a = q_a;
-	iter->q_b = q_b;
-	iter->granularity = granularity;
-	iter->current = NULL;
-	iter->exhausted = false;
+	iter->scan_strategy = CDS_FT_RANGE_SCAN_HALO;
+	iter->halo_q_a = q_a;
+	iter->halo_q_b = q_b;
+	iter->end_floor = q_a;
+	iter->end_ceil = UINT64_MAX;
+	iter->length_lo = granularity;
+	iter->length_hi = UINT64_MAX;
+	iter->k_min = min_level_for_granularity(granularity);
+	iter->k_max = CDS_FT_RANGE_NR_LEVELS - 1;
+	s = iter_begin(iter);
+	if (s != CDS_FT_STATUS_OK)
+		return s;
+	return advance_to_match(iter);
+}
 
-	k_min = min_level_for_granularity(granularity);
-	if (k_min >= CDS_FT_RANGE_NR_LEVELS) {
+enum cds_ft_status cds_ft_range_lookup_overlap_band(
+		struct cds_ft_range_iter *iter,
+		uint64_t q_a, uint64_t q_b,
+		uint64_t length_lo, uint64_t length_hi)
+{
+	enum cds_ft_status s;
+
+	if (!iter)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (q_b <= q_a || length_hi <= length_lo) {
+		iter->current = NULL;
+		iter->exhausted = true;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+
+	iter->scan_strategy = CDS_FT_RANGE_SCAN_HALO;
+	iter->halo_q_a = q_a;
+	iter->halo_q_b = q_b;
+	iter->end_floor = q_a;
+	iter->end_ceil = UINT64_MAX;
+	iter->length_lo = length_lo;
+	iter->length_hi = length_hi;
+	iter->k_min = min_level_for_granularity(length_lo);
+	iter->k_max = max_level_for_length_hi(length_hi);
+	s = iter_begin(iter);
+	if (s != CDS_FT_STATUS_OK)
+		return s;
+	return advance_to_match(iter);
+}
+
+/*
+ * Pan-classifier helpers.  Both viewports are assumed valid
+ * (q_b > q_a).
+ */
+static inline
+bool viewports_disjoint(uint64_t old_a, uint64_t old_b,
+		uint64_t new_a, uint64_t new_b)
+{
+	return new_a >= old_b || new_b <= old_a;
+}
+
+static inline
+bool is_pure_pan_right(uint64_t old_a, uint64_t old_b,
+		uint64_t new_a, uint64_t new_b)
+{
+	return new_a > old_a && new_b > old_b;
+}
+
+static inline
+bool is_pure_pan_left(uint64_t old_a, uint64_t old_b,
+		uint64_t new_a, uint64_t new_b)
+{
+	return new_a < old_a && new_b < old_b;
+}
+
+static inline
+bool viewport_contains(uint64_t outer_a, uint64_t outer_b,
+		uint64_t inner_a, uint64_t inner_b)
+{
+	return outer_a <= inner_a && outer_b >= inner_b;
+}
+
+enum cds_ft_status cds_ft_range_lookup_entering(
+		struct cds_ft_range_iter *iter,
+		uint64_t old_q_a, uint64_t old_q_b,
+		uint64_t new_q_a, uint64_t new_q_b,
+		uint64_t granularity)
+{
+	enum cds_ft_status s;
+
+	if (!iter)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (old_q_b <= old_q_a || new_q_b <= new_q_a) {
+		iter->current = NULL;
+		iter->exhausted = true;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	/*
+	 * NEW subset of OLD (including identity): nothing entering.
+	 * "subset" here means new_q_a >= old_q_a AND new_q_b <= old_q_b.
+	 */
+	if (viewport_contains(old_q_a, old_q_b, new_q_a, new_q_b)) {
+		iter->current = NULL;
 		iter->exhausted = true;
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
+	/* No overlap: entering = full new viewport. */
+	if (viewports_disjoint(old_q_a, old_q_b, new_q_a, new_q_b))
+		return cds_ft_range_lookup_overlap(iter,
+			new_q_a, new_q_b, granularity);
 
+	if (is_pure_pan_right(old_q_a, old_q_b, new_q_a, new_q_b)) {
+		/*
+		 * Entering: start in [old_q_b, new_q_b),
+		 * end > new_q_a, length >= g.
+		 */
+		iter->scan_strategy = CDS_FT_RANGE_SCAN_FIXED;
+		iter->scan_start_lo = old_q_b;
+		iter->scan_start_hi = new_q_b;
+		iter->end_floor = new_q_a;
+		iter->end_ceil = UINT64_MAX;
+		iter->length_lo = granularity;
+		iter->length_hi = UINT64_MAX;
+		iter->k_min = min_level_for_granularity(granularity);
+		iter->k_max = CDS_FT_RANGE_NR_LEVELS - 1;
+		s = iter_begin(iter);
+		if (s != CDS_FT_STATUS_OK)
+			return s;
+		return advance_to_match(iter);
+	}
+	if (is_pure_pan_left(old_q_a, old_q_b, new_q_a, new_q_b)) {
+		/*
+		 * Entering: end in (new_q_a, old_q_a], start < new_q_b,
+		 * length >= g.  Pan-left with overlap implies new_q_b >
+		 * old_q_a, so any range with start < old_q_a satisfies
+		 * start < new_q_b automatically.  We use a halo-style
+		 * scan over the leading strip [new_q_a, old_q_a).
+		 */
+		iter->scan_strategy = CDS_FT_RANGE_SCAN_HALO;
+		iter->halo_q_a = new_q_a;
+		iter->halo_q_b = old_q_a;
+		iter->end_floor = new_q_a;
+		iter->end_ceil = old_q_a;
+		iter->length_lo = granularity;
+		iter->length_hi = UINT64_MAX;
+		iter->k_min = min_level_for_granularity(granularity);
+		iter->k_max = CDS_FT_RANGE_NR_LEVELS - 1;
+		s = iter_begin(iter);
+		if (s != CDS_FT_STATUS_OK)
+			return s;
+		return advance_to_match(iter);
+	}
 	/*
-	 * Position at the level-(k_min - 1) -> k_min boundary. The
-	 * advance_to_match() loop starts by walking chain_pos (NULL,
-	 * so skips), then tries advancing the trie iter (NULL, so
-	 * goes to next_level) which increments iter->level. Set up so
-	 * the first level visited is k_min.
+	 * Mixed transition (e.g., widening or shifted-and-resized):
+	 * fall back to a full re-query of NEW.  Caller can compose
+	 * two delta calls explicitly if it needs the cheap path.
 	 */
-	iter->level = (k_min == 0) ? UINT_MAX : (k_min - 1);
-	/*
-	 * If k_min is 0, we want next_level to land on 0. The do/while
-	 * in advance_to_match increments first, so set level to "below
-	 * 0" using underflow on unsigned: UINT_MAX -> 0 after ++.
-	 */
+	return cds_ft_range_lookup_overlap(iter,
+		new_q_a, new_q_b, granularity);
+}
 
-	return advance_to_match(iter);
+enum cds_ft_status cds_ft_range_lookup_leaving(
+		struct cds_ft_range_iter *iter,
+		uint64_t old_q_a, uint64_t old_q_b,
+		uint64_t new_q_a, uint64_t new_q_b,
+		uint64_t granularity)
+{
+	enum cds_ft_status s;
+
+	if (!iter)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (old_q_b <= old_q_a || new_q_b <= new_q_a) {
+		iter->current = NULL;
+		iter->exhausted = true;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	/* OLD subset of NEW (including identity): nothing leaving. */
+	if (viewport_contains(new_q_a, new_q_b, old_q_a, old_q_b)) {
+		iter->current = NULL;
+		iter->exhausted = true;
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	/* No overlap: leaving = full old viewport. */
+	if (viewports_disjoint(old_q_a, old_q_b, new_q_a, new_q_b))
+		return cds_ft_range_lookup_overlap(iter,
+			old_q_a, old_q_b, granularity);
+
+	if (is_pure_pan_right(old_q_a, old_q_b, new_q_a, new_q_b)) {
+		/*
+		 * Leaving: end in (old_q_a, new_q_a], start < old_q_b,
+		 * length >= g.  Pan-right with overlap implies new_q_a <
+		 * old_q_b, so any range whose end <= new_q_a and was in
+		 * OLD has start < old_q_b automatically (start <= end-1
+		 * < new_q_a < old_q_b).  Halo-scan the leading strip
+		 * [old_q_a, new_q_a) and bound end <= new_q_a.
+		 */
+		iter->scan_strategy = CDS_FT_RANGE_SCAN_HALO;
+		iter->halo_q_a = old_q_a;
+		iter->halo_q_b = new_q_a;
+		iter->end_floor = old_q_a;
+		iter->end_ceil = new_q_a;
+		iter->length_lo = granularity;
+		iter->length_hi = UINT64_MAX;
+		iter->k_min = min_level_for_granularity(granularity);
+		iter->k_max = CDS_FT_RANGE_NR_LEVELS - 1;
+		s = iter_begin(iter);
+		if (s != CDS_FT_STATUS_OK)
+			return s;
+		return advance_to_match(iter);
+	}
+	if (is_pure_pan_left(old_q_a, old_q_b, new_q_a, new_q_b)) {
+		/*
+		 * Leaving: start in [new_q_b, old_q_b), end > old_q_a,
+		 * length >= g.
+		 */
+		iter->scan_strategy = CDS_FT_RANGE_SCAN_FIXED;
+		iter->scan_start_lo = new_q_b;
+		iter->scan_start_hi = old_q_b;
+		iter->end_floor = old_q_a;
+		iter->end_ceil = UINT64_MAX;
+		iter->length_lo = granularity;
+		iter->length_hi = UINT64_MAX;
+		iter->k_min = min_level_for_granularity(granularity);
+		iter->k_max = CDS_FT_RANGE_NR_LEVELS - 1;
+		s = iter_begin(iter);
+		if (s != CDS_FT_STATUS_OK)
+			return s;
+		return advance_to_match(iter);
+	}
+	/*
+	 * Mixed transition (e.g., shrinking): fall back to a full
+	 * re-query of OLD.  This may include ranges that ARE in NEW;
+	 * callers that need a precise leaving-only set should filter
+	 * the result against NEW client-side or compose two delta
+	 * calls.
+	 */
+	return cds_ft_range_lookup_overlap(iter,
+		old_q_a, old_q_b, granularity);
 }
 
 enum cds_ft_status cds_ft_range_iter_next(struct cds_ft_range_iter *iter)
