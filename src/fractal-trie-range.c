@@ -617,6 +617,21 @@ enum cds_ft_status cds_ft_range_lookup_overlap(
 	return advance_to_match(iter);
 }
 
+enum cds_ft_status cds_ft_range_lookup_stab(
+		struct cds_ft_range_iter *iter,
+		uint64_t x, uint64_t granularity)
+{
+	if (!iter)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (x == UINT64_MAX) {
+		/* No range can have end > UINT64_MAX. */
+		iter->current = NULL;
+		iter->exhausted = true;
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	return cds_ft_range_lookup_overlap(iter, x, x + 1, granularity);
+}
+
 enum cds_ft_status cds_ft_range_lookup_overlap_band(
 		struct cds_ft_range_iter *iter,
 		uint64_t q_a, uint64_t q_b,

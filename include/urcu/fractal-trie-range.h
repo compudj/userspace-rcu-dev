@@ -256,6 +256,26 @@ enum cds_ft_status cds_ft_range_lookup_overlap(
 		uint64_t granularity);
 
 /*
+ * cds_ft_range_lookup_stab - Position the iterator at the first
+ *     range covering point @x with length >= @granularity.
+ *     Predicate: start <= x AND end > x AND L >= g.
+ * @iter: The iterator.
+ * @x: Stabbing point.
+ * @granularity: Minimum range length to return. Pass 0 to disable
+ *     culling.
+ *
+ * Convenience for hit-test / cursor-at-point queries; equivalent to
+ * cds_ft_range_lookup_overlap(iter, x, x + 1, granularity), with a
+ * NOT_FOUND short-circuit when x = UINT64_MAX (no range can have
+ * end > UINT64_MAX).
+ *
+ * Same RCU locking discipline as cds_ft_range_lookup_overlap().
+ */
+enum cds_ft_status cds_ft_range_lookup_stab(
+		struct cds_ft_range_iter *iter,
+		uint64_t x, uint64_t granularity);
+
+/*
  * cds_ft_range_lookup_overlap_band - Position the iterator at the
  *     first range overlapping [q_a, q_b) with length in
  *     [length_lo, length_hi).
