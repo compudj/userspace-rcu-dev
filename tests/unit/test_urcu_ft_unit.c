@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 176
+#define NR_TESTS 190
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -12868,6 +12868,863 @@ static int test_excl_validate_concurrent_reader_writer_no_rcu(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*                  19. cds_ft_merge tests                            */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Helper used by merge tests: collect every (key, node) pair reachable
+ * in @ft and verify they exactly match an expected list of keys.
+ */
+struct merge_expected {
+	const char *key;
+	size_t key_len;
+};
+
+static int verify_keys_present(struct cds_ft *ft,
+		const struct merge_expected *exp, unsigned int nr_exp)
+{
+	unsigned int i;
+	int ret = 0;
+
+	rcu_read_lock();
+	if (cds_ft_count_entries(ft) != nr_exp) {
+		fprintf(stderr, "verify_keys_present: count %lu != expected %u\n",
+			cds_ft_count_entries(ft), nr_exp);
+		ret = -1;
+		goto out;
+	}
+	for (i = 0; i < nr_exp; i++) {
+		struct cds_ft_node *found = NULL;
+		enum cds_ft_status s;
+
+		s = cds_ft_lookup_key(ft, (const uint8_t *) exp[i].key,
+				exp[i].key_len, &found);
+		if (s != CDS_FT_STATUS_OK || !found) {
+			fprintf(stderr, "verify_keys_present: missing '%.*s'\n",
+				(int) exp[i].key_len, exp[i].key);
+			ret = -1;
+			goto out;
+		}
+	}
+out:
+	rcu_read_unlock();
+	return ret;
+}
+
+/*
+ * Merge with a disjoint LCP: src has all keys under prefix "z", dst
+ * has none.  Triggers the detach+graft fast path.  After merge, dst
+ * must contain its original keys plus src's keys, byte-identical to
+ * what was inserted.
+ */
+static int test_merge_disjoint_prefix_fast_path(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	const struct merge_expected expected[] = {
+		{ "alpha", 5 }, { "beta", 4 },
+		{ "zaa", 3 }, { "zab", 3 }, { "zac", 3 },
+	};
+	unsigned int i;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < 2; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(dst, (const uint8_t *) expected[i].key,
+				expected[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	for (i = 2; i < 5; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(src, (const uint8_t *) expected[i].key,
+				expected[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge(dst, NULL, 0, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_disjoint_prefix: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_disjoint_prefix: src not empty\n");
+		goto out;
+	}
+	if (verify_keys_present(dst, expected, 5) < 0)
+		goto out;
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Merge where dst has content under src's LCP: forces the per-entry
+ * fallback.  Verifies that all keys end up in dst with original bytes.
+ */
+static int test_merge_overlapping_per_entry(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	const struct merge_expected expected[] = {
+		{ "k01", 3 }, { "k03", 3 }, { "k05", 3 },	/* dst */
+		{ "k02", 3 }, { "k04", 3 }, { "k06", 3 },	/* src */
+	};
+	unsigned int i;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < 3; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(dst, (const uint8_t *) expected[i].key,
+				expected[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	for (i = 3; i < 6; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(src, (const uint8_t *) expected[i].key,
+				expected[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge(dst, NULL, 0, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_overlapping: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_overlapping: src not empty\n");
+		goto out;
+	}
+	if (verify_keys_present(dst, expected, 6) < 0)
+		goto out;
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Merge with an empty src: no-op, dst unchanged.
+ */
+static int test_merge_empty_source(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct ft_test_node *n;
+	enum cds_ft_status s;
+	int ret = -1;
+	unsigned long count_before, count_after;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	n = node_alloc(0);
+	s = cds_ft_insert(dst, (const uint8_t *)"keep", 4, &n->node);
+	if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+
+	rcu_read_lock();
+	count_before = cds_ft_count_entries(dst);
+	rcu_read_unlock();
+
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge(dst, NULL, 0, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_empty_source: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	rcu_read_lock();
+	count_after = cds_ft_count_entries(dst);
+	rcu_read_unlock();
+	if (count_before != count_after) {
+		fprintf(stderr, "merge_empty_source: count changed %lu→%lu\n",
+			count_before, count_after);
+		goto out;
+	}
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Merge with LCP=0 + dst empty: root-level graft fast path.
+ */
+static int test_merge_at_root_empty_dst(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	const struct merge_expected expected[] = {
+		{ "alpha", 5 }, { "beta", 4 }, { "gamma", 5 },
+	};
+	unsigned int i;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < 3; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(src, (const uint8_t *) expected[i].key,
+				expected[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge(dst, NULL, 0, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_root_empty_dst: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_at_root_empty_dst: src not empty\n");
+		goto out;
+	}
+	if (verify_keys_present(dst, expected, 3) < 0)
+		goto out;
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Merge with duplicate chains in src: every duplicate must end up in
+ * dst at the same key.
+ */
+static int test_merge_duplicate_chains(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	int ret = -1;
+	unsigned int i, count;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	/* 5 duplicates at key "dup" in src. */
+	for (i = 0; i < 5; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		n->value = i;
+		s = cds_ft_insert(src, (const uint8_t *)"dup", 3, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge(dst, NULL, 0, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_duplicate_chains: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_duplicate_chains: src not empty\n");
+		goto out;
+	}
+
+	if (cds_ft_iter_create(dst, &iter) != CDS_FT_STATUS_OK)
+		goto out;
+	rcu_read_lock();
+	s = cds_ft_lookup_key(dst, (const uint8_t *)"dup", 3, &found);
+	count = 0;
+	if (s == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *p;
+		cds_ft_for_each_duplicate_safe_rcu(found, p)
+			count++;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	if (count != 5) {
+		fprintf(stderr, "merge_duplicate_chains: %u dups, expected 5\n",
+			count);
+		goto out;
+	}
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Argument validation: NULL, dst == src, mismatched groups,
+ * out-of-range key_len all return INVALID_ARGUMENT_ERROR.
+ *
+ * Non-exclusive src is now accepted (the implementation detaches
+ * @key first, which yields an exclusive transient regardless of
+ * src's mode), so it is no longer a rejected case.
+ */
+static int test_merge_invalid_arguments(void)
+{
+	struct cds_ft_group *group1, *group2;
+	struct cds_ft *ft1a, *ft1b, *ft2;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	ft1a = create_varlen_ft(&group1);
+	if (cds_ft_create(group1, NULL, &ft1b) < 0)
+		goto out_ft1a;
+	ft2 = create_varlen_ft(&group2);
+
+	s = cds_ft_merge(NULL, NULL, 0, ft1b);
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) goto out;
+	s = cds_ft_merge(ft1a, NULL, 0, NULL);
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) goto out;
+	s = cds_ft_merge(ft1a, NULL, 0, ft1a);
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) goto out;
+	s = cds_ft_merge(ft1a, NULL, 0, ft2);
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) goto out;
+
+	ret = 0;
+out:
+	cds_ft_destroy(ft2);
+	cds_ft_group_destroy(group2);
+	cds_ft_destroy(ft1b);
+out_ft1a:
+	cds_ft_destroy(ft1a);
+	cds_ft_group_destroy(group1);
+	return ret;
+}
+
+/*
+ * Merge from a concurrent (non-exclusive) src trie.  The new
+ * detach-first design accepts this because the initial detach
+ * drains src's RCU readers and produces an exclusive transient
+ * for the rest of the merge.
+ */
+static int test_merge_concurrent_source(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	const struct merge_expected expected[] = {
+		{ "k1", 2 }, { "k2", 2 }, { "k3", 2 },
+	};
+	unsigned int i;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	/* src stays in concurrent (default) mode — no make_exclusive. */
+	for (i = 0; i < 3; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(src, (const uint8_t *) expected[i].key,
+				expected[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	if (cds_ft_is_exclusive(src)) {
+		fprintf(stderr, "merge_concurrent_source: src expected concurrent\n");
+		goto out;
+	}
+
+	s = cds_ft_merge(dst, NULL, 0, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_concurrent_source: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_concurrent_source: src not empty\n");
+		goto out;
+	}
+	if (verify_keys_present(dst, expected, 3) < 0)
+		goto out;
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Prefix-scoped merge: src has keys both inside and outside the
+ * @key prefix.  Only keys under @key are moved to dst.  src keys
+ * outside @key remain untouched.
+ */
+static int test_merge_prefix_subtree(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	const struct merge_expected src_keys[] = {
+		{ "z01", 3 }, { "z02", 3 }, { "z03", 3 },	/* moved */
+		{ "alpha", 5 }, { "beta", 4 },			/* stay  */
+	};
+	const struct merge_expected dst_after[] = {
+		{ "z01", 3 }, { "z02", 3 }, { "z03", 3 },
+	};
+	const struct merge_expected src_after[] = {
+		{ "alpha", 5 }, { "beta", 4 },
+	};
+	unsigned int i;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < 5; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(src, (const uint8_t *) src_keys[i].key,
+				src_keys[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge(dst, (const uint8_t *)"z", 1, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_prefix_subtree: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (verify_keys_present(dst, dst_after, 3) < 0)
+		goto out;
+	if (verify_keys_present(src, src_after, 2) < 0)
+		goto out;
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Fixed-length merge fast path: src has 4-byte integer keys all
+ * sharing a leading byte, dst has none.  The internal detach+graft
+ * helpers (which skip the public API's fixed-length-vs-non-root
+ * rejection) move src as a sub-trie at the LCP.
+ */
+static int test_merge_fixed_length_fast_path(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	uint64_t i;
+	unsigned long count;
+
+	dst = create_fixed_ft(4, &group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	/* Insert dst keys in the 0x00.. range. */
+	for (i = 0; i < 5; i++) {
+		struct ft_test_node *n = node_alloc(i);
+		uint8_t k[4];
+		cds_ft_u64_to_key(dst, i, k, CDS_FT_LEN_DEFAULT);
+		s = cds_ft_insert(dst, k, 4, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	/* Insert src keys in the 0xff.. range — disjoint from dst. */
+	for (i = 0; i < 5; i++) {
+		uint64_t v = 0xff000000ull | i;
+		struct ft_test_node *n = node_alloc(v);
+		uint8_t k[4];
+		cds_ft_u64_to_key(src, v, k, CDS_FT_LEN_DEFAULT);
+		s = cds_ft_insert(src, k, 4, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge(dst, NULL, 0, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_fixed_length_fast_path: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_fixed_length_fast_path: src not empty\n");
+		goto out;
+	}
+	rcu_read_lock();
+	count = cds_ft_count_entries(dst);
+	rcu_read_unlock();
+	if (count != 10) {
+		fprintf(stderr, "merge_fixed_length_fast_path: count=%lu, expected 10\n",
+			count);
+		goto out;
+	}
+	/* Verify each src key landed in dst with original byte value. */
+	for (i = 0; i < 5; i++) {
+		uint64_t v = 0xff000000ull | i;
+		struct cds_ft_node *found = NULL;
+
+		rcu_read_lock();
+		s = lookup_u64(dst, v, &found);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK || !found) {
+			fprintf(stderr, "merge_fixed_length_fast_path: missing 0x%lx\n",
+				(unsigned long) v);
+			goto out;
+		}
+	}
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Merge-at-key with overlap: src has keys under @key, dst already has
+ * overlapping keys under the same @key.  Forces the per-entry
+ * fallback (scoped to @key).  src keys outside @key remain.
+ */
+static int test_merge_prefix_overlap_per_entry(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	unsigned int i;
+	const struct merge_expected dst_after[] = {
+		{ "p01", 3 }, { "p02", 3 }, { "p03", 3 },
+		{ "p04", 3 }, { "p05", 3 }, { "p06", 3 },
+	};
+	const struct merge_expected src_after[] = {
+		{ "outside", 7 },
+	};
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	/* dst gets p01, p03, p05; src gets p02, p04, p06 + "outside". */
+	for (i = 0; i < 6; i += 2) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(dst, (const uint8_t *) dst_after[i].key,
+				dst_after[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	for (i = 1; i < 6; i += 2) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(src, (const uint8_t *) dst_after[i].key,
+				dst_after[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	{
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(src, (const uint8_t *)"outside", 7, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge(dst, (const uint8_t *)"p", 1, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_prefix_overlap: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (verify_keys_present(dst, dst_after, 6) < 0)
+		goto out;
+	if (verify_keys_present(src, src_after, 1) < 0)
+		goto out;
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Cross-key merge on a variable-length group: src has keys under
+ * "src/", merged into dst under "dst/".  Each src key K = "src/X"
+ * lands in dst as "dst/X".  src keys outside "src/" are left.
+ */
+static int test_merge_at_varlen_rekey(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	const struct merge_expected src_keys[] = {
+		{ "src/a", 5 }, { "src/b", 5 }, { "src/c", 5 },
+		{ "elsewhere", 9 },
+	};
+	const struct merge_expected dst_after[] = {
+		{ "dst/a", 5 }, { "dst/b", 5 }, { "dst/c", 5 },
+	};
+	const struct merge_expected src_after[] = {
+		{ "elsewhere", 9 },
+	};
+	unsigned int i;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < 4; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(src, (const uint8_t *) src_keys[i].key,
+				src_keys[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	s = cds_ft_merge_at(dst,
+			(const uint8_t *)"dst/", 4,
+			src,
+			(const uint8_t *)"src/", 4);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_varlen_rekey: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (verify_keys_present(dst, dst_after, 3) < 0)
+		goto out;
+	if (verify_keys_present(src, src_after, 1) < 0)
+		goto out;
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Cross-key merge on a fixed-length group: 4-byte keys, src_key and
+ * dst_key both 1 byte (same length, as required for fixed-length).
+ * Src has keys under leading byte 0x10, merged into dst under
+ * leading byte 0x20.  Verifies that fixed-length groups can do
+ * cross-key merges (which the public detach+graft pair cannot).
+ */
+static int test_merge_at_fixed_rekey(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	uint8_t src_prefix = 0x10, dst_prefix = 0x20;
+	uint64_t i;
+
+	dst = create_fixed_ft(4, &group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < 5; i++) {
+		uint64_t v = ((uint64_t) src_prefix << 24) | i;
+		struct ft_test_node *n = node_alloc(v);
+		uint8_t k[4];
+		cds_ft_u64_to_key(src, v, k, CDS_FT_LEN_DEFAULT);
+		s = cds_ft_insert(src, k, 4, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	s = cds_ft_merge_at(dst,
+			&dst_prefix, 1,
+			src,
+			&src_prefix, 1);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_fixed_rekey: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_at_fixed_rekey: src not empty\n");
+		goto out;
+	}
+	for (i = 0; i < 5; i++) {
+		uint64_t v = ((uint64_t) dst_prefix << 24) | i;
+		struct cds_ft_node *found = NULL;
+
+		rcu_read_lock();
+		s = lookup_u64(dst, v, &found);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK || !found) {
+			fprintf(stderr, "merge_at_fixed_rekey: missing dst 0x%lx\n",
+				(unsigned long) v);
+			goto out;
+		}
+	}
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Cross-key merge with overlap: dst already has content under
+ * dst_key.  Per-entry fallback engages.
+ */
+static int test_merge_at_overlap(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	const struct merge_expected dst_pre[] = {
+		{ "dst/x", 5 },
+	};
+	const struct merge_expected src_pre[] = {
+		{ "src/a", 5 }, { "src/b", 5 },
+	};
+	const struct merge_expected dst_after[] = {
+		{ "dst/x", 5 }, { "dst/a", 5 }, { "dst/b", 5 },
+	};
+	unsigned int i;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < 1; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(dst, (const uint8_t *) dst_pre[i].key,
+				dst_pre[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	for (i = 0; i < 2; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		s = cds_ft_insert(src, (const uint8_t *) src_pre[i].key,
+				src_pre[i].key_len, &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	s = cds_ft_merge_at(dst,
+			(const uint8_t *)"dst/", 4,
+			src,
+			(const uint8_t *)"src/", 4);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_overlap: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_at_overlap: src not empty\n");
+		goto out;
+	}
+	if (verify_keys_present(dst, dst_after, 3) < 0)
+		goto out;
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Fixed-length group rejects cross-key merge with mismatched key
+ * lengths.
+ */
+static int test_merge_at_fixed_unequal_keylen(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	uint8_t a = 0x10, b[2] = { 0x20, 0x21 };
+	int ret = -1;
+
+	dst = create_fixed_ft(4, &group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	s = cds_ft_merge_at(dst, b, 2, src, &a, 1);
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "merge_at_fixed_unequal_keylen: expected INVALID, got %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	ret = 0;
+out:
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -13123,6 +13980,23 @@ int main(int argc, char **argv)
 	RUN_TEST(test_excl_validate_writer_writer);
 	RUN_TEST(test_excl_validate_excl_reader_writer);
 	RUN_TEST(test_excl_validate_concurrent_reader_writer_no_rcu);
+
+	/* 19. cds_ft_merge tests */
+	diag("cds_ft_merge tests");
+	RUN_TEST(test_merge_disjoint_prefix_fast_path);
+	RUN_TEST(test_merge_overlapping_per_entry);
+	RUN_TEST(test_merge_empty_source);
+	RUN_TEST(test_merge_at_root_empty_dst);
+	RUN_TEST(test_merge_duplicate_chains);
+	RUN_TEST(test_merge_invalid_arguments);
+	RUN_TEST(test_merge_concurrent_source);
+	RUN_TEST(test_merge_prefix_subtree);
+	RUN_TEST(test_merge_fixed_length_fast_path);
+	RUN_TEST(test_merge_prefix_overlap_per_entry);
+	RUN_TEST(test_merge_at_varlen_rekey);
+	RUN_TEST(test_merge_at_fixed_rekey);
+	RUN_TEST(test_merge_at_overlap);
+	RUN_TEST(test_merge_at_fixed_unequal_keylen);
 
 	rcu_barrier();
 	rcu_unregister_thread();

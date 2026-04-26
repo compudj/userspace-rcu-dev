@@ -14649,44 +14649,35 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
-		const uint8_t *_key, size_t _key_len,
+/*
+ * ft_graft_keylen - Internal graft helper.
+ *
+ * Identical to cds_ft_graft except that:
+ *   - @key_len is already resolved into bytes (no CDS_FT_LEN_DEFAULT).
+ *   - The fixed-length-vs-non-root rejection is NOT performed.  This
+ *     lets cds_ft_merge use a sub-prefix graft on fixed-length groups
+ *     when paired with a matching ft_detach_keylen at the same prefix
+ *     (the intermediate stripped-key state is purely internal and
+ *     never visible to the caller).
+ *   - Argument NULL/group/self checks and the FT_TP_KEY/FT_TP
+ *     tracepoints are the public wrapper's responsibility.
+ *
+ * All other validation (overflow, memory, src empty) and the full
+ * structural body — root-level swap or descent + ft_store_at_graft_point
+ * + density propagation — are performed here, so this helper is the
+ * single source of truth for what graft actually does.
+ */
+static
+enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
+		const uint8_t *_key, size_t key_len,
 		struct cds_ft *src_ft)
 {
 	struct cds_ft_metadata *src_rmeta;
-	size_t key_len, src_max;
+	size_t src_max;
 	enum cds_ft_status status;
-
-	FT_TP_KEY(graft_enter, dst_ft, _key, _key_len);
-
-	if (!dst_ft || !src_ft || dst_ft == src_ft) {
-		FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	}
-	if (dst_ft->group != src_ft->group) {
-		FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	}
 
 	CDS_FT_SCOPED_WRITER(dst_ft);
 	CDS_FT_SCOPED_WRITER(src_ft);
-
-	/*
-	 * Root-level graft (key_len == 0) is valid for both
-	 * variable-length and fixed-length groups: it swaps the entire
-	 * root, so no key-length constraint applies.  Bypass
-	 * ft_key_len() which would reject 0 != fixed_len.
-	 */
-	if (_key_len == 0) {
-		key_len = 0;
-	} else {
-		key_len = ft_key_len(dst_ft, _key_len);
-		if (!valid_key_len(dst_ft, key_len) ||
-				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE) {
-			FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
-			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-		}
-	}
 
 	const struct cds_ft_key_map *km = &dst_ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
@@ -14700,22 +14691,16 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 	}
 
 	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
-	if (key_len > 0 && src_max > dst_ft->group->max_key_len - key_len) {
-		FT_TP(graft_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
+	if (key_len > 0 && src_max > dst_ft->group->max_key_len - key_len)
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	}
-	if (ft_density_pool_ensure(dst_ft, FT_MAX_DEPTH)) {
-		FT_TP(graft_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
+	if (ft_density_pool_ensure(dst_ft, FT_MAX_DEPTH))
 		return CDS_FT_STATUS_MEMORY_ERROR;
-	}
 
 	src_rmeta = ft_root_metadata(src_ft);
 
 	/* Check if source trie is empty. */
-	if (src_rmeta->nr_child == 0 && !src_rmeta->external_nodes) {
-		FT_TP(graft_exit, (int) CDS_FT_STATUS_OK);
+	if (src_rmeta->nr_child == 0 && !src_rmeta->external_nodes)
 		return CDS_FT_STATUS_OK;
-	}
 
 	if (key_len == 0) {
 		struct cds_ft_metadata *dst_rmeta = ft_root_metadata(dst_ft);
@@ -14723,20 +14708,16 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		struct cds_ft_metadata *fresh_meta;
 
 		/* Destination must be empty for a root-level graft. */
-		if (dst_rmeta->nr_child != 0 || dst_rmeta->external_nodes) {
-			FT_TP(graft_exit, (int) CDS_FT_STATUS_POPULATED_ERROR);
+		if (dst_rmeta->nr_child != 0 || dst_rmeta->external_nodes)
 			return CDS_FT_STATUS_POPULATED_ERROR;
-		}
 
 		/*
 		 * Allocate a fresh empty root for the source before
 		 * swapping, so the source remains a valid trie.
 		 */
 		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], &fresh_meta);
-		if (!fresh_root) {
-			FT_TP(graft_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
+		if (!fresh_root)
 			return CDS_FT_STATUS_MEMORY_ERROR;
-		}
 
 		/*
 		 * Root-level graft: the source's root becomes the
@@ -14773,10 +14754,8 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 * on memory shortage instead of calling abort().
 		 */
 		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
-		if (!fresh_node) {
-			FT_TP(graft_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
+		if (!fresh_node)
 			return CDS_FT_STATUS_MEMORY_ERROR;
-		}
 
 		ft_descend_to_graft_point(dst_ft, key, key_len, &d,
 				graft_snapshot, graft_snapshot_depth,
@@ -14835,7 +14814,6 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 			if (!src_ft->exclusive)
 				src_ft->group->flavor->update_synchronize_rcu();
 			free_cds_ft_node(src_ft, fresh_node);
-			FT_TP(graft_exit, (int) status);
 			return status;
 		}
 
@@ -14878,8 +14856,47 @@ done:
 	if (key_len > 0)
 		ft_check_collapse_on_path(dst_ft, key, key_len);
 #endif
-	FT_TP(graft_exit, (int) CDS_FT_STATUS_OK);
 	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
+		const uint8_t *_key, size_t _key_len,
+		struct cds_ft *src_ft)
+{
+	size_t key_len;
+	enum cds_ft_status status;
+
+	FT_TP_KEY(graft_enter, dst_ft, _key, _key_len);
+
+	if (!dst_ft || !src_ft || dst_ft == src_ft) {
+		FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	if (dst_ft->group != src_ft->group) {
+		FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+
+	/*
+	 * Root-level graft (key_len == 0) is valid for both
+	 * variable-length and fixed-length groups: it swaps the entire
+	 * root, so no key-length constraint applies.  Bypass
+	 * ft_key_len() which would reject 0 != fixed_len.
+	 */
+	if (_key_len == 0) {
+		key_len = 0;
+	} else {
+		key_len = ft_key_len(dst_ft, _key_len);
+		if (!valid_key_len(dst_ft, key_len) ||
+				dst_ft->group->key_len != CDS_FT_LEN_VARIABLE) {
+			FT_TP(graft_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		}
+	}
+
+	status = ft_graft_keylen(dst_ft, _key, key_len, src_ft);
+	FT_TP(graft_exit, (int) status);
+	return status;
 }
 
 enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
@@ -15386,40 +15403,34 @@ enum cds_ft_status ft_detach_descent_collapsed(struct cds_ft *ft,
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
-		const uint8_t *_key, size_t _key_len,
+/*
+ * ft_detach_keylen - Internal detach helper.
+ *
+ * Identical to cds_ft_detach except that:
+ *   - @key_len is already resolved into bytes (no CDS_FT_LEN_DEFAULT).
+ *   - The fixed-length-vs-non-root rejection is NOT performed.  See
+ *     ft_graft_keylen for the merge use case that motivates this.
+ *   - Argument NULL check and the FT_TP_KEY/FT_TP tracepoints are
+ *     the public wrapper's responsibility.
+ *
+ * The detached subtree handle returned for non-root detach in a
+ * fixed-length group has keys shorter than the group's fixed length;
+ * it is therefore an internal-use-only handle and must be re-grafted
+ * (via ft_graft_keylen at the same prefix) before any public API
+ * consumer interacts with it.
+ */
+static
+enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
+		const uint8_t *_key, size_t key_len,
 		struct cds_ft **result_ft)
 {
 	struct cds_ft *detached;
 	struct cds_ft_inode_flag *child;
-	size_t key_len;
 	enum cds_ft_status status;
-
-	FT_TP_KEY(detach_enter, ft, _key, _key_len);
 
 	*result_ft = NULL;
 
-	if (!ft) {
-		FT_TP(detach_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	}
-
 	CDS_FT_SCOPED_WRITER(ft);
-
-	/*
-	 * Root-level detach (key_len == 0) is valid for both
-	 * variable-length and fixed-length groups.  See cds_ft_graft.
-	 */
-	if (_key_len == 0) {
-		key_len = 0;
-	} else {
-		key_len = ft_key_len(ft, _key_len);
-		if (!valid_key_len(ft, key_len) ||
-				ft->group->key_len != CDS_FT_LEN_VARIABLE) {
-			FT_TP(detach_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
-			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-		}
-	}
 
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
@@ -15432,10 +15443,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		key = ordinal_buf;
 	}
 
-	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH)) {
-		FT_TP(detach_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
+	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH))
 		return CDS_FT_STATUS_MEMORY_ERROR;
-	}
 
 	if (key_len == 0) {
 		struct cds_ft_metadata *rmeta = ft_root_metadata(ft);
@@ -15443,16 +15452,12 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		struct cds_ft_metadata *fresh_meta;
 
 		/* Check if source trie is empty. */
-		if (rmeta->nr_child == 0 && !rmeta->external_nodes) {
-			FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+		if (rmeta->nr_child == 0 && !rmeta->external_nodes)
 			return CDS_FT_STATUS_NOT_FOUND;
-		}
 
 		status = cds_ft_create(ft->group, NULL, &detached);
-		if (status != CDS_FT_STATUS_OK) {
-			FT_TP(detach_exit, (int) status);
+		if (status != CDS_FT_STATUS_OK)
 			return status;
-		}
 		/*
 		 * The detached trie is returned exclusive: no external
 		 * handle to @detached existed before this call, so no
@@ -15471,7 +15476,6 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		fresh_node = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
 		if (!fresh_node) {
 			cds_ft_destroy(detached);
-			FT_TP(detach_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 
@@ -15507,7 +15511,6 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
 		*result_ft = detached;
-		FT_TP(detach_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
 
@@ -15525,14 +15528,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			uint8_t kv;
 			const struct cds_ft_metadata *meta;
 
-			if (!ft_node_ptr(dd.d.nf)) {
-				FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+			if (!ft_node_ptr(dd.d.nf))
 				return CDS_FT_STATUS_NOT_FOUND;
-			}
-			if (ft_node_external(dd.d.nf)) {
-				FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+			if (ft_node_external(dd.d.nf))
 				return CDS_FT_STATUS_NOT_FOUND;
-			}
 			if (ft_node_compressed(dd.d.nf)) {
 				struct cds_ft_compressed_node *cn =
 					ft_compressed_node_ptr(dd.d.nf);
@@ -15553,10 +15552,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 				s = ft_detach_descent_collapsed(ft, &dd, &ik,
 						key_len);
-				if (s != CDS_FT_STATUS_OK) {
-					FT_TP(detach_exit, (int) s);
+				if (s != CDS_FT_STATUS_OK)
 					return s;
-				}
 				continue;
 			}
 
@@ -15569,10 +15566,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 
 		child = dd.d.nf;
 
-		if (!ft_node_ptr(child)) {
-			FT_TP(detach_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+		if (!ft_node_ptr(child))
 			return CDS_FT_STATUS_NOT_FOUND;
-		}
 
 		/*
 		 * Compute the external node count of the subtree
@@ -15591,10 +15586,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 			}
 
 			status = cds_ft_create(ft->group, NULL, &detached);
-			if (status != CDS_FT_STATUS_OK) {
-				FT_TP(detach_exit, (int) status);
+			if (status != CDS_FT_STATUS_OK)
 				return status;
-			}
 			/*
 			 * The detached trie is returned exclusive: the
 			 * synchronize_rcu below drains in-flight readers of
@@ -15634,7 +15627,6 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 						dd.d.pnf,
 						(long) detached_count);
 					cds_ft_destroy(detached);
-					FT_TP(detach_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
 			}
@@ -15721,9 +15713,221 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 #ifdef FEATURE_FT_COLLAPSE
 		ft_check_collapse_on_path(ft, key, key_len);
 #endif
-		FT_TP(detach_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
+}
+
+enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
+		const uint8_t *_key, size_t _key_len,
+		struct cds_ft **result_ft)
+{
+	size_t key_len;
+	enum cds_ft_status status;
+
+	FT_TP_KEY(detach_enter, ft, _key, _key_len);
+
+	*result_ft = NULL;
+
+	if (!ft) {
+		FT_TP(detach_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+
+	/*
+	 * Root-level detach (key_len == 0) is valid for both
+	 * variable-length and fixed-length groups.  See cds_ft_graft.
+	 */
+	if (_key_len == 0) {
+		key_len = 0;
+	} else {
+		key_len = ft_key_len(ft, _key_len);
+		if (!valid_key_len(ft, key_len) ||
+				ft->group->key_len != CDS_FT_LEN_VARIABLE) {
+			FT_TP(detach_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		}
+	}
+
+	status = ft_detach_keylen(ft, _key, key_len, result_ft);
+	FT_TP(detach_exit, (int) status);
+	return status;
+}
+
+enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
+		const uint8_t *dst_key, size_t dst_key_len,
+		struct cds_ft *src_ft,
+		const uint8_t *src_key, size_t src_key_len)
+{
+	struct cds_ft *subtree = NULL;
+	enum cds_ft_status status;
+
+	FT_TP(merge_enter, (const void *) dst_ft, (const void *) src_ft);
+
+	if (!dst_ft || !src_ft || dst_ft == src_ft) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	if (dst_ft->group != src_ft->group) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	if (dst_key_len > dst_ft->group->max_key_len ||
+			src_key_len > dst_ft->group->max_key_len) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	if ((dst_key_len > 0 && !dst_key) ||
+			(src_key_len > 0 && !src_key)) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	/*
+	 * Fixed-length groups: each source key K has length fixed_len,
+	 * the moved subtree's stripped keys have length
+	 * (fixed_len - src_key_len), and the resulting destination key
+	 * is dst_key || stripped, of length
+	 * (dst_key_len + fixed_len - src_key_len).  For that result to
+	 * equal fixed_len (the only key length the destination group
+	 * accepts), src_key_len and dst_key_len must be equal.
+	 */
+	if (dst_ft->group->key_len != CDS_FT_LEN_VARIABLE
+			&& dst_key_len != src_key_len) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+
+	dst_ft->group->flavor->read_lock();
+
+	/*
+	 * Step 1: detach @src_ft at @src_key into a transient @subtree.
+	 *
+	 * cds_ft_detach drains in-flight RCU readers of the moved
+	 * sub-tree (one grace period unless @src_ft is exclusive), so
+	 * @subtree is returned in exclusive mode.  This is what frees
+	 * @src_ft from a "must be exclusive" requirement: the rest of
+	 * the merge operates entirely on @subtree (which is provably
+	 * exclusive) instead of touching @src_ft's payload.
+	 *
+	 * @subtree's keys are stripped of the @src_key prefix, so on a
+	 * fixed-length group @subtree's per-key length is shorter than
+	 * the group's nominal fixed length.  This handle does NOT
+	 * conform to the group's public-API key-length invariant; we
+	 * keep it strictly internal and only touch it via the
+	 * keylen-bypassing helpers (ft_keys_lcp, ft_detach_keylen,
+	 * ft_graft_keylen) and cds_ft_destroy.
+	 *
+	 * NOT_FOUND from the detach means @src_ft has no content under
+	 * @src_key: the merge is a no-op.
+	 */
+	status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
+	if (status == CDS_FT_STATUS_NOT_FOUND) {
+		dst_ft->group->flavor->read_unlock();
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
+		return CDS_FT_STATUS_OK;
+	}
+	if (status < 0)
+		goto out_unlock;
+
+	/*
+	 * Step 2: pick the fast path or per-entry fallback based on
+	 * whether @dst_ft has any content under @dst_key.
+	 *
+	 * Fast path: ft_graft_keylen(@dst_ft, @dst_key, @subtree)
+	 * re-prepends @dst_key to each of @subtree's stripped keys,
+	 * placing the original keys (or re-keyed ones for cross-key
+	 * merges) in @dst_ft.
+	 *
+	 * The keylen-bypassing helpers skip the public API's
+	 * fixed-length-vs-non-root rejection, so the fast path
+	 * applies uniformly to variable-length and fixed-length
+	 * groups.
+	 *
+	 * (A future optimization, not implemented here: when @dst_ft
+	 * has content under @dst_key but not under @dst_key
+	 * concatenated with @subtree's LCP, a nested detach+graft at
+	 * the deeper attach point would let the fast path apply more
+	 * often.  The current implementation conservatively falls
+	 * back to per-entry in that case because ft_store_at_graft_point
+	 * wraps an external-nodes-only graft payload in a fresh
+	 * internal node, which leaves an invariant-breaking empty
+	 * internal in @dst_ft after the chain is later removed.)
+	 */
+	if (cds_ft_count_keys_prefix(dst_ft, dst_key, dst_key_len) == 0) {
+		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len,
+				subtree);
+	} else {
+		struct cds_ft_iter *iter = NULL;
+
+		status = cds_ft_iter_create(subtree, &iter);
+		if (status != CDS_FT_STATUS_OK)
+			goto out_rollback;
+		while (cds_ft_lookup_first(subtree, iter)
+				== CDS_FT_STATUS_OK) {
+			uint8_t sub_key[FT_MAX_KEY_LEN];
+			uint8_t dst_full[FT_MAX_KEY_LEN];
+			size_t sub_key_len = 0;
+			struct cds_ft_node *head, *tmp;
+
+			status = cds_ft_iter_get_key(iter, sub_key,
+					sizeof(sub_key), &sub_key_len);
+			if (status != CDS_FT_STATUS_OK)
+				break;
+			if (dst_key_len + sub_key_len > sizeof(dst_full)) {
+				status = CDS_FT_STATUS_OVERFLOW_ERROR;
+				break;
+			}
+			memcpy(dst_full, dst_key, dst_key_len);
+			memcpy(dst_full + dst_key_len, sub_key, sub_key_len);
+
+			status = cds_ft_remove_all(subtree, iter, &head);
+			if (status != CDS_FT_STATUS_OK)
+				break;
+			cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
+				cds_ft_node_init(head);
+				status = cds_ft_insert(dst_ft, dst_full,
+						dst_key_len + sub_key_len,
+						head);
+				if (status != CDS_FT_STATUS_OK)
+					break;
+			}
+			if (status != CDS_FT_STATUS_OK)
+				break;
+		}
+		cds_ft_iter_destroy(iter);
+	}
+
+	if (status != CDS_FT_STATUS_OK)
+		goto out_rollback;
+
+	cds_ft_destroy(subtree);
+	dst_ft->group->flavor->read_unlock();
+	FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
+	return CDS_FT_STATUS_OK;
+
+out_rollback:
+	/*
+	 * Best-effort rollback: re-graft @subtree (with whatever
+	 * content remains in it) back into @src_ft at @src_key.
+	 * @src_ft was emptied of all content under @src_key by the
+	 * initial detach, so this graft cannot collide and only fails
+	 * on memory exhaustion.  On rollback failure @subtree's
+	 * externals are leaked (cds_ft_destroy releases the wrapper
+	 * but cannot drain externals).  The original error is
+	 * propagated.
+	 */
+	(void) ft_graft_keylen(src_ft, src_key, src_key_len, subtree);
+	cds_ft_destroy(subtree);
+out_unlock:
+	dst_ft->group->flavor->read_unlock();
+	FT_TP(merge_exit, (int) status);
+	return status;
+}
+
+enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft *src_ft)
+{
+	return cds_ft_merge_at(dst_ft, key, key_len, src_ft, key, key_len);
 }
 
 size_t cds_ft_key_len(const struct cds_ft *ft)

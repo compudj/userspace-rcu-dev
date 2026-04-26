@@ -624,6 +624,17 @@ LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_key_event_class, cds_ft,
 	detach_enter,
 	LTTNG_UST_TP_ARGS(const void *, ft, const uint8_t *, key, size_t, key_len))
 
+/*
+ * Merge: keyless entry, status exit (defined below in the status-only block).
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, merge_enter,
+	LTTNG_UST_TP_ARGS(const void *, dst_ft, const void *, src_ft),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, dst_ft, (uintptr_t) dst_ft)
+		lttng_ust_field_integer_hex(uintptr_t, src_ft, (uintptr_t) src_ft)
+	)
+)
+
 /* Iter-keyed public APIs: emit both ft and iter for snapshot safety. */
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_iter_key_event_class, cds_ft,
 	remove_enter,
@@ -662,6 +673,9 @@ LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_status_event_class, cds_ft,
 	LTTNG_UST_TP_ARGS(int, status))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_status_event_class, cds_ft,
 	detach_exit,
+	LTTNG_UST_TP_ARGS(int, status))
+LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_status_event_class, cds_ft,
+	merge_exit,
 	LTTNG_UST_TP_ARGS(int, status))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_status_event_class, cds_ft,
 	lookup_exit,
