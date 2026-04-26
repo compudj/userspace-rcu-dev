@@ -42,6 +42,7 @@ nobase_include_HEADERS = \
 	urcu/pointer.h \
 	urcu/rcuhlist.h \
 	urcu/fractal-trie.h \
+	urcu/fractal-trie-range.h \
 	urcu/rculfhash.h \
 	urcu/rculfqueue.h \
 	urcu/rculfstack.h \

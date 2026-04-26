@@ -1,0 +1,314 @@
+// SPDX-FileCopyrightText: 2026 EfficiOS Inc.
+//
+// SPDX-License-Identifier: LGPL-2.1-only
+
+#ifndef _URCU_FRACTAL_TRIE_RANGE_H
+#define _URCU_FRACTAL_TRIE_RANGE_H
+
+/*
+ * urcu/fractal-trie-range.h
+ *
+ * Userspace RCU library - Range index layered on top of Fractal Trie.
+ *
+ * Indexes half-open ranges [start, end) over uint64_t timelines and
+ * answers range-overlap queries with two structural properties suited
+ * to interactive timeline / trace viewers:
+ *
+ *   - Granularity culling: a query supplies a "granularity" floor and
+ *     the index skips any range with length below it (sub-pixel state
+ *     ranges are not visited at all).
+ *
+ *   - Pan locality: when the viewport shifts by Delta, the per-level
+ *     scan window shifts by Delta too. The bulk of work at coarse
+ *     levels is reusable; only fine levels need to re-scan more of
+ *     their key window.
+ *
+ * Internally, ranges are partitioned into up to 64 per-level
+ * cds_ft instances by length class:
+ *
+ *     k = ceil(log2(L))    where L = end - start
+ *
+ * Level k holds ranges with L in (2^(k-1), 2^k]. Each per-level trie
+ * is keyed on the range's start position (big-endian uint64_t). One
+ * trie entry per inserted range. Multiple ranges sharing the same
+ * start ride the trie's native duplicate chain.
+ *
+ * Scope (v1): 8-byte unsigned integer keys only. Generalisation to
+ * other widths, signed keys, and variable-length keys is future
+ * work; the design does not preclude it.
+ *
+ * Concurrency: the range index inherits cds_ft's reader/writer
+ * contract. Readers must hold the RCU read-side lock for the entire
+ * iteration sequence (the iterator caches per-level trie state).
+ * Writers (insert / remove) must serialise themselves the same way
+ * as cds_ft writers do (typically a single writer mutex).
+ *
+ * Include this header _after_ the URCU flavor header, just like
+ * urcu/fractal-trie.h.
+ */
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include <urcu/fractal-trie.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Number of per-length-class levels. One trie per bit position of L. */
+#define CDS_FT_RANGE_NR_LEVELS	64
+
+/* Opaque types. */
+struct cds_ft_range;
+struct cds_ft_range_iter;
+struct cds_ft_range_attr;
+
+/*
+ * Intrusive node embedded in user data.
+ *
+ * The user provides the storage (typically by embedding this struct
+ * in their own range record) and is responsible for its lifetime
+ * relative to RCU grace periods, just like with cds_ft_node.
+ *
+ * Fields:
+ *   ft_node - the trie node used by the underlying cds_ft. Must be
+ *             initialised via cds_ft_node_init(&n->ft_node) (or
+ *             zeroed) before insertion, the same way cds_ft_node is
+ *             initialised. cds_ft_range_insert() does NOT call
+ *             cds_ft_node_init for the user; doing so here would
+ *             clobber re-inserted nodes that are on the dup chain of
+ *             a parallel chain. Match cds_ft conventions.
+ *   end     - end position of the half-open range [start, end).
+ *             Stored on the node so the query path can filter
+ *             overlap (T+L > q_a) without indirecting into user
+ *             data.
+ *   level   - routed level. Set by cds_ft_range_insert(); read by
+ *             cds_ft_range_remove() to find the right per-level
+ *             trie. Do not modify between insert and remove.
+ *
+ * To recover the user record from a cds_ft_range_node *, use
+ * cds_ft_range_entry() (or directly caa_container_of).
+ */
+struct cds_ft_range_node {
+	struct cds_ft_node ft_node;
+	uint64_t start;
+	uint64_t end;
+	unsigned int level;
+};
+
+#define cds_ft_range_entry(ptr, type, member) \
+	caa_container_of(ptr, type, member)
+
+/*
+ * cds_ft_range_node_init - Initialise a range node.
+ * @node: The node.
+ *
+ * Wraps cds_ft_node_init() and zeros end/level. Equivalent to
+ * memset(node, 0, sizeof(*node)).
+ */
+static inline
+void cds_ft_range_node_init(struct cds_ft_range_node *node)
+{
+	cds_ft_node_init(&node->ft_node);
+	node->start = 0;
+	node->end = 0;
+	node->level = 0;
+}
+
+/*
+ * Range-attr API (currently empty; reserved for future flags such as
+ * exclusive mode). Use NULL where attr is accepted to take defaults.
+ */
+
+enum cds_ft_status cds_ft_range_attr_create(struct cds_ft_range_attr **result);
+void cds_ft_range_attr_destroy(struct cds_ft_range_attr *attr);
+
+/*
+ * cds_ft_range_create - Create a range index.
+ * @group: A cds_ft_group (must be configured with key_len = 8).
+ *         The group is owned by the caller; the range index simply
+ *         creates per-level cds_ft instances inside it.
+ * @attr: Attributes (may be NULL for defaults).
+ * @result: Output range index handle.
+ *
+ * Per-level cds_ft instances are NOT created up front; they are
+ * allocated lazily on first insert at each level.
+ *
+ * The group must outlive the range index. Multiple range indices
+ * can share the same group; they will not interfere because each
+ * uses its own per-level cds_ft instances.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
+ * on error.
+ */
+enum cds_ft_status cds_ft_range_create(
+		struct cds_ft_group *group,
+		const struct cds_ft_range_attr *attr,
+		struct cds_ft_range **result);
+
+/*
+ * cds_ft_range_destroy - Destroy a range index.
+ * @ftr: The range index.
+ *
+ * Destroys all per-level cds_ft instances. The caller's group is
+ * NOT destroyed (caller owns it). The caller must ensure no
+ * concurrent readers or writers can access @ftr after this call
+ * returns. All inserted nodes must have been removed and
+ * reclaimed beforehand (the index does not own user nodes and
+ * does not call_rcu them on destruction).
+ */
+void cds_ft_range_destroy(struct cds_ft_range *ftr);
+
+/*
+ * cds_ft_range_insert - Insert a half-open range [start, end).
+ * @ftr: The range index.
+ * @start: Range start (inclusive).
+ * @end: Range end (exclusive). Must satisfy end > start.
+ * @node: User-provided node. Must be initialised via
+ *        cds_ft_range_node_init() (or zeroed) before this call.
+ *
+ * Routes the range to its length-class level (ceil(log2(end-start)))
+ * and inserts at that level under key @start. Sets node->level and
+ * node->end. Multiple ranges sharing the same @start ride the
+ * trie's native duplicate chain.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
+ * on error (CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if end <= start;
+ * CDS_FT_STATUS_MEMORY_ERROR on allocation failure of the per-level
+ * trie).
+ *
+ * Mutual exclusion between writers (insert / remove) is the
+ * caller's responsibility, like cds_ft.
+ */
+enum cds_ft_status cds_ft_range_insert(
+		struct cds_ft_range *ftr,
+		uint64_t start, uint64_t end,
+		struct cds_ft_range_node *node);
+
+/*
+ * cds_ft_range_remove - Remove a previously inserted range.
+ * @ftr: The range index.
+ * @start: Range start, same as the value passed to insert.
+ * @node: The node to remove (matched by identity within the
+ *        duplicate chain at that key).
+ *
+ * Reads node->level to locate the per-level trie. The caller is
+ * responsible for waiting an RCU grace period before reusing or
+ * freeing @node, just like cds_ft_remove.
+ *
+ * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
+ * the node is not present, or a negative cds_ft_status on error.
+ */
+enum cds_ft_status cds_ft_range_remove(
+		struct cds_ft_range *ftr,
+		uint64_t start,
+		struct cds_ft_range_node *node);
+
+/*
+ * cds_ft_range_iter_create - Create an iterator for an overlap query.
+ * @ftr: The range index.
+ * @result_iter: Output iterator handle.
+ *
+ * The returned iterator is bound to @ftr until destroyed. It
+ * does not start a query yet; call cds_ft_range_lookup_overlap()
+ * to position it.
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ */
+enum cds_ft_status cds_ft_range_iter_create(
+		struct cds_ft_range *ftr,
+		struct cds_ft_range_iter **result_iter);
+
+/*
+ * cds_ft_range_iter_destroy - Destroy an iterator.
+ */
+void cds_ft_range_iter_destroy(struct cds_ft_range_iter *iter);
+
+/*
+ * cds_ft_range_lookup_overlap - Position the iterator at the first
+ *                               range overlapping [q_a, q_b) with
+ *                               length >= granularity.
+ * @iter: The iterator (must be already created with
+ *        cds_ft_range_iter_create).
+ * @q_a: Query window start (inclusive).
+ * @q_b: Query window end (exclusive). Must satisfy q_b > q_a.
+ * @granularity: Minimum range length to return. Pass 0 to disable
+ *               culling.
+ *
+ * After this call, cds_ft_range_iter_node() returns either the
+ * first matching range's node (if any), or NULL when none.
+ * Subsequent matches are reached with cds_ft_range_iter_next().
+ *
+ * The RCU read-side lock must be held by the caller throughout
+ * the iteration sequence (lookup_overlap + next + ... + access of
+ * returned nodes), the same way cds_ft requires for ordered
+ * iteration with a path-cached iterator.
+ *
+ * Returns CDS_FT_STATUS_OK on success (iterator is positioned
+ * at first match or exhausted), or a negative cds_ft_status on
+ * error.
+ */
+enum cds_ft_status cds_ft_range_lookup_overlap(
+		struct cds_ft_range_iter *iter,
+		uint64_t q_a, uint64_t q_b,
+		uint64_t granularity);
+
+/*
+ * cds_ft_range_iter_next - Advance the iterator to the next match.
+ * @iter: Iterator already positioned by cds_ft_range_lookup_overlap().
+ *
+ * On return, cds_ft_range_iter_node() either returns the next
+ * matching range's node, or NULL when iteration is exhausted.
+ *
+ * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND when
+ * exhausted, or a negative cds_ft_status on error.
+ */
+enum cds_ft_status cds_ft_range_iter_next(struct cds_ft_range_iter *iter);
+
+/*
+ * cds_ft_range_iter_node - Return the current matching range node.
+ * @iter: The iterator.
+ *
+ * Returns the cds_ft_range_node * for the current match, or NULL
+ * when iteration is exhausted or before the first lookup_overlap()
+ * call.
+ */
+struct cds_ft_range_node *cds_ft_range_iter_node(
+		const struct cds_ft_range_iter *iter);
+
+/*
+ * cds_ft_range_for_each_overlap_rcu - Iterate over all matches.
+ * @iter: Iterator (struct cds_ft_range_iter *), used as loop cursor.
+ * @q_a, @q_b, @granularity: Query window and granularity (see
+ *                           cds_ft_range_lookup_overlap()).
+ *
+ * The RCU read-side lock must be held continuously by the caller
+ * during the entire loop, including access to nodes returned by
+ * cds_ft_range_iter_node().
+ */
+#define cds_ft_range_for_each_overlap_rcu(iter, q_a, q_b, granularity)	\
+	for (cds_ft_range_lookup_overlap((iter), (q_a), (q_b),		\
+					(granularity));			\
+			cds_ft_range_iter_node(iter);			\
+			cds_ft_range_iter_next(iter))
+
+/*
+ * cds_ft_range_route_level - Compute the level a range would route to.
+ * @start, @end: The half-open range.
+ *
+ * Pure function of L = end - start. Returns 0 for L = 1, otherwise
+ * 64 - __builtin_clzll(L - 1) (i.e. ceil(log2(L))). Returns
+ * CDS_FT_RANGE_NR_LEVELS if @end <= @start (caller error).
+ *
+ * Useful for callers that want to pre-classify ranges (e.g. when
+ * loading from a file format that records level-class statistics).
+ */
+unsigned int cds_ft_range_route_level(uint64_t start, uint64_t end);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* _URCU_FRACTAL_TRIE_RANGE_H */
