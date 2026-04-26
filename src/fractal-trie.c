@@ -132,6 +132,7 @@ struct cds_ft_group_attr {
 
 struct cds_ft_attr {
 	bool exclusive;
+	unsigned int collapse_threshold_pct;
 };
 
 enum cds_ft_type_class {
@@ -9526,8 +9527,14 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	int pivot;
 	struct cds_ft_inode_flag *child;
 	uint8_t suffix_buf[FT_COLLAPSED_SCAN_ZONE_MAX];
+	unsigned int threshold_pct = uatomic_load(&ft->collapse_threshold_pct,
+			CMM_RELAXED);
 
 	*nr_absorbed_out = 0;
+
+	/* Collapse disabled on this trie. */
+	if (threshold_pct == CDS_FT_COLLAPSE_THRESHOLD_DISABLED)
+		return NULL;
 
 	/* Need at least 2 children. */
 	if (nr_child < 2)
@@ -9768,12 +9775,19 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			}
 
 			/*
-			 * Footprint ratio check: absorbed > collapsed
-			 * (ratio > 1) and this candidate beats the
-			 * current best.  Cross-multiply to avoid
-			 * division.
+			 * Footprint ratio check: candidate must clear
+			 * the per-trie threshold
+			 *   absorbed * 100 > collapsed * threshold_pct
+			 * (threshold_pct == 100 reproduces the historical
+			 * "absorbed > collapsed" gate) and beat the current
+			 * best.  Cross-multiply to avoid division.  The
+			 * best-candidate comparison itself is independent
+			 * of threshold_pct: it picks the largest ratio
+			 * among the candidates that already cleared the
+			 * gate.
 			 */
-			if (absorbed > collapsed_fp &&
+			if ((unsigned long) absorbed * 100UL >
+			    (unsigned long) collapsed_fp * threshold_pct &&
 			    (unsigned long) absorbed * best_collapsed >
 			    (unsigned long) best_absorbed * collapsed_fp) {
 				if (best_col)
@@ -9893,6 +9907,15 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 	struct cds_ft_inode_flag *parent_nf = NULL;
 	const uint8_t *ik = key;
 	unsigned int depth = 0;
+
+	/*
+	 * Fast path: collapse disabled on this trie — skip the entire
+	 * post-mutation path walk.  This is what users opt into when
+	 * write throughput matters more than read locality.
+	 */
+	if (uatomic_load(&ft->collapse_threshold_pct, CMM_RELAXED)
+	    == CDS_FT_COLLAPSE_THRESHOLD_DISABLED)
+		return;
 
 	node_flag = ft_dereference_prefetch(ft->root);
 	parent_slot = &ft->root;
@@ -15468,6 +15491,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * readers must call cds_ft_make_concurrent first.
 		 */
 		detached->exclusive = true;
+		detached->collapse_threshold_pct = ft->collapse_threshold_pct;
 
 		/*
 		 * Allocate a fresh empty root for the source trie
@@ -15598,6 +15622,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 * first.
 			 */
 			detached->exclusive = true;
+			detached->collapse_threshold_pct = ft->collapse_threshold_pct;
 
 			/*
 			 * Propagate count removal through ancestors
@@ -18162,6 +18187,7 @@ enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 		*result = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
+	attr->collapse_threshold_pct = CDS_FT_COLLAPSE_THRESHOLD_DEFAULT;
 	*result = attr;
 	return CDS_FT_STATUS_OK;
 }
@@ -18175,6 +18201,15 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 		bool exclusive)
 {
 	attr->exclusive = exclusive;
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_attr_set_collapse_threshold(struct cds_ft_attr *attr,
+		unsigned int threshold_pct)
+{
+	if (threshold_pct < CDS_FT_COLLAPSE_THRESHOLD_DEFAULT)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->collapse_threshold_pct = threshold_pct;
 	return CDS_FT_STATUS_OK;
 }
 
@@ -18205,6 +18240,20 @@ bool cds_ft_excl_validate_enabled(void)
 #else
 	return false;
 #endif
+}
+
+enum cds_ft_status cds_ft_collapse_threshold_set(struct cds_ft *ft,
+		unsigned int threshold_pct)
+{
+	if (threshold_pct < CDS_FT_COLLAPSE_THRESHOLD_DEFAULT)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	uatomic_store(&ft->collapse_threshold_pct, threshold_pct, CMM_RELAXED);
+	return CDS_FT_STATUS_OK;
+}
+
+unsigned int cds_ft_collapse_threshold_get(struct cds_ft *ft)
+{
+	return uatomic_load(&ft->collapse_threshold_pct, CMM_RELAXED);
 }
 
 enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
@@ -18275,8 +18324,11 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->group = ft_group;
-	if (attr)
+	ft->collapse_threshold_pct = CDS_FT_COLLAPSE_THRESHOLD_DEFAULT;
+	if (attr) {
 		ft->exclusive = attr->exclusive;
+		ft->collapse_threshold_pct = attr->collapse_threshold_pct;
+	}
 
 	/*
 	 * Allocate the root node (smallest linear type, initially empty).

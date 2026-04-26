@@ -305,6 +305,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <limits.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -1810,6 +1811,24 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 		bool exclusive);
 
 /*
+ * cds_ft_attr_set_collapse_threshold - Set the collapse acceptance
+ *                                      threshold attribute used at
+ *                                      cds_ft_create time.
+ * @attr: Fractal Trie attributes.
+ * @threshold_pct: Threshold in percent.  See
+ *                 cds_ft_collapse_threshold_set for semantics.
+ *                 Must be >= CDS_FT_COLLAPSE_THRESHOLD_DEFAULT.
+ *
+ * Default: CDS_FT_COLLAPSE_THRESHOLD_DEFAULT (100).
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @threshold_pct is below
+ * CDS_FT_COLLAPSE_THRESHOLD_DEFAULT.
+ */
+enum cds_ft_status cds_ft_attr_set_collapse_threshold(struct cds_ft_attr *attr,
+		unsigned int threshold_pct);
+
+/*
  * cds_ft_make_exclusive - Transition a Fractal Trie to exclusive
  *                         access discipline.
  * @ft: The Fractal Trie.
@@ -1870,6 +1889,75 @@ bool cds_ft_is_exclusive(const struct cds_ft *ft);
  * the validator is absent.
  */
 bool cds_ft_excl_validate_enabled(void);
+
+/*
+ * Collapse threshold control.
+ *
+ * Collapse merges a sparse internal subtree into a single
+ * cache-line-friendly collapsed node when the read-side footprint
+ * absorbed by the merge exceeds the collapsed allocation by a
+ * configurable margin.  Both absorbed_footprint and
+ * collapsed_footprint are expressed in 16-byte units of read-side
+ * cache-line load along the lookup fast path, so the acceptance gate
+ *
+ *   absorbed_footprint * 100 > collapsed_footprint * threshold_pct
+ *
+ * directly compares "cache lines a reader touches before collapse"
+ * against "cache lines a reader touches after collapse" (scaled by
+ * threshold_pct).  threshold_pct is a per-trie tunable, loaded with
+ * relaxed atomics on the write path so it may be retuned on a live
+ * trie under writers.
+ *
+ * - CDS_FT_COLLAPSE_THRESHOLD_DEFAULT (100): historical behavior —
+ *   collapse fires when it strictly reduces the read-side cache-line
+ *   footprint.
+ * - Larger values demand bigger wins (e.g. 200 requires the absorbed
+ *   footprint to be strictly more than twice the collapsed footprint),
+ *   which trades read-side gains for fewer collapse invocations on
+ *   the write path.
+ * - CDS_FT_COLLAPSE_THRESHOLD_DISABLED (UINT_MAX) suppresses
+ *   collapse entirely; the post-mutation collapse pass becomes a
+ *   no-op, eliminating its overhead from the write path.
+ *
+ * Values below 100 are rejected: since the metric is read-side
+ * cache-line footprint, a setting that accepts a candidate where
+ * collapsed > absorbed would unconditionally pessimize the lookup
+ * fast path with no compensating benefit.
+ *
+ * Mixed-layout content (e.g. produced by graft / merge) remains
+ * fully valid regardless of the threshold; the threshold only
+ * governs whether future mutations on the destination trie attempt
+ * additional collapse.
+ */
+#define CDS_FT_COLLAPSE_THRESHOLD_DEFAULT	100U
+#define CDS_FT_COLLAPSE_THRESHOLD_DISABLED	UINT_MAX
+
+/*
+ * cds_ft_collapse_threshold_set - Set the collapse acceptance
+ *                                 threshold for a Fractal Trie.
+ * @ft: The Fractal Trie.
+ * @threshold_pct: Threshold in percent (see semantics above).
+ *                 Must be >= CDS_FT_COLLAPSE_THRESHOLD_DEFAULT.
+ *
+ * Safe to call on a live trie under writers; the new value is
+ * picked up by subsequent collapse evaluations.  Has no effect on
+ * already-collapsed (or already-uncollapsed) content.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @threshold_pct is below
+ * CDS_FT_COLLAPSE_THRESHOLD_DEFAULT.
+ */
+enum cds_ft_status cds_ft_collapse_threshold_set(struct cds_ft *ft,
+		unsigned int threshold_pct);
+
+/*
+ * cds_ft_collapse_threshold_get - Query the collapse acceptance
+ *                                 threshold for a Fractal Trie.
+ * @ft: The Fractal Trie.
+ *
+ * Returns the current threshold in percent.
+ */
+unsigned int cds_ft_collapse_threshold_get(struct cds_ft *ft);
 
 /*
  * Iterator management
