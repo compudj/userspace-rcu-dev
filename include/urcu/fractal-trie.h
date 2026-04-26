@@ -1319,6 +1319,112 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		struct cds_ft **result_ft);
 
 /*
+ * cds_ft_merge - Move @src_ft's content under @key into @dst_ft.
+ * @dst_ft: Destination Fractal Trie.
+ * @key: Key prefix that selects the @src_ft sub-trie to move and
+ *       the @dst_ft attach point.  May be NULL if @key_len is 0.
+ * @key_len: Length of @key in bytes.  Use 0 to merge every key in
+ *           @src_ft into @dst_ft (whole-trie merge).
+ * @src_ft: Source Fractal Trie.  Must belong to the same group as
+ *          @dst_ft and must not equal @dst_ft.  May be in either
+ *          exclusive or concurrent mode; concurrent readers on
+ *          @src_ft are tolerated.
+ *
+ * Moves @src_ft's content under prefix @key into @dst_ft at the
+ * same prefix, preserving original key bytes.  @src_ft keys that
+ * do not start with @key are left untouched in @src_ft.  Unlike
+ * cds_ft_graft, @dst_ft may already contain entries under @key.
+ *
+ * The @key_len == 0 case is a whole-trie merge: every key in
+ * @src_ft is moved into @dst_ft, and @src_ft becomes empty on
+ * success.
+ *
+ * Algorithm (single call from the caller's POV):
+ *
+ *   1. Detach @src_ft at @key into a transient internal sub-trie.
+ *      For a concurrent-mode @src_ft this incurs one grace period
+ *      (the same one cds_ft_detach already needs to drain readers
+ *      of the moved subtree); for an exclusive @src_ft no grace
+ *      period is required.  After this step the transient is
+ *      exclusive and @src_ft retains only the keys outside @key.
+ *   2. Compute the longest common prefix (LCP) of the transient's
+ *      stripped keys.  The full attach point in @dst_ft is
+ *      @key concatenated with that LCP.
+ *   3. If @dst_ft has no content under @key||LCP, move the
+ *      transient as a single sub-trie:
+ *        - LCP empty: graft the transient into @dst_ft at @key.
+ *        - LCP non-empty: nested-detach the transient at LCP and
+ *          graft the inner sub-trie into @dst_ft at @key||LCP.
+ *      Works uniformly for variable-length and fixed-length
+ *      groups; the intermediate stripped-key state is purely
+ *      internal.
+ *   4. Otherwise, drain the transient one duplicate chain at a
+ *      time, re-prepending @key to each stripped key, and insert
+ *      into @dst_ft.
+ *
+ * Concurrent RCU readers on @dst_ft observe a sequence of single
+ * atomic publishes — either the fast-path graft or one per
+ * per-entry insert — and never see a half-merged duplicate chain
+ * at a given key.
+ *
+ * Returns CDS_FT_STATUS_OK on success (including the no-op case
+ * where @src_ft has no content under @key).
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if either trie
+ * pointer is NULL, if @dst_ft == @src_ft, if the tries are not in
+ * the same group, or if @key_len exceeds the group's maximum key
+ * length.
+ * Returns a negative cds_ft_status on memory allocation failure.
+ * On failure the function makes a best-effort rollback of the
+ * initial detach by grafting the transient back into @src_ft at
+ * @key; if the rollback itself fails, the affected externals are
+ * leaked.  Both tries remain individually valid in any case.
+ *
+ * Mutual exclusion between writers on both @dst_ft and @src_ft is
+ * the caller's responsibility.
+ */
+enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
+		const uint8_t *key, size_t key_len,
+		struct cds_ft *src_ft);
+
+/*
+ * cds_ft_merge_at - Cross-key variant of cds_ft_merge.
+ * @dst_ft: Destination Fractal Trie.
+ * @dst_key: Attach prefix in @dst_ft.  May be NULL if
+ *           @dst_key_len is 0.
+ * @dst_key_len: Length of @dst_key in bytes.
+ * @src_ft: Source Fractal Trie.  Must belong to the same group as
+ *          @dst_ft and must not equal @dst_ft.  May be in either
+ *          exclusive or concurrent mode.
+ * @src_key: Source-side prefix selecting which @src_ft sub-trie to
+ *           move.  May be NULL if @src_key_len is 0.
+ * @src_key_len: Length of @src_key in bytes.
+ *
+ * Same as cds_ft_merge except that the source-side prefix
+ * (@src_key) and destination-side prefix (@dst_key) may differ:
+ * @src_ft's content under @src_key is moved into @dst_ft at
+ * @dst_key.  Each moved key K = @src_key || S becomes
+ * @dst_key || S in @dst_ft.  cds_ft_merge is the special case
+ * where @dst_key == @src_key.
+ *
+ * Useful for re-keying patterns (archive moves, tier promotion,
+ * partition rename) that cannot be expressed via the public
+ * cds_ft_detach + cds_ft_graft pair on fixed-length groups.
+ *
+ * Same algorithm and same contract as cds_ft_merge, with @src_key
+ * driving the initial detach and @dst_key driving the graft attach
+ * point and per-entry key re-prepend.
+ *
+ * Returns the same statuses as cds_ft_merge.  In addition,
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR is returned if either
+ * @src_key_len or @dst_key_len exceeds the group's maximum key
+ * length.
+ */
+enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
+		const uint8_t *dst_key, size_t dst_key_len,
+		struct cds_ft *src_ft,
+		const uint8_t *src_key, size_t src_key_len);
+
+/*
  * Trie lifecycle
  */
 
