@@ -7375,15 +7375,26 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 
 	/*
 	 * suffix_base: the ordinal_key position where collapsed
-	 * suffix data starts.  Normally entry_depth, except when the
-	 * collapsed node is a direct child of a compressed node (no
-	 * intermediate internal dispatch).  In that case, the
-	 * compressed handler wrote ordinal_key one position earlier.
+	 * suffix data starts.  ft_inequality_collapsed (and the
+	 * minmax variant) wrote suffix at ordinal_key[level_entry - 1]
+	 * where level_entry is the level passed into the descent.
+	 *
+	 * The collapsed handler writes iter_path[level_entry..
+	 * level_entry + slen - 1] = collapsed.  The previous
+	 * iter_path[level_entry - 1] is also collapsed in every case
+	 * we see here:
+	 *   - root = collapsed: iter_path[0] = collapsed (root itself);
+	 *   - internal -> collapsed: iter_path[level_entry - 1] = collapsed
+	 *     (set by the main loop's previous-iter dispatch
+	 *     ft_node_get_nth that fetched this collapsed child);
+	 *   - compressed -> collapsed: iter_path[level_entry - 1] =
+	 *     collapsed (overwritten by ft_inequality_compressed's
+	 *     post-loop iter_path[level] = cn->child).
+	 *
+	 * Hence the walk-back above always lands entry_depth at
+	 * level_entry - 1, and suffix_base = entry_depth.
 	 */
 	suffix_base = entry_depth;
-	if (entry_depth > 0 &&
-	    ft_node_compressed(iter_path_node(iter)[entry_depth - 1]))
-		suffix_base = entry_depth - 1;
 
 	/*
 	 * Find the current entry by suffix match.  Don't skip
