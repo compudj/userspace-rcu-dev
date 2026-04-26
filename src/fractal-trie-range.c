@@ -319,7 +319,7 @@ out:
 /* Iterator                                                           */
 /* ------------------------------------------------------------------ */
 
-enum cds_ft_status cds_ft_range_graft(struct cds_ft_range *dst,
+enum cds_ft_status cds_ft_range_merge(struct cds_ft_range *dst,
 		struct cds_ft_range *src)
 {
 	unsigned int k;
@@ -331,9 +331,12 @@ enum cds_ft_status cds_ft_range_graft(struct cds_ft_range *dst,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 
 	/*
-	 * Pre-validate: dst must be empty at every level where src
-	 * has content.  Performed up front so we don't half-graft
-	 * before discovering a population conflict.
+	 * For each populated level in src, lazy-create dst's matching
+	 * level if absent and call cds_ft_merge.  cds_ft_merge handles
+	 * the prefix-graft fast path and the per-entry fallback at
+	 * each level, so the common chunk-disjoint case becomes a
+	 * subtree graft per level (cheap), and the chunk-overlap case
+	 * degrades gracefully to per-entry insert.
 	 */
 	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
 		struct cds_ft *src_lk = rcu_dereference(src->level[k]);
@@ -342,29 +345,13 @@ enum cds_ft_status cds_ft_range_graft(struct cds_ft_range *dst,
 		if (!src_lk || cds_ft_empty(src_lk))
 			continue;
 		dst_lk = rcu_dereference(dst->level[k]);
-		if (dst_lk && !cds_ft_empty(dst_lk))
-			return CDS_FT_STATUS_POPULATED_ERROR;
-	}
-
-	/* Graft each populated source level into the destination. */
-	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
-		struct cds_ft *src_lk = rcu_dereference(src->level[k]);
-		struct cds_ft *dst_lk;
-
-		if (!src_lk || cds_ft_empty(src_lk))
-			continue;
-		dst_lk = rcu_dereference(dst->level[k]);
 		if (!dst_lk) {
-			/*
-			 * Lazy-create dst's level so cds_ft_graft has
-			 * an empty destination to graft into.
-			 */
 			s = cds_ft_create(dst->group, NULL, &dst_lk);
 			if (s < 0)
 				return s;
 			rcu_assign_pointer(dst->level[k], dst_lk);
 		}
-		s = cds_ft_graft(dst_lk, NULL, 0, src_lk);
+		s = cds_ft_merge(dst_lk, NULL, 0, src_lk);
 		if (s < 0)
 			return s;
 	}

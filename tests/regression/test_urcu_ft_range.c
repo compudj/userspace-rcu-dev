@@ -1634,115 +1634,158 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* Test 13: graft / detach                                            */
+/* Test 13: merge / detach                                            */
 /* ------------------------------------------------------------------ */
 
-static int test_graft_detach(void)
+/*
+ * Exercises the bulk merge + detach pattern.  Three sub-scenarios:
+ *
+ *   A. Cold load: merge a populated staging into an empty live.
+ *      cds_ft_merge picks the fast subtree-graft path at every
+ *      level (live has nothing under any prefix).
+ *
+ *   B. Chunk-disjoint incremental merge: build a second staging
+ *      with starts in a higher byte-prefix range.  Merging into a
+ *      now-non-empty live still hits the fast path because each
+ *      level's content sits under a different prefix from live's.
+ *
+ *   C. Overlapping merge: build a third staging whose starts share
+ *      bytes with live's existing content (forced collision via
+ *      reused length class and overlapping start range).
+ *      cds_ft_merge falls back to per-entry insert; the union is
+ *      still correct.
+ *
+ * Then drains live by detaching into a new index and checks the
+ * detached index has the full union.
+ */
+static int test_merge_detach(void)
 {
 	struct cds_ft_group *group;
-	struct cds_ft_range *staging = NULL, *live = NULL, *detached = NULL;
-	const size_t N = 1000;
-	struct rec **recs = NULL;
-	uint64_t *expected_ids = NULL, *got_ids = NULL;
+	struct cds_ft_range *live = NULL, *detached = NULL;
+	struct cds_ft_range *staging_a = NULL, *staging_b = NULL, *staging_c = NULL;
+	const size_t N_A = 1000, N_B = 500, N_C = 200;
+	struct rec **recs_a = NULL, **recs_b = NULL, **recs_c = NULL;
+	uint64_t *got_ids = NULL;
+	const size_t total = N_A + N_B + N_C;
 	int ret = -1;
 
 	group = make_group();
-	if (cds_ft_range_create(group, NULL, &staging) < 0)
-		goto out;
-	if (cds_ft_range_create(group, NULL, &live) < 0)
-		goto out;
-
-	recs = (struct rec **) calloc(N, sizeof(*recs));
-	expected_ids = (uint64_t *) calloc(N, sizeof(*expected_ids));
-	got_ids = (uint64_t *) calloc(N, sizeof(*got_ids));
-	if (!recs || !expected_ids || !got_ids)
+	if (cds_ft_range_create(group, NULL, &live) < 0
+			|| cds_ft_range_create(group, NULL, &staging_a) < 0
+			|| cds_ft_range_create(group, NULL, &staging_b) < 0
+			|| cds_ft_range_create(group, NULL, &staging_c) < 0)
 		goto out;
 
-	/* Populate staging. */
-	prng_seed(0x9007);
-	for (size_t i = 0; i < N; i++) {
-		uint64_t a = prng() & ((1ULL << 32) - 1);
+	recs_a = (struct rec **) calloc(N_A, sizeof(*recs_a));
+	recs_b = (struct rec **) calloc(N_B, sizeof(*recs_b));
+	recs_c = (struct rec **) calloc(N_C, sizeof(*recs_c));
+	got_ids = (uint64_t *) calloc(total, sizeof(*got_ids));
+	if (!recs_a || !recs_b || !recs_c || !got_ids)
+		goto out;
+
+	/* Staging A: starts in [0, 2^31). */
+	prng_seed(0xa11ae);
+	for (size_t i = 0; i < N_A; i++) {
+		uint64_t a = prng() & ((1ULL << 31) - 1);
 		uint64_t L = 1 + (prng() & ((1ULL << 14) - 1));
-		if (a > UINT64_MAX - L)
-			a = UINT64_MAX - L;
-		recs[i] = rec_alloc(a, a + L, i);
-		expected_ids[i] = i;
-		if (cds_ft_range_insert(staging, a, a + L,
-				&recs[i]->node) < 0)
+		recs_a[i] = rec_alloc(a, a + L, i);
+		if (cds_ft_range_insert(staging_a, a, a + L,
+				&recs_a[i]->node) < 0)
+			goto out;
+	}
+	/* Staging B: starts in [2^33, 2^33 + 2^31) - disjoint high-byte
+	 * prefix from staging A's range, exercising the fast path. */
+	for (size_t i = 0; i < N_B; i++) {
+		uint64_t a = (1ULL << 33) | (prng() & ((1ULL << 31) - 1));
+		uint64_t L = 1 + (prng() & ((1ULL << 14) - 1));
+		recs_b[i] = rec_alloc(a, a + L, N_A + i);
+		if (cds_ft_range_insert(staging_b, a, a + L,
+				&recs_b[i]->node) < 0)
+			goto out;
+	}
+	/* Staging C: starts in [0, 2^31) - overlapping with staging A's
+	 * range, forcing the per-entry path. */
+	for (size_t i = 0; i < N_C; i++) {
+		uint64_t a = prng() & ((1ULL << 31) - 1);
+		uint64_t L = 1 + (prng() & ((1ULL << 14) - 1));
+		recs_c[i] = rec_alloc(a, a + L, N_A + N_B + i);
+		if (cds_ft_range_insert(staging_c, a, a + L,
+				&recs_c[i]->node) < 0)
 			goto out;
 	}
 
+	/* Sub-scenario A: merge staging_a into empty live (cold load). */
+	if (cds_ft_range_merge(live, staging_a) < 0) {
+		fprintf(stderr, "A: merge into empty live failed\n");
+		goto out;
+	}
 	rcu_read_lock();
-	if (cds_ft_range_count_entries(staging) != N) {
-		fprintf(stderr, "staging count != N\n");
+	if (!cds_ft_range_empty(staging_a)) {
+		fprintf(stderr, "A: staging not empty after merge\n");
 		rcu_read_unlock();
 		goto out;
 	}
-	if (!cds_ft_range_empty(live)) {
-		fprintf(stderr, "live not initially empty\n");
+	if (cds_ft_range_count_entries(live) != N_A) {
+		fprintf(stderr, "A: live count != N_A (%lu vs %zu)\n",
+			cds_ft_range_count_entries(live), N_A);
 		rcu_read_unlock();
 		goto out;
 	}
 	rcu_read_unlock();
 
-	/* Graft staging into live (live is empty). */
-	if (cds_ft_range_graft(live, staging) < 0) {
-		fprintf(stderr, "graft failed\n");
+	/* Sub-scenario B: merge staging_b into populated live, with
+	 * disjoint high-byte prefixes -> cds_ft_merge fast path. */
+	if (cds_ft_range_merge(live, staging_b) < 0) {
+		fprintf(stderr, "B: merge of disjoint staging failed\n");
 		goto out;
 	}
-
 	rcu_read_lock();
-	if (!cds_ft_range_empty(staging)) {
-		fprintf(stderr, "staging not empty after graft\n");
+	if (!cds_ft_range_empty(staging_b)) {
+		fprintf(stderr, "B: staging not empty after merge\n");
 		rcu_read_unlock();
 		goto out;
 	}
-	if (cds_ft_range_count_entries(live) != N) {
-		fprintf(stderr,
-			"live count after graft != N (got %lu)\n",
-			cds_ft_range_count_entries(live));
-		rcu_read_unlock();
-		goto out;
-	}
-	/* All N ranges are reachable in live via a wide overlap query. */
-	int got = collect_overlap(live, 0, UINT64_MAX, 0, got_ids, N);
-	if (got != (int) N) {
-		fprintf(stderr,
-			"live overlap returned %d, expected %zu\n", got, N);
+	if (cds_ft_range_count_entries(live) != N_A + N_B) {
+		fprintf(stderr, "B: live count != N_A+N_B (%lu vs %zu)\n",
+			cds_ft_range_count_entries(live), N_A + N_B);
 		rcu_read_unlock();
 		goto out;
 	}
 	rcu_read_unlock();
 
-	/* Re-grafting an empty staging into live should be a no-op success. */
-	if (cds_ft_range_graft(live, staging) < 0) {
-		fprintf(stderr, "no-op graft failed\n");
+	/* No-op merge of empty staging. */
+	if (cds_ft_range_merge(live, staging_b) < 0) {
+		fprintf(stderr, "no-op merge failed\n");
 		goto out;
 	}
 
-	/* POPULATED rejection: insert into staging at the same length
-	 * class as recs[0] (so the conflicting level is guaranteed
-	 * populated in live), then attempt graft. */
-	{
-		uint64_t conflict_L = recs[0]->end - recs[0]->start;
-		uint64_t conflict_a = 0xfffe0000ULL;
-		uint64_t conflict_b = conflict_a + conflict_L;
-		struct rec *extra = rec_alloc(conflict_a, conflict_b, N);
-
-		if (cds_ft_range_insert(staging, conflict_a, conflict_b,
-				&extra->node) < 0)
-			goto out;
-		enum cds_ft_status s = cds_ft_range_graft(live, staging);
-		if (s != CDS_FT_STATUS_POPULATED_ERROR) {
-			fprintf(stderr,
-				"graft into populated dst returned %d, expected %d\n",
-				(int) s, (int) CDS_FT_STATUS_POPULATED_ERROR);
-			goto out;
-		}
-		(void) cds_ft_range_remove(staging, conflict_a,
-			&extra->node);
-		call_rcu(&extra->rcu, rec_free_rcu_cb);
+	/* Sub-scenario C: merge staging_c into live with overlapping
+	 * starts -> per-entry fallback in cds_ft_merge. */
+	if (cds_ft_range_merge(live, staging_c) < 0) {
+		fprintf(stderr, "C: merge with overlap failed\n");
+		goto out;
 	}
+	rcu_read_lock();
+	if (!cds_ft_range_empty(staging_c)) {
+		fprintf(stderr, "C: staging not empty after merge\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_range_count_entries(live) != total) {
+		fprintf(stderr, "C: live count != total (%lu vs %zu)\n",
+			cds_ft_range_count_entries(live), total);
+		rcu_read_unlock();
+		goto out;
+	}
+	int got = collect_overlap(live, 0, UINT64_MAX, 0, got_ids, total);
+	if (got != (int) total) {
+		fprintf(stderr,
+			"live overlap returned %d, expected %zu\n",
+			got, total);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
 
 	/* Detach all of live into a new index. */
 	if (cds_ft_range_detach(live, &detached) < 0) {
@@ -1757,18 +1800,18 @@ static int test_graft_detach(void)
 		rcu_read_unlock();
 		goto out;
 	}
-	if (cds_ft_range_count_entries(detached) != N) {
+	if (cds_ft_range_count_entries(detached) != total) {
 		fprintf(stderr,
-			"detached count != N (got %lu)\n",
+			"detached count != total (got %lu)\n",
 			cds_ft_range_count_entries(detached));
 		rcu_read_unlock();
 		goto out;
 	}
-	got = collect_overlap(detached, 0, UINT64_MAX, 0, got_ids, N);
-	if (got != (int) N) {
+	got = collect_overlap(detached, 0, UINT64_MAX, 0, got_ids, total);
+	if (got != (int) total) {
 		fprintf(stderr,
 			"detached overlap returned %d, expected %zu\n",
-			got, N);
+			got, total);
 		rcu_read_unlock();
 		goto out;
 	}
@@ -1784,13 +1827,22 @@ out:
 		drain_all(live);
 		cds_ft_range_destroy(live);
 	}
-	if (staging) {
-		drain_all(staging);
-		cds_ft_range_destroy(staging);
+	if (staging_a) {
+		drain_all(staging_a);
+		cds_ft_range_destroy(staging_a);
+	}
+	if (staging_b) {
+		drain_all(staging_b);
+		cds_ft_range_destroy(staging_b);
+	}
+	if (staging_c) {
+		drain_all(staging_c);
+		cds_ft_range_destroy(staging_c);
 	}
 	cds_ft_group_destroy(group);
-	free(recs);
-	free(expected_ids);
+	free(recs_a);
+	free(recs_b);
+	free(recs_c);
 	free(got_ids);
 	return ret;
 }
@@ -1991,7 +2043,7 @@ int main(void)
 	RUN_TEST(test_overlap_band);
 	RUN_TEST(test_entering_leaving);
 	RUN_TEST(test_count);
-	RUN_TEST(test_graft_detach);
+	RUN_TEST(test_merge_detach);
 	/* Concurrent test is the slowest; run last. */
 	RUN_TEST(test_concurrent);
 

@@ -207,19 +207,21 @@ enum cds_ft_status cds_ft_range_remove(
 		struct cds_ft_range_node *node);
 
 /*
- * Bulk move primitives (graft / detach), mirroring cds_ft_graft and
- * cds_ft_detach.  Useful for offline staging then atomic publish:
+ * Bulk move primitives (merge / detach), layered on cds_ft_merge
+ * and cds_ft_detach.  Useful for offline-staging-then-atomic-publish
+ * bulk-load and incremental chunk ingestion patterns:
  *
  *     // build offline (no readers, no mutex)
  *     cds_ft_range_create(group, NULL, &staging);
  *     for each range: cds_ft_range_insert(staging, ...);
  *
- *     // optional: skip the in-graft synchronize_rcu
+ *     // optional: skip the in-merge synchronize_rcu by going
+ *     // exclusive while staging has no concurrent readers
  *     cds_ft_range_make_exclusive(staging);
  *
- *     // atomic publish
+ *     // atomic publish (works whether @live is empty or not)
  *     lock(&writer_mutex);
- *     cds_ft_range_graft(live, staging);
+ *     cds_ft_range_merge(live, staging);
  *     unlock(&writer_mutex);
  *
  *     // staging is now empty; reuse or destroy.
@@ -228,35 +230,41 @@ enum cds_ft_status cds_ft_range_remove(
  */
 
 /*
- * cds_ft_range_graft - Move all ranges from @src into @dst.
+ * cds_ft_range_merge - Move all ranges from @src into @dst.
  * @dst: Destination range index.
- * @src: Source range index. Must share dst's cds_ft_group.
+ * @src: Source range index. Must share dst's cds_ft_group, must
+ *       not equal @dst.
  *
- * For each level k where @src has content, @dst's same level must
- * be empty (or absent); per-level tries in @dst are lazily created
- * as needed.  On success @src is emptied (each per-level trie
- * becomes empty but remains allocated for reuse).
+ * For each level k where @src has content, this calls
+ * cds_ft_merge() into the matching @dst level (lazy-creating it
+ * if absent).  cds_ft_merge in turn picks the longest common
+ * prefix of @src's keys at that level and either subtree-grafts
+ * (when @dst has nothing under that prefix — fast path, typical
+ * for time-disjoint trace chunks) or falls back to per-entry
+ * insertion (when keys overlap).  Output-sensitive in both cases:
+ * @dst always ends up holding the union of its prior content and
+ * @src's, and @src is emptied.
  *
- * Concurrent RCU readers see the move published level by level via
- * single atomic pointer updates: at any moment, each level is
- * either entirely the old @dst content or entirely the moved-in
- * @src content, never partial.  A reader that interleaves with the
- * graft may see different levels in different states (some pre-,
- * some post-graft).
+ * @src may be in either exclusive or concurrent mode; exclusive
+ * skips the in-merge synchronize_rcu.
+ *
+ * Concurrent RCU readers on @dst see a sequence of atomic
+ * publishes (one per fast-path graft and one per per-entry
+ * insert).  No reader observes a half-merged duplicate chain at
+ * any key.
  *
  * Mutual exclusion on @dst (and @src, if it could be observed by
  * other writers) is the caller's responsibility, same as cds_ft.
  *
  * Returns CDS_FT_STATUS_OK on success.
- * Returns CDS_FT_STATUS_POPULATED_ERROR if any level in @dst is
- * non-empty where @src has content.
  * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for NULL pointers,
  * @dst == @src, or differing groups.
- * Returns a negative status on per-level graft failure (which may
- * leave the operation in a partial state — earlier levels grafted,
- * later levels not).
+ * Returns a negative status on per-level merge failure.  cds_ft_merge
+ * makes a best-effort rollback of its own initial detach within a
+ * single level on failure; partial state across levels is
+ * possible (earlier levels merged, later levels not).
  */
-enum cds_ft_status cds_ft_range_graft(
+enum cds_ft_status cds_ft_range_merge(
 		struct cds_ft_range *dst,
 		struct cds_ft_range *src);
 
