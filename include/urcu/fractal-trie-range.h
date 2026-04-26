@@ -207,6 +207,110 @@ enum cds_ft_status cds_ft_range_remove(
 		struct cds_ft_range_node *node);
 
 /*
+ * Bulk move primitives (graft / detach), mirroring cds_ft_graft and
+ * cds_ft_detach.  Useful for offline staging then atomic publish:
+ *
+ *     // build offline (no readers, no mutex)
+ *     cds_ft_range_create(group, NULL, &staging);
+ *     for each range: cds_ft_range_insert(staging, ...);
+ *
+ *     // optional: skip the in-graft synchronize_rcu
+ *     cds_ft_range_make_exclusive(staging);
+ *
+ *     // atomic publish
+ *     lock(&writer_mutex);
+ *     cds_ft_range_graft(live, staging);
+ *     unlock(&writer_mutex);
+ *
+ *     // staging is now empty; reuse or destroy.
+ *
+ * Both range indices must share the same cds_ft_group.
+ */
+
+/*
+ * cds_ft_range_graft - Move all ranges from @src into @dst.
+ * @dst: Destination range index.
+ * @src: Source range index. Must share dst's cds_ft_group.
+ *
+ * For each level k where @src has content, @dst's same level must
+ * be empty (or absent); per-level tries in @dst are lazily created
+ * as needed.  On success @src is emptied (each per-level trie
+ * becomes empty but remains allocated for reuse).
+ *
+ * Concurrent RCU readers see the move published level by level via
+ * single atomic pointer updates: at any moment, each level is
+ * either entirely the old @dst content or entirely the moved-in
+ * @src content, never partial.  A reader that interleaves with the
+ * graft may see different levels in different states (some pre-,
+ * some post-graft).
+ *
+ * Mutual exclusion on @dst (and @src, if it could be observed by
+ * other writers) is the caller's responsibility, same as cds_ft.
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_POPULATED_ERROR if any level in @dst is
+ * non-empty where @src has content.
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for NULL pointers,
+ * @dst == @src, or differing groups.
+ * Returns a negative status on per-level graft failure (which may
+ * leave the operation in a partial state — earlier levels grafted,
+ * later levels not).
+ */
+enum cds_ft_status cds_ft_range_graft(
+		struct cds_ft_range *dst,
+		struct cds_ft_range *src);
+
+/*
+ * cds_ft_range_detach - Detach all ranges from @src into a new
+ *                       range index.
+ * @src: Source range index.
+ * @result: Output handle for the newly-created index.
+ *
+ * On success @src is emptied (each per-level trie becomes empty
+ * but remains allocated) and *@result owns a new range index that
+ * shares @src's cds_ft_group.  Each per-level cds_ft in the
+ * returned index is in EXCLUSIVE mode (per cds_ft_detach
+ * semantics): it is safe to inspect or modify single-threaded, but
+ * NOT safe to expose to concurrent RCU readers without first
+ * calling cds_ft_range_make_concurrent().
+ *
+ * Mutual exclusion on @src is the caller's responsibility.
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_MEMORY_ERROR on allocation failure.
+ * Returns a negative status on per-level detach failure (partial
+ * state).
+ */
+enum cds_ft_status cds_ft_range_detach(
+		struct cds_ft_range *src,
+		struct cds_ft_range **result);
+
+/*
+ * cds_ft_range_make_concurrent - Mark every populated per-level
+ *                                trie as concurrent-mode.
+ * @ftr: The range index.
+ *
+ * Cheap: does not block.  Typically called on an index returned
+ * by cds_ft_range_detach() before publishing it to readers.
+ */
+void cds_ft_range_make_concurrent(struct cds_ft_range *ftr);
+
+/*
+ * cds_ft_range_make_exclusive - Mark every populated per-level
+ *                               trie as exclusive-mode.
+ * @ftr: The range index.
+ *
+ * Drains in-flight RCU readers (one synchronize_rcu per
+ * level transitioning out of concurrent mode; no-op for levels
+ * already exclusive).  After this call subsequent grafts using
+ * @ftr as source skip their internal synchronize_rcu.
+ *
+ * Caller asserts that no new RCU readers will enter @ftr until a
+ * matching cds_ft_range_make_concurrent().
+ */
+void cds_ft_range_make_exclusive(struct cds_ft_range *ftr);
+
+/*
  * cds_ft_range_empty - Test whether a range index contains any
  *                      stored ranges.
  * @ftr: The range index.

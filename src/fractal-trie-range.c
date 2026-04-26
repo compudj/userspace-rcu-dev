@@ -319,6 +319,121 @@ out:
 /* Iterator                                                           */
 /* ------------------------------------------------------------------ */
 
+enum cds_ft_status cds_ft_range_graft(struct cds_ft_range *dst,
+		struct cds_ft_range *src)
+{
+	unsigned int k;
+	enum cds_ft_status s;
+
+	if (!dst || !src || dst == src)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (dst->group != src->group)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+
+	/*
+	 * Pre-validate: dst must be empty at every level where src
+	 * has content.  Performed up front so we don't half-graft
+	 * before discovering a population conflict.
+	 */
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *src_lk = rcu_dereference(src->level[k]);
+		struct cds_ft *dst_lk;
+
+		if (!src_lk || cds_ft_empty(src_lk))
+			continue;
+		dst_lk = rcu_dereference(dst->level[k]);
+		if (dst_lk && !cds_ft_empty(dst_lk))
+			return CDS_FT_STATUS_POPULATED_ERROR;
+	}
+
+	/* Graft each populated source level into the destination. */
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *src_lk = rcu_dereference(src->level[k]);
+		struct cds_ft *dst_lk;
+
+		if (!src_lk || cds_ft_empty(src_lk))
+			continue;
+		dst_lk = rcu_dereference(dst->level[k]);
+		if (!dst_lk) {
+			/*
+			 * Lazy-create dst's level so cds_ft_graft has
+			 * an empty destination to graft into.
+			 */
+			s = cds_ft_create(dst->group, NULL, &dst_lk);
+			if (s < 0)
+				return s;
+			rcu_assign_pointer(dst->level[k], dst_lk);
+		}
+		s = cds_ft_graft(dst_lk, NULL, 0, src_lk);
+		if (s < 0)
+			return s;
+	}
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_range_detach(struct cds_ft_range *src,
+		struct cds_ft_range **result)
+{
+	struct cds_ft_range *new_idx;
+	unsigned int k;
+	enum cds_ft_status s;
+
+	if (!src || !result)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	*result = NULL;
+
+	new_idx = (struct cds_ft_range *) calloc(1, sizeof(*new_idx));
+	if (!new_idx)
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	new_idx->group = src->group;
+
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *src_lk = rcu_dereference(src->level[k]);
+		struct cds_ft *detached;
+
+		if (!src_lk || cds_ft_empty(src_lk))
+			continue;
+		s = cds_ft_detach(src_lk, NULL, 0, &detached);
+		if (s < 0)
+			goto err;
+		rcu_assign_pointer(new_idx->level[k], detached);
+	}
+	*result = new_idx;
+	return CDS_FT_STATUS_OK;
+
+err:
+	cds_ft_range_destroy(new_idx);
+	return s;
+}
+
+void cds_ft_range_make_concurrent(struct cds_ft_range *ftr)
+{
+	unsigned int k;
+
+	if (!ftr)
+		return;
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *trie = rcu_dereference(ftr->level[k]);
+
+		if (trie)
+			cds_ft_make_concurrent(trie);
+	}
+}
+
+void cds_ft_range_make_exclusive(struct cds_ft_range *ftr)
+{
+	unsigned int k;
+
+	if (!ftr)
+		return;
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *trie = rcu_dereference(ftr->level[k]);
+
+		if (trie)
+			cds_ft_make_exclusive(trie);
+	}
+}
+
 bool cds_ft_range_empty(struct cds_ft_range *ftr)
 {
 	unsigned int k;

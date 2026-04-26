@@ -47,7 +47,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 13
+#define NR_TESTS 14
 
 /* ------------------------------------------------------------------ */
 /* Group helper                                                       */
@@ -1634,7 +1634,169 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* Test 13: concurrent reader + writer                                */
+/* Test 13: graft / detach                                            */
+/* ------------------------------------------------------------------ */
+
+static int test_graft_detach(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft_range *staging = NULL, *live = NULL, *detached = NULL;
+	const size_t N = 1000;
+	struct rec **recs = NULL;
+	uint64_t *expected_ids = NULL, *got_ids = NULL;
+	int ret = -1;
+
+	group = make_group();
+	if (cds_ft_range_create(group, NULL, &staging) < 0)
+		goto out;
+	if (cds_ft_range_create(group, NULL, &live) < 0)
+		goto out;
+
+	recs = (struct rec **) calloc(N, sizeof(*recs));
+	expected_ids = (uint64_t *) calloc(N, sizeof(*expected_ids));
+	got_ids = (uint64_t *) calloc(N, sizeof(*got_ids));
+	if (!recs || !expected_ids || !got_ids)
+		goto out;
+
+	/* Populate staging. */
+	prng_seed(0x9007);
+	for (size_t i = 0; i < N; i++) {
+		uint64_t a = prng() & ((1ULL << 32) - 1);
+		uint64_t L = 1 + (prng() & ((1ULL << 14) - 1));
+		if (a > UINT64_MAX - L)
+			a = UINT64_MAX - L;
+		recs[i] = rec_alloc(a, a + L, i);
+		expected_ids[i] = i;
+		if (cds_ft_range_insert(staging, a, a + L,
+				&recs[i]->node) < 0)
+			goto out;
+	}
+
+	rcu_read_lock();
+	if (cds_ft_range_count_entries(staging) != N) {
+		fprintf(stderr, "staging count != N\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (!cds_ft_range_empty(live)) {
+		fprintf(stderr, "live not initially empty\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+
+	/* Graft staging into live (live is empty). */
+	if (cds_ft_range_graft(live, staging) < 0) {
+		fprintf(stderr, "graft failed\n");
+		goto out;
+	}
+
+	rcu_read_lock();
+	if (!cds_ft_range_empty(staging)) {
+		fprintf(stderr, "staging not empty after graft\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_range_count_entries(live) != N) {
+		fprintf(stderr,
+			"live count after graft != N (got %lu)\n",
+			cds_ft_range_count_entries(live));
+		rcu_read_unlock();
+		goto out;
+	}
+	/* All N ranges are reachable in live via a wide overlap query. */
+	int got = collect_overlap(live, 0, UINT64_MAX, 0, got_ids, N);
+	if (got != (int) N) {
+		fprintf(stderr,
+			"live overlap returned %d, expected %zu\n", got, N);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+
+	/* Re-grafting an empty staging into live should be a no-op success. */
+	if (cds_ft_range_graft(live, staging) < 0) {
+		fprintf(stderr, "no-op graft failed\n");
+		goto out;
+	}
+
+	/* POPULATED rejection: insert into staging at the same length
+	 * class as recs[0] (so the conflicting level is guaranteed
+	 * populated in live), then attempt graft. */
+	{
+		uint64_t conflict_L = recs[0]->end - recs[0]->start;
+		uint64_t conflict_a = 0xfffe0000ULL;
+		uint64_t conflict_b = conflict_a + conflict_L;
+		struct rec *extra = rec_alloc(conflict_a, conflict_b, N);
+
+		if (cds_ft_range_insert(staging, conflict_a, conflict_b,
+				&extra->node) < 0)
+			goto out;
+		enum cds_ft_status s = cds_ft_range_graft(live, staging);
+		if (s != CDS_FT_STATUS_POPULATED_ERROR) {
+			fprintf(stderr,
+				"graft into populated dst returned %d, expected %d\n",
+				(int) s, (int) CDS_FT_STATUS_POPULATED_ERROR);
+			goto out;
+		}
+		(void) cds_ft_range_remove(staging, conflict_a,
+			&extra->node);
+		call_rcu(&extra->rcu, rec_free_rcu_cb);
+	}
+
+	/* Detach all of live into a new index. */
+	if (cds_ft_range_detach(live, &detached) < 0) {
+		fprintf(stderr, "detach failed\n");
+		goto out;
+	}
+	cds_ft_range_make_concurrent(detached);
+
+	rcu_read_lock();
+	if (!cds_ft_range_empty(live)) {
+		fprintf(stderr, "live not empty after detach\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_range_count_entries(detached) != N) {
+		fprintf(stderr,
+			"detached count != N (got %lu)\n",
+			cds_ft_range_count_entries(detached));
+		rcu_read_unlock();
+		goto out;
+	}
+	got = collect_overlap(detached, 0, UINT64_MAX, 0, got_ids, N);
+	if (got != (int) N) {
+		fprintf(stderr,
+			"detached overlap returned %d, expected %zu\n",
+			got, N);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+
+	ret = 0;
+out:
+	if (detached) {
+		drain_all(detached);
+		cds_ft_range_destroy(detached);
+	}
+	if (live) {
+		drain_all(live);
+		cds_ft_range_destroy(live);
+	}
+	if (staging) {
+		drain_all(staging);
+		cds_ft_range_destroy(staging);
+	}
+	cds_ft_group_destroy(group);
+	free(recs);
+	free(expected_ids);
+	free(got_ids);
+	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 14: concurrent reader + writer                                */
 /* ------------------------------------------------------------------ */
 
 #define CONCURRENT_DURATION_MS	1500
@@ -1829,6 +1991,7 @@ int main(void)
 	RUN_TEST(test_overlap_band);
 	RUN_TEST(test_entering_leaving);
 	RUN_TEST(test_count);
+	RUN_TEST(test_graft_detach);
 	/* Concurrent test is the slowest; run last. */
 	RUN_TEST(test_concurrent);
 
