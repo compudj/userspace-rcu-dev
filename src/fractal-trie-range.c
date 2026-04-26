@@ -632,6 +632,53 @@ enum cds_ft_status cds_ft_range_lookup_stab(
 	return cds_ft_range_lookup_overlap(iter, x, x + 1, granularity);
 }
 
+enum cds_ft_status cds_ft_range_lookup_containing(
+		struct cds_ft_range_iter *iter,
+		uint64_t q_a, uint64_t q_b,
+		uint64_t granularity)
+{
+	enum cds_ft_status s;
+	uint64_t W, length_lo;
+
+	if (!iter)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (q_b <= q_a) {
+		iter->current = NULL;
+		iter->exhausted = true;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	W = q_b - q_a;
+	length_lo = (granularity > W) ? granularity : W;
+
+	/*
+	 * Predicate: start <= q_a AND end >= q_b AND L >= max(g, W).
+	 *
+	 * Scan trie keys T in [q_b - 2^k, q_a + 1) per level: a range
+	 * with start = T at level k has L <= 2^k, so end = T + L
+	 * reaches q_b only when T >= q_b - 2^k.  Reuse the HALO
+	 * strategy with the halo anchor at q_b (lower-halo) and the
+	 * scan_hi bound at q_a + 1 (upper, exclusive).  The per-range
+	 * filter requires end >= q_b (encoded as end > q_b - 1) and
+	 * L >= length_lo.
+	 *
+	 * Length-class pruning: range must have L >= W to fit, so
+	 * skip levels whose max length is less than length_lo.
+	 */
+	iter->scan_strategy = CDS_FT_RANGE_SCAN_HALO;
+	iter->halo_q_a = q_b;
+	iter->halo_q_b = q_a + 1;	/* q_a < q_b <= UINT64_MAX so no overflow */
+	iter->end_floor = q_b - 1;	/* q_b > 0 since q_b > q_a >= 0 */
+	iter->end_ceil = UINT64_MAX;
+	iter->length_lo = length_lo;
+	iter->length_hi = UINT64_MAX;
+	iter->k_min = min_level_for_granularity(length_lo);
+	iter->k_max = CDS_FT_RANGE_NR_LEVELS - 1;
+	s = iter_begin(iter);
+	if (s != CDS_FT_STATUS_OK)
+		return s;
+	return advance_to_match(iter);
+}
+
 enum cds_ft_status cds_ft_range_lookup_contained_in(
 		struct cds_ft_range_iter *iter,
 		uint64_t q_a, uint64_t q_b,

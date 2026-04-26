@@ -299,6 +299,31 @@ enum cds_ft_status cds_ft_range_lookup_overlap_band(
 		uint64_t length_lo, uint64_t length_hi);
 
 /*
+ * cds_ft_range_lookup_containing - Position the iterator at the
+ *     first range fully containing [q_a, q_b) with length >=
+ *     granularity.
+ *     Predicate: start <= q_a AND end >= q_b AND L >= g.
+ * @iter: The iterator.
+ * @q_a, @q_b: Window bounds (half-open). q_b > q_a.
+ * @granularity: Minimum range length to return. Pass 0 to disable
+ *     culling.
+ *
+ * Useful for "what state(s) span this region?" queries: e.g.,
+ * given a hover region, find the enclosing process / phase / span.
+ *
+ * Cost focuses on the coarse end of the level partitioning because
+ * containing ranges must have L >= q_b - q_a, so length-class
+ * levels with maximum length less than the window width are
+ * skipped entirely.
+ *
+ * Same RCU locking discipline as cds_ft_range_lookup_overlap().
+ */
+enum cds_ft_status cds_ft_range_lookup_containing(
+		struct cds_ft_range_iter *iter,
+		uint64_t q_a, uint64_t q_b,
+		uint64_t granularity);
+
+/*
  * cds_ft_range_lookup_contained_in - Position the iterator at the
  *     first range fully inside [q_a, q_b) with length >= granularity.
  *     Predicate: start >= q_a AND end <= q_b AND L >= g.
