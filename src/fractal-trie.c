@@ -6793,6 +6793,15 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 		node_flag = ft_dereference_acquire_prefetch(cn->child);
 		if (!ft_node_ptr(node_flag))
 			goto out_break;
+		/*
+		 * iter_path[level] is the dispatcher for byte at index
+		 * level - 1 (i.e. the byte AFTER the compressed prefix).
+		 * That dispatcher is cn->child, not the compressed node
+		 * itself, so overwrite the fill-loop's compressed entry at
+		 * this position. going_up relies on this to find the
+		 * sibling of the failing byte in cn->child.
+		 */
+		iter_path_node(iter)[level] = node_flag;
 		iter_path_node(iter)[level + 1] = node_flag;
 		*skip_eq_external_nodes_p = false;
 		*node_flag_p = node_flag;
@@ -6817,6 +6826,7 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			if (!ft_node_ptr(node_flag))
 				goto out_break;
+			iter_path_node(iter)[level] = node_flag;
 			iter_path_node(iter)[level + 1] = node_flag;
 			*skip_eq_external_nodes_p = false;
 			*node_flag_p = node_flag;
@@ -6840,6 +6850,7 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 	node_flag = ft_dereference_acquire_prefetch(cn->child);
 	if (!ft_node_ptr(node_flag))
 		goto out_break;
+	iter_path_node(iter)[level] = node_flag;
 	iter_path_node(iter)[level + 1] = node_flag;
 	if (ft_node_external(node_flag))
 		goto out_break;
