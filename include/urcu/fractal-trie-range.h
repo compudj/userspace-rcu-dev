@@ -207,6 +207,54 @@ enum cds_ft_status cds_ft_range_remove(
 		struct cds_ft_range_node *node);
 
 /*
+ * cds_ft_range_empty - Test whether a range index contains any
+ *                      stored ranges.
+ * @ftr: The range index.
+ *
+ * Returns true when no range is currently stored, false otherwise.
+ *
+ * RCU read-side lock must be held by the caller (the function may
+ * cds_ft_empty() the lazily-created per-level tries).  The result
+ * is a snapshot: concurrent inserts / removes may change the
+ * emptiness state at any time.
+ */
+bool cds_ft_range_empty(struct cds_ft_range *ftr);
+
+/*
+ * cds_ft_range_count_keys - Return the number of distinct (start)
+ *                           keys currently stored across all
+ *                           length-class levels.
+ * @ftr: The range index.
+ *
+ * Sums cds_ft_count_keys() across the populated per-level tries.
+ * Each level is O(1), and at most key_len * 8 = 64 levels are
+ * inspected, so the operation is O(1) overall (with a small
+ * constant).  Multiple ranges sharing the same start are counted
+ * once each only at their level — i.e., this counts unique
+ * (start, level) pairs, not total entries.  Use
+ * cds_ft_range_count_entries() for the inserted-range count.
+ *
+ * RCU read-side lock must be held; concurrent updates may change
+ * the count between calls.
+ */
+unsigned long cds_ft_range_count_keys(struct cds_ft_range *ftr);
+
+/*
+ * cds_ft_range_count_entries - Return the number of inserted
+ *                              ranges (counting duplicates at the
+ *                              same start).
+ * @ftr: The range index.
+ *
+ * Sums cds_ft_count_entries() across all populated per-level
+ * tries.  This is the total number of cds_ft_range_node entries
+ * stored.  O(N) in the number of inserted ranges.
+ *
+ * RCU read-side lock must be held; concurrent updates may change
+ * the count between calls.
+ */
+unsigned long cds_ft_range_count_entries(struct cds_ft_range *ftr);
+
+/*
  * cds_ft_range_iter_create - Create an iterator for an overlap query.
  * @ftr: The range index.
  * @result_iter: Output iterator handle.

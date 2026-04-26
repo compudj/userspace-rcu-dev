@@ -319,6 +319,53 @@ out:
 /* Iterator                                                           */
 /* ------------------------------------------------------------------ */
 
+bool cds_ft_range_empty(struct cds_ft_range *ftr)
+{
+	unsigned int k;
+
+	if (!ftr)
+		return true;
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *trie = rcu_dereference(ftr->level[k]);
+
+		if (trie && !cds_ft_empty(trie))
+			return false;
+	}
+	return true;
+}
+
+unsigned long cds_ft_range_count_keys(struct cds_ft_range *ftr)
+{
+	unsigned long total = 0;
+	unsigned int k;
+
+	if (!ftr)
+		return 0;
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *trie = rcu_dereference(ftr->level[k]);
+
+		if (trie)
+			total += cds_ft_count_keys(trie);
+	}
+	return total;
+}
+
+unsigned long cds_ft_range_count_entries(struct cds_ft_range *ftr)
+{
+	unsigned long total = 0;
+	unsigned int k;
+
+	if (!ftr)
+		return 0;
+	for (k = 0; k < CDS_FT_RANGE_NR_LEVELS; k++) {
+		struct cds_ft *trie = rcu_dereference(ftr->level[k]);
+
+		if (trie)
+			total += cds_ft_count_entries(trie);
+	}
+	return total;
+}
+
 enum cds_ft_status cds_ft_range_iter_create(struct cds_ft_range *ftr,
 		struct cds_ft_range_iter **result_iter)
 {

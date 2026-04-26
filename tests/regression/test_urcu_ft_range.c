@@ -47,7 +47,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 12
+#define NR_TESTS 13
 
 /* ------------------------------------------------------------------ */
 /* Group helper                                                       */
@@ -1553,7 +1553,88 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* Test 12: concurrent reader + writer                                */
+/* Test 12: empty / count_keys / count_entries                        */
+/* ------------------------------------------------------------------ */
+
+#define COUNT_TEST_N 1000
+
+static int test_count(void)
+{
+	struct cds_ft_range *ftr;
+	struct rec **recs = NULL;
+	int ret = -1;
+
+	struct cds_ft_group *group = make_group();
+	if (cds_ft_range_create(group, NULL, &ftr) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	recs = (struct rec **) calloc(COUNT_TEST_N, sizeof(*recs));
+	if (!recs)
+		goto out;
+
+	rcu_read_lock();
+	if (!cds_ft_range_empty(ftr)) {
+		fprintf(stderr, "fresh index reports non-empty\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_range_count_keys(ftr) != 0) {
+		fprintf(stderr, "fresh index has non-zero key count\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_range_count_entries(ftr) != 0) {
+		fprintf(stderr, "fresh index has non-zero entry count\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+
+	for (size_t i = 0; i < COUNT_TEST_N; i++) {
+		uint64_t a = i * 17;
+		uint64_t L = 1 + (i & 0xff);
+		recs[i] = rec_alloc(a, a + L, i);
+		if (cds_ft_range_insert(ftr, a, a + L, &recs[i]->node) < 0)
+			goto out;
+	}
+
+	rcu_read_lock();
+	if (cds_ft_range_empty(ftr)) {
+		fprintf(stderr, "populated index reports empty\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_range_count_entries(ftr) != COUNT_TEST_N) {
+		fprintf(stderr,
+			"count_entries: got %lu, expected %d\n",
+			cds_ft_range_count_entries(ftr), COUNT_TEST_N);
+		rcu_read_unlock();
+		goto out;
+	}
+	/* Each range routes to exactly one level by its length class;
+	 * starts (0, 17, 34, ...) are unique within each level, so
+	 * count_keys totals to N. */
+	if (cds_ft_range_count_keys(ftr) != COUNT_TEST_N) {
+		fprintf(stderr,
+			"count_keys: got %lu, expected %d\n",
+			cds_ft_range_count_keys(ftr), COUNT_TEST_N);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+
+	ret = 0;
+out:
+	free(recs);
+	drain_all(ftr);
+	cds_ft_range_destroy(ftr);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 13: concurrent reader + writer                                */
 /* ------------------------------------------------------------------ */
 
 #define CONCURRENT_DURATION_MS	1500
@@ -1747,6 +1828,7 @@ int main(void)
 	RUN_TEST(test_contained_in);
 	RUN_TEST(test_overlap_band);
 	RUN_TEST(test_entering_leaving);
+	RUN_TEST(test_count);
 	/* Concurrent test is the slowest; run last. */
 	RUN_TEST(test_concurrent);
 
