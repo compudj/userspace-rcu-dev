@@ -632,6 +632,47 @@ enum cds_ft_status cds_ft_range_lookup_stab(
 	return cds_ft_range_lookup_overlap(iter, x, x + 1, granularity);
 }
 
+enum cds_ft_status cds_ft_range_lookup_contained_in(
+		struct cds_ft_range_iter *iter,
+		uint64_t q_a, uint64_t q_b,
+		uint64_t granularity)
+{
+	enum cds_ft_status s;
+	uint64_t W;
+
+	if (!iter)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (q_b <= q_a) {
+		iter->current = NULL;
+		iter->exhausted = true;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	W = q_b - q_a;
+
+	/*
+	 * Predicate: start in [q_a, q_b) AND end <= q_b AND L >= g.
+	 *
+	 * Use a FIXED-range scan so we only see trie keys with start
+	 * in [q_a, q_b); the per-range end_ceil filter enforces
+	 * end <= q_b; length_hi = W + 1 (inclusive cap at L = W) prunes
+	 * length-class levels whose minimum length exceeds the window
+	 * width.
+	 */
+	iter->scan_strategy = CDS_FT_RANGE_SCAN_FIXED;
+	iter->scan_start_lo = q_a;
+	iter->scan_start_hi = q_b;
+	iter->end_floor = 0;	/* end > 0 is tautologically true (L >= 1). */
+	iter->end_ceil = q_b;
+	iter->length_lo = granularity;
+	iter->length_hi = (W == UINT64_MAX) ? UINT64_MAX : W + 1;
+	iter->k_min = min_level_for_granularity(granularity);
+	iter->k_max = max_level_for_length_hi(iter->length_hi);
+	s = iter_begin(iter);
+	if (s != CDS_FT_STATUS_OK)
+		return s;
+	return advance_to_match(iter);
+}
+
 enum cds_ft_status cds_ft_range_lookup_overlap_band(
 		struct cds_ft_range_iter *iter,
 		uint64_t q_a, uint64_t q_b,

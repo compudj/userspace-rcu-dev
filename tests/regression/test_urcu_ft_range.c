@@ -47,7 +47,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 10
+#define NR_TESTS 11
 
 /* ------------------------------------------------------------------ */
 /* Group helper                                                       */
@@ -839,7 +839,142 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* Test 8: overlap_band parity                                        */
+/* Test 8: contained_in parity                                        */
+/* ------------------------------------------------------------------ */
+
+static int collect_contained_in(struct cds_ft_range *ftr,
+		uint64_t q_a, uint64_t q_b, uint64_t g,
+		uint64_t *ids, size_t cap)
+{
+	struct cds_ft_range_iter *it;
+	struct cds_ft_range_node *n;
+	size_t k = 0;
+
+	if (cds_ft_range_iter_create(ftr, &it) < 0)
+		return -1;
+	rcu_read_lock();
+	cds_ft_range_lookup_contained_in(it, q_a, q_b, g);
+	while ((n = cds_ft_range_iter_node(it)) != NULL) {
+		struct rec *r = caa_container_of(n, struct rec, node);
+		if (k >= cap) {
+			rcu_read_unlock();
+			cds_ft_range_iter_destroy(it);
+			return -1;
+		}
+		ids[k++] = r->id;
+		cds_ft_range_iter_next(it);
+	}
+	rcu_read_unlock();
+	cds_ft_range_iter_destroy(it);
+	return (int) k;
+}
+
+static size_t shadow_contained_in(const struct shadow *s, size_t n,
+		uint64_t q_a, uint64_t q_b, uint64_t g, uint64_t *out)
+{
+	size_t k = 0;
+	for (size_t i = 0; i < n; i++) {
+		uint64_t L = s[i].end - s[i].start;
+		if (L < g)
+			continue;
+		if (s[i].start >= q_a && s[i].end <= q_b)
+			out[k++] = s[i].id;
+	}
+	return k;
+}
+
+static int test_contained_in(void)
+{
+	struct cds_ft_range *ftr;
+	const size_t N = 3000;
+	const size_t Q = 200;
+	struct shadow *shadow = NULL;
+	uint64_t *got_ids = NULL, *want_ids = NULL;
+	int ret = -1;
+	size_t cap = N;
+
+	struct cds_ft_group *group = make_group();
+	if (cds_ft_range_create(group, NULL, &ftr) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	shadow = (struct shadow *) calloc(N, sizeof(*shadow));
+	got_ids = (uint64_t *) calloc(cap, sizeof(*got_ids));
+	want_ids = (uint64_t *) calloc(cap, sizeof(*want_ids));
+	if (!shadow || !got_ids || !want_ids)
+		goto out;
+
+	prng_seed(0xc011);
+	for (size_t i = 0; i < N; i++) {
+		uint64_t a = prng() & ((1ULL << 40) - 1);
+		uint64_t L = 1 + (prng() & ((1ULL << 18) - 1));
+		uint64_t b;
+		struct rec *r;
+		if (a > UINT64_MAX - L)
+			a = UINT64_MAX - L;
+		b = a + L;
+		shadow[i].start = a;
+		shadow[i].end = b;
+		shadow[i].id = i;
+		r = rec_alloc(a, b, i);
+		if (cds_ft_range_insert(ftr, a, b, &r->node) < 0)
+			goto out;
+	}
+
+	for (size_t q = 0; q < Q; q++) {
+		uint64_t base = prng() & ((1ULL << 40) - 1);
+		/* Window widths: a mix of "around typical L" (most contained)
+		 * and "tight" (few contained) to exercise level pruning. */
+		unsigned int wbits = 1 + (prng() % 23);
+		uint64_t W = 1 + (prng() & ((1ULL << wbits) - 1));
+		uint64_t q_a = base;
+		uint64_t q_b;
+		uint64_t g = (q & 3) ? 0 : (1ULL << ((prng() & 0xf)));
+		size_t got_n, want_n;
+
+		if (q_a > UINT64_MAX - W)
+			q_a = UINT64_MAX - W;
+		q_b = q_a + W;
+
+		want_n = shadow_contained_in(shadow, N, q_a, q_b, g, want_ids);
+		int got = collect_contained_in(ftr, q_a, q_b, g,
+			got_ids, cap);
+		if (got < 0) {
+			fprintf(stderr, "contained_in collect failed q=%zu\n", q);
+			goto out;
+		}
+		got_n = (size_t) got;
+		if (got_n != want_n) {
+			fprintf(stderr,
+				"contained_in mismatch q=%zu [%" PRIu64
+				", %" PRIu64 ") g=%" PRIu64
+				": got %zu want %zu\n",
+				q, q_a, q_b, g, got_n, want_n);
+			goto out;
+		}
+		qsort(got_ids, got_n, sizeof(*got_ids), u64_cmp);
+		qsort(want_ids, want_n, sizeof(*want_ids), u64_cmp);
+		if (memcmp(got_ids, want_ids,
+				got_n * sizeof(*got_ids)) != 0) {
+			fprintf(stderr,
+				"contained_in id-set mismatch q=%zu\n", q);
+			goto out;
+		}
+	}
+
+	ret = 0;
+out:
+	free(shadow);
+	free(got_ids);
+	free(want_ids);
+	drain_all(ftr);
+	cds_ft_range_destroy(ftr);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 9: overlap_band parity                                        */
 /* ------------------------------------------------------------------ */
 
 static size_t shadow_overlap_band(const struct shadow *s, size_t n,
@@ -976,7 +1111,7 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* Test 9: entering / leaving parity                                  */
+/* Test 10: entering / leaving parity                                 */
 /* ------------------------------------------------------------------ */
 
 static size_t shadow_entering(const struct shadow *s, size_t n,
@@ -1273,7 +1408,7 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* Test 10: concurrent reader + writer                                */
+/* Test 11: concurrent reader + writer                                */
 /* ------------------------------------------------------------------ */
 
 #define CONCURRENT_DURATION_MS	1500
@@ -1463,6 +1598,7 @@ int main(void)
 	RUN_TEST(test_pan);
 	RUN_TEST(test_edges);
 	RUN_TEST(test_stab);
+	RUN_TEST(test_contained_in);
 	RUN_TEST(test_overlap_band);
 	RUN_TEST(test_entering_leaving);
 	/* Concurrent test is the slowest; run last. */

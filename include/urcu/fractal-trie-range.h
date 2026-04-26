@@ -299,6 +299,28 @@ enum cds_ft_status cds_ft_range_lookup_overlap_band(
 		uint64_t length_lo, uint64_t length_hi);
 
 /*
+ * cds_ft_range_lookup_contained_in - Position the iterator at the
+ *     first range fully inside [q_a, q_b) with length >= granularity.
+ *     Predicate: start >= q_a AND end <= q_b AND L >= g.
+ * @iter: The iterator.
+ * @q_a, @q_b: Window bounds (half-open). q_b > q_a.
+ * @granularity: Minimum range length to return. Pass 0 to disable
+ *     culling.
+ *
+ * Useful for "list all ranges entirely within this selection" /
+ * sub-trace export / layout passes that need self-contained ranges.
+ * Cost is bounded by the per-level scan over [q_a, q_b) and skips
+ * length-class levels whose minimum length exceeds the window
+ * width.
+ *
+ * Same RCU locking discipline as cds_ft_range_lookup_overlap().
+ */
+enum cds_ft_status cds_ft_range_lookup_contained_in(
+		struct cds_ft_range_iter *iter,
+		uint64_t q_a, uint64_t q_b,
+		uint64_t granularity);
+
+/*
  * cds_ft_range_lookup_entering - Position the iterator at the first
  *     range entering the viewport on a transition from
  *     [old_q_a, old_q_b) to [new_q_a, new_q_b) at granularity g.
