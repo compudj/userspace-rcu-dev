@@ -9152,6 +9152,24 @@ next:
  */
 #define FT_COLLAPSE_ABSORBED_MAX	512
 
+static
+int ft_collapsed_explode_node(struct cds_ft *ft,
+		struct cds_ft_collapsed_node *col,
+		struct cds_ft_inode_flag *col_flag,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot,
+		unsigned int depth,
+		struct cds_ft_inode_flag **out_internal_flag);
+
+#ifdef FEATURE_FT_COMPRESS
+static
+int ft_compress_chain_at(struct cds_ft *ft,
+		struct cds_ft_inode_flag *top_flag,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot,
+		unsigned int top_depth);
+#endif
+
 static inline
 void ft_record_absorbed(struct cds_ft_inode_flag **absorbed,
 		unsigned int *absorbed_depths,
@@ -9888,15 +9906,30 @@ void ft_free_absorbed_node(struct cds_ft *ft,
 
 /*
  * ft_check_collapse_on_path: after a mutation, walk the key path from
- * root to leaf through the LIVE trie, evaluating each internal node
- * for collapse.  This sees all nodes including freshly created
- * junctions from compressed splits, which may not be in the snapshot.
+ * root to leaf through the LIVE trie in three passes.  This sees all
+ * nodes including freshly created junctions from compressed splits,
+ * which may not be in the snapshot.
  *
- * Collapses are applied immediately top-down: when an internal node
+ * Pass 1 (dissolve, skip-compress mode only): explode any collapsed
+ * node on the path back into structured internals so subsequent
+ * passes see explicit shape.
+ *
+ * Pass 2 (chain-compress): at every visited internal, fold chains
+ * of single-child no-external-nodes internals into compressed (or
+ * skip-encoded compressed) nodes.  Self-compress when the visited
+ * node is itself a chain head (except the root, which must stay
+ * internal); otherwise iterate immediate children and compress each
+ * chain-head child to canonicalize the absorbed footprint pass 3
+ * will see.
+ *
+ * Pass 3 (collapse-attempt): evaluate each internal node on the
+ * canonicalized path for collapse acceptance.  When an internal node
  * qualifies, it is replaced with a collapsed node before continuing
  * deeper.  The walk then descends into the collapsed node's matching
  * entry, naturally handling multi-level collapse without a separate
- * collection pass.
+ * collection pass.  Skipped at CDS_FT_COLLAPSE_THRESHOLD_DISABLED;
+ * passes 1 and 2 still run to keep canonical form across
+ * insert+remove sequences regardless of acceptance threshold.
  */
 static
 void ft_check_collapse_on_path(struct cds_ft *ft,
@@ -9908,10 +9941,198 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 	const uint8_t *ik = key;
 	unsigned int depth = 0;
 
+#ifdef FEATURE_FT_COMPRESS
 	/*
-	 * Fast path: collapse disabled on this trie — skip the entire
-	 * post-mutation path walk.  This is what users opt into when
-	 * write throughput matters more than read locality.
+	 * Pass 1+2 (canonicalization): walk the mutation path top-down,
+	 * dissolving collapseds (skip-compress mode only) and
+	 * opportunistically compressing chains of single-child
+	 * no-external-nodes internals into compressed (or skip-encoded
+	 * compressed) nodes.  Pass 3's collapse-acceptance gate then
+	 * evaluates against canonical layout — its absorbed_footprint
+	 * count is no longer inflated by uncompressed chains, so it
+	 * makes the same decision a fresh-canonical trie would make.
+	 *
+	 * Pass 2 (chain-compress) runs at every visited internal:
+	 *
+	 *   - If the visited node itself is a chain head (single-child
+	 *     no-external-nodes), compress its chain in place; the
+	 *     replacement compressed becomes the new visited node.
+	 *
+	 *   - Otherwise, iterate its children and compress each child
+	 *     that is a chain head.  This canonicalizes one step out
+	 *     from the descent path so pass 3's absorbed_footprint
+	 *     counts neighbors at their canonical (compressed) cost,
+	 *     not at chain cost.
+	 *
+	 * Pass 1 (dissolve) is gated on ft_group_skip_compressed.
+	 * Without skip-compress the cost lattice is monotonic
+	 * (collapsed strictly cheaper than the chain it absorbs),
+	 * greedy collapse is correct, and dissolve adds pure
+	 * write-side overhead with no read-side benefit.
+	 */
+	{
+		bool can_dissolve = ft_group_skip_compressed(ft->group);
+		struct cds_ft_inode_flag *p1_nf;
+		struct cds_ft_inode_flag **p1_slot;
+		struct cds_ft_inode_flag *p1_pnf = NULL;
+		const uint8_t *p1_ik = key;
+		unsigned int p1_depth = 0;
+
+		p1_nf = ft_dereference_prefetch(ft->root);
+		p1_slot = &ft->root;
+
+		while (p1_depth < key_len + 1) {
+			/*
+			 * Resolve skip-encoded compressed up-front: a slot may
+			 * hold a skip-encoded pointer whose low tag bits inherit
+			 * the wrapped child's tag, so untreated dispatch via
+			 * ft_node_compressed/ft_node_external would mis-classify.
+			 */
+			p1_nf = ft_resolve_skip_compressed(p1_nf);
+			if (!ft_node_ptr(p1_nf))
+				break;
+			if (ft_node_external(p1_nf))
+				break;
+			if (ft_node_compressed(p1_nf)) {
+				struct cds_ft_compressed_node *cn =
+					ft_compressed_node_ptr(p1_nf);
+				unsigned int remaining =
+					key_len - p1_depth;
+				unsigned int cmp = cn->len < remaining ?
+					cn->len : remaining;
+				unsigned int j;
+
+				for (j = 0; j < cmp; j++) {
+					if (p1_ik[j] != cn->key_bytes[j])
+						break;
+				}
+				if (j < cmp)
+					break;
+				p1_slot = &cn->child;
+				p1_pnf = p1_nf;
+				p1_nf = ft_dereference_acquire_prefetch(
+					cn->child);
+				p1_depth += cn->len;
+				p1_ik += cn->len;
+				continue;
+			}
+			if (ft_node_collapsed(p1_nf)) {
+				struct cds_ft_collapsed_node *col;
+				struct cds_ft_inode_flag *internal_flag;
+				int err;
+
+				if (!can_dissolve)
+					break;
+				col = ft_collapsed_node_ptr(p1_nf);
+				err = ft_collapsed_explode_node(ft, col,
+					p1_nf, p1_pnf, p1_slot,
+					p1_depth, &internal_flag);
+				if (err < 0)
+					return;
+				p1_nf = internal_flag;
+				/* Re-process at same depth. */
+				continue;
+			}
+			/* Internal node. */
+			{
+				struct cds_ft_metadata *m =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(p1_nf));
+				bool is_root = (p1_pnf == NULL);
+				bool is_chain_head =
+					(m->nr_child == 1 && !m->external_nodes);
+
+				/*
+				 * Self-compress: visited node is itself a
+				 * chain head.  After replace, p1_nf becomes
+				 * the new compressed; re-enter the loop to
+				 * walk through its bytes.  Skipped at root
+				 * because root must stay internal.
+				 */
+				if (is_chain_head && !is_root) {
+					int r = ft_compress_chain_at(ft,
+						p1_nf, p1_pnf, p1_slot,
+						p1_depth);
+
+					if (r < 0)
+						return;
+					if (r > 0) {
+						p1_nf = ft_dereference_acquire(
+							*p1_slot);
+						continue;
+					}
+					/* r == 0: chain too short, fall through. */
+				}
+				/*
+				 * Iterate children and chain-compress each
+				 * chain-head internal child.  Compressed
+				 * children are already canonical; collapsed
+				 * and external children are not chain heads.
+				 * Skip-encoded children are resolved by
+				 * ft_node_get_direction to their underlying
+				 * compressed.
+				 */
+				{
+					int prev = -1;
+					uint8_t k = 0;
+					struct cds_ft_inode_flag *c;
+
+					c = ft_node_get_direction(p1_nf,
+						prev, &k, FT_RIGHT);
+					while (ft_node_ptr(c)) {
+						if (ft_node_internal(c)) {
+							struct cds_ft_metadata *cm =
+								cds_ft_item_to_metadata(
+									ft_node_ptr(c));
+
+							if (cm->nr_child == 1
+							    && !cm->external_nodes) {
+								struct cds_ft_inode_flag **child_slot = NULL;
+
+								ft_node_get_nth(p1_nf,
+									&child_slot, k,
+									FT_PF_NONE);
+								if (child_slot) {
+									int r = ft_compress_chain_at(
+										ft, c, p1_nf,
+										child_slot,
+										p1_depth + 1);
+									if (r < 0)
+										return;
+								}
+							}
+						}
+						prev = (int) k;
+						c = ft_node_get_direction(p1_nf,
+							prev, &k, FT_RIGHT);
+					}
+				}
+			}
+			/* Descend by key byte. */
+			{
+				uint8_t kv = *(p1_ik++);
+				struct cds_ft_inode_flag **slot = NULL;
+				struct cds_ft_inode_flag *child;
+
+				child = ft_node_get_nth(p1_nf, &slot, kv,
+					FT_PF_NONE);
+				if (!slot || !ft_node_ptr(child))
+					break;
+				p1_slot = slot;
+				p1_pnf = p1_nf;
+				p1_nf = child;
+				p1_depth++;
+			}
+		}
+	}
+#endif
+
+	/*
+	 * Pass 3 (collapse-attempt) is the only stage that depends on
+	 * the threshold.  Pass 1+2 (canonicalization) above always run
+	 * so insert+remove sequences and fresh inserts converge to the
+	 * same skip-encoded canonical form regardless of whether
+	 * collapse is enabled.
 	 */
 	if (uatomic_load(&ft->collapse_threshold_pct, CMM_RELAXED)
 	    == CDS_FT_COLLAPSE_THRESHOLD_DISABLED)
@@ -11565,55 +11786,17 @@ collapsed_explode:
 	{
 		/*
 		 * Collapsed node full or has prefix conflict: explode
-		 * into internal + compressed nodes.  Uses recursive
-		 * trie rebuild to handle entries that may share first
-		 * suffix bytes.
+		 * into internal + compressed nodes.
 		 */
 		struct cds_ft_inode_flag *internal_flag;
-		struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) col);
-		/*
-		 * Save collapsed node's density and footprint before
-		 * explode frees it.
-		 */
-		unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
-		unsigned int old_col_fp = ft_node_readside_footprint(ft, d->nf);
-		unsigned int di;
+		int err;
 
-		for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
-			old_col_density[di] = ft_density_get(col_meta, di);
-
-		internal_flag = ft_explode_entries(ft, col, cptrs,
-			0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
-			0, d->depth);
-		if (!internal_flag) {
-			*ret_p = -ENOMEM;
+		err = ft_collapsed_explode_node(ft, col, d->nf,
+			d->pnf, d->nfp, d->depth, &internal_flag);
+		if (err < 0) {
+			*ret_p = err;
 			return FT_DESCENT_END;
 		}
-		{
-			struct cds_ft_metadata *int_meta =
-				ft_flag_to_metadata(internal_flag);
-
-			if (col_meta->external_nodes) {
-				ft_metadata_set_external_nodes(internal_flag,
-					int_meta, col_meta->external_nodes);
-				ft_nr_keys_store(ft, int_meta,
-					ft_nr_keys_get(int_meta) + 1,
-					CMM_RELAXED);
-			}
-		}
-		ft_init_node_density(ft, internal_flag);
-
-		ft_set_parent(internal_flag, d->pnf, d->nfp);
-		ft_publish_to_parent(ft, d->pnf, d->nfp, internal_flag);
-		free_collapsed_node(ft, col);
-
-		ft_propagate_density_replace(ft, internal_flag, d->depth,
-			old_col_density, old_col_fp,
-			cds_ft_item_to_metadata(ft_node_ptr(internal_flag)),
-			ft_node_readside_footprint(ft, internal_flag),
-			NULL, 0);
-
 		d->nf = internal_flag;
 		return FT_DESCENT_CONTINUE;
 	}
@@ -11694,23 +11877,35 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 		unsigned int base_depth)
 {
 #ifdef FEATURE_FT_COMPRESS
-	if (len >= 2) {
-		struct cds_ft_compressed_node *cn;
-		struct cds_ft_metadata *cn_meta;
-		struct cds_ft_inode_flag *cflag;
+	/*
+	 * In skip mode allow len == 1: the 1-byte compressed publishes
+	 * as a skip-encoded pointer (0 CL on the read side), which is
+	 * strictly cheaper than the 1-child internal it replaces.  In
+	 * non-skip mode a 1-byte compressed is just an extra indirection
+	 * over a 1-child internal — keep the historical len >= 2 floor.
+	 */
+	{
+		unsigned int min_compress_len =
+			ft_group_skip_compressed(ft->group) ? 1 : 2;
 
-		cn = alloc_compressed_node(ft, len, &cn_meta);
-		if (!cn)
-			return NULL;
-		cn->child = child;
-		cn->len = len;
-		memcpy(cn->key_bytes, ordinals, len);
-		cn_meta->nr_child = 1;
-		ft_nr_keys_store(ft, cn_meta, nr_keys, CMM_RELAXED);
-		cflag = ft_compressed_node_flag(cn);
-		ft_set_parent(child, cflag, NULL);
-		ft_init_node_density(ft, cflag);
-		return ft_publish_compressed(ft, cn, cflag);
+		if (len >= min_compress_len) {
+			struct cds_ft_compressed_node *cn;
+			struct cds_ft_metadata *cn_meta;
+			struct cds_ft_inode_flag *cflag;
+
+			cn = alloc_compressed_node(ft, len, &cn_meta);
+			if (!cn)
+				return NULL;
+			cn->child = child;
+			cn->len = len;
+			memcpy(cn->key_bytes, ordinals, len);
+			cn_meta->nr_child = 1;
+			ft_nr_keys_store(ft, cn_meta, nr_keys, CMM_RELAXED);
+			cflag = ft_compressed_node_flag(cn);
+			ft_set_parent(child, cflag, NULL);
+			ft_init_node_density(ft, cflag);
+			return ft_publish_compressed(ft, cn, cflag);
+		}
 	}
 #endif
 	{
@@ -11916,6 +12111,243 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		return internal_flag;
 	}
 }
+
+/*
+ * ft_collapsed_explode_node: explode a collapsed node into an
+ * internal/compressed subtree at the same parent slot.  Used by the
+ * insert / detach / dissolve paths where a collapsed becomes
+ * unsuitable (full, prefix conflict, or canonicalization).
+ *
+ * On success @*out_internal_flag receives the published replacement
+ * (an internal node with the entries laid out as children).  Density
+ * is propagated; the old collapsed is freed via call_rcu.  Any
+ * resulting chains of single-child internals are not folded here —
+ * that is left to the chain-compress pass in
+ * ft_check_collapse_on_path.
+ *
+ * Returns 0 on success, -ENOMEM on allocation failure.  The collapsed
+ * is left untouched on failure — callers must propagate the error.
+ */
+static
+int ft_collapsed_explode_node(struct cds_ft *ft,
+		struct cds_ft_collapsed_node *col,
+		struct cds_ft_inode_flag *col_flag,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot,
+		unsigned int depth,
+		struct cds_ft_inode_flag **out_internal_flag)
+{
+	struct cds_ft_inode_flag *internal_flag;
+	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) col);
+	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col,
+		ft_collapsed_nr_entries(col));
+	unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
+	unsigned int old_col_fp = ft_node_readside_footprint(ft, col_flag);
+	unsigned int di;
+
+	for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
+		old_col_density[di] = ft_density_get(col_meta, di);
+
+	internal_flag = ft_explode_entries(ft, col, cptrs,
+		0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
+		0, depth);
+	if (!internal_flag)
+		return -ENOMEM;
+	{
+		struct cds_ft_metadata *int_meta =
+			ft_flag_to_metadata(internal_flag);
+
+		if (col_meta->external_nodes) {
+			ft_metadata_set_external_nodes(internal_flag,
+				int_meta, col_meta->external_nodes);
+			ft_nr_keys_store(ft, int_meta,
+				ft_nr_keys_get(int_meta) + 1,
+				CMM_RELAXED);
+		}
+	}
+	ft_init_node_density(ft, internal_flag);
+
+	ft_set_parent(internal_flag, parent_nf, slot);
+	ft_publish_to_parent(ft, parent_nf, slot, internal_flag);
+	free_collapsed_node(ft, col);
+
+	ft_propagate_density_replace(ft, internal_flag, depth,
+		old_col_density, old_col_fp,
+		ft_flag_to_metadata(internal_flag),
+		ft_node_readside_footprint(ft, internal_flag),
+		NULL, 0);
+
+	*out_internal_flag = internal_flag;
+	return 0;
+}
+
+#ifdef FEATURE_FT_COMPRESS
+/*
+ * ft_compress_chain_at: opportunistically replace a chain of single-child
+ * no-external-nodes internals (extending through any adjacent compressed
+ * or skip-compressed nodes) starting at @top_flag with a single compressed
+ * (or skip-encoded compressed) node holding the accumulated path bytes.
+ *
+ * Walks down from @top_flag, accumulating one byte per single-child
+ * internal and cn->len bytes per compressed/skip-compressed.  Stops at
+ * the first node that is multi-child, has external_nodes, or is a
+ * collapsed/external/null leaf — that node becomes the new compressed's
+ * cn->child.  In skip mode the minimum useful length is 1 (a 1-byte
+ * compressed publishes as a skip-encoded pointer, 0 CL on the read
+ * side); in non-skip mode the minimum is 2 (a 1-byte compressed there
+ * is just an extra indirection).  If the accumulated length clears
+ * that floor, ft_build_ordinal_chain builds the new compressed
+ * (auto-encoded as skip-compressed for short paths in skip-mode
+ * tries), the new flag is atomically swapped into @parent_nf's @slot,
+ * and absorbed nodes are freed.
+ *
+ * Why "extend through compressed":  the trie invariant forbids two
+ * adjacent compressed nodes.  If the chain bottoms out at an existing
+ * compressed, the new compressed must absorb that compressed's bytes
+ * to preserve the invariant.  The absorbed compressed is freed.
+ *
+ * Returns 0 if not eligible (top is not a chain head, or accumulated
+ * length is below the per-mode floor), 1 if compression succeeded,
+ * -ENOMEM on allocation failure (chain unchanged).
+ *
+ * @top_flag must be an internal node when entering; the chain-head
+ * eligibility test (nr_child == 1 and !external_nodes) is performed
+ * inside.  @parent_nf may be NULL when @slot == &ft->root.
+ *
+ * Write-side only (mutex-held).
+ */
+static
+int ft_compress_chain_at(struct cds_ft *ft,
+		struct cds_ft_inode_flag *top_flag,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot,
+		unsigned int top_depth)
+{
+	struct cds_ft_metadata *top_meta;
+	uint8_t bytes_buf[FT_MAX_KEY_LEN];
+	struct cds_ft_inode_flag *absorbed[FT_MAX_KEY_LEN];
+	unsigned int len = 0;
+	unsigned int nr_absorbed = 0;
+	struct cds_ft_inode_flag *walk;
+	struct cds_ft_inode_flag *compressed_flag;
+	unsigned long old_density[FT_NODE_DENSITY_DEPTH];
+	unsigned int old_fp;
+	unsigned int di;
+	unsigned long leaf_nr_keys;
+	unsigned int i;
+
+	if (!ft_node_internal(top_flag))
+		return 0;
+	top_meta = cds_ft_item_to_metadata(ft_node_ptr(top_flag));
+	if (top_meta->nr_child != 1 || top_meta->external_nodes)
+		return 0;
+
+	old_fp = ft_node_readside_footprint(ft, top_flag);
+	for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
+		old_density[di] = ft_density_get(top_meta, di);
+
+	walk = top_flag;
+	for (;;) {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_node_skip_compressed(walk)) {
+			struct cds_ft_compressed_node *cn =
+				ft_skip_to_compressed(walk);
+			unsigned int j;
+
+			if (len + cn->len > 255)
+				break;
+			for (j = 0; j < cn->len; j++)
+				bytes_buf[len++] = cn->key_bytes[j];
+			absorbed[nr_absorbed++] =
+				ft_compressed_node_flag(cn);
+			walk = ft_dereference_acquire(cn->child);
+			continue;
+		}
+#endif
+		if (ft_node_external(walk))
+			break;
+		if (ft_node_compressed(walk)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(walk);
+			struct cds_ft_metadata *cn_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) cn);
+			unsigned int j;
+
+			if (cn_meta->external_nodes)
+				break;
+			if (len + cn->len > 255)
+				break;
+			for (j = 0; j < cn->len; j++)
+				bytes_buf[len++] = cn->key_bytes[j];
+			absorbed[nr_absorbed++] = walk;
+			walk = ft_dereference_acquire(cn->child);
+			continue;
+		}
+		if (ft_node_collapsed(walk))
+			break;
+		if (ft_node_internal(walk)) {
+			struct cds_ft_metadata *m =
+				cds_ft_item_to_metadata(ft_node_ptr(walk));
+			uint8_t k = 0;
+			struct cds_ft_inode_flag *c;
+
+			if (m->nr_child != 1 || m->external_nodes)
+				break;
+			if (len + 1 > 255)
+				break;
+			c = ft_node_get_minmax(walk, &k, FT_LEFTMOST);
+			if (!ft_node_ptr(c))
+				return 0;
+			bytes_buf[len++] = k;
+			absorbed[nr_absorbed++] = walk;
+			walk = c;
+			continue;
+		}
+		break;
+	}
+
+	{
+		unsigned int min_chain_len =
+			ft_group_skip_compressed(ft->group) ? 1 : 2;
+
+		if (len < min_chain_len || nr_absorbed == 0)
+			return 0;
+	}
+
+	if (ft_node_external(walk))
+		leaf_nr_keys = 1;
+	else
+		leaf_nr_keys = ft_nr_keys_get(ft_flag_to_metadata(walk));
+
+	compressed_flag = ft_build_ordinal_chain(ft, bytes_buf, len, walk,
+		leaf_nr_keys, top_depth);
+	if (!compressed_flag)
+		return -ENOMEM;
+
+	ft_set_parent(compressed_flag, parent_nf, slot);
+	ft_publish_to_parent(ft, parent_nf, slot, compressed_flag);
+
+	for (i = 0; i < nr_absorbed; i++) {
+		struct cds_ft_inode_flag *abs = absorbed[i];
+
+		if (ft_node_compressed(abs))
+			free_compressed_node(ft, ft_compressed_node_ptr(abs));
+		else
+			free_cds_ft_node(ft, ft_node_ptr(abs));
+	}
+
+	ft_propagate_density_replace(ft, compressed_flag, top_depth,
+		old_density, old_fp,
+		ft_flag_to_metadata(compressed_flag),
+		ft_node_readside_footprint(ft, compressed_flag),
+		NULL, 0);
+
+	return 1;
+}
+#endif
+
 #else
 static
 struct cds_ft_inode_flag *ft_explode_entries(
@@ -15384,43 +15816,12 @@ enum cds_ft_status ft_detach_descent_collapsed(struct cds_ft *ft,
 	 */
 	{
 		struct cds_ft_inode_flag *internal_flag;
-		unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
-		unsigned int old_col_fp =
-			ft_node_readside_footprint(ft, dd->d.nf);
-		unsigned int di;
+		int err;
 
-		for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
-			old_col_density[di] = ft_density_get(col_meta, di);
-
-		internal_flag = ft_explode_entries(ft, col, cptrs,
-			0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
-			0, dd->d.depth);
-		if (!internal_flag)
+		err = ft_collapsed_explode_node(ft, col, dd->d.nf,
+			dd->d.pnf, dd->d.nfp, dd->d.depth, &internal_flag);
+		if (err < 0)
 			return CDS_FT_STATUS_MEMORY_ERROR;
-		{
-			struct cds_ft_metadata *int_meta =
-				ft_flag_to_metadata(internal_flag);
-
-			if (col_meta->external_nodes) {
-				ft_metadata_set_external_nodes(internal_flag,
-					int_meta, col_meta->external_nodes);
-				ft_nr_keys_store(ft, int_meta,
-					ft_nr_keys_get(int_meta) + 1,
-					CMM_RELAXED);
-			}
-		}
-		ft_init_node_density(ft, internal_flag);
-
-		ft_set_parent(internal_flag, dd->d.pnf, dd->d.nfp);
-		ft_publish_to_parent(ft, dd->d.pnf, dd->d.nfp, internal_flag);
-		free_collapsed_node(ft, col);
-
-		ft_propagate_density_replace(ft, internal_flag,
-			dd->d.depth, old_col_density, old_col_fp,
-			cds_ft_item_to_metadata(ft_node_ptr(internal_flag)),
-			ft_node_readside_footprint(ft, internal_flag),
-			NULL, 0);
-
 		dd->d.nf = internal_flag;
 	}
 	return CDS_FT_STATUS_OK;
