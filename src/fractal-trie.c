@@ -2433,6 +2433,24 @@ void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 }
 
 /*
+ * Immediate-free variant for internal nodes that never escape the
+ * writer's stack (e.g., nodes built by an attach/split/recompact
+ * helper but freed by an -ENOMEM error path before publication).
+ * See cds_ft_free_item_unpublished for the safety contract.
+ */
+static
+void free_cds_ft_node_unpublished(struct cds_ft *ft, struct cds_ft_inode *node)
+{
+	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
+
+	cds_ft_free_item_unpublished(ft, metadata);
+	if (ft_debug_counters() && node) {
+		uatomic_inc(&ft->nr_nodes_freed);
+		uatomic_inc(&ft->nr_internal_freed);
+	}
+}
+
+/*
  * Compute the arena allocation order for a compressed node with
  * @path_len key bytes.  The compressed node layout is:
  *   [child pointer] [len byte] [key_bytes...]
@@ -2605,6 +2623,26 @@ void free_compressed_node(struct cds_ft *ft,
 
 	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(node));
 	cds_ft_free_item(ft, metadata);
+	if (ft_debug_counters() && node) {
+		uatomic_inc(&ft->nr_nodes_freed);
+		uatomic_inc(&ft->nr_compressed_freed);
+	}
+}
+
+/*
+ * Immediate-free variant for compressed nodes that never escape the
+ * writer's stack (e.g., -ENOMEM error paths in build/split helpers).
+ * See cds_ft_free_item_unpublished for the safety contract.
+ */
+static
+void free_compressed_node_unpublished(struct cds_ft *ft,
+		struct cds_ft_compressed_node *node)
+{
+	struct cds_ft_metadata *metadata =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
+
+	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(node));
+	cds_ft_free_item_unpublished(ft, metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->nr_nodes_freed);
 		uatomic_inc(&ft->nr_compressed_freed);
@@ -5531,7 +5569,7 @@ end:
 
 fallback_toosmall:
 	/* fallback if next pool is too small */
-	free_cds_ft_node(ft, new_node);
+	free_cds_ft_node_unpublished(ft, new_node);
 
 	switch (mode) {
 	case FT_RECOMPACT_ADD_SAME:
@@ -10899,13 +10937,13 @@ error:
 
 		for (i = 0; i < nr_created; i++) {
 			if (ft_node_compressed(created[i]))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_compressed_node_ptr(created[i]));
 			else if (ft_node_skip_compressed(created[i]))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_skip_to_compressed(created[i]));
 			else
-				free_cds_ft_node(ft, ft_node_ptr(created[i]));
+				free_cds_ft_node_unpublished(ft, ft_node_ptr(created[i]));
 		}
 	}
 	return -ENOMEM;
@@ -11124,10 +11162,10 @@ error:
 
 		for (i = 0; i < nr_created; i++) {
 			if (ft_node_compressed(created[i]))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_compressed_node_ptr(created[i]));
 			else
-				free_cds_ft_node(ft,
+				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(created[i]));
 		}
 	}
@@ -11440,12 +11478,17 @@ publish_done:
 
 check_error:
 	if (ret) {
+		/*
+		 * All goto-check_error paths in this function are before
+		 * ft_publish_to_parent, so created_nodes[] never escaped
+		 * the writer's stack — immediate-free is safe.
+		 */
 		for (i = 0; i < nr_created_nodes; i++) {
 			if (ft_node_compressed(created_nodes[i]))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_compressed_node_ptr(created_nodes[i]));
 			else
-				free_cds_ft_node(ft, ft_node_ptr(created_nodes[i]));
+				free_cds_ft_node_unpublished(ft, ft_node_ptr(created_nodes[i]));
 		}
 	}
 	FT_TP(attach_node_exit, (int) ret);
@@ -12192,13 +12235,17 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 			ret = ft_node_set_nth(ft, &dest, ordinals[i],
 				cur, NULL, NULL, base_depth + i);
 			if (ret) {
-				/* Cleanup on failure. */
+				/*
+				 * Cleanup on failure.  Chain is bottom-up
+				 * and unpublished until the final return,
+				 * so any partial chain we built is local.
+				 */
 				while (cur != child) {
 					struct cds_ft_inode_flag *next;
 
 					next = ft_node_get_nth(cur, NULL,
 						ordinals[i + 1], FT_PF_NONE);
-					free_cds_ft_node(ft, ft_node_ptr(cur));
+					free_cds_ft_node_unpublished(ft, ft_node_ptr(cur));
 					cur = next;
 					i++;
 				}
@@ -14802,13 +14849,13 @@ error:
 
 		for (i = 0; i < nr_created; i++) {
 			if (ft_node_compressed(created[i]))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_compressed_node_ptr(created[i]));
 			else if (ft_node_skip_compressed(created[i]))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_skip_to_compressed(created[i]));
 			else
-				free_cds_ft_node(ft, ft_node_ptr(created[i]));
+				free_cds_ft_node_unpublished(ft, ft_node_ptr(created[i]));
 		}
 	}
 	return -ENOMEM;
@@ -15078,10 +15125,10 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		pfx = alloc_compressed_node(ft, prefix_len, &pfx_meta);
 		if (!pfx) {
 			if (ft_node_compressed(suffix_flag))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_compressed_node_ptr(suffix_flag));
 			else
-				free_cds_ft_node(ft, ft_node_ptr(suffix_flag));
+				free_cds_ft_node_unpublished(ft, ft_node_ptr(suffix_flag));
 			return -1;
 		}
 		pfx->child = suffix_flag;
@@ -15108,10 +15155,10 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 			pfx = alloc_compressed_node(ft, prefix_len - 1, &pfx_meta);
 			if (!pfx) {
 				if (ft_node_compressed(suffix_flag))
-					free_compressed_node(ft,
+					free_compressed_node_unpublished(ft,
 						ft_compressed_node_ptr(suffix_flag));
 				else
-					free_cds_ft_node(ft, ft_node_ptr(suffix_flag));
+					free_cds_ft_node_unpublished(ft, ft_node_ptr(suffix_flag));
 				return -1;
 			}
 			pfx->child = suffix_flag;
@@ -15128,13 +15175,13 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 				pfx_child, NULL, NULL, d->depth);
 		if (ret) {
 			if (prefix_len >= 3 && ft_node_compressed(pfx_child))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_compressed_node_ptr(pfx_child));
 			if (ft_node_compressed(suffix_flag))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_compressed_node_ptr(suffix_flag));
 			else
-				free_cds_ft_node(ft, ft_node_ptr(suffix_flag));
+				free_cds_ft_node_unpublished(ft, ft_node_ptr(suffix_flag));
 			return -1;
 		}
 		int_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
@@ -15152,10 +15199,10 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 			suffix_flag, NULL, NULL, d->depth);
 		if (ret) {
 			if (ft_node_compressed(suffix_flag))
-				free_compressed_node(ft,
+				free_compressed_node_unpublished(ft,
 					ft_compressed_node_ptr(suffix_flag));
 			else
-				free_cds_ft_node(ft, ft_node_ptr(suffix_flag));
+				free_cds_ft_node_unpublished(ft, ft_node_ptr(suffix_flag));
 			return -1;
 		}
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
