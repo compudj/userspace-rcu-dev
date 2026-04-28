@@ -1838,7 +1838,7 @@ enum cds_ft_status cds_ft_attr_set_collapse_threshold(struct cds_ft_attr *attr,
  *                cds_ft_collapse_scan_mul_set for semantics.  Must
  *                be >= 100.
  *
- * Default: CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT (300).
+ * Default: CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT (150).
  *
  * Returns CDS_FT_STATUS_OK on success, or
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @scan_mul_pct is below 100.
@@ -1856,7 +1856,7 @@ enum cds_ft_status cds_ft_attr_set_collapse_scan_mul(struct cds_ft_attr *attr,
  *                cds_ft_compress_scan_mul_set for semantics.  Must
  *                be >= 100.
  *
- * Default: CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT (300).
+ * Default: CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT (150).
  *
  * Returns CDS_FT_STATUS_OK on success, or
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @scan_mul_pct is below 100.
@@ -2002,26 +2002,29 @@ bool cds_ft_excl_validate_enabled(void);
  * doesn't capture (loop dispatch, byte compares per iteration,
  * branch-on-match, reduced ILP vs. dependent pointer chases).
  *
- * The default (300 = 3.0×) is empirically chosen from a workload
- * sweep on AMD64.  The single-thread sweep
+ * The default (150 = 1.5×) is empirically chosen from a workload
+ * sweep on AMD64.  Intuitively, the 0.5× margin above raw CL bandwidth
+ * is roughly the cost of one branch misprediction relative to the cost
+ * of a cache-line load — enough to discount marginal collapses without
+ * starving the trie of beneficial ones.  The single-thread sweep
  * (u32d/u32s/u64d/u64s/dns/dict/paths at 1M keys) shows the integer
  * datasets are insensitive to this multiplier (the gate fires too
- * rarely on shallow tries to matter), and dict/paths each gain ~14%
- * vs. the prior 225 default.  A multi-thread DNS sweep (qpmulti_ft on
- * a real reverse-DNS dataset, 384 readers + paced writer) confirms the
- * choice in both cache-pressured (uniform random) and Zipf-like (hot
- * subset) regimes: 300 closes the FT-vs-QP read-throughput gap from
- * ~16% to ~5% at uniform-random and to ~4% at Zipf vs. the prior
- * default.  The optimal value is architecture-dependent because it
- * reflects scan-loop cycle cost relative to a cache-line load — both
- * of which vary across micro-architectures.  Tune per host if needed.
+ * rarely on shallow tries to matter), and dict/paths sit within trial
+ * noise of higher multipliers.  A multi-thread DNS sweep (qpmulti_ft
+ * on a real reverse-DNS dataset, 384 readers + paced writer) shows
+ * 150 ties or beats higher multipliers across uniform-random and
+ * Zipf-like (hot subset) regimes, with lower trial-to-trial variance
+ * and lower RSS on the dict workload.  The optimal value is
+ * architecture-dependent because it reflects scan-loop cycle cost
+ * relative to a cache-line load — both of which vary across
+ * micro-architectures.  Tune per host if needed.
  *
  * Values below 100 are rejected: the gate's only purpose is to
  * over-estimate collapsed cost relative to memory bandwidth, so
  * under-estimating it would push the gate toward accepting
  * collapses that lose latency.
  */
-#define CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT	300U
+#define CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT	150U
 
 /*
  * Chain-compress per-path CL latency gate's scan-cost multiplier (in
@@ -2036,23 +2039,25 @@ bool cds_ft_excl_validate_enabled(void);
  *
  * against the accumulated CL load of the absorbed chain nodes.
  *
- * Default 300 (= 3.0×): in non-skip groups every chain-compress
+ * Default 150 (= 1.5×): in non-skip groups every chain-compress
  * publication produces an allocated compressed node that costs 1-2
- * CL on the read side; 300 rejects marginal compressions across the
- * single-thread sweep (u32d/u32s/u64d/u64s/dns/dict/paths at 1M keys)
- * — dict and paths each gain ~14% vs. the prior 200 default,
- * integer datasets are insensitive — and aligns with the
- * collapse-side default chosen at the same time, so both gates
- * apply the same scan-vs-bandwidth tradeoff.  In skip-compressed
- * groups the gate fires only on the long-chain tail (most chains
- * skip-encode for 0 CL on read) so the multiplier choice is
- * essentially noise — the same default is reused to keep the
- * API simple.
+ * CL on the read side; 150 discounts the candidate by roughly one
+ * branch misprediction relative to a cache-line load — enough margin
+ * to reject clearly-marginal compressions without starving the
+ * trie of beneficial ones.  The single-thread sweep
+ * (u32d/u32s/u64d/u64s/dns/dict/paths at 1M keys) shows the integer
+ * datasets are insensitive to this multiplier and dict/paths sit
+ * within trial noise of higher multipliers.  Aligns with the
+ * collapse-side default so both gates apply the same scan-vs-bandwidth
+ * tradeoff.  In skip-compressed groups the gate fires only on the
+ * long-chain tail (most chains skip-encode for 0 CL on read) so the
+ * multiplier choice is essentially noise — the same default is
+ * reused to keep the API simple.
  *
  * Tune up if measuring a chip where compressed scan is even more
  * expensive per CL than dependent pointer chases (rare).
  */
-#define CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT	300U
+#define CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT	150U
 
 /*
  * cds_ft_collapse_threshold_set - Set the collapse acceptance

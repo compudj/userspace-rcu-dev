@@ -12655,7 +12655,7 @@ int ft_compress_chain_at(struct cds_ft *ft,
 	 * latency.
 	 *
 	 * compress_scan_mul_pct (per-trie tunable, default
-	 * CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT = 300) scales the
+	 * CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT = 150) scales the
 	 * candidate's scan portion to model scan-loop overhead beyond
 	 * raw CL bandwidth.
 	 *
