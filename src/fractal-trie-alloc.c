@@ -404,6 +404,19 @@ void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata)
 #endif
 }
 
+/*
+ * Immediate-free path for items that were never published — no reader
+ * can hold a reference, so call_rcu would only delay arena reuse.
+ * Always routes through the synchronous body, regardless of exclusive
+ * mode or FT_IMMEDIATE_FREE configuration.  See declaration in
+ * fractal-trie-internal.h for the safety contract.
+ */
+void cds_ft_free_item_unpublished(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_metadata *metadata)
+{
+	cds_ft_do_free_item(metadata);
+}
+
 void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
 {
 	int i;

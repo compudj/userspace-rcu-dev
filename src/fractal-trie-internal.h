@@ -938,6 +938,19 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
 
+/*
+ * cds_ft_free_item_unpublished - immediate free for items that were
+ * never published (no reader can possibly hold a reference).  Bypasses
+ * call_rcu and returns the slot directly to the arena free list.
+ *
+ * Use only for nodes that never escaped the writer's stack (e.g.,
+ * speculative candidate collapsed nodes evaluated by
+ * ft_try_collapse_at_node and rejected before publication).  Calling
+ * this on a published node corrupts concurrent readers.
+ */
+__attribute__((visibility("hidden")))
+void cds_ft_free_item_unpublished(struct cds_ft *ft, struct cds_ft_metadata *metadata);
+
 //#define DEBUG
 //#define DEBUG_COUNTERS
 #define DEBUG_CLEAR_ITER

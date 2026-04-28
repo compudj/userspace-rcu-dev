@@ -2689,6 +2689,29 @@ void free_collapsed_node(struct cds_ft *ft,
 }
 
 /*
+ * Immediate-free variant for speculative collapsed candidates that
+ * never escape the writer's stack (rejected by gates inside
+ * ft_try_collapse_at_node).  Bypasses call_rcu so the arena slot is
+ * available to subsequent allocations on the same writer's path,
+ * preventing the free-pending queue from growing under high mutation
+ * rates with rejection-heavy gate settings.
+ */
+static
+void free_collapsed_node_unpublished(struct cds_ft *ft,
+		struct cds_ft_collapsed_node *node)
+{
+	struct cds_ft_metadata *metadata =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
+
+	FT_TP(collapsed_free, (const void *) ft_collapsed_node_flag(node));
+	cds_ft_free_item_unpublished(ft, metadata);
+	if (ft_debug_counters() && node) {
+		uatomic_inc(&ft->nr_nodes_freed);
+		uatomic_inc(&ft->nr_collapsed_freed);
+	}
+}
+
+/*
  * Maximum number of entries for a collapsed node of the given order
  * and scan zone selector.
  */
@@ -9954,7 +9977,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			if (!walk_ok ||
 			    ft_collapsed_count(
 				ft_collapsed_nr_entries(col)) < 2) {
-				free_collapsed_node(ft, col);
+				free_collapsed_node_unpublished(ft, col);
 				continue;
 			}
 
@@ -9990,7 +10013,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 						all_meet_min = false;
 				}
 				if (!has_long_suffix || !all_meet_min) {
-					free_collapsed_node(ft, col);
+					free_collapsed_node_unpublished(ft, col);
 					continue;
 				}
 			}
@@ -10037,7 +10060,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 
 				if ((unsigned long) weighted_absorbed_cl_pct <
 				    (unsigned long) collapsed_cl_pct * nr_emit) {
-					free_collapsed_node(ft, col);
+					free_collapsed_node_unpublished(ft, col);
 					continue;
 				}
 			}
@@ -10059,7 +10082,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			    (unsigned long) absorbed * best_collapsed >
 			    (unsigned long) best_absorbed * collapsed_fp) {
 				if (best_col)
-					free_collapsed_node(ft, best_col);
+					free_collapsed_node_unpublished(ft, best_col);
 				best_col = col;
 				best_meta = col_meta;
 				best_ptrs = col_ptrs;
@@ -10071,7 +10094,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 					nr_absorbed_cur * sizeof(absorbed_depths_best[0]));
 				nr_absorbed_best = nr_absorbed_cur;
 			} else {
-				free_collapsed_node(ft, col);
+				free_collapsed_node_unpublished(ft, col);
 			}
 		}
 
