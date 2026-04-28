@@ -1856,7 +1856,7 @@ enum cds_ft_status cds_ft_attr_set_collapse_scan_mul(struct cds_ft_attr *attr,
  *                cds_ft_compress_scan_mul_set for semantics.  Must
  *                be >= 100.
  *
- * Default: CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT (100).
+ * Default: CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT (200).
  *
  * Returns CDS_FT_STATUS_OK on success, or
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @scan_mul_pct is below 100.
@@ -1969,6 +1969,28 @@ bool cds_ft_excl_validate_enabled(void);
 #define CDS_FT_COLLAPSE_THRESHOLD_DISABLED	UINT_MAX
 
 /*
+ * Library default collapse threshold for non-skip-compressed groups.
+ *
+ * In non-skip groups every absorbed compressed node still costs one or
+ * two cache lines on read (skip-encoding is unavailable), so the
+ * footprint-ratio gate alone tends to admit collapses that don't
+ * meaningfully reduce per-path CL load count.  Empirically, across the
+ * u32d/u32s/u64d/u64s/dns/dict/paths sweep, only `paths` clearly
+ * benefits from collapse in non-skip mode; the other six workloads
+ * either don't move or regress.  Combined with the mutation-side
+ * overhead of the post-mutation collapse pass, the safer non-skip
+ * library default disables collapse entirely and lets users opt in
+ * via cds_ft_attr_set_collapse_threshold if they have a known
+ * collapse-friendly workload.
+ *
+ * Skip-compressed groups continue to default to
+ * CDS_FT_COLLAPSE_THRESHOLD_DEFAULT (100), where collapse pays off
+ * across the full workload set.
+ */
+#define CDS_FT_COLLAPSE_THRESHOLD_NONSKIP_DEFAULT	\
+		CDS_FT_COLLAPSE_THRESHOLD_DISABLED
+
+/*
  * Per-path CL latency gate's scan-cost multiplier (in percent).  The
  * gate computes a candidate collapsed-node CL cost as
  *
@@ -2006,18 +2028,20 @@ bool cds_ft_excl_validate_enabled(void);
  *
  * against the accumulated CL load of the absorbed chain nodes.
  *
- * The compressed scan loop is *simpler* than the collapsed one — no
- * per-entry suffix-length logic, no offset arithmetic, no pointer
- * table indirection — so the optimal multiplier is generally
- * *lower* than the collapsed-side multiplier.  Default 100 (= 1.0×,
- * pure CL bandwidth model) keeps chain-compress maximally
- * permissive: any compression that strictly reduces read-side CL
- * load count is accepted.
+ * Default 200 (= 2.0×): in non-skip groups every chain-compress
+ * publication produces an allocated compressed node that costs 1-2
+ * CL on the read side, and 200 is the smallest multiplier that
+ * consistently rejects marginal compressions in the workload sweep
+ * without harming the strong wins (paths benefits from compressing
+ * only the longer chains).  In skip-compressed groups the gate fires
+ * only on the long-chain tail (most chains skip-encode for 0 CL on
+ * read) so the multiplier choice is essentially noise — the same
+ * default is reused to keep the API simple.
  *
- * Tune up if measuring a chip where compressed scan is more
+ * Tune up if measuring a chip where compressed scan is even more
  * expensive per CL than dependent pointer chases (rare).
  */
-#define CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT	100U
+#define CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT	200U
 
 /*
  * cds_ft_collapse_threshold_set - Set the collapse acceptance

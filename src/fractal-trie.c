@@ -12585,11 +12585,9 @@ int ft_compress_chain_at(struct cds_ft *ft,
 	 * latency.
 	 *
 	 * compress_scan_mul_pct (per-trie tunable, default
-	 * CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT = 100) scales the
+	 * CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT = 200) scales the
 	 * candidate's scan portion to model scan-loop overhead beyond
-	 * raw CL bandwidth.  The default is lower than the collapse
-	 * gate's (225) because the compressed scan is simpler — no
-	 * offset arithmetic, no per-entry suffix length, single match.
+	 * raw CL bandwidth.
 	 *
 	 * Both muls are also passed to ft_node_readside_cl_pct() when
 	 * pricing the absorbed-side nodes so that per-node-type costs
@@ -18902,9 +18900,14 @@ enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 		*result = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
-	attr->collapse_threshold_pct = CDS_FT_COLLAPSE_THRESHOLD_DEFAULT;
-	attr->collapse_scan_mul_pct = CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT;
-	attr->compress_scan_mul_pct = CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT;
+	/*
+	 * Leave threshold and multipliers at 0 (calloc'd) as a "use
+	 * library default" sentinel; cds_ft_create resolves them to
+	 * mode-aware defaults that depend on the group's skip-compressed
+	 * setting.  Fields explicitly set via the attr setters take
+	 * precedence (the setters validate >= 100 or DISABLED, so 0
+	 * cannot leak in by accident).
+	 */
 	*result = attr;
 	return CDS_FT_STATUS_OK;
 }
@@ -19087,14 +19090,32 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->group = ft_group;
-	ft->collapse_threshold_pct = CDS_FT_COLLAPSE_THRESHOLD_DEFAULT;
-	ft->collapse_scan_mul_pct = CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT;
-	ft->compress_scan_mul_pct = CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT;
-	if (attr) {
-		ft->exclusive = attr->exclusive;
-		ft->collapse_threshold_pct = attr->collapse_threshold_pct;
-		ft->collapse_scan_mul_pct = attr->collapse_scan_mul_pct;
-		ft->compress_scan_mul_pct = attr->compress_scan_mul_pct;
+	{
+		unsigned int dflt_T = ft_group_skip_compressed(ft_group)
+			? CDS_FT_COLLAPSE_THRESHOLD_DEFAULT
+			: CDS_FT_COLLAPSE_THRESHOLD_NONSKIP_DEFAULT;
+		unsigned int dflt_c = CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT;
+		unsigned int dflt_m = CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT;
+
+		if (attr) {
+			ft->exclusive = attr->exclusive;
+			ft->collapse_threshold_pct =
+				attr->collapse_threshold_pct
+				? attr->collapse_threshold_pct
+				: dflt_T;
+			ft->collapse_scan_mul_pct =
+				attr->collapse_scan_mul_pct
+				? attr->collapse_scan_mul_pct
+				: dflt_c;
+			ft->compress_scan_mul_pct =
+				attr->compress_scan_mul_pct
+				? attr->compress_scan_mul_pct
+				: dflt_m;
+		} else {
+			ft->collapse_threshold_pct = dflt_T;
+			ft->collapse_scan_mul_pct = dflt_c;
+			ft->compress_scan_mul_pct = dflt_m;
+		}
 	}
 
 	/*
