@@ -134,6 +134,7 @@ struct cds_ft_attr {
 	bool exclusive;
 	unsigned int collapse_threshold_pct;
 	unsigned int collapse_scan_mul_pct;
+	unsigned int compress_scan_mul_pct;
 };
 
 enum cds_ft_type_class {
@@ -2487,55 +2488,67 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
 }
 
 /*
- * ft_node_readside_cl_loads: number of cache lines a read-side lookup
- * loads when traversing this node, by node type.  Avg-case for nodes
- * with variable scan ranges (collapsed); deterministic for the rest.
+ * ft_node_readside_cl_pct: number of cache lines a read-side lookup
+ * loads when traversing this node, scaled by the per-node-type
+ * scan-cost multiplier (in percent), returning a pct-scaled CL cost.
  *
- *   Skip-encoded compressed   : 0 (resolved from pointer bits)
- *   Linear (order <= 6)       : 1 (16/32/64 B node fits in one CL)
- *   Linear order 7 (128 B)    : 2 (bytes in CL0, matched ptr may be in CL1)
- *   Pool A (order 8)          : 2 (sub-pool dispatch ≡ Linear order 7)
- *   Pool B (order 9)          : 2 (sub-pool dispatch ≡ Linear order 7)
- *   Pigeon (order 10)         : 1 (direct byte-indexed slot)
- *   Compressed alloc <= 64 B  : 1
- *   Compressed alloc >= 128 B : 2 (key byte scan + child pointer)
- *   Collapsed by scan_sel (avg-case: half scan zone + 1 ptr CL):
- *     SCAN_32  (0.5 CL zone)  : 1   (zone loads 1 CL either way)
- *     SCAN_64  (1 CL zone)    : 2   (1 zone CL + 1 ptr CL)
- *     SCAN_128 (2 CL zone)    : 2   (avg 1 zone CL + 1 ptr CL; worst 3)
- *     SCAN_256 (4 CL zone)    : 3   (avg 2 zone CL + 1 ptr CL; worst 5)
+ *   Skip-encoded compressed   : 0  (resolved from pointer bits)
+ *   Linear (order <= 6)       : 1 × 100  (fits in 1 CL)
+ *   Linear order 7 (128 B)    : 2 × 100  (bytes + matched ptr)
+ *   Pool A/B (order 8/9)      : 2 × 100  (sub-pool dispatch ≡ Linear 7)
+ *   Pigeon (order 10)         : 1 × 100  (direct byte-indexed slot)
+ *   Compressed alloc <= 64 B  : 1 × @compress_scan_mul_pct
+ *   Compressed alloc >= 128 B : 2 × @compress_scan_mul_pct
+ *   Collapsed by scan_sel (avg: half scan zone + 1 ptr CL):
+ *     scaled by scan_mul on the scan portion + 100 × ptr_CL:
+ *     SCAN_32  : (1 × @collapse_scan_mul_pct + 0)
+ *     SCAN_64  : (1 × @collapse_scan_mul_pct + 100)
+ *     SCAN_128 : (1 × @collapse_scan_mul_pct + 100)
+ *     SCAN_256 : (2 × @collapse_scan_mul_pct + 100)
  *
- * The collapsed avg matches the absorbed-side accounting, which is
- * also a deterministic per-path average.  Using worst-case here would
- * inflate the collapsed cost and bias the gate toward accepting
- * collapses that lose on average.  Note: the per-path latency gate
- * in ft_try_collapse_at_node uses a different table that doubles the
- * scan portion to model scan-loop overhead the raw CL count misses.
+ * Internals get raw × 100 (no scan loop, just dependent loads).
+ * Compressed and collapsed scans get their respective multiplier on
+ * the scan portion, matching the candidate-side accounting in
+ * ft_try_collapse_at_node and ft_compress_chain_at.  This keeps
+ * absorbed-side and candidate-side cost comparisons symmetric: if a
+ * scan-bearing node is on the absorbed path, it is priced the same
+ * way as a candidate of the same type would be priced.
  *
  * Externals are leaves of every read path, paid the same on the
  * collapsed and absorbed sides — callers exclude them from the
  * latency comparison.
  */
 static
-unsigned int ft_node_readside_cl_loads(const struct cds_ft *ft,
-		struct cds_ft_inode_flag *node_flag)
+unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag,
+		unsigned int collapse_scan_mul_pct,
+		unsigned int compress_scan_mul_pct)
 {
-	static const unsigned int collapsed_cl_by_scan_sel[] = {
+	static const unsigned int collapsed_avg_scan_cl_by_sel[] = {
 		[FT_COLLAPSED_SCAN_32]  = 1,
-		[FT_COLLAPSED_SCAN_64]  = 2,
-		[FT_COLLAPSED_SCAN_128] = 2,
-		[FT_COLLAPSED_SCAN_256] = 3,
+		[FT_COLLAPSED_SCAN_64]  = 1,
+		[FT_COLLAPSED_SCAN_128] = 1,
+		[FT_COLLAPSED_SCAN_256] = 2,
+	};
+	static const unsigned int collapsed_ptr_cl_by_sel[] = {
+		[FT_COLLAPSED_SCAN_32]  = 0,
+		[FT_COLLAPSED_SCAN_64]  = 1,
+		[FT_COLLAPSED_SCAN_128] = 1,
+		[FT_COLLAPSED_SCAN_256] = 1,
 	};
 	unsigned int order;
 
 	if (ft_node_compressed(node_flag)) {
 		struct cds_ft_compressed_node *cn =
 			ft_compressed_node_ptr(node_flag);
+		unsigned int cl;
+
 		if (ft_group_skip_compressed(ft->group) &&
 		    cn->len <= FT_SKIP_LEN_MAX)
 			return 0;
 		order = ft_compressed_order(cn->len);
-		return (order >= 7) ? 2U : 1U;
+		cl = (order >= 7) ? 2U : 1U;
+		return cl * compress_scan_mul_pct;
 	} else if (ft_node_skip_compressed(node_flag)) {
 		return 0;
 	} else if (ft_node_collapsed(node_flag)) {
@@ -2545,14 +2558,20 @@ unsigned int ft_node_readside_cl_loads(const struct cds_ft *ft,
 			(unsigned int) (uatomic_load(&col->nr_entries,
 				CMM_RELAXED) >> FT_COLLAPSED_SCAN_SHIFT);
 
-		return collapsed_cl_by_scan_sel[scan_sel];
+		return collapsed_avg_scan_cl_by_sel[scan_sel]
+				* collapse_scan_mul_pct
+			+ collapsed_ptr_cl_by_sel[scan_sel] * 100U;
 	} else {
 		unsigned int type_index = ft_node_type(node_flag);
+		unsigned int cl;
 
 		if (ft_types[type_index].type_class == FT_PIGEON)
-			return 1U;
-		order = ft_types[type_index].order;
-		return (order >= 7) ? 2U : 1U;
+			cl = 1U;
+		else {
+			order = ft_types[type_index].order;
+			cl = (order >= 7) ? 2U : 1U;
+		}
+		return cl * 100U;
 	}
 }
 
@@ -9315,14 +9334,19 @@ unsigned int ft_collapsed_min_slen(unsigned int scan_sel)
  * @absorbed_depths: parallel array of slen values (depth offset from
  *   the decision point) for each absorbed node.
  * @nr_absorbed: count of entries in @absorbed.
- * @current_path_cl: cache lines a read-side lookup loads on the
- *   current absorbed path (by value, includes the decision-point
- *   collapsed candidate).  Bumped on each absorption.
- * @weighted_absorbed_cl: accumulator for per-path CL totals.  At
- *   each emit_entry, the current_path_cl is added in.  Sum across
- *   all emit-entries equals N * avg_path_cl, suitable for direct
- *   comparison with collapsed_cl * N.  Initialize to 0 before the
- *   first call.
+ * @current_path_cl_pct: pct-scaled CL cost a read-side lookup
+ *   incurs on the current absorbed path (by value, includes the
+ *   decision-point CL × 100).  Bumped on each absorption by
+ *   ft_node_readside_cl_pct(...) so the per-node-type
+ *   scan-cost multipliers are baked in.
+ * @weighted_absorbed_cl_pct: accumulator for per-path pct-CL
+ *   totals.  At each emit_entry, current_path_cl_pct is added in.
+ *   Sum across all emit-entries equals N * avg_path_cl_pct,
+ *   suitable for direct comparison with collapsed_cl_pct * N.
+ *   Initialize to 0 before the first call.
+ * @collapse_scan_mul_pct, @compress_scan_mul_pct: per-trie
+ *   tunables (snapshot once by the caller); applied via
+ *   ft_node_readside_cl_pct().
  * @branch_depth: number of multi-child branching points traversed
  *   from the decision point (passed by value).
  * @max_branch_depth: maximum branching depth before emitting.
@@ -9342,8 +9366,10 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 		struct cds_ft_inode_flag **absorbed,
 		unsigned int *absorbed_depths,
 		unsigned int *nr_absorbed,
-		unsigned int current_path_cl,
-		unsigned int *weighted_absorbed_cl,
+		unsigned int current_path_cl_pct,
+		unsigned int *weighted_absorbed_cl_pct,
+		unsigned int collapse_scan_mul_pct,
+		unsigned int compress_scan_mul_pct,
 		unsigned int branch_depth,
 		unsigned int max_branch_depth)
 {
@@ -9390,8 +9416,10 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 				goto emit_entry; /* Would exceed suffix buffer. */
 			*absorbed_footprint +=
 				ft_node_readside_footprint(ft, orig_walk);
-			current_path_cl +=
-				ft_node_readside_cl_loads(ft, orig_walk);
+			current_path_cl_pct +=
+				ft_node_readside_cl_pct(ft, orig_walk,
+					collapse_scan_mul_pct,
+					compress_scan_mul_pct);
 			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, orig_walk, slen);
 			for (j = 0; j < cn->len; j++)
 				suffix_buf[slen++] = cn->key_bytes[j];
@@ -9428,8 +9456,10 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 				goto emit_entry;
 			*absorbed_footprint +=
 				ft_node_readside_footprint(ft, walk);
-			current_path_cl +=
-				ft_node_readside_cl_loads(ft, walk);
+			current_path_cl_pct +=
+				ft_node_readside_cl_pct(ft, walk,
+					collapse_scan_mul_pct,
+					compress_scan_mul_pct);
 			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
 			for (e = 0; e < ft_collapsed_count(col_child_nr_e); e++) {
 				uint8_t data_e =
@@ -9465,8 +9495,10 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 						absorbed_footprint,
 						absorbed, absorbed_depths,
 						nr_absorbed,
-						current_path_cl,
-						weighted_absorbed_cl,
+						current_path_cl_pct,
+						weighted_absorbed_cl_pct,
+						collapse_scan_mul_pct,
+						compress_scan_mul_pct,
 						branch_depth + 1,
 						max_branch_depth))
 					return -1;
@@ -9495,8 +9527,10 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 					return -1;
 				*absorbed_footprint +=
 					ft_node_readside_footprint(ft, walk);
-				current_path_cl +=
-					ft_node_readside_cl_loads(ft, walk);
+				current_path_cl_pct +=
+					ft_node_readside_cl_pct(ft, walk,
+						collapse_scan_mul_pct,
+						compress_scan_mul_pct);
 				ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
 				suffix_buf[slen++] = wk;
 				walk = wc;
@@ -9519,8 +9553,10 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 				goto emit_entry;
 			*absorbed_footprint +=
 				ft_node_readside_footprint(ft, walk);
-			current_path_cl +=
-				ft_node_readside_cl_loads(ft, walk);
+			current_path_cl_pct +=
+				ft_node_readside_cl_pct(ft, walk,
+					collapse_scan_mul_pct,
+					compress_scan_mul_pct);
 			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
 			{
 				uint8_t ck = 0;
@@ -9540,8 +9576,10 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 							absorbed_footprint,
 							absorbed, absorbed_depths,
 							nr_absorbed,
-							current_path_cl,
-							weighted_absorbed_cl,
+							current_path_cl_pct,
+							weighted_absorbed_cl_pct,
+							collapse_scan_mul_pct,
+							compress_scan_mul_pct,
 							branch_depth + 1,
 							max_branch_depth))
 						return -1;
@@ -9580,7 +9618,7 @@ emit_entry:
 			- (uint8_t *) col);
 		col_ptrs[entry_idx] = walk;
 		ft_collapsed_set_nr_entries(col, entry_idx + 1);
-		*weighted_absorbed_cl += current_path_cl;
+		*weighted_absorbed_cl_pct += current_path_cl_pct;
 		FT_TP(collapsed_entry,
 			(const void *) ft_collapsed_node_flag(col), entry_idx,
 			suffix_buf, slen, (const void *) walk, 0);
@@ -9671,13 +9709,25 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		 */
 		unsigned int decision_fp = ft_node_readside_footprint(ft, node_flag);
 		/*
-		 * Read-side CL load count for the decision-point node
-		 * itself.  This is the cost the absorbed paths pay to
-		 * dispatch from the existing internal/compressed/already-
-		 * collapsed node; it's reset to be the starting CL on
-		 * each collapse_walk_subtree call.
+		 * Snapshot the per-trie scan-cost multipliers.  Both
+		 * apply throughout the walk (compress_mul on absorbed
+		 * compressed nodes, collapse_mul on absorbed already-
+		 * collapsed nodes) and to the collapsed candidate
+		 * itself, keeping absorbed-side and candidate-side cost
+		 * accounting symmetric.
 		 */
-		unsigned int decision_cl = ft_node_readside_cl_loads(ft, node_flag);
+		unsigned int collapse_scan_mul_pct = uatomic_load(
+				&ft->collapse_scan_mul_pct, CMM_RELAXED);
+		unsigned int compress_scan_mul_pct = uatomic_load(
+				&ft->compress_scan_mul_pct, CMM_RELAXED);
+		/*
+		 * Pct-scaled read-side CL cost of the decision-point
+		 * node (the absorbed path's first node).  Reset to be
+		 * the starting CL on each collapse_walk_subtree call.
+		 */
+		unsigned int decision_cl_pct = ft_node_readside_cl_pct(ft,
+				node_flag, collapse_scan_mul_pct,
+				compress_scan_mul_pct);
 
 		/*
 		 * max_walk_slen: maximum suffix length.  Bounded by
@@ -9752,15 +9802,16 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		/*
 		 * Per-scan_sel collapsed CL cost for the per-path
 		 * latency gate, computed as
-		 *   collapsed_cl_pct = scan_mul_pct × avg_scan_CL
+		 *   collapsed_cl_pct = collapse_scan_mul_pct × avg_scan_CL
 		 *                      + 100 × ptr_CL
 		 *
 		 * Internal arithmetic is in pct-CL units (everything
 		 * scaled by 100), matching the existing collapse-
 		 * threshold pct convention so the scan multiplier can
 		 * take fractional values (e.g. 150 = 1.5×, 250 = 2.5×).
-		 * Gate compares
-		 *   100 × weighted_absorbed_cl > collapsed_cl_pct × N
+		 * Both sides of the gate are already in pct units:
+		 *   gate: weighted_absorbed_cl_pct
+		 *         >= collapsed_cl_pct × N
 		 *
 		 * The multiplier on the scan portion accounts for
 		 * scan-loop cost the pure CL-load count doesn't capture
@@ -9775,7 +9826,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		 *   ptr_CL = 0 if scan and ptr area share a CL
 		 *           (TINY/SCAN_32 only), else 1.
 		 *
-		 * scan_mul_pct is per-trie tunable; see
+		 * collapse_scan_mul_pct is per-trie tunable; see
 		 * cds_ft_collapse_scan_mul_set.
 		 */
 		static const unsigned int avg_scan_cl_by_sel[] = {
@@ -9790,15 +9841,12 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			[FT_COLLAPSED_SCAN_128] = 1,
 			[FT_COLLAPSED_SCAN_256] = 1,
 		};
-		unsigned int scan_mul_pct = uatomic_load(&ft->collapse_scan_mul_pct,
-				CMM_RELAXED);
-
 		for (ci = 0; ci < nr_configs; ci++) {
 			unsigned int order = configs[ci].order;
 			unsigned int scan_sel = configs[ci].scan_sel;
 			unsigned int collapsed_fp = 1U << (order - 4);
 			unsigned int collapsed_cl_pct =
-				scan_mul_pct * avg_scan_cl_by_sel[scan_sel]
+				collapse_scan_mul_pct * avg_scan_cl_by_sel[scan_sel]
 				+ 100U * ptr_cl_by_sel[scan_sel];
 			unsigned int max_entries =
 				ft_collapsed_max_entries(order, scan_sel);
@@ -9806,7 +9854,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			struct cds_ft_metadata *col_meta;
 			struct cds_ft_inode_flag **col_ptrs;
 			unsigned int absorbed;
-			unsigned int weighted_absorbed_cl;
+			unsigned int weighted_absorbed_cl_pct;
 			bool walk_ok;
 
 			if (max_entries < 2)
@@ -9871,7 +9919,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				uatomic_load(&col->nr_entries, CMM_RELAXED));
 
 			absorbed = decision_fp;
-			weighted_absorbed_cl = 0;
+			weighted_absorbed_cl_pct = 0;
 			nr_absorbed_cur = 0;
 			walk_ok = true;
 
@@ -9888,8 +9936,10 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 						&absorbed,
 						absorbed_cur, absorbed_depths_cur,
 						&nr_absorbed_cur,
-						decision_cl,
-						&weighted_absorbed_cl,
+						decision_cl_pct,
+						&weighted_absorbed_cl_pct,
+						collapse_scan_mul_pct,
+						compress_scan_mul_pct,
 						0, /* branch_depth */
 						max_branch_depth)) {
 					walk_ok = false;
@@ -9950,17 +10000,21 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			 * paths' average CL load count must be at least as
 			 * large as the collapsed candidate's CL load count.
 			 *
-			 * weighted_absorbed_cl = Σ_e path_cl(e), summed
-			 * across emit-entries.  Each path_cl includes the
-			 * decision-point CL plus every absorbed interior
-			 * node on that path.  For N emit-entries:
-			 *   avg_path_cl = weighted_absorbed_cl / N
-			 *   gate: avg_path_cl >= collapsed_cl
-			 *   i.e., weighted_absorbed_cl >= collapsed_cl * N
+			 * weighted_absorbed_cl_pct = Σ_e path_cl_pct(e),
+			 * summed across emit-entries.  Each path_cl_pct
+			 * includes the decision-point pct-CL plus every
+			 * absorbed interior node on that path, all priced
+			 * with the same per-node-type multipliers used for
+			 * the collapsed candidate (collapse_scan_mul_pct on
+			 * scan zones, compress_scan_mul_pct on compressed
+			 * scan).  For N emit-entries:
+			 *   avg_path_cl_pct = weighted_absorbed_cl_pct / N
+			 *   gate: avg_path_cl_pct >= collapsed_cl_pct
+			 *   i.e., weighted_absorbed_cl_pct
+			 *         >= collapsed_cl_pct × N
 			 *
-			 * collapsed_cl is computed in pct units to support
-			 * fractional scan multipliers; cross-multiply by
-			 * 100 on the absorbed side.
+			 * Both sides are already in pct units, so no extra
+			 * cross-multiplication is needed.
 			 *
 			 * Non-strict (>=): a tie means the read-side
 			 * latency is unchanged on average, while the
@@ -9981,7 +10035,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 					ft_collapsed_count(
 						ft_collapsed_nr_entries(col));
 
-				if (100UL * (unsigned long) weighted_absorbed_cl <
+				if ((unsigned long) weighted_absorbed_cl_pct <
 				    (unsigned long) collapsed_cl_pct * nr_emit) {
 					free_collapsed_node(ft, col);
 					continue;
@@ -12510,6 +12564,66 @@ int ft_compress_chain_at(struct cds_ft *ft,
 
 		if (len < min_chain_len || nr_absorbed == 0)
 			return 0;
+	}
+
+	/*
+	 * Per-path CL latency gate for non-skip publication.
+	 *
+	 * Skip-encoded publication (skip mode + len <= FT_SKIP_LEN_MAX)
+	 * is always a strict win: 0 CL on the read side, replacing N
+	 * absorbed nodes that each cost >= 0 CL.  Bypass the gate.
+	 *
+	 * Non-skip publication (non-skip mode, or len > FT_SKIP_LEN_MAX
+	 * in skip mode) creates a compressed node that costs
+	 *
+	 *   candidate_cl = ceil((header + len) / 64)
+	 *
+	 * cache lines on a successful read (full key-byte scan with
+	 * cn->child colocated in the header CL).  Compare against the
+	 * accumulated CL load of the absorbed chain nodes; reject if
+	 * the chain replacement would strictly increase per-path
+	 * latency.
+	 *
+	 * compress_scan_mul_pct (per-trie tunable, default
+	 * CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT = 100) scales the
+	 * candidate's scan portion to model scan-loop overhead beyond
+	 * raw CL bandwidth.  The default is lower than the collapse
+	 * gate's (225) because the compressed scan is simpler — no
+	 * offset arithmetic, no per-entry suffix length, single match.
+	 *
+	 * Both muls are also passed to ft_node_readside_cl_pct() when
+	 * pricing the absorbed-side nodes so that per-node-type costs
+	 * stay symmetric between gates: a compressed (or collapsed)
+	 * node priced as the candidate in one gate carries the same
+	 * pct-CL cost when it appears as absorbed in another gate.
+	 */
+	{
+		bool skip_publish =
+			ft_group_skip_compressed(ft->group) &&
+			len <= FT_SKIP_LEN_MAX;
+
+		if (!skip_publish) {
+			unsigned int collapse_scan_mul_pct = uatomic_load(
+				&ft->collapse_scan_mul_pct, CMM_RELAXED);
+			unsigned int compress_scan_mul_pct = uatomic_load(
+				&ft->compress_scan_mul_pct, CMM_RELAXED);
+			unsigned int absorbed_cl_pct = 0;
+			unsigned int candidate_cl;
+			unsigned int candidate_cl_pct;
+			unsigned int j;
+
+			for (j = 0; j < nr_absorbed; j++)
+				absorbed_cl_pct +=
+					ft_node_readside_cl_pct(ft, absorbed[j],
+						collapse_scan_mul_pct,
+						compress_scan_mul_pct);
+			candidate_cl = (offsetof(struct cds_ft_compressed_node,
+					key_bytes) + len + 63U) / 64U;
+			candidate_cl_pct = compress_scan_mul_pct * candidate_cl;
+			if ((unsigned long) absorbed_cl_pct <
+			    (unsigned long) candidate_cl_pct)
+				return 0;
+		}
 	}
 
 	if (ft_node_external(walk))
@@ -16090,6 +16204,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		detached->exclusive = true;
 		detached->collapse_threshold_pct = ft->collapse_threshold_pct;
 		detached->collapse_scan_mul_pct = ft->collapse_scan_mul_pct;
+		detached->compress_scan_mul_pct = ft->compress_scan_mul_pct;
 
 		/*
 		 * Allocate a fresh empty root for the source trie
@@ -16222,6 +16337,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			detached->exclusive = true;
 			detached->collapse_threshold_pct = ft->collapse_threshold_pct;
 			detached->collapse_scan_mul_pct = ft->collapse_scan_mul_pct;
+			detached->compress_scan_mul_pct = ft->compress_scan_mul_pct;
 
 			/*
 			 * Propagate count removal through ancestors
@@ -18788,6 +18904,7 @@ enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 	}
 	attr->collapse_threshold_pct = CDS_FT_COLLAPSE_THRESHOLD_DEFAULT;
 	attr->collapse_scan_mul_pct = CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT;
+	attr->compress_scan_mul_pct = CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT;
 	*result = attr;
 	return CDS_FT_STATUS_OK;
 }
@@ -18819,6 +18936,15 @@ enum cds_ft_status cds_ft_attr_set_collapse_scan_mul(struct cds_ft_attr *attr,
 	if (scan_mul_pct < 100U)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	attr->collapse_scan_mul_pct = scan_mul_pct;
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_attr_set_compress_scan_mul(struct cds_ft_attr *attr,
+		unsigned int scan_mul_pct)
+{
+	if (scan_mul_pct < 100U)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->compress_scan_mul_pct = scan_mul_pct;
 	return CDS_FT_STATUS_OK;
 }
 
@@ -18877,6 +19003,20 @@ enum cds_ft_status cds_ft_collapse_scan_mul_set(struct cds_ft *ft,
 unsigned int cds_ft_collapse_scan_mul_get(struct cds_ft *ft)
 {
 	return uatomic_load(&ft->collapse_scan_mul_pct, CMM_RELAXED);
+}
+
+enum cds_ft_status cds_ft_compress_scan_mul_set(struct cds_ft *ft,
+		unsigned int scan_mul_pct)
+{
+	if (scan_mul_pct < 100U)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	uatomic_store(&ft->compress_scan_mul_pct, scan_mul_pct, CMM_RELAXED);
+	return CDS_FT_STATUS_OK;
+}
+
+unsigned int cds_ft_compress_scan_mul_get(struct cds_ft *ft)
+{
+	return uatomic_load(&ft->compress_scan_mul_pct, CMM_RELAXED);
 }
 
 enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
@@ -18949,10 +19089,12 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->group = ft_group;
 	ft->collapse_threshold_pct = CDS_FT_COLLAPSE_THRESHOLD_DEFAULT;
 	ft->collapse_scan_mul_pct = CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT;
+	ft->compress_scan_mul_pct = CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT;
 	if (attr) {
 		ft->exclusive = attr->exclusive;
 		ft->collapse_threshold_pct = attr->collapse_threshold_pct;
 		ft->collapse_scan_mul_pct = attr->collapse_scan_mul_pct;
+		ft->compress_scan_mul_pct = attr->compress_scan_mul_pct;
 	}
 
 	/*

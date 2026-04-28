@@ -1847,6 +1847,24 @@ enum cds_ft_status cds_ft_attr_set_collapse_scan_mul(struct cds_ft_attr *attr,
 		unsigned int scan_mul_pct);
 
 /*
+ * cds_ft_attr_set_compress_scan_mul - Set the chain-compress per-path
+ *                                     CL latency gate's scan-cost
+ *                                     multiplier attribute used at
+ *                                     cds_ft_create time.
+ * @attr: Fractal Trie attributes.
+ * @scan_mul_pct: Multiplier in percent.  See
+ *                cds_ft_compress_scan_mul_set for semantics.  Must
+ *                be >= 100.
+ *
+ * Default: CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT (100).
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @scan_mul_pct is below 100.
+ */
+enum cds_ft_status cds_ft_attr_set_compress_scan_mul(struct cds_ft_attr *attr,
+		unsigned int scan_mul_pct);
+
+/*
  * cds_ft_make_exclusive - Transition a Fractal Trie to exclusive
  *                         access discipline.
  * @ft: The Fractal Trie.
@@ -1976,6 +1994,32 @@ bool cds_ft_excl_validate_enabled(void);
 #define CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT	225U
 
 /*
+ * Chain-compress per-path CL latency gate's scan-cost multiplier (in
+ * percent), independent of the collapse multiplier above.  Applied to
+ * `ft_compress_chain_at` when publishing a non-skip compressed node:
+ * skip-encoded publication (len <= FT_SKIP_LEN_MAX in skip mode) is
+ * always a strict win and bypasses the gate.
+ *
+ * The gate compares
+ *
+ *     candidate_cl = scan_mul_pct/100 × ceil((header + len) / 64)
+ *
+ * against the accumulated CL load of the absorbed chain nodes.
+ *
+ * The compressed scan loop is *simpler* than the collapsed one — no
+ * per-entry suffix-length logic, no offset arithmetic, no pointer
+ * table indirection — so the optimal multiplier is generally
+ * *lower* than the collapsed-side multiplier.  Default 100 (= 1.0×,
+ * pure CL bandwidth model) keeps chain-compress maximally
+ * permissive: any compression that strictly reduces read-side CL
+ * load count is accepted.
+ *
+ * Tune up if measuring a chip where compressed scan is more
+ * expensive per CL than dependent pointer chases (rare).
+ */
+#define CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT	100U
+
+/*
  * cds_ft_collapse_threshold_set - Set the collapse acceptance
  *                                 threshold for a Fractal Trie.
  * @ft: The Fractal Trie.
@@ -2033,6 +2077,37 @@ enum cds_ft_status cds_ft_collapse_scan_mul_set(struct cds_ft *ft,
  * Returns the current multiplier in percent.
  */
 unsigned int cds_ft_collapse_scan_mul_get(struct cds_ft *ft);
+
+/*
+ * cds_ft_compress_scan_mul_set - Set the chain-compress per-path CL
+ *                                latency gate's scan-cost multiplier
+ *                                for a Fractal Trie.
+ * @ft: The Fractal Trie.
+ * @scan_mul_pct: Multiplier in percent (100 = 1.0×).  Must be >= 100.
+ *
+ * Applied to `ft_compress_chain_at` when publishing a non-skip
+ * compressed node.  Skip-encoded publication is always a strict win
+ * and bypasses the gate.  See CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT
+ * for default and rationale.
+ *
+ * Safe to call on a live trie under writers.  Has no effect on
+ * already-compressed content.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @scan_mul_pct < 100.
+ */
+enum cds_ft_status cds_ft_compress_scan_mul_set(struct cds_ft *ft,
+		unsigned int scan_mul_pct);
+
+/*
+ * cds_ft_compress_scan_mul_get - Query the chain-compress per-path
+ *                                CL latency gate's scan-cost
+ *                                multiplier for a Fractal Trie.
+ * @ft: The Fractal Trie.
+ *
+ * Returns the current multiplier in percent.
+ */
+unsigned int cds_ft_compress_scan_mul_get(struct cds_ft *ft);
 
 /*
  * Iterator management
