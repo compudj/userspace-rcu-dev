@@ -1829,6 +1829,24 @@ enum cds_ft_status cds_ft_attr_set_collapse_threshold(struct cds_ft_attr *attr,
 		unsigned int threshold_pct);
 
 /*
+ * cds_ft_attr_set_collapse_scan_mul - Set the per-path CL latency
+ *                                     gate's scan-cost multiplier
+ *                                     attribute used at cds_ft_create
+ *                                     time.
+ * @attr: Fractal Trie attributes.
+ * @scan_mul_pct: Scan multiplier in percent (100 = 1.0×).  See
+ *                cds_ft_collapse_scan_mul_set for semantics.  Must
+ *                be >= 100.
+ *
+ * Default: CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT (225).
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @scan_mul_pct is below 100.
+ */
+enum cds_ft_status cds_ft_attr_set_collapse_scan_mul(struct cds_ft_attr *attr,
+		unsigned int scan_mul_pct);
+
+/*
  * cds_ft_make_exclusive - Transition a Fractal Trie to exclusive
  *                         access discipline.
  * @ft: The Fractal Trie.
@@ -1933,6 +1951,31 @@ bool cds_ft_excl_validate_enabled(void);
 #define CDS_FT_COLLAPSE_THRESHOLD_DISABLED	UINT_MAX
 
 /*
+ * Per-path CL latency gate's scan-cost multiplier (in percent).  The
+ * gate computes a candidate collapsed-node CL cost as
+ *
+ *     collapsed_cl = scan_mul_pct/100 × avg_scan_CL + ptr_CL
+ *
+ * and rejects the candidate if the absorbed paths' average CL load
+ * count does not strictly exceed it.  The multiplier on the scan
+ * portion accounts for scan-loop overhead the raw CL load count
+ * doesn't capture (loop dispatch, byte compares per iteration,
+ * branch-on-match, reduced ILP vs. dependent pointer chases).
+ *
+ * The default (225 = 2.25×) is empirically chosen from a workload
+ * sweep on AMD64 (u32d/u32s/u64d/u64s/dns/dict/paths at 1M keys); the
+ * optimal value is architecture-dependent because it reflects
+ * scan-loop cycle cost relative to a cache-line load — both of
+ * which vary across micro-architectures.  Tune per host if needed.
+ *
+ * Values below 100 are rejected: the gate's only purpose is to
+ * over-estimate collapsed cost relative to memory bandwidth, so
+ * under-estimating it would push the gate toward accepting
+ * collapses that lose latency.
+ */
+#define CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT	225U
+
+/*
  * cds_ft_collapse_threshold_set - Set the collapse acceptance
  *                                 threshold for a Fractal Trie.
  * @ft: The Fractal Trie.
@@ -1958,6 +2001,38 @@ enum cds_ft_status cds_ft_collapse_threshold_set(struct cds_ft *ft,
  * Returns the current threshold in percent.
  */
 unsigned int cds_ft_collapse_threshold_get(struct cds_ft *ft);
+
+/*
+ * cds_ft_collapse_scan_mul_set - Set the per-path CL latency gate's
+ *                                scan-cost multiplier for a Fractal
+ *                                Trie.
+ * @ft: The Fractal Trie.
+ * @scan_mul_pct: Multiplier in percent (100 = 1.0×).  Must be >= 100.
+ *
+ * The multiplier scales the scan-zone CL cost on the collapsed side
+ * of the per-path latency gate, modeling scan-loop overhead beyond
+ * pure CL bandwidth.  See CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT for
+ * the default and the architecture-dependence rationale.
+ *
+ * Safe to call on a live trie under writers; the new value is picked
+ * up by subsequent collapse evaluations.  Has no effect on
+ * already-collapsed (or already-uncollapsed) content.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @scan_mul_pct < 100.
+ */
+enum cds_ft_status cds_ft_collapse_scan_mul_set(struct cds_ft *ft,
+		unsigned int scan_mul_pct);
+
+/*
+ * cds_ft_collapse_scan_mul_get - Query the per-path CL latency gate's
+ *                                scan-cost multiplier for a Fractal
+ *                                Trie.
+ * @ft: The Fractal Trie.
+ *
+ * Returns the current multiplier in percent.
+ */
+unsigned int cds_ft_collapse_scan_mul_get(struct cds_ft *ft);
 
 /*
  * Iterator management

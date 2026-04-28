@@ -623,6 +623,21 @@ struct cds_ft {
 	 */
 	unsigned int collapse_threshold_pct;
 
+	/*
+	 * Per-path CL latency gate's scan-cost multiplier, in
+	 * percent (100 = 1.0×).  Models scan-loop overhead the raw
+	 * CL load count doesn't capture (loop dispatch, byte
+	 * compares, branch-on-match, reduced ILP).  Larger values
+	 * reject more SCAN_256-targeted collapses since the
+	 * multiplier hits avg_scan_CL=2 there.  Loaded with relaxed
+	 * atomics on the write path; retunable on a live trie.
+	 *
+	 * Default CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT (225) chosen
+	 * empirically from a workload sweep on AMD64; the optimal
+	 * value is architecture-dependent.
+	 */
+	unsigned int collapse_scan_mul_pct;
+
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[FT_ENTRY_PER_NODE];
 	unsigned long nr_nodes_allocated, nr_nodes_freed;
