@@ -3494,6 +3494,74 @@ static inline void ft_maybe_prefetch(const void *ptr)
 #define ft_dereference_acquire(p)	\
 	(__typeof__(p)) uatomic_load(&(p), CMM_ACQUIRE)
 
+#ifdef FEATURE_FT_COLLAPSE
+/*
+ * Stride-aware reader-side candidate match.  Given a slot index @e
+ * (typically yielded by the SIMD prefilter or the (0,0) bypass scan),
+ * loads the slot's atomic snapshot, verifies the suffix bytes match
+ * @key[0..slen-1], and returns the live child pointer.
+ *
+ * Narrow path (FT_COL_STRIDE_NARROW): SWAR pack/match via the 8-byte
+ * subkey load; entry pointer not needed by the verify itself but is
+ * still used for the child fetch.
+ *
+ * Wide path (FT_COL_STRIDE_WIDE): acquire-load @len, byte-by-byte
+ * compare suffix[0..slen-1] against @key, then fetch @child.  No
+ * SWAR — the 23-byte wide suffix does not fit in one uint64_t.
+ *
+ * Returns true on a live, suffix-matching slot whose @slen <=
+ * @remaining_key, with *@slen_p and *@child_p set.  Returns false
+ * for unpublished, dead, length-overflow, and suffix-mismatch slots.
+ *
+ * Defined here (after ft_dereference_prefetch) rather than alongside
+ * the iteration macros so it can use the macro directly.
+ */
+static inline_lookup
+bool ft_collapsed_match_candidate(struct cds_ft_collapsed_node *col,
+		unsigned int tier, unsigned int stride, unsigned int e,
+		const uint8_t *key, unsigned int remaining_key,
+		unsigned int *slen_p, struct cds_ft_inode_flag **child_p)
+{
+	if (stride == FT_COL_STRIDE_NARROW) {
+		struct cds_ft_collapsed_entry *entry =
+				&ft_collapsed_entries(col, tier)[e];
+		uint64_t subkey = ft_collapsed_subkey_load(col, tier, e);
+		unsigned int slen = ft_collapsed_subkey_unpack_slen(subkey);
+		struct cds_ft_inode_flag *child;
+
+		if (slen == 0 || slen > remaining_key)
+			return false;
+		if (!ft_collapsed_subkey_match(subkey, key, slen))
+			return false;
+		child = ft_dereference_prefetch(entry->child);
+		if (child == NULL)
+			return false;
+		*slen_p = slen;
+		*child_p = child;
+		return true;
+	} else {
+		struct cds_ft_collapsed_entry_wide *entry =
+				&ft_collapsed_entries_wide(col, tier)[e];
+		unsigned int slen = ft_collapsed_wide_load_slen(col, tier, e);
+		struct cds_ft_inode_flag *child;
+		unsigned int k;
+
+		if (slen == 0 || slen > remaining_key)
+			return false;
+		for (k = 0; k < slen; k++) {
+			if (entry->suffix[k] != key[k])
+				return false;
+		}
+		child = ft_dereference_prefetch(entry->child);
+		if (child == NULL)
+			return false;
+		*slen_p = slen;
+		*child_p = child;
+		return true;
+	}
+}
+#endif /* FEATURE_FT_COLLAPSE */
+
 /*
  * Per-caller prefetch hint for ft_node_get_nth_skip / ft_node_get_nth
  * and the underlying scanners.  Compile-time constant at each call
@@ -6489,8 +6557,8 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 	const uint8_t *key = *key_p;
 	unsigned int i = *i_p;
 	unsigned int tier = ft_collapsed_tier(node_flag);
+	unsigned int stride = ft_collapsed_stride(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
 	unsigned int remaining_key = key_depth - 1 - i;
 	unsigned int candidate_mask;
 	uint16_t target_prefix;
@@ -6542,12 +6610,19 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 	 * stores are relaxed; the verify on the atomically-published
 	 * subkey (full bytes 0..slen-1) is the source of truth and
 	 * catches any torn-prefix false acceptance.
+	 *
+	 * The SIMD prefix scan is stride-invariant: wide nodes share
+	 * the narrow header layout exactly, only halving the entry
+	 * count.  Trailing prefix lanes beyond the wide capacity are
+	 * zero-init and produce no false positives against any
+	 * non-zero target.  The (0,0) bypass uses stride-aware
+	 * capacity to bound the scalar walk correctly.
 	 */
 	target_prefix = (uint16_t) key[0] | ((uint16_t) key[1] << 8);
 	if (caa_unlikely(target_prefix == 0)) {
 		const uint8_t *p0 = ft_collapsed_prefix_0(col, tier);
 		const uint8_t *p1 = ft_collapsed_prefix_1(col, tier);
-		unsigned int cap = ft_collapsed_capacity(tier);
+		unsigned int cap = ft_collapsed_capacity_stride(tier, stride);
 		unsigned int e;
 
 		candidate_mask = 0;
@@ -6563,29 +6638,25 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 
 	/*
 	 * Iterate set bits in the candidate mask.  For each candidate:
-	 * (1) load the subkey (atomic on 64-bit; acquire on len then
-	 *     plain suffix reads on 32-bit) — the source of truth;
+	 * (1) load the subkey (narrow: 8B SWAR; wide: acquire on @len);
 	 * (2) skip if slen=0 (slot unwritten or unpublished);
-	 * (3) verify suffix bytes 0..slen-1 against the full target;
+	 * (3) verify suffix bytes 0..slen-1 against the full target
+	 *     (narrow: SWAR equality on the packed word; wide:
+	 *     byte-by-byte compare against entry->suffix);
 	 * (4) rcu_dereference child for liveness, skip if NULL.
+	 *
+	 * ft_collapsed_match_candidate encapsulates steps (1)-(4) and
+	 * dispatches on @stride.
 	 */
 	while (candidate_mask) {
 		unsigned int e = (unsigned int) __builtin_ctz(candidate_mask);
-		struct cds_ft_collapsed_entry *entry = &entries[e];
 		struct cds_ft_inode_flag *child;
-		uint64_t subkey;
 		unsigned int slen;
 
 		candidate_mask &= candidate_mask - 1;
 
-		subkey = ft_collapsed_subkey_load(col, tier, e);
-		slen = ft_collapsed_subkey_unpack_slen(subkey);
-		if (slen == 0 || slen > remaining_key)
-			continue;
-		if (!ft_collapsed_subkey_match(subkey, key, slen))
-			continue;
-		child = ft_dereference_prefetch(entry->child);
-		if (child == NULL)
+		if (!ft_collapsed_match_candidate(col, tier, stride, e,
+				key, remaining_key, &slen, &child))
 			continue;
 
 		/* Match found. Advance past the suffix. */
@@ -6596,7 +6667,7 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 			for (k = 1; k <= slen; k++)
 				iter_path_node(iter)[i + k] =
 					(struct cds_ft_inode_flag *)
-					ft_collapsed_node_flag_tier(col, tier);
+					ft_collapsed_node_flag_tier_stride(col, tier, stride);
 		}
 		i += slen;
 		node_flag = child;
