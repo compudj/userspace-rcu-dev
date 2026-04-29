@@ -2388,11 +2388,22 @@ unsigned int ft_collapsed_subkey_unpack_slen(uint64_t val)
 /*
  * Compare an unpacked subkey value's suffix bytes [0..slen-1] against
  * @key bytes [0..slen-1].  Returns true on full match.
+ *
+ * 64-bit SWAR fast path: pack @key with the same byte layout as the
+ * subkey (bytes 0..slen-1 from the source, bytes slen..6 zero, byte 7
+ * holding slen), then a single uint64_t equality check covers all
+ * suffix bytes plus the implicit slen byte at position 7.  The
+ * packing is endian-portable via memcpy through uint8_t[8], so the
+ * comparison works on any host endianness as long as both sides use
+ * the same packing function.
  */
 static inline_lookup
 bool ft_collapsed_subkey_match(uint64_t val, const uint8_t *key,
 		unsigned int slen)
 {
+#if (CAA_BITS_PER_LONG >= 64)
+	return val == ft_collapsed_subkey_pack(key, slen);
+#else
 	uint8_t bytes[8];
 	unsigned int k;
 
@@ -2402,6 +2413,7 @@ bool ft_collapsed_subkey_match(uint64_t val, const uint8_t *key,
 			return false;
 	}
 	return true;
+#endif
 }
 
 /*
