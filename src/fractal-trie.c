@@ -1939,31 +1939,140 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 
 /* Collapsed node accessors. */
 
-static const unsigned int ft_collapsed_scan_sizes[] = {
-	[FT_COLLAPSED_SCAN_32]  = 32,
-	[FT_COLLAPSED_SCAN_64]  = 64,
+/*
+ * Per-tier metadata tables (read-only, compile-time-constant).
+ *
+ * Indexed by tier (0..3) recovered from a collapsed-node tagged
+ * pointer via ft_collapsed_tier().
+ */
+static const uint8_t ft_col_tier_capacity[FT_COL_NR_TIERS] = {
+	[0] = FT_COL_T0_CAPACITY,
+	[1] = FT_COL_T1_CAPACITY,
+	[2] = FT_COL_T2_CAPACITY,
+	[3] = FT_COL_T3_CAPACITY,
+};
+
+static const uint8_t ft_col_tier_alloc_order[FT_COL_NR_TIERS] = {
+	[0] = FT_COL_T0_ALLOC_ORDER,
+	[1] = FT_COL_T1_ALLOC_ORDER,
+	[2] = FT_COL_T2_ALLOC_ORDER,
+	[3] = FT_COL_T3_ALLOC_ORDER,
+};
+
+static const uint8_t ft_col_tier_header_size[FT_COL_NR_TIERS] = {
+	[0] = FT_COL_T0_HEADER_SIZE,
+	[1] = FT_COL_T1_HEADER_SIZE,
+	[2] = FT_COL_T2_HEADER_SIZE,
+	[3] = FT_COL_T3_HEADER_SIZE,
+};
+
+static const uint8_t ft_col_tier_prefix_stride[FT_COL_NR_TIERS] = {
+	[0] = FT_COL_T0_PREFIX_STRIDE,
+	[1] = FT_COL_T1_PREFIX_STRIDE,
+	[2] = FT_COL_T2_PREFIX_STRIDE,
+	[3] = FT_COL_T3_PREFIX_STRIDE,
 };
 
 /*
- * Load nr_entries with acquire ordering.  Returns the full byte
- * including the scan zone selector in bit 6.  Callers that
- * need just the entry count must mask with FT_COLLAPSED_NR_ENTRIES_MASK.
- * Callers that pass this to collapsed accessors (ft_collapsed_ptrs,
- * ft_collapsed_suffix, ft_collapsed_suffix_len, ft_collapsed_entry_dead,
- * ft_collapsed_scan_zone_size, ft_collapsed_offset_mask) must pass
- * the full value so the scan zone selector is preserved.
+ * Tail mask: bits 0..(capacity-1) set.  Applied after the SIMD
+ * cmpeq movemask to discard matches in unused slots.  Each tier's
+ * mask fits comfortably in 32 bits (max capacity is 28).
  */
-static inline
-unsigned int ft_collapsed_nr_entries(struct cds_ft_collapsed_node *col)
+static const uint32_t ft_col_tier_tail_mask[FT_COL_NR_TIERS] = {
+	[0] = (1U << FT_COL_T0_CAPACITY) - 1U,	/* 0x07 */
+	[1] = (1U << FT_COL_T1_CAPACITY) - 1U,	/* 0x7F */
+	[2] = (1U << FT_COL_T2_CAPACITY) - 1U,	/* 0x0FFF */
+	[3] = (1U << FT_COL_T3_CAPACITY) - 1U,	/* 0x0FFFFFFF */
+};
+
+/* Capacity of a collapsed node at the given tier. */
+static inline_lookup
+unsigned int ft_collapsed_capacity(unsigned int tier)
 {
-	return uatomic_load(&col->nr_entries, CMM_ACQUIRE);
+	return ft_col_tier_capacity[tier];
 }
 
-/* Extract entry count from the full nr_entries value (mask out selector). */
-static inline
-unsigned int ft_collapsed_count(unsigned int nr_entries)
+/*
+ * Pointer to the entries[] array.  Each entry is 16 bytes; the array
+ * starts at a tier-dependent header offset (16B for T0/T1, 64B for
+ * T2/T3) so it is 16-byte aligned for SWAR.
+ */
+static inline_lookup
+struct cds_ft_collapsed_entry *ft_collapsed_entries(
+		struct cds_ft_collapsed_node *col, unsigned int tier)
 {
-	return nr_entries & FT_COLLAPSED_NR_ENTRIES_MASK;
+	return (struct cds_ft_collapsed_entry *)
+		(((uint8_t *) col) + ft_col_tier_header_size[tier]);
+}
+
+/* Pointer to prefix_0 array (always at offset 0). */
+static inline_lookup
+uint8_t *ft_collapsed_prefix_0(struct cds_ft_collapsed_node *col,
+		unsigned int tier __attribute__((unused)))
+{
+	return (uint8_t *) col;
+}
+
+/*
+ * Pointer to prefix_1 array.  Immediately follows prefix_0; the
+ * stride per tier accounts for SIMD-load alignment (8B for T0/T1,
+ * 16B for T2, 32B for T3).
+ */
+static inline_lookup
+uint8_t *ft_collapsed_prefix_1(struct cds_ft_collapsed_node *col,
+		unsigned int tier)
+{
+	return ((uint8_t *) col) + ft_col_tier_prefix_stride[tier];
+}
+
+/*
+ * Count live entries (slots with child != NULL).
+ *
+ * Acquire-load on each child pointer pairs with the writer's
+ * release-store at publication and deletion, ensuring readers
+ * observe the per-slot suffix/len bytes prior to seeing a
+ * non-NULL child.
+ */
+static inline
+unsigned int ft_collapsed_count_live(struct cds_ft_collapsed_node *col,
+		unsigned int tier)
+{
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int e, n = 0;
+
+	for (e = 0; e < cap; e++) {
+		if (uatomic_load(&entries[e].child, CMM_ACQUIRE) != NULL)
+			n++;
+	}
+	return n;
+}
+
+/*
+ * High-water-mark: index of the first never-written slot.
+ * Equivalent to the count of slots ever published.
+ *
+ * Once-live-then-dead slots still have len > 0 (since min suffix
+ * len is 1), so they are counted as "ever written".  Born-dead
+ * slots have len == 0 (zero-init by allocator).
+ *
+ * Used by the writer to find the next free slot for in-order
+ * tail-append.  Read with relaxed ordering — len bytes are
+ * immutable once published.
+ */
+static inline
+unsigned int ft_collapsed_high_water(struct cds_ft_collapsed_node *col,
+		unsigned int tier)
+{
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int e;
+
+	for (e = 0; e < cap; e++) {
+		if (entries[e].len == 0)
+			return e;
+	}
+	return cap;
 }
 
 #ifdef FT_ENABLE_TRACING
@@ -2101,138 +2210,83 @@ uint16_t ft_tp_node_skip_len(struct cds_ft_inode_flag *nf)
 #endif /* FT_ENABLE_TRACING */
 
 /*
- * Set the entry count, preserving the scan zone selector in bits 6-7.
- * Writer-only (not published to readers).
+ * Suffix bytes for a collapsed entry — &entry->suffix[0].  Returned
+ * pointer covers FT_COL_SUFFIX_MAX (7) bytes; the valid prefix length
+ * is given by ft_collapsed_suffix_len().
  */
 static inline
-void ft_collapsed_set_nr_entries(struct cds_ft_collapsed_node *col,
-		unsigned int count)
+uint8_t *ft_collapsed_suffix(struct cds_ft_collapsed_entry *entry)
 {
-	col->nr_entries = (col->nr_entries & ~FT_COLLAPSED_NR_ENTRIES_MASK)
-		| (count & FT_COLLAPSED_NR_ENTRIES_MASK);
+	return entry->suffix;
+}
+
+/* Suffix length (1..7) for a collapsed entry. */
+static inline
+unsigned int ft_collapsed_suffix_len(struct cds_ft_collapsed_entry *entry)
+{
+	return entry->len;
+}
+
+/* Liveness check: dead iff child == NULL.  Relaxed load is fine for
+ * filtering during iteration; sites that descend into the child must
+ * use ft_dereference_acquire on the child pointer. */
+static inline
+bool ft_collapsed_entry_dead(struct cds_ft_collapsed_entry *entry)
+{
+	return uatomic_load(&entry->child, CMM_RELAXED) == NULL;
 }
 
 /*
- * Publish an incremented entry count with store-release ordering.
- * Ensures readers (via load-acquire in ft_collapsed_nr_entries) see
- * the fully written suffix, offset, and pointer data before seeing
- * the incremented count.  Preserves the scan zone selector in bits 6-7.
+ * Publish a freshly-written entry by release-storing its child
+ * pointer.  Suffix bytes, length, and prefix-cache bytes must be
+ * written before this call.  Pairs with the reader's acquire load.
  */
 static inline
-void ft_collapsed_publish_inc_nr_entries(struct cds_ft_collapsed_node *col)
+void ft_collapsed_publish_entry(struct cds_ft_collapsed_node *col,
+		unsigned int tier, unsigned int e,
+		struct cds_ft_inode_flag *child)
 {
-	/* Verify increment does not overflow into scan zone selector bits. */
-	assert((col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) ==
-	       ((uint8_t)(col->nr_entries + 1) >> FT_COLLAPSED_SCAN_SHIFT));
-	uatomic_store(&col->nr_entries, col->nr_entries + 1, CMM_RELEASE);
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+
+	uatomic_store(&entries[e].child, child, CMM_RELEASE);
 }
 
 /*
- * Scan zone size and offset mask derived from nr_entries.
- * Accept a preloaded nr_entries value to avoid reloading on
- * read-side fast paths.  Write-side callers can pass
- * cn->nr_entries directly.
+ * Mark a live entry dead.  Single CMM_RELEASE store of NULL into
+ * the entry's child pointer.  The entry's (suffix, len) bytes
+ * remain in place but are filtered out by every reader's
+ * child-NULL check.  Slots are never reused.
  */
 static inline
-unsigned int ft_collapsed_scan_zone_size(unsigned int nr_entries)
+void ft_collapsed_kill_entry(struct cds_ft_collapsed_node *col,
+		unsigned int tier, unsigned int e)
 {
-	/* 32 << selector: selector 0=32B, 1=64B. */
-	return 32U << (nr_entries >> FT_COLLAPSED_SCAN_SHIFT);
-}
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
 
-static inline
-unsigned int ft_collapsed_offset_mask(unsigned int nr_entries
-		__attribute__((unused)))
-{
-	/*
-	 * Both supported scan zone sizes (32B, 64B) use 7-bit
-	 * offsets with bit 7 reserved as the tombstone marker.
-	 */
-	return FT_COLLAPSED_OFFSET_MASK;
+	uatomic_store(&entries[e].child, NULL, CMM_RELEASE);
 }
 
 /*
- * Load entry @i's data byte once (relaxed atomic).  Use the returned
- * value to avoid reloading cn->data[i] across multiple accessors.
- */
-static inline
-uint8_t ft_collapsed_load_data(struct cds_ft_collapsed_node *col,
-		unsigned int i)
-{
-	return uatomic_load(&col->data[i], CMM_RELAXED);
-}
-
-/*
- * Collapsed node accessors: accept preloaded data byte and nr_entries
- * to avoid reloading shared state.  nr_entries provides the scan zone
- * selector for offset mask and scan zone size computation.
- */
-
-/* Suffix pointer from preloaded data byte and nr_entries. */
-static inline
-uint8_t *ft_collapsed_suffix(struct cds_ft_collapsed_node *col,
-		uint8_t data_i, unsigned int nr_entries)
-{
-	return ((uint8_t *) col) + (data_i & ft_collapsed_offset_mask(nr_entries));
-}
-
-/* Suffix length from preloaded data byte and nr_entries. */
-static inline
-unsigned int ft_collapsed_suffix_len(struct cds_ft_collapsed_node *col,
-		uint8_t data_i, unsigned int i, unsigned int nr_entries)
-{
-	unsigned int mask = ft_collapsed_offset_mask(nr_entries);
-	unsigned int start = data_i & mask;
-	unsigned int end;
-
-	if (i == 0)
-		end = ft_collapsed_scan_zone_size(nr_entries);
-	else
-		end = ft_collapsed_load_data(col, i - 1) & mask;
-	if (end < start) {
-		FT_TP(collapsed_suffix_len_bad,
-			(const void *) col, i, nr_entries,
-			start, end, data_i,
-			i == 0 ? 0 : ft_collapsed_load_data(col, i - 1));
-	}
-	assert(end >= start);
-	return end - start;
-}
-
-/* Dead check from preloaded data byte and nr_entries. */
-static inline
-bool ft_collapsed_entry_dead(uint8_t data_i,
-		unsigned int nr_entries __attribute__((unused)))
-{
-	return data_i & FT_COLLAPSED_TOMBSTONE;
-}
-
-static inline
-struct cds_ft_inode_flag **ft_collapsed_ptrs(struct cds_ft_collapsed_node *col,
-		unsigned int nr_entries)
-{
-	return (struct cds_ft_inode_flag **)
-		(((uint8_t *) col) + ft_collapsed_scan_zone_size(nr_entries));
-}
-
-/*
- * Iterate over each live entry of a collapsed node.  For each
- * non-tombstoned entry, the loop body runs with @e set to the entry
- * index and @data_e set to the loaded slot byte (suffix length +
- * offset bits).  Tombstoned entries are skipped.
+ * Iterate over every live (child != NULL) entry of a collapsed
+ * node.  Loop body runs with @e set to the slot index and @entry
+ * pointing to that slot.  Dead slots (child == NULL) are skipped.
  *
- * @col:    struct cds_ft_collapsed_node *
- * @nr_e:   unsigned int — full nr_entries (selector + count),
- *          typically obtained via ft_collapsed_nr_entries(@col)
- * @e:      unsigned int — iteration variable; declared by caller
- * @data_e: uint8_t — loaded slot byte; declared by caller
+ * Live entries appear in lexicographic order across slot indices,
+ * so the iteration visits them in sorted order.  Dead-slot holes
+ * may be present (deleted slots), but the macro filters them.
  *
  * Wrap the body in `{ ... }` to avoid dangling-else hazards.
+ *
+ * @col:   struct cds_ft_collapsed_node *
+ * @tier:  unsigned int — recovered via ft_collapsed_tier(node_flag)
+ * @e:     unsigned int — iteration variable; declared by caller
+ * @entry: struct cds_ft_collapsed_entry * — declared by caller;
+ *         set to &entries[e] before the dead-skip check
  */
-#define ft_for_each_live_collapsed_entry(_col, _nr_e, _e, _data_e)	\
-	for ((_e) = 0; (_e) < ft_collapsed_count(_nr_e); (_e)++)	\
-		if (((_data_e) = ft_collapsed_load_data((_col), (_e))),	\
-		    ft_collapsed_entry_dead((_data_e), (_nr_e)))	\
+#define ft_for_each_live_collapsed_entry(_col, _tier, _e, _entry)	\
+	for ((_e) = 0; (_e) < ft_collapsed_capacity(_tier); (_e)++)	\
+		if (((_entry) = &ft_collapsed_entries((_col), (_tier))[(_e)]),	\
+		    ft_collapsed_entry_dead((_entry)))			\
 			continue;					\
 		else
 
@@ -2557,13 +2611,23 @@ unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
 		unsigned int collapse_scan_mul_pct,
 		unsigned int compress_scan_mul_pct)
 {
-	static const unsigned int collapsed_avg_scan_cl_by_sel[] = {
-		[FT_COLLAPSED_SCAN_32]  = 1,
-		[FT_COLLAPSED_SCAN_64]  = 1,
+	/*
+	 * Per-tier read-side CL counts for the SoA collapsed layout:
+	 *   scan_cl: cache lines fetched for the prefix-vector header.
+	 *   ptr_cl:  additional cache line for the matching 16B entry
+	 *            (0 for T0 since header + entries share a 64B line).
+	 */
+	static const unsigned int collapsed_avg_scan_cl_by_tier[FT_COL_NR_TIERS] = {
+		[0] = 1,	/* 64B alloc — header + entries on 1 CL */
+		[1] = 1,	/* 128B alloc — 16B header CL */
+		[2] = 1,	/* 256B alloc — 64B header = 1 CL */
+		[3] = 1,	/* 512B alloc — 64B header = 1 CL */
 	};
-	static const unsigned int collapsed_ptr_cl_by_sel[] = {
-		[FT_COLLAPSED_SCAN_32]  = 0,
-		[FT_COLLAPSED_SCAN_64]  = 1,
+	static const unsigned int collapsed_ptr_cl_by_tier[FT_COL_NR_TIERS] = {
+		[0] = 0,	/* T0: shared CL with scan */
+		[1] = 1,
+		[2] = 1,
+		[3] = 1,
 	};
 	unsigned int order;
 
@@ -2581,15 +2645,11 @@ unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
 	} else if (ft_node_skip_compressed(node_flag)) {
 		return 0;
 	} else if (ft_node_collapsed(node_flag)) {
-		struct cds_ft_collapsed_node *col =
-			ft_collapsed_node_ptr(node_flag);
-		unsigned int scan_sel =
-			(unsigned int) (uatomic_load(&col->nr_entries,
-				CMM_RELAXED) >> FT_COLLAPSED_SCAN_SHIFT);
+		unsigned int tier = ft_collapsed_tier(node_flag);
 
-		return collapsed_avg_scan_cl_by_sel[scan_sel]
+		return collapsed_avg_scan_cl_by_tier[tier]
 				* collapse_scan_mul_pct
-			+ collapsed_ptr_cl_by_sel[scan_sel] * 100U;
+			+ collapsed_ptr_cl_by_tier[tier] * 100U;
 	} else {
 		unsigned int type_index = ft_node_type(node_flag);
 		unsigned int cl;
@@ -2661,63 +2721,50 @@ void free_compressed_node_unpublished(struct cds_ft *ft,
 }
 
 /*
- * Collapsed node configurations:
+ * Collapsed node configurations (SoA layout — see header for the
+ * full per-tier byte map).
  *
- *   Config  Alloc  Scan   Ptrs  Max entries  CL loads  slen req
- *   TINY    64B    32B    32B   4            1         slen >= 2
- *   SMALL   128B   64B    64B   8            2         slen >= 2
- *   MEDIUM  256B   64B    192B  24           2         slen >= 2
+ *   Tier  Alloc  Header  Entries  Capacity  Read-side CLs (typical)
+ *   T0    64B    16B     48B      3          1 (header+entries share line)
+ *   T1    128B   16B     112B     7          2 (header CL + 1 entry CL)
+ *   T2    256B   64B     192B     12         2 (header CL + 1 entry CL)
+ *   T3    512B   64B     448B     28         2 (header CL + 1 entry CL)
  *
- * TINY is special: scan zone + pointers share a single cache line.
- * Lookup costs 1 CL load (vs 2 for SMALL/MEDIUM).  Selected via
- * post-walk compaction when entries fit in the 32B scan budget.
+ * Header holds two prefix-cache vectors (prefix_0[capacity] and
+ * prefix_1[capacity], padded to a tier-dependent SIMD-load stride).
+ * Entries are 16-byte fixed-stride records (suffix[7] | len | child).
  *
- * Select smallest allocation fitting the density.  Walk with 64B
- * scan zone, then compact to TINY if suffix quality allows.
- *
- * Cache-line guarantee: each entry's slen must justify the scan
- * zone's cache-line cost.  slen >= (scan_zone_size / 64) + 1
- * for ALL live entries (worst-case bound, not average).
- *
- * Why no XLARGE (512B): the 64B scan zone caps live entries at
- * ~21 (1 header + N offsets + N×min_slen bytes <= 64), so
- * MEDIUM's 24-pointer area already covers the maximum density
- * the scan zone can express.  A 512B XLARGE would have 56
- * pointer slots that the scan zone can never fill.
+ * Capacity is implicit from the tier — there is no in-node count
+ * byte.  Liveness is per-slot (entry.child == NULL marks a dead
+ * slot).  Live entries appear in lexicographic order across slots.
  */
-enum {
-	FT_COLLAPSED_ORDER_TINY   = 6,	/* 64B alloc */
-	FT_COLLAPSED_ORDER_SMALL  = 7,	/* 128B alloc */
-	FT_COLLAPSED_ORDER_MEDIUM = 8,	/* 256B alloc */
-
-	/*
-	 * Maximum entries for the largest configuration (order 8,
-	 * 64B scan zone).  Used for stack buffer sizing only.
-	 */
-	FT_COLLAPSED_MAX_ENTRIES_MAX = ((1 << FT_COLLAPSED_ORDER_MEDIUM)
-					- FT_COLLAPSED_SCAN_ZONE_MAX)
-				     / sizeof(struct cds_ft_inode_flag *),
-};
 
 #ifdef FEATURE_FT_COLLAPSE
 static
 struct cds_ft_collapsed_node *alloc_collapsed_node(struct cds_ft *ft,
-		unsigned int order, unsigned int scan_sel,
+		unsigned int tier,
 		struct cds_ft_metadata **_metadata)
 {
 	struct cds_ft_metadata *metadata;
 	struct cds_ft_collapsed_node *col;
-	unsigned int scan_sz = ft_collapsed_scan_sizes[scan_sel];
+	unsigned int order;
+	size_t alloc_sz;
+
+	assert(tier < FT_COL_NR_TIERS);
+	order = ft_col_tier_alloc_order[tier];
+	alloc_sz = (size_t) 1U << order;
 
 	metadata = cds_ft_alloc_item(ft, order, false);
 	if (!metadata)
 		return NULL;
 	col = (struct cds_ft_collapsed_node *) cds_ft_metadata_to_item(metadata);
-	memset(col, 0, scan_sz);
-	/* Set scan zone selector in bit 6 of nr_entries (count starts at 0). */
-	assert(scan_sel == FT_COLLAPSED_SCAN_32 ||
-	       scan_sel == FT_COLLAPSED_SCAN_64);
-	col->nr_entries = scan_sel << FT_COLLAPSED_SCAN_SHIFT;
+	/*
+	 * Zero the entire allocation: prefix-cache bytes start clean,
+	 * every entry is born-dead (suffix=0, len=0, child=NULL) so
+	 * readers' SIMD-prefix matches against an unwritten slot are
+	 * filtered by the child-NULL check.
+	 */
+	memset(col, 0, alloc_sz);
 	if (ft_debug_counters()) {
 		uatomic_inc(&ft->nr_nodes_allocated);
 		uatomic_inc(&ft->nr_collapsed_alloc);
@@ -2766,15 +2813,14 @@ void free_collapsed_node_unpublished(struct cds_ft *ft,
 }
 
 /*
- * Maximum number of entries for a collapsed node of the given order
- * and scan zone selector.
+ * Maximum number of entries for a collapsed node at the given tier.
+ * Equivalent to ft_collapsed_capacity(); kept under this name for
+ * call sites that read better when phrased as a "capacity check".
  */
 static inline
-unsigned int ft_collapsed_max_entries(unsigned int order, unsigned int scan_sel)
+unsigned int ft_collapsed_max_entries(unsigned int tier)
 {
-	unsigned int scan_sz = ft_collapsed_scan_sizes[scan_sel];
-
-	return ((1U << order) - scan_sz) / sizeof(struct cds_ft_inode_flag *);
+	return ft_col_tier_capacity[tier];
 }
 
 #define __FT_ALIGN_MASK(v, mask)	(((v) + (mask)) & ~(mask))
@@ -5949,11 +5995,10 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	const uint8_t *key = *key_p;
 	unsigned int i = *i_p;
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	unsigned int scan_sz = ft_collapsed_scan_zone_size(nr_e);
-	unsigned int off_mask = ft_collapsed_offset_mask(nr_e);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
 	unsigned int remaining_key = key_depth - 1 - i;
 	unsigned int e;
 
@@ -5977,26 +6022,26 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 		}
 	}
 
-	/* Scan entries for a matching suffix. */
-	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-		unsigned int slen, start, end;
-		uint8_t *suffix;
+	/*
+	 * Scalar scan over all tier-capacity slots.  Live entries are
+	 * filtered by child != NULL; the SIMD prefix-cache fast path
+	 * is added in a follow-up commit.  Live entries appear in
+	 * lexicographic order, but for an equality lookup the order
+	 * is irrelevant — we descend on the first match.
+	 */
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *entry = &entries[e];
+		struct cds_ft_inode_flag *child;
+		unsigned int slen;
 		bool match;
-		uint8_t data_e = ft_collapsed_load_data(col, e);
 
-		if (data_e & (off_mask ^ 0xFF))
-			continue;	/* tombstone (only for non-256B zones) */
-		start = data_e & off_mask;
-		/*
-		 * Previous entry's data byte is immutable once published,
-		 * so loading it without caching is safe.
-		 */
-		end = (e == 0) ? scan_sz : (ft_collapsed_load_data(col, e - 1) & off_mask);
-		slen = end - start;
+		child = ft_dereference_acquire_prefetch(entry->child);
+		if (child == NULL)
+			continue;
+		slen = entry->len;
 		if (slen > remaining_key)
 			continue;
-		suffix = ((uint8_t *) col) + start;
-		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, false, NULL) == 0);
+		match = (ft_key_cmp_ordinals(key, entry->suffix, slen, slen, false, NULL) == 0);
 		if (!match)
 			continue;
 
@@ -6008,10 +6053,10 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 			for (k = 1; k <= slen; k++)
 				iter_path_node(iter)[i + k] =
 					(struct cds_ft_inode_flag *)
-					ft_collapsed_node_flag(col);
+					ft_collapsed_node_flag_tier(col, tier);
 		}
 		i += slen;
-		node_flag = ft_dereference_acquire_prefetch(ptrs[e]);
+		node_flag = child;
 		if (!ft_node_ptr(node_flag)) {
 			*status_ret = CDS_FT_STATUS_NOT_FOUND;
 			return FT_DESCENT_END;
@@ -6140,43 +6185,45 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 		unsigned int key_depth, bool *not_found)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
 	const uint8_t *key = *key_p;
 	unsigned int i = *i_p;
 	unsigned int remaining = key_depth - i;
 	unsigned int e;
-	uint8_t data_e;
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
 
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *entry = &entries[e];
+		struct cds_ft_inode_flag *child;
 		unsigned int slen;
-		uint8_t *suffix;
 		bool match;
 
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		child = ft_dereference_acquire_prefetch(entry->child);
+		if (child == NULL)
+			continue;
+		slen = entry->len;
 		if (slen > remaining)
 			continue;
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
-		match = (ft_key_cmp_ordinals(key, suffix, slen, slen, false, NULL) == 0);
+		match = (ft_key_cmp_ordinals(key, entry->suffix, slen, slen, false, NULL) == 0);
 		if (!match)
 			continue;
 
 		*key_p = key + slen;
 		*i_p = i + slen - 1;
 		{
-			struct cds_ft_inode_flag *child =
-				ft_dereference_acquire_prefetch(ptrs[e]);
-			child = ft_resolve_skip_compressed(child);
-			*node_flag_p = child;
+			struct cds_ft_inode_flag *resolved =
+				ft_resolve_skip_compressed(child);
+			*node_flag_p = resolved;
 		}
 		if (node_flag_ptr_p)
-			*node_flag_ptr_p = &ptrs[e];
-		if (!ft_node_ptr(ptrs[e])) {
+			*node_flag_ptr_p = &entry->child;
+		if (!ft_node_ptr(child)) {
 			*not_found = true;
 			return FT_DESCENT_END;
 		}
-		if (ft_node_external(ptrs[e]))
+		if (ft_node_external(child))
 			return FT_DESCENT_BREAK;
 		return FT_DESCENT_CONTINUE;
 	}
@@ -6758,16 +6805,14 @@ end:
  * nearest live entry in @dir relative to entry @ref_entry.
  *
  * Compares each candidate's suffix against @ref_entry's suffix to
- * determine direction.  Skips @ref_entry itself, dead (tombstoned)
- * entries, and NULL-pointer entries.
+ * determine direction.  Skips @ref_entry itself and dead (child ==
+ * NULL) entries.
  *
  * Race-free pointer selection: each candidate entry is filtered by
- * (dead-bit clear AND cptrs non-NULL) at scan time, and we SAVE the
- * cptrs value into *@best_child so the caller uses the same pointer
- * the scan validated.  Otherwise a concurrent writer's sub-case-A
- * detach (which writes NULL to cptrs[e] and *then* sets the dead
- * bit) can leave the caller re-reading cptrs[best] and observing
- * NULL, with no easy way to recover.
+ * child != NULL at scan time, and we SAVE the acquire-loaded child
+ * pointer into *@best_child so the caller uses the same pointer the
+ * scan validated.  Re-reading the entry's child pointer later could
+ * race with a concurrent delete (CMM_RELEASE of NULL into child).
  *
  * Returns the index of the nearest entry, or -1 if none found.
  * On success, *@best_child receives the validated child pointer.
@@ -6776,37 +6821,36 @@ end:
 static inline_lookup
 int ft_collapsed_find_nearest(
 		struct cds_ft_collapsed_node *col,
-		struct cds_ft_inode_flag **cptrs,
+		unsigned int tier,
 		unsigned int ref_entry,
-		unsigned int nr_e,
 		enum ft_direction dir,
 		struct cds_ft_inode_flag **best_child)
 {
-	uint8_t ref_data = ft_collapsed_load_data(col, ref_entry);
-	uint8_t *ref_suffix = ft_collapsed_suffix(col, ref_data, nr_e);
-	unsigned int ref_slen = ft_collapsed_suffix_len(col, ref_data, ref_entry, nr_e);
-	unsigned int count = ft_collapsed_count(nr_e);
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	uint8_t *ref_suffix = ft_collapsed_suffix(&entries[ref_entry]);
+	unsigned int ref_slen = ft_collapsed_suffix_len(&entries[ref_entry]);
+	unsigned int cap = ft_collapsed_capacity(tier);
 	int best = -1;
-	uint8_t best_data = 0;
+	struct cds_ft_collapsed_entry *best_entry = NULL;
 	struct cds_ft_inode_flag *saved_best_child = NULL;
 	unsigned int e;
 
-	for (e = 0; e < count; e++) {
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *entry = &entries[e];
+		struct cds_ft_inode_flag *child;
 		uint8_t *suffix;
 		unsigned int slen, mc;
 		int r;
-		uint8_t data_e = ft_collapsed_load_data(col, e);
-		struct cds_ft_inode_flag *entry;
 
 		if (e == ref_entry)
 			continue;
-		if (ft_collapsed_entry_dead(data_e, nr_e))
+		child = ft_dereference_acquire(entry->child);
+		if (child == NULL)
 			continue;
-		entry = ft_dereference_acquire(cptrs[e]);
-		if (!ft_node_ptr(entry))
+		if (!ft_node_ptr(child))
 			continue;
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		suffix = ft_collapsed_suffix(entry);
+		slen = ft_collapsed_suffix_len(entry);
 
 		mc = slen < ref_slen ? slen : ref_slen;
 		r = ft_key_cmp_ordinals(suffix, ref_suffix, mc, mc, true, NULL);
@@ -6817,19 +6861,19 @@ int ft_collapsed_find_nearest(
 		    (dir == FT_LEFT && r < 0)) {
 			if (best < 0) {
 				best = (int)e;
-				best_data = data_e;
-				saved_best_child = entry;
+				best_entry = entry;
+				saved_best_child = child;
 			} else {
-				uint8_t *bs = ft_collapsed_suffix(col, best_data, nr_e);
-				unsigned int bl = ft_collapsed_suffix_len(col, best_data, (unsigned)best, nr_e);
+				uint8_t *bs = ft_collapsed_suffix(best_entry);
+				unsigned int bl = ft_collapsed_suffix_len(best_entry);
 				unsigned int mc2 = bl < slen ? bl : slen;
 				int r2 = ft_key_cmp_ordinals(suffix, bs, mc2, mc2, true, NULL);
 
 				if ((dir == FT_RIGHT && (r2 < 0 || (r2 == 0 && slen < bl))) ||
 				    (dir == FT_LEFT && (r2 > 0 || (r2 == 0 && slen > bl)))) {
 					best = (int)e;
-					best_data = data_e;
-					saved_best_child = entry;
+					best_entry = entry;
+					saved_best_child = child;
 				}
 			}
 		}
@@ -7058,30 +7102,28 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 		const uint8_t *input_key,
 		struct cds_ft_iter *iter,
 		uint8_t *ordinal_key,
-		bool *skip_eq_external_nodes_p,
-		unsigned int nr_e)
+		bool *skip_eq_external_nodes_p)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
 	int level = *level_p;
 	unsigned int remaining = key_depth - level;
 	unsigned int e;
-	uint8_t data_e;
+	struct cds_ft_collapsed_entry *entry;
 	int best_match = -1;	/* index of best directional match */
-	uint8_t best_match_data = 0;
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
+	struct cds_ft_collapsed_entry *best_match_entry = NULL;
 
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
 		unsigned int slen, cmp;
 		uint8_t *suffix;
 		const uint8_t *cmp_key;
 		uint8_t last_key_buf[FT_MAX_KEY_LEN];
 		int cmp_result;
 
-		if (!ft_node_ptr(ptrs[e]))
-			continue;
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		slen = ft_collapsed_suffix_len(entry);
+		suffix = ft_collapsed_suffix(entry);
 		cmp = slen < remaining ? slen : remaining;
 
 		/* Build contiguous comparison key for this limit mode. */
@@ -7138,7 +7180,7 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 				 */
 				if (slen == 1)
 					iter_path_node(iter)[level - 1] = node_flag;
-				node_flag = ft_dereference_acquire_prefetch(ptrs[e]);
+				node_flag = ft_dereference_acquire_prefetch(entry->child);
 				if (!ft_node_ptr(node_flag)) {
 					*node_flag_p = node_flag;
 					*level_p = level;
@@ -7171,44 +7213,45 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 		if ((mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT) && cmp_result < 0) {
 			if (best_match < 0) {
 				best_match = (int)e;
-				best_match_data = data_e;
+				best_match_entry = entry;
 			} else {
 				/* Keep the smallest. */
-				uint8_t *bs = ft_collapsed_suffix(col, best_match_data, nr_e);
-				unsigned int bl = ft_collapsed_suffix_len(col, best_match_data, (unsigned)best_match, nr_e);
+				uint8_t *bs = ft_collapsed_suffix(best_match_entry);
+				unsigned int bl = ft_collapsed_suffix_len(best_match_entry);
 				unsigned int mc = bl < slen ? bl : slen;
 				int r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
 							true, NULL);
 
 				if (r < 0 || (r == 0 && slen < bl)) {
 					best_match = (int)e;
-					best_match_data = data_e;
+					best_match_entry = entry;
 				}
 			}
 		} else if ((mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) && cmp_result > 0) {
 			if (best_match < 0) {
 				best_match = (int)e;
-				best_match_data = data_e;
+				best_match_entry = entry;
 			} else {
 				/* Keep the largest. */
-				uint8_t *bs = ft_collapsed_suffix(col, best_match_data, nr_e);
-				unsigned int bl = ft_collapsed_suffix_len(col, best_match_data, (unsigned)best_match, nr_e);
+				uint8_t *bs = ft_collapsed_suffix(best_match_entry);
+				unsigned int bl = ft_collapsed_suffix_len(best_match_entry);
 				unsigned int mc = bl < slen ? bl : slen;
 				int r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
 							true, NULL);
 
 				if (r > 0 || (r == 0 && slen > bl)) {
 					best_match = (int)e;
-					best_match_data = data_e;
+					best_match_entry = entry;
 				}
 			}
 		}
 	}
+	(void) entries;
 
 	if (best_match >= 0) {
 		/* Descend into the best directional match. */
-		unsigned int slen = ft_collapsed_suffix_len(col, best_match_data, (unsigned)best_match, nr_e);
-		uint8_t *suffix = ft_collapsed_suffix(col, best_match_data, nr_e);
+		unsigned int slen = ft_collapsed_suffix_len(best_match_entry);
+		uint8_t *suffix = ft_collapsed_suffix(best_match_entry);
 		unsigned int k;
 
 		for (k = 0; k < slen; k++) {
@@ -7219,7 +7262,7 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 		assert(level < (int) max_tree_depth);
 		if (slen == 1)
 			iter_path_node(iter)[level - 1] = node_flag;
-		node_flag = ft_dereference_acquire_prefetch(ptrs[best_match]);
+		node_flag = ft_dereference_acquire_prefetch(best_match_entry->child);
 		if (!ft_node_ptr(node_flag)) {
 			*node_flag_p = node_flag;
 			*level_p = level;
@@ -7252,8 +7295,7 @@ enum ft_descent_action ft_inequality_collapsed(
 		const uint8_t *input_key __attribute__((unused)),
 		struct cds_ft_iter *iter __attribute__((unused)),
 		uint8_t *ordinal_key __attribute__((unused)),
-		bool *skip_eq_external_nodes_p __attribute__((unused)),
-		unsigned int nr_e __attribute__((unused)))
+		bool *skip_eq_external_nodes_p __attribute__((unused)))
 {
 	return FT_DESCENT_GOING_UP;
 }
@@ -7372,12 +7414,13 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 		ssize_t max_tree_depth __attribute__((unused)))
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
 	ssize_t level = *level_p;
-	unsigned int col_nr_e;
-	struct cds_ft_inode_flag **cptrs;
 	unsigned int best, e;
-	uint8_t best_d;
+	struct cds_ft_collapsed_entry *best_entry = NULL;
 	struct cds_ft_inode_flag *best_child;
 
 	if (dir == FT_LEFTMOST) {
@@ -7395,51 +7438,48 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 	 * Find the min/max entry by suffix and descend.
 	 *
 	 * Race-free pointer selection: each candidate entry is
-	 * filtered by (dead-bit clear AND cptrs non-NULL) at scan
-	 * time, and we SAVE the cptrs value (@best_child) alongside
-	 * @best so the descent uses the same pointer the scan
-	 * validated.  No re-read of cptrs[best] later.
+	 * filtered by child != NULL at scan time, and we SAVE the
+	 * acquire-loaded child pointer (@best_child) alongside the
+	 * winning @best_entry so the descent uses the same pointer
+	 * the scan validated.  No re-read of entry->child later.
 	 */
-	col_nr_e = ft_collapsed_nr_entries(col);
-	cptrs = ft_collapsed_ptrs(col, col_nr_e);
 	best = UINT_MAX;
-	best_d = 0;
 	best_child = NULL;
 
-	for (e = 0; e < ft_collapsed_count(col_nr_e); e++) {
-		uint8_t data_e = ft_collapsed_load_data(col, e);
-		struct cds_ft_inode_flag *entry;
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *entry = &entries[e];
+		struct cds_ft_inode_flag *child;
 
-		if (ft_collapsed_entry_dead(data_e, col_nr_e))
+		child = ft_dereference_acquire(entry->child);
+		if (child == NULL)
 			continue;
-		entry = ft_dereference_acquire(cptrs[e]);
-		if (!ft_node_ptr(entry))
+		if (!ft_node_ptr(child))
 			continue;
 		if (best == UINT_MAX) {
 			best = e;
-			best_d = data_e;
-			best_child = entry;
+			best_entry = entry;
+			best_child = child;
 			continue;
 		}
 		{
-			uint8_t *sa = ft_collapsed_suffix(col, best_d, col_nr_e);
-			unsigned int la = ft_collapsed_suffix_len(col, best_d, best, col_nr_e);
-			uint8_t *sb = ft_collapsed_suffix(col, data_e, col_nr_e);
-			unsigned int lb = ft_collapsed_suffix_len(col, data_e, e, col_nr_e);
+			uint8_t *sa = ft_collapsed_suffix(best_entry);
+			unsigned int la = ft_collapsed_suffix_len(best_entry);
+			uint8_t *sb = ft_collapsed_suffix(entry);
+			unsigned int lb = ft_collapsed_suffix_len(entry);
 			unsigned int mc = la < lb ? la : lb;
 			int r = memcmp(sb, sa, mc);
 
 			if (dir == FT_LEFTMOST) {
 				if (r < 0 || (r == 0 && lb < la)) {
 					best = e;
-					best_d = data_e;
-					best_child = entry;
+					best_entry = entry;
+					best_child = child;
 				}
 			} else {
 				if (r > 0 || (r == 0 && lb > la)) {
 					best = e;
-					best_d = data_e;
-					best_child = entry;
+					best_entry = entry;
+					best_child = child;
 				}
 			}
 		}
@@ -7465,14 +7505,13 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 		return FT_DESCENT_GOING_UP;
 	}
 	{
-		unsigned int slen = ft_collapsed_suffix_len(col, best_d, best, col_nr_e);
-		uint8_t *suffix = ft_collapsed_suffix(col, best_d, col_nr_e);
+		unsigned int slen = ft_collapsed_suffix_len(best_entry);
+		uint8_t *suffix = ft_collapsed_suffix(best_entry);
 		unsigned int k;
 
 		for (k = 0; k < slen; k++) {
 			ordinal_key[level - 1 + k] = suffix[k];
-			iter_path_node(iter)[level + k] =
-				ft_collapsed_node_flag(col);
+			iter_path_node(iter)[level + k] = node_flag;
 		}
 		level += slen - 1;
 		assert(level < max_tree_depth);
@@ -7509,31 +7548,23 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 		ssize_t *level_p,
 		const uint8_t **iter_key_p,
 		bool *going_up_p,
-		unsigned int *cached_col_nr_e_p,
 		struct cds_ft_iter *iter,
 		uint8_t *ordinal_key,
 		enum ft_direction dir,
 		ssize_t max_tree_depth __attribute__((unused)))
 {
 	ssize_t level = *level_p;
-	struct cds_ft_collapsed_node *col =
-		ft_collapsed_node_ptr(iter_path_node(iter)[level - 1]);
-	/*
-	 * Use cached nr_entries from the downward walk when
-	 * available; fresh load for collapsed nodes encountered at
-	 * higher levels.
-	 */
-	unsigned int col_nr_e = *cached_col_nr_e_p ?
-		*cached_col_nr_e_p : ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, col_nr_e);
+	struct cds_ft_inode_flag *col_node_flag = iter_path_node(iter)[level - 1];
+	unsigned int tier = ft_collapsed_tier(col_node_flag);
+	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(col_node_flag);
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
 	int entry_depth = level - 1;
 	int suffix_base;
 	int current_entry = -1, best;
 	unsigned int cur_slen = 0;
 	unsigned int e;
 	struct cds_ft_inode_flag *best_child = NULL;
-
-	*cached_col_nr_e_p = 0;
 
 	/* Walk back to the collapsed node's entry depth. */
 	while (entry_depth > 0 &&
@@ -7566,18 +7597,22 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 
 	/*
 	 * Find the current entry by suffix match.  Don't skip
-	 * dead/tombstoned entries: the suffix data is immutable and
-	 * we need the position even if a concurrent writer
-	 * tombstoned the entry.
+	 * dead entries: the (suffix,len) pair is immutable once
+	 * written, so a concurrent delete (child=NULL) can leave a
+	 * dead slot whose suffix still matches the path the downward
+	 * walk recorded.  We need the slot position to drive the
+	 * sibling search regardless of liveness.
 	 */
-	for (e = 0; e < ft_collapsed_count(col_nr_e); e++) {
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *entry = &entries[e];
 		uint8_t *suffix;
 		unsigned int slen, j2;
 		bool match2;
-		uint8_t data_e = ft_collapsed_load_data(col, e);
 
-		suffix = ft_collapsed_suffix(col, data_e, col_nr_e);
-		slen = ft_collapsed_suffix_len(col, data_e, e, col_nr_e);
+		slen = ft_collapsed_suffix_len(entry);
+		if (slen == 0)
+			continue;	/* born-dead slot */
+		suffix = ft_collapsed_suffix(entry);
 		match2 = true;
 		for (j2 = 0; j2 < slen; j2++) {
 			if (suffix[j2] != ordinal_key[suffix_base + j2]) {
@@ -7606,7 +7641,7 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 	 */
 	if (level > (ssize_t)(suffix_base + cur_slen)) {
 		struct cds_ft_inode_flag *child_flag =
-			ft_dereference_acquire(cptrs[current_entry]);
+			ft_dereference_acquire(entries[current_entry].child);
 
 		child_flag = ft_resolve_skip_compressed(child_flag);
 		if (ft_node_ptr(child_flag) && ft_node_internal(child_flag)) {
@@ -7640,14 +7675,13 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 	 * re-read window can return NULL while the scan-time check
 	 * observed live.
 	 */
-	best = ft_collapsed_find_nearest(col, cptrs,
-		(unsigned) current_entry, col_nr_e, dir, &best_child);
+	best = ft_collapsed_find_nearest(col, tier,
+		(unsigned) current_entry, dir, &best_child);
 
 	if (best >= 0) {
-		uint8_t best_d = ft_collapsed_load_data(col, (unsigned) best);
-		unsigned int slen = ft_collapsed_suffix_len(
-			col, best_d, (unsigned) best, col_nr_e);
-		uint8_t *suffix = ft_collapsed_suffix(col, best_d, col_nr_e);
+		struct cds_ft_collapsed_entry *best_entry = &entries[best];
+		unsigned int slen = ft_collapsed_suffix_len(best_entry);
+		uint8_t *suffix = ft_collapsed_suffix(best_entry);
 		struct cds_ft_inode_flag *node_flag;
 		unsigned int k;
 
@@ -7703,7 +7737,6 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 		ssize_t *level_p __attribute__((unused)),
 		const uint8_t **iter_key_p __attribute__((unused)),
 		bool *going_up_p __attribute__((unused)),
-		unsigned int *cached_col_nr_e_p __attribute__((unused)),
 		struct cds_ft_iter *iter __attribute__((unused)),
 		uint8_t *ordinal_key __attribute__((unused)),
 		enum ft_direction dir __attribute__((unused)),
@@ -7728,15 +7761,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = 0;
 	bool going_up = false, skip_eq_external_nodes;
-	/*
-	 * Cache nr_entries from the downward collapsed walk so the
-	 * going-up handler uses the same acquire-loaded snapshot.
-	 * 0 means unset (collapsed nodes always have >= 1 entry by
-	 * construction).  Consumed and reset to 0 after use, so
-	 * collapsed nodes encountered at higher levels during
-	 * going-up get a fresh load.
-	 */
-	unsigned int cached_col_nr_e = 0;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
@@ -7906,15 +7930,12 @@ slow_path:
 		if (ft_node_collapsed(node_flag)) {
 			enum ft_descent_action act;
 
-			cached_col_nr_e = ft_collapsed_nr_entries(
-				ft_collapsed_node_ptr(node_flag));
 			act = ft_inequality_collapsed(&node_flag,
 				&level, key_depth,
 				ft->group->max_tree_depth,
 				mode, limit,
 				&iter_key, input_key, iter,
-				ordinal_key, &skip_eq_external_nodes,
-				cached_col_nr_e);
+				ordinal_key, &skip_eq_external_nodes);
 			if (act == FT_DESCENT_GOING_UP)
 				goto going_up;
 			if (act == FT_DESCENT_DESCEND_CHILDREN)
@@ -8150,7 +8171,7 @@ going_up:
 
 			act = ft_inequality_going_up_collapsed(
 				&node_flag, &level, &iter_key,
-				&going_up, &cached_col_nr_e,
+				&going_up,
 				iter, ordinal_key, dir,
 				(ssize_t) ft->group->max_tree_depth);
 			if (act == FT_DESCENT_BREAK)
@@ -9132,21 +9153,16 @@ void ft_init_node_density(struct cds_ft *ft,
 		return;
 	}
 	if (ft_node_collapsed(node_flag)) {
+		unsigned int tier = ft_collapsed_tier(node_flag);
 		struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 		struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) col);
+		struct cds_ft_collapsed_entry *entry;
 		unsigned int e;
 
-		unsigned int nr_e = ft_collapsed_nr_entries(col);
+		ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+			unsigned int slen = ft_collapsed_suffix_len(entry);
+			struct cds_ft_inode_flag *child = entry->child;
 
-		for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-			uint8_t data_e = ft_collapsed_load_data(col, e);
-			unsigned int slen;
-			struct cds_ft_inode_flag *child;
-
-			if (ft_collapsed_entry_dead(data_e, nr_e))
-				continue;
-			slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-			child = ft_collapsed_ptrs(col, nr_e)[e];
 			if (!ft_node_ptr(child))
 				continue;
 			/*
@@ -9217,27 +9233,27 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 		return cn->len;
 	}
 	if (ft_node_collapsed(parent_nf)) {
+		unsigned int tier = ft_collapsed_tier(parent_nf);
 		struct cds_ft_collapsed_node *col =
 			ft_collapsed_node_ptr(parent_nf);
-		unsigned int nr_e = ft_collapsed_nr_entries(col);
-		struct cds_ft_inode_flag **cptrs =
-			ft_collapsed_ptrs(col, nr_e);
+		struct cds_ft_collapsed_entry *entries =
+			ft_collapsed_entries(col, tier);
+		unsigned int cap = ft_collapsed_capacity(tier);
 		unsigned int e;
 
-		for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-			struct cds_ft_inode_flag *entry = cptrs[e];
+		for (e = 0; e < cap; e++) {
+			struct cds_ft_collapsed_entry *entry = &entries[e];
+			struct cds_ft_inode_flag *child = entry->child;
 
+			if (child == NULL)
+				continue;
 			/*
 			 * Collapsed entries may hold skip pointers.
 			 * Resolve to compressed flag before comparing.
 			 */
-			entry = ft_resolve_skip_compressed(entry);
-			if (entry == child_nf) {
-				uint8_t data_e =
-					ft_collapsed_load_data(col, e);
-				return ft_collapsed_suffix_len(
-					col, data_e, e, nr_e);
-			}
+			child = ft_resolve_skip_compressed(child);
+			if (child == child_nf)
+				return ft_collapsed_suffix_len(entry);
 		}
 		assert(0);
 		return 1;
@@ -9352,38 +9368,31 @@ void ft_record_absorbed(struct cds_ft_inode_flag **absorbed,
 }
 
 /*
- * Minimum suffix length per scan zone size to ensure the collapsed
- * lookup CL cost never exceeds the worst-case uncollapsed cost.
+ * Minimum suffix length per tier to ensure the collapsed lookup CL
+ * cost never exceeds the worst-case uncollapsed cost.
  *
  * Uncollapsed: each key byte traverses one internal node, costing
  * at most 2 CL loads (node dispatch + child pointer chase).
  * For S key bytes: worst-case uncollapsed cost = 2S CL.
  *
- * Collapsed: scan zone CL + 1 pointer CL per lookup.
+ * Collapsed: header CL(s) (prefix vectors) + 1 entry CL per lookup.
  *
- * Bound: scan_CL + 1 <= 2S  →  S >= ceil((scan_CL + 1) / 2).
- * Floor at FT_COLLAPSE_SUFFIX_MIN (2) since 1-byte suffixes
- * don't save over a direct dispatch.
+ * Floor at FT_COLLAPSE_SUFFIX_MIN (2) since 1-byte suffixes don't
+ * save over a direct dispatch.
  */
 static inline
-unsigned int ft_collapsed_min_slen(unsigned int scan_sel)
+unsigned int ft_collapsed_min_slen(unsigned int tier)
 {
-	static const unsigned int min_slen[] = {
-		[FT_COLLAPSED_SCAN_32]  = 2,	/* 1 CL total: S >= 1, floor 2 */
-		[FT_COLLAPSED_SCAN_64]  = 2,	/* 2 CL total: S >= 1, floor 2 */
-	};
-	return min_slen[scan_sel];
+	(void) tier;
+	return FT_COLLAPSE_SUFFIX_MIN;
 }
 
 /*
  * Collapsed node configuration table.
  *
- * Ordered by preference: smallest allocation first, within the same
- * allocation prefer wider scan zone (better suffix coverage at the
- * cost of stricter slen requirements).
- *
- * The selection walks this table and picks the first entry where:
- *   1. density fits in max_entries
+ * Ordered by preference: smallest allocation first.  The selection
+ * walks this table and picks the first entry where:
+ *   1. all entries fit in tier capacity
  *   2. all suffix lengths >= min_slen (checked post-walk)
  */
 
@@ -9435,7 +9444,8 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 		uint8_t *suffix_buf, unsigned int slen,
 		unsigned int max_slen,
 		struct cds_ft_collapsed_node *col,
-		struct cds_ft_inode_flag **col_ptrs,
+		unsigned int tier,
+		unsigned int *entry_idx,
 		unsigned int max_entries,
 		unsigned int *absorbed_footprint,
 		struct cds_ft_inode_flag **absorbed,
@@ -9513,16 +9523,13 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 		 * to preserve prefix keys at this depth.
 		 */
 		if (ft_node_collapsed(walk)) {
+			unsigned int child_tier = ft_collapsed_tier(walk);
 			struct cds_ft_collapsed_node *col_child =
 				ft_collapsed_node_ptr(walk);
 			struct cds_ft_metadata *col_child_meta =
 				cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) col_child);
-			unsigned int col_child_nr_e =
-				ft_collapsed_nr_entries(col_child);
-			struct cds_ft_inode_flag **col_child_ptrs =
-				ft_collapsed_ptrs(col_child,
-					col_child_nr_e);
+			struct cds_ft_collapsed_entry *child_entry;
 			unsigned int e;
 
 			if (col_child_meta->external_nodes)
@@ -9536,27 +9543,17 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 					collapse_scan_mul_pct,
 					compress_scan_mul_pct);
 			ft_record_absorbed(absorbed, absorbed_depths, nr_absorbed, walk, slen);
-			for (e = 0; e < ft_collapsed_count(col_child_nr_e); e++) {
-				uint8_t data_e =
-					ft_collapsed_load_data(col_child, e);
-				unsigned int child_slen;
-				uint8_t *child_suffix;
-				struct cds_ft_inode_flag *child_ptr;
+			ft_for_each_live_collapsed_entry(col_child, child_tier, e, child_entry) {
+				unsigned int child_slen =
+					ft_collapsed_suffix_len(child_entry);
+				uint8_t *child_suffix =
+					ft_collapsed_suffix(child_entry);
+				struct cds_ft_inode_flag *child_ptr =
+					child_entry->child;
 				unsigned int k;
 
-				if (ft_collapsed_entry_dead(data_e,
-						col_child_nr_e))
-					continue;
-				child_ptr = col_child_ptrs[e];
 				if (!ft_node_ptr(child_ptr))
 					continue;
-				child_slen = ft_collapsed_suffix_len(
-					col_child, data_e, e,
-					col_child_nr_e);
-				child_suffix = ft_collapsed_suffix(
-					col_child, data_e,
-					col_child_nr_e);
-
 				if (slen + child_slen > max_slen)
 					return -1;
 				for (k = 0; k < child_slen; k++)
@@ -9565,7 +9562,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 						child_ptr, suffix_buf,
 						slen + child_slen,
 						max_slen,
-						col, col_ptrs,
+						col, tier, entry_idx,
 						max_entries,
 						absorbed_footprint,
 						absorbed, absorbed_depths,
@@ -9646,7 +9643,7 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 							c, suffix_buf,
 							slen + 1,
 							max_slen,
-							col, col_ptrs,
+							col, tier, entry_idx,
 							max_entries,
 							absorbed_footprint,
 							absorbed, absorbed_depths,
@@ -9671,36 +9668,39 @@ int ft_collapse_walk_subtree(struct cds_ft *ft,
 	/* Depth limit reached: emit intermediate entry. */
 emit_entry:
 	{
-		unsigned int entry_idx = ft_collapsed_count(ft_collapsed_nr_entries(col));
-		unsigned int suffix_start;
-		uint8_t *suffix_pos;
+		struct cds_ft_collapsed_entry *entries;
+		struct cds_ft_collapsed_entry *entry;
+		unsigned int idx = *entry_idx;
+		unsigned int k;
 
 		if (slen == 0)
 			return -1;
-		if (entry_idx >= max_entries)
+		if (slen > FT_COL_SUFFIX_MAX)
 			return -1;
-		if (entry_idx == 0)
-			suffix_start = ft_collapsed_scan_zone_size(uatomic_load(&col->nr_entries, CMM_RELAXED));
-		else
-			suffix_start = col->data[entry_idx - 1]
-				& ft_collapsed_offset_mask(uatomic_load(&col->nr_entries, CMM_RELAXED));
-		if (1 + entry_idx + 1 + slen > suffix_start)
+		if (idx >= max_entries)
 			return -1;
 
-		suffix_pos = ((uint8_t *) col) + suffix_start - slen;
-		memcpy(suffix_pos, suffix_buf, slen);
-		col->data[entry_idx] = (uint8_t)(suffix_pos
-			- (uint8_t *) col);
-		col_ptrs[entry_idx] = walk;
-		ft_collapsed_set_nr_entries(col, entry_idx + 1);
+		entries = ft_collapsed_entries(col, tier);
+		entry = &entries[idx];
+		for (k = 0; k < slen; k++)
+			entry->suffix[k] = suffix_buf[k];
+		entry->len = (uint8_t) slen;
+		/*
+		 * Pre-publish: the candidate is still private to the
+		 * builder, no readers can see it yet.  The caller publishes
+		 * the whole node atomically by grafting it into the parent's
+		 * slot.  Use a plain store here; CMM_RELEASE on the parent's
+		 * graft pairs with readers' acquire on the parent.
+		 */
+		entry->child = walk;
+		*entry_idx = idx + 1;
 		*weighted_absorbed_cl_pct += current_path_cl_pct;
 		FT_TP(collapsed_entry,
-			(const void *) ft_collapsed_node_flag(col), entry_idx,
+			(const void *) ft_collapsed_node_flag(col), idx,
 			suffix_buf, slen, (const void *) walk, 0);
 		FT_TP(collapsed_publish,
-			(const void *) ft_collapsed_node_flag(col), entry_idx + 1,
-			ft_collapsed_scan_zone_size(
-				uatomic_load(&col->nr_entries, CMM_RELAXED)));
+			(const void *) ft_collapsed_node_flag(col), idx + 1,
+			(unsigned int) FT_COL_ENTRY_SIZE);
 		return 0;
 	}
 }
@@ -9751,7 +9751,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	uint8_t child_key = 0;
 	int pivot;
 	struct cds_ft_inode_flag *child;
-	uint8_t suffix_buf[FT_COLLAPSED_SCAN_ZONE_MAX];
+	uint8_t suffix_buf[FT_COL_SUFFIX_MAX];
 	unsigned int threshold_pct = uatomic_load(&ft->collapse_threshold_pct,
 			CMM_RELAXED);
 
@@ -9769,12 +9769,12 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 	 * Quick footprint pre-filter: the subtree's total
 	 * read-side footprint (in 16B units) plus the decision
 	 * point must exceed the smallest collapsed allocation
-	 * (TINY = 64B = 4 units).  Avoids entering the config
+	 * (T0 = 64B = 4 units).  Avoids entering the config
 	 * loop when no config can possibly win.
 	 */
 	if (ft_density_get(metadata, 0)
 	    + ft_node_readside_footprint(ft, node_flag)
-	    <= (1U << (FT_COLLAPSED_ORDER_TINY - 4)))
+	    <= (1U << (FT_COL_T0_ALLOC_ORDER - 4)))
 		return NULL;
 
 	{
@@ -9817,8 +9817,8 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				- node_depth - 1;
 		else
 			return NULL;
-		if (max_walk_slen > FT_COLLAPSED_SCAN_ZONE_MAX)
-			max_walk_slen = FT_COLLAPSED_SCAN_ZONE_MAX;
+		if (max_walk_slen > FT_COL_SUFFIX_MAX)
+			max_walk_slen = FT_COL_SUFFIX_MAX;
 
 		/*
 		 * max_branch_depth: limits combinatorial explosion
@@ -9831,7 +9831,8 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		/* Best candidate tracking. */
 		struct cds_ft_collapsed_node *best_col = NULL;
 		struct cds_ft_metadata *best_meta = NULL;
-		struct cds_ft_inode_flag **best_ptrs = NULL;
+		unsigned int best_tier = 0;
+		unsigned int best_nr_entries = 0;
 		unsigned int best_absorbed = 0;
 		unsigned int best_collapsed = 1;	/* denominator for first comparison */
 
@@ -9849,20 +9850,10 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		unsigned int nr_absorbed_best = 0;
 
 		/*
-		 * All valid (order, scan_sel) configurations.
-		 * Ordered small-to-large: smaller allocations are tried
-		 * first so that equal-ratio candidates prefer the
-		 * smallest footprint.
+		 * All valid tier configurations.  Tiers are ordered
+		 * small-to-large by allocation size, so equal-ratio
+		 * candidates prefer the smallest footprint.
 		 */
-		static const struct {
-			unsigned int order;
-			unsigned int scan_sel;
-		} configs[] = {
-			{ FT_COLLAPSED_ORDER_TINY,   FT_COLLAPSED_SCAN_32 },
-			{ FT_COLLAPSED_ORDER_SMALL,  FT_COLLAPSED_SCAN_64 },
-			{ FT_COLLAPSED_ORDER_MEDIUM, FT_COLLAPSED_SCAN_64 },
-		};
-		unsigned int nr_configs = sizeof(configs) / sizeof(configs[0]);
 		unsigned int ci;
 
 		/*
@@ -9872,55 +9863,41 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		unsigned long density_total = ft_density_get(metadata, 0);
 
 		/*
-		 * Per-scan_sel collapsed CL cost for the per-path
-		 * latency gate, computed as
-		 *   collapsed_cl_pct = collapse_scan_mul_pct × avg_scan_CL
-		 *                      + 100 × ptr_CL
+		 * Per-tier collapsed CL cost for the per-path latency
+		 * gate, in pct-CL units (scan multiplier × avg_scan_CL +
+		 * 100 × ptr_CL).
 		 *
-		 * Internal arithmetic is in pct-CL units (everything
-		 * scaled by 100), matching the existing collapse-
-		 * threshold pct convention so the scan multiplier can
-		 * take fractional values (e.g. 150 = 1.5×, 250 = 2.5×).
-		 * Both sides of the gate are already in pct units:
-		 *   gate: weighted_absorbed_cl_pct
-		 *         >= collapsed_cl_pct × N
+		 * Each lookup pays:
+		 *   - prefix-vector header CL load(s): 1 CL for T0/T1
+		 *     (16B header), 1 CL for T2 (64B header touches one
+		 *     line in the steady state), 1 CL for T3 (32B
+		 *     prefix vectors fit alongside entries in the same
+		 *     base CL when the entry-of-interest is one of the
+		 *     first 4).  Worst case is bounded at 1 prefix CL.
+		 *   - one entry CL load on a hit (16B aligned).
 		 *
-		 * The multiplier on the scan portion accounts for
-		 * scan-loop cost the pure CL-load count doesn't capture
-		 * (loop dispatch, byte-compares, branch-on-match,
-		 * reduced ILP vs. dependent pointer chases).  Larger
-		 * scan zones do more byte-compare work, so they pay
-		 * proportionally more.
-		 *
-		 *   avg_scan_CL = ceil(zone_bytes / 2 / 64):
-		 *     SCAN_32 (32B):1, SCAN_64:1
-		 *
-		 *   ptr_CL = 0 if scan and ptr area share a CL
-		 *           (TINY/SCAN_32 only), else 1.
-		 *
-		 * collapse_scan_mul_pct is per-trie tunable; see
-		 * cds_ft_collapse_scan_mul_set.
+		 * Expressed conservatively as 1 scan CL + 1 entry CL
+		 * for every tier; readers prefetch both lines so the
+		 * cost is dominated by the dependent loads.
 		 */
-		static const unsigned int avg_scan_cl_by_sel[] = {
-			[FT_COLLAPSED_SCAN_32]  = 1,
-			[FT_COLLAPSED_SCAN_64]  = 1,
+		static const unsigned int avg_scan_cl_by_tier[FT_COL_NR_TIERS] = {
+			[0] = 1, [1] = 1, [2] = 1, [3] = 1,
 		};
-		static const unsigned int ptr_cl_by_sel[] = {
-			[FT_COLLAPSED_SCAN_32]  = 0,
-			[FT_COLLAPSED_SCAN_64]  = 1,
+		static const unsigned int ptr_cl_by_tier[FT_COL_NR_TIERS] = {
+			[0] = 1, [1] = 1, [2] = 1, [3] = 1,
 		};
-		for (ci = 0; ci < nr_configs; ci++) {
-			unsigned int order = configs[ci].order;
-			unsigned int scan_sel = configs[ci].scan_sel;
+		for (ci = 0; ci < FT_COL_NR_TIERS; ci++) {
+			unsigned int tier_ci = ci;
+			unsigned int order = ft_col_tier_alloc_order[tier_ci];
 			unsigned int collapsed_fp = 1U << (order - 4);
 			unsigned int collapsed_cl_pct =
-				collapse_scan_mul_pct * avg_scan_cl_by_sel[scan_sel]
-				+ 100U * ptr_cl_by_sel[scan_sel];
+				collapse_scan_mul_pct * avg_scan_cl_by_tier[tier_ci]
+				+ 100U * ptr_cl_by_tier[tier_ci];
 			unsigned int max_entries =
-				ft_collapsed_max_entries(order, scan_sel);
+				ft_collapsed_max_entries(tier_ci);
 			struct cds_ft_collapsed_node *col;
 			struct cds_ft_metadata *col_meta;
-			struct cds_ft_inode_flag **col_ptrs;
+			unsigned int entry_idx;
 			unsigned int absorbed;
 			unsigned int weighted_absorbed_cl_pct;
 			bool walk_ok;
@@ -9979,16 +9956,14 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 					continue;
 			}
 
-			col = alloc_collapsed_node(ft, order, scan_sel,
-				&col_meta);
+			col = alloc_collapsed_node(ft, tier_ci, &col_meta);
 			if (!col)
 				continue;
-			col_ptrs = ft_collapsed_ptrs(col,
-				uatomic_load(&col->nr_entries, CMM_RELAXED));
 
 			absorbed = decision_fp;
 			weighted_absorbed_cl_pct = 0;
 			nr_absorbed_cur = 0;
+			entry_idx = 0;
 			walk_ok = true;
 
 			pivot = -1;
@@ -9999,7 +9974,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				if (ft_collapse_walk_subtree(ft,
 						child, suffix_buf, 1,
 						max_walk_slen,
-						col, col_ptrs,
+						col, tier_ci, &entry_idx,
 						max_entries,
 						&absorbed,
 						absorbed_cur, absorbed_depths_cur,
@@ -10019,9 +9994,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 					&child_key, FT_RIGHT);
 			}
 
-			if (!walk_ok ||
-			    ft_collapsed_count(
-				ft_collapsed_nr_entries(col)) < 2) {
+			if (!walk_ok || entry_idx < 2) {
 				free_collapsed_node_unpublished(ft, col);
 				continue;
 			}
@@ -10035,20 +10008,17 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			 *    suffixes to justify the cost.
 			 */
 			{
-				unsigned int nr =
-					ft_collapsed_nr_entries(col);
+				struct cds_ft_collapsed_entry *entries =
+					ft_collapsed_entries(col, tier_ci);
 				unsigned int e;
 				bool has_long_suffix = false;
 				unsigned int cfg_min_slen =
-					ft_collapsed_min_slen(scan_sel);
+					ft_collapsed_min_slen(tier_ci);
 				bool all_meet_min = true;
 
-				for (e = 0; e < ft_collapsed_count(nr); e++) {
-					uint8_t data_e =
-						ft_collapsed_load_data(col, e);
+				for (e = 0; e < entry_idx; e++) {
 					unsigned int sl =
-						ft_collapsed_suffix_len(
-							col, data_e, e, nr);
+						ft_collapsed_suffix_len(&entries[e]);
 
 					if (sl >= FT_COLLAPSE_SUFFIX_MIN)
 						has_long_suffix = true;
@@ -10097,9 +10067,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			 * lookup was strictly cheaper per query.
 			 */
 			{
-				unsigned int nr_emit =
-					ft_collapsed_count(
-						ft_collapsed_nr_entries(col));
+				unsigned int nr_emit = entry_idx;
 
 				if ((unsigned long) weighted_absorbed_cl_pct <
 				    (unsigned long) collapsed_cl_pct * nr_emit) {
@@ -10128,7 +10096,8 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 					free_collapsed_node_unpublished(ft, best_col);
 				best_col = col;
 				best_meta = col_meta;
-				best_ptrs = col_ptrs;
+				best_tier = tier_ci;
+				best_nr_entries = entry_idx;
 				best_absorbed = absorbed;
 				best_collapsed = collapsed_fp;
 				memcpy(absorbed_best, absorbed_cur,
@@ -10145,29 +10114,30 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			return NULL;
 
 		if (ft_debug_counters())
-			fprintf(stderr, "COLLAPSE: order=%u scan=%uB entries=%u "
+			fprintf(stderr, "COLLAPSE: tier=%u entries=%u "
 				"fp_ratio=%.2f (absorbed=%u collapsed=%u)\n",
-				(unsigned int) cds_ft_item_order(best_col),
-				ft_collapsed_scan_zone_size(
-					uatomic_load(&best_col->nr_entries,
-						CMM_RELAXED)),
-				ft_collapsed_count(
-					ft_collapsed_nr_entries(best_col)),
+				best_tier,
+				best_nr_entries,
 				(double) best_absorbed / best_collapsed,
 				best_absorbed, best_collapsed);
 
-		best_meta->nr_child = ft_collapsed_count(
-			ft_collapsed_nr_entries(best_col));
+		best_meta->nr_child = best_nr_entries;
 		ft_nr_keys_store(ft, best_meta, ft_nr_keys_get(metadata),
 			CMM_RELAXED);
-		ft_metadata_set_external_nodes(ft_collapsed_node_flag(best_col), best_meta, metadata->external_nodes);
+		ft_metadata_set_external_nodes(
+			ft_collapsed_node_flag_tier(best_col, best_tier),
+			best_meta, metadata->external_nodes);
 
 		{
 			struct cds_ft_inode_flag *col_flag =
-				ft_collapsed_node_flag(best_col);
+				ft_collapsed_node_flag_tier(best_col, best_tier);
+			struct cds_ft_collapsed_entry *best_entries =
+				ft_collapsed_entries(best_col, best_tier);
 			unsigned int e;
 
-			for (e = 0; e < best_meta->nr_child; e++) {
+			for (e = 0; e < best_nr_entries; e++) {
+				struct cds_ft_inode_flag *cf = best_entries[e].child;
+
 				/*
 				 * Re-publish compressed entries as skip
 				 * pointers.
@@ -10177,19 +10147,18 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 				 * compressed_flag.  Convert back to skip
 				 * pointer to preserve the optimization.
 				 */
-				if (ft_node_compressed(best_ptrs[e]) &&
+				if (ft_node_compressed(cf) &&
 				    ft_group_skip_compressed(ft->group)) {
 					struct cds_ft_compressed_node *cn =
-						ft_compressed_node_ptr(
-							best_ptrs[e]);
-					if (cn->len <= FT_SKIP_LEN_MAX)
-						best_ptrs[e] =
-							ft_skip_compressed_flag(
-								cn->child,
-								cn->len);
+						ft_compressed_node_ptr(cf);
+					if (cn->len <= FT_SKIP_LEN_MAX) {
+						cf = ft_skip_compressed_flag(
+							cn->child, cn->len);
+						best_entries[e].child = cf;
+					}
 				}
-				ft_set_parent(best_ptrs[e], col_flag,
-					&best_ptrs[e]);
+				ft_set_parent(cf, col_flag,
+					&best_entries[e].child);
 			}
 			memcpy(absorbed_out, absorbed_best,
 				nr_absorbed_best * sizeof(absorbed_out[0]));
@@ -10485,37 +10454,37 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			continue;
 		}
 		if (ft_node_collapsed(node_flag)) {
+			unsigned int tier = ft_collapsed_tier(node_flag);
 			struct cds_ft_collapsed_node *col =
 				ft_collapsed_node_ptr(node_flag);
+			struct cds_ft_collapsed_entry *entries =
+				ft_collapsed_entries(col, tier);
+			unsigned int cap = ft_collapsed_capacity(tier);
 			unsigned int remaining = key_len - depth;
 			unsigned int e;
 			bool found = false;
 
-			unsigned int nr_e = ft_collapsed_nr_entries(col);
-			struct cds_ft_inode_flag **cptrs =
-				ft_collapsed_ptrs(col, nr_e);
-
-			for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-				uint8_t data_e = ft_collapsed_load_data(col, e);
+			for (e = 0; e < cap; e++) {
+				struct cds_ft_collapsed_entry *entry = &entries[e];
+				struct cds_ft_inode_flag *entry_child;
 				unsigned int slen, j;
 				uint8_t *suffix;
 
-				if (ft_collapsed_entry_dead(data_e, nr_e))
+				entry_child = ft_dereference_acquire_prefetch(entry->child);
+				if (entry_child == NULL)
 					continue;
-				slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+				slen = ft_collapsed_suffix_len(entry);
 				if (slen > remaining)
 					continue;
-				suffix = ft_collapsed_suffix(col, data_e, nr_e);
+				suffix = ft_collapsed_suffix(entry);
 				for (j = 0; j < slen; j++) {
 					if (ik[j] !=
 					    suffix[j])
 						break;
 				}
 				if (j == slen) {
-					struct cds_ft_inode_flag *entry_child;
-					entry_child = ft_dereference_acquire_prefetch(cptrs[e]);
 					entry_child = ft_resolve_skip_compressed(entry_child);
-					parent_slot = &cptrs[e];
+					parent_slot = &entry->child;
 					parent_nf = node_flag;
 					node_flag = entry_child;
 					depth += slen;
@@ -11262,7 +11231,7 @@ static struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 
 static struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		struct cds_ft_collapsed_node *col,
-		struct cds_ft_inode_flag **cptrs,
+		unsigned int tier,
 		unsigned int start, unsigned int end,
 		unsigned int suffix_offset,
 		unsigned int collapse_depth);
@@ -11932,68 +11901,81 @@ enum ft_descent_action ft_insert_collapsed(struct cds_ft *ft,
 		int *nr_snapshot_p,
 		int *ret_p)
 {
+	unsigned int tier = ft_collapsed_tier(d->nf);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(d->nf);
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
 	unsigned int remaining = key_depth - 1 - d->depth;
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
 	const uint8_t *iter_key = *iter_key_p;
 	int prefix_match_entry = -1;
 	unsigned int prefix_match_len = 0;
 	unsigned int new_slen;
-	unsigned int col_nr;
-	unsigned int header_end;
-	unsigned int cur_suffix_start;
-	uint8_t *new_suffix_pos;
+	unsigned int high_water;
 	struct cds_ft_inode_flag *branch;
-	unsigned int e, k;
-	int tombstone_reuse;
+	struct cds_ft_collapsed_entry *new_entry;
+	struct cds_ft_collapsed_entry *last_live = NULL;
+	int last_live_cmp = -1;	/* sign of new key vs last live entry */
+	unsigned int e;
 
-	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-		uint8_t data_e = ft_collapsed_load_data(col, e);
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *entry = &entries[e];
+		struct cds_ft_inode_flag *child;
 		unsigned int slen, j;
 		uint8_t *suffix;
 
-		if (ft_collapsed_entry_dead(data_e, nr_e))
+		child = ft_dereference_acquire(entry->child);
+		if (child == NULL)
 			continue;
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		slen = ft_collapsed_suffix_len(entry);
+		suffix = ft_collapsed_suffix(entry);
 
 		/* Check for prefix match. */
 		{
 			unsigned int cmp_len = slen < remaining ? slen : remaining;
+			int rc;
 
-			if (ft_key_cmp_ordinals(iter_key, suffix, cmp_len, cmp_len, false, &j) != 0) {
-				if (j == 0)
-					continue; /* No prefix overlap. */
+			rc = ft_key_cmp_ordinals(iter_key, suffix,
+					cmp_len, cmp_len, false, &j);
+			if (rc != 0) {
+				if (j == 0) {
+					/* No prefix overlap.  Track ordering
+					 * vs. last live for sorted-append
+					 * eligibility. */
+					last_live = entry;
+					last_live_cmp = rc;
+					continue;
+				}
 			} else {
 				j = cmp_len; /* Full match up to cmp_len. */
 			}
-		}
 
-		if (j == slen && slen <= remaining) {
-			/* Full suffix match: traverse through. */
-			ft_snapshot_push(snapshot, snapshot_depth,
-				*nr_snapshot_p, d->nf, d->depth);
-			d->ppnf  = d->pnf;
-			d->ppnfp = d->pnfp;
-			d->pnf   = d->nf;
-			d->pnfp  = d->nfp;
-			d->nf    = ft_dereference_acquire(cptrs[e]);
-			d->nfp   = &cptrs[e];
-			d->depth += slen;
-			iter_key += slen;
-			*iter_key_p = iter_key;
-			return FT_DESCENT_CONTINUE;
-		}
-		/*
-		 * Partial prefix match: the new key shares j bytes
-		 * with this entry's suffix but diverges after that.
-		 * Record the best (longest) prefix match for possible
-		 * entry splitting.
-		 */
-		if (j > prefix_match_len) {
-			prefix_match_entry = (int) e;
-			prefix_match_len = j;
+			if (j == slen && slen <= remaining) {
+				/* Full suffix match: traverse through. */
+				ft_snapshot_push(snapshot, snapshot_depth,
+					*nr_snapshot_p, d->nf, d->depth);
+				d->ppnf  = d->pnf;
+				d->ppnfp = d->pnfp;
+				d->pnf   = d->nf;
+				d->pnfp  = d->nfp;
+				d->nf    = child;
+				d->nfp   = &entry->child;
+				d->depth += slen;
+				iter_key += slen;
+				*iter_key_p = iter_key;
+				return FT_DESCENT_CONTINUE;
+			}
+			/*
+			 * Partial prefix match: the new key shares j bytes
+			 * with this entry's suffix but diverges after that.
+			 * Record the best (longest) prefix match for possible
+			 * entry splitting.
+			 */
+			if (j > prefix_match_len) {
+				prefix_match_entry = (int) e;
+				prefix_match_len = j;
+			}
+			last_live = entry;
+			last_live_cmp = rc != 0 ? rc : 1;
 		}
 	}
 	/*
@@ -12006,119 +11988,26 @@ enum ft_descent_action ft_insert_collapsed(struct cds_ft *ft,
 		goto collapsed_explode;
 
 	/*
-	 * No matching entry.  First check for a tombstoned entry
-	 * with the same suffix that we can reuse.  This avoids
-	 * creating duplicate suffixes which would confuse the
-	 * going-up inequality backtracking.
+	 * No matching entry.  Compute the high-water slot index
+	 * (one past the highest-index live or once-live slot).
+	 * SoA slots are append-only-no-reuse, so a fresh insert
+	 * lands at high_water.
+	 *
+	 * The new entry must sort strictly after the highest live
+	 * entry (lexicographic by suffix bytes); otherwise the
+	 * sorted-slot invariant is violated and we must rebuild —
+	 * fall back to explode+rebuild.
 	 */
 	new_slen = remaining;
-	col_nr = ft_collapsed_nr_entries(col);
-	header_end = 1 + ft_collapsed_count(col_nr) + 1;
-	tombstone_reuse = -1;
+	high_water = ft_collapsed_high_water(col, tier);
 
-	for (k = 0; k < ft_collapsed_count(col_nr); k++) {
-		uint8_t data_k = ft_collapsed_load_data(col, k);
-		uint8_t *ts_suffix;
-		unsigned int ts_slen;
-
-		if (!ft_collapsed_entry_dead(data_k, col_nr))
-			continue;
-		ts_slen = ft_collapsed_suffix_len(col, data_k, k, col_nr);
-		if (ts_slen != new_slen)
-			continue;
-		ts_suffix = ft_collapsed_suffix(col, data_k, col_nr);
-		if (ft_key_cmp_ordinals(iter_key, ts_suffix,
-				new_slen, new_slen,
-				false, NULL) == 0) {
-			tombstone_reuse = (int) k;
-			break;
-		}
-	}
-
-	if (tombstone_reuse >= 0)
-		goto collapsed_tombstone_reuse;
-
-	if (ft_collapsed_count(col_nr) > 0)
-		cur_suffix_start = col->data[ft_collapsed_count(col_nr) - 1] & ft_collapsed_offset_mask(col_nr);
-	else
-		cur_suffix_start = ft_collapsed_scan_zone_size(col_nr);
-
-	if (header_end + new_slen > cur_suffix_start ||
-	    ft_collapsed_count(col_nr) >= ft_collapsed_max_entries(
-		cds_ft_item_order(col),
-		col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT))
+	if (new_slen == 0 || new_slen > FT_COL_SUFFIX_MAX)
 		goto collapsed_explode;
-	goto collapsed_inplace_add;
+	if (high_water >= cap)
+		goto collapsed_explode;
+	if (last_live != NULL && last_live_cmp <= 0)
+		goto collapsed_explode;
 
-collapsed_tombstone_reuse:
-	/*
-	 * Reuse tombstoned entry: clear the tombstone and write
-	 * the new child.  The suffix data is already correct.
-	 */
-	if (d->depth + new_slen == key_len) {
-		branch = (struct cds_ft_inode_flag *) node;
-	} else {
-		branch = ft_build_branch(ft, key,
-			d->depth + new_slen, key_len,
-			(struct cds_ft_inode_flag *) node,
-			1, false);
-		if (!branch) {
-			*ret_p = -ENOMEM;
-			return FT_DESCENT_END;
-		}
-	}
-	/* Clear tombstone. */
-	uatomic_store(&col->data[tombstone_reuse],
-		col->data[tombstone_reuse] & ~FT_COLLAPSED_TOMBSTONE,
-		CMM_RELAXED);
-	ft_set_parent(branch, d->nf, &cptrs[tombstone_reuse]);
-	ft_publish_to_parent(ft, d->nf,
-		&cptrs[tombstone_reuse], branch);
-	/*
-	 * Re-emit collapsed_entry so consumers see the revived
-	 * entry and its new child (the suffix is unchanged — the
-	 * entry was previously tombstoned).
-	 */
-	FT_TP(collapsed_entry,
-		(const void *) ft_collapsed_node_flag(col),
-		(unsigned int) tombstone_reuse,
-		ft_collapsed_suffix(col,
-			col->data[tombstone_reuse],
-			col->nr_entries),
-		ft_collapsed_suffix_len(col,
-			col->data[tombstone_reuse] & ~FT_COLLAPSED_TOMBSTONE,
-			tombstone_reuse,
-			col->nr_entries),
-		(const void *) branch, 0);
-	{
-		struct cds_ft_metadata *col_meta =
-			cds_ft_item_to_metadata((struct cds_ft_inode *) col);
-		col_meta->nr_child++;
-	}
-	ft_propagate_external_count_parent(ft, d->nf, 1);
-	*ret_p = 0;
-	return FT_DESCENT_END;
-
-collapsed_explode:
-	{
-		/*
-		 * Collapsed node full or has prefix conflict: explode
-		 * into internal + compressed nodes.
-		 */
-		struct cds_ft_inode_flag *internal_flag;
-		int err;
-
-		err = ft_collapsed_explode_node(ft, col, d->nf,
-			d->pnf, d->nfp, d->depth, &internal_flag);
-		if (err < 0) {
-			*ret_p = err;
-			return FT_DESCENT_END;
-		}
-		d->nf = internal_flag;
-		return FT_DESCENT_CONTINUE;
-	}
-
-collapsed_inplace_add:
 	/*
 	 * Build child for the new entry.  The suffix covers key
 	 * bytes from d->depth to key_len.  If suffix IS the full
@@ -12138,33 +12027,31 @@ collapsed_inplace_add:
 		}
 	}
 
-	/* Write suffix (grows leftward from existing suffixes). */
-	new_suffix_pos = ((uint8_t *) col) + cur_suffix_start - new_slen;
-	for (k = 0; k < new_slen; k++)
-		new_suffix_pos[k] = iter_key[k];
+	/* Append at high_water slot. */
+	new_entry = &entries[high_water];
+	{
+		unsigned int k;
 
-	/* Set offset for new entry. */
-	col->data[ft_collapsed_count(col_nr)] = (uint8_t)(new_suffix_pos - (uint8_t *) col);
-
-	/* Set pointer. */
-	cptrs[ft_collapsed_count(col_nr)] = branch;
-	ft_set_parent(branch, d->nf, &cptrs[ft_collapsed_count(col_nr)]);
-
+		for (k = 0; k < new_slen; k++)
+			new_entry->suffix[k] = iter_key[k];
+	}
+	new_entry->len = (uint8_t) new_slen;
+	ft_set_parent(branch, d->nf, &new_entry->child);
 	/*
-	 * Publish: increment nr_entries (atomic store).  Store-
-	 * release in publish_inc ensures readers see suffix /
-	 * offset / pointer data.
+	 * Publish: release-store the child pointer.  Suffix and len
+	 * are written above before the release-store; readers' acquire
+	 * load on entry->child happens-after these stores.
 	 */
+	ft_collapsed_publish_entry(col, tier, high_water, branch);
 	FT_TP(collapsed_entry,
-		(const void *) ft_collapsed_node_flag(col),
-		ft_collapsed_count(col_nr),
+		(const void *) ft_collapsed_node_flag_tier(col, tier),
+		high_water,
 		iter_key, new_slen,
 		(const void *) branch, 0);
-	ft_collapsed_publish_inc_nr_entries(col);
 	FT_TP(collapsed_publish,
-		(const void *) ft_collapsed_node_flag(col),
-		ft_collapsed_count(uatomic_load(&col->nr_entries, CMM_RELAXED)),
-		ft_collapsed_scan_zone_size(uatomic_load(&col->nr_entries, CMM_RELAXED)));
+		(const void *) ft_collapsed_node_flag_tier(col, tier),
+		high_water + 1,
+		(unsigned int) FT_COL_ENTRY_SIZE);
 
 	{
 		struct cds_ft_metadata *col_meta =
@@ -12175,6 +12062,25 @@ collapsed_inplace_add:
 	ft_propagate_external_count_parent(ft, d->nf, 1);
 	*ret_p = 0;
 	return FT_DESCENT_END;
+
+collapsed_explode:
+	{
+		/*
+		 * Collapsed node full / out-of-order / prefix conflict:
+		 * explode into internal + compressed nodes.
+		 */
+		struct cds_ft_inode_flag *internal_flag;
+		int err;
+
+		err = ft_collapsed_explode_node(ft, col, d->nf,
+			d->pnf, d->nfp, d->depth, &internal_flag);
+		if (err < 0) {
+			*ret_p = err;
+			return FT_DESCENT_END;
+		}
+		d->nf = internal_flag;
+		return FT_DESCENT_CONTINUE;
+	}
 }
 
 /*
@@ -12294,23 +12200,24 @@ struct cds_ft_inode_flag *ft_build_ordinal_chain(struct cds_ft *ft,
 static
 struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		struct cds_ft_collapsed_node *col,
-		struct cds_ft_inode_flag **cptrs,
+		unsigned int tier,
 		unsigned int start, unsigned int end,
 		unsigned int suffix_offset,
 		unsigned int collapse_depth)
 {
+	struct cds_ft_collapsed_entry *entries =
+		ft_collapsed_entries(col, tier);
 	unsigned int count = end - start;
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
 
 	if (count == 0)
 		return NULL;
 
 	if (count == 1) {
 		unsigned int e = start;
-		uint8_t data_e = ft_collapsed_load_data(col, e);
-		unsigned int slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-		uint8_t *sfx = ft_collapsed_suffix(col, data_e, nr_e);
-		struct cds_ft_inode_flag *child = cptrs[e];
+		struct cds_ft_collapsed_entry *entry = &entries[e];
+		unsigned int slen = ft_collapsed_suffix_len(entry);
+		uint8_t *sfx = ft_collapsed_suffix(entry);
+		struct cds_ft_inode_flag *child = entry->child;
 		unsigned long child_nr_keys;
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -12350,9 +12257,9 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		unsigned long total_keys = 0;
 
 		while (i < end) {
-			uint8_t data_i = ft_collapsed_load_data(col, i);
-			uint8_t *sfx_i = ft_collapsed_suffix(col, data_i, nr_e);
-			unsigned int slen_i = ft_collapsed_suffix_len(col, data_i, i, nr_e);
+			struct cds_ft_collapsed_entry *entry_i = &entries[i];
+			uint8_t *sfx_i = ft_collapsed_suffix(entry_i);
+			unsigned int slen_i = ft_collapsed_suffix_len(entry_i);
 			uint8_t first;
 			unsigned int group_end;
 			struct cds_ft_inode_flag *sub;
@@ -12368,11 +12275,12 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 			group_end = i + 1;
 
 			while (group_end < end) {
-				uint8_t data_g = ft_collapsed_load_data(col, group_end);
+				struct cds_ft_collapsed_entry *entry_g =
+					&entries[group_end];
 				uint8_t *sfx_g =
-					ft_collapsed_suffix(col, data_g, nr_e);
+					ft_collapsed_suffix(entry_g);
 				unsigned int slen_g =
-					ft_collapsed_suffix_len(col, data_g, group_end, nr_e);
+					ft_collapsed_suffix_len(entry_g);
 
 				if (slen_g <= suffix_offset ||
 				    sfx_g[suffix_offset] != first)
@@ -12380,7 +12288,7 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 				group_end++;
 			}
 
-			sub = ft_explode_entries(ft, col, cptrs,
+			sub = ft_explode_entries(ft, col, tier,
 					i, group_end,
 					suffix_offset + 1,
 					collapse_depth);
@@ -12459,10 +12367,10 @@ int ft_collapsed_explode_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **out_internal_flag)
 {
 	struct cds_ft_inode_flag *internal_flag;
+	unsigned int tier = ft_collapsed_tier(col_flag);
 	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) col);
-	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col,
-		ft_collapsed_nr_entries(col));
+	unsigned int cap = ft_collapsed_capacity(tier);
 	unsigned long old_col_density[FT_NODE_DENSITY_DEPTH];
 	unsigned int old_col_fp = ft_node_readside_footprint(ft, col_flag);
 	unsigned int di;
@@ -12470,8 +12378,8 @@ int ft_collapsed_explode_node(struct cds_ft *ft,
 	for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
 		old_col_density[di] = ft_density_get(col_meta, di);
 
-	internal_flag = ft_explode_entries(ft, col, cptrs,
-		0, ft_collapsed_count(ft_collapsed_nr_entries(col)),
+	internal_flag = ft_explode_entries(ft, col, tier,
+		0, cap,
 		0, depth);
 	if (!internal_flag)
 		return -ENOMEM;
@@ -13527,11 +13435,12 @@ void ft_detach_node_replace_collapsed_parent(struct cds_ft *ft,
 		struct cds_ft_node *topmost_external_nodes,
 		unsigned int cur_depth)
 {
+	unsigned int tier = ft_collapsed_tier(iter_node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(iter_node_flag);
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
 	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) col);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
 	unsigned int e;
 
 	/*
@@ -13569,11 +13478,13 @@ void ft_detach_node_replace_collapsed_parent(struct cds_ft *ft,
 	}
 
 	/*
-	 * Sub-cases A and B: tombstone (A) or repurpose (B) the
-	 * detached entry.  nr_child stays >= 1 in both.
+	 * Sub-cases A and B: kill (A) or repurpose (B) the detached
+	 * entry.  nr_child stays >= 1 in both.
 	 */
-	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-		if (&cptrs[e] != detach_node_flag_ptr)
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *entry = &entries[e];
+
+		if (&entry->child != detach_node_flag_ptr)
 			continue;
 		if (topmost_external_nodes) {
 			/*
@@ -13588,25 +13499,20 @@ void ft_detach_node_replace_collapsed_parent(struct cds_ft *ft,
 			 */
 			ft_set_parent(
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
-				iter_node_flag, &cptrs[e]);
+				iter_node_flag, &entry->child);
 			ft_publish_to_parent(ft, iter_node_flag,
-				&cptrs[e],
+				&entry->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes);
 		} else {
 			/*
-			 * Sub-case A: tombstone entry.  Only reached when
-			 * col.nr_child > 1, so nr_child-- leaves col >= 1
-			 * (guarded by sub-case C above).
+			 * Sub-case A: mark slot dead by release-storing NULL
+			 * into entry->child.  Slot keeps its (suffix,len) and
+			 * is never reused.  Only reached when col.nr_child > 1.
 			 */
 			assert(col_meta->nr_child > 1);
-			ft_publish_to_parent(ft, iter_node_flag,
-				&cptrs[e], NULL);
-			/* Set tombstone. */
-			uatomic_store(&col->data[e],
-				col->data[e] | FT_COLLAPSED_TOMBSTONE,
-				CMM_RELAXED);
+			ft_collapsed_kill_entry(col, tier, e);
 			FT_TP(collapsed_entry,
-				(const void *) ft_collapsed_node_flag(col), e,
+				(const void *) ft_collapsed_node_flag_tier(col, tier), e,
 				(const uint8_t *) NULL, 0U,
 				(const void *) NULL, 1);
 			col_meta->nr_child--;
@@ -14173,38 +14079,39 @@ enum cds_ft_status ft_remove_descent_collapsed(
 		const uint8_t **iter_key_p,
 		size_t key_len)
 {
+	unsigned int tier = ft_collapsed_tier(dd->d.nf);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(dd->d.nf);
 	const struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) col);
 	unsigned int remaining = key_len - dd->d.depth;
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
 	const uint8_t *iter_key = *iter_key_p;
+	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
-	uint8_t data_e;
 
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+		struct cds_ft_inode_flag *child;
 		unsigned int slen;
 		uint8_t *suffix;
 		bool match;
 
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		slen = ft_collapsed_suffix_len(entry);
 		if (slen > remaining)
 			continue;
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		suffix = ft_collapsed_suffix(entry);
 		match = (ft_key_cmp_ordinals(iter_key, suffix, slen, slen,
 					     false, NULL) == 0);
 		if (!match)
 			continue;
-		if (!ft_node_ptr(cptrs[e]))
+		child = ft_dereference_acquire(entry->child);
+		if (!ft_node_ptr(child))
 			return CDS_FT_STATUS_NOT_FOUND;
 		ft_detach_descent_track(dd, col_meta);
 		dd->d.ppnf  = dd->d.pnf;
 		dd->d.ppnfp = dd->d.pnfp;
 		dd->d.pnf   = dd->d.nf;
 		dd->d.pnfp  = dd->d.nfp;
-		dd->d.nf    = ft_dereference_acquire(cptrs[e]);
-		dd->d.nfp   = &cptrs[e];
+		dd->d.nf    = child;
+		dd->d.nfp   = &entry->child;
 		dd->d.depth += slen;
 		iter_key += slen;
 		if (ft_node_ptr(dd->d.nf) && dd->pending) {
@@ -14955,35 +14862,36 @@ enum ft_descent_action ft_descent_step_collapsed(
 		unsigned int *snapshot_depth,
 		int *nr_snapshot)
 {
+	unsigned int tier = ft_collapsed_tier(d->nf);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(d->nf);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
 	const uint8_t *ik = *ik_p;
 	unsigned int remaining = key_len - d->depth;
+	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
-	uint8_t data_e;
 
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+		struct cds_ft_inode_flag *child;
 		unsigned int slen;
 		uint8_t *suffix;
 		bool match;
 
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		slen = ft_collapsed_suffix_len(entry);
 		if (slen > remaining)
 			continue;
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		suffix = ft_collapsed_suffix(entry);
 		match = (ft_key_cmp_ordinals(ik, suffix, slen, slen,
 					     false, NULL) == 0);
 		if (!match)
 			continue;
+		child = ft_dereference_acquire(entry->child);
 		ft_snapshot_push(snapshot, snapshot_depth,
 			*nr_snapshot, d->nf, d->depth);
 		d->ppnf  = d->pnf;
 		d->ppnfp = d->pnfp;
 		d->pnf   = d->nf;
 		d->pnfp  = d->nfp;
-		d->nf    = ft_dereference_acquire(cptrs[e]);
-		d->nfp   = &cptrs[e];
+		d->nf    = child;
+		d->nfp   = &entry->child;
 		d->depth += slen;
 		ik += slen;
 		*ik_p = ik;
@@ -16119,25 +16027,25 @@ enum cds_ft_status ft_detach_descent_collapsed(struct cds_ft *ft,
 		const uint8_t **ik_p,
 		size_t key_len)
 {
+	unsigned int tier = ft_collapsed_tier(dd->d.nf);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(dd->d.nf);
 	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) col);
 	unsigned int remaining = key_len - dd->d.depth;
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
 	const uint8_t *ik = *ik_p;
 	bool need_explode = false;
 	bool found = false;
+	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
-	uint8_t data_e;
 
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+		struct cds_ft_inode_flag *child;
 		unsigned int slen;
 		uint8_t *suffix;
 		bool match;
 
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		slen = ft_collapsed_suffix_len(entry);
+		suffix = ft_collapsed_suffix(entry);
 		/*
 		 * Partial prefix match (detach prefix falls within
 		 * this suffix): explode the collapsed node and
@@ -16155,15 +16063,16 @@ enum cds_ft_status ft_detach_descent_collapsed(struct cds_ft *ft,
 					     false, NULL) == 0);
 		if (!match)
 			continue;
-		if (!ft_node_ptr(cptrs[e]))
+		child = ft_dereference_acquire(entry->child);
+		if (!ft_node_ptr(child))
 			return CDS_FT_STATUS_NOT_FOUND;
 		ft_detach_descent_track(dd, col_meta);
 		dd->d.ppnf  = dd->d.pnf;
 		dd->d.ppnfp = dd->d.pnfp;
 		dd->d.pnf   = dd->d.nf;
 		dd->d.pnfp  = dd->d.nfp;
-		dd->d.nf    = ft_dereference_acquire(cptrs[e]);
-		dd->d.nfp   = &cptrs[e];
+		dd->d.nf    = child;
+		dd->d.nfp   = &entry->child;
 		dd->d.depth += slen;
 		ik += slen;
 		if (ft_node_ptr(dd->d.nf) && dd->pending) {
@@ -16852,23 +16761,24 @@ enum ft_descent_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **node
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	unsigned int i = *i_p;
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
 	unsigned int remaining = prefix_len - i;
+	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
-	uint8_t data_e;
 
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+		struct cds_ft_inode_flag *child;
 		unsigned int slen, j;
 		uint8_t *suffix;
 		bool match;
 
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		slen = ft_collapsed_suffix_len(entry);
+		child = entry->child;
 
 		if (slen >= remaining) {
 			/* Suffix covers the rest of the prefix — compare. */
-			suffix = ft_collapsed_suffix(col, data_e, nr_e);
+			suffix = ft_collapsed_suffix(entry);
 			match = true;
 			for (j = 0; j < remaining; j++) {
 				if (prefix[i + j] != suffix[j]) {
@@ -16879,11 +16789,11 @@ enum ft_descent_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **node
 			if (!match)
 				continue;
 			/* Prefix ends within or at this entry's span. */
-			if (!ft_node_external(ptrs[e])) {
+			if (!ft_node_external(child)) {
 				struct cds_ft_metadata *m =
-					cds_ft_item_to_metadata(ft_node_ptr(ptrs[e]));
+					cds_ft_item_to_metadata(ft_node_ptr(child));
 				*count_ret = ft_nr_keys_load(m);
-			} else if (ft_node_ptr(ptrs[e])) {
+			} else if (ft_node_ptr(child)) {
 				*count_ret = 1;
 			} else {
 				*count_ret = 0;
@@ -16891,7 +16801,7 @@ enum ft_descent_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **node
 			return FT_DESCENT_END;
 		}
 		/* Suffix is shorter than remaining prefix — check prefix. */
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		suffix = ft_collapsed_suffix(entry);
 		match = true;
 		for (j = 0; j < slen; j++) {
 			if (prefix[i + j] != suffix[j]) {
@@ -16904,10 +16814,10 @@ enum ft_descent_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **node
 		/* Full suffix match, continue descent into child. */
 		*i_p = i + slen - 1;
 		{
-			struct cds_ft_inode_flag *child =
-				ft_dereference_acquire_prefetch(ptrs[e]);
-			child = ft_resolve_skip_compressed(child);
-			*node_flag_p = child;
+			struct cds_ft_inode_flag *resolved =
+				ft_dereference_acquire_prefetch(entry->child);
+			resolved = ft_resolve_skip_compressed(resolved);
+			*node_flag_p = resolved;
 		}
 		return FT_DESCENT_CONTINUE;
 	}
@@ -17089,80 +16999,52 @@ enum ft_descent_action ft_lookup_nth_collapsed(
 		struct cds_ft_inode_flag **node_flag_p,
 		int *level_p, uint8_t *ordinal_key,
 		struct cds_ft_iter *iter,
-		unsigned long *remaining_p,
-		unsigned int nr)
+		unsigned long *remaining_p)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	int level = *level_p;
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr);
-	bool visited[FT_COLLAPSED_MAX_ENTRIES_MAX];
-	unsigned int i, best, steps;
-
-	memset(visited, 0, ft_collapsed_count(nr) * sizeof(visited[0]));
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int e;
 
 	/*
-	 * Walk entries in ascending suffix order (selection sort style).
-	 * N is small (≤ 24), all in 1 cache line.
+	 * Live entries appear in lexicographic order across slot
+	 * indices, so a single forward pass visits them in ascending
+	 * suffix order — no sort needed.
 	 */
-	for (steps = 0; steps < ft_collapsed_count(nr); steps++) {
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *entry = &entries[e];
+		struct cds_ft_inode_flag *child;
 		unsigned long child_keys;
 		unsigned int slen;
 		uint8_t *suffix;
-		uint8_t best_d = 0;
 
-		/* Find the smallest unvisited live entry. */
-		best = UINT_MAX;
-		for (i = 0; i < ft_collapsed_count(nr); i++) {
-			uint8_t data_i = ft_collapsed_load_data(col, i);
-
-			if (visited[i] || ft_collapsed_entry_dead(data_i, nr))
-				continue;
-			if (best == UINT_MAX) {
-				best = i;
-				best_d = data_i;
-				continue;
-			}
-			/* Compare suffixes lexicographically. */
-			{
-				uint8_t *sa = ft_collapsed_suffix(col, best_d, nr);
-				unsigned int la = ft_collapsed_suffix_len(col, best_d, best, nr);
-				uint8_t *sb = ft_collapsed_suffix(col, data_i, nr);
-				unsigned int lb = ft_collapsed_suffix_len(col, data_i, i, nr);
-				unsigned int cmp = la < lb ? la : lb;
-				int r = memcmp(sb, sa, cmp);
-
-				if (r < 0 || (r == 0 && lb < la)) {
-					best = i;
-					best_d = data_i;
-				}
-			}
-		}
-		if (best == UINT_MAX)
-			break;
-		visited[best] = true;
-
-		if (!ft_node_ptr(ptrs[best]))
+		child = ft_dereference_acquire_prefetch(entry->child);
+		if (child == NULL)
 			continue;
-		child_keys = ft_child_key_count(ptrs[best]);
+		if (!ft_node_ptr(child))
+			continue;
+		child_keys = ft_child_key_count(child);
 		if (*remaining_p < child_keys) {
 			/* Target is in this entry's subtree. */
-			slen = ft_collapsed_suffix_len(col, best_d, best, nr);
-			suffix = ft_collapsed_suffix(col, best_d, nr);
+			slen = ft_collapsed_suffix_len(entry);
+			suffix = ft_collapsed_suffix(entry);
 			{
 				unsigned int k;
 
 				for (k = 0; k < slen; k++) {
 					ordinal_key[level - 1 + k] = suffix[k];
 					iter_path_node(iter)[level + k] =
-						ft_collapsed_node_flag(col);
+						ft_collapsed_node_flag_tier(col, tier);
 				}
 			}
-			node_flag = ft_dereference_acquire_prefetch(ptrs[best]);
-			if (ft_node_ptr(node_flag) &&
-			    ft_node_skip_compressed(node_flag))
-				node_flag = ft_compressed_node_flag(
-					ft_skip_to_compressed(node_flag));
+			if (ft_node_ptr(child) &&
+			    ft_node_skip_compressed(child))
+				child = ft_compressed_node_flag(
+					ft_skip_to_compressed(child));
+			node_flag = child;
 			if (!ft_node_ptr(node_flag) || ft_node_external(node_flag)) {
 				level += slen;
 				if (ft_node_ptr(node_flag))
@@ -17188,8 +17070,7 @@ enum ft_descent_action ft_lookup_nth_collapsed(
 		int *level_p __attribute__((unused)),
 		uint8_t *ordinal_key __attribute__((unused)),
 		struct cds_ft_iter *iter __attribute__((unused)),
-		unsigned long *remaining_p __attribute__((unused)),
-		unsigned int nr __attribute__((unused)))
+		unsigned long *remaining_p __attribute__((unused)))
 {
 	return FT_DESCENT_BREAK;
 }
@@ -17276,12 +17157,10 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		}
 		if (ft_node_collapsed(node_flag)) {
 			enum ft_descent_action act;
-			unsigned int col_nr_e = ft_collapsed_nr_entries(
-				ft_collapsed_node_ptr(node_flag));
 
 			act = ft_lookup_nth_collapsed(&node_flag,
 				&level, ordinal_key, iter,
-				&remaining, col_nr_e);
+				&remaining);
 			if (act == FT_DESCENT_BREAK)
 				break;
 			continue;
@@ -17408,74 +17287,51 @@ enum ft_descent_action ft_lookup_nth_last_collapsed(
 		struct cds_ft_inode_flag **node_flag_p,
 		int *level_p, uint8_t *ordinal_key,
 		struct cds_ft_iter *iter,
-		unsigned long *remaining_p,
-		unsigned int nr)
+		unsigned long *remaining_p)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	int level = *level_p;
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr);
-	bool visited[FT_COLLAPSED_MAX_ENTRIES_MAX];
-	unsigned int i, best, steps;
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int e;
 
-	memset(visited, 0, ft_collapsed_count(nr) * sizeof(visited[0]));
-
-	for (steps = 0; steps < ft_collapsed_count(nr); steps++) {
+	/*
+	 * Live entries appear in lexicographic order across slot
+	 * indices.  A reverse pass (high-to-low) visits them in
+	 * descending suffix order — no sort needed.
+	 */
+	for (e = cap; e-- > 0; ) {
+		struct cds_ft_collapsed_entry *entry = &entries[e];
+		struct cds_ft_inode_flag *child;
 		unsigned long child_keys;
 		unsigned int slen;
 		uint8_t *suffix;
-		uint8_t best_d = 0;
 
-		/* Find the largest unvisited live entry. */
-		best = UINT_MAX;
-		for (i = 0; i < ft_collapsed_count(nr); i++) {
-			uint8_t data_i = ft_collapsed_load_data(col, i);
-
-			if (visited[i] || ft_collapsed_entry_dead(data_i, nr))
-				continue;
-			if (best == UINT_MAX) {
-				best = i;
-				best_d = data_i;
-				continue;
-			}
-			{
-				uint8_t *sa = ft_collapsed_suffix(col, best_d, nr);
-				unsigned int la = ft_collapsed_suffix_len(col, best_d, best, nr);
-				uint8_t *sb = ft_collapsed_suffix(col, data_i, nr);
-				unsigned int lb = ft_collapsed_suffix_len(col, data_i, i, nr);
-				unsigned int cmp = la < lb ? la : lb;
-				int r = memcmp(sb, sa, cmp);
-
-				if (r > 0 || (r == 0 && lb > la)) {
-					best = i;
-					best_d = data_i;
-				}
-			}
-		}
-		if (best == UINT_MAX)
-			break;
-		visited[best] = true;
-
-		if (!ft_node_ptr(ptrs[best]))
+		child = ft_dereference_acquire_prefetch(entry->child);
+		if (child == NULL)
 			continue;
-		child_keys = ft_child_key_count(ptrs[best]);
+		if (!ft_node_ptr(child))
+			continue;
+		child_keys = ft_child_key_count(child);
 		if (*remaining_p < child_keys) {
-			slen = ft_collapsed_suffix_len(col, best_d, best, nr);
-			suffix = ft_collapsed_suffix(col, best_d, nr);
+			slen = ft_collapsed_suffix_len(entry);
+			suffix = ft_collapsed_suffix(entry);
 			{
 				unsigned int k;
 
 				for (k = 0; k < slen; k++) {
 					ordinal_key[level - 1 + k] = suffix[k];
 					iter_path_node(iter)[level + k] =
-						ft_collapsed_node_flag(col);
+						ft_collapsed_node_flag_tier(col, tier);
 				}
 			}
-			node_flag = ft_dereference_acquire_prefetch(ptrs[best]);
-			if (ft_node_ptr(node_flag) &&
-			    ft_node_skip_compressed(node_flag))
-				node_flag = ft_compressed_node_flag(
-					ft_skip_to_compressed(node_flag));
+			if (ft_node_ptr(child) &&
+			    ft_node_skip_compressed(child))
+				child = ft_compressed_node_flag(
+					ft_skip_to_compressed(child));
+			node_flag = child;
 			if (!ft_node_ptr(node_flag) || ft_node_external(node_flag)) {
 				level += slen;
 				if (ft_node_ptr(node_flag))
@@ -17501,8 +17357,7 @@ enum ft_descent_action ft_lookup_nth_last_collapsed(
 		int *level_p __attribute__((unused)),
 		uint8_t *ordinal_key __attribute__((unused)),
 		struct cds_ft_iter *iter __attribute__((unused)),
-		unsigned long *remaining_p __attribute__((unused)),
-		unsigned int nr __attribute__((unused)))
+		unsigned long *remaining_p __attribute__((unused)))
 {
 	return FT_DESCENT_END;
 }
@@ -17562,13 +17417,11 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		}
 		if (ft_node_collapsed(node_flag)) {
 			enum ft_descent_action act;
-			unsigned int col_nr_e = ft_collapsed_nr_entries(
-				ft_collapsed_node_ptr(node_flag));
 
 			/* Reuse nth helper in reverse: walk entries largest-first. */
 			act = ft_lookup_nth_last_collapsed(
 				&node_flag, &level, ordinal_key,
-				iter, &remaining, col_nr_e);
+				iter, &remaining);
 			if (act == FT_DESCENT_BREAK)
 				break;
 			if (act == FT_DESCENT_END)
@@ -17715,23 +17568,23 @@ enum ft_descent_action ft_rebuild_path_collapsed(
 		struct cds_ft_iter *iter)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
 	unsigned int i = *i_p;
 	unsigned int remaining = key_len - i;
+	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
-	uint8_t data_e;
 
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+		struct cds_ft_inode_flag *child;
 		unsigned int slen, j;
 		uint8_t *suffix;
 		bool match;
 
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		slen = ft_collapsed_suffix_len(entry);
 		if (slen > remaining)
 			continue;
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		suffix = ft_collapsed_suffix(entry);
 		match = true;
 		for (j = 0; j < slen; j++) {
 			uint8_t ord = key[i + j];
@@ -17743,17 +17596,17 @@ enum ft_descent_action ft_rebuild_path_collapsed(
 			ordinal_key[i + j] = ord;
 			iter_path_node(iter)[i + j + 1] =
 				(struct cds_ft_inode_flag *)
-				ft_collapsed_node_flag(col);
+				ft_collapsed_node_flag_tier(col, tier);
 		}
 		if (!match)
 			continue;
 		i += slen - 1;
-		node_flag = ft_dereference_acquire_prefetch(ptrs[e]);
-		if (!ft_node_ptr(node_flag))
+		child = ft_dereference_acquire_prefetch(entry->child);
+		if (!ft_node_ptr(child))
 			return FT_DESCENT_END;
-		node_flag = ft_resolve_skip_compressed(node_flag);
-		iter_path_node(iter)[i + 1] = node_flag;
-		*node_flag_p = node_flag;
+		child = ft_resolve_skip_compressed(child);
+		iter_path_node(iter)[i + 1] = child;
+		*node_flag_p = child;
 		*i_p = i;
 		return FT_DESCENT_CONTINUE;
 	}
@@ -17875,42 +17728,33 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 		int *level_p,
 		int depth,
 		unsigned long *remaining_p,
-		unsigned int *cached_col_nr_e_p,
 		uint8_t *ordinal_key,
 		struct cds_ft_iter *iter)
 {
 	int level = *level_p;
+	unsigned int tier = ft_collapsed_tier(ancestor);
 	struct cds_ft_collapsed_node *col;
-	unsigned int nr_e;
-	struct cds_ft_inode_flag **cptrs;
+	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
-	uint8_t data_e;
 
 	/* Skip intermediate levels (same node at adjacent levels). */
 	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
 		return FT_DESCENT_CONTINUE;
 
 	col = ft_collapsed_node_ptr(ancestor);
-	/*
-	 * Use cached nr_entries from the downward walk when
-	 * available; fresh load for collapsed nodes at higher levels.
-	 */
-	nr_e = *cached_col_nr_e_p ? *cached_col_nr_e_p :
-		ft_collapsed_nr_entries(col);
-	cptrs = ft_collapsed_ptrs(col, nr_e);
 
-	*cached_col_nr_e_p = 0;
-
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+		struct cds_ft_inode_flag *child;
 		unsigned int slen;
 		uint8_t *suffix;
 		unsigned long ck;
 		bool is_current;
 
-		if (!ft_node_ptr(cptrs[e]))
+		child = ft_dereference_acquire(entry->child);
+		if (!ft_node_ptr(child))
 			continue;
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		slen = ft_collapsed_suffix_len(entry);
+		suffix = ft_collapsed_suffix(entry);
 
 		/*
 		 * Check if this is the current entry by comparing
@@ -17956,7 +17800,7 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 			if (r <= 0)
 				continue;
 		}
-		ck = ft_child_key_count(cptrs[e]);
+		ck = ft_child_key_count(child);
 		if (*remaining_p <= ck) {
 			unsigned int k;
 
@@ -17967,7 +17811,7 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 					iter_path_node(iter)[level + k + 1] = ancestor;
 			}
 			level += slen;
-			iter_path_node(iter)[level] = cptrs[e];
+			iter_path_node(iter)[level] = child;
 			*level_p = level;
 			return FT_DESCENT_BREAK;
 		}
@@ -17994,15 +17838,6 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	unsigned long remaining;
 	int depth, level = 0;
 	bool at_external_nodes;
-	/*
-	 * Cache nr_entries from the downward collapsed walk so the
-	 * going-up handler uses the same acquire-loaded snapshot.
-	 * 0 means unset (collapsed nodes always have >= 1 entry by
-	 * construction).  Consumed and reset to 0 after use, so
-	 * collapsed nodes encountered at higher levels during
-	 * going-up get a fresh load.
-	 */
-	unsigned int cached_col_nr_e = 0;
 
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP(iter_skip_forward_enter, n);
@@ -18087,12 +17922,9 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 				enum ft_descent_action act;
 				int lv = depth;
 
-				cached_col_nr_e = ft_collapsed_nr_entries(
-					ft_collapsed_node_ptr(parent));
 				act = ft_lookup_nth_collapsed(
 					&parent, &lv, ordinal_key,
-					iter, &remaining,
-					cached_col_nr_e);
+					iter, &remaining);
 				if (act == FT_DESCENT_BREAK) {
 					/* Leaf at path[lv]. */
 					level = lv;
@@ -18162,7 +17994,7 @@ skip_fwd_walk_up:
 
 			act = ft_skip_forward_walk_up_collapsed(ancestor,
 				&level, depth, &remaining,
-				&cached_col_nr_e, ordinal_key, iter);
+				ordinal_key, iter);
 			if (act == FT_DESCENT_BREAK)
 				goto descend_forward;
 			assert(act == FT_DESCENT_CONTINUE);
@@ -18260,13 +18092,10 @@ descend_forward:
 			}
 			if (ft_node_collapsed(node_flag)) {
 				enum ft_descent_action act;
-				unsigned int col_nr_e = ft_collapsed_nr_entries(
-					ft_collapsed_node_ptr(node_flag));
 
 				act = ft_lookup_nth_collapsed(
 					&node_flag, &level,
-					ordinal_key, iter, &remaining,
-					col_nr_e);
+					ordinal_key, iter, &remaining);
 				if (act == FT_DESCENT_BREAK)
 					break;
 				continue;
@@ -18448,32 +18277,31 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 		struct cds_ft_iter *iter)
 {
 	int level = *level_p;
+	unsigned int tier = ft_collapsed_tier(ancestor);
 	struct cds_ft_collapsed_node *col;
-	unsigned int nr_e;
-	struct cds_ft_inode_flag **cptrs;
+	struct cds_ft_collapsed_entry *entry;
 	struct cds_ft_metadata *col_meta;
 	struct cds_ft_node *a_ext;
 	unsigned int e;
-	uint8_t data_e;
 
 	/* Skip intermediate levels. */
 	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
 		return FT_DESCENT_CONTINUE;
 
 	col = ft_collapsed_node_ptr(ancestor);
-	nr_e = ft_collapsed_nr_entries(col);
-	cptrs = ft_collapsed_ptrs(col, nr_e);
 	col_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) col);
 
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+		struct cds_ft_inode_flag *child;
 		unsigned int slen;
 		uint8_t *suffix;
 		unsigned long ck;
 
-		if (!ft_node_ptr(cptrs[e]))
+		child = ft_dereference_acquire(entry->child);
+		if (!ft_node_ptr(child))
 			continue;
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
+		slen = ft_collapsed_suffix_len(entry);
+		suffix = ft_collapsed_suffix(entry);
 
 		/* Check if suffix < current key. */
 		{
@@ -18497,7 +18325,7 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 			if (r >= 0)
 				continue;
 		}
-		ck = ft_child_key_count(cptrs[e]);
+		ck = ft_child_key_count(child);
 		if (*remaining_p <= ck) {
 			unsigned int k;
 
@@ -18508,7 +18336,7 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 					iter_path_node(iter)[level + k + 1] = ancestor;
 			}
 			level += slen;
-			iter_path_node(iter)[level] = cptrs[e];
+			iter_path_node(iter)[level] = child;
 			*level_p = level;
 			return FT_DESCENT_BREAK;
 		}
@@ -18753,13 +18581,10 @@ descend_reverse:
 			}
 			if (ft_node_collapsed(node_flag)) {
 				enum ft_descent_action act;
-				unsigned int col_nr_e = ft_collapsed_nr_entries(
-					ft_collapsed_node_ptr(node_flag));
 
 				act = ft_lookup_nth_last_collapsed(
 					&node_flag, &level,
-					ordinal_key, iter, &remaining,
-					col_nr_e);
+					ordinal_key, iter, &remaining);
 				if (act == FT_DESCENT_BREAK)
 					break;
 				if (act == FT_DESCENT_END)
@@ -19425,17 +19250,16 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 		unsigned int depth,
 		unsigned long *out_nr_keys)
 {
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) col);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
 	struct cds_ft_node *external_nodes = col_meta->external_nodes;
+	struct cds_ft_collapsed_entry *entry;
 	unsigned long total_child_keys = 0;
 	unsigned long local_keys = 0;
 	unsigned int live_children = 0;
 	unsigned int e;
-	uint8_t data_e;
 
 	/* Parent pointer check. */
 	if (col_meta->parent != expected_parent) {
@@ -19451,12 +19275,12 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 		local_keys = 1;	/* One unique key position. */
 	}
 	/* Walk each collapsed entry. */
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
 		unsigned int slen;
 		struct cds_ft_inode_flag *child;
 
-		child = ptrs[e];
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		child = entry->child;
+		slen = ft_collapsed_suffix_len(entry);
 		if (!ft_node_ptr(child))
 			continue;
 		live_children++;
@@ -19685,22 +19509,21 @@ int ft_verify_density_collapsed(const struct cds_ft *ft, FILE *out,
 		struct cds_ft_inode_flag *node_flag,
 		unsigned int depth)
 {
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) col);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
+	struct cds_ft_collapsed_entry *entry;
 	unsigned long accum[FT_NODE_DENSITY_DEPTH] = { 0 };
 	int errors = 0;
 	unsigned int e, j;
-	uint8_t data_e;
 
-	ft_for_each_live_collapsed_entry(col, nr_e, e, data_e) {
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
 		unsigned int slen;
 		struct cds_ft_inode_flag *child;
 
-		child = ptrs[e];
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
+		child = entry->child;
+		slen = ft_collapsed_suffix_len(entry);
 		if (!ft_node_ptr(child))
 			continue;
 		/* Resolve skip-compressed: see ft_init_node_density. */
@@ -19848,18 +19671,18 @@ static void print_density(FILE *out, const struct cds_ft_metadata *m)
 static void show_collapsed_node(const struct cds_ft *ft, FILE *out,
 		struct cds_ft_inode_flag *node_flag, int level)
 {
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	struct cds_ft_metadata *col_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) col);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
+	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int live = ft_collapsed_count_live(col, tier);
 	struct cds_ft_node *external_nodes = rcu_dereference(col_meta->external_nodes);
 	unsigned int e;
 
 	print_indent(out, level);
-	fprintf(out, "Level %d, COLLAPSED node: %p, nr_entries: %u, scan=%uB, order=%zu, nr_keys: %lu, density: ",
-		level, node_flag, ft_collapsed_count(nr_e),
-		ft_collapsed_scan_zone_size(nr_e),
+	fprintf(out, "Level %d, COLLAPSED node: %p, tier=%u, capacity=%u, live=%u, order=%zu, nr_keys: %lu, density: ",
+		level, node_flag, tier, cap, live,
 		cds_ft_item_order(col),
 		ft_nr_keys_get(col_meta));
 	print_density(out, col_meta);
@@ -19870,16 +19693,17 @@ static void show_collapsed_node(const struct cds_ft *ft, FILE *out,
 			level, external_nodes);
 	}
 
-	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-		uint8_t data_e = ft_collapsed_load_data(col, e);
-		unsigned int slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-		uint8_t *suffix = ft_collapsed_suffix(col, data_e, nr_e);
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *entry =
+			&ft_collapsed_entries(col, tier)[e];
+		unsigned int slen = ft_collapsed_suffix_len(entry);
+		uint8_t *suffix = ft_collapsed_suffix(entry);
 		struct cds_ft_inode_flag *child;
 		unsigned int k;
 
-		if (ft_collapsed_entry_dead(data_e, nr_e))
+		child = ft_dereference_acquire(entry->child);
+		if (child == NULL)
 			continue;
-		child = ft_dereference_acquire(ptrs[e]);
 		print_indent(out, level);
 		fprintf(out, "  entry[%u]: suffix=[", e);
 		for (k = 0; k < slen; k++)
@@ -20074,36 +19898,32 @@ static
 void json_emit_collapsed(const struct cds_ft *ft, FILE *out,
 		struct cds_ft_inode_flag *node_flag, int level)
 {
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	struct cds_ft_metadata *col_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) col);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **ptrs = ft_collapsed_ptrs(col, nr_e);
+	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int live = ft_collapsed_count_live(col, tier);
 	struct cds_ft_node *external_nodes = rcu_dereference(col_meta->external_nodes);
-	unsigned int count = ft_collapsed_count(nr_e);
+	struct cds_ft_collapsed_entry *entry;
 	unsigned int e, printed = 0;
 
 	fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"COLLAPSED\",\"level\":%d,"
-		"\"scan_zone_size\":%u,\"nr_entries\":%u",
-		node_flag, level, ft_collapsed_scan_zone_size(nr_e), count);
+		"\"tier\":%u,\"capacity\":%u,\"nr_live\":%u",
+		node_flag, level, tier, cap, live);
 	if (external_nodes)
 		fprintf(out, ",\"external_nodes\":\"%p\"",
 			(void *) external_nodes);
 	fprintf(out, ",\"entries\":[");
-	for (e = 0; e < count; e++) {
-		uint8_t data_e = ft_collapsed_load_data(col, e);
-		unsigned int slen;
-		uint8_t *suffix;
-		struct cds_ft_inode_flag *child;
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+		unsigned int slen = ft_collapsed_suffix_len(entry);
+		uint8_t *suffix = ft_collapsed_suffix(entry);
+		struct cds_ft_inode_flag *child =
+			ft_dereference_acquire(entry->child);
 		unsigned int k;
 
-		if (ft_collapsed_entry_dead(data_e, nr_e))
-			continue;
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
-		suffix = ft_collapsed_suffix(col, data_e, nr_e);
-		child = ft_dereference_acquire(ptrs[e]);
 		if (printed++) fprintf(out, ",");
-		fprintf(out, "{\"suffix\":[");
+		fprintf(out, "{\"slot\":%u,\"suffix\":[", e);
 		for (k = 0; k < slen; k++) {
 			if (k) fprintf(out, ",");
 			fprintf(out, "%u", suffix[k]);
@@ -20237,8 +20057,7 @@ struct cds_ft_stats_level {
 	uint64_t nr_internal_nodes;
 	uint64_t nr_compressed_nodes;
 	uint64_t nr_collapsed_nodes;
-	uint64_t nr_collapsed_scan32;
-	uint64_t nr_collapsed_scan64;
+	uint64_t nr_collapsed_tier[FT_COL_NR_TIERS];
 	struct cds_ft_node_stats node_stats[FT_TYPE_MAX_NR];
 	bool has_nodes;
 };
@@ -20310,27 +20129,21 @@ void calc_stats_collapsed(const struct cds_ft *ft,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_stats *stats, int level)
 {
+	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	struct cds_ft_metadata *col_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) col);
-	unsigned int nr_e = ft_collapsed_nr_entries(col);
-	struct cds_ft_inode_flag **cptrs = ft_collapsed_ptrs(col, nr_e);
 	struct cds_ft_node *external_nodes = rcu_dereference(col_meta->external_nodes);
+	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
 
 	stats->level[level].nr_internal_nodes++;
 	stats->level[level].nr_collapsed_nodes++;
-	switch (col->nr_entries >> FT_COLLAPSED_SCAN_SHIFT) {
-	case FT_COLLAPSED_SCAN_32:
-		stats->level[level].nr_collapsed_scan32++;
-		break;
-	case FT_COLLAPSED_SCAN_64:
-		stats->level[level].nr_collapsed_scan64++;
-		break;
-	}
+	if (tier < FT_COL_NR_TIERS)
+		stats->level[level].nr_collapsed_tier[tier]++;
 	stats->level[level].has_nodes = true;
 	{
-		unsigned int count = ft_collapsed_count(nr_e);
+		unsigned int count = ft_collapsed_count_live(col, tier);
 		unsigned int bucket;
 
 		if (count >= 256)
@@ -20364,21 +20177,18 @@ void calc_stats_collapsed(const struct cds_ft *ft,
 			stats->level[level].has_nodes = true;
 		}
 	}
-	for (e = 0; e < ft_collapsed_count(nr_e); e++) {
-		uint8_t data_e = ft_collapsed_load_data(col, e);
-		unsigned int slen, j;
+	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+		unsigned int slen = ft_collapsed_suffix_len(entry);
+		unsigned int j;
 		struct cds_ft_inode_flag *child;
 
-		if (ft_collapsed_entry_dead(data_e, nr_e))
-			continue;
-		slen = ft_collapsed_suffix_len(col, data_e, e, nr_e);
 		{
 			unsigned int slen_bin = (slen > FT_COLLAPSE_SLEN_MAX_BIN)
 				? FT_COLLAPSE_SLEN_MAX_BIN : slen;
 
 			stats->collapsed_suffix_len_dist[slen_bin]++;
 		}
-		child = ft_dereference_acquire(cptrs[e]);
+		child = ft_dereference_acquire(entry->child);
 		for (j = 1; j < slen; j++) {
 			stats->level[level + j].nr_internal_nodes++;
 			stats->level[level + j].nr_compressed_nodes++;
@@ -20542,10 +20352,13 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 		if (stats_level->nr_collapsed_nodes) {
 			print_indent(out, 1);
 			fprintf(out, "Collapsed nodes: %" PRIu64
-				" (32B: %" PRIu64 ", 64B: %" PRIu64 ")\n",
+				" (T0: %" PRIu64 ", T1: %" PRIu64
+				", T2: %" PRIu64 ", T3: %" PRIu64 ")\n",
 				stats_level->nr_collapsed_nodes,
-				stats_level->nr_collapsed_scan32,
-				stats_level->nr_collapsed_scan64);
+				stats_level->nr_collapsed_tier[0],
+				stats_level->nr_collapsed_tier[1],
+				stats_level->nr_collapsed_tier[2],
+				stats_level->nr_collapsed_tier[3]);
 		}
 		for (type = 0; type < FT_TYPE_MAX_NR; type++) {
 			const struct cds_ft_node_stats *node_stats = &stats->level[level].node_stats[type];

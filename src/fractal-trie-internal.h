@@ -487,100 +487,150 @@ struct cds_ft_compressed_node {
 };
 
 /*
- * Collapsed subtree node.  Replaces a sparse subtree with a single
- * node storing variable-length key suffixes and child pointers.
+ * Collapsed subtree node — fixed-stride Struct-of-Arrays (SoA) layout.
  *
  * Tagged in the parent's child pointer with FT_COLLAPSED_MASK
- * (bits 1-2 set, bit 0 clear = 0b110).
+ * (bits 1-2 set, bit 0 clear = 0b110), plus a 2-bit tier index in
+ * bits 4-5 (FT_COL_TIER_MASK).  The tier is the sole source of
+ * capacity, allocation size, and header layout — there is no
+ * in-node nr_entries or scan-zone metadata.
  *
- * Two-zone layout (node allocation >= 128 bytes, cache-line aligned):
+ * Per-tier layout (offsets in bytes from the node base):
  *
- *   Zone 1 (scan zone, variable size: 32 or 64 bytes):
- *     [nr_entries] [offset_0] [offset_1] ... → ← ... [suffix_1] [suffix_0]
- *     Offset array grows left-to-right; suffix data grows right-to-left.
- *     Scan zone size encoded in bit 6 of nr_entries.
+ *   Tier 0 (64B alloc, 3 entries):
+ *     [0..7]:   prefix_0[8]   (3 valid bytes, 5 padding)
+ *     [8..15]:  prefix_1[8]   (3 valid bytes, 5 padding)
+ *     [16..63]: entries[3]    (3 × 16B = 48B)
  *
- *   Zone 2 (pointer zone, starts at scan zone end):
- *     [ptr_0] [ptr_1] ... [ptr_{nr_entries-1}]
- *     Child pointers (struct cds_ft_inode_flag *), any node type.
+ *   Tier 1 (128B alloc, 7 entries):
+ *     [0..7]:    prefix_0[8]  (7 valid bytes, 1 padding)
+ *     [8..15]:   prefix_1[8]  (7 valid bytes, 1 padding)
+ *     [16..127]: entries[7]   (7 × 16B = 112B)
  *
- * nr_entries encoding (uint8_t):
- *   bit  6   = scan zone size selector:
- *     0 = 32B  (half cache line, FT_COLLAPSED_SCAN_32)
- *     1 = 64B  (1 cache line, FT_COLLAPSED_SCAN_64)
- *   bit  7   = unused (must be 0)
- *   bits 5-0 = entry count (max 63)
+ *   Tier 2 (256B alloc, 12 entries):
+ *     [0..15]:    prefix_0[16] (12 valid bytes, 4 padding)
+ *     [16..31]:   prefix_1[16] (12 valid bytes, 4 padding)
+ *     [32..63]:   header padding (32B reserved)
+ *     [64..255]:  entries[12]  (12 × 16B = 192B)
  *
- * entry_offset[i] encoding (uint8_t):
- *   bit 7 (0x80) = tombstone marker (1 = dead entry, 0 = live)
- *   bits 0-6     = byte offset from start of node to entry i's suffix
+ *   Tier 3 (512B alloc, 28 entries):
+ *     [0..31]:    prefix_0[32] (28 valid bytes, 4 padding)
+ *     [32..63]:   prefix_1[32] (28 valid bytes, 4 padding)
+ *     [64..511]:  entries[28]  (28 × 16B = 448B)
  *
- * Suffix length derivation:
- *   Entry 0: suffix_len = scan_zone_size - (offset[0] & offset_mask)
- *   Entry i: suffix_len = (offset[i-1] & offset_mask) - (offset[i] & offset_mask)
+ * Each entry is a 16-byte fixed-stride record (cds_ft_collapsed_entry):
+ *   bytes [0..6] = suffix bytes (max 7 bytes; longer paths nest a
+ *                  compressed child)
+ *   byte  [7]    = suffix length (1..7); 0 = born-dead slot
+ *   bytes [8..15] = child pointer (NULL = dead/empty slot)
  *
- * Lookup: scan zone 1 to find matching suffix, then
- * load ptr[i] from zone 2.
+ * The 8 bytes [0..7] form a single uint64_t SWAR word — a one-shot
+ * compare against a target word verifies the suffix in full.
+ *
+ * Liveness is encoded purely in the entry's child pointer:
+ * child == NULL marks a dead slot (born-dead at allocation, or
+ * once-live after deletion).  The allocator zero-initializes the
+ * node, so freshly-allocated entry slots start dead.
+ *
+ * Slot lifecycle is append-only-no-reuse: once a slot's (suffix,len)
+ * is written, it is immutable.  The slot transitions live → dead by
+ * a single CMM_RELEASE store of NULL into child.  A dead slot is
+ * never re-bound to a different (suffix,len).
+ *
+ * Live entries appear in lexicographic order across slot indices: if
+ * slots i and j are both live and i < j, then entry[i] < entry[j].
+ * Dead slots may appear at any position, creating "holes" — readers
+ * skip them via the child-NULL check.
+ *
+ * Insert paths:
+ *   - In-order tail insert: when the new key sorts strictly after
+ *     the highest written slot's (suffix,len), append at the next
+ *     unused slot.  Suffix/len/prefix bytes written first, then the
+ *     child pointer is published with CMM_RELEASE.
+ *   - Out-of-order insert: rebuild a fresh sorted node (allocate at
+ *     the appropriate tier, copy with the new entry merged in sort
+ *     position, atomic-graft into the parent, RCU-free old node).
+ *   - Capacity exhaustion: rebuild at the next tier.
+ *
+ * Delete: CMM_RELEASE store of NULL into the entry's child pointer.
+ * The slot remains "occupied" by its immutable (suffix,len) but is
+ * filtered by the child-NULL check at read time.  Slot is never
+ * reused.
+ *
+ * Lookup pipeline (per tier):
+ *   1. Broadcast key[0]/key[1] into XMM registers.
+ *   2. SIMD-load prefix_0/prefix_1 (8B for T0/T1, 16B for T2,
+ *      dual 16B for T3 — no AVX2 to keep backend port pressure low).
+ *   3. Dual cmpeq, AND, movemask.
+ *   4. Apply tier-constant tail mask (clears unused-slot bits).
+ *   5. ctz-iterate set bits; for each candidate, load entry's
+ *      [suffix:7][len:1] block as a uint64_t and compare against
+ *      target_word.
+ *   6. On match, verify child != NULL and descend.
+ *
+ * The reader touches only 2 cache lines in the common case: the
+ * header (prefix vectors) plus a single 16B entry.  Tier 3's 32B
+ * prefix vectors share the header cache line(s) with no overflow
+ * because entries always start at offset 64.
  */
-#define FT_COLLAPSED_SCAN_32		0	/* bit 6 = 0 */
-#define FT_COLLAPSED_SCAN_64		1	/* bit 6 = 1 */
-#define FT_COLLAPSED_SCAN_SHIFT		6
-#define FT_COLLAPSED_NR_ENTRIES_MASK	0x3F
 
-#define FT_COLLAPSED_TOMBSTONE		0x80
-#define FT_COLLAPSED_OFFSET_MASK	0x7F
-
-/* Default scan zone size (64B, 1 cache line). */
-#define FT_COLLAPSED_SCAN_ZONE_SIZE	64
-
-/* Maximum scan zone size across all selectors (for stack buffers). */
-#define FT_COLLAPSED_SCAN_ZONE_MAX	64
-
-struct cds_ft_collapsed_node {
-	uint8_t nr_entries;			/* Bits 7-6: scan zone selector.
-						 * Bits 5-0: entry count. */
-	uint8_t data[];				/* Offset array + suffix data (zone 1). */
-};
-
-/*
- * Phase 2+ SoA layout (forward declarations for the tier-tagged
- * pointer encoding now wired up via FT_COL_TIER_MASK).  The struct
- * cds_ft_collapsed_node above will be replaced with a tier-dependent
- * layout in a follow-up; these constants are kept as compile-time
- * forward references so the macro / pointer-helper changes can land
- * incrementally.
- */
+/* Per-tier compile-time constants. */
 #define FT_COL_NR_TIERS			4U
-#define FT_COL_SUFFIX_MAX		7U
-#define FT_COL_ENTRY_SIZE		16U
+#define FT_COL_SUFFIX_MAX		7U	/* per-entry suffix bytes */
+#define FT_COL_ENTRY_SIZE		16U	/* bytes per entry */
 
+/* Tier 0: 64B alloc, 3 entries, 16B header. */
 #define FT_COL_T0_CAPACITY		3U
 #define FT_COL_T0_ALLOC_ORDER		6U
 #define FT_COL_T0_HEADER_SIZE		16U
 #define FT_COL_T0_PREFIX_STRIDE		8U
 
+/* Tier 1: 128B alloc, 7 entries, 16B header. */
 #define FT_COL_T1_CAPACITY		7U
 #define FT_COL_T1_ALLOC_ORDER		7U
 #define FT_COL_T1_HEADER_SIZE		16U
 #define FT_COL_T1_PREFIX_STRIDE		8U
 
+/* Tier 2: 256B alloc, 12 entries, 64B header. */
 #define FT_COL_T2_CAPACITY		12U
 #define FT_COL_T2_ALLOC_ORDER		8U
 #define FT_COL_T2_HEADER_SIZE		64U
 #define FT_COL_T2_PREFIX_STRIDE		16U
 
+/* Tier 3: 512B alloc, 28 entries, 64B header. */
 #define FT_COL_T3_CAPACITY		28U
 #define FT_COL_T3_ALLOC_ORDER		9U
 #define FT_COL_T3_HEADER_SIZE		64U
 #define FT_COL_T3_PREFIX_STRIDE		32U
 
+/* Maximum capacity across all tiers (for stack buffers). */
 #define FT_COL_CAPACITY_MAX		FT_COL_T3_CAPACITY
 
+/*
+ * One collapsed entry — fixed 16-byte record.  Suffix bytes and
+ * length share a uint64_t SWAR word for one-shot verification.
+ */
 struct cds_ft_collapsed_entry {
-	uint8_t suffix[FT_COL_SUFFIX_MAX];
-	uint8_t len;
-	struct cds_ft_inode_flag *child;
+	uint8_t suffix[FT_COL_SUFFIX_MAX];	/* bytes 0..6 — suffix data */
+	uint8_t len;				/* byte  7    — 1..7 (0 = born dead) */
+	struct cds_ft_inode_flag *child;	/* bytes 8..15 — NULL = dead slot */
 } __attribute__((__aligned__(FT_COL_ENTRY_SIZE)));
+
+/*
+ * Collapsed-node base type — opaque outside accessor helpers.  The
+ * actual layout (header size, prefix array width, entry count) is
+ * tier-dependent; tier is recovered from the parent's child pointer
+ * via FT_COL_TIER_MASK.  64-byte alignment ensures pointer bits 0-5
+ * are tag-safe, supporting the tier index in bits 4-5.
+ *
+ * The struct is treated as a base address: accessors compute byte
+ * offsets from it via tier-aware tables.  No direct field access
+ * is performed on it; the placeholder byte exists only so that the
+ * type is a complete struct usable as a typed pointer.
+ */
+struct cds_ft_collapsed_node {
+	uint8_t _placeholder;			/* Anchor; do not access. */
+} __attribute__((__aligned__(64)));
 
 struct cds_ft_bitmap {
 	/*
