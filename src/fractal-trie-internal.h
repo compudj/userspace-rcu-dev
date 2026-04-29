@@ -44,17 +44,41 @@
  *   (ptr & 0b111) == 0b110  →  collapsed subtree node
  *
  * Internal nodes always have bit 0 set; the type index encoding in
- * bits 1-3 is unchanged.  Compressed and collapsed nodes use bits 1-2
- * with bit 0 clear.  External nodes have bits 0-2 clear.
- * Both compressed and collapsed nodes are >= 16-byte aligned
- * (strided allocator minimum order 4), so bits 0-3 are available.
+ * bits 1-3 is unchanged.  Compressed nodes use bits 1-2 with bit 0
+ * clear; bit 3 is unused (16-byte alignment).
+ *
+ * Collapsed nodes are 64-byte aligned (smallest tier is 64B), so
+ * pointer bits 4-5 are also tag-safe.  They carry the tier index:
+ *
+ *   bits 4-5 = collapsed tier (0..3) → capacity 3, 7, 12, 28
+ *
+ * External nodes have bits 0-2 clear (external nodes are 8-byte aligned).
+ * Compressed nodes are >= 16-byte aligned (strided allocator
+ * minimum order 4); bits 0-3 are available.
  */
 #define FT_INTERNAL_BITS	1
 #define FT_INTERNAL_MASK	(1U << 0)
 #define FT_COMPRESSED_MASK	(1U << 1)
 #define FT_COLLAPSED_MASK	((1U << 2) | (1U << 1))	/* 0b110 */
 #define FT_TAG_MASK		(FT_COMPRESSED_MASK | FT_INTERNAL_MASK)	/* 0b011 — for compressed ptr unmasking */
-#define FT_TAG_MASK_WIDE	(FT_COLLAPSED_MASK | FT_INTERNAL_MASK)	/* 0b111 — for collapsed ptr unmasking and type checks */
+#define FT_TAG_MASK_WIDE	(FT_COLLAPSED_MASK | FT_INTERNAL_MASK)	/* 0b111 — collapsed type check (bits 0-2 only) */
+
+/*
+ * Collapsed-node tier: 2 bits in pointer bits 4-5, encoding the
+ * allocation size class and per-node entry capacity.
+ *
+ *   tier 0 → 64B alloc, capacity 3
+ *   tier 1 → 128B alloc, capacity 7
+ *   tier 2 → 256B alloc, capacity 12
+ *   tier 3 → 512B alloc, capacity 28
+ *
+ * The tier is recovered from the collapsed-node child pointer in the
+ * parent, so the in-node header carries no tier or count metadata.
+ */
+#define FT_COL_TIER_SHIFT	4U
+#define FT_COL_TIER_BITS	2U
+#define FT_COL_TIER_MASK	(((1U << FT_COL_TIER_BITS) - 1U) << FT_COL_TIER_SHIFT)	/* 0x30 */
+#define FT_TAG_MASK_COLLAPSED	(FT_TAG_MASK_WIDE | FT_COL_TIER_MASK)			/* 0x37 — for collapsed ptr unmasking */
 
 /*
  * This if followed by a number of bits reserved to represent the child
@@ -517,6 +541,46 @@ struct cds_ft_collapsed_node {
 						 * Bits 5-0: entry count. */
 	uint8_t data[];				/* Offset array + suffix data (zone 1). */
 };
+
+/*
+ * Phase 2+ SoA layout (forward declarations for the tier-tagged
+ * pointer encoding now wired up via FT_COL_TIER_MASK).  The struct
+ * cds_ft_collapsed_node above will be replaced with a tier-dependent
+ * layout in a follow-up; these constants are kept as compile-time
+ * forward references so the macro / pointer-helper changes can land
+ * incrementally.
+ */
+#define FT_COL_NR_TIERS			4U
+#define FT_COL_SUFFIX_MAX		7U
+#define FT_COL_ENTRY_SIZE		16U
+
+#define FT_COL_T0_CAPACITY		3U
+#define FT_COL_T0_ALLOC_ORDER		6U
+#define FT_COL_T0_HEADER_SIZE		16U
+#define FT_COL_T0_PREFIX_STRIDE		8U
+
+#define FT_COL_T1_CAPACITY		7U
+#define FT_COL_T1_ALLOC_ORDER		7U
+#define FT_COL_T1_HEADER_SIZE		16U
+#define FT_COL_T1_PREFIX_STRIDE		8U
+
+#define FT_COL_T2_CAPACITY		12U
+#define FT_COL_T2_ALLOC_ORDER		8U
+#define FT_COL_T2_HEADER_SIZE		64U
+#define FT_COL_T2_PREFIX_STRIDE		16U
+
+#define FT_COL_T3_CAPACITY		28U
+#define FT_COL_T3_ALLOC_ORDER		9U
+#define FT_COL_T3_HEADER_SIZE		64U
+#define FT_COL_T3_PREFIX_STRIDE		32U
+
+#define FT_COL_CAPACITY_MAX		FT_COL_T3_CAPACITY
+
+struct cds_ft_collapsed_entry {
+	uint8_t suffix[FT_COL_SUFFIX_MAX];
+	uint8_t len;
+	struct cds_ft_inode_flag *child;
+} __attribute__((__aligned__(FT_COL_ENTRY_SIZE)));
 
 struct cds_ft_bitmap {
 	/*

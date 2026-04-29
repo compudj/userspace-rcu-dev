@@ -1430,6 +1430,23 @@ struct cds_ft_compressed_node *ft_compressed_node_ptr(
 		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
 }
 
+/*
+ * Recover the tier (0..3) from a collapsed-node tagged pointer.
+ * Tier sits in pointer bits 4-5; collapsed nodes are 64-byte aligned
+ * (smallest tier is 64B) so those bits are tag-safe.
+ *
+ * Phase 1: no caller sets tier bits yet, so this currently returns 0
+ * for every collapsed pointer in the codebase.  The tier helper is
+ * here so that Phase 2+ rewrites can encode and decode it without
+ * further header churn.
+ */
+static inline_lookup
+unsigned int ft_collapsed_tier(struct cds_ft_inode_flag *node)
+{
+	return (unsigned int) (((unsigned long) node) >> FT_COL_TIER_SHIFT)
+			& ((1U << FT_COL_TIER_BITS) - 1U);
+}
+
 static
 struct cds_ft_inode_flag *ft_collapsed_node_flag(
 		struct cds_ft_collapsed_node *node)
@@ -1438,12 +1455,26 @@ struct cds_ft_inode_flag *ft_collapsed_node_flag(
 		(((unsigned long) node) | FT_COLLAPSED_MASK);
 }
 
+/*
+ * Tier-aware variant for use by Phase 2+ allocation / publication
+ * paths.  Encodes the tier index (0..3) into pointer bits 4-5.
+ */
+static inline
+struct cds_ft_inode_flag *ft_collapsed_node_flag_tier(
+		struct cds_ft_collapsed_node *node, unsigned int tier)
+{
+	return (struct cds_ft_inode_flag *)
+		(((unsigned long) node)
+			| FT_COLLAPSED_MASK
+			| ((unsigned long) tier << FT_COL_TIER_SHIFT));
+}
+
 static inline_lookup
 struct cds_ft_collapsed_node *ft_collapsed_node_ptr(
 		struct cds_ft_inode_flag *node)
 {
 	return (struct cds_ft_collapsed_node *)
-		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK_WIDE);
+		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK_COLLAPSED);
 }
 
 /* Skip-compressed pointer helpers. */
