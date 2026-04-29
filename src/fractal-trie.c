@@ -6800,8 +6800,8 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	unsigned int tier = ft_collapsed_tier(node_flag);
+	unsigned int stride = ft_collapsed_stride(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
 	const uint8_t *key = *key_p;
 	unsigned int i = *i_p;
 	unsigned int remaining = key_depth - i;
@@ -6828,7 +6828,7 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 	if (caa_unlikely(target_prefix == 0)) {
 		const uint8_t *p0 = ft_collapsed_prefix_0(col, tier);
 		const uint8_t *p1 = ft_collapsed_prefix_1(col, tier);
-		unsigned int cap = ft_collapsed_capacity(tier);
+		unsigned int cap = ft_collapsed_capacity_stride(tier, stride);
 		unsigned int e;
 
 		candidate_mask = 0;
@@ -6844,21 +6844,14 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 
 	while (candidate_mask) {
 		unsigned int e = (unsigned int) __builtin_ctz(candidate_mask);
-		struct cds_ft_collapsed_entry *entry = &entries[e];
 		struct cds_ft_inode_flag *child;
-		uint64_t subkey;
+		struct cds_ft_inode_flag **child_addr;
 		unsigned int slen;
 
 		candidate_mask &= candidate_mask - 1;
 
-		subkey = ft_collapsed_subkey_load(col, tier, e);
-		slen = ft_collapsed_subkey_unpack_slen(subkey);
-		if (slen == 0 || slen > remaining)
-			continue;
-		if (!ft_collapsed_subkey_match(subkey, key, slen))
-			continue;
-		child = ft_dereference_prefetch(entry->child);
-		if (child == NULL)
+		if (!ft_collapsed_match_candidate(col, tier, stride, e,
+				key, remaining, &slen, &child))
 			continue;
 
 		*key_p = key + slen;
@@ -6868,8 +6861,13 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 				ft_resolve_skip_compressed(child);
 			*node_flag_p = resolved;
 		}
-		if (node_flag_ptr_p)
-			*node_flag_ptr_p = &entry->child;
+		if (node_flag_ptr_p) {
+			if (stride == FT_COL_STRIDE_NARROW)
+				child_addr = &ft_collapsed_entries(col, tier)[e].child;
+			else
+				child_addr = &ft_collapsed_entries_wide(col, tier)[e].child;
+			*node_flag_ptr_p = child_addr;
+		}
 		if (!ft_node_ptr(child)) {
 			*not_found = true;
 			return FT_DESCENT_END;
