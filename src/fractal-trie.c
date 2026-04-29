@@ -17769,66 +17769,57 @@ enum ft_descent_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **node
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	unsigned int i = *i_p;
 	unsigned int tier = ft_collapsed_tier(node_flag);
+	unsigned int stride = ft_collapsed_stride(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	unsigned int remaining = prefix_len - i;
-	struct cds_ft_collapsed_entry *entry;
+	struct ft_col_view view;
 	unsigned int e;
 
-	{
-		uint64_t cur_subkey;
-		unsigned int cur_slen;
-		struct cds_ft_inode_flag *cur_child;
+	ft_for_each_live_collapsed_entry_view_rcu(col, tier, stride, e, view) {
+		unsigned int slen = view.slen, j;
+		bool match;
 
-		ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
-				cur_subkey, cur_slen, cur_child) {
-			unsigned int slen = cur_slen, j;
-			uint8_t suffix[FT_COL_SUFFIX_MAX];
-			bool match;
-
-			memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
-
-			if (slen >= remaining) {
-				/* Suffix covers the rest of the prefix — compare. */
-				match = true;
-				for (j = 0; j < remaining; j++) {
-					if (prefix[i + j] != suffix[j]) {
-						match = false;
-						break;
-					}
-				}
-				if (!match)
-					continue;
-				/* Prefix ends within or at this entry's span. */
-				if (!ft_node_external(cur_child)) {
-					struct cds_ft_metadata *m =
-						cds_ft_item_to_metadata(ft_node_ptr(cur_child));
-					*count_ret = ft_nr_keys_load(m);
-				} else if (ft_node_ptr(cur_child)) {
-					*count_ret = 1;
-				} else {
-					*count_ret = 0;
-				}
-				return FT_DESCENT_END;
-			}
-			/* Suffix is shorter than remaining prefix — check prefix. */
+		if (slen >= remaining) {
+			/* Suffix covers the rest of the prefix — compare. */
 			match = true;
-			for (j = 0; j < slen; j++) {
-				if (prefix[i + j] != suffix[j]) {
+			for (j = 0; j < remaining; j++) {
+				if (prefix[i + j] != view.suffix[j]) {
 					match = false;
 					break;
 				}
 			}
 			if (!match)
 				continue;
-			/* Full suffix match, continue descent into child. */
-			*i_p = i + slen - 1;
-			{
-				struct cds_ft_inode_flag *resolved =
-					ft_resolve_skip_compressed(cur_child);
-				*node_flag_p = resolved;
+			/* Prefix ends within or at this entry's span. */
+			if (!ft_node_external(view.child)) {
+				struct cds_ft_metadata *m =
+					cds_ft_item_to_metadata(ft_node_ptr(view.child));
+				*count_ret = ft_nr_keys_load(m);
+			} else if (ft_node_ptr(view.child)) {
+				*count_ret = 1;
+			} else {
+				*count_ret = 0;
 			}
-			return FT_DESCENT_CONTINUE;
+			return FT_DESCENT_END;
 		}
+		/* Suffix is shorter than remaining prefix — check prefix. */
+		match = true;
+		for (j = 0; j < slen; j++) {
+			if (prefix[i + j] != view.suffix[j]) {
+				match = false;
+				break;
+			}
+		}
+		if (!match)
+			continue;
+		/* Full suffix match, continue descent into child. */
+		*i_p = i + slen - 1;
+		{
+			struct cds_ft_inode_flag *resolved =
+				ft_resolve_skip_compressed(view.child);
+			*node_flag_p = resolved;
+		}
+		return FT_DESCENT_CONTINUE;
 	}
 	*count_ret = 0;
 	return FT_DESCENT_END;
@@ -18013,9 +18004,9 @@ enum ft_descent_action ft_lookup_nth_collapsed(
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	int level = *level_p;
 	unsigned int tier = ft_collapsed_tier(node_flag);
+	unsigned int stride = ft_collapsed_stride(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
-	unsigned int cap = ft_collapsed_capacity(tier);
+	struct ft_col_view view;
 	unsigned int e;
 
 	/*
@@ -18023,35 +18014,22 @@ enum ft_descent_action ft_lookup_nth_collapsed(
 	 * indices, so a single forward pass visits them in ascending
 	 * suffix order — no sort needed.
 	 */
-	for (e = 0; e < cap; e++) {
-		struct cds_ft_collapsed_entry *entry = &entries[e];
-		struct cds_ft_inode_flag *child;
-		uint64_t subkey;
+	ft_for_each_live_collapsed_entry_view_rcu(col, tier, stride, e, view) {
+		struct cds_ft_inode_flag *child = view.child;
 		unsigned long child_keys;
-		unsigned int slen;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
+		unsigned int slen = view.slen;
 
-		subkey = ft_collapsed_subkey_load(col, tier, e);
-		slen = ft_collapsed_subkey_unpack_slen(subkey);
-		if (slen == 0)
-			continue;
-		child = ft_dereference_prefetch(entry->child);
-		if (child == NULL)
-			continue;
 		if (!ft_node_ptr(child))
 			continue;
 		child_keys = ft_child_key_count(child);
 		if (*remaining_p < child_keys) {
 			/* Target is in this entry's subtree. */
-			memcpy(suffix, &subkey, FT_COL_SUFFIX_MAX);
-			{
-				unsigned int k;
+			unsigned int k;
 
-				for (k = 0; k < slen; k++) {
-					ordinal_key[level - 1 + k] = suffix[k];
-					iter_path_node(iter)[level + k] =
-						ft_collapsed_node_flag_tier(col, tier);
-				}
+			for (k = 0; k < slen; k++) {
+				ordinal_key[level - 1 + k] = view.suffix[k];
+				iter_path_node(iter)[level + k] =
+					ft_collapsed_node_flag_tier_stride(col, tier, stride);
 			}
 			if (ft_node_ptr(child) &&
 			    ft_node_skip_compressed(child))
@@ -18305,9 +18283,9 @@ enum ft_descent_action ft_lookup_nth_last_collapsed(
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	int level = *level_p;
 	unsigned int tier = ft_collapsed_tier(node_flag);
+	unsigned int stride = ft_collapsed_stride(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
-	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int cap = ft_collapsed_capacity_stride(tier, stride);
 	unsigned int e;
 
 	/*
@@ -18316,33 +18294,26 @@ enum ft_descent_action ft_lookup_nth_last_collapsed(
 	 * descending suffix order — no sort needed.
 	 */
 	for (e = cap; e-- > 0; ) {
-		struct cds_ft_collapsed_entry *entry = &entries[e];
+		struct ft_col_view view;
 		struct cds_ft_inode_flag *child;
-		uint64_t subkey;
 		unsigned long child_keys;
 		unsigned int slen;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
 
-		subkey = ft_collapsed_subkey_load(col, tier, e);
-		slen = ft_collapsed_subkey_unpack_slen(subkey);
-		if (slen == 0)
+		ft_collapsed_load_entry_view_rcu(col, tier, stride, e, &view);
+		if (view.slen == 0 || view.child == NULL)
 			continue;
-		child = ft_dereference_prefetch(entry->child);
-		if (child == NULL)
-			continue;
+		child = view.child;
+		slen = view.slen;
 		if (!ft_node_ptr(child))
 			continue;
 		child_keys = ft_child_key_count(child);
 		if (*remaining_p < child_keys) {
-			memcpy(suffix, &subkey, FT_COL_SUFFIX_MAX);
-			{
-				unsigned int k;
+			unsigned int k;
 
-				for (k = 0; k < slen; k++) {
-					ordinal_key[level - 1 + k] = suffix[k];
-					iter_path_node(iter)[level + k] =
-						ft_collapsed_node_flag_tier(col, tier);
-				}
+			for (k = 0; k < slen; k++) {
+				ordinal_key[level - 1 + k] = view.suffix[k];
+				iter_path_node(iter)[level + k] =
+					ft_collapsed_node_flag_tier_stride(col, tier, stride);
 			}
 			if (ft_node_ptr(child) &&
 			    ft_node_skip_compressed(child))
@@ -18586,42 +18557,37 @@ enum ft_descent_action ft_rebuild_path_collapsed(
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	unsigned int tier = ft_collapsed_tier(node_flag);
+	unsigned int stride = ft_collapsed_stride(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	unsigned int i = *i_p;
 	unsigned int remaining = key_len - i;
-	struct cds_ft_collapsed_entry *entry;
+	struct ft_col_view view;
 	unsigned int e;
-	uint64_t cur_subkey;
-	unsigned int cur_slen;
-	struct cds_ft_inode_flag *cur_child;
 
-	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
-			cur_subkey, cur_slen, cur_child) {
+	ft_for_each_live_collapsed_entry_view_rcu(col, tier, stride, e, view) {
 		struct cds_ft_inode_flag *child;
-		unsigned int slen = cur_slen, j;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
+		unsigned int slen = view.slen, j;
 		bool match;
 
 		if (slen > remaining)
 			continue;
-		memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
 		match = true;
 		for (j = 0; j < slen; j++) {
 			uint8_t ord = key[i + j];
 
-			if (ord != suffix[j]) {
+			if (ord != view.suffix[j]) {
 				match = false;
 				break;
 			}
 			ordinal_key[i + j] = ord;
 			iter_path_node(iter)[i + j + 1] =
 				(struct cds_ft_inode_flag *)
-				ft_collapsed_node_flag_tier(col, tier);
+				ft_collapsed_node_flag_tier_stride(col, tier, stride);
 		}
 		if (!match)
 			continue;
 		i += slen - 1;
-		child = cur_child;
+		child = view.child;
 		if (!ft_node_ptr(child))
 			return FT_DESCENT_END;
 		child = ft_resolve_skip_compressed(child);
@@ -18753,12 +18719,10 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 {
 	int level = *level_p;
 	unsigned int tier = ft_collapsed_tier(ancestor);
+	unsigned int stride = ft_collapsed_stride(ancestor);
 	struct cds_ft_collapsed_node *col;
-	struct cds_ft_collapsed_entry *entry;
+	struct ft_col_view view;
 	unsigned int e;
-	uint64_t cur_subkey;
-	unsigned int cur_slen;
-	struct cds_ft_inode_flag *cur_child;
 
 	/* Skip intermediate levels (same node at adjacent levels). */
 	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
@@ -18766,15 +18730,11 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 
 	col = ft_collapsed_node_ptr(ancestor);
 
-	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
-			cur_subkey, cur_slen, cur_child) {
-		struct cds_ft_inode_flag *child = cur_child;
-		unsigned int slen = cur_slen;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
+	ft_for_each_live_collapsed_entry_view_rcu(col, tier, stride, e, view) {
+		struct cds_ft_inode_flag *child = view.child;
+		unsigned int slen = view.slen;
 		unsigned long ck;
 		bool is_current;
-
-		memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
 
 		/*
 		 * Check if this is the current entry by comparing
@@ -18786,7 +18746,7 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 			unsigned int cmp = slen;
 
 			for (j = 0; j < cmp; j++) {
-				if (suffix[j] != ordinal_key[level + j]) {
+				if (view.suffix[j] != ordinal_key[level + j]) {
 					is_current = false;
 					break;
 				}
@@ -18806,11 +18766,11 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 			int r = 0;
 
 			for (j = 0; j < cmp; j++) {
-				if (suffix[j] > ordinal_key[level + j]) {
+				if (view.suffix[j] > ordinal_key[level + j]) {
 					r = 1;
 					break;
 				}
-				if (suffix[j] < ordinal_key[level + j]) {
+				if (view.suffix[j] < ordinal_key[level + j]) {
 					r = -1;
 					break;
 				}
@@ -18826,7 +18786,7 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 
 			(*remaining_p)--;
 			for (k = 0; k < slen; k++) {
-				ordinal_key[level + k] = suffix[k];
+				ordinal_key[level + k] = view.suffix[k];
 				if (k > 0)
 					iter_path_node(iter)[level + k + 1] = ancestor;
 			}
@@ -19298,14 +19258,12 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 {
 	int level = *level_p;
 	unsigned int tier = ft_collapsed_tier(ancestor);
+	unsigned int stride = ft_collapsed_stride(ancestor);
 	struct cds_ft_collapsed_node *col;
-	struct cds_ft_collapsed_entry *entry;
+	struct ft_col_view view;
 	struct cds_ft_metadata *col_meta;
 	struct cds_ft_node *a_ext;
 	unsigned int e;
-	uint64_t cur_subkey;
-	unsigned int cur_slen;
-	struct cds_ft_inode_flag *cur_child;
 
 	/* Skip intermediate levels. */
 	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
@@ -19314,14 +19272,10 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 	col = ft_collapsed_node_ptr(ancestor);
 	col_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) col);
 
-	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
-			cur_subkey, cur_slen, cur_child) {
-		struct cds_ft_inode_flag *child = cur_child;
-		unsigned int slen = cur_slen;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
+	ft_for_each_live_collapsed_entry_view_rcu(col, tier, stride, e, view) {
+		struct cds_ft_inode_flag *child = view.child;
+		unsigned int slen = view.slen;
 		unsigned long ck;
-
-		memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
 
 		/* Check if suffix < current key. */
 		{
@@ -19331,11 +19285,11 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 			int r = 0;
 
 			for (j = 0; j < cmp; j++) {
-				if (suffix[j] < ordinal_key[level + j]) {
+				if (view.suffix[j] < ordinal_key[level + j]) {
 					r = -1;
 					break;
 				}
-				if (suffix[j] > ordinal_key[level + j]) {
+				if (view.suffix[j] > ordinal_key[level + j]) {
 					r = 1;
 					break;
 				}
@@ -19351,7 +19305,7 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 
 			(*remaining_p)--;
 			for (k = 0; k < slen; k++) {
-				ordinal_key[level + k] = suffix[k];
+				ordinal_key[level + k] = view.suffix[k];
 				if (k > 0)
 					iter_path_node(iter)[level + k + 1] = ancestor;
 			}
