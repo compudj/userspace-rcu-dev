@@ -2361,28 +2361,47 @@ void ft_collapsed_write_prefix_bytes(struct cds_ft_collapsed_node *col,
  * byte 7.  Pack/unpack via memcpy through a uint8_t[8] staging array
  * to avoid host-endian assumptions.
  */
+/*
+ * Subkey word view: a uint8_t[8] / uint64_t union.  Field-by-field
+ * access via .b[k] is endian-portable (byte at memory offset k is
+ * always the same byte regardless of host endianness); the bit-
+ * position of each byte within .v varies by endianness, but that
+ * is irrelevant to our use because both writer and reader always
+ * pack / unpack through the union, so values compare equal if and
+ * only if the underlying byte arrays do.
+ */
+union ft_collapsed_subkey_word {
+	uint8_t b[8];
+	uint64_t v;
+};
+
 static inline
 uint64_t ft_collapsed_subkey_pack(const uint8_t *suffix,
 		unsigned int slen)
 {
-	uint8_t bytes[8] = { 0 };
-	uint64_t val;
+	union ft_collapsed_subkey_word u = { .v = 0 };
 	unsigned int k;
 
 	for (k = 0; k < slen; k++)
-		bytes[k] = suffix[k];
-	bytes[FT_COL_SUFFIX_MAX] = (uint8_t) slen;
-	memcpy(&val, bytes, sizeof(val));
-	return val;
+		u.b[k] = suffix[k];
+	u.b[FT_COL_SUFFIX_MAX] = (uint8_t) slen;
+	return u.v;
 }
 
 static inline_lookup
 unsigned int ft_collapsed_subkey_unpack_slen(uint64_t val)
 {
-	uint8_t bytes[8];
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	/* LE: byte 7 sits at the high 8 bits of the uint64_t. */
+	return (unsigned int) (val >> (FT_COL_SUFFIX_MAX * 8));
+#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	/* BE: byte 7 sits at the low 8 bits of the uint64_t. */
+	return (unsigned int) (val & 0xFFU);
+#else
+	union ft_collapsed_subkey_word u = { .v = val };
 
-	memcpy(bytes, &val, sizeof(val));
-	return (unsigned int) bytes[FT_COL_SUFFIX_MAX];
+	return (unsigned int) u.b[FT_COL_SUFFIX_MAX];
+#endif
 }
 
 /*
@@ -2393,7 +2412,7 @@ unsigned int ft_collapsed_subkey_unpack_slen(uint64_t val)
  * subkey (bytes 0..slen-1 from the source, bytes slen..6 zero, byte 7
  * holding slen), then a single uint64_t equality check covers all
  * suffix bytes plus the implicit slen byte at position 7.  The
- * packing is endian-portable via memcpy through uint8_t[8], so the
+ * packing is endian-portable via the subkey-word union, so the
  * comparison works on any host endianness as long as both sides use
  * the same packing function.
  */
@@ -2404,12 +2423,11 @@ bool ft_collapsed_subkey_match(uint64_t val, const uint8_t *key,
 #if (CAA_BITS_PER_LONG >= 64)
 	return val == ft_collapsed_subkey_pack(key, slen);
 #else
-	uint8_t bytes[8];
+	union ft_collapsed_subkey_word u = { .v = val };
 	unsigned int k;
 
-	memcpy(bytes, &val, sizeof(val));
 	for (k = 0; k < slen; k++) {
-		if (bytes[k] != key[k])
+		if (u.b[k] != key[k])
 			return false;
 	}
 	return true;
@@ -2473,20 +2491,18 @@ uint64_t ft_collapsed_subkey_load(struct cds_ft_collapsed_node *col,
 	}
 #else
 	{
-		uint8_t bytes[8] = { 0 };
-		uint64_t val;
+		union ft_collapsed_subkey_word u = { .v = 0 };
 		unsigned int slen, k;
 
 		slen = uatomic_load(&entries[e].len, CMM_ACQUIRE);
-		bytes[FT_COL_SUFFIX_MAX] = (uint8_t) slen;
+		u.b[FT_COL_SUFFIX_MAX] = (uint8_t) slen;
 		/*
 		 * Acquire on len pairs with writer's release; suffix bytes
 		 * are now safe to read via plain loads.
 		 */
 		for (k = 0; k < slen && k < FT_COL_SUFFIX_MAX; k++)
-			bytes[k] = entries[e].suffix[k];
-		memcpy(&val, bytes, sizeof(val));
-		return val;
+			u.b[k] = entries[e].suffix[k];
+		return u.v;
 	}
 #endif
 }
