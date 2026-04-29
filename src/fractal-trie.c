@@ -2318,18 +2318,11 @@ bool ft_collapsed_entry_dead(struct cds_ft_collapsed_entry *entry)
 }
 
 /*
- * Write the SIMD prefix-cache bytes for a slot.  Entries always have
- * slen >= 2 (enforced by ft_collapsed_min_slen at build time), so
- * suffix[0] and suffix[1] are always valid.  The reader's SIMD path
- * loads prefix_0 and prefix_1 as fixed-stride byte arrays and
- * cmpeq's them against the target key's first two bytes; only the
- * candidates that match are then SWAR-verified against the full
- * suffix.
- *
- * Order:  prefix bytes are written before the entry's child pointer
- * is release-stored.  The reader's acquire load on entry->child
- * happens-after these writes, so when child is observed non-NULL,
- * the prefix bytes (and suffix/len) are already visible.
+ * Write the SIMD prefix-cache bytes for a slot.  The prefix arrays
+ * are a best-effort fast-path filter; the per-entry (suffix, len)
+ * block is the source of truth.  Stores are relaxed and may be
+ * observed torn by SIMD readers — verify on the atomically-published
+ * subkey catches any false acceptance.
  */
 static inline
 void ft_collapsed_write_prefix_bytes(struct cds_ft_collapsed_node *col,
@@ -2344,9 +2337,153 @@ void ft_collapsed_write_prefix_bytes(struct cds_ft_collapsed_node *col,
 }
 
 /*
- * Publish a freshly-written entry by release-storing its child
- * pointer.  Suffix bytes, length, and prefix-cache bytes must be
- * written before this call.  Pairs with the reader's acquire load.
+ * Subkey publication primitives.  The per-entry (suffix[7], len) block
+ * occupies the first 8 bytes of a 16-byte aligned cds_ft_collapsed_entry
+ * and is the source of truth for the subkey.
+ *
+ * 64-bit:  suffix + len fit in one 8-byte aligned word.  Writer does
+ *          a single relaxed atomic 8-byte store; reader does a single
+ *          relaxed atomic 8-byte load.  The slen=0 → slen!=0 transition
+ *          is the safety property: slot can't expose a matchable
+ *          intermediate state because the 8-byte aligned write is
+ *          atomic.  No release-acquire pair needed on the subkey
+ *          itself — rcu_dereference on the child pointer is the only
+ *          synchronization required (it pairs with writer's release on
+ *          child to publish liveness).
+ *
+ * 32-bit:  suffix + len span two 4-byte words.  Writer plain-stores
+ *          the suffix bytes, then release-stores len to publish the
+ *          subkey across word boundaries.  Reader acquire-loads len
+ *          first; subsequent plain reads of suffix are synchronized
+ *          via the len release-acquire pair.
+ *
+ * Endian-portability: the in-memory layout is suffix[0..6] then len at
+ * byte 7.  Pack/unpack via memcpy through a uint8_t[8] staging array
+ * to avoid host-endian assumptions.
+ */
+static inline
+uint64_t ft_collapsed_subkey_pack(const uint8_t *suffix,
+		unsigned int slen)
+{
+	uint8_t bytes[8] = { 0 };
+	uint64_t val;
+	unsigned int k;
+
+	for (k = 0; k < slen; k++)
+		bytes[k] = suffix[k];
+	bytes[FT_COL_SUFFIX_MAX] = (uint8_t) slen;
+	memcpy(&val, bytes, sizeof(val));
+	return val;
+}
+
+static inline_lookup
+unsigned int ft_collapsed_subkey_unpack_slen(uint64_t val)
+{
+	uint8_t bytes[8];
+
+	memcpy(bytes, &val, sizeof(val));
+	return (unsigned int) bytes[FT_COL_SUFFIX_MAX];
+}
+
+/*
+ * Compare an unpacked subkey value's suffix bytes [0..slen-1] against
+ * @key bytes [0..slen-1].  Returns true on full match.
+ */
+static inline_lookup
+bool ft_collapsed_subkey_match(uint64_t val, const uint8_t *key,
+		unsigned int slen)
+{
+	uint8_t bytes[8];
+	unsigned int k;
+
+	memcpy(bytes, &val, sizeof(val));
+	for (k = 0; k < slen; k++) {
+		if (bytes[k] != key[k])
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Publish the subkey of a freshly-written entry.  Caller must already
+ * have written the prefix-cache bytes; readers will verify against the
+ * atomically-published subkey, catching any torn-prefix observation.
+ *
+ * Slots are append-only-no-reuse; the slot transitions exactly once
+ * from slen=0 (cannot match) to slen=N (can match).
+ *
+ * The child pointer is published separately by ft_collapsed_publish_entry.
+ */
+static inline
+void ft_collapsed_publish_subkey(struct cds_ft_collapsed_node *col,
+		unsigned int tier, unsigned int e,
+		const uint8_t *suffix, unsigned int slen)
+{
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+
+#if (CAA_BITS_PER_LONG >= 64)
+	{
+		uint64_t val = ft_collapsed_subkey_pack(suffix, slen);
+
+		uatomic_store((uint64_t *) &entries[e], val, CMM_RELAXED);
+	}
+#else
+	{
+		unsigned int k;
+
+		for (k = 0; k < slen; k++)
+			entries[e].suffix[k] = suffix[k];
+		uatomic_store(&entries[e].len, (uint8_t) slen, CMM_RELEASE);
+	}
+#endif
+}
+
+/*
+ * Read-side subkey load.  Pairs with ft_collapsed_publish_subkey.
+ * Returns a packed uint64_t with bytes 0..6 = suffix and byte 7 = len
+ * regardless of host endianness.  Use ft_collapsed_subkey_unpack_slen
+ * and ft_collapsed_subkey_match to interpret.
+ */
+static inline_lookup
+uint64_t ft_collapsed_subkey_load(struct cds_ft_collapsed_node *col,
+		unsigned int tier, unsigned int e)
+{
+	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
+
+#if (CAA_BITS_PER_LONG >= 64)
+	{
+		/*
+		 * Relaxed atomic 8-byte load.  No release-acquire pair on
+		 * the subkey — the rcu_dereference on the child pointer
+		 * provides the only synchronization needed.
+		 */
+		return uatomic_load((uint64_t *) &entries[e], CMM_RELAXED);
+	}
+#else
+	{
+		uint8_t bytes[8] = { 0 };
+		uint64_t val;
+		unsigned int slen, k;
+
+		slen = uatomic_load(&entries[e].len, CMM_ACQUIRE);
+		bytes[FT_COL_SUFFIX_MAX] = (uint8_t) slen;
+		/*
+		 * Acquire on len pairs with writer's release; suffix bytes
+		 * are now safe to read via plain loads.
+		 */
+		for (k = 0; k < slen && k < FT_COL_SUFFIX_MAX; k++)
+			bytes[k] = entries[e].suffix[k];
+		memcpy(&val, bytes, sizeof(val));
+		return val;
+	}
+#endif
+}
+
+/*
+ * Publish a freshly-written entry as live by release-storing its child
+ * pointer.  Subkey (via ft_collapsed_publish_subkey) and prefix bytes
+ * must be written before this call.  Pairs with the reader's
+ * rcu_dereference on entry->child.
  */
 static inline
 void ft_collapsed_publish_entry(struct cds_ft_collapsed_node *col,
@@ -2394,6 +2531,30 @@ void ft_collapsed_kill_entry(struct cds_ft_collapsed_node *col,
 	for ((_e) = 0; (_e) < ft_collapsed_capacity(_tier); (_e)++)	\
 		if (((_entry) = &ft_collapsed_entries((_col), (_tier))[(_e)]),	\
 		    ft_collapsed_entry_dead((_entry)))			\
+			continue;					\
+		else
+
+/*
+ * Reader-side variant: per slot, atomically load the subkey
+ * (relaxed 8-byte load on 64-bit; acquire on len + plain suffix
+ * reads on 32-bit), filter unpublished slots (slen == 0), and
+ * rcu_dereference the child pointer for liveness.  The body sees
+ * the slot's atomic snapshot via @subkey (uint64_t), @slen
+ * (unsigned int), and @child (live pointer).
+ *
+ * Body must NOT re-read @entry->suffix / @entry->len / @entry->child
+ * — those plain accesses would defeat the new contract's direct
+ * subkey synchronization.  Use ft_collapsed_subkey_unpack_slen on
+ * @subkey, and memcpy(buf, &@subkey, FT_COL_SUFFIX_MAX) to obtain
+ * suffix bytes for byte-by-byte comparisons.
+ */
+#define ft_for_each_live_collapsed_entry_rcu(_col, _tier, _e, _entry, _subkey, _slen, _child) \
+	for ((_e) = 0; (_e) < ft_collapsed_capacity(_tier); (_e)++)	\
+		if (((_entry) = &ft_collapsed_entries((_col), (_tier))[(_e)]),	\
+		    ((_subkey) = ft_collapsed_subkey_load((_col), (_tier), (_e))),	\
+		    ((_slen) = ft_collapsed_subkey_unpack_slen(_subkey)),	\
+		    ((_child) = ft_dereference_prefetch((_entry)->child)),	\
+		    (_slen) == 0 || (_child) == NULL)			\
 			continue;					\
 		else
 
@@ -6142,57 +6303,65 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 
 	/*
 	 * Compose the target's first two bytes into a 16-bit prefix.
-	 * The {0x00, 0x00} case is special-cased: under the strict
-	 * sort invariant, only slot 0 can hold a \0\0-prefix entry,
-	 * so we bypass SIMD entirely (uninitialized slots also read
-	 * as zero, which would otherwise generate false positives).
+	 * The {0x00, 0x00} case takes a scalar bypass: zero-init memory
+	 * (unwritten slots) reads as (0,0) in the prefix arrays, which
+	 * would saturate the SIMD candidate mask with ghost matches.
+	 * Sort invariant places live (0,0)-prefix entries contiguously
+	 * starting at slot 0; the bypass walks until the first slot
+	 * with a non-zero prefix byte (or capacity), building a
+	 * candidate mask that the unified verify loop processes.
 	 *
-	 * For all other targets, the SIMD prefix scan returns a
+	 * For non-(0,0) targets the SIMD prefix scan returns a
 	 * candidate mask whose set bits identify slots whose
-	 * prefix_0/prefix_1 bytes both match the target.  Padding
-	 * bytes are zero-init'd; against a non-zero target lane,
-	 * they cannot generate spurious matches, so no per-tier
-	 * dynamic tail mask is needed (T3 alone uses a static
-	 * 0x0FFFFFFF mask, applied inside the helper).
+	 * prefix_0/prefix_1 bytes both match the target.  Prefix
+	 * stores are relaxed; the verify on the atomically-published
+	 * subkey (full bytes 0..slen-1) is the source of truth and
+	 * catches any torn-prefix false acceptance.
 	 */
 	target_prefix = (uint16_t) key[0] | ((uint16_t) key[1] << 8);
-	if (caa_unlikely(target_prefix == 0))
-		candidate_mask = 1U;	/* slot 0 only */
-	else
+	if (caa_unlikely(target_prefix == 0)) {
+		const uint8_t *p0 = ft_collapsed_prefix_0(col, tier);
+		const uint8_t *p1 = ft_collapsed_prefix_1(col, tier);
+		unsigned int cap = ft_collapsed_capacity(tier);
+		unsigned int e;
+
+		candidate_mask = 0;
+		for (e = 0; e < cap; e++) {
+			if (p0[e] != 0 || p1[e] != 0)
+				break;
+			candidate_mask |= 1U << e;
+		}
+	} else {
 		candidate_mask = ft_collapsed_simd_match(col, tier,
 				key[0], key[1]);
+	}
 
 	/*
-	 * Iterate set bits in the candidate mask.  For each candidate
-	 * slot, acquire-load child to filter dead/uninitialized
-	 * slots, then verify the full suffix against the remaining
-	 * key.
+	 * Iterate set bits in the candidate mask.  For each candidate:
+	 * (1) load the subkey (atomic on 64-bit; acquire on len then
+	 *     plain suffix reads on 32-bit) — the source of truth;
+	 * (2) skip if slen=0 (slot unwritten or unpublished);
+	 * (3) verify suffix bytes 0..slen-1 against the full target;
+	 * (4) rcu_dereference child for liveness, skip if NULL.
 	 */
 	while (candidate_mask) {
 		unsigned int e = (unsigned int) __builtin_ctz(candidate_mask);
 		struct cds_ft_collapsed_entry *entry = &entries[e];
 		struct cds_ft_inode_flag *child;
+		uint64_t subkey;
 		unsigned int slen;
-		bool match;
 
 		candidate_mask &= candidate_mask - 1;
 
-		child = ft_dereference_acquire_prefetch(entry->child);
+		subkey = ft_collapsed_subkey_load(col, tier, e);
+		slen = ft_collapsed_subkey_unpack_slen(subkey);
+		if (slen == 0 || slen > remaining_key)
+			continue;
+		if (!ft_collapsed_subkey_match(subkey, key, slen))
+			continue;
+		child = ft_dereference_prefetch(entry->child);
 		if (child == NULL)
 			continue;
-		slen = entry->len;
-		if (slen > remaining_key)
-			continue;
-		/*
-		 * Bytes 0 and 1 already match (via prefix-cache or \0\0
-		 * bypass).  Verify the remaining slen-2 suffix bytes.
-		 */
-		if (slen > 2) {
-			match = (ft_key_cmp_ordinals(key + 2, entry->suffix + 2,
-					slen - 2, slen - 2, false, NULL) == 0);
-			if (!match)
-				continue;
-		}
 
 		/* Match found. Advance past the suffix. */
 		key += slen;
@@ -6352,34 +6521,49 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 		return FT_DESCENT_END;
 	}
 
+	/*
+	 * (0,0) bypass walks slots [0..first non-zero prefix byte) since
+	 * sort invariant + zero-init unwritten slots would otherwise
+	 * saturate the SIMD candidate mask.  Non-(0,0) targets use the
+	 * SIMD prefilter directly.  Verify on the atomically-published
+	 * subkey is the source of truth; SIMD pre-filter is best-effort.
+	 */
 	target_prefix = (uint16_t) key[0] | ((uint16_t) key[1] << 8);
-	if (caa_unlikely(target_prefix == 0))
-		candidate_mask = 1U;	/* slot 0 only under sort invariant */
-	else
+	if (caa_unlikely(target_prefix == 0)) {
+		const uint8_t *p0 = ft_collapsed_prefix_0(col, tier);
+		const uint8_t *p1 = ft_collapsed_prefix_1(col, tier);
+		unsigned int cap = ft_collapsed_capacity(tier);
+		unsigned int e;
+
+		candidate_mask = 0;
+		for (e = 0; e < cap; e++) {
+			if (p0[e] != 0 || p1[e] != 0)
+				break;
+			candidate_mask |= 1U << e;
+		}
+	} else {
 		candidate_mask = ft_collapsed_simd_match(col, tier,
 				key[0], key[1]);
+	}
 
 	while (candidate_mask) {
 		unsigned int e = (unsigned int) __builtin_ctz(candidate_mask);
 		struct cds_ft_collapsed_entry *entry = &entries[e];
 		struct cds_ft_inode_flag *child;
+		uint64_t subkey;
 		unsigned int slen;
-		bool match;
 
 		candidate_mask &= candidate_mask - 1;
 
-		child = ft_dereference_acquire_prefetch(entry->child);
+		subkey = ft_collapsed_subkey_load(col, tier, e);
+		slen = ft_collapsed_subkey_unpack_slen(subkey);
+		if (slen == 0 || slen > remaining)
+			continue;
+		if (!ft_collapsed_subkey_match(subkey, key, slen))
+			continue;
+		child = ft_dereference_prefetch(entry->child);
 		if (child == NULL)
 			continue;
-		slen = entry->len;
-		if (slen > remaining)
-			continue;
-		if (slen > 2) {
-			match = (ft_key_cmp_ordinals(key + 2, entry->suffix + 2,
-					slen - 2, slen - 2, false, NULL) == 0);
-			if (!match)
-				continue;
-		}
 
 		*key_p = key + slen;
 		*i_p = i + slen - 1;
@@ -6995,33 +7179,42 @@ int ft_collapsed_find_nearest(
 		unsigned int tier,
 		unsigned int ref_entry,
 		enum ft_direction dir,
-		struct cds_ft_inode_flag **best_child)
+		struct cds_ft_inode_flag **best_child,
+		uint64_t *best_subkey_out,
+		unsigned int *best_slen_out)
 {
 	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
-	uint8_t *ref_suffix = ft_collapsed_suffix(&entries[ref_entry]);
-	unsigned int ref_slen = ft_collapsed_suffix_len(&entries[ref_entry]);
+	uint64_t ref_subkey = ft_collapsed_subkey_load(col, tier, ref_entry);
+	unsigned int ref_slen = ft_collapsed_subkey_unpack_slen(ref_subkey);
+	uint8_t ref_suffix[FT_COL_SUFFIX_MAX];
 	unsigned int cap = ft_collapsed_capacity(tier);
 	int best = -1;
-	struct cds_ft_collapsed_entry *best_entry = NULL;
+	uint64_t best_subkey = 0;
+	unsigned int best_slen = 0;
 	struct cds_ft_inode_flag *saved_best_child = NULL;
 	unsigned int e;
 
+	memcpy(ref_suffix, &ref_subkey, FT_COL_SUFFIX_MAX);
 	for (e = 0; e < cap; e++) {
 		struct cds_ft_collapsed_entry *entry = &entries[e];
 		struct cds_ft_inode_flag *child;
-		uint8_t *suffix;
+		uint64_t subkey;
 		unsigned int slen, mc;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		int r;
 
 		if (e == ref_entry)
 			continue;
-		child = ft_dereference_acquire(entry->child);
+		subkey = ft_collapsed_subkey_load(col, tier, e);
+		slen = ft_collapsed_subkey_unpack_slen(subkey);
+		if (slen == 0)
+			continue;
+		child = ft_dereference_prefetch(entry->child);
 		if (child == NULL)
 			continue;
 		if (!ft_node_ptr(child))
 			continue;
-		suffix = ft_collapsed_suffix(entry);
-		slen = ft_collapsed_suffix_len(entry);
+		memcpy(suffix, &subkey, FT_COL_SUFFIX_MAX);
 
 		mc = slen < ref_slen ? slen : ref_slen;
 		r = ft_key_cmp_ordinals(suffix, ref_suffix, mc, mc, true, NULL);
@@ -7032,25 +7225,35 @@ int ft_collapsed_find_nearest(
 		    (dir == FT_LEFT && r < 0)) {
 			if (best < 0) {
 				best = (int)e;
-				best_entry = entry;
+				best_subkey = subkey;
+				best_slen = slen;
 				saved_best_child = child;
 			} else {
-				uint8_t *bs = ft_collapsed_suffix(best_entry);
-				unsigned int bl = ft_collapsed_suffix_len(best_entry);
+				uint8_t bs[FT_COL_SUFFIX_MAX];
+				unsigned int bl = best_slen;
 				unsigned int mc2 = bl < slen ? bl : slen;
-				int r2 = ft_key_cmp_ordinals(suffix, bs, mc2, mc2, true, NULL);
+				int r2;
+
+				memcpy(bs, &best_subkey, FT_COL_SUFFIX_MAX);
+				r2 = ft_key_cmp_ordinals(suffix, bs, mc2, mc2, true, NULL);
 
 				if ((dir == FT_RIGHT && (r2 < 0 || (r2 == 0 && slen < bl))) ||
 				    (dir == FT_LEFT && (r2 > 0 || (r2 == 0 && slen > bl)))) {
 					best = (int)e;
-					best_entry = entry;
+					best_subkey = subkey;
+					best_slen = slen;
 					saved_best_child = child;
 				}
 			}
 		}
 	}
-	if (best >= 0)
+	if (best >= 0) {
 		*best_child = saved_best_child;
+		if (best_subkey_out)
+			*best_subkey_out = best_subkey;
+		if (best_slen_out)
+			*best_slen_out = best_slen;
+	}
 	return best;
 }
 #endif /* FEATURE_FT_COLLAPSE */
@@ -7283,18 +7486,23 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 	unsigned int remaining = key_depth - level;
 	unsigned int e;
 	struct cds_ft_collapsed_entry *entry;
+	uint64_t cur_subkey;
+	unsigned int cur_slen;
+	struct cds_ft_inode_flag *cur_child;
 	int best_match = -1;	/* index of best directional match */
-	struct cds_ft_collapsed_entry *best_match_entry = NULL;
+	uint64_t best_match_subkey = 0;
+	unsigned int best_match_slen = 0;
+	struct cds_ft_inode_flag *best_match_child = NULL;
 
-	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
-		unsigned int slen, cmp;
-		uint8_t *suffix;
+	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
+			cur_subkey, cur_slen, cur_child) {
+		unsigned int slen = cur_slen, cmp;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		const uint8_t *cmp_key;
 		uint8_t last_key_buf[FT_MAX_KEY_LEN];
 		int cmp_result;
 
-		slen = ft_collapsed_suffix_len(entry);
-		suffix = ft_collapsed_suffix(entry);
+		memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
 		cmp = slen < remaining ? slen : remaining;
 
 		/* Build contiguous comparison key for this limit mode. */
@@ -7351,7 +7559,7 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 				 */
 				if (slen == 1)
 					iter_path_node(iter)[level - 1] = node_flag;
-				node_flag = ft_dereference_acquire_prefetch(entry->child);
+				node_flag = cur_child;
 				if (!ft_node_ptr(node_flag)) {
 					*node_flag_p = node_flag;
 					*level_p = level;
@@ -7384,35 +7592,49 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 		if ((mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT) && cmp_result < 0) {
 			if (best_match < 0) {
 				best_match = (int)e;
-				best_match_entry = entry;
+				best_match_subkey = cur_subkey;
+				best_match_slen = slen;
+				best_match_child = cur_child;
 			} else {
 				/* Keep the smallest. */
-				uint8_t *bs = ft_collapsed_suffix(best_match_entry);
-				unsigned int bl = ft_collapsed_suffix_len(best_match_entry);
+				uint8_t bs[FT_COL_SUFFIX_MAX];
+				unsigned int bl = best_match_slen;
 				unsigned int mc = bl < slen ? bl : slen;
-				int r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
+				int r;
+
+				memcpy(bs, &best_match_subkey, FT_COL_SUFFIX_MAX);
+				r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
 							true, NULL);
 
 				if (r < 0 || (r == 0 && slen < bl)) {
 					best_match = (int)e;
-					best_match_entry = entry;
+					best_match_subkey = cur_subkey;
+					best_match_slen = slen;
+					best_match_child = cur_child;
 				}
 			}
 		} else if ((mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) && cmp_result > 0) {
 			if (best_match < 0) {
 				best_match = (int)e;
-				best_match_entry = entry;
+				best_match_subkey = cur_subkey;
+				best_match_slen = slen;
+				best_match_child = cur_child;
 			} else {
 				/* Keep the largest. */
-				uint8_t *bs = ft_collapsed_suffix(best_match_entry);
-				unsigned int bl = ft_collapsed_suffix_len(best_match_entry);
+				uint8_t bs[FT_COL_SUFFIX_MAX];
+				unsigned int bl = best_match_slen;
 				unsigned int mc = bl < slen ? bl : slen;
-				int r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
+				int r;
+
+				memcpy(bs, &best_match_subkey, FT_COL_SUFFIX_MAX);
+				r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
 							true, NULL);
 
 				if (r > 0 || (r == 0 && slen > bl)) {
 					best_match = (int)e;
-					best_match_entry = entry;
+					best_match_subkey = cur_subkey;
+					best_match_slen = slen;
+					best_match_child = cur_child;
 				}
 			}
 		}
@@ -7421,10 +7643,11 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 
 	if (best_match >= 0) {
 		/* Descend into the best directional match. */
-		unsigned int slen = ft_collapsed_suffix_len(best_match_entry);
-		uint8_t *suffix = ft_collapsed_suffix(best_match_entry);
+		unsigned int slen = best_match_slen;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		unsigned int k;
 
+		memcpy(suffix, &best_match_subkey, FT_COL_SUFFIX_MAX);
 		for (k = 0; k < slen; k++) {
 			ordinal_key[level - 1 + k] = suffix[k];
 			iter_path_node(iter)[level + k] = node_flag;
@@ -7433,7 +7656,7 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 		assert(level < (int) max_tree_depth);
 		if (slen == 1)
 			iter_path_node(iter)[level - 1] = node_flag;
-		node_flag = ft_dereference_acquire_prefetch(best_match_entry->child);
+		node_flag = best_match_child;
 		if (!ft_node_ptr(node_flag)) {
 			*node_flag_p = node_flag;
 			*level_p = level;
@@ -7588,11 +7811,15 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
-	unsigned int cap = ft_collapsed_capacity(tier);
 	ssize_t level = *level_p;
 	unsigned int best, e;
-	struct cds_ft_collapsed_entry *best_entry = NULL;
+	uint64_t best_subkey = 0;
+	unsigned int best_slen = 0;
 	struct cds_ft_inode_flag *best_child;
+	struct cds_ft_collapsed_entry *entry;
+	uint64_t cur_subkey;
+	unsigned int cur_slen;
+	struct cds_ft_inode_flag *cur_child;
 
 	if (dir == FT_LEFTMOST) {
 		struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
@@ -7609,52 +7836,55 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 	 * Find the min/max entry by suffix and descend.
 	 *
 	 * Race-free pointer selection: each candidate entry is
-	 * filtered by child != NULL at scan time, and we SAVE the
-	 * acquire-loaded child pointer (@best_child) alongside the
-	 * winning @best_entry so the descent uses the same pointer
-	 * the scan validated.  No re-read of entry->child later.
+	 * filtered by slen != 0 (subkey published) and child != NULL
+	 * (rcu_dereference) at scan time; we save the validated
+	 * child pointer alongside the winning subkey so descent uses
+	 * the snapshotted values.  No re-read of entry data later.
 	 */
 	best = UINT_MAX;
 	best_child = NULL;
 
-	for (e = 0; e < cap; e++) {
-		struct cds_ft_collapsed_entry *entry = &entries[e];
-		struct cds_ft_inode_flag *child;
-
-		child = ft_dereference_acquire(entry->child);
-		if (child == NULL)
-			continue;
-		if (!ft_node_ptr(child))
+	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
+			cur_subkey, cur_slen, cur_child) {
+		if (!ft_node_ptr(cur_child))
 			continue;
 		if (best == UINT_MAX) {
 			best = e;
-			best_entry = entry;
-			best_child = child;
+			best_subkey = cur_subkey;
+			best_slen = cur_slen;
+			best_child = cur_child;
 			continue;
 		}
 		{
-			uint8_t *sa = ft_collapsed_suffix(best_entry);
-			unsigned int la = ft_collapsed_suffix_len(best_entry);
-			uint8_t *sb = ft_collapsed_suffix(entry);
-			unsigned int lb = ft_collapsed_suffix_len(entry);
+			uint8_t sa[FT_COL_SUFFIX_MAX];
+			unsigned int la = best_slen;
+			uint8_t sb[FT_COL_SUFFIX_MAX];
+			unsigned int lb = cur_slen;
 			unsigned int mc = la < lb ? la : lb;
-			int r = memcmp(sb, sa, mc);
+			int r;
+
+			memcpy(sa, &best_subkey, FT_COL_SUFFIX_MAX);
+			memcpy(sb, &cur_subkey, FT_COL_SUFFIX_MAX);
+			r = memcmp(sb, sa, mc);
 
 			if (dir == FT_LEFTMOST) {
 				if (r < 0 || (r == 0 && lb < la)) {
 					best = e;
-					best_entry = entry;
-					best_child = child;
+					best_subkey = cur_subkey;
+					best_slen = cur_slen;
+					best_child = cur_child;
 				}
 			} else {
 				if (r > 0 || (r == 0 && lb > la)) {
 					best = e;
-					best_entry = entry;
-					best_child = child;
+					best_subkey = cur_subkey;
+					best_slen = cur_slen;
+					best_child = cur_child;
 				}
 			}
 		}
 	}
+	(void) entries;
 	if (best == UINT_MAX) {
 		/*
 		 * Transiently empty collapsed: a racing writer's
@@ -7676,10 +7906,11 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 		return FT_DESCENT_GOING_UP;
 	}
 	{
-		unsigned int slen = ft_collapsed_suffix_len(best_entry);
-		uint8_t *suffix = ft_collapsed_suffix(best_entry);
+		unsigned int slen = best_slen;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		unsigned int k;
 
+		memcpy(suffix, &best_subkey, FT_COL_SUFFIX_MAX);
 		for (k = 0; k < slen; k++) {
 			ordinal_key[level - 1 + k] = suffix[k];
 			iter_path_node(iter)[level + k] = node_flag;
@@ -7767,23 +7998,25 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 	suffix_base = entry_depth;
 
 	/*
-	 * Find the current entry by suffix match.  Don't skip
-	 * dead entries: the (suffix,len) pair is immutable once
-	 * written, so a concurrent delete (child=NULL) can leave a
-	 * dead slot whose suffix still matches the path the downward
-	 * walk recorded.  We need the slot position to drive the
-	 * sibling search regardless of liveness.
+	 * Find the current entry by suffix match.  Don't filter dead
+	 * entries: the (suffix,len) pair is immutable once published,
+	 * so a concurrent delete (child=NULL) can leave a dead slot
+	 * whose suffix still matches the path the downward walk
+	 * recorded.  We need the slot position to drive the sibling
+	 * search regardless of liveness.  Filter only on slen==0
+	 * (unpublished slot).
 	 */
 	for (e = 0; e < cap; e++) {
-		struct cds_ft_collapsed_entry *entry = &entries[e];
-		uint8_t *suffix;
+		uint64_t subkey;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		unsigned int slen, j2;
 		bool match2;
 
-		slen = ft_collapsed_suffix_len(entry);
+		subkey = ft_collapsed_subkey_load(col, tier, e);
+		slen = ft_collapsed_subkey_unpack_slen(subkey);
 		if (slen == 0)
-			continue;	/* born-dead slot */
-		suffix = ft_collapsed_suffix(entry);
+			continue;
+		memcpy(suffix, &subkey, FT_COL_SUFFIX_MAX);
 		match2 = true;
 		for (j2 = 0; j2 < slen; j2++) {
 			if (suffix[j2] != ordinal_key[suffix_base + j2]) {
@@ -7812,7 +8045,7 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 	 */
 	if (level > (ssize_t)(suffix_base + cur_slen)) {
 		struct cds_ft_inode_flag *child_flag =
-			ft_dereference_acquire(entries[current_entry].child);
+			ft_dereference_prefetch(entries[current_entry].child);
 
 		child_flag = ft_resolve_skip_compressed(child_flag);
 		if (ft_node_ptr(child_flag) && ft_node_internal(child_flag)) {
@@ -7846,30 +8079,36 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 	 * re-read window can return NULL while the scan-time check
 	 * observed live.
 	 */
-	best = ft_collapsed_find_nearest(col, tier,
-		(unsigned) current_entry, dir, &best_child);
+	{
+		uint64_t best_subkey;
+		unsigned int best_slen;
 
-	if (best >= 0) {
-		struct cds_ft_collapsed_entry *best_entry = &entries[best];
-		unsigned int slen = ft_collapsed_suffix_len(best_entry);
-		uint8_t *suffix = ft_collapsed_suffix(best_entry);
-		struct cds_ft_inode_flag *node_flag;
-		unsigned int k;
+		best = ft_collapsed_find_nearest(col, tier,
+			(unsigned) current_entry, dir, &best_child,
+			&best_subkey, &best_slen);
 
-		for (k = 0; k < slen; k++) {
-			ordinal_key[suffix_base + k] = suffix[k];
-			if (k > 0)
-				iter_path_node(iter)[suffix_base + k] =
-					iter_path_node(iter)[level - 1];
+		if (best >= 0) {
+			unsigned int slen = best_slen;
+			uint8_t suffix[FT_COL_SUFFIX_MAX];
+			struct cds_ft_inode_flag *node_flag;
+			unsigned int k;
+
+			memcpy(suffix, &best_subkey, FT_COL_SUFFIX_MAX);
+			for (k = 0; k < slen; k++) {
+				ordinal_key[suffix_base + k] = suffix[k];
+				if (k > 0)
+					iter_path_node(iter)[suffix_base + k] =
+						iter_path_node(iter)[level - 1];
+			}
+			level = suffix_base + slen;
+			assert(level < max_tree_depth);
+			node_flag = best_child;
+			node_flag = ft_resolve_skip_compressed(node_flag);
+			iter_path_node(iter)[level] = node_flag;
+			*node_flag_p = node_flag;
+			*level_p = level;
+			return FT_DESCENT_BREAK;
 		}
-		level = suffix_base + slen;
-		assert(level < max_tree_depth);
-		node_flag = best_child;
-		node_flag = ft_resolve_skip_compressed(node_flag);
-		iter_path_node(iter)[level] = node_flag;
-		*node_flag_p = node_flag;
-		*level_p = level;
-		return FT_DESCENT_BREAK;
 	}
 
 	/*
@@ -11342,6 +11581,25 @@ static struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		unsigned long subtree_external_count,
 		bool has_external_nodes);
 
+static
+void ft_free_branch(struct cds_ft *ft,
+		const uint8_t *key, unsigned int start, unsigned int end,
+		struct cds_ft_inode_flag *top_node);
+
+#ifdef FEATURE_FT_COLLAPSE
+static
+int ft_collapsed_recompact_with_insert(struct cds_ft *ft,
+		struct cds_ft_collapsed_node *col,
+		struct cds_ft_inode_flag *col_flag,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot,
+		unsigned int depth,
+		const uint8_t *new_suffix,
+		unsigned int new_slen,
+		struct cds_ft_inode_flag *new_branch,
+		struct cds_ft_inode_flag **out_replacement_flag);
+#endif
+
 /*
  * Try to create a compressed path for a chain of single-child nodes.
  * Returns the compressed node flag on success, NULL if compression
@@ -12183,52 +12441,99 @@ enum ft_descent_action ft_insert_collapsed(struct cds_ft *ft,
 	 */
 	if (new_slen < FT_COLLAPSE_SUFFIX_MIN || new_slen > FT_COL_SUFFIX_MAX)
 		goto collapsed_explode;
-	if (high_water >= cap)
-		goto collapsed_explode;
-	if (last_live != NULL && last_live_cmp <= 0)
-		goto collapsed_explode;
 
-	/*
-	 * Build child for the new entry.  The suffix covers key
-	 * bytes from d->depth to key_len.  If suffix IS the full
-	 * remaining key, the child is the external node directly.
-	 * Otherwise, wrap remaining bytes in a compressed path.
-	 */
-	if (d->depth + new_slen == key_len) {
-		branch = (struct cds_ft_inode_flag *) node;
-	} else {
-		branch = ft_build_branch(ft, key,
-			d->depth + new_slen, key_len,
-			(struct cds_ft_inode_flag *) node,
-			1, false);
-		if (!branch) {
-			*ret_p = -ENOMEM;
+	{
+		struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) col);
+		bool need_recompact = (high_water >= cap) ||
+				(last_live != NULL && last_live_cmp <= 0);
+
+		/*
+		 * Pre-check recompact viability before allocating a child
+		 * branch: if the tier is full of live entries, neither
+		 * in-place sorted-append nor recompact can fit a new entry,
+		 * and we must explode.
+		 */
+		if (need_recompact && (unsigned int) col_meta->nr_child + 1 > cap)
+			goto collapsed_explode;
+
+		/*
+		 * Build child for the new entry.  The suffix covers key
+		 * bytes from d->depth to key_len.  If suffix IS the full
+		 * remaining key, the child is the external node directly.
+		 * Otherwise, wrap remaining bytes in a compressed path.
+		 */
+		if (d->depth + new_slen == key_len) {
+			branch = (struct cds_ft_inode_flag *) node;
+		} else {
+			branch = ft_build_branch(ft, key,
+				d->depth + new_slen, key_len,
+				(struct cds_ft_inode_flag *) node,
+				1, false);
+			if (!branch) {
+				*ret_p = -ENOMEM;
+				return FT_DESCENT_END;
+			}
+		}
+
+		if (need_recompact) {
+			struct cds_ft_inode_flag *new_col_flag;
+			int rc;
+
+			rc = ft_collapsed_recompact_with_insert(ft, col, d->nf,
+					d->pnf, d->nfp, d->depth,
+					iter_key, new_slen, branch,
+					&new_col_flag);
+			if (rc == 0) {
+				FT_TP(collapsed_entry,
+					(const void *) new_col_flag,
+					(unsigned int) col_meta->nr_child,
+					iter_key, new_slen,
+					(const void *) branch, 0);
+				d->nf = new_col_flag;
+				*ret_p = 0;
+				return FT_DESCENT_END;
+			}
+			/*
+			 * Pre-check above guarantees rc != 1, so any
+			 * non-zero is an allocation failure.  The child
+			 * branch we just built is unpublished; release it.
+			 */
+			assert(rc < 0);
+			if (branch != (struct cds_ft_inode_flag *) node)
+				ft_free_branch(ft, key,
+					d->depth + new_slen, key_len,
+					branch);
+			*ret_p = rc;
 			return FT_DESCENT_END;
 		}
 	}
 
 	/* Append at high_water slot. */
 	new_entry = &entries[high_water];
-	{
-		unsigned int k;
-
-		for (k = 0; k < new_slen; k++)
-			new_entry->suffix[k] = iter_key[k];
-	}
-	new_entry->len = (uint8_t) new_slen;
 	/*
-	 * Prefix-cache bytes for the SIMD reader fast path.  Entries
-	 * always have slen >= 2 (enforced by the build path's
-	 * suffix-min gate), so iter_key[0] and iter_key[1] are valid.
+	 * Prefix-cache bytes for the SIMD reader fast path — relaxed
+	 * stores; readers may observe torn states.  The verify on the
+	 * atomically-published subkey (next call) is the source of truth
+	 * and catches any false acceptance from the SIMD pre-filter.
+	 *
+	 * Entries always have slen >= FT_COLLAPSE_SUFFIX_MIN (= 2),
+	 * enforced by the build path and the SUFFIX_MIN gate above.
 	 */
 	ft_collapsed_write_prefix_bytes(col, tier, high_water,
 		iter_key[0], iter_key[1]);
+	/*
+	 * Publish the subkey atomically.  64-bit: single relaxed 8-byte
+	 * store transitions the slot from slen=0 (cannot match) to
+	 * slen=N (can match).  32-bit: plain suffix bytes followed by
+	 * release-store on len.
+	 */
+	ft_collapsed_publish_subkey(col, tier, high_water, iter_key, new_slen);
 	ft_set_parent(branch, d->nf, &new_entry->child);
 	/*
-	 * Publish: release-store the child pointer.  Suffix, len, and
-	 * prefix bytes are written above before the release-store;
-	 * readers' acquire load on entry->child happens-after these
-	 * stores.
+	 * Publish liveness: release-store on child pairs with reader's
+	 * rcu_dereference.  Readers reaching this point observe the
+	 * subkey already published and the entry now live.
 	 */
 	ft_collapsed_publish_entry(col, tier, high_water, branch);
 	FT_TP(collapsed_entry,
@@ -12527,6 +12832,179 @@ struct cds_ft_inode_flag *ft_explode_entries(struct cds_ft *ft,
 		}
 		return internal_flag;
 	}
+}
+
+/*
+ * ft_collapsed_recompact_with_insert: rebuild a collapsed node in
+ * place at the same tier, copying live entries in sort order and
+ * inserting one new entry at its sorted position.  Used by the
+ * insert path when the in-place sorted-append is unsuitable
+ * (high_water at capacity due to dead slots, or new key sorts
+ * before an existing live entry).
+ *
+ * @new_suffix:           suffix bytes of the new entry (must not match
+ *                        any existing live entry's prefix — caller has
+ *                        filtered partial prefix overlaps to explode).
+ * @new_slen:             length of @new_suffix (in [SUFFIX_MIN..SUFFIX_MAX]).
+ * @new_branch:           child pointer to install for the new entry
+ *                        (already has parent set; we update it below
+ *                        to point at the new collapsed flag).
+ * @out_replacement_flag: receives the new collapsed flag on success.
+ *
+ * Returns:
+ *   0  on success — *@out_replacement_flag receives the new collapsed
+ *      flag, the old collapsed has been freed via call_rcu, density and
+ *      nr_keys are propagated.
+ *   1  if recompact is not viable at this tier (live count + 1 > cap).
+ *      Caller state unchanged; caller should fall through to explode.
+ *  -ENOMEM on allocation failure.  Caller state unchanged.
+ *
+ * Concurrency: write-side only (mutex-held).  All stores into the new
+ * collapsed happen on memory that has not yet been published; the
+ * rcu_assign_pointer in ft_publish_to_parent provides the single
+ * release fence ordering all of them before readers can observe the
+ * replacement.
+ */
+static
+int ft_collapsed_recompact_with_insert(struct cds_ft *ft,
+		struct cds_ft_collapsed_node *col,
+		struct cds_ft_inode_flag *col_flag,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot,
+		unsigned int depth,
+		const uint8_t *new_suffix,
+		unsigned int new_slen,
+		struct cds_ft_inode_flag *new_branch,
+		struct cds_ft_inode_flag **out_replacement_flag)
+{
+	unsigned int tier = ft_collapsed_tier(col_flag);
+	unsigned int cap = ft_collapsed_capacity(tier);
+	struct cds_ft_collapsed_entry *old_entries =
+			ft_collapsed_entries(col, tier);
+	struct cds_ft_collapsed_node *new_col;
+	struct cds_ft_metadata *new_meta;
+	struct cds_ft_collapsed_entry *new_entries;
+	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) col);
+	struct cds_ft_inode_flag *new_col_flag;
+	unsigned long old_density[FT_NODE_DENSITY_DEPTH];
+	unsigned int old_fp = ft_node_readside_footprint(ft, col_flag);
+	unsigned int e, ne;
+	unsigned int nr_live = 0;
+	bool inserted = false;
+	unsigned int di;
+
+	for (e = 0; e < cap; e++) {
+		if (old_entries[e].child != NULL)
+			nr_live++;
+	}
+	if (nr_live + 1 > cap)
+		return 1;
+
+	for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
+		old_density[di] = ft_density_get(col_meta, di);
+
+	new_col = alloc_collapsed_node(ft, tier, &new_meta);
+	if (!new_col)
+		return -ENOMEM;
+	new_entries = ft_collapsed_entries(new_col, tier);
+	new_col_flag = ft_collapsed_node_flag_tier(new_col, tier);
+
+	/*
+	 * Walk old entries in slot order (= lex order across live
+	 * entries), inserting the new entry at its sorted position.
+	 */
+	ne = 0;
+	for (e = 0; e < cap; e++) {
+		struct cds_ft_collapsed_entry *old_entry = &old_entries[e];
+		struct cds_ft_inode_flag *child = old_entry->child;
+		unsigned int slen;
+		uint8_t *suffix;
+
+		if (child == NULL)
+			continue;
+		slen = ft_collapsed_suffix_len(old_entry);
+		suffix = ft_collapsed_suffix(old_entry);
+
+		if (!inserted) {
+			unsigned int cmp_len = slen < new_slen ? slen : new_slen;
+			int cmp = ft_key_cmp_ordinals(suffix, new_suffix,
+					cmp_len, cmp_len, false, NULL);
+
+			if (cmp == 0)
+				cmp = (slen < new_slen) ? -1 :
+						(slen > new_slen) ? 1 : 0;
+			/*
+			 * Caller filters duplicates via prefix-match
+			 * tracking, so suffixes here are distinct.
+			 */
+			assert(cmp != 0);
+			if (cmp > 0) {
+				ft_collapsed_write_prefix_bytes(new_col, tier,
+						ne, new_suffix[0],
+						new_suffix[1]);
+				ft_collapsed_publish_subkey(new_col, tier, ne,
+						new_suffix, new_slen);
+				ft_collapsed_publish_entry(new_col, tier, ne,
+						new_branch);
+				ne++;
+				inserted = true;
+			}
+		}
+		ft_collapsed_write_prefix_bytes(new_col, tier, ne,
+				suffix[0], suffix[1]);
+		ft_collapsed_publish_subkey(new_col, tier, ne, suffix, slen);
+		ft_collapsed_publish_entry(new_col, tier, ne, child);
+		ne++;
+	}
+	if (!inserted) {
+		ft_collapsed_write_prefix_bytes(new_col, tier, ne,
+				new_suffix[0], new_suffix[1]);
+		ft_collapsed_publish_subkey(new_col, tier, ne,
+				new_suffix, new_slen);
+		ft_collapsed_publish_entry(new_col, tier, ne, new_branch);
+		ne++;
+	}
+	assert(ne == nr_live + 1);
+
+	/*
+	 * Re-parent every child onto the new collapsed flag so that
+	 * back-pointers (used by skip-compressed and parent-walk paths)
+	 * stay valid after the swap.  external_nodes head, if any, is
+	 * re-parented by ft_metadata_set_external_nodes below.
+	 */
+	for (e = 0; e < ne; e++) {
+		ft_set_parent(new_entries[e].child, new_col_flag,
+				&new_entries[e].child);
+	}
+
+	new_meta->nr_child = ne;
+	if (col_meta->external_nodes) {
+		ft_metadata_set_external_nodes(new_col_flag, new_meta,
+				col_meta->external_nodes);
+	}
+	/*
+	 * Seed nr_keys to the old value; the +1 for the inserted key
+	 * (and propagation up the tree) is added by
+	 * ft_propagate_external_count_parent below.
+	 */
+	ft_nr_keys_store(ft, new_meta, ft_nr_keys_get(col_meta),
+			CMM_RELAXED);
+	ft_init_node_density(ft, new_col_flag);
+
+	ft_set_parent(new_col_flag, parent_nf, slot);
+	ft_publish_to_parent(ft, parent_nf, slot, new_col_flag);
+	free_collapsed_node(ft, col);
+
+	ft_propagate_density_replace(ft, new_col_flag, depth,
+			old_density, old_fp,
+			ft_flag_to_metadata(new_col_flag),
+			ft_node_readside_footprint(ft, new_col_flag),
+			NULL, 0);
+	ft_propagate_external_count_parent(ft, new_col_flag, 1);
+
+	*out_replacement_flag = new_col_flag;
+	return 0;
 }
 
 /*
@@ -16955,20 +17433,45 @@ enum ft_descent_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **node
 	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
 
-	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
-		struct cds_ft_inode_flag *child;
-		unsigned int slen, j;
-		uint8_t *suffix;
-		bool match;
+	{
+		uint64_t cur_subkey;
+		unsigned int cur_slen;
+		struct cds_ft_inode_flag *cur_child;
 
-		slen = ft_collapsed_suffix_len(entry);
-		child = entry->child;
+		ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
+				cur_subkey, cur_slen, cur_child) {
+			unsigned int slen = cur_slen, j;
+			uint8_t suffix[FT_COL_SUFFIX_MAX];
+			bool match;
 
-		if (slen >= remaining) {
-			/* Suffix covers the rest of the prefix — compare. */
-			suffix = ft_collapsed_suffix(entry);
+			memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
+
+			if (slen >= remaining) {
+				/* Suffix covers the rest of the prefix — compare. */
+				match = true;
+				for (j = 0; j < remaining; j++) {
+					if (prefix[i + j] != suffix[j]) {
+						match = false;
+						break;
+					}
+				}
+				if (!match)
+					continue;
+				/* Prefix ends within or at this entry's span. */
+				if (!ft_node_external(cur_child)) {
+					struct cds_ft_metadata *m =
+						cds_ft_item_to_metadata(ft_node_ptr(cur_child));
+					*count_ret = ft_nr_keys_load(m);
+				} else if (ft_node_ptr(cur_child)) {
+					*count_ret = 1;
+				} else {
+					*count_ret = 0;
+				}
+				return FT_DESCENT_END;
+			}
+			/* Suffix is shorter than remaining prefix — check prefix. */
 			match = true;
-			for (j = 0; j < remaining; j++) {
+			for (j = 0; j < slen; j++) {
 				if (prefix[i + j] != suffix[j]) {
 					match = false;
 					break;
@@ -16976,38 +17479,15 @@ enum ft_descent_action ft_count_prefix_collapsed(struct cds_ft_inode_flag **node
 			}
 			if (!match)
 				continue;
-			/* Prefix ends within or at this entry's span. */
-			if (!ft_node_external(child)) {
-				struct cds_ft_metadata *m =
-					cds_ft_item_to_metadata(ft_node_ptr(child));
-				*count_ret = ft_nr_keys_load(m);
-			} else if (ft_node_ptr(child)) {
-				*count_ret = 1;
-			} else {
-				*count_ret = 0;
+			/* Full suffix match, continue descent into child. */
+			*i_p = i + slen - 1;
+			{
+				struct cds_ft_inode_flag *resolved =
+					ft_resolve_skip_compressed(cur_child);
+				*node_flag_p = resolved;
 			}
-			return FT_DESCENT_END;
+			return FT_DESCENT_CONTINUE;
 		}
-		/* Suffix is shorter than remaining prefix — check prefix. */
-		suffix = ft_collapsed_suffix(entry);
-		match = true;
-		for (j = 0; j < slen; j++) {
-			if (prefix[i + j] != suffix[j]) {
-				match = false;
-				break;
-			}
-		}
-		if (!match)
-			continue;
-		/* Full suffix match, continue descent into child. */
-		*i_p = i + slen - 1;
-		{
-			struct cds_ft_inode_flag *resolved =
-				ft_dereference_acquire_prefetch(entry->child);
-			resolved = ft_resolve_skip_compressed(resolved);
-			*node_flag_p = resolved;
-		}
-		return FT_DESCENT_CONTINUE;
 	}
 	*count_ret = 0;
 	return FT_DESCENT_END;
@@ -17205,11 +17685,16 @@ enum ft_descent_action ft_lookup_nth_collapsed(
 	for (e = 0; e < cap; e++) {
 		struct cds_ft_collapsed_entry *entry = &entries[e];
 		struct cds_ft_inode_flag *child;
+		uint64_t subkey;
 		unsigned long child_keys;
 		unsigned int slen;
-		uint8_t *suffix;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 
-		child = ft_dereference_acquire_prefetch(entry->child);
+		subkey = ft_collapsed_subkey_load(col, tier, e);
+		slen = ft_collapsed_subkey_unpack_slen(subkey);
+		if (slen == 0)
+			continue;
+		child = ft_dereference_prefetch(entry->child);
 		if (child == NULL)
 			continue;
 		if (!ft_node_ptr(child))
@@ -17217,8 +17702,7 @@ enum ft_descent_action ft_lookup_nth_collapsed(
 		child_keys = ft_child_key_count(child);
 		if (*remaining_p < child_keys) {
 			/* Target is in this entry's subtree. */
-			slen = ft_collapsed_suffix_len(entry);
-			suffix = ft_collapsed_suffix(entry);
+			memcpy(suffix, &subkey, FT_COL_SUFFIX_MAX);
 			{
 				unsigned int k;
 
@@ -17493,19 +17977,23 @@ enum ft_descent_action ft_lookup_nth_last_collapsed(
 	for (e = cap; e-- > 0; ) {
 		struct cds_ft_collapsed_entry *entry = &entries[e];
 		struct cds_ft_inode_flag *child;
+		uint64_t subkey;
 		unsigned long child_keys;
 		unsigned int slen;
-		uint8_t *suffix;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 
-		child = ft_dereference_acquire_prefetch(entry->child);
+		subkey = ft_collapsed_subkey_load(col, tier, e);
+		slen = ft_collapsed_subkey_unpack_slen(subkey);
+		if (slen == 0)
+			continue;
+		child = ft_dereference_prefetch(entry->child);
 		if (child == NULL)
 			continue;
 		if (!ft_node_ptr(child))
 			continue;
 		child_keys = ft_child_key_count(child);
 		if (*remaining_p < child_keys) {
-			slen = ft_collapsed_suffix_len(entry);
-			suffix = ft_collapsed_suffix(entry);
+			memcpy(suffix, &subkey, FT_COL_SUFFIX_MAX);
 			{
 				unsigned int k;
 
@@ -17762,17 +18250,20 @@ enum ft_descent_action ft_rebuild_path_collapsed(
 	unsigned int remaining = key_len - i;
 	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
+	uint64_t cur_subkey;
+	unsigned int cur_slen;
+	struct cds_ft_inode_flag *cur_child;
 
-	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
+	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
+			cur_subkey, cur_slen, cur_child) {
 		struct cds_ft_inode_flag *child;
-		unsigned int slen, j;
-		uint8_t *suffix;
+		unsigned int slen = cur_slen, j;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		bool match;
 
-		slen = ft_collapsed_suffix_len(entry);
 		if (slen > remaining)
 			continue;
-		suffix = ft_collapsed_suffix(entry);
+		memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
 		match = true;
 		for (j = 0; j < slen; j++) {
 			uint8_t ord = key[i + j];
@@ -17789,7 +18280,7 @@ enum ft_descent_action ft_rebuild_path_collapsed(
 		if (!match)
 			continue;
 		i += slen - 1;
-		child = ft_dereference_acquire_prefetch(entry->child);
+		child = cur_child;
 		if (!ft_node_ptr(child))
 			return FT_DESCENT_END;
 		child = ft_resolve_skip_compressed(child);
@@ -17924,6 +18415,9 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 	struct cds_ft_collapsed_node *col;
 	struct cds_ft_collapsed_entry *entry;
 	unsigned int e;
+	uint64_t cur_subkey;
+	unsigned int cur_slen;
+	struct cds_ft_inode_flag *cur_child;
 
 	/* Skip intermediate levels (same node at adjacent levels). */
 	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
@@ -17931,18 +18425,15 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 
 	col = ft_collapsed_node_ptr(ancestor);
 
-	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
-		struct cds_ft_inode_flag *child;
-		unsigned int slen;
-		uint8_t *suffix;
+	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
+			cur_subkey, cur_slen, cur_child) {
+		struct cds_ft_inode_flag *child = cur_child;
+		unsigned int slen = cur_slen;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		unsigned long ck;
 		bool is_current;
 
-		child = ft_dereference_acquire(entry->child);
-		if (!ft_node_ptr(child))
-			continue;
-		slen = ft_collapsed_suffix_len(entry);
-		suffix = ft_collapsed_suffix(entry);
+		memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
 
 		/*
 		 * Check if this is the current entry by comparing
@@ -17969,8 +18460,8 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 		 */
 		{
 			unsigned int j;
-			unsigned int cur_slen = depth - level;
-			unsigned int cmp = slen < cur_slen ? slen : cur_slen;
+			unsigned int cur_key_slen = depth - level;
+			unsigned int cmp = slen < cur_key_slen ? slen : cur_key_slen;
 			int r = 0;
 
 			for (j = 0; j < cmp; j++) {
@@ -17983,7 +18474,7 @@ enum ft_descent_action ft_skip_forward_walk_up_collapsed(
 					break;
 				}
 			}
-			if (r == 0 && slen > cur_slen)
+			if (r == 0 && slen > cur_key_slen)
 				r = 1;
 			if (r <= 0)
 				continue;
@@ -18471,6 +18962,9 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 	struct cds_ft_metadata *col_meta;
 	struct cds_ft_node *a_ext;
 	unsigned int e;
+	uint64_t cur_subkey;
+	unsigned int cur_slen;
+	struct cds_ft_inode_flag *cur_child;
 
 	/* Skip intermediate levels. */
 	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
@@ -18479,23 +18973,20 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 	col = ft_collapsed_node_ptr(ancestor);
 	col_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) col);
 
-	ft_for_each_live_collapsed_entry(col, tier, e, entry) {
-		struct cds_ft_inode_flag *child;
-		unsigned int slen;
-		uint8_t *suffix;
+	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
+			cur_subkey, cur_slen, cur_child) {
+		struct cds_ft_inode_flag *child = cur_child;
+		unsigned int slen = cur_slen;
+		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		unsigned long ck;
 
-		child = ft_dereference_acquire(entry->child);
-		if (!ft_node_ptr(child))
-			continue;
-		slen = ft_collapsed_suffix_len(entry);
-		suffix = ft_collapsed_suffix(entry);
+		memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
 
 		/* Check if suffix < current key. */
 		{
 			unsigned int j;
-			unsigned int cur_slen = depth - level;
-			unsigned int cmp = slen < cur_slen ? slen : cur_slen;
+			unsigned int cur_key_slen = depth - level;
+			unsigned int cmp = slen < cur_key_slen ? slen : cur_key_slen;
 			int r = 0;
 
 			for (j = 0; j < cmp; j++) {
@@ -18508,7 +18999,7 @@ enum ft_descent_action ft_skip_reverse_walk_up_collapsed(
 					break;
 				}
 			}
-			if (r == 0 && slen < cur_slen)
+			if (r == 0 && slen < cur_key_slen)
 				r = -1;
 			if (r >= 0)
 				continue;
