@@ -67,18 +67,42 @@
  * Collapsed-node tier: 2 bits in pointer bits 4-5, encoding the
  * allocation size class and per-node entry capacity.
  *
- *   tier 0 → 64B alloc, capacity 3
- *   tier 1 → 128B alloc, capacity 7
- *   tier 2 → 256B alloc, capacity 12
- *   tier 3 → 512B alloc, capacity 28
+ *   tier 0 → 64B alloc, capacity 3 (narrow) / 1 (wide)
+ *   tier 1 → 128B alloc, capacity 7 / 3
+ *   tier 2 → 256B alloc, capacity 12 / 6
+ *   tier 3 → 512B alloc, capacity 28 / 14
  *
  * The tier is recovered from the collapsed-node child pointer in the
  * parent, so the in-node header carries no tier or count metadata.
+ *
+ * Collapsed-node stride: 1 bit in pointer bit 3, encoding the
+ * per-entry stride.  Stride 0 is "narrow" (16-byte entries with a
+ * 7-byte suffix, FT_COL_SUFFIX_MAX); stride 1 is "wide" (32-byte
+ * entries with a 23-byte suffix, FT_COL_W_SUFFIX_MAX).  Wide
+ * collapses absorb paths whose suffix bytes exceed the narrow cap
+ * without degrading to a nested compressed child; the trade is
+ * roughly half the per-tier capacity.  Like tier, stride is
+ * recovered from the parent's child pointer.
  */
 #define FT_COL_TIER_SHIFT	4U
 #define FT_COL_TIER_BITS	2U
 #define FT_COL_TIER_MASK	(((1U << FT_COL_TIER_BITS) - 1U) << FT_COL_TIER_SHIFT)	/* 0x30 */
-#define FT_TAG_MASK_COLLAPSED	(FT_TAG_MASK_WIDE | FT_COL_TIER_MASK)			/* 0x37 — for collapsed ptr unmasking */
+#define FT_COL_STRIDE_SHIFT	3U
+#define FT_COL_STRIDE_BITS	1U
+#define FT_COL_STRIDE_MASK	(((1U << FT_COL_STRIDE_BITS) - 1U) << FT_COL_STRIDE_SHIFT)	/* 0x08 */
+#define FT_TAG_MASK_COLLAPSED	(FT_TAG_MASK_WIDE | FT_COL_STRIDE_MASK | FT_COL_TIER_MASK)	/* 0x3E — for collapsed ptr unmasking */
+
+/*
+ * Stride enum: keep narrow=0 / wide=1 so a NULL-zeroed flag and the
+ * existing all-narrow code path map onto stride=NARROW without any
+ * per-call-site bookkeeping change while the wide variant is being
+ * introduced.
+ */
+enum ft_col_stride {
+	FT_COL_STRIDE_NARROW	= 0,
+	FT_COL_STRIDE_WIDE	= 1,
+	FT_COL_NR_STRIDES	= 2,
+};
 
 /*
  * This if followed by a number of bits reserved to represent the child

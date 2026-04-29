@@ -1447,6 +1447,18 @@ unsigned int ft_collapsed_tier(struct cds_ft_inode_flag *node)
 			& ((1U << FT_COL_TIER_BITS) - 1U);
 }
 
+/*
+ * Recover the stride bit (NARROW / WIDE) from a tagged collapsed-node
+ * pointer.  Returns FT_COL_STRIDE_NARROW (0) for the existing 16-byte
+ * entry layout and FT_COL_STRIDE_WIDE (1) for the 32-byte wide layout.
+ */
+static inline_lookup
+unsigned int ft_collapsed_stride(struct cds_ft_inode_flag *node)
+{
+	return (unsigned int) (((unsigned long) node) >> FT_COL_STRIDE_SHIFT)
+			& ((1U << FT_COL_STRIDE_BITS) - 1U);
+}
+
 static
 struct cds_ft_inode_flag *ft_collapsed_node_flag(
 		struct cds_ft_collapsed_node *node)
@@ -1458,6 +1470,9 @@ struct cds_ft_inode_flag *ft_collapsed_node_flag(
 /*
  * Tier-aware variant for use by Phase 2+ allocation / publication
  * paths.  Encodes the tier index (0..3) into pointer bits 4-5.
+ *
+ * Stride defaults to NARROW (bit 3 = 0); use ft_collapsed_node_flag_tier_stride
+ * to publish a wide-stride collapsed node.
  */
 static inline
 struct cds_ft_inode_flag *ft_collapsed_node_flag_tier(
@@ -1466,6 +1481,24 @@ struct cds_ft_inode_flag *ft_collapsed_node_flag_tier(
 	return (struct cds_ft_inode_flag *)
 		(((unsigned long) node)
 			| FT_COLLAPSED_MASK
+			| ((unsigned long) tier << FT_COL_TIER_SHIFT));
+}
+
+/*
+ * Encode tier and stride bits into a tagged collapsed-node pointer.
+ * stride = FT_COL_STRIDE_NARROW (0) reproduces ft_collapsed_node_flag_tier;
+ * stride = FT_COL_STRIDE_WIDE (1) sets bit 3 of the pointer so the
+ * read side dispatches on the wide entry layout.
+ */
+static inline
+struct cds_ft_inode_flag *ft_collapsed_node_flag_tier_stride(
+		struct cds_ft_collapsed_node *node,
+		unsigned int tier, unsigned int stride)
+{
+	return (struct cds_ft_inode_flag *)
+		(((unsigned long) node)
+			| FT_COLLAPSED_MASK
+			| ((unsigned long) stride << FT_COL_STRIDE_SHIFT)
 			| ((unsigned long) tier << FT_COL_TIER_SHIFT));
 }
 
