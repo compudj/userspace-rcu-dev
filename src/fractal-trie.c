@@ -7556,80 +7556,69 @@ static inline_lookup
 int ft_collapsed_find_nearest(
 		struct cds_ft_collapsed_node *col,
 		unsigned int tier,
+		unsigned int stride,
 		unsigned int ref_entry,
 		enum ft_direction dir,
 		struct cds_ft_inode_flag **best_child,
-		uint64_t *best_subkey_out,
+		uint8_t *best_suffix_out,
 		unsigned int *best_slen_out)
 {
-	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
-	uint64_t ref_subkey = ft_collapsed_subkey_load(col, tier, ref_entry);
-	unsigned int ref_slen = ft_collapsed_subkey_unpack_slen(ref_subkey);
-	uint8_t ref_suffix[FT_COL_SUFFIX_MAX];
-	unsigned int cap = ft_collapsed_capacity(tier);
-	int best = -1;
-	uint64_t best_subkey = 0;
+	struct ft_col_view ref_view;
+	struct ft_col_view view;
+	uint8_t best_suffix[FT_COL_W_SUFFIX_MAX];
 	unsigned int best_slen = 0;
 	struct cds_ft_inode_flag *saved_best_child = NULL;
+	int best = -1;
 	unsigned int e;
 
-	memcpy(ref_suffix, &ref_subkey, FT_COL_SUFFIX_MAX);
-	for (e = 0; e < cap; e++) {
-		struct cds_ft_collapsed_entry *entry = &entries[e];
-		struct cds_ft_inode_flag *child;
-		uint64_t subkey;
-		unsigned int slen, mc;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
+	ft_collapsed_load_entry_view_rcu(col, tier, stride, ref_entry, &ref_view);
+
+	ft_for_each_live_collapsed_entry_view_rcu(col, tier, stride, e, view) {
+		unsigned int slen = view.slen;
+		unsigned int mc;
 		int r;
 
 		if (e == ref_entry)
 			continue;
-		subkey = ft_collapsed_subkey_load(col, tier, e);
-		slen = ft_collapsed_subkey_unpack_slen(subkey);
-		if (slen == 0)
+		if (!ft_node_ptr(view.child))
 			continue;
-		child = ft_dereference_prefetch(entry->child);
-		if (child == NULL)
-			continue;
-		if (!ft_node_ptr(child))
-			continue;
-		memcpy(suffix, &subkey, FT_COL_SUFFIX_MAX);
 
-		mc = slen < ref_slen ? slen : ref_slen;
-		r = ft_key_cmp_ordinals(suffix, ref_suffix, mc, mc, true, NULL);
+		mc = slen < ref_view.slen ? slen : ref_view.slen;
+		r = ft_key_cmp_ordinals(view.suffix, ref_view.suffix,
+					mc, mc, true, NULL);
 		if (r == 0)
-			r = (slen > ref_slen) ? 1 : (slen < ref_slen) ? -1 : 0;
+			r = (slen > ref_view.slen) ? 1 :
+			    (slen < ref_view.slen) ? -1 : 0;
 
 		if ((dir == FT_RIGHT && r > 0) ||
 		    (dir == FT_LEFT && r < 0)) {
 			if (best < 0) {
 				best = (int)e;
-				best_subkey = subkey;
+				memcpy(best_suffix, view.suffix, slen);
 				best_slen = slen;
-				saved_best_child = child;
+				saved_best_child = view.child;
 			} else {
-				uint8_t bs[FT_COL_SUFFIX_MAX];
 				unsigned int bl = best_slen;
 				unsigned int mc2 = bl < slen ? bl : slen;
 				int r2;
 
-				memcpy(bs, &best_subkey, FT_COL_SUFFIX_MAX);
-				r2 = ft_key_cmp_ordinals(suffix, bs, mc2, mc2, true, NULL);
+				r2 = ft_key_cmp_ordinals(view.suffix, best_suffix,
+							 mc2, mc2, true, NULL);
 
 				if ((dir == FT_RIGHT && (r2 < 0 || (r2 == 0 && slen < bl))) ||
 				    (dir == FT_LEFT && (r2 > 0 || (r2 == 0 && slen > bl)))) {
 					best = (int)e;
-					best_subkey = subkey;
+					memcpy(best_suffix, view.suffix, slen);
 					best_slen = slen;
-					saved_best_child = child;
+					saved_best_child = view.child;
 				}
 			}
 		}
 	}
 	if (best >= 0) {
 		*best_child = saved_best_child;
-		if (best_subkey_out)
-			*best_subkey_out = best_subkey;
+		if (best_suffix_out)
+			memcpy(best_suffix_out, best_suffix, best_slen);
 		if (best_slen_out)
 			*best_slen_out = best_slen;
 	}
@@ -8176,17 +8165,14 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	unsigned int tier = ft_collapsed_tier(node_flag);
+	unsigned int stride = ft_collapsed_stride(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
 	ssize_t level = *level_p;
 	unsigned int best, e;
-	uint64_t best_subkey = 0;
+	uint8_t best_suffix[FT_COL_W_SUFFIX_MAX];
 	unsigned int best_slen = 0;
 	struct cds_ft_inode_flag *best_child;
-	struct cds_ft_collapsed_entry *entry;
-	uint64_t cur_subkey;
-	unsigned int cur_slen;
-	struct cds_ft_inode_flag *cur_child;
+	struct ft_col_view view;
 
 	if (dir == FT_LEFTMOST) {
 		struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
@@ -8205,53 +8191,47 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 	 * Race-free pointer selection: each candidate entry is
 	 * filtered by slen != 0 (subkey published) and child != NULL
 	 * (rcu_dereference) at scan time; we save the validated
-	 * child pointer alongside the winning subkey so descent uses
+	 * child pointer alongside the winning suffix so descent uses
 	 * the snapshotted values.  No re-read of entry data later.
 	 */
 	best = UINT_MAX;
 	best_child = NULL;
 
-	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
-			cur_subkey, cur_slen, cur_child) {
-		if (!ft_node_ptr(cur_child))
+	ft_for_each_live_collapsed_entry_view_rcu(col, tier, stride, e, view) {
+		if (!ft_node_ptr(view.child))
 			continue;
 		if (best == UINT_MAX) {
 			best = e;
-			best_subkey = cur_subkey;
-			best_slen = cur_slen;
-			best_child = cur_child;
+			memcpy(best_suffix, view.suffix, view.slen);
+			best_slen = view.slen;
+			best_child = view.child;
 			continue;
 		}
 		{
-			uint8_t sa[FT_COL_SUFFIX_MAX];
 			unsigned int la = best_slen;
-			uint8_t sb[FT_COL_SUFFIX_MAX];
-			unsigned int lb = cur_slen;
+			unsigned int lb = view.slen;
 			unsigned int mc = la < lb ? la : lb;
 			int r;
 
-			memcpy(sa, &best_subkey, FT_COL_SUFFIX_MAX);
-			memcpy(sb, &cur_subkey, FT_COL_SUFFIX_MAX);
-			r = memcmp(sb, sa, mc);
+			r = memcmp(view.suffix, best_suffix, mc);
 
 			if (dir == FT_LEFTMOST) {
 				if (r < 0 || (r == 0 && lb < la)) {
 					best = e;
-					best_subkey = cur_subkey;
-					best_slen = cur_slen;
-					best_child = cur_child;
+					memcpy(best_suffix, view.suffix, view.slen);
+					best_slen = view.slen;
+					best_child = view.child;
 				}
 			} else {
 				if (r > 0 || (r == 0 && lb > la)) {
 					best = e;
-					best_subkey = cur_subkey;
-					best_slen = cur_slen;
-					best_child = cur_child;
+					memcpy(best_suffix, view.suffix, view.slen);
+					best_slen = view.slen;
+					best_child = view.child;
 				}
 			}
 		}
 	}
-	(void) entries;
 	if (best == UINT_MAX) {
 		/*
 		 * Transiently empty collapsed: a racing writer's
@@ -8274,12 +8254,10 @@ enum ft_descent_action ft_inequality_minmax_collapsed(
 	}
 	{
 		unsigned int slen = best_slen;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		unsigned int k;
 
-		memcpy(suffix, &best_subkey, FT_COL_SUFFIX_MAX);
 		for (k = 0; k < slen; k++) {
-			ordinal_key[level - 1 + k] = suffix[k];
+			ordinal_key[level - 1 + k] = best_suffix[k];
 			iter_path_node(iter)[level + k] = node_flag;
 		}
 		level += slen - 1;
@@ -8325,13 +8303,14 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 	ssize_t level = *level_p;
 	struct cds_ft_inode_flag *col_node_flag = iter_path_node(iter)[level - 1];
 	unsigned int tier = ft_collapsed_tier(col_node_flag);
+	unsigned int stride = ft_collapsed_stride(col_node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(col_node_flag);
-	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
-	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int cap = ft_collapsed_capacity_stride(tier, stride);
 	int entry_depth = level - 1;
 	int suffix_base;
 	int current_entry = -1, best;
 	unsigned int cur_slen = 0;
+	struct cds_ft_inode_flag *cur_child_at_match = NULL;
 	unsigned int e;
 	struct cds_ft_inode_flag *best_child = NULL;
 
@@ -8374,26 +8353,24 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 	 * (unpublished slot).
 	 */
 	for (e = 0; e < cap; e++) {
-		uint64_t subkey;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
-		unsigned int slen, j2;
+		struct ft_col_view view;
+		unsigned int j2;
 		bool match2;
 
-		subkey = ft_collapsed_subkey_load(col, tier, e);
-		slen = ft_collapsed_subkey_unpack_slen(subkey);
-		if (slen == 0)
+		ft_collapsed_load_entry_view_rcu(col, tier, stride, e, &view);
+		if (view.slen == 0)
 			continue;
-		memcpy(suffix, &subkey, FT_COL_SUFFIX_MAX);
 		match2 = true;
-		for (j2 = 0; j2 < slen; j2++) {
-			if (suffix[j2] != ordinal_key[suffix_base + j2]) {
+		for (j2 = 0; j2 < view.slen; j2++) {
+			if (view.suffix[j2] != ordinal_key[suffix_base + j2]) {
 				match2 = false;
 				break;
 			}
 		}
 		if (match2) {
 			current_entry = (int) e;
-			cur_slen = slen;
+			cur_slen = view.slen;
+			cur_child_at_match = view.child;
 			break;
 		}
 	}
@@ -8411,8 +8388,7 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 	 * subtree), check the child node for siblings first.
 	 */
 	if (level > (ssize_t)(suffix_base + cur_slen)) {
-		struct cds_ft_inode_flag *child_flag =
-			ft_dereference_prefetch(entries[current_entry].child);
+		struct cds_ft_inode_flag *child_flag = cur_child_at_match;
 
 		child_flag = ft_resolve_skip_compressed(child_flag);
 		if (ft_node_ptr(child_flag) && ft_node_internal(child_flag)) {
@@ -8447,22 +8423,20 @@ enum ft_descent_action ft_inequality_going_up_collapsed(
 	 * observed live.
 	 */
 	{
-		uint64_t best_subkey;
+		uint8_t best_suffix[FT_COL_W_SUFFIX_MAX];
 		unsigned int best_slen;
 
-		best = ft_collapsed_find_nearest(col, tier,
+		best = ft_collapsed_find_nearest(col, tier, stride,
 			(unsigned) current_entry, dir, &best_child,
-			&best_subkey, &best_slen);
+			best_suffix, &best_slen);
 
 		if (best >= 0) {
 			unsigned int slen = best_slen;
-			uint8_t suffix[FT_COL_SUFFIX_MAX];
 			struct cds_ft_inode_flag *node_flag;
 			unsigned int k;
 
-			memcpy(suffix, &best_subkey, FT_COL_SUFFIX_MAX);
 			for (k = 0; k < slen; k++) {
-				ordinal_key[suffix_base + k] = suffix[k];
+				ordinal_key[suffix_base + k] = best_suffix[k];
 				if (k > 0)
 					iter_path_node(iter)[suffix_base + k] =
 						iter_path_node(iter)[level - 1];
