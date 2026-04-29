@@ -1973,18 +1973,6 @@ static const uint8_t ft_col_tier_prefix_stride[FT_COL_NR_TIERS] = {
 	[3] = FT_COL_T3_PREFIX_STRIDE,
 };
 
-/*
- * Tail mask: bits 0..(capacity-1) set.  Applied after the SIMD
- * cmpeq movemask to discard matches in unused slots.  Each tier's
- * mask fits comfortably in 32 bits (max capacity is 28).
- */
-static const uint32_t ft_col_tier_tail_mask[FT_COL_NR_TIERS] = {
-	[0] = (1U << FT_COL_T0_CAPACITY) - 1U,	/* 0x07 */
-	[1] = (1U << FT_COL_T1_CAPACITY) - 1U,	/* 0x7F */
-	[2] = (1U << FT_COL_T2_CAPACITY) - 1U,	/* 0x0FFF */
-	[3] = (1U << FT_COL_T3_CAPACITY) - 1U,	/* 0x0FFFFFFF */
-};
-
 /* Capacity of a collapsed node at the given tier. */
 static inline_lookup
 unsigned int ft_collapsed_capacity(unsigned int tier)
@@ -2024,6 +2012,99 @@ uint8_t *ft_collapsed_prefix_1(struct cds_ft_collapsed_node *col,
 {
 	return ((uint8_t *) col) + ft_col_tier_prefix_stride[tier];
 }
+
+/*
+ * SIMD prefix-cache match: AND of (prefix_0 == k0) and (prefix_1 == k1),
+ * returned as a per-slot bitmask (bit e set iff slot e matches both).
+ *
+ * Caller must guarantee at least one of {k0, k1} is non-zero.  Under
+ * that precondition, padding bytes (zero-init) and uninitialized slots
+ * cannot generate set bits, so no dynamic per-tier tail mask is needed
+ * for T0/T1/T2.  T3 only applies a static 0x0FFFFFFF mask to clear the
+ * 4 high bits in the 32-bit movemask result.
+ *
+ * The {0x00, 0x00} target case is handled by a separate fast-path
+ * bypass in the caller (only slot 0 can hold a \0\0-prefix entry under
+ * the strict sort invariant), so this helper is never called with
+ * k0 == 0 && k1 == 0.
+ */
+#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+static inline_lookup
+unsigned int ft_collapsed_simd_match(struct cds_ft_collapsed_node *col,
+		unsigned int tier, uint8_t k0, uint8_t k1)
+{
+	const uint8_t *p0 = ft_collapsed_prefix_0(col, tier);
+	const uint8_t *p1 = ft_collapsed_prefix_1(col, tier);
+	__m128i b0 = _mm_set1_epi8((char) k0);
+	__m128i b1 = _mm_set1_epi8((char) k1);
+	__m128i v0, v1, eq0, eq1, eqand;
+	unsigned int m;
+
+	switch (tier) {
+	case 0:
+	case 1: {
+		/*
+		 * 8-byte prefix arrays: load via 64-bit move into the low
+		 * half of an XMM, high half zero-extended.  cmpeq against
+		 * a non-zero broadcast leaves the high half as all-zero
+		 * lanes, contributing 0 bits to movemask.
+		 */
+		v0 = _mm_loadl_epi64((const __m128i *) p0);
+		v1 = _mm_loadl_epi64((const __m128i *) p1);
+		eq0 = _mm_cmpeq_epi8(v0, b0);
+		eq1 = _mm_cmpeq_epi8(v1, b1);
+		eqand = _mm_and_si128(eq0, eq1);
+		return (unsigned int) _mm_movemask_epi8(eqand);
+	}
+	case 2: {
+		v0 = _mm_load_si128((const __m128i *) p0);
+		v1 = _mm_load_si128((const __m128i *) p1);
+		eq0 = _mm_cmpeq_epi8(v0, b0);
+		eq1 = _mm_cmpeq_epi8(v1, b1);
+		eqand = _mm_and_si128(eq0, eq1);
+		return (unsigned int) _mm_movemask_epi8(eqand);
+	}
+	case 3:
+	default: {
+		__m128i v0a = _mm_load_si128((const __m128i *)(p0 + 0));
+		__m128i v0b = _mm_load_si128((const __m128i *)(p0 + 16));
+		__m128i v1a = _mm_load_si128((const __m128i *)(p1 + 0));
+		__m128i v1b = _mm_load_si128((const __m128i *)(p1 + 16));
+		__m128i ea = _mm_and_si128(_mm_cmpeq_epi8(v0a, b0),
+					   _mm_cmpeq_epi8(v1a, b1));
+		__m128i eb = _mm_and_si128(_mm_cmpeq_epi8(v0b, b0),
+					   _mm_cmpeq_epi8(v1b, b1));
+		unsigned int ma = (unsigned int) _mm_movemask_epi8(ea);
+		unsigned int mb = (unsigned int) _mm_movemask_epi8(eb);
+
+		m = ma | (mb << 16);
+		/*
+		 * T3's second 16B vector contributes 4 bytes of trailing
+		 * padding (capacity 28, vector width 32).  Clear bits
+		 * 28..31 so the candidate iterator never visits a
+		 * non-existent slot.
+		 */
+		return m & 0x0FFFFFFFU;
+	}
+	}
+}
+#else
+static inline_lookup
+unsigned int ft_collapsed_simd_match(struct cds_ft_collapsed_node *col,
+		unsigned int tier, uint8_t k0, uint8_t k1)
+{
+	const uint8_t *p0 = ft_collapsed_prefix_0(col, tier);
+	const uint8_t *p1 = ft_collapsed_prefix_1(col, tier);
+	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int m = 0, e;
+
+	for (e = 0; e < cap; e++) {
+		if (p0[e] == k0 && p1[e] == k1)
+			m |= 1U << e;
+	}
+	return m;
+}
+#endif /* __SSE2__ && !FT_NO_SIMD_CMP */
 
 /*
  * Count live entries (slots with child != NULL).
@@ -2234,6 +2315,32 @@ static inline
 bool ft_collapsed_entry_dead(struct cds_ft_collapsed_entry *entry)
 {
 	return uatomic_load(&entry->child, CMM_RELAXED) == NULL;
+}
+
+/*
+ * Write the SIMD prefix-cache bytes for a slot.  Entries always have
+ * slen >= 2 (enforced by ft_collapsed_min_slen at build time), so
+ * suffix[0] and suffix[1] are always valid.  The reader's SIMD path
+ * loads prefix_0 and prefix_1 as fixed-stride byte arrays and
+ * cmpeq's them against the target key's first two bytes; only the
+ * candidates that match are then SWAR-verified against the full
+ * suffix.
+ *
+ * Order:  prefix bytes are written before the entry's child pointer
+ * is release-stored.  The reader's acquire load on entry->child
+ * happens-after these writes, so when child is observed non-NULL,
+ * the prefix bytes (and suffix/len) are already visible.
+ */
+static inline
+void ft_collapsed_write_prefix_bytes(struct cds_ft_collapsed_node *col,
+		unsigned int tier, unsigned int e,
+		uint8_t b0, uint8_t b1)
+{
+	uint8_t *p0 = ft_collapsed_prefix_0(col, tier);
+	uint8_t *p1 = ft_collapsed_prefix_1(col, tier);
+
+	p0[e] = b0;
+	p1[e] = b1;
 }
 
 /*
@@ -5998,9 +6105,9 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
-	unsigned int cap = ft_collapsed_capacity(tier);
 	unsigned int remaining_key = key_depth - 1 - i;
-	unsigned int e;
+	unsigned int candidate_mask;
+	uint16_t target_prefix;
 
 	/*
 	 * Check external_nodes only when needed: for prefix
@@ -6023,17 +6130,52 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 	}
 
 	/*
-	 * Scalar scan over all tier-capacity slots.  Live entries are
-	 * filtered by child != NULL; the SIMD prefix-cache fast path
-	 * is added in a follow-up commit.  Live entries appear in
-	 * lexicographic order, but for an equality lookup the order
-	 * is irrelevant — we descend on the first match.
+	 * Every live entry has slen >= FT_COLLAPSE_SUFFIX_MIN (= 2),
+	 * enforced by the build path's per-tier suffix-min gate and
+	 * the in-place append gate.  When fewer than 2 key bytes
+	 * remain, no entry can match — fail fast.
 	 */
-	for (e = 0; e < cap; e++) {
+	if (remaining_key < 2) {
+		*status_ret = CDS_FT_STATUS_NOT_FOUND;
+		return FT_DESCENT_END;
+	}
+
+	/*
+	 * Compose the target's first two bytes into a 16-bit prefix.
+	 * The {0x00, 0x00} case is special-cased: under the strict
+	 * sort invariant, only slot 0 can hold a \0\0-prefix entry,
+	 * so we bypass SIMD entirely (uninitialized slots also read
+	 * as zero, which would otherwise generate false positives).
+	 *
+	 * For all other targets, the SIMD prefix scan returns a
+	 * candidate mask whose set bits identify slots whose
+	 * prefix_0/prefix_1 bytes both match the target.  Padding
+	 * bytes are zero-init'd; against a non-zero target lane,
+	 * they cannot generate spurious matches, so no per-tier
+	 * dynamic tail mask is needed (T3 alone uses a static
+	 * 0x0FFFFFFF mask, applied inside the helper).
+	 */
+	target_prefix = (uint16_t) key[0] | ((uint16_t) key[1] << 8);
+	if (caa_unlikely(target_prefix == 0))
+		candidate_mask = 1U;	/* slot 0 only */
+	else
+		candidate_mask = ft_collapsed_simd_match(col, tier,
+				key[0], key[1]);
+
+	/*
+	 * Iterate set bits in the candidate mask.  For each candidate
+	 * slot, acquire-load child to filter dead/uninitialized
+	 * slots, then verify the full suffix against the remaining
+	 * key.
+	 */
+	while (candidate_mask) {
+		unsigned int e = (unsigned int) __builtin_ctz(candidate_mask);
 		struct cds_ft_collapsed_entry *entry = &entries[e];
 		struct cds_ft_inode_flag *child;
 		unsigned int slen;
 		bool match;
+
+		candidate_mask &= candidate_mask - 1;
 
 		child = ft_dereference_acquire_prefetch(entry->child);
 		if (child == NULL)
@@ -6041,9 +6183,16 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 		slen = entry->len;
 		if (slen > remaining_key)
 			continue;
-		match = (ft_key_cmp_ordinals(key, entry->suffix, slen, slen, false, NULL) == 0);
-		if (!match)
-			continue;
+		/*
+		 * Bytes 0 and 1 already match (via prefix-cache or \0\0
+		 * bypass).  Verify the remaining slen-2 suffix bytes.
+		 */
+		if (slen > 2) {
+			match = (ft_key_cmp_ordinals(key + 2, entry->suffix + 2,
+					slen - 2, slen - 2, false, NULL) == 0);
+			if (!match)
+				continue;
+		}
 
 		/* Match found. Advance past the suffix. */
 		key += slen;
@@ -6188,17 +6337,36 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 	unsigned int tier = ft_collapsed_tier(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
 	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
-	unsigned int cap = ft_collapsed_capacity(tier);
 	const uint8_t *key = *key_p;
 	unsigned int i = *i_p;
 	unsigned int remaining = key_depth - i;
-	unsigned int e;
+	unsigned int candidate_mask;
+	uint16_t target_prefix;
 
-	for (e = 0; e < cap; e++) {
+	/*
+	 * Live entries have slen >= 2.  Fewer than 2 remaining key
+	 * bytes means no entry can match.
+	 */
+	if (remaining < 2) {
+		*not_found = true;
+		return FT_DESCENT_END;
+	}
+
+	target_prefix = (uint16_t) key[0] | ((uint16_t) key[1] << 8);
+	if (caa_unlikely(target_prefix == 0))
+		candidate_mask = 1U;	/* slot 0 only under sort invariant */
+	else
+		candidate_mask = ft_collapsed_simd_match(col, tier,
+				key[0], key[1]);
+
+	while (candidate_mask) {
+		unsigned int e = (unsigned int) __builtin_ctz(candidate_mask);
 		struct cds_ft_collapsed_entry *entry = &entries[e];
 		struct cds_ft_inode_flag *child;
 		unsigned int slen;
 		bool match;
+
+		candidate_mask &= candidate_mask - 1;
 
 		child = ft_dereference_acquire_prefetch(entry->child);
 		if (child == NULL)
@@ -6206,9 +6374,12 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 		slen = entry->len;
 		if (slen > remaining)
 			continue;
-		match = (ft_key_cmp_ordinals(key, entry->suffix, slen, slen, false, NULL) == 0);
-		if (!match)
-			continue;
+		if (slen > 2) {
+			match = (ft_key_cmp_ordinals(key + 2, entry->suffix + 2,
+					slen - 2, slen - 2, false, NULL) == 0);
+			if (!match)
+				continue;
+		}
 
 		*key_p = key + slen;
 		*i_p = i + slen - 1;
@@ -9685,6 +9856,9 @@ emit_entry:
 		for (k = 0; k < slen; k++)
 			entry->suffix[k] = suffix_buf[k];
 		entry->len = (uint8_t) slen;
+		/* Prefix-cache bytes for the SIMD reader fast path. */
+		ft_collapsed_write_prefix_bytes(col, tier, idx,
+			suffix_buf[0], suffix_buf[1]);
 		/*
 		 * Pre-publish: the candidate is still private to the
 		 * builder, no readers can see it yet.  The caller publishes
@@ -12001,7 +12175,13 @@ enum ft_descent_action ft_insert_collapsed(struct cds_ft *ft,
 	new_slen = remaining;
 	high_water = ft_collapsed_high_water(col, tier);
 
-	if (new_slen == 0 || new_slen > FT_COL_SUFFIX_MAX)
+	/*
+	 * Suffix length must be in [SUFFIX_MIN..SUFFIX_MAX].  The lower
+	 * bound preserves the SIMD path invariant that every live entry
+	 * has a valid prefix_1 byte; the upper bound is the per-entry
+	 * cap.  Anything outside falls through to explode.
+	 */
+	if (new_slen < FT_COLLAPSE_SUFFIX_MIN || new_slen > FT_COL_SUFFIX_MAX)
 		goto collapsed_explode;
 	if (high_water >= cap)
 		goto collapsed_explode;
@@ -12036,11 +12216,19 @@ enum ft_descent_action ft_insert_collapsed(struct cds_ft *ft,
 			new_entry->suffix[k] = iter_key[k];
 	}
 	new_entry->len = (uint8_t) new_slen;
+	/*
+	 * Prefix-cache bytes for the SIMD reader fast path.  Entries
+	 * always have slen >= 2 (enforced by the build path's
+	 * suffix-min gate), so iter_key[0] and iter_key[1] are valid.
+	 */
+	ft_collapsed_write_prefix_bytes(col, tier, high_water,
+		iter_key[0], iter_key[1]);
 	ft_set_parent(branch, d->nf, &new_entry->child);
 	/*
-	 * Publish: release-store the child pointer.  Suffix and len
-	 * are written above before the release-store; readers' acquire
-	 * load on entry->child happens-after these stores.
+	 * Publish: release-store the child pointer.  Suffix, len, and
+	 * prefix bytes are written above before the release-store;
+	 * readers' acquire load on entry->child happens-after these
+	 * stores.
 	 */
 	ft_collapsed_publish_entry(col, tier, high_water, branch);
 	FT_TP(collapsed_entry,
