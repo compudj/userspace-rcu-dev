@@ -471,27 +471,25 @@ struct cds_ft_compressed_node {
  *
  * Two-zone layout (node allocation >= 128 bytes, cache-line aligned):
  *
- *   Zone 1 (scan zone, variable size: 32, 64, 128, or 256 bytes):
+ *   Zone 1 (scan zone, variable size: 32 or 64 bytes):
  *     [nr_entries] [offset_0] [offset_1] ... → ← ... [suffix_1] [suffix_0]
  *     Offset array grows left-to-right; suffix data grows right-to-left.
- *     Scan zone size encoded in bits 6-7 of nr_entries.
+ *     Scan zone size encoded in bit 6 of nr_entries.
  *
  *   Zone 2 (pointer zone, starts at scan zone end):
  *     [ptr_0] [ptr_1] ... [ptr_{nr_entries-1}]
  *     Child pointers (struct cds_ft_inode_flag *), any node type.
  *
  * nr_entries encoding (uint8_t):
- *   bits 7-6 = scan zone size selector:
- *     00 = 32B  (half cache line, FT_COLLAPSED_SCAN_32)
- *     01 = 64B  (1 cache line, FT_COLLAPSED_SCAN_64)
- *     10 = 128B (2 cache lines, FT_COLLAPSED_SCAN_128)
- *     11 = 256B (4 cache lines, FT_COLLAPSED_SCAN_256)
+ *   bit  6   = scan zone size selector:
+ *     0 = 32B  (half cache line, FT_COLLAPSED_SCAN_32)
+ *     1 = 64B  (1 cache line, FT_COLLAPSED_SCAN_64)
+ *   bit  7   = unused (must be 0)
  *   bits 5-0 = entry count (max 63)
  *
  * entry_offset[i] encoding (uint8_t):
  *   bit 7 (0x80) = tombstone marker (1 = dead entry, 0 = live)
  *   bits 0-6     = byte offset from start of node to entry i's suffix
- *                  (for 256B scan zone, full 8-bit offset without tombstone)
  *
  * Suffix length derivation:
  *   Entry 0: suffix_len = scan_zone_size - (offset[0] & offset_mask)
@@ -500,10 +498,8 @@ struct cds_ft_compressed_node {
  * Lookup: scan zone 1 to find matching suffix, then
  * load ptr[i] from zone 2.
  */
-#define FT_COLLAPSED_SCAN_32		0	/* bits 7-6 = 00 */
-#define FT_COLLAPSED_SCAN_64		1	/* bits 7-6 = 01 */
-#define FT_COLLAPSED_SCAN_128		2	/* bits 7-6 = 10 */
-#define FT_COLLAPSED_SCAN_256		3	/* bits 7-6 = 11 */
+#define FT_COLLAPSED_SCAN_32		0	/* bit 6 = 0 */
+#define FT_COLLAPSED_SCAN_64		1	/* bit 6 = 1 */
 #define FT_COLLAPSED_SCAN_SHIFT		6
 #define FT_COLLAPSED_NR_ENTRIES_MASK	0x3F
 
@@ -514,7 +510,7 @@ struct cds_ft_compressed_node {
 #define FT_COLLAPSED_SCAN_ZONE_SIZE	64
 
 /* Maximum scan zone size across all selectors (for stack buffers). */
-#define FT_COLLAPSED_SCAN_ZONE_MAX	256
+#define FT_COLLAPSED_SCAN_ZONE_MAX	64
 
 struct cds_ft_collapsed_node {
 	uint8_t nr_entries;			/* Bits 7-6: scan zone selector.
@@ -628,8 +624,7 @@ struct cds_ft {
 	 * percent (100 = 1.0×).  Models scan-loop overhead the raw
 	 * CL load count doesn't capture (loop dispatch, byte
 	 * compares, branch-on-match, reduced ILP).  Larger values
-	 * reject more SCAN_256-targeted collapses since the
-	 * multiplier hits avg_scan_CL=2 there.  Loaded with relaxed
+	 * reject more borderline-cost collapses.  Loaded with relaxed
 	 * atomics on the write path; retunable on a live trie.
 	 *
 	 * Default CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT (225) chosen
