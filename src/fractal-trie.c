@@ -3496,6 +3496,91 @@ static inline void ft_maybe_prefetch(const void *ptr)
 
 #ifdef FEATURE_FT_COLLAPSE
 /*
+ * Stride-agnostic loaded-entry view.  Used by reader sites that need
+ * to inspect the full suffix bytes (for ordered comparisons, ranged
+ * scans, n-th selection, etc.) without specializing their bodies on
+ * the per-stride struct types.
+ *
+ * @suffix is sized for FT_COL_W_SUFFIX_MAX (the maximum across both
+ * strides); narrow loads populate the first FT_COL_SUFFIX_MAX bytes
+ * (bytes 7..22 are uninitialized but @slen <= 7 keeps callers from
+ * inspecting them).
+ *
+ * Populated by ft_collapsed_load_entry_view_rcu and consumed by the
+ * ft_for_each_live_collapsed_entry_view_rcu iteration macro.
+ */
+struct ft_col_view {
+	uint8_t suffix[FT_COL_W_SUFFIX_MAX];
+	unsigned int slen;		/* 0 = unpublished slot */
+	struct cds_ft_inode_flag *child; /* NULL = dead slot */
+};
+
+/*
+ * Load a slot's atomic snapshot into @view.  Stride dispatch:
+ *
+ *   Narrow: subkey 8B SWAR load; suffix bytes are the low 7 bytes
+ *           of the packed word, copied byte-by-byte into @view.
+ *
+ *   Wide:   acquire-load @len, then plain reads of suffix bytes
+ *           [0..slen-1] (synchronized via the acquire).
+ *
+ * For both strides @child is rcu_dereference'd (with prefetch).
+ *
+ * Callers must filter unpublished (slen == 0) and dead (child ==
+ * NULL) slots — that is the job of the iteration macro below.
+ */
+static inline_lookup
+void ft_collapsed_load_entry_view_rcu(struct cds_ft_collapsed_node *col,
+		unsigned int tier, unsigned int stride, unsigned int e,
+		struct ft_col_view *view)
+{
+	if (stride == FT_COL_STRIDE_NARROW) {
+		struct cds_ft_collapsed_entry *entry =
+				&ft_collapsed_entries(col, tier)[e];
+		uint64_t subkey = ft_collapsed_subkey_load(col, tier, e);
+		unsigned int slen = ft_collapsed_subkey_unpack_slen(subkey);
+		union ft_collapsed_subkey_word u;
+		unsigned int k;
+
+		u.v = subkey;
+		view->slen = slen;
+		for (k = 0; k < FT_COL_SUFFIX_MAX; k++)
+			view->suffix[k] = u.b[k];
+		view->child = ft_dereference_prefetch(entry->child);
+	} else {
+		struct cds_ft_collapsed_entry_wide *entry =
+				&ft_collapsed_entries_wide(col, tier)[e];
+		unsigned int slen = ft_collapsed_wide_load_slen(col, tier, e);
+		unsigned int k;
+
+		view->slen = slen;
+		for (k = 0; k < slen; k++)
+			view->suffix[k] = entry->suffix[k];
+		view->child = ft_dereference_prefetch(entry->child);
+	}
+}
+
+/*
+ * Stride-agnostic reader iteration macro.  Per slot:
+ *   - load the entry view (suffix, slen, child) via the
+ *     stride-aware loader;
+ *   - skip slots that are unpublished (slen == 0) or dead
+ *     (child == NULL);
+ *   - body sees the @view structure; @suffix[0..slen-1] is
+ *     valid, @child is the live pointer.
+ *
+ * @view must be a struct ft_col_view declared by the caller.
+ *
+ * Wrap the body in `{ ... }` to avoid dangling-else hazards.
+ */
+#define ft_for_each_live_collapsed_entry_view_rcu(_col, _tier, _stride, _e, _view)	\
+	for ((_e) = 0; (_e) < ft_collapsed_capacity_stride((_tier), (_stride)); (_e)++)	\
+		if ((ft_collapsed_load_entry_view_rcu((_col), (_tier), (_stride), (_e), &(_view)),	\
+		     (_view).slen == 0 || (_view).child == NULL))	\
+			continue;					\
+		else
+
+/*
  * Stride-aware reader-side candidate match.  Given a slot index @e
  * (typically yielded by the SIMD prefilter or the (0,0) bypass scan),
  * loads the slot's atomic snapshot, verifies the suffix bytes match
@@ -7774,29 +7859,24 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	unsigned int tier = ft_collapsed_tier(node_flag);
+	unsigned int stride = ft_collapsed_stride(node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(node_flag);
-	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
 	int level = *level_p;
 	unsigned int remaining = key_depth - level;
 	unsigned int e;
-	struct cds_ft_collapsed_entry *entry;
-	uint64_t cur_subkey;
-	unsigned int cur_slen;
-	struct cds_ft_inode_flag *cur_child;
+	struct ft_col_view view;
 	int best_match = -1;	/* index of best directional match */
-	uint64_t best_match_subkey = 0;
+	uint8_t best_match_suffix[FT_COL_W_SUFFIX_MAX];
 	unsigned int best_match_slen = 0;
 	struct cds_ft_inode_flag *best_match_child = NULL;
 
-	ft_for_each_live_collapsed_entry_rcu(col, tier, e, entry,
-			cur_subkey, cur_slen, cur_child) {
-		unsigned int slen = cur_slen, cmp;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
+	ft_for_each_live_collapsed_entry_view_rcu(col, tier, stride, e, view) {
+		unsigned int slen = view.slen, cmp;
+		const uint8_t *suffix = view.suffix;
 		const uint8_t *cmp_key;
 		uint8_t last_key_buf[FT_MAX_KEY_LEN];
 		int cmp_result;
 
-		memcpy(suffix, &cur_subkey, FT_COL_SUFFIX_MAX);
 		cmp = slen < remaining ? slen : remaining;
 
 		/* Build contiguous comparison key for this limit mode. */
@@ -7853,7 +7933,7 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 				 */
 				if (slen == 1)
 					iter_path_node(iter)[level - 1] = node_flag;
-				node_flag = cur_child;
+				node_flag = view.child;
 				if (!ft_node_ptr(node_flag)) {
 					*node_flag_p = node_flag;
 					*level_p = level;
@@ -7886,64 +7966,57 @@ enum ft_descent_action ft_inequality_collapsed(struct cds_ft_inode_flag **node_f
 		if ((mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT) && cmp_result < 0) {
 			if (best_match < 0) {
 				best_match = (int)e;
-				best_match_subkey = cur_subkey;
+				memcpy(best_match_suffix, suffix, slen);
 				best_match_slen = slen;
-				best_match_child = cur_child;
+				best_match_child = view.child;
 			} else {
 				/* Keep the smallest. */
-				uint8_t bs[FT_COL_SUFFIX_MAX];
 				unsigned int bl = best_match_slen;
 				unsigned int mc = bl < slen ? bl : slen;
 				int r;
 
-				memcpy(bs, &best_match_subkey, FT_COL_SUFFIX_MAX);
-				r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
-							true, NULL);
+				r = ft_key_cmp_ordinals(suffix, best_match_suffix,
+							mc, mc, true, NULL);
 
 				if (r < 0 || (r == 0 && slen < bl)) {
 					best_match = (int)e;
-					best_match_subkey = cur_subkey;
+					memcpy(best_match_suffix, suffix, slen);
 					best_match_slen = slen;
-					best_match_child = cur_child;
+					best_match_child = view.child;
 				}
 			}
 		} else if ((mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) && cmp_result > 0) {
 			if (best_match < 0) {
 				best_match = (int)e;
-				best_match_subkey = cur_subkey;
+				memcpy(best_match_suffix, suffix, slen);
 				best_match_slen = slen;
-				best_match_child = cur_child;
+				best_match_child = view.child;
 			} else {
 				/* Keep the largest. */
-				uint8_t bs[FT_COL_SUFFIX_MAX];
 				unsigned int bl = best_match_slen;
 				unsigned int mc = bl < slen ? bl : slen;
 				int r;
 
-				memcpy(bs, &best_match_subkey, FT_COL_SUFFIX_MAX);
-				r = ft_key_cmp_ordinals(suffix, bs, mc, mc,
-							true, NULL);
+				r = ft_key_cmp_ordinals(suffix, best_match_suffix,
+							mc, mc, true, NULL);
 
 				if (r > 0 || (r == 0 && slen > bl)) {
 					best_match = (int)e;
-					best_match_subkey = cur_subkey;
+					memcpy(best_match_suffix, suffix, slen);
 					best_match_slen = slen;
-					best_match_child = cur_child;
+					best_match_child = view.child;
 				}
 			}
 		}
 	}
-	(void) entries;
 
 	if (best_match >= 0) {
 		/* Descend into the best directional match. */
 		unsigned int slen = best_match_slen;
-		uint8_t suffix[FT_COL_SUFFIX_MAX];
 		unsigned int k;
 
-		memcpy(suffix, &best_match_subkey, FT_COL_SUFFIX_MAX);
 		for (k = 0; k < slen; k++) {
-			ordinal_key[level - 1 + k] = suffix[k];
+			ordinal_key[level - 1 + k] = best_match_suffix[k];
 			iter_path_node(iter)[level + k] = node_flag;
 		}
 		level += slen - 1;
