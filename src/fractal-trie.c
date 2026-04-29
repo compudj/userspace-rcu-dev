@@ -1978,11 +1978,19 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
  * Indexed by tier (0..3) recovered from a collapsed-node tagged
  * pointer via ft_collapsed_tier().
  */
-static const uint8_t ft_col_tier_capacity[FT_COL_NR_TIERS] = {
-	[0] = FT_COL_T0_CAPACITY,
-	[1] = FT_COL_T1_CAPACITY,
-	[2] = FT_COL_T2_CAPACITY,
-	[3] = FT_COL_T3_CAPACITY,
+static const uint8_t ft_col_tier_capacity[FT_COL_NR_STRIDES][FT_COL_NR_TIERS] = {
+	[FT_COL_STRIDE_NARROW] = {
+		[0] = FT_COL_T0_CAPACITY,
+		[1] = FT_COL_T1_CAPACITY,
+		[2] = FT_COL_T2_CAPACITY,
+		[3] = FT_COL_T3_CAPACITY,
+	},
+	[FT_COL_STRIDE_WIDE] = {
+		[0] = FT_COL_W_T0_CAPACITY,
+		[1] = FT_COL_W_T1_CAPACITY,
+		[2] = FT_COL_W_T2_CAPACITY,
+		[3] = FT_COL_W_T3_CAPACITY,
+	},
 };
 
 static const uint8_t ft_col_tier_alloc_order[FT_COL_NR_TIERS] = {
@@ -2006,23 +2014,70 @@ static const uint8_t ft_col_tier_prefix_stride[FT_COL_NR_TIERS] = {
 	[3] = FT_COL_T3_PREFIX_STRIDE,
 };
 
-/* Capacity of a collapsed node at the given tier. */
+/* Per-stride entry size: 16B narrow / 32B wide. */
+static const uint8_t ft_col_stride_entry_size[FT_COL_NR_STRIDES]
+		__attribute__((unused)) = {
+	[FT_COL_STRIDE_NARROW]	= FT_COL_ENTRY_SIZE,
+	[FT_COL_STRIDE_WIDE]	= FT_COL_W_ENTRY_SIZE,
+};
+
+/* Per-stride suffix-byte cap: 7 narrow / 23 wide. */
+static const uint8_t ft_col_stride_suffix_max[FT_COL_NR_STRIDES]
+		__attribute__((unused)) = {
+	[FT_COL_STRIDE_NARROW]	= FT_COL_SUFFIX_MAX,
+	[FT_COL_STRIDE_WIDE]	= FT_COL_W_SUFFIX_MAX,
+};
+
+/*
+ * Capacity of a collapsed node at the given (tier, stride).  Narrow
+ * is the existing 16B-entry layout; wide halves the entry count per
+ * tier in exchange for a 23-byte inline suffix.
+ */
 static inline_lookup
-unsigned int ft_collapsed_capacity(unsigned int tier)
+unsigned int ft_collapsed_capacity_stride(unsigned int tier, unsigned int stride)
 {
-	return ft_col_tier_capacity[tier];
+	return ft_col_tier_capacity[stride][tier];
 }
 
 /*
- * Pointer to the entries[] array.  Each entry is 16 bytes; the array
- * starts at a tier-dependent header offset (16B for T0/T1, 64B for
- * T2/T3) so it is 16-byte aligned for SWAR.
+ * Narrow-stride shorthand — preserved for the existing call sites
+ * that have not yet been ported to stride-aware iteration.  Each
+ * such caller is implicitly working on a narrow node (the only
+ * stride that currently exists in the wild).
+ */
+static inline_lookup
+unsigned int ft_collapsed_capacity(unsigned int tier)
+{
+	return ft_collapsed_capacity_stride(tier, FT_COL_STRIDE_NARROW);
+}
+
+/*
+ * Pointer to the narrow entries[] array.  Each entry is 16 bytes;
+ * the array starts at a tier-dependent header offset (16B for T0/T1,
+ * 64B for T2/T3) so it is 16-byte aligned for SWAR.
+ *
+ * Wide nodes use ft_collapsed_entries_wide() instead — the header
+ * offset is identical, but the per-entry stride is 32B and the typed
+ * pointer differs.
  */
 static inline_lookup
 struct cds_ft_collapsed_entry *ft_collapsed_entries(
 		struct cds_ft_collapsed_node *col, unsigned int tier)
 {
 	return (struct cds_ft_collapsed_entry *)
+		(((uint8_t *) col) + ft_col_tier_header_size[tier]);
+}
+
+/*
+ * Pointer to the wide entries[] array.  Each entry is 32 bytes; the
+ * array starts at the same tier-dependent header offset as the
+ * narrow case (header size is stride-invariant).
+ */
+static inline_lookup
+struct cds_ft_collapsed_entry_wide *ft_collapsed_entries_wide(
+		struct cds_ft_collapsed_node *col, unsigned int tier)
+{
+	return (struct cds_ft_collapsed_entry_wide *)
 		(((uint8_t *) col) + ft_col_tier_header_size[tier]);
 }
 
@@ -3149,7 +3204,7 @@ void free_collapsed_node_unpublished(struct cds_ft *ft,
 static inline
 unsigned int ft_collapsed_max_entries(unsigned int tier)
 {
-	return ft_col_tier_capacity[tier];
+	return ft_collapsed_capacity(tier);
 }
 
 #define __FT_ALIGN_MASK(v, mask)	(((v) + (mask)) & ~(mask))

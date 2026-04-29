@@ -600,45 +600,76 @@ struct cds_ft_compressed_node {
 
 /* Per-tier compile-time constants. */
 #define FT_COL_NR_TIERS			4U
-#define FT_COL_SUFFIX_MAX		7U	/* per-entry suffix bytes */
-#define FT_COL_ENTRY_SIZE		16U	/* bytes per entry */
+#define FT_COL_SUFFIX_MAX		7U	/* narrow per-entry suffix bytes */
+#define FT_COL_ENTRY_SIZE		16U	/* narrow bytes per entry */
+#define FT_COL_W_SUFFIX_MAX		23U	/* wide per-entry suffix bytes */
+#define FT_COL_W_ENTRY_SIZE		32U	/* wide bytes per entry */
 
-/* Tier 0: 64B alloc, 3 entries, 16B header. */
+/*
+ * Per-tier sizing — narrow stride (16-byte entries, 7-byte suffix).
+ * Header size, alloc order, and prefix stride are stride-invariant:
+ * the prefix arrays are sized to fit the tier's narrow capacity, and
+ * the wide variant's smaller capacity uses only a prefix-array prefix
+ * of the same stride (zero-initialized tail bytes are filtered by the
+ * SIMD comparator's non-zero-target precondition or the (0,0) bypass).
+ */
+
+/* Tier 0: 64B alloc, narrow=3 / wide=1 entries, 16B header. */
 #define FT_COL_T0_CAPACITY		3U
+#define FT_COL_W_T0_CAPACITY		1U
 #define FT_COL_T0_ALLOC_ORDER		6U
 #define FT_COL_T0_HEADER_SIZE		16U
 #define FT_COL_T0_PREFIX_STRIDE		8U
 
-/* Tier 1: 128B alloc, 7 entries, 16B header. */
+/* Tier 1: 128B alloc, narrow=7 / wide=3 entries, 16B header. */
 #define FT_COL_T1_CAPACITY		7U
+#define FT_COL_W_T1_CAPACITY		3U
 #define FT_COL_T1_ALLOC_ORDER		7U
 #define FT_COL_T1_HEADER_SIZE		16U
 #define FT_COL_T1_PREFIX_STRIDE		8U
 
-/* Tier 2: 256B alloc, 12 entries, 64B header. */
+/* Tier 2: 256B alloc, narrow=12 / wide=6 entries, 64B header. */
 #define FT_COL_T2_CAPACITY		12U
+#define FT_COL_W_T2_CAPACITY		6U
 #define FT_COL_T2_ALLOC_ORDER		8U
 #define FT_COL_T2_HEADER_SIZE		64U
 #define FT_COL_T2_PREFIX_STRIDE		16U
 
-/* Tier 3: 512B alloc, 28 entries, 64B header. */
+/* Tier 3: 512B alloc, narrow=28 / wide=14 entries, 64B header. */
 #define FT_COL_T3_CAPACITY		28U
+#define FT_COL_W_T3_CAPACITY		14U
 #define FT_COL_T3_ALLOC_ORDER		9U
 #define FT_COL_T3_HEADER_SIZE		64U
 #define FT_COL_T3_PREFIX_STRIDE		32U
 
-/* Maximum capacity across all tiers (for stack buffers). */
+/* Maximum capacity across all tiers and strides (for stack buffers). */
 #define FT_COL_CAPACITY_MAX		FT_COL_T3_CAPACITY
 
 /*
- * One collapsed entry — fixed 16-byte record.  Suffix bytes and
- * length share a uint64_t SWAR word for one-shot verification.
+ * One narrow collapsed entry — fixed 16-byte record.  Suffix bytes
+ * and length share a uint64_t SWAR word for one-shot verification.
  */
 struct cds_ft_collapsed_entry {
 	uint8_t suffix[FT_COL_SUFFIX_MAX];	/* bytes 0..6 — suffix data */
 	uint8_t len;				/* byte  7    — 1..7 (0 = born dead) */
 	struct cds_ft_inode_flag *child;	/* bytes 8..15 — NULL = dead slot */
 } __attribute__((__aligned__(FT_COL_ENTRY_SIZE)));
+
+/*
+ * One wide collapsed entry — fixed 32-byte record.  Holds suffixes
+ * up to 23 bytes inline, avoiding a nested compressed child for
+ * absorbed paths whose segment lengths exceed the narrow cap.
+ *
+ * The 24-byte (suffix,len) span is too large for a single 8-byte
+ * SWAR write, so wide entries publish via the release-acquire scheme
+ * on @len for both 64-bit and 32-bit hosts (cf. narrow 32-bit path).
+ * Reader: acquire-load @len, then plain reads of suffix[0..len-1].
+ */
+struct cds_ft_collapsed_entry_wide {
+	uint8_t suffix[FT_COL_W_SUFFIX_MAX];	/* bytes 0..22 — suffix data */
+	uint8_t len;				/* byte 23     — 1..23 (0 = born dead) */
+	struct cds_ft_inode_flag *child;	/* bytes 24..31 — NULL = dead slot */
+} __attribute__((__aligned__(FT_COL_W_ENTRY_SIZE)));
 
 /*
  * Collapsed-node base type — opaque outside accessor helpers.  The
