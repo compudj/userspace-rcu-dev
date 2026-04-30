@@ -14684,9 +14684,9 @@ void ft_detach_node_replace_collapsed_parent(struct cds_ft *ft,
 		unsigned int cur_depth)
 {
 	unsigned int tier = ft_collapsed_tier(iter_node_flag);
+	unsigned int stride = ft_collapsed_stride(iter_node_flag);
 	struct cds_ft_collapsed_node *col = ft_collapsed_node_ptr(iter_node_flag);
-	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
-	unsigned int cap = ft_collapsed_capacity(tier);
+	unsigned int cap = ft_collapsed_capacity_stride(tier, stride);
 	struct cds_ft_metadata *col_meta = cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) col);
 	unsigned int e;
@@ -14730,9 +14730,13 @@ void ft_detach_node_replace_collapsed_parent(struct cds_ft *ft,
 	 * entry.  nr_child stays >= 1 in both.
 	 */
 	for (e = 0; e < cap; e++) {
-		struct cds_ft_collapsed_entry *entry = &entries[e];
+		struct cds_ft_inode_flag **child_addr;
 
-		if (&entry->child != detach_node_flag_ptr)
+		if (stride == FT_COL_STRIDE_NARROW)
+			child_addr = &ft_collapsed_entries(col, tier)[e].child;
+		else
+			child_addr = &ft_collapsed_entries_wide(col, tier)[e].child;
+		if (child_addr != detach_node_flag_ptr)
 			continue;
 		if (topmost_external_nodes) {
 			/*
@@ -14747,9 +14751,9 @@ void ft_detach_node_replace_collapsed_parent(struct cds_ft *ft,
 			 */
 			ft_set_parent(
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
-				iter_node_flag, &entry->child);
+				iter_node_flag, child_addr);
 			ft_publish_to_parent(ft, iter_node_flag,
-				&entry->child,
+				child_addr,
 				(struct cds_ft_inode_flag *) topmost_external_nodes);
 		} else {
 			/*
@@ -14758,7 +14762,10 @@ void ft_detach_node_replace_collapsed_parent(struct cds_ft *ft,
 			 * is never reused.  Only reached when col.nr_child > 1.
 			 */
 			assert(col_meta->nr_child > 1);
-			ft_collapsed_kill_entry(col, tier, e);
+			if (stride == FT_COL_STRIDE_NARROW)
+				ft_collapsed_kill_entry(col, tier, e);
+			else
+				ft_collapsed_wide_kill_entry(col, tier, e);
 			FT_TP(collapsed_entry,
 				(const void *) ft_collapsed_node_flag_tier(col, tier), e,
 				(const uint8_t *) NULL, 0U,
