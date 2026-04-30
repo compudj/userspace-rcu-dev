@@ -128,6 +128,10 @@ struct cds_ft_group_attr {
 	size_t max_key_len;
 	struct cds_ft_key_map key_map;
 	unsigned int flags;
+	bool speculative;
+	bool speculative_validated;
+	size_t speculative_key_offset;
+	size_t speculative_key_len_offset;
 };
 
 struct cds_ft_attr {
@@ -7038,6 +7042,13 @@ enum ft_descent_action ft_traverse_collapsed(
  * during traversal (patricia-like mode).  The returned node is a
  * candidate that must be verified by the caller against their
  * stored key.  Constant-folded at each call site.
+ *
+ * When the group enables speculative_validated and the caller did
+ * not request candidate semantics, descend with cand-mode anyway and
+ * validate the result against the external node's stored key before
+ * returning.  Limited to equality lookups (tracking == NONE) and
+ * identity key_map (the user's stored key matches the trie's byte
+ * order without reverse-mapping).
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
@@ -7054,6 +7065,11 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	struct cds_ft_node *found = NULL;
 	unsigned int key_depth, i;
 	enum cds_ft_status status;
+	bool spec_validate = !candidate
+			&& ft->group->speculative_validated
+			&& ft->group->key_map.identity
+			&& tracking == FT_PREFIX_TRACK_NONE;
+	bool descend_cand = candidate || spec_validate;
 	size_t iter_path_len = 0;
 	bool track = (tracking != FT_PREFIX_TRACK_NONE);
 	bool track_longest = (tracking == FT_PREFIX_TRACK_LONGEST);
@@ -7137,7 +7153,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 */
 		if (skip_compressed &&
 		    caa_unlikely(ft_node_skip_compressed(node_flag))) {
-			if (!candidate) {
+			if (!descend_cand) {
 				node_flag = ft_compressed_node_flag(
 					ft_skip_to_compressed(node_flag));
 			} else {
@@ -7183,7 +7199,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
 					&match_len, &match_node, &found, &status,
-					candidate);
+					descend_cand);
 				if (act == FT_DESCENT_END)
 					goto end;
 				if (act == FT_DESCENT_BREAK)
@@ -7198,7 +7214,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
 					&match_len, &match_node, &found, &status,
-					candidate);
+					descend_cand);
 				if (act == FT_DESCENT_END)
 					goto end;
 				if (act == FT_DESCENT_BREAK)
@@ -7218,7 +7234,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		}
 
 		iter_key = *(key++);
-		if (candidate)
+		if (descend_cand)
 			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_DATA);
 		else if (!skip_compressed)
 			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_DATA);
@@ -7242,7 +7258,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * compressed path without comparison).
 		 */
 		if (skip_compressed && caa_unlikely(ft_node_skip_compressed(node_flag))) {
-			if (!candidate) {
+			if (!descend_cand) {
 				node_flag = ft_compressed_node_flag(
 					ft_skip_to_compressed(node_flag));
 				continue;
@@ -7350,6 +7366,41 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	}
 
 end:
+	/*
+	 * Speculative-validated lookup: when the group enables library-
+	 * side validation and the descent ran in cand mode (spec_validate
+	 * implies descend_cand was set internally), verify the candidate
+	 * found at the leaf against the user's stored key bytes via the
+	 * inline SIMD/SWAR comparator before reporting success.  A
+	 * mismatch — caused by a wrong descent through a multi-byte
+	 * compressed/collapsed prefix that the cand-mode descent did not
+	 * verify — is reported as NOT_FOUND.
+	 */
+	if (spec_validate && status == CDS_FT_STATUS_OK && found) {
+		const struct cds_ft_group *group = ft->group;
+		const uint8_t *stored_key =
+			(const uint8_t *) found + group->speculative_key_offset;
+		bool match = true;
+
+		if (group->speculative_key_len_offset !=
+				CDS_FT_SPECULATIVE_OFFSET_NONE) {
+			size_t stored_len = *(const size_t *)
+				((const uint8_t *) found +
+				 group->speculative_key_len_offset);
+			if (stored_len != _key_len)
+				match = false;
+		}
+		if (match && key_len > 0 &&
+		    ft_key_cmp_ordinals(key, stored_key,
+				(unsigned int) key_len,
+				(unsigned int) key_len,
+				false, NULL) != 0)
+			match = false;
+		if (!match) {
+			found = NULL;
+			status = CDS_FT_STATUS_NOT_FOUND;
+		}
+	}
 	if (result_node)
 		*result_node = found;
 	if (iter) {
@@ -19986,6 +20037,7 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	attr->key_len = CDS_FT_LEN_DEFAULT;
 	attr->max_key_len = FT_MAX_KEY_LEN;
 	attr->key_map.identity = true;
+	attr->speculative_key_len_offset = CDS_FT_SPECULATIVE_OFFSET_NONE;
 	*result = attr;
 	return CDS_FT_STATUS_OK;
 }
@@ -20053,18 +20105,68 @@ bool ft_skip_compressed_validate(void)
 }
 #endif
 
-enum cds_ft_status cds_ft_group_attr_set_flags(struct cds_ft_group_attr *attr,
-		unsigned int flags)
+enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *attr)
 {
+	/*
+	 * Speculative-only mode requires skip-compressed pointer encoding
+	 * to be useful: without it, cds_ft_lookup_candidate_key already
+	 * does cand-mode descent regardless of the group attr (the
+	 * candidate flag is gated by the API entry point, not the group),
+	 * and cds_ft_lookup_key stays on the precise path (no offsets to
+	 * validate against).  When skip-compressed is unavailable on the
+	 * build/host, this attribute would be a no-op, so report it as
+	 * unsupported rather than silently doing nothing.
+	 */
 #ifndef FEATURE_FT_SKIP_COMPRESSED
-	if (flags & CDS_FT_FLAG_SKIP_COMPRESSED)
-		return CDS_FT_STATUS_NOT_SUPPORTED;
+	(void) attr;
+	return CDS_FT_STATUS_NOT_SUPPORTED;
 #else
-	if ((flags & CDS_FT_FLAG_SKIP_COMPRESSED) &&
-	    !ft_skip_compressed_validate())
+	if (!ft_skip_compressed_validate())
 		return CDS_FT_STATUS_NOT_SUPPORTED;
+	attr->speculative = true;
+	attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
+	return CDS_FT_STATUS_OK;
 #endif
-	attr->flags = flags;
+}
+
+enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
+		struct cds_ft_group_attr *attr,
+		size_t key_offset,
+		size_t key_len_offset)
+{
+	/*
+	 * Reject a non-NONE key_len_offset on a fixed-length-key group
+	 * to catch misuse early — fixed-length groups derive key length
+	 * from the trie and never read it from the external node.
+	 */
+	if (attr->key_len != CDS_FT_LEN_VARIABLE &&
+	    key_len_offset != CDS_FT_SPECULATIVE_OFFSET_NONE)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	/*
+	 * Variable-length groups must provide a key-length offset; without
+	 * it the library cannot know how many bytes to compare.
+	 */
+	if (attr->key_len == CDS_FT_LEN_VARIABLE &&
+	    key_len_offset == CDS_FT_SPECULATIVE_OFFSET_NONE)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	/*
+	 * Opportunistically enable skip-compressed pointer encoding when
+	 * available — it stacks with library-side validation to also
+	 * avoid the compressed-node cache-line load.  Tolerate
+	 * NOT_SUPPORTED here: validated speculative descent is still
+	 * profitable without skip-compressed (cand-mode descent skips
+	 * the compressed/collapsed byte verify, and the leaf compare
+	 * uses the inline SIMD/SWAR comparator).
+	 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_skip_compressed_validate()) {
+		attr->speculative = true;
+		attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
+	}
+#endif
+	attr->speculative_validated = true;
+	attr->speculative_key_offset = key_offset;
+	attr->speculative_key_len_offset = key_len_offset;
 	return CDS_FT_STATUS_OK;
 }
 
@@ -20232,8 +20334,13 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 	if (attr) {
 		ft_group->key_map = attr->key_map;
 		ft_group->flags = attr->flags;
+		ft_group->speculative = attr->speculative;
+		ft_group->speculative_validated = attr->speculative_validated;
+		ft_group->speculative_key_offset = attr->speculative_key_offset;
+		ft_group->speculative_key_len_offset = attr->speculative_key_len_offset;
 	} else {
 		ft_group->key_map.identity = true;
+		ft_group->speculative_key_len_offset = CDS_FT_SPECULATIVE_OFFSET_NONE;
 	}
 	*result_ft_group = ft_group;
 	FT_TP(group_create, (const void *) ft_group);
@@ -20267,7 +20374,18 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	}
 	ft->group = ft_group;
 	{
-		unsigned int dflt_T = ft_group_skip_compressed(ft_group)
+		/*
+		 * Pick the collapse-threshold default based on the descent
+		 * mode the trie will run in.  Cand-mode descent — used by
+		 * skip-compressed groups (cds_ft_lookup_candidate_key) and by
+		 * speculative_validated groups (cds_ft_lookup_key internally
+		 * cand-descends + validates at leaf) — benefits from
+		 * collapse, so use the skip-mode default (T=100).  Plain
+		 * non-skip / non-speculative groups stick with the precise-
+		 * descent default (T=DISABLED).
+		 */
+		unsigned int dflt_T = (ft_group_skip_compressed(ft_group) ||
+				ft_group->speculative_validated)
 			? CDS_FT_COLLAPSE_THRESHOLD_DEFAULT
 			: CDS_FT_COLLAPSE_THRESHOLD_NONSKIP_DEFAULT;
 		unsigned int dflt_c = CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT;

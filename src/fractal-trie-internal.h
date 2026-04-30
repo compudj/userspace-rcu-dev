@@ -114,6 +114,16 @@ enum ft_col_stride {
 #define FT_PTR_MASK	(~(FT_TYPE_MASK | FT_INTERNAL_MASK))
 
 /*
+ * Internal group flag: skip-compressed pointer encoding.
+ *
+ * Bit set in struct cds_ft_group::flags when the speculative-mode
+ * setters (cds_ft_group_attr_set_speculative /
+ * cds_ft_group_attr_set_speculative_validated) opportunistically
+ * enable the skip-compressed encoding.  Not part of the public API.
+ */
+#define CDS_FT_FLAG_SKIP_COMPRESSED	(1U << 0)
+
+/*
  * Skip-compressed pointer encoding.
  *
  * When CDS_FT_FLAG_SKIP_COMPRESSED is set, compressed node pointers
@@ -741,6 +751,27 @@ struct cds_ft_group {
 	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
+
+	/*
+	 * Speculative-descent and library-side validation attributes.
+	 * @speculative: enable cand-mode descent and (when supported)
+	 *   skip-compressed pointer encoding for this group's tries.
+	 * @speculative_validated: implies @speculative; in addition,
+	 *   non-candidate lookups (cds_ft_lookup_key, iterator-based
+	 *   cds_ft_lookup) descend speculatively and validate the result
+	 *   against the external node's stored key bytes via the inline
+	 *   SIMD/SWAR comparator before returning.
+	 * @speculative_key_offset: byte offset from the external node's
+	 *   address to the start of the stored key.  Used only when
+	 *   @speculative_validated is true.
+	 * @speculative_key_len_offset: byte offset (same base) to a
+	 *   size_t holding the key length, for variable-length-key
+	 *   groups.  CDS_FT_SPECULATIVE_OFFSET_NONE for fixed-length.
+	 */
+	bool speculative;
+	bool speculative_validated;
+	size_t speculative_key_offset;
+	size_t speculative_key_len_offset;
 };
 
 

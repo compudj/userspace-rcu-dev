@@ -327,33 +327,6 @@ struct cds_ft_group;
 #define CDS_FT_KEY_MAP_SIZE		256
 
 /*
- * Fractal Trie group flags.
- *
- * CDS_FT_FLAG_SKIP_COMPRESSED: encode compressed path lengths in
- * the high bits of pointers, allowing the candidate lookup fast
- * path to skip compressed nodes entirely.
- *
- * The number of available high bits, and thus the maximum
- * compressed path length that can be skip-encoded, is architecture-
- * dependent (see FT_SKIP_LEN_BITS / FT_SKIP_LEN_MAX in
- * fractal-trie-internal.h).  Compressed paths longer than the
- * architecture limit fall back to traditional compressed node
- * pointers transparently.
- *
- * Architecture requirement: the pointer bits used by the encoding
- * must be zero for userspace pointers.  cds_ft_group_attr_set_flags()
- * returns NOT_SUPPORTED on architectures where this cannot be
- * guaranteed.
- *
- * Caller requirement: external node pointers (struct cds_ft_node *)
- * stored in the trie must not carry metadata in their upper bits.
- * Pointer authentication (AArch64 PAC) or memory tagging (MTE)
- * signatures must be stripped before the pointer is passed to the
- * trie insertion API.
- */
-#define CDS_FT_FLAG_SKIP_COMPRESSED	(1U << 0)
-
-/*
  * Status codes returned by Fractal Trie operations.
  *
  * Success codes are >= 0. Error codes are < 0. Callers can test
@@ -1760,21 +1733,103 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key);
 
 /*
- * cds_ft_group_attr_set_flags - Set Fractal Trie group flags.
- * @attr: Fractal Trie attributes.
- * @flags: Combination of CDS_FT_FLAG_* constants.
- *
- * Flags are set at group creation time and cannot be changed afterwards.
- *
- * Returns CDS_FT_STATUS_OK on success, or
- * CDS_FT_STATUS_NOT_SUPPORTED if a requested flag is unavailable on
- * the host: CDS_FT_FLAG_SKIP_COMPRESSED requires both build-time
- * support (FEATURE_FT_SKIP_COMPRESSED) and a runtime mmap probe
- * confirming the kernel does not use the encoding bits in
- * userspace virtual addresses.
+ * Sentinel for cds_ft_group_attr_set_speculative_validated() indicating
+ * that the group uses fixed-length keys and no key-length field is
+ * present in the external node.
  */
-enum cds_ft_status cds_ft_group_attr_set_flags(struct cds_ft_group_attr *attr,
-		unsigned int flags);
+#define CDS_FT_SPECULATIVE_OFFSET_NONE	((size_t) ~(size_t) 0)
+
+/*
+ * cds_ft_group_attr_set_speculative - Enable speculative descent.
+ * @attr: Fractal Trie group attributes.
+ *
+ * Speculative descent enables the skip-compressed pointer encoding
+ * for this group's tries, so that cds_ft_lookup_candidate_key
+ * bypasses compressed nodes without loading their cache line: the
+ * compressed path length and the child pointer are encoded in the
+ * upper bits of the parent's slot value.  Compressed paths longer
+ * than the architecture limit fall back to traditional compressed
+ * node pointers transparently.
+ *
+ * The number of available high bits, and thus the maximum
+ * compressed path length that can be skip-encoded, is architecture-
+ * dependent (see FT_SKIP_LEN_BITS / FT_SKIP_LEN_MAX in the internal
+ * header).
+ *
+ * Architecture requirement: the pointer bits used by the encoding
+ * must be zero for userspace pointers.  This setter returns
+ * NOT_SUPPORTED on architectures where this cannot be guaranteed,
+ * and on builds without FEATURE_FT_SKIP_COMPRESSED.
+ *
+ * Caller requirement: external node pointers (struct cds_ft_node *)
+ * stored in the trie must not carry metadata in their upper bits.
+ * Pointer authentication (AArch64 PAC) or memory tagging (MTE)
+ * signatures must be stripped before the pointer is passed to the
+ * trie insertion API.
+ *
+ * Effect on the public lookup APIs:
+ *
+ *   cds_ft_lookup_candidate_key gets the full speedup — cand-mode
+ *   descent plus bypassing compressed nodes via the skip-compressed
+ *   pointer encoding.  This is the primary use case for the
+ *   attribute on its own.
+ *
+ *   cds_ft_lookup_key continues to return precise (verified) results
+ *   and the caller does not need to perform any additional
+ *   validation.  Without library-side validation offsets (see
+ *   cds_ft_group_attr_set_speculative_validated) the descent for
+ *   cds_ft_lookup_key remains precise.  Setting only this attribute
+ *   adds slight overhead on the cds_ft_lookup_key path: the parent's
+ *   slot holds a skip-encoded pointer (length plus child address)
+ *   rather than a direct pointer to the compressed node, so the
+ *   precise descent must derive the compressed node's address from
+ *   the encoded form before fetching the node for the byte
+ *   comparison.  This loses the early prefetch the parent slot would
+ *   otherwise provide.  Use cds_ft_group_attr_set_speculative_validated
+ *   if speeding up cds_ft_lookup_key is the goal.
+ *
+ * Returns CDS_FT_STATUS_OK on success,
+ * CDS_FT_STATUS_NOT_SUPPORTED on builds/hosts where skip-compressed
+ * encoding is unavailable.
+ */
+enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *attr);
+
+/*
+ * cds_ft_group_attr_set_speculative_validated - Enable speculative
+ *                                               descent with library-
+ *                                               side key validation.
+ * @attr: Fractal Trie group attributes.
+ * @key_offset: Byte offset from the (struct cds_ft_node *) stored in
+ *              the trie to the start of the user-stored key bytes.
+ *              Typically computed as
+ *              offsetof(user_struct, key_field) -
+ *              offsetof(user_struct, ft_node_field).
+ * @key_len_offset: For variable-length keys, byte offset (same base
+ *                  as @key_offset) to a size_t field holding the key
+ *                  length.  Pass CDS_FT_SPECULATIVE_OFFSET_NONE for
+ *                  fixed-length-key groups.
+ *
+ * Implies cds_ft_group_attr_set_speculative.  When set, lookups
+ * via cds_ft_lookup_key (and the iterator-based cds_ft_lookup) on
+ * this group's tries descend speculatively and validate the result
+ * against the external node's stored key using the library's inline
+ * SIMD/SWAR comparator before returning.  This gives the user the
+ * same verified-result contract as a precise lookup, with the
+ * descent speed of a candidate lookup, and no user-side validation
+ * function call.
+ *
+ * cds_ft_lookup_candidate_key on the same group still returns an
+ * unvalidated candidate — the caller's intent (candidate vs verified)
+ * is controlled by the API entry point, independently of this attr.
+ *
+ * Returns CDS_FT_STATUS_OK on success,
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @key_len_offset is not
+ * CDS_FT_SPECULATIVE_OFFSET_NONE on a fixed-length-key group.
+ */
+enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
+		struct cds_ft_group_attr *attr,
+		size_t key_offset,
+		size_t key_len_offset);
 
 /*
  * cds_ft_attr_create - Create a per-instance Fractal Trie attribute
@@ -1838,7 +1893,7 @@ enum cds_ft_status cds_ft_attr_set_collapse_threshold(struct cds_ft_attr *attr,
  *                cds_ft_collapse_scan_mul_set for semantics.  Must
  *                be >= 100.
  *
- * Default: CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT (150).
+ * Default: CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT (100).
  *
  * Returns CDS_FT_STATUS_OK on success, or
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @scan_mul_pct is below 100.
@@ -1856,7 +1911,7 @@ enum cds_ft_status cds_ft_attr_set_collapse_scan_mul(struct cds_ft_attr *attr,
  *                cds_ft_compress_scan_mul_set for semantics.  Must
  *                be >= 100.
  *
- * Default: CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT (150).
+ * Default: CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT (100).
  *
  * Returns CDS_FT_STATUS_OK on success, or
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @scan_mul_pct is below 100.
@@ -2024,7 +2079,7 @@ bool cds_ft_excl_validate_enabled(void);
  * under-estimating it would push the gate toward accepting
  * collapses that lose latency.
  */
-#define CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT	150U
+#define CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT	100U
 
 /*
  * Chain-compress per-path CL latency gate's scan-cost multiplier (in
@@ -2057,7 +2112,7 @@ bool cds_ft_excl_validate_enabled(void);
  * Tune up if measuring a chip where compressed scan is even more
  * expensive per CL than dependent pointer chases (rare).
  */
-#define CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT	150U
+#define CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT	100U
 
 /*
  * cds_ft_collapse_threshold_set - Set the collapse acceptance

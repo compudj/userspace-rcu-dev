@@ -10516,7 +10516,7 @@ fail:
 /*                                                                    */
 /* ================================================================== */
 
-/* Create a variable-length trie with CDS_FT_FLAG_SKIP_COMPRESSED. */
+/* Create a variable-length trie with skip-compressed pointer encoding. */
 static struct cds_ft *create_skip_compressed_ft(struct cds_ft_group **group_out)
 {
 	struct cds_ft_group_attr *attr;
@@ -10526,7 +10526,7 @@ static struct cds_ft *create_skip_compressed_ft(struct cds_ft_group **group_out)
 	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
-	cds_ft_group_attr_set_flags(attr, CDS_FT_FLAG_SKIP_COMPRESSED);
+	cds_ft_group_attr_set_speculative(attr);
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);

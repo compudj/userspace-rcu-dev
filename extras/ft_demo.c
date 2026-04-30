@@ -96,15 +96,15 @@ static const char *col_keys[] = {
 #define NR_DNS_KEYS ((int)(sizeof(dns_keys) / sizeof(dns_keys[0])))
 #define NR_COL_KEYS ((int)(sizeof(col_keys) / sizeof(col_keys[0])))
 
-static int make_group(struct cds_ft_group **group_out, unsigned int flags)
+static int make_group(struct cds_ft_group **group_out, int speculative)
 {
 	struct cds_ft_group_attr *attr;
 
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
-	if (flags)
-		cds_ft_group_attr_set_flags(attr, flags);
+	if (speculative)
+		cds_ft_group_attr_set_speculative(attr);
 	if (cds_ft_group_create(attr, group_out) != CDS_FT_STATUS_OK) {
 		cds_ft_group_attr_destroy(attr);
 		return -1;
