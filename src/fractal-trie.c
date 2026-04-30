@@ -10007,26 +10007,40 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 	}
 	if (ft_node_collapsed(parent_nf)) {
 		unsigned int tier = ft_collapsed_tier(parent_nf);
+		unsigned int stride = ft_collapsed_stride(parent_nf);
 		struct cds_ft_collapsed_node *col =
 			ft_collapsed_node_ptr(parent_nf);
-		struct cds_ft_collapsed_entry *entries =
-			ft_collapsed_entries(col, tier);
-		unsigned int cap = ft_collapsed_capacity(tier);
+		unsigned int cap = ft_collapsed_capacity_stride(tier, stride);
 		unsigned int e;
 
-		for (e = 0; e < cap; e++) {
-			struct cds_ft_collapsed_entry *entry = &entries[e];
-			struct cds_ft_inode_flag *child = entry->child;
+		if (stride == FT_COL_STRIDE_NARROW) {
+			struct cds_ft_collapsed_entry *entries =
+				ft_collapsed_entries(col, tier);
 
-			if (child == NULL)
-				continue;
-			/*
-			 * Collapsed entries may hold skip pointers.
-			 * Resolve to compressed flag before comparing.
-			 */
-			child = ft_resolve_skip_compressed(child);
-			if (child == child_nf)
-				return ft_collapsed_suffix_len(entry);
+			for (e = 0; e < cap; e++) {
+				struct cds_ft_collapsed_entry *entry = &entries[e];
+				struct cds_ft_inode_flag *child = entry->child;
+
+				if (child == NULL)
+					continue;
+				child = ft_resolve_skip_compressed(child);
+				if (child == child_nf)
+					return ft_collapsed_suffix_len(entry);
+			}
+		} else {
+			struct cds_ft_collapsed_entry_wide *entries =
+				ft_collapsed_entries_wide(col, tier);
+
+			for (e = 0; e < cap; e++) {
+				struct cds_ft_collapsed_entry_wide *entry = &entries[e];
+				struct cds_ft_inode_flag *child = entry->child;
+
+				if (child == NULL)
+					continue;
+				child = ft_resolve_skip_compressed(child);
+				if (child == child_nf)
+					return entry->len;
+			}
 		}
 		assert(0);
 		return 1;
@@ -11274,42 +11288,75 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 		}
 		if (ft_node_collapsed(node_flag)) {
 			unsigned int tier = ft_collapsed_tier(node_flag);
+			unsigned int stride = ft_collapsed_stride(node_flag);
 			struct cds_ft_collapsed_node *col =
 				ft_collapsed_node_ptr(node_flag);
-			struct cds_ft_collapsed_entry *entries =
-				ft_collapsed_entries(col, tier);
-			unsigned int cap = ft_collapsed_capacity(tier);
+			unsigned int cap = ft_collapsed_capacity_stride(tier, stride);
 			unsigned int remaining = key_len - depth;
 			unsigned int e;
 			bool found = false;
 
-			for (e = 0; e < cap; e++) {
-				struct cds_ft_collapsed_entry *entry = &entries[e];
-				struct cds_ft_inode_flag *entry_child;
-				unsigned int slen, j;
-				uint8_t *suffix;
+			if (stride == FT_COL_STRIDE_NARROW) {
+				struct cds_ft_collapsed_entry *entries =
+					ft_collapsed_entries(col, tier);
 
-				entry_child = ft_dereference_acquire_prefetch(entry->child);
-				if (entry_child == NULL)
-					continue;
-				slen = ft_collapsed_suffix_len(entry);
-				if (slen > remaining)
-					continue;
-				suffix = ft_collapsed_suffix(entry);
-				for (j = 0; j < slen; j++) {
-					if (ik[j] !=
-					    suffix[j])
+				for (e = 0; e < cap; e++) {
+					struct cds_ft_collapsed_entry *entry = &entries[e];
+					struct cds_ft_inode_flag *entry_child;
+					unsigned int slen, j;
+					uint8_t *suffix;
+
+					entry_child = ft_dereference_acquire_prefetch(entry->child);
+					if (entry_child == NULL)
+						continue;
+					slen = ft_collapsed_suffix_len(entry);
+					if (slen > remaining)
+						continue;
+					suffix = ft_collapsed_suffix(entry);
+					for (j = 0; j < slen; j++) {
+						if (ik[j] != suffix[j])
+							break;
+					}
+					if (j == slen) {
+						entry_child = ft_resolve_skip_compressed(entry_child);
+						parent_slot = &entry->child;
+						parent_nf = node_flag;
+						node_flag = entry_child;
+						depth += slen;
+						ik += slen;
+						found = true;
 						break;
+					}
 				}
-				if (j == slen) {
-					entry_child = ft_resolve_skip_compressed(entry_child);
-					parent_slot = &entry->child;
-					parent_nf = node_flag;
-					node_flag = entry_child;
-					depth += slen;
-					ik += slen;
-					found = true;
-					break;
+			} else {
+				struct cds_ft_collapsed_entry_wide *entries =
+					ft_collapsed_entries_wide(col, tier);
+
+				for (e = 0; e < cap; e++) {
+					struct cds_ft_collapsed_entry_wide *entry = &entries[e];
+					struct cds_ft_inode_flag *entry_child;
+					unsigned int slen, j;
+
+					entry_child = ft_dereference_acquire_prefetch(entry->child);
+					if (entry_child == NULL)
+						continue;
+					slen = entry->len;
+					if (slen > remaining)
+						continue;
+					for (j = 0; j < slen; j++) {
+						if (ik[j] != entry->suffix[j])
+							break;
+					}
+					if (j == slen) {
+						entry_child = ft_resolve_skip_compressed(entry_child);
+						parent_slot = &entry->child;
+						parent_nf = node_flag;
+						node_flag = entry_child;
+						depth += slen;
+						ik += slen;
+						found = true;
+						break;
+					}
 				}
 			}
 			if (!found)
