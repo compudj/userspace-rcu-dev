@@ -7116,6 +7116,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		bool candidate)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
+	const uint8_t *orig_key = key;
 	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_node *found = NULL;
 	unsigned int key_depth, i;
@@ -7446,7 +7447,7 @@ end:
 				match = false;
 		}
 		if (match && key_len > 0 &&
-		    ft_key_cmp_ordinals(key, stored_key,
+		    ft_key_cmp_ordinals(orig_key, stored_key,
 				(unsigned int) key_len,
 				(unsigned int) key_len,
 				false, NULL) != 0)
