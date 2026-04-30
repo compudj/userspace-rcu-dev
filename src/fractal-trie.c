@@ -3059,18 +3059,48 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
 
 /*
  * ft_node_readside_cl_pct: number of cache lines a read-side lookup
- * loads when traversing this node, scaled by the per-node-type
- * scan-cost multiplier (in percent), returning a pct-scaled CL cost.
+ * loads when traversing this node, returning a pct-scaled CL cost.
+ *
+ * Layout-sensitive nodes (linear, pool sub-node, collapsed) compose
+ * their cost from a scan term plus an average-pointer term:
+ *
+ *   cost_pct = avg_scan_cl × scan_mul_pct + avg_ptr_cl_pct
+ *
+ * avg_ptr_cl_pct is the percent-CL probability that the matched
+ * entry's CL is *not* already loaded by the scan, computed under a
+ * uniform distribution over slot positions.
  *
  *   Skip-encoded compressed   : 0  (resolved from pointer bits)
- *   Linear (order <= 6)       : 1 × 100  (fits in 1 CL)
- *   Linear order 7 (128 B)    : 2 × 100  (bytes + matched ptr)
- *   Pool A/B (order 8/9)      : 2 × 100  (sub-pool dispatch ≡ Linear 7)
- *   Pigeon (order 10)         : 1 × 100  (direct byte-indexed slot)
  *   Compressed alloc <= 64 B  : 1 × @compress_scan_mul_pct
  *   Compressed alloc >= 128 B : 2 × @compress_scan_mul_pct
+ *   Linear / Pool sub-node    : avg_scan_cl × 100 + avg_ptr_cl_pct
+ *   Pigeon                    : 100  (1 fixed CL: matched slot only)
  *   Collapsed (per (stride, tier)):
  *     avg_scan_cl × @collapse_scan_mul_pct + ptr_cl_pct
+ *
+ * Linear / Pool sub-node layout:
+ *
+ *   keys_zone : bytes [0, max_lc)            (uint8_t keys)
+ *   ptr_zone  : bytes [P, P + max_lc × sizeof(void *)),
+ *                 P = roundup(max_lc, sizeof(void *))
+ *
+ * Pool dispatch itself reads no memory — the sub-node index is
+ * decoded from flag bits in the parent pointer — and each sub-node
+ * has the same internal layout as a linear node with its own
+ * max_linear_child.  The SIMD/SWAR scan loads the keys_zone,
+ * touching ceil(max_lc/64) CLs (every shipped ft_types[] entry
+ * keeps max_lc <= 28, so avg_scan_cl = 1 today).  The matched
+ * pointer is at slot s ∈ [0, max_lc); its CL is "free" iff it
+ * lies in the same CL as the scan, i.e. P + s × sizeof(void *)
+ * < 64.  Under a uniform distribution over s,
+ *
+ *   ptrs_in_first_CL = max(0, min(max_lc, (64 - P) / sizeof(void *)))
+ *   avg_ptr_cl_pct   = (max_lc - ptrs_in_first_CL) / max_lc × 100
+ *
+ * Pigeon: no key scan; the matched pointer's CL is always a fresh
+ * load.  avg_scan_cl = 0, avg_ptr_cl_pct = 100 → 100 pct CLs.
+ *
+ * Collapsed (per (stride, tier)) avg_ptr_cl_pct breakdown:
  *
  *     ptr_cl_pct is the per-tier-per-stride percent-CL probability
  *     that a matched entry's CL is *not* already loaded by the
@@ -3085,7 +3115,8 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
  *     T2/T3: 64B header = a full CL; matched entry is always in some
  *         later CL — ptr_cl_pct = 100 for both strides.
  *
- * Internals get raw × 100 (no scan loop, just dependent loads).
+ * Internals (linear, pool sub-node, pigeon) use scan_mul_pct = 100
+ * (the scan is just dependent loads, not a tunable scan loop).
  * Compressed and collapsed scans get their respective multiplier on
  * the scan portion, matching the candidate-side accounting in
  * ft_try_collapse_at_node and ft_compress_chain_at.  This keeps
@@ -3153,15 +3184,32 @@ unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
 			+ collapsed_ptr_cl_pct_by_tier_stride[stride][tier];
 	} else {
 		unsigned int type_index = ft_node_type(node_flag);
-		unsigned int cl;
+		const struct cds_ft_type *type = &ft_types[type_index];
+		unsigned int max_lc, p, by_space, ptrs_in_cl0, ptrs_out;
+		unsigned int avg_scan_cl, avg_ptr_cl_pct;
 
-		if (ft_types[type_index].type_class == FT_PIGEON)
-			cl = 1U;
-		else {
-			order = ft_types[type_index].order;
-			cl = (order >= 7) ? 2U : 1U;
+		if (type->type_class == FT_PIGEON) {
+			/*
+			 * Direct-indexed; no scan loop.  Matched pointer's
+			 * CL is always a fresh dependent load.
+			 */
+			return 100U;
 		}
-		return cl * 100U;
+
+		/*
+		 * Linear or pool sub-node — both share the keys-then-
+		 * aligned-pointers layout with their own max_linear_child.
+		 * Pool dispatch itself reads no memory (decoded from
+		 * pointer flag bits).
+		 */
+		max_lc = type->max_linear_child;
+		p = (max_lc + sizeof(void *) - 1U) & ~(sizeof(void *) - 1U);
+		by_space = (p < 64U) ? (64U - p) / sizeof(void *) : 0U;
+		ptrs_in_cl0 = (by_space < max_lc) ? by_space : max_lc;
+		ptrs_out = max_lc - ptrs_in_cl0;
+		avg_ptr_cl_pct = (ptrs_out * 100U) / max_lc;
+		avg_scan_cl = (max_lc + 63U) / 64U;	/* always 1 today */
+		return avg_scan_cl * 100U + avg_ptr_cl_pct;
 	}
 }
 
