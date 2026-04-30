@@ -321,9 +321,14 @@ const struct cds_ft_type ft_types[] = {
  * Memory Layouts by Type Class:
  *
  * 1. FT_LINEAR:
- * - data[0]: nr_child (number of populated slots in this node).
- * - data[1 .. max_linear_child]: uint8_t keys (child values).
- * - [Padding] to reach the next pointer-aligned (8-byte/4-byte) boundary.
+ * - data[0 .. max_linear_child-1]: uint8_t keys (child values).
+ *   The populated count is derived at lookup time via the
+ *   sentinel scheme in ft_linear_node_get_nr_child: positions i > 0
+ *   hold values distinct from values[0]; the first i >= 1 where
+ *   values[i] == values[0] marks the unwritten tail.  No explicit
+ *   nr_child field lives in the node — the authoritative count is
+ *   in the out-of-line metadata (struct cds_ft_metadata).
+ * - [Padding] to reach the next pointer-aligned (8-byte) boundary.
  * - Array of (struct cds_ft_inode_flag *) pointers.
  *
  * 2. FT_POOL:
@@ -338,8 +343,8 @@ const struct cds_ft_type ft_types[] = {
  *
  * 3. FT_PIGEON:
  * - A direct, flat array of up to 256 (struct cds_ft_inode_flag *) pointers.
- * - No nr_child or key arrays are stored inside the node (the key is
- *   implicit from the pointer's array index).
+ * - No key array is stored inside the node — the key is implicit
+ *   from the pointer's array index.
  * - Because 'data' is explicitly pointer-aligned, it can be safely cast
  *   directly to (struct cds_ft_inode_flag **).
  *
@@ -2951,10 +2956,13 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 	}
 	p = cds_ft_metadata_to_item(metadata);
 	/*
-	 * data[0] holds nr_child for linear/pool nodes; the allocator
-	 * returns zeroed memory, so nr_child = 0 is already in place.
-	 * The pointer-array offset is derived from
-	 * type->max_linear_child at lookup time.
+	 * Linear/pool node data[] is the keys array; the allocator
+	 * returns zeroed memory, which is the initial state expected
+	 * by the sentinel-based count derivation in
+	 * ft_linear_node_get_nr_child (values[0] == 0 with no other
+	 * keys written matches the i=1 sentinel hit).  The
+	 * pointer-array offset is derived from type->max_linear_child
+	 * at lookup time.
 	 */
 	if (ft_debug_counters()) {
 		uatomic_inc(&ft->nr_nodes_allocated);
@@ -3828,13 +3836,12 @@ void ft_maybe_prefetch_hint(const void *ptr, enum ft_pf_target hint)
  * the node type's max_linear_child.
  *
  * The thresholds define the minimum max_linear_child for each
- * strategy.  The key array starts at node->data[1] (data[0] holds
- * nr_child and the pointer offset).  SIMD/SWAR scanners load from
- * data+1 using unaligned loads; a 16-byte SSE2 load covers 16 key
- * entries and an 8-byte SWAR word covers 8.
+ * strategy.  The key array starts at node->data[0]; SIMD/SWAR
+ * scanners load from data+0 using unaligned loads.  A 16-byte SSE2
+ * load covers 16 key entries and an 8-byte SWAR word covers 8.
  *
  * Nodes are aligned to their size (>=64 bytes), so a scan of
- * 1 + max_linear_child <= 32 bytes starting at data+1 stays within
+ * max_linear_child <= 32 bytes starting at data+0 stays within
  * a single cacheline by construction.
  *
  * Tunable via -DFT_SIMD_LINEAR_THRESHOLD=N and
