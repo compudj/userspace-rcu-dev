@@ -11138,10 +11138,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 					cn->len : remaining;
 				unsigned int j;
 
-				for (j = 0; j < cmp; j++) {
-					if (p1_ik[j] != cn->key_bytes[j])
-						break;
-				}
+				j = ft_match_compressed_key(p1_ik, cn, cmp);
 				if (j < cmp)
 					break;
 				p1_slot = &cn->child;
@@ -11290,11 +11287,7 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 				cn->len : remaining;
 			unsigned int j;
 
-			for (j = 0; j < cmp; j++) {
-				if (ik[j] !=
-				    cn->key_bytes[j])
-					break;
-			}
+			j = ft_match_compressed_key(ik, cn, cmp);
 			if (j < cmp)
 				break;
 			parent_slot = &cn->child;
