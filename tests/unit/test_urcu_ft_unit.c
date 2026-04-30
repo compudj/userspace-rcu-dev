@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 190
+#define NR_TESTS 195
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -10690,6 +10690,461 @@ fail:
 
 /* ================================================================== */
 /*                                                                    */
+/*       14b. SPECULATIVE-VALIDATED LOOKUP UNIT TESTS                 */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Speculative-validated lookup runs cds_ft_lookup_key in cand-mode
+ * descent and validates the candidate leaf against the user-stored
+ * key bytes via the library's inline comparator.  The struct layout
+ * below positions the key (and optional key_len) at known offsets
+ * from the embedded cds_ft_node so the library can locate them from
+ * a stored leaf pointer.
+ *
+ * Regression: the descent loop advances the local @key cursor, so
+ * the post-loop validation must compare the original caller-supplied
+ * key against the stored key.  A bug that compared the post-descent
+ * cursor caused valid hits to return NOT_FOUND.
+ */
+
+struct ft_specv_node {
+	struct cds_ft_node node;
+	struct rcu_head head;
+	size_t key_len;
+	uint8_t key[64];
+};
+
+#define SPECV_KEY_OFFSET \
+	(offsetof(struct ft_specv_node, key) - \
+	 offsetof(struct ft_specv_node, node))
+#define SPECV_KEY_LEN_OFFSET \
+	(offsetof(struct ft_specv_node, key_len) - \
+	 offsetof(struct ft_specv_node, node))
+
+static struct ft_specv_node *specv_node_alloc(const uint8_t *key, size_t klen)
+{
+	struct ft_specv_node *n =
+		(struct ft_specv_node *) calloc(1, sizeof(*n));
+	if (!n)
+		abort();
+	cds_ft_node_init(&n->node);
+	if (klen > sizeof(n->key))
+		abort();
+	memcpy(n->key, key, klen);
+	n->key_len = klen;
+	__atomic_add_fetch(&nodes_allocated, 1, __ATOMIC_RELAXED);
+	return n;
+}
+
+static void specv_node_free(struct ft_specv_node *n)
+{
+	memset(n, 0xfe, sizeof(*n));
+	free(n);
+	__atomic_add_fetch(&nodes_freed, 1, __ATOMIC_RELAXED);
+}
+
+/*
+ * Drain the trie by removing each entry via lookup_first iter and
+ * freeing the ft_specv_node behind a grace period.
+ */
+static int specv_drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
+{
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+	int ret = 0;
+
+	s = cds_ft_iter_create(ft, &iter);
+	if (s < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head;
+		struct cds_ft_node *node = cds_ft_iter_node(iter);
+		struct ft_specv_node *sn =
+			caa_container_of(node, struct ft_specv_node, node);
+
+		s = cds_ft_remove_all(ft, iter, &head);
+		if (s < 0) {
+			ret = -1;
+			break;
+		}
+		(void) head;
+		rcu_read_unlock();
+		rcu_barrier();
+		specv_node_free(sn);
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Build a variable-length speculative-validated trie.  Returns NULL
+ * on architectures where speculative_validated isn't supported (the
+ * caller should skip the test in that case).
+ */
+static struct cds_ft *create_specv_varlen_ft(struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	s = cds_ft_group_attr_set_speculative_validated(attr,
+		SPECV_KEY_OFFSET, SPECV_KEY_LEN_OFFSET);
+	if (s != CDS_FT_STATUS_OK) {
+		cds_ft_group_attr_destroy(attr);
+		return NULL;
+	}
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * Build a fixed-length speculative-validated trie.  Returns NULL on
+ * architectures where speculative_validated isn't supported.
+ */
+static struct cds_ft *create_specv_fixed_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		abort();
+	}
+	s = cds_ft_group_attr_set_speculative_validated(attr,
+		SPECV_KEY_OFFSET, CDS_FT_SPECULATIVE_OFFSET_NONE);
+	if (s != CDS_FT_STATUS_OK) {
+		cds_ft_group_attr_destroy(attr);
+		return NULL;
+	}
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * Insert a handful of fixed-length keys, look each one up via
+ * cds_ft_lookup_key, expect every hit to validate.  Without the
+ * orig_key fix the validation comparator runs on garbage bytes and
+ * every hit is rejected as NOT_FOUND.
+ */
+static int test_specv_fixed_basic(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_specv_fixed_ft(8, &group);
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	static const uint64_t keys[] = {
+		0x0011223344556677ULL,
+		0xaabbccddeeff0011ULL,
+		0xdeadbeefcafef00dULL,
+		0x0123456789abcdefULL,
+	};
+	enum { NKEYS = sizeof(keys) / sizeof(keys[0]) };
+	struct ft_specv_node *nodes[NKEYS];
+	unsigned int i;
+	int ret = -1;
+
+	if (!ft) {
+		skip(1, "speculative_validated unsupported on this build/host");
+		return 0;
+	}
+
+	for (i = 0; i < NKEYS; i++) {
+		uint8_t k[8];
+
+		cds_ft_u64_to_key(ft, keys[i], k, CDS_FT_LEN_DEFAULT);
+		nodes[i] = specv_node_alloc(k, 8);
+	}
+	rcu_read_lock();
+	for (i = 0; i < NKEYS; i++) {
+		s = cds_ft_insert(ft, nodes[i]->key, CDS_FT_LEN_DEFAULT,
+			&nodes[i]->node);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "specv_fixed_basic: insert %u: %s\n",
+				i, cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	for (i = 0; i < NKEYS; i++) {
+		s = cds_ft_lookup_key(ft, nodes[i]->key, CDS_FT_LEN_DEFAULT,
+			&found);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "specv_fixed_basic: lookup %u: %s\n",
+				i, cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			goto out;
+		}
+		if (found != &nodes[i]->node) {
+			fprintf(stderr, "specv_fixed_basic: lookup %u wrong node\n",
+				i);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	return specv_drain_and_destroy(ft, group) | ret;
+}
+
+/*
+ * Variable-length keys with a length offset: validation must check
+ * stored_len against _key_len before the byte compare, and then
+ * compare against the original caller key.
+ */
+static int test_specv_varlen_basic(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_specv_varlen_ft(&group);
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	static const char *keys[] = {
+		"alpha", "beta", "gamma",
+		"prefix-shared-key-one",
+		"prefix-shared-key-two",
+		"prefix-shared-key-three",
+	};
+	enum { NKEYS = sizeof(keys) / sizeof(keys[0]) };
+	struct ft_specv_node *nodes[NKEYS];
+	unsigned int i;
+	int ret = -1;
+
+	if (!ft) {
+		skip(1, "speculative_validated unsupported on this build/host");
+		return 0;
+	}
+
+	for (i = 0; i < NKEYS; i++)
+		nodes[i] = specv_node_alloc((const uint8_t *) keys[i],
+			strlen(keys[i]));
+	rcu_read_lock();
+	for (i = 0; i < NKEYS; i++) {
+		s = cds_ft_insert(ft, nodes[i]->key, nodes[i]->key_len,
+			&nodes[i]->node);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "specv_varlen_basic: insert '%s': %s\n",
+				keys[i], cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	for (i = 0; i < NKEYS; i++) {
+		s = cds_ft_lookup_key(ft, nodes[i]->key, nodes[i]->key_len,
+			&found);
+		if (s != CDS_FT_STATUS_OK || found != &nodes[i]->node) {
+			fprintf(stderr, "specv_varlen_basic: lookup '%s' status %s found %p (expected %p)\n",
+				keys[i], cds_ft_status_to_string(s),
+				(void *) found, (void *) &nodes[i]->node);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	return specv_drain_and_destroy(ft, group) | ret;
+}
+
+/*
+ * Long shared prefix exercises the cand-mode descent through long
+ * compressed paths (and skip-compressed encoding).  Without the
+ * orig_key fix this path was the most reliable repro: the descent
+ * advances the cursor past the shared prefix, so the post-loop
+ * validation comparator sees only the diverging-suffix tail and
+ * rejects every match.
+ */
+static int test_specv_long_compressed_prefix(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_specv_varlen_ft(&group);
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	static const char *prefix = "the-quick-brown-fox-jumps-over-the-lazy-dog";
+	enum { NSUFFIX = 16, NKEYS = NSUFFIX };
+	struct ft_specv_node *nodes[NKEYS];
+	uint8_t kbuf[64];
+	size_t plen;
+	unsigned int i;
+	int ret = -1;
+
+	if (!ft) {
+		skip(1, "speculative_validated unsupported on this build/host");
+		return 0;
+	}
+	plen = strlen(prefix);
+	for (i = 0; i < NKEYS; i++) {
+		size_t klen;
+
+		memcpy(kbuf, prefix, plen);
+		kbuf[plen]     = '/';
+		kbuf[plen + 1] = (uint8_t) ('a' + i);
+		klen = plen + 2;
+		nodes[i] = specv_node_alloc(kbuf, klen);
+	}
+	rcu_read_lock();
+	for (i = 0; i < NKEYS; i++) {
+		s = cds_ft_insert(ft, nodes[i]->key, nodes[i]->key_len,
+			&nodes[i]->node);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "specv_long_compressed_prefix: insert %u: %s\n",
+				i, cds_ft_status_to_string(s));
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	for (i = 0; i < NKEYS; i++) {
+		s = cds_ft_lookup_key(ft, nodes[i]->key, nodes[i]->key_len,
+			&found);
+		if (s != CDS_FT_STATUS_OK || found != &nodes[i]->node) {
+			fprintf(stderr, "specv_long_compressed_prefix: lookup %u status %s found %p\n",
+				i, cds_ft_status_to_string(s),
+				(void *) found);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	return specv_drain_and_destroy(ft, group) | ret;
+}
+
+/*
+ * Negative case: a key absent from the trie must return NOT_FOUND
+ * after validation rejects whichever candidate the cand-mode descent
+ * returned.  Validates that the validation step actually rejects
+ * non-matching candidates rather than reporting OK on whatever leaf
+ * the descent landed on.
+ */
+static int test_specv_mismatch_rejected(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_specv_varlen_ft(&group);
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	struct ft_specv_node *nodes[3];
+	int ret = -1;
+	static const char *inserted[] = {
+		"prefix-shared-key-aaaaa",
+		"prefix-shared-key-bbbbb",
+		"prefix-shared-key-ccccc",
+	};
+	static const char *missing = "prefix-shared-key-zzzzz";
+	unsigned int i;
+
+	if (!ft) {
+		skip(1, "speculative_validated unsupported on this build/host");
+		return 0;
+	}
+	for (i = 0; i < 3; i++)
+		nodes[i] = specv_node_alloc((const uint8_t *) inserted[i],
+			strlen(inserted[i]));
+	rcu_read_lock();
+	for (i = 0; i < 3; i++) {
+		s = cds_ft_insert(ft, nodes[i]->key, nodes[i]->key_len,
+			&nodes[i]->node);
+		if (s != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	s = cds_ft_lookup_key(ft, (const uint8_t *) missing,
+		strlen(missing), &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "specv_mismatch_rejected: missing key returned %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	ret = 0;
+out:
+	return specv_drain_and_destroy(ft, group) | ret;
+}
+
+/*
+ * Mixed-length keys at the same position: a short key that is a
+ * prefix of an existing longer key must be rejected as NOT_FOUND
+ * (when not actually inserted), even though the cand-mode descent
+ * can land on the longer key's leaf along the shared path.  The
+ * validation step rejects via the stored_len check before the byte
+ * compare even runs, but the ordering matters — confirm the path.
+ */
+static int test_specv_prefix_key_mismatch(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_specv_varlen_ft(&group);
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	int ret = -1;
+	static const char *long_key  = "shared-prefix-then-suffix";
+	static const char *short_key = "shared-prefix";
+	struct ft_specv_node *node;
+
+	if (!ft) {
+		skip(1, "speculative_validated unsupported on this build/host");
+		return 0;
+	}
+	node = specv_node_alloc((const uint8_t *) long_key,
+		strlen(long_key));
+	rcu_read_lock();
+	s = cds_ft_insert(ft, node->key, node->key_len, &node->node);
+	if (s != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto out;
+	}
+	/* Short key not inserted: must NOT_FOUND. */
+	s = cds_ft_lookup_key(ft, (const uint8_t *) short_key,
+		strlen(short_key), &found);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "specv_prefix_key_mismatch: short key returned %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto out;
+	}
+	/* Long key inserted: must hit. */
+	s = cds_ft_lookup_key(ft, node->key, node->key_len, &found);
+	if (s != CDS_FT_STATUS_OK || found != &node->node) {
+		fprintf(stderr, "specv_prefix_key_mismatch: long key status %s\n",
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	return specv_drain_and_destroy(ft, group) | ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*  15. Integrity verification tests                                  */
 /*                                                                    */
 /* ================================================================== */
@@ -13942,6 +14397,14 @@ int main(int argc, char **argv)
 	/* 14. Skip-compressed unit tests */
 	diag("Skip-compressed unit tests");
 	RUN_TEST(test_skip_compressed_unit);
+
+	/* 14b. Speculative-validated lookup unit tests */
+	diag("Speculative-validated lookup unit tests");
+	RUN_TEST(test_specv_fixed_basic);
+	RUN_TEST(test_specv_varlen_basic);
+	RUN_TEST(test_specv_long_compressed_prefix);
+	RUN_TEST(test_specv_mismatch_rejected);
+	RUN_TEST(test_specv_prefix_key_mismatch);
 
 	/* 15. Integrity verification tests */
 	diag("Integrity verification tests");
