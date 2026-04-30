@@ -2040,18 +2040,6 @@ unsigned int ft_collapsed_capacity_stride(unsigned int tier, unsigned int stride
 }
 
 /*
- * Narrow-stride shorthand — preserved for the existing call sites
- * that have not yet been ported to stride-aware iteration.  Each
- * such caller is implicitly working on a narrow node (the only
- * stride that currently exists in the wild).
- */
-static inline_lookup
-unsigned int ft_collapsed_capacity(unsigned int tier)
-{
-	return ft_collapsed_capacity_stride(tier, FT_COL_STRIDE_NARROW);
-}
-
-/*
  * Pointer to the narrow entries[] array.  Each entry is 16 bytes;
  * the array starts at a tier-dependent header offset (16B for T0/T1,
  * 64B for T2/T3) so it is 16-byte aligned for SWAR.
@@ -2183,7 +2171,16 @@ unsigned int ft_collapsed_simd_match(struct cds_ft_collapsed_node *col,
 {
 	const uint8_t *p0 = ft_collapsed_prefix_0(col, tier);
 	const uint8_t *p1 = ft_collapsed_prefix_1(col, tier);
-	unsigned int cap = ft_collapsed_capacity(tier);
+	/*
+	 * Prefix arrays are sized for narrow capacity regardless of the
+	 * node's stride — the layout is stride-invariant.  Walking narrow
+	 * lanes on a wide node visits zero-init padding for slots beyond
+	 * the wide capacity; those only match on (k0, k1) = (0, 0), which
+	 * is handled by the (0, 0) bypass walk and never reaches this
+	 * prefilter.
+	 */
+	unsigned int cap = ft_collapsed_capacity_stride(tier,
+			FT_COL_STRIDE_NARROW);
 	unsigned int m = 0, e;
 
 	for (e = 0; e < cap; e++) {
@@ -2717,57 +2714,10 @@ void ft_collapsed_wide_kill_entry(struct cds_ft_collapsed_node *col,
 }
 
 /*
- * Iterate over every live (child != NULL) entry of a collapsed
- * node.  Loop body runs with @e set to the slot index and @entry
- * pointing to that slot.  Dead slots (child == NULL) are skipped.
- *
- * Live entries appear in lexicographic order across slot indices,
- * so the iteration visits them in sorted order.  Dead-slot holes
- * may be present (deleted slots), but the macro filters them.
- *
- * Wrap the body in `{ ... }` to avoid dangling-else hazards.
- *
- * @col:   struct cds_ft_collapsed_node *
- * @tier:  unsigned int — recovered via ft_collapsed_tier(node_flag)
- * @e:     unsigned int — iteration variable; declared by caller
- * @entry: struct cds_ft_collapsed_entry * — declared by caller;
- *         set to &entries[e] before the dead-skip check
- */
-#define ft_for_each_live_collapsed_entry(_col, _tier, _e, _entry)	\
-	for ((_e) = 0; (_e) < ft_collapsed_capacity(_tier); (_e)++)	\
-		if (((_entry) = &ft_collapsed_entries((_col), (_tier))[(_e)]),	\
-		    ft_collapsed_entry_dead((_entry)))			\
-			continue;					\
-		else
-
-/*
- * Reader-side variant: per slot, atomically load the subkey
- * (relaxed 8-byte load on 64-bit; acquire on len + plain suffix
- * reads on 32-bit), filter unpublished slots (slen == 0), and
- * rcu_dereference the child pointer for liveness.  The body sees
- * the slot's atomic snapshot via @subkey (uint64_t), @slen
- * (unsigned int), and @child (live pointer).
- *
- * Body must NOT re-read @entry->suffix / @entry->len / @entry->child
- * — those plain accesses would defeat the new contract's direct
- * subkey synchronization.  Use ft_collapsed_subkey_unpack_slen on
- * @subkey, and memcpy(buf, &@subkey, FT_COL_SUFFIX_MAX) to obtain
- * suffix bytes for byte-by-byte comparisons.
- */
-#define ft_for_each_live_collapsed_entry_rcu(_col, _tier, _e, _entry, _subkey, _slen, _child) \
-	for ((_e) = 0; (_e) < ft_collapsed_capacity(_tier); (_e)++)	\
-		if (((_entry) = &ft_collapsed_entries((_col), (_tier))[(_e)]),	\
-		    ((_subkey) = ft_collapsed_subkey_load((_col), (_tier), (_e))),	\
-		    ((_slen) = ft_collapsed_subkey_unpack_slen(_subkey)),	\
-		    ((_child) = ft_dereference_prefetch((_entry)->child)),	\
-		    (_slen) == 0 || (_child) == NULL)			\
-			continue;					\
-		else
-
-/*
- * Wide-stride writer-side variant of ft_for_each_live_collapsed_entry.
- * Walks every live entry of a wide collapsed node in lex order.  Body
- * sees @e (slot index) and @entry (cds_ft_collapsed_entry_wide *).
+ * Writer-side iteration over a wide collapsed node.  Walks every live
+ * entry in lex order; body sees @e (slot index) and @entry
+ * (cds_ft_collapsed_entry_wide *).  Dead slots (child == NULL) are
+ * skipped.
  *
  * Wrap the body in `{ ... }` to avoid dangling-else hazards.
  */
@@ -2779,8 +2729,7 @@ void ft_collapsed_wide_kill_entry(struct cds_ft_collapsed_node *col,
 		else
 
 /*
- * Wide-stride reader variant of ft_for_each_live_collapsed_entry_rcu.
- * Per slot:
+ * Reader-side iteration over a wide collapsed node.  Per slot:
  *   - acquire-load @len via ft_collapsed_wide_load_slen, exposing it
  *     as @slen (slot is "unpublished" if slen == 0; skipped),
  *   - rcu_dereference the child pointer, exposing it as @child,
@@ -2790,9 +2739,10 @@ void ft_collapsed_wide_kill_entry(struct cds_ft_collapsed_node *col,
  * via the acquire on @len in load_slen).  @entry->child must not be
  * re-read with a plain load — use @child.
  *
- * Unlike the narrow reader macro, no @subkey uint64_t is exposed:
- * the 23-byte wide suffix does not fit in a single SWAR word, so
- * verification is byte-by-byte against @entry->suffix.
+ * No packed @subkey uint64_t is exposed (unlike the narrow path used
+ * inside ft_collapsed_load_entry_view_rcu): the 23-byte wide suffix
+ * does not fit in a single SWAR word, so verification is byte-by-byte
+ * against @entry->suffix.
  */
 #define ft_for_each_live_collapsed_entry_wide_rcu(_col, _tier, _e, _entry, _slen, _child) \
 	for ((_e) = 0; (_e) < ft_collapsed_capacity_stride((_tier), FT_COL_STRIDE_WIDE); (_e)++)	\
