@@ -614,9 +614,19 @@ struct cds_ft_compressed_node {
  * SIMD comparator's non-zero-target precondition or the (0,0) bypass).
  */
 
-/* Tier 0: 64B alloc, narrow=3 / wide=1 entries, 16B header. */
+/*
+ * Tier 0: 64B alloc, narrow=3 / wide=disabled entries, 16B header.
+ *
+ * Wide-T0 (cap 1) was retained through the wide-stride landing for
+ * symmetry with the T1/T2/T3 cross product but is functionally
+ * redundant with a single compressed node (1 CL of read cost, same
+ * as compressed; no branching capture; 2x the memory of compressed
+ * for an 8-23 byte path).  Disabled here by setting capacity to 0;
+ * ft_try_collapse_at_node's `max_entries < 2` filter naturally
+ * skips the (stride=wide, tier=0) iteration without further code.
+ */
 #define FT_COL_T0_CAPACITY		3U
-#define FT_COL_W_T0_CAPACITY		1U
+#define FT_COL_W_T0_CAPACITY		0U
 #define FT_COL_T0_ALLOC_ORDER		6U
 #define FT_COL_T0_HEADER_SIZE		16U
 #define FT_COL_T0_PREFIX_STRIDE		8U

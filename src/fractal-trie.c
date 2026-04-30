@@ -3057,10 +3057,21 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
  *   Pigeon (order 10)         : 1 × 100  (direct byte-indexed slot)
  *   Compressed alloc <= 64 B  : 1 × @compress_scan_mul_pct
  *   Compressed alloc >= 128 B : 2 × @compress_scan_mul_pct
- *   Collapsed by scan_sel (avg: half scan zone + 1 ptr CL):
- *     scaled by scan_mul on the scan portion + 100 × ptr_CL:
- *     SCAN_32  : (1 × @collapse_scan_mul_pct + 0)
- *     SCAN_64  : (1 × @collapse_scan_mul_pct + 100)
+ *   Collapsed (per (stride, tier)):
+ *     avg_scan_cl × @collapse_scan_mul_pct + ptr_cl_pct
+ *
+ *     ptr_cl_pct is the per-tier-per-stride percent-CL probability
+ *     that a matched entry's CL is *not* already loaded by the
+ *     SIMD prefilter's header CL touch.
+ *
+ *     T0: header (16B) + entries (3 × 16B narrow / disabled wide)
+ *         all fit in one 64B CL — ptr_cl_pct = 0 for any matched slot.
+ *     T1 narrow (cap 7, 16B/entry): slots 0-2 are in the header CL
+ *         (free); slots 3-6 in CL 1.  Avg = 4/7 ≈ 57%.
+ *     T1 wide (cap 3, 32B/entry):  slot 0 is in the header CL (free),
+ *         slot 1 straddles into CL 1, slot 2 in CL 1.  Avg = 2/3 ≈ 67%.
+ *     T2/T3: 64B header = a full CL; matched entry is always in some
+ *         later CL — ptr_cl_pct = 100 for both strides.
  *
  * Internals get raw × 100 (no scan loop, just dependent loads).
  * Compressed and collapsed scans get their respective multiplier on
@@ -3081,10 +3092,9 @@ unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
 		unsigned int compress_scan_mul_pct)
 {
 	/*
-	 * Per-tier read-side CL counts for the SoA collapsed layout:
-	 *   scan_cl: cache lines fetched for the prefix-vector header.
-	 *   ptr_cl:  additional cache line for the matching 16B entry
-	 *            (0 for T0 since header + entries share a 64B line).
+	 * Per-(stride, tier) read-side CL cost for the SoA collapsed
+	 * layout.  See the function-header comment for the derivation
+	 * of each ptr_cl_pct entry.
 	 */
 	static const unsigned int collapsed_avg_scan_cl_by_tier[FT_COL_NR_TIERS] = {
 		[0] = 1,	/* 64B alloc — header + entries on 1 CL */
@@ -3092,11 +3102,20 @@ unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
 		[2] = 1,	/* 256B alloc — 64B header = 1 CL */
 		[3] = 1,	/* 512B alloc — 64B header = 1 CL */
 	};
-	static const unsigned int collapsed_ptr_cl_by_tier[FT_COL_NR_TIERS] = {
-		[0] = 0,	/* T0: shared CL with scan */
-		[1] = 1,
-		[2] = 1,
-		[3] = 1,
+	static const unsigned int collapsed_ptr_cl_pct_by_tier_stride
+			[FT_COL_NR_STRIDES][FT_COL_NR_TIERS] = {
+		[FT_COL_STRIDE_NARROW] = {
+			[0] = 0,	/* shared CL with scan */
+			[1] = 57,	/* 4/7 slots in CL 1 */
+			[2] = 100,	/* matched entry always past header CL */
+			[3] = 100,
+		},
+		[FT_COL_STRIDE_WIDE] = {
+			[0] = 0,	/* wide-T0 disabled — value never queried */
+			[1] = 67,	/* 2/3 slots reach CL 1 (slot 1 straddles) */
+			[2] = 100,
+			[3] = 100,
+		},
 	};
 	unsigned int order;
 
@@ -3115,10 +3134,11 @@ unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
 		return 0;
 	} else if (ft_node_collapsed(node_flag)) {
 		unsigned int tier = ft_collapsed_tier(node_flag);
+		unsigned int stride = ft_collapsed_stride(node_flag);
 
 		return collapsed_avg_scan_cl_by_tier[tier]
 				* collapse_scan_mul_pct
-			+ collapsed_ptr_cl_by_tier[tier] * 100U;
+			+ collapsed_ptr_cl_pct_by_tier_stride[stride][tier];
 	} else {
 		unsigned int type_index = ft_node_type(node_flag);
 		unsigned int cl;
@@ -10658,28 +10678,39 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 		unsigned long density_total = ft_density_get(metadata, 0);
 
 		/*
-		 * Per-tier collapsed CL cost for the per-path latency
-		 * gate, in pct-CL units (scan multiplier × avg_scan_CL +
-		 * 100 × ptr_CL).
+		 * Per-(stride, tier) candidate-side CL cost for the
+		 * per-path latency gate, in pct-CL units
+		 * (scan multiplier × avg_scan_CL + ptr_CL_pct).  Mirrors
+		 * the absorbed-side accounting in ft_node_readside_cl_pct
+		 * — see the function-header comment there for the
+		 * derivation of each ptr_cl_pct entry.
 		 *
 		 * Each lookup pays:
-		 *   - prefix-vector header CL load(s): 1 CL for T0/T1
-		 *     (16B header), 1 CL for T2 (64B header touches one
-		 *     line in the steady state), 1 CL for T3 (32B
-		 *     prefix vectors fit alongside entries in the same
-		 *     base CL when the entry-of-interest is one of the
-		 *     first 4).  Worst case is bounded at 1 prefix CL.
-		 *   - one entry CL load on a hit (16B aligned).
-		 *
-		 * Expressed conservatively as 1 scan CL + 1 entry CL
-		 * for every tier; readers prefetch both lines so the
-		 * cost is dominated by the dependent loads.
+		 *   - prefix-vector header CL load(s): 1 CL for every
+		 *     tier (16B header for T0/T1, 64B header = full CL
+		 *     for T2/T3).
+		 *   - matched entry CL: 0 for T0 (entries share the
+		 *     header CL), variable for T1 (per-stride straddle
+		 *     accounting), 100 for T2/T3 (matched entry always
+		 *     past the header CL).
 		 */
 		static const unsigned int avg_scan_cl_by_tier[FT_COL_NR_TIERS] = {
 			[0] = 1, [1] = 1, [2] = 1, [3] = 1,
 		};
-		static const unsigned int ptr_cl_by_tier[FT_COL_NR_TIERS] = {
-			[0] = 1, [1] = 1, [2] = 1, [3] = 1,
+		static const unsigned int ptr_cl_pct_by_tier_stride
+				[FT_COL_NR_STRIDES][FT_COL_NR_TIERS] = {
+			[FT_COL_STRIDE_NARROW] = {
+				[0] = 0,	/* shared CL with scan */
+				[1] = 57,	/* 4/7 slots in CL 1 */
+				[2] = 100,
+				[3] = 100,
+			},
+			[FT_COL_STRIDE_WIDE] = {
+				[0] = 0,	/* wide-T0 disabled */
+				[1] = 67,	/* 2/3 slots reach CL 1 */
+				[2] = 100,
+				[3] = 100,
+			},
 		};
 		for (si = 0; si < FT_COL_NR_STRIDES; si++)
 		for (ci = 0; ci < FT_COL_NR_TIERS; ci++) {
@@ -10689,7 +10720,7 @@ struct cds_ft_inode_flag *ft_try_collapse_at_node(struct cds_ft *ft,
 			unsigned int collapsed_fp = 1U << (order - 4);
 			unsigned int collapsed_cl_pct =
 				collapse_scan_mul_pct * avg_scan_cl_by_tier[tier_ci]
-				+ 100U * ptr_cl_by_tier[tier_ci];
+				+ ptr_cl_pct_by_tier_stride[stride_si][tier_ci];
 			unsigned int max_entries =
 				ft_collapsed_max_entries(tier_ci, stride_si);
 			unsigned int stride_suffix_max =
