@@ -10167,6 +10167,15 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 			ft_collapsed_node_ptr(parent_nf);
 		unsigned int cap = ft_collapsed_capacity_stride(tier, stride);
 		unsigned int e;
+		/*
+		 * Resolve the search key once.  Callers may hand us either
+		 * the bare compressed flag (e.g. metadata->parent loads) or
+		 * the skip-encoded form (e.g. *slot or just-published top).
+		 * Slot entries can carry either form too.  Comparing both
+		 * sides in their resolved (bare) form is the unambiguous
+		 * match.
+		 */
+		struct cds_ft_inode_flag *target = ft_resolve_skip_compressed(child_nf);
 
 		if (stride == FT_COL_STRIDE_NARROW) {
 			struct cds_ft_collapsed_entry *entries =
@@ -10179,7 +10188,7 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 				if (child == NULL)
 					continue;
 				child = ft_resolve_skip_compressed(child);
-				if (child == child_nf)
+				if (child == target)
 					return ft_collapsed_suffix_len(entry);
 			}
 		} else {
@@ -10193,7 +10202,7 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 				if (child == NULL)
 					continue;
 				child = ft_resolve_skip_compressed(child);
-				if (child == child_nf)
+				if (child == target)
 					return entry->len;
 			}
 		}
