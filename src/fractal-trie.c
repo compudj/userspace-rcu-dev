@@ -12845,9 +12845,12 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 	j = ft_match_compressed_key(*iter_key_p, cn, cmp);
 	if (j == cmp && cn->len <= remaining) {
 		/* Full match: traverse through if child is internal,
-		 * compressed, or collapsed. */
+		 * compressed, collapsed, or skip-compressed (which
+		 * encodes another compressed node deeper in the
+		 * chain). */
 		if (ft_node_ptr(cn->child) &&
-		    (ft_node_internal(cn->child) ||
+		    (ft_node_skip_compressed(cn->child) ||
+		     ft_node_internal(cn->child) ||
 		     ft_node_compressed(cn->child) ||
 		     ft_node_collapsed(cn->child))) {
 			ft_snapshot_push(snapshot, snapshot_depth,
@@ -14156,6 +14159,16 @@ int _cds_ft_insert(struct cds_ft *ft,
 		ft_descent_step(&d, key_value);
 	}
 
+	/*
+	 * Resolve any skip-compressed pointer left in d.nf by the descent
+	 * loop's final step (e.g., ft_descent_traverse_compressed sets d.nf
+	 * to cn->child raw, which may be skip-compressed).  The loop body's
+	 * resolve at the top of each iteration only fires when the loop
+	 * iterates again; a traverse that pushes d.depth to key_depth - 1
+	 * exits the loop without re-entering.
+	 */
+	d.nf = ft_resolve_skip_compressed(d.nf);
+
 	if (d.depth == key_depth - 1) {
 		/* Found either an internal, external node or NULL at end of key. */
 		if (!ft_node_ptr(d.nf)) {
@@ -14181,7 +14194,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 			 * Split: internal(external_nodes) + compressed(len-1).
 			 */
 			ret = ft_insert_compressed_key_shorter(ft, &d, 0,
-				node, NULL);
+				node, unique_node_ret);
 		} else if (!ft_node_external(d.nf)) {
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
@@ -14431,6 +14444,13 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		key_value = *(iter_key++);
 		ft_descent_step(&d, key_value);
 	}
+
+	/*
+	 * Resolve any skip-compressed pointer left in d.nf by a final
+	 * traverse that exited the loop without re-entering the loop's
+	 * resolve step.
+	 */
+	d.nf = ft_resolve_skip_compressed(d.nf);
 
 	if (d.depth == key_depth - 1) {
 		/* Found either an internal, external node or NULL at end of key. */
