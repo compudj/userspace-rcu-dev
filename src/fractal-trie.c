@@ -2222,10 +2222,8 @@ unsigned int ft_collapsed_simd_match(struct cds_ft_collapsed_node *col,
 /*
  * Count live entries (slots with child != NULL).
  *
- * Acquire-load on each child pointer pairs with the writer's
- * release-store at publication and deletion, ensuring readers
- * observe the per-slot suffix/len bytes prior to seeing a
- * non-NULL child.
+ * Relaxed load: only the NULL/non-NULL status of @child is consumed,
+ * never the per-slot suffix/len bytes, so no acquire is needed.
  */
 static inline
 unsigned int ft_collapsed_count_live(struct cds_ft_collapsed_node *col,
@@ -2238,14 +2236,14 @@ unsigned int ft_collapsed_count_live(struct cds_ft_collapsed_node *col,
 		struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
 
 		for (e = 0; e < cap; e++) {
-			if (uatomic_load(&entries[e].child, CMM_ACQUIRE) != NULL)
+			if (uatomic_load(&entries[e].child, CMM_RELAXED) != NULL)
 				n++;
 		}
 	} else {
 		struct cds_ft_collapsed_entry_wide *entries = ft_collapsed_entries_wide(col, tier);
 
 		for (e = 0; e < cap; e++) {
-			if (uatomic_load(&entries[e].child, CMM_ACQUIRE) != NULL)
+			if (uatomic_load(&entries[e].child, CMM_RELAXED) != NULL)
 				n++;
 		}
 	}
@@ -2675,7 +2673,7 @@ void ft_collapsed_kill_entry(struct cds_ft_collapsed_node *col,
 {
 	struct cds_ft_collapsed_entry *entries = ft_collapsed_entries(col, tier);
 
-	uatomic_store(&entries[e].child, NULL, CMM_RELEASE);
+	uatomic_store(&entries[e].child, NULL, CMM_RELAXED);
 }
 
 /*
@@ -2738,7 +2736,7 @@ void ft_collapsed_wide_kill_entry(struct cds_ft_collapsed_node *col,
 {
 	struct cds_ft_collapsed_entry_wide *entries = ft_collapsed_entries_wide(col, tier);
 
-	uatomic_store(&entries[e].child, NULL, CMM_RELEASE);
+	uatomic_store(&entries[e].child, NULL, CMM_RELAXED);
 }
 
 /*
