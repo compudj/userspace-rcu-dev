@@ -3607,7 +3607,8 @@ static inline_lookup
 bool ft_collapsed_match_candidate(struct cds_ft_collapsed_node *col,
 		unsigned int tier, unsigned int stride, unsigned int e,
 		const uint8_t *key, unsigned int remaining_key,
-		unsigned int *slen_p, struct cds_ft_inode_flag **child_p)
+		unsigned int *slen_p, struct cds_ft_inode_flag **child_p,
+		bool skip_verify)
 {
 	if (stride == FT_COL_STRIDE_NARROW) {
 		struct cds_ft_collapsed_entry *entry =
@@ -3618,7 +3619,8 @@ bool ft_collapsed_match_candidate(struct cds_ft_collapsed_node *col,
 
 		if (slen == 0 || slen > remaining_key)
 			return false;
-		if (!ft_collapsed_subkey_match(subkey, key, slen))
+		if (!skip_verify &&
+		    !ft_collapsed_subkey_match(subkey, key, slen))
 			return false;
 		child = ft_dereference_prefetch(entry->child);
 		if (child == NULL)
@@ -3631,13 +3633,16 @@ bool ft_collapsed_match_candidate(struct cds_ft_collapsed_node *col,
 				&ft_collapsed_entries_wide(col, tier)[e];
 		unsigned int slen = ft_collapsed_wide_load_slen(col, tier, e);
 		struct cds_ft_inode_flag *child;
-		unsigned int k;
 
 		if (slen == 0 || slen > remaining_key)
 			return false;
-		for (k = 0; k < slen; k++) {
-			if (entry->suffix[k] != key[k])
-				return false;
+		if (!skip_verify) {
+			unsigned int k;
+
+			for (k = 0; k < slen; k++) {
+				if (entry->suffix[k] != key[k])
+					return false;
+			}
 		}
 		child = ft_dereference_prefetch(entry->child);
 		if (child == NULL)
@@ -3664,10 +3669,12 @@ static inline_lookup
 bool ft_collapsed_match_candidate(struct cds_ft_collapsed_node *col,
 		unsigned int tier, unsigned int stride, unsigned int e,
 		const uint8_t *key, unsigned int remaining_key,
-		unsigned int *slen_p, struct cds_ft_inode_flag **child_p)
+		unsigned int *slen_p, struct cds_ft_inode_flag **child_p,
+		bool skip_verify)
 {
 	(void) col; (void) tier; (void) stride; (void) e;
 	(void) key; (void) remaining_key; (void) slen_p; (void) child_p;
+	(void) skip_verify;
 	return false;
 }
 
@@ -6662,7 +6669,8 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 		bool track, bool track_longest,
 		size_t *match_len_p, struct cds_ft_node **match_node_p,
 		struct cds_ft_node __attribute__((unused)) **found_ret,
-		enum cds_ft_status *status_ret)
+		enum cds_ft_status *status_ret,
+		bool candidate)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	const uint8_t *key = *key_p;
@@ -6673,6 +6681,7 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 	unsigned int remaining_key = key_depth - 1 - i;
 	unsigned int candidate_mask;
 	uint16_t target_prefix;
+	bool skip_verify;
 
 	/*
 	 * Check external_nodes only when needed: for prefix
@@ -6748,6 +6757,22 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 	}
 
 	/*
+	 * Candidate-mode fast path: if the prefilter narrowed to exactly
+	 * one entry, skip the suffix byte verify and descend speculatively.
+	 * Any wrong descent (caused by a torn prefix or by suffix bytes
+	 * past prefix_0/prefix_1 not matching the lookup key) is caught at
+	 * the leaf full-key compare in candidate-mode lookups.  The slen
+	 * load itself is the publish handshake (slen != 0) and remains.
+	 *
+	 * Multi-candidate (popcount > 1) cannot skip the verify: it would
+	 * mis-disambiguate between sibling branches and return a false
+	 * NOT_FOUND for keys that exist via the correct sibling.
+	 */
+	skip_verify = candidate
+			&& candidate_mask != 0
+			&& (candidate_mask & (candidate_mask - 1)) == 0;
+
+	/*
 	 * Iterate set bits in the candidate mask.  For each candidate:
 	 * (1) load the subkey (narrow: 8B SWAR; wide: acquire on @len);
 	 * (2) skip if slen=0 (slot unwritten or unpublished);
@@ -6757,7 +6782,8 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 	 * (4) rcu_dereference child for liveness, skip if NULL.
 	 *
 	 * ft_collapsed_match_candidate encapsulates steps (1)-(4) and
-	 * dispatches on @stride.
+	 * dispatches on @stride.  When @skip_verify is true (cand mode,
+	 * popcount==1), step (3) is omitted.
 	 */
 	while (candidate_mask) {
 		unsigned int e = (unsigned int) __builtin_ctz(candidate_mask);
@@ -6767,7 +6793,8 @@ enum ft_descent_action ft_lookup_collapsed(struct cds_ft_inode_flag **node_flag_
 		candidate_mask &= candidate_mask - 1;
 
 		if (!ft_collapsed_match_candidate(col, tier, stride, e,
-				key, remaining_key, &slen, &child))
+				key, remaining_key, &slen, &child,
+				skip_verify))
 			continue;
 
 		/* Match found. Advance past the suffix. */
@@ -6843,7 +6870,8 @@ enum ft_descent_action ft_lookup_collapsed(
 		size_t *match_len_p __attribute__((unused)),
 		struct cds_ft_node **match_node_p __attribute__((unused)),
 		struct cds_ft_node **found_ret __attribute__((unused)),
-		enum cds_ft_status *status_ret __attribute__((unused)))
+		enum cds_ft_status *status_ret __attribute__((unused)),
+		bool candidate __attribute__((unused)))
 {
 	return FT_DESCENT_END;
 }
@@ -6962,7 +6990,8 @@ enum ft_descent_action ft_traverse_collapsed(struct cds_ft_inode_flag **node_fla
 		candidate_mask &= candidate_mask - 1;
 
 		if (!ft_collapsed_match_candidate(col, tier, stride, e,
-				key, remaining, &slen, &child))
+				key, remaining, &slen, &child,
+				false /* skip_verify */))
 			continue;
 
 		*key_p = key + slen;
@@ -7168,7 +7197,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				act = ft_lookup_collapsed(&node_flag, &key, &i,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
-					&match_len, &match_node, &found, &status);
+					&match_len, &match_node, &found, &status,
+					candidate);
 				if (act == FT_DESCENT_END)
 					goto end;
 				if (act == FT_DESCENT_BREAK)
