@@ -1999,7 +1999,7 @@ static const uint8_t ft_col_tier_capacity[FT_COL_NR_STRIDES][FT_COL_NR_TIERS] = 
 	},
 };
 
-static const uint8_t ft_col_tier_alloc_order[FT_COL_NR_TIERS] = {
+static const uint8_t __attribute__((unused)) ft_col_tier_alloc_order[FT_COL_NR_TIERS] = {
 	[0] = FT_COL_T0_ALLOC_ORDER,
 	[1] = FT_COL_T1_ALLOC_ORDER,
 	[2] = FT_COL_T2_ALLOC_ORDER,
@@ -3074,7 +3074,7 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
  * collapsed and absorbed sides — callers exclude them from the
  * latency comparison.
  */
-static
+static __attribute__((unused))
 unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
 		struct cds_ft_inode_flag *node_flag,
 		unsigned int collapse_scan_mul_pct,
@@ -3266,7 +3266,7 @@ void free_collapsed_node(struct cds_ft *ft,
  * preventing the free-pending queue from growing under high mutation
  * rates with rejection-heavy gate settings.
  */
-static
+static __attribute__((unused))
 void free_collapsed_node_unpublished(struct cds_ft *ft,
 		struct cds_ft_collapsed_node *node)
 {
@@ -3471,7 +3471,6 @@ static inline void ft_maybe_prefetch(const void *ptr)
 #define ft_dereference_acquire(p)	\
 	(__typeof__(p)) uatomic_load(&(p), CMM_ACQUIRE)
 
-#ifdef FEATURE_FT_COLLAPSE
 /*
  * Stride-agnostic loaded-entry view.  Used by reader sites that need
  * to inspect the full suffix bytes (for ordered comparisons, ranged
@@ -3485,6 +3484,11 @@ static inline void ft_maybe_prefetch(const void *ptr)
  *
  * Populated by ft_collapsed_load_entry_view_rcu and consumed by the
  * ft_for_each_live_collapsed_entry_view_rcu iteration macro.
+ *
+ * Defined unconditionally so that reader sites which dispatch on
+ * ft_node_collapsed() outside FEATURE_FT_COLLAPSE blocks still parse
+ * (the dispatch is dead-coded by a constant-false ft_node_collapsed
+ * when collapse is disabled).
  */
 struct ft_col_view {
 	uint8_t suffix[FT_COL_W_SUFFIX_MAX];
@@ -3492,6 +3496,7 @@ struct ft_col_view {
 	struct cds_ft_inode_flag *child; /* NULL = dead slot */
 };
 
+#ifdef FEATURE_FT_COLLAPSE
 /*
  * Load a slot's atomic snapshot into @view.  Stride dispatch:
  *
@@ -3622,6 +3627,30 @@ bool ft_collapsed_match_candidate(struct cds_ft_collapsed_node *col,
 		return true;
 	}
 }
+#else /* FEATURE_FT_COLLAPSE */
+
+/*
+ * Stubs for non-collapse builds.  These never execute (the calling
+ * sites are guarded by ft_node_collapsed which evaluates to constant
+ * false when FEATURE_FT_COLLAPSE is undefined), but the source must
+ * still parse.  The macro expands to an empty for-loop body; the
+ * stub functions are declared but never defined or called.
+ */
+#define ft_for_each_live_collapsed_entry_view_rcu(_col, _tier, _stride, _e, _view) \
+	for ((_e) = 0, (void) (_col), (void) (_tier), (void) (_stride),	\
+	     (void) (_view).slen; 0; (_e)++)
+
+static inline_lookup
+bool ft_collapsed_match_candidate(struct cds_ft_collapsed_node *col,
+		unsigned int tier, unsigned int stride, unsigned int e,
+		const uint8_t *key, unsigned int remaining_key,
+		unsigned int *slen_p, struct cds_ft_inode_flag **child_p)
+{
+	(void) col; (void) tier; (void) stride; (void) e;
+	(void) key; (void) remaining_key; (void) slen_p; (void) child_p;
+	return false;
+}
+
 #endif /* FEATURE_FT_COLLAPSE */
 
 /*
@@ -9880,6 +9909,7 @@ void ft_init_node_density(struct cds_ft *ft,
 			ft_density_set(ft, cn_meta, j, accum[j]);
 		return;
 	}
+#ifdef FEATURE_FT_COLLAPSE
 	if (ft_node_collapsed(node_flag)) {
 		unsigned int tier = ft_collapsed_tier(node_flag);
 		unsigned int stride = ft_collapsed_stride(node_flag);
@@ -9915,6 +9945,7 @@ void ft_init_node_density(struct cds_ft *ft,
 			ft_density_set(ft, col_meta, j, accum[j]);
 		return;
 	}
+#endif /* FEATURE_FT_COLLAPSE */
 	/* Internal node: walk children (at distance 1). */
 	node = ft_node_ptr(node_flag);
 	meta = cds_ft_item_to_metadata(node);
@@ -12695,6 +12726,7 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 	return FT_DESCENT_END;
 }
 
+#ifdef FEATURE_FT_COLLAPSE
 /*
  * Handle a collapsed node in _cds_ft_insert's descent loop.
  *
@@ -13003,6 +13035,7 @@ collapsed_explode:
 		return FT_DESCENT_CONTINUE;
 	}
 }
+#endif /* FEATURE_FT_COLLAPSE */
 
 /*
  * ft_build_ordinal_chain: create a chain of nodes from an array of
@@ -13840,17 +13873,29 @@ int ft_compress_chain_at(struct cds_ft *ft,
 #endif
 
 #else
-static
+static __attribute__((unused))
 struct cds_ft_inode_flag *ft_explode_entries(
 		struct cds_ft *ft __attribute__((unused)),
 		struct cds_ft_collapsed_node *col __attribute__((unused)),
-		struct cds_ft_inode_flag **cptrs __attribute__((unused)),
+		unsigned int tier __attribute__((unused)),
+		unsigned int stride __attribute__((unused)),
 		unsigned int start __attribute__((unused)),
 		unsigned int end __attribute__((unused)),
 		unsigned int suffix_offset __attribute__((unused)),
 		unsigned int collapse_depth __attribute__((unused)))
 {
 	return NULL;
+}
+static __attribute__((unused))
+int ft_collapsed_explode_node(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_collapsed_node *col __attribute__((unused)),
+		struct cds_ft_inode_flag *col_flag __attribute__((unused)),
+		struct cds_ft_inode_flag *parent_nf __attribute__((unused)),
+		struct cds_ft_inode_flag **slot __attribute__((unused)),
+		unsigned int depth __attribute__((unused)),
+		struct cds_ft_inode_flag **out_internal_flag __attribute__((unused)))
+{
+	return -1;
 }
 #endif /* FEATURE_FT_COLLAPSE */
 
@@ -13929,6 +13974,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				break;
 			continue;
 		}
+#ifdef FEATURE_FT_COLLAPSE
 		if (ft_node_collapsed(d.nf)) {
 			enum ft_descent_action act;
 
@@ -13941,6 +13987,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 			assert(act == FT_DESCENT_CONTINUE);
 			continue;
 		}
+#endif /* FEATURE_FT_COLLAPSE */
 		dbg_printf("cds_ft_insert iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
 		ft_snapshot_push(snapshot, snapshot_depth,
