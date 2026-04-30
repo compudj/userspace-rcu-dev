@@ -1559,6 +1559,19 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		struct cds_ft_inode_flag *child, unsigned int len)
 {
 	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
+	/*
+	 * The encoding ORs len into the high bits of child.  If child
+	 * already carries skip-length bits (i.e., is itself a skip-
+	 * compressed pointer), the OR conflicts with len and produces
+	 * a corrupted nested encoding from which neither len nor child
+	 * can be recovered cleanly.  Chain-compress canonicalization
+	 * is responsible for ensuring that cn->child is never skip-
+	 * compressed at publish time (the "no two adjacent compresseds"
+	 * invariant).  Assert the invariant here so any future regression
+	 * fails loudly under -UNDEBUG smoke tests rather than silently
+	 * corrupting the trie.
+	 */
+	assert(((unsigned long) child >> FT_SKIP_LEN_SHIFT) == 0);
 	return (struct cds_ft_inode_flag *)
 		((unsigned long) child |
 		 ((unsigned long) len << FT_SKIP_LEN_SHIFT));
