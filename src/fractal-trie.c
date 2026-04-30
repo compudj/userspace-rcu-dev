@@ -1459,7 +1459,13 @@ unsigned int ft_collapsed_stride(struct cds_ft_inode_flag *node)
 			& ((1U << FT_COL_STRIDE_BITS) - 1U);
 }
 
-static
+/*
+ * Used only by tracepoint payloads in free_collapsed_node /
+ * free_collapsed_node_unpublished, which compile out when tracing is
+ * disabled.  Marked unused so configs without FT_ENABLE_TRACING don't
+ * warn.
+ */
+static __attribute__((unused))
 struct cds_ft_inode_flag *ft_collapsed_node_flag(
 		struct cds_ft_collapsed_node *node)
 {
