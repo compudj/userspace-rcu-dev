@@ -17721,6 +17721,17 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		detached->collapse_threshold_pct = ft->collapse_threshold_pct;
 		detached->collapse_scan_mul_pct = ft->collapse_scan_mul_pct;
 		detached->compress_scan_mul_pct = ft->compress_scan_mul_pct;
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+		/*
+		 * Carry the source's verify-at-mutation cadence into the
+		 * detached trie.  Otherwise the detached trie would reset
+		 * to the default period of 1 and re-introduce the O(N)
+		 * per-mutation cost on the detached subtree, defeating the
+		 * very reason the source was tuned to a larger period.
+		 * Counter is reset (calloc'd in cds_ft_create).
+		 */
+		detached->verify_at_mutation_period = ft->verify_at_mutation_period;
+#endif
 
 		/*
 		 * Allocate a fresh empty root for the source trie
@@ -17854,6 +17865,10 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			detached->collapse_threshold_pct = ft->collapse_threshold_pct;
 			detached->collapse_scan_mul_pct = ft->collapse_scan_mul_pct;
 			detached->compress_scan_mul_pct = ft->compress_scan_mul_pct;
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+			/* Mirror of the root-detach branch above; see rationale there. */
+			detached->verify_at_mutation_period = ft->verify_at_mutation_period;
+#endif
 
 			/*
 			 * Propagate count removal through ancestors
