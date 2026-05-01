@@ -21404,6 +21404,50 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 						(unsigned int) type->max_child);
 				return -1;
 			}
+			/*
+			 * Linear-node sentinel-array bounds.  The
+			 * sentinel-derived count returned by
+			 * ft_linear_node_get_nr_child is the position of
+			 * the unwritten tail in the values[] array, not the
+			 * live-children count: removals set the pointer to
+			 * NULL but leave the value byte in place (avoiding
+			 * an ABA on the value), and only a recompact reclaims
+			 * the slot.  The well-defined invariants are:
+			 *
+			 *   - in_array <= type->max_linear_child   (capacity)
+			 *   - in_array >= metadata->nr_child       (lazy slack)
+			 *
+			 * The upper bound is asserted on the
+			 * ft_linear_node_replace_ptr hot path; the lower
+			 * bound is the verify-time invariant — a stored
+			 * nr_child larger than the touched-slot count would
+			 * imply removal accounting got ahead of the array
+			 * itself, which is impossible under the lazy-NULL
+			 * scheme.
+			 */
+			if (type->type_class == FT_LINEAR) {
+				uint8_t in_array =
+					ft_linear_node_get_nr_child(type, node);
+
+				if (in_array > type->max_linear_child) {
+					if (out)
+						fprintf(out, "ft_verify: depth %u: linear node %p (type %u) sentinel-derived nr_child %u exceeds max_linear_child %u\n",
+							depth, node_flag,
+							type_index,
+							(unsigned int) in_array,
+							(unsigned int) type->max_linear_child);
+					return -1;
+				}
+				if (in_array < metadata->nr_child) {
+					if (out)
+						fprintf(out, "ft_verify: depth %u: linear node %p (type %u) sentinel-derived nr_child %u < metadata nr_child %u\n",
+							depth, node_flag,
+							type_index,
+							(unsigned int) in_array,
+							metadata->nr_child);
+					return -1;
+				}
+			}
 		}
 		/* Count external nodes attached to this node's metadata. */
 		if (external_nodes) {
