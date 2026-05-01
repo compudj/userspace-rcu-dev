@@ -1485,6 +1485,12 @@ void cds_ft_destroy(struct cds_ft *ft);
  * arena improves cache and NUMA locality on the read-side fast path,
  * including speculative-validation reads of the embedded key.
  *
+ * The arena slot also carries a struct rcu_head reused by
+ * cds_ft_free_external for deferred reclamation, so applications
+ * that allocate from this API do not need to embed their own
+ * rcu_head in their external-node struct nor write a free callback
+ * — the deferral plumbing comes for free.
+ *
  * The buffer is zero-initialized.  Returns NULL on allocation
  * failure (errno is set to EINVAL for an out-of-range @size or
  * ENOMEM for an exhausted arena).
