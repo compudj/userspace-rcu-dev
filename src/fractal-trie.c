@@ -20768,6 +20768,60 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 				depth, node_flag, external_nodes);
 		return -1;
 	}
+	/*
+	 * Canonicalization: no two adjacent compressed nodes.  Check both
+	 * directions of the adjacency at every visited compressed:
+	 *
+	 *  - ancestor-chain (works in both modes, including skip-compress):
+	 *    walk metadata->parent upward; every consecutive compressed
+	 *    ancestor is part of an adjacency run.  The chain walk is
+	 *    necessary in skip-compress mode because a single skip pointer
+	 *    can bypass two (or more) compresseds at once: the slot's
+	 *    metadata-parent chase from the deepest underlying child only
+	 *    surfaces the innermost compressed-being-skipped, so the
+	 *    walker visits that one but not its compressed ancestor(s).
+	 *    Walking the parent chain at the visited compressed re-exposes
+	 *    every adjacency in the bypassed run.
+	 *
+	 *  - child-side (cheap and direct, primary in non-skip mode):
+	 *    cn->child must not be a (raw or skip-encoded) compressed.  In
+	 *    canonical post-fix tries cn->child is never skip-encoded; the
+	 *    skip-compressed disjunct is defensive.
+	 *
+	 * Chain-compress is responsible for fusing adjacencies into a
+	 * single compressed; a violation here means the canonicalization
+	 * walk missed a case (and skip mode would silently double-wrap the
+	 * grandparent's skip pointer).
+	 */
+	{
+		struct cds_ft_inode_flag *child_in_chain = node_flag;
+		struct cds_ft_inode_flag *anc = cn_meta->parent;
+		bool adj_violation = false;
+
+		while (anc && ft_node_compressed(anc)) {
+			struct cds_ft_metadata *anc_meta =
+				cds_ft_item_to_metadata(ft_node_ptr(anc));
+
+			if (out)
+				fprintf(out, "ft_verify: depth %u: compressed %p adjacent to compressed parent %p (no two adjacent compresseds)\n",
+					depth, child_in_chain, anc);
+			adj_violation = true;
+			child_in_chain = anc;
+			anc = anc_meta->parent;
+		}
+		if (adj_violation)
+			return -1;
+	}
+	if (ft_node_skip_compressed(cn->child) ||
+			(ft_node_ptr(cn->child) && ft_node_compressed(cn->child))) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: compressed node %p has %s child %p (no two adjacent compresseds)\n",
+				depth, node_flag,
+				ft_node_skip_compressed(cn->child) ?
+					"skip-encoded compressed" : "compressed",
+				cn->child);
+		return -1;
+	}
 	/* Recurse into the child. */
 	if (ft_node_ptr(cn->child)) {
 		if (ft_node_external(cn->child)) {
