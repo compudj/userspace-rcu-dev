@@ -20780,6 +20780,30 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 				depth, node_flag, (unsigned int) cn->len);
 		return -1;
 	}
+	/*
+	 * key_bytes[] must fit in the allocated slot.  The arena
+	 * allocation order encodes the slot size; subtract the fixed
+	 * header (offsetof(..., key_bytes)) to get the capacity, then
+	 * assert cn->len fits.  Catches a stale len byte after a
+	 * size-class mismatch (e.g. a chain-compress that grew len
+	 * without reallocating into a larger size class), which would
+	 * otherwise silently overrun key_bytes[] on lookup.
+	 */
+	{
+		size_t alloc_size = 1UL << cds_ft_item_order(cn);
+		size_t header_size = offsetof(struct cds_ft_compressed_node,
+				key_bytes);
+		size_t key_bytes_capacity = alloc_size - header_size;
+
+		if ((size_t) cn->len > key_bytes_capacity) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: compressed node %p len %u exceeds key_bytes capacity %zu (alloc size %zu)\n",
+					depth, node_flag,
+					(unsigned int) cn->len,
+					key_bytes_capacity, alloc_size);
+			return -1;
+		}
+	}
 	/* Parent pointer check. */
 	if (cn_meta->parent != expected_parent) {
 		if (out)
