@@ -21261,6 +21261,42 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 					counted_children);
 			return -1;
 		}
+#ifdef FEATURE_FT_COMPRESS
+		/*
+		 * Canonicalization (skip-compressed mode, non-root): a
+		 * single-child internal node with no external_nodes attached
+		 * should have been replaced by a 1-byte compressed node — in
+		 * skip mode the compressed publishes as a skip-encoded
+		 * pointer (zero read-side cost), strictly cheaper than the
+		 * 1-child internal it stands in for.  The external_nodes
+		 * carve-out is mandatory: compressed nodes cannot carry
+		 * external_nodes, so an internal that hosts a NIL-key
+		 * end-of-path and a single non-NIL branch must remain
+		 * internal.
+		 *
+		 * The root is exempt: ft->root is read directly by the
+		 * traversal entry, so the skip-encoded pointer's zero
+		 * read-side cost has nowhere to attach (there is no parent
+		 * slot to encode the slen into).  A 1-byte compressed at
+		 * root costs the same CL as a 1-child internal, so the
+		 * canonicalization policy is allowed to keep it internal.
+		 *
+		 * In non-skip mode, ft_build_ordinal_chain keeps a 1-byte
+		 * compressed floor at len >= 2, so a 1-child internal at
+		 * the head of a length-1 chain is canonical and must not
+		 * trip this check; the runtime gate handles the distinction.
+		 *
+		 * Dual of the existing "no two adjacent compresseds" check.
+		 */
+		if (expected_parent != NULL &&
+		    ft_group_skip_compressed(ft->group) &&
+		    counted_children == 1 && !external_nodes) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: internal node %p has 1 child and no external_nodes (should be a 1-byte compressed in skip mode)\n",
+					depth, node_flag);
+			return -1;
+		}
+#endif
 		/* Verify nr_keys. */
 		{
 			unsigned long stored_nr_keys = ft_nr_keys_get(metadata);
