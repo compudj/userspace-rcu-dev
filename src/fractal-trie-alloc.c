@@ -31,13 +31,34 @@
 
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/mman.h>
 #include <urcu/fractal-trie.h>
 #include <urcu/list.h>
 #include <urcu/uatomic.h>
 #include "fractal-trie-internal.h"
 #include "urcu-utils.h"
 
+/*
+ * Superblock size for the bump-allocator backing range_create.  Each
+ * arena owns a list of superblocks; ranges are carved out of the head
+ * superblock with a bump pointer, and a new superblock is mmap'd when
+ * the head fills up.  Sized large enough that VMA fragmentation is
+ * negligible and small enough to avoid wasting address space on tiny
+ * tries.
+ */
+#ifndef FT_SUPERBLOCK_SIZE
+#define FT_SUPERBLOCK_SIZE (64UL * 1024 * 1024)
+#endif
+
 struct cds_ft_alloc_arena;
+
+struct cds_ft_alloc_superblock {
+	void *base;
+	size_t size;
+	size_t used;
+	struct cds_list_head node;
+};
 
 __attribute__((visibility("hidden")))
 size_t cds_ft_page_size;
@@ -52,6 +73,7 @@ size_t cds_ft_page_size;
 struct cds_ft_alloc_arena {
 	struct cds_ft_group *ft_group;
 	struct cds_list_head ranges;			/* List head of struct cds_ft_alloc_range. */
+	struct cds_list_head superblocks;		/* List head of struct cds_ft_alloc_superblock. */
 	size_t item_len_order;
 	size_t max_nr_items_per_range;
 	struct cds_ft_metadata_alloc *free_list_head;	/* NULL terminated singly-linked list. */
@@ -109,30 +131,89 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 			(cds_ft_page_size >> item_len_order) * sizeof(struct cds_ft_metadata_alloc);
 }
 
+/*
+ * Allocate a fresh superblock big enough to host at least one
+ * range of size min_size.  Pages are mmap'd anonymous, so they are
+ * lazily zero-initialized on first touch.
+ */
+static
+struct cds_ft_alloc_superblock *superblock_create(size_t min_size)
+{
+	struct cds_ft_alloc_superblock *sb;
+	size_t size;
+	void *base;
+
+	size = FT_SUPERBLOCK_SIZE > min_size ? FT_SUPERBLOCK_SIZE : min_size;
+	/* Round up to page boundary. */
+	size = (size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
+	base = mmap(NULL, size, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (base == MAP_FAILED)
+		return NULL;
+	sb = malloc(sizeof(*sb));
+	if (!sb) {
+		munmap(base, size);
+		return NULL;
+	}
+	sb->base = base;
+	sb->size = size;
+	sb->used = 0;
+	return sb;
+}
+
+static
+void superblock_destroy(struct cds_ft_alloc_superblock *sb)
+{
+	cds_list_del(&sb->node);
+	munmap(sb->base, sb->size);
+	free(sb);
+}
+
+/*
+ * Carve a range out of the arena's current head superblock.  If the
+ * head has insufficient room (or there are no superblocks yet),
+ * allocate a new one and prepend it.
+ *
+ * Caller must hold arena->lock.
+ */
 static
 struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 {
 	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
-	/* Round up to cds_ft_page_size for aligned_alloc (C11 requires size to be a multiple of alignment). */
 	size_t alloc_size_aligned = (alloc_size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
-	void *ptr = aligned_alloc(cds_ft_page_size, alloc_size_aligned);
+	struct cds_ft_alloc_superblock *sb;
 	struct cds_ft_alloc_range *range;
+	void *ptr;
 
-	if (!ptr)
+	if (cds_list_empty(&arena->superblocks))
+		goto create_sb;
+	sb = cds_list_first_entry(&arena->superblocks,
+			struct cds_ft_alloc_superblock, node);
+	if (sb->used + alloc_size_aligned > sb->size)
+		goto create_sb;
+	goto carve;
+create_sb:
+	sb = superblock_create(alloc_size_aligned);
+	if (!sb)
 		return NULL;
-	memset(ptr, 0, alloc_size);
+	cds_list_add(&sb->node, &arena->superblocks);
+carve:
+	ptr = (char *) sb->base + sb->used;
+	sb->used += alloc_size_aligned;
+	/* mmap'd anonymous pages are zero-initialized; no memset needed. */
 	range = (struct cds_ft_alloc_range *) ((char *) ptr + cds_ft_page_size);
 	range->arena = arena;
 	return range;
 }
 
+/*
+ * Remove a range from the arena's range list.  Memory is owned by
+ * the superblock; it is reclaimed when the superblock is destroyed.
+ */
 static
 void range_destroy(struct cds_ft_alloc_range *range)
 {
-	void *p = (char *) range - cds_ft_page_size;
-
 	cds_list_del(&range->node);
-	free(p);
 }
 
 static
@@ -183,6 +264,7 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	arena->max_nr_items_per_range = max_items_per_range;
 	arena->bitmap = bitmap;
 	CDS_INIT_LIST_HEAD(&arena->ranges);
+	CDS_INIT_LIST_HEAD(&arena->superblocks);
 	if (arena_name) {
 		arena->name = strdup(arena_name);
 		if (!arena->name)
@@ -200,13 +282,16 @@ error_alloc:
 static
 void cds_ft_arena_destroy(struct cds_ft_alloc_arena *arena)
 {
-	struct cds_ft_alloc_range *range, *tmp;
+	struct cds_ft_alloc_range *range, *range_tmp;
+	struct cds_ft_alloc_superblock *sb, *sb_tmp;
 
 	if (!arena)
 		return;
 	pthread_mutex_destroy(&arena->lock);
-	cds_list_for_each_entry_safe(range, tmp, &arena->ranges, node)
+	cds_list_for_each_entry_safe(range, range_tmp, &arena->ranges, node)
 		range_destroy(range);
+	cds_list_for_each_entry_safe(sb, sb_tmp, &arena->superblocks, node)
+		superblock_destroy(sb);
 	free(arena->name);
 	free(arena);
 }
