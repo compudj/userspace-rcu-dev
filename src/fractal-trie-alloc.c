@@ -138,9 +138,15 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 /*
  * mbind() with MPOL_INTERLEAVE round-robins page placement across
  * the calling thread's allowed NUMA nodes, applied at superblock
- * creation while no page is faulted yet.  Gated behind the
- * CDS_FT_NUMA_INTERLEAVE env var (default off) so the library
- * keeps its first-touch placement policy unless the user opts in.
+ * creation while no page is faulted yet.
+ *
+ * Enabled by default: the fractal trie targets workloads with many
+ * concurrent readers traversing shared data, where spreading the
+ * arena across NUMA nodes wins by a wide margin over concentrating
+ * it on a single node via first-touch.  Set CDS_FT_NUMA_INTERLEAVE=0
+ * to opt out and fall back to first-touch placement (useful for
+ * workloads with thread-local working sets or for benchmarking
+ * against the no-policy baseline).
  */
 #ifdef __linux__
 #define FT_MPOL_INTERLEAVE	3
@@ -159,7 +165,7 @@ int ft_interleave_enabled(void)
 	if (v != -1)
 		return v;
 	env = getenv("CDS_FT_NUMA_INTERLEAVE");
-	v = (env && env[0] && env[0] != '0') ? 1 : 0;
+	v = (env && env[0] == '0') ? 0 : 1;
 	uatomic_store(&cached, v, CMM_RELAXED);
 	return v;
 }
