@@ -18,6 +18,7 @@
 #include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <getopt.h>
 
 #define key_len_split(var)	var, sizeof(var)
@@ -54,6 +55,34 @@ unsigned long init_pool_size = DEFAULT_RAND_POOL,
 int validate_lookup;
 int sanity_test, sanity_test_varlen, sanity_test_varlen_string, test_dictionary, reverse_sort, torture_test_string;
 unsigned int key_len = 4;
+
+/*
+ * Verify-at-mutation sampling period override.  When the
+ * --verify-at-mutation-period CLI flag is given,
+ * verify_at_mutation_period_set is true and verify_at_mutation_period
+ * holds the value that should be applied to every trie this test
+ * creates (via cds_ft_verify_at_mutation_period_set).  Without VAM
+ * compiled into the library, the setter returns NOT_SUPPORTED and we
+ * abort early so the mismatch is loud.
+ */
+static bool verify_at_mutation_period_set = false;
+static unsigned long verify_at_mutation_period = 0;
+
+static
+void test_apply_verify_period(struct cds_ft *ft)
+{
+	enum cds_ft_status s;
+
+	if (!verify_at_mutation_period_set)
+		return;
+	s = cds_ft_verify_at_mutation_period_set(ft,
+			verify_at_mutation_period);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"--verify-at-mutation-period requested but the library was built without FEATURE_FT_VERIFY_AT_MUTATION; aborting.\n");
+		exit(1);
+	}
+}
 
 int count_pipe[2];
 
@@ -219,6 +248,12 @@ void show_usage(char **argv)
 	printf("  -q, --reverse-sort            Reverse sort dictionary.\n");
 	printf("  -o, --torture-test-string     Torture test strings.\n");
 	printf("\n");
+	printf("      --verify-at-mutation-period <n>\n");
+	printf("                                Verify-at-mutation sampling period\n");
+	printf("                                (requires -DFEATURE_FT_VERIFY_AT_MUTATION):\n");
+	printf("                                0 disables, 1 verifies every mutation,\n");
+	printf("                                N>1 verifies once every N mutations.\n");
+	printf("\n");
 }
 
 static
@@ -294,6 +329,7 @@ int test_1byte_key(void)
 		printf("Error allocating Fractal Trie.\n");
 		return -1;
 	}
+	test_apply_verify_period(test_ft);
 
 	if (cds_ft_iter_create(test_ft, &iter) < 0)
 		abort();
@@ -530,6 +566,7 @@ int test_2bytes_key(void)
 		printf("Error allocating Fractal Trie.\n");
 		return -1;
 	}
+	test_apply_verify_period(test_ft);
 
 	if (cds_ft_iter_create(test_ft, &iter) < 0)
 		abort();
@@ -783,6 +820,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 		printf("Error allocating Fractal Trie.\n");
 		return -1;
 	}
+	test_apply_verify_period(test_ft);
 
 	if (cds_ft_iter_create(test_ft, &iter) < 0)
 		abort();
@@ -1170,6 +1208,7 @@ int do_sanity_test_varlen_dup(int nr_dup)
 		printf("Error allocating Fractal Trie.\n");
 		return -1;
 	}
+	test_apply_verify_period(test_ft);
 
 	/* key length (bytes) */
 	for (i = 1; i <= 8; i *= 2) {
@@ -1427,6 +1466,7 @@ int do_test_varlen_string(void)
 		printf("Error allocating Fractal Trie.\n");
 		return -1;
 	}
+	test_apply_verify_period(test_ft);
 
 	ret = test_varlen_string_key_insert();
 	if (ret) {
@@ -1766,6 +1806,7 @@ int do_mt_test(void)
 		ret = -1;
 		goto end;
 	}
+	test_apply_verify_period(test_ft);
 
 	do_mt_populate_ft();
 
@@ -1895,6 +1936,7 @@ int do_test_dictionary(void)
 		printf("Error allocating Fractal Trie.\n");
 		return -1;
 	}
+	test_apply_verify_period(test_ft);
 
 	if (cds_ft_iter_create(test_ft, &iter) < 0)
 		abort();
@@ -2006,6 +2048,7 @@ int do_test_dictionary(void)
 enum {
 	OPT_YIELD_READER = 256,
 	OPT_YIELD_WRITER,
+	OPT_VERIFY_AT_MUTATION_PERIOD,
 };
 
 int main(int argc, char **argv)
@@ -2039,6 +2082,7 @@ int main(int argc, char **argv)
 		{ "dictionary",			no_argument,		NULL, 'D' },
 		{ "reverse-sort",		no_argument,		NULL, 'q' },
 		{ "torture-test-string",	no_argument,		NULL, 'o' },
+		{ "verify-at-mutation-period",	required_argument,	NULL, OPT_VERIFY_AT_MUTATION_PERIOD },
 #ifdef DEBUG_YIELD
 		{ "yield-reader",		no_argument,		NULL, OPT_YIELD_READER },
 		{ "yield-writer",		no_argument,		NULL, OPT_YIELD_WRITER },
@@ -2141,6 +2185,10 @@ int main(int argc, char **argv)
 			break;
 		case 'o':
 			torture_test_string = 1;
+			break;
+		case OPT_VERIFY_AT_MUTATION_PERIOD:
+			verify_at_mutation_period = strtoul(optarg, NULL, 0);
+			verify_at_mutation_period_set = true;
 			break;
 #ifdef DEBUG_YIELD
 		case OPT_YIELD_READER:
