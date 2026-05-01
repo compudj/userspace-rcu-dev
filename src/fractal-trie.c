@@ -20817,6 +20817,7 @@ int ft_visited_add(struct ft_visited_set *vs, void *key)
 static
 int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		struct ft_visited_set *visited,
+		uint8_t *path,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag *expected_parent,
 		unsigned int depth,
@@ -20825,26 +20826,41 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 /*
  * Verify the doubly-linked external-node duplicate chain anchored at
  * @head, owned by @owner_flag (the flagged pointer to the
- * internal/collapsed node whose metadata holds the chain).
+ * internal/collapsed/compressed node, or its slot's parent).
  *
  *   - Head's prev must equal @owner_flag (the parent flagged-pointer
- *     convention used by ft_metadata_set_external_nodes).
+ *     convention used by ft_metadata_set_external_nodes and by the
+ *     slot-attached external publish in cds_ft_insert).
  *   - Each non-head node's prev must point to its predecessor.
  *   - No node may appear twice (cycle / aliasing across chains).  We
  *     reuse @visited so a node accidentally referenced from a second
  *     chain elsewhere in the trie is also caught.
+ *   - When @path is non-NULL (path verification is enabled), every
+ *     chain entry's stored key (at group->speculative_key_offset) is
+ *     compared byte-for-byte against @path[0..@depth-1].  For
+ *     variable-length groups, the leaf's stored length (read from
+ *     speculative_key_len_offset) must equal @depth.  This is the
+ *     end-to-end path/key consistency check: it catches a corrupted
+ *     cn->key_bytes write or a wrong child-slot byte that would
+ *     otherwise be silent under speculative-validated lookup (since
+ *     the descent skips per-step key comparison and only the leaf
+ *     compare at the lookup tail would notice).
  *
  * Returns 0 on success, -1 on first violation.  No-op when @head is
  * NULL.
  */
 static
-int ft_verify_external_chain(FILE *out, struct ft_visited_set *visited,
+int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
+		struct ft_visited_set *visited,
+		const uint8_t *path,
 		struct cds_ft_inode_flag *owner_flag,
 		struct cds_ft_node *head,
 		unsigned int depth)
 {
 	struct cds_ft_node *node = head;
 	struct cds_ft_node *prev = NULL;
+	const struct cds_ft_group *group = ft->group;
+	bool check_path = (path != NULL);
 
 	while (node) {
 		void *expected_prev = (prev == NULL) ?
@@ -20872,6 +20888,31 @@ int ft_verify_external_chain(FILE *out, struct ft_visited_set *visited,
 						"head should point to owner" :
 						"non-head should point to predecessor");
 			return -1;
+		}
+		if (check_path) {
+			const uint8_t *stored_key = (const uint8_t *) node +
+					group->speculative_key_offset;
+
+			if (group->speculative_key_len_offset !=
+					CDS_FT_SPECULATIVE_OFFSET_NONE) {
+				size_t stored_len = *(const size_t *)
+					((const uint8_t *) node +
+					 group->speculative_key_len_offset);
+
+				if (stored_len != depth) {
+					if (out)
+						fprintf(out, "ft_verify: depth %u: external node %p stored key length %zu != trie depth %u\n",
+							depth, node,
+							stored_len, depth);
+					return -1;
+				}
+			}
+			if (depth > 0 && memcmp(stored_key, path, depth) != 0) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: external node %p stored key bytes diverge from trie path\n",
+						depth, node);
+				return -1;
+			}
 		}
 		prev = node;
 		node = node->next;
@@ -20922,6 +20963,7 @@ int ft_verify_skip_encoding(FILE *out, struct cds_ft_inode_flag *slot_val,
 static
 int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		struct ft_visited_set *visited,
+		uint8_t *path,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag *expected_parent,
 		unsigned int depth,
@@ -21042,14 +21084,27 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 				cn->child);
 		return -1;
 	}
+	/*
+	 * Path tracking: write the compressed key bytes into the path
+	 * buffer at positions [depth..depth+cn->len-1].  Subsequent
+	 * recursion / external-chain compares read these bytes back
+	 * against leaf-stored keys.
+	 */
+	if (path)
+		memcpy(path + depth, cn->key_bytes, cn->len);
 	/* Recurse into the child. */
 	if (ft_node_ptr(cn->child)) {
 		if (ft_node_external(cn->child)) {
-			/* External child at end of compressed path. */
+			/* External leaf chain at end of compressed path. */
+			if (ft_verify_external_chain(ft, out, visited, path,
+					node_flag,
+					(struct cds_ft_node *) ft_node_ptr(cn->child),
+					depth + cn->len))
+				return -1;
 			local_keys = 1;	/* One unique key. */
 		} else {
 			/* Internal/compressed/collapsed child. */
-			if (ft_verify_node_recursive(ft, out, visited,
+			if (ft_verify_node_recursive(ft, out, visited, path,
 					cn->child,
 					node_flag, depth + cn->len,
 					&child_nr_keys))
@@ -21080,6 +21135,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 static
 int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 		struct ft_visited_set *visited,
+		uint8_t *path,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag *expected_parent,
 		unsigned int depth,
@@ -21108,7 +21164,7 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 	}
 	/* Count external nodes attached to this collapsed node's metadata. */
 	if (external_nodes) {
-		if (ft_verify_external_chain(out, visited, node_flag,
+		if (ft_verify_external_chain(ft, out, visited, path, node_flag,
 				external_nodes, depth))
 			return -1;
 		local_keys = 1;	/* One unique key position. */
@@ -21161,7 +21217,21 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 		if (!ft_node_ptr(child))
 			continue;
 		live_children++;
+		/*
+		 * Path tracking for this entry: write the entry's suffix
+		 * bytes into the path buffer at [depth..depth+slen-1].
+		 * Each live entry's suffix differs, so this must be
+		 * refreshed per iteration.
+		 */
+		if (path)
+			memcpy(path + depth, view.suffix, slen);
 		if (ft_node_external(child)) {
+			/* External leaf chain at this entry's slot. */
+			if (ft_verify_external_chain(ft, out, visited, path,
+					node_flag,
+					(struct cds_ft_node *) ft_node_ptr(child),
+					depth + slen))
+				return -1;
 			total_child_keys += 1;
 		} else {
 			struct cds_ft_inode_flag *child_resolved;
@@ -21170,7 +21240,7 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 			if (ft_verify_skip_encoding(out, child, depth + slen))
 				return -1;
 			child_resolved = ft_resolve_skip_compressed(child);
-			if (ft_verify_node_recursive(ft, out, visited,
+			if (ft_verify_node_recursive(ft, out, visited, path,
 					child_resolved,
 					node_flag, depth + slen,
 					&sub_keys))
@@ -21208,6 +21278,7 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 static
 int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		struct ft_visited_set *visited,
+		uint8_t *path,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag *expected_parent,
 		unsigned int depth,
@@ -21256,11 +21327,11 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 	}
 	if (ft_node_compressed(node_flag))
-		return ft_verify_node_compressed(ft, out, visited, node_flag,
-			expected_parent, depth, out_nr_keys);
+		return ft_verify_node_compressed(ft, out, visited, path,
+			node_flag, expected_parent, depth, out_nr_keys);
 	if (ft_node_collapsed(node_flag))
-		return ft_verify_node_collapsed(ft, out, visited, node_flag,
-			expected_parent, depth, out_nr_keys);
+		return ft_verify_node_collapsed(ft, out, visited, path,
+			node_flag, expected_parent, depth, out_nr_keys);
 
 	/* --- Internal node (linear, pool, pigeon) --- */
 	{
@@ -21336,8 +21407,8 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 		/* Count external nodes attached to this node's metadata. */
 		if (external_nodes) {
-			if (ft_verify_external_chain(out, visited, node_flag,
-					external_nodes, depth))
+			if (ft_verify_external_chain(ft, out, visited, path,
+					node_flag, external_nodes, depth))
 				return -1;
 			local_keys = 1;	/* One unique key position. */
 		}
@@ -21358,13 +21429,25 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 				return -1;
 			child = ft_resolve_skip_compressed(child_raw);
 			counted_children++;
+			/*
+			 * Path tracking: this slot's byte at @depth is
+			 * the one being consumed to reach @child.
+			 */
+			if (path)
+				path[depth] = (uint8_t) key;
 			if (ft_node_external(child)) {
+				/* External leaf chain at this slot. */
+				if (ft_verify_external_chain(ft, out, visited,
+						path, node_flag,
+						(struct cds_ft_node *) ft_node_ptr(child),
+						depth + 1))
+					return -1;
 				total_child_keys += 1;
 			} else {
 				unsigned long sub_keys = 0;
 
 				if (ft_verify_node_recursive(ft, out, visited,
-						child,
+						path, child,
 						node_flag, depth + 1,
 						&sub_keys))
 					return -1;
@@ -21455,6 +21538,8 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	struct cds_ft_inode_flag *root = ft->root;
 	unsigned long root_nr_keys = 0;
 	struct ft_visited_set visited;
+	uint8_t path_buf[FT_MAX_KEY_LEN];
+	uint8_t *path;
 	int ret;
 
 	if (ft_visited_init(&visited)) {
@@ -21462,7 +21547,26 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 			fprintf(out, "ft_verify: visited-set allocation failed\n");
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
 	}
-	ret = ft_verify_node_recursive(ft, out, &visited, root, NULL, 0,
+	/*
+	 * End-to-end path/key consistency (invariant 10) is only
+	 * meaningful when the group is configured for speculative
+	 * validation: in that mode the user's leaf node carries an
+	 * addressable copy of the inserted key at
+	 * group->speculative_key_offset, in ordinal space (key_map
+	 * identity is the gating condition the spec_validate lookup
+	 * itself enforces — non-identity maps would require a per-byte
+	 * conversion of the path at compare time, which we skip).
+	 *
+	 * When enabled, the path buffer is filled in during descent and
+	 * compared at each external leaf in ft_verify_external_chain.
+	 * When disabled, leave path = NULL and all path-tracking writes
+	 * / compares short-circuit.
+	 */
+	if (ft->group->speculative_validated && ft->group->key_map.identity)
+		path = path_buf;
+	else
+		path = NULL;
+	ret = ft_verify_node_recursive(ft, out, &visited, path, root, NULL, 0,
 			&root_nr_keys);
 	ft_visited_destroy(&visited);
 	if (ret)
