@@ -4142,10 +4142,26 @@ struct cds_ft_inode_flag *ft_linear_scan_1(
 }
 
 /*
- * scan_3: bytewise scan for the 3-slot type (type_index 1,
- * max_linear_child=3 on 64-bit tier-2).  Three independent
- * load+compare pairs pipeline in parallel and beat the SWAR
- * dependency chain at this size.  ptr_offset is 8.
+ * scan_3: SSE2 cmpeq + movemask + ctz over the 3-slot type (type_index
+ * 1, max_linear_child=3 on 64-bit tier-2).  ptr_offset is 8.
+ *
+ * The earlier scalar implementation chained three independent
+ * load+compare pairs and relied on the front end pipelining them in
+ * parallel.  That shape is fastest under predictable input but
+ * generates one taken/untaken decision per slot, so on workloads with
+ * unpredictable slot occupancy (real DNS keys hitting any of the three
+ * slots with similar probability) the per-slot mispredictions
+ * dominate.  perf record on cds_ft_lookup_key shows the first byte's
+ * je was the single largest branch-miss site.
+ *
+ * The SIMD form replaces three branches with one masked movemask + ctz
+ * + a single not-found branch.  The 8-byte _mm_loadl_epi64 reads the
+ * 3 keys plus 5 bytes of inter-slot padding; the static mask & 0x7
+ * clears any matches in the padding lanes so the result is always
+ * within [0, 2].  scan_3 is the dominant dispatch (46% of dispatches
+ * in bench_comprehensive), so reducing its branch-miss footprint
+ * lowers the lookup-path branch-miss budget materially for
+ * candidate-mode descents.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_linear_scan_3(
@@ -4154,21 +4170,23 @@ struct cds_ft_inode_flag *ft_linear_scan_3(
 		uint8_t n, enum ft_pf_target pf_hint)
 {
 	uint8_t *values = &node->data[0];
+	__m128i target = _mm_set1_epi8((char) n);
+	__m128i chunk = _mm_loadl_epi64((const __m128i *) values);
+	unsigned int mask = (unsigned int) _mm_movemask_epi8(
+			_mm_cmpeq_epi8(chunk, target)) & 0x7U;
 	struct cds_ft_inode_flag **pointers;
 	unsigned int i;
 
-	for (i = 0; i < 3; i++) {
-		if (values[i] == n) {
-			pointers = (struct cds_ft_inode_flag **)
-					((uint8_t *) node + 8);
-			if (caa_unlikely(node_flag_ptr))
-				*node_flag_ptr = &pointers[i];
-			return ft_dereference_acquire_prefetch_hint(pointers[i], pf_hint);
-		}
+	if (!mask) {
+		if (caa_unlikely(node_flag_ptr))
+			*node_flag_ptr = NULL;
+		return NULL;
 	}
+	i = (unsigned int) __builtin_ctz(mask);
+	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 8);
 	if (caa_unlikely(node_flag_ptr))
-		*node_flag_ptr = NULL;
-	return NULL;
+		*node_flag_ptr = &pointers[i];
+	return ft_dereference_acquire_prefetch_hint(pointers[i], pf_hint);
 }
 
 /*
