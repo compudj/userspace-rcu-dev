@@ -21225,6 +21225,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 	{
 		void *node_addr = ft_node_ptr(node_flag);
 		int added = ft_visited_add(visited, node_addr);
+		struct cds_ft_metadata *m = cds_ft_item_to_metadata(node_addr);
 
 		if (added < 0) {
 			if (out)
@@ -21235,6 +21236,21 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		if (added == 0) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: node %p reached twice (shared subtree or parent-pointer cycle)\n",
+					depth, node_flag);
+			return -1;
+		}
+		/*
+		 * Density / nr_keys promotion sanity.  The compact-vs-extended
+		 * discriminator is m->nr_keys == UINT32_MAX; ft_density_promote
+		 * assigns m->density_ext before publishing the sentinel via a
+		 * release store.  A torn or rolled-back promotion that leaves
+		 * the sentinel set without a backing density_ext would cause
+		 * the very next ft_density_get / ft_nr_keys_get to dereference
+		 * NULL — flag it here with a clean diagnostic instead.
+		 */
+		if (ft_density_is_extended(m) && m->density_ext == NULL) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: node %p has nr_keys==UINT32_MAX (promoted) but density_ext is NULL\n",
 					depth, node_flag);
 			return -1;
 		}
