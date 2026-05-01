@@ -21177,6 +21177,47 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			}
 		}
 #endif
+		/*
+		 * Type / alloc_index sanity.  ft_node_type already asserts
+		 * the tag bits decode within FT_TYPE_BITS, but it does not
+		 * verify the entry is a real internal class, that the arena
+		 * order matches the type's expected order, or that nr_child
+		 * fits the type's capacity.  A corrupted tag/bitfield write
+		 * would otherwise survive verify and only manifest later as
+		 * a wrong-sized scan or a min_child assertion.
+		 */
+		{
+			unsigned int type_index = ft_node_type(node_flag);
+			const struct cds_ft_type *type = &ft_types[type_index];
+			size_t actual_order = cds_ft_item_order(node);
+
+			if (type->type_class != FT_LINEAR &&
+			    type->type_class != FT_POOL &&
+			    type->type_class != FT_PIGEON) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: internal node %p has non-internal type_class %d (type_index %u)\n",
+						depth, node_flag,
+						(int) type->type_class,
+						type_index);
+				return -1;
+			}
+			if (actual_order != type->order) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: internal node %p alloc order %zu mismatches type %u expected order %u\n",
+						depth, node_flag,
+						actual_order, type_index,
+						(unsigned int) type->order);
+				return -1;
+			}
+			if (metadata->nr_child > type->max_child) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: internal node %p nr_child %u exceeds type %u max_child %u\n",
+						depth, node_flag,
+						metadata->nr_child, type_index,
+						(unsigned int) type->max_child);
+				return -1;
+			}
+		}
 		/* Count external nodes attached to this node's metadata. */
 		if (external_nodes) {
 			local_keys = 1;	/* One unique key position. */
