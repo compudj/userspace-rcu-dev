@@ -20710,9 +20710,113 @@ void cds_ft_destroy(struct cds_ft *ft)
  * @out_nr_keys: output — total nr_keys in the subtree rooted here
  *               (written on success for parent aggregation).
  */
+/*
+ * Visited-pointer set for cds_ft_verify subtree-uniqueness check.
+ *
+ * Linear-probing open-addressing hash table keyed by node allocation
+ * address (low tag bits stripped via ft_node_ptr).  Only used while a
+ * single verify walk is in progress; the entire table is freed at the
+ * end of cds_ft_verify.  Catches accidental sharing of a subtree
+ * between two parents (a rebase/recompact bug class) and detects
+ * parent-pointer cycles before the upward adjacency walk in
+ * ft_verify_node_compressed gets a chance to loop forever.
+ */
+struct ft_visited_set {
+	void **slots;		/* NULL = empty bucket. */
+	size_t cap;		/* Power of two. */
+	size_t mask;		/* cap - 1. */
+	size_t count;
+};
+
+static
+size_t ft_visited_hash(void *p)
+{
+	/*
+	 * Drop the low alignment bits (arena items are at least 16-byte
+	 * aligned, so the low 4 bits are zero), then mix with the 64-bit
+	 * golden-ratio multiplier.
+	 */
+	uintptr_t v = (uintptr_t) p >> 4;
+	return (size_t) (v * 11400714819323198485ULL);
+}
+
+static
+int ft_visited_init(struct ft_visited_set *vs)
+{
+	vs->cap = 64;
+	vs->mask = vs->cap - 1;
+	vs->count = 0;
+	vs->slots = calloc(vs->cap, sizeof(void *));
+	return vs->slots ? 0 : -1;
+}
+
+static
+void ft_visited_destroy(struct ft_visited_set *vs)
+{
+	free(vs->slots);
+	vs->slots = NULL;
+}
+
+static
+int ft_visited_grow(struct ft_visited_set *vs)
+{
+	size_t new_cap = vs->cap * 2;
+	size_t new_mask = new_cap - 1;
+	void **new_slots = calloc(new_cap, sizeof(void *));
+	size_t i;
+
+	if (!new_slots)
+		return -1;
+	for (i = 0; i < vs->cap; i++) {
+		void *key = vs->slots[i];
+		size_t j;
+
+		if (!key)
+			continue;
+		j = ft_visited_hash(key) & new_mask;
+		while (new_slots[j] != NULL)
+			j = (j + 1) & new_mask;
+		new_slots[j] = key;
+	}
+	free(vs->slots);
+	vs->slots = new_slots;
+	vs->cap = new_cap;
+	vs->mask = new_mask;
+	return 0;
+}
+
+/*
+ * Returns 1 if @key was newly inserted, 0 if @key was already present
+ * (duplicate visit), -1 on allocation failure.  NULL keys are not
+ * tracked (they are filtered out by callers anyway).
+ */
+static
+int ft_visited_add(struct ft_visited_set *vs, void *key)
+{
+	size_t i;
+
+	if (key == NULL)
+		return 1;
+	/* Keep load factor below 0.5 for fast linear probing. */
+	if ((vs->count + 1) * 2 > vs->cap) {
+		if (ft_visited_grow(vs))
+			return -1;
+	}
+	i = ft_visited_hash(key) & vs->mask;
+	while (vs->slots[i] != NULL) {
+		if (vs->slots[i] == key)
+			return 0;
+		i = (i + 1) & vs->mask;
+	}
+	vs->slots[i] = key;
+	vs->count++;
+	return 1;
+}
+
 /* Forward declaration so the per-kind helpers below can recurse. */
 static
 int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
+		struct ft_visited_set *visited,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag *expected_parent,
 		unsigned int depth,
@@ -20760,6 +20864,7 @@ int ft_verify_skip_encoding(FILE *out, struct cds_ft_inode_flag *slot_val,
  */
 static
 int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
+		struct ft_visited_set *visited,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag *expected_parent,
 		unsigned int depth,
@@ -20887,7 +20992,8 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 			local_keys = 1;	/* One unique key. */
 		} else {
 			/* Internal/compressed/collapsed child. */
-			if (ft_verify_node_recursive(ft, out, cn->child,
+			if (ft_verify_node_recursive(ft, out, visited,
+					cn->child,
 					node_flag, depth + cn->len,
 					&child_nr_keys))
 				return -1;
@@ -20916,6 +21022,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
  */
 static
 int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
+		struct ft_visited_set *visited,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag *expected_parent,
 		unsigned int depth,
@@ -20963,7 +21070,8 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 			if (ft_verify_skip_encoding(out, child, depth + slen))
 				return -1;
 			child_resolved = ft_resolve_skip_compressed(child);
-			if (ft_verify_node_recursive(ft, out, child_resolved,
+			if (ft_verify_node_recursive(ft, out, visited,
+					child_resolved,
 					node_flag, depth + slen,
 					&sub_keys))
 				return -1;
@@ -20999,16 +21107,43 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 
 static
 int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
+		struct ft_visited_set *visited,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag *expected_parent,
 		unsigned int depth,
 		unsigned long *out_nr_keys)
 {
+	/*
+	 * Subtree-uniqueness / cycle check.  Every traversable node
+	 * (compressed, collapsed, internal) must be reached exactly
+	 * once from the root.  A duplicate visit means either two
+	 * parents share the same child subtree (rebase/recompact bug)
+	 * or a parent-pointer cycle has been introduced — bail out
+	 * before recursing further so the upward parent walks in the
+	 * adjacency check cannot loop forever.
+	 */
+	{
+		void *node_addr = ft_node_ptr(node_flag);
+		int added = ft_visited_add(visited, node_addr);
+
+		if (added < 0) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: visited-set allocation failed at node %p\n",
+					depth, node_flag);
+			return -1;
+		}
+		if (added == 0) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: node %p reached twice (shared subtree or parent-pointer cycle)\n",
+					depth, node_flag);
+			return -1;
+		}
+	}
 	if (ft_node_compressed(node_flag))
-		return ft_verify_node_compressed(ft, out, node_flag,
+		return ft_verify_node_compressed(ft, out, visited, node_flag,
 			expected_parent, depth, out_nr_keys);
 	if (ft_node_collapsed(node_flag))
-		return ft_verify_node_collapsed(ft, out, node_flag,
+		return ft_verify_node_collapsed(ft, out, visited, node_flag,
 			expected_parent, depth, out_nr_keys);
 
 	/* --- Internal node (linear, pool, pigeon) --- */
@@ -21068,7 +21203,8 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			} else {
 				unsigned long sub_keys = 0;
 
-				if (ft_verify_node_recursive(ft, out, child,
+				if (ft_verify_node_recursive(ft, out, visited,
+						child,
 						node_flag, depth + 1,
 						&sub_keys))
 					return -1;
@@ -21122,8 +21258,18 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 {
 	struct cds_ft_inode_flag *root = ft->root;
 	unsigned long root_nr_keys = 0;
+	struct ft_visited_set visited;
+	int ret;
 
-	if (ft_verify_node_recursive(ft, out, root, NULL, 0, &root_nr_keys))
+	if (ft_visited_init(&visited)) {
+		if (out)
+			fprintf(out, "ft_verify: visited-set allocation failed\n");
+		return CDS_FT_STATUS_INTEGRITY_ERROR;
+	}
+	ret = ft_verify_node_recursive(ft, out, &visited, root, NULL, 0,
+			&root_nr_keys);
+	ft_visited_destroy(&visited);
+	if (ret)
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
 	return CDS_FT_STATUS_OK;
 }
