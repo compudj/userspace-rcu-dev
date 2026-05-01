@@ -15851,7 +15851,15 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	switch (ret) {
 	case 0:
 #ifdef FEATURE_FT_COLLAPSE
-		ft_check_collapse_on_path(ft, iter_key, key_len);
+		/*
+		 * iter_key was advanced byte-by-byte during the descent
+		 * loop above, so it now points key_len bytes past the
+		 * iterator's key buffer.  Re-read iter_key(iter) to pass
+		 * the ORIGINAL key path; otherwise the canonicalization
+		 * walk reads zeros / garbage past the end of the key and
+		 * bails before reaching the slot of the removed key.
+		 */
+		ft_check_collapse_on_path(ft, iter_key(iter), key_len);
 #endif
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
@@ -16032,7 +16040,17 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 
 #ifdef FEATURE_FT_COLLAPSE
-	ft_check_collapse_on_path(ft, iter_key, key_len);
+	/*
+	 * iter_key was advanced byte-by-byte during the descent loop
+	 * above and now points key_len bytes past the iterator's key
+	 * buffer.  Re-read iter_key(iter) to pass the ORIGINAL key
+	 * path; otherwise the canonicalization walk reads zeros / garbage
+	 * past the end of the key and bails before reaching the slot of
+	 * the removed key, leaving a chain-head internal that the
+	 * post-remove fold should have absorbed into the parent
+	 * compressed.
+	 */
+	ft_check_collapse_on_path(ft, iter_key(iter), key_len);
 #endif
 	return CDS_FT_STATUS_OK;
 }
