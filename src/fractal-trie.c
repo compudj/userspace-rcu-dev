@@ -20432,6 +20432,79 @@ bool cds_ft_excl_validate_enabled(void)
 #endif
 }
 
+bool cds_ft_verify_at_mutation_enabled(void)
+{
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+	return true;
+#else
+	return false;
+#endif
+}
+
+/*
+ * Set the verify-at-mutation sampling period for @ft.  When the
+ * library is built with -DFEATURE_FT_VERIFY_AT_MUTATION, the writer
+ * scope-exit hook runs cds_ft_verify + cds_ft_verify_density once
+ * every @period mutations.
+ *
+ *   period == 0 : disable the verify walk on this trie (the
+ *                 increment-and-compare still runs in the hook).
+ *   period == 1 : verify at every mutation (the historical
+ *                 -DFEATURE_FT_VERIFY_AT_MUTATION cadence).
+ *   period >  1 : verify every @period mutations — useful on large
+ *                 tries where O(N) per mutation is impractical.
+ *
+ * The counter is reset to 0 on each period boundary, so it never
+ * exceeds @period - 1 and there is no overflow / cadence-drift
+ * concern on long-running workloads.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_NOT_SUPPORTED if the library was built without
+ * FEATURE_FT_VERIFY_AT_MUTATION — the call surfaces the mismatch
+ * loudly rather than silently doing nothing, so a test that relies
+ * on the verify cadence cannot accidentally run with verify-at-
+ * mutation compiled out.  Use cds_ft_verify_at_mutation_enabled()
+ * to gate the call.
+ *
+ * Write-side only (mutex-held); not safe to call concurrently
+ * with writers on the same trie.
+ */
+enum cds_ft_status cds_ft_verify_at_mutation_period_set(struct cds_ft *ft,
+		unsigned long period)
+{
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+	ft->verify_at_mutation_period = period;
+	ft->verify_at_mutation_counter = 0;
+	return CDS_FT_STATUS_OK;
+#else
+	(void) ft;
+	(void) period;
+	return CDS_FT_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+/*
+ * Read the verify-at-mutation sampling period for @ft into
+ * *@period.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_NOT_SUPPORTED if the library was built without
+ * FEATURE_FT_VERIFY_AT_MUTATION — distinguishing the
+ * build-disabled case from a runtime period == 0.
+ */
+enum cds_ft_status cds_ft_verify_at_mutation_period_get(
+		const struct cds_ft *ft, unsigned long *period)
+{
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+	*period = ft->verify_at_mutation_period;
+	return CDS_FT_STATUS_OK;
+#else
+	(void) ft;
+	(void) period;
+	return CDS_FT_STATUS_NOT_SUPPORTED;
+#endif
+}
+
 enum cds_ft_status cds_ft_collapse_threshold_set(struct cds_ft *ft,
 		unsigned int threshold_pct)
 {
@@ -20547,6 +20620,16 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->group = ft_group;
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+	/*
+	 * Default to verify-every-mutation cadence to preserve the
+	 * historical -DFEATURE_FT_VERIFY_AT_MUTATION behavior; tests
+	 * working with large tries can call
+	 * cds_ft_set_verify_at_mutation_period() to dial it down.
+	 * Counter is already zero from calloc.
+	 */
+	ft->verify_at_mutation_period = 1;
+#endif
 	{
 		/*
 		 * Pick the collapse-threshold default based on the descent
@@ -21900,12 +21983,27 @@ enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft, FILE *out)
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 /*
  * Hook called from CDS_FT_SCOPED_WRITER's scope-exit, before the
- * writer claim is released.  Runs both verifiers; on any mismatch,
- * abort after letting both finish so we get the full diagnostic.
+ * writer claim is released.  Sampled by the per-trie
+ * @verify_at_mutation_period: the full cds_ft_verify +
+ * cds_ft_verify_density walk runs once every @period mutations.  The
+ * counter is incremented and reset on the boundary so it never
+ * exceeds @period - 1, avoiding any overflow / cadence-drift issue
+ * on long-running workloads.  Period 0 disables the walk entirely
+ * (only the increment-and-compare runs).  On any mismatch, both
+ * verifiers run to completion before aborting so we get the full
+ * diagnostic.
  */
 void ft_writer_scope_verify(struct cds_ft *ft)
 {
+	unsigned long period = ft->verify_at_mutation_period;
 	bool fail = false;
+
+	if (period == 0)
+		return;
+	ft->verify_at_mutation_counter++;
+	if (ft->verify_at_mutation_counter < period)
+		return;
+	ft->verify_at_mutation_counter = 0;
 
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
 		fail = true;

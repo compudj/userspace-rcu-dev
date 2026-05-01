@@ -2051,6 +2051,73 @@ bool cds_ft_is_exclusive(const struct cds_ft *ft);
 bool cds_ft_excl_validate_enabled(void);
 
 /*
+ * cds_ft_verify_at_mutation_enabled - Query whether the optional
+ *                                     verify-at-mutation feature is
+ *                                     compiled into the library.
+ *
+ * Returns true if the library was built with
+ * -DFEATURE_FT_VERIFY_AT_MUTATION, in which case the writer
+ * scope-exit hook samples cds_ft_verify + cds_ft_verify_density at a
+ * per-trie tunable period (see
+ * cds_ft_verify_at_mutation_period_set).  Returns false if the
+ * feature is compiled out (the default), in which case the period
+ * setter / getter return CDS_FT_STATUS_NOT_SUPPORTED.
+ *
+ * Use as a build-time gate from tests so that a negative test that
+ * relies on the verify cadence can SKIP itself rather than silently
+ * pass on a non-VAM build.
+ */
+bool cds_ft_verify_at_mutation_enabled(void);
+
+/*
+ * cds_ft_verify_at_mutation_period_set - Set the verify-at-mutation
+ *                                        sampling period for @ft.
+ *
+ * When the library is built with -DFEATURE_FT_VERIFY_AT_MUTATION,
+ * the writer scope-exit hook runs cds_ft_verify +
+ * cds_ft_verify_density once every @period mutations:
+ *
+ *   period == 0 : disable the verify walk on this trie (the
+ *                 increment-and-compare in the hook still runs);
+ *   period == 1 : verify every mutation (the historical
+ *                 -DFEATURE_FT_VERIFY_AT_MUTATION cadence; this is
+ *                 the default at cds_ft_create() time);
+ *   period >  1 : verify every @period mutations — useful on large
+ *                 tries where O(N) per mutation is impractical.
+ *
+ * The internal counter is reset to 0 on each period boundary, so it
+ * never exceeds @period - 1 and there is no overflow / cadence-drift
+ * concern on long-running workloads.  Setting a new period also
+ * resets the counter, so the next verify lands @period mutations
+ * from now.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_NOT_SUPPORTED when the library was built without
+ * FEATURE_FT_VERIFY_AT_MUTATION — the call surfaces the mismatch
+ * loudly so a test that relies on the verify cadence cannot
+ * accidentally run with verify-at-mutation compiled out.  Use
+ * cds_ft_verify_at_mutation_enabled() to gate the call.
+ *
+ * Write-side only (mutex-held); not safe to call concurrently with
+ * writers on the same trie.
+ */
+enum cds_ft_status cds_ft_verify_at_mutation_period_set(struct cds_ft *ft,
+		unsigned long period);
+
+/*
+ * cds_ft_verify_at_mutation_period_get - Read the verify-at-mutation
+ *                                        sampling period for @ft
+ *                                        into *@period.
+ *
+ * Returns CDS_FT_STATUS_OK on success, or
+ * CDS_FT_STATUS_NOT_SUPPORTED when the library was built without
+ * FEATURE_FT_VERIFY_AT_MUTATION — distinguishing build-disabled
+ * from a runtime period == 0.
+ */
+enum cds_ft_status cds_ft_verify_at_mutation_period_get(
+		const struct cds_ft *ft, unsigned long *period);
+
+/*
  * Collapse threshold control.
  *
  * Collapse merges a sparse internal subtree into a single

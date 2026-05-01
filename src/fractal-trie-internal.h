@@ -865,6 +865,25 @@ struct cds_ft {
 	unsigned long nr_internal_alloc, nr_internal_freed;
 	unsigned long nr_compressed_alloc, nr_compressed_freed;
 	unsigned long nr_collapsed_alloc, nr_collapsed_freed;
+
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+	/*
+	 * Verify-at-mutation sampling.  ft_writer_scope_verify runs
+	 * the full O(N) cds_ft_verify + cds_ft_verify_density walk
+	 * once every @verify_at_mutation_period mutations.
+	 * @verify_at_mutation_counter increments on every writer-scope
+	 * exit and is reset to 0 each time the period is reached, so
+	 * it never exceeds @verify_at_mutation_period - 1 (no overflow
+	 * concerns even on long-running workloads).  Period 1
+	 * reproduces the historical "every mutation" cadence; larger
+	 * periods are useful on large tries where O(N) per mutation
+	 * is impractical.  Period 0 disables the walk entirely.  Both
+	 * fields are write-side only (mutex-held during the writer
+	 * scope), so plain accesses are safe.
+	 */
+	unsigned long verify_at_mutation_period;
+	unsigned long verify_at_mutation_counter;
+#endif
 };
 
 /*
