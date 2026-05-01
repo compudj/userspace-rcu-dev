@@ -21232,6 +21232,50 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 				cn->child);
 		return -1;
 	}
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * Skip-slot offset round-trip.  Each compressed records a
+	 * pointer-stride offset from its parent to the slot that holds
+	 * the (skip-encoded) pointer to itself; ft_publish_to_parent
+	 * uses this to refresh the skip slot when cn->child is replaced.
+	 * Verify the offset still resolves to a slot whose contents
+	 * encode this very compressed (either skip-encoded or as a raw
+	 * compressed flag — both are valid publish states).  A stale
+	 * offset left after a recompact / graft would be the same bug
+	 * family as the recent parent_depth_span and double-wrap fixes;
+	 * surfacing it at the mutation that introduced it is much
+	 * cheaper than chasing a corrupted skip pointer at lookup time.
+	 *
+	 * NULL slot means the offset was never set (offset == 0 with a
+	 * non-NULL parent — e.g. compressed reached only via a raw
+	 * compressed pointer that doesn't exercise the skip path).  No
+	 * round-trip to verify in that case.  ft_get_skip_slot wants a
+	 * non-const ft for the root case (parent == NULL); cast away
+	 * const since we only read *slot.
+	 */
+	{
+		struct cds_ft_inode_flag **skip_slot =
+			ft_get_skip_slot(cn_meta, (struct cds_ft *) ft);
+
+		if (skip_slot) {
+			struct cds_ft_inode_flag *slot_val = *skip_slot;
+			struct cds_ft_compressed_node *target_cn = NULL;
+
+			if (ft_node_skip_compressed(slot_val))
+				target_cn = ft_skip_to_compressed(slot_val);
+			else if (ft_node_ptr(slot_val) &&
+				 ft_node_compressed(slot_val))
+				target_cn = ft_compressed_node_ptr(slot_val);
+			if (target_cn != cn) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: compressed %p skip_slot_offset round-trip mismatch: slot %p holds %p (resolves to cn %p, expected %p)\n",
+						depth, node_flag, skip_slot,
+						slot_val, target_cn, cn);
+				return -1;
+			}
+		}
+	}
+#endif
 	/*
 	 * Path tracking: write the compressed key bytes into the path
 	 * buffer at positions [depth..depth+cn->len-1].  Subsequent
