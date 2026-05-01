@@ -20862,6 +20862,21 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 	const struct cds_ft_group *group = ft->group;
 	bool check_path = (path != NULL);
 
+	/*
+	 * Every external leaf reached at @depth represents a key of
+	 * length @depth (NIL terminator at metadata depth, or full key
+	 * at slot depth — both produce the same external chain).  That
+	 * length must respect the group's max_key_len bound.  When the
+	 * group is configured with CDS_FT_MAX_LEN_UNLIMITED
+	 * (max_key_len == SIZE_MAX) this is a no-op since @depth is at
+	 * most FT_MAX_KEY_LEN.
+	 */
+	if (head && (size_t) depth > group->max_key_len) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: external chain head %p exceeds group max_key_len %zu\n",
+				depth, head, group->max_key_len);
+		return -1;
+	}
 	while (node) {
 		void *expected_prev = (prev == NULL) ?
 			(void *) owner_flag : (void *) prev;
@@ -21021,6 +21036,23 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		if (out)
 			fprintf(out, "ft_verify: depth %u: compressed node %p nr_child %u > 1\n",
 				depth, node_flag, cn_meta->nr_child);
+		return -1;
+	}
+	/*
+	 * cn->child / nr_child bookkeeping must agree:
+	 *   nr_child == 1 implies cn->child is non-NULL (the one child);
+	 *   nr_child == 0 implies cn->child is NULL.
+	 * A drift between the two is a publish/clear bug that the
+	 * subtree-key recursion would not catch on its own — the
+	 * key-aggregation path simply skips a NULL cn->child and would
+	 * accept a stored nr_child of 1 with cn->child = NULL as long
+	 * as nr_keys also dropped to 0 in lockstep.
+	 */
+	if ((cn_meta->nr_child == 1) != (ft_node_ptr(cn->child) != NULL)) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: compressed node %p nr_child %u does not match cn->child %p presence\n",
+				depth, node_flag,
+				cn_meta->nr_child, cn->child);
 		return -1;
 	}
 	/* Compressed nodes must not carry external_nodes. */
@@ -21325,6 +21357,20 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 					depth, node_flag);
 			return -1;
 		}
+		/*
+		 * alloc_index round-trip: cds_ft_metadata_to_item walks back
+		 * from the metadata to the arena slot using m->alloc_index.
+		 * It must land on this very node; a corrupted alloc_index
+		 * would otherwise survive verify and only fault later inside
+		 * the allocator on free or recompact.
+		 */
+		if (cds_ft_metadata_to_item(m) != node_addr) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: node %p alloc_index round-trip yields %p (mismatch)\n",
+					depth, node_flag,
+					cds_ft_metadata_to_item(m));
+			return -1;
+		}
 	}
 	if (ft_node_compressed(node_flag))
 		return ft_verify_node_compressed(ft, out, visited, path,
@@ -21506,6 +21552,46 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 					depth, node_flag, metadata->nr_child,
 					counted_children);
 			return -1;
+		}
+		/*
+		 * Pigeon bitmap consistency: pigeon nodes maintain a
+		 * 256-bit live-slot bitmap (allocated alongside the node
+		 * via ft_alloc_item with type->bitmap=true) that the
+		 * directional / bitmap-scan readers consult.  The bitmap
+		 * must agree slot-for-slot with the actual pointer array:
+		 * bit i set iff node->data[i] holds a non-NULL pointer.
+		 * ft_pigeon_node_get_nth reads node->data[n] directly
+		 * (bitmap-independent), so cross-checking the two surfaces
+		 * a desynchronised set / clear at the mutation site rather
+		 * than letting it produce wrong directional results later.
+		 */
+		{
+			unsigned int t = ft_node_type(node_flag);
+			const struct cds_ft_type *t_type = &ft_types[t];
+
+			if (t_type->type_class == FT_PIGEON) {
+				struct cds_ft_bitmap *bm =
+					cds_ft_item_to_bitmap(node, t_type->order);
+				unsigned int b;
+
+				for (b = 0; b < FT_ENTRY_PER_NODE; b++) {
+					struct cds_ft_inode_flag *child =
+						ft_pigeon_node_get_nth(NULL, node,
+							NULL, (uint8_t) b,
+							FT_PF_NONE);
+					bool slot_set = ft_node_ptr(child) != NULL;
+					bool bit_set = cds_test_bit(bm->bitmap, b);
+
+					if (slot_set != bit_set) {
+						if (out)
+							fprintf(out, "ft_verify: depth %u: pigeon node %p slot %u: data %s, bitmap bit %s\n",
+								depth, node_flag, b,
+								slot_set ? "set" : "NULL",
+								bit_set ? "set" : "clear");
+						return -1;
+					}
+				}
+			}
 		}
 #ifdef FEATURE_FT_COMPRESS
 		/*
