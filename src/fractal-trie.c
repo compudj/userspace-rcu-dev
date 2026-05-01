@@ -21113,6 +21113,46 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 			return -1;
 		local_keys = 1;	/* One unique key position. */
 	}
+#ifdef FEATURE_FT_COLLAPSE
+	/*
+	 * Per-slot encoding sanity (all capacity slots, not just the
+	 * live ones the iterator yields).  Three valid states:
+	 *   slen == 0, child == NULL : unused slot;
+	 *   slen >  0, child == NULL : dead slot (post-removal);
+	 *   slen >  0, child != NULL : live slot, slen <= stride max.
+	 * The fourth combination (slen == 0, child != NULL) is invalid:
+	 * a child published without its slen would be unreachable on the
+	 * read side (slen drives suffix-byte consumption and depth
+	 * advancement) and indicates a torn publish.
+	 */
+	{
+		unsigned int capacity =
+			ft_collapsed_capacity_stride(tier, stride);
+		unsigned int max_suffix = ft_col_stride_suffix_max[stride];
+		unsigned int slot;
+
+		for (slot = 0; slot < capacity; slot++) {
+			struct ft_col_view sv;
+
+			ft_collapsed_load_entry_view_rcu(col, tier, stride,
+					slot, &sv);
+			if (sv.slen == 0 && sv.child != NULL) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: collapsed node %p slot %u has child %p with slen 0 (torn publish)\n",
+						depth, node_flag, slot, sv.child);
+				return -1;
+			}
+			if (sv.slen > 0 && sv.child != NULL &&
+			    sv.slen > max_suffix) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: collapsed node %p slot %u live slen %u exceeds stride %u max %u\n",
+						depth, node_flag, slot,
+						sv.slen, stride, max_suffix);
+				return -1;
+			}
+		}
+	}
+#endif
 	/* Walk each collapsed entry. */
 	ft_for_each_live_collapsed_entry_view_rcu(col, tier, stride, e, view) {
 		unsigned int slen = view.slen;
