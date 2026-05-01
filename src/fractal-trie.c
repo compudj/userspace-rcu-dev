@@ -20823,6 +20823,63 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		unsigned long *out_nr_keys);
 
 /*
+ * Verify the doubly-linked external-node duplicate chain anchored at
+ * @head, owned by @owner_flag (the flagged pointer to the
+ * internal/collapsed node whose metadata holds the chain).
+ *
+ *   - Head's prev must equal @owner_flag (the parent flagged-pointer
+ *     convention used by ft_metadata_set_external_nodes).
+ *   - Each non-head node's prev must point to its predecessor.
+ *   - No node may appear twice (cycle / aliasing across chains).  We
+ *     reuse @visited so a node accidentally referenced from a second
+ *     chain elsewhere in the trie is also caught.
+ *
+ * Returns 0 on success, -1 on first violation.  No-op when @head is
+ * NULL.
+ */
+static
+int ft_verify_external_chain(FILE *out, struct ft_visited_set *visited,
+		struct cds_ft_inode_flag *owner_flag,
+		struct cds_ft_node *head,
+		unsigned int depth)
+{
+	struct cds_ft_node *node = head;
+	struct cds_ft_node *prev = NULL;
+
+	while (node) {
+		void *expected_prev = (prev == NULL) ?
+			(void *) owner_flag : (void *) prev;
+		int added = ft_visited_add(visited, node);
+
+		if (added < 0) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: visited-set allocation failed in external chain at %p\n",
+					depth, node);
+			return -1;
+		}
+		if (added == 0) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: external chain node %p reached twice (cycle or alias)\n",
+					depth, node);
+			return -1;
+		}
+		if (node->prev != expected_prev) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: external chain node %p prev %p != expected %p (%s)\n",
+					depth, node, node->prev,
+					expected_prev,
+					prev == NULL ?
+						"head should point to owner" :
+						"non-head should point to predecessor");
+			return -1;
+		}
+		prev = node;
+		node = node->next;
+	}
+	return 0;
+}
+
+/*
  * If @slot_val is skip-encoded, verify the encoded slen equals
  * cn->len of the underlying compressed node.  Returns 0 when the
  * slot is not skip-encoded or the slen matches; -1 on mismatch
@@ -21051,6 +21108,9 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 	}
 	/* Count external nodes attached to this collapsed node's metadata. */
 	if (external_nodes) {
+		if (ft_verify_external_chain(out, visited, node_flag,
+				external_nodes, depth))
+			return -1;
 		local_keys = 1;	/* One unique key position. */
 	}
 	/* Walk each collapsed entry. */
@@ -21220,6 +21280,9 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 		/* Count external nodes attached to this node's metadata. */
 		if (external_nodes) {
+			if (ft_verify_external_chain(out, visited, node_flag,
+					external_nodes, depth))
+				return -1;
 			local_keys = 1;	/* One unique key position. */
 		}
 		/* Walk all 256 child slots. */
