@@ -20719,6 +20719,40 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		unsigned long *out_nr_keys);
 
 /*
+ * If @slot_val is skip-encoded, verify the encoded slen equals
+ * cn->len of the underlying compressed node.  Returns 0 when the
+ * slot is not skip-encoded or the slen matches; -1 on mismatch
+ * (with diagnostic to @out).  No-op on architectures without
+ * FEATURE_FT_SKIP_COMPRESSED (ft_node_skip_compressed is constant
+ * false and the body is dead-coded).
+ *
+ * Catches double-wrap of an already-skip-encoded child, stale skip
+ * pointers left behind by a recompact that did not refresh the
+ * encoded slen, and the parent_depth_span class of bug fixed by
+ * ft_parent_depth_span match against skip-encoded child.
+ */
+static
+int ft_verify_skip_encoding(FILE *out, struct cds_ft_inode_flag *slot_val,
+		unsigned int depth)
+{
+	struct cds_ft_compressed_node *cn;
+	unsigned int slen, cn_len;
+
+	if (!ft_node_skip_compressed(slot_val))
+		return 0;
+	slen = ft_skip_len(slot_val);
+	cn = ft_skip_to_compressed(slot_val);
+	cn_len = cn->len;
+	if (slen != cn_len) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: skip-encoded slot %p slen %u != cn->len %u (cn %p)\n",
+				depth, slot_val, slen, cn_len, cn);
+		return -1;
+	}
+	return 0;
+}
+
+/*
  * Verify a compressed node's invariants (cn->len >= 1, no
  * external_nodes, nr_child <= 1, parent pointer matches), recurse
  * into its child, and check the stored nr_keys against the child's
@@ -20899,9 +20933,12 @@ int ft_verify_node_collapsed(const struct cds_ft *ft, FILE *out,
 		if (ft_node_external(child)) {
 			total_child_keys += 1;
 		} else {
-			struct cds_ft_inode_flag *child_resolved = ft_resolve_skip_compressed(child);
+			struct cds_ft_inode_flag *child_resolved;
 			unsigned long sub_keys = 0;
 
+			if (ft_verify_skip_encoding(out, child, depth + slen))
+				return -1;
+			child_resolved = ft_resolve_skip_compressed(child);
 			if (ft_verify_node_recursive(ft, out, child_resolved,
 					node_flag, depth + slen,
 					&sub_keys))
@@ -20987,11 +21024,20 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 		/* Walk all 256 child slots. */
 		for (key = 0; key < 256; key++) {
-			struct cds_ft_inode_flag *child =
-				ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
+			struct cds_ft_inode_flag *child_raw =
+				ft_node_get_nth_skip(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
+			struct cds_ft_inode_flag *child;
 
-			if (!ft_node_ptr(child))
+			if (!ft_node_ptr(child_raw))
 				continue;
+			/*
+			 * Raw slot may be skip-encoded; verify the encoded
+			 * slen matches the underlying compressed's cn->len
+			 * before resolving for the recursion.
+			 */
+			if (ft_verify_skip_encoding(out, child_raw, depth + 1))
+				return -1;
+			child = ft_resolve_skip_compressed(child_raw);
 			counted_children++;
 			if (ft_node_external(child)) {
 				total_child_keys += 1;
