@@ -11287,14 +11287,39 @@ void ft_check_collapse_on_path(struct cds_ft *ft,
 			if (ft_node_external(p1_nf))
 				break;
 			if (ft_node_compressed(p1_nf)) {
-				struct cds_ft_compressed_node *cn =
-					ft_compressed_node_ptr(p1_nf);
-				unsigned int remaining =
-					key_len - p1_depth;
-				unsigned int cmp = cn->len < remaining ?
-					cn->len : remaining;
+				struct cds_ft_compressed_node *cn;
+				unsigned int remaining;
+				unsigned int cmp;
 				unsigned int j;
 
+				/*
+				 * Self-canonicalize the compressed: if its
+				 * child is itself a chain head (or skip-/
+				 * compressed), absorb it into a single bigger
+				 * compressed.  Without this, a chain head
+				 * emerging beneath a compressed could not be
+				 * canonicalized via ft_compress_chain_at on
+				 * the chain head itself (the function refuses
+				 * to publish a compressed adjacent to a
+				 * compressed parent, which would produce two
+				 * adjacent compresseds and a double-wrapped
+				 * skip pointer in skip mode).
+				 */
+				{
+					int r = ft_compress_chain_at(ft, p1_nf,
+						p1_pnf, p1_slot, p1_depth);
+
+					if (r < 0)
+						return;
+					if (r > 0) {
+						p1_nf = ft_dereference_acquire(
+							*p1_slot);
+						continue;
+					}
+				}
+				cn = ft_compressed_node_ptr(p1_nf);
+				remaining = key_len - p1_depth;
+				cmp = cn->len < remaining ? cn->len : remaining;
 				j = ft_match_compressed_key(p1_ik, cn, cmp);
 				if (j < cmp)
 					break;
@@ -13886,12 +13911,38 @@ int ft_compress_chain_at(struct cds_ft *ft,
 	unsigned int di;
 	unsigned long leaf_nr_keys;
 	unsigned int i;
+	unsigned int initial_top_len = 0;
 
-	if (!ft_node_internal(top_flag))
+	/*
+	 * Top must be either an internal chain head (single-child, no
+	 * external nodes) or a compressed node.  Starting from a
+	 * compressed top is the canonicalization handle for the
+	 * "compressed → internal chain head → ..." pattern: the walk loop
+	 * below absorbs the top compressed's bytes and then continues
+	 * downward into any chain head, fusing them all into one new
+	 * compressed without ever creating two adjacent compresseds.
+	 */
+	if (!ft_node_internal(top_flag) && !ft_node_compressed(top_flag))
 		return 0;
 	top_meta = cds_ft_item_to_metadata(ft_node_ptr(top_flag));
 	if (top_meta->nr_child != 1 || top_meta->external_nodes)
 		return 0;
+	/*
+	 * Defensive: if top is internal and parent is compressed, the
+	 * walk would build a new compressed adjacent to the compressed
+	 * parent and ft_publish_to_parent would double-wrap the
+	 * grandparent's skip pointer.  Pass-2's compressed-branch call
+	 * canonicalizes from the compressed level instead and normally
+	 * absorbs this chain head before we ever land here, but the
+	 * absorb can refuse in edge cases (len would exceed 255, or the
+	 * parent compressed has external_nodes).  Bail out cleanly in
+	 * those residual cases.
+	 */
+	if (ft_node_internal(top_flag) && parent_nf
+			&& ft_node_compressed(parent_nf))
+		return 0;
+	if (ft_node_compressed(top_flag))
+		initial_top_len = ft_compressed_node_ptr(top_flag)->len;
 
 	old_fp = ft_node_readside_footprint(ft, top_flag);
 	for (di = 0; di < FT_NODE_DENSITY_DEPTH; di++)
@@ -13965,6 +14016,15 @@ int ft_compress_chain_at(struct cds_ft *ft,
 		if (len < min_chain_len || nr_absorbed == 0)
 			return 0;
 	}
+
+	/*
+	 * Compressed-top no-progress guard: if the only thing absorbed
+	 * was the top compressed itself (no chain head, no further
+	 * compresseds below), rebuilding would yield the same byte
+	 * sequence in a same-size compressed.  Skip the useless work.
+	 */
+	if (initial_top_len > 0 && len <= initial_top_len)
+		return 0;
 
 	/*
 	 * Per-path CL latency gate for non-skip publication.
