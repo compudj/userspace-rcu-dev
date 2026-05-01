@@ -33,6 +33,10 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <urcu/fractal-trie.h>
 #include <urcu/list.h>
 #include <urcu/uatomic.h>
@@ -132,9 +136,67 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 }
 
 /*
+ * mbind() with MPOL_INTERLEAVE round-robins page placement across
+ * the calling thread's allowed NUMA nodes, applied at superblock
+ * creation while no page is faulted yet.  Gated behind the
+ * CDS_FT_NUMA_INTERLEAVE env var (default off) so the library
+ * keeps its first-touch placement policy unless the user opts in.
+ */
+#ifdef __linux__
+#define FT_MPOL_INTERLEAVE	3
+#define FT_MPOL_F_MEMS_ALLOWED	(1U << 2)
+#define FT_MAX_NUMA_NODES	1024
+#define FT_NODEMASK_LONGS	(FT_MAX_NUMA_NODES / (sizeof(unsigned long) * 8))
+
+static
+int ft_interleave_enabled(void)
+{
+	static int cached = -1;
+	const char *env;
+	int v;
+
+	v = uatomic_load(&cached, CMM_RELAXED);
+	if (v != -1)
+		return v;
+	env = getenv("CDS_FT_NUMA_INTERLEAVE");
+	v = (env && env[0] && env[0] != '0') ? 1 : 0;
+	uatomic_store(&cached, v, CMM_RELAXED);
+	return v;
+}
+
+static
+void ft_apply_interleave(void *base, size_t size)
+{
+	unsigned long nodemask[FT_NODEMASK_LONGS] = { 0 };
+	unsigned long any = 0;
+	size_t i;
+	long r;
+
+	if (!ft_interleave_enabled())
+		return;
+	r = syscall(__NR_get_mempolicy, NULL, nodemask, (unsigned long) FT_MAX_NUMA_NODES,
+			NULL, FT_MPOL_F_MEMS_ALLOWED);
+	if (r < 0)
+		return;
+	for (i = 0; i < FT_NODEMASK_LONGS; i++)
+		any |= nodemask[i];
+	if (!any)
+		return;
+	(void) syscall(__NR_mbind, base, size, FT_MPOL_INTERLEAVE,
+			nodemask, (unsigned long) FT_MAX_NUMA_NODES, 0);
+}
+#else
+static inline void ft_apply_interleave(void *base __attribute__((unused)),
+		size_t size __attribute__((unused))) {}
+#endif
+
+/*
  * Allocate a fresh superblock big enough to host at least one
  * range of size min_size.  Pages are mmap'd anonymous, so they are
- * lazily zero-initialized on first touch.
+ * lazily zero-initialized on first touch.  When CDS_FT_NUMA_INTERLEAVE
+ * is set, mbind(MPOL_INTERLEAVE) is applied before any page is
+ * faulted, so the kernel round-robins placement across the calling
+ * thread's allowed NUMA nodes.
  */
 static
 struct cds_ft_alloc_superblock *superblock_create(size_t min_size)
@@ -150,6 +212,7 @@ struct cds_ft_alloc_superblock *superblock_create(size_t min_size)
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (base == MAP_FAILED)
 		return NULL;
+	ft_apply_interleave(base, size);
 	sb = malloc(sizeof(*sb));
 	if (!sb) {
 		munmap(base, size);
