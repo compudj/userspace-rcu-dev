@@ -22627,6 +22627,7 @@ void calc_stats_collapsed(const struct cds_ft *ft,
 		unsigned int slen = view.slen;
 		unsigned int j;
 		struct cds_ft_inode_flag *child = view.child;
+		int child_level;
 
 		{
 			unsigned int slen_bin = (slen > FT_COLLAPSE_SLEN_MAX_BIN)
@@ -22639,20 +22640,81 @@ void calc_stats_collapsed(const struct cds_ft *ft,
 			stats->level[level + j].nr_compressed_nodes++;
 			stats->level[level + j].has_nodes = true;
 		}
-		if (ft_node_ptr(child) && !ft_node_external(child))
+		child_level = level + slen;
+		/*
+		 * Skip-compressed: the slot stores cn->child OR'd with
+		 * cn->len in the high bits.  Account for cn (one
+		 * explicit compressed) and its implicit path
+		 * (skip_len - 1 levels), then strip and re-classify the
+		 * underlying child.
+		 */
+		if (ft_node_skip_compressed(child)) {
+			unsigned int skip = ft_skip_len(child);
+			unsigned int k;
+
+			for (k = 0; k < skip; k++) {
+				stats->level[child_level + k].nr_internal_nodes++;
+				stats->level[child_level + k].nr_compressed_nodes++;
+				stats->level[child_level + k].has_nodes = true;
+			}
+			child = ft_skip_child_ptr(child);
+			child_level += skip;
+		}
+		/*
+		 * The collapsed entry's child slot, after skip strip,
+		 * may directly carry an explicit compressed pointer
+		 * (paths longer than FT_SKIP_LEN_MAX, or non-skip
+		 * groups).  Mirror the compressed branch from
+		 * calc_stats_node_recursive: count cn + implicit path,
+		 * then descend into cn->child.  calc_stats_node_recursive
+		 * cannot iterate compressed children itself
+		 * (ft_node_get_nth_skip returns NULL on a non-internal
+		 * tag), so the descent must happen here.
+		 */
+		if (ft_node_ptr(child) && ft_node_compressed(child)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(child);
+			unsigned int k;
+
+			stats->level[child_level].nr_internal_nodes++;
+			stats->level[child_level].nr_compressed_nodes++;
+			stats->level[child_level].has_nodes = true;
+			for (k = 1; k < cn->len; k++) {
+				stats->level[child_level + k].nr_internal_nodes++;
+				stats->level[child_level + k].nr_compressed_nodes++;
+				stats->level[child_level + k].has_nodes = true;
+			}
+			if (ft_node_ptr(cn->child) &&
+			    !ft_node_external(cn->child)) {
+				calc_stats_node_recursive(ft, cn->child,
+					stats, child_level + cn->len);
+			} else if (ft_node_ptr(cn->child)) {
+				struct cds_ft_node *iter_node;
+				unsigned int count = 0;
+
+				iter_node = (struct cds_ft_node *) ft_node_ptr(cn->child);
+				cds_ft_for_each_duplicate(iter_node) {
+					if (count++ == 0)
+						stats->level[child_level + cn->len].nr_external_nodes++;
+					else
+						stats->level[child_level + cn->len].nr_duplicate_external_nodes++;
+					stats->level[child_level + cn->len].has_nodes = true;
+				}
+			}
+		} else if (ft_node_ptr(child) && !ft_node_external(child)) {
 			calc_stats_node_recursive(ft, child,
-				stats, level + slen);
-		else if (ft_node_ptr(child)) {
+				stats, child_level);
+		} else if (ft_node_ptr(child)) {
 			struct cds_ft_node *iter_node;
 			unsigned int count = 0;
 
 			iter_node = (struct cds_ft_node *) ft_node_ptr(child);
 			cds_ft_for_each_duplicate(iter_node) {
 				if (count++ == 0)
-					stats->level[level + slen].nr_external_nodes++;
+					stats->level[child_level].nr_external_nodes++;
 				else
-					stats->level[level + slen].nr_duplicate_external_nodes++;
-				stats->level[level + slen].has_nodes = true;
+					stats->level[child_level].nr_duplicate_external_nodes++;
+				stats->level[child_level].has_nodes = true;
 			}
 		}
 	}
