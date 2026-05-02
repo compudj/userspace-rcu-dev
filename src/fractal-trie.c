@@ -154,8 +154,6 @@ enum cds_ft_type_class {
 
 #define ft_type_is_linear(tc)	((tc) == FT_LINEAR)
 #define ft_type_is_popcount(tc)	((tc) == FT_POPCOUNT)
-#define ft_type_is_linear_or_popcount(tc) \
-	(ft_type_is_linear(tc) || ft_type_is_popcount(tc))
 
 /*
  * FT_HAVE_EFFICIENT_UNALIGNED_ACCESS: architectures where unaligned
@@ -3603,12 +3601,6 @@ uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
 	unsigned int max_lc = type->max_linear_child;
 	unsigned int i;
 
-#ifdef FEATURE_FT_POPCOUNT_NODE
-	if (type->nibble_popcount_2l)
-		return ft_nibble_popcount_2l_node_get_nr_child(type, node);
-	if (type->byte_popcount_1l)
-		return ft_byte_popcount_1l_node_get_nr_child(type, node);
-#endif
 	values = &node->data[0];
 	v0 = uatomic_load(&values[0], CMM_RELAXED);
 	for (i = 1; i < max_lc; i++) {
@@ -3616,6 +3608,31 @@ uint8_t ft_linear_node_get_nr_child(const struct cds_ft_type *type,
 			return (uint8_t)i;
 	}
 	return (uint8_t)max_lc;
+}
+
+/*
+ * FT_POPCOUNT class nr_child: dispatch to the byte_popcount_1l or
+ * nibble_popcount_2l layout helper.  Both count populated slots via
+ * popcount of the bitmap (independent of the soft-delete pointer
+ * accounting in metadata->nr_child).  Stub in baseline builds (where
+ * FT_POPCOUNT class types do not exist and the dispatcher case is
+ * unreachable).
+ */
+static inline_lookup
+uint8_t ft_popcount_node_get_nr_child(const struct cds_ft_type *type,
+		struct cds_ft_inode *node)
+{
+#ifdef FEATURE_FT_POPCOUNT_NODE
+	assert(ft_type_is_popcount(type->type_class));
+	if (type->nibble_popcount_2l)
+		return ft_nibble_popcount_2l_node_get_nr_child(type, node);
+	assert(type->byte_popcount_1l);
+	return ft_byte_popcount_1l_node_get_nr_child(type, node);
+#else
+	(void) type; (void) node;
+	assert(0);
+	return 0;
+#endif
 }
 
 /*
@@ -4685,15 +4702,8 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	unsigned int i;
 	int match_v;
 
-	assert(ft_type_is_linear_or_popcount(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
-
-#ifdef FEATURE_FT_POPCOUNT_NODE
-	if (type->nibble_popcount_2l)
-		return ft_nibble_popcount_2l_node_get_direction(type, node, n, result_key, dir);
-	if (type->byte_popcount_1l)
-		return ft_byte_popcount_1l_node_get_direction(type, node, n, result_key, dir);
-#endif
 
 	if (dir == FT_LEFT) {
 		match_v = -1;
@@ -4743,6 +4753,34 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	return match_ptr;
 }
 
+/*
+ * FT_POPCOUNT class get_direction: dispatch to byte_popcount_1l or
+ * nibble_popcount_2l layout helper.  Stub in baseline builds (where
+ * FT_POPCOUNT class types do not exist and the dispatcher case is
+ * unreachable).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_popcount_node_get_direction(
+		const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		int n, uint8_t *result_key,
+		enum ft_direction dir)
+{
+#ifdef FEATURE_FT_POPCOUNT_NODE
+	assert(ft_type_is_popcount(type->type_class));
+	if (type->nibble_popcount_2l)
+		return ft_nibble_popcount_2l_node_get_direction(
+				type, node, n, result_key, dir);
+	assert(type->byte_popcount_1l);
+	return ft_byte_popcount_1l_node_get_direction(
+			type, node, n, result_key, dir);
+#else
+	(void) type; (void) node; (void) n; (void) result_key; (void) dir;
+	assert(0);
+	return NULL;
+#endif
+}
+
 static inline_lookup
 void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
@@ -4753,24 +4791,41 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 	uint8_t *values;
 	struct cds_ft_inode_flag **pointers;
 
-	assert(ft_type_is_linear_or_popcount(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 	assert(i < ft_linear_node_get_nr_child(type, node));
-
-#ifdef FEATURE_FT_POPCOUNT_NODE
-	if (type->nibble_popcount_2l) {
-		ft_nibble_popcount_2l_node_get_ith_pos(type, node, i, v, iter);
-		return;
-	}
-	if (type->byte_popcount_1l) {
-		ft_byte_popcount_1l_node_get_ith_pos(type, node, i, v, iter);
-		return;
-	}
-#endif
 
 	values = &node->data[0];
 	*v = values[i];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
 	*iter = ft_dereference_acquire(pointers[i]);
+}
+
+/*
+ * FT_POPCOUNT class get_ith_pos: dispatch to byte_popcount_1l or
+ * nibble_popcount_2l layout helper.  Returns the byte value v and
+ * the (acquire-loaded) child pointer for the i-th populated slot in
+ * popcount order.  Stub in baseline builds.
+ */
+static inline_lookup
+void ft_popcount_node_get_ith_pos(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		uint8_t i,
+		uint8_t *v,
+		struct cds_ft_inode_flag **iter)
+{
+#ifdef FEATURE_FT_POPCOUNT_NODE
+	assert(ft_type_is_popcount(type->type_class));
+	assert(i < ft_popcount_node_get_nr_child(type, node));
+	if (type->nibble_popcount_2l) {
+		ft_nibble_popcount_2l_node_get_ith_pos(type, node, i, v, iter);
+		return;
+	}
+	assert(type->byte_popcount_1l);
+	ft_byte_popcount_1l_node_get_ith_pos(type, node, i, v, iter);
+#else
+	(void) type; (void) node; (void) i; (void) v; (void) iter;
+	assert(0);
+#endif
 }
 
 #ifdef FEATURE_FT_POPCOUNT_NODE
@@ -6010,6 +6065,25 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
+	{
+		uint8_t nr_child = ft_popcount_node_get_nr_child(type, node);
+		unsigned int i;
+
+		for (i = 0; i < nr_child; i++) {
+			struct cds_ft_inode_flag *iter;
+			uint8_t v;
+
+			ft_popcount_node_get_ith_pos(type, node, i, &v, &iter);
+			if (iter == child_nf) {
+				if (n_ret)
+					*n_ret = v;
+				if (slot_ret)
+					ft_node_get_nth(parent_nf, slot_ret, v, FT_PF_NONE);
+				return true;
+			}
+		}
+		return false;
+	}
 	case FT_LINEAR:
 	{
 		uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
@@ -6104,6 +6178,8 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
+		child = ft_popcount_node_get_direction(type, node, n, result_key, dir);
+		break;
 	case FT_LINEAR:
 		child = ft_linear_node_get_direction(type, node, n, result_key, dir);
 		break;
@@ -6600,10 +6676,10 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		struct cds_ft_inode_flag *newptr)
 {
-	assert(ft_type_is_linear_or_popcount(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 	assert(ft_linear_node_get_nr_child(type, node) <= type->max_linear_child);
 
-	if (ft_type_is_linear_or_popcount(type->type_class) && !newptr) {
+	if (ft_type_is_linear(type->type_class) && !newptr) {
 		assert(!metadata->fallback_removal_count);
 		if (metadata->nr_child <= type->min_child) {
 			/* We need to try recompacting the node */
@@ -6627,6 +6703,49 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 		(unsigned int) metadata->nr_child,
 		node, newptr);
 	return 0;
+}
+
+/*
+ * FT_POPCOUNT class replace_ptr: same publish protocol as the linear
+ * replace (rcu_assign_pointer on the slot), with min_child gating on
+ * delete and nr_child accounting via the bitmap-popcount helper.
+ * Stub in baseline builds (where FT_POPCOUNT class types do not
+ * exist and the dispatcher case is unreachable).
+ */
+static
+int ft_popcount_node_replace_ptr(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_metadata *metadata,
+		struct cds_ft_inode_flag **node_flag_ptr,
+		struct cds_ft_inode_flag *newptr)
+{
+#ifdef FEATURE_FT_POPCOUNT_NODE
+	assert(ft_type_is_popcount(type->type_class));
+	assert(ft_popcount_node_get_nr_child(type, node) <= type->max_linear_child);
+
+	if (!newptr) {
+		assert(!metadata->fallback_removal_count);
+		if (metadata->nr_child <= type->min_child) {
+			/* We need to try recompacting the node */
+			return -EFBIG;
+		}
+	}
+	dbg_printf("popcount replace ptr: node %p\n", node);
+	assert(*node_flag_ptr != NULL);
+	rcu_assign_pointer(*node_flag_ptr, newptr);
+	if (!newptr)
+		metadata->nr_child--;
+	dbg_printf("popcount replace ptr: %u child, metadata: %u child, for node %p newptr %p\n",
+		(unsigned int) ft_popcount_node_get_nr_child(type, node),
+		(unsigned int) metadata->nr_child,
+		node, newptr);
+	return 0;
+#else
+	(void) type; (void) node; (void) metadata;
+	(void) node_flag_ptr; (void) newptr;
+	assert(0);
+	return -EINVAL;
+#endif
 }
 
 static
@@ -6714,6 +6833,8 @@ int _ft_node_replace_ptr(const struct cds_ft_type *type,
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
+		ret = ft_popcount_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
+		break;
 	case FT_LINEAR:
 		ret = ft_linear_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
 		break;
@@ -6754,6 +6875,28 @@ unsigned int ft_node_sum_distribution_1d(enum ft_recompact mode,
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
+	{
+		uint8_t nr_child =
+			ft_popcount_node_get_nr_child(type, node);
+		unsigned int i;
+
+		for (i = 0; i < nr_child; i++) {
+			struct cds_ft_inode_flag *iter;
+			uint8_t v;
+
+			ft_popcount_node_get_ith_pos(type, node, i, &v, &iter);
+			if (!iter)
+				continue;
+			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
+				continue;
+			for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
+				if (v & (1U << bit_i))
+					nr_one[bit_i]++;
+			}
+			distrib_nr_child++;
+		}
+		break;
+	}
 	case FT_LINEAR:
 	{
 		uint8_t nr_child =
@@ -6893,6 +7036,41 @@ void ft_node_sum_distribution_2d(enum ft_recompact mode,
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
+	{
+		uint8_t nr_child =
+			ft_popcount_node_get_nr_child(type, node);
+		unsigned int i;
+
+		for (i = 0; i < nr_child; i++) {
+			struct cds_ft_inode_flag *iter;
+			uint8_t v;
+
+			ft_popcount_node_get_ith_pos(type, node, i, &v, &iter);
+			if (!iter)
+				continue;
+			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
+				continue;
+			for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
+				for (bit_j = bit_i + 1; bit_j < FT_BITS_PER_BYTE; bit_j++) {
+					if (v & (1U << bit_i)) {
+						if (v & (1U << bit_j)) {
+							nr_2d_11[bit_i][bit_j]++;
+						} else {
+							nr_2d_10[bit_i][bit_j]++;
+						}
+					} else {
+						if (v & (1U << bit_j)) {
+							nr_2d_01[bit_i][bit_j]++;
+						} else {
+							nr_2d_00[bit_i][bit_j]++;
+						}
+					}
+				}
+			}
+			distrib_nr_child++;
+		}
+		break;
+	}
 	case FT_LINEAR:
 	{
 		uint8_t nr_child =
@@ -7269,6 +7447,11 @@ retry:		/* for fallback */
 #define RECOMPACT_IS_INIT(byte_value) ({				\
 	bool __is_init = false;						\
 	switch (new_type->type_class) {					\
+	/*								\
+	 * FT_POPCOUNT and FT_LINEAR share the single-init-flag	\
+	 * scheme (no per-subnode state); fall-through is		\
+	 * intentional and the bodies are exact copies.		\
+	 */								\
 	case FT_POPCOUNT:						\
 	case FT_LINEAR:							\
 		__is_init = !new_linear_init_done;			\
@@ -7291,6 +7474,40 @@ retry:		/* for fallback */
 
 	switch (old_type->type_class) {
 	case FT_POPCOUNT:
+	{
+		uint8_t nr_child =
+			ft_popcount_node_get_nr_child(old_type, old_node);
+		unsigned int i;
+
+		for (i = 0; i < nr_child; i++) {
+			struct cds_ft_inode_flag *iter;
+			uint8_t v;
+
+			ft_popcount_node_get_ith_pos(old_type, old_node, i, &v, &iter);
+			if (!iter)
+				continue;
+			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
+				continue;
+#ifdef FEATURE_FT_POPCOUNT_NODE
+			if (new_type->nibble_popcount_2l)
+				ret = ft_nibble_popcount_2l_node_set_nth(new_type,
+						new_node, new_metadata, v, iter,
+						RECOMPACT_IS_INIT(v));
+			else if (new_type->byte_popcount_1l)
+				ret = ft_byte_popcount_1l_node_set_nth(new_type,
+						new_node, new_metadata, v, iter,
+						RECOMPACT_IS_INIT(v));
+			else
+#endif
+			ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
+					new_metadata, v, iter, RECOMPACT_IS_INIT(v));
+			if (new_type->type_class == FT_POOL && ret) {
+				goto fallback_toosmall;
+			}
+			assert(!ret);
+		}
+		break;
+	}
 	case FT_LINEAR:
 	{
 		uint8_t nr_child =
@@ -7567,6 +7784,26 @@ skip_copy:
 	{
 		switch (new_type->type_class) {
 		case FT_POPCOUNT:
+		{
+			uint8_t nc = ft_popcount_node_get_nr_child(new_type,
+					new_node);
+			unsigned int i;
+
+			for (i = 0; i < nc; i++) {
+				struct cds_ft_inode_flag *iter;
+				struct cds_ft_inode_flag **slot = NULL;
+				uint8_t v;
+
+				ft_popcount_node_get_ith_pos(new_type,
+						new_node, i, &v, &iter);
+				if (!iter)
+					continue;
+				ft_node_get_nth_skip(new_node_flag,
+						&slot, v, FT_PF_NONE);
+				ft_set_parent(iter, new_node_flag, slot);
+			}
+			break;
+		}
 		case FT_LINEAR:
 		{
 			uint8_t nc = ft_linear_node_get_nr_child(new_type,
