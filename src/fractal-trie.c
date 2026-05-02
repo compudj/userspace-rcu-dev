@@ -6161,46 +6161,127 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 			return ret;
 		}
 		/*
-		 * Non-init call on a published QP node: only in-place
-		 * pointer replacement is RCU-safe (single-slot write).
-		 * A new key would shift existing pointer slots and race
-		 * with concurrent readers, so force the caller to
-		 * recompact.
+		 * Non-init call on a published QP node.  Three cases:
+		 *
+		 * 1. Key already present (root and sub_bm bits both set):
+		 *    in-place pointer replace.
+		 *
+		 * 2A. hi already present, lo not present, AND no existing
+		 *     bit lies above (hi, lo) in the flat 256-bit space.
+		 *     "No bit above" decomposes into "no bit above lo in
+		 *     sub_bm[slot1]" AND "no bit above hi in root_bm" (which
+		 *     guarantees sub_bm[k > slot1] is unpopulated).  Setting
+		 *     bit lo in sub_bm[slot1] does not shift any existing
+		 *     pointer's popcount-rank, so we can write the new
+		 *     pointer at the (current) end-of-array slot.
+		 *
+		 * 2B. hi not present AND no existing bit at a position above
+		 *     hi in root_bm.  slot1 == popcount(root) == nr_used,
+		 *     which is the first unused sub_bm slot (zero from alloc
+		 *     / recompact-into).  We initialize sub_bm[slot1] to
+		 *     (1 << lo), publish the new pointer at end-of-array,
+		 *     and finally set bit hi in root_bm.
+		 *
+		 * 3. Otherwise: a new bit below an existing bit would shift
+		 *    pointer ranks (or sub_bm slots), racing with concurrent
+		 *    readers.  Return -ERANGE to force a recompact.
+		 *
+		 * Publish ordering for cases 2A and 2B is identical to the
+		 * byte_popcount_1l safe-append below; see the ordering note
+		 * there for the full reasoning (release on the new pointer,
+		 * relaxed on each bitmap publish; reader's address-dependency
+		 * from bitmap-derived index to pointer load keeps the loads
+		 * ordered, and any partial state collapses to "not found").
 		 */
 		qp_hdr = (struct ft_nibble_popcount_2l_header *) &node->data[0];
 		qp_pointers = ft_nibble_popcount_2l_pointers(node, type);
 		qp_root = qp_hdr->root_bm;
 		qp_hi = (unsigned int) n >> 4;
 		qp_lo = (unsigned int) n & 0xFU;
-		if (!((qp_root >> qp_hi) & 1U))
-			return -ERANGE;
 		qp_slot1 = (unsigned int) __builtin_popcount(
 				qp_root & ((1U << qp_hi) - 1U));
-		qp_sub = qp_hdr->sub_bm[qp_slot1];
-		if (!((qp_sub >> qp_lo) & 1U))
-			return -ERANGE;
-		/* Key already present: in-place pointer replace. */
-		{
-			uint64_t subs_below = 0;
-			unsigned int k;
 
-			for (k = 0; k < qp_slot1; k++)
+		if ((qp_root >> qp_hi) & 1U) {
+			qp_sub = qp_hdr->sub_bm[qp_slot1];
+			if ((qp_sub >> qp_lo) & 1U) {
+				/* Case 1: key already present, in-place replace. */
+				uint64_t subs_below = 0;
+				unsigned int k;
+
+				for (k = 0; k < qp_slot1; k++)
+					subs_below += (uint64_t)
+						__builtin_popcount(
+							qp_hdr->sub_bm[k]);
 				subs_below += (uint64_t) __builtin_popcount(
-						qp_hdr->sub_bm[k]);
-			subs_below += (uint64_t) __builtin_popcount(
-					(unsigned int) qp_sub
-					& ((1U << qp_lo) - 1U));
-			qp_ptr_idx = (unsigned int) subs_below;
-		}
-		if (qp_pointers[qp_ptr_idx]) {
-			if (_replace_old_ptr)
-				*_replace_old_ptr = true;
-		} else {
+						(unsigned int) qp_sub
+						& ((1U << qp_lo) - 1U));
+				qp_ptr_idx = (unsigned int) subs_below;
+				if (qp_pointers[qp_ptr_idx]) {
+					if (_replace_old_ptr)
+						*_replace_old_ptr = true;
+				} else {
+					if (_replace_old_ptr)
+						*_replace_old_ptr = false;
+					metadata->nr_child++;
+				}
+				rcu_assign_pointer(qp_pointers[qp_ptr_idx],
+						child_node_flag);
+				return 0;
+			}
+			/*
+			 * Case 2A: try safe-append within existing hi.
+			 * Need: no bit above lo in sub_bm[slot1], AND no bit
+			 * above hi in root_bm (so sub_bm[k > slot1] is all 0).
+			 */
+			{
+				uint16_t in_word_above = qp_lo == 15 ? 0
+					: (uint16_t) (qp_sub >> (qp_lo + 1));
+				uint16_t root_above = (uint16_t)
+					((qp_root >> qp_hi) >> 1);
+
+				if (in_word_above != 0 || root_above != 0)
+					return -ERANGE;	/* Case 3. */
+			}
+			qp_ptr_idx = (unsigned int)
+				ft_nibble_popcount_2l_node_get_nr_child(
+					type, node);
+			if (qp_ptr_idx >= type->max_linear_child)
+				return -ENOSPC;
+			rcu_assign_pointer(qp_pointers[qp_ptr_idx],
+					child_node_flag);
+			uatomic_store(&qp_hdr->sub_bm[qp_slot1],
+					(uint16_t) (qp_sub | (1U << qp_lo)),
+					CMM_RELAXED);
+			metadata->nr_child++;
 			if (_replace_old_ptr)
 				*_replace_old_ptr = false;
-			metadata->nr_child++;
+			return 0;
 		}
+		/*
+		 * Case 2B: hi not present.  Try safe-append of a new hi.
+		 * Need: no bit at a position > hi in root_bm.
+		 */
+		if ((qp_root >> qp_hi) != 0)
+			return -ERANGE;	/* Case 3. */
+		/*
+		 * slot1 == popcount(root_bm) since all currently-set hi
+		 * positions are below qp_hi.  This is the first unused
+		 * sub_bm slot, guaranteed zero from alloc / recompact-into.
+		 */
+		qp_slot1 = (unsigned int) __builtin_popcount(qp_root);
+		qp_ptr_idx = (unsigned int)
+			ft_nibble_popcount_2l_node_get_nr_child(type, node);
+		if (qp_ptr_idx >= type->max_linear_child)
+			return -ENOSPC;
+		uatomic_store(&qp_hdr->sub_bm[qp_slot1],
+				(uint16_t) (1U << qp_lo), CMM_RELAXED);
 		rcu_assign_pointer(qp_pointers[qp_ptr_idx], child_node_flag);
+		uatomic_store(&qp_hdr->root_bm,
+				(uint16_t) (qp_root | (1U << qp_hi)),
+				CMM_RELAXED);
+		metadata->nr_child++;
+		if (_replace_old_ptr)
+			*_replace_old_ptr = false;
 		return 0;
 	}
 	if (type->byte_popcount_1l) {
