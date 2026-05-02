@@ -6213,8 +6213,23 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 			return ret;
 		}
 		/*
-		 * Non-init call on a published byte-popcount node: only
-		 * in-place pointer replacement is RCU-safe.
+		 * Non-init call on a published byte-popcount node.  Three
+		 * cases:
+		 *
+		 * 1. Key already present (bitmap bit set): in-place pointer
+		 *    replace (single-slot RCU-safe write).
+		 *
+		 * 2. Key not present AND no existing bit lies above n:
+		 *    safe-append.  Setting bit n does not shift any existing
+		 *    pointer's popcount-rank, so we can write the new
+		 *    pointer at the (current) end-of-array slot and then
+		 *    publish the new bit.  See the ordering note at the
+		 *    publish-stores below for why the pointer is released
+		 *    and the bitmap is relaxed.
+		 *
+		 * 3. Otherwise: a new bit below an existing bit would shift
+		 *    pointer ranks, racing with concurrent readers.  Return
+		 *    -ERANGE to force a recompact.
 		 */
 		{
 			uint64_t *bm = (uint64_t *) &node->data[0];
@@ -6224,25 +6239,76 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 			unsigned int word_idx = (unsigned int) n >> 6;
 			unsigned int bit_idx = (unsigned int) n & 63U;
 			uint64_t word = bm[word_idx];
+			uint64_t bit = 1ULL << bit_idx;
 			unsigned int ptr_idx = 0;
 			unsigned int k;
 
-			if (!((word >> bit_idx) & 1ULL))
-				return -ERANGE;
-			for (k = 0; k < word_idx; k++)
-				ptr_idx += (unsigned int)
-					__builtin_popcountll(bm[k]);
-			ptr_idx += (unsigned int) __builtin_popcountll(
-					word & ((1ULL << bit_idx) - 1ULL));
-			if (bp_pointers[ptr_idx]) {
-				if (_replace_old_ptr)
-					*_replace_old_ptr = true;
-			} else {
-				if (_replace_old_ptr)
-					*_replace_old_ptr = false;
-				metadata->nr_child++;
+			if (word & bit) {
+				/* Case 1: in-place pointer replace. */
+				for (k = 0; k < word_idx; k++)
+					ptr_idx += (unsigned int)
+						__builtin_popcountll(bm[k]);
+				ptr_idx += (unsigned int) __builtin_popcountll(
+						word & (bit - 1ULL));
+				if (bp_pointers[ptr_idx]) {
+					if (_replace_old_ptr)
+						*_replace_old_ptr = true;
+				} else {
+					if (_replace_old_ptr)
+						*_replace_old_ptr = false;
+					metadata->nr_child++;
+				}
+				rcu_assign_pointer(bp_pointers[ptr_idx], child_node_flag);
+				return 0;
 			}
+
+			/*
+			 * Case 2: try safe-append.  Condition is "no existing
+			 * bit at a position > n" -- evaluated as "no bit
+			 * above bit_idx in word_idx, AND no bit set in any
+			 * higher word".
+			 */
+			{
+				bool safe_append;
+				uint64_t in_word_above = bit_idx == 63 ? 0
+					: (word >> (bit_idx + 1));
+
+				safe_append = (in_word_above == 0);
+				for (k = word_idx + 1; safe_append && k < 4; k++)
+					safe_append = (bm[k] == 0);
+				if (!safe_append)
+					return -ERANGE;	/* Case 3. */
+			}
+
+			/* Case 2: do the append. */
+			ptr_idx = (unsigned int) __builtin_popcountll(bm[0])
+				+ (unsigned int) __builtin_popcountll(bm[1])
+				+ (unsigned int) __builtin_popcountll(bm[2])
+				+ (unsigned int) __builtin_popcountll(bm[3]);
+			if (ptr_idx >= type->max_linear_child)
+				return -ENOSPC;
+			/*
+			 * Pointer store carries a release: the next-level
+			 * child node's contents (initialized by the caller
+			 * before this set_nth) must be visible to readers
+			 * that follow the pointer (matching acquire on the
+			 * scanner's pointer load).
+			 *
+			 * Bitmap bit set is relaxed: it is only a
+			 * reachability flag for this slot.  If a reader
+			 * observes the bit set but the pointer-store is
+			 * not yet visible (still NULL), the lookup returns
+			 * NULL -- a legitimate not-found result for an
+			 * append that hasn't fully propagated.  No reader
+			 * can compute ptr_idx == this new slot without
+			 * also seeing the bit set, so the slot is invisible
+			 * until the bit is.
+			 */
 			rcu_assign_pointer(bp_pointers[ptr_idx], child_node_flag);
+			uatomic_store(&bm[word_idx], word | bit, CMM_RELAXED);
+			metadata->nr_child++;
+			if (_replace_old_ptr)
+				*_replace_old_ptr = false;
 			return 0;
 		}
 	}
