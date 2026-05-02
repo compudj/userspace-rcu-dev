@@ -342,10 +342,50 @@ const struct cds_ft_type ft_types[] = {
 	},
 
 	/* Pools may fill sooner than max_child. */
+	/*
+	 * Indices 5 and 6 are historically pools (FT_POOL with subnode
+	 * dispatch).  When FEATURE_FT_POPCOUNT_NODE is enabled, the
+	 * "pool" layout collapses to a single 256-bit-bitmap + pointer
+	 * table spanning the whole node (no subnodes), which is just a
+	 * large linear-class node with the byte_popcount_1l layout
+	 * variant.  type_class is FT_LINEAR in that case, so all the
+	 * FT_POOL-specific code (subnode iteration, bit selector, post-
+	 * copy sweep, fallback split) is dead and unreached.
+	 */
 	/* This pool is hardcoded at index 5. See ft_node_ptr(). */
-	[FT_POOL_IDX_A] = { .type_class = FT_POOL, .min_child = 22, .max_child = ft_type_5_max_child, .max_linear_child = ft_type_5_max_linear_child, .order = 9, .nr_pool_order = ft_type_5_nr_pool_order, .pool_size_order = 8, .bitmap = FT_NO_BITMAP },
+	[FT_POOL_IDX_A] = {
+#ifdef FEATURE_FT_POPCOUNT_NODE
+		/*
+		 * byte_popcount_1l: 32B bitmap + 54*8B ptrs = 464B, fits
+		 * in the 512B order-9 node.  No subnode dispatch.
+		 */
+		.type_class = FT_LINEAR,
+		.max_linear_child = ft_type_5_max_child,
+		.byte_popcount_1l = true,
+#else
+		.type_class = FT_POOL,
+		.max_linear_child = ft_type_5_max_linear_child,
+#endif
+		.min_child = 22,
+		.max_child = ft_type_5_max_child,
+		.order = 9, .nr_pool_order = ft_type_5_nr_pool_order, .pool_size_order = 8, .bitmap = FT_NO_BITMAP },
 	/* This pool is hardcoded at index 6. See ft_node_ptr(). */
-	[FT_POOL_IDX_B] = { .type_class = FT_POOL, .min_child = 51, .max_child = ft_type_6_max_child, .max_linear_child = ft_type_6_max_linear_child, .order = 10, .nr_pool_order = ft_type_6_nr_pool_order, .pool_size_order = 8, .bitmap = FT_BITMAP },
+	[FT_POOL_IDX_B] = {
+#ifdef FEATURE_FT_POPCOUNT_NODE
+		/*
+		 * byte_popcount_1l: 32B bitmap + 104*8B ptrs = 864B, fits
+		 * in the 1024B order-10 node.  No subnode dispatch.
+		 */
+		.type_class = FT_LINEAR,
+		.max_linear_child = ft_type_6_max_child,
+		.byte_popcount_1l = true,
+#else
+		.type_class = FT_POOL,
+		.max_linear_child = ft_type_6_max_linear_child,
+#endif
+		.min_child = 51,
+		.max_child = ft_type_6_max_child,
+		.order = 10, .nr_pool_order = ft_type_6_nr_pool_order, .pool_size_order = 8, .bitmap = FT_BITMAP },
 
 	/*
 	 * Upon node removal below min_child, if child pool is filled
@@ -4480,10 +4520,18 @@ void ft_specialized_scan_layout_assert(void)
 	assert(FT_ALIGN(ft_types[2].max_linear_child, sizeof(void *)) == 8);
 	assert(FT_ALIGN(ft_types[3].max_linear_child, sizeof(void *)) == 16);
 	assert(FT_ALIGN(ft_types[4].max_linear_child, sizeof(void *)) == 32);
+#ifndef FEATURE_FT_POPCOUNT_NODE
+	/*
+	 * byte_popcount_1l pools (FEATURE_FT_POPCOUNT_NODE) have
+	 * max_linear_child == max_child (54 / 104), so per-subnode
+	 * ptr_offset alignment does not apply -- the whole node is one
+	 * 256-bit bitmap + 54 or 104 pointers.
+	 */
 	assert(FT_ALIGN(ft_types[FT_POOL_IDX_A].max_linear_child,
 				sizeof(void *)) == 32);
 	assert(FT_ALIGN(ft_types[FT_POOL_IDX_B].max_linear_child,
 				sizeof(void *)) == 32);
+#endif
 	assert(FT_POOL_IDX_A == 5);
 	assert(FT_POOL_IDX_B == 6);
 	assert(ft_types[7].type_class == FT_PIGEON);
@@ -4532,6 +4580,16 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 #ifdef FEATURE_FT_POPCOUNT_NODE
 	if (type->nibble_popcount_2l)
 		return ft_nibble_popcount_2l_scan_3(node, node_flag_ptr, n, pf_hint);
+	/*
+	 * byte_popcount_1l covers type-4 and the former pool indices
+	 * (5/6) -- one 256-bit-bitmap + ptr-array layout in either
+	 * 256B/512B/1024B nodes.  Reached via the generic fallback
+	 * dispatch on non-x86 64-bit (where FT_USE_SPECIALIZED_SCAN
+	 * is inactive); on x86-64 the specialized switch routes by
+	 * type_index directly.
+	 */
+	if (type->byte_popcount_1l)
+		return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
 #endif
 #if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS) && defined(__SSE2__)
 	/*
@@ -5696,6 +5754,19 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
 static void __attribute__((constructor))
 ft_check_pool_dispatch_assumptions(void)
 {
+#ifdef FEATURE_FT_POPCOUNT_NODE
+	/*
+	 * FEATURE_FT_POPCOUNT_NODE collapses the historical pools at
+	 * indices 5 and 6 to byte_popcount_1l linear-class layouts (no
+	 * subnodes), so FT_POOL is empty and the bit-selector / 2D-index
+	 * machinery is unused.
+	 */
+	assert(ft_types[FT_POOL_IDX_A].type_class == FT_LINEAR);
+	assert(ft_types[FT_POOL_IDX_B].type_class == FT_LINEAR);
+	assert(ft_types[FT_POOL_IDX_A].byte_popcount_1l);
+	assert(ft_types[FT_POOL_IDX_B].byte_popcount_1l);
+	assert(FT_MASK_POOL == 0);
+#else
 	assert(ft_types[FT_POOL_IDX_A].type_class == FT_POOL);
 	assert(ft_types[FT_POOL_IDX_B].type_class == FT_POOL);
 	assert(ft_types[FT_POOL_IDX_A].nr_pool_order == 1);
@@ -5703,6 +5774,7 @@ ft_check_pool_dispatch_assumptions(void)
 	assert(ft_types[FT_POOL_IDX_A].pool_size_order == FT_POOL_SIZE_ORDER);
 	assert(ft_types[FT_POOL_IDX_B].pool_size_order == FT_POOL_SIZE_ORDER);
 	assert((FT_MASK_POOL & ~((1U << FT_POOL_IDX_A) | (1U << FT_POOL_IDX_B))) == 0);
+#endif
 }
 
 static inline_lookup
@@ -5797,9 +5869,25 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		return ft_linear_scan_32(node, node_flag_ptr, n, pf_hint);
 #endif
 	case 5:
+#ifdef FEATURE_FT_POPCOUNT_NODE
+		/*
+		 * byte_popcount_1l pool: no subnode dispatch -- the whole
+		 * 512B node is one 256-bit bitmap + 54-pointer table.
+		 */
+		return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
+#else
 		return ft_pool_scan_1d(node, node_flag, node_flag_ptr, n, pf_hint);
+#endif
 	case 6:
+#ifdef FEATURE_FT_POPCOUNT_NODE
+		/*
+		 * byte_popcount_1l pool: no subnode dispatch -- the whole
+		 * 1024B node is one 256-bit bitmap + 104-pointer table.
+		 */
+		return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
+#else
 		return ft_pool_scan_2d(node, node_flag, node_flag_ptr, n, pf_hint);
+#endif
 	case 7:
 		return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
 	default:
@@ -23341,6 +23429,13 @@ const char *internal_type_name(unsigned int type_index)
 			case 6: return "LINEAR_64";
 			case 7: return "LINEAR_128";
 			case 8: return "LINEAR_256";
+			/*
+			 * Orders 9/10 in FT_LINEAR class only happen when
+			 * FEATURE_FT_POPCOUNT_NODE collapses the former
+			 * POOL_A/POOL_B into byte_popcount_1l linear nodes.
+			 */
+			case 9: return "POPCOUNT_512";
+			case 10: return "POPCOUNT_1024";
 			}
 			break;
 		case FT_POOL:
