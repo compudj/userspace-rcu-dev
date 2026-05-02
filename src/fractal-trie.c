@@ -6151,8 +6151,34 @@ struct cds_ft_inode_flag *ft_node_get_minmax(struct cds_ft_inode_flag *node_flag
 	return ret;
 }
 
+/*
+ * Insert (or replace) child_node_flag at byte n within an FT_POPCOUNT
+ * node.  Three outcome paths:
+ *
+ *   - is_init: caller-promised first set_nth on a freshly-allocated
+ *     (unpublished) node; call the byte/nibble layout's helper
+ *     directly with is_init=true to set up the bitmap and pointer
+ *     array from scratch.
+ *
+ *   - non-init, key already present: in-place pointer replace
+ *     (single-slot RCU-safe write).
+ *
+ *   - non-init, key not present, "no existing bit lies above n":
+ *     safe-append.  Setting bit n does not shift any existing
+ *     pointer's popcount-rank, so the new pointer can be written at
+ *     the (current) end-of-array slot and the new bit then published.
+ *     Reader sees either the old state, an "appendinflight" state
+ *     that returns NULL (legitimate), or the fully-published new
+ *     entry.  See the publish-stores below for the detailed ordering
+ *     reasoning (release on the new pointer, relaxed on each bitmap
+ *     publish; reader's address-dependency from bitmap-derived index
+ *     to pointer load keeps the loads ordered on weakly-ordered
+ *     architectures).
+ *
+ *   - otherwise: -ERANGE, forcing the caller to recompact.
+ */
 static
-int ft_linear_node_set_nth(const struct cds_ft_type *type,
+int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_metadata *metadata,
 		uint8_t n,
@@ -6160,15 +6186,9 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 		bool *_replace_old_ptr,
 		bool is_init)
 {
-	uint8_t nr_child;
-	uint8_t *values;
-	struct cds_ft_inode_flag **pointers;
-	unsigned int i, unused = 0;
-	bool replace_old_ptr = false;
-
-	assert(ft_type_is_linear_or_popcount(type->type_class) || type->type_class == FT_POOL);
-
 #ifdef FEATURE_FT_POPCOUNT_NODE
+	assert(ft_type_is_popcount(type->type_class));
+
 	if (type->nibble_popcount_2l) {
 		struct ft_nibble_popcount_2l_header *qp_hdr;
 		struct cds_ft_inode_flag **qp_pointers;
@@ -6183,39 +6203,6 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 				*_replace_old_ptr = false;
 			return ret;
 		}
-		/*
-		 * Non-init call on a published QP node.  Three cases:
-		 *
-		 * 1. Key already present (root and sub_bm bits both set):
-		 *    in-place pointer replace.
-		 *
-		 * 2A. hi already present, lo not present, AND no existing
-		 *     bit lies above (hi, lo) in the flat 256-bit space.
-		 *     "No bit above" decomposes into "no bit above lo in
-		 *     sub_bm[slot1]" AND "no bit above hi in root_bm" (which
-		 *     guarantees sub_bm[k > slot1] is unpopulated).  Setting
-		 *     bit lo in sub_bm[slot1] does not shift any existing
-		 *     pointer's popcount-rank, so we can write the new
-		 *     pointer at the (current) end-of-array slot.
-		 *
-		 * 2B. hi not present AND no existing bit at a position above
-		 *     hi in root_bm.  slot1 == popcount(root) == nr_used,
-		 *     which is the first unused sub_bm slot (zero from alloc
-		 *     / recompact-into).  We initialize sub_bm[slot1] to
-		 *     (1 << lo), publish the new pointer at end-of-array,
-		 *     and finally set bit hi in root_bm.
-		 *
-		 * 3. Otherwise: a new bit below an existing bit would shift
-		 *    pointer ranks (or sub_bm slots), racing with concurrent
-		 *    readers.  Return -ERANGE to force a recompact.
-		 *
-		 * Publish ordering for cases 2A and 2B is identical to the
-		 * byte_popcount_1l safe-append below; see the ordering note
-		 * there for the full reasoning (release on the new pointer,
-		 * relaxed on each bitmap publish; reader's address-dependency
-		 * from bitmap-derived index to pointer load keeps the loads
-		 * ordered, and any partial state collapses to "not found").
-		 */
 		qp_hdr = (struct ft_nibble_popcount_2l_header *) &node->data[0];
 		qp_pointers = ft_nibble_popcount_2l_pointers(node, type);
 		qp_root = qp_hdr->root_bm;
@@ -6307,116 +6294,120 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 			*_replace_old_ptr = false;
 		return 0;
 	}
-	if (type->byte_popcount_1l) {
-		if (is_init) {
-			int ret;
-			ret = ft_byte_popcount_1l_node_set_nth(type, node,
-					metadata, n, child_node_flag, true);
-			if (_replace_old_ptr)
-				*_replace_old_ptr = false;
-			return ret;
-		}
-		/*
-		 * Non-init call on a published byte-popcount node.  Three
-		 * cases:
-		 *
-		 * 1. Key already present (bitmap bit set): in-place pointer
-		 *    replace (single-slot RCU-safe write).
-		 *
-		 * 2. Key not present AND no existing bit lies above n:
-		 *    safe-append.  Setting bit n does not shift any existing
-		 *    pointer's popcount-rank, so we can write the new
-		 *    pointer at the (current) end-of-array slot and then
-		 *    publish the new bit.  See the ordering note at the
-		 *    publish-stores below for why the pointer is released
-		 *    and the bitmap is relaxed.
-		 *
-		 * 3. Otherwise: a new bit below an existing bit would shift
-		 *    pointer ranks, racing with concurrent readers.  Return
-		 *    -ERANGE to force a recompact.
-		 */
-		{
-			uint64_t *bm = (uint64_t *) &node->data[0];
-			struct cds_ft_inode_flag **bp_pointers =
-				(struct cds_ft_inode_flag **)
-					((uint8_t *) node + 32);
-			unsigned int word_idx = (unsigned int) n >> 6;
-			unsigned int bit_idx = (unsigned int) n & 63U;
-			uint64_t word = bm[word_idx];
-			uint64_t bit = 1ULL << bit_idx;
-			unsigned int ptr_idx = 0;
-			unsigned int k;
+	assert(type->byte_popcount_1l);
+	if (is_init) {
+		int ret;
+		ret = ft_byte_popcount_1l_node_set_nth(type, node,
+				metadata, n, child_node_flag, true);
+		if (_replace_old_ptr)
+			*_replace_old_ptr = false;
+		return ret;
+	}
+	{
+		uint64_t *bm = (uint64_t *) &node->data[0];
+		struct cds_ft_inode_flag **bp_pointers =
+			(struct cds_ft_inode_flag **)
+				((uint8_t *) node + 32);
+		unsigned int word_idx = (unsigned int) n >> 6;
+		unsigned int bit_idx = (unsigned int) n & 63U;
+		uint64_t word = bm[word_idx];
+		uint64_t bit = 1ULL << bit_idx;
+		unsigned int ptr_idx = 0;
+		unsigned int k;
 
-			if (word & bit) {
-				/* Case 1: in-place pointer replace. */
-				for (k = 0; k < word_idx; k++)
-					ptr_idx += (unsigned int)
-						__builtin_popcountll(bm[k]);
-				ptr_idx += (unsigned int) __builtin_popcountll(
-						word & (bit - 1ULL));
-				if (bp_pointers[ptr_idx]) {
-					if (_replace_old_ptr)
-						*_replace_old_ptr = true;
-				} else {
-					if (_replace_old_ptr)
-						*_replace_old_ptr = false;
-					metadata->nr_child++;
-				}
-				rcu_assign_pointer(bp_pointers[ptr_idx], child_node_flag);
-				return 0;
+		if (word & bit) {
+			/* Case 1: in-place pointer replace. */
+			for (k = 0; k < word_idx; k++)
+				ptr_idx += (unsigned int)
+					__builtin_popcountll(bm[k]);
+			ptr_idx += (unsigned int) __builtin_popcountll(
+					word & (bit - 1ULL));
+			if (bp_pointers[ptr_idx]) {
+				if (_replace_old_ptr)
+					*_replace_old_ptr = true;
+			} else {
+				if (_replace_old_ptr)
+					*_replace_old_ptr = false;
+				metadata->nr_child++;
 			}
-
-			/*
-			 * Case 2: try safe-append.  Condition is "no existing
-			 * bit at a position > n" -- evaluated as "no bit
-			 * above bit_idx in word_idx, AND no bit set in any
-			 * higher word".
-			 */
-			{
-				bool safe_append;
-				uint64_t in_word_above = bit_idx == 63 ? 0
-					: (word >> (bit_idx + 1));
-
-				safe_append = (in_word_above == 0);
-				for (k = word_idx + 1; safe_append && k < 4; k++)
-					safe_append = (bm[k] == 0);
-				if (!safe_append)
-					return -ERANGE;	/* Case 3. */
-			}
-
-			/* Case 2: do the append. */
-			ptr_idx = (unsigned int) __builtin_popcountll(bm[0])
-				+ (unsigned int) __builtin_popcountll(bm[1])
-				+ (unsigned int) __builtin_popcountll(bm[2])
-				+ (unsigned int) __builtin_popcountll(bm[3]);
-			if (ptr_idx >= type->max_linear_child)
-				return -ENOSPC;
-			/*
-			 * Pointer store carries a release: the next-level
-			 * child node's contents (initialized by the caller
-			 * before this set_nth) must be visible to readers
-			 * that follow the pointer (matching acquire on the
-			 * scanner's pointer load).
-			 *
-			 * Bitmap bit set is relaxed: it is only a
-			 * reachability flag for this slot.  If a reader
-			 * observes the bit set but the pointer-store is
-			 * not yet visible (still NULL), the lookup returns
-			 * NULL -- a legitimate not-found result for an
-			 * append that hasn't fully propagated.  No reader
-			 * can compute ptr_idx == this new slot without
-			 * also seeing the bit set, so the slot is invisible
-			 * until the bit is.
-			 */
 			rcu_assign_pointer(bp_pointers[ptr_idx], child_node_flag);
-			uatomic_store(&bm[word_idx], word | bit, CMM_RELAXED);
-			metadata->nr_child++;
-			if (_replace_old_ptr)
-				*_replace_old_ptr = false;
 			return 0;
 		}
+
+		/*
+		 * Case 2: try safe-append.  Condition is "no existing
+		 * bit at a position > n" -- evaluated as "no bit
+		 * above bit_idx in word_idx, AND no bit set in any
+		 * higher word".
+		 */
+		{
+			bool safe_append;
+			uint64_t in_word_above = bit_idx == 63 ? 0
+				: (word >> (bit_idx + 1));
+
+			safe_append = (in_word_above == 0);
+			for (k = word_idx + 1; safe_append && k < 4; k++)
+				safe_append = (bm[k] == 0);
+			if (!safe_append)
+				return -ERANGE;	/* Case 3. */
+		}
+
+		/* Case 2: do the append. */
+		ptr_idx = (unsigned int) __builtin_popcountll(bm[0])
+			+ (unsigned int) __builtin_popcountll(bm[1])
+			+ (unsigned int) __builtin_popcountll(bm[2])
+			+ (unsigned int) __builtin_popcountll(bm[3]);
+		if (ptr_idx >= type->max_linear_child)
+			return -ENOSPC;
+		/*
+		 * Pointer store carries a release: the next-level child
+		 * node's contents (initialized by the caller before this
+		 * set_nth) must be visible to readers that follow the
+		 * pointer (matching acquire on the scanner's pointer load).
+		 *
+		 * Bitmap bit set is relaxed: it is only a reachability flag
+		 * for this slot.  If a reader observes the bit set but the
+		 * pointer-store is not yet visible (still NULL), the lookup
+		 * returns NULL -- a legitimate not-found result for an
+		 * append that hasn't fully propagated.  No reader can
+		 * compute ptr_idx == this new slot without also seeing the
+		 * bit set, so the slot is invisible until the bit is.
+		 */
+		rcu_assign_pointer(bp_pointers[ptr_idx], child_node_flag);
+		uatomic_store(&bm[word_idx], word | bit, CMM_RELAXED);
+		metadata->nr_child++;
+		if (_replace_old_ptr)
+			*_replace_old_ptr = false;
+		return 0;
 	}
+#else
+	/*
+	 * FT_POPCOUNT class types only exist when FEATURE_FT_POPCOUNT_NODE
+	 * is defined; this case is unreachable in baseline builds.
+	 */
+	(void) type; (void) node; (void) metadata; (void) n;
+	(void) child_node_flag; (void) _replace_old_ptr; (void) is_init;
+	assert(0);
+	return -EINVAL;
 #endif
+}
+
+static
+int ft_linear_node_set_nth(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_metadata *metadata,
+		uint8_t n,
+		struct cds_ft_inode_flag *child_node_flag,
+		bool *_replace_old_ptr,
+		bool is_init)
+{
+	uint8_t nr_child;
+	uint8_t *values;
+	struct cds_ft_inode_flag **pointers;
+	unsigned int i, unused = 0;
+	bool replace_old_ptr = false;
+
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 
 	values = &node->data[0];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
@@ -6582,6 +6573,8 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
+		ret = ft_popcount_node_set_nth(type, node, metadata, n, child_node_flag, NULL, is_init);
+		break;
 	case FT_LINEAR:
 		ret = ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL, is_init);
 		break;
