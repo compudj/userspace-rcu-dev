@@ -143,6 +143,7 @@ struct cds_ft_attr {
 
 enum cds_ft_type_class {
 	FT_LINEAR = 0,		/* Linear: per-type specialized scan */
+	FT_POPCOUNT = 1,	/* Popcount-bitmap: byte_popcount_1l / nibble_popcount_2l */
 	FT_POOL = 2,		/* Pool: 1D/2D subnode dispatch */
 	FT_PIGEON = 3,		/* Pigeon: direct indexed */
 	/* Leaf nodes are implicit from their height in the tree */
@@ -152,6 +153,9 @@ enum cds_ft_type_class {
 };
 
 #define ft_type_is_linear(tc)	((tc) == FT_LINEAR)
+#define ft_type_is_popcount(tc)	((tc) == FT_POPCOUNT)
+#define ft_type_is_linear_or_popcount(tc) \
+	(ft_type_is_linear(tc) || ft_type_is_popcount(tc))
 
 /*
  * FT_HAVE_EFFICIENT_UNALIGNED_ACCESS: architectures where unaligned
@@ -320,25 +324,41 @@ enum {
 
 const struct cds_ft_type ft_types[] = {
 	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
-	[1] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP,
+	[1] = {
 #ifdef FEATURE_FT_POPCOUNT_NODE
+		.type_class = FT_POPCOUNT,
 		.nibble_popcount_2l = true,
+#else
+		.type_class = FT_LINEAR,
 #endif
+		.min_child = 1, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP,
 	},
-	[2] = { .type_class = FT_LINEAR, .min_child = 3, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP,
+	[2] = {
 #ifdef FEATURE_FT_POPCOUNT_NODE
+		.type_class = FT_POPCOUNT,
 		.nibble_popcount_2l = true,
+#else
+		.type_class = FT_LINEAR,
 #endif
+		.min_child = 3, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP,
 	},
-	[3] = { .type_class = FT_LINEAR, .min_child = 5, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP,
+	[3] = {
 #ifdef FEATURE_FT_POPCOUNT_NODE
+		.type_class = FT_POPCOUNT,
 		.nibble_popcount_2l = true,
+#else
+		.type_class = FT_LINEAR,
 #endif
+		.min_child = 5, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP,
 	},
-	[4] = { .type_class = FT_LINEAR, .min_child = 10, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_linear_child, .order = 8, .bitmap = FT_NO_BITMAP,
+	[4] = {
 #ifdef FEATURE_FT_POPCOUNT_NODE
+		.type_class = FT_POPCOUNT,
 		.byte_popcount_1l = true,
+#else
+		.type_class = FT_LINEAR,
 #endif
+		.min_child = 10, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_linear_child, .order = 8, .bitmap = FT_NO_BITMAP,
 	},
 
 	/* Pools may fill sooner than max_child. */
@@ -359,7 +379,7 @@ const struct cds_ft_type ft_types[] = {
 		 * byte_popcount_1l: 32B bitmap + 54*8B ptrs = 464B, fits
 		 * in the 512B order-9 node.  No subnode dispatch.
 		 */
-		.type_class = FT_LINEAR,
+		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_5_max_child,
 		.byte_popcount_1l = true,
 #else
@@ -376,7 +396,7 @@ const struct cds_ft_type ft_types[] = {
 		 * byte_popcount_1l: 32B bitmap + 104*8B ptrs = 864B, fits
 		 * in the 1024B order-10 node.  No subnode dispatch.
 		 */
-		.type_class = FT_LINEAR,
+		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_6_max_child,
 		.byte_popcount_1l = true,
 #else
@@ -4665,7 +4685,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	unsigned int i;
 	int match_v;
 
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear_or_popcount(type->type_class) || type->type_class == FT_POOL);
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
 #ifdef FEATURE_FT_POPCOUNT_NODE
@@ -4733,7 +4753,7 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 	uint8_t *values;
 	struct cds_ft_inode_flag **pointers;
 
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear_or_popcount(type->type_class) || type->type_class == FT_POOL);
 	assert(i < ft_linear_node_get_nr_child(type, node));
 
 #ifdef FEATURE_FT_POPCOUNT_NODE
@@ -5762,6 +5782,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
 #endif
 
 #define FT_MASK_LINEAR      FT_MASK_CLASS(FT_LINEAR)
+#define FT_MASK_POPCOUNT    FT_MASK_CLASS(FT_POPCOUNT)
 #define FT_MASK_POOL        FT_MASK_CLASS(FT_POOL)
 
 /*
@@ -5780,12 +5801,12 @@ ft_check_pool_dispatch_assumptions(void)
 #ifdef FEATURE_FT_POPCOUNT_NODE
 	/*
 	 * FEATURE_FT_POPCOUNT_NODE collapses the historical pools at
-	 * indices 5 and 6 to byte_popcount_1l linear-class layouts (no
-	 * subnodes), so FT_POOL is empty and the bit-selector / 2D-index
-	 * machinery is unused.
+	 * indices 5 and 6 to byte_popcount_1l layouts in the FT_POPCOUNT
+	 * class (no subnodes), so FT_POOL is empty and the bit-selector /
+	 * 2D-index machinery is unused.
 	 */
-	assert(ft_types[FT_POOL_IDX_A].type_class == FT_LINEAR);
-	assert(ft_types[FT_POOL_IDX_B].type_class == FT_LINEAR);
+	assert(ft_types[FT_POOL_IDX_A].type_class == FT_POPCOUNT);
+	assert(ft_types[FT_POOL_IDX_B].type_class == FT_POPCOUNT);
 	assert(ft_types[FT_POOL_IDX_A].byte_popcount_1l);
 	assert(ft_types[FT_POOL_IDX_B].byte_popcount_1l);
 	assert(FT_MASK_POOL == 0);
@@ -5931,7 +5952,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 * to let each subnode scanner inline a fixed pool shape; no
 	 * ft_types[] field load on the pool path.
 	 */
-	if (caa_likely(bit & FT_MASK_LINEAR))
+	if (caa_likely(bit & (FT_MASK_LINEAR | FT_MASK_POPCOUNT)))
 		return ft_linear_node_get_nth(&ft_types[type_index], node,
 				node_flag_ptr, n, pf_hint);
 	if (bit & FT_MASK_POOL) {
@@ -5988,6 +6009,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 	const struct cds_ft_type *type = &ft_types[type_index];
 
 	switch (type->type_class) {
+	case FT_POPCOUNT:
 	case FT_LINEAR:
 	{
 		uint8_t nr_child = ft_linear_node_get_nr_child(type, node);
@@ -6081,6 +6103,7 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	type = &ft_types[type_index];
 
 	switch (type->type_class) {
+	case FT_POPCOUNT:
 	case FT_LINEAR:
 		child = ft_linear_node_get_direction(type, node, n, result_key, dir);
 		break;
@@ -6143,7 +6166,7 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 	unsigned int i, unused = 0;
 	bool replace_old_ptr = false;
 
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear_or_popcount(type->type_class) || type->type_class == FT_POOL);
 
 #ifdef FEATURE_FT_POPCOUNT_NODE
 	if (type->nibble_popcount_2l) {
@@ -6558,6 +6581,7 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 	int ret;
 
 	switch (type->type_class) {
+	case FT_POPCOUNT:
 	case FT_LINEAR:
 		ret = ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL, is_init);
 		break;
@@ -6583,10 +6607,10 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		struct cds_ft_inode_flag *newptr)
 {
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear_or_popcount(type->type_class) || type->type_class == FT_POOL);
 	assert(ft_linear_node_get_nr_child(type, node) <= type->max_linear_child);
 
-	if (ft_type_is_linear(type->type_class) && !newptr) {
+	if (ft_type_is_linear_or_popcount(type->type_class) && !newptr) {
 		assert(!metadata->fallback_removal_count);
 		if (metadata->nr_child <= type->min_child) {
 			/* We need to try recompacting the node */
@@ -6696,6 +6720,7 @@ int _ft_node_replace_ptr(const struct cds_ft_type *type,
 	int ret;
 
 	switch (type->type_class) {
+	case FT_POPCOUNT:
 	case FT_LINEAR:
 		ret = ft_linear_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
 		break;
@@ -6735,6 +6760,7 @@ unsigned int ft_node_sum_distribution_1d(enum ft_recompact mode,
 	memset(nr_one, 0, sizeof(nr_one));
 
 	switch (type->type_class) {
+	case FT_POPCOUNT:
 	case FT_LINEAR:
 	{
 		uint8_t nr_child =
@@ -6873,6 +6899,7 @@ void ft_node_sum_distribution_2d(enum ft_recompact mode,
 	memset(nr_2d_00, 0, sizeof(nr_2d_00));
 
 	switch (type->type_class) {
+	case FT_POPCOUNT:
 	case FT_LINEAR:
 	{
 		uint8_t nr_child =
@@ -7249,6 +7276,7 @@ retry:		/* for fallback */
 #define RECOMPACT_IS_INIT(byte_value) ({				\
 	bool __is_init = false;						\
 	switch (new_type->type_class) {					\
+	case FT_POPCOUNT:						\
 	case FT_LINEAR:							\
 		__is_init = !new_linear_init_done;			\
 		new_linear_init_done = true;				\
@@ -7269,6 +7297,7 @@ retry:		/* for fallback */
 })
 
 	switch (old_type->type_class) {
+	case FT_POPCOUNT:
 	case FT_LINEAR:
 	{
 		uint8_t nr_child =
@@ -7544,6 +7573,7 @@ skip_copy:
 	 */
 	{
 		switch (new_type->type_class) {
+		case FT_POPCOUNT:
 		case FT_LINEAR:
 		{
 			uint8_t nc = ft_linear_node_get_nr_child(new_type,
@@ -22894,6 +22924,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			size_t actual_order = cds_ft_item_order(node);
 
 			if (type->type_class != FT_LINEAR &&
+			    type->type_class != FT_POPCOUNT &&
 			    type->type_class != FT_POOL &&
 			    type->type_class != FT_PIGEON) {
 				if (out)
@@ -23599,11 +23630,23 @@ const char *internal_type_name(unsigned int type_index)
 			case 6: return "LINEAR_64";
 			case 7: return "LINEAR_128";
 			case 8: return "LINEAR_256";
+			}
+			break;
+		case FT_POPCOUNT:
 			/*
-			 * Orders 9/10 in FT_LINEAR class only happen when
-			 * FEATURE_FT_POPCOUNT_NODE collapses the former
-			 * POOL_A/POOL_B into byte_popcount_1l linear nodes.
+			 * Orders 5/6/7 are the 2-level nibble_popcount_2l
+			 * layouts (qp_3 / qp_6 / qp_12) -- the only true
+			 * quadbit-popcount nodes.  Orders 8/9/10 are 1-level
+			 * byte_popcount_1l layouts (a single 256-bit bitmap +
+			 * ptr-array, not quadbit): order 8 is type-4, orders
+			 * 9/10 are byte_popcount layouts collapsed from the
+			 * former POOL_A / POOL_B.
 			 */
+			switch (order) {
+			case 5: return "POPCOUNT_QP3";
+			case 6: return "POPCOUNT_QP6";
+			case 7: return "POPCOUNT_QP12";
+			case 8: return "POPCOUNT_256";
 			case 9: return "POPCOUNT_512";
 			case 10: return "POPCOUNT_1024";
 			}
