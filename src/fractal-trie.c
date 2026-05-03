@@ -4637,20 +4637,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-#ifdef FEATURE_FT_POPCOUNT_NODE
-	if (type->nibble_popcount_2l)
-		return ft_nibble_popcount_2l_scan_3(node, node_flag_ptr, n, pf_hint);
-	/*
-	 * byte_popcount_1l covers type-4 and the former pool indices
-	 * (5/6) -- one 256-bit-bitmap + ptr-array layout in either
-	 * 256B/512B/1024B nodes.  Reached via the generic fallback
-	 * dispatch on non-x86 64-bit (where FT_USE_SPECIALIZED_SCAN
-	 * is inactive); on x86-64 the specialized switch routes by
-	 * type_index directly.
-	 */
-	if (type->byte_popcount_1l)
-		return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
-#endif
+	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
 #if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS) && defined(__SSE2__)
 	/*
 	 * Types with max_linear_child <= sizeof(unsigned long) have a
@@ -4686,6 +4673,33 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 			return ft_dereference_acquire_prefetch_hint(pointers[i], pf_hint);
 		}
 	}
+#endif
+}
+
+/*
+ * FT_POPCOUNT class get_nth: dispatch to byte_popcount_1l or
+ * nibble_popcount_2l layout helper.  Reached via the generic
+ * fallback dispatch on non-x86 64-bit (where FT_USE_SPECIALIZED_SCAN
+ * is inactive); on x86-64 the specialized switch in
+ * ft_node_get_nth_skip routes by type_index directly.  Stub in
+ * baseline builds.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_popcount_node_get_nth(const struct cds_ft_type *type,
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint)
+{
+#ifdef FEATURE_FT_POPCOUNT_NODE
+	assert(ft_type_is_popcount(type->type_class));
+	if (type->nibble_popcount_2l)
+		return ft_nibble_popcount_2l_scan_3(node, node_flag_ptr, n, pf_hint);
+	assert(type->byte_popcount_1l);
+	return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
+#else
+	(void) type; (void) node; (void) node_flag_ptr; (void) n; (void) pf_hint;
+	assert(0);
+	return NULL;
 #endif
 }
 
@@ -6002,13 +6016,19 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	unsigned int bit = 1U << type_index;
 	/*
 	 * Linear (bytewise scan) is the most common type in
-	 * byte-indexed tries — predicted-taken fast path.  Pool
-	 * dispatch discriminates POOL_IDX_A (1D) from POOL_IDX_B (2D)
-	 * to let each subnode scanner inline a fixed pool shape; no
-	 * ft_types[] field load on the pool path.
+	 * byte-indexed tries — predicted-taken fast path.  FT_POPCOUNT
+	 * (32/64/256-bit popcount layouts) is dispatched separately so
+	 * the helper does not re-discover the class identity that the
+	 * type_index already carries.  Pool dispatch discriminates
+	 * POOL_IDX_A (1D) from POOL_IDX_B (2D) to let each subnode
+	 * scanner inline a fixed pool shape; no ft_types[] field load
+	 * on the pool path.
 	 */
-	if (caa_likely(bit & (FT_MASK_LINEAR | FT_MASK_POPCOUNT)))
+	if (caa_likely(bit & FT_MASK_LINEAR))
 		return ft_linear_node_get_nth(&ft_types[type_index], node,
+				node_flag_ptr, n, pf_hint);
+	if (bit & FT_MASK_POPCOUNT)
+		return ft_popcount_node_get_nth(&ft_types[type_index], node,
 				node_flag_ptr, n, pf_hint);
 	if (bit & FT_MASK_POOL) {
 		if (bit & (1U << FT_POOL_IDX_A))
