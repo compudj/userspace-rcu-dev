@@ -1518,6 +1518,28 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	return (struct cds_ft_inode *) (v & mask);
 }
 
+/*
+ * Lookup-hot variant: caller has already established that the
+ * internal-flag bit is set (e.g. ft_node_get_nth_skip checks
+ * !(tag & FT_INTERNAL_MASK) and returns NULL before this call).
+ * Skips the (v & 1) ? ... : ~7UL branch in ft_node_ptr() above,
+ * shaving the cmov/branch from the per-visit dependency chain on
+ * the lookup hot path.
+ */
+static inline_lookup
+struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
+{
+	unsigned long v = (unsigned long) node;
+	unsigned long mask = (~15UL) << ((v >> 1) & 7);
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	v &= FT_ADDR_MASK;
+#endif
+
+	assert((v & FT_INTERNAL_MASK) || node == NULL);
+	return (struct cds_ft_inode *) (v & mask);
+}
+
 static
 struct cds_ft_inode *_ft_node_mask_ptr(struct cds_ft_inode_flag *node)
 {
@@ -5928,7 +5950,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		return NULL;
 	}
 
-	node = ft_node_ptr(node_flag);
+	node = ft_node_ptr_internal(node_flag);
 	type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
 
 #ifdef FT_USE_SPECIALIZED_SCAN
@@ -8915,7 +8937,16 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			node_flag = ft_node_get_nth(node_flag, NULL, iter_key, FT_PF_NONE);
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
-		if (!ft_node_ptr(node_flag)) {
+		/*
+		 * "Not found" iff the slot is NULL: ft_node_get_nth*
+		 * returns NULL when the parent isn't internal, and an
+		 * empty slot is stored as NULL.  All valid pointers
+		 * (any tag) carry a non-zero underlying address, so the
+		 * full ft_node_ptr() unmasking would always answer the
+		 * same as a plain NULL check, at the cost of the (v & 1)
+		 * branch in the per-step dependency chain.
+		 */
+		if (!node_flag) {
 			status = CDS_FT_STATUS_NOT_FOUND;
 			goto end;
 		}
