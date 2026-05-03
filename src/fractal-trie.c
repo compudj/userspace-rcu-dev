@@ -209,6 +209,23 @@ struct cds_ft_type {
  */
 
 /*
+ * Auto-enable popcount nodes on 64-bit targets where the compiler
+ * advertises hardware POPCNT (via -mpopcnt, -msse4.2, or -march=
+ * sandybridge / native / etc.).  Without hardware POPCNT the
+ * popcount-bitmap scanners would lower __builtin_popcount to a
+ * ~10-20-cycle software loop, defeating the purpose of the layout.
+ * Users who want to force linear-only nodes -- e.g. for portability
+ * testing or debugging -- can disable by passing
+ * -DNO_FEATURE_FT_POPCOUNT_NODE on the compiler command line.
+ */
+#if !defined(FEATURE_FT_POPCOUNT_NODE) \
+		&& !defined(NO_FEATURE_FT_POPCOUNT_NODE) \
+		&& (CAA_BITS_PER_LONG >= 64) \
+		&& (defined(__POPCNT__) || defined(__SSE4_2__))
+#define FEATURE_FT_POPCOUNT_NODE
+#endif
+
+/*
  * The 2-level nibble-popcount layouts (qp_3, etc.) are designed
  * around 8-byte pointers: e.g. qp_3 places 3 pointers + an 8-byte
  * popcount header into a 32-byte node.  On 32-bit pointers the same
