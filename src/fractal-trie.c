@@ -4992,15 +4992,25 @@ not_found:
  * Layout in the 64-byte order-6 node:
  *   [0..1]   root_bm
  *   [2..13]  sub_bm[0..5]   (6 x 16-bit, 12 bytes)
- *   [14..15] padding (header rounded to 16-byte alignment)
+ *   [14]     pop_lo_cache  (popcount of sub_bm[0..3])
+ *   [15]     padding
  *   [16..63] 6 x cds_ft_inode_flag *
  *
- * Two 64-bit loads cover the 14-byte header (the second load reads
- * the two padding bytes too, harmless).  Concatenating sub_bm[0..5]
- * yields a 96-bit "subs" view, split as a 64-bit low half (sub[0..3])
- * and a 32-bit high half (sub[4..5]).  Pointer index = popcount of
- * subs prefix below bit position (slot1 << 4) | lo, with one branch
- * to pick between the two halves.
+ * The cached popcount byte is written by set_nth at every mutation.
+ * sub_bm[0..3] forms a 64-bit "subs_lo" view (positions 0..63);
+ * sub_bm[4..5] forms a 32-bit "subs_hi" (positions 64..95).  The
+ * lookup reads sub_bm[slot1] via a direct unaligned 16-bit load and
+ * computes ptr_idx branchlessly via cmov:
+ *   prior = (p < 64) ? 0 : pop_lo
+ *   chunk = (p < 64) ? subs_lo : subs_hi
+ * One popcount on the partial chunk yields ptr_idx -- the runtime
+ * popcount(subs_lo) on the p >= 64 path disappears.
+ *
+ * Note: the alternative table layout (cache[0]=0, cache[1]=pop_lo,
+ * indexed by chunk_idx) regresses ~17% median in benchmarking.  The
+ * cmov pattern lets pop_lo and subs_{lo,hi} loads issue in parallel
+ * with constant offsets; the table pattern serializes the cache load
+ * behind chunk_idx, putting load latency on the critical path.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_6(
@@ -5008,39 +5018,40 @@ struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_6(
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-	uint64_t bms_lo = *(const uint64_t *) &node->data[0];
-	uint64_t bms_hi = *(const uint64_t *) &node->data[8];
-	uint16_t root = (uint16_t) bms_lo;
-	uint64_t subs_lo = (bms_lo >> 16) | (bms_hi << 48);
-	uint32_t subs_hi = (uint32_t) (bms_hi >> 16);
+	uint16_t root = *(const uint16_t *) &node->data[0];
 	unsigned int hi = (unsigned int) n >> 4;
 	unsigned int lo = (unsigned int) n & 0xFU;
-	unsigned int slot1, p, ptr_idx;
+	unsigned int slot1, p, ptr_idx, prior;
 	struct cds_ft_inode_flag **pointers;
 	uint16_t sub;
+	uint64_t subs_lo, chunk;
+	uint32_t subs_hi;
+	uint8_t pop_lo;
+	unsigned int b;
 
 	if (caa_unlikely(!((root >> hi) & 1U)))
 		goto not_found;
 
 	slot1 = (unsigned int) __builtin_popcount(root & ((1U << hi) - 1U));
-	p = (slot1 << 4) | lo;
 
-	if (caa_likely(slot1 < 4))
-		sub = (uint16_t) (subs_lo >> (slot1 * 16));
-	else
-		sub = (uint16_t) (subs_hi >> ((slot1 - 4) * 16));
-
+	/* Direct unaligned 16-bit read of sub_bm[slot1]; no chunk-select. */
+	sub = *(const uint16_t *) &node->data[2 + slot1 * 2];
 	if (caa_unlikely(!((sub >> lo) & 1U)))
 		goto not_found;
 
-	if (caa_likely(p < 64)) {
-		ptr_idx = (unsigned int) __builtin_popcountll(
-				subs_lo & ((1ULL << p) - 1ULL));
-	} else {
-		ptr_idx = (unsigned int) __builtin_popcountll(subs_lo)
-			+ (unsigned int) __builtin_popcount(
-				subs_hi & ((1U << (p - 64)) - 1U));
-	}
+	p = (slot1 << 4) | lo;
+
+	subs_lo = *(const uint64_t *) &node->data[2];
+	subs_hi = *(const uint32_t *) &node->data[10];
+	pop_lo  = node->data[14];
+
+	/* Branchless chunk and prior select via cmov. */
+	chunk = (p < 64) ? subs_lo : (uint64_t) subs_hi;
+	prior = (p < 64) ? 0U : (unsigned int) pop_lo;
+
+	b = p & 63;
+	ptr_idx = prior + (unsigned int) __builtin_popcountll(
+			chunk & ((1ULL << b) - 1ULL));
 
 	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 16);
 	if (caa_unlikely(node_flag_ptr))
@@ -5057,19 +5068,20 @@ not_found:
  * Lookup primitive: 2-level popcount, max_linear_child = 12.
  *
  * Layout in the 128-byte order-7 node:
- *   [0..1]   root_bm
- *   [2..25]  sub_bm[0..11]   (12 x 16-bit, 24 bytes)
- *   [26]     pop_lo_cache   (popcount of sub_bm[0..3])
- *   [27]     pop_mid_cache  (popcount of sub_bm[4..7])
- *   [28..31] padding         (header rounded to 32-byte boundary)
+ *   [0..1]    root_bm
+ *   [2..25]   sub_bm[0..11]   (12 x 16-bit, 24 bytes)
+ *   [26]      prior_cache[0] = 0 (placeholder)
+ *   [27]      prior_cache[1] = popcount(sub_bm[0..3])
+ *   [28]      prior_cache[2] = popcount(sub_bm[0..7])
+ *   [29..31]  padding
  *   [32..127] 12 x cds_ft_inode_flag *
  *
- * The two cached popcount bytes are written by set_nth at every
- * mutation (cheap on the insert path, eliminates the multi-popcount
- * add chain on the lookup hot path).  ptr_idx = prior_chunk_popcount
- * + popcount(chunk_holding_p & mask) -- one popcount, no chunk-select
- * branch.  This kills the 19% branch-miss site in scan_12 measured
- * via perf annotate.
+ * Lookup picks (chunk, prior) via index arithmetic on chunk_idx = p >> 6,
+ * eliminating both the chunk-select branch chain AND the cmov chain that
+ * the v1 cached layout still required:
+ *   chunk = *(uint64_t *) &node->data[2 + chunk_idx * 8]
+ *   prior = node->data[26 + chunk_idx]
+ * One popcount on the masked chunk yields ptr_idx.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_12(
@@ -5080,12 +5092,10 @@ struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_12(
 	uint16_t root = *(const uint16_t *) &node->data[0];
 	unsigned int hi = (unsigned int) n >> 4;
 	unsigned int lo = (unsigned int) n & 0xFU;
-	unsigned int slot1, p, ptr_idx, prior, prior_lo_mid;
+	unsigned int slot1, p, ptr_idx, prior, chunk_idx, b;
 	struct cds_ft_inode_flag **pointers;
 	uint16_t sub;
-	uint64_t subs_lo, subs_mid, subs_hi, chunk, lo_or_mid;
-	uint8_t pop_lo, pop_mid;
-	unsigned int b;
+	uint64_t chunk;
 
 	if (caa_unlikely(!((root >> hi) & 1U)))
 		goto not_found;
@@ -5098,24 +5108,11 @@ struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_12(
 		goto not_found;
 
 	p = (slot1 << 4) | lo;
+	chunk_idx = p >> 6;
 
-	subs_lo  = *(const uint64_t *) &node->data[2];
-	subs_mid = *(const uint64_t *) &node->data[10];
-	subs_hi  = *(const uint64_t *) &node->data[18];
-	pop_lo   = node->data[26];
-	pop_mid  = node->data[27];
-
-	/* Branchless chunk select via two cmovs. */
-	lo_or_mid = (p < 64) ? subs_lo : subs_mid;
-	chunk     = (p < 128) ? lo_or_mid : subs_hi;
-
-	/* Branchless prior-popcount via two cmovs.  pop_{lo,mid} are
-	 * precomputed by set_nth so no runtime popcount of subs_{lo,mid}
-	 * is needed -- only one popcount on the partial chunk.
-	 */
-	prior_lo_mid = (p < 64) ? 0U : (unsigned int) pop_lo;
-	prior        = (p < 128) ? prior_lo_mid
-			: (unsigned int) pop_lo + (unsigned int) pop_mid;
+	/* Single LEA + load each; no cmov chain. */
+	chunk = *(const uint64_t *) &node->data[2 + chunk_idx * 8];
+	prior = (unsigned int) node->data[26 + chunk_idx];
 
 	b = p & 63;
 	ptr_idx = prior + (unsigned int) __builtin_popcountll(
@@ -5264,19 +5261,27 @@ struct cds_ft_inode_flag *ft_nibble_popcount_2l_node_get_direction(
 }
 
 /*
- * Refresh the popcount cache bytes [26]/[27] for max_lc==12 nodes.
- * Bytes [26]/[27] sit in header padding (header_bytes(12)=26, pointers
- * start at offset 32) so writing them never clobbers pointers.  scan_3
- * (header 8B, pointers from 8) and scan_6 (header 14B, pointers from 16)
- * have pointers occupying byte 26: callers MUST gate on max_lc==12.
+ * Refresh the popcount cache bytes for nibble_popcount_2l nodes that
+ * carry one (scan_6: byte [14]) or two (scan_12: bytes [26]/[27]).
+ *
+ * Cache locations sit in header padding (scan_6 pointers start at
+ * offset 16, scan_12 pointers start at offset 32), so writes never
+ * clobber pointers.  scan_3 has pointers from offset 8 with no
+ * padding -- it is excluded.
  */
 static inline_lookup
-void ft_nibble_popcount_2l_refresh_cache(struct cds_ft_inode *node)
+void ft_nibble_popcount_2l_refresh_cache(struct cds_ft_inode *node,
+		unsigned int max_lc)
 {
-	uint64_t subs_lo  = *(const uint64_t *) &node->data[2];
-	uint64_t subs_mid = *(const uint64_t *) &node->data[10];
-	node->data[26] = (uint8_t) __builtin_popcountll(subs_lo);
-	node->data[27] = (uint8_t) __builtin_popcountll(subs_mid);
+	if (max_lc == 6) {
+		uint64_t subs_lo = *(const uint64_t *) &node->data[2];
+		node->data[14] = (uint8_t) __builtin_popcountll(subs_lo);
+	} else if (max_lc == 12) {
+		uint64_t subs_lo  = *(const uint64_t *) &node->data[2];
+		uint64_t subs_mid = *(const uint64_t *) &node->data[10];
+		node->data[26] = (uint8_t) __builtin_popcountll(subs_lo);
+		node->data[27] = (uint8_t) __builtin_popcountll(subs_mid);
+	}
 }
 
 /*
@@ -5317,8 +5322,7 @@ int ft_nibble_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 		hdr->sub_bm[0] = (uint16_t) (1U << lo);
 		pointers[0] = child_node_flag;
 		metadata->nr_child++;
-		if (max_lc == 12)
-			ft_nibble_popcount_2l_refresh_cache(node);
+		ft_nibble_popcount_2l_refresh_cache(node, max_lc);
 		return 0;
 	}
 
@@ -5359,8 +5363,7 @@ int ft_nibble_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 
 	hdr->sub_bm[slot1] = (uint16_t) (sub | (1U << lo));
 	metadata->nr_child++;
-	if (max_lc == 12)
-		ft_nibble_popcount_2l_refresh_cache(node);
+	ft_nibble_popcount_2l_refresh_cache(node, max_lc);
 	return 0;
 }
 
@@ -6429,23 +6432,11 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 			 * Stale-cache window (bit set, cache not yet
 			 * updated) is safe: lookups for the new key (the
 			 * highest p in safe-append) compute prior from
-			 * the OLD pop_lo/pop_mid which still match the
-			 * pre-insert pointers[] layout.  See scan_12 doc.
+			 * the OLD cumulative cache which still matches
+			 * the pre-insert pointers[] layout.
 			 */
-			if (type->max_linear_child == 12 && qp_slot1 < 8) {
-				if (qp_slot1 < 4)
-					uatomic_store(&node->data[26],
-						(uint8_t) __builtin_popcountll(
-						*(const uint64_t *)
-						&node->data[2]),
-						CMM_RELAXED);
-				else
-					uatomic_store(&node->data[27],
-						(uint8_t) __builtin_popcountll(
-						*(const uint64_t *)
-						&node->data[10]),
-						CMM_RELAXED);
-			}
+			ft_nibble_popcount_2l_refresh_cache(node,
+					type->max_linear_child);
 			metadata->nr_child++;
 			if (_replace_old_ptr)
 				*_replace_old_ptr = false;
@@ -6474,18 +6465,8 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 				(uint16_t) (qp_root | (1U << qp_hi)),
 				CMM_RELAXED);
 		/* Refresh popcount cache.  See Case 2A above for ordering. */
-		if (type->max_linear_child == 12 && qp_slot1 < 8) {
-			if (qp_slot1 < 4)
-				uatomic_store(&node->data[26],
-					(uint8_t) __builtin_popcountll(
-					*(const uint64_t *) &node->data[2]),
-					CMM_RELAXED);
-			else
-				uatomic_store(&node->data[27],
-					(uint8_t) __builtin_popcountll(
-					*(const uint64_t *) &node->data[10]),
-					CMM_RELAXED);
-		}
+		ft_nibble_popcount_2l_refresh_cache(node,
+				type->max_linear_child);
 		metadata->nr_child++;
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
