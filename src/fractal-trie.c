@@ -3758,16 +3758,16 @@ bool ft_linear_node_is_empty(const struct cds_ft_type *type,
  *     POOL_B, PIGEON).  Type 4 (LINEAR_256) is included in the
  *     simple-mask skip; the prefetch win there is small enough
  *     that the cheaper test is preferred.
- *   popcount build: skip only when type_index == 7 (PIGEON), since
- *     types 4/5/6 are all byte_popcount_1l with bitmap at offset 0
- *     and a clean pointer encoding.  The check matches the full
- *     type field (bits 0..3 == 0xF).
+ *   popcount build: no skip test -- always prefetch.  Measurement
+ *     on dns ft_specv (single-thread and 192-thread load-names)
+ *     shows the type-equality check earns nothing on this build:
+ *     PIGEON is rare on real workloads, the wrong-cache-line cost
+ *     for the few PIGEON visits that do happen is tiny relative to
+ *     the per-call cost of running the test on every other call,
+ *     and the hot-path branch is one fewer instruction without it.
  */
+#ifndef FEATURE_FT_POPCOUNT_NODE
 #define FT_TYPE_HIGH_BIT	(1UL << (FT_TYPE_BITS - 1 + FT_INTERNAL_BITS))
-#ifdef FEATURE_FT_POPCOUNT_NODE
-#define FT_PREFETCH_SKIP_MASK	(FT_TYPE_MASK | FT_INTERNAL_MASK)
-#define FT_PREFETCH_SKIP_VALUE	(FT_TYPE_MASK | FT_INTERNAL_MASK)
-#else
 #define FT_PREFETCH_SKIP_MASK	(FT_TYPE_HIGH_BIT | FT_INTERNAL_MASK)
 #define FT_PREFETCH_SKIP_VALUE	(FT_TYPE_HIGH_BIT | FT_INTERNAL_MASK)
 #endif
@@ -3780,8 +3780,12 @@ static inline void ft_maybe_prefetch(const void *ptr)
 	/* Clear skip-compressed length bits. */
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
 #endif
+#ifdef FEATURE_FT_POPCOUNT_NODE
+	__builtin_prefetch((const void *) v);
+#else
 	if ((v & FT_PREFETCH_SKIP_MASK) != FT_PREFETCH_SKIP_VALUE)
 		__builtin_prefetch((const void *) v);
+#endif
 }
 
 /*
