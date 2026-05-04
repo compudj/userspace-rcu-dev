@@ -144,12 +144,12 @@ These were deliberated and settled during the scaffolding phase. Don't relitigat
 
 1. **Lo-node reclamation on full-tombstone**: when `byte_clear` empties a lo-node (live-child count drops to 0), the writer **NULLs the hi-node's slot pointing at that lo-node** and **RCU-frees the lo-node**. Concretely:
    1. `byte_clear` does the lo-side `clear_nth` (NULL the lo-slot for the dying child).
-   2. If `nr_keys` of the lo-node is now 0 (live count, not bitmap popcount), proceed to detach the lo-node:
+   2. If `nr_child` of the lo-node is now 0 (live count, not bitmap popcount), proceed to detach the lo-node:
       - `clear_nth(hi_node, hi_nibble)` — tombstones the hi-slot (NULL the slot, bit stays set per monotonic-bitmap rule).
       - `call_rcu` to free the lo-node after the grace period.
    3. Concurrent readers either resolve the old hi-slot value (old lo-node pointer) and descend into the now-tombstoned lo-node (all lo-slots NULL → returns not-found), or see the new NULL hi-slot value and return not-found immediately. Both correct. The grace period defers the actual `free()` until all readers using the old hi-slot value have exited.
 
-   The lo-node's `nr_keys` (stored in its `cds_ft_metadata`) is the live-child counter to test against zero — bitmap popcount can be > 0 with all slots NULL'd (tombstones-only state).
+   The lo-node's `nr_child` (stored in its `cds_ft_metadata`) is the live-child counter to test against zero — bitmap popcount can be > 0 with all slots NULL'd (tombstones-only state).  `nr_keys` is the subtree total and is unrelated to the local detach decision.
 
 2. **Skip-compressed pointer placement**: skip-compress encodes byte-aligned hop count in the high pointer bits, so a skip-compressed pointer can only live in a **lo-nibble slot** (byte-boundary). The descent flow is unchanged from the pre-QP design:
    1. hi descend → lo-node (untagged).
