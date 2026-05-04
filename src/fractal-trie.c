@@ -3258,9 +3258,6 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
 		order = ft_compressed_order(cn->len);
 	} else if (ft_node_skip_compressed(node_flag)) {
 		return 0;
-	} else if (ft_node_collapsed(node_flag)) {
-		order = cds_ft_item_order(
-			(void *) ft_collapsed_node_ptr(node_flag));
 	} else {
 		/* Internal: linear, pool, or pigeon. */
 		order = ft_types[ft_node_type(node_flag)].order;
@@ -3387,13 +3384,6 @@ unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
 		return cl * compress_scan_mul_pct;
 	} else if (ft_node_skip_compressed(node_flag)) {
 		return 0;
-	} else if (ft_node_collapsed(node_flag)) {
-		unsigned int tier = ft_collapsed_tier(node_flag);
-		unsigned int stride = ft_collapsed_stride(node_flag);
-
-		return collapsed_avg_scan_cl_by_tier[tier]
-				* collapse_scan_mul_pct
-			+ collapsed_ptr_cl_pct_by_tier_stride[stride][tier];
 	} else {
 		unsigned int type_index = ft_node_type(node_flag);
 		const struct cds_ft_type *type = &ft_types[type_index];
@@ -8981,21 +8971,6 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					break;
 				continue;
 			}
-			if (ft_node_collapsed(node_flag)) {
-				enum ft_descent_action act;
-
-				i--;
-				act = ft_lookup_collapsed(&node_flag, &key, &i,
-					key_depth, iter, &iter_path_len,
-					track, track_longest,
-					&match_len, &match_node, &found, &status,
-					descend_cand);
-				if (act == FT_DESCENT_END)
-					goto end;
-				if (act == FT_DESCENT_BREAK)
-					break;
-				continue;
-			}
 			/*
 			 * External or NULL at loop top.  Can happen when
 			 * a compressed node's cn->child is an external
@@ -9157,18 +9132,6 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			cds_ft_item_to_metadata_fast(
 				(struct cds_ft_inode *) cn,
 				ft_compressed_order(cn->len));
-		found = ft_dereference_prefetch_external(metadata->external_nodes);
-		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
-		if (track && (found || track_longest)) {
-			match_len = key_len;
-			match_node = found;
-		}
-	} else if (ft_node_collapsed(node_flag)) {
-		struct cds_ft_metadata *metadata =
-			cds_ft_item_to_metadata_fast(
-				ft_node_ptr(node_flag),
-				cds_ft_item_order(
-					(struct cds_ft_inode *) ft_collapsed_node_ptr(node_flag)));
 		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
@@ -10081,35 +10044,6 @@ slow_path:
 			}
 			continue;
 		}
-		if (ft_node_collapsed(node_flag)) {
-			enum ft_descent_action act;
-
-			act = ft_inequality_collapsed(&node_flag,
-				&level, key_depth,
-				ft->group->max_tree_depth,
-				mode, limit,
-				&iter_key, input_key, iter,
-				ordinal_key, &skip_eq_external_nodes);
-			if (act == FT_DESCENT_GOING_UP)
-				goto going_up;
-			if (act == FT_DESCENT_DESCEND_CHILDREN)
-				goto descend_children;
-			if (act == FT_DESCENT_BREAK)
-				break;
-			/*
-			 * CONTINUE: the suffix advanced level.  If the
-			 * for-loop increment would push level past
-			 * key_depth, descend into the child to find
-			 * the min/max leaf rather than exiting the
-			 * loop with a non-leaf node.
-			 */
-			if (level + 1 >= key_depth) {
-				level++;
-				skip_eq_external_nodes = false;
-				goto descend_children;
-			}
-			continue;
-		}
 
 		switch (limit) {
 		case FT_LOOKUP_LIMIT_NONE:
@@ -10320,19 +10254,6 @@ going_up:
 		 * (compressed or external entries from compressed path
 		 * traversal have no siblings).
 		 */
-		if (ft_node_collapsed(iter_path_node(iter)[level - 1])) {
-			enum ft_descent_action act;
-
-			act = ft_inequality_going_up_collapsed(
-				&node_flag, &level, &iter_key,
-				&going_up,
-				iter, ordinal_key, dir,
-				(ssize_t) ft->group->max_tree_depth);
-			if (act == FT_DESCENT_BREAK)
-				break;
-			assert(act == FT_DESCENT_CONTINUE);
-			continue;
-		}
 		if (!ft_node_internal(iter_path_node(iter)[level - 1])) {
 			FT_TP(ineq_going_up_step, level,
 				(const void *) iter_path_node(iter)[level - 1],
@@ -10508,23 +10429,6 @@ descend_children:
 				iter, ordinal_key, dir);
 			if (act == FT_DESCENT_FOUND_MINMAX)
 				goto found_minmax;
-			if (act == FT_DESCENT_BREAK)
-				break;
-			assert(act == FT_DESCENT_CONTINUE);
-			continue;
-		}
-		if (ft_node_collapsed(node_flag)) {
-			enum ft_descent_action act;
-
-			act = ft_inequality_minmax_collapsed(
-				&node_flag, &level, &ret_node,
-				&skip_eq_external_nodes, &going_up,
-				iter, ordinal_key, dir,
-				(ssize_t) ft->group->max_tree_depth);
-			if (act == FT_DESCENT_FOUND_MINMAX)
-				goto found_minmax;
-			if (act == FT_DESCENT_GOING_UP)
-				goto going_up;
 			if (act == FT_DESCENT_BREAK)
 				break;
 			assert(act == FT_DESCENT_CONTINUE);
@@ -11351,55 +11255,6 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_compressed_node *cn =
 			ft_compressed_node_ptr(parent_nf);
 		return cn->len;
-	}
-	if (ft_node_collapsed(parent_nf)) {
-		unsigned int tier = ft_collapsed_tier(parent_nf);
-		unsigned int stride = ft_collapsed_stride(parent_nf);
-		struct cds_ft_collapsed_node *col =
-			ft_collapsed_node_ptr(parent_nf);
-		unsigned int cap = ft_collapsed_capacity_stride(tier, stride);
-		unsigned int e;
-		/*
-		 * Resolve the search key once.  Callers may hand us either
-		 * the bare compressed flag (e.g. metadata->parent loads) or
-		 * the skip-encoded form (e.g. *slot or just-published top).
-		 * Slot entries can carry either form too.  Comparing both
-		 * sides in their resolved (bare) form is the unambiguous
-		 * match.
-		 */
-		struct cds_ft_inode_flag *target = ft_resolve_skip_compressed(child_nf);
-
-		if (stride == FT_COL_STRIDE_NARROW) {
-			struct cds_ft_collapsed_entry *entries =
-				ft_collapsed_entries(col, tier);
-
-			for (e = 0; e < cap; e++) {
-				struct cds_ft_collapsed_entry *entry = &entries[e];
-				struct cds_ft_inode_flag *child = entry->child;
-
-				if (child == NULL)
-					continue;
-				child = ft_resolve_skip_compressed(child);
-				if (child == target)
-					return ft_collapsed_suffix_len(entry);
-			}
-		} else {
-			struct cds_ft_collapsed_entry_wide *entries =
-				ft_collapsed_entries_wide(col, tier);
-
-			for (e = 0; e < cap; e++) {
-				struct cds_ft_collapsed_entry_wide *entry = &entries[e];
-				struct cds_ft_inode_flag *child = entry->child;
-
-				if (child == NULL)
-					continue;
-				child = ft_resolve_skip_compressed(child);
-				if (child == target)
-					return entry->len;
-			}
-		}
-		assert(0);
-		return 1;
 	}
 	/* Internal node: dispatches on one key byte. */
 	return 1;
@@ -13065,17 +12920,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				break;
 			continue;
 		}
-		if (ft_node_collapsed(d.nf)) {
-			enum ft_descent_action act;
-
-			act = ft_descent_step_collapsed(&d, &iter_key,
-				key_len, snapshot, snapshot_depth,
-				&nr_snapshot);
-			if (act == FT_DESCENT_BREAK)
-				break;
-			assert(act == FT_DESCENT_CONTINUE);
-			continue;
-		}
 		dbg_printf("_cds_ft_insert_replace iter ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
 		ft_snapshot_push(snapshot, snapshot_depth,
@@ -13291,22 +13135,6 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			enum ft_descent_action act;
 
 			act = ft_traverse_compressed(&node_flag,
-				&node_flag_ptr, &iter_key, &i,
-				key_depth, &nf);
-			if (nf) {
-				s = CDS_FT_STATUS_NOT_FOUND;
-				FT_TP(replace_exit, (int) s);
-				return s;
-			}
-			if (act == FT_DESCENT_BREAK)
-				break;
-			continue;
-		}
-		if (ft_node_collapsed(node_flag)) {
-			bool nf = false;
-			enum ft_descent_action act;
-
-			act = ft_traverse_collapsed(&node_flag,
 				&node_flag_ptr, &iter_key, &i,
 				key_depth, &nf);
 			if (nf) {
@@ -13827,67 +13655,6 @@ int ft_detach_node(struct cds_ft *ft,
 			topmost_external_nodes, &nr_clear);
 		if (ret)
 			goto end;
-	} else if (ft_node_collapsed(iter_node_flag)) {
-		/*
-		 * Collapsed parent.  The upward walk stopped here for
-		 * one of: col.nr_child > 1, col.external_nodes is set,
-		 * or a descendant's external_nodes was propagated up
-		 * (topmost_external_nodes non-NULL).
-		 *
-		 * A collapsed with nr_child == 0 would be a dead-end
-		 * under ordered traversal -- an invariant violation.
-		 * The three sub-cases handled in
-		 * ft_detach_node_replace_collapsed_parent ensure
-		 * nr_child stays >= 1 *quiescently* at all times a
-		 * reader can observe col in the trie:
-		 *
-		 *   A. col.nr_child > 1: tombstone the one entry being
-		 *      detached.  nr_child-- leaves nr_child >= 1; col
-		 *      remains live with fewer entries.
-		 *
-		 *   B. col.nr_child == 1 AND topmost_external_nodes
-		 *      (detached child had external_nodes to promote):
-		 *      repurpose the entry -- cptrs[e] becomes the
-		 *      promoted external chain head.  nr_child stays at
-		 *      1; col's own external_nodes (if any) is
-		 *      unchanged.  No tombstone, no nr_child decrement.
-		 *
-		 *   C. col.nr_child == 1 AND col.external_nodes (no
-		 *      topmost_external_nodes): replace col in its
-		 *      grandparent's slot with col.external_nodes.
-		 *      col is freed; grandparent now points directly
-		 *      at col's NIL-key chain.  col is never observed
-		 *      quiescently with nr_child == 0.
-		 *
-		 * The remaining case (nr_child == 1 AND no external
-		 * anywhere) is handled earlier by the upward walk:
-		 * col is marked for prune (nr_clear++), the whole
-		 * single-child chain up to col's non-prunable ancestor
-		 * is replaced via ft_node_replace_ptr, and col is
-		 * freed via the free-intermediate walk without ever
-		 * being iter_node_flag here.
-		 *
-		 * Reader-side transient exception: a reader's entry
-		 * scan is not atomic, and sub-case A writes cptrs[e] =
-		 * NULL *before* setting the tombstone bit.  With the
-		 * right interleaving, a reader can observe every entry
-		 * as dead-bit-set or NULL-pointer simultaneously --
-		 * even though at no wall-clock instant were all entries
-		 * quiescently dead.  cds_ft_lookup_inequality treats
-		 * this as "empty at this step" and backs out via
-		 * going_up to find the next sibling at a higher level;
-		 * it does NOT abort.  Abort here is reserved for the
-		 * compressed-child-NULL case, where the invariant
-		 * holds even transiently (cn->child is set before the
-		 * compressed is published and never cleared in place).
-		 *
-		 * Density was already propagated above (before
-		 * structural changes).
-		 */
-		ft_detach_node_replace_collapsed_parent(ft, iter_node_flag,
-			detach_parent_flag_ptr, detach_node_flag_ptr,
-			topmost_external_nodes, cur_depth);
-		ret = 0;
 	} else {
 		/*
 		 * Density was already propagated above (before
@@ -13955,8 +13722,6 @@ int ft_detach_node(struct cds_ft *ft,
 						     cm->external_nodes))
 							break;
 						next = cn->child;
-					} else if (ft_node_collapsed(walk_nf)) {
-						break;
 					} else {
 						struct cds_ft_metadata *m =
 							cds_ft_item_to_metadata(
@@ -14270,17 +14035,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			}
 			continue;
 		}
-		if (ft_node_collapsed(dd.d.nf)) {
-			enum cds_ft_status s;
-
-			s = ft_remove_descent_collapsed(&dd, &iter_key,
-							key_len);
-			if (s != CDS_FT_STATUS_OK) {
-				FT_TP(remove_exit, (int) s);
-				return s;
-			}
-			continue;
-		}
 
 		/*
 		 * Track pointers for the detach point during descent.
@@ -14494,17 +14248,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 
 			s = ft_remove_descent_compressed(&dd, &iter_key,
 							 key_len);
-			if (s != CDS_FT_STATUS_OK) {
-				*result_node = NULL;
-				return s;
-			}
-			continue;
-		}
-		if (ft_node_collapsed(dd.d.nf)) {
-			enum cds_ft_status s;
-
-			s = ft_remove_descent_collapsed(&dd, &iter_key,
-							key_len);
 			if (s != CDS_FT_STATUS_OK) {
 				*result_node = NULL;
 				return s;
@@ -15001,17 +14744,6 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 
 			act = ft_descend_to_graft_point_compressed(ft, d,
 				&ik, key_len, snapshot, snapshot_depth,
-				nr_snapshot);
-			if (act == FT_DESCENT_BREAK)
-				break;
-			assert(act == FT_DESCENT_CONTINUE);
-			continue;
-		}
-		if (ft_node_collapsed(d->nf)) {
-			enum ft_descent_action act;
-
-			act = ft_descent_step_collapsed(d, &ik,
-				key_len, snapshot, snapshot_depth,
 				nr_snapshot);
 			if (act == FT_DESCENT_BREAK)
 				break;
@@ -16341,15 +16073,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				}
 				continue;
 			}
-			if (ft_node_collapsed(dd.d.nf)) {
-				enum cds_ft_status s;
-
-				s = ft_detach_descent_collapsed(ft, &dd, &ik,
-						key_len);
-				if (s != CDS_FT_STATUS_OK)
-					return s;
-				continue;
-			}
 
 			meta = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
 			ft_detach_descent_track(&dd, meta);
@@ -16886,16 +16609,6 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 				goto out;
 			continue;
 		}
-		if (ft_node_collapsed(node_flag)) {
-			enum ft_descent_action act;
-
-			act = ft_count_prefix_collapsed(
-				&node_flag, &i, prefix,
-				prefix_len, &count);
-			if (act == FT_DESCENT_END)
-				goto out;
-			continue;
-		}
 		kv = prefix[i];
 		node_flag = ft_node_get_nth(node_flag, NULL, kv, FT_PF_NONE);
 	}
@@ -16914,12 +16627,6 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		count = ft_nr_keys_load(cn_meta);
-		goto out;
-	}
-	if (ft_node_collapsed(node_flag)) {
-		struct cds_ft_metadata *col_meta =
-			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		count = ft_nr_keys_load(col_meta);
 		goto out;
 	}
 	/* External node: one key (possibly with duplicates). */
@@ -17074,16 +16781,6 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 
 			act = ft_lookup_nth_compressed(&node_flag,
 				&level, ordinal_key, iter);
-			if (act == FT_DESCENT_BREAK)
-				break;
-			continue;
-		}
-		if (ft_node_collapsed(node_flag)) {
-			enum ft_descent_action act;
-
-			act = ft_lookup_nth_collapsed(&node_flag,
-				&level, ordinal_key, iter,
-				&remaining);
 			if (act == FT_DESCENT_BREAK)
 				break;
 			continue;
@@ -17255,19 +16952,6 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 			act = ft_lookup_nth_last_compressed(
 				&node_flag, &level, &remaining,
 				ordinal_key, iter);
-			if (act == FT_DESCENT_BREAK)
-				break;
-			if (act == FT_DESCENT_END)
-				goto check_ext_nth_last;
-			continue;
-		}
-		if (ft_node_collapsed(node_flag)) {
-			enum ft_descent_action act;
-
-			/* Reuse nth helper in reverse: walk entries largest-first. */
-			act = ft_lookup_nth_last_collapsed(
-				&node_flag, &level, ordinal_key,
-				iter, &remaining);
 			if (act == FT_DESCENT_BREAK)
 				break;
 			if (act == FT_DESCENT_END)
@@ -17483,16 +17167,6 @@ int ft_rebuild_path(struct cds_ft *ft,
 			enum ft_descent_action act;
 
 			act = ft_rebuild_path_compressed(&node_flag, &i,
-				key, key_len, ordinal_key, iter);
-			if (act == FT_DESCENT_END)
-				return -1;
-			assert(act == FT_DESCENT_CONTINUE);
-			continue;
-		}
-		if (ft_node_collapsed(node_flag)) {
-			enum ft_descent_action act;
-
-			act = ft_rebuild_path_collapsed(&node_flag, &i,
 				key, key_len, ordinal_key, iter);
 			if (act == FT_DESCENT_END)
 				return -1;
@@ -17750,29 +17424,6 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 					goto descend_forward;
 				}
 				remaining -= ck;
-			} else if (ft_node_collapsed(parent)) {
-				/*
-				 * Walk collapsed entries in ascending suffix
-				 * order.  ft_lookup_nth_collapsed fills the
-				 * iter path and ordinal_key through the
-				 * matched suffix — don't overwrite them.
-				 */
-				enum ft_descent_action act;
-				int lv = depth;
-
-				act = ft_lookup_nth_collapsed(
-					&parent, &lv, ordinal_key,
-					iter, &remaining);
-				if (act == FT_DESCENT_BREAK) {
-					/* Leaf at path[lv]. */
-					level = lv;
-					goto descend_forward;
-				}
-				if (act == FT_DESCENT_CONTINUE) {
-					/* Non-leaf child at path[lv+1]. */
-					level = lv + 1;
-					goto descend_forward;
-				}
 			} else {
 				struct cds_ft_inode_flag *child;
 				uint8_t child_key = 0;
@@ -17827,17 +17478,6 @@ skip_fwd_walk_up:
 		 * at adjacent levels).  At the entry level, scan
 		 * entries to the right and count their keys.
 		 */
-		if (ft_node_collapsed(ancestor)) {
-			enum ft_descent_action act;
-
-			act = ft_skip_forward_walk_up_collapsed(ancestor,
-				&level, depth, &remaining,
-				ordinal_key, iter);
-			if (act == FT_DESCENT_BREAK)
-				goto descend_forward;
-			assert(act == FT_DESCENT_CONTINUE);
-			continue;
-		}
 
 		pivot = ordinal_key[level];
 		child = ft_node_get_direction(ancestor, pivot,
@@ -17924,16 +17564,6 @@ descend_forward:
 				act = ft_skip_forward_compressed(
 					&node_flag, &level,
 					ordinal_key, iter);
-				if (act == FT_DESCENT_BREAK)
-					break;
-				continue;
-			}
-			if (ft_node_collapsed(node_flag)) {
-				enum ft_descent_action act;
-
-				act = ft_lookup_nth_collapsed(
-					&node_flag, &level,
-					ordinal_key, iter, &remaining);
 				if (act == FT_DESCENT_BREAK)
 					break;
 				continue;
@@ -18282,19 +17912,6 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 			assert(act == FT_DESCENT_CONTINUE);
 			continue;
 		}
-		if (ft_node_collapsed(ancestor)) {
-			enum ft_descent_action act;
-
-			act = ft_skip_reverse_walk_up_collapsed(ancestor,
-				&level, depth, &remaining,
-				ordinal_key, iter);
-			if (act == FT_DESCENT_BREAK)
-				goto descend_reverse;
-			if (act == FT_DESCENT_END)
-				goto end;
-			assert(act == FT_DESCENT_CONTINUE);
-			continue;
-		}
 
 		ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
 
@@ -18405,18 +18022,6 @@ descend_reverse:
 				act = ft_skip_reverse_compressed(
 					&node_flag, &level, &remaining,
 					ordinal_key, iter);
-				if (act == FT_DESCENT_BREAK)
-					break;
-				if (act == FT_DESCENT_END)
-					goto check_ext_descend_reverse;
-				continue;
-			}
-			if (ft_node_collapsed(node_flag)) {
-				enum ft_descent_action act;
-
-				act = ft_lookup_nth_last_collapsed(
-					&node_flag, &level,
-					ordinal_key, iter, &remaining);
 				if (act == FT_DESCENT_BREAK)
 					break;
 				if (act == FT_DESCENT_END)
@@ -19802,9 +19407,6 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 	if (ft_node_compressed(node_flag))
 		return ft_verify_node_compressed(ft, out, visited, path,
 			node_flag, expected_parent, depth, out_nr_keys);
-	if (ft_node_collapsed(node_flag))
-		return ft_verify_node_collapsed(ft, out, visited, path,
-			node_flag, expected_parent, depth, out_nr_keys);
 
 	/* --- Internal node (linear, pool, pigeon) --- */
 	{
@@ -20256,8 +19858,6 @@ int ft_verify_density_recursive(const struct cds_ft *ft, FILE *out,
 
 	if (ft_node_compressed(node_flag))
 		return ft_verify_density_compressed(ft, out, node_flag, depth);
-	if (ft_node_collapsed(node_flag))
-		return ft_verify_density_collapsed(ft, out, node_flag, depth);
 
 	/* Internal node. */
 	{
@@ -20425,10 +20025,6 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 {
 	unsigned int key;
 
-	if (ft_node_collapsed(node_flag)) {
-		show_collapsed_node(ft, out, node_flag, level);
-		return;
-	}
 
 	print_indent(out, level);
 	fprintf(out, "Level %d within node %p\n", level, node_flag);
@@ -20438,11 +20034,7 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 		if (!child_node_flag)
 			continue;
-		if (ft_node_collapsed(child_node_flag)) {
-			print_indent(out, level);
-			fprintf(out, "Level %d, key value: %u ->\n", level, key);
-			show_collapsed_node(ft, out, child_node_flag, level + 1);
-		} else if (ft_node_internal(child_node_flag)) {
+		if (ft_node_internal(child_node_flag)) {
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(child_node_flag));
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
@@ -20695,10 +20287,6 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 		else
 			fprintf(out, "null");
 		fprintf(out, "}");
-		return;
-	}
-	if (ft_node_collapsed(node_flag)) {
-		json_emit_collapsed(ft, out, node_flag, level);
 		return;
 	}
 	/* Internal. */
@@ -20997,10 +20585,6 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 {
 	unsigned int key;
 
-	if (ft_node_collapsed(node_flag)) {
-		calc_stats_collapsed(ft, node_flag, stats, level);
-		return;
-	}
 
 	for (key = 0; key < 256; key++) {
 		struct cds_ft_inode_flag *child_node_flag;
@@ -21008,11 +20592,6 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 		if (!child_node_flag)
 			continue;
-		if (ft_node_collapsed(child_node_flag)) {
-			calc_stats_collapsed(ft, child_node_flag,
-				stats, level);
-			continue;
-		}
 		if (ft_node_internal(child_node_flag)) {
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(child_node_flag));
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
