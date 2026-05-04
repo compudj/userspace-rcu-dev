@@ -16016,10 +16016,6 @@ void ft_final_checks(struct cds_ft *ft)
 			uatomic_read(&ft->nr_compressed_alloc),
 			uatomic_read(&ft->nr_compressed_freed),
 			(long)(uatomic_read(&ft->nr_compressed_alloc) - uatomic_read(&ft->nr_compressed_freed)));
-		fprintf(stderr, "  collapsed: alloc=%lu freed=%lu leaked=%ld\n",
-			uatomic_read(&ft->nr_collapsed_alloc),
-			uatomic_read(&ft->nr_collapsed_freed),
-			(long)(uatomic_read(&ft->nr_collapsed_alloc) - uatomic_read(&ft->nr_collapsed_freed)));
 	}
 }
 
@@ -17324,31 +17320,12 @@ struct cds_ft_stats_level {
 	uint64_t nr_duplicate_external_nodes;
 	uint64_t nr_internal_nodes;
 	uint64_t nr_compressed_nodes;
-	uint64_t nr_collapsed_nodes;
-	uint64_t nr_collapsed_tier[FT_COL_NR_TIERS];
 	struct cds_ft_node_stats node_stats[FT_TYPE_MAX_NR];
 	bool has_nodes;
 };
 
-/*
- * Trie-wide collapsed-node distributions.
- *
- * collapsed_nr_entries_dist: histogram of nr_entries (= leaf count)
- *   per collapsed node, log2-bucketed:
- *     [0]=[2..3] [1]=[4..7] [2]=[8..15] [3]=[16..31]
- *     [4]=[32..63] [5]=[64..127] [6]=[128..255] [7]=[256]
- *
- * collapsed_suffix_len_dist: histogram of per-entry suffix lengths
- *   (in bytes), bucket FT_COLLAPSE_SLEN_MAX_BIN holds suffix_len >=
- *   that bin.
- */
-#define FT_COLLAPSE_NR_ENTRIES_BUCKETS	8
-#define FT_COLLAPSE_SLEN_MAX_BIN	33
-
 struct cds_ft_stats {
 	struct cds_ft_stats_level level[FT_MAX_DEPTH];
-	uint64_t collapsed_nr_entries_dist[FT_COLLAPSE_NR_ENTRIES_BUCKETS];
-	uint64_t collapsed_suffix_len_dist[FT_COLLAPSE_SLEN_MAX_BIN + 1];
 	uint64_t compressed_len_dist[256];
 };
 
@@ -17521,17 +17498,6 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 			print_indent(out, 1);
 			fprintf(out, "Compressed nodes: %" PRIu64 "\n", stats_level->nr_compressed_nodes);
 		}
-		if (stats_level->nr_collapsed_nodes) {
-			print_indent(out, 1);
-			fprintf(out, "Collapsed nodes: %" PRIu64
-				" (T0: %" PRIu64 ", T1: %" PRIu64
-				", T2: %" PRIu64 ", T3: %" PRIu64 ")\n",
-				stats_level->nr_collapsed_nodes,
-				stats_level->nr_collapsed_tier[0],
-				stats_level->nr_collapsed_tier[1],
-				stats_level->nr_collapsed_tier[2],
-				stats_level->nr_collapsed_tier[3]);
-		}
 		for (type = 0; type < FT_TYPE_MAX_NR; type++) {
 			const struct cds_ft_node_stats *node_stats = &stats->level[level].node_stats[type];
 			uint64_t nr_nodes = node_stats->count;
@@ -17550,59 +17516,6 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 					}
 				}
 				fprintf(out, ")\n");
-			}
-		}
-	}
-	{
-		static const char *const nr_entries_labels[
-			FT_COLLAPSE_NR_ENTRIES_BUCKETS] = {
-			"2-3", "4-7", "8-15", "16-31",
-			"32-63", "64-127", "128-255", "256",
-		};
-		uint64_t total = 0;
-		unsigned int b;
-		bool any_collapse = false;
-
-		for (b = 0; b < FT_COLLAPSE_NR_ENTRIES_BUCKETS; b++) {
-			total += stats->collapsed_nr_entries_dist[b];
-			if (stats->collapsed_nr_entries_dist[b])
-				any_collapse = true;
-		}
-		if (any_collapse) {
-			fprintf(out, "Collapsed nodes (trie-wide): %"
-				PRIu64 "\n", total);
-			print_indent(out, 1);
-			fprintf(out, "nr_entries distribution:");
-			for (b = 0; b < FT_COLLAPSE_NR_ENTRIES_BUCKETS; b++) {
-				if (stats->collapsed_nr_entries_dist[b])
-					fprintf(out, " [%s]=%" PRIu64,
-						nr_entries_labels[b],
-						stats->collapsed_nr_entries_dist[b]);
-			}
-			fprintf(out, "\n");
-			{
-				uint64_t slen_total = 0;
-				unsigned int s;
-
-				for (s = 0; s <= FT_COLLAPSE_SLEN_MAX_BIN; s++)
-					slen_total +=
-						stats->collapsed_suffix_len_dist[s];
-				print_indent(out, 1);
-				fprintf(out,
-					"entry suffix_len distribution (n=%"
-					PRIu64 "):", slen_total);
-				for (s = 0; s <= FT_COLLAPSE_SLEN_MAX_BIN; s++) {
-					if (stats->collapsed_suffix_len_dist[s]) {
-						const char *suffix =
-							(s == FT_COLLAPSE_SLEN_MAX_BIN)
-							? "+" : "";
-						fprintf(out, " [%u%s]=%"
-							PRIu64,
-							s, suffix,
-							stats->collapsed_suffix_len_dist[s]);
-					}
-				}
-				fprintf(out, "\n");
 			}
 		}
 	}
