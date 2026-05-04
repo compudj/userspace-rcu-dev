@@ -5562,6 +5562,104 @@ struct cds_ft_inode_flag *ft_qp_byte_get_ith_pos(
 	}
 	return NULL;
 }
+
+/*
+ * QP-nibble byte-step delete — tombstone the lo-side slot at @byte
+ * and, if the lo-node's live-child count drops to zero, detach the
+ * lo-node from the hi-node and RCU-free it (per design 4.6.1).
+ *
+ * @lo_slot is the lo-side pointer slot returned by a previous
+ * ft_qp_byte_get; the caller has located it via the read-side
+ * descent and passes it through to share the work.
+ *
+ * Mutation order matches ft_pigeon_node_replace_ptr / the byte-keyed
+ * helpers — slot publish first, accounting after — and is safe under
+ * the count-based readers' undercount guarantee: a reader that
+ * acquire-loads a tombstoned slot has already passed (or is about to
+ * skip) the bitmap pre-filter, so it observes "not found" without
+ * needing the metadata count to be in sync.
+ *
+ *   1. rcu_assign_pointer(*lo_slot, NULL) — tombstones the byte.
+ *   2. lo_meta->nr_child-- — local live count.
+ *   3. If lo_meta->nr_child == 0 (lo-node fully tombstoned):
+ *      a. rcu_assign_pointer(*hi_slot, NULL) — tombstones the bucket
+ *         (hi-bit stays set per the monotonic-bitmap rule).
+ *      b. hi_meta->nr_child-- — bucket count.
+ *      c. ft_qp16_node_free_rcu(ft, lo) — defer free to the next
+ *         grace period.  Concurrent readers either resolve the OLD
+ *         hi-slot (descend into the now-empty lo-node — every lo-slot
+ *         is NULL, returns not-found) or the NEW NULL hi-slot
+ *         (returns not-found immediately).  Both correct.
+ *
+ * The lo-node's metadata is recovered via the slow pointer-mask
+ * accessor (cds_ft_item_to_metadata) — the hi→lo pointer is raw and
+ * untagged, so the tag-derived "_fast" accessor is unavailable.  This
+ * is write-side only; read-side never needs lo-node metadata.
+ *
+ * Returns 0 on success.  The byte-stage recompact threshold
+ * (-EFBIG-style trigger comparing hi_meta->nr_child against the QP
+ * tier's min_child) is left to the dispatch arm and lands alongside
+ * the case FT_QP: arms; this helper unconditionally completes the
+ * detach when the live count hits zero.
+ */
+static __attribute__((unused))
+int ft_qp_byte_clear(struct cds_ft *ft,
+		struct cds_ft_qp16_node *hi, struct cds_ft_metadata *hi_meta,
+		struct cds_ft_inode_flag **lo_slot, uint8_t byte)
+{
+	uint8_t hi_n = (uint8_t) (byte >> 4);
+	struct cds_ft_inode_flag **hi_slot;
+	struct cds_ft_inode_flag *lo_flag;
+	struct cds_ft_qp16_node *lo;
+	struct cds_ft_metadata *lo_meta;
+
+	assert(*lo_slot != NULL);
+	rcu_assign_pointer(*lo_slot, NULL);
+
+	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0);
+	assert(lo_flag);
+	lo = (struct cds_ft_qp16_node *) lo_flag;
+	lo_meta = cds_ft_item_to_metadata(lo);
+
+	assert(lo_meta->nr_child > 0);
+	lo_meta->nr_child--;
+	if (lo_meta->nr_child > 0)
+		return 0;
+
+	/* Lo-node fully tombstoned: detach + RCU-free. */
+	assert(*hi_slot != NULL);
+	rcu_assign_pointer(*hi_slot, NULL);
+	assert(hi_meta->nr_child > 0);
+	hi_meta->nr_child--;
+	ft_qp16_node_free_rcu(ft, lo);
+	return 0;
+}
+
+/*
+ * QP-nibble byte-step replace — atomic pointer replace at a byte
+ * that is already present in the node, sharing the lo-slot pointer
+ * the caller obtained via ft_qp_byte_get.
+ *
+ * @newptr non-NULL is a live replace (graft swap, candidate
+ * promotion).  @newptr NULL routes to ft_qp_byte_clear so the
+ * dispatch arm can use the same _ft_node_replace_ptr-style call site
+ * for both replace and delete; the lo-node detach + free-RCU
+ * machinery stays encapsulated here.
+ *
+ * Returns 0 on success.
+ */
+static __attribute__((unused))
+int ft_qp_byte_replace(struct cds_ft *ft,
+		struct cds_ft_qp16_node *hi, struct cds_ft_metadata *hi_meta,
+		struct cds_ft_inode_flag **lo_slot,
+		uint8_t byte, struct cds_ft_inode_flag *newptr)
+{
+	if (!newptr)
+		return ft_qp_byte_clear(ft, hi, hi_meta, lo_slot, byte);
+	assert(*lo_slot != NULL);
+	rcu_assign_pointer(*lo_slot, newptr);
+	return 0;
+}
 #endif /* FEATURE_FT_QP */
 
 /*
