@@ -138,9 +138,11 @@ The `byte_set` insert path:
 - Tier-up CoW: allocate at `ft_qp16_tiers[tier+1].order`, build via `recompact_and_insert`, swap parent pointer, RCU-free old.
 - New helper `ft_qp16_node_recompact_and_insert(new, src, nibble, child, capacity)`: combines `recompact` (drops tombstones) + insert in a single walk. Saves an alloc on the -ENOSPC path.
 
-### 4.6 Open design questions
+### 4.6 Decisions
 
-1. **Lo-node reclamation on full-tombstone** *(decided)*: when `byte_clear` empties a lo-node (popcount of live children drops to 0), the writer **NULLs the hi-node's slot pointing at that lo-node** and **RCU-frees the lo-node**. Concretely:
+These were deliberated and settled during the scaffolding phase. Don't relitigate.
+
+1. **Lo-node reclamation on full-tombstone**: when `byte_clear` empties a lo-node (live-child count drops to 0), the writer **NULLs the hi-node's slot pointing at that lo-node** and **RCU-frees the lo-node**. Concretely:
    1. `byte_clear` does the lo-side `clear_nth` (NULL the lo-slot for the dying child).
    2. If `nr_keys` of the lo-node is now 0 (live count, not bitmap popcount), proceed to detach the lo-node:
       - `clear_nth(hi_node, hi_nibble)` — tombstones the hi-slot (NULL the slot, bit stays set per monotonic-bitmap rule).
@@ -149,18 +151,21 @@ The `byte_set` insert path:
 
    The lo-node's `nr_keys` (stored in its `cds_ft_metadata`) is the live-child counter to test against zero — bitmap popcount can be > 0 with all slots NULL'd (tombstones-only state).
 
-2. **Skip-compressed pointer in lo-nibble slots**: skip-compress encodes byte-aligned hop count in the high pointer bits. A skip-compressed pointer in a lo-nibble slot represents "skip N bytes starting from the next byte boundary" (i.e., the lo-bit transition completes the current byte, then we skip N bytes). The descent flow:
-   1. hi descend → lo-node.
-   2. lo descend → tagged ptr. Tag = skip-compressed → use existing `ft_resolve_skip_compressed`.
-   - This is a minimal change from existing behavior; the hi/lo split doesn't affect skip-compress logic since skip-compress only fires at byte boundaries.
+2. **Skip-compressed pointer placement**: skip-compress encodes byte-aligned hop count in the high pointer bits, so a skip-compressed pointer can only live in a **lo-nibble slot** (byte-boundary). The descent flow is unchanged from the pre-QP design:
+   1. hi descend → lo-node (untagged).
+   2. lo descend → tagged ptr. Tag = skip-compressed → resolve via existing `ft_resolve_skip_compressed`.
 
-3. **Compressed node child**: similar to skip-compress — only at byte boundaries, so always reachable through a lo-nibble slot. No special hi-side handling.
+   The QP hi/lo split adds an unconditional hi hop in front of each byte boundary but does not affect skip-compress encoding or resolution. No new handling needed; `ft_resolve_skip_compressed` lands on the next byte's hi-nibble node by construction.
 
-4. **PIGEON ↔ QP transitions**: when a sparse byte level grows past T3 capacity (16 distinct nibbles, hi-node fully populated), the writer must transition from QP to PIGEON. Likely path:
+3. **Compressed node child placement**: same rule as skip-compress — compressed children are byte-boundary objects, so they live exclusively in **lo-nibble slots**. No hi-side handling needed.
+
+### 4.7 Remaining design questions
+
+1. **PIGEON ↔ QP transitions**: when a sparse byte level grows past T3 capacity (16 distinct nibbles, hi-node fully populated), the writer must transition from QP to PIGEON. Likely path:
    - Detect at hi-node `set_nth_safe` returning -ENOSPC with `popcount == 16` (T3 maxed and bit not set is impossible since bm == 0xFFFF). Real trigger: hi-node at T3 + each lo-node at T3 = 16×16 = 256 distinct bytes. At that point, allocate a PIGEON node, walk all 256 byte values, set each in PIGEON, swap parent pointer, RCU-free hi+all 16 lo-nodes.
    - Reverse direction (PIGEON shrink to QP) on byte-level delete below threshold. Less critical; could defer.
 
-5. **Recompact policy**: tunable trigger (live ≤ X% of capacity → recompact even before -ENOSPC) is a future perf optimization. Initial implementation: only on -ENOSPC.
+2. **Recompact policy**: tunable trigger (live ≤ X% of capacity → recompact even before -ENOSPC) is a future perf optimization. Initial implementation: only on -ENOSPC.
 
 ## 5. Smoke / bench plan (Phase 3)
 
