@@ -4807,6 +4807,135 @@ unsigned int ft_qp16_node_nr_child(const struct cds_ft_qp16_node *node)
 	return (unsigned int) __builtin_popcount(
 			(unsigned int) uatomic_load(&node->bitmap, CMM_RELAXED));
 }
+
+/*
+ * QP-nibble directional lookup — find the first nibble strictly
+ * greater (or strictly less) than @nibble that has a child, and
+ * return that child along with the matched nibble.
+ *
+ * @dir == FT_RIGHT: smallest nibble strictly greater than @nibble.
+ * @dir == FT_LEFT:  largest nibble strictly less than @nibble.
+ *
+ * Returns NULL when no such nibble exists (caller is at the boundary
+ * of the node).  When non-NULL, *@result_nibble holds the matched
+ * nibble (0..15).
+ *
+ * Used by inequality lookup (cds_ft_lookup_lt / _gt / _le / _ge):
+ * after a non-matching nibble, the descent picks the directional
+ * neighbor to continue.
+ *
+ * Implementation: mask the bitmap to the candidate range, then ctz
+ * (right) or 31-clz (left) the result to find the matching set bit,
+ * and use popcount on the lower side to derive the pointer index.
+ *
+ * Range masks (16-bit):
+ *   right of nibble n: bits (n+1)..15  →  ~((1<<(n+1)) - 1) & 0xFFFF
+ *   left  of nibble n: bits 0..(n-1)   →  (1<<n) - 1
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_qp16_node_get_direction(
+		struct cds_ft_qp16_node *node,
+		uint8_t nibble, uint8_t *result_nibble,
+		enum ft_direction dir)
+{
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_ACQUIRE);
+	uint16_t side;
+	unsigned int n;
+	unsigned int matched_bit;
+	unsigned int idx;
+
+	n = (unsigned int) (nibble & 0xFU);
+	if (dir == FT_RIGHT) {
+		/* bits strictly greater than n */
+		uint16_t hi_mask = (uint16_t) (~((1U << (n + 1U)) - 1U) & 0xFFFFU);
+		side = (uint16_t) (bm & hi_mask);
+		if (!side)
+			return NULL;
+		matched_bit = (unsigned int) __builtin_ctz((unsigned int) side);
+	} else {
+		/* bits strictly less than n */
+		uint16_t lo_mask = (uint16_t) ((1U << n) - 1U);
+		side = (uint16_t) (bm & lo_mask);
+		if (!side)
+			return NULL;
+		matched_bit = 31U - (unsigned int) __builtin_clz((unsigned int) side);
+	}
+	*result_nibble = (uint8_t) matched_bit;
+	idx = (unsigned int) __builtin_popcount(
+			(unsigned int) (bm & ((1U << matched_bit) - 1U)));
+	return ft_dereference_acquire(node->ptrs[idx]);
+}
+
+/*
+ * QP-nibble ith-position accessor — return the i-th live child in
+ * popcount order (i ∈ [0, popcount(bitmap))) and the nibble it
+ * dispatches on.
+ *
+ * Used by ordered iteration (cds_ft_for_each_rcu, lookup_nth) and
+ * by debug walks.  Symmetric to ft_pigeon_node_get_ith_pos but
+ * resolves nibble via popcount-bit-select instead of a 256-bit
+ * bitmap scan.
+ *
+ * Bit-select via popcount: walk the bitmap finding the i-th set bit.
+ * On x86-64 with BMI2, this could compile to a PDEP + TZCNT pair;
+ * portable code uses an unrolled bit-scan loop.  For QP-16 the
+ * worst case is 16 bits, so a simple loop is fine.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_qp16_node_get_ith_pos(
+		struct cds_ft_qp16_node *node,
+		unsigned int i, uint8_t *result_nibble)
+{
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_ACQUIRE);
+	unsigned int j, count = 0, matched = 16U;
+
+	for (j = 0; j < 16U; j++) {
+		if (!(bm & (1U << j)))
+			continue;
+		if (count == i) {
+			matched = j;
+			break;
+		}
+		count++;
+	}
+	if (matched == 16U)
+		return NULL;
+	*result_nibble = (uint8_t) matched;
+	return ft_dereference_acquire(node->ptrs[i]);
+}
+
+/*
+ * QP-nibble ordered iteration — convenience wrapper that returns
+ * the leftmost (FT_LEFT) or rightmost (FT_RIGHT) live child.  Used
+ * to start a forward / reverse iteration at a node.  Equivalent to
+ * ft_qp16_node_get_ith_pos(node, 0) / (..., nr_child - 1).
+ *
+ * Returns NULL only on an empty node (bitmap == 0), which is the
+ * empty-root case.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_qp16_node_get_extremum(
+		struct cds_ft_qp16_node *node,
+		uint8_t *result_nibble, enum ft_direction dir)
+{
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_ACQUIRE);
+	unsigned int matched_bit;
+
+	if (!bm)
+		return NULL;
+	if (dir == FT_LEFT) {
+		matched_bit = (unsigned int) __builtin_ctz((unsigned int) bm);
+		*result_nibble = (uint8_t) matched_bit;
+		return ft_dereference_acquire(node->ptrs[0]);
+	}
+	matched_bit = 31U - (unsigned int) __builtin_clz((unsigned int) bm);
+	*result_nibble = (uint8_t) matched_bit;
+	{
+		unsigned int idx = (unsigned int) __builtin_popcount(
+				(unsigned int) bm) - 1U;
+		return ft_dereference_acquire(node->ptrs[idx]);
+	}
+}
 #endif /* FEATURE_FT_QP */
 
 /*
