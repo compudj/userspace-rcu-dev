@@ -1405,7 +1405,7 @@ bool ft_node_external(struct cds_ft_inode_flag *node)
 static inline_lookup
 bool ft_node_compressed(struct cds_ft_inode_flag *node)
 {
-	return ((unsigned long) node & FT_TAG_MASK_WIDE) == FT_COMPRESSED_MASK;
+	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
 }
 #else
 static
@@ -2757,13 +2757,13 @@ void ft_prefetch_child_meta(const void *ptr)
 #endif
 	if ((v & FT_INTERNAL_MASK) == 0) {
 		/*
-		 * External (bits 0-2 == 0): no FT metadata.  Prefetch the
+		 * External (bits 0-1 == 0): no FT metadata.  Prefetch the
 		 * node body, which the META-hint caller typically reads
 		 * next (user_data / ->next for the duplicate chain).
-		 * Compressed / collapsed children: their handlers
-		 * prefetch their own targets; skip here.
+		 * Compressed children: their handler prefetches its own
+		 * target; skip here.
 		 */
-		if ((v & FT_TAG_MASK_WIDE) == 0)
+		if ((v & FT_TAG_MASK) == 0)
 			__builtin_prefetch((const void *) v);
 		return;
 	}
@@ -2788,7 +2788,7 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
 #endif
 	if ((v & FT_INTERNAL_MASK) == 0) {
-		if ((v & FT_TAG_MASK_WIDE) == 0)
+		if ((v & FT_TAG_MASK) == 0)
 			__builtin_prefetch((const void *) v);
 		return;
 	}
