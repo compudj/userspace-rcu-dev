@@ -4773,21 +4773,25 @@ static const struct cds_ft_qp16_tier ft_qp16_tiers[FT_QP16_NR_TIERS] = {
 
 /*
  * QP-nibble read-side scanner.  Two dependent loads on the hot path:
- *   1. acquire-load bitmap (header CL)
+ *   1. relaxed-load bitmap (header CL) — pre-filter only
  *   2. acquire-load ptrs[idx] (pointer-array CL — same CL as bitmap
- *      for tiers T0/T1)
+ *      for tiers T0/T1) — source of truth via rcu_dereference
  *
  * @nibble must be in 0..15.  Returns the child pointer, or NULL if
- * the nibble has no child (bit clear in bitmap).  When @ptr_slot_p
- * is non-NULL, also returns the address of the pointer slot — used
- * by writers that need to atomically rewrite the slot (e.g. graft,
- * recompact-publish).  Pure-read callers pass NULL.
+ * the nibble has no child (bit clear in bitmap, or slot is a
+ * tombstone-NULL).  When @ptr_slot_p is non-NULL, also returns the
+ * address of the pointer slot — used by writers that need to
+ * atomically rewrite the slot (e.g. graft, recompact-publish).
+ * Pure-read callers pass NULL.
  *
- * The bitmap acquire-load synchronizes-with the writer's release-
- * publish of either the bitmap (on widening insert) or a freshly-
- * written ptrs[] slot (on in-place insert).  Pointer-array slot is
- * loaded with a separate acquire to pick up the publication of the
- * actual child.
+ * The bitmap is a pre-filter: a clear bit guarantees absence (skip
+ * the pointer load); a set bit is an "is-this-maybe-here" hint with
+ * the rcu_dereference on the slot as the source of truth.  Same
+ * pattern as FT_PIGEON's bitmap_scan: writer publishes the new
+ * child via rcu_assign_pointer on the slot (release), and the
+ * reader's acquire on the slot is what synchronizes-with that
+ * publish.  The bitmap therefore needs no synchronization itself
+ * and is loaded relaxed.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_qp16_node_get_nth(
@@ -4795,7 +4799,7 @@ struct cds_ft_inode_flag *ft_qp16_node_get_nth(
 		struct cds_ft_inode_flag ***ptr_slot_p,
 		uint8_t nibble, enum ft_pf_target pf_hint)
 {
-	uint16_t bm = uatomic_load(&node->bitmap, CMM_ACQUIRE);
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
 
 	if (!(bm & bit)) {
@@ -4876,7 +4880,7 @@ struct cds_ft_inode_flag *ft_qp16_node_get_direction(
 		uint8_t nibble, uint8_t *result_nibble,
 		enum ft_direction dir)
 {
-	uint16_t bm = uatomic_load(&node->bitmap, CMM_ACQUIRE);
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	uint16_t side;
 	unsigned int n;
 	unsigned int matched_bit;
@@ -4924,7 +4928,7 @@ struct cds_ft_inode_flag *ft_qp16_node_get_ith_pos(
 		struct cds_ft_qp16_node *node,
 		unsigned int i, uint8_t *result_nibble)
 {
-	uint16_t bm = uatomic_load(&node->bitmap, CMM_ACQUIRE);
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	unsigned int j, count = 0, matched = 16U;
 
 	for (j = 0; j < 16U; j++) {
@@ -4956,7 +4960,7 @@ struct cds_ft_inode_flag *ft_qp16_node_get_extremum(
 		struct cds_ft_qp16_node *node,
 		uint8_t *result_nibble, enum ft_direction dir)
 {
-	uint16_t bm = uatomic_load(&node->bitmap, CMM_ACQUIRE);
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	unsigned int matched_bit;
 
 	if (!bm)
