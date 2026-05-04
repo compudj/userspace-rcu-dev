@@ -3244,26 +3244,11 @@ unsigned int ft_compressed_order(uint8_t path_len)
  * Write-side only (may chase parent pointers for skip resolution).
  */
 static
-unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
-		struct cds_ft_inode_flag *node_flag)
+unsigned int ft_node_readside_footprint(const struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_inode_flag *node_flag __attribute__((unused)))
 {
-	unsigned int order;
-
-	if (ft_node_compressed(node_flag)) {
-		struct cds_ft_compressed_node *cn =
-			ft_compressed_node_ptr(node_flag);
-		if (ft_group_skip_compressed(ft->group) &&
-		    cn->len <= FT_SKIP_LEN_MAX)
-			return 0;
-		order = ft_compressed_order(cn->len);
-	} else if (ft_node_skip_compressed(node_flag)) {
-		return 0;
-	} else {
-		/* Internal: linear, pool, or pigeon. */
-		order = ft_types[ft_node_type(node_flag)].order;
-	}
-	assert(order >= 4);
-	return 1U << (order - 4);
+	/* Density tracking removed (was collapse-decision driven); always 0. */
+	return 0;
 }
 
 /*
@@ -3338,81 +3323,13 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
  * latency comparison.
  */
 static __attribute__((unused))
-unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
-		struct cds_ft_inode_flag *node_flag,
-		unsigned int collapse_scan_mul_pct,
-		unsigned int compress_scan_mul_pct)
+unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_inode_flag *node_flag __attribute__((unused)),
+		unsigned int collapse_scan_mul_pct __attribute__((unused)),
+		unsigned int compress_scan_mul_pct __attribute__((unused)))
 {
-	/*
-	 * Per-(stride, tier) read-side CL cost for the SoA collapsed
-	 * layout.  See the function-header comment for the derivation
-	 * of each ptr_cl_pct entry.
-	 */
-	static const unsigned int collapsed_avg_scan_cl_by_tier[FT_COL_NR_TIERS] = {
-		[0] = 1,	/* 64B alloc — header + entries on 1 CL */
-		[1] = 1,	/* 128B alloc — 16B header CL */
-		[2] = 1,	/* 256B alloc — 64B header = 1 CL */
-		[3] = 1,	/* 512B alloc — 64B header = 1 CL */
-	};
-	static const unsigned int collapsed_ptr_cl_pct_by_tier_stride
-			[FT_COL_NR_STRIDES][FT_COL_NR_TIERS] = {
-		[FT_COL_STRIDE_NARROW] = {
-			[0] = 0,	/* shared CL with scan */
-			[1] = 57,	/* 4/7 slots in CL 1 */
-			[2] = 100,	/* matched entry always past header CL */
-			[3] = 100,
-		},
-		[FT_COL_STRIDE_WIDE] = {
-			[0] = 0,	/* wide-T0 disabled — value never queried */
-			[1] = 67,	/* 2/3 slots reach CL 1 (slot 1 straddles) */
-			[2] = 100,
-			[3] = 100,
-		},
-	};
-	unsigned int order;
-
-	if (ft_node_compressed(node_flag)) {
-		struct cds_ft_compressed_node *cn =
-			ft_compressed_node_ptr(node_flag);
-		unsigned int cl;
-
-		if (ft_group_skip_compressed(ft->group) &&
-		    cn->len <= FT_SKIP_LEN_MAX)
-			return 0;
-		order = ft_compressed_order(cn->len);
-		cl = (order >= 7) ? 2U : 1U;
-		return cl * compress_scan_mul_pct;
-	} else if (ft_node_skip_compressed(node_flag)) {
-		return 0;
-	} else {
-		unsigned int type_index = ft_node_type(node_flag);
-		const struct cds_ft_type *type = &ft_types[type_index];
-		unsigned int max_lc, p, by_space, ptrs_in_cl0, ptrs_out;
-		unsigned int avg_scan_cl, avg_ptr_cl_pct;
-
-		if (type->type_class == FT_PIGEON) {
-			/*
-			 * Direct-indexed; no scan loop.  Matched pointer's
-			 * CL is always a fresh dependent load.
-			 */
-			return 100U;
-		}
-
-		/*
-		 * Linear or pool sub-node — both share the keys-then-
-		 * aligned-pointers layout with their own max_linear_child.
-		 * Pool dispatch itself reads no memory (decoded from
-		 * pointer flag bits).
-		 */
-		max_lc = type->max_linear_child;
-		p = (max_lc + sizeof(void *) - 1U) & ~(sizeof(void *) - 1U);
-		by_space = (p < 64U) ? (64U - p) / sizeof(void *) : 0U;
-		ptrs_in_cl0 = (by_space < max_lc) ? by_space : max_lc;
-		ptrs_out = max_lc - ptrs_in_cl0;
-		avg_ptr_cl_pct = (ptrs_out * 100U) / max_lc;
-		avg_scan_cl = (max_lc + 63U) / 64U;	/* always 1 today */
-		return avg_scan_cl * 100U + avg_ptr_cl_pct;
-	}
+	/* Density tracking removed (was collapse-decision driven); always 0. */
+	return 0;
 }
 
 static
@@ -10762,11 +10679,11 @@ bool ft_density_is_extended(const struct cds_ft_metadata *m)
 }
 
 static inline
-unsigned long ft_density_get(const struct cds_ft_metadata *m, unsigned int idx)
+unsigned long ft_density_get(const struct cds_ft_metadata *m __attribute__((unused)),
+		unsigned int idx __attribute__((unused)))
 {
-	if (caa_unlikely(ft_density_is_extended(m)))
-		return m->density_ext->nr_nodes_at_depth[idx];
-	return m->nr_nodes_at_depth[idx];
+	/* Density tracking removed (was collapse-decision driven); always 0. */
+	return 0;
 }
 
 /*
@@ -10882,47 +10799,30 @@ void ft_nr_keys_store(struct cds_ft *ft, struct cds_ft_metadata *m, unsigned lon
 }
 
 static inline
-void ft_density_set(struct cds_ft *ft, struct cds_ft_metadata *m, unsigned int idx, unsigned long val)
+void ft_density_set(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_metadata *m __attribute__((unused)),
+		unsigned int idx __attribute__((unused)),
+		unsigned long val __attribute__((unused)))
 {
-	if (caa_unlikely(ft_density_is_extended(m))) {
-		m->density_ext->nr_nodes_at_depth[idx] = val;
-		return;
-	}
-	if (caa_unlikely(val > FT_DENSITY_COMPACT_MAX)) {
-		ft_density_promote(ft, m);
-		m->density_ext->nr_nodes_at_depth[idx] = val;
-		return;
-	}
-	m->nr_nodes_at_depth[idx] = (uint8_t) val;
+	/* Density tracking removed (was collapse-decision driven); no-op. */
 }
 
 static inline
-void ft_density_add(struct cds_ft *ft, struct cds_ft_metadata *m, unsigned int idx, long delta)
+void ft_density_add(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_metadata *m __attribute__((unused)),
+		unsigned int idx __attribute__((unused)),
+		long delta __attribute__((unused)))
 {
-	unsigned long val = ft_density_get(m, idx);
-
-	assert(delta >= 0 || val >= (unsigned long) -delta);
-	val += delta;
-	ft_density_set(ft, m, idx, val);
+	/* Density tracking removed (was collapse-decision driven); no-op. */
 }
 
 static inline
-void ft_density_sub(struct cds_ft *ft, struct cds_ft_metadata *m, unsigned int idx, unsigned long sub)
+void ft_density_sub(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_metadata *m __attribute__((unused)),
+		unsigned int idx __attribute__((unused)),
+		unsigned long sub __attribute__((unused)))
 {
-	unsigned long val = ft_density_get(m, idx);
-
-	/*
-	 * Density underflow breaks the core counter invariant. Assert
-	 * loudly in debug builds; clamp to 0 in release builds so a
-	 * broken invariant does not wrap into a giant counter and
-	 * silently corrupt subsequent density math.
-	 */
-	assert(val >= sub);
-	if (caa_unlikely(val < sub)) {
-		ft_density_set(ft, m, idx, 0);
-		return;
-	}
-	ft_density_set(ft, m, idx, val - sub);
+	/* Density tracking removed (was collapse-decision driven); no-op. */
 }
 
 static inline
@@ -10978,14 +10878,11 @@ void ft_propagate_external_count_parent(struct cds_ft *ft,
  * window, subtracted in one operation.
  */
 static inline unsigned long ft_child_density_contribution(
-		struct cds_ft_metadata *cm, unsigned int distance,
-		unsigned int child_footprint)
+		struct cds_ft_metadata *cm __attribute__((unused)),
+		unsigned int distance __attribute__((unused)),
+		unsigned int child_footprint __attribute__((unused)))
 {
-	if (distance >= FT_NODE_DENSITY_DEPTH)
-		return child_footprint;
-	return child_footprint
-		+ ft_density_get(cm, 0)
-		- ft_density_get(cm, FT_NODE_DENSITY_DEPTH - distance);
+	return 0;
 }
 
 /*
@@ -11001,29 +10898,12 @@ static inline unsigned long ft_child_density_contribution(
  * Accumulates into @accum[0..DEPTH-1].
  */
 static inline void ft_child_density_contribution_all(
-		struct cds_ft_metadata *cm, unsigned int distance,
-		unsigned int child_footprint,
-		unsigned long *accum)
+		struct cds_ft_metadata *cm __attribute__((unused)),
+		unsigned int distance __attribute__((unused)),
+		unsigned int child_footprint __attribute__((unused)),
+		unsigned long *accum __attribute__((unused)))
 {
-	unsigned int j;
-
-	if (distance >= FT_NODE_DENSITY_DEPTH) {
-		/* Child beyond window: only its own footprint visible. */
-		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
-			accum[j] += child_footprint;
-		return;
-	}
-	{
-		unsigned long overflow =
-			ft_density_get(cm, FT_NODE_DENSITY_DEPTH - distance);
-
-		for (j = 0; j < distance; j++)
-			accum[j] += child_footprint
-				+ ft_density_get(cm, 0) - overflow;
-		for (j = distance; j < FT_NODE_DENSITY_DEPTH; j++)
-			accum[j] += ft_density_get(cm, j - distance)
-				- overflow;
-	}
+	/* Density tracking removed (was collapse-decision driven); no-op. */
 }
 
 /*
@@ -11032,28 +10912,12 @@ static inline void ft_child_density_contribution_all(
  * array instead of live metadata.  Used when the child has been freed.
  */
 static inline void ft_child_density_contribution_all_snapshot(
-		const unsigned long *density, unsigned int distance,
-		unsigned int child_footprint,
-		unsigned long *accum)
+		const unsigned long *density __attribute__((unused)),
+		unsigned int distance __attribute__((unused)),
+		unsigned int child_footprint __attribute__((unused)),
+		unsigned long *accum __attribute__((unused)))
 {
-	unsigned int j;
-
-	if (distance >= FT_NODE_DENSITY_DEPTH) {
-		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
-			accum[j] += child_footprint;
-		return;
-	}
-	{
-		unsigned long overflow =
-			density[FT_NODE_DENSITY_DEPTH - distance];
-
-		for (j = 0; j < distance; j++)
-			accum[j] += child_footprint
-				+ density[0] - overflow;
-		for (j = distance; j < FT_NODE_DENSITY_DEPTH; j++)
-			accum[j] += density[j - distance]
-				- overflow;
-	}
+	/* Density tracking removed (was collapse-decision driven); no-op. */
 }
 
 /*
@@ -11083,64 +10947,17 @@ static inline void ft_child_density_contribution_all_snapshot(
  * @first_anc_depth: depth of @first_anc (used when @start is NULL).
  */
 static
-void ft_propagate_density_replace(struct cds_ft *ft,
-		struct cds_ft_inode_flag *start,
-		unsigned int child_depth,
-		const unsigned long *old_density,
-		unsigned int old_fp,
-		struct cds_ft_metadata *new_meta,
-		unsigned int new_fp,
-		struct cds_ft_inode_flag *first_anc,
-		unsigned int first_anc_depth)
+void ft_propagate_density_replace(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_inode_flag *start __attribute__((unused)),
+		unsigned int child_depth __attribute__((unused)),
+		const unsigned long *old_density __attribute__((unused)),
+		unsigned int old_fp __attribute__((unused)),
+		struct cds_ft_metadata *new_meta __attribute__((unused)),
+		unsigned int new_fp __attribute__((unused)),
+		struct cds_ft_inode_flag *first_anc __attribute__((unused)),
+		unsigned int first_anc_depth __attribute__((unused)))
 {
-	struct cds_ft_inode_flag *anc;
-	unsigned int anc_depth;
-
-	if (start) {
-		struct cds_ft_metadata *sm = ft_flag_to_metadata(start);
-
-		anc = sm->parent;
-		if (!anc)
-			return;
-		anc_depth = child_depth
-			- ft_parent_depth_span(anc, start);
-	} else {
-		anc = first_anc;
-		anc_depth = first_anc_depth;
-	}
-
-	while (anc) {
-		struct cds_ft_metadata *am = ft_flag_to_metadata(anc);
-		unsigned int distance = child_depth - anc_depth;
-		unsigned int j;
-		unsigned long old_c[FT_NODE_DENSITY_DEPTH] = { 0 };
-		unsigned long new_c[FT_NODE_DENSITY_DEPTH] = { 0 };
-
-		if (distance > FT_NODE_DENSITY_DEPTH)
-			break;
-		if (old_density)
-			ft_child_density_contribution_all_snapshot(
-				old_density, distance, old_fp, old_c);
-		if (new_meta)
-			ft_child_density_contribution_all(
-				new_meta, distance, new_fp, new_c);
-		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++) {
-			long delta = (long) new_c[j] - (long) old_c[j];
-
-			if (delta > 0)
-				ft_density_add(ft, am, j, delta);
-			else if (delta < 0)
-				ft_density_sub(ft, am, j, (unsigned long) -delta);
-		}
-		{
-			struct cds_ft_inode_flag *parent = am->parent;
-
-			if (!parent)
-				break;
-			anc_depth -= ft_parent_depth_span(parent, anc);
-			anc = parent;
-		}
-	}
+	/* Density tracking removed (was collapse-decision driven); no-op. */
 }
 
 /*
@@ -11152,84 +10969,10 @@ void ft_propagate_density_replace(struct cds_ft *ft,
  * traversable nodes at levels j+1 through DEPTH below this node.
  */
 static
-void ft_init_node_density(struct cds_ft *ft,
-		struct cds_ft_inode_flag *node_flag)
+void ft_init_node_density(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_inode_flag *node_flag __attribute__((unused)))
 {
-	struct cds_ft_inode *node;
-	struct cds_ft_metadata *meta;
-	unsigned int key, j;
-	unsigned long accum[FT_NODE_DENSITY_DEPTH] = { 0 };
-
-	if (!node_flag)
-		return;
-	/*
-	 * Skip-compressed: initialize density on the underlying
-	 * compressed node.  Must check before ft_node_external
-	 * because a skip pointer with an external child has low
-	 * tag bits == 0.
-	 */
-	if (ft_node_skip_compressed(node_flag)) {
-		struct cds_ft_compressed_node *cn =
-			ft_skip_to_compressed(node_flag);
-		struct cds_ft_metadata *cn_meta =
-			cds_ft_item_to_metadata(
-				(struct cds_ft_inode *) cn);
-		struct cds_ft_inode_flag *child =
-			ft_skip_child_ptr(node_flag);
-
-		if (child && !ft_node_external(child)) {
-			if (cn->len <= FT_NODE_DENSITY_DEPTH) {
-				struct cds_ft_metadata *cm =
-					cds_ft_item_to_metadata(
-						ft_node_ptr(child));
-				ft_child_density_contribution_all(
-					cm, cn->len,
-					ft_node_readside_footprint(ft, child),
-					accum);
-			}
-		}
-		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
-			ft_density_set(ft, cn_meta, j, accum[j]);
-		return;
-	}
-	if (ft_node_external(node_flag))
-		return;
-	if (ft_node_compressed(node_flag)) {
-		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
-		struct cds_ft_metadata *cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
-
-		if (cn->child && !ft_node_external(cn->child)) {
-			if (cn->len <= FT_NODE_DENSITY_DEPTH) {
-				struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(cn->child));
-				ft_child_density_contribution_all(cm, cn->len,
-					ft_node_readside_footprint(ft, cn->child),
-					accum);
-			}
-		}
-		for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
-			ft_density_set(ft, cn_meta, j, accum[j]);
-		return;
-	}
-	/* Internal node: walk children (at distance 1). */
-	node = ft_node_ptr(node_flag);
-	meta = cds_ft_item_to_metadata(node);
-
-	for (key = 0; key < 256; key++) {
-		struct cds_ft_inode_flag *child = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
-
-		if (!child)
-			continue;
-		if (ft_node_external(child))
-			continue;
-		{
-			struct cds_ft_metadata *cm = cds_ft_item_to_metadata(ft_node_ptr(child));
-			ft_child_density_contribution_all(cm, 1,
-				ft_node_readside_footprint(ft, child),
-				accum);
-		}
-	}
-	for (j = 0; j < FT_NODE_DENSITY_DEPTH; j++)
-		ft_density_set(ft, meta, j, accum[j]);
+	/* Density tracking removed (was collapse-decision driven); no-op. */
 }
 
 /*
@@ -11274,45 +11017,13 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
  * Only called from the write-side (mutex-held).
  */
 static
-void ft_propagate_node_density_parent(struct cds_ft *ft,
-		struct cds_ft_inode_flag *start,
-		unsigned int start_depth,
-		unsigned int node_depth, long delta)
+void ft_propagate_node_density_parent(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_inode_flag *start __attribute__((unused)),
+		unsigned int start_depth __attribute__((unused)),
+		unsigned int node_depth __attribute__((unused)),
+		long delta __attribute__((unused)))
 {
-	struct cds_ft_inode_flag *cur = start;
-	unsigned int cur_depth = start_depth;
-
-	while (cur) {
-		struct cds_ft_metadata *m;
-		unsigned int distance;
-		struct cds_ft_inode_flag *parent;
-
-		if (cur_depth >= node_depth)
-			goto next;
-		distance = node_depth - cur_depth;
-		if (distance > FT_NODE_DENSITY_DEPTH)
-			break;
-
-		m = ft_flag_to_metadata(cur);
-		/*
-		 * Cumulative density: density[j] = footprint at
-		 * levels j+1..DEPTH.  A node at @distance
-		 * contributes to all density[0..distance-1].
-		 */
-		{
-			unsigned int j;
-
-			for (j = 0; j < distance; j++)
-				ft_density_add(ft, m, j, delta);
-		}
-next:
-		m = ft_flag_to_metadata(cur);
-		parent = m->parent;
-		if (!parent)
-			break;
-		cur_depth -= ft_parent_depth_span(parent, cur);
-		cur = parent;
-	}
+	/* Density tracking removed (was collapse-decision driven); no-op. */
 }
 
 
