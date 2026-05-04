@@ -5202,6 +5202,137 @@ int ft_qp16_node_recompact(struct cds_ft_qp16_node *new_node,
 }
 
 /*
+ * QP-nibble writer: recompact + insert in a single walk.
+ *
+ * Combines ft_qp16_node_recompact (drop tombstones) and an insert at
+ * @nibble in popcount order.  Saves an alloc on the -ENOSPC path:
+ * instead of "alloc new at same tier → recompact → still no room →
+ * alloc new at next tier → cow_insert", the caller goes "alloc at
+ * the speculative tier → recompact_and_insert" once.
+ *
+ * Caller has allocated @new_node (zeroed) at the tier whose capacity
+ * is at least the live-child popcount of @src_node + 1.  Publishing
+ * uses the same swap-parent-then-RCU-free protocol as cow_insert /
+ * recompact.
+ *
+ * Returns 0 on success, -EEXIST if @nibble is already set in
+ * @src_node (caller intended set_nth_safe instead), or -ENOSPC if the
+ * destination tier can't hold (live-children + 1).
+ */
+static __attribute__((unused))
+int ft_qp16_node_recompact_and_insert(struct cds_ft_qp16_node *new_node,
+		const struct cds_ft_qp16_node *src_node,
+		uint8_t nibble, struct cds_ft_inode_flag *child,
+		unsigned int new_capacity)
+{
+	uint16_t src_bm = src_node->bitmap;
+	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
+	uint16_t new_bm = 0;
+	unsigned int src_idx = 0, new_idx = 0;
+	unsigned int b;
+
+	if (src_bm & bit)
+		return -EEXIST;
+
+	for (b = 0; b < 16U; b++) {
+		struct cds_ft_inode_flag *p;
+
+		if (b == (nibble & 0xFU)) {
+			/* Insert here; src had no slot at this nibble. */
+			if (new_idx >= new_capacity)
+				return -ENOSPC;
+			new_node->ptrs[new_idx++] = child;
+			new_bm |= (uint16_t) (1U << b);
+			continue;
+		}
+		if (!(src_bm & (uint16_t) (1U << b)))
+			continue;
+		p = src_node->ptrs[src_idx++];
+		if (!p)
+			continue;	/* tombstone: drop */
+		if (new_idx >= new_capacity)
+			return -ENOSPC;
+		new_node->ptrs[new_idx++] = p;
+		new_bm |= (uint16_t) (1U << b);
+	}
+	new_node->bitmap = new_bm;
+	return 0;
+}
+
+/*
+ * QP-nibble allocator wrappers.  Thin layer over cds_ft_alloc_item /
+ * cds_ft_free_item that:
+ *   - returns the allocator's metadata alongside the node so callers
+ *     can avoid a redundant cds_ft_item_to_metadata round-trip;
+ *   - bumps the per-ft debug counters consistently with the byte-keyed
+ *     alloc_cds_ft_node / free_cds_ft_node helpers;
+ *   - documents the always-zeroed contract: the allocator delivers
+ *     zeroed memory, so bitmap = 0 and ptrs[] = NULL on return — this
+ *     matches the empty-node invariant ft_qp16_node_init asserts.
+ *
+ * @order is one of FT_QP16_T{0,1,2,3}_ALLOC_ORDER (or whatever the
+ * caller picks via ft_qp16_alloc_order from the live-child popcount).
+ * No bitmap arena slot is requested: QP nodes carry their bitmap
+ * inline in the header, unlike the byte-keyed FT_PIGEON / pool nodes
+ * where the bitmap lives at the page footer.
+ */
+static __attribute__((unused))
+struct cds_ft_qp16_node *ft_qp16_node_alloc(struct cds_ft *ft,
+		unsigned int order, struct cds_ft_metadata **meta_p)
+{
+	struct cds_ft_metadata *metadata;
+	struct cds_ft_qp16_node *node;
+
+	metadata = cds_ft_alloc_item(ft, (size_t) order, false);
+	if (!metadata)
+		return NULL;
+	node = (struct cds_ft_qp16_node *) cds_ft_metadata_to_item(metadata);
+	if (ft_debug_counters()) {
+		uatomic_inc(&ft->nr_nodes_allocated);
+		uatomic_inc(&ft->nr_internal_alloc);
+	}
+	*meta_p = metadata;
+	return node;
+}
+
+/*
+ * QP-nibble allocator: deferred (call_rcu) free of a published node.
+ * Use after the parent's slot has been atomically swapped to a new
+ * node — readers that captured the old slot will continue descending
+ * into @node and must complete a grace period before @node's memory
+ * can be reused.
+ */
+static __attribute__((unused))
+void ft_qp16_node_free_rcu(struct cds_ft *ft, struct cds_ft_qp16_node *node)
+{
+	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
+
+	cds_ft_free_item(ft, metadata);
+	if (ft_debug_counters() && node) {
+		uatomic_inc(&ft->nr_nodes_freed);
+		uatomic_inc(&ft->nr_internal_freed);
+	}
+}
+
+/*
+ * QP-nibble allocator: immediate free for a node that never escaped
+ * the writer's stack (e.g. a CoW destination abandoned mid-build by
+ * an -ENOMEM error path).  See cds_ft_free_item_unpublished for the
+ * safety contract.
+ */
+static __attribute__((unused))
+void ft_qp16_node_free_unpublished(struct cds_ft *ft, struct cds_ft_qp16_node *node)
+{
+	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
+
+	cds_ft_free_item_unpublished(ft, metadata);
+	if (ft_debug_counters() && node) {
+		uatomic_inc(&ft->nr_nodes_freed);
+		uatomic_inc(&ft->nr_internal_freed);
+	}
+}
+
+/*
  * QP-nibble byte-step descent — chains hi+lo to produce byte-keyed
  * get_nth semantics on a QP byte stage.  Caller passes the hi-nibble
  * head node; the helper does:
