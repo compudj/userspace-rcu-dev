@@ -9,4 +9,5 @@ dist_doc_DATA = rcu-api.md \
 		solaris-build.md \
 		uatomic-api.md \
 		fractal-trie-design.txt \
-		fractal-trie-design-combination.txt
+		fractal-trie-design-combination.txt \
+		design/qp-nibble-refactor.md

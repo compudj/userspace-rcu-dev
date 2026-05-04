@@ -1,6 +1,6 @@
 # Fractal Trie — QP-nibble Refactor Design Doc
 
-**Status**: WIP, branch `fractal-trie-dev-qp-wip`. Delete this file before merging to master.
+**Status**: WIP, branch `fractal-trie-dev-qp-wip`.
 
 This doc captures the QP-nibble refactor design so future sessions can pick up the work without re-litigating decisions. It is *not* an introduction to the FT — read `src/fractal-trie-internal.h`, `src/fractal-trie.c`, and the `FT_PIGEON` / `FT_POPCOUNT` paths first.
 
