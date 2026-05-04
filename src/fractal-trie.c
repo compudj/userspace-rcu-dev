@@ -2142,9 +2142,41 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 			parent_nf);
 		return;
 	}
-	rcu_assign_pointer(
-		cds_ft_item_to_metadata(ft_node_ptr(child_nf))->parent,
-		parent_nf);
+	{
+		struct cds_ft_metadata *child_meta =
+			cds_ft_item_to_metadata(ft_node_ptr(child_nf));
+
+		rcu_assign_pointer(child_meta->parent, parent_nf);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		/*
+		 * Populate skip-compress parent cache.  When the parent is a
+		 * compressed node with len <= FT_SKIP_PARENT_CACHE_LEN, copy
+		 * the first cn_len bytes of cn->key_bytes into the child's
+		 * metadata so cand-mode validation can verify against a
+		 * cache-hot CL without loading the cn header.  Longer cn
+		 * leave cn_len_cache = 0, falling back to the indirect path.
+		 *
+		 * NOTE (phase 1): cache mutation here is not RCU-safe under
+		 * concurrent reparent.  load-names builds before querying so
+		 * the bench is fine; production needs phase 2 (write-once
+		 * metadata with recompact-style replacement on reparent).
+		 */
+		if (parent_nf && ft_node_compressed(parent_nf)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(parent_nf);
+
+			if (cn->len <= FT_SKIP_PARENT_CACHE_LEN) {
+				memcpy(child_meta->cn_bytes_cache,
+					cn->key_bytes, cn->len);
+				child_meta->cn_len_cache = cn->len;
+			} else {
+				child_meta->cn_len_cache = 0;
+			}
+		} else {
+			child_meta->cn_len_cache = 0;
+		}
+#endif
+	}
 }
 
 /* Collapsed node accessors. */
@@ -2204,6 +2236,41 @@ static const uint8_t ft_col_stride_suffix_max[FT_COL_NR_STRIDES]
 	[FT_COL_STRIDE_NARROW]	= FT_COL_SUFFIX_MAX,
 	[FT_COL_STRIDE_WIDE]	= FT_COL_W_SUFFIX_MAX,
 };
+
+/*
+ * Fast-path variant of ft_flag_to_metadata for the lookup hot path.
+ *
+ * Avoids the out-of-line cds_ft_item_to_metadata() (which loads
+ * range->arena->item_len_order before computing the metadata
+ * address) by deriving item_len_order directly from the node tag
+ * bits where possible:
+ *   - internal: ft_types[ft_node_type(nf)].order (small const table).
+ *   - collapsed: ft_col_tier_alloc_order[tier(nf)] (4-entry table).
+ *   - compressed / external: fall back to the out-of-line path
+ *     (rare on the lookup hot path).
+ *
+ * Caller must ensure nf is not NULL.  Used by speculative-validated
+ * skip-compress prefetch and validation: the validation path reads
+ * cn_bytes_cache + cn_len_cache from the metadata, so dropping the
+ * arena CL load from the prefetch dependency chain is the point.
+ */
+static inline_lookup
+struct cds_ft_metadata *ft_flag_to_metadata_fast(struct cds_ft_inode_flag *nf)
+{
+	if (caa_likely(ft_node_internal(nf))) {
+		size_t order = ft_types[ft_node_type(nf)].order;
+
+		return cds_ft_item_to_metadata_fast(ft_node_ptr(nf), order);
+	}
+#ifdef FEATURE_FT_COLLAPSE
+	if (ft_node_collapsed(nf)) {
+		size_t order = ft_col_tier_alloc_order[ft_collapsed_tier(nf)];
+
+		return cds_ft_item_to_metadata_fast(ft_node_ptr(nf), order);
+	}
+#endif
+	return cds_ft_item_to_metadata(ft_node_ptr(nf));
+}
 
 /*
  * Capacity of a collapsed node at the given (tier, stride).  Narrow
@@ -8587,6 +8654,68 @@ enum ft_prefix_tracking {
 #define FT_MATCH_LEN_NONE	SIZE_MAX
 
 /*
+ * Deferred-validation skip records for speculative descent.
+ *
+ * When the descent runs in "candidate mode" (descend_cand=true), the
+ * code at compressed nodes does NOT compare cn->key_bytes against the
+ * lookup key — it just advances past the compressed path on a popcount-
+ * driven guess.  Validation must therefore confirm those skipped bytes
+ * before reporting CDS_FT_STATUS_OK.
+ *
+ * The traditional approach (cds_ft_group_attr_set_speculative_validated)
+ * compares the lookup key against the bytes stored in the external leaf,
+ * which forces a cold cacheline load on the leaf.  That cold load shows
+ * up as ~24% of cds_ft_lookup_key cycles in dns ft_specv_alloc benches.
+ *
+ * Skip records replace that with a per-skip log of (compressed_node_addr,
+ * lookup_key_offset, length).  Validation walks the log and compares
+ * lookup_key[offset..offset+len] against compressed_node_addr[0..len].
+ * Compressed-node bytes were already touched by the descent (they had
+ * to be read to learn cn->len), so the validation reads hit cache.  The
+ * external leaf is never loaded by the lookup itself; the caller chooses
+ * whether to dereference it.
+ *
+ * FT_MAX_SKIPS bounds the on-stack array; deeper tries that would need
+ * more skip slots fall back to status=NOT_FOUND for the speculative
+ * lookup so the caller re-runs in precise mode.
+ */
+#define FT_MAX_SKIPS	16
+
+/*
+ * Two skip-record kinds:
+ *
+ *   FT_SKIP_KIND_CN_BYTES — descent loaded the cn header CL (compressed
+ *     node, no skip-compress).  src points directly at cn->key_bytes
+ *     (RCU-protected, immutable post-publish).  Validation compares
+ *     lookup_key[key_off..] vs src[..len] without any extra CL load —
+ *     cn->key_bytes is on the same CL we already touched for cn->len.
+ *
+ *   FT_SKIP_KIND_META_CACHE — descent took a skip-compress slot and
+ *     never loaded the cn.  src points at the post-skip child's
+ *     metadata.  Validation reads metadata->cn_bytes_cache (and
+ *     metadata->cn_len_cache as a sanity check) — one extra CL load
+ *     per skip, but that CL is in FT-arena memory (NUMA-local, dense)
+ *     instead of in the cold external-leaf body.
+ */
+enum ft_skip_kind {
+	FT_SKIP_KIND_CN_BYTES = 0,
+	FT_SKIP_KIND_META_CACHE = 1,
+};
+
+struct ft_skip_record {
+	const void *src;	/* cn->key_bytes (CN_BYTES) or child metadata (META_CACHE) */
+	uint16_t key_off;	/* lookup-key offset where the skip starts */
+	uint8_t len;		/* number of bytes skipped (= cn->len at most) */
+	uint8_t kind;		/* enum ft_skip_kind */
+};
+
+struct ft_skip_records {
+	unsigned int count;
+	bool overflow;		/* set if a skip could not be recorded */
+	struct ft_skip_record entries[FT_MAX_SKIPS];
+};
+
+/*
  * Handle a compressed node during exact lookup descent.
  *
  * Compares key bytes against the compressed path, tracks
@@ -8606,7 +8735,8 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 		size_t *match_len_p, struct cds_ft_node **match_node_p,
 		struct cds_ft_node **found_ret,
 		enum cds_ft_status *status_ret,
-		bool candidate)
+		bool candidate,
+		struct ft_skip_records *skips)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	const uint8_t *key = *key_p;
@@ -8631,6 +8761,12 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 	/*
 	 * In candidate mode, skip key comparison — just advance past
 	 * the compressed path.  The caller verifies the key at the leaf.
+	 *
+	 * If a skip-records buffer was supplied, log this skip for
+	 * deferred validation against compressed-node bytes (which the
+	 * descent has touched and are hot in cache) instead of cold-loading
+	 * the external leaf.  Overflow (more than FT_MAX_SKIPS skips) is
+	 * recorded so the caller can fall back to leaf-bytes validation.
 	 */
 	if (!candidate) {
 		if (track_longest) {
@@ -8652,6 +8788,16 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 				*status_ret = CDS_FT_STATUS_NOT_FOUND;
 				return FT_DESCENT_END;
 			}
+		}
+	} else if (skips) {
+		if (caa_likely(skips->count < FT_MAX_SKIPS)) {
+			struct ft_skip_record *r = &skips->entries[skips->count++];
+			r->src = cn->key_bytes;
+			r->key_off = (uint16_t) i;
+			r->len = (uint8_t) cmp_len;
+			r->kind = FT_SKIP_KIND_CN_BYTES;
+		} else {
+			skips->overflow = true;
 		}
 	}
 	if (cn->len > remaining_key) {
@@ -9156,6 +9302,14 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	bool skip_compressed = ft_group_skip_compressed(ft->group);
 	size_t match_len = track_longest ? FT_MATCH_LEN_NONE : 0;
 	struct cds_ft_node *match_node = NULL;
+	struct ft_skip_records skips;
+	struct ft_skip_records *skips_p = NULL;
+
+	if (spec_validate) {
+		skips.count = 0;
+		skips.overflow = false;
+		skips_p = &skips;
+	}
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
@@ -9251,6 +9405,41 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					iter_path_node(iter)[i] = node_flag;
 					iter_path_len = i + 1;
 				}
+				if (skips_p && node_flag) {
+					if (caa_likely(skips_p->count < FT_MAX_SKIPS)) {
+						struct ft_skip_record *r =
+							&skips_p->entries[skips_p->count++];
+						r->src = node_flag;
+						r->key_off = (uint16_t) (i - skip);
+						r->len = (uint8_t) skip;
+						r->kind = FT_SKIP_KIND_META_CACHE;
+						if (caa_likely(!ft_node_external(node_flag))) {
+							/*
+							 * Internal/collapsed child:
+							 * prefetch metadata CL via
+							 * the inline-fast getter so
+							 * the prefetch's address is
+							 * not gated by an arena CL
+							 * load.
+							 */
+							__builtin_prefetch(
+								ft_flag_to_metadata_fast(
+									node_flag));
+						} else {
+							/*
+							 * External child: leaf is
+							 * here; prefetch the key
+							 * bytes range we'll compare.
+							 */
+							__builtin_prefetch(
+								(const uint8_t *) ft_node_ptr(node_flag) +
+								ft->group->speculative_key_offset +
+								(i - skip));
+						}
+					} else {
+						skips_p->overflow = true;
+					}
+				}
 				/*
 				 * If the skip's child is external and
 				 * we've consumed the full key, exit the
@@ -9279,7 +9468,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
 					&match_len, &match_node, &found, &status,
-					descend_cand);
+					descend_cand, skips_p);
 				if (act == FT_DESCENT_END)
 					goto end;
 				if (act == FT_DESCENT_BREAK)
@@ -9363,6 +9552,41 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				key += skip;
 				i += skip;
 				node_flag = ft_skip_child_ptr(node_flag);
+				if (skips_p && node_flag) {
+					if (caa_likely(skips_p->count < FT_MAX_SKIPS)) {
+						struct ft_skip_record *r =
+							&skips_p->entries[skips_p->count++];
+						r->src = node_flag;
+						r->key_off = (uint16_t) (i - skip);
+						r->len = (uint8_t) skip;
+						r->kind = FT_SKIP_KIND_META_CACHE;
+						if (caa_likely(!ft_node_external(node_flag))) {
+							/*
+							 * Internal/collapsed child:
+							 * prefetch metadata CL via
+							 * the inline-fast getter so
+							 * the prefetch's address is
+							 * not gated by an arena CL
+							 * load.
+							 */
+							__builtin_prefetch(
+								ft_flag_to_metadata_fast(
+									node_flag));
+						} else {
+							/*
+							 * External child: leaf is
+							 * here; prefetch the key
+							 * bytes range we'll compare.
+							 */
+							__builtin_prefetch(
+								(const uint8_t *) ft_node_ptr(node_flag) +
+								ft->group->speculative_key_offset +
+								(i - skip));
+						}
+					} else {
+						skips_p->overflow = true;
+					}
+				}
 			}
 		}
 		if (iter) {
@@ -9467,24 +9691,117 @@ end:
 	 */
 	if (spec_validate && status == CDS_FT_STATUS_OK && found) {
 		const struct cds_ft_group *group = ft->group;
-		const uint8_t *stored_key =
-			(const uint8_t *) found + group->speculative_key_offset;
+		const uint8_t *leaf_key = NULL;
 		bool match = true;
 
-		if (group->speculative_key_len_offset !=
-				CDS_FT_SPECULATIVE_OFFSET_NONE) {
-			size_t stored_len = *(const size_t *)
-				((const uint8_t *) found +
-				 group->speculative_key_len_offset);
-			if (stored_len != _key_len)
+		if (caa_unlikely(skips.overflow)) {
+			/*
+			 * Too many recorded skips: fall back to a single full
+			 * leaf-bytes compare.  Depth-equals-stored-len is a
+			 * trie invariant, so no separate stored_len check is
+			 * needed.
+			 */
+			leaf_key = (const uint8_t *) found +
+					group->speculative_key_offset;
+			if (key_len > 0 &&
+			    ft_key_cmp_ordinals(orig_key, leaf_key,
+					(unsigned int) key_len,
+					(unsigned int) key_len,
+					false, NULL) != 0)
 				match = false;
+		} else {
+			unsigned int s;
+
+			/*
+			 * Pass 1: validate cache-hit records (CN_BYTES and
+			 * META_CACHE with populated cache).  Records that
+			 * need leaf bytes (cache empty / external child) are
+			 * deferred to pass 2.  On the first deferral, issue
+			 * a prefetch on the leaf key region so pass 1's
+			 * cache reads hide its latency.
+			 */
+			for (s = 0; s < skips.count; s++) {
+				const struct ft_skip_record *r = &skips.entries[s];
+				const uint8_t *cmp_src;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				if (r->kind == FT_SKIP_KIND_META_CACHE) {
+					struct cds_ft_inode_flag *child_nf =
+						(struct cds_ft_inode_flag *) r->src;
+
+					if (ft_node_external(child_nf)) {
+						if (!leaf_key) {
+							leaf_key = (const uint8_t *) found +
+								group->speculative_key_offset;
+							__builtin_prefetch(leaf_key + r->key_off);
+						}
+						continue;
+					}
+					{
+						struct cds_ft_metadata *meta =
+							ft_flag_to_metadata_fast(child_nf);
+
+						if (caa_likely(meta->cn_len_cache == r->len)) {
+							cmp_src = meta->cn_bytes_cache;
+						} else {
+							if (!leaf_key) {
+								leaf_key = (const uint8_t *) found +
+									group->speculative_key_offset;
+								__builtin_prefetch(leaf_key + r->key_off);
+							}
+							continue;
+						}
+					}
+				} else
+#endif
+				{
+					cmp_src = (const uint8_t *) r->src;
+				}
+				if (ft_key_cmp_ordinals(orig_key + r->key_off,
+						cmp_src, r->len, r->len,
+						false, NULL) != 0) {
+					match = false;
+					break;
+				}
+			}
+
+			/*
+			 * Pass 2: piecewise leaf-bytes compare for records
+			 * deferred above.  Only runs if pass 1 succeeded and
+			 * at least one record needed leaf bytes.
+			 */
+			if (match && leaf_key) {
+				for (s = 0; s < skips.count; s++) {
+					const struct ft_skip_record *r = &skips.entries[s];
+					bool needs_leaf = false;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+					if (r->kind == FT_SKIP_KIND_META_CACHE) {
+						struct cds_ft_inode_flag *child_nf =
+							(struct cds_ft_inode_flag *) r->src;
+
+						if (ft_node_external(child_nf)) {
+							needs_leaf = true;
+						} else {
+							struct cds_ft_metadata *meta =
+								ft_flag_to_metadata_fast(child_nf);
+
+							needs_leaf = (meta->cn_len_cache != r->len);
+						}
+					}
+#endif
+					if (!needs_leaf)
+						continue;
+					if (ft_key_cmp_ordinals(orig_key + r->key_off,
+							leaf_key + r->key_off,
+							r->len, r->len,
+							false, NULL) != 0) {
+						match = false;
+						break;
+					}
+				}
+			}
 		}
-		if (match && key_len > 0 &&
-		    ft_key_cmp_ordinals(orig_key, stored_key,
-				(unsigned int) key_len,
-				(unsigned int) key_len,
-				false, NULL) != 0)
-			match = false;
 		if (!match) {
 			found = NULL;
 			status = CDS_FT_STATUS_NOT_FOUND;
@@ -24550,6 +24867,7 @@ struct cds_ft_stats {
 	struct cds_ft_stats_level level[FT_MAX_DEPTH];
 	uint64_t collapsed_nr_entries_dist[FT_COLLAPSE_NR_ENTRIES_BUCKETS];
 	uint64_t collapsed_suffix_len_dist[FT_COLLAPSE_SLEN_MAX_BIN + 1];
+	uint64_t compressed_len_dist[256];
 };
 
 enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft)
@@ -24700,6 +25018,7 @@ void calc_stats_collapsed(const struct cds_ft *ft,
 				ft_compressed_node_ptr(child);
 			unsigned int k;
 
+			stats->compressed_len_dist[cn->len]++;
 			stats->level[child_level].nr_internal_nodes++;
 			stats->level[child_level].nr_compressed_nodes++;
 			stats->level[child_level].has_nodes = true;
@@ -24793,6 +25112,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 			int j;
 
+			stats->compressed_len_dist[cn->len]++;
 			stats->level[level].nr_internal_nodes++;
 			stats->level[level].nr_compressed_nodes++;
 			stats->level[level].has_nodes = true;
@@ -24963,6 +25283,43 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 				}
 				fprintf(out, "\n");
 			}
+		}
+	}
+	{
+		uint64_t cn_total = 0;
+		uint64_t cumulative = 0;
+		unsigned int n;
+
+		for (n = 1; n < 256; n++)
+			cn_total += stats->compressed_len_dist[n];
+		if (cn_total) {
+			fprintf(out,
+				"Compressed nodes (trie-wide, distinct cn): %"
+				PRIu64 "\n", cn_total);
+			print_indent(out, 1);
+			fprintf(out, "cn->len distribution:");
+			for (n = 1; n < 256; n++) {
+				if (stats->compressed_len_dist[n])
+					fprintf(out, " [%u]=%" PRIu64,
+						n,
+						stats->compressed_len_dist[n]);
+			}
+			fprintf(out, "\n");
+			print_indent(out, 1);
+			fprintf(out, "cn->len <= K cumulative %%:");
+			for (n = 1; n < 256; n++) {
+				cumulative += stats->compressed_len_dist[n];
+				if (n == 4 || n == 8 || n == 12 ||
+				    n == 16 || n == 20 || n == 24 ||
+				    n == 32 || n == 48 || n == 64 ||
+				    n == 96 || n == 128) {
+					fprintf(out, " <=%u: %.1f%%",
+						n,
+						100.0 * (double) cumulative
+							/ (double) cn_total);
+				}
+			}
+			fprintf(out, "\n");
 		}
 	}
 	fprintf(out, "---------------------------------------------------\n");
