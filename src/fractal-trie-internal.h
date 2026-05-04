@@ -259,6 +259,29 @@
 #endif
 
 /*
+ * FEATURE_FT_QP: nibble-popcount internal node layout (Phase 2 WIP).
+ *
+ * Replaces the LINEAR / POOL / byte_popcount_1l / nibble_popcount_2l
+ * internal-node families with two unified types:
+ *
+ *   - QP-nibble : 16-bit popcount bitmap + popcount-indexed pointer
+ *                 array.  Each level dispatches on one nibble (4 bits).
+ *                 Multiple size tiers driven by popcount(bitmap).
+ *   - PIGEON    : direct ptrs[256] (unchanged from the existing
+ *                 implementation; promoted to from QP-nibble pairs
+ *                 when the byte-level fan-out crosses a threshold).
+ *
+ * Trie depth doubles for byte-keyed inputs (each byte becomes two
+ * nibble levels); the depth-doubling cost at runs is absorbed by
+ * skip-compressed pointers, which collapse compressed-node chains
+ * out of the read-side descent on architectures that support them.
+ *
+ * Off by default while the layout is being introduced.  Enable with
+ * -DFEATURE_FT_QP.  When undefined, none of the QP-nibble code is
+ * reachable from any execution path.
+ */
+
+/*
  * Skip-compressed pointers encode the compressed path length in the
  * high bits of pointers (bits 57-63).  This requires architectures
  * where those bits are guaranteed zero for userspace pointers.
@@ -500,6 +523,58 @@ struct cds_ft_compressed_node {
 	uint8_t len;				/* Number of key bytes in path (1-255). */
 	uint8_t key_bytes[];			/* Compressed key path (flexible array). */
 };
+
+#ifdef FEATURE_FT_QP
+/*
+ * QP-nibble internal node — 16-bit popcount bitmap + popcount-indexed
+ * pointer array.  Each level dispatches on one nibble (4 bits, values
+ * 0..15).  Lookup is:
+ *
+ *   if (!(bitmap & (1u << n))) return NULL;
+ *   idx = popcount(bitmap & ((1u << n) - 1u));
+ *   return ptrs[idx];
+ *
+ * Two dependent loads on the hot path: bitmap (in the header CL) and
+ * ptrs[idx] (in the pointer-array CL — typically the same CL for the
+ * smaller tiers).
+ *
+ * Tier sizing (popcount → alloc):
+ *
+ *   T0 (32B):  popcount  ≤ 3   (header 8B + 3 × 8B  = 32B)
+ *   T1 (64B):  popcount  ≤ 7   (header 8B + 7 × 8B  = 64B)
+ *   T2 (128B): popcount ≤ 15   (header 8B + 15 × 8B = 128B)
+ *   T3 (256B): popcount  = 16  (header 8B + 16 × 8B = 136B; padded to 256B)
+ *
+ * popcount = 0 is valid only for the root node of an empty trie
+ * (no parent slot exists to clear).  Non-root internal nodes never
+ * reach popcount = 0: when a removal would drop nr_child to 0, the
+ * detach path replaces the node in its grandparent's slot and frees
+ * it.  popcount = 1 is common at byte-aligned compressed boundaries
+ * (high-nibble level when the parent compressed node ends mid-byte)
+ * and at root before the second key is inserted.
+ *
+ * The 8-byte header reserves 6 bytes after the bitmap for future
+ * fields (keep_alive markers, write-side metadata, debug counters,
+ * etc.).  Today they're padding; the SoA layout means the SIMD-shape
+ * scanners can ignore them.
+ */
+#define FT_QP16_HEADER_SIZE	8U
+#define FT_QP16_NR_TIERS	4U
+#define FT_QP16_T0_CAPACITY	3U
+#define FT_QP16_T0_ALLOC_ORDER	5U	/* 32B */
+#define FT_QP16_T1_CAPACITY	7U
+#define FT_QP16_T1_ALLOC_ORDER	6U	/* 64B */
+#define FT_QP16_T2_CAPACITY	15U
+#define FT_QP16_T2_ALLOC_ORDER	7U	/* 128B */
+#define FT_QP16_T3_CAPACITY	16U
+#define FT_QP16_T3_ALLOC_ORDER	8U	/* 256B */
+
+struct cds_ft_qp16_node {
+	uint16_t bitmap;			/* bytes 0-1: nibble-presence bitmap */
+	uint8_t  _pad[FT_QP16_HEADER_SIZE - 2];	/* bytes 2-7: reserved */
+	struct cds_ft_inode_flag *ptrs[];	/* bytes 8+: popcount(bitmap) entries */
+} __attribute__((__aligned__(8)));
+#endif /* FEATURE_FT_QP */
 
 struct cds_ft_bitmap {
 	/*

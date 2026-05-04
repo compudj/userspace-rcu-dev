@@ -4732,6 +4732,83 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
 	return ft_pigeon_node_get_nth(type, node, NULL, i, FT_PF_NONE);
 }
 
+#ifdef FEATURE_FT_QP
+/*
+ * QP-nibble read-side scanner.  Two dependent loads on the hot path:
+ *   1. acquire-load bitmap (header CL)
+ *   2. acquire-load ptrs[idx] (pointer-array CL — same CL as bitmap
+ *      for tiers T0/T1)
+ *
+ * @nibble must be in 0..15.  Returns the child pointer, or NULL if
+ * the nibble has no child (bit clear in bitmap).  When @ptr_slot_p
+ * is non-NULL, also returns the address of the pointer slot — used
+ * by writers that need to atomically rewrite the slot (e.g. graft,
+ * recompact-publish).  Pure-read callers pass NULL.
+ *
+ * The bitmap acquire-load synchronizes-with the writer's release-
+ * publish of either the bitmap (on widening insert) or a freshly-
+ * written ptrs[] slot (on in-place insert).  Pointer-array slot is
+ * loaded with a separate acquire to pick up the publication of the
+ * actual child.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_qp16_node_get_nth(
+		struct cds_ft_qp16_node *node,
+		struct cds_ft_inode_flag ***ptr_slot_p,
+		uint8_t nibble, enum ft_pf_target pf_hint)
+{
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_ACQUIRE);
+	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
+
+	if (!(bm & bit)) {
+		if (caa_unlikely(ptr_slot_p))
+			*ptr_slot_p = NULL;
+		return NULL;
+	}
+	{
+		unsigned int idx = (unsigned int)
+			__builtin_popcount((unsigned int) (bm & (bit - 1U)));
+		struct cds_ft_inode_flag **slot = &node->ptrs[idx];
+
+		if (caa_unlikely(ptr_slot_p))
+			*ptr_slot_p = slot;
+		return ft_dereference_acquire_prefetch_hint(*slot, pf_hint);
+	}
+}
+
+/*
+ * QP-nibble alloc-order picker — maps popcount(bitmap) to the
+ * smallest tier whose capacity fits.  Used by writers to size newly
+ * allocated nodes; declared static-inline here so the compiler can
+ * fold it into a chain of compares (or a lookup table) at the call
+ * site.
+ */
+static inline
+unsigned int ft_qp16_alloc_order(unsigned int popcount)
+{
+	if (popcount <= FT_QP16_T0_CAPACITY)
+		return FT_QP16_T0_ALLOC_ORDER;
+	if (popcount <= FT_QP16_T1_CAPACITY)
+		return FT_QP16_T1_ALLOC_ORDER;
+	if (popcount <= FT_QP16_T2_CAPACITY)
+		return FT_QP16_T2_ALLOC_ORDER;
+	return FT_QP16_T3_ALLOC_ORDER;
+}
+
+/*
+ * QP-nibble nr_child accessor — popcount of the bitmap.  Bitmap
+ * field is read with CMM_RELAXED; callers that need acquire ordering
+ * use ft_qp16_node_get_nth above (which acquires through the bitmap
+ * load).
+ */
+static inline
+unsigned int ft_qp16_node_nr_child(const struct cds_ft_qp16_node *node)
+{
+	return (unsigned int) __builtin_popcount(
+			(unsigned int) uatomic_load(&node->bitmap, CMM_RELAXED));
+}
+#endif /* FEATURE_FT_QP */
+
 /*
  * ft_node_get_nth: get nth item from a node.
  * node_flag is already rcu_dereference'd.
