@@ -1415,12 +1415,6 @@ bool ft_node_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
 }
 #endif
 
-static
-bool ft_node_collapsed(struct cds_ft_inode_flag *node __attribute__((unused)))
-{
-	return false;
-}
-
 /*
  * ft_metadata_set_external_nodes: set external_nodes on a node's metadata.
  * Asserts that the node is not a compressed node (compressed nodes
@@ -1552,9 +1546,8 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
 	if (_ft_node_mask_ptr(node) == NULL) {
 		return NODE_INDEX_NULL;
 	}
-	/* Compressed and collapsed nodes don't have a type index. */
+	/* Compressed nodes don't have a type index. */
 	assert(!ft_node_compressed(node));
-	assert(!ft_node_collapsed(node));
 	type = (unsigned int) (((unsigned long) node & FT_TYPE_MASK) >> FT_INTERNAL_BITS);
 	assert(type < (1UL << FT_TYPE_BITS));
 	return type;
@@ -8684,8 +8677,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		 * Fall back to the slow path.
 		 */
 		if (ft_node_compressed(node_flag) ||
-		    ft_node_skip_compressed(node_flag) ||
-		    ft_node_collapsed(node_flag)) {
+		    ft_node_skip_compressed(node_flag)) {
 			node_flag = ft_dereference_prefetch(ft->root);
 			iter_key = input_key;
 			goto slow_path;
@@ -8892,8 +8884,7 @@ going_up:
 		    !ft_node_external(iter_path_node(iter)[level])) {
 			struct cds_ft_metadata *metadata;
 
-			if (ft_node_compressed(iter_path_node(iter)[level]) ||
-			    ft_node_collapsed(iter_path_node(iter)[level]))
+			if (ft_node_compressed(iter_path_node(iter)[level]))
 				metadata = cds_ft_item_to_metadata(
 					ft_node_ptr(iter_path_node(iter)[level]));
 			else {
@@ -10723,8 +10714,7 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 		if (cn->child &&
 		    (ft_node_skip_compressed(cn->child) ||
 		     ft_node_internal(cn->child) ||
-		     ft_node_compressed(cn->child) ||
-		     ft_node_collapsed(cn->child))) {
+		     ft_node_compressed(cn->child))) {
 			ft_snapshot_push(snapshot, snapshot_depth,
 				*nr_snapshot_p, d->nf, d->depth);
 			ft_descent_traverse_compressed(d, cn, iter_key_p);
@@ -11575,7 +11565,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 * for internal parents (compressed/collapsed are
 			 * handled separately below).
 			 */
-			if (!ft_node_compressed(cur) && !ft_node_collapsed(cur))
+			if (!ft_node_compressed(cur))
 				ft_node_find_child(cur, *detach_node_flag_ptr,
 					&n, NULL);
 			break;
@@ -11779,12 +11769,11 @@ int ft_detach_node(struct cds_ft *ft,
 
 	/*
 	 * Update address of parent ptr in its parent.
-	 * Skip for compressed/collapsed parents: the replacement was
+	 * Skip for compressed parents: the replacement was
 	 * already published inline above.
 	 */
 	if (!ft_node_compressed(iter_node_flag) &&
-	    !ft_node_skip_compressed(iter_node_flag) &&
-	    !ft_node_collapsed(iter_node_flag)) {
+	    !ft_node_skip_compressed(iter_node_flag)) {
 		struct cds_ft_metadata *iter_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
 
