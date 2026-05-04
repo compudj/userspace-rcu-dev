@@ -4936,6 +4936,201 @@ struct cds_ft_inode_flag *ft_qp16_node_get_extremum(
 		return ft_dereference_acquire(node->ptrs[idx]);
 	}
 }
+
+/*
+ * QP-nibble writer: initialize a freshly-allocated node.  Allocator
+ * delivers zeroed memory (bitmap = 0, ptrs[] = NULL); this helper is
+ * a relaxed-store no-op that documents the invariant.
+ */
+static inline
+void ft_qp16_node_init(struct cds_ft_qp16_node *node)
+{
+	uatomic_store(&node->bitmap, (uint16_t) 0, CMM_RELAXED);
+}
+
+/*
+ * QP-nibble writer: insert / replace / revive in-place.
+ *
+ *   - Bit already set (live or tombstone): rcu_assign_pointer the
+ *     slot.  This handles graft-replace and re-insert at a previously
+ *     deleted nibble uniformly.  The bitmap is not touched.
+ *
+ *   - Bit not set, safe-append (no higher bit set in the bitmap):
+ *     bitmap |= bit (relaxed) FIRST, then rcu_assign_pointer the
+ *     slot.  Safety: the slot at popcount(bm) was zeroed at
+ *     allocation and never written since (the bitmap monotonically
+ *     grows under this design — delete is a slot-NULL, not a bit
+ *     clear), so a reader that observes the new bit and races to
+ *     the slot sees either NULL (returns not-found) or the new
+ *     child (returns found).  rcu_assign_pointer is the publishing
+ *     release.
+ *
+ *   - Bit not set, non-safe-append: returns -ERANGE.  Caller falls
+ *     back to CoW (ft_qp16_node_cow_insert) — building a new node
+ *     with the inserted slot in popcount order avoids the race that
+ *     in-place insertion-in-the-middle would create on existing
+ *     slot indices above @nibble.
+ *
+ *   - Capacity exhaustion (popcount == @capacity, bit not set):
+ *     returns -ENOSPC.  Caller recompacts — building a fresh node
+ *     of appropriate tier, dropping tombstones in the process.
+ *
+ * @capacity is the node's tier capacity (T0..T3 → 3, 7, 15, 16);
+ * caller derives it from the parent's pointer-tag bookkeeping.
+ */
+static inline
+int ft_qp16_node_set_nth_safe(struct cds_ft_qp16_node *node,
+		uint8_t nibble, struct cds_ft_inode_flag *child,
+		unsigned int capacity)
+{
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
+	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
+	unsigned int idx;
+
+	if (bm & bit) {
+		/* Replace live or revive tombstone — bitmap unchanged. */
+		idx = (unsigned int) __builtin_popcount(
+				(unsigned int) (bm & (bit - 1U)));
+		rcu_assign_pointer(node->ptrs[idx], child);
+		return 0;
+	}
+	/* Bit not set — must be safe-append. */
+	if (bm & (uint16_t) ~((1U << (nibble & 0xFU)) - 1U))
+		return -ERANGE;	/* higher bit already set; not safe-append */
+	idx = (unsigned int) __builtin_popcount((unsigned int) bm);
+	if (idx >= capacity)
+		return -ENOSPC;
+	uatomic_store(&node->bitmap, (uint16_t) (bm | bit), CMM_RELAXED);
+	rcu_assign_pointer(node->ptrs[idx], child);
+	return 0;
+}
+
+/*
+ * QP-nibble writer: tombstone-style delete.
+ *
+ * The bitmap bit is left set; only the pointer slot is NULL'd (via
+ * rcu_assign_pointer, store-release).  Readers that observe the
+ * (still-set) bit acquire-load the slot and see either the old child
+ * (still RCU-valid, will be reclaimed after the matching grace
+ * period at the deletion site) or NULL (return not-found).
+ *
+ * The bitmap doubles as a pre-filter: a clear bit guarantees absence;
+ * a set bit only indicates "may be present", with the slot load as
+ * the source of truth.  Same pattern as FT_PIGEON's bitmap_scan path.
+ *
+ * Returns -ENOENT if the bit is clear or the slot is already NULL
+ * (idempotent).  Recompaction (recovering tombstoned slots into a
+ * tighter bitmap) happens when set_nth_safe returns -ENOSPC.
+ */
+static inline
+int ft_qp16_node_clear_nth(struct cds_ft_qp16_node *node, uint8_t nibble)
+{
+	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
+	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
+	unsigned int idx;
+
+	if (!(bm & bit))
+		return -ENOENT;
+	idx = (unsigned int) __builtin_popcount(
+			(unsigned int) (bm & (bit - 1U)));
+	if (!node->ptrs[idx])
+		return -ENOENT;
+	rcu_assign_pointer(node->ptrs[idx], NULL);
+	return 0;
+}
+
+/*
+ * QP-nibble writer: copy-on-write insert for the non-safe-append
+ * fallback.  Caller has allocated @new_node (zeroed via
+ * ft_qp16_node_init or allocator) and passes the source @src_node
+ * (still published; readers may be concurrently descending it).
+ *
+ * Walks the new bitmap (src_bm | bit) in popcount order; for each
+ * set bit either copies the corresponding ptrs[] entry from src
+ * (preserving tombstones — NULL slots stay NULL) or substitutes
+ * @child at the inserted nibble.  All stores are plain (the
+ * destination is unpublished); caller publishes by atomically
+ * swapping the parent's child pointer and RCU-freeing @src_node.
+ *
+ * Returns 0 on success, -EEXIST if @nibble is already set in the
+ * source bitmap (caller should have used set_nth_safe), or -ENOSPC
+ * if the destination tier is too small for popcount(new_bm).
+ *
+ * Recompact (tombstone-cleanup) is a separate op: it walks src
+ * dropping NULL slots; not in this helper.
+ */
+static
+int ft_qp16_node_cow_insert(struct cds_ft_qp16_node *new_node,
+		const struct cds_ft_qp16_node *src_node,
+		uint8_t nibble, struct cds_ft_inode_flag *child,
+		unsigned int new_capacity)
+{
+	uint16_t src_bm = src_node->bitmap;
+	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
+	uint16_t new_bm;
+	unsigned int src_idx = 0, new_idx = 0;
+	unsigned int b;
+
+	if (src_bm & bit)
+		return -EEXIST;
+	new_bm = (uint16_t) (src_bm | bit);
+	if ((unsigned int) __builtin_popcount((unsigned int) new_bm)
+			> new_capacity)
+		return -ENOSPC;
+
+	for (b = 0; b < 16U; b++) {
+		uint16_t mask = (uint16_t) (1U << b);
+
+		if (b == (nibble & 0xFU)) {
+			new_node->ptrs[new_idx++] = child;
+			continue;
+		}
+		if (src_bm & mask)
+			new_node->ptrs[new_idx++] = src_node->ptrs[src_idx++];
+	}
+	new_node->bitmap = new_bm;
+	return 0;
+}
+
+/*
+ * QP-nibble writer: recompact a node into @new_node, dropping
+ * tombstones (NULL slots).  Walks src in popcount order; emits only
+ * slots whose ptr is non-NULL, building the corresponding tightened
+ * bitmap.
+ *
+ * Caller has allocated @new_node (zeroed) at a tier sized for the
+ * live-child popcount (recompute via ft_qp16_alloc_order); publishing
+ * is the same swap-parent-then-RCU-free pattern as cow_insert.
+ *
+ * Returns 0 on success, -ENOSPC if the destination tier can't hold
+ * the live-child popcount.
+ */
+static
+int ft_qp16_node_recompact(struct cds_ft_qp16_node *new_node,
+		const struct cds_ft_qp16_node *src_node,
+		unsigned int new_capacity)
+{
+	uint16_t src_bm = src_node->bitmap;
+	uint16_t new_bm = 0;
+	unsigned int src_idx = 0, new_idx = 0;
+	unsigned int b;
+
+	for (b = 0; b < 16U; b++) {
+		struct cds_ft_inode_flag *p;
+
+		if (!(src_bm & (uint16_t) (1U << b)))
+			continue;
+		p = src_node->ptrs[src_idx++];
+		if (!p)
+			continue;	/* tombstone: drop */
+		if (new_idx >= new_capacity)
+			return -ENOSPC;
+		new_node->ptrs[new_idx++] = p;
+		new_bm |= (uint16_t) (1U << b);
+	}
+	new_node->bitmap = new_bm;
+	return 0;
+}
 #endif /* FEATURE_FT_QP */
 
 /*
