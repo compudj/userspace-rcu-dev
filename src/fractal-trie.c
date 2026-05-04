@@ -5200,6 +5200,237 @@ int ft_qp16_node_recompact(struct cds_ft_qp16_node *new_node,
 	new_node->bitmap = new_bm;
 	return 0;
 }
+
+/*
+ * QP-nibble byte-step descent — chains hi+lo to produce byte-keyed
+ * get_nth semantics on a QP byte stage.  Caller passes the hi-nibble
+ * head node; the helper does:
+ *
+ *   1. hi descend (untagged lo-node ptr; bitmap is pre-filter, slot
+ *      load is acquire and authoritative).  NULL → byte absent.
+ *   2. lo descend on the resolved lo-node (tagged child; tag dispatch
+ *      and prefetch hint applied).  NULL → byte absent (clear bit or
+ *      tombstone slot).
+ *
+ * @ptr_slot_p, when non-NULL, returns the *lo-side* pointer slot — the
+ * one a graft / replace caller would overwrite.  The hi-side slot
+ * holds the lo-node and is not exposed: byte-level mutations operate
+ * at the lo level.  Pure-read callers pass NULL.
+ *
+ * Two acquire-loads on the slot path; the bitmap pre-filters keep the
+ * early-NULL exits predictable.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_qp_byte_get(
+		struct cds_ft_qp16_node *hi,
+		struct cds_ft_inode_flag ***ptr_slot_p,
+		uint8_t byte, enum ft_pf_target pf_hint)
+{
+	struct cds_ft_inode_flag *lo_flag;
+	struct cds_ft_qp16_node *lo;
+
+	lo_flag = ft_qp16_node_descend(hi, NULL,
+			(uint8_t) (byte >> 4), FT_PF_NONE, 0);
+	if (caa_unlikely(!lo_flag)) {
+		if (caa_unlikely(ptr_slot_p))
+			*ptr_slot_p = NULL;
+		return NULL;
+	}
+	lo = (struct cds_ft_qp16_node *) lo_flag;
+	return ft_qp16_node_descend(lo, ptr_slot_p,
+			(uint8_t) (byte & 0xFU), pf_hint, 1);
+}
+
+/*
+ * QP-nibble byte-step directional lookup — return the next/prev byte
+ * with a live child relative to @byte_in, and that child.
+ *
+ * @dir == FT_RIGHT: smallest byte strictly greater than @byte_in.
+ * @dir == FT_LEFT:  largest byte strictly less than @byte_in.
+ *
+ * Sentinel inputs (matching the byte-keyed get_minmax convention):
+ *   @byte_in == -1  with FT_RIGHT → leftmost (smallest) byte.
+ *   @byte_in == 256 with FT_LEFT  → rightmost (largest) byte.
+ *
+ * Returns NULL when no such byte exists in the node.  On success,
+ * *@byte_out holds the matched byte (0..255).
+ *
+ * Walks the (hi, lo) bitmap lattice in @dir order.  Tombstones are
+ * skipped two ways:
+ *   - a NULL hi-slot (lo-node detached) skips the entire bucket;
+ *   - a NULL lo-slot (tombstoned child) skips that lo bit and we
+ *     keep scanning within the same lo-node.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_qp_byte_get_direction(
+		struct cds_ft_qp16_node *hi, int byte_in,
+		uint8_t *byte_out, enum ft_direction dir)
+{
+	uint16_t hi_bm = uatomic_load(&hi->bitmap, CMM_RELAXED);
+	int hi_n_start, lo_n_start;
+	int hi_iter, hi_step;
+	int in_range = (byte_in >= 0 && byte_in < FT_ENTRY_PER_NODE);
+
+	assert(dir == FT_LEFT || dir == FT_RIGHT);
+
+	if (in_range) {
+		hi_n_start = byte_in >> 4;
+		lo_n_start = byte_in & 0xF;
+	} else if (byte_in < 0) {
+		/* leftmost sentinel: walk all 16 buckets in @dir order */
+		hi_n_start = (dir == FT_RIGHT) ? 0 : -1;
+		lo_n_start = 0;
+	} else {
+		/* rightmost sentinel (byte_in >= 256) */
+		hi_n_start = (dir == FT_RIGHT) ? 16 : 15;
+		lo_n_start = 0;
+	}
+
+	hi_step = (dir == FT_RIGHT) ? 1 : -1;
+	for (hi_iter = hi_n_start;
+			hi_iter >= 0 && hi_iter < 16;
+			hi_iter += hi_step) {
+		uint16_t hi_bit = (uint16_t) (1U << hi_iter);
+		unsigned int hi_idx;
+		struct cds_ft_inode_flag *lo_flag;
+		struct cds_ft_qp16_node *lo;
+		uint16_t lo_bm, side;
+
+		if (!(hi_bm & hi_bit))
+			continue;
+		hi_idx = (unsigned int) __builtin_popcount(
+				(unsigned int) (hi_bm & (hi_bit - 1U)));
+		lo_flag = ft_dereference_acquire(hi->ptrs[hi_idx]);
+		if (!lo_flag)
+			continue;
+		lo = (struct cds_ft_qp16_node *) lo_flag;
+		lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
+
+		/*
+		 * On the cursor's bucket, exclude @byte_in itself by
+		 * masking the lo bitmap to the strict @dir half.  In any
+		 * later bucket, the whole lo bitmap is in scope.
+		 */
+		if (in_range && hi_iter == hi_n_start) {
+			if (dir == FT_RIGHT)
+				side = (uint16_t) (lo_bm & (uint16_t)
+					~((1U << ((unsigned int) lo_n_start + 1U))
+						- 1U));
+			else
+				side = (uint16_t) (lo_bm &
+					(uint16_t) ((1U << (unsigned int) lo_n_start) - 1U));
+		} else {
+			side = lo_bm;
+		}
+
+		while (side) {
+			unsigned int lo_match;
+			unsigned int lo_idx;
+			struct cds_ft_inode_flag *child;
+
+			if (dir == FT_RIGHT)
+				lo_match = (unsigned int) __builtin_ctz(
+						(unsigned int) side);
+			else
+				lo_match = 31U - (unsigned int) __builtin_clz(
+						(unsigned int) side);
+			lo_idx = (unsigned int) __builtin_popcount(
+					(unsigned int) (lo_bm
+						& ((1U << lo_match) - 1U)));
+			child = ft_dereference_acquire(lo->ptrs[lo_idx]);
+			if (child) {
+				*byte_out = (uint8_t) (((unsigned int) hi_iter << 4)
+						| lo_match);
+				return child;
+			}
+			side &= (uint16_t) ~(1U << lo_match);
+		}
+	}
+	return NULL;
+}
+
+/*
+ * QP-nibble byte-step extremum — convenience wrapper that returns the
+ * leftmost (smallest) or rightmost (largest) byte with a live child.
+ *
+ * Convention matches ft_qp16_node_get_extremum:
+ *   @dir == FT_LEFT  → leftmost (smallest) byte.
+ *   @dir == FT_RIGHT → rightmost (largest) byte.
+ *
+ * Implemented via the directional walk with sentinel @byte_in.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_qp_byte_get_extremum(
+		struct cds_ft_qp16_node *hi,
+		uint8_t *byte_out, enum ft_direction dir)
+{
+	assert(dir == FT_LEFT || dir == FT_RIGHT);
+	if (dir == FT_LEFT)
+		return ft_qp_byte_get_direction(hi, -1, byte_out, FT_RIGHT);
+	return ft_qp_byte_get_direction(hi, FT_ENTRY_PER_NODE, byte_out, FT_LEFT);
+}
+
+/*
+ * QP-nibble byte-step ith-position — return the i-th byte in
+ * popcount-lattice order across (hi-bit, lo-bit) pairs, skipping
+ * buckets whose hi-slot is tombstoned.
+ *
+ * Mirrors ft_pigeon_node_get_ith_pos / ft_qp16_node_get_ith_pos: i
+ * indexes the popcount-counted lattice positions; a returned NULL
+ * indicates an out-of-range i OR a tombstoned lo-slot at position i,
+ * and the caller filters NULL just as for the other node types.
+ *
+ * Tombstoned hi-slots (lo-node detached) contribute zero to the
+ * lattice count — the entire bucket is skipped.  This matches the
+ * design: when a lo-node is freed, no lo bits are visible anymore.
+ *
+ * Linear walk; at most 16*16 = 256 bit tests in the worst case.  Used
+ * by recompact / iter / debug paths, not by the hot lookup path.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_qp_byte_get_ith_pos(
+		struct cds_ft_qp16_node *hi, unsigned int i,
+		uint8_t *byte_out)
+{
+	uint16_t hi_bm = uatomic_load(&hi->bitmap, CMM_RELAXED);
+	unsigned int count = 0;
+	unsigned int hi_iter;
+
+	for (hi_iter = 0; hi_iter < 16U; hi_iter++) {
+		uint16_t hi_bit = (uint16_t) (1U << hi_iter);
+		unsigned int hi_idx;
+		struct cds_ft_inode_flag *lo_flag;
+		struct cds_ft_qp16_node *lo;
+		uint16_t lo_bm;
+		unsigned int j;
+
+		if (!(hi_bm & hi_bit))
+			continue;
+		hi_idx = (unsigned int) __builtin_popcount(
+				(unsigned int) (hi_bm & (hi_bit - 1U)));
+		lo_flag = ft_dereference_acquire(hi->ptrs[hi_idx]);
+		if (!lo_flag)
+			continue;
+		lo = (struct cds_ft_qp16_node *) lo_flag;
+		lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
+
+		for (j = 0; j < 16U; j++) {
+			unsigned int lo_idx;
+
+			if (!(lo_bm & (1U << j)))
+				continue;
+			if (count == i) {
+				lo_idx = (unsigned int) __builtin_popcount(
+						(unsigned int) (lo_bm
+							& ((1U << j) - 1U)));
+				*byte_out = (uint8_t) ((hi_iter << 4) | j);
+				return ft_dereference_acquire(lo->ptrs[lo_idx]);
+			}
+			count++;
+		}
+	}
+	return NULL;
+}
 #endif /* FEATURE_FT_QP */
 
 /*
