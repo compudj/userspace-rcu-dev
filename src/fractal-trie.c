@@ -4772,10 +4772,13 @@ static const struct cds_ft_qp16_tier ft_qp16_tiers[FT_QP16_NR_TIERS] = {
 };
 
 /*
- * QP-nibble read-side scanner.  Two dependent loads on the hot path:
+ * QP-nibble read-side scanner — handles both hi- and lo-nibble
+ * descent in one inlinable helper.  Two dependent loads on the hot
+ * path:
  *   1. relaxed-load bitmap (header CL) — pre-filter only
  *   2. acquire-load ptrs[idx] (pointer-array CL — same CL as bitmap
- *      for tiers T0/T1) — source of truth via rcu_dereference
+ *      for tiers T0/T1) — source of truth, paired with the writer's
+ *      rcu_assign_pointer release at insert / removal.
  *
  * @nibble must be in 0..15.  Returns the child pointer, or NULL if
  * the nibble has no child (bit clear in bitmap, or slot is a
@@ -4786,36 +4789,59 @@ static const struct cds_ft_qp16_tier ft_qp16_tiers[FT_QP16_NR_TIERS] = {
  *
  * The bitmap is a pre-filter: a clear bit guarantees absence (skip
  * the pointer load); a set bit is an "is-this-maybe-here" hint with
- * the rcu_dereference on the slot as the source of truth.  Same
- * pattern as FT_PIGEON's bitmap_scan: writer publishes the new
- * child via rcu_assign_pointer on the slot (release), and the
- * reader's acquire on the slot is what synchronizes-with that
- * publish.  The bitmap therefore needs no synchronization itself
- * and is loaded relaxed.
+ * the acquire-load on the slot as the source of truth.  Acquire
+ * (rather than relaxed) on the slot pairs with the count-based
+ * readers' undercount guarantee: writers do the nr_keys decrement
+ * BEFORE the rcu_assign_pointer release at removal, so a reader that
+ * observes the detached pointer also observes the preceding nr_keys
+ * update on weakly-ordered architectures.
+ *
+ * Pointer encoding (writer-side discipline):
+ *   - Hi-nibble slots store the lo-nibble qp16_node pointer raw and
+ *     untagged.  Reader casts directly; no tag-bit work.
+ *   - Lo-nibble slots store a tagged cds_ft_inode_flag * (external,
+ *     compressed, internal, or skip-compressed).  Reader inspects
+ *     tag bits to dispatch.
+ *
+ * @is_lo_nibble (0 = hi, non-zero = lo): compile-time constant at the
+ * call site.  Selects the prefetch path:
+ *   - hi: direct __builtin_prefetch on the loaded ptr (no tag work,
+ *     slot is known untagged).
+ *   - lo: ft_maybe_prefetch_hint with the caller's @pf_hint (tag
+ *     dispatch, may skip prefetch for compressed-class children).
+ * The acquire-load itself is identical in both branches.
  */
 static inline_lookup
-struct cds_ft_inode_flag *ft_qp16_node_get_nth(
+struct cds_ft_inode_flag *ft_qp16_node_descend(
 		struct cds_ft_qp16_node *node,
 		struct cds_ft_inode_flag ***ptr_slot_p,
-		uint8_t nibble, enum ft_pf_target pf_hint)
+		uint8_t nibble, enum ft_pf_target pf_hint,
+		int is_lo_nibble)
 {
 	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
+	struct cds_ft_inode_flag **slot, *child;
+	unsigned int idx;
 
 	if (!(bm & bit)) {
 		if (caa_unlikely(ptr_slot_p))
 			*ptr_slot_p = NULL;
 		return NULL;
 	}
-	{
-		unsigned int idx = (unsigned int)
-			__builtin_popcount((unsigned int) (bm & (bit - 1U)));
-		struct cds_ft_inode_flag **slot = &node->ptrs[idx];
-
-		if (caa_unlikely(ptr_slot_p))
-			*ptr_slot_p = slot;
-		return ft_dereference_acquire_prefetch_hint(*slot, pf_hint);
+	idx = (unsigned int) __builtin_popcount(
+			(unsigned int) (bm & (bit - 1U)));
+	slot = &node->ptrs[idx];
+	if (caa_unlikely(ptr_slot_p))
+		*ptr_slot_p = slot;
+	if (is_lo_nibble) {
+		child = ft_dereference_acquire_prefetch_hint(*slot, pf_hint);
+	} else {
+		(void) pf_hint;
+		child = ft_dereference_acquire(*slot);
+		if (caa_likely(child))
+			__builtin_prefetch(child);
 	}
+	return child;
 }
 
 /*
@@ -4839,9 +4865,10 @@ unsigned int ft_qp16_alloc_order(unsigned int popcount)
 
 /*
  * QP-nibble nr_child accessor — popcount of the bitmap.  Bitmap
- * field is read with CMM_RELAXED; callers that need acquire ordering
- * use ft_qp16_node_get_nth above (which acquires through the bitmap
- * load).
+ * field is read relaxed; this is a pre-filter count, not a
+ * synchronizing load.  Callers needing a child pointer with
+ * publication-safe semantics use ft_qp16_node_descend above (which
+ * acquire-loads the slot).
  */
 static inline
 unsigned int ft_qp16_node_nr_child(const struct cds_ft_qp16_node *node)
