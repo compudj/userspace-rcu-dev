@@ -146,8 +146,11 @@ enum cds_ft_type_class {
 	FT_POPCOUNT = 1,	/* Popcount-bitmap: byte_popcount_1l / nibble_popcount_2l */
 	FT_POOL = 2,		/* Pool: 1D/2D subnode dispatch */
 	FT_PIGEON = 3,		/* Pigeon: direct indexed */
+#ifdef FEATURE_FT_QP
+	FT_QP = 4,		/* QP-nibble: 16-bit popcount + ptrs[]; not yet wired into ft_types[] dispatch */
+#endif
 	/* Leaf nodes are implicit from their height in the tree */
-	FT_NR_TYPES = 4,
+	FT_NR_TYPES,
 
 	FT_NULL,	/* not an encoded type, but keeps code regular */
 };
@@ -4733,6 +4736,41 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
 }
 
 #ifdef FEATURE_FT_QP
+/*
+ * QP-nibble tier table.  Parallel to ft_types[]; describes the four
+ * QP-nibble allocation tiers (T0..T3) by popcount range and node
+ * size.  Indexed by tier number (0..3); FT_QP16_NR_TIERS == 4.
+ *
+ * The hysteresis (min_child < previous max_child) gives a window
+ * during shrinkage where we stay in the larger tier — same idea as
+ * ft_types[]'s overlapping min/max ranges for the byte-keyed types.
+ *
+ * Not yet consulted by any allocator path: writers will pick a tier
+ * by ft_qp16_alloc_order(popcount) once descent dispatch is wired
+ * (Phase 2 step 1b + dispatch arms).  This commit lands the table
+ * alongside the FT_QP enum value as scaffolding only.
+ */
+struct cds_ft_qp16_tier {
+	uint16_t min_child;	/* hysteresis lower bound (inclusive) */
+	uint16_t max_child;	/* highest popcount this tier holds */
+	uint16_t order;		/* node size = (1 << order) bytes */
+};
+
+static const struct cds_ft_qp16_tier ft_qp16_tiers[FT_QP16_NR_TIERS] = {
+	[0] = {	.min_child = 1,
+		.max_child = FT_QP16_T0_CAPACITY,
+		.order     = FT_QP16_T0_ALLOC_ORDER },
+	[1] = {	.min_child = 2,
+		.max_child = FT_QP16_T1_CAPACITY,
+		.order     = FT_QP16_T1_ALLOC_ORDER },
+	[2] = {	.min_child = 5,
+		.max_child = FT_QP16_T2_CAPACITY,
+		.order     = FT_QP16_T2_ALLOC_ORDER },
+	[3] = {	.min_child = 11,
+		.max_child = FT_QP16_T3_CAPACITY,
+		.order     = FT_QP16_T3_ALLOC_ORDER },
+};
+
 /*
  * QP-nibble read-side scanner.  Two dependent loads on the hot path:
  *   1. acquire-load bitmap (header CL)
