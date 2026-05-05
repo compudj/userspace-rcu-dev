@@ -6906,10 +6906,18 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
  * _ft_node_set_nth: set nth item within a node. Return an error
  * (negative error value) if it is already there.
  *
+ * @ft is needed only by the FT_QP arm — ft_qp_byte_set may lazily
+ * allocate a fresh lo-node (Path 1) or CoW the lo-node onto a larger
+ * tier (Path 2b).  All other type_class arms ignore @ft; the
+ * parameter is annotated unused so the compiler does not warn under
+ * builds where FEATURE_FT_QP is disabled and the only reader is
+ * gone.
+ *
  * @is_init: caller guarantees this is the first set_nth on a
  * freshly-allocated unpublished (sub)node.  Used by recompact to
  * adopt the first inserted byte as values[0].  Ignored for
- * FT_PIGEON (dense 256-slot array, no reserved slot).
+ * FT_PIGEON (dense 256-slot array, no reserved slot) and FT_QP
+ * (bitmap is the source of truth, no values[0] sentinel).
  *
  * This helper does NOT set @child_node_flag's parent pointer.  The
  * caller is responsible for ft_set_parent once @node is in a state
@@ -6925,7 +6933,8 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
  *     performs ft_set_parent after the whole new_node is assembled.
  */
 static
-int _ft_node_set_nth(const struct cds_ft_type *type,
+int _ft_node_set_nth(struct cds_ft *ft __attribute__((unused)),
+		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
@@ -6948,6 +6957,13 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 	case FT_PIGEON:
 		ret = ft_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
 		break;
+#ifdef FEATURE_FT_QP
+	case FT_QP:
+		ret = ft_qp_byte_set(ft, node_flag,
+				(struct cds_ft_qp16_node *) node, metadata,
+				n, child_node_flag, type->max_child);
+		break;
+#endif
 	case FT_NULL:
 		return -ENOSPC;
 	default:
@@ -7108,9 +7124,14 @@ int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
 /*
  * _ft_node_replace_ptr: replace ptr item within a node. Return an error
  * (negative error value) if it is not found (-ENOENT).
+ *
+ * @ft is needed only by the FT_QP arm — ft_qp_byte_replace routes
+ * NULL @newptr to ft_qp_byte_clear, which may RCU-free a now-empty
+ * lo-node (decision 4.6.1).  Other arms ignore @ft.
  */
 static
-int _ft_node_replace_ptr(const struct cds_ft_type *type,
+int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
+		const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
@@ -7132,6 +7153,13 @@ int _ft_node_replace_ptr(const struct cds_ft_type *type,
 	case FT_PIGEON:
 		ret = ft_pigeon_node_replace_ptr(type, node, metadata, node_flag_ptr, n, newptr);
 		break;
+#ifdef FEATURE_FT_QP
+	case FT_QP:
+		ret = ft_qp_byte_replace(ft,
+				(struct cds_ft_qp16_node *) node, metadata,
+				node_flag_ptr, n, newptr);
+		break;
+#endif
 	case FT_NULL:
 		return -ENOENT;
 	default:
@@ -7775,7 +7803,7 @@ retry:		/* for fallback */
 						RECOMPACT_IS_INIT(v));
 			else
 #endif
-			ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
+			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, v, iter, RECOMPACT_IS_INIT(v));
 			if (new_type->type_class == FT_POOL && ret) {
 				goto fallback_toosmall;
@@ -7810,7 +7838,7 @@ retry:		/* for fallback */
 						RECOMPACT_IS_INIT(v));
 			else
 #endif
-			ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
+			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, v, iter, RECOMPACT_IS_INIT(v));
 			if (new_type->type_class == FT_POOL && ret) {
 				goto fallback_toosmall;
@@ -7852,7 +7880,7 @@ retry:		/* for fallback */
 							RECOMPACT_IS_INIT(v));
 				else
 #endif
-				ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
+				ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 						new_metadata, v, iter, RECOMPACT_IS_INIT(v));
 				if (new_type->type_class == FT_POOL
 						&& ret) {
@@ -7890,7 +7918,7 @@ retry:		/* for fallback */
 						RECOMPACT_IS_INIT((uint8_t)i));
 			else
 #endif
-			ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
+			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, i, iter, RECOMPACT_IS_INIT((uint8_t)i));
 			if (new_type->type_class == FT_POOL && ret) {
 				goto fallback_toosmall;
@@ -7899,6 +7927,70 @@ retry:		/* for fallback */
 		}
 		break;
 	}
+#ifdef FEATURE_FT_QP
+	case FT_QP:
+	{
+		struct cds_ft_qp16_node *old_hi =
+			(struct cds_ft_qp16_node *) old_node;
+		uint16_t old_hi_bm = uatomic_load(&old_hi->bitmap, CMM_RELAXED);
+		unsigned int hi_iter;
+
+		/*
+		 * Walk the old (hi, lo) lattice in popcount order, copying
+		 * each live (byte, child) pair into the new node via
+		 * _ft_node_set_nth.  Tombstones (NULL slots with set bits)
+		 * are skipped naturally — same pattern as the byte-keyed
+		 * arms above.  RECOMPACT_IS_INIT is irrelevant for QP
+		 * destinations (no values[0] sentinel) but we keep the
+		 * argument shape consistent with the other arms.
+		 */
+		for (hi_iter = 0; hi_iter < 16U; hi_iter++) {
+			uint16_t hi_bit = (uint16_t) (1U << hi_iter);
+			unsigned int hi_idx;
+			struct cds_ft_inode_flag *lo_flag;
+			struct cds_ft_qp16_node *lo;
+			uint16_t lo_bm;
+			unsigned int j;
+
+			if (!(old_hi_bm & hi_bit))
+				continue;
+			hi_idx = (unsigned int) __builtin_popcount(
+					(unsigned int) (old_hi_bm & (hi_bit - 1U)));
+			lo_flag = ft_dereference_acquire(old_hi->ptrs[hi_idx]);
+			if (!lo_flag)
+				continue;
+			lo = (struct cds_ft_qp16_node *) lo_flag;
+			lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
+
+			for (j = 0; j < 16U; j++) {
+				unsigned int lo_idx;
+				struct cds_ft_inode_flag *iter;
+				uint8_t v;
+
+				if (!(lo_bm & (1U << j)))
+					continue;
+				lo_idx = (unsigned int) __builtin_popcount(
+						(unsigned int) (lo_bm
+							& ((1U << j) - 1U)));
+				iter = ft_dereference_acquire(lo->ptrs[lo_idx]);
+				if (!iter)
+					continue;
+				if (mode == FT_RECOMPACT_DEL
+						&& *nullify_node_flag_ptr == iter)
+					continue;
+				v = (uint8_t) ((hi_iter << 4) | j);
+				ret = _ft_node_set_nth(ft, new_type, new_node,
+						new_node_flag, new_metadata,
+						v, iter, RECOMPACT_IS_INIT(v));
+				if (new_type->type_class == FT_POOL && ret) {
+					goto fallback_toosmall;
+				}
+				assert(!ret);
+			}
+		}
+		break;
+	}
+#endif
 	default:
 		assert(0);
 		ret = -EINVAL;
@@ -7919,7 +8011,7 @@ skip_copy:
 					RECOMPACT_IS_INIT(n));
 		else
 #endif
-		ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
+		ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 				new_metadata, n, child_node_flag,
 				RECOMPACT_IS_INIT(n));
 		if (new_type->type_class == FT_POOL && ret) {
@@ -8150,6 +8242,63 @@ skip_copy:
 			}
 			break;
 		}
+#ifdef FEATURE_FT_QP
+		case FT_QP:
+		{
+			struct cds_ft_qp16_node *new_hi =
+				(struct cds_ft_qp16_node *) new_node;
+			uint16_t new_hi_bm =
+				uatomic_load(&new_hi->bitmap, CMM_RELAXED);
+			unsigned int hi_iter;
+
+			/*
+			 * Walk new node's (hi, lo) lattice and reparent each
+			 * live child under the new node's published flag.
+			 * Same shape as the FT_PIGEON arm but indexed via
+			 * the popcount-bitmap walk.
+			 */
+			for (hi_iter = 0; hi_iter < 16U; hi_iter++) {
+				uint16_t hi_bit = (uint16_t) (1U << hi_iter);
+				unsigned int hi_idx;
+				struct cds_ft_inode_flag *lo_flag;
+				struct cds_ft_qp16_node *lo;
+				uint16_t lo_bm;
+				unsigned int j;
+
+				if (!(new_hi_bm & hi_bit))
+					continue;
+				hi_idx = (unsigned int) __builtin_popcount(
+						(unsigned int) (new_hi_bm
+							& (hi_bit - 1U)));
+				lo_flag = new_hi->ptrs[hi_idx];
+				if (!lo_flag)
+					continue;
+				lo = (struct cds_ft_qp16_node *) lo_flag;
+				lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
+
+				for (j = 0; j < 16U; j++) {
+					unsigned int lo_idx;
+					struct cds_ft_inode_flag *iter;
+					struct cds_ft_inode_flag **slot = NULL;
+					uint8_t v;
+
+					if (!(lo_bm & (1U << j)))
+						continue;
+					lo_idx = (unsigned int) __builtin_popcount(
+							(unsigned int) (lo_bm
+								& ((1U << j) - 1U)));
+					iter = lo->ptrs[lo_idx];
+					if (!iter)
+						continue;
+					v = (uint8_t) ((hi_iter << 4) | j);
+					ft_node_get_nth_skip(new_node_flag,
+							&slot, v, FT_PF_NONE);
+					ft_set_parent(iter, new_node_flag, slot);
+				}
+			}
+			break;
+		}
+#endif
 		default:
 			break;
 		}
@@ -8270,7 +8419,7 @@ int ft_node_set_nth(struct cds_ft *ft,
 	 * false; fresh-init cases funnel here via -ENOSPC / -ERANGE to
 	 * ft_node_recompact, which uses is_init internally.
 	 */
-	ret = _ft_node_set_nth(type, node, *node_flag, metadata, n, child_node_flag, false);
+	ret = _ft_node_set_nth(ft, type, node, *node_flag, metadata, n, child_node_flag, false);
 	switch (ret) {
 	case 0:
 	{
@@ -8332,7 +8481,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	node = ft_node_ptr(*parent_node_flag_ptr);
 	type_index = ft_node_type(*parent_node_flag_ptr);
 	type = &ft_types[type_index];
-	ret = _ft_node_replace_ptr(type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr);
+	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr);
 	if (ret == -EFBIG) {
 		assert(!newptr);
 		/* Should try recompaction. */
