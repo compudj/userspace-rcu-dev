@@ -136,9 +136,6 @@ struct cds_ft_group_attr {
 
 struct cds_ft_attr {
 	bool exclusive;
-	unsigned int collapse_threshold_pct;
-	unsigned int collapse_scan_mul_pct;
-	unsigned int compress_scan_mul_pct;
 };
 
 enum cds_ft_type_class {
@@ -14947,9 +14944,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * readers must call cds_ft_make_concurrent first.
 		 */
 		detached->exclusive = true;
-		detached->collapse_threshold_pct = ft->collapse_threshold_pct;
-		detached->collapse_scan_mul_pct = ft->collapse_scan_mul_pct;
-		detached->compress_scan_mul_pct = ft->compress_scan_mul_pct;
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 		/*
 		 * Carry the source's verify-at-mutation cadence into the
@@ -15082,9 +15076,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 * first.
 			 */
 			detached->exclusive = true;
-			detached->collapse_threshold_pct = ft->collapse_threshold_pct;
-			detached->collapse_scan_mul_pct = ft->collapse_scan_mul_pct;
-			detached->compress_scan_mul_pct = ft->compress_scan_mul_pct;
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 			/* Mirror of the root-detach branch above; see rationale there. */
 			detached->verify_at_mutation_period = ft->verify_at_mutation_period;
@@ -16985,33 +16976,6 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_attr_set_collapse_threshold(struct cds_ft_attr *attr,
-		unsigned int threshold_pct)
-{
-	if (threshold_pct < CDS_FT_COLLAPSE_THRESHOLD_DEFAULT)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	attr->collapse_threshold_pct = threshold_pct;
-	return CDS_FT_STATUS_OK;
-}
-
-enum cds_ft_status cds_ft_attr_set_collapse_scan_mul(struct cds_ft_attr *attr,
-		unsigned int scan_mul_pct)
-{
-	if (scan_mul_pct < 100U)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	attr->collapse_scan_mul_pct = scan_mul_pct;
-	return CDS_FT_STATUS_OK;
-}
-
-enum cds_ft_status cds_ft_attr_set_compress_scan_mul(struct cds_ft_attr *attr,
-		unsigned int scan_mul_pct)
-{
-	if (scan_mul_pct < 100U)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	attr->compress_scan_mul_pct = scan_mul_pct;
-	return CDS_FT_STATUS_OK;
-}
-
 void cds_ft_make_exclusive(struct cds_ft *ft)
 {
 	CDS_FT_SCOPED_WRITER(ft);
@@ -17113,48 +17077,6 @@ enum cds_ft_status cds_ft_verify_at_mutation_period_get(
 #endif
 }
 
-enum cds_ft_status cds_ft_collapse_threshold_set(struct cds_ft *ft,
-		unsigned int threshold_pct)
-{
-	if (threshold_pct < CDS_FT_COLLAPSE_THRESHOLD_DEFAULT)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	uatomic_store(&ft->collapse_threshold_pct, threshold_pct, CMM_RELAXED);
-	return CDS_FT_STATUS_OK;
-}
-
-unsigned int cds_ft_collapse_threshold_get(struct cds_ft *ft)
-{
-	return uatomic_load(&ft->collapse_threshold_pct, CMM_RELAXED);
-}
-
-enum cds_ft_status cds_ft_collapse_scan_mul_set(struct cds_ft *ft,
-		unsigned int scan_mul_pct)
-{
-	if (scan_mul_pct < 100U)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	uatomic_store(&ft->collapse_scan_mul_pct, scan_mul_pct, CMM_RELAXED);
-	return CDS_FT_STATUS_OK;
-}
-
-unsigned int cds_ft_collapse_scan_mul_get(struct cds_ft *ft)
-{
-	return uatomic_load(&ft->collapse_scan_mul_pct, CMM_RELAXED);
-}
-
-enum cds_ft_status cds_ft_compress_scan_mul_set(struct cds_ft *ft,
-		unsigned int scan_mul_pct)
-{
-	if (scan_mul_pct < 100U)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	uatomic_store(&ft->compress_scan_mul_pct, scan_mul_pct, CMM_RELAXED);
-	return CDS_FT_STATUS_OK;
-}
-
-unsigned int cds_ft_compress_scan_mul_get(struct cds_ft *ft)
-{
-	return uatomic_load(&ft->compress_scan_mul_pct, CMM_RELAXED);
-}
-
 enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor)
@@ -17238,44 +17160,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 */
 	ft->verify_at_mutation_period = 1;
 #endif
-	{
-		/*
-		 * Pick the collapse-threshold default based on the descent
-		 * mode the trie will run in.  Cand-mode descent — used by
-		 * skip-compressed groups (cds_ft_lookup_candidate_key) and by
-		 * speculative_validated groups (cds_ft_lookup_key internally
-		 * cand-descends + validates at leaf) — benefits from
-		 * collapse, so use the skip-mode default (T=100).  Plain
-		 * non-skip / non-speculative groups stick with the precise-
-		 * descent default (T=DISABLED).
-		 */
-		unsigned int dflt_T = (ft_group_skip_compressed(ft_group) ||
-				ft_group->speculative_validated)
-			? CDS_FT_COLLAPSE_THRESHOLD_DEFAULT
-			: CDS_FT_COLLAPSE_THRESHOLD_NONSKIP_DEFAULT;
-		unsigned int dflt_c = CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT;
-		unsigned int dflt_m = CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT;
-
-		if (attr) {
-			ft->exclusive = attr->exclusive;
-			ft->collapse_threshold_pct =
-				attr->collapse_threshold_pct
-				? attr->collapse_threshold_pct
-				: dflt_T;
-			ft->collapse_scan_mul_pct =
-				attr->collapse_scan_mul_pct
-				? attr->collapse_scan_mul_pct
-				: dflt_c;
-			ft->compress_scan_mul_pct =
-				attr->compress_scan_mul_pct
-				? attr->compress_scan_mul_pct
-				: dflt_m;
-		} else {
-			ft->collapse_threshold_pct = dflt_T;
-			ft->collapse_scan_mul_pct = dflt_c;
-			ft->compress_scan_mul_pct = dflt_m;
-		}
-	}
+	if (attr)
+		ft->exclusive = attr->exclusive;
 
 	/*
 	 * Allocate the root node (smallest linear type, initially empty).

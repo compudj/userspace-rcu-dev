@@ -633,49 +633,6 @@ struct cds_ft {
 	unsigned long excl_nr_readers;
 #endif
 
-	/*
-	 * Collapse acceptance threshold, expressed as a percentage of
-	 * the candidate collapsed-node footprint that the absorbed
-	 * subtree footprint must exceed for the collapse to fire.  100
-	 * (CDS_FT_COLLAPSE_THRESHOLD_DEFAULT) reproduces the historical
-	 * "absorbed > collapsed" gate.  Larger values demand a bigger
-	 * footprint win before collapsing; UINT_MAX
-	 * (CDS_FT_COLLAPSE_THRESHOLD_DISABLED) disables collapse on
-	 * this trie entirely.  Loaded with relaxed atomics on the write
-	 * path so it can be retuned on a live trie under writers.
-	 */
-	unsigned int collapse_threshold_pct;
-
-	/*
-	 * Per-path CL latency gate's scan-cost multiplier, in
-	 * percent (100 = 1.0×).  Models scan-loop overhead the raw
-	 * CL load count doesn't capture (loop dispatch, byte
-	 * compares, branch-on-match, reduced ILP).  Larger values
-	 * reject more borderline-cost collapses.  Loaded with relaxed
-	 * atomics on the write path; retunable on a live trie.
-	 *
-	 * Default CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT (225) chosen
-	 * empirically from a workload sweep on AMD64; the optimal
-	 * value is architecture-dependent.
-	 */
-	unsigned int collapse_scan_mul_pct;
-
-	/*
-	 * Chain-compress per-path CL latency gate's scan-cost
-	 * multiplier, in percent (100 = 1.0×).  Independent of the
-	 * collapse multiplier above.  Applied to
-	 * `ft_compress_chain_at` when publishing a non-skip
-	 * compressed node; skip-encoded publication bypasses the
-	 * gate (always a strict win on read).  Loaded with relaxed
-	 * atomics; retunable on a live trie.
-	 *
-	 * Default CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT (100) — the
-	 * compressed scan loop is simpler than the collapsed one
-	 * (no offsets, no per-entry suffix length, single match) so
-	 * it's priced by raw CL bandwidth by default.
-	 */
-	unsigned int compress_scan_mul_pct;
-
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[FT_ENTRY_PER_NODE];
 	unsigned long nr_nodes_allocated, nr_nodes_freed;
