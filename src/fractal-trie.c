@@ -339,6 +339,60 @@ enum {
 	ft_type_6_nr_pool_order = 2,
 };
 
+#ifdef FEATURE_FT_QP
+/*
+ * 64-bit ft_types[] under FEATURE_FT_QP.  The byte-keyed taxonomy
+ * collapses to QP-nibble (sparse byte stages) and PIGEON (dense byte
+ * stages):
+ *
+ *   [0..3] = QP T0..T3 — type_class FT_QP, orders 5..8 (32..256 B
+ *            qp16_node), max_child = 3 / 7 / 15 / 16 (lo-bucket count
+ *            on the hi-node).
+ *   [4]    = PIGEON — type_class FT_PIGEON, order 11 (2048 B), kept
+ *            for the eventual QP→PIGEON transition (§4.7.1, deferred).
+ *            Currently unreachable: QP byte-stages cap at 16 hi-buckets
+ *            naturally (16 nibbles), so popcount(hi_bm) > 16 is
+ *            impossible and the tier picker stays inside [0..3].
+ *   [5..7] = NULL filler.  Slots are required by the FT_TYPE_MAX_NR
+ *            (3-bit type_index field, 8-entry minimum), but unreachable
+ *            because no encoded pointer carries these indices and the
+ *            tier picker stops at [4] for any nr_child <= 256.
+ *   [8]    = NULL sentinel (NODE_INDEX_NULL on 64-bit).
+ *
+ * The LINEAR / POPCOUNT / POOL entries that populate this table when
+ * FEATURE_FT_QP is undefined disappear; their case arms in dispatch
+ * switches become unreachable but are kept for the no-FT_QP build.
+ */
+const struct cds_ft_type ft_types[] = {
+	/*
+	 * FT_QP tier max_child / min_child are *byte-children* counts
+	 * (sum of lo_meta nr_child across hi-buckets), not popcount(hi_bm).
+	 * The hi-node structural capacity (popcount(hi_bm) <= hi_capacity)
+	 * is FT_QP16_T{0,1,2,3}_CAPACITY = 3, 7, 15, 16 — used internally
+	 * by ft_qp16_node_set_nth_safe for the -ENOSPC trigger.  Since
+	 * each hi-bucket holds up to 16 lo-children, the byte-count cap
+	 * is hi_capacity * 16 (e.g. T0: 3 * 16 = 48 byte children fit
+	 * before the hi-node structurally maxes out).
+	 *
+	 * The recompact framework's new-tier picker (find_nearest_type_index
+	 * via metadata->nr_child + 1 / - 1) is bypassed for FT_QP — see
+	 * the FT_QP special-cases in ft_node_recompact's ADD_NEXT /
+	 * ADD_SAME / DEL switches.  Tier-up is triggered by structural
+	 * -ENOSPC from set_nth_safe (popcount-based), not by byte-count
+	 * exceeding max_child.
+	 */
+	[0] = { .type_class = FT_QP, .min_child = 1,  .max_child = FT_QP16_T0_CAPACITY * 16, .order = FT_QP16_T0_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
+	[1] = { .type_class = FT_QP, .min_child = 2,  .max_child = FT_QP16_T1_CAPACITY * 16, .order = FT_QP16_T1_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
+	[2] = { .type_class = FT_QP, .min_child = 5,  .max_child = FT_QP16_T2_CAPACITY * 16, .order = FT_QP16_T2_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
+	[3] = { .type_class = FT_QP, .min_child = 11, .max_child = FT_QP16_T3_CAPACITY * 16, .order = FT_QP16_T3_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
+	[4] = { .type_class = FT_PIGEON, .min_child = 16, .max_child = ft_type_7_max_child, .order = 11, .bitmap = FT_BITMAP },
+	/* NULL filler slots — see comment above. */
+	[5] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
+	[6] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
+	[7] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
+	[8] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
+};
+#else /* !FEATURE_FT_QP */
 const struct cds_ft_type ft_types[] = {
 	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
 	[1] = {
@@ -432,6 +486,7 @@ const struct cds_ft_type ft_types[] = {
 
 	[8] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
 };
+#endif /* !FEATURE_FT_QP */
 #endif /* !(BITS_PER_LONG < 64) */
 
 /*
@@ -3317,6 +3372,15 @@ struct cds_ft_inode_flag *ft_pool_scan_2d(
 static inline __attribute__((unused))
 void ft_specialized_scan_layout_assert(void)
 {
+#ifdef FEATURE_FT_QP
+	/*
+	 * FEATURE_FT_QP replaces all linear/popcount/pool entries with
+	 * FT_QP T0..T3 + FT_PIGEON.  The specialized scanners are gone
+	 * (descent goes through ft_qp_byte_get / ft_pigeon_node_get_nth)
+	 * so the linear-type ptr_offset layout assertions do not apply.
+	 */
+	(void) 0;
+#else
 	assert(FT_ALIGN(ft_types[0].max_linear_child, sizeof(void *)) == 8);
 	assert(FT_ALIGN(ft_types[1].max_linear_child, sizeof(void *)) == 8);
 	assert(FT_ALIGN(ft_types[2].max_linear_child, sizeof(void *)) == 8);
@@ -3337,6 +3401,7 @@ void ft_specialized_scan_layout_assert(void)
 	assert(FT_POOL_IDX_A == 5);
 	assert(FT_POOL_IDX_B == 6);
 	assert(ft_types[7].type_class == FT_PIGEON);
+#endif /* !FEATURE_FT_QP */
 }
 
 #endif /* FT_USE_SPECIALIZED_SCAN */
@@ -5638,14 +5703,19 @@ int ft_qp_byte_clear(struct cds_ft *ft,
 
 	assert(lo_meta->nr_child > 0);
 	lo_meta->nr_child--;
+	/*
+	 * hi_meta->nr_child tracks total byte children (sum of lo_meta
+	 * nr_child across hi-buckets), not popcount(hi_bm).  This matches
+	 * the semantic used by ft_detach_node and ft_detach_descent_track.
+	 */
+	assert(hi_meta->nr_child > 0);
+	hi_meta->nr_child--;
 	if (lo_meta->nr_child > 0)
 		return 0;
 
 	/* Lo-node fully tombstoned: detach + RCU-free. */
 	assert(*hi_slot != NULL);
 	rcu_assign_pointer(*hi_slot, NULL);
-	assert(hi_meta->nr_child > 0);
-	hi_meta->nr_child--;
 	ft_qp16_node_free_rcu(ft, lo);
 	return 0;
 }
@@ -5691,8 +5761,9 @@ int ft_qp_byte_replace(struct cds_ft *ft,
  *
  *   Path 2 — lo-node exists, in-place set_nth_safe in lo:
  *     - Success with the slot previously NULL (clear bit OR tombstone):
- *       lo_meta->nr_child++ — adds a new live byte to the bucket.
- *       hi_meta->nr_child unchanged — the bucket count didn't move.
+ *       lo_meta->nr_child++ and hi_meta->nr_child++ — both track
+ *       byte-children counts (sum of lo nr_child across hi-buckets at
+ *       the hi level), so each new live byte bumps both.
  *     - Success with the slot previously non-NULL: live replace,
  *       no metadata accounting change.
  *     - -ERANGE / -ENOSPC: lo-side CoW (Path 2b).
@@ -5705,7 +5776,8 @@ int ft_qp_byte_replace(struct cds_ft *ft,
  *        any lo-tombstones and inserts (lo_n, child) in popcount order.
  *     4. Set new_lo_meta->nr_child = new_live and parent = hi_flag.
  *     5. rcu_assign_pointer(*hi_slot, new_lo) atomically swaps the
- *        bucket; the OLD lo is RCU-freed.  hi_meta->nr_child unchanged.
+ *        bucket; the OLD lo is RCU-freed.  hi_meta->nr_child++ for
+ *        the freshly-introduced byte at lo_n.
  *
  * @hi_flag is the tagged hi-node inode_flag (used to set the lo-node's
  * parent pointer).  @hi_capacity is the hi-node's tier capacity.
@@ -5752,6 +5824,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 			ft_qp16_node_free_unpublished(ft, new_lo);
 			return ret;
 		}
+		/* hi_meta->nr_child = total byte children. +1 for the new byte. */
 		hi_meta->nr_child++;
 		return 0;
 	}
@@ -5779,8 +5852,10 @@ int ft_qp_byte_set(struct cds_ft *ft,
 
 		ret = ft_qp16_node_set_nth_safe(lo, lo_n, child, lo_capacity);
 		if (ret == 0) {
-			if (!existing)
+			if (!existing) {
 				lo_meta->nr_child++;
+				hi_meta->nr_child++;
+			}
 			return 0;
 		}
 		if (ret != -ERANGE && ret != -ENOSPC)
@@ -5810,6 +5885,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 			rcu_assign_pointer(*hi_slot,
 					(struct cds_ft_inode_flag *) new_lo);
 			ft_qp16_node_free_rcu(ft, lo);
+			hi_meta->nr_child++;
 			return 0;
 		}
 	}
@@ -5861,7 +5937,17 @@ int ft_qp_byte_set(struct cds_ft *ft,
 static void __attribute__((constructor))
 ft_check_pool_dispatch_assumptions(void)
 {
-#ifdef FEATURE_FT_POPCOUNT_NODE
+#ifdef FEATURE_FT_QP
+	/*
+	 * FEATURE_FT_QP eliminates FT_POOL and FT_POPCOUNT from
+	 * ft_types[] entirely; the only internal classes are FT_QP and
+	 * FT_PIGEON.  The pool / popcount-pool dispatch machinery is
+	 * unreachable.
+	 */
+	assert(FT_MASK_POOL == 0);
+	assert(FT_MASK_POPCOUNT == 0);
+	assert(FT_MASK_LINEAR == 0);
+#elif defined(FEATURE_FT_POPCOUNT_NODE)
 	/*
 	 * FEATURE_FT_POPCOUNT_NODE collapses the historical pools at
 	 * indices 5 and 6 to byte_popcount_1l layouts in the FT_POPCOUNT
@@ -5908,7 +5994,24 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	node = ft_node_ptr_internal(node_flag);
 	type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
 
-#ifdef FT_USE_SPECIALIZED_SCAN
+#ifdef FEATURE_FT_QP
+	/*
+	 * Under FEATURE_FT_QP the ft_types[] layout is
+	 *   [0..3] = QP T0..T3 (all share the byte-step descent helper)
+	 *   [4]    = PIGEON
+	 *   [5..7] = NULL filler
+	 * so the byte-keyed-specialized scan dispatch below is replaced
+	 * by a single sub-4 fast-path branch into the QP byte-step
+	 * descent, with PIGEON as the only other reachable target.  The
+	 * specialized scanners (linear_scan_*, popcount_*) handle layouts
+	 * that no longer exist under FEATURE_FT_QP and are unreachable.
+	 */
+	if (caa_likely(type_index < 4))
+		return ft_qp_byte_get(
+				(struct cds_ft_qp16_node *) node,
+				node_flag_ptr, n, pf_hint);
+	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
+#elif defined(FT_USE_SPECIALIZED_SCAN)
 	/*
 	 * Per-type dispatch on type_index (no ft_types[] field load).
 	 *
@@ -6959,9 +7062,19 @@ int _ft_node_set_nth(struct cds_ft *ft __attribute__((unused)),
 		break;
 #ifdef FEATURE_FT_QP
 	case FT_QP:
+		/*
+		 * hi_capacity is the structural hi-bucket count
+		 * (popcount(hi_bm) cap), derived from the tier order:
+		 * T0..T3 = 3 / 7 / 15 / 16.  type->max_child is the
+		 * *byte-children* count (hi_capacity * 16) used by the
+		 * recompact framework's nr_child accounting; passing it
+		 * as hi_capacity would let set_nth_safe overflow the
+		 * pointer array.
+		 */
 		ret = ft_qp_byte_set(ft, node_flag,
 				(struct cds_ft_qp16_node *) node, metadata,
-				n, child_node_flag, type->max_child);
+				n, child_node_flag,
+				ft_qp16_capacity_from_order(type->order));
 		break;
 #endif
 	case FT_NULL:
@@ -7643,6 +7756,31 @@ int ft_node_recompact(enum ft_recompact mode,
 	 */
 	switch (mode) {
 	case FT_RECOMPACT_ADD_SAME:
+#ifdef FEATURE_FT_QP
+		/*
+		 * FT_QP -ERANGE recompact: rebuild + insert new hi-bucket
+		 * below an existing higher bucket.  popcount grows by 1.
+		 * If old's hi was at full structural capacity (popcount ==
+		 * hi_capacity), tier up; else same-tier rebuild suffices
+		 * (the merged walk weaves the new byte in nibble order).
+		 */
+		if (old_type->type_class == FT_QP) {
+			struct cds_ft_qp16_node *qp_old =
+				(struct cds_ft_qp16_node *) old_node;
+			unsigned int old_pop = (unsigned int) __builtin_popcount(
+					uatomic_load(&qp_old->bitmap, CMM_RELAXED));
+			unsigned int old_cap = ft_qp16_capacity_from_order(
+					old_type->order);
+
+			if (old_pop >= old_cap)
+				new_type_index = old_type_index + 1;
+			else
+				new_type_index = old_type_index;
+			dbg_printf("Recompact FT_QP add-same: tier %u -> %u (pop=%u cap=%u)\n",
+				old_type_index, new_type_index, old_pop, old_cap);
+			break;
+		}
+#endif
 		new_type_index = find_nearest_type_index(old_type_index,
 			metadata->nr_child + 1, false);
 		dbg_printf("Recompact for node with %u children\n",
@@ -7653,6 +7791,20 @@ int ft_node_recompact(enum ft_recompact mode,
 			new_type_index = 0;
 			dbg_printf("Recompact for NULL\n");
 		} else {
+#ifdef FEATURE_FT_QP
+			/*
+			 * FT_QP -ENOSPC recompact: structural hi-bucket overflow
+			 * (popcount(hi_bm) == hi_capacity, new bit needed).  Tier
+			 * up by exactly one — byte-count semantic on max_child
+			 * does not capture the structural trigger.
+			 */
+			if (old_type->type_class == FT_QP) {
+				new_type_index = old_type_index + 1;
+				dbg_printf("Recompact FT_QP tier-up %u -> %u\n",
+					old_type_index, new_type_index);
+				break;
+			}
+#endif
 			new_type_index = find_nearest_type_index(old_type_index,
 				metadata->nr_child + 1, false);
 			dbg_printf("Recompact for node with %u children\n",
@@ -7660,6 +7812,25 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 		break;
 	case FT_RECOMPACT_DEL:
+#ifdef FEATURE_FT_QP
+		/*
+		 * FT_QP DEL recompact: byte_clear returned -EFBIG signalling
+		 * either tier-down (post-decrement byte count) or full
+		 * elision when removing the last byte child.  When the new
+		 * byte count would be 0, return NODE_INDEX_NULL (elide);
+		 * otherwise stay at the current tier — there is no fine-
+		 * grained tier-down policy yet (deferred).
+		 */
+		if (old_type->type_class == FT_QP) {
+			if (metadata->nr_child <= 1)
+				new_type_index = is_root ? 0 : NODE_INDEX_NULL;
+			else
+				new_type_index = old_type_index;
+			dbg_printf("Recompact FT_QP del tier %u (nr_child %u)\n",
+				new_type_index, metadata->nr_child);
+			break;
+		}
+#endif
 		new_type_index = find_nearest_type_index(old_type_index,
 			metadata->nr_child - 1, is_root);
 		dbg_printf("Recompact for node with %u children\n",
@@ -7933,51 +8104,82 @@ retry:		/* for fallback */
 		struct cds_ft_qp16_node *old_hi =
 			(struct cds_ft_qp16_node *) old_node;
 		uint16_t old_hi_bm = uatomic_load(&old_hi->bitmap, CMM_RELAXED);
+		bool insert_new = (mode == FT_RECOMPACT_ADD_NEXT
+				|| mode == FT_RECOMPACT_ADD_SAME);
+		unsigned int new_hi_n = (unsigned int) (n >> 4);
+		unsigned int new_lo_n = (unsigned int) (n & 0xFU);
+		bool new_inserted = false;
 		unsigned int hi_iter;
 
 		/*
-		 * Walk the old (hi, lo) lattice in popcount order, copying
-		 * each live (byte, child) pair into the new node via
-		 * _ft_node_set_nth.  Tombstones (NULL slots with set bits)
-		 * are skipped naturally — same pattern as the byte-keyed
-		 * arms above.  RECOMPACT_IS_INIT is irrelevant for QP
-		 * destinations (no values[0] sentinel) but we keep the
-		 * argument shape consistent with the other arms.
+		 * Walk the old (hi, lo) lattice in popcount order, building
+		 * the new node by inserting each live (byte, child) pair via
+		 * _ft_node_set_nth.  For ADD modes, weave the new (n,
+		 * child_node_flag) into the walk at its lattice position so
+		 * the destination's bitmap is filled in strictly increasing
+		 * nibble order — set_nth_safe requires the inserted bit to
+		 * be the highest set bit ("safe-append"), which the post-
+		 * copy add at the framework level violates when @n is below
+		 * any of the old node's nibbles.
+		 *
+		 * The framework's post-copy add (line 8056) re-inserts the
+		 * same (n, child) by routing through ft_qp_byte_set Path 2
+		 * (lo-bucket now exists, set_nth_safe bit-already-set
+		 * branch) and observes existing == child_node_flag, so the
+		 * redundant call lands in the live-replace path and is a
+		 * pure no-op for accounting.
 		 */
 		for (hi_iter = 0; hi_iter < 16U; hi_iter++) {
 			uint16_t hi_bit = (uint16_t) (1U << hi_iter);
+			bool old_has_bucket = (old_hi_bm & hi_bit);
+			bool new_in_bucket = (insert_new
+					&& new_hi_n == hi_iter
+					&& !new_inserted);
 			unsigned int hi_idx;
-			struct cds_ft_inode_flag *lo_flag;
-			struct cds_ft_qp16_node *lo;
-			uint16_t lo_bm;
+			struct cds_ft_inode_flag *lo_flag = NULL;
+			struct cds_ft_qp16_node *lo = NULL;
+			uint16_t lo_bm = 0;
 			unsigned int j;
 
-			if (!(old_hi_bm & hi_bit))
+			if (!old_has_bucket && !new_in_bucket)
 				continue;
-			hi_idx = (unsigned int) __builtin_popcount(
-					(unsigned int) (old_hi_bm & (hi_bit - 1U)));
-			lo_flag = ft_dereference_acquire(old_hi->ptrs[hi_idx]);
-			if (!lo_flag)
-				continue;
-			lo = (struct cds_ft_qp16_node *) lo_flag;
-			lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
+			if (old_has_bucket) {
+				hi_idx = (unsigned int) __builtin_popcount(
+						(unsigned int) (old_hi_bm & (hi_bit - 1U)));
+				lo_flag = ft_dereference_acquire(old_hi->ptrs[hi_idx]);
+				if (lo_flag) {
+					lo = (struct cds_ft_qp16_node *) lo_flag;
+					lo_bm = uatomic_load(&lo->bitmap,
+							CMM_RELAXED);
+				}
+			}
 
 			for (j = 0; j < 16U; j++) {
 				unsigned int lo_idx;
 				struct cds_ft_inode_flag *iter;
 				uint8_t v;
+				bool old_has = (lo != NULL)
+					&& (lo_bm & (1U << j));
+				bool new_at_pos = new_in_bucket
+					&& new_lo_n == j
+					&& !new_inserted;
 
-				if (!(lo_bm & (1U << j)))
+				if (!old_has && !new_at_pos)
 					continue;
-				lo_idx = (unsigned int) __builtin_popcount(
-						(unsigned int) (lo_bm
-							& ((1U << j) - 1U)));
-				iter = ft_dereference_acquire(lo->ptrs[lo_idx]);
-				if (!iter)
-					continue;
-				if (mode == FT_RECOMPACT_DEL
-						&& *nullify_node_flag_ptr == iter)
-					continue;
+				if (new_at_pos) {
+					iter = child_node_flag;
+					new_inserted = true;
+				} else {
+					lo_idx = (unsigned int) __builtin_popcount(
+							(unsigned int) (lo_bm
+								& ((1U << j) - 1U)));
+					iter = ft_dereference_acquire(lo->ptrs[lo_idx]);
+					if (!iter)
+						continue;
+					if (mode == FT_RECOMPACT_DEL
+							&& *nullify_node_flag_ptr == iter)
+						continue;
+				}
 				v = (uint8_t) ((hi_iter << 4) | j);
 				ret = _ft_node_set_nth(ft, new_type, new_node,
 						new_node_flag, new_metadata,
@@ -15439,6 +15641,21 @@ bool cds_ft_empty(struct cds_ft *ft)
 	 * pointer array is also read-side-safe (the metadata nr_child
 	 * counter is write-side accounting).
 	 */
+#ifdef FEATURE_FT_QP
+	if (type->type_class == FT_QP) {
+		/*
+		 * For FT_QP the hi-bitmap can carry tombstones (bits left
+		 * set when the lo-bucket was reclaimed via §4.6.1) so a
+		 * bitmap != 0 does not imply non-empty.  rmeta->nr_child
+		 * is the live byte-children count (sum of lo nr_child
+		 * across hi-buckets) and drops to zero only when all
+		 * descendant bytes have been removed.
+		 */
+		if (rmeta->nr_child)
+			return false;
+		return !uatomic_load(&rmeta->external_nodes, CMM_RELAXED);
+	}
+#endif
 	if (!ft_type_is_linear(type->type_class))
 		return false;
 	if (!ft_linear_node_is_empty(type, root_node))
@@ -17973,7 +18190,11 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			if (type->type_class != FT_LINEAR &&
 			    type->type_class != FT_POPCOUNT &&
 			    type->type_class != FT_POOL &&
-			    type->type_class != FT_PIGEON) {
+			    type->type_class != FT_PIGEON
+#ifdef FEATURE_FT_QP
+			    && type->type_class != FT_QP
+#endif
+			   ) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: internal node %p has non-internal type_class %d (type_index %u)\n",
 						depth, node_flag,
