@@ -4864,6 +4864,21 @@ unsigned int ft_qp16_alloc_order(unsigned int popcount)
 }
 
 /*
+ * QP-nibble alloc-order → capacity inverse.  T0..T3 alloc orders are
+ * sequential (5..8), so the tier index is just (order - T0_order) and
+ * the capacity comes from the parallel ft_qp16_tiers[] table.  Static
+ * inline so the lookup folds at the call site.
+ */
+static inline
+unsigned int ft_qp16_capacity_from_order(unsigned int order)
+{
+	unsigned int tier = order - FT_QP16_T0_ALLOC_ORDER;
+
+	assert(tier < FT_QP16_NR_TIERS);
+	return ft_qp16_tiers[tier].max_child;
+}
+
+/*
  * QP-nibble nr_child accessor — popcount of the bitmap.  Bitmap
  * field is read relaxed; this is a pre-filter count, not a
  * synchronizing load.  Callers needing a child pointer with
@@ -5659,6 +5674,145 @@ int ft_qp_byte_replace(struct cds_ft *ft,
 	assert(*lo_slot != NULL);
 	rcu_assign_pointer(*lo_slot, newptr);
 	return 0;
+}
+
+/*
+ * QP-nibble byte-step insert — three paths sharing one entry point.
+ *
+ *   Path 1 — lo-node missing (hi-bit clear OR hi-tombstone):
+ *     1. Allocate fresh lo at T0.
+ *     2. Plant (lo_n, child) directly into the unpublished node:
+ *        ptrs[0] = child, bitmap = 1<<lo_n, nr_child = 1, parent = hi_flag.
+ *     3. Try ft_qp16_node_set_nth_safe on hi to install (hi_n, new_lo).
+ *        - Success: hi_meta->nr_child++, return 0.
+ *        - -ERANGE / -ENOSPC: free new_lo unpublished and return the
+ *          error.  Hi-side tier-up is the dispatch arm's responsibility
+ *          (same recompact-or-grow protocol as other byte-keyed types).
+ *
+ *   Path 2 — lo-node exists, in-place set_nth_safe in lo:
+ *     - Success with the slot previously NULL (clear bit OR tombstone):
+ *       lo_meta->nr_child++ — adds a new live byte to the bucket.
+ *       hi_meta->nr_child unchanged — the bucket count didn't move.
+ *     - Success with the slot previously non-NULL: live replace,
+ *       no metadata accounting change.
+ *     - -ERANGE / -ENOSPC: lo-side CoW (Path 2b).
+ *
+ *   Path 2b — lo-side CoW with recompact_and_insert:
+ *     1. new_live = lo_meta->nr_child + 1.
+ *     2. new_order = ft_qp16_alloc_order(new_live), new_capacity from
+ *        the tier table.
+ *     3. Allocate new_lo at new_order.  recompact_and_insert drops
+ *        any lo-tombstones and inserts (lo_n, child) in popcount order.
+ *     4. Set new_lo_meta->nr_child = new_live and parent = hi_flag.
+ *     5. rcu_assign_pointer(*hi_slot, new_lo) atomically swaps the
+ *        bucket; the OLD lo is RCU-freed.  hi_meta->nr_child unchanged.
+ *
+ * @hi_flag is the tagged hi-node inode_flag (used to set the lo-node's
+ * parent pointer).  @hi_capacity is the hi-node's tier capacity.
+ *
+ * Returns 0 on success.  -ERANGE / -ENOSPC are reserved for hi-side
+ * tier-up signaling — they propagate from Path 1's set_nth_safe on
+ * the hi-node.  Lo-side CoW is fully handled internally and never
+ * surfaces those errors to the caller.
+ */
+static __attribute__((unused))
+int ft_qp_byte_set(struct cds_ft *ft,
+		struct cds_ft_inode_flag *hi_flag,
+		struct cds_ft_qp16_node *hi, struct cds_ft_metadata *hi_meta,
+		uint8_t byte, struct cds_ft_inode_flag *child,
+		unsigned int hi_capacity)
+{
+	uint8_t hi_n = (uint8_t) (byte >> 4);
+	uint8_t lo_n = (uint8_t) (byte & 0xFU);
+	struct cds_ft_inode_flag **hi_slot;
+	struct cds_ft_inode_flag *lo_flag;
+	struct cds_ft_qp16_node *lo;
+	struct cds_ft_metadata *lo_meta;
+	int ret;
+
+	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0);
+
+	if (!lo_flag) {
+		/* Path 1: lo-node missing — lazy alloc + install in hi. */
+		struct cds_ft_qp16_node *new_lo;
+		struct cds_ft_metadata *new_lo_meta;
+
+		new_lo = ft_qp16_node_alloc(ft,
+				FT_QP16_T0_ALLOC_ORDER, &new_lo_meta);
+		if (!new_lo)
+			return -ENOMEM;
+		new_lo->ptrs[0] = child;
+		new_lo->bitmap = (uint16_t) (1U << lo_n);
+		new_lo_meta->nr_child = 1;
+		new_lo_meta->parent = hi_flag;
+
+		ret = ft_qp16_node_set_nth_safe(hi, hi_n,
+				(struct cds_ft_inode_flag *) new_lo, hi_capacity);
+		if (ret < 0) {
+			ft_qp16_node_free_unpublished(ft, new_lo);
+			return ret;
+		}
+		hi_meta->nr_child++;
+		return 0;
+	}
+
+	lo = (struct cds_ft_qp16_node *) lo_flag;
+	lo_meta = cds_ft_item_to_metadata(lo);
+
+	{
+		/* Peek the lo-slot to distinguish live-replace from
+		 * insert/revival for nr_child accounting.  Relaxed load is
+		 * sufficient on the write side (mutex-held). */
+		uint16_t lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
+		uint16_t lo_bit = (uint16_t) (1U << lo_n);
+		struct cds_ft_inode_flag *existing = NULL;
+		unsigned int lo_order =
+			(unsigned int) cds_ft_item_order(lo);
+		unsigned int lo_capacity =
+			ft_qp16_capacity_from_order(lo_order);
+
+		if (lo_bm & lo_bit) {
+			unsigned int lo_idx = (unsigned int) __builtin_popcount(
+					(unsigned int) (lo_bm & (lo_bit - 1U)));
+			existing = uatomic_load(&lo->ptrs[lo_idx], CMM_RELAXED);
+		}
+
+		ret = ft_qp16_node_set_nth_safe(lo, lo_n, child, lo_capacity);
+		if (ret == 0) {
+			if (!existing)
+				lo_meta->nr_child++;
+			return 0;
+		}
+		if (ret != -ERANGE && ret != -ENOSPC)
+			return ret;
+
+		/* Path 2b: lo-side CoW. */
+		{
+			struct cds_ft_qp16_node *new_lo;
+			struct cds_ft_metadata *new_lo_meta;
+			unsigned int new_live = lo_meta->nr_child + 1U;
+			unsigned int new_order = ft_qp16_alloc_order(new_live);
+			unsigned int new_capacity =
+				ft_qp16_capacity_from_order(new_order);
+
+			new_lo = ft_qp16_node_alloc(ft, new_order,
+					&new_lo_meta);
+			if (!new_lo)
+				return -ENOMEM;
+			ret = ft_qp16_node_recompact_and_insert(new_lo, lo,
+					lo_n, child, new_capacity);
+			if (ret < 0) {
+				ft_qp16_node_free_unpublished(ft, new_lo);
+				return ret;
+			}
+			new_lo_meta->nr_child = new_live;
+			new_lo_meta->parent = hi_flag;
+			rcu_assign_pointer(*hi_slot,
+					(struct cds_ft_inode_flag *) new_lo);
+			ft_qp16_node_free_rcu(ft, lo);
+			return 0;
+		}
+	}
 }
 #endif /* FEATURE_FT_QP */
 
