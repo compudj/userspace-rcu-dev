@@ -1521,9 +1521,7 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
  * parallel; the compiler emits a CMOV, keeping the critical path
  * to 4 cycles.
  */
-/* Forward declarations for nr_keys helpers (defined after density accessors). */
-static inline bool ft_density_is_extended(const struct cds_ft_metadata *m);
-static void ft_density_promote(struct cds_ft *ft, struct cds_ft_metadata *m);
+/* Forward declarations for nr_keys helpers. */
 static inline unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m);
 static inline unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m);
 static inline void ft_nr_keys_store(struct cds_ft *ft, struct cds_ft_metadata *m, unsigned long val, int mo);
@@ -10922,175 +10920,33 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
  * for simplicity.
  */
 /*
- * Compact density counter accessors.
+ * nr_keys accessors.
  *
- * ft_density_get: read counter[idx] from compact or extended storage.
- * ft_density_promote: allocate extended storage, copy compact values.
- * ft_density_set: write counter[idx], promoting to extended on overflow.
- * ft_density_add: saturating add (clamped at 0 on underflow).
- * ft_density_sub: saturating subtract (clamped at 0 on underflow).
- * ft_density_free: free extended storage (called on node reclaim).
+ * ft_nr_keys_get: write-side load (under mutex).
+ * ft_nr_keys_load: read-side acquire load.
+ * ft_nr_keys_store: write-side store with caller-specified memory order.
  *
- * All write-side only (mutex-held).
- */
-static inline
-bool ft_density_is_extended(const struct cds_ft_metadata *m)
-{
-	return m->nr_keys == UINT32_MAX;
-}
-
-static inline
-unsigned long ft_density_get(const struct cds_ft_metadata *m __attribute__((unused)),
-		unsigned int idx __attribute__((unused)))
-{
-	/* Density tracking removed (was collapse-decision driven); always 0. */
-	return 0;
-}
-
-/*
- * Density pool: pre-allocated free list of cds_ft_density_extended
- * structs, per trie.  Topped up at mutation entry where -ENOMEM can
- * be cleanly returned; drawn from in ft_density_promote after the
- * point of no return.
- */
-static
-int ft_density_pool_ensure(struct cds_ft *ft, unsigned int needed)
-{
-	struct cds_ft_density_extended *ext;
-
-	while (ft->density_pool_count < needed) {
-		ext = calloc(1, sizeof(*ext));
-		if (!ext)
-			return -ENOMEM;
-		ext->next = ft->density_pool;
-		ft->density_pool = ext;
-		ft->density_pool_count++;
-	}
-	return 0;
-}
-
-static inline
-struct cds_ft_density_extended *ft_density_pool_alloc(struct cds_ft *ft)
-{
-	struct cds_ft_density_extended *ext = ft->density_pool;
-
-	assert(ext);
-	ft->density_pool = ext->next;
-	ft->density_pool_count--;
-	memset(ext, 0, sizeof(*ext));
-	return ext;
-}
-
-static
-void ft_density_pool_destroy(struct cds_ft *ft)
-{
-	struct cds_ft_density_extended *ext, *next;
-
-	for (ext = ft->density_pool; ext; ext = next) {
-		next = ext->next;
-		free(ext);
-	}
-	ft->density_pool = NULL;
-}
-
-static
-void ft_density_promote(struct cds_ft *ft, struct cds_ft_metadata *m)
-{
-	struct cds_ft_density_extended *ext;
-	unsigned int i;
-
-	ext = ft_density_pool_alloc(ft);
-	for (i = 0; i < FT_NODE_DENSITY_DEPTH; i++)
-		ext->nr_nodes_at_depth[i] = m->nr_nodes_at_depth[i];
-	ext->nr_keys = m->nr_keys;
-	/*
-	 * Store density_ext pointer into the union first, then
-	 * publish via nr_keys = UINT32_MAX with release.  Readers
-	 * doing acquire-load on nr_keys that see UINT32_MAX are
-	 * guaranteed to see the valid density_ext pointer.
-	 */
-	m->density_ext = ext;
-	uatomic_store(&m->nr_keys, UINT32_MAX, CMM_RELEASE);
-}
-
-/*
- * ft_nr_keys_get: read nr_keys from compact or extended storage.
- * Write-side only (non-atomic read under mutex).
+ * nr_keys is full unsigned-long width; the historical UINT32_MAX
+ * "promoted" sentinel and the per-depth uint8_t density counters were
+ * removed when the collapse heuristic that drove them was retired.
  */
 static inline
 unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m)
 {
-	if (caa_unlikely(ft_density_is_extended(m)))
-		return m->density_ext->nr_keys;
 	return m->nr_keys;
 }
 
-/*
- * ft_nr_keys_load: read nr_keys with acquire semantics.
- * Read-side safe (concurrent with writers).
- */
 static inline
 unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
 {
-	uint32_t val = uatomic_load(&m->nr_keys, CMM_ACQUIRE);
-
-	if (caa_unlikely(val == UINT32_MAX))
-		return uatomic_load(&m->density_ext->nr_keys, CMM_ACQUIRE);
-	return val;
-}
-
-/*
- * ft_nr_keys_store: write nr_keys with specified memory order.
- * If compact and val would reach UINT32_MAX, promotes first.
- * Write-side only (mutex-held).
- */
-static inline
-void ft_nr_keys_store(struct cds_ft *ft, struct cds_ft_metadata *m, unsigned long val, int mo)
-{
-	if (caa_unlikely(ft_density_is_extended(m))) {
-		uatomic_store(&m->density_ext->nr_keys, val, mo);
-		return;
-	}
-	if (caa_unlikely(val >= UINT32_MAX)) {
-		ft_density_promote(ft, m);
-		uatomic_store(&m->density_ext->nr_keys, val, mo);
-		return;
-	}
-	uatomic_store(&m->nr_keys, (uint32_t) val, mo);
+	return uatomic_load(&m->nr_keys, CMM_ACQUIRE);
 }
 
 static inline
-void ft_density_set(struct cds_ft *ft __attribute__((unused)),
-		struct cds_ft_metadata *m __attribute__((unused)),
-		unsigned int idx __attribute__((unused)),
-		unsigned long val __attribute__((unused)))
+void ft_nr_keys_store(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_metadata *m, unsigned long val, int mo)
 {
-	/* Density tracking removed (was collapse-decision driven); no-op. */
-}
-
-static inline
-void ft_density_add(struct cds_ft *ft __attribute__((unused)),
-		struct cds_ft_metadata *m __attribute__((unused)),
-		unsigned int idx __attribute__((unused)),
-		long delta __attribute__((unused)))
-{
-	/* Density tracking removed (was collapse-decision driven); no-op. */
-}
-
-static inline
-void ft_density_sub(struct cds_ft *ft __attribute__((unused)),
-		struct cds_ft_metadata *m __attribute__((unused)),
-		unsigned int idx __attribute__((unused)),
-		unsigned long sub __attribute__((unused)))
-{
-	/* Density tracking removed (was collapse-decision driven); no-op. */
-}
-
-static inline
-void ft_density_free(struct cds_ft_metadata *m)
-{
-	if (ft_density_is_extended(m))
-		free(m->density_ext);
+	uatomic_store(&m->nr_keys, val, mo);
 }
 
 /*
@@ -12280,8 +12136,6 @@ int _cds_ft_insert(struct cds_ft *ft,
 	/* Expect zeroed prev/next pointers. This catches some double-insert misuses. */
 	if (node->prev || node->next)
 		return -EINVAL;
-	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH))
-		return -ENOMEM;
 
 	key_depth = key_len + 1;
 
@@ -12555,8 +12409,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	/* Expect zeroed prev/next pointers. */
 	if (node->prev || node->next)
 		return -EINVAL;
-	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH))
-		return -ENOMEM;
 
 	key_depth = key_len + 1;
 
@@ -13428,10 +13280,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
-	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH)) {
-		FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
-		return CDS_FT_STATUS_MEMORY_ERROR;
-	}
 
 	iter_key = iter_key(iter);
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
@@ -13627,10 +13475,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	if (!valid_key_len(ft, key_len)) {
 		*result_node = NULL;
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	}
-	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH)) {
-		*result_node = NULL;
-		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
 	/*
@@ -14552,8 +14396,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
 	if (key_len > 0 && src_max > dst_ft->group->max_key_len - key_len)
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	if (ft_density_pool_ensure(dst_ft, FT_MAX_DEPTH))
-		return CDS_FT_STATUS_MEMORY_ERROR;
 
 	src_rmeta = ft_root_metadata(src_ft);
 
@@ -14779,10 +14621,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	if (key_len > 0 && swap_max > dst_ft->group->max_key_len - key_len) {
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	}
-	if (ft_density_pool_ensure(dst_ft, FT_MAX_DEPTH)) {
-		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
-		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
 	if (key_len == 0) {
@@ -15086,9 +14924,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		ft_key_to_ordinals(ordinal_buf, _key, key_len, km);
 		key = ordinal_buf;
 	}
-
-	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH))
-		return CDS_FT_STATUS_MEMORY_ERROR;
 
 	if (key_len == 0) {
 		struct cds_ft_metadata *rmeta = ft_root_metadata(ft);
@@ -17218,8 +17053,7 @@ bool cds_ft_verify_at_mutation_enabled(void)
 /*
  * Set the verify-at-mutation sampling period for @ft.  When the
  * library is built with -DFEATURE_FT_VERIFY_AT_MUTATION, the writer
- * scope-exit hook runs cds_ft_verify + cds_ft_verify_density once
- * every @period mutations.
+ * scope-exit hook runs cds_ft_verify once every @period mutations.
  *
  *   period == 0 : disable the verify walk on this trie (the
  *                 increment-and-compare still runs in the hook).
@@ -17468,13 +17302,6 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->root = ft_node_flag(root_node, 0);
 	FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
-	if (ft_density_pool_ensure(ft, FT_MAX_DEPTH)) {
-		free_cds_ft_node(ft, root_node);
-		free(ft);
-		*result_ft = NULL;
-		return CDS_FT_STATUS_MEMORY_ERROR;
-	}
-
 	uatomic_inc(&ft_group->nr_ft_instances, CMM_RELAXED);
 	*result_ft = ft;
 	FT_TP(ft_create, (const void *) ft, (const void *) ft_group);
@@ -17547,7 +17374,6 @@ void cds_ft_destroy(struct cds_ft *ft)
 	/* Wait for in-flight call_rcu free to complete. */
 	flavor->barrier();
 	ft_final_checks(ft);
-	ft_density_pool_destroy(ft);
 	uatomic_dec(&ft->group->nr_ft_instances, CMM_RELAXED);
 	free(ft);
 }
@@ -18109,21 +17935,6 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			return -1;
 		}
 		/*
-		 * Density / nr_keys promotion sanity.  The compact-vs-extended
-		 * discriminator is m->nr_keys == UINT32_MAX; ft_density_promote
-		 * assigns m->density_ext before publishing the sentinel via a
-		 * release store.  A torn or rolled-back promotion that leaves
-		 * the sentinel set without a backing density_ext would cause
-		 * the very next ft_density_get / ft_nr_keys_get to dereference
-		 * NULL — flag it here with a clean diagnostic instead.
-		 */
-		if (ft_density_is_extended(m) && m->density_ext == NULL) {
-			if (out)
-				fprintf(out, "ft_verify: depth %u: node %p has nr_keys==UINT32_MAX (promoted) but density_ext is NULL\n",
-					depth, node_flag);
-			return -1;
-		}
-		/*
 		 * alloc_index round-trip: cds_ft_metadata_to_item walks back
 		 * from the metadata to the arena slot using m->alloc_index.
 		 * It must land on this very node; a corrupted alloc_index
@@ -18472,28 +18283,17 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	return CDS_FT_STATUS_OK;
 }
 
-/*
- * Density tracking is unused now that collapse is gone — the public
- * verify API is preserved as a no-op for ABI compatibility.
- */
-enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft __attribute__((unused)),
-		FILE *out __attribute__((unused)))
-{
-	return CDS_FT_STATUS_OK;
-}
-
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 /*
  * Hook called from CDS_FT_SCOPED_WRITER's scope-exit, before the
  * writer claim is released.  Sampled by the per-trie
- * @verify_at_mutation_period: the full cds_ft_verify +
- * cds_ft_verify_density walk runs once every @period mutations.  The
- * counter is incremented and reset on the boundary so it never
- * exceeds @period - 1, avoiding any overflow / cadence-drift issue
- * on long-running workloads.  Period 0 disables the walk entirely
- * (only the increment-and-compare runs).  On any mismatch, both
- * verifiers run to completion before aborting so we get the full
- * diagnostic.
+ * @verify_at_mutation_period: the full cds_ft_verify walk runs once
+ * every @period mutations.  The counter is incremented and reset on
+ * the boundary so it never exceeds @period - 1, avoiding any overflow
+ * / cadence-drift issue on long-running workloads.  Period 0 disables
+ * the walk entirely (only the increment-and-compare runs).  On any
+ * mismatch the verifier runs to completion before aborting so we get
+ * the full diagnostic.
  */
 void ft_writer_scope_verify(struct cds_ft *ft)
 {
@@ -18508,8 +18308,6 @@ void ft_writer_scope_verify(struct cds_ft *ft)
 	ft->verify_at_mutation_counter = 0;
 
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
-		fail = true;
-	if (cds_ft_verify_density(ft, stderr) != CDS_FT_STATUS_OK)
 		fail = true;
 	if (fail) {
 		fprintf(stderr, "FT verify-at-mutation: invariant violation on ft=%p\n",
@@ -18531,18 +18329,6 @@ void print_indent(FILE *out, int level)
 static void show_node_recursive(const struct cds_ft *ft, FILE *out,
 		struct cds_ft_inode_flag *node_flag, int level);
 
-static void print_density(FILE *out, const struct cds_ft_metadata *m)
-{
-	int i;
-
-	fprintf(out, "[");
-	for (i = 0; i < FT_NODE_DENSITY_DEPTH; i++) {
-		if (i) fprintf(out, " ");
-		fprintf(out, "%lu", ft_density_get(m, i));
-	}
-	fprintf(out, "]");
-}
-
 void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode_flag *node_flag, int level)
 {
 	unsigned int key;
@@ -18561,10 +18347,8 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			print_indent(out, level);
-			fprintf(out, "Level %d, key value: %u, internal node: %p, nr_children: %u, density: ",
+			fprintf(out, "Level %d, key value: %u, internal node: %p, nr_children: %u\n",
 				level, key, child_node_flag, metadata->nr_child);
-			print_density(out, metadata);
-			fprintf(out, "\n");
 			if (external_nodes) {
 				print_indent(out, level);
 				fprintf(out, "Level %d, key value: %u, (meta)external node list ptr: %p\n",
@@ -18579,11 +18363,9 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
 
 			print_indent(out, level);
-			fprintf(out, "Level %d, key value: %u, compressed node: %p, path_len: %u, nr_keys: %lu, density: ",
+			fprintf(out, "Level %d, key value: %u, compressed node: %p, path_len: %u, nr_keys: %lu\n",
 				level, key, child_node_flag, (unsigned int) cn->len,
 				ft_nr_keys_get(metadata));
-			print_density(out, metadata);
-			fprintf(out, "\n");
 			if (external_nodes) {
 				print_indent(out, level);
 				fprintf(out, "Level %d, key value: %u, (meta)external node list ptr: %p\n",
@@ -18620,10 +18402,9 @@ void show_pretty(const struct cds_ft *ft, FILE *out)
 	{
 		struct cds_ft_metadata *rm = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 
+		(void) rm;
 		print_indent(out, level);
-		fprintf(out, "Level 0: root node %p, density: ", node_flag);
-		print_density(out, rm);
-		fprintf(out, "\n");
+		fprintf(out, "Level 0: root node %p\n", node_flag);
 	}
 	show_node_recursive(ft, out, node_flag, level + 1);
 	fprintf(out, "---------------------------------------------------\n");
@@ -18711,19 +18492,6 @@ const char *internal_type_name(unsigned int type_index)
 }
 
 static
-void json_emit_density(FILE *out, const struct cds_ft_metadata *m)
-{
-	int i;
-
-	fprintf(out, "[");
-	for (i = 0; i < FT_NODE_DENSITY_DEPTH; i++) {
-		if (i) fprintf(out, ",");
-		fprintf(out, "%lu", ft_density_get(m, i));
-	}
-	fprintf(out, "]");
-}
-
-static
 void json_emit_node(const struct cds_ft *ft, FILE *out,
 		struct cds_ft_inode_flag *node_flag, int level)
 {
@@ -18747,11 +18515,9 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 
 		fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"COMPRESSED\","
 			"\"level\":%d,\"path_len\":%u,\"nr_keys\":%lu,"
-			"\"density\":",
+			"\"key_bytes\":[",
 			node_flag, level, (unsigned int) cn->len,
 			ft_nr_keys_get(metadata));
-		json_emit_density(out, metadata);
-		fprintf(out, ",\"key_bytes\":[");
 		for (j = 0; j < cn->len; j++) {
 			if (j) fprintf(out, ",");
 			fprintf(out, "%u", cn->key_bytes[j]);
@@ -18778,10 +18544,9 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 		unsigned int key, printed = 0;
 
 		fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"%s\",\"level\":%d,"
-			"\"nr_child\":%u,\"density\":",
+			"\"nr_child\":%u",
 			node_flag, internal_type_name(type_index), level,
 			metadata->nr_child);
-		json_emit_density(out, metadata);
 		if (external_nodes)
 			fprintf(out, ",\"external_nodes\":\"%p\"",
 				(void *) external_nodes);
