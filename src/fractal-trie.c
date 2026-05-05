@@ -6162,6 +6162,62 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 		}
 		return false;
 	}
+#ifdef FEATURE_FT_QP
+	case FT_QP:
+	{
+		struct cds_ft_qp16_node *hi = (struct cds_ft_qp16_node *) node;
+		uint16_t hi_bm = uatomic_load(&hi->bitmap, CMM_RELAXED);
+		unsigned int hi_iter;
+
+		/*
+		 * Walk the (hi, lo) bitmap lattice directly — get_ith_pos
+		 * conflates "past end" with "tombstone slot at this i", and
+		 * we want to skip tombstones cleanly.  At most 16 * 16 =
+		 * 256 bit tests with early exit on the first matching child.
+		 */
+		for (hi_iter = 0; hi_iter < 16U; hi_iter++) {
+			uint16_t hi_bit = (uint16_t) (1U << hi_iter);
+			unsigned int hi_idx;
+			struct cds_ft_inode_flag *lo_flag;
+			struct cds_ft_qp16_node *lo;
+			uint16_t lo_bm;
+			unsigned int j;
+
+			if (!(hi_bm & hi_bit))
+				continue;
+			hi_idx = (unsigned int) __builtin_popcount(
+					(unsigned int) (hi_bm & (hi_bit - 1U)));
+			lo_flag = ft_dereference_acquire(hi->ptrs[hi_idx]);
+			if (!lo_flag)
+				continue;
+			lo = (struct cds_ft_qp16_node *) lo_flag;
+			lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
+
+			for (j = 0; j < 16U; j++) {
+				unsigned int lo_idx;
+				struct cds_ft_inode_flag *iter;
+
+				if (!(lo_bm & (1U << j)))
+					continue;
+				lo_idx = (unsigned int) __builtin_popcount(
+						(unsigned int) (lo_bm
+							& ((1U << j) - 1U)));
+				iter = ft_dereference_acquire(lo->ptrs[lo_idx]);
+				if (iter == child_nf) {
+					uint8_t byte = (uint8_t) ((hi_iter << 4) | j);
+
+					if (n_ret)
+						*n_ret = byte;
+					if (slot_ret)
+						ft_node_get_nth(parent_nf, slot_ret,
+								byte, FT_PF_NONE);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+#endif
 	default:
 		assert(0);
 		return false;
@@ -6203,6 +6259,13 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	case FT_PIGEON:
 		child = ft_pigeon_node_get_direction(type, node, n, result_key, dir);
 		break;
+#ifdef FEATURE_FT_QP
+	case FT_QP:
+		child = ft_qp_byte_get_direction(
+				(struct cds_ft_qp16_node *) node,
+				n, result_key, dir);
+		break;
+#endif
 	default:
 		assert(0);
 		return (void *) -1UL;
