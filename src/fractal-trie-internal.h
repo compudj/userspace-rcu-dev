@@ -213,6 +213,25 @@
 # define FT_POOL_IDX_B	6
 #endif
 
+#ifdef FEATURE_FT_QP
+/*
+ * Type-index reservation for QP lo-nodes.
+ *
+ * Hi-nodes use indices 0..3 (tier-encoded).  PIGEON uses index 4.
+ * Lo-nodes are stored in their parent hi-node's ptrs[] as TAGGED
+ * internal flags so the upward parent walk (via meta->parent) can
+ * reach them as proper nodes.  We give them a distinct type-index so
+ * ft_parent_depth_span (and other walk consumers) can recognize lo
+ * by tag alone — no metadata bit, no extra load.  The lo's allocation
+ * tier is recovered from cds_ft_item_order() when needed.
+ *
+ * ft_types[FT_QP_LO_TYPE_INDEX] is FT_NULL filler: lo-nodes never
+ * appear as descent targets (descent always enters via hi), so no
+ * type-class dispatch is performed on this index.
+ */
+# define FT_QP_LO_TYPE_INDEX	5U
+#endif
+
 /*
  * Number of removals needed on a fallback node before we try to shrink
  * it.  Derived from FT_FALLBACK_REMOVAL_BITS to always use the full

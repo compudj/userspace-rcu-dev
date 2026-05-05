@@ -1524,6 +1524,11 @@ static inline unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m);
 static inline void ft_nr_keys_store(struct cds_ft *ft, struct cds_ft_metadata *m, unsigned long val, int mo);
 static unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag *child_nf);
+#ifdef FEATURE_FT_QP
+struct cds_ft_qp16_node;
+static inline struct cds_ft_inode_flag *ft_qp16_lo_flag(
+		struct cds_ft_qp16_node *lo);
+#endif
 
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
@@ -1536,8 +1541,20 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	 * dispatch, so this runs in parallel with the ADDR_MASK AND
 	 * below (full ILP).
 	 */
+#ifdef FEATURE_FT_QP
+	/*
+	 * No pool / 2D-bitsel encoding under FEATURE_FT_QP — internal
+	 * flags carry only the 4 tag bits (INTERNAL_MASK + 3-bit type),
+	 * so a fixed ~15UL mask suffices.  Hi tiers 0..3 and the lo
+	 * type-index (FT_QP_LO_TYPE_INDEX) all need the same mask;
+	 * dropping the type-dependent shift prevents over-clearing bits
+	 * 4..8 that the lo-flag's address actually uses.
+	 */
+	unsigned long mask = (v & 1) ? ~15UL : ~7UL;
+#else
 	unsigned long mask_internal = (~15UL) << ((v >> 1) & 7);
 	unsigned long mask = (v & 1) ? mask_internal : ~7UL;
+#endif
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
@@ -1564,7 +1581,12 @@ static inline_lookup
 struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
+#ifdef FEATURE_FT_QP
+	/* See ft_node_ptr: no pool encoding under FT_QP, fixed ~15UL mask. */
+	unsigned long mask = ~15UL;
+#else
 	unsigned long mask = (~15UL) << ((v >> 1) & 7);
+#endif
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	v &= FT_ADDR_MASK;
@@ -2089,6 +2111,32 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 #endif
 	if (!child_nf)
 		return;
+#ifdef FEATURE_FT_QP
+	/*
+	 * Option 3: byte-keyed children of a QP hi-node carry the tagged
+	 * lo-flag as their parent (slot is in the lo arena, not in the hi
+	 * node).  When callers pass the hi-flag with a lo-side @slot —
+	 * the convention used by every byte-step insert/replace path —
+	 * resolve to the lo-flag derived from the slot's containing
+	 * arena allocation so that meta->parent stays internally
+	 * consistent and ft_set_skip_slot's 8-bit offset is bounded.
+	 */
+	if (slot && parent_nf && ft_node_internal(parent_nf)) {
+		unsigned int p_type = ft_node_type(parent_nf);
+
+		if (p_type < FT_QP16_NR_TIERS) {
+			void *p_addr = ft_node_ptr(parent_nf);
+			size_t lo_order = cds_ft_item_order(slot);
+			void *lo_base = (void *) ((unsigned long) slot
+				& ~((1UL << lo_order) - 1UL));
+
+			if (lo_base != p_addr) {
+				parent_nf = ft_qp16_lo_flag(
+					(struct cds_ft_qp16_node *) lo_base);
+			}
+		}
+	}
+#endif
 	FT_TP(set_parent, (const void *) child_nf, (const void *) parent_nf);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (ft_node_skip_compressed(child_nf)) {
@@ -4939,6 +4987,26 @@ unsigned int ft_qp16_capacity_from_order(unsigned int order)
 }
 
 /*
+ * QP-nibble lo-flag builder.
+ *
+ * Lo-nodes are stored TAGGED in their parent hi-node's ptrs[i] so the
+ * upward parent walk (via meta->parent) reaches them as proper
+ * internal flags.  All lo-nodes share a single reserved type-index
+ * (FT_QP_LO_TYPE_INDEX) regardless of tier; the tier is recovered from
+ * cds_ft_item_order() when needed.  Hi-nodes keep their tier-encoded
+ * type-index (0..3) — the distinct lo tag lets ft_parent_depth_span
+ * collapse the (hi, lo) pair to one byte step without consulting the
+ * metadata.
+ */
+static inline
+struct cds_ft_inode_flag *ft_qp16_lo_flag(struct cds_ft_qp16_node *lo)
+{
+	return (struct cds_ft_inode_flag *) (((unsigned long) lo) |
+		((unsigned long) FT_QP_LO_TYPE_INDEX << FT_INTERNAL_BITS) |
+		FT_INTERNAL_MASK);
+}
+
+/*
  * QP-nibble nr_child accessor — popcount of the bitmap.  Bitmap
  * field is read relaxed; this is a pre-filter count, not a
  * synchronizing load.  Callers needing a child pointer with
@@ -5442,7 +5510,7 @@ struct cds_ft_inode_flag *ft_qp_byte_get(
 			*ptr_slot_p = NULL;
 		return NULL;
 	}
-	lo = (struct cds_ft_qp16_node *) lo_flag;
+	lo = (struct cds_ft_qp16_node *) ft_node_ptr(lo_flag);
 	return ft_qp16_node_descend(lo, ptr_slot_p,
 			(uint8_t) (byte & 0xFU), pf_hint, 1);
 }
@@ -5509,7 +5577,7 @@ struct cds_ft_inode_flag *ft_qp_byte_get_direction(
 		lo_flag = ft_dereference_acquire(hi->ptrs[hi_idx]);
 		if (!lo_flag)
 			continue;
-		lo = (struct cds_ft_qp16_node *) lo_flag;
+		lo = (struct cds_ft_qp16_node *) ft_node_ptr(lo_flag);
 		lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
 
 		/*
@@ -5617,7 +5685,7 @@ struct cds_ft_inode_flag *ft_qp_byte_get_ith_pos(
 		lo_flag = ft_dereference_acquire(hi->ptrs[hi_idx]);
 		if (!lo_flag)
 			continue;
-		lo = (struct cds_ft_qp16_node *) lo_flag;
+		lo = (struct cds_ft_qp16_node *) ft_node_ptr(lo_flag);
 		lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
 
 		for (j = 0; j < 16U; j++) {
@@ -5693,7 +5761,7 @@ int ft_qp_byte_clear(struct cds_ft *ft,
 
 	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0);
 	assert(lo_flag);
-	lo = (struct cds_ft_qp16_node *) lo_flag;
+	lo = (struct cds_ft_qp16_node *) ft_node_ptr(lo_flag);
 	lo_meta = cds_ft_item_to_metadata(lo);
 
 	assert(lo_meta->nr_child > 0);
@@ -5803,6 +5871,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 		/* Path 1: lo-node missing — lazy alloc + install in hi. */
 		struct cds_ft_qp16_node *new_lo;
 		struct cds_ft_metadata *new_lo_meta;
+		struct cds_ft_inode_flag *new_lo_flag;
 
 		new_lo = ft_qp16_node_alloc(ft,
 				FT_QP16_T0_ALLOC_ORDER, &new_lo_meta);
@@ -5812,19 +5881,27 @@ int ft_qp_byte_set(struct cds_ft *ft,
 		new_lo->bitmap = (uint16_t) (1U << lo_n);
 		new_lo_meta->nr_child = 1;
 		new_lo_meta->parent = hi_flag;
+		new_lo_flag = ft_qp16_lo_flag(new_lo);
 
 		ret = ft_qp16_node_set_nth_safe(hi, hi_n,
-				(struct cds_ft_inode_flag *) new_lo, hi_capacity);
+				new_lo_flag, hi_capacity);
 		if (ret < 0) {
 			ft_qp16_node_free_unpublished(ft, new_lo);
 			return ret;
 		}
 		/* hi_meta->nr_child = total byte children. +1 for the new byte. */
 		hi_meta->nr_child++;
+		/*
+		 * Direct child of new_lo: parent = tagged lo-flag, slot is in
+		 * the lo-arena (8-bit skip_slot_offset is bounded).  Must run
+		 * after new_lo is published in hi so a concurrent reader can
+		 * resolve the parent walk back to the live tree.
+		 */
+		ft_set_parent(child, new_lo_flag, &new_lo->ptrs[0]);
 		return 0;
 	}
 
-	lo = (struct cds_ft_qp16_node *) lo_flag;
+	lo = (struct cds_ft_qp16_node *) ft_node_ptr(lo_flag);
 	lo_meta = cds_ft_item_to_metadata(lo);
 
 	{
@@ -5847,10 +5924,18 @@ int ft_qp_byte_set(struct cds_ft *ft,
 
 		ret = ft_qp16_node_set_nth_safe(lo, lo_n, child, lo_capacity);
 		if (ret == 0) {
+			unsigned int lo_idx_after;
+			uint16_t lo_bm_after =
+				uatomic_load(&lo->bitmap, CMM_RELAXED);
+
 			if (!existing) {
 				lo_meta->nr_child++;
 				hi_meta->nr_child++;
 			}
+			lo_idx_after = (unsigned int) __builtin_popcount(
+					(unsigned int) (lo_bm_after
+						& (lo_bit - 1U)));
+			ft_set_parent(child, lo_flag, &lo->ptrs[lo_idx_after]);
 			return 0;
 		}
 		if (ret != -ERANGE && ret != -ENOSPC)
@@ -5860,10 +5945,13 @@ int ft_qp_byte_set(struct cds_ft *ft,
 		{
 			struct cds_ft_qp16_node *new_lo;
 			struct cds_ft_metadata *new_lo_meta;
+			struct cds_ft_inode_flag *new_lo_flag;
 			unsigned int new_live = lo_meta->nr_child + 1U;
 			unsigned int new_order = ft_qp16_alloc_order(new_live);
 			unsigned int new_capacity =
 				ft_qp16_capacity_from_order(new_order);
+			uint16_t new_bm;
+			unsigned int b;
 
 			new_lo = ft_qp16_node_alloc(ft, new_order,
 					&new_lo_meta);
@@ -5877,8 +5965,30 @@ int ft_qp_byte_set(struct cds_ft *ft,
 			}
 			new_lo_meta->nr_child = new_live;
 			new_lo_meta->parent = hi_flag;
-			rcu_assign_pointer(*hi_slot,
-					(struct cds_ft_inode_flag *) new_lo);
+			new_lo_flag = ft_qp16_lo_flag(new_lo);
+			rcu_assign_pointer(*hi_slot, new_lo_flag);
+			/*
+			 * Reparent every surviving child of new_lo to the new
+			 * lo-flag.  Includes the freshly-inserted @child.  The
+			 * old lo's slot addresses are stale; children must
+			 * track the new lo-arena slot (skip_slot_offset).
+			 */
+			new_bm = new_lo->bitmap;
+			for (b = 0; b < 16U; b++) {
+				unsigned int new_idx;
+				struct cds_ft_inode_flag *iter;
+
+				if (!(new_bm & (uint16_t) (1U << b)))
+					continue;
+				new_idx = (unsigned int) __builtin_popcount(
+						(unsigned int) (new_bm
+							& ((1U << b) - 1U)));
+				iter = new_lo->ptrs[new_idx];
+				if (!iter)
+					continue;
+				ft_set_parent(iter, new_lo_flag,
+					&new_lo->ptrs[new_idx]);
+			}
 			ft_qp16_node_free_rcu(ft, lo);
 			hi_meta->nr_child++;
 			return 0;
@@ -6288,7 +6398,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 			lo_flag = ft_dereference_acquire(hi->ptrs[hi_idx]);
 			if (!lo_flag)
 				continue;
-			lo = (struct cds_ft_qp16_node *) lo_flag;
+			lo = (struct cds_ft_qp16_node *) ft_node_ptr(lo_flag);
 			lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
 
 			for (j = 0; j < 16U; j++) {
@@ -8143,7 +8253,8 @@ retry:		/* for fallback */
 						(unsigned int) (old_hi_bm & (hi_bit - 1U)));
 				lo_flag = ft_dereference_acquire(old_hi->ptrs[hi_idx]);
 				if (lo_flag) {
-					lo = (struct cds_ft_qp16_node *) lo_flag;
+					lo = (struct cds_ft_qp16_node *)
+						ft_node_ptr(lo_flag);
 					lo_bm = uatomic_load(&lo->bitmap,
 							CMM_RELAXED);
 				}
@@ -8470,14 +8581,27 @@ skip_copy:
 				lo_flag = new_hi->ptrs[hi_idx];
 				if (!lo_flag)
 					continue;
-				lo = (struct cds_ft_qp16_node *) lo_flag;
+				lo = (struct cds_ft_qp16_node *)
+					ft_node_ptr(lo_flag);
 				lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
+
+				/*
+				 * Lo-nodes are reused from the old hi (recompact
+				 * only swaps the hi).  Repoint each surviving
+				 * lo's parent at the freshly published new hi
+				 * before the old hi is RCU-freed.
+				 */
+				{
+					struct cds_ft_metadata *lo_meta =
+						cds_ft_item_to_metadata(lo);
+
+					rcu_assign_pointer(lo_meta->parent,
+						new_node_flag);
+				}
 
 				for (j = 0; j < 16U; j++) {
 					unsigned int lo_idx;
 					struct cds_ft_inode_flag *iter;
-					struct cds_ft_inode_flag **slot = NULL;
-					uint8_t v;
 
 					if (!(lo_bm & (1U << j)))
 						continue;
@@ -8487,10 +8611,13 @@ skip_copy:
 					iter = lo->ptrs[lo_idx];
 					if (!iter)
 						continue;
-					v = (uint8_t) ((hi_iter << 4) | j);
-					ft_node_get_nth_skip(new_node_flag,
-							&slot, v, FT_PF_NONE);
-					ft_set_parent(iter, new_node_flag, slot);
+					/*
+					 * Direct child of lo: parent = tagged
+					 * lo-flag (not new_node_flag).  Slot
+					 * is in the lo-arena allocation.
+					 */
+					ft_set_parent(iter, lo_flag,
+						&lo->ptrs[lo_idx]);
 				}
 			}
 			break;
@@ -8624,12 +8751,23 @@ int ft_node_set_nth(struct cds_ft *ft,
 		 * In-place insert succeeded on the published target node.
 		 * Safe to link child -> target via parent pointer now:
 		 * target is already fully valid to readers.
+		 *
+		 * Under FEATURE_FT_QP the FT_QP arm of _ft_node_set_nth
+		 * (ft_qp_byte_set) already records the child's parent as the
+		 * tagged lo-flag — overwriting it here with @node_flag (the
+		 * hi-flag) would clobber the (hi, lo) parent semantics, so
+		 * skip the secondary ft_set_parent for QP nodes.
 		 */
-		struct cds_ft_inode_flag **slot_ptr = NULL;
+#ifdef FEATURE_FT_QP
+		if (type->type_class != FT_QP)
+#endif
+		{
+			struct cds_ft_inode_flag **slot_ptr = NULL;
 
-		if (ft_node_skip_compressed(child_node_flag))
-			ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
-		ft_set_parent(child_node_flag, *node_flag, slot_ptr);
+			if (ft_node_skip_compressed(child_node_flag))
+				ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
+			ft_set_parent(child_node_flag, *node_flag, slot_ptr);
+		}
 		break;
 	}
 	case -ENOSPC:
@@ -10989,6 +11127,10 @@ void ft_propagate_external_count_parent(struct cds_ft *ft,
  *          cn->len for compressed nodes,
  *          suffix_len for the matching collapsed entry.
  *
+ * Under FEATURE_FT_QP, lo-nodes contribute 0: a (hi, lo) pair shares
+ * one byte step in the trie — hi handles the hi-nibble, lo handles
+ * the lo-nibble — so the upward walk treats the pair as one tier.
+ *
  * Write-side only (mutex-held).
  */
 static
@@ -11000,6 +11142,10 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 			ft_compressed_node_ptr(parent_nf);
 		return cn->len;
 	}
+#ifdef FEATURE_FT_QP
+	if (ft_node_type(parent_nf) == FT_QP_LO_TYPE_INDEX)
+		return 0;
+#endif
 	/* Internal node: dispatches on one key byte. */
 	return 1;
 }
@@ -17972,6 +18118,8 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			struct cds_ft_inode_flag *child_raw =
 				ft_node_get_nth_skip(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 			struct cds_ft_inode_flag *child;
+			struct cds_ft_inode_flag *child_expected_parent =
+				node_flag;
 
 			if (!child_raw)
 				continue;
@@ -17990,10 +18138,38 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			 */
 			if (path)
 				path[depth] = (uint8_t) key;
+#ifdef FEATURE_FT_QP
+			/*
+			 * Under FEATURE_FT_QP a byte step traverses (hi, lo);
+			 * the byte-keyed child's parent points at the lo-flag
+			 * (read from hi.ptrs[hi_idx]), not at @node_flag.  Other
+			 * type classes are unchanged.
+			 */
+			{
+				unsigned int t_idx = ft_node_type(node_flag);
+				const struct cds_ft_type *t_ty = &ft_types[t_idx];
+
+				if (t_idx < FT_QP16_NR_TIERS
+				    && t_ty->type_class == FT_QP) {
+					struct cds_ft_qp16_node *hi_n =
+						(struct cds_ft_qp16_node *) node;
+					uint16_t hi_bm = uatomic_load(&hi_n->bitmap,
+							CMM_RELAXED);
+					uint16_t hi_bit = (uint16_t) (1U << (key >> 4));
+					unsigned int hi_idx;
+
+					assert(hi_bm & hi_bit);
+					hi_idx = (unsigned int) __builtin_popcount(
+							(unsigned int) (hi_bm
+								& (hi_bit - 1U)));
+					child_expected_parent = hi_n->ptrs[hi_idx];
+				}
+			}
+#endif
 			if (ft_node_external(child)) {
 				/* External leaf chain at this slot. */
 				if (ft_verify_external_chain(ft, out, visited,
-						path, node_flag,
+						path, child_expected_parent,
 						(struct cds_ft_node *) ft_node_ptr(child),
 						depth + 1))
 					return -1;
@@ -18003,7 +18179,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 
 				if (ft_verify_node_recursive(ft, out, visited,
 						path, child,
-						node_flag, depth + 1,
+						child_expected_parent, depth + 1,
 						&sub_keys))
 					return -1;
 				total_child_keys += sub_keys;
