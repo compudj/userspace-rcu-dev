@@ -449,9 +449,11 @@ struct cds_ft_compressed_node {
  *                            0 otherwise.  Same CL as bitmap, so the
  *                            skip-resolver pays no extra CL load.)
  *   bytes 3-7  : subkey[5]  (leading bytes of the parent cn's
- *                            key_bytes, cached for ft_specv-style
- *                            validation.  Paths longer than 5 bytes
- *                            fall back to leaf-bytes compare.)
+ *                            key_bytes.  Skip-compressed candidate
+ *                            descents validate immediately against
+ *                            this subkey when skip_len ≤ 5; longer
+ *                            paths and PIGEON / EXT skips defer to a
+ *                            single end-of-descent leaf-bytes compare.)
  *
  * Without FEATURE_FT_SKIP_COMPRESSED the same 6 bytes remain reserved
  * padding so the layout (and ptrs[] offset) stays identical across
