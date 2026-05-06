@@ -141,10 +141,9 @@ struct cds_ft_attr {
 enum cds_ft_type_class {
 	FT_LINEAR = 0,		/* Linear: per-type specialized scan */
 	FT_POPCOUNT = 1,	/* Popcount-bitmap: byte_popcount_1l / nibble_popcount_2l */
-	FT_POOL = 2,		/* Pool: 1D/2D subnode dispatch */
-	FT_PIGEON = 3,		/* Pigeon: direct indexed */
+	FT_PIGEON = 2,		/* Pigeon: direct indexed */
 #ifdef FEATURE_FT_QP
-	FT_QP = 4,		/* QP-nibble: 16-bit popcount + ptrs[]; not yet wired into ft_types[] dispatch */
+	FT_QP = 3,		/* QP-nibble: 16-bit popcount + ptrs[]; not yet wired into ft_types[] dispatch */
 #endif
 	/* Leaf nodes are implicit from their height in the tree */
 	FT_NR_TYPES,
@@ -175,10 +174,8 @@ struct cds_ft_type {
 	enum cds_ft_type_class type_class;
 	uint16_t min_child;		/* minimum number of children: 1 to 256 */
 	uint16_t max_child;		/* maximum number of children: 1 to 256 */
-	uint16_t max_linear_child;	/* per-pool max nr. children: 1 to 256 */
+	uint16_t max_linear_child;	/* max nr. children for linear-class nodes: 1 to 256 */
 	uint16_t order;			/* node size is (1 << order), in bytes */
-	uint16_t nr_pool_order;		/* number of pools */
-	uint16_t pool_size_order;	/* pool size */
 	bool bitmap;			/* allocate bitmap */
 	bool nibble_popcount_2l;		/* 2-level popcount-bitmap layout */
 	bool byte_popcount_1l;			/* 1-level byte popcount layout */
@@ -194,12 +191,6 @@ struct cds_ft_type {
  * The node the index within the following arrays is represented on 3
  * bits. It identifies the node type, min/max number of children, and
  * the size order.
- * The max_child values for the FT_POOL below result from
- * statistical approximation: over million populations, the max_child
- * covers between 97% and 99% of the populations generated. Therefore, a
- * fallback should exist to cover the rare extreme population unbalance
- * cases, but it will not have a major impact on speed nor space
- * consumption, since those are rare cases.
  */
 
 /*
@@ -246,7 +237,6 @@ enum {
 	ft_type_2_max_child = 12,
 	ft_type_3_max_child = 25,
 	ft_type_4_max_child = 48,
-	ft_type_5_max_child = 92,
 	ft_type_6_max_child = 256,
 	ft_type_7_max_child = 0,	/* NULL */
 };
@@ -256,13 +246,6 @@ enum {
 	ft_type_1_max_linear_child = 6,
 	ft_type_2_max_linear_child = 12,
 	ft_type_3_max_linear_child = 25,
-	ft_type_4_max_linear_child = 24,
-	ft_type_5_max_linear_child = 23,
-};
-
-enum {
-	ft_type_4_nr_pool_order = 1,
-	ft_type_5_nr_pool_order = 2,
 };
 
 const struct cds_ft_type ft_types[] = {
@@ -271,16 +254,9 @@ const struct cds_ft_type ft_types[] = {
 	[2] = { .type_class = FT_LINEAR, .min_child = 4, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP },
 	[3] = { .type_class = FT_LINEAR, .min_child = 10, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP },
 
-	/* Pools may fill sooner than max_child */
-	/* This pool is hardcoded at index 4. See ft_node_ptr(). */
-	[FT_POOL_IDX_A] = { .type_class = FT_POOL, .min_child = 20, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_linear_child, .order = 8, .nr_pool_order = ft_type_4_nr_pool_order, .pool_size_order = 7, .bitmap = FT_NO_BITMAP },
-	/* This pool is hardcoded at index 5. See ft_node_ptr(). */
-	[FT_POOL_IDX_B] = { .type_class = FT_POOL, .min_child = 45, .max_child = ft_type_5_max_child, .max_linear_child = ft_type_5_max_linear_child, .order = 9, .nr_pool_order = ft_type_5_nr_pool_order, .pool_size_order = 7, .bitmap = FT_BITMAP },
+	[4] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_4_max_child, .bitmap = FT_NO_BITMAP },
+	[5] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_4_max_child, .bitmap = FT_NO_BITMAP },
 
-	/*
-	 * Upon node removal below min_child, if child pool is filled
-	 * beyond capacity, we roll back to pigeon.
-	 */
 	[6] = { .type_class = FT_PIGEON, .min_child = 83, .max_child = ft_type_6_max_child, .order = 10, .bitmap = FT_BITMAP },
 
 	[7] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_7_max_child, .bitmap = FT_NO_BITMAP },
@@ -327,13 +303,6 @@ enum {
 	ft_type_3_max_linear_child = 14,
 #endif
 	ft_type_4_max_linear_child = 28,
-	ft_type_5_max_linear_child = 27,
-	ft_type_6_max_linear_child = 26,
-};
-
-enum {
-	ft_type_5_nr_pool_order = 1,
-	ft_type_6_nr_pool_order = 2,
 };
 
 #ifdef FEATURE_FT_QP
@@ -356,7 +325,7 @@ enum {
  *            tier picker stops at [4] for any nr_child <= 256.
  *   [8]    = NULL sentinel (NODE_INDEX_NULL on 64-bit).
  *
- * The LINEAR / POPCOUNT / POOL entries that populate this table when
+ * The LINEAR / POPCOUNT entries that populate this table when
  * FEATURE_FT_QP is undefined disappear; their case arms in dispatch
  * switches become unreachable but are kept for the no-FT_QP build.
  */
@@ -429,56 +398,45 @@ const struct cds_ft_type ft_types[] = {
 		.min_child = 10, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_linear_child, .order = 8, .bitmap = FT_NO_BITMAP,
 	},
 
-	/* Pools may fill sooner than max_child. */
-	/*
-	 * Indices 5 and 6 are historically pools (FT_POOL with subnode
-	 * dispatch).  When FEATURE_FT_POPCOUNT_NODE is enabled, the
-	 * "pool" layout collapses to a single 256-bit-bitmap + pointer
-	 * table spanning the whole node (no subnodes), which is just a
-	 * large linear-class node with the byte_popcount_1l layout
-	 * variant.  type_class is FT_LINEAR in that case, so all the
-	 * FT_POOL-specific code (subnode iteration, bit selector, post-
-	 * copy sweep, fallback split) is dead and unreached.
-	 */
-	/* This pool is hardcoded at index 5. See ft_node_ptr(). */
-	[FT_POOL_IDX_A] = {
+	[5] = {
 #ifdef FEATURE_FT_POPCOUNT_NODE
 		/*
 		 * byte_popcount_1l: 32B bitmap + 54*8B ptrs = 464B, fits
-		 * in the 512B order-9 node.  No subnode dispatch.
+		 * in the 512B order-9 node.
 		 */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_5_max_child,
 		.byte_popcount_1l = true,
-#else
-		.type_class = FT_POOL,
-		.max_linear_child = ft_type_5_max_linear_child,
-#endif
 		.min_child = 22,
 		.max_child = ft_type_5_max_child,
-		.order = 9, .nr_pool_order = ft_type_5_nr_pool_order, .pool_size_order = 8, .bitmap = FT_NO_BITMAP },
-	/* This pool is hardcoded at index 6. See ft_node_ptr(). */
-	[FT_POOL_IDX_B] = {
+		.order = 9,
+		.bitmap = FT_NO_BITMAP,
+#else
+		.type_class = FT_NULL,
+		.max_child = ft_type_5_max_child,
+		.bitmap = FT_NO_BITMAP,
+#endif
+	},
+	[6] = {
 #ifdef FEATURE_FT_POPCOUNT_NODE
 		/*
 		 * byte_popcount_1l: 32B bitmap + 104*8B ptrs = 864B, fits
-		 * in the 1024B order-10 node.  No subnode dispatch.
+		 * in the 1024B order-10 node.
 		 */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_6_max_child,
 		.byte_popcount_1l = true,
-#else
-		.type_class = FT_POOL,
-		.max_linear_child = ft_type_6_max_linear_child,
-#endif
 		.min_child = 51,
 		.max_child = ft_type_6_max_child,
-		.order = 10, .nr_pool_order = ft_type_6_nr_pool_order, .pool_size_order = 8, .bitmap = FT_BITMAP },
+		.order = 10,
+		.bitmap = FT_BITMAP,
+#else
+		.type_class = FT_NULL,
+		.max_child = ft_type_6_max_child,
+		.bitmap = FT_NO_BITMAP,
+#endif
+	},
 
-	/*
-	 * Upon node removal below min_child, if child pool is filled
-	 * beyond capacity, we roll back to pigeon.
-	 */
 	[7] = { .type_class = FT_PIGEON, .min_child = 95, .max_child = ft_type_7_max_child, .order = 11, .bitmap = FT_BITMAP },
 
 	[8] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
@@ -513,17 +471,7 @@ const struct cds_ft_type ft_types[] = {
  * - [Padding] to reach the next pointer-aligned (8-byte) boundary.
  * - Array of (struct cds_ft_inode_flag *) pointers.
  *
- * 2. FT_POOL:
- * - An array of (1 << nr_pool_order) linear sub-nodes.
- * - Each sub-node has the exact same internal layout as FT_LINEAR.
- * - Each sub-node is sized and padded to exactly (1 << pool_size_order) bytes,
- *   allowing O(1) stride access via index << pool_size_order.
- * - The 'index' of the target sub-node is derived using a value population
- *   bit-select strategy. Specific bits of the search key (encoded in the
- *   pointer flag) are evaluated to optimally distribute children and
- *   minimize collisions within the pool.
- *
- * 3. FT_PIGEON:
+ * 2. FT_PIGEON:
  * - A direct, flat array of up to 256 (struct cds_ft_inode_flag *) pointers.
  * - No key array is stored inside the node — the key is implicit
  *   from the pointer's array index.
@@ -829,29 +777,6 @@ void index_to_bits_C_n8_r2(unsigned int index, uint8_t *bits)
 	assert(index < CAA_ARRAY_SIZE(C_n8_r2));
 	bits[0] = C_n8_r2[index].bit[0];
 	bits[1] = C_n8_r2[index].bit[1];
-}
-
-/*
- * Keep only the requested 2 bits from value, and move them to LSB to
- * form a subclass index.
- */
-static inline
-unsigned int value_and_bits_to_subclass_index(uint8_t value, const uint8_t *bits)
-{
-
-	return (((value >> bits[0]) & 0x1) << 1) | ((value >> bits[1]) & 0x1);
-}
-
-static
-unsigned long ft_node_pool_1d_bitsel(struct cds_ft_inode_flag *node)
-{
-	return ((unsigned long) node & FT_POOL_1D_MASK) >> (FT_TYPE_BITS + FT_INTERNAL_BITS);
-}
-
-static
-void ft_node_pool_2d_index(struct cds_ft_inode_flag *node, unsigned int *index)
-{
-	*index = ((unsigned long) node & FT_POOL_2D_MASK) >> (FT_TYPE_BITS + FT_INTERNAL_BITS);
 }
 
 static
@@ -1417,29 +1342,6 @@ struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 {
 	assert(type < (1UL << FT_TYPE_BITS));
 	return (struct cds_ft_inode_flag *) (((unsigned long) node) |
-		(type << FT_INTERNAL_BITS) |
-		FT_INTERNAL_MASK);
-}
-
-static
-struct cds_ft_inode_flag *ft_node_flag_pool_1d(struct cds_ft_inode *node,
-		unsigned long type, unsigned long bitsel)
-{
-	assert(type < (1UL << FT_TYPE_BITS));
-	assert(bitsel < FT_BITS_PER_BYTE);
-	return (struct cds_ft_inode_flag *) (((unsigned long) node) |
-		(bitsel << (FT_TYPE_BITS + FT_INTERNAL_BITS)) |
-		(type << FT_INTERNAL_BITS) |
-		FT_INTERNAL_MASK);
-}
-
-static
-struct cds_ft_inode_flag *ft_node_flag_pool_2d(struct cds_ft_inode *node,
-		unsigned long type, unsigned int subclass_index)
-{
-	assert(type < (1UL << FT_TYPE_BITS));
-	return (struct cds_ft_inode_flag *) (((unsigned long) node) |
-		(subclass_index << (FT_TYPE_BITS + FT_INTERNAL_BITS)) |
 		(type << FT_INTERNAL_BITS) |
 		FT_INTERNAL_MASK);
 }
@@ -2721,10 +2623,7 @@ bool ft_linear_node_is_empty(const struct cds_ft_type *type,
  * Skip when the scanner's first read does NOT live at the start of
  * the node body (so prefetching `v` would fetch the wrong cache
  * line):
- * - FT_POOL (non-popcount build only): subclass bits in pointer
- *   bits [4, order) offset the tagged pointer by up to ~500 B from
- *   the node start.
- * - FT_PIGEON (type 7): dense `pointers[256]`; the scanner reads
+ * - FT_PIGEON: dense `pointers[256]`; the scanner reads
  *   `pointers[n]` at offset n*8.  First cache line covers only
  *   pointers[0..7], ~3% of random keys.
  *
@@ -2734,16 +2633,14 @@ bool ft_linear_node_is_empty(const struct cds_ft_type *type,
  *   offset 0.
  * - nibble_popcount_2l (types 1/2/3 in popcount build): bitmap
  *   header at offset 0.
- * - byte_popcount_1l (type 4 in popcount build, plus the former
- *   POOL_A / POOL_B at indices 5/6 in popcount build): 32-byte
- *   bitmap header at offset 0.
+ * - byte_popcount_1l: 32-byte bitmap header at offset 0.
  *
  * Encoding:
  *   non-popcount build: skip when internal bit AND type high bit
- *     (bit 3) both set, i.e. type_index >= 4 (LINEAR_256, POOL_A,
- *     POOL_B, PIGEON).  Type 4 (LINEAR_256) is included in the
- *     simple-mask skip; the prefetch win there is small enough
- *     that the cheaper test is preferred.
+ *     (bit 3) both set, i.e. type_index >= 4 (LINEAR_256, PIGEON).
+ *     Type 4 (LINEAR_256) is included in the simple-mask skip; the
+ *     prefetch win there is small enough that the cheaper test is
+ *     preferred.
  *   popcount build: no skip test -- always prefetch.  Measurement
  *     on dns ft_specv (single-thread and 192-thread load-names)
  *     shows the type-equality check earns nothing on this build:
@@ -2900,8 +2797,7 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 		void *node = (void *) (v & align_mask);
 
 		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
-		/* Pool-2D and pigeon are the bitmap types (type_index >= IDX_B). */
-		if (type_index >= FT_POOL_IDX_B)
+		if (ft_types[type_index].bitmap)
 			__builtin_prefetch(cds_ft_item_to_bitmap(node, order));
 	}
 }
@@ -3137,19 +3033,6 @@ found:
 #endif /* FT_HAVE_EFFICIENT_UNALIGNED_ACCESS */
 
 /*
- * Pool-shape specialized scanners for the lookup hot path.
- * nr_pool_order and pool_size_order are encoded in the function
- * identity rather than loaded from ft_types[]: nr_pool_order is
- * implicit (_1d / _2d), and pool_size_order is identical across
- * both pools in each tier (8 on 64-bit, 7 on 32-bit).
- */
-#if CAA_BITS_PER_LONG >= 64
-#define FT_POOL_SIZE_ORDER	8
-#else
-#define FT_POOL_SIZE_ORDER	7
-#endif
-
-/*
  * FT_USE_SPECIALIZED_SCAN: 64-bit tier-2 layout is power-of-two in
  * ptr_offset per type_index:
  *   type_index 0..2: ptr_offset=8   (SWAR 8-byte)
@@ -3322,7 +3205,7 @@ struct cds_ft_inode_flag *ft_linear_scan_16(
 
 /*
  * scan_32: dual SSE2 16-byte cmpeq, combined into a 32-bit mask.
- * Covers ptr_offset=32 types (type_index 4, POOL_A/B subnodes).
+ * Covers ptr_offset=32 types (type_index 4).
  *
  * A single-op AVX2 vpcmpeqb/vpmovmskb on ymm was remeasured under a
  * full -mavx2 build (VEX everywhere, no AVX-SSE transition) on Zen3+
@@ -3367,45 +3250,6 @@ struct cds_ft_inode_flag *ft_linear_scan_32(
 }
 
 /*
- * Pool dispatch: compute subnode offset from the node_flag-encoded
- * bitsel / 2D index, then delegate to scan_32 (all pool subnodes
- * have ptr_offset=32 on 64-bit).
- */
-static inline_lookup
-struct cds_ft_inode_flag *ft_pool_scan_1d(
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, enum ft_pf_target pf_hint)
-{
-	unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
-	unsigned long index = ((unsigned long) n >> bitsel) & 0x1;
-	struct cds_ft_inode *subnode = (struct cds_ft_inode *)
-			&node->data[index << FT_POOL_SIZE_ORDER];
-
-	return ft_linear_scan_32(subnode, node_flag_ptr, n, pf_hint);
-}
-
-static inline_lookup
-struct cds_ft_inode_flag *ft_pool_scan_2d(
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, enum ft_pf_target pf_hint)
-{
-	unsigned int C_n8_r2_index, subclass_index;
-	uint8_t bits[2];
-	struct cds_ft_inode *subnode;
-
-	ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
-	index_to_bits_C_n8_r2(C_n8_r2_index, bits);
-	subclass_index = value_and_bits_to_subclass_index(n, bits);
-	subnode = (struct cds_ft_inode *)
-			&node->data[subclass_index << FT_POOL_SIZE_ORDER];
-	return ft_linear_scan_32(subnode, node_flag_ptr, n, pf_hint);
-}
-
-/*
  * Runtime validation of ft_types[] ptr_offset layout assumed by the
  * specialized scanners.  Called from cds_ft_group_create at init.
  * Not a static assert because ft_types[].max_linear_child is a
@@ -3417,7 +3261,7 @@ void ft_specialized_scan_layout_assert(void)
 {
 #ifdef FEATURE_FT_QP
 	/*
-	 * FEATURE_FT_QP replaces all linear/popcount/pool entries with
+	 * FEATURE_FT_QP replaces all linear/popcount entries with
 	 * FT_QP T0..T3 + FT_PIGEON.  The specialized scanners are gone
 	 * (descent goes through ft_qp_byte_get / ft_pigeon_node_get_nth)
 	 * so the linear-type ptr_offset layout assertions do not apply.
@@ -3429,20 +3273,6 @@ void ft_specialized_scan_layout_assert(void)
 	assert(FT_ALIGN(ft_types[2].max_linear_child, sizeof(void *)) == 8);
 	assert(FT_ALIGN(ft_types[3].max_linear_child, sizeof(void *)) == 16);
 	assert(FT_ALIGN(ft_types[4].max_linear_child, sizeof(void *)) == 32);
-#ifndef FEATURE_FT_POPCOUNT_NODE
-	/*
-	 * byte_popcount_1l pools (FEATURE_FT_POPCOUNT_NODE) have
-	 * max_linear_child == max_child (54 / 104), so per-subnode
-	 * ptr_offset alignment does not apply -- the whole node is one
-	 * 256-bit bitmap + 54 or 104 pointers.
-	 */
-	assert(FT_ALIGN(ft_types[FT_POOL_IDX_A].max_linear_child,
-				sizeof(void *)) == 32);
-	assert(FT_ALIGN(ft_types[FT_POOL_IDX_B].max_linear_child,
-				sizeof(void *)) == 32);
-#endif
-	assert(FT_POOL_IDX_A == 5);
-	assert(FT_POOL_IDX_B == 6);
 	assert(ft_types[7].type_class == FT_PIGEON);
 #endif /* !FEATURE_FT_QP */
 }
@@ -3487,7 +3317,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class));
 #if defined(FT_HAVE_EFFICIENT_UNALIGNED_ACCESS) && defined(__SSE2__)
 	/*
 	 * Types with max_linear_child <= sizeof(unsigned long) have a
@@ -3566,7 +3396,7 @@ struct cds_ft_inode_flag *ft_linear_node_get_direction(const struct cds_ft_type 
 	unsigned int i;
 	int match_v;
 
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class));
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
 	if (dir == FT_LEFT) {
@@ -3655,7 +3485,7 @@ void ft_linear_node_get_ith_pos(const struct cds_ft_type *type,
 	uint8_t *values;
 	struct cds_ft_inode_flag **pointers;
 
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class));
 	assert(i < ft_linear_node_get_nr_child(type, node));
 
 	values = &node->data[0];
@@ -4568,185 +4398,6 @@ int ft_byte_popcount_1l_node_set_nth(const struct cds_ft_type *type,
 	return 0;
 }
 #endif /* FEATURE_FT_POPCOUNT_NODE */
-
-static inline_lookup
-unsigned int ft_pool_subnode_index(const struct cds_ft_type *type,
-		struct cds_ft_inode_flag *node_flag,
-		uint8_t n)
-{
-	switch (type->nr_pool_order) {
-	case 1:
-	{
-		unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
-		return (unsigned int) (((unsigned long) n >> bitsel) & 0x1);
-	}
-	case 2:
-	{
-		unsigned int C_n8_r2_index;
-		uint8_t bits[2];
-
-		ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
-		index_to_bits_C_n8_r2(C_n8_r2_index, bits);
-		return value_and_bits_to_subclass_index(n, bits);
-	}
-	default:
-		assert(0);
-		return 0;
-	}
-}
-
-static inline_lookup
-struct cds_ft_inode *ft_pool_get_linear_subnode(const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag,
-		uint8_t n)
-{
-	unsigned int index = ft_pool_subnode_index(type, node_flag, n);
-	return (struct cds_ft_inode *) &node->data[index << type->pool_size_order];
-}
-
-static inline_lookup
-struct cds_ft_inode_flag *ft_pool_node_get_nth(const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, enum ft_pf_target pf_hint)
-{
-	struct cds_ft_inode *linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
-	/* Pool subnodes are always large enough for wide scan. */
-	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n, pf_hint);
-}
-
-static inline_lookup
-struct cds_ft_inode_flag *ft_pool_node_get_nth_1d(
-		const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, enum ft_pf_target pf_hint)
-{
-	unsigned long bitsel = ft_node_pool_1d_bitsel(node_flag);
-	unsigned long index = ((unsigned long) n >> bitsel) & 0x1;
-	struct cds_ft_inode *linear = (struct cds_ft_inode *)
-			&node->data[index << FT_POOL_SIZE_ORDER];
-
-	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n, pf_hint);
-}
-
-static inline_lookup
-struct cds_ft_inode_flag *ft_pool_node_get_nth_2d(
-		const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, enum ft_pf_target pf_hint)
-{
-	unsigned int C_n8_r2_index, subclass_index;
-	uint8_t bits[2];
-	struct cds_ft_inode *linear;
-
-	ft_node_pool_2d_index(node_flag, &C_n8_r2_index);
-	index_to_bits_C_n8_r2(C_n8_r2_index, bits);
-	subclass_index = value_and_bits_to_subclass_index(n, bits);
-	linear = (struct cds_ft_inode *)
-			&node->data[subclass_index << FT_POOL_SIZE_ORDER];
-	return ft_linear_node_get_nth(type, linear, node_flag_ptr, n, pf_hint);
-}
-
-static inline_lookup
-struct cds_ft_inode *ft_pool_node_get_ith_pool(const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		uint8_t i)
-{
-	assert(type->type_class == FT_POOL);
-	return (struct cds_ft_inode *)
-		&node->data[(unsigned int) i << type->pool_size_order];
-}
-
-static inline_lookup
-struct cds_ft_inode_flag *ft_pool_node_get_direction(const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag __attribute__((unused)),
-		int n, uint8_t *result_key,
-		enum ft_direction dir)
-{
-	unsigned int pool_nr;
-	int match_v;
-	struct cds_ft_inode_flag *match_node_flag = NULL;
-
-	assert(type->type_class == FT_POOL);
-	assert(dir == FT_LEFT || dir == FT_RIGHT);
-
-#ifdef FEATURE_USE_BITMAP_SCAN
-	if (type->bitmap) {
-		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
-retry:
-		if (dir == FT_LEFT)
-			match_v = cds_find_prev_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n - 1);
-		else
-			match_v = cds_find_next_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n + 1);
-		if (match_v >= 0) {
-			match_node_flag = ft_pool_node_get_nth(type, node, node_flag, NULL, (uint8_t) match_v, FT_PF_NONE);
-			/*
-			 * The source of truth is the pointer load from
-			 * get_nth. Continue the bitmap scan if the node
-			 * is not found.
-			 */
-			if (!match_node_flag) {
-				n = match_v;
-				goto retry;
-			}
-		}
-		goto end;
-	}
-#endif
-
-	if (dir == FT_LEFT) {
-		match_v = -1;
-	} else {
-		match_v = FT_ENTRY_PER_NODE;
-	}
-
-	for (pool_nr = 0; pool_nr < (1U << type->nr_pool_order); pool_nr++) {
-		struct cds_ft_inode *pool =
-			ft_pool_node_get_ith_pool(type,
-				node, pool_nr);
-		uint8_t nr_child =
-			ft_linear_node_get_nr_child(type, pool);
-		unsigned int j;
-
-		for (j = 0; j < nr_child; j++) {
-			struct cds_ft_inode_flag *iter;
-			uint8_t v;
-
-			ft_linear_node_get_ith_pos(type, pool,
-					j, &v, &iter);
-			if (!iter)
-				continue;
-			if (dir == FT_LEFT) {
-				if ((int) v < n && (int) v > match_v) {
-					match_v = v;
-					match_node_flag = iter;
-					/* Found value immediately left of n. */
-					if (match_v == n - 1)
-						goto end;
-				}
-			} else {
-				if ((int) v > n && (int) v < match_v) {
-					match_v = v;
-					match_node_flag = iter;
-					/* Found value immediately right of n. */
-					if (match_v == n + 1)
-						goto end;
-				}
-			}
-		}
-	}
-end:
-	if (match_node_flag)
-		*result_key = (uint8_t) match_v;
-	return match_node_flag;
-}
 
 static inline_lookup
 struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type __attribute__((unused)) *type,
@@ -6048,53 +5699,6 @@ int ft_qp_byte_set(struct cds_ft *ft,
 
 #define FT_MASK_LINEAR      FT_MASK_CLASS(FT_LINEAR)
 #define FT_MASK_POPCOUNT    FT_MASK_CLASS(FT_POPCOUNT)
-#define FT_MASK_POOL        FT_MASK_CLASS(FT_POOL)
-
-/*
- * The pool dispatch routes POOL_IDX_A to ft_pool_node_get_nth_1d
- * and everything else in FT_MASK_POOL to ft_pool_node_get_nth_2d,
- * with FT_POOL_SIZE_ORDER hardcoded per tier.  ft_types[].field
- * is not a constant expression in gcc's strict sense, so the
- * layout checks run once at library load via a constructor.
- * If the ft_types[] layout changes (pool swap, added pool type,
- * different pool_size_order) the assertions fire before any
- * lookup runs.
- */
-static void __attribute__((constructor))
-ft_check_pool_dispatch_assumptions(void)
-{
-#ifdef FEATURE_FT_QP
-	/*
-	 * FEATURE_FT_QP eliminates FT_POOL and FT_POPCOUNT from
-	 * ft_types[] entirely; the only internal classes are FT_QP and
-	 * FT_PIGEON.  The pool / popcount-pool dispatch machinery is
-	 * unreachable.
-	 */
-	assert(FT_MASK_POOL == 0);
-	assert(FT_MASK_POPCOUNT == 0);
-	assert(FT_MASK_LINEAR == 0);
-#elif defined(FEATURE_FT_POPCOUNT_NODE)
-	/*
-	 * FEATURE_FT_POPCOUNT_NODE collapses the historical pools at
-	 * indices 5 and 6 to byte_popcount_1l layouts in the FT_POPCOUNT
-	 * class (no subnodes), so FT_POOL is empty and the bit-selector /
-	 * 2D-index machinery is unused.
-	 */
-	assert(ft_types[FT_POOL_IDX_A].type_class == FT_POPCOUNT);
-	assert(ft_types[FT_POOL_IDX_B].type_class == FT_POPCOUNT);
-	assert(ft_types[FT_POOL_IDX_A].byte_popcount_1l);
-	assert(ft_types[FT_POOL_IDX_B].byte_popcount_1l);
-	assert(FT_MASK_POOL == 0);
-#else
-	assert(ft_types[FT_POOL_IDX_A].type_class == FT_POOL);
-	assert(ft_types[FT_POOL_IDX_B].type_class == FT_POOL);
-	assert(ft_types[FT_POOL_IDX_A].nr_pool_order == 1);
-	assert(ft_types[FT_POOL_IDX_B].nr_pool_order == 2);
-	assert(ft_types[FT_POOL_IDX_A].pool_size_order == FT_POOL_SIZE_ORDER);
-	assert(ft_types[FT_POOL_IDX_B].pool_size_order == FT_POOL_SIZE_ORDER);
-	assert((FT_MASK_POOL & ~((1U << FT_POOL_IDX_A) | (1U << FT_POOL_IDX_B))) == 0);
-#endif
-}
 
 static inline_lookup
 /*
@@ -6147,27 +5751,16 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 *   2:  max_lc=7,  ptr_offset=8   -> scan_8 (SWAR)
 	 *   3:  max_lc=14, ptr_offset=16  -> scan_16 (SSE2)
 	 *   4:  max_lc=28, ptr_offset=32  -> scan_32 (dual-SSE2)
-	 *   5:  POOL_A (1D)               -> pool_scan_1d
-	 *   6:  POOL_B (2D)               -> pool_scan_2d
+	 *   5/6: byte_popcount_1l (popcount build) / NULL (else)
 	 *   7:  PIGEON                    -> pigeon
 	 *
 	 * Hybrid shape: caa_likely gate on the two most frequent linear
 	 * types, switch/jump-table on the rest.
 	 *
-	 * Measured distribution over bench_comprehensive
-	 * (u32d/u32s/u64d/u64s/dns/dict/paths, ~1.2B total dispatches):
-	 *   type_index  1 (scan_3)   46.4%  <-- dominant
-	 *   type_index  0 (scan_1)   21.6%
-	 *   type_index  2 (scan_8)   16.8%
-	 *   type_index  3 (scan_16)   9.5%
-	 *   type_index  7 (pigeon)    4.3%
-	 *   type_index  4 (scan_32)   1.2%
-	 *   type_index 5/6 (pools)   <0.2%
-	 *
-	 * Types 1 and 0 cover 68% of dispatches.  Short-circuiting them
-	 * with explicit predicted-not-taken branches keeps the hot path
+	 * Types 1 and 0 cover the majority of dispatches.  Short-circuiting
+	 * them with explicit predicted-not-taken branches keeps the hot path
 	 * to 1-2 branches, and lets the compiler emit a jump-table for
-	 * the remaining six cases.
+	 * the remaining cases.
 	 */
 	if (caa_likely(type_index == 1)) {
 #ifdef FEATURE_FT_POPCOUNT_NODE
@@ -6207,22 +5800,20 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	case 5:
 #ifdef FEATURE_FT_POPCOUNT_NODE
 		/*
-		 * byte_popcount_1l pool: no subnode dispatch -- the whole
-		 * 512B node is one 256-bit bitmap + 54-pointer table.
+		 * byte_popcount_1l: 256-bit bitmap + 54-pointer table.
 		 */
 		return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
 #else
-		return ft_pool_scan_1d(node, node_flag, node_flag_ptr, n, pf_hint);
+		__builtin_unreachable();
 #endif
 	case 6:
 #ifdef FEATURE_FT_POPCOUNT_NODE
 		/*
-		 * byte_popcount_1l pool: no subnode dispatch -- the whole
-		 * 1024B node is one 256-bit bitmap + 104-pointer table.
+		 * byte_popcount_1l: 256-bit bitmap + 104-pointer table.
 		 */
 		return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
 #else
-		return ft_pool_scan_2d(node, node_flag, node_flag_ptr, n, pf_hint);
+		__builtin_unreachable();
 #endif
 	case 7:
 		return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
@@ -6242,10 +5833,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 * byte-indexed tries — predicted-taken fast path.  FT_POPCOUNT
 	 * (32/64/256-bit popcount layouts) is dispatched separately so
 	 * the helper does not re-discover the class identity that the
-	 * type_index already carries.  Pool dispatch discriminates
-	 * POOL_IDX_A (1D) from POOL_IDX_B (2D) to let each subnode
-	 * scanner inline a fixed pool shape; no ft_types[] field load
-	 * on the pool path.
+	 * type_index already carries.
 	 */
 	if (caa_likely(bit & FT_MASK_LINEAR))
 		return ft_linear_node_get_nth(&ft_types[type_index], node,
@@ -6253,13 +5841,6 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	if (bit & FT_MASK_POPCOUNT)
 		return ft_popcount_node_get_nth(&ft_types[type_index], node,
 				node_flag_ptr, n, pf_hint);
-	if (bit & FT_MASK_POOL) {
-		if (bit & (1U << FT_POOL_IDX_A))
-			return ft_pool_node_get_nth_1d(&ft_types[type_index],
-					node, node_flag, node_flag_ptr, n, pf_hint);
-		return ft_pool_node_get_nth_2d(&ft_types[type_index],
-				node, node_flag, node_flag_ptr, n, pf_hint);
-	}
 	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
 	}
 #endif
@@ -6343,32 +5924,6 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 				if (slot_ret)
 					ft_node_get_nth(parent_nf, slot_ret, v, FT_PF_NONE);
 				return true;
-			}
-		}
-		return false;
-	}
-	case FT_POOL:
-	{
-		unsigned int pool_nr;
-
-		for (pool_nr = 0; pool_nr < (1U << type->nr_pool_order); pool_nr++) {
-			struct cds_ft_inode *pool =
-				ft_pool_node_get_ith_pool(type, node, pool_nr);
-			uint8_t nr_child = ft_linear_node_get_nr_child(type, pool);
-			unsigned int j;
-
-			for (j = 0; j < nr_child; j++) {
-				struct cds_ft_inode_flag *iter;
-				uint8_t v;
-
-				ft_linear_node_get_ith_pos(type, pool, j, &v, &iter);
-				if (iter == child_nf) {
-					if (n_ret)
-						*n_ret = v;
-					if (slot_ret)
-						ft_node_get_nth(parent_nf, slot_ret, v, FT_PF_NONE);
-					return true;
-				}
 			}
 		}
 		return false;
@@ -6481,9 +6036,6 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 		break;
 	case FT_LINEAR:
 		child = ft_linear_node_get_direction(type, node, n, result_key, dir);
-		break;
-	case FT_POOL:
-		child = ft_pool_node_get_direction(type, node, node_flag, n, result_key, dir);
 		break;
 	case FT_PIGEON:
 		child = ft_pigeon_node_get_direction(type, node, n, result_key, dir);
@@ -7000,7 +6552,7 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 	unsigned int i, unused = 0;
 	bool replace_old_ptr = false;
 
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class));
 
 	values = &node->data[0];
 	pointers = (struct cds_ft_inode_flag **) align_ptr_size(&values[type->max_linear_child]);
@@ -7080,31 +6632,6 @@ int ft_linear_node_set_nth(const struct cds_ft_type *type,
 }
 
 static
-int ft_pool_node_set_nth(const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_metadata *metadata,
-		uint8_t n,
-		struct cds_ft_inode_flag *child_node_flag,
-		bool is_init)
-{
-	struct cds_ft_inode *linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
-	bool replace_old_ptr = false;
-	int ret;
-
-	ret = ft_linear_node_set_nth(type, linear, metadata, n, child_node_flag, &replace_old_ptr, is_init);
-#ifdef FEATURE_USE_BITMAP_SCAN
-	if (ret == 0 && !replace_old_ptr && type->bitmap) {
-		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
-
-		/* Set n in bitmap. */
-		cds_set_bit_relaxed(bitmap->bitmap, n);
-	}
-#endif
-	return ret;
-}
-
-static
 int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
 		struct cds_ft_metadata *metadata,
@@ -7180,9 +6707,6 @@ int _ft_node_set_nth(struct cds_ft *ft __attribute__((unused)),
 	case FT_LINEAR:
 		ret = ft_linear_node_set_nth(type, node, metadata, n, child_node_flag, NULL, is_init);
 		break;
-	case FT_POOL:
-		ret = ft_pool_node_set_nth(type, node, node_flag, metadata, n, child_node_flag, is_init);
-		break;
 	case FT_PIGEON:
 		ret = ft_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
 		break;
@@ -7219,7 +6743,7 @@ int ft_linear_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		struct cds_ft_inode_flag *newptr)
 {
-	assert(ft_type_is_linear(type->type_class) || type->type_class == FT_POOL);
+	assert(ft_type_is_linear(type->type_class));
 	assert(ft_linear_node_get_nr_child(type, node) <= type->max_linear_child);
 
 	if (ft_type_is_linear(type->type_class) && !newptr) {
@@ -7292,41 +6816,6 @@ int ft_popcount_node_replace_ptr(const struct cds_ft_type *type,
 }
 
 static
-int ft_pool_node_replace_ptr(const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_metadata *metadata,
-		struct cds_ft_inode_flag **node_flag_ptr,
-		uint8_t n,
-		struct cds_ft_inode_flag *newptr)
-{
-	struct cds_ft_inode *linear;
-	int ret;
-
-	if (!newptr) {
-		if (metadata->fallback_removal_count) {
-			metadata->fallback_removal_count--;
-		} else {
-			/* We should try recompacting the node */
-			if (metadata->nr_child <= type->min_child)
-				return -EFBIG;
-		}
-	}
-
-	linear = ft_pool_get_linear_subnode(type, node, node_flag, n);
-	ret = ft_linear_node_replace_ptr(type, linear, metadata, node_flag_ptr, newptr);
-#ifdef FEATURE_USE_BITMAP_SCAN
-	if (ret == 0 && !newptr && type->bitmap) {
-		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
-
-		/* Clear n in bitmap. */
-		cds_clear_bit_relaxed(bitmap->bitmap, n);
-	}
-#endif
-	return ret;
-}
-
-static
 int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode *node __attribute__((unused)),
 		struct cds_ft_metadata *metadata,
@@ -7386,9 +6875,6 @@ int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
 	case FT_LINEAR:
 		ret = ft_linear_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
 		break;
-	case FT_POOL:
-		ret = ft_pool_node_replace_ptr(type, node, node_flag, metadata, node_flag_ptr, n, newptr);
-		break;
 	case FT_PIGEON:
 		ret = ft_pigeon_node_replace_ptr(type, node, metadata, node_flag_ptr, n, newptr);
 		break;
@@ -7410,407 +6896,6 @@ int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
 	return ret;
 }
 
-/*
- * Calculate bit distribution. Returns the bit (0 to 7) that splits the
- * distribution in two sub-distributions containing as much elements one
- * compared to the other.
- */
-static
-unsigned int ft_node_sum_distribution_1d(enum ft_recompact mode,
-		const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		uint8_t n,
-		struct cds_ft_inode_flag **nullify_node_flag_ptr)
-{
-	uint8_t nr_one[FT_BITS_PER_BYTE];
-	unsigned int bitsel = 0, bit_i, overall_best_distance = UINT_MAX;
-	unsigned int distrib_nr_child = 0;
-
-	memset(nr_one, 0, sizeof(nr_one));
-
-	switch (type->type_class) {
-	case FT_POPCOUNT:
-	{
-		uint8_t nr_child =
-			ft_popcount_node_get_nr_child(type, node);
-		unsigned int i;
-
-		for (i = 0; i < nr_child; i++) {
-			struct cds_ft_inode_flag *iter;
-			uint8_t v;
-
-			ft_popcount_node_get_ith_pos(type, node, i, &v, &iter);
-			if (!iter)
-				continue;
-			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
-				continue;
-			for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-				if (v & (1U << bit_i))
-					nr_one[bit_i]++;
-			}
-			distrib_nr_child++;
-		}
-		break;
-	}
-	case FT_LINEAR:
-	{
-		uint8_t nr_child =
-			ft_linear_node_get_nr_child(type, node);
-		unsigned int i;
-
-		for (i = 0; i < nr_child; i++) {
-			struct cds_ft_inode_flag *iter;
-			uint8_t v;
-
-			ft_linear_node_get_ith_pos(type, node, i, &v, &iter);
-			if (!iter)
-				continue;
-			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
-				continue;
-			for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-				if (v & (1U << bit_i))
-					nr_one[bit_i]++;
-			}
-			distrib_nr_child++;
-		}
-		break;
-	}
-	case FT_POOL:
-	{
-		unsigned int pool_nr;
-
-		for (pool_nr = 0; pool_nr < (1U << type->nr_pool_order); pool_nr++) {
-			struct cds_ft_inode *pool =
-				ft_pool_node_get_ith_pool(type,
-					node, pool_nr);
-			uint8_t nr_child =
-				ft_linear_node_get_nr_child(type, pool);
-			unsigned int j;
-
-			for (j = 0; j < nr_child; j++) {
-				struct cds_ft_inode_flag *iter;
-				uint8_t v;
-
-				ft_linear_node_get_ith_pos(type, pool,
-						j, &v, &iter);
-				if (!iter)
-					continue;
-				if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
-					continue;
-				for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-					if (v & (1U << bit_i))
-						nr_one[bit_i]++;
-				}
-				distrib_nr_child++;
-			}
-		}
-		break;
-	}
-	case FT_PIGEON:
-	{
-		unsigned int i;
-
-		assert(mode == FT_RECOMPACT_DEL);
-		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
-			struct cds_ft_inode_flag *iter;
-
-			iter = ft_pigeon_node_get_ith_pos(type, node, i);
-			if (!iter)
-				continue;
-			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
-				continue;
-			for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-				if (i & (1U << bit_i))
-					nr_one[bit_i]++;
-			}
-			distrib_nr_child++;
-		}
-		break;
-	}
-	case FT_NULL:
-		assert(mode == FT_RECOMPACT_ADD_NEXT);
-		break;
-	default:
-		assert(0);
-		break;
-	}
-
-	if (mode == FT_RECOMPACT_ADD_NEXT || mode == FT_RECOMPACT_ADD_SAME) {
-		for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-			if (n & (1U << bit_i))
-				nr_one[bit_i]++;
-		}
-		distrib_nr_child++;
-	}
-
-	/*
-	 * The best bit selector is that for which the number of ones is
-	 * closest to half of the number of children in the
-	 * distribution. We calculate the distance using the double of
-	 * the sub-distribution sizes to eliminate truncation error.
-	 */
-	for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-		unsigned int distance_to_best;
-
-		distance_to_best = abs_int(((unsigned int) nr_one[bit_i] << 1U) - distrib_nr_child);
-		if (distance_to_best < overall_best_distance) {
-			overall_best_distance = distance_to_best;
-			bitsel = bit_i;
-		}
-	}
-	dbg_printf("1 dimension pool bit selection: (%u)\n", bitsel);
-	return bitsel;
-}
-
-/*
- * Calculate bit distribution in two dimensions. Returns the two bits
- * (each 0 to 7) that splits the distribution in four sub-distributions
- * containing as much elements one compared to the other.
- */
-static
-void ft_node_sum_distribution_2d(enum ft_recompact mode,
-		const struct cds_ft_type *type,
-		struct cds_ft_inode *node,
-		uint8_t n,
-		struct cds_ft_inode_flag **nullify_node_flag_ptr,
-		unsigned int *_bitsel)
-{
-	uint8_t nr_2d_11[FT_BITS_PER_BYTE][FT_BITS_PER_BYTE],
-		nr_2d_10[FT_BITS_PER_BYTE][FT_BITS_PER_BYTE],
-		nr_2d_01[FT_BITS_PER_BYTE][FT_BITS_PER_BYTE],
-		nr_2d_00[FT_BITS_PER_BYTE][FT_BITS_PER_BYTE];
-	unsigned int bitsel[2] = { 0, 1 };
-	unsigned int bit_i, bit_j;
-	int overall_best_distance = INT_MAX;
-	unsigned int distrib_nr_child = 0;
-
-	memset(nr_2d_11, 0, sizeof(nr_2d_11));
-	memset(nr_2d_10, 0, sizeof(nr_2d_10));
-	memset(nr_2d_01, 0, sizeof(nr_2d_01));
-	memset(nr_2d_00, 0, sizeof(nr_2d_00));
-
-	switch (type->type_class) {
-	case FT_POPCOUNT:
-	{
-		uint8_t nr_child =
-			ft_popcount_node_get_nr_child(type, node);
-		unsigned int i;
-
-		for (i = 0; i < nr_child; i++) {
-			struct cds_ft_inode_flag *iter;
-			uint8_t v;
-
-			ft_popcount_node_get_ith_pos(type, node, i, &v, &iter);
-			if (!iter)
-				continue;
-			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
-				continue;
-			for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-				for (bit_j = bit_i + 1; bit_j < FT_BITS_PER_BYTE; bit_j++) {
-					if (v & (1U << bit_i)) {
-						if (v & (1U << bit_j)) {
-							nr_2d_11[bit_i][bit_j]++;
-						} else {
-							nr_2d_10[bit_i][bit_j]++;
-						}
-					} else {
-						if (v & (1U << bit_j)) {
-							nr_2d_01[bit_i][bit_j]++;
-						} else {
-							nr_2d_00[bit_i][bit_j]++;
-						}
-					}
-				}
-			}
-			distrib_nr_child++;
-		}
-		break;
-	}
-	case FT_LINEAR:
-	{
-		uint8_t nr_child =
-			ft_linear_node_get_nr_child(type, node);
-		unsigned int i;
-
-		for (i = 0; i < nr_child; i++) {
-			struct cds_ft_inode_flag *iter;
-			uint8_t v;
-
-			ft_linear_node_get_ith_pos(type, node, i, &v, &iter);
-			if (!iter)
-				continue;
-			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
-				continue;
-			for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-				for (bit_j = bit_i + 1; bit_j < FT_BITS_PER_BYTE; bit_j++) {
-					if (v & (1U << bit_i)) {
-						if (v & (1U << bit_j)) {
-							nr_2d_11[bit_i][bit_j]++;
-						} else {
-							nr_2d_10[bit_i][bit_j]++;
-						}
-					} else {
-						if (v & (1U << bit_j)) {
-							nr_2d_01[bit_i][bit_j]++;
-						} else {
-							nr_2d_00[bit_i][bit_j]++;
-						}
-					}
-				}
-			}
-			distrib_nr_child++;
-		}
-		break;
-	}
-	case FT_POOL:
-	{
-		unsigned int pool_nr;
-
-		for (pool_nr = 0; pool_nr < (1U << type->nr_pool_order); pool_nr++) {
-			struct cds_ft_inode *pool =
-				ft_pool_node_get_ith_pool(type,
-					node, pool_nr);
-			uint8_t nr_child =
-				ft_linear_node_get_nr_child(type, pool);
-			unsigned int j;
-
-			for (j = 0; j < nr_child; j++) {
-				struct cds_ft_inode_flag *iter;
-				uint8_t v;
-
-				ft_linear_node_get_ith_pos(type, pool,
-						j, &v, &iter);
-				if (!iter)
-					continue;
-				if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
-					continue;
-				for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-					for (bit_j = bit_i + 1; bit_j < FT_BITS_PER_BYTE; bit_j++) {
-						if (v & (1U << bit_i)) {
-							if (v & (1U << bit_j)) {
-								nr_2d_11[bit_i][bit_j]++;
-							} else {
-								nr_2d_10[bit_i][bit_j]++;
-							}
-						} else {
-							if (v & (1U << bit_j)) {
-								nr_2d_01[bit_i][bit_j]++;
-							} else {
-								nr_2d_00[bit_i][bit_j]++;
-							}
-						}
-					}
-				}
-				distrib_nr_child++;
-			}
-		}
-		break;
-	}
-	case FT_PIGEON:
-	{
-		unsigned int i;
-
-		assert(mode == FT_RECOMPACT_DEL);
-		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
-			struct cds_ft_inode_flag *iter;
-
-			iter = ft_pigeon_node_get_ith_pos(type, node, i);
-			if (!iter)
-				continue;
-			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
-				continue;
-			for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-				for (bit_j = bit_i + 1; bit_j < FT_BITS_PER_BYTE; bit_j++) {
-					if (i & (1U << bit_i)) {
-						if (i & (1U << bit_j)) {
-							nr_2d_11[bit_i][bit_j]++;
-						} else {
-							nr_2d_10[bit_i][bit_j]++;
-						}
-					} else {
-						if (i & (1U << bit_j)) {
-							nr_2d_01[bit_i][bit_j]++;
-						} else {
-							nr_2d_00[bit_i][bit_j]++;
-						}
-					}
-				}
-			}
-			distrib_nr_child++;
-		}
-		break;
-	}
-	case FT_NULL:
-		assert(mode == FT_RECOMPACT_ADD_NEXT);
-		break;
-	default:
-		assert(0);
-		break;
-	}
-
-	if (mode == FT_RECOMPACT_ADD_NEXT || mode == FT_RECOMPACT_ADD_SAME) {
-		for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-			for (bit_j = bit_i + 1; bit_j < FT_BITS_PER_BYTE; bit_j++) {
-				if (n & (1U << bit_i)) {
-					if (n & (1U << bit_j)) {
-						nr_2d_11[bit_i][bit_j]++;
-					} else {
-						nr_2d_10[bit_i][bit_j]++;
-					}
-				} else {
-					if (n & (1U << bit_j)) {
-						nr_2d_01[bit_i][bit_j]++;
-					} else {
-						nr_2d_00[bit_i][bit_j]++;
-					}
-				}
-			}
-		}
-		distrib_nr_child++;
-	}
-
-	/*
-	 * The best bit selector is that for which the number of nodes
-	 * in each sub-class is closest to one-fourth of the number of
-	 * children in the distribution. We calculate the distance using
-	 * 4 times the size of the sub-distribution to eliminate
-	 * truncation error.
-	 */
-	for (bit_i = 0; bit_i < FT_BITS_PER_BYTE; bit_i++) {
-		for (bit_j = bit_i + 1; bit_j < FT_BITS_PER_BYTE; bit_j++) {
-			int distance_to_best[4];
-
-			distance_to_best[0] = ((unsigned int) nr_2d_11[bit_i][bit_j] << 2U) - distrib_nr_child;
-			distance_to_best[1] = ((unsigned int) nr_2d_10[bit_i][bit_j] << 2U) - distrib_nr_child;
-			distance_to_best[2] = ((unsigned int) nr_2d_01[bit_i][bit_j] << 2U) - distrib_nr_child;
-			distance_to_best[3] = ((unsigned int) nr_2d_00[bit_i][bit_j] << 2U) - distrib_nr_child;
-
-			/* Consider worse distance above best */
-			if (distance_to_best[1] > 0 && distance_to_best[1] > distance_to_best[0])
-				distance_to_best[0] = distance_to_best[1];
-			if (distance_to_best[2] > 0 && distance_to_best[2] > distance_to_best[0])
-				distance_to_best[0] = distance_to_best[2];
-			if (distance_to_best[3] > 0 && distance_to_best[3] > distance_to_best[0])
-				distance_to_best[0] = distance_to_best[3];
-
-			/*
-			 * If our worse distance is better than overall,
-			 * we become new best candidate.
-			 */
-			if (distance_to_best[0] < overall_best_distance) {
-				overall_best_distance = distance_to_best[0];
-				bitsel[0] = bit_i;
-				bitsel[1] = bit_j;
-			}
-		}
-	}
-
-	dbg_printf("2 dimensions pool bit selection: (%u,%u)\n", bitsel[0], bitsel[1]);
-
-	/* Return our bit selection */
-	_bitsel[0] = bitsel[0];
-	_bitsel[1] = bitsel[1];
-}
 
 static
 unsigned int find_nearest_type_index(unsigned int type_index,
@@ -7861,18 +6946,11 @@ int ft_node_recompact(enum ft_recompact mode,
 	const struct cds_ft_type *new_type;
 	struct cds_ft_inode_flag *new_node_flag = NULL;
 	int ret;
-	int fallback = 0;
 	/*
-	 * Track which (sub)nodes within new_node have received their
-	 * first child via is_init=true.  For FT_LINEAR:
-	 * `new_linear_init_done` is the single flag.  For FT_POOL:
-	 * `new_pool_init_done` is a bitmap indexed by subnode index
-	 * (at most 4 subnodes on current tiers, uint32_t is generous).
-	 * Subnodes not touched during copy are pre-initialized in a
-	 * post-copy sweep with the lowest byte routing to them.
+	 * Track whether new_node has received its first child via
+	 * is_init=true (single flag for FT_LINEAR / FT_POPCOUNT).
 	 */
 	bool new_linear_init_done = false;
-	uint32_t new_pool_init_done = 0;
 
 	/*
 	 * Need to find nearest type index even for ADD_SAME, because
@@ -7966,7 +7044,6 @@ int ft_node_recompact(enum ft_recompact mode,
 		assert(0);
 	}
 
-retry:		/* for fallback */
 	new_metadata = NULL;
 	dbg_printf("Recompact from type %d to type %d\n",
 			old_type_index, new_type_index);
@@ -7976,44 +7053,7 @@ retry:		/* for fallback */
 		if (!new_node)
 			return -ENOMEM;
 
-		if (new_type->type_class == FT_POOL) {
-			switch (new_type->nr_pool_order) {
-			case 1:
-			{
-				unsigned int node_distrib_bitsel;
-
-				node_distrib_bitsel =
-					ft_node_sum_distribution_1d(mode,
-						old_type, old_node,
-						n, nullify_node_flag_ptr);
-				assert(!((unsigned long) new_node & FT_POOL_1D_MASK));
-				new_node_flag = ft_node_flag_pool_1d(new_node,
-					new_type_index, node_distrib_bitsel);
-				break;
-			}
-			case 2:
-			{
-				unsigned int node_distrib_bitsel[2];
-				unsigned int subclass_index;
-				uint8_t mask;
-
-				ft_node_sum_distribution_2d(mode,
-					old_type, old_node,
-					n, nullify_node_flag_ptr,
-					node_distrib_bitsel);
-				assert(!((unsigned long) new_node & FT_POOL_2D_MASK));
-				mask = (1U << node_distrib_bitsel[0]) | (1U << node_distrib_bitsel[1]);
-				subclass_index = mask_to_index_C_n8_r2(mask);
-				new_node_flag = ft_node_flag_pool_2d(new_node,
-					new_type_index, subclass_index);
-				break;
-			}
-			default:
-				assert(0);
-			}
-		} else {
-			new_node_flag = ft_node_flag(new_node, new_type_index);
-		}
+		new_node_flag = ft_node_flag(new_node, new_type_index);
 
 		dbg_printf("Recompact inherit from %p\n", metadata);
 		if (metadata) {
@@ -8027,9 +7067,6 @@ retry:		/* for fallback */
 			ft_nr_keys_store(ft, new_metadata,
 				ft_nr_keys_get(metadata), CMM_RELAXED);
 		}
-		if (fallback)
-			new_metadata->fallback_removal_count =
-						FT_FALLBACK_REMOVAL_COUNT;
 	} else {
 		new_node = NULL;
 		new_node_flag = NULL;
@@ -8042,11 +7079,12 @@ retry:		/* for fallback */
 
 /*
  * Derive is_init for a set_nth call into the freshly-allocated
- * new_node / pool subnode.  Updates init-done state so the next
- * call for the same (sub)node returns false.
+ * new_node.  Updates init-done state so the next call for the same
+ * node returns false.
  */
 #define RECOMPACT_IS_INIT(byte_value) ({				\
 	bool __is_init = false;						\
+	(void) (byte_value);						\
 	switch (new_type->type_class) {					\
 	/*								\
 	 * FT_POPCOUNT and FT_LINEAR share the single-init-flag	\
@@ -8058,15 +7096,6 @@ retry:		/* for fallback */
 		__is_init = !new_linear_init_done;			\
 		new_linear_init_done = true;				\
 		break;							\
-	case FT_POOL:							\
-	{								\
-		unsigned int __idx = ft_pool_subnode_index(new_type,	\
-			new_node_flag, (byte_value));			\
-		uint32_t __bit = 1U << __idx;				\
-		__is_init = !(new_pool_init_done & __bit);		\
-		new_pool_init_done |= __bit;				\
-		break;							\
-	}								\
 	default:							\
 		break;  /* FT_PIGEON, FT_NULL: is_init irrelevant */	\
 	}								\
@@ -8102,9 +7131,6 @@ retry:		/* for fallback */
 #endif
 			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, v, iter, RECOMPACT_IS_INIT(v));
-			if (new_type->type_class == FT_POOL && ret) {
-				goto fallback_toosmall;
-			}
 			assert(!ret);
 		}
 		break;
@@ -8137,54 +7163,7 @@ retry:		/* for fallback */
 #endif
 			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, v, iter, RECOMPACT_IS_INIT(v));
-			if (new_type->type_class == FT_POOL && ret) {
-				goto fallback_toosmall;
-			}
 			assert(!ret);
-		}
-		break;
-	}
-	case FT_POOL:
-	{
-		unsigned int pool_nr;
-
-		for (pool_nr = 0; pool_nr < (1U << old_type->nr_pool_order); pool_nr++) {
-			struct cds_ft_inode *pool =
-				ft_pool_node_get_ith_pool(old_type,
-					old_node, pool_nr);
-			uint8_t nr_child =
-				ft_linear_node_get_nr_child(old_type, pool);
-			unsigned int j;
-
-			for (j = 0; j < nr_child; j++) {
-				struct cds_ft_inode_flag *iter;
-				uint8_t v;
-
-				ft_linear_node_get_ith_pos(old_type, pool,
-						j, &v, &iter);
-				if (!iter)
-					continue;
-				if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
-					continue;
-#ifdef FEATURE_FT_POPCOUNT_NODE
-				if (new_type->nibble_popcount_2l)
-					ret = ft_nibble_popcount_2l_node_set_nth(new_type,
-							new_node, new_metadata, v, iter,
-							RECOMPACT_IS_INIT(v));
-				else if (new_type->byte_popcount_1l)
-					ret = ft_byte_popcount_1l_node_set_nth(new_type,
-							new_node, new_metadata, v, iter,
-							RECOMPACT_IS_INIT(v));
-				else
-#endif
-				ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
-						new_metadata, v, iter, RECOMPACT_IS_INIT(v));
-				if (new_type->type_class == FT_POOL
-						&& ret) {
-					goto fallback_toosmall;
-				}
-				assert(!ret);
-			}
 		}
 		break;
 	}
@@ -8217,9 +7196,6 @@ retry:		/* for fallback */
 #endif
 			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, i, iter, RECOMPACT_IS_INIT((uint8_t)i));
-			if (new_type->type_class == FT_POOL && ret) {
-				goto fallback_toosmall;
-			}
 			assert(!ret);
 		}
 		break;
@@ -8310,9 +7286,6 @@ retry:		/* for fallback */
 				ret = _ft_node_set_nth(ft, new_type, new_node,
 						new_node_flag, new_metadata,
 						v, iter, RECOMPACT_IS_INIT(v));
-				if (new_type->type_class == FT_POOL && ret) {
-					goto fallback_toosmall;
-				}
 				assert(!ret);
 			}
 		}
@@ -8342,90 +7315,10 @@ skip_copy:
 		ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 				new_metadata, n, child_node_flag,
 				RECOMPACT_IS_INIT(n));
-		if (new_type->type_class == FT_POOL && ret) {
-			goto fallback_toosmall;
-		}
 		assert(!ret);
 	}
 
-	/*
-	 * Post-copy sweep: for FT_POOL new_type, pre-initialize any
-	 * subnode that received no children during the copy.  Readers
-	 * must not observe an unpublished subnode in zero-init state --
-	 * the sentinel scan would return a phantom slot count (see
-	 * ft_linear_node_get_direction's nr_child >= min_child assert).
-	 *
-	 * For each untouched subnode, derive the lowest byte routing to
-	 * it by inverting the pool dispatch -- O(nr_subnodes) rather
-	 * than O(256).  The reserved byte becomes that subnode's
-	 * values[0]; any real insert of that byte later adopts slot 0.
-	 */
-	if (new_type_index != NODE_INDEX_NULL
-			&& new_type->type_class == FT_POOL) {
-		unsigned int nr_subnodes = 1U << new_type->nr_pool_order;
-		unsigned int idx;
-		uint8_t bits_2d[2] = { 0, 0 };
-
-		if (new_type->nr_pool_order == 2) {
-			unsigned int C_n8_r2_index;
-
-			ft_node_pool_2d_index(new_node_flag, &C_n8_r2_index);
-			index_to_bits_C_n8_r2(C_n8_r2_index, bits_2d);
-		}
-		for (idx = 0; idx < nr_subnodes; idx++) {
-			uint32_t bit = 1U << idx;
-			uint8_t reserved;
-			struct cds_ft_inode *subnode;
-			uint8_t *values;
-			struct cds_ft_inode_flag **pointers;
-
-			if (new_pool_init_done & bit)
-				continue;
-
-			/*
-			 * Invert the routing: compute the lowest byte whose
-			 * subnode-index equals idx.  Any byte routing to idx
-			 * works; lowest is the cheap choice and happens to
-			 * equal (idx << bitsel) / (positional bit composition)
-			 * with all other bits zero.
-			 */
-			if (new_type->nr_pool_order == 1) {
-				unsigned long bitsel = ft_node_pool_1d_bitsel(
-						new_node_flag);
-				reserved = (uint8_t)(idx << bitsel);
-			} else {
-				/*
-				 * POOL_2D: subnode index bit layout is
-				 *   high bit <- bits_2d[0] position
-				 *   low  bit <- bits_2d[1] position
-				 * (see value_and_bits_to_subclass_index).
-				 */
-				reserved = (uint8_t)(((idx >> 1) & 1) << bits_2d[0])
-					 | (uint8_t)((idx & 1) << bits_2d[1]);
-			}
-			assert(ft_pool_subnode_index(new_type,
-					new_node_flag, reserved) == idx);
-
-			subnode = ft_pool_get_linear_subnode(new_type,
-					new_node, new_node_flag, reserved);
-			values = &subnode->data[0];
-			pointers = (struct cds_ft_inode_flag **)
-				align_ptr_size(&values[new_type->max_linear_child]);
-			memset(values, reserved,
-				(uint8_t *)pointers - values);
-			new_pool_init_done |= bit;
-		}
-	}
-
 #undef RECOMPACT_IS_INIT
-
-	if (fallback) {
-		dbg_printf("Using fallback for %u children, node type index: %u, mode %s\n",
-			new_metadata->nr_child, old_type_index, mode == FT_RECOMPACT_ADD_NEXT ? "add_next" :
-				(mode == FT_RECOMPACT_DEL ? "del" : "add_same"));
-		if (ft_debug_counters())
-			uatomic_inc(&ft->node_fallback_count_distribution[new_metadata->nr_child]);
-	}
 
 	/*
 	 * Inherit the old node's parent pointer so upward walks
@@ -8518,37 +7411,6 @@ skip_copy:
 				ft_node_get_nth_skip(new_node_flag,
 						&slot, v, FT_PF_NONE);
 				ft_set_parent(iter, new_node_flag, slot);
-			}
-			break;
-		}
-		case FT_POOL:
-		{
-			unsigned int pool_nr;
-
-			for (pool_nr = 0;
-			     pool_nr < (1U << new_type->nr_pool_order);
-			     pool_nr++) {
-				struct cds_ft_inode *pool =
-					ft_pool_node_get_ith_pool(new_type,
-						new_node, pool_nr);
-				uint8_t nc = ft_linear_node_get_nr_child(
-						new_type, pool);
-				unsigned int j;
-
-				for (j = 0; j < nc; j++) {
-					struct cds_ft_inode_flag *iter;
-					struct cds_ft_inode_flag **slot = NULL;
-					uint8_t v;
-
-					ft_linear_node_get_ith_pos(new_type,
-							pool, j, &v, &iter);
-					if (!iter)
-						continue;
-					ft_node_get_nth_skip(
-						new_node_flag, &slot, v, FT_PF_NONE);
-					ft_set_parent(iter,
-						new_node_flag, slot);
-				}
 			}
 			break;
 		}
@@ -8662,80 +7524,6 @@ skip_copy:
 	ret = 0;
 end:
 	return ret;
-
-fallback_toosmall:
-	/* fallback if next pool is too small */
-	free_cds_ft_node_unpublished(ft, new_node);
-
-	switch (mode) {
-	case FT_RECOMPACT_ADD_SAME:
-		/*
-		 * FT_RECOMPACT_ADD_SAME is only triggered if a linear
-		 * node within a pool has unused entries. It should
-		 * therefore _never_ be too small.
-		 */
-		assert(0);
-
-		/* Fall-through */
-	case FT_RECOMPACT_ADD_NEXT:
-	{
-		const struct cds_ft_type *next_type;
-
-		/*
-		 * Recompaction attempt on add failed. Should only
-		 * happen if target node type is pool. Caused by
-		 * hard-to-split distribution. Recompact using the next
-		 * distribution size.
-		 */
-		assert(new_type->type_class == FT_POOL);
-		next_type = &ft_types[new_type_index + 1];
-		/*
-		 * Try going to the next pool size if our population
-		 * fits within its range. This is not flagged as a
-		 * fallback.
-		 */
-		if (metadata->nr_child + 1 >= next_type->min_child
-				&& metadata->nr_child + 1 <= next_type->max_child) {
-			new_type_index++;
-			goto retry;
-		} else {
-			new_type_index++;
-			dbg_printf("Add fallback to type %d\n", new_type_index);
-			if (ft_debug_counters())
-				uatomic_inc(&ft->nr_fallback);
-			fallback = 1;
-			goto retry;
-		}
-		break;
-	}
-	case FT_RECOMPACT_DEL:
-		/*
-		 * Recompaction attempt on delete failed. Should only
-		 * happen if target node type is pool. This is caused by
-		 * a hard-to-split distribution. Recompact on same node
-		 * size, but flag current node as "fallback" to ensure
-		 * we don't attempt recompaction before some activity
-		 * has reshuffled our node.
-		 */
-		assert(new_type->type_class == FT_POOL);
-		new_type_index = old_type_index;
-		dbg_printf("Delete fallback keeping type %d\n", new_type_index);
-		uatomic_inc(&ft->nr_fallback);
-		fallback = 1;
-		goto retry;
-	default:
-		assert(0);
-		return -EINVAL;
-	}
-
-	/*
-	 * Last resort fallback: pigeon.
-	 */
-	new_type_index = (1UL << FT_TYPE_BITS) - 1;
-	dbg_printf("Fallback to type %d\n", new_type_index);
-	uatomic_inc(&ft->nr_fallback);
-	fallback = 1;
-	goto retry;
 }
 
 /*
@@ -18055,7 +16843,6 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 
 			if (type->type_class != FT_LINEAR &&
 			    type->type_class != FT_POPCOUNT &&
-			    type->type_class != FT_POOL &&
 			    type->type_class != FT_PIGEON
 #ifdef FEATURE_FT_QP
 			    && type->type_class != FT_QP
@@ -18532,7 +17319,6 @@ const char *internal_type_name(unsigned int type_index)
 	{
 		unsigned int cls = ft_types[type_index].type_class;
 		unsigned int order = ft_types[type_index].order;
-		unsigned int npo = ft_types[type_index].nr_pool_order;
 
 		switch (cls) {
 		case FT_LINEAR:
@@ -18550,9 +17336,7 @@ const char *internal_type_name(unsigned int type_index)
 			 * layouts (qp_3 / qp_6 / qp_12) -- the only true
 			 * quadbit-popcount nodes.  Orders 8/9/10 are 1-level
 			 * byte_popcount_1l layouts (a single 256-bit bitmap +
-			 * ptr-array, not quadbit): order 8 is type-4, orders
-			 * 9/10 are byte_popcount layouts collapsed from the
-			 * former POOL_A / POOL_B.
+			 * ptr-array, not quadbit).
 			 */
 			switch (order) {
 			case 5: return "POPCOUNT_QP3";
@@ -18562,12 +17346,6 @@ const char *internal_type_name(unsigned int type_index)
 			case 9: return "POPCOUNT_512";
 			case 10: return "POPCOUNT_1024";
 			}
-			break;
-		case FT_POOL:
-			if (npo == 1 && order == 8)	return "POOL_1D_256";
-			if (npo == 1 && order == 9)	return "POOL_1D_512";
-			if (npo == 2 && order == 9)	return "POOL_2D_512";
-			if (npo == 2 && order == 10)	return "POOL_2D_1024";
 			break;
 		case FT_PIGEON:
 			switch (order) {
