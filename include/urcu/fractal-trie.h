@@ -426,7 +426,14 @@ enum cds_ft_iter_path_mode {
  * a grace period (e.g. via call_rcu() or synchronize_rcu()) before
  * being allowed to re-insert it.
  *
- * This structure is required to be naturally aligned.
+ * The struct (and any user struct embedding it as a member) must be
+ * 16-byte aligned: external-node pointers stored in the trie use the
+ * low 4 bits as a kind tag, and the kind value for external nodes is
+ * 0 (FT_KIND_EXT).  An 8-byte-aligned external pointer with bit 3
+ * set would decode as a different (reserved) kind and fail
+ * insertion.  The __aligned__(16) attribute forces the alignment
+ * to propagate through embedding structs without the user having to
+ * know about the encoding.
  */
 struct cds_ft_node {
 	/*
@@ -442,7 +449,7 @@ struct cds_ft_node {
 	 */
 	void *prev;
 	struct cds_ft_node *next;
-};
+} __attribute__((__aligned__(16)));
 
 #define cds_ft_entry(ptr, type, member)		caa_container_of(ptr, type, member)
 
@@ -485,31 +492,6 @@ void cds_ft_node_init(struct cds_ft_node *node)
  * while accessing the returned node.
  */
 enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
-		struct cds_ft_node **result_node);
-
-/*
- * cds_ft_lookup_candidate_key - Fast candidate lookup by key.
- * @ft: The Fractal Trie.
- * @key: Pointer to the key (may be NULL if @key_len is 0).
- * @key_len: Key length in bytes (same semantics as cds_ft_lookup_key).
- * @result_node: Candidate node output. Set to a node if a candidate is
- *               found, or NULL if not found or on error.
- *
- * Faster than cds_ft_lookup_key: skips key comparison at compressed
- * nodes during traversal.  The returned node is a CANDIDATE that may
- * not be an exact match.  The caller MUST compare the returned node's
- * key against the lookup key to confirm.  If the keys do not match,
- * the lookup key is not in the trie.
- *
- * Returns CDS_FT_STATUS_OK on success (candidate found),
- * CDS_FT_STATUS_NOT_FOUND if no candidate, or a negative cds_ft_status
- * on error.
- *
- * An RCU read-side lock must be held while calling this function and
- * while accessing the returned node.
- */
-enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		struct cds_ft_node **result_node);
 
@@ -1809,61 +1791,6 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 #define CDS_FT_SPECULATIVE_OFFSET_NONE	((size_t) ~(size_t) 0)
 
 /*
- * cds_ft_group_attr_set_speculative - Enable speculative descent.
- * @attr: Fractal Trie group attributes.
- *
- * Speculative descent enables the skip-compressed pointer encoding
- * for this group's tries, so that cds_ft_lookup_candidate_key
- * bypasses compressed nodes without loading their cache line: the
- * compressed path length and the child pointer are encoded in the
- * upper bits of the parent's slot value.  Compressed paths longer
- * than the architecture limit fall back to traditional compressed
- * node pointers transparently.
- *
- * The number of available high bits, and thus the maximum
- * compressed path length that can be skip-encoded, is architecture-
- * dependent (see FT_SKIP_LEN_BITS / FT_SKIP_LEN_MAX in the internal
- * header).
- *
- * Architecture requirement: the pointer bits used by the encoding
- * must be zero for userspace pointers.  This setter returns
- * NOT_SUPPORTED on architectures where this cannot be guaranteed,
- * and on builds without FEATURE_FT_SKIP_COMPRESSED.
- *
- * Caller requirement: external node pointers (struct cds_ft_node *)
- * stored in the trie must not carry metadata in their upper bits.
- * Pointer authentication (AArch64 PAC) or memory tagging (MTE)
- * signatures must be stripped before the pointer is passed to the
- * trie insertion API.
- *
- * Effect on the public lookup APIs:
- *
- *   cds_ft_lookup_candidate_key gets the full speedup — cand-mode
- *   descent plus bypassing compressed nodes via the skip-compressed
- *   pointer encoding.  This is the primary use case for the
- *   attribute on its own.
- *
- *   cds_ft_lookup_key continues to return precise (verified) results
- *   and the caller does not need to perform any additional
- *   validation.  Without library-side validation offsets (see
- *   cds_ft_group_attr_set_speculative_validated) the descent for
- *   cds_ft_lookup_key remains precise.  Setting only this attribute
- *   adds slight overhead on the cds_ft_lookup_key path: the parent's
- *   slot holds a skip-encoded pointer (length plus child address)
- *   rather than a direct pointer to the compressed node, so the
- *   precise descent must derive the compressed node's address from
- *   the encoded form before fetching the node for the byte
- *   comparison.  This loses the early prefetch the parent slot would
- *   otherwise provide.  Use cds_ft_group_attr_set_speculative_validated
- *   if speeding up cds_ft_lookup_key is the goal.
- *
- * Returns CDS_FT_STATUS_OK on success,
- * CDS_FT_STATUS_NOT_SUPPORTED on builds/hosts where skip-compressed
- * encoding is unavailable.
- */
-enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *attr);
-
-/*
  * cds_ft_group_attr_set_speculative_validated - Enable speculative
  *                                               descent with library-
  *                                               side key validation.
@@ -1878,18 +1805,33 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
  *                  length.  Pass CDS_FT_SPECULATIVE_OFFSET_NONE for
  *                  fixed-length-key groups.
  *
- * Implies cds_ft_group_attr_set_speculative.  When set, lookups
- * via cds_ft_lookup_key (and the iterator-based cds_ft_lookup) on
- * this group's tries descend speculatively and validate the result
- * against the external node's stored key using the library's inline
- * SIMD/SWAR comparator before returning.  This gives the user the
- * same verified-result contract as a precise lookup, with the
- * descent speed of a candidate lookup, and no user-side validation
- * function call.
+ * Lookups via cds_ft_lookup_key (and the iterator-based
+ * cds_ft_lookup) on this group's tries descend speculatively and
+ * validate the result against the external node's stored key using
+ * the library's inline SIMD/SWAR comparator before returning.  This
+ * gives the same verified-result contract as a precise lookup, with
+ * the descent speed of a speculative lookup, and no user-side
+ * validation function call.
  *
- * cds_ft_lookup_candidate_key on the same group still returns an
- * unvalidated candidate — the caller's intent (candidate vs verified)
- * is controlled by the API entry point, independently of this attr.
+ * Opportunistically enables the skip-compressed pointer encoding
+ * (CDS_FT_FLAG_SKIP_COMPRESSED) when the architecture supports it.
+ * Compressed paths longer than the architecture limit fall back to
+ * traditional compressed node pointers transparently.  See
+ * FT_SKIP_LEN_BITS / FT_SKIP_LEN_MAX in the internal header for the
+ * per-arch limits.
+ *
+ * Architecture requirement (for skip-compressed encoding): the
+ * pointer bits used by the encoding must be zero for userspace
+ * pointers.  When this cannot be guaranteed (or on builds without
+ * FEATURE_FT_SKIP_COMPRESSED), the speculative-validated mode still
+ * applies — the cand-mode descent plus leaf compare — but
+ * skip-compressed encoding is disabled.
+ *
+ * Caller requirement (when skip-compressed is active): external node
+ * pointers (struct cds_ft_node *) stored in the trie must not carry
+ * metadata in their upper bits.  Pointer authentication (AArch64
+ * PAC) or memory tagging (MTE) signatures must be stripped before
+ * the pointer is passed to the trie insertion API.
  *
  * Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @key_len_offset is not

@@ -128,7 +128,6 @@ struct cds_ft_group_attr {
 	size_t max_key_len;
 	struct cds_ft_key_map key_map;
 	unsigned int flags;
-	bool speculative;
 	bool speculative_validated;
 	size_t speculative_key_offset;
 	size_t speculative_key_len_offset;
@@ -5503,48 +5502,6 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 	}
 	FT_TP(lookup_key_exit, (int) status);
 	return status;
-}
-
-/*
- * cds_ft_lookup_candidate_key - Fast candidate lookup.
- *
- * Skips key comparison at compressed nodes during traversal,
- * returning a candidate node that may not be an exact match.
- * The caller MUST verify the returned node's key matches the
- * lookup key.  If it does not match, the key is not in the trie.
- *
- * This is faster than cds_ft_lookup_key for workloads with long
- * compressed paths (e.g. reverse DNS, file paths) because it
- * eliminates per-node key comparisons, doing a single verification
- * at the end instead.
- */
-enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
-		struct cds_ft_node **result_node)
-{
-	size_t key_len = ft_key_len(ft, _key_len);
-	const struct cds_ft_key_map *km = &ft->group->key_map;
-
-	if (!valid_key_len(ft, key_len))
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	CDS_FT_SCOPED_READER(ft);
-	/*
-	 * Identity key-map fast path: the ordinals[] buffer would be
-	 * a byte-for-byte copy of @key; skip the 256-byte stack
-	 * allocation and the entry memcpy by passing the caller's
-	 * key directly to the descent.  Common case -- non-identity
-	 * maps are only set up for key_maps that reorder bytes.
-	 */
-	if (caa_likely(km->identity))
-		return do_cds_ft_lookup(ft, key, key_len, result_node, NULL,
-					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
-	{
-		uint8_t ordinals[FT_MAX_KEY_LEN];
-
-		ft_key_to_ordinals(ordinals, key, key_len, km);
-		return do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
-					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
-	}
 }
 
 enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
@@ -12788,30 +12745,6 @@ bool ft_skip_compressed_validate(void)
 }
 #endif
 
-enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *attr)
-{
-	/*
-	 * Speculative-only mode requires skip-compressed pointer encoding
-	 * to be useful: without it, cds_ft_lookup_candidate_key already
-	 * does cand-mode descent regardless of the group attr (the
-	 * candidate flag is gated by the API entry point, not the group),
-	 * and cds_ft_lookup_key stays on the precise path (no offsets to
-	 * validate against).  When skip-compressed is unavailable on the
-	 * build/host, this attribute would be a no-op, so report it as
-	 * unsupported rather than silently doing nothing.
-	 */
-#ifndef FEATURE_FT_SKIP_COMPRESSED
-	(void) attr;
-	return CDS_FT_STATUS_NOT_SUPPORTED;
-#else
-	if (!ft_skip_compressed_validate())
-		return CDS_FT_STATUS_NOT_SUPPORTED;
-	attr->speculative = true;
-	attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
-	return CDS_FT_STATUS_OK;
-#endif
-}
-
 enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 		struct cds_ft_group_attr *attr,
 		size_t key_offset,
@@ -12842,10 +12775,8 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 	 * uses the inline SIMD/SWAR comparator).
 	 */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-	if (ft_skip_compressed_validate()) {
-		attr->speculative = true;
+	if (ft_skip_compressed_validate())
 		attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
-	}
 #endif
 	attr->speculative_validated = true;
 	attr->speculative_key_offset = key_offset;
@@ -13017,7 +12948,6 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 	if (attr) {
 		ft_group->key_map = attr->key_map;
 		ft_group->flags = attr->flags;
-		ft_group->speculative = attr->speculative;
 		ft_group->speculative_validated = attr->speculative_validated;
 		ft_group->speculative_key_offset = attr->speculative_key_offset;
 		ft_group->speculative_key_len_offset = attr->speculative_key_len_offset;
