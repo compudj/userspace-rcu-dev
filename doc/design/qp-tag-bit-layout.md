@@ -348,37 +348,10 @@ its new tag without renaming the type-table slot.
 
 Smoke: tests must still pass; this is a tag-bit rename only.
 
-### 3.3 Stage C — flip tag value of COMPRESSED from `0x2` → `0x1`
+### 3.3 Stage C — flip QP_HI tag from `0x1..0x7` (per-tier) → `0x5` (uniform)
 
-Sites:
-
-- `ft_compressed_node_flag` constructor (low-bit OR change).
-- `ft_compressed_node_ptr` (mask change: `~0x3` → `~0xF` —
-  effectively becomes `& FT_TAG_PTR_MASK`).
-- `ft_node_compressed` predicate (`tag == 0x2` → `tag == 0x1`).
-- `ft_node_external` predicate (currently `tag == 0` — still
-  matches `0x0`, no change).
-- `ft_node_internal` predicate — needs update: today it's
-  `tag & 1`, which under the new layout is *also* set on
-  COMPRESSED (`0x1`). New formula: `(tag & 1) && (tag != 0x1)`
-  or, equivalently, the new `ft_kind_of(nf) >= 0x5`.
-
-This is the **invasive stage**. Bit 1 stops being
-`FT_COMPRESSED_MASK`; it is now part of the skip-compressed
-indicator. Every direct test against `FT_COMPRESSED_MASK` or
-`FT_TAG_MASK` must be audited. Plan to grep:
-
-```sh
-grep -n 'FT_COMPRESSED_MASK\|FT_TAG_MASK\|FT_INTERNAL_MASK' src/fractal-trie.c
-```
-
-and rewrite each one to use `ft_kind_of` + an enum compare.
-
-Smoke: must pass. Run `test_urcu_ft_inv` with longer durations
-(60s) to surface any concurrent-path regression — the skip-
-resolve path is the highest-risk surface.
-
-### 3.4 Stage D — flip QP_HI tag from `0x1..0x7` (per-tier) → `0x5` (uniform)
+(Done before the COMPRESSED move because today's QP T0 = `0x1`,
+which COMPRESSED needs to occupy.)
 
 This collapses the 3-bit type-index for QP-hi nodes. Sites:
 
@@ -403,6 +376,38 @@ This collapses the 3-bit type-index for QP-hi nodes. Sites:
 Smoke: full unit + inv. Likely smallest risk surface — the
 read-side dispatch is just substituting one switch arm for
 another; the descent helper is unchanged.
+
+### 3.4 Stage D — flip tag value of COMPRESSED from `0x2` → `0x1`
+
+Now that QP_HI no longer occupies `0x1` (Stage C), COMPRESSED
+can move there.  Sites:
+
+- `ft_compressed_node_flag` constructor (low-bit OR change).
+- `ft_compressed_node_ptr` (mask change: `~0x3` → `~0xF` —
+  effectively becomes `& FT_KIND_PTR_MASK`).
+- `ft_node_compressed` predicate (`tag == 0x2` → `tag == 0x1`).
+- `ft_node_external` predicate (currently `(tag & 0x3) == 0` —
+  still matches `0x0`, no change in semantics).
+- `ft_node_internal` predicate — needs update: today it's
+  `tag & 1`, which under the new layout is *also* set on
+  COMPRESSED (`0x1`).  New formula: `(tag & 1) && (tag != 0x1)`,
+  or equivalently `ft_kind_of(nf) >= FT_KIND_QP_HI`.
+
+This is the **invasive stage**.  Bit 1 stops being
+`FT_COMPRESSED_MASK`; it is now reserved as the future
+skip-compressed indicator (used by Stage E).  Every direct test
+against `FT_COMPRESSED_MASK` or `FT_TAG_MASK` must be audited.
+Plan to grep:
+
+```sh
+grep -n 'FT_COMPRESSED_MASK\|FT_TAG_MASK\|FT_INTERNAL_MASK' src/fractal-trie.c
+```
+
+and rewrite each one to use `ft_kind_of` + an enum compare.
+
+Smoke: must pass.  Run `test_urcu_ft_inv` with longer durations
+(60 s) to surface any concurrent-path regression — the
+skip-resolve path is the highest-risk surface.
 
 ### 3.5 Stage E — add SKIP_EXT / SKIP_QP / SKIP_PIGEON encoding
 
@@ -519,8 +524,8 @@ and is dropped from the smoke configs as part of stage F.
 |---|---|---|
 | A | Tag-bit refactor: add `enum ft_kind` + `ft_kind_of` (parallel) | +60 / -0 |
 | B | Tag-bit refactor: move QP_LO tag from `0xB` to `0xD` | +20 / -10 |
-| C | Tag-bit refactor: move COMPRESSED tag from `0x2` to `0x1` | +120 / -100 |
-| D | Tag-bit refactor: collapse QP T0..T3 to uniform `QP_HI = 0x5` | +80 / -100 |
+| C | Tag-bit refactor: collapse QP T0..T3 to uniform `QP_HI = 0x5` | +80 / -100 |
+| D | Tag-bit refactor: move COMPRESSED tag from `0x2` to `0x1` | +120 / -100 |
 | E | Tag-bit refactor: encode skip-target class in tag bits | +60 / -30 |
 | F | Tag-bit refactor: drop legacy `FT_INTERNAL_MASK` / `FT_TYPE_MASK` macros | +0 / -100 |
 
