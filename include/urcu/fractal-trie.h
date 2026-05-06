@@ -1821,24 +1821,15 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  * validation function call.
  *
  * Opportunistically enables the skip-compressed pointer encoding
- * (CDS_FT_FLAG_SKIP_COMPRESSED) when the architecture supports it.
- * Compressed paths longer than the architecture limit fall back to
- * traditional compressed node pointers transparently.  See
- * FT_SKIP_LEN_BITS / FT_SKIP_LEN_MAX in the internal header for the
- * per-arch limits.
+ * (CDS_FT_FLAG_SKIP_COMPRESSED) when FEATURE_FT_SKIP_COMPRESSED is
+ * compiled in.  Compressed paths longer than FT_SKIP_LEN_MAX (255
+ * bytes — the per-item compress-cache page's uint8_t skip_len field)
+ * fall back to traditional compressed-node pointers transparently.
  *
- * Architecture requirement (for skip-compressed encoding): the
- * pointer bits used by the encoding must be zero for userspace
- * pointers.  When this cannot be guaranteed (or on builds without
- * FEATURE_FT_SKIP_COMPRESSED), the speculative-validated mode still
- * applies — the cand-mode descent plus leaf compare — but
- * skip-compressed encoding is disabled.
- *
- * Caller requirement (when skip-compressed is active): external node
- * pointers (struct cds_ft_node *) stored in the trie must not carry
- * metadata in their upper bits.  Pointer authentication (AArch64
- * PAC) or memory tagging (MTE) signatures must be stripped before
- * the pointer is passed to the trie insertion API.
+ * The legacy high-bit pointer encoding is gone; length and subkey
+ * recovery now go through the per-item compress-cache page, so the
+ * feature no longer relies on specific virtual-address layouts and
+ * is available on every supported 64-bit ABI.
  *
  * Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @key_len_offset is not

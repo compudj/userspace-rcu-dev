@@ -16,7 +16,6 @@
 #include <assert.h>
 #include <endian.h>
 #include <stdbool.h>
-#include <sys/mman.h>
 #include <urcu/fractal-trie.h>
 #include <urcu/compiler.h>
 #include <urcu/arch.h>
@@ -1186,18 +1185,13 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	 * already 8-byte aligned (no tag) so the result is unchanged
 	 * by either mask, but ~7UL keeps the cleanest semantics for
 	 * the bit-0-clear branch.
+	 *
+	 * No high-bit strip: Phase B.4 retired the legacy skip-length
+	 * encoding (high bits), so skip pointers leave them clear.
+	 * The dependent next-level load can issue one cycle earlier
+	 * per descent step.
 	 */
 	unsigned long mask = (v & 1) ? ~15UL : ~7UL;
-
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	/*
-	 * Clear the top FT_SKIP_LEN_BITS (7 bits).  In a hot loop
-	 * the compiler hoists FT_ADDR_MASK into a register, making
-	 * this a single 1-cycle AND that runs in parallel with the
-	 * mask chain above.
-	 */
-	v &= FT_ADDR_MASK;
-#endif
 
 	return (struct cds_ft_inode *) (v & mask);
 }
@@ -1216,10 +1210,6 @@ struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
 	unsigned long v = (unsigned long) node;
 	unsigned long mask = ~15UL;
 
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	v &= FT_ADDR_MASK;
-#endif
-
 	assert(((v & FT_KIND_MASK) >= FT_KIND_QP_HI) || node == NULL);
 	return (struct cds_ft_inode *) (v & mask);
 }
@@ -1227,12 +1217,7 @@ struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
 static
 struct cds_ft_inode *_ft_node_mask_ptr(struct cds_ft_inode_flag *node)
 {
-	unsigned long v = (unsigned long) node;
-
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
-#endif
-	return (struct cds_ft_inode *) (v & FT_KIND_PTR_MASK);
+	return (struct cds_ft_inode *) ((unsigned long) node & FT_KIND_PTR_MASK);
 }
 
 static inline_lookup
@@ -1348,9 +1333,8 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 		|| kind == FT_KIND_SKIP_PIGEON);
 	if (caa_unlikely(!(v & 1)))
 		return ft_skip_to_compressed(node)->len;
-	v &= FT_ADDR_MASK;	/* strip skip-length high bits */
-	v &= FT_KIND_PTR_MASK;	/* strip kind nibble */
-	return ft_compress_cache_of((void *) v)->skip_len;
+	return ft_compress_cache_of(
+		(void *) (v & FT_KIND_PTR_MASK))->skip_len;
 }
 
 /*
@@ -1387,14 +1371,13 @@ unsigned long ft_skip_kind_to_child_kind(unsigned long skip_kind)
 
 /*
  * ft_skip_child_ptr: extract the child tagged pointer from a skip
- * pointer.  Clears the skip-length high bits and rewrites the
- * skip-target tag (0x2/0x3/0xB) back into the child's actual kind
- * tag (0x0/0x5/0x9).
+ * pointer.  Rewrites the skip-target tag (0x2/0x3/0xB) back into
+ * the child's actual kind tag (0x0/0x5/0x9).
  */
 static inline
 struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
 {
-	unsigned long v = (unsigned long) node & FT_ADDR_MASK;
+	unsigned long v = (unsigned long) node;
 	unsigned long child_kind = ft_skip_kind_to_child_kind(v & FT_KIND_MASK);
 
 	return (struct cds_ft_inode_flag *) ((v & FT_KIND_PTR_MASK) | child_kind);
@@ -1406,12 +1389,10 @@ struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
  * rewritten to the matching FT_KIND_SKIP_* variant; readers can
  * dispatch on the skip-target class without consulting cn metadata.
  *
- * Length recovery (formerly encoded into the high bits of the
- * returned pointer) now lives in the per-item compress-cache page
- * for SKIP_QP / SKIP_PIGEON, and in the external_node->prev → cn->len
- * chain for SKIP_EXT.  The high bits of the returned pointer are
- * therefore left clear; Phase B.4 removes the FT_ADDR_MASK strips
- * that defensively re-clear them on the read side.
+ * Length recovery lives in the per-item compress-cache page for
+ * SKIP_QP / SKIP_PIGEON, and in the external_node->prev → cn->len
+ * chain for SKIP_EXT.  The returned pointer carries no length bits
+ * — read-side length recovery is decoupled from the pointer.
  *
  * Side effect: populates the compress-cache entry for @child (when
  * @child is FT-arena-allocated, i.e. not FT_KIND_EXT) with cn->len
@@ -1434,13 +1415,7 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	unsigned long skip_kind = ft_kind_to_skip_kind(child_kind);
 	unsigned int len = cn->len;
 
-	/*
-	 * Length still bounded by FT_SKIP_LEN_MAX upstream
-	 * (cn->len <= FT_SKIP_LEN_MAX gate before this is called) AND
-	 * by the cache's uint8_t skip_len field (255).  After Phase B.4
-	 * removes the FT_SKIP_LEN_* machinery, the cache bound becomes
-	 * the only constraint.
-	 */
+	/* Bounded by FT_SKIP_LEN_MAX (cache's uint8_t skip_len field). */
 	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
 	/*
 	 * Only EXT / QP_HI / PIGEON are valid skip targets.  COMPRESSED
@@ -2329,13 +2304,8 @@ uint8_t *align_ptr_size(uint8_t *ptr)
 static inline void ft_maybe_prefetch(const void *ptr)
 {
 	unsigned long v = (unsigned long) ptr;
-	unsigned long kind;
+	unsigned long kind = v & FT_KIND_MASK;
 
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	/* Clear skip-compressed length bits. */
-	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
-#endif
-	kind = v & FT_KIND_MASK;
 	if (kind == FT_KIND_PIGEON || kind == FT_KIND_SKIP_PIGEON)
 		return;
 	__builtin_prefetch((const void *) v);
@@ -2419,9 +2389,6 @@ void ft_prefetch_child_meta(const void *ptr)
 
 	if (!v)
 		return;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
-#endif
 	/*
 	 * External kinds (EXT 0x0, SKIP_EXT 0x2) are the only kinds
 	 * with bit 0 = 0; every internal kind has bit 0 = 1.  A single
@@ -2458,9 +2425,6 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 
 	if (!v)
 		return;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
-#endif
 	/* See ft_prefetch_child_meta for the bit-0 dispatch rationale. */
 	if (!(v & 1)) {
 		__builtin_prefetch((const void *) v);
@@ -12786,37 +12750,6 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
-/*
- * Validate that the pointer bits used by the skip-compressed encoding
- * are outside the kernel's virtual address range.  Attempt to mmap a
- * page at the encoding boundary; if the mapping succeeds or fails
- * with EEXIST the bit is within the VA range and skip-compressed
- * cannot be used safely.  Only ENOMEM (address beyond TASK_SIZE)
- * confirms the bit is available; any other failure (EPERM, EINVAL,
- * EAGAIN, seccomp, ...) is treated conservatively as unavailable.
- *
- * Called once from cds_ft_group_attr_set_flags when CDS_FT_FLAG_SKIP_COMPRESSED
- * is requested.
- */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-static
-bool ft_skip_compressed_validate(void)
-{
-	void *p;
-
-	p = mmap((void *)(1UL << FT_SKIP_LEN_SHIFT), urcu_get_page_len(),
-		 PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-		 -1, 0);
-	if (p == MAP_FAILED) {
-		/* Only ENOMEM proves the address is outside the VA range. */
-		return errno == ENOMEM;
-	}
-	/* Mapping succeeded: the bit is within the VA range. */
-	munmap(p, urcu_get_page_len());
-	return false;
-}
-#endif
-
 enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 		struct cds_ft_group_attr *attr,
 		size_t key_offset,
@@ -12840,15 +12773,14 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 	/*
 	 * Opportunistically enable skip-compressed pointer encoding when
 	 * available — it stacks with library-side validation to also
-	 * avoid the compressed-node cache-line load.  Tolerate
-	 * NOT_SUPPORTED here: validated speculative descent is still
-	 * profitable without skip-compressed (cand-mode descent skips
-	 * the compressed/collapsed byte verify, and the leaf compare
-	 * uses the inline SIMD/SWAR comparator).
+	 * avoid the compressed-node cache-line load.  Skip-compressed
+	 * no longer relies on high-bit pointer encoding (since Phase
+	 * B.3/B.4), so the runtime mmap probe that used to validate
+	 * VA-range availability is gone — the feature gate alone
+	 * decides applicability.
 	 */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-	if (ft_skip_compressed_validate())
-		attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
+	attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
 	attr->speculative_validated = true;
 	attr->speculative_key_offset = key_offset;

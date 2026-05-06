@@ -92,29 +92,20 @@ enum ft_kind {
  * compressed node's child, skipping the compressed node on the read
  * fast path (candidate lookup).
  *
- * Encoding: the high bits of a pointer (starting at FT_SKIP_LEN_SHIFT)
- * store the compressed path length.  These bits must be zero in normal
- * userspace pointers.  A non-zero value identifies a skip pointer.
- * The number of available bits (FT_SKIP_LEN_BITS) and thus the
- * maximum encodable path length (FT_SKIP_LEN_MAX) are architecture-
- * dependent.  Compressed paths longer than FT_SKIP_LEN_MAX keep the
- * traditional compressed node pointer (no skip optimization).
+ * The skip pointer's kind nibble is FT_KIND_SKIP_EXT / FT_KIND_SKIP_QP
+ * / FT_KIND_SKIP_PIGEON depending on the resolved child class.  Length
+ * recovery uses the per-item compress-cache page (16 bytes per item,
+ * one page after the items page in each arena range): SKIP_QP and
+ * SKIP_PIGEON readers fetch cn->len from cache->skip_len with a
+ * single ALU-add (child + page_size); SKIP_EXT readers fall back to
+ * the external_node->prev → cn->len chain (external nodes may live
+ * outside our arenas, so the page-offset cache slot is not safe to
+ * read for them).
  *
- * Per-architecture parameters:
- *   x86-64:    shift=57, bits=7, max path=127  (LA57: 57-bit VA)
- *   AArch64:   shift=56, bits=8, max path=255  (LVA: 52-bit VA)
- *   PPC64:     shift=56, bits=8, max path=255  (Radix: 52-bit VA)
- *   riscv64:   shift=56, bits=8, max path=255  (Sv57: 57-bit VA)
- *   MIPS64:    shift=56, bits=8, max path=255  (48-bit VA)
- *   LoongArch: shift=56, bits=8, max path=255  (48-bit VA)
- *
- * New architectures can be added by defining FT_SKIP_LEN_SHIFT and
- * FT_SKIP_LEN_BITS below, enabling FEATURE_FT_SKIP_COMPRESSED in
- * the architecture gate, and verifying that userspace pointers have
- * the selected bits clear.  Architectures with fewer available high
- * bits can still benefit from skip-compressed with a smaller
- * FT_SKIP_LEN_BITS; the fallback to traditional compressed pointers
- * handles longer paths transparently.
+ * The high bits of a skip pointer are zero — the legacy
+ * `len << shift` encoding (and its per-arch shift table) is gone,
+ * so the read-side ft_node_ptr family carries no defensive high-bit
+ * strip on the lookup hot path's load-address dependency chain.
  *
  * The compressed node remains allocated (for key bytes, inequality
  * lookup, exact lookup) and is accessible via the child node's
@@ -148,50 +139,22 @@ enum ft_kind {
  * Both use rcu_dereference / rcu_assign_pointer for proper ordering.
  */
 
-/* Per-architecture skip-length encoding parameters (64-bit only). */
-#if defined(URCU_ARCH_AMD64)
-# define FT_SKIP_LEN_SHIFT	57	/* Bits 57-63 (7 bits). LA57: 57-bit VA. */
-# define FT_SKIP_LEN_BITS	7
-#elif defined(URCU_ARCH_AARCH64)
-# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). LVA: 52-bit VA. */
-# define FT_SKIP_LEN_BITS	8
-#elif defined(URCU_ARCH_PPC64)
-# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). Radix: 52-bit VA. */
-# define FT_SKIP_LEN_BITS	8
-#elif defined(URCU_ARCH_RISCV) && CAA_BITS_PER_LONG >= 64
-# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). Sv57: 57-bit VA. */
-# define FT_SKIP_LEN_BITS	8
-#elif defined(URCU_ARCH_MIPS) && CAA_BITS_PER_LONG >= 64
-# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). 48-bit VA. */
-# define FT_SKIP_LEN_BITS	8
-#elif defined(URCU_ARCH_LOONGARCH)
-# define FT_SKIP_LEN_SHIFT	56	/* Bits 56-63 (8 bits). 48-bit VA. */
-# define FT_SKIP_LEN_BITS	8
-#endif
+/*
+ * Maximum compressed-path length that can be skip-compressed.  Bound
+ * by the compress-cache's uint8_t skip_len field (FF == 255).  Paths
+ * longer than this keep the traditional cn_flag pointer; readers
+ * descend through the compressed node's child slot.
+ */
+#define FT_SKIP_LEN_MAX		255U
 
-#ifdef FT_SKIP_LEN_BITS
-# define FT_SKIP_LEN_MAX	((1U << FT_SKIP_LEN_BITS) - 1)
-# define FT_SKIP_LEN_MASK	(((unsigned long) FT_SKIP_LEN_MAX) << FT_SKIP_LEN_SHIFT)
-# define FT_ADDR_MASK		((1UL << FT_SKIP_LEN_SHIFT) - 1)
 /*
  * Inline cache, in cds_ft_metadata, of the first
  * FT_SKIP_PARENT_CACHE_LEN bytes of the parent compressed node's
  * key_bytes.  Validated against the lookup key without loading the
- * cn header CL.  Compressed parents whose len > this fall back to the
- * indirect path via metadata.parent.
+ * cn header CL.  Compressed parents whose len > this fall back to
+ * the indirect path via metadata.parent.
  */
-# define FT_SKIP_PARENT_CACHE_LEN	23
-#else
-/*
- * Fallback on architectures without skip-compressed support (notably
- * 32-bit).  FEATURE_FT_SKIP_COMPRESSED is also undefined in that
- * case, so call sites guarded by ft_group_skip_compressed() short-
- * circuit before evaluating FT_SKIP_LEN_MAX; the fallback value
- * keeps those expressions type-correct at compile time without
- * changing runtime behavior.
- */
-# define FT_SKIP_LEN_MAX	0U
-#endif
+#define FT_SKIP_PARENT_CACHE_LEN	23
 
 #define FT_ENTRY_PER_NODE	256
 #define FT_LOG2_BITS_PER_BYTE	3U
@@ -274,16 +237,16 @@ enum ft_kind {
  */
 
 /*
- * Skip-compressed pointers encode the compressed path length in the
- * high bits of pointers (bits 57-63).  This requires architectures
- * where those bits are guaranteed zero for userspace pointers.
+ * Skip-compressed pointers tag a child slot's pointer with FT_KIND_
+ * SKIP_* and bypass the compressed node on the candidate-lookup fast
+ * path.  Length / subkey recovery uses the per-item compress-cache
+ * page (see ft_compress_cache_of); no high-bit pointer encoding is
+ * involved, so unlike the legacy encoding the feature is no longer
+ * tied to specific 64-bit virtual-address layouts.
  *
- * Enabled on architectures that define FT_SKIP_LEN_BITS (see
- * per-architecture encoding parameters above).  A runtime
- * validation (mmap probe) at flag-set time rejects the feature
- * if the encoding bits fall within the kernel's VA range.
- *
- * Not supported on s390x (full 64-bit virtual addresses).
+ * Gated on 64-bit only for now: the cache encoding itself works on
+ * 32-bit too, but enabling it there is deferred to a follow-up
+ * (depends on a perf evaluation on 32-bit ABIs).
  *
  * Requires FEATURE_FT_COMPRESS (skip-compressed is meaningless
  * without compressed nodes).
@@ -296,7 +259,7 @@ enum ft_kind {
 # endif
 #endif
 #ifndef NO_FEATURE_FT_SKIP_COMPRESSED
-# if defined(FT_SKIP_LEN_BITS)
+# if CAA_BITS_PER_LONG >= 64
 #  define FEATURE_FT_SKIP_COMPRESSED
 # endif
 #endif
