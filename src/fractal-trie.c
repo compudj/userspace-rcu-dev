@@ -1362,16 +1362,30 @@ struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
 
 /*
  * ft_skip_compressed_flag: encode a skip pointer from a child pointer
- * and the compressed path length.  The child's kind tag is rewritten
- * to the matching FT_KIND_SKIP_* variant; readers can then dispatch
- * on the skip-target class without consulting cn metadata.
+ * and the parent compressed node @cn.  The child's kind tag is
+ * rewritten to the matching FT_KIND_SKIP_* variant; readers can
+ * dispatch on the skip-target class without consulting cn metadata.
+ *
+ * Side effect: populates the compress-cache entry for @child (when
+ * @child is FT-arena-allocated, i.e. not FT_KIND_EXT) with cn->len
+ * and the leading subkey bytes.  Cache writes happen BEFORE this
+ * function returns; the caller's subsequent rcu_assign_pointer of
+ * the resulting flag provides the release ordering between the
+ * cache population and any reader that observes the skip pointer.
+ *
+ * SKIP_EXT cache population is intentionally skipped: external nodes
+ * may be user-allocated outside our arenas, so (child + page_size)
+ * is not a valid cache slot.  SKIP_EXT length recovery goes via the
+ * external_node->prev → cn->len chain.
  */
 static
 struct cds_ft_inode_flag *ft_skip_compressed_flag(
-		struct cds_ft_inode_flag *child, unsigned int len)
+		struct cds_ft_inode_flag *child,
+		const struct cds_ft_compressed_node *cn)
 {
 	unsigned long child_kind = (unsigned long) child & FT_KIND_MASK;
 	unsigned long skip_kind = ft_kind_to_skip_kind(child_kind);
+	unsigned int len = cn->len;
 
 	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
 	/*
@@ -1392,6 +1406,16 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	 * (chain-compress invariant) and QP_LO (skip only crosses byte
 	 * boundaries) are forbidden; ft_kind_to_skip_kind asserts.
 	 */
+	if (child_kind != FT_KIND_EXT) {
+		struct ft_compress_cache *cache = ft_compress_cache_of(
+			(void *) ((unsigned long) child & FT_KIND_PTR_MASK));
+		size_t copy_len = len < FT_COMPRESS_CACHE_SUBKEY_LEN
+				? len : FT_COMPRESS_CACHE_SUBKEY_LEN;
+
+		if (copy_len)
+			memcpy(cache->subkey, cn->key_bytes, copy_len);
+		cache->skip_len = (uint8_t) len;
+	}
 	return (struct cds_ft_inode_flag *)
 		(((unsigned long) child & FT_KIND_PTR_MASK) | skip_kind |
 		 ((unsigned long) len << FT_SKIP_LEN_SHIFT));
@@ -1533,7 +1557,7 @@ struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
 static
 struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		struct cds_ft_inode_flag *child,
-		unsigned int len __attribute__((unused)))
+		const struct cds_ft_compressed_node *cn __attribute__((unused)))
 {
 	return child;
 }
@@ -1666,7 +1690,7 @@ void ft_update_skip_pointer(struct cds_ft_inode_flag **parent_slot,
 	if (!ft_node_skip_compressed(slot_val))
 		return;
 	rcu_assign_pointer(*parent_slot,
-		ft_skip_compressed_flag(cn->child, cn->len));
+		ft_skip_compressed_flag(cn->child, cn));
 }
 
 /*
@@ -1705,7 +1729,7 @@ void ft_publish_to_parent(struct cds_ft *ft,
 			    ft_node_skip_compressed(*skip_slot))
 				rcu_assign_pointer(*skip_slot,
 					ft_skip_compressed_flag(
-						new_child, cn->len));
+						new_child, cn));
 		}
 #endif
 		/*
@@ -1774,7 +1798,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 		(const void *) NULL);
 	if (ft_group_skip_compressed(ft->group) &&
 	    cn->len <= FT_SKIP_LEN_MAX) {
-		return ft_skip_compressed_flag(cn->child, cn->len);
+		return ft_skip_compressed_flag(cn->child, cn);
 	}
 	return cflag;
 }
@@ -4429,7 +4453,7 @@ skip_copy:
 			    ft_node_skip_compressed(*skip_slot))
 				rcu_assign_pointer(*skip_slot,
 					ft_skip_compressed_flag(
-						new_node_flag, cn->len));
+						new_node_flag, cn));
 		}
 #endif
 	}
