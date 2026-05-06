@@ -1406,6 +1406,13 @@ struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
  * rewritten to the matching FT_KIND_SKIP_* variant; readers can
  * dispatch on the skip-target class without consulting cn metadata.
  *
+ * Length recovery (formerly encoded into the high bits of the
+ * returned pointer) now lives in the per-item compress-cache page
+ * for SKIP_QP / SKIP_PIGEON, and in the external_node->prev → cn->len
+ * chain for SKIP_EXT.  The high bits of the returned pointer are
+ * therefore left clear; Phase B.4 removes the FT_ADDR_MASK strips
+ * that defensively re-clear them on the read side.
+ *
  * Side effect: populates the compress-cache entry for @child (when
  * @child is FT-arena-allocated, i.e. not FT_KIND_EXT) with cn->len
  * and the leading subkey bytes.  Cache writes happen BEFORE this
@@ -1427,20 +1434,14 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	unsigned long skip_kind = ft_kind_to_skip_kind(child_kind);
 	unsigned int len = cn->len;
 
-	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
 	/*
-	 * The encoding ORs len into the high bits of child.  If child
-	 * already carries skip-length bits (i.e., is itself a skip-
-	 * compressed pointer), the OR conflicts with len and produces
-	 * a corrupted nested encoding from which neither len nor child
-	 * can be recovered cleanly.  Chain-compress canonicalization
-	 * is responsible for ensuring that cn->child is never skip-
-	 * compressed at publish time (the "no two adjacent compresseds"
-	 * invariant).  Assert the invariant here so any future regression
-	 * fails loudly under -UNDEBUG smoke tests rather than silently
-	 * corrupting the trie.
+	 * Length still bounded by FT_SKIP_LEN_MAX upstream
+	 * (cn->len <= FT_SKIP_LEN_MAX gate before this is called) AND
+	 * by the cache's uint8_t skip_len field (255).  After Phase B.4
+	 * removes the FT_SKIP_LEN_* machinery, the cache bound becomes
+	 * the only constraint.
 	 */
-	assert(((unsigned long) child >> FT_SKIP_LEN_SHIFT) == 0);
+	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
 	/*
 	 * Only EXT / QP_HI / PIGEON are valid skip targets.  COMPRESSED
 	 * (chain-compress invariant) and QP_LO (skip only crosses byte
@@ -1457,8 +1458,7 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		cache->skip_len = (uint8_t) len;
 	}
 	return (struct cds_ft_inode_flag *)
-		(((unsigned long) child & FT_KIND_PTR_MASK) | skip_kind |
-		 ((unsigned long) len << FT_SKIP_LEN_SHIFT));
+		(((unsigned long) child & FT_KIND_PTR_MASK) | skip_kind);
 }
 
 /*
