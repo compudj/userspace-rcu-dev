@@ -168,19 +168,13 @@ struct cds_ft_type {
  */
 
 /*
- * The smallest allocation order we can use is 4:
- * - 1 bit is reserved for internal vs external flag,
- * - 3 bits are reserved to encode the node type.
+ * The smallest allocation order is 4 (16-byte alignment): the low 4
+ * bits of every tagged pointer carry the kind nibble (FT_KIND_*).
  */
 
-#if (CAA_BITS_PER_LONG < 64)
-#error "Fractal Trie requires 64-bit pointers"
-#endif
-
-/* 64-bit pointers */
 enum {
-	ft_type_7_max_child = 256,
-	ft_type_8_max_child = 256,
+	ft_type_pigeon_max_child = 256,
+	ft_type_null_max_child = 256,
 };
 
 /*
@@ -224,9 +218,9 @@ const struct cds_ft_type ft_types[] = {
 	[1] = { .type_class = FT_QP, .min_child = 2,  .max_child = FT_QP16_T1_CAPACITY * 16, .order = FT_QP16_T1_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	[2] = { .type_class = FT_QP, .min_child = 5,  .max_child = FT_QP16_T2_CAPACITY * 16, .order = FT_QP16_T2_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	[3] = { .type_class = FT_QP, .min_child = 11, .max_child = FT_QP16_T3_CAPACITY * 16, .order = FT_QP16_T3_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
-	[4] = { .type_class = FT_PIGEON, .min_child = 16, .max_child = ft_type_7_max_child, .order = 11, .bitmap = FT_BITMAP },
+	[4] = { .type_class = FT_PIGEON, .min_child = 16, .max_child = ft_type_pigeon_max_child, .order = 11, .bitmap = FT_BITMAP },
 	/* NULL sentinel at NODE_INDEX_NULL (= FT_NUM_INTERNAL_TYPES). */
-	[NODE_INDEX_NULL] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
+	[NODE_INDEX_NULL] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_null_max_child, .bitmap = FT_NO_BITMAP },
 };
 
 /*
@@ -3721,29 +3715,6 @@ int ft_qp_byte_set(struct cds_ft *ft,
  * ft_node_get_nth: get nth item from a node.
  * node_flag is already rcu_dereference'd.
  */
-
-/*
- * Compile-time bitmasks indexed by type_index: for each class,
- * the set of type_index values whose ft_types[] entry has that
- * class.  Dispatching via `(1U << type_index) & FT_MASK_X` keeps
- * the check in ALU ops only.  Each bit is derived from
- * ft_types[i].type_class directly, so an ft_types[] edit
- * (reclassification, new type) updates the masks automatically.
- */
-#define FT_TC_BIT(n, tc) \
-	(ft_types[(n)].type_class == (tc) ? (1U << (n)) : 0)
-
-#if CAA_BITS_PER_LONG < 64
-#define FT_MASK_CLASS(tc) \
-	(FT_TC_BIT(0, tc) | FT_TC_BIT(1, tc) | FT_TC_BIT(2, tc) | \
-	 FT_TC_BIT(3, tc) | FT_TC_BIT(4, tc) | FT_TC_BIT(5, tc) | \
-	 FT_TC_BIT(6, tc))
-#else
-#define FT_MASK_CLASS(tc) \
-	(FT_TC_BIT(0, tc) | FT_TC_BIT(1, tc) | FT_TC_BIT(2, tc) | \
-	 FT_TC_BIT(3, tc) | FT_TC_BIT(4, tc) | FT_TC_BIT(5, tc) | \
-	 FT_TC_BIT(6, tc) | FT_TC_BIT(7, tc))
-#endif
 
 static inline_lookup
 /*
