@@ -1071,10 +1071,30 @@ static
 struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 		unsigned long type)
 {
+	unsigned long tag;
+
 	assert(type < (1UL << FT_TYPE_BITS));
-	return (struct cds_ft_inode_flag *) (((unsigned long) node) |
-		(type << FT_INTERNAL_BITS) |
-		FT_INTERNAL_MASK);
+	/*
+	 * Map the legacy ft_types[] slot index to the new 4-bit kind
+	 * nibble.  All four QP hi-tiers (T0..T3) carry FT_KIND_QP_HI
+	 * uniformly; the per-tier alloc order is recoverable from
+	 * cds_ft_item_order() when needed (write side / verify).
+	 * PIGEON carries FT_KIND_PIGEON.  ft_types[].type_class is a
+	 * constant load — folded by the compiler when @type is a
+	 * compile-time literal (every fresh-root call site passes 0).
+	 */
+	switch (ft_types[type].type_class) {
+	case FT_QP:
+		tag = FT_KIND_QP_HI;
+		break;
+	case FT_PIGEON:
+		tag = FT_KIND_PIGEON;
+		break;
+	default:
+		assert(0);
+		__builtin_unreachable();
+	}
+	return (struct cds_ft_inode_flag *) (((unsigned long) node) | tag);
 }
 
 /*
@@ -1230,16 +1250,36 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
 static inline_lookup
 unsigned long ft_node_type(struct cds_ft_inode_flag *node)
 {
-	unsigned long type;
+	unsigned long tag;
 
 	if (_ft_node_mask_ptr(node) == NULL) {
 		return NODE_INDEX_NULL;
 	}
 	/* Compressed nodes don't have a type index. */
 	assert(!ft_node_compressed(node));
-	type = (unsigned int) (((unsigned long) node & FT_TYPE_MASK) >> FT_INTERNAL_BITS);
-	assert(type < (1UL << FT_TYPE_BITS));
-	return type;
+	/*
+	 * After Stage C, all QP-hi tiers share kind nibble
+	 * FT_KIND_QP_HI (= 0x5); the per-tier index used by
+	 * ft_types[] indexing is recovered from the alloc order
+	 * (T0..T3 = orders 5..8 = ft_types[0..3]).  PIGEON
+	 * (FT_KIND_PIGEON = 0x9) maps to ft_types[4]; QP_LO and any
+	 * future kinds keep their legacy bit-extracted value.
+	 */
+	tag = (unsigned long) node & FT_KIND_MASK;
+	if (tag == FT_KIND_QP_HI) {
+		size_t order = cds_ft_item_order(ft_node_ptr_internal(node));
+		assert(order >= FT_QP16_T0_ALLOC_ORDER
+			&& order < FT_QP16_T0_ALLOC_ORDER + FT_QP16_NR_TIERS);
+		return order - FT_QP16_T0_ALLOC_ORDER;
+	}
+	if (tag == FT_KIND_PIGEON)
+		return 4;
+	{
+		unsigned long type =
+			(((unsigned long) node) & FT_TYPE_MASK) >> FT_INTERNAL_BITS;
+		assert(type < (1UL << FT_TYPE_BITS));
+		return type;
+	}
 }
 
 static
