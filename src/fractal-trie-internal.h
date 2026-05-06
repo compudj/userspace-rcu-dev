@@ -65,6 +65,41 @@
 #define FT_PTR_MASK	(~(FT_TYPE_MASK | FT_INTERNAL_MASK))
 
 /*
+ * Tag-bit kind enumeration (target layout for the in-flight tag-bit
+ * refactor — see doc/design/qp-tag-bit-layout.md).
+ *
+ * The enum is added now (Stage A) so that subsequent stages can
+ * introduce constructors / dispatch arms that already speak the new
+ * vocabulary.  The actual on-pointer encoding still uses the legacy
+ * FT_INTERNAL_MASK / FT_COMPRESSED_MASK / FT_TYPE_MASK layout; later
+ * stages migrate the encoding bit by bit until the enum value IS the
+ * pointer's low nibble (Stage F).
+ *
+ * Migration progress (low-nibble values that already match the
+ * target encoding on HEAD):
+ *   - FT_KIND_EXT (0x0)     : matches today
+ *   - FT_KIND_PIGEON (0x9)  : matches today (type_index 4)
+ *   - FT_KIND_QP_HI (0x5)   : matches today only for type_index 2;
+ *                             the rest of T0..T3 still carry their
+ *                             per-tier type_index in bits 1..3
+ *   - all others            : not yet migrated; do NOT compare a raw
+ *                             low nibble against these values yet
+ */
+enum ft_kind {
+	FT_KIND_EXT		= 0x0,
+	FT_KIND_COMPRESSED	= 0x1,
+	FT_KIND_SKIP_EXT	= 0x2,
+	FT_KIND_SKIP_QP		= 0x3,
+	FT_KIND_QP_HI		= 0x5,
+	FT_KIND_PIGEON		= 0x9,
+	FT_KIND_SKIP_PIGEON	= 0xB,
+	FT_KIND_QP_LO		= 0xD,
+};
+
+#define FT_KIND_MASK		0xFUL
+#define FT_KIND_PTR_MASK	(~FT_KIND_MASK)
+
+/*
  * Internal group flag: skip-compressed pointer encoding.
  *
  * Bit set in struct cds_ft_group::flags when the speculative-mode
