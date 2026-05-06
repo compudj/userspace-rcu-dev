@@ -17,14 +17,34 @@
  *
  *   nr_items = cds_ft_page_size / item_len.
  *
+ *   Without FEATURE_FT_SKIP_COMPRESSED:
+ *
  *   Offset                 Content
  *
  *   0:                     array of nr_items elements of item_len each
- *   cds_ft_page_size:             struct cds_ft_alloc_range
- *   cds_ft_page_size + sizeof(struct cds_ft_alloc_range):
+ *   page_size:             struct cds_ft_alloc_range
+ *   page_size + sizeof(struct cds_ft_alloc_range):
  *                          array of nr_items struct cds_ft_metadata_alloc
- *   2 * cds_ft_page_size - nr_items * sizeof(struct cds_ft_bitmap):
- *                          reverse array of nr_items struct cds_ft_bitmap (only for 2D pool and pigeon)
+ *   2 * page_size - nr_items * sizeof(struct cds_ft_bitmap):
+ *                          reverse array of nr_items struct cds_ft_bitmap
+ *                          (only for pigeon)
+ *
+ *   With FEATURE_FT_SKIP_COMPRESSED:
+ *
+ *   Offset                 Content
+ *
+ *   0:                     array of nr_items elements of item_len each
+ *   page_size:             ft_compress_cache array (16 B per item slot,
+ *                          aligned at the SAME in-page offset as the
+ *                          corresponding item).  Recovery from an
+ *                          item pointer is a single
+ *                          (char *)item + page_size — no load, no
+ *                          shift, no arena chase.
+ *   2 * page_size:         struct cds_ft_alloc_range
+ *   2 * page_size + sizeof(struct cds_ft_alloc_range):
+ *                          array of nr_items struct cds_ft_metadata_alloc
+ *   3 * page_size - nr_items * sizeof(struct cds_ft_bitmap):
+ *                          reverse array of nr_items struct cds_ft_bitmap
  *
  * An allocation arena contains a linked list of allocation ranges.
  */
@@ -89,7 +109,7 @@ struct cds_ft_alloc_arena {
 static
 void *cds_ft_range_get_nth_item(struct cds_ft_alloc_range *range, size_t n)
 {
-	return (((char *) range) - cds_ft_page_size) + (n << range->arena->item_len_order);
+	return (((char *) range) - FT_RANGE_HDR_PAGE_OFFSET) + (n << range->arena->item_len_order);
 }
 
 static
@@ -129,9 +149,9 @@ static
 size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 {
 	if (bitmap)
-		return 2 * cds_ft_page_size;
+		return FT_RANGE_END_PAGE_OFFSET;
 	else
-		return cds_ft_page_size + sizeof(struct cds_ft_alloc_range) +
+		return FT_RANGE_HDR_PAGE_OFFSET + sizeof(struct cds_ft_alloc_range) +
 			(cds_ft_page_size >> item_len_order) * sizeof(struct cds_ft_metadata_alloc);
 }
 
@@ -270,7 +290,7 @@ carve:
 	ptr = (char *) sb->base + sb->used;
 	sb->used += alloc_size_aligned;
 	/* mmap'd anonymous pages are zero-initialized; no memset needed. */
-	range = (struct cds_ft_alloc_range *) ((char *) ptr + cds_ft_page_size);
+	range = (struct cds_ft_alloc_range *) ((char *) ptr + FT_RANGE_HDR_PAGE_OFFSET);
 	range->arena = arena;
 	return range;
 }
@@ -385,6 +405,9 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 		memset(p, 0, 1U << arena->item_len_order);
 		memset(&free_list_head->metadata, 0, sizeof(free_list_head->metadata));
 		free_list_head->metadata.alloc_index = saved_alloc_index;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		memset(ft_compress_cache_of(p), 0, sizeof(struct ft_compress_cache));
+#endif
 		if (arena->bitmap) {
 			struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(p, arena->item_len_order);
 			memset(bitmap, 0, sizeof(struct cds_ft_bitmap));
@@ -479,6 +502,9 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 
 		memset(item, 0xfe, item_len);
 		memset(metadata_alloc, 0xfe, sizeof(*metadata_alloc));
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		memset(ft_compress_cache_of(item), 0xfe, sizeof(struct ft_compress_cache));
+#endif
 	}
 #else
 	{

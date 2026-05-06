@@ -815,17 +815,33 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
 /*
  * Allocator layout (see fractal-trie-alloc.c for the full picture).
  *
- * Each 2*page_size range holds the items array (page 0), then the
- * per-range header (struct cds_ft_alloc_range) followed by the
- * per-item metadata array (page 1).  Optional bitmap array grows
- * backward from (range base + 2*page_size) on 2D-pool / pigeon arenas.
+ * Without FEATURE_FT_SKIP_COMPRESSED, each 2*page_size range holds:
  *
- * The two cache lines most often prefetched from a tagged child
- * pointer — the item's metadata and (for bitmap types) its bitmap —
- * are derivable with pure pointer arithmetic given the item's order.
- * The helpers below live in this header so that the prefetch-hint
- * path can compute their addresses inline, without a cross-TU call
- * into fractal-trie-alloc.c.
+ *   page 0:  items array
+ *   page 1:  cds_ft_alloc_range header + cds_ft_metadata_alloc array
+ *            (optional cds_ft_bitmap array grows backward from end of
+ *            page 1 on 2D-pool / pigeon arenas)
+ *
+ * With FEATURE_FT_SKIP_COMPRESSED, a dedicated compress-cache page is
+ * inserted between the items page and the range header, yielding a
+ * 3*page_size range:
+ *
+ *   page 0:  items array
+ *   page 1:  ft_compress_cache array (16 B per item slot, at the SAME
+ *            in-page offset as the corresponding item).  Holds the
+ *            cached subkey bytes (15 B) and the skip length (1 B) for
+ *            children whose parent is a skip-compressed cn.  Recovery
+ *            from a child pointer is a single (char *)node + page_size.
+ *   page 2:  cds_ft_alloc_range header + cds_ft_metadata_alloc array
+ *            (optional cds_ft_bitmap array grows backward from end of
+ *            page 2)
+ *
+ * The cache lines most often prefetched from a tagged child pointer —
+ * the item's compress-cache, metadata, and (for bitmap types) bitmap
+ * — are derivable with pure pointer arithmetic.  The helpers below
+ * live in this header so the prefetch-hint path can compute their
+ * addresses inline, without a cross-TU call into
+ * fractal-trie-alloc.c.
  *
  * struct cds_ft_alloc_arena remains opaque here: only out-of-line
  * slow paths (cds_ft_item_to_metadata, cds_ft_item_order,
@@ -833,6 +849,32 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
  * fractal-trie-alloc.c.
  */
 struct cds_ft_alloc_arena;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+/*
+ * ft_compress_cache: per-item, 16-byte cache entry holding the
+ * skip-compressed parent's length and a cached prefix of its key
+ * bytes.  Lives at the same in-page offset as its associated item,
+ * one page above the items page (see allocator layout above).
+ *
+ * Layout invariants:
+ *   skip_len == 0  : this child is not parented by a skip-compressed
+ *                    cn (or has not yet been published).
+ *   skip_len  > 0  : skip-compressed parent.  cn->len == skip_len.
+ *                    The first min(skip_len, sizeof(subkey)) bytes of
+ *                    cn->key_bytes are mirrored in subkey[];
+ *                    candidate-mode validation can compare against
+ *                    those without loading the cn header CL.  For
+ *                    skip_len > sizeof(subkey), validation falls back
+ *                    to leaf-bytes compare for the trailing portion.
+ */
+#define FT_COMPRESS_CACHE_SUBKEY_LEN	15U
+
+struct ft_compress_cache {
+	uint8_t subkey[FT_COMPRESS_CACHE_SUBKEY_LEN];
+	uint8_t skip_len;
+} __attribute__((__aligned__(16)));
+#endif
 
 struct cds_ft_metadata_alloc {
 	struct rcu_head rcu_head;
@@ -873,13 +915,26 @@ static inline size_t cds_ft_get_page_size(void)
 #endif
 }
 
+/*
+ * Range header lives one page above the items page when
+ * FEATURE_FT_SKIP_COMPRESSED is off, two pages above when it is on
+ * (the extra page holds the compress-cache, see ft_compress_cache).
+ */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+# define FT_RANGE_HDR_PAGE_OFFSET	(2UL * cds_ft_get_page_size())
+# define FT_RANGE_END_PAGE_OFFSET	(3UL * cds_ft_get_page_size())
+#else
+# define FT_RANGE_HDR_PAGE_OFFSET	(1UL * cds_ft_get_page_size())
+# define FT_RANGE_END_PAGE_OFFSET	(2UL * cds_ft_get_page_size())
+#endif
+
 static inline
 struct cds_ft_alloc_range *cds_ft_item_to_range(void *p)
 {
 	size_t pg = cds_ft_get_page_size();
 	void *base = (void *)((unsigned long) p & ~(pg - 1));
 
-	return (struct cds_ft_alloc_range *) ((char *) base + pg);
+	return (struct cds_ft_alloc_range *) ((char *) base + FT_RANGE_HDR_PAGE_OFFSET);
 }
 
 static inline
@@ -892,8 +947,23 @@ struct cds_ft_metadata *cds_ft_item_to_metadata_fast(void *p, size_t item_len_or
 	return &range->metadata[index].metadata;
 }
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 /*
- * bitmap array is indexed backwards from range base + (2 * page_size).
+ * Compress-cache entry for an item: same in-page offset as the item,
+ * one page above the items page.  Recovery from a child pointer is a
+ * single immediate-add: (char *)p + page_size.  No load, no shift, no
+ * arena indirection on the dependency chain.
+ */
+static inline
+struct ft_compress_cache *ft_compress_cache_of(void *p)
+{
+	return (struct ft_compress_cache *)
+		((char *) p + cds_ft_get_page_size());
+}
+#endif
+
+/*
+ * bitmap array is indexed backwards from end of range header page.
  */
 static inline
 struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order)
@@ -902,7 +972,7 @@ struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order)
 	void *base = (void *)((unsigned long) p & ~(pg - 1));
 	size_t index = ((unsigned long) p & (pg - 1)) >> item_len_order;
 
-	return (struct cds_ft_bitmap *) ((char *) base + (2 * pg) -
+	return (struct cds_ft_bitmap *) ((char *) base + FT_RANGE_END_PAGE_OFFSET -
 			((index + 1) * sizeof(struct cds_ft_bitmap)));
 }
 
