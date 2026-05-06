@@ -327,7 +327,8 @@ struct cds_ft_alloc_arena;
  *   offset 16: 8-byte nr_keys (unsigned long)
  *   offset 24: 4-byte packed bitfield (nr_child, skip_slot_offset,
  *              fallback_removal_count, alloc_index)
- *   offset 28: pigeon_skip_len (1 byte) + 3 bytes trailing padding
+ *   offset 28: pigeon_skip_len OR qp_subtree_half_cls (1 byte each,
+ *              union — see field comments) + 2 bytes trailing pad
  *
  * In cds_ft_metadata_alloc, rcu_head is a separate field placed
  * before the metadata union — no overlap with metadata fields.
@@ -377,18 +378,31 @@ struct cds_ft_metadata {
 #endif
 	uint32_t fallback_removal_count:FT_FALLBACK_REMOVAL_BITS;
 	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
-	 * Inline skip-target length for PIGEON nodes (which have no
-	 * spare bytes in their dense ptrs[256] layout).  Set by
-	 * ft_skip_compressed_flag for FT_KIND_PIGEON children; ignored
-	 * for QP children (they use cds_ft_qp16_node::skip_len in the
-	 * node header, same CL as the bitmap).  No subkey is cached
-	 * for PIGEON skip targets — validation falls back to the
-	 * leaf-bytes compare.
+	 * Trailing-pad byte at offset 28.  Two mutually-exclusive uses
+	 * — a metadata is either a QP-hi's or a PIGEON's, never both:
+	 *
+	 *   FT_KIND_PIGEON skip target → pigeon_skip_len: cn->len when
+	 *     this PIGEON is the target of a skip-compressed pointer.
+	 *     PIGEON has no spare bytes in its dense ptrs[256] layout,
+	 *     so the skip length lives here.  No subkey is cached for
+	 *     PIGEON skip targets — validation falls back to the leaf-
+	 *     bytes compare.  Gated on FEATURE_FT_SKIP_COMPRESSED.
+	 *
+	 *   FT_KIND_QP_HI hi-node → qp_subtree_half_cls: total
+	 *     half-cacheline (32 B) footprint of the hi+lo subtree
+	 *     rooted at this hi.  Used by the QP→PIGEON up-trigger:
+	 *     when the count exceeds PIGEON's flat 64 half-CLs (= 2 KB),
+	 *     the recompact framework swaps to PIGEON.  Set on hi
+	 *     creation, +=/-= on Path 1 (new T0 lo), Path 2b (lo CoW
+	 *     grow), and ft_qp_byte_clear (last-byte lo elide).
 	 */
-	uint8_t pigeon_skip_len;
+	union {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		uint8_t pigeon_skip_len;
 #endif
+		uint8_t qp_subtree_half_cls;
+	};
 };
 
 /*

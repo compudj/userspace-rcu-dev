@@ -216,7 +216,7 @@ const struct cds_ft_type ft_types[] = {
 	[1] = { .type_class = FT_QP, .min_child = 2,  .max_child = FT_QP16_T1_CAPACITY * 16, .order = FT_QP16_T1_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	[2] = { .type_class = FT_QP, .min_child = 5,  .max_child = FT_QP16_T2_CAPACITY * 16, .order = FT_QP16_T2_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	[3] = { .type_class = FT_QP, .min_child = 11, .max_child = FT_QP16_T3_CAPACITY * 16, .order = FT_QP16_T3_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
-	[4] = { .type_class = FT_PIGEON, .min_child = 16, .max_child = ft_type_pigeon_max_child, .order = 11, .bitmap = FT_BITMAP },
+	[4] = { .type_class = FT_PIGEON, .min_child = 8, .max_child = ft_type_pigeon_max_child, .order = 11, .bitmap = FT_BITMAP },
 	/* NULL sentinel at NODE_INDEX_NULL (= FT_NUM_INTERNAL_TYPES). */
 	[NODE_INDEX_NULL] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_null_max_child, .bitmap = FT_NO_BITMAP },
 };
@@ -2705,6 +2705,27 @@ unsigned int ft_qp16_capacity_from_order(unsigned int order)
 }
 
 /*
+ * Half-cacheline footprint of a node allocation order.  Half-CL = 32 B,
+ * the unit used by qp_subtree_half_cls accounting:
+ *
+ *   T0  (order 5 = 32 B)   → 1
+ *   T1  (order 6 = 64 B)   → 2
+ *   T2  (order 7 = 128 B)  → 4
+ *   T3  (order 8 = 256 B)  → 8
+ *   PIGEON (order 11 = 2 KB) → 64
+ *
+ * The QP→PIGEON up-trigger fires when the hi+lo half-CL sum exceeds
+ * PIGEON's flat 64.
+ */
+#define FT_PIGEON_HALF_CLS	64U	/* 2 KB / 32 B = 64 half-CLs. */
+
+static inline
+unsigned int ft_node_half_cls(unsigned int order)
+{
+	return 1U << (order - 5U);
+}
+
+/*
  * QP-nibble lo-flag builder.
  *
  * Lo-nodes are stored RAW (untagged) in their parent hi-node's ptrs[i]
@@ -3501,6 +3522,9 @@ int ft_qp_byte_clear(struct cds_ft *ft,
 	/* Lo-node fully tombstoned: detach + RCU-free. */
 	assert(*hi_slot != NULL);
 	rcu_assign_pointer(*hi_slot, NULL);
+	/* Half-CL accounting: lo leaves the subtree. */
+	hi_meta->qp_subtree_half_cls -= (uint8_t)
+		ft_node_half_cls(cds_ft_item_order(lo));
 	ft_qp16_node_free_rcu(ft, lo);
 	return 0;
 }
@@ -3620,6 +3644,9 @@ int ft_qp_byte_set(struct cds_ft *ft,
 		}
 		/* hi_meta->nr_child = total byte children. +1 for the new byte. */
 		hi_meta->nr_child++;
+		/* Half-CL accounting: new T0 lo joins the subtree. */
+		hi_meta->qp_subtree_half_cls += (uint8_t)
+			ft_node_half_cls(FT_QP16_T0_ALLOC_ORDER);
 		/*
 		 * Direct child of new_lo: parent = tagged lo-flag, slot is in
 		 * the lo-arena (8-bit skip_slot_offset is bounded).  Must run
@@ -3701,6 +3728,16 @@ int ft_qp_byte_set(struct cds_ft *ft,
 			new_lo_meta->nr_child = new_live;
 			new_lo_meta->parent = hi_flag;
 			new_lo_flag = ft_qp16_lo_flag(new_lo);
+			/*
+			 * Half-CL accounting: replace old lo's footprint with
+			 * the new (potentially larger) lo's.  When the old
+			 * order equals the new order (in-place rebuild without
+			 * tier-up), this is a no-op.
+			 */
+			hi_meta->qp_subtree_half_cls += (uint8_t)
+				ft_node_half_cls(new_order);
+			hi_meta->qp_subtree_half_cls -= (uint8_t)
+				ft_node_half_cls(lo_order);
 			/*
 			 * Publish RAW lo pointer in hi.  Children's
 			 * meta->parent (set below) keeps the tagged lo-flag.
@@ -4280,6 +4317,16 @@ int ft_node_recompact(enum ft_recompact mode,
 			ft_nr_keys_store(ft, new_metadata,
 				ft_nr_keys_get(metadata), CMM_RELAXED);
 		}
+		/*
+		 * Initialize half-CL accounting for the new node.  For
+		 * FT_QP, the lattice walk's Path-1 / Path-2b calls in
+		 * _ft_node_set_nth accumulate the lo costs as bytes are
+		 * inserted; the hi's own footprint is seeded here.  For
+		 * FT_PIGEON the field is unused (a different union arm).
+		 */
+		if (new_type->type_class == FT_QP)
+			new_metadata->qp_subtree_half_cls =
+				(uint8_t) ft_node_half_cls(new_type->order);
 	} else {
 		new_node = NULL;
 		new_node_flag = NULL;
@@ -4581,6 +4628,165 @@ end:
 }
 
 /*
+ * QP→PIGEON conversion.  Used by the post-success up-trigger in
+ * ft_node_set_nth when an FT_QP hi-node's qp_subtree_half_cls exceeds
+ * PIGEON's flat 64 half-CLs.
+ *
+ * Allocates a fresh PIGEON, walks the (hi, lo, byte) lattice into it,
+ * inherits hi-meta state, swaps the parent's slot, reparents children,
+ * and queues the old hi + 16 lo's for RCU-free.  Caller passes
+ * @old_node_ret so the framework's existing post-recompact free dance
+ * applies to the old hi.
+ *
+ * Returns 0 on success.  -ENOMEM on PIGEON alloc failure (the QP stays
+ * intact; the caller may try again later).
+ */
+static
+int ft_qp_to_pigeon_convert(struct cds_ft *ft,
+		struct cds_ft_inode_flag **old_node_flag_ptr,
+		struct cds_ft_metadata *old_meta,
+		struct cds_ft_inode **old_node_ret)
+{
+	const struct cds_ft_type *pigeon_type =
+			&ft_types[FT_NUM_INTERNAL_TYPES - 1];
+	struct cds_ft_inode_flag *old_hi_flag = *old_node_flag_ptr;
+	struct cds_ft_qp16_node *old_hi =
+			(struct cds_ft_qp16_node *) ft_node_ptr(old_hi_flag);
+	struct cds_ft_inode *new_pigeon;
+	struct cds_ft_metadata *new_meta;
+	struct cds_ft_inode_flag *new_pigeon_flag;
+	uint16_t old_hi_bm;
+	unsigned int hi_iter;
+
+	assert(pigeon_type->type_class == FT_PIGEON);
+
+	new_pigeon = alloc_cds_ft_node(ft, pigeon_type, &new_meta);
+	if (!new_pigeon)
+		return -ENOMEM;
+	new_pigeon_flag = ft_node_flag(new_pigeon,
+			FT_NUM_INTERNAL_TYPES - 1);
+
+	new_meta->parent = old_meta->parent;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	new_meta->skip_slot_offset = old_meta->skip_slot_offset;
+	new_meta->pigeon_skip_len = 0;	/* set below if old hi was a skip target */
+#endif
+	new_meta->fallback_removal_count = old_meta->fallback_removal_count;
+	ft_metadata_set_external_nodes(new_pigeon_flag, new_meta,
+			old_meta->external_nodes);
+	ft_nr_keys_store(ft, new_meta, ft_nr_keys_get(old_meta), CMM_RELAXED);
+	new_meta->nr_child = old_meta->nr_child;
+
+	/* Walk old (hi, lo, byte) lattice, populate PIGEON. */
+	old_hi_bm = uatomic_load(&old_hi->bitmap, CMM_RELAXED);
+	for (hi_iter = 0; hi_iter < 16U; hi_iter++) {
+		uint16_t hi_bit = (uint16_t) (1U << hi_iter);
+		unsigned int hi_idx;
+		struct cds_ft_qp16_node *lo;
+		uint16_t lo_bm;
+		unsigned int j;
+
+		if (!(old_hi_bm & hi_bit))
+			continue;
+		hi_idx = (unsigned int) __builtin_popcount(
+				(unsigned int) (old_hi_bm & (hi_bit - 1U)));
+		lo = (struct cds_ft_qp16_node *) ft_dereference_acquire(
+				old_hi->ptrs[hi_idx]);
+		if (!lo)
+			continue;
+		lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
+		for (j = 0; j < 16U; j++) {
+			uint16_t lo_bit = (uint16_t) (1U << j);
+			unsigned int lo_idx;
+			struct cds_ft_inode_flag *iter;
+			uint8_t v;
+
+			if (!(lo_bm & lo_bit))
+				continue;
+			lo_idx = (unsigned int) __builtin_popcount(
+					(unsigned int) (lo_bm & (lo_bit - 1U)));
+			iter = ft_dereference_acquire(lo->ptrs[lo_idx]);
+			if (!iter)
+				continue;
+			v = (uint8_t) ((hi_iter << 4) | j);
+			/*
+			 * ft_pigeon_node_set_nth bumps new_meta->nr_child
+			 * for every slot it sets.  We pre-set nr_child from
+			 * old_meta above, so undo each bump as we go to keep
+			 * the final count consistent.
+			 */
+			(void) ft_pigeon_node_set_nth(pigeon_type, new_pigeon,
+					new_meta, v, iter);
+			new_meta->nr_child--;
+		}
+	}
+
+	/*
+	 * If old hi was the target of a skip-compressed pointer in its
+	 * parent compressed node, repoint that skip slot at new PIGEON
+	 * BEFORE swapping the regular slot (mirrors the recompact
+	 * framework's ordering).
+	 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (old_meta->parent && ft_node_compressed(old_meta->parent)) {
+		struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(old_meta->parent);
+		struct cds_ft_metadata *cn_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) cn);
+		struct cds_ft_inode_flag **skip_slot =
+				ft_get_skip_slot(cn_meta, ft);
+
+		if (skip_slot && ft_node_skip_compressed(*skip_slot))
+			rcu_assign_pointer(*skip_slot,
+				ft_skip_compressed_flag(new_pigeon_flag, cn));
+	}
+#endif
+
+	/* Swap the regular parent slot to point at new PIGEON. */
+	rcu_assign_pointer(*old_node_flag_ptr, new_pigeon_flag);
+
+	/* Reparent children: each child's metadata->parent → new PIGEON. */
+	for (hi_iter = 0; hi_iter < FT_ENTRY_PER_NODE; hi_iter++) {
+		struct cds_ft_inode_flag *iter;
+		struct cds_ft_inode_flag **slot = NULL;
+
+		iter = ft_pigeon_node_get_ith_pos(pigeon_type, new_pigeon,
+				hi_iter);
+		if (!iter)
+			continue;
+		ft_node_get_nth_skip(new_pigeon_flag, &slot,
+				(uint8_t) hi_iter, FT_PF_NONE);
+		ft_set_parent(iter, new_pigeon_flag, slot);
+	}
+
+	/* RCU-free old lo's. */
+	for (hi_iter = 0; hi_iter < 16U; hi_iter++) {
+		uint16_t hi_bit = (uint16_t) (1U << hi_iter);
+		unsigned int hi_idx;
+		struct cds_ft_qp16_node *old_lo;
+
+		if (!(old_hi_bm & hi_bit))
+			continue;
+		hi_idx = (unsigned int) __builtin_popcount(
+				(unsigned int) (old_hi_bm & (hi_bit - 1U)));
+		old_lo = (struct cds_ft_qp16_node *) ft_dereference_acquire(
+				old_hi->ptrs[hi_idx]);
+		if (old_lo)
+			ft_qp16_node_free_rcu(ft, old_lo);
+	}
+
+	FT_TP(node_recompact, (const void *) old_hi_flag,
+		(const void *) new_pigeon_flag,
+		(int) (FT_NUM_INTERNAL_TYPES - 1));
+
+	*old_node_flag_ptr = new_pigeon_flag;
+	if (old_node_ret)
+		*old_node_ret = (struct cds_ft_inode *) old_hi;
+	return 0;
+}
+
+/*
  * Return 0 on success or negative error value on error.
  */
 static
@@ -4622,6 +4828,17 @@ int ft_node_set_nth(struct cds_ft *ft,
 			if (ft_node_skip_compressed(child_node_flag))
 				ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
 			ft_set_parent(child_node_flag, *node_flag, slot_ptr);
+		} else if (caa_unlikely(metadata->qp_subtree_half_cls >
+				FT_PIGEON_HALF_CLS)) {
+			/*
+			 * QP→PIGEON up-trigger: hi+lo subtree footprint just
+			 * crossed PIGEON's flat 2 KB.  Convert in place.  The
+			 * trigger only fires post-success — never inside the
+			 * recompact framework's lattice walk — so the
+			 * conversion's own lattice walk runs uninterrupted.
+			 */
+			ret = ft_qp_to_pigeon_convert(ft, node_flag, metadata,
+					old_node_ret);
 		}
 		break;
 	}
@@ -12875,6 +13092,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		*result_ft = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
+	/* Half-CL accounting: T0 hi alone, no lo's yet. */
+	metadata->qp_subtree_half_cls = (uint8_t) ft_node_half_cls(type0->order);
 	ft->root = ft_node_flag(root_node, 0);
 	FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
