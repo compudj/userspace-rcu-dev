@@ -426,14 +426,15 @@ enum cds_ft_iter_path_mode {
  * a grace period (e.g. via call_rcu() or synchronize_rcu()) before
  * being allowed to re-insert it.
  *
- * The struct (and any user struct embedding it as a member) must be
- * 16-byte aligned: external-node pointers stored in the trie use the
- * low 4 bits as a kind tag, and the kind value for external nodes is
- * 0 (FT_KIND_EXT).  An 8-byte-aligned external pointer with bit 3
- * set would decode as a different (reserved) kind and fail
- * insertion.  The __aligned__(16) attribute forces the alignment
- * to propagate through embedding structs without the user having to
- * know about the encoding.
+ * The struct only needs the natural pointer alignment of the host
+ * ABI (4 bytes on 32-bit, 8 bytes on 64-bit).  External-node pointers
+ * stored in the trie use bits 0,1 as a 2-bit kind tag (FT_KIND_EXT
+ * == 0x0, FT_KIND_SKIP_EXT == 0x2; every non-EXT kind has at least
+ * one of bit 0,1 set, so 2 bits suffice to identify externals).
+ * Bits 2,3 of the natural address are not part of the tag and ride
+ * through ft_node_ptr's EXT branch unchanged, so the user does not
+ * need to over-align this struct.  The two `void *` members already
+ * give it the natural pointer alignment guaranteed by the ABI.
  */
 struct cds_ft_node {
 	/*
@@ -449,7 +450,7 @@ struct cds_ft_node {
 	 */
 	void *prev;
 	struct cds_ft_node *next;
-} __attribute__((__aligned__(16)));
+};
 
 #define cds_ft_entry(ptr, type, member)		caa_container_of(ptr, type, member)
 

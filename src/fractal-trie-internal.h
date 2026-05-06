@@ -56,8 +56,17 @@
  *   - bits 2..3 encode the resolved class (00 = ext/compressed, 01 =
  *     qp_hi, 10 = pigeon, 11 = qp_lo).
  *
- * All allocations are >= 16-byte aligned (FT_ALLOC_ORDER_MIN = 4) so
- * the low 4 bits are guaranteed zero in raw addresses.
+ * Internal allocations are >= 16-byte aligned (FT_ALLOC_ORDER_MIN = 4)
+ * so the full 4-bit kind nibble is free in their raw addresses.
+ *
+ * External nodes (struct cds_ft_node, user-allocated) only need the
+ * low 2 bits free — EXT (0x0) and SKIP_EXT (0x2) only use bit 1.  The
+ * remaining bits 2,3 ride through unchanged: the EXT-branch of
+ * ft_node_ptr strips just bits 0,1 (FT_EXT_PTR_MASK), and every
+ * non-EXT kind has at least one of {bit 0, bit 1} set so the
+ * (ptr & 0x3) == 0 test in ft_node_external is sufficient to pick out
+ * EXT.  This keeps cds_ft_node's natural alignment at sizeof(void *)
+ * on both 32-bit (4-byte) and 64-bit (8-byte) ABIs.
  */
 enum ft_kind {
 	FT_KIND_EXT		= 0x0,
@@ -72,6 +81,17 @@ enum ft_kind {
 
 #define FT_KIND_MASK		0xFUL
 #define FT_KIND_PTR_MASK	(~FT_KIND_MASK)
+
+/*
+ * EXT-only kind mask.  EXT (0x0) and SKIP_EXT (0x2) share bits 0,1
+ * with no other kind: every non-EXT kind has at least one of bit 0
+ * or bit 1 set.  Using only the low 2 bits to encode external-pointer
+ * kinds lets bits 2,3 of the natural cds_ft_node address ride through
+ * unchanged, keeping external alignment at the ABI's natural pointer
+ * alignment (4 bytes on 32-bit, 8 bytes on 64-bit).
+ */
+#define FT_KIND_EXT_MASK	0x3UL
+#define FT_EXT_PTR_MASK		(~FT_KIND_EXT_MASK)
 
 /*
  * Internal group flag: skip-compressed pointer encoding.
