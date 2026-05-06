@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 187
+#define NR_TESTS 186
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */

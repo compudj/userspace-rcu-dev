@@ -1304,13 +1304,47 @@ struct cds_ft_compressed_node *ft_compressed_node_ptr(
 static inline
 bool ft_node_skip_compressed(struct cds_ft_inode_flag *node)
 {
-	return ((unsigned long) node >> FT_SKIP_LEN_SHIFT) != 0;
+	/*
+	 * Bit 1 of the kind nibble is the universal "is skip-compressed"
+	 * predicate: set on FT_KIND_SKIP_EXT (0x2), FT_KIND_SKIP_QP
+	 * (0x3), FT_KIND_SKIP_PIGEON (0xB); clear on every non-skip
+	 * kind (EXT 0x0, COMPRESSED 0x1, QP_HI 0x5, PIGEON 0x9, QP_LO
+	 * 0xD).  Cheaper than the high-bit length test (one AND, no
+	 * shift) and decoupled from the high-bit length encoding that
+	 * Phase B.3+ retires.
+	 */
+	return ((unsigned long) node & 0x2UL) != 0;
 }
 
+/*
+ * Recover the skip length for a skip-compressed pointer.
+ *
+ * SKIP_QP / SKIP_PIGEON: the resolved child lives in our arena, so
+ * the per-item compress-cache page sits at child + page_size.
+ * Single immediate-add + one CL load.
+ *
+ * SKIP_EXT: the resolved child can be user-allocated outside our
+ * arenas, so the cache page is not safe to read at child + page_size.
+ * Length recovery routes through ft_skip_to_compressed (the
+ * external_node->prev → cn->len chain).
+ */
+static inline
+struct cds_ft_compressed_node *ft_skip_to_compressed(
+		struct cds_ft_inode_flag *skip_ptr);
 static inline
 unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 {
-	return (unsigned long) node >> FT_SKIP_LEN_SHIFT;
+	unsigned long kind = (unsigned long) node & FT_KIND_MASK;
+	unsigned long v;
+
+	assert(kind == FT_KIND_SKIP_EXT || kind == FT_KIND_SKIP_QP
+		|| kind == FT_KIND_SKIP_PIGEON);
+	if (caa_unlikely(kind == FT_KIND_SKIP_EXT))
+		return ft_skip_to_compressed(node)->len;
+	v = (unsigned long) node;
+	v &= FT_ADDR_MASK;	/* strip skip-length high bits */
+	v &= FT_KIND_PTR_MASK;	/* strip kind nibble */
+	return ft_compress_cache_of((void *) v)->skip_len;
 }
 
 /*
