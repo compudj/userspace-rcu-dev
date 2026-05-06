@@ -1304,14 +1304,18 @@ bool ft_node_skip_compressed(struct cds_ft_inode_flag *node)
 /*
  * Recover the skip length for a skip-compressed pointer.
  *
- * SKIP_QP / SKIP_PIGEON: the resolved child lives in our arena, so
- * the per-item compress-cache page sits at child + page_size.
- * Single immediate-add + one CL load.
+ * SKIP_QP: skip_len lives inline in the QP node header (byte 2 of
+ * cds_ft_qp16_node, same CL as the bitmap that descent already
+ * loads).  No extra CL load.
+ *
+ * SKIP_PIGEON: PIGEON has no spare bytes in its dense ptrs[256]
+ * layout, so skip_len lives in cds_ft_metadata::pigeon_skip_len.
+ * One extra CL load (the metadata page).
  *
  * SKIP_EXT: the resolved child can be user-allocated outside our
- * arenas, so the cache page is not safe to read at child + page_size.
- * Length recovery routes through ft_skip_to_compressed (the
- * external_node->prev → cn->len chain).
+ * arenas, so we cannot rely on inline storage.  Length recovery
+ * routes through ft_skip_to_compressed (the external_node->prev →
+ * cn->len chain).
  */
 static inline
 struct cds_ft_compressed_node *ft_skip_to_compressed(
@@ -1321,20 +1325,22 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
 	unsigned long kind = v & FT_KIND_MASK;
+	void *natural;
 
 	/*
 	 * Caller has already established that @node is a skip-compressed
 	 * kind (FT_KIND_SKIP_EXT 0x2, FT_KIND_SKIP_QP 0x3, or
-	 * FT_KIND_SKIP_PIGEON 0xB).  Among those, only SKIP_EXT has
-	 * bit 0 clear, so the read-side dispatch is a single bit-0 test
-	 * (cheaper than a 3-way compare against the FT_KIND_SKIP_* values).
+	 * FT_KIND_SKIP_PIGEON 0xB).
 	 */
 	assert(kind == FT_KIND_SKIP_EXT || kind == FT_KIND_SKIP_QP
 		|| kind == FT_KIND_SKIP_PIGEON);
-	if (caa_unlikely(!(v & 1)))
+	if (caa_unlikely(kind == FT_KIND_SKIP_EXT))
 		return ft_skip_to_compressed(node)->len;
-	return ft_compress_cache_of(
-		(void *) (v & FT_KIND_PTR_MASK))->skip_len;
+	natural = (void *) (v & FT_KIND_PTR_MASK);
+	if (kind == FT_KIND_SKIP_QP)
+		return ((const struct cds_ft_qp16_node *) natural)->skip_len;
+	/* FT_KIND_SKIP_PIGEON */
+	return cds_ft_item_to_metadata(natural)->pigeon_skip_len;
 }
 
 /*
@@ -1389,22 +1395,19 @@ struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
  * rewritten to the matching FT_KIND_SKIP_* variant; readers can
  * dispatch on the skip-target class without consulting cn metadata.
  *
- * Length recovery lives in the per-item compress-cache page for
- * SKIP_QP / SKIP_PIGEON, and in the external_node->prev → cn->len
- * chain for SKIP_EXT.  The returned pointer carries no length bits
- * — read-side length recovery is decoupled from the pointer.
+ * Length recovery is inline in the destination node:
+ *   FT_KIND_QP_HI  → cds_ft_qp16_node::skip_len + subkey[5]
+ *                    (same CL as bitmap; covers ≤5B paths inline)
+ *   FT_KIND_PIGEON → cds_ft_metadata::pigeon_skip_len (no subkey)
+ *   FT_KIND_EXT    → external_node->prev → cn->len chain (cn is
+ *                    located via the back-pointer; no inline write,
+ *                    since external nodes may live outside our arenas).
  *
- * Side effect: populates the compress-cache entry for @child (when
- * @child is FT-arena-allocated, i.e. not FT_KIND_EXT) with cn->len
- * and the leading subkey bytes.  Cache writes happen BEFORE this
- * function returns; the caller's subsequent rcu_assign_pointer of
- * the resulting flag provides the release ordering between the
- * cache population and any reader that observes the skip pointer.
- *
- * SKIP_EXT cache population is intentionally skipped: external nodes
- * may be user-allocated outside our arenas, so (child + page_size)
- * is not a valid cache slot.  SKIP_EXT length recovery goes via the
- * external_node->prev → cn->len chain.
+ * Side effect: writes the inline skip storage for @child (when @child
+ * is FT-arena-allocated, i.e. not FT_KIND_EXT).  Writes happen BEFORE
+ * this function returns; the caller's subsequent rcu_assign_pointer
+ * of the resulting flag provides the release ordering between the
+ * inline write and any reader that observes the skip pointer.
  */
 static
 struct cds_ft_inode_flag *ft_skip_compressed_flag(
@@ -1415,37 +1418,29 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	unsigned long skip_kind = ft_kind_to_skip_kind(child_kind);
 	unsigned int len = cn->len;
 
-	/* Bounded by FT_SKIP_LEN_MAX (cache's uint8_t skip_len field). */
+	/* Bounded by FT_SKIP_LEN_MAX (uint8_t skip_len field). */
 	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
 	/*
 	 * Only EXT / QP_HI / PIGEON are valid skip targets.  COMPRESSED
 	 * (chain-compress invariant) and QP_LO (skip only crosses byte
 	 * boundaries) are forbidden; ft_kind_to_skip_kind asserts.
 	 */
-	if (child_kind != FT_KIND_EXT) {
+	if (child_kind == FT_KIND_QP_HI) {
+		struct cds_ft_qp16_node *qp = (struct cds_ft_qp16_node *)
+			((unsigned long) child & FT_KIND_PTR_MASK);
+		size_t copy_len = len < FT_QP16_SUBKEY_INLINE_LEN
+				? len : FT_QP16_SUBKEY_INLINE_LEN;
+
+		if (copy_len)
+			memcpy(qp->subkey, cn->key_bytes, copy_len);
+		qp->skip_len = (uint8_t) len;
+	} else if (child_kind == FT_KIND_PIGEON) {
 		void *natural_child = (void *)
 			((unsigned long) child & FT_KIND_PTR_MASK);
-		struct ft_compress_cache *cache =
-			ft_compress_cache_of(natural_child);
-		size_t copy_len = len < FT_COMPRESS_CACHE_SUBKEY_LEN
-				? len : FT_COMPRESS_CACHE_SUBKEY_LEN;
+		struct cds_ft_metadata *meta =
+			cds_ft_item_to_metadata(natural_child);
 
-		/*
-		 * Contract: any node we publish a skip pointer to must
-		 * live in a compressed_child arena.  The cache page
-		 * (child + page_size) is only mapped/touched for those
-		 * arenas; writing to the cache slot of a non-compressed_
-		 * child node would either fault in a page that should
-		 * stay untouched (RSS bloat) or, worse, corrupt arena
-		 * bookkeeping that lives at that offset.  Allocation
-		 * sites are responsible for picking the right arena
-		 * based on whether the node may become a skip target.
-		 */
-		assert(cds_ft_item_to_range(natural_child)->arena_class
-			== FT_ARENA_COMPRESSED_CHILD);
-		if (copy_len)
-			memcpy(cache->subkey, cn->key_bytes, copy_len);
-		cache->skip_len = (uint8_t) len;
+		meta->pigeon_skip_len = (uint8_t) len;
 	}
 	return (struct cds_ft_inode_flag *)
 		(((unsigned long) child & FT_KIND_PTR_MASK) | skip_kind);
@@ -2097,14 +2092,12 @@ bool valid_key_len(struct cds_ft *ft, size_t key_len)
 static
 struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 		const struct cds_ft_type *ft_type,
-		enum cds_ft_arena_class arena_class,
 		struct cds_ft_metadata **_metadata)
 {
 	struct cds_ft_metadata *metadata;
 	void *p;
 
-	metadata = cds_ft_alloc_item(ft, ft_type->order, ft_type->bitmap,
-		arena_class);
+	metadata = cds_ft_alloc_item(ft, ft_type->order, ft_type->bitmap);
 	if (!metadata) {
 		return NULL;
 	}
@@ -2172,13 +2165,7 @@ struct cds_ft_compressed_node *alloc_compressed_node(struct cds_ft *ft,
 	void *p;
 	unsigned int order = ft_compressed_order(path_len);
 
-	/*
-	 * Compressed nodes are never skip targets: they are the SOURCE
-	 * of skip pointers (cn → child encoded as a SKIP_* pointer in
-	 * the grandparent's slot).  Allocate from non-compressed_child
-	 * arenas to skip the cache-page bookkeeping.
-	 */
-	metadata = cds_ft_alloc_item(ft, order, false, FT_ARENA_NORMAL);
+	metadata = cds_ft_alloc_item(ft, order, false);
 	if (!metadata)
 		return NULL;
 	p = cds_ft_metadata_to_item(metadata);
@@ -3148,13 +3135,13 @@ int ft_qp16_node_recompact_and_insert(struct cds_ft_qp16_node *new_node,
  */
 static __attribute__((unused))
 struct cds_ft_qp16_node *ft_qp16_node_alloc(struct cds_ft *ft,
-		unsigned int order, enum cds_ft_arena_class arena_class,
+		unsigned int order,
 		struct cds_ft_metadata **meta_p)
 {
 	struct cds_ft_metadata *metadata;
 	struct cds_ft_qp16_node *node;
 
-	metadata = cds_ft_alloc_item(ft, (size_t) order, false, arena_class);
+	metadata = cds_ft_alloc_item(ft, (size_t) order, false);
 	if (!metadata)
 		return NULL;
 	node = (struct cds_ft_qp16_node *) cds_ft_metadata_to_item(metadata);
@@ -3603,7 +3590,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 
 		new_lo = ft_qp16_node_alloc(ft,
 				FT_QP16_T0_ALLOC_ORDER,
-				FT_ARENA_NORMAL, &new_lo_meta);
+				&new_lo_meta);
 		if (!new_lo)
 			return -ENOMEM;
 		new_lo->ptrs[0] = child;
@@ -3695,7 +3682,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 			unsigned int b;
 
 			new_lo = ft_qp16_node_alloc(ft, new_order,
-					FT_ARENA_NORMAL, &new_lo_meta);
+					&new_lo_meta);
 			if (!new_lo)
 				return -ENOMEM;
 			ret = ft_qp16_node_recompact_and_insert(new_lo, lo,
@@ -4268,7 +4255,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			old_type_index, new_type_index);
 	new_type = &ft_types[new_type_index];
 	if (new_type_index != NODE_INDEX_NULL) {
-		new_node = alloc_cds_ft_node(ft, new_type, FT_ARENA_COMPRESSED_CHILD, &new_metadata);
+		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
 		if (!new_node)
 			return -ENOMEM;
 
@@ -5132,15 +5119,16 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						if (caa_likely(!ft_node_external(node_flag))) {
 							/*
 							 * Internal/collapsed child:
-							 * prefetch the per-item
-							 * compress-cache page entry.
-							 * Address is `child + page_size`
-							 * — no chained arena CL load
-							 * gating the prefetch.
+							 * prefetch the natural child's
+							 * first CL.  For QP targets,
+							 * that CL holds the inline
+							 * subkey bytes the validation
+							 * pass-1 will read; for PIGEON
+							 * it overlaps the ptrs[] array
+							 * descent will use.
 							 */
 							__builtin_prefetch(
-								ft_compress_cache_of(
-									ft_node_ptr(node_flag)));
+								ft_node_ptr(node_flag));
 						} else {
 							/*
 							 * External child: leaf is
@@ -5266,13 +5254,12 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						if (caa_likely(!ft_node_external(node_flag))) {
 							/*
 							 * Internal/collapsed child:
-							 * prefetch the per-item
-							 * compress-cache page entry
-							 * (child + page_size).
+							 * prefetch the natural child's
+							 * first CL (QP target → inline
+							 * subkey; PIGEON → ptrs[]).
 							 */
 							__builtin_prefetch(
-								ft_compress_cache_of(
-									ft_node_ptr(node_flag)));
+								ft_node_ptr(node_flag));
 						} else {
 							/*
 							 * External child: leaf is
@@ -5414,23 +5401,27 @@ end:
 				if (r->kind == FT_SKIP_KIND_META_CACHE) {
 					struct cds_ft_inode_flag *child_nf =
 						(struct cds_ft_inode_flag *) r->src;
+					unsigned long child_kind =
+						(unsigned long) child_nf & FT_KIND_MASK;
 
-					if (ft_node_external(child_nf)) {
-						if (!leaf_key) {
-							leaf_key = (const uint8_t *) found +
-								group->speculative_key_offset;
-							__builtin_prefetch(leaf_key + r->key_off);
-						}
-						continue;
-					}
-					{
-						struct ft_compress_cache *cc =
-							ft_compress_cache_of(
-								ft_node_ptr(child_nf));
+					/*
+					 * QP target: inline subkey is on the
+					 * QP node header CL.  Covers paths up
+					 * to FT_QP16_SUBKEY_INLINE_LEN bytes;
+					 * longer paths fall back to leaf bytes.
+					 *
+					 * PIGEON target / external child: no
+					 * inline subkey, always fall back to
+					 * leaf-bytes compare.
+					 */
+					if (child_kind == FT_KIND_QP_HI &&
+					    r->len <= FT_QP16_SUBKEY_INLINE_LEN) {
+						const struct cds_ft_qp16_node *qp =
+							(const struct cds_ft_qp16_node *)
+							ft_node_ptr(child_nf);
 
-						if (caa_likely(cc->skip_len == r->len &&
-								r->len <= FT_COMPRESS_CACHE_SUBKEY_LEN)) {
-							cmp_src = cc->subkey;
+						if (caa_likely(qp->skip_len == r->len)) {
+							cmp_src = qp->subkey;
 						} else {
 							if (!leaf_key) {
 								leaf_key = (const uint8_t *) found +
@@ -5439,6 +5430,13 @@ end:
 							}
 							continue;
 						}
+					} else {
+						if (!leaf_key) {
+							leaf_key = (const uint8_t *) found +
+								group->speculative_key_offset;
+							__builtin_prefetch(leaf_key + r->key_off);
+						}
+						continue;
 					}
 				} else
 #endif
@@ -5467,16 +5465,18 @@ end:
 					if (r->kind == FT_SKIP_KIND_META_CACHE) {
 						struct cds_ft_inode_flag *child_nf =
 							(struct cds_ft_inode_flag *) r->src;
+						unsigned long child_kind =
+							(unsigned long) child_nf & FT_KIND_MASK;
 
-						if (ft_node_external(child_nf)) {
-							needs_leaf = true;
+						if (child_kind == FT_KIND_QP_HI &&
+						    r->len <= FT_QP16_SUBKEY_INLINE_LEN) {
+							const struct cds_ft_qp16_node *qp =
+								(const struct cds_ft_qp16_node *)
+								ft_node_ptr(child_nf);
+
+							needs_leaf = (qp->skip_len != r->len);
 						} else {
-							struct ft_compress_cache *cc =
-								ft_compress_cache_of(
-									ft_node_ptr(child_nf));
-
-							needs_leaf = (cc->skip_len != r->len ||
-								r->len > FT_COMPRESS_CACHE_SUBKEY_LEN);
+							needs_leaf = true;
 						}
 					}
 #endif
@@ -8732,7 +8732,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_metadata *fresh_meta;
 		struct cds_ft_metadata *src_meta;
 
-		fresh = alloc_cds_ft_node(ft, &ft_types[0], FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
+		fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
 		if (!fresh)
 			return -ENOMEM;
 		src_meta = cds_ft_item_to_metadata(
@@ -10336,7 +10336,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * Allocate a fresh empty root for the source before
 		 * swapping, so the source remains a valid trie.
 		 */
-		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
+		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], &fresh_meta);
 		if (!fresh_root)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -10374,7 +10374,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * before the point of no return, so we can fail cleanly
 		 * on memory shortage instead of calling abort().
 		 */
-		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
+		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
 		if (!fresh_node)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -10657,7 +10657,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (need_fresh) {
 			fresh = alloc_cds_ft_node(swap_ft,
 				&ft_types[0],
-				FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
+				&fresh_meta);
 			if (!fresh) {
 				FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 				return CDS_FT_STATUS_MEMORY_ERROR;
@@ -10884,7 +10884,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * Allocate a fresh empty root for the source trie
 		 * before swapping.
 		 */
-		fresh_node = alloc_cds_ft_node(ft, &ft_types[0], FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
+		fresh_node = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
 		if (!fresh_node) {
 			cds_ft_destroy(detached);
 			return CDS_FT_STATUS_MEMORY_ERROR;
@@ -13025,7 +13025,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * transplanting a root node between tries is a single pointer
 	 * swap with no metadata relocation.
 	 */
-	root_node = alloc_cds_ft_node(ft, type0, FT_ARENA_COMPRESSED_CHILD, &metadata);
+	root_node = alloc_cds_ft_node(ft, type0, &metadata);
 	if (!root_node) {
 		free(ft);
 		*result_ft = NULL;

@@ -230,14 +230,14 @@ enum ft_kind {
 /*
  * Skip-compressed pointers tag a child slot's pointer with FT_KIND_
  * SKIP_* and bypass the compressed node on the candidate-lookup fast
- * path.  Length / subkey recovery uses the per-item compress-cache
- * page (see ft_compress_cache_of); no high-bit pointer encoding is
- * involved, so unlike the legacy encoding the feature is no longer
- * tied to specific 64-bit virtual-address layouts.
+ * path.  Length / subkey recovery is inline in the destination node
+ * (cds_ft_qp16_node::skip_len + subkey[] for QP targets,
+ * cds_ft_metadata::pigeon_skip_len for PIGEON; SKIP_EXT routes
+ * through the external_node->prev → cn->len chain).
  *
- * Gated on 64-bit only for now: the cache encoding itself works on
- * 32-bit too, but enabling it there is deferred to a follow-up
- * (depends on a perf evaluation on 32-bit ABIs).
+ * Gated on 64-bit only for now: the encoding works on 32-bit too,
+ * but enabling it there is deferred to a follow-up (depends on a
+ * perf evaluation on 32-bit ABIs).
  *
  * Requires FEATURE_FT_COMPRESS (skip-compressed is meaningless
  * without compressed nodes).
@@ -327,7 +327,7 @@ struct cds_ft_alloc_arena;
  *   offset 16: 8-byte nr_keys (unsigned long)
  *   offset 24: 4-byte packed bitfield (nr_child, skip_slot_offset,
  *              fallback_removal_count, alloc_index)
- *   offset 28: 4-byte trailing padding (preserved for future use)
+ *   offset 28: pigeon_skip_len (1 byte) + 3 bytes trailing padding
  *
  * In cds_ft_metadata_alloc, rcu_head is a separate field placed
  * before the metadata union — no overlap with metadata fields.
@@ -377,6 +377,18 @@ struct cds_ft_metadata {
 #endif
 	uint32_t fallback_removal_count:FT_FALLBACK_REMOVAL_BITS;
 	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * Inline skip-target length for PIGEON nodes (which have no
+	 * spare bytes in their dense ptrs[256] layout).  Set by
+	 * ft_skip_compressed_flag for FT_KIND_PIGEON children; ignored
+	 * for QP children (they use cds_ft_qp16_node::skip_len in the
+	 * node header, same CL as the bitmap).  No subkey is cached
+	 * for PIGEON skip targets — validation falls back to the
+	 * leaf-bytes compare.
+	 */
+	uint8_t pigeon_skip_len;
+#endif
 };
 
 /*
@@ -430,10 +442,20 @@ struct cds_ft_compressed_node {
  * (high-nibble level when the parent compressed node ends mid-byte)
  * and at root before the second key is inserted.
  *
- * The 8-byte header reserves 6 bytes after the bitmap for future
- * fields (keep_alive markers, write-side metadata, debug counters,
- * etc.).  Today they're padding; the SoA layout means the SIMD-shape
- * scanners can ignore them.
+ * The 8-byte header reserves 6 bytes after the bitmap.  Under
+ * FEATURE_FT_SKIP_COMPRESSED, bytes 2-7 carry an inline skip cache:
+ *
+ *   byte 2     : skip_len   (cn->len when this QP is a skip target;
+ *                            0 otherwise.  Same CL as bitmap, so the
+ *                            skip-resolver pays no extra CL load.)
+ *   bytes 3-7  : subkey[5]  (leading bytes of the parent cn's
+ *                            key_bytes, cached for ft_specv-style
+ *                            validation.  Paths longer than 5 bytes
+ *                            fall back to leaf-bytes compare.)
+ *
+ * Without FEATURE_FT_SKIP_COMPRESSED the same 6 bytes remain reserved
+ * padding so the layout (and ptrs[] offset) stays identical across
+ * configs.
  */
 #define FT_QP16_HEADER_SIZE	8U
 #define FT_QP16_NR_TIERS	4U
@@ -446,9 +468,16 @@ struct cds_ft_compressed_node {
 #define FT_QP16_T3_CAPACITY	16U
 #define FT_QP16_T3_ALLOC_ORDER	8U	/* 256B */
 
+#define FT_QP16_SUBKEY_INLINE_LEN	5U
+
 struct cds_ft_qp16_node {
 	uint16_t bitmap;			/* bytes 0-1: nibble-presence bitmap */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	uint8_t  skip_len;			/* byte 2: cn->len when skip target, 0 otherwise */
+	uint8_t  subkey[FT_QP16_SUBKEY_INLINE_LEN]; /* bytes 3-7: leading cn->key_bytes */
+#else
 	uint8_t  _pad[FT_QP16_HEADER_SIZE - 2];	/* bytes 2-7: reserved */
+#endif
 	struct cds_ft_inode_flag *ptrs[];	/* bytes 8+: popcount(bitmap) entries */
 } __attribute__((__aligned__(8)));
 
@@ -492,14 +521,11 @@ struct cds_ft_group {
 	unsigned int flags;		/* CDS_FT_FLAG_* creation-time flags. */
 	const struct rcu_flavor_struct *flavor;
 	/*
-	 * Allocation arenas, indexed by [item_len_order][compressed_child].
-	 * compressed_child=true ([1]) arenas allocate items WITH an
-	 * associated compress-cache page; =false ([0]) arenas don't.
-	 * QP_LO and COMPRESSED nodes are never skip targets, so their
-	 * allocations route to [order][0]; QP_HI / PIGEON nodes may be
-	 * skip targets and route to [order][1].
+	 * Allocation arenas, indexed by item_len_order.  All node
+	 * classes share a single arena per order; skip-compressed
+	 * metadata is stored inline in the destination node.
 	 */
-	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1][2];
+	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
 	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
@@ -751,33 +777,23 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
 /*
  * Allocator layout (see fractal-trie-alloc.c for the full picture).
  *
- * Without FEATURE_FT_SKIP_COMPRESSED, each 2*page_size range holds:
+ * Each 2*page_size range holds:
  *
  *   page 0:  items array
  *   page 1:  cds_ft_alloc_range header + cds_ft_metadata_alloc array
  *            (optional cds_ft_bitmap array grows backward from end of
  *            page 1 on 2D-pool / pigeon arenas)
  *
- * With FEATURE_FT_SKIP_COMPRESSED, a dedicated compress-cache page is
- * inserted between the items page and the range header, yielding a
- * 3*page_size range:
- *
- *   page 0:  items array
- *   page 1:  ft_compress_cache array (16 B per item slot, at the SAME
- *            in-page offset as the corresponding item).  Holds the
- *            cached subkey bytes (15 B) and the skip length (1 B) for
- *            children whose parent is a skip-compressed cn.  Recovery
- *            from a child pointer is a single (char *)node + page_size.
- *   page 2:  cds_ft_alloc_range header + cds_ft_metadata_alloc array
- *            (optional cds_ft_bitmap array grows backward from end of
- *            page 2)
+ * Skip-compressed metadata (skip_len, optional subkey) is stored
+ * inline in the destination node — in cds_ft_qp16_node::skip_len /
+ * subkey[] for QP nodes, and in cds_ft_metadata::pigeon_skip_len for
+ * PIGEON nodes.  No dedicated compress-cache page is needed.
  *
  * The cache lines most often prefetched from a tagged child pointer —
- * the item's compress-cache, metadata, and (for bitmap types) bitmap
- * — are derivable with pure pointer arithmetic.  The helpers below
- * live in this header so the prefetch-hint path can compute their
- * addresses inline, without a cross-TU call into
- * fractal-trie-alloc.c.
+ * the item's metadata and (for bitmap types) bitmap — are derivable
+ * with pure pointer arithmetic.  The helpers below live in this
+ * header so the prefetch-hint path can compute their addresses
+ * inline, without a cross-TU call into fractal-trie-alloc.c.
  *
  * struct cds_ft_alloc_arena remains opaque here: only out-of-line
  * slow paths (cds_ft_item_to_metadata, cds_ft_item_order,
@@ -785,32 +801,6 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
  * fractal-trie-alloc.c.
  */
 struct cds_ft_alloc_arena;
-
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-/*
- * ft_compress_cache: per-item, 16-byte cache entry holding the
- * skip-compressed parent's length and a cached prefix of its key
- * bytes.  Lives at the same in-page offset as its associated item,
- * one page above the items page (see allocator layout above).
- *
- * Layout invariants:
- *   skip_len == 0  : this child is not parented by a skip-compressed
- *                    cn (or has not yet been published).
- *   skip_len  > 0  : skip-compressed parent.  cn->len == skip_len.
- *                    The first min(skip_len, sizeof(subkey)) bytes of
- *                    cn->key_bytes are mirrored in subkey[];
- *                    candidate-mode validation can compare against
- *                    those without loading the cn header CL.  For
- *                    skip_len > sizeof(subkey), validation falls back
- *                    to leaf-bytes compare for the trailing portion.
- */
-#define FT_COMPRESS_CACHE_SUBKEY_LEN	15U
-
-struct ft_compress_cache {
-	uint8_t subkey[FT_COMPRESS_CACHE_SUBKEY_LEN];
-	uint8_t skip_len;
-} __attribute__((__aligned__(16)));
-#endif
 
 struct cds_ft_metadata_alloc {
 	struct rcu_head rcu_head;
@@ -820,40 +810,10 @@ struct cds_ft_metadata_alloc {
 	};
 };
 
-/*
- * Arena classification — drives the per-arena memory layout for
- * skip-compressed support.  Currently a binary distinction; left
- * room as an enum for future classes (e.g. "always skip target",
- * "alloc-time hint pending", etc.).
- */
-enum cds_ft_arena_class {
-	/*
-	 * Arena holds nodes that are never skip targets — QP_LO,
-	 * COMPRESSED, and (during allocation) any node not destined
-	 * to be a child of a compressed node.  No compress-cache
-	 * page is touched for these arenas; the page-mapping cost
-	 * stays unfaulted (mmap-lazy → 0 RSS).
-	 */
-	FT_ARENA_NORMAL = 0,
-	/*
-	 * Arena holds nodes that may become skip targets — children
-	 * of compressed nodes (QP_HI / PIGEON in skip-compressed
-	 * groups).  ft_skip_compressed_flag writes into the cache
-	 * page (child + page_size) when publishing a skip pointer.
-	 */
-	FT_ARENA_COMPRESSED_CHILD = 1,
-};
-
 struct cds_ft_alloc_range {
 	struct cds_list_head node;			/* Linked list of ranges. */
 	struct cds_ft_alloc_arena *arena;		/* Backward reference to arena. */
 	size_t next_unused;
-	/*
-	 * Mirror of arena->arena_class for fast access from the
-	 * skip-pointer publish-site assert without dereferencing the
-	 * opaque arena struct from outside fractal-trie-alloc.c.
-	 */
-	enum cds_ft_arena_class arena_class;
 
 	struct cds_ft_metadata_alloc metadata[];
 };
@@ -882,17 +842,12 @@ static inline size_t cds_ft_get_page_size(void)
 }
 
 /*
- * Range header lives one page above the items page when
- * FEATURE_FT_SKIP_COMPRESSED is off, two pages above when it is on
- * (the extra page holds the compress-cache, see ft_compress_cache).
+ * Range header lives one page above the items page.
+ * Skip-compressed metadata lives inline in the destination node;
+ * no extra cache page is needed.
  */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-# define FT_RANGE_HDR_PAGE_OFFSET	(2UL * cds_ft_get_page_size())
-# define FT_RANGE_END_PAGE_OFFSET	(3UL * cds_ft_get_page_size())
-#else
-# define FT_RANGE_HDR_PAGE_OFFSET	(1UL * cds_ft_get_page_size())
-# define FT_RANGE_END_PAGE_OFFSET	(2UL * cds_ft_get_page_size())
-#endif
+#define FT_RANGE_HDR_PAGE_OFFSET	(1UL * cds_ft_get_page_size())
+#define FT_RANGE_END_PAGE_OFFSET	(2UL * cds_ft_get_page_size())
 
 static inline
 struct cds_ft_alloc_range *cds_ft_item_to_range(void *p)
@@ -912,21 +867,6 @@ struct cds_ft_metadata *cds_ft_item_to_metadata_fast(void *p, size_t item_len_or
 
 	return &range->metadata[index].metadata;
 }
-
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-/*
- * Compress-cache entry for an item: same in-page offset as the item,
- * one page above the items page.  Recovery from a child pointer is a
- * single immediate-add: (char *)p + page_size.  No load, no shift, no
- * arena indirection on the dependency chain.
- */
-static inline
-struct ft_compress_cache *ft_compress_cache_of(void *p)
-{
-	return (struct ft_compress_cache *)
-		((char *) p + cds_ft_get_page_size());
-}
-#endif
 
 /*
  * bitmap array is indexed backwards from end of range header page.
@@ -955,20 +895,13 @@ __attribute__((visibility("hidden")))
 void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata);
 
 /*
- * Allocate an item from one of the per-(order, arena_class) arenas.
- *
- * @arena_class: FT_ARENA_COMPRESSED_CHILD if the item may become a
- *               child of a compressed node (QP_HI / PIGEON, in which
- *               case the arena is selected from the with-cache pool).
- *               FT_ARENA_NORMAL for items that can never be skip
- *               targets (QP_LO / COMPRESSED).
+ * Allocate an item from the per-order arena.
  *
  * The arena is created lazily on first use.
  */
 __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft,
-		size_t item_len_order, bool bitmap,
-		enum cds_ft_arena_class arena_class);
+		size_t item_len_order, bool bitmap);
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
