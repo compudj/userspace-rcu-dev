@@ -1901,35 +1901,6 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 			cds_ft_item_to_metadata(ft_node_ptr(child_nf));
 
 		rcu_assign_pointer(child_meta->parent, parent_nf);
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-		/*
-		 * Populate skip-compress parent cache.  When the parent is a
-		 * compressed node with len <= FT_SKIP_PARENT_CACHE_LEN, copy
-		 * the first cn_len bytes of cn->key_bytes into the child's
-		 * metadata so cand-mode validation can verify against a
-		 * cache-hot CL without loading the cn header.  Longer cn
-		 * leave cn_len_cache = 0, falling back to the indirect path.
-		 *
-		 * NOTE (phase 1): cache mutation here is not RCU-safe under
-		 * concurrent reparent.  load-names builds before querying so
-		 * the bench is fine; production needs phase 2 (write-once
-		 * metadata with recompact-style replacement on reparent).
-		 */
-		if (parent_nf && ft_node_compressed(parent_nf)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(parent_nf);
-
-			if (cn->len <= FT_SKIP_PARENT_CACHE_LEN) {
-				memcpy(child_meta->cn_bytes_cache,
-					cn->key_bytes, cn->len);
-				child_meta->cn_len_cache = cn->len;
-			} else {
-				child_meta->cn_len_cache = 0;
-			}
-		} else {
-			child_meta->cn_len_cache = 0;
-		}
-#endif
 	}
 }
 
@@ -4749,11 +4720,14 @@ enum ft_prefix_tracking {
  *     cn->key_bytes is on the same CL we already touched for cn->len.
  *
  *   FT_SKIP_KIND_META_CACHE — descent took a skip-compress slot and
- *     never loaded the cn.  src points at the post-skip child's
- *     metadata.  Validation reads metadata->cn_bytes_cache (and
- *     metadata->cn_len_cache as a sanity check) — one extra CL load
- *     per skip, but that CL is in FT-arena memory (NUMA-local, dense)
- *     instead of in the cold external-leaf body.
+ *     never loaded the cn.  src points at the post-skip child node
+ *     pointer.  Validation reads the per-item compress-cache page
+ *     entry (child + page_size) for that child — one extra CL load
+ *     per skip, but the cache page is dense (16 B per item) and the
+ *     address is a single immediate-add from the child pointer (no
+ *     arena CL load on the dependency chain).  Falls back to the
+ *     leaf-bytes compare when cn->len exceeds the cache's 15-byte
+ *     subkey window.
  */
 enum ft_skip_kind {
 	FT_SKIP_KIND_CN_BYTES = 0,
@@ -4761,7 +4735,7 @@ enum ft_skip_kind {
 };
 
 struct ft_skip_record {
-	const void *src;	/* cn->key_bytes (CN_BYTES) or child metadata (META_CACHE) */
+	const void *src;	/* cn->key_bytes (CN_BYTES) or child node-flag (META_CACHE) */
 	uint16_t key_off;	/* lookup-key offset where the skip starts */
 	uint8_t len;		/* number of bytes skipped (= cn->len at most) */
 	uint8_t kind;		/* enum ft_skip_kind */
@@ -5129,18 +5103,19 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						r->key_off = (uint16_t) (i - skip);
 						r->len = (uint8_t) skip;
 						r->kind = FT_SKIP_KIND_META_CACHE;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 						if (caa_likely(!ft_node_external(node_flag))) {
 							/*
 							 * Internal/collapsed child:
-							 * prefetch metadata CL via
-							 * the inline-fast getter so
-							 * the prefetch's address is
-							 * not gated by an arena CL
-							 * load.
+							 * prefetch the per-item
+							 * compress-cache page entry.
+							 * Address is `child + page_size`
+							 * — no chained arena CL load
+							 * gating the prefetch.
 							 */
 							__builtin_prefetch(
-								ft_flag_to_metadata_fast(
-									node_flag));
+								ft_compress_cache_of(
+									ft_node_ptr(node_flag)));
 						} else {
 							/*
 							 * External child: leaf is
@@ -5152,6 +5127,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 								ft->group->speculative_key_offset +
 								(i - skip));
 						}
+#endif
 					} else {
 						skips_p->overflow = true;
 					}
@@ -5261,18 +5237,17 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						r->key_off = (uint16_t) (i - skip);
 						r->len = (uint8_t) skip;
 						r->kind = FT_SKIP_KIND_META_CACHE;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 						if (caa_likely(!ft_node_external(node_flag))) {
 							/*
 							 * Internal/collapsed child:
-							 * prefetch metadata CL via
-							 * the inline-fast getter so
-							 * the prefetch's address is
-							 * not gated by an arena CL
-							 * load.
+							 * prefetch the per-item
+							 * compress-cache page entry
+							 * (child + page_size).
 							 */
 							__builtin_prefetch(
-								ft_flag_to_metadata_fast(
-									node_flag));
+								ft_compress_cache_of(
+									ft_node_ptr(node_flag)));
 						} else {
 							/*
 							 * External child: leaf is
@@ -5284,6 +5259,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 								ft->group->speculative_key_offset +
 								(i - skip));
 						}
+#endif
 					} else {
 						skips_p->overflow = true;
 					}
@@ -5423,11 +5399,13 @@ end:
 						continue;
 					}
 					{
-						struct cds_ft_metadata *meta =
-							ft_flag_to_metadata_fast(child_nf);
+						struct ft_compress_cache *cc =
+							ft_compress_cache_of(
+								ft_node_ptr(child_nf));
 
-						if (caa_likely(meta->cn_len_cache == r->len)) {
-							cmp_src = meta->cn_bytes_cache;
+						if (caa_likely(cc->skip_len == r->len &&
+								r->len <= FT_COMPRESS_CACHE_SUBKEY_LEN)) {
+							cmp_src = cc->subkey;
 						} else {
 							if (!leaf_key) {
 								leaf_key = (const uint8_t *) found +
@@ -5468,10 +5446,12 @@ end:
 						if (ft_node_external(child_nf)) {
 							needs_leaf = true;
 						} else {
-							struct cds_ft_metadata *meta =
-								ft_flag_to_metadata_fast(child_nf);
+							struct ft_compress_cache *cc =
+								ft_compress_cache_of(
+									ft_node_ptr(child_nf));
 
-							needs_leaf = (meta->cn_len_cache != r->len);
+							needs_leaf = (cc->skip_len != r->len ||
+								r->len > FT_COMPRESS_CACHE_SUBKEY_LEN);
 						}
 					}
 #endif

@@ -147,15 +147,6 @@ enum ft_kind {
  */
 #define FT_SKIP_LEN_MAX		255U
 
-/*
- * Inline cache, in cds_ft_metadata, of the first
- * FT_SKIP_PARENT_CACHE_LEN bytes of the parent compressed node's
- * key_bytes.  Validated against the lookup key without loading the
- * cn header CL.  Compressed parents whose len > this fall back to
- * the indirect path via metadata.parent.
- */
-#define FT_SKIP_PARENT_CACHE_LEN	23
-
 #define FT_ENTRY_PER_NODE	256
 #define FT_LOG2_BITS_PER_BYTE	3U
 #define FT_BITS_PER_BYTE	(1U << FT_LOG2_BITS_PER_BYTE)
@@ -349,31 +340,6 @@ struct cds_ft_alloc_arena;
  * collapse heuristic that drove them was retired.
  */
 struct cds_ft_metadata {
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	/*
-	 * Skip-compress parent cache, placed at the FRONT of the struct
-	 * so cn_bytes_cache + cn_len_cache fit alongside rcu_head in
-	 * the first cacheline of the enclosing cds_ft_metadata_alloc
-	 * (rcu_head occupies bytes 0-15; metadata starts at byte 16).
-	 * The validation hot path reads only these fields, so keeping
-	 * them together at a low offset minimises CL spillover.
-	 *
-	 * When this node's parent is a compressed path traversed via
-	 * skip-compress (i.e. the descent does not load the cn header),
-	 * cn_len_cache holds the cn->len and cn_bytes_cache holds the
-	 * first cn_len_cache bytes of cn->key_bytes.  Set at install
-	 * time only when cn->len <= FT_SKIP_PARENT_CACHE_LEN; otherwise
-	 * cn_len_cache stays 0 and validation falls back to the
-	 * piecewise leaf-bytes compare.
-	 *
-	 * Read-only post-publish: any reparent that would change the
-	 * cache value must allocate a fresh metadata struct (recompact-
-	 * style replacement) so RCU readers cannot observe a slot/cache
-	 * mismatch.
-	 */
-	uint8_t cn_bytes_cache[FT_SKIP_PARENT_CACHE_LEN];
-	uint8_t cn_len_cache;
-#endif
 	/* 8-byte aligned fields. */
 	struct cds_ft_inode_flag *parent;	/*
 						 * Tagged pointer to parent node.  NULL at
