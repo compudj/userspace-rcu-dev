@@ -2600,7 +2600,7 @@ unsigned int ft_qp16_capacity_from_order(unsigned int order)
  * holds the tagged lo-flag, and ft_set_parent's slot-based resolver
  * derives the tag from the lo-arena base when callers pass the hi-flag.
  *
- * All lo-nodes share a single reserved type-index (FT_QP_LO_TYPE_INDEX)
+ * All lo-nodes share a single tag-bit kind (FT_KIND_QP_LO = 0xD)
  * regardless of tier; the tier is recovered from cds_ft_item_order()
  * when needed.  Hi-nodes keep their tier-encoded type-index (0..3) —
  * the distinct lo tag lets ft_parent_depth_span collapse the (hi, lo)
@@ -2609,9 +2609,8 @@ unsigned int ft_qp16_capacity_from_order(unsigned int order)
 static inline
 struct cds_ft_inode_flag *ft_qp16_lo_flag(struct cds_ft_qp16_node *lo)
 {
-	return (struct cds_ft_inode_flag *) (((unsigned long) lo) |
-		((unsigned long) FT_QP_LO_TYPE_INDEX << FT_INTERNAL_BITS) |
-		FT_INTERNAL_MASK);
+	return (struct cds_ft_inode_flag *)
+		(((unsigned long) lo) | (unsigned long) FT_KIND_QP_LO);
 }
 
 /*
@@ -6873,7 +6872,7 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 			ft_compressed_node_ptr(parent_nf);
 		return cn->len;
 	}
-	if (ft_node_type(parent_nf) == FT_QP_LO_TYPE_INDEX)
+	if (((unsigned long) parent_nf & FT_KIND_MASK) == FT_KIND_QP_LO)
 		return 0;
 	/* Internal node: dispatches on one key byte. */
 	return 1;
