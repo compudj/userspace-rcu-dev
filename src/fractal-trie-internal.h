@@ -31,59 +31,33 @@
 #define FEATURE_INLINE_LOOKUP
 
 /*
- * If the internal bit is set in a pointer, it points to an internal
- * Fractal Trie node, else it points to a node outside of the Fractal Trie.
- * This can be used for variable length keys to identify the end of key.
- */
-/*
- * Pointer tag encoding (bits 0-2):
+ * Tag-bit kind encoding (4-bit nibble in the low bits of every
+ * cds_ft_inode_flag pointer).  The enum value IS the pointer's low
+ * nibble.  See doc/design/qp-tag-bit-layout.md for design rationale.
  *
- *   (ptr & 0b011) == 0b000  →  external node (leaf) or NULL
- *   (ptr & 0b001) == 0b001  →  internal node (bit 0 set), bits 1-3 = type index
- *   (ptr & 0b011) == 0b010  →  compressed path node
+ *   FT_KIND_EXT (0x0)         external leaf chain head; pointer is the raw
+ *                             struct cds_ft_node *.  Matches NULL.
+ *   FT_KIND_COMPRESSED (0x1)  pointer to a struct cds_ft_compressed_node.
+ *   FT_KIND_SKIP_EXT (0x2)    skip-compressed pointer; resolved target is EXT.
+ *   FT_KIND_SKIP_QP (0x3)     skip-compressed pointer; resolved target is QP_HI.
+ *   FT_KIND_QP_HI (0x5)       QP-nibble hi-node (all tiers); cds_ft_qp16_node *.
+ *   FT_KIND_PIGEON (0x9)      pigeon (dense 256-pointer) node; cds_ft_inode *.
+ *   FT_KIND_SKIP_PIGEON (0xB) skip-compressed pointer; resolved target is PIGEON.
+ *   FT_KIND_QP_LO (0xD)       QP-nibble lo-node (all tiers); cds_ft_qp16_node *.
  *
- * Internal nodes always have bit 0 set; the type index encoding in
- * bits 1-3 is unchanged.  Compressed nodes use bit 1 with bit 0
- * clear; bits 2+ are unused (16-byte alignment).
+ * Reserved (assert-on-encode): 0x4, 0x6, 0x7, 0x8, 0xA, 0xC, 0xE, 0xF.
  *
- * External nodes have bits 0-1 clear (external nodes are 8-byte aligned).
- * Compressed nodes are >= 16-byte aligned (strided allocator
- * minimum order 4); bits 0-3 are available.
- */
-#define FT_INTERNAL_BITS	1
-#define FT_INTERNAL_MASK	(1U << 0)
-#define FT_COMPRESSED_MASK	(1U << 1)
-#define FT_TAG_MASK		(FT_COMPRESSED_MASK | FT_INTERNAL_MASK)	/* 0b011 */
-
-/*
- * This if followed by a number of bits reserved to represent the child
- * type.
- */
-#define FT_TYPE_BITS	3
-#define FT_TYPE_MAX_NR	(1UL << FT_TYPE_BITS)
-#define FT_TYPE_MASK	((FT_TYPE_MAX_NR - 1) << FT_INTERNAL_BITS)
-#define FT_PTR_MASK	(~(FT_TYPE_MASK | FT_INTERNAL_MASK))
-
-/*
- * Tag-bit kind enumeration (target layout for the in-flight tag-bit
- * refactor — see doc/design/qp-tag-bit-layout.md).
+ * Bit-pattern rationale:
+ *   - bit 0 separates the two NULL-equivalent kinds (EXT, SKIP_EXT)
+ *     from everything else (clear → ext-or-null fast path).
+ *   - bit 1 is the universal "is skip-compressed" predicate; SKIP_EXT
+ *     (0x2) is the asymmetry where bit 0 is clear because the
+ *     resolved target is external.
+ *   - bits 2..3 encode the resolved class (00 = ext/compressed, 01 =
+ *     qp_hi, 10 = pigeon, 11 = qp_lo).
  *
- * The enum is added now (Stage A) so that subsequent stages can
- * introduce constructors / dispatch arms that already speak the new
- * vocabulary.  The actual on-pointer encoding still uses the legacy
- * FT_INTERNAL_MASK / FT_COMPRESSED_MASK / FT_TYPE_MASK layout; later
- * stages migrate the encoding bit by bit until the enum value IS the
- * pointer's low nibble (Stage F).
- *
- * Migration progress (low-nibble values that already match the
- * target encoding on HEAD):
- *   - FT_KIND_EXT (0x0)     : matches today
- *   - FT_KIND_PIGEON (0x9)  : matches today (type_index 4)
- *   - FT_KIND_QP_HI (0x5)   : matches today only for type_index 2;
- *                             the rest of T0..T3 still carry their
- *                             per-tier type_index in bits 1..3
- *   - all others            : not yet migrated; do NOT compare a raw
- *                             low nibble against these values yet
+ * All allocations are >= 16-byte aligned (FT_ALLOC_ORDER_MIN = 4) so
+ * the low 4 bits are guaranteed zero in raw addresses.
  */
 enum ft_kind {
 	FT_KIND_EXT		= 0x0,
@@ -226,31 +200,15 @@ enum ft_kind {
 #define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 1)	/* Maximum depth, including root. */
 
 /*
- * Entry for NULL node is at index 7 (32-bit) or 8 (64-bit) of the
- * table. It is never encoded in flags.
+ * ft_types[] internal-class slot count: T0..T3 (QP hi tiers) at
+ * indices 0..3, PIGEON at index 4.  Lo-nodes are recognized by tag
+ * (FT_KIND_QP_LO) and never indexed into ft_types[].  NODE_INDEX_NULL
+ * is the one-past-the-end sentinel, used by recompact / verify code
+ * to encode "elide this node"; ft_types[] keeps a trailing FT_NULL
+ * entry at that index so &ft_types[NODE_INDEX_NULL] is in-bounds.
  */
-#if (CAA_BITS_PER_LONG < 64)
-# define NODE_INDEX_NULL		7
-#else
-# define NODE_INDEX_NULL		8
-#endif
-
-/*
- * Type-index reservation for QP lo-nodes.
- *
- * Hi-nodes use indices 0..3 (tier-encoded).  PIGEON uses index 4.
- * Lo-nodes are stored in their parent hi-node's ptrs[] as TAGGED
- * internal flags so the upward parent walk (via meta->parent) can
- * reach them as proper nodes.  We give them a distinct type-index so
- * ft_parent_depth_span (and other walk consumers) can recognize lo
- * by tag alone — no metadata bit, no extra load.  The lo's allocation
- * tier is recovered from cds_ft_item_order() when needed.
- *
- * ft_types[FT_QP_LO_TYPE_INDEX] is FT_NULL filler: lo-nodes never
- * appear as descent targets (descent always enters via hi), so no
- * type-class dispatch is performed on this index.
- */
-#define FT_QP_LO_TYPE_INDEX	5U
+#define FT_NUM_INTERNAL_TYPES	5U
+#define NODE_INDEX_NULL		FT_NUM_INTERNAL_TYPES
 
 /*
  * Number of removals needed on a fallback node before we try to shrink
@@ -503,8 +461,8 @@ struct cds_ft_metadata {
  * metadata->external_nodes), or as child pointer of a compressed
  * or collapsed node.
  *
- * Tagged in the parent's child pointer with FT_COMPRESSED_MASK
- * (bit 1 set, bit 0 clear).
+ * Tagged in the parent's child pointer with FT_KIND_COMPRESSED (low
+ * nibble = 0x1).
  *
  * Layout: [child pointer] [len] [key_bytes...]
  */

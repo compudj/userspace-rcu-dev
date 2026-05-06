@@ -184,22 +184,23 @@ enum {
 };
 
 /*
- * 64-bit ft_types[].  The byte-keyed taxonomy is QP-nibble (sparse
- * byte stages) and PIGEON (dense byte stages):
+ * ft_types[]: write-side per-class metadata (allocator order, child
+ * count bounds, bitmap requirement).  The kind tag bits encode the
+ * dispatch class directly, so this table is not consulted on the
+ * read-side hot path.
  *
  *   [0..3] = QP T0..T3 — type_class FT_QP, orders 5..8 (32..256 B
  *            qp16_node), max_child = 3 / 7 / 15 / 16 (lo-bucket count
- *            on the hi-node).
+ *            on the hi-node).  Encoded on-pointer as FT_KIND_QP_HI;
+ *            tier is recovered from cds_ft_item_order().
  *   [4]    = PIGEON — type_class FT_PIGEON, order 11 (2048 B), kept
  *            for the eventual QP→PIGEON transition (§4.7.1, deferred).
  *            Currently unreachable: QP byte-stages cap at 16 hi-buckets
  *            naturally (16 nibbles), so popcount(hi_bm) > 16 is
  *            impossible and the tier picker stays inside [0..3].
- *   [5..7] = NULL filler.  Slots are required by the FT_TYPE_MAX_NR
- *            (3-bit type_index field, 8-entry minimum), but unreachable
- *            because no encoded pointer carries these indices and the
- *            tier picker stops at [4] for any nr_child <= 256.
- *   [8]    = NULL sentinel (NODE_INDEX_NULL on 64-bit).
+ *   [NODE_INDEX_NULL] = FT_NULL sentinel — &ft_types[NODE_INDEX_NULL]
+ *            is materialized by recompact when eliding a node, but
+ *            never dereferenced.
  */
 const struct cds_ft_type ft_types[] = {
 	/*
@@ -224,11 +225,8 @@ const struct cds_ft_type ft_types[] = {
 	[2] = { .type_class = FT_QP, .min_child = 5,  .max_child = FT_QP16_T2_CAPACITY * 16, .order = FT_QP16_T2_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	[3] = { .type_class = FT_QP, .min_child = 11, .max_child = FT_QP16_T3_CAPACITY * 16, .order = FT_QP16_T3_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	[4] = { .type_class = FT_PIGEON, .min_child = 16, .max_child = ft_type_7_max_child, .order = 11, .bitmap = FT_BITMAP },
-	/* NULL filler slots — see comment above. */
-	[5] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
-	[6] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
-	[7] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
-	[8] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
+	/* NULL sentinel at NODE_INDEX_NULL (= FT_NUM_INTERNAL_TYPES). */
+	[NODE_INDEX_NULL] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
 };
 
 /*
@@ -274,7 +272,7 @@ struct cds_ft_inode {
 static inline __attribute__((unused))
 void static_array_size_check(void)
 {
-	CAA_BUILD_BUG_ON(CAA_ARRAY_SIZE(ft_types) < FT_TYPE_MAX_NR);
+	CAA_BUILD_BUG_ON(CAA_ARRAY_SIZE(ft_types) < NODE_INDEX_NULL + 1);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
 	 * skip_slot_offset is 8 bits and stores byte_offset / sizeof(void *).
@@ -1073,15 +1071,15 @@ struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 {
 	unsigned long tag;
 
-	assert(type < (1UL << FT_TYPE_BITS));
+	assert(type < FT_NUM_INTERNAL_TYPES);
 	/*
-	 * Map the legacy ft_types[] slot index to the new 4-bit kind
-	 * nibble.  All four QP hi-tiers (T0..T3) carry FT_KIND_QP_HI
-	 * uniformly; the per-tier alloc order is recoverable from
-	 * cds_ft_item_order() when needed (write side / verify).
-	 * PIGEON carries FT_KIND_PIGEON.  ft_types[].type_class is a
-	 * constant load — folded by the compiler when @type is a
-	 * compile-time literal (every fresh-root call site passes 0).
+	 * Map the ft_types[] slot index to the 4-bit kind nibble.  All
+	 * four QP hi-tiers (T0..T3) carry FT_KIND_QP_HI uniformly; the
+	 * per-tier alloc order is recoverable from cds_ft_item_order()
+	 * when needed (write side / verify).  PIGEON carries
+	 * FT_KIND_PIGEON.  ft_types[].type_class is a constant load —
+	 * folded by the compiler when @type is a compile-time literal
+	 * (every fresh-root call site passes 0).
 	 */
 	switch (ft_types[type].type_class) {
 	case FT_QP:
@@ -1098,15 +1096,16 @@ struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 }
 
 /*
- * Test whether @node has the external tag (bits 0-1 == 0b00).
- * This matches both non-NULL external leaf pointers AND NULL,
- * since NULL has tag bits 0b00.  Callers that need to distinguish
- * NULL from a valid external node should also check ft_node_ptr().
+ * Test whether @node has the external tag (kind == FT_KIND_EXT, low
+ * nibble = 0x0).  This matches both non-NULL external leaf pointers
+ * AND NULL, since NULL has all bits clear.  Callers that need to
+ * distinguish NULL from a valid external node should also check
+ * ft_node_ptr().
  */
 static inline_lookup
 bool ft_node_external(struct cds_ft_inode_flag *node)
 {
-	return ((unsigned long) node & FT_TAG_MASK) == 0;
+	return ((unsigned long) node & FT_KIND_MASK) == FT_KIND_EXT;
 }
 
 #ifdef FEATURE_FT_COMPRESS
@@ -1240,7 +1239,7 @@ struct cds_ft_inode *_ft_node_mask_ptr(struct cds_ft_inode_flag *node)
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
 #endif
-	return (struct cds_ft_inode *) (v & FT_PTR_MASK);
+	return (struct cds_ft_inode *) (v & FT_KIND_PTR_MASK);
 }
 
 static inline_lookup
@@ -1256,39 +1255,38 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
 	return ((unsigned long) node & FT_KIND_MASK) >= FT_KIND_QP_HI;
 }
 
+/*
+ * Recover the ft_types[] slot index for an internal node flag.
+ * Returns NODE_INDEX_NULL for a NULL pointer.  Asserts on COMPRESSED
+ * (compressed nodes have no type-table slot) and on any non-internal
+ * kind.
+ *
+ * QP-hi nodes (FT_KIND_QP_HI) share one nibble across all tiers; the
+ * per-tier slot index is recovered from the alloc order (T0..T3 =
+ * orders 5..8 = ft_types[0..3]).  PIGEON (FT_KIND_PIGEON) maps to
+ * ft_types[4].  The function is write-side / verify only — descent
+ * dispatches on the kind tag directly without indexing ft_types[].
+ */
 static inline_lookup
-unsigned long ft_node_type(struct cds_ft_inode_flag *node)
+unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
 {
 	unsigned long tag;
 
-	if (_ft_node_mask_ptr(node) == NULL) {
+	if (_ft_node_mask_ptr(node) == NULL)
 		return NODE_INDEX_NULL;
-	}
-	/* Compressed nodes don't have a type index. */
 	assert(!ft_node_compressed(node));
-	/*
-	 * After Stage C, all QP-hi tiers share kind nibble
-	 * FT_KIND_QP_HI (= 0x5); the per-tier index used by
-	 * ft_types[] indexing is recovered from the alloc order
-	 * (T0..T3 = orders 5..8 = ft_types[0..3]).  PIGEON
-	 * (FT_KIND_PIGEON = 0x9) maps to ft_types[4]; QP_LO and any
-	 * future kinds keep their legacy bit-extracted value.
-	 */
+
 	tag = (unsigned long) node & FT_KIND_MASK;
 	if (tag == FT_KIND_QP_HI) {
 		size_t order = cds_ft_item_order(ft_node_ptr_internal(node));
 		assert(order >= FT_QP16_T0_ALLOC_ORDER
 			&& order < FT_QP16_T0_ALLOC_ORDER + FT_QP16_NR_TIERS);
-		return order - FT_QP16_T0_ALLOC_ORDER;
+		return (unsigned int) (order - FT_QP16_T0_ALLOC_ORDER);
 	}
 	if (tag == FT_KIND_PIGEON)
 		return 4;
-	{
-		unsigned long type =
-			(((unsigned long) node) & FT_TYPE_MASK) >> FT_INTERNAL_BITS;
-		assert(type < (1UL << FT_TYPE_BITS));
-		return type;
-	}
+	assert(0);
+	__builtin_unreachable();
 }
 
 static
@@ -1598,20 +1596,25 @@ struct cds_ft_metadata *ft_flag_to_metadata(struct cds_ft_inode_flag *nf)
 }
 
 /*
- * ft_flag_to_metadata_fast: faster variant for callers that know
- * @nf is an internal node (linear/pool/pigeon).  Bypasses the
- * skip-compressed branch in ft_flag_to_metadata and uses the type
- * tag bits to derive the alloc order without loading the type
- * descriptor.
+ * ft_flag_to_metadata_fast: variant for callers that know @nf is an
+ * internal node (qp_hi / qp_lo / pigeon).  Bypasses the skip-compressed
+ * branch in ft_flag_to_metadata.
+ *
+ * TODO: post-tag-bit refactor (Stage F) the legacy fast path —
+ * deriving alloc order from the tag's type-index — is gone, so this
+ * helper now falls through to cds_ft_item_to_metadata which loads
+ * range->arena->item_len_order (2 dependent loads).  This regresses
+ * the metadata-prefetch sites that used to amortize the order load
+ * via tag-bit math.  Repair this before relying on the fast path for
+ * the skip-compressed-descent length recovery (cn->len read on a
+ * SKIP_* tag), since that path needs a single-load metadata fetch to
+ * stay in budget.  Candidate fix: encode item_len_order in a small
+ * per-page header byte so it is reachable without the
+ * range->arena pointer chase.
  */
 static inline
 struct cds_ft_metadata *ft_flag_to_metadata_fast(struct cds_ft_inode_flag *nf)
 {
-	if (caa_likely(ft_node_internal(nf))) {
-		size_t order = ft_types[ft_node_type(nf)].order;
-
-		return cds_ft_item_to_metadata_fast(ft_node_ptr(nf), order);
-	}
 	return cds_ft_item_to_metadata(ft_node_ptr(nf));
 }
 
@@ -1830,19 +1833,16 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 	 * arena allocation so that meta->parent stays internally
 	 * consistent and ft_set_skip_slot's 8-bit offset is bounded.
 	 */
-	if (slot && parent_nf && ft_node_internal(parent_nf)) {
-		unsigned int p_type = ft_node_type(parent_nf);
+	if (slot && parent_nf
+	    && ((unsigned long) parent_nf & FT_KIND_MASK) == FT_KIND_QP_HI) {
+		void *p_addr = ft_node_ptr(parent_nf);
+		size_t lo_order = cds_ft_item_order(slot);
+		void *lo_base = (void *) ((unsigned long) slot
+			& ~((1UL << lo_order) - 1UL));
 
-		if (p_type < FT_QP16_NR_TIERS) {
-			void *p_addr = ft_node_ptr(parent_nf);
-			size_t lo_order = cds_ft_item_order(slot);
-			void *lo_base = (void *) ((unsigned long) slot
-				& ~((1UL << lo_order) - 1UL));
-
-			if (lo_base != p_addr) {
-				parent_nf = ft_qp16_lo_flag(
-					(struct cds_ft_qp16_node *) lo_base);
-			}
+		if (lo_base != p_addr) {
+			parent_nf = ft_qp16_lo_flag(
+				(struct cds_ft_qp16_node *) lo_base);
 		}
 	}
 	FT_TP(set_parent, (const void *) child_nf, (const void *) parent_nf);
@@ -2265,27 +2265,23 @@ uint8_t *align_ptr_size(uint8_t *ptr)
  * Skip when the scanner's first read does NOT live at the start of
  * the node body (so prefetching `v` would fetch the wrong cache
  * line):
- * - FT_PIGEON: dense `pointers[256]`; the scanner reads
+ * - FT_PIGEON / SKIP_PIGEON: dense `pointers[256]`; the scanner reads
  *   `pointers[n]` at offset n*8.  First cache line covers only
  *   pointers[0..7], ~3% of random keys.
- *
- * Encoding: skip when internal bit AND type high bit (bit 3) both
- * set, i.e. type_index >= 4 (PIGEON + filler slots).
  */
-#define FT_TYPE_HIGH_BIT	(1UL << (FT_TYPE_BITS - 1 + FT_INTERNAL_BITS))
-#define FT_PREFETCH_SKIP_MASK	(FT_TYPE_HIGH_BIT | FT_INTERNAL_MASK)
-#define FT_PREFETCH_SKIP_VALUE	(FT_TYPE_HIGH_BIT | FT_INTERNAL_MASK)
-
 static inline void ft_maybe_prefetch(const void *ptr)
 {
 	unsigned long v = (unsigned long) ptr;
+	unsigned long kind;
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/* Clear skip-compressed length bits. */
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
 #endif
-	if ((v & FT_PREFETCH_SKIP_MASK) != FT_PREFETCH_SKIP_VALUE)
-		__builtin_prefetch((const void *) v);
+	kind = v & FT_KIND_MASK;
+	if (kind == FT_KIND_PIGEON || kind == FT_KIND_SKIP_PIGEON)
+		return;
+	__builtin_prefetch((const void *) v);
 }
 
 /*
@@ -2343,15 +2339,13 @@ static inline void ft_maybe_prefetch(const void *ptr)
  *                      their own handlers prefetch cn->child /
  *                      col->data.
  *   FT_PF_BITMAP_META: same as META plus prefetches the bitmap
- *                      cache line for pool-2D / pigeon children
- *                      (used by ordered get_direction traversal).
+ *                      cache line for pigeon children (used by
+ *                      ordered get_direction traversal).
  *
- * The item's alloc order is derived from the tag bits directly
- * (type_index + FT_ALLOC_ORDER_MIN) without loading ft_types[],
- * and the node base address is derived from the tagged pointer via
- * alignment masking (bits below the order are all zero because
- * allocations are order-aligned, and the pool subclass bits in
- * [4, order) are cleared along with the type tag).
+ * The item's alloc order is recovered via cds_ft_item_order(node),
+ * which reads the arena range header at the page boundary; the node
+ * base address is derived from the tagged pointer via FT_KIND_PTR_MASK
+ * (low 4 bits hold the kind tag; allocations are >= 16-byte aligned).
  */
 enum ft_pf_target {
 	FT_PF_NONE,
@@ -2386,12 +2380,9 @@ void ft_prefetch_child_meta(const void *ptr)
 		return;
 	}
 	{
-		size_t order = ((v & FT_TYPE_MASK) >> FT_INTERNAL_BITS)
-				+ FT_ALLOC_ORDER_MIN;
-		unsigned long align_mask = ~((1UL << order) - 1UL);
-		void *node = (void *) (v & align_mask);
+		void *node = (void *) (v & FT_KIND_PTR_MASK);
 
-		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
+		__builtin_prefetch(cds_ft_item_to_metadata(node));
 	}
 }
 
@@ -2415,13 +2406,16 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 		return;
 	}
 	{
-		unsigned int type_index = (v & FT_TYPE_MASK) >> FT_INTERNAL_BITS;
-		size_t order = type_index + FT_ALLOC_ORDER_MIN;
-		unsigned long align_mask = ~((1UL << order) - 1UL);
-		void *node = (void *) (v & align_mask);
+		void *node = (void *) (v & FT_KIND_PTR_MASK);
+		size_t order = cds_ft_item_order(node);
 
 		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
-		if (ft_types[type_index].bitmap)
+		/*
+		 * PIGEON is the only internal kind with a co-allocated
+		 * bitmap (ft_types[4].bitmap == FT_BITMAP); QP_HI / QP_LO
+		 * pack their nibble bitmap into the qp16_node header.
+		 */
+		if (kind == FT_KIND_PIGEON)
 			__builtin_prefetch(cds_ft_item_to_bitmap(node, order));
 	}
 }
@@ -3828,7 +3822,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag ***slot_ret)
 {
 	struct cds_ft_inode *node = ft_node_ptr(parent_nf);
-	unsigned int type_index = ft_node_type(parent_nf);
+	unsigned int type_index = ft_node_type_index(parent_nf);
 	const struct cds_ft_type *type = &ft_types[type_index];
 
 	switch (type->type_class) {
@@ -3929,7 +3923,7 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 		return NULL;
 	node = ft_node_ptr(node_flag);
 	assert(node != NULL);
-	type_index = ft_node_type(node_flag);
+	type_index = ft_node_type_index(node_flag);
 	type = &ft_types[type_index];
 
 	switch (type->type_class) {
@@ -4609,7 +4603,7 @@ int ft_node_set_nth(struct cds_ft *ft,
 	dbg_printf("ft_node_set_nth for n=%u, node %p\n", (unsigned int) n, ft_node_ptr(*node_flag));
 
 	node = ft_node_ptr(*node_flag);
-	type_index = ft_node_type(*node_flag);
+	type_index = ft_node_type_index(*node_flag);
 	type = &ft_types[type_index];
 	ret = _ft_node_set_nth(ft, type, node, *node_flag, metadata, n, child_node_flag);
 	switch (ret) {
@@ -4679,7 +4673,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		ft_node_ptr(*parent_node_flag_ptr), node_flag_ptr);
 
 	node = ft_node_ptr(*parent_node_flag_ptr);
-	type_index = ft_node_type(*parent_node_flag_ptr);
+	type_index = ft_node_type_index(*parent_node_flag_ptr);
 	type = &ft_types[type_index];
 	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr);
 	if (ret == -EFBIG) {
@@ -5051,9 +5045,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	 * metadata external_nodes (NIL-key entries).
 	 */
 	if (!key_len) {
-		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
-							type->order);
+		struct cds_ft_metadata *metadata = ft_flag_to_metadata_fast(node_flag);
 		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track) {
@@ -5069,9 +5061,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	 * when there are no external nodes.
 	 */
 	if (track) {
-		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
-							type->order);
+		struct cds_ft_metadata *metadata = ft_flag_to_metadata_fast(node_flag);
 		struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
 		if (external_nodes || track_longest) {
@@ -5323,9 +5313,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 */
 		if (track && caa_likely(ft_node_internal(node_flag))
 		    && i < key_depth - 1) {
-			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
-					ft_node_ptr(node_flag), type->order);
+			struct cds_ft_metadata *metadata = ft_flag_to_metadata_fast(node_flag);
 			struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
 			if (external_nodes || track_longest) {
@@ -5340,9 +5328,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	 * nodes or internal/compressed node associated with external nodes.
 	 */
 	if (ft_node_internal(node_flag)) {
-		const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
-							type->order);
+		struct cds_ft_metadata *metadata = ft_flag_to_metadata_fast(node_flag);
 		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
@@ -6249,10 +6235,9 @@ post_traversal:
 			struct cds_ft_node *external_nodes;
 
 			if (ft_node_internal(node_flag)) {
-				struct cds_ft_metadata *metadata;
-				const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
+				struct cds_ft_metadata *metadata =
+					ft_flag_to_metadata_fast(node_flag);
 
-				metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag), type->order);
 				external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 			} else if (ft_node_compressed(node_flag)) {
 				struct cds_ft_metadata *metadata =
@@ -6353,12 +6338,9 @@ going_up:
 			if (ft_node_compressed(iter_path_node(iter)[level]))
 				metadata = cds_ft_item_to_metadata(
 					ft_node_ptr(iter_path_node(iter)[level]));
-			else {
-				const struct cds_ft_type *type = &ft_types[ft_node_type(iter_path_node(iter)[level])];
-				metadata = cds_ft_item_to_metadata_fast(
-					ft_node_ptr(iter_path_node(iter)[level]),
-					type->order);
-			}
+			else
+				metadata = ft_flag_to_metadata_fast(
+					iter_path_node(iter)[level]);
 			{
 			struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
@@ -6453,13 +6435,8 @@ going_up:
 				if (ft_node_compressed(pfx_flag))
 					metadata = cds_ft_item_to_metadata(
 						ft_node_ptr(pfx_flag));
-				else {
-					const struct cds_ft_type *type =
-						&ft_types[ft_node_type(pfx_flag)];
-					metadata = cds_ft_item_to_metadata_fast(
-						ft_node_ptr(pfx_flag),
-						type->order);
-				}
+				else
+					metadata = ft_flag_to_metadata_fast(pfx_flag);
 				struct cds_ft_node *external_nodes =
 					ft_dereference_prefetch_external(metadata->external_nodes);
 
@@ -6543,9 +6520,7 @@ descend_children:
 		 */
 		if (dir == FT_LEFTMOST && ft_node_internal(node_flag)
 				&& !skip_eq_external_nodes) {
-			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
-			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
-					ft_node_ptr(node_flag), type->order);
+			struct cds_ft_metadata *metadata = ft_flag_to_metadata_fast(node_flag);
 			struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
 			if (external_nodes) {
@@ -11433,7 +11408,7 @@ bool cds_ft_empty(struct cds_ft *ft)
 	if (ft_node_compressed(root_flag))
 		return false;
 
-	type_idx = ft_node_type(root_flag);
+	type_idx = ft_node_type_index(root_flag);
 	type = &ft_types[type_idx];
 	rmeta = cds_ft_item_to_metadata(root_node);
 
@@ -13831,16 +13806,16 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 #endif
 		/*
-		 * Type / alloc_index sanity.  ft_node_type already asserts
-		 * the tag bits decode within FT_TYPE_BITS, but it does not
-		 * verify the entry is a real internal class, that the arena
-		 * order matches the type's expected order, or that nr_child
-		 * fits the type's capacity.  A corrupted tag/bitfield write
-		 * would otherwise survive verify and only manifest later as
-		 * a wrong-sized scan or a min_child assertion.
+		 * Type / alloc_index sanity.  ft_node_type_index already
+		 * asserts the kind tag is a real internal kind, but does
+		 * not verify the entry's type_class, that the arena order
+		 * matches the type's expected order, or that nr_child fits
+		 * the type's capacity.  A corrupted tag/bitfield write would
+		 * otherwise survive verify and only manifest later as a
+		 * wrong-sized scan or a min_child assertion.
 		 */
 		{
-			unsigned int type_index = ft_node_type(node_flag);
+			unsigned int type_index = ft_node_type_index(node_flag);
 			const struct cds_ft_type *type = &ft_types[type_index];
 			size_t actual_order = cds_ft_item_order(node);
 
@@ -13908,29 +13883,23 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			 * the raw lo pointer in hi.ptrs[hi_idx], not at
 			 * @node_flag.  PIGEON children are unchanged.
 			 */
-			{
-				unsigned int t_idx = ft_node_type(node_flag);
-				const struct cds_ft_type *t_ty = &ft_types[t_idx];
+			if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_QP_HI) {
+				struct cds_ft_qp16_node *hi_n =
+					(struct cds_ft_qp16_node *) node;
+				uint16_t hi_bm = uatomic_load(&hi_n->bitmap,
+						CMM_RELAXED);
+				uint16_t hi_bit = (uint16_t) (1U << (key >> 4));
+				unsigned int hi_idx;
+				struct cds_ft_qp16_node *lo_raw;
 
-				if (t_idx < FT_QP16_NR_TIERS
-				    && t_ty->type_class == FT_QP) {
-					struct cds_ft_qp16_node *hi_n =
-						(struct cds_ft_qp16_node *) node;
-					uint16_t hi_bm = uatomic_load(&hi_n->bitmap,
-							CMM_RELAXED);
-					uint16_t hi_bit = (uint16_t) (1U << (key >> 4));
-					unsigned int hi_idx;
-					struct cds_ft_qp16_node *lo_raw;
-
-					assert(hi_bm & hi_bit);
-					hi_idx = (unsigned int) __builtin_popcount(
-							(unsigned int) (hi_bm
-								& (hi_bit - 1U)));
-					lo_raw = (struct cds_ft_qp16_node *)
-						hi_n->ptrs[hi_idx];
-					child_expected_parent =
-						ft_qp16_lo_flag(lo_raw);
-				}
+				assert(hi_bm & hi_bit);
+				hi_idx = (unsigned int) __builtin_popcount(
+						(unsigned int) (hi_bm
+							& (hi_bit - 1U)));
+				lo_raw = (struct cds_ft_qp16_node *)
+					hi_n->ptrs[hi_idx];
+				child_expected_parent =
+					ft_qp16_lo_flag(lo_raw);
 			}
 			if (ft_node_external(child)) {
 				/* External leaf chain at this slot. */
@@ -13972,31 +13941,26 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		 * a desynchronised set / clear at the mutation site rather
 		 * than letting it produce wrong directional results later.
 		 */
-		{
-			unsigned int t = ft_node_type(node_flag);
-			const struct cds_ft_type *t_type = &ft_types[t];
+		if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_PIGEON) {
+			struct cds_ft_bitmap *bm =
+				cds_ft_item_to_bitmap(node, cds_ft_item_order(node));
+			unsigned int b;
 
-			if (t_type->type_class == FT_PIGEON) {
-				struct cds_ft_bitmap *bm =
-					cds_ft_item_to_bitmap(node, t_type->order);
-				unsigned int b;
+			for (b = 0; b < FT_ENTRY_PER_NODE; b++) {
+				struct cds_ft_inode_flag *child =
+					ft_pigeon_node_get_nth(NULL, node,
+						NULL, (uint8_t) b,
+						FT_PF_NONE);
+				bool slot_set = ft_node_ptr(child) != NULL;
+				bool bit_set = cds_test_bit(bm->bitmap, b);
 
-				for (b = 0; b < FT_ENTRY_PER_NODE; b++) {
-					struct cds_ft_inode_flag *child =
-						ft_pigeon_node_get_nth(NULL, node,
-							NULL, (uint8_t) b,
-							FT_PF_NONE);
-					bool slot_set = ft_node_ptr(child) != NULL;
-					bool bit_set = cds_test_bit(bm->bitmap, b);
-
-					if (slot_set != bit_set) {
-						if (out)
-							fprintf(out, "ft_verify: depth %u: pigeon node %p slot %u: data %s, bitmap bit %s\n",
-								depth, node_flag, b,
-								slot_set ? "set" : "NULL",
-								bit_set ? "set" : "clear");
-						return -1;
-					}
+				if (slot_set != bit_set) {
+					if (out)
+						fprintf(out, "ft_verify: depth %u: pigeon node %p slot %u: data %s, bitmap bit %s\n",
+							depth, node_flag, b,
+							slot_set ? "set" : "NULL",
+							bit_set ? "set" : "clear");
+					return -1;
 				}
 			}
 		}
@@ -14333,7 +14297,7 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		struct cds_ft_node *external_nodes =
 			rcu_dereference(metadata->external_nodes);
-		unsigned int type_index = ft_node_type(node_flag);
+		unsigned int type_index = ft_node_type_index(node_flag);
 		unsigned int key, printed = 0;
 
 		fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"%s\",\"level\":%d,"
@@ -14395,7 +14359,7 @@ struct cds_ft_stats_level {
 	uint64_t nr_duplicate_external_nodes;
 	uint64_t nr_internal_nodes;
 	uint64_t nr_compressed_nodes;
-	struct cds_ft_node_stats node_stats[FT_TYPE_MAX_NR];
+	struct cds_ft_node_stats node_stats[FT_NUM_INTERNAL_TYPES];
 	bool has_nodes;
 };
 
@@ -14430,7 +14394,7 @@ static
 void calc_stats_node(const struct cds_ft *ft __attribute__((unused)),
 		struct cds_ft_inode_flag *node_flag, struct cds_ft_stats *stats, int level)
 {
-	unsigned long node_type = ft_node_type(node_flag);
+	unsigned long node_type = ft_node_type_index(node_flag);
 	struct cds_ft_node_stats *node_stats = &stats->level[level].node_stats[node_type];
 	const struct cds_ft_metadata *metadata;
 
@@ -14573,7 +14537,7 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 			print_indent(out, 1);
 			fprintf(out, "Compressed nodes: %" PRIu64 "\n", stats_level->nr_compressed_nodes);
 		}
-		for (type = 0; type < FT_TYPE_MAX_NR; type++) {
+		for (type = 0; type < FT_NUM_INTERNAL_TYPES; type++) {
 			const struct cds_ft_node_stats *node_stats = &stats->level[level].node_stats[type];
 			uint64_t nr_nodes = node_stats->count;
 
