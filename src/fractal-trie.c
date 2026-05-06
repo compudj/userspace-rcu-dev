@@ -1113,7 +1113,7 @@ bool ft_node_external(struct cds_ft_inode_flag *node)
 static inline_lookup
 bool ft_node_compressed(struct cds_ft_inode_flag *node)
 {
-	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
+	return ((unsigned long) node & FT_KIND_MASK) == FT_KIND_COMPRESSED;
 }
 #else
 static
@@ -1187,11 +1187,13 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	unsigned long v = (unsigned long) node;
 
 	/*
-	 * Internal flags carry only the 4 tag bits (INTERNAL_MASK +
-	 * 3-bit type), so a fixed ~15UL mask suffices on the internal
-	 * branch; the external branch needs ~7UL to keep the bit-1
-	 * compressed-pointer tag if set.  Hi tiers 0..3 and the lo
-	 * type-index (FT_QP_LO_TYPE_INDEX) share the same mask.
+	 * After Stage D, every tagged kind (COMPRESSED, QP_HI, PIGEON,
+	 * QP_LO) has bit 0 set; only EXT (0x0) has bit 0 clear.  All
+	 * tagged kinds use the low 4 bits as their tag, so ~15UL is
+	 * the universal strip mask on the tagged branch.  EXT is
+	 * already 8-byte aligned (no tag) so the result is unchanged
+	 * by either mask, but ~7UL keeps the cleanest semantics for
+	 * the bit-0-clear branch.
 	 */
 	unsigned long mask = (v & 1) ? ~15UL : ~7UL;
 
@@ -1210,11 +1212,11 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 
 /*
  * Lookup-hot variant: caller has already established that the
- * internal-flag bit is set (e.g. ft_node_get_nth_skip checks
- * !(tag & FT_INTERNAL_MASK) and returns NULL before this call).
- * Skips the (v & 1) ? ... : ~7UL branch in ft_node_ptr() above,
- * shaving the cmov/branch from the per-visit dependency chain on
- * the lookup hot path.
+ * input is an internal-node flag (e.g. ft_node_get_nth_skip
+ * filters tags < FT_KIND_QP_HI and returns NULL before this
+ * call).  Skips the (v & 1) ? ... : ~7UL branch in ft_node_ptr()
+ * above, shaving the cmov/branch from the per-visit dependency
+ * chain on the lookup hot path.
  */
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
@@ -1226,7 +1228,7 @@ struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
 	v &= FT_ADDR_MASK;
 #endif
 
-	assert((v & FT_INTERNAL_MASK) || node == NULL);
+	assert(((v & FT_KIND_MASK) >= FT_KIND_QP_HI) || node == NULL);
 	return (struct cds_ft_inode *) (v & mask);
 }
 
@@ -1244,7 +1246,14 @@ struct cds_ft_inode *_ft_node_mask_ptr(struct cds_ft_inode_flag *node)
 static inline_lookup
 bool ft_node_internal(struct cds_ft_inode_flag *node)
 {
-	return (unsigned long) node & FT_INTERNAL_MASK;
+	/*
+	 * After Stage D, COMPRESSED has bit 0 set too — `node & 1` is
+	 * no longer sufficient.  Internal kinds are FT_KIND_QP_HI (0x5),
+	 * FT_KIND_PIGEON (0x9), FT_KIND_QP_LO (0xD); all share bits 2 or
+	 * 3 set.  COMPRESSED (0x1), EXT (0x0), and the future skip-target
+	 * tags (0x2, 0x3, 0xB) all have bits 2-3 clear.
+	 */
+	return ((unsigned long) node & FT_KIND_MASK) >= FT_KIND_QP_HI;
 }
 
 static inline_lookup
@@ -1287,7 +1296,7 @@ struct cds_ft_inode_flag *ft_compressed_node_flag(
 		struct cds_ft_compressed_node *node)
 {
 	return (struct cds_ft_inode_flag *)
-		(((unsigned long) node) | FT_COMPRESSED_MASK);
+		(((unsigned long) node) | (unsigned long) FT_KIND_COMPRESSED);
 }
 
 static inline_lookup
@@ -1295,7 +1304,7 @@ struct cds_ft_compressed_node *ft_compressed_node_ptr(
 		struct cds_ft_inode_flag *node)
 {
 	return (struct cds_ft_compressed_node *)
-		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
+		(((unsigned long) node) & FT_KIND_PTR_MASK);
 }
 
 /* Skip-compressed pointer helpers. */
@@ -2308,22 +2317,25 @@ static inline __attribute__((always_inline))
 void ft_prefetch_child_meta(const void *ptr)
 {
 	unsigned long v = (unsigned long) ptr;
+	unsigned long kind;
 
 	if (!v)
 		return;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
 #endif
-	if ((v & FT_INTERNAL_MASK) == 0) {
+	kind = v & FT_KIND_MASK;
+	if (kind == FT_KIND_EXT) {
 		/*
-		 * External (bits 0-1 == 0): no FT metadata.  Prefetch the
-		 * node body, which the META-hint caller typically reads
-		 * next (user_data / ->next for the duplicate chain).
-		 * Compressed children: their handler prefetches its own
-		 * target; skip here.
+		 * External: no FT metadata.  Prefetch the node body,
+		 * which the META-hint caller typically reads next
+		 * (user_data / ->next for the duplicate chain).
 		 */
-		if ((v & FT_TAG_MASK) == 0)
-			__builtin_prefetch((const void *) v);
+		__builtin_prefetch((const void *) v);
+		return;
+	}
+	if (kind == FT_KIND_COMPRESSED) {
+		/* Compressed: handler prefetches its own target; skip. */
 		return;
 	}
 	{
@@ -2340,15 +2352,19 @@ static inline __attribute__((always_inline))
 void ft_prefetch_child_bitmap_meta(const void *ptr)
 {
 	unsigned long v = (unsigned long) ptr;
+	unsigned long kind;
 
 	if (!v)
 		return;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
 #endif
-	if ((v & FT_INTERNAL_MASK) == 0) {
-		if ((v & FT_TAG_MASK) == 0)
-			__builtin_prefetch((const void *) v);
+	kind = v & FT_KIND_MASK;
+	if (kind == FT_KIND_EXT) {
+		__builtin_prefetch((const void *) v);
+		return;
+	}
+	if (kind == FT_KIND_COMPRESSED) {
 		return;
 	}
 	{
@@ -3698,27 +3714,29 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-	unsigned long tag = (unsigned long) node_flag & 0xF;
+	unsigned long tag = (unsigned long) node_flag & FT_KIND_MASK;
 	struct cds_ft_inode *node;
-	unsigned int type_index;
 
-	/* External / compressed / collapsed: internal flag clear. */
-	if (caa_unlikely(!(tag & FT_INTERNAL_MASK))) {
+	/*
+	 * Non-internal kinds (FT_KIND_EXT = 0, FT_KIND_COMPRESSED = 1,
+	 * future skip-target tags 0x2/0x3 = 2/3, reserved 0x4): no
+	 * byte-step descent.  Tags >= FT_KIND_QP_HI are the internal
+	 * dispatch targets.
+	 */
+	if (caa_unlikely(tag < FT_KIND_QP_HI)) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
 		return NULL;
 	}
 
 	node = ft_node_ptr_internal(node_flag);
-	type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
 
 	/*
-	 * ft_types[] layout:
-	 *   [0..3] = QP T0..T3 (all share the byte-step descent helper)
-	 *   [4]    = PIGEON
-	 *   [5..7] = NULL filler
+	 * Internal dispatch: FT_KIND_QP_HI (0x5) routes to QP byte-step;
+	 * FT_KIND_PIGEON (0x9) routes to PIGEON; FT_KIND_QP_LO (0xD) is
+	 * not a slot value and never reaches this function.
 	 */
-	if (caa_likely(type_index < 4))
+	if (caa_likely(tag == FT_KIND_QP_HI))
 		return ft_qp_byte_get(
 				(struct cds_ft_qp16_node *) node,
 				node_flag_ptr, n, pf_hint);
