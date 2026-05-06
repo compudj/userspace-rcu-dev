@@ -176,6 +176,17 @@ enum {
 };
 
 /*
+ * PIGEON node alloc order: dense 256-entry pointer array.
+ * 64-bit: 256 * 8 = 2048 B = 1 << 11.
+ * 32-bit: 256 * 4 = 1024 B = 1 << 10.
+ */
+#if CAA_BITS_PER_LONG >= 64
+# define FT_PIGEON_ORDER	11U
+#else
+# define FT_PIGEON_ORDER	10U
+#endif
+
+/*
  * ft_types[]: write-side per-class metadata (allocator order, child
  * count bounds, bitmap requirement).  The kind tag bits encode the
  * dispatch class directly, so this table is not consulted on the
@@ -216,7 +227,7 @@ const struct cds_ft_type ft_types[] = {
 	[1] = { .type_class = FT_QP, .min_child = 2,  .max_child = FT_QP16_T1_CAPACITY * 16, .order = FT_QP16_T1_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	[2] = { .type_class = FT_QP, .min_child = 5,  .max_child = FT_QP16_T2_CAPACITY * 16, .order = FT_QP16_T2_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	[3] = { .type_class = FT_QP, .min_child = 11, .max_child = FT_QP16_T3_CAPACITY * 16, .order = FT_QP16_T3_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
-	[4] = { .type_class = FT_PIGEON, .min_child = 8, .max_child = ft_type_pigeon_max_child, .order = 11, .bitmap = FT_BITMAP },
+	[4] = { .type_class = FT_PIGEON, .min_child = 8, .max_child = ft_type_pigeon_max_child, .order = FT_PIGEON_ORDER, .bitmap = FT_BITMAP },
 	/* NULL sentinel at NODE_INDEX_NULL (= FT_NUM_INTERNAL_TYPES). */
 	[NODE_INDEX_NULL] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_null_max_child, .bitmap = FT_NO_BITMAP },
 };
@@ -268,12 +279,12 @@ void static_array_size_check(void)
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
 	 * skip_slot_offset is 8 bits and stores byte_offset / sizeof(void *).
-	 * Ensure the largest node (pigeon, 2^11 = 2048 bytes) fits:
-	 * 2048 / sizeof(void *) = 256 slots, max index 255.  Only enabled
-	 * on 64-bit architectures, where sizeof(void *) == 8 and the
-	 * quotient is exactly 256.
+	 * Ensure the largest node (pigeon) fits 256 slots: PIGEON's 256
+	 * dense entries scale with sizeof(void *) (FT_PIGEON_ORDER), so
+	 * the quotient is exactly 256 on both 64-bit (2 KB / 8) and
+	 * 32-bit (1 KB / 4).
 	 */
-	CAA_BUILD_BUG_ON((1U << 11) / sizeof(void *) > 256);
+	CAA_BUILD_BUG_ON((1U << FT_PIGEON_ORDER) / sizeof(void *) > 256);
 #endif
 	/*
 	 * Metadata packed bitfield must fit in a uint32_t.
@@ -2712,12 +2723,12 @@ unsigned int ft_qp16_capacity_from_order(unsigned int order)
  *   T1  (order 6 = 64 B)   → 2
  *   T2  (order 7 = 128 B)  → 4
  *   T3  (order 8 = 256 B)  → 8
- *   PIGEON (order 11 = 2 KB) → 64
+ *   PIGEON (order 11 = 2 KB on 64-bit, 1 KB on 32-bit) → 64 / 32
  *
  * The QP→PIGEON up-trigger fires when the hi+lo half-CL sum exceeds
- * PIGEON's flat 64.
+ * PIGEON's flat footprint.
  */
-#define FT_PIGEON_HALF_CLS	64U	/* 2 KB / 32 B = 64 half-CLs. */
+#define FT_PIGEON_HALF_CLS	(1U << (FT_PIGEON_ORDER - 5U))
 
 static inline
 unsigned int ft_node_half_cls(unsigned int order)

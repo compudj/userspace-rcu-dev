@@ -235,9 +235,12 @@ enum ft_kind {
  * cds_ft_metadata::pigeon_skip_len for PIGEON; SKIP_EXT routes
  * through the external_node->prev → cn->len chain).
  *
- * Gated on 64-bit only for now: the encoding works on 32-bit too,
- * but enabling it there is deferred to a follow-up (depends on a
- * perf evaluation on 32-bit ABIs).
+ * Length / subkey recovery is inline in the destination node since
+ * Phase B.3/B.4 retired the high-bit pointer encoding, so the
+ * mechanics are no longer tied to specific 64-bit virtual-address
+ * layouts.  Enabled on both 32-bit and 64-bit; a fair perf
+ * comparison between the two ABIs guides any follow-up work on
+ * pointer compression on 64-bit.
  *
  * Requires FEATURE_FT_COMPRESS (skip-compressed is meaningless
  * without compressed nodes).
@@ -250,9 +253,7 @@ enum ft_kind {
 # endif
 #endif
 #ifndef NO_FEATURE_FT_SKIP_COMPRESSED
-# if CAA_BITS_PER_LONG >= 64
-#  define FEATURE_FT_SKIP_COMPRESSED
-# endif
+# define FEATURE_FT_SKIP_COMPRESSED
 #endif
 
 /*
@@ -392,7 +393,8 @@ struct cds_ft_metadata {
 	 *   FT_KIND_QP_HI hi-node → qp_subtree_half_cls: total
 	 *     half-cacheline (32 B) footprint of the hi+lo subtree
 	 *     rooted at this hi.  Used by the QP→PIGEON up-trigger:
-	 *     when the count exceeds PIGEON's flat 64 half-CLs (= 2 KB),
+	 *     when the count exceeds PIGEON's flat footprint (64
+	 *     half-CLs = 2 KB on 64-bit; 32 half-CLs = 1 KB on 32-bit),
 	 *     the recompact framework swaps to PIGEON.  Set on hi
 	 *     creation, +=/-= on Path 1 (new T0 lo), Path 2b (lo CoW
 	 *     grow), and ft_qp_byte_clear (last-byte lo elide).
