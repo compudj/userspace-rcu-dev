@@ -200,7 +200,6 @@
 # define NODE_INDEX_NULL		8
 #endif
 
-#ifdef FEATURE_FT_QP
 /*
  * Type-index reservation for QP lo-nodes.
  *
@@ -216,8 +215,7 @@
  * appear as descent targets (descent always enters via hi), so no
  * type-class dispatch is performed on this index.
  */
-# define FT_QP_LO_TYPE_INDEX	5U
-#endif
+#define FT_QP_LO_TYPE_INDEX	5U
 
 /*
  * Number of removals needed on a fallback node before we try to shrink
@@ -265,26 +263,20 @@
 #endif
 
 /*
- * FEATURE_FT_QP: nibble-popcount internal node layout (Phase 2 WIP).
+ * QP-nibble internal node layout.
  *
- * Replaces the LINEAR / POOL / byte_popcount_1l / nibble_popcount_2l
- * internal-node families with two unified types:
+ * Internal nodes come in two flavors:
  *
  *   - QP-nibble : 16-bit popcount bitmap + popcount-indexed pointer
  *                 array.  Each level dispatches on one nibble (4 bits).
  *                 Multiple size tiers driven by popcount(bitmap).
- *   - PIGEON    : direct ptrs[256] (unchanged from the existing
- *                 implementation; promoted to from QP-nibble pairs
- *                 when the byte-level fan-out crosses a threshold).
+ *   - PIGEON    : direct ptrs[256], promoted from QP-nibble pairs
+ *                 when the byte-level fan-out crosses a threshold.
  *
  * Trie depth doubles for byte-keyed inputs (each byte becomes two
  * nibble levels); the depth-doubling cost at runs is absorbed by
  * skip-compressed pointers, which collapse compressed-node chains
  * out of the read-side descent on architectures that support them.
- *
- * Off by default while the layout is being introduced.  Enable with
- * -DFEATURE_FT_QP.  When undefined, none of the QP-nibble code is
- * reachable from any execution path.
  */
 
 /*
@@ -487,7 +479,6 @@ struct cds_ft_compressed_node {
 	uint8_t key_bytes[];			/* Compressed key path (flexible array). */
 };
 
-#ifdef FEATURE_FT_QP
 /*
  * QP-nibble internal node — 16-bit popcount bitmap + popcount-indexed
  * pointer array.  Each level dispatches on one nibble (4 bits, values
@@ -537,7 +528,6 @@ struct cds_ft_qp16_node {
 	uint8_t  _pad[FT_QP16_HEADER_SIZE - 2];	/* bytes 2-7: reserved */
 	struct cds_ft_inode_flag *ptrs[];	/* bytes 8+: popcount(bitmap) entries */
 } __attribute__((__aligned__(8)));
-#endif /* FEATURE_FT_QP */
 
 struct cds_ft_bitmap {
 	/*

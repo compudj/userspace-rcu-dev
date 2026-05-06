@@ -140,9 +140,7 @@ struct cds_ft_attr {
 
 enum cds_ft_type_class {
 	FT_PIGEON = 0,		/* Pigeon: direct indexed */
-#ifdef FEATURE_FT_QP
-	FT_QP = 1,		/* QP-nibble: 16-bit popcount + ptrs[]; not yet wired into ft_types[] dispatch */
-#endif
+	FT_QP = 1,		/* QP-nibble: 16-bit popcount + ptrs[] */
 	/* Leaf nodes are implicit from their height in the tree */
 	FT_NR_TYPES,
 
@@ -185,11 +183,9 @@ enum {
 	ft_type_8_max_child = 256,
 };
 
-#ifdef FEATURE_FT_QP
 /*
- * 64-bit ft_types[] under FEATURE_FT_QP.  The byte-keyed taxonomy
- * collapses to QP-nibble (sparse byte stages) and PIGEON (dense byte
- * stages):
+ * 64-bit ft_types[].  The byte-keyed taxonomy is QP-nibble (sparse
+ * byte stages) and PIGEON (dense byte stages):
  *
  *   [0..3] = QP T0..T3 — type_class FT_QP, orders 5..8 (32..256 B
  *            qp16_node), max_child = 3 / 7 / 15 / 16 (lo-bucket count
@@ -234,9 +230,6 @@ const struct cds_ft_type ft_types[] = {
 	[7] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
 	[8] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_8_max_child, .bitmap = FT_NO_BITMAP },
 };
-#else /* !FEATURE_FT_QP */
-#error "Fractal Trie requires FEATURE_FT_QP"
-#endif /* !FEATURE_FT_QP */
 
 /*
  * The cds_ft_inode contains the compressed node data needed for
@@ -1164,11 +1157,9 @@ static inline unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m);
 static inline void ft_nr_keys_store(struct cds_ft *ft, struct cds_ft_metadata *m, unsigned long val, int mo);
 static unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag *child_nf);
-#ifdef FEATURE_FT_QP
 struct cds_ft_qp16_node;
 static inline struct cds_ft_inode_flag *ft_qp16_lo_flag(
 		struct cds_ft_qp16_node *lo);
-#endif
 
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
@@ -1176,25 +1167,13 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	unsigned long v = (unsigned long) node;
 
 	/*
-	 * Compute mask from the original pointer: the skip-compressed
-	 * length bits (57-63) don't affect bits 0-3 used for type
-	 * dispatch, so this runs in parallel with the ADDR_MASK AND
-	 * below (full ILP).
-	 */
-#ifdef FEATURE_FT_QP
-	/*
-	 * No pool / 2D-bitsel encoding under FEATURE_FT_QP — internal
-	 * flags carry only the 4 tag bits (INTERNAL_MASK + 3-bit type),
-	 * so a fixed ~15UL mask suffices.  Hi tiers 0..3 and the lo
-	 * type-index (FT_QP_LO_TYPE_INDEX) all need the same mask;
-	 * dropping the type-dependent shift prevents over-clearing bits
-	 * 4..8 that the lo-flag's address actually uses.
+	 * Internal flags carry only the 4 tag bits (INTERNAL_MASK +
+	 * 3-bit type), so a fixed ~15UL mask suffices on the internal
+	 * branch; the external branch needs ~7UL to keep the bit-1
+	 * compressed-pointer tag if set.  Hi tiers 0..3 and the lo
+	 * type-index (FT_QP_LO_TYPE_INDEX) share the same mask.
 	 */
 	unsigned long mask = (v & 1) ? ~15UL : ~7UL;
-#else
-	unsigned long mask_internal = (~15UL) << ((v >> 1) & 7);
-	unsigned long mask = (v & 1) ? mask_internal : ~7UL;
-#endif
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
@@ -1221,12 +1200,7 @@ static inline_lookup
 struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
-#ifdef FEATURE_FT_QP
-	/* See ft_node_ptr: no pool encoding under FT_QP, fixed ~15UL mask. */
 	unsigned long mask = ~15UL;
-#else
-	unsigned long mask = (~15UL) << ((v >> 1) & 7);
-#endif
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	v &= FT_ADDR_MASK;
@@ -1751,7 +1725,6 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 #endif
 	if (!child_nf)
 		return;
-#ifdef FEATURE_FT_QP
 	/*
 	 * Option 3: byte-keyed children of a QP hi-node carry the tagged
 	 * lo-flag as their parent (slot is in the lo arena, not in the hi
@@ -1776,7 +1749,6 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 			}
 		}
 	}
-#endif
 	FT_TP(set_parent, (const void *) child_nf, (const void *) parent_nf);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (ft_node_skip_compressed(child_nf)) {
@@ -2481,7 +2453,6 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
 	return ft_pigeon_node_get_nth(type, node, NULL, i, FT_PF_NONE);
 }
 
-#ifdef FEATURE_FT_QP
 /*
  * QP-nibble tier table.  Parallel to ft_types[]; describes the four
  * QP-nibble allocation tiers (T0..T3) by popcount range and node
@@ -2490,11 +2461,6 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
  * The hysteresis (min_child < previous max_child) gives a window
  * during shrinkage where we stay in the larger tier — same idea as
  * ft_types[]'s overlapping min/max ranges for the byte-keyed types.
- *
- * Not yet consulted by any allocator path: writers will pick a tier
- * by ft_qp16_alloc_order(popcount) once descent dispatch is wired
- * (Phase 2 step 1b + dispatch arms).  This commit lands the table
- * alongside the FT_QP enum value as scaffolding only.
  */
 struct cds_ft_qp16_tier {
 	uint16_t min_child;	/* hysteresis lower bound (inclusive) */
@@ -3654,7 +3620,6 @@ int ft_qp_byte_set(struct cds_ft *ft,
 		}
 	}
 }
-#endif /* FEATURE_FT_QP */
 
 /*
  * ft_node_get_nth: get nth item from a node.
@@ -3709,7 +3674,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
 
 	/*
-	 * Under FEATURE_FT_QP the ft_types[] layout is
+	 * ft_types[] layout:
 	 *   [0..3] = QP T0..T3 (all share the byte-step descent helper)
 	 *   [4]    = PIGEON
 	 *   [5..7] = NULL filler
@@ -3781,7 +3746,6 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 		}
 		return false;
 	}
-#ifdef FEATURE_FT_QP
 	case FT_QP:
 	{
 		struct cds_ft_qp16_node *hi = (struct cds_ft_qp16_node *) node;
@@ -3836,7 +3800,6 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 		}
 		return false;
 	}
-#endif
 	default:
 		assert(0);
 		return false;
@@ -3869,13 +3832,11 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	case FT_PIGEON:
 		child = ft_pigeon_node_get_direction(type, node, n, result_key, dir);
 		break;
-#ifdef FEATURE_FT_QP
 	case FT_QP:
 		child = ft_qp_byte_get_direction(
 				(struct cds_ft_qp16_node *) node,
 				n, result_key, dir);
 		break;
-#endif
 	default:
 		assert(0);
 		return (void *) -1UL;
@@ -3974,7 +3935,6 @@ int _ft_node_set_nth(struct cds_ft *ft,
 	case FT_PIGEON:
 		ret = ft_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
 		break;
-#ifdef FEATURE_FT_QP
 	case FT_QP:
 		/*
 		 * hi_capacity is the structural hi-bucket count
@@ -3990,7 +3950,6 @@ int _ft_node_set_nth(struct cds_ft *ft,
 				n, child_node_flag,
 				ft_qp16_capacity_from_order(type->order));
 		break;
-#endif
 	case FT_NULL:
 		return -ENOSPC;
 	default:
@@ -4057,13 +4016,11 @@ int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
 	case FT_PIGEON:
 		ret = ft_pigeon_node_replace_ptr(type, node, metadata, node_flag_ptr, n, newptr);
 		break;
-#ifdef FEATURE_FT_QP
 	case FT_QP:
 		ret = ft_qp_byte_replace(ft,
 				(struct cds_ft_qp16_node *) node, metadata,
 				node_flag_ptr, n, newptr);
 		break;
-#endif
 	case FT_NULL:
 		return -ENOENT;
 	default:
@@ -4126,15 +4083,8 @@ int ft_node_recompact(enum ft_recompact mode,
 	struct cds_ft_inode_flag *new_node_flag = NULL;
 	int ret;
 
-	/*
-	 * Need to find nearest type index even for ADD_SAME, because
-	 * this recompaction, when applied to linear nodes, will garbage
-	 * collect dummy (NULL) entries, and can therefore cause a few
-	 * linear representations to be skipped.
-	 */
 	switch (mode) {
 	case FT_RECOMPACT_ADD_SAME:
-#ifdef FEATURE_FT_QP
 		/*
 		 * FT_QP -ERANGE recompact: rebuild + insert new hi-bucket
 		 * below an existing higher bucket.  popcount grows by 1.
@@ -4158,7 +4108,6 @@ int ft_node_recompact(enum ft_recompact mode,
 				old_type_index, new_type_index, old_pop, old_cap);
 			break;
 		}
-#endif
 		new_type_index = find_nearest_type_index(old_type_index,
 			metadata->nr_child + 1, false);
 		dbg_printf("Recompact for node with %u children\n",
@@ -4169,7 +4118,6 @@ int ft_node_recompact(enum ft_recompact mode,
 			new_type_index = 0;
 			dbg_printf("Recompact for NULL\n");
 		} else {
-#ifdef FEATURE_FT_QP
 			/*
 			 * FT_QP -ENOSPC recompact: structural hi-bucket overflow
 			 * (popcount(hi_bm) == hi_capacity, new bit needed).  Tier
@@ -4182,7 +4130,6 @@ int ft_node_recompact(enum ft_recompact mode,
 					old_type_index, new_type_index);
 				break;
 			}
-#endif
 			new_type_index = find_nearest_type_index(old_type_index,
 				metadata->nr_child + 1, false);
 			dbg_printf("Recompact for node with %u children\n",
@@ -4190,7 +4137,6 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 		break;
 	case FT_RECOMPACT_DEL:
-#ifdef FEATURE_FT_QP
 		/*
 		 * FT_QP DEL recompact: byte_clear returned -EFBIG signalling
 		 * either tier-down (post-decrement byte count) or full
@@ -4208,7 +4154,6 @@ int ft_node_recompact(enum ft_recompact mode,
 				new_type_index, metadata->nr_child);
 			break;
 		}
-#endif
 		new_type_index = find_nearest_type_index(old_type_index,
 			metadata->nr_child - 1, is_root);
 		dbg_printf("Recompact for node with %u children\n",
@@ -4274,7 +4219,6 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 		break;
 	}
-#ifdef FEATURE_FT_QP
 	case FT_QP:
 	{
 		struct cds_ft_qp16_node *old_hi =
@@ -4365,7 +4309,6 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 		break;
 	}
-#endif
 	default:
 		assert(0);
 		ret = -EINVAL;
@@ -4451,7 +4394,6 @@ skip_copy:
 			}
 			break;
 		}
-#ifdef FEATURE_FT_QP
 		case FT_QP:
 		{
 			struct cds_ft_qp16_node *new_hi =
@@ -4526,7 +4468,6 @@ skip_copy:
 			}
 			break;
 		}
-#endif
 		default:
 			break;
 		}
@@ -4575,16 +4516,13 @@ int ft_node_set_nth(struct cds_ft *ft,
 		 * Safe to link child -> target via parent pointer now:
 		 * target is already fully valid to readers.
 		 *
-		 * Under FEATURE_FT_QP the FT_QP arm of _ft_node_set_nth
-		 * (ft_qp_byte_set) already records the child's parent as the
-		 * tagged lo-flag — overwriting it here with @node_flag (the
-		 * hi-flag) would clobber the (hi, lo) parent semantics, so
-		 * skip the secondary ft_set_parent for QP nodes.
+		 * The FT_QP arm of _ft_node_set_nth (ft_qp_byte_set) already
+		 * records the child's parent as the tagged lo-flag —
+		 * overwriting it here with @node_flag (the hi-flag) would
+		 * clobber the (hi, lo) parent semantics, so skip the
+		 * secondary ft_set_parent for QP nodes.
 		 */
-#ifdef FEATURE_FT_QP
-		if (type->type_class != FT_QP)
-#endif
-		{
+		if (type->type_class != FT_QP) {
 			struct cds_ft_inode_flag **slot_ptr = NULL;
 
 			if (ft_node_skip_compressed(child_node_flag))
@@ -6920,9 +6858,9 @@ void ft_propagate_external_count_parent(struct cds_ft *ft,
  *          cn->len for compressed nodes,
  *          suffix_len for the matching collapsed entry.
  *
- * Under FEATURE_FT_QP, lo-nodes contribute 0: a (hi, lo) pair shares
- * one byte step in the trie — hi handles the hi-nibble, lo handles
- * the lo-nibble — so the upward walk treats the pair as one tier.
+ * Lo-nodes contribute 0: a (hi, lo) pair shares one byte step in the
+ * trie — hi handles the hi-nibble, lo handles the lo-nibble — so the
+ * upward walk treats the pair as one tier.
  *
  * Write-side only (mutex-held).
  */
@@ -6935,10 +6873,8 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 			ft_compressed_node_ptr(parent_nf);
 		return cn->len;
 	}
-#ifdef FEATURE_FT_QP
 	if (ft_node_type(parent_nf) == FT_QP_LO_TYPE_INDEX)
 		return 0;
-#endif
 	/* Internal node: dispatches on one key byte. */
 	return 1;
 }
@@ -13805,10 +13741,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			size_t actual_order = cds_ft_item_order(node);
 
 			if (type->type_class != FT_PIGEON
-#ifdef FEATURE_FT_QP
-			    && type->type_class != FT_QP
-#endif
-			   ) {
+			    && type->type_class != FT_QP) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: internal node %p has non-internal type_class %d (type_index %u)\n",
 						depth, node_flag,
@@ -13865,12 +13798,11 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			 */
 			if (path)
 				path[depth] = (uint8_t) key;
-#ifdef FEATURE_FT_QP
 			/*
-			 * Under FEATURE_FT_QP a byte step traverses (hi, lo);
-			 * the byte-keyed child's parent points at the lo-flag
-			 * derived from the raw lo pointer in hi.ptrs[hi_idx],
-			 * not at @node_flag.  Other type classes are unchanged.
+			 * A byte step traverses (hi, lo); the byte-keyed
+			 * child's parent points at the lo-flag derived from
+			 * the raw lo pointer in hi.ptrs[hi_idx], not at
+			 * @node_flag.  PIGEON children are unchanged.
 			 */
 			{
 				unsigned int t_idx = ft_node_type(node_flag);
@@ -13896,7 +13828,6 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 						ft_qp16_lo_flag(lo_raw);
 				}
 			}
-#endif
 			if (ft_node_external(child)) {
 				/* External leaf chain at this slot. */
 				if (ft_verify_external_chain(ft, out, visited,
