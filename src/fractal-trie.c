@@ -1089,22 +1089,16 @@ struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 }
 
 /*
- * Test whether @node has the external tag (kind == FT_KIND_EXT).
- * Uses only bits 0,1: every non-EXT kind has at least one of bit 0
- * or bit 1 set, so this 2-bit test is sufficient to pick out EXT
- * without forcing externals beyond their natural pointer alignment
- * (4 bytes on 32-bit, 8 bytes on 64-bit).  Bits 2,3 of the natural
- * external address are not part of the tag and ride through the
- * EXT branch of ft_node_ptr (which strips only bits 0,1) unchanged.
- *
- * Matches both non-NULL external leaf pointers AND NULL (NULL has
- * all bits clear).  Callers that need to distinguish NULL from a
- * valid external node should also check ft_node_ptr().
+ * Test whether @node has the external tag (kind == FT_KIND_EXT, low
+ * nibble = 0x0).  This matches both non-NULL external leaf pointers
+ * AND NULL, since NULL has all bits clear.  Callers that need to
+ * distinguish NULL from a valid external node should also check
+ * ft_node_ptr().
  */
 static inline_lookup
 bool ft_node_external(struct cds_ft_inode_flag *node)
 {
-	return ((unsigned long) node & FT_KIND_EXT_MASK) == FT_KIND_EXT;
+	return ((unsigned long) node & FT_KIND_MASK) == FT_KIND_EXT;
 }
 
 #ifdef FEATURE_FT_COMPRESS
@@ -1161,10 +1155,9 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
  * type's alignment boundary.  The shift amount is derived purely
  * from bits 1-3 with no dependency on bit 0.
  *
- * For non-internal nodes (bit 0 clear): external nodes only need
- * 4-byte natural alignment (bits 0,1 free for the FT_KIND_EXT /
- * FT_KIND_SKIP_EXT tags); bits 2,3 ride through unchanged.  The
- * EXT-branch mask therefore strips only bits 0,1 (FT_EXT_PTR_MASK).
+ * For non-internal nodes (bit 0 clear): external nodes are >= 8-byte
+ * aligned (bits 0-2 zero), compressed/collapsed are >= 16-byte
+ * aligned with tags in bits 1-2.  A fixed ~7UL mask suffices.
  *
  * The conditional select lets the two mask computations run in
  * parallel; the compiler emits a CMOV, keeping the critical path
@@ -1186,17 +1179,15 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	unsigned long v = (unsigned long) node;
 
 	/*
-	 * Every internal/compressed kind (COMPRESSED, QP_HI, PIGEON,
-	 * QP_LO and their skip-target variants) has bit 0 set; only
-	 * EXT (0x0) and SKIP_EXT (0x2) have bit 0 clear.  Internal
-	 * pointers carry the full 4-bit kind nibble, so the strip
-	 * mask is FT_KIND_PTR_MASK (~15UL).  External pointers only
-	 * use bits 0,1 of the kind, so the strip mask is
-	 * FT_EXT_PTR_MASK (~3UL); bits 2,3 of the natural cds_ft_node
-	 * address ride through unchanged (preserving 4-byte natural
-	 * alignment on 32-bit, 8-byte on 64-bit).
+	 * After Stage D, every tagged kind (COMPRESSED, QP_HI, PIGEON,
+	 * QP_LO) has bit 0 set; only EXT (0x0) has bit 0 clear.  All
+	 * tagged kinds use the low 4 bits as their tag, so ~15UL is
+	 * the universal strip mask on the tagged branch.  EXT is
+	 * already 8-byte aligned (no tag) so the result is unchanged
+	 * by either mask, but ~7UL keeps the cleanest semantics for
+	 * the bit-0-clear branch.
 	 */
-	unsigned long mask = (v & 1) ? FT_KIND_PTR_MASK : FT_EXT_PTR_MASK;
+	unsigned long mask = (v & 1) ? ~15UL : ~7UL;
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
@@ -1229,8 +1220,7 @@ struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
 	v &= FT_ADDR_MASK;
 #endif
 
-	assert(((v & 1) && (v & FT_KIND_MASK) >= FT_KIND_QP_HI)
-		|| node == NULL);
+	assert(((v & FT_KIND_MASK) >= FT_KIND_QP_HI) || node == NULL);
 	return (struct cds_ft_inode *) (v & mask);
 }
 
@@ -1249,46 +1239,14 @@ static inline_lookup
 bool ft_node_internal(struct cds_ft_inode_flag *node)
 {
 	/*
-	 * Internal-class kinds are FT_KIND_QP_HI (0x5), FT_KIND_PIGEON
-	 * (0x9), FT_KIND_QP_LO (0xD), and FT_KIND_SKIP_PIGEON (0xB).
-	 * All four have bit 0 set (separating them from EXT/SKIP_EXT)
-	 * AND have low-nibble value >= 0x5.  COMPRESSED (0x1) and
-	 * SKIP_QP (0x3) have bit 0 set but are < 0x5.
-	 *
-	 * The bit-0 check is required: with 4-byte natural alignment of
-	 * external nodes, an EXT pointer's bits 2,3 ride through the
-	 * encoding unchanged, so the encoded form's low nibble can be
-	 * 0x4 / 0x8 / 0xC (and SKIP_EXT can be 0x6 / 0xA / 0xE).
-	 * Without the bit-0 gate, low nibbles 0x8 / 0xC / 0xA / 0xE
-	 * would falsely match `>= 0x5` and slip into the internal path.
+	 * After Stage D, COMPRESSED has bit 0 set too — `node & 1` is
+	 * no longer sufficient.  Internal kinds are FT_KIND_QP_HI (0x5),
+	 * FT_KIND_PIGEON (0x9), FT_KIND_QP_LO (0xD); all share bits 2 or
+	 * 3 set.  COMPRESSED (0x1), EXT (0x0), and the future skip-target
+	 * tags (0x2, 0x3, 0xB) all have bits 2-3 clear.
 	 */
-	unsigned long k = (unsigned long) node & FT_KIND_MASK;
-
-	return (k & 0x1UL) && k >= FT_KIND_QP_HI;
+	return ((unsigned long) node & FT_KIND_MASK) >= FT_KIND_QP_HI;
 }
-
-/*
- * With the 4-byte external alignment relaxation, an EXT-encoded
- * pointer's low nibble can be any of {0x0, 0x4, 0x8, 0xC} (bits 2,3
- * are part of the natural cds_ft_node address, not the kind), and a
- * SKIP_EXT-encoded pointer's low nibble can be any of {0x2, 0x6,
- * 0xA, 0xE}.  Internal kinds always have bit 0 set, externals
- * always have bit 0 clear, so the two universes don't collide.
- *
- * Concrete consequences for code that inspects the kind nibble:
- *   - "Is this EXT?"          → ft_node_external (uses bits 0,1).
- *   - "Is this SKIP_EXT?"     → (ptr & FT_KIND_EXT_MASK) == FT_KIND_SKIP_EXT.
- *   - "Is this internal?"     → ft_node_internal (gates on bit 0).
- *   - "Is this COMPRESSED /
- *     QP_HI / PIGEON / etc.?" → (ptr & FT_KIND_MASK) == FT_KIND_X is
- *                               still safe — every internal-class
- *                               kind has bit 0 set, EXT alternates
- *                               never collide.
- *
- * The only tests that need the wider-mask vs narrower-mask choice
- * are tests against FT_KIND_EXT or FT_KIND_SKIP_EXT — those have to
- * use FT_KIND_EXT_MASK to catch the alternates.
- */
 
 /*
  * Recover the ft_types[] slot index for an internal node flag.
@@ -1377,19 +1335,17 @@ static inline
 unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
+	unsigned long kind = v & FT_KIND_MASK;
 
 	/*
 	 * Caller has already established that @node is a skip-compressed
 	 * kind (FT_KIND_SKIP_EXT 0x2, FT_KIND_SKIP_QP 0x3, or
 	 * FT_KIND_SKIP_PIGEON 0xB).  Among those, only SKIP_EXT has
-	 * bit 0 clear — and that property is preserved across all
-	 * SKIP_EXT alternates {0x2, 0x6, 0xA, 0xE} from the 4-byte
-	 * EXT alignment relaxation.  A single bit-0 test is therefore
-	 * sufficient and avoids the FT_KIND_MASK + 3-way compare chain.
+	 * bit 0 clear, so the read-side dispatch is a single bit-0 test
+	 * (cheaper than a 3-way compare against the FT_KIND_SKIP_* values).
 	 */
-	assert(((v & 1) && (((v & FT_KIND_MASK) == FT_KIND_SKIP_QP)
-			|| ((v & FT_KIND_MASK) == FT_KIND_SKIP_PIGEON)))
-		|| (!(v & 1) && ((v & FT_KIND_EXT_MASK) == FT_KIND_SKIP_EXT)));
+	assert(kind == FT_KIND_SKIP_EXT || kind == FT_KIND_SKIP_QP
+		|| kind == FT_KIND_SKIP_PIGEON);
 	if (caa_unlikely(!(v & 1)))
 		return ft_skip_to_compressed(node)->len;
 	v &= FT_ADDR_MASK;	/* strip skip-length high bits */
@@ -1434,41 +1390,14 @@ unsigned long ft_skip_kind_to_child_kind(unsigned long skip_kind)
  * pointer.  Clears the skip-length high bits and rewrites the
  * skip-target tag (0x2/0x3/0xB) back into the child's actual kind
  * tag (0x0/0x5/0x9).
- *
- * For SKIP_EXT: the resolved natural cds_ft_node may have bits 2,3
- * set (4-byte / 8-byte natural alignment, not 16).  Strip only bits
- * 0,1 (FT_EXT_PTR_MASK) to preserve those.  Then OR with FT_KIND_EXT
- * (== 0x0) is a no-op, so the result is the bare natural pointer.
- *
- * For SKIP_QP / SKIP_PIGEON: the resolved natural pointer is FT-
- * allocated and 16-byte aligned, so the full FT_KIND_PTR_MASK strip
- * + child-kind OR recovers the canonical tagged form.
  */
 static inline
 struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node & FT_ADDR_MASK;
-	unsigned long child_kind, out_mask;
+	unsigned long child_kind = ft_skip_kind_to_child_kind(v & FT_KIND_MASK);
 
-	/*
-	 * Dispatch on bit 0: SKIP_EXT is the only skip kind with bit 0
-	 * clear (alternates {0x2, 0x6, 0xA, 0xE} all have bit 0 = 0;
-	 * SKIP_QP 0x3 and SKIP_PIGEON 0xB both have bit 0 = 1).
-	 *
-	 * For SKIP_EXT: out_mask = FT_EXT_PTR_MASK preserves bits 2,3
-	 *   of the natural cds_ft_node address; child_kind = FT_KIND_EXT
-	 *   (an OR of 0x0 is a no-op).
-	 * For SKIP_QP / SKIP_PIGEON: out_mask = FT_KIND_PTR_MASK strips
-	 *   the full kind nibble; child_kind comes from the kind table.
-	 */
-	if (caa_unlikely(!(v & 1))) {
-		child_kind = FT_KIND_EXT;
-		out_mask = FT_EXT_PTR_MASK;
-	} else {
-		child_kind = ft_skip_kind_to_child_kind(v & FT_KIND_MASK);
-		out_mask = FT_KIND_PTR_MASK;
-	}
-	return (struct cds_ft_inode_flag *) ((v & out_mask) | child_kind);
+	return (struct cds_ft_inode_flag *) ((v & FT_KIND_PTR_MASK) | child_kind);
 }
 
 /*
@@ -1494,15 +1423,7 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		struct cds_ft_inode_flag *child,
 		const struct cds_ft_compressed_node *cn)
 {
-	/*
-	 * Encode-side helper (mutator path, cold).  Canonicalize the
-	 * child kind: EXT alternates ({0x4, 0x8, 0xC} from 4-byte
-	 * natural alignment) collapse to FT_KIND_EXT; internal kinds
-	 * keep their full 4-bit form.
-	 */
-	unsigned long child_kind = ((unsigned long) child & 1)
-			? ((unsigned long) child & FT_KIND_MASK)
-			: ((unsigned long) child & FT_KIND_EXT_MASK);
+	unsigned long child_kind = (unsigned long) child & FT_KIND_MASK;
 	unsigned long skip_kind = ft_kind_to_skip_kind(child_kind);
 	unsigned int len = cn->len;
 
@@ -1535,21 +1456,9 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 			memcpy(cache->subkey, cn->key_bytes, copy_len);
 		cache->skip_len = (uint8_t) len;
 	}
-	{
-		/*
-		 * EXT children may have bits 2,3 set in their natural
-		 * address (4-byte natural alignment), so strip only bits
-		 * 0,1 here.  Internal-kind children (QP_HI / PIGEON) are
-		 * 16-byte aligned in the arena, so the full kind-nibble
-		 * strip is correct for them.
-		 */
-		unsigned long child_mask = (child_kind == FT_KIND_EXT)
-				? FT_EXT_PTR_MASK : FT_KIND_PTR_MASK;
-
-		return (struct cds_ft_inode_flag *)
-			(((unsigned long) child & child_mask) | skip_kind |
-			 ((unsigned long) len << FT_SKIP_LEN_SHIFT));
-	}
+	return (struct cds_ft_inode_flag *)
+		(((unsigned long) child & FT_KIND_PTR_MASK) | skip_kind |
+		 ((unsigned long) len << FT_SKIP_LEN_SHIFT));
 }
 
 /*
@@ -2514,11 +2423,10 @@ void ft_prefetch_child_meta(const void *ptr)
 	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
 #endif
 	/*
-	 * EXT alternates ({0x4, 0x8, 0xC} from the 4-byte natural
-	 * alignment of cds_ft_node) all have bit 0 = 0; internal kinds
-	 * always have bit 0 = 1.  The bit-0 test is therefore a faster
-	 * dispatch than `(v & FT_KIND_MASK) == FT_KIND_EXT` and is
-	 * correct across all alternates.
+	 * External kinds (EXT 0x0, SKIP_EXT 0x2) are the only kinds
+	 * with bit 0 = 0; every internal kind has bit 0 = 1.  A single
+	 * bit-0 test is therefore cheaper than (v & FT_KIND_MASK) ==
+	 * FT_KIND_EXT and folds the SKIP_EXT case in for free.
 	 */
 	if (!(v & 1)) {
 		/*
@@ -3889,21 +3797,16 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-	unsigned long v = (unsigned long) node_flag;
-	unsigned long tag = v & FT_KIND_MASK;
+	unsigned long tag = (unsigned long) node_flag & FT_KIND_MASK;
 	struct cds_ft_inode *node;
 
 	/*
-	 * Non-internal kinds (EXT 0x0, COMPRESSED 0x1, SKIP_EXT 0x2,
-	 * SKIP_QP 0x3): no byte-step descent.  The bit-0 gate is
-	 * required to filter out EXT alternates ({0x4, 0x8, 0xC} from
-	 * the 4-byte natural alignment of cds_ft_node) and SKIP_EXT
-	 * alternates ({0x6, 0xA, 0xE}); without it, low nibbles 0x8
-	 * and 0xC would slip past `tag < FT_KIND_QP_HI` and reach the
-	 * internal dispatch with an EXT pointer.  Internal-class kinds
-	 * always have bit 0 set.
+	 * Non-internal kinds (FT_KIND_EXT = 0, FT_KIND_COMPRESSED = 1,
+	 * future skip-target tags 0x2/0x3 = 2/3, reserved 0x4): no
+	 * byte-step descent.  Tags >= FT_KIND_QP_HI are the internal
+	 * dispatch targets.
 	 */
-	if (caa_unlikely(!(v & 1) || tag < FT_KIND_QP_HI)) {
+	if (caa_unlikely(tag < FT_KIND_QP_HI)) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
 		return NULL;
