@@ -1323,23 +1323,65 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 }
 
 /*
+ * Map a child kind tag (FT_KIND_EXT / FT_KIND_QP_HI / FT_KIND_PIGEON)
+ * to the corresponding skip-target kind tag (FT_KIND_SKIP_EXT /
+ * FT_KIND_SKIP_QP / FT_KIND_SKIP_PIGEON).  Used by encoding /
+ * decoding of skip-compressed pointers.
+ */
+static inline
+unsigned long ft_kind_to_skip_kind(unsigned long child_kind)
+{
+	switch (child_kind) {
+	case FT_KIND_EXT:    return FT_KIND_SKIP_EXT;
+	case FT_KIND_QP_HI:  return FT_KIND_SKIP_QP;
+	case FT_KIND_PIGEON: return FT_KIND_SKIP_PIGEON;
+	default:
+		assert(0);
+		__builtin_unreachable();
+	}
+}
+
+static inline
+unsigned long ft_skip_kind_to_child_kind(unsigned long skip_kind)
+{
+	switch (skip_kind) {
+	case FT_KIND_SKIP_EXT:    return FT_KIND_EXT;
+	case FT_KIND_SKIP_QP:     return FT_KIND_QP_HI;
+	case FT_KIND_SKIP_PIGEON: return FT_KIND_PIGEON;
+	default:
+		assert(0);
+		__builtin_unreachable();
+	}
+}
+
+/*
  * ft_skip_child_ptr: extract the child tagged pointer from a skip
- * pointer by clearing the skip-length bits.
+ * pointer.  Clears the skip-length high bits and rewrites the
+ * skip-target tag (0x2/0x3/0xB) back into the child's actual kind
+ * tag (0x0/0x5/0x9).
  */
 static inline
 struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
 {
-	return (struct cds_ft_inode_flag *) ((unsigned long) node & FT_ADDR_MASK);
+	unsigned long v = (unsigned long) node & FT_ADDR_MASK;
+	unsigned long child_kind = ft_skip_kind_to_child_kind(v & FT_KIND_MASK);
+
+	return (struct cds_ft_inode_flag *) ((v & FT_KIND_PTR_MASK) | child_kind);
 }
 
 /*
  * ft_skip_compressed_flag: encode a skip pointer from a child pointer
- * and the compressed path length.
+ * and the compressed path length.  The child's kind tag is rewritten
+ * to the matching FT_KIND_SKIP_* variant; readers can then dispatch
+ * on the skip-target class without consulting cn metadata.
  */
 static
 struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		struct cds_ft_inode_flag *child, unsigned int len)
 {
+	unsigned long child_kind = (unsigned long) child & FT_KIND_MASK;
+	unsigned long skip_kind = ft_kind_to_skip_kind(child_kind);
+
 	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
 	/*
 	 * The encoding ORs len into the high bits of child.  If child
@@ -1354,8 +1396,13 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	 * corrupting the trie.
 	 */
 	assert(((unsigned long) child >> FT_SKIP_LEN_SHIFT) == 0);
+	/*
+	 * Only EXT / QP_HI / PIGEON are valid skip targets.  COMPRESSED
+	 * (chain-compress invariant) and QP_LO (skip only crosses byte
+	 * boundaries) are forbidden; ft_kind_to_skip_kind asserts.
+	 */
 	return (struct cds_ft_inode_flag *)
-		((unsigned long) child |
+		(((unsigned long) child & FT_KIND_PTR_MASK) | skip_kind |
 		 ((unsigned long) len << FT_SKIP_LEN_SHIFT));
 }
 
