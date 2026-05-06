@@ -1423,11 +1423,26 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	 * boundaries) are forbidden; ft_kind_to_skip_kind asserts.
 	 */
 	if (child_kind != FT_KIND_EXT) {
-		struct ft_compress_cache *cache = ft_compress_cache_of(
-			(void *) ((unsigned long) child & FT_KIND_PTR_MASK));
+		void *natural_child = (void *)
+			((unsigned long) child & FT_KIND_PTR_MASK);
+		struct ft_compress_cache *cache =
+			ft_compress_cache_of(natural_child);
 		size_t copy_len = len < FT_COMPRESS_CACHE_SUBKEY_LEN
 				? len : FT_COMPRESS_CACHE_SUBKEY_LEN;
 
+		/*
+		 * Contract: any node we publish a skip pointer to must
+		 * live in a compressed_child arena.  The cache page
+		 * (child + page_size) is only mapped/touched for those
+		 * arenas; writing to the cache slot of a non-compressed_
+		 * child node would either fault in a page that should
+		 * stay untouched (RSS bloat) or, worse, corrupt arena
+		 * bookkeeping that lives at that offset.  Allocation
+		 * sites are responsible for picking the right arena
+		 * based on whether the node may become a skip target.
+		 */
+		assert(cds_ft_item_to_range(natural_child)->arena_class
+			== FT_ARENA_COMPRESSED_CHILD);
 		if (copy_len)
 			memcpy(cache->subkey, cn->key_bytes, copy_len);
 		cache->skip_len = (uint8_t) len;
@@ -2082,12 +2097,14 @@ bool valid_key_len(struct cds_ft *ft, size_t key_len)
 static
 struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 		const struct cds_ft_type *ft_type,
+		enum cds_ft_arena_class arena_class,
 		struct cds_ft_metadata **_metadata)
 {
 	struct cds_ft_metadata *metadata;
 	void *p;
 
-	metadata = cds_ft_alloc_item(ft, ft_type->order, ft_type->bitmap);
+	metadata = cds_ft_alloc_item(ft, ft_type->order, ft_type->bitmap,
+		arena_class);
 	if (!metadata) {
 		return NULL;
 	}
@@ -2155,7 +2172,13 @@ struct cds_ft_compressed_node *alloc_compressed_node(struct cds_ft *ft,
 	void *p;
 	unsigned int order = ft_compressed_order(path_len);
 
-	metadata = cds_ft_alloc_item(ft, order, false);
+	/*
+	 * Compressed nodes are never skip targets: they are the SOURCE
+	 * of skip pointers (cn → child encoded as a SKIP_* pointer in
+	 * the grandparent's slot).  Allocate from non-compressed_child
+	 * arenas to skip the cache-page bookkeeping.
+	 */
+	metadata = cds_ft_alloc_item(ft, order, false, FT_ARENA_NORMAL);
 	if (!metadata)
 		return NULL;
 	p = cds_ft_metadata_to_item(metadata);
@@ -3125,12 +3148,13 @@ int ft_qp16_node_recompact_and_insert(struct cds_ft_qp16_node *new_node,
  */
 static __attribute__((unused))
 struct cds_ft_qp16_node *ft_qp16_node_alloc(struct cds_ft *ft,
-		unsigned int order, struct cds_ft_metadata **meta_p)
+		unsigned int order, enum cds_ft_arena_class arena_class,
+		struct cds_ft_metadata **meta_p)
 {
 	struct cds_ft_metadata *metadata;
 	struct cds_ft_qp16_node *node;
 
-	metadata = cds_ft_alloc_item(ft, (size_t) order, false);
+	metadata = cds_ft_alloc_item(ft, (size_t) order, false, arena_class);
 	if (!metadata)
 		return NULL;
 	node = (struct cds_ft_qp16_node *) cds_ft_metadata_to_item(metadata);
@@ -3578,7 +3602,8 @@ int ft_qp_byte_set(struct cds_ft *ft,
 		struct cds_ft_inode_flag *new_lo_flag;
 
 		new_lo = ft_qp16_node_alloc(ft,
-				FT_QP16_T0_ALLOC_ORDER, &new_lo_meta);
+				FT_QP16_T0_ALLOC_ORDER,
+				FT_ARENA_NORMAL, &new_lo_meta);
 		if (!new_lo)
 			return -ENOMEM;
 		new_lo->ptrs[0] = child;
@@ -3670,7 +3695,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 			unsigned int b;
 
 			new_lo = ft_qp16_node_alloc(ft, new_order,
-					&new_lo_meta);
+					FT_ARENA_NORMAL, &new_lo_meta);
 			if (!new_lo)
 				return -ENOMEM;
 			ret = ft_qp16_node_recompact_and_insert(new_lo, lo,
@@ -4243,7 +4268,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			old_type_index, new_type_index);
 	new_type = &ft_types[new_type_index];
 	if (new_type_index != NODE_INDEX_NULL) {
-		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
+		new_node = alloc_cds_ft_node(ft, new_type, FT_ARENA_COMPRESSED_CHILD, &new_metadata);
 		if (!new_node)
 			return -ENOMEM;
 
@@ -8707,7 +8732,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_metadata *fresh_meta;
 		struct cds_ft_metadata *src_meta;
 
-		fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
+		fresh = alloc_cds_ft_node(ft, &ft_types[0], FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
 		if (!fresh)
 			return -ENOMEM;
 		src_meta = cds_ft_item_to_metadata(
@@ -10311,7 +10336,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * Allocate a fresh empty root for the source before
 		 * swapping, so the source remains a valid trie.
 		 */
-		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], &fresh_meta);
+		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
 		if (!fresh_root)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -10349,7 +10374,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * before the point of no return, so we can fail cleanly
 		 * on memory shortage instead of calling abort().
 		 */
-		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
+		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
 		if (!fresh_node)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -10631,7 +10656,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		need_fresh = !swap_empty;
 		if (need_fresh) {
 			fresh = alloc_cds_ft_node(swap_ft,
-				&ft_types[0], &fresh_meta);
+				&ft_types[0],
+				FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
 			if (!fresh) {
 				FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 				return CDS_FT_STATUS_MEMORY_ERROR;
@@ -10858,7 +10884,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * Allocate a fresh empty root for the source trie
 		 * before swapping.
 		 */
-		fresh_node = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
+		fresh_node = alloc_cds_ft_node(ft, &ft_types[0], FT_ARENA_COMPRESSED_CHILD, &fresh_meta);
 		if (!fresh_node) {
 			cds_ft_destroy(detached);
 			return CDS_FT_STATUS_MEMORY_ERROR;
@@ -12999,7 +13025,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * transplanting a root node between tries is a single pointer
 	 * swap with no metadata relocation.
 	 */
-	root_node = alloc_cds_ft_node(ft, type0, &metadata);
+	root_node = alloc_cds_ft_node(ft, type0, FT_ARENA_COMPRESSED_CHILD, &metadata);
 	if (!root_node) {
 		free(ft);
 		*result_ft = NULL;

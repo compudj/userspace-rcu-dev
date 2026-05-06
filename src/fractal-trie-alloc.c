@@ -104,6 +104,13 @@ struct cds_ft_alloc_arena {
 	pthread_mutex_t lock;
 	char *name;
 	bool bitmap;
+	/*
+	 * arena_class: see enum cds_ft_arena_class.  FT_ARENA_COMPRESSED_CHILD
+	 * arenas have an associated compress-cache page touched by
+	 * ft_skip_compressed_flag at skip-pointer publish; FT_ARENA_NORMAL
+	 * arenas don't, keeping the cache page unfaulted (0 RSS).
+	 */
+	enum cds_ft_arena_class arena_class;
 };
 
 static
@@ -292,6 +299,7 @@ carve:
 	/* mmap'd anonymous pages are zero-initialized; no memset needed. */
 	range = (struct cds_ft_alloc_range *) ((char *) ptr + FT_RANGE_HDR_PAGE_OFFSET);
 	range->arena = arena;
+	range->arena_class = arena->arena_class;
 	return range;
 }
 
@@ -307,7 +315,8 @@ void range_destroy(struct cds_ft_alloc_range *range)
 
 static
 struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
-		const char *arena_name, size_t item_len_order, bool bitmap)
+		const char *arena_name, size_t item_len_order, bool bitmap,
+		enum cds_ft_arena_class arena_class)
 {
 	struct cds_ft_alloc_arena *arena;
 	size_t max_items_per_range;
@@ -352,6 +361,7 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	arena->item_len_order = item_len_order;
 	arena->max_nr_items_per_range = max_items_per_range;
 	arena->bitmap = bitmap;
+	arena->arena_class = arena_class;
 	CDS_INIT_LIST_HEAD(&arena->ranges);
 	CDS_INIT_LIST_HEAD(&arena->superblocks);
 	if (arena_name) {
@@ -406,7 +416,16 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 		memset(&free_list_head->metadata, 0, sizeof(free_list_head->metadata));
 		free_list_head->metadata.alloc_index = saved_alloc_index;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		memset(ft_compress_cache_of(p), 0, sizeof(struct ft_compress_cache));
+		/*
+		 * Cache page is only written for compressed_child arenas.
+		 * Skipping the memset for non-compressed_child arenas keeps
+		 * the cache page unfaulted (mmap is lazy → 0 RSS impact),
+		 * eliminating the per-range cache-page bloat for QP_LO and
+		 * COMPRESSED arenas which never have skip-pointer children.
+		 */
+		if (arena->arena_class == FT_ARENA_COMPRESSED_CHILD)
+			memset(ft_compress_cache_of(p), 0,
+				sizeof(struct ft_compress_cache));
 #endif
 		if (arena->bitmap) {
 			struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(p, arena->item_len_order);
@@ -445,10 +464,13 @@ room_left:
 	return &item->metadata;
 }
 
-struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order, bool bitmap)
+struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft,
+		size_t item_len_order, bool bitmap,
+		enum cds_ft_arena_class arena_class)
 {
 	struct cds_ft_alloc_arena **arena_p;
 	struct cds_ft_alloc_arena *arena;
+	unsigned int idx = (unsigned int) arena_class;
 
 	if (!cds_ft_page_size)
 		cds_ft_page_size = urcu_get_page_len();
@@ -456,13 +478,16 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 		errno = EINVAL;
 		return NULL;
 	}
-	arena_p = &ft->group->arena_order[item_len_order];
+	arena_p = &ft->group->arena_order[item_len_order][idx];
 	arena = uatomic_load(arena_p, CMM_ACQUIRE);
 	if (caa_unlikely(!arena)) {
 		pthread_mutex_lock(&ft->group->arena_lock);
 		arena = *arena_p;
 		if (!arena) {
-			arena = cds_ft_arena_create(ft->group, "cds_ft_alloc", item_len_order, bitmap);
+			arena = cds_ft_arena_create(ft->group,
+				arena_class == FT_ARENA_COMPRESSED_CHILD
+					? "cds_ft_alloc_cc" : "cds_ft_alloc",
+				item_len_order, bitmap, arena_class);
 			if (!arena) {
 				pthread_mutex_unlock(&ft->group->arena_lock);
 				return NULL;
@@ -503,7 +528,9 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 		memset(item, 0xfe, item_len);
 		memset(metadata_alloc, 0xfe, sizeof(*metadata_alloc));
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		memset(ft_compress_cache_of(item), 0xfe, sizeof(struct ft_compress_cache));
+		if (arena->arena_class == FT_ARENA_COMPRESSED_CHILD)
+			memset(ft_compress_cache_of(item), 0xfe,
+				sizeof(struct ft_compress_cache));
 #endif
 	}
 #else
@@ -599,10 +626,14 @@ void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
 	int i;
 
 	for (i = 0; i <= FT_ALLOC_ORDER_MAX; i++) {
-		if (!ft_group->arena_order[i])
-			continue;
-		cds_ft_arena_destroy(ft_group->arena_order[i]);
-		ft_group->arena_order[i] = NULL;
+		unsigned int cc;
+
+		for (cc = 0; cc < 2U; cc++) {
+			if (!ft_group->arena_order[i][cc])
+				continue;
+			cds_ft_arena_destroy(ft_group->arena_order[i][cc]);
+			ft_group->arena_order[i][cc] = NULL;
+		}
 	}
 }
 
@@ -634,7 +665,13 @@ void *cds_ft_alloc_external(struct cds_ft *ft, size_t size)
 		errno = EINVAL;
 		return NULL;
 	}
-	metadata = cds_ft_alloc_item(ft, order, false);
+	/*
+	 * External (leaf) nodes are never skip targets — SKIP_EXT
+	 * pointers don't use the per-item cache page (length recovery
+	 * goes through external_node->prev → cn->len).  Allocate from
+	 * a normal arena to skip the cache-page bookkeeping.
+	 */
+	metadata = cds_ft_alloc_item(ft, order, false, FT_ARENA_NORMAL);
 	if (!metadata)
 		return NULL;
 	return cds_ft_metadata_to_item(metadata);

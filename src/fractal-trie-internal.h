@@ -491,8 +491,15 @@ struct cds_ft_group {
 	size_t max_key_len;		/* Maximum key length allowed. */
 	unsigned int flags;		/* CDS_FT_FLAG_* creation-time flags. */
 	const struct rcu_flavor_struct *flavor;
-	/* Allocation arenas. */
-	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
+	/*
+	 * Allocation arenas, indexed by [item_len_order][compressed_child].
+	 * compressed_child=true ([1]) arenas allocate items WITH an
+	 * associated compress-cache page; =false ([0]) arenas don't.
+	 * QP_LO and COMPRESSED nodes are never skip targets, so their
+	 * allocations route to [order][0]; QP_HI / PIGEON nodes may be
+	 * skip targets and route to [order][1].
+	 */
+	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1][2];
 	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
@@ -813,10 +820,40 @@ struct cds_ft_metadata_alloc {
 	};
 };
 
+/*
+ * Arena classification — drives the per-arena memory layout for
+ * skip-compressed support.  Currently a binary distinction; left
+ * room as an enum for future classes (e.g. "always skip target",
+ * "alloc-time hint pending", etc.).
+ */
+enum cds_ft_arena_class {
+	/*
+	 * Arena holds nodes that are never skip targets — QP_LO,
+	 * COMPRESSED, and (during allocation) any node not destined
+	 * to be a child of a compressed node.  No compress-cache
+	 * page is touched for these arenas; the page-mapping cost
+	 * stays unfaulted (mmap-lazy → 0 RSS).
+	 */
+	FT_ARENA_NORMAL = 0,
+	/*
+	 * Arena holds nodes that may become skip targets — children
+	 * of compressed nodes (QP_HI / PIGEON in skip-compressed
+	 * groups).  ft_skip_compressed_flag writes into the cache
+	 * page (child + page_size) when publishing a skip pointer.
+	 */
+	FT_ARENA_COMPRESSED_CHILD = 1,
+};
+
 struct cds_ft_alloc_range {
 	struct cds_list_head node;			/* Linked list of ranges. */
 	struct cds_ft_alloc_arena *arena;		/* Backward reference to arena. */
 	size_t next_unused;
+	/*
+	 * Mirror of arena->arena_class for fast access from the
+	 * skip-pointer publish-site assert without dereferencing the
+	 * opaque arena struct from outside fractal-trie-alloc.c.
+	 */
+	enum cds_ft_arena_class arena_class;
 
 	struct cds_ft_metadata_alloc metadata[];
 };
@@ -917,8 +954,21 @@ size_t cds_ft_item_order(void *p);
 __attribute__((visibility("hidden")))
 void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata);
 
+/*
+ * Allocate an item from one of the per-(order, arena_class) arenas.
+ *
+ * @arena_class: FT_ARENA_COMPRESSED_CHILD if the item may become a
+ *               child of a compressed node (QP_HI / PIGEON, in which
+ *               case the arena is selected from the with-cache pool).
+ *               FT_ARENA_NORMAL for items that can never be skip
+ *               targets (QP_LO / COMPRESSED).
+ *
+ * The arena is created lazily on first use.
+ */
 __attribute__((visibility("hidden")))
-struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order, bool bitmap);
+struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft,
+		size_t item_len_order, bool bitmap,
+		enum cds_ft_arena_class arena_class);
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
