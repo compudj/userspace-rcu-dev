@@ -194,7 +194,7 @@ enum {
  *
  *   [0..3] = QP T0..T3 — type_class FT_QP, orders 5..8 (32..256 B
  *            qp16_node), max_child = 3 / 7 / 15 / 16 (lo-bucket count
- *            on the hi-node).  Encoded on-pointer as FT_KIND_QP_HI;
+ *            on the hi-node).  Encoded on-pointer as FT_KIND_QP;
  *            tier is recovered from cds_ft_item_order().
  *   [4]    = PIGEON — type_class FT_PIGEON, order 11 (2048 B), kept
  *            for the eventual QP→PIGEON transition (§4.7.1, deferred).
@@ -1077,7 +1077,7 @@ struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 	assert(type < FT_NUM_INTERNAL_TYPES);
 	/*
 	 * Map the ft_types[] slot index to the 4-bit kind nibble.  All
-	 * four QP hi-tiers (T0..T3) carry FT_KIND_QP_HI uniformly; the
+	 * four QP hi-tiers (T0..T3) carry FT_KIND_QP uniformly; the
 	 * per-tier alloc order is recoverable from cds_ft_item_order()
 	 * when needed (write side / verify).  PIGEON carries
 	 * FT_KIND_PIGEON.  ft_types[].type_class is a constant load —
@@ -1086,7 +1086,7 @@ struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 	 */
 	switch (ft_types[type].type_class) {
 	case FT_QP:
-		tag = FT_KIND_QP_HI;
+		tag = FT_KIND_QP;
 		break;
 	case FT_PIGEON:
 		tag = FT_KIND_PIGEON;
@@ -1206,7 +1206,7 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 /*
  * Lookup-hot variant: caller has already established that the
  * input is an internal-node flag (e.g. ft_node_get_nth_skip
- * filters tags < FT_KIND_QP_HI and returns NULL before this
+ * filters tags < FT_KIND_QP and returns NULL before this
  * call).  Skips the (v & 1) ? ... : ~7UL branch in ft_node_ptr()
  * above, shaving the cmov/branch from the per-visit dependency
  * chain on the lookup hot path.
@@ -1217,7 +1217,7 @@ struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
 	unsigned long v = (unsigned long) node;
 	unsigned long mask = ~15UL;
 
-	assert((((v & FT_KIND_MASK) >= FT_KIND_QP_HI) &&
+	assert((((v & FT_KIND_MASK) >= FT_KIND_QP) &&
 		!(v & FT_KIND_SKIP_BIT)) || node == NULL);
 	return (struct cds_ft_inode *) (v & mask);
 }
@@ -1232,7 +1232,7 @@ static inline_lookup
 bool ft_node_internal(struct cds_ft_inode_flag *node)
 {
 	/*
-	 * Internal kinds are FT_KIND_QP_HI (0x5) and FT_KIND_PIGEON (0x9).
+	 * Internal kinds are FT_KIND_QP (0x5) and FT_KIND_PIGEON (0x9).
 	 * Both have FT_KIND_INTERNAL_BITS (bits 2-3) non-zero; EXT (0x0),
 	 * COMPRESSED (0x1), SKIP_EXT (0x2) all have those bits zero.
 	 * Single AND + jnz, no CMP.
@@ -1252,7 +1252,7 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
  * (compressed nodes have no type-table slot) and on any non-internal
  * kind.
  *
- * QP-hi nodes (FT_KIND_QP_HI) share one nibble across all tiers; the
+ * QP-hi nodes (FT_KIND_QP) share one nibble across all tiers; the
  * per-tier slot index is recovered from the alloc order (T0..T3 =
  * orders 5..8 = ft_types[0..3]).  PIGEON (FT_KIND_PIGEON) maps to
  * ft_types[4].  The function is write-side / verify only — descent
@@ -1268,7 +1268,7 @@ unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
 	assert(!ft_node_compressed(node));
 
 	tag = (unsigned long) node & FT_KIND_MASK;
-	if (tag == FT_KIND_QP_HI) {
+	if (tag == FT_KIND_QP) {
 		size_t order = cds_ft_item_order(ft_node_ptr_internal(node));
 		assert(order >= FT_QP16_T0_ALLOC_ORDER
 			&& order < FT_QP16_T0_ALLOC_ORDER + FT_QP16_NR_TIERS);
@@ -1315,7 +1315,7 @@ bool ft_node_skip_compressed(struct cds_ft_inode_flag *node)
 	 * FT_KIND_SKIP_BIT (bit 1) is the universal "is skip-compressed"
 	 * predicate: set on FT_KIND_SKIP_EXT (0x2), FT_KIND_SKIP_QP
 	 * (0x7), FT_KIND_SKIP_PIGEON (0xB); clear on every non-skip
-	 * kind (EXT 0x0, COMPRESSED 0x1, QP_HI 0x5, PIGEON 0x9).  One
+	 * kind (EXT 0x0, COMPRESSED 0x1, QP 0x5, PIGEON 0x9).  One
 	 * AND on the lookup hot path.
 	 */
 	return ((unsigned long) node & FT_KIND_SKIP_BIT) != 0;
@@ -1378,7 +1378,7 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 }
 
 /*
- * Map a child kind tag (FT_KIND_EXT / FT_KIND_QP_HI / FT_KIND_PIGEON)
+ * Map a child kind tag (FT_KIND_EXT / FT_KIND_QP / FT_KIND_PIGEON)
  * to the corresponding skip-target kind tag (FT_KIND_SKIP_EXT /
  * FT_KIND_SKIP_QP / FT_KIND_SKIP_PIGEON).
  *
@@ -1391,7 +1391,7 @@ static inline
 unsigned long ft_kind_to_skip_kind(unsigned long child_kind)
 {
 	assert(child_kind == FT_KIND_EXT ||
-	       child_kind == FT_KIND_QP_HI ||
+	       child_kind == FT_KIND_QP ||
 	       child_kind == FT_KIND_PIGEON);
 	return child_kind | FT_KIND_SKIP_BIT;
 }
@@ -1433,7 +1433,7 @@ struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
  *
  * Length recovery and short-path validation use inline storage in
  * the destination node:
- *   FT_KIND_QP_HI  → cds_ft_qp16_node::skip_len + subkey[5] in the
+ *   FT_KIND_QP  → cds_ft_qp16_node::skip_len + subkey[5] in the
  *                    8B header CL (same CL as the bitmap descent
  *                    already loads).  Skip lengths ≤ 5 are validated
  *                    immediately during cand-mode descent against
@@ -1466,10 +1466,10 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	/*
 	 * Only EXT / QP_HI / PIGEON are valid skip targets.  COMPRESSED
 	 * is forbidden by the chain-compress invariant; ft_kind_to_skip_kind
-	 * asserts.  (QP-nibble lo-nodes share the QP_HI tag and are not a
+	 * asserts.  (QP-nibble lo-nodes share the QP tag and are not a
 	 * separate kind in the slot-tag space.)
 	 */
-	if (child_kind == FT_KIND_QP_HI) {
+	if (child_kind == FT_KIND_QP) {
 		struct cds_ft_qp16_node *qp = (struct cds_ft_qp16_node *)
 			((unsigned long) child & FT_KIND_PTR_MASK);
 		size_t copy_len = len < FT_QP16_SUBKEY_INLINE_LEN
@@ -1920,12 +1920,12 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 	 * the lo and ft_set_skip_slot's 8-bit offset is bounded by the
 	 * lo's alloc size.
 	 *
-	 * The tag stays FT_KIND_QP_HI (HI and LO share one slot-tag kind
+	 * The tag stays FT_KIND_QP (HI and LO share one slot-tag kind
 	 * since the QP_LO retirement); the parent walk recovers HI vs LO
 	 * via the lo-node's metadata is_lo bit.
 	 */
 	if (slot && parent_nf
-	    && ((unsigned long) parent_nf & FT_KIND_MASK) == FT_KIND_QP_HI) {
+	    && ((unsigned long) parent_nf & FT_KIND_MASK) == FT_KIND_QP) {
 		void *p_addr = ft_node_ptr(parent_nf);
 		size_t lo_order = cds_ft_item_order(slot);
 		void *lo_base = (void *) ((unsigned long) slot
@@ -2778,7 +2778,7 @@ unsigned int ft_node_half_cls(unsigned int order)
  * holds the tagged lo-flag, and ft_set_parent's slot-based resolver
  * derives the tag from the lo-arena base when callers pass the hi-flag.
  *
- * Lo-nodes share the FT_KIND_QP_HI kind tag with hi-nodes — the
+ * Lo-nodes share the FT_KIND_QP kind tag with hi-nodes — the
  * HI/LO distinction has been retired from the slot-tag space and
  * is recovered from the lo-node's metadata is_lo bit during the
  * upward parent walk (ft_parent_depth_span).
@@ -2787,7 +2787,7 @@ static inline
 struct cds_ft_inode_flag *ft_qp16_lo_flag(struct cds_ft_qp16_node *lo)
 {
 	return (struct cds_ft_inode_flag *)
-		(((unsigned long) lo) | (unsigned long) FT_KIND_QP_HI);
+		(((unsigned long) lo) | (unsigned long) FT_KIND_QP);
 }
 
 /*
@@ -3838,16 +3838,16 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 * handler before reaching here, so this filter is just a safety
 	 * net.  Catches all skip kinds via FT_KIND_SKIP_BIT (bit 1).
 	 */
-	if (caa_unlikely(tag < FT_KIND_QP_HI || (tag & FT_KIND_SKIP_BIT))) {
+	if (caa_unlikely(tag < FT_KIND_QP || (tag & FT_KIND_SKIP_BIT))) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
 		return NULL;
 	}
 
 	/*
-	 * Internal dispatch: FT_KIND_QP_HI (0x5) routes to QP byte-step;
+	 * Internal dispatch: FT_KIND_QP (0x5) routes to QP byte-step;
 	 * FT_KIND_PIGEON (0x9) routes to PIGEON.  Lo-nodes share the
-	 * QP_HI tag (HI/LO disambiguated via metadata is_lo bit during
+	 * QP tag (HI/LO disambiguated via metadata is_lo bit during
 	 * the parent walk) but never appear as a slot value here — the
 	 * descent reaches them only inside ft_qp_byte_get's HI→LO chain.
 	 *
@@ -3857,10 +3857,10 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 * earlier, and the prefetcher's stride detector treats the
 	 * result as a linear pointer offset.
 	 */
-	if (caa_likely(tag == FT_KIND_QP_HI))
+	if (caa_likely(tag == FT_KIND_QP))
 		return ft_qp_byte_get(
 				(struct cds_ft_qp16_node *)
-				((unsigned long) node_flag - FT_KIND_QP_HI),
+				((unsigned long) node_flag - FT_KIND_QP),
 				node_flag_ptr, n, pf_hint);
 	return ft_pigeon_node_get_nth(NULL,
 			(struct cds_ft_inode *)
@@ -5347,7 +5347,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * QP_HI fast path (1/5 in the flat dispatch sequence): the
 		 * dominant byte-step in spec_validate descent and a major
 		 * case in candidate / track / exact-lookup descent too.
-		 * Constant-tag SUB strips FT_KIND_QP_HI with no dispatch;
+		 * Constant-tag SUB strips FT_KIND_QP with no dispatch;
 		 * ft_qp_byte_get inlines the bitmap+ptr load.
 		 *
 		 * Absorbs the per-iter post-step bookkeeping (iter-path,
@@ -5357,10 +5357,10 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * handler resolves them (mode-aware).
 		 */
 		if (caa_likely(((unsigned long) node_flag & FT_KIND_MASK)
-				== FT_KIND_QP_HI)) {
+				== FT_KIND_QP)) {
 			struct cds_ft_qp16_node *qp =
 				(struct cds_ft_qp16_node *)
-				((unsigned long) node_flag - FT_KIND_QP_HI);
+				((unsigned long) node_flag - FT_KIND_QP);
 
 			iter_key = *(key++);
 			node_flag = ft_qp_byte_get(qp, NULL, iter_key,
@@ -14025,7 +14025,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			 * the raw lo pointer in hi.ptrs[hi_idx], not at
 			 * @node_flag.  PIGEON children are unchanged.
 			 */
-			if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_QP_HI) {
+			if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_QP) {
 				struct cds_ft_qp16_node *hi_n =
 					(struct cds_ft_qp16_node *) node;
 				uint16_t hi_bm = uatomic_load(&hi_n->bitmap,
@@ -14552,7 +14552,7 @@ void calc_stats_node(const struct cds_ft *ft __attribute__((unused)),
 	node_stats->distribution[metadata->nr_child]++;
 	stats->level[level].nr_internal_nodes++;
 	stats->level[level].has_nodes = true;
-	if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_QP_HI) {
+	if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_QP) {
 		stats->qp_hi_half_cls_dist[metadata->qp_subtree_half_cls]++;
 		stats->nr_qp_hi_total++;
 	}

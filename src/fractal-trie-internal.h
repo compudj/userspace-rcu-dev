@@ -39,7 +39,7 @@
  *                             struct cds_ft_node *.  Matches NULL.
  *   FT_KIND_COMPRESSED (0x1)  pointer to a struct cds_ft_compressed_node.
  *   FT_KIND_SKIP_EXT (0x2)    skip-compressed pointer; resolved target is EXT.
- *   FT_KIND_QP_HI (0x5)       QP-nibble node (hi or lo, all tiers);
+ *   FT_KIND_QP (0x5)       QP-nibble node (hi or lo, all tiers);
  *                             cds_ft_qp16_node *.  HI vs LO is recovered
  *                             from the lo-node's metadata is_lo bit
  *                             during the upward parent walk.
@@ -69,7 +69,7 @@ enum ft_kind {
 	FT_KIND_EXT		= 0x0,
 	FT_KIND_COMPRESSED	= 0x1,
 	FT_KIND_SKIP_EXT	= 0x2,
-	FT_KIND_QP_HI		= 0x5,
+	FT_KIND_QP		= 0x5,
 	FT_KIND_SKIP_QP		= 0x7,
 	FT_KIND_PIGEON		= 0x9,
 	FT_KIND_SKIP_PIGEON	= 0xB,
@@ -87,7 +87,7 @@ enum ft_kind {
 
 /*
  * FT_KIND_INTERNAL_BITS (bits 2-3): non-zero iff the kind is one of
- * the two internal types — FT_KIND_QP_HI (0x5) or FT_KIND_PIGEON
+ * the two internal types — FT_KIND_QP (0x5) or FT_KIND_PIGEON
  * (0x9).  Zero on EXT (0x0), COMPRESSED (0x1), SKIP_EXT (0x2).
  * Skip kinds SKIP_QP (0x7) and SKIP_PIGEON (0xB) also satisfy the
  * test — callers must filter skips upstream via
@@ -179,7 +179,7 @@ enum ft_kind {
 
 /*
  * ft_types[] internal-class slot count: T0..T3 (QP hi tiers) at
- * indices 0..3, PIGEON at index 4.  Lo-nodes share the FT_KIND_QP_HI
+ * indices 0..3, PIGEON at index 4.  Lo-nodes share the FT_KIND_QP
  * slot-tag with hi-nodes (HI/LO disambiguated via metadata is_lo bit
  * during the parent walk) and are never indexed into ft_types[].
  * NODE_INDEX_NULL is the one-past-the-end sentinel, used by recompact
@@ -421,7 +421,7 @@ struct cds_ft_metadata {
 	 *     PIGEON skip targets — validation falls back to the leaf-
 	 *     bytes compare.  Gated on FEATURE_FT_SKIP_COMPRESSED.
 	 *
-	 *   FT_KIND_QP_HI hi-node → qp_subtree_half_cls: total
+	 *   FT_KIND_QP hi-node → qp_subtree_half_cls: total
 	 *     half-cacheline (32 B) footprint of the hi+lo subtree
 	 *     rooted at this hi.  Used by the QP→PIGEON up-trigger:
 	 *     when the count exceeds PIGEON's flat footprint (64
