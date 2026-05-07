@@ -5353,29 +5353,21 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			continue;
 		}
 		/*
-		 * Compressed node at current position (e.g. compressed
-		 * root or compressed child from ft_node_get_nth).
-		 */
-		/*
-		 * Non-internal nodes at this position (compressed or
-		 * collapsed) need special handling.  Internal (bit 0
-		 * set) is the common case — skip directly to the
-		 * key dispatch below.
-		 */
-		/*
-		 * Skip-compressed pointer at loop top: handles skip
-		 * pointers returned by collapsed entry children or
-		 * by ft_node_get_nth in the previous iteration.
+		 * SKIP handler (2/5 in the flat dispatch sequence): after
+		 * QP_HI miss, a skip-compressed pointer is the next most
+		 * likely case (skip-tagged children produced by the
+		 * previous iter's QP_HI byte-step or by collapsed entries).
+		 * No caa_unlikely: at this point in the dispatch chain the
+		 * skip case is the second-most-frequent.
 		 *
 		 * Non-candidate: convert to compressed flag so the
-		 * compressed handler below processes it with full
-		 * key comparison.
+		 * compressed handler below processes it with full key
+		 * comparison.
 		 *
-		 * Candidate: resolve the skip (advance past the
-		 * compressed path without comparison).
+		 * Candidate: resolve the skip (advance past the compressed
+		 * path without comparison).
 		 */
-		if (skip_compressed &&
-		    caa_unlikely(ft_node_skip_compressed(node_flag))) {
+		if (skip_compressed && ft_node_skip_compressed(node_flag)) {
 			if (!descend_cand) {
 				node_flag = ft_compressed_node_flag(
 					ft_skip_to_compressed(node_flag));
@@ -5516,6 +5508,58 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				if (ft_node_external(node_flag))
 					break;
 			}
+		}
+		/*
+		 * PIGEON fast path (3/5 in the flat dispatch sequence):
+		 * rare on sparse workloads but a major case on dense ones
+		 * (post-QP→PIGEON escalation).  After QP_HI miss + SKIP
+		 * filtering, FT_KIND_PIGEON_FAMILY_BIT (bit 3) is unique
+		 * to FT_KIND_PIGEON (0x9): SKIP_PIGEON (0xB) is consumed
+		 * by the SKIP handler above (cand: resolved to PIGEON;
+		 * non-cand: rewritten to COMPRESSED), and FT_KIND_QP_LO
+		 * (0xD) never appears as a slot value.
+		 *
+		 * Constant-tag SUB strips FT_KIND_PIGEON; ft_pigeon_node_get_nth
+		 * inlines the data[n] load.  Same iter-path / mid-EXT /
+		 * track-prefix bookkeeping as QP_HI.
+		 */
+		if ((unsigned long) node_flag & FT_KIND_PIGEON_FAMILY_BIT) {
+			struct cds_ft_inode *node =
+				(struct cds_ft_inode *)
+				((unsigned long) node_flag - FT_KIND_PIGEON);
+
+			iter_key = *(key++);
+			node_flag = ft_pigeon_node_get_nth(NULL, node, NULL,
+					iter_key, FT_PF_DATA);
+			if (caa_unlikely(!node_flag)) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			if (iter) {
+				iter_path_node(iter)[i] = node_flag;
+				iter_path_len = i + 1;
+			}
+			if (caa_unlikely(ft_node_external(node_flag))
+			    && i < key_depth - 1) {
+				if (track) {
+					match_len = i;
+					match_node = (struct cds_ft_node *) node_flag;
+				}
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			if (track && caa_likely(ft_node_internal(node_flag))
+			    && i < key_depth - 1) {
+				struct cds_ft_metadata *metadata =
+					ft_flag_to_metadata_fast(node_flag);
+				struct cds_ft_node *external_nodes =
+					ft_dereference_prefetch_external(metadata->external_nodes);
+				if (external_nodes || track_longest) {
+					match_len = i;
+					match_node = external_nodes;
+				}
+			}
+			continue;
 		}
 		/*
 		 * Non-internal nodes need special handling.
