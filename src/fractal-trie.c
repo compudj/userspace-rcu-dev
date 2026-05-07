@@ -3811,16 +3811,12 @@ int ft_qp_byte_set(struct cds_ft *ft,
 }
 
 /*
- * ft_node_get_nth: get nth item from a node.
- * node_flag is already rcu_dereference'd.
- */
-
-static inline_lookup
-/*
  * ft_node_get_nth_skip: raw child slot access.  Returns the slot
- * value as-is, including skip-compressed pointers.  Used only by
- * candidate lookup which resolves skip pointers itself.
+ * value as-is, including skip-compressed pointers.  node_flag is
+ * already rcu_dereference'd.  Used only by candidate lookup which
+ * resolves skip pointers itself.
  */
+static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
@@ -5294,6 +5290,39 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	for (i = 1; i < key_depth; i++) {
 		uint8_t iter_key;
 
+		/*
+		 * QP_HI fast path: dominant case in spec_validated descent
+		 * (every byte-step that doesn't hit a skip pointer or a
+		 * leaf).  Gated on spec_validate (which implies !track,
+		 * descend_cand, skip_compressed, key_map.identity).
+		 *
+		 * Constant-tag SUB strips FT_KIND_QP_HI with no dispatch;
+		 * ft_qp_byte_get inlines the bitmap+ptr load.  The post-
+		 * byte-step result can be any kind: SKIP_*, EXT, COMPRESSED,
+		 * PIGEON — all routed by the layered handlers on the next
+		 * iteration's loop top, or (for tag != QP_HI on this
+		 * iter) by the layered handlers immediately.
+		 */
+		if (spec_validate &&
+		    caa_likely(((unsigned long) node_flag & FT_KIND_MASK)
+				== FT_KIND_QP_HI)) {
+			struct cds_ft_qp16_node *qp =
+				(struct cds_ft_qp16_node *)
+				((unsigned long) node_flag - FT_KIND_QP_HI);
+
+			iter_key = *(key++);
+			node_flag = ft_qp_byte_get(qp, NULL, iter_key,
+					FT_PF_DATA);
+			if (caa_unlikely(!node_flag)) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			if (iter) {
+				iter_path_node(iter)[i] = node_flag;
+				iter_path_len = i + 1;
+			}
+			continue;
+		}
 		/*
 		 * Compressed node at current position (e.g. compressed
 		 * root or compressed child from ft_node_get_nth).
