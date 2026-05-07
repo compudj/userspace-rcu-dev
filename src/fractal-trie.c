@@ -5485,7 +5485,17 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				}
 #endif
 				key += skip;
-				i += skip;
+				/*
+				 * i += skip - 1 (NOT skip): the for-loop's
+				 * i++ at end-of-iter brings the total advance
+				 * to `skip`, matching `key += skip`.  Preserves
+				 * the descent loop invariant `i - 1 == bytes
+				 * consumed` after the byte-step block was
+				 * eliminated; the resolved skip target is now
+				 * dispatched by next iter's loop-top fast paths
+				 * (QP_HI / PIGEON / EXT / COMPRESSED).
+				 */
+				i += skip - 1;
 				node_flag = ft_skip_child_ptr(node_flag);
 				if (iter) {
 					iter_path_node(iter)[i] = node_flag;
@@ -5512,12 +5522,12 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				}
 #endif
 				/*
-				 * If the skip's child is external and
-				 * we've consumed the full key, exit the
-				 * loop to the terminal check below.
+				 * Resolved kind (QP_HI / PIGEON / COMPRESSED /
+				 * EXT) is dispatched by the next iter's loop-top
+				 * fast paths.  EXT (from non-spec_validate cand
+				 * SKIP_EXT) is caught by the EXT direct test
+				 * which breaks to the terminal handler.
 				 */
-				if (ft_node_external(node_flag))
-					break;
 			}
 		}
 		/*
@@ -5561,12 +5571,11 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			break;
 		/*
 		 * COMPRESSED handler (5/5 in the flat dispatch sequence):
-		 * residual after QP_HI / SKIP / PIGEON / EXT.  Among the
-		 * kinds that can still reach here (EXT, COMPRESSED, QP_HI
-		 * from SKIP cand fall-through), EXT was caught above.
-		 * COMPRESSED has bit 0 set; QP_HI also has bit 0 set, so
-		 * the residual still needs disambiguation — assert it's
-		 * COMPRESSED before dispatching.
+		 * residual after QP_HI / SKIP / PIGEON / EXT.  Reachable
+		 * for COMPRESSED slots (chain-compress middles, including
+		 * non-cand SKIP fall-through that converted SKIP_* → COMPRESSED)
+		 * and as harmless no-op for QP_HI from cand SKIP fall-through
+		 * (continues to next iter where QP_HI fast path catches).
 		 */
 		assert(((unsigned long) node_flag & FT_KIND_SKIP_BIT) == 0);
 		if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_COMPRESSED) {
@@ -5587,139 +5596,6 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			continue;
 		}
 
-		iter_key = *(key++);
-		if (descend_cand)
-			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_DATA);
-		else if (!skip_compressed)
-			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_DATA);
-		else
-			node_flag = ft_node_get_nth(node_flag, NULL, iter_key, FT_PF_NONE);
-		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
-				(unsigned int) iter_key, node_flag);
-		/*
-		 * "Not found" iff the slot is NULL: ft_node_get_nth*
-		 * returns NULL when the parent isn't internal, and an
-		 * empty slot is stored as NULL.  All valid pointers
-		 * (any tag) carry a non-zero underlying address, so the
-		 * full ft_node_ptr() unmasking would always answer the
-		 * same as a plain NULL check, at the cost of the (v & 1)
-		 * branch in the per-step dependency chain.
-		 */
-		if (!node_flag) {
-			status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
-		}
-		/*
-		 * Skip-compressed pointer from child slot.
-		 *
-		 * Non-candidate: convert to compressed flag and
-		 * continue so the compressed handler at the loop
-		 * top processes it (key comparison, external_nodes
-		 * check, etc.).
-		 *
-		 * Candidate: resolve the skip (advance past the
-		 * compressed path without comparison).
-		 */
-		if (skip_compressed && caa_unlikely(ft_node_skip_compressed(node_flag))) {
-			if (!descend_cand) {
-				node_flag = ft_compressed_node_flag(
-					ft_skip_to_compressed(node_flag));
-				continue;
-			}
-			{
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-				unsigned long skip_kind =
-					(unsigned long) node_flag & FT_KIND_MASK;
-				/*
-				 * SKIP_EXT fast path — see the loop-top
-				 * mirror site for the rationale.  Skip the
-				 * ext->prev → cn->len chain entirely; iter
-				 * path slot is filled at depth key_len; the
-				 * end-of-descent leaf-bytes compare runs
-				 * over [first_skip_offset, key_len).
-				 */
-				if (caa_likely(spec_validate &&
-				    skip_kind == FT_KIND_SKIP_EXT)) {
-					if (first_skip_offset == key_len)
-						first_skip_offset = i;
-					needs_leaf_validate = true;
-					node_flag = ft_skip_child_ptr(node_flag);
-					if (iter) {
-						iter_path_node(iter)[key_len] = node_flag;
-						iter_path_len = key_len + 1;
-					}
-					if (node_flag)
-						__builtin_prefetch(
-							(const uint8_t *) ft_node_ptr(node_flag) +
-							ft->group->speculative_key_offset +
-							first_skip_offset);
-					/*
-					 * Break out of the descent for-loop;
-					 * skips the trailing iter_path/external-
-					 * child checks (we already populated iter
-					 * at depth key_len) and falls into the
-					 * terminal-node check below.
-					 */
-					break;
-				}
-#endif
-				unsigned int skip = ft_skip_len(node_flag);
-				int remaining = key_depth - 1 - i;
-
-				if ((int) skip > remaining) {
-					status = CDS_FT_STATUS_NOT_FOUND;
-					goto end;
-				}
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-				/*
-				 * Speculative-validated only.  See the
-				 * loop-top mirror site for the contract:
-				 * QP skip ≤ 5 → immediate inline check;
-				 * other skips (PIGEON, QP with skip_len > 5)
-				 * → defer to leaf compare.  SKIP_EXT is
-				 * handled by the fast path above.
-				 */
-				if (spec_validate) {
-					if (skip_kind == FT_KIND_SKIP_QP &&
-					    skip <= FT_QP16_SUBKEY_INLINE_LEN) {
-						const struct cds_ft_qp16_node *qp =
-							(const struct cds_ft_qp16_node *)
-							/* SUB: tag known to be FT_KIND_SKIP_QP. */
-							((unsigned long) node_flag - FT_KIND_SKIP_QP);
-
-						if (caa_unlikely(ft_key_cmp_ordinals(
-								key, qp->subkey,
-								skip, skip,
-								false, NULL) != 0)) {
-							status = CDS_FT_STATUS_NOT_FOUND;
-							goto end;
-						}
-					} else {
-						if (first_skip_offset == key_len)
-							first_skip_offset = i;
-						needs_leaf_validate = true;
-					}
-				}
-#endif
-				key += skip;
-				i += skip;
-				node_flag = ft_skip_child_ptr(node_flag);
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-				if (node_flag) {
-					if (caa_likely(!ft_node_external(node_flag))) {
-						__builtin_prefetch(
-							ft_node_ptr(node_flag));
-					} else if (needs_leaf_validate) {
-						__builtin_prefetch(
-							(const uint8_t *) ft_node_ptr(node_flag) +
-							ft->group->speculative_key_offset +
-							first_skip_offset);
-					}
-				}
-#endif
-			}
-		}
-		FT_BYTE_STEP_POST();
 	}
 #undef FT_BYTE_STEP_POST
 
