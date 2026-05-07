@@ -1186,25 +1186,21 @@ static inline struct cds_ft_inode_flag *ft_qp16_lo_flag(
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
-	unsigned long v = (unsigned long) node;
-
 	/*
-	 * After Stage D, every tagged kind (COMPRESSED, QP_HI, PIGEON,
-	 * QP_LO) has bit 0 set; only EXT (0x0) has bit 0 clear.  All
-	 * tagged kinds use the low 4 bits as their tag, so ~15UL is
-	 * the universal strip mask on the tagged branch.  EXT is
-	 * already 8-byte aligned (no tag) so the result is unchanged
-	 * by either mask, but ~7UL keeps the cleanest semantics for
-	 * the bit-0-clear branch.
+	 * Single mask, no bit-0 dispatch: every kind carries a 4-bit
+	 * tag in the low nibble, and every underlying pointer is
+	 * 16B-aligned — FT_ALLOC_ORDER_MIN guarantees this for
+	 * arena-allocated nodes, and external nodes (struct cds_ft_node)
+	 * carry __aligned__(16) per include/urcu/fractal-trie.h.
+	 * Stripping low 4 bits is therefore safe for every input
+	 * including EXT, SKIP_EXT, and NULL.
 	 *
 	 * No high-bit strip: Phase B.4 retired the legacy skip-length
 	 * encoding (high bits), so skip pointers leave them clear.
 	 * The dependent next-level load can issue one cycle earlier
 	 * per descent step.
 	 */
-	unsigned long mask = (v & 1) ? ~15UL : ~7UL;
-
-	return (struct cds_ft_inode *) (v & mask);
+	return (struct cds_ft_inode *) ((unsigned long) node & ~15UL);
 }
 
 /*
@@ -5474,7 +5470,15 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 *   or collapsed handler output
 		 */
 		if (caa_unlikely(!ft_node_internal(node_flag))) {
-			if (ft_node_compressed(node_flag)) {
+			/*
+				 * !internal && !skip (skips routed above) leaves
+			 * node_flag in {EXT (0x0), COMPRESSED (0x1)};
+			 * bit 0 distinguishes them.  TEST + JNZ — saves
+			 * the CMP that the general ft_node_compressed
+			 * predicate emits.
+			 */
+			assert(((unsigned long) node_flag & FT_KIND_SKIP_BIT) == 0);
+			if ((unsigned long) node_flag & 0x1UL) {
 				enum ft_descent_action act;
 
 				i--;
