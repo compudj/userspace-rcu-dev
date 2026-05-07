@@ -39,22 +39,24 @@
  *                             struct cds_ft_node *.  Matches NULL.
  *   FT_KIND_COMPRESSED (0x1)  pointer to a struct cds_ft_compressed_node.
  *   FT_KIND_SKIP_EXT (0x2)    skip-compressed pointer; resolved target is EXT.
- *   FT_KIND_SKIP_QP (0x3)     skip-compressed pointer; resolved target is QP_HI.
  *   FT_KIND_QP_HI (0x5)       QP-nibble hi-node (all tiers); cds_ft_qp16_node *.
+ *   FT_KIND_SKIP_QP (0x7)     skip-compressed pointer; resolved target is QP_HI.
  *   FT_KIND_PIGEON (0x9)      pigeon (dense 256-pointer) node; cds_ft_inode *.
  *   FT_KIND_SKIP_PIGEON (0xB) skip-compressed pointer; resolved target is PIGEON.
  *   FT_KIND_QP_LO (0xD)       QP-nibble lo-node (all tiers); cds_ft_qp16_node *.
  *
- * Reserved (assert-on-encode): 0x4, 0x6, 0x7, 0x8, 0xA, 0xC, 0xE, 0xF.
+ * Reserved (assert-on-encode): 0x3, 0x4, 0x6, 0x8, 0xA, 0xC, 0xE, 0xF.
  *
  * Bit-pattern rationale:
  *   - bit 0 separates the two NULL-equivalent kinds (EXT, SKIP_EXT)
  *     from everything else (clear → ext-or-null fast path).
- *   - bit 1 is the universal "is skip-compressed" predicate; SKIP_EXT
- *     (0x2) is the asymmetry where bit 0 is clear because the
- *     resolved target is external.
+ *   - bit 1 is the universal "is skip-compressed" predicate; setting
+ *     bit 1 on a child kind tag yields the matching SKIP_* tag
+ *     (skip = child | 0x2; child = skip - 0x2).  This single-bit
+ *     toggle replaces the dispatch switch on the lookup fast path.
  *   - bits 2..3 encode the resolved class (00 = ext/compressed, 01 =
- *     qp_hi, 10 = pigeon, 11 = qp_lo).
+ *     qp_hi, 10 = pigeon, 11 = qp_lo); skip and child for the same
+ *     class share these bits.
  *
  * All allocations are >= 16-byte aligned (FT_ALLOC_ORDER_MIN = 4) so
  * the low 4 bits are guaranteed zero in raw addresses.  External
@@ -65,12 +67,34 @@ enum ft_kind {
 	FT_KIND_EXT		= 0x0,
 	FT_KIND_COMPRESSED	= 0x1,
 	FT_KIND_SKIP_EXT	= 0x2,
-	FT_KIND_SKIP_QP		= 0x3,
 	FT_KIND_QP_HI		= 0x5,
+	FT_KIND_SKIP_QP		= 0x7,
 	FT_KIND_PIGEON		= 0x9,
 	FT_KIND_SKIP_PIGEON	= 0xB,
 	FT_KIND_QP_LO		= 0xD,
 };
+
+#define FT_KIND_SKIP_BIT	0x2UL	/* skip = child | FT_KIND_SKIP_BIT */
+
+/*
+ * FT_KIND_PIGEON_FAMILY_BIT (bit 3): identifies PIGEON-class slots —
+ * set on FT_KIND_PIGEON (0x9) and FT_KIND_SKIP_PIGEON (0xB), clear
+ * on every kind that can appear as a child slot (EXT, COMPRESSED,
+ * SKIP_EXT, QP_HI, SKIP_QP).  FT_KIND_QP_LO (0xD) also has the bit
+ * set but is never a slot value; the predicate is therefore exact
+ * for the slot domain.
+ */
+#define FT_KIND_PIGEON_FAMILY_BIT	0x8UL
+
+/*
+ * FT_KIND_INTERNAL_BITS (bits 2-3): non-zero iff the kind is one of
+ * the three internal types — FT_KIND_QP_HI (0x5), FT_KIND_PIGEON
+ * (0x9), FT_KIND_QP_LO (0xD).  Zero on EXT (0x0), COMPRESSED (0x1),
+ * SKIP_EXT (0x2).  Skip kinds SKIP_QP (0x7) and SKIP_PIGEON (0xB)
+ * also satisfy the test — callers must filter skips upstream via
+ * ft_node_skip_compressed (asserted by ft_node_internal).
+ */
+#define FT_KIND_INTERNAL_BITS	0xCUL
 
 #define FT_KIND_MASK		0xFUL
 #define FT_KIND_PTR_MASK	(~FT_KIND_MASK)

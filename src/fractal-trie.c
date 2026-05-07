@@ -1221,7 +1221,8 @@ struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
 	unsigned long v = (unsigned long) node;
 	unsigned long mask = ~15UL;
 
-	assert(((v & FT_KIND_MASK) >= FT_KIND_QP_HI) || node == NULL);
+	assert((((v & FT_KIND_MASK) >= FT_KIND_QP_HI) &&
+		!(v & FT_KIND_SKIP_BIT)) || node == NULL);
 	return (struct cds_ft_inode *) (v & mask);
 }
 
@@ -1235,13 +1236,18 @@ static inline_lookup
 bool ft_node_internal(struct cds_ft_inode_flag *node)
 {
 	/*
-	 * After Stage D, COMPRESSED has bit 0 set too — `node & 1` is
-	 * no longer sufficient.  Internal kinds are FT_KIND_QP_HI (0x5),
-	 * FT_KIND_PIGEON (0x9), FT_KIND_QP_LO (0xD); all share bits 2 or
-	 * 3 set.  COMPRESSED (0x1), EXT (0x0), and the future skip-target
-	 * tags (0x2, 0x3, 0xB) all have bits 2-3 clear.
+	 * Internal kinds are FT_KIND_QP_HI (0x5), FT_KIND_PIGEON (0x9),
+	 * FT_KIND_QP_LO (0xD).  All have FT_KIND_INTERNAL_BITS (bits 2-3)
+	 * non-zero; EXT (0x0), COMPRESSED (0x1), SKIP_EXT (0x2) all
+	 * have those bits zero.  Single AND + jnz, no CMP.
+	 *
+	 * Skip kinds SKIP_QP (0x7) and SKIP_PIGEON (0xB) also have these
+	 * bits non-zero; callers MUST resolve skip-compressed pointers
+	 * via ft_node_skip_compressed before consulting this predicate.
+	 * Asserted in debug; no runtime cost in -DNDEBUG.
 	 */
-	return ((unsigned long) node & FT_KIND_MASK) >= FT_KIND_QP_HI;
+	assert(((unsigned long) node & FT_KIND_SKIP_BIT) == 0);
+	return ((unsigned long) node & FT_KIND_INTERNAL_BITS) != 0;
 }
 
 /*
@@ -1290,8 +1296,17 @@ static inline_lookup
 struct cds_ft_compressed_node *ft_compressed_node_ptr(
 		struct cds_ft_inode_flag *node)
 {
+	/*
+	 * Inverse of ft_compressed_node_flag (which OR's in
+	 * FT_KIND_COMPRESSED).  Subtract the known constant tag rather
+	 * than masking — pointer arithmetic is recognized by the
+	 * prefetcher's stride detector as a linear offset, while a
+	 * mask confuses it.  Asserted in debug; release relies on the
+	 * caller's prior FT_KIND_COMPRESSED check.
+	 */
+	assert(((unsigned long) node & FT_KIND_MASK) == FT_KIND_COMPRESSED);
 	return (struct cds_ft_compressed_node *)
-		(((unsigned long) node) & FT_KIND_PTR_MASK);
+		((unsigned long) node - FT_KIND_COMPRESSED);
 }
 
 /* Skip-compressed pointer helpers. */
@@ -1301,15 +1316,13 @@ static inline
 bool ft_node_skip_compressed(struct cds_ft_inode_flag *node)
 {
 	/*
-	 * Bit 1 of the kind nibble is the universal "is skip-compressed"
+	 * FT_KIND_SKIP_BIT (bit 1) is the universal "is skip-compressed"
 	 * predicate: set on FT_KIND_SKIP_EXT (0x2), FT_KIND_SKIP_QP
-	 * (0x3), FT_KIND_SKIP_PIGEON (0xB); clear on every non-skip
+	 * (0x7), FT_KIND_SKIP_PIGEON (0xB); clear on every non-skip
 	 * kind (EXT 0x0, COMPRESSED 0x1, QP_HI 0x5, PIGEON 0x9, QP_LO
-	 * 0xD).  Cheaper than the high-bit length test (one AND, no
-	 * shift) and decoupled from the high-bit length encoding that
-	 * Phase B.3+ retires.
+	 * 0xD).  One AND on the lookup hot path.
 	 */
-	return ((unsigned long) node & 0x2UL) != 0;
+	return ((unsigned long) node & FT_KIND_SKIP_BIT) != 0;
 }
 
 /*
@@ -1340,64 +1353,80 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 
 	/*
 	 * Caller has already established that @node is a skip-compressed
-	 * kind (FT_KIND_SKIP_EXT 0x2, FT_KIND_SKIP_QP 0x3, or
+	 * kind (FT_KIND_SKIP_EXT 0x2, FT_KIND_SKIP_QP 0x7, or
 	 * FT_KIND_SKIP_PIGEON 0xB).
 	 */
 	assert(kind == FT_KIND_SKIP_EXT || kind == FT_KIND_SKIP_QP
 		|| kind == FT_KIND_SKIP_PIGEON);
-	if (caa_unlikely(kind == FT_KIND_SKIP_EXT))
-		return ft_skip_to_compressed(node)->len;
-	natural = (void *) (v & FT_KIND_PTR_MASK);
-	if (kind == FT_KIND_SKIP_QP)
+	/*
+	 * Branch order optimized for the lookup hot path: SKIP_QP is the
+	 * dominant input since the SKIP_EXT fast path in cds_ft_lookup
+	 * never reaches here.  SKIP_PIGEON is second (rare in practice).
+	 * SKIP_EXT falls through last and is only reached from off-hot-
+	 * path callers (verify / show_stats).
+	 *
+	 * SUB by the constant tag inside each branch: lets the prefetcher
+	 * recognize a constant-stride access and frees `kind` from being
+	 * held live across the load.
+	 */
+	if (caa_likely(kind == FT_KIND_SKIP_QP)) {
+		natural = (void *) (v - FT_KIND_SKIP_QP);
 		return ((const struct cds_ft_qp16_node *) natural)->skip_len;
-	/* FT_KIND_SKIP_PIGEON */
-	return cds_ft_item_to_metadata(natural)->pigeon_skip_len;
+	}
+	if (kind == FT_KIND_SKIP_PIGEON) {
+		natural = (void *) (v - FT_KIND_SKIP_PIGEON);
+		return cds_ft_item_to_metadata(natural)->pigeon_skip_len;
+	}
+	/* FT_KIND_SKIP_EXT — fall-through cold path. */
+	return ft_skip_to_compressed(node)->len;
 }
 
 /*
  * Map a child kind tag (FT_KIND_EXT / FT_KIND_QP_HI / FT_KIND_PIGEON)
  * to the corresponding skip-target kind tag (FT_KIND_SKIP_EXT /
- * FT_KIND_SKIP_QP / FT_KIND_SKIP_PIGEON).  Used by encoding /
- * decoding of skip-compressed pointers.
+ * FT_KIND_SKIP_QP / FT_KIND_SKIP_PIGEON).
+ *
+ * Skip-target kinds all have FT_KIND_SKIP_BIT (bit 1) set; the
+ * conversion is a single OR (or, equivalently, ADD 0x2 since bit 1
+ * is always clear in a child kind).  Asserted because the encoder
+ * never receives a non-resolvable kind.
  */
 static inline
 unsigned long ft_kind_to_skip_kind(unsigned long child_kind)
 {
-	switch (child_kind) {
-	case FT_KIND_EXT:    return FT_KIND_SKIP_EXT;
-	case FT_KIND_QP_HI:  return FT_KIND_SKIP_QP;
-	case FT_KIND_PIGEON: return FT_KIND_SKIP_PIGEON;
-	default:
-		assert(0);
-		__builtin_unreachable();
-	}
+	assert(child_kind == FT_KIND_EXT ||
+	       child_kind == FT_KIND_QP_HI ||
+	       child_kind == FT_KIND_PIGEON);
+	return child_kind | FT_KIND_SKIP_BIT;
 }
 
+/*
+ * Inverse of ft_kind_to_skip_kind: clear the skip bit to recover the
+ * child kind.  Single-instruction `skip - 0x2` (or `skip & ~0x2`).
+ */
 static inline
 unsigned long ft_skip_kind_to_child_kind(unsigned long skip_kind)
 {
-	switch (skip_kind) {
-	case FT_KIND_SKIP_EXT:    return FT_KIND_EXT;
-	case FT_KIND_SKIP_QP:     return FT_KIND_QP_HI;
-	case FT_KIND_SKIP_PIGEON: return FT_KIND_PIGEON;
-	default:
-		assert(0);
-		__builtin_unreachable();
-	}
+	assert(skip_kind == FT_KIND_SKIP_EXT ||
+	       skip_kind == FT_KIND_SKIP_QP ||
+	       skip_kind == FT_KIND_SKIP_PIGEON);
+	return skip_kind - FT_KIND_SKIP_BIT;
 }
 
 /*
  * ft_skip_child_ptr: extract the child tagged pointer from a skip
- * pointer.  Rewrites the skip-target tag (0x2/0x3/0xB) back into
- * the child's actual kind tag (0x0/0x5/0x9).
+ * pointer.  With the encoding skip = child | FT_KIND_SKIP_BIT, the
+ * child pointer is recovered by subtracting FT_KIND_SKIP_BIT (= 2)
+ * from the skip pointer's low nibble.  We use pointer subtraction
+ * rather than a mask-and-or because the prefetcher's stride detector
+ * treats SUB on an address as a natural linear offset, while a mask
+ * confuses the prediction.
  */
 static inline
 struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
 {
-	unsigned long v = (unsigned long) node;
-	unsigned long child_kind = ft_skip_kind_to_child_kind(v & FT_KIND_MASK);
-
-	return (struct cds_ft_inode_flag *) ((v & FT_KIND_PTR_MASK) | child_kind);
+	assert(((unsigned long) node & FT_KIND_SKIP_BIT) != 0);
+	return (struct cds_ft_inode_flag *) ((unsigned long) node - FT_KIND_SKIP_BIT);
 }
 
 /*
@@ -2410,7 +2439,7 @@ void ft_prefetch_child_meta(const void *ptr)
 		return;
 	}
 	{
-		void *node = (void *) (v & FT_KIND_PTR_MASK);
+		void *node = (void *) (v - kind);	/* SUB: kind register-resident */
 
 		__builtin_prefetch(cds_ft_item_to_metadata(node));
 	}
@@ -2434,16 +2463,17 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 		return;
 	}
 	{
-		void *node = (void *) (v & FT_KIND_PTR_MASK);
+		void *node = (void *) (v - kind);	/* SUB: kind register-resident */
 		size_t order = cds_ft_item_order(node);
 
 		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
 		/*
-		 * PIGEON is the only internal kind with a co-allocated
-		 * bitmap (ft_types[4].bitmap == FT_BITMAP); QP_HI / QP_LO
-		 * pack their nibble bitmap into the qp16_node header.
+		 * PIGEON-family (0x9, 0xB) is the only kind with a co-
+		 * allocated bitmap.  Single bit test: FT_KIND_PIGEON_FAMILY_BIT
+		 * is set on PIGEON and SKIP_PIGEON, clear on the QP family
+		 * that can appear as a slot.  One AND + jnz, no CMP.
 		 */
-		if (kind == FT_KIND_PIGEON)
+		if (kind & FT_KIND_PIGEON_FAMILY_BIT)
 			__builtin_prefetch(cds_ft_item_to_bitmap(node, order));
 	}
 }
@@ -3800,32 +3830,41 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		uint8_t n, enum ft_pf_target pf_hint)
 {
 	unsigned long tag = (unsigned long) node_flag & FT_KIND_MASK;
-	struct cds_ft_inode *node;
 
 	/*
 	 * Non-internal kinds (FT_KIND_EXT = 0, FT_KIND_COMPRESSED = 1,
-	 * future skip-target tags 0x2/0x3 = 2/3, reserved 0x4): no
-	 * byte-step descent.  Tags >= FT_KIND_QP_HI are the internal
-	 * dispatch targets.
+	 * FT_KIND_SKIP_EXT = 2, FT_KIND_SKIP_QP = 7, FT_KIND_SKIP_PIGEON
+	 * = 0xB) have no byte-step descent; reject and return NULL.  In
+	 * normal descent, callers route skip pointers through the skip
+	 * handler before reaching here, so this filter is just a safety
+	 * net.  Catches all skip kinds via FT_KIND_SKIP_BIT (bit 1).
 	 */
-	if (caa_unlikely(tag < FT_KIND_QP_HI)) {
+	if (caa_unlikely(tag < FT_KIND_QP_HI || (tag & FT_KIND_SKIP_BIT))) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
 		return NULL;
 	}
 
-	node = ft_node_ptr_internal(node_flag);
-
 	/*
 	 * Internal dispatch: FT_KIND_QP_HI (0x5) routes to QP byte-step;
 	 * FT_KIND_PIGEON (0x9) routes to PIGEON; FT_KIND_QP_LO (0xD) is
 	 * not a slot value and never reaches this function.
+	 *
+	 * Untag with a constant SUB inside each branch (rather than a
+	 * shared mask via ft_node_ptr_internal): the SUB has no
+	 * dependency on `tag`, lets the address compute issue one cycle
+	 * earlier, and the prefetcher's stride detector treats the
+	 * result as a linear pointer offset.
 	 */
 	if (caa_likely(tag == FT_KIND_QP_HI))
 		return ft_qp_byte_get(
-				(struct cds_ft_qp16_node *) node,
+				(struct cds_ft_qp16_node *)
+				((unsigned long) node_flag - FT_KIND_QP_HI),
 				node_flag_ptr, n, pf_hint);
-	return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
+	return ft_pigeon_node_get_nth(NULL,
+			(struct cds_ft_inode *)
+			((unsigned long) node_flag - FT_KIND_PIGEON),
+			node_flag_ptr, n, pf_hint);
 }
 
 /*
@@ -4955,7 +4994,8 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 		struct cds_ft_node **found_ret,
 		enum cds_ft_status *status_ret,
 		bool candidate,
-		bool *needs_leaf_validate)
+		bool *needs_leaf_validate,
+		size_t *first_skip_offset_p)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	const uint8_t *key = *key_p;
@@ -5006,6 +5046,17 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 		}
 	} else if (needs_leaf_validate) {
 		*needs_leaf_validate = true;
+		/*
+		 * Anchor first_skip_offset at the depth of this cn-handler
+		 * step.  In spec_validate mode this path runs with the
+		 * compare suppressed, so cn->key_bytes are trusted-but-
+		 * unvalidated — same status as SKIP_* bytes.
+		 */
+		if (first_skip_offset_p) {
+			size_t cur = *i_p;
+			if (*first_skip_offset_p > cur)
+				*first_skip_offset_p = cur;
+		}
 	}
 	if (cn->len > remaining_key) {
 		struct cds_ft_metadata *cn_meta =
@@ -5181,6 +5232,22 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	 * step takes the inline path, the leaf load is avoided.
 	 */
 	bool needs_leaf_validate = false;
+	/*
+	 * first_skip_offset: byte position of the first deferred-validate
+	 * skip during descent.  Bytes before this offset were validated
+	 * implicitly by the descent (QP/PIGEON byte-steps consume one
+	 * byte each; FT_KIND_COMPRESSED steps validate cn->len bytes
+	 * inline; SKIP_QP with skip_len ≤ 5 validates against the inline
+	 * subkey).  Bytes at and after this offset may include trusted-
+	 * but-unvalidated bytes from one or more deferred skip steps.
+	 *
+	 * Sentinel: key_len means "no deferred skip yet" — the end-of-
+	 * descent leaf-bytes compare runs over [first_skip_offset, key_len)
+	 * which collapses to an empty range when needs_leaf_validate is
+	 * also false (no deferred skip happened).  Guarded with key_len > 0
+	 * downstream.
+	 */
+	size_t first_skip_offset;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
@@ -5189,6 +5256,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		goto end;
 	}
 	key_depth = key_len + 1;
+	first_skip_offset = key_len;	/* sentinel: no deferred skip yet */
 	node_flag = ft_dereference_prefetch(ft->root);
 
 	if (iter) {
@@ -5261,6 +5329,57 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				unsigned long skip_kind =
 					(unsigned long) node_flag & FT_KIND_MASK;
+				/*
+				 * SKIP_EXT fast path: target is a leaf, so
+				 * the descent is about to terminate anyway.
+				 * Don't recover skip_len (would force an
+				 * extra CL load via ext->prev → cn->len);
+				 * don't advance key/i (dead, the loop breaks
+				 * on ft_node_external next iter); the end-of-
+				 * descent leaf-bytes compare validates the
+				 * full key, including any bytes covered by
+				 * this skip.
+				 *
+				 * Length mismatch (input shorter than leaf
+				 * key) is caught by the leaf compare's
+				 * length check; the CDS_FT_STATUS_NOT_FOUND
+				 * early-exit on `skip > remaining` is purely
+				 * a perf optimization for doomed lookups.
+				 */
+				if (caa_likely(spec_validate &&
+				    skip_kind == FT_KIND_SKIP_EXT)) {
+					if (first_skip_offset == key_len)
+						first_skip_offset = i;
+					needs_leaf_validate = true;
+					node_flag = ft_skip_child_ptr(node_flag);
+					if (iter) {
+						/*
+						 * Iter path: leaf sits at
+						 * depth key_len for an OK
+						 * lookup.  If status ends
+						 * up NOT_FOUND, path_valid
+						 * is cleared at end so this
+						 * value is moot.
+						 */
+						iter_path_node(iter)[key_len] = node_flag;
+						iter_path_len = key_len + 1;
+					}
+					if (node_flag)
+						/*
+						 * After ft_skip_child_ptr(SKIP_EXT),
+						 * node_flag has tag 0 (FT_KIND_EXT)
+						 * and the external node is 16B-
+						 * aligned, so the low nibble is
+						 * already 0 — skip ft_node_ptr's
+						 * tag-strip dispatch and cast
+						 * directly.
+						 */
+						__builtin_prefetch(
+							(const uint8_t *) node_flag +
+							ft->group->speculative_key_offset +
+							first_skip_offset);
+					break;
+				}
 #endif
 				unsigned int skip = ft_skip_len(node_flag);
 				int remaining = key_depth - 1 - i;
@@ -5276,9 +5395,11 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				 * immediately against the inline subkey on
 				 * the QP node header CL (already loaded by
 				 * the descent that brought us here).  Other
-				 * cases (PIGEON, EXT, QP with skip_len > 5)
+				 * cases (PIGEON, QP with skip_len > 5)
 				 * defer to the end-of-descent leaf-bytes
-				 * compare via needs_leaf_validate.
+				 * compare via needs_leaf_validate.  The
+				 * SKIP_EXT case is handled by the fast path
+				 * above and never reaches here.
 				 *
 				 * Pure candidate mode (caller-validated)
 				 * leaves the skip unchecked here and lets
@@ -5289,7 +5410,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					    skip <= FT_QP16_SUBKEY_INLINE_LEN) {
 						const struct cds_ft_qp16_node *qp =
 							(const struct cds_ft_qp16_node *)
-							((unsigned long) node_flag & FT_KIND_PTR_MASK);
+							/* SUB: tag known to be FT_KIND_SKIP_QP. */
+							((unsigned long) node_flag - FT_KIND_SKIP_QP);
 
 						if (caa_unlikely(ft_key_cmp_ordinals(
 								key, qp->subkey,
@@ -5299,6 +5421,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 							goto end;
 						}
 					} else {
+						if (first_skip_offset == key_len)
+							first_skip_offset = i;
 						needs_leaf_validate = true;
 					}
 				}
@@ -5325,7 +5449,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					} else if (needs_leaf_validate) {
 						__builtin_prefetch(
 							(const uint8_t *) ft_node_ptr(node_flag) +
-							ft->group->speculative_key_offset);
+							ft->group->speculative_key_offset +
+							first_skip_offset);
 					}
 				}
 #endif
@@ -5358,7 +5483,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					track, track_longest,
 					&match_len, &match_node, &found, &status,
 					descend_cand,
-					spec_validate ? &needs_leaf_validate : NULL);
+					spec_validate ? &needs_leaf_validate : NULL,
+					spec_validate ? &first_skip_offset : NULL);
 				if (act == FT_DESCENT_END)
 					goto end;
 				if (act == FT_DESCENT_BREAK)
@@ -5420,6 +5546,38 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				unsigned long skip_kind =
 					(unsigned long) node_flag & FT_KIND_MASK;
+				/*
+				 * SKIP_EXT fast path — see the loop-top
+				 * mirror site for the rationale.  Skip the
+				 * ext->prev → cn->len chain entirely; iter
+				 * path slot is filled at depth key_len; the
+				 * end-of-descent leaf-bytes compare runs
+				 * over [first_skip_offset, key_len).
+				 */
+				if (caa_likely(spec_validate &&
+				    skip_kind == FT_KIND_SKIP_EXT)) {
+					if (first_skip_offset == key_len)
+						first_skip_offset = i;
+					needs_leaf_validate = true;
+					node_flag = ft_skip_child_ptr(node_flag);
+					if (iter) {
+						iter_path_node(iter)[key_len] = node_flag;
+						iter_path_len = key_len + 1;
+					}
+					if (node_flag)
+						__builtin_prefetch(
+							(const uint8_t *) ft_node_ptr(node_flag) +
+							ft->group->speculative_key_offset +
+							first_skip_offset);
+					/*
+					 * Break out of the descent for-loop;
+					 * skips the trailing iter_path/external-
+					 * child checks (we already populated iter
+					 * at depth key_len) and falls into the
+					 * terminal-node check below.
+					 */
+					break;
+				}
 #endif
 				unsigned int skip = ft_skip_len(node_flag);
 				int remaining = key_depth - 1 - i;
@@ -5433,14 +5591,17 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				 * Speculative-validated only.  See the
 				 * loop-top mirror site for the contract:
 				 * QP skip ≤ 5 → immediate inline check;
-				 * other skips → defer to leaf compare.
+				 * other skips (PIGEON, QP with skip_len > 5)
+				 * → defer to leaf compare.  SKIP_EXT is
+				 * handled by the fast path above.
 				 */
 				if (spec_validate) {
 					if (skip_kind == FT_KIND_SKIP_QP &&
 					    skip <= FT_QP16_SUBKEY_INLINE_LEN) {
 						const struct cds_ft_qp16_node *qp =
 							(const struct cds_ft_qp16_node *)
-							((unsigned long) node_flag & FT_KIND_PTR_MASK);
+							/* SUB: tag known to be FT_KIND_SKIP_QP. */
+							((unsigned long) node_flag - FT_KIND_SKIP_QP);
 
 						if (caa_unlikely(ft_key_cmp_ordinals(
 								key, qp->subkey,
@@ -5450,6 +5611,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 							goto end;
 						}
 					} else {
+						if (first_skip_offset == key_len)
+							first_skip_offset = i;
 						needs_leaf_validate = true;
 					}
 				}
@@ -5465,7 +5628,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					} else if (needs_leaf_validate) {
 						__builtin_prefetch(
 							(const uint8_t *) ft_node_ptr(node_flag) +
-							ft->group->speculative_key_offset);
+							ft->group->speculative_key_offset +
+							first_skip_offset);
 					}
 				}
 #endif
@@ -5557,18 +5721,67 @@ end:
 	 * matched inline, the leaf load is skipped entirely.
 	 */
 	if (spec_validate && needs_leaf_validate
-	    && status == CDS_FT_STATUS_OK && found && key_len > 0) {
+	    && status == CDS_FT_STATUS_OK && found
+	    && first_skip_offset < key_len) {
 		const uint8_t *leaf_key = (const uint8_t *) found +
 				ft->group->speculative_key_offset;
+		size_t cmp_len = key_len - first_skip_offset;
 
-		if (ft_key_cmp_ordinals(orig_key, leaf_key,
-				(unsigned int) key_len,
-				(unsigned int) key_len,
+		/*
+		 * For variable-length groups, also verify the leaf's
+		 * stored key length matches the input key length.  This
+		 * catches the input-shorter-than-leaf case that the
+		 * SKIP_EXT fast path no longer detects via the descent
+		 * bounds check (skip_len > remaining).  For fixed-length
+		 * groups, length match is implicit.
+		 */
+		if (ft->group->speculative_key_len_offset !=
+				CDS_FT_SPECULATIVE_OFFSET_NONE) {
+			size_t stored_len = *(const size_t *)
+				((const uint8_t *) found +
+				 ft->group->speculative_key_len_offset);
+
+			if (caa_unlikely(stored_len != key_len)) {
+				found = NULL;
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto specv_done;
+			}
+		}
+		/*
+		 * Compare only [first_skip_offset, key_len): bytes before
+		 * first_skip_offset were validated implicitly by descent
+		 * (QP/PIGEON byte-steps each consume one byte; FT_KIND_-
+		 * COMPRESSED steps validate cn->len bytes inline; SKIP_QP
+		 * with skip_len ≤ 5 validates inline against qp->subkey).
+		 * Bytes at and after first_skip_offset may include trusted-
+		 * but-unvalidated bytes from one or more deferred skips.
+		 *
+		 * Short-tail widening: if cmp_len < 8 but key_len >= 8,
+		 * extend the compare to 8 bytes anchored at (key_len - 8).
+		 * The leading "extra" bytes [key_len - 8, first_skip_offset)
+		 * were already validated by descent, so they match by
+		 * construction; widening costs nothing semantically and
+		 * collapses ft_key_cmp_ordinals' length dispatch to the
+		 * 8-byte word path (single unaligned 64-bit load + cmp).
+		 * spec_validate requires km.identity, so raw-byte unaligned
+		 * access is correct.
+		 */
+		size_t cmp_off = first_skip_offset;
+
+		if (cmp_len < 8 && key_len >= 8) {
+			cmp_off = key_len - 8;
+			cmp_len = 8;
+		}
+		if (ft_key_cmp_ordinals(orig_key + cmp_off,
+				leaf_key + cmp_off,
+				(unsigned int) cmp_len,
+				(unsigned int) cmp_len,
 				false, NULL) != 0) {
 			found = NULL;
 			status = CDS_FT_STATUS_NOT_FOUND;
 		}
 	}
+specv_done:
 	if (result_node)
 		*result_node = found;
 	if (iter) {
