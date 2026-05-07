@@ -5291,20 +5291,19 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		uint8_t iter_key;
 
 		/*
-		 * QP_HI fast path: dominant case in spec_validated descent
-		 * (every byte-step that doesn't hit a skip pointer or a
-		 * leaf).  Gated on spec_validate (which implies !track,
-		 * descend_cand, skip_compressed, key_map.identity).
-		 *
+		 * QP_HI fast path (1/5 in the flat dispatch sequence): the
+		 * dominant byte-step in spec_validate descent and a major
+		 * case in candidate / track / exact-lookup descent too.
 		 * Constant-tag SUB strips FT_KIND_QP_HI with no dispatch;
-		 * ft_qp_byte_get inlines the bitmap+ptr load.  The post-
-		 * byte-step result can be any kind: SKIP_*, EXT, COMPRESSED,
-		 * PIGEON — all routed by the layered handlers on the next
-		 * iteration's loop top, or (for tag != QP_HI on this
-		 * iter) by the layered handlers immediately.
+		 * ft_qp_byte_get inlines the bitmap+ptr load.
+		 *
+		 * Absorbs the per-iter post-step bookkeeping (iter-path,
+		 * mid-descent EXT detection, track prefix tracking) so all
+		 * modes share this path.  Skip-compressed children produced
+		 * by ft_qp_byte_get stay tagged here; the next iter's SKIP
+		 * handler resolves them (mode-aware).
 		 */
-		if (spec_validate &&
-		    caa_likely(((unsigned long) node_flag & FT_KIND_MASK)
+		if (caa_likely(((unsigned long) node_flag & FT_KIND_MASK)
 				== FT_KIND_QP_HI)) {
 			struct cds_ft_qp16_node *qp =
 				(struct cds_ft_qp16_node *)
@@ -5320,6 +5319,36 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			if (iter) {
 				iter_path_node(iter)[i] = node_flag;
 				iter_path_len = i + 1;
+			}
+			/*
+			 * Mid-descent EXT: input key extends past a leaf
+			 * → NOT_FOUND.  Same semantics as the post-step
+			 * EXT check that the legacy path does after
+			 * ft_node_get_nth_skip.
+			 */
+			if (caa_unlikely(ft_node_external(node_flag))
+			    && i < key_depth - 1) {
+				if (track) {
+					match_len = i;
+					match_node = (struct cds_ft_node *) node_flag;
+				}
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			/*
+			 * Track-mode prefix tracking on internal hops.
+			 * Compiles out for track=false.
+			 */
+			if (track && caa_likely(ft_node_internal(node_flag))
+			    && i < key_depth - 1) {
+				struct cds_ft_metadata *metadata =
+					ft_flag_to_metadata_fast(node_flag);
+				struct cds_ft_node *external_nodes =
+					ft_dereference_prefetch_external(metadata->external_nodes);
+				if (external_nodes || track_longest) {
+					match_len = i;
+					match_node = external_nodes;
+				}
 			}
 			continue;
 		}
