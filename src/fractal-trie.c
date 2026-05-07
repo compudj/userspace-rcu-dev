@@ -5562,51 +5562,41 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			continue;
 		}
 		/*
-		 * Non-internal nodes need special handling.
-		 * Internal (bit 0 set) is the common case.
-		 *
-		 * This single check handles both:
-		 * - compressed/collapsed from previous iteration's
-		 *   get_nth result
-		 * - compressed/collapsed/external from compressed
-		 *   or collapsed handler output
+		 * EXT terminal (4/5 in the flat dispatch sequence): an
+		 * external child at loop top means the key terminates at
+		 * a compressed path end (e.g. a compressed node's cn->child
+		 * is EXT, surfaced in node_flag by the COMPRESSED handler
+		 * below in a previous iter).  Break to the post-loop
+		 * terminal handler.
 		 */
-		if (caa_unlikely(!ft_node_internal(node_flag))) {
-			/*
-				 * !internal && !skip (skips routed above) leaves
-			 * node_flag in {EXT (0x0), COMPRESSED (0x1)};
-			 * bit 0 distinguishes them.  TEST + JNZ — saves
-			 * the CMP that the general ft_node_compressed
-			 * predicate emits.
-			 */
-			assert(((unsigned long) node_flag & FT_KIND_SKIP_BIT) == 0);
-			if ((unsigned long) node_flag & 0x1UL) {
-				enum ft_descent_action act;
+		if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_EXT)
+			break;
+		/*
+		 * COMPRESSED handler (5/5 in the flat dispatch sequence):
+		 * residual after QP_HI / SKIP / PIGEON / EXT.  Among the
+		 * kinds that can still reach here (EXT, COMPRESSED, QP_HI
+		 * from SKIP cand fall-through), EXT was caught above.
+		 * COMPRESSED has bit 0 set; QP_HI also has bit 0 set, so
+		 * the residual still needs disambiguation — assert it's
+		 * COMPRESSED before dispatching.
+		 */
+		assert(((unsigned long) node_flag & FT_KIND_SKIP_BIT) == 0);
+		if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_COMPRESSED) {
+			enum ft_descent_action act;
 
-				i--;
-				act = ft_lookup_compressed(&node_flag, &key, &i,
-					key_depth, iter, &iter_path_len,
-					track, track_longest,
-					&match_len, &match_node, &found, &status,
-					descend_cand,
-					spec_validate ? &needs_leaf_validate : NULL,
-					spec_validate ? &first_skip_offset : NULL);
-				if (act == FT_DESCENT_END)
-					goto end;
-				if (act == FT_DESCENT_BREAK)
-					break;
-				continue;
-			}
-			/*
-			 * External or NULL at loop top.  Can happen when
-			 * a compressed node's cn->child is an external
-			 * node (key terminates at the compressed path
-			 * end).  Break to the post-loop terminal handler.
-			 */
-			if (ft_node_external(node_flag))
+			i--;
+			act = ft_lookup_compressed(&node_flag, &key, &i,
+				key_depth, iter, &iter_path_len,
+				track, track_longest,
+				&match_len, &match_node, &found, &status,
+				descend_cand,
+				spec_validate ? &needs_leaf_validate : NULL,
+				spec_validate ? &first_skip_offset : NULL);
+			if (act == FT_DESCENT_END)
+				goto end;
+			if (act == FT_DESCENT_BREAK)
 				break;
-			status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
+			continue;
 		}
 
 		iter_key = *(key++);
