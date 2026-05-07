@@ -5287,6 +5287,50 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		}
 	}
 
+	/*
+	 * Per-iter post-step bookkeeping shared by every byte-step fast
+	 * path (QP_HI, PIGEON, legacy ft_node_get_nth_skip tail).
+	 *
+	 * - Update iter_path[i] with the post-step node_flag (sparse:
+	 *   skip-elided depths are not filled).
+	 * - Mid-descent EXT detection: input key extends past a leaf →
+	 *   NOT_FOUND.  Goto end with status set; track callers also
+	 *   record the partial match.
+	 * - track-mode prefix tracking on internal hops: compiles out
+	 *   for track=false because track is a constant-folded literal
+	 *   at every do_cds_ft_lookup callsite.
+	 *
+	 * `goto end` from inside the macro keeps the early-exit flow
+	 * inline at each call site without requiring a returned status
+	 * flag.  Undef after the for-loop to keep the name local.
+	 */
+#define FT_BYTE_STEP_POST() do { \
+	if (iter) { \
+		iter_path_node(iter)[i] = node_flag; \
+		iter_path_len = i + 1; \
+	} \
+	if (caa_unlikely(ft_node_external(node_flag)) \
+	    && i < key_depth - 1) { \
+		if (track) { \
+			match_len = i; \
+			match_node = (struct cds_ft_node *) node_flag; \
+		} \
+		status = CDS_FT_STATUS_NOT_FOUND; \
+		goto end; \
+	} \
+	if (track && caa_likely(ft_node_internal(node_flag)) \
+	    && i < key_depth - 1) { \
+		struct cds_ft_metadata *metadata = \
+			ft_flag_to_metadata_fast(node_flag); \
+		struct cds_ft_node *external_nodes = \
+			ft_dereference_prefetch_external(metadata->external_nodes); \
+		if (external_nodes || track_longest) { \
+			match_len = i; \
+			match_node = external_nodes; \
+		} \
+	} \
+} while (0)
+
 	for (i = 1; i < key_depth; i++) {
 		uint8_t iter_key;
 
@@ -5316,40 +5360,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				status = CDS_FT_STATUS_NOT_FOUND;
 				goto end;
 			}
-			if (iter) {
-				iter_path_node(iter)[i] = node_flag;
-				iter_path_len = i + 1;
-			}
-			/*
-			 * Mid-descent EXT: input key extends past a leaf
-			 * → NOT_FOUND.  Same semantics as the post-step
-			 * EXT check that the legacy path does after
-			 * ft_node_get_nth_skip.
-			 */
-			if (caa_unlikely(ft_node_external(node_flag))
-			    && i < key_depth - 1) {
-				if (track) {
-					match_len = i;
-					match_node = (struct cds_ft_node *) node_flag;
-				}
-				status = CDS_FT_STATUS_NOT_FOUND;
-				goto end;
-			}
-			/*
-			 * Track-mode prefix tracking on internal hops.
-			 * Compiles out for track=false.
-			 */
-			if (track && caa_likely(ft_node_internal(node_flag))
-			    && i < key_depth - 1) {
-				struct cds_ft_metadata *metadata =
-					ft_flag_to_metadata_fast(node_flag);
-				struct cds_ft_node *external_nodes =
-					ft_dereference_prefetch_external(metadata->external_nodes);
-				if (external_nodes || track_longest) {
-					match_len = i;
-					match_node = external_nodes;
-				}
-			}
+			FT_BYTE_STEP_POST();
 			continue;
 		}
 		/*
@@ -5535,30 +5546,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				status = CDS_FT_STATUS_NOT_FOUND;
 				goto end;
 			}
-			if (iter) {
-				iter_path_node(iter)[i] = node_flag;
-				iter_path_len = i + 1;
-			}
-			if (caa_unlikely(ft_node_external(node_flag))
-			    && i < key_depth - 1) {
-				if (track) {
-					match_len = i;
-					match_node = (struct cds_ft_node *) node_flag;
-				}
-				status = CDS_FT_STATUS_NOT_FOUND;
-				goto end;
-			}
-			if (track && caa_likely(ft_node_internal(node_flag))
-			    && i < key_depth - 1) {
-				struct cds_ft_metadata *metadata =
-					ft_flag_to_metadata_fast(node_flag);
-				struct cds_ft_node *external_nodes =
-					ft_dereference_prefetch_external(metadata->external_nodes);
-				if (external_nodes || track_longest) {
-					match_len = i;
-					match_node = external_nodes;
-				}
-			}
+			FT_BYTE_STEP_POST();
 			continue;
 		}
 		/*
@@ -5731,44 +5719,9 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 #endif
 			}
 		}
-		if (iter) {
-			iter_path_node(iter)[i] = node_flag;
-			iter_path_len = i + 1;
-		}
-		/*
-		 * External child before end of key: the key is
-		 * longer than this branch.
-		 */
-		if (caa_unlikely(ft_node_external(node_flag)) &&
-		    i < key_depth - 1) {
-			if (track) {
-				match_len = i;
-				match_node = (struct cds_ft_node *) node_flag;
-			}
-			status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
-		}
-		/*
-		 * Track prefix match on the child node.  Only
-		 * evaluated when tracking is requested — dead-code
-		 * eliminated for cds_ft_lookup_key (track=false).
-		 * The ft_node_internal check here is only reached
-		 * by track=true callers; for track=false the
-		 * compiler eliminates the entire block, leaving
-		 * just one ft_node_internal check per iteration
-		 * (at the loop top).
-		 */
-		if (track && caa_likely(ft_node_internal(node_flag))
-		    && i < key_depth - 1) {
-			struct cds_ft_metadata *metadata = ft_flag_to_metadata_fast(node_flag);
-			struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
-
-			if (external_nodes || track_longest) {
-				match_len = i;
-				match_node = external_nodes;
-			}
-		}
+		FT_BYTE_STEP_POST();
 	}
+#undef FT_BYTE_STEP_POST
 
 	/*
 	 * Reached key_depth, check for terminal node: either external
