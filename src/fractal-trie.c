@@ -14564,6 +14564,13 @@ struct cds_ft_stats_level {
 struct cds_ft_stats {
 	struct cds_ft_stats_level level[FT_MAX_DEPTH];
 	uint64_t compressed_len_dist[256];
+	uint64_t skip_compressed_len_dist[256];
+	uint64_t nr_skip_compressed_total;
+	uint64_t nr_skip_compressed_qp;
+	uint64_t nr_skip_compressed_pigeon;
+	uint64_t nr_skip_compressed_ext;
+	uint64_t qp_hi_half_cls_dist[256];
+	uint64_t nr_qp_hi_total;
 };
 
 enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft)
@@ -14601,6 +14608,10 @@ void calc_stats_node(const struct cds_ft *ft __attribute__((unused)),
 	node_stats->distribution[metadata->nr_child]++;
 	stats->level[level].nr_internal_nodes++;
 	stats->level[level].has_nodes = true;
+	if (((unsigned long) node_flag & FT_KIND_MASK) == FT_KIND_QP_HI) {
+		stats->qp_hi_half_cls_dist[metadata->qp_subtree_half_cls]++;
+		stats->nr_qp_hi_total++;
+	}
 }
 
 static
@@ -14617,9 +14628,26 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 	for (key = 0; key < 256; key++) {
 		struct cds_ft_inode_flag *child_node_flag;
 
-		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
+		child_node_flag = ft_node_get_nth_skip(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 		if (!child_node_flag)
 			continue;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_node_skip_compressed(child_node_flag)) {
+			unsigned long tag = (unsigned long) child_node_flag & FT_KIND_MASK;
+			unsigned int skip = ft_skip_len(child_node_flag);
+
+			stats->nr_skip_compressed_total++;
+			if (skip < 256)
+				stats->skip_compressed_len_dist[skip]++;
+			if (tag == FT_KIND_SKIP_QP)
+				stats->nr_skip_compressed_qp++;
+			else if (tag == FT_KIND_SKIP_PIGEON)
+				stats->nr_skip_compressed_pigeon++;
+			else if (tag == FT_KIND_SKIP_EXT)
+				stats->nr_skip_compressed_ext++;
+			child_node_flag = ft_resolve_skip_compressed(child_node_flag);
+		}
+#endif
 		if (ft_node_internal(child_node_flag)) {
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(child_node_flag));
 			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
@@ -14792,6 +14820,71 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 			}
 			fprintf(out, "\n");
 		}
+	}
+	if (stats->nr_qp_hi_total) {
+		uint64_t total = stats->nr_qp_hi_total;
+		uint64_t cumulative = 0;
+		unsigned int n;
+
+		fprintf(out, "QP-hi nodes: %" PRIu64 "\n", total);
+		print_indent(out, 1);
+		fprintf(out, "qp_subtree_half_cls distribution:");
+		for (n = 0; n < 256; n++) {
+			if (stats->qp_hi_half_cls_dist[n])
+				fprintf(out, " [%u]=%" PRIu64,
+					n, stats->qp_hi_half_cls_dist[n]);
+		}
+		fprintf(out, "\n");
+		print_indent(out, 1);
+		fprintf(out, "qp_subtree_half_cls <= K cumulative %%:");
+		for (n = 0; n < 256; n++) {
+			cumulative += stats->qp_hi_half_cls_dist[n];
+			if (n == 1 || n == 2 || n == 4 || n == 8 ||
+			    n == 16 || n == 24 || n == 32 || n == 48 ||
+			    n == 64) {
+				fprintf(out, " <=%u: %.1f%%",
+					n,
+					100.0 * (double) cumulative
+						/ (double) total);
+			}
+		}
+		fprintf(out, "\n");
+	}
+	if (stats->nr_skip_compressed_total) {
+		uint64_t total = stats->nr_skip_compressed_total;
+		uint64_t cumulative = 0;
+		unsigned int n;
+
+		fprintf(out,
+			"Skip-compressed pointers: %" PRIu64
+			" (qp:%" PRIu64 " pigeon:%" PRIu64 " ext:%" PRIu64 ")\n",
+			total,
+			stats->nr_skip_compressed_qp,
+			stats->nr_skip_compressed_pigeon,
+			stats->nr_skip_compressed_ext);
+		print_indent(out, 1);
+		fprintf(out, "skip_len distribution:");
+		for (n = 1; n < 256; n++) {
+			if (stats->skip_compressed_len_dist[n])
+				fprintf(out, " [%u]=%" PRIu64,
+					n, stats->skip_compressed_len_dist[n]);
+		}
+		fprintf(out, "\n");
+		print_indent(out, 1);
+		fprintf(out, "skip_len <= K cumulative %%:");
+		for (n = 1; n < 256; n++) {
+			cumulative += stats->skip_compressed_len_dist[n];
+			if (n == 4 || n == 5 || n == 8 || n == 12 ||
+			    n == 16 || n == 20 || n == 24 ||
+			    n == 32 || n == 48 || n == 64 ||
+			    n == 96 || n == 128) {
+				fprintf(out, " <=%u: %.1f%%",
+					n,
+					100.0 * (double) cumulative
+						/ (double) total);
+			}
+		}
+		fprintf(out, "\n");
 	}
 	fprintf(out, "---------------------------------------------------\n");
 }
