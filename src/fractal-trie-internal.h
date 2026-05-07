@@ -39,13 +39,15 @@
  *                             struct cds_ft_node *.  Matches NULL.
  *   FT_KIND_COMPRESSED (0x1)  pointer to a struct cds_ft_compressed_node.
  *   FT_KIND_SKIP_EXT (0x2)    skip-compressed pointer; resolved target is EXT.
- *   FT_KIND_QP_HI (0x5)       QP-nibble hi-node (all tiers); cds_ft_qp16_node *.
+ *   FT_KIND_QP_HI (0x5)       QP-nibble node (hi or lo, all tiers);
+ *                             cds_ft_qp16_node *.  HI vs LO is recovered
+ *                             from the lo-node's metadata is_lo bit
+ *                             during the upward parent walk.
  *   FT_KIND_SKIP_QP (0x7)     skip-compressed pointer; resolved target is QP_HI.
  *   FT_KIND_PIGEON (0x9)      pigeon (dense 256-pointer) node; cds_ft_inode *.
  *   FT_KIND_SKIP_PIGEON (0xB) skip-compressed pointer; resolved target is PIGEON.
- *   FT_KIND_QP_LO (0xD)       QP-nibble lo-node (all tiers); cds_ft_qp16_node *.
  *
- * Reserved (assert-on-encode): 0x3, 0x4, 0x6, 0x8, 0xA, 0xC, 0xE, 0xF.
+ * Reserved (assert-on-encode): 0x3, 0x4, 0x6, 0x8, 0xA, 0xC, 0xD, 0xE, 0xF.
  *
  * Bit-pattern rationale:
  *   - bit 0 separates the two NULL-equivalent kinds (EXT, SKIP_EXT)
@@ -55,8 +57,8 @@
  *     (skip = child | 0x2; child = skip - 0x2).  This single-bit
  *     toggle replaces the dispatch switch on the lookup fast path.
  *   - bits 2..3 encode the resolved class (00 = ext/compressed, 01 =
- *     qp_hi, 10 = pigeon, 11 = qp_lo); skip and child for the same
- *     class share these bits.
+ *     qp, 10 = pigeon); skip and child for the same class share
+ *     these bits.
  *
  * All allocations are >= 16-byte aligned (FT_ALLOC_ORDER_MIN = 4) so
  * the low 4 bits are guaranteed zero in raw addresses.  External
@@ -71,7 +73,6 @@ enum ft_kind {
 	FT_KIND_SKIP_QP		= 0x7,
 	FT_KIND_PIGEON		= 0x9,
 	FT_KIND_SKIP_PIGEON	= 0xB,
-	FT_KIND_QP_LO		= 0xD,
 };
 
 #define FT_KIND_SKIP_BIT	0x2UL	/* skip = child | FT_KIND_SKIP_BIT */
@@ -80,18 +81,16 @@ enum ft_kind {
  * FT_KIND_PIGEON_FAMILY_BIT (bit 3): identifies PIGEON-class slots —
  * set on FT_KIND_PIGEON (0x9) and FT_KIND_SKIP_PIGEON (0xB), clear
  * on every kind that can appear as a child slot (EXT, COMPRESSED,
- * SKIP_EXT, QP_HI, SKIP_QP).  FT_KIND_QP_LO (0xD) also has the bit
- * set but is never a slot value; the predicate is therefore exact
- * for the slot domain.
+ * SKIP_EXT, QP_HI, SKIP_QP).  Slot-domain exact.
  */
 #define FT_KIND_PIGEON_FAMILY_BIT	0x8UL
 
 /*
  * FT_KIND_INTERNAL_BITS (bits 2-3): non-zero iff the kind is one of
- * the three internal types — FT_KIND_QP_HI (0x5), FT_KIND_PIGEON
- * (0x9), FT_KIND_QP_LO (0xD).  Zero on EXT (0x0), COMPRESSED (0x1),
- * SKIP_EXT (0x2).  Skip kinds SKIP_QP (0x7) and SKIP_PIGEON (0xB)
- * also satisfy the test — callers must filter skips upstream via
+ * the two internal types — FT_KIND_QP_HI (0x5) or FT_KIND_PIGEON
+ * (0x9).  Zero on EXT (0x0), COMPRESSED (0x1), SKIP_EXT (0x2).
+ * Skip kinds SKIP_QP (0x7) and SKIP_PIGEON (0xB) also satisfy the
+ * test — callers must filter skips upstream via
  * ft_node_skip_compressed (asserted by ft_node_internal).
  */
 #define FT_KIND_INTERNAL_BITS	0xCUL
@@ -180,11 +179,13 @@ enum ft_kind {
 
 /*
  * ft_types[] internal-class slot count: T0..T3 (QP hi tiers) at
- * indices 0..3, PIGEON at index 4.  Lo-nodes are recognized by tag
- * (FT_KIND_QP_LO) and never indexed into ft_types[].  NODE_INDEX_NULL
- * is the one-past-the-end sentinel, used by recompact / verify code
- * to encode "elide this node"; ft_types[] keeps a trailing FT_NULL
- * entry at that index so &ft_types[NODE_INDEX_NULL] is in-bounds.
+ * indices 0..3, PIGEON at index 4.  Lo-nodes share the FT_KIND_QP_HI
+ * slot-tag with hi-nodes (HI/LO disambiguated via metadata is_lo bit
+ * during the parent walk) and are never indexed into ft_types[].
+ * NODE_INDEX_NULL is the one-past-the-end sentinel, used by recompact
+ * / verify code to encode "elide this node"; ft_types[] keeps a
+ * trailing FT_NULL entry at that index so &ft_types[NODE_INDEX_NULL]
+ * is in-bounds.
  */
 #define FT_NUM_INTERNAL_TYPES	5U
 #define NODE_INDEX_NULL		FT_NUM_INTERNAL_TYPES
@@ -387,7 +388,8 @@ struct cds_ft_metadata {
 	unsigned long nr_keys;
 
 	/*
-	 * Packed bitfield — small fields in a single uint32_t.
+	 * Packed bitfield — small fields in a single uint32_t (or uint64_t
+	 * on big-page archs where the total bit count exceeds 32).
 	 *
 	 * nr_child:               9 bits (max 256)
 	 * skip_slot_offset:       8 bits (byte_offset / sizeof(void *)
@@ -396,6 +398,10 @@ struct cds_ft_metadata {
 	 * fallback_removal_count: 3 bits (max 7)
 	 * alloc_index:            FT_ALLOC_INDEX_BITS (architecture-dependent,
 	 *                         sized for max page_size >> FT_ALLOC_ORDER_MIN)
+	 * is_lo:                  1 bit  (set on QP-nibble lo-node metadata;
+	 *                         used in the parent-walk to recover the
+	 *                         HI/LO distinction now that FT_KIND_QP_LO
+	 *                         no longer occupies a slot-tag value)
 	 */
 	uint32_t nr_child:9;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -403,6 +409,7 @@ struct cds_ft_metadata {
 #endif
 	uint32_t fallback_removal_count:FT_FALLBACK_REMOVAL_BITS;
 	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
+	uint32_t is_lo:1;
 	/*
 	 * Trailing-pad byte at offset 28.  Two mutually-exclusive uses
 	 * — a metadata is either a QP-hi's or a PIGEON's, never both:

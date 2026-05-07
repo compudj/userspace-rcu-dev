@@ -1232,10 +1232,10 @@ static inline_lookup
 bool ft_node_internal(struct cds_ft_inode_flag *node)
 {
 	/*
-	 * Internal kinds are FT_KIND_QP_HI (0x5), FT_KIND_PIGEON (0x9),
-	 * FT_KIND_QP_LO (0xD).  All have FT_KIND_INTERNAL_BITS (bits 2-3)
-	 * non-zero; EXT (0x0), COMPRESSED (0x1), SKIP_EXT (0x2) all
-	 * have those bits zero.  Single AND + jnz, no CMP.
+	 * Internal kinds are FT_KIND_QP_HI (0x5) and FT_KIND_PIGEON (0x9).
+	 * Both have FT_KIND_INTERNAL_BITS (bits 2-3) non-zero; EXT (0x0),
+	 * COMPRESSED (0x1), SKIP_EXT (0x2) all have those bits zero.
+	 * Single AND + jnz, no CMP.
 	 *
 	 * Skip kinds SKIP_QP (0x7) and SKIP_PIGEON (0xB) also have these
 	 * bits non-zero; callers MUST resolve skip-compressed pointers
@@ -1315,8 +1315,8 @@ bool ft_node_skip_compressed(struct cds_ft_inode_flag *node)
 	 * FT_KIND_SKIP_BIT (bit 1) is the universal "is skip-compressed"
 	 * predicate: set on FT_KIND_SKIP_EXT (0x2), FT_KIND_SKIP_QP
 	 * (0x7), FT_KIND_SKIP_PIGEON (0xB); clear on every non-skip
-	 * kind (EXT 0x0, COMPRESSED 0x1, QP_HI 0x5, PIGEON 0x9, QP_LO
-	 * 0xD).  One AND on the lookup hot path.
+	 * kind (EXT 0x0, COMPRESSED 0x1, QP_HI 0x5, PIGEON 0x9).  One
+	 * AND on the lookup hot path.
 	 */
 	return ((unsigned long) node & FT_KIND_SKIP_BIT) != 0;
 }
@@ -1465,8 +1465,9 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
 	/*
 	 * Only EXT / QP_HI / PIGEON are valid skip targets.  COMPRESSED
-	 * (chain-compress invariant) and QP_LO (skip only crosses byte
-	 * boundaries) are forbidden; ft_kind_to_skip_kind asserts.
+	 * is forbidden by the chain-compress invariant; ft_kind_to_skip_kind
+	 * asserts.  (QP-nibble lo-nodes share the QP_HI tag and are not a
+	 * separate kind in the slot-tag space.)
 	 */
 	if (child_kind == FT_KIND_QP_HI) {
 		struct cds_ft_qp16_node *qp = (struct cds_ft_qp16_node *)
@@ -1911,12 +1912,17 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 		return;
 	/*
 	 * Option 3: byte-keyed children of a QP hi-node carry the tagged
-	 * lo-flag as their parent (slot is in the lo arena, not in the hi
-	 * node).  When callers pass the hi-flag with a lo-side @slot —
-	 * the convention used by every byte-step insert/replace path —
-	 * resolve to the lo-flag derived from the slot's containing
-	 * arena allocation so that meta->parent stays internally
-	 * consistent and ft_set_skip_slot's 8-bit offset is bounded.
+	 * lo-pointer as their parent (slot is in the lo arena, not in
+	 * the hi node).  When callers pass the hi-flag with a lo-side
+	 * @slot — the convention used by every byte-step insert/replace
+	 * path — rebase parent_nf to the lo-arena base derived from the
+	 * slot's containing allocation so that meta->parent's address is
+	 * the lo and ft_set_skip_slot's 8-bit offset is bounded by the
+	 * lo's alloc size.
+	 *
+	 * The tag stays FT_KIND_QP_HI (HI and LO share one slot-tag kind
+	 * since the QP_LO retirement); the parent walk recovers HI vs LO
+	 * via the lo-node's metadata is_lo bit.
 	 */
 	if (slot && parent_nf
 	    && ((unsigned long) parent_nf & FT_KIND_MASK) == FT_KIND_QP_HI) {
@@ -2772,17 +2778,16 @@ unsigned int ft_node_half_cls(unsigned int order)
  * holds the tagged lo-flag, and ft_set_parent's slot-based resolver
  * derives the tag from the lo-arena base when callers pass the hi-flag.
  *
- * All lo-nodes share a single tag-bit kind (FT_KIND_QP_LO = 0xD)
- * regardless of tier; the tier is recovered from cds_ft_item_order()
- * when needed.  Hi-nodes keep their tier-encoded type-index (0..3) —
- * the distinct lo tag lets ft_parent_depth_span collapse the (hi, lo)
- * pair to one byte step without consulting the metadata.
+ * Lo-nodes share the FT_KIND_QP_HI kind tag with hi-nodes — the
+ * HI/LO distinction has been retired from the slot-tag space and
+ * is recovered from the lo-node's metadata is_lo bit during the
+ * upward parent walk (ft_parent_depth_span).
  */
 static inline
 struct cds_ft_inode_flag *ft_qp16_lo_flag(struct cds_ft_qp16_node *lo)
 {
 	return (struct cds_ft_inode_flag *)
-		(((unsigned long) lo) | (unsigned long) FT_KIND_QP_LO);
+		(((unsigned long) lo) | (unsigned long) FT_KIND_QP_HI);
 }
 
 /*
@@ -3665,6 +3670,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 		new_lo->bitmap = (uint16_t) (1U << lo_n);
 		new_lo_meta->nr_child = 1;
 		new_lo_meta->parent = hi_flag;
+		new_lo_meta->is_lo = 1;	/* mark this metadata as a QP-nibble lo-node */
 		new_lo_flag = ft_qp16_lo_flag(new_lo);
 
 		/*
@@ -3764,6 +3770,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 			}
 			new_lo_meta->nr_child = new_live;
 			new_lo_meta->parent = hi_flag;
+			new_lo_meta->is_lo = 1;	/* mark this metadata as a QP-nibble lo-node */
 			new_lo_flag = ft_qp16_lo_flag(new_lo);
 			/*
 			 * Half-CL accounting: replace old lo's footprint with
@@ -3839,8 +3846,10 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 
 	/*
 	 * Internal dispatch: FT_KIND_QP_HI (0x5) routes to QP byte-step;
-	 * FT_KIND_PIGEON (0x9) routes to PIGEON; FT_KIND_QP_LO (0xD) is
-	 * not a slot value and never reaches this function.
+	 * FT_KIND_PIGEON (0x9) routes to PIGEON.  Lo-nodes share the
+	 * QP_HI tag (HI/LO disambiguated via metadata is_lo bit during
+	 * the parent walk) but never appear as a slot value here — the
+	 * descent reaches them only inside ft_qp_byte_get's HI→LO chain.
 	 *
 	 * Untag with a constant SUB inside each branch (rather than a
 	 * shared mask via ft_node_ptr_internal): the SUB has no
@@ -5537,8 +5546,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * filtering, FT_KIND_PIGEON_FAMILY_BIT (bit 3) is unique
 		 * to FT_KIND_PIGEON (0x9): SKIP_PIGEON (0xB) is consumed
 		 * by the SKIP handler above (cand: resolved to PIGEON;
-		 * non-cand: rewritten to COMPRESSED), and FT_KIND_QP_LO
-		 * (0xD) never appears as a slot value.
+		 * non-cand: rewritten to COMPRESSED).
 		 *
 		 * Constant-tag SUB strips FT_KIND_PIGEON; ft_pigeon_node_get_nth
 		 * inlines the data[n] load.  Same iter-path / mid-EXT /
@@ -7131,8 +7139,19 @@ unsigned int ft_parent_depth_span(struct cds_ft_inode_flag *parent_nf,
 			ft_compressed_node_ptr(parent_nf);
 		return cn->len;
 	}
-	if (((unsigned long) parent_nf & FT_KIND_MASK) == FT_KIND_QP_LO)
-		return 0;
+	/*
+	 * QP-nibble lo-node: contributes 0 depth (the (hi, lo) pair shares
+	 * one byte step).  Recovered via the is_lo metadata bit rather than
+	 * a slot-tag — FT_KIND_QP_LO has been retired from the kind tag
+	 * space.  Pigeon and other internal kinds have is_lo = 0 by
+	 * zero-init at alloc.
+	 */
+	{
+		struct cds_ft_metadata *m =
+			cds_ft_item_to_metadata(ft_node_ptr(parent_nf));
+		if (m->is_lo)
+			return 0;
+	}
 	/* Internal node: dispatches on one key byte. */
 	return 1;
 }
