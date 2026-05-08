@@ -2178,6 +2178,23 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->pnfp = NULL;
 	d->ppnf = NULL;
 	d->ppnfp = NULL;
+	/*
+	 * Resolve a SKIP-encoded root once at descent start.  ft->root is
+	 * the only pointer in the trie that's read raw without going
+	 * through ft_node_get_nth (which resolves), so a compressed root
+	 * (stored as SKIP_X via ft_publish_compressed) would otherwise
+	 * leave d.nf SKIP-tagged.  Resolving here normalises d.nf to
+	 * post-resolve form and lets the descent loop drop its redundant
+	 * top-of-iteration resolves.
+	 *
+	 * Under the 4-bit encoding this is semantics-preserving — the
+	 * loop-top resolves were no-ops on already-resolved values.
+	 * Under the planned 5-bit encoding (where COMPRESSED 0x03 and
+	 * SKIP_PIGEON 0x03 share bit patterns), this restructuring is
+	 * required: the loop-top resolves would otherwise erroneously
+	 * fire on COMPRESSED-tagged values left by ft_descent_step.
+	 */
+	d->nf = ft_resolve_skip_compressed(d->nf);
 }
 
 /*
@@ -2199,6 +2216,20 @@ void ft_descent_traverse_compressed(struct ft_descent *d,
 	d->nfp   = &cn->child;
 	d->depth += cn->len;
 	*iter_key += cn->len;
+	/*
+	 * cn->child can be SKIP-encoded (e.g. when the compressed cluster
+	 * was built over a child that was itself wrapped via
+	 * ft_skip_compressed_flag).  Resolve here so d.nf at the descent
+	 * loop's top is always post-resolve, matching the contract
+	 * established by ft_descent_init and ft_descent_step.  Without
+	 * this, the surrounding loop has to call ft_resolve_skip_compressed
+	 * itself — which under the planned 5-bit tag encoding would
+	 * erroneously fire on COMPRESSED-tagged values returned by
+	 * ft_descent_step (because COMPRESSED and SKIP_PIGEON share the
+	 * bit pattern 0x03 and the bit-1 SKIP test no longer
+	 * distinguishes them).
+	 */
+	d->nf = ft_resolve_skip_compressed(d->nf);
 }
 
 /*
@@ -8399,14 +8430,12 @@ int _cds_ft_insert(struct cds_ft *ft,
 		if (!d.nf)
 			break;
 		/*
-		 * Resolve skip-compressed pointer.  Can appear after
-		 * descending through a collapsed entry whose child was
-		 * later split/recompacted, or after a collapse publish
-		 * updated the parent's skip pointer.  Convert to the
-		 * underlying compressed flag so the compressed handler
-		 * below processes it correctly.
+		 * d.nf is post-resolve at every loop top: ft_descent_init
+		 * resolves ft->root, ft_descent_step calls ft_node_get_nth
+		 * which resolves, and ft_descent_traverse_compressed
+		 * resolves cn->child before returning.  No additional
+		 * resolve needed here.
 		 */
-		d.nf = ft_resolve_skip_compressed(d.nf);
 		/* Found external node. */
 		if (ft_node_external_direct(d.nf))
 			break;
@@ -8439,14 +8468,10 @@ int _cds_ft_insert(struct cds_ft *ft,
 	}
 
 	/*
-	 * Resolve any skip-compressed pointer left in d.nf by the descent
-	 * loop's final step (e.g., ft_descent_traverse_compressed sets d.nf
-	 * to cn->child raw, which may be skip-compressed).  The loop body's
-	 * resolve at the top of each iteration only fires when the loop
-	 * iterates again; a traverse that pushes d.depth to key_depth - 1
-	 * exits the loop without re-entering.
+	 * d.nf is post-resolve at exit: every path that sets it
+	 * (ft_descent_init, ft_descent_step, ft_descent_traverse_compressed)
+	 * resolves SKIP_X internally.
 	 */
-	d.nf = ft_resolve_skip_compressed(d.nf);
 
 	if (d.depth == key_depth - 1) {
 		/* Found either an internal, external node or NULL at end of key. */
@@ -8672,8 +8697,10 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 		if (!d.nf)
 			break;
-		/* Resolve skip-compressed (e.g. from collapsed entry). */
-		d.nf = ft_resolve_skip_compressed(d.nf);
+		/*
+		 * d.nf is post-resolve at every loop top: see ft_descent_init
+		 * / ft_descent_step / ft_descent_traverse_compressed.
+		 */
 		if (ft_node_external_direct(d.nf))
 			break;
 		if (ft_node_compressed_in_node(d.nf)) {
@@ -8696,13 +8723,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		key_value = *(iter_key++);
 		ft_descent_step(&d, key_value);
 	}
-
-	/*
-	 * Resolve any skip-compressed pointer left in d.nf by a final
-	 * traverse that exited the loop without re-entering the loop's
-	 * resolve step.
-	 */
-	d.nf = ft_resolve_skip_compressed(d.nf);
+	/* d.nf is post-resolve at loop exit (every setter resolves). */
 
 	if (d.depth == key_depth - 1) {
 		/* Found either an internal, external node or NULL at end of key. */
@@ -9624,8 +9645,11 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
-		/* Resolve skip-compressed (e.g. from collapsed entry). */
-		dd.d.nf = ft_resolve_skip_compressed(dd.d.nf);
+		/*
+		 * dd.d.nf is post-resolve at every loop top:
+		 * ft_detach_descent_init -> ft_descent_init resolves;
+		 * ft_descent_step / ft_descent_traverse_compressed resolve.
+		 */
 
 		/*
 		 * Compressed node: compare remaining key bytes with
