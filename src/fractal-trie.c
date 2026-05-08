@@ -1098,16 +1098,60 @@ struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 }
 
 /*
- * Test whether @node has the external tag (kind == FT_KIND_EXT, low
- * nibble = 0x0).  This matches both non-NULL external leaf pointers
- * AND NULL, since NULL has all bits clear.  Callers that need to
- * distinguish NULL from a valid external node should also check
- * ft_node_ptr().
+ * Test whether @node has the raw external tag (kind == FT_KIND_EXT,
+ * low nibble = 0x0).  Strict form: rejects FT_KIND_SKIP_EXT.  This
+ * matches both non-NULL external leaf pointers AND NULL, since NULL
+ * has all bits clear.  Callers that need to distinguish NULL from a
+ * valid external node should also check ft_node_ptr().
+ *
+ * Use this variant when you need to operate on the EXT pointer
+ * directly (e.g. dereferencing the cds_ft_node leaf).  For the
+ * "external-side" classification (EXT or SKIP_EXT), use the
+ * direction-agnostic ft_node_external().
+ */
+static inline_lookup
+bool ft_node_external_direct(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & FT_KIND_MASK) == FT_KIND_EXT;
+}
+
+/*
+ * Test whether @node has the SKIP_EXT tag (a skip-compressed pointer
+ * resolving to an external leaf).  Strict form: rejects raw EXT.
+ *
+ * Use when the slot's encoding matters (e.g., when about to recover
+ * the cn metadata via ft_skip_to_compressed).  Outside of
+ * FEATURE_FT_SKIP_COMPRESSED builds, slots never carry the SKIP_EXT
+ * tag and this predicate folds to constant false.
+ */
+static inline_lookup
+bool ft_node_external_skip(struct cds_ft_inode_flag *node)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	return ((unsigned long) node & FT_KIND_MASK) == FT_KIND_SKIP_EXT;
+#else
+	(void) node;
+	return false;
+#endif
+}
+
+/*
+ * Test whether @node is "external-side" — either a raw external leaf
+ * (FT_KIND_EXT, including NULL) or a skip-compressed pointer that
+ * resolves to one (FT_KIND_SKIP_EXT).  Bit-0 partition: bit 0 = 0
+ * means external-side, bit 0 = 1 means internal-side.
+ *
+ * Use this variant when you only care about "this slot does not
+ * resolve to a branching internal node" — e.g., end-of-descent
+ * detection.  Callers that need to operate on the underlying EXT
+ * pointer must additionally resolve SKIP_EXT (via
+ * ft_resolve_skip_compressed) or use ft_node_external_direct() to
+ * filter out the SKIP case.
  */
 static inline_lookup
 bool ft_node_external(struct cds_ft_inode_flag *node)
 {
-	return ((unsigned long) node & FT_KIND_MASK) == FT_KIND_EXT;
+	return ((unsigned long) node & 0x1UL) == 0;
 }
 
 #ifdef FEATURE_FT_COMPRESS
@@ -1573,7 +1617,7 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
 	struct cds_ft_inode_flag *child = ft_skip_child_ptr(skip_ptr);
 	struct cds_ft_inode_flag *parent;
 
-	if (ft_node_external(child))
+	if (ft_node_external_direct(child))
 		parent = rcu_dereference(((struct cds_ft_node *) child)->prev);
 	else
 		parent = rcu_dereference(cds_ft_item_to_metadata(
@@ -1611,12 +1655,12 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft_inode_flag *node)
 {
 	struct cds_ft_inode_flag *parent;
 
-	if (ft_node_external(node))
+	if (ft_node_external_direct(node))
 		parent = rcu_dereference(((struct cds_ft_node *) node)->prev);
 	else
 		parent = rcu_dereference(cds_ft_item_to_metadata(
 			ft_node_ptr(node))->parent);
-	assert(!parent || !ft_node_external(parent));
+	assert(!parent || !ft_node_external_direct(parent));
 	return parent;
 }
 
@@ -1944,7 +1988,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
  *
  * Skip-compressed must be checked before external: a skip pointer
  * whose child is external has low tag bits == 0, which would match
- * ft_node_external on the raw value.
+ * ft_node_external_direct on the raw value.
  *
  * Write-side only (mutex-held).
  */
@@ -2008,7 +2052,7 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 		return;
 	}
 #endif
-	if (ft_node_external(child_nf)) {
+	if (ft_node_external_direct(child_nf)) {
 		rcu_assign_pointer(
 			((struct cds_ft_node *) child_nf)->prev,
 			parent_nf);
@@ -2077,7 +2121,7 @@ void ft_fill_compressed_path(struct cds_ft_compressed_node *cn,
 static
 bool valid_external_node(struct cds_ft_node *node)
 {
-	return node != NULL && ft_node_external((struct cds_ft_inode_flag *) node);
+	return node != NULL && ft_node_external_direct((struct cds_ft_inode_flag *) node);
 }
 
 /*
@@ -5166,7 +5210,7 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 	 * External child before end of key: record for partial
 	 * tracking, set NOT_FOUND, and tell the caller to end.
 	 */
-	if (i < key_depth - 1 && ft_node_external(node_flag)) {
+	if (i < key_depth - 1 && ft_node_external_direct(node_flag)) {
 		if (track) {
 			*match_len_p = i;
 			*match_node_p = (struct cds_ft_node *) node_flag;
@@ -5180,7 +5224,7 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 	 * compressed path) so callers that skip the normal tracking
 	 * code via continue don't miss it.
 	 */
-	if (track && i < key_depth - 1 && !ft_node_external(node_flag)) {
+	if (track && i < key_depth - 1 && !ft_node_external_direct(node_flag)) {
 		struct cds_ft_metadata *metadata =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		struct cds_ft_node *ext =
@@ -5237,7 +5281,7 @@ enum ft_descent_action ft_traverse_compressed(
 		*not_found = true;
 		return FT_DESCENT_END;
 	}
-	if (ft_node_external(cn->child))
+	if (ft_node_external_direct(cn->child))
 		return FT_DESCENT_BREAK;
 	return FT_DESCENT_CONTINUE;
 }
@@ -5376,7 +5420,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		iter_path_node(iter)[i] = node_flag; \
 		iter_path_len = i + 1; \
 	} \
-	if (caa_unlikely(ft_node_external(node_flag)) \
+	if (caa_unlikely(ft_node_external_direct(node_flag)) \
 	    && i < key_depth - 1) { \
 		if (track) { \
 			match_len = i; \
@@ -5459,7 +5503,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				 * Don't recover skip_len (would force an
 				 * extra CL load via ext->prev → cn->len);
 				 * don't advance key/i (dead, the loop breaks
-				 * on ft_node_external next iter); the end-of-
+				 * on ft_node_external_direct next iter); the end-of-
 				 * descent leaf-bytes compare validates the
 				 * full key, including any bytes covered by
 				 * this skip.
@@ -5577,7 +5621,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				 * rest of the descent.
 				 */
 				if (node_flag) {
-					if (caa_likely(!ft_node_external(node_flag))) {
+					if (caa_likely(!ft_node_external_direct(node_flag))) {
 						__builtin_prefetch(
 							ft_node_ptr(node_flag));
 					} else if (needs_leaf_validate) {
@@ -6169,7 +6213,7 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 		goto out_break;
 	iter_path_node(iter)[level] = node_flag;
 	iter_path_node(iter)[level + 1] = node_flag;
-	if (ft_node_external(node_flag))
+	if (ft_node_external_direct(node_flag))
 		goto out_break;
 
 	*node_flag_p = node_flag;
@@ -6266,7 +6310,7 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 	iter_path_node(iter)[level] = node_flag;
 	*node_flag_p = node_flag;
 	*level_p = level;
-	if (ft_node_external(node_flag))
+	if (ft_node_external_direct(node_flag))
 		return FT_DESCENT_BREAK;
 	*skip_eq_external_nodes_p = false;
 	return FT_DESCENT_CONTINUE;
@@ -6387,7 +6431,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		 *  - key_depth - 1 if last node is external, NULL, or
 		 *                  the path ended early (loop broke).
 		 */
-		if (!ft_node_external(node_flag))
+		if (!ft_node_external_direct(node_flag))
 			level = key_depth;
 		else
 			level = key_depth - 1;
@@ -6455,7 +6499,7 @@ slow_path:
 			(const void *) node_flag, 0);
 		dbg_printf("cds_ft_lookup_inequality iter key lookup %u finds node_flag %p\n",
 				(unsigned int) key_value, node_flag);
-		if (ft_node_external(node_flag))
+		if (ft_node_external_direct(node_flag))
 			break;
 	}
 
@@ -6533,7 +6577,7 @@ post_traversal:
 	 * the correct direction to find shorter (lesser) prefix keys.
 	 */
 	if ((mode == FT_LOOKUP_GT || mode == FT_LOOKUP_GE) &&
-			!ft_node_external(node_flag))
+			!ft_node_external_direct(node_flag))
 		goto descend_children;
 
 going_up:
@@ -6576,7 +6620,7 @@ going_up:
 		 * going upward.
 		 */
 		if (going_up && dir == FT_LEFT &&
-		    !ft_node_external(iter_path_node(iter)[level])) {
+		    !ft_node_external_direct(iter_path_node(iter)[level])) {
 			struct cds_ft_metadata *metadata;
 
 			if (ft_node_compressed_in_node(iter_path_node(iter)[level]))
@@ -6673,7 +6717,7 @@ going_up:
 			struct cds_ft_inode_flag *pfx_flag =
 				iter_path_node(iter)[iter->prefix_len];
 
-			if (!ft_node_external(pfx_flag)) {
+			if (!ft_node_external_direct(pfx_flag)) {
 				struct cds_ft_metadata *metadata;
 
 				if (ft_node_compressed_in_node(pfx_flag))
@@ -6708,7 +6752,7 @@ going_up:
 	}
 
 descend_children:
-	if (ft_node_external(node_flag)) {
+	if (ft_node_external_direct(node_flag)) {
 		int j;
 
 		assert(level <= (int) ft->group->max_key_len);
@@ -6774,7 +6818,7 @@ descend_children:
 			}
 		}
 		/* Return external node. */
-		if (ft_node_external(node_flag))
+		if (ft_node_external_direct(node_flag))
 			break;
 		/*
 		 * Skip-compressed: convert to compressed flag.
@@ -6823,7 +6867,7 @@ descend_children:
 		iter_path_node(iter)[level] = node_flag;
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) ordinal_key[level - 1], node_flag);
-		if (ft_node_external(node_flag))
+		if (ft_node_external_direct(node_flag))
 			break;
 	}
 	/*
@@ -7265,7 +7309,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	unsigned int junction_depth = node_depth + diverge_pos;
 
 	/* Compute old child's nr_keys for the new nodes. */
-	if (!ft_node_external(cn->child)) {
+	if (!ft_node_external_direct(cn->child)) {
 		struct cds_ft_metadata *cm =
 			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
 		old_child_nr_keys = ft_nr_keys_get(cm);
@@ -7548,7 +7592,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	unsigned long child_nr_keys;
 	int ret;
 
-	if (!ft_node_external(cn->child)) {
+	if (!ft_node_external_direct(cn->child)) {
 		struct cds_ft_metadata *cm =
 			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
 		child_nr_keys = ft_nr_keys_get(cm);
@@ -8364,7 +8408,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 		 */
 		d.nf = ft_resolve_skip_compressed(d.nf);
 		/* Found external node. */
-		if (ft_node_external(d.nf))
+		if (ft_node_external_direct(d.nf))
 			break;
 		/* Decompress compressed node before continuing descent. */
 		/*
@@ -8430,7 +8474,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 			 */
 			ret = ft_insert_compressed_key_shorter(ft, &d, 0,
 				node, unique_node_ret);
-		} else if (!ft_node_external(d.nf)) {
+		} else if (!ft_node_external_direct(d.nf)) {
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
 
@@ -8630,7 +8674,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			break;
 		/* Resolve skip-compressed (e.g. from collapsed entry). */
 		d.nf = ft_resolve_skip_compressed(d.nf);
-		if (ft_node_external(d.nf))
+		if (ft_node_external_direct(d.nf))
 			break;
 		if (ft_node_compressed_in_node(d.nf)) {
 			enum ft_descent_action act;
@@ -8687,7 +8731,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				node, old_node_ret);
 			if (ret == -EEXIST)
 				ret = 0;	/* Replace handled by key_shorter. */
-		} else if (!ft_node_external(d.nf)) {
+		} else if (!ft_node_external_direct(d.nf)) {
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
 
@@ -8850,7 +8894,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	for (i = 1; i < key_depth; i++) {
 		uint8_t key_value;
 
-		if (ft_node_external(node_flag)) {
+		if (ft_node_external_direct(node_flag)) {
 			s = CDS_FT_STATUS_NOT_FOUND;
 			FT_TP(replace_exit, (int) s);
 			return s;
@@ -8881,7 +8925,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	}
 
 	/* Reached end of key. Locate the duplicate chain. */
-	if (!ft_node_external(node_flag)) {
+	if (!ft_node_external_direct(node_flag)) {
 		struct cds_ft_metadata *metadata;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
@@ -8924,7 +8968,7 @@ find_and_replace:
 	new_node->next = old_node->next;
 	if (new_node->next)
 		new_node->next->prev = new_node;
-	if (ft_node_external((struct cds_ft_inode_flag *) old_node->prev)) {
+	if (ft_node_external_direct((struct cds_ft_inode_flag *) old_node->prev)) {
 		/* Non-head: update predecessor's next pointer. */
 		struct cds_ft_node *prev_node =
 			(struct cds_ft_node *) old_node->prev;
@@ -9074,12 +9118,12 @@ int ft_detach_node(struct cds_ft *ft,
 		/*
 		 * Resolve skip-compressed before type checks: a skip
 		 * pointer with an external child has low bits == 0,
-		 * falsely matching ft_node_external and skipping the
+		 * falsely matching ft_node_external_direct and skipping the
 		 * external_nodes preservation entirely.
 		 */
 		detach_child = ft_resolve_skip_compressed(detach_child);
 
-		if (detach_child && !ft_node_external(detach_child)) {
+		if (detach_child && !ft_node_external_direct(detach_child)) {
 			struct cds_ft_metadata *child_meta =
 				ft_flag_to_metadata(detach_child);
 			if (child_meta && child_meta->external_nodes)
@@ -9254,7 +9298,7 @@ int ft_detach_node(struct cds_ft *ft,
 				struct cds_ft_inode_flag *walk_nf = orig_detach_child;
 
 				while (walk_nf &&
-				       !ft_node_external(walk_nf) &&
+				       !ft_node_external_direct(walk_nf) &&
 				       nr_to_free < FT_MAX_DEPTH) {
 					struct cds_ft_inode_flag *next = NULL;
 
@@ -9459,10 +9503,10 @@ void ft_unchain_node(struct cds_ft_node **head_slot,
 	struct cds_ft_node *next_node = node->next;
 
 	FT_TP(unchain_node, (const void *) head_slot, (const void *) node,
-		!ft_node_external((struct cds_ft_inode_flag *) node->prev));
+		!ft_node_external_direct((struct cds_ft_inode_flag *) node->prev));
 	if (next_node)
 		next_node->prev = node->prev;
-	if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
+	if (ft_node_external_direct((struct cds_ft_inode_flag *) node->prev)) {
 		/* Non-head: prev is a cds_ft_node. */
 		struct cds_ft_node *prev_node =
 			(struct cds_ft_node *) node->prev;
@@ -9625,7 +9669,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 
-	if (!ft_node_external(dd.d.nf)) {
+	if (!ft_node_external_direct(dd.d.nf)) {
 		/* Found internal or compressed node at end of key. */
 		struct cds_ft_node *external_nodes;
 		struct cds_ft_metadata *metadata;
@@ -9653,7 +9697,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * entry in the chain (undercount ordering: decrement
 			 * nr_keys before detaching the pointer).
 			 */
-			if (!ft_node_external((struct cds_ft_inode_flag *) match->prev)
+			if (!ft_node_external_direct((struct cds_ft_inode_flag *) match->prev)
 			    && !match->next) {
 				ft_propagate_external_count_parent(ft, dd.d.nf, -1);
 			}
@@ -9833,7 +9877,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 
-	if (!ft_node_external(dd.d.nf)) {
+	if (!ft_node_external_direct(dd.d.nf)) {
 		/* Internal or compressed node at end of key. Remove all external nodes from metadata. */
 		struct cds_ft_node *external_nodes;
 		struct cds_ft_metadata *metadata;
@@ -9926,7 +9970,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	int ret;
 
 	/* Compute old child's nr_keys. */
-	if (!ft_node_external(cn->child)) {
+	if (!ft_node_external_direct(cn->child)) {
 		struct cds_ft_metadata *cm =
 			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
 		old_child_nr_keys = ft_nr_keys_get(cm);
@@ -10209,7 +10253,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 	for (; d->depth < key_len; ) {
 		uint8_t kv;
 
-		if (ft_node_external(d->nf))
+		if (ft_node_external_direct(d->nf))
 			break;
 		/* Resolve skip-compressed (e.g. from collapsed entry). */
 		d->nf = ft_resolve_skip_compressed(d->nf);
@@ -10257,7 +10301,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	struct cds_ft_inode_flag *prefix_flag;
 	unsigned long child_nr_keys;
 
-	if (!ft_node_external(cn->child)) {
+	if (!ft_node_external_direct(cn->child)) {
 		struct cds_ft_metadata *cm =
 			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
 		child_nr_keys = ft_nr_keys_get(cm);
@@ -10589,7 +10633,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		struct cds_ft_inode_flag *branch;
 		struct cds_ft_node *displaced = NULL;
 
-		if (d->nf && ft_node_external(d->nf))
+		if (d->nf && ft_node_external_direct(d->nf))
 			displaced = (struct cds_ft_node *)
 				ft_node_ptr(d->nf);
 
@@ -11006,7 +11050,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		swap_count = swap_empty ? 0 : ft_nr_keys_get(swap_rmeta);
 
 		/* Compute old_count from the content being displaced. */
-		if (!ft_node_external(old_child)) {
+		if (!ft_node_external_direct(old_child)) {
 			struct cds_ft_metadata *old_meta =
 				cds_ft_item_to_metadata(ft_node_ptr(old_child));
 			old_count = ft_nr_keys_get(old_meta);
@@ -11126,7 +11170,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * (swap's original empty root) and old_child attaches
 		 * there as external_nodes.
 		 */
-		if (!ft_node_external(old_child)) {
+		if (!ft_node_external_direct(old_child)) {
 			/*
 			 * Clear parent: old_child is now a root.  Use
 			 * rcu_assign_pointer so read-side parent-pointer
@@ -11322,7 +11366,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 
 			if (!dd.d.nf)
 				return CDS_FT_STATUS_NOT_FOUND;
-			if (ft_node_external(dd.d.nf))
+			if (ft_node_external_direct(dd.d.nf))
 				return CDS_FT_STATUS_NOT_FOUND;
 			if (ft_node_compressed_in_node(dd.d.nf)) {
 				struct cds_ft_compressed_node *cn =
@@ -11359,7 +11403,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		{
 			unsigned long detached_count;
 
-			if (!ft_node_external(child)) {
+			if (!ft_node_external_direct(child)) {
 				struct cds_ft_metadata *child_meta =
 					cds_ft_item_to_metadata(
 						ft_node_ptr(child));
@@ -11431,7 +11475,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 * the detached trie's (empty) root metadata as
 			 * a NIL-key entry.
 			 */
-			if (!ft_node_external(child)) {
+			if (!ft_node_external_direct(child)) {
 				/*
 				 * Drain source-trie readers that entered
 				 * before ft_detach_node published the unlink
@@ -11846,7 +11890,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	for (i = 0; i < prefix_len; i++) {
 		uint8_t kv;
 
-		if (ft_node_external(node_flag)) {
+		if (ft_node_external_direct(node_flag)) {
 			count = 0;
 			goto out;
 		}
@@ -11898,7 +11942,7 @@ unsigned long cds_ft_count_keys(struct cds_ft *ft)
 static inline
 unsigned long ft_child_key_count(struct cds_ft_inode_flag *child)
 {
-	if (!ft_node_external(child)) {
+	if (!ft_node_external_direct(child)) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(child));
 		return ft_nr_keys_load(m);
@@ -11936,7 +11980,7 @@ enum ft_descent_action ft_lookup_nth_compressed(
 		return FT_DESCENT_BREAK;
 	}
 	iter_path_node(iter)[level] = node_flag;
-	if (ft_node_external(node_flag)) {
+	if (ft_node_external_direct(node_flag)) {
 		*node_flag_p = node_flag;
 		*level_p = level;
 		return FT_DESCENT_BREAK;
@@ -11989,7 +12033,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		uint8_t child_key = 0;
 		int pivot;
 
-		if (ft_node_external(node_flag))
+		if (ft_node_external_direct(node_flag))
 			break;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
@@ -12054,7 +12098,7 @@ next_level:
 	}
 
 	/* Reached a leaf (external node). */
-	if (node_flag && ft_node_external(node_flag) && remaining == 0) {
+	if (node_flag && ft_node_external_direct(node_flag) && remaining == 0) {
 		iter->key_len = level - 1;
 		{
 			int j;
@@ -12121,7 +12165,7 @@ enum ft_descent_action ft_lookup_nth_last_compressed(
 				return FT_DESCENT_BREAK;
 			}
 			iter_path_node(iter)[level] = node_flag;
-			if (ft_node_external(node_flag)) {
+			if (ft_node_external_direct(node_flag)) {
 				*node_flag_p = node_flag;
 				*level_p = level;
 				return FT_DESCENT_BREAK;
@@ -12170,7 +12214,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		uint8_t child_key = 0;
 		int pivot;
 
-		if (ft_node_external(node_flag))
+		if (ft_node_external_direct(node_flag))
 			break;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
@@ -12238,7 +12282,7 @@ next_level:
 	}
 
 	/* Reached a leaf (external node). */
-	if (node_flag && ft_node_external(node_flag) && remaining == 0) {
+	if (node_flag && ft_node_external_direct(node_flag) && remaining == 0) {
 		iter->key_len = level - 1;
 		{
 			int j;
@@ -12328,7 +12372,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 	for (i = 0; i < key_len; i++) {
 		uint8_t ordinal;
 
-		if (ft_node_external(node_flag))
+		if (ft_node_external_direct(node_flag))
 			return -1;
 
 		if (ft_node_compressed_in_node(node_flag)) {
@@ -12387,7 +12431,7 @@ enum ft_descent_action ft_skip_forward_compressed(
 		return FT_DESCENT_BREAK;
 	}
 	iter_path_node(iter)[level] = node_flag;
-	if (ft_node_external(node_flag)) {
+	if (ft_node_external_direct(node_flag)) {
 		*node_flag_p = node_flag;
 		*level_p = level;
 		return FT_DESCENT_BREAK;
@@ -12445,7 +12489,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 * compressed node's external_nodes (variable-length prefix key)
 	 * or at a leaf child.
 	 */
-	at_external_nodes = !ft_node_external(iter_path_node(iter)[depth]);
+	at_external_nodes = !ft_node_external_direct(iter_path_node(iter)[depth]);
 
 	/*
 	 * If at external_nodes of an internal/compressed node, all
@@ -12531,7 +12575,7 @@ skip_fwd_walk_up:
 		uint8_t child_key = 0;
 		int pivot;
 
-		if (ft_node_external(ancestor))
+		if (ft_node_external_direct(ancestor))
 			continue;
 		/*
 		 * Compressed path levels have no siblings: skip.
@@ -12594,7 +12638,7 @@ descend_forward:
 			uint8_t child_key = 0;
 			int pivot;
 
-			if (ft_node_external(node_flag))
+			if (ft_node_external_direct(node_flag))
 				break;
 
 			metadata = cds_ft_item_to_metadata(
@@ -12660,7 +12704,7 @@ next_forward_level:
 
 		/* Reached a leaf. */
 		if (ft_node_ptr(iter_path_node(iter)[level]) &&
-		    ft_node_external(iter_path_node(iter)[level]) &&
+		    ft_node_external_direct(iter_path_node(iter)[level]) &&
 		    remaining == 0) {
 			int j;
 
@@ -12727,7 +12771,7 @@ enum ft_descent_action ft_skip_reverse_compressed(
 				return FT_DESCENT_BREAK;
 			}
 			iter_path_node(iter)[level] = node_flag;
-			if (ft_node_external(node_flag)) {
+			if (ft_node_external_direct(node_flag)) {
 				*node_flag_p = node_flag;
 				*level_p = level;
 				return FT_DESCENT_BREAK;
@@ -12834,7 +12878,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	 * Determine whether the current key sits at an internal or
 	 * compressed node's external_nodes or at a leaf child.
 	 */
-	at_external_nodes = !ft_node_external(iter_path_node(iter)[depth]);
+	at_external_nodes = !ft_node_external_direct(iter_path_node(iter)[depth]);
 	(void) at_external_nodes;
 
 	/*
@@ -12857,7 +12901,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		unsigned long left_keys = 0;
 		int pivot;
 
-		if (ft_node_external(ancestor))
+		if (ft_node_external_direct(ancestor))
 			continue;
 		/*
 		 * Skip intermediate compressed path levels (same
@@ -12972,7 +13016,7 @@ descend_reverse:
 			uint8_t child_key = 0;
 			int pivot;
 
-			if (ft_node_external(node_flag))
+			if (ft_node_external_direct(node_flag))
 				break;
 
 			metadata = cds_ft_item_to_metadata(
@@ -13038,7 +13082,7 @@ next_reverse_level:
 
 		/* Reached a leaf. */
 		if (ft_node_ptr(iter_path_node(iter)[level]) &&
-		    ft_node_external(iter_path_node(iter)[level]) &&
+		    ft_node_external_direct(iter_path_node(iter)[level]) &&
 		    remaining == 0) {
 			int j;
 
@@ -13977,7 +14021,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		memcpy(path + depth, cn->key_bytes, cn->len);
 	/* Recurse into the child. */
 	if (cn->child) {
-		if (ft_node_external(cn->child)) {
+		if (ft_node_external_direct(cn->child)) {
 			/* External leaf chain at end of compressed path. */
 			if (ft_verify_external_chain(ft, out, visited, path,
 					node_flag,
@@ -14190,7 +14234,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 				child_expected_parent =
 					ft_qp16_lo_flag(lo_raw);
 			}
-			if (ft_node_external(child)) {
+			if (ft_node_external_direct(child)) {
 				/* External leaf chain at this slot. */
 				if (ft_verify_external_chain(ft, out, visited,
 						path, child_expected_parent,
@@ -14456,7 +14500,7 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 					level, key, external_nodes);
 			}
 			if (cn->child &&
-			    !ft_node_external(cn->child))
+			    !ft_node_external_direct(cn->child))
 				show_node_recursive(ft, out, cn->child, level + cn->len);
 			else if (cn->child) {
 				print_indent(out, level + cn->len);
@@ -14548,7 +14592,7 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 		fprintf(out, "null");
 		return;
 	}
-	if (ft_node_external(node_flag)) {
+	if (ft_node_external_direct(node_flag)) {
 		fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"EXTERNAL\","
 			"\"level\":%d}", node_flag, level);
 		return;
@@ -14792,7 +14836,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 				stats->level[level + j].has_nodes = true;
 			}
 			if (cn->child &&
-			    !ft_node_external(cn->child))
+			    !ft_node_external_direct(cn->child))
 				calc_stats_node_recursive(ft, cn->child, stats, level + cn->len);
 			else if (cn->child) {
 				struct cds_ft_node *iter_node;
