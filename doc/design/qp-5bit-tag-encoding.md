@@ -303,6 +303,109 @@ mass migration may have missed.  Also audit:
   these would silently mis-classify POPCOUNT_64 (`0x11`) as PIGEON
   (`0x01`) since the high bit is masked off.
 
+## 6.5. Stage 2b discovery (2026-05-08): SKIP_PIGEON / COMPRESSED ambiguity
+
+A first attempt at the atomic encoding flip surfaced a deeper issue
+than the original plan accounted for.  The plan assumed call sites
+that consult bit 1 (`FT_KIND_SKIP_BIT`) could be left alone — under
+the old encoding, COMPRESSED's tag (`0x1`) had bit 1 clear, so
+`(node & 0x02) != 0` cleanly matched only SKIP_X kinds.  Under the
+new encoding, COMPRESSED (`0x03`) and SKIP_PIGEON (`0x03`) share both
+bits 0 and 1, and *every* SKIP_X variant has bit 1 set.  Plain `bit
+1` no longer distinguishes "SKIP-encoded slot value" from
+"COMPRESSED resolved value".
+
+The direction-aware predicate aliases landed in 60bdc30b / 9a34a949
+already encode the right intent:
+`ft_node_skip_compressed_in_slot` is for slot-context callers
+(where COMPRESSED can't appear, so bit 1 = SKIP), and
+`ft_node_compressed_in_node` is for node-context callers
+(where SKIP_X can't appear, so bit 1 = COMPRESSED).  But there is a
+class of call sites that operates on *mixed* contexts — values that
+might be slot-encoded (just read from a parent slot) or
+node-context (returned from `ft_resolve_skip_compressed` earlier in
+the same path) — and those sites cannot decide from the bits alone.
+
+The most prominent example is `ft_resolve_skip_compressed` itself.
+Several callers (e.g. `cds_ft_lookup_inequality:6917`,
+`_cds_ft_insert:8500`, `cds_ft_remove:9719`) pass `node_flag` whose
+context is mixed: it might be a freshly-read slot value (SKIP_X
+candidate) or a value left from a prior resolve (COMPRESSED
+candidate).  Under the old encoding the resolve was a no-op for
+COMPRESSED (bit 1 clear), so callers could call it freely.  Under
+the new encoding, calling resolve on COMPRESSED erroneously fires
+`ft_skip_to_compressed`, which then tries to recover the cn from
+the compressed pointer's `prev` (a parent which is *not* itself
+compressed) and trips the `ft_compressed_node_ptr` assertion.
+
+### What it took to discover
+
+A single-key insert (`test_insert_basic`) crashed during
+`cds_ft_count_entries`.  The descent built a SKIP_EXT pointer
+(legitimate — chain-compress wrapped the 4-byte path), the
+inequality-lookup back-walk resolved that into a COMPRESSED-tagged
+cn flag (also legitimate), and the *next* iteration of the descent
+loop called `ft_resolve_skip_compressed` again on the now-COMPRESSED
+value (legitimate under the old encoding's bit 1 = 0 invariant for
+COMPRESSED, broken under the new encoding's bit 1 = 1).
+
+### Implications for the migration plan
+
+Stage 2b cannot be a single atomic commit covering encoding +
+predicate updates.  It needs to be split:
+
+1. **Stage 2b.1 — audit `ft_resolve_skip_compressed` callers.**
+   Each call site is one of:
+   - **Pure slot-context** (raw slot read, never resolved): keep
+     the call.  Bit-1 test correctly catches SKIP_X.
+   - **Pure node-context** (post-resolve, parent ptr from
+     metadata): drop the call.  The value is already resolved.
+   - **Mixed-context** (could be either): rewrite to test
+     unambiguously.  Options:
+     a. Test for SKIP_X variants that *don't* collide with
+        COMPRESSED — i.e. SKIP_EXT (`(x & 0x03) == 0x02`) and
+        SKIP_X-with-class-bit (`(x & 0x02) && (x & 0x1C)`).
+        Skip this branch for the 0x03 pattern entirely
+        (treat as already-resolved).
+     b. Restructure the surrounding code so the value's context
+        is determined unambiguously before reaching the resolve.
+
+2. **Stage 2b.2 — audit `ft_skip_compressed_skip_len` and other
+   functions that switch on the kind tag.**  Same issue: a tag
+   read of `0x03` could be COMPRESSED (node) or SKIP_PIGEON (slot).
+   Functions that operate on slot values should be safe; functions
+   called in mixed-context need rewriting.
+
+3. **Stage 2b.3 — kind extraction.**  `& FT_KIND_MASK` returns a
+   different value depending on whether the underlying alignment is
+   16-byte (EXT, SKIP_EXT, COMPRESSED) or 32-byte (QP, PIGEON,
+   POPCOUNT_X, SKIP variants thereof).  An EXT pointer at an
+   address with bit 4 set yields kind `0x10` instead of `0x00`
+   under the 5-bit mask.  Kind-extraction sites need to dispatch
+   on alignment first.  This was caught early in the first attempt:
+   the fix is to dispatch on `(v & 0x01)` (external/internal) and
+   choose `& 0x0F` or `& 0x1F` accordingly.
+
+4. **Stage 2b.4 — the actual encoding flip.**  Once 2b.1-2b.3 are
+   each landed and smoke-tested under the *old* encoding (each
+   change preserves semantics), the final encoding flip becomes
+   small and contained: just the enum values, `FT_KIND_MASK`,
+   `ft_node_ptr` alignment dispatch, and the predicates' bit
+   patterns.
+
+The first attempt skipped 2b.1-2b.3 and tried to do everything in
+one commit.  The result compiled cleanly but crashed on the first
+insert.  The smoke tests caught it; the production CI (which runs
+under `-DNDEBUG` and so silences the assertion) would have
+mis-classified slot values as compressed and corrupted state
+silently.  Lesson: each pre-encoding-flip stage must preserve
+semantics under the *current* encoding, not just under the future
+one.
+
+A reverted snapshot of the broken atomic flip lives in the local
+working-directory history; rebuilding it from the design table is
+straightforward once 2b.1-2b.3 land.
+
 ## 7. Risks and rollback
 
 The Stage 2 flip is the high-risk commit.  Rollback strategy:
