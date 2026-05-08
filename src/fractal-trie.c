@@ -8755,7 +8755,6 @@ slow_path:
 			if (act == FT_DESCENT_BREAK)
 				break;
 			if (level + 1 >= key_depth) {
-				level++;
 				skip_eq_external_nodes = false;
 				goto descend_children;
 			}
@@ -11777,7 +11776,31 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		}
 	prefix_done:
 		(void) 0;
+	} else if (diverge_pos == 1 && !cn_meta->external_nodes) {
+		/*
+		 * 1-byte prefix without external_nodes: emit a 1-byte
+		 * compressed node instead of a 1-child internal — canonical
+		 * form under FEATURE_FT_SKIP_COMPRESSED.
+		 */
+		struct cds_ft_compressed_node *pfx;
+		struct cds_ft_metadata *pfx_meta;
+		struct cds_ft_inode_flag *pfx_flag;
+
+		pfx = alloc_compressed_node(ft, 1, &pfx_meta);
+		if (!pfx) goto error;
+		pfx->child = branch_flag;
+		pfx->len = 1;
+		pfx->key_bytes[0] = cn->key_bytes[0];
+		pfx_meta->nr_child = 1;
+		ft_nr_keys_store(ft, pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
+		pfx_flag = ft_compressed_node_flag(pfx);
+		ft_set_parent(branch_flag, pfx_flag, &pfx->child);
+		pfx_flag = ft_publish_compressed(ft, pfx, pfx_flag);
+		top_flag = pfx_flag;
+		created[nr_created++] = top_flag;
 	} else if (diverge_pos == 1) {
+		/* diverge_pos == 1 with external_nodes: must remain internal
+		 * (compressed nodes cannot carry external_nodes). */
 		struct cds_ft_inode_flag *dest = NULL;
 		struct cds_ft_metadata *pfx_meta;
 
@@ -11786,8 +11809,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		if (ret) goto error;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(ft, pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
-		if (cn_meta->external_nodes)
-			ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
+		ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
 		top_flag = dest;
 		created[nr_created++] = dest;
 	} else {
