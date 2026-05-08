@@ -1125,6 +1125,28 @@ bool ft_node_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
 #endif
 
 /*
+ * Direction-aware variant of ft_node_compressed for "node-context" call
+ * sites: the input has already been resolved to a concrete node — it is
+ * either a parent pointer pulled from a child's metadata, a value
+ * returned from ft_resolve_skip_compressed, or a raw slot value in a
+ * non-skip-compressed build where the COMPRESSED tag is unambiguous.
+ *
+ * In such contexts there is no SKIP_X tag to disambiguate, so this
+ * predicate's interpretation is unconditional: "is the underlying node
+ * a compressed-cluster node?".
+ *
+ * Currently aliases ft_node_compressed.  Once the 5-bit tag encoding
+ * lands, COMPRESSED and SKIP_PIGEON share the bit pattern 0x03; the two
+ * predicates will diverge — slot-context callers must use the SKIP-aware
+ * variant, node-context callers stay on this one.
+ */
+static inline_lookup
+bool ft_node_compressed_in_node(struct cds_ft_inode_flag *node)
+{
+	return ft_node_compressed(node);
+}
+
+/*
  * ft_metadata_set_external_nodes: set external_nodes on a node's metadata.
  * Asserts that the node is not a compressed node (compressed nodes
  * must not carry metadata->external_nodes).
@@ -1318,6 +1340,27 @@ bool ft_node_skip_compressed(struct cds_ft_inode_flag *node)
 	 * AND on the lookup hot path.
 	 */
 	return ((unsigned long) node & FT_KIND_SKIP_BIT) != 0;
+}
+
+/*
+ * Direction-aware variant of ft_node_skip_compressed for "slot-context"
+ * call sites: the input is the raw value loaded from a parent's child
+ * slot during descent, where SKIP_X tags are the in-band marker that
+ * the slot stores a skip-compressed pointer rather than a direct child.
+ *
+ * Currently aliases ft_node_skip_compressed.  Once the 5-bit tag
+ * encoding lands, SKIP_PIGEON shares the bit pattern 0x03 with
+ * COMPRESSED; this predicate's interpretation is "the slot stores a
+ * SKIP_X — including SKIP_PIGEON 0x03", whereas a node-context
+ * COMPRESSED check on the same value must report false.  Use this
+ * variant in descent paths and any code that consults the tag of a
+ * value sourced directly from a child slot (no ft_node_ptr / resolve
+ * step in between).
+ */
+static inline
+bool ft_node_skip_compressed_in_slot(struct cds_ft_inode_flag *node)
+{
+	return ft_node_skip_compressed(node);
 }
 
 /*
@@ -1602,6 +1645,12 @@ static inline
 bool ft_node_skip_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
 {
 	return false;
+}
+
+static inline
+bool ft_node_skip_compressed_in_slot(struct cds_ft_inode_flag *node)
+{
+	return ft_node_skip_compressed(node);
 }
 
 static inline
