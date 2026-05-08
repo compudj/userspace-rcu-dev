@@ -10832,6 +10832,18 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 
 		/* Snapshot old content at the graft slot. */
 		old_child = d.nf;
+		/*
+		 * d.nf carries the in-slot encoding, so when the graft point
+		 * sits above a compressed sub-trie under FEATURE_FT_SKIP_
+		 * COMPRESSED it arrives skip-tagged (SKIP_EXT / SKIP_QP /
+		 * SKIP_PIGEON).  graft_swap then treats @old_child as a
+		 * payload — accounting (nr_keys), parent re-link, and
+		 * publication as swap_ft's root all need the underlying
+		 * compressed-node form, not the slot-form skip pointer that
+		 * points "through" the cn to its child.  Resolve once here
+		 * so the rest of the block is uniform.
+		 */
+		old_child = ft_resolve_skip_compressed(old_child);
 
 		old_swap_root = swap_ft->root;
 		swap_rmeta = ft_root_metadata(swap_ft);
