@@ -445,12 +445,11 @@ enum cds_ft_iter_path_mode {
 struct cds_ft_node {
 	/*
 	 * prev pointer: for the head of the duplicate chain, this points
-	 * to the parent internal node (flagged pointer, used by
-	 * CDS_FT_FLAG_SKIP_COMPRESSED to recover the compressed node
-	 * from a skip pointer, and by the ordered-traversal upward walk
-	 * to reach the parent without consulting a cached iterator
-	 * path). For non-head duplicates, this points to the preceding
-	 * cds_ft_node. Written by the mutation side via
+	 * to the parent internal node (flagged pointer, used by skip-
+	 * compressed builds to recover the compressed node from a skip
+	 * pointer, and by the ordered-traversal upward walk to reach the
+	 * parent without consulting a cached iterator path). For non-head
+	 * duplicates, this points to the preceding cds_ft_node. Written by the mutation side via
 	 * rcu_assign_pointer; read on the read side via rcu_dereference.
 	 * Not accessed on the candidate lookup fast path.
 	 */
@@ -1820,11 +1819,11 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  * the descent speed of a speculative lookup, and no user-side
  * validation function call.
  *
- * Opportunistically enables the skip-compressed pointer encoding
- * (CDS_FT_FLAG_SKIP_COMPRESSED) when FEATURE_FT_SKIP_COMPRESSED is
- * compiled in.  Compressed paths longer than FT_SKIP_LEN_MAX (255
- * bytes — the per-item compress-cache page's uint8_t skip_len field)
- * fall back to traditional compressed-node pointers transparently.
+ * Skip-compressed pointer encoding applies whenever
+ * FEATURE_FT_SKIP_COMPRESSED is compiled in — there is no per-group
+ * runtime gate.  Compressed paths are bounded to FT_SKIP_LEN_MAX
+ * (255 bytes — the per-item compress-cache page's uint8_t skip_len
+ * field) by construction.
  *
  * The legacy high-bit pointer encoding is gone; length and subkey
  * recovery now go through the per-item compress-cache page, so the

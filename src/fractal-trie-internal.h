@@ -99,18 +99,9 @@ enum ft_kind {
 #define FT_KIND_PTR_MASK	(~FT_KIND_MASK)
 
 /*
- * Internal group flag: skip-compressed pointer encoding.
- *
- * Bit set in struct cds_ft_group::flags when
- * cds_ft_group_attr_set_speculative_validated opportunistically
- * enables the skip-compressed encoding.  Not part of the public API.
- */
-#define CDS_FT_FLAG_SKIP_COMPRESSED	(1U << 0)
-
-/*
  * Skip-compressed pointer encoding.
  *
- * When CDS_FT_FLAG_SKIP_COMPRESSED is set, compressed node pointers
+ * When FEATURE_FT_SKIP_COMPRESSED is defined, compressed node pointers
  * are replaced by "skip pointers" that point directly to the
  * compressed node's child, skipping the compressed node on the read
  * fast path (candidate lookup).
@@ -567,7 +558,6 @@ struct cds_ft_group {
 	size_t max_tree_depth;
 	size_t key_len;
 	size_t max_key_len;		/* Maximum key length allowed. */
-	unsigned int flags;		/* CDS_FT_FLAG_* creation-time flags. */
 	const struct rcu_flavor_struct *flavor;
 	/*
 	 * Allocation arenas, indexed by item_len_order.  All node
@@ -585,9 +575,8 @@ struct cds_ft_group {
 	 *   iterator-based cds_ft_lookup) descend speculatively and
 	 *   validate the result against the external node's stored key
 	 *   bytes via the inline SIMD/SWAR comparator before returning.
-	 *   Setter opportunistically enables skip-compressed pointer
-	 *   encoding (CDS_FT_FLAG_SKIP_COMPRESSED) when the architecture
-	 *   supports it.
+	 *   Skip-compressed pointer encoding is enabled at build time via
+	 *   FEATURE_FT_SKIP_COMPRESSED; no per-group runtime gate.
 	 * @speculative_key_offset: byte offset from the external node's
 	 *   address to the start of the stored key.  Used only when
 	 *   @speculative_validated is true.

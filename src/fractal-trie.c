@@ -126,7 +126,6 @@ struct cds_ft_group_attr {
 	size_t key_len;
 	size_t max_key_len;
 	struct cds_ft_key_map key_map;
-	unsigned int flags;
 	bool speculative_validated;
 	size_t speculative_key_offset;
 	size_t speculative_key_len_offset;
@@ -1555,12 +1554,6 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft_inode_flag *node)
 	return parent;
 }
 
-static inline
-bool ft_group_skip_compressed(const struct cds_ft_group *group)
-{
-	return group->flags & CDS_FT_FLAG_SKIP_COMPRESSED;
-}
-
 /*
  * ft_set_skip_slot: encode the skip pointer slot address as a
  * pointer-stride offset from the parent node.  The raw byte offset
@@ -1636,12 +1629,6 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
 		struct cds_ft_inode_flag *skip_ptr)
 {
 	return ft_compressed_node_ptr(skip_ptr);
-}
-
-static inline
-bool ft_group_skip_compressed(const struct cds_ft_group *group __attribute__((unused)))
-{
-	return false;
 }
 
 static inline
@@ -1865,11 +1852,11 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 		cn->key_bytes,
 		(const void *) cn->child,
 		(const void *) NULL);
-	if (ft_group_skip_compressed(ft->group) &&
-	    cn->len <= FT_SKIP_LEN_MAX) {
-		return ft_skip_compressed_flag(cn->child, cn);
-	}
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	return ft_skip_compressed_flag(cn->child, cn);
+#else
 	return cflag;
+#endif
 }
 
 /*
@@ -5220,7 +5207,6 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	size_t iter_path_len = 0;
 	bool track = (tracking != FT_PREFIX_TRACK_NONE);
 	bool track_longest = (tracking == FT_PREFIX_TRACK_LONGEST);
-	bool skip_compressed = ft_group_skip_compressed(ft->group);
 	size_t match_len = track_longest ? FT_MATCH_LEN_NONE : 0;
 	struct cds_ft_node *match_node = NULL;
 	/*
@@ -5387,7 +5373,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * Candidate: resolve the skip (advance past the compressed
 		 * path without comparison).
 		 */
-		if (skip_compressed && ft_node_skip_compressed(node_flag)) {
+		if (ft_node_skip_compressed(node_flag)) {
 			if (!descend_cand) {
 				node_flag = ft_compressed_node_flag(
 					ft_skip_to_compressed(node_flag));
@@ -13006,17 +12992,13 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 	    key_len_offset == CDS_FT_SPECULATIVE_OFFSET_NONE)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	/*
-	 * Opportunistically enable skip-compressed pointer encoding when
-	 * available — it stacks with library-side validation to also
-	 * avoid the compressed-node cache-line load.  Skip-compressed
-	 * no longer relies on high-bit pointer encoding (since Phase
-	 * B.3/B.4), so the runtime mmap probe that used to validate
-	 * VA-range availability is gone — the feature gate alone
-	 * decides applicability.
+	 * Skip-compressed pointer encoding is decided at build time via
+	 * FEATURE_FT_SKIP_COMPRESSED — no per-group runtime gate.
+	 * Skip-compressed no longer relies on high-bit pointer encoding
+	 * (since Phase B.3/B.4), so the runtime mmap probe that used to
+	 * validate VA-range availability is gone — the feature gate
+	 * alone decides applicability.
 	 */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
-#endif
 	attr->speculative_validated = true;
 	attr->speculative_key_offset = key_offset;
 	attr->speculative_key_len_offset = key_len_offset;
@@ -13186,7 +13168,6 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 	pthread_mutex_init(&ft_group->arena_lock, NULL);
 	if (attr) {
 		ft_group->key_map = attr->key_map;
-		ft_group->flags = attr->flags;
 		ft_group->speculative_validated = attr->speculative_validated;
 		ft_group->speculative_key_offset = attr->speculative_key_offset;
 		ft_group->speculative_key_len_offset = attr->speculative_key_len_offset;
@@ -14108,7 +14089,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 #ifdef FEATURE_FT_COMPRESS
 		/*
-		 * Canonicalization (skip-compressed mode, non-root): a
+		 * Canonicalization (skip-compressed build, non-root): a
 		 * single-child internal node with no external_nodes attached
 		 * should have been replaced by a 1-byte compressed node — in
 		 * skip mode the compressed publishes as a skip-encoded
@@ -14126,21 +14107,24 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		 * root costs the same CL as a 1-child internal, so the
 		 * canonicalization policy is allowed to keep it internal.
 		 *
-		 * In non-skip mode, ft_build_ordinal_chain keeps a 1-byte
-		 * compressed floor at len >= 2, so a 1-child internal at
-		 * the head of a length-1 chain is canonical and must not
-		 * trip this check; the runtime gate handles the distinction.
+		 * In non-skip-compressed builds, ft_build_ordinal_chain
+		 * keeps a 1-byte compressed floor at len >= 2, so a 1-child
+		 * internal at the head of a length-1 chain is canonical and
+		 * must not trip this check; this verify branch is
+		 * compiled out via the inner FEATURE_FT_SKIP_COMPRESSED
+		 * gate.
 		 *
 		 * Dual of the existing "no two adjacent compresseds" check.
 		 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (expected_parent != NULL &&
-		    ft_group_skip_compressed(ft->group) &&
 		    counted_children == 1 && !external_nodes) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: internal node %p has 1 child and no external_nodes (should be a 1-byte compressed in skip mode)\n",
 					depth, node_flag);
 			return -1;
 		}
+#endif
 #endif
 		/* Verify nr_keys. */
 		{
