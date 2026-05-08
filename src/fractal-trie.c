@@ -11632,7 +11632,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	}
 
 	/* 1. Build old suffix → old child. */
-	if (suffix_len >= 2) {
+	if (suffix_len >= 1) {
 		struct cds_ft_compressed_node *sfx;
 		struct cds_ft_metadata *sfx_meta;
 
@@ -11647,26 +11647,13 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ft_set_parent(cn->child, old_suffix_flag, &sfx->child);
 		old_suffix_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
 		created[nr_created++] = old_suffix_flag;
-	} else if (suffix_len == 1) {
-		struct cds_ft_inode_flag *dest = NULL;
-
-		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[diverge_pos + 1],
-				cn->child, NULL, NULL, junction_depth + 1);
-		if (ret) goto error;
-		{
-			struct cds_ft_metadata *m =
-				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			ft_nr_keys_store(ft, m, old_child_nr_keys, CMM_RELAXED);
-		}
-		old_suffix_flag = dest;
-		created[nr_created++] = dest;
 	} else {
 		/* suffix_len == 0: old child directly. */
 		old_suffix_flag = cn->child;
 	}
 
 	/* 2. Build new branch → new leaf. */
-	if (new_len >= 2) {
+	if (new_len >= 1) {
 		struct cds_ft_compressed_node *nb;
 		struct cds_ft_metadata *nb_meta;
 
@@ -11686,21 +11673,6 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ft_set_parent(nb->child, new_branch_flag, NULL);
 		new_branch_flag = ft_publish_compressed(ft, nb, new_branch_flag);
 		created[nr_created++] = new_branch_flag;
-	} else if (new_len == 1) {
-		struct cds_ft_inode_flag *dest = NULL;
-
-		ret = ft_node_set_nth(ft, &dest,
-				iter_key[diverge_pos + 1],
-				(struct cds_ft_inode_flag *) child_node, NULL, NULL,
-				junction_depth + 1);
-		if (ret) goto error;
-		{
-			struct cds_ft_metadata *m =
-				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			ft_nr_keys_store(ft, m, 1, CMM_RELAXED);
-		}
-		new_branch_flag = dest;
-		created[nr_created++] = dest;
 	} else {
 		/* new_len == 0: child_node directly. */
 		new_branch_flag = (struct cds_ft_inode_flag *) child_node;
@@ -12173,7 +12145,13 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	struct cds_ft_metadata *cn_meta;
 	int j;
 
-	if (path_len < 2)
+	/*
+	 * Length-1 compressed nodes are canonical under
+	 * FEATURE_FT_SKIP_COMPRESSED: the publish wraps cn into a
+	 * SKIP_X-tagged slot pointer, dispatching for free relative to
+	 * the 1-child internal node it replaces.
+	 */
+	if (path_len < 1)
 		return NULL;
 	cn = alloc_compressed_node(ft, path_len, &cn_meta);
 	if (!cn)
@@ -16631,8 +16609,14 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 	if (start == end)
 		return leaf;	/* path_len == 0. */
 
-	/* Try compression over [compress_start, end). */
-	if (end >= compress_start + 2) {
+	/*
+	 * Try compression over [compress_start, end).  Floor is len 1:
+	 * a 1-byte compressed under FEATURE_FT_SKIP_COMPRESSED publishes
+	 * as a SKIP_X-tagged slot pointer (free dispatch) and is the
+	 * canonical replacement for what would otherwise be a non-root
+	 * 1-child internal node.
+	 */
+	if (end >= compress_start + 1) {
 		struct cds_ft_inode_flag *compressed;
 
 		compressed = ft_try_compress_chain(ft, key, end,
