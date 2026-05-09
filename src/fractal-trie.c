@@ -6186,6 +6186,12 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 		if (!node_flag)
 			goto out_break;
 		/*
+		 * cn->child is a slot-context value; resolve once here so the
+		 * caller's descent loop can drop its top-of-iteration resolve.
+		 * See ft_descent_traverse_compressed for the same contract.
+		 */
+		node_flag = ft_resolve_skip_compressed(node_flag);
+		/*
 		 * iter_path[level] is the dispatcher for byte at index
 		 * level - 1 (i.e. the byte AFTER the compressed prefix).
 		 * That dispatcher is cn->child, not the compressed node
@@ -6218,6 +6224,7 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			if (!node_flag)
 				goto out_break;
+			node_flag = ft_resolve_skip_compressed(node_flag);
 			iter_path_node(iter)[level] = node_flag;
 			iter_path_node(iter)[level + 1] = node_flag;
 			*skip_eq_external_nodes_p = false;
@@ -6242,6 +6249,7 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 	node_flag = ft_dereference_acquire_prefetch(cn->child);
 	if (!node_flag)
 		goto out_break;
+	node_flag = ft_resolve_skip_compressed(node_flag);
 	iter_path_node(iter)[level] = node_flag;
 	iter_path_node(iter)[level + 1] = node_flag;
 	if (ft_node_external_direct(node_flag))
@@ -6314,6 +6322,8 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 		iter_path_node(iter), level, node_flag);
 	level += cn->len - 1;
 	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	if (caa_likely(node_flag != NULL))
+		node_flag = ft_resolve_skip_compressed(node_flag);
 	if (!node_flag) {
 		/*
 		 * Invariant violation: a reachable compressed node always
@@ -6852,10 +6862,16 @@ descend_children:
 		if (ft_node_external_direct(node_flag))
 			break;
 		/*
-		 * Skip-compressed: convert to compressed flag.
-		 */
-		node_flag = ft_resolve_skip_compressed(node_flag);
-		/*
+		 * node_flag is post-resolve at every loop iteration:
+		 *  - first iter: from descend_children entry, where any
+		 *    cn->child read in ft_inequality_compressed already
+		 *    resolves; or from the going_up phase via
+		 *    ft_node_get_leftright (resolves through
+		 *    ft_node_get_direction);
+		 *  - subsequent iters: from ft_node_get_minmax (below) or
+		 *    ft_inequality_minmax_compressed, which both resolve
+		 *    cn->child before exposing it.
+		 *
 		 * Compressed node: traverse through the compressed
 		 * path to reach the child.  Fill ordinal_key and
 		 * iter path as we go.
@@ -10274,13 +10290,17 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 	ft_descent_init(d, ft);
 	*nr_snapshot = 0;
 
+	/*
+	 * d->nf is post-resolve at every loop iteration: ft_descent_init
+	 * resolves on entry; ft_descent_step (via ft_node_get_nth) and
+	 * ft_descend_to_graft_point_compressed (via
+	 * ft_descent_traverse_compressed) resolve before storing.
+	 */
 	for (; d->depth < key_len; ) {
 		uint8_t kv;
 
 		if (ft_node_external_direct(d->nf))
 			break;
-		/* Resolve skip-compressed (e.g. from collapsed entry). */
-		d->nf = ft_resolve_skip_compressed(d->nf);
 		if (ft_node_compressed_in_node(d->nf)) {
 			enum ft_descent_action act;
 
@@ -10478,7 +10498,14 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	else
 		ft_node_get_nth(prefix_flag, &d->pnfp,
 				cn->key_bytes[0], FT_PF_NONE);
-	d->nf = suffix_flag;
+	/*
+	 * suffix_flag is the newly built sub-trie published into the
+	 * parent's slot via ft_publish_compressed, so it may be
+	 * SKIP-encoded under FEATURE_FT_SKIP_COMPRESSED.  Normalise
+	 * d->nf to post-resolve form to match the contract upheld by
+	 * ft_descent_init / ft_descent_step / ft_descent_traverse_compressed.
+	 */
+	d->nf = ft_resolve_skip_compressed(suffix_flag);
 	d->nfp = d->pnfp;
 	d->depth += remaining;
 
@@ -11055,17 +11082,11 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		/* Snapshot old content at the graft slot. */
 		old_child = d.nf;
 		/*
-		 * d.nf carries the in-slot encoding, so when the graft point
-		 * sits above a compressed sub-trie under FEATURE_FT_SKIP_
-		 * COMPRESSED it arrives skip-tagged (SKIP_EXT / SKIP_QP /
-		 * SKIP_PIGEON).  graft_swap then treats @old_child as a
-		 * payload — accounting (nr_keys), parent re-link, and
-		 * publication as swap_ft's root all need the underlying
-		 * compressed-node form, not the slot-form skip pointer that
-		 * points "through" the cn to its child.  Resolve once here
-		 * so the rest of the block is uniform.
+		 * d.nf is post-resolve at ft_descend_to_graft_point exit:
+		 * every path that sets it (ft_descent_init, ft_descent_step,
+		 * ft_descent_traverse_compressed, and the split helpers) now
+		 * stores the post-resolve form.  No additional resolve here.
 		 */
-		old_child = ft_resolve_skip_compressed(old_child);
 
 		old_swap_root = swap_ft->root;
 		swap_rmeta = ft_root_metadata(swap_ft);
@@ -12003,6 +12024,7 @@ enum ft_descent_action ft_lookup_nth_compressed(
 		*level_p = level;
 		return FT_DESCENT_BREAK;
 	}
+	node_flag = ft_resolve_skip_compressed(node_flag);
 	iter_path_node(iter)[level] = node_flag;
 	if (ft_node_external_direct(node_flag)) {
 		*node_flag_p = node_flag;
@@ -12188,6 +12210,7 @@ enum ft_descent_action ft_lookup_nth_last_compressed(
 				*level_p = level;
 				return FT_DESCENT_BREAK;
 			}
+			node_flag = ft_resolve_skip_compressed(node_flag);
 			iter_path_node(iter)[level] = node_flag;
 			if (ft_node_external_direct(node_flag)) {
 				*node_flag_p = node_flag;
