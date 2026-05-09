@@ -191,16 +191,29 @@ enum ft_kind {
 #define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 1)	/* Maximum depth, including root. */
 
 /*
- * ft_types[] internal-class slot count: T0..T3 (QP hi tiers) at
- * indices 0..3, PIGEON at index 4.  Lo-nodes share the FT_KIND_QP
- * slot-tag with hi-nodes (HI/LO disambiguated via metadata is_lo bit
- * during the parent walk) and are never indexed into ft_types[].
- * NODE_INDEX_NULL is the one-past-the-end sentinel, used by recompact
- * / verify code to encode "elide this node"; ft_types[] keeps a
- * trailing FT_NULL entry at that index so &ft_types[NODE_INDEX_NULL]
- * is in-bounds.
+ * ft_types[] internal-class slot count.  Per-class entries (one
+ * per node class), indexed by class — not per QP tier.  QP's four
+ * allocation tiers (T0..T3, orders 5..8) are handled internally
+ * via the parallel ft_qp16_tiers[] table; the recompact framework
+ * sees QP as a single entry that the QP-internal tier picker
+ * (ft_qp16_alloc_order, popcount-driven) sub-resolves to a tier.
+ *
+ * Lo-nodes share the FT_KIND_QP slot-tag with hi-nodes (HI/LO
+ * disambiguated via metadata is_lo bit during the parent walk)
+ * and are never indexed into ft_types[].
+ *
+ * NODE_INDEX_NULL is the one-past-the-end sentinel, used by
+ * recompact / verify code to encode "elide this node"; ft_types[]
+ * keeps a trailing FT_NULL entry at that index so
+ * &ft_types[NODE_INDEX_NULL] is in-bounds.
+ *
+ * Indices: FT_QP_INDEX = 0, FT_PIGEON_INDEX = 1.  Future Stage 3
+ * (POPCOUNT_32 / POPCOUNT_64) reserves indices 0..1 for the
+ * popcount-byte classes and shifts QP / PIGEON to 2 / 3.
  */
-#define FT_NUM_INTERNAL_TYPES	5U
+#define FT_QP_INDEX		0U
+#define FT_PIGEON_INDEX		1U
+#define FT_NUM_INTERNAL_TYPES	2U
 #define NODE_INDEX_NULL		FT_NUM_INTERNAL_TYPES
 
 /*

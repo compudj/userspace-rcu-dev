@@ -187,48 +187,53 @@ enum {
 
 /*
  * ft_types[]: write-side per-class metadata (allocator order, child
- * count bounds, bitmap requirement).  The kind tag bits encode the
+ * count bounds, bitmap requirement).  One entry per node class —
+ * QP's four tier orders are an internal detail captured by the
+ * parallel ft_qp16_tiers[] table.  The kind tag bits encode the
  * dispatch class directly, so this table is not consulted on the
  * read-side hot path.
  *
- *   [0..3] = QP T0..T3 — type_class FT_QP, orders 5..8 (32..256 B
- *            qp16_node), max_child = 3 / 7 / 15 / 16 (lo-bucket count
- *            on the hi-node).  Encoded on-pointer as FT_KIND_QP;
- *            tier is recovered from cds_ft_item_order().
- *   [4]    = PIGEON — type_class FT_PIGEON, order 11 (2048 B), kept
- *            for the eventual QP→PIGEON transition (§4.7.1, deferred).
- *            Currently unreachable: QP byte-stages cap at 16 hi-buckets
- *            naturally (16 nibbles), so popcount(hi_bm) > 16 is
- *            impossible and the tier picker stays inside [0..3].
+ *   [FT_QP_INDEX]     = QP class — 16-nibble bitmap, popcount-
+ *            indexed ptrs[].  Internal tier picker (T0..T3 at
+ *            orders 5..8) is popcount-driven via
+ *            ft_qp16_alloc_order; ft_types[FT_QP_INDEX].order
+ *            holds the T0 default for fresh allocations.  Upper
+ *            bound is enforced by the QP→PIGEON CL-footprint
+ *            trigger (qp_subtree_half_cls > FT_PIGEON_HALF_CLS),
+ *            not by max_child.
+ *   [FT_PIGEON_INDEX] = PIGEON class — order 11 (2048 B), dense
+ *            256-entry pointer array.  min_child = 24 is the
+ *            conservative hysteresis demote threshold, lower than
+ *            the forward QP→PIGEON CL-footprint trigger (~ 60+
+ *            children depending on subtree shape) so a PIGEON →
+ *            QP demotion lands in a QP that won't immediately
+ *            re-fire the forward trigger.
  *   [NODE_INDEX_NULL] = FT_NULL sentinel — &ft_types[NODE_INDEX_NULL]
  *            is materialized by recompact when eliding a node, but
  *            never dereferenced.
  */
 const struct cds_ft_type ft_types[] = {
 	/*
-	 * FT_QP tier max_child / min_child are *byte-children* counts
-	 * (sum of lo_meta nr_child across hi-buckets), not popcount(hi_bm).
-	 * The hi-node structural capacity (popcount(hi_bm) <= hi_capacity)
-	 * is FT_QP16_T{0,1,2,3}_CAPACITY = 3, 7, 15, 16 — used internally
-	 * by ft_qp16_node_set_nth_safe for the -ENOSPC trigger.  Since
-	 * each hi-bucket holds up to 16 lo-children, the byte-count cap
-	 * is hi_capacity * 16 (e.g. T0: 3 * 16 = 48 byte children fit
-	 * before the hi-node structurally maxes out).
+	 * FT_QP entry: max_child uses the byte-count ceiling at QP T3
+	 * (16 hi-buckets * 16 lo-children = 256) for find_nearest_type_index
+	 * walks coming from PIGEON.  In practice the lattice walk only
+	 * reaches FT_QP_INDEX from above (PIGEON → QP demote) — the QP→PIGEON
+	 * forward trigger is the CL-footprint check, not max_child.
 	 *
-	 * The recompact framework's new-tier picker (find_nearest_type_index
-	 * via metadata->nr_child + 1 / - 1) is bypassed for FT_QP — see
-	 * the FT_QP special-cases in ft_node_recompact's ADD_NEXT /
-	 * ADD_SAME / DEL switches.  Tier-up is triggered by structural
-	 * -ENOSPC from set_nth_safe (popcount-based), not by byte-count
-	 * exceeding max_child.
+	 * Tier-up within QP (T0→T1→T2→T3) is bypassed in the lattice walk:
+	 * see the FT_QP special-cases in ft_node_recompact's ADD_NEXT /
+	 * ADD_SAME / DEL switches, which use ft_qp16_tiers[] / popcount
+	 * directly.
 	 */
-	[0] = { .type_class = FT_QP, .min_child = 1,  .max_child = FT_QP16_T0_CAPACITY * 16, .order = FT_QP16_T0_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
-	[1] = { .type_class = FT_QP, .min_child = 2,  .max_child = FT_QP16_T1_CAPACITY * 16, .order = FT_QP16_T1_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
-	[2] = { .type_class = FT_QP, .min_child = 5,  .max_child = FT_QP16_T2_CAPACITY * 16, .order = FT_QP16_T2_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
-	[3] = { .type_class = FT_QP, .min_child = 11, .max_child = FT_QP16_T3_CAPACITY * 16, .order = FT_QP16_T3_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
-	[4] = { .type_class = FT_PIGEON, .min_child = 8, .max_child = ft_type_pigeon_max_child, .order = FT_PIGEON_ORDER, .bitmap = FT_BITMAP },
+	[FT_QP_INDEX] = { .type_class = FT_QP, .min_child = 1,
+		.max_child = FT_QP16_T3_CAPACITY * 16,
+		.order = FT_QP16_T0_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
+	[FT_PIGEON_INDEX] = { .type_class = FT_PIGEON, .min_child = 24,
+		.max_child = ft_type_pigeon_max_child,
+		.order = FT_PIGEON_ORDER, .bitmap = FT_BITMAP },
 	/* NULL sentinel at NODE_INDEX_NULL (= FT_NUM_INTERNAL_TYPES). */
-	[NODE_INDEX_NULL] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_null_max_child, .bitmap = FT_NO_BITMAP },
+	[NODE_INDEX_NULL] = { .type_class = FT_NULL, .min_child = 0,
+		.max_child = ft_type_null_max_child, .bitmap = FT_NO_BITMAP },
 };
 
 /*
@@ -1397,16 +1402,16 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
 }
 
 /*
- * Recover the ft_types[] slot index for an internal node flag.
+ * Recover the ft_types[] class index for an internal node flag.
  * Returns NODE_INDEX_NULL for a NULL pointer.  Asserts on COMPRESSED
  * (compressed nodes have no type-table slot) and on any non-internal
  * kind.
  *
- * QP-hi nodes (FT_KIND_QP) share one nibble across all tiers; the
- * per-tier slot index is recovered from the alloc order (T0..T3 =
- * orders 5..8 = ft_types[0..3]).  PIGEON (FT_KIND_PIGEON) maps to
- * ft_types[4].  The function is write-side / verify only — descent
- * dispatches on the kind tag directly without indexing ft_types[].
+ * One index per class: FT_KIND_QP → FT_QP_INDEX, FT_KIND_PIGEON →
+ * FT_PIGEON_INDEX.  QP's tier (T0..T3, alloc orders 5..8) is recovered
+ * separately via cds_ft_item_order(ft_node_ptr_internal(node)) and
+ * indexed into ft_qp16_tiers[].  Descent dispatches on the kind tag
+ * directly without indexing ft_types[].
  */
 static inline_lookup
 unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
@@ -1418,16 +1423,28 @@ unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
 	assert(!ft_node_compressed_in_node(node));
 
 	tag = (unsigned long) node & FT_KIND_MASK_INTERNAL;
-	if (tag == FT_KIND_QP) {
-		size_t order = cds_ft_item_order(ft_node_ptr_internal(node));
-		assert(order >= FT_QP16_T0_ALLOC_ORDER
-			&& order < FT_QP16_T0_ALLOC_ORDER + FT_QP16_NR_TIERS);
-		return (unsigned int) (order - FT_QP16_T0_ALLOC_ORDER);
-	}
+	if (tag == FT_KIND_QP)
+		return FT_QP_INDEX;
 	if (tag == FT_KIND_PIGEON)
-		return 4;
+		return FT_PIGEON_INDEX;
 	assert(0);
 	__builtin_unreachable();
+}
+
+/*
+ * Recover the QP tier index (0..FT_QP16_NR_TIERS-1) for a QP-tagged
+ * node flag.  Tier is encoded in the alloc order: T0 = order 5,
+ * T1 = 6, T2 = 7, T3 = 8.  Caller must have established FT_KIND_QP.
+ */
+static inline_lookup
+unsigned int ft_node_qp_tier(struct cds_ft_inode_flag *node)
+{
+	size_t order = cds_ft_item_order(ft_node_ptr_internal(node));
+
+	assert(((unsigned long) node & FT_KIND_MASK_INTERNAL) == FT_KIND_QP);
+	assert(order >= FT_QP16_T0_ALLOC_ORDER
+		&& order < FT_QP16_T0_ALLOC_ORDER + FT_QP16_NR_TIERS);
+	return (unsigned int) (order - FT_QP16_T0_ALLOC_ORDER);
 }
 
 static
@@ -2482,14 +2499,14 @@ bool valid_key_len(struct cds_ft *ft, size_t key_len)
 }
 
 static
-struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
-		const struct cds_ft_type *ft_type,
+struct cds_ft_inode *alloc_cds_ft_node_at_order(struct cds_ft *ft,
+		unsigned int order, bool bitmap,
 		struct cds_ft_metadata **_metadata)
 {
 	struct cds_ft_metadata *metadata;
 	void *p;
 
-	metadata = cds_ft_alloc_item(ft, ft_type->order, ft_type->bitmap);
+	metadata = cds_ft_alloc_item(ft, order, bitmap);
 	if (!metadata) {
 		return NULL;
 	}
@@ -2500,6 +2517,15 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 	}
 	*_metadata = metadata;
 	return p;
+}
+
+static
+struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
+		const struct cds_ft_type *ft_type,
+		struct cds_ft_metadata **_metadata)
+{
+	return alloc_cds_ft_node_at_order(ft, ft_type->order,
+			ft_type->bitmap, _metadata);
 }
 
 static
@@ -4478,7 +4504,11 @@ int _ft_node_set_nth(struct cds_ft *ft,
 		/*
 		 * hi_capacity is the structural hi-bucket count
 		 * (popcount(hi_bm) cap), derived from the tier order:
-		 * T0..T3 = 3 / 7 / 15 / 16.  type->max_child is the
+		 * T0..T3 = 3 / 7 / 15 / 16.  Recover the actual order
+		 * from cds_ft_item_order(node) — the flattened
+		 * ft_types[FT_QP_INDEX].order carries only the T0
+		 * default for fresh allocations and would mis-cap nodes
+		 * promoted to higher tiers.  type->max_child is the
 		 * *byte-children* count (hi_capacity * 16) used by the
 		 * recompact framework's nr_child accounting; passing it
 		 * as hi_capacity would let set_nth_safe overflow the
@@ -4487,7 +4517,8 @@ int _ft_node_set_nth(struct cds_ft *ft,
 		ret = ft_qp_byte_set(ft, node_flag,
 				(struct cds_ft_qp16_node *) node, metadata,
 				n, child_node_flag,
-				ft_qp16_capacity_from_order(type->order));
+				ft_qp16_capacity_from_order(
+					(unsigned int) cds_ft_item_order(node)));
 		break;
 	case FT_NULL:
 		return -ENOSPC;
@@ -4620,6 +4651,15 @@ int ft_node_recompact(enum ft_recompact mode,
 	struct cds_ft_metadata *new_metadata;
 	const struct cds_ft_type *new_type;
 	struct cds_ft_inode_flag *new_node_flag = NULL;
+	/*
+	 * Effective allocation order for the new node.  For non-QP
+	 * classes equals new_type->order; for QP, the QP-internal
+	 * tier picker (popcount-driven) overrides ft_types' default
+	 * since the flattened ft_types[FT_QP_INDEX] only carries the
+	 * T0 default.  Initialised to a sentinel; assigned by every
+	 * arm before the alloc.
+	 */
+	unsigned int new_alloc_order = 0;
 	int ret;
 
 	switch (mode) {
@@ -4630,21 +4670,35 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * If old's hi was at full structural capacity (popcount ==
 		 * hi_capacity), tier up; else same-tier rebuild suffices
 		 * (the merged walk weaves the new byte in nibble order).
+		 * At T3 + full capacity, escalate to PIGEON (no higher QP
+		 * tier).
 		 */
 		if (old_type->type_class == FT_QP) {
 			struct cds_ft_qp16_node *qp_old =
 				(struct cds_ft_qp16_node *) old_node;
 			unsigned int old_pop = (unsigned int) __builtin_popcount(
 					uatomic_load(&qp_old->bitmap, CMM_RELAXED));
-			unsigned int old_cap = ft_qp16_capacity_from_order(
-					old_type->order);
+			unsigned int old_order = (unsigned int)
+				cds_ft_item_order(old_node);
+			unsigned int old_tier = old_order - FT_QP16_T0_ALLOC_ORDER;
+			unsigned int old_cap = ft_qp16_capacity_from_order(old_order);
 
-			if (old_pop >= old_cap)
-				new_type_index = old_type_index + 1;
-			else
-				new_type_index = old_type_index;
-			dbg_printf("Recompact FT_QP add-same: tier %u -> %u (pop=%u cap=%u)\n",
-				old_type_index, new_type_index, old_pop, old_cap);
+			if (old_pop >= old_cap
+			    && old_tier + 1 >= FT_QP16_NR_TIERS) {
+				/* T3 full -> PIGEON escalation. */
+				new_type_index = FT_PIGEON_INDEX;
+				dbg_printf("Recompact FT_QP add-same T3 -> PIGEON (pop=%u cap=%u)\n",
+					old_pop, old_cap);
+			} else {
+				unsigned int new_tier =
+					(old_pop >= old_cap) ?
+					old_tier + 1 : old_tier;
+
+				new_type_index = FT_QP_INDEX;
+				new_alloc_order = ft_qp16_tiers[new_tier].order;
+				dbg_printf("Recompact FT_QP add-same: tier %u -> %u (pop=%u cap=%u)\n",
+					old_tier, new_tier, old_pop, old_cap);
+			}
 			break;
 		}
 		new_type_index = find_nearest_type_index(old_type_index,
@@ -4660,13 +4714,34 @@ int ft_node_recompact(enum ft_recompact mode,
 			/*
 			 * FT_QP -ENOSPC recompact: structural hi-bucket overflow
 			 * (popcount(hi_bm) == hi_capacity, new bit needed).  Tier
-			 * up by exactly one — byte-count semantic on max_child
-			 * does not capture the structural trigger.
+			 * up within QP by exactly one — byte-count semantic on
+			 * max_child does not capture the structural trigger.  At
+			 * QP T3 (highest tier, 16-bit hi-bitmap full), there is
+			 * no higher QP tier; escalate to PIGEON directly.  Note
+			 * that the CL-footprint trigger (qp_subtree_half_cls >
+			 * FT_PIGEON_HALF_CLS) usually fires first, but a worst-
+			 * case shape can still reach T3 ENOSPC without crossing
+			 * the footprint threshold.
 			 */
 			if (old_type->type_class == FT_QP) {
-				new_type_index = old_type_index + 1;
-				dbg_printf("Recompact FT_QP tier-up %u -> %u\n",
-					old_type_index, new_type_index);
+				unsigned int old_order = (unsigned int)
+					cds_ft_item_order(old_node);
+				unsigned int old_tier = old_order
+					- FT_QP16_T0_ALLOC_ORDER;
+
+				if (old_tier + 1 < FT_QP16_NR_TIERS) {
+					unsigned int new_tier = old_tier + 1;
+
+					new_type_index = FT_QP_INDEX;
+					new_alloc_order =
+						ft_qp16_tiers[new_tier].order;
+					dbg_printf("Recompact FT_QP tier-up %u -> %u\n",
+						old_tier, new_tier);
+				} else {
+					/* T3 -> PIGEON escalation. */
+					new_type_index = FT_PIGEON_INDEX;
+					dbg_printf("Recompact FT_QP T3 -> PIGEON\n");
+				}
 				break;
 			}
 			new_type_index = find_nearest_type_index(old_type_index,
@@ -4685,22 +4760,42 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * grained tier-down policy yet (deferred).
 		 */
 		if (old_type->type_class == FT_QP) {
-			if (metadata->nr_child <= 1)
-				new_type_index = is_root ? 0 : NODE_INDEX_NULL;
-			else
-				new_type_index = old_type_index;
-			dbg_printf("Recompact FT_QP del tier %u (nr_child %u)\n",
-				new_type_index, metadata->nr_child);
+			if (metadata->nr_child <= 1) {
+				new_type_index = is_root ? FT_QP_INDEX : NODE_INDEX_NULL;
+				if (new_type_index != NODE_INDEX_NULL)
+					new_alloc_order = FT_QP16_T0_ALLOC_ORDER;
+			} else {
+				new_type_index = FT_QP_INDEX;
+				new_alloc_order = (unsigned int)
+					cds_ft_item_order(old_node);
+			}
+			dbg_printf("Recompact FT_QP del tier (nr_child %u)\n",
+				metadata->nr_child);
 			break;
 		}
 		new_type_index = find_nearest_type_index(old_type_index,
 			metadata->nr_child - 1, is_root);
+		/*
+		 * PIGEON -> QP demotion: lattice walk lands at FT_QP_INDEX
+		 * but ft_types[FT_QP_INDEX].order is the T0 default (3 hi-
+		 * bucket capacity) — too small for any PIGEON population
+		 * that crossed the hysteresis threshold.  Pick T3 (16 hi-
+		 * bucket capacity) to accommodate any byte-child
+		 * distribution.  Subsequent FT_QP DEL passes stay at the
+		 * current order (no internal tier-down policy yet).
+		 */
+		if (new_type_index == FT_QP_INDEX
+		    && old_type->type_class == FT_PIGEON)
+			new_alloc_order = FT_QP16_T3_ALLOC_ORDER;
 		dbg_printf("Recompact for node with %u children\n",
 			metadata->nr_child - 1);
 		break;
 	case FT_RECOMPACT_REPARENT:
 		/* Same-type clone: no add, no delete, no resize. */
 		new_type_index = old_type_index;
+		if (old_type->type_class == FT_QP)
+			new_alloc_order = (unsigned int)
+				cds_ft_item_order(old_node);
 		break;
 	default:
 		assert(0);
@@ -4711,7 +4806,17 @@ int ft_node_recompact(enum ft_recompact mode,
 			old_type_index, new_type_index);
 	new_type = &ft_types[new_type_index];
 	if (new_type_index != NODE_INDEX_NULL) {
-		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
+		/*
+		 * Switch arms above leave new_alloc_order at 0 unless they
+		 * have a tier-specific override (QP popcount-driven tier-up,
+		 * PIGEON->QP demote landing at T3).  When unset, fall back
+		 * to new_type->order — which is correct for non-QP types and
+		 * the T0 default for fresh QP allocations.
+		 */
+		if (new_alloc_order == 0)
+			new_alloc_order = new_type->order;
+		new_node = alloc_cds_ft_node_at_order(ft, new_alloc_order,
+				new_type->bitmap, &new_metadata);
 		if (!new_node)
 			return -ENOMEM;
 
@@ -4733,12 +4838,14 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * Initialize half-CL accounting for the new node.  For
 		 * FT_QP, the lattice walk's Path-1 / Path-2b calls in
 		 * _ft_node_set_nth accumulate the lo costs as bytes are
-		 * inserted; the hi's own footprint is seeded here.  For
+		 * inserted; the hi's own footprint is seeded here.  Use
+		 * the QP-internal alloc order (per-tier) rather than the
+		 * flattened ft_types[FT_QP_INDEX].order (T0 default).  For
 		 * FT_PIGEON the field is unused (a different union arm).
 		 */
 		if (new_type->type_class == FT_QP)
 			new_metadata->qp_subtree_half_cls =
-				(uint8_t) ft_node_half_cls(new_type->order);
+				(uint8_t) ft_node_half_cls(new_alloc_order);
 	} else {
 		new_node = NULL;
 		new_node_flag = NULL;
@@ -14837,6 +14944,12 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			unsigned int type_index = ft_node_type_index(node_flag);
 			const struct cds_ft_type *type = &ft_types[type_index];
 			size_t actual_order = cds_ft_item_order(node);
+			/*
+			 * Expected order: for FT_QP, the per-tier order
+			 * lives in ft_qp16_tiers[]; ft_types[FT_QP_INDEX].order
+			 * is only the T0 default for fresh allocations.
+			 */
+			unsigned int expected_order = type->order;
 
 			if (type->type_class != FT_PIGEON
 			    && type->type_class != FT_QP) {
@@ -14847,12 +14960,23 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 						type_index);
 				return -1;
 			}
-			if (actual_order != type->order) {
+			if (type->type_class == FT_QP) {
+				if (actual_order < FT_QP16_T0_ALLOC_ORDER
+				    || actual_order >= FT_QP16_T0_ALLOC_ORDER + FT_QP16_NR_TIERS) {
+					if (out)
+						fprintf(out, "ft_verify: depth %u: internal QP node %p alloc order %zu out of T0..T3 range\n",
+							depth, node_flag,
+							actual_order);
+					return -1;
+				}
+				expected_order = (unsigned int) actual_order;
+			}
+			if (actual_order != expected_order) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: internal node %p alloc order %zu mismatches type %u expected order %u\n",
 						depth, node_flag,
 						actual_order, type_index,
-						(unsigned int) type->order);
+						expected_order);
 				return -1;
 			}
 			if (metadata->nr_child > type->max_child) {
