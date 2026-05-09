@@ -5478,7 +5478,22 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		status = CDS_FT_STATUS_NOT_FOUND; \
 		goto end; \
 	} \
-	if (track && caa_likely(ft_node_internal(node_flag)) \
+	/*  \
+	 * Filter SKIP-X tags before consulting ft_node_internal: the \
+	 * QP byte-step above can return SKIP-tagged children (per the \
+	 * "Skip-compressed children produced by ft_qp_byte_get stay \
+	 * tagged here" contract), and ft_node_internal asserts a \
+	 * post-resolve input.  In track mode the SKIP-X step represents \
+	 * a multi-level compressed cluster traversal; recording its \
+	 * external_nodes via ft_flag_to_metadata_fast would also be \
+	 * incorrect because that fast variant strips the tag and indexes \
+	 * the underlying child, which for SKIP_EXT is an external leaf \
+	 * (not in our arena).  Skip the track update for SKIP-X iters; \
+	 * the subsequent SKIP handler resolves the value and the next \
+	 * iter records the resolved node. \
+	 */ \
+	if (track && !ft_node_skip_compressed_in_slot(node_flag) \
+	    && caa_likely(ft_node_internal(node_flag)) \
 	    && i < key_depth - 1) { \
 		struct cds_ft_metadata *metadata = \
 			ft_flag_to_metadata_fast(node_flag); \
