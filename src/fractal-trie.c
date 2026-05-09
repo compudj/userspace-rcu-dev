@@ -5662,41 +5662,159 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * path without comparison).
 		 */
 		if (ft_node_skip_compressed_in_slot(node_flag)) {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			unsigned long skip_kind =
+				(unsigned long) node_flag & FT_KIND_MASK;
+#endif
 			if (!descend_cand) {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Non-cand mode + SKIP_EXT: SKIP_EXT only
+				 * exists in spec-validate groups (Phase 1
+				 * gate in ft_publish_compressed and
+				 * ft_publish_to_parent), so
+				 * speculative_key_offset is always available
+				 * here.  Recover the implicit cn_len from
+				 * the leaf's stored key length and run the
+				 * cn-prefix compare against the leaf's
+				 * stored bytes — never dereference
+				 * ext->prev (mutator-only after this
+				 * redesign).
+				 *
+				 * Gated on key_map.identity: the leaf's
+				 * stored bytes are in user space, while
+				 * the trie's path bytes (and the input
+				 * key) are in ordinal space.  When
+				 * identity, the two coincide and the
+				 * compare is a direct memcmp.  Non-identity
+				 * spec groups in track mode are rare; they
+				 * fall through to ft_skip_to_compressed
+				 * (the still-racy path) until a future
+				 * follow-up reverse-maps before compare.
+				 *
+				 * Track-mode bookkeeping is inline:
+				 * full match terminates at the leaf at
+				 * depth leaf_key_len; partial match
+				 * (input longer than leaf) records the
+				 * leaf as the longest-match candidate
+				 * for track_longest before NOT_FOUND.
+				 */
+				if (skip_kind == FT_KIND_SKIP_EXT
+				    && ft->group->key_map.identity) {
+					struct cds_ft_node *leaf =
+						(struct cds_ft_node *)
+						((unsigned long) node_flag - FT_KIND_SKIP_EXT);
+					const uint8_t *leaf_key =
+						(const uint8_t *) leaf +
+						ft->group->speculative_key_offset;
+					size_t leaf_key_len;
+					size_t input_remaining = key_len - i;
+					size_t cn_len_implied;
+
+					assert(ft->group->speculative_validated);
+					if (ft->group->speculative_key_len_offset !=
+							CDS_FT_SPECULATIVE_OFFSET_NONE) {
+						leaf_key_len = *(const size_t *)
+							((const uint8_t *) leaf +
+							 ft->group->speculative_key_len_offset);
+					} else {
+						/*
+						 * Fixed-length group: leaf
+						 * stores the full fixed_key_len.
+						 * For non-cand descent, key_len
+						 * == fixed_key_len (length is
+						 * group invariant), so leaf
+						 * sits at exactly key_len.
+						 */
+						leaf_key_len = key_len;
+					}
+					assert(leaf_key_len > i);
+					cn_len_implied = leaf_key_len - i;
+					if (cn_len_implied > input_remaining) {
+						/* Leaf longer than remaining input. */
+						status = CDS_FT_STATUS_NOT_FOUND;
+						goto end;
+					}
+					if (memcmp(key, leaf_key + i, cn_len_implied) != 0) {
+						status = CDS_FT_STATUS_NOT_FOUND;
+						goto end;
+					}
+					if (cn_len_implied < input_remaining) {
+						/*
+						 * Input longer than leaf — partial
+						 * match.  For track_longest, leaf
+						 * at depth leaf_key_len is the
+						 * longest matching prefix.
+						 */
+						if (track) {
+							match_len = leaf_key_len;
+							match_node = leaf;
+						}
+						status = CDS_FT_STATUS_NOT_FOUND;
+						goto end;
+					}
+					/*
+					 * cn_len_implied == input_remaining:
+					 * exact match at leaf depth.  Advance
+					 * i/key by cn_len_implied and let the
+					 * post-loop terminal handler (line
+					 * ~5888) record the leaf and set OK.
+					 */
+					key += cn_len_implied;
+					i += cn_len_implied - 1;
+					node_flag = (struct cds_ft_inode_flag *) leaf;
+					if (iter) {
+						iter_path_node(iter)[i + 1] = node_flag;
+						iter_path_len = i + 2;
+					}
+					/*
+					 * Next iter top: EXT direct test
+					 * (line ~5852) breaks to the post-
+					 * loop terminal handler.
+					 */
+					continue;
+				}
+#endif
 				node_flag = ft_compressed_node_flag(
 					ft_skip_to_compressed(node_flag));
 			} else {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-				unsigned long skip_kind =
-					(unsigned long) node_flag & FT_KIND_MASK;
 				/*
 				 * SKIP_EXT fast path: target is a leaf, so
 				 * the descent is about to terminate anyway.
 				 * Don't recover skip_len (would force an
-				 * extra CL load via ext->prev → cn->len);
-				 * don't advance key/i (dead, the loop breaks
-				 * on ft_node_external_direct next iter); the end-of-
-				 * descent leaf-bytes compare validates the
-				 * full key, including any bytes covered by
-				 * this skip.
+				 * extra CL load via ext->prev → cn->len —
+				 * and ext->prev is mutator-only); don't
+				 * advance key/i (dead, the loop breaks on
+				 * ft_node_external_direct next iter); for
+				 * spec_validate, the end-of-descent leaf-
+				 * bytes compare validates the full key,
+				 * including any bytes covered by this
+				 * skip.  For pure candidate (no
+				 * spec_validate), the caller validates
+				 * against its stored key.
 				 *
 				 * Length mismatch (input shorter than leaf
 				 * key) is caught by the leaf compare's
-				 * length check; the CDS_FT_STATUS_NOT_FOUND
-				 * early-exit on `skip > remaining` is purely
-				 * a perf optimization for doomed lookups.
+				 * length check (spec_validate) or the
+				 * caller's stored-key compare (pure
+				 * candidate).
 				 */
-				if (caa_likely(spec_validate &&
-				    skip_kind == FT_KIND_SKIP_EXT)) {
-					if (first_skip_offset == key_len)
-						first_skip_offset = i;
-					needs_leaf_validate = true;
+				if (caa_likely(skip_kind == FT_KIND_SKIP_EXT)) {
+					if (spec_validate) {
+						if (first_skip_offset == key_len)
+							first_skip_offset = i;
+						needs_leaf_validate = true;
+					}
 					node_flag = ft_skip_child_ptr(node_flag);
 					if (iter) {
 						/*
 						 * Iter path: leaf sits at
 						 * depth key_len for an OK
-						 * lookup.  If status ends
+						 * lookup (spec_validate
+						 * enforces equal length;
+						 * pure candidate trusts
+						 * caller).  If status ends
 						 * up NOT_FOUND, path_valid
 						 * is cleared at end so this
 						 * value is moot.
@@ -5704,7 +5822,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						iter_path_node(iter)[key_len] = node_flag;
 						iter_path_len = key_len + 1;
 					}
-					if (node_flag)
+					if (node_flag && spec_validate)
 						/*
 						 * After ft_skip_child_ptr(SKIP_EXT),
 						 * node_flag has tag 0 (FT_KIND_EXT)
@@ -5805,11 +5923,12 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				}
 #endif
 				/*
-				 * Resolved kind (QP_HI / PIGEON / COMPRESSED /
-				 * EXT) is dispatched by the next iter's loop-top
-				 * fast paths.  EXT (from non-spec_validate cand
-				 * SKIP_EXT) is caught by the EXT direct test
-				 * which breaks to the terminal handler.
+				 * Resolved kind (QP_HI / PIGEON / COMPRESSED) is
+				 * dispatched by the next iter's loop-top fast
+				 * paths.  SKIP_EXT (any cand mode) was already
+				 * absorbed by the fast path above; this code
+				 * path only sees SKIP_QP / SKIP_PIGEON, whose
+				 * resolved targets are internal nodes.
 				 */
 			}
 		}
