@@ -1545,6 +1545,11 @@ bool ft_node_skip_compressed_in_slot(struct cds_ft_inode_flag *node)
  * layout, so skip_len lives in cds_ft_metadata::pigeon_skip_len.
  * One extra CL load (the metadata page).
  *
+ * SKIP_POPCOUNT_32: POPCOUNT_32's direct-variant 8-byte header has
+ * no spare bytes either; skip_len lives in
+ * cds_ft_metadata::popcount_skip_len (aliases pigeon_skip_len in
+ * the metadata union).  One extra CL load.
+ *
  * SKIP_EXT: the resolved child can be user-allocated outside our
  * arenas, so we cannot rely on inline storage.  Length recovery
  * routes through ft_skip_to_compressed (the external_node->prev →
@@ -1558,14 +1563,16 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
 	/*
-	 * Candidate E: SKIP_EXT (0x02) is 16-byte-aligned (bit 4 of
-	 * the leaf address may leak through `& 0x1F`).  Use `& 0x07`
-	 * to distinguish among the three SKIP_X kinds — SKIP_EXT
-	 * (0x02), SKIP_PIGEON (0x03), SKIP_QP (0x07).  Future
-	 * SKIP_POPCOUNT_* (0x0B / 0x13) need bits 3-4 and Stage 3
-	 * will widen the mask once they land.
+	 * Candidate E: SKIP_EXT (0x02) is 16-byte-aligned, so bit 4 of
+	 * the leaf address may leak into `v & 0x1F`.  Use a 4-bit mask
+	 * (0x0F): the bit-4 leak is ignored, and SKIP_EXT collapses to
+	 * 0x02 regardless of address bit 4.  This distinguishes SKIP_EXT
+	 * (0x02), SKIP_PIGEON (0x03), SKIP_QP (0x07), and
+	 * SKIP_POPCOUNT_32 (0x0B) cleanly.  SKIP_POPCOUNT_64 (0x13)
+	 * would alias SKIP_PIGEON under 4-bit mask — its handler will
+	 * widen the test to 5-bit and disambiguate via bit 4.
 	 */
-	unsigned long kind = v & 0x07UL;
+	unsigned long kind = v & 0x0FUL;
 	void *natural;
 
 	/*
@@ -1573,13 +1580,15 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 	 * kind.
 	 */
 	assert(kind == FT_KIND_SKIP_EXT || kind == FT_KIND_SKIP_QP
-		|| kind == FT_KIND_SKIP_PIGEON);
+		|| kind == FT_KIND_SKIP_PIGEON
+		|| kind == FT_KIND_SKIP_POPCOUNT_32);
 	/*
 	 * Branch order optimized for the lookup hot path: SKIP_QP is the
 	 * dominant input since the SKIP_EXT fast path in cds_ft_lookup
-	 * never reaches here.  SKIP_PIGEON is second (rare in practice).
-	 * SKIP_EXT falls through last and is only reached from off-hot-
-	 * path callers (verify / show_stats).
+	 * never reaches here.  SKIP_POPCOUNT_32 / SKIP_PIGEON come next
+	 * (small / large dense subtries respectively).  SKIP_EXT falls
+	 * through last and is only reached from off-hot-path callers
+	 * (verify / show_stats).
 	 *
 	 * SUB by the constant tag inside each branch: lets the prefetcher
 	 * recognize a constant-stride access and frees `kind` from being
@@ -1588,6 +1597,10 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 	if (caa_likely(kind == FT_KIND_SKIP_QP)) {
 		natural = (void *) (v - FT_KIND_SKIP_QP);
 		return ((const struct cds_ft_qp16_node *) natural)->skip_len;
+	}
+	if (kind == FT_KIND_SKIP_POPCOUNT_32) {
+		natural = (void *) (v - FT_KIND_SKIP_POPCOUNT_32);
+		return cds_ft_item_to_metadata(natural)->popcount_skip_len;
 	}
 	if (kind == FT_KIND_SKIP_PIGEON) {
 		natural = (void *) (v - FT_KIND_SKIP_PIGEON);
@@ -1598,9 +1611,10 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 }
 
 /*
- * Map a child kind tag (FT_KIND_EXT / FT_KIND_QP / FT_KIND_PIGEON)
- * to the corresponding skip-target kind tag (FT_KIND_SKIP_EXT /
- * FT_KIND_SKIP_QP / FT_KIND_SKIP_PIGEON).
+ * Map a child kind tag (FT_KIND_EXT / FT_KIND_QP / FT_KIND_PIGEON /
+ * FT_KIND_POPCOUNT_32) to the corresponding skip-target kind tag
+ * (FT_KIND_SKIP_EXT / FT_KIND_SKIP_QP / FT_KIND_SKIP_PIGEON /
+ * FT_KIND_SKIP_POPCOUNT_32).
  *
  * Skip-target kinds all have FT_KIND_SKIP_BIT (bit 1) set; the
  * conversion is a single OR (or, equivalently, ADD 0x2 since bit 1
@@ -1612,7 +1626,8 @@ unsigned long ft_kind_to_skip_kind(unsigned long child_kind)
 {
 	assert(child_kind == FT_KIND_EXT ||
 	       child_kind == FT_KIND_QP ||
-	       child_kind == FT_KIND_PIGEON);
+	       child_kind == FT_KIND_PIGEON ||
+	       child_kind == FT_KIND_POPCOUNT_32);
 	return child_kind | FT_KIND_SKIP_BIT;
 }
 
@@ -1625,7 +1640,8 @@ unsigned long ft_skip_kind_to_child_kind(unsigned long skip_kind)
 {
 	assert(skip_kind == FT_KIND_SKIP_EXT ||
 	       skip_kind == FT_KIND_SKIP_QP ||
-	       skip_kind == FT_KIND_SKIP_PIGEON);
+	       skip_kind == FT_KIND_SKIP_PIGEON ||
+	       skip_kind == FT_KIND_SKIP_POPCOUNT_32);
 	return skip_kind - FT_KIND_SKIP_BIT;
 }
 
@@ -1678,23 +1694,25 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		const struct cds_ft_compressed_node *cn)
 {
 	/*
-	 * Candidate E: child is one of EXT (0x00, 16B), QP (0x05,
-	 * 32B), or PIGEON (0x01, 32B).  EXT is 16-byte-aligned and
-	 * bit 4 of its address may leak through `& 0x1F`.  Use
-	 * `& 0x07`: cleanly extracts EXT (0x00), QP (0x05), and
-	 * PIGEON (0x01) — bit 4 is masked off.
+	 * Candidate E: child is one of EXT (0x00, 16B), QP (0x05, 32B),
+	 * PIGEON (0x01, 32B), POPCOUNT_32 (0x09, 32B).  EXT is 16-byte-
+	 * aligned and bit 4 of its address may leak under a 5-bit mask;
+	 * use `& 0x0F` to ignore the leak and still distinguish all four
+	 * direct-internal kinds (EXT 0x00, PIGEON 0x01, QP 0x05,
+	 * POPCOUNT_32 0x09).  POPCOUNT_64 (0x11) lands in B-followups
+	 * and will widen the mask to 5-bit there.
 	 */
-	unsigned long child_kind = (unsigned long) child & 0x07UL;
+	unsigned long child_kind = (unsigned long) child & 0x0FUL;
 	unsigned long skip_kind = ft_kind_to_skip_kind(child_kind);
 	unsigned int len = cn->len;
 
 	/* Bounded by FT_SKIP_LEN_MAX (uint8_t skip_len field). */
 	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
 	/*
-	 * Only EXT / QP_HI / PIGEON are valid skip targets.  COMPRESSED
-	 * is forbidden by the chain-compress invariant; ft_kind_to_skip_kind
-	 * asserts.  (QP-nibble lo-nodes share the QP tag and are not a
-	 * separate kind in the slot-tag space.)
+	 * Only EXT / QP_HI / PIGEON / POPCOUNT_32 are valid skip targets.
+	 * COMPRESSED is forbidden by the chain-compress invariant;
+	 * ft_kind_to_skip_kind asserts.  (QP-nibble lo-nodes share the
+	 * QP tag and are not a separate kind in the slot-tag space.)
 	 */
 	if (child_kind == FT_KIND_QP) {
 		/* QP is 32-byte aligned: ~31UL strips kind cleanly. */
@@ -1714,6 +1732,14 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 			cds_ft_item_to_metadata(natural_child);
 
 		meta->pigeon_skip_len = (uint8_t) len;
+	} else if (child_kind == FT_KIND_POPCOUNT_32) {
+		/* POPCOUNT_32 is 32-byte aligned: ~31UL strips kind cleanly. */
+		void *natural_child = (void *)
+			((unsigned long) child & ~31UL);
+		struct cds_ft_metadata *meta =
+			cds_ft_item_to_metadata(natural_child);
+
+		meta->popcount_skip_len = (uint8_t) len;
 	}
 	/*
 	 * Tag-encode by SUB of the child's tag value rather than masking
@@ -1721,10 +1747,10 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	 * 16-byte-aligned EXT pointers may legitimately have bit 4 set
 	 * as an address bit; ~0x1F would clear it and corrupt the
 	 * underlying pointer.  SUB by the kind value (0x00 for EXT,
-	 * 0x01 for PIGEON, 0x05 for QP) preserves bits 4+ of the
-	 * underlying address regardless of alignment.  The skip-tag is
-	 * OR'd in at the end since bit 1 (FT_KIND_SKIP_BIT) was clear
-	 * in every child kind.
+	 * 0x01 for PIGEON, 0x05 for QP, 0x09 for POPCOUNT_32) preserves
+	 * bits 4+ of the underlying address regardless of alignment.
+	 * The skip-tag is OR'd in at the end since bit 1
+	 * (FT_KIND_SKIP_BIT) was clear in every child kind.
 	 */
 	return (struct cds_ft_inode_flag *)
 		(((unsigned long) child - child_kind) | skip_kind);
@@ -16037,6 +16063,7 @@ struct cds_ft_stats {
 	uint64_t nr_skip_compressed_total;
 	uint64_t nr_skip_compressed_qp;
 	uint64_t nr_skip_compressed_pigeon;
+	uint64_t nr_skip_compressed_popcount_32;
 	uint64_t nr_skip_compressed_ext;
 	uint64_t qp_hi_half_cls_dist[256];
 	uint64_t nr_qp_hi_total;
@@ -16104,10 +16131,14 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 		if (ft_node_skip_compressed_in_slot(child_node_flag)) {
 			/*
 			 * Candidate E: 16-byte-aligned SKIP_EXT addresses can
-			 * have bit 4 set; use 0x07 (3-bit) tag extraction to
-			 * distinguish the three SKIP_X variants without leak.
+			 * have bit 4 set; a 5-bit `& 0x1F` would leak.  Use
+			 * 4-bit `& 0x0F`: SKIP_EXT (0x02), SKIP_PIGEON (0x03),
+			 * SKIP_QP (0x07), SKIP_POPCOUNT_32 (0x0B) are all
+			 * distinct under this mask.  SKIP_POPCOUNT_64 (0x13)
+			 * would alias SKIP_PIGEON under 4-bit mask and will
+			 * need a wider test once it lands.
 			 */
-			unsigned long tag = (unsigned long) child_node_flag & 0x07UL;
+			unsigned long tag = (unsigned long) child_node_flag & 0x0FUL;
 			unsigned int skip = ft_skip_len(child_node_flag);
 
 			stats->nr_skip_compressed_total++;
@@ -16115,6 +16146,8 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 				stats->skip_compressed_len_dist[skip]++;
 			if (tag == FT_KIND_SKIP_QP)
 				stats->nr_skip_compressed_qp++;
+			else if (tag == FT_KIND_SKIP_POPCOUNT_32)
+				stats->nr_skip_compressed_popcount_32++;
 			else if (tag == FT_KIND_SKIP_PIGEON)
 				stats->nr_skip_compressed_pigeon++;
 			else if (tag == FT_KIND_SKIP_EXT)
@@ -16331,10 +16364,12 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 
 		fprintf(out,
 			"Skip-compressed pointers: %" PRIu64
-			" (qp:%" PRIu64 " pigeon:%" PRIu64 " ext:%" PRIu64 ")\n",
+			" (qp:%" PRIu64 " pigeon:%" PRIu64 " popcount_32:%" PRIu64
+			" ext:%" PRIu64 ")\n",
 			total,
 			stats->nr_skip_compressed_qp,
 			stats->nr_skip_compressed_pigeon,
+			stats->nr_skip_compressed_popcount_32,
 			stats->nr_skip_compressed_ext);
 		print_indent(out, 1);
 		fprintf(out, "skip_len distribution:");

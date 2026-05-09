@@ -456,8 +456,8 @@ struct cds_ft_metadata {
 	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
 	uint32_t is_lo:1;
 	/*
-	 * Trailing-pad byte at offset 28.  Two mutually-exclusive uses
-	 * — a metadata is either a QP-hi's or a PIGEON's, never both:
+	 * Trailing-pad byte at offset 28.  Mutually-exclusive uses —
+	 * a metadata is one of QP-hi / PIGEON / POPCOUNT_32 at a time:
 	 *
 	 *   FT_KIND_PIGEON skip target → pigeon_skip_len: cn->len when
 	 *     this PIGEON is the target of a skip-compressed pointer.
@@ -465,6 +465,14 @@ struct cds_ft_metadata {
 	 *     so the skip length lives here.  No subkey is cached for
 	 *     PIGEON skip targets — validation falls back to the leaf-
 	 *     bytes compare.  Gated on FEATURE_FT_SKIP_COMPRESSED.
+	 *
+	 *   FT_KIND_POPCOUNT_32 skip target → popcount_skip_len: cn->len
+	 *     when this POPCOUNT_32 is the target of a skip-compressed
+	 *     pointer.  Same role as pigeon_skip_len — POPCOUNT_32's
+	 *     direct-variant 8-byte header has no spare bytes either, so
+	 *     the skip length lives in metadata.  No subkey is cached
+	 *     yet (skip-variant slot-0 inline subkey lands later).
+	 *     Gated on FEATURE_FT_SKIP_COMPRESSED.
 	 *
 	 *   FT_KIND_QP hi-node → qp_subtree_half_cls: total
 	 *     half-cacheline (32 B) footprint of the hi+lo subtree
@@ -478,6 +486,7 @@ struct cds_ft_metadata {
 	union {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		uint8_t pigeon_skip_len;
+		uint8_t popcount_skip_len;
 #endif
 		uint8_t qp_subtree_half_cls;
 	};
