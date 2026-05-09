@@ -54,10 +54,23 @@
  *                              walk.
  *   FT_KIND_SKIP_QP (0x07)     skip-compressed pointer; resolved
  *                              target is QP_HI.
- *
- * Reserved for future Stage 3 wire-up (assert-on-encode):
- *   FT_KIND_POPCOUNT_32 (0x09), FT_KIND_SKIP_POPCOUNT_32 (0x0B),
- *   FT_KIND_POPCOUNT_64 (0x11), FT_KIND_SKIP_POPCOUNT_64 (0x13).
+ *   FT_KIND_POPCOUNT_32 (0x09) popcount-byte node, order 5 (32 B);
+ *                              2-level nibble layout, max_lc 3
+ *                              (direct context).  Reserved — helper
+ *                              and dispatch wire-up lands in a later
+ *                              sub-stage of Step 4.
+ *   FT_KIND_SKIP_POPCOUNT_32 (0x0B) skip-compressed pointer; resolved
+ *                              target is POPCOUNT_32 in skip layout
+ *                              (slot 0 repurposed for inline skip
+ *                              metadata, max_lc drops to 2).
+ *                              Reserved.
+ *   FT_KIND_POPCOUNT_64 (0x11) popcount-byte node, order 6 (64 B);
+ *                              2-level nibble layout (5+3 packed),
+ *                              max_lc 6 (direct context).  Reserved.
+ *   FT_KIND_SKIP_POPCOUNT_64 (0x13) skip-compressed pointer; resolved
+ *                              target is POPCOUNT_64 in skip layout
+ *                              (slot 0 repurposed for skip metadata,
+ *                              max_lc drops to 5).  Reserved.
  *
  * Other reserved patterns: 0x06, 0x08, 0x0A, 0x0C-0x0F, 0x10, 0x12,
  * 0x14-0x1F.  Bit pattern 0x06 (bit 0=0, bit 1=1, bit 2=1) is
@@ -86,13 +99,17 @@
  * extraction at the bit-2 level used by the read-side predicates).
  */
 enum ft_kind {
-	FT_KIND_EXT		= 0x00,
-	FT_KIND_PIGEON		= 0x01,
-	FT_KIND_SKIP_EXT	= 0x02,
-	FT_KIND_SKIP_PIGEON	= 0x03,
-	FT_KIND_COMPRESSED	= 0x04,
-	FT_KIND_QP		= 0x05,
-	FT_KIND_SKIP_QP		= 0x07,
+	FT_KIND_EXT			= 0x00,
+	FT_KIND_PIGEON			= 0x01,
+	FT_KIND_SKIP_EXT		= 0x02,
+	FT_KIND_SKIP_PIGEON		= 0x03,
+	FT_KIND_COMPRESSED		= 0x04,
+	FT_KIND_QP			= 0x05,
+	FT_KIND_SKIP_QP			= 0x07,
+	FT_KIND_POPCOUNT_32		= 0x09,
+	FT_KIND_SKIP_POPCOUNT_32	= 0x0B,
+	FT_KIND_POPCOUNT_64		= 0x11,
+	FT_KIND_SKIP_POPCOUNT_64	= 0x13,
 };
 
 #define FT_KIND_SKIP_BIT	0x2UL	/* skip = child | FT_KIND_SKIP_BIT */

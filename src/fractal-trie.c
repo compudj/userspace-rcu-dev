@@ -138,6 +138,12 @@ struct cds_ft_attr {
 enum cds_ft_type_class {
 	FT_PIGEON = 0,		/* Pigeon: direct indexed */
 	FT_QP = 1,		/* QP-nibble: 16-bit popcount + ptrs[] */
+	FT_POPCOUNT = 2,	/*
+				 * Popcount-byte: 2-level nibble bitmap +
+				 * popcount-indexed ptrs[].  Reserved for
+				 * Step 4 sub-stage B2 wire-up; helpers
+				 * and ft_types[] entries land later.
+				 */
 	/* Leaf nodes are implicit from their height in the tree */
 	FT_NR_TYPES,
 
