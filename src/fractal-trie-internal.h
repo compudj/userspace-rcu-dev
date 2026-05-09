@@ -224,13 +224,15 @@ enum ft_kind {
  * keeps a trailing FT_NULL entry at that index so
  * &ft_types[NODE_INDEX_NULL] is in-bounds.
  *
- * Indices: FT_QP_INDEX = 0, FT_PIGEON_INDEX = 1.  Future Stage 3
- * (POPCOUNT_32 / POPCOUNT_64) reserves indices 0..1 for the
- * popcount-byte classes and shifts QP / PIGEON to 2 / 3.
+ * Indices: FT_POPCOUNT_32_INDEX = 0, FT_QP_INDEX = 1,
+ * FT_PIGEON_INDEX = 2.  POPCOUNT_64 lands in sub-stage C and will
+ * be inserted at index 1 (between POPCOUNT_32 and QP), shifting
+ * QP / PIGEON up by one.
  */
-#define FT_QP_INDEX		0U
-#define FT_PIGEON_INDEX		1U
-#define FT_NUM_INTERNAL_TYPES	2U
+#define FT_POPCOUNT_32_INDEX	0U
+#define FT_QP_INDEX		1U
+#define FT_PIGEON_INDEX		2U
+#define FT_NUM_INTERNAL_TYPES	3U
 #define NODE_INDEX_NULL		FT_NUM_INTERNAL_TYPES
 
 /*
@@ -571,6 +573,47 @@ struct cds_ft_qp16_node {
 	uint8_t  _pad[FT_QP16_HEADER_SIZE - 2];	/* bytes 2-7: reserved */
 #endif
 	struct cds_ft_inode_flag *ptrs[];	/* bytes 8+: popcount(bitmap) entries */
+} __attribute__((__aligned__(8)));
+
+/*
+ * POPCOUNT_32 layout (order 5 = 32 B), shared by direct (FT_KIND_-
+ * POPCOUNT_32) and skip (FT_KIND_SKIP_POPCOUNT_32) variants:
+ *
+ *   bytes 0-1   : root_bm    (16-bit, one bit per high-nibble n>>4)
+ *   bytes 2-7   : sub_bm[3]  (3 x 16-bit, one bit per (slot1, lo)
+ *                             pair where slot1 = popcount-rank of
+ *                             the high nibble in root_bm)
+ *   bytes 8-15  : slot 0     (DIRECT: ptr for popcount-idx 2.
+ *                             SKIP:   skip_meta = skip_len byte +
+ *                                     subkey[5] + 2 pad bytes)
+ *   bytes 16-23 : slot 1     (ptr for popcount-idx 1)
+ *   bytes 24-31 : slot 2     (ptr for popcount-idx 0)
+ *
+ * Reverse-indexed: ptr_offset = (FT_PC32_MAX_LC_DIRECT - 1) -
+ * popcount_idx, so the highest-rank popcount index sits at byte
+ * offset 8 (slot 0 from header) and the lowest-rank populates the
+ * highest physical offset.  This places slot 0 (lowest physical
+ * offset) at the popcount-idx-(N-1) position; in SKIP variants the
+ * slot 0 is repurposed for inline skip metadata, naturally dropping
+ * the highest popcount index from valid range and lowering capacity
+ * by one.  The same lookup formula serves both variants — only the
+ * caller-side max_lc differs.
+ */
+#define FT_PC32_HEADER_SIZE	8U
+#define FT_PC32_ALLOC_ORDER	5U	/* 32 B */
+#define FT_PC32_MAX_LC_DIRECT	3U
+#define FT_PC32_MAX_LC_SKIP	2U
+
+struct ft_pc32_skip_meta {
+	uint8_t skip_len;
+	uint8_t subkey[5];
+	uint8_t pad[2];
+} __attribute__((__aligned__(8)));
+
+struct ft_pc32_node {
+	uint16_t root_bm;	/* bytes 0-1 */
+	uint16_t sub_bm[3];	/* bytes 2-7 */
+	/* bytes 8-31: 3 x 8-byte slots; layout-dependent (see comment above). */
 } __attribute__((__aligned__(8)));
 
 struct cds_ft_bitmap {

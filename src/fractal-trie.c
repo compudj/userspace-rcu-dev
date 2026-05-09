@@ -199,6 +199,10 @@ enum {
  * dispatch class directly, so this table is not consulted on the
  * read-side hot path.
  *
+ *   [FT_POPCOUNT_32_INDEX] = POPCOUNT_32 class — order 5 (32 B),
+ *            2-level nibble bitmap with popcount-indexed ptrs[].
+ *            Direct variant max_lc = 3.  Used as the smallest
+ *            internal node, replacing fresh-allocation QP T0.
  *   [FT_QP_INDEX]     = QP class — 16-nibble bitmap, popcount-
  *            indexed ptrs[].  Internal tier picker (T0..T3 at
  *            orders 5..8) is popcount-driven via
@@ -219,19 +223,22 @@ enum {
  *            never dereferenced.
  */
 const struct cds_ft_type ft_types[] = {
+	[FT_POPCOUNT_32_INDEX] = { .type_class = FT_POPCOUNT, .min_child = 1,
+		.max_child = FT_PC32_MAX_LC_DIRECT,
+		.order = FT_PC32_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	/*
 	 * FT_QP entry: max_child uses the byte-count ceiling at QP T3
 	 * (16 hi-buckets * 16 lo-children = 256) for find_nearest_type_index
-	 * walks coming from PIGEON.  In practice the lattice walk only
-	 * reaches FT_QP_INDEX from above (PIGEON → QP demote) — the QP→PIGEON
-	 * forward trigger is the CL-footprint check, not max_child.
+	 * walks coming from PIGEON.  min_child = 2 gives a hysteresis
+	 * window with POPCOUNT_32 (max=3): nr_child in [2,3] stays in
+	 * the current class.
 	 *
 	 * Tier-up within QP (T0→T1→T2→T3) is bypassed in the lattice walk:
 	 * see the FT_QP special-cases in ft_node_recompact's ADD_NEXT /
 	 * ADD_SAME / DEL switches, which use ft_qp16_tiers[] / popcount
 	 * directly.
 	 */
-	[FT_QP_INDEX] = { .type_class = FT_QP, .min_child = 1,
+	[FT_QP_INDEX] = { .type_class = FT_QP, .min_child = 2,
 		.max_child = FT_QP16_T3_CAPACITY * 16,
 		.order = FT_QP16_T0_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	[FT_PIGEON_INDEX] = { .type_class = FT_PIGEON, .min_child = 24,
@@ -1102,15 +1109,21 @@ struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 
 	assert(type < FT_NUM_INTERNAL_TYPES);
 	/*
-	 * Map the ft_types[] slot index to the 4-bit kind nibble.  All
-	 * four QP hi-tiers (T0..T3) carry FT_KIND_QP uniformly; the
-	 * per-tier alloc order is recoverable from cds_ft_item_order()
-	 * when needed (write side / verify).  PIGEON carries
+	 * Map the ft_types[] slot index to the 5-bit kind tag.  All four
+	 * QP hi-tiers (T0..T3) carry FT_KIND_QP uniformly; the per-tier
+	 * alloc order is recoverable from cds_ft_item_order() when
+	 * needed (write side / verify).  POPCOUNT_32 carries FT_KIND_-
+	 * POPCOUNT_32 (direct variant; SKIP variant gets the SKIP tag
+	 * via ft_skip_compressed_flag at publish time).  PIGEON carries
 	 * FT_KIND_PIGEON.  ft_types[].type_class is a constant load —
 	 * folded by the compiler when @type is a compile-time literal
-	 * (every fresh-root call site passes 0).
+	 * (fresh-alloc call sites pass 0).
 	 */
 	switch (ft_types[type].type_class) {
+	case FT_POPCOUNT:
+		assert(type == FT_POPCOUNT_32_INDEX);
+		tag = FT_KIND_POPCOUNT_32;
+		break;
 	case FT_QP:
 		tag = FT_KIND_QP;
 		break;
@@ -1413,11 +1426,12 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
  * (compressed nodes have no type-table slot) and on any non-internal
  * kind.
  *
- * One index per class: FT_KIND_QP → FT_QP_INDEX, FT_KIND_PIGEON →
- * FT_PIGEON_INDEX.  QP's tier (T0..T3, alloc orders 5..8) is recovered
- * separately via cds_ft_item_order(ft_node_ptr_internal(node)) and
- * indexed into ft_qp16_tiers[].  Descent dispatches on the kind tag
- * directly without indexing ft_types[].
+ * One index per class: FT_KIND_POPCOUNT_32 → FT_POPCOUNT_32_INDEX,
+ * FT_KIND_QP → FT_QP_INDEX, FT_KIND_PIGEON → FT_PIGEON_INDEX.  QP's
+ * tier (T0..T3, alloc orders 5..8) is recovered separately via
+ * cds_ft_item_order(ft_node_ptr_internal(node)) and indexed into
+ * ft_qp16_tiers[].  Descent dispatches on the kind tag directly
+ * without indexing ft_types[].
  */
 static inline_lookup
 unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
@@ -1433,6 +1447,8 @@ unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
 		return FT_QP_INDEX;
 	if (tag == FT_KIND_PIGEON)
 		return FT_PIGEON_INDEX;
+	if (tag == FT_KIND_POPCOUNT_32)
+		return FT_POPCOUNT_32_INDEX;
 	assert(0);
 	__builtin_unreachable();
 }
@@ -2044,7 +2060,7 @@ void ft_publish_to_parent(struct cds_ft *ft,
 	 * no parent, and ft_set_skip_slot's offset computation assumes
 	 * the slot lives inside a node-arena chunk.
 	 */
-	if (parent_slot != &ft->root) {
+	if (parent_slot != &ft->root && parent_nf) {
 		struct cds_ft_compressed_node *cn = NULL;
 
 		if (ft_node_skip_compressed_in_slot(new_child))
@@ -2056,8 +2072,18 @@ void ft_publish_to_parent(struct cds_ft *ft,
 				cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) cn);
 
-			if (cn_meta->parent)
-				ft_set_skip_slot(cn_meta, parent_slot);
+			/*
+			 * Compute the offset directly from @parent_nf rather
+			 * than via cn_meta->parent.  Some callers publish the
+			 * cn before calling ft_set_parent on the cn (or assign
+			 * cn_meta->parent themselves), so cn_meta->parent may
+			 * still be NULL at this point.  parent_nf is already
+			 * the correct grandparent for the published slot.
+			 */
+			cn_meta->skip_slot_offset = (unsigned int)
+				((char *) parent_slot -
+				 (char *) ft_node_ptr(parent_nf))
+				/ sizeof(void *);
 		}
 	}
 #endif
@@ -2991,6 +3017,315 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
 {
 	return ft_pigeon_node_get_nth(type, node, NULL, i, FT_PF_NONE);
 }
+
+/*
+ * POPCOUNT_32 helpers.  See struct ft_pc32_node and the layout
+ * comment in fractal-trie-internal.h.  All accessors take @max_lc
+ * so the same code serves direct (max_lc = FT_PC32_MAX_LC_DIRECT)
+ * and skip (max_lc = FT_PC32_MAX_LC_SKIP) variants — the only
+ * difference is the valid popcount range and (write side) the
+ * skip-meta slot at physical offset 0.
+ *
+ * Reverse-indexed pointer slot: ptr_offset = (max_lc_direct - 1) -
+ * popcount_idx.  Constant max_lc_direct (= 3) keeps the lookup
+ * formula identical across variants; SKIP variant just disallows
+ * popcount_idx == max_lc_direct - 1 (= 2), which would land at
+ * physical offset 0 (the skip-meta slot).
+ */
+
+/* Slot 0 is at physical offset FT_PC32_HEADER_SIZE (= 8 B). */
+static inline_lookup
+struct cds_ft_inode_flag **ft_pc32_node_slot(struct ft_pc32_node *node,
+		unsigned int ptr_offset)
+{
+	return (struct cds_ft_inode_flag **)
+		((uint8_t *) node + FT_PC32_HEADER_SIZE
+		 + ptr_offset * sizeof(struct cds_ft_inode_flag *));
+}
+
+/*
+ * 2-level nibble popcount lookup, max_lc_direct = 3.
+ *
+ * One 64-bit load brings root_bm + sub_bm[0..2] into a single
+ * register: low 16 bits = root_bm, upper 48 bits = sub_bm[0..2]
+ * concatenated in popcount order.  Two presence tests (high then
+ * low nibble) guard a single popcount-prefix-sum into the pointer
+ * array via the reverse-indexed offset formula.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_pc32_node_get_nth_skip(struct ft_pc32_node *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint)
+{
+	uint64_t bms = *(const uint64_t *) node;
+	uint16_t root = (uint16_t) bms;
+	uint64_t subs = bms >> 16;
+	unsigned int hi = (unsigned int) n >> 4;
+	unsigned int lo = (unsigned int) n & 0xFU;
+	unsigned int slot1, bit_pos, ptr_idx, ptr_offset;
+	struct cds_ft_inode_flag **slot;
+
+	/* 1. Root check (high nibble present?). */
+	if (caa_unlikely(!((root >> hi) & 1U)))
+		goto not_found;
+
+	slot1 = (unsigned int) __builtin_popcount(root & ((1U << hi) - 1U));
+	bit_pos = (slot1 << 4) | lo;
+
+	/* 2. Sub-bitmap check (low nibble present in this hi's slot?). */
+	if (caa_unlikely(!((subs >> bit_pos) & 1ULL)))
+		goto not_found;
+
+	/* 3. Pointer index = rank of (hi, lo) among populated entries. */
+	ptr_idx = (unsigned int) __builtin_popcountll(
+			subs & ((1ULL << bit_pos) - 1ULL));
+	/* Reverse-indexed: physical offset 2 = popcount idx 0, etc. */
+	ptr_offset = (FT_PC32_MAX_LC_DIRECT - 1U) - ptr_idx;
+	slot = ft_pc32_node_slot(node, ptr_offset);
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = slot;
+	return ft_dereference_acquire_prefetch_hint(*slot, pf_hint);
+
+not_found:
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+}
+
+/*
+ * Number of children in the node — popcount of the sub_bm
+ * concatenation.  root_bm popcount equals the count of populated
+ * sub-bitmaps and is not a child count by itself.
+ */
+static inline_lookup
+unsigned int ft_pc32_node_get_nr_child(struct ft_pc32_node *node)
+{
+	uint64_t bms = *(const uint64_t *) node;
+	uint64_t subs = bms >> 16;
+
+	return (unsigned int) __builtin_popcountll(subs);
+}
+
+/*
+ * Insert (n, child) into a freshly-allocated or rebuild-target
+ * POPCOUNT_32 node, in safe-append discipline: the byte n must be
+ * strictly greater than all existing bytes in the node (highest
+ * popcount rank).  Used by:
+ *   - recompact's rebuild copy phase (walks old entries in popcount
+ *     order, appending to the freshly-zeroed new node).
+ *   - the framework's post-copy "add new (n, child)" tail when the
+ *     new entry is at the highest popcount rank.
+ *
+ * Returns 0 on success, -ENOSPC if popcount(new_subs) > @max_lc.
+ *
+ * Non-safe-append regular inserts (existing node + lower-rank entry)
+ * route through recompact (FT_RECOMPACT_ADD_SAME) — the framework
+ * builds a new POPCOUNT_32 node off-tree and atomically swaps in.
+ *
+ * Caller writes the bitmap and pointer slot directly; readers may
+ * observe partial state when this is called on a tree-attached node,
+ * which is why the caller must guarantee the safe-append precondition
+ * or build off-tree.  No release ordering needed for individual
+ * stores — the eventual rcu_assign_pointer at publish time provides
+ * release ordering for the entire node contents.
+ */
+static
+int ft_pc32_node_set_nth_safe(struct ft_pc32_node *node,
+		struct cds_ft_metadata *metadata,
+		uint8_t n,
+		struct cds_ft_inode_flag *child,
+		unsigned int max_lc)
+{
+	uint16_t root = node->root_bm;
+	uint64_t subs = ((uint64_t) node->sub_bm[0])
+		      | ((uint64_t) node->sub_bm[1] << 16)
+		      | ((uint64_t) node->sub_bm[2] << 32);
+	unsigned int hi = (unsigned int) n >> 4;
+	unsigned int lo = (unsigned int) n & 0xFU;
+	uint16_t hi_bit = (uint16_t) (1U << hi);
+	unsigned int slot1, bit_pos, ptr_idx, ptr_offset;
+	uint64_t new_subs;
+
+	if (!(root & hi_bit))
+		root |= hi_bit;
+	slot1 = (unsigned int) __builtin_popcount(root & (hi_bit - 1U));
+	bit_pos = (slot1 << 4) | lo;
+
+	/* Compose new_subs: insert the lo bit at popcount rank slot1. */
+	if (!((node->root_bm) & hi_bit)) {
+		uint64_t low_mask = (slot1 == 0) ? 0ULL
+			: ((1ULL << (slot1 << 4)) - 1ULL);
+		uint64_t low_part = subs & low_mask;
+		uint64_t high_part = (subs & ~low_mask) << 16;
+
+		new_subs = low_part | high_part;
+	} else {
+		new_subs = subs;
+	}
+	/*
+	 * If the byte n is already present, this is a slot rewrite
+	 * (replace semantics, matching FT_PIGEON / FT_QP behavior).
+	 * The bitmap stays the same; just rewrite the slot pointer
+	 * and skip the nr_child bump.
+	 */
+	if ((new_subs >> bit_pos) & 1ULL) {
+		ptr_idx = (unsigned int) __builtin_popcountll(
+				new_subs & ((1ULL << bit_pos) - 1ULL));
+		ptr_offset = (FT_PC32_MAX_LC_DIRECT - 1U) - ptr_idx;
+		rcu_assign_pointer(*ft_pc32_node_slot(node, ptr_offset),
+				child);
+		return 0;
+	}
+	new_subs |= 1ULL << bit_pos;
+
+	if (caa_unlikely((unsigned int) __builtin_popcountll(new_subs) > max_lc))
+		return -ENOSPC;
+
+	/*
+	 * Safe-append precondition: the new entry must have the highest
+	 * popcount rank.  popcount of bits >= bit_pos in new_subs must
+	 * equal 1 (just the new bit).  Caller violations return -ERANGE
+	 * so the framework can route through recompact ADD_SAME to
+	 * rebuild off-tree.
+	 */
+	if ((unsigned int) __builtin_popcountll(
+			new_subs & ~((1ULL << bit_pos) - 1ULL)) != 1U)
+		return -ERANGE;
+	ptr_idx = (unsigned int) __builtin_popcountll(
+			new_subs & ((1ULL << bit_pos) - 1ULL));
+	ptr_offset = (FT_PC32_MAX_LC_DIRECT - 1U) - ptr_idx;
+
+	*ft_pc32_node_slot(node, ptr_offset) = child;
+	node->root_bm = root;
+	node->sub_bm[0] = (uint16_t) (new_subs & 0xFFFFU);
+	node->sub_bm[1] = (uint16_t) ((new_subs >> 16) & 0xFFFFU);
+	node->sub_bm[2] = (uint16_t) ((new_subs >> 32) & 0xFFFFU);
+	metadata->nr_child++;
+	return 0;
+}
+
+/*
+ * Walk POPCOUNT_32 children in popcount order: returns the (byte, ptr)
+ * pair at popcount index @i (0 = lowest rank).  Used by recompact
+ * copy phase to walk old entries before writing them to the new
+ * node, and by iter helpers (get_direction).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_pc32_node_get_ith_pos(struct ft_pc32_node *node,
+		unsigned int i, uint8_t *byte_out)
+{
+	uint16_t root = node->root_bm;
+	uint64_t subs = ((uint64_t) node->sub_bm[0])
+		      | ((uint64_t) node->sub_bm[1] << 16)
+		      | ((uint64_t) node->sub_bm[2] << 32);
+	unsigned int bit_pos, slot1, lo, hi;
+	uint64_t shifted;
+	unsigned int ptr_offset;
+
+	if (i >= (unsigned int) __builtin_popcountll(subs))
+		return NULL;
+
+	/* Find the i-th set bit in subs (lowest first). */
+	shifted = subs;
+	while (i--) {
+		shifted &= shifted - 1;
+	}
+	bit_pos = (unsigned int) __builtin_ctzll(shifted);
+	slot1 = bit_pos >> 4;
+	lo = bit_pos & 0xFU;
+
+	/* Recover hi = position of the slot1-th set bit in root. */
+	{
+		uint16_t r = root;
+		unsigned int k;
+
+		for (k = 0; k < slot1; k++)
+			r &= (uint16_t) (r - 1U);
+		hi = (unsigned int) __builtin_ctz((unsigned int) r);
+	}
+
+	if (byte_out)
+		*byte_out = (uint8_t) ((hi << 4) | lo);
+
+	ptr_offset = (FT_PC32_MAX_LC_DIRECT - 1U)
+		   - (unsigned int) __builtin_popcountll(
+				subs & ((1ULL << bit_pos) - 1ULL));
+	return *ft_pc32_node_slot(node, ptr_offset);
+}
+
+/*
+ * Replace the slot at byte @n.  In-place rewrite for non-NULL
+ * @newptr.  For @newptr == NULL (remove), returns -EFBIG to route
+ * through recompact DEL (which copies surviving entries to a fresh
+ * node, dropping the removed one).  This avoids the in-place shift
+ * needed to maintain reverse-indexed-popcount layout — same
+ * simplification as set_nth's -ERANGE path.
+ */
+static
+int ft_pc32_node_replace_ptr(struct ft_pc32_node *node,
+		struct cds_ft_metadata *metadata,
+		struct cds_ft_inode_flag **node_flag_ptr,
+		uint8_t n __attribute__((unused)),
+		struct cds_ft_inode_flag *newptr)
+{
+	if (!newptr) {
+		if (metadata->fallback_removal_count) {
+			metadata->fallback_removal_count--;
+			rcu_assign_pointer(*node_flag_ptr, NULL);
+			return 0;
+		}
+		return -EFBIG;
+	}
+	rcu_assign_pointer(*node_flag_ptr, newptr);
+	return 0;
+}
+
+/*
+ * Iterator-direction lookup: find the populated child whose key is
+ * the leftmost > @n (FT_RIGHT) or rightmost < @n (FT_LEFT).  Returns
+ * the child pointer with the matched key in @result_key, or NULL if
+ * no such child exists.
+ *
+ * Strategy: probe the bitmap directly.  POPCOUNT_32 holds at most 3
+ * children, so a sequential scan of populated bits is cheap (~6
+ * popcounts and bit tests at worst).
+ */
+static
+struct cds_ft_inode_flag *ft_pc32_node_get_direction(struct ft_pc32_node *node,
+		int n, uint8_t *result_key, enum ft_direction dir)
+{
+	unsigned int nr = ft_pc32_node_get_nr_child(node);
+	unsigned int i;
+
+	if (dir == FT_RIGHT) {
+		for (i = 0; i < nr; i++) {
+			uint8_t k;
+			struct cds_ft_inode_flag *child =
+				ft_pc32_node_get_ith_pos(node, i, &k);
+
+			if ((int) k > n) {
+				if (result_key)
+					*result_key = k;
+				return child;
+			}
+		}
+		return NULL;
+	}
+	/* FT_LEFT: find the rightmost (highest-byte) child < n. */
+	for (i = nr; i > 0; i--) {
+		uint8_t k;
+		struct cds_ft_inode_flag *child =
+			ft_pc32_node_get_ith_pos(node, i - 1, &k);
+
+		if ((int) k < n) {
+			if (result_key)
+				*result_key = k;
+			return child;
+		}
+	}
+	return NULL;
+}
+
 
 /*
  * QP-nibble tier table.  Parallel to ft_types[]; describes the four
@@ -4241,15 +4576,22 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 * earlier, and the prefetcher's stride detector treats the
 	 * result as a linear pointer offset.
 	 *
-	 * Distinguish QP vs PIGEON by bit 2 (QP's class bit): QP =
-	 * 0x05 has bit 2 set, PIGEON = 0x01 doesn't.  Skipping a tag
-	 * extraction lets the bit test fold against the original
-	 * node_flag.
+	 * Internal-direct kinds at this point: PIGEON (0x01), QP (0x05),
+	 * POPCOUNT_32 (0x09).  Distinguishing tag bits:
+	 *   bit 2 = QP (0x05 only)
+	 *   bit 3 = POPCOUNT_32 (0x09 only)
+	 *   neither = PIGEON (0x01)
+	 * Hot path likely caa_likely(QP); POPCOUNT_32 second; PIGEON last.
 	 */
 	if (caa_likely((v & 0x04UL) != 0))
 		return ft_qp_byte_get(
 				(struct cds_ft_qp16_node *)
 				((unsigned long) node_flag - FT_KIND_QP),
+				node_flag_ptr, n, pf_hint);
+	if ((v & 0x08UL) != 0)
+		return ft_pc32_node_get_nth_skip(
+				(struct ft_pc32_node *)
+				((unsigned long) node_flag - FT_KIND_POPCOUNT_32),
 				node_flag_ptr, n, pf_hint);
 	return ft_pigeon_node_get_nth(NULL,
 			(struct cds_ft_inode *)
@@ -4371,6 +4713,28 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 		}
 		return false;
 	}
+	case FT_POPCOUNT:
+	{
+		struct ft_pc32_node *pc = (struct ft_pc32_node *) node;
+		unsigned int nr = ft_pc32_node_get_nr_child(pc);
+		unsigned int i;
+
+		for (i = 0; i < nr; i++) {
+			uint8_t v;
+			struct cds_ft_inode_flag *iter =
+				ft_pc32_node_get_ith_pos(pc, i, &v);
+
+			if (iter == child_nf) {
+				if (n_ret)
+					*n_ret = v;
+				if (slot_ret)
+					ft_node_get_nth(parent_nf, slot_ret,
+							v, FT_PF_NONE);
+				return true;
+			}
+		}
+		return false;
+	}
 	default:
 		assert(0);
 		return false;
@@ -4406,6 +4770,11 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	case FT_QP:
 		child = ft_qp_byte_get_direction(
 				(struct cds_ft_qp16_node *) node,
+				n, result_key, dir);
+		break;
+	case FT_POPCOUNT:
+		child = ft_pc32_node_get_direction(
+				(struct ft_pc32_node *) node,
 				n, result_key, dir);
 		break;
 	default:
@@ -4506,6 +4875,20 @@ int _ft_node_set_nth(struct cds_ft *ft,
 	case FT_PIGEON:
 		ret = ft_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
 		break;
+	case FT_POPCOUNT:
+		/*
+		 * Direct (non-skip) variant in B2; SKIP variant lands in
+		 * a follow-up sub-stage.  Returns -ERANGE on non-safe-
+		 * append insert, routing through recompact ADD_SAME for
+		 * an off-tree rebuild.  Returns -ENOSPC when popcount
+		 * overflows max_lc, routing through recompact ADD_NEXT
+		 * to escalate to QP.
+		 */
+		ret = ft_pc32_node_set_nth_safe(
+				(struct ft_pc32_node *) node, metadata,
+				n, child_node_flag,
+				FT_PC32_MAX_LC_DIRECT);
+		break;
 	case FT_QP:
 		/*
 		 * hi_capacity is the structural hi-bucket count
@@ -4591,6 +4974,11 @@ int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
 	switch (type->type_class) {
 	case FT_PIGEON:
 		ret = ft_pigeon_node_replace_ptr(type, node, metadata, node_flag_ptr, n, newptr);
+		break;
+	case FT_POPCOUNT:
+		ret = ft_pc32_node_replace_ptr(
+				(struct ft_pc32_node *) node, metadata,
+				node_flag_ptr, n, newptr);
 		break;
 	case FT_QP:
 		ret = ft_qp_byte_replace(ft,
@@ -4752,6 +5140,18 @@ int ft_node_recompact(enum ft_recompact mode,
 			}
 			new_type_index = find_nearest_type_index(old_type_index,
 				metadata->nr_child + 1, false);
+			/*
+			 * POPCOUNT_X -> QP escalation: pick a QP tier whose
+			 * structural hi-bucket capacity admits the worst-case
+			 * byte distribution (each byte in a distinct hi-nibble).
+			 * Worst-case popcount(hi_bm) = nr_child + 1.  Default
+			 * ft_types[FT_QP_INDEX].order (T0, cap 3) is too small
+			 * for any source with nr_child >= 3.
+			 */
+			if (new_type_index == FT_QP_INDEX
+			    && old_type->type_class == FT_POPCOUNT)
+				new_alloc_order = ft_qp16_alloc_order(
+						metadata->nr_child + 1);
 			dbg_printf("Recompact for node with %u children\n",
 				metadata->nr_child + 1);
 		}
@@ -4884,6 +5284,53 @@ int ft_node_recompact(enum ft_recompact mode,
 					new_metadata, i, iter);
 			assert(!ret);
 		}
+		break;
+	}
+	case FT_POPCOUNT:
+	{
+		struct ft_pc32_node *old_pc =
+			(struct ft_pc32_node *) old_node;
+		unsigned int old_nr = ft_pc32_node_get_nr_child(old_pc);
+		bool insert_new = (mode == FT_RECOMPACT_ADD_NEXT
+				|| mode == FT_RECOMPACT_ADD_SAME);
+		bool new_inserted = false;
+		unsigned int i;
+
+		/*
+		 * Walk old POPCOUNT_32 entries in popcount-rank order
+		 * (low rank first).  For ADD modes, weave the new
+		 * (n, child_node_flag) at the right rank so the
+		 * destination is filled strictly safe-append.  Recompact
+		 * DEL skips the to-be-removed entry.
+		 */
+		for (i = 0; i < old_nr; i++) {
+			uint8_t v;
+			struct cds_ft_inode_flag *iter =
+				ft_pc32_node_get_ith_pos(old_pc, i, &v);
+
+			if (insert_new && !new_inserted
+			    && (unsigned int) v > (unsigned int) n) {
+				ret = _ft_node_set_nth(ft, new_type,
+					new_node, new_node_flag,
+					new_metadata, n, child_node_flag);
+				assert(!ret);
+				new_inserted = true;
+			}
+			if (mode == FT_RECOMPACT_DEL
+			    && *nullify_node_flag_ptr == iter)
+				continue;
+			ret = _ft_node_set_nth(ft, new_type, new_node,
+				new_node_flag, new_metadata, v, iter);
+			assert(!ret);
+		}
+		if (insert_new && !new_inserted) {
+			ret = _ft_node_set_nth(ft, new_type, new_node,
+				new_node_flag, new_metadata, n,
+				child_node_flag);
+			assert(!ret);
+			new_inserted = true;
+		}
+		(void) new_inserted;
 		break;
 	}
 	case FT_QP:
@@ -5146,6 +5593,36 @@ skip_copy:
 			}
 			break;
 		}
+		case FT_POPCOUNT:
+		{
+			struct ft_pc32_node *new_pc =
+				(struct ft_pc32_node *) new_node;
+			unsigned int new_nr =
+				ft_pc32_node_get_nr_child(new_pc);
+			unsigned int i;
+
+			/*
+			 * Walk new POPCOUNT_32 children in popcount-rank
+			 * order and reparent each under the freshly
+			 * published new_node_flag, mirroring the FT_PIGEON
+			 * arm.  Children copied from the old node still
+			 * reference the old node via meta->parent until
+			 * this loop runs.
+			 */
+			for (i = 0; i < new_nr; i++) {
+				uint8_t v;
+				struct cds_ft_inode_flag *iter;
+				struct cds_ft_inode_flag **slot = NULL;
+
+				iter = ft_pc32_node_get_ith_pos(new_pc, i, &v);
+				if (!iter)
+					continue;
+				ft_node_get_nth_skip(new_node_flag,
+						&slot, v, FT_PF_NONE);
+				ft_set_parent(iter, new_node_flag, slot);
+			}
+			break;
+		}
 		default:
 			break;
 		}
@@ -5405,7 +5882,18 @@ int ft_node_set_nth(struct cds_ft *ft,
 		if (type->type_class != FT_QP) {
 			struct cds_ft_inode_flag **slot_ptr = NULL;
 
-			if (ft_node_skip_compressed_in_slot(child_node_flag))
+			/*
+			 * Compute slot_ptr for any compressed-form child
+			 * (SKIP_X or plain COMPRESSED) so ft_set_parent →
+			 * ft_set_skip_slot can record the slot offset.
+			 * Without this, plain-COMPRESSED children installed
+			 * under non-QP parents leave skip_slot_offset == 0
+			 * and break later chain-merge canonicalization in
+			 * ft_detach_node, which recovers the slot via
+			 * ft_get_skip_slot.
+			 */
+			if (ft_node_skip_compressed_in_slot(child_node_flag)
+			    || ft_node_compressed_in_node(child_node_flag))
 				ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
 			ft_set_parent(child_node_flag, *node_flag, slot_ptr);
 		} else if (caa_unlikely(metadata->qp_subtree_half_cls >
@@ -6235,6 +6723,29 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 			iter_key = *(key++);
 			node_flag = ft_pigeon_node_get_nth(NULL, node, NULL,
+					iter_key, FT_PF_DATA);
+			if (caa_unlikely(!node_flag)) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			FT_BYTE_STEP_POST();
+			continue;
+		}
+		/*
+		 * POPCOUNT_32 fast path: 2L nibble bitmap byte step on a
+		 * sparse internal node (1-3 children).  Tag-specific test
+		 * `(v & 0x1F) == FT_KIND_POPCOUNT_32` (= 0x09) — POPCOUNT_-
+		 * 32 has bit 0 + bit 3 set, distinct from QP / PIGEON.  Skip
+		 * variant (SKIP_POPCOUNT_32, 0x0B) is filtered upstream by
+		 * the SKIP handler (bit 1 set).
+		 */
+		if (((unsigned long) node_flag & 0x1FUL) == FT_KIND_POPCOUNT_32) {
+			struct ft_pc32_node *pc =
+				(struct ft_pc32_node *)
+				((unsigned long) node_flag - FT_KIND_POPCOUNT_32);
+
+			iter_key = *(key++);
+			node_flag = ft_pc32_node_get_nth_skip(pc, NULL,
 					iter_key, FT_PF_DATA);
 			if (caa_unlikely(!node_flag)) {
 				status = CDS_FT_STATUS_NOT_FOUND;
@@ -12610,9 +13121,12 @@ bool cds_ft_empty(struct cds_ft *ft)
 	 * does not imply non-empty.  rmeta->nr_child is the live
 	 * byte-children count (sum of lo nr_child across hi-buckets)
 	 * and drops to zero only when all descendant bytes have been
-	 * removed.
+	 * removed.  FT_POPCOUNT carries no tombstones; nr_child is
+	 * authoritative.  PIGEON returns false here (a PIGEON root
+	 * implies many populated entries — no empty PIGEON case worth
+	 * handling).
 	 */
-	if (type->type_class != FT_QP)
+	if (type->type_class != FT_QP && type->type_class != FT_POPCOUNT)
 		return false;
 	if (rmeta->nr_child)
 		return false;
@@ -14958,7 +15472,8 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			unsigned int expected_order = type->order;
 
 			if (type->type_class != FT_PIGEON
-			    && type->type_class != FT_QP) {
+			    && type->type_class != FT_QP
+			    && type->type_class != FT_POPCOUNT) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: internal node %p has non-internal type_class %d (type_index %u)\n",
 						depth, node_flag,
