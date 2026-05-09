@@ -309,6 +309,22 @@ enum ft_recompact {
 	FT_RECOMPACT_ADD_SAME,
 	FT_RECOMPACT_ADD_NEXT,
 	FT_RECOMPACT_DEL,
+	/*
+	 * Clone a node into a freshly-allocated sibling of the same type,
+	 * with all children copied and reparented to the new node.  No
+	 * child is added or removed; old node is intact post-call and the
+	 * caller is responsible for RCU-freeing it via *old_node_ret.
+	 *
+	 * Used to safely move a node across the COMPRESSED↔non-COMPRESSED
+	 * parent-kind boundary: the CALLER places the cloned node under its
+	 * new parent (potentially demoting parent kind), while the OLD node
+	 * stays attached to its OLD COMPRESSED parent for the benefit of
+	 * concurrent readers holding stale SKIP_X pointers.  Crucially, this
+	 * mode does NOT update the upstream skip slot above the old parent
+	 * (unlike ADD modes), since the cloned node will live at a different
+	 * tree position than the original.
+	 */
+	FT_RECOMPACT_REPARENT,
 };
 
 enum ft_lookup_inequality {
@@ -1898,10 +1914,29 @@ void ft_publish_to_parent(struct cds_ft *ft,
 			struct cds_ft_inode_flag **skip_slot =
 				ft_get_skip_slot(cn_meta, ft);
 			if (skip_slot &&
-			    ft_node_skip_compressed_in_slot(*skip_slot))
-				rcu_assign_pointer(*skip_slot,
-					ft_skip_compressed_flag(
-						new_child, cn));
+			    ft_node_skip_compressed_in_slot(*skip_slot)) {
+				struct cds_ft_inode_flag *new_skip_val;
+
+				/*
+				 * SKIP_EXT gating: in non-spec-validate groups,
+				 * cn → EXT chains use plain COMPRESSED in the
+				 * upstream slot, not SKIP_EXT.  When new_child
+				 * transitions to EXT in such a group, demote
+				 * the slot from SKIP_X (set up earlier when
+				 * cn->child was non-EXT) back to plain
+				 * COMPRESSED.  See ft_publish_compressed for
+				 * the matching creation-time gate.
+				 */
+				if (ft_node_external_direct(new_child) &&
+				    !ft->group->speculative_validated)
+					new_skip_val =
+						ft_compressed_node_flag(cn);
+				else
+					new_skip_val =
+						ft_skip_compressed_flag(
+							new_child, cn);
+				rcu_assign_pointer(*skip_slot, new_skip_val);
+			}
 		}
 #endif
 		/*
@@ -1969,6 +2004,20 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 		(const void *) cn->child,
 		(const void *) NULL);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * SKIP_EXT is gated on speculative-validate: only in spec-validate
+	 * groups can the read path recover the skipped compressed node's
+	 * length without dereferencing ext->prev (which is mutator-only,
+	 * via the EXT's stored key at @speculative_key_offset).  In non-
+	 * spec-validate groups, leave cn → EXT chains as plain COMPRESSED
+	 * in the parent slot so the read path descends through cn and
+	 * recovers cn->len directly.  SKIP_QP and SKIP_PIGEON remain
+	 * unconditional — their length lives inline in the resolved
+	 * target (qp->skip_len / pigeon_skip_len).
+	 */
+	if (ft_node_external_direct(cn->child) &&
+	    !ft->group->speculative_validated)
+		return cflag;
 	return ft_skip_compressed_flag(cn->child, cn);
 #else
 	return cflag;
@@ -4493,6 +4542,10 @@ int ft_node_recompact(enum ft_recompact mode,
 		dbg_printf("Recompact for node with %u children\n",
 			metadata->nr_child - 1);
 		break;
+	case FT_RECOMPACT_REPARENT:
+		/* Same-type clone: no add, no delete, no resize. */
+		new_type_index = old_type_index;
+		break;
 	default:
 		assert(0);
 	}
@@ -4548,7 +4601,8 @@ int ft_node_recompact(enum ft_recompact mode,
 	{
 		unsigned int i;
 
-		assert(mode == FT_RECOMPACT_DEL);
+		assert(mode == FT_RECOMPACT_DEL ||
+		       mode == FT_RECOMPACT_REPARENT);
 		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
 			struct cds_ft_inode_flag *iter;
 
@@ -4692,7 +4746,18 @@ skip_copy:
 #endif
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		if (old_parent && ft_node_compressed_in_node(old_parent)) {
+		/*
+		 * For ADD/DEL modes, the new node REPLACES the old at the
+		 * same tree position, so the upstream SKIP_X (if any) must
+		 * be repointed at the new node.  For REPARENT, the new node
+		 * lives at a DIFFERENT position (caller installs it
+		 * elsewhere); leave the upstream SKIP_X pointing to the old
+		 * node so concurrent readers holding stale SKIP_X (loaded
+		 * before the caller's later publish) keep resolving via the
+		 * intact old node + its untouched COMPRESSED parent.
+		 */
+		if (mode != FT_RECOMPACT_REPARENT &&
+		    old_parent && ft_node_compressed_in_node(old_parent)) {
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(old_parent);
 			struct cds_ft_metadata *cn_meta =
@@ -4828,6 +4893,49 @@ skip_copy:
 	ret = 0;
 end:
 	return ret;
+}
+
+/*
+ * ft_node_clone_for_reparent: allocate a fresh sibling of @old_node_flag
+ * (same type, all children copied, child meta->parent updated to the
+ * clone).  The original node is intact and the caller is responsible
+ * for RCU-freeing it via *old_node_ret.  The clone's own meta->parent
+ * inherits from the original; the caller must overwrite via
+ * ft_set_parent / ft_node_set_nth when installing the clone.
+ *
+ * Used to safely move a child across the COMPRESSED↔non-COMPRESSED
+ * parent-kind boundary in compressed-split paths.  In-place demote
+ * (rcu_assign_pointer of meta->parent from a COMPRESSED to a non-
+ * COMPRESSED) would race with concurrent readers holding stale
+ * SKIP_X(child) pointers from the upstream slot, since the readers
+ * would observe the stale skip pointer paired with the freshly-demoted
+ * non-COMPRESSED parent and trip ft_skip_to_compressed's COMPRESSED
+ * assertion.  Cloning preserves the OLD (child, parent=COMPRESSED)
+ * relationship for those readers until a grace period drains them, at
+ * which point the original is freed.
+ *
+ * Returns NULL on -ENOMEM.  Only meaningful for internal node kinds
+ * (FT_KIND_QP, FT_KIND_PIGEON); EXT children are user-allocated and
+ * cannot be cloned.
+ */
+static
+struct cds_ft_inode_flag *ft_node_clone_for_reparent(struct cds_ft *ft,
+		struct cds_ft_inode_flag *old_node_flag,
+		struct cds_ft_inode **old_node_ret)
+{
+	struct cds_ft_inode *old_node = ft_node_ptr(old_node_flag);
+	struct cds_ft_metadata *old_meta = cds_ft_item_to_metadata(old_node);
+	unsigned int type_index = ft_node_type_index(old_node_flag);
+	const struct cds_ft_type *type = &ft_types[type_index];
+	struct cds_ft_inode_flag *new_node_flag = old_node_flag;
+	int ret;
+
+	ret = ft_node_recompact(FT_RECOMPACT_REPARENT, ft, type_index, type,
+			old_node, old_meta, &new_node_flag,
+			0, NULL, NULL, old_node_ret, false);
+	if (ret)
+		return NULL;
+	return new_node_flag;
 }
 
 /*
@@ -7384,6 +7492,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
 	uint8_t new_ordinal = iter_key[diverge_pos];
 	unsigned long old_child_nr_keys;
+	struct cds_ft_inode *cloned_orig_child = NULL;
 	int ret;
 
 	unsigned int junction_depth = node_depth + diverge_pos;
@@ -7416,8 +7525,30 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		old_suffix_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
 		created[nr_created++] = old_suffix_flag;
 	} else {
-		/* suffix_len == 0: old child directly. */
-		old_suffix_flag = cn->child;
+		/* suffix_len == 0: old child becomes a direct child of the
+		 * junction (no compressed wrapper).  For internal kinds
+		 * (QP/PIGEON), placing cn->child directly would demote its
+		 * meta->parent across the COMPRESSED→non-COMPRESSED boundary
+		 * in place, racing with concurrent readers holding stale
+		 * SKIP_X(cn->child) pointers.  Clone instead: the clone takes
+		 * the new parent context (placed under junction), while the
+		 * original keeps its old COMPRESSED parent (cn) and stays
+		 * alive for the grace period until cn is RCU-freed.
+		 *
+		 * EXT children: in non-spec groups the upstream slot has no
+		 * SKIP_EXT (Phase 1 mutator gate), so no race; in spec groups
+		 * the read path will validate against the EXT's stored key
+		 * directly (length-recovery redesign), so ext->prev is
+		 * mutator-only and the in-place demote is safe.
+		 */
+		if (cn->child && !ft_node_external_direct(cn->child)) {
+			old_suffix_flag = ft_node_clone_for_reparent(ft,
+				cn->child, &cloned_orig_child);
+			if (!old_suffix_flag) goto error;
+			created[nr_created++] = old_suffix_flag;
+		} else {
+			old_suffix_flag = cn->child;
+		}
 	}
 
 	/* 2. Build new branch → new leaf. */
@@ -7613,6 +7744,16 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		(const void *) top_flag);
 	ft_publish_to_parent(ft, cn_meta->parent, parent_slot, top_flag);
 
+	/*
+	 * RCU-free the original cn->child if we cloned it.  The clone
+	 * lives in the new structure (junction's slot); the original is
+	 * unreferenced from the new tree but remains the target of any
+	 * stale SKIP_X(orig) reader holding cn (still alive below) as
+	 * its parent.  Deferred free so those readers drain first.
+	 */
+	if (cloned_orig_child)
+		free_cds_ft_node(ft, cloned_orig_child);
+
 	/* 7. Free the old compressed node. */
 	free_compressed_node(ft, cn);
 
@@ -7658,6 +7799,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		unsigned int remaining,
 		struct cds_ft_inode_flag **top_ret,
 		struct cds_ft_inode_flag **jct_ret,
+		struct cds_ft_inode **cloned_orig_child_ret,
 		unsigned int node_depth)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
@@ -7670,7 +7812,10 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
 	int nr_created = 0;
 	unsigned long child_nr_keys;
+	struct cds_ft_inode *cloned_orig_child = NULL;
 	int ret;
+
+	*cloned_orig_child_ret = NULL;
 
 	if (!ft_node_external_direct(cn->child)) {
 		struct cds_ft_metadata *cm =
@@ -7702,10 +7847,27 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		created[nr_created++] = suffix_flag;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
+		struct cds_ft_inode_flag *child_for_dest;
 
+		/*
+		 * Same parent-kind boundary concern as ft_split_compressed_-
+		 * insert (suffix_len == 0): cn->child gets installed under a
+		 * fresh non-COMPRESSED dest, demoting its meta->parent across
+		 * the boundary in place.  Clone for QP/PIGEON; EXT is handled
+		 * by the Phase 1 SKIP_EXT gate (non-spec) or the read-side
+		 * length-recovery redesign (spec).
+		 */
+		if (cn->child && !ft_node_external_direct(cn->child)) {
+			child_for_dest = ft_node_clone_for_reparent(ft,
+				cn->child, &cloned_orig_child);
+			if (!child_for_dest) goto error;
+			created[nr_created++] = child_for_dest;
+		} else {
+			child_for_dest = cn->child;
+		}
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining + 1],
-			cn->child, NULL, NULL,
+			child_for_dest, NULL, NULL,
 			node_depth + remaining + 1);
 		if (ret) goto error;
 		{
@@ -7717,7 +7879,17 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		suffix_flag = dest;
 		created[nr_created++] = dest;
 	} else {
-		suffix_flag = cn->child;
+		/* suffix_len == 0: cn->child becomes a direct child of the
+		 * junction.  Same boundary-crossing concern; clone for
+		 * QP/PIGEON. */
+		if (cn->child && !ft_node_external_direct(cn->child)) {
+			suffix_flag = ft_node_clone_for_reparent(ft,
+				cn->child, &cloned_orig_child);
+			if (!suffix_flag) goto error;
+			created[nr_created++] = suffix_flag;
+		} else {
+			suffix_flag = cn->child;
+		}
 	}
 
 	/* Junction: internal node with suffix child. */
@@ -7830,6 +8002,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		(const void *) top_flag, remaining);
 	*top_ret = top_flag;
 	*jct_ret = jct_flag;
+	*cloned_orig_child_ret = cloned_orig_child;
 	return 0;
 
 error:
@@ -8315,10 +8488,12 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		struct cds_ft_node **unique_node_ret)
 {
 	struct cds_ft_inode_flag *top_flag, *jct_flag;
+	struct cds_ft_inode *cloned_orig_child = NULL;
 	int sret;
 
 	sret = ft_split_compressed_key_shorter(ft,
-		d->nf, remaining, &top_flag, &jct_flag, d->depth);
+		d->nf, remaining, &top_flag, &jct_flag,
+		&cloned_orig_child, d->depth);
 	if (sret)
 		return sret;
 	ft_set_parent(top_flag, d->pnf, d->nfp);
@@ -8356,6 +8531,15 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	}
 	ft_propagate_external_count_parent(ft, jct_flag, 1);
 skip_key_count_propagation:
+	/*
+	 * RCU-free the cloned original child (if any) before freeing cn.
+	 * After ft_publish_to_parent above, both cn and the original
+	 * child are unreferenced from the new tree, but stale SKIP_X
+	 * readers still resolve via original → original->parent = cn.
+	 * Both must outlive the grace period; both are call_rcu-deferred.
+	 */
+	if (cloned_orig_child)
+		free_cds_ft_node(ft, cloned_orig_child);
 	free_compressed_node(ft, ft_compressed_node_ptr(d->nf));
 	return 0;
 }
@@ -10040,6 +10224,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	unsigned int suffix_len = cn->len - diverge_pos - 1;
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
 	unsigned long old_child_nr_keys;
+	struct cds_ft_inode *cloned_orig_child = NULL;
 	int ret;
 
 	/* Compute old child's nr_keys. */
@@ -10073,10 +10258,21 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		created[nr_created++] = old_suffix_flag;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
+		struct cds_ft_inode_flag *child_for_dest;
 
+		/* Clone QP/PIGEON cn->child to avoid in-place parent-kind
+		 * boundary demote (see ft_node_clone_for_reparent). */
+		if (cn->child && !ft_node_external_direct(cn->child)) {
+			child_for_dest = ft_node_clone_for_reparent(ft,
+				cn->child, &cloned_orig_child);
+			if (!child_for_dest) goto error;
+			created[nr_created++] = child_for_dest;
+		} else {
+			child_for_dest = cn->child;
+		}
 		ret = ft_node_set_nth(ft, &dest,
 				cn->key_bytes[diverge_pos + 1],
-				cn->child, NULL, NULL,
+				child_for_dest, NULL, NULL,
 				d->depth + diverge_pos + 1);
 		if (ret) goto error;
 		{
@@ -10088,7 +10284,15 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		old_suffix_flag = dest;
 		created[nr_created++] = dest;
 	} else {
-		old_suffix_flag = cn->child;
+		/* suffix_len == 0: clone if QP/PIGEON; same boundary concern. */
+		if (cn->child && !ft_node_external_direct(cn->child)) {
+			old_suffix_flag = ft_node_clone_for_reparent(ft,
+				cn->child, &cloned_orig_child);
+			if (!old_suffix_flag) goto error;
+			created[nr_created++] = old_suffix_flag;
+		} else {
+			old_suffix_flag = cn->child;
+		}
 	}
 
 	/* 2. Build branch node with old direction only. */
@@ -10214,6 +10418,11 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		/* nf should be NULL: the branch only has the old direction. */
 	}
 	d->depth += diverge_pos + 1;
+
+	/* RCU-free the cloned original child, if any (mirrors
+	 * ft_split_compressed_insert and ft_split_compressed_key_shorter). */
+	if (cloned_orig_child)
+		free_cds_ft_node(ft, cloned_orig_child);
 
 	/* 7. Free old compressed node. */
 	free_compressed_node(ft, cn);
@@ -10377,6 +10586,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	struct cds_ft_inode_flag *suffix_flag;
 	struct cds_ft_inode_flag *prefix_flag;
 	unsigned long child_nr_keys;
+	struct cds_ft_inode *cloned_orig_child = NULL;
 
 	if (!ft_node_external_direct(cn->child)) {
 		struct cds_ft_metadata *cm =
@@ -10407,13 +10617,28 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		suffix_flag = ft_publish_compressed(ft, sfx, suffix_flag);
 	} else {
 		struct cds_ft_inode_flag *dest = NULL;
+		struct cds_ft_inode_flag *child_for_dest;
 		int ret;
 
+		/* Clone QP/PIGEON cn->child to avoid in-place parent-kind
+		 * boundary demote (see ft_node_clone_for_reparent). */
+		if (cn->child && !ft_node_external_direct(cn->child)) {
+			child_for_dest = ft_node_clone_for_reparent(ft,
+				cn->child, &cloned_orig_child);
+			if (!child_for_dest) return -1;
+		} else {
+			child_for_dest = cn->child;
+		}
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining],
-			cn->child, NULL, NULL,
+			child_for_dest, NULL, NULL,
 			d->depth + remaining);
-		if (ret) return -1;
+		if (ret) {
+			if (cloned_orig_child)
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(child_for_dest));
+			return -1;
+		}
 		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(dest));
@@ -10541,6 +10766,10 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	d->nf = ft_resolve_skip_compressed(suffix_flag);
 	d->nfp = d->pnfp;
 	d->depth += remaining;
+
+	/* RCU-free the cloned original child (if any). */
+	if (cloned_orig_child)
+		free_cds_ft_node(ft, cloned_orig_child);
 
 	free_compressed_node(ft, cn);
 	return 0;
