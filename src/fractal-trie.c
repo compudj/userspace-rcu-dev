@@ -1889,6 +1889,20 @@ void ft_update_skip_pointer(struct cds_ft_inode_flag **parent_slot,
  * ensures candidate readers (which follow the skip pointer) see the
  * new child before exact/inequality readers (which follow cn->child).
  *
+ * For compressed-form @new_child (SKIP_X or plain COMPRESSED), also
+ * maintains the underlying compressed node's skip_slot_offset so it
+ * records @parent_slot's offset in @parent_nf — required by
+ * ft_get_skip_slot lookups (the dual-pointer dance above, and the
+ * chain-merge canonicalization in ft_detach_node that publishes a
+ * replacement at the cn's same grandparent slot).  Without this,
+ * compressed nodes installed via ft_publish_to_parent rather than via
+ * ft_node_set_nth → ft_set_parent leave skip_slot_offset == 0 — a
+ * latent gap that silently disabled the dual-pointer SKIP_X update
+ * and tripped chain-merge.  This intentionally does NOT update
+ * @new_child's parent linkage; callers manage that via their own
+ * ft_set_parent (or by direct meta->parent assignment), with
+ * semantics that vary across call sites.
+ *
  * Centralizes the dual-pointer RCU publication pattern so every
  * write to cn->child automatically maintains the skip pointer.
  */
@@ -1898,6 +1912,57 @@ void ft_publish_to_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child)
 {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * For compressed-form @new_child (SKIP_X or plain COMPRESSED):
+	 * maintain the compressed node's skip_slot_offset so that it
+	 * records the slot holding it in @new_child's eventual parent
+	 * node.  This is the value ft_get_skip_slot(cn_meta) recovers
+	 * later — used by dual-pointer publishes from cn->child
+	 * (ft_publish_to_parent itself, when called with parent_nf = cn)
+	 * and by chain-merge canonicalization (ft_detach_node) that
+	 * publishes a replacement at the same slot.
+	 *
+	 * Without this, compressed nodes installed via ft_publish_to_parent
+	 * (rather than via ft_node_set_nth, which routes through
+	 * ft_set_parent) leave skip_slot_offset == 0 — a latent gap that
+	 * silently disabled the dual-pointer SKIP_X update at the
+	 * grandparent slot and tripped chain-merge that *needs* the slot.
+	 *
+	 * Both encodings (SKIP_X and plain COMPRESSED) are handled: a
+	 * plain-COMPRESSED publish (ft_publish_compressed gate hit on
+	 * non-spec EXT child) still populates skip_slot_offset so a later
+	 * cn → non-EXT child transition (which would re-encode the slot
+	 * as SKIP_X via the dual-pointer dance) can update the right
+	 * grandparent slot.
+	 *
+	 * We do NOT touch @new_child's parent linkage here; existing
+	 * callers manage that via their own ft_set_parent (or by direct
+	 * meta->parent assignment) before calling us, with semantics that
+	 * vary across call sites.  This keeps the bookkeeping fix narrow.
+	 *
+	 * Skip the update at the root slot (&ft->root): root nodes have
+	 * no parent, and ft_set_skip_slot's offset computation assumes
+	 * the slot lives inside a node-arena chunk.
+	 */
+	if (parent_slot != &ft->root) {
+		struct cds_ft_compressed_node *cn = NULL;
+
+		if (ft_node_skip_compressed_in_slot(new_child))
+			cn = ft_skip_to_compressed(new_child);
+		else if (ft_node_compressed_in_node(new_child))
+			cn = ft_compressed_node_ptr(new_child);
+		if (cn) {
+			struct cds_ft_metadata *cn_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) cn);
+
+			if (cn_meta->parent)
+				ft_set_skip_slot(cn_meta, parent_slot);
+		}
+	}
+#endif
+
 	if (parent_nf && ft_node_compressed_in_node(parent_nf)) {
 		struct cds_ft_compressed_node *cn =
 			ft_compressed_node_ptr(parent_nf);
@@ -2093,6 +2158,25 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 	if (ft_node_skip_compressed_in_slot(child_nf)) {
 		struct cds_ft_compressed_node *cn =
 			ft_skip_to_compressed(child_nf);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) cn);
+		rcu_assign_pointer(cn_meta->parent, parent_nf);
+		ft_set_skip_slot(cn_meta, slot);
+		return;
+	}
+	if (ft_node_compressed_in_node(child_nf)) {
+		/*
+		 * Plain COMPRESSED form (no SKIP_X wrap): typically
+		 * arises when ft_publish_compressed gates SKIP-X off
+		 * for a non-spec EXT child.  Maintain the cn's
+		 * skip_slot_offset just like the SKIP_X branch above so
+		 * later ft_publish_to_parent / chain-merge calls can
+		 * recover the slot in cn's parent via
+		 * ft_get_skip_slot.
+		 */
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(child_nf);
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
@@ -9760,74 +9844,154 @@ int ft_detach_node(struct cds_ft *ft,
 		/*
 		 * Post-detach canonicalization: if the surviving ancestor
 		 * is now a non-root internal with exactly 1 live child and
-		 * no external_nodes attached, replace it with a 1-byte
-		 * compressed node — canonical form under FEATURE_FT_SKIP_-
-		 * COMPRESSED.  If its parent is itself compressed, extend
-		 * the parent compressed by one byte (chain-merge) instead
-		 * of stacking two adjacent compresseds, preserving the
-		 * "no two adjacent compresseds" invariant.
+		 * no external_nodes attached, replace the
+		 * [parent_cn?, iter_internal, child_cn?] chain with a single
+		 * compressed node — canonical form under
+		 * FEATURE_FT_SKIP_COMPRESSED.
+		 *
+		 * Four sub-cases on whether the parent and surviving child
+		 * are themselves compressed nodes:
+		 *
+		 *  - parent non-compressed, child non-compressed:
+		 *      [iter_internal] → [new_cn(1 byte)]; child preserved.
+		 *  - parent non-compressed, child compressed:
+		 *      [iter_internal, child_cn] →
+		 *      [new_cn(1 + child_cn.len bytes)];
+		 *      new_cn.child = child_cn.child.
+		 *  - parent compressed, child non-compressed:
+		 *      [parent_cn, iter_internal] →
+		 *      [new_cn(parent_cn.len + 1 bytes)];
+		 *      new_cn.child = surviving_child.
+		 *  - parent compressed, child compressed:
+		 *      [parent_cn, iter_internal, child_cn] →
+		 *      [new_cn(parent_cn.len + 1 + child_cn.len bytes)];
+		 *      new_cn.child = child_cn.child.
+		 *
+		 * In all cases the merged compressed replaces the entire
+		 * chain at the same trie position — preserving the
+		 * "no two adjacent compresseds" invariant by absorbing any
+		 * adjacent compressed neighbours into the new node.
+		 *
+		 * The chain-compress invariant guarantees that parent_cn's
+		 * own parent (the grandparent) is non-compressed, so the
+		 * publish at grandparent's slot does not need a recursive
+		 * merge.
+		 *
+		 * Bounded by FT_SKIP_LEN_MAX (uint8_t cn->len): when the
+		 * merged length would exceed the bound, fall back to leaving
+		 * the residue.  Subsequent inserts may rebuild canonical
+		 * form.
 		 */
 		if (iter_meta->nr_child == 1 &&
 		    !iter_meta->external_nodes &&
-		    iter_meta->parent != NULL &&
-		    !ft_node_compressed_in_node(iter_meta->parent) &&
-		    !ft_node_skip_compressed_in_slot(iter_meta->parent)) {
+		    iter_meta->parent != NULL) {
 			uint8_t surviving_byte = 0;
 			struct cds_ft_inode_flag *surviving_child =
 				ft_node_get_minmax(iter_node_flag,
 					&surviving_byte, FT_LEFTMOST);
+			bool parent_compressed = ft_node_compressed_in_node(
+					iter_meta->parent);
+			bool child_compressed = surviving_child
+				&& ft_node_compressed_in_node(surviving_child);
+			struct cds_ft_compressed_node *parent_cn =
+				parent_compressed
+				? ft_compressed_node_ptr(iter_meta->parent)
+				: NULL;
+			struct cds_ft_metadata *parent_cn_meta = parent_cn
+				? cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) parent_cn)
+				: NULL;
+			struct cds_ft_compressed_node *child_cn =
+				child_compressed
+				? ft_compressed_node_ptr(surviving_child)
+				: NULL;
+			unsigned int parent_len = parent_cn ? parent_cn->len : 0;
+			unsigned int child_len = child_cn ? child_cn->len : 0;
+			unsigned int merged_len = parent_len + 1 + child_len;
 
-			/*
-			 * Skip if the surviving child is itself compressed:
-			 * a 1-byte compressed wrapping it would create two
-			 * adjacent compresseds.  Chain-merging the surviving
-			 * compressed into the new node is the right answer
-			 * but is deferred.
-			 *
-			 * The "parent is compressed" guard above is the same
-			 * concern in the other direction: extending the parent
-			 * compressed by one byte (chain-merge) is the right
-			 * answer.  An attempt to do so was unstable (SIGSEGV
-			 * during test_merge_prefix_overlap_per_entry's drain
-			 * phase, with iter_path[level - 1] arriving SKIP-tagged
-			 * at the post-merge cds_ft_lookup_first descent's
-			 * leftmost loop) and is also deferred.
-			 *
-			 * Together these two carve-outs leave a residue of
-			 * 1-child internals that ft_verify still flags;
-			 * test_verify_compress_split's remove phase exercises
-			 * this residue.
-			 */
-			if (surviving_child &&
-			    !ft_node_compressed_in_node(surviving_child) &&
-			    !ft_node_skip_compressed_in_slot(surviving_child)) {
-				struct cds_ft_metadata *cn_meta;
-				struct cds_ft_compressed_node *cn =
-					alloc_compressed_node(ft, 1, &cn_meta);
-				if (cn) {
-					struct cds_ft_inode_flag *cn_flag;
+			if (surviving_child && merged_len <= FT_SKIP_LEN_MAX) {
+				struct cds_ft_metadata *new_cn_meta;
+				struct cds_ft_compressed_node *new_cn =
+					alloc_compressed_node(ft, merged_len,
+						&new_cn_meta);
+				if (new_cn) {
+					struct cds_ft_inode_flag *new_cn_flag;
+					struct cds_ft_inode_flag **publish_slot;
+					struct cds_ft_inode_flag *publish_parent;
 
-					cn->child = surviving_child;
-					cn->len = 1;
-					cn->key_bytes[0] = surviving_byte;
-					cn_meta->nr_child = 1;
-					ft_nr_keys_store(ft, cn_meta,
-						ft_nr_keys_get(iter_meta),
+					/* Compose merged path bytes. */
+					if (parent_cn)
+						memcpy(new_cn->key_bytes,
+							parent_cn->key_bytes,
+							parent_len);
+					new_cn->key_bytes[parent_len] = surviving_byte;
+					if (child_cn)
+						memcpy(&new_cn->key_bytes[parent_len + 1],
+							child_cn->key_bytes,
+							child_len);
+					new_cn->len = (uint8_t) merged_len;
+					new_cn->child = child_cn
+						? child_cn->child
+						: surviving_child;
+					new_cn_meta->nr_child = 1;
+					ft_nr_keys_store(ft, new_cn_meta,
+						ft_nr_keys_get(parent_cn_meta
+							? parent_cn_meta
+							: iter_meta),
 						CMM_RELAXED);
-					cn_meta->parent = iter_meta->parent;
-					cn_flag = ft_compressed_node_flag(cn);
-					ft_set_parent(surviving_child, cn_flag,
-						&cn->child);
-					cn_flag = ft_publish_compressed(ft, cn,
-						cn_flag);
-					ft_publish_to_parent(ft, iter_meta->parent,
-						detach_parent_flag_ptr, cn_flag);
+
+					if (parent_cn) {
+						/*
+						 * Replace parent_cn at its
+						 * own slot in the
+						 * grandparent.  Inherit the
+						 * grandparent context from
+						 * parent_cn.
+						 */
+						new_cn_meta->parent =
+							parent_cn_meta->parent;
+						publish_parent =
+							parent_cn_meta->parent;
+						publish_slot = ft_get_skip_slot(
+							parent_cn_meta, ft);
+					} else {
+						/*
+						 * Replace iter_internal at
+						 * its slot in the
+						 * non-compressed parent.
+						 */
+						new_cn_meta->parent =
+							iter_meta->parent;
+						publish_parent =
+							iter_meta->parent;
+						publish_slot =
+							detach_parent_flag_ptr;
+					}
+					ft_set_skip_slot(new_cn_meta,
+						publish_slot);
+
+					new_cn_flag = ft_compressed_node_flag(new_cn);
+					ft_set_parent(new_cn->child, new_cn_flag,
+						&new_cn->child);
+					new_cn_flag = ft_publish_compressed(ft,
+						new_cn, new_cn_flag);
+					ft_publish_to_parent(ft, publish_parent,
+						publish_slot, new_cn_flag);
+
 					free_cds_ft_node(ft,
 						ft_node_ptr(iter_node_flag));
+					if (parent_cn)
+						free_cds_ft_node(ft,
+							(struct cds_ft_inode *)
+							parent_cn);
+					if (child_cn)
+						free_cds_ft_node(ft,
+							(struct cds_ft_inode *)
+							child_cn);
 				}
 				/* Allocation failure: leave non-canonical
-				 * 1-child internal in place; subsequent
-				 * inserts may rebuild canonical form. */
+				 * residue in place; subsequent inserts may
+				 * rebuild canonical form. */
 			}
 		}
 #endif
