@@ -31,100 +31,94 @@
 #define FEATURE_INLINE_LOOKUP
 
 /*
- * Tag-bit kind encoding (4-bit nibble in the low bits of every
- * cds_ft_inode_flag pointer).  The enum value IS the pointer's low
- * nibble.  See doc/design/qp-tag-bit-layout.md for design rationale.
+ * Tag-bit kind encoding (5-bit, "Candidate E") in the low bits of
+ * every cds_ft_inode_flag pointer.  The enum value IS the pointer's
+ * low 5 bits.  See doc/design/qp-5bit-tag-encoding.md for design
+ * rationale.
  *
- *   FT_KIND_EXT (0x0)         external leaf chain head; pointer is the raw
- *                             struct cds_ft_node *.  Matches NULL.
- *   FT_KIND_COMPRESSED (0x1)  pointer to a struct cds_ft_compressed_node.
- *   FT_KIND_SKIP_EXT (0x2)    skip-compressed pointer; resolved target is EXT.
- *   FT_KIND_QP (0x5)       QP-nibble node (hi or lo, all tiers);
- *                             cds_ft_qp16_node *.  HI vs LO is recovered
- *                             from the lo-node's metadata is_lo bit
- *                             during the upward parent walk.
- *   FT_KIND_SKIP_QP (0x7)     skip-compressed pointer; resolved target is QP_HI.
- *   FT_KIND_PIGEON (0x9)      pigeon (dense 256-pointer) node; cds_ft_inode *.
- *   FT_KIND_SKIP_PIGEON (0xB) skip-compressed pointer; resolved target is PIGEON.
+ *   FT_KIND_EXT (0x00)         external leaf chain head; pointer is
+ *                              the raw struct cds_ft_node *.
+ *                              Matches NULL.
+ *   FT_KIND_PIGEON (0x01)      pigeon (dense 256-pointer) node;
+ *                              cds_ft_inode *.
+ *   FT_KIND_SKIP_EXT (0x02)    skip-compressed pointer; resolved
+ *                              target is EXT.
+ *   FT_KIND_SKIP_PIGEON (0x03) skip-compressed pointer; resolved
+ *                              target is PIGEON.
+ *   FT_KIND_COMPRESSED (0x04)  pointer to a struct
+ *                              cds_ft_compressed_node.
+ *   FT_KIND_QP (0x05)          QP-nibble node (hi or lo, all tiers);
+ *                              cds_ft_qp16_node *.  HI vs LO is
+ *                              recovered from the lo-node's metadata
+ *                              is_lo bit during the upward parent
+ *                              walk.
+ *   FT_KIND_SKIP_QP (0x07)     skip-compressed pointer; resolved
+ *                              target is QP_HI.
  *
- * Reserved (assert-on-encode): 0x3, 0x4, 0x6, 0x8, 0xA, 0xC, 0xD, 0xE, 0xF.
+ * Reserved for future Stage 3 wire-up (assert-on-encode):
+ *   FT_KIND_POPCOUNT_32 (0x09), FT_KIND_SKIP_POPCOUNT_32 (0x0B),
+ *   FT_KIND_POPCOUNT_64 (0x11), FT_KIND_SKIP_POPCOUNT_64 (0x13).
+ *
+ * Other reserved patterns: 0x06, 0x08, 0x0A, 0x0C-0x0F, 0x10, 0x12,
+ * 0x14-0x1F.  Bit pattern 0x06 (bit 0=0, bit 1=1, bit 2=1) is
+ * reserved: it would mean "skip-compressed of COMPRESSED", forbidden
+ * by the chain-compress invariant.
  *
  * Bit-pattern rationale:
- *   - bit 0 separates the two NULL-equivalent kinds (EXT, SKIP_EXT)
- *     from everything else (clear → ext-or-null fast path).
+ *   - bit 0 partitions the encoding by underlying alignment:
+ *     external-aligned (EXT, SKIP_EXT, COMPRESSED, 16-byte aligned)
+ *     has bit 0 clear; internal-aligned (PIGEON, QP, POPCOUNT_*,
+ *     and their SKIP variants — 32-byte aligned) has bit 0 set.
  *   - bit 1 is the universal "is skip-compressed" predicate; setting
  *     bit 1 on a child kind tag yields the matching SKIP_* tag
- *     (skip = child | 0x2; child = skip - 0x2).  This single-bit
- *     toggle replaces the dispatch switch on the lookup fast path.
- *   - bits 2..3 encode the resolved class (00 = ext/compressed, 01 =
- *     qp, 10 = pigeon); skip and child for the same class share
- *     these bits.
+ *     (skip = child | 0x2; child = skip - 0x2).
+ *   - bit 2 in the external-aligned half identifies COMPRESSED;
+ *     in the internal-aligned half it is QP's one-hot class bit.
+ *   - bit 3 / bit 4 are POPCOUNT_32 / POPCOUNT_64 one-hot class
+ *     bits in the internal-aligned half.
  *
- * All allocations are >= 16-byte aligned (FT_ALLOC_ORDER_MIN = 4) so
- * the low 4 bits are guaranteed zero in raw addresses.  External
- * nodes (struct cds_ft_node) carry __aligned__(16) for the same
- * reason — see include/urcu/fractal-trie.h.
+ * Internal nodes are 32-byte aligned (FT_QP16_T0_ALLOC_ORDER = 5
+ * and FT_PIGEON_ORDER ≥ 10) so the low 5 bits are guaranteed zero
+ * in raw addresses.  External nodes (struct cds_ft_node) and
+ * compressed nodes are 16-byte aligned — bits 0-3 are kind bits,
+ * bit 4 of the underlying address remains free (for external-
+ * aligned tags 0x00/0x02/0x04 it does not contaminate the kind
+ * extraction at the bit-2 level used by the read-side predicates).
  */
 enum ft_kind {
-	FT_KIND_EXT		= 0x0,
-	FT_KIND_COMPRESSED	= 0x1,
-	FT_KIND_SKIP_EXT	= 0x2,
-	FT_KIND_QP		= 0x5,
-	FT_KIND_SKIP_QP		= 0x7,
-	FT_KIND_PIGEON		= 0x9,
-	FT_KIND_SKIP_PIGEON	= 0xB,
+	FT_KIND_EXT		= 0x00,
+	FT_KIND_PIGEON		= 0x01,
+	FT_KIND_SKIP_EXT	= 0x02,
+	FT_KIND_SKIP_PIGEON	= 0x03,
+	FT_KIND_COMPRESSED	= 0x04,
+	FT_KIND_QP		= 0x05,
+	FT_KIND_SKIP_QP		= 0x07,
 };
 
 #define FT_KIND_SKIP_BIT	0x2UL	/* skip = child | FT_KIND_SKIP_BIT */
 
 /*
- * FT_KIND_PIGEON_FAMILY_BIT (bit 3): identifies PIGEON-class slots —
- * set on FT_KIND_PIGEON (0x9) and FT_KIND_SKIP_PIGEON (0xB), clear
- * on every kind that can appear as a child slot (EXT, COMPRESSED,
- * SKIP_EXT, QP_HI, SKIP_QP).  Slot-domain exact.
+ * Kind extraction mask.  Under Candidate E both slot-context and
+ * direct-internal sites use a 5-bit mask: internal kinds are 32-byte
+ * aligned (clean 5-bit kind), and external-aligned kinds (EXT,
+ * SKIP_EXT, COMPRESSED) keep bits 0-2 as clean kind bits — bit 4
+ * remains an address bit but is filtered out by the bit-aware
+ * predicates (ft_node_external uses `& 0x05`, ft_node_compressed
+ * uses `& 0x07`, ft_node_skip_compressed uses bit 1).  Direct
+ * extraction of `(v & FT_KIND_MASK)` against an external-aligned
+ * value still risks a bit-4 leak, so callers compare against the
+ * specific kind tag they expect (where bit 4 is 0) and rely on the
+ * predicate-level bit-aware filtering above instead.
  */
-#define FT_KIND_PIGEON_FAMILY_BIT	0x8UL
-
-/*
- * FT_KIND_INTERNAL_BITS (bits 2-3): non-zero iff the kind is one of
- * the two internal types — FT_KIND_QP (0x5) or FT_KIND_PIGEON
- * (0x9).  Zero on EXT (0x0), COMPRESSED (0x1), SKIP_EXT (0x2).
- * Skip kinds SKIP_QP (0x7) and SKIP_PIGEON (0xB) also satisfy the
- * test — callers must filter skips upstream via
- * ft_node_skip_compressed (asserted by ft_node_internal).
- */
-#define FT_KIND_INTERNAL_BITS	0xCUL
-
-/*
- * Slot-context kind extraction (4-bit).  Use at every site that may
- * read a value of unknown kind — i.e., any slot read whose value can
- * be EXT, SKIP_EXT, COMPRESSED, or any internal kind.  The 4-bit
- * width is required because EXT and SKIP_EXT pointers are only
- * 16-byte aligned (per `__aligned__(16)` on `struct cds_ft_node`),
- * and 16-byte-aligned compressed nodes can both legitimately have
- * bit 4 of their underlying address set.  A 5-bit mask would leak
- * that address bit into the recovered kind tag and misclassify EXT
- * as `0x10`.
- */
-#define FT_KIND_MASK		0xFUL
+#define FT_KIND_MASK		0x1FUL
 #define FT_KIND_PTR_MASK	(~FT_KIND_MASK)
 
 /*
- * Internal-context kind extraction (5-bit).  Use only at sites that
- * have already established the value is a *direct internal* node
- * (FT_KIND_QP, FT_KIND_PIGEON, and the future FT_KIND_POPCOUNT_*
- * kinds).  Internal nodes are 32-byte aligned (allocator order ≥ 5
- * for QP T0..T3 and ≥ 10 for PIGEON), so bit 4 of their underlying
- * address is always clear and the 5-bit mask recovers the full kind
- * tag without contamination.
- *
- * The 5-bit width is required to distinguish kinds whose tag
- * encoding uses bit 4 — currently a no-op (all current kinds fit
- * in 4 bits) but mandatory for the future FT_KIND_POPCOUNT_64
- * (planned tag `0x11`).  Using FT_KIND_MASK (4-bit) at internal-
- * only sites would mis-extract POPCOUNT_64 as PIGEON (`0x01`).
+ * Legacy alias for sites that have already established the value is
+ * a direct internal kind.  Equal to FT_KIND_MASK under Candidate E
+ * (both 0x1F).  Kept as a documentation hint for caller intent.
  */
-#define FT_KIND_MASK_INTERNAL	0x1FUL
+#define FT_KIND_MASK_INTERNAL	FT_KIND_MASK
 
 /*
  * Skip-compressed pointer encoding.
