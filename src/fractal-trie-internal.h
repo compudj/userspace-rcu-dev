@@ -95,8 +95,36 @@ enum ft_kind {
  */
 #define FT_KIND_INTERNAL_BITS	0xCUL
 
+/*
+ * Slot-context kind extraction (4-bit).  Use at every site that may
+ * read a value of unknown kind — i.e., any slot read whose value can
+ * be EXT, SKIP_EXT, COMPRESSED, or any internal kind.  The 4-bit
+ * width is required because EXT and SKIP_EXT pointers are only
+ * 16-byte aligned (per `__aligned__(16)` on `struct cds_ft_node`),
+ * and 16-byte-aligned compressed nodes can both legitimately have
+ * bit 4 of their underlying address set.  A 5-bit mask would leak
+ * that address bit into the recovered kind tag and misclassify EXT
+ * as `0x10`.
+ */
 #define FT_KIND_MASK		0xFUL
 #define FT_KIND_PTR_MASK	(~FT_KIND_MASK)
+
+/*
+ * Internal-context kind extraction (5-bit).  Use only at sites that
+ * have already established the value is a *direct internal* node
+ * (FT_KIND_QP, FT_KIND_PIGEON, and the future FT_KIND_POPCOUNT_*
+ * kinds).  Internal nodes are 32-byte aligned (allocator order ≥ 5
+ * for QP T0..T3 and ≥ 10 for PIGEON), so bit 4 of their underlying
+ * address is always clear and the 5-bit mask recovers the full kind
+ * tag without contamination.
+ *
+ * The 5-bit width is required to distinguish kinds whose tag
+ * encoding uses bit 4 — currently a no-op (all current kinds fit
+ * in 4 bits) but mandatory for the future FT_KIND_POPCOUNT_64
+ * (planned tag `0x11`).  Using FT_KIND_MASK (4-bit) at internal-
+ * only sites would mis-extract POPCOUNT_64 as PIGEON (`0x01`).
+ */
+#define FT_KIND_MASK_INTERNAL	0x1FUL
 
 /*
  * Skip-compressed pointer encoding.

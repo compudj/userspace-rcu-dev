@@ -1305,7 +1305,7 @@ struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
 	unsigned long v = (unsigned long) node;
 	unsigned long mask = ~15UL;
 
-	assert((((v & FT_KIND_MASK) >= FT_KIND_QP) &&
+	assert((((v & FT_KIND_MASK_INTERNAL) >= FT_KIND_QP) &&
 		!(v & FT_KIND_SKIP_BIT)) || node == NULL);
 	return (struct cds_ft_inode *) (v & mask);
 }
@@ -1355,7 +1355,7 @@ unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
 		return NODE_INDEX_NULL;
 	assert(!ft_node_compressed_in_node(node));
 
-	tag = (unsigned long) node & FT_KIND_MASK;
+	tag = (unsigned long) node & FT_KIND_MASK_INTERNAL;
 	if (tag == FT_KIND_QP) {
 		size_t order = cds_ft_item_order(ft_node_ptr_internal(node));
 		assert(order >= FT_QP16_T0_ALLOC_ORDER
@@ -2569,13 +2569,26 @@ void ft_prefetch_child_meta(const void *ptr)
 		__builtin_prefetch((const void *) v);
 		return;
 	}
+	/*
+	 * Use the 4-bit slot mask to test for COMPRESSED — COMPRESSED is
+	 * 16-byte aligned and bit 4 of its address is part of the address,
+	 * not the tag.  Only switch to FT_KIND_MASK_INTERNAL after the
+	 * COMPRESSED filter, where the value is known to be direct
+	 * internal (32-byte aligned).
+	 */
 	kind = v & FT_KIND_MASK;
 	if (kind == FT_KIND_COMPRESSED) {
 		/* Compressed: handler prefetches its own target; skip. */
 		return;
 	}
 	{
-		void *node = (void *) (v - kind);	/* SUB: kind register-resident */
+		/*
+		 * Direct internal kind (QP, PIGEON, future POPCOUNT_*).  Use
+		 * FT_KIND_MASK_INTERNAL so the SUB strips the full tag —
+		 * needed once tag values use bit 4 (POPCOUNT_64).
+		 */
+		unsigned long internal_kind = v & FT_KIND_MASK_INTERNAL;
+		void *node = (void *) (v - internal_kind);	/* SUB: kind register-resident */
 
 		__builtin_prefetch(cds_ft_item_to_metadata(node));
 	}
@@ -2594,12 +2607,17 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 		__builtin_prefetch((const void *) v);
 		return;
 	}
+	/* Use 4-bit mask while COMPRESSED (16-byte-aligned) is still possible. */
 	kind = v & FT_KIND_MASK;
 	if (kind == FT_KIND_COMPRESSED) {
 		return;
 	}
 	{
-		void *node = (void *) (v - kind);	/* SUB: kind register-resident */
+		/* Direct internal: use FT_KIND_MASK_INTERNAL so the SUB
+		 * strips the full tag (needed once POPCOUNT_64 lands).
+		 */
+		unsigned long internal_kind = v & FT_KIND_MASK_INTERNAL;
+		void *node = (void *) (v - internal_kind);	/* SUB: kind register-resident */
 		size_t order = cds_ft_item_order(node);
 
 		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
