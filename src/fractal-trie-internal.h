@@ -224,10 +224,10 @@ enum ft_kind {
  * keeps a trailing FT_NULL entry at that index so
  * &ft_types[NODE_INDEX_NULL] is in-bounds.
  *
- * Indices: FT_POPCOUNT_32_INDEX = 0, FT_QP_INDEX = 1,
- * FT_PIGEON_INDEX = 2.  POPCOUNT_64 lands in sub-stage C and will
- * be inserted at index 1 (between POPCOUNT_32 and QP), shifting
- * QP / PIGEON up by one.
+ * Indices: FT_POPCOUNT_32_INDEX = 0, FT_POPCOUNT_64_INDEX = 1,
+ * FT_QP_INDEX = 2, FT_PIGEON_INDEX = 3.  POPCOUNT_64 sits between
+ * POPCOUNT_32 and QP in the lattice walk: nr_child in [4, 6]
+ * lands here; nr_child > 6 escalates to QP.
  *
  * Each ft_types[] entry carries TWO sets of (min_child, max_child)
  * bounds — one for the direct variant, one for the skip-target
@@ -236,12 +236,13 @@ enum ft_kind {
  * types with no per-variant capacity difference (FT_QP, FT_PIGEON),
  * the two pairs are identical.  FT_POPCOUNT reduces max_child by
  * one in skip mode (slot 0 holds ft_pc32_skip_meta instead of a
- * pointer).
+ * pointer) for both POPCOUNT_32 and POPCOUNT_64.
  */
 #define FT_POPCOUNT_32_INDEX	0U
-#define FT_QP_INDEX		1U
-#define FT_PIGEON_INDEX		2U
-#define FT_NUM_INTERNAL_TYPES	3U
+#define FT_POPCOUNT_64_INDEX	1U
+#define FT_QP_INDEX		2U
+#define FT_PIGEON_INDEX		3U
+#define FT_NUM_INTERNAL_TYPES	4U
 #define NODE_INDEX_NULL		FT_NUM_INTERNAL_TYPES
 
 /*
@@ -667,6 +668,68 @@ struct ft_pc32_node {
 		struct {
 			struct ft_pc32_skip_meta meta;	/* slot 0 */
 			struct cds_ft_inode_flag *slots[2]; /* slots 1, 2 */
+		} skip;
+	} u;
+} __attribute__((__aligned__(8)));
+
+/*
+ * POPCOUNT_64 layout (order 6 = 64 B), shared by direct (FT_KIND_-
+ * POPCOUNT_64) and skip (FT_KIND_SKIP_POPCOUNT_64) variants.  Uses
+ * the "scan_6" flat-packed bitmap geometry — a 5+3 byte split,
+ * NOT the 4+4 nibble split of POPCOUNT_32.  The choice fits all
+ * sub_bms in one u64 for max_lc=6 with no chunk-select cmov.
+ *
+ *   bytes 0-3   : root_bm    (32-bit, one bit per high 5-bit prefix
+ *                             hi = n >> 3, so 32 hi-buckets)
+ *   bytes 4-11  : packed_bms (64-bit; up to 6 x 8-bit sub_bms — each
+ *                             sub_bm holds presence bits for the 8
+ *                             low values lo = n & 0x7 within that
+ *                             popcount-rank slot.  bit at position
+ *                             p = (slot1 * 8) | lo is set iff
+ *                             (hi, lo) is populated, where slot1 =
+ *                             popcount-rank of hi in root_bm)
+ *   bytes 12-15 : padding    (header is 16 B, 8-byte aligned)
+ *   bytes 16-23 : slot 0     (DIRECT: ptr for popcount-idx 5.
+ *                             SKIP:   reuses ft_pc32_skip_meta —
+ *                                     skip_len byte + subkey[7].)
+ *   bytes 24-31 : slot 1     (ptr for popcount-idx 4)
+ *   bytes 32-39 : slot 2     (ptr for popcount-idx 3)
+ *   bytes 40-47 : slot 3     (ptr for popcount-idx 2)
+ *   bytes 48-55 : slot 4     (ptr for popcount-idx 1)
+ *   bytes 56-63 : slot 5     (ptr for popcount-idx 0)
+ *
+ * Reverse-indexed pointers same as POPCOUNT_32: ptr_offset =
+ * (FT_PC64_MAX_LC_DIRECT - 1) - popcount_idx.  SKIP variant
+ * repurposes slot 0 (popcount-idx 5) for inline skip metadata,
+ * dropping max_lc to FT_PC64_MAX_LC_SKIP.
+ *
+ * Hot path (lookup):
+ *   slot1   = popcount(root & ((1<<hi)-1))
+ *   p       = (slot1 << 3) | lo
+ *   present = (packed_bms >> p) & 1
+ *   ptr_idx = popcount(packed_bms & ((1<<p)-1))
+ *
+ * No chunk-select cmov, no per-slot prior cache: a single packed
+ * bitmap suffices because max_lc=6 needs at most 48 bits in the u64.
+ */
+#define FT_PC64_HEADER_SIZE		16U
+#define FT_PC64_ALLOC_ORDER		6U	/* 64 B */
+#define FT_PC64_MAX_LC_DIRECT		6U
+#define FT_PC64_MAX_LC_SKIP		5U
+#define FT_PC64_HI_BITS			5U	/* 5+3 byte split */
+#define FT_PC64_LO_BITS			3U
+#define FT_PC64_LO_MASK			((1U << FT_PC64_LO_BITS) - 1U)
+#define FT_PC64_HI_BUCKETS		(1U << FT_PC64_HI_BITS) /* 32 */
+
+struct ft_pc64_node {
+	uint32_t root_bm;	/* bytes 0-3 */
+	uint64_t packed_bms;	/* bytes 4-11 */
+	uint32_t _pad;		/* bytes 12-15 */
+	union {
+		struct cds_ft_inode_flag *direct[6];	/* direct mode */
+		struct {
+			struct ft_pc32_skip_meta meta;	/* slot 0 */
+			struct cds_ft_inode_flag *slots[5]; /* slots 1..5 */
 		} skip;
 	} u;
 } __attribute__((__aligned__(8)));

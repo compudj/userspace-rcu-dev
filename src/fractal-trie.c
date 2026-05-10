@@ -218,9 +218,15 @@ enum {
  * read-side hot path.
  *
  *   [FT_POPCOUNT_32_INDEX] = POPCOUNT_32 class — order 5 (32 B),
- *            2-level nibble bitmap with popcount-indexed ptrs[].
- *            Direct variant max_lc = 3.  Used as the smallest
- *            internal node, replacing fresh-allocation QP T0.
+ *            2-level nibble bitmap with popcount-indexed ptrs[]
+ *            (scan_3, 4+4 byte split).  Direct variant max_lc = 3.
+ *            Used as the smallest internal node, replacing fresh-
+ *            allocation QP T0.
+ *   [FT_POPCOUNT_64_INDEX] = POPCOUNT_64 class — order 6 (64 B),
+ *            scan_6 flat-packed layout (5+3 byte split, single
+ *            packed_bms u64).  Direct variant max_lc = 6.  Sits
+ *            between POPCOUNT_32 and QP in the lattice walk: nr_-
+ *            child in [4, 6] lands here.
  *   [FT_QP_INDEX]     = QP class — 16-nibble bitmap, popcount-
  *            indexed ptrs[].  Internal tier picker (T0..T3 at
  *            orders 5..8) is popcount-driven via
@@ -245,6 +251,19 @@ const struct cds_ft_type ft_types[] = {
 		.min_child = 1, .max_child = FT_PC32_MAX_LC_DIRECT,
 		.min_child_skip = 1, .max_child_skip = FT_PC32_MAX_LC_SKIP,
 		.order = FT_PC32_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
+	/*
+	 * FT_POPCOUNT_64 entry: scan_6 layout (5+3 byte split, single
+	 * packed_bms u64 holding up to 6 sub_bms × 8 bits).  min_child
+	 * overlaps with POPCOUNT_32's max_child (=3) for hysteresis;
+	 * nr_child in [2,3] can stay in either class (the recompact
+	 * framework prefers POPCOUNT_32 since the lattice walk lands
+	 * there first).  Skip variant reserves slot 0 for skip-meta,
+	 * dropping max_lc by one (5).
+	 */
+	[FT_POPCOUNT_64_INDEX] = { .type_class = FT_POPCOUNT,
+		.min_child = 2, .max_child = FT_PC64_MAX_LC_DIRECT,
+		.min_child_skip = 2, .max_child_skip = FT_PC64_MAX_LC_SKIP,
+		.order = FT_PC64_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	/*
 	 * FT_QP entry: max_child uses the byte-count ceiling at QP T3
 	 * (16 hi-buckets * 16 lo-children = 256) for find_nearest_type_index
@@ -1153,8 +1172,17 @@ struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 	 */
 	switch (ft_types[type].type_class) {
 	case FT_POPCOUNT:
-		assert(type == FT_POPCOUNT_32_INDEX);
-		tag = FT_KIND_POPCOUNT_32;
+		switch (type) {
+		case FT_POPCOUNT_32_INDEX:
+			tag = FT_KIND_POPCOUNT_32;
+			break;
+		case FT_POPCOUNT_64_INDEX:
+			tag = FT_KIND_POPCOUNT_64;
+			break;
+		default:
+			assert(0);
+			__builtin_unreachable();
+		}
 		break;
 	case FT_QP:
 		tag = FT_KIND_QP;
@@ -1459,11 +1487,11 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
  * kind.
  *
  * One index per class: FT_KIND_POPCOUNT_32 → FT_POPCOUNT_32_INDEX,
- * FT_KIND_QP → FT_QP_INDEX, FT_KIND_PIGEON → FT_PIGEON_INDEX.  QP's
- * tier (T0..T3, alloc orders 5..8) is recovered separately via
- * cds_ft_item_order(ft_node_ptr_internal(node)) and indexed into
- * ft_qp16_tiers[].  Descent dispatches on the kind tag directly
- * without indexing ft_types[].
+ * FT_KIND_POPCOUNT_64 → FT_POPCOUNT_64_INDEX, FT_KIND_QP →
+ * FT_QP_INDEX, FT_KIND_PIGEON → FT_PIGEON_INDEX.  QP's tier (T0..T3,
+ * alloc orders 5..8) is recovered separately via cds_ft_item_order()
+ * and indexed into ft_qp16_tiers[].  Descent dispatches on the kind
+ * tag directly without indexing ft_types[].
  */
 static inline_lookup
 unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
@@ -1481,6 +1509,8 @@ unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
 		return FT_PIGEON_INDEX;
 	if (tag == FT_KIND_POPCOUNT_32)
 		return FT_POPCOUNT_32_INDEX;
+	if (tag == FT_KIND_POPCOUNT_64)
+		return FT_POPCOUNT_64_INDEX;
 	assert(0);
 	__builtin_unreachable();
 }
@@ -1595,32 +1625,34 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
 	/*
-	 * Candidate E: SKIP_EXT (0x02) is 16-byte-aligned, so bit 4 of
-	 * the leaf address may leak into `v & 0x1F`.  Use a 4-bit mask
-	 * (0x0F): the bit-4 leak is ignored, and SKIP_EXT collapses to
-	 * 0x02 regardless of address bit 4.  This distinguishes SKIP_EXT
-	 * (0x02), SKIP_PIGEON (0x03), SKIP_QP (0x07), and
-	 * SKIP_POPCOUNT_32 (0x0B) cleanly.  SKIP_POPCOUNT_64 (0x13)
-	 * would alias SKIP_PIGEON under 4-bit mask — its handler will
-	 * widen the test to 5-bit and disambiguate via bit 4.
+	 * 5-bit mask: internal-aligned skip kinds (SKIP_PIGEON 0x03,
+	 * SKIP_QP 0x07, SKIP_POPCOUNT_32 0x0B, SKIP_POPCOUNT_64 0x13)
+	 * are 32-byte-aligned so bits 0..4 are clean kind bits.
+	 * SKIP_EXT (0x02) is 16-byte-aligned, so the leaf-address bit 4
+	 * may leak in giving 0x02 or 0x12; that is distinguishable from
+	 * the internal-aligned variants by bit 0 (clear for SKIP_EXT,
+	 * set for all internal-aligned skip kinds), and SKIP_EXT falls
+	 * out of the cascade as the unmatched cold-path tail.
 	 */
-	unsigned long kind = v & 0x0FUL;
+	unsigned long kind = v & 0x1FUL;
 	void *natural;
 
 	/*
 	 * Caller has already established that @node is a skip-compressed
 	 * kind.
 	 */
-	assert(kind == FT_KIND_SKIP_EXT || kind == FT_KIND_SKIP_QP
+	assert(kind == FT_KIND_SKIP_EXT || kind == (FT_KIND_SKIP_EXT | 0x10UL)
+		|| kind == FT_KIND_SKIP_QP
 		|| kind == FT_KIND_SKIP_PIGEON
-		|| kind == FT_KIND_SKIP_POPCOUNT_32);
+		|| kind == FT_KIND_SKIP_POPCOUNT_32
+		|| kind == FT_KIND_SKIP_POPCOUNT_64);
 	/*
 	 * Branch order optimized for the lookup hot path: SKIP_QP is the
 	 * dominant input since the SKIP_EXT fast path in cds_ft_lookup
-	 * never reaches here.  SKIP_POPCOUNT_32 / SKIP_PIGEON come next
-	 * (small / large dense subtries respectively).  SKIP_EXT falls
-	 * through last and is only reached from off-hot-path callers
-	 * (verify / show_stats).
+	 * never reaches here.  SKIP_POPCOUNT_32 / SKIP_POPCOUNT_64 /
+	 * SKIP_PIGEON come next (small / medium / large dense subtries).
+	 * SKIP_EXT falls through last and is only reached from
+	 * off-hot-path callers (verify / show_stats).
 	 *
 	 * SUB by the constant tag inside each branch: lets the prefetcher
 	 * recognize a constant-stride access and frees `kind` from being
@@ -1632,6 +1664,10 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 	}
 	if (kind == FT_KIND_SKIP_POPCOUNT_32) {
 		natural = (void *) (v - FT_KIND_SKIP_POPCOUNT_32);
+		return cds_ft_item_to_metadata(natural)->popcount_skip_len;
+	}
+	if (kind == FT_KIND_SKIP_POPCOUNT_64) {
+		natural = (void *) (v - FT_KIND_SKIP_POPCOUNT_64);
 		return cds_ft_item_to_metadata(natural)->popcount_skip_len;
 	}
 	if (kind == FT_KIND_SKIP_PIGEON) {
@@ -1659,7 +1695,8 @@ unsigned long ft_kind_to_skip_kind(unsigned long child_kind)
 	assert(child_kind == FT_KIND_EXT ||
 	       child_kind == FT_KIND_QP ||
 	       child_kind == FT_KIND_PIGEON ||
-	       child_kind == FT_KIND_POPCOUNT_32);
+	       child_kind == FT_KIND_POPCOUNT_32 ||
+	       child_kind == FT_KIND_POPCOUNT_64);
 	return child_kind | FT_KIND_SKIP_BIT;
 }
 
@@ -1673,7 +1710,8 @@ unsigned long ft_skip_kind_to_child_kind(unsigned long skip_kind)
 	assert(skip_kind == FT_KIND_SKIP_EXT ||
 	       skip_kind == FT_KIND_SKIP_QP ||
 	       skip_kind == FT_KIND_SKIP_PIGEON ||
-	       skip_kind == FT_KIND_SKIP_POPCOUNT_32);
+	       skip_kind == FT_KIND_SKIP_POPCOUNT_32 ||
+	       skip_kind == FT_KIND_SKIP_POPCOUNT_64);
 	return skip_kind - FT_KIND_SKIP_BIT;
 }
 
@@ -1726,30 +1764,33 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		const struct cds_ft_compressed_node *cn)
 {
 	/*
-	 * Candidate E: child is one of EXT (0x00, 16B), QP (0x05, 32B),
-	 * PIGEON (0x01, 32B), POPCOUNT_32 (0x09, 32B).  EXT is 16-byte-
-	 * aligned and bit 4 of its address may leak under a 5-bit mask;
-	 * use `& 0x0F` to ignore the leak and still distinguish all four
-	 * direct-internal kinds (EXT 0x00, PIGEON 0x01, QP 0x05,
-	 * POPCOUNT_32 0x09).  POPCOUNT_64 (0x11) lands in B-followups
-	 * and will widen the mask to 5-bit there.
+	 * Candidate E: child is one of EXT (0x00, 16B-aligned), PIGEON
+	 * (0x01, 32B), QP (0x05, 32B), POPCOUNT_32 (0x09, 32B), or
+	 * POPCOUNT_64 (0x11, 32B).  Internal-aligned kinds (bit 0 set)
+	 * are 32-byte aligned so all 5 low bits are clean kind bits.
+	 * EXT (bit 0 clear) is 16-byte aligned and bit 4 of its address
+	 * may leak under a 5-bit mask — force child_kind to FT_KIND_EXT
+	 * for that case so the SUB encoding below preserves bit 4 of
+	 * the underlying address.
 	 */
-	unsigned long child_kind = (unsigned long) child & 0x0FUL;
+	unsigned long v = (unsigned long) child;
+	unsigned long child_kind = (v & 0x01UL) ? (v & 0x1FUL) : FT_KIND_EXT;
 	unsigned long skip_kind = ft_kind_to_skip_kind(child_kind);
 	unsigned int len = cn->len;
 
 	/* Bounded by FT_SKIP_LEN_MAX (uint8_t skip_len field). */
 	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
 	/*
-	 * Only EXT / QP_HI / PIGEON / POPCOUNT_32 are valid skip targets.
-	 * COMPRESSED is forbidden by the chain-compress invariant;
-	 * ft_kind_to_skip_kind asserts.  (QP-nibble lo-nodes share the
-	 * QP tag and are not a separate kind in the slot-tag space.)
+	 * Only EXT / QP / PIGEON / POPCOUNT_32 / POPCOUNT_64 are valid
+	 * skip targets.  COMPRESSED is forbidden by the chain-compress
+	 * invariant; ft_kind_to_skip_kind asserts.  (QP-nibble lo-nodes
+	 * share the QP tag and are not a separate kind in the slot-tag
+	 * space.)
 	 */
 	if (child_kind == FT_KIND_QP) {
 		/* QP is 32-byte aligned: ~31UL strips kind cleanly. */
 		struct cds_ft_qp16_node *qp = (struct cds_ft_qp16_node *)
-			((unsigned long) child & ~31UL);
+			(v & ~31UL);
 		size_t copy_len = len < FT_QP16_SUBKEY_INLINE_LEN
 				? len : FT_QP16_SUBKEY_INLINE_LEN;
 
@@ -1758,16 +1799,19 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		qp->skip_len = (uint8_t) len;
 	} else if (child_kind == FT_KIND_PIGEON) {
 		/* PIGEON is 32-byte aligned: ~31UL strips kind cleanly. */
-		void *natural_child = (void *)
-			((unsigned long) child & ~31UL);
+		void *natural_child = (void *) (v & ~31UL);
 		struct cds_ft_metadata *meta =
 			cds_ft_item_to_metadata(natural_child);
 
 		meta->pigeon_skip_len = (uint8_t) len;
-	} else if (child_kind == FT_KIND_POPCOUNT_32) {
-		/* POPCOUNT_32 is 32-byte aligned: ~31UL strips kind cleanly. */
-		void *natural_child = (void *)
-			((unsigned long) child & ~31UL);
+	} else if (child_kind == FT_KIND_POPCOUNT_32
+			|| child_kind == FT_KIND_POPCOUNT_64) {
+		/*
+		 * POPCOUNT_32 and POPCOUNT_64 share the metadata
+		 * popcount_skip_len field; both are 32-byte aligned
+		 * (~31UL strips the kind cleanly).
+		 */
+		void *natural_child = (void *) (v & ~31UL);
 		struct cds_ft_metadata *meta =
 			cds_ft_item_to_metadata(natural_child);
 
@@ -1779,13 +1823,12 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 	 * 16-byte-aligned EXT pointers may legitimately have bit 4 set
 	 * as an address bit; ~0x1F would clear it and corrupt the
 	 * underlying pointer.  SUB by the kind value (0x00 for EXT,
-	 * 0x01 for PIGEON, 0x05 for QP, 0x09 for POPCOUNT_32) preserves
-	 * bits 4+ of the underlying address regardless of alignment.
-	 * The skip-tag is OR'd in at the end since bit 1
-	 * (FT_KIND_SKIP_BIT) was clear in every child kind.
+	 * 0x01 for PIGEON, 0x05 for QP, 0x09 for POPCOUNT_32, 0x11 for
+	 * POPCOUNT_64) preserves bits 4+ of the underlying address
+	 * regardless of alignment.  The skip-tag is OR'd in at the end
+	 * since bit 1 (FT_KIND_SKIP_BIT) was clear in every child kind.
 	 */
-	return (struct cds_ft_inode_flag *)
-		(((unsigned long) child - child_kind) | skip_kind);
+	return (struct cds_ft_inode_flag *) ((v - child_kind) | skip_kind);
 }
 
 /*
@@ -2267,39 +2310,68 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 	    !ft->group->speculative_validated)
 		return cflag;
 	/*
-	 * POPCOUNT_32 skip-variant transition: when cn->child is a
-	 * POPCOUNT_32 with nr_child ≤ FT_PC32_MAX_LC_SKIP, repurpose
-	 * slot 0 to hold ft_pc32_skip_meta (skip_len + cached subkey)
-	 * so speculative-validate descent can validate the skipped path
-	 * inline against the cached subkey, no parent walk to cn
-	 * required.  Set popcount_is_skip on the child's metadata so
-	 * subsequent set_nth uses the reduced max_lc.  Slot 0 (ptr-
-	 * offset 0 = popcount-rank 2) is guaranteed unused at this
-	 * point because nr_child ≤ 2 — write is non-destructive.
+	 * POPCOUNT_{32,64} skip-variant transition: when cn->child is a
+	 * POPCOUNT node with nr_child ≤ MAX_LC_SKIP for that layout,
+	 * repurpose slot 0 to hold ft_pc32_skip_meta (skip_len + cached
+	 * subkey) so speculative-validate descent can validate the
+	 * skipped path inline against the cached subkey, no parent walk
+	 * to cn required.  Set popcount_is_skip on the child's metadata
+	 * so subsequent set_nth uses the reduced max_lc.  Slot 0
+	 * (highest popcount-rank) is guaranteed unused at this point
+	 * because nr_child ≤ MAX_LC_SKIP — write is non-destructive.
 	 *
-	 * For nr_child > 2, the slot-0 reservation would overwrite a
-	 * live pointer; fall back to the SKIP_POPCOUNT_32 wrapper
-	 * without slot-0 caching (skip_len still in popcount_skip_len
-	 * metadata, validation defers to leaf-bytes).
+	 * For nr_child > MAX_LC_SKIP, the slot-0 reservation would
+	 * overwrite a live pointer; fall back to the SKIP_POPCOUNT_*
+	 * wrapper without slot-0 caching (skip_len still in
+	 * popcount_skip_len metadata, validation defers to leaf-bytes).
+	 *
+	 * pc32 and pc64 share struct ft_pc32_skip_meta as the slot-0
+	 * cached-subkey form; layout differs only in the byte offset
+	 * of slot 0 inside the node (8 vs 16) which the union access
+	 * handles transparently.
 	 */
-	if (((unsigned long) cn->child & 0x1FUL) == FT_KIND_POPCOUNT_32) {
-		struct ft_pc32_node *pc = (struct ft_pc32_node *)
-			((unsigned long) cn->child & ~31UL);
-		struct cds_ft_metadata *pc_meta =
-			cds_ft_item_to_metadata(pc);
+	{
+		unsigned long child_kind =
+			(unsigned long) cn->child & 0x1FUL;
 
-		if (pc_meta->nr_child <= FT_PC32_MAX_LC_SKIP &&
-		    !pc_meta->popcount_is_skip) {
-			struct ft_pc32_skip_meta *meta = &pc->u.skip.meta;
-			size_t copy_len = cn->len < sizeof(meta->subkey)
-				? cn->len
-				: sizeof(meta->subkey);
+		if (child_kind == FT_KIND_POPCOUNT_32) {
+			struct ft_pc32_node *pc = (struct ft_pc32_node *)
+				((unsigned long) cn->child & ~31UL);
+			struct cds_ft_metadata *pc_meta =
+				cds_ft_item_to_metadata(pc);
 
-			memset(meta, 0, sizeof(*meta));
-			meta->skip_len = (uint8_t) cn->len;
-			if (copy_len)
-				memcpy(meta->subkey, cn->key_bytes, copy_len);
-			pc_meta->popcount_is_skip = 1;
+			if (pc_meta->nr_child <= FT_PC32_MAX_LC_SKIP &&
+			    !pc_meta->popcount_is_skip) {
+				struct ft_pc32_skip_meta *meta = &pc->u.skip.meta;
+				size_t copy_len = cn->len < sizeof(meta->subkey)
+					? cn->len
+					: sizeof(meta->subkey);
+
+				memset(meta, 0, sizeof(*meta));
+				meta->skip_len = (uint8_t) cn->len;
+				if (copy_len)
+					memcpy(meta->subkey, cn->key_bytes, copy_len);
+				pc_meta->popcount_is_skip = 1;
+			}
+		} else if (child_kind == FT_KIND_POPCOUNT_64) {
+			struct ft_pc64_node *pc = (struct ft_pc64_node *)
+				((unsigned long) cn->child & ~31UL);
+			struct cds_ft_metadata *pc_meta =
+				cds_ft_item_to_metadata(pc);
+
+			if (pc_meta->nr_child <= FT_PC64_MAX_LC_SKIP &&
+			    !pc_meta->popcount_is_skip) {
+				struct ft_pc32_skip_meta *meta = &pc->u.skip.meta;
+				size_t copy_len = cn->len < sizeof(meta->subkey)
+					? cn->len
+					: sizeof(meta->subkey);
+
+				memset(meta, 0, sizeof(*meta));
+				meta->skip_len = (uint8_t) cn->len;
+				if (copy_len)
+					memcpy(meta->subkey, cn->key_bytes, copy_len);
+				pc_meta->popcount_is_skip = 1;
+			}
 		}
 	}
 	return ft_skip_compressed_flag(cn->child, cn);
@@ -3410,7 +3482,7 @@ struct cds_ft_inode_flag *ft_pc32_node_get_direction(struct ft_pc32_node *node,
 
 	if (dir == FT_RIGHT) {
 		for (i = 0; i < nr; i++) {
-			uint8_t k;
+			uint8_t k = 0;
 			struct cds_ft_inode_flag *child =
 				ft_pc32_node_get_ith_pos(node, i, &k);
 
@@ -3424,9 +3496,279 @@ struct cds_ft_inode_flag *ft_pc32_node_get_direction(struct ft_pc32_node *node,
 	}
 	/* FT_LEFT: find the rightmost (highest-byte) child < n. */
 	for (i = nr; i > 0; i--) {
-		uint8_t k;
+		uint8_t k = 0;
 		struct cds_ft_inode_flag *child =
 			ft_pc32_node_get_ith_pos(node, i - 1, &k);
+
+		if ((int) k < n) {
+			if (result_key)
+				*result_key = k;
+			return child;
+		}
+	}
+	return NULL;
+}
+
+
+/*
+ * POPCOUNT_64 helpers (scan_6 layout, 5+3 byte split).  See struct
+ * ft_pc64_node and the layout comment in fractal-trie-internal.h.
+ *
+ * Reverse-indexed pointer slot: ptr_offset = (max_lc_direct - 1) -
+ * popcount_idx.  Constant max_lc_direct (= 6) keeps the lookup
+ * formula identical across direct and skip variants; SKIP variant
+ * just disallows popcount_idx == max_lc_direct - 1 (= 5), which
+ * would land at physical offset 0 (the skip-meta slot).
+ *
+ * Hot-path uses (slot1 << 3) | lo as the absolute bit position in
+ * packed_bms, and a single popcount on (packed_bms & mask) yields
+ * ptr_idx — no chunk-select cmov, no per-slot prior cache (max_lc=6
+ * fits in 48 bits, well within u64).
+ */
+
+/* Slot 0 is at physical offset FT_PC64_HEADER_SIZE (= 16 B). */
+static inline_lookup
+struct cds_ft_inode_flag **ft_pc64_node_slot(struct ft_pc64_node *node,
+		unsigned int ptr_offset)
+{
+	return (struct cds_ft_inode_flag **)
+		((uint8_t *) node + FT_PC64_HEADER_SIZE
+		 + ptr_offset * sizeof(struct cds_ft_inode_flag *));
+}
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+/* Skip-variant slot 0 access; symmetric to ft_pc32_node_skip_meta. */
+static inline_lookup
+struct ft_pc32_skip_meta *ft_pc64_node_skip_meta(struct ft_pc64_node *node)
+{
+	return &node->u.skip.meta;
+}
+#endif
+
+/*
+ * Lookup primitive: 5+3 flat-packed popcount, max_lc_direct = 6.
+ *
+ * One 32-bit load brings root_bm into a register; one 64-bit load
+ * brings packed_bms.  Two presence tests guard a single popcount-
+ * prefix-sum into the pointer array via the reverse-indexed offset
+ * formula.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_pc64_node_get_nth_skip(struct ft_pc64_node *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint)
+{
+	uint32_t root = node->root_bm;
+	uint64_t bms = node->packed_bms;
+	unsigned int hi = (unsigned int) n >> FT_PC64_LO_BITS;
+	unsigned int lo = (unsigned int) n & FT_PC64_LO_MASK;
+	unsigned int slot1, p, ptr_idx, ptr_offset;
+	struct cds_ft_inode_flag **slot;
+
+	/* 1. Root check (high 5-bit prefix present?). */
+	if (caa_unlikely(!((root >> hi) & 1U)))
+		goto not_found;
+
+	slot1 = (unsigned int) __builtin_popcount(root & ((1U << hi) - 1U));
+	p = (slot1 << FT_PC64_LO_BITS) | lo;
+
+	/* 2. Sub-bitmap check (low 3-bit suffix present in this slot?). */
+	if (caa_unlikely(!((bms >> p) & 1ULL)))
+		goto not_found;
+
+	/* 3. Pointer index = rank of (hi, lo) among populated entries. */
+	ptr_idx = (unsigned int) __builtin_popcountll(
+			bms & ((1ULL << p) - 1ULL));
+	ptr_offset = (FT_PC64_MAX_LC_DIRECT - 1U) - ptr_idx;
+	slot = ft_pc64_node_slot(node, ptr_offset);
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = slot;
+	return ft_dereference_acquire_prefetch_hint(*slot, pf_hint);
+
+not_found:
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+}
+
+/*
+ * Number of children: popcount of packed_bms.  No need to consult
+ * root_bm — it tracks distinct hi-buckets, not child count.
+ */
+static inline_lookup
+unsigned int ft_pc64_node_get_nr_child(struct ft_pc64_node *node)
+{
+	return (unsigned int) __builtin_popcountll(node->packed_bms);
+}
+
+/*
+ * Insert (n, child) into a freshly-allocated or rebuild-target
+ * POPCOUNT_64 node, in safe-append discipline.  Mirrors
+ * ft_pc32_node_set_nth_safe; returns -ENOSPC if popcount(new_bms)
+ * exceeds @max_lc, -ERANGE on non-safe-append insert (the framework
+ * routes through recompact ADD_SAME), 0 on success.
+ *
+ * A duplicate byte triggers a slot rewrite (no nr_child bump),
+ * matching FT_PIGEON / FT_QP / POPCOUNT_32 replace semantics.
+ */
+static
+int ft_pc64_node_set_nth_safe(struct ft_pc64_node *node,
+		struct cds_ft_metadata *metadata,
+		uint8_t n,
+		struct cds_ft_inode_flag *child,
+		unsigned int max_lc)
+{
+	uint32_t root = node->root_bm;
+	uint64_t bms = node->packed_bms;
+	unsigned int hi = (unsigned int) n >> FT_PC64_LO_BITS;
+	unsigned int lo = (unsigned int) n & FT_PC64_LO_MASK;
+	uint32_t hi_bit = 1U << hi;
+	unsigned int slot1, p, ptr_idx, ptr_offset;
+	uint64_t new_bms;
+
+	if (!(root & hi_bit))
+		root |= hi_bit;
+	slot1 = (unsigned int) __builtin_popcount(root & (hi_bit - 1U));
+	p = (slot1 << FT_PC64_LO_BITS) | lo;
+
+	/* Compose new_bms: insert the lo bit at popcount rank slot1. */
+	if (!(node->root_bm & hi_bit)) {
+		uint64_t low_mask = (slot1 == 0) ? 0ULL
+			: ((1ULL << (slot1 << FT_PC64_LO_BITS)) - 1ULL);
+		uint64_t low_part = bms & low_mask;
+		uint64_t high_part = (bms & ~low_mask) << (1U << FT_PC64_LO_BITS);
+
+		new_bms = low_part | high_part;
+	} else {
+		new_bms = bms;
+	}
+	/* Duplicate-byte rewrite — same semantics as POPCOUNT_32. */
+	if ((new_bms >> p) & 1ULL) {
+		ptr_idx = (unsigned int) __builtin_popcountll(
+				new_bms & ((1ULL << p) - 1ULL));
+		ptr_offset = (FT_PC64_MAX_LC_DIRECT - 1U) - ptr_idx;
+		rcu_assign_pointer(*ft_pc64_node_slot(node, ptr_offset),
+				child);
+		return 0;
+	}
+	new_bms |= 1ULL << p;
+
+	if (caa_unlikely((unsigned int) __builtin_popcountll(new_bms) > max_lc))
+		return -ENOSPC;
+
+	/* Safe-append: only the new bit may be at-or-above bit_pos. */
+	if ((unsigned int) __builtin_popcountll(
+			new_bms & ~((1ULL << p) - 1ULL)) != 1U)
+		return -ERANGE;
+	ptr_idx = (unsigned int) __builtin_popcountll(
+			new_bms & ((1ULL << p) - 1ULL));
+	ptr_offset = (FT_PC64_MAX_LC_DIRECT - 1U) - ptr_idx;
+
+	*ft_pc64_node_slot(node, ptr_offset) = child;
+	node->root_bm = root;
+	node->packed_bms = new_bms;
+	metadata->nr_child++;
+	return 0;
+}
+
+/*
+ * Walk POPCOUNT_64 children in popcount order: returns the (byte, ptr)
+ * pair at popcount index @i (0 = lowest rank).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_pc64_node_get_ith_pos(struct ft_pc64_node *node,
+		unsigned int i, uint8_t *byte_out)
+{
+	uint32_t root = node->root_bm;
+	uint64_t bms = node->packed_bms;
+	unsigned int p, slot1, lo, hi;
+	uint64_t shifted;
+	unsigned int ptr_offset;
+
+	if (i >= (unsigned int) __builtin_popcountll(bms))
+		return NULL;
+
+	/* Find the i-th set bit in bms (lowest first). */
+	shifted = bms;
+	while (i--)
+		shifted &= shifted - 1;
+	p = (unsigned int) __builtin_ctzll(shifted);
+	slot1 = p >> FT_PC64_LO_BITS;
+	lo = p & FT_PC64_LO_MASK;
+
+	/* Recover hi = position of the slot1-th set bit in root. */
+	{
+		uint32_t r = root;
+		unsigned int k;
+
+		for (k = 0; k < slot1; k++)
+			r &= r - 1U;
+		hi = (unsigned int) __builtin_ctz(r);
+	}
+
+	if (byte_out)
+		*byte_out = (uint8_t) ((hi << FT_PC64_LO_BITS) | lo);
+
+	ptr_offset = (FT_PC64_MAX_LC_DIRECT - 1U)
+		   - (unsigned int) __builtin_popcountll(
+				bms & ((1ULL << p) - 1ULL));
+	return *ft_pc64_node_slot(node, ptr_offset);
+}
+
+/*
+ * Replace the slot at byte @n.  Same semantics as POPCOUNT_32:
+ * -EFBIG on remove (route through recompact DEL), in-place rewrite
+ * for non-NULL @newptr.
+ */
+static
+int ft_pc64_node_replace_ptr(struct ft_pc64_node *node __attribute__((unused)),
+		struct cds_ft_metadata *metadata,
+		struct cds_ft_inode_flag **node_flag_ptr,
+		uint8_t n __attribute__((unused)),
+		struct cds_ft_inode_flag *newptr)
+{
+	if (!newptr) {
+		if (metadata->fallback_removal_count) {
+			metadata->fallback_removal_count--;
+			rcu_assign_pointer(*node_flag_ptr, NULL);
+			return 0;
+		}
+		return -EFBIG;
+	}
+	rcu_assign_pointer(*node_flag_ptr, newptr);
+	return 0;
+}
+
+/*
+ * Iterator-direction lookup, mirroring the POPCOUNT_32 version.
+ * POPCOUNT_64 holds at most 6 children, so a sequential walk over
+ * populated bits is still cheap.
+ */
+static
+struct cds_ft_inode_flag *ft_pc64_node_get_direction(struct ft_pc64_node *node,
+		int n, uint8_t *result_key, enum ft_direction dir)
+{
+	unsigned int nr = ft_pc64_node_get_nr_child(node);
+	unsigned int i;
+
+	if (dir == FT_RIGHT) {
+		for (i = 0; i < nr; i++) {
+			uint8_t k = 0;
+			struct cds_ft_inode_flag *child =
+				ft_pc64_node_get_ith_pos(node, i, &k);
+
+			if ((int) k > n) {
+				if (result_key)
+					*result_key = k;
+				return child;
+			}
+		}
+		return NULL;
+	}
+	for (i = nr; i > 0; i--) {
+		uint8_t k = 0;
+		struct cds_ft_inode_flag *child =
+			ft_pc64_node_get_ith_pos(node, i - 1, &k);
 
 		if ((int) k < n) {
 			if (result_key)
@@ -4676,11 +5018,11 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	/*
 	 * Internal dispatch: FT_KIND_QP (0x05) routes to QP byte-step;
 	 * FT_KIND_PIGEON (0x01) routes to PIGEON.  The full 5-bit tag
-	 * is clean here because direct-internal kinds are 32-byte
-	 * aligned.  Lo-nodes share the QP tag (HI/LO disambiguated via
-	 * metadata is_lo bit during the parent walk) but never appear
-	 * as a slot value here — the descent reaches them only inside
-	 * ft_qp_byte_get's HI→LO chain.
+	 * is clean here because direct-internal kinds are 32-byte+
+	 * aligned (POPCOUNT_64 is 64-byte aligned).  Lo-nodes share the
+	 * QP tag (HI/LO disambiguated via metadata is_lo bit during the
+	 * parent walk) but never appear as a slot value here — the
+	 * descent reaches them only inside ft_qp_byte_get's HI→LO chain.
 	 *
 	 * Untag with a constant SUB inside each branch: the SUB has no
 	 * dependency on `tag`, lets the address compute issue one cycle
@@ -4688,11 +5030,13 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 * result as a linear pointer offset.
 	 *
 	 * Internal-direct kinds at this point: PIGEON (0x01), QP (0x05),
-	 * POPCOUNT_32 (0x09).  Distinguishing tag bits:
+	 * POPCOUNT_32 (0x09), POPCOUNT_64 (0x11).  Distinguishing tag
+	 * bits (one-hot on bits 2-4, plus bit 0 alignment):
 	 *   bit 2 = QP (0x05 only)
 	 *   bit 3 = POPCOUNT_32 (0x09 only)
-	 *   neither = PIGEON (0x01)
-	 * Hot path likely caa_likely(QP); POPCOUNT_32 second; PIGEON last.
+	 *   bit 4 = POPCOUNT_64 (0x11 only)
+	 *   none of bits 2/3/4 = PIGEON (0x01)
+	 * Hot path likely caa_likely(QP); POPCOUNT_* second; PIGEON last.
 	 */
 	if (caa_likely((v & 0x04UL) != 0))
 		return ft_qp_byte_get(
@@ -4703,6 +5047,11 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		return ft_pc32_node_get_nth_skip(
 				(struct ft_pc32_node *)
 				((unsigned long) node_flag - FT_KIND_POPCOUNT_32),
+				node_flag_ptr, n, pf_hint);
+	if ((v & 0x10UL) != 0)
+		return ft_pc64_node_get_nth_skip(
+				(struct ft_pc64_node *)
+				((unsigned long) node_flag - FT_KIND_POPCOUNT_64),
 				node_flag_ptr, n, pf_hint);
 	return ft_pigeon_node_get_nth(NULL,
 			(struct cds_ft_inode *)
@@ -4826,22 +5175,44 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 	}
 	case FT_POPCOUNT:
 	{
-		struct ft_pc32_node *pc = (struct ft_pc32_node *) node;
-		unsigned int nr = ft_pc32_node_get_nr_child(pc);
+		unsigned int nr;
 		unsigned int i;
 
-		for (i = 0; i < nr; i++) {
-			uint8_t v;
-			struct cds_ft_inode_flag *iter =
-				ft_pc32_node_get_ith_pos(pc, i, &v);
+		if (type_index == FT_POPCOUNT_64_INDEX) {
+			struct ft_pc64_node *pc = (struct ft_pc64_node *) node;
 
-			if (iter == child_nf) {
-				if (n_ret)
-					*n_ret = v;
-				if (slot_ret)
-					ft_node_get_nth(parent_nf, slot_ret,
-							v, FT_PF_NONE);
-				return true;
+			nr = ft_pc64_node_get_nr_child(pc);
+			for (i = 0; i < nr; i++) {
+				uint8_t v = 0;
+				struct cds_ft_inode_flag *iter =
+					ft_pc64_node_get_ith_pos(pc, i, &v);
+
+				if (iter == child_nf) {
+					if (n_ret)
+						*n_ret = v;
+					if (slot_ret)
+						ft_node_get_nth(parent_nf, slot_ret,
+								v, FT_PF_NONE);
+					return true;
+				}
+			}
+		} else {
+			struct ft_pc32_node *pc = (struct ft_pc32_node *) node;
+
+			nr = ft_pc32_node_get_nr_child(pc);
+			for (i = 0; i < nr; i++) {
+				uint8_t v = 0;
+				struct cds_ft_inode_flag *iter =
+					ft_pc32_node_get_ith_pos(pc, i, &v);
+
+				if (iter == child_nf) {
+					if (n_ret)
+						*n_ret = v;
+					if (slot_ret)
+						ft_node_get_nth(parent_nf, slot_ret,
+								v, FT_PF_NONE);
+					return true;
+				}
 			}
 		}
 		return false;
@@ -4884,9 +5255,14 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 				n, result_key, dir);
 		break;
 	case FT_POPCOUNT:
-		child = ft_pc32_node_get_direction(
-				(struct ft_pc32_node *) node,
-				n, result_key, dir);
+		if (type_index == FT_POPCOUNT_64_INDEX)
+			child = ft_pc64_node_get_direction(
+					(struct ft_pc64_node *) node,
+					n, result_key, dir);
+		else
+			child = ft_pc32_node_get_direction(
+					(struct ft_pc32_node *) node,
+					n, result_key, dir);
 		break;
 	default:
 		assert(0);
@@ -4989,27 +5365,36 @@ int _ft_node_set_nth(struct cds_ft *ft,
 	case FT_POPCOUNT:
 	{
 		/*
-		 * Pick max_lc from the metadata mode bit: skip-target
-		 * variant reserves slot 0 for ft_pc32_skip_meta, so
-		 * max_lc drops to FT_PC32_MAX_LC_SKIP (= 2).  Direct
-		 * variant uses FT_PC32_MAX_LC_DIRECT (= 3).
+		 * Two POPCOUNT layouts share FT_POPCOUNT type_class — pc32
+		 * (scan_3, max_lc=3) and pc64 (scan_6, max_lc=6).  Dispatch
+		 * by type->order: 5 = pc32, 6 = pc64.  Each picks max_lc
+		 * from the metadata skip-mode bit (skip variant reserves
+		 * slot 0 for ft_pc32_skip_meta, dropping max_lc by one).
 		 *
 		 * Returns -ERANGE on non-safe-append insert, routing
 		 * through recompact ADD_SAME for an off-tree rebuild.
-		 * Returns -ENOSPC when popcount overflows max_lc, routing
-		 * through recompact ADD_NEXT to escalate to QP — which
-		 * inherits the skip-target context (popcount_is_skip
-		 * propagates to the new node, even though QP's bounds
-		 * don't change between modes).
+		 * Returns -ENOSPC on capacity overflow, routing through
+		 * recompact ADD_NEXT (pc32 → pc64 → QP escalation).
 		 */
-		unsigned int max_lc = FT_PC32_MAX_LC_DIRECT;
+		if (type->order == FT_PC64_ALLOC_ORDER) {
+			unsigned int max_lc = FT_PC64_MAX_LC_DIRECT;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		if (metadata->popcount_is_skip)
-			max_lc = FT_PC32_MAX_LC_SKIP;
+			if (metadata->popcount_is_skip)
+				max_lc = FT_PC64_MAX_LC_SKIP;
 #endif
-		ret = ft_pc32_node_set_nth_safe(
-				(struct ft_pc32_node *) node, metadata,
-				n, child_node_flag, max_lc);
+			ret = ft_pc64_node_set_nth_safe(
+					(struct ft_pc64_node *) node, metadata,
+					n, child_node_flag, max_lc);
+		} else {
+			unsigned int max_lc = FT_PC32_MAX_LC_DIRECT;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			if (metadata->popcount_is_skip)
+				max_lc = FT_PC32_MAX_LC_SKIP;
+#endif
+			ret = ft_pc32_node_set_nth_safe(
+					(struct ft_pc32_node *) node, metadata,
+					n, child_node_flag, max_lc);
+		}
 		break;
 	}
 	case FT_QP:
@@ -5099,9 +5484,14 @@ int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
 		ret = ft_pigeon_node_replace_ptr(type, node, metadata, node_flag_ptr, n, newptr);
 		break;
 	case FT_POPCOUNT:
-		ret = ft_pc32_node_replace_ptr(
-				(struct ft_pc32_node *) node, metadata,
-				node_flag_ptr, n, newptr);
+		if (type->order == FT_PC64_ALLOC_ORDER)
+			ret = ft_pc64_node_replace_ptr(
+					(struct ft_pc64_node *) node, metadata,
+					node_flag_ptr, n, newptr);
+		else
+			ret = ft_pc32_node_replace_ptr(
+					(struct ft_pc32_node *) node, metadata,
+					node_flag_ptr, n, newptr);
 		break;
 	case FT_QP:
 		ret = ft_qp_byte_replace(ft,
@@ -5450,40 +5840,71 @@ int ft_node_recompact(enum ft_recompact mode,
 	}
 	case FT_POPCOUNT:
 	{
-		struct ft_pc32_node *old_pc =
-			(struct ft_pc32_node *) old_node;
-		unsigned int old_nr = ft_pc32_node_get_nr_child(old_pc);
 		bool insert_new = (mode == FT_RECOMPACT_ADD_NEXT
 				|| mode == FT_RECOMPACT_ADD_SAME);
 		bool new_inserted = false;
+		unsigned int old_nr;
 		unsigned int i;
 
 		/*
-		 * Walk old POPCOUNT_32 entries in popcount-rank order
-		 * (low rank first).  For ADD modes, weave the new
-		 * (n, child_node_flag) at the right rank so the
-		 * destination is filled strictly safe-append.  Recompact
-		 * DEL skips the to-be-removed entry.
+		 * Walk old POPCOUNT entries in popcount-rank order (low
+		 * rank first).  For ADD modes, weave the new (n,
+		 * child_node_flag) at the right rank so the destination
+		 * is filled strictly safe-append.  Recompact DEL skips
+		 * the to-be-removed entry.  Two layouts share
+		 * FT_POPCOUNT type_class: pc32 (order 5) vs pc64 (order
+		 * 6); dispatch by old_type->order.
 		 */
-		for (i = 0; i < old_nr; i++) {
-			uint8_t v;
-			struct cds_ft_inode_flag *iter =
-				ft_pc32_node_get_ith_pos(old_pc, i, &v);
+		if (old_type->order == FT_PC64_ALLOC_ORDER) {
+			struct ft_pc64_node *old_pc =
+				(struct ft_pc64_node *) old_node;
 
-			if (insert_new && !new_inserted
-			    && (unsigned int) v > (unsigned int) n) {
-				ret = _ft_node_set_nth(ft, new_type,
-					new_node, new_node_flag,
-					new_metadata, n, child_node_flag);
+			old_nr = ft_pc64_node_get_nr_child(old_pc);
+			for (i = 0; i < old_nr; i++) {
+				uint8_t v = 0;
+				struct cds_ft_inode_flag *iter =
+					ft_pc64_node_get_ith_pos(old_pc, i, &v);
+
+				if (insert_new && !new_inserted
+				    && (unsigned int) v > (unsigned int) n) {
+					ret = _ft_node_set_nth(ft, new_type,
+						new_node, new_node_flag,
+						new_metadata, n, child_node_flag);
+					assert(!ret);
+					new_inserted = true;
+				}
+				if (mode == FT_RECOMPACT_DEL
+				    && *nullify_node_flag_ptr == iter)
+					continue;
+				ret = _ft_node_set_nth(ft, new_type, new_node,
+					new_node_flag, new_metadata, v, iter);
 				assert(!ret);
-				new_inserted = true;
 			}
-			if (mode == FT_RECOMPACT_DEL
-			    && *nullify_node_flag_ptr == iter)
-				continue;
-			ret = _ft_node_set_nth(ft, new_type, new_node,
-				new_node_flag, new_metadata, v, iter);
-			assert(!ret);
+		} else {
+			struct ft_pc32_node *old_pc =
+				(struct ft_pc32_node *) old_node;
+
+			old_nr = ft_pc32_node_get_nr_child(old_pc);
+			for (i = 0; i < old_nr; i++) {
+				uint8_t v = 0;
+				struct cds_ft_inode_flag *iter =
+					ft_pc32_node_get_ith_pos(old_pc, i, &v);
+
+				if (insert_new && !new_inserted
+				    && (unsigned int) v > (unsigned int) n) {
+					ret = _ft_node_set_nth(ft, new_type,
+						new_node, new_node_flag,
+						new_metadata, n, child_node_flag);
+					assert(!ret);
+					new_inserted = true;
+				}
+				if (mode == FT_RECOMPACT_DEL
+				    && *nullify_node_flag_ptr == iter)
+					continue;
+				ret = _ft_node_set_nth(ft, new_type, new_node,
+					new_node_flag, new_metadata, v, iter);
+				assert(!ret);
+			}
 		}
 		if (insert_new && !new_inserted) {
 			ret = _ft_node_set_nth(ft, new_type, new_node,
@@ -5757,31 +6178,55 @@ skip_copy:
 		}
 		case FT_POPCOUNT:
 		{
-			struct ft_pc32_node *new_pc =
-				(struct ft_pc32_node *) new_node;
-			unsigned int new_nr =
-				ft_pc32_node_get_nr_child(new_pc);
+			unsigned int new_nr;
 			unsigned int i;
 
 			/*
-			 * Walk new POPCOUNT_32 children in popcount-rank
+			 * Walk new POPCOUNT children in popcount-rank
 			 * order and reparent each under the freshly
 			 * published new_node_flag, mirroring the FT_PIGEON
 			 * arm.  Children copied from the old node still
 			 * reference the old node via meta->parent until
-			 * this loop runs.
+			 * this loop runs.  pc32 (order 5) vs pc64 (order
+			 * 6) layouts share FT_POPCOUNT type_class; dispatch
+			 * by new_type->order.
 			 */
-			for (i = 0; i < new_nr; i++) {
-				uint8_t v;
-				struct cds_ft_inode_flag *iter;
-				struct cds_ft_inode_flag **slot = NULL;
+			if (new_type->order == FT_PC64_ALLOC_ORDER) {
+				struct ft_pc64_node *new_pc =
+					(struct ft_pc64_node *) new_node;
 
-				iter = ft_pc32_node_get_ith_pos(new_pc, i, &v);
-				if (!iter)
-					continue;
-				ft_node_get_nth_skip(new_node_flag,
-						&slot, v, FT_PF_NONE);
-				ft_set_parent(iter, new_node_flag, slot);
+				new_nr = ft_pc64_node_get_nr_child(new_pc);
+				for (i = 0; i < new_nr; i++) {
+					uint8_t v;
+					struct cds_ft_inode_flag *iter;
+					struct cds_ft_inode_flag **slot = NULL;
+
+					iter = ft_pc64_node_get_ith_pos(
+							new_pc, i, &v);
+					if (!iter)
+						continue;
+					ft_node_get_nth_skip(new_node_flag,
+							&slot, v, FT_PF_NONE);
+					ft_set_parent(iter, new_node_flag, slot);
+				}
+			} else {
+				struct ft_pc32_node *new_pc =
+					(struct ft_pc32_node *) new_node;
+
+				new_nr = ft_pc32_node_get_nr_child(new_pc);
+				for (i = 0; i < new_nr; i++) {
+					uint8_t v;
+					struct cds_ft_inode_flag *iter;
+					struct cds_ft_inode_flag **slot = NULL;
+
+					iter = ft_pc32_node_get_ith_pos(
+							new_pc, i, &v);
+					if (!iter)
+						continue;
+					ft_node_get_nth_skip(new_node_flag,
+							&slot, v, FT_PF_NONE);
+					ft_set_parent(iter, new_node_flag, slot);
+				}
 			}
 			break;
 		}
@@ -6583,16 +7028,19 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		if (ft_node_skip_compressed_in_slot(node_flag)) {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
-			 * Candidate E: SKIP_EXT is 16-byte aligned (bit 4
-			 * may leak through `& 0x1F`).  Use `& 0x0F` to
-			 * distinguish SKIP_EXT (0x02), SKIP_PIGEON (0x03),
-			 * SKIP_QP (0x07), and SKIP_POPCOUNT_32 (0x0B) —
-			 * bit 4 is masked off.  SKIP_POPCOUNT_64 (0x13)
-			 * would alias SKIP_PIGEON under 4-bit mask and
-			 * needs a wider test once it lands.
+			 * Candidate E: bit 0 partitions by alignment.  Internal-
+			 * aligned skips (SKIP_PIGEON 0x03, SKIP_QP 0x07,
+			 * SKIP_POPCOUNT_32 0x0B, SKIP_POPCOUNT_64 0x13) are
+			 * 32-byte aligned with clean 5-bit kind; SKIP_EXT
+			 * (0x02) is 16-byte aligned and bit 4 of the leaf
+			 * address may leak under a 5-bit mask, but bit 0 is
+			 * always clear for SKIP_EXT so the conditional folds
+			 * the leak into a fixed FT_KIND_SKIP_EXT value.
 			 */
 			unsigned long skip_kind =
-				(unsigned long) node_flag & 0x0FUL;
+				((unsigned long) node_flag & 0x01UL)
+				? ((unsigned long) node_flag & 0x1FUL)
+				: FT_KIND_SKIP_EXT;
 #endif
 			if (!descend_cand) {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -6833,6 +7281,35 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 							status = CDS_FT_STATUS_NOT_FOUND;
 							goto end;
 						}
+					} else if (skip_kind == FT_KIND_SKIP_POPCOUNT_64 &&
+					    skip <= FT_PC32_SUBKEY_INLINE_LEN) {
+						/*
+						 * POPCOUNT_64 skip variant: same
+						 * cached-subkey layout as
+						 * POPCOUNT_32 (both reuse struct
+						 * ft_pc32_skip_meta in slot 0).
+						 * The slot-0 cache line is on the
+						 * second CL of the 64 B node — not
+						 * the same CL as the bitmap header
+						 * for direct-class POPCOUNT_64
+						 * descents, but the next-iter
+						 * bitmap descent will fetch the
+						 * header CL anyway, and the slot-0
+						 * CL is what the actual descent
+						 * will need for ptrs.
+						 */
+						const struct ft_pc64_node *pc =
+							(const struct ft_pc64_node *)
+							/* SUB: tag known to be FT_KIND_SKIP_POPCOUNT_64. */
+							((unsigned long) node_flag - FT_KIND_SKIP_POPCOUNT_64);
+
+						if (caa_unlikely(ft_key_cmp_ordinals(
+								key, pc->u.skip.meta.subkey,
+								skip, skip,
+								false, NULL) != 0)) {
+							status = CDS_FT_STATUS_NOT_FOUND;
+							goto end;
+						}
 					} else {
 						if (first_skip_offset == key_len)
 							first_skip_offset = i;
@@ -6936,6 +7413,30 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 			iter_key = *(key++);
 			node_flag = ft_pc32_node_get_nth_skip(pc, NULL,
+					iter_key, FT_PF_DATA);
+			if (caa_unlikely(!node_flag)) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			FT_BYTE_STEP_POST();
+			continue;
+		}
+		/*
+		 * POPCOUNT_64 fast path: scan_6 (5+3 byte split) flat-packed
+		 * popcount byte step on a medium-density internal node (4-6
+		 * children).  Tag-specific test `(v & 0x1F) == FT_KIND_-
+		 * POPCOUNT_64` (= 0x11) — POPCOUNT_64 has bit 0 + bit 4 set,
+		 * distinct from QP / PIGEON / POPCOUNT_32.  Skip variant
+		 * (SKIP_POPCOUNT_64, 0x13) is filtered upstream by the SKIP
+		 * handler (bit 1 set).
+		 */
+		if (((unsigned long) node_flag & 0x1FUL) == FT_KIND_POPCOUNT_64) {
+			struct ft_pc64_node *pc =
+				(struct ft_pc64_node *)
+				((unsigned long) node_flag - FT_KIND_POPCOUNT_64);
+
+			iter_key = *(key++);
+			node_flag = ft_pc64_node_get_nth_skip(pc, NULL,
 					iter_key, FT_PF_DATA);
 			if (caa_unlikely(!node_flag)) {
 				status = CDS_FT_STATUS_NOT_FOUND;
@@ -15690,13 +16191,31 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 						expected_order);
 				return -1;
 			}
-			if (metadata->nr_child > type->max_child) {
-				if (out)
-					fprintf(out, "ft_verify: depth %u: internal node %p nr_child %u exceeds type %u max_child %u\n",
-						depth, node_flag,
-						metadata->nr_child, type_index,
-						(unsigned int) type->max_child);
-				return -1;
+			{
+				unsigned int max_child;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Skip-target POPCOUNT nodes reserve slot 0 for
+				 * cached subkey, dropping max by one.  The bit
+				 * is meaningful only for FT_POPCOUNT; on QP /
+				 * PIGEON it is harmless inheritance.
+				 */
+				max_child = (type->type_class == FT_POPCOUNT
+					     && metadata->popcount_is_skip)
+					? type->max_child_skip
+					: type->max_child;
+#else
+				max_child = type->max_child;
+#endif
+				if (metadata->nr_child > max_child) {
+					if (out)
+						fprintf(out, "ft_verify: depth %u: internal node %p nr_child %u exceeds type %u max_child %u\n",
+							depth, node_flag,
+							metadata->nr_child, type_index,
+							max_child);
+					return -1;
+				}
 			}
 		}
 		/* Count external nodes attached to this node's metadata. */
@@ -16228,6 +16747,7 @@ struct cds_ft_stats {
 	uint64_t nr_skip_compressed_qp;
 	uint64_t nr_skip_compressed_pigeon;
 	uint64_t nr_skip_compressed_popcount_32;
+	uint64_t nr_skip_compressed_popcount_64;
 	uint64_t nr_skip_compressed_ext;
 	uint64_t qp_hi_half_cls_dist[256];
 	uint64_t nr_qp_hi_total;
@@ -16294,15 +16814,15 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (ft_node_skip_compressed_in_slot(child_node_flag)) {
 			/*
-			 * Candidate E: 16-byte-aligned SKIP_EXT addresses can
-			 * have bit 4 set; a 5-bit `& 0x1F` would leak.  Use
-			 * 4-bit `& 0x0F`: SKIP_EXT (0x02), SKIP_PIGEON (0x03),
-			 * SKIP_QP (0x07), SKIP_POPCOUNT_32 (0x0B) are all
-			 * distinct under this mask.  SKIP_POPCOUNT_64 (0x13)
-			 * would alias SKIP_PIGEON under 4-bit mask and will
-			 * need a wider test once it lands.
+			 * Candidate E: bit 0 partitions by alignment.  Internal-
+			 * aligned skips are 32-byte aligned with clean 5-bit
+			 * kind; SKIP_EXT is 16-byte aligned and bit 4 may leak
+			 * under a 5-bit mask but bit 0 is always clear so the
+			 * conditional folds the leak into FT_KIND_SKIP_EXT.
 			 */
-			unsigned long tag = (unsigned long) child_node_flag & 0x0FUL;
+			unsigned long v = (unsigned long) child_node_flag;
+			unsigned long tag = (v & 0x01UL)
+				? (v & 0x1FUL) : FT_KIND_SKIP_EXT;
 			unsigned int skip = ft_skip_len(child_node_flag);
 
 			stats->nr_skip_compressed_total++;
@@ -16312,6 +16832,8 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 				stats->nr_skip_compressed_qp++;
 			else if (tag == FT_KIND_SKIP_POPCOUNT_32)
 				stats->nr_skip_compressed_popcount_32++;
+			else if (tag == FT_KIND_SKIP_POPCOUNT_64)
+				stats->nr_skip_compressed_popcount_64++;
 			else if (tag == FT_KIND_SKIP_PIGEON)
 				stats->nr_skip_compressed_pigeon++;
 			else if (tag == FT_KIND_SKIP_EXT)
@@ -16529,11 +17051,12 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 		fprintf(out,
 			"Skip-compressed pointers: %" PRIu64
 			" (qp:%" PRIu64 " pigeon:%" PRIu64 " popcount_32:%" PRIu64
-			" ext:%" PRIu64 ")\n",
+			" popcount_64:%" PRIu64 " ext:%" PRIu64 ")\n",
 			total,
 			stats->nr_skip_compressed_qp,
 			stats->nr_skip_compressed_pigeon,
 			stats->nr_skip_compressed_popcount_32,
+			stats->nr_skip_compressed_popcount_64,
 			stats->nr_skip_compressed_ext);
 		print_indent(out, 1);
 		fprintf(out, "skip_len distribution:");
