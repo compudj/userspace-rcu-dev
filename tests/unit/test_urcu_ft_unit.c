@@ -10796,15 +10796,27 @@ out:
  * validation comparator sees only the diverging-suffix tail and
  * rejects every match.
  */
-static int test_specv_long_compressed_prefix(void)
+/*
+ * Helper: run the long-compressed-prefix scenario with @nsuffix divergent
+ * keys, exercising each internal-node class as the SKIP wrapper's
+ * resolved target:
+ *   nsuffix = 2  → POPCOUNT_32 target (SKIP_POPCOUNT_32 wrapper)
+ *   nsuffix = 4  → POPCOUNT_64 target (SKIP_POPCOUNT_64 wrapper)
+ *   nsuffix = 8  → QP target (SKIP_QP wrapper)
+ *   nsuffix = 16 → QP T3 target
+ *
+ * Catches off-by-one bugs in the SKIP→fast-path fall-through where the
+ * post-skip in-iter byte step lands on a key-terminating external
+ * (FT_BYTE_STEP_POST then mistakes it for mid-descent EXT and bails).
+ */
+static int test_specv_long_compressed_prefix_n(unsigned int nsuffix)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_specv_varlen_ft(&group);
 	struct cds_ft_node *found;
 	enum cds_ft_status s;
 	static const char *prefix = "the-quick-brown-fox-jumps-over-the-lazy-dog";
-	enum { NSUFFIX = 16, NKEYS = NSUFFIX };
-	struct ft_specv_node *nodes[NKEYS];
+	struct ft_specv_node **nodes;
 	uint8_t kbuf[64];
 	size_t plen;
 	unsigned int i;
@@ -10814,8 +10826,11 @@ static int test_specv_long_compressed_prefix(void)
 		skip(1, "speculative_validated unsupported on this build/host");
 		return 0;
 	}
+	nodes = (struct ft_specv_node **) calloc(nsuffix, sizeof(*nodes));
+	if (!nodes)
+		return specv_drain_and_destroy(ft, group) | -1;
 	plen = strlen(prefix);
-	for (i = 0; i < NKEYS; i++) {
+	for (i = 0; i < nsuffix; i++) {
 		size_t klen;
 
 		memcpy(kbuf, prefix, plen);
@@ -10825,22 +10840,22 @@ static int test_specv_long_compressed_prefix(void)
 		nodes[i] = specv_node_alloc(kbuf, klen);
 	}
 	rcu_read_lock();
-	for (i = 0; i < NKEYS; i++) {
+	for (i = 0; i < nsuffix; i++) {
 		s = cds_ft_insert(ft, nodes[i]->key, nodes[i]->key_len,
 			&nodes[i]->node);
 		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "specv_long_compressed_prefix: insert %u: %s\n",
-				i, cds_ft_status_to_string(s));
+			fprintf(stderr, "specv_long_compressed_prefix(nsuffix=%u): insert %u: %s\n",
+				nsuffix, i, cds_ft_status_to_string(s));
 			rcu_read_unlock();
 			goto out;
 		}
 	}
-	for (i = 0; i < NKEYS; i++) {
+	for (i = 0; i < nsuffix; i++) {
 		s = cds_ft_lookup_key(ft, nodes[i]->key, nodes[i]->key_len,
 			&found);
 		if (s != CDS_FT_STATUS_OK || found != &nodes[i]->node) {
-			fprintf(stderr, "specv_long_compressed_prefix: lookup %u status %s found %p\n",
-				i, cds_ft_status_to_string(s),
+			fprintf(stderr, "specv_long_compressed_prefix(nsuffix=%u): lookup %u status %s found %p\n",
+				nsuffix, i, cds_ft_status_to_string(s),
 				(void *) found);
 			rcu_read_unlock();
 			goto out;
@@ -10849,7 +10864,18 @@ static int test_specv_long_compressed_prefix(void)
 	rcu_read_unlock();
 	ret = 0;
 out:
+	free(nodes);
 	return specv_drain_and_destroy(ft, group) | ret;
+}
+
+static int test_specv_long_compressed_prefix(void)
+{
+	int ret = 0;
+	unsigned int n;
+
+	for (n = 2; n <= 16; n *= 2)
+		ret |= test_specv_long_compressed_prefix_n(n);
+	return ret;
 }
 
 /*

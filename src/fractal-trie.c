@@ -7355,13 +7355,22 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				}
 #endif
 				/*
-				 * Resolved kind (QP_HI / PIGEON / COMPRESSED) is
-				 * dispatched by the next iter's loop-top fast
-				 * paths.  SKIP_EXT (any cand mode) was already
-				 * absorbed by the fast path above; this code
-				 * path only sees SKIP_QP / SKIP_PIGEON, whose
-				 * resolved targets are internal nodes.
+				 * Resolved kind (QP_HI / PIGEON / POPCOUNT_32 /
+				 * POPCOUNT_64 / COMPRESSED) is dispatched by the
+				 * next iter's loop-top fast paths.  Without
+				 * `continue` here, the in-iter PIGEON / POPCOUNT
+				 * fast paths below would steal an extra byte step
+				 * that the off-by-one in `i += skip - 1` accounts
+				 * for in the natural for-loop i++; FT_BYTE_STEP_-
+				 * POST would then mistake a key-terminating
+				 * external for mid-descent EXT and bail.  SKIP_EXT
+				 * (any cand mode) was already absorbed by the
+				 * fast path above with `break`; this code path
+				 * only sees SKIP_QP / SKIP_PIGEON / SKIP_POPCOUNT_-
+				 * 32 / SKIP_POPCOUNT_64, whose resolved targets
+				 * are internal nodes.
 				 */
+				continue;
 			}
 		}
 		/*
@@ -16959,13 +16968,22 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 		for (type = 0; type < FT_NUM_INTERNAL_TYPES; type++) {
 			const struct cds_ft_node_stats *node_stats = &stats->level[level].node_stats[type];
 			uint64_t nr_nodes = node_stats->count;
+			const char *name;
 
+			switch (type) {
+			case FT_POPCOUNT_32_INDEX:	name = "POPCOUNT_32"; break;
+			case FT_POPCOUNT_64_INDEX:	name = "POPCOUNT_64"; break;
+			case FT_QP_INDEX:		name = "QP"; break;
+			case FT_PIGEON_INDEX:		name = "PIGEON"; break;
+			default:			name = "UNKNOWN"; break;
+			}
 			if (nr_nodes) {
 				unsigned int i;
 				bool first = true;
 
 				print_indent(out, 2);
-				fprintf(out, "Internal node type %lu: %" PRIu64 " (", type, nr_nodes);
+				fprintf(out, "Internal node type %lu (%s): %" PRIu64
+					" (", type, name, nr_nodes);
 				for (i = 0; i <= 256; i++) {
 					if (node_stats->distribution[i]) {
 						fprintf(out, "%s%u: %" PRIu64,
