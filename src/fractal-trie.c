@@ -5785,6 +5785,37 @@ int ft_node_recompact(enum ft_recompact mode,
 				 && new_type->type_class == FT_POPCOUNT)
 				? metadata->popcount_is_skip
 				: 0;
+			/*
+			 * Copy the cached subkey (slot 0) when both old and
+			 * new are FT_POPCOUNT in skip mode.  The COPY phase
+			 * below walks children only; slot 0 in skip-mode
+			 * holds ft_pc32_skip_meta (skip_len + subkey), not
+			 * a child ptr, so it would otherwise be left zeroed
+			 * on the new node.  Subsequent SKIP_POPCOUNT_*
+			 * lookups would see zero subkey and reject inline.
+			 *
+			 * pc32 and pc64 share struct ft_pc32_skip_meta as
+			 * the slot-0 form; the byte offset of slot 0 differs
+			 * (8 vs 16) so the source/dest pointer is computed
+			 * per type.
+			 */
+			if (new_metadata->popcount_is_skip
+			    && old_type->type_class == FT_POPCOUNT) {
+				const struct ft_pc32_skip_meta *old_meta;
+				struct ft_pc32_skip_meta *new_meta;
+
+				if (old_type->order == FT_PC64_ALLOC_ORDER) {
+					old_meta = &((const struct ft_pc64_node *) old_node)->u.skip.meta;
+				} else {
+					old_meta = &((const struct ft_pc32_node *) old_node)->u.skip.meta;
+				}
+				if (new_type->order == FT_PC64_ALLOC_ORDER) {
+					new_meta = &((struct ft_pc64_node *) new_node)->u.skip.meta;
+				} else {
+					new_meta = &((struct ft_pc32_node *) new_node)->u.skip.meta;
+				}
+				*new_meta = *old_meta;
+			}
 #endif
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
 			ft_metadata_set_external_nodes(new_node_flag,
@@ -7261,25 +7292,35 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						 * subkey lives in slot 0 of the
 						 * target node, written by
 						 * ft_publish_compressed when the
-						 * cn was published.  Same shape as
-						 * the SKIP_QP arm — validate
-						 * inline against the cached bytes.
-						 * The slot-0 read is on the same CL
-						 * as the bitmap descent will load
-						 * for the next iter, so the cache
-						 * line is hot regardless.
+						 * cn was published — but only when
+						 * pc_meta->nr_child <=
+						 * FT_PC32_MAX_LC_SKIP at publish
+						 * time (otherwise slot 0 holds a
+						 * live ptr).  The popcount_is_skip
+						 * metadata bit signals subkey
+						 * validity; without it, slot 0 is
+						 * a live ptr and the inline compare
+						 * would read garbage.  Fall back to
+						 * needs_leaf_validate when not
+						 * skip-variant.
 						 */
 						const struct ft_pc32_node *pc =
 							(const struct ft_pc32_node *)
 							/* SUB: tag known to be FT_KIND_SKIP_POPCOUNT_32. */
 							((unsigned long) node_flag - FT_KIND_SKIP_POPCOUNT_32);
 
-						if (caa_unlikely(ft_key_cmp_ordinals(
-								key, pc->u.skip.meta.subkey,
-								skip, skip,
-								false, NULL) != 0)) {
-							status = CDS_FT_STATUS_NOT_FOUND;
-							goto end;
+						if (cds_ft_item_to_metadata((void *) pc)->popcount_is_skip) {
+							if (caa_unlikely(ft_key_cmp_ordinals(
+									key, pc->u.skip.meta.subkey,
+									skip, skip,
+									false, NULL) != 0)) {
+								status = CDS_FT_STATUS_NOT_FOUND;
+								goto end;
+							}
+						} else {
+							if (first_skip_offset == key_len)
+								first_skip_offset = i;
+							needs_leaf_validate = true;
 						}
 					} else if (skip_kind == FT_KIND_SKIP_POPCOUNT_64 &&
 					    skip <= FT_PC32_SUBKEY_INLINE_LEN) {
@@ -7288,27 +7329,27 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						 * cached-subkey layout as
 						 * POPCOUNT_32 (both reuse struct
 						 * ft_pc32_skip_meta in slot 0).
-						 * The slot-0 cache line is on the
-						 * second CL of the 64 B node — not
-						 * the same CL as the bitmap header
-						 * for direct-class POPCOUNT_64
-						 * descents, but the next-iter
-						 * bitmap descent will fetch the
-						 * header CL anyway, and the slot-0
-						 * CL is what the actual descent
-						 * will need for ptrs.
+						 * Same popcount_is_skip gate —
+						 * publish only writes slot 0 when
+						 * nr_child <= FT_PC64_MAX_LC_SKIP.
 						 */
 						const struct ft_pc64_node *pc =
 							(const struct ft_pc64_node *)
 							/* SUB: tag known to be FT_KIND_SKIP_POPCOUNT_64. */
 							((unsigned long) node_flag - FT_KIND_SKIP_POPCOUNT_64);
 
-						if (caa_unlikely(ft_key_cmp_ordinals(
-								key, pc->u.skip.meta.subkey,
-								skip, skip,
-								false, NULL) != 0)) {
-							status = CDS_FT_STATUS_NOT_FOUND;
-							goto end;
+						if (cds_ft_item_to_metadata((void *) pc)->popcount_is_skip) {
+							if (caa_unlikely(ft_key_cmp_ordinals(
+									key, pc->u.skip.meta.subkey,
+									skip, skip,
+									false, NULL) != 0)) {
+								status = CDS_FT_STATUS_NOT_FOUND;
+								goto end;
+							}
+						} else {
+							if (first_skip_offset == key_len)
+								first_skip_offset = i;
+							needs_leaf_validate = true;
 						}
 					} else {
 						if (first_skip_offset == key_len)
