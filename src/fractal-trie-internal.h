@@ -228,6 +228,15 @@ enum ft_kind {
  * FT_PIGEON_INDEX = 2.  POPCOUNT_64 lands in sub-stage C and will
  * be inserted at index 1 (between POPCOUNT_32 and QP), shifting
  * QP / PIGEON up by one.
+ *
+ * Each ft_types[] entry carries TWO sets of (min_child, max_child)
+ * bounds — one for the direct variant, one for the skip-target
+ * variant — so a single type entry covers both modes.  The lattice
+ * walk picks the correct bounds via metadata::popcount_is_skip.  For
+ * types with no per-variant capacity difference (FT_QP, FT_PIGEON),
+ * the two pairs are identical.  FT_POPCOUNT reduces max_child by
+ * one in skip mode (slot 0 holds ft_pc32_skip_meta instead of a
+ * pointer).
  */
 #define FT_POPCOUNT_32_INDEX	0U
 #define FT_QP_INDEX		1U
@@ -447,6 +456,14 @@ struct cds_ft_metadata {
 	 *                         used in the parent-walk to recover the
 	 *                         HI/LO distinction now that FT_KIND_QP_LO
 	 *                         no longer occupies a slot-tag value)
+	 * popcount_is_skip:       1 bit  (set on POPCOUNT_32 nodes that
+	 *                         are skip-target variants — slot 0
+	 *                         holds ft_pc32_skip_meta instead of a
+	 *                         pointer; max_lc effective = 2.
+	 *                         Driven by ft_publish_compressed when a
+	 *                         POPCOUNT_32 becomes a cn->child.
+	 *                         Ifdef-gated; meaningless when SKIP-
+	 *                         compressed is disabled.)
 	 */
 	uint32_t nr_child:9;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -455,6 +472,9 @@ struct cds_ft_metadata {
 	uint32_t fallback_removal_count:FT_FALLBACK_REMOVAL_BITS;
 	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
 	uint32_t is_lo:1;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	uint32_t popcount_is_skip:1;
+#endif
 	/*
 	 * Trailing-pad byte at offset 28.  Mutually-exclusive uses —
 	 * a metadata is one of QP-hi / PIGEON / POPCOUNT_32 at a time:
@@ -594,7 +614,7 @@ struct cds_ft_qp16_node {
  *                             the high nibble in root_bm)
  *   bytes 8-15  : slot 0     (DIRECT: ptr for popcount-idx 2.
  *                             SKIP:   skip_meta = skip_len byte +
- *                                     subkey[5] + 2 pad bytes)
+ *                                     subkey[7], no padding)
  *   bytes 16-23 : slot 1     (ptr for popcount-idx 1)
  *   bytes 24-31 : slot 2     (ptr for popcount-idx 0)
  *
@@ -608,21 +628,47 @@ struct cds_ft_qp16_node {
  * by one.  The same lookup formula serves both variants — only the
  * caller-side max_lc differs.
  */
-#define FT_PC32_HEADER_SIZE	8U
-#define FT_PC32_ALLOC_ORDER	5U	/* 32 B */
-#define FT_PC32_MAX_LC_DIRECT	3U
-#define FT_PC32_MAX_LC_SKIP	2U
+#define FT_PC32_HEADER_SIZE		8U
+#define FT_PC32_ALLOC_ORDER		5U	/* 32 B */
+#define FT_PC32_MAX_LC_DIRECT		3U
+#define FT_PC32_MAX_LC_SKIP		2U
+/*
+ * Cached-subkey length for the SKIP variant.  Slot 0 is 8 bytes
+ * (one pointer-sized slot in the direct layout); use 1 byte for
+ * skip_len and 7 bytes for the inline subkey — no padding.  Two
+ * bytes more inline reach than SKIP_QP (FT_QP16_SUBKEY_INLINE_LEN
+ * == 5) since QP's header byte budget is tighter.
+ */
+#define FT_PC32_SUBKEY_INLINE_LEN	7U
 
 struct ft_pc32_skip_meta {
 	uint8_t skip_len;
-	uint8_t subkey[5];
-	uint8_t pad[2];
+	uint8_t subkey[FT_PC32_SUBKEY_INLINE_LEN];
 } __attribute__((__aligned__(8)));
 
+/*
+ * Layout of bytes 8-31 (24 bytes) depends on direct vs skip variant:
+ *   - direct: three 8-byte pointer slots, indexed by ptr_offset 0/1/2.
+ *   - skip:   ft_pc32_skip_meta at byte offset 8 (slot 0), followed
+ *             by two 8-byte pointer slots at offsets 16 and 24
+ *             (ptr_offset 1 and 2 in the direct numbering).
+ *
+ * Both arms span the same 24-byte storage; the union expresses the
+ * two interpretations.  Helpers that index by ptr_offset use byte
+ * arithmetic (ft_pc32_node_slot) and work uniformly across modes —
+ * the union is for documentation / aliasing-safe access on read
+ * paths that want a typed view of the skip metadata.
+ */
 struct ft_pc32_node {
 	uint16_t root_bm;	/* bytes 0-1 */
 	uint16_t sub_bm[3];	/* bytes 2-7 */
-	/* bytes 8-31: 3 x 8-byte slots; layout-dependent (see comment above). */
+	union {
+		struct cds_ft_inode_flag *direct[3];	/* direct mode */
+		struct {
+			struct ft_pc32_skip_meta meta;	/* slot 0 */
+			struct cds_ft_inode_flag *slots[2]; /* slots 1, 2 */
+		} skip;
+	} u;
 } __attribute__((__aligned__(8)));
 
 struct cds_ft_bitmap {

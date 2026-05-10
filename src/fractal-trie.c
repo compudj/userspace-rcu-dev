@@ -152,8 +152,26 @@ enum cds_ft_type_class {
 
 struct cds_ft_type {
 	enum cds_ft_type_class type_class;
-	uint16_t min_child;		/* minimum number of children: 1 to 256 */
-	uint16_t max_child;		/* maximum number of children: 1 to 256 */
+	uint16_t min_child;		/*
+					 * Minimum / maximum number of children
+					 * for the DIRECT variant (1..256).
+					 * Used by find_nearest_type_index for
+					 * nodes that are NOT skip targets.
+					 */
+	uint16_t max_child;
+	uint16_t min_child_skip;	/*
+					 * Same, for the SKIP-target variant.
+					 * For types where skip mode reserves
+					 * inline space (FT_POPCOUNT — slot 0
+					 * holds ft_pc32_skip_meta), max_child_-
+					 * skip is one less than max_child.  For
+					 * types with no per-variant capacity
+					 * difference (FT_QP, FT_PIGEON), these
+					 * mirror the direct bounds so the
+					 * lattice walk lands on the same type
+					 * entries regardless of mode.
+					 */
+	uint16_t max_child_skip;
 	uint16_t order;			/* node size is (1 << order), in bytes */
 	bool bitmap;			/* allocate bitmap */
 };
@@ -223,8 +241,9 @@ enum {
  *            never dereferenced.
  */
 const struct cds_ft_type ft_types[] = {
-	[FT_POPCOUNT_32_INDEX] = { .type_class = FT_POPCOUNT, .min_child = 1,
-		.max_child = FT_PC32_MAX_LC_DIRECT,
+	[FT_POPCOUNT_32_INDEX] = { .type_class = FT_POPCOUNT,
+		.min_child = 1, .max_child = FT_PC32_MAX_LC_DIRECT,
+		.min_child_skip = 1, .max_child_skip = FT_PC32_MAX_LC_SKIP,
 		.order = FT_PC32_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
 	/*
 	 * FT_QP entry: max_child uses the byte-count ceiling at QP T3
@@ -237,16 +256,29 @@ const struct cds_ft_type ft_types[] = {
 	 * see the FT_QP special-cases in ft_node_recompact's ADD_NEXT /
 	 * ADD_SAME / DEL switches, which use ft_qp16_tiers[] / popcount
 	 * directly.
+	 *
+	 * QP has no per-variant capacity difference: the SKIP_QP wrapper
+	 * stores skip_len + subkey in spare bytes of the QP header, not
+	 * by reserving a pointer slot.  Skip bounds therefore mirror the
+	 * direct bounds.
 	 */
-	[FT_QP_INDEX] = { .type_class = FT_QP, .min_child = 2,
-		.max_child = FT_QP16_T3_CAPACITY * 16,
+	[FT_QP_INDEX] = { .type_class = FT_QP,
+		.min_child = 2, .max_child = FT_QP16_T3_CAPACITY * 16,
+		.min_child_skip = 2, .max_child_skip = FT_QP16_T3_CAPACITY * 16,
 		.order = FT_QP16_T0_ALLOC_ORDER, .bitmap = FT_NO_BITMAP },
-	[FT_PIGEON_INDEX] = { .type_class = FT_PIGEON, .min_child = 24,
-		.max_child = ft_type_pigeon_max_child,
+	/*
+	 * PIGEON has no per-variant capacity difference either: skip
+	 * length lives in metadata::pigeon_skip_len, no slot reserved.
+	 */
+	[FT_PIGEON_INDEX] = { .type_class = FT_PIGEON,
+		.min_child = 24, .max_child = ft_type_pigeon_max_child,
+		.min_child_skip = 24, .max_child_skip = ft_type_pigeon_max_child,
 		.order = FT_PIGEON_ORDER, .bitmap = FT_BITMAP },
 	/* NULL sentinel at NODE_INDEX_NULL (= FT_NUM_INTERNAL_TYPES). */
-	[NODE_INDEX_NULL] = { .type_class = FT_NULL, .min_child = 0,
-		.max_child = ft_type_null_max_child, .bitmap = FT_NO_BITMAP },
+	[NODE_INDEX_NULL] = { .type_class = FT_NULL,
+		.min_child = 0, .max_child = ft_type_null_max_child,
+		.min_child_skip = 0, .max_child_skip = ft_type_null_max_child,
+		.bitmap = FT_NO_BITMAP },
 };
 
 /*
@@ -2234,6 +2266,42 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 	if (ft_node_external_direct(cn->child) &&
 	    !ft->group->speculative_validated)
 		return cflag;
+	/*
+	 * POPCOUNT_32 skip-variant transition: when cn->child is a
+	 * POPCOUNT_32 with nr_child ≤ FT_PC32_MAX_LC_SKIP, repurpose
+	 * slot 0 to hold ft_pc32_skip_meta (skip_len + cached subkey)
+	 * so speculative-validate descent can validate the skipped path
+	 * inline against the cached subkey, no parent walk to cn
+	 * required.  Set popcount_is_skip on the child's metadata so
+	 * subsequent set_nth uses the reduced max_lc.  Slot 0 (ptr-
+	 * offset 0 = popcount-rank 2) is guaranteed unused at this
+	 * point because nr_child ≤ 2 — write is non-destructive.
+	 *
+	 * For nr_child > 2, the slot-0 reservation would overwrite a
+	 * live pointer; fall back to the SKIP_POPCOUNT_32 wrapper
+	 * without slot-0 caching (skip_len still in popcount_skip_len
+	 * metadata, validation defers to leaf-bytes).
+	 */
+	if (((unsigned long) cn->child & 0x1FUL) == FT_KIND_POPCOUNT_32) {
+		struct ft_pc32_node *pc = (struct ft_pc32_node *)
+			((unsigned long) cn->child & ~31UL);
+		struct cds_ft_metadata *pc_meta =
+			cds_ft_item_to_metadata(pc);
+
+		if (pc_meta->nr_child <= FT_PC32_MAX_LC_SKIP &&
+		    !pc_meta->popcount_is_skip) {
+			struct ft_pc32_skip_meta *meta = &pc->u.skip.meta;
+			size_t copy_len = cn->len < sizeof(meta->subkey)
+				? cn->len
+				: sizeof(meta->subkey);
+
+			memset(meta, 0, sizeof(*meta));
+			meta->skip_len = (uint8_t) cn->len;
+			if (copy_len)
+				memcpy(meta->subkey, cn->key_bytes, copy_len);
+			pc_meta->popcount_is_skip = 1;
+		}
+	}
 	return ft_skip_compressed_flag(cn->child, cn);
 #else
 	return cflag;
@@ -3068,6 +3136,23 @@ struct cds_ft_inode_flag **ft_pc32_node_slot(struct ft_pc32_node *node,
 		((uint8_t *) node + FT_PC32_HEADER_SIZE
 		 + ptr_offset * sizeof(struct cds_ft_inode_flag *));
 }
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+/*
+ * Skip-variant slot 0 access: ft_pc32_skip_meta lives at byte offset
+ * FT_PC32_HEADER_SIZE (= 8) from the node base, sharing storage with
+ * the direct variant's popcount-rank-2 pointer slot.  The union arm
+ * makes the aliasing intent explicit; the byte arithmetic in
+ * ft_pc32_node_slot still works for ptr_offset 0 readers because the
+ * skip-mode bitmap excludes popcount-rank 2 (max_lc enforced at
+ * write time).
+ */
+static inline_lookup
+struct ft_pc32_skip_meta *ft_pc32_node_skip_meta(struct ft_pc32_node *node)
+{
+	return &node->u.skip.meta;
+}
+#endif
 
 /*
  * 2-level nibble popcount lookup, max_lc_direct = 3.
@@ -4902,19 +4987,31 @@ int _ft_node_set_nth(struct cds_ft *ft,
 		ret = ft_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
 		break;
 	case FT_POPCOUNT:
+	{
 		/*
-		 * Direct (non-skip) variant in B2; SKIP variant lands in
-		 * a follow-up sub-stage.  Returns -ERANGE on non-safe-
-		 * append insert, routing through recompact ADD_SAME for
-		 * an off-tree rebuild.  Returns -ENOSPC when popcount
-		 * overflows max_lc, routing through recompact ADD_NEXT
-		 * to escalate to QP.
+		 * Pick max_lc from the metadata mode bit: skip-target
+		 * variant reserves slot 0 for ft_pc32_skip_meta, so
+		 * max_lc drops to FT_PC32_MAX_LC_SKIP (= 2).  Direct
+		 * variant uses FT_PC32_MAX_LC_DIRECT (= 3).
+		 *
+		 * Returns -ERANGE on non-safe-append insert, routing
+		 * through recompact ADD_SAME for an off-tree rebuild.
+		 * Returns -ENOSPC when popcount overflows max_lc, routing
+		 * through recompact ADD_NEXT to escalate to QP — which
+		 * inherits the skip-target context (popcount_is_skip
+		 * propagates to the new node, even though QP's bounds
+		 * don't change between modes).
 		 */
+		unsigned int max_lc = FT_PC32_MAX_LC_DIRECT;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (metadata->popcount_is_skip)
+			max_lc = FT_PC32_MAX_LC_SKIP;
+#endif
 		ret = ft_pc32_node_set_nth_safe(
 				(struct ft_pc32_node *) node, metadata,
-				n, child_node_flag,
-				FT_PC32_MAX_LC_DIRECT);
+				n, child_node_flag, max_lc);
 		break;
+	}
 	case FT_QP:
 		/*
 		 * hi_capacity is the structural hi-bucket count
@@ -5025,7 +5122,7 @@ int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
 
 static
 unsigned int find_nearest_type_index(unsigned int type_index,
-		unsigned int nr_nodes, bool is_root)
+		unsigned int nr_nodes, bool is_root, bool is_skip)
 {
 	const struct cds_ft_type *type;
 
@@ -5037,11 +5134,23 @@ unsigned int find_nearest_type_index(unsigned int type_index,
 		 */
 		return is_root ? 0 : NODE_INDEX_NULL;
 	}
+	/*
+	 * Each type entry carries direct- and skip-mode bounds.  When the
+	 * node is a skip target (e.g., POPCOUNT_32 with slot 0 reserved
+	 * for ft_pc32_skip_meta), use the skip pair, which has reduced
+	 * max_child for types that lose a slot to inline metadata.  For
+	 * types with identical bounds across modes (QP, PIGEON), this is
+	 * equivalent to the direct walk.
+	 */
 	for (;;) {
+		unsigned int min, max;
+
 		type = &ft_types[type_index];
-		if (nr_nodes < type->min_child)
+		min = is_skip ? type->min_child_skip : type->min_child;
+		max = is_skip ? type->max_child_skip : type->max_child;
+		if (nr_nodes < min)
 			type_index--;
-		else if (nr_nodes > type->max_child)
+		else if (nr_nodes > max)
 			type_index++;
 		else
 			break;
@@ -5071,6 +5180,19 @@ int ft_node_recompact(enum ft_recompact mode,
 	struct cds_ft_metadata *new_metadata;
 	const struct cds_ft_type *new_type;
 	struct cds_ft_inode_flag *new_node_flag = NULL;
+	/*
+	 * Inherit popcount_is_skip from the old metadata: if the old
+	 * node was a skip-target POPCOUNT_32 with slot 0 reserved for
+	 * cached subkey, the recompacted node is in the same skip-target
+	 * context and uses the same reduced max_child for its lattice
+	 * walk and copy-loop max_lc.  Cleared for non-POPCOUNT classes
+	 * (the bit is meaningless there) and for fresh allocations.
+	 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	bool is_skip = metadata && metadata->popcount_is_skip;
+#else
+	bool is_skip = false;
+#endif
 	/*
 	 * Effective allocation order for the new node.  For non-QP
 	 * classes equals new_type->order; for QP, the QP-internal
@@ -5122,7 +5244,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			break;
 		}
 		new_type_index = find_nearest_type_index(old_type_index,
-			metadata->nr_child + 1, false);
+			metadata->nr_child + 1, false, is_skip);
 		dbg_printf("Recompact for node with %u children\n",
 			metadata->nr_child + 1);
 		break;
@@ -5165,7 +5287,7 @@ int ft_node_recompact(enum ft_recompact mode,
 				break;
 			}
 			new_type_index = find_nearest_type_index(old_type_index,
-				metadata->nr_child + 1, false);
+				metadata->nr_child + 1, false, is_skip);
 			/*
 			 * POPCOUNT_X -> QP escalation: pick a QP tier whose
 			 * structural hi-bucket capacity admits the worst-case
@@ -5206,7 +5328,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			break;
 		}
 		new_type_index = find_nearest_type_index(old_type_index,
-			metadata->nr_child - 1, is_root);
+			metadata->nr_child - 1, is_root, is_skip);
 		/*
 		 * PIGEON -> QP demotion: lattice walk lands at FT_QP_INDEX
 		 * but ft_types[FT_QP_INDEX].order is the T0 default (3 hi-
@@ -5259,6 +5381,20 @@ int ft_node_recompact(enum ft_recompact mode,
 			new_metadata->parent = metadata->parent;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			new_metadata->skip_slot_offset = metadata->skip_slot_offset;
+			/*
+			 * Inherit skip-target marker.  Only meaningful for
+			 * FT_POPCOUNT new types; on FT_QP / FT_PIGEON the bit
+			 * is harmless (they read pigeon_skip_len /
+			 * qp->skip_len, not popcount_is_skip).  Cleared if the
+			 * recompact is changing type_class to something that
+			 * doesn't honor the bit, since it would be stale on the
+			 * new type.
+			 */
+			new_metadata->popcount_is_skip =
+				(new_type_index != NODE_INDEX_NULL
+				 && new_type->type_class == FT_POPCOUNT)
+				? metadata->popcount_is_skip
+				: 0;
 #endif
 			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
 			ft_metadata_set_external_nodes(new_node_flag,
@@ -6448,14 +6584,15 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
 			 * Candidate E: SKIP_EXT is 16-byte aligned (bit 4
-			 * may leak through `& 0x1F`).  Use `& 0x07` to
-			 * distinguish among SKIP_EXT (0x02), SKIP_PIGEON
-			 * (0x03), SKIP_QP (0x07).  Future SKIP_POPCOUNT_*
-			 * (0x0B / 0x13) need bits 3-4 and a wider mask
-			 * here once they land — Stage 3 will revisit.
+			 * may leak through `& 0x1F`).  Use `& 0x0F` to
+			 * distinguish SKIP_EXT (0x02), SKIP_PIGEON (0x03),
+			 * SKIP_QP (0x07), and SKIP_POPCOUNT_32 (0x0B) —
+			 * bit 4 is masked off.  SKIP_POPCOUNT_64 (0x13)
+			 * would alias SKIP_PIGEON under 4-bit mask and
+			 * needs a wider test once it lands.
 			 */
 			unsigned long skip_kind =
-				(unsigned long) node_flag & 0x07UL;
+				(unsigned long) node_flag & 0x0FUL;
 #endif
 			if (!descend_cand) {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -6664,6 +6801,33 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 						if (caa_unlikely(ft_key_cmp_ordinals(
 								key, qp->subkey,
+								skip, skip,
+								false, NULL) != 0)) {
+							status = CDS_FT_STATUS_NOT_FOUND;
+							goto end;
+						}
+					} else if (skip_kind == FT_KIND_SKIP_POPCOUNT_32 &&
+					    skip <= FT_PC32_SUBKEY_INLINE_LEN) {
+						/*
+						 * POPCOUNT_32 skip variant: cached
+						 * subkey lives in slot 0 of the
+						 * target node, written by
+						 * ft_publish_compressed when the
+						 * cn was published.  Same shape as
+						 * the SKIP_QP arm — validate
+						 * inline against the cached bytes.
+						 * The slot-0 read is on the same CL
+						 * as the bitmap descent will load
+						 * for the next iter, so the cache
+						 * line is hot regardless.
+						 */
+						const struct ft_pc32_node *pc =
+							(const struct ft_pc32_node *)
+							/* SUB: tag known to be FT_KIND_SKIP_POPCOUNT_32. */
+							((unsigned long) node_flag - FT_KIND_SKIP_POPCOUNT_32);
+
+						if (caa_unlikely(ft_key_cmp_ordinals(
+								key, pc->u.skip.meta.subkey,
 								skip, skip,
 								false, NULL) != 0)) {
 							status = CDS_FT_STATUS_NOT_FOUND;
