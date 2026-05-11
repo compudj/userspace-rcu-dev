@@ -1481,6 +1481,25 @@ bool ft_node_internal(struct cds_ft_inode_flag *node)
 }
 
 /*
+ * Predicate: does this tagged pointer point to a QP-class node,
+ * either direct (FT_KIND_QP = 0x05) or skip-variant (FT_KIND_SKIP_QP
+ * = 0x07)?  Used by up-walk / parent-tag dispatch sites that need to
+ * accept both variants — the QP layout differs only in ptrs[] offset
+ * (8 vs 16) and cached subkey reach, never in the underlying class.
+ *
+ * Mask is (FT_KIND_MASK & ~FT_KIND_SKIP_BIT) = 0x1F & ~0x02 = 0x1D:
+ * clears the skip-bit before comparing the residual to FT_KIND_QP.
+ * Predict-friendly: single AND + compare; no internal data-dependent
+ * branch.  Equivalent expression for readability is to AND with the
+ * mask explicitly: (tag & 0x1DUL) == FT_KIND_QP.
+ */
+static inline
+bool ft_kind_is_qp_variant(unsigned long tag)
+{
+	return (tag & (FT_KIND_MASK & ~FT_KIND_SKIP_BIT)) == FT_KIND_QP;
+}
+
+/*
  * Recover the ft_types[] class index for an internal node flag.
  * Returns NODE_INDEX_NULL for a NULL pointer.  Asserts on COMPRESSED
  * (compressed nodes have no type-table slot) and on any non-internal
@@ -1503,7 +1522,17 @@ unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
 	assert(!ft_node_compressed_in_node(node));
 
 	tag = (unsigned long) node & FT_KIND_MASK_INTERNAL;
-	if (tag == FT_KIND_QP)
+	/*
+	 * Accept FT_KIND_SKIP_QP alongside FT_KIND_QP: the type index
+	 * identifies the QP class, not the direct/skip layout (the
+	 * layout is recovered separately from the slot tag at the call
+	 * site).  Without this, a parent walk that lands on a
+	 * SKIP_QP-tagged inode_flag would trip the trailing assert.
+	 * SKIP_POPCOUNT_* / SKIP_PIGEON do not need the same treatment:
+	 * the POPCOUNT skip variant uses a metadata bit
+	 * (popcount_is_skip), and PIGEON has no skip-variant layout.
+	 */
+	if (ft_kind_is_qp_variant(tag))
 		return FT_QP_INDEX;
 	if (tag == FT_KIND_PIGEON)
 		return FT_PIGEON_INDEX;
@@ -2197,8 +2226,16 @@ void ft_publish_to_parent(struct cds_ft *ft,
 			{
 				struct cds_ft_inode_flag *eff_parent_nf = parent_nf;
 
-				if (((unsigned long) parent_nf & FT_KIND_MASK)
-						== FT_KIND_QP) {
+				/*
+				 * Match both FT_KIND_QP (direct) and
+				 * FT_KIND_SKIP_QP (skip variant): the
+				 * HI/LO rebase is about disambiguating
+				 * the slot's containing allocation, not
+				 * about the variant.  Rebasing to LO
+				 * always yields an FT_KIND_QP-tagged
+				 * flag since LO is never skip-variant.
+				 */
+				if (ft_kind_is_qp_variant((unsigned long) parent_nf)) {
 					void *p_addr = ft_node_ptr(parent_nf);
 					size_t lo_order =
 						cds_ft_item_order(parent_slot);
@@ -2474,8 +2511,14 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 	 * since the QP_LO retirement); the parent walk recovers HI vs LO
 	 * via the lo-node's metadata is_lo bit.
 	 */
+	/*
+	 * Match both FT_KIND_QP (direct) and FT_KIND_SKIP_QP (skip
+	 * variant).  The rebase to LO produces an FT_KIND_QP-tagged
+	 * flag — LO is never skip-variant.  Callers store the resulting
+	 * tag verbatim into meta->parent.
+	 */
 	if (slot && parent_nf
-	    && ((unsigned long) parent_nf & FT_KIND_MASK) == FT_KIND_QP) {
+	    && ft_kind_is_qp_variant((unsigned long) parent_nf)) {
 		void *p_addr = ft_node_ptr(parent_nf);
 		size_t lo_order = cds_ft_item_order(slot);
 		void *lo_base = (void *) ((unsigned long) slot
@@ -5251,6 +5294,14 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 	{
 		struct cds_ft_qp16_node *hi = (struct cds_ft_qp16_node *) node;
 		uint16_t hi_bm = uatomic_load(&hi->bitmap, CMM_RELAXED);
+		/*
+		 * Extract is_skip from the parent slot tag bit-1: a SKIP_QP
+		 * (0x07) parent points at a skip-variant HI whose ptrs[]
+		 * starts at byte 16; direct FT_KIND_QP (0x05) parents have
+		 * ptrs at byte 8.  Folded by ft_qp16_ptrs at the load site.
+		 */
+		bool is_skip = ((unsigned long) parent_nf & FT_KIND_SKIP_BIT)
+				!= 0;
 		unsigned int hi_iter;
 
 		/*
@@ -5271,7 +5322,8 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 				continue;
 			hi_idx = (unsigned int) __builtin_popcount(
 					(unsigned int) (hi_bm & (hi_bit - 1U)));
-			lo_flag = ft_dereference_acquire(hi->ptrs[hi_idx]);
+			lo_flag = ft_dereference_acquire(
+					ft_qp16_ptrs(hi, is_skip)[hi_idx]);
 			if (!lo_flag)
 				continue;
 			lo = (struct cds_ft_qp16_node *) lo_flag;
@@ -5378,10 +5430,19 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 		child = ft_pigeon_node_get_direction(type, node, n, result_key, dir);
 		break;
 	case FT_QP:
+	{
+		/*
+		 * Recover is_skip from the slot tag bit 1: skip-variant
+		 * QP nodes (FT_KIND_SKIP_QP, 0x07) have ptrs[] at byte 16.
+		 */
+		bool is_skip = ((unsigned long) node_flag & FT_KIND_SKIP_BIT)
+				!= 0;
+
 		child = ft_qp_byte_get_direction(
 				(struct cds_ft_qp16_node *) node,
-				n, result_key, dir, false);
+				n, result_key, dir, is_skip);
 		break;
+	}
 	case FT_POPCOUNT:
 		if (type_index == FT_POPCOUNT_64_INDEX)
 			child = ft_pc64_node_get_direction(
@@ -5526,6 +5587,7 @@ int _ft_node_set_nth(struct cds_ft *ft,
 		break;
 	}
 	case FT_QP:
+	{
 		/*
 		 * hi_capacity is the structural hi-bucket count
 		 * (popcount(hi_bm) cap), derived from the tier order:
@@ -5538,14 +5600,22 @@ int _ft_node_set_nth(struct cds_ft *ft,
 		 * recompact framework's nr_child accounting; passing it
 		 * as hi_capacity would let set_nth_safe overflow the
 		 * pointer array.
+		 *
+		 * is_skip is recovered from node_flag's tag bit 1:
+		 * SKIP_QP-tagged parents route writes through the
+		 * skip-variant ptrs+16 layout.
 		 */
+		bool is_skip = ((unsigned long) node_flag & FT_KIND_SKIP_BIT)
+				!= 0;
+
 		ret = ft_qp_byte_set(ft, node_flag,
 				(struct cds_ft_qp16_node *) node, metadata,
 				n, child_node_flag,
 				ft_qp16_capacity_from_order(
 					(unsigned int) cds_ft_item_order(node)),
-				false);
+				is_skip);
 		break;
+	}
 	case FT_NULL:
 		return -ENOSPC;
 	default:
@@ -5623,10 +5693,15 @@ int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
 					node_flag_ptr, n, newptr);
 		break;
 	case FT_QP:
+	{
+		bool is_skip = ((unsigned long) node_flag & FT_KIND_SKIP_BIT)
+				!= 0;
+
 		ret = ft_qp_byte_replace(ft,
 				(struct cds_ft_qp16_node *) node, metadata,
-				node_flag_ptr, n, newptr, false);
+				node_flag_ptr, n, newptr, is_skip);
 		break;
+	}
 	case FT_NULL:
 		return -ENOENT;
 	default:
