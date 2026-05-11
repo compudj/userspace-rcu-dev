@@ -7504,27 +7504,24 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		uint8_t iter_key;
 
 		/*
-		 * QP_HI fast path (1/5 in the flat dispatch sequence): the
-		 * dominant byte-step in spec_validate descent and a major
-		 * case in candidate / track / exact-lookup descent too.
-		 * Constant-tag SUB strips FT_KIND_QP with no dispatch;
-		 * ft_qp_byte_get inlines the bitmap+ptr load.
-		 *
-		 * Absorbs the per-iter post-step bookkeeping (iter-path,
-		 * mid-descent EXT detection, track prefix tracking) so all
-		 * modes share this path.  Skip-compressed children produced
-		 * by ft_qp_byte_get stay tagged here; the next iter's SKIP
-		 * handler resolves them (mode-aware).
+		 * POPCOUNT_32 fast path (1/7 — dns-tuned dispatch order).
+		 * 2L nibble bitmap byte step on a sparse internal node
+		 * (1-3 children).  Most common internal byte-step on
+		 * dns/paths workloads (45%+ of internal byte-steps).
+		 * Tag-specific test `(v & 0x1F) == FT_KIND_POPCOUNT_32`
+		 * (= 0x09) — POPCOUNT_32 has bit 0 + bit 3 set, distinct
+		 * from QP / PIGEON.  Skip variant (SKIP_POPCOUNT_32, 0x0B)
+		 * is filtered downstream by the SKIP handler (bit 1 set).
 		 */
-		if (caa_likely(((unsigned long) node_flag & FT_KIND_MASK)
-				== FT_KIND_QP)) {
-			struct cds_ft_qp16_node *qp =
-				(struct cds_ft_qp16_node *)
-				((unsigned long) node_flag - FT_KIND_QP);
+		if (caa_likely(((unsigned long) node_flag & 0x1FUL)
+				== FT_KIND_POPCOUNT_32)) {
+			struct ft_pc32_node *pc =
+				(struct ft_pc32_node *)
+				((unsigned long) node_flag - FT_KIND_POPCOUNT_32);
 
 			iter_key = *(key++);
-			node_flag = ft_qp_byte_get(qp, NULL, iter_key,
-					FT_PF_DATA, false);
+			node_flag = ft_pc32_node_get_nth_skip(pc, NULL,
+					iter_key, FT_PF_DATA);
 			if (caa_unlikely(!node_flag)) {
 				status = CDS_FT_STATUS_NOT_FOUND;
 				goto end;
@@ -7533,8 +7530,33 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			continue;
 		}
 		/*
-		 * SKIP handler (2/5 in the flat dispatch sequence): after
-		 * QP_HI miss, a skip-compressed pointer is the next most
+		 * POPCOUNT_64 fast path (2/7 — dns-tuned dispatch order).
+		 * scan_6 (5+3 byte split) flat-packed popcount byte step
+		 * on a medium-density internal node (4-6 children).
+		 * Second most common internal byte-step on dns (~42%).
+		 * Tag-specific test `(v & 0x1F) == FT_KIND_POPCOUNT_64`
+		 * (= 0x11) — bit 0 + bit 4 set, distinct from QP / PIGEON
+		 * / POPCOUNT_32.  Skip variant (SKIP_POPCOUNT_64, 0x13)
+		 * is filtered downstream by the SKIP handler (bit 1 set).
+		 */
+		if (((unsigned long) node_flag & 0x1FUL) == FT_KIND_POPCOUNT_64) {
+			struct ft_pc64_node *pc =
+				(struct ft_pc64_node *)
+				((unsigned long) node_flag - FT_KIND_POPCOUNT_64);
+
+			iter_key = *(key++);
+			node_flag = ft_pc64_node_get_nth_skip(pc, NULL,
+					iter_key, FT_PF_DATA);
+			if (caa_unlikely(!node_flag)) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			FT_BYTE_STEP_POST();
+			continue;
+		}
+		/*
+		 * SKIP handler (3/7 — dns-tuned dispatch order): after
+		 * POPCOUNT_* miss, a skip-compressed pointer is the next most
 		 * likely case (skip-tagged children produced by the
 		 * previous iter's QP_HI byte-step or by collapsed entries).
 		 * No caa_unlikely: at this point in the dispatch chain the
@@ -8156,23 +8178,57 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			}
 		}
 		/*
-		 * PIGEON fast path (3/5 in the flat dispatch sequence):
-		 * rare on sparse workloads but a major case on dense ones
-		 * (post-QP→PIGEON escalation).  After QP_HI / SKIP / EXT
-		 * filters, node_flag may be PIGEON (0x01), COMPRESSED
-		 * (0x04), or — when the previous iter's SKIP handler in
-		 * descend_cand mode resolved a SKIP_QP / SKIP_PIGEON —
-		 * an internal-aligned QP (0x05) or PIGEON (0x01) target
-		 * passed through.  A bit-0 test would conflate PIGEON
-		 * with QP under Candidate E (both have bit 0 = 1).  Use
-		 * the full 5-bit mask check for PIGEON exclusively;
-		 * resolved QP targets fall through this block and the
-		 * COMPRESSED handler, ending the iter so the next iter's
-		 * QP_HI fast path catches them.
+		 * QP fast path (4/7 — dns-tuned dispatch order).  After
+		 * POPCOUNT_* / SKIP miss, QP is the dominant remaining
+		 * internal kind.  On u32s QP is the majority (~69%) and the
+		 * inline fast path still wins because each previous test was
+		 * a single AND+CMP+predicted-not-taken.  Constant-tag SUB
+		 * strips FT_KIND_QP; ft_qp_byte_get inlines the bitmap+ptr
+		 * load.  Skip-compressed children produced by ft_qp_byte_get
+		 * stay tagged here; the next iter's SKIP handler resolves
+		 * them (mode-aware).
+		 */
+		if (((unsigned long) node_flag & FT_KIND_MASK)
+				== FT_KIND_QP) {
+			struct cds_ft_qp16_node *qp =
+				(struct cds_ft_qp16_node *)
+				((unsigned long) node_flag - FT_KIND_QP);
+
+			iter_key = *(key++);
+			node_flag = ft_qp_byte_get(qp, NULL, iter_key,
+					FT_PF_DATA, false);
+			if (caa_unlikely(!node_flag)) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			FT_BYTE_STEP_POST();
+			continue;
+		}
+		/*
+		 * EXT terminal (5/7 — dns-tuned dispatch order): an
+		 * external child at loop top means the key terminates at
+		 * a compressed path end (e.g. a compressed node's cn->child
+		 * is EXT, surfaced in node_flag by the COMPRESSED handler
+		 * below in a previous iter).  Break to the post-loop
+		 * terminal handler.
+		 *
+		 * Candidate E: use ft_node_external_direct (`& 0x07 == 0`)
+		 * — a direct `& FT_KIND_MASK == FT_KIND_EXT` would leak
+		 * bit 4 of the 16-byte-aligned leaf address.
+		 */
+		if (ft_node_external_direct(node_flag))
+			break;
+		/*
+		 * PIGEON fast path (6/7 — dns-tuned dispatch order): rare on
+		 * sparse workloads (zero on dns/paths) but a major case on
+		 * dense ones (post-QP→PIGEON escalation).  Parked late because
+		 * dns/paths inserts no PIGEON nodes; the few PIGEON-bearing
+		 * workloads (u32s with PIGEON < 1%) pay one extra mispredict
+		 * to reach this arm.
 		 *
 		 * Constant-tag SUB strips FT_KIND_PIGEON; ft_pigeon_node_get_nth
 		 * inlines the data[n] load.  Same iter-path / mid-EXT /
-		 * track-prefix bookkeeping as QP_HI.
+		 * track-prefix bookkeeping as POPCOUNT_*.
 		 */
 		if (((unsigned long) node_flag & 0x1FUL) == FT_KIND_PIGEON) {
 			struct cds_ft_inode *node =
@@ -8189,67 +8245,6 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			FT_BYTE_STEP_POST();
 			continue;
 		}
-		/*
-		 * POPCOUNT_32 fast path: 2L nibble bitmap byte step on a
-		 * sparse internal node (1-3 children).  Tag-specific test
-		 * `(v & 0x1F) == FT_KIND_POPCOUNT_32` (= 0x09) — POPCOUNT_-
-		 * 32 has bit 0 + bit 3 set, distinct from QP / PIGEON.  Skip
-		 * variant (SKIP_POPCOUNT_32, 0x0B) is filtered upstream by
-		 * the SKIP handler (bit 1 set).
-		 */
-		if (((unsigned long) node_flag & 0x1FUL) == FT_KIND_POPCOUNT_32) {
-			struct ft_pc32_node *pc =
-				(struct ft_pc32_node *)
-				((unsigned long) node_flag - FT_KIND_POPCOUNT_32);
-
-			iter_key = *(key++);
-			node_flag = ft_pc32_node_get_nth_skip(pc, NULL,
-					iter_key, FT_PF_DATA);
-			if (caa_unlikely(!node_flag)) {
-				status = CDS_FT_STATUS_NOT_FOUND;
-				goto end;
-			}
-			FT_BYTE_STEP_POST();
-			continue;
-		}
-		/*
-		 * POPCOUNT_64 fast path: scan_6 (5+3 byte split) flat-packed
-		 * popcount byte step on a medium-density internal node (4-6
-		 * children).  Tag-specific test `(v & 0x1F) == FT_KIND_-
-		 * POPCOUNT_64` (= 0x11) — POPCOUNT_64 has bit 0 + bit 4 set,
-		 * distinct from QP / PIGEON / POPCOUNT_32.  Skip variant
-		 * (SKIP_POPCOUNT_64, 0x13) is filtered upstream by the SKIP
-		 * handler (bit 1 set).
-		 */
-		if (((unsigned long) node_flag & 0x1FUL) == FT_KIND_POPCOUNT_64) {
-			struct ft_pc64_node *pc =
-				(struct ft_pc64_node *)
-				((unsigned long) node_flag - FT_KIND_POPCOUNT_64);
-
-			iter_key = *(key++);
-			node_flag = ft_pc64_node_get_nth_skip(pc, NULL,
-					iter_key, FT_PF_DATA);
-			if (caa_unlikely(!node_flag)) {
-				status = CDS_FT_STATUS_NOT_FOUND;
-				goto end;
-			}
-			FT_BYTE_STEP_POST();
-			continue;
-		}
-		/*
-		 * EXT terminal (4/5 in the flat dispatch sequence): an
-		 * external child at loop top means the key terminates at
-		 * a compressed path end (e.g. a compressed node's cn->child
-		 * is EXT, surfaced in node_flag by the COMPRESSED handler
-		 * below in a previous iter).  Break to the post-loop
-		 * terminal handler.
-		 *
-		 * Candidate E: use ft_node_external_direct (`& 0x07 == 0`)
-		 * — a direct `& FT_KIND_MASK == FT_KIND_EXT` would leak
-		 * bit 4 of the 16-byte-aligned leaf address.
-		 */
-		if (ft_node_external_direct(node_flag))
-			break;
 		/*
 		 * COMPRESSED handler (5/5 in the flat dispatch sequence):
 		 * residual after QP_HI / SKIP / PIGEON / EXT.  Reachable
