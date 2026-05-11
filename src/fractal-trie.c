@@ -1787,6 +1787,27 @@ struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
  * of the resulting flag provides the release ordering between the
  * inline write and any reader that observes the skip pointer.
  */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+/*
+ * Forward declarations for QP-skip Phase 2 helpers used below.  Full
+ * definitions live near the QP read-side helpers / allocator wrappers.
+ */
+static inline
+struct cds_ft_inode_flag **
+ft_qp16_ptrs(struct cds_ft_qp16_node *node, bool is_skip);
+static inline
+struct ft_qp16_skip_meta *
+ft_qp16_skip_meta_at(struct cds_ft_qp16_node *node);
+static inline
+unsigned int ft_qp16_alloc_order_skip(unsigned int popcount);
+static __attribute__((unused))
+struct cds_ft_qp16_node *ft_qp16_node_alloc(struct cds_ft *ft,
+		unsigned int order,
+		struct cds_ft_metadata **meta_p);
+static __attribute__((unused))
+void ft_qp16_node_free_rcu(struct cds_ft *ft, struct cds_ft_qp16_node *node);
+#endif
+
 static
 struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		struct cds_ft_inode_flag *child,
@@ -1820,12 +1841,24 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		/* QP is 32-byte aligned: ~31UL strips kind cleanly. */
 		struct cds_ft_qp16_node *qp = (struct cds_ft_qp16_node *)
 			(v & ~31UL);
+		/*
+		 * Write up to FT_QP16_SUBKEY_INLINE_LEN (= 13) cached bytes
+		 * via the skip-meta view (skip_len at byte 2, subkey[13] at
+		 * bytes 3-15).  Bytes 8-15 of the QP body overlay what would
+		 * otherwise be ptrs[0] in the direct layout — the caller
+		 * (ft_publish_compressed) migrates the QP to a skip-variant
+		 * allocation before reaching here so that ptrs[] starts at
+		 * byte 16 and the overlay region is dedicated to the cached
+		 * subkey.  metadata->is_skip on the qp is the authoritative
+		 * signal that the overlay is safe to write.
+		 */
+		struct ft_qp16_skip_meta *meta = ft_qp16_skip_meta_at(qp);
 		size_t copy_len = len < FT_QP16_SUBKEY_INLINE_LEN
 				? len : FT_QP16_SUBKEY_INLINE_LEN;
 
 		if (copy_len)
-			memcpy(qp->subkey, cn->key_bytes, copy_len);
-		qp->skip_len = (uint8_t) len;
+			memcpy(meta->subkey, cn->key_bytes, copy_len);
+		meta->skip_len = (uint8_t) len;
 	} else if (child_kind == FT_KIND_PIGEON) {
 		/* PIGEON is 32-byte aligned: ~31UL strips kind cleanly. */
 		void *natural_child = (void *) (v & ~31UL);
@@ -2329,6 +2362,140 @@ void ft_publish_to_parent(struct cds_ft *ft,
 	rcu_assign_pointer(*parent_slot, new_child);
 }
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+/*
+ * QP-skip Phase 2 migration: when ft_publish_compressed wraps a
+ * chain-compressed cn around a direct-variant QP HI child, allocate a
+ * fresh skip-variant HI at the appropriate tier, copy children into
+ * the ptrs-at-byte-16 layout, reparent LO children's meta->parent to
+ * the new HI (SKIP_QP-tagged), atomic-swap cn->child, and RCU-free
+ * the old direct HI.  The new HI's metadata::is_skip is set to 1 so
+ * subsequent mutators that descend through cn->child (FT_KIND_QP-
+ * tagged, since cn->child does not carry the skip tag) still pick the
+ * correct layout via the metadata bit.
+ *
+ * Returns true on success.  Returns false when:
+ *   - popcount > FT_QP16_T3_CAPACITY_SKIP: no skip-variant tier holds
+ *     the children (the overlay drops capacity by one per tier).
+ *     Rare on chain-compress targets (those are typically degenerate
+ *     single-child paths), but possible.
+ *   - allocator returns NULL.
+ * The caller interprets false as a signal to fall back to plain
+ * COMPRESSED publication (no SKIP_QP wrapper); descent then walks
+ * cn byte-by-byte to the still-direct QP.
+ *
+ * cn is not yet attached to the tree at this point (the caller has
+ * just constructed it and is about to publish), so the cn->child swap
+ * is invisible to readers — the new HI becomes reader-visible only
+ * when the caller subsequently publishes the SKIP_QP wrapper in the
+ * grandparent slot.  rcu_assign_pointer on cn->child still provides
+ * the release fence for the migration's stores.
+ */
+static
+bool ft_qp_migrate_to_skip_variant(struct cds_ft *ft,
+		struct cds_ft_compressed_node *cn)
+{
+	struct cds_ft_qp16_node *old_hi = (struct cds_ft_qp16_node *)
+		((unsigned long) cn->child & ~31UL);
+	struct cds_ft_metadata *old_meta = cds_ft_item_to_metadata(old_hi);
+	uint16_t old_bm = uatomic_load(&old_hi->bitmap, CMM_RELAXED);
+	unsigned int pop = (unsigned int)
+		__builtin_popcount((unsigned int) old_bm);
+	unsigned int new_order;
+	struct cds_ft_metadata *new_meta;
+	struct cds_ft_qp16_node *new_hi;
+	struct cds_ft_inode_flag **old_ptrs;
+	struct cds_ft_inode_flag **new_ptrs;
+	struct cds_ft_inode_flag *new_hi_skip_flag;
+	unsigned int b;
+
+	if (pop > FT_QP16_T3_CAPACITY_SKIP)
+		return false;
+	/*
+	 * Cap skip-variant migration at cn->len <= FT_QP16_SUBKEY_INLINE_LEN.
+	 *
+	 * Why: the SKIP_QP descent arms (cand and non-cand) validate the
+	 * skipped compressed prefix against the qp's cached subkey,
+	 * which has room for exactly FT_QP16_SUBKEY_INLINE_LEN (13) bytes.
+	 * Past that, the validate would have to fall back to cn->key_bytes,
+	 * which forces the cn cacheline back into the hot lookup path —
+	 * the very thing the inline subkey is meant to avoid.  For long-
+	 * prefix compressed nodes, publish plain COMPRESSED (no SKIP_QP
+	 * wrapper); the cn handler descends through cn byte-by-byte to a
+	 * still-direct QP, and the inline QP_HI fast path stays correct
+	 * with is_skip = false.
+	 */
+	if (cn->len > FT_QP16_SUBKEY_INLINE_LEN)
+		return false;
+	new_order = ft_qp16_alloc_order_skip(pop);
+	new_hi = ft_qp16_node_alloc(ft, new_order, &new_meta);
+	if (!new_hi)
+		return false;
+
+	/* Copy bitmap; ptrs from byte 8 (direct) to byte 16 (skip). */
+	new_hi->bitmap = old_bm;
+	old_ptrs = ft_qp16_ptrs(old_hi, false);
+	new_ptrs = ft_qp16_ptrs(new_hi, true);
+	for (b = 0; b < pop; b++)
+		new_ptrs[b] = old_ptrs[b];
+
+	/*
+	 * Preserve metadata fields the migration cannot reconstruct:
+	 *   nr_child, nr_keys, parent — same subtree semantics.
+	 *   qp_subtree_half_cls — the lo-subtree footprint is unchanged
+	 *     (we did not touch LOs), so the accumulated total stays.
+	 *   is_lo — 0 (HI).
+	 *   is_skip — 1 (new node is skip-variant).
+	 * fallback_removal_count / alloc_index / skip_slot_offset are
+	 * either reset by ft_qp16_node_alloc or re-derived by
+	 * ft_set_parent / ft_set_skip_slot in the publish path.
+	 */
+	new_meta->nr_child = old_meta->nr_child;
+	new_meta->qp_subtree_half_cls = old_meta->qp_subtree_half_cls;
+	new_meta->parent = old_meta->parent;
+	uatomic_store(&new_meta->nr_keys,
+		uatomic_load(&old_meta->nr_keys, CMM_RELAXED),
+		CMM_RELAXED);
+	new_meta->is_lo = 0;
+	new_meta->is_skip = 1;
+
+	/*
+	 * Reparent each populated LO child's meta->parent to point at
+	 * the new HI with the SKIP_QP slot-tag.  Children walking up via
+	 * meta->parent then discover the variant directly from the tag
+	 * (faster than the metadata bit on the up-walk hot path).
+	 */
+	new_hi_skip_flag = (struct cds_ft_inode_flag *)
+		((unsigned long) new_hi | FT_KIND_SKIP_QP);
+	for (b = 0; b < 16U; b++) {
+		unsigned int idx;
+		struct cds_ft_qp16_node *lo;
+		struct cds_ft_metadata *lo_meta;
+
+		if (!(old_bm & (uint16_t) (1U << b)))
+			continue;
+		idx = (unsigned int) __builtin_popcount(
+				(unsigned int) (old_bm & ((1U << b) - 1U)));
+		lo = (struct cds_ft_qp16_node *) new_ptrs[idx];
+		if (!lo)
+			continue;
+		lo_meta = cds_ft_item_to_metadata(lo);
+		rcu_assign_pointer(lo_meta->parent, new_hi_skip_flag);
+	}
+
+	/*
+	 * Atomic-swap cn->child to the new HI (FT_KIND_QP-tagged, since
+	 * the SKIP_QP wrap lives in the grandparent slot — applied by
+	 * ft_skip_compressed_flag after we return).  Then RCU-free the
+	 * old direct HI.
+	 */
+	rcu_assign_pointer(cn->child, (struct cds_ft_inode_flag *)
+			((unsigned long) new_hi | FT_KIND_QP));
+	ft_qp16_node_free_rcu(ft, old_hi);
+	return true;
+}
+#endif /* FEATURE_FT_SKIP_COMPRESSED */
+
 /*
  * ft_publish_compressed: convert a compressed node flag to a skip
  * pointer if skip-compressed mode is enabled, the path length fits,
@@ -2451,6 +2618,22 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 					memcpy(meta->subkey, cn->key_bytes, copy_len);
 				pc_meta->is_skip = 1;
 			}
+		} else if (child_kind == FT_KIND_QP) {
+			/*
+			 * QP-skip Phase 2 migration: replace the direct QP
+			 * HI under cn with a skip-variant HI (ptrs at byte
+			 * 16, subkey extension at bytes 8-15) so the
+			 * subsequent ft_skip_compressed_flag below can
+			 * write a 13B cached subkey into the overlay
+			 * region without colliding with a live ptr.  If
+			 * the migration cannot proceed (popcount too high
+			 * for any skip tier, or allocator failure), fall
+			 * back to publishing plain COMPRESSED — the
+			 * SKIP_QP wrapper is bypassed and descent walks
+			 * the cn byte-by-byte to the still-direct QP.
+			 */
+			if (!ft_qp_migrate_to_skip_variant(ft, cn))
+				return cflag;
 		}
 	}
 	return ft_skip_compressed_flag(cn->child, cn);
@@ -5209,11 +5392,23 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	 *   none of bits 2/3/4 = PIGEON (0x01)
 	 * Hot path likely caa_likely(QP); POPCOUNT_* second; PIGEON last.
 	 */
-	if (caa_likely((v & 0x04UL) != 0))
-		return ft_qp_byte_get(
-				(struct cds_ft_qp16_node *)
-				((unsigned long) node_flag - FT_KIND_QP),
-				node_flag_ptr, n, pf_hint, false);
+	if (caa_likely((v & 0x04UL) != 0)) {
+		struct cds_ft_qp16_node *qp = (struct cds_ft_qp16_node *)
+				((unsigned long) node_flag - FT_KIND_QP);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		/*
+		 * metadata->is_skip is authoritative: cn->child carries
+		 * FT_KIND_QP regardless of variant, so the tag alone cannot
+		 * distinguish skip-variant from direct.  Skip-variant ptrs[]
+		 * are at offset 16 instead of 8 — wrong is_skip here reads
+		 * the bitmap of bogus memory.
+		 */
+		bool is_skip = cds_ft_item_to_metadata(qp)->is_skip;
+#else
+		bool is_skip = false;
+#endif
+		return ft_qp_byte_get(qp, node_flag_ptr, n, pf_hint, is_skip);
+	}
 	if ((v & 0x08UL) != 0)
 		return ft_pc32_node_get_nth_skip(
 				(struct ft_pc32_node *)
@@ -5295,13 +5490,16 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_qp16_node *hi = (struct cds_ft_qp16_node *) node;
 		uint16_t hi_bm = uatomic_load(&hi->bitmap, CMM_RELAXED);
 		/*
-		 * Extract is_skip from the parent slot tag bit-1: a SKIP_QP
-		 * (0x07) parent points at a skip-variant HI whose ptrs[]
-		 * starts at byte 16; direct FT_KIND_QP (0x05) parents have
-		 * ptrs at byte 8.  Folded by ft_qp16_ptrs at the load site.
+		 * is_skip comes from metadata->is_skip (authoritative across
+		 * cn->child / SKIP_QP wrapper access paths) rather than the
+		 * parent_nf slot tag, which only carries FT_KIND_SKIP_QP on
+		 * the SKIP wrapper path.
 		 */
-		bool is_skip = ((unsigned long) parent_nf & FT_KIND_SKIP_BIT)
-				!= 0;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		bool is_skip = cds_ft_item_to_metadata(node)->is_skip;
+#else
+		bool is_skip = false;
+#endif
 		unsigned int hi_iter;
 
 		/*
@@ -5431,12 +5629,14 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 		break;
 	case FT_QP:
 	{
-		/*
-		 * Recover is_skip from the slot tag bit 1: skip-variant
-		 * QP nodes (FT_KIND_SKIP_QP, 0x07) have ptrs[] at byte 16.
+		/* metadata->is_skip is authoritative; see FT_QP arms in
+		 * _ft_node_set_nth and ft_node_find_child.
 		 */
-		bool is_skip = ((unsigned long) node_flag & FT_KIND_SKIP_BIT)
-				!= 0;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		bool is_skip = cds_ft_item_to_metadata(node)->is_skip;
+#else
+		bool is_skip = false;
+#endif
 
 		child = ft_qp_byte_get_direction(
 				(struct cds_ft_qp16_node *) node,
@@ -5601,19 +5801,30 @@ int _ft_node_set_nth(struct cds_ft *ft,
 		 * as hi_capacity would let set_nth_safe overflow the
 		 * pointer array.
 		 *
-		 * is_skip is recovered from node_flag's tag bit 1:
-		 * SKIP_QP-tagged parents route writes through the
-		 * skip-variant ptrs+16 layout.
+		 * is_skip comes from metadata->is_skip — the authoritative
+		 * per-node signal set by ft_publish_compressed's QP
+		 * migration.  The slot tag in node_flag is unreliable here:
+		 * descent reaching this QP HI via cn->child carries
+		 * FT_KIND_QP regardless of variant, while descent via the
+		 * SKIP_QP wrapper carries FT_KIND_SKIP_QP.  Skip-variant
+		 * capacity drops by one (the highest-rank ptr slot is
+		 * overlaid by the cached subkey extension).
 		 */
-		bool is_skip = ((unsigned long) node_flag & FT_KIND_SKIP_BIT)
-				!= 0;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		bool is_skip = metadata && metadata->is_skip;
+#else
+		bool is_skip = false;
+#endif
+		unsigned int hi_capacity = ft_qp16_capacity_from_order(
+				(unsigned int) cds_ft_item_order(node));
+
+		if (is_skip)
+			hi_capacity -= 1;
 
 		ret = ft_qp_byte_set(ft, node_flag,
 				(struct cds_ft_qp16_node *) node, metadata,
 				n, child_node_flag,
-				ft_qp16_capacity_from_order(
-					(unsigned int) cds_ft_item_order(node)),
-				is_skip);
+				hi_capacity, is_skip);
 		break;
 	}
 	case FT_NULL:
@@ -5694,8 +5905,14 @@ int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
 		break;
 	case FT_QP:
 	{
-		bool is_skip = ((unsigned long) node_flag & FT_KIND_SKIP_BIT)
-				!= 0;
+		/* See _ft_node_set_nth FT_QP arm: metadata->is_skip is
+		 * authoritative across cn->child / SKIP_QP wrapper paths.
+		 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		bool is_skip = metadata && metadata->is_skip;
+#else
+		bool is_skip = false;
+#endif
 
 		ret = ft_qp_byte_replace(ft,
 				(struct cds_ft_qp16_node *) node, metadata,
@@ -5998,7 +6215,8 @@ int ft_node_recompact(enum ft_recompact mode,
 			new_metadata->is_skip =
 				(mode != FT_RECOMPACT_REPARENT
 				 && new_type_index != NODE_INDEX_NULL
-				 && new_type->type_class == FT_POPCOUNT)
+				 && (new_type->type_class == FT_POPCOUNT
+				     || new_type->type_class == FT_QP))
 				? metadata->is_skip
 				: 0;
 			/*
@@ -6174,6 +6392,14 @@ int ft_node_recompact(enum ft_recompact mode,
 		unsigned int new_lo_n = (unsigned int) (n & 0xFU);
 		bool new_inserted = false;
 		unsigned int hi_iter;
+		/*
+		 * Route HI-side ptrs reads through ft_qp16_ptrs so the skip
+		 * variant (ptrs at byte 16) is handled correctly.  LO nodes
+		 * are always direct (LO is reached only via HI byte-step and
+		 * is never a SKIP target), so lo->ptrs[] stays raw.
+		 */
+		struct cds_ft_inode_flag **old_hi_ptrs =
+			ft_qp16_ptrs(old_hi, is_skip);
 
 		/*
 		 * Walk the old (hi, lo) lattice in popcount order, building
@@ -6210,7 +6436,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			if (old_has_bucket) {
 				hi_idx = (unsigned int) __builtin_popcount(
 						(unsigned int) (old_hi_bm & (hi_bit - 1U)));
-				lo_flag = ft_dereference_acquire(old_hi->ptrs[hi_idx]);
+				lo_flag = ft_dereference_acquire(old_hi_ptrs[hi_idx]);
 				if (lo_flag) {
 					lo = (struct cds_ft_qp16_node *) lo_flag;
 					lo_bm = uatomic_load(&lo->bitmap,
@@ -6356,6 +6582,27 @@ skip_copy:
 			uint16_t new_hi_bm =
 				uatomic_load(&new_hi->bitmap, CMM_RELAXED);
 			unsigned int hi_iter;
+			/*
+			 * Route new_hi ptrs reads through ft_qp16_ptrs.  is_skip
+			 * propagates from the source variant — recompact does
+			 * not change variant (the migration path is the only
+			 * one that does).  For skip-variant nodes, LO children
+			 * need their meta->parent set to the SKIP_QP-tagged hi
+			 * flag (so up-walks recover the variant from the slot
+			 * tag); the direct path stores new_node_flag verbatim.
+			 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			bool new_hi_is_skip = new_metadata->is_skip;
+#else
+			bool new_hi_is_skip = false;
+#endif
+			struct cds_ft_inode_flag **new_hi_ptrs =
+				ft_qp16_ptrs(new_hi, new_hi_is_skip);
+			struct cds_ft_inode_flag *lo_parent_flag =
+				new_hi_is_skip
+				? (struct cds_ft_inode_flag *)
+				  ((unsigned long) new_node | FT_KIND_SKIP_QP)
+				: new_node_flag;
 
 			/*
 			 * Walk new node's (hi, lo) lattice and reparent each
@@ -6376,7 +6623,7 @@ skip_copy:
 				hi_idx = (unsigned int) __builtin_popcount(
 						(unsigned int) (new_hi_bm
 							& (hi_bit - 1U)));
-				lo_flag = new_hi->ptrs[hi_idx];
+				lo_flag = new_hi_ptrs[hi_idx];
 				if (!lo_flag)
 					continue;
 				lo = (struct cds_ft_qp16_node *) lo_flag;
@@ -6393,7 +6640,7 @@ skip_copy:
 						cds_ft_item_to_metadata(lo);
 
 					rcu_assign_pointer(lo_meta->parent,
-						new_node_flag);
+						lo_parent_flag);
 				}
 
 				for (j = 0; j < 16U; j++) {
@@ -6568,6 +6815,21 @@ int ft_qp_to_pigeon_convert(struct cds_ft *ft,
 	struct cds_ft_inode_flag *new_pigeon_flag;
 	uint16_t old_hi_bm;
 	unsigned int hi_iter;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * QP→PIGEON escalation may fire on a skip-variant qp HI (the
+	 * migrated cn->child under a SKIP_QP-wrapped chain).  ptrs[] is at
+	 * byte 16 in the skip layout, not at the struct-member offset of 8.
+	 * Read is_skip from old_meta and use ft_qp16_ptrs(old_hi, is_skip)
+	 * for every HI ptr access below.  Write-side (mutex held); the
+	 * cold metadata load is acceptable here.
+	 */
+	bool old_hi_is_skip = old_meta->is_skip;
+#else
+	bool old_hi_is_skip = false;
+#endif
+	struct cds_ft_inode_flag **old_hi_ptrs =
+			ft_qp16_ptrs(old_hi, old_hi_is_skip);
 
 	assert(pigeon_type->type_class == FT_PIGEON);
 
@@ -6602,7 +6864,7 @@ int ft_qp_to_pigeon_convert(struct cds_ft *ft,
 		hi_idx = (unsigned int) __builtin_popcount(
 				(unsigned int) (old_hi_bm & (hi_bit - 1U)));
 		lo = (struct cds_ft_qp16_node *) ft_dereference_acquire(
-				old_hi->ptrs[hi_idx]);
+				old_hi_ptrs[hi_idx]);
 		if (!lo)
 			continue;
 		lo_bm = uatomic_load(&lo->bitmap, CMM_RELAXED);
@@ -6682,7 +6944,7 @@ int ft_qp_to_pigeon_convert(struct cds_ft *ft,
 		hi_idx = (unsigned int) __builtin_popcount(
 				(unsigned int) (old_hi_bm & (hi_bit - 1U)));
 		old_lo = (struct cds_ft_qp16_node *) ft_dereference_acquire(
-				old_hi->ptrs[hi_idx]);
+				old_hi_ptrs[hi_idx]);
 		if (old_lo)
 			ft_qp16_node_free_rcu(ft, old_lo);
 	}
@@ -7397,6 +7659,117 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					 */
 					continue;
 				}
+				/*
+				 * Non-cand SKIP_QP inline arm: mirror of
+				 * the cand SKIP_QP arm below, but with an
+				 * explicit cn->key_bytes-equivalent compare
+				 * against qp->skip_meta->subkey (cand mode
+				 * skips this since the caller validates the
+				 * leaf).  Migration is gated to
+				 * cn->len <= FT_QP16_SUBKEY_INLINE_LEN, so the
+				 * cached subkey always covers the full
+				 * compressed prefix — no cn->key_bytes load
+				 * is needed for the descent compare.
+				 *
+				 * Bypassing cn keeps the inline QP_HI fast
+				 * path correct with is_skip = false: descent
+				 * never feeds an FT_KIND_QP-tagged
+				 * skip-variant qp back into the loop top,
+				 * because the SKIP_QP arm byte-steps directly
+				 * into the qp (with is_skip = true) and the
+				 * resulting next-iter node_flag is the LO's
+				 * child — a fresh-level node, not the
+				 * skip-variant qp.
+				 */
+				if (caa_likely(skip_kind == FT_KIND_SKIP_QP)) {
+					struct cds_ft_qp16_node *qp =
+						(struct cds_ft_qp16_node *)
+						((unsigned long) node_flag - FT_KIND_SKIP_QP);
+					const struct ft_qp16_skip_meta *meta =
+						ft_qp16_skip_meta_at(qp);
+					unsigned int skip = meta->skip_len;
+					int remaining_key = key_depth - 1 - i;
+					int cmp_len = (int) skip < remaining_key
+						? (int) skip : remaining_key;
+
+					if (track_longest) {
+						unsigned int mpos;
+						int cmp = ft_key_cmp_ordinals(
+								key, meta->subkey,
+								cmp_len, remaining_key,
+								false, &mpos);
+
+						if (cmp != 0) {
+							match_len = i + mpos;
+							match_node = NULL;
+							status = CDS_FT_STATUS_NOT_FOUND;
+							goto end;
+						}
+						match_len = i + cmp_len;
+						match_node = NULL;
+					} else {
+						if (caa_unlikely(ft_key_cmp_ordinals(
+								key, meta->subkey,
+								cmp_len, remaining_key,
+								false, NULL) != 0)) {
+							status = CDS_FT_STATUS_NOT_FOUND;
+							goto end;
+						}
+					}
+
+					if (caa_unlikely((int) skip > remaining_key)) {
+						/*
+						 * Input terminates inside the
+						 * compressed prefix.  Recover cn
+						 * via qp->meta->parent (cold
+						 * load; partial-match is rare)
+						 * and read cn's external_nodes
+						 * for keys ending at this depth.
+						 */
+						struct cds_ft_compressed_node *cn =
+							ft_skip_to_compressed(node_flag);
+						struct cds_ft_metadata *cn_meta =
+							cds_ft_item_to_metadata_fast(
+								(struct cds_ft_inode *) cn,
+								ft_compressed_order(cn->len));
+
+						found = ft_dereference_prefetch_external(
+								cn_meta->external_nodes);
+						status = found ? CDS_FT_STATUS_OK
+								: CDS_FT_STATUS_NOT_FOUND;
+						if (track && (found || track_longest)) {
+							match_len = i;
+							match_node = found;
+						}
+						goto end;
+					}
+
+					/* Advance past the compressed prefix. */
+					key += skip;
+					i += skip;
+
+					/*
+					 * Consume one more byte via the
+					 * skip-variant byte-step (ptrs at
+					 * byte 16).  The for-loop's i++
+					 * advances past this byte; next iter
+					 * dispatches the returned child via
+					 * the loop-top fast paths.  Result is
+					 * the LO's child slot value — a
+					 * fresh-level node, not the
+					 * skip-variant qp.
+					 */
+					iter_key = *(key++);
+					node_flag = ft_qp_byte_get(qp, NULL,
+							iter_key, FT_PF_DATA,
+							true);
+					if (caa_unlikely(!node_flag)) {
+						status = CDS_FT_STATUS_NOT_FOUND;
+						goto end;
+					}
+					FT_BYTE_STEP_POST();
+					continue;
+				}
 #endif
 				node_flag = ft_compressed_node_flag(
 					ft_skip_to_compressed(node_flag));
@@ -7471,6 +7844,71 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				/*
+				 * Dedicated SKIP_QP arm (Phase 2): the
+				 * chain-compress migration has reshaped the
+				 * QP target to skip-variant layout (ptrs at
+				 * byte 16, subkey extension at bytes 8-15),
+				 * so we inline-cmp up to 13B of cached
+				 * subkey, advance past the compressed prefix,
+				 * and consume one more byte via the
+				 * skip-variant byte-step (is_skip=true) — all
+				 * in this block.  The SKIP_QP node_flag stays
+				 * tagged here so the QP_HI fast path's narrow
+				 * test (FT_KIND_QP only) does NOT match
+				 * SKIP_QP-tagged input; this arm is the one
+				 * place SKIP_QP descent lives.  Tag-equality
+				 * branch is predict-friendly (a single
+				 * compare-equal against a constant).
+				 */
+				if (caa_likely(skip_kind == FT_KIND_SKIP_QP)) {
+					struct cds_ft_qp16_node *qp =
+						(struct cds_ft_qp16_node *)
+						/* SUB: tag known to be FT_KIND_SKIP_QP. */
+						((unsigned long) node_flag - FT_KIND_SKIP_QP);
+
+					if (spec_validate) {
+						if (skip <= FT_QP16_SUBKEY_INLINE_LEN) {
+							const struct ft_qp16_skip_meta *meta =
+								ft_qp16_skip_meta_at(qp);
+
+							if (caa_unlikely(ft_key_cmp_ordinals(
+									key, meta->subkey,
+									skip, skip,
+									false, NULL) != 0)) {
+								status = CDS_FT_STATUS_NOT_FOUND;
+								goto end;
+							}
+						} else {
+							if (first_skip_offset == key_len)
+								first_skip_offset = i;
+							needs_leaf_validate = true;
+						}
+					}
+
+					/* Advance past the compressed prefix. */
+					key += skip;
+					i += skip;
+
+					/*
+					 * Consume one more byte via the skip-
+					 * variant byte-step (ptrs at byte 16).
+					 * The for-loop's i++ then advances past
+					 * this byte; the next iter dispatches
+					 * the returned child via the loop-top
+					 * fast paths.
+					 */
+					iter_key = *(key++);
+					node_flag = ft_qp_byte_get(qp, NULL,
+							iter_key, FT_PF_DATA,
+							true);
+					if (caa_unlikely(!node_flag)) {
+						status = CDS_FT_STATUS_NOT_FOUND;
+						goto end;
+					}
+					FT_BYTE_STEP_POST();
+					continue;
+				}
+				/*
 				 * Speculative-validated lookup only:
 				 * QP skip with skip_len ≤ 5 → validate
 				 * immediately against the inline subkey on
@@ -7487,21 +7925,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				 * the caller do its own leaf compare.
 				 */
 				if (spec_validate) {
-					if (skip_kind == FT_KIND_SKIP_QP &&
-					    skip <= FT_QP16_SUBKEY_INLINE_LEN) {
-						const struct cds_ft_qp16_node *qp =
-							(const struct cds_ft_qp16_node *)
-							/* SUB: tag known to be FT_KIND_SKIP_QP. */
-							((unsigned long) node_flag - FT_KIND_SKIP_QP);
-
-						if (caa_unlikely(ft_key_cmp_ordinals(
-								key, qp->subkey,
-								skip, skip,
-								false, NULL) != 0)) {
-							status = CDS_FT_STATUS_NOT_FOUND;
-							goto end;
-						}
-					} else if (skip_kind == FT_KIND_SKIP_POPCOUNT_32 &&
+					if (skip_kind == FT_KIND_SKIP_POPCOUNT_32 &&
 					    skip <= FT_PC32_SUBKEY_INLINE_LEN) {
 						/*
 						 * POPCOUNT_32 skip variant: cached
@@ -16530,13 +16954,26 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 				uint16_t hi_bit = (uint16_t) (1U << (key >> 4));
 				unsigned int hi_idx;
 				struct cds_ft_qp16_node *lo_raw;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Skip-variant qp HI puts ptrs[] at byte
+				 * offset 16, not at the direct-layout
+				 * struct-member offset 8.  Read is_skip from
+				 * metadata (verify is the slow path; cold
+				 * metadata load is fine here) and pick the
+				 * correct base via ft_qp16_ptrs.
+				 */
+				bool hi_is_skip = metadata->is_skip;
+#else
+				bool hi_is_skip = false;
+#endif
 
 				assert(hi_bm & hi_bit);
 				hi_idx = (unsigned int) __builtin_popcount(
 						(unsigned int) (hi_bm
 							& (hi_bit - 1U)));
 				lo_raw = (struct cds_ft_qp16_node *)
-					hi_n->ptrs[hi_idx];
+					ft_qp16_ptrs(hi_n, hi_is_skip)[hi_idx];
 				child_expected_parent =
 					ft_qp16_lo_flag(lo_raw);
 			}
