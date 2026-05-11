@@ -18325,3 +18325,57 @@ enum cds_ft_iter_path_mode cds_ft_iter_get_path_mode(
 {
 	return iter->path_mode;
 }
+
+#ifdef FT_ENABLE_TRACING
+/*
+ * Map a tagged cds_ft_inode_flag pointer to one of the FT_TP_NODE_*
+ * enum values used in LTTng tracepoint payloads.  Stub — only covers
+ * the post-Stage-F kinds emitted on current builds; older node types
+ * (LINEAR_*, POOL_*, COLLAPSED, etc.) report as UNKNOWN.
+ *
+ * Stubbed at the call-graph leaf because commit 422edd35 wiped the
+ * collapsed-helper layer and dropped the original definition along
+ * with it.  The declaration in cds_ft_tp.h must still resolve at link
+ * time when FT_ENABLE_TRACING is on.
+ */
+uint16_t ft_tp_node_kind(struct cds_ft_inode_flag *nf)
+{
+	unsigned long v;
+	unsigned long kind;
+
+	if (!nf)
+		return FT_TP_NODE_NULL;
+	v = (unsigned long) nf;
+	if (ft_node_external_direct(nf))
+		return FT_TP_NODE_EXTERNAL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed_in_slot(nf))
+		return FT_TP_NODE_COMPRESSED;
+#endif
+	if (ft_node_compressed_in_node(nf))
+		return FT_TP_NODE_COMPRESSED;
+	kind = v & 0x1FUL;
+	switch (kind) {
+	case FT_KIND_QP:
+		return FT_TP_NODE_POOL_2D_512;
+	case FT_KIND_PIGEON:
+		return FT_TP_NODE_PIGEON_1024;
+	case FT_KIND_POPCOUNT_32:
+		return FT_TP_NODE_LINEAR_32;
+	case FT_KIND_POPCOUNT_64:
+		return FT_TP_NODE_LINEAR_64;
+	}
+	return FT_TP_NODE_UNKNOWN;
+}
+
+uint16_t ft_tp_node_skip_len(struct cds_ft_inode_flag *nf)
+{
+	if (!nf)
+		return 0;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed_in_slot(nf))
+		return (uint16_t) ft_skip_len(nf);
+#endif
+	return 0;
+}
+#endif /* FT_ENABLE_TRACING */
