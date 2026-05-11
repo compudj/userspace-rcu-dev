@@ -2409,6 +2409,24 @@ bool ft_qp_migrate_to_skip_variant(struct cds_ft *ft,
 	struct cds_ft_inode_flag *new_hi_skip_flag;
 	unsigned int b;
 
+	/*
+	 * Chain-compress re-publish over an already-skip qp HI:
+	 * compressed-split / chain-merge can build a fresh cn whose
+	 * child slot already points to a skip-variant qp HI (migrated
+	 * by an earlier publish under the now-replaced cn).  Treat
+	 * this as a no-op migration — the qp is already in the right
+	 * layout and the caller's subsequent ft_skip_compressed_flag
+	 * will refresh the cached subkey to match the new cn.
+	 * Mirrors the "refresh slot 0 in both the initial transition
+	 * AND on chain-compress re-publish" pattern the POPCOUNT_32 /
+	 * POPCOUNT_64 arms already implement.
+	 *
+	 * Reading old_hi->ptrs[] under the direct layout (offset 8)
+	 * for an already-skip qp returns subkey bytes — caller would
+	 * then dereference those bytes as LO pointers and crash.
+	 */
+	if (old_meta->is_skip)
+		return true;
 	if (pop > FT_QP16_T3_CAPACITY_SKIP)
 		return false;
 	/*
