@@ -594,6 +594,35 @@ struct cds_ft_compressed_node {
 
 #define FT_QP16_SUBKEY_INLINE_LEN	5U
 
+/*
+ * QP-skip Phase 2 (planned):
+ *
+ * Skip-variant QP nodes overlay the highest-rank ptr slot (bytes 8-15)
+ * with an extension of the cached subkey, yielding subkey[13] at bytes
+ * 3-15 and shifting ptrs[] to start at byte 16.  Capacity drops by
+ * one — see FT_QP16_T*_CAPACITY_SKIP below.  Variant is recovered from
+ * the SLOT TAG that points to the node (FT_KIND_QP direct vs
+ * FT_KIND_SKIP_QP skip), never from the node body; no metadata bit.
+ *
+ * Layout (skip variant):
+ *   bytes 0-1   : bitmap         (same offset as direct)
+ *   byte  2     : skip_len       (same offset as the prior 5B mode)
+ *   bytes 3-15  : subkey[13]     (extends through the overlay slot)
+ *   bytes 16+   : ptrs[popcount(bitmap)]    (forward-indexed, 8B each;
+ *                                            capacity = direct cap - 1)
+ *
+ * Lo-nodes are always direct (LO is reached only via HI byte-step and
+ * is never a SKIP target), so the overlay never applies on the LO side.
+ *
+ * Step 1 of the Phase 2 sequence adds the constants and helpers below
+ * but no node is allocated as skip-variant yet — see ft_qp16_skip_meta,
+ * ft_qp16_skip_meta_at, ft_qp16_ptrs, ft_qp16_alloc_order_skip.
+ */
+#define FT_QP16_T0_CAPACITY_SKIP	2U
+#define FT_QP16_T1_CAPACITY_SKIP	6U
+#define FT_QP16_T2_CAPACITY_SKIP	14U
+#define FT_QP16_T3_CAPACITY_SKIP	15U
+
 struct cds_ft_qp16_node {
 	uint16_t bitmap;			/* bytes 0-1: nibble-presence bitmap */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -602,8 +631,31 @@ struct cds_ft_qp16_node {
 #else
 	uint8_t  _pad[FT_QP16_HEADER_SIZE - 2];	/* bytes 2-7: reserved */
 #endif
-	struct cds_ft_inode_flag *ptrs[];	/* bytes 8+: popcount(bitmap) entries */
+	struct cds_ft_inode_flag *ptrs[];	/* bytes 8+: popcount(bitmap) entries
+						 * (direct variant). Skip variant
+						 * shifts ptrs[] to byte 16; see
+						 * ft_qp16_ptrs(node, is_skip). */
 } __attribute__((__aligned__(8)));
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+/*
+ * Skip-variant header view, anchored at byte 2 of a QP node:
+ *
+ *   skip_len    : same byte as cds_ft_qp16_node::skip_len
+ *   subkey[13]  : skip-variant cached subkey, bytes 3-15.  First 5 bytes
+ *                 alias cds_ft_qp16_node::subkey; bytes 5-12 occupy the
+ *                 overlay (where direct variant carries ptrs[0]).
+ *
+ * Only valid to access this view when the slot tag that pointed at the
+ * node is FT_KIND_SKIP_QP.  Reading via this view on a direct-variant
+ * node returns subkey[5..12] = the first ptr (interpreted as bytes),
+ * which is nonsense — never do it.
+ */
+struct ft_qp16_skip_meta {
+	uint8_t skip_len;
+	uint8_t subkey[13];
+};
+#endif
 
 /*
  * POPCOUNT_32 layout (order 5 = 32 B), shared by direct (FT_KIND_-

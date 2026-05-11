@@ -3853,6 +3853,23 @@ static const struct cds_ft_qp16_tier ft_qp16_tiers[FT_QP16_NR_TIERS] = {
 };
 
 /*
+ * QP-skip Phase 2 base pointer helper.  Direct variant starts at byte
+ * 8 (immediately after the 8B header); skip variant starts at byte 16
+ * (after the overlay subkey extension).  Hot-path callers fold the
+ * branch by passing a compile-time constant for is_skip.  Defined here
+ * because ft_qp16_node_descend below uses it; the SKIP-COMPRESSED-only
+ * helpers (ft_qp16_skip_meta_at, ft_qp16_alloc_order_skip) live after
+ * the descent body — see further below.
+ */
+static inline
+struct cds_ft_inode_flag **
+ft_qp16_ptrs(struct cds_ft_qp16_node *node, bool is_skip)
+{
+	size_t offset = is_skip ? 16U : FT_QP16_HEADER_SIZE;
+	return (struct cds_ft_inode_flag **) ((char *) node + offset);
+}
+
+/*
  * QP-nibble read-side scanner — handles both hi- and lo-nibble
  * descent in one inlinable helper.  Two dependent loads on the hot
  * path:
@@ -3958,6 +3975,50 @@ unsigned int ft_qp16_capacity_from_order(unsigned int order)
 	assert(tier < FT_QP16_NR_TIERS);
 	return ft_qp16_tiers[tier].max_child;
 }
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+/*
+ * QP-skip Phase 2 skip-only helpers.  The base pointer helper
+ * ft_qp16_ptrs is defined earlier (before ft_qp16_node_descend) so it
+ * is callable from the descent body; the view + picker below are
+ * skip-variant-only and gated on FEATURE_FT_SKIP_COMPRESSED.
+ *
+ * Skip-variant header view of a QP node.  Anchored at byte offset 2,
+ * giving skip_len at byte 2 and subkey[13] at bytes 3-15 — the same
+ * memory the direct layout would expose as the prior 5B inline subkey
+ * (bytes 3-7) plus the highest-rank ptr slot (bytes 8-15).
+ *
+ * Callers must hold that the node was reached via an FT_KIND_SKIP_QP
+ * slot tag before dereferencing the extension bytes; otherwise the
+ * overlay aliases a live pointer.
+ */
+static inline
+struct ft_qp16_skip_meta *
+ft_qp16_skip_meta_at(struct cds_ft_qp16_node *node)
+{
+	return (struct ft_qp16_skip_meta *) ((char *) node + 2);
+}
+
+/*
+ * QP-nibble alloc-order picker for skip-variant nodes.  Same tier
+ * lattice as ft_qp16_alloc_order, but capacity bounds drop by one to
+ * account for the subkey overlay.  Returns T3 order for popcount
+ * values up to FT_QP16_T3_CAPACITY_SKIP; popcount > 15 is not
+ * representable by the skip variant — callers must fall back to
+ * direct-variant alloc with a leaf-validate descent.
+ */
+static inline
+unsigned int ft_qp16_alloc_order_skip(unsigned int popcount)
+{
+	if (popcount <= FT_QP16_T0_CAPACITY_SKIP)
+		return FT_QP16_T0_ALLOC_ORDER;
+	if (popcount <= FT_QP16_T1_CAPACITY_SKIP)
+		return FT_QP16_T1_ALLOC_ORDER;
+	if (popcount <= FT_QP16_T2_CAPACITY_SKIP)
+		return FT_QP16_T2_ALLOC_ORDER;
+	return FT_QP16_T3_ALLOC_ORDER;
+}
+#endif /* FEATURE_FT_SKIP_COMPRESSED */
 
 /*
  * Half-cacheline footprint of a node allocation order.  Half-CL = 32 B,
