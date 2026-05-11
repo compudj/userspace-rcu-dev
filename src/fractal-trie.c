@@ -2180,11 +2180,42 @@ void ft_publish_to_parent(struct cds_ft *ft,
 			 * cn_meta->parent themselves), so cn_meta->parent may
 			 * still be NULL at this point.  parent_nf is already
 			 * the correct grandparent for the published slot.
+			 *
+			 * QP HI/LO rebase: byte-keyed children of a QP hi-node
+			 * carry the tagged lo-pointer as their parent (slot is
+			 * in the lo arena, not in the hi node).  Mirror the
+			 * rebase in ft_set_parent so skip_slot_offset is bounded
+			 * by the lo's alloc size and matches the value
+			 * cn_meta->parent will eventually hold once
+			 * ft_set_parent (called by the caller) rebases to the
+			 * lo-flag.  Without this, the offset is computed
+			 * against the hi base while cn_meta->parent ends up at
+			 * the lo flag — ft_get_skip_slot then resolves the
+			 * stored offset against the lo, returning a slot in
+			 * an unrelated arena range.
 			 */
-			cn_meta->skip_slot_offset = (unsigned int)
-				((char *) parent_slot -
-				 (char *) ft_node_ptr(parent_nf))
-				/ sizeof(void *);
+			{
+				struct cds_ft_inode_flag *eff_parent_nf = parent_nf;
+
+				if (((unsigned long) parent_nf & FT_KIND_MASK)
+						== FT_KIND_QP) {
+					void *p_addr = ft_node_ptr(parent_nf);
+					size_t lo_order =
+						cds_ft_item_order(parent_slot);
+					void *lo_base = (void *)
+						((unsigned long) parent_slot
+						 & ~((1UL << lo_order) - 1UL));
+
+					if (lo_base != p_addr)
+						eff_parent_nf = ft_qp16_lo_flag(
+							(struct cds_ft_qp16_node *)
+								lo_base);
+				}
+				cn_meta->skip_slot_offset = (unsigned int)
+					((char *) parent_slot -
+					 (char *) ft_node_ptr(eff_parent_nf))
+					/ sizeof(void *);
+			}
 		}
 	}
 #endif
