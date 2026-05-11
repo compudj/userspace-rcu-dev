@@ -7908,8 +7908,38 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 #endif
 				unsigned int skip = ft_skip_len(node_flag);
 				int remaining = key_depth - 1 - i;
-
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Per-kind bounds.  SKIP_QP performs an
+				 * explicit byte-step inside the in-iter
+				 * arm (`*(key++)`) so its total advance is
+				 * `skip + 1`: rejecting `skip > remaining`
+				 * is what keeps that read in-bounds.
+				 *
+				 * SKIP_POPCOUNT_* / SKIP_PIGEON bake the
+				 * byte-step into `skip` (see the comment
+				 * on `i += skip - 1` below) and only do
+				 * pointer arithmetic on `key` — no in-iter
+				 * read past the input.  The largest skip
+				 * that can still reach a length-matched
+				 * leaf at depth `key_depth` is therefore
+				 * `remaining + 1` (the exact-fit case
+				 * where the resolved skip-child sits at
+				 * key_depth).  Rejecting at `skip > remaining`
+				 * (without the +1) loses the exact-fit case
+				 * and turns a valid lookup into NOT_FOUND.
+				 * Skips beyond `remaining + 1` land a leaf
+				 * at depth > key_depth and the end-of-
+				 * descent leaf length-check would reject
+				 * them anyway — short-circuit here.
+				 */
+				int max_skip = (skip_kind == FT_KIND_SKIP_QP)
+						? remaining
+						: remaining + 1;
+				if ((int) skip > max_skip) {
+#else
 				if ((int) skip > remaining) {
+#endif
 					status = CDS_FT_STATUS_NOT_FOUND;
 					goto end;
 				}
