@@ -6083,6 +6083,22 @@ int ft_node_recompact(enum ft_recompact mode,
 			unsigned int old_tier = old_order - FT_QP16_T0_ALLOC_ORDER;
 			unsigned int old_cap = ft_qp16_capacity_from_order(old_order);
 
+			/*
+			 * Skip-variant QP nodes drop one ptr slot per tier (the
+			 * highest-rank slot is overlaid by the cached subkey
+			 * extension), so the structural capacity is one less
+			 * than the direct-variant tier capacity.  Use the
+			 * authoritative metadata bit for QP — the upstream
+			 * cross-ref (see is_skip above) is for POPCOUNT
+			 * overshoot recovery and doesn't apply here.
+			 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			if (metadata && metadata->is_skip) {
+				assert(old_cap > 0);
+				old_cap -= 1;
+			}
+#endif
+
 			if (old_pop >= old_cap
 			    && old_tier + 1 >= FT_QP16_NR_TIERS) {
 				/* T3 full -> PIGEON escalation. */
@@ -6334,9 +6350,24 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * the slot-0 form; the byte offset of slot 0 differs
 			 * (8 vs 16) so the source/dest pointer is computed
 			 * per type.
+			 *
+			 * Strictly POPCOUNT→POPCOUNT:
+			 *   - Old must be skip (metadata->is_skip): otherwise
+			 *     slot 0 holds a child ptr, not skip_meta, and the
+			 *     copy would propagate a child as skip metadata.
+			 *   - New must be POPCOUNT: when new is FT_QP under
+			 *     SKIP_X (POPCOUNT→QP escalation with is_skip
+			 *     forced true), the QP body layout is bitmap +
+			 *     skip_len + subkey, not pc32-skip-meta; writing
+			 *     pc32 layout would corrupt QP header bytes.
+			 *     ft_skip_compressed_flag below (the upstream
+			 *     SKIP_X refresh) re-populates the new QP's
+			 *     skip_len/subkey from cn directly.
 			 */
-			if (new_metadata->is_skip
-			    && old_type->type_class == FT_POPCOUNT) {
+			if (metadata->is_skip
+			    && new_metadata->is_skip
+			    && old_type->type_class == FT_POPCOUNT
+			    && new_type->type_class == FT_POPCOUNT) {
 				const struct ft_pc32_skip_meta *old_meta;
 				struct ft_pc32_skip_meta *new_meta;
 
@@ -6499,9 +6530,22 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * variant (ptrs at byte 16) is handled correctly.  LO nodes
 		 * are always direct (LO is reached only via HI byte-step and
 		 * is never a SKIP target), so lo->ptrs[] stays raw.
+		 *
+		 * Use metadata->is_skip for the OLD-side read offset rather
+		 * than the outer `is_skip` (which folds in the upstream cross-
+		 * ref): for QP the metadata bit IS authoritative for the body
+		 * layout — bytes 8-15 are either ptrs[0] (direct) or subkey
+		 * overlay (skip).  The cross-ref override is a stale-recovery
+		 * mechanism for POPCOUNT overshoot only, and using it here on
+		 * a direct-layout QP would read ptrs from byte 16 (garbage).
 		 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		bool old_is_skip = metadata && metadata->is_skip;
+#else
+		bool old_is_skip = false;
+#endif
 		struct cds_ft_inode_flag **old_hi_ptrs =
-			ft_qp16_ptrs(old_hi, is_skip);
+			ft_qp16_ptrs(old_hi, old_is_skip);
 
 		/*
 		 * Walk the old (hi, lo) lattice in popcount order, building
