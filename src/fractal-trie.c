@@ -2480,6 +2480,22 @@ bool ft_qp_migrate_to_skip_variant(struct cds_ft *ft,
 		CMM_RELAXED);
 	new_meta->is_lo = 0;
 	new_meta->is_skip = 1;
+	/*
+	 * Preserve external_nodes across the migration: keys terminating
+	 * exactly at this QP's depth hang off old_meta->external_nodes;
+	 * without this copy, the chain-merge / compressed re-publish path
+	 * that triggers the migration would silently drop those leaves,
+	 * leaving them stored only via cn_meta->external_nodes (or, when
+	 * the prefix-cn was elided at diverge_pos == 1, only via the qp's
+	 * own metadata — which is what we are about to replace).  The
+	 * non-cand SKIP_QP exact-fit-at-anchor reader (do_cds_ft_lookup)
+	 * already mirrors the cand-branch terminal handler in reading
+	 * qp_meta->external_nodes as a fallback after cn_meta; for the
+	 * fallback to succeed, the migration must carry the field over.
+	 */
+	ft_metadata_set_external_nodes(
+		(struct cds_ft_inode_flag *) ((unsigned long) new_hi | FT_KIND_QP),
+		new_meta, old_meta->external_nodes);
 
 	/*
 	 * Reparent each populated LO child's meta->parent to point at
@@ -8017,6 +8033,23 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						 * tail cmp if applicable) and
 						 * read cn's external_nodes for
 						 * keys ending at this depth.
+						 *
+						 * Exact-fit-at-anchor fallback
+						 * (skip == remaining_key + 1):
+						 * cn->external_nodes may be unset
+						 * if the chain-compress reorg
+						 * pushed them onto the cn->child
+						 * (the QP) instead — e.g. when
+						 * diverge_pos == 1 with external
+						 * leaves, the prefix-cn is elided
+						 * and external_nodes move to the
+						 * internal at slot depth.  Read
+						 * the QP's metadata->external_nodes
+						 * as a second source before
+						 * declaring NOT_FOUND.  Mirrors
+						 * the cand-mode SKIP_QP arm which
+						 * falls through to the post-loop
+						 * terminal handler.
 						 */
 						struct cds_ft_metadata *cn_meta;
 
@@ -8028,6 +8061,14 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 						found = ft_dereference_prefetch_external(
 								cn_meta->external_nodes);
+						if (!found
+						    && (int) skip == remaining_key + 1) {
+							struct cds_ft_metadata *qp_meta =
+								cds_ft_item_to_metadata(
+									(struct cds_ft_inode *) qp);
+							found = ft_dereference_prefetch_external(
+									qp_meta->external_nodes);
+						}
 						status = found ? CDS_FT_STATUS_OK
 								: CDS_FT_STATUS_NOT_FOUND;
 						if (track && (found || track_longest)) {
