@@ -2412,21 +2412,16 @@ bool ft_qp_migrate_to_skip_variant(struct cds_ft *ft,
 	if (pop > FT_QP16_T3_CAPACITY_SKIP)
 		return false;
 	/*
-	 * Cap skip-variant migration at cn->len <= FT_QP16_SUBKEY_INLINE_LEN.
-	 *
-	 * Why: the SKIP_QP descent arms (cand and non-cand) validate the
-	 * skipped compressed prefix against the qp's cached subkey,
-	 * which has room for exactly FT_QP16_SUBKEY_INLINE_LEN (13) bytes.
-	 * Past that, the validate would have to fall back to cn->key_bytes,
-	 * which forces the cn cacheline back into the hot lookup path —
-	 * the very thing the inline subkey is meant to avoid.  For long-
-	 * prefix compressed nodes, publish plain COMPRESSED (no SKIP_QP
-	 * wrapper); the cn handler descends through cn byte-by-byte to a
-	 * still-direct QP, and the inline QP_HI fast path stays correct
-	 * with is_skip = false.
+	 * No cap on cn->len: the SKIP_QP wrapper is still worth publishing
+	 * when cn->len > FT_QP16_SUBKEY_INLINE_LEN because cand-mode
+	 * descent (spec_validate) handles the long-subkey case via
+	 * needs_leaf_validate + first_skip_offset (deferred end-of-descent
+	 * leaf-bytes compare).  Non-cand descent splits the validation:
+	 * first FT_QP16_SUBKEY_INLINE_LEN bytes against the qp's cached
+	 * subkey (hot, on the qp body), tail bytes recovered from
+	 * cn->key_bytes via ft_skip_to_compressed (cold, but only fires
+	 * for cn->len > 13 in non-cand mode).
 	 */
-	if (cn->len > FT_QP16_SUBKEY_INLINE_LEN)
-		return false;
 	new_order = ft_qp16_alloc_order_skip(pop);
 	new_hi = ft_qp16_node_alloc(ft, new_order, &new_meta);
 	if (!new_hi)
@@ -7660,26 +7655,35 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					continue;
 				}
 				/*
-				 * Non-cand SKIP_QP inline arm: mirror of
-				 * the cand SKIP_QP arm below, but with an
-				 * explicit cn->key_bytes-equivalent compare
-				 * against qp->skip_meta->subkey (cand mode
-				 * skips this since the caller validates the
-				 * leaf).  Migration is gated to
-				 * cn->len <= FT_QP16_SUBKEY_INLINE_LEN, so the
-				 * cached subkey always covers the full
-				 * compressed prefix — no cn->key_bytes load
-				 * is needed for the descent compare.
+				 * Non-cand SKIP_QP inline arm.  Non-cand mode
+				 * has no end-of-descent leaf compare, so the
+				 * skipped compressed prefix must be validated
+				 * here.  Split the compare:
 				 *
-				 * Bypassing cn keeps the inline QP_HI fast
-				 * path correct with is_skip = false: descent
-				 * never feeds an FT_KIND_QP-tagged
-				 * skip-variant qp back into the loop top,
-				 * because the SKIP_QP arm byte-steps directly
-				 * into the qp (with is_skip = true) and the
-				 * resulting next-iter node_flag is the LO's
-				 * child — a fresh-level node, not the
-				 * skip-variant qp.
+				 *   - First min(skip, 13) bytes against the
+				 *     qp's cached subkey (hot, on the qp body
+				 *     CL the next byte-step will touch too).
+				 *   - Tail bytes (if skip > 13) against
+				 *     cn->key_bytes via ft_skip_to_compressed —
+				 *     cold cn CL, but only fired when the
+				 *     prefix exceeds the inline reach.
+				 *
+				 * cand mode (the spec_validate arm below) does
+				 * not need this split: skip > 13 sets
+				 * needs_leaf_validate + first_skip_offset, and
+				 * the end-of-descent leaf-bytes compare covers
+				 * the entire unverified tail in one memcmp
+				 * against the leaf's stored key.
+				 *
+				 * Bypassing cn (when skip <= 13) keeps the
+				 * inline QP_HI fast path correct with
+				 * is_skip = false: descent never feeds an
+				 * FT_KIND_QP-tagged skip-variant qp back into
+				 * the loop top, because the SKIP_QP arm
+				 * byte-steps directly into the qp (with
+				 * is_skip = true) and the resulting next-iter
+				 * node_flag is the LO's child — a fresh-level
+				 * node, not the skip-variant qp.
 				 */
 				if (caa_likely(skip_kind == FT_KIND_SKIP_QP)) {
 					struct cds_ft_qp16_node *qp =
@@ -7691,12 +7695,19 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					int remaining_key = key_depth - 1 - i;
 					int cmp_len = (int) skip < remaining_key
 						? (int) skip : remaining_key;
+					int inline_cmp_len = cmp_len < (int) FT_QP16_SUBKEY_INLINE_LEN
+						? cmp_len : (int) FT_QP16_SUBKEY_INLINE_LEN;
+					struct cds_ft_compressed_node *cn = NULL;
 
+					/*
+					 * Inline cmp: first inline_cmp_len bytes
+					 * against the qp's cached subkey.
+					 */
 					if (track_longest) {
 						unsigned int mpos;
 						int cmp = ft_key_cmp_ordinals(
 								key, meta->subkey,
-								cmp_len, remaining_key,
+								inline_cmp_len, remaining_key,
 								false, &mpos);
 
 						if (cmp != 0) {
@@ -7705,31 +7716,73 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 							status = CDS_FT_STATUS_NOT_FOUND;
 							goto end;
 						}
-						match_len = i + cmp_len;
-						match_node = NULL;
 					} else {
 						if (caa_unlikely(ft_key_cmp_ordinals(
 								key, meta->subkey,
-								cmp_len, remaining_key,
+								inline_cmp_len, remaining_key,
 								false, NULL) != 0)) {
 							status = CDS_FT_STATUS_NOT_FOUND;
 							goto end;
 						}
 					}
 
+					/*
+					 * Tail cmp: bytes beyond the inline reach
+					 * against cn->key_bytes.  Loads cn on the
+					 * long-prefix path only (cn->len > 13).
+					 */
+					if (caa_unlikely(cmp_len > inline_cmp_len)) {
+						int tail_len = cmp_len - inline_cmp_len;
+
+						cn = ft_skip_to_compressed(node_flag);
+						if (track_longest) {
+							unsigned int mpos;
+							int cmp = ft_key_cmp_ordinals(
+									key + inline_cmp_len,
+									cn->key_bytes + inline_cmp_len,
+									tail_len,
+									remaining_key - inline_cmp_len,
+									false, &mpos);
+
+							if (cmp != 0) {
+								match_len = i + inline_cmp_len + mpos;
+								match_node = NULL;
+								status = CDS_FT_STATUS_NOT_FOUND;
+								goto end;
+							}
+						} else {
+							if (caa_unlikely(ft_key_cmp_ordinals(
+									key + inline_cmp_len,
+									cn->key_bytes + inline_cmp_len,
+									tail_len,
+									remaining_key - inline_cmp_len,
+									false, NULL) != 0)) {
+								status = CDS_FT_STATUS_NOT_FOUND;
+								goto end;
+							}
+						}
+					}
+
+					if (track_longest) {
+						match_len = i + cmp_len;
+						match_node = NULL;
+					}
+
 					if (caa_unlikely((int) skip > remaining_key)) {
 						/*
 						 * Input terminates inside the
 						 * compressed prefix.  Recover cn
-						 * via qp->meta->parent (cold
-						 * load; partial-match is rare)
-						 * and read cn's external_nodes
-						 * for keys ending at this depth.
+						 * via qp->meta->parent (re-use
+						 * the cn already loaded for the
+						 * tail cmp if applicable) and
+						 * read cn's external_nodes for
+						 * keys ending at this depth.
 						 */
-						struct cds_ft_compressed_node *cn =
-							ft_skip_to_compressed(node_flag);
-						struct cds_ft_metadata *cn_meta =
-							cds_ft_item_to_metadata_fast(
+						struct cds_ft_metadata *cn_meta;
+
+						if (!cn)
+							cn = ft_skip_to_compressed(node_flag);
+						cn_meta = cds_ft_item_to_metadata_fast(
 								(struct cds_ft_inode *) cn,
 								ft_compressed_order(cn->len));
 
