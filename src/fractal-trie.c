@@ -6493,6 +6493,16 @@ int ft_node_recompact(enum ft_recompact mode,
 					ret = _ft_node_set_nth(ft, new_type,
 						new_node, new_node_flag,
 						new_metadata, n, child_node_flag);
+					if (ret) {
+						char _vmsg[160];
+						snprintf(_vmsg, sizeof(_vmsg),
+							"pc64 weave-new: mode=%d old_ti=%u new_ti=%u n=0x%02x v=0x%02x ret=%d old_skip=%u new_skip=%u",
+							(int) mode, old_type_index,
+							new_type_index, n, v, ret,
+							(unsigned int) (metadata && metadata->is_skip),
+							(unsigned int) new_metadata->is_skip);
+						FT_TP(inv_violation, "recompact_copy", _vmsg);
+					}
 					assert(!ret);
 					new_inserted = true;
 				}
@@ -6501,6 +6511,17 @@ int ft_node_recompact(enum ft_recompact mode,
 					continue;
 				ret = _ft_node_set_nth(ft, new_type, new_node,
 					new_node_flag, new_metadata, v, iter);
+				if (ret) {
+					char _vmsg[160];
+					snprintf(_vmsg, sizeof(_vmsg),
+						"pc64 copy: mode=%d old_ti=%u new_ti=%u v=0x%02x ret=%d old_skip=%u new_skip=%u old_nr=%u",
+						(int) mode, old_type_index,
+						new_type_index, v, ret,
+						(unsigned int) (metadata && metadata->is_skip),
+						(unsigned int) new_metadata->is_skip,
+						old_nr);
+					FT_TP(inv_violation, "recompact_copy", _vmsg);
+				}
 				assert(!ret);
 			}
 		} else {
@@ -6518,6 +6539,16 @@ int ft_node_recompact(enum ft_recompact mode,
 					ret = _ft_node_set_nth(ft, new_type,
 						new_node, new_node_flag,
 						new_metadata, n, child_node_flag);
+					if (ret) {
+						char _vmsg[160];
+						snprintf(_vmsg, sizeof(_vmsg),
+							"pc32 weave-new: mode=%d old_ti=%u new_ti=%u n=0x%02x v=0x%02x ret=%d old_skip=%u new_skip=%u",
+							(int) mode, old_type_index,
+							new_type_index, n, v, ret,
+							(unsigned int) (metadata && metadata->is_skip),
+							(unsigned int) new_metadata->is_skip);
+						FT_TP(inv_violation, "recompact_copy", _vmsg);
+					}
 					assert(!ret);
 					new_inserted = true;
 				}
@@ -6526,6 +6557,17 @@ int ft_node_recompact(enum ft_recompact mode,
 					continue;
 				ret = _ft_node_set_nth(ft, new_type, new_node,
 					new_node_flag, new_metadata, v, iter);
+				if (ret) {
+					char _vmsg[160];
+					snprintf(_vmsg, sizeof(_vmsg),
+						"pc32 copy: mode=%d old_ti=%u new_ti=%u v=0x%02x ret=%d old_skip=%u new_skip=%u old_nr=%u",
+						(int) mode, old_type_index,
+						new_type_index, v, ret,
+						(unsigned int) (metadata && metadata->is_skip),
+						(unsigned int) new_metadata->is_skip,
+						old_nr);
+					FT_TP(inv_violation, "recompact_copy", _vmsg);
+				}
 				assert(!ret);
 			}
 		}
