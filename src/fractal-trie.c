@@ -2371,8 +2371,20 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 			struct cds_ft_metadata *pc_meta =
 				cds_ft_item_to_metadata(pc);
 
-			if (pc_meta->nr_child <= FT_PC32_MAX_LC_SKIP &&
-			    !pc_meta->popcount_is_skip) {
+			/*
+			 * Refresh slot 0 in both the initial transition
+			 * (popcount_is_skip == 0) and on chain-compress
+			 * re-publish over an already-skip popcount: a new cn
+			 * wrapping the same popcount with different key bytes
+			 * (compressed-split shortening, chain-merge) must
+			 * overwrite the cached subkey/skip_len so spec-
+			 * validate descent compares against the new cn's
+			 * bytes.  The nr_child <= MAX_LC_SKIP guard ensures
+			 * slot 0 is not allocated to a child via the reverse-
+			 * indexed layout, so the write is non-destructive
+			 * regardless of the current popcount_is_skip state.
+			 */
+			if (pc_meta->nr_child <= FT_PC32_MAX_LC_SKIP) {
 				struct ft_pc32_skip_meta *meta = &pc->u.skip.meta;
 				size_t copy_len = cn->len < sizeof(meta->subkey)
 					? cn->len
@@ -2390,8 +2402,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 			struct cds_ft_metadata *pc_meta =
 				cds_ft_item_to_metadata(pc);
 
-			if (pc_meta->nr_child <= FT_PC64_MAX_LC_SKIP &&
-			    !pc_meta->popcount_is_skip) {
+			if (pc_meta->nr_child <= FT_PC64_MAX_LC_SKIP) {
 				struct ft_pc32_skip_meta *meta = &pc->u.skip.meta;
 				size_t copy_len = cn->len < sizeof(meta->subkey)
 					? cn->len
@@ -5810,9 +5821,21 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * recompact is changing type_class to something that
 			 * doesn't honor the bit, since it would be stale on the
 			 * new type.
+			 *
+			 * REPARENT mode: clone_for_reparent moves the node to a
+			 * new parent context built by the caller.  The new
+			 * parent may be non-COMPRESSED (e.g., compressed-split's
+			 * branch internal in the suffix_len == 0 path), in
+			 * which case popcount_is_skip would falsely persist on
+			 * a node no longer reached via SKIP_POPCOUNT_X.  Clear
+			 * here unconditionally for REPARENT; if the caller
+			 * re-installs the clone under a fresh CN and calls
+			 * ft_publish_compressed, the bit gets re-set with a
+			 * fresh slot-0 skip_meta.
 			 */
 			new_metadata->popcount_is_skip =
-				(new_type_index != NODE_INDEX_NULL
+				(mode != FT_RECOMPACT_REPARENT
+				 && new_type_index != NODE_INDEX_NULL
 				 && new_type->type_class == FT_POPCOUNT)
 				? metadata->popcount_is_skip
 				: 0;
