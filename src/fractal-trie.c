@@ -8065,32 +8065,36 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 				int remaining = key_depth - 1 - i;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				/*
-				 * Per-kind bounds.  SKIP_QP performs an
-				 * explicit byte-step inside the in-iter
-				 * arm (`*(key++)`) so its total advance is
-				 * `skip + 1`: rejecting `skip > remaining`
-				 * is what keeps that read in-bounds.
+				 * Per-kind bounds.  Both SKIP_QP and the
+				 * non-QP SKIP variants admit
+				 * `skip <= remaining + 1`:
 				 *
-				 * SKIP_POPCOUNT_* / SKIP_PIGEON bake the
-				 * byte-step into `skip` (see the comment
-				 * on `i += skip - 1` below) and only do
-				 * pointer arithmetic on `key` — no in-iter
-				 * read past the input.  The largest skip
-				 * that can still reach a length-matched
-				 * leaf at depth `key_depth` is therefore
-				 * `remaining + 1` (the exact-fit case
-				 * where the resolved skip-child sits at
-				 * key_depth).  Rejecting at `skip > remaining`
-				 * (without the +1) loses the exact-fit case
-				 * and turns a valid lookup into NOT_FOUND.
+				 * - SKIP_POPCOUNT_* / SKIP_PIGEON bake the
+				 *   byte-step into `skip` and only do
+				 *   pointer arithmetic on `key` (no in-iter
+				 *   read past the input).  Exact-fit at
+				 *   skip == remaining + 1 lands the resolved
+				 *   skip-child at key_depth — the post-loop
+				 *   terminal handler reads its external_nodes.
+				 *
+				 * - SKIP_QP normally does an explicit
+				 *   byte-step (`*(key++)`) for total advance
+				 *   `skip + 1`.  The exact-fit case
+				 *   skip == remaining + 1 means the cn alone
+				 *   consumes all remaining input — the QP
+				 *   byte-step would read past key_len.  The
+				 *   SKIP_QP arm detects this case below and
+				 *   lands on the QP itself (untagged) so the
+				 *   terminal handler reads the QP's
+				 *   external_nodes (keys ending exactly at
+				 *   cn anchor depth).
+				 *
 				 * Skips beyond `remaining + 1` land a leaf
-				 * at depth > key_depth and the end-of-
-				 * descent leaf length-check would reject
-				 * them anyway — short-circuit here.
+				 * at depth > key_depth and the end-of-descent
+				 * leaf length-check would reject them
+				 * anyway — short-circuit here.
 				 */
-				int max_skip = (skip_kind == FT_KIND_SKIP_QP)
-						? remaining
-						: remaining + 1;
+				int max_skip = remaining + 1;
 				if ((int) skip > max_skip) {
 #else
 				if ((int) skip > remaining) {
@@ -8144,6 +8148,30 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 					/* Advance past the compressed prefix. */
 					key += skip;
 					i += skip;
+
+					/*
+					 * Exact-fit-at-anchor: skip == remaining + 1
+					 * means cn consumed all remaining input
+					 * bytes and there is no input left to
+					 * feed the QP byte-step.  The lookup
+					 * terminates at cn anchor depth (= the
+					 * QP's own depth) — let the post-loop
+					 * terminal handler read the QP's
+					 * external_nodes for keys ending exactly
+					 * here.  Hand it a QP-tagged node_flag
+					 * so ft_node_internal recognizes it.
+					 *
+					 * The for-loop's i++ at end-of-iter
+					 * brings i to (old_i + skip + 1) ==
+					 * key_depth, so the loop exits cleanly
+					 * before another byte-step is attempted.
+					 */
+					if (caa_unlikely((int) skip > remaining)) {
+						node_flag = (struct cds_ft_inode_flag *)
+							((unsigned long) qp | FT_KIND_QP);
+						FT_BYTE_STEP_POST();
+						continue;
+					}
 
 					/*
 					 * Consume one more byte via the skip-
