@@ -232,11 +232,12 @@ enum ft_kind {
  * Each ft_types[] entry carries TWO sets of (min_child, max_child)
  * bounds — one for the direct variant, one for the skip-target
  * variant — so a single type entry covers both modes.  The lattice
- * walk picks the correct bounds via metadata::popcount_is_skip.  For
- * types with no per-variant capacity difference (FT_QP, FT_PIGEON),
- * the two pairs are identical.  FT_POPCOUNT reduces max_child by
- * one in skip mode (slot 0 holds ft_pc32_skip_meta instead of a
- * pointer) for both POPCOUNT_32 and POPCOUNT_64.
+ * walk picks the correct bounds via metadata::is_skip.  For types
+ * with no per-variant capacity difference (FT_PIGEON), the two pairs
+ * are identical.  FT_POPCOUNT reduces max_child by one in skip mode
+ * (slot 0 holds ft_pc32_skip_meta instead of a pointer) for both
+ * POPCOUNT_32 and POPCOUNT_64.  FT_QP also reduces by one in skip
+ * mode (highest-rank ptr overlaid by the cached subkey extension).
  */
 #define FT_POPCOUNT_32_INDEX	0U
 #define FT_POPCOUNT_64_INDEX	1U
@@ -457,12 +458,21 @@ struct cds_ft_metadata {
 	 *                         used in the parent-walk to recover the
 	 *                         HI/LO distinction now that FT_KIND_QP_LO
 	 *                         no longer occupies a slot-tag value)
-	 * popcount_is_skip:       1 bit  (set on POPCOUNT_32 nodes that
-	 *                         are skip-target variants — slot 0
-	 *                         holds ft_pc32_skip_meta instead of a
-	 *                         pointer; max_lc effective = 2.
+	 * is_skip:                1 bit  (generic skip-variant marker for
+	 *                         POPCOUNT_32 / POPCOUNT_64 / QP — see the
+	 *                         per-class layout notes for what the
+	 *                         skip variant changes:
+	 *                           POPCOUNT_32 / POPCOUNT_64: slot 0
+	 *                             reserved for ft_pc32_skip_meta
+	 *                             (skip_len + cached subkey); max_lc
+	 *                             drops by one.
+	 *                           QP: ptrs[] shifts from byte 8 to
+	 *                             byte 16; subkey extension occupies
+	 *                             the overlay slot at bytes 8-15;
+	 *                             per-tier capacity drops by one
+	 *                             (FT_QP16_T*_CAPACITY_SKIP).
 	 *                         Driven by ft_publish_compressed when a
-	 *                         POPCOUNT_32 becomes a cn->child.
+	 *                         node becomes a cn->child target.
 	 *                         Ifdef-gated; meaningless when SKIP-
 	 *                         compressed is disabled.)
 	 */
@@ -474,7 +484,7 @@ struct cds_ft_metadata {
 	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
 	uint32_t is_lo:1;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-	uint32_t popcount_is_skip:1;
+	uint32_t is_skip:1;
 #endif
 	/*
 	 * Trailing-pad byte at offset 28.  Mutually-exclusive uses —

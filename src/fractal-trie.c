@@ -1530,7 +1530,7 @@ unsigned int ft_node_type_index(struct cds_ft_inode_flag *node)
 	 * SKIP_QP-tagged inode_flag would trip the trailing assert.
 	 * SKIP_POPCOUNT_* / SKIP_PIGEON do not need the same treatment:
 	 * the POPCOUNT skip variant uses a metadata bit
-	 * (popcount_is_skip), and PIGEON has no skip-variant layout.
+	 * (is_skip), and PIGEON has no skip-variant layout.
 	 */
 	if (ft_kind_is_qp_variant(tag))
 		return FT_QP_INDEX;
@@ -2383,7 +2383,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 	 * repurpose slot 0 to hold ft_pc32_skip_meta (skip_len + cached
 	 * subkey) so speculative-validate descent can validate the
 	 * skipped path inline against the cached subkey, no parent walk
-	 * to cn required.  Set popcount_is_skip on the child's metadata
+	 * to cn required.  Set is_skip on the child's metadata
 	 * so subsequent set_nth uses the reduced max_lc.  Slot 0
 	 * (highest popcount-rank) is guaranteed unused at this point
 	 * because nr_child ≤ MAX_LC_SKIP — write is non-destructive.
@@ -2410,7 +2410,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 
 			/*
 			 * Refresh slot 0 in both the initial transition
-			 * (popcount_is_skip == 0) and on chain-compress
+			 * (is_skip == 0) and on chain-compress
 			 * re-publish over an already-skip popcount: a new cn
 			 * wrapping the same popcount with different key bytes
 			 * (compressed-split shortening, chain-merge) must
@@ -2419,7 +2419,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 			 * bytes.  The nr_child <= MAX_LC_SKIP guard ensures
 			 * slot 0 is not allocated to a child via the reverse-
 			 * indexed layout, so the write is non-destructive
-			 * regardless of the current popcount_is_skip state.
+			 * regardless of the current is_skip state.
 			 */
 			if (pc_meta->nr_child <= FT_PC32_MAX_LC_SKIP) {
 				struct ft_pc32_skip_meta *meta = &pc->u.skip.meta;
@@ -2431,7 +2431,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 				meta->skip_len = (uint8_t) cn->len;
 				if (copy_len)
 					memcpy(meta->subkey, cn->key_bytes, copy_len);
-				pc_meta->popcount_is_skip = 1;
+				pc_meta->is_skip = 1;
 			}
 		} else if (child_kind == FT_KIND_POPCOUNT_64) {
 			struct ft_pc64_node *pc = (struct ft_pc64_node *)
@@ -2449,7 +2449,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
 				meta->skip_len = (uint8_t) cn->len;
 				if (copy_len)
 					memcpy(meta->subkey, cn->key_bytes, copy_len);
-				pc_meta->popcount_is_skip = 1;
+				pc_meta->is_skip = 1;
 			}
 		}
 	}
@@ -5568,7 +5568,7 @@ int _ft_node_set_nth(struct cds_ft *ft,
 		if (type->order == FT_PC64_ALLOC_ORDER) {
 			unsigned int max_lc = FT_PC64_MAX_LC_DIRECT;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			if (metadata->popcount_is_skip)
+			if (metadata->is_skip)
 				max_lc = FT_PC64_MAX_LC_SKIP;
 #endif
 			ret = ft_pc64_node_set_nth_safe(
@@ -5577,7 +5577,7 @@ int _ft_node_set_nth(struct cds_ft *ft,
 		} else {
 			unsigned int max_lc = FT_PC32_MAX_LC_DIRECT;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			if (metadata->popcount_is_skip)
+			if (metadata->is_skip)
 				max_lc = FT_PC32_MAX_LC_SKIP;
 #endif
 			ret = ft_pc32_node_set_nth_safe(
@@ -5775,7 +5775,7 @@ int ft_node_recompact(enum ft_recompact mode,
 	const struct cds_ft_type *new_type;
 	struct cds_ft_inode_flag *new_node_flag = NULL;
 	/*
-	 * Inherit popcount_is_skip from the old metadata: if the old
+	 * Inherit is_skip from the old metadata: if the old
 	 * node was a skip-target POPCOUNT_32 with slot 0 reserved for
 	 * cached subkey, the recompacted node is in the same skip-target
 	 * context and uses the same reduced max_child for its lattice
@@ -5783,7 +5783,7 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * (the bit is meaningless there) and for fresh allocations.
 	 */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-	bool is_skip = metadata && metadata->popcount_is_skip;
+	bool is_skip = metadata && metadata->is_skip;
 #else
 	bool is_skip = false;
 #endif
@@ -5979,7 +5979,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * Inherit skip-target marker.  Only meaningful for
 			 * FT_POPCOUNT new types; on FT_QP / FT_PIGEON the bit
 			 * is harmless (they read pigeon_skip_len /
-			 * qp->skip_len, not popcount_is_skip).  Cleared if the
+			 * qp->skip_len, not is_skip).  Cleared if the
 			 * recompact is changing type_class to something that
 			 * doesn't honor the bit, since it would be stale on the
 			 * new type.
@@ -5988,18 +5988,18 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * new parent context built by the caller.  The new
 			 * parent may be non-COMPRESSED (e.g., compressed-split's
 			 * branch internal in the suffix_len == 0 path), in
-			 * which case popcount_is_skip would falsely persist on
+			 * which case is_skip would falsely persist on
 			 * a node no longer reached via SKIP_POPCOUNT_X.  Clear
 			 * here unconditionally for REPARENT; if the caller
 			 * re-installs the clone under a fresh CN and calls
 			 * ft_publish_compressed, the bit gets re-set with a
 			 * fresh slot-0 skip_meta.
 			 */
-			new_metadata->popcount_is_skip =
+			new_metadata->is_skip =
 				(mode != FT_RECOMPACT_REPARENT
 				 && new_type_index != NODE_INDEX_NULL
 				 && new_type->type_class == FT_POPCOUNT)
-				? metadata->popcount_is_skip
+				? metadata->is_skip
 				: 0;
 			/*
 			 * Copy the cached subkey (slot 0) when both old and
@@ -6015,7 +6015,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * (8 vs 16) so the source/dest pointer is computed
 			 * per type.
 			 */
-			if (new_metadata->popcount_is_skip
+			if (new_metadata->is_skip
 			    && old_type->type_class == FT_POPCOUNT) {
 				const struct ft_pc32_skip_meta *old_meta;
 				struct ft_pc32_skip_meta *new_meta;
@@ -7512,7 +7512,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						 * pc_meta->nr_child <=
 						 * FT_PC32_MAX_LC_SKIP at publish
 						 * time (otherwise slot 0 holds a
-						 * live ptr).  The popcount_is_skip
+						 * live ptr).  The is_skip
 						 * metadata bit signals subkey
 						 * validity; without it, slot 0 is
 						 * a live ptr and the inline compare
@@ -7525,7 +7525,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 							/* SUB: tag known to be FT_KIND_SKIP_POPCOUNT_32. */
 							((unsigned long) node_flag - FT_KIND_SKIP_POPCOUNT_32);
 
-						if (cds_ft_item_to_metadata((void *) pc)->popcount_is_skip) {
+						if (cds_ft_item_to_metadata((void *) pc)->is_skip) {
 							if (caa_unlikely(ft_key_cmp_ordinals(
 									key, pc->u.skip.meta.subkey,
 									skip, skip,
@@ -7545,7 +7545,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 						 * cached-subkey layout as
 						 * POPCOUNT_32 (both reuse struct
 						 * ft_pc32_skip_meta in slot 0).
-						 * Same popcount_is_skip gate —
+						 * Same is_skip gate —
 						 * publish only writes slot 0 when
 						 * nr_child <= FT_PC64_MAX_LC_SKIP.
 						 */
@@ -7554,7 +7554,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 							/* SUB: tag known to be FT_KIND_SKIP_POPCOUNT_64. */
 							((unsigned long) node_flag - FT_KIND_SKIP_POPCOUNT_64);
 
-						if (cds_ft_item_to_metadata((void *) pc)->popcount_is_skip) {
+						if (cds_ft_item_to_metadata((void *) pc)->is_skip) {
 							if (caa_unlikely(ft_key_cmp_ordinals(
 									key, pc->u.skip.meta.subkey,
 									skip, skip,
@@ -16468,7 +16468,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 				 * PIGEON it is harmless inheritance.
 				 */
 				max_child = (type->type_class == FT_POPCOUNT
-					     && metadata->popcount_is_skip)
+					     && metadata->is_skip)
 					? type->max_child_skip
 					: type->max_child;
 #else
