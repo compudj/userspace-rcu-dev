@@ -679,15 +679,15 @@ struct ft_pc32_node {
  * NOT the 4+4 nibble split of POPCOUNT_32.  The choice fits all
  * sub_bms in one u64 for max_lc=6 with no chunk-select cmov.
  *
- *   bytes 0-3   : root_bm    (32-bit, one bit per high 5-bit prefix
- *                             hi = n >> 3, so 32 hi-buckets)
- *   bytes 4-11  : packed_bms (64-bit; up to 6 x 8-bit sub_bms — each
+ *   bytes 0-7   : packed_bms (64-bit; up to 6 x 8-bit sub_bms — each
  *                             sub_bm holds presence bits for the 8
  *                             low values lo = n & 0x7 within that
  *                             popcount-rank slot.  bit at position
  *                             p = (slot1 * 8) | lo is set iff
  *                             (hi, lo) is populated, where slot1 =
  *                             popcount-rank of hi in root_bm)
+ *   bytes 8-11  : root_bm    (32-bit, one bit per high 5-bit prefix
+ *                             hi = n >> 3, so 32 hi-buckets)
  *   bytes 12-15 : padding    (header is 16 B, 8-byte aligned)
  *   bytes 16-23 : slot 0     (DIRECT: ptr for popcount-idx 5.
  *                             SKIP:   reuses ft_pc32_skip_meta —
@@ -697,6 +697,15 @@ struct ft_pc32_node {
  *   bytes 40-47 : slot 3     (ptr for popcount-idx 2)
  *   bytes 48-55 : slot 4     (ptr for popcount-idx 1)
  *   bytes 56-63 : slot 5     (ptr for popcount-idx 0)
+ *
+ * Field order matters: packed_bms (u64) is placed first to avoid the
+ * 4-byte tail padding the compiler would otherwise insert between
+ * root_bm (u32) and packed_bms (u64) to satisfy uint64_t's 8-byte
+ * alignment.  With root_bm first the natural layout becomes
+ * root_bm(4) + pad(4) + packed_bms(8) + _pad(4) + pad(4) = 24-byte
+ * header, blowing past FT_PC64_HEADER_SIZE and shifting every slot
+ * by one — slot 0 reads then alias into the meta region in skip
+ * mode, returning skip_len/subkey bytes as a "child pointer".
  *
  * Reverse-indexed pointers same as POPCOUNT_32: ptr_offset =
  * (FT_PC64_MAX_LC_DIRECT - 1) - popcount_idx.  SKIP variant
@@ -722,8 +731,8 @@ struct ft_pc32_node {
 #define FT_PC64_HI_BUCKETS		(1U << FT_PC64_HI_BITS) /* 32 */
 
 struct ft_pc64_node {
-	uint32_t root_bm;	/* bytes 0-3 */
-	uint64_t packed_bms;	/* bytes 4-11 */
+	uint64_t packed_bms;	/* bytes 0-7 */
+	uint32_t root_bm;	/* bytes 8-11 */
 	uint32_t _pad;		/* bytes 12-15 */
 	union {
 		struct cds_ft_inode_flag *direct[6];	/* direct mode */
