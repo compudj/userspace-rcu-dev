@@ -4250,17 +4250,18 @@ void ft_qp16_node_init(struct cds_ft_qp16_node *node)
 static inline
 int ft_qp16_node_set_nth_safe(struct cds_ft_qp16_node *node,
 		uint8_t nibble, struct cds_ft_inode_flag *child,
-		unsigned int capacity)
+		unsigned int capacity, bool is_skip)
 {
 	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
+	struct cds_ft_inode_flag **ptrs = ft_qp16_ptrs(node, is_skip);
 	unsigned int idx;
 
 	if (bm & bit) {
 		/* Replace live or revive tombstone — bitmap unchanged. */
 		idx = (unsigned int) __builtin_popcount(
 				(unsigned int) (bm & (bit - 1U)));
-		rcu_assign_pointer(node->ptrs[idx], child);
+		rcu_assign_pointer(ptrs[idx], child);
 		return 0;
 	}
 	/* Bit not set — must be safe-append. */
@@ -4270,7 +4271,7 @@ int ft_qp16_node_set_nth_safe(struct cds_ft_qp16_node *node,
 	if (idx >= capacity)
 		return -ENOSPC;
 	uatomic_store(&node->bitmap, (uint16_t) (bm | bit), CMM_RELAXED);
-	rcu_assign_pointer(node->ptrs[idx], child);
+	rcu_assign_pointer(ptrs[idx], child);
 	return 0;
 }
 
@@ -4292,19 +4293,21 @@ int ft_qp16_node_set_nth_safe(struct cds_ft_qp16_node *node,
  * tighter bitmap) happens when set_nth_safe returns -ENOSPC.
  */
 static inline
-int ft_qp16_node_clear_nth(struct cds_ft_qp16_node *node, uint8_t nibble)
+int ft_qp16_node_clear_nth(struct cds_ft_qp16_node *node, uint8_t nibble,
+		bool is_skip)
 {
 	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
+	struct cds_ft_inode_flag **ptrs = ft_qp16_ptrs(node, is_skip);
 	unsigned int idx;
 
 	if (!(bm & bit))
 		return -ENOENT;
 	idx = (unsigned int) __builtin_popcount(
 			(unsigned int) (bm & (bit - 1U)));
-	if (!node->ptrs[idx])
+	if (!ptrs[idx])
 		return -ENOENT;
-	rcu_assign_pointer(node->ptrs[idx], NULL);
+	rcu_assign_pointer(ptrs[idx], NULL);
 	return 0;
 }
 
@@ -4332,11 +4335,14 @@ static
 int ft_qp16_node_cow_insert(struct cds_ft_qp16_node *new_node,
 		const struct cds_ft_qp16_node *src_node,
 		uint8_t nibble, struct cds_ft_inode_flag *child,
-		unsigned int new_capacity)
+		unsigned int new_capacity, bool is_skip)
 {
 	uint16_t src_bm = src_node->bitmap;
 	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
 	uint16_t new_bm;
+	struct cds_ft_inode_flag **new_ptrs = ft_qp16_ptrs(new_node, is_skip);
+	struct cds_ft_inode_flag **src_ptrs = ft_qp16_ptrs(
+			(struct cds_ft_qp16_node *) src_node, is_skip);
 	unsigned int src_idx = 0, new_idx = 0;
 	unsigned int b;
 
@@ -4351,11 +4357,11 @@ int ft_qp16_node_cow_insert(struct cds_ft_qp16_node *new_node,
 		uint16_t mask = (uint16_t) (1U << b);
 
 		if (b == (nibble & 0xFU)) {
-			new_node->ptrs[new_idx++] = child;
+			new_ptrs[new_idx++] = child;
 			continue;
 		}
 		if (src_bm & mask)
-			new_node->ptrs[new_idx++] = src_node->ptrs[src_idx++];
+			new_ptrs[new_idx++] = src_ptrs[src_idx++];
 	}
 	new_node->bitmap = new_bm;
 	return 0;
@@ -4377,10 +4383,13 @@ int ft_qp16_node_cow_insert(struct cds_ft_qp16_node *new_node,
 static
 int ft_qp16_node_recompact(struct cds_ft_qp16_node *new_node,
 		const struct cds_ft_qp16_node *src_node,
-		unsigned int new_capacity)
+		unsigned int new_capacity, bool is_skip)
 {
 	uint16_t src_bm = src_node->bitmap;
 	uint16_t new_bm = 0;
+	struct cds_ft_inode_flag **new_ptrs = ft_qp16_ptrs(new_node, is_skip);
+	struct cds_ft_inode_flag **src_ptrs = ft_qp16_ptrs(
+			(struct cds_ft_qp16_node *) src_node, is_skip);
 	unsigned int src_idx = 0, new_idx = 0;
 	unsigned int b;
 
@@ -4389,12 +4398,12 @@ int ft_qp16_node_recompact(struct cds_ft_qp16_node *new_node,
 
 		if (!(src_bm & (uint16_t) (1U << b)))
 			continue;
-		p = src_node->ptrs[src_idx++];
+		p = src_ptrs[src_idx++];
 		if (!p)
 			continue;	/* tombstone: drop */
 		if (new_idx >= new_capacity)
 			return -ENOSPC;
-		new_node->ptrs[new_idx++] = p;
+		new_ptrs[new_idx++] = p;
 		new_bm |= (uint16_t) (1U << b);
 	}
 	new_node->bitmap = new_bm;
@@ -4423,11 +4432,14 @@ static __attribute__((unused))
 int ft_qp16_node_recompact_and_insert(struct cds_ft_qp16_node *new_node,
 		const struct cds_ft_qp16_node *src_node,
 		uint8_t nibble, struct cds_ft_inode_flag *child,
-		unsigned int new_capacity)
+		unsigned int new_capacity, bool is_skip)
 {
 	uint16_t src_bm = src_node->bitmap;
 	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
 	uint16_t new_bm = 0;
+	struct cds_ft_inode_flag **new_ptrs = ft_qp16_ptrs(new_node, is_skip);
+	struct cds_ft_inode_flag **src_ptrs = ft_qp16_ptrs(
+			(struct cds_ft_qp16_node *) src_node, is_skip);
 	unsigned int src_idx = 0, new_idx = 0;
 	unsigned int b;
 
@@ -4441,18 +4453,18 @@ int ft_qp16_node_recompact_and_insert(struct cds_ft_qp16_node *new_node,
 			/* Insert here; src had no slot at this nibble. */
 			if (new_idx >= new_capacity)
 				return -ENOSPC;
-			new_node->ptrs[new_idx++] = child;
+			new_ptrs[new_idx++] = child;
 			new_bm |= (uint16_t) (1U << b);
 			continue;
 		}
 		if (!(src_bm & (uint16_t) (1U << b)))
 			continue;
-		p = src_node->ptrs[src_idx++];
+		p = src_ptrs[src_idx++];
 		if (!p)
 			continue;	/* tombstone: drop */
 		if (new_idx >= new_capacity)
 			return -ENOSPC;
-		new_node->ptrs[new_idx++] = p;
+		new_ptrs[new_idx++] = p;
 		new_bm |= (uint16_t) (1U << b);
 	}
 	new_node->bitmap = new_bm;
@@ -4814,7 +4826,7 @@ struct cds_ft_inode_flag *ft_qp_byte_get_ith_pos(
 static __attribute__((unused))
 int ft_qp_byte_clear(struct cds_ft *ft,
 		struct cds_ft_qp16_node *hi, struct cds_ft_metadata *hi_meta,
-		struct cds_ft_inode_flag **lo_slot, uint8_t byte)
+		struct cds_ft_inode_flag **lo_slot, uint8_t byte, bool is_skip)
 {
 	uint8_t hi_n = (uint8_t) (byte >> 4);
 	struct cds_ft_inode_flag **hi_slot;
@@ -4825,7 +4837,8 @@ int ft_qp_byte_clear(struct cds_ft *ft,
 	assert(*lo_slot != NULL);
 	rcu_assign_pointer(*lo_slot, NULL);
 
-	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0, false);
+	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0,
+			is_skip);
 	assert(lo_flag);
 	lo = (struct cds_ft_qp16_node *) lo_flag;
 	lo_meta = cds_ft_item_to_metadata(lo);
@@ -4869,10 +4882,10 @@ static __attribute__((unused))
 int ft_qp_byte_replace(struct cds_ft *ft,
 		struct cds_ft_qp16_node *hi, struct cds_ft_metadata *hi_meta,
 		struct cds_ft_inode_flag **lo_slot,
-		uint8_t byte, struct cds_ft_inode_flag *newptr)
+		uint8_t byte, struct cds_ft_inode_flag *newptr, bool is_skip)
 {
 	if (!newptr)
-		return ft_qp_byte_clear(ft, hi, hi_meta, lo_slot, byte);
+		return ft_qp_byte_clear(ft, hi, hi_meta, lo_slot, byte, is_skip);
 	assert(*lo_slot != NULL);
 	rcu_assign_pointer(*lo_slot, newptr);
 	return 0;
@@ -4924,7 +4937,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 		struct cds_ft_inode_flag *hi_flag,
 		struct cds_ft_qp16_node *hi, struct cds_ft_metadata *hi_meta,
 		uint8_t byte, struct cds_ft_inode_flag *child,
-		unsigned int hi_capacity)
+		unsigned int hi_capacity, bool is_skip)
 {
 	uint8_t hi_n = (uint8_t) (byte >> 4);
 	uint8_t lo_n = (uint8_t) (byte & 0xFU);
@@ -4934,7 +4947,8 @@ int ft_qp_byte_set(struct cds_ft *ft,
 	struct cds_ft_metadata *lo_meta;
 	int ret;
 
-	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0, false);
+	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0,
+			is_skip);
 
 	if (!lo_flag) {
 		/* Path 1: lo-node missing — lazy alloc + install in hi. */
@@ -4961,7 +4975,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 		 */
 		ret = ft_qp16_node_set_nth_safe(hi, hi_n,
 				(struct cds_ft_inode_flag *) new_lo,
-				hi_capacity);
+				hi_capacity, is_skip);
 		if (ret < 0) {
 			ft_qp16_node_free_unpublished(ft, new_lo);
 			return ret;
@@ -5002,7 +5016,9 @@ int ft_qp_byte_set(struct cds_ft *ft,
 			existing = uatomic_load(&lo->ptrs[lo_idx], CMM_RELAXED);
 		}
 
-		ret = ft_qp16_node_set_nth_safe(lo, lo_n, child, lo_capacity);
+		/* LO is always direct: never a SKIP target. */
+		ret = ft_qp16_node_set_nth_safe(lo, lo_n, child, lo_capacity,
+				false);
 		if (ret == 0) {
 			unsigned int lo_idx_after;
 			uint16_t lo_bm_after =
@@ -5043,8 +5059,9 @@ int ft_qp_byte_set(struct cds_ft *ft,
 					&new_lo_meta);
 			if (!new_lo)
 				return -ENOMEM;
+			/* LO is always direct: never a SKIP target. */
 			ret = ft_qp16_node_recompact_and_insert(new_lo, lo,
-					lo_n, child, new_capacity);
+					lo_n, child, new_capacity, false);
 			if (ret < 0) {
 				ft_qp16_node_free_unpublished(ft, new_lo);
 				return ret;
@@ -5526,7 +5543,8 @@ int _ft_node_set_nth(struct cds_ft *ft,
 				(struct cds_ft_qp16_node *) node, metadata,
 				n, child_node_flag,
 				ft_qp16_capacity_from_order(
-					(unsigned int) cds_ft_item_order(node)));
+					(unsigned int) cds_ft_item_order(node)),
+				false);
 		break;
 	case FT_NULL:
 		return -ENOSPC;
@@ -5607,7 +5625,7 @@ int _ft_node_replace_ptr(struct cds_ft *ft __attribute__((unused)),
 	case FT_QP:
 		ret = ft_qp_byte_replace(ft,
 				(struct cds_ft_qp16_node *) node, metadata,
-				node_flag_ptr, n, newptr);
+				node_flag_ptr, n, newptr, false);
 		break;
 	case FT_NULL:
 		return -ENOENT;
