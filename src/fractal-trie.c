@@ -6119,6 +6119,31 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 		new_type_index = find_nearest_type_index(old_type_index,
 			metadata->nr_child + 1, false, is_skip);
+		/*
+		 * POPCOUNT_X -> QP escalation under ADD_SAME (e.g. POPCOUNT
+		 * skip overshoot triggering a class jump on -ERANGE rebuild):
+		 * the QP must be allocated at a tier whose structural hi-bucket
+		 * capacity admits the worst-case byte distribution (each byte
+		 * in a distinct hi-nibble).  Worst-case popcount(hi_bm) =
+		 * nr_child + 1.  ft_types[FT_QP_INDEX].order (T0, hi-cap 3) is
+		 * too small for nr_child >= 3.  Same logic as the ADD_NEXT arm
+		 * below — without this override, _ft_node_set_nth in the COPY
+		 * phase returns -ENOSPC partway through and recompact silently
+		 * drops children (under -DNDEBUG) or asserts (under -DDEBUG).
+		 */
+		if (new_type_index == FT_QP_INDEX
+		    && old_type->type_class == FT_POPCOUNT) {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			new_alloc_order = is_skip
+				? ft_qp16_alloc_order_skip(
+						metadata->nr_child + 1)
+				: ft_qp16_alloc_order(
+						metadata->nr_child + 1);
+#else
+			new_alloc_order = ft_qp16_alloc_order(
+					metadata->nr_child + 1);
+#endif
+		}
 		dbg_printf("Recompact for node with %u children\n",
 			metadata->nr_child + 1);
 		break;
