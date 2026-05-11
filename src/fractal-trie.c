@@ -1856,6 +1856,15 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 		size_t copy_len = len < FT_QP16_SUBKEY_INLINE_LEN
 				? len : FT_QP16_SUBKEY_INLINE_LEN;
 
+		/*
+		 * Caller-side invariant: @qp must be a HI in skip-variant
+		 * layout (ptrs at byte 16).  Writing skip-meta on a direct-
+		 * layout QP would overlay ptrs[0] with subkey bytes.  Keep a
+		 * cheap assert under -DDEBUG to catch regressions of the
+		 * publish/recompact contract.
+		 */
+		assert(!cds_ft_item_to_metadata(qp)->is_lo);
+		assert(cds_ft_item_to_metadata(qp)->is_skip);
 		if (copy_len)
 			memcpy(meta->subkey, cn->key_bytes, copy_len);
 		meta->skip_len = (uint8_t) len;
@@ -6013,7 +6022,32 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * (the bit is meaningless there) and for fresh allocations.
 	 */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * Authoritative "is a SKIP_X target" signal for the old node:
+	 * metadata->is_skip alone is not enough — the POPCOUNT_32/64
+	 * overshoot case (nr_child > MAX_LC_SKIP) publishes the upstream
+	 * SKIP_X without setting is_skip (no slot-0 cache fits).  Cross-
+	 * reference the parent slot's tag so the recompact preserves the
+	 * skip-target property across type transitions, in particular
+	 * POPCOUNT_X → QP, where the new QP must be allocated in skip-
+	 * variant layout to receive the skip-meta written by the
+	 * upstream-SKIP_X refresh below.
+	 */
 	bool is_skip = metadata && metadata->is_skip;
+	if (!is_skip && metadata && metadata->parent
+	    && ft_node_compressed_in_node(metadata->parent)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(metadata->parent);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) cn);
+		struct cds_ft_inode_flag **skip_slot =
+			ft_get_skip_slot(cn_meta, ft);
+
+		if (skip_slot &&
+		    ft_node_skip_compressed_in_slot(*skip_slot))
+			is_skip = true;
+	}
 #else
 	bool is_skip = false;
 #endif
@@ -6121,9 +6155,26 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * for any source with nr_child >= 3.
 			 */
 			if (new_type_index == FT_QP_INDEX
-			    && old_type->type_class == FT_POPCOUNT)
+			    && old_type->type_class == FT_POPCOUNT) {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * When the upstream slot is SKIP_X, the new QP
+				 * must be in skip-variant layout (ptrs at byte
+				 * 16) so the upstream-SKIP_X refresh below can
+				 * safely write skip-meta into the overlay.
+				 * Capacity drops by one in the skip variant —
+				 * ft_qp16_alloc_order_skip accounts for this.
+				 */
+				new_alloc_order = is_skip
+					? ft_qp16_alloc_order_skip(
+							metadata->nr_child + 1)
+					: ft_qp16_alloc_order(
+							metadata->nr_child + 1);
+#else
 				new_alloc_order = ft_qp16_alloc_order(
 						metadata->nr_child + 1);
+#endif
+			}
 			dbg_printf("Recompact for node with %u children\n",
 				metadata->nr_child + 1);
 		}
@@ -6225,13 +6276,51 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * ft_publish_compressed, the bit gets re-set with a
 			 * fresh slot-0 skip_meta.
 			 */
-			new_metadata->is_skip =
-				(mode != FT_RECOMPACT_REPARENT
-				 && new_type_index != NODE_INDEX_NULL
-				 && (new_type->type_class == FT_POPCOUNT
-				     || new_type->type_class == FT_QP))
-				? metadata->is_skip
-				: 0;
+			/*
+			 * is_skip has type-specific semantics:
+			 *
+			 *   POPCOUNT: "slot 0 of the node body holds the
+			 *             cached subkey (ft_pc32_skip_meta)".
+			 *             Set iff old had it AND nr_child still
+			 *             fits MAX_LC_SKIP.  In the overshoot
+			 *             case (nr_child > MAX_LC_SKIP) the
+			 *             SKIP_X wrapper is still published but
+			 *             slot 0 carries a live ptr → is_skip
+			 *             stays 0; the cache is not propagated.
+			 *
+			 *   QP:       "node body is in skip-variant layout
+			 *             (ptrs at byte 16, 13B cached subkey
+			 *             at bytes 3-15)".  Required whenever
+			 *             the upstream slot publishes SKIP_QP.
+			 *             The recompact alloc-order picker above
+			 *             chose ft_qp16_alloc_order_skip when
+			 *             upstream is SKIP_X so the body is in
+			 *             skip layout — record that in is_skip
+			 *             so the subsequent SKIP_QP refresh
+			 *             (ft_skip_compressed_flag) writes into
+			 *             the overlay region rather than ptrs[0].
+			 *
+			 * REPARENT clones a node to a new context whose
+			 * parent may not be a SKIP_X-publishing CN, so the
+			 * inherited skip-target marker would falsely persist.
+			 * Clear unconditionally for REPARENT.
+			 */
+			if (mode == FT_RECOMPACT_REPARENT
+			    || new_type_index == NODE_INDEX_NULL) {
+				new_metadata->is_skip = 0;
+			} else if (new_type->type_class == FT_QP) {
+				/*
+				 * Force is_skip = 1 when upstream is SKIP_X,
+				 * even if the old node was a POPCOUNT overshoot
+				 * (is_skip = 0) — the new QP body was allocated
+				 * in skip-variant layout for exactly this case.
+				 */
+				new_metadata->is_skip = is_skip;
+			} else if (new_type->type_class == FT_POPCOUNT) {
+				new_metadata->is_skip = metadata->is_skip;
+			} else {
+				new_metadata->is_skip = 0;
+			}
 			/*
 			 * Copy the cached subkey (slot 0) when both old and
 			 * new are FT_POPCOUNT in skip mode.  The COPY phase
