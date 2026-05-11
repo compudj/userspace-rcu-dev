@@ -3914,7 +3914,7 @@ struct cds_ft_inode_flag *ft_qp16_node_descend(
 		struct cds_ft_qp16_node *node,
 		struct cds_ft_inode_flag ***ptr_slot_p,
 		uint8_t nibble, enum ft_pf_target pf_hint,
-		int is_lo_nibble)
+		int is_lo_nibble, bool is_skip)
 {
 	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	uint16_t bit = (uint16_t) (1U << (nibble & 0xFU));
@@ -3928,7 +3928,7 @@ struct cds_ft_inode_flag *ft_qp16_node_descend(
 	}
 	idx = (unsigned int) __builtin_popcount(
 			(unsigned int) (bm & (bit - 1U)));
-	slot = &node->ptrs[idx];
+	slot = &ft_qp16_ptrs(node, is_skip)[idx];
 	if (caa_unlikely(ptr_slot_p))
 		*ptr_slot_p = slot;
 	if (is_lo_nibble) {
@@ -4153,7 +4153,7 @@ struct cds_ft_inode_flag *ft_qp16_node_get_direction(
 static inline_lookup
 struct cds_ft_inode_flag *ft_qp16_node_get_ith_pos(
 		struct cds_ft_qp16_node *node,
-		unsigned int i, uint8_t *result_nibble)
+		unsigned int i, uint8_t *result_nibble, bool is_skip)
 {
 	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	unsigned int j, count = 0, matched = 16U;
@@ -4170,7 +4170,7 @@ struct cds_ft_inode_flag *ft_qp16_node_get_ith_pos(
 	if (matched == 16U)
 		return NULL;
 	*result_nibble = (uint8_t) matched;
-	return ft_dereference_acquire(node->ptrs[i]);
+	return ft_dereference_acquire(ft_qp16_ptrs(node, is_skip)[i]);
 }
 
 /*
@@ -4185,7 +4185,7 @@ struct cds_ft_inode_flag *ft_qp16_node_get_ith_pos(
 static inline_lookup
 struct cds_ft_inode_flag *ft_qp16_node_get_extremum(
 		struct cds_ft_qp16_node *node,
-		uint8_t *result_nibble, enum ft_direction dir)
+		uint8_t *result_nibble, enum ft_direction dir, bool is_skip)
 {
 	uint16_t bm = uatomic_load(&node->bitmap, CMM_RELAXED);
 	unsigned int matched_bit;
@@ -4195,14 +4195,14 @@ struct cds_ft_inode_flag *ft_qp16_node_get_extremum(
 	if (dir == FT_LEFT) {
 		matched_bit = (unsigned int) __builtin_ctz((unsigned int) bm);
 		*result_nibble = (uint8_t) matched_bit;
-		return ft_dereference_acquire(node->ptrs[0]);
+		return ft_dereference_acquire(ft_qp16_ptrs(node, is_skip)[0]);
 	}
 	matched_bit = 31U - (unsigned int) __builtin_clz((unsigned int) bm);
 	*result_nibble = (uint8_t) matched_bit;
 	{
 		unsigned int idx = (unsigned int) __builtin_popcount(
 				(unsigned int) bm) - 1U;
-		return ft_dereference_acquire(node->ptrs[idx]);
+		return ft_dereference_acquire(ft_qp16_ptrs(node, is_skip)[idx]);
 	}
 }
 
@@ -4556,21 +4556,25 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_qp_byte_get(
 		struct cds_ft_qp16_node *hi,
 		struct cds_ft_inode_flag ***ptr_slot_p,
-		uint8_t byte, enum ft_pf_target pf_hint)
+		uint8_t byte, enum ft_pf_target pf_hint, bool is_skip)
 {
 	struct cds_ft_inode_flag *lo_flag;
 	struct cds_ft_qp16_node *lo;
 
 	lo_flag = ft_qp16_node_descend(hi, NULL,
-			(uint8_t) (byte >> 4), FT_PF_NONE, 0);
+			(uint8_t) (byte >> 4), FT_PF_NONE, 0, is_skip);
 	if (caa_unlikely(!lo_flag)) {
 		if (caa_unlikely(ptr_slot_p))
 			*ptr_slot_p = NULL;
 		return NULL;
 	}
 	lo = (struct cds_ft_qp16_node *) lo_flag;
+	/*
+	 * LO is always direct: it is reached only via HI byte-step, never
+	 * as a SKIP target.  Pass false unconditionally.
+	 */
 	return ft_qp16_node_descend(lo, ptr_slot_p,
-			(uint8_t) (byte & 0xFU), pf_hint, 1);
+			(uint8_t) (byte & 0xFU), pf_hint, 1, false);
 }
 
 /*
@@ -4596,7 +4600,7 @@ struct cds_ft_inode_flag *ft_qp_byte_get(
 static inline_lookup
 struct cds_ft_inode_flag *ft_qp_byte_get_direction(
 		struct cds_ft_qp16_node *hi, int byte_in,
-		uint8_t *byte_out, enum ft_direction dir)
+		uint8_t *byte_out, enum ft_direction dir, bool is_skip)
 {
 	uint16_t hi_bm = uatomic_load(&hi->bitmap, CMM_RELAXED);
 	int hi_n_start, lo_n_start;
@@ -4632,7 +4636,8 @@ struct cds_ft_inode_flag *ft_qp_byte_get_direction(
 			continue;
 		hi_idx = (unsigned int) __builtin_popcount(
 				(unsigned int) (hi_bm & (hi_bit - 1U)));
-		lo_flag = ft_dereference_acquire(hi->ptrs[hi_idx]);
+		lo_flag = ft_dereference_acquire(
+				ft_qp16_ptrs(hi, is_skip)[hi_idx]);
 		if (!lo_flag)
 			continue;
 		lo = (struct cds_ft_qp16_node *) lo_flag;
@@ -4694,12 +4699,14 @@ struct cds_ft_inode_flag *ft_qp_byte_get_direction(
 static inline_lookup
 struct cds_ft_inode_flag *ft_qp_byte_get_extremum(
 		struct cds_ft_qp16_node *hi,
-		uint8_t *byte_out, enum ft_direction dir)
+		uint8_t *byte_out, enum ft_direction dir, bool is_skip)
 {
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 	if (dir == FT_LEFT)
-		return ft_qp_byte_get_direction(hi, -1, byte_out, FT_RIGHT);
-	return ft_qp_byte_get_direction(hi, FT_ENTRY_PER_NODE, byte_out, FT_LEFT);
+		return ft_qp_byte_get_direction(hi, -1, byte_out, FT_RIGHT,
+				is_skip);
+	return ft_qp_byte_get_direction(hi, FT_ENTRY_PER_NODE, byte_out,
+			FT_LEFT, is_skip);
 }
 
 /*
@@ -4722,7 +4729,7 @@ struct cds_ft_inode_flag *ft_qp_byte_get_extremum(
 static inline_lookup
 struct cds_ft_inode_flag *ft_qp_byte_get_ith_pos(
 		struct cds_ft_qp16_node *hi, unsigned int i,
-		uint8_t *byte_out)
+		uint8_t *byte_out, bool is_skip)
 {
 	uint16_t hi_bm = uatomic_load(&hi->bitmap, CMM_RELAXED);
 	unsigned int count = 0;
@@ -4740,7 +4747,8 @@ struct cds_ft_inode_flag *ft_qp_byte_get_ith_pos(
 			continue;
 		hi_idx = (unsigned int) __builtin_popcount(
 				(unsigned int) (hi_bm & (hi_bit - 1U)));
-		lo_flag = ft_dereference_acquire(hi->ptrs[hi_idx]);
+		lo_flag = ft_dereference_acquire(
+				ft_qp16_ptrs(hi, is_skip)[hi_idx]);
 		if (!lo_flag)
 			continue;
 		lo = (struct cds_ft_qp16_node *) lo_flag;
@@ -4817,7 +4825,7 @@ int ft_qp_byte_clear(struct cds_ft *ft,
 	assert(*lo_slot != NULL);
 	rcu_assign_pointer(*lo_slot, NULL);
 
-	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0);
+	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0, false);
 	assert(lo_flag);
 	lo = (struct cds_ft_qp16_node *) lo_flag;
 	lo_meta = cds_ft_item_to_metadata(lo);
@@ -4926,7 +4934,7 @@ int ft_qp_byte_set(struct cds_ft *ft,
 	struct cds_ft_metadata *lo_meta;
 	int ret;
 
-	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0);
+	lo_flag = ft_qp16_node_descend(hi, &hi_slot, hi_n, FT_PF_NONE, 0, false);
 
 	if (!lo_flag) {
 		/* Path 1: lo-node missing — lazy alloc + install in hi. */
@@ -5145,7 +5153,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		return ft_qp_byte_get(
 				(struct cds_ft_qp16_node *)
 				((unsigned long) node_flag - FT_KIND_QP),
-				node_flag_ptr, n, pf_hint);
+				node_flag_ptr, n, pf_hint, false);
 	if ((v & 0x08UL) != 0)
 		return ft_pc32_node_get_nth_skip(
 				(struct ft_pc32_node *)
@@ -5355,7 +5363,7 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	case FT_QP:
 		child = ft_qp_byte_get_direction(
 				(struct cds_ft_qp16_node *) node,
-				n, result_key, dir);
+				n, result_key, dir, false);
 		break;
 	case FT_POPCOUNT:
 		if (type_index == FT_POPCOUNT_64_INDEX)
@@ -7148,7 +7156,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 			iter_key = *(key++);
 			node_flag = ft_qp_byte_get(qp, NULL, iter_key,
-					FT_PF_DATA);
+					FT_PF_DATA, false);
 			if (caa_unlikely(!node_flag)) {
 				status = CDS_FT_STATUS_NOT_FOUND;
 				goto end;
