@@ -5370,7 +5370,6 @@ int ft_nibble_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 
 		slot1 = (unsigned int) __builtin_popcount(root & ((1U << hi) - 1U));
 		p = (slot1 << 3) | lo;
-		assert(!((bms >> p) & 1ULL));   /* duplicate would be a bug */
 
 		if (!((root >> hi) & 1U)) {
 			/* New hi: shift packed_bms bytes [slot1..) up by one byte. */
@@ -5383,6 +5382,7 @@ int ft_nibble_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 			root |= (1U << hi);
 		} else {
 			/* Existing hi: OR new lo bit into byte at slot1 position. */
+			assert(!((bms >> p) & 1ULL));	/* duplicate would be a bug */
 			bms |= ((uint64_t)(1U << lo)) << (slot1 * 8);
 		}
 
@@ -5422,7 +5422,6 @@ int ft_nibble_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 		slot1 = (unsigned int) __builtin_popcountll(
 				root & ((1ULL << hi) - 1ULL));
 		p = (slot1 << 2) | lo;
-		assert(!((bms >> p) & 1ULL));   /* duplicate would be a bug */
 
 		if (!((root >> hi) & 1ULL)) {
 			/* New hi: shift packed_bms nibbles [slot1..) up by one nibble (4 bits). */
@@ -5435,6 +5434,7 @@ int ft_nibble_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 			root |= 1ULL << hi;
 		} else {
 			/* Existing hi: OR new lo bit into slot1's nibble. */
+			assert(!((bms >> p) & 1ULL));	/* duplicate would be a bug */
 			bms |= ((uint64_t)(1U << lo)) << (slot1 * 4);
 		}
 
