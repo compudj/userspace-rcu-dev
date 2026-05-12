@@ -5063,11 +5063,13 @@ struct cds_ft_inode_flag **ft_nibble_popcount_2l_pointers(
 	unsigned int byte_offset;
 
 	/*
-	 * Flat scan_6 / scan_14 layouts reserve 4 B of padding between
-	 * the header and the pointer table on both arches (for the
-	 * popcount cache byte at [14] in scan_6, and natural u64
-	 * alignment in scan_14).  Hardcode the ptr offset at 16 so the
-	 * scanners' hardcoded ptr+16 access matches on 32-bit too.
+	 * Flat scan_6 (12 B header) and scan_14 (16 B header) scanners
+	 * hardcode the ptr table at node+16 -- the 4 B padding region
+	 * between scan_6's 12 B header and the ptr table is natural
+	 * u64 alignment slack on 64-bit, and is preserved on 32-bit so
+	 * the same scanner code works for both arches.  scan_13
+	 * (max_lc=13, 32-bit only) is the denser variant that drops
+	 * the padding and uses ptr offset 12; it has its own scanner.
 	 */
 	if (max_lc == 6 || max_lc == 12 || max_lc == 14 || max_lc == 28)
 		byte_offset = 16;
@@ -5449,23 +5451,6 @@ struct cds_ft_inode_flag *ft_nibble_popcount_2l_node_get_direction(
 }
 
 /*
- * Refresh the popcount cache byte carried by scan_6 (the 5+3 flat
- * layout uses byte [14] to skip a popcount during lookups).  Other
- * scan variants either compute the prefix popcount inline (scan_14
- * uses BMI2 BZHI+POPCNT on a single u64 packed_bms) or have no room
- * for a cache (scan_3).
- */
-static inline_lookup
-void ft_nibble_popcount_2l_refresh_cache(struct cds_ft_inode *node,
-		unsigned int max_lc)
-{
-	if (max_lc == 6 || max_lc == 12) {
-		uint64_t subs_lo = *(const uint64_t *) &node->data[2];
-		node->data[14] = (uint8_t) __builtin_popcountll(subs_lo);
-	}
-}
-
-/*
  * Insert (n, child_node_flag) into a freshly-allocated, unpublished
  * QP node.  Called only from the recompact path: the new node is
  * not yet wired into the trie, so direct in-place mutation (shifts
@@ -5610,7 +5595,6 @@ int ft_nibble_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 		hdr->sub_bm[0] = (uint16_t) (1U << lo);
 		pointers[0] = child_node_flag;
 		metadata->nr_child++;
-		ft_nibble_popcount_2l_refresh_cache(node, max_lc);
 		return 0;
 	}
 
@@ -5651,7 +5635,6 @@ int ft_nibble_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 
 	hdr->sub_bm[slot1] = (uint16_t) (sub | (1U << lo));
 	metadata->nr_child++;
-	ft_nibble_popcount_2l_refresh_cache(node, max_lc);
 	return 0;
 	}
 }
@@ -6916,16 +6899,6 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 			uatomic_store(&qp_hdr->sub_bm[qp_slot1],
 					(uint16_t) (qp_sub | (1U << qp_lo)),
 					CMM_RELAXED);
-			/*
-			 * Refresh popcount cache after the sub_bm store.
-			 * Stale-cache window (bit set, cache not yet
-			 * updated) is safe: lookups for the new key (the
-			 * highest p in safe-append) compute prior from
-			 * the OLD cumulative cache which still matches
-			 * the pre-insert pointers[] layout.
-			 */
-			ft_nibble_popcount_2l_refresh_cache(node,
-					type->max_linear_child);
 			metadata->nr_child++;
 			if (_replace_old_ptr)
 				*_replace_old_ptr = false;
@@ -6953,9 +6926,6 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 		uatomic_store(&qp_hdr->root_bm,
 				(uint16_t) (qp_root | (1U << qp_hi)),
 				CMM_RELAXED);
-		/* Refresh popcount cache.  See Case 2A above for ordering. */
-		ft_nibble_popcount_2l_refresh_cache(node,
-				type->max_linear_child);
 		metadata->nr_child++;
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
