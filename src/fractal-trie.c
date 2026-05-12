@@ -260,13 +260,17 @@ enum {
 	ft_type_0_max_child = 3,
 #ifdef FEATURE_FT_POPCOUNT_NODE
 	/*
-	 * scan_3 stays at max_lc=3 (8 B header packs root_bm + 3
-	 * sub_bm exactly; cannot grow without a new scanner shape).
-	 * scan_6 / scan_14 layouts are header-fixed; 32-bit ptrs let
-	 * the ptr table fit max_lc=12 in 64 B and max_lc=28 in 128 B.
+	 * 32-bit-specialised flat-layout scanners use ptr offset
+	 * FT_ALIGN(header_bytes, 4) instead of the 64-bit-aligned +16,
+	 * recovering one or more ptr slots per node compared to the
+	 * 64-bit layout values.
+	 *
+	 *   scan_5  (order-5, 32 B): 12 B hdr + 5 x 4 B ptrs = 32 B
+	 *   scan_13 (order-6, 64 B): 12 B hdr + 13 x 4 B ptrs = 64 B
+	 *   scan_14 (order-7, 128 B): 16 B hdr + 28 x 4 B ptrs = 128 B
 	 */
-	ft_type_1_max_child = 3,
-	ft_type_2_max_child = 12,
+	ft_type_1_max_child = 5,
+	ft_type_2_max_child = 13,
 	ft_type_3_max_child = 28,
 	/*
 	 * byte_popcount_1l: 32 B bitmap header is fixed, so the
@@ -289,8 +293,8 @@ enum {
 enum {
 	ft_type_0_max_linear_child = 3,
 #ifdef FEATURE_FT_POPCOUNT_NODE
-	ft_type_1_max_linear_child = 3,
-	ft_type_2_max_linear_child = 12,
+	ft_type_1_max_linear_child = 5,
+	ft_type_2_max_linear_child = 13,
 	ft_type_3_max_linear_child = 28,
 #else
 	ft_type_1_max_linear_child = 6,
@@ -4774,7 +4778,17 @@ struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_3(
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint);
 static inline_lookup
+struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_5(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint);
+static inline_lookup
 struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_6(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint);
+static inline_lookup
+struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_13(
 		struct cds_ft_inode *node,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint);
@@ -4855,18 +4869,35 @@ struct cds_ft_inode_flag *ft_popcount_node_get_nth(const struct cds_ft_type *typ
 	assert(ft_type_is_popcount(type->type_class));
 	if (type->nibble_popcount_2l) {
 		/*
-		 * Dispatch by max_lc to the layout-matching scanner.  The
-		 * canonical values are 3 (scan_3 layout) on both 32- and
-		 * 64-bit, 6 (scan_6 layout) on 64-bit, 12 (scan_6 layout) on
-		 * 32-bit, 14 (scan_14 layout) on 64-bit, and 28 (scan_14
-		 * layout) on 32-bit.  scan_6 / scan_14 layouts are pointer-
-		 * size agnostic; only the per-node ptr-table capacity differs.
+		 * Dispatch by max_lc to the layout-matching scanner.
+		 *
+		 * Scanners and their layouts:
+		 *   max_lc=3   scan_3   generic 2L hdr 8 B, ptr@8 (both arches)
+		 *   max_lc=5   scan_5   generic 2L hdr 12 B, ptr@12 (32-bit only)
+		 *   max_lc=6   scan_6   flat 5+3 hdr 12 B + 4 B pad, ptr@16 (64-bit)
+		 *   max_lc=12  scan_6   same flat 5+3 layout (32-bit, max_lc bumped)
+		 *   max_lc=13  scan_13  flat 5+3 hdr 12 B, ptr@12 (32-bit only,
+		 *                       drops the 4 B pad for one extra ptr slot)
+		 *   max_lc=14  scan_14  flat 6+2 hdr 16 B, ptr@16 (64-bit)
+		 *   max_lc=28  scan_14  same flat 6+2 layout (32-bit, max_lc bumped)
 		 */
-		if (max_lc <= 3)
+		switch (max_lc) {
+		case 3:
 			return ft_nibble_popcount_2l_scan_3(node, node_flag_ptr, n, pf_hint);
-		if (max_lc <= 12)
+		case 5:
+			return ft_nibble_popcount_2l_scan_5(node, node_flag_ptr, n, pf_hint);
+		case 6:
+		case 12:
 			return ft_nibble_popcount_2l_scan_6(node, node_flag_ptr, n, pf_hint);
-		return ft_nibble_popcount_2l_scan_14(node, node_flag_ptr, n, pf_hint);
+		case 13:
+			return ft_nibble_popcount_2l_scan_13(node, node_flag_ptr, n, pf_hint);
+		case 14:
+		case 28:
+			return ft_nibble_popcount_2l_scan_14(node, node_flag_ptr, n, pf_hint);
+		default:
+			assert(0);
+			return NULL;
+		}
 	}
 	assert(type->byte_popcount_1l);
 	return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
@@ -5048,7 +5079,7 @@ struct ft_nibble_popcount_2l_header {
 static inline_lookup
 unsigned int ft_nibble_popcount_2l_header_bytes(unsigned int max_lc)
 {
-	if (max_lc == 6 || max_lc == 12)
+	if (max_lc == 6 || max_lc == 12 || max_lc == 13)
 		return 12;	/* 5+3 split: 4B root + 8B packed_bms */
 	if (max_lc == 14 || max_lc == 28)
 		return 16;	/* 6+2 FLAT: 8B root + 8B packed_bms */
@@ -5137,6 +5168,64 @@ not_found:
 }
 
 /*
+ * Lookup primitive: 2-level popcount, max_linear_child = 5 (32-bit only).
+ *
+ * Same generic 2L layout as scan_3, just two more slots:
+ *   [0..1]   root_bm
+ *   [2..11]  sub_bm[0..4]  (5 x 16-bit)
+ *   [12..31] 5 x 4-byte pointers
+ *
+ * 32-bit-native: 16-bit loads for root_bm and sub_bm[], 32-bit
+ * popcount.  No 64-bit ops on the hot path (which would compile to
+ * register-pair handling on i386).  The prefix sum runs a short
+ * loop of 0..4 iterations over sub_bm[0..slot1-1]; the compiler can
+ * predict / unroll given the bounded count.
+ *
+ * Trade-off vs scan_3 (max_lc=3): one variable-length prefix loop
+ * in exchange for max_lc 3 -> 5 (recovers the 12 B of trailing
+ * waste per 32 B node).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_5(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint)
+{
+	uint16_t root = *(const uint16_t *) &node->data[0];
+	const uint16_t *subs = (const uint16_t *) (node->data + 2);
+	unsigned int hi = (unsigned int) n >> 4;
+	unsigned int lo = (unsigned int) n & 0xFU;
+	unsigned int slot1, ptr_idx, k;
+	uint16_t sub;
+	struct cds_ft_inode_flag **pointers;
+
+	if (caa_unlikely(!((root >> hi) & 1U)))
+		goto not_found;
+
+	slot1 = (unsigned int) __builtin_popcount(
+			root & (uint16_t) ((1U << hi) - 1U));
+	sub = subs[slot1];
+
+	if (caa_unlikely(!((sub >> lo) & 1U)))
+		goto not_found;
+
+	ptr_idx = (unsigned int) __builtin_popcount(
+			sub & (uint16_t) ((1U << lo) - 1U));
+	for (k = 0; k < slot1; k++)
+		ptr_idx += (unsigned int) __builtin_popcount(subs[k]);
+
+	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 12);
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = &pointers[ptr_idx];
+	return ft_dereference_acquire_prefetch_hint(pointers[ptr_idx], pf_hint);
+
+not_found:
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+}
+
+/*
  * Lookup primitive: per-slot flat popcount with 5+3 byte split,
  * max_linear_child = 6.
  *
@@ -5187,6 +5276,54 @@ struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_6(
 			bms & ((1ULL << p) - 1ULL));
 
 	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 16);
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = &pointers[ptr_idx];
+	return ft_dereference_acquire_prefetch_hint(pointers[ptr_idx], pf_hint);
+
+not_found:
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+}
+
+/*
+ * Lookup primitive: flat 5+3 packed_bms layout, max_linear_child = 13
+ * (32-bit only).
+ *
+ * Identical scan_6 layout (12 B header: 4 B root_bm + 8 B packed_bms,
+ * 5+3 byte split) but pointer table starts at offset 12 instead of 16
+ * -- drops the 4 B alignment pad and reclaims one ptr slot in the
+ * 64 B order-6 node (max_lc 12 -> 13).  Only meaningful on 32-bit
+ * where ptrs are 4 B and (64 - 12) / 4 = 13 fits exactly.
+ *
+ * Algorithm is identical to scan_6 modulo the ptr base.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_13(
+		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint)
+{
+	uint32_t root = *(const uint32_t *) &node->data[0];
+	uint64_t bms  = *(const uint64_t *) &node->data[4];
+	unsigned int hi = (unsigned int) n >> 3;
+	unsigned int lo = (unsigned int) n & 0x7U;
+	unsigned int slot1, p, ptr_idx;
+	struct cds_ft_inode_flag **pointers;
+
+	if (caa_unlikely(!((root >> hi) & 1U)))
+		goto not_found;
+
+	slot1 = (unsigned int) __builtin_popcount(root & ((1U << hi) - 1U));
+	p = (slot1 << 3) | lo;
+
+	if (caa_unlikely(!((bms >> p) & 1ULL)))
+		goto not_found;
+
+	ptr_idx = (unsigned int) __builtin_popcountll(
+			bms & ((1ULL << p) - 1ULL));
+
+	pointers = (struct cds_ft_inode_flag **) ((uint8_t *) node + 12);
 	if (caa_unlikely(node_flag_ptr))
 		*node_flag_ptr = &pointers[ptr_idx];
 	return ft_dereference_acquire_prefetch_hint(pointers[ptr_idx], pf_hint);
@@ -5272,7 +5409,7 @@ uint8_t ft_nibble_popcount_2l_node_get_nr_child(const struct cds_ft_type *type,
 {
 	unsigned int max_lc = type->max_linear_child;
 
-	if (max_lc == 6 || max_lc == 12) {
+	if (max_lc == 6 || max_lc == 12 || max_lc == 13) {
 		/* Flat 5+3 layout: nr_child = popcount of packed_bms. */
 		uint64_t bms = *(const uint64_t *) &node->data[4];
 		return (uint8_t) __builtin_popcountll(bms);
@@ -5310,7 +5447,7 @@ void ft_nibble_popcount_2l_node_get_ith_pos(const struct cds_ft_type *type,
 	unsigned int max_lc = type->max_linear_child;
 	struct cds_ft_inode_flag **pointers = ft_nibble_popcount_2l_pointers(node, type);
 
-	if (max_lc == 6 || max_lc == 12) {
+	if (max_lc == 6 || max_lc == 12 || max_lc == 13) {
 		/* Flat 5+3 layout: find i-th set bit in packed_bms. */
 		uint32_t root = *(const uint32_t *) &node->data[0];
 		uint64_t bms  = *(const uint64_t *) &node->data[4];
@@ -5476,7 +5613,7 @@ int ft_nibble_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 	struct cds_ft_inode_flag **pointers = ft_nibble_popcount_2l_pointers(node, type);
 	unsigned int max_lc = type->max_linear_child;
 
-	if (max_lc == 6 || max_lc == 12) {
+	if (max_lc == 6 || max_lc == 12 || max_lc == 13) {
 		/* Flat 5+3 layout. */
 		unsigned int hi = (unsigned int) n >> 3;
 		unsigned int lo = (unsigned int) n & 0x7U;
@@ -6627,8 +6764,9 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 	assert(ft_type_is_popcount(type->type_class));
 
 	if (type->nibble_popcount_2l && (type->max_linear_child == 6
-				|| type->max_linear_child == 12)) {
-		/* Flat 5+3 layout (max_lc=6 on 64-bit, 12 on 32-bit). */
+				|| type->max_linear_child == 12
+				|| type->max_linear_child == 13)) {
+		/* Flat 5+3 layout (max_lc=6 on 64-bit, 12/13 on 32-bit). */
 		struct cds_ft_inode_flag **qp_pointers =
 			ft_nibble_popcount_2l_pointers(node, type);
 		unsigned int qp_hi = (unsigned int) n >> 3;
