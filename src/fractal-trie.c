@@ -5059,8 +5059,21 @@ static inline_lookup
 struct cds_ft_inode_flag **ft_nibble_popcount_2l_pointers(
 		struct cds_ft_inode *node, const struct cds_ft_type *type)
 {
-	unsigned int byte_offset = FT_ALIGN(
-			ft_nibble_popcount_2l_header_bytes(type->max_linear_child),
+	unsigned int max_lc = type->max_linear_child;
+	unsigned int byte_offset;
+
+	/*
+	 * Flat scan_6 / scan_14 layouts reserve 4 B of padding between
+	 * the header and the pointer table on both arches (for the
+	 * popcount cache byte at [14] in scan_6, and natural u64
+	 * alignment in scan_14).  Hardcode the ptr offset at 16 so the
+	 * scanners' hardcoded ptr+16 access matches on 32-bit too.
+	 */
+	if (max_lc == 6 || max_lc == 12 || max_lc == 14 || max_lc == 28)
+		byte_offset = 16;
+	else
+		byte_offset = FT_ALIGN(
+			ft_nibble_popcount_2l_header_bytes(max_lc),
 			sizeof(void *));
 	return (struct cds_ft_inode_flag **)
 		((uint8_t *) node + byte_offset);
