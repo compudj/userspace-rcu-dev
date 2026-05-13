@@ -287,6 +287,34 @@ enum ft_col_stride {
 #define FT_BITMAP_LEN			32
 
 /*
+ * On x86_64 / i386, warn loudly when popcount or BMI/BMI2 ISA flags
+ * are missing from the compile.  Several hot-path inlines silently
+ * fall back to software emulation when the compiler isn't told the
+ * target supports the native instruction:
+ *
+ *   - __builtin_popcount* on the popcount-node byte-step.
+ *   - bzhi-style masked popcount on the popcount_2l byte-step
+ *     (scan_6 / scan_16 / scan_32_8 / scan_64_4).
+ *   - Generic codegen on bit-manipulation helpers.
+ *
+ * The fallbacks cost roughly 10-20% on lookup throughput in our
+ * microbenches.  Override with -DCDS_FT_SUPPRESS_ISA_WARNING when
+ * intentionally building for a stripped-down target.
+ */
+#if !defined(CDS_FT_SUPPRESS_ISA_WARNING) && \
+		(defined(__x86_64__) || defined(__i386__))
+# if !defined(__POPCNT__)
+#  warning "Fractal trie: building for x86 without -mpopcnt; __builtin_popcount* will use a software fallback. Expect ~10-20% lookup-throughput regression. Add -mpopcnt or -march=native, or define CDS_FT_SUPPRESS_ISA_WARNING to silence."
+# endif
+# if !defined(__BMI__)
+#  warning "Fractal trie: building for x86 without -mbmi; bit-manipulation helpers will use generic codegen. Add -mbmi or -march=native, or define CDS_FT_SUPPRESS_ISA_WARNING to silence."
+# endif
+# if !defined(__BMI2__)
+#  warning "Fractal trie: building for x86 without -mbmi2; bzhi-style masked popcount on the popcount_2l byte-step degrades to a 5-insn fallback (~10% slower on the dns workload). Add -mbmi2 or -march=native, or define CDS_FT_SUPPRESS_ISA_WARNING to silence."
+# endif
+#endif
+
+/*
  * FEATURE_FT_COMPRESS: enable prefix compression (path compaction).
  * When enabled, chains of single-child internal nodes are replaced
  * with compressed path nodes.  Disabling compiles out all compressed
