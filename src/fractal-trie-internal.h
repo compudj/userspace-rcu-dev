@@ -325,9 +325,16 @@ enum ft_col_stride {
 #ifndef NO_FEATURE_FT_COMPRESS
 # define FEATURE_FT_COMPRESS
 #endif
-#ifndef NO_FEATURE_FT_COLLAPSE
-# define FEATURE_FT_COLLAPSE
-#endif
+/*
+ * FEATURE_FT_COLLAPSE retired (2026-05-13).  A/B benchmark showed
+ * lookup speed favored disabled collapse across 21/28 dataset×engine
+ * combinations, and mutation cost without collapse was 60-99% lower.
+ * The collapsed-node tier-and-stride machinery is being torn out in
+ * follow-up commits; this header gate is force-disabled in the
+ * interim so smoke continues to pass while the removal happens
+ * incrementally.  See task #28 (bench A/B) and commit log for
+ * details.
+ */
 
 /*
  * Skip-compressed pointers encode the compressed path length in the
