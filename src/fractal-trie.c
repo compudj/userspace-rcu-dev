@@ -6467,10 +6467,21 @@ int ft_node_set_nth(struct cds_ft *ft,
 		 * In-place insert succeeded on the published target node.
 		 * Safe to link child -> target via parent pointer now:
 		 * target is already fully valid to readers.
+		 *
+		 * Fetch the parent's child slot for both SKIP_X and plain
+		 * COMPRESSED children: ft_set_parent's compressed branches
+		 * use it to record skip_slot_offset, which chain-merge
+		 * canonicalization (ft_detach_node) recovers via
+		 * ft_get_skip_slot to publish the replacement at the same
+		 * slot.  Without it, plain-COMPRESSED children (the path
+		 * taken when CDS_FT_FLAG_SKIP_COMPRESSED is unset on the
+		 * group) leave skip_slot_offset == 0 — a latent gap that
+		 * trips chain-merge with parent-cn=plain-COMPRESSED.
 		 */
 		struct cds_ft_inode_flag **slot_ptr = NULL;
 
-		if (ft_node_skip_compressed(child_node_flag))
+		if (ft_node_skip_compressed(child_node_flag) ||
+		    ft_node_compressed(child_node_flag))
 			ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
 		ft_set_parent(child_node_flag, *node_flag, slot_ptr);
 		break;
@@ -15513,21 +15524,6 @@ int ft_detach_node(struct cds_ft *ft,
 			unsigned int child_len = child_cn ? child_cn->len : 0;
 			unsigned int merged_len = parent_len + 1 + child_len;
 
-			/*
-			 * Cases C/D require ft_get_skip_slot(parent_cn_meta)
-			 * to recover the grandparent slot that holds
-			 * parent_cn.  If parent_cn was published via a path
-			 * that left skip_slot_offset == 0 (a latent gap in
-			 * some compressed-creation paths not yet audited by
-			 * 29b6c9c9), we cannot publish the replacement —
-			 * leave the residue.  Subsequent inserts may rebuild
-			 * canonical form.
-			 */
-			if (parent_cn &&
-			    parent_cn_meta->parent != NULL &&
-			    ft_get_skip_slot(parent_cn_meta, ft) == NULL)
-				goto skip_chain_merge;
-
 			if (surviving_child && merged_len <= FT_SKIP_LEN_MAX) {
 				struct cds_ft_metadata *new_cn_meta;
 				struct cds_ft_compressed_node *new_cn =
@@ -15668,8 +15664,6 @@ int ft_detach_node(struct cds_ft *ft,
 				 * residue in place; subsequent inserts may
 				 * rebuild canonical form. */
 			}
-skip_chain_merge:
-			(void) 0;
 		}
 #endif
 	}
