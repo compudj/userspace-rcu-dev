@@ -246,15 +246,15 @@ enum {
 	 *   idx 1  scan_16_16_max_5  32 B  hdr 12 B +  5 x 4 B = 32 B exact
 	 *   idx 2  scan_64_4         64 B  hdr 16 B + 12 x 4 B = 64 B exact
 	 *                            (flat 6+2; node-size cap 12, bitmap cap 16)
-	 *   idx 3  scan_64_4        128 B  hdr 16 B + 16 x 4 B = 80 B used,
-	 *                            48 B trailing slack (flat 6+2 reused in
-	 *                            128 B; bitmap cap 16 is binding)
-	 *   idx 4  bp_1l            256 B  hdr 32 B + 56 x 4 B = 256 B exact
-	 *   idx 5  bp_1l            512 B  hdr 32 B + 120 x 4 B = 512 B exact
+	 *   idx 3  popcount_1l      128 B  hdr 32 B + 24 x 4 B = 128 B exact
+	 *                            (was scan_64_4 max_lc=16 with 48 B slack;
+	 *                            popcount_1l unlocks the full pointer table)
+	 *   idx 4  popcount_1l      256 B  hdr 32 B + 56 x 4 B = 256 B exact
+	 *   idx 5  popcount_1l      512 B  hdr 32 B + 120 x 4 B = 512 B exact
 	 */
 	ft_type_1_max_child = 5,
 	ft_type_2_max_child = 12,
-	ft_type_3_max_child = 16,
+	ft_type_3_max_child = 24,
 	ft_type_4_max_child = 56,
 	ft_type_5_max_child = 120,
 	ft_type_6_max_child = 256,
@@ -265,7 +265,6 @@ enum {
 	ft_type_0_max_linear_child = 3,
 	ft_type_1_max_linear_child = 5,
 	ft_type_2_max_linear_child = 12,
-	ft_type_3_max_linear_child = 16,
 };
 
 const struct cds_ft_type ft_types[] = {
@@ -283,14 +282,15 @@ const struct cds_ft_type ft_types[] = {
 		.max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP,
 	},
 	[3] = {
+		/* 32 B bitmap + 24 x 4 B ptrs = 128 B (order-7). */
 		.type_class = FT_POPCOUNT,
-		.popcount_2l = true,
-		.min_child = 5,
-		.max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP,
+		.popcount_1l = true,
+		.min_child = 7,
+		.max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_child, .order = 7, .bitmap = FT_NO_BITMAP,
 	},
 
 	/*
-	 * Indices 4 and 5 use popcount_1l (32 B bitmap + 4 B ptr
+	 * Indices 3, 4, and 5 use popcount_1l (32 B bitmap + 4 B ptr
 	 * table fills the node exactly).
 	 */
 	[4] = {
@@ -327,8 +327,8 @@ enum {
 	ft_type_2_max_child = 6,	/* scan_32_8 (per-slot 5+3, qp_6) */
 	ft_type_3_max_child = 14,	/* scan_64_4 (flat 6+2, qp_14) */
 	ft_type_4_max_child = 28,
-	ft_type_5_max_child = 54,
-	ft_type_6_max_child = 104,
+	ft_type_5_max_child = 60,
+	ft_type_6_max_child = 124,
 	ft_type_7_max_child = 256,
 	ft_type_8_max_child = 256,
 };
@@ -4424,10 +4424,6 @@ struct cds_ft_inode_flag *ft_popcount_node_get_nth(const struct cds_ft_type *typ
 		 *                                Slot cap = 16.
 		 *   max_lc=14  scan_64_4         flat 6+2, 64-bit only.
 		 *                                Slot cap = 16.
-		 *   max_lc=16  scan_64_4         flat 6+2 reused in 128 B
-		 *                                order-7 node (32-bit). Bitmap
-		 *                                cap 16 is binding; 48 B
-		 *                                trailing slack.
 		 */
 		switch (max_lc) {
 		case 3:
@@ -4438,7 +4434,6 @@ struct cds_ft_inode_flag *ft_popcount_node_get_nth(const struct cds_ft_type *typ
 			return ft_popcount_2l_scan_32_8(node, node_flag_ptr, n, pf_hint);
 		case 12:
 		case 14:
-		case 16:
 			return ft_popcount_2l_scan_64_4(node, node_flag_ptr, n, pf_hint);
 		default:
 			assert(0);
