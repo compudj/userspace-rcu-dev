@@ -112,7 +112,6 @@ LTTNG_UST_TRACEPOINT_ENUM(cds_ft, ft_tp_node_kind,
 		lttng_ust_field_enum_value("NULL",		FT_TP_NODE_NULL)
 		lttng_ust_field_enum_value("EXTERNAL",		FT_TP_NODE_EXTERNAL)
 		lttng_ust_field_enum_value("COMPRESSED",	FT_TP_NODE_COMPRESSED)
-		lttng_ust_field_enum_value("COLLAPSED",		FT_TP_NODE_COLLAPSED)
 		lttng_ust_field_enum_value("P1L_128",		FT_TP_NODE_P1L_128)
 		lttng_ust_field_enum_value("P2L_32",		FT_TP_NODE_P2L_32)
 		lttng_ust_field_enum_value("P2L_64",		FT_TP_NODE_P2L_64)
@@ -243,10 +242,6 @@ LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_node_event_class, cds_ft,
 	compressed_free,
 	LTTNG_UST_TP_ARGS(const void *, node))
 
-LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_node_event_class, cds_ft,
-	collapsed_free,
-	LTTNG_UST_TP_ARGS(const void *, node))
-
 /*
  * Lifecycle events that bind ft to its group.  A trace consumer uses
  * group_create + ft_create to build an ft -> group map, then filters
@@ -331,45 +326,6 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, root_publish,
  * `dead` is 0 for a live entry (install / update) and non-zero
  * for an entry being logically removed.
  */
-LTTNG_UST_TRACEPOINT_EVENT(cds_ft, collapsed_entry,
-	LTTNG_UST_TP_ARGS(
-		const void *, col,
-		unsigned int, entry_idx,
-		const uint8_t *, suffix,
-		unsigned int, suffix_len,
-		const void *, child,
-		uint8_t, dead
-	),
-	LTTNG_UST_TP_FIELDS(
-		lttng_ust_field_integer_hex(uintptr_t, col, (uintptr_t) col)
-		lttng_ust_field_integer(unsigned int, entry_idx, entry_idx)
-		lttng_ust_field_sequence_hex(uint8_t, suffix, suffix,
-			unsigned int, suffix_len)
-		lttng_ust_field_integer_hex(uintptr_t, child, (uintptr_t) child)
-		lttng_ust_field_enum(cds_ft, ft_tp_node_kind, uint16_t, child_kind,
-			ft_tp_node_kind((struct cds_ft_inode_flag *) child))
-		lttng_ust_field_integer(uint8_t, dead, dead)
-	)
-)
-
-/*
- * Collapsed-node scan metadata.  Emitted when a collapsed node is
- * first populated (so consumers can know its scan_zone and initial
- * nr_entries) and whenever nr_entries changes.
- */
-LTTNG_UST_TRACEPOINT_EVENT(cds_ft, collapsed_publish,
-	LTTNG_UST_TP_ARGS(
-		const void *, col,
-		unsigned int, nr_entries,
-		unsigned int, scan_zone_size
-	),
-	LTTNG_UST_TP_FIELDS(
-		lttng_ust_field_integer_hex(uintptr_t, col, (uintptr_t) col)
-		lttng_ust_field_integer(unsigned int, nr_entries, nr_entries)
-		lttng_ust_field_integer(unsigned int, scan_zone_size, scan_zone_size)
-	)
-)
-
 /*
  * Structural edge change: a parent node's child slot at ordinal
  * byte `key_byte` is now `child`.  Fired after ft_node_set_nth()
