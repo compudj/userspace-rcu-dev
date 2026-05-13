@@ -228,10 +228,6 @@ enum ft_col_stride {
 #define FT_LOG2_BITS_PER_BYTE	3U
 #define FT_BITS_PER_BYTE	(1U << FT_LOG2_BITS_PER_BYTE)
 
-#define FT_POOL_1D_MASK	((FT_BITS_PER_BYTE - 1) << (FT_TYPE_BITS + FT_INTERNAL_BITS))
-/* 2D mask has C(n=8,r=2) = 28 possibilities (fits in 5 bits). */
-#define FT_POOL_2D_MASK	(((1U << 5) - 1) << (FT_TYPE_BITS + FT_INTERNAL_BITS))
-
 #define FT_MAX_KEY_LEN	256			/* Maximum key length supported. */
 #define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 1)	/* Maximum depth, including root. */
 
