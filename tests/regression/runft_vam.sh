@@ -4,8 +4,8 @@
 # runft.sh, but each one runs against a library built with
 # -DFEATURE_FT_VERIFY_AT_MUTATION (see fractal-trie-internal.h) and
 # passes --verify-at-mutation-period N to test_urcu_ft so the writer
-# scope-exit hook samples cds_ft_verify + cds_ft_verify_density at a
-# tractable cadence instead of the every-mutation default.
+# scope-exit hook samples cds_ft_verify at a tractable cadence instead
+# of the every-mutation default.
 #
 # Verify is O(N) per call, so verifying every mutation on a large
 # trie collapses throughput (16M-pool runs were minutes per

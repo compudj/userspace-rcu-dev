@@ -331,8 +331,8 @@
 /*
  * FEATURE_FT_VERIFY_AT_MUTATION: walk the entire trie at the exit of
  * every public write API (insert / remove / replace / graft / detach)
- * and run cds_ft_verify and cds_ft_verify_density.  On any invariant
- * mismatch, print a diagnostic to stderr and abort the process.
+ * and run cds_ft_verify.  On any invariant mismatch, print a
+ * diagnostic to stderr and abort the process.
  *
  * Catches structural / nr_keys / parent-pointer regressions
  * at the mutation that introduced them, instead of via downstream
@@ -539,8 +539,8 @@ struct cds_ft {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
 	 * Verify-at-mutation sampling.  ft_writer_scope_verify runs
-	 * the full O(N) cds_ft_verify + cds_ft_verify_density walk
-	 * once every @verify_at_mutation_period mutations.
+	 * the full O(N) cds_ft_verify walk once every
+	 * @verify_at_mutation_period mutations.
 	 * @verify_at_mutation_counter increments on every writer-scope
 	 * exit and is reset to 0 each time the period is reached, so
 	 * it never exceeds @verify_at_mutation_period - 1 (no overflow

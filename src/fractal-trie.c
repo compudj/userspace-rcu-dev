@@ -13380,8 +13380,7 @@ bool cds_ft_verify_at_mutation_enabled(void)
 /*
  * Set the verify-at-mutation sampling period for @ft.  When the
  * library is built with -DFEATURE_FT_VERIFY_AT_MUTATION, the writer
- * scope-exit hook runs cds_ft_verify + cds_ft_verify_density once
- * every @period mutations.
+ * scope-exit hook runs cds_ft_verify once every @period mutations.
  *
  *   period == 0 : disable the verify walk on this trie (the
  *                 increment-and-compare still runs in the hook).
@@ -14480,30 +14479,20 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft __attribute__((unused)),
-		FILE *out __attribute__((unused)))
-{
-	/* Density counters retired; no per-node density state to verify. */
-	return CDS_FT_STATUS_OK;
-}
-
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 /*
  * Hook called from CDS_FT_SCOPED_WRITER's scope-exit, before the
  * writer claim is released.  Sampled by the per-trie
- * @verify_at_mutation_period: the full cds_ft_verify +
- * cds_ft_verify_density walk runs once every @period mutations.  The
- * counter is incremented and reset on the boundary so it never
- * exceeds @period - 1, avoiding any overflow / cadence-drift issue
- * on long-running workloads.  Period 0 disables the walk entirely
- * (only the increment-and-compare runs).  On any mismatch, both
- * verifiers run to completion before aborting so we get the full
- * diagnostic.
+ * @verify_at_mutation_period: the cds_ft_verify walk runs once every
+ * @period mutations.  The counter is incremented and reset on the
+ * boundary so it never exceeds @period - 1, avoiding any overflow /
+ * cadence-drift issue on long-running workloads.  Period 0 disables
+ * the walk entirely (only the increment-and-compare runs).  On
+ * mismatch, abort with diagnostic.
  */
 void ft_writer_scope_verify(struct cds_ft *ft)
 {
 	unsigned long period = ft->verify_at_mutation_period;
-	bool fail = false;
 
 	if (period == 0)
 		return;
@@ -14512,11 +14501,7 @@ void ft_writer_scope_verify(struct cds_ft *ft)
 		return;
 	ft->verify_at_mutation_counter = 0;
 
-	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
-		fail = true;
-	if (cds_ft_verify_density(ft, stderr) != CDS_FT_STATUS_OK)
-		fail = true;
-	if (fail) {
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "FT verify-at-mutation: invariant violation on ft=%p\n",
 			(void *) ft);
 		abort();

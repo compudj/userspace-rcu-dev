@@ -1999,9 +1999,8 @@ bool cds_ft_excl_validate_enabled(void);
  *
  * Returns true if the library was built with
  * -DFEATURE_FT_VERIFY_AT_MUTATION, in which case the writer
- * scope-exit hook samples cds_ft_verify + cds_ft_verify_density at a
- * per-trie tunable period (see
- * cds_ft_verify_at_mutation_period_set).  Returns false if the
+ * scope-exit hook samples cds_ft_verify at a per-trie tunable period
+ * (see cds_ft_verify_at_mutation_period_set).  Returns false if the
  * feature is compiled out (the default), in which case the period
  * setter / getter return CDS_FT_STATUS_NOT_SUPPORTED.
  *
@@ -2016,8 +2015,8 @@ bool cds_ft_verify_at_mutation_enabled(void);
  *                                        sampling period for @ft.
  *
  * When the library is built with -DFEATURE_FT_VERIFY_AT_MUTATION,
- * the writer scope-exit hook runs cds_ft_verify +
- * cds_ft_verify_density once every @period mutations:
+ * the writer scope-exit hook runs cds_ft_verify once every @period
+ * mutations:
  *
  *   period == 0 : disable the verify walk on this trie (the
  *                 increment-and-compare in the hook still runs);
@@ -2452,15 +2451,6 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t 
  * CDS_FT_STATUS_INTEGRITY_ERROR on integrity violation.
  */
 enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
-
-/*
- * cds_ft_verify_density - Verify density counters (no-op stub).
- *
- * Density counters were retired; this entry point always returns
- * CDS_FT_STATUS_OK without inspecting the trie.  Kept for source
- * compatibility with existing call sites.
- */
-enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft, FILE *out);
 
 /*
  * cds_ft_show_format - Output format for cds_ft_show().
