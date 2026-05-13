@@ -136,9 +136,6 @@ struct cds_ft_group_attr {
 
 struct cds_ft_attr {
 	bool exclusive;
-	unsigned int collapse_threshold_pct;
-	unsigned int collapse_scan_mul_pct;
-	unsigned int compress_scan_mul_pct;
 };
 
 enum cds_ft_type_class {
@@ -3143,156 +3140,6 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
 	}
 	assert(order >= 4);
 	return 1U << (order - 4);
-}
-
-/*
- * ft_node_readside_cl_pct: number of cache lines a read-side lookup
- * loads when traversing this node, returning a pct-scaled CL cost.
- *
- * Layout-sensitive nodes (linear, collapsed) compose their cost
- * from a scan term plus an average-pointer term:
- *
- *   cost_pct = avg_scan_cl × scan_mul_pct + avg_ptr_cl_pct
- *
- * avg_ptr_cl_pct is the percent-CL probability that the matched
- * entry's CL is *not* already loaded by the scan, computed under a
- * uniform distribution over slot positions.
- *
- *   Skip-encoded compressed   : 0  (resolved from pointer bits)
- *   Compressed alloc <= 64 B  : 1 × @compress_scan_mul_pct
- *   Compressed alloc >= 128 B : 2 × @compress_scan_mul_pct
- *   Linear                    : avg_scan_cl × 100 + avg_ptr_cl_pct
- *   Pigeon                    : 100  (1 fixed CL: matched slot only)
- *   Collapsed (per (stride, tier)):
- *     avg_scan_cl × @collapse_scan_mul_pct + ptr_cl_pct
- *
- * Linear layout:
- *
- *   keys_zone : bytes [0, max_lc)            (uint8_t keys)
- *   ptr_zone  : bytes [P, P + max_lc × sizeof(void *)),
- *                 P = roundup(max_lc, sizeof(void *))
- *
- * The SIMD/SWAR scan loads the keys_zone, touching ceil(max_lc/64)
- * CLs (every shipped ft_types[] entry keeps max_lc <= 28, so
- * avg_scan_cl = 1 today).  The matched pointer is at slot
- * s ∈ [0, max_lc); its CL is "free" iff it lies in the same CL as
- * the scan, i.e. P + s × sizeof(void *) < 64.  Under a uniform
- * distribution over s,
- *
- *   ptrs_in_first_CL = max(0, min(max_lc, (64 - P) / sizeof(void *)))
- *   avg_ptr_cl_pct   = (max_lc - ptrs_in_first_CL) / max_lc × 100
- *
- * Pigeon: no key scan; the matched pointer's CL is always a fresh
- * load.  avg_scan_cl = 0, avg_ptr_cl_pct = 100 → 100 pct CLs.
- *
- * Collapsed (per (stride, tier)) avg_ptr_cl_pct breakdown:
- *
- *     ptr_cl_pct is the per-tier-per-stride percent-CL probability
- *     that a matched entry's CL is *not* already loaded by the
- *     SIMD prefilter's header CL touch.
- *
- *     T0: header (16B) + entries (3 × 16B narrow / disabled wide)
- *         all fit in one 64B CL — ptr_cl_pct = 0 for any matched slot.
- *     T1 narrow (cap 7, 16B/entry): slots 0-2 are in the header CL
- *         (free); slots 3-6 in CL 1.  Avg = 4/7 ≈ 57%.
- *     T1 wide (cap 3, 32B/entry):  slot 0 is in the header CL (free),
- *         slot 1 straddles into CL 1, slot 2 in CL 1.  Avg = 2/3 ≈ 67%.
- *     T2/T3: 64B header = a full CL; matched entry is always in some
- *         later CL — ptr_cl_pct = 100 for both strides.
- *
- * Internals (linear, popcount, pigeon) use scan_mul_pct = 100
- * (the scan is just dependent loads, not a tunable scan loop).
- * Compressed and collapsed scans get their respective multiplier on
- * the scan portion, matching the candidate-side accounting in
- * ft_try_collapse_at_node and ft_compress_chain_at.  This keeps
- * absorbed-side and candidate-side cost comparisons symmetric: if a
- * scan-bearing node is on the absorbed path, it is priced the same
- * way as a candidate of the same type would be priced.
- *
- * Externals are leaves of every read path, paid the same on the
- * collapsed and absorbed sides — callers exclude them from the
- * latency comparison.
- */
-static __attribute__((unused))
-unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
-		struct cds_ft_inode_flag *node_flag,
-		unsigned int collapse_scan_mul_pct,
-		unsigned int compress_scan_mul_pct)
-{
-	/*
-	 * Per-(stride, tier) read-side CL cost for the SoA collapsed
-	 * layout.  See the function-header comment for the derivation
-	 * of each ptr_cl_pct entry.
-	 */
-	static const unsigned int collapsed_avg_scan_cl_by_tier[FT_COL_NR_TIERS] = {
-		[0] = 1,	/* 64B alloc — header + entries on 1 CL */
-		[1] = 1,	/* 128B alloc — 16B header CL */
-		[2] = 1,	/* 256B alloc — 64B header = 1 CL */
-		[3] = 1,	/* 512B alloc — 64B header = 1 CL */
-	};
-	static const unsigned int collapsed_ptr_cl_pct_by_tier_stride
-			[FT_COL_NR_STRIDES][FT_COL_NR_TIERS] = {
-		[FT_COL_STRIDE_NARROW] = {
-			[0] = 0,	/* shared CL with scan */
-			[1] = 57,	/* 4/7 slots in CL 1 */
-			[2] = 100,	/* matched entry always past header CL */
-			[3] = 100,
-		},
-		[FT_COL_STRIDE_WIDE] = {
-			[0] = 0,	/* wide-T0 disabled — value never queried */
-			[1] = 67,	/* 2/3 slots reach CL 1 (slot 1 straddles) */
-			[2] = 100,
-			[3] = 100,
-		},
-	};
-	unsigned int order;
-
-	if (ft_node_compressed(node_flag)) {
-		struct cds_ft_compressed_node *cn =
-			ft_compressed_node_ptr(node_flag);
-		unsigned int cl;
-
-		if (ft_group_skip_compressed(ft->group) &&
-		    cn->len <= FT_SKIP_LEN_MAX)
-			return 0;
-		order = ft_compressed_order(cn->len);
-		cl = (order >= 7) ? 2U : 1U;
-		return cl * compress_scan_mul_pct;
-	} else if (ft_node_skip_compressed(node_flag)) {
-		return 0;
-	} else if (ft_node_collapsed(node_flag)) {
-		unsigned int tier = ft_collapsed_tier(node_flag);
-		unsigned int stride = ft_collapsed_stride(node_flag);
-
-		return collapsed_avg_scan_cl_by_tier[tier]
-				* collapse_scan_mul_pct
-			+ collapsed_ptr_cl_pct_by_tier_stride[stride][tier];
-	} else {
-		unsigned int type_index = ft_node_type(node_flag);
-		const struct cds_ft_type *type = &ft_types[type_index];
-		unsigned int max_lc, p, by_space, ptrs_in_cl0, ptrs_out;
-		unsigned int avg_scan_cl, avg_ptr_cl_pct;
-
-		if (type->type_class == FT_PIGEON) {
-			/*
-			 * Direct-indexed; no scan loop.  Matched pointer's
-			 * CL is always a fresh dependent load.
-			 */
-			return 100U;
-		}
-
-		/*
-		 * Linear layout: keys followed by aligned pointer table.
-		 */
-		max_lc = type->max_linear_child;
-		p = (max_lc + sizeof(void *) - 1U) & ~(sizeof(void *) - 1U);
-		by_space = (p < 64U) ? (64U - p) / sizeof(void *) : 0U;
-		ptrs_in_cl0 = (by_space < max_lc) ? by_space : max_lc;
-		ptrs_out = max_lc - ptrs_in_cl0;
-		avg_ptr_cl_pct = (ptrs_out * 100U) / max_lc;
-		avg_scan_cl = (max_lc + 63U) / 64U;	/* always 1 today */
-		return avg_scan_cl * 100U + avg_ptr_cl_pct;
-	}
 }
 
 static
@@ -14132,9 +13979,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * readers must call cds_ft_make_concurrent first.
 		 */
 		detached->exclusive = true;
-		detached->collapse_threshold_pct = ft->collapse_threshold_pct;
-		detached->collapse_scan_mul_pct = ft->collapse_scan_mul_pct;
-		detached->compress_scan_mul_pct = ft->compress_scan_mul_pct;
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 		/*
 		 * Carry the source's verify-at-mutation cadence into the
@@ -14276,9 +14120,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 * first.
 			 */
 			detached->exclusive = true;
-			detached->collapse_threshold_pct = ft->collapse_threshold_pct;
-			detached->collapse_scan_mul_pct = ft->collapse_scan_mul_pct;
-			detached->compress_scan_mul_pct = ft->compress_scan_mul_pct;
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 			/* Mirror of the root-detach branch above; see rationale there. */
 			detached->verify_at_mutation_period = ft->verify_at_mutation_period;
@@ -16573,33 +16414,6 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_attr_set_collapse_threshold(struct cds_ft_attr *attr,
-		unsigned int threshold_pct)
-{
-	if (threshold_pct < CDS_FT_COLLAPSE_THRESHOLD_DEFAULT)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	attr->collapse_threshold_pct = threshold_pct;
-	return CDS_FT_STATUS_OK;
-}
-
-enum cds_ft_status cds_ft_attr_set_collapse_scan_mul(struct cds_ft_attr *attr,
-		unsigned int scan_mul_pct)
-{
-	if (scan_mul_pct < 100U)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	attr->collapse_scan_mul_pct = scan_mul_pct;
-	return CDS_FT_STATUS_OK;
-}
-
-enum cds_ft_status cds_ft_attr_set_compress_scan_mul(struct cds_ft_attr *attr,
-		unsigned int scan_mul_pct)
-{
-	if (scan_mul_pct < 100U)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	attr->compress_scan_mul_pct = scan_mul_pct;
-	return CDS_FT_STATUS_OK;
-}
-
 void cds_ft_make_exclusive(struct cds_ft *ft)
 {
 	CDS_FT_SCOPED_WRITER(ft);
@@ -16702,48 +16516,6 @@ enum cds_ft_status cds_ft_verify_at_mutation_period_get(
 #endif
 }
 
-enum cds_ft_status cds_ft_collapse_threshold_set(struct cds_ft *ft,
-		unsigned int threshold_pct)
-{
-	if (threshold_pct < CDS_FT_COLLAPSE_THRESHOLD_DEFAULT)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	uatomic_store(&ft->collapse_threshold_pct, threshold_pct, CMM_RELAXED);
-	return CDS_FT_STATUS_OK;
-}
-
-unsigned int cds_ft_collapse_threshold_get(struct cds_ft *ft)
-{
-	return uatomic_load(&ft->collapse_threshold_pct, CMM_RELAXED);
-}
-
-enum cds_ft_status cds_ft_collapse_scan_mul_set(struct cds_ft *ft,
-		unsigned int scan_mul_pct)
-{
-	if (scan_mul_pct < 100U)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	uatomic_store(&ft->collapse_scan_mul_pct, scan_mul_pct, CMM_RELAXED);
-	return CDS_FT_STATUS_OK;
-}
-
-unsigned int cds_ft_collapse_scan_mul_get(struct cds_ft *ft)
-{
-	return uatomic_load(&ft->collapse_scan_mul_pct, CMM_RELAXED);
-}
-
-enum cds_ft_status cds_ft_compress_scan_mul_set(struct cds_ft *ft,
-		unsigned int scan_mul_pct)
-{
-	if (scan_mul_pct < 100U)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	uatomic_store(&ft->compress_scan_mul_pct, scan_mul_pct, CMM_RELAXED);
-	return CDS_FT_STATUS_OK;
-}
-
-unsigned int cds_ft_compress_scan_mul_get(struct cds_ft *ft)
-{
-	return uatomic_load(&ft->compress_scan_mul_pct, CMM_RELAXED);
-}
-
 enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor)
@@ -16827,44 +16599,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 */
 	ft->verify_at_mutation_period = 1;
 #endif
-	{
-		/*
-		 * Pick the collapse-threshold default based on the descent
-		 * mode the trie will run in.  Cand-mode descent — used by
-		 * skip-compressed groups (cds_ft_lookup_candidate_key) and by
-		 * speculative_validated groups (cds_ft_lookup_key internally
-		 * cand-descends + validates at leaf) — benefits from
-		 * collapse, so use the skip-mode default (T=100).  Plain
-		 * non-skip / non-speculative groups stick with the precise-
-		 * descent default (T=DISABLED).
-		 */
-		unsigned int dflt_T = (ft_group_skip_compressed(ft_group) ||
-				ft_group->speculative_validated)
-			? CDS_FT_COLLAPSE_THRESHOLD_DEFAULT
-			: CDS_FT_COLLAPSE_THRESHOLD_NONSKIP_DEFAULT;
-		unsigned int dflt_c = CDS_FT_COLLAPSE_SCAN_MUL_PCT_DEFAULT;
-		unsigned int dflt_m = CDS_FT_COMPRESS_SCAN_MUL_PCT_DEFAULT;
-
-		if (attr) {
-			ft->exclusive = attr->exclusive;
-			ft->collapse_threshold_pct =
-				attr->collapse_threshold_pct
-				? attr->collapse_threshold_pct
-				: dflt_T;
-			ft->collapse_scan_mul_pct =
-				attr->collapse_scan_mul_pct
-				? attr->collapse_scan_mul_pct
-				: dflt_c;
-			ft->compress_scan_mul_pct =
-				attr->compress_scan_mul_pct
-				? attr->compress_scan_mul_pct
-				: dflt_m;
-		} else {
-			ft->collapse_threshold_pct = dflt_T;
-			ft->collapse_scan_mul_pct = dflt_c;
-			ft->compress_scan_mul_pct = dflt_m;
-		}
-	}
+	if (attr)
+		ft->exclusive = attr->exclusive;
 
 	/*
 	 * Allocate the root node (smallest linear type, initially empty).
