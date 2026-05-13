@@ -696,23 +696,16 @@ struct cds_ft_collapsed_node {
 
 struct cds_ft_bitmap {
 	/*
-	 * Bitmap is attached to the largest popcount_1l tier and pigeon for
-	 * ordered traversals.  Comparative costs per ordered-traversal
-	 * step:
+	 * Bitmap is attached to pigeon nodes only.  Pigeon has no key
+	 * array and no internal bitmap header -- the bitmap-scan path
+	 * needs this metadata bitmap to find populated slots without
+	 * a 256-pointer linear scan.  Cost: 2 cache line loads + 1
+	 * extra TLB hit, compared to 32 cache line loads worst case
+	 * without the bitmap.  Popcount tiers carry their own bitmaps
+	 * inline in the node body and do not need a metadata bitmap.
 	 *
-	 * - For pigeon, using the bitmap costs 2 cache line loads and
-	 *   1 extra TLB hit, compared to 32 cache line loads worst case
-	 *   without the bitmap.
-	 *
-	 *   Bitmap memory use (in bytes) (32-bit)
-	 *                        bitmap size    node size       %
-	 *   bp_1l (idx B)             32            512       6.2
-	 *   Pigeon                    32           1024       3.1
-	 *
-	 *   Bitmap memory use (in bytes) (64-bit)
-	 *                        bitmap size    node size       %
-	 *   bp_1l (idx B)             32           1024       3.1
-	 *   Pigeon                    32           2048       1.6
+	 *   Pigeon bitmap memory use (32-bit): 32 B / 1024 B node =  3.1%
+	 *   Pigeon bitmap memory use (64-bit): 32 B / 2048 B node =  1.6%
 	 */
 	unsigned long bitmap[FT_BITMAP_LEN / sizeof(unsigned long)];
 } __attribute__((__aligned__(FT_BITMAP_LEN)));

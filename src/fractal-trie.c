@@ -392,7 +392,7 @@ const struct cds_ft_type ft_types[] = {
 		.popcount_1l = true,
 		.min_child = 51,
 		.max_child = ft_type_6_max_child,
-		.order = 10, .bitmap = FT_BITMAP },
+		.order = 10, .bitmap = FT_NO_BITMAP },
 
 	/*
 	 * Upon node removal below min_child, if a popcount_1l node would
@@ -3941,13 +3941,16 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 
 		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
 		/*
-		 * Tiers attaching a 32B bitmap in metadata.  On 64-bit:
-		 * popcount_1l@1024 (idx 6, currently still allocates a
-		 * redundant metadata bitmap pending follow-up cleanup) and
-		 * pigeon (idx 7).  On 32-bit: pigeon only (idx 6).  Threshold
-		 * is the same literal on both arches.
+		 * Only pigeon attaches a 32B bitmap in metadata; popcount
+		 * tiers carry their bitmaps inline in the node body.  Pigeon
+		 * is the last type index on both arches (6 on 32-bit,
+		 * 7 on 64-bit) so a single arch-conditional literal suffices.
 		 */
-		if (type_index >= 6)
+#if (CAA_BITS_PER_LONG < 64)
+		if (type_index == 6)
+#else
+		if (type_index == 7)
+#endif
 			__builtin_prefetch(cds_ft_item_to_bitmap(node, order));
 	}
 }
