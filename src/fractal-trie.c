@@ -174,10 +174,8 @@ struct cds_ft_type {
 	enum cds_ft_type_class type_class;
 	uint16_t min_child;		/* minimum number of children: 1 to 256 */
 	uint16_t max_child;		/* maximum number of children: 1 to 256 */
-	uint16_t max_linear_child;	/* per-pool max nr. children: 1 to 256 */
+	uint16_t max_linear_child;	/* max children with linear-scan layout: 1 to 256 */
 	uint16_t order;			/* node size is (1 << order), in bytes */
-	uint16_t nr_pool_order;		/* number of pools */
-	uint16_t pool_size_order;	/* pool size */
 	bool bitmap;			/* allocate bitmap */
 	bool nibble_popcount_2l;		/* 2-level popcount-bitmap layout */
 	bool byte_popcount_1l;			/* 1-level byte popcount layout */
@@ -270,16 +268,6 @@ enum {
 	ft_type_3_max_linear_child = 16,
 };
 
-enum {
-	/*
-	 * Retained for the trace-kind table at FT_TP_INTERNAL_TAG
-	 * (decoder needs the pool geometry to interpret historical
-	 * traces).  Not read at runtime in popcount mode.
-	 */
-	ft_type_4_nr_pool_order = 1,
-	ft_type_5_nr_pool_order = 2,
-};
-
 const struct cds_ft_type ft_types[] = {
 	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
 	[1] = {
@@ -303,29 +291,27 @@ const struct cds_ft_type ft_types[] = {
 
 	/*
 	 * Indices 4 and 5 use byte_popcount_1l (32 B bitmap + 4 B ptr
-	 * table fills the node exactly).  Their array slots retain the
-	 * FT_POOL_IDX_A / FT_POOL_IDX_B names for historical reasons;
-	 * no subnode dispatch happens here.
+	 * table fills the node exactly).
 	 */
-	[FT_POOL_IDX_A] = {
+	[FT_BP1L_IDX_A] = {
 		/* 32 B bitmap + 56 * 4 B ptrs = 256 B (order-8). */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_4_max_child,
 		.byte_popcount_1l = true,
 		.min_child = 10,
-		.max_child = ft_type_4_max_child, .order = 8, .nr_pool_order = ft_type_4_nr_pool_order, .pool_size_order = 7, .bitmap = FT_NO_BITMAP },
-	[FT_POOL_IDX_B] = {
+		.max_child = ft_type_4_max_child, .order = 8, .bitmap = FT_NO_BITMAP },
+	[FT_BP1L_IDX_B] = {
 		/* 32 B bitmap + 120 * 4 B ptrs = 512 B (order-9). */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_5_max_child,
 		.byte_popcount_1l = true,
 		.min_child = 28,
 		.bitmap = FT_NO_BITMAP,
-		.max_child = ft_type_5_max_child, .order = 9, .nr_pool_order = ft_type_5_nr_pool_order, .pool_size_order = 7 },
+		.max_child = ft_type_5_max_child, .order = 9 },
 
 	/*
-	 * Upon node removal below min_child, if child pool is filled
-	 * beyond capacity, we roll back to pigeon.
+	 * Upon node removal below min_child, if a bp_1l node would
+	 * otherwise be filled beyond capacity, we roll back to pigeon.
 	 */
 	[6] = { .type_class = FT_PIGEON,
 		.min_child = 51,
@@ -364,16 +350,6 @@ enum {
 	ft_type_3_max_linear_child = 14,
 };
 
-enum {
-	/*
-	 * Retained for the trace-kind table at FT_TP_INTERNAL_TAG
-	 * (decoder needs the pool geometry to interpret historical
-	 * traces).  Not read at runtime in popcount mode.
-	 */
-	ft_type_5_nr_pool_order = 1,
-	ft_type_6_nr_pool_order = 2,
-};
-
 const struct cds_ft_type ft_types[] = {
 	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
 	[1] = {
@@ -399,30 +375,28 @@ const struct cds_ft_type ft_types[] = {
 
 	/*
 	 * Indices 5 and 6 use byte_popcount_1l (32B bitmap + 8B ptr
-	 * table fills the node).  Their array slots retain the
-	 * FT_POOL_IDX_A / FT_POOL_IDX_B names for historical reasons;
-	 * no subnode dispatch happens here.
+	 * table fills the node).
 	 */
-	[FT_POOL_IDX_A] = {
+	[FT_BP1L_IDX_A] = {
 		/* 32B bitmap + 54 * 8B ptrs = 464B, fits 512B order-9. */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_5_max_child,
 		.byte_popcount_1l = true,
 		.min_child = 22,
 		.max_child = ft_type_5_max_child,
-		.order = 9, .nr_pool_order = ft_type_5_nr_pool_order, .pool_size_order = 8, .bitmap = FT_NO_BITMAP },
-	[FT_POOL_IDX_B] = {
+		.order = 9, .bitmap = FT_NO_BITMAP },
+	[FT_BP1L_IDX_B] = {
 		/* 32B bitmap + 104 * 8B ptrs = 864B, fits 1024B order-10. */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_6_max_child,
 		.byte_popcount_1l = true,
 		.min_child = 51,
 		.max_child = ft_type_6_max_child,
-		.order = 10, .nr_pool_order = ft_type_6_nr_pool_order, .pool_size_order = 8, .bitmap = FT_BITMAP },
+		.order = 10, .bitmap = FT_BITMAP },
 
 	/*
-	 * Upon node removal below min_child, if child pool is filled
-	 * beyond capacity, we roll back to pigeon.
+	 * Upon node removal below min_child, if a bp_1l node would
+	 * otherwise be filled beyond capacity, we roll back to pigeon.
 	 */
 	[7] = { .type_class = FT_PIGEON, .min_child = 95, .max_child = ft_type_7_max_child, .order = 11, .bitmap = FT_BITMAP },
 
@@ -433,7 +407,7 @@ const struct cds_ft_type ft_types[] = {
 /*
  * The cds_ft_inode contains the compressed node data needed for
  * the read-side traversal. Because the actual layout depends on the
- * node's type_class (Linear, Pool, or Pigeon), the struct uses a single
+ * node's type_class (Linear, Popcount, or Pigeon), the struct uses a single
  * pointer-aligned byte array. The allocator sizes this array dynamically
  * based on the type's order (1 << type->order).
  *
@@ -1359,9 +1333,9 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
  *   mask_internal = (~15UL) << ((v >> 1) & 7)
  *                 = ~0UL << (4 + type_idx)
  *
- * This clears all tag and pool sub-index bits that sit below the
- * type's alignment boundary.  The shift amount is derived purely
- * from bits 1-3 with no dependency on bit 0.
+ * This clears all tag bits that sit below the type's alignment
+ * boundary.  The shift amount is derived purely from bits 1-3 with
+ * no dependency on bit 0.
  *
  * For non-internal nodes (bit 0 clear): external nodes are >= 8-byte
  * aligned (bits 0-2 zero), compressed/collapsed are >= 16-byte
@@ -2380,11 +2354,10 @@ unsigned int ft_collapsed_high_water(struct cds_ft_collapsed_node *col,
 	(ord) == 7 ? FT_TP_NODE_LINEAR_128 :			\
 	(ord) == 8 ? FT_TP_NODE_LINEAR_256 :			\
 	FT_TP_NODE_UNKNOWN)
-#define FT_TP_KIND_POOL(npo, ord) (				\
-	(npo) == 1 && (ord) == 8 ? FT_TP_NODE_POOL_1D_256 :	\
-	(npo) == 1 && (ord) == 9 ? FT_TP_NODE_POOL_1D_512 :	\
-	(npo) == 2 && (ord) == 9 ? FT_TP_NODE_POOL_2D_512 :	\
-	(npo) == 2 && (ord) == 10 ? FT_TP_NODE_POOL_2D_1024 :	\
+#define FT_TP_KIND_BP1L(ord) (					\
+	(ord) == 8  ? FT_TP_NODE_BP1L_256 :			\
+	(ord) == 9  ? FT_TP_NODE_BP1L_512 :			\
+	(ord) == 10 ? FT_TP_NODE_BP1L_1024 :			\
 	FT_TP_NODE_UNKNOWN)
 #define FT_TP_KIND_PIGEON(ord) (				\
 	(ord) == 10 ? FT_TP_NODE_PIGEON_1024 :			\
@@ -2408,8 +2381,8 @@ static const uint8_t ft_tp_kind_table[FT_TP_KIND_TABLE_MASK + 1] = {
 	[FT_TP_INTERNAL_TAG(1)]			= FT_TP_KIND_LINEAR(5),
 	[FT_TP_INTERNAL_TAG(2)]			= FT_TP_KIND_LINEAR(6),
 	[FT_TP_INTERNAL_TAG(3)]			= FT_TP_KIND_LINEAR(7),
-	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_A)]	= FT_TP_KIND_POOL(ft_type_4_nr_pool_order, 8),
-	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_B)]	= FT_TP_KIND_POOL(ft_type_5_nr_pool_order, 9),
+	[FT_TP_INTERNAL_TAG(FT_BP1L_IDX_A)]	= FT_TP_KIND_BP1L(8),
+	[FT_TP_INTERNAL_TAG(FT_BP1L_IDX_B)]	= FT_TP_KIND_BP1L(9),
 	[FT_TP_INTERNAL_TAG(6)]			= FT_TP_KIND_PIGEON(10),
 	/* idx 7 = NODE_INDEX_NULL: never encoded in a pointer. */
 #else
@@ -2417,9 +2390,9 @@ static const uint8_t ft_tp_kind_table[FT_TP_KIND_TABLE_MASK + 1] = {
 	[FT_TP_INTERNAL_TAG(1)]			= FT_TP_KIND_LINEAR(5),
 	[FT_TP_INTERNAL_TAG(2)]			= FT_TP_KIND_LINEAR(6),
 	[FT_TP_INTERNAL_TAG(3)]			= FT_TP_KIND_LINEAR(7),
-	[FT_TP_INTERNAL_TAG(4)]			= FT_TP_KIND_LINEAR(8),
-	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_A)]	= FT_TP_KIND_POOL(ft_type_5_nr_pool_order, 9),
-	[FT_TP_INTERNAL_TAG(FT_POOL_IDX_B)]	= FT_TP_KIND_POOL(ft_type_6_nr_pool_order, 10),
+	[FT_TP_INTERNAL_TAG(4)]			= FT_TP_KIND_BP1L(8),
+	[FT_TP_INTERNAL_TAG(FT_BP1L_IDX_A)]	= FT_TP_KIND_BP1L(9),
+	[FT_TP_INTERNAL_TAG(FT_BP1L_IDX_B)]	= FT_TP_KIND_BP1L(10),
 	[FT_TP_INTERNAL_TAG(7)]			= FT_TP_KIND_PIGEON(11),
 #endif
 };
@@ -3010,7 +2983,7 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 	}
 	p = cds_ft_metadata_to_item(metadata);
 	/*
-	 * Linear/pool node data[] is the keys array; the allocator
+	 * Linear node data[] is the keys array; the allocator
 	 * returns zeroed memory, which is the initial state expected
 	 * by the sentinel-based count derivation in
 	 * ft_linear_node_get_nr_child (values[0] == 0 with no other
@@ -3104,7 +3077,7 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
 		order = cds_ft_item_order(
 			(void *) ft_collapsed_node_ptr(node_flag));
 	} else {
-		/* Internal: linear, pool, or pigeon. */
+		/* Internal: linear, popcount, or pigeon. */
 		order = ft_types[ft_node_type(node_flag)].order;
 	}
 	assert(order >= 4);
@@ -3115,8 +3088,8 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
  * ft_node_readside_cl_pct: number of cache lines a read-side lookup
  * loads when traversing this node, returning a pct-scaled CL cost.
  *
- * Layout-sensitive nodes (linear, pool sub-node, collapsed) compose
- * their cost from a scan term plus an average-pointer term:
+ * Layout-sensitive nodes (linear, collapsed) compose their cost
+ * from a scan term plus an average-pointer term:
  *
  *   cost_pct = avg_scan_cl × scan_mul_pct + avg_ptr_cl_pct
  *
@@ -3127,26 +3100,23 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
  *   Skip-encoded compressed   : 0  (resolved from pointer bits)
  *   Compressed alloc <= 64 B  : 1 × @compress_scan_mul_pct
  *   Compressed alloc >= 128 B : 2 × @compress_scan_mul_pct
- *   Linear / Pool sub-node    : avg_scan_cl × 100 + avg_ptr_cl_pct
+ *   Linear                    : avg_scan_cl × 100 + avg_ptr_cl_pct
  *   Pigeon                    : 100  (1 fixed CL: matched slot only)
  *   Collapsed (per (stride, tier)):
  *     avg_scan_cl × @collapse_scan_mul_pct + ptr_cl_pct
  *
- * Linear / Pool sub-node layout:
+ * Linear layout:
  *
  *   keys_zone : bytes [0, max_lc)            (uint8_t keys)
  *   ptr_zone  : bytes [P, P + max_lc × sizeof(void *)),
  *                 P = roundup(max_lc, sizeof(void *))
  *
- * Pool dispatch itself reads no memory — the sub-node index is
- * decoded from flag bits in the parent pointer — and each sub-node
- * has the same internal layout as a linear node with its own
- * max_linear_child.  The SIMD/SWAR scan loads the keys_zone,
- * touching ceil(max_lc/64) CLs (every shipped ft_types[] entry
- * keeps max_lc <= 28, so avg_scan_cl = 1 today).  The matched
- * pointer is at slot s ∈ [0, max_lc); its CL is "free" iff it
- * lies in the same CL as the scan, i.e. P + s × sizeof(void *)
- * < 64.  Under a uniform distribution over s,
+ * The SIMD/SWAR scan loads the keys_zone, touching ceil(max_lc/64)
+ * CLs (every shipped ft_types[] entry keeps max_lc <= 28, so
+ * avg_scan_cl = 1 today).  The matched pointer is at slot
+ * s ∈ [0, max_lc); its CL is "free" iff it lies in the same CL as
+ * the scan, i.e. P + s × sizeof(void *) < 64.  Under a uniform
+ * distribution over s,
  *
  *   ptrs_in_first_CL = max(0, min(max_lc, (64 - P) / sizeof(void *)))
  *   avg_ptr_cl_pct   = (max_lc - ptrs_in_first_CL) / max_lc × 100
@@ -3169,7 +3139,7 @@ unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
  *     T2/T3: 64B header = a full CL; matched entry is always in some
  *         later CL — ptr_cl_pct = 100 for both strides.
  *
- * Internals (linear, pool sub-node, pigeon) use scan_mul_pct = 100
+ * Internals (linear, popcount, pigeon) use scan_mul_pct = 100
  * (the scan is just dependent loads, not a tunable scan loop).
  * Compressed and collapsed scans get their respective multiplier on
  * the scan portion, matching the candidate-side accounting in
@@ -3251,10 +3221,7 @@ unsigned int ft_node_readside_cl_pct(const struct cds_ft *ft,
 		}
 
 		/*
-		 * Linear or pool sub-node — both share the keys-then-
-		 * aligned-pointers layout with their own max_linear_child.
-		 * Pool dispatch itself reads no memory (decoded from
-		 * pointer flag bits).
+		 * Linear layout: keys followed by aligned pointer table.
 		 */
 		max_lc = type->max_linear_child;
 		p = (max_lc + sizeof(void *) - 1U) & ~(sizeof(void *) - 1U);
@@ -3659,9 +3626,9 @@ static inline void ft_maybe_prefetch(const void *ptr)
 }
 
 /*
- * ft_dereference_prefetch: for tagged FT node pointers (may have
- * pool/pigeon subclass bits).  Uses ft_maybe_prefetch to skip
- * pool/pigeon types.
+ * ft_dereference_prefetch: for tagged FT node pointers.  Uses
+ * ft_maybe_prefetch to strip any skip-compressed length bits before
+ * issuing the prefetch.
  *
  * ft_dereference_prefetch_external: for plain (non-tagged) pointers
  * like external_nodes.  Direct prefetch, no tag check needed.
@@ -3902,15 +3869,14 @@ bool ft_collapsed_match_candidate(struct cds_ft_collapsed_node *col,
  *                      their own handlers prefetch cn->child /
  *                      col->data.
  *   FT_PF_BITMAP_META: same as META plus prefetches the bitmap
- *                      cache line for pool-2D / pigeon children
+ *                      cache line for bitmap-bearing children
  *                      (used by ordered get_direction traversal).
  *
  * The item's alloc order is derived from the tag bits directly
  * (type_index + FT_ALLOC_ORDER_MIN) without loading ft_types[],
  * and the node base address is derived from the tagged pointer via
  * alignment masking (bits below the order are all zero because
- * allocations are order-aligned, and the pool subclass bits in
- * [4, order) are cleared along with the type tag).
+ * allocations are order-aligned).
  */
 enum ft_pf_target {
 	FT_PF_NONE,
@@ -3973,8 +3939,8 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 		void *node = (void *) (v & align_mask);
 
 		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
-		/* Pool-2D and pigeon are the bitmap types (type_index >= IDX_B). */
-		if (type_index >= FT_POOL_IDX_B)
+		/* The pigeon tier and one bp_1l tier carry bitmaps (type_index >= IDX_B). */
+		if (type_index >= FT_BP1L_IDX_B)
 			__builtin_prefetch(cds_ft_item_to_bitmap(node, order));
 	}
 }
@@ -4210,25 +4176,12 @@ found:
 #endif /* FT_HAVE_EFFICIENT_UNALIGNED_ACCESS */
 
 /*
- * Pool-shape specialized scanners for the lookup hot path.
- * nr_pool_order and pool_size_order are encoded in the function
- * identity rather than loaded from ft_types[]: nr_pool_order is
- * implicit (_1d / _2d), and pool_size_order is identical across
- * both pools in each tier (8 on 64-bit, 7 on 32-bit).
- */
-#if CAA_BITS_PER_LONG >= 64
-#define FT_POOL_SIZE_ORDER	8
-#else
-#define FT_POOL_SIZE_ORDER	7
-#endif
-
-/*
  * FT_USE_SPECIALIZED_SCAN: 64-bit tier-2 layout is power-of-two in
  * ptr_offset per type_index:
  *   type_index 0..2: ptr_offset=8   (SWAR 8-byte)
  *   type_index 3:    ptr_offset=16  (SIMD 16-byte)
  *   type_index 4:    ptr_offset=32  (SIMD 32-byte)
- *   type_index 5..6: pool subnodes, ptr_offset=32 (SIMD 32-byte)
+ *   type_index 5..6: byte_popcount_1l, ptr_offset=32  (32B bitmap header)
  *   type_index 7:    pigeon (dense)
  *
  * Each scanner uses a compile-time-constant scan width equal to the
@@ -4335,8 +4288,8 @@ void ft_specialized_scan_layout_assert(void)
 	assert(FT_ALIGN(ft_types[2].max_linear_child, sizeof(void *)) == 8);
 	assert(FT_ALIGN(ft_types[3].max_linear_child, sizeof(void *)) == 16);
 	assert(FT_ALIGN(ft_types[4].max_linear_child, sizeof(void *)) == 32);
-	assert(FT_POOL_IDX_A == 5);
-	assert(FT_POOL_IDX_B == 6);
+	assert(FT_BP1L_IDX_A == 5);
+	assert(FT_BP1L_IDX_B == 6);
 	assert(ft_types[7].type_class == FT_PIGEON);
 }
 
@@ -4345,11 +4298,11 @@ void ft_specialized_scan_layout_assert(void)
 /*
  * Generic linear node scanner used by the non-specialized dispatch
  * fallback (32-bit, strict-alignment architectures, or when
- * FT_USE_SPECIALIZED_SCAN is unavailable) and by the pool subnode
- * dispatch.  Switches between bytewise, SWAR, and SIMD based on
- * max_linear_child; the branch is on a compile-time-constant
- * type->max_linear_child from the dispatcher's &ft_types[N], so the
- * compiler prunes the dead arm at each call site.
+ * FT_USE_SPECIALIZED_SCAN is unavailable).  Switches between bytewise,
+ * SWAR, and SIMD based on max_linear_child; the branch is on a
+ * compile-time-constant type->max_linear_child from the dispatcher's
+ * &ft_types[N], so the compiler prunes the dead arm at each call
+ * site.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_nibble_popcount_2l_scan_16_16_max_3(
@@ -5671,19 +5624,18 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_ith_pos(const struct cds_ft_type *t
 #define FT_MASK_POPCOUNT    FT_MASK_CLASS(FT_POPCOUNT)
 
 /*
- * Runtime assertions on the FT_POOL_IDX_A / FT_POOL_IDX_B slots.
- * These array indices retain their historical "POOL" names but
- * now host byte_popcount_1l FT_POPCOUNT nodes.  Validated at
+ * Runtime assertions on the FT_BP1L_IDX_A / FT_BP1L_IDX_B slots:
+ * both host byte_popcount_1l FT_POPCOUNT nodes.  Validated at
  * library load so any future ft_types[] regression fires before
  * any lookup runs.
  */
 static void __attribute__((constructor))
-ft_check_pool_idx_assumptions(void)
+ft_check_bp1l_idx_assumptions(void)
 {
-	assert(ft_types[FT_POOL_IDX_A].type_class == FT_POPCOUNT);
-	assert(ft_types[FT_POOL_IDX_B].type_class == FT_POPCOUNT);
-	assert(ft_types[FT_POOL_IDX_A].byte_popcount_1l);
-	assert(ft_types[FT_POOL_IDX_B].byte_popcount_1l);
+	assert(ft_types[FT_BP1L_IDX_A].type_class == FT_POPCOUNT);
+	assert(ft_types[FT_BP1L_IDX_B].type_class == FT_POPCOUNT);
+	assert(ft_types[FT_BP1L_IDX_A].byte_popcount_1l);
+	assert(ft_types[FT_BP1L_IDX_B].byte_popcount_1l);
 }
 
 static inline_lookup
@@ -5762,16 +5714,10 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	case 4:
 		return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
 	case 5:
-		/*
-		 * byte_popcount_1l pool: no subnode dispatch -- the whole
-		 * 512B node is one 256-bit bitmap + 54-pointer table.
-		 */
+		/* byte_popcount_1l 512B: 256-bit bitmap + 54-pointer table. */
 		return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
 	case 6:
-		/*
-		 * byte_popcount_1l pool: no subnode dispatch -- the whole
-		 * 1024B node is one 256-bit bitmap + 104-pointer table.
-		 */
+		/* byte_popcount_1l 1024B: 256-bit bitmap + 104-pointer table. */
 		return ft_byte_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
 	case 7:
 		return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
@@ -5832,7 +5778,7 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
  * Returns false if the child is not found (should not happen on a
  * well-formed trie).
  *
- * Only handles internal node types (linear, pool, pigeon).
+ * Only handles internal node types (linear, popcount, pigeon).
  * Compressed and collapsed parents are handled separately by callers.
  * Write-side only (mutex-held).
  */
@@ -6867,8 +6813,7 @@ int ft_node_recompact(enum ft_recompact mode,
 
 /*
  * Derive is_init for a set_nth call into the freshly-allocated
- * new_node / pool subnode.  Updates init-done state so the next
- * call for the same (sub)node returns false.
+ * new_node.  Updates init-done state so the next call returns false.
  */
 #define RECOMPACT_IS_INIT(byte_value) ({				\
 	bool __is_init = false;						\
@@ -10061,7 +10006,7 @@ descend_children:
 		skip_eq_external_nodes = false;
 		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir);
 		/*
-		 * Transiently empty internal/pool/pigeon: a reader may
+		 * Transiently empty internal node (linear/popcount/pigeon): a reader may
 		 * observe every slot of a reachable internal node as
 		 * NULL in the narrow window between a writer's per-slot
 		 * detach and the upward walk's slot-replace at a higher
@@ -22296,7 +22241,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		return ft_verify_node_collapsed(ft, out, visited, path,
 			node_flag, expected_parent, depth, out_nr_keys);
 
-	/* --- Internal node (linear, pool, pigeon) --- */
+	/* --- Internal node (linear, popcount, pigeon) --- */
 	{
 		struct cds_ft_inode *node = ft_node_ptr(node_flag);
 		struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);

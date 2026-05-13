@@ -241,13 +241,18 @@ enum ft_col_stride {
 # define NODE_INDEX_NULL		8
 #endif
 
-/* Hardcoded pool indexes for fast path. */
+/*
+ * Hardcoded type-index slots for the byte_popcount_1l (32B bitmap +
+ * ptr table) nodes.  These two indices identify the largest two FT
+ * internal-node tiers before pigeon.  Kept as compile-time constants
+ * so the prefetch / get_nth_skip dispatch can short-circuit on them.
+ */
 #if (CAA_BITS_PER_LONG < 64)
-# define FT_POOL_IDX_A	4
-# define FT_POOL_IDX_B	5
+# define FT_BP1L_IDX_A	4
+# define FT_BP1L_IDX_B	5
 #else
-# define FT_POOL_IDX_A	5
-# define FT_POOL_IDX_B	6
+# define FT_BP1L_IDX_A	5
+# define FT_BP1L_IDX_B	6
 #endif
 
 /*
@@ -705,26 +710,22 @@ struct cds_ft_collapsed_node {
 
 struct cds_ft_bitmap {
 	/*
-	 * Bitmap is used by 2D pool and pigeon node configurations
-	 * for ordered traversals. Here are the comparative costs for
-	 * ordered traveral of a node:
-	 *
-	 * - For 2D pool, using the bitmap costs a total of 3 cache line
-	 *   loads and 1 extra TLB hit, compared to a worse case of 5
-	 *   cache line loads without the bitmap.
+	 * Bitmap is attached to the FT_BP1L_IDX_B and pigeon tiers for
+	 * ordered traversals.  Comparative costs per ordered-traversal
+	 * step:
 	 *
 	 * - For pigeon, using the bitmap costs 2 cache line loads and
-	 *   1 extra TLB hit, compared to 32 cache line loads worse case
+	 *   1 extra TLB hit, compared to 32 cache line loads worst case
 	 *   without the bitmap.
 	 *
 	 *   Bitmap memory use (in bytes) (32-bit)
 	 *                        bitmap size    node size       %
-	 *   2D pool                   32            512       6.2
+	 *   bp_1l (idx B)             32            512       6.2
 	 *   Pigeon                    32           1024       3.1
 	 *
 	 *   Bitmap memory use (in bytes) (64-bit)
 	 *                        bitmap size    node size       %
-	 *   2D pool                   32           1024       3.1
+	 *   bp_1l (idx B)             32           1024       3.1
 	 *   Pigeon                    32           2048       1.6
 	 */
 	unsigned long bitmap[FT_BITMAP_LEN / sizeof(unsigned long)];
@@ -1052,7 +1053,7 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
  * Each 2*page_size range holds the items array (page 0), then the
  * per-range header (struct cds_ft_alloc_range) followed by the
  * per-item metadata array (page 1).  Optional bitmap array grows
- * backward from (range base + 2*page_size) on 2D-pool / pigeon arenas.
+ * backward from (range base + 2*page_size) on bitmap-bearing arenas.
  *
  * The two cache lines most often prefetched from a tagged child
  * pointer — the item's metadata and (for bitmap types) its bitmap —
@@ -1317,16 +1318,14 @@ static inline void ft_delay_reader(void) { }
  * these C enum labels).  Keeping both in the same enum guarantees the
  * C side and the trace-metadata side cannot drift out of sync.
  *
- * Labels are designed to describe the underlying structure without
- * requiring the reader to know the build's pointer width:
- *   - LINEAR/LINEAR_WIDE: total node size in bytes (= 2^order).
- *   - POOL_<dim>D_<bytes>: dimensionality (1D = single sub-array,
- *     2D = matrix of sub-arrays) and total node size in bytes.
- *     POOL_1D_512 (a 64-bit POOL_IDX_A) is structurally distinct
- *     from POOL_2D_512 (a 32-bit POOL_IDX_B) even though both have
- *     the same byte size.
- *   - PIGEON: 256-entry direct table; the byte size depends on
- *     pointer width (1024 on 32-bit, 2048 on 64-bit).
+ * Labels describe the underlying structure without requiring the
+ * reader to know the build's pointer width:
+ *   - LINEAR_<bytes>: byte-keys + ptr-table; total node size in bytes
+ *     (= 2^order).
+ *   - BP1L_<bytes>: byte_popcount_1l (32-byte 256-bit bitmap +
+ *     ptr-table); total node size in bytes.
+ *   - PIGEON_<bytes>: 256-entry direct table; total node size in
+ *     bytes (1024 on 32-bit, 2048 on 64-bit).
  *   - COLLAPSED: single label; the scan-size variant requires reading
  *     the node header and is intentionally not exposed in this enum.
  *
@@ -1349,13 +1348,12 @@ enum ft_tp_node_kind {
 	FT_TP_NODE_LINEAR_64		=  6,
 	FT_TP_NODE_LINEAR_128		=  7,
 	FT_TP_NODE_LINEAR_256		=  8,
-	FT_TP_NODE_POOL_1D_256		=  9,
-	FT_TP_NODE_POOL_1D_512		= 10,
-	FT_TP_NODE_POOL_2D_512		= 11,
-	FT_TP_NODE_POOL_2D_1024		= 12,
-	FT_TP_NODE_PIGEON_1024		= 13,
-	FT_TP_NODE_PIGEON_2048		= 14,
-	FT_TP_NODE_UNKNOWN		= 15,
+	FT_TP_NODE_BP1L_256		=  9,
+	FT_TP_NODE_BP1L_512		= 10,
+	FT_TP_NODE_BP1L_1024		= 11,
+	FT_TP_NODE_PIGEON_1024		= 12,
+	FT_TP_NODE_PIGEON_2048		= 13,
+	FT_TP_NODE_UNKNOWN		= 14,
 };
 
 #endif /* _URCU_FT_INTERNAL_H */

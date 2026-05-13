@@ -24,7 +24,7 @@
  *   cds_ft_page_size + sizeof(struct cds_ft_alloc_range):
  *                          array of nr_items struct cds_ft_metadata_alloc
  *   2 * cds_ft_page_size - nr_items * sizeof(struct cds_ft_bitmap):
- *                          reverse array of nr_items struct cds_ft_bitmap (only for 2D pool and pigeon)
+ *                          reverse array of nr_items struct cds_ft_bitmap (only for bitmap-bearing arenas)
  *
  * An allocation arena contains a linked list of allocation ranges.
  */

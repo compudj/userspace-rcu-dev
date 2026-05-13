@@ -33,44 +33,40 @@
  * Internal node configurations:
  *
  * Internal nodes self-adapt to the key population using several
- * configurations (linear, 1D pool, 2D pool, pigeon), each with
- * a different indexing strategy suited to its child density.
- * The appropriate configuration is chosen automatically based
- * on the number of children. Node sizes are powers of 2 between
- * 16 bytes and 2048 bytes on 64-bit architectures (1024 bytes
- * on 32-bit). Mutations use in-place updates when possible to
- * minimize node recompaction, and hysteresis at size thresholds
- * prevents repeated recompaction when the child count oscillates
- * near a boundary.
+ * configurations (linear, popcount-bitmap, pigeon), each with a
+ * different indexing strategy suited to its child density.  The
+ * appropriate configuration is chosen automatically based on the
+ * number of children.  Node sizes are powers of 2 between 16 bytes
+ * and 2048 bytes on 64-bit architectures (1024 bytes on 32-bit).
+ * Mutations use in-place updates when possible to minimize node
+ * recompaction, and hysteresis at size thresholds prevents repeated
+ * recompaction when the child count oscillates near a boundary.
  *
- * The 1D and 2D pool configurations partition the 8-bit key
- * byte space using one or two bit positions respectively,
- * distributing children across sub-nodes. This provides a
- * range of intermediate node sizes between the compact linear
- * configuration and the full 256-entry pigeon configuration,
- * allowing memory-efficient representation of medium-density
- * populations without requiring the full pigeon footprint.
- * The bit positions are selected to minimize the maximum
- * sub-node population, using a minimax criterion. The
- * transition thresholds and worst-case sub-node sizes were
- * empirically validated by brute-force enumeration of optimal
- * bit selections across millions of random populations.
- * Alternative approaches such as Judy use a population bitmap
- * with a dense child array, which requires recompacting the
- * array on every insertion or removal. This is incompatible
- * with wait-free RCU lookups, since a reader could observe a
- * partially recompacted array. The pool approach avoids this
- * by using fixed index positions derived from key bits,
- * allowing children to be added or removed with single-pointer
- * updates visible atomically to concurrent readers.
+ * The popcount-bitmap configurations (2-level nibble bitmaps for
+ * small/medium fan-out, single 256-bit byte bitmap for large
+ * fan-out) record which key bytes are populated in a fixed-position
+ * bitmap and dispatch matches through a popcount-derived rank.
+ * This provides a range of intermediate node sizes between the
+ * compact linear configuration and the full 256-entry pigeon
+ * configuration, allowing memory-efficient representation of
+ * medium-density populations without requiring the full pigeon
+ * footprint.  Alternative approaches such as Judy use a population
+ * bitmap with a dense child array, which requires recompacting the
+ * array on every insertion or removal -- incompatible with wait-free
+ * RCU lookups because a reader could observe a partially recompacted
+ * array.  The popcount-bitmap approach avoids that by using fixed
+ * bit positions derived from key bytes, allowing children to be
+ * added or removed with single-pointer updates visible atomically
+ * to concurrent readers.
  *
  * Node type and configuration are encoded in the low bits of
  * child pointers (tagged pointers), so determining a node's
  * layout during lookup requires no extra memory access.
  *
- * The 2D pool and pigeon configurations use a 32-byte bitmap
- * to locate populated children via bit scanning, reducing the
- * number of cache-line accesses needed for ordered traversal.
+ * Pigeon and the largest popcount-bitmap node both carry a 32-byte
+ * presence bitmap that locates populated children via bit scanning,
+ * reducing the number of cache-line accesses needed for ordered
+ * traversal.
  *
  * Prefix compression (path compaction):
  *
