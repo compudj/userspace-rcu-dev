@@ -341,6 +341,7 @@
  *
  * Off by default (zero overhead).  Enable with -DFEATURE_FT_VERIFY_AT_MUTATION.
  */
+struct cds_ft;
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 void ft_writer_scope_verify(struct cds_ft *ft);
 #endif

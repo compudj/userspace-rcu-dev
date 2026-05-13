@@ -7872,10 +7872,9 @@ int ft_attach_node(struct cds_ft *ft,
 
 	/* Concurrent update prevented by mutual exclusion. */
 	assert(!(old_node_flag_ptr && (ft_node_ptr(*old_node_flag_ptr) && !external_nodes)));
-
-	/* Concurrent update prevented by mutual exclusion. */
 	assert(!(attach_node_flag_ptr && ft_node_ptr(*attach_node_flag_ptr) !=
 			ft_node_ptr(attach_node_flag)));
+	(void) old_node_flag_ptr;	/* Used by assert above; silence -DNDEBUG. */
 
 	/* Create new branch, starting from bottom */
 	iter_node_flag = (struct cds_ft_inode_flag *) child_node;
