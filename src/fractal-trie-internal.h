@@ -242,20 +242,6 @@ enum ft_col_stride {
 #endif
 
 /*
- * Hardcoded type-index slots for the byte_popcount_1l (32B bitmap +
- * ptr table) nodes.  These two indices identify the largest two FT
- * internal-node tiers before pigeon.  Kept as compile-time constants
- * so the prefetch / get_nth_skip dispatch can short-circuit on them.
- */
-#if (CAA_BITS_PER_LONG < 64)
-# define FT_BP1L_IDX_A	4
-# define FT_BP1L_IDX_B	5
-#else
-# define FT_BP1L_IDX_A	5
-# define FT_BP1L_IDX_B	6
-#endif
-
-/*
  * Number of removals needed on a fallback node before we try to shrink
  * it.  Derived from FT_FALLBACK_REMOVAL_BITS to always use the full
  * range of the bitfield.
@@ -710,7 +696,7 @@ struct cds_ft_collapsed_node {
 
 struct cds_ft_bitmap {
 	/*
-	 * Bitmap is attached to the FT_BP1L_IDX_B and pigeon tiers for
+	 * Bitmap is attached to the largest popcount_1l tier and pigeon for
 	 * ordered traversals.  Comparative costs per ordered-traversal
 	 * step:
 	 *
@@ -1321,8 +1307,12 @@ static inline void ft_delay_reader(void) { }
  * Labels describe the underlying structure without requiring the
  * reader to know the build's pointer width:
  *   - LINEAR_<bytes>: byte-keys + ptr-table; total node size in bytes
- *     (= 2^order).
- *   - BP1L_<bytes>: byte_popcount_1l (32-byte 256-bit bitmap +
+ *     (= 2^order).  Only the smallest tier remains LINEAR; larger
+ *     tiers use popcount-bitmap layouts.
+ *   - P2L_<bytes>: popcount_2l (2-level root_bm + sub_bm[] popcount
+ *     layout; sub_bm bit width varies by tier and target pointer
+ *     width); total node size in bytes.
+ *   - P1L_<bytes>: popcount_1l (32-byte 256-bit bitmap +
  *     ptr-table); total node size in bytes.
  *   - PIGEON_<bytes>: 256-entry direct table; total node size in
  *     bytes (1024 on 32-bit, 2048 on 64-bit).
@@ -1344,16 +1334,15 @@ enum ft_tp_node_kind {
 	FT_TP_NODE_COMPRESSED		=  2,
 	FT_TP_NODE_COLLAPSED		=  3,
 	FT_TP_NODE_LINEAR_16		=  4,
-	FT_TP_NODE_LINEAR_32		=  5,
-	FT_TP_NODE_LINEAR_64		=  6,
-	FT_TP_NODE_LINEAR_128		=  7,
-	FT_TP_NODE_LINEAR_256		=  8,
-	FT_TP_NODE_BP1L_256		=  9,
-	FT_TP_NODE_BP1L_512		= 10,
-	FT_TP_NODE_BP1L_1024		= 11,
-	FT_TP_NODE_PIGEON_1024		= 12,
-	FT_TP_NODE_PIGEON_2048		= 13,
-	FT_TP_NODE_UNKNOWN		= 14,
+	FT_TP_NODE_P2L_32		=  5,
+	FT_TP_NODE_P2L_64		=  6,
+	FT_TP_NODE_P2L_128		=  7,
+	FT_TP_NODE_P1L_256		=  8,
+	FT_TP_NODE_P1L_512		=  9,
+	FT_TP_NODE_P1L_1024		= 10,
+	FT_TP_NODE_PIGEON_1024		= 11,
+	FT_TP_NODE_PIGEON_2048		= 12,
+	FT_TP_NODE_UNKNOWN		= 13,
 };
 
 #endif /* _URCU_FT_INTERNAL_H */

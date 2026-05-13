@@ -42,7 +42,7 @@
  * recompaction, and hysteresis at size thresholds prevents repeated
  * recompaction when the child count oscillates near a boundary.
  *
- * The popcount-bitmap configurations (2-level nibble bitmaps for
+ * The popcount-bitmap configurations (cascaded 2-level bitmaps for
  * small/medium fan-out, single 256-bit byte bitmap for large
  * fan-out) record which key bytes are populated in a fixed-position
  * bitmap and dispatch matches through a popcount-derived rank.
