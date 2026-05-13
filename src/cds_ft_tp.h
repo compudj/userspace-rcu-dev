@@ -113,7 +113,7 @@ LTTNG_UST_TRACEPOINT_ENUM(cds_ft, ft_tp_node_kind,
 		lttng_ust_field_enum_value("EXTERNAL",		FT_TP_NODE_EXTERNAL)
 		lttng_ust_field_enum_value("COMPRESSED",	FT_TP_NODE_COMPRESSED)
 		lttng_ust_field_enum_value("COLLAPSED",		FT_TP_NODE_COLLAPSED)
-		lttng_ust_field_enum_value("LINEAR_16",		FT_TP_NODE_LINEAR_16)
+		lttng_ust_field_enum_value("P1L_128",		FT_TP_NODE_P1L_128)
 		lttng_ust_field_enum_value("P2L_32",		FT_TP_NODE_P2L_32)
 		lttng_ust_field_enum_value("P2L_64",		FT_TP_NODE_P2L_64)
 		lttng_ust_field_enum_value("P2L_128",		FT_TP_NODE_P2L_128)

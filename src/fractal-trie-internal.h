@@ -232,14 +232,26 @@ enum ft_col_stride {
 #define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 1)	/* Maximum depth, including root. */
 
 /*
- * Entry for NULL node is at index 7 (32-bit) or 8 (64-bit) of the
+ * Entry for NULL node is at index 6 (32-bit) or 7 (64-bit) of the
  * table. It is never encoded in flags.
  */
 #if (CAA_BITS_PER_LONG < 64)
-# define NODE_INDEX_NULL		7
+# define NODE_INDEX_NULL		6
 #else
-# define NODE_INDEX_NULL		8
+# define NODE_INDEX_NULL		7
 #endif
+
+/*
+ * FT_INTERNAL_ORDER_MIN: alloc order of the smallest internal node type
+ * (index 0).  Internal-node orders increase by 1 per index (the
+ * ft_types[] table is constructed so this holds), so the prefetch fast
+ * path can derive an item's order as (type_index + FT_INTERNAL_ORDER_MIN)
+ * without loading ft_types[].
+ *
+ * Distinct from FT_ALLOC_ORDER_MIN, which is the allocator's minimum
+ * order (16 B) used by compressed nodes with short key tails.
+ */
+#define FT_INTERNAL_ORDER_MIN		5
 
 /*
  * Number of removals needed on a fallback node before we try to shrink
@@ -1326,10 +1338,10 @@ enum ft_tp_node_kind {
 	FT_TP_NODE_EXTERNAL		=  1,
 	FT_TP_NODE_COMPRESSED		=  2,
 	FT_TP_NODE_COLLAPSED		=  3,
-	FT_TP_NODE_LINEAR_16		=  4,
 	FT_TP_NODE_P2L_32		=  5,
 	FT_TP_NODE_P2L_64		=  6,
 	FT_TP_NODE_P2L_128		=  7,
+	FT_TP_NODE_P1L_128		=  4,
 	FT_TP_NODE_P1L_256		=  8,
 	FT_TP_NODE_P1L_512		=  9,
 	FT_TP_NODE_P1L_1024		= 10,
