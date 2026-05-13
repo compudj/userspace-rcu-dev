@@ -463,9 +463,6 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 	struct cds_ft_metadata_alloc *metadata_alloc =
 		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
 
-	/* Free extended density counters. */
-	if (metadata_alloc->metadata.nr_keys == UINT32_MAX)
-		free(metadata_alloc->metadata.density_ext);
 #ifdef FT_IMMEDIATE_FREE
 	/*
 	 * Immediate-free testing mode: poison metadata and node data

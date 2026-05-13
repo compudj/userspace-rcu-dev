@@ -387,49 +387,17 @@ struct cds_ft_inode;
 struct cds_ft_alloc_arena;
 
 /*
- * Extended density counters: lazily allocated when any compact
- * uint16_t counter would overflow FT_DENSITY_COMPACT_MAX.
- * Once allocated (monotonic promotion), never demoted back.
- * Write-side only (mutex-held), no RCU publish concerns.
- */
-#define FT_NODE_DENSITY_DEPTH	6
-#define FT_DENSITY_COMPACT_MAX	UINT8_MAX
-
-struct cds_ft_density_extended {
-	union {
-		struct {
-			unsigned long nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
-			unsigned long nr_keys;	/* Full-width nr_keys when compact
-						 * uint32_t overflows UINT32_MAX.
-						 */
-		};
-		struct cds_ft_density_extended *next;	/* Free-list linkage (pool). */
-	};
-};
-
-/*
  * Struct layout (32 bytes, zero internal padding):
  *   offset  0: 8-byte parent pointer
  *   offset  8: 8-byte external_nodes pointer
- *   offset 16: 8-byte density union (density_ext ptr / uint8_t[6])
+ *   offset 16: 8-byte nr_keys (unsigned long, total keys in subtree)
  *   offset 24: 4-byte packed bitfield (nr_child, skip_slot_offset,
  *              fallback_removal_count, alloc_index)
- *   offset 28: 4-byte nr_keys (uint32_t)
+ *   offset 28: 4-byte tail padding
  *
  * In cds_ft_metadata_alloc, rcu_head is a separate field placed
  * before the metadata union — no overlap with metadata fields.
  * All metadata fields remain valid throughout the RCU grace period.
- *
- * nr_keys == UINT32_MAX is the sentinel indicating that both
- * the density counters and nr_keys have been promoted to the
- * extended struct (density_ext).  This is the sole discriminator
- * for the density union: no separate flag is needed.
- *
- * Publication ordering: the writer stores the density_ext
- * pointer into the union BEFORE storing UINT32_MAX into nr_keys
- * with release semantics.  A reader that loads nr_keys with
- * acquire and sees UINT32_MAX is guaranteed to see the valid
- * density_ext pointer.  Promotion is monotonic (never demoted).
  */
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
@@ -446,21 +414,10 @@ struct cds_ft_metadata {
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
 
 	/*
-	 * Local node density counters and nr_keys (compact/extended).
-	 *
-	 * Compact (nr_keys < UINT32_MAX):
-	 *   uint8_t[6] density counters inline, nr_keys in uint32_t.
-	 * Extended (nr_keys == UINT32_MAX):
-	 *   density_ext pointer to struct holding full unsigned long
-	 *   density counters and nr_keys.
-	 *
-	 * Promotion triggered when any density counter > 255 or
-	 * nr_keys would reach UINT32_MAX.
+	 * Total unique keys in subtree.
+	 * Stored with uatomic_store release, loaded with acquire.
 	 */
-	union {
-		struct cds_ft_density_extended *density_ext;
-		uint8_t nr_nodes_at_depth[FT_NODE_DENSITY_DEPTH];
-	};
+	unsigned long nr_keys;
 
 	/*
 	 * Packed bitfield — small fields in a single uint32_t.
@@ -479,13 +436,6 @@ struct cds_ft_metadata {
 #endif
 	uint32_t fallback_removal_count:FT_FALLBACK_REMOVAL_BITS;
 	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
-
-	/*
-	 * Total unique keys in subtree.
-	 * Stored with uatomic_store release, loaded with acquire.
-	 * UINT32_MAX is a sentinel meaning "promoted to density_ext".
-	 */
-	uint32_t nr_keys;
 };
 
 /*
@@ -599,15 +549,6 @@ struct cds_ft {
 	unsigned long excl_writer_depth;
 	unsigned long excl_nr_readers;
 #endif
-
-	/*
-	 * Pre-allocated pool for density promotion (compact → extended).
-	 * Topped up at mutation entry (where -ENOMEM can be returned),
-	 * drawn from in ft_density_promote (after point of no return).
-	 * Write-side only — no synchronization needed.
-	 */
-	struct cds_ft_density_extended *density_pool;
-	unsigned int density_pool_count;
 
 	/* For debugging */
 	unsigned long node_fallback_count_distribution[FT_ENTRY_PER_NODE];
