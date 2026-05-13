@@ -209,20 +209,16 @@ struct cds_ft_type {
  */
 
 /*
- * Auto-enable popcount nodes on 64-bit targets where the compiler
- * advertises hardware POPCNT (via -mpopcnt, -msse4.2, or -march=
- * sandybridge / native / etc.).  Without hardware POPCNT the
- * popcount-bitmap scanners would lower __builtin_popcount to a
- * ~10-20-cycle software loop, defeating the purpose of the layout.
- * Users who want to force linear-only nodes -- e.g. for portability
- * testing or debugging -- can disable by passing
- * -DNO_FEATURE_FT_POPCOUNT_NODE on the compiler command line.
+ * FEATURE_FT_POPCOUNT_NODE: popcount-bitmap node layouts.  This is
+ * always defined now; the auto-gate is a transitional stub kept so
+ * existing #ifdef-guarded code can collapse incrementally in
+ * follow-up commits.  The compiler lowers __builtin_popcount* even
+ * without hardware POPCNT (~10-20 cycle software loop); for
+ * production performance build with -mpopcnt (or -msse4.2 /
+ * -march=sandybridge / native / etc.) so the scanners emit a single
+ * popcnt instruction.
  */
-#if !defined(FEATURE_FT_POPCOUNT_NODE) \
-		&& !defined(NO_FEATURE_FT_POPCOUNT_NODE) \
-		&& (defined(__POPCNT__) || defined(__SSE4_2__))
 #define FEATURE_FT_POPCOUNT_NODE
-#endif
 
 /*
  * The popcount scanners hardcode the pointer offset that matches
@@ -266,7 +262,6 @@ struct cds_ft_type {
 /* 32-bit pointers */
 enum {
 	ft_type_0_max_child = 3,
-#ifdef FEATURE_FT_POPCOUNT_NODE
 	/*
 	 * 32-bit max-density popcount tiers:
 	 *   idx 1  scan_16_16_max_5  32 B  hdr 12 B +  5 x 4 B = 32 B exact
@@ -283,33 +278,23 @@ enum {
 	ft_type_3_max_child = 16,
 	ft_type_4_max_child = 56,
 	ft_type_5_max_child = 120,
-#else
-	ft_type_1_max_child = 6,
-	ft_type_2_max_child = 12,
-	ft_type_3_max_child = 25,
-	ft_type_4_max_child = 48,
-	ft_type_5_max_child = 92,
-#endif
 	ft_type_6_max_child = 256,
 	ft_type_7_max_child = 0,	/* NULL */
 };
 
 enum {
 	ft_type_0_max_linear_child = 3,
-#ifdef FEATURE_FT_POPCOUNT_NODE
 	ft_type_1_max_linear_child = 5,
 	ft_type_2_max_linear_child = 12,
 	ft_type_3_max_linear_child = 16,
-#else
-	ft_type_1_max_linear_child = 6,
-	ft_type_2_max_linear_child = 12,
-	ft_type_3_max_linear_child = 25,
-	ft_type_4_max_linear_child = 24,
-	ft_type_5_max_linear_child = 23,
-#endif
 };
 
 enum {
+	/*
+	 * Retained for the trace-kind table at FT_TP_INTERNAL_TAG
+	 * (decoder needs the pool geometry to interpret historical
+	 * traces).  Not read at runtime in popcount mode.
+	 */
 	ft_type_4_nr_pool_order = 1,
 	ft_type_5_nr_pool_order = 2,
 };
@@ -317,83 +302,44 @@ enum {
 const struct cds_ft_type ft_types[] = {
 	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
 	[1] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
 		.type_class = FT_POPCOUNT,
 		.nibble_popcount_2l = true,
 		.min_child = 1,
-#else
-		.type_class = FT_LINEAR,
-		.min_child = 3,
-#endif
 		.max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP,
 	},
 	[2] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
 		.type_class = FT_POPCOUNT,
 		.nibble_popcount_2l = true,
 		.min_child = 3,
-#else
-		.type_class = FT_LINEAR,
-		.min_child = 4,
-#endif
 		.max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP,
 	},
 	[3] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
 		.type_class = FT_POPCOUNT,
 		.nibble_popcount_2l = true,
 		.min_child = 5,
-#else
-		.type_class = FT_LINEAR,
-		.min_child = 10,
-#endif
 		.max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP,
 	},
 
-	/* Pools may fill sooner than max_child */
 	/*
-	 * Indices 4 and 5 are historically pools (FT_POOL with subnode
-	 * dispatch).  When FEATURE_FT_POPCOUNT_NODE is enabled, the
-	 * "pool" layout collapses to a single 256-bit-bitmap + pointer
-	 * table spanning the whole node (no subnodes), like the 64-bit
-	 * popcount build.  type_class is FT_POPCOUNT in that case, so
-	 * all FT_POOL-specific code is dead and unreached.
+	 * Indices 4 and 5 use byte_popcount_1l (32 B bitmap + 4 B ptr
+	 * table fills the node exactly).  Their array slots retain the
+	 * FT_POOL_IDX_A / FT_POOL_IDX_B names for historical reasons;
+	 * no subnode dispatch happens here.
 	 */
-	/* This pool is hardcoded at index 4. See ft_node_ptr(). */
 	[FT_POOL_IDX_A] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
-		/*
-		 * byte_popcount_1l: 32 B bitmap + 56 * 4 B ptrs = 256 B,
-		 * fits the 256 B order-8 node exactly.  No subnode dispatch.
-		 */
+		/* 32 B bitmap + 56 * 4 B ptrs = 256 B (order-8). */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_4_max_child,
 		.byte_popcount_1l = true,
 		.min_child = 10,
-#else
-		.type_class = FT_POOL,
-		.max_linear_child = ft_type_4_max_linear_child,
-		.min_child = 20,
-#endif
 		.max_child = ft_type_4_max_child, .order = 8, .nr_pool_order = ft_type_4_nr_pool_order, .pool_size_order = 7, .bitmap = FT_NO_BITMAP },
-	/* This pool is hardcoded at index 5. See ft_node_ptr(). */
 	[FT_POOL_IDX_B] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
-		/*
-		 * byte_popcount_1l: 32 B bitmap + 120 * 4 B ptrs = 512 B,
-		 * fits the 512 B order-9 node exactly.  No subnode dispatch.
-		 */
+		/* 32 B bitmap + 120 * 4 B ptrs = 512 B (order-9). */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_5_max_child,
 		.byte_popcount_1l = true,
 		.min_child = 28,
 		.bitmap = FT_NO_BITMAP,
-#else
-		.type_class = FT_POOL,
-		.max_linear_child = ft_type_5_max_linear_child,
-		.min_child = 45,
-		.bitmap = FT_BITMAP,
-#endif
 		.max_child = ft_type_5_max_child, .order = 9, .nr_pool_order = ft_type_5_nr_pool_order, .pool_size_order = 7 },
 
 	/*
@@ -401,11 +347,7 @@ const struct cds_ft_type ft_types[] = {
 	 * beyond capacity, we roll back to pigeon.
 	 */
 	[6] = { .type_class = FT_PIGEON,
-#ifdef FEATURE_FT_POPCOUNT_NODE
 		.min_child = 51,
-#else
-		.min_child = 83,
-#endif
 		.max_child = ft_type_6_max_child, .order = 10, .bitmap = FT_BITMAP },
 
 	[7] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_7_max_child, .bitmap = FT_NO_BITMAP },
@@ -415,15 +357,8 @@ const struct cds_ft_type ft_types[] = {
 enum {
 	ft_type_0_max_child = 1,
 	ft_type_1_max_child = 3,
-	/* qp_6 layout: see ft_type_2_max_linear_child below. */
-#ifdef FEATURE_FT_POPCOUNT_NODE
-	ft_type_2_max_child = 6,
-	/* qp_14 layout: see ft_type_3_max_linear_child below. */
-	ft_type_3_max_child = 14,
-#else
-	ft_type_2_max_child = 7,
-	ft_type_3_max_child = 14,
-#endif
+	ft_type_2_max_child = 6,	/* scan_32_8 (per-slot 5+3, qp_6) */
+	ft_type_3_max_child = 14,	/* scan_64_4 (flat 6+2, qp_14) */
 	ft_type_4_max_child = 28,
 	ft_type_5_max_child = 54,
 	ft_type_6_max_child = 104,
@@ -435,28 +370,25 @@ enum {
 	ft_type_0_max_linear_child = 1,
 	ft_type_1_max_linear_child = 3,
 	/*
-	 * qp_6 (per-slot packed 5+3 split, max_lc=6) packs a 12-byte
-	 * popcount header (4B root + 8B packed sub_bms) + 6 x 8-byte
-	 * pointers into the 64B order-6 node.
+	 * scan_32_8 (per-slot 5+3 byte split, max_lc=6): 12-byte popcount
+	 * header (4B root + 8B packed sub_bms) + 6 x 8-byte pointers into
+	 * the 64B order-6 node.
 	 *
-	 * qp_14 (flat packed 6+2 split, max_lc=14) packs a 16-byte
-	 * popcount header (8B root + 8B packed_bms with 14 x 4-bit
-	 * sub_bms = 56 bits used) + 14 x 8-byte pointers into the 128B
-	 * order-7 node (16 + 14 * 8 = 128 exactly).
+	 * scan_64_4 (flat 6+2 byte split, max_lc=14): 16-byte popcount
+	 * header (8B root + 8B packed_bms with 14 x 4-bit sub_bms =
+	 * 56 bits used) + 14 x 8-byte pointers into the 128B order-7
+	 * node (16 + 14 * 8 = 128 exactly).
 	 */
-#ifdef FEATURE_FT_POPCOUNT_NODE
 	ft_type_2_max_linear_child = 6,
 	ft_type_3_max_linear_child = 14,
-#else
-	ft_type_2_max_linear_child = 7,
-	ft_type_3_max_linear_child = 14,
-#endif
-	ft_type_4_max_linear_child = 28,
-	ft_type_5_max_linear_child = 27,
-	ft_type_6_max_linear_child = 26,
 };
 
 enum {
+	/*
+	 * Retained for the trace-kind table at FT_TP_INTERNAL_TAG
+	 * (decoder needs the pool geometry to interpret historical
+	 * traces).  Not read at runtime in popcount mode.
+	 */
 	ft_type_5_nr_pool_order = 1,
 	ft_type_6_nr_pool_order = 2,
 };
@@ -464,84 +396,45 @@ enum {
 const struct cds_ft_type ft_types[] = {
 	[0] = { .type_class = FT_LINEAR, .min_child = 1, .max_child = ft_type_0_max_child, .max_linear_child = ft_type_0_max_linear_child, .order = 4, .bitmap = FT_NO_BITMAP },
 	[1] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
 		.type_class = FT_POPCOUNT,
 		.nibble_popcount_2l = true,
-#else
-		.type_class = FT_LINEAR,
-#endif
 		.min_child = 1, .max_child = ft_type_1_max_child, .max_linear_child = ft_type_1_max_linear_child, .order = 5, .bitmap = FT_NO_BITMAP,
 	},
 	[2] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
 		.type_class = FT_POPCOUNT,
 		.nibble_popcount_2l = true,
-#else
-		.type_class = FT_LINEAR,
-#endif
 		.min_child = 3, .max_child = ft_type_2_max_child, .max_linear_child = ft_type_2_max_linear_child, .order = 6, .bitmap = FT_NO_BITMAP,
 	},
 	[3] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
 		.type_class = FT_POPCOUNT,
 		.nibble_popcount_2l = true,
-#else
-		.type_class = FT_LINEAR,
-#endif
 		.min_child = 5, .max_child = ft_type_3_max_child, .max_linear_child = ft_type_3_max_linear_child, .order = 7, .bitmap = FT_NO_BITMAP,
 	},
 	[4] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
 		.type_class = FT_POPCOUNT,
 		.byte_popcount_1l = true,
-#else
-		.type_class = FT_LINEAR,
-#endif
-		.min_child = 10, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_linear_child, .order = 8, .bitmap = FT_NO_BITMAP,
+		.min_child = 10, .max_child = ft_type_4_max_child, .max_linear_child = ft_type_4_max_child, .order = 8, .bitmap = FT_NO_BITMAP,
 	},
 
-	/* Pools may fill sooner than max_child. */
 	/*
-	 * Indices 5 and 6 are historically pools (FT_POOL with subnode
-	 * dispatch).  When FEATURE_FT_POPCOUNT_NODE is enabled, the
-	 * "pool" layout collapses to a single 256-bit-bitmap + pointer
-	 * table spanning the whole node (no subnodes), which is just a
-	 * large linear-class node with the byte_popcount_1l layout
-	 * variant.  type_class is FT_LINEAR in that case, so all the
-	 * FT_POOL-specific code (subnode iteration, bit selector, post-
-	 * copy sweep, fallback split) is dead and unreached.
+	 * Indices 5 and 6 use byte_popcount_1l (32B bitmap + 8B ptr
+	 * table fills the node).  Their array slots retain the
+	 * FT_POOL_IDX_A / FT_POOL_IDX_B names for historical reasons;
+	 * no subnode dispatch happens here.
 	 */
-	/* This pool is hardcoded at index 5. See ft_node_ptr(). */
 	[FT_POOL_IDX_A] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
-		/*
-		 * byte_popcount_1l: 32B bitmap + 54*8B ptrs = 464B, fits
-		 * in the 512B order-9 node.  No subnode dispatch.
-		 */
+		/* 32B bitmap + 54 * 8B ptrs = 464B, fits 512B order-9. */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_5_max_child,
 		.byte_popcount_1l = true,
-#else
-		.type_class = FT_POOL,
-		.max_linear_child = ft_type_5_max_linear_child,
-#endif
 		.min_child = 22,
 		.max_child = ft_type_5_max_child,
 		.order = 9, .nr_pool_order = ft_type_5_nr_pool_order, .pool_size_order = 8, .bitmap = FT_NO_BITMAP },
-	/* This pool is hardcoded at index 6. See ft_node_ptr(). */
 	[FT_POOL_IDX_B] = {
-#ifdef FEATURE_FT_POPCOUNT_NODE
-		/*
-		 * byte_popcount_1l: 32B bitmap + 104*8B ptrs = 864B, fits
-		 * in the 1024B order-10 node.  No subnode dispatch.
-		 */
+		/* 32B bitmap + 104 * 8B ptrs = 864B, fits 1024B order-10. */
 		.type_class = FT_POPCOUNT,
 		.max_linear_child = ft_type_6_max_child,
 		.byte_popcount_1l = true,
-#else
-		.type_class = FT_POOL,
-		.max_linear_child = ft_type_6_max_linear_child,
-#endif
 		.min_child = 51,
 		.max_child = ft_type_6_max_child,
 		.order = 10, .nr_pool_order = ft_type_6_nr_pool_order, .pool_size_order = 8, .bitmap = FT_BITMAP },
