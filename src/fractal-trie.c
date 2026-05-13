@@ -6374,25 +6374,6 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 	return FT_DESCENT_CONTINUE;
 }
 
-static inline_lookup
-enum ft_descent_action ft_lookup_collapsed(
-		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
-		const uint8_t **key_p __attribute__((unused)),
-		unsigned int *i_p __attribute__((unused)),
-		unsigned int key_depth __attribute__((unused)),
-		struct cds_ft_iter *iter __attribute__((unused)),
-		size_t *iter_path_len_p __attribute__((unused)),
-		bool track __attribute__((unused)),
-		bool track_longest __attribute__((unused)),
-		size_t *match_len_p __attribute__((unused)),
-		struct cds_ft_node **match_node_p __attribute__((unused)),
-		struct cds_ft_node **found_ret __attribute__((unused)),
-		enum cds_ft_status *status_ret __attribute__((unused)),
-		bool candidate __attribute__((unused)))
-{
-	return FT_DESCENT_END;
-}
-
 /*
  * Simple compressed node traversal for read-side loops (replace,
  * count_keys_prefix).  Matches the key against the compressed path,
@@ -6438,18 +6419,6 @@ enum ft_descent_action ft_traverse_compressed(
 	if (ft_node_external(cn->child))
 		return FT_DESCENT_BREAK;
 	return FT_DESCENT_CONTINUE;
-}
-
-static
-enum ft_descent_action ft_traverse_collapsed(
-		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
-		struct cds_ft_inode_flag ***node_flag_ptr_p __attribute__((unused)),
-		const uint8_t **key_p __attribute__((unused)),
-		unsigned int *i_p __attribute__((unused)),
-		unsigned int key_depth __attribute__((unused)),
-		bool *not_found __attribute__((unused)))
-{
-	return FT_DESCENT_END;
 }
 
 /*
@@ -6612,21 +6581,6 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 				i--;
 				act = ft_lookup_compressed(&node_flag, &key, &i,
-					key_depth, iter, &iter_path_len,
-					track, track_longest,
-					&match_len, &match_node, &found, &status,
-					descend_cand);
-				if (act == FT_DESCENT_END)
-					goto end;
-				if (act == FT_DESCENT_BREAK)
-					break;
-				continue;
-			}
-			if (ft_node_collapsed(node_flag)) {
-				enum ft_descent_action act;
-
-				i--;
-				act = ft_lookup_collapsed(&node_flag, &key, &i,
 					key_depth, iter, &iter_path_len,
 					track, track_longest,
 					&match_len, &match_node, &found, &status,
@@ -7283,23 +7237,6 @@ out_break:
 	return FT_DESCENT_BREAK;
 }
 
-static inline_lookup
-enum ft_descent_action ft_inequality_collapsed(
-		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
-		ssize_t *level_p __attribute__((unused)),
-		ssize_t key_depth __attribute__((unused)),
-		ssize_t max_tree_depth __attribute__((unused)),
-		enum ft_lookup_inequality mode __attribute__((unused)),
-		enum ft_lookup_limit limit __attribute__((unused)),
-		const uint8_t **iter_key_p __attribute__((unused)),
-		const uint8_t *input_key __attribute__((unused)),
-		struct cds_ft_iter *iter __attribute__((unused)),
-		uint8_t *ordinal_key __attribute__((unused)),
-		bool *skip_eq_external_nodes_p __attribute__((unused)))
-{
-	return FT_DESCENT_GOING_UP;
-}
-
 /*
  * Handle a compressed node during the inequality minmax descent.
  *
@@ -7382,21 +7319,6 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 		return FT_DESCENT_BREAK;
 	*skip_eq_external_nodes_p = false;
 	return FT_DESCENT_CONTINUE;
-}
-
-static inline_lookup
-enum ft_descent_action ft_inequality_minmax_collapsed(
-		struct cds_ft_inode_flag **node_flag_p __attribute__((unused)),
-		ssize_t *level_p __attribute__((unused)),
-		struct cds_ft_node **ret_node_p __attribute__((unused)),
-		bool *skip_eq_external_nodes_p __attribute__((unused)),
-		bool *going_up_p __attribute__((unused)),
-		struct cds_ft_iter *iter __attribute__((unused)),
-		uint8_t *ordinal_key __attribute__((unused)),
-		enum ft_direction dir __attribute__((unused)),
-		ssize_t max_tree_depth __attribute__((unused)))
-{
-	return FT_DESCENT_GOING_UP;
 }
 
 static inline_lookup
@@ -7588,35 +7510,6 @@ slow_path:
 			if (act == FT_DESCENT_BREAK)
 				break;
 			if (level + 1 >= key_depth) {
-				skip_eq_external_nodes = false;
-				goto descend_children;
-			}
-			continue;
-		}
-		if (ft_node_collapsed(node_flag)) {
-			enum ft_descent_action act;
-
-			act = ft_inequality_collapsed(&node_flag,
-				&level, key_depth,
-				ft->group->max_tree_depth,
-				mode, limit,
-				&iter_key, input_key, iter,
-				ordinal_key, &skip_eq_external_nodes);
-			if (act == FT_DESCENT_GOING_UP)
-				goto going_up;
-			if (act == FT_DESCENT_DESCEND_CHILDREN)
-				goto descend_children;
-			if (act == FT_DESCENT_BREAK)
-				break;
-			/*
-			 * CONTINUE: the suffix advanced level.  If the
-			 * for-loop increment would push level past
-			 * key_depth, descend into the child to find
-			 * the min/max leaf rather than exiting the
-			 * loop with a non-leaf node.
-			 */
-			if (level + 1 >= key_depth) {
-				level++;
 				skip_eq_external_nodes = false;
 				goto descend_children;
 			}
@@ -8020,23 +7913,6 @@ descend_children:
 				iter, ordinal_key, dir);
 			if (act == FT_DESCENT_FOUND_MINMAX)
 				goto found_minmax;
-			if (act == FT_DESCENT_BREAK)
-				break;
-			assert(act == FT_DESCENT_CONTINUE);
-			continue;
-		}
-		if (ft_node_collapsed(node_flag)) {
-			enum ft_descent_action act;
-
-			act = ft_inequality_minmax_collapsed(
-				&node_flag, &level, &ret_node,
-				&skip_eq_external_nodes, &going_up,
-				iter, ordinal_key, dir,
-				(ssize_t) ft->group->max_tree_depth);
-			if (act == FT_DESCENT_FOUND_MINMAX)
-				goto found_minmax;
-			if (act == FT_DESCENT_GOING_UP)
-				goto going_up;
 			if (act == FT_DESCENT_BREAK)
 				break;
 			assert(act == FT_DESCENT_CONTINUE);
@@ -10804,22 +10680,6 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			enum ft_descent_action act;
 
 			act = ft_traverse_compressed(&node_flag,
-				&node_flag_ptr, &iter_key, &i,
-				key_depth, &nf);
-			if (nf) {
-				s = CDS_FT_STATUS_NOT_FOUND;
-				FT_TP(replace_exit, (int) s);
-				return s;
-			}
-			if (act == FT_DESCENT_BREAK)
-				break;
-			continue;
-		}
-		if (ft_node_collapsed(node_flag)) {
-			bool nf = false;
-			enum ft_descent_action act;
-
-			act = ft_traverse_collapsed(&node_flag,
 				&node_flag_ptr, &iter_key, &i,
 				key_depth, &nf);
 			if (nf) {
