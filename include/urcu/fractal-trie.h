@@ -2437,18 +2437,14 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t 
  * @out: File stream for diagnostic output on failure (may be NULL
  *       to suppress output).
  *
- * Recursively walks every internal, compressed, and collapsed node
- * starting from the root, checking that:
+ * Recursively walks every internal and compressed node starting
+ * from the root, checking that:
  * - nr_child matches the actual count of non-NULL child slots.
  * - nr_keys equals the sum of children's nr_keys plus the count
  *   of unique keys from local external node chains.
  * - Parent pointers of children point back to the correct parent.
  * - Compressed node invariants (len >= 1, no external_nodes on
  *   the compressed node itself).
- * - Collapsed node invariants (live entries consistent).
- *
- * Density counters are not verified: they are maintained
- * incrementally and serve as a heuristic for collapse decisions.
  *
  * Must be called with mutual exclusion wrt updaters.
  *
@@ -2458,18 +2454,11 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t 
 enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
 
 /*
- * cds_ft_verify_density - Verify density counters of the entire Fractal Trie.
- * @ft: The Fractal Trie.
- * @out: File stream for diagnostic output on failure (may be NULL).
+ * cds_ft_verify_density - Verify density counters (no-op stub).
  *
- * Recursively recomputes every node's density counters from its
- * children and compares with the stored values.  Reports all nodes
- * with mismatches (does not stop at the first).
- *
- * Must be called with mutual exclusion wrt updaters.
- *
- * Returns CDS_FT_STATUS_OK if all density counters match, or
- * CDS_FT_STATUS_INTEGRITY_ERROR if any mismatch is found.
+ * Density counters were retired; this entry point always returns
+ * CDS_FT_STATUS_OK without inspecting the trie.  Kept for source
+ * compatibility with existing call sites.
  */
 enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft, FILE *out);
 
@@ -2477,17 +2466,16 @@ enum cds_ft_status cds_ft_verify_density(const struct cds_ft *ft, FILE *out);
  * cds_ft_show_format - Output format for cds_ft_show().
  *
  * CDS_FT_SHOW_PRETTY: human-readable indented text, suitable for
- *   debugging printouts.  Emits level headers, node kinds, density
- *   counters, and per-edge key-byte values.
+ *   debugging printouts.  Emits level headers, node kinds, and
+ *   per-edge key-byte values.
  * CDS_FT_SHOW_JSON:   machine-readable JSON tree.  The root document
  *   is an object with "ft" (pointer) and "root" (node).  Each node
- *   carries "ptr", "kind", "level", optional "nr_child", "density",
- *   and a "children" array whose entries are
+ *   carries "ptr", "kind", "level", optional "nr_child", and a
+ *   "children" array whose entries are
  *   {"key_byte": N, "child": <node>}.  Compressed nodes additionally
- *   carry "path_len" and "child"; collapsed nodes carry "entries":
- *   [{"suffix": [...], "child": <node>}, ...].  External nodes carry
- *   just "ptr" and "kind".  Intended for programmatic consumption
- *   (visualizers, test assertions).
+ *   carry "path_len" and "child".  External nodes carry just "ptr"
+ *   and "kind".  Intended for programmatic consumption (visualizers,
+ *   test assertions).
  */
 enum cds_ft_show_format {
 	CDS_FT_SHOW_PRETTY,

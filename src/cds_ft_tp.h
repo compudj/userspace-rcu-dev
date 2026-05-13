@@ -101,11 +101,10 @@ LTTNG_UST_TRACEPOINT_ENUM(cds_ft, ft_compressed_action,
  * defined alongside the helper.
  *
  * Internal labels are <class>_<size_in_bytes>; size = 2^order
- * where order is the ft_types[i].order field.  Collapsed labels
- * encode the scan-size variant.  The exact labels realized in a
- * trace depend on build-time configuration (32-bit vs 64-bit); the
- * full superset is listed here so the same provider metadata works
- * on any build.
+ * where order is the ft_types[i].order field.  The exact labels
+ * realized in a trace depend on build-time configuration (32-bit
+ * vs 64-bit); the full superset is listed here so the same
+ * provider metadata works on any build.
  */
 LTTNG_UST_TRACEPOINT_ENUM(cds_ft, ft_tp_node_kind,
 	LTTNG_UST_TP_ENUM_VALUES(
@@ -294,8 +293,8 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, ft_destroy,
  * root-slot publish, which has no structural parent node).
  *
  * The root_kind field lets a consumer distinguish the kind of
- * the new root (internal, compressed, collapsed, external) in
- * the same enum as tree_edge_set's parent_kind/child_kind, so
+ * the new root (internal, compressed, external) in the same
+ * enum as tree_edge_set's parent_kind/child_kind, so
  * the consumer can tag the root node correctly without having
  * to observe a separate event.
  */
@@ -312,20 +311,6 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, root_publish,
 	)
 )
 
-/*
- * Collapsed-node entry (re)publish.
- *
- * A collapsed node stores up to 256 entries, each with a variable-
- * length byte suffix and a child pointer.  Rather than emit the
- * entire entry table in a single event (which cannot easily
- * accommodate the nested variable-length suffixes), a separate
- * event per entry is emitted whenever a slot is installed or its
- * child pointer changes.  Consumers accumulate the state keyed by
- * (col, entry_idx).
- *
- * `dead` is 0 for a live entry (install / update) and non-zero
- * for an entry being logically removed.
- */
 /*
  * Structural edge change: a parent node's child slot at ordinal
  * byte `key_byte` is now `child`.  Fired after ft_node_set_nth()
@@ -845,27 +830,6 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, inv_violation,
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_string(test, test_name)
 		lttng_ust_field_string(msg, message)
-	)
-)
-
-LTTNG_UST_TRACEPOINT_EVENT(cds_ft, collapsed_suffix_len_bad,
-	LTTNG_UST_TP_ARGS(
-		const void *, col,
-		unsigned int, i,
-		unsigned int, nr_entries,
-		unsigned int, start,
-		unsigned int, end,
-		uint8_t, data_i,
-		uint8_t, data_prev
-	),
-	LTTNG_UST_TP_FIELDS(
-		lttng_ust_field_integer_hex(uintptr_t, col, (uintptr_t) col)
-		lttng_ust_field_integer(unsigned int, i, i)
-		lttng_ust_field_integer(unsigned int, nr_entries, nr_entries)
-		lttng_ust_field_integer(unsigned int, start, start)
-		lttng_ust_field_integer(unsigned int, end, end)
-		lttng_ust_field_integer(uint8_t, data_i, data_i)
-		lttng_ust_field_integer(uint8_t, data_prev, data_prev)
 	)
 )
 

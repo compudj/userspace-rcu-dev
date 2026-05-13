@@ -36,25 +36,15 @@
  * This can be used for variable length keys to identify the end of key.
  */
 /*
- * Pointer tag encoding (bits 0-2):
+ * Pointer tag encoding (bits 0-1):
  *
- *   (ptr & 0b111) == 0b000  →  external node (leaf) or NULL
+ *   (ptr & 0b011) == 0b00   →  external node (leaf) or NULL
  *   (ptr & 0b001) == 0b001  →  internal node (bit 0 set), bits 1-3 = type index
- *   (ptr & 0b111) == 0b010  →  compressed path node
- *   (ptr & 0b111) == 0b110  →  collapsed subtree node
+ *   (ptr & 0b011) == 0b010  →  compressed path node
  *
- * Internal nodes always have bit 0 set; the type index encoding in
- * bits 1-3 is unchanged.  Compressed nodes use bits 1-2 with bit 0
- * clear; bit 3 is unused (16-byte alignment).
- *
- * Collapsed nodes are 64-byte aligned (smallest tier is 64B), so
- * pointer bits 4-5 are also tag-safe.  They carry the tier index:
- *
- *   bits 4-5 = collapsed tier (0..3) → capacity 3, 7, 12, 28
- *
- * External nodes have bits 0-2 clear (external nodes are 8-byte aligned).
- * Compressed nodes are >= 16-byte aligned (strided allocator
- * minimum order 4); bits 0-3 are available.
+ * Internal nodes always have bit 0 set; the type index encoding lives
+ * in bits 1-3.  Compressed nodes use bit 1 with bit 0 clear (16-byte
+ * alignment).  External nodes have bits 0-1 clear (8-byte aligned).
  */
 #define FT_INTERNAL_BITS	1
 #define FT_INTERNAL_MASK	(1U << 0)
@@ -282,16 +272,6 @@
 #ifndef NO_FEATURE_FT_COMPRESS
 # define FEATURE_FT_COMPRESS
 #endif
-/*
- * FEATURE_FT_COLLAPSE retired (2026-05-13).  A/B benchmark showed
- * lookup speed favored disabled collapse across 21/28 dataset×engine
- * combinations, and mutation cost without collapse was 60-99% lower.
- * The collapsed-node tier-and-stride machinery is being torn out in
- * follow-up commits; this header gate is force-disabled in the
- * interim so smoke continues to pass while the removal happens
- * incrementally.  See task #28 (bench A/B) and commit log for
- * details.
- */
 
 /*
  * Skip-compressed pointers encode the compressed path length in the
@@ -443,12 +423,12 @@ struct cds_ft_metadata {
  * nodes with a single node storing the key bytes inline.
  *
  * cn->child can point to any node type: internal, compressed,
- * collapsed, or external.  An external child means a key terminates
- * at the end of the compressed path.  However, the compressed node's
+ * or external.  An external child means a key terminates at the
+ * end of the compressed path.  However, the compressed node's
  * metadata->external_nodes must NOT be used — variable-length key
- * entries belong on internal or collapsed nodes (which can have
+ * entries belong on internal nodes (which can have
  * metadata->external_nodes), or as child pointer of a compressed
- * or collapsed node.
+ * node.
  *
  * Tagged in the parent's child pointer with FT_COMPRESSED_MASK
  * (bit 1 set, bit 0 clear).
@@ -857,10 +837,9 @@ void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
  * never published (no reader can possibly hold a reference).  Bypasses
  * call_rcu and returns the slot directly to the arena free list.
  *
- * Use only for nodes that never escaped the writer's stack (e.g.,
- * speculative candidate collapsed nodes evaluated by
- * ft_try_collapse_at_node and rejected before publication).  Calling
- * this on a published node corrupts concurrent readers.
+ * Use only for nodes that never escaped the writer's stack (i.e.,
+ * speculative candidate nodes built but rejected before publication).
+ * Calling this on a published node corrupts concurrent readers.
  */
 __attribute__((visibility("hidden")))
 void cds_ft_free_item_unpublished(struct cds_ft *ft, struct cds_ft_metadata *metadata);
@@ -1023,8 +1002,6 @@ static inline void ft_delay_reader(void) { }
  *     ptr-table); total node size in bytes.
  *   - PIGEON_<bytes>: 256-entry direct table; total node size in
  *     bytes (1024 on 32-bit, 2048 on 64-bit).
- *   - COLLAPSED: single label; the scan-size variant requires reading
- *     the node header and is intentionally not exposed in this enum.
  *
  * Skip-compression is an orthogonal property (a skip-compressed
  * pointer can point to any underlying node type), so it is not

@@ -1000,8 +1000,8 @@ int ft_word_mismatch(unsigned long va, unsigned long vb,
  * checks are constant-folded at each call site.
  *
  * Dispatch is ordered by frequency: short keys (< 8 bytes) are the
- * most common case in trie traversal (collapsed suffixes, compressed
- * paths), followed by medium keys, then long keys where SIMD helps.
+ * most common case in trie traversal (compressed paths), followed
+ * by medium keys, then long keys where SIMD helps.
  */
 
 /*
@@ -1218,8 +1218,8 @@ int ft_cmp_avx2(const uint8_t *a, const uint8_t *b,
  * ft_key_cmp_ordinals: compare @len bytes in ordinal space.
  *
  * Dispatch in natural increasing order:
- *   < 8:  tiny (masked word or byte-by-byte) — hot for collapsed
- *         suffixes and short compressed paths
+ *   < 8:  tiny (masked word or byte-by-byte) — hot for short
+ *         compressed paths
  *   < 16: word-at-a-time + overlapping tail
  *   >= 16: SSE2 loop + overlapping 16-byte tail
  */
@@ -1318,8 +1318,8 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
  * no dependency on bit 0.
  *
  * For non-internal nodes (bit 0 clear): external nodes are >= 8-byte
- * aligned (bits 0-2 zero), compressed/collapsed are >= 16-byte
- * aligned with tags in bits 1-2.  A fixed ~7UL mask suffices.
+ * aligned (bits 0-2 zero), compressed nodes are >= 16-byte aligned
+ * with tag in bit 1.  A fixed ~7UL mask suffices.
  *
  * The conditional select lets the two mask computations run in
  * parallel; the compiler emits a CMOV, keeping the critical path
@@ -1491,7 +1491,7 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
  * ft_skip_to_compressed: recover the compressed node from a skip
  * pointer by following the child's parent back-pointer.
  *
- * For internal/compressed/collapsed children: uses metadata->parent.
+ * For internal/compressed children: uses metadata->parent.
  * For external (leaf) children: uses cds_ft_node.prev (which points
  * to the parent for the head of a duplicate chain).
  *
@@ -1523,7 +1523,7 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
  * Iterators and lookups maintain this invariant by convention —
  * iter->node always refers to the chain head.
  *
- * For internal/compressed/collapsed nodes: returns metadata->parent.
+ * For internal/compressed nodes: returns metadata->parent.
  *
  * Returns NULL when @node is at the root position, or when @node
  * has been orphaned by a concurrent detach / graft_swap that
@@ -2002,12 +2002,12 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
  * type:
  *   - bit 0      = FT_INTERNAL_MASK (1 = internal node)
  *   - bits 1..3  = type index (when internal) or class selector
- *                  (when not: 00=external, 01=compressed, 11=collapsed)
+ *                  (when not: 00=external, 01=compressed)
  *
- * Compressed and collapsed nodes are 16-byte aligned, so bit 3 is
- * guaranteed zero for them.  External nodes need only 8-byte
- * alignment (low 3 bits = 000), so bit 3 may be either value — both
- * [0b0000] and [0b1000] map to EXTERNAL.
+ * Compressed nodes are 16-byte aligned, so bit 3 is guaranteed zero
+ * for them.  External nodes need only 8-byte alignment (low 3 bits
+ * = 000), so bit 3 may be either value — both [0b0000] and [0b1000]
+ * map to EXTERNAL.
  *
  * Skip-compressed pointers are special-cased before the table lookup
  * (the only exception); the table itself is a pure pointer-bits
@@ -2083,9 +2083,9 @@ uint16_t ft_tp_node_kind(struct cds_ft_inode_flag *nf)
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
 	 * Skip-compression is orthogonal to the underlying node type: a
-	 * skip pointer still points to a real child (external, internal,
-	 * collapsed, ...).  Strip the skip-length bits so the dispatch
-	 * table sees the underlying child's tag bits; the companion
+	 * skip pointer still points to a real child (external or
+	 * internal).  Strip the skip-length bits so the dispatch table
+	 * sees the underlying child's tag bits; the companion
 	 * ft_tp_node_skip_len() field exposes the skip length separately.
 	 */
 	if (ft_node_skip_compressed(nf))
@@ -2362,42 +2362,6 @@ unsigned int ft_compressed_order(uint8_t path_len)
 	return (unsigned int) order;
 }
 
-/*
- * ft_node_readside_footprint: return the read-side memory footprint
- * of a traversable node, in 16-byte units.
- *
- * Skip-compressed nodes return 0: the reader never loads the
- * compressed node — the skip length is encoded in the pointer's
- * high bits, so traversal is free.
- *
- * For other types, returns the arena allocation size (1 << order)
- * in 16-byte units: (1 << order) / 16 = 1 << (order - 4).
- *
- * Write-side only (may chase parent pointers for skip resolution).
- */
-static
-unsigned int ft_node_readside_footprint(const struct cds_ft *ft,
-		struct cds_ft_inode_flag *node_flag)
-{
-	unsigned int order;
-
-	if (ft_node_compressed(node_flag)) {
-		struct cds_ft_compressed_node *cn =
-			ft_compressed_node_ptr(node_flag);
-		if (ft_group_skip_compressed(ft->group) &&
-		    cn->len <= FT_SKIP_LEN_MAX)
-			return 0;
-		order = ft_compressed_order(cn->len);
-	} else if (ft_node_skip_compressed(node_flag)) {
-		return 0;
-	} else {
-		/* Internal: linear, popcount, or pigeon. */
-		order = ft_types[ft_node_type(node_flag)].order;
-	}
-	assert(order >= 4);
-	return 1U << (order - 4);
-}
-
 static
 struct cds_ft_compressed_node *alloc_compressed_node(struct cds_ft *ft,
 		uint8_t path_len,
@@ -2454,35 +2418,14 @@ void free_compressed_node_unpublished(struct cds_ft *ft,
 	}
 }
 
-/*
- * Collapsed node configurations (SoA layout — see header for the
- * full per-tier byte map).
- *
- *   Tier  Alloc  Header  Entries  Capacity  Read-side CLs (typical)
- *   T0    64B    16B     48B      3          1 (header+entries share line)
- *   T1    128B   16B     112B     7          2 (header CL + 1 entry CL)
- *   T2    256B   64B     192B     12         2 (header CL + 1 entry CL)
- *   T3    512B   64B     448B     28         2 (header CL + 1 entry CL)
- *
- * Header holds two prefix-cache vectors (prefix_0[capacity] and
- * prefix_1[capacity], padded to a tier-dependent SIMD-load stride).
- * Entries are 16-byte fixed-stride records (suffix[7] | len | child).
- *
- * Capacity is implicit from the tier — there is no in-node count
- * byte.  Liveness is per-slot (entry.child == NULL marks a dead
- * slot).  Live entries appear in lexicographic order across slots.
- */
-
-
 #define __FT_ALIGN_MASK(v, mask)	(((v) + (mask)) & ~(mask))
 #define FT_ALIGN(v, align)		__FT_ALIGN_MASK(v, (typeof(v)) (align) - 1)
 #define __FT_FLOOR_MASK(v, mask)	((v) & ~(mask))
 #define FT_FLOOR(v, align)		__FT_FLOOR_MASK(v, (typeof(v)) (align) - 1)
 
 /*
- * Push a node and its depth onto the snapshot stack.
- * Used to maintain the parallel snapshot_depth[] array alongside
- * snapshot[] for local node density propagation.
+ * Push a node and its depth onto the snapshot stack, maintaining the
+ * parallel snapshot_depth[] array alongside snapshot[].
  */
 #define ft_snapshot_push(snap, snap_depth, nr, node_flag, depth)	\
 	do {								\
@@ -2683,9 +2626,8 @@ static inline void ft_maybe_prefetch(const void *ptr)
  *                      metadata->nr_keys before further descent.
  *                      For external children, prefetches the node
  *                      body instead (no FT metadata exists).  For
- *                      compressed / collapsed children, skips —
- *                      their own handlers prefetch cn->child /
- *                      col->data.
+ *                      compressed children, skips — their own
+ *                      handlers prefetch cn->child.
  *   FT_PF_BITMAP_META: same as META plus prefetches the bitmap
  *                      cache line for bitmap-bearing children
  *                      (used by ordered get_direction traversal).
@@ -2718,8 +2660,8 @@ void ft_prefetch_child_meta(const void *ptr)
 		 * External (bits 0-2 == 0): no FT metadata.  Prefetch the
 		 * node body, which the META-hint caller typically reads
 		 * next (user_data / ->next for the duplicate chain).
-		 * Compressed / collapsed children: their handlers
-		 * prefetch their own targets; skip here.
+		 * Compressed children: their handlers prefetch their own
+		 * targets; skip here.
 		 */
 		if ((v & FT_TAG_MASK) == 0)
 			__builtin_prefetch((const void *) v);
@@ -4027,7 +3969,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	struct cds_ft_inode *node;
 	unsigned int type_index;
 
-	/* External / compressed / collapsed: internal flag clear. */
+	/* External / compressed: internal flag clear. */
 	if (caa_unlikely(!(tag & FT_INTERNAL_MASK))) {
 		if (caa_unlikely(node_flag_ptr))
 			*node_flag_ptr = NULL;
@@ -4109,7 +4051,7 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
  * well-formed trie).
  *
  * Only handles internal node types (linear, popcount, pigeon).
- * Compressed and collapsed parents are handled separately by callers.
+ * Compressed parents are handled separately by callers.
  * Write-side only (mutex-held).
  */
 static
@@ -5607,15 +5549,14 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * root or compressed child from ft_node_get_nth).
 		 */
 		/*
-		 * Non-internal nodes at this position (compressed or
-		 * collapsed) need special handling.  Internal (bit 0
-		 * set) is the common case — skip directly to the
-		 * key dispatch below.
+		 * Non-internal nodes at this position (compressed) need
+		 * special handling.  Internal (bit 0 set) is the common
+		 * case — skip directly to the key dispatch below.
 		 */
 		/*
 		 * Skip-compressed pointer at loop top: handles skip
-		 * pointers returned by collapsed entry children or
-		 * by ft_node_get_nth in the previous iteration.
+		 * pointers returned by ft_node_get_nth in the previous
+		 * iteration.
 		 *
 		 * Non-candidate: convert to compressed flag so the
 		 * compressed handler below processes it with full
@@ -5658,10 +5599,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		 * Internal (bit 0 set) is the common case.
 		 *
 		 * This single check handles both:
-		 * - compressed/collapsed from previous iteration's
-		 *   get_nth result
-		 * - compressed/collapsed/external from compressed
-		 *   or collapsed handler output
+		 * - compressed from previous iteration's get_nth result
+		 * - compressed/external from compressed handler output
 		 */
 		if (caa_unlikely(!ft_node_internal(node_flag))) {
 			if (ft_node_compressed(node_flag)) {
@@ -5828,7 +5767,7 @@ end:
 	 * found at the leaf against the user's stored key bytes via the
 	 * inline SIMD/SWAR comparator before reporting success.  A
 	 * mismatch — caused by a wrong descent through a multi-byte
-	 * compressed/collapsed prefix that the cand-mode descent did not
+	 * compressed prefix that the cand-mode descent did not
 	 * verify — is reported as NOT_FOUND.
 	 */
 	if (spec_validate && status == CDS_FT_STATUS_OK && found) {
@@ -6357,12 +6296,12 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 		 * branch -- either way the compressed itself is no longer
 		 * reachable when it becomes empty).
 		 *
-		 * Unlike the collapsed empty-scan case and the internal
-		 * minmax == NULL case (both transiently observable and
-		 * handled via going_up above/below), there is no race
-		 * window in which a reachable compressed has cn->child ==
-		 * NULL.  Observing NULL here is a real bug: abort loudly
-		 * instead of silently propagating a corrupt node_flag.
+		 * Unlike the internal minmax == NULL case (transiently
+		 * observable and handled via going_up above/below), there
+		 * is no race window in which a reachable compressed has
+		 * cn->child == NULL.  Observing NULL here is a real bug:
+		 * abort loudly instead of silently propagating a corrupt
+		 * node_flag.
 		 */
 		fprintf(stderr,
 			"BUG: cds_ft_lookup_inequality minmax: "
@@ -6976,13 +6915,11 @@ descend_children:
 	}
 	/*
 	 * Every break path in the descent loop sets node_flag to a
-	 * validated external (compressed-branch external child,
-	 * collapsed-branch best_child that turned out external, or
+	 * validated external (compressed-branch external child or
 	 * minmax-branch external return).  Transiently-empty
-	 * intermediate steps (see collapsed best == UINT_MAX and
-	 * non-root minmax == NULL above) do not reach this assert
-	 * -- they jump to going_up and re-enter the search at a
-	 * higher level.
+	 * intermediate steps (non-root minmax == NULL above) do not
+	 * reach this assert -- they jump to going_up and re-enter the
+	 * search at a higher level.
 	 */
 	assert(ft_node_ptr(node_flag));
 	ret_node = (struct cds_ft_node *) node_flag;
@@ -7278,10 +7215,9 @@ void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo)
  * ft_propagate_external_count_parent: propagate nr_keys delta
  * from @start up to the root via metadata->parent pointers.
  *
- * @start: deepest internal/compressed/collapsed node on the path
- *         (the node where the external was attached, or the
- *         deepest ancestor with metadata).  Must not be an
- *         external node or NULL.
+ * @start: deepest internal/compressed node on the path (the node
+ *         where the external was attached, or the deepest ancestor
+ *         with metadata).  Must not be an external node or NULL.
  * @delta: +1 for insert, -1 for remove.
  *
  * Same ordering guarantees as the snapshot-based variant:
@@ -8430,10 +8366,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 		if (!d.nf)
 			break;
 		/*
-		 * Resolve skip-compressed pointer.  Can appear after
-		 * descending through a collapsed entry whose child was
-		 * later split/recompacted, or after a collapse publish
-		 * updated the parent's skip pointer.  Convert to the
+		 * Resolve skip-compressed pointer.  Convert to the
 		 * underlying compressed flag so the compressed handler
 		 * below processes it correctly.
 		 */
@@ -8703,7 +8636,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 		if (!d.nf)
 			break;
-		/* Resolve skip-compressed (e.g. from collapsed entry). */
+		/* Resolve skip-compressed pointer. */
 		d.nf = ft_resolve_skip_compressed(d.nf);
 		if (ft_node_external(d.nf))
 			break;
@@ -9692,19 +9625,6 @@ enum cds_ft_status ft_remove_descent_compressed(
 	return CDS_FT_STATUS_OK;
 }
 
-/*
- * Handle a collapsed node in cds_ft_remove / cds_ft_remove_all's
- * descent loop.  Scan entries for a suffix match against
- * key[dd->d.depth..key_len-1]; only entries with slen <= remaining
- * are considered (no partial-prefix explode here, since remove
- * targets an exact key).
- *
- * On match: track the detach point, advance dd and *iter_key_p
- * past the matched span, refresh the pending detach pointer if
- * needed, and return CDS_FT_STATUS_OK so the caller continues
- * the descent.  On no-match (or match with NULL pointer slot):
- * return CDS_FT_STATUS_NOT_FOUND.
- */
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
@@ -9748,7 +9668,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
-		/* Resolve skip-compressed (e.g. from collapsed entry). */
+		/* Resolve skip-compressed pointer. */
 		dd.d.nf = ft_resolve_skip_compressed(dd.d.nf);
 
 		/*
@@ -10361,23 +10281,6 @@ enum ft_descent_action ft_descend_to_graft_point_compressed(
 	return FT_DESCENT_BREAK;
 }
 
-/*
- * Match a single collapsed-entry suffix against key[d->depth..key_len-1]
- * and step into the matched child.  Mirrors ft_descent_step (single-
- * byte step) and ft_descent_traverse_compressed (multi-byte compressed
- * step) for the collapsed-node case.
- *
- * Only entries with slen <= remaining are considered (no partial-
- * prefix split is performed here — callers that need an explode
- * handle that case before calling this helper).  On match: snapshot
- * the collapsed node, advance d and *ik_p past the matched span,
- * return FT_DESCENT_CONTINUE.  On no-match: return
- * FT_DESCENT_BREAK, leaving d at the collapsed node so the
- * caller can decide what that means in its phase (graft point,
- * insert-replace key terminus, ...).
- *
- * Used by ft_descend_to_graft_point and _cds_ft_insert_replace.
- */
 static
 void ft_descend_to_graft_point(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -10396,7 +10299,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 
 		if (ft_node_external(d->nf))
 			break;
-		/* Resolve skip-compressed (e.g. from collapsed entry). */
+		/* Resolve skip-compressed pointer. */
 		d->nf = ft_resolve_skip_compressed(d->nf);
 		if (ft_node_compressed(d->nf)) {
 			enum ft_descent_action act;
@@ -11377,27 +11280,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	}
 }
 
-/*
- * Handle a collapsed node in cds_ft_detach's descent loop.  Scans
- * entries for a suffix match against key[dd->d.depth..key_len-1]:
- *
- *   - Exact / shorter-or-equal suffix match: advance dd and *ik_p
- *     past the matched span, return CDS_FT_STATUS_OK so the caller
- *     continues the descent loop.
- *
- *   - Partial-prefix match (collapsed entry's suffix is longer than
- *     the remaining key but matches as a prefix): explode the
- *     collapsed node into internals so the detach point lands on a
- *     real internal-node boundary, install the result in dd->d.nf,
- *     return CDS_FT_STATUS_OK so the caller's next iteration
- *     re-dispatches via the regular internal-node path.
- *
- *   - No match found, or matched entry has a NULL pointer slot:
- *     return CDS_FT_STATUS_NOT_FOUND.
- *
- *   - Allocation failure during explode: return
- *     CDS_FT_STATUS_MEMORY_ERROR.
- */
 /*
  * ft_detach_keylen - Internal detach helper.
  *
@@ -12510,15 +12392,6 @@ enum ft_descent_action ft_rebuild_path_compressed(
 }
 
 /*
- * Match a collapsed node's entries against @key starting at @i.
- * Scans entries for a suffix match against key[i..], filling
- * ordinal_key + iter_path across the matched suffix span.  On hit,
- * advances *i_p past the matched span, follows the entry's child
- * (resolving skip-compressed if needed) into *node_flag_p, and
- * returns FT_DESCENT_CONTINUE.  Returns FT_DESCENT_END if no
- * entry's suffix matches or the matched child is NULL.
- */
-/*
  * Re-descend from the root following @key to rebuild the iterator path
  * and ordinal_key arrays.  Returns the depth reached, or -1 on error.
  */
@@ -12605,17 +12478,6 @@ enum ft_descent_action ft_skip_forward_compressed(
 	return FT_DESCENT_CONTINUE;
 }
 
-/*
- * Handle a collapsed ancestor in cds_ft_iter_skip_forward's walk-up
- * loop.  Skips intermediate path levels (same collapsed node at
- * adjacent levels).  At the entry level, scans entries to the right
- * of the current key's suffix and counts their keys.  When the
- * target falls within a rightward entry's subtree, fills
- * ordinal_key + iter_path across the suffix span, advances *level_p
- * and returns FT_DESCENT_BREAK so the caller can goto
- * descend_forward.  Otherwise returns FT_DESCENT_CONTINUE for
- * the caller to keep walking up.
- */
 /*
  * Skip forward by @n keys from the current iterator position using
  * local traversal.
@@ -13001,18 +12863,6 @@ enum ft_descent_action ft_skip_reverse_walk_up_compressed(
 	return FT_DESCENT_CONTINUE;
 }
 
-/*
- * Handle a collapsed ancestor in cds_ft_iter_skip_reverse's walk-up
- * loop.  Skips intermediate levels (same collapsed node at adjacent
- * levels).  At the entry level, scans entries to the left of the
- * current key's suffix and counts their keys; when the target falls
- * within a leftward entry's subtree, fills ordinal_key + iter_path
- * across the suffix span, advances *level_p and returns
- * FT_DESCENT_BREAK so the caller can goto descend_reverse.
- * Then checks the collapsed node's external_nodes (smallest key);
- * on match returns FT_DESCENT_END with the iter written and
- * *iter_status_p set to OK.  Otherwise returns FT_DESCENT_CONTINUE.
- */
 /*
  * Skip backward by @n keys from the current iterator position using
  * local traversal.
@@ -13442,8 +13292,8 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 	 * avoid the compressed-node cache-line load.  Tolerate
 	 * NOT_SUPPORTED here: validated speculative descent is still
 	 * profitable without skip-compressed (cand-mode descent skips
-	 * the compressed/collapsed byte verify, and the leaf compare
-	 * uses the inline SIMD/SWAR comparator).
+	 * the compressed byte verify, and the leaf compare uses the
+	 * inline SIMD/SWAR comparator).
 	 */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (ft_skip_compressed_validate()) {
@@ -13783,10 +13633,10 @@ void cds_ft_destroy(struct cds_ft *ft)
  * Integrity verification.
  *
  * ft_verify_node_recursive: recursively verify structural invariants
- * starting at @node_flag (which may be internal, compressed, or
- * collapsed).  Returns 0 on success, -1 on first detected error
- * (with details printed to @out).  Must be called with mutual
- * exclusion wrt updaters.
+ * starting at @node_flag (which may be internal or compressed).
+ * Returns 0 on success, -1 on first detected error (with details
+ * printed to @out).  Must be called with mutual exclusion wrt
+ * updaters.
  *
  * Checks performed:
  * - nr_child matches the actual count of non-NULL child slots.
@@ -13794,10 +13644,6 @@ void cds_ft_destroy(struct cds_ft *ft)
  *   of unique keys from external node chains attached to this node.
  * - Parent pointers of children point back to the correct parent.
  * - Compressed node invariants (len > 0, no external_nodes).
- * - Collapsed node invariants (live entries consistent).
- *
- * Density counters are not verified: they are maintained
- * incrementally and serve as a heuristic for collapse decisions.
  *
  * @ft: the Fractal Trie (for group/flag access).
  * @out: file stream for diagnostic output (may be NULL to suppress).
@@ -13924,7 +13770,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 /*
  * Verify the doubly-linked external-node duplicate chain anchored at
  * @head, owned by @owner_flag (the flagged pointer to the
- * internal/collapsed/compressed node, or its slot's parent).
+ * internal/compressed node, or its slot's parent).
  *
  *   - Head's prev must equal @owner_flag (the parent flagged-pointer
  *     convention used by ft_metadata_set_external_nodes and by the
@@ -14277,7 +14123,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 				return -1;
 			local_keys = 1;	/* One unique key. */
 		} else {
-			/* Internal/compressed/collapsed child. */
+			/* Internal/compressed child. */
 			if (ft_verify_node_recursive(ft, out, visited, path,
 					cn->child,
 					node_flag, depth + cn->len,
@@ -14311,8 +14157,8 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 {
 	/*
 	 * Subtree-uniqueness / cycle check.  Every traversable node
-	 * (compressed, collapsed, internal) must be reached exactly
-	 * once from the root.  A duplicate visit means either two
+	 * (compressed, internal) must be reached exactly once from
+	 * the root.  A duplicate visit means either two
 	 * parents share the same child subtree (rebase/recompact bug)
 	 * or a parent-pointer cycle has been introduced — bail out
 	 * before recursing further so the upward parent walks in the
@@ -14581,9 +14427,9 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 /*
  * cds_ft_verify - Verify integrity of the entire Fractal Trie.
  *
- * Recursively walks every internal, compressed, and collapsed node
- * starting from the root, checking that nr_child, nr_keys, and
- * parent pointers are self-consistent.
+ * Recursively walks every internal and compressed node starting
+ * from the root, checking that nr_child, nr_keys, and parent
+ * pointers are self-consistent.
  *
  * Must be called with mutual exclusion wrt updaters.
  *
@@ -14780,8 +14626,6 @@ void show_pretty(const struct cds_ft *ft, FILE *out)
  *               "external_nodes"?, "children": [ {"key_byte", "child"} ] }
  *   Compressed: { "ptr", "kind": "COMPRESSED", "level", "path_len",
  *                 "key_bytes", "external_nodes"?, "child" }
- *   Collapsed:  { "ptr", "kind": "COLLAPSED", "level", "scan_zone_size",
- *                 "external_nodes"?, "entries": [{"suffix", "child"}] }
  *   External:   { "ptr", "kind": "EXTERNAL", "level" }
  */
 

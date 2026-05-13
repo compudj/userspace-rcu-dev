@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 195
+#define NR_TESTS 194
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -12086,142 +12086,6 @@ static int test_density_recompact_full(void)
 	return 0;
 }
 
-/*
- * Density counter verification: collapse and explode.
- *
- * Insert variable-length keys that create a sparse subtree eligible
- * for collapse.  The keys share a common prefix ("P") followed by
- * distinct long suffixes, creating a deep subtree under the "P"
- * branch.  After enough inserts, ft_check_collapse_on_path should
- * collapse this subtree into a collapsed node.
- *
- * Then remove keys one at a time.  When a collapsed node loses
- * entries and is eventually exploded back, density must stay correct.
- */
-static int test_density_collapse_explode(void)
-{
-	struct cds_ft_group *group;
-	struct cds_ft *ft;
-	struct cds_ft_iter *iter;
-	enum cds_ft_status s;
-	unsigned int i;
-	/*
-	 * Keys: 4-byte prefix "PPPP" + 2 distinguishing bytes.
-	 * 6-byte total.  The shared 4-byte prefix creates a deep
-	 * single-child chain which gets compressed.  Adding multiple
-	 * keys that diverge at byte 4 creates a subtree that's a
-	 * candidate for collapse once the internal node at depth 4
-	 * has several children with single-child subtrees below.
-	 */
-	struct {
-		uint8_t key[6];
-		size_t len;
-	} keys[] = {
-		{ { 'P', 'P', 'P', 'P', 0x00, 0x01 }, 6 },
-		{ { 'P', 'P', 'P', 'P', 0x00, 0x02 }, 6 },
-		{ { 'P', 'P', 'P', 'P', 0x01, 0x01 }, 6 },
-		{ { 'P', 'P', 'P', 'P', 0x01, 0x02 }, 6 },
-		{ { 'P', 'P', 'P', 'P', 0x02, 0x01 }, 6 },
-		{ { 'P', 'P', 'P', 'P', 0x02, 0x02 }, 6 },
-		{ { 'P', 'P', 'P', 'P', 0x03, 0x01 }, 6 },
-		{ { 'P', 'P', 'P', 'P', 0x03, 0x02 }, 6 },
-		/* Add shorter keys to create external_nodes at intermediate depths. */
-		{ { 'P', 'P', 'P', 'P', 0x00 }, 5 },
-		{ { 'P', 'P', 'P', 'P', 0x01 }, 5 },
-		/* A key in a different branch to trigger root recompact. */
-		{ { 'Q', 0x01 }, 2 },
-	};
-	unsigned int nkeys = sizeof(keys) / sizeof(keys[0]);
-
-	ft = create_varlen_ft(&group);
-	s = cds_ft_iter_create(ft, &iter);
-	if (s < 0) {
-		drain_and_destroy(ft, group);
-		return -1;
-	}
-
-	/* Insert all keys, verifying density after each. */
-	rcu_read_lock();
-	for (i = 0; i < nkeys; i++) {
-		s = cds_ft_insert(ft, keys[i].key, keys[i].len,
-				  &node_alloc(i)->node);
-		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "density_collapse: insert %u failed: %s\n",
-				i, cds_ft_status_to_string(s));
-			rcu_read_unlock();
-			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft, group);
-			return -1;
-		}
-		s = cds_ft_verify(ft, stderr);
-		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "density_collapse: structural verify failed after insert %u\n", i);
-			rcu_read_unlock();
-			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft, group);
-			return -1;
-		}
-		s = cds_ft_verify_density(ft, stderr);
-		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "density_collapse: density mismatch after insert %u\n", i);
-			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
-			rcu_read_unlock();
-			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft, group);
-			return -1;
-		}
-	}
-
-	/* Remove keys one at a time, verifying after each. */
-	for (i = 0; i < nkeys; i++) {
-		struct cds_ft_node *removed;
-
-		cds_ft_iter_set_key(iter, keys[i].key, keys[i].len);
-		s = cds_ft_lookup(ft, iter);
-		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "density_collapse: lookup key %u for remove failed\n", i);
-			rcu_read_unlock();
-			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft, group);
-			return -1;
-		}
-		removed = cds_ft_iter_node(iter);
-		s = cds_ft_remove(ft, iter, removed);
-		if (s < 0) {
-			fprintf(stderr, "density_collapse: remove key %u failed\n", i);
-			rcu_read_unlock();
-			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft, group);
-			return -1;
-		}
-		node_free_rcu(to_test_node(removed));
-
-		s = cds_ft_verify(ft, stderr);
-		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "density_collapse: structural verify failed after remove %u\n", i);
-			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
-			rcu_read_unlock();
-			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft, group);
-			return -1;
-		}
-		s = cds_ft_verify_density(ft, stderr);
-		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "density_collapse: density mismatch after remove %u\n", i);
-			cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
-			rcu_read_unlock();
-			cds_ft_iter_destroy(iter);
-			drain_and_destroy(ft, group);
-			return -1;
-		}
-	}
-	rcu_read_unlock();
-	rcu_barrier();
-	cds_ft_iter_destroy(iter);
-	cds_ft_destroy(ft);
-	cds_ft_group_destroy(group);
-	return 0;
-}
 
 /*
  * Density counter verification: remove through compressed paths.
@@ -12518,13 +12382,13 @@ fail_nounlock:
 }
 
 /*
- * Stress test: random insert/remove with integrity and density
- * verification after every mutation.
+ * Stress test: random insert/remove with integrity verification
+ * after every mutation.
  *
  * Uses a deterministic PRNG (xorshift32) for reproducibility.
- * Variable-length keys exercise compress, split, collapse, explode,
- * and recompact paths.  Keys are 1-6 bytes, drawn from a small
- * alphabet to maximize prefix sharing and structural transitions.
+ * Variable-length keys exercise compress, split, and recompact paths.
+ * Keys are 1-6 bytes, drawn from a small alphabet to maximize prefix
+ * sharing and structural transitions.
  */
 
 static uint32_t xorshift32(uint32_t *state)
@@ -14423,7 +14287,6 @@ int main(int argc, char **argv)
 	RUN_TEST(test_density_compress_nested);
 	RUN_TEST(test_density_graft_detach);
 	RUN_TEST(test_density_recompact_full);
-	RUN_TEST(test_density_collapse_explode);
 	RUN_TEST(test_density_remove_through_compress);
 	RUN_TEST(test_density_graft_swap);
 	RUN_TEST(test_density_stress);
