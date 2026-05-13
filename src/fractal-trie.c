@@ -1870,9 +1870,9 @@ void ft_publish_to_parent(struct cds_ft *ft,
  * pointer if skip-compressed mode is enabled, the path length fits,
  * and the child has metadata (is not external).
  *
- * Call AFTER ft_set_parent and ft_init_node_density have been done
- * with the real compressed flag (@cflag).  The returned value is
- * what should be published/stored in parent child slots.
+ * Call AFTER ft_set_parent has been done with the real compressed
+ * flag (@cflag).  The returned value is what should be
+ * published/stored in parent child slots.
  */
 static
 struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
@@ -4883,7 +4883,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		struct cds_ft_inode_flag **nullify_node_flag_ptr,
 		struct cds_ft_inode **old_node_ret,
 		bool is_root,
-		unsigned int node_depth)
+		unsigned int node_depth __attribute__((unused)))
 {
 	unsigned int new_type_index;
 	struct cds_ft_inode *new_node;
@@ -5173,22 +5173,13 @@ skip_copy:
 		}
 	}
 
-	/*
-	 * Save old flag before overwriting: the parent (e.g. a collapsed
-	 * node) still holds this value in its child slots, so
-	 * ft_parent_depth_span needs it to find the entry.
-	 */
-	{
-		struct cds_ft_inode_flag *old_flag = *old_node_flag_ptr;
+	FT_TP(node_recompact, (const void *) *old_node_flag_ptr,
+		(const void *) new_node_flag, (int) new_type_index);
 
-		FT_TP(node_recompact, (const void *) old_flag,
-			(const void *) new_node_flag, (int) new_type_index);
-
-		/* Return pointer to new recompacted node through old_node_flag_ptr */
-		*old_node_flag_ptr = new_node_flag;
-		if (old_node && old_node_ret)
-			*old_node_ret = old_node;
-	}
+	/* Return pointer to new recompacted node through old_node_flag_ptr */
+	*old_node_flag_ptr = new_node_flag;
+	if (old_node && old_node_ret)
+		*old_node_ret = old_node;
 
 	ret = 0;
 end:
@@ -14344,8 +14335,6 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 					depth, node_flag);
 			return -1;
 		}
-		/*
-		 * Density / nr_keys promotion sanity.  The compact-vs-extended
 		/*
 		 * alloc_index round-trip: cds_ft_metadata_to_item walks back
 		 * from the metadata to the arena slot using m->alloc_index.

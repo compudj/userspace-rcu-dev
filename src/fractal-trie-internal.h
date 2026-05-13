@@ -354,7 +354,7 @@
  * and run cds_ft_verify and cds_ft_verify_density.  On any invariant
  * mismatch, print a diagnostic to stderr and abort the process.
  *
- * Catches structural / nr_keys / parent-pointer / density regressions
+ * Catches structural / nr_keys / parent-pointer regressions
  * at the mutation that introduced them, instead of via downstream
  * symptoms.  The recursive walk is O(N) per mutation, so this is for
  * testing / debugging only.
