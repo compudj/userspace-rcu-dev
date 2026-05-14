@@ -9049,7 +9049,8 @@ static
 int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **detach_node_flag_ptr,
 		struct cds_ft_inode_flag **detach_parent_flag_ptr,
-		unsigned int detach_depth)
+		unsigned int detach_depth,
+		bool free_detached_subtree)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
@@ -9061,11 +9062,15 @@ int ft_detach_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag *cur;
 	unsigned int cur_depth;
 	/*
-	 * Save the original detach child before the upward walk may
-	 * shift detach_node_flag_ptr to a higher level.  Used for the
-	 * free-intermediate walk below.
+	 * Snapshot of the slot value at the detach point.  Set once the
+	 * upward walk finishes elevating @detach_node_flag_ptr, before
+	 * ft_node_replace_ptr overwrites the slot.  The free-walk below
+	 * starts from this value so it covers BOTH the elevated single-
+	 * child ancestors and the original detach target (the elevation
+	 * walk only crosses nodes with nr_child==1, so the underlying
+	 * chain reaches the original detach child).
 	 */
-	struct cds_ft_inode_flag *orig_detach_child = *detach_node_flag_ptr;
+	struct cds_ft_inode_flag *elevated_old_child;
 
 	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
 
@@ -9202,6 +9207,7 @@ int ft_detach_node(struct cds_ft *ft,
 	}
 
 	iter_node_flag = *detach_parent_flag_ptr;
+	elevated_old_child = *detach_node_flag_ptr;
 
 	/*
 	 * Replace within parent.  If the parent is a compressed node:
@@ -9226,14 +9232,6 @@ int ft_detach_node(struct cds_ft *ft,
 		/*
 		 * Density was already propagated above (before
 		 * structural changes).
-		 *
-		 * Use orig_detach_child (saved before the upward walk)
-		 * for the free-intermediate walk.  When the walk elevated
-		 * detach_node_flag_ptr, *detach_node_flag_ptr equals
-		 * iter_node_flag (the parent we are about to modify).
-		 * Freeing iter_node_flag would corrupt the trie.
-		 * orig_detach_child always points to the actual child
-		 * subtree that needs freeing.
 		 */
 
 		ret = ft_node_replace_ptr(ft,
@@ -9248,76 +9246,158 @@ int ft_detach_node(struct cds_ft *ft,
 			/*
 			 * Free the old detach subtree.  After
 			 * ft_node_replace_ptr replaced it, the entire
-			 * single-child chain from old_detach_child
-			 * down is unreachable.  Collect nodes first,
-			 * then free after the walk completes (avoids
-			 * use-after-free during traversal).
-			 * topmost_external_nodes (if any) was already
-			 * saved and published at the replacement point.
+			 * single-child chain from @elevated_old_child
+			 * down is unreachable.  When the upward walk
+			 * elevated the detach point, @elevated_old_child
+			 * is the topmost ancestor that became orphaned;
+			 * walking through its single-child chain reaches
+			 * the original detach target (each elevated node
+			 * has nr_child==1 by the walk's own invariant).
+			 * Collect nodes first, then free after the walk
+			 * completes (avoids use-after-free during
+			 * traversal).  topmost_external_nodes (if any)
+			 * was already saved and published at the
+			 * replacement point.
 			 */
 			{
 				struct cds_ft_inode_flag *to_free[FT_MAX_DEPTH];
 				int nr_to_free = 0, fi;
-				struct cds_ft_inode_flag *walk_nf = orig_detach_child;
+				struct cds_ft_inode_flag *walk_nf = elevated_old_child;
 
-				while (walk_nf &&
+				/*
+				 * Free walk semantics:
+				 *
+				 *   Phase 1 — elevated ancestors (always
+				 *   single-child no-external by the upward
+				 *   walk's own invariant).  Free @nr_clear
+				 *   nodes unconditionally.
+				 *
+				 *   Phase 2 — target and chain below.  For
+				 *   destroy-style detach, walk the target's
+				 *   single-child no-external chain (descent
+				 *   tracking guarantees this) until we hit
+				 *   an external, a multi-child node, a node
+				 *   with external_nodes (its content was
+				 *   either preserved as topmost_external_nodes
+				 *   or still referenced), or nr_child == 0.
+				 *   For move-style, stop — the target is the
+				 *   new trie's root and must be preserved.
+				 */
+				/*
+				 * Pointer classification used by the walks
+				 * below:
+				 *
+				 *   ft_node_external() returns true for
+				 *   genuine external leaves AND for
+				 *   external skip-target encodings
+				 *   (FT_SKIP_MASK on an external pointer):
+				 *   in both cases the underlying node is an
+				 *   external leaf that the caller (not the
+				 *   free walk) is responsible for reclaiming.
+				 *
+				 *   ft_node_compressed() — checks
+				 *   FT_COMPRESSED_MASK only — covers both
+				 *   plain compressed and legacy high-bit
+				 *   skip-compressed: both encodings keep
+				 *   FT_COMPRESSED_MASK on the parent slot,
+				 *   and ft_compressed_node_ptr() strips
+				 *   FT_TAG_MASK to recover the cn pointer.
+				 *
+				 *   Otherwise (neither external nor
+				 *   compressed) the pointer is an internal
+				 *   node (possibly with FT_SKIP_MASK from a
+				 *   Stage 4b internal skip-target; dormant
+				 *   today).
+				 */
+				/* Phase 1: elevated ancestors. */
+				while (nr_to_free < nr_clear &&
+				       walk_nf &&
 				       !ft_node_external(walk_nf) &&
 				       nr_to_free < FT_MAX_DEPTH) {
 					struct cds_ft_inode_flag *next = NULL;
 
-					if (ft_node_compressed(walk_nf) ||
-					    ft_node_skip_compressed(walk_nf)) {
+					if (ft_node_compressed(walk_nf)) {
 						struct cds_ft_compressed_node *cn;
-						struct cds_ft_metadata *cm;
 
-						if (ft_node_skip_compressed(walk_nf))
-							cn = ft_skip_to_compressed(walk_nf);
-						else
-							cn = ft_compressed_node_ptr(walk_nf);
-						cm = cds_ft_item_to_metadata(
-							(struct cds_ft_inode *) cn);
-						/*
-						 * When nr_clear == 0, stop at
-						 * nodes with content (they're
-						 * still reachable).  When
-						 * nr_clear > 0, the upward
-						 * pruning made the entire chain
-						 * unreachable — free everything.
-						 */
-						if (!nr_clear &&
-						    (cm->nr_child > 0 ||
-						     cm->external_nodes))
-							break;
+						cn = ft_compressed_node_ptr(walk_nf);
 						next = cn->child;
 					} else {
-						struct cds_ft_metadata *m =
-							cds_ft_item_to_metadata(
-								ft_node_ptr(walk_nf));
+						unsigned int key;
 
-						if (!nr_clear &&
-						    (m->nr_child > 0 ||
-						     m->external_nodes))
-							break;
-						if (m->nr_child == 1) {
-							unsigned int key;
-
-							for (key = 0; key < 256; key++) {
-								next = ft_node_get_nth(
-									walk_nf, NULL,
-									(uint8_t) key, FT_PF_NONE);
-								if (next)
-									break;
-							}
-						} else if (m->nr_child > 1) {
-							break;
+						for (key = 0; key < 256; key++) {
+							next = ft_node_get_nth(
+								walk_nf, NULL,
+								(uint8_t) key, FT_PF_NONE);
+							if (next)
+								break;
 						}
 					}
 					to_free[nr_to_free++] = walk_nf;
 					walk_nf = next;
 				}
+
+				/* Phase 2: target and chain below. */
+				if (free_detached_subtree) {
+					bool phase2_first = true;
+
+					while (walk_nf &&
+					       !ft_node_external(walk_nf) &&
+					       nr_to_free < FT_MAX_DEPTH) {
+						struct cds_ft_inode_flag *next = NULL;
+						unsigned int nr_child;
+						struct cds_ft_node *ext_nodes;
+
+						if (ft_node_compressed(walk_nf)) {
+							struct cds_ft_compressed_node *cn;
+							struct cds_ft_metadata *cm;
+
+							cn = ft_compressed_node_ptr(walk_nf);
+							cm = cds_ft_item_to_metadata(
+								(struct cds_ft_inode *) cn);
+							nr_child = cm->nr_child;
+							ext_nodes = cm->external_nodes;
+							next = cn->child;
+						} else {
+							struct cds_ft_metadata *m =
+								cds_ft_item_to_metadata(
+									ft_node_ptr(walk_nf));
+
+							nr_child = m->nr_child;
+							ext_nodes = m->external_nodes;
+							if (nr_child == 1) {
+								unsigned int key;
+
+								for (key = 0; key < 256; key++) {
+									next = ft_node_get_nth(
+										walk_nf, NULL,
+										(uint8_t) key, FT_PF_NONE);
+									if (next)
+										break;
+								}
+							}
+						}
+
+						/*
+						 * Stop at content (multi-child
+						 * or external_nodes), except
+						 * on the very first phase-2
+						 * iteration: that node is the
+						 * detach target itself, which
+						 * may carry residual content
+						 * that was either promoted
+						 * (topmost_external_nodes) or
+						 * just cleared by the caller.
+						 */
+						if (!phase2_first &&
+						    (nr_child > 1 || ext_nodes))
+							break;
+						phase2_first = false;
+						to_free[nr_to_free++] = walk_nf;
+						walk_nf = next;
+					}
+				}
 				for (fi = 0; fi < nr_to_free; fi++) {
-					if (ft_node_compressed(to_free[fi]) ||
-					    ft_node_skip_compressed(to_free[fi]))
+					if (ft_node_compressed(to_free[fi]))
 						free_compressed_node(ft,
 							ft_compressed_node_ptr(
 								to_free[fi]));
@@ -9487,12 +9567,10 @@ int ft_detach_node(struct cds_ft *ft,
 					free_cds_ft_node(ft,
 						ft_node_ptr(iter_node_flag));
 					if (parent_cn)
-						free_cds_ft_node(ft,
-							(struct cds_ft_inode *)
+						free_compressed_node(ft,
 							parent_cn);
 					if (child_cn)
-						free_cds_ft_node(ft,
-							(struct cds_ft_inode *)
+						free_compressed_node(ft,
 							child_cn);
 				}
 				/* Allocation failure: leave non-canonical
@@ -9785,7 +9863,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ret = ft_detach_node(ft,
 					dd.det_nfp,
 					dd.det_pfp,
-					dd.det_depth);
+					dd.det_depth,
+					true);
 			if (ret) {
 				/* Undo propagation on failure. */
 				ft_propagate_external_count_parent(ft, dd.d.pnf, 1);
@@ -9933,10 +10012,12 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		/*
-		 * Atomically remove the entire chain. The internal
-		 * node itself remains (it still has children). A grace
-		 * period must be observed before reclaiming any node
-		 * in the old chain.
+		 * Atomically remove the entire chain.  The internal
+		 * node itself remains as long as it still has
+		 * children; if clearing external_nodes leaves it empty
+		 * (nr_child == 0), detach it below.  A grace period
+		 * must be observed before reclaiming any node in the
+		 * old chain.
 		 */
 		/*
 		 * Removing one key (with all its duplicates).
@@ -9946,6 +10027,30 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_propagate_external_count_parent(ft, dd.d.nf, -1);
 		rcu_assign_pointer(metadata->external_nodes, NULL);
 		ret = 0;
+
+		/*
+		 * If the internal at end-of-key now has no children and
+		 * no external_nodes, it is a leaf with no content — its
+		 * entire single-child ancestor chain (up to the closest
+		 * branch / external_nodes / root) is now orphaned and
+		 * must be detached & freed.  Call ft_detach_node with
+		 * the descent's current slot pointers: its upward walk
+		 * will elevate detach_node_flag_ptr to the topmost
+		 * orphaned ancestor and the free-walk will reclaim the
+		 * whole chain.
+		 */
+		if (metadata->nr_child == 0 && dd.d.pnfp != NULL) {
+			ret = ft_detach_node(ft,
+					dd.d.nfp,
+					dd.d.pnfp,
+					dd.d.depth,
+					true);
+			if (ret) {
+				/* Undo propagation on failure. */
+				ft_propagate_external_count_parent(ft,
+					dd.d.nf, 1);
+			}
+		}
 	} else {
 		/*
 		 * External node at end of key. Detach the branch.
@@ -9957,7 +10062,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ret = ft_detach_node(ft,
 				dd.det_nfp,
 				dd.det_pfp,
-				dd.det_depth);
+				dd.det_depth,
+				true);
 		if (ret) {
 			/* Undo propagation on failure. */
 			ft_propagate_external_count_parent(ft, dd.d.pnf, 1);
@@ -11491,10 +11597,18 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 * new readers.
 			 */
 			{
+				/*
+				 * Subtree-move detach: preserve @child as
+				 * the root of the new @detached trie.  The
+				 * caller's saved @child pointer keeps the
+				 * detached subtree alive; ft_detach_node
+				 * must not free it.
+				 */
 				int ret = ft_detach_node(ft,
 							 dd.det_nfp,
 							 dd.det_pfp,
-							 dd.det_depth);
+							 dd.det_depth,
+							 false);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*
