@@ -13447,9 +13447,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 	size_t key_len = CDS_FT_LEN_DEFAULT,
 	       max_key_len = FT_MAX_KEY_LEN;
 
-#ifdef FT_USE_SPECIALIZED_SCAN
 	ft_specialized_scan_layout_assert();
-#endif
 	if (attr) {
 		key_len = attr->key_len;
 		max_key_len = attr->max_key_len;
