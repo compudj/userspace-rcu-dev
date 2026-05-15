@@ -51,7 +51,7 @@ liburcu_bp_la_LIBADD = liburcu-common.la
 
 liburcu_cds_la_SOURCES = rculfqueue.c rculfstack.c lfstack.c \
 	workqueue.c workqueue.h $(FRACTAL_TRIE) $(RCULFHASH) $(COMPAT)
-liburcu_cds_la_LIBADD = liburcu-common.la
+liburcu_cds_la_LIBADD = liburcu-common.la $(FT_TRACING_LIBS)
 
 pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = liburcu-cds.pc liburcu.pc liburcu-bp.pc liburcu-qsbr.pc \

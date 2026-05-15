@@ -202,6 +202,30 @@ AC_SEARCH_LIBS([clock_gettime], [rt], [
   AC_DEFINE([CONFIG_RCU_HAVE_CLOCK_GETTIME], [1], [clock_gettime() is detected.])
 ])
 
+# Fractal Trie LTTng-UST tracing support.
+#
+# When the user configures with `-DFT_ENABLE_TRACING` in CFLAGS (or
+# CPPFLAGS), src/cds_ft_tp.c registers LTTng-UST tracepoints, which
+# turns lttng_ust_probe_register / lttng_ust_urcu_* into runtime
+# dependencies of liburcu-cds.  Detect that here and link the
+# required LTTng-UST libraries into liburcu-cds so downstream
+# consumers (tests, examples) don't have to know about the
+# dependency.
+#
+# This is a no-op for default builds (FT_ENABLE_TRACING unset);
+# enabling tracing requires lttng-ust to be installed.
+AC_MSG_CHECKING([whether FT_ENABLE_TRACING is set])
+AS_IF([echo " $CFLAGS $CPPFLAGS " | $GREP -q -- '-DFT_ENABLE_TRACING'],
+  [AC_MSG_RESULT([yes])
+   AC_CHECK_LIB([lttng-ust], [lttng_ust_probe_register],
+     [FT_TRACING_LIBS="-llttng-ust -llttng-ust-common -ldl"],
+     [AC_MSG_ERROR([FT_ENABLE_TRACING is set in CFLAGS/CPPFLAGS but liblttng-ust is not available.  Install lttng-ust or remove -DFT_ENABLE_TRACING.])])
+  ],
+  [AC_MSG_RESULT([no])
+   FT_TRACING_LIBS=""
+  ])
+AC_SUBST([FT_TRACING_LIBS])
+
 
 ##                             ##
 ## Optional features selection ##
