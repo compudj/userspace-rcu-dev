@@ -9228,6 +9228,80 @@ int ft_detach_node(struct cds_ft *ft,
 			topmost_external_nodes, &nr_clear);
 		if (ret)
 			goto end;
+		/*
+		 * Phase 2-style free walk for the orphaned chain below
+		 * the compressed parent.  When a compressed cn's child
+		 * was an internal node N with N->external_nodes
+		 * promoted (or no external_nodes), the chain
+		 * [N -> ... -> external_target] is now unreachable.
+		 * Walk from @elevated_old_child (the original cn->child)
+		 * down the single-child no-ext chain, collecting nodes
+		 * to free.  The first iteration is special: the target
+		 * itself may carry residual content (external_nodes)
+		 * that was promoted as topmost_external_nodes.
+		 */
+		if (free_detached_subtree) {
+			struct cds_ft_inode_flag *to_free[FT_MAX_DEPTH];
+			int nr_to_free = 0, fi;
+			struct cds_ft_inode_flag *walk_nf = elevated_old_child;
+			bool phase2_first = true;
+
+			while (walk_nf &&
+			       !ft_node_external(walk_nf) &&
+			       nr_to_free < FT_MAX_DEPTH) {
+				struct cds_ft_inode_flag *next = NULL;
+				unsigned int nr_child;
+				struct cds_ft_node *ext_nodes;
+
+				if (ft_node_compressed(walk_nf)) {
+					struct cds_ft_compressed_node *cn;
+					struct cds_ft_metadata *cm;
+
+					cn = ft_compressed_node_ptr(
+						ft_skip_child_ptr(walk_nf));
+					cm = cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) cn);
+					nr_child = cm->nr_child;
+					ext_nodes = cm->external_nodes;
+					next = cn->child;
+				} else {
+					struct cds_ft_metadata *m =
+						cds_ft_item_to_metadata(
+							ft_node_ptr(walk_nf));
+
+					nr_child = m->nr_child;
+					ext_nodes = m->external_nodes;
+					if (nr_child == 1) {
+						unsigned int key;
+
+						for (key = 0; key < 256; key++) {
+							next = ft_node_get_nth(
+								walk_nf, NULL,
+								(uint8_t) key,
+								FT_PF_NONE);
+							if (next)
+								break;
+						}
+					}
+				}
+
+				if (!phase2_first &&
+				    (nr_child > 1 || ext_nodes))
+					break;
+				phase2_first = false;
+				to_free[nr_to_free++] = walk_nf;
+				walk_nf = next;
+			}
+			for (fi = 0; fi < nr_to_free; fi++) {
+				if (ft_node_compressed(to_free[fi]))
+					free_compressed_node(ft,
+						ft_compressed_node_ptr(
+							ft_skip_child_ptr(to_free[fi])));
+				else
+					free_cds_ft_node(ft,
+						ft_node_ptr(to_free[fi]));
+			}
+		}
 	} else {
 		/*
 		 * Density was already propagated above (before
