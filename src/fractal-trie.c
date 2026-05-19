@@ -5687,9 +5687,25 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		}
 
 		iter_key = *(key++);
-		if (descend_cand)
-			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_DATA);
-		else if (!skip_compressed)
+		/*
+		 * Two paths after key dispatch:
+		 *
+		 * - ft_node_get_nth_skip: returns the slot value as-is,
+		 *   including skip-compressed pointers.  Used when the
+		 *   caller resolves skip pointers itself (descend_cand
+		 *   handles them at the next loop-top check) or when
+		 *   skip-compressed is disabled and resolution is a no-op.
+		 *   FT_PF_DATA prefetch is safe — the raw value's high
+		 *   bits may carry skip-length, but __builtin_prefetch
+		 *   silently drops non-canonical addresses.
+		 *
+		 * - ft_node_get_nth: wraps _skip with
+		 *   ft_resolve_skip_compressed so the next loop iteration
+		 *   sees a compressed-flag pointer.  FT_PF_NONE because
+		 *   the raw slot's high bits would direct prefetch at a
+		 *   non-canonical address, wasted before resolution.
+		 */
+		if (descend_cand || !skip_compressed)
 			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_DATA);
 		else
 			node_flag = ft_node_get_nth(node_flag, NULL, iter_key, FT_PF_NONE);
