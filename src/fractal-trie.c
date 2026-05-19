@@ -148,22 +148,7 @@ enum cds_ft_type_class {
 };
 
 #define ft_type_is_popcount(tc)	((tc) == FT_POPCOUNT)
-
-/*
- * FT_HAVE_EFFICIENT_UNALIGNED_ACCESS: architectures where unaligned
- * loads that stay within a single cacheline have no measurable
- * overhead vs aligned loads.  Required for the SIMD/SWAR linear
- * node scans that load the values+padding region as one word.
- * Nodes are aligned to their size (>=64), so 16- or 32-byte scans
- * stay within one cacheline by construction.
- *
- * On strict-alignment architectures, all linear nodes fall back to
- * the bytewise scan.
- */
-#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) \
-	|| (defined(__powerpc64__) && defined(__LITTLE_ENDIAN__))
-#define FT_HAVE_EFFICIENT_UNALIGNED_ACCESS
-#endif
+#define ft_type_is_pigeon(tc)	((tc) == FT_PIGEON)
 
 struct cds_ft_type {
 	enum cds_ft_type_class type_class;
@@ -173,7 +158,7 @@ struct cds_ft_type {
 	uint16_t order;			/* node size is (1 << order), in bytes */
 	bool bitmap;			/* allocate bitmap */
 	bool popcount_2l;		/* 2-level popcount-bitmap layout */
-	bool popcount_1l;			/* 1-level byte popcount layout */
+	bool popcount_1l;		/* 1-level byte popcount layout */
 };
 
 /*
@@ -2775,14 +2760,14 @@ void ft_specialized_scan_layout_assert(void)
 	assert(FT_ALIGN(ft_types[3].max_linear_child, sizeof(void *)) == 32);
 	assert(ft_types[4].popcount_1l);
 	assert(ft_types[5].popcount_1l);
-	assert(ft_types[6].type_class == FT_PIGEON);
+	assert(ft_type_is_pigeon(ft_types[6].type_class));
 #else
 	assert(ft_types[0].popcount_2l);
 	assert(ft_types[1].popcount_2l);
 	assert(ft_types[2].popcount_1l);
 	assert(ft_types[3].popcount_1l);
 	assert(ft_types[4].popcount_1l);
-	assert(ft_types[5].type_class == FT_PIGEON);
+	assert(ft_type_is_pigeon(ft_types[5].type_class));
 #endif
 }
 
@@ -3798,11 +3783,9 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_nth(const struct cds_ft_type __attr
 	struct cds_ft_inode_flag **child_node_flag_ptr;
 	struct cds_ft_inode_flag *child_node_flag;
 
-	assert(!type || type->type_class == FT_PIGEON);
+	assert(!type || ft_type_is_pigeon(type->type_class));
 	child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[n];
 	child_node_flag = ft_dereference_acquire_prefetch_hint(*child_node_flag_ptr, pf_hint);
-	//dbg_printf("ft_pigeon_node_get_nth child_node_flag_ptr %p\n",
-	//	child_node_flag_ptr);
 	if (caa_unlikely(node_flag_ptr))
 		*node_flag_ptr = child_node_flag_ptr;
 	return child_node_flag;
@@ -3821,7 +3804,7 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_direction(const struct cds_ft_type 
 #endif
 	int i;
 
-	assert(type->type_class == FT_PIGEON);
+	assert(ft_type_is_pigeon(type->type_class));
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
 #ifdef FEATURE_USE_BITMAP_SCAN
@@ -4669,7 +4652,7 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
 	struct cds_ft_inode_flag **ptr;
 	bool replace_old_ptr = false;
 
-	assert(type->type_class == FT_PIGEON);
+	assert(ft_type_is_pigeon(type->type_class));
 	ptr = &((struct cds_ft_inode_flag **) node->data)[n];
 	if (*ptr)
 		replace_old_ptr = true;
@@ -4777,7 +4760,7 @@ int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
 		uint8_t n __attribute__((unused)),
 		struct cds_ft_inode_flag *newptr)
 {
-	assert(type->type_class == FT_PIGEON);
+	assert(ft_type_is_pigeon(type->type_class));
 
 	if (!newptr) {
 		if (metadata->fallback_removal_count) {
@@ -14795,7 +14778,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			unsigned int t = ft_node_type(node_flag);
 			const struct cds_ft_type *t_type = &ft_types[t];
 
-			if (t_type->type_class == FT_PIGEON) {
+			if (ft_type_is_pigeon(t_type->type_class)) {
 				struct cds_ft_bitmap *bm =
 					cds_ft_item_to_bitmap(node, t_type->order);
 				unsigned int b;
