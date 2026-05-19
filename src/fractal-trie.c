@@ -2566,13 +2566,15 @@ uint8_t ft_popcount_node_get_nr_child(const struct cds_ft_type *type,
 
 static inline void ft_maybe_prefetch(const void *ptr)
 {
-	unsigned long v = (unsigned long) ptr;
-
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	/* Clear skip-compressed length bits. */
-	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
-#endif
-	__builtin_prefetch((const void *) v);
+	/*
+	 * Experiment: drop the skip-compressed high-bit clear.
+	 * __builtin_prefetch doesn't fault on non-canonical addresses
+	 * (it's a hint that silently drops invalid loads), so feeding
+	 * a skip-encoded pointer directly is safe.  The "wasted"
+	 * prefetch on skip-encoded externals is acceptable; the
+	 * common case (clean high bits) is unchanged.
+	 */
+	__builtin_prefetch(ptr);
 }
 
 /*
@@ -2652,9 +2654,11 @@ void ft_prefetch_child_meta(const void *ptr)
 
 	if (!v)
 		return;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
-#endif
+	/*
+	 * Experiment: skip the high-bit clear.  The tag-bit tests below
+	 * only consult low bits, and the align_mask path's metadata
+	 * prefetch is a hint that tolerates non-canonical addresses.
+	 */
 	if ((v & FT_INTERNAL_MASK) == 0) {
 		/*
 		 * External (bits 0-2 == 0): no FT metadata.  Prefetch the
@@ -2684,9 +2688,7 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 
 	if (!v)
 		return;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
-#endif
+	/* Experiment: skip the high-bit clear (see ft_prefetch_child_meta). */
 	if ((v & FT_INTERNAL_MASK) == 0) {
 		if ((v & FT_TAG_MASK) == 0)
 			__builtin_prefetch((const void *) v);
