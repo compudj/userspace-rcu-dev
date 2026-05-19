@@ -5695,20 +5695,23 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		 *   caller resolves skip pointers itself (descend_cand
 		 *   handles them at the next loop-top check) or when
 		 *   skip-compressed is disabled and resolution is a no-op.
-		 *   FT_PF_DATA prefetch is safe — the raw value's high
-		 *   bits may carry skip-length, but __builtin_prefetch
-		 *   silently drops non-canonical addresses.
 		 *
 		 * - ft_node_get_nth: wraps _skip with
 		 *   ft_resolve_skip_compressed so the next loop iteration
-		 *   sees a compressed-flag pointer.  FT_PF_NONE because
-		 *   the raw slot's high bits would direct prefetch at a
-		 *   non-canonical address, wasted before resolution.
+		 *   sees a compressed-flag pointer.
+		 *
+		 * FT_PF_DATA in both: the prefetch fires on the raw slot
+		 * value.  For regular internal/external/compressed children
+		 * (the dominant case — ~97% on dns) the address is clean and
+		 * the prefetch hits the right target.  For skip-encoded
+		 * children (~3%) the high bits carry skip-length, the address
+		 * is non-canonical, and __builtin_prefetch silently drops it
+		 * (one cheap uop, no fault).
 		 */
 		if (descend_cand || !skip_compressed)
 			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_DATA);
 		else
-			node_flag = ft_node_get_nth(node_flag, NULL, iter_key, FT_PF_NONE);
+			node_flag = ft_node_get_nth(node_flag, NULL, iter_key, FT_PF_DATA);
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
 		/*
