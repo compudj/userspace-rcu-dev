@@ -2,6 +2,60 @@
 
 ## Status
 
+Abandoned 2026-05-18.
+
+The refactor was implemented end-to-end on `fractal-trie-dev-skip-bit`
+(preserved at commit dbcc68ca) through Stages 1-7 plus follow-up
+optimizations (external-check merge, branchful skip-apply, fused
+descent step, class-gated cascade dispatcher).  Best post-optimization
+state on dns ft_specv (taskset -c 0, -O2 -DNDEBUG, single-thread)
+measured 270.8 ns/op median vs the pre-refactor baseline (this
+commit, 97a6cc0c) of 192.5 ns/op — a +78 ns / +41% regression.
+
+Critical-path analysis (disassembly of the fused descent step's
+type-0 popcount_2l max_lc=3 hot path) identified the root cause:
+
+  Pre-refactor (skip_len in pointer high bits):
+    node_flag (in reg from prev iter dispatch)
+      → shr node_flag, 56            ; 1c, no memory load
+      → lea key+skip                 ; 1c
+      → movzx [key+skip] → iter_key  ; 4-5c memory load
+    (in parallel: bms_full load — 4-5c — for bitmap dispatch)
+
+  Refactor (skip_len in child body byte):
+    node_flag (in reg)
+      → load bms_full [node-1]       ; 4-5c memory load
+      → shr bms_full, 56 → skip      ; 1c
+      → lea key+skip                 ; 1c
+      → movzx [key+skip] → iter_key  ; 4-5c memory load (serialized)
+
+The body-byte encoding adds ~5 cycles to the per-iter critical path
+because the iter_key load must wait for the body load + skip
+extraction.  Over a ~6-iter average dns descent this is ~30 cycles
+/ ~9 ns, accounting for ~1/3 of the +78 ns regression.  The remainder
+lives in the surrounding skip-target machinery (lazy validation
+infrastructure, dispatch fan-out across many cases, producer-side
+housekeeping touching cold lines), each of which costs a smaller
+amount that compounds.
+
+**Decision: keep the high-bit skip_len encoding (the design active at
+this commit) as the going-forward layout for skip-compressed pointers.**
+This document is preserved as a record of the explored alternative;
+the implementation lives on `fractal-trie-dev-skip-bit` for inspection
+but is not slated for merge.
+
+The 2026-05-13 SUB-vs-AND tag-clear win (5-18% lookup gain) and the
+type-0 occupancy data (30-64% of internal nodes) were the original
+motivation; both remain valid observations, but recovering them inside
+the high-bit-encoding constraints is the open question — orthogonal
+to the body-byte / cache-page direction proposed below.
+
+---
+
+Design draft below preserved verbatim for reference.
+
+## Original status
+
 Design draft.  Motivated by the 2026-05-13 SUB-vs-AND tag-clear
 experiment (5-18% lookup gain on the hot path) and the type-0
 occupancy probe (type-0 dominates 30-64% of internal nodes).
