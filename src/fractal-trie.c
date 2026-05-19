@@ -3960,13 +3960,45 @@ ft_check_popcount_1l_idx_assumptions(void)
  * targets the most-frequent type observed across the comprehensive
  * benchmark (popcount_2l max_lc=3 on 64-bit: ~46% of dispatches).
  */
+
+/*
+ * FT_NODE_SUB_TAG: SUB-by-imm tag-clear.  At each dispatch case below
+ * the type_index is a compile-time literal, so the tag value to
+ * subtract is a compile-time constant — the compiler emits a single
+ * SUB-by-immediate (or folds into an LEA with displacement) instead
+ * of the data-dependent variable-shift AND used by
+ * ft_node_ptr_internal.
+ *
+ * The subtraction is exact because every alignment bit covered by the
+ * tag bits is zero in the raw address: type-T internal nodes are
+ * 2^(4+T)-byte aligned, while the tag bits live in [0,3]
+ * (FT_INTERNAL_MASK | FT_TYPE_MASK = 0xF).
+ *
+ * On FEATURE_FT_SKIP_COMPRESSED builds the skip-len high bits live
+ * at [FT_SKIP_LEN_SHIFT, 63]; mask them off with FT_ADDR_MASK so
+ * the result is a canonical address suitable for memory access.
+ * Builds without FEATURE_FT_SKIP_COMPRESSED skip the mask entirely.
+ */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+# define FT_NODE_SUB_TAG(nf, type_idx)					\
+	((struct cds_ft_inode *)					\
+		((((unsigned long) (nf) -				\
+		   (((unsigned long) (type_idx) << FT_INTERNAL_BITS) | \
+		    FT_INTERNAL_MASK)) & FT_ADDR_MASK)))
+#else
+# define FT_NODE_SUB_TAG(nf, type_idx)					\
+	((struct cds_ft_inode *)					\
+		((unsigned long) (nf) -					\
+		 (((unsigned long) (type_idx) << FT_INTERNAL_BITS) |	\
+		  FT_INTERNAL_MASK)))
+#endif
+
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
 	unsigned long tag = (unsigned long) node_flag & 0xF;
-	struct cds_ft_inode *node;
 	unsigned int type_index;
 
 	/* External / compressed: internal flag clear. */
@@ -3976,28 +4008,39 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		return NULL;
 	}
 
-	node = ft_node_ptr_internal(node_flag);
 	type_index = (tag >> FT_INTERNAL_BITS) & 0x7;
 
 #if CAA_BITS_PER_LONG >= 64
 	/*
 	 * Types 0 (popcount_2l max_lc=3) and 1 (popcount_2l max_lc=6)
 	 * together cover the dominant portion of dispatches; short-circuit
-	 * them ahead of the jump-table.
+	 * them ahead of the jump-table.  Each case computes the raw node
+	 * pointer via FT_NODE_SUB_TAG with a compile-time-literal type, so
+	 * the SUB is by-immediate and has no data dependency on @node_flag's
+	 * type bits.
 	 */
 	if (caa_likely(type_index == 0))
-		return ft_popcount_2l_scan_16_16_max_3(node, node_flag_ptr, n, pf_hint);
+		return ft_popcount_2l_scan_16_16_max_3(
+			FT_NODE_SUB_TAG(node_flag, 0), node_flag_ptr, n, pf_hint);
 	if (caa_likely(type_index == 1))
-		return ft_popcount_2l_scan_32_8(node, node_flag_ptr, n, pf_hint);
+		return ft_popcount_2l_scan_32_8(
+			FT_NODE_SUB_TAG(node_flag, 1), node_flag_ptr, n, pf_hint);
 	switch (type_index) {
 	case 2:
-		return ft_popcount_2l_scan_64_4(node, node_flag_ptr, n, pf_hint);
+		return ft_popcount_2l_scan_64_4(
+			FT_NODE_SUB_TAG(node_flag, 2), node_flag_ptr, n, pf_hint);
 	case 3:
+		return ft_popcount_1l_scan_28(
+			FT_NODE_SUB_TAG(node_flag, 3), node_flag_ptr, n, pf_hint);
 	case 4:
+		return ft_popcount_1l_scan_28(
+			FT_NODE_SUB_TAG(node_flag, 4), node_flag_ptr, n, pf_hint);
 	case 5:
-		return ft_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
+		return ft_popcount_1l_scan_28(
+			FT_NODE_SUB_TAG(node_flag, 5), node_flag_ptr, n, pf_hint);
 	case 6:
-		return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
+		return ft_pigeon_node_get_nth(NULL,
+			FT_NODE_SUB_TAG(node_flag, 6), node_flag_ptr, n, pf_hint);
 	default:
 		/*
 		 * type_index is a 3-bit field; values 7+ are NODE_INDEX_NULL,
@@ -4007,16 +4050,24 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 	}
 #else
 	if (caa_likely(type_index == 0))
-		return ft_popcount_2l_scan_16_16_max_5(node, node_flag_ptr, n, pf_hint);
+		return ft_popcount_2l_scan_16_16_max_5(
+			FT_NODE_SUB_TAG(node_flag, 0), node_flag_ptr, n, pf_hint);
 	if (caa_likely(type_index == 1))
-		return ft_popcount_2l_scan_64_4(node, node_flag_ptr, n, pf_hint);
+		return ft_popcount_2l_scan_64_4(
+			FT_NODE_SUB_TAG(node_flag, 1), node_flag_ptr, n, pf_hint);
 	switch (type_index) {
 	case 2:
+		return ft_popcount_1l_scan_28(
+			FT_NODE_SUB_TAG(node_flag, 2), node_flag_ptr, n, pf_hint);
 	case 3:
+		return ft_popcount_1l_scan_28(
+			FT_NODE_SUB_TAG(node_flag, 3), node_flag_ptr, n, pf_hint);
 	case 4:
-		return ft_popcount_1l_scan_28(node, node_flag_ptr, n, pf_hint);
+		return ft_popcount_1l_scan_28(
+			FT_NODE_SUB_TAG(node_flag, 4), node_flag_ptr, n, pf_hint);
 	case 5:
-		return ft_pigeon_node_get_nth(NULL, node, node_flag_ptr, n, pf_hint);
+		return ft_pigeon_node_get_nth(NULL,
+			FT_NODE_SUB_TAG(node_flag, 5), node_flag_ptr, n, pf_hint);
 	default:
 		__builtin_unreachable();
 	}
