@@ -10975,6 +10975,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct cds_ft_metadata *dst_rmeta = ft_root_metadata(dst_ft);
 		struct cds_ft_inode *fresh_root;
 		struct cds_ft_metadata *fresh_meta;
+		struct cds_ft_inode *old_dst_root;
 
 		/* Destination must be empty for a root-level graft. */
 		if (dst_rmeta->nr_child != 0 || dst_rmeta->external_nodes)
@@ -10996,14 +10997,20 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * required for this path.
 		 *
 		 * Swap root pointers.  The source's root carries all
-		 * metadata (nr_child, external_nodes) with it.
+		 * metadata (nr_child, external_nodes) with it.  The
+		 * destination's old (empty) root is orphaned by the
+		 * swap and must be reclaimed via call_rcu so concurrent
+		 * readers that entered before the swap finish their
+		 * descent first.
 		 */
+		old_dst_root = ft_node_ptr(dst_ft->root);
 		rcu_assign_pointer(dst_ft->root, src_ft->root);
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);
 		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
 		FT_TP(root_publish, (const void *) src_ft,
 			(const void *) src_ft->root);
+		free_cds_ft_node(dst_ft, old_dst_root);
 		goto done;
 	}
 
@@ -11672,6 +11679,17 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 */
 			{
 				/*
+				 * Save the slot value at @dd.det_nfp before
+				 * ft_detach_node nulls it: this is the head
+				 * of the single-child chain between the
+				 * source's topmost branch point and the move
+				 * target.  Move-style ft_detach_node
+				 * preserves @child but does NOT free the
+				 * intermediate chain; we free it explicitly
+				 * after the detach so it is not leaked.
+				 */
+				struct cds_ft_inode_flag *chain_head = *dd.det_nfp;
+				/*
 				 * Subtree-move detach: preserve @child as
 				 * the root of the new @detached trie.  The
 				 * caller's saved @child pointer keeps the
@@ -11694,6 +11712,58 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						(long) detached_count);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
+				}
+				/*
+				 * Walk from @chain_head down toward @child,
+				 * reclaiming every compressed / internal
+				 * single-child no-external link in between.
+				 * Stop at @child (move target, preserved) or
+				 * any earlier divergence we did not expect.
+				 *
+				 * After ft_detach_node + ft_node_replace_ptr
+				 * the chain is unreachable from the source
+				 * root and call_rcu via free_*_node defers
+				 * reclamation until in-flight readers have
+				 * left.
+				 */
+				while (chain_head &&
+				       chain_head != child &&
+				       !ft_node_external(chain_head)) {
+					struct cds_ft_inode_flag *next = NULL;
+
+					if (ft_node_compressed(chain_head)) {
+						struct cds_ft_compressed_node *cn;
+						struct cds_ft_metadata *cm;
+
+						cn = ft_compressed_node_ptr(
+							ft_skip_child_ptr(chain_head));
+						cm = cds_ft_item_to_metadata(
+							(struct cds_ft_inode *) cn);
+						if (cm->nr_child != 1 ||
+						    cm->external_nodes)
+							break;
+						next = cn->child;
+						free_compressed_node(ft, cn);
+					} else {
+						struct cds_ft_metadata *m =
+							cds_ft_item_to_metadata(
+								ft_node_ptr(chain_head));
+						unsigned int kv;
+
+						if (m->nr_child != 1 ||
+						    m->external_nodes)
+							break;
+						for (kv = 0; kv < 256; kv++) {
+							next = ft_node_get_nth(
+								chain_head, NULL,
+								(uint8_t) kv, FT_PF_NONE);
+							if (next)
+								break;
+						}
+						free_cds_ft_node(ft,
+							ft_node_ptr(chain_head));
+					}
+					chain_head = next;
 				}
 			}
 
