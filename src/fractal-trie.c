@@ -3997,20 +3997,18 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 
 #if CAA_BITS_PER_LONG >= 64
 	/*
-	 * Types 0 (popcount_2l max_lc=3) and 1 (popcount_2l max_lc=6)
-	 * together cover the dominant portion of dispatches; short-circuit
-	 * them ahead of the jump-table.  Each case computes the raw node
-	 * pointer via FT_NODE_SUB_TAG with a compile-time-literal type, so
-	 * the SUB is by-immediate and has no data dependency on @node_flag's
-	 * type bits.
+	 * Pure switch; expect gcc to emit a jump table for 0..6.  Each
+	 * case computes FT_NODE_SUB_TAG with a compile-time-literal type
+	 * so the SUB is by-immediate and has no data dependency on
+	 * @node_flag's type bits.
 	 */
-	if (caa_likely(type_index == 0))
+	switch (type_index) {
+	case 0:
 		return ft_popcount_2l_scan_16_16_max_3(
 			FT_NODE_SUB_TAG(node_flag, 0), node_flag_ptr, n, pf_hint);
-	if (caa_likely(type_index == 1))
+	case 1:
 		return ft_popcount_2l_scan_32_8(
 			FT_NODE_SUB_TAG(node_flag, 1), node_flag_ptr, n, pf_hint);
-	switch (type_index) {
 	case 2:
 		return ft_popcount_2l_scan_64_4(
 			FT_NODE_SUB_TAG(node_flag, 2), node_flag_ptr, n, pf_hint);
@@ -4034,13 +4032,13 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		__builtin_unreachable();
 	}
 #else
-	if (caa_likely(type_index == 0))
+	switch (type_index) {
+	case 0:
 		return ft_popcount_2l_scan_16_16_max_5(
 			FT_NODE_SUB_TAG(node_flag, 0), node_flag_ptr, n, pf_hint);
-	if (caa_likely(type_index == 1))
+	case 1:
 		return ft_popcount_2l_scan_64_4(
 			FT_NODE_SUB_TAG(node_flag, 1), node_flag_ptr, n, pf_hint);
-	switch (type_index) {
 	case 2:
 		return ft_popcount_1l_scan_28(
 			FT_NODE_SUB_TAG(node_flag, 2), node_flag_ptr, n, pf_hint);
