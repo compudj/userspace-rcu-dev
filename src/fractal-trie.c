@@ -5505,27 +5505,36 @@ enum ft_descent_action ft_traverse_compressed(
 }
 
 /*
- * @candidate: when true, skip key comparison at compressed nodes
- * during traversal (patricia-like mode).  The returned node is a
- * candidate that must be verified by the caller against their
- * stored key.  Constant-folded at each call site.
+ * do_cds_ft_lookup_inner: descent template.
  *
- * When the group enables speculative_validated and the caller did
- * not request candidate semantics, descend with cand-mode anyway and
- * validate the result against the external node's stored key before
- * returning.  Limited to equality lookups (tracking == NONE) and
- * identity key_map (the user's stored key matches the trie's byte
- * order without reverse-mapping).
+ * @descend_cand and @skip_compressed are compile-time constants at
+ * every call site (the four specialization wrappers below pass true /
+ * false literals).  always_inline + literal arguments lets the compiler
+ * constant-fold the per-iter branches on these flags:
+ *   - loop-top skip-compressed resolution (line 5621 area)
+ *   - get_nth dispatch (line 5687 area)
+ *   - post-get_nth skip-compressed resolution (line 5719 area)
+ * Eliminates the per-iter `test %sil, %sil` hot spot identified via
+ * perf annotate.
+ *
+ * @spec_validate stays runtime (passed through the dispatcher); it
+ * only gates the at-end leaf verify, a single conditional outside the
+ * loop.
+ *
+ * @candidate is gone — the dispatcher computes spec_validate and
+ * descend_cand from it once and passes the results in.
  */
 static inline_lookup
-enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
+enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
 		struct cds_ft_node **tracking_match_node,
-		bool candidate)
+		bool spec_validate,
+		bool descend_cand,
+		bool skip_compressed)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
 	const uint8_t *orig_key = key;
@@ -5533,15 +5542,9 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 	struct cds_ft_node *found = NULL;
 	unsigned int key_depth, i;
 	enum cds_ft_status status;
-	bool spec_validate = !candidate
-			&& ft->group->speculative_validated
-			&& ft->group->key_map.identity
-			&& tracking == FT_PREFIX_TRACK_NONE;
-	bool descend_cand = candidate || spec_validate;
 	size_t iter_path_len = 0;
 	bool track = (tracking != FT_PREFIX_TRACK_NONE);
 	bool track_longest = (tracking == FT_PREFIX_TRACK_LONGEST);
-	bool skip_compressed = ft_group_skip_compressed(ft->group);
 	size_t match_len = track_longest ? FT_MATCH_LEN_NONE : 0;
 	struct cds_ft_node *match_node = NULL;
 
@@ -5868,6 +5871,127 @@ end:
 		*tracking_match_node = match_node;
 	}
 	return status;
+}
+
+/*
+ * Four specialized instantiations of do_cds_ft_lookup_inner.  Each
+ * wrapper passes a const (descend_cand, skip_compressed) pair so the
+ * always_inline body collapses to a single specialized descent loop.
+ * inline_lookup (always_inline) keeps them inlined into the dispatcher
+ * and ultimately into the public entry points, so per-caller constants
+ * (iter == NULL, candidate, tracking) also DCE the body.
+ */
+static inline_lookup
+enum cds_ft_status do_cds_ft_lookup_dc_sc(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft_node **result_node,
+		struct cds_ft_iter *iter,
+		enum ft_prefix_tracking tracking,
+		size_t *tracking_match_len,
+		struct cds_ft_node **tracking_match_node,
+		bool spec_validate)
+{
+	return do_cds_ft_lookup_inner(ft, key, _key_len, result_node, iter,
+			tracking, tracking_match_len, tracking_match_node,
+			spec_validate, true, true);
+}
+
+static inline_lookup
+enum cds_ft_status do_cds_ft_lookup_dc_nosc(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft_node **result_node,
+		struct cds_ft_iter *iter,
+		enum ft_prefix_tracking tracking,
+		size_t *tracking_match_len,
+		struct cds_ft_node **tracking_match_node,
+		bool spec_validate)
+{
+	return do_cds_ft_lookup_inner(ft, key, _key_len, result_node, iter,
+			tracking, tracking_match_len, tracking_match_node,
+			spec_validate, true, false);
+}
+
+static inline_lookup
+enum cds_ft_status do_cds_ft_lookup_nodc_sc(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft_node **result_node,
+		struct cds_ft_iter *iter,
+		enum ft_prefix_tracking tracking,
+		size_t *tracking_match_len,
+		struct cds_ft_node **tracking_match_node)
+{
+	return do_cds_ft_lookup_inner(ft, key, _key_len, result_node, iter,
+			tracking, tracking_match_len, tracking_match_node,
+			false, false, true);
+}
+
+static inline_lookup
+enum cds_ft_status do_cds_ft_lookup_nodc_nosc(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft_node **result_node,
+		struct cds_ft_iter *iter,
+		enum ft_prefix_tracking tracking,
+		size_t *tracking_match_len,
+		struct cds_ft_node **tracking_match_node)
+{
+	return do_cds_ft_lookup_inner(ft, key, _key_len, result_node, iter,
+			tracking, tracking_match_len, tracking_match_node,
+			false, false, false);
+}
+
+/*
+ * @candidate: when true, skip key comparison at compressed nodes
+ * during traversal (patricia-like mode).  The returned node is a
+ * candidate that must be verified by the caller against their
+ * stored key.  Constant-folded at each call site.
+ *
+ * When the group enables speculative_validated and the caller did
+ * not request candidate semantics, descend with cand-mode anyway and
+ * validate the result against the external node's stored key before
+ * returning.  Limited to equality lookups (tracking == NONE) and
+ * identity key_map (the user's stored key matches the trie's byte
+ * order without reverse-mapping).
+ *
+ * 4-way dispatch on (descend_cand, skip_compressed).  descend_cand=false
+ * implies spec_validate=false (per its definition), so the nodc wrappers
+ * skip the spec_validate argument entirely — their leaf-verify branch
+ * is dead-code-eliminated.
+ */
+static inline_lookup
+enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len,
+		struct cds_ft_node **result_node,
+		struct cds_ft_iter *iter,
+		enum ft_prefix_tracking tracking,
+		size_t *tracking_match_len,
+		struct cds_ft_node **tracking_match_node,
+		bool candidate)
+{
+	bool spec_validate = !candidate
+			&& ft->group->speculative_validated
+			&& ft->group->key_map.identity
+			&& tracking == FT_PREFIX_TRACK_NONE;
+	bool descend_cand = candidate || spec_validate;
+	bool skip_compressed = ft_group_skip_compressed(ft->group);
+
+	if (descend_cand) {
+		if (skip_compressed)
+			return do_cds_ft_lookup_dc_sc(ft, key, _key_len,
+					result_node, iter, tracking,
+					tracking_match_len, tracking_match_node,
+					spec_validate);
+		return do_cds_ft_lookup_dc_nosc(ft, key, _key_len,
+				result_node, iter, tracking,
+				tracking_match_len, tracking_match_node,
+				spec_validate);
+	}
+	if (skip_compressed)
+		return do_cds_ft_lookup_nodc_sc(ft, key, _key_len,
+				result_node, iter, tracking,
+				tracking_match_len, tracking_match_node);
+	return do_cds_ft_lookup_nodc_nosc(ft, key, _key_len,
+			result_node, iter, tracking,
+			tracking_match_len, tracking_match_node);
 }
 
 enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
