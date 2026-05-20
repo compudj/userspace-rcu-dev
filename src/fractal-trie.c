@@ -5431,7 +5431,8 @@ static inline_lookup
 enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag_p,
 		const uint8_t **key_p, unsigned int *i_p,
 		unsigned int key_depth,
-		struct cds_ft_iter *iter, size_t *iter_path_len_p,
+		struct cds_ft_inode_flag **path_nodes,
+		size_t *iter_path_len_p,
 		bool track, bool track_longest,
 		size_t *match_len_p, struct cds_ft_node **match_node_p,
 		struct cds_ft_node **found_ret,
@@ -5502,11 +5503,11 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 
 	/* Advance past the compressed path. */
 	key += cn->len;
-	if (iter) {
+	if (path_nodes) {
 		int k;
 
 		for (k = 1; k <= cn->len; k++)
-			iter_path_node(iter)[i + k] =
+			path_nodes[i + k] =
 				(struct cds_ft_inode_flag *)
 				ft_compressed_node_flag(cn);
 	}
@@ -5516,8 +5517,8 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 		*status_ret = CDS_FT_STATUS_NOT_FOUND;
 		return FT_DESCENT_END;
 	}
-	if (iter) {
-		iter_path_node(iter)[i] = node_flag;
+	if (path_nodes) {
+		path_nodes[i] = node_flag;
 		*iter_path_len_p = i + 1;
 	}
 
@@ -5657,9 +5658,21 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	node_flag = ft_dereference_prefetch(ft->root);
 	key_depth = key_len + 1;
 
+	{
+	/*
+	 * Capture the path-node array base BEFORE spilling @iter so the
+	 * loop body and the inlined compressed-node handler can write
+	 * the per-step path entry through @path_nodes without rehydrating
+	 * @iter from its stack slot at every access.  NULL @iter yields a
+	 * NULL @path_nodes, and the path-write conditionals fold away at
+	 * compile time for callers without an iter (cds_ft_lookup_key).
+	 */
+	struct cds_ft_inode_flag ** const path_nodes =
+		iter ? iter_path_node(iter) : NULL;
+
 	if (iter) {
 		iter_debug_path_snapshot(iter);
-		iter_path_node(iter)[0] = node_flag;
+		path_nodes[0] = node_flag;
 		iter_path_len = 1;
 	}
 	/*
@@ -5753,8 +5766,8 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 				key += skip;
 				i += skip;
 				node_flag = ft_skip_child_ptr(node_flag);
-				if (iter) {
-					iter_path_node(iter)[i] = node_flag;
+				if (path_nodes) {
+					path_nodes[i] = node_flag;
 					iter_path_len = i + 1;
 				}
 				/*
@@ -5780,7 +5793,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 
 				i--;
 				act = ft_lookup_compressed(&node_flag, &key, &i,
-					key_depth, iter, &iter_path_len,
+					key_depth, path_nodes, &iter_path_len,
 					track, track_longest,
 					&match_len, &match_node, &found, &status,
 					descend_cand);
@@ -5902,8 +5915,8 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 				node_flag = ft_skip_child_ptr(node_flag);
 			}
 		}
-		if (iter) {
-			iter_path_node(iter)[i] = node_flag;
+		if (path_nodes) {
+			path_nodes[i] = node_flag;
 			iter_path_len = i + 1;
 		}
 		/*
@@ -5941,6 +5954,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 				match_node = external_nodes;
 			}
 		}
+	}
 	}
 	}
 
