@@ -5677,8 +5677,19 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	 * NULL @path_nodes, and the path-write conditionals fold away at
 	 * compile time for callers without an iter (cds_ft_lookup_key).
 	 */
+	/*
+	 * Gate path tracking on CACHED mode: UNCACHED iters have their
+	 * path discarded by iter_auto_invalidate_path() in the epilogue,
+	 * so populating it byte-by-byte across the descent is pure
+	 * waste.  Set @path_nodes = NULL upfront and the existing
+	 * `if (path_nodes)` gates in the loop / compressed handler all
+	 * DCE.  Defensive: keeps the iter prologue snapshot intact for
+	 * callers that read iter->node etc. — they're independent of
+	 * the path array.
+	 */
 	struct cds_ft_inode_flag ** const path_nodes =
-		iter ? iter_path_node(iter) : NULL;
+		(iter && iter->path_mode == CDS_FT_ITER_PATH_CACHED) ?
+			iter_path_node(iter) : NULL;
 	/*
 	 * Optional path-write cursor.  Tracks the slot for the current
 	 * iteration's path write (advances at skip and at iter-end via
@@ -5689,10 +5700,10 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	struct cds_ft_inode_flag **path_cur =
 		path_nodes ? path_nodes + 1 : NULL;
 
-	if (iter) {
+	if (iter)
 		iter_debug_path_snapshot(iter);
+	if (path_nodes)
 		path_nodes[0] = node_flag;
-	}
 	/*
 	 * Spill @iter to its stack slot after the prologue's last
 	 * in-register use of it.  The register holding @iter is then
