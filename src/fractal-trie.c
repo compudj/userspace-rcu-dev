@@ -5429,21 +5429,19 @@ enum ft_prefix_tracking {
  */
 static inline_lookup
 enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag_p,
-		const uint8_t **key_p, unsigned int *i_p,
-		unsigned int key_depth,
-		struct cds_ft_inode_flag **path_nodes,
-		size_t *iter_path_len_p,
+		const uint8_t **key_p, const uint8_t *key_end,
+		struct cds_ft_inode_flag ***path_cur_pp,
 		bool track, bool track_longest,
-		size_t *match_len_p, struct cds_ft_node **match_node_p,
+		const uint8_t **match_key_pos_p, struct cds_ft_node **match_node_p,
 		struct cds_ft_node **found_ret,
 		enum cds_ft_status *status_ret,
 		bool candidate)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	const uint8_t *key = *key_p;
-	unsigned int i = *i_p;
+	struct cds_ft_inode_flag **path_cur = *path_cur_pp;
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
-	int remaining_key = key_depth - 1 - i;
+	int remaining_key = (int) (key_end - key);
 	int cmp_len = cn->len < remaining_key ? cn->len : remaining_key;
 
 	/* Check external_nodes at the compressed node's depth. */
@@ -5454,7 +5452,7 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 			ft_dereference_prefetch_external(cn_meta->external_nodes);
 
 		if (ext || track_longest) {
-			*match_len_p = i;
+			*match_key_pos_p = key;
 			*match_node_p = ext;
 		}
 	}
@@ -5470,12 +5468,12 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 					cmp_len, remaining_key, false, &mpos);
 
 			if (cmp != 0) {
-				*match_len_p = i + mpos;
+				*match_key_pos_p = key + mpos;
 				*match_node_p = NULL;
 				*status_ret = CDS_FT_STATUS_NOT_FOUND;
 				return FT_DESCENT_END;
 			}
-			*match_len_p = i + cmp_len;
+			*match_key_pos_p = key + cmp_len;
 			*match_node_p = NULL;
 		} else {
 			if (ft_key_cmp_ordinals(key, cn->key_bytes,
@@ -5495,47 +5493,53 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 		*status_ret = *found_ret ? CDS_FT_STATUS_OK :
 				CDS_FT_STATUS_NOT_FOUND;
 		if (track && (*found_ret || track_longest)) {
-			*match_len_p = i;
+			*match_key_pos_p = key;
 			*match_node_p = *found_ret;
 		}
 		return FT_DESCENT_END;
 	}
 
-	/* Advance past the compressed path. */
+	/*
+	 * Advance past the compressed path.  Caller passes @path_cur at
+	 * its iter-top value (no `i--` shift), so the per-byte fill is
+	 * path_cur[0..cn->len-1], the final child write lands on
+	 * path_cur[cn->len - 1] (overwriting the last fill slot — matches
+	 * the legacy i-based code's semantics), and we leave @path_cur
+	 * advanced by cn->len for the caller's next iter.
+	 */
 	key += cn->len;
-	if (path_nodes) {
+	if (path_cur) {
 		int k;
 
-		for (k = 1; k <= cn->len; k++)
-			path_nodes[i + k] =
+		for (k = 0; k < cn->len; k++)
+			path_cur[k] =
 				(struct cds_ft_inode_flag *)
 				ft_compressed_node_flag(cn);
 	}
-	i += cn->len;
 	node_flag = ft_dereference_acquire_prefetch(cn->child);
 	if (!node_flag) {
 		*status_ret = CDS_FT_STATUS_NOT_FOUND;
 		return FT_DESCENT_END;
 	}
-	if (path_nodes) {
-		path_nodes[i] = node_flag;
-		*iter_path_len_p = i + 1;
+	if (path_cur) {
+		path_cur[cn->len - 1] = node_flag;
+		path_cur += cn->len;
+		*path_cur_pp = path_cur;
 	}
 
 	*node_flag_p = node_flag;
 	*key_p = key;
-	*i_p = i;
 
-	if (i >= key_depth)
+	if (key > key_end)
 		return FT_DESCENT_BREAK;
 
 	/*
 	 * External child before end of key: record for partial
 	 * tracking, set NOT_FOUND, and tell the caller to end.
 	 */
-	if (i < key_depth - 1 && ft_node_external(node_flag)) {
+	if (key < key_end && ft_node_external(node_flag)) {
 		if (track) {
-			*match_len_p = i;
+			*match_key_pos_p = key;
 			*match_node_p = (struct cds_ft_node *) node_flag;
 		}
 		*status_ret = CDS_FT_STATUS_NOT_FOUND;
@@ -5547,14 +5551,14 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 	 * compressed path) so callers that skip the normal tracking
 	 * code via continue don't miss it.
 	 */
-	if (track && i < key_depth - 1 && !ft_node_external(node_flag)) {
+	if (track && key < key_end && !ft_node_external(node_flag)) {
 		struct cds_ft_metadata *metadata =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 		struct cds_ft_node *ext =
 			ft_dereference_prefetch_external(metadata->external_nodes);
 
 		if (ext || track_longest) {
-			*match_len_p = i;
+			*match_key_pos_p = key;
 			*match_node_p = ext;
 		}
 	}
@@ -5643,20 +5647,26 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 {
 	size_t key_len = ft_key_len(ft, _key_len);
 	const uint8_t *orig_key = key;
+	const uint8_t *key_end = orig_key + key_len;
 	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_node *found = NULL;
-	unsigned int key_depth, i;
 	enum cds_ft_status status;
 	size_t iter_path_len = 0;
 	bool track = (tracking != FT_PREFIX_TRACK_NONE);
 	bool track_longest = (tracking == FT_PREFIX_TRACK_LONGEST);
-	size_t match_len = track_longest ? FT_MATCH_LEN_NONE : 0;
+	/*
+	 * Pointer-form prefix-tracking state.  @match_key_pos == NULL is
+	 * the "no match yet" sentinel (track_longest's initial state, was
+	 * FT_MATCH_LEN_NONE in the size_t form).  Non-NULL points into the
+	 * @orig_key buffer at the matched position; the size_t match_len
+	 * reported to the caller is computed at end: as the difference.
+	 */
+	const uint8_t *match_key_pos = track_longest ? NULL : orig_key;
 	struct cds_ft_node *match_node = NULL;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	node_flag = ft_dereference_prefetch(ft->root);
-	key_depth = key_len + 1;
 
 	{
 	/*
@@ -5669,11 +5679,19 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	 */
 	struct cds_ft_inode_flag ** const path_nodes =
 		iter ? iter_path_node(iter) : NULL;
+	/*
+	 * Optional path-write cursor.  Tracks the slot for the current
+	 * iteration's path write (advances at skip and at iter-end via
+	 * lockstep with the loop's level counter).  NULL when no iter,
+	 * so the per-iter advance and per-write store are compile-time
+	 * DCE'd for the no-iter callers.
+	 */
+	struct cds_ft_inode_flag **path_cur =
+		path_nodes ? path_nodes + 1 : NULL;
 
 	if (iter) {
 		iter_debug_path_snapshot(iter);
 		path_nodes[0] = node_flag;
-		iter_path_len = 1;
 	}
 	/*
 	 * Spill @iter to its stack slot after the prologue's last
@@ -5700,7 +5718,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track) {
-			match_len = 0;
+			match_key_pos = orig_key;
 			match_node = found;
 		}
 		goto end;
@@ -5718,15 +5736,12 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
 		if (external_nodes || track_longest) {
-			match_len = 0;
+			match_key_pos = orig_key;
 			match_node = external_nodes;
 		}
 	}
 
-	{
-	const uint8_t *key_end = orig_key + key_len;
-
-	for (i = 1; key < key_end; i++) {
+	while (key < key_end) {
 		uint8_t iter_key;
 
 		/*
@@ -5764,12 +5779,11 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 					goto end;
 				}
 				key += skip;
-				i += skip;
+				if (path_nodes)
+					path_cur += skip;
 				node_flag = ft_skip_child_ptr(node_flag);
-				if (path_nodes) {
-					path_nodes[i] = node_flag;
-					iter_path_len = i + 1;
-				}
+				if (path_nodes)
+					*path_cur = node_flag;
 				/*
 				 * If the skip's child is external and
 				 * we've consumed the full key, exit the
@@ -5791,11 +5805,10 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 			if (ft_node_compressed(node_flag)) {
 				enum ft_descent_action act;
 
-				i--;
-				act = ft_lookup_compressed(&node_flag, &key, &i,
-					key_depth, path_nodes, &iter_path_len,
+				act = ft_lookup_compressed(&node_flag, &key, key_end,
+					&path_cur,
 					track, track_longest,
-					&match_len, &match_node, &found, &status,
+					&match_key_pos, &match_node, &found, &status,
 					descend_cand);
 				if (act == FT_DESCENT_END)
 					goto end;
@@ -5911,14 +5924,13 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 					goto end;
 				}
 				key += skip;
-				i += skip;
+				if (path_nodes)
+					path_cur += skip;
 				node_flag = ft_skip_child_ptr(node_flag);
 			}
 		}
-		if (path_nodes) {
-			path_nodes[i] = node_flag;
-			iter_path_len = i + 1;
-		}
+		if (path_nodes)
+			*path_cur = node_flag;
 		/*
 		 * External child before end of key: the key is
 		 * longer than this branch.
@@ -5926,7 +5938,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		if (caa_unlikely(ft_node_external(node_flag)) &&
 		    key < key_end) {
 			if (track) {
-				match_len = i;
+				match_key_pos = key;
 				match_node = (struct cds_ft_node *) node_flag;
 			}
 			status = CDS_FT_STATUS_NOT_FOUND;
@@ -5950,12 +5962,21 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 			struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
 
 			if (external_nodes || track_longest) {
-				match_len = i;
+				match_key_pos = key;
 				match_node = external_nodes;
 			}
 		}
+		/* Iter-end advance for lockstep with key/level. */
+		if (path_nodes)
+			path_cur++;
 	}
-	}
+	/*
+	 * Compute iter_path_len at end from @path_cur (last write
+	 * position + 1 advance per iter, all in lockstep with the
+	 * level counter).
+	 */
+	if (path_nodes)
+		iter_path_len = path_cur - path_nodes;
 	}
 
 	/*
@@ -5969,7 +5990,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
-			match_len = key_len;
+			match_key_pos = key_end;
 			match_node = found;
 		}
 	} else if (ft_node_compressed(node_flag)) {
@@ -5982,14 +6003,14 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		found = ft_dereference_prefetch_external(metadata->external_nodes);
 		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 		if (track && (found || track_longest)) {
-			match_len = key_len;
+			match_key_pos = key_end;
 			match_node = found;
 		}
 	} else {
 		found = (struct cds_ft_node *) node_flag;
 		status = CDS_FT_STATUS_OK;
 		if (track) {
-			match_len = key_len;
+			match_key_pos = key_end;
 			match_node = found;
 		}
 	}
@@ -6048,7 +6069,9 @@ end:
 		iter_auto_invalidate_path(iter);
 	}
 	if (track) {
-		*tracking_match_len = match_len;
+		*tracking_match_len = match_key_pos ?
+			(size_t) (match_key_pos - orig_key) :
+			FT_MATCH_LEN_NONE;
 		*tracking_match_node = match_node;
 	}
 	return status;
