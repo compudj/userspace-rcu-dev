@@ -5654,17 +5654,26 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
-	if (!valid_key_len(ft, key_len)) {
-		status = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-		goto end;
-	}
-	key_depth = key_len + 1;
 	node_flag = ft_dereference_prefetch(ft->root);
+	key_depth = key_len + 1;
 
 	if (iter) {
 		iter_debug_path_snapshot(iter);
 		iter_path_node(iter)[0] = node_flag;
 		iter_path_len = 1;
+	}
+	/*
+	 * Spill @iter to its stack slot after the prologue's last
+	 * in-register use of it.  The register holding @iter is then
+	 * free for the rest of the function; the matching reload at
+	 * end: rehydrates it for the epilogue writes.  Validations
+	 * below this line goto-end through the spilled path.
+	 */
+	FT_SPILL_TO_STACK(iter);
+
+	if (caa_unlikely(!valid_key_len(ft, key_len))) {
+		status = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		goto end;
 	}
 
 	/*
@@ -5701,7 +5710,10 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		}
 	}
 
-	for (i = 1; i < key_depth; i++) {
+	{
+	const uint8_t *key_end = orig_key + key_len;
+
+	for (i = 1; key < key_end; i++) {
 		uint8_t iter_key;
 
 		/*
@@ -5732,7 +5744,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 					ft_skip_to_compressed(node_flag));
 			} else {
 				unsigned int skip = ft_skip_len(node_flag);
-				int remaining = key_depth - 1 - i;
+				int remaining = (int) (key_end - key) - 1;
 
 				if ((int) skip > remaining) {
 					status = CDS_FT_STATUS_NOT_FOUND;
@@ -5879,7 +5891,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 			}
 			{
 				unsigned int skip = ft_skip_len(node_flag);
-				int remaining = key_depth - 1 - i;
+				int remaining = (int) (key_end - key);
 
 				if ((int) skip > remaining) {
 					status = CDS_FT_STATUS_NOT_FOUND;
@@ -5899,7 +5911,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		 * longer than this branch.
 		 */
 		if (caa_unlikely(ft_node_external(node_flag)) &&
-		    i < key_depth - 1) {
+		    key < key_end) {
 			if (track) {
 				match_len = i;
 				match_node = (struct cds_ft_node *) node_flag;
@@ -5918,7 +5930,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		 * (at the loop top).
 		 */
 		if (track && caa_likely(ft_node_internal(node_flag))
-		    && i < key_depth - 1) {
+		    && key < key_end) {
 			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
 					ft_node_ptr(node_flag), type->order);
@@ -5929,6 +5941,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 				match_node = external_nodes;
 			}
 		}
+	}
 	}
 
 	/*
@@ -5968,6 +5981,8 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	}
 
 end:
+	/* Bring @iter back into a register for the epilogue writes. */
+	FT_RELOAD_FROM_STACK(iter);
 	/*
 	 * Speculative-validated lookup: when the group enables library-
 	 * side validation and the descent ran in cand mode (spec_validate

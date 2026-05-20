@@ -352,6 +352,45 @@ void ft_writer_scope_verify(struct cds_ft *ft);
 #define inline_lookup
 #endif
 
+/*
+ * Spill/reload helpers for breaking the live range of a variable.
+ *
+ * FT_SPILL_TO_STACK(var) stores @var to its own stack slot through
+ * a volatile lvalue, forcing gcc to actually emit the store and to
+ * stop assuming any register copy is in sync with memory.  With
+ * no normal use of @var until the matching reload, gcc is free to
+ * recycle the register that held @var.
+ *
+ * FT_RELOAD_FROM_STACK(var) is the matching reload — a volatile
+ * load from @var's stack slot into a fresh register.
+ *
+ * The two MUST be paired.  Every code path that reaches the
+ * reload must have executed the matching spill first; otherwise
+ * the reload returns an uninitialized stack-slot value.
+ *
+ * Implementation: an empty inline asm with `"=m"`/`"=r"`
+ * constraints would declare the memory or register as touched
+ * but emit no instructions — gcc's data-flow then folds the
+ * pair away and keeps @var live across the gap, defeating the
+ * purpose.  The volatile cast emits the actual store and load.
+ *
+ * Caveat: if the freed register would be useful inside the gap,
+ * the gap must not derive its work-state from @var (e.g. via
+ * macros that dereference @var), since each such reference would
+ * force a reload from the spill slot.  Capture work-state into
+ * local pointers BEFORE the spill and refer to those locals
+ * inside the gap.
+ */
+#define FT_SPILL_TO_STACK(var)						\
+	do {								\
+		*(volatile __typeof__(var) *) &(var) = (var);		\
+	} while (0)
+
+#define FT_RELOAD_FROM_STACK(var)					\
+	do {								\
+		(var) = *(volatile __typeof__(var) *) &(var);		\
+	} while (0)
+
 enum {
 	FT_NO_BITMAP = false,
 #ifdef FEATURE_USE_BITMAP_SCAN
