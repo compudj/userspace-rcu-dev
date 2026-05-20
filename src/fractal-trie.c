@@ -5752,93 +5752,68 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		}
 	}
 
+	/*
+	 * Pre-loop non-internal root handler.  graft_swap can place a
+	 * compressed node directly at ft->root when it splits inside a
+	 * compressed prefix and the displaced subtree becomes the swap's
+	 * root.  The hot loop assumes the dispatch parent is an internal
+	 * node; resolve a non-internal root once here so the loop body
+	 * stays lean (no tag-bit branch before each dispatch).
+	 *
+	 * Skip-encoded root is not currently produced by any mutator
+	 * path, but resolve it defensively for completeness — cost is
+	 * one shr+jne, DCE'd when skip_compressed compile-time false.
+	 */
+	if (skip_compressed &&
+	    caa_unlikely(ft_node_skip_compressed(node_flag))) {
+		if (!descend_cand) {
+			node_flag = ft_compressed_node_flag(
+				ft_skip_to_compressed(node_flag));
+		} else {
+			unsigned int skip = ft_skip_len(node_flag);
+
+			if ((int) skip > (int) (key_end - key)) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			key += skip;
+			if (path_nodes)
+				path_cur += skip;
+			node_flag = ft_skip_child_ptr(node_flag);
+		}
+	}
+	if (caa_unlikely(!ft_node_internal(node_flag))) {
+		if (ft_node_compressed(node_flag)) {
+			enum ft_descent_action act;
+
+			act = ft_lookup_compressed(&node_flag, &key, key_end,
+				&path_cur,
+				track, track_longest,
+				&match_key_pos, &match_node, &found, &status,
+				descend_cand);
+			if (act == FT_DESCENT_END)
+				goto end;
+			if (act == FT_DESCENT_BREAK)
+				goto terminal;
+			/* CONTINUE: node_flag is now plain, fall through to loop. */
+		} else if (ft_node_external(node_flag)) {
+			goto terminal;
+		} else {
+			status = CDS_FT_STATUS_NOT_FOUND;
+			goto end;
+		}
+	}
+
 	while (key < key_end) {
 		uint8_t iter_key;
 
 		/*
-		 * Compressed node at current position (e.g. compressed
-		 * root or compressed child from ft_node_get_nth).
+		 * Loop top is lean: node_flag is internal.  ft->root was
+		 * normalized by the pre-loop check above; subsequent
+		 * iterations land here only on the internal fall-through
+		 * path of the post-step merged handler.  No tag-bit branch
+		 * before dispatch.
 		 */
-		/*
-		 * Non-internal nodes at this position (compressed) need
-		 * special handling.  Internal (bit 0 set) is the common
-		 * case — skip directly to the key dispatch below.
-		 */
-		/*
-		 * Skip-compressed pointer at loop top: handles skip
-		 * pointers returned by ft_node_get_nth in the previous
-		 * iteration.
-		 *
-		 * Non-candidate: convert to compressed flag so the
-		 * compressed handler below processes it with full
-		 * key comparison.
-		 *
-		 * Candidate: resolve the skip (advance past the
-		 * compressed path without comparison).
-		 */
-		if (skip_compressed &&
-		    caa_unlikely(ft_node_skip_compressed(node_flag))) {
-			if (!descend_cand) {
-				node_flag = ft_compressed_node_flag(
-					ft_skip_to_compressed(node_flag));
-			} else {
-				unsigned int skip = ft_skip_len(node_flag);
-				int remaining = (int) (key_end - key) - 1;
-
-				if ((int) skip > remaining) {
-					status = CDS_FT_STATUS_NOT_FOUND;
-					goto end;
-				}
-				key += skip;
-				if (path_nodes)
-					path_cur += skip;
-				node_flag = ft_skip_child_ptr(node_flag);
-				if (path_nodes)
-					*path_cur = node_flag;
-				/*
-				 * If the skip's child is external and
-				 * we've consumed the full key, exit the
-				 * loop to the terminal check below.
-				 */
-				if (ft_node_external(node_flag))
-					break;
-			}
-		}
-		/*
-		 * Non-internal nodes need special handling.
-		 * Internal (bit 0 set) is the common case.
-		 *
-		 * This single check handles both:
-		 * - compressed from previous iteration's get_nth result
-		 * - compressed/external from compressed handler output
-		 */
-		if (caa_unlikely(!ft_node_internal(node_flag))) {
-			if (ft_node_compressed(node_flag)) {
-				enum ft_descent_action act;
-
-				act = ft_lookup_compressed(&node_flag, &key, key_end,
-					&path_cur,
-					track, track_longest,
-					&match_key_pos, &match_node, &found, &status,
-					descend_cand);
-				if (act == FT_DESCENT_END)
-					goto end;
-				if (act == FT_DESCENT_BREAK)
-					break;
-				continue;
-			}
-			/*
-			 * External or NULL at loop top.  Can happen when
-			 * a compressed node's cn->child is an external
-			 * node (key terminates at the compressed path
-			 * end).  Break to the post-loop terminal handler.
-			 */
-			if (ft_node_external(node_flag))
-				break;
-			status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
-		}
-
 		iter_key = *(key++);
 		/*
 		 * Two paths after key dispatch:
@@ -5912,10 +5887,9 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		/*
 		 * Skip-compressed pointer from child slot.
 		 *
-		 * Non-candidate: convert to compressed flag and
-		 * continue so the compressed handler at the loop
-		 * top processes it (key comparison, external_nodes
-		 * check, etc.).
+		 * Non-candidate: convert to compressed flag and fall
+		 * through to the merged handler below (which calls
+		 * ft_lookup_compressed).
 		 *
 		 * Candidate: resolve the skip (advance past the
 		 * compressed path without comparison).
@@ -5924,9 +5898,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 			if (!descend_cand) {
 				node_flag = ft_compressed_node_flag(
 					ft_skip_to_compressed(node_flag));
-				continue;
-			}
-			{
+			} else {
 				unsigned int skip = ft_skip_len(node_flag);
 				int remaining = (int) (key_end - key);
 
@@ -5943,30 +5915,57 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		if (path_nodes)
 			*path_cur = node_flag;
 		/*
-		 * External child before end of key: the key is
-		 * longer than this branch.
+		 * Merged post-step handler for non-internal results.
+		 * Bundles what was a loop-top !internal slow path with
+		 * the separate post-step external check.  Compressed
+		 * reachable only in non-cand mode (cand mode's skip
+		 * handler above resolves skip → underlying internal/
+		 * external).
 		 */
-		if (caa_unlikely(ft_node_external(node_flag)) &&
-		    key < key_end) {
-			if (track) {
-				match_key_pos = key;
-				match_node = (struct cds_ft_node *) node_flag;
+		if (caa_unlikely(!ft_node_internal(node_flag))) {
+			if (!descend_cand &&
+			    caa_unlikely(ft_node_compressed(node_flag))) {
+				enum ft_descent_action act;
+
+				/*
+				 * The *path_cur = node_flag write above filled
+				 * path[K] with compressed_flag.  Advance one slot
+				 * so ft_lookup_compressed's fill/overwrite land
+				 * at the right depth (matches OLD loop-top
+				 * compressed-handler semantics).
+				 */
+				if (path_nodes)
+					path_cur++;
+				act = ft_lookup_compressed(&node_flag, &key, key_end,
+					&path_cur,
+					track, track_longest,
+					&match_key_pos, &match_node, &found, &status,
+					descend_cand);
+				if (act == FT_DESCENT_END)
+					goto end;
+				if (act == FT_DESCENT_BREAK)
+					break;
+				continue;
 			}
-			status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
-		}
-		/*
-		 * Track prefix match on the child node.  Only
-		 * evaluated when tracking is requested — dead-code
-		 * eliminated for cds_ft_lookup_key (track=false).
-		 * The ft_node_internal check here is only reached
-		 * by track=true callers; for track=false the
-		 * compiler eliminates the entire block, leaving
-		 * just one ft_node_internal check per iteration
-		 * (at the loop top).
-		 */
-		if (track && caa_likely(ft_node_internal(node_flag))
-		    && key < key_end) {
+			if (ft_node_external(node_flag)) {
+				if (key < key_end) {
+					if (track) {
+						match_key_pos = key;
+						match_node = (struct cds_ft_node *) node_flag;
+					}
+					status = CDS_FT_STATUS_NOT_FOUND;
+					goto end;
+				}
+				/* terminal external — fall through to path_cur++ */
+			} else {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+		} else if (track && key < key_end) {
+			/*
+			 * Track prefix match on the internal child.  DCE'd
+			 * when track=false (cds_ft_lookup_key).
+			 */
 			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
 					ft_node_ptr(node_flag), type->order);
@@ -5981,10 +5980,15 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		if (path_nodes)
 			path_cur++;
 	}
+
+terminal:
 	/*
 	 * Compute iter_path_len at end from @path_cur (last write
 	 * position + 1 advance per iter, all in lockstep with the
-	 * level counter).
+	 * level counter).  Also reached from the pre-loop non-internal
+	 * root handler, which already advanced path_cur via
+	 * ft_lookup_compressed (compressed root) or left it at the
+	 * initial slot (external root).
 	 */
 	if (path_nodes)
 		iter_path_len = path_cur - path_nodes;
