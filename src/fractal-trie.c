@@ -4058,6 +4058,69 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 }
 
 /*
+ * ft_node_get_nth_skip_clean: same dispatch as ft_node_get_nth_skip,
+ * but the caller has *already* split the tagged parent pointer into
+ *  - @clean_node : address with tag bits and (on skip-compressed builds)
+ *                  skip-len high bits already masked off
+ *  - @type_index : type tag bits 1-3, already extracted
+ *
+ * Callers also guarantee the FT_INTERNAL_MASK bit was set on the source
+ * pointer, so the internal-flag check is omitted.  Used by the descent
+ * loop in do_cds_ft_lookup_inner where these properties hold at the
+ * call site.  Avoids the per-scanner-case SUB-by-literal + ADDR_MASK ops
+ * that ft_node_get_nth_skip's FT_NODE_SUB_TAG would emit redundantly.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_node_get_nth_skip_clean(struct cds_ft_inode *clean_node,
+		unsigned int type_index,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint)
+{
+#if CAA_BITS_PER_LONG >= 64
+	switch (type_index) {
+	case 0:
+		return ft_popcount_2l_scan_16_16_max_3(
+			clean_node, node_flag_ptr, n, pf_hint);
+	case 1:
+		return ft_popcount_2l_scan_32_8(
+			clean_node, node_flag_ptr, n, pf_hint);
+	case 2:
+		return ft_popcount_2l_scan_64_4(
+			clean_node, node_flag_ptr, n, pf_hint);
+	case 3:
+	case 4:
+	case 5:
+		return ft_popcount_1l_scan_28(
+			clean_node, node_flag_ptr, n, pf_hint);
+	case 6:
+		return ft_pigeon_node_get_nth(NULL,
+			clean_node, node_flag_ptr, n, pf_hint);
+	default:
+		__builtin_unreachable();
+	}
+#else
+	switch (type_index) {
+	case 0:
+		return ft_popcount_2l_scan_16_16_max_5(
+			clean_node, node_flag_ptr, n, pf_hint);
+	case 1:
+		return ft_popcount_2l_scan_64_4(
+			clean_node, node_flag_ptr, n, pf_hint);
+	case 2:
+	case 3:
+	case 4:
+		return ft_popcount_1l_scan_28(
+			clean_node, node_flag_ptr, n, pf_hint);
+	case 5:
+		return ft_pigeon_node_get_nth(NULL,
+			clean_node, node_flag_ptr, n, pf_hint);
+	default:
+		__builtin_unreachable();
+	}
+#endif
+}
+
+/*
  * ft_node_get_nth: child slot access with skip-compressed resolution.
  * If the child is a skip pointer, converts it to the underlying
  * compressed node flag so callers see it as a regular compressed node.
@@ -4071,6 +4134,25 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 	struct cds_ft_inode_flag *child;
 
 	child = ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
+	child = ft_resolve_skip_compressed(child);
+	return child;
+}
+
+/*
+ * Clean-parent counterpart of ft_node_get_nth.  See
+ * ft_node_get_nth_skip_clean for the precondition contract on the
+ * caller-side split of the tagged parent pointer.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_node_get_nth_clean(struct cds_ft_inode *clean_node,
+		unsigned int type_index,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint)
+{
+	struct cds_ft_inode_flag *child;
+
+	child = ft_node_get_nth_skip_clean(clean_node, type_index,
+			node_flag_ptr, n, pf_hint);
 	child = ft_resolve_skip_compressed(child);
 	return child;
 }
@@ -5689,10 +5771,37 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		 * is non-canonical, and __builtin_prefetch silently drops it
 		 * (one cheap uop, no fault).
 		 */
-		if (descend_cand || !skip_compressed)
-			node_flag = ft_node_get_nth_skip(node_flag, NULL, iter_key, FT_PF_DATA);
-		else
-			node_flag = ft_node_get_nth(node_flag, NULL, iter_key, FT_PF_DATA);
+		{
+			/*
+			 * Eager-split optimization: extract type_index and the
+			 * clean parent address from the tagged @node_flag once,
+			 * then dispatch via the *_clean variants.  At this point
+			 * the loop top has already verified node_flag is internal
+			 * (FT_INTERNAL_MASK set) and not skip-compressed, so the
+			 * scanner doesn't need to re-check those bits.  This
+			 * removes the per-scanner-case SUB-by-literal + ADDR_MASK
+			 * pair that was previously emitted inside each
+			 * FT_NODE_SUB_TAG-using case (~2 cycles per descent step
+			 * before the body load issued).
+			 */
+			unsigned long _raw = (unsigned long) node_flag;
+			unsigned int _type =
+				(unsigned int) ((_raw >> FT_INTERNAL_BITS) & 0x7);
+			struct cds_ft_inode *_clean;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			_clean = (struct cds_ft_inode *)
+				((_raw & FT_PTR_MASK) & FT_ADDR_MASK);
+#else
+			_clean = (struct cds_ft_inode *) (_raw & FT_PTR_MASK);
+#endif
+			if (descend_cand || !skip_compressed)
+				node_flag = ft_node_get_nth_skip_clean(_clean,
+						_type, NULL, iter_key, FT_PF_DATA);
+			else
+				node_flag = ft_node_get_nth_clean(_clean,
+						_type, NULL, iter_key, FT_PF_DATA);
+		}
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
 		/*
