@@ -4179,26 +4179,6 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 }
 
 /*
- * Pretyped counterpart of ft_node_get_nth.  See
- * ft_node_get_nth_skip_pretyped for the precondition contract on the
- * caller-side type extraction.
- */
-static inline_lookup
-struct cds_ft_inode_flag *ft_node_get_nth_pretyped(
-		struct cds_ft_inode_flag *node_flag,
-		unsigned int type_index,
-		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, enum ft_pf_target pf_hint)
-{
-	struct cds_ft_inode_flag *child;
-
-	child = ft_node_get_nth_skip_pretyped(node_flag, type_index,
-			node_flag_ptr, n, pf_hint);
-	child = ft_resolve_skip_compressed(child);
-	return child;
-}
-
-/*
  * ft_node_find_child: reverse lookup — given a parent internal node and
  * a child pointer, find the key byte and slot that lead to that child.
  *
@@ -5816,58 +5796,38 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		 */
 		iter_key = *(key++);
 		/*
-		 * Two paths after key dispatch:
+		 * Dispatch returns the slot value as-is, including any
+		 * skip-encoded high bits.  Skip resolution is handled
+		 * uniformly by the post-step skip handler below (cand
+		 * mode advances key + ft_skip_child_ptr; non-cand mode
+		 * converts to compressed_flag).
 		 *
-		 * - ft_node_get_nth_skip: returns the slot value as-is,
-		 *   including skip-compressed pointers.  Used when the
-		 *   caller resolves skip pointers itself (descend_cand
-		 *   handles them at the next loop-top check) or when
-		 *   skip-compressed is disabled and resolution is a no-op.
-		 *
-		 * - ft_node_get_nth: wraps _skip with
-		 *   ft_resolve_skip_compressed so the next loop iteration
-		 *   sees a compressed-flag pointer.
-		 *
-		 * FT_PF_DATA in both: the prefetch fires on the raw slot
-		 * value.  For regular internal/external/compressed children
-		 * (the dominant case — ~97% on dns) the address is clean and
+		 * FT_PF_DATA: the prefetch fires on the raw slot value.
+		 * For regular internal/external/compressed children (the
+		 * dominant case — ~97% on dns) the address is clean and
 		 * the prefetch hits the right target.  For skip-encoded
-		 * children (~3%) the high bits carry skip-length, the address
-		 * is non-canonical, and __builtin_prefetch silently drops it
-		 * (one cheap uop, no fault).
+		 * children (~3%) the high bits carry skip-length, the
+		 * address is non-canonical, and __builtin_prefetch
+		 * silently drops it (one cheap uop, no fault).
 		 */
 		{
 			/*
-			 * Eager-split optimization: extract type_index and the
-			 * clean parent address from the tagged @node_flag once,
-			 * then dispatch via the *_clean variants.  At this point
-			 * the loop top has already verified node_flag is internal
-			 * (FT_INTERNAL_MASK set) and not skip-compressed, so the
-			 * scanner doesn't need to re-check those bits.  This
-			 * removes the per-scanner-case SUB-by-literal + ADDR_MASK
-			 * pair that was previously emitted inside each
-			 * FT_NODE_SUB_TAG-using case (~2 cycles per descent step
-			 * before the body load issued).
+			 * Eager-split: extract type_index from the tagged
+			 * @node_flag once, then dispatch via the pretyped
+			 * scanner.  The pre-loop normalization (or the
+			 * internal-fall-through of the post-step merged
+			 * handler) guarantees @node_flag is internal here,
+			 * so the scanner doesn't need to re-check tag bit 0.
+			 * Per-case FT_NODE_SUB_TAG_NOSKIP with a compile-
+			 * time literal folds the SUB into the body load's
+			 * displacement.
 			 */
 			unsigned long _raw = (unsigned long) node_flag;
 			unsigned int _type =
 				(unsigned int) ((_raw >> FT_INTERNAL_BITS) & 0x7);
-			/*
-			 * Pretyped dispatch: the per-case scanner uses
-			 * FT_NODE_SUB_TAG_NOSKIP with a compile-time literal,
-			 * so gcc folds the SUB into the body load's
-			 * displacement — no explicit AND step on the
-			 * critical dep chain before the load.  The loop top
-			 * has already cleared skip_len (so we can skip
-			 * FT_ADDR_MASK) and verified FT_INTERNAL_MASK is set
-			 * (so the scanner doesn't re-check tag bit 0).
-			 */
-			if (descend_cand || !skip_compressed)
-				node_flag = ft_node_get_nth_skip_pretyped(node_flag,
-						_type, NULL, iter_key, FT_PF_DATA);
-			else
-				node_flag = ft_node_get_nth_pretyped(node_flag,
-						_type, NULL, iter_key, FT_PF_DATA);
+
+			node_flag = ft_node_get_nth_skip_pretyped(node_flag,
+					_type, NULL, iter_key, FT_PF_DATA);
 		}
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
