@@ -618,3 +618,215 @@ void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
 	}
 }
 
+/*
+ * External-node arena (public API): power-of-two size-class
+ * allocator backed by a linked list of mmap'd ranges, with per-
+ * class freelists and a trailing guard area on every range to
+ * support the library's 32-byte SIMD leaf compare over-read.
+ *
+ * Each range is FT_EXT_ARENA_RANGE_SIZE bytes, aligned to its own
+ * size (via over-mmap-and-trim) so range_base = item & ~(SIZE-1).
+ * The range header sits at offset 0 of its base, encoding the size
+ * class served by that range; cds_ft_external_arena_free recovers
+ * the class from any item pointer with one mask + one load.
+ *
+ * No buddy splitting/merging across classes — slots returned to the
+ * freelist are reused at the same class only.  Buddy refinement is
+ * left as future work; small-and-uniform allocation patterns (the
+ * common case for FT external nodes) do not need it.
+ */
+
+#define FT_EXT_ARENA_MIN_ORDER		4	/* 16 B minimum slot */
+#define FT_EXT_ARENA_MAX_ORDER		20	/* 1 MiB maximum slot */
+#define FT_EXT_ARENA_NR_CLASSES					\
+	(FT_EXT_ARENA_MAX_ORDER - FT_EXT_ARENA_MIN_ORDER + 1)
+#define FT_EXT_ARENA_RANGE_ORDER	24	/* 16 MiB per range */
+#define FT_EXT_ARENA_RANGE_SIZE		(1UL << FT_EXT_ARENA_RANGE_ORDER)
+#define FT_EXT_ARENA_RANGE_MASK		(FT_EXT_ARENA_RANGE_SIZE - 1)
+/*
+ * Trailing guard: one full page reserved at the tail of every
+ * range, well in excess of the 32-byte AVX2 over-read horizon and
+ * any plausible AVX-512 widening to 64 B.
+ */
+#define FT_EXT_ARENA_GUARD_SIZE		4096UL
+
+struct cds_ft_external_arena_range {
+	uint8_t order;					/* size class for this range */
+	uint8_t _pad[7];
+	size_t used;					/* bump offset within range */
+	struct cds_list_head node;			/* class's range list */
+	/* Followed by class-aligned slots up to RANGE_SIZE - GUARD_SIZE. */
+};
+
+struct cds_ft_external_arena_freenode {
+	struct cds_ft_external_arena_freenode *next;
+};
+
+struct cds_ft_external_arena {
+	pthread_mutex_t lock;
+	struct {
+		struct cds_list_head ranges;
+		struct cds_ft_external_arena_freenode *freelist;
+	} classes[FT_EXT_ARENA_NR_CLASSES];
+};
+
+static
+int ft_ext_arena_order_for_size(size_t size)
+{
+	int o;
+
+	if (size <= (1UL << FT_EXT_ARENA_MIN_ORDER))
+		return FT_EXT_ARENA_MIN_ORDER;
+	/* Smallest order with (1 << order) >= size. */
+	o = 64 - __builtin_clzll((unsigned long long)(size - 1));
+	return o;
+}
+
+static
+struct cds_ft_external_arena_range *
+ft_ext_arena_range_create(int order)
+{
+	void *raw, *aligned;
+	uintptr_t pre, post;
+	size_t raw_size = 2 * FT_EXT_ARENA_RANGE_SIZE;
+	size_t slot_size = 1UL << order;
+	size_t header_aligned;
+	struct cds_ft_external_arena_range *r;
+
+	/*
+	 * mmap an over-large region and trim to land on a
+	 * FT_EXT_ARENA_RANGE_SIZE-aligned base — required for the
+	 * item-to-range pointer-masking trick.
+	 */
+	raw = mmap(NULL, raw_size, PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (raw == MAP_FAILED)
+		return NULL;
+	aligned = (void *)(((uintptr_t) raw + FT_EXT_ARENA_RANGE_MASK) &
+			~(uintptr_t) FT_EXT_ARENA_RANGE_MASK);
+	pre = (uintptr_t) aligned - (uintptr_t) raw;
+	post = raw_size - pre - FT_EXT_ARENA_RANGE_SIZE;
+	if (pre)
+		(void) munmap(raw, pre);
+	if (post)
+		(void) munmap((char *) aligned + FT_EXT_ARENA_RANGE_SIZE, post);
+
+	r = (struct cds_ft_external_arena_range *) aligned;
+	r->order = (uint8_t) order;
+	CDS_INIT_LIST_HEAD(&r->node);
+	/*
+	 * First slot offset: round the header size up to slot
+	 * alignment so item pointers are class-aligned.
+	 */
+	header_aligned = (sizeof(*r) + slot_size - 1) & ~(slot_size - 1);
+	r->used = header_aligned;
+	return r;
+}
+
+struct cds_ft_external_arena *cds_ft_external_arena_create(void)
+{
+	struct cds_ft_external_arena *a;
+	int i;
+
+	if (!cds_ft_page_size)
+		cds_ft_page_size = urcu_get_page_len();
+	a = calloc(1, sizeof(*a));
+	if (!a)
+		return NULL;
+	pthread_mutex_init(&a->lock, NULL);
+	for (i = 0; i < FT_EXT_ARENA_NR_CLASSES; i++) {
+		CDS_INIT_LIST_HEAD(&a->classes[i].ranges);
+		a->classes[i].freelist = NULL;
+	}
+	return a;
+}
+
+void *cds_ft_external_arena_alloc(struct cds_ft_external_arena *a,
+		size_t size)
+{
+	int order, class_idx;
+	size_t slot_size;
+	struct cds_ft_external_arena_range *r;
+	void *p = NULL;
+
+	if (!a || !size)
+		return NULL;
+	order = ft_ext_arena_order_for_size(size);
+	if (order > FT_EXT_ARENA_MAX_ORDER)
+		return NULL;
+	if (order < FT_EXT_ARENA_MIN_ORDER)
+		order = FT_EXT_ARENA_MIN_ORDER;
+	class_idx = order - FT_EXT_ARENA_MIN_ORDER;
+	slot_size = 1UL << order;
+
+	pthread_mutex_lock(&a->lock);
+	/* 1. Try the freelist for this class. */
+	if (a->classes[class_idx].freelist) {
+		struct cds_ft_external_arena_freenode *fn =
+			a->classes[class_idx].freelist;
+		a->classes[class_idx].freelist = fn->next;
+		p = fn;
+		goto unlock;
+	}
+	/* 2. Try the active range for this class. */
+	if (!cds_list_empty(&a->classes[class_idx].ranges)) {
+		r = cds_list_first_entry(&a->classes[class_idx].ranges,
+				struct cds_ft_external_arena_range, node);
+		if (r->used + slot_size + FT_EXT_ARENA_GUARD_SIZE
+				<= FT_EXT_ARENA_RANGE_SIZE) {
+			p = (char *) r + r->used;
+			r->used += slot_size;
+			goto unlock;
+		}
+	}
+	/* 3. Allocate a new range for this class. */
+	r = ft_ext_arena_range_create(order);
+	if (!r)
+		goto unlock;
+	cds_list_add(&r->node, &a->classes[class_idx].ranges);
+	p = (char *) r + r->used;
+	r->used += slot_size;
+unlock:
+	pthread_mutex_unlock(&a->lock);
+	if (p)
+		memset(p, 0, slot_size);
+	return p;
+}
+
+void cds_ft_external_arena_free(struct cds_ft_external_arena *a, void *ptr)
+{
+	struct cds_ft_external_arena_range *r;
+	struct cds_ft_external_arena_freenode *fn;
+	int class_idx;
+
+	if (!a || !ptr)
+		return;
+	/* Recover range header via pointer mask. */
+	r = (struct cds_ft_external_arena_range *)
+		((uintptr_t) ptr & ~(uintptr_t) FT_EXT_ARENA_RANGE_MASK);
+	class_idx = (int) r->order - FT_EXT_ARENA_MIN_ORDER;
+	fn = (struct cds_ft_external_arena_freenode *) ptr;
+	pthread_mutex_lock(&a->lock);
+	fn->next = a->classes[class_idx].freelist;
+	a->classes[class_idx].freelist = fn;
+	pthread_mutex_unlock(&a->lock);
+}
+
+void cds_ft_external_arena_destroy(struct cds_ft_external_arena *a)
+{
+	struct cds_ft_external_arena_range *r, *tmp;
+	int i;
+
+	if (!a)
+		return;
+	for (i = 0; i < FT_EXT_ARENA_NR_CLASSES; i++) {
+		cds_list_for_each_entry_safe(r, tmp,
+				&a->classes[i].ranges, node) {
+			cds_list_del(&r->node);
+			(void) munmap(r, FT_EXT_ARENA_RANGE_SIZE);
+		}
+	}
+	pthread_mutex_destroy(&a->lock);
+	free(a);
+}
+

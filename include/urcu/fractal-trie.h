@@ -459,6 +459,88 @@ void cds_ft_node_init(struct cds_ft_node *node)
  */
 
 /*
+ * External-node arena: bump-allocator with end-of-zone over-read
+ * safety, suitable for embedding application leaf structures (those
+ * containing a struct cds_ft_node) when the trie group declares a
+ * @leaf_readable_len > 0 via cds_ft_group_attr_set_speculative_validated.
+ *
+ * Pattern: app embeds struct cds_ft_node in its own leaf struct,
+ * allocates each leaf from this arena via cds_ft_external_arena_alloc,
+ * and inserts into the trie.  The arena grows on demand as a linked
+ * list of mmap'd ranges (default ~64 MiB each); each range reserves
+ * a trailing guard page so the library's SIMD leaf compare can safely
+ * over-read 32 bytes past any allocation's last byte without faulting,
+ * regardless of where the allocation sits within its range.
+ *
+ * Lifetime: all-or-nothing.  cds_ft_external_arena_destroy frees
+ * every allocation served by the arena.  The caller is responsible
+ * for ensuring no RCU readers (and no remaining trie keys) reach
+ * any allocation before destroy.
+ *
+ * Allocations are 8-byte aligned and zero-initialised.
+ *
+ * NUMA: pages lazy-fault onto the first-touching thread's local
+ * node.  Callers that want a specific NUMA policy should pre-touch
+ * the arena from the desired thread.
+ *
+ * Thread-safety: cds_ft_external_arena_alloc is internally
+ * synchronised by a per-arena mutex, so multiple writer threads may
+ * share a single arena.  cds_ft_external_arena_destroy is NOT
+ * synchronised and must be called once, with no concurrent users.
+ */
+struct cds_ft_external_arena;
+
+/*
+ * cds_ft_external_arena_create - Create a leaf-allocation arena.
+ *
+ * The arena starts empty; ranges are mmap'd on demand by
+ * cds_ft_external_arena_alloc.  No capacity hint is required.
+ *
+ * Returns the arena handle on success, NULL on memory error.
+ */
+struct cds_ft_external_arena *cds_ft_external_arena_create(void);
+
+/*
+ * cds_ft_external_arena_alloc - Allocate from @arena.
+ * @arena: Arena returned by cds_ft_external_arena_create.
+ * @size:  Number of bytes the caller needs.  Rounded up internally
+ *         to the next power of two (the slot's "size class");
+ *         requests below 16 bytes are bumped to 16 bytes, requests
+ *         above 1 MiB are rejected with NULL.
+ *
+ * Returns a pointer aligned to its size class with the slot
+ * zero-initialised, or NULL if the size class is out of range or
+ * a backing-range allocation fails.
+ */
+void *cds_ft_external_arena_alloc(struct cds_ft_external_arena *arena,
+		size_t size);
+
+/*
+ * cds_ft_external_arena_free - Return @ptr to @arena's freelist.
+ * @arena: Arena that allocated @ptr.
+ * @ptr:   Pointer previously returned by cds_ft_external_arena_alloc.
+ *
+ * The slot's size class is recovered from the containing range
+ * header (no size argument needed).  Slots returned to the
+ * freelist are reused by subsequent allocations of the same class.
+ *
+ * Caller must ensure no RCU reader still references @ptr (e.g.
+ * via synchronize_rcu after removal from any published trie) — the
+ * arena does not defer reclamation.
+ */
+void cds_ft_external_arena_free(struct cds_ft_external_arena *arena,
+		void *ptr);
+
+/*
+ * cds_ft_external_arena_destroy - Free @arena and every allocation.
+ * @arena: Arena to destroy (may be NULL).
+ *
+ * Caller must ensure no RCU readers reach any allocation served
+ * by this arena before calling.
+ */
+void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
+
+/*
  * Key-based lookup API
  */
 
