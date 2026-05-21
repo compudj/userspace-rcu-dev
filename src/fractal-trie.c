@@ -5821,12 +5821,14 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	const uint8_t *key_end = orig_key + key_len;
 	/*
 	 * Caller-promised "readable" region — bytes safely loadable from
-	 * @orig_key without faulting.  Always >= key_len (defensive clamp
-	 * below in case caller passed less).  Used as the input-side
-	 * contract for ft_key_cmp_ordinals; descent through compressed
-	 * nodes forwards the remaining-safe-bytes at each level.
+	 * @orig_key without faulting.  Public-API entry points enforce
+	 * @_key_readable_len >= @key_len; internal callers (iter-based
+	 * lookup, partial/le/ge) also satisfy that precondition.  Used
+	 * as the input-side contract for ft_key_cmp_ordinals; descent
+	 * through compressed nodes forwards the remaining-safe-bytes at
+	 * each level.
 	 */
-	size_t key_readable_len = _key_readable_len < key_len ? key_len : _key_readable_len;
+	size_t key_readable_len = _key_readable_len;
 	const uint8_t *key_safe_end = orig_key + key_readable_len;
 	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_node *found = NULL;
@@ -6413,13 +6415,22 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 	if (!valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	/*
-	 * CDS_FT_LEN_DEFAULT for @_key_readable_len means "no over-read
-	 * promised" — clamp to the resolved @key_len.  Caller code that
-	 * passes the same sentinel for both arguments thus stays
-	 * conservative on the readable side.
+	 * @_key_readable_len == 0 or CDS_FT_LEN_DEFAULT means "no
+	 * over-read promised": resolve to the resolved @key_len.
+	 * Either sentinel keeps the caller conservative without
+	 * requiring them to repeat @key_len.
 	 */
-	if (_key_readable_len == CDS_FT_LEN_DEFAULT)
+	if (_key_readable_len == 0 || _key_readable_len == CDS_FT_LEN_DEFAULT)
 		_key_readable_len = key_len;
+	/*
+	 * Contract: caller-promised readable region must cover the full
+	 * lookup key.  The library reads at minimum @key_len bytes from
+	 * @key during descent; a smaller readable horizon would be a
+	 * caller bug (over-read past the caller's actual buffer).  Reject
+	 * the call rather than silently clamping.
+	 */
+	if (_key_readable_len < key_len)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP_KEY(lookup_key_enter, ft, key, _key_len);
 	if (caa_likely(km->identity)) {
@@ -6465,9 +6476,12 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 
 	if (!valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	/* See cds_ft_lookup_key: CDS_FT_LEN_DEFAULT means "no over-read". */
-	if (_key_readable_len == CDS_FT_LEN_DEFAULT)
+	/* See cds_ft_lookup_key: 0 or CDS_FT_LEN_DEFAULT means "no over-read". */
+	if (_key_readable_len == 0 || _key_readable_len == CDS_FT_LEN_DEFAULT)
 		_key_readable_len = key_len;
+	/* See cds_ft_lookup_key: readable must cover the full lookup key. */
+	if (_key_readable_len < key_len)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	CDS_FT_SCOPED_READER(ft);
 	/*
 	 * Identity key-map fast path: the ordinals[] buffer would be

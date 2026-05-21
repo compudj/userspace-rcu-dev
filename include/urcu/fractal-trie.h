@@ -473,10 +473,14 @@ void cds_ft_node_init(struct cds_ft_node *node)
  * @key_readable_len: Total number of bytes safely loadable starting at
  *                    @key without faulting — typically the allocation
  *                    size of the buffer the caller owns.  Must be >=
- *                    @key_len.  Values larger than @key_len let the
- *                    library use unmasked SIMD loads on the input side,
- *                    avoiding page-cross checks on the hot path.  If
- *                    unsure, pass @key_len (the conservative default).
+ *                    @key_len; passing any non-zero value smaller than
+ *                    @key_len (after resolution below) is rejected
+ *                    with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
+ *                    Values larger than @key_len let the library use
+ *                    unmasked SIMD loads on the input side, avoiding
+ *                    page-cross checks on the hot path.  Pass 0 (or
+ *                    CDS_FT_LEN_DEFAULT) to mean "no over-read
+ *                    promised" — the library treats it as @key_len.
  *                    Note: a memory allocator that guarantees a
  *                    non-faulting guard page (or any non-faulting trailing
  *                    mapping) after each allocation lets the caller safely
