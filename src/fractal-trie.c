@@ -9439,7 +9439,12 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	node_flag = ft->root;
 	node_flag_ptr = &ft->root;
 
-	/* Root is always present and always internal. */
+	/*
+	 * Trie root is always an internal node (invariant enforced by
+	 * ft_make_root_internal at the few sites that could otherwise
+	 * publish a compressed or skip-compressed root).  No need to
+	 * dispatch on tag here.
+	 */
 
 	/*
 	 * Handle NIL key (key_len == 0).
@@ -12856,12 +12861,10 @@ bool cds_ft_empty(struct cds_ft *ft)
 	root_node = ft_node_ptr(root_flag);
 
 	/*
-	 * Compressed root is never empty: recompaction in ft_detach_node
-	 * replaces an emptied compressed root with an internal node.
+	 * The root is always an internal node (invariant enforced by
+	 * ft_make_root_internal at every site that publishes ft->root),
+	 * so no tag dispatch is needed before reading metadata.
 	 */
-	if (ft_node_compressed(root_flag))
-		return false;
-
 	rmeta = cds_ft_item_to_metadata(root_node);
 
 	/*
