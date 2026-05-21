@@ -619,55 +619,93 @@ void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
 }
 
 /*
- * External-node arena (public API): power-of-two size-class
- * allocator backed by a linked list of mmap'd ranges, with per-
- * class freelists and a trailing guard area on every range to
- * support the library's 32-byte SIMD leaf compare over-read.
+ * External-node arena (public API): power-of-two size-class buddy
+ * allocator backed by a linked list of mmap'd ranges.
  *
  * Each range is FT_EXT_ARENA_RANGE_SIZE bytes, aligned to its own
  * size (via over-mmap-and-trim) so range_base = item & ~(SIZE-1).
- * The range header sits at offset 0 of its base, encoding the size
- * class served by that range; cds_ft_external_arena_free recovers
- * the class from any item pointer with one mask + one load.
+ * A 1 MiB per-cell metadata bitmap (1 byte / 16-byte cell) at the
+ * start of each range encodes "is this cell the start of an
+ * allocated/free block, and at what order".  cds_ft_external_arena_free
+ * recovers the order from any item pointer with one mask + one load.
  *
- * No buddy splitting/merging across classes — slots returned to the
- * freelist are reused at the same class only.  Buddy refinement is
- * left as future work; small-and-uniform allocation patterns (the
- * common case for FT external nodes) do not need it.
+ * Cross-class buddy splitting: alloc(O) first checks freelist[O];
+ * on miss, scans freelist[O+1..MAX] for a larger free block, pops
+ * it, and splits it down to order O — each split pushes one
+ * smaller-order half onto the corresponding freelist.
+ *
+ * Cross-class buddy merging: free(ptr) reads the block's order
+ * from the cell map, then checks its buddy (at offset ^ (1 << O))
+ * — if the buddy is also free at the same order, removes it from
+ * its freelist, marks one cell as "interior", merges into an
+ * order-(O+1) block, and recurses upward.
+ *
+ * The trailing FT_EXT_ARENA_GUARD_SIZE bytes of every range are
+ * reserved as a never-allocated guard so the library's 32-byte
+ * SIMD leaf compare can safely over-read past the last bump-
+ * allocated slot in the range.
  */
 
 #define FT_EXT_ARENA_MIN_ORDER		4	/* 16 B minimum slot */
-#define FT_EXT_ARENA_MAX_ORDER		20	/* 1 MiB maximum slot */
+#define FT_EXT_ARENA_MAX_ORDER		22	/* 4 MiB maximum slot */
 #define FT_EXT_ARENA_NR_CLASSES					\
 	(FT_EXT_ARENA_MAX_ORDER - FT_EXT_ARENA_MIN_ORDER + 1)
 #define FT_EXT_ARENA_RANGE_ORDER	24	/* 16 MiB per range */
 #define FT_EXT_ARENA_RANGE_SIZE		(1UL << FT_EXT_ARENA_RANGE_ORDER)
 #define FT_EXT_ARENA_RANGE_MASK		(FT_EXT_ARENA_RANGE_SIZE - 1)
-/*
- * Trailing guard: one full page reserved at the tail of every
- * range, well in excess of the 32-byte AVX2 over-read horizon and
- * any plausible AVX-512 widening to 64 B.
- */
 #define FT_EXT_ARENA_GUARD_SIZE		4096UL
+#define FT_EXT_ARENA_MIN_SLOT_SIZE	(1UL << FT_EXT_ARENA_MIN_ORDER)
+#define FT_EXT_ARENA_NUM_CELLS						\
+	(FT_EXT_ARENA_RANGE_SIZE / FT_EXT_ARENA_MIN_SLOT_SIZE)
+/*
+ * Cell sentinel for "not a block start" (interior of a larger
+ * block, or unallocated metadata region).  Real cell values
+ * encode bit 0 = free, bits 1-7 = (order - MIN_ORDER); 0xFF is
+ * unreachable as a real value (order_bias 0x7F = order 131 is
+ * impossibly large).
+ */
+#define FT_EXT_ARENA_CELL_NONE		0xFF
 
-struct cds_ft_external_arena_range {
-	uint8_t order;					/* size class for this range */
-	uint8_t _pad[7];
-	size_t used;					/* bump offset within range */
-	struct cds_list_head node;			/* class's range list */
-	/* Followed by class-aligned slots up to RANGE_SIZE - GUARD_SIZE. */
-};
+static inline
+uint8_t ft_ext_arena_cell_pack(int order, int is_free)
+{
+	return (uint8_t) ((((order) - FT_EXT_ARENA_MIN_ORDER) << 1) |
+			((is_free) ? 1 : 0));
+}
 
+static inline
+int ft_ext_arena_cell_order(uint8_t c)
+{
+	return (int) ((c >> 1) & 0x7F) + FT_EXT_ARENA_MIN_ORDER;
+}
+
+static inline
+int ft_ext_arena_cell_is_free(uint8_t c)
+{
+	return c & 0x01;
+}
+
+/* Doubly-linked freelist node — fits in 16 B (MIN_SLOT_SIZE). */
 struct cds_ft_external_arena_freenode {
 	struct cds_ft_external_arena_freenode *next;
+	struct cds_ft_external_arena_freenode *prev;
+};
+
+struct cds_ft_external_arena_range {
+	struct cds_list_head node;		/* per-arena list */
+	size_t bump;				/* next un-bumped byte offset */
+	uint8_t cells[FT_EXT_ARENA_NUM_CELLS];	/* per-cell block metadata */
+	/*
+	 * Slots start at the first MIN_SLOT-aligned offset past
+	 * sizeof(struct cds_ft_external_arena_range).
+	 */
 };
 
 struct cds_ft_external_arena {
 	pthread_mutex_t lock;
-	struct {
-		struct cds_list_head ranges;
-		struct cds_ft_external_arena_freenode *freelist;
-	} classes[FT_EXT_ARENA_NR_CLASSES];
+	struct cds_list_head ranges;
+	struct cds_ft_external_arena_range *active_range;
+	struct cds_ft_external_arena_freenode *freelist[FT_EXT_ARENA_NR_CLASSES];
 };
 
 static
@@ -682,22 +720,34 @@ int ft_ext_arena_order_for_size(size_t size)
 	return o;
 }
 
+static inline
+size_t ft_ext_arena_offset_in_range(const void *ptr)
+{
+	return (uintptr_t) ptr & FT_EXT_ARENA_RANGE_MASK;
+}
+
+static inline
+struct cds_ft_external_arena_range *ft_ext_arena_range_of(const void *ptr)
+{
+	return (struct cds_ft_external_arena_range *)
+		((uintptr_t) ptr & ~(uintptr_t) FT_EXT_ARENA_RANGE_MASK);
+}
+
+static inline
+size_t ft_ext_arena_cell_index(const void *ptr)
+{
+	return ft_ext_arena_offset_in_range(ptr) / FT_EXT_ARENA_MIN_SLOT_SIZE;
+}
+
 static
 struct cds_ft_external_arena_range *
-ft_ext_arena_range_create(int order)
+ft_ext_arena_range_create(void)
 {
 	void *raw, *aligned;
 	uintptr_t pre, post;
 	size_t raw_size = 2 * FT_EXT_ARENA_RANGE_SIZE;
-	size_t slot_size = 1UL << order;
-	size_t header_aligned;
 	struct cds_ft_external_arena_range *r;
 
-	/*
-	 * mmap an over-large region and trim to land on a
-	 * FT_EXT_ARENA_RANGE_SIZE-aligned base — required for the
-	 * item-to-range pointer-masking trick.
-	 */
 	raw = mmap(NULL, raw_size, PROT_READ | PROT_WRITE,
 		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (raw == MAP_FAILED)
@@ -712,15 +762,94 @@ ft_ext_arena_range_create(int order)
 		(void) munmap((char *) aligned + FT_EXT_ARENA_RANGE_SIZE, post);
 
 	r = (struct cds_ft_external_arena_range *) aligned;
-	r->order = (uint8_t) order;
 	CDS_INIT_LIST_HEAD(&r->node);
 	/*
-	 * First slot offset: round the header size up to slot
-	 * alignment so item pointers are class-aligned.
+	 * First slot offset: round struct size up to MIN_SLOT_SIZE
+	 * so the cell-index calculation works uniformly.  All cells
+	 * (including those covering the header bytes) start at the
+	 * "no block here" sentinel so merge buddy-checks against
+	 * the unbumped tail or the header region read as "not a
+	 * block start" and skip.
 	 */
-	header_aligned = (sizeof(*r) + slot_size - 1) & ~(slot_size - 1);
-	r->used = header_aligned;
+	memset(r->cells, FT_EXT_ARENA_CELL_NONE, sizeof(r->cells));
+	r->bump = (sizeof(*r) + FT_EXT_ARENA_MIN_SLOT_SIZE - 1)
+			& ~(FT_EXT_ARENA_MIN_SLOT_SIZE - 1);
 	return r;
+}
+
+static inline
+void ft_ext_arena_freelist_push(struct cds_ft_external_arena *a,
+		int order, struct cds_ft_external_arena_freenode *fn)
+{
+	int idx = order - FT_EXT_ARENA_MIN_ORDER;
+	struct cds_ft_external_arena_freenode *head = a->freelist[idx];
+
+	fn->next = head;
+	fn->prev = NULL;
+	if (head)
+		head->prev = fn;
+	a->freelist[idx] = fn;
+}
+
+static inline
+void ft_ext_arena_freelist_remove(struct cds_ft_external_arena *a,
+		int order, struct cds_ft_external_arena_freenode *fn)
+{
+	int idx = order - FT_EXT_ARENA_MIN_ORDER;
+
+	if (fn->prev)
+		fn->prev->next = fn->next;
+	else
+		a->freelist[idx] = fn->next;
+	if (fn->next)
+		fn->next->prev = fn->prev;
+}
+
+static inline
+struct cds_ft_external_arena_freenode *
+ft_ext_arena_freelist_pop(struct cds_ft_external_arena *a, int order)
+{
+	int idx = order - FT_EXT_ARENA_MIN_ORDER;
+	struct cds_ft_external_arena_freenode *fn = a->freelist[idx];
+
+	if (fn)
+		ft_ext_arena_freelist_remove(a, order, fn);
+	return fn;
+}
+
+static
+void *ft_ext_arena_bump_alloc(struct cds_ft_external_arena *a, int order)
+{
+	struct cds_ft_external_arena_range *r;
+	size_t slot_size = 1UL << order;
+	size_t aligned_bump;
+	void *p;
+
+	if (!a->active_range) {
+		r = ft_ext_arena_range_create();
+		if (!r)
+			return NULL;
+		cds_list_add(&r->node, &a->ranges);
+		a->active_range = r;
+	}
+	r = a->active_range;
+	aligned_bump = (r->bump + slot_size - 1) & ~(slot_size - 1);
+	if (aligned_bump + slot_size + FT_EXT_ARENA_GUARD_SIZE
+			> FT_EXT_ARENA_RANGE_SIZE) {
+		/* Doesn't fit; start a fresh range. */
+		r = ft_ext_arena_range_create();
+		if (!r)
+			return NULL;
+		cds_list_add(&r->node, &a->ranges);
+		a->active_range = r;
+		aligned_bump = (r->bump + slot_size - 1) & ~(slot_size - 1);
+		if (aligned_bump + slot_size + FT_EXT_ARENA_GUARD_SIZE
+				> FT_EXT_ARENA_RANGE_SIZE)
+			return NULL;	/* even a fresh range too small */
+	}
+	p = (char *) r + aligned_bump;
+	r->bump = aligned_bump + slot_size;
+	return p;
 }
 
 struct cds_ft_external_arena *cds_ft_external_arena_create(void)
@@ -734,97 +863,115 @@ struct cds_ft_external_arena *cds_ft_external_arena_create(void)
 	if (!a)
 		return NULL;
 	pthread_mutex_init(&a->lock, NULL);
-	for (i = 0; i < FT_EXT_ARENA_NR_CLASSES; i++) {
-		CDS_INIT_LIST_HEAD(&a->classes[i].ranges);
-		a->classes[i].freelist = NULL;
-	}
+	CDS_INIT_LIST_HEAD(&a->ranges);
+	a->active_range = NULL;
+	for (i = 0; i < FT_EXT_ARENA_NR_CLASSES; i++)
+		a->freelist[i] = NULL;
 	return a;
 }
 
 void *cds_ft_external_arena_alloc(struct cds_ft_external_arena *a,
 		size_t size)
 {
-	int order, class_idx;
-	size_t slot_size;
-	struct cds_ft_external_arena_range *r;
+	int target_order, cur;
 	void *p = NULL;
+	struct cds_ft_external_arena_range *r;
 
 	if (!a || !size)
 		return NULL;
-	order = ft_ext_arena_order_for_size(size);
-	if (order > FT_EXT_ARENA_MAX_ORDER)
+	target_order = ft_ext_arena_order_for_size(size);
+	if (target_order > FT_EXT_ARENA_MAX_ORDER)
 		return NULL;
-	if (order < FT_EXT_ARENA_MIN_ORDER)
-		order = FT_EXT_ARENA_MIN_ORDER;
-	class_idx = order - FT_EXT_ARENA_MIN_ORDER;
-	slot_size = 1UL << order;
+	if (target_order < FT_EXT_ARENA_MIN_ORDER)
+		target_order = FT_EXT_ARENA_MIN_ORDER;
 
 	pthread_mutex_lock(&a->lock);
-	/* 1. Try the freelist for this class. */
-	if (a->classes[class_idx].freelist) {
-		struct cds_ft_external_arena_freenode *fn =
-			a->classes[class_idx].freelist;
-		a->classes[class_idx].freelist = fn->next;
-		p = fn;
-		goto unlock;
-	}
-	/* 2. Try the active range for this class. */
-	if (!cds_list_empty(&a->classes[class_idx].ranges)) {
-		r = cds_list_first_entry(&a->classes[class_idx].ranges,
-				struct cds_ft_external_arena_range, node);
-		if (r->used + slot_size + FT_EXT_ARENA_GUARD_SIZE
-				<= FT_EXT_ARENA_RANGE_SIZE) {
-			p = (char *) r + r->used;
-			r->used += slot_size;
-			goto unlock;
+	/* Scan freelists from target order upward. */
+	for (cur = target_order; cur <= FT_EXT_ARENA_MAX_ORDER; cur++) {
+		if (a->freelist[cur - FT_EXT_ARENA_MIN_ORDER]) {
+			p = ft_ext_arena_freelist_pop(a, cur);
+			break;
 		}
 	}
-	/* 3. Allocate a new range for this class. */
-	r = ft_ext_arena_range_create(order);
-	if (!r)
-		goto unlock;
-	cds_list_add(&r->node, &a->classes[class_idx].ranges);
-	p = (char *) r + r->used;
-	r->used += slot_size;
+	if (!p) {
+		/* No freelist; bump from active range (creating one if needed). */
+		p = ft_ext_arena_bump_alloc(a, target_order);
+		cur = target_order;
+		if (!p)
+			goto unlock;
+	}
+	/* Split @p (currently at order @cur) down to @target_order. */
+	while (cur > target_order) {
+		size_t lower_off = ft_ext_arena_offset_in_range(p);
+		size_t upper_off = lower_off + (1UL << (cur - 1));
+		struct cds_ft_external_arena_range *rr = ft_ext_arena_range_of(p);
+		struct cds_ft_external_arena_freenode *upper =
+			(struct cds_ft_external_arena_freenode *)
+			((char *) rr + upper_off);
+
+		cur--;
+		rr->cells[upper_off / FT_EXT_ARENA_MIN_SLOT_SIZE] =
+			ft_ext_arena_cell_pack(cur, 1);
+		ft_ext_arena_freelist_push(a, cur, upper);
+	}
+	r = ft_ext_arena_range_of(p);
+	r->cells[ft_ext_arena_cell_index(p)] = ft_ext_arena_cell_pack(target_order, 0);
 unlock:
 	pthread_mutex_unlock(&a->lock);
 	if (p)
-		memset(p, 0, slot_size);
+		memset(p, 0, 1UL << target_order);
 	return p;
 }
 
 void cds_ft_external_arena_free(struct cds_ft_external_arena *a, void *ptr)
 {
 	struct cds_ft_external_arena_range *r;
-	struct cds_ft_external_arena_freenode *fn;
-	int class_idx;
+	int order;
+	uint8_t cell;
 
 	if (!a || !ptr)
 		return;
-	/* Recover range header via pointer mask. */
-	r = (struct cds_ft_external_arena_range *)
-		((uintptr_t) ptr & ~(uintptr_t) FT_EXT_ARENA_RANGE_MASK);
-	class_idx = (int) r->order - FT_EXT_ARENA_MIN_ORDER;
-	fn = (struct cds_ft_external_arena_freenode *) ptr;
+	r = ft_ext_arena_range_of(ptr);
+	cell = r->cells[ft_ext_arena_cell_index(ptr)];
+	order = ft_ext_arena_cell_order(cell);
+
 	pthread_mutex_lock(&a->lock);
-	fn->next = a->classes[class_idx].freelist;
-	a->classes[class_idx].freelist = fn;
+	/* Try to merge upward with the buddy at each order. */
+	while (order < FT_EXT_ARENA_MAX_ORDER) {
+		size_t off = ft_ext_arena_offset_in_range(ptr);
+		size_t buddy_off = off ^ (1UL << order);
+		uint8_t buddy_cell;
+		struct cds_ft_external_arena_freenode *buddy;
+		void *merged;
+		void *cleared;
+
+		buddy_cell = r->cells[buddy_off / FT_EXT_ARENA_MIN_SLOT_SIZE];
+		if (buddy_cell != ft_ext_arena_cell_pack(order, 1))
+			break;
+		buddy = (struct cds_ft_external_arena_freenode *)
+			((char *) r + buddy_off);
+		ft_ext_arena_freelist_remove(a, order, buddy);
+		merged = (off < buddy_off) ? ptr : (void *) buddy;
+		cleared = (off < buddy_off) ? (void *) buddy : ptr;
+		r->cells[ft_ext_arena_cell_index(cleared)] = FT_EXT_ARENA_CELL_NONE;
+		ptr = merged;
+		order++;
+	}
+	r->cells[ft_ext_arena_cell_index(ptr)] = ft_ext_arena_cell_pack(order, 1);
+	ft_ext_arena_freelist_push(a, order,
+		(struct cds_ft_external_arena_freenode *) ptr);
 	pthread_mutex_unlock(&a->lock);
 }
 
 void cds_ft_external_arena_destroy(struct cds_ft_external_arena *a)
 {
 	struct cds_ft_external_arena_range *r, *tmp;
-	int i;
 
 	if (!a)
 		return;
-	for (i = 0; i < FT_EXT_ARENA_NR_CLASSES; i++) {
-		cds_list_for_each_entry_safe(r, tmp,
-				&a->classes[i].ranges, node) {
-			cds_list_del(&r->node);
-			(void) munmap(r, FT_EXT_ARENA_RANGE_SIZE);
-		}
+	cds_list_for_each_entry_safe(r, tmp, &a->ranges, node) {
+		cds_list_del(&r->node);
+		(void) munmap(r, FT_EXT_ARENA_RANGE_SIZE);
 	}
 	pthread_mutex_destroy(&a->lock);
 	free(a);

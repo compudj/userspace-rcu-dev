@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 190
+#define NR_TESTS 197
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -13669,6 +13669,243 @@ out_dst:
 
 /* ================================================================== */
 /*                                                                    */
+/*                  EXTERNAL-NODE ARENA TESTS                         */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Basic create / alloc / destroy.
+ */
+static int test_external_arena_basic(void)
+{
+	struct cds_ft_external_arena *a = cds_ft_external_arena_create();
+	if (!a)
+		return -1;
+	void *p = cds_ft_external_arena_alloc(a, 16);
+	if (!p) {
+		cds_ft_external_arena_destroy(a);
+		return -1;
+	}
+	/* Allocation must be at least 16-byte aligned (MIN_ORDER). */
+	if (((uintptr_t) p) & 0xF) {
+		cds_ft_external_arena_destroy(a);
+		return -1;
+	}
+	/* Zero-initialised. */
+	uint8_t buf[16];
+	memcpy(buf, p, 16);
+	for (int i = 0; i < 16; i++)
+		if (buf[i] != 0) {
+			cds_ft_external_arena_destroy(a);
+			return -1;
+		}
+	cds_ft_external_arena_destroy(a);
+	return 0;
+}
+
+/*
+ * Alloc/free of many slots; verify each pointer is unique and
+ * the freelist correctly recycles slots after a free round.
+ */
+static int test_external_arena_alloc_free_recycle(void)
+{
+	enum { N = 4096 };
+	struct cds_ft_external_arena *a;
+	void *p[N];
+	void *q[N];
+	int ret = -1;
+
+	a = cds_ft_external_arena_create();
+	if (!a)
+		return -1;
+	for (int i = 0; i < N; i++) {
+		p[i] = cds_ft_external_arena_alloc(a, 64);
+		if (!p[i])
+			goto out;
+	}
+	for (int i = 0; i < N; i++)
+		for (int j = i + 1; j < N; j++)
+			if (p[i] == p[j])
+				goto out;
+	for (int i = N - 1; i >= 0; i--)
+		cds_ft_external_arena_free(a, p[i]);
+	for (int i = 0; i < N; i++) {
+		q[i] = cds_ft_external_arena_alloc(a, 64);
+		if (!q[i])
+			goto out;
+	}
+	for (int i = 0; i < N; i++)
+		for (int j = i + 1; j < N; j++)
+			if (q[i] == q[j])
+				goto out;
+	ret = 0;
+out:
+	cds_ft_external_arena_destroy(a);
+	return ret;
+}
+
+/*
+ * Cross-class buddy split: free no order-O slots, only one order-O+K
+ * slot.  alloc(O) should split the larger free block down and return
+ * an order-O slot.  Verify the returned pointer falls inside the
+ * larger block's range.
+ */
+static int test_external_arena_split(void)
+{
+	struct cds_ft_external_arena *a;
+	void *p256_a, *p256_b, *p128;
+	uintptr_t base;
+	int ret = -1;
+
+	a = cds_ft_external_arena_create();
+	if (!a)
+		return -1;
+	p256_a = cds_ft_external_arena_alloc(a, 256);
+	p256_b = cds_ft_external_arena_alloc(a, 256);
+	if (!p256_a || !p256_b)
+		goto out;
+	cds_ft_external_arena_free(a, p256_a);
+	cds_ft_external_arena_free(a, p256_b);
+	p128 = cds_ft_external_arena_alloc(a, 128);
+	if (!p128)
+		goto out;
+	base = ((uintptr_t) p256_a < (uintptr_t) p256_b)
+		? (uintptr_t) p256_a : (uintptr_t) p256_b;
+	if ((uintptr_t) p128 < base || (uintptr_t) p128 >= base + 512)
+		goto out;
+	ret = 0;
+out:
+	cds_ft_external_arena_destroy(a);
+	return ret;
+}
+
+/*
+ * Cross-class buddy merge: alloc two buddies at order O, free both,
+ * then alloc at order O+1 — must return the merged block.
+ */
+static int test_external_arena_merge(void)
+{
+	struct cds_ft_external_arena *a;
+	void *p128_a, *p64_a, *p64_b, *p128_b;
+	int ret = -1;
+
+	a = cds_ft_external_arena_create();
+	if (!a)
+		return -1;
+	/*
+	 * Bump-allocated 64 B slots are 64-aligned but not necessarily
+	 * 128-aligned, so adjacent 64 B bump allocations may NOT be
+	 * buddies at order 7 (their order-7 buddy may land in the
+	 * range's header region).  Force a 128-aligned starting offset
+	 * by first allocating + freeing a 128 B block: that puts a
+	 * 128-aligned 128 B block on freelist[7].  Subsequent 64 B
+	 * allocations then come from splitting that block, producing
+	 * a true buddy pair at order 6.
+	 */
+	p128_a = cds_ft_external_arena_alloc(a, 128);
+	if (!p128_a)
+		goto out;
+	cds_ft_external_arena_free(a, p128_a);
+	p64_a = cds_ft_external_arena_alloc(a, 64);
+	p64_b = cds_ft_external_arena_alloc(a, 64);
+	if (!p64_a || !p64_b)
+		goto out;
+	/* Confirm they are order-6 buddies. */
+	if (((uintptr_t) p64_a ^ (uintptr_t) p64_b) != 64)
+		goto out;
+	cds_ft_external_arena_free(a, p64_a);
+	cds_ft_external_arena_free(a, p64_b);
+	/* alloc(128) must return the merged block at the original
+	 * 128 B address. */
+	p128_b = cds_ft_external_arena_alloc(a, 128);
+	if (p128_b != p128_a)
+		goto out;
+	ret = 0;
+out:
+	cds_ft_external_arena_destroy(a);
+	return ret;
+}
+
+/*
+ * Cross-range allocation: allocate enough to span multiple ranges,
+ * then verify pointers are distinct and free returns work across
+ * range boundaries.
+ */
+static int test_external_arena_multi_range(void)
+{
+	struct cds_ft_external_arena *a = cds_ft_external_arena_create();
+	if (!a)
+		return -1;
+	/* Each range fits ~64 1 MiB slots (after header + guard).
+	 * Allocate 200 of them so we span at least 3 ranges. */
+	enum { N = 200 };
+	void *p[N];
+	int ret = -1;
+
+	for (int i = 0; i < N; i++) {
+		p[i] = cds_ft_external_arena_alloc(a, 1UL << 20);
+		if (!p[i])
+			goto out;
+	}
+	/* All distinct. */
+	for (int i = 0; i < N; i++)
+		for (int j = i + 1; j < N; j++)
+			if (p[i] == p[j])
+				goto out;
+	/* Free + re-alloc all. */
+	for (int i = 0; i < N; i++)
+		cds_ft_external_arena_free(a, p[i]);
+	for (int i = 0; i < N; i++) {
+		p[i] = cds_ft_external_arena_alloc(a, 1UL << 20);
+		if (!p[i])
+			goto out;
+	}
+	ret = 0;
+out:
+	cds_ft_external_arena_destroy(a);
+	return ret;
+}
+
+/*
+ * Pointer alignment matches size class.
+ */
+static int test_external_arena_alignment(void)
+{
+	struct cds_ft_external_arena *a = cds_ft_external_arena_create();
+	if (!a)
+		return -1;
+	int ret = -1;
+	for (size_t sz = 16; sz <= 4096; sz *= 2) {
+		void *p = cds_ft_external_arena_alloc(a, sz);
+		if (!p)
+			goto out;
+		if (((uintptr_t) p) & (sz - 1))
+			goto out;
+	}
+	ret = 0;
+out:
+	cds_ft_external_arena_destroy(a);
+	return ret;
+}
+
+/*
+ * Allocations exceeding the MAX_ORDER cap (4 MiB) must return NULL.
+ */
+static int test_external_arena_oversize_reject(void)
+{
+	struct cds_ft_external_arena *a = cds_ft_external_arena_create();
+	if (!a)
+		return -1;
+	void *p = cds_ft_external_arena_alloc(a, (1UL << 22) + 1);
+	int ret = (p == NULL) ? 0 : -1;
+	if (p)
+		cds_ft_external_arena_free(a, p);
+	cds_ft_external_arena_destroy(a);
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -13944,6 +14181,15 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_at_fixed_rekey);
 	RUN_TEST(test_merge_at_overlap);
 	RUN_TEST(test_merge_at_fixed_unequal_keylen);
+
+	diag("External-node arena allocator tests");
+	RUN_TEST(test_external_arena_basic);
+	RUN_TEST(test_external_arena_alloc_free_recycle);
+	RUN_TEST(test_external_arena_split);
+	RUN_TEST(test_external_arena_merge);
+	RUN_TEST(test_external_arena_multi_range);
+	RUN_TEST(test_external_arena_alignment);
+	RUN_TEST(test_external_arena_oversize_reject);
 
 	rcu_barrier();
 	rcu_unregister_thread();
