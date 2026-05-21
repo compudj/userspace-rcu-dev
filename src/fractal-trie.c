@@ -1219,11 +1219,12 @@ int ft_cmp_short_unmasked_sse2(const uint8_t *a, const uint8_t *b,
 /*
  * AVX-512 short-key compare for 1 <= len <= 32 (BW + VL).
  *
- * Predicated load + predicated compare in two µops.  The k-mask
- * gates which byte lanes the load fetches — bytes outside the mask
+ * Predicated load on BOTH sides + predicated compare.  The k-mask
+ * gates which byte lanes each load fetches — bytes outside the mask
  * are NOT read from memory (architectural guarantee in Intel SDM
  * and AMD APM for AVX-512 masked memory operands).  Page-cross safe
- * by construction; no runtime check needed.
+ * on both pointers by construction; no runtime check, no
+ * @readable_bytes contract needed beyond @readable_bytes >= @len.
  *
  * Cheaper than the AVX2 fallback (no page-cross branch, no separate
  * mask-and-result step) and matches what glibc's __memcmp_evex_movbe
@@ -1236,8 +1237,8 @@ int ft_cmp_short_avx512(const uint8_t *a, const uint8_t *b,
 {
 	__mmask32 k = (__mmask32) _bzhi_u32(0xFFFFFFFFU, len);
 	__m256i va = _mm256_maskz_loadu_epi8(k, (const void *) a);
-	__mmask32 ne = _mm256_mask_cmpneq_epu8_mask(k, va,
-			_mm256_loadu_si256((const __m256i *) b));
+	__m256i vb = _mm256_maskz_loadu_epi8(k, (const void *) b);
+	__mmask32 ne = _mm256_mask_cmpneq_epu8_mask(k, va, vb);
 
 	if (ne == 0)
 		return 0;
@@ -1339,31 +1340,35 @@ int ft_cmp_avx2(const uint8_t *a, const uint8_t *b,
  *                  padding pass a larger value, unlocking the
  *                  widest unmasked single-load fast path.
  *
- * Dispatch ordered by call-site frequency (hottest first, coldest
- * last) — short keys with a 32-B readable contract dominate; long
- * keys are rare:
+ * Dispatch ordered by call-site frequency (hottest first):
  *
  *   1. len <= 32 && readable >= 32:    ft_cmp_short_unmasked_avx2
  *                                      (1 vmovdqu pair + mask to @len)
  *                                      — HOT, single likely branch.
  *
- *   2. len <= 16 && readable >= 16:    ft_cmp_short_unmasked_sse2
+ *   AVX-512 BW+VL build:
+ *   2. len <= 32 (any readable):       ft_cmp_short_avx512
+ *                                      (predicated load on both sides,
+ *                                       handles 1..32 contract-free)
  *
+ *   Non-AVX-512 build (SWAR ladder):
+ *   2. len <= 16 && readable >= 16:    ft_cmp_short_unmasked_sse2
  *   3. len < 8:                        tiny (masked 8-B word if
  *                                       readable >= 8, else byte-by-byte)
- *
  *   4. 8 <= len < 16:                  word-overlap-pair
- *
- *   5. 16 <= len <= 32 w/o 32B:        AVX-512 EVEX predicated load
- *                                      / AVX2 page-cross check
+ *   5. 16 <= len <= 32:                ft_cmp_short_avx2 (page-cross check)
  *                                      / SSE2 overlapping pair
  *
+ *   Final (any build):
  *   6. len > 32:                       loop + overlapping tail
  *                                      (contract-independent; rare).
  *
  * Key insight: when @readable_bytes >= 32, every short key
  * (regardless of @len: 1..32) takes the same fast path.  The same
  * code is emitted for len=5 and len=25 — only the mask differs.
+ * When AVX-512 BW+VL is available, the predicated short path
+ * covers ALL of 1..32 without any contract, so the SWAR ladder is
+ * elided entirely.
  */
 static inline_lookup
 int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
@@ -1372,19 +1377,28 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 {
 	if (caa_likely(len <= 32)) {
 		/*
-		 * Hot path within the short block: caller-promised 32-B
-		 * readable horizon on both sides — single unmasked AVX2
-		 * load each side and a movemask-driven mismatch dispatch.
+		 * Hot path: caller-promised 32-B readable horizon on
+		 * both sides — single unmasked AVX2 load each side.
 		 */
 #if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
 		if (caa_likely(readable_bytes >= 32))
 			return ft_cmp_short_unmasked_avx2(a, b, len, signed_cmp, mismatch_pos);
 #endif
+#if defined(__AVX512VL__) && defined(__AVX512BW__) && !defined(FT_NO_SIMD_CMP)
+		/*
+		 * AVX-512 BW+VL: predicated loads on both sides are
+		 * page-cross safe and cover all 1..32 without further
+		 * dispatch.  Wins over the SWAR ladder for the common
+		 * short-key range (16..32) and matches glibc's
+		 * __memcmp_evex_movbe for shorter keys too.
+		 */
+		return ft_cmp_short_avx512(a, b, len, signed_cmp, mismatch_pos);
+#else
 		/* Short key, no 32-B contract.  Try 16-B contract. */
-#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+# if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
 		if (len <= 16 && readable_bytes >= 16)
 			return ft_cmp_short_unmasked_sse2(a, b, len, signed_cmp, mismatch_pos);
-#endif
+# endif
 		/* len < 8: tiny (byte/masked-word). */
 		if (len < sizeof(unsigned long))
 			return ft_cmp_tiny(a, b, len, readable_bytes,
@@ -1393,14 +1407,13 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 		if (len < 16)
 			return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
 		/* 16 <= len <= 32 without 32-B contract: safe fallback. */
-#if defined(__AVX512VL__) && defined(__AVX512BW__) && !defined(FT_NO_SIMD_CMP)
-		return ft_cmp_short_avx512(a, b, len, signed_cmp, mismatch_pos);
-#elif defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+# if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
 		return ft_cmp_short_avx2(a, b, len, signed_cmp, mismatch_pos);
-#elif defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+# elif defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
 		return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
-#else
+# else
 		return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
+# endif
 #endif
 	}
 
