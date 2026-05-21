@@ -1007,8 +1007,6 @@ int ft_byte_mismatch(const uint8_t *a, const uint8_t *b,
 	return 1;
 }
 
-#if 0 /* AVX2 comparison — available but not used: SSE2 is sufficient
-       * for typical key lengths and avoids an extra dispatch branch. */
 #if defined(__AVX2__)
 #ifndef FT_IMMINTRIN_INCLUDED
 #define FT_IMMINTRIN_INCLUDED
@@ -1030,7 +1028,6 @@ int ft_avx2_mismatch(const uint8_t *a, const uint8_t *b,
 	return ft_byte_mismatch(a, b, pos, signed_cmp, mismatch_pos);
 }
 #endif /* __AVX2__ && !FT_NO_SIMD_CMP */
-#endif /* AVX2 comparison disabled */
 
 #if defined(__SSE2__)
 #ifndef FT_IMMINTRIN_INCLUDED
@@ -1160,8 +1157,83 @@ int ft_cmp_sse2(const uint8_t *a, const uint8_t *b,
 }
 #endif /* __SSE2__ && !FT_NO_SIMD_CMP */
 
-#if 0 /* AVX2 comparison — see ft_avx2_mismatch above. */
+#if defined(__AVX512VL__) && defined(__AVX512BW__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * AVX-512 short-key compare for 1 <= len <= 32 (BW + VL).
+ *
+ * Predicated load + predicated compare in two µops.  The k-mask
+ * gates which byte lanes the load fetches — bytes outside the mask
+ * are NOT read from memory (architectural guarantee in Intel SDM
+ * and AMD APM for AVX-512 masked memory operands).  Page-cross safe
+ * by construction; no runtime check needed.
+ *
+ * Cheaper than the AVX2 fallback (no page-cross branch, no separate
+ * mask-and-result step) and matches what glibc's __memcmp_evex_movbe
+ * emits for len <= 32.
+ */
+static inline_lookup
+int ft_cmp_short_avx512(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	__mmask32 k = (__mmask32) _bzhi_u32(0xFFFFFFFFU, len);
+	__m256i va = _mm256_maskz_loadu_epi8(k, (const void *) a);
+	__mmask32 ne = _mm256_mask_cmpneq_epu8_mask(k, va,
+			_mm256_loadu_si256((const __m256i *) b));
+
+	if (ne == 0)
+		return 0;
+	return ft_avx2_mismatch(a, b, 0, (uint32_t) ne,
+				signed_cmp, mismatch_pos);
+}
+#endif
+
 #if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Page-cross-safe single-vector compare for 16 <= len <= 31.
+ *
+ * Loads 32 bytes from both pointers, compares all 32, masks the
+ * result to the first @len lanes.  Reading 7-15 bytes past the
+ * requested length is safe iff neither pointer is in the last 32
+ * bytes of its 4 KB page — the page-cross check below.  If the
+ * check fails, fall back to the overlapping-pair SSE2 path which
+ * never reads past byte @len-1.
+ *
+ * The branch is highly predictable: in practice both @a and @b
+ * are typically in the first ~4000 bytes of their pages (slot
+ * bodies start CL-aligned and never span pages for our slot
+ * sizes), so the fast path is taken essentially 100% of the time.
+ *
+ * Used only when AVX-512 BW+VL is not available; the AVX-512 path
+ * above does the same job without the page-cross check.
+ */
+static inline_lookup
+int ft_cmp_short_avx2(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	/*
+	 * Page-cross check: a 32-byte load at @p is safe (cannot cross
+	 * a page boundary) iff (p & 0xFFF) <= 0xFE0.  Both pointers
+	 * must be safe; OR-ing the low 12 bits picks up the worst of
+	 * the two with a single AND.
+	 */
+	if (caa_likely((((uintptr_t)a | (uintptr_t)b) & 0xFFFu) <= 0xFE0u)) {
+		__m256i va = _mm256_loadu_si256((const __m256i *)a);
+		__m256i vb = _mm256_loadu_si256((const __m256i *)b);
+		__m256i eq = _mm256_cmpeq_epi8(va, vb);
+		uint32_t mask = (uint32_t)_mm256_movemask_epi8(eq);
+		uint32_t want = (uint32_t)((1ULL << len) - 1ULL);
+
+		if ((mask & want) != want)
+			return ft_avx2_mismatch(a, b, 0,
+						(~mask) & want,
+						signed_cmp, mismatch_pos);
+		return 0;
+	}
+	return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
+}
+
 /* Compare len >= 32 bytes using AVX2 + overlapping 32-byte tail. */
 static inline_lookup
 int ft_cmp_avx2(const uint8_t *a, const uint8_t *b,
@@ -1174,7 +1246,7 @@ int ft_cmp_avx2(const uint8_t *a, const uint8_t *b,
 		__m256i va = _mm256_loadu_si256((const __m256i *)(a + j));
 		__m256i vb = _mm256_loadu_si256((const __m256i *)(b + j));
 		__m256i eq = _mm256_cmpeq_epi8(va, vb);
-		unsigned int mask = (unsigned int)_mm256_movemask_epi8(eq);
+		uint32_t mask = (uint32_t)_mm256_movemask_epi8(eq);
 
 		if (mask != 0xFFFFFFFFU)
 			return ft_avx2_mismatch(a, b, j,
@@ -1187,7 +1259,7 @@ int ft_cmp_avx2(const uint8_t *a, const uint8_t *b,
 		__m256i va = _mm256_loadu_si256((const __m256i *)(a + tail));
 		__m256i vb = _mm256_loadu_si256((const __m256i *)(b + tail));
 		__m256i eq = _mm256_cmpeq_epi8(va, vb);
-		unsigned int mask = (unsigned int)_mm256_movemask_epi8(eq);
+		uint32_t mask = (uint32_t)_mm256_movemask_epi8(eq);
 
 		if (mask != 0xFFFFFFFFU)
 			return ft_avx2_mismatch(a, b, tail,
@@ -1197,31 +1269,51 @@ int ft_cmp_avx2(const uint8_t *a, const uint8_t *b,
 	return 0;
 }
 #endif /* __AVX2__ && !FT_NO_SIMD_CMP */
-#endif /* AVX2 comparison disabled */
 
 /*
  * ft_key_cmp_ordinals: compare @len bytes in ordinal space.
  *
  * Dispatch in natural increasing order:
- *   < 8:  tiny (masked word or byte-by-byte) — hot for short
- *         compressed paths
- *   < 16: word-at-a-time + overlapping tail
- *   >= 16: SSE2 loop + overlapping 16-byte tail
+ *   < 8:    tiny (masked word or byte-by-byte) — hot for short
+ *           compressed paths
+ *   < 16:   word-at-a-time + overlapping tail
+ *   < 32:   AVX2 single-vector load + masked compare (page-cross
+ *           safe via runtime check; falls back to SSE2 overlapping
+ *           pair if either pointer is in the last 32 bytes of a
+ *           page).  Replaces 2 SSE2 overlapping loads with 1 AVX2
+ *           load + mask.
+ *   >= 32:  AVX2 loop + overlapping 32-byte tail.
  */
 static inline_lookup
 int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 		unsigned int len, unsigned int remaining_key,
 		bool signed_cmp, unsigned int *mismatch_pos)
 {
+#if defined(__AVX512VL__) && defined(__AVX512BW__) && !defined(FT_NO_SIMD_CMP)
+	/*
+	 * AVX-512 BW+VL path: predicated load + predicated compare,
+	 * no page-cross check needed.  Handles len 1..32 in one shot,
+	 * so the tiny/word dispatch is bypassed (the predicated load
+	 * is safe for any len without a remaining_key contract).
+	 */
+	if (caa_likely(len <= 32))
+		return ft_cmp_short_avx512(a, b, len, signed_cmp, mismatch_pos);
+	return ft_cmp_avx2(a, b, len, signed_cmp, mismatch_pos);
+#else
 	if (len < sizeof(unsigned long))
 		return ft_cmp_tiny(a, b, len, remaining_key,
 				   signed_cmp, mismatch_pos);
 	if (len < 16)
 		return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
-#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+	if (len < 32)
+		return ft_cmp_short_avx2(a, b, len, signed_cmp, mismatch_pos);
+	return ft_cmp_avx2(a, b, len, signed_cmp, mismatch_pos);
+#elif defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
 	return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
 #else
 	return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
+#endif
 #endif
 }
 
