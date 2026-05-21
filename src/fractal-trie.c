@@ -132,6 +132,7 @@ struct cds_ft_group_attr {
 	bool speculative_validated;
 	size_t speculative_key_offset;
 	size_t speculative_key_len_offset;
+	size_t speculative_leaf_readable_len;
 };
 
 struct cds_ft_attr {
@@ -1157,6 +1158,63 @@ int ft_cmp_sse2(const uint8_t *a, const uint8_t *b,
 }
 #endif /* __SSE2__ && !FT_NO_SIMD_CMP */
 
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Unmasked 32-byte AVX2 short-key compare for 1 <= len <= 32.
+ *
+ * Caller guarantees @a and @b each have at least 32 readable bytes.
+ * Load is unmasked; mask is applied only to the comparison result
+ * so bytes past @len don't influence the outcome.
+ *
+ * Cheapest short-key path when the contract permits it: one
+ * vmovdqu pair + vpcmpeqb + vpmovmskb + bzhi + andn + jne.  No
+ * page-cross check (caller-promised safe), no EVEX kmask setup,
+ * no overlapping tail load.  ~10 cycles on Zen 4 for the matching
+ * case.
+ */
+static inline_lookup
+int ft_cmp_short_unmasked_avx2(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	__m256i va = _mm256_loadu_si256((const __m256i *) a);
+	__m256i vb = _mm256_loadu_si256((const __m256i *) b);
+	__m256i eq = _mm256_cmpeq_epi8(va, vb);
+	uint32_t mask = (uint32_t) _mm256_movemask_epi8(eq);
+	uint32_t want = (uint32_t) _bzhi_u32(0xFFFFFFFFU, len);
+
+	if ((mask & want) == want)
+		return 0;
+	return ft_avx2_mismatch(a, b, 0, (~mask) & want,
+				signed_cmp, mismatch_pos);
+}
+#endif
+
+#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Unmasked 16-byte SSE2 short-key compare for 1 <= len <= 16.
+ *
+ * Same idea as ft_cmp_short_unmasked_avx2 but 16-byte load width.
+ * Caller guarantees @a and @b each have at least 16 readable bytes.
+ */
+static inline_lookup
+int ft_cmp_short_unmasked_sse2(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	__m128i va = _mm_loadu_si128((const __m128i *) a);
+	__m128i vb = _mm_loadu_si128((const __m128i *) b);
+	__m128i eq = _mm_cmpeq_epi8(va, vb);
+	unsigned int mask = (unsigned int) _mm_movemask_epi8(eq);
+	unsigned int want = (1U << len) - 1U;
+
+	if ((mask & want) == want)
+		return 0;
+	return ft_sse2_mismatch(a, b, 0, (~mask) & want,
+				signed_cmp, mismatch_pos);
+}
+#endif
+
 #if defined(__AVX512VL__) && defined(__AVX512BW__) && !defined(FT_NO_SIMD_CMP)
 /*
  * AVX-512 short-key compare for 1 <= len <= 32 (BW + VL).
@@ -1273,47 +1331,86 @@ int ft_cmp_avx2(const uint8_t *a, const uint8_t *b,
 /*
  * ft_key_cmp_ordinals: compare @len bytes in ordinal space.
  *
- * Dispatch in natural increasing order:
- *   < 8:    tiny (masked word or byte-by-byte) — hot for short
- *           compressed paths
- *   < 16:   word-at-a-time + overlapping tail
- *   < 32:   AVX2 single-vector load + masked compare (page-cross
- *           safe via runtime check; falls back to SSE2 overlapping
- *           pair if either pointer is in the last 32 bytes of a
- *           page).  Replaces 2 SSE2 overlapping loads with 1 AVX2
- *           load + mask.
- *   >= 32:  AVX2 loop + overlapping 32-byte tail.
+ * @readable_bytes: contract from the caller — @a and @b each have
+ *                  at least this many bytes safely readable (no
+ *                  fault on load).  Conservative callers pass
+ *                  @readable_bytes = @len (no over-read promised).
+ *                  Callers that know their buffers have trailing
+ *                  padding pass a larger value, unlocking the
+ *                  widest unmasked single-load fast path.
+ *
+ * Dispatch ordered by call-site frequency (hottest first, coldest
+ * last) — short keys with a 32-B readable contract dominate; long
+ * keys are rare:
+ *
+ *   1. len <= 32 && readable >= 32:    ft_cmp_short_unmasked_avx2
+ *                                      (1 vmovdqu pair + mask to @len)
+ *                                      — HOT, single likely branch.
+ *
+ *   2. len <= 16 && readable >= 16:    ft_cmp_short_unmasked_sse2
+ *
+ *   3. len < 8:                        tiny (masked 8-B word if
+ *                                       readable >= 8, else byte-by-byte)
+ *
+ *   4. 8 <= len < 16:                  word-overlap-pair
+ *
+ *   5. 16 <= len <= 32 w/o 32B:        AVX-512 EVEX predicated load
+ *                                      / AVX2 page-cross check
+ *                                      / SSE2 overlapping pair
+ *
+ *   6. len > 32:                       loop + overlapping tail
+ *                                      (contract-independent; rare).
+ *
+ * Key insight: when @readable_bytes >= 32, every short key
+ * (regardless of @len: 1..32) takes the same fast path.  The same
+ * code is emitted for len=5 and len=25 — only the mask differs.
  */
 static inline_lookup
 int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
-		unsigned int len, unsigned int remaining_key,
+		unsigned int len, unsigned int readable_bytes,
 		bool signed_cmp, unsigned int *mismatch_pos)
 {
-#if defined(__AVX512VL__) && defined(__AVX512BW__) && !defined(FT_NO_SIMD_CMP)
-	/*
-	 * AVX-512 BW+VL path: predicated load + predicated compare,
-	 * no page-cross check needed.  Handles len 1..32 in one shot,
-	 * so the tiny/word dispatch is bypassed (the predicated load
-	 * is safe for any len without a remaining_key contract).
-	 */
-	if (caa_likely(len <= 32))
-		return ft_cmp_short_avx512(a, b, len, signed_cmp, mismatch_pos);
-	return ft_cmp_avx2(a, b, len, signed_cmp, mismatch_pos);
-#else
-	if (len < sizeof(unsigned long))
-		return ft_cmp_tiny(a, b, len, remaining_key,
-				   signed_cmp, mismatch_pos);
-	if (len < 16)
-		return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
+	if (caa_likely(len <= 32)) {
+		/*
+		 * Hot path within the short block: caller-promised 32-B
+		 * readable horizon on both sides — single unmasked AVX2
+		 * load each side and a movemask-driven mismatch dispatch.
+		 */
 #if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
-	if (len < 32)
+		if (caa_likely(readable_bytes >= 32))
+			return ft_cmp_short_unmasked_avx2(a, b, len, signed_cmp, mismatch_pos);
+#endif
+		/* Short key, no 32-B contract.  Try 16-B contract. */
+#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+		if (len <= 16 && readable_bytes >= 16)
+			return ft_cmp_short_unmasked_sse2(a, b, len, signed_cmp, mismatch_pos);
+#endif
+		/* len < 8: tiny (byte/masked-word). */
+		if (len < sizeof(unsigned long))
+			return ft_cmp_tiny(a, b, len, readable_bytes,
+					   signed_cmp, mismatch_pos);
+		/* 8 <= len < 16: word-overlap-pair. */
+		if (len < 16)
+			return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
+		/* 16 <= len <= 32 without 32-B contract: safe fallback. */
+#if defined(__AVX512VL__) && defined(__AVX512BW__) && !defined(FT_NO_SIMD_CMP)
+		return ft_cmp_short_avx512(a, b, len, signed_cmp, mismatch_pos);
+#elif defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
 		return ft_cmp_short_avx2(a, b, len, signed_cmp, mismatch_pos);
+#elif defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+		return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
+#else
+		return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
+#endif
+	}
+
+	/* Long key (>32): contract-independent loop. */
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
 	return ft_cmp_avx2(a, b, len, signed_cmp, mismatch_pos);
 #elif defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
 	return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
 #else
 	return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
-#endif
 #endif
 }
 
@@ -5502,6 +5599,7 @@ enum ft_prefix_tracking {
 static inline_lookup
 enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag_p,
 		const uint8_t **key_p, const uint8_t *key_end,
+		const uint8_t *key_safe_end,
 		struct cds_ft_inode_flag ***path_cur_pp,
 		bool track, bool track_longest,
 		const uint8_t **match_key_pos_p, struct cds_ft_node **match_node_p,
@@ -5514,6 +5612,7 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 	struct cds_ft_inode_flag **path_cur = *path_cur_pp;
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
 	int remaining_key = (int) (key_end - key);
+	int remaining_safe = (int) (key_safe_end - key);
 	int cmp_len = cn->len < remaining_key ? cn->len : remaining_key;
 
 	/* Check external_nodes at the compressed node's depth. */
@@ -5537,7 +5636,7 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 		if (track_longest) {
 			unsigned int mpos;
 			int cmp = ft_key_cmp_ordinals(key, cn->key_bytes,
-					cmp_len, remaining_key, false, &mpos);
+					cmp_len, remaining_safe, false, &mpos);
 
 			if (cmp != 0) {
 				*match_key_pos_p = key + mpos;
@@ -5549,7 +5648,7 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 			*match_node_p = NULL;
 		} else {
 			if (ft_key_cmp_ordinals(key, cn->key_bytes,
-					cmp_len, remaining_key, false, NULL) != 0) {
+					cmp_len, remaining_safe, false, NULL) != 0) {
 				*status_ret = CDS_FT_STATUS_NOT_FOUND;
 				return FT_DESCENT_END;
 			}
@@ -5707,7 +5806,7 @@ enum ft_descent_action ft_traverse_compressed(
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
@@ -5720,6 +5819,15 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, _key_len);
 	const uint8_t *orig_key = key;
 	const uint8_t *key_end = orig_key + key_len;
+	/*
+	 * Caller-promised "readable" region — bytes safely loadable from
+	 * @orig_key without faulting.  Always >= key_len (defensive clamp
+	 * below in case caller passed less).  Used as the input-side
+	 * contract for ft_key_cmp_ordinals; descent through compressed
+	 * nodes forwards the remaining-safe-bytes at each level.
+	 */
+	size_t key_readable_len = _key_readable_len < key_len ? key_len : _key_readable_len;
+	const uint8_t *key_safe_end = orig_key + key_readable_len;
 	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_node *found = NULL;
 	enum cds_ft_status status;
@@ -5859,6 +5967,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 			enum ft_descent_action act;
 
 			act = ft_lookup_compressed(&node_flag, &key, key_end,
+				key_safe_end,
 				&path_cur,
 				track, track_longest,
 				&match_key_pos, &match_node, &found, &status,
@@ -5989,6 +6098,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 				if (path_nodes)
 					path_cur++;
 				act = ft_lookup_compressed(&node_flag, &key, key_end,
+					key_safe_end,
 					&path_cur,
 					track, track_longest,
 					&match_key_pos, &match_node, &found, &status,
@@ -6109,12 +6219,30 @@ end:
 			if (stored_len != _key_len)
 				match = false;
 		}
-		if (match && key_len > 0 &&
-		    ft_key_cmp_ordinals(orig_key, stored_key,
-				(unsigned int) key_len,
-				(unsigned int) key_len,
-				false, NULL) != 0)
-			match = false;
+		if (match && key_len > 0) {
+			/*
+			 * Effective readable horizon for the SIMD compare:
+			 * min(input-side, leaf-side).  Input side is the
+			 * caller's @_key_readable_len (defensively clamped
+			 * to key_len above).  Leaf side is the app-promised
+			 * total readable bytes from the stored key base
+			 * (@speculative_leaf_readable_len), floored at
+			 * key_len so a 0 (no over-read promised) attr stays
+			 * correct.
+			 */
+			size_t leaf_readable = group->speculative_leaf_readable_len;
+			size_t both_readable;
+
+			if (leaf_readable < key_len)
+				leaf_readable = key_len;
+			both_readable = key_readable_len < leaf_readable ?
+				key_readable_len : leaf_readable;
+			if (ft_key_cmp_ordinals(orig_key, stored_key,
+					(unsigned int) key_len,
+					(unsigned int) both_readable,
+					false, NULL) != 0)
+				match = false;
+		}
 		if (!match) {
 			found = NULL;
 			status = CDS_FT_STATUS_NOT_FOUND;
@@ -6154,7 +6282,7 @@ end:
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_dc_sc(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
@@ -6162,14 +6290,15 @@ enum cds_ft_status do_cds_ft_lookup_dc_sc(struct cds_ft *ft,
 		struct cds_ft_node **tracking_match_node,
 		bool spec_validate)
 {
-	return do_cds_ft_lookup_inner(ft, key, _key_len, result_node, iter,
+	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_len,
+			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
 			spec_validate, true, true);
 }
 
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_dc_nosc(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
@@ -6177,35 +6306,38 @@ enum cds_ft_status do_cds_ft_lookup_dc_nosc(struct cds_ft *ft,
 		struct cds_ft_node **tracking_match_node,
 		bool spec_validate)
 {
-	return do_cds_ft_lookup_inner(ft, key, _key_len, result_node, iter,
+	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_len,
+			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
 			spec_validate, true, false);
 }
 
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_nodc_sc(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
 		struct cds_ft_node **tracking_match_node)
 {
-	return do_cds_ft_lookup_inner(ft, key, _key_len, result_node, iter,
+	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_len,
+			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
 			false, false, true);
 }
 
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_nodc_nosc(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
 		struct cds_ft_node **tracking_match_node)
 {
-	return do_cds_ft_lookup_inner(ft, key, _key_len, result_node, iter,
+	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_len,
+			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
 			false, false, false);
 }
@@ -6230,7 +6362,7 @@ enum cds_ft_status do_cds_ft_lookup_nodc_nosc(struct cds_ft *ft,
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
@@ -6247,26 +6379,26 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 	if (descend_cand) {
 		if (skip_compressed)
-			return do_cds_ft_lookup_dc_sc(ft, key, _key_len,
+			return do_cds_ft_lookup_dc_sc(ft, key, _key_len, _key_readable_len,
 					result_node, iter, tracking,
 					tracking_match_len, tracking_match_node,
 					spec_validate);
-		return do_cds_ft_lookup_dc_nosc(ft, key, _key_len,
+		return do_cds_ft_lookup_dc_nosc(ft, key, _key_len, _key_readable_len,
 				result_node, iter, tracking,
 				tracking_match_len, tracking_match_node,
 				spec_validate);
 	}
 	if (skip_compressed)
-		return do_cds_ft_lookup_nodc_sc(ft, key, _key_len,
+		return do_cds_ft_lookup_nodc_sc(ft, key, _key_len, _key_readable_len,
 				result_node, iter, tracking,
 				tracking_match_len, tracking_match_node);
-	return do_cds_ft_lookup_nodc_nosc(ft, key, _key_len,
+	return do_cds_ft_lookup_nodc_nosc(ft, key, _key_len, _key_readable_len,
 			result_node, iter, tracking,
 			tracking_match_len, tracking_match_node);
 }
 
 enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
 		struct cds_ft_node **result_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
@@ -6275,16 +6407,31 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 
 	if (!valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	/*
+	 * CDS_FT_LEN_DEFAULT for @_key_readable_len means "no over-read
+	 * promised" — clamp to the resolved @key_len.  Caller code that
+	 * passes the same sentinel for both arguments thus stays
+	 * conservative on the readable side.
+	 */
+	if (_key_readable_len == CDS_FT_LEN_DEFAULT)
+		_key_readable_len = key_len;
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP_KEY(lookup_key_enter, ft, key, _key_len);
 	if (caa_likely(km->identity)) {
-		status = do_cds_ft_lookup(ft, key, key_len, result_node, NULL,
+		status = do_cds_ft_lookup(ft, key, key_len, _key_readable_len,
+					result_node, NULL,
 					FT_PREFIX_TRACK_NONE, NULL, NULL, false);
 	} else {
 		uint8_t ordinals[FT_MAX_KEY_LEN];
 
 		ft_key_to_ordinals(ordinals, key, key_len, km);
-		status = do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
+		/*
+		 * ordinals[] is a FT_MAX_KEY_LEN stack buffer; the entire
+		 * buffer is safely readable independent of caller's
+		 * @_key_readable_len.
+		 */
+		status = do_cds_ft_lookup(ft, ordinals, key_len,
+					FT_MAX_KEY_LEN, result_node, NULL,
 					FT_PREFIX_TRACK_NONE, NULL, NULL, false);
 	}
 	FT_TP(lookup_key_exit, (int) status);
@@ -6305,7 +6452,7 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
  * at the end instead.
  */
 enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
 		struct cds_ft_node **result_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
@@ -6313,6 +6460,9 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 
 	if (!valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	/* See cds_ft_lookup_key: CDS_FT_LEN_DEFAULT means "no over-read". */
+	if (_key_readable_len == CDS_FT_LEN_DEFAULT)
+		_key_readable_len = key_len;
 	CDS_FT_SCOPED_READER(ft);
 	/*
 	 * Identity key-map fast path: the ordinals[] buffer would be
@@ -6322,13 +6472,15 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 	 * maps are only set up for key_maps that reorder bytes.
 	 */
 	if (caa_likely(km->identity))
-		return do_cds_ft_lookup(ft, key, key_len, result_node, NULL,
+		return do_cds_ft_lookup(ft, key, key_len, _key_readable_len,
+					result_node, NULL,
 					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
 	{
 		uint8_t ordinals[FT_MAX_KEY_LEN];
 
 		ft_key_to_ordinals(ordinals, key, key_len, km);
-		return do_cds_ft_lookup(ft, ordinals, key_len, result_node, NULL,
+		return do_cds_ft_lookup(ft, ordinals, key_len,
+					FT_MAX_KEY_LEN, result_node, NULL,
 					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
 	}
 }
@@ -6340,7 +6492,7 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP_ITER_KEY(lookup_enter, iter);
-	status = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
+	status = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, iter->key_len + FT_KEY_READABLE_PAD, NULL, iter,
 				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
 	FT_TP(lookup_exit, (int) status);
 	return status;
@@ -6362,14 +6514,14 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 	}
 	CDS_FT_SCOPED_READER(ft);
 	if (caa_likely(km->identity)) {
-		do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
+		do_cds_ft_lookup(ft, key, key_len, key_len, NULL, NULL,
 				 FT_PREFIX_TRACK_PARTIAL, &partial_len,
 				 &partial_node, false);
 	} else {
 		uint8_t ordinals[FT_MAX_KEY_LEN];
 
 		ft_key_to_ordinals(ordinals, key, key_len, km);
-		do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
+		do_cds_ft_lookup(ft, ordinals, key_len, key_len, NULL, NULL,
 				 FT_PREFIX_TRACK_PARTIAL, &partial_len,
 				 &partial_node, false);
 	}
@@ -6391,7 +6543,7 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 	 * backtracking) while simultaneously tracking the closest
 	 * ancestor with external nodes for partial-match semantics.
 	 */
-	do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
+	do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, iter->key_len + FT_KEY_READABLE_PAD, NULL, iter,
 			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node,
 			 false);
 
@@ -6423,14 +6575,14 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
 	}
 	CDS_FT_SCOPED_READER(ft);
 	if (caa_likely(km->identity)) {
-		ret = do_cds_ft_lookup(ft, key, key_len, NULL, NULL,
+		ret = do_cds_ft_lookup(ft, key, key_len, key_len, NULL, NULL,
 				       FT_PREFIX_TRACK_LONGEST, &longest_len,
 				       &match_node, false);
 	} else {
 		uint8_t ordinals[FT_MAX_KEY_LEN];
 
 		ft_key_to_ordinals(ordinals, key, key_len, km);
-		ret = do_cds_ft_lookup(ft, ordinals, key_len, NULL, NULL,
+		ret = do_cds_ft_lookup(ft, ordinals, key_len, key_len, NULL, NULL,
 				       FT_PREFIX_TRACK_LONGEST, &longest_len,
 				       &match_node, false);
 	}
@@ -6458,7 +6610,7 @@ enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 	enum cds_ft_status ret;
 
 	CDS_FT_SCOPED_READER(ft);
-	ret = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, NULL, iter,
+	ret = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, iter->key_len + FT_KEY_READABLE_PAD, NULL, iter,
 			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node,
 			       false);
 
@@ -13974,7 +14126,8 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
 enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 		struct cds_ft_group_attr *attr,
 		size_t key_offset,
-		size_t key_len_offset)
+		size_t key_len_offset,
+		size_t leaf_readable_len)
 {
 	/*
 	 * Reject a non-NONE key_len_offset on a fixed-length-key group
@@ -14009,6 +14162,7 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 	attr->speculative_validated = true;
 	attr->speculative_key_offset = key_offset;
 	attr->speculative_key_len_offset = key_len_offset;
+	attr->speculative_leaf_readable_len = leaf_readable_len;
 	return CDS_FT_STATUS_OK;
 }
 
@@ -14181,6 +14335,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->speculative_validated = attr->speculative_validated;
 		ft_group->speculative_key_offset = attr->speculative_key_offset;
 		ft_group->speculative_key_len_offset = attr->speculative_key_len_offset;
+		ft_group->speculative_leaf_readable_len = attr->speculative_leaf_readable_len;
 	} else {
 		ft_group->key_map.identity = true;
 		ft_group->speculative_key_len_offset = CDS_FT_SPECULATIVE_OFFSET_NONE;
@@ -15734,7 +15889,13 @@ enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **re
 	size_t max_depth = ft->group->max_tree_depth;
 	size_t max_key_len = ft->group->max_key_len;
 	size_t path_size = max_depth * sizeof(struct cds_ft_inode_flag *);
-	size_t key_size  = max_key_len * sizeof(uint8_t);
+	/*
+	 * Tail pad of FT_KEY_READABLE_PAD bytes after the key buffer so
+	 * the descent can SIMD-load 32 bytes past key[key_len-1] without
+	 * faulting.  The iter-based lookup paths pass
+	 * @max_key_len + FT_KEY_READABLE_PAD as @key_readable_len.
+	 */
+	size_t key_size  = (max_key_len + FT_KEY_READABLE_PAD) * sizeof(uint8_t);
 	struct cds_ft_iter *iter = calloc(1, sizeof(*iter) + path_size + key_size);
 
 	CDS_FT_SCOPED_READER(ft);

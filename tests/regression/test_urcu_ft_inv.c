@@ -237,7 +237,7 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
 	uint8_t k[8];
 
 	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
-	return cds_ft_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, out);
+	return cds_ft_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, out);
 }
 
 /* ------------------------------------------------------------------ */

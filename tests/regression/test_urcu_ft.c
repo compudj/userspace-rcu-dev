@@ -356,7 +356,7 @@ int test_1byte_key(void)
 	for (key = 0; key < 200; key++) {
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		status = cds_ft_lookup_key(test_ft, key_len_split(ftkey), &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, sizeof(ftkey), sizeof(ftkey), &ft_node);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 			assert(0);
@@ -368,7 +368,7 @@ int test_1byte_key(void)
 	for (key = 200; key < 240; key++) {
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		status = cds_ft_lookup_key(test_ft, key_len_split(ftkey), &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, sizeof(ftkey), sizeof(ftkey), &ft_node);
 		if (ft_node) {
 			fprintf(stderr,
 				"Error unexpected lookup node %" PRIu64 ": %s\n",
@@ -399,7 +399,7 @@ int test_1byte_key(void)
 		}
 		rcu_free_test_node(node);
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		status = cds_ft_lookup_key(test_ft, key_len_split(ftkey), &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, sizeof(ftkey), sizeof(ftkey), &ft_node);
 		if (ft_node) {
 			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after remove) failed. Node is not expected: %s\n", key, ft_node, cds_ft_status_to_string(status));
 			assert(0);
@@ -597,7 +597,7 @@ int test_2bytes_key(void)
 
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		status = cds_ft_lookup_key(test_ft, key_len_split(ftkey), &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, sizeof(ftkey), sizeof(ftkey), &ft_node);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 			assert(0);
@@ -611,7 +611,7 @@ int test_2bytes_key(void)
 
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, key_len_split(ftkey));
-		status = cds_ft_lookup_key(test_ft, key_len_split(ftkey), &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, sizeof(ftkey), sizeof(ftkey), &ft_node);
 		if (ft_node) {
 			fprintf(stderr,
 				"Error unexpected lookup node %" PRIu64 ": %s\n",
@@ -643,7 +643,7 @@ int test_2bytes_key(void)
 			assert(0);
 		}
 		rcu_free_test_node(node);
-		status = cds_ft_lookup_key(test_ft, key_len_split(ftkey), &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, sizeof(ftkey), sizeof(ftkey), &ft_node);
 		if (ft_node) {
 			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after remove) failed. Node is not expected: %s\n", key, ft_node, cds_ft_status_to_string(status));
 			assert(0);
@@ -860,7 +860,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
-		status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &ft_node);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 			assert(0);
@@ -884,7 +884,7 @@ int test_sparse_key(unsigned int len, int nr_dup)
 
 			rcu_read_lock();
 			cds_ft_u64_to_key(test_ft, key + 42, ftkey, CDS_FT_LEN_DEFAULT);
-			status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &ft_node);
+			status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &ft_node);
 			if (ft_node) {
 				fprintf(stderr,
 					"Error unexpected lookup node %" PRIu64 ": %s\n",
@@ -922,13 +922,13 @@ int test_sparse_key(unsigned int len, int nr_dup)
 				assert(0);
 			}
 			rcu_free_test_node(node);
-			status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &test_ft_node);
+			status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &test_ft_node);
 			if (count < nr_dup && !test_ft_node) {
 				fprintf(stderr, "Error no node found after removal of some nodes of a key: %s\n", cds_ft_status_to_string(status));
 				assert(0);
 			}
 		}
-		status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &ft_node);
 		if (ft_node) {
 			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after remove) failed. Node is not expected: %s\n", key, ft_node, cds_ft_status_to_string(status));
 			assert(0);
@@ -1058,7 +1058,7 @@ int test_varlen_sparse_key_lookup(unsigned int len, int nr_dup)
 
 		rcu_read_lock();
 		cds_ft_u64_to_key(test_ft, key, ftkey, len);
-		status = cds_ft_lookup_key(test_ft, ftkey, len, &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, len, len, &ft_node);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup node %" PRIu64 ": %s\n", key, cds_ft_status_to_string(status));
 			assert(0);
@@ -1102,7 +1102,7 @@ int test_varlen_sparse_key_lookup_fail(unsigned int len)
 
 			rcu_read_lock();
 			cds_ft_u64_to_key(test_ft, key + 42, ftkey, len);
-			status = cds_ft_lookup_key(test_ft, ftkey, len, &ft_node);
+			status = cds_ft_lookup_key(test_ft, ftkey, len, len, &ft_node);
 			if (ft_node) {
 				fprintf(stderr,
 					"Error unexpected lookup node %" PRIu64 ": %s\n",
@@ -1164,13 +1164,13 @@ int test_varlen_sparse_key_remove(unsigned int len, int nr_dup)
 				assert(0);
 			}
 			rcu_free_test_node(node);
-			status = cds_ft_lookup_key(test_ft, ftkey, len, &test_ft_node);
+			status = cds_ft_lookup_key(test_ft, ftkey, len, len, &test_ft_node);
 			if (count < nr_dup && !test_ft_node) {
 				fprintf(stderr, "Error no node found after removal of some nodes of a key: %s\n", cds_ft_status_to_string(status));
 				assert(0);
 			}
 		}
-		status = cds_ft_lookup_key(test_ft, ftkey, len, &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, len, len, &ft_node);
 		if (ft_node) {
 			fprintf(stderr, "Error lookup %" PRIu64 ": %p (after remove) failed. Node is not expected: %s\n", key, ft_node, cds_ft_status_to_string(status));
 			assert(0);
@@ -1348,7 +1348,7 @@ int test_varlen_string_key_lookup(void)
 		int count = 0;
 
 		rcu_read_lock();
-		status = cds_ft_lookup_key(test_ft, (uint8_t *) string, strlen(string), &ft_node);
+		status = cds_ft_lookup_key(test_ft, (uint8_t *) string, strlen(string), strlen(string), &ft_node);
 		if (!ft_node) {
 			fprintf(stderr, "Error lookup node \"%s\": %s\n", string, cds_ft_status_to_string(status));
 			assert(0);
@@ -1378,7 +1378,7 @@ int test_varlen_string_key_lookup_fail(void)
 		enum cds_ft_status status;
 
 		rcu_read_lock();
-		status = cds_ft_lookup_key(test_ft, (uint8_t *) string, strlen(string), &ft_node);
+		status = cds_ft_lookup_key(test_ft, (uint8_t *) string, strlen(string), strlen(string), &ft_node);
 		if (ft_node) {
 			fprintf(stderr, "Error unexpected lookup node \"%s\": %s\n", string, cds_ft_status_to_string(status));
 			assert(0);
@@ -1424,13 +1424,13 @@ int test_varlen_string_key_remove(void)
 				assert(0);
 			}
 			rcu_free_test_node(node);
-			status = cds_ft_lookup_key(test_ft, (uint8_t *) string, strlen(string), &test_ft_node);
+			status = cds_ft_lookup_key(test_ft, (uint8_t *) string, strlen(string), strlen(string), &test_ft_node);
 			if (count < 2 && strcmp(string, "abcd") == 0 && !test_ft_node) {
 				fprintf(stderr, "Error no node found after removal of some nodes of a key: %s\n", cds_ft_status_to_string(status));
 				assert(0);
 			}
 		}
-		status = cds_ft_lookup_key(test_ft, (uint8_t *) string, strlen(string), &ft_node);
+		status = cds_ft_lookup_key(test_ft, (uint8_t *) string, strlen(string), strlen(string), &ft_node);
 		if (ft_node) {
 			fprintf(stderr, "Error lookup \"%s\": %p (after remove) failed. Node is not expected: %s\n", string, ft_node, cds_ft_status_to_string(status));
 			assert(0);
@@ -1565,7 +1565,7 @@ void *test_ft_rw_thr_reader(void *_count)
 		key = ((unsigned long) rand_r(&URCU_TLS(rand_lookup)) % lookup_pool_size) + lookup_pool_offset;
 		key *= key_mul;
 		cds_ft_u64_to_key(test_ft, key, ftkey, CDS_FT_LEN_DEFAULT);
-		status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, &ft_node);
+		status = cds_ft_lookup_key(test_ft, ftkey, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &ft_node);
 		if (!ft_node) {
 			if (validate_lookup) {
 				printf("[ERROR] Lookup cannot find initial node: %s\n", cds_ft_status_to_string(status));

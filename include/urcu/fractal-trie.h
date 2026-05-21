@@ -470,6 +470,18 @@ void cds_ft_node_init(struct cds_ft_node *node)
  * - > 0: Explicit key length (must not exceed trie's max length).
  * - 0: NIL key (zero-length).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
+ * @key_readable_len: Total number of bytes safely loadable starting at
+ *                    @key without faulting — typically the allocation
+ *                    size of the buffer the caller owns.  Must be >=
+ *                    @key_len.  Values larger than @key_len let the
+ *                    library use unmasked SIMD loads on the input side,
+ *                    avoiding page-cross checks on the hot path.  If
+ *                    unsure, pass @key_len (the conservative default).
+ *                    Note: a memory allocator that guarantees a
+ *                    non-faulting guard page (or any non-faulting trailing
+ *                    mapping) after each allocation lets the caller safely
+ *                    declare a @key_readable_len up to the next page
+ *                    boundary even when the actual key data is shorter.
  * @result_node: Node output. Set to the first node of the duplicate chain
  *               if a match is found, or NULL if not found or on error.
  *
@@ -481,7 +493,7 @@ void cds_ft_node_init(struct cds_ft_node *node)
  * while accessing the returned node.
  */
 enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
+		const uint8_t *key, size_t key_len, size_t key_readable_len,
 		struct cds_ft_node **result_node);
 
 /*
@@ -489,6 +501,7 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @key: Pointer to the key (may be NULL if @key_len is 0).
  * @key_len: Key length in bytes (same semantics as cds_ft_lookup_key).
+ * @key_readable_len: Readable horizon for @key (see cds_ft_lookup_key).
  * @result_node: Candidate node output. Set to a node if a candidate is
  *               found, or NULL if not found or on error.
  *
@@ -506,7 +519,7 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
  * while accessing the returned node.
  */
 enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len,
+		const uint8_t *key, size_t key_len, size_t key_readable_len,
 		struct cds_ft_node **result_node);
 
 /*
@@ -1804,6 +1817,22 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
  *                  as @key_offset) to a size_t field holding the key
  *                  length.  Pass CDS_FT_SPECULATIVE_OFFSET_NONE for
  *                  fixed-length-key groups.
+ * @leaf_readable_len: Total number of bytes safely loadable starting
+ *                  at the stored key (offset @key_offset from the leaf
+ *                  base) without faulting — typically the size of the
+ *                  key buffer field the app reserved in its leaf
+ *                  struct.  Must be >= every possible stored key
+ *                  length for this group, or 0 if no over-read is
+ *                  guaranteed (conservative; the library uses a
+ *                  page-cross-safe fallback compare).  Values >=
+ *                  stored_key_len + 32 let the library use unmasked
+ *                  SIMD loads on the leaf side, avoiding page-cross
+ *                  checks on the hot path.  Note: a memory allocator
+ *                  that guarantees a non-faulting guard page (or any
+ *                  non-faulting trailing mapping) after each leaf
+ *                  allocation lets the app declare a @leaf_readable_len
+ *                  up to the next page boundary even when the key
+ *                  buffer is shorter.
  *
  * Implies cds_ft_group_attr_set_speculative.  When set, lookups
  * via cds_ft_lookup_key (and the iterator-based cds_ft_lookup) on
@@ -1825,7 +1854,8 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
 enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 		struct cds_ft_group_attr *attr,
 		size_t key_offset,
-		size_t key_len_offset);
+		size_t key_len_offset,
+		size_t leaf_readable_len);
 
 /*
  * cds_ft_attr_create - Create a per-instance Fractal Trie attribute

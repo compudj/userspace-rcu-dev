@@ -179,6 +179,15 @@
 #define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 1)	/* Maximum depth, including root. */
 
 /*
+ * Number of bytes of safe over-read past a caller's key_len that the
+ * descent SIMD comparator may load.  Library-internal: used to size
+ * the iter-allocated key buffer (struct cds_ft_iter) and as the
+ * implicit horizon for library-internal key buffers.  Sized for a
+ * 32-byte AVX2 load.
+ */
+#define FT_KEY_READABLE_PAD	32U
+
+/*
  * Entry for NULL node is at index 6 (32-bit) or 7 (64-bit) of the
  * table. It is never encoded in flags.
  */
@@ -543,11 +552,17 @@ struct cds_ft_group {
 	 * @speculative_key_len_offset: byte offset (same base) to a
 	 *   size_t holding the key length, for variable-length-key
 	 *   groups.  CDS_FT_SPECULATIVE_OFFSET_NONE for fixed-length.
+	 * @speculative_leaf_readable_len: app-promised total readable
+	 *   bytes from the stored key base (offset @speculative_key_offset
+	 *   from leaf base).  Must be >= every stored key length, or 0
+	 *   for "no over-read promised".  Used by the spec_validate leaf
+	 *   compare to pick the widest unmasked SIMD load.
 	 */
 	bool speculative;
 	bool speculative_validated;
 	size_t speculative_key_offset;
 	size_t speculative_key_len_offset;
+	size_t speculative_leaf_readable_len;
 };
 
 
