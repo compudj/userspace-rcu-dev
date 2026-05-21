@@ -11419,6 +11419,116 @@ void ft_free_branch(struct cds_ft *ft,
 }
 
 /*
+ * ft_make_root_internal: materialize an internal-node root for
+ * assignment to ft->root, preserving the trie-wide invariant that
+ * the root pointer always tags an internal node (never compressed,
+ * never skip-compressed).
+ *
+ * @ft:    trie that will own the returned root (used for the
+ *         allocator only — no concurrent readers are reached via
+ *         @ft yet).
+ * @child: incoming root candidate.  May be internal, regular
+ *         compressed, or skip-compressed.  External @child must be
+ *         filtered by the caller (externals go into the root's
+ *         external_nodes slot, not via this helper).
+ *
+ * If @child is already internal, returns it unchanged.  Otherwise
+ * peels the first byte off the compressed path (resolving skip
+ * encoding first), allocates a fresh type-0 internal root, and
+ * installs the slot at byte 0 with either:
+ *   - cn->child directly (when cn->len == 1, the whole compressed
+ *     collapses), or
+ *   - a freshly-allocated shorter compressed node holding bytes
+ *     [1..cn->len-1] → cn->child (when cn->len >= 2).
+ *
+ * The original cn is freed in the success path.  Subtree key count
+ * (ft_nr_keys_get(cn_meta)) is propagated to the new root and to
+ * any shorter compressed node so the parent count invariant is
+ * preserved.
+ *
+ * Caller must be the sole owner of @child (no concurrent readers
+ * may reach it via any published pointer); only valid for fresh /
+ * exclusive trie roots.
+ *
+ * Returns the new internal-tagged root flag on success, NULL on
+ * allocation failure (the caller's detach must roll back).
+ */
+static
+struct cds_ft_inode_flag *
+ft_make_root_internal(struct cds_ft *ft,
+		struct cds_ft_inode_flag *child)
+{
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_metadata *cn_meta;
+	struct cds_ft_inode_flag *slot_value;
+	struct cds_ft_compressed_node *new_cn = NULL;
+	unsigned int suffix_len;
+	uint8_t first_byte;
+	unsigned long subtree_count;
+	struct cds_ft_inode *root_node;
+	struct cds_ft_metadata *root_meta;
+	struct cds_ft_inode_flag *dest;
+	int ret;
+
+	/* Skip-compressed → regular compressed flag. */
+	child = ft_resolve_skip_compressed(child);
+	if (caa_likely(!ft_node_compressed(child)))
+		return child;
+
+	cn = ft_compressed_node_ptr(child);
+	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	subtree_count = ft_nr_keys_get(cn_meta);
+	suffix_len = cn->len - 1;
+	first_byte = cn->key_bytes[0];
+
+	if (suffix_len == 0) {
+		/* Single-byte compressed: cn collapses, cn->child plugs
+		 * directly into the root slot. */
+		slot_value = cn->child;
+	} else {
+		struct cds_ft_metadata *new_cn_meta;
+
+		new_cn = alloc_compressed_node(ft, suffix_len, &new_cn_meta);
+		if (!new_cn)
+			return NULL;
+		new_cn->len = suffix_len;
+		new_cn->child = cn->child;
+		memcpy(new_cn->key_bytes, &cn->key_bytes[1], suffix_len);
+		new_cn_meta->nr_child = cn_meta->nr_child;
+		ft_nr_keys_store(new_cn_meta, subtree_count, CMM_RELAXED);
+		slot_value = ft_compressed_node_flag(new_cn);
+		/*
+		 * Re-parent the moved cn->child: its parent pointer
+		 * still references the OLD cn (about to be freed).
+		 * For the suffix_len == 0 case below, ft_node_set_nth
+		 * does the equivalent when it places cn->child into
+		 * the root slot.
+		 */
+		ft_set_parent(cn->child, slot_value, &new_cn->child);
+	}
+
+	root_node = alloc_cds_ft_node(ft, &ft_types[0], &root_meta);
+	if (!root_node) {
+		if (new_cn)
+			free_compressed_node(ft, new_cn);
+		return NULL;
+	}
+	dest = ft_node_flag(root_node, 0);
+	ret = ft_node_set_nth(ft, &dest, first_byte, slot_value,
+			NULL, root_meta, 0);
+	if (ret) {
+		if (new_cn)
+			free_compressed_node(ft, new_cn);
+		free_cds_ft_node(ft, root_node);
+		return NULL;
+	}
+	ft_nr_keys_store(ft_flag_to_metadata(dest), subtree_count,
+			CMM_RELAXED);
+	free_compressed_node(ft, cn);
+	return dest;
+}
+
+/*
  * Store graft_payload at the graft point described by @d.
  *
  * Handles two cases:
@@ -12012,6 +12122,26 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		if (!ft_node_external(old_child)) {
 			/*
+			 * Materialize an internal root from @old_child if
+			 * needed (compressed / skip-compressed cases): the
+			 * trie root invariant requires internal here.
+			 * swap_ft has been drained of readers by the
+			 * synchronize_rcu above, so @old_child is safe to
+			 * rewrite structurally.
+			 *
+			 * On allocation failure we have no good roll-back
+			 * path post-publish; abort.
+			 */
+			struct cds_ft_inode_flag *new_root_child;
+
+			new_root_child = ft_make_root_internal(swap_ft, old_child);
+			if (!new_root_child) {
+				fprintf(stderr,
+					"BUG: ft_make_root_internal OOM during graft_swap\n");
+				abort();
+			}
+			old_child = new_root_child;
+			/*
 			 * Clear parent: old_child is now a root.  Use
 			 * rcu_assign_pointer so read-side parent-pointer
 			 * walks see a single atomic transition.
@@ -12413,6 +12543,27 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 */
 				if (!ft->exclusive)
 					ft->group->flavor->update_synchronize_rcu();
+				/*
+				 * Materialize an internal root if @child is
+				 * compressed or skip-compressed: the trie
+				 * root invariant requires an internal node
+				 * here.  See ft_make_root_internal.
+				 */
+				child = ft_make_root_internal(detached, child);
+				if (!child) {
+					/*
+					 * Allocation failure during root
+					 * materialization.  Re-attach the
+					 * subtree to source and surface
+					 * MEMORY_ERROR.  The propagate-down
+					 * undo mirrors the original detach.
+					 */
+					ft_propagate_external_count_parent(ft,
+						dd.d.pnf,
+						(long) detached_count);
+					cds_ft_destroy(detached);
+					return CDS_FT_STATUS_MEMORY_ERROR;
+				}
 				free_cds_ft_node(detached,
 					ft_node_ptr(detached->root));
 				/* No readers in detached root yet. */
