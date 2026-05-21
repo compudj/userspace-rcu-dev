@@ -549,19 +549,14 @@ struct cds_ft_group {
 	 * @speculative_key_offset: byte offset from the external node's
 	 *   address to the start of the stored key.  Used only when
 	 *   @speculative_validated is true.
-	 * @speculative_key_len_offset: byte offset (same base) to a
-	 *   size_t holding the key length, for variable-length-key
-	 *   groups.  CDS_FT_SPECULATIVE_OFFSET_NONE for fixed-length.
-	 * @speculative_leaf_readable_pad: app-promised total readable
-	 *   bytes from the stored key base (offset @speculative_key_offset
-	 *   from leaf base).  Must be >= every stored key length, or 0
-	 *   for "no over-read promised".  Used by the spec_validate leaf
-	 *   compare to pick the widest unmasked SIMD load.
+	 * @speculative_leaf_readable_pad: app-promised bytes safely
+	 *   loadable PAST stored_key[stored_key_len-1].  0 for "no
+	 *   over-read promised".  Used by the spec_validate leaf compare
+	 *   to pick the widest unmasked SIMD load.
 	 */
 	bool speculative;
 	bool speculative_validated;
 	size_t speculative_key_offset;
-	size_t speculative_key_len_offset;
 	size_t speculative_leaf_readable_pad;
 };
 
@@ -571,25 +566,30 @@ struct cds_ft_group {
  * at trie creation and re-read on every cds_ft_lookup_key call.
  * Lives in struct cds_ft (next to @root) so the descent's existing
  * load of @ft picks the line up; the spec_validate compare block
- * then gets all 4 attrs from one CL load instead of 3-4 separate
- * dependent loads from struct cds_ft_group (extra pointer chase).
+ * then gets both attrs from one CL load instead of dependent loads
+ * through @ft->group's separate CL.
  *
  * Field semantics match the public-API attrs documented at
  * cds_ft_group_attr_set_speculative_validated:
  *  - key_offset: byte offset from external node base to stored
  *    key.  Max 65535.
- *  - key_len_offset: byte offset to stored key_len size_t.
- *    0xFFFF = NONE sentinel (fixed-length group).
  *  - leaf_readable_pad: bytes safely loadable past
- *    stored_key[key_len-1].
+ *    stored_key[stored_key_len-1].
  *  - validated: 1 if cds_ft_lookup_key should run spec_validate.
+ *
+ * The stored key length is intentionally NOT cached or read: a
+ * candidate/speculative descent only terminates at a leaf when the
+ * total bytes consumed equals @key_len, and a leaf inserted at depth
+ * L has stored_key_len == L by construction.  Loading stored_key_len
+ * would be a dependent-load chain on the same CL as stored_key,
+ * blocking the SIMD compare for no semantic gain — the byte compare
+ * already catches the cand-mode "wrong compressed path" case.
  */
 struct cds_ft_speculative_attrs {
 	uint16_t key_offset;
-	uint16_t key_len_offset;
 	uint16_t leaf_readable_pad;
 	uint8_t validated;
-	uint8_t _reserved;
+	uint8_t _reserved[3];
 };
 
 struct cds_ft {

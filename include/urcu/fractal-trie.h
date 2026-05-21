@@ -1824,13 +1824,6 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key);
 
 /*
- * Sentinel for cds_ft_group_attr_set_speculative_validated() indicating
- * that the group uses fixed-length keys and no key-length field is
- * present in the external node.
- */
-#define CDS_FT_SPECULATIVE_OFFSET_NONE	((size_t) ~(size_t) 0)
-
-/*
  * cds_ft_group_attr_set_speculative - Enable speculative descent.
  * @attr: Fractal Trie group attributes.
  *
@@ -1895,10 +1888,6 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
  *              Typically computed as
  *              offsetof(user_struct, key_field) -
  *              offsetof(user_struct, ft_node_field).
- * @key_len_offset: For variable-length keys, byte offset (same base
- *                  as @key_offset) to a size_t field holding the key
- *                  length.  Pass CDS_FT_SPECULATIVE_OFFSET_NONE for
- *                  fixed-length-key groups.
  * @leaf_readable_pad: Number of bytes guaranteed safely loadable
  *                  PAST the last byte of the stored key (i.e. starting
  *                  at stored_key + stored_key_len) without faulting.
@@ -1924,18 +1913,24 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
  * descent speed of a candidate lookup, and no user-side validation
  * function call.
  *
+ * The stored key length is not consulted by the library on the hot
+ * path: a candidate/speculative descent only reaches a leaf when the
+ * total bytes consumed equals @key_len, and a leaf inserted at depth
+ * L has stored_key_len == L by construction.  The byte compare
+ * therefore reads exactly @key_len bytes from both sides; the
+ * @leaf_readable_pad contract makes that read safe even if the
+ * stored key is shorter than @key_len in the unlikely event of a
+ * caller-side contract violation.
+ *
  * cds_ft_lookup_candidate_key on the same group still returns an
  * unvalidated candidate — the caller's intent (candidate vs verified)
  * is controlled by the API entry point, independently of this attr.
  *
- * Returns CDS_FT_STATUS_OK on success,
- * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @key_len_offset is not
- * CDS_FT_SPECULATIVE_OFFSET_NONE on a fixed-length-key group.
+ * Returns CDS_FT_STATUS_OK on success.
  */
 enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 		struct cds_ft_group_attr *attr,
 		size_t key_offset,
-		size_t key_len_offset,
 		size_t leaf_readable_pad);
 
 /*

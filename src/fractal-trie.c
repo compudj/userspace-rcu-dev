@@ -131,7 +131,6 @@ struct cds_ft_group_attr {
 	bool speculative;
 	bool speculative_validated;
 	size_t speculative_key_offset;
-	size_t speculative_key_len_offset;
 	size_t speculative_leaf_readable_pad;
 };
 
@@ -6225,34 +6224,39 @@ end:
 	 */
 	if (spec_validate && status == CDS_FT_STATUS_OK && found) {
 		/*
-		 * Read all four spec_validate attrs from ft->spec (one
-		 * cache line, shared with @root and @group which the
-		 * descent already loaded — saves the pointer chase
-		 * through ft->group and the 3 dependent loads from the
-		 * group's separate CL).  Sentinels: key_len_offset
-		 * 0xFFFF means NONE (fixed-len group).
+		 * Read the three hot-path spec_validate attrs from ft->spec
+		 * (one cache line, shared with @root and @group which the
+		 * descent already loaded — saves the pointer chase through
+		 * ft->group and the dependent loads from the group's
+		 * separate CL).
+		 *
+		 * stored_len is NOT loaded here.  The cand-mode descent
+		 * already guarantees the leaf reached has stored_len ==
+		 * @key_len: a leaf inserted at depth L is only reachable
+		 * via a descent that consumed L input bytes (the
+		 * skip-compressed length-vs-remaining check enforces
+		 * this).  Loading + comparing stored_len would be a
+		 * dependent-load chain on the same CL as stored_key,
+		 * blocking the SIMD compare for no semantic gain.  The
+		 * byte compare below still catches the cand-mode
+		 * "wrong compressed path" case (the byte values
+		 * mismatch even if the depths agree).
 		 */
-		const struct cds_ft_speculative_attrs spec = ft->spec;
 		const uint8_t *stored_key =
-			(const uint8_t *) found + spec.key_offset;
+			(const uint8_t *) found + ft->spec.key_offset;
 		bool match = true;
 
-		if (spec.key_len_offset != (uint16_t) 0xFFFFU) {
-			size_t stored_len = *(const size_t *)
-				((const uint8_t *) found + spec.key_len_offset);
-			if (stored_len != _key_len)
-				match = false;
-		}
-		if (match && key_len > 0) {
+		if (key_len > 0) {
 			/*
-			 * @key_readable_pad and @spec.leaf_readable_pad both
-			 * express "bytes safely loadable past stored_key +
-			 * key_len".  Min of the two is the over-read budget
-			 * both sides honour; total readable horizon for the
-			 * SIMD compare is key_len + that min.
+			 * @key_readable_pad and @ft->spec.leaf_readable_pad
+			 * both express "bytes safely loadable past
+			 * stored_key + key_len".  Min of the two is the
+			 * over-read budget both sides honour; total
+			 * readable horizon for the SIMD compare is
+			 * key_len + that min.
 			 */
-			size_t pad_min = key_readable_pad < spec.leaf_readable_pad
-				? key_readable_pad : spec.leaf_readable_pad;
+			size_t pad_min = key_readable_pad < ft->spec.leaf_readable_pad
+				? key_readable_pad : ft->spec.leaf_readable_pad;
 			if (ft_key_cmp_ordinals(orig_key, stored_key,
 					(unsigned int) key_len,
 					(unsigned int) (key_len + pad_min),
@@ -14192,7 +14196,6 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	attr->key_len = CDS_FT_LEN_DEFAULT;
 	attr->max_key_len = FT_MAX_KEY_LEN;
 	attr->key_map.identity = true;
-	attr->speculative_key_len_offset = CDS_FT_SPECULATIVE_OFFSET_NONE;
 	*result = attr;
 	return CDS_FT_STATUS_OK;
 }
@@ -14287,36 +14290,15 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
 enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 		struct cds_ft_group_attr *attr,
 		size_t key_offset,
-		size_t key_len_offset,
 		size_t leaf_readable_pad)
 {
 	/*
-	 * Reject a non-NONE key_len_offset on a fixed-length-key group
-	 * to catch misuse early — fixed-length groups derive key length
-	 * from the trie and never read it from the external node.
-	 */
-	if (attr->key_len != CDS_FT_LEN_VARIABLE &&
-	    key_len_offset != CDS_FT_SPECULATIVE_OFFSET_NONE)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	/*
-	 * Variable-length groups must provide a key-length offset; without
-	 * it the library cannot know how many bytes to compare.
-	 */
-	if (attr->key_len == CDS_FT_LEN_VARIABLE &&
-	    key_len_offset == CDS_FT_SPECULATIVE_OFFSET_NONE)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	/*
-	 * The library packs these three offsets into uint16_t fields on
-	 * the trie struct for hot-path single-load access.  Anything that
+	 * The library packs the two offsets into uint16_t fields on the
+	 * trie struct for hot-path single-load access.  Anything that
 	 * doesn't fit a u16 is rejected here.  Realistic leaf structs
-	 * are well below 64 KiB so the cap is generous.  0xFFFF is the
-	 * NONE sentinel for the packed @key_len_offset field; reject
-	 * a user-passed value that would collide with the sentinel.
+	 * are well below 64 KiB so the cap is generous.
 	 */
 	if (key_offset > UINT16_MAX)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (key_len_offset != CDS_FT_SPECULATIVE_OFFSET_NONE &&
-	    key_len_offset >= UINT16_MAX)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	if (leaf_readable_pad > UINT16_MAX)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -14337,7 +14319,6 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 #endif
 	attr->speculative_validated = true;
 	attr->speculative_key_offset = key_offset;
-	attr->speculative_key_len_offset = key_len_offset;
 	attr->speculative_leaf_readable_pad = leaf_readable_pad;
 	return CDS_FT_STATUS_OK;
 }
@@ -14510,11 +14491,9 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->speculative = attr->speculative;
 		ft_group->speculative_validated = attr->speculative_validated;
 		ft_group->speculative_key_offset = attr->speculative_key_offset;
-		ft_group->speculative_key_len_offset = attr->speculative_key_len_offset;
 		ft_group->speculative_leaf_readable_pad = attr->speculative_leaf_readable_pad;
 	} else {
 		ft_group->key_map.identity = true;
-		ft_group->speculative_key_len_offset = CDS_FT_SPECULATIVE_OFFSET_NONE;
 	}
 	*result_ft_group = ft_group;
 	FT_TP(group_create, (const void *) ft_group);
@@ -14549,18 +14528,14 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->group = ft_group;
 	/*
 	 * Cache the spec_validate attrs in the trie struct itself so
-	 * the lookup hot path can fetch all three offsets + the
-	 * "validated" flag from one cache line (shared with @root and
-	 * @group, already loaded by the descent).  See struct
+	 * the lookup hot path can fetch both offsets + the "validated"
+	 * flag from one cache line (shared with @root and @group,
+	 * already loaded by the descent).  See struct
 	 * cds_ft_speculative_attrs in fractal-trie-internal.h.  Range
 	 * checks at the setter (cds_ft_group_attr_set_speculative_validated)
-	 * guarantee these fits in u16.
+	 * guarantee these fit in u16.
 	 */
 	ft->spec.key_offset = (uint16_t) ft_group->speculative_key_offset;
-	ft->spec.key_len_offset = (ft_group->speculative_key_len_offset
-			== CDS_FT_SPECULATIVE_OFFSET_NONE)
-		? (uint16_t) 0xFFFFU
-		: (uint16_t) ft_group->speculative_key_len_offset;
 	ft->spec.leaf_readable_pad = (uint16_t) ft_group->speculative_leaf_readable_pad;
 	ft->spec.validated = ft_group->speculative_validated ? 1 : 0;
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -14830,9 +14805,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
  *     chain elsewhere in the trie is also caught.
  *   - When @path is non-NULL (path verification is enabled), every
  *     chain entry's stored key (at group->speculative_key_offset) is
- *     compared byte-for-byte against @path[0..@depth-1].  For
- *     variable-length groups, the leaf's stored length (read from
- *     speculative_key_len_offset) must equal @depth.  This is the
+ *     compared byte-for-byte against @path[0..@depth-1].  This is the
  *     end-to-end path/key consistency check: it catches a corrupted
  *     cn->key_bytes write or a wrong child-slot byte that would
  *     otherwise be silent under speculative-validated lookup (since
@@ -14901,20 +14874,6 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 			const uint8_t *stored_key = (const uint8_t *) node +
 					group->speculative_key_offset;
 
-			if (group->speculative_key_len_offset !=
-					CDS_FT_SPECULATIVE_OFFSET_NONE) {
-				size_t stored_len = *(const size_t *)
-					((const uint8_t *) node +
-					 group->speculative_key_len_offset);
-
-				if (stored_len != depth) {
-					if (out)
-						fprintf(out, "ft_verify: depth %u: external node %p stored key length %zu != trie depth %u\n",
-							depth, node,
-							stored_len, depth);
-					return -1;
-				}
-			}
 			if (depth > 0 && memcmp(stored_key, path, depth) != 0) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: external node %p stored key bytes diverge from trie path\n",

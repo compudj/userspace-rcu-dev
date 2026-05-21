@@ -10794,7 +10794,7 @@ static struct cds_ft *create_specv_varlen_ft(struct cds_ft_group **group_out)
 		abort();
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	s = cds_ft_group_attr_set_speculative_validated(attr,
-		SPECV_KEY_OFFSET, SPECV_KEY_LEN_OFFSET, 0);
+		SPECV_KEY_OFFSET, 0);
 	if (s != CDS_FT_STATUS_OK) {
 		cds_ft_group_attr_destroy(attr);
 		return NULL;
@@ -10827,7 +10827,7 @@ static struct cds_ft *create_specv_fixed_ft(size_t klen,
 		abort();
 	}
 	s = cds_ft_group_attr_set_speculative_validated(attr,
-		SPECV_KEY_OFFSET, CDS_FT_SPECULATIVE_OFFSET_NONE, 0);
+		SPECV_KEY_OFFSET, 0);
 	if (s != CDS_FT_STATUS_OK) {
 		cds_ft_group_attr_destroy(attr);
 		return NULL;
