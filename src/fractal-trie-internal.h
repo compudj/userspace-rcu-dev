@@ -566,10 +566,37 @@ struct cds_ft_group {
 };
 
 
+/*
+ * Spec_validate attrs packed into 8 bytes, copied from the group
+ * at trie creation and re-read on every cds_ft_lookup_key call.
+ * Lives in struct cds_ft (next to @root) so the descent's existing
+ * load of @ft picks the line up; the spec_validate compare block
+ * then gets all 4 attrs from one CL load instead of 3-4 separate
+ * dependent loads from struct cds_ft_group (extra pointer chase).
+ *
+ * Field semantics match the public-API attrs documented at
+ * cds_ft_group_attr_set_speculative_validated:
+ *  - key_offset: byte offset from external node base to stored
+ *    key.  Max 65535.
+ *  - key_len_offset: byte offset to stored key_len size_t.
+ *    0xFFFF = NONE sentinel (fixed-length group).
+ *  - leaf_readable_pad: bytes safely loadable past
+ *    stored_key[key_len-1].
+ *  - validated: 1 if cds_ft_lookup_key should run spec_validate.
+ */
+struct cds_ft_speculative_attrs {
+	uint16_t key_offset;
+	uint16_t key_len_offset;
+	uint16_t leaf_readable_pad;
+	uint8_t validated;
+	uint8_t _reserved;
+};
+
 struct cds_ft {
 	struct cds_ft_group *group;
 
 	struct cds_ft_inode_flag *root;		/* Root node (arena-allocated, always present, always internal). */
+	struct cds_ft_speculative_attrs spec;	/* Cached spec_validate attrs (read on lookup hot path). */
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
 	unsigned long nr_fallback;		/* Number of fallback nodes used */
 

@@ -6224,33 +6224,35 @@ end:
 	 * verify — is reported as NOT_FOUND.
 	 */
 	if (spec_validate && status == CDS_FT_STATUS_OK && found) {
-		const struct cds_ft_group *group = ft->group;
+		/*
+		 * Read all four spec_validate attrs from ft->spec (one
+		 * cache line, shared with @root and @group which the
+		 * descent already loaded — saves the pointer chase
+		 * through ft->group and the 3 dependent loads from the
+		 * group's separate CL).  Sentinels: key_len_offset
+		 * 0xFFFF means NONE (fixed-len group).
+		 */
+		const struct cds_ft_speculative_attrs spec = ft->spec;
 		const uint8_t *stored_key =
-			(const uint8_t *) found + group->speculative_key_offset;
+			(const uint8_t *) found + spec.key_offset;
 		bool match = true;
 
-		if (group->speculative_key_len_offset !=
-				CDS_FT_SPECULATIVE_OFFSET_NONE) {
+		if (spec.key_len_offset != (uint16_t) 0xFFFFU) {
 			size_t stored_len = *(const size_t *)
-				((const uint8_t *) found +
-				 group->speculative_key_len_offset);
+				((const uint8_t *) found + spec.key_len_offset);
 			if (stored_len != _key_len)
 				match = false;
 		}
 		if (match && key_len > 0) {
 			/*
-			 * @key_readable_pad and @speculative_leaf_readable_pad
-			 * both express "bytes safely loadable past stored_key
-			 * + key_len".  Min of the two is the over-read budget
+			 * @key_readable_pad and @spec.leaf_readable_pad both
+			 * express "bytes safely loadable past stored_key +
+			 * key_len".  Min of the two is the over-read budget
 			 * both sides honour; total readable horizon for the
-			 * SIMD compare is key_len + that min.  No floor logic
-			 * needed — a 0 pad on either side simply caps the
-			 * other.
+			 * SIMD compare is key_len + that min.
 			 */
-			size_t pad_min = key_readable_pad <
-					group->speculative_leaf_readable_pad ?
-				key_readable_pad :
-				group->speculative_leaf_readable_pad;
+			size_t pad_min = key_readable_pad < spec.leaf_readable_pad
+				? key_readable_pad : spec.leaf_readable_pad;
 			if (ft_key_cmp_ordinals(orig_key, stored_key,
 					(unsigned int) key_len,
 					(unsigned int) (key_len + pad_min),
@@ -14304,6 +14306,21 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 	    key_len_offset == CDS_FT_SPECULATIVE_OFFSET_NONE)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	/*
+	 * The library packs these three offsets into uint16_t fields on
+	 * the trie struct for hot-path single-load access.  Anything that
+	 * doesn't fit a u16 is rejected here.  Realistic leaf structs
+	 * are well below 64 KiB so the cap is generous.  0xFFFF is the
+	 * NONE sentinel for the packed @key_len_offset field; reject
+	 * a user-passed value that would collide with the sentinel.
+	 */
+	if (key_offset > UINT16_MAX)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (key_len_offset != CDS_FT_SPECULATIVE_OFFSET_NONE &&
+	    key_len_offset >= UINT16_MAX)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (leaf_readable_pad > UINT16_MAX)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	/*
 	 * Opportunistically enable skip-compressed pointer encoding when
 	 * available — it stacks with library-side validation to also
 	 * avoid the compressed-node cache-line load.  Tolerate
@@ -14530,6 +14547,22 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->group = ft_group;
+	/*
+	 * Cache the spec_validate attrs in the trie struct itself so
+	 * the lookup hot path can fetch all three offsets + the
+	 * "validated" flag from one cache line (shared with @root and
+	 * @group, already loaded by the descent).  See struct
+	 * cds_ft_speculative_attrs in fractal-trie-internal.h.  Range
+	 * checks at the setter (cds_ft_group_attr_set_speculative_validated)
+	 * guarantee these fits in u16.
+	 */
+	ft->spec.key_offset = (uint16_t) ft_group->speculative_key_offset;
+	ft->spec.key_len_offset = (ft_group->speculative_key_len_offset
+			== CDS_FT_SPECULATIVE_OFFSET_NONE)
+		? (uint16_t) 0xFFFFU
+		: (uint16_t) ft_group->speculative_key_len_offset;
+	ft->spec.leaf_readable_pad = (uint16_t) ft_group->speculative_leaf_readable_pad;
+	ft->spec.validated = ft_group->speculative_validated ? 1 : 0;
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
 	 * Default to verify-every-mutation cadence to preserve the
