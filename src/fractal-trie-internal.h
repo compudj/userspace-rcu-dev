@@ -552,7 +552,7 @@ struct cds_ft_group {
 	 * @speculative_key_len_offset: byte offset (same base) to a
 	 *   size_t holding the key length, for variable-length-key
 	 *   groups.  CDS_FT_SPECULATIVE_OFFSET_NONE for fixed-length.
-	 * @speculative_leaf_readable_len: app-promised total readable
+	 * @speculative_leaf_readable_pad: app-promised total readable
 	 *   bytes from the stored key base (offset @speculative_key_offset
 	 *   from leaf base).  Must be >= every stored key length, or 0
 	 *   for "no over-read promised".  Used by the spec_validate leaf
@@ -562,7 +562,7 @@ struct cds_ft_group {
 	bool speculative_validated;
 	size_t speculative_key_offset;
 	size_t speculative_key_len_offset;
-	size_t speculative_leaf_readable_len;
+	size_t speculative_leaf_readable_pad;
 };
 
 

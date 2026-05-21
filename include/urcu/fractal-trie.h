@@ -462,7 +462,7 @@ void cds_ft_node_init(struct cds_ft_node *node)
  * External-node arena: bump-allocator with end-of-zone over-read
  * safety, suitable for embedding application leaf structures (those
  * containing a struct cds_ft_node) when the trie group declares a
- * @leaf_readable_len > 0 via cds_ft_group_attr_set_speculative_validated.
+ * @leaf_readable_pad > 0 via cds_ft_group_attr_set_speculative_validated.
  *
  * Pattern: app embeds struct cds_ft_node in its own leaf struct,
  * allocates each leaf from this arena via cds_ft_external_arena_alloc,
@@ -552,22 +552,18 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  * - > 0: Explicit key length (must not exceed trie's max length).
  * - 0: NIL key (zero-length).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
- * @key_readable_len: Total number of bytes safely loadable starting at
- *                    @key without faulting — typically the allocation
- *                    size of the buffer the caller owns.  Must be >=
- *                    @key_len; passing any non-zero value smaller than
- *                    @key_len (after resolution below) is rejected
- *                    with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
- *                    Values larger than @key_len let the library use
- *                    unmasked SIMD loads on the input side, avoiding
- *                    page-cross checks on the hot path.  Pass 0 (or
- *                    CDS_FT_LEN_DEFAULT) to mean "no over-read
- *                    promised" — the library treats it as @key_len.
- *                    Note: a memory allocator that guarantees a
- *                    non-faulting guard page (or any non-faulting trailing
- *                    mapping) after each allocation lets the caller safely
- *                    declare a @key_readable_len up to the next page
- *                    boundary even when the actual key data is shorter.
+ * @key_readable_pad: Number of bytes guaranteed safely loadable PAST
+ *                    the last byte of @key (i.e. starting at
+ *                    key + key_len) without faulting.  0 means "no
+ *                    over-read promised"; the library uses a
+ *                    page-cross-safe fallback compare.  Values >= 32
+ *                    let the library use unmasked SIMD loads on the
+ *                    input side, avoiding page-cross checks on the
+ *                    hot path.  A memory allocator that gives every
+ *                    allocation a non-faulting trailing region (e.g.
+ *                    cds_ft_external_arena's per-range guard page,
+ *                    or a guard-page allocator) satisfies any value
+ *                    up to that trailing-region size trivially.
  * @result_node: Node output. Set to the first node of the duplicate chain
  *               if a match is found, or NULL if not found or on error.
  *
@@ -579,7 +575,7 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  * while accessing the returned node.
  */
 enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len, size_t key_readable_len,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node);
 
 /*
@@ -587,7 +583,7 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @key: Pointer to the key (may be NULL if @key_len is 0).
  * @key_len: Key length in bytes (same semantics as cds_ft_lookup_key).
- * @key_readable_len: Readable horizon for @key (see cds_ft_lookup_key).
+ * @key_readable_pad: Padding past @key end (see cds_ft_lookup_key).
  * @result_node: Candidate node output. Set to a node if a candidate is
  *               found, or NULL if not found or on error.
  *
@@ -605,7 +601,7 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
  * while accessing the returned node.
  */
 enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len, size_t key_readable_len,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node);
 
 /*
@@ -1903,22 +1899,21 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
  *                  as @key_offset) to a size_t field holding the key
  *                  length.  Pass CDS_FT_SPECULATIVE_OFFSET_NONE for
  *                  fixed-length-key groups.
- * @leaf_readable_len: Total number of bytes safely loadable starting
- *                  at the stored key (offset @key_offset from the leaf
- *                  base) without faulting — typically the size of the
- *                  key buffer field the app reserved in its leaf
- *                  struct.  Must be >= every possible stored key
- *                  length for this group, or 0 if no over-read is
- *                  guaranteed (conservative; the library uses a
- *                  page-cross-safe fallback compare).  Values >=
- *                  stored_key_len + 32 let the library use unmasked
- *                  SIMD loads on the leaf side, avoiding page-cross
- *                  checks on the hot path.  Note: a memory allocator
- *                  that guarantees a non-faulting guard page (or any
- *                  non-faulting trailing mapping) after each leaf
- *                  allocation lets the app declare a @leaf_readable_len
- *                  up to the next page boundary even when the key
- *                  buffer is shorter.
+ * @leaf_readable_pad: Number of bytes guaranteed safely loadable
+ *                  PAST the last byte of the stored key (i.e. starting
+ *                  at stored_key + stored_key_len) without faulting.
+ *                  0 means "no over-read guaranteed" — the library
+ *                  uses a page-cross-safe fallback compare.  Values
+ *                  >= 32 let the library use unmasked SIMD loads on
+ *                  the leaf side regardless of stored_key_len, avoiding
+ *                  page-cross checks on the hot path.  This semantic
+ *                  matches what variable-length-key apps can actually
+ *                  promise: a per-leaf trailing pad of N bytes, rather
+ *                  than a per-leaf total readable horizon that varies
+ *                  with stored_key_len.  Allocators that give every
+ *                  allocation a non-faulting trailing region (e.g.
+ *                  cds_ft_external_arena's per-range guard page)
+ *                  satisfy this contract trivially.
  *
  * Implies cds_ft_group_attr_set_speculative.  When set, lookups
  * via cds_ft_lookup_key (and the iterator-based cds_ft_lookup) on
@@ -1941,7 +1936,7 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 		struct cds_ft_group_attr *attr,
 		size_t key_offset,
 		size_t key_len_offset,
-		size_t leaf_readable_len);
+		size_t leaf_readable_pad);
 
 /*
  * cds_ft_attr_create - Create a per-instance Fractal Trie attribute

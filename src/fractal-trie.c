@@ -132,7 +132,7 @@ struct cds_ft_group_attr {
 	bool speculative_validated;
 	size_t speculative_key_offset;
 	size_t speculative_key_len_offset;
-	size_t speculative_leaf_readable_len;
+	size_t speculative_leaf_readable_pad;
 };
 
 struct cds_ft_attr {
@@ -5819,7 +5819,7 @@ enum ft_descent_action ft_traverse_compressed(
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
@@ -5833,16 +5833,14 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	const uint8_t *orig_key = key;
 	const uint8_t *key_end = orig_key + key_len;
 	/*
-	 * Caller-promised "readable" region — bytes safely loadable from
-	 * @orig_key without faulting.  Public-API entry points enforce
-	 * @_key_readable_len >= @key_len; internal callers (iter-based
-	 * lookup, partial/le/ge) also satisfy that precondition.  Used
-	 * as the input-side contract for ft_key_cmp_ordinals; descent
-	 * through compressed nodes forwards the remaining-safe-bytes at
-	 * each level.
+	 * Caller-promised input over-read horizon: @_key_readable_pad
+	 * bytes past @key + @key_len are safely loadable without faulting.
+	 * Used as the input-side contract for ft_key_cmp_ordinals;
+	 * descent through compressed nodes forwards the remaining-safe-
+	 * bytes at each level.
 	 */
-	size_t key_readable_len = _key_readable_len;
-	const uint8_t *key_safe_end = orig_key + key_readable_len;
+	size_t key_readable_pad = _key_readable_pad;
+	const uint8_t *key_safe_end = key_end + key_readable_pad;
 	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_node *found = NULL;
 	enum cds_ft_status status;
@@ -6241,25 +6239,21 @@ end:
 		}
 		if (match && key_len > 0) {
 			/*
-			 * Effective readable horizon for the SIMD compare:
-			 * min(input-side, leaf-side).  Input side is the
-			 * caller's @_key_readable_len (defensively clamped
-			 * to key_len above).  Leaf side is the app-promised
-			 * total readable bytes from the stored key base
-			 * (@speculative_leaf_readable_len), floored at
-			 * key_len so a 0 (no over-read promised) attr stays
-			 * correct.
+			 * @key_readable_pad and @speculative_leaf_readable_pad
+			 * both express "bytes safely loadable past stored_key
+			 * + key_len".  Min of the two is the over-read budget
+			 * both sides honour; total readable horizon for the
+			 * SIMD compare is key_len + that min.  No floor logic
+			 * needed — a 0 pad on either side simply caps the
+			 * other.
 			 */
-			size_t leaf_readable = group->speculative_leaf_readable_len;
-			size_t both_readable;
-
-			if (leaf_readable < key_len)
-				leaf_readable = key_len;
-			both_readable = key_readable_len < leaf_readable ?
-				key_readable_len : leaf_readable;
+			size_t pad_min = key_readable_pad <
+					group->speculative_leaf_readable_pad ?
+				key_readable_pad :
+				group->speculative_leaf_readable_pad;
 			if (ft_key_cmp_ordinals(orig_key, stored_key,
 					(unsigned int) key_len,
-					(unsigned int) both_readable,
+					(unsigned int) (key_len + pad_min),
 					false, NULL) != 0)
 				match = false;
 		}
@@ -6302,7 +6296,7 @@ end:
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_dc_sc(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
@@ -6310,7 +6304,7 @@ enum cds_ft_status do_cds_ft_lookup_dc_sc(struct cds_ft *ft,
 		struct cds_ft_node **tracking_match_node,
 		bool spec_validate)
 {
-	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_len,
+	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
 			spec_validate, true, true);
@@ -6318,7 +6312,7 @@ enum cds_ft_status do_cds_ft_lookup_dc_sc(struct cds_ft *ft,
 
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_dc_nosc(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
@@ -6326,7 +6320,7 @@ enum cds_ft_status do_cds_ft_lookup_dc_nosc(struct cds_ft *ft,
 		struct cds_ft_node **tracking_match_node,
 		bool spec_validate)
 {
-	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_len,
+	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
 			spec_validate, true, false);
@@ -6334,14 +6328,14 @@ enum cds_ft_status do_cds_ft_lookup_dc_nosc(struct cds_ft *ft,
 
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_nodc_sc(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
 		struct cds_ft_node **tracking_match_node)
 {
-	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_len,
+	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
 			false, false, true);
@@ -6349,14 +6343,14 @@ enum cds_ft_status do_cds_ft_lookup_nodc_sc(struct cds_ft *ft,
 
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_nodc_nosc(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
 		struct cds_ft_node **tracking_match_node)
 {
-	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_len,
+	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
 			false, false, false);
@@ -6382,7 +6376,7 @@ enum cds_ft_status do_cds_ft_lookup_nodc_nosc(struct cds_ft *ft,
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
@@ -6399,26 +6393,26 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 	if (descend_cand) {
 		if (skip_compressed)
-			return do_cds_ft_lookup_dc_sc(ft, key, _key_len, _key_readable_len,
+			return do_cds_ft_lookup_dc_sc(ft, key, _key_len, _key_readable_pad,
 					result_node, iter, tracking,
 					tracking_match_len, tracking_match_node,
 					spec_validate);
-		return do_cds_ft_lookup_dc_nosc(ft, key, _key_len, _key_readable_len,
+		return do_cds_ft_lookup_dc_nosc(ft, key, _key_len, _key_readable_pad,
 				result_node, iter, tracking,
 				tracking_match_len, tracking_match_node,
 				spec_validate);
 	}
 	if (skip_compressed)
-		return do_cds_ft_lookup_nodc_sc(ft, key, _key_len, _key_readable_len,
+		return do_cds_ft_lookup_nodc_sc(ft, key, _key_len, _key_readable_pad,
 				result_node, iter, tracking,
 				tracking_match_len, tracking_match_node);
-	return do_cds_ft_lookup_nodc_nosc(ft, key, _key_len, _key_readable_len,
+	return do_cds_ft_lookup_nodc_nosc(ft, key, _key_len, _key_readable_pad,
 			result_node, iter, tracking,
 			tracking_match_len, tracking_match_node);
 }
 
 enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
@@ -6427,27 +6421,10 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 
 	if (!valid_key_len(ft, key_len))
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	/*
-	 * @_key_readable_len == 0 or CDS_FT_LEN_DEFAULT means "no
-	 * over-read promised": resolve to the resolved @key_len.
-	 * Either sentinel keeps the caller conservative without
-	 * requiring them to repeat @key_len.
-	 */
-	if (_key_readable_len == 0 || _key_readable_len == CDS_FT_LEN_DEFAULT)
-		_key_readable_len = key_len;
-	/*
-	 * Contract: caller-promised readable region must cover the full
-	 * lookup key.  The library reads at minimum @key_len bytes from
-	 * @key during descent; a smaller readable horizon would be a
-	 * caller bug (over-read past the caller's actual buffer).  Reject
-	 * the call rather than silently clamping.
-	 */
-	if (_key_readable_len < key_len)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP_KEY(lookup_key_enter, ft, key, _key_len);
 	if (caa_likely(km->identity)) {
-		status = do_cds_ft_lookup(ft, key, key_len, _key_readable_len,
+		status = do_cds_ft_lookup(ft, key, key_len, _key_readable_pad,
 					result_node, NULL,
 					FT_PREFIX_TRACK_NONE, NULL, NULL, false);
 	} else {
@@ -6455,12 +6432,14 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 
 		ft_key_to_ordinals(ordinals, key, key_len, km);
 		/*
-		 * ordinals[] is a FT_MAX_KEY_LEN stack buffer; the entire
-		 * buffer is safely readable independent of caller's
-		 * @_key_readable_len.
+		 * ordinals[] is a FT_MAX_KEY_LEN stack buffer.  For
+		 * key_len <= 32 the buffer's tail provides far more than
+		 * FT_KEY_READABLE_PAD bytes past the key; for key_len > 32
+		 * the long-key dispatcher doesn't use the pad.  Either way
+		 * FT_KEY_READABLE_PAD is a safe promise.
 		 */
 		status = do_cds_ft_lookup(ft, ordinals, key_len,
-					FT_MAX_KEY_LEN, result_node, NULL,
+					FT_KEY_READABLE_PAD, result_node, NULL,
 					FT_PREFIX_TRACK_NONE, NULL, NULL, false);
 	}
 	FT_TP(lookup_key_exit, (int) status);
@@ -6481,19 +6460,13 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
  * at the end instead.
  */
 enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t _key_readable_len,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node)
 {
 	size_t key_len = ft_key_len(ft, _key_len);
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 
 	if (!valid_key_len(ft, key_len))
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	/* See cds_ft_lookup_key: 0 or CDS_FT_LEN_DEFAULT means "no over-read". */
-	if (_key_readable_len == 0 || _key_readable_len == CDS_FT_LEN_DEFAULT)
-		_key_readable_len = key_len;
-	/* See cds_ft_lookup_key: readable must cover the full lookup key. */
-	if (_key_readable_len < key_len)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	CDS_FT_SCOPED_READER(ft);
 	/*
@@ -6504,7 +6477,7 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 	 * maps are only set up for key_maps that reorder bytes.
 	 */
 	if (caa_likely(km->identity))
-		return do_cds_ft_lookup(ft, key, key_len, _key_readable_len,
+		return do_cds_ft_lookup(ft, key, key_len, _key_readable_pad,
 					result_node, NULL,
 					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
 	{
@@ -6512,7 +6485,7 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 
 		ft_key_to_ordinals(ordinals, key, key_len, km);
 		return do_cds_ft_lookup(ft, ordinals, key_len,
-					FT_MAX_KEY_LEN, result_node, NULL,
+					FT_KEY_READABLE_PAD, result_node, NULL,
 					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
 	}
 }
@@ -6524,7 +6497,7 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP_ITER_KEY(lookup_enter, iter);
-	status = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, iter->key_len + FT_KEY_READABLE_PAD, NULL, iter,
+	status = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, FT_KEY_READABLE_PAD, NULL, iter,
 				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
 	FT_TP(lookup_exit, (int) status);
 	return status;
@@ -6546,14 +6519,14 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 	}
 	CDS_FT_SCOPED_READER(ft);
 	if (caa_likely(km->identity)) {
-		do_cds_ft_lookup(ft, key, key_len, key_len, NULL, NULL,
+		do_cds_ft_lookup(ft, key, key_len, 0, NULL, NULL,
 				 FT_PREFIX_TRACK_PARTIAL, &partial_len,
 				 &partial_node, false);
 	} else {
 		uint8_t ordinals[FT_MAX_KEY_LEN];
 
 		ft_key_to_ordinals(ordinals, key, key_len, km);
-		do_cds_ft_lookup(ft, ordinals, key_len, key_len, NULL, NULL,
+		do_cds_ft_lookup(ft, ordinals, key_len, 0, NULL, NULL,
 				 FT_PREFIX_TRACK_PARTIAL, &partial_len,
 				 &partial_node, false);
 	}
@@ -6575,7 +6548,7 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 	 * backtracking) while simultaneously tracking the closest
 	 * ancestor with external nodes for partial-match semantics.
 	 */
-	do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, iter->key_len + FT_KEY_READABLE_PAD, NULL, iter,
+	do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, FT_KEY_READABLE_PAD, NULL, iter,
 			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node,
 			 false);
 
@@ -6607,14 +6580,14 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
 	}
 	CDS_FT_SCOPED_READER(ft);
 	if (caa_likely(km->identity)) {
-		ret = do_cds_ft_lookup(ft, key, key_len, key_len, NULL, NULL,
+		ret = do_cds_ft_lookup(ft, key, key_len, 0, NULL, NULL,
 				       FT_PREFIX_TRACK_LONGEST, &longest_len,
 				       &match_node, false);
 	} else {
 		uint8_t ordinals[FT_MAX_KEY_LEN];
 
 		ft_key_to_ordinals(ordinals, key, key_len, km);
-		ret = do_cds_ft_lookup(ft, ordinals, key_len, key_len, NULL, NULL,
+		ret = do_cds_ft_lookup(ft, ordinals, key_len, 0, NULL, NULL,
 				       FT_PREFIX_TRACK_LONGEST, &longest_len,
 				       &match_node, false);
 	}
@@ -6642,7 +6615,7 @@ enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 	enum cds_ft_status ret;
 
 	CDS_FT_SCOPED_READER(ft);
-	ret = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, iter->key_len + FT_KEY_READABLE_PAD, NULL, iter,
+	ret = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, FT_KEY_READABLE_PAD, NULL, iter,
 			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node,
 			       false);
 
@@ -14313,7 +14286,7 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 		struct cds_ft_group_attr *attr,
 		size_t key_offset,
 		size_t key_len_offset,
-		size_t leaf_readable_len)
+		size_t leaf_readable_pad)
 {
 	/*
 	 * Reject a non-NONE key_len_offset on a fixed-length-key group
@@ -14348,7 +14321,7 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
 	attr->speculative_validated = true;
 	attr->speculative_key_offset = key_offset;
 	attr->speculative_key_len_offset = key_len_offset;
-	attr->speculative_leaf_readable_len = leaf_readable_len;
+	attr->speculative_leaf_readable_pad = leaf_readable_pad;
 	return CDS_FT_STATUS_OK;
 }
 
@@ -14521,7 +14494,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->speculative_validated = attr->speculative_validated;
 		ft_group->speculative_key_offset = attr->speculative_key_offset;
 		ft_group->speculative_key_len_offset = attr->speculative_key_len_offset;
-		ft_group->speculative_leaf_readable_len = attr->speculative_leaf_readable_len;
+		ft_group->speculative_leaf_readable_pad = attr->speculative_leaf_readable_pad;
 	} else {
 		ft_group->key_map.identity = true;
 		ft_group->speculative_key_len_offset = CDS_FT_SPECULATIVE_OFFSET_NONE;
@@ -16078,8 +16051,8 @@ enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **re
 	/*
 	 * Tail pad of FT_KEY_READABLE_PAD bytes after the key buffer so
 	 * the descent can SIMD-load 32 bytes past key[key_len-1] without
-	 * faulting.  The iter-based lookup paths pass
-	 * @max_key_len + FT_KEY_READABLE_PAD as @key_readable_len.
+	 * faulting.  The iter-based lookup paths pass FT_KEY_READABLE_PAD
+	 * as @key_readable_pad (bytes safely loadable past key end).
 	 */
 	size_t key_size  = (max_key_len + FT_KEY_READABLE_PAD) * sizeof(uint8_t);
 	struct cds_ft_iter *iter = calloc(1, sizeof(*iter) + path_size + key_size);
