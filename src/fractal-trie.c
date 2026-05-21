@@ -2356,7 +2356,7 @@ struct cds_ft_compressed_node *alloc_compressed_node(struct cds_ft *ft,
 	void *p;
 	unsigned int order = ft_compressed_order(path_len);
 
-	metadata = cds_ft_alloc_item(ft, order, false);
+	metadata = cds_ft_alloc_compressed_item(ft, order);
 	if (!metadata)
 		return NULL;
 	p = cds_ft_metadata_to_item(metadata);

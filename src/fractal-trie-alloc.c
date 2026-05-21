@@ -422,9 +422,12 @@ room_left:
 	return &item->metadata;
 }
 
-struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order, bool bitmap)
+static
+struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
+		struct cds_ft_alloc_arena **arena_p,
+		const char *arena_name,
+		size_t item_len_order, bool bitmap)
 {
-	struct cds_ft_alloc_arena **arena_p;
 	struct cds_ft_alloc_arena *arena;
 
 	if (!cds_ft_page_size)
@@ -433,13 +436,12 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 		errno = EINVAL;
 		return NULL;
 	}
-	arena_p = &ft->group->arena_order[item_len_order];
 	arena = uatomic_load(arena_p, CMM_ACQUIRE);
 	if (caa_unlikely(!arena)) {
 		pthread_mutex_lock(&ft->group->arena_lock);
 		arena = *arena_p;
 		if (!arena) {
-			arena = cds_ft_arena_create(ft->group, "cds_ft_alloc", item_len_order, bitmap);
+			arena = cds_ft_arena_create(ft->group, arena_name, item_len_order, bitmap);
 			if (!arena) {
 				pthread_mutex_unlock(&ft->group->arena_lock);
 				return NULL;
@@ -449,6 +451,38 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 		pthread_mutex_unlock(&ft->group->arena_lock);
 	}
 	return cds_ft_arena_alloc(arena);
+}
+
+struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order, bool bitmap)
+{
+	return cds_ft_alloc_item_from(ft,
+		&ft->group->arena_order[item_len_order],
+		"cds_ft_alloc", item_len_order, bitmap);
+}
+
+/*
+ * Compressed-node allocation for skip-compressed groups: routes to a
+ * separate arena set so compressed-node pages don't share allocator
+ * pages with the internal nodes that ARE on the cand-mode descent
+ * hot path.  Cold for lookup in skip-compressed groups; the descent
+ * never reads compressed-node bodies, only the skip_len high bits.
+ *
+ * Non-speculative groups can still use this entry point but get the
+ * same single-arena-set behavior as cds_ft_alloc_item (caller routes).
+ */
+__attribute__((visibility("hidden")))
+struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft,
+		size_t item_len_order)
+{
+	struct cds_ft_alloc_arena **arena_p;
+
+	if (ft->group->speculative)
+		arena_p = &ft->group->compressed_arena_order[item_len_order];
+	else
+		arena_p = &ft->group->arena_order[item_len_order];
+	return cds_ft_alloc_item_from(ft, arena_p,
+		ft->group->speculative ? "cds_ft_alloc_compressed" : "cds_ft_alloc",
+		item_len_order, false);
 }
 
 /*
@@ -573,10 +607,14 @@ void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
 	int i;
 
 	for (i = 0; i <= FT_ALLOC_ORDER_MAX; i++) {
-		if (!ft_group->arena_order[i])
-			continue;
-		cds_ft_arena_destroy(ft_group->arena_order[i]);
-		ft_group->arena_order[i] = NULL;
+		if (ft_group->arena_order[i]) {
+			cds_ft_arena_destroy(ft_group->arena_order[i]);
+			ft_group->arena_order[i] = NULL;
+		}
+		if (ft_group->compressed_arena_order[i]) {
+			cds_ft_arena_destroy(ft_group->compressed_arena_order[i]);
+			ft_group->compressed_arena_order[i] = NULL;
+		}
 	}
 }
 

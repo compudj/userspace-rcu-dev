@@ -511,6 +511,19 @@ struct cds_ft_group {
 	const struct rcu_flavor_struct *flavor;
 	/* Allocation arenas. */
 	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
+	/*
+	 * Separate arena set for compressed nodes in skip-compressed
+	 * groups (speculative=true).  Cand-mode descent never reads
+	 * compressed-node bodies (skip-encoded pointers carry skip_len
+	 * in the high bits and the descent jumps past the compressed
+	 * key bytes), so compressed-node pages would otherwise pollute
+	 * the same allocator pages as the internal nodes that ARE on
+	 * the descent hot path.  Routing compressed allocations to a
+	 * dedicated arena keeps them off the descent's I/D-cache and
+	 * TLB working set.  NULL slots fall back to arena_order[] for
+	 * groups where speculative is false.
+	 */
+	struct cds_ft_alloc_arena *compressed_arena_order[FT_ALLOC_ORDER_MAX + 1];
 	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
@@ -868,6 +881,16 @@ void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata);
 
 __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_order, bool bitmap);
+
+/*
+ * Same as cds_ft_alloc_item but routes to the per-group compressed-
+ * node arena set when the group is speculative (skip-compressed).
+ * Compressed-node pages are off the descent hot path in that mode,
+ * so keeping them out of the internal-node arenas reduces I-cache /
+ * D-cache / TLB interference for cand-mode lookups.
+ */
+__attribute__((visibility("hidden")))
+struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft, size_t item_len_order);
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
