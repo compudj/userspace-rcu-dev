@@ -6078,14 +6078,19 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		/*
 		 * Merged post-step handler for non-internal results.
 		 * Bundles what was a loop-top !internal slow path with
-		 * the separate post-step external check.  Compressed
-		 * reachable only in non-cand mode (cand mode's skip
-		 * handler above resolves skip → underlying internal/
-		 * external).
+		 * the separate post-step external check.
+		 *
+		 * Compressed reachable in non-cand mode and also in
+		 * cand mode for compressed paths longer than
+		 * FT_SKIP_LEN_MAX: those keep the regular compressed
+		 * pointer (skip-pointer length encoding wouldn't fit),
+		 * so the slot does not carry a skip pointer and the
+		 * pre-step skip handler above didn't resolve it.
+		 * ft_lookup_compressed(candidate=true) advances past
+		 * the compressed path without comparison.
 		 */
 		if (caa_unlikely(!ft_node_internal(node_flag))) {
-			if (!descend_cand &&
-			    caa_unlikely(ft_node_compressed(node_flag))) {
+			if (caa_unlikely(ft_node_compressed(node_flag))) {
 				enum ft_descent_action act;
 
 				/*
