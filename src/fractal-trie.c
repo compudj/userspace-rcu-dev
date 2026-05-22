@@ -6542,7 +6542,7 @@ enum cds_ft_status ft_lookup_cand_nosc(struct cds_ft *ft,
  * cds_ft_group_attr_set_key_map) so the extra dispatch hop is
  * not worth specializing further.
  */
-static
+static __attribute__((cold))
 enum cds_ft_status ft_lookup_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		size_t key_readable_pad,
@@ -6567,7 +6567,7 @@ enum cds_ft_status ft_lookup_key_nonidentity(struct cds_ft *ft,
 	return status;
 }
 
-static
+static __attribute__((cold))
 enum cds_ft_status ft_lookup_candidate_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		size_t key_readable_pad,
@@ -6848,7 +6848,7 @@ enum cds_ft_status ft_lookup_partial_key_nosc(struct cds_ft *ft,
  * rare; ordinals[] is allocated on stack inside this fn so
  * call/return overhead is acceptable.
  */
-static
+static __attribute__((cold))
 enum cds_ft_status ft_lookup_partial_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
@@ -6998,7 +6998,7 @@ enum cds_ft_status ft_lookup_longest_match_key_nosc(struct cds_ft *ft,
 			match_node, match_len, result_node);
 }
 
-static
+static __attribute__((cold))
 enum cds_ft_status ft_lookup_longest_match_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
