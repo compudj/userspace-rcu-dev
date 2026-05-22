@@ -129,9 +129,6 @@ struct cds_ft_group_attr {
 	struct cds_ft_key_map key_map;
 	unsigned int flags;
 	bool speculative;
-	bool speculative_validated;
-	size_t speculative_key_offset;
-	size_t speculative_leaf_readable_pad;
 };
 
 struct cds_ft_attr {
@@ -5808,13 +5805,6 @@ enum ft_descent_action ft_traverse_compressed(
  *   - post-get_nth skip-compressed resolution (line 5719 area)
  * Eliminates the per-iter `test %sil, %sil` hot spot identified via
  * perf annotate.
- *
- * @spec_validate stays runtime (passed through the dispatcher); it
- * only gates the at-end leaf verify, a single conditional outside the
- * loop.
- *
- * @candidate is gone — the dispatcher computes spec_validate and
- * descend_cand from it once and passes the results in.
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
@@ -5824,7 +5814,6 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
 		struct cds_ft_node **tracking_match_node,
-		bool spec_validate,
 		bool descend_cand,
 		bool skip_compressed)
 {
@@ -6212,62 +6201,6 @@ terminal:
 end:
 	/* Bring @iter back into a register for the epilogue writes. */
 	FT_RELOAD_FROM_STACK(iter);
-	/*
-	 * Speculative-validated lookup: when the group enables library-
-	 * side validation and the descent ran in cand mode (spec_validate
-	 * implies descend_cand was set internally), verify the candidate
-	 * found at the leaf against the user's stored key bytes via the
-	 * inline SIMD/SWAR comparator before reporting success.  A
-	 * mismatch — caused by a wrong descent through a multi-byte
-	 * compressed prefix that the cand-mode descent did not
-	 * verify — is reported as NOT_FOUND.
-	 */
-	if (spec_validate && status == CDS_FT_STATUS_OK && found) {
-		/*
-		 * Read the three hot-path spec_validate attrs from ft->spec
-		 * (one cache line, shared with @root and @group which the
-		 * descent already loaded — saves the pointer chase through
-		 * ft->group and the dependent loads from the group's
-		 * separate CL).
-		 *
-		 * stored_len is NOT loaded here.  The cand-mode descent
-		 * already guarantees the leaf reached has stored_len ==
-		 * @key_len: a leaf inserted at depth L is only reachable
-		 * via a descent that consumed L input bytes (the
-		 * skip-compressed length-vs-remaining check enforces
-		 * this).  Loading + comparing stored_len would be a
-		 * dependent-load chain on the same CL as stored_key,
-		 * blocking the SIMD compare for no semantic gain.  The
-		 * byte compare below still catches the cand-mode
-		 * "wrong compressed path" case (the byte values
-		 * mismatch even if the depths agree).
-		 */
-		const uint8_t *stored_key =
-			(const uint8_t *) found + ft->spec.key_offset;
-		bool match = true;
-
-		if (key_len > 0) {
-			/*
-			 * @key_readable_pad and @ft->spec.leaf_readable_pad
-			 * both express "bytes safely loadable past
-			 * stored_key + key_len".  Min of the two is the
-			 * over-read budget both sides honour; total
-			 * readable horizon for the SIMD compare is
-			 * key_len + that min.
-			 */
-			size_t pad_min = key_readable_pad < ft->spec.leaf_readable_pad
-				? key_readable_pad : ft->spec.leaf_readable_pad;
-			if (ft_key_cmp_ordinals(orig_key, stored_key,
-					(unsigned int) key_len,
-					(unsigned int) (key_len + pad_min),
-					false, NULL) != 0)
-				match = false;
-		}
-		if (!match) {
-			found = NULL;
-			status = CDS_FT_STATUS_NOT_FOUND;
-		}
-	}
 	if (result_node)
 		*result_node = found;
 	if (iter) {
@@ -6307,13 +6240,12 @@ enum cds_ft_status do_cds_ft_lookup_dc_sc(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
-		struct cds_ft_node **tracking_match_node,
-		bool spec_validate)
+		struct cds_ft_node **tracking_match_node)
 {
 	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
-			spec_validate, true, true);
+			true, true);
 }
 
 static inline_lookup
@@ -6323,13 +6255,12 @@ enum cds_ft_status do_cds_ft_lookup_dc_nosc(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
-		struct cds_ft_node **tracking_match_node,
-		bool spec_validate)
+		struct cds_ft_node **tracking_match_node)
 {
 	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
-			spec_validate, true, false);
+			true, false);
 }
 
 static inline_lookup
@@ -6344,7 +6275,7 @@ enum cds_ft_status do_cds_ft_lookup_nodc_sc(struct cds_ft *ft,
 	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
-			false, false, true);
+			false, true);
 }
 
 static inline_lookup
@@ -6359,7 +6290,7 @@ enum cds_ft_status do_cds_ft_lookup_nodc_nosc(struct cds_ft *ft,
 	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
-			false, false, false);
+			false, false);
 }
 
 /*
@@ -6368,17 +6299,7 @@ enum cds_ft_status do_cds_ft_lookup_nodc_nosc(struct cds_ft *ft,
  * candidate that must be verified by the caller against their
  * stored key.  Constant-folded at each call site.
  *
- * When the group enables speculative_validated and the caller did
- * not request candidate semantics, descend with cand-mode anyway and
- * validate the result against the external node's stored key before
- * returning.  Limited to equality lookups (tracking == NONE) and
- * identity key_map (the user's stored key matches the trie's byte
- * order without reverse-mapping).
- *
- * 4-way dispatch on (descend_cand, skip_compressed).  descend_cand=false
- * implies spec_validate=false (per its definition), so the nodc wrappers
- * skip the spec_validate argument entirely — their leaf-verify branch
- * is dead-code-eliminated.
+ * 4-way dispatch on (descend_cand, skip_compressed).
  */
 static inline_lookup
 enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
@@ -6390,23 +6311,16 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 		struct cds_ft_node **tracking_match_node,
 		bool candidate)
 {
-	bool spec_validate = !candidate
-			&& ft->group->speculative_validated
-			&& ft->group->key_map.identity
-			&& tracking == FT_PREFIX_TRACK_NONE;
-	bool descend_cand = candidate || spec_validate;
 	bool skip_compressed = ft_group_skip_compressed(ft->group);
 
-	if (descend_cand) {
+	if (candidate) {
 		if (skip_compressed)
 			return do_cds_ft_lookup_dc_sc(ft, key, _key_len, _key_readable_pad,
 					result_node, iter, tracking,
-					tracking_match_len, tracking_match_node,
-					spec_validate);
+					tracking_match_len, tracking_match_node);
 		return do_cds_ft_lookup_dc_nosc(ft, key, _key_len, _key_readable_pad,
 				result_node, iter, tracking,
-				tracking_match_len, tracking_match_node,
-				spec_validate);
+				tracking_match_len, tracking_match_node);
 	}
 	if (skip_compressed)
 		return do_cds_ft_lookup_nodc_sc(ft, key, _key_len, _key_readable_pad,
@@ -6472,8 +6386,8 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 
 /*
  * Specialized lookup_key/lookup_candidate_key inner functions.
- * Each bakes the (descend_cand, skip_compressed, spec_validate)
- * triple into a literal-arg call to the matching always_inline
+ * Each bakes the (descend_cand, skip_compressed) pair into a
+ * literal-arg call to the matching always_inline
  * wrapper — the wrapper then inlines into the inner with all
  * per-iter branches on those constants folded out.  Each is
  * referenced via the function pointers installed on struct cds_ft
@@ -6487,42 +6401,6 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
  * below, which carry a FT_MAX_KEY_LEN stack buffer.
  */
 static FT_LOOKUP_FAST_PATH("lookup_key")
-enum cds_ft_status ft_lookup_specv_sc(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len, size_t key_readable_pad,
-		struct cds_ft_node **result_node)
-{
-	enum cds_ft_status status;
-	key_len = ft_key_len(ft, key_len);
-	if (!valid_key_len(ft, key_len))
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	CDS_FT_SCOPED_READER(ft);
-	FT_TP_KEY(lookup_key_enter, ft, key, key_len);
-	status = do_cds_ft_lookup_dc_sc(ft, key, key_len, key_readable_pad,
-			result_node, NULL,
-			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
-	FT_TP(lookup_key_exit, (int) status);
-	return status;
-}
-
-static FT_LOOKUP_SLOW_PATH("lookup_key")
-enum cds_ft_status ft_lookup_specv_nosc(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len, size_t key_readable_pad,
-		struct cds_ft_node **result_node)
-{
-	enum cds_ft_status status;
-	key_len = ft_key_len(ft, key_len);
-	if (!valid_key_len(ft, key_len))
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	CDS_FT_SCOPED_READER(ft);
-	FT_TP_KEY(lookup_key_enter, ft, key, key_len);
-	status = do_cds_ft_lookup_dc_nosc(ft, key, key_len, key_readable_pad,
-			result_node, NULL,
-			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
-	FT_TP(lookup_key_exit, (int) status);
-	return status;
-}
-
-static FT_LOOKUP_SLOW_PATH("lookup_key")
 enum cds_ft_status ft_lookup_precise_sc(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node)
@@ -6569,7 +6447,7 @@ enum cds_ft_status ft_lookup_cand_sc(struct cds_ft *ft,
 	CDS_FT_SCOPED_READER(ft);
 	return do_cds_ft_lookup_dc_sc(ft, key, key_len, key_readable_pad,
 			result_node, NULL,
-			FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+			FT_PREFIX_TRACK_NONE, NULL, NULL);
 }
 
 static FT_LOOKUP_SLOW_PATH("lookup_candidate_key")
@@ -6583,14 +6461,14 @@ enum cds_ft_status ft_lookup_cand_nosc(struct cds_ft *ft,
 	CDS_FT_SCOPED_READER(ft);
 	return do_cds_ft_lookup_dc_nosc(ft, key, key_len, key_readable_pad,
 			result_node, NULL,
-			FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+			FT_PREFIX_TRACK_NONE, NULL, NULL);
 }
 
 /*
  * Non-identity key_map fallback (key + candidate variants).
  * Allocates a FT_MAX_KEY_LEN stack buffer for the ordinals[]
- * remap and routes through do_cds_ft_lookup, which re-derives
- * (spec_validate, descend_cand) from group state at runtime.
+ * remap and routes through do_cds_ft_lookup, which re-derives the
+ * descend_cand path from group state at runtime.
  * Non-identity maps are rare (only set via
  * cds_ft_group_attr_set_key_map) so the extra dispatch hop is
  * not worth specializing further.
@@ -6643,15 +6521,10 @@ enum cds_ft_status ft_lookup_candidate_key_nonidentity(struct cds_ft *ft,
  * Install per-API lookup function pointers on @ft based on group
  * flags.  Called once at cds_ft_create.  Pointers are stable for
  * the trie's lifetime because the group flags (key_map.identity,
- * speculative_validated, CDS_FT_FLAG_SKIP_COMPRESSED) are immutable
- * after group creation.
+ * CDS_FT_FLAG_SKIP_COMPRESSED) are immutable after group creation.
  */
 /* Forward decls for ft_install_lookup_ops — definitions follow
  * after cds_ft_lookup_candidate_key. */
-static enum cds_ft_status ft_lookup_iter_specv_sc(struct cds_ft *,
-		struct cds_ft_iter *);
-static enum cds_ft_status ft_lookup_iter_specv_nosc(struct cds_ft *,
-		struct cds_ft_iter *);
 static enum cds_ft_status ft_lookup_iter_precise_sc(struct cds_ft *,
 		struct cds_ft_iter *);
 static enum cds_ft_status ft_lookup_iter_precise_nosc(struct cds_ft *,
@@ -6687,21 +6560,13 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 	 * Iter-form lookup_iter_fn: iter always carries ordinals-mapped
 	 * key bytes (see cds_ft_iter_set_key), so the non-identity key_map
 	 * case is handled at iter-set time and the lookup-time inner only
-	 * needs (descend_cand, skip_compressed, spec_validate)
-	 * specialization.
+	 * needs (skip_compressed) specialization.
 	 */
-	if (group->speculative_validated) {
-		ft->lookup_iter_fn = sc
-			? ft_lookup_iter_specv_sc : ft_lookup_iter_specv_nosc;
-	} else {
-		ft->lookup_iter_fn = sc
-			? ft_lookup_iter_precise_sc : ft_lookup_iter_precise_nosc;
-	}
+	ft->lookup_iter_fn = sc
+		? ft_lookup_iter_precise_sc : ft_lookup_iter_precise_nosc;
 	/*
-	 * Partial-match (tracking=PARTIAL) is always precise descent —
-	 * spec_validate does not apply (no leaf compare on partial
-	 * matches).  Iter form has no non-identity issue (iter holds
-	 * ordinals already).
+	 * Partial-match (tracking=PARTIAL) is precise descent.  Iter form
+	 * has no non-identity issue (iter holds ordinals already).
 	 */
 	ft->lookup_partial_iter_fn = sc
 		? ft_lookup_partial_iter_sc : ft_lookup_partial_iter_nosc;
@@ -6719,13 +6584,8 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 		ft->lookup_longest_match_key_fn = ft_lookup_longest_match_key_nonidentity;
 		return;
 	}
-	if (group->speculative_validated) {
-		ft->lookup_key_fn = sc
-			? ft_lookup_specv_sc : ft_lookup_specv_nosc;
-	} else {
-		ft->lookup_key_fn = sc
-			? ft_lookup_precise_sc : ft_lookup_precise_nosc;
-	}
+	ft->lookup_key_fn = sc
+		? ft_lookup_precise_sc : ft_lookup_precise_nosc;
 	ft->lookup_candidate_key_fn = sc
 		? ft_lookup_cand_sc : ft_lookup_cand_nosc;
 	ft->lookup_partial_key_fn = sc
@@ -6781,40 +6641,12 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
  * Specialized iter-form lookup inners.  iter is always non-NULL on
  * this path (path tracking is the whole point of the iter API), so
  * each inner bakes that into the wrapper call along with the
- * (descend_cand, skip_compressed, spec_validate) triple.  iter
- * already holds ordinals-mapped key bytes (see cds_ft_iter_set_key:
- * non-identity key_map remapping happens at iter-set time, not at
- * lookup time), so there is no non-identity branch on this path.
+ * (descend_cand, skip_compressed) pair.  iter already holds
+ * ordinals-mapped key bytes (see cds_ft_iter_set_key: non-identity
+ * key_map remapping happens at iter-set time, not at lookup time),
+ * so there is no non-identity branch on this path.
  */
 static FT_LOOKUP_FAST_PATH("lookup")
-enum cds_ft_status ft_lookup_iter_specv_sc(struct cds_ft *ft,
-		struct cds_ft_iter *iter)
-{
-	enum cds_ft_status status;
-	CDS_FT_SCOPED_READER(ft);
-	FT_TP_ITER_KEY(lookup_enter, iter);
-	status = do_cds_ft_lookup_dc_sc(ft, iter_key(iter), iter->key_len,
-			FT_KEY_READABLE_PAD, NULL, iter,
-			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
-	FT_TP(lookup_exit, (int) status);
-	return status;
-}
-
-static FT_LOOKUP_SLOW_PATH("lookup")
-enum cds_ft_status ft_lookup_iter_specv_nosc(struct cds_ft *ft,
-		struct cds_ft_iter *iter)
-{
-	enum cds_ft_status status;
-	CDS_FT_SCOPED_READER(ft);
-	FT_TP_ITER_KEY(lookup_enter, iter);
-	status = do_cds_ft_lookup_dc_nosc(ft, iter_key(iter), iter->key_len,
-			FT_KEY_READABLE_PAD, NULL, iter,
-			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
-	FT_TP(lookup_exit, (int) status);
-	return status;
-}
-
-static FT_LOOKUP_SLOW_PATH("lookup")
 enum cds_ft_status ft_lookup_iter_precise_sc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -6851,8 +6683,8 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 
 /*
  * Specialized partial_key inners (tracking=PARTIAL, identity key_map).
- * Always precise descent (descend_cand=false, spec_validate=false)
- * because partial-match needs per-step compressed verification.
+ * Always precise descent (descend_cand=false) because partial-match
+ * needs per-step compressed verification.
  */
 static FT_LOOKUP_FAST_PATH("lookup_partial_key")
 enum cds_ft_status ft_lookup_partial_key_sc(struct cds_ft *ft,
@@ -14799,42 +14631,6 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
 #endif
 }
 
-enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
-		struct cds_ft_group_attr *attr,
-		size_t key_offset,
-		size_t leaf_readable_pad)
-{
-	/*
-	 * The library packs the two offsets into uint16_t fields on the
-	 * trie struct for hot-path single-load access.  Anything that
-	 * doesn't fit a u16 is rejected here.  Realistic leaf structs
-	 * are well below 64 KiB so the cap is generous.
-	 */
-	if (key_offset > UINT16_MAX)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (leaf_readable_pad > UINT16_MAX)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	/*
-	 * Opportunistically enable skip-compressed pointer encoding when
-	 * available — it stacks with library-side validation to also
-	 * avoid the compressed-node cache-line load.  Tolerate
-	 * NOT_SUPPORTED here: validated speculative descent is still
-	 * profitable without skip-compressed (cand-mode descent skips
-	 * the compressed byte verify, and the leaf compare uses the
-	 * inline SIMD/SWAR comparator).
-	 */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	if (ft_skip_compressed_validate()) {
-		attr->speculative = true;
-		attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
-	}
-#endif
-	attr->speculative_validated = true;
-	attr->speculative_key_offset = key_offset;
-	attr->speculative_leaf_readable_pad = leaf_readable_pad;
-	return CDS_FT_STATUS_OK;
-}
-
 enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 {
 	struct cds_ft_attr *attr = calloc(1, sizeof(struct cds_ft_attr));
@@ -15001,9 +14797,6 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->key_map = attr->key_map;
 		ft_group->flags = attr->flags;
 		ft_group->speculative = attr->speculative;
-		ft_group->speculative_validated = attr->speculative_validated;
-		ft_group->speculative_key_offset = attr->speculative_key_offset;
-		ft_group->speculative_leaf_readable_pad = attr->speculative_leaf_readable_pad;
 	} else {
 		ft_group->key_map.identity = true;
 	}
@@ -15038,18 +14831,6 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->group = ft_group;
-	/*
-	 * Cache the spec_validate attrs in the trie struct itself so
-	 * the lookup hot path can fetch both offsets + the "validated"
-	 * flag from one cache line (shared with @root and @group,
-	 * already loaded by the descent).  See struct
-	 * cds_ft_speculative_attrs in fractal-trie-internal.h.  Range
-	 * checks at the setter (cds_ft_group_attr_set_speculative_validated)
-	 * guarantee these fit in u16.
-	 */
-	ft->spec.key_offset = (uint16_t) ft_group->speculative_key_offset;
-	ft->spec.leaf_readable_pad = (uint16_t) ft_group->speculative_leaf_readable_pad;
-	ft->spec.validated = ft_group->speculative_validated ? 1 : 0;
 	ft_install_lookup_ops(ft);
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
@@ -15316,14 +15097,11 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
  *   - No node may appear twice (cycle / aliasing across chains).  We
  *     reuse @visited so a node accidentally referenced from a second
  *     chain elsewhere in the trie is also caught.
- *   - When @path is non-NULL (path verification is enabled), every
- *     chain entry's stored key (at group->speculative_key_offset) is
- *     compared byte-for-byte against @path[0..@depth-1].  This is the
- *     end-to-end path/key consistency check: it catches a corrupted
- *     cn->key_bytes write or a wrong child-slot byte that would
- *     otherwise be silent under speculative-validated lookup (since
- *     the descent skips per-step key comparison and only the leaf
- *     compare at the lookup tail would notice).
+ *   - @path is currently always NULL.  Historical end-to-end
+ *     path/key consistency relied on a group-known stored-key
+ *     offset, which is no longer tracked at group level — callers
+ *     now provide @key_offset per-call via
+ *     cds_ft_speculative_lookup_key.
  *
  * Returns 0 on success, -1 on first violation.  No-op when @head is
  * NULL.
@@ -15383,17 +15161,9 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 						"non-head should point to predecessor");
 			return -1;
 		}
-		if (check_path) {
-			const uint8_t *stored_key = (const uint8_t *) node +
-					group->speculative_key_offset;
-
-			if (depth > 0 && memcmp(stored_key, path, depth) != 0) {
-				if (out)
-					fprintf(out, "ft_verify: depth %u: external node %p stored key bytes diverge from trie path\n",
-						depth, node);
-				return -1;
-			}
-		}
+		(void) check_path;
+		(void) path;
+		(void) group;
 		prev = node;
 		node = node->next;
 	}
@@ -15965,8 +15735,7 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	struct cds_ft_inode_flag *root = ft->root;
 	unsigned long root_nr_keys = 0;
 	struct ft_visited_set visited;
-	uint8_t path_buf[FT_MAX_KEY_LEN];
-	uint8_t *path;
+	uint8_t *path = NULL;
 	int ret;
 
 	if (ft_visited_init(&visited)) {
@@ -15975,24 +15744,13 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
 	}
 	/*
-	 * End-to-end path/key consistency (invariant 10) is only
-	 * meaningful when the group is configured for speculative
-	 * validation: in that mode the user's leaf node carries an
-	 * addressable copy of the inserted key at
-	 * group->speculative_key_offset, in ordinal space (key_map
-	 * identity is the gating condition the spec_validate lookup
-	 * itself enforces — non-identity maps would require a per-byte
-	 * conversion of the path at compare time, which we skip).
-	 *
-	 * When enabled, the path buffer is filled in during descent and
-	 * compared at each external leaf in ft_verify_external_chain.
-	 * When disabled, leave path = NULL and all path-tracking writes
-	 * / compares short-circuit.
+	 * End-to-end path/key consistency (invariant 10) requires an
+	 * addressable copy of the inserted key at a group-known offset
+	 * on each leaf, which the library no longer tracks (the user
+	 * provides @key_offset per-call via cds_ft_speculative_lookup_key).
+	 * Pass path = NULL so all path-tracking writes / compares
+	 * short-circuit.
 	 */
-	if (ft->group->speculative_validated && ft->group->key_map.identity)
-		path = path_buf;
-	else
-		path = NULL;
 	ret = ft_verify_node_recursive(ft, out, &visited, path, root, NULL, 0,
 			&root_nr_keys);
 	ft_visited_destroy(&visited);

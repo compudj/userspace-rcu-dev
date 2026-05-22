@@ -63,10 +63,9 @@
 /*
  * Internal group flag: skip-compressed pointer encoding.
  *
- * Bit set in struct cds_ft_group::flags when the speculative-mode
- * setters (cds_ft_group_attr_set_speculative /
- * cds_ft_group_attr_set_speculative_validated) opportunistically
- * enable the skip-compressed encoding.  Not part of the public API.
+ * Bit set in struct cds_ft_group::flags when
+ * cds_ft_group_attr_set_speculative opportunistically enables the
+ * skip-compressed encoding.  Not part of the public API.
  */
 #define CDS_FT_FLAG_SKIP_COMPRESSED	(1U << 0)
 
@@ -538,59 +537,12 @@ struct cds_ft_group {
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
 
 	/*
-	 * Speculative-descent and library-side validation attributes.
 	 * @speculative: enable cand-mode descent and (when supported)
 	 *   skip-compressed pointer encoding for this group's tries.
-	 * @speculative_validated: implies @speculative; in addition,
-	 *   non-candidate lookups (cds_ft_eager_lookup_key, iterator-based
-	 *   cds_ft_lookup) descend speculatively and validate the result
-	 *   against the external node's stored key bytes via the inline
-	 *   SIMD/SWAR comparator before returning.
-	 * @speculative_key_offset: byte offset from the external node's
-	 *   address to the start of the stored key.  Used only when
-	 *   @speculative_validated is true.
-	 * @speculative_leaf_readable_pad: app-promised bytes safely
-	 *   loadable PAST stored_key[stored_key_len-1].  0 for "no
-	 *   over-read promised".  Used by the spec_validate leaf compare
-	 *   to pick the widest unmasked SIMD load.
 	 */
 	bool speculative;
-	bool speculative_validated;
-	size_t speculative_key_offset;
-	size_t speculative_leaf_readable_pad;
 };
 
-
-/*
- * Spec_validate attrs packed into 8 bytes, copied from the group
- * at trie creation and re-read on every cds_ft_eager_lookup_key call.
- * Lives in struct cds_ft (next to @root) so the descent's existing
- * load of @ft picks the line up; the spec_validate compare block
- * then gets both attrs from one CL load instead of dependent loads
- * through @ft->group's separate CL.
- *
- * Field semantics match the public-API attrs documented at
- * cds_ft_group_attr_set_speculative_validated:
- *  - key_offset: byte offset from external node base to stored
- *    key.  Max 65535.
- *  - leaf_readable_pad: bytes safely loadable past
- *    stored_key[stored_key_len-1].
- *  - validated: 1 if cds_ft_eager_lookup_key should run spec_validate.
- *
- * The stored key length is intentionally NOT cached or read: a
- * candidate/speculative descent only terminates at a leaf when the
- * total bytes consumed equals @key_len, and a leaf inserted at depth
- * L has stored_key_len == L by construction.  Loading stored_key_len
- * would be a dependent-load chain on the same CL as stored_key,
- * blocking the SIMD compare for no semantic gain — the byte compare
- * already catches the cand-mode "wrong compressed path" case.
- */
-struct cds_ft_speculative_attrs {
-	uint16_t key_offset;
-	uint16_t leaf_readable_pad;
-	uint8_t validated;
-	uint8_t _reserved[3];
-};
 
 /*
  * Per-API lookup function pointers cached on struct cds_ft so the
@@ -601,11 +553,10 @@ struct cds_ft_speculative_attrs {
  *
  * Each pointer's signature matches the corresponding cds_ft_*
  * public API.  The pointer is stable for the lifetime of the trie:
- * group flags (key_map.identity, speculative_validated, the
- * CDS_FT_FLAG_SKIP_COMPRESSED bit) are immutable after group
- * creation, so a single load + indirect jmp on the hot path is all
- * the dispatch cost vs the ~22 ns regression seen from runtime-
- * gated dispatch (see [[ft-lookup-inline-keep]]).
+ * group flags (key_map.identity, CDS_FT_FLAG_SKIP_COMPRESSED bit) are
+ * immutable after group creation, so a single load + indirect jmp on
+ * the hot path is all the dispatch cost vs the ~22 ns regression seen
+ * from runtime-gated dispatch (see [[ft-lookup-inline-keep]]).
  */
 struct cds_ft;
 struct cds_ft_node;
@@ -630,13 +581,12 @@ struct cds_ft {
 	struct cds_ft_group *group;
 
 	struct cds_ft_inode_flag *root;		/* Root node (arena-allocated, always present, always internal). */
-	struct cds_ft_speculative_attrs spec;	/* Cached spec_validate attrs (read on lookup hot path). */
 
 	/*
 	 * Specialized lookup dispatch pointers — installed at
 	 * cds_ft_create based on group flags.  See the typedef
-	 * comment above.  Placed near @root and @spec so a single
-	 * cache-line fetch on lookup entry serves the descent.
+	 * comment above.  Placed near @root so a single cache-line
+	 * fetch on lookup entry serves the descent.
 	 */
 	cds_ft_lookup_key_fn lookup_key_fn;
 	cds_ft_lookup_key_fn lookup_candidate_key_fn;

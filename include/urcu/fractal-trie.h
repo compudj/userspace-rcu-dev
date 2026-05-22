@@ -462,8 +462,8 @@ void cds_ft_node_init(struct cds_ft_node *node)
 /*
  * External-node arena: bump-allocator with end-of-zone over-read
  * safety, suitable for embedding application leaf structures (those
- * containing a struct cds_ft_node) when the trie group declares a
- * @leaf_readable_pad > 0 via cds_ft_group_attr_set_speculative_validated.
+ * containing a struct cds_ft_node) when the caller needs a trailing
+ * readable pad past stored keys for SIMD-friendly comparison.
  *
  * Pattern: app embeds struct cds_ft_node in its own leaf struct,
  * allocates each leaf from this arena via cds_ft_external_arena_alloc,
@@ -1912,85 +1912,26 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  *
  * Effect on the public lookup APIs:
  *
- *   cds_ft_lookup_candidate_key gets the full speedup — cand-mode
- *   descent plus bypassing compressed nodes via the skip-compressed
- *   pointer encoding.  This is the primary use case for the
- *   attribute on its own.
+ *   cds_ft_lookup_candidate_key and cds_ft_speculative_lookup_key get
+ *   the full speedup — cand-mode descent plus bypassing compressed
+ *   nodes via the skip-compressed pointer encoding.
  *
- *   cds_ft_eager_lookup_key continues to return precise (verified) results
- *   and the caller does not need to perform any additional
- *   validation.  Without library-side validation offsets (see
- *   cds_ft_group_attr_set_speculative_validated) the descent for
- *   cds_ft_eager_lookup_key remains precise.  Setting only this attribute
- *   adds slight overhead on the cds_ft_eager_lookup_key path: the parent's
- *   slot holds a skip-encoded pointer (length plus child address)
- *   rather than a direct pointer to the compressed node, so the
- *   precise descent must derive the compressed node's address from
- *   the encoded form before fetching the node for the byte
- *   comparison.  This loses the early prefetch the parent slot would
- *   otherwise provide.  Use cds_ft_group_attr_set_speculative_validated
- *   if speeding up cds_ft_eager_lookup_key is the goal.
+ *   cds_ft_eager_lookup_key continues to return precise (verified)
+ *   results.  Setting this attribute adds slight overhead on the
+ *   cds_ft_eager_lookup_key path: the parent's slot holds a
+ *   skip-encoded pointer (length plus child address) rather than a
+ *   direct pointer to the compressed node, so the precise descent
+ *   must derive the compressed node's address from the encoded form
+ *   before fetching the node for the byte comparison.  This loses
+ *   the early prefetch the parent slot would otherwise provide.
+ *   Use cds_ft_speculative_lookup_key if speeding up validated key
+ *   lookups is the goal.
  *
  * Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_NOT_SUPPORTED on builds/hosts where skip-compressed
  * encoding is unavailable.
  */
 enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *attr);
-
-/*
- * cds_ft_group_attr_set_speculative_validated - Enable speculative
- *                                               descent with library-
- *                                               side key validation.
- * @attr: Fractal Trie group attributes.
- * @key_offset: Byte offset from the (struct cds_ft_node *) stored in
- *              the trie to the start of the user-stored key bytes.
- *              Typically computed as
- *              offsetof(user_struct, key_field) -
- *              offsetof(user_struct, ft_node_field).
- * @leaf_readable_pad: Number of bytes guaranteed safely loadable
- *                  PAST the last byte of the stored key (i.e. starting
- *                  at stored_key + stored_key_len) without faulting.
- *                  0 means "no over-read guaranteed" — the library
- *                  uses a page-cross-safe fallback compare.  Values
- *                  >= 32 let the library use unmasked SIMD loads on
- *                  the leaf side regardless of stored_key_len, avoiding
- *                  page-cross checks on the hot path.  This semantic
- *                  matches what variable-length-key apps can actually
- *                  promise: a per-leaf trailing pad of N bytes, rather
- *                  than a per-leaf total readable horizon that varies
- *                  with stored_key_len.  Allocators that give every
- *                  allocation a non-faulting trailing region (e.g.
- *                  cds_ft_external_arena's per-range guard page)
- *                  satisfy this contract trivially.
- *
- * Implies cds_ft_group_attr_set_speculative.  When set, lookups
- * via cds_ft_eager_lookup_key (and the iterator-based cds_ft_lookup) on
- * this group's tries descend speculatively and validate the result
- * against the external node's stored key using the library's inline
- * SIMD/SWAR comparator before returning.  This gives the user the
- * same verified-result contract as a precise lookup, with the
- * descent speed of a candidate lookup, and no user-side validation
- * function call.
- *
- * The stored key length is not consulted by the library on the hot
- * path: a candidate/speculative descent only reaches a leaf when the
- * total bytes consumed equals @key_len, and a leaf inserted at depth
- * L has stored_key_len == L by construction.  The byte compare
- * therefore reads exactly @key_len bytes from both sides; the
- * @leaf_readable_pad contract makes that read safe even if the
- * stored key is shorter than @key_len in the unlikely event of a
- * caller-side contract violation.
- *
- * cds_ft_lookup_candidate_key on the same group still returns an
- * unvalidated candidate — the caller's intent (candidate vs verified)
- * is controlled by the API entry point, independently of this attr.
- *
- * Returns CDS_FT_STATUS_OK on success.
- */
-enum cds_ft_status cds_ft_group_attr_set_speculative_validated(
-		struct cds_ft_group_attr *attr,
-		size_t key_offset,
-		size_t leaf_readable_pad);
 
 /*
  * cds_ft_attr_create - Create a per-instance Fractal Trie attribute
