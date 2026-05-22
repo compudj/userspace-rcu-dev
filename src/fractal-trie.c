@@ -6593,24 +6593,50 @@ enum cds_ft_status ft_lookup_candidate_key_nonidentity(struct cds_ft *ft,
  * speculative_validated, CDS_FT_FLAG_SKIP_COMPRESSED) are immutable
  * after group creation.
  */
+/* Forward decls for ft_install_lookup_ops — definitions follow
+ * after cds_ft_lookup_candidate_key. */
+static enum cds_ft_status ft_lookup_iter_specv_sc(struct cds_ft *,
+		struct cds_ft_iter *);
+static enum cds_ft_status ft_lookup_iter_specv_nosc(struct cds_ft *,
+		struct cds_ft_iter *);
+static enum cds_ft_status ft_lookup_iter_precise_sc(struct cds_ft *,
+		struct cds_ft_iter *);
+static enum cds_ft_status ft_lookup_iter_precise_nosc(struct cds_ft *,
+		struct cds_ft_iter *);
+
 static
 void ft_install_lookup_ops(struct cds_ft *ft)
 {
 	const struct cds_ft_group *group = ft->group;
+	bool sc = ft_group_skip_compressed(group);
 
+	/*
+	 * Iter-form lookup_iter_fn: iter always carries ordinals-mapped
+	 * key bytes (see cds_ft_iter_set_key), so the non-identity key_map
+	 * case is handled at iter-set time and the lookup-time inner only
+	 * needs (descend_cand, skip_compressed, spec_validate)
+	 * specialization.
+	 */
+	if (group->speculative_validated) {
+		ft->lookup_iter_fn = sc
+			? ft_lookup_iter_specv_sc : ft_lookup_iter_specv_nosc;
+	} else {
+		ft->lookup_iter_fn = sc
+			? ft_lookup_iter_precise_sc : ft_lookup_iter_precise_nosc;
+	}
 	if (caa_unlikely(!group->key_map.identity)) {
 		ft->lookup_key_fn = ft_lookup_key_nonidentity;
 		ft->lookup_candidate_key_fn = ft_lookup_candidate_key_nonidentity;
 		return;
 	}
 	if (group->speculative_validated) {
-		ft->lookup_key_fn = ft_group_skip_compressed(group)
+		ft->lookup_key_fn = sc
 			? ft_lookup_specv_sc : ft_lookup_specv_nosc;
 	} else {
-		ft->lookup_key_fn = ft_group_skip_compressed(group)
+		ft->lookup_key_fn = sc
 			? ft_lookup_precise_sc : ft_lookup_precise_nosc;
 	}
-	ft->lookup_candidate_key_fn = ft_group_skip_compressed(group)
+	ft->lookup_candidate_key_fn = sc
 		? ft_lookup_cand_sc : ft_lookup_cand_nosc;
 }
 
@@ -6654,17 +6680,75 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 			_key_readable_pad, result_node);
 }
 
-enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
+/*
+ * Specialized iter-form lookup inners.  iter is always non-NULL on
+ * this path (path tracking is the whole point of the iter API), so
+ * each inner bakes that into the wrapper call along with the
+ * (descend_cand, skip_compressed, spec_validate) triple.  iter
+ * already holds ordinals-mapped key bytes (see cds_ft_iter_set_key:
+ * non-identity key_map remapping happens at iter-set time, not at
+ * lookup time), so there is no non-identity branch on this path.
+ */
+static
+enum cds_ft_status ft_lookup_iter_specv_sc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
 	enum cds_ft_status status;
-
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP_ITER_KEY(lookup_enter, iter);
-	status = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, FT_KEY_READABLE_PAD, NULL, iter,
-				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+	status = do_cds_ft_lookup_dc_sc(ft, iter_key(iter), iter->key_len,
+			FT_KEY_READABLE_PAD, NULL, iter,
+			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
 	FT_TP(lookup_exit, (int) status);
 	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_iter_specv_nosc(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	enum cds_ft_status status;
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP_ITER_KEY(lookup_enter, iter);
+	status = do_cds_ft_lookup_dc_nosc(ft, iter_key(iter), iter->key_len,
+			FT_KEY_READABLE_PAD, NULL, iter,
+			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
+	FT_TP(lookup_exit, (int) status);
+	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_iter_precise_sc(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	enum cds_ft_status status;
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP_ITER_KEY(lookup_enter, iter);
+	status = do_cds_ft_lookup_nodc_sc(ft, iter_key(iter), iter->key_len,
+			FT_KEY_READABLE_PAD, NULL, iter,
+			FT_PREFIX_TRACK_NONE, NULL, NULL);
+	FT_TP(lookup_exit, (int) status);
+	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_iter_precise_nosc(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	enum cds_ft_status status;
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP_ITER_KEY(lookup_enter, iter);
+	status = do_cds_ft_lookup_nodc_nosc(ft, iter_key(iter), iter->key_len,
+			FT_KEY_READABLE_PAD, NULL, iter,
+			FT_PREFIX_TRACK_NONE, NULL, NULL);
+	FT_TP(lookup_exit, (int) status);
+	return status;
+}
+
+enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	return (*ft->lookup_iter_fn)(ft, iter);
 }
 
 enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
