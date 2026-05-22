@@ -616,6 +616,15 @@ typedef enum cds_ft_status (*cds_ft_lookup_key_fn)(
 		struct cds_ft_node **result_node);
 typedef enum cds_ft_status (*cds_ft_lookup_iter_fn)(
 		struct cds_ft *ft, struct cds_ft_iter *iter);
+/*
+ * Signature shared by cds_ft_lookup_partial_key and
+ * cds_ft_lookup_longest_match_key: returns the partial/longest match
+ * length via @match_len and the matched node via @result_node.
+ */
+typedef enum cds_ft_status (*cds_ft_lookup_prefix_key_fn)(
+		struct cds_ft *ft, const uint8_t *key,
+		size_t key_len, size_t *match_len,
+		struct cds_ft_node **result_node);
 
 struct cds_ft {
 	struct cds_ft_group *group;
@@ -632,6 +641,10 @@ struct cds_ft {
 	cds_ft_lookup_key_fn lookup_key_fn;
 	cds_ft_lookup_key_fn lookup_candidate_key_fn;
 	cds_ft_lookup_iter_fn lookup_iter_fn;
+	cds_ft_lookup_prefix_key_fn lookup_partial_key_fn;
+	cds_ft_lookup_iter_fn lookup_partial_iter_fn;
+	cds_ft_lookup_prefix_key_fn lookup_longest_match_key_fn;
+	cds_ft_lookup_iter_fn lookup_longest_match_iter_fn;
 
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
 	unsigned long nr_fallback;		/* Number of fallback nodes used */

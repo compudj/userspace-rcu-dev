@@ -6603,6 +6603,26 @@ static enum cds_ft_status ft_lookup_iter_precise_sc(struct cds_ft *,
 		struct cds_ft_iter *);
 static enum cds_ft_status ft_lookup_iter_precise_nosc(struct cds_ft *,
 		struct cds_ft_iter *);
+static enum cds_ft_status ft_lookup_partial_key_sc(struct cds_ft *,
+		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+static enum cds_ft_status ft_lookup_partial_key_nosc(struct cds_ft *,
+		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+static enum cds_ft_status ft_lookup_partial_key_nonidentity(struct cds_ft *,
+		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+static enum cds_ft_status ft_lookup_partial_iter_sc(struct cds_ft *,
+		struct cds_ft_iter *);
+static enum cds_ft_status ft_lookup_partial_iter_nosc(struct cds_ft *,
+		struct cds_ft_iter *);
+static enum cds_ft_status ft_lookup_longest_match_key_sc(struct cds_ft *,
+		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+static enum cds_ft_status ft_lookup_longest_match_key_nosc(struct cds_ft *,
+		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+static enum cds_ft_status ft_lookup_longest_match_key_nonidentity(struct cds_ft *,
+		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+static enum cds_ft_status ft_lookup_longest_match_iter_sc(struct cds_ft *,
+		struct cds_ft_iter *);
+static enum cds_ft_status ft_lookup_longest_match_iter_nosc(struct cds_ft *,
+		struct cds_ft_iter *);
 
 static
 void ft_install_lookup_ops(struct cds_ft *ft)
@@ -6624,9 +6644,26 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 		ft->lookup_iter_fn = sc
 			? ft_lookup_iter_precise_sc : ft_lookup_iter_precise_nosc;
 	}
+	/*
+	 * Partial-match (tracking=PARTIAL) is always precise descent —
+	 * spec_validate does not apply (no leaf compare on partial
+	 * matches).  Iter form has no non-identity issue (iter holds
+	 * ordinals already).
+	 */
+	ft->lookup_partial_iter_fn = sc
+		? ft_lookup_partial_iter_sc : ft_lookup_partial_iter_nosc;
+	/*
+	 * Longest-match (tracking=LONGEST) is also always precise
+	 * descent.  Same shape as partial.
+	 */
+	ft->lookup_longest_match_iter_fn = sc
+		? ft_lookup_longest_match_iter_sc
+		: ft_lookup_longest_match_iter_nosc;
 	if (caa_unlikely(!group->key_map.identity)) {
 		ft->lookup_key_fn = ft_lookup_key_nonidentity;
 		ft->lookup_candidate_key_fn = ft_lookup_candidate_key_nonidentity;
+		ft->lookup_partial_key_fn = ft_lookup_partial_key_nonidentity;
+		ft->lookup_longest_match_key_fn = ft_lookup_longest_match_key_nonidentity;
 		return;
 	}
 	if (group->speculative_validated) {
@@ -6638,6 +6675,11 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 	}
 	ft->lookup_candidate_key_fn = sc
 		? ft_lookup_cand_sc : ft_lookup_cand_nosc;
+	ft->lookup_partial_key_fn = sc
+		? ft_lookup_partial_key_sc : ft_lookup_partial_key_nosc;
+	ft->lookup_longest_match_key_fn = sc
+		? ft_lookup_longest_match_key_sc
+		: ft_lookup_longest_match_key_nosc;
 }
 
 /*
@@ -6751,14 +6793,19 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 	return (*ft->lookup_iter_fn)(ft, iter);
 }
 
-enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
+/*
+ * Specialized partial_key inners (tracking=PARTIAL, identity key_map).
+ * Always precise descent (descend_cand=false, spec_validate=false)
+ * because partial-match needs per-step compressed verification.
+ */
+static
+enum cds_ft_status ft_lookup_partial_key_sc(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
 {
 	struct cds_ft_node *partial_node = NULL;
 	size_t partial_len = 0;
 	size_t key_len = ft_key_len(ft, _key_len);
-	const struct cds_ft_key_map *km = &ft->group->key_map;
 
 	if (!valid_key_len(ft, key_len)) {
 		*match_len = 0;
@@ -6766,44 +6813,89 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 	CDS_FT_SCOPED_READER(ft);
-	if (caa_likely(km->identity)) {
-		do_cds_ft_lookup(ft, key, key_len, 0, NULL, NULL,
-				 FT_PREFIX_TRACK_PARTIAL, &partial_len,
-				 &partial_node, false);
-	} else {
-		uint8_t ordinals[FT_MAX_KEY_LEN];
-
-		ft_key_to_ordinals(ordinals, key, key_len, km);
-		do_cds_ft_lookup(ft, ordinals, key_len, 0, NULL, NULL,
-				 FT_PREFIX_TRACK_PARTIAL, &partial_len,
-				 &partial_node, false);
-	}
-
+	do_cds_ft_lookup_nodc_sc(ft, key, key_len, 0, NULL, NULL,
+			FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node);
 	*match_len = partial_len;
 	*result_node = partial_node;
 	return partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
-enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
+static
+enum cds_ft_status ft_lookup_partial_key_nosc(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t *match_len,
+		struct cds_ft_node **result_node)
+{
+	struct cds_ft_node *partial_node = NULL;
+	size_t partial_len = 0;
+	size_t key_len = ft_key_len(ft, _key_len);
+
+	if (!valid_key_len(ft, key_len)) {
+		*match_len = 0;
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	CDS_FT_SCOPED_READER(ft);
+	do_cds_ft_lookup_nodc_nosc(ft, key, key_len, 0, NULL, NULL,
+			FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node);
+	*match_len = partial_len;
+	*result_node = partial_node;
+	return partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+}
+
+/*
+ * Non-identity key_map fallback for partial_key.  Routes through
+ * the generic do_cds_ft_lookup dispatcher because non-identity is
+ * rare; ordinals[] is allocated on stack inside this fn so
+ * call/return overhead is acceptable.
+ */
+static
+enum cds_ft_status ft_lookup_partial_key_nonidentity(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t *match_len,
+		struct cds_ft_node **result_node)
+{
+	struct cds_ft_node *partial_node = NULL;
+	size_t partial_len = 0;
+	size_t key_len = ft_key_len(ft, _key_len);
+	uint8_t ordinals[FT_MAX_KEY_LEN];
+
+	if (!valid_key_len(ft, key_len)) {
+		*match_len = 0;
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	CDS_FT_SCOPED_READER(ft);
+	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
+	do_cds_ft_lookup(ft, ordinals, key_len, 0, NULL, NULL,
+			FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node,
+			false);
+	*match_len = partial_len;
+	*result_node = partial_node;
+	return partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+}
+
+enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t *match_len,
+		struct cds_ft_node **result_node)
+{
+	return (*ft->lookup_partial_key_fn)(ft, key, _key_len, match_len,
+			result_node);
+}
+
+/*
+ * Specialized partial (iter form) inners.  Same as lookup_iter_*
+ * but with tracking=PARTIAL and the post-descent iter override.
+ */
+static
+enum cds_ft_status ft_lookup_partial_iter_sc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
 	struct cds_ft_node *partial_node = NULL;
 	size_t partial_len = 0;
 
 	CDS_FT_SCOPED_READER(ft);
-	/*
-	 * Perform the full lookup (populating the iterator path for
-	 * backtracking) while simultaneously tracking the closest
-	 * ancestor with external nodes for partial-match semantics.
-	 */
-	do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, FT_KEY_READABLE_PAD, NULL, iter,
-			 FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node,
-			 false);
-
-	/*
-	 * Override the iterator's node and status with the partial-match
-	 * result.
-	 */
+	do_cds_ft_lookup_nodc_sc(ft, iter_key(iter), iter->key_len,
+			FT_KEY_READABLE_PAD, NULL, iter,
+			FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node);
 	iter->node = partial_node;
 	iter->key_len = partial_len;
 	iter->path_len = partial_len + 1;
@@ -6811,35 +6903,42 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 	return iter->status;
 }
 
-enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
-		const uint8_t *key, size_t _key_len, size_t *match_len,
-		struct cds_ft_node **result_node)
+static
+enum cds_ft_status ft_lookup_partial_iter_nosc(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
 {
-	struct cds_ft_node *match_node = NULL;
-	size_t longest_len = 0;
-	enum cds_ft_status ret;
-	size_t key_len = ft_key_len(ft, _key_len);
-	const struct cds_ft_key_map *km = &ft->group->key_map;
+	struct cds_ft_node *partial_node = NULL;
+	size_t partial_len = 0;
 
-	if (!valid_key_len(ft, key_len)) {
-		*match_len = 0;
-		*result_node = NULL;
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	}
 	CDS_FT_SCOPED_READER(ft);
-	if (caa_likely(km->identity)) {
-		ret = do_cds_ft_lookup(ft, key, key_len, 0, NULL, NULL,
-				       FT_PREFIX_TRACK_LONGEST, &longest_len,
-				       &match_node, false);
-	} else {
-		uint8_t ordinals[FT_MAX_KEY_LEN];
+	do_cds_ft_lookup_nodc_nosc(ft, iter_key(iter), iter->key_len,
+			FT_KEY_READABLE_PAD, NULL, iter,
+			FT_PREFIX_TRACK_PARTIAL, &partial_len, &partial_node);
+	iter->node = partial_node;
+	iter->key_len = partial_len;
+	iter->path_len = partial_len + 1;
+	iter->status = partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+	return iter->status;
+}
 
-		ft_key_to_ordinals(ordinals, key, key_len, km);
-		ret = do_cds_ft_lookup(ft, ordinals, key_len, 0, NULL, NULL,
-				       FT_PREFIX_TRACK_LONGEST, &longest_len,
-				       &match_node, false);
-	}
+enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	return (*ft->lookup_partial_iter_fn)(ft, iter);
+}
 
+/*
+ * Helper: derive the public-API return value for longest_match
+ * from the descent result.  Sets *match_len / *result_node and
+ * returns CDS_FT_STATUS_OK / NOT_FOUND / INTERNAL_MATCH or a
+ * negative status when the descent itself failed.
+ */
+static inline
+enum cds_ft_status ft_lookup_longest_match_key_finish(
+		enum cds_ft_status ret,
+		size_t longest_len, struct cds_ft_node *match_node,
+		size_t *match_len, struct cds_ft_node **result_node)
+{
 	if (ret < 0) {
 		*match_len = 0;
 		*result_node = NULL;
@@ -6855,18 +6954,91 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
 	return match_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_INTERNAL_MATCH;
 }
 
-enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
-		struct cds_ft_iter *iter)
+static
+enum cds_ft_status ft_lookup_longest_match_key_sc(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t *match_len,
+		struct cds_ft_node **result_node)
 {
 	struct cds_ft_node *match_node = NULL;
 	size_t longest_len = 0;
 	enum cds_ft_status ret;
+	size_t key_len = ft_key_len(ft, _key_len);
 
+	if (!valid_key_len(ft, key_len)) {
+		*match_len = 0;
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 	CDS_FT_SCOPED_READER(ft);
-	ret = do_cds_ft_lookup(ft, iter_key(iter), iter->key_len, FT_KEY_READABLE_PAD, NULL, iter,
-			       FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node,
-			       false);
+	ret = do_cds_ft_lookup_nodc_sc(ft, key, key_len, 0, NULL, NULL,
+			FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node);
+	return ft_lookup_longest_match_key_finish(ret, longest_len,
+			match_node, match_len, result_node);
+}
 
+static
+enum cds_ft_status ft_lookup_longest_match_key_nosc(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t *match_len,
+		struct cds_ft_node **result_node)
+{
+	struct cds_ft_node *match_node = NULL;
+	size_t longest_len = 0;
+	enum cds_ft_status ret;
+	size_t key_len = ft_key_len(ft, _key_len);
+
+	if (!valid_key_len(ft, key_len)) {
+		*match_len = 0;
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	CDS_FT_SCOPED_READER(ft);
+	ret = do_cds_ft_lookup_nodc_nosc(ft, key, key_len, 0, NULL, NULL,
+			FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node);
+	return ft_lookup_longest_match_key_finish(ret, longest_len,
+			match_node, match_len, result_node);
+}
+
+static
+enum cds_ft_status ft_lookup_longest_match_key_nonidentity(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t *match_len,
+		struct cds_ft_node **result_node)
+{
+	struct cds_ft_node *match_node = NULL;
+	size_t longest_len = 0;
+	enum cds_ft_status ret;
+	size_t key_len = ft_key_len(ft, _key_len);
+	uint8_t ordinals[FT_MAX_KEY_LEN];
+
+	if (!valid_key_len(ft, key_len)) {
+		*match_len = 0;
+		*result_node = NULL;
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	CDS_FT_SCOPED_READER(ft);
+	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
+	ret = do_cds_ft_lookup(ft, ordinals, key_len, 0, NULL, NULL,
+			FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node, false);
+	return ft_lookup_longest_match_key_finish(ret, longest_len,
+			match_node, match_len, result_node);
+}
+
+enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t *match_len,
+		struct cds_ft_node **result_node)
+{
+	return (*ft->lookup_longest_match_key_fn)(ft, key, _key_len,
+			match_len, result_node);
+}
+
+/*
+ * Helper: write descent result back into iter for longest_match iter.
+ */
+static inline
+enum cds_ft_status ft_lookup_longest_match_iter_finish(
+		enum cds_ft_status ret,
+		size_t longest_len, struct cds_ft_node *match_node,
+		struct cds_ft_iter *iter)
+{
 	if (ret < 0) {
 		iter->node = NULL;
 		iter->status = ret;
@@ -6886,6 +7058,44 @@ enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 end:
 	iter_auto_invalidate_path(iter);
 	return iter->status;
+}
+
+static
+enum cds_ft_status ft_lookup_longest_match_iter_sc(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	struct cds_ft_node *match_node = NULL;
+	size_t longest_len = 0;
+	enum cds_ft_status ret;
+
+	CDS_FT_SCOPED_READER(ft);
+	ret = do_cds_ft_lookup_nodc_sc(ft, iter_key(iter), iter->key_len,
+			FT_KEY_READABLE_PAD, NULL, iter,
+			FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node);
+	return ft_lookup_longest_match_iter_finish(ret, longest_len,
+			match_node, iter);
+}
+
+static
+enum cds_ft_status ft_lookup_longest_match_iter_nosc(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	struct cds_ft_node *match_node = NULL;
+	size_t longest_len = 0;
+	enum cds_ft_status ret;
+
+	CDS_FT_SCOPED_READER(ft);
+	ret = do_cds_ft_lookup_nodc_nosc(ft, iter_key(iter), iter->key_len,
+			FT_KEY_READABLE_PAD, NULL, iter,
+			FT_PREFIX_TRACK_LONGEST, &longest_len, &match_node);
+	return ft_lookup_longest_match_iter_finish(ret, longest_len,
+			match_node, iter);
+}
+
+enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	return (*ft->lookup_longest_match_iter_fn)(ft, iter);
 }
 
 /*
