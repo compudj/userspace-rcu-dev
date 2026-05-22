@@ -128,7 +128,7 @@ struct cds_ft_group_attr {
 	size_t max_key_len;
 	struct cds_ft_key_map key_map;
 	unsigned int flags;
-	bool speculative;
+	bool speculative;	/* See cds_ft_lookup_optimization. */
 };
 
 struct cds_ft_attr {
@@ -14540,6 +14540,18 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	attr->key_len = CDS_FT_LEN_DEFAULT;
 	attr->max_key_len = FT_MAX_KEY_LEN;
 	attr->key_map.identity = true;
+	/*
+	 * Default lookup optimization is EAGER (preserves historical
+	 * behavior).  Callers tuning for cds_ft_lookup_candidate_key or
+	 * cds_ft_speculative_lookup_key should call
+	 * cds_ft_group_attr_set_lookup_optimization(attr,
+	 * CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE) explicitly.
+	 *
+	 * Flipping the default to SPECULATIVE is a future follow-up
+	 * (gated on resolving a latent issue with concurrent iteration
+	 * under SKIP_COMPRESSED — inv_iteration_order hangs on
+	 * speculative tries).
+	 */
 	*result = attr;
 	return CDS_FT_STATUS_OK;
 }
@@ -14607,28 +14619,31 @@ bool ft_skip_compressed_validate(void)
 }
 #endif
 
-enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *attr)
+enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
+		struct cds_ft_group_attr *attr,
+		enum cds_ft_lookup_optimization opt)
 {
-	/*
-	 * Speculative-only mode requires skip-compressed pointer encoding
-	 * to be useful: without it, cds_ft_lookup_candidate_key already
-	 * does cand-mode descent regardless of the group attr (the
-	 * candidate flag is gated by the API entry point, not the group),
-	 * and cds_ft_eager_lookup_key stays on the precise path (no offsets to
-	 * validate against).  When skip-compressed is unavailable on the
-	 * build/host, this attribute would be a no-op, so report it as
-	 * unsupported rather than silently doing nothing.
-	 */
-#ifndef FEATURE_FT_SKIP_COMPRESSED
-	(void) attr;
-	return CDS_FT_STATUS_NOT_SUPPORTED;
-#else
-	if (!ft_skip_compressed_validate())
-		return CDS_FT_STATUS_NOT_SUPPORTED;
-	attr->speculative = true;
-	attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
-	return CDS_FT_STATUS_OK;
+	switch (opt) {
+	case CDS_FT_LOOKUP_OPTIMIZE_EAGER:
+		attr->speculative = false;
+		attr->flags &= ~CDS_FT_FLAG_SKIP_COMPRESSED;
+		return CDS_FT_STATUS_OK;
+	case CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE:
+		/*
+		 * Speculative descent always works.  Opportunistically
+		 * enable the skip-compressed pointer encoding when the
+		 * arch supports it; on archs without it the descent still
+		 * skips per-step byte compares — just without the extra
+		 * compressed-CL bypass.
+		 */
+		attr->speculative = true;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_skip_compressed_validate())
+			attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
+		return CDS_FT_STATUS_OK;
+	}
+	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 }
 
 enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)

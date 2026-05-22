@@ -10519,7 +10519,7 @@ static struct cds_ft *create_skip_compressed_ft(struct cds_ft_group **group_out)
 	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
-	cds_ft_group_attr_set_speculative(attr);
+	cds_ft_group_attr_set_lookup_optimization(attr, CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -10793,7 +10793,7 @@ static struct cds_ft *create_specv_varlen_ft(struct cds_ft_group **group_out)
 	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
-	s = cds_ft_group_attr_set_speculative(attr);
+	s = cds_ft_group_attr_set_lookup_optimization(attr, CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
 	if (s != CDS_FT_STATUS_OK) {
 		cds_ft_group_attr_destroy(attr);
 		return NULL;
@@ -10825,7 +10825,7 @@ static struct cds_ft *create_specv_fixed_ft(size_t klen,
 		cds_ft_group_attr_destroy(attr);
 		abort();
 	}
-	s = cds_ft_group_attr_set_speculative(attr);
+	s = cds_ft_group_attr_set_lookup_optimization(attr, CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
 	if (s != CDS_FT_STATUS_OK) {
 		cds_ft_group_attr_destroy(attr);
 		return NULL;

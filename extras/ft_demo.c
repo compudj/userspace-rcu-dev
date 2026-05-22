@@ -104,7 +104,7 @@ static int make_group(struct cds_ft_group **group_out, int speculative)
 		return -1;
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	if (speculative)
-		cds_ft_group_attr_set_speculative(attr);
+		cds_ft_group_attr_set_lookup_optimization(attr, CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
 	if (cds_ft_group_create(attr, group_out) != CDS_FT_STATUS_OK) {
 		cds_ft_group_attr_destroy(attr);
 		return -1;

@@ -63,9 +63,10 @@
 /*
  * Internal group flag: skip-compressed pointer encoding.
  *
- * Bit set in struct cds_ft_group::flags when
- * cds_ft_group_attr_set_speculative opportunistically enables the
- * skip-compressed encoding.  Not part of the public API.
+ * Bit set in struct cds_ft_group::flags when the SPECULATIVE lookup
+ * optimization (default; cds_ft_group_attr_set_lookup_optimization)
+ * is selected AND the arch supports skip-encoded pointers.  Not
+ * part of the public API.
  */
 #define CDS_FT_FLAG_SKIP_COMPRESSED	(1U << 0)
 
@@ -537,8 +538,13 @@ struct cds_ft_group {
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
 
 	/*
-	 * @speculative: enable cand-mode descent and (when supported)
-	 *   skip-compressed pointer encoding for this group's tries.
+	 * @speculative: SPECULATIVE lookup optimization (default).  When
+	 *   true, the group's compressed-node allocations are routed to a
+	 *   dedicated arena set for improved descent locality.
+	 *   Orthogonal to CDS_FT_FLAG_SKIP_COMPRESSED (the skip-encoded
+	 *   pointer optimization, which is also gated on
+	 *   arch-availability).  See
+	 *   cds_ft_group_attr_set_lookup_optimization.
 	 */
 	bool speculative;
 };
