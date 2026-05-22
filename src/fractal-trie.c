@@ -6036,8 +6036,21 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	if (skip_compressed &&
 	    caa_unlikely(ft_node_skip_compressed(node_flag))) {
 		if (!descend_cand) {
-			node_flag = ft_compressed_node_flag(
-				ft_skip_to_compressed(node_flag));
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			for (;;) {
+				struct cds_ft_compressed_node *cn =
+					ft_skip_to_compressed_validate(node_flag);
+				if (caa_likely(cn != NULL)) {
+					node_flag = ft_compressed_node_flag(cn);
+					break;
+				}
+				/* validation failed: re-read root and retry */
+				node_flag = ft_dereference_prefetch(ft->root);
+				if (!ft_node_skip_compressed(node_flag))
+					break;
+				caa_cpu_relax();
+			}
+#endif
 		} else {
 			unsigned int skip = ft_skip_len(node_flag);
 
@@ -6111,57 +6124,74 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 			 * Per-case FT_NODE_SUB_TAG_NOSKIP with a compile-
 			 * time literal folds the SUB into the body load's
 			 * displacement.
+			 *
+			 * Retry loop guards the precise-descent skip-encoded
+			 * resolution: a concurrent writer mid-split/merge
+			 * may have updated the child's back-pointer chain in
+			 * place but not yet republished the slot, so
+			 * ft_skip_to_compressed_validate can return NULL.
+			 * On NULL we re-read the slot via the pretyped
+			 * scanner (the writer will eventually republish; the
+			 * second read either gets the new value or a still-
+			 * stale value that matches a stable cn).  Candidate
+			 * descent doesn't need the cn — it advances via
+			 * ft_skip_child_ptr — so the retry loop only spins
+			 * in the !descend_cand branch.
 			 */
-			unsigned long _raw = (unsigned long) node_flag;
+			struct cds_ft_inode_flag *parent_node_flag = node_flag;
+			unsigned long _raw = (unsigned long) parent_node_flag;
 			unsigned int _type =
 				(unsigned int) ((_raw >> FT_INTERNAL_BITS) & 0x7);
 
-			node_flag = ft_node_get_nth_skip_pretyped(node_flag,
-					_type, NULL, iter_key, FT_PF_DATA);
-		}
-		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
-				(unsigned int) iter_key, node_flag);
-		/*
-		 * "Not found" iff the slot is NULL: ft_node_get_nth*
-		 * returns NULL when the parent isn't internal, and an
-		 * empty slot is stored as NULL.  All valid pointers
-		 * (any tag) carry a non-zero underlying address, so the
-		 * full ft_node_ptr() unmasking would always answer the
-		 * same as a plain NULL check, at the cost of the (v & 1)
-		 * branch in the per-step dependency chain.
-		 */
-		if (!node_flag) {
-			status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
-		}
-		/*
-		 * Skip-compressed pointer from child slot.
-		 *
-		 * Non-candidate: convert to compressed flag and fall
-		 * through to the merged handler below (which calls
-		 * ft_lookup_compressed).
-		 *
-		 * Candidate: resolve the skip (advance past the
-		 * compressed path without comparison).
-		 */
-		if (skip_compressed && caa_unlikely(ft_node_skip_compressed(node_flag))) {
-			if (!descend_cand) {
-				node_flag = ft_compressed_node_flag(
-					ft_skip_to_compressed(node_flag));
-			} else {
-				unsigned int skip = ft_skip_len(node_flag);
-				int remaining = (int) (key_end - key);
-
-				if ((int) skip > remaining) {
+			for (;;) {
+				node_flag = ft_node_get_nth_skip_pretyped(parent_node_flag,
+						_type, NULL, iter_key, FT_PF_DATA);
+				if (!node_flag) {
 					status = CDS_FT_STATUS_NOT_FOUND;
 					goto end;
 				}
-				key += skip;
-				if (path_nodes)
-					path_cur += skip;
-				node_flag = ft_skip_child_ptr(node_flag);
+				if (!skip_compressed
+				    || caa_likely(!ft_node_skip_compressed(node_flag)))
+					break;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				if (!descend_cand) {
+					struct cds_ft_compressed_node *cn =
+						ft_skip_to_compressed_validate(node_flag);
+					if (caa_likely(cn != NULL)) {
+						node_flag = ft_compressed_node_flag(cn);
+						break;
+					}
+					/* validation failed: writer mid-mutation, retry */
+					caa_cpu_relax();
+					continue;
+				}
+#endif
+				/* candidate mode: skip-advance handled below */
+				break;
 			}
 		}
+		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
+				(unsigned int) iter_key, node_flag);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		/*
+		 * Candidate-mode skip-advance for skip-encoded child slots.
+		 * Precise-mode resolution happened in the dispatcher retry
+		 * loop above.
+		 */
+		if (skip_compressed && descend_cand && caa_unlikely(ft_node_skip_compressed(node_flag))) {
+			unsigned int skip = ft_skip_len(node_flag);
+			int remaining = (int) (key_end - key);
+
+			if ((int) skip > remaining) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
+			}
+			key += skip;
+			if (path_nodes)
+				path_cur += skip;
+			node_flag = ft_skip_child_ptr(node_flag);
+		}
+#endif
 		if (path_nodes)
 			*path_cur = node_flag;
 		/*
