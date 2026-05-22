@@ -4413,22 +4413,36 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip_pretyped(
  * compressed node flag so callers see it as a regular compressed node.
  * Used by all paths except candidate lookup.
  *
- * No validation: callers may be writers reading their own in-flight
- * mutation state (between ft_set_parent and ft_publish_to_parent),
- * where the parent back-pointer chain is intentionally inconsistent
- * with the slot value.  Reader callers that need consistency wrap
- * with ft_skip_to_compressed and the validation retry locally.
+ * @validate_lookup: when true, validate the skip-compressed resolution
+ * against the slot's skip_len and retry on mismatch.  RCU readers
+ * pass true; writers must pass false (a writer mid-mutation reading
+ * its own in-flight state would loop forever).
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, enum ft_pf_target pf_hint)
+		uint8_t n, enum ft_pf_target pf_hint, bool validate_lookup)
 {
-	struct cds_ft_inode_flag *child;
+	for (;;) {
+		struct cds_ft_inode_flag *child =
+			ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
 
-	child = ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
-	child = ft_resolve_skip_compressed(child);
-	return child;
+		if (!validate_lookup)
+			return ft_resolve_skip_compressed(child);
+		if (!child || !ft_node_skip_compressed(child))
+			return child;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		{
+			struct cds_ft_compressed_node *cn =
+				ft_skip_to_compressed_validate(child);
+			if (caa_likely(cn != NULL))
+				return ft_compressed_node_flag(cn);
+		}
+		caa_cpu_relax();
+#else
+		return child;
+#endif
+	}
 }
 
 /*
@@ -4469,7 +4483,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 				if (n_ret)
 					*n_ret = v;
 				if (slot_ret)
-					ft_node_get_nth(parent_nf, slot_ret, v, FT_PF_NONE);
+					ft_node_get_nth(parent_nf, slot_ret, v, FT_PF_NONE, false /* writer */);
 				return true;
 			}
 		}
@@ -4487,7 +4501,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 				if (n_ret)
 					*n_ret = (uint8_t) i;
 				if (slot_ret)
-					ft_node_get_nth(parent_nf, slot_ret, i, FT_PF_NONE);
+					ft_node_get_nth(parent_nf, slot_ret, i, FT_PF_NONE, false /* writer */);
 				return true;
 			}
 		}
@@ -7549,7 +7563,7 @@ slow_path:
 		 * must be set regardless of whether descent continues.
 		 */
 		ordinal_key[level - 1] = key_value;
-		node_flag = ft_node_get_nth(node_flag, NULL, key_value, FT_PF_NONE);
+		node_flag = ft_node_get_nth(node_flag, NULL, key_value, FT_PF_NONE, true /* reader */);
 		if (!node_flag) {
 			FT_TP(slowpath_step, (int) level, key_value,
 				(const void *) node_flag, 1);
@@ -9061,7 +9075,7 @@ struct cds_ft_inode_flag *ft_descent_step(struct ft_descent *d,
 	d->ppnfp = d->pnfp;
 	d->pnf   = d->nf;
 	d->pnfp  = d->nfp;
-	d->nf    = ft_node_get_nth(d->pnf, &d->nfp, key_value, FT_PF_NONE);
+	d->nf    = ft_node_get_nth(d->pnf, &d->nfp, key_value, FT_PF_NONE, false /* writer */);
 	d->depth++;
 	return d->nf;
 }
@@ -9915,7 +9929,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			continue;
 		}
 		key_value = *(iter_key++);
-		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value, FT_PF_NONE);
+		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value, FT_PF_NONE, false /* writer */);
 		if (!node_flag) {
 			s = CDS_FT_STATUS_NOT_FOUND;
 			FT_TP(replace_exit, (int) s);
@@ -10314,7 +10328,8 @@ int ft_detach_node(struct cds_ft *ft,
 							next = ft_node_get_nth(
 								walk_nf, NULL,
 								(uint8_t) key,
-								FT_PF_NONE);
+								FT_PF_NONE,
+								false /* writer */);
 							if (next)
 								break;
 						}
@@ -10437,7 +10452,8 @@ int ft_detach_node(struct cds_ft *ft,
 						for (key = 0; key < 256; key++) {
 							next = ft_node_get_nth(
 								walk_nf, NULL,
-								(uint8_t) key, FT_PF_NONE);
+								(uint8_t) key, FT_PF_NONE,
+								false /* writer */);
 							if (next)
 								break;
 						}
@@ -10480,7 +10496,8 @@ int ft_detach_node(struct cds_ft *ft,
 								for (key = 0; key < 256; key++) {
 									next = ft_node_get_nth(
 										walk_nf, NULL,
-										(uint8_t) key, FT_PF_NONE);
+										(uint8_t) key, FT_PF_NONE,
+										false /* writer */);
 									if (next)
 										break;
 								}
@@ -11390,14 +11407,15 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 			/* Single-child internal prefix: find the slot
 			 * holding branch_flag within the prefix node. */
 			ft_node_get_nth(top_flag, &d->pnfp,
-					cn->key_bytes[0], FT_PF_NONE);
+					cn->key_bytes[0], FT_PF_NONE,
+					false /* writer */);
 	} else {
 		d->pnfp = d->nfp;  /* branch IS the top, parent is the old parent */
 	}
 	{
 		uint8_t new_ordinal = iter_key[diverge_pos];
 
-		d->nf = ft_node_get_nth(branch_flag, &d->nfp, new_ordinal, FT_PF_NONE);
+		d->nf = ft_node_get_nth(branch_flag, &d->nfp, new_ordinal, FT_PF_NONE, false /* writer */);
 		/* nf should be NULL: the branch only has the old direction. */
 	}
 	d->depth += diverge_pos + 1;
@@ -11713,7 +11731,8 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		d->pnfp = &ft_compressed_node_ptr(prefix_flag)->child;
 	else
 		ft_node_get_nth(prefix_flag, &d->pnfp,
-				cn->key_bytes[0], FT_PF_NONE);
+				cn->key_bytes[0], FT_PF_NONE,
+				false /* writer */);
 	d->nf = suffix_flag;
 	d->nfp = d->pnfp;
 	d->depth += remaining;
@@ -11807,7 +11826,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 					struct cds_ft_inode_flag *next;
 					uint8_t kv = key[i + 1];
 
-					next = ft_node_get_nth(cur, NULL, kv, FT_PF_NONE);
+					next = ft_node_get_nth(cur, NULL, kv, FT_PF_NONE, false /* writer */);
 					free_cds_ft_node(ft, ft_node_ptr(cur));
 					cur = next;
 					i++;
@@ -12923,7 +12942,8 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						for (kv = 0; kv < 256; kv++) {
 							next = ft_node_get_nth(
 								chain_head, NULL,
-								(uint8_t) kv, FT_PF_NONE);
+								(uint8_t) kv, FT_PF_NONE,
+								false /* writer */);
 							if (next)
 								break;
 						}
@@ -13388,7 +13408,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 			continue;
 		}
 		kv = prefix[i];
-		node_flag = ft_node_get_nth(node_flag, NULL, kv, FT_PF_NONE);
+		node_flag = ft_node_get_nth(node_flag, NULL, kv, FT_PF_NONE, true /* reader */);
 	}
 
 	if (!node_flag) {
@@ -13868,7 +13888,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 		}
 		ordinal = key[i];
 		ordinal_key[i] = ordinal;
-		node_flag = ft_node_get_nth(node_flag, NULL, ordinal, FT_PF_NONE);
+		node_flag = ft_node_get_nth(node_flag, NULL, ordinal, FT_PF_NONE, true /* reader */);
 		if (!node_flag)
 			return -1;
 		iter_path_node(iter)[i + 1] = node_flag;
@@ -15901,7 +15921,7 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 	for (key = 0; key < 256; key++) {
 		struct cds_ft_inode_flag *child_node_flag;
 
-		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
+		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE, false /* debug */);
 		if (!child_node_flag)
 			continue;
 		if (ft_node_internal(child_node_flag)) {
@@ -16103,7 +16123,7 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 		for (key = 0; key < 256; key++) {
 			struct cds_ft_inode_flag *child;
 
-			child = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
+			child = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE, false /* debug */);
 			if (!child)
 				continue;
 			if (printed++) fprintf(out, ",");
@@ -16209,7 +16229,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 	for (key = 0; key < 256; key++) {
 		struct cds_ft_inode_flag *child_node_flag;
 
-		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
+		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE, false /* debug */);
 		if (!child_node_flag)
 			continue;
 		if (ft_node_internal(child_node_flag)) {
