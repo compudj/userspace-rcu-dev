@@ -12022,6 +12022,121 @@ ft_make_root_internal(struct cds_ft *ft,
 }
 
 /*
+ * ft_compress_single_child_if_needed: convert a 1-child internal node
+ * (no external_nodes) to a 1-byte compressed/skip-encoded node when
+ * the trie group has skip-compressed enabled.  Used at graft sites
+ * where a moved root (which was an internal at trie-root position) is
+ * being placed at a non-root position: under skip mode, non-root
+ * 1-child internals without external_nodes must be a 1-byte
+ * compressed (chain-compress invariant).
+ *
+ * Returns the converted compressed/skip-encoded flag on success.
+ * Returns @child unchanged when conversion isn't applicable:
+ *   - skip-compressed mode is disabled,
+ *   - @child is not an internal node,
+ *   - @child has more than one child,
+ *   - @child has external_nodes attached,
+ *   - the single child is a compressed node (would violate the
+ *     "no two adjacent compresseds" invariant — leave for a future
+ *     chain-merge),
+ *   - allocation failure.
+ *
+ * On successful conversion the old internal is freed.  Write-side
+ * only (mutex held); the caller is the sole owner of @child.
+ */
+static
+struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
+		struct cds_ft_inode_flag *child)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	struct cds_ft_inode *node;
+	unsigned int type_index;
+	const struct cds_ft_type *type;
+	struct cds_ft_metadata *meta;
+	uint8_t byte;
+	struct cds_ft_inode_flag *single_child;
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_metadata *cn_meta;
+	struct cds_ft_inode_flag *cflag;
+
+	if (!ft_group_skip_compressed(ft->group))
+		return child;
+	if (!ft_node_internal(child))
+		return child;
+	node = ft_node_ptr(child);
+	type_index = ft_node_type(child);
+	type = &ft_types[type_index];
+	meta = cds_ft_item_to_metadata_fast(node, type->order);
+	if (meta->nr_child != 1 || meta->external_nodes != NULL)
+		return child;
+
+	/*
+	 * Find the single set byte.  ft_node_get_minmax returns the
+	 * resolved child (skip-encoded → compressed flag); but we
+	 * need the raw slot value to preserve any skip encoding when
+	 * placing it as cn->child.  Walk via the low-level get_ith.
+	 */
+	switch (type->type_class) {
+	case FT_POPCOUNT:
+		ft_popcount_node_get_ith_pos(type, node, 0, &byte, &single_child);
+		break;
+	case FT_PIGEON:
+	{
+		unsigned int i;
+
+		single_child = NULL;
+		byte = 0;
+		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
+			struct cds_ft_inode_flag *v =
+				ft_pigeon_node_get_ith_pos(type, node, i);
+			if (v) {
+				byte = (uint8_t) i;
+				single_child = v;
+				break;
+			}
+		}
+		break;
+	}
+	default:
+		return child;
+	}
+	if (!single_child)
+		return child;
+	/*
+	 * The "no two adjacent compresseds" invariant: skip the
+	 * conversion when the single child is itself a compressed
+	 * (or skip-encoded) node.  A proper chain-merge would extend
+	 * the existing compressed by one byte; deferred.
+	 */
+	if (ft_node_compressed(single_child) || ft_node_skip_compressed(single_child))
+		return child;
+
+	cn = alloc_compressed_node(ft, 1, &cn_meta);
+	if (!cn)
+		return child;
+	cn->len = 1;
+	cn->key_bytes[0] = byte;
+	cn->child = single_child;
+	cn_meta->nr_child = 1;
+	ft_nr_keys_store(cn_meta, ft_nr_keys_get(meta), CMM_RELAXED);
+	cflag = ft_compressed_node_flag(cn);
+	ft_set_parent(single_child, cflag, &cn->child);
+	/*
+	 * The caller has already unlinked @node from src and waited a
+	 * grace period (cds_ft_graft / graft_swap protocol); @node has
+	 * not been published to dst.  No reader can be inside it, so
+	 * the immediate-free path is safe — saves a grace period of
+	 * deferred-free pressure.
+	 */
+	free_cds_ft_node_unpublished(ft, node);
+	return ft_publish_compressed(ft, cn, cflag);
+#else
+	(void) ft;
+	return child;
+#endif
+}
+
+/*
  * Store graft_payload at the graft point described by @d.
  *
  * Handles two cases:
@@ -12044,6 +12159,28 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		unsigned int *attached_depth)
 {
 	struct cds_ft_inode *old_recompacted_node = NULL;
+
+	if (d->depth == key_len) {
+		/*
+		 * Skip-mode chain-compress invariant: under SPECULATIVE-
+		 * mode tries, non-root 1-child internals without
+		 * external_nodes must be a 1-byte compressed.  The
+		 * graft_payload here may be the source trie's old root
+		 * (a 1-child internal is permitted at root but not at
+		 * the non-root position we're placing it in).  Convert
+		 * before publishing.
+		 *
+		 * The d->depth < key_len branch below builds a branch
+		 * via ft_build_branch and attaches @graft_payload as
+		 * the bottom node; converting graft_payload to a
+		 * compressed there would produce two adjacent
+		 * compresseds and violate that invariant instead.
+		 * Leave that case to ft_build_branch — it already
+		 * handles single-child internal payloads by extending
+		 * its own compressed prefix when applicable.
+		 */
+		graft_payload = ft_compress_single_child_if_needed(ft, graft_payload);
+	}
 
 	if (d->depth == key_len) {
 		struct cds_ft_metadata *pmeta;
