@@ -6418,6 +6418,59 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 }
 
 /*
+ * Per-API cluster sub-sections.  Each public-API stub lives in
+ * .text.hot.cds_ft_<api>.0_stub; its primary inner in
+ * .text.hot.cds_ft_<api>.1_primary; secondary variants in
+ * .text.hot.cds_ft_<api>.2_secondary.
+ *
+ * The linker script ft-lookup-layout.ld groups each cluster
+ * (per public API) into one output section, page-aligned, with
+ * sub-sections sorted alphabetically — stub first, primary
+ * second, secondary last.  This ensures the bench's hot path
+ * (call → stub → primary inner) touches a single iTLB page on
+ * the critical setup, and primary's tail spilling past 4 KiB
+ * doesn't cost an extra iTLB miss on every lookup because the
+ * descent's PC stays on page 1 during the first iterations.
+ */
+/*
+ * Cluster layout: dispatch at page start, fast path next, slow paths
+ * trailing.  The linker script (ft-lookup-layout.ld) gathers each
+ * cluster's sub-sections in alphabetical name order, page-aligned
+ * at the start:
+ *
+ *   ALIGN(4096) ┐
+ *               │  .text.hot.cds_ft_<api>.0_dispatch  — public stub
+ *               │  .text.hot.cds_ft_<api>.1_fast      — primary inner
+ *               │                                      (spec_validated +
+ *               │                                       skip_compressed)
+ *               │  .text.hot.cds_ft_<api>.2_slow      — slow paths:
+ *               │                                      precise_*, *_nosc,
+ *               │                                      *_nonidentity
+ *
+ * For the bench's hot path (call → stub → primary inner), the call
+ * lands at the cluster's page boundary; the stub's indirect jmp
+ * forwards into the primary on the same page.  Slow paths trail
+ * later in the cluster (later addresses, possibly later pages).
+ * The whole cluster shares iTLB/icache locality.
+ *
+ * Direction of the indirect jmp (forward to primary vs backward to
+ * a slow path) is not a factor — unconditional jmps don't use the
+ * "backward predicted taken" heuristic (that applies only to
+ * conditional branches with a cold BPB).  Layout experiments
+ * 2026-05-22 confirmed stub-FIRST / stub-LAST / stub on different
+ * page from primary all measure within ~1 ns on ft_specv_local
+ * dns load-names ST.  Dispatch-FIRST was selected for clarity:
+ * the bench's CALL lands at the page-aligned cluster start,
+ * forward into the next-most-likely target.
+ */
+#define FT_LOOKUP_DISPATCH(name)	\
+	__attribute__((section(".text.hot.cds_ft_" name ".0_dispatch")))
+#define FT_LOOKUP_FAST_PATH(name)	\
+	__attribute__((section(".text.hot.cds_ft_" name ".1_fast")))
+#define FT_LOOKUP_SLOW_PATH(name)	\
+	__attribute__((section(".text.hot.cds_ft_" name ".2_slow")))
+
+/*
  * Specialized lookup_key/lookup_candidate_key inner functions.
  * Each bakes the (descend_cand, skip_compressed, spec_validate)
  * triple into a literal-arg call to the matching always_inline
@@ -6433,7 +6486,7 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
  * Non-identity callers route through ft_lookup_*_nonidentity
  * below, which carry a FT_MAX_KEY_LEN stack buffer.
  */
-static
+static FT_LOOKUP_FAST_PATH("lookup_key")
 enum cds_ft_status ft_lookup_specv_sc(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node)
@@ -6451,7 +6504,7 @@ enum cds_ft_status ft_lookup_specv_sc(struct cds_ft *ft,
 	return status;
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup_key")
 enum cds_ft_status ft_lookup_specv_nosc(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node)
@@ -6469,7 +6522,7 @@ enum cds_ft_status ft_lookup_specv_nosc(struct cds_ft *ft,
 	return status;
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup_key")
 enum cds_ft_status ft_lookup_precise_sc(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node)
@@ -6487,7 +6540,7 @@ enum cds_ft_status ft_lookup_precise_sc(struct cds_ft *ft,
 	return status;
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup_key")
 enum cds_ft_status ft_lookup_precise_nosc(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node)
@@ -6505,7 +6558,7 @@ enum cds_ft_status ft_lookup_precise_nosc(struct cds_ft *ft,
 	return status;
 }
 
-static
+static FT_LOOKUP_FAST_PATH("lookup_candidate_key")
 enum cds_ft_status ft_lookup_cand_sc(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node)
@@ -6519,7 +6572,7 @@ enum cds_ft_status ft_lookup_cand_sc(struct cds_ft *ft,
 			FT_PREFIX_TRACK_NONE, NULL, NULL, false);
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup_candidate_key")
 enum cds_ft_status ft_lookup_cand_nosc(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node)
@@ -6542,7 +6595,7 @@ enum cds_ft_status ft_lookup_cand_nosc(struct cds_ft *ft,
  * cds_ft_group_attr_set_key_map) so the extra dispatch hop is
  * not worth specializing further.
  */
-static __attribute__((cold))
+static FT_LOOKUP_SLOW_PATH("lookup_key")
 enum cds_ft_status ft_lookup_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		size_t key_readable_pad,
@@ -6567,7 +6620,7 @@ enum cds_ft_status ft_lookup_key_nonidentity(struct cds_ft *ft,
 	return status;
 }
 
-static __attribute__((cold))
+static FT_LOOKUP_SLOW_PATH("lookup_candidate_key")
 enum cds_ft_status ft_lookup_candidate_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		size_t key_readable_pad,
@@ -6693,6 +6746,7 @@ void ft_install_lookup_ops(struct cds_ft *ft)
  * The branch predictor stores the fn-ptr target once per trie
  * and predicts it for every subsequent lookup.
  */
+FT_LOOKUP_DISPATCH("lookup_key")
 enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node)
@@ -6714,6 +6768,7 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
  * eliminates per-node key comparisons, doing a single verification
  * at the end instead.
  */
+FT_LOOKUP_DISPATCH("lookup_candidate_key")
 enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node)
@@ -6731,7 +6786,7 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
  * non-identity key_map remapping happens at iter-set time, not at
  * lookup time), so there is no non-identity branch on this path.
  */
-static
+static FT_LOOKUP_FAST_PATH("lookup")
 enum cds_ft_status ft_lookup_iter_specv_sc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -6745,7 +6800,7 @@ enum cds_ft_status ft_lookup_iter_specv_sc(struct cds_ft *ft,
 	return status;
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup")
 enum cds_ft_status ft_lookup_iter_specv_nosc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -6759,7 +6814,7 @@ enum cds_ft_status ft_lookup_iter_specv_nosc(struct cds_ft *ft,
 	return status;
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup")
 enum cds_ft_status ft_lookup_iter_precise_sc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -6773,7 +6828,7 @@ enum cds_ft_status ft_lookup_iter_precise_sc(struct cds_ft *ft,
 	return status;
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup")
 enum cds_ft_status ft_lookup_iter_precise_nosc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -6787,6 +6842,7 @@ enum cds_ft_status ft_lookup_iter_precise_nosc(struct cds_ft *ft,
 	return status;
 }
 
+FT_LOOKUP_DISPATCH("lookup")
 enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -6798,7 +6854,7 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
  * Always precise descent (descend_cand=false, spec_validate=false)
  * because partial-match needs per-step compressed verification.
  */
-static
+static FT_LOOKUP_FAST_PATH("lookup_partial_key")
 enum cds_ft_status ft_lookup_partial_key_sc(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
@@ -6820,7 +6876,7 @@ enum cds_ft_status ft_lookup_partial_key_sc(struct cds_ft *ft,
 	return partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup_partial_key")
 enum cds_ft_status ft_lookup_partial_key_nosc(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
@@ -6848,7 +6904,7 @@ enum cds_ft_status ft_lookup_partial_key_nosc(struct cds_ft *ft,
  * rare; ordinals[] is allocated on stack inside this fn so
  * call/return overhead is acceptable.
  */
-static __attribute__((cold))
+static FT_LOOKUP_SLOW_PATH("lookup_partial_key")
 enum cds_ft_status ft_lookup_partial_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
@@ -6873,6 +6929,7 @@ enum cds_ft_status ft_lookup_partial_key_nonidentity(struct cds_ft *ft,
 	return partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
 
+FT_LOOKUP_DISPATCH("lookup_partial_key")
 enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
@@ -6885,7 +6942,7 @@ enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
  * Specialized partial (iter form) inners.  Same as lookup_iter_*
  * but with tracking=PARTIAL and the post-descent iter override.
  */
-static
+static FT_LOOKUP_FAST_PATH("lookup_partial")
 enum cds_ft_status ft_lookup_partial_iter_sc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -6903,7 +6960,7 @@ enum cds_ft_status ft_lookup_partial_iter_sc(struct cds_ft *ft,
 	return iter->status;
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup_partial")
 enum cds_ft_status ft_lookup_partial_iter_nosc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -6921,6 +6978,7 @@ enum cds_ft_status ft_lookup_partial_iter_nosc(struct cds_ft *ft,
 	return iter->status;
 }
 
+FT_LOOKUP_DISPATCH("lookup_partial")
 enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -6954,7 +7012,7 @@ enum cds_ft_status ft_lookup_longest_match_key_finish(
 	return match_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_INTERNAL_MATCH;
 }
 
-static
+static FT_LOOKUP_FAST_PATH("lookup_longest_match_key")
 enum cds_ft_status ft_lookup_longest_match_key_sc(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
@@ -6976,7 +7034,7 @@ enum cds_ft_status ft_lookup_longest_match_key_sc(struct cds_ft *ft,
 			match_node, match_len, result_node);
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup_longest_match_key")
 enum cds_ft_status ft_lookup_longest_match_key_nosc(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
@@ -6998,7 +7056,7 @@ enum cds_ft_status ft_lookup_longest_match_key_nosc(struct cds_ft *ft,
 			match_node, match_len, result_node);
 }
 
-static __attribute__((cold))
+static FT_LOOKUP_SLOW_PATH("lookup_longest_match_key")
 enum cds_ft_status ft_lookup_longest_match_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
@@ -7022,6 +7080,7 @@ enum cds_ft_status ft_lookup_longest_match_key_nonidentity(struct cds_ft *ft,
 			match_node, match_len, result_node);
 }
 
+FT_LOOKUP_DISPATCH("lookup_longest_match_key")
 enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
 		struct cds_ft_node **result_node)
@@ -7060,7 +7119,7 @@ end:
 	return iter->status;
 }
 
-static
+static FT_LOOKUP_FAST_PATH("lookup_longest_match")
 enum cds_ft_status ft_lookup_longest_match_iter_sc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -7076,7 +7135,7 @@ enum cds_ft_status ft_lookup_longest_match_iter_sc(struct cds_ft *ft,
 			match_node, iter);
 }
 
-static
+static FT_LOOKUP_SLOW_PATH("lookup_longest_match")
 enum cds_ft_status ft_lookup_longest_match_iter_nosc(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
@@ -7092,6 +7151,7 @@ enum cds_ft_status ft_lookup_longest_match_iter_nosc(struct cds_ft *ft,
 			match_node, iter);
 }
 
+FT_LOOKUP_DISPATCH("lookup_longest_match")
 enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
