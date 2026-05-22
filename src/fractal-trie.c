@@ -1678,6 +1678,13 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
  * For external (leaf) children: uses cds_ft_node.prev (which points
  * to the parent for the head of a duplicate chain).
  *
+ * No validation against the slot's skip_len: callers (including
+ * writers in mid-mutation, where the back-pointer and slot value
+ * are intentionally inconsistent for a brief window) get whatever
+ * the back-pointer currently says.  Reader paths that must observe
+ * a self-consistent slot+cn pair use ft_skip_to_compressed_validate
+ * (with retry at the caller level).
+ *
  * Read-side safe (rcu_dereference on both fields).  Callers must be
  * in an RCU read-side critical section (or QSBR equivalent).
  */
@@ -1694,6 +1701,41 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
 		parent = rcu_dereference(cds_ft_item_to_metadata(
 			ft_node_ptr(child))->parent);
 	return ft_compressed_node_ptr(parent);
+}
+
+/*
+ * ft_skip_to_compressed_validate: reader-only variant that validates
+ * the recovery against the slot's skip_len.  Returns NULL on mismatch,
+ * indicating a concurrent writer is mid-split/merge: the child's
+ * back-pointer has been updated in-place but the parent slot value
+ * hasn't been republished yet.  The caller is expected to be in the
+ * reader role: re-read the slot from its source and retry, bounded
+ * by the writer's structural mutation window (microseconds — between
+ * ft_set_parent and ft_publish_to_parent on the writer side).
+ *
+ * The validation works because:
+ *   - Split always shortens: sfx->len < CN->len.
+ *   - Chain-merge always lengthens: CN_merged->len = CN1->len + CN2->len.
+ * So every problematic in-place mutation lands at a cn whose len
+ * differs from the slot's skip_len.  Same-length spurious matches
+ * are correct: the only structurally relevant property for the
+ * caller (ordinal_key byte count, cn->key_bytes content) is the
+ * length; same-length cn replacement consumes the same byte count.
+ *
+ * Writers must NOT use this function: a writer mid-mutation reading
+ * its own in-flight state would loop forever (it IS the race partner).
+ * Writers use ft_skip_to_compressed (no validation).
+ */
+static inline
+struct cds_ft_compressed_node *ft_skip_to_compressed_validate(
+		struct cds_ft_inode_flag *skip_ptr)
+{
+	unsigned int skip_len_slot = ft_skip_len(skip_ptr);
+	struct cds_ft_compressed_node *cn = ft_skip_to_compressed(skip_ptr);
+
+	if (caa_unlikely(!cn || cn->len != skip_len_slot))
+		return NULL;
+	return cn;
 }
 
 /*
@@ -1813,6 +1855,13 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
 
 static inline
 struct cds_ft_compressed_node *ft_skip_to_compressed(
+		struct cds_ft_inode_flag *skip_ptr)
+{
+	return ft_compressed_node_ptr(skip_ptr);
+}
+
+static inline
+struct cds_ft_compressed_node *ft_skip_to_compressed_validate(
 		struct cds_ft_inode_flag *skip_ptr)
 {
 	return ft_compressed_node_ptr(skip_ptr);
@@ -4363,6 +4412,12 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip_pretyped(
  * If the child is a skip pointer, converts it to the underlying
  * compressed node flag so callers see it as a regular compressed node.
  * Used by all paths except candidate lookup.
+ *
+ * No validation: callers may be writers reading their own in-flight
+ * mutation state (between ft_set_parent and ft_publish_to_parent),
+ * where the parent back-pointer chain is intentionally inconsistent
+ * with the slot value.  Reader callers that need consistency wrap
+ * with ft_skip_to_compressed and the validation retry locally.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
@@ -4444,10 +4499,18 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 	}
 }
 
+/*
+ * @validate_lookup: when true, validate the skip-compressed resolution
+ * against the slot's skip_len and retry on mismatch.  RCU readers
+ * must pass true; writers must pass false (a writer mid-mutation
+ * reading its own in-flight state would loop forever — the writer
+ * IS the race partner).  With static inlining and a constant arg,
+ * the unused branch is DCE'd at each call site.
+ */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_flag,
 		int n, uint8_t *result_key,
-		enum ft_direction dir)
+		enum ft_direction dir, bool validate_lookup)
 {
 	unsigned int type_index;
 	struct cds_ft_inode *node;
@@ -4466,49 +4529,60 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	type_index = ft_node_type(node_flag);
 	type = &ft_types[type_index];
 
-	switch (type->type_class) {
-	case FT_POPCOUNT:
-		child = ft_popcount_node_get_direction(type, node, n, result_key, dir);
-		break;
-	case FT_PIGEON:
-		child = ft_pigeon_node_get_direction(type, node, n, result_key, dir);
-		break;
-	default:
-		assert(0);
-		return (void *) -1UL;
+	for (;;) {
+		switch (type->type_class) {
+		case FT_POPCOUNT:
+			child = ft_popcount_node_get_direction(type, node, n, result_key, dir);
+			break;
+		case FT_PIGEON:
+			child = ft_pigeon_node_get_direction(type, node, n, result_key, dir);
+			break;
+		default:
+			assert(0);
+			return (void *) -1UL;
+		}
+		if (!validate_lookup)
+			return ft_resolve_skip_compressed(child);
+		if (!child || !ft_node_skip_compressed(child))
+			return child;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		{
+			struct cds_ft_compressed_node *cn =
+				ft_skip_to_compressed_validate(child);
+			if (caa_likely(cn != NULL))
+				return ft_compressed_node_flag(cn);
+		}
+		caa_cpu_relax();
+#else
+		return child;
+#endif
 	}
-	child = ft_resolve_skip_compressed(child);
-	return child;
 }
 
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_leftright(struct cds_ft_inode_flag *node_flag,
 		unsigned int n, uint8_t *result_key,
-		enum ft_direction dir)
+		enum ft_direction dir, bool validate_lookup)
 {
-	return ft_node_get_direction(node_flag, n, result_key, dir);
+	return ft_node_get_direction(node_flag, n, result_key, dir, validate_lookup);
 }
 
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_minmax(struct cds_ft_inode_flag *node_flag,
 		uint8_t *result_key,
-		enum ft_direction dir)
+		enum ft_direction dir, bool validate_lookup)
 {
-	struct cds_ft_inode_flag *ret;
-
 	switch (dir) {
 	case FT_LEFTMOST:
-		ret = ft_node_get_direction(node_flag,
-				-1, result_key, FT_RIGHT);
-		break;
+		return ft_node_get_direction(node_flag,
+				-1, result_key, FT_RIGHT, validate_lookup);
 	case FT_RIGHTMOST:
-		ret = ft_node_get_direction(node_flag,
-				FT_ENTRY_PER_NODE, result_key, FT_LEFT);
-		break;
+		return ft_node_get_direction(node_flag,
+				FT_ENTRY_PER_NODE, result_key, FT_LEFT, validate_lookup);
 	default:
 		assert(0);
+		return NULL;
 	}
-	return ret;
 }
 
 /*
@@ -7669,7 +7743,8 @@ going_up:
 			continue;
 		}
 		node_flag = ft_node_get_leftright(iter_path_node(iter)[level - 1],
-				key_value, &ordinal_key[level - 1], dir);
+				key_value, &ordinal_key[level - 1], dir,
+				true /* validate_lookup */);
 		dbg_printf("cds_ft_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
 				(unsigned int) key_value, (unsigned int) ordinal_key[level - 1],
 				node_flag);
@@ -7842,7 +7917,8 @@ descend_children:
 			continue;
 		}
 		skip_eq_external_nodes = false;
-		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir);
+		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir,
+				true /* validate_lookup */);
 		/*
 		 * Transiently empty internal node (linear/popcount/pigeon): a reader may
 		 * observe every slot of a reachable internal node as
@@ -10508,7 +10584,8 @@ int ft_detach_node(struct cds_ft *ft,
 			uint8_t surviving_byte = 0;
 			struct cds_ft_inode_flag *surviving_child =
 				ft_node_get_minmax(iter_node_flag,
-					&surviving_byte, FT_LEFTMOST);
+					&surviving_byte, FT_LEFTMOST,
+					false /* writer; no validation */);
 			bool parent_compressed = ft_node_compressed(
 					iter_meta->parent);
 			bool child_compressed = surviving_child
@@ -13477,7 +13554,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		}
 		/* Iterate children in ascending ordinal order. */
 		pivot = -1;
-		child = ft_node_get_direction(node_flag, pivot, &child_key, FT_RIGHT);
+		child = ft_node_get_direction(node_flag, pivot, &child_key, FT_RIGHT, true);
 		while (child) {
 			unsigned long child_keys;
 
@@ -13492,7 +13569,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 			}
 			remaining -= child_keys;
 			pivot = child_key;
-			child = ft_node_get_direction(node_flag, pivot, &child_key, FT_RIGHT);
+			child = ft_node_get_direction(node_flag, pivot, &child_key, FT_RIGHT, true);
 		}
 
 		/* Exhausted all children without finding. */
@@ -13638,7 +13715,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		}
 		/* Iterate children in descending ordinal order first. */
 		pivot = FT_ENTRY_PER_NODE;
-		child = ft_node_get_direction(node_flag, pivot, &child_key, FT_LEFT);
+		child = ft_node_get_direction(node_flag, pivot, &child_key, FT_LEFT, true);
 		while (child) {
 			unsigned long child_keys;
 
@@ -13653,7 +13730,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 			}
 			remaining -= child_keys;
 			pivot = child_key;
-			child = ft_node_get_direction(node_flag, pivot, &child_key, FT_LEFT);
+			child = ft_node_get_direction(node_flag, pivot, &child_key, FT_LEFT, true);
 		}
 
 check_ext_nth_last:
@@ -13942,7 +14019,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 				int pivot = -1;
 
 				child = ft_node_get_direction(parent, pivot,
-						&child_key, FT_RIGHT);
+						&child_key, FT_RIGHT, true);
 				while (child) {
 					unsigned long ck = ft_child_key_count(child);
 
@@ -13955,7 +14032,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 					remaining -= ck;
 					pivot = child_key;
 					child = ft_node_get_direction(parent, pivot,
-							&child_key, FT_RIGHT);
+							&child_key, FT_RIGHT, true);
 				}
 			}
 		}
@@ -13988,7 +14065,7 @@ skip_fwd_walk_up:
 
 		pivot = ordinal_key[level];
 		child = ft_node_get_direction(ancestor, pivot,
-				&child_key, FT_RIGHT);
+				&child_key, FT_RIGHT, true);
 		while (child) {
 			unsigned long ck = ft_child_key_count(child);
 
@@ -14002,7 +14079,7 @@ skip_fwd_walk_up:
 			remaining -= ck;
 			pivot = child_key;
 			child = ft_node_get_direction(ancestor, pivot,
-					&child_key, FT_RIGHT);
+					&child_key, FT_RIGHT, true);
 		}
 		/*
 		 * No external_nodes to count going up in forward direction
@@ -14077,7 +14154,7 @@ descend_forward:
 			}
 			pivot = -1;
 			child = ft_node_get_direction(node_flag, pivot,
-					&child_key, FT_RIGHT);
+					&child_key, FT_RIGHT, true);
 			while (child) {
 				unsigned long ck = ft_child_key_count(child);
 
@@ -14091,7 +14168,7 @@ descend_forward:
 				remaining -= ck;
 				pivot = child_key;
 				child = ft_node_get_direction(node_flag, pivot,
-						&child_key, FT_RIGHT);
+						&child_key, FT_RIGHT, true);
 			}
 			break;
 
@@ -14321,12 +14398,12 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		/* Count leftward siblings. */
 		pivot = ordinal_key[level];
 		child = ft_node_get_direction(ancestor, pivot,
-				&child_key, FT_LEFT);
+				&child_key, FT_LEFT, true);
 		while (child) {
 			left_keys += ft_child_key_count(child);
 			pivot = child_key;
 			child = ft_node_get_direction(ancestor, pivot,
-					&child_key, FT_LEFT);
+					&child_key, FT_LEFT, true);
 		}
 
 		/* External_nodes at ancestor sort before all children. */
@@ -14347,7 +14424,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 				 */
 				pivot = ordinal_key[level];
 				child = ft_node_get_direction(ancestor, pivot,
-						&child_key, FT_LEFT);
+						&child_key, FT_LEFT, true);
 				while (child) {
 					unsigned long ck =
 						ft_child_key_count(child);
@@ -14364,7 +14441,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 					pivot = child_key;
 					child = ft_node_get_direction(
 							ancestor, pivot,
-							&child_key, FT_LEFT);
+							&child_key, FT_LEFT, true);
 				}
 
 				/* Must be the external_nodes. */
@@ -14433,7 +14510,7 @@ descend_reverse:
 			}
 			pivot = FT_ENTRY_PER_NODE;
 			child = ft_node_get_direction(node_flag, pivot,
-					&child_key, FT_LEFT);
+					&child_key, FT_LEFT, true);
 			while (child) {
 				unsigned long ck = ft_child_key_count(child);
 
@@ -14447,7 +14524,7 @@ descend_reverse:
 				remaining -= ck;
 				pivot = child_key;
 				child = ft_node_get_direction(node_flag, pivot,
-						&child_key, FT_LEFT);
+						&child_key, FT_LEFT, true);
 			}
 
 check_ext_descend_reverse:
