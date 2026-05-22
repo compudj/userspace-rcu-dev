@@ -11986,6 +11986,18 @@ ft_make_root_internal(struct cds_ft *ft,
 		 * the root slot.
 		 */
 		ft_set_parent(cn->child, slot_value, &new_cn->child);
+		/*
+		 * Convert to skip-encoded pointer if skip-compressed
+		 * mode is enabled and the path length fits.  Without
+		 * this, slot stores a plain compressed flag and skip
+		 * mode loses the CL-bypass on this slot — and reader
+		 * code that expects skip-encoded slots under SPECULATIVE
+		 * (e.g. iter / inequality descent) can dispatch the
+		 * wrong way.  Mirrors the pattern in
+		 * ft_split_compressed_graft_key_shorter and other
+		 * compressed-publish sites.
+		 */
+		slot_value = ft_publish_compressed(ft, new_cn, slot_value);
 	}
 
 	root_node = alloc_cds_ft_node(ft, &ft_types[0], &root_meta);
@@ -12600,8 +12612,16 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * For empty swap, swap_ft->root stays as old_swap_root
 		 * (swap's original empty root) and old_child attaches
 		 * there as external_nodes.
+		 *
+		 * Skip-encoded pointers carry a compressed-prefix above
+		 * the external leaf; treat them as non-external for this
+		 * decision so the compressed prefix is materialized
+		 * into swap_ft's structure (ft_make_root_internal
+		 * handles the skip-encoded case).  The low tag bits of
+		 * a skip-encoded external are 0, so ft_node_external
+		 * alone misclassifies them.
 		 */
-		if (!ft_node_external(old_child)) {
+		if (!ft_node_external(old_child) || ft_node_skip_compressed(old_child)) {
 			/*
 			 * Materialize an internal root from @old_child if
 			 * needed (compressed / skip-compressed cases): the
@@ -14673,11 +14693,6 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	 * cds_ft_speculative_lookup_key should call
 	 * cds_ft_group_attr_set_lookup_optimization(attr,
 	 * CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE) explicitly.
-	 *
-	 * Flipping the default to SPECULATIVE is a future follow-up
-	 * (gated on resolving a latent issue with concurrent iteration
-	 * under SKIP_COMPRESSED — inv_iteration_order hangs on
-	 * speculative tries).
 	 */
 	*result = attr;
 	return CDS_FT_STATUS_OK;
