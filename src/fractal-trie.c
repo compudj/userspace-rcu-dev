@@ -6417,39 +6417,220 @@ enum cds_ft_status do_cds_ft_lookup(struct cds_ft *ft,
 			tracking_match_len, tracking_match_node);
 }
 
+/*
+ * Specialized lookup_key/lookup_candidate_key inner functions.
+ * Each bakes the (descend_cand, skip_compressed, spec_validate)
+ * triple into a literal-arg call to the matching always_inline
+ * wrapper — the wrapper then inlines into the inner with all
+ * per-iter branches on those constants folded out.  Each is
+ * referenced via the function pointers installed on struct cds_ft
+ * by ft_install_lookup_ops (see cds_ft_create), so gcc cannot
+ * inline them into the caller — they exist as real symbols and
+ * the public entry point dispatches via an indirect tail call.
+ *
+ * Identity key_map is implied for the four hot-path inners
+ * (FT_PREFIX_TRACK_NONE, key passed directly, no ordinals[]).
+ * Non-identity callers route through ft_lookup_*_nonidentity
+ * below, which carry a FT_MAX_KEY_LEN stack buffer.
+ */
+static
+enum cds_ft_status ft_lookup_specv_sc(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	enum cds_ft_status status;
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP_KEY(lookup_key_enter, ft, key, key_len);
+	status = do_cds_ft_lookup_dc_sc(ft, key, key_len, key_readable_pad,
+			result_node, NULL,
+			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
+	FT_TP(lookup_key_exit, (int) status);
+	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_specv_nosc(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	enum cds_ft_status status;
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP_KEY(lookup_key_enter, ft, key, key_len);
+	status = do_cds_ft_lookup_dc_nosc(ft, key, key_len, key_readable_pad,
+			result_node, NULL,
+			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
+	FT_TP(lookup_key_exit, (int) status);
+	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_precise_sc(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	enum cds_ft_status status;
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP_KEY(lookup_key_enter, ft, key, key_len);
+	status = do_cds_ft_lookup_nodc_sc(ft, key, key_len, key_readable_pad,
+			result_node, NULL,
+			FT_PREFIX_TRACK_NONE, NULL, NULL);
+	FT_TP(lookup_key_exit, (int) status);
+	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_precise_nosc(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	enum cds_ft_status status;
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP_KEY(lookup_key_enter, ft, key, key_len);
+	status = do_cds_ft_lookup_nodc_nosc(ft, key, key_len, key_readable_pad,
+			result_node, NULL,
+			FT_PREFIX_TRACK_NONE, NULL, NULL);
+	FT_TP(lookup_key_exit, (int) status);
+	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_cand_sc(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	return do_cds_ft_lookup_dc_sc(ft, key, key_len, key_readable_pad,
+			result_node, NULL,
+			FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+}
+
+static
+enum cds_ft_status ft_lookup_cand_nosc(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	return do_cds_ft_lookup_dc_nosc(ft, key, key_len, key_readable_pad,
+			result_node, NULL,
+			FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+}
+
+/*
+ * Non-identity key_map fallback (key + candidate variants).
+ * Allocates a FT_MAX_KEY_LEN stack buffer for the ordinals[]
+ * remap and routes through do_cds_ft_lookup, which re-derives
+ * (spec_validate, descend_cand) from group state at runtime.
+ * Non-identity maps are rare (only set via
+ * cds_ft_group_attr_set_key_map) so the extra dispatch hop is
+ * not worth specializing further.
+ */
+static
+enum cds_ft_status ft_lookup_key_nonidentity(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	uint8_t ordinals[FT_MAX_KEY_LEN];
+	enum cds_ft_status status;
+
+	(void) key_readable_pad;	/* ordinals[] is a stack buffer of
+					   fixed size; readable_pad doesn't
+					   carry across the remap. */
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
+	FT_TP_KEY(lookup_key_enter, ft, ordinals, key_len);
+	status = do_cds_ft_lookup(ft, ordinals, key_len,
+			FT_KEY_READABLE_PAD, result_node, NULL,
+			FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+	FT_TP(lookup_key_exit, (int) status);
+	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_candidate_key_nonidentity(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	uint8_t ordinals[FT_MAX_KEY_LEN];
+
+	(void) key_readable_pad;
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
+	return do_cds_ft_lookup(ft, ordinals, key_len,
+			FT_KEY_READABLE_PAD, result_node, NULL,
+			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
+}
+
+/*
+ * Install per-API lookup function pointers on @ft based on group
+ * flags.  Called once at cds_ft_create.  Pointers are stable for
+ * the trie's lifetime because the group flags (key_map.identity,
+ * speculative_validated, CDS_FT_FLAG_SKIP_COMPRESSED) are immutable
+ * after group creation.
+ */
+static
+void ft_install_lookup_ops(struct cds_ft *ft)
+{
+	const struct cds_ft_group *group = ft->group;
+
+	if (caa_unlikely(!group->key_map.identity)) {
+		ft->lookup_key_fn = ft_lookup_key_nonidentity;
+		ft->lookup_candidate_key_fn = ft_lookup_candidate_key_nonidentity;
+		return;
+	}
+	if (group->speculative_validated) {
+		ft->lookup_key_fn = ft_group_skip_compressed(group)
+			? ft_lookup_specv_sc : ft_lookup_specv_nosc;
+	} else {
+		ft->lookup_key_fn = ft_group_skip_compressed(group)
+			? ft_lookup_precise_sc : ft_lookup_precise_nosc;
+	}
+	ft->lookup_candidate_key_fn = ft_group_skip_compressed(group)
+		? ft_lookup_cand_sc : ft_lookup_cand_nosc;
+}
+
+/*
+ * Public lookup_key / lookup_candidate_key entries.
+ *
+ * Reduced to a single indirect tail-call through the function
+ * pointer installed on @ft at create time (see
+ * ft_install_lookup_ops).  gcc -O2 emits a sibling call
+ * (`mov 0x?(%rdi),%rax; jmp *%rax`) — no stack frame, no
+ * callee-save save/restore, no per-call branch on group shape.
+ * The branch predictor stores the fn-ptr target once per trie
+ * and predicts it for every subsequent lookup.
+ */
 enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node)
 {
-	size_t key_len = ft_key_len(ft, _key_len);
-	const struct cds_ft_key_map *km = &ft->group->key_map;
-	enum cds_ft_status status;
-
-	if (!valid_key_len(ft, key_len))
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	CDS_FT_SCOPED_READER(ft);
-	FT_TP_KEY(lookup_key_enter, ft, key, _key_len);
-	if (caa_likely(km->identity)) {
-		status = do_cds_ft_lookup(ft, key, key_len, _key_readable_pad,
-					result_node, NULL,
-					FT_PREFIX_TRACK_NONE, NULL, NULL, false);
-	} else {
-		uint8_t ordinals[FT_MAX_KEY_LEN];
-
-		ft_key_to_ordinals(ordinals, key, key_len, km);
-		/*
-		 * ordinals[] is a FT_MAX_KEY_LEN stack buffer.  For
-		 * key_len <= 32 the buffer's tail provides far more than
-		 * FT_KEY_READABLE_PAD bytes past the key; for key_len > 32
-		 * the long-key dispatcher doesn't use the pad.  Either way
-		 * FT_KEY_READABLE_PAD is a safe promise.
-		 */
-		status = do_cds_ft_lookup(ft, ordinals, key_len,
-					FT_KEY_READABLE_PAD, result_node, NULL,
-					FT_PREFIX_TRACK_NONE, NULL, NULL, false);
-	}
-	FT_TP(lookup_key_exit, (int) status);
-	return status;
+	return (*ft->lookup_key_fn)(ft, key, _key_len,
+			_key_readable_pad, result_node);
 }
 
 /*
@@ -6469,31 +6650,8 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node)
 {
-	size_t key_len = ft_key_len(ft, _key_len);
-	const struct cds_ft_key_map *km = &ft->group->key_map;
-
-	if (!valid_key_len(ft, key_len))
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	CDS_FT_SCOPED_READER(ft);
-	/*
-	 * Identity key-map fast path: the ordinals[] buffer would be
-	 * a byte-for-byte copy of @key; skip the 256-byte stack
-	 * allocation and the entry memcpy by passing the caller's
-	 * key directly to the descent.  Common case -- non-identity
-	 * maps are only set up for key_maps that reorder bytes.
-	 */
-	if (caa_likely(km->identity))
-		return do_cds_ft_lookup(ft, key, key_len, _key_readable_pad,
-					result_node, NULL,
-					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
-	{
-		uint8_t ordinals[FT_MAX_KEY_LEN];
-
-		ft_key_to_ordinals(ordinals, key, key_len, km);
-		return do_cds_ft_lookup(ft, ordinals, key_len,
-					FT_KEY_READABLE_PAD, result_node, NULL,
-					FT_PREFIX_TRACK_NONE, NULL, NULL, true);
-	}
+	return (*ft->lookup_candidate_key_fn)(ft, key, _key_len,
+			_key_readable_pad, result_node);
 }
 
 enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
@@ -14538,6 +14696,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->spec.key_offset = (uint16_t) ft_group->speculative_key_offset;
 	ft->spec.leaf_readable_pad = (uint16_t) ft_group->speculative_leaf_readable_pad;
 	ft->spec.validated = ft_group->speculative_validated ? 1 : 0;
+	ft_install_lookup_ops(ft);
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
 	 * Default to verify-every-mutation cadence to preserve the

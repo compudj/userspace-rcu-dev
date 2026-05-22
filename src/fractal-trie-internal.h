@@ -592,11 +592,43 @@ struct cds_ft_speculative_attrs {
 	uint8_t _reserved[3];
 };
 
+/*
+ * Per-API lookup function pointers cached on struct cds_ft so the
+ * public entry points dispatch via one indirect tail-call to a
+ * fully-specialized inner (no per-call runtime branch on group
+ * shape — the library picks the right inner once at cds_ft_create
+ * and caches it here).  See ft_install_lookup_ops in fractal-trie.c.
+ *
+ * Each pointer's signature matches the corresponding cds_ft_*
+ * public API.  The pointer is stable for the lifetime of the trie:
+ * group flags (key_map.identity, speculative_validated, the
+ * CDS_FT_FLAG_SKIP_COMPRESSED bit) are immutable after group
+ * creation, so a single load + indirect jmp on the hot path is all
+ * the dispatch cost vs the ~22 ns regression seen from runtime-
+ * gated dispatch (see [[ft-lookup-inline-keep]]).
+ */
+struct cds_ft;
+struct cds_ft_node;
+typedef enum cds_ft_status (*cds_ft_lookup_key_fn)(
+		struct cds_ft *ft, const uint8_t *key,
+		size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node);
+
 struct cds_ft {
 	struct cds_ft_group *group;
 
 	struct cds_ft_inode_flag *root;		/* Root node (arena-allocated, always present, always internal). */
 	struct cds_ft_speculative_attrs spec;	/* Cached spec_validate attrs (read on lookup hot path). */
+
+	/*
+	 * Specialized lookup dispatch pointers — installed at
+	 * cds_ft_create based on group flags.  See the typedef
+	 * comment above.  Placed near @root and @spec so a single
+	 * cache-line fetch on lookup entry serves the descent.
+	 */
+	cds_ft_lookup_key_fn lookup_key_fn;
+	cds_ft_lookup_key_fn lookup_candidate_key_fn;
+
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
 	unsigned long nr_fallback;		/* Number of fallback nodes used */
 
