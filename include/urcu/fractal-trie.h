@@ -302,6 +302,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -603,6 +604,64 @@ enum cds_ft_status cds_ft_eager_lookup_key(struct cds_ft *ft,
 enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, size_t key_readable_pad,
 		struct cds_ft_node **result_node);
+
+/*
+ * cds_ft_speculative_lookup_key - Speculative descent + caller-side
+ *                                 key validation.
+ * @ft: The Fractal Trie.
+ * @key: Key to look up (may be NULL if @key_len is 0).
+ * @key_len: Key length in bytes (must be the resolved byte count, not
+ *           CDS_FT_LEN_DEFAULT).
+ * @key_readable_pad: Padding past @key end (see cds_ft_eager_lookup_key).
+ * @key_offset: Byte offset from the (struct cds_ft_node *) stored in
+ *              the trie to the start of the user-stored key bytes.
+ *              Typically computed as
+ *              offsetof(user_struct, key_field) -
+ *              offsetof(user_struct, ft_node_field).
+ * @result_node: Result output. Set to the matched node on OK, NULL on
+ *               NOT_FOUND.
+ *
+ * Equivalent to cds_ft_lookup_candidate_key followed by a memcmp
+ * against the candidate's stored key bytes.  Inlined into the caller
+ * so the offset and length are visible to the compiler at the compare
+ * site (typically allowing constant-folding when the caller knows
+ * them).  The validation memcmp uses libc's optimized variant (e.g.
+ * EVEX/AVX-512 on x86) resolved through the PLT at runtime.
+ *
+ * Equivalent to cds_ft_eager_lookup_key in result semantics, but with
+ * caller-side validation instead of library-side.  On a candidate
+ * descent the library no longer pays for inline SIMD validation in
+ * the descent function, and the caller's memcmp inlines at the use
+ * site where @key_offset and @key_len are typically constant.
+ *
+ * Returns CDS_FT_STATUS_OK on success (match found),
+ * CDS_FT_STATUS_NOT_FOUND if no match, or a negative cds_ft_status
+ * on error.
+ *
+ * An RCU read-side lock must be held while calling this function and
+ * while accessing the returned node.
+ */
+static inline
+enum cds_ft_status cds_ft_speculative_lookup_key(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		size_t key_offset, struct cds_ft_node **result_node)
+{
+	struct cds_ft_node *found = NULL;
+	enum cds_ft_status status;
+
+	status = cds_ft_lookup_candidate_key(ft, key, key_len,
+			key_readable_pad, &found);
+	if (status != CDS_FT_STATUS_OK)
+		return status;
+	if (memcmp(key, (const uint8_t *) found + key_offset, key_len) != 0) {
+		if (result_node)
+			*result_node = NULL;
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	if (result_node)
+		*result_node = found;
+	return CDS_FT_STATUS_OK;
+}
 
 /*
  * cds_ft_lookup_partial_key - Look up by key, find closest partial match.
