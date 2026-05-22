@@ -5867,7 +5867,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	 * the per-step path entry through @path_nodes without rehydrating
 	 * @iter from its stack slot at every access.  NULL @iter yields a
 	 * NULL @path_nodes, and the path-write conditionals fold away at
-	 * compile time for callers without an iter (cds_ft_lookup_key).
+	 * compile time for callers without an iter (cds_ft_eager_lookup_key).
 	 */
 	/*
 	 * Gate path tracking on CACHED mode: UNCACHED iters have their
@@ -6143,7 +6143,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		} else if (track && key < key_end) {
 			/*
 			 * Track prefix match on the internal child.  DCE'd
-			 * when track=false (cds_ft_lookup_key).
+			 * when track=false (cds_ft_eager_lookup_key).
 			 */
 			const struct cds_ft_type *type = &ft_types[ft_node_type(node_flag)];
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata_fast(
@@ -6747,7 +6747,7 @@ void ft_install_lookup_ops(struct cds_ft *ft)
  * and predicts it for every subsequent lookup.
  */
 FT_LOOKUP_DISPATCH("lookup_key")
-enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
+enum cds_ft_status cds_ft_eager_lookup_key(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node)
 {
@@ -6763,7 +6763,7 @@ enum cds_ft_status cds_ft_lookup_key(struct cds_ft *ft,
  * The caller MUST verify the returned node's key matches the
  * lookup key.  If it does not match, the key is not in the trie.
  *
- * This is faster than cds_ft_lookup_key for workloads with long
+ * This is faster than cds_ft_eager_lookup_key for workloads with long
  * compressed paths (e.g. reverse DNS, file paths) because it
  * eliminates per-node key comparisons, doing a single verification
  * at the end instead.
@@ -14782,7 +14782,7 @@ enum cds_ft_status cds_ft_group_attr_set_speculative(struct cds_ft_group_attr *a
 	 * to be useful: without it, cds_ft_lookup_candidate_key already
 	 * does cand-mode descent regardless of the group attr (the
 	 * candidate flag is gated by the API entry point, not the group),
-	 * and cds_ft_lookup_key stays on the precise path (no offsets to
+	 * and cds_ft_eager_lookup_key stays on the precise path (no offsets to
 	 * validate against).  When skip-compressed is unavailable on the
 	 * build/host, this attribute would be a no-op, so report it as
 	 * unsupported rather than silently doing nothing.

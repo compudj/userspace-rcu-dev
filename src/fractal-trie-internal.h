@@ -542,7 +542,7 @@ struct cds_ft_group {
 	 * @speculative: enable cand-mode descent and (when supported)
 	 *   skip-compressed pointer encoding for this group's tries.
 	 * @speculative_validated: implies @speculative; in addition,
-	 *   non-candidate lookups (cds_ft_lookup_key, iterator-based
+	 *   non-candidate lookups (cds_ft_eager_lookup_key, iterator-based
 	 *   cds_ft_lookup) descend speculatively and validate the result
 	 *   against the external node's stored key bytes via the inline
 	 *   SIMD/SWAR comparator before returning.
@@ -563,7 +563,7 @@ struct cds_ft_group {
 
 /*
  * Spec_validate attrs packed into 8 bytes, copied from the group
- * at trie creation and re-read on every cds_ft_lookup_key call.
+ * at trie creation and re-read on every cds_ft_eager_lookup_key call.
  * Lives in struct cds_ft (next to @root) so the descent's existing
  * load of @ft picks the line up; the spec_validate compare block
  * then gets both attrs from one CL load instead of dependent loads
@@ -575,7 +575,7 @@ struct cds_ft_group {
  *    key.  Max 65535.
  *  - leaf_readable_pad: bytes safely loadable past
  *    stored_key[stored_key_len-1].
- *  - validated: 1 if cds_ft_lookup_key should run spec_validate.
+ *  - validated: 1 if cds_ft_eager_lookup_key should run spec_validate.
  *
  * The stored key length is intentionally NOT cached or read: a
  * candidate/speculative descent only terminates at a leaf when the
