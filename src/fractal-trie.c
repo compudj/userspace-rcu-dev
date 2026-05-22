@@ -8662,8 +8662,21 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		child_nr_keys = 0;
 	}
 
-	/* Build suffix → old child. */
-	if (suffix_len >= 2) {
+	/*
+	 * Build suffix → old child.
+	 *
+	 * Under SKIP_COMPRESSED, suffix_len >= 1 must produce a
+	 * compressed (skip-encoded) node; a 1-child internal at this
+	 * level would violate the chain-compress invariant (verify
+	 * rejects it).  Under non-SC mode, suffix_len == 1 historically
+	 * produced an internal node — that's still acceptable since the
+	 * invariant only applies in skip mode.
+	 */
+	if (suffix_len >= 2
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			|| (suffix_len == 1 && ft_group_skip_compressed(ft->group))
+#endif
+	   ) {
 		struct cds_ft_compressed_node *sfx;
 		struct cds_ft_metadata *sfx_meta;
 
@@ -8774,19 +8787,46 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			created[nr_created++] = dest;
 		}
 	} else if (remaining == 1) {
-		struct cds_ft_inode_flag *dest = NULL;
-		struct cds_ft_metadata *pfx_meta;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_group_skip_compressed(ft->group) &&
+		    !cn_meta->external_nodes) {
+			/*
+			 * 1-byte prefix without external_nodes: emit a
+			 * 1-byte compressed instead of a 1-child internal
+			 * (canonical form under SKIP_COMPRESSED).
+			 */
+			struct cds_ft_compressed_node *pfx;
+			struct cds_ft_metadata *pfx_meta;
 
-		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-			jct_flag, NULL, NULL, node_depth);
-		if (ret) goto error;
-		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
-			CMM_RELAXED);
-		if (cn_meta->external_nodes)
-			ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
-		top_flag = dest;
-		created[nr_created++] = dest;
+			pfx = alloc_compressed_node(ft, 1, &pfx_meta);
+			if (!pfx) goto error;
+			pfx->child = jct_flag;
+			pfx->len = 1;
+			pfx->key_bytes[0] = cn->key_bytes[0];
+			pfx_meta->nr_child = 1;
+			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
+				CMM_RELAXED);
+			top_flag = ft_compressed_node_flag(pfx);
+			ft_set_parent(jct_flag, top_flag, &pfx->child);
+			top_flag = ft_publish_compressed(ft, pfx, top_flag);
+			created[nr_created++] = top_flag;
+		} else
+#endif
+		{
+			struct cds_ft_inode_flag *dest = NULL;
+			struct cds_ft_metadata *pfx_meta;
+
+			ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
+				jct_flag, NULL, NULL, node_depth);
+			if (ret) goto error;
+			pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
+				CMM_RELAXED);
+			if (cn_meta->external_nodes)
+				ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
+			top_flag = dest;
+			created[nr_created++] = dest;
+		}
 	} else {
 		/* remaining == 0: no prefix, junction IS the top.
 		 * Transfer any existing external_nodes from the old
@@ -11287,8 +11327,19 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		old_child_nr_keys = 0;
 	}
 
-	/* 1. Build old suffix -> old child. */
-	if (suffix_len >= 2) {
+	/*
+	 * 1. Build old suffix -> old child.
+	 *
+	 * suffix_len == 1 under SKIP_COMPRESSED must be a 1-byte
+	 * compressed (the caller's branch keeps it as a non-root child
+	 * with no external_nodes — a 1-child internal would violate
+	 * the chain-compress invariant).
+	 */
+	if (suffix_len >= 2
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			|| (suffix_len == 1 && ft_group_skip_compressed(ft->group))
+#endif
+	   ) {
 		struct cds_ft_compressed_node *sfx;
 		struct cds_ft_metadata *sfx_meta;
 
@@ -11393,6 +11444,33 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		top_flag = dest;
 		created[nr_created++] = dest;
 	} else if (diverge_pos == 1) {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_group_skip_compressed(ft->group) &&
+		    !cn_meta->external_nodes) {
+			/*
+			 * 1-byte prefix without external_nodes: emit a
+			 * 1-byte compressed instead of a 1-child internal
+			 * (canonical form under SKIP_COMPRESSED).
+			 */
+			struct cds_ft_compressed_node *pfx;
+			struct cds_ft_metadata *pfx_meta;
+
+			pfx = alloc_compressed_node(ft, 1, &pfx_meta);
+			if (!pfx) goto error;
+			pfx->child = branch_flag;
+			pfx->len = 1;
+			pfx->key_bytes[0] = cn->key_bytes[0];
+			pfx_meta->nr_child = 1;
+			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
+				CMM_RELAXED);
+			top_flag = ft_compressed_node_flag(pfx);
+			ft_set_parent(branch_flag, top_flag, &pfx->child);
+			top_flag = ft_publish_compressed(ft, pfx, top_flag);
+			created[nr_created++] = top_flag;
+			goto after_prefix;
+		}
+#endif
+		{
 		struct cds_ft_inode_flag *dest = NULL;
 		struct cds_ft_metadata *pfx_meta;
 
@@ -11406,6 +11484,11 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 			ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
 		top_flag = dest;
 		created[nr_created++] = dest;
+		}
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	after_prefix:
+		(void) 0;
+#endif
 	} else {
 		/* diverge_pos == 0: branch IS the top. */
 		struct cds_ft_metadata *branch_meta =
