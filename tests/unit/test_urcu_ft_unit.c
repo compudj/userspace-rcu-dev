@@ -11900,13 +11900,26 @@ static int test_density_remove_through_compress(void)
  */
 static int test_density_graft_swap(void)
 {
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *live, *swap;
 	enum cds_ft_status s;
 	unsigned int i;
 
-	if (cds_ft_group_create(NULL, &group) < 0)
+	/*
+	 * Force SPECULATIVE so the test exercises the chain-compress
+	 * invariant on the graft_swap path (under EAGER the verify
+	 * walk's SC-only checks are no-ops).
+	 */
+	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	cds_ft_group_attr_set_lookup_optimization(attr,
+		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, NULL, &live) < 0) {
 		cds_ft_group_destroy(group);
 		return -1;

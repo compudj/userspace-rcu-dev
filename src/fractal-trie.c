@@ -12802,9 +12802,28 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * Atomic store at graft point.  If swap is empty,
 		 * place NULL (removing the subtree); otherwise place
 		 * the swap root node directly.
+		 *
+		 * Chain-compress invariant: old_swap_root may be a
+		 * 1-child internal at the source's root (permitted at
+		 * root, forbidden at non-root under SKIP_COMPRESSED).
+		 * Canonicalize before publishing at the non-root slot.
+		 *
+		 * Note: when d.pnf is itself compressed (key landed at
+		 * an existing compressed's child slot) AND the
+		 * canonicalized old_swap_root is also compressed, the
+		 * "no two adjacent compresseds" invariant would still
+		 * be violated.  No current test exercises that path; a
+		 * compressed-parent + compressed-child merge is left
+		 * for a follow-up that also reworks the nr_keys
+		 * propagation at line ~12886 (d.pnf would be freed by
+		 * the merge).
 		 */
-		if (!swap_empty)
+		if (!swap_empty) {
+			old_swap_root =
+				ft_compress_single_child_if_needed(dst_ft,
+					old_swap_root);
 			ft_set_parent(old_swap_root, d.pnf, d.nfp);
+		}
 		ft_publish_to_parent(dst_ft, d.pnf, d.nfp,
 			swap_empty ? NULL : old_swap_root);
 		/*
