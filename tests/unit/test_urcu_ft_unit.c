@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 197
+#define NR_TESTS 198
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -4186,6 +4186,102 @@ fail:
 	cds_ft_destroy(live);
 	cds_ft_group_destroy(group);
 	return -1;
+}
+
+/*
+ * Reproducer for nr_keys propagation through a compressed parent
+ * under SKIP_COMPRESSED:
+ *
+ * After ft_store_at_graft_point publishes the new branch into a
+ * compressed parent's child slot, ft_publish_to_parent updates the
+ * grandparent slot via the cn's skip_slot mechanism, encoding
+ * cn->len|new_child.  *d.pnfp consequently points at the new branch
+ * (with skip_len bits set), not at the old parent cn.
+ *
+ * ft_propagate_external_count_parent starting from *d.pnfp then
+ * walks from @branch (which already has the correct nr_keys set by
+ * ft_store_at_graft_point) instead of from @branch.parent.  The
+ * extra +delta at @branch over-counts its subtree, surfaced by
+ * cds_ft_verify as a nr_keys mismatch.
+ *
+ * Setup: live trie holds a single key whose path goes through a
+ * compressed node ("hello"); staging holds two keys ("y0", "z0") so
+ * its old root is multi-child (no chain-compress canonicalization
+ * required, isolating the propagation bug).
+ *
+ * Forces SPECULATIVE so the compressed publish materializes as a
+ * SKIP-X encoded slot pointer.
+ */
+static int test_graft_propagate_through_compressed(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	cds_ft_group_attr_set_lookup_optimization(attr,
+		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+
+	if (cds_ft_create(group, NULL, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Live: single multi-byte key creates a compressed path. */
+	rcu_read_lock();
+	s = cds_ft_insert(live, (const uint8_t *)"hello", 5,
+			&node_alloc(0)->node);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) goto out;
+
+	/* Staging: two keys so old root is multi-child (no
+	 * chain-compress canonicalization needed for the swap root). */
+	s = cds_ft_insert(staging, (const uint8_t *)"y0", 2,
+			&node_alloc(1)->node);
+	if (s != CDS_FT_STATUS_OK) goto out;
+	s = cds_ft_insert(staging, (const uint8_t *)"z0", 2,
+			&node_alloc(2)->node);
+	if (s != CDS_FT_STATUS_OK) goto out;
+
+	/* Graft staging into live at "helloX" (descent stops at the
+	 * existing external "hello", d.pnf is the cn for "ello" with
+	 * the displaced external). */
+	rcu_read_lock();
+	s = cds_ft_graft(live, (const uint8_t *)"helloX", 6, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_propagate: graft failed: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	if (cds_ft_verify(live, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_propagate: live verify failed\n");
+		goto out;
+	}
+
+	ret = 0;
+out:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 /*
@@ -14031,6 +14127,7 @@ int main(int argc, char **argv)
 	diag("Graft, graft_swap & detach tests");
 	RUN_TEST(test_graft_basic);
 	RUN_TEST(test_graft_displaced_external_compressed);
+	RUN_TEST(test_graft_propagate_through_compressed);
 	RUN_TEST(test_graft_at_root);
 	RUN_TEST(test_graft_populated_error);
 	RUN_TEST(test_graft_different_group_error);

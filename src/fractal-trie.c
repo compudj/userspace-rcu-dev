@@ -12534,8 +12534,25 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			return status;
 		}
 
-		ft_propagate_external_count_parent(dst_ft, *d.pnfp,
-				(long) src_count);
+		/*
+		 * Propagate src_count up the ancestor chain, starting
+		 * from @attached_nf's parent (skipping @attached_nf
+		 * itself, whose nr_keys was already set by
+		 * ft_store_at_graft_point).
+		 *
+		 * Note: *d.pnfp can't be used as the start because under
+		 * SKIP_COMPRESSED, ft_publish_to_parent may have updated
+		 * the grandparent slot (via cn's skip_slot mechanism) to
+		 * point directly at @attached_nf — starting propagation
+		 * there would double-count @attached_nf's subtree.
+		 */
+		{
+			struct cds_ft_metadata *am =
+				ft_flag_to_metadata(attached_nf);
+			if (am->parent)
+				ft_propagate_external_count_parent(dst_ft,
+					am->parent, (long) src_count);
+		}
 
 	}
 
