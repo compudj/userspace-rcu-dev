@@ -392,6 +392,54 @@ enum cds_ft_lookup_optimization {
 };
 
 /*
+ * NUMA placement policy for a Fractal Trie group's internal-node
+ * allocator.  Affects where the kernel places pages backing the
+ * group's internal/compressed-node arenas.  No effect on caller-
+ * provided external node storage.
+ */
+enum cds_ft_numa_policy {
+	/*
+	 * CDS_FT_NUMA_DEFAULT: defer to the process's libnuma / mempolicy
+	 * configuration.  The library applies no mbind() of its own — the
+	 * kernel honors whatever policy the application set (via
+	 * set_mempolicy(), numa_set_*(), or a numactl wrapper at launch),
+	 * falling back to first-touch placement if no process policy is
+	 * set.
+	 *
+	 * This is the default value of a freshly-created group attr.
+	 * Applications that want explicit library-side placement should
+	 * set INTERLEAVE or LOCAL.
+	 */
+	CDS_FT_NUMA_DEFAULT = 0,
+
+	/*
+	 * CDS_FT_NUMA_INTERLEAVE: round-robin allocator superblocks
+	 * across the calling thread's allowed NUMA nodes in 2 MiB
+	 * chunks (mbind(MPOL_BIND) per chunk).  Best for workloads
+	 * with concurrent readers distributed across NUMA nodes: every
+	 * reader sees the same balanced cross-node access pattern, so
+	 * the worst-case cross-NUMA cost is bounded by (NR_NODES - 1) /
+	 * NR_NODES of accesses.  Enables transparent hugepage collapse
+	 * by keeping each 2 MiB chunk on a single node.
+	 */
+	CDS_FT_NUMA_INTERLEAVE,
+
+	/*
+	 * CDS_FT_NUMA_LOCAL: explicit first-touch placement — pages
+	 * land on whichever NUMA node first faults them (typically the
+	 * writer thread).  Mechanically the library skips mbind(); the
+	 * distinction from DEFAULT is intent: LOCAL declares "I want
+	 * first-touch", DEFAULT declares "I defer to process policy".
+	 *
+	 * Best for single-threaded workloads and for tries accessed
+	 * exclusively by threads on the writer's node.  Multi-node-
+	 * distributed readers pay full cross-NUMA latency for every
+	 * access since all pages live on one node.
+	 */
+	CDS_FT_NUMA_LOCAL,
+};
+
+/*
  * Iterator path mode.
  *
  * Controls whether the iterator retains or discards its internal
@@ -1979,6 +2027,57 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
 		struct cds_ft_group_attr *attr,
 		enum cds_ft_lookup_optimization opt);
+
+/*
+ * cds_ft_group_attr_set_numa_policy - Select the trie group's NUMA
+ *                                     placement policy for its internal
+ *                                     allocator.
+ * @attr: Fractal Trie group attributes.
+ * @policy: One of enum cds_ft_numa_policy
+ *          (DEFAULT, INTERLEAVE, LOCAL).
+ *
+ * Defaults to CDS_FT_NUMA_DEFAULT when the group attr is freshly
+ * created: the library applies no mbind() of its own, deferring to
+ * whatever NUMA policy the process has configured (numactl, libnuma,
+ * set_mempolicy()).  Applications wanting explicit library-side
+ * placement should opt in via INTERLEAVE or LOCAL.
+ *
+ * Selection guide:
+ *   - DEFAULT:    library imposes nothing; process / libnuma policy
+ *                 takes effect (typically first-touch absent a
+ *                 process-wide policy).  Use when running under
+ *                 numactl or when the application configures
+ *                 set_mempolicy() itself.
+ *   - INTERLEAVE: 2 MiB-granular round-robin across allowed NUMA
+ *                 nodes (mbind(MPOL_BIND) per chunk).  Best for
+ *                 multi-reader workloads with readers distributed
+ *                 across NUMA nodes.  Single-threaded performance is
+ *                 within noise of LOCAL on modern x86 (the L2/L3
+ *                 prefetcher works fine over 2 MiB chunks of
+ *                 contiguous physical memory).  Enables transparent
+ *                 hugepage collapse by keeping each 2 MiB chunk on
+ *                 a single node.
+ *   - LOCAL:      explicit first-touch (skip mbind, like DEFAULT).
+ *                 Same syscall sequence as DEFAULT; differs in
+ *                 intent: LOCAL means "I want first-touch on my
+ *                 thread's node", DEFAULT means "I defer to whatever
+ *                 the process / libnuma decides".
+ *
+ * The CDS_FT_NUMA_INTERLEAVE=0 environment variable, if set, forces
+ * the library to skip mbind regardless of the group's policy —
+ * useful for debugging without recompiling.  Otherwise the group's
+ * policy takes effect.
+ *
+ * No effect on caller-provided external node storage
+ * (cds_ft_external_arena_create has no group context; today it
+ * applies CDS_FT_NUMA_DEFAULT — defers to process policy).
+ *
+ * Returns CDS_FT_STATUS_OK on success,
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @policy value.
+ */
+enum cds_ft_status cds_ft_group_attr_set_numa_policy(
+		struct cds_ft_group_attr *attr,
+		enum cds_ft_numa_policy policy);
 
 /*
  * cds_ft_attr_create - Create a per-instance Fractal Trie attribute

@@ -149,16 +149,29 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
  * against the no-policy baseline).
  */
 #ifdef __linux__
+/*
+ * mempolicy mode numbers — match the linux/mempolicy.h enum.  Re-declared
+ * locally to avoid pulling in the libnuma headers.
+ */
+#define FT_MPOL_DEFAULT		0
+#define FT_MPOL_PREFERRED	1
 #define FT_MPOL_BIND		2
 #define FT_MPOL_INTERLEAVE	3
+#define FT_MPOL_LOCAL		4	/* Linux 3.8+ */
 #define FT_MPOL_F_MEMS_ALLOWED	(1U << 2)
 #define FT_MAX_NUMA_NODES	1024
 #define FT_NODEMASK_LONGS	(FT_MAX_NUMA_NODES / (sizeof(unsigned long) * 8))
 #define FT_NODEMASK_BITS_PER_LONG	(sizeof(unsigned long) * 8)
 #define FT_HUGEPAGE_SIZE	(2UL * 1024 * 1024)	/* 2 MiB */
 
+/*
+ * Returns 1 if the env var CDS_FT_NUMA_INTERLEAVE=0 is set — a debug
+ * override telling the library to skip ALL mbind() calls regardless of
+ * group policy.  Defers entirely to whatever the kernel / process
+ * policy decides.  Returns 0 otherwise.
+ */
 static
-int ft_interleave_enabled(void)
+int ft_interleave_env_forces_skip(void)
 {
 	static int cached = -1;
 	const char *env;
@@ -168,28 +181,57 @@ int ft_interleave_enabled(void)
 	if (v != -1)
 		return v;
 	env = getenv("CDS_FT_NUMA_INTERLEAVE");
-	v = (env && env[0] == '0') ? 0 : 1;
+	v = (env && env[0] == '0') ? 1 : 0;
 	uatomic_store(&cached, v, CMM_RELAXED);
 	return v;
 }
 
 /*
- * Apply per-2MB-chunk round-robin placement across the calling thread's
- * allowed NUMA nodes when the @base region is 2 MiB-aligned and large
- * enough (≥ 2 MiB).  Each 2 MiB chunk is mbind(MPOL_BIND)'d to a single
- * node, so when khugepaged collapses or the kernel allocates hugepages
- * directly, every collapsed 2 MiB page lands wholly on its bound node —
- * preserving bandwidth-balanced placement under transparent hugepages
- * (cross-NUMA collapse is refused by khugepaged, so MPOL_INTERLEAVE at
- * 4 KiB granularity would silently prevent collapse).
- *
- * Fallback: when @base isn't 2 MiB-aligned, when fewer than 2 nodes are
- * allowed, or when the region is smaller than one hugepage, fall back to
- * MPOL_INTERLEAVE over the whole region — which round-robins at native
- * page granularity (no THP coverage, but still balanced bandwidth).
+ * Query the calling thread's process-default NUMA policy mode (set by
+ * numactl, set_mempolicy(), or libnuma).  Returns one of FT_MPOL_*.
+ * Returns FT_MPOL_DEFAULT on query failure (treat as "no policy set").
  */
 static
-void ft_apply_interleave(void *base, size_t size)
+int ft_query_process_mempolicy_mode(void)
+{
+	int mode = FT_MPOL_DEFAULT;
+	long r;
+
+	r = syscall(__NR_get_mempolicy, &mode, NULL, 0UL, NULL, 0UL);
+	if (r < 0)
+		return FT_MPOL_DEFAULT;
+	return mode;
+}
+
+/*
+ * Apply the configured NUMA placement policy to the @size bytes at
+ * @base.  Three policies, all subject to the CDS_FT_NUMA_INTERLEAVE=0
+ * env var (which forces a skip):
+ *
+ *   - CDS_FT_NUMA_INTERLEAVE: per-2 MiB-chunk mbind(MPOL_BIND) round-
+ *     robin across the calling thread's allowed nodes.  Each 2 MiB
+ *     chunk is bound to a single node so transparent hugepages can
+ *     form (khugepaged refuses cross-NUMA collapse).  Falls back to
+ *     whole-region MPOL_INTERLEAVE at native page granularity when
+ *     @base isn't 2 MiB-aligned, the region is smaller than 2 MiB,
+ *     or only one node is allowed.
+ *
+ *   - CDS_FT_NUMA_LOCAL: single mbind(MPOL_LOCAL) over the whole
+ *     region.  Pages allocated within @base land on the local node
+ *     of whichever thread first faults each page.  Persists even if
+ *     the process policy is set to something else (e.g., interleave-
+ *     all under a numactl wrapper).
+ *
+ *   - CDS_FT_NUMA_DEFAULT: query the process / libnuma policy via
+ *     get_mempolicy().  If the process policy is INTERLEAVE, treat
+ *     this group as INTERLEAVE (apply 2 MiB-chunk MPOL_BIND so the
+ *     kernel's intent gets THP-friendly placement).  For any other
+ *     process policy (DEFAULT/PREFERRED/BIND/LOCAL), skip mbind and
+ *     let the kernel honor the process policy directly.
+ */
+static
+void ft_apply_interleave(void *base, size_t size,
+		enum cds_ft_numa_policy policy)
 {
 	unsigned long nodemask[FT_NODEMASK_LONGS] = { 0 };
 	int allowed_nodes[FT_MAX_NUMA_NODES];
@@ -198,8 +240,35 @@ void ft_apply_interleave(void *base, size_t size)
 	size_t i, off;
 	long r;
 
-	if (!ft_interleave_enabled())
+	if (ft_interleave_env_forces_skip())
 		return;
+
+	if (policy == CDS_FT_NUMA_DEFAULT) {
+		/*
+		 * Query process policy.  Translate INTERLEAVE upward so
+		 * the kernel's process-wide intent gets our THP-friendly
+		 * 2 MiB-granular placement.  Other modes: leave the
+		 * region untouched and let the kernel honor the process
+		 * policy at fault time.
+		 */
+		if (ft_query_process_mempolicy_mode() != FT_MPOL_INTERLEAVE)
+			return;
+		policy = CDS_FT_NUMA_INTERLEAVE;
+	}
+
+	if (policy == CDS_FT_NUMA_LOCAL) {
+		/*
+		 * MPOL_LOCAL (Linux 3.8+).  Single mbind over the whole
+		 * region.  Pages fault local to the thread that touches
+		 * them first; if THP is enabled, hugepages allocate
+		 * locally too.  No nodemask needed.
+		 */
+		(void) syscall(__NR_mbind, base, size, FT_MPOL_LOCAL,
+				NULL, 0UL, 0);
+		return;
+	}
+
+	/* CDS_FT_NUMA_INTERLEAVE — per-2 MiB-chunk MPOL_BIND round-robin. */
 	r = syscall(__NR_get_mempolicy, NULL, nodemask, (unsigned long) FT_MAX_NUMA_NODES,
 			NULL, FT_MPOL_F_MEMS_ALLOWED);
 	if (r < 0)
@@ -253,27 +322,27 @@ void ft_apply_interleave(void *base, size_t size)
 }
 #else
 static inline void ft_apply_interleave(void *base __attribute__((unused)),
-		size_t size __attribute__((unused))) {}
+		size_t size __attribute__((unused)),
+		enum cds_ft_numa_policy policy __attribute__((unused))) {}
 #endif
 
 /*
  * Allocate a fresh superblock big enough to host at least one
  * range of size min_size.  Pages are mmap'd anonymous, so they are
- * lazily zero-initialized on first touch.  When CDS_FT_NUMA_INTERLEAVE
- * is set, mbind(MPOL_INTERLEAVE) is applied before any page is
- * faulted, so the kernel round-robins placement across the calling
- * thread's allowed NUMA nodes.
+ * lazily zero-initialized on first touch.
+ *
+ * NUMA placement: if @numa_policy is INTERLEAVE/DEFAULT (and not
+ * overridden by CDS_FT_NUMA_INTERLEAVE=0), apply per-2 MiB-chunk
+ * mbind(MPOL_BIND) round-robin across the calling thread's allowed
+ * NUMA nodes.  Each chunk is bound to a single node so transparent
+ * hugepages can form (khugepaged refuses cross-NUMA collapse).
  *
  * MADV_HUGEPAGE hints khugepaged to collapse 4 KiB pages into 2 MiB
  * transparent hugepages where alignment + memory availability allow.
- * Note: while MPOL_INTERLEAVE is active at 4 KiB granularity, khugepaged
- * refuses cross-NUMA collapse, so MADV_HUGEPAGE is silently a no-op.
- * A future change that switches interleave to 2 MiB granularity will
- * unlock collapse; the madvise call here is the standing hint so the
- * collapse fires as soon as that becomes possible.
  */
 static
-struct cds_ft_alloc_superblock *superblock_create(size_t min_size)
+struct cds_ft_alloc_superblock *superblock_create(size_t min_size,
+		enum cds_ft_numa_policy numa_policy)
 {
 	struct cds_ft_alloc_superblock *sb;
 	size_t size;
@@ -286,7 +355,7 @@ struct cds_ft_alloc_superblock *superblock_create(size_t min_size)
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (base == MAP_FAILED)
 		return NULL;
-	ft_apply_interleave(base, size);
+	ft_apply_interleave(base, size, numa_policy);
 #ifdef MADV_HUGEPAGE
 	(void) madvise(base, size, MADV_HUGEPAGE);
 #endif
@@ -333,7 +402,8 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 		goto create_sb;
 	goto carve;
 create_sb:
-	sb = superblock_create(alloc_size_aligned);
+	sb = superblock_create(alloc_size_aligned,
+			arena->ft_group->numa_policy);
 	if (!sb)
 		return NULL;
 	cds_list_add(&sb->node, &arena->superblocks);
@@ -832,15 +902,16 @@ ft_ext_arena_range_create(void)
 	if (post)
 		(void) munmap((char *) aligned + FT_EXT_ARENA_RANGE_SIZE, post);
 	/*
-	 * Apply the same per-2 MiB-chunk MPOL_BIND interleave as the
-	 * internal arena so multi-reader workloads (e.g., concurrent
-	 * lookups from threads on different NUMA nodes) see balanced
-	 * bandwidth and so that THP collapse isn't blocked by cross-NUMA
-	 * page placement.  Falls back to whole-region MPOL_INTERLEAVE
-	 * when the alignment fast path doesn't fire (here it always
-	 * fires: the range is 16 MiB-aligned).
+	 * External arena isn't tied to a specific group, so it uses
+	 * CDS_FT_NUMA_DEFAULT: defer to the process / libnuma policy.
+	 * When the process policy is INTERLEAVE (typical numactl
+	 * --interleave wrapper), ft_apply_interleave promotes it to
+	 * 2 MiB-chunk MPOL_BIND so THP collapse can fire.  Otherwise
+	 * (no process policy, or LOCAL/PREFERRED/BIND), the kernel
+	 * honors the process choice at fault time.
 	 */
-	ft_apply_interleave(aligned, FT_EXT_ARENA_RANGE_SIZE);
+	ft_apply_interleave(aligned, FT_EXT_ARENA_RANGE_SIZE,
+			CDS_FT_NUMA_DEFAULT);
 	/*
 	 * Hint THP collapse on the 16 MiB range.  The range is 16 MiB-
 	 * aligned (= 2 MiB-aligned), so each 2 MiB sub-region is a valid

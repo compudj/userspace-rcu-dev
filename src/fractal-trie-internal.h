@@ -547,6 +547,15 @@ struct cds_ft_group {
 	 *   cds_ft_group_attr_set_lookup_optimization.
 	 */
 	bool speculative;
+	/*
+	 * @numa_policy: NUMA placement policy for the group's internal
+	 *   allocator superblocks.  See
+	 *   cds_ft_group_attr_set_numa_policy.  Default: INTERLEAVE at
+	 *   2 MiB chunk granularity.  Overridden by the env var
+	 *   CDS_FT_NUMA_INTERLEAVE=0 to force LOCAL placement (for
+	 *   benchmarking without recompiling).
+	 */
+	enum cds_ft_numa_policy numa_policy;
 };
 
 

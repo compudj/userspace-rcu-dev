@@ -129,6 +129,7 @@ struct cds_ft_group_attr {
 	struct cds_ft_key_map key_map;
 	unsigned int flags;
 	bool speculative;	/* See cds_ft_lookup_optimization. */
+	enum cds_ft_numa_policy numa_policy;	/* See cds_ft_group_attr_set_numa_policy. */
 };
 
 struct cds_ft_attr {
@@ -15223,6 +15224,17 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	if (ft_skip_compressed_validate())
 		attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
+	/*
+	 * NUMA placement default: defer to process / libnuma policy.
+	 * The library applies no mbind() of its own; the kernel honors
+	 * numactl wrappers, set_mempolicy() calls, or falls back to
+	 * first-touch when no process policy is set.  Applications that
+	 * want explicit library-side placement should opt into
+	 * CDS_FT_NUMA_INTERLEAVE (multi-reader workloads) or
+	 * CDS_FT_NUMA_LOCAL (single-threaded / sharded workloads) via
+	 * cds_ft_group_attr_set_numa_policy.
+	 */
+	attr->numa_policy = CDS_FT_NUMA_DEFAULT;
 	*result = attr;
 	return CDS_FT_STATUS_OK;
 }
@@ -15281,6 +15293,20 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
 		if (ft_skip_compressed_validate())
 			attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
+		return CDS_FT_STATUS_OK;
+	}
+	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+}
+
+enum cds_ft_status cds_ft_group_attr_set_numa_policy(
+		struct cds_ft_group_attr *attr,
+		enum cds_ft_numa_policy policy)
+{
+	switch (policy) {
+	case CDS_FT_NUMA_DEFAULT:
+	case CDS_FT_NUMA_INTERLEAVE:
+	case CDS_FT_NUMA_LOCAL:
+		attr->numa_policy = policy;
 		return CDS_FT_STATUS_OK;
 	}
 	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -15452,6 +15478,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->key_map = attr->key_map;
 		ft_group->flags = attr->flags;
 		ft_group->speculative = attr->speculative;
+		ft_group->numa_policy = attr->numa_policy;
 	} else {
 		/*
 		 * NULL attr: mirror the defaults set by
@@ -15465,6 +15492,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		if (ft_skip_compressed_validate())
 			ft_group->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
+		ft_group->numa_policy = CDS_FT_NUMA_INTERLEAVE;
 	}
 	*result_ft_group = ft_group;
 	FT_TP(group_create, (const void *) ft_group);
