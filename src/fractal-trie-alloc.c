@@ -832,11 +832,19 @@ ft_ext_arena_range_create(void)
 	if (post)
 		(void) munmap((char *) aligned + FT_EXT_ARENA_RANGE_SIZE, post);
 	/*
+	 * Apply the same per-2 MiB-chunk MPOL_BIND interleave as the
+	 * internal arena so multi-reader workloads (e.g., concurrent
+	 * lookups from threads on different NUMA nodes) see balanced
+	 * bandwidth and so that THP collapse isn't blocked by cross-NUMA
+	 * page placement.  Falls back to whole-region MPOL_INTERLEAVE
+	 * when the alignment fast path doesn't fire (here it always
+	 * fires: the range is 16 MiB-aligned).
+	 */
+	ft_apply_interleave(aligned, FT_EXT_ARENA_RANGE_SIZE);
+	/*
 	 * Hint THP collapse on the 16 MiB range.  The range is 16 MiB-
 	 * aligned (= 2 MiB-aligned), so each 2 MiB sub-region is a valid
-	 * collapse candidate.  No mbind here — external arena uses
-	 * first-touch placement, so khugepaged can collapse freely once
-	 * pages are faulted in.
+	 * collapse candidate.
 	 */
 #ifdef MADV_HUGEPAGE
 	(void) madvise(aligned, FT_EXT_ARENA_RANGE_SIZE, MADV_HUGEPAGE);
