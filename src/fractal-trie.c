@@ -8912,6 +8912,9 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	uint8_t path_len = (uint8_t)(key_len - level);
 	struct cds_ft_compressed_node *cn;
 	struct cds_ft_metadata *cn_meta;
+	struct cds_ft_compressed_node *child_cn = NULL;
+	unsigned int child_len = 0;
+	uint8_t merged_len;
 	int j;
 
 	/*
@@ -8922,20 +8925,57 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	 */
 	if (path_len < 1)
 		return NULL;
-	cn = alloc_compressed_node(ft, path_len, &cn_meta);
+
+	/*
+	 * Chain-merge: if @child is already a compressed (or skip-
+	 * compressed) node, wrapping it in another compressed prefix
+	 * would violate the "no two adjacent compresseds" invariant.
+	 * Absorb the child's path bytes into the outer cn so the
+	 * result is a single compressed spanning
+	 * (key[level..key_len-1] ++ child_cn->key_bytes) →
+	 * child_cn->child.  Bounded by FT_SKIP_LEN_MAX; on overflow,
+	 * fall back to the un-merged form (rare; the residue may be
+	 * cleaned up by a subsequent mutation).
+	 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(child))
+		child_cn = ft_skip_to_compressed(child);
+	else
+#endif
+	if (ft_node_compressed(child))
+		child_cn = ft_compressed_node_ptr(child);
+	if (child_cn) {
+		child_len = child_cn->len;
+		if ((unsigned int) path_len + child_len > FT_SKIP_LEN_MAX) {
+			/* Overflow: leave adjacency in place. */
+			child_cn = NULL;
+			child_len = 0;
+		}
+	}
+	merged_len = (uint8_t)(path_len + child_len);
+
+	cn = alloc_compressed_node(ft, merged_len, &cn_meta);
 	if (!cn)
 		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
-	cn->child = child;
-	cn->len = path_len;
+	if (child_cn)
+		cn->child = child_cn->child;
+	else
+		cn->child = child;
+	cn->len = merged_len;
 	for (j = 0; j < path_len; j++)
 		cn->key_bytes[j] = key[level + j];
+	if (child_cn)
+		memcpy(&cn->key_bytes[path_len],
+			child_cn->key_bytes, child_len);
 	cn_meta->nr_child = 1;
 	ft_nr_keys_store(cn_meta, 1, CMM_RELAXED);
 	/* Compressed nodes must not carry external_nodes. */
 	assert(!external_nodes);
 	{
 		struct cds_ft_inode_flag *cflag = ft_compressed_node_flag(cn);
-		ft_set_parent(child, cflag, &cn->child);
+		ft_set_parent(cn->child, cflag, &cn->child);
+		if (child_cn)
+			free_compressed_node_unpublished(ft, child_cn);
 		/* compressed_publish emitted by ft_publish_compressed. */
 		return ft_publish_compressed(ft, cn, cflag);
 	}
@@ -12256,27 +12296,24 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 {
 	struct cds_ft_inode *old_recompacted_node = NULL;
 
-	if (d->depth == key_len) {
-		/*
-		 * Skip-mode chain-compress invariant: under SPECULATIVE-
-		 * mode tries, non-root 1-child internals without
-		 * external_nodes must be a 1-byte compressed.  The
-		 * graft_payload here may be the source trie's old root
-		 * (a 1-child internal is permitted at root but not at
-		 * the non-root position we're placing it in).  Convert
-		 * before publishing.
-		 *
-		 * The d->depth < key_len branch below builds a branch
-		 * via ft_build_branch and attaches @graft_payload as
-		 * the bottom node; converting graft_payload to a
-		 * compressed there would produce two adjacent
-		 * compresseds and violate that invariant instead.
-		 * Leave that case to ft_build_branch — it already
-		 * handles single-child internal payloads by extending
-		 * its own compressed prefix when applicable.
-		 */
-		graft_payload = ft_compress_single_child_if_needed(ft, graft_payload);
-	}
+	/*
+	 * Skip-mode chain-compress invariant: under SPECULATIVE-mode
+	 * tries, non-root 1-child internals without external_nodes
+	 * must be a 1-byte compressed.  graft_payload here may be the
+	 * source trie's old root (a 1-child internal is permitted at
+	 * root, forbidden at the non-root position we're placing it
+	 * in).  Canonicalize in both branches:
+	 *
+	 *  - d->depth == key_len: place graft_payload directly at the
+	 *    slot — convert to compressed if needed.
+	 *  - d->depth <  key_len: ft_build_branch wraps graft_payload
+	 *    in a key[i..key_len-1] compressed prefix; converting
+	 *    graft_payload to a compressed lets ft_try_compress_chain's
+	 *    chain-merge absorb it into the outer prefix (one cn
+	 *    spanning outer_bytes ++ leaf_cn_bytes → leaf_cn->child)
+	 *    instead of producing two adjacent compresseds.
+	 */
+	graft_payload = ft_compress_single_child_if_needed(ft, graft_payload);
 
 	if (d->depth == key_len) {
 		struct cds_ft_metadata *pmeta;

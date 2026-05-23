@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 198
+#define NR_TESTS 199
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -4270,6 +4270,89 @@ static int test_graft_propagate_through_compressed(void)
 
 	if (cds_ft_verify(live, stderr) != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "graft_propagate: live verify failed\n");
+		goto out;
+	}
+
+	ret = 0;
+out:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Reproducer for the chain-compress invariant in cds_ft_graft when
+ * the descent stops at d.depth < key_len:
+ *
+ * ft_store_at_graft_point only canonicalizes graft_payload via
+ * ft_compress_single_child_if_needed when d.depth == key_len.  The
+ * d.depth < key_len branch hands graft_payload to ft_build_branch
+ * unchanged; if graft_payload is a 1-child internal at its source
+ * root (permitted at root, forbidden at non-root under
+ * SKIP_COMPRESSED), the resulting structure has a 1-child internal
+ * at a non-root position.
+ *
+ * Setup: empty live; staging holds "lo" + "lp" so staging.root has
+ * exactly one outgoing edge ('l').  Graft at "he" so the descent
+ * breaks at d.depth=1 (empty slot) with d.depth < key_len=2.
+ *
+ * Forces SPECULATIVE so the verify walk's chain-compress check
+ * actually fires.
+ */
+static int test_graft_canonicalize_at_intermediate_depth(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	cds_ft_group_attr_set_lookup_optimization(attr,
+		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+
+	if (cds_ft_create(group, NULL, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Staging: two keys sharing prefix "l" so staging.root has a
+	 * single outgoing edge at 'l' → internal with 'o'/'p'. */
+	s = cds_ft_insert(staging, (const uint8_t *)"lo", 2,
+			&node_alloc(0)->node);
+	if (s != CDS_FT_STATUS_OK) goto out;
+	s = cds_ft_insert(staging, (const uint8_t *)"lp", 2,
+			&node_alloc(1)->node);
+	if (s != CDS_FT_STATUS_OK) goto out;
+
+	/* Graft staging at "he" (descent stops at empty d.nf, depth 1
+	 * < key_len 2). */
+	rcu_read_lock();
+	s = cds_ft_graft(live, (const uint8_t *)"he", 2, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_canonicalize: graft failed: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	if (cds_ft_verify(live, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_canonicalize: live verify failed\n");
 		goto out;
 	}
 
@@ -14128,6 +14211,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_graft_basic);
 	RUN_TEST(test_graft_displaced_external_compressed);
 	RUN_TEST(test_graft_propagate_through_compressed);
+	RUN_TEST(test_graft_canonicalize_at_intermediate_depth);
 	RUN_TEST(test_graft_at_root);
 	RUN_TEST(test_graft_populated_error);
 	RUN_TEST(test_graft_different_group_error);
