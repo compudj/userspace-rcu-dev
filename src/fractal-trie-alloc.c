@@ -203,6 +203,14 @@ static inline void ft_apply_interleave(void *base __attribute__((unused)),
  * is set, mbind(MPOL_INTERLEAVE) is applied before any page is
  * faulted, so the kernel round-robins placement across the calling
  * thread's allowed NUMA nodes.
+ *
+ * MADV_HUGEPAGE hints khugepaged to collapse 4 KiB pages into 2 MiB
+ * transparent hugepages where alignment + memory availability allow.
+ * Note: while MPOL_INTERLEAVE is active at 4 KiB granularity, khugepaged
+ * refuses cross-NUMA collapse, so MADV_HUGEPAGE is silently a no-op.
+ * A future change that switches interleave to 2 MiB granularity will
+ * unlock collapse; the madvise call here is the standing hint so the
+ * collapse fires as soon as that becomes possible.
  */
 static
 struct cds_ft_alloc_superblock *superblock_create(size_t min_size)
@@ -219,6 +227,9 @@ struct cds_ft_alloc_superblock *superblock_create(size_t min_size)
 	if (base == MAP_FAILED)
 		return NULL;
 	ft_apply_interleave(base, size);
+#ifdef MADV_HUGEPAGE
+	(void) madvise(base, size, MADV_HUGEPAGE);
+#endif
 	sb = malloc(sizeof(*sb));
 	if (!sb) {
 		munmap(base, size);
@@ -760,6 +771,16 @@ ft_ext_arena_range_create(void)
 		(void) munmap(raw, pre);
 	if (post)
 		(void) munmap((char *) aligned + FT_EXT_ARENA_RANGE_SIZE, post);
+	/*
+	 * Hint THP collapse on the 16 MiB range.  The range is 16 MiB-
+	 * aligned (= 2 MiB-aligned), so each 2 MiB sub-region is a valid
+	 * collapse candidate.  No mbind here — external arena uses
+	 * first-touch placement, so khugepaged can collapse freely once
+	 * pages are faulted in.
+	 */
+#ifdef MADV_HUGEPAGE
+	(void) madvise(aligned, FT_EXT_ARENA_RANGE_SIZE, MADV_HUGEPAGE);
+#endif
 
 	r = (struct cds_ft_external_arena_range *) aligned;
 	CDS_INIT_LIST_HEAD(&r->node);
