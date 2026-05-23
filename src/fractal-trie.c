@@ -11864,26 +11864,80 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		prefix_flag = dest;
 	} else {
 		/* prefix_len == 1 */
-		struct cds_ft_inode_flag *dest = NULL;
-		struct cds_ft_metadata *pfx_meta;
-		int ret;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_group_skip_compressed(ft->group) &&
+		    !cn_meta->external_nodes) {
+			/*
+			 * 1-byte prefix without external_nodes: emit a
+			 * 1-byte compressed instead of a 1-child internal.
+			 *
+			 * The suffix this prefix wraps is about to be
+			 * replaced by the caller (graft / graft_swap) with
+			 * the new content, so we must NOT chain-merge
+			 * prefix with suffix (that would absorb suffix's
+			 * path bytes into prefix and the caller's
+			 * subsequent slot write at &pfx->child would
+			 * leave those bytes incorrectly in the merged path).
+			 *
+			 * If @suffix_flag is already a skip-compressed
+			 * pointer, skip-encoding the outer cn would also
+			 * corrupt: ft_skip_compressed_flag OR-into-high-
+			 * bits-of-child requires child's high bits clear.
+			 * Skip the publish in that case and leave the
+			 * prefix as a plain (non-SKIP-X) compressed flag
+			 * — readers descend via the compressed handler;
+			 * the caller's subsequent ft_publish_to_parent
+			 * re-encodes the slot via cn's skip_slot once the
+			 * child is a non-compressed payload.
+			 */
+			struct cds_ft_compressed_node *pfx;
+			struct cds_ft_metadata *pfx_meta;
 
-		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-			suffix_flag, NULL, NULL, d->depth);
-		if (ret) {
-			if (ft_node_compressed(suffix_flag))
-				free_compressed_node_unpublished(ft,
-					ft_compressed_node_ptr(suffix_flag));
-			else
-				free_cds_ft_node_unpublished(ft, ft_node_ptr(suffix_flag));
-			return -1;
+			pfx = alloc_compressed_node(ft, 1, &pfx_meta);
+			if (!pfx) {
+				if (ft_node_compressed(suffix_flag))
+					free_compressed_node_unpublished(ft,
+						ft_compressed_node_ptr(suffix_flag));
+				else
+					free_cds_ft_node_unpublished(ft, ft_node_ptr(suffix_flag));
+				return -1;
+			}
+			pfx->child = suffix_flag;
+			pfx->len = 1;
+			pfx->key_bytes[0] = cn->key_bytes[0];
+			pfx_meta->nr_child = 1;
+			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
+				CMM_RELAXED);
+			prefix_flag = ft_compressed_node_flag(pfx);
+			ft_set_parent(suffix_flag, prefix_flag, &pfx->child);
+			if (!ft_node_skip_compressed(suffix_flag) &&
+			    !ft_node_compressed(suffix_flag))
+				prefix_flag = ft_publish_compressed(ft, pfx,
+					prefix_flag);
+		} else
+#endif
+		{
+			struct cds_ft_inode_flag *dest = NULL;
+			struct cds_ft_metadata *pfx_meta;
+			int ret;
+
+			ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
+				suffix_flag, NULL, NULL, d->depth);
+			if (ret) {
+				if (ft_node_compressed(suffix_flag))
+					free_compressed_node_unpublished(ft,
+						ft_compressed_node_ptr(suffix_flag));
+				else
+					free_cds_ft_node_unpublished(ft, ft_node_ptr(suffix_flag));
+				return -1;
+			}
+			pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
+				CMM_RELAXED);
+			if (cn_meta->external_nodes)
+				ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
+			prefix_flag = dest;
 		}
-		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
-			CMM_RELAXED);
-		if (cn_meta->external_nodes)
-			ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
-		prefix_flag = dest;
 	}
 
 	/* Publish and set descent state. */
@@ -12159,12 +12213,21 @@ ft_make_root_internal(struct cds_ft *ft,
 
 /*
  * ft_compress_single_child_if_needed: convert a 1-child internal node
- * (no external_nodes) to a 1-byte compressed/skip-encoded node when
- * the trie group has skip-compressed enabled.  Used at graft sites
- * where a moved root (which was an internal at trie-root position) is
- * being placed at a non-root position: under skip mode, non-root
- * 1-child internals without external_nodes must be a 1-byte
- * compressed (chain-compress invariant).
+ * (no external_nodes) to a compressed/skip-encoded node when the trie
+ * group has skip-compressed enabled.  Used at graft sites where a
+ * moved root (which was an internal at trie-root position) is being
+ * placed at a non-root position: under skip mode, non-root 1-child
+ * internals without external_nodes must be a compressed (chain-
+ * compress invariant).
+ *
+ * Two cases on the single child:
+ *  - non-compressed:    build a 1-byte cn(byte) → single_child.
+ *  - compressed (or
+ *    skip-encoded):     chain-merge — build a cn(byte ++
+ *                       single_cn.key_bytes) → single_cn.child,
+ *                       free the absorbed cn.  Bounded by
+ *                       FT_SKIP_LEN_MAX; on overflow leave @child
+ *                       unchanged.
  *
  * Returns the converted compressed/skip-encoded flag on success.
  * Returns @child unchanged when conversion isn't applicable:
@@ -12172,9 +12235,7 @@ ft_make_root_internal(struct cds_ft *ft,
  *   - @child is not an internal node,
  *   - @child has more than one child,
  *   - @child has external_nodes attached,
- *   - the single child is a compressed node (would violate the
- *     "no two adjacent compresseds" invariant — leave for a future
- *     chain-merge),
+ *   - chain-merge length would overflow FT_SKIP_LEN_MAX,
  *   - allocation failure.
  *
  * On successful conversion the old internal is freed.  Write-side
@@ -12191,9 +12252,12 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 	struct cds_ft_metadata *meta;
 	uint8_t byte;
 	struct cds_ft_inode_flag *single_child;
+	struct cds_ft_compressed_node *single_cn = NULL;
+	unsigned int single_len = 0;
 	struct cds_ft_compressed_node *cn;
 	struct cds_ft_metadata *cn_meta;
 	struct cds_ft_inode_flag *cflag;
+	unsigned int cn_len;
 
 	if (!ft_group_skip_compressed(ft->group))
 		return child;
@@ -12238,33 +12302,54 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 	}
 	if (!single_child)
 		return child;
-	/*
-	 * The "no two adjacent compresseds" invariant: skip the
-	 * conversion when the single child is itself a compressed
-	 * (or skip-encoded) node.  A proper chain-merge would extend
-	 * the existing compressed by one byte; deferred.
-	 */
-	if (ft_node_compressed(single_child) || ft_node_skip_compressed(single_child))
-		return child;
 
-	cn = alloc_compressed_node(ft, 1, &cn_meta);
+	/*
+	 * Chain-merge when the single child is itself a compressed
+	 * (or skip-encoded) cn: absorb its path bytes so the result
+	 * is one compressed spanning [byte ++ single_cn->key_bytes]
+	 * → single_cn->child.  Preserves the "no two adjacent
+	 * compresseds" invariant.
+	 */
+	if (ft_node_skip_compressed(single_child))
+		single_cn = ft_skip_to_compressed(single_child);
+	else if (ft_node_compressed(single_child))
+		single_cn = ft_compressed_node_ptr(single_child);
+	if (single_cn) {
+		single_len = single_cn->len;
+		if (1U + single_len > FT_SKIP_LEN_MAX) {
+			/* Overflow: leave un-canonicalized. */
+			return child;
+		}
+	}
+	cn_len = 1U + single_len;
+
+	cn = alloc_compressed_node(ft, cn_len, &cn_meta);
 	if (!cn)
 		return child;
-	cn->len = 1;
+	cn->len = (uint8_t) cn_len;
 	cn->key_bytes[0] = byte;
-	cn->child = single_child;
+	if (single_cn) {
+		memcpy(&cn->key_bytes[1], single_cn->key_bytes, single_len);
+		cn->child = single_cn->child;
+	} else {
+		cn->child = single_child;
+	}
 	cn_meta->nr_child = 1;
 	ft_nr_keys_store(cn_meta, ft_nr_keys_get(meta), CMM_RELAXED);
 	cflag = ft_compressed_node_flag(cn);
-	ft_set_parent(single_child, cflag, &cn->child);
+	ft_set_parent(cn->child, cflag, &cn->child);
 	/*
 	 * The caller has already unlinked @node from src and waited a
 	 * grace period (cds_ft_graft / graft_swap protocol); @node has
 	 * not been published to dst.  No reader can be inside it, so
 	 * the immediate-free path is safe — saves a grace period of
-	 * deferred-free pressure.
+	 * deferred-free pressure.  Same applies to single_cn (the
+	 * compressed sub-node we just absorbed): it was reachable only
+	 * via @node, which is itself unpublished here.
 	 */
 	free_cds_ft_node_unpublished(ft, node);
+	if (single_cn)
+		free_compressed_node_unpublished(ft, single_cn);
 	return ft_publish_compressed(ft, cn, cflag);
 #else
 	(void) ft;
@@ -12299,22 +12384,15 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 	/*
 	 * Skip-mode chain-compress invariant: under SPECULATIVE-mode
 	 * tries, non-root 1-child internals without external_nodes
-	 * must be a 1-byte compressed.  graft_payload here may be the
-	 * source trie's old root (a 1-child internal is permitted at
-	 * root, forbidden at the non-root position we're placing it
-	 * in).  Canonicalize in both branches:
-	 *
-	 *  - d->depth == key_len: place graft_payload directly at the
-	 *    slot — convert to compressed if needed.
-	 *  - d->depth <  key_len: ft_build_branch wraps graft_payload
-	 *    in a key[i..key_len-1] compressed prefix; converting
-	 *    graft_payload to a compressed lets ft_try_compress_chain's
-	 *    chain-merge absorb it into the outer prefix (one cn
-	 *    spanning outer_bytes ++ leaf_cn_bytes → leaf_cn->child)
-	 *    instead of producing two adjacent compresseds.
+	 * must be a compressed.  graft_payload here may be the source
+	 * trie's old root (a 1-child internal is permitted at root,
+	 * forbidden at the non-root position we're placing it in).
+	 * Canonicalize per branch — deferred past the POPULATED_ERROR
+	 * check so that on failure the caller can still reach the
+	 * original payload for rollback (ft_compress_single_child_
+	 * if_needed frees the input internal + any absorbed cn on
+	 * success).
 	 */
-	graft_payload = ft_compress_single_child_if_needed(ft, graft_payload);
-
 	if (d->depth == key_len) {
 		struct cds_ft_metadata *pmeta;
 		struct cds_ft_inode_flag *dest;
@@ -12322,6 +12400,9 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		if (d->nf)
 			return CDS_FT_STATUS_POPULATED_ERROR;
+
+		graft_payload = ft_compress_single_child_if_needed(ft,
+			graft_payload);
 
 		pmeta = cds_ft_item_to_metadata(ft_node_ptr(d->pnf));
 
@@ -12347,6 +12428,9 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		if (d->nf && ft_node_external(d->nf))
 			displaced = (struct cds_ft_node *)
 				ft_node_ptr(d->nf);
+
+		graft_payload = ft_compress_single_child_if_needed(ft,
+			graft_payload);
 
 		branch = ft_build_branch(ft, key, i, key_len, graft_payload,
 				graft_external_count, displaced != NULL);
@@ -12862,24 +12946,128 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * root, forbidden at non-root under SKIP_COMPRESSED).
 		 * Canonicalize before publishing at the non-root slot.
 		 *
-		 * Note: when d.pnf is itself compressed (key landed at
-		 * an existing compressed's child slot) AND the
+		 * When d.pnf is itself compressed (key landed at an
+		 * existing compressed's child slot) AND the
 		 * canonicalized old_swap_root is also compressed, the
 		 * "no two adjacent compresseds" invariant would still
-		 * be violated.  No current test exercises that path; a
-		 * compressed-parent + compressed-child merge is left
-		 * for a follow-up that also reworks the nr_keys
-		 * propagation at line ~12886 (d.pnf would be freed by
-		 * the merge).
+		 * be violated.  Fuse them into a single cn at the
+		 * grandparent slot: keys = parent.key_bytes ++
+		 * child.key_bytes, child = child_cn->child.  d.pnf is
+		 * redirected to the merged cn so the subsequent
+		 * nr_child + propagate updates land on the right node.
 		 */
 		if (!swap_empty) {
 			old_swap_root =
 				ft_compress_single_child_if_needed(dst_ft,
 					old_swap_root);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			{
+				struct cds_ft_compressed_node *parent_cn = NULL;
+				struct cds_ft_compressed_node *child_cn = NULL;
+
+				if (ft_node_skip_compressed(d.pnf))
+					parent_cn = ft_skip_to_compressed(d.pnf);
+				else if (ft_node_compressed(d.pnf))
+					parent_cn = ft_compressed_node_ptr(d.pnf);
+
+				if (ft_node_skip_compressed(old_swap_root))
+					child_cn = ft_skip_to_compressed(old_swap_root);
+				else if (ft_node_compressed(old_swap_root))
+					child_cn = ft_compressed_node_ptr(old_swap_root);
+				if (parent_cn) {
+				if (child_cn &&
+				    (unsigned int) parent_cn->len + child_cn->len
+				    <= FT_SKIP_LEN_MAX) {
+					struct cds_ft_metadata *parent_cn_meta =
+						cds_ft_item_to_metadata(
+							(struct cds_ft_inode *) parent_cn);
+					unsigned int merged_len =
+						parent_cn->len + child_cn->len;
+					struct cds_ft_compressed_node *merged_cn;
+					struct cds_ft_metadata *merged_cn_meta;
+					struct cds_ft_inode_flag *merged_cn_flag;
+					struct cds_ft_inode_flag **publish_slot;
+					struct cds_ft_inode_flag *publish_parent;
+
+					merged_cn = alloc_compressed_node(dst_ft,
+						merged_len, &merged_cn_meta);
+					if (!merged_cn) {
+						FT_TP(graft_swap_exit,
+							(int) CDS_FT_STATUS_MEMORY_ERROR);
+						return CDS_FT_STATUS_MEMORY_ERROR;
+					}
+					memcpy(merged_cn->key_bytes,
+						parent_cn->key_bytes,
+						parent_cn->len);
+					memcpy(&merged_cn->key_bytes[parent_cn->len],
+						child_cn->key_bytes,
+						child_cn->len);
+					merged_cn->len = (uint8_t) merged_len;
+					merged_cn->child = child_cn->child;
+					merged_cn_meta->nr_child = 1;
+					/*
+					 * Carry parent_cn's nr_keys so the
+					 * subsequent propagate(d.pnf, delta)
+					 * applies delta on the merged cn —
+					 * mirroring the parent_cn → merged_cn
+					 * replacement at the same tree position.
+					 */
+					ft_nr_keys_store(merged_cn_meta,
+						ft_nr_keys_get(parent_cn_meta),
+						CMM_RELAXED);
+					merged_cn_meta->parent =
+						parent_cn_meta->parent;
+					publish_parent = parent_cn_meta->parent;
+					publish_slot = ft_get_skip_slot(
+						parent_cn_meta, dst_ft);
+					ft_set_skip_slot(merged_cn_meta,
+						publish_slot);
+					merged_cn_flag = ft_compressed_node_flag(merged_cn);
+					ft_set_parent(merged_cn->child,
+						merged_cn_flag, &merged_cn->child);
+					{
+						struct cds_ft_inode_flag *published =
+							ft_publish_compressed(
+								dst_ft,
+								merged_cn,
+								merged_cn_flag);
+						ft_publish_to_parent(dst_ft,
+							publish_parent,
+							publish_slot, published);
+					}
+					/*
+					 * parent_cn was published in the trie
+					 * (deferred-free); child_cn was the
+					 * unpublished canonicalization wrapper
+					 * (immediate-free).
+					 */
+					free_compressed_node(dst_ft, parent_cn);
+					free_compressed_node_unpublished(
+						dst_ft, child_cn);
+					/*
+					 * Redirect d.pnf so the subsequent
+					 * nr_child + propagate updates land
+					 * on the merged cn.  Use the plain
+					 * compressed flag (ft_node_ptr at
+					 * line ~12898 doesn't strip
+					 * SKIP-X-encoded high bits, and
+					 * cds_ft_item_to_metadata on a
+					 * SKIP-X encoding crashes).
+					 */
+					d.pnf = merged_cn_flag;
+					goto graft_swap_published;
+				}
+				}
+			}
+#endif
 			ft_set_parent(old_swap_root, d.pnf, d.nfp);
 		}
 		ft_publish_to_parent(dst_ft, d.pnf, d.nfp,
 			swap_empty ? NULL : old_swap_root);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	graft_swap_published:
+		(void) 0;
+#endif
 		/*
 		 * graft_swap replaces the subtree at key_len in dst_ft
 		 * via ft_publish_to_parent directly; no ft_node_set_nth
@@ -14982,6 +15170,34 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft)
 	return count;
 }
 
+/*
+ * Validate that the pointer bits used by the skip-compressed encoding
+ * are outside the kernel's virtual address range.  Attempt to mmap a
+ * page at the encoding boundary; if the mapping succeeds or fails
+ * with EEXIST the bit is within the VA range and skip-compressed
+ * cannot be used safely.  Only ENOMEM (address beyond TASK_SIZE)
+ * confirms the bit is available; any other failure (EPERM, EINVAL,
+ * EAGAIN, seccomp, ...) is treated conservatively as unavailable.
+ */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+static
+bool ft_skip_compressed_validate(void)
+{
+	void *p;
+
+	p = mmap((void *)(1UL << FT_SKIP_LEN_SHIFT), urcu_get_page_len(),
+		 PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+		 -1, 0);
+	if (p == MAP_FAILED) {
+		/* Only ENOMEM proves the address is outside the VA range. */
+		return errno == ENOMEM;
+	}
+	/* Mapping succeeded: the bit is within the VA range. */
+	munmap(p, urcu_get_page_len());
+	return false;
+}
+#endif
+
 enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 {
 	struct cds_ft_group_attr *attr = calloc(1, sizeof(struct cds_ft_group_attr));
@@ -14994,12 +15210,19 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	attr->max_key_len = FT_MAX_KEY_LEN;
 	attr->key_map.identity = true;
 	/*
-	 * Default lookup optimization is EAGER (preserves historical
-	 * behavior).  Callers tuning for cds_ft_lookup_candidate_key or
-	 * cds_ft_speculative_lookup_key should call
+	 * Default lookup optimization is SPECULATIVE: speculative
+	 * descent with validate-and-retry, plus opportunistic
+	 * skip-compressed pointer encoding on supported archs.
+	 * Callers that need strict EAGER (per-step exact compare, no
+	 * skip-compressed) must call
 	 * cds_ft_group_attr_set_lookup_optimization(attr,
-	 * CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE) explicitly.
+	 * CDS_FT_LOOKUP_OPTIMIZE_EAGER) explicitly.
 	 */
+	attr->speculative = true;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_skip_compressed_validate())
+		attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
+#endif
 	*result = attr;
 	return CDS_FT_STATUS_OK;
 }
@@ -15035,37 +15258,6 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 	memcpy(attr->key_map.ordinal_to_key, ordinal_to_key, sizeof(attr->key_map.ordinal_to_key));
 	return CDS_FT_STATUS_OK;
 }
-
-/*
- * Validate that the pointer bits used by the skip-compressed encoding
- * are outside the kernel's virtual address range.  Attempt to mmap a
- * page at the encoding boundary; if the mapping succeeds or fails
- * with EEXIST the bit is within the VA range and skip-compressed
- * cannot be used safely.  Only ENOMEM (address beyond TASK_SIZE)
- * confirms the bit is available; any other failure (EPERM, EINVAL,
- * EAGAIN, seccomp, ...) is treated conservatively as unavailable.
- *
- * Called once from cds_ft_group_attr_set_flags when CDS_FT_FLAG_SKIP_COMPRESSED
- * is requested.
- */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-static
-bool ft_skip_compressed_validate(void)
-{
-	void *p;
-
-	p = mmap((void *)(1UL << FT_SKIP_LEN_SHIFT), urcu_get_page_len(),
-		 PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-		 -1, 0);
-	if (p == MAP_FAILED) {
-		/* Only ENOMEM proves the address is outside the VA range. */
-		return errno == ENOMEM;
-	}
-	/* Mapping succeeded: the bit is within the VA range. */
-	munmap(p, urcu_get_page_len());
-	return false;
-}
-#endif
 
 enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
 		struct cds_ft_group_attr *attr,
@@ -15261,7 +15453,18 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->flags = attr->flags;
 		ft_group->speculative = attr->speculative;
 	} else {
+		/*
+		 * NULL attr: mirror the defaults set by
+		 * cds_ft_group_attr_create — identity key map plus
+		 * SPECULATIVE lookup optimization with opportunistic
+		 * SKIP_COMPRESSED on supported archs.
+		 */
 		ft_group->key_map.identity = true;
+		ft_group->speculative = true;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_skip_compressed_validate())
+			ft_group->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
+#endif
 	}
 	*result_ft_group = ft_group;
 	FT_TP(group_create, (const void *) ft_group);
