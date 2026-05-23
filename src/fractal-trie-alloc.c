@@ -149,10 +149,13 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
  * against the no-policy baseline).
  */
 #ifdef __linux__
+#define FT_MPOL_BIND		2
 #define FT_MPOL_INTERLEAVE	3
 #define FT_MPOL_F_MEMS_ALLOWED	(1U << 2)
 #define FT_MAX_NUMA_NODES	1024
 #define FT_NODEMASK_LONGS	(FT_MAX_NUMA_NODES / (sizeof(unsigned long) * 8))
+#define FT_NODEMASK_BITS_PER_LONG	(sizeof(unsigned long) * 8)
+#define FT_HUGEPAGE_SIZE	(2UL * 1024 * 1024)	/* 2 MiB */
 
 static
 int ft_interleave_enabled(void)
@@ -170,12 +173,29 @@ int ft_interleave_enabled(void)
 	return v;
 }
 
+/*
+ * Apply per-2MB-chunk round-robin placement across the calling thread's
+ * allowed NUMA nodes when the @base region is 2 MiB-aligned and large
+ * enough (≥ 2 MiB).  Each 2 MiB chunk is mbind(MPOL_BIND)'d to a single
+ * node, so when khugepaged collapses or the kernel allocates hugepages
+ * directly, every collapsed 2 MiB page lands wholly on its bound node —
+ * preserving bandwidth-balanced placement under transparent hugepages
+ * (cross-NUMA collapse is refused by khugepaged, so MPOL_INTERLEAVE at
+ * 4 KiB granularity would silently prevent collapse).
+ *
+ * Fallback: when @base isn't 2 MiB-aligned, when fewer than 2 nodes are
+ * allowed, or when the region is smaller than one hugepage, fall back to
+ * MPOL_INTERLEAVE over the whole region — which round-robins at native
+ * page granularity (no THP coverage, but still balanced bandwidth).
+ */
 static
 void ft_apply_interleave(void *base, size_t size)
 {
 	unsigned long nodemask[FT_NODEMASK_LONGS] = { 0 };
+	int allowed_nodes[FT_MAX_NUMA_NODES];
 	unsigned long any = 0;
-	size_t i;
+	int nr_allowed = 0;
+	size_t i, off;
 	long r;
 
 	if (!ft_interleave_enabled())
@@ -188,6 +208,46 @@ void ft_apply_interleave(void *base, size_t size)
 		any |= nodemask[i];
 	if (!any)
 		return;
+	/* Enumerate allowed node IDs. */
+	for (i = 0; i < FT_MAX_NUMA_NODES; i++) {
+		size_t idx = i / FT_NODEMASK_BITS_PER_LONG;
+		size_t bit = i % FT_NODEMASK_BITS_PER_LONG;
+		if (nodemask[idx] & (1UL << bit))
+			allowed_nodes[nr_allowed++] = (int) i;
+	}
+	/*
+	 * Per-2MB-chunk MPOL_BIND fast path: needs 2 MiB alignment, at
+	 * least one hugepage of room, and multiple allowed nodes for
+	 * round-robin to do anything useful.
+	 */
+	if (nr_allowed > 1 &&
+	    ((uintptr_t) base & (FT_HUGEPAGE_SIZE - 1)) == 0 &&
+	    size >= FT_HUGEPAGE_SIZE) {
+		unsigned int chunk = 0;
+		for (off = 0; off + FT_HUGEPAGE_SIZE <= size;
+				off += FT_HUGEPAGE_SIZE, chunk++) {
+			unsigned long single[FT_NODEMASK_LONGS] = { 0 };
+			int node = allowed_nodes[chunk % (unsigned) nr_allowed];
+			single[node / FT_NODEMASK_BITS_PER_LONG] =
+				1UL << (node % FT_NODEMASK_BITS_PER_LONG);
+			(void) syscall(__NR_mbind,
+				(char *) base + off, FT_HUGEPAGE_SIZE,
+				FT_MPOL_BIND, single,
+				(unsigned long) FT_MAX_NUMA_NODES, 0);
+		}
+		/*
+		 * Trailing sub-2MB region: spread it across all allowed
+		 * nodes at native-page granularity.
+		 */
+		if (off < size) {
+			(void) syscall(__NR_mbind,
+				(char *) base + off, size - off,
+				FT_MPOL_INTERLEAVE, nodemask,
+				(unsigned long) FT_MAX_NUMA_NODES, 0);
+		}
+		return;
+	}
+	/* Fallback: whole region INTERLEAVE at native page granularity. */
 	(void) syscall(__NR_mbind, base, size, FT_MPOL_INTERLEAVE,
 			nodemask, (unsigned long) FT_MAX_NUMA_NODES, 0);
 }
