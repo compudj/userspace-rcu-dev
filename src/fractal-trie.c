@@ -2800,20 +2800,33 @@ uint8_t ft_popcount_node_get_nr_child(const struct cds_ft_type *type,
 static inline void ft_maybe_prefetch(const void *ptr)
 {
 	/*
-	 * Experiment: drop the skip-compressed high-bit clear.
-	 * __builtin_prefetch doesn't fault on non-canonical addresses
-	 * (it's a hint that silently drops invalid loads), so feeding
-	 * a skip-encoded pointer directly is safe.  The "wasted"
-	 * prefetch on skip-encoded externals is acceptable; the
-	 * common case (clean high bits) is unchanged.
+	 * Prefetch the RAW pointer without clearing the skip-compressed
+	 * length high bits.  __builtin_prefetch doesn't fault on
+	 * non-canonical addresses (it's a hint that silently drops invalid
+	 * loads), so:
+	 *   - clean child (~97% on dns): canonical -> prefetch fires with
+	 *     zero added latency on the common path;
+	 *   - skip-encoded child (~3%): non-canonical -> prefetch dropped.
+	 *
+	 * Clearing the bits first is a NET LOSS (measured on dns ft_specv,
+	 * 2026-05-23): an unconditional mask (& 57-bit imm) and an
+	 * unconditional double-shift were BOTH ~2% slower because the clear
+	 * sits ahead of the prefetch in the dep chain and delays the
+	 * common-case prefetch issue.  A raw-prefetch-then-conditional-clear
+	 * shape keeps the common case fast but only TIES no-clear --
+	 * prefetching the rare 3% skip children buys nothing measurable.
+	 * So: prefetch raw, accept the dropped 3%.  Do NOT re-add the clear
+	 * without a skip-heavy workload that shows a real win.
 	 */
 	__builtin_prefetch(ptr);
 }
 
 /*
- * ft_dereference_prefetch: for tagged FT node pointers.  Uses
- * ft_maybe_prefetch to strip any skip-compressed length bits before
- * issuing the prefetch.
+ * ft_dereference_prefetch: for tagged FT node pointers.  Prefetches the
+ * raw pointer via ft_maybe_prefetch, which does NOT clear the
+ * skip-compressed length bits (see there: a skip-encoded pointer is
+ * non-canonical and its prefetch is silently dropped -- keeping the
+ * common-case prefetch un-delayed beats prefetching the rare skip child).
  *
  * ft_dereference_prefetch_external: for plain (non-tagged) pointers
  * like external_nodes.  Direct prefetch, no tag check needed.
@@ -6178,6 +6191,20 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		 * Candidate-mode skip-advance for skip-encoded child slots.
 		 * Precise-mode resolution happened in the dispatcher retry
 		 * loop above.
+		 *
+		 * Tempting follow-up that does NOT work: adding a
+		 * ft_maybe_prefetch(node_flag) here to prefetch the skip
+		 * target's body (the 1-step-ahead FT_PF_DATA prefetch saw the
+		 * raw skip pointer and dropped it as non-canonical; node_flag
+		 * is cleared here so it would fire).  Measured a NET LOSS of
+		 * ~10-13% on dns ft_specv at T1 AND T192 (interleaved A/B,
+		 * 2026-05-24).  A prefetch on only ~3% of steps cannot cost
+		 * that directly: adding the instruction perturbs the codegen /
+		 * code layout of this always-inline descent template (which is
+		 * iTLB/layout-sensitive) and regresses every step.  Besides,
+		 * the lead time is tiny — a skip target is consumed almost
+		 * immediately (validated, for a leaf) — so it could not hide
+		 * the leaf's DRAM latency anyway.  Do not add a prefetch here.
 		 */
 		if (skip_compressed && descend_cand && caa_unlikely(ft_node_skip_compressed(node_flag))) {
 			unsigned int skip = ft_skip_len(node_flag);
