@@ -639,7 +639,9 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  */
 
 /*
- * cds_ft_eager_lookup_key - Look up a node by key.
+ * cds_ft_lookup_candidate_key - Fast candidate lookup by key (no
+ *                               validation).  The foundation of the
+ *                               speculative path.
  * @ft: The Fractal Trie.
  * @key: Pointer to the key (may be NULL if @key_len is 0).
  * @key_len: Key length in bytes.
@@ -658,34 +660,16 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  *                    cds_ft_external_arena's per-range guard page,
  *                    or a guard-page allocator) satisfies any value
  *                    up to that trailing-region size trivially.
- * @result_node: Node output. Set to the first node of the duplicate chain
- *               if a match is found, or NULL if not found or on error.
- *
- * Returns CDS_FT_STATUS_OK on success (match found),
- * CDS_FT_STATUS_NOT_FOUND if no match, or a negative cds_ft_status
- * on error.
- *
- * An RCU read-side lock must be held while calling this function and
- * while accessing the returned node.
- */
-enum cds_ft_status cds_ft_eager_lookup_key(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len, size_t key_readable_pad,
-		struct cds_ft_node **result_node);
-
-/*
- * cds_ft_lookup_candidate_key - Fast candidate lookup by key.
- * @ft: The Fractal Trie.
- * @key: Pointer to the key (may be NULL if @key_len is 0).
- * @key_len: Key length in bytes (same semantics as cds_ft_eager_lookup_key).
- * @key_readable_pad: Padding past @key end (see cds_ft_eager_lookup_key).
  * @result_node: Candidate node output. Set to a node if a candidate is
  *               found, or NULL if not found or on error.
  *
- * Faster than cds_ft_eager_lookup_key: skips key comparison at compressed
- * nodes during traversal.  The returned node is a CANDIDATE that may
- * not be an exact match.  The caller MUST compare the returned node's
- * key against the lookup key to confirm.  If the keys do not match,
- * the lookup key is not in the trie.
+ * The fastest lookup: the descent skips key comparison at compressed
+ * nodes, so the returned node is a CANDIDATE that may not be an exact
+ * match.  The caller MUST compare the returned node's key against the
+ * lookup key to confirm; if the keys do not match, the lookup key is
+ * not in the trie.  cds_ft_speculative_lookup_key wraps this with the
+ * validating compare and is the recommended entry point for callers
+ * that want an exact match.
  *
  * Returns CDS_FT_STATUS_OK on success (candidate found),
  * CDS_FT_STATUS_NOT_FOUND if no candidate, or a negative cds_ft_status
@@ -700,12 +684,14 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
 
 /*
  * cds_ft_speculative_lookup_key - Speculative descent + caller-side
- *                                 key validation.
+ *                                 key validation.  The recommended
+ *                                 lookup; matches the trie's default
+ *                                 SPECULATIVE optimization.
  * @ft: The Fractal Trie.
  * @key: Key to look up (may be NULL if @key_len is 0).
  * @key_len: Key length in bytes (must be the resolved byte count, not
  *           CDS_FT_LEN_DEFAULT).
- * @key_readable_pad: Padding past @key end (see cds_ft_eager_lookup_key).
+ * @key_readable_pad: Padding past @key end (see cds_ft_lookup_candidate_key).
  * @key_offset: Byte offset from the (struct cds_ft_node *) stored in
  *              the trie to the start of the user-stored key bytes.
  *              Typically computed as
@@ -721,11 +707,11 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
  * them).  The validation memcmp uses libc's optimized variant (e.g.
  * EVEX/AVX-512 on x86) resolved through the PLT at runtime.
  *
- * Equivalent to cds_ft_eager_lookup_key in result semantics, but with
- * caller-side validation instead of library-side.  On a candidate
- * descent the library no longer pays for inline SIMD validation in
- * the descent function, and the caller's memcmp inlines at the use
- * site where @key_offset and @key_len are typically constant.
+ * Validation is done caller-side (this memcmp) rather than in the
+ * descent function, so the library pays no inline SIMD validation cost
+ * on the hot path and the caller's memcmp inlines at the use site where
+ * @key_offset and @key_len are typically constant.  cds_ft_eager_lookup_key
+ * returns the same result with library-side validation instead.
  *
  * Returns CDS_FT_STATUS_OK on success (match found),
  * CDS_FT_STATUS_NOT_FOUND if no match, or a negative cds_ft_status
@@ -755,6 +741,36 @@ enum cds_ft_status cds_ft_speculative_lookup_key(struct cds_ft *ft,
 		*result_node = found;
 	return CDS_FT_STATUS_OK;
 }
+
+/*
+ * cds_ft_eager_lookup_key - Exact lookup by key with library-side
+ *                           validation (precise descent).
+ * @ft: The Fractal Trie.
+ * @key: Pointer to the key (may be NULL if @key_len is 0).
+ * @key_len: Key length in bytes; same as cds_ft_speculative_lookup_key
+ *           except CDS_FT_LEN_DEFAULT is also accepted (resolved to the
+ *           trie's configured fixed length).
+ * @key_readable_pad: Padding past @key end (see cds_ft_lookup_candidate_key).
+ * @result_node: Node output. Set to the first node of the duplicate chain
+ *               if a match is found, or NULL if not found or on error.
+ *
+ * Same result as cds_ft_speculative_lookup_key, but the library validates
+ * the key during a precise descent (reading compressed-node bytes
+ * directly), so no @key_offset is needed.  Strongest when the group is
+ * tuned with CDS_FT_LOOKUP_OPTIMIZE_EAGER; on the default speculative-
+ * tuned trie it still works but pays a small extra cost to unwrap
+ * skip-encoded pointers before fetching compressed nodes.
+ *
+ * Returns CDS_FT_STATUS_OK on success (match found),
+ * CDS_FT_STATUS_NOT_FOUND if no match, or a negative cds_ft_status
+ * on error.
+ *
+ * An RCU read-side lock must be held while calling this function and
+ * while accessing the returned node.
+ */
+enum cds_ft_status cds_ft_eager_lookup_key(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node);
 
 /*
  * cds_ft_lookup_partial_key - Look up by key, find closest partial match.
