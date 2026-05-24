@@ -356,7 +356,7 @@ enum cds_ft_status {
  */
 enum cds_ft_lookup_optimization {
 	/*
-	 * CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE:
+	 * CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE (default):
 	 *
 	 *   Optimize for cds_ft_lookup_candidate_key and
 	 *   cds_ft_speculative_lookup_key.  Compressed-node bytes are
@@ -379,7 +379,7 @@ enum cds_ft_lookup_optimization {
 	CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE = 0,
 
 	/*
-	 * CDS_FT_LOOKUP_OPTIMIZE_EAGER (default):
+	 * CDS_FT_LOOKUP_OPTIMIZE_EAGER:
 	 *
 	 *   Optimize for cds_ft_eager_lookup_key.  Precise descent
 	 *   reads compressed nodes via direct pointers (no
@@ -1983,11 +1983,10 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  * @opt: One of enum cds_ft_lookup_optimization
  *       (SPECULATIVE or EAGER).
  *
- * Defaults to CDS_FT_LOOKUP_OPTIMIZE_EAGER when the group attr is
- * freshly created.  Callers tuning the trie for
- * cds_ft_lookup_candidate_key + caller-side memcmp via
- * cds_ft_speculative_lookup_key should select
- * CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE explicitly.
+ * Defaults to CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE when the group attr is
+ * freshly created.  Callers that need strict eager descent (per-step
+ * exact compare via cds_ft_eager_lookup_key, no skip-compressed
+ * encoding) should select CDS_FT_LOOKUP_OPTIMIZE_EAGER explicitly.
  *
  * Speculative mode at the implementation level:
  *
