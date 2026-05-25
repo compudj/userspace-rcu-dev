@@ -240,6 +240,40 @@
 
 #define FT_ALLOC_INDEX_BITS	(FT_MAX_PAGE_ORDER - FT_ALLOC_ORDER_MIN)
 
+/*
+ * Far-metadata is the default internal-arena layout: it gives the same lookup
+ * throughput as the near (page_size-range) layout but a tighter multi-thread
+ * tail (fewer outliers) and marginally lower RSS on large tries.  Define
+ * FT_NEAR_METADATA to fall back to the original page_size-range layout.
+ */
+#if !defined(FT_NEAR_METADATA) && !defined(FT_FAR_METADATA)
+#define FT_FAR_METADATA
+#endif
+
+#ifdef FT_FAR_METADATA
+/*
+ * FT_FAR_METADATA: the exact near range layout, but with the page unit scaled
+ * from page_size (4 KiB) to a 2 MiB macro.  A range becomes:
+ *
+ *   [ ITEMS  N x 2^order  @base            ]   (N = 2 MiB >> order, one dense
+ *   [ header + METADATA[] @base + 2 MiB    ]    2 MiB-aligned run of node bodies)
+ *   [ BITMAP grows backward from base + 4 MiB (bitmap arenas only)         ]
+ *
+ * So the items are one contiguous 2 MiB run (vs the default 4 KiB items page
+ * diluted by an interleaved metadata page every 8 KiB), and the metadata array
+ * starts at the CONSTANT offset base + 2 MiB — no per-order offset table, the
+ * hot-path item->metadata / item->bitmap helpers are the default formulas with
+ * page_size replaced by FT_FAR_MACRO_SIZE.
+ *
+ * Goal: test whether a dense 2 MiB body run + internal-arena THP lets the HW
+ * prefetcher's (now unfenced within the 2 MiB) speculative neighbour fetches
+ * land on useful node bodies instead of interleaved metadata pages.
+ */
+#define FT_FAR_MACRO_ORDER	21			/* 2 MiB macro page. */
+#define FT_FAR_MACRO_SIZE	(1UL << FT_FAR_MACRO_ORDER)
+#define FT_FAR_MACRO_MASK	(FT_FAR_MACRO_SIZE - 1)
+#endif /* FT_FAR_METADATA */
+
 #define FT_BITMAP_LEN			32
 
 /*
@@ -464,7 +498,18 @@ struct cds_ft_metadata {
 	uint32_t skip_slot_offset:8;
 #endif
 	uint32_t fallback_removal_count:FT_FALLBACK_REMOVAL_BITS;
+#ifdef FT_FAR_METADATA
+	/*
+	 * A 2 MiB far macro-block holds far more than 256 items (e.g. ~18 700
+	 * order-5 nodes), overflowing the FT_ALLOC_INDEX_BITS (8-bit) packed
+	 * field.  Store alloc_index as its own uint32_t — it lands in the
+	 * struct's existing 4-byte tail padding, so the struct stays 32 B and
+	 * the hot descent bitfield (nr_child/skip_slot_offset) is untouched.
+	 */
+	uint32_t alloc_index;
+#else
 	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
+#endif
 };
 
 /*
@@ -890,10 +935,22 @@ static inline size_t cds_ft_get_page_size(void)
 #endif
 }
 
+/*
+ * FT_FAR_METADATA scales the layout's page unit from page_size to a 2 MiB
+ * macro: items fill [base, base+2MiB), the range header + metadata[] start at
+ * base+2MiB, and bitmaps grow backward from base+4MiB.  The helpers are the
+ * default formulas with cds_ft_get_page_size() replaced by FT_FAR_MACRO_SIZE.
+ */
+#ifdef FT_FAR_METADATA
+# define FT_RANGE_PAGE_UNIT	FT_FAR_MACRO_SIZE
+#else
+# define FT_RANGE_PAGE_UNIT	cds_ft_get_page_size()
+#endif
+
 static inline
 struct cds_ft_alloc_range *cds_ft_item_to_range(void *p)
 {
-	size_t pg = cds_ft_get_page_size();
+	size_t pg = FT_RANGE_PAGE_UNIT;
 	void *base = (void *)((unsigned long) p & ~(pg - 1));
 
 	return (struct cds_ft_alloc_range *) ((char *) base + pg);
@@ -903,19 +960,19 @@ static inline
 struct cds_ft_metadata *cds_ft_item_to_metadata_fast(void *p, size_t item_len_order)
 {
 	struct cds_ft_alloc_range *range = cds_ft_item_to_range(p);
-	size_t page_offset = (unsigned long) p & (cds_ft_get_page_size() - 1);
+	size_t page_offset = (unsigned long) p & (FT_RANGE_PAGE_UNIT - 1);
 	size_t index = page_offset >> item_len_order;
 
 	return &range->metadata[index].metadata;
 }
 
 /*
- * bitmap array is indexed backwards from range base + (2 * page_size).
+ * bitmap array is indexed backwards from range base + (2 * page unit).
  */
 static inline
 struct cds_ft_bitmap *cds_ft_item_to_bitmap(void *p, size_t item_len_order)
 {
-	size_t pg = cds_ft_get_page_size();
+	size_t pg = FT_RANGE_PAGE_UNIT;
 	void *base = (void *)((unsigned long) p & ~(pg - 1));
 	size_t index = ((unsigned long) p & (pg - 1)) >> item_len_order;
 

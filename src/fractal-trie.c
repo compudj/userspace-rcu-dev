@@ -447,7 +447,11 @@ void static_array_size_check(void)
 	 * Layout: nr_child(9) + [skip_slot_offset(8)] +
 	 *         fallback_removal(3) + alloc_index(FT_ALLOC_INDEX_BITS).
 	 */
-	CAA_BUILD_BUG_ON(9 + FT_FALLBACK_REMOVAL_BITS + FT_ALLOC_INDEX_BITS
+	CAA_BUILD_BUG_ON(9 + FT_FALLBACK_REMOVAL_BITS
+#ifndef FT_FAR_METADATA
+		/* far-metadata stores alloc_index as its own uint32_t. */
+		+ FT_ALLOC_INDEX_BITS
+#endif
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		+ 8
 #endif

@@ -89,7 +89,12 @@ struct cds_ft_alloc_arena {
 static
 void *cds_ft_range_get_nth_item(struct cds_ft_alloc_range *range, size_t n)
 {
-	return (((char *) range) - cds_ft_page_size) + (n << range->arena->item_len_order);
+	/*
+	 * Items occupy the page unit just before the range header: page_size in
+	 * the default layout, the leading 2 MiB of the macro under FT_FAR_METADATA
+	 * (range == macro base + 2 MiB).
+	 */
+	return (((char *) range) - FT_RANGE_PAGE_UNIT) + (n << range->arena->item_len_order);
 }
 
 static
@@ -128,11 +133,13 @@ void *cds_ft_metadata_to_item(struct cds_ft_metadata *metadata)
 static
 size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 {
+	size_t pg = FT_RANGE_PAGE_UNIT;
+
 	if (bitmap)
-		return 2 * cds_ft_page_size;
+		return 2 * pg;
 	else
-		return cds_ft_page_size + sizeof(struct cds_ft_alloc_range) +
-			(cds_ft_page_size >> item_len_order) * sizeof(struct cds_ft_metadata_alloc);
+		return pg + sizeof(struct cds_ft_alloc_range) +
+			(pg >> item_len_order) * sizeof(struct cds_ft_metadata_alloc);
 }
 
 /*
@@ -406,7 +413,7 @@ static inline void ft_apply_interleave(void *base __attribute__((unused)),
  * Transparent hugepages are advised ON for this internal node arena
  * (MADV_HUGEPAGE); see ft_apply_thp_policy() for the per-arena rationale.
  */
-static
+static __attribute__((unused))
 struct cds_ft_alloc_superblock *superblock_create(size_t min_size,
 		enum cds_ft_numa_policy numa_policy)
 {
@@ -452,6 +459,40 @@ void superblock_destroy(struct cds_ft_alloc_superblock *sb)
 static
 struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 {
+#ifdef FT_FAR_METADATA
+	/*
+	 * Far-metadata range: a 2 MiB-aligned mmap whose leading 2 MiB is one
+	 * dense run of node bodies and whose remainder (starting at base + 2 MiB)
+	 * holds the range header + metadata[] array.  range == base + 2 MiB, so
+	 * item->range is (item & ~MASK) + 2 MiB and the metadata offset is the
+	 * constant base + 2 MiB.  Its own mmap (over-map + trim to 2 MiB), not
+	 * carved from a superblock.
+	 */
+	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
+	size_t mapped = (alloc_size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
+	size_t raw_size = mapped + FT_FAR_MACRO_SIZE;
+	struct cds_ft_alloc_range *range;
+	void *raw, *base;
+	uintptr_t pre, post;
+
+	raw = mmap(NULL, raw_size, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (raw == MAP_FAILED)
+		return NULL;
+	base = (void *) (((uintptr_t) raw + FT_FAR_MACRO_MASK) & ~(uintptr_t) FT_FAR_MACRO_MASK);
+	pre = (uintptr_t) base - (uintptr_t) raw;
+	post = raw_size - pre - mapped;
+	if (pre)
+		(void) munmap(raw, pre);
+	if (post)
+		(void) munmap((char *) base + mapped, post);
+	ft_apply_interleave(base, mapped, arena->ft_group->numa_policy);
+	ft_apply_thp_policy(base, mapped, 0 /* internal node arena */);
+	range = (struct cds_ft_alloc_range *) ((char *) base + FT_FAR_MACRO_SIZE);
+	range->arena = arena;
+	range->next_unused = 0;
+	return range;
+#else
 	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
 	size_t alloc_size_aligned = (alloc_size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
 	struct cds_ft_alloc_superblock *sb;
@@ -478,16 +519,28 @@ carve:
 	range = (struct cds_ft_alloc_range *) ((char *) ptr + cds_ft_page_size);
 	range->arena = arena;
 	return range;
+#endif /* FT_FAR_METADATA */
 }
 
 /*
- * Remove a range from the arena's range list.  Memory is owned by
- * the superblock; it is reclaimed when the superblock is destroyed.
+ * Remove a range from the arena's range list.  Default ranges are owned by
+ * the superblock (reclaimed at superblock destroy); far-metadata ranges own
+ * their 2 MiB macro mmap and unmap it here.
  */
 static
 void range_destroy(struct cds_ft_alloc_range *range)
 {
 	cds_list_del(&range->node);
+#ifdef FT_FAR_METADATA
+	{
+		size_t alloc_size = cds_ft_arena_range_alloc_size(
+				range->arena->item_len_order, range->arena->bitmap);
+		size_t mapped = (alloc_size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
+
+		/* base == range - 2 MiB (items occupy the leading 2 MiB). */
+		(void) munmap((char *) range - FT_FAR_MACRO_SIZE, mapped);
+	}
+#endif
 }
 
 static
@@ -522,6 +575,17 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 		errno = EINVAL;
 		return NULL;
 	}
+#ifdef FT_FAR_METADATA
+	/* Items fill the leading 2 MiB; metadata (+ bitmap) live past base+2MiB. */
+	max_items_per_range = FT_FAR_MACRO_SIZE >> item_len_order;
+	/* Bitmap arenas: header + metadata + bitmap must fit the second 2 MiB. */
+	if (bitmap && (sizeof(struct cds_ft_alloc_range) +
+			max_items_per_range * (sizeof(struct cds_ft_metadata_alloc) +
+				sizeof(struct cds_ft_bitmap)) > FT_FAR_MACRO_SIZE)) {
+		errno = EINVAL;
+		return NULL;
+	}
+#else
 	max_items_per_range = cds_ft_page_size >> item_len_order;
 	/* Ensure that range header, metadata array and bitmaps fit in a page. */
 	if (bitmap && (sizeof(struct cds_ft_alloc_range) +
@@ -530,6 +594,7 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 		errno = EINVAL;
 		return NULL;
 	}
+#endif
 	arena = calloc(1, sizeof(struct cds_ft_alloc_arena));
 	if (!arena)
 		goto error_alloc;
@@ -583,7 +648,7 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 
 	/* Return head of free list. */
 	if (free_list_head) {
-		uint16_t saved_alloc_index = free_list_head->metadata.alloc_index;
+		size_t saved_alloc_index = free_list_head->metadata.alloc_index;
 
 		arena->free_list_head = free_list_head->free_list_next;
 		p = cds_ft_metadata_to_item(&free_list_head->metadata);
