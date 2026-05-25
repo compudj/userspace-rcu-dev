@@ -15681,6 +15681,19 @@ void cds_ft_destroy(struct cds_ft *ft)
 {
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 
+	/*
+	 * A compaction the caller never ended would otherwise strand its
+	 * private ranges (relocated nodes in arena-untracked ranges) and leak
+	 * its state/iter.  Finalize it here: cds_ft_compact_end merges the
+	 * private ranges back into the arenas and frees the state, leaving a
+	 * consistent trie to tear down.
+	 */
+	if (caa_unlikely(ft->active_compact != NULL)) {
+		fprintf(stderr,
+			"cds_ft_destroy: trie %p destroyed with a compaction still in progress; finalizing (missing cds_ft_compact_end)\n",
+			(void *) ft);
+		cds_ft_compact_end(ft->active_compact);
+	}
 	FT_TP(ft_destroy, (const void *) ft);
 	/* Free root node. No concurrent readers at this point. */
 	free_cds_ft_node(ft, ft_node_ptr(ft->root));
@@ -16692,8 +16705,19 @@ struct cds_ft_compact_state {
 
 struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft)
 {
-	struct cds_ft_compact_state *st = calloc(1, sizeof(*st));
+	struct cds_ft_compact_state *st;
 
+	if (caa_unlikely(ft->active_compact != NULL)) {
+		/*
+		 * A compaction is already in flight on this trie (a previous
+		 * one was never ended, or two are being started).  Programmer
+		 * error: assert in debug, and refuse in release rather than
+		 * abandon the in-flight one.
+		 */
+		assert(!"cds_ft_compact_begin: a compaction is already in progress on this trie");
+		return NULL;
+	}
+	st = calloc(1, sizeof(*st));
 	if (!st)
 		return NULL;
 	if (cds_ft_iter_create(ft, &st->iter) != CDS_FT_STATUS_OK) {
@@ -16702,6 +16726,7 @@ struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft)
 	}
 	ft_recompact_alloc_init(&st->ctx);
 	st->ft = ft;
+	ft->active_compact = st;
 	return st;
 }
 
@@ -16764,6 +16789,7 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 
 void cds_ft_compact_end(struct cds_ft_compact_state *st)
 {
+	st->ft->active_compact = NULL;
 	ft_recompact_alloc_merge(&st->ctx);
 	cds_ft_iter_destroy(st->iter);
 	free(st);

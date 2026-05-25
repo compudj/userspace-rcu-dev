@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 201
+#define NR_TESTS 202
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -14229,6 +14229,63 @@ out:
 	return ret;
 }
 
+/*
+ * Forgotten cds_ft_compact_end: start a compaction, run a couple of steps
+ * (partial), then never call _end.  cds_ft_destroy must finalize the abandoned
+ * compaction (merge its private ranges, free its state) -- no crash, no leak.
+ * The "compaction still in progress" warning on stderr at destroy is expected.
+ */
+static int test_compact_forgotten_end(void)
+{
+	const unsigned int N = 2000;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_compact_state *st;
+	unsigned int i;
+	int ret = 0;
+
+	ft = create_fixed_ft(8, &group);
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			node_free(n);
+			ret = -1;
+			goto out;
+		}
+	}
+	st = cds_ft_compact_begin(ft);
+	if (!st) {
+		ret = -1;
+		goto out;
+	}
+	(void) cds_ft_compact_step(st, 8);	/* partial: do not run to completion */
+	(void) cds_ft_compact_step(st, 8);
+	/* Intentionally NO cds_ft_compact_end(st) -- destroy must finalize it. */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "forgotten-end: verify failed mid-compaction\n");
+		ret = -1;
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < N; i++) {
+		struct cds_ft_node *out_node = NULL;
+
+		if (lookup_u64(ft, i, &out_node) != CDS_FT_STATUS_OK ||
+				to_test_node(out_node)->key != i) {
+			fprintf(stderr, "forgotten-end: key %u missing\n", i);
+			ret = -1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+out:
+	drain_trie(ft);
+	cds_ft_destroy(ft);	/* finalizes the un-ended compaction */
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                           MAIN                                     */
@@ -14522,6 +14579,7 @@ int main(int argc, char **argv)
 	diag("Compaction tests");
 	RUN_TEST(test_compact_integrity);
 	RUN_TEST(test_compact_concurrent_mutation);
+	RUN_TEST(test_compact_forgotten_end);
 
 	rcu_barrier();
 	rcu_unregister_thread();

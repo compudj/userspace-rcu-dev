@@ -637,6 +637,8 @@ typedef enum cds_ft_status (*cds_ft_lookup_prefix_key_fn)(
 		size_t key_len, size_t *match_len,
 		struct cds_ft_node **result_node);
 
+struct cds_ft_compact_state;
+
 struct cds_ft {
 	struct cds_ft_group *group;
 
@@ -668,6 +670,16 @@ struct cds_ft {
 	 * When false, concurrent RCU readers are permitted.
 	 */
 	bool exclusive;
+
+	/*
+	 * In-progress compaction state (cds_ft_compact_begin), or NULL.
+	 * Set at begin, cleared at end.  Lets cds_ft_compact_begin reject a
+	 * second concurrent compaction on the same trie, and cds_ft_destroy
+	 * finalize one the caller forgot to end (merging its private ranges
+	 * back so they are not leaked).  Written under the caller's writer
+	 * exclusion, like every other mutation.
+	 */
+	struct cds_ft_compact_state *active_compact;
 
 #ifdef FEATURE_FT_EXCL_VALIDATE
 	/*
