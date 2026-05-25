@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 202
+#define NR_TESTS 203
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -14106,6 +14106,110 @@ static int test_external_arena_oversize_reject(void)
  * expected value.  Exercises node relocation (including skip targets) and
  * the private-range allocation + merge path.
  */
+/*
+ * Leak introspection, present only in DEBUG_COUNTERS lib builds (no public
+ * header decl).  Weak-referenced so this test links against any lib build:
+ * when absent (default build) the compressed-leak assertion is skipped and
+ * cds_ft_verify is the structural check; when present (debug-counters) the
+ * compressed-node leak is asserted directly.
+ */
+extern void cds_ft_debug_arena_resident(const struct cds_ft *ft,
+		size_t *live_ranges, size_t *reclaimed_ranges,
+		size_t *internal_items, size_t *compressed_items,
+		size_t *range_bytes) __attribute__((weak));
+
+/*
+ * Regression: removing every key must free the compressed (path-edge) nodes,
+ * not just the internal branch nodes.  Keys (i << 32) leave a 4-byte zero
+ * suffix per leaf, so the build creates ~N compressed nodes.  After removing
+ * all keys via cds_ft_remove the trie is empty, so the compressed node arena
+ * must drain to zero -- a nonzero residual is the detach-path compressed leak.
+ */
+static int test_remove_compressed_no_leak(void)
+{
+	const char *nenv = getenv("FT_TEST_N");
+	const unsigned int N = nenv ? (unsigned int) atoi(nenv) : 4096;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node **nodes;
+	size_t lr = 0, rr = 0, ii = 0, ci_build = 0, ci_after = 0, rb = 0;
+	unsigned int i;
+	int ret = 0;
+
+	nodes = (struct ft_test_node **) calloc(N, sizeof(*nodes));
+	if (!nodes)
+		abort();
+	ft = create_fixed_ft(8, &group);
+	for (i = 0; i < N; i++) {
+		nodes[i] = node_alloc((uint64_t) i << 32);
+		rcu_read_lock();
+		if (insert_u64(ft, (uint64_t) i << 32, nodes[i]) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "remove_compressed: insert %u failed\n", i);
+			node_free(nodes[i]);
+			ret = -1;
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+	if (cds_ft_debug_arena_resident)
+		cds_ft_debug_arena_resident(ft, &lr, &rr, &ii, &ci_build, &rb);
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "remove_compressed: verify failed after build\n");
+		ret = -1;
+		goto out;
+	}
+
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK) {
+		ret = -1;
+		goto out;
+	}
+	for (i = 0; i < N; i++) {
+		uint8_t k[8];
+
+		cds_ft_u64_to_key(ft, (uint64_t) i << 32, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK)
+			(void) cds_ft_remove(ft, iter, &nodes[i]->node);
+		rcu_read_unlock();
+		node_free_rcu(nodes[i]);
+		/* Periodically re-verify the shrinking trie stays well-formed. */
+		if ((i & 1023) == 1023 && cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "remove_compressed: verify failed mid-removal at %u\n", i);
+			ret = -1;
+			goto out;
+		}
+	}
+	rcu_barrier();		/* complete deferred frees */
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "remove_compressed: verify failed on empty trie\n");
+		ret = -1;
+		goto out;
+	}
+	if (cds_ft_debug_arena_resident) {
+		cds_ft_debug_arena_resident(ft, &lr, &rr, &ii, &ci_after, &rb);
+		fprintf(stderr, "remove_compressed: compressed build=%zu after_remove_all=%zu (internal residual=%zu)\n",
+			ci_build, ci_after, ii);
+		if (ci_after != 0) {
+			fprintf(stderr, "remove_compressed: LEAK %zu compressed nodes survived full deletion\n",
+				ci_after);
+			ret = -1;
+		}
+	} else {
+		fprintf(stderr, "remove_compressed: arena introspection unavailable (build without DEBUG_COUNTERS); cds_ft_verify-only\n");
+	}
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	free(nodes);
+	return ret;
+}
+
 static int test_compact_integrity(void)
 {
 	const unsigned int N = 4096;
@@ -14580,6 +14684,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_integrity);
 	RUN_TEST(test_compact_concurrent_mutation);
 	RUN_TEST(test_compact_forgotten_end);
+	RUN_TEST(test_remove_compressed_no_leak);
 
 	rcu_barrier();
 	rcu_unregister_thread();

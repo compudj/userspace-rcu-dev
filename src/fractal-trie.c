@@ -10628,6 +10628,16 @@ int ft_detach_node(struct cds_ft *ft,
 				to_free[nr_to_free++] = walk_nf;
 				walk_nf = next;
 			}
+			/*
+			 * As in the replace-ptr free-walk below: a skip-compressed
+			 * external leaf at the chain end keeps its path bytes in a
+			 * separate, now-orphaned skip-target compressed node that the
+			 * walk stops short of.  Free it (the external leaf stays
+			 * caller-owned).
+			 */
+			if (walk_nf && ft_node_skip_compressed(walk_nf))
+				free_compressed_node(ft,
+					ft_skip_to_compressed(walk_nf));
 			for (fi = 0; fi < nr_to_free; fi++) {
 				if (ft_node_compressed(to_free[fi]))
 					free_compressed_node(ft,
@@ -10807,6 +10817,18 @@ int ft_detach_node(struct cds_ft *ft,
 						to_free[nr_to_free++] = walk_nf;
 						walk_nf = next;
 					}
+					/*
+					 * The chain stops at @walk_nf.  If that is a
+					 * skip-compressed external leaf, its path bytes
+					 * live in a separate skip-target compressed node:
+					 * the external leaf is caller-owned, but that
+					 * skip-target is trie-owned and now orphaned, and
+					 * the walk above stopped at the external pointer
+					 * without seeing it.  Free it here.
+					 */
+					if (walk_nf && ft_node_skip_compressed(walk_nf))
+						free_compressed_node(ft,
+							ft_skip_to_compressed(walk_nf));
 				}
 				for (fi = 0; fi < nr_to_free; fi++) {
 					if (ft_node_compressed(to_free[fi]))

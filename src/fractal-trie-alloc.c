@@ -629,6 +629,67 @@ void ft_arena_reclaim_range(struct cds_ft_alloc_arena *arena,
 	pthread_mutex_unlock(&arena->lock);
 }
 
+#ifdef DEBUG_COUNTERS
+/*
+ * DEBUG_COUNTERS-only leak introspection (no public header decl; tests
+ * weak-reference it).  Reports the internal + compressed node-arena occupancy
+ * of @ft's group.  @live_ranges counts ranges still backed by RAM (on
+ * arena->ranges); @reclaimed_ranges counts ranges whose pages were released via
+ * MADV_DONTNEED and parked on arena->free_ranges; @internal_items and
+ * @compressed_items sum per-range nr_live for the internal vs compressed
+ * arenas; @range_bytes is the per-range page unit.  Resident node-arena bytes
+ * ~= live_ranges * range_bytes.  Caller must ensure no concurrent arena
+ * mutation (we walk the lists without the arena lock).
+ */
+void cds_ft_debug_arena_resident(const struct cds_ft *ft, size_t *live_ranges,
+		size_t *reclaimed_ranges, size_t *internal_items,
+		size_t *compressed_items, size_t *range_bytes);
+void cds_ft_debug_arena_resident(const struct cds_ft *ft, size_t *live_ranges,
+		size_t *reclaimed_ranges, size_t *internal_items,
+		size_t *compressed_items, size_t *range_bytes)
+{
+	struct cds_ft_group *group = ft->group;
+	size_t lr = 0, rr = 0, internal_li = 0, compressed_li = 0;
+	int i;
+
+	for (i = 0; i <= FT_ALLOC_ORDER_MAX; i++) {
+		struct cds_ft_alloc_arena *arenas[2];
+		int a;
+
+		arenas[0] = group->arena_order[i];		/* internal */
+		arenas[1] = group->compressed_arena_order[i];	/* compressed */
+		if (arenas[1] == arenas[0])
+			arenas[1] = NULL;	/* shared: avoid double count */
+		for (a = 0; a < 2; a++) {
+			struct cds_ft_alloc_arena *arena = arenas[a];
+			struct cds_ft_alloc_range *r;
+
+			if (arena == NULL)
+				continue;
+			cds_list_for_each_entry(r, &arena->ranges, node) {
+				lr++;
+				if (a == 0)
+					internal_li += r->nr_live;
+				else
+					compressed_li += r->nr_live;
+			}
+			cds_list_for_each_entry(r, &arena->free_ranges, node)
+				rr++;
+		}
+	}
+	if (live_ranges)
+		*live_ranges = lr;
+	if (reclaimed_ranges)
+		*reclaimed_ranges = rr;
+	if (internal_items)
+		*internal_items = internal_li;
+	if (compressed_items)
+		*compressed_items = compressed_li;
+	if (range_bytes)
+		*range_bytes = FT_RANGE_PAGE_UNIT;
+}
+#endif /* DEBUG_COUNTERS */
+
 static
 struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 		const char *arena_name, size_t item_len_order, bool bitmap)
