@@ -491,6 +491,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	range = (struct cds_ft_alloc_range *) ((char *) base + FT_FAR_MACRO_SIZE);
 	range->arena = arena;
 	range->next_unused = 0;
+	range->nr_live = 0;
 	return range;
 #else
 	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
@@ -659,6 +660,8 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 			struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(p, arena->item_len_order);
 			memset(bitmap, 0, sizeof(struct cds_ft_bitmap));
 		}
+		/* alloc_index restored above, so the range lookup is valid. */
+		cds_ft_metadata_to_range(&free_list_head->metadata)->nr_live++;
 		pthread_mutex_unlock(&arena->lock);
 		return &free_list_head->metadata;
 	}
@@ -686,6 +689,7 @@ create_range:
 room_left:
 	/* First range in list has room left. */
 	item_index = range->next_unused++;
+	range->nr_live++;
 	item = &range->metadata[item_index];
 	item->metadata.alloc_index = item_index;
 	pthread_mutex_unlock(&arena->lock);
@@ -781,15 +785,21 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 		size_t item_len = 1UL << arena->item_len_order;
 		void *item = cds_ft_metadata_to_item(metadata);
 
+		/* Single-threaded testing mode: no arena->lock needed. */
+		assert(range->nr_live > 0);
+		range->nr_live--;
 		memset(item, 0xfe, item_len);
 		memset(metadata_alloc, 0xfe, sizeof(*metadata_alloc));
 	}
 #else
 	{
-		struct cds_ft_alloc_arena *arena =
-			cds_ft_metadata_to_range(metadata)->arena;
+		struct cds_ft_alloc_range *range =
+			cds_ft_metadata_to_range(metadata);
+		struct cds_ft_alloc_arena *arena = range->arena;
 
 		pthread_mutex_lock(&arena->lock);
+		assert(range->nr_live > 0);
+		range->nr_live--;
 		metadata_alloc->free_list_next = arena->free_list_head;
 		arena->free_list_head = metadata_alloc;
 		pthread_mutex_unlock(&arena->lock);

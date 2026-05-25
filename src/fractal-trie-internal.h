@@ -908,6 +908,15 @@ struct cds_ft_alloc_range {
 	struct cds_list_head node;			/* Linked list of ranges. */
 	struct cds_ft_alloc_arena *arena;		/* Backward reference to arena. */
 	size_t next_unused;
+	/*
+	 * Number of currently-live (allocated, not free-listed) items in
+	 * this range.  Incremented in cds_ft_arena_alloc (both the
+	 * free-list reuse and bump paths) and decremented in
+	 * cds_ft_do_free_item, all under arena->lock.  A range whose
+	 * nr_live reaches 0 holds no live nodes and is a candidate for
+	 * reclaiming its backing pages to the OS.
+	 */
+	size_t nr_live;
 
 	struct cds_ft_metadata_alloc metadata[];
 };
