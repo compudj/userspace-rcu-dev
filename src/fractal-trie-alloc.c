@@ -148,13 +148,11 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
  * workloads with thread-local working sets or for benchmarking
  * against the no-policy baseline).
  *
- * Transparent hugepages are a separate, orthogonal concern: FT actively
- * opts OUT of THP on its arenas (ft_disable_thp / MADV_NOHUGEPAGE) because
- * 2 MiB pages are a measured net loss for the trie's random pointer-chase
- * (they pin the L2/L3 page-colour bits to the virtual offset, so the
- * arena's strided node accesses self-conflict in the cache).  The
- * 2 MiB-granular interleave below is about NUMA placement only and is
- * unaffected — it stands whether the backing pages are 4 KiB or larger.
+ * Transparent hugepages are a separate, orthogonal concern handled per-arena
+ * by ft_apply_thp_policy(): 2 MiB pages are advised ON for the internal node
+ * arena (TLB win on the structured descent) and OFF for the external/leaf
+ * arena (prefetch-pollution loss on random access).  The 2 MiB-granular
+ * interleave below is about NUMA placement only and is unaffected by page size.
  */
 #ifdef __linux__
 /*
@@ -173,15 +171,18 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 #define FT_HUGEPAGE_SIZE	(2UL * 1024 * 1024)	/* 2 MiB */
 
 /*
- * MADV_NOHUGEPAGE (asm-generic/mman-common.h value 15).  glibc only
- * exposes it under _GNU_SOURCE, so define it locally — like the FT_MPOL_*
- * numbers above — to guarantee FT can opt its arenas out of THP
- * regardless of the feature-test macros the translation unit was built
- * with.  Without this the madvise() silently compiles out and THP is NOT
- * disabled on a kernel configured with transparent_hugepage=always.
+ * MADV_HUGEPAGE / MADV_NOHUGEPAGE (asm-generic/mman-common.h values 14/15).
+ * glibc only exposes them under _GNU_SOURCE, so define them locally — like
+ * the FT_MPOL_* numbers above — to guarantee ft_apply_thp_policy() can advise
+ * THP per-arena regardless of the feature-test macros this translation unit
+ * was built with.  Without these the madvise() silently compiles out and the
+ * per-arena policy is NOT applied on a kernel with transparent_hugepage=always.
  */
 #ifndef MADV_NOHUGEPAGE
 #define MADV_NOHUGEPAGE		15
+#endif
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE		14
 #endif
 
 /*
@@ -207,47 +208,43 @@ int ft_interleave_env_forces_skip(void)
 }
 
 /*
- * Disable transparent hugepages (THP) on an FT arena mapping.
+ * Per-arena Transparent Huge Page (THP) policy for FT allocator mappings.
  *
- * THP is a measured NET LOSS for the fractal trie and is therefore
- * actively opted out of (MADV_NOHUGEPAGE), not merely left un-hinted —
- * the latter is insufficient on systems configured with THP "always",
- * where the kernel would back the arena with 2 MiB pages regardless.
+ * Page size does NOT affect cache-line selection on this hardware: the L1 is
+ * virtually indexed from the page offset, the L2/L3 (and the L3 slice hash)
+ * are physically indexed, and a 2 MiB-vs-4 KiB mapping over the *same physical
+ * frames* gives identical cache behaviour (verified by a same-frames
+ * split-the-PMD experiment).  So THP is purely a TLB / hardware-prefetcher
+ * tradeoff — and that tradeoff has OPPOSITE sign for the two arenas
+ * (load-names dns, Zen 4, perf-verified):
  *
- * Why THP hurts FT (load-names dns, single-thread, Zen 4; perf-verified):
+ *   External (leaf) arena -> opt OUT (MADV_NOHUGEPAGE).
+ *     Leaf access is random: one cold leaf per lookup, no reuse, no stride.
+ *     The HW prefetcher can never usefully prefetch it; under 2 MiB pages it
+ *     only pays the cost (fetching useless neighbours across the former 4 KiB
+ *     prefetch fences) with zero benefit.  Measured ~-13% with hugepages.
  *
- *   2 MiB pages slash TLB misses (~550x fewer L1 DTLB misses, ~170x
- *   fewer page-table walks) — but that is NOT the FT lookup bottleneck.
- *   A lookup is a random pointer-chase through a working set far larger
- *   than the LLC, so it is ~68% bound on LLC-miss DRAM latency.  Page
- *   size cannot change whether a line is cached, so it cannot touch that
- *   68%.  Meanwhile the TLB misses it does eliminate are CHEAP: the page
- *   tables for the hot set stay cache-resident, so each walk is ~15-20
- *   cycles, not a DRAM hit — only ~3% of cycles total.
- *
- *   Worse, 2 MiB pages ADD last-level cache-conflict misses (+8% LLC
- *   misses measured, net +5% cycles).  The L2/L3 are physically indexed,
- *   so the set index is a function of the physical "page colour" bits
- *   above the 4 KiB offset.  With 4 KiB pages the OS scatters frames,
- *   randomising those bits and spreading the arena's regular, strided
- *   node accesses across cache sets.  Inside a 2 MiB hugepage physical
- *   == virtual, so the colour bits are pinned to the virtual offset: the
- *   arena stride survives straight into the cache index and strided
- *   nodes collide into far fewer sets.  (L1 is virtually indexed from
- *   the page offset and is unaffected — consistent with the measured
- *   L1-flat / LLC-up signature.)
- *
- * So FT keeps 4 KiB pages for their page-colour entropy, and gets its
- * NUMA-locality win from the orthogonal 2 MiB-granular mbind interleave
- * (ft_apply_interleave), which is independent of page size.
+ *   Internal node arena -> opt IN (MADV_HUGEPAGE).
+ *     The descent is a structured pointer-chase with a small hot top, over a
+ *     working set that thrashes the 4 KiB DTLB; 2 MiB pages cut DTLB misses
+ *     ~1000x and that win dominates (no prefetch pollution, unlike the random
+ *     leaves).  Measured ~+7% with hugepages.  Advice only (no eager
+ *     populate) so worker first-touch still places pages on the local NUMA
+ *     node; the 2 MiB-granular mbind interleave (ft_apply_interleave) is
+ *     orthogonal and unaffected.
  */
 static
-void ft_disable_thp(void *base __attribute__((unused)),
-		size_t size __attribute__((unused)))
+void ft_apply_thp_policy(void *base, size_t size, int is_external)
 {
+	if (is_external) {
 #ifdef MADV_NOHUGEPAGE
-	(void) madvise(base, size, MADV_NOHUGEPAGE);
+		(void) madvise(base, size, MADV_NOHUGEPAGE);
 #endif
+	} else {
+#ifdef MADV_HUGEPAGE
+		(void) madvise(base, size, MADV_HUGEPAGE);
+#endif
+	}
 }
 
 /*
@@ -278,7 +275,7 @@ int ft_query_process_mempolicy_mode(void)
  *     contiguous virtual ranges node-local, which the hardware
  *     prefetcher and NUMA locality favour — this coarse granularity is
  *     the measured win.  (FT pages stay 4 KiB; THP is disabled, see
- *     ft_disable_thp.)  Falls back to whole-region MPOL_INTERLEAVE at
+ *     ft_apply_thp_policy.)  Falls back to whole-region MPOL_INTERLEAVE at
  *     native page granularity when @base isn't 2 MiB-aligned, the region
  *     is smaller than 2 MiB, or only one node is allowed.
  *
@@ -406,8 +403,8 @@ static inline void ft_apply_interleave(void *base __attribute__((unused)),
  * favour — this coarse interleave is the real measured win and is
  * independent of page size.
  *
- * Transparent hugepages are explicitly DISABLED on FT arenas
- * (MADV_NOHUGEPAGE); see ft_disable_thp() for the rationale.
+ * Transparent hugepages are advised ON for this internal node arena
+ * (MADV_HUGEPAGE); see ft_apply_thp_policy() for the per-arena rationale.
  */
 static
 struct cds_ft_alloc_superblock *superblock_create(size_t min_size,
@@ -425,7 +422,7 @@ struct cds_ft_alloc_superblock *superblock_create(size_t min_size,
 	if (base == MAP_FAILED)
 		return NULL;
 	ft_apply_interleave(base, size, numa_policy);
-	ft_disable_thp(base, size);
+	ft_apply_thp_policy(base, size, 0 /* internal node arena */);
 	sb = malloc(sizeof(*sb));
 	if (!sb) {
 		munmap(base, size);
@@ -979,8 +976,8 @@ ft_ext_arena_range_create(void)
 	 */
 	ft_apply_interleave(aligned, FT_EXT_ARENA_RANGE_SIZE,
 			CDS_FT_NUMA_DEFAULT);
-	/* Opt out of THP (net loss for FT — see ft_disable_thp). */
-	ft_disable_thp(aligned, FT_EXT_ARENA_RANGE_SIZE);
+	/* Opt out of THP for the external/leaf arena — see ft_apply_thp_policy. */
+	ft_apply_thp_policy(aligned, FT_EXT_ARENA_RANGE_SIZE, 1 /* external node arena */);
 
 	r = (struct cds_ft_external_arena_range *) aligned;
 	CDS_INIT_LIST_HEAD(&r->node);
