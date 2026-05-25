@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 200
+#define NR_TESTS 201
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -14159,6 +14159,76 @@ out:
 	return ret;
 }
 
+/*
+ * Resumable compaction interleaved with mutations: drive begin/step/end with a
+ * tiny batch and insert a fresh key between each step.  Exercises the headline
+ * capability -- the cached iterator re-descending by key onto a structure that
+ * changed while the read lock was dropped -- then verifies integrity and that
+ * every key (original + inserted) survives.
+ */
+static int test_compact_concurrent_mutation(void)
+{
+	const unsigned int N = 2000;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_compact_state *st;
+	unsigned int i, inserted = 0;
+	int ret = 0, more;
+
+	ft = create_fixed_ft(8, &group);
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			node_free(n);
+			ret = -1;
+			goto out;
+		}
+	}
+
+	st = cds_ft_compact_begin(ft);
+	if (!st) {
+		ret = -1;
+		goto out;
+	}
+	do {
+		more = cds_ft_compact_step(st, 1);	/* batch 1 -> many steps */
+		/* Mutate between steps (the read lock was just dropped). */
+		if (inserted < N) {
+			struct ft_test_node *n = node_alloc(N + inserted);
+
+			if (insert_u64(ft, N + inserted, n) == CDS_FT_STATUS_OK)
+				inserted++;
+			else
+				node_free(n);
+		}
+	} while (more);
+	cds_ft_compact_end(st);
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "concurrent compact: verify failed\n");
+		ret = -1;
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < N + inserted; i++) {
+		struct cds_ft_node *out_node = NULL;
+
+		if (lookup_u64(ft, i, &out_node) != CDS_FT_STATUS_OK ||
+				to_test_node(out_node)->key != i) {
+			fprintf(stderr, "concurrent compact: key %u missing\n", i);
+			ret = -1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+out:
+	drain_trie(ft);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                           MAIN                                     */
@@ -14451,6 +14521,7 @@ int main(int argc, char **argv)
 	/* Compaction */
 	diag("Compaction tests");
 	RUN_TEST(test_compact_integrity);
+	RUN_TEST(test_compact_concurrent_mutation);
 
 	rcu_barrier();
 	rcu_unregister_thread();

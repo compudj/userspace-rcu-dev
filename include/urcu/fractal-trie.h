@@ -2658,10 +2658,11 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
  * reclaimed. Recovers the descent locality and resident memory that churn or
  * graft-based population fragmentation cost over time.
  *
- * Runs as a writer: the caller must exclude concurrent writers on @ft for the
- * duration of the call (the same mutual-exclusion contract as the other
- * mutators). Concurrent RCU readers are permitted throughout, and other tries
- * sharing the group keep mutating -- the group stays online.
+ * One-shot convenience wrapper around cds_ft_compact_begin/step/end: the
+ * caller must exclude concurrent writers on @ft for the whole call (the same
+ * mutual-exclusion contract as the other mutators). Concurrent RCU readers are
+ * permitted throughout, and other tries sharing the group keep mutating -- the
+ * group stays online.
  *
  * Best-effort with respect to memory pressure: if an allocation fails while
  * walking, the affected node is left at its current address and the walk
@@ -2670,6 +2671,57 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
  * To defragment a whole group, call this on each trie the group contains.
  */
 void cds_ft_compact(struct cds_ft *ft);
+
+/*
+ * Resumable compaction (cds_ft_compact_begin / _step / _end).
+ *
+ * Lets a long compaction be interleaved with concurrent mutations of the
+ * SAME trie: the caller drives it, holding its writer mutex only around each
+ * cds_ft_compact_step and releasing it between steps so other writers (and
+ * grace periods that drain reclaimed ranges) get a window. Each step uses the
+ * leaf key reached so far as a resume cursor and re-descends from the root, so
+ * it tolerates the structure changing between steps.
+ *
+ *   struct cds_ft_compact_state *st = cds_ft_compact_begin(ft);
+ *   do {
+ *           writer_lock();
+ *           more = cds_ft_compact_step(st, batch);
+ *           writer_unlock();
+ *   } while (more);
+ *   cds_ft_compact_end(st);
+ */
+struct cds_ft_compact_state;
+
+/*
+ * cds_ft_compact_begin - Start a resumable compaction of @ft.
+ *
+ * Returns an opaque state to drive with cds_ft_compact_step, or NULL on
+ * allocation failure. The returned state must be released with
+ * cds_ft_compact_end.
+ */
+struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft);
+
+/*
+ * cds_ft_compact_step - Relocate up to @batch internal nodes.
+ * @st: State from cds_ft_compact_begin.
+ * @batch: Maximum nodes to relocate this step (0 selects a default).
+ *
+ * The caller must hold its writer exclusion for @ft across this call.
+ * Returns true if more work remains (call again), false once the trie is
+ * fully compacted. Either way the trie is valid at every step boundary.
+ */
+bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch);
+
+/*
+ * cds_ft_compact_end - Finish a compaction and release its state.
+ * @st: State from cds_ft_compact_begin.
+ *
+ * Must be called exactly once after cds_ft_compact_begin, whether the
+ * compaction ran to completion or the caller stopped early. Stopping early is
+ * fine: it merges the work done so far and leaves a valid, partially-compacted
+ * trie. Releases all resources held by @st.
+ */
+void cds_ft_compact_end(struct cds_ft_compact_state *st);
 
 /*
  * cds_ft_show_format - Output format for cds_ft_show().

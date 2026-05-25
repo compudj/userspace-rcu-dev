@@ -16523,42 +16523,18 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
  * ft_node_recompact's dual-pointer publish updates both cn->child and the
  * skip pointer.
  */
-struct ft_reloc_work {
-	struct cds_ft_inode_flag **holder;	/* parent slot to relocate the child into */
-	struct cds_ft_inode_flag *node;		/* node to descend into without relocating */
-	unsigned int depth;
-	bool relocate;
-	bool is_root;
-};
-
+/* Relocate the internal node at *@holder into a fresh slot; RCU-free the old. */
 static
-struct cds_ft_inode_flag *ft_reloc_skip_target(struct cds_ft_inode_flag *raw)
+void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder)
 {
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	if (ft_node_skip_compressed(raw))
-		return ft_skip_child_ptr(raw);
-#endif
-	return raw;
-}
+	struct cds_ft_inode_flag *nf = *holder;
+	unsigned int type_index = ft_node_type(nf);
+	struct cds_ft_inode *node = ft_node_ptr(nf), *old_ret = NULL;
+	struct cds_ft_metadata *meta = cds_ft_item_to_metadata(node);
 
-static
-struct cds_ft_inode_flag *ft_reloc_one(struct cds_ft *ft,
-		const struct ft_reloc_work *w)
-{
-	struct cds_ft_inode_flag *nf;
-	unsigned int type_index;
-	struct cds_ft_inode *node, *old_ret = NULL;
-	struct cds_ft_metadata *meta;
-
-	if (!w->relocate)
-		return w->node;
-	nf = *w->holder;
-	type_index = ft_node_type(nf);
-	node = ft_node_ptr(nf);
-	meta = cds_ft_item_to_metadata(node);
 	(void) ft_node_recompact(FT_RECOMPACT_RELOCATE, ft, type_index,
-			&ft_types[type_index], node, meta, w->holder,
-			0, NULL, NULL, &old_ret, w->is_root, w->depth);
+			&ft_types[type_index], node, meta, holder,
+			0, NULL, NULL, &old_ret, holder == &ft->root, 0);
 	/*
 	 * The old node was just unpublished; concurrent readers may still
 	 * hold it, so free it after a grace period.  Its range's nr_live
@@ -16566,114 +16542,177 @@ struct cds_ft_inode_flag *ft_reloc_one(struct cds_ft *ft,
 	 */
 	if (old_ret)
 		cds_ft_free_item(ft, cds_ft_item_to_metadata(old_ret));
-	return *w->holder;	/* recompact stored the new flag here */
-}
-
-static
-int ft_reloc_expand(struct cds_ft_inode_flag *cur_flag,
-		unsigned int child_depth, struct ft_reloc_work *out)
-{
-	unsigned int k;
-	int n = 0;
-
-	for (k = 0; k < FT_ENTRY_PER_NODE; k++) {
-		struct cds_ft_inode_flag **slot = NULL;
-		struct cds_ft_inode_flag *raw =
-			ft_node_get_nth_skip(cur_flag, &slot, (uint8_t) k,
-				FT_PF_NONE);
-		struct cds_ft_inode_flag *t;
-
-		if (!raw)
-			continue;
-		t = ft_reloc_skip_target(raw);
-		if (t != raw) {
-			/* raw is a skip pointer; t is its (plain internal) target. */
-			struct cds_ft_metadata *t_meta;
-			struct cds_ft_inode_flag *cn_flag;
-
-			if (ft_node_external(t) || ft_node_compressed(t))
-				continue;
-			t_meta = cds_ft_item_to_metadata(ft_node_ptr(t));
-			cn_flag = t_meta->parent;
-			if (cn_flag && ft_node_compressed(cn_flag)) {
-				/*
-				 * Relocate the skip target through the compressed
-				 * node's cn->child slot; ft_node_recompact then
-				 * republishes BOTH cn->child and the skip pointer.
-				 */
-				out[n].holder =
-					&ft_compressed_node_ptr(cn_flag)->child;
-				out[n].node = NULL;
-				out[n].relocate = true;
-			} else {
-				/* Defensive: no compressed parent -- descend only. */
-				out[n].holder = NULL;
-				out[n].node = t;
-				out[n].relocate = false;
-			}
-			out[n].depth = child_depth;
-			out[n].is_root = false;
-			n++;
-			continue;
-		}
-		if (ft_node_external(raw) || ft_node_compressed(raw))
-			continue;	/* leaves stay put; compressed left in place */
-		out[n].holder = slot;
-		out[n].node = NULL;
-		out[n].relocate = true;
-		out[n].depth = child_depth;
-		out[n].is_root = false;
-		n++;
-	}
-	return n;
-}
-
-static
-void ft_reloc_dfs(struct cds_ft *ft, const struct ft_reloc_work *w)
-{
-	struct cds_ft_inode_flag *cur = ft_reloc_one(ft, w);
-	struct ft_reloc_work kids[FT_ENTRY_PER_NODE];
-	int n, i;
-
-	n = ft_reloc_expand(cur, w->depth + 1, kids);
-	for (i = 0; i < n; i++)
-		ft_reloc_dfs(ft, &kids[i]);
 }
 
 /*
- * cds_ft_compact - defragment a trie's internal-node arenas in place.
- *
- * Relocates every internal node into freshly-allocated, densely-packed slots
- * in DFS descent order; the now-empty source ranges drain and are reclaimed
- * by the allocator.  Recovers the descent locality and RSS that churn or
- * graft fragmentation cost.
- *
- * Runs as a writer: the caller must exclude concurrent writers on @ft for the
- * whole call (the standard writer-serialization contract).  Concurrent RCU
- * readers are permitted throughout and other tries in the same group keep
- * mutating -- the group stays online.  Compressed nodes are left in place.
- *
- * Best-effort: if an allocation fails mid-walk the affected node is left at
- * its old address and the walk continues; the trie stays valid, just less
- * fully compacted.
+ * Forward relocate-descent: walk from the root to the leaf for @key
+ * (the user key), relocating every internal node on the path that has
+ * not already been relocated this pass (recompact_private).  Mirrors the
+ * lookup descent's ordinal mapping and skip/compressed advancement, but
+ * tracks the holder at each step (which the read descent does not) so it
+ * can republish.  A skip target is relocated through the compressed
+ * node's cn->child slot, so ft_node_recompact republishes both cn->child
+ * and the skip pointer.  Increments *@relocated per node moved.
  */
+static
+void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
+		size_t key_len, unsigned long *relocated)
+{
+	const struct cds_ft_key_map *km = &ft->group->key_map;
+	struct cds_ft_inode_flag **holder = &ft->root;
+	size_t depth = 0;
+
+	for (;;) {
+		struct cds_ft_inode_flag *nf = rcu_dereference(*holder);
+		struct cds_ft_inode_flag **child_slot = NULL;
+		struct cds_ft_inode_flag *raw;
+		uint8_t ord;
+
+		if (ft_node_external(nf))
+			return;		/* reached a leaf */
+		if (!cds_ft_metadata_in_recompact_private(
+				cds_ft_item_to_metadata(ft_node_ptr(nf)))) {
+			ft_compact_relocate_at(ft, holder);
+			(*relocated)++;
+			nf = rcu_dereference(*holder);	/* the relocated node */
+		}
+		if (depth >= key_len)
+			return;		/* consumed the whole key */
+		ord = key_to_ordinal(key[depth], km);
+		raw = ft_node_get_nth_skip(nf, &child_slot, ord, FT_PF_NONE);
+		if (!raw)
+			return;		/* child absent (e.g. concurrent removal) */
+		depth++;		/* child-index byte (matches iter_key = *key++) */
+		if (ft_node_skip_compressed(raw)) {
+			struct cds_ft_inode_flag *target = ft_skip_child_ptr(raw);
+			struct cds_ft_compressed_node *cn;
+
+			depth += ft_skip_len(raw);
+			if (ft_node_external(target))
+				return;
+			cn = ft_compressed_node_ptr(rcu_dereference(
+				cds_ft_item_to_metadata(ft_node_ptr(target))->parent));
+			holder = &cn->child;	/* relocate target via cn->child next iter */
+		} else if (ft_node_compressed(raw)) {
+			struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(raw);
+
+			depth += cn->len;
+			holder = &cn->child;
+		} else {
+			holder = child_slot;	/* plain internal or external child */
+		}
+	}
+}
+
+/* Default per-step relocation budget when cds_ft_compact_step(batch == 0). */
+#define FT_COMPACT_BATCH_DEFAULT	64
+
+/*
+ * Resumable compaction state.  Heap-allocated by cds_ft_compact_begin so the
+ * caller treats it as opaque.  The navigation iterator is left in its default
+ * CACHED mode: within a step's read-lock window it advances incrementally on
+ * its cached path (the relocated-away nodes it navigates stay alive until the
+ * read-unlock, and relocation preserves key order), and it retains the cursor
+ * key itself.  Between steps the path is invalidated, so the iterator's key is
+ * the only resume token; the private-range context persists, merged at end.
+ */
+struct cds_ft_compact_state {
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	struct ft_recompact_alloc_ctx ctx;
+	bool started;
+	bool done;
+};
+
+struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft)
+{
+	struct cds_ft_compact_state *st = calloc(1, sizeof(*st));
+
+	if (!st)
+		return NULL;
+	if (cds_ft_iter_create(ft, &st->iter) != CDS_FT_STATUS_OK) {
+		free(st);
+		return NULL;
+	}
+	ft_recompact_alloc_init(&st->ctx);
+	st->ft = ft;
+	return st;
+}
+
+bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
+{
+	struct cds_ft *ft = st->ft;
+	const struct rcu_flavor_struct *flavor = ft->group->flavor;
+	unsigned long relocated = 0;
+
+	if (st->done)
+		return false;
+	if (batch == 0)
+		batch = FT_COMPACT_BATCH_DEFAULT;
+
+	/*
+	 * Route this step's relocations into private ranges, and hold the
+	 * RCU read lock for the whole batch: it keeps the iterator's reads
+	 * and our descents safe, and defers our own call_rcu node frees until
+	 * the read-unlock between steps (where the drained ranges reclaim and
+	 * concurrent mutations get their window).
+	 */
+	ft_recompact_alloc_set_active(&st->ctx);
+	flavor->read_lock();
+	while (relocated < batch) {
+		uint8_t key[FT_MAX_KEY_LEN];
+		size_t key_len;
+		enum cds_ft_status s;
+
+		/*
+		 * Cached iter: lookup_gt advances incrementally on the cached
+		 * path within this read-lock window.  The first lookup of each
+		 * batch re-descends the current structure (the path was
+		 * invalidated at the previous read-unlock) from the iterator's
+		 * retained key.
+		 */
+		s = st->started ? cds_ft_lookup_gt(ft, st->iter)
+				: cds_ft_lookup_first(ft, st->iter);
+		st->started = true;
+		if (s != CDS_FT_STATUS_OK) {	/* NOT_FOUND or error: finished */
+			st->done = true;
+			break;
+		}
+		if (cds_ft_iter_get_key(st->iter, key, sizeof(key),
+				&key_len) != CDS_FT_STATUS_OK) {
+			st->done = true;
+			break;
+		}
+		ft_compact_descend(ft, key, key_len, &relocated);
+	}
+	/*
+	 * Drop the cached path before releasing the read lock: the nodes it
+	 * references become eligible for the grace-period free once unlocked.
+	 * The iterator's key is retained, so the next step re-descends from it.
+	 */
+	cds_ft_iter_invalidate_path(st->iter);
+	flavor->read_unlock();
+	ft_recompact_alloc_set_active(NULL);
+	return !st->done;
+}
+
+void cds_ft_compact_end(struct cds_ft_compact_state *st)
+{
+	ft_recompact_alloc_merge(&st->ctx);
+	cds_ft_iter_destroy(st->iter);
+	free(st);
+}
+
 void cds_ft_compact(struct cds_ft *ft)
 {
 	CDS_FT_SCOPED_WRITER(ft);
-	struct ft_recompact_alloc_ctx ctx;
-	struct ft_reloc_work root_w = {
-		.holder = &ft->root,
-		.node = NULL,
-		.relocate = true,
-		.is_root = true,
-		.depth = 0,
-	};
+	struct cds_ft_compact_state *st = cds_ft_compact_begin(ft);
 
-	ft_recompact_alloc_init(&ctx);
-	ft_recompact_alloc_set_active(&ctx);
-	ft_reloc_dfs(ft, &root_w);
-	ft_recompact_alloc_set_active(NULL);
-	ft_recompact_alloc_merge(&ctx);
+	if (!st)
+		return;		/* OOM: best-effort, leave the trie as-is */
+	while (cds_ft_compact_step(st, 0))
+		;
+	cds_ft_compact_end(st);
 }
 
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
