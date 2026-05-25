@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 199
+#define NR_TESTS 200
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -14096,6 +14096,71 @@ static int test_external_arena_oversize_reject(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*                         COMPACTION                                 */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Build a trie, cds_ft_compact() it, and verify the trie stays correct:
+ * structural integrity (cds_ft_verify) plus every key still found at its
+ * expected value.  Exercises node relocation (including skip targets) and
+ * the private-range allocation + merge path.
+ */
+static int test_compact_integrity(void)
+{
+	const unsigned int N = 4096;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	unsigned int i;
+	int ret = 0;
+
+	/* Fixed 8-byte keys so insert_u64/lookup_u64 (CDS_FT_LEN_DEFAULT) apply. */
+	ft = create_fixed_ft(8, &group);
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compact: insert %u failed\n", i);
+			node_free(n);
+			ret = -1;
+			goto out;
+		}
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compact: pre-compaction verify failed\n");
+		ret = -1;
+		goto out;
+	}
+
+	cds_ft_compact(ft);
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compact: post-compaction verify failed\n");
+		ret = -1;
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < N; i++) {
+		struct cds_ft_node *out_node = NULL;
+
+		if (lookup_u64(ft, i, &out_node) != CDS_FT_STATUS_OK ||
+				to_test_node(out_node)->key != i) {
+			fprintf(stderr, "compact: key %u not found after compaction\n",
+				i);
+			ret = -1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+out:
+	drain_trie(ft);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -14382,6 +14447,10 @@ int main(int argc, char **argv)
 	RUN_TEST(test_external_arena_multi_range);
 	RUN_TEST(test_external_arena_alignment);
 	RUN_TEST(test_external_arena_oversize_reject);
+
+	/* Compaction */
+	diag("Compaction tests");
+	RUN_TEST(test_compact_integrity);
 
 	rcu_barrier();
 	rcu_unregister_thread();

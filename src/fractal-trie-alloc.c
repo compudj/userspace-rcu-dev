@@ -495,6 +495,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 		range->next_unused = 0;
 		range->nr_live = 0;
 		range->free_list_head = NULL;
+		range->recompact_private = false;
 		CDS_INIT_LIST_HEAD(&range->partial_node);
 		return range;
 	}
@@ -532,6 +533,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	range->next_unused = 0;
 	range->nr_live = 0;
 	range->free_list_head = NULL;
+	range->recompact_private = false;
 	CDS_INIT_LIST_HEAD(&range->partial_node);
 	return range;
 #else
@@ -728,6 +730,53 @@ void cds_ft_arena_destroy(struct cds_ft_alloc_arena *arena)
 	free(arena);
 }
 
+/*
+ * Per-thread recompaction allocation context (NULL except on a thread running
+ * cds_ft_compact).  See struct ft_recompact_alloc_ctx and the routing below.
+ */
+static __thread struct ft_recompact_alloc_ctx *ft_recompact_alloc_tls;
+
+void ft_recompact_alloc_init(struct ft_recompact_alloc_ctx *ctx)
+{
+	size_t i;
+
+	for (i = 0; i <= FT_ALLOC_ORDER_MAX; i++)
+		ctx->cur[i] = NULL;
+	CDS_INIT_LIST_HEAD(&ctx->all);
+}
+
+void ft_recompact_alloc_set_active(struct ft_recompact_alloc_ctx *ctx)
+{
+	ft_recompact_alloc_tls = ctx;
+}
+
+void ft_recompact_alloc_merge(struct ft_recompact_alloc_ctx *ctx)
+{
+	struct cds_ft_alloc_range *range, *tmp;
+
+	/*
+	 * Splice the private ranges into their arenas' general range lists so
+	 * the general allocator sees them.  They hold the densely-relocated
+	 * nodes; any free slots (the last, partially-filled range per order)
+	 * become reusable through the normal frontier/partial paths.  Clearing
+	 * recompact_private makes them ordinary ranges again.
+	 */
+	cds_list_for_each_entry_safe(range, tmp, &ctx->all, node) {
+		struct cds_ft_alloc_arena *arena = range->arena;
+
+		pthread_mutex_lock(&arena->lock);
+		cds_list_del(&range->node);
+		range->recompact_private = false;
+		cds_list_add(&range->node, &arena->ranges);
+		pthread_mutex_unlock(&arena->lock);
+	}
+}
+
+bool cds_ft_metadata_in_recompact_private(struct cds_ft_metadata *metadata)
+{
+	return cds_ft_metadata_to_range(metadata)->recompact_private;
+}
+
 static
 struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 {
@@ -736,6 +785,42 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 	size_t item_index;
 
 	pthread_mutex_lock(&arena->lock);
+
+	/*
+	 * Recompaction context active on this thread: bump-allocate into a
+	 * per-order private fresh range (created lazily, kept off the arena's
+	 * general lists until ft_recompact_alloc_end splices it in), so the
+	 * relocated nodes pack densely and unrelated concurrent allocations on
+	 * other threads (ctx == NULL) are unaffected by the path below.
+	 */
+	{
+		struct ft_recompact_alloc_ctx *ctx = ft_recompact_alloc_tls;
+
+		if (caa_unlikely(ctx != NULL)) {
+			size_t order = arena->item_len_order;
+
+			assert(order <= FT_ALLOC_ORDER_MAX);
+			range = ctx->cur[order];
+			if (!range || range->next_unused ==
+					arena->max_nr_items_per_range) {
+				range = range_create(arena);
+				if (!range) {
+					errno = ENOMEM;
+					pthread_mutex_unlock(&arena->lock);
+					return NULL;
+				}
+				range->recompact_private = true;
+				ctx->cur[order] = range;
+				cds_list_add(&range->node, &ctx->all);
+			}
+			item_index = range->next_unused++;
+			range->nr_live++;
+			item = &range->metadata[item_index];
+			item->metadata.alloc_index = item_index;
+			pthread_mutex_unlock(&arena->lock);
+			return &item->metadata;
+		}
+	}
 
 	/*
 	 * Reuse a freed slot from the most-recently-used range that still

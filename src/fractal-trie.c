@@ -470,6 +470,13 @@ enum ft_recompact {
 	FT_RECOMPACT_ADD_SAME,
 	FT_RECOMPACT_ADD_NEXT,
 	FT_RECOMPACT_DEL,
+	/*
+	 * Pure relocation: same type and child set, copied verbatim into a
+	 * fresh allocation (new address), children reparented, republished
+	 * into the parent slot (and skip slot, via the shared publish path).
+	 * Used by cds_ft_compact() to defragment the node arenas.
+	 */
+	FT_RECOMPACT_RELOCATE,
 };
 
 enum ft_lookup_inequality {
@@ -5319,6 +5326,9 @@ int ft_node_recompact(enum ft_recompact mode,
 		dbg_printf("Recompact for node with %u children\n",
 			metadata->nr_child - 1);
 		break;
+	case FT_RECOMPACT_RELOCATE:
+		new_type_index = old_type_index;	/* same type, pure relocation */
+		break;
 	default:
 		assert(0);
 	}
@@ -5410,7 +5420,8 @@ int ft_node_recompact(enum ft_recompact mode,
 	{
 		unsigned int i;
 
-		assert(mode == FT_RECOMPACT_DEL);
+		assert(mode == FT_RECOMPACT_DEL ||
+			mode == FT_RECOMPACT_RELOCATE);
 		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
 			struct cds_ft_inode_flag *iter;
 
@@ -16490,6 +16501,179 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	if (ret)
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
 	return CDS_FT_STATUS_OK;
+}
+
+/*
+ * cds_ft_compact internals.
+ *
+ * Relocate every internal node of a trie into fresh, densely-packed
+ * allocations in DFS descent order, so the node arenas defragment: the old
+ * ranges drain as relocated nodes are freed, and the allocator reclaims the
+ * ones that empty (see cds_ft_do_free_item).  The relative layout order is
+ * not a measurable performance lever (DFS, BFS+DFS and density-DFS all tie);
+ * the win is recovering locality lost to churn/graft, so we use plain DFS.
+ *
+ * Concurrency: the caller's writer exclusion keeps the trie quiescent w.r.t.
+ * other writers for the whole walk; concurrent RCU readers are fine.  Each
+ * node is republished and its old copy RCU-freed (ft_node_recompact +
+ * cds_ft_free_item), so a reader observes the old or the new node, never a
+ * freed one.  Compressed nodes are left in place (off the speculative descent
+ * path).  A skip target (a plain internal node reached through a skip pointer)
+ * IS relocated, routed through the compressed node's cn->child slot so
+ * ft_node_recompact's dual-pointer publish updates both cn->child and the
+ * skip pointer.
+ */
+struct ft_reloc_work {
+	struct cds_ft_inode_flag **holder;	/* parent slot to relocate the child into */
+	struct cds_ft_inode_flag *node;		/* node to descend into without relocating */
+	unsigned int depth;
+	bool relocate;
+	bool is_root;
+};
+
+static
+struct cds_ft_inode_flag *ft_reloc_skip_target(struct cds_ft_inode_flag *raw)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(raw))
+		return ft_skip_child_ptr(raw);
+#endif
+	return raw;
+}
+
+static
+struct cds_ft_inode_flag *ft_reloc_one(struct cds_ft *ft,
+		const struct ft_reloc_work *w)
+{
+	struct cds_ft_inode_flag *nf;
+	unsigned int type_index;
+	struct cds_ft_inode *node, *old_ret = NULL;
+	struct cds_ft_metadata *meta;
+
+	if (!w->relocate)
+		return w->node;
+	nf = *w->holder;
+	type_index = ft_node_type(nf);
+	node = ft_node_ptr(nf);
+	meta = cds_ft_item_to_metadata(node);
+	(void) ft_node_recompact(FT_RECOMPACT_RELOCATE, ft, type_index,
+			&ft_types[type_index], node, meta, w->holder,
+			0, NULL, NULL, &old_ret, w->is_root, w->depth);
+	/*
+	 * The old node was just unpublished; concurrent readers may still
+	 * hold it, so free it after a grace period.  Its range's nr_live
+	 * decrements in the callback, so a fully-drained range self-reclaims.
+	 */
+	if (old_ret)
+		cds_ft_free_item(ft, cds_ft_item_to_metadata(old_ret));
+	return *w->holder;	/* recompact stored the new flag here */
+}
+
+static
+int ft_reloc_expand(struct cds_ft_inode_flag *cur_flag,
+		unsigned int child_depth, struct ft_reloc_work *out)
+{
+	unsigned int k;
+	int n = 0;
+
+	for (k = 0; k < FT_ENTRY_PER_NODE; k++) {
+		struct cds_ft_inode_flag **slot = NULL;
+		struct cds_ft_inode_flag *raw =
+			ft_node_get_nth_skip(cur_flag, &slot, (uint8_t) k,
+				FT_PF_NONE);
+		struct cds_ft_inode_flag *t;
+
+		if (!raw)
+			continue;
+		t = ft_reloc_skip_target(raw);
+		if (t != raw) {
+			/* raw is a skip pointer; t is its (plain internal) target. */
+			struct cds_ft_metadata *t_meta;
+			struct cds_ft_inode_flag *cn_flag;
+
+			if (ft_node_external(t) || ft_node_compressed(t))
+				continue;
+			t_meta = cds_ft_item_to_metadata(ft_node_ptr(t));
+			cn_flag = t_meta->parent;
+			if (cn_flag && ft_node_compressed(cn_flag)) {
+				/*
+				 * Relocate the skip target through the compressed
+				 * node's cn->child slot; ft_node_recompact then
+				 * republishes BOTH cn->child and the skip pointer.
+				 */
+				out[n].holder =
+					&ft_compressed_node_ptr(cn_flag)->child;
+				out[n].node = NULL;
+				out[n].relocate = true;
+			} else {
+				/* Defensive: no compressed parent -- descend only. */
+				out[n].holder = NULL;
+				out[n].node = t;
+				out[n].relocate = false;
+			}
+			out[n].depth = child_depth;
+			out[n].is_root = false;
+			n++;
+			continue;
+		}
+		if (ft_node_external(raw) || ft_node_compressed(raw))
+			continue;	/* leaves stay put; compressed left in place */
+		out[n].holder = slot;
+		out[n].node = NULL;
+		out[n].relocate = true;
+		out[n].depth = child_depth;
+		out[n].is_root = false;
+		n++;
+	}
+	return n;
+}
+
+static
+void ft_reloc_dfs(struct cds_ft *ft, const struct ft_reloc_work *w)
+{
+	struct cds_ft_inode_flag *cur = ft_reloc_one(ft, w);
+	struct ft_reloc_work kids[FT_ENTRY_PER_NODE];
+	int n, i;
+
+	n = ft_reloc_expand(cur, w->depth + 1, kids);
+	for (i = 0; i < n; i++)
+		ft_reloc_dfs(ft, &kids[i]);
+}
+
+/*
+ * cds_ft_compact - defragment a trie's internal-node arenas in place.
+ *
+ * Relocates every internal node into freshly-allocated, densely-packed slots
+ * in DFS descent order; the now-empty source ranges drain and are reclaimed
+ * by the allocator.  Recovers the descent locality and RSS that churn or
+ * graft fragmentation cost.
+ *
+ * Runs as a writer: the caller must exclude concurrent writers on @ft for the
+ * whole call (the standard writer-serialization contract).  Concurrent RCU
+ * readers are permitted throughout and other tries in the same group keep
+ * mutating -- the group stays online.  Compressed nodes are left in place.
+ *
+ * Best-effort: if an allocation fails mid-walk the affected node is left at
+ * its old address and the walk continues; the trie stays valid, just less
+ * fully compacted.
+ */
+void cds_ft_compact(struct cds_ft *ft)
+{
+	CDS_FT_SCOPED_WRITER(ft);
+	struct ft_recompact_alloc_ctx ctx;
+	struct ft_reloc_work root_w = {
+		.holder = &ft->root,
+		.node = NULL,
+		.relocate = true,
+		.is_root = true,
+		.depth = 0,
+	};
+
+	ft_recompact_alloc_init(&ctx);
+	ft_recompact_alloc_set_active(&ctx);
+	ft_reloc_dfs(ft, &root_w);
+	ft_recompact_alloc_set_active(NULL);
+	ft_recompact_alloc_merge(&ctx);
 }
 
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION

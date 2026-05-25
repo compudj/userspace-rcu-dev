@@ -928,6 +928,15 @@ struct cds_ft_alloc_range {
 	 */
 	struct cds_ft_metadata_alloc *free_list_head;
 	struct cds_list_head partial_node;
+	/*
+	 * Set while this range is a private destination of an in-progress
+	 * cds_ft_compact (allocated through the recompaction context, not yet
+	 * merged into the arena).  The compactor reads it to tell, in O(1),
+	 * whether a node it is descending past has already been relocated this
+	 * pass (so it relocates each node exactly once).  Cleared when the
+	 * range is merged back into the arena's general pool.
+	 */
+	bool recompact_private;
 
 	struct cds_ft_metadata_alloc metadata[];
 };
@@ -1039,6 +1048,44 @@ void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
  */
 __attribute__((visibility("hidden")))
 void cds_ft_free_item_unpublished(struct cds_ft *ft, struct cds_ft_metadata *metadata);
+
+/*
+ * Recompaction allocation context (cds_ft_compact).  While active on the
+ * recompacting thread (set via ft_recompact_alloc_begin), cds_ft_arena_alloc
+ * routes that thread's allocations into per-order private fresh ranges held
+ * here -- kept off the arena's general range lists so the relocated nodes
+ * pack densely, and concurrent unrelated allocations neither land among them
+ * nor get forced to bump.  ft_recompact_alloc_end splices the private ranges
+ * into their arenas and clears the context.  @cur is indexed by the arena's
+ * item_len_order.
+ */
+struct ft_recompact_alloc_ctx {
+	struct cds_ft_alloc_range *cur[FT_ALLOC_ORDER_MAX + 1];
+	struct cds_list_head all;
+};
+
+/* Initialize a context (no ranges yet, not active). */
+__attribute__((visibility("hidden")))
+void ft_recompact_alloc_init(struct ft_recompact_alloc_ctx *ctx);
+
+/*
+ * Route this thread's subsequent internal-node allocations into @ctx's private
+ * ranges (pass NULL to stop routing).  Called around each compaction step so
+ * the caller's other mutations between steps allocate normally.
+ */
+__attribute__((visibility("hidden")))
+void ft_recompact_alloc_set_active(struct ft_recompact_alloc_ctx *ctx);
+
+/*
+ * Splice @ctx's private ranges into their arenas' general pools and clear
+ * their recompact_private flag.  Called once when compaction completes.
+ */
+__attribute__((visibility("hidden")))
+void ft_recompact_alloc_merge(struct ft_recompact_alloc_ctx *ctx);
+
+/* True if @metadata's item lives in a range currently flagged recompact_private. */
+__attribute__((visibility("hidden")))
+bool cds_ft_metadata_in_recompact_private(struct cds_ft_metadata *metadata);
 
 //#define DEBUG
 //#define DEBUG_COUNTERS

@@ -2651,6 +2651,27 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t 
 enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
 
 /*
+ * cds_ft_compact - Defragment a trie's internal-node arenas in place.
+ *
+ * Relocates every internal node into freshly-allocated, densely-packed slots
+ * in descent order; the now-empty source ranges drain and their memory is
+ * reclaimed. Recovers the descent locality and resident memory that churn or
+ * graft-based population fragmentation cost over time.
+ *
+ * Runs as a writer: the caller must exclude concurrent writers on @ft for the
+ * duration of the call (the same mutual-exclusion contract as the other
+ * mutators). Concurrent RCU readers are permitted throughout, and other tries
+ * sharing the group keep mutating -- the group stays online.
+ *
+ * Best-effort with respect to memory pressure: if an allocation fails while
+ * walking, the affected node is left at its current address and the walk
+ * continues. The trie remains valid and correct, only less fully compacted.
+ *
+ * To defragment a whole group, call this on each trie the group contains.
+ */
+void cds_ft_compact(struct cds_ft *ft);
+
+/*
  * cds_ft_show_format - Output format for cds_ft_show().
  *
  * CDS_FT_SHOW_PRETTY: human-readable indented text, suitable for
