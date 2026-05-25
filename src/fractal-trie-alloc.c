@@ -102,6 +102,7 @@ struct cds_ft_alloc_arena {
 	pthread_mutex_t lock;
 	char *name;
 	bool bitmap;
+	bool compressed;	/* Dedicated compressed-node arena (speculative groups). */
 };
 
 static
@@ -687,6 +688,14 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	arena->item_len_order = item_len_order;
 	arena->max_nr_items_per_range = max_items_per_range;
 	arena->bitmap = bitmap;
+	/*
+	 * The dedicated compressed-node arena (speculative groups route
+	 * compressed nodes here via cds_ft_alloc_compressed_item).  Lets the
+	 * compactor keep relocated compressed nodes in their own private
+	 * ranges, separate from internal nodes of the same order.
+	 */
+	arena->compressed = arena_name &&
+		!strcmp(arena_name, "cds_ft_alloc_compressed");
 	CDS_INIT_LIST_HEAD(&arena->ranges);
 	CDS_INIT_LIST_HEAD(&arena->partial_ranges);
 	CDS_INIT_LIST_HEAD(&arena->free_ranges);
@@ -740,8 +749,10 @@ void ft_recompact_alloc_init(struct ft_recompact_alloc_ctx *ctx)
 {
 	size_t i;
 
-	for (i = 0; i <= FT_ALLOC_ORDER_MAX; i++)
+	for (i = 0; i <= FT_ALLOC_ORDER_MAX; i++) {
 		ctx->cur[i] = NULL;
+		ctx->cur_compressed[i] = NULL;
+	}
 	CDS_INIT_LIST_HEAD(&ctx->all);
 }
 
@@ -798,9 +809,17 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 
 		if (caa_unlikely(ctx != NULL)) {
 			size_t order = arena->item_len_order;
+			/*
+			 * Internal and compressed-node arenas share item-length
+			 * orders but are distinct arenas, so keep separate private
+			 * current-ranges for each (else a compressed node and an
+			 * internal node of the same order would share a range).
+			 */
+			struct cds_ft_alloc_range **curp = arena->compressed ?
+				&ctx->cur_compressed[order] : &ctx->cur[order];
 
 			assert(order <= FT_ALLOC_ORDER_MAX);
-			range = ctx->cur[order];
+			range = *curp;
 			if (!range || range->next_unused ==
 					arena->max_nr_items_per_range) {
 				range = range_create(arena);
@@ -810,7 +829,7 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 					return NULL;
 				}
 				range->recompact_private = true;
-				ctx->cur[order] = range;
+				*curp = range;
 				cds_list_add(&range->node, &ctx->all);
 			}
 			item_index = range->next_unused++;

@@ -16545,6 +16545,55 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 }
 
 /*
+ * Relocate a compressed node @cn into a fresh slot, keeping the same length.
+ * Because the length is unchanged, the skip pointer's encoded length still
+ * matches (ft_skip_to_compressed_validate's cn->len == skip_len holds whether a
+ * reader resolves the old or the new node), and the parent-pointer flip is
+ * exactly what that reader-side validation already tolerates; the old node
+ * stays alive until its grace period.  A compressed node never carries
+ * external_nodes (that would fork a path that must remain skippable), so the
+ * only reference to redirect is its child's back-pointer.  The grandparent slot
+ * is repointed only for a traditional (non-skip) compressed node -- a skip
+ * pointer addresses the target, not @cn, so it needs no change.
+ *
+ * @gp_slot: grandparent slot holding the cn flag (traditional), or NULL (skip).
+ * Returns the new compressed node (or @cn unchanged on allocation failure).
+ */
+static
+struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
+		struct cds_ft_compressed_node *cn,
+		struct cds_ft_inode_flag **gp_slot)
+{
+	struct cds_ft_metadata *cn_meta =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	struct cds_ft_metadata *cn2_meta;
+	struct cds_ft_compressed_node *cn2;
+	struct cds_ft_inode_flag *cn2_flag;
+	uint8_t len = cn->len;
+
+	cn2 = alloc_compressed_node(ft, len, &cn2_meta);
+	if (!cn2)
+		return cn;	/* OOM: leave in place (best-effort) */
+	cn2->len = len;
+	cn2->child = cn->child;
+	memcpy(cn2->key_bytes, cn->key_bytes, len);
+	cn2_meta->parent = cn_meta->parent;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	cn2_meta->skip_slot_offset = cn_meta->skip_slot_offset;
+#endif
+	cn2_meta->nr_child = cn_meta->nr_child;		/* == 1 for a compressed node */
+	cn2_meta->external_nodes = NULL;		/* never set on a compressed node */
+	ft_nr_keys_store(cn2_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
+	cn2_flag = ft_compressed_node_flag(cn2);
+	/* Redirect the child's back-reference (internal: parent; external: prev). */
+	ft_set_parent(cn2->child, cn2_flag, &cn2->child);
+	if (gp_slot)
+		rcu_assign_pointer(*gp_slot, cn2_flag);
+	free_compressed_node(ft, cn);
+	return cn2;
+}
+
+/*
  * Forward relocate-descent: walk from the root to the leaf for @key
  * (the user key), relocating every internal node on the path that has
  * not already been relocated this pass (recompact_private).  Mirrors the
@@ -16592,11 +16641,28 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 				return;
 			cn = ft_compressed_node_ptr(rcu_dereference(
 				cds_ft_item_to_metadata(ft_node_ptr(target))->parent));
-			holder = &cn->child;	/* relocate target via cn->child next iter */
+			/*
+			 * Relocate the compressed node too.  The grandparent slot
+			 * is a skip pointer addressing the target, not cn, so it
+			 * needs no repoint (NULL).  The target is then relocated via
+			 * cn->child on the next iteration.
+			 */
+			if (!cds_ft_metadata_in_recompact_private(
+					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
+				cn = ft_compact_relocate_compressed(ft, cn, NULL);
+				(*relocated)++;
+			}
+			holder = &cn->child;
 		} else if (ft_node_compressed(raw)) {
 			struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(raw);
 
 			depth += cn->len;
+			/* Traditional: the grandparent slot (child_slot) holds the cn flag. */
+			if (!cds_ft_metadata_in_recompact_private(
+					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
+				cn = ft_compact_relocate_compressed(ft, cn, child_slot);
+				(*relocated)++;
+			}
 			holder = &cn->child;
 		} else {
 			holder = child_slot;	/* plain internal or external child */

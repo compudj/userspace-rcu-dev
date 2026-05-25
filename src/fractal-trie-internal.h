@@ -1060,7 +1060,13 @@ void cds_ft_free_item_unpublished(struct cds_ft *ft, struct cds_ft_metadata *met
  * item_len_order.
  */
 struct ft_recompact_alloc_ctx {
+	/*
+	 * Per-order current private range, separately for the internal-node
+	 * arenas (@cur) and the dedicated compressed-node arena (@cur_compressed),
+	 * since the two share item-length orders but are distinct arenas.
+	 */
 	struct cds_ft_alloc_range *cur[FT_ALLOC_ORDER_MAX + 1];
+	struct cds_ft_alloc_range *cur_compressed[FT_ALLOC_ORDER_MAX + 1];
 	struct cds_list_head all;
 };
 
