@@ -2817,8 +2817,16 @@ static inline void ft_maybe_prefetch(const void *ptr)
 	 * prefetching the rare 3% skip children buys nothing measurable.
 	 * So: prefetch raw, accept the dropped 3%.  Do NOT re-add the clear
 	 * without a skip-heavy workload that shows a real win.
+	 *
+	 * EXPERIMENT: external (leaf) targets — tag bits 0-1 clear — are
+	 * accessed randomly and once (no reuse), so prefetch them
+	 * NON-TEMPORALLY to avoid polluting L2/L3 with use-once leaf lines.
+	 * Internal children are re-touched -> normal temporal prefetch.
 	 */
-	__builtin_prefetch(ptr);
+	if (((unsigned long) ptr & FT_TAG_MASK) == 0)
+		__builtin_prefetch(ptr, 0, 0);	/* prefetchnta */
+	else
+		__builtin_prefetch(ptr);
 }
 
 /*
@@ -2842,7 +2850,7 @@ static inline void ft_maybe_prefetch(const void *ptr)
 	({							\
 		__typeof__(p) __ft_tmp = rcu_dereference(p);	\
 		if (__ft_tmp)					\
-			__builtin_prefetch(__ft_tmp);		\
+			__builtin_prefetch(__ft_tmp, 0, 0); /* non-temporal: random leaf */ \
 		__ft_tmp;					\
 	})
 
