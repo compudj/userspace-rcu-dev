@@ -917,6 +917,17 @@ struct cds_ft_alloc_range {
 	 * reclaiming its backing pages to the OS.
 	 */
 	size_t nr_live;
+	/*
+	 * Per-range LIFO freelist of returned slots, threaded through
+	 * cds_ft_metadata_alloc::free_list_next.  A per-range (rather than
+	 * per-arena) freelist lets a drained range be reclaimed in O(1):
+	 * its freed slots leave the allocatable set together with the
+	 * range, with no shared-list walk and no dangling entries.  The
+	 * range is linked onto arena->partial_ranges via @partial_node
+	 * exactly while @free_list_head != NULL.
+	 */
+	struct cds_ft_metadata_alloc *free_list_head;
+	struct cds_list_head partial_node;
 
 	struct cds_ft_metadata_alloc metadata[];
 };

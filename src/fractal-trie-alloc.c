@@ -80,7 +80,15 @@ struct cds_ft_alloc_arena {
 	struct cds_list_head superblocks;		/* List head of struct cds_ft_alloc_superblock. */
 	size_t item_len_order;
 	size_t max_nr_items_per_range;
-	struct cds_ft_metadata_alloc *free_list_head;	/* NULL terminated singly-linked list. */
+	/*
+	 * Ranges that currently hold reusable freed slots (i.e. whose
+	 * per-range free_list_head != NULL), MRU-ordered: cds_ft_do_free_item
+	 * moves a freed-into range to the head so the next allocation reuses
+	 * the hottest just-freed slot (recovering the locality the former
+	 * single per-arena freelist provided).  Keeping freelists per range
+	 * lets a drained range be reclaimed in O(1) without a shared-list walk.
+	 */
+	struct cds_list_head partial_ranges;
 	pthread_mutex_t lock;
 	char *name;
 	bool bitmap;
@@ -492,6 +500,8 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	range->arena = arena;
 	range->next_unused = 0;
 	range->nr_live = 0;
+	range->free_list_head = NULL;
+	CDS_INIT_LIST_HEAD(&range->partial_node);
 	return range;
 #else
 	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
@@ -519,6 +529,8 @@ carve:
 	/* mmap'd anonymous pages are zero-initialized; no memset needed. */
 	range = (struct cds_ft_alloc_range *) ((char *) ptr + cds_ft_page_size);
 	range->arena = arena;
+	/* next_unused / nr_live / free_list_head are zero from the fresh mmap. */
+	CDS_INIT_LIST_HEAD(&range->partial_node);
 	return range;
 #endif /* FT_FAR_METADATA */
 }
@@ -604,6 +616,7 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	arena->max_nr_items_per_range = max_items_per_range;
 	arena->bitmap = bitmap;
 	CDS_INIT_LIST_HEAD(&arena->ranges);
+	CDS_INIT_LIST_HEAD(&arena->partial_ranges);
 	CDS_INIT_LIST_HEAD(&arena->superblocks);
 	if (arena_name) {
 		arena->name = strdup(arena_name);
@@ -639,36 +652,47 @@ void cds_ft_arena_destroy(struct cds_ft_alloc_arena *arena)
 static
 struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 {
-	struct cds_ft_metadata_alloc *free_list_head, *item;
+	struct cds_ft_metadata_alloc *item;
 	struct cds_ft_alloc_range *range;
 	size_t item_index;
-	void *p;
 
 	pthread_mutex_lock(&arena->lock);
-	free_list_head = arena->free_list_head;
 
-	/* Return head of free list. */
-	if (free_list_head) {
-		size_t saved_alloc_index = free_list_head->metadata.alloc_index;
+	/*
+	 * Reuse a freed slot from the most-recently-used range that still
+	 * has one.  partial_ranges is kept MRU-ordered by cds_ft_do_free_item,
+	 * so its head holds the hottest just-freed slot — preserving the
+	 * locality the former single per-arena freelist provided.  A range
+	 * sits on partial_ranges exactly while its free_list_head != NULL.
+	 */
+	if (!cds_list_empty(&arena->partial_ranges)) {
+		struct cds_ft_metadata_alloc *fl;
+		size_t saved_alloc_index;
+		void *p;
 
-		arena->free_list_head = free_list_head->free_list_next;
-		p = cds_ft_metadata_to_item(&free_list_head->metadata);
+		range = cds_list_first_entry(&arena->partial_ranges,
+				struct cds_ft_alloc_range, partial_node);
+		fl = range->free_list_head;
+		saved_alloc_index = fl->metadata.alloc_index;
+		range->free_list_head = fl->free_list_next;
+		if (!range->free_list_head)
+			cds_list_del(&range->partial_node);
+		p = cds_ft_metadata_to_item(&fl->metadata);
 		memset(p, 0, 1U << arena->item_len_order);
-		memset(&free_list_head->metadata, 0, sizeof(free_list_head->metadata));
-		free_list_head->metadata.alloc_index = saved_alloc_index;
+		memset(&fl->metadata, 0, sizeof(fl->metadata));
+		fl->metadata.alloc_index = saved_alloc_index;
 		if (arena->bitmap) {
 			struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(p, arena->item_len_order);
 			memset(bitmap, 0, sizeof(struct cds_ft_bitmap));
 		}
-		/* alloc_index restored above, so the range lookup is valid. */
-		cds_ft_metadata_to_range(&free_list_head->metadata)->nr_live++;
+		range->nr_live++;
 		pthread_mutex_unlock(&arena->lock);
-		return &free_list_head->metadata;
+		return &fl->metadata;
 	}
 	/*
-	 * If there are no ranges, or if the most recent range (first in
-	 * list) does not have any room left, create a new range and
-	 * prepend it to the list head.
+	 * No reusable slot: bump the frontier range.  If there are no
+	 * ranges, or the most recent range (first in list) has no room
+	 * left, create a new range and prepend it to the list head.
 	 */
 	if (cds_list_empty(&arena->ranges))
 		goto create_range;
@@ -796,12 +820,24 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 		struct cds_ft_alloc_range *range =
 			cds_ft_metadata_to_range(metadata);
 		struct cds_ft_alloc_arena *arena = range->arena;
+		bool was_empty;
 
 		pthread_mutex_lock(&arena->lock);
 		assert(range->nr_live > 0);
 		range->nr_live--;
-		metadata_alloc->free_list_next = arena->free_list_head;
-		arena->free_list_head = metadata_alloc;
+		was_empty = (range->free_list_head == NULL);
+		metadata_alloc->free_list_next = range->free_list_head;
+		range->free_list_head = metadata_alloc;
+		/*
+		 * Keep partial_ranges MRU-ordered so the next allocation
+		 * reuses this hot just-freed slot.  partial_node is on the
+		 * list iff free_list_head != NULL: add it if the range had no
+		 * freed slots before, otherwise move it to the head.
+		 */
+		if (was_empty)
+			cds_list_add(&range->partial_node, &arena->partial_ranges);
+		else
+			cds_list_move(&range->partial_node, &arena->partial_ranges);
 		pthread_mutex_unlock(&arena->lock);
 	}
 #endif
