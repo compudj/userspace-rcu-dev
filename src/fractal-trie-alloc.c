@@ -89,6 +89,16 @@ struct cds_ft_alloc_arena {
 	 * lets a drained range be reclaimed in O(1) without a shared-list walk.
 	 */
 	struct cds_list_head partial_ranges;
+	/*
+	 * Reclaimed ranges available for reuse.  When a range fills then
+	 * fully drains, its node-body region is released with MADV_DONTNEED
+	 * (see ft_arena_reclaim_range) and the range is parked here;
+	 * range_create recycles it before allocating fresh, avoiding a new
+	 * mmap and re-applying the NUMA/THP policy.  Both layouts use this:
+	 * a far range could instead be munmap'd to also return its VA, but
+	 * recycling avoids the munmap+mmap+re-policy churn on range turnover.
+	 */
+	struct cds_list_head free_ranges;
 	pthread_mutex_t lock;
 	char *name;
 	bool bitmap;
@@ -198,6 +208,9 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 #endif
 #ifndef MADV_HUGEPAGE
 #define MADV_HUGEPAGE		14
+#endif
+#ifndef MADV_DONTNEED
+#define MADV_DONTNEED		4
 #endif
 
 /*
@@ -467,6 +480,24 @@ void superblock_destroy(struct cds_ft_alloc_superblock *sb)
 static
 struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 {
+	/*
+	 * Recycle a previously reclaimed range first (both layouts): its
+	 * node-body region was MADV_DONTNEED'd and re-faults zero on use,
+	 * while its header + metadata page stays mapped and retains the
+	 * range's NUMA / THP policy.  Reset the per-range bookkeeping and
+	 * hand it back, avoiding a fresh mmap + re-policy.
+	 */
+	if (!cds_list_empty(&arena->free_ranges)) {
+		struct cds_ft_alloc_range *range = cds_list_first_entry(
+				&arena->free_ranges, struct cds_ft_alloc_range, node);
+
+		cds_list_del(&range->node);
+		range->next_unused = 0;
+		range->nr_live = 0;
+		range->free_list_head = NULL;
+		CDS_INIT_LIST_HEAD(&range->partial_node);
+		return range;
+	}
 #ifdef FT_FAR_METADATA
 	/*
 	 * Far-metadata range: a 2 MiB-aligned mmap whose leading 2 MiB is one
@@ -538,7 +569,8 @@ carve:
 /*
  * Remove a range from the arena's range list.  Default ranges are owned by
  * the superblock (reclaimed at superblock destroy); far-metadata ranges own
- * their 2 MiB macro mmap and unmap it here.
+ * their 2 MiB macro mmap and unmap it here.  Used at arena teardown for both
+ * the live (arena->ranges) and recycled (arena->free_ranges) range lists.
  */
 static
 void range_destroy(struct cds_ft_alloc_range *range)
@@ -554,6 +586,44 @@ void range_destroy(struct cds_ft_alloc_range *range)
 		(void) munmap((char *) range - FT_FAR_MACRO_SIZE, mapped);
 	}
 #endif
+}
+
+/*
+ * Reclaim a drained range (nr_live == 0, fully bumped) whose links have
+ * already been removed from arena->ranges and arena->partial_ranges under
+ * arena->lock by the caller.  The range is unreachable, so the page-returning
+ * syscall runs here OUTSIDE arena->lock to keep mutator latency bounded.
+ *
+ * Far: the range owns its 2 MiB mapping -> munmap returns VA and RAM.
+ * Near: the superblock owns the mapping -> MADV_DONTNEED returns the node-body
+ *   page's RAM, and the range region is parked on arena->free_ranges for
+ *   range_create to recycle (the header+metadata page stays mapped; it carries
+ *   the recycle linkage and is reused as-is).
+ */
+static
+void ft_arena_reclaim_range(struct cds_ft_alloc_arena *arena,
+		struct cds_ft_alloc_range *range)
+{
+	/*
+	 * Return the node-body region (the leading FT_RANGE_PAGE_UNIT, just
+	 * before the range header) to the OS, keeping the header + metadata
+	 * mapped: it carries the recycle linkage and preserves the range's
+	 * NUMA / THP policy so reuse is a syscall-free re-fault.  The range is
+	 * parked on free_ranges for range_create to recycle.
+	 *
+	 * Layout-agnostic by design.  A far range owns its mapping and could
+	 * be munmap'd outright to also return the VA, but recycling avoids the
+	 * munmap + mmap + re-mbind + re-THP churn that range turnover (e.g.
+	 * recompaction) would otherwise pay, and MADV_DONTNEED only takes
+	 * mmap_lock for read whereas munmap takes it for write (stalling other
+	 * threads' faults).  The retained VA is a bounded, reused pool, not a
+	 * leak; capping it and munmap'ing the surplus is a later refinement.
+	 */
+	(void) madvise((char *) range - FT_RANGE_PAGE_UNIT,
+			FT_RANGE_PAGE_UNIT, MADV_DONTNEED);
+	pthread_mutex_lock(&arena->lock);
+	cds_list_add(&range->node, &arena->free_ranges);
+	pthread_mutex_unlock(&arena->lock);
 }
 
 static
@@ -617,6 +687,7 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	arena->bitmap = bitmap;
 	CDS_INIT_LIST_HEAD(&arena->ranges);
 	CDS_INIT_LIST_HEAD(&arena->partial_ranges);
+	CDS_INIT_LIST_HEAD(&arena->free_ranges);
 	CDS_INIT_LIST_HEAD(&arena->superblocks);
 	if (arena_name) {
 		arena->name = strdup(arena_name);
@@ -642,6 +713,14 @@ void cds_ft_arena_destroy(struct cds_ft_alloc_arena *arena)
 		return;
 	pthread_mutex_destroy(&arena->lock);
 	cds_list_for_each_entry_safe(range, range_tmp, &arena->ranges, node)
+		range_destroy(range);
+	/*
+	 * Reclaimed-but-recycled ranges (parked on free_ranges) also need
+	 * teardown: far ranges still own their mapping and must be munmap'd
+	 * (range_destroy does so); near ranges are freed with their superblock
+	 * below, so range_destroy just unlinks them here.
+	 */
+	cds_list_for_each_entry_safe(range, range_tmp, &arena->free_ranges, node)
 		range_destroy(range);
 	cds_list_for_each_entry_safe(sb, sb_tmp, &arena->superblocks, node)
 		superblock_destroy(sb);
@@ -820,25 +899,44 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 		struct cds_ft_alloc_range *range =
 			cds_ft_metadata_to_range(metadata);
 		struct cds_ft_alloc_arena *arena = range->arena;
-		bool was_empty;
+		bool reclaim = false;
 
 		pthread_mutex_lock(&arena->lock);
 		assert(range->nr_live > 0);
 		range->nr_live--;
-		was_empty = (range->free_list_head == NULL);
-		metadata_alloc->free_list_next = range->free_list_head;
-		range->free_list_head = metadata_alloc;
-		/*
-		 * Keep partial_ranges MRU-ordered so the next allocation
-		 * reuses this hot just-freed slot.  partial_node is on the
-		 * list iff free_list_head != NULL: add it if the range had no
-		 * freed slots before, otherwise move it to the head.
-		 */
-		if (was_empty)
-			cds_list_add(&range->partial_node, &arena->partial_ranges);
-		else
-			cds_list_move(&range->partial_node, &arena->partial_ranges);
+		if (range->nr_live == 0 &&
+				range->next_unused == arena->max_nr_items_per_range) {
+			/*
+			 * Range was filled and is now fully drained: reclaim it.
+			 * It still sits on partial_ranges via its earlier-freed
+			 * slots (free_list_head != NULL), unless it held a single
+			 * item.  Unlink it from both lists under the lock so it is
+			 * unreachable, then return its pages outside the lock.  The
+			 * slot being freed is discarded with the range, not pushed.
+			 */
+			if (range->free_list_head)
+				cds_list_del(&range->partial_node);
+			cds_list_del(&range->node);
+			reclaim = true;
+		} else {
+			bool was_empty = (range->free_list_head == NULL);
+
+			metadata_alloc->free_list_next = range->free_list_head;
+			range->free_list_head = metadata_alloc;
+			/*
+			 * Keep partial_ranges MRU-ordered so the next allocation
+			 * reuses this hot just-freed slot.  partial_node is on the
+			 * list iff free_list_head != NULL: add it if the range had
+			 * no freed slots before, otherwise move it to the head.
+			 */
+			if (was_empty)
+				cds_list_add(&range->partial_node, &arena->partial_ranges);
+			else
+				cds_list_move(&range->partial_node, &arena->partial_ranges);
+		}
 		pthread_mutex_unlock(&arena->lock);
+		if (reclaim)
+			ft_arena_reclaim_range(arena, range);
 	}
 #endif
 }
