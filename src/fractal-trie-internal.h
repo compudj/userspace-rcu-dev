@@ -209,14 +209,6 @@
  */
 #define FT_INTERNAL_ORDER_MIN		5
 
-/*
- * Number of removals needed on a fallback node before we try to shrink
- * it.  Derived from FT_FALLBACK_REMOVAL_BITS to always use the full
- * range of the bitfield.
- */
-#define FT_FALLBACK_REMOVAL_BITS	3
-#define FT_FALLBACK_REMOVAL_COUNT	((1U << FT_FALLBACK_REMOVAL_BITS) - 1)
-
 #define FT_ALLOC_ORDER_MAX		12
 #define FT_ALLOC_ORDER_MIN		4	/* Minimum item size: 16 bytes. */
 
@@ -455,7 +447,7 @@ struct cds_ft_alloc_arena;
  *   offset  8: 8-byte external_nodes pointer
  *   offset 16: 8-byte nr_keys (unsigned long, total keys in subtree)
  *   offset 24: 4-byte packed bitfield (nr_child, skip_slot_offset,
- *              fallback_removal_count, alloc_index)
+ *              alloc_index)
  *   offset 28: 4-byte tail padding
  *
  * In cds_ft_metadata_alloc, rcu_head is a separate field placed
@@ -489,15 +481,15 @@ struct cds_ft_metadata {
 	 * skip_slot_offset:       8 bits (byte_offset / sizeof(void *)
 	 *                         from parent node; ifdef-gated, 0 when
 	 *                         disabled)
-	 * fallback_removal_count: 3 bits (max 7)
-	 * alloc_index:            FT_ALLOC_INDEX_BITS (architecture-dependent,
-	 *                         sized for max page_size >> FT_ALLOC_ORDER_MIN)
+	 * alloc_index:            near: FT_ALLOC_INDEX_BITS + 3 spare bits of
+	 *                         headroom above the page_size >>
+	 *                         FT_ALLOC_ORDER_MIN minimum; far: a separate
+	 *                         uint32_t (see below).
 	 */
 	uint32_t nr_child:9;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	uint32_t skip_slot_offset:8;
 #endif
-	uint32_t fallback_removal_count:FT_FALLBACK_REMOVAL_BITS;
 #ifdef FT_FAR_METADATA
 	/*
 	 * A 2 MiB far macro-block holds far more than 256 items (e.g. ~18 700
@@ -508,7 +500,12 @@ struct cds_ft_metadata {
 	 */
 	uint32_t alloc_index;
 #else
-	uint32_t alloc_index:FT_ALLOC_INDEX_BITS;
+	/*
+	 * Near metadata: alloc_index is packed into this word, sized with
+	 * 3 spare bits of headroom above the FT_ALLOC_INDEX_BITS minimum
+	 * needed to index a page-sized range.
+	 */
+	uint32_t alloc_index:(FT_ALLOC_INDEX_BITS + 3);
 #endif
 };
 
@@ -665,7 +662,6 @@ struct cds_ft {
 	cds_ft_lookup_iter_fn lookup_longest_match_iter_fn;
 
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
-	unsigned long nr_fallback;		/* Number of fallback nodes used */
 
 	/*
 	 * Access discipline. When true, access is serialized
@@ -703,7 +699,6 @@ struct cds_ft {
 #endif
 
 	/* For debugging */
-	unsigned long node_fallback_count_distribution[FT_ENTRY_PER_NODE];
 	unsigned long nr_nodes_allocated, nr_nodes_freed;
 	unsigned long nr_internal_alloc, nr_internal_freed;
 	unsigned long nr_compressed_alloc, nr_compressed_freed;

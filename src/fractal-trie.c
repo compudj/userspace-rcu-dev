@@ -445,13 +445,13 @@ void static_array_size_check(void)
 #endif
 	/*
 	 * Metadata packed bitfield must fit in a uint32_t.
-	 * Layout: nr_child(9) + [skip_slot_offset(8)] +
-	 *         fallback_removal(3) + alloc_index(FT_ALLOC_INDEX_BITS).
+	 * Layout: nr_child(9) + [skip_slot_offset(8)] + alloc_index
+	 *         (near: FT_ALLOC_INDEX_BITS + 3; far: a separate uint32_t).
 	 */
-	CAA_BUILD_BUG_ON(9 + FT_FALLBACK_REMOVAL_BITS
+	CAA_BUILD_BUG_ON(9
 #ifndef FT_FAR_METADATA
 		/* far-metadata stores alloc_index as its own uint32_t. */
-		+ FT_ALLOC_INDEX_BITS
+		+ (FT_ALLOC_INDEX_BITS + 3)
 #endif
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		+ 8
@@ -5150,7 +5150,6 @@ int ft_popcount_node_replace_ptr(const struct cds_ft_type *type,
 	assert(ft_popcount_node_get_nr_child(type, node) <= type->max_linear_child);
 
 	if (!newptr) {
-		assert(!metadata->fallback_removal_count);
 		if (metadata->nr_child <= type->min_child) {
 			/* We need to try recompacting the node */
 			return -EFBIG;
@@ -5179,13 +5178,9 @@ int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
 	assert(ft_type_is_pigeon(type->type_class));
 
 	if (!newptr) {
-		if (metadata->fallback_removal_count) {
-			metadata->fallback_removal_count--;
-		} else {
-			/* We should try recompacting the node */
-			if (metadata->nr_child <= type->min_child)
-				return -EFBIG;
-		}
+		/* We should try recompacting the node */
+		if (metadata->nr_child <= type->min_child)
+			return -EFBIG;
 	}
 	dbg_printf("ft_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
 	assert(*node_flag_ptr != NULL);
@@ -5285,7 +5280,6 @@ int ft_node_recompact(enum ft_recompact mode,
 	const struct cds_ft_type *new_type;
 	struct cds_ft_inode_flag *new_node_flag = NULL;
 	int ret;
-	int fallback = 0;
 	/*
 	 * Track whether new_node has received its first child via
 	 * is_init=true.  Popcount nodes use a single init-done flag
@@ -5346,15 +5340,11 @@ int ft_node_recompact(enum ft_recompact mode,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			new_metadata->skip_slot_offset = metadata->skip_slot_offset;
 #endif
-			new_metadata->fallback_removal_count = metadata->fallback_removal_count;
 			ft_metadata_set_external_nodes(new_node_flag,
 				new_metadata, metadata->external_nodes);
 			ft_nr_keys_store(new_metadata,
 				ft_nr_keys_get(metadata), CMM_RELAXED);
 		}
-		if (fallback)
-			new_metadata->fallback_removal_count =
-						FT_FALLBACK_REMOVAL_COUNT;
 	} else {
 		new_node = NULL;
 		new_node_flag = NULL;
@@ -5466,14 +5456,6 @@ skip_copy:
 	}
 
 #undef RECOMPACT_IS_INIT
-
-	if (fallback) {
-		dbg_printf("Using fallback for %u children, node type index: %u, mode %s\n",
-			new_metadata->nr_child, old_type_index, mode == FT_RECOMPACT_ADD_NEXT ? "add_next" :
-				(mode == FT_RECOMPACT_DEL ? "del" : "add_same"));
-		if (ft_debug_counters())
-			uatomic_inc(&ft->node_fallback_count_distribution[new_metadata->nr_child]);
-	}
 
 	/*
 	 * Inherit the old node's parent pointer so upward walks
@@ -15668,41 +15650,15 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 }
 
 static
-void print_debug_fallback_distribution(struct cds_ft *ft)
-{
-	int i;
-
-	fprintf(stderr, "Fallback node distribution:\n");
-	for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
-		if (!ft->node_fallback_count_distribution[i])
-			continue;
-		fprintf(stderr, "	%3u: %4lu\n",
-			i, ft->node_fallback_count_distribution[i]);
-	}
-}
-
-static
 void ft_final_checks(struct cds_ft *ft)
 {
-	double fallback_ratio;
-	unsigned long na, nf, nr_fallback;
+	unsigned long na, nf;
 
 	if (!ft_debug_counters())
 		return;
 
-	fallback_ratio = (double) uatomic_read(&ft->nr_fallback);
-	fallback_ratio /= (double) uatomic_read(&ft->nr_nodes_allocated);
-	nr_fallback = uatomic_read(&ft->nr_fallback);
-	if (nr_fallback)
-		fprintf(stderr,
-			"[warning] RCU Fractal Trie used %lu fallback node(s) (ratio: %g)\n",
-			uatomic_read(&ft->nr_fallback),
-			fallback_ratio);
-
 	na = uatomic_read(&ft->nr_nodes_allocated);
 	nf = uatomic_read(&ft->nr_nodes_freed);
-	if (nr_fallback)
-		print_debug_fallback_distribution(ft);
 
 	if (na != nf) {
 		fprintf(stderr, "[error] Fractal Trie leaked %ld nodes. Allocated: %lu, freed: %lu.\n",
