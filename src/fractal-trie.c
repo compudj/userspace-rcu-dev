@@ -8394,6 +8394,15 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	uint8_t new_ordinal = iter_key[diverge_pos];
 	unsigned long old_child_nr_keys;
 	int ret;
+	/*
+	 * Two-phase publish (suffix_len >= 1): build the cluster invisibly,
+	 * then re-parent the live old child (cn->child) into the new suffix
+	 * and swing the parent slot, at the end.  See the rcu-mutation pattern.
+	 */
+	struct cds_ft_inode_flag *sfx_skip_flag = NULL;
+	struct cds_ft_inode_flag *deferred_child = NULL;
+	struct cds_ft_inode_flag *deferred_parent = NULL;
+	struct cds_ft_inode_flag **deferred_slot = NULL;
 
 	unsigned int junction_depth = node_depth + diverge_pos;
 
@@ -8420,10 +8429,19 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1], suffix_len);
 		sfx_meta->nr_child = 1;
 		ft_nr_keys_store(sfx_meta, old_child_nr_keys, CMM_RELAXED);
-		old_suffix_flag = ft_compressed_node_flag(sfx);
-		ft_set_parent(cn->child, old_suffix_flag, &sfx->child);
-		old_suffix_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
-		created[nr_created++] = old_suffix_flag;
+		old_suffix_flag = ft_compressed_node_flag(sfx);	/* PLAIN: install + recover sfx directly */
+		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);	/* skip form for the slot */
+		created[nr_created++] = old_suffix_flag;	/* track PLAIN so the error path frees sfx directly */
+		/*
+		 * Defer re-parenting the live old child to publish: writing
+		 * cn->child's back-pointer now would make this unpublished
+		 * cluster observable from the bottom (and the branch install
+		 * below would otherwise recover sfx through it).  sfx->child
+		 * already points at cn->child (a write into the new sfx only).
+		 */
+		deferred_child = cn->child;
+		deferred_parent = old_suffix_flag;
+		deferred_slot = &sfx->child;
 	} else {
 		/* suffix_len == 0: old child directly. */
 		old_suffix_flag = cn->child;
@@ -8486,6 +8504,23 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ft_nr_keys_store(branch_meta, old_child_nr_keys + 1,
 				CMM_RELAXED);
 		branch_flag = dest;
+
+		/*
+		 * sfx was installed via its PLAIN flag so ft_set_parent could
+		 * recover it directly (without reading cn->child's back-pointer,
+		 * which still points at the old cn).  Re-encode the old-direction
+		 * slot to sfx's skip form now — a value write into the still-
+		 * unpublished branch; it becomes recoverable once cn->child's
+		 * back-pointer is set at publish.
+		 */
+		if (suffix_len >= 1 && sfx_skip_flag != old_suffix_flag) {
+			struct cds_ft_inode_flag **oslot = NULL;
+
+			ft_node_get_nth_skip(branch_flag, &oslot, old_ordinal,
+					FT_PF_NONE);
+			if (oslot)
+				rcu_assign_pointer(*oslot, sfx_skip_flag);
+		}
 	}
 
 	/* 4. Build prefix → branch (if needed). */
@@ -8620,6 +8655,15 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		(unsigned int) (node_depth - 1),
 		(uint8_t) iter_key[-1],
 		(const void *) top_flag);
+	/*
+	 * Phase 2 (publish) — no failures past here.  First re-parent the live
+	 * old child into the new suffix (bottom publish: the branch's skip slot
+	 * now resolves to sfx); then swing the parent's forward slot to the new
+	 * cluster (top publish).  Ordered so an up-walk from cn->child enters
+	 * the new cluster before the cluster becomes forward-reachable.
+	 */
+	if (deferred_child)
+		ft_set_parent(deferred_child, deferred_parent, deferred_slot);
 	ft_publish_to_parent(ft, cn_meta->parent, parent_slot, top_flag);
 
 	/* 7. Free the old compressed node. */

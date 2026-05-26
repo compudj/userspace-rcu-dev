@@ -48,7 +48,11 @@
 
 #include "tap.h"
 
+#ifdef FEATURE_FT_FAULT_INJECT
+#define NR_TESTS 208
+#else
 #define NR_TESTS 207
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -14703,6 +14707,71 @@ out:
 /*                                                                    */
 /* ================================================================== */
 
+#ifdef FEATURE_FT_FAULT_INJECT
+extern long cds_ft_fault_alloc_countdown;
+
+/*
+ * Fault-injection regression for the compressed-split create-cluster-then-
+ * publish discipline.  Drives ft_split_compressed_insert through each of its
+ * allocation-failure points while a compressed node is live, and asserts the
+ * trie stays structurally consistent after every failed split (cds_ft_verify
+ * checks each node's parent back-pointer).  Catches the bug where the split
+ * publishes cn->child's back-pointer mid-build and, on a later OOM, frees the
+ * transiently-observable new node without restoring it: the back-pointer must
+ * not be written until the failure-free commit tail.  Requires the alloc
+ * fault hook (FEATURE_FT_FAULT_INJECT).
+ */
+static int test_split_oom_backpointer(void)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < 16; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_varlen_ft(&group);
+		struct ft_test_node *a = node_alloc(1);
+		struct ft_test_node *b = node_alloc(2);
+		struct ft_test_node *c = node_alloc(3);
+		enum cds_ft_status s;
+		int verified;
+
+		/* Build compressed("aaaaaaa") -> internal child {a, b}. */
+		if (cds_ft_insert(ft, (const uint8_t *)"aaaaaaaa", 8, &a->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *)"aaaaaaab", 8, &b->node) < 0) {
+			fprintf(stderr, "split_oom: build failed\n");
+			rc = -1;
+		}
+
+		/* Diverge inside the compressed path (suffix_len >= 1), failing
+		 * the (n+1)-th allocation performed by the split. */
+		cds_ft_fault_alloc_countdown = n;
+		s = cds_ft_insert(ft, (const uint8_t *)"aaaXaaaa", 8, &c->node);
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		rcu_read_unlock();
+		if (!verified) {
+			fprintf(stderr,
+				"split_oom: verify FAILED after fault n=%d (insert=%s)\n",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			/*
+			 * The trie is corrupt; draining it would follow the
+			 * dangling back-pointer and livelock.  Abandon (leak)
+			 * this iteration's trie -- the test has already failed.
+			 */
+			continue;
+		}
+
+		if (s != CDS_FT_STATUS_OK)
+			node_free(c);	/* OOM: never inserted, never observable */
+		if (drain_and_destroy(ft, group) < 0)
+			rc = -1;
+	}
+	return rc;
+}
+#endif /* FEATURE_FT_FAULT_INJECT */
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -14996,6 +15065,9 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_forgotten_end);
 	RUN_TEST(test_remove_compressed_no_leak);
 	RUN_TEST(test_compact_dense_full_node);
+#ifdef FEATURE_FT_FAULT_INJECT
+	RUN_TEST(test_split_oom_backpointer);
+#endif
 
 	rcu_barrier();
 	rcu_unregister_thread();
