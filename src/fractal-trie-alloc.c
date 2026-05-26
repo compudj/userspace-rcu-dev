@@ -1279,25 +1279,27 @@ void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
 #define FT_EXT_ARENA_NUM_CELLS						\
 	(FT_EXT_ARENA_RANGE_SIZE / FT_EXT_ARENA_MIN_SLOT_SIZE)
 /*
- * Cell sentinel for "not a block start" (interior of a larger
- * block, or unallocated metadata region).  Real cell values
- * encode bit 0 = free, bits 1-7 = (order - MIN_ORDER); 0xFF is
- * unreachable as a real value (order_bias 0x7F = order 131 is
- * impossibly large).
+ * Cell sentinel for "not a block start" (interior of a larger block, or
+ * unallocated region).  Real cell values encode bit 0 = free, bits 1-7 =
+ * (order - MIN_ORDER + 1) -- the +1 reserves the all-zero value as the
+ * sentinel so a freshly mmap'd range reads CELL_NONE everywhere WITHOUT an
+ * eager memset (the 1 MiB cells[] of a 16 MiB range faults lazily, only the
+ * cells the allocator touches).  Real values are therefore >= 2; value 1 is
+ * an unused hole (uint8_t has ample room).
  */
-#define FT_EXT_ARENA_CELL_NONE		0xFF
+#define FT_EXT_ARENA_CELL_NONE		0x00
 
 static inline
 uint8_t ft_ext_arena_cell_pack(int order, int is_free)
 {
-	return (uint8_t) ((((order) - FT_EXT_ARENA_MIN_ORDER) << 1) |
+	return (uint8_t) ((((order) - FT_EXT_ARENA_MIN_ORDER + 1) << 1) |
 			((is_free) ? 1 : 0));
 }
 
 static inline
 int ft_ext_arena_cell_order(uint8_t c)
 {
-	return (int) ((c >> 1) & 0x7F) + FT_EXT_ARENA_MIN_ORDER;
+	return (int) (((c >> 1) & 0x7F) - 1) + FT_EXT_ARENA_MIN_ORDER;
 }
 
 static inline
@@ -1433,14 +1435,12 @@ ft_ext_arena_range_create(int huge)
 	r = (struct cds_ft_external_arena_range *) aligned;
 	CDS_INIT_LIST_HEAD(&r->node);
 	/*
-	 * First slot offset: round struct size up to MIN_SLOT_SIZE
-	 * so the cell-index calculation works uniformly.  All cells
-	 * (including those covering the header bytes) start at the
-	 * "no block here" sentinel so merge buddy-checks against
-	 * the unbumped tail or the header region read as "not a
-	 * block start" and skip.
+	 * No cells[] memset: FT_EXT_ARENA_CELL_NONE is 0, which the fresh mmap
+	 * already zero-fills, so every cell (header region, unbumped tail)
+	 * reads "not a block start" and the 1 MiB cells[] array faults lazily
+	 * -- only the cells the allocator touches.  First slot offset rounds
+	 * the struct size up to MIN_SLOT_SIZE so cell-index math is uniform.
 	 */
-	memset(r->cells, FT_EXT_ARENA_CELL_NONE, sizeof(r->cells));
 	r->bump = (sizeof(*r) + FT_EXT_ARENA_MIN_SLOT_SIZE - 1)
 			& ~(FT_EXT_ARENA_MIN_SLOT_SIZE - 1);
 	return r;
