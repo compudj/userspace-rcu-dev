@@ -1009,6 +1009,17 @@ room_left:
 	return &item->metadata;
 }
 
+#ifdef FEATURE_FT_FAULT_INJECT
+/*
+ * Test-only allocation fault injection (single-threaded use; compiled out
+ * unless FEATURE_FT_FAULT_INJECT).  -1 disables.  Arm to N: the next N item
+ * allocations succeed and the (N+1)-th returns NULL (simulated -ENOMEM),
+ * then it auto-disarms.  Used to drive mutators through every OOM error
+ * path; both cds_ft_alloc_item and cds_ft_alloc_compressed_item route here.
+ */
+long cds_ft_fault_alloc_countdown = -1;
+#endif
+
 static
 struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 		struct cds_ft_alloc_arena **arena_p,
@@ -1017,6 +1028,16 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 {
 	struct cds_ft_alloc_arena *arena;
 
+#ifdef FEATURE_FT_FAULT_INJECT
+	if (cds_ft_fault_alloc_countdown >= 0) {
+		if (cds_ft_fault_alloc_countdown == 0) {
+			cds_ft_fault_alloc_countdown = -1;
+			errno = ENOMEM;
+			return NULL;
+		}
+		cds_ft_fault_alloc_countdown--;
+	}
+#endif
 	if (!cds_ft_page_size)
 		cds_ft_page_size = urcu_get_page_len();
 	if ((1UL << item_len_order) > cds_ft_page_size) {
