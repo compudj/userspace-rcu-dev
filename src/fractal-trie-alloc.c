@@ -414,6 +414,9 @@ void ft_apply_interleave(void *base, size_t size,
 static inline void ft_apply_interleave(void *base __attribute__((unused)),
 		size_t size __attribute__((unused)),
 		enum cds_ft_numa_policy policy __attribute__((unused))) {}
+static inline void ft_apply_thp_policy(void *base __attribute__((unused)),
+		size_t size __attribute__((unused)),
+		int huge __attribute__((unused))) {}
 #endif
 
 /*
