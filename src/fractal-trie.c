@@ -15334,6 +15334,21 @@ enum cds_ft_status cds_ft_group_attr_set_max_key_len(struct cds_ft_group_attr *a
 enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key)
 {
+	size_t i;
+
+	if (!key_to_ordinal || !ordinal_to_key)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	/*
+	 * Verify the two maps are exact inverse permutations.  Checking
+	 * ordinal_to_key[key_to_ordinal[i]] == i for every i is sufficient:
+	 * it forces key_to_ordinal to be injective (hence a bijection over
+	 * the byte values) and ordinal_to_key to be its inverse (hence also
+	 * a bijection), so both maps are valid permutations.
+	 */
+	for (i = 0; i < sizeof(attr->key_map.key_to_ordinal); i++) {
+		if (ordinal_to_key[key_to_ordinal[i]] != i)
+			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
 	attr->key_map.identity = false;
 	memcpy(attr->key_map.key_to_ordinal, key_to_ordinal, sizeof(attr->key_map.key_to_ordinal));
 	memcpy(attr->key_map.ordinal_to_key, ordinal_to_key, sizeof(attr->key_map.ordinal_to_key));

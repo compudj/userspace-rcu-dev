@@ -2027,8 +2027,25 @@ enum cds_ft_status cds_ft_group_attr_set_max_key_len(struct cds_ft_group_attr *a
  * @ordinal_to_key: Mapping from ordered values to external key.
  *                  (caller-provided array of CDS_FT_KEY_MAP_SIZE elements)
  *
- * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
- * on error.
+ * Both arrays must be permutations of 0..CDS_FT_KEY_MAP_SIZE-1, and
+ * @ordinal_to_key must be the exact inverse of @key_to_ordinal (i.e.
+ * ordinal_to_key[key_to_ordinal[i]] == i for all i).  This bijection
+ * defines the trie's key ordering; maps that are not exact inverses
+ * are rejected.
+ *
+ * The map is an order-preserving bijection only: it re-orders the byte
+ * alphabet but never folds distinct bytes onto one ordinal.  Folding
+ * (e.g. case-insensitive matching) is intentionally unsupported here:
+ * the speculative lookup fast path validates by comparing external key
+ * bytes directly (memcmp against the candidate's stored key), so a
+ * non-injective map would let descent reach a leaf that validation then
+ * rejects.  For case-folding or other canonicalization, normalize keys
+ * to a canonical form in the application before insert and lookup,
+ * leaving this map a bijection (or identity).
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if either pointer is
+ * NULL or the maps are not exact inverse permutations.
  */
 enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key);
