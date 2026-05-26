@@ -583,16 +583,58 @@ void cds_ft_node_init(struct cds_ft_node *node)
  * synchronised and must be called once, with no concurrent users.
  */
 struct cds_ft_external_arena;
+struct cds_ft_external_arena_attr;
+
+/*
+ * cds_ft_optimize - Per-arena page-size policy: trade RSS against throughput.
+ *
+ * CDS_FT_OPTIMIZE_THROUGHPUT (default): advise 2 MiB transparent hugepages.
+ *   Cuts DTLB misses on large tries (measured +7% T1 / +14% T192 on the
+ *   internal node arena).  A 2 MiB-advised range faults a whole hugepage on
+ *   first touch, so a small / sparse trie pays a ~2 MiB RSS floor per range.
+ *
+ * CDS_FT_OPTIMIZE_RSS: advise 4 KiB pages (MADV_NOHUGEPAGE).  No hugepage
+ *   floor -- a small or sparse trie faults only the pages it touches -- at the
+ *   cost of more DTLB pressure once the working set is large.  Choose this for
+ *   workloads with many small tries / arenas.
+ */
+enum cds_ft_optimize {
+	CDS_FT_OPTIMIZE_THROUGHPUT = 0,
+	CDS_FT_OPTIMIZE_RSS = 1,
+};
+
+/*
+ * cds_ft_external_arena_attr_create - Allocate a default external-arena attr
+ * (CDS_FT_OPTIMIZE_THROUGHPUT).  Destroy with
+ * cds_ft_external_arena_attr_destroy.  Returns CDS_FT_STATUS_OK on success.
+ */
+enum cds_ft_status cds_ft_external_arena_attr_create(
+		struct cds_ft_external_arena_attr **attr);
+
+void cds_ft_external_arena_attr_destroy(struct cds_ft_external_arena_attr *attr);
+
+/*
+ * cds_ft_external_arena_attr_set_optimize - Set the arena's page-size policy
+ * (see enum cds_ft_optimize).  Returns CDS_FT_STATUS_OK, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @opt.
+ */
+enum cds_ft_status cds_ft_external_arena_attr_set_optimize(
+		struct cds_ft_external_arena_attr *attr, enum cds_ft_optimize opt);
 
 /*
  * cds_ft_external_arena_create - Create a leaf-allocation arena.
  *
+ * @attr: external-arena attributes, or NULL for defaults
+ *   (CDS_FT_OPTIMIZE_THROUGHPUT).  The arena copies what it needs; the caller
+ *   may destroy @attr immediately afterwards.
+ *
  * The arena starts empty; ranges are mmap'd on demand by
- * cds_ft_external_arena_alloc.  No capacity hint is required.
+ * cds_ft_external_arena_alloc.
  *
  * Returns the arena handle on success, NULL on memory error.
  */
-struct cds_ft_external_arena *cds_ft_external_arena_create(void);
+struct cds_ft_external_arena *cds_ft_external_arena_create(
+		const struct cds_ft_external_arena_attr *attr);
 
 /*
  * cds_ft_external_arena_alloc - Allocate from @arena.
@@ -2093,6 +2135,16 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
 enum cds_ft_status cds_ft_group_attr_set_numa_policy(
 		struct cds_ft_group_attr *attr,
 		enum cds_ft_numa_policy policy);
+
+/*
+ * cds_ft_group_attr_set_optimize - Select the page-size policy for the group's
+ * internal + compressed node arenas (see enum cds_ft_optimize).  Default:
+ * CDS_FT_OPTIMIZE_THROUGHPUT.  Returns CDS_FT_STATUS_OK, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @opt.
+ */
+enum cds_ft_status cds_ft_group_attr_set_optimize(
+		struct cds_ft_group_attr *attr,
+		enum cds_ft_optimize opt);
 
 /*
  * cds_ft_attr_create - Create a per-instance Fractal Trie attribute

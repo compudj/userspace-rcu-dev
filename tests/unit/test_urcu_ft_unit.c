@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 204
+#define NR_TESTS 207
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -13868,7 +13868,7 @@ out_dst:
  */
 static int test_external_arena_basic(void)
 {
-	struct cds_ft_external_arena *a = cds_ft_external_arena_create();
+	struct cds_ft_external_arena *a = cds_ft_external_arena_create(NULL);
 	if (!a)
 		return -1;
 	void *p = cds_ft_external_arena_alloc(a, 16);
@@ -13894,6 +13894,197 @@ static int test_external_arena_basic(void)
 }
 
 /*
+ * Return 1 if the /proc/self/smaps VMA containing @addr lists VmFlags @flag,
+ * 0 if VmFlags was found without it, -1 if undeterminable (no smaps, no
+ * VmFlags line for that VMA).  Used to confirm the cds_ft_optimize hint
+ * reaches madvise: MADV_NOHUGEPAGE sets the "nh" flag regardless of whether
+ * THP formation is enabled (so it is reliable even in a THP-disabled sandbox).
+ */
+static int smaps_vmflag(const void *addr, const char *flag)
+{
+	unsigned long a = (unsigned long) addr;
+	char line[1024];
+	int in_vma = 0, ret = -1;
+	FILE *f = fopen("/proc/self/smaps", "r");
+
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long s, e;
+
+		if (sscanf(line, "%lx-%lx", &s, &e) == 2) {
+			in_vma = (a >= s && a < e);
+		} else if (in_vma && strncmp(line, "VmFlags:", 8) == 0) {
+			char *tok = strtok(line + 8, " \t\n");
+
+			ret = 0;
+			for (; tok != NULL; tok = strtok(NULL, " \t\n"))
+				if (strcmp(tok, flag) == 0) {
+					ret = 1;
+					break;
+				}
+			break;
+		}
+	}
+	fclose(f);
+	return ret;
+}
+
+/*
+ * cds_ft_optimize attribute API: group + external-arena setters accept the
+ * two valid values and reject anything else; create works with an attr and
+ * with NULL (default).
+ */
+static int test_optimize_attr_api(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_external_arena_attr *eattr;
+	struct cds_ft_external_arena *a;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&gattr) != CDS_FT_STATUS_OK)
+		return -1;
+	if (cds_ft_group_attr_set_optimize(gattr, CDS_FT_OPTIMIZE_THROUGHPUT) != CDS_FT_STATUS_OK ||
+	    cds_ft_group_attr_set_optimize(gattr, CDS_FT_OPTIMIZE_RSS) != CDS_FT_STATUS_OK ||
+	    cds_ft_group_attr_set_optimize(gattr, (enum cds_ft_optimize) 99) !=
+			CDS_FT_STATUS_INVALID_ARGUMENT_ERROR)
+		ret = -1;
+	cds_ft_group_attr_destroy(gattr);
+
+	if (cds_ft_external_arena_attr_create(&eattr) != CDS_FT_STATUS_OK)
+		return -1;
+	if (cds_ft_external_arena_attr_set_optimize(eattr, CDS_FT_OPTIMIZE_RSS) != CDS_FT_STATUS_OK ||
+	    cds_ft_external_arena_attr_set_optimize(eattr, (enum cds_ft_optimize) 99) !=
+			CDS_FT_STATUS_INVALID_ARGUMENT_ERROR)
+		ret = -1;
+	a = cds_ft_external_arena_create(eattr);
+	cds_ft_external_arena_attr_destroy(eattr);
+	if (!a)
+		return -1;
+	if (!cds_ft_external_arena_alloc(a, 32))
+		ret = -1;
+	cds_ft_external_arena_destroy(a);
+
+	a = cds_ft_external_arena_create(NULL);	/* default */
+	if (!a)
+		return -1;
+	cds_ft_external_arena_destroy(a);
+	return ret;
+}
+
+/*
+ * The external-arena hint must reach madvise: an RSS arena's range VMA carries
+ * the "nh" (MADV_NOHUGEPAGE) flag; a THROUGHPUT arena's does not.  Skips
+ * gracefully if smaps is unreadable.
+ */
+static int test_optimize_external_thp(void)
+{
+	struct cds_ft_external_arena_attr *attr;
+	struct cds_ft_external_arena *a;
+	void *p;
+	int nh, ret = 0;
+
+	if (cds_ft_external_arena_attr_create(&attr) != CDS_FT_STATUS_OK)
+		return -1;
+	cds_ft_external_arena_attr_set_optimize(attr, CDS_FT_OPTIMIZE_THROUGHPUT);
+	a = cds_ft_external_arena_create(attr);
+	cds_ft_external_arena_attr_destroy(attr);
+	if (!a)
+		return -1;
+	p = cds_ft_external_arena_alloc(a, 64);
+	nh = p ? smaps_vmflag(p, "nh") : -1;
+	cds_ft_external_arena_destroy(a);
+	if (!p)
+		return -1;
+	if (nh == 1) {		/* THROUGHPUT arena wrongly advised NOHUGEPAGE */
+		fprintf(stderr, "optimize_external_thp: THROUGHPUT arena marked nh\n");
+		ret = -1;
+	}
+
+	if (cds_ft_external_arena_attr_create(&attr) != CDS_FT_STATUS_OK)
+		return -1;
+	cds_ft_external_arena_attr_set_optimize(attr, CDS_FT_OPTIMIZE_RSS);
+	a = cds_ft_external_arena_create(attr);
+	cds_ft_external_arena_attr_destroy(attr);
+	if (!a)
+		return -1;
+	p = cds_ft_external_arena_alloc(a, 64);
+	nh = p ? smaps_vmflag(p, "nh") : -1;
+	cds_ft_external_arena_destroy(a);
+	if (!p)
+		return -1;
+	if (nh == 0) {		/* RSS arena not advised NOHUGEPAGE */
+		fprintf(stderr, "optimize_external_thp: RSS arena not marked nh\n");
+		ret = -1;
+	}
+	return ret;
+}
+
+/*
+ * The group hint must be semantically inert: a trie built under each
+ * cds_ft_optimize value (which drives the internal + compressed arena THP
+ * policy) verifies and looks up identically.
+ */
+static int test_optimize_group_functional(void)
+{
+	enum cds_ft_optimize opts[2] = {
+		CDS_FT_OPTIMIZE_THROUGHPUT, CDS_FT_OPTIMIZE_RSS
+	};
+	const unsigned int N = 20000;
+	int ret = 0, k;
+
+	for (k = 0; k < 2; k++) {
+		struct cds_ft_group_attr *attr;
+		struct cds_ft_group *group;
+		struct cds_ft *ft;
+		unsigned int i;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			return -1;
+		cds_ft_group_attr_set_key_len(attr, 3);
+		cds_ft_group_attr_set_optimize(attr, opts[k]);
+		if (cds_ft_group_create(attr, &group) < 0) {
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0) {
+			cds_ft_group_destroy(group);
+			return -1;
+		}
+		for (i = 0; i < N; i++) {
+			struct ft_test_node *n = node_alloc(i);
+
+			rcu_read_lock();
+			if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				node_free(n);
+				ret = -1;
+				break;
+			}
+			rcu_read_unlock();
+			if ((i & 8191) == 8191)
+				rcu_quiescent_state();
+		}
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+			ret = -1;
+		rcu_read_lock();
+		for (i = 0; i < N; i += 313) {
+			struct cds_ft_node *out_node = NULL;
+
+			if (lookup_u64(ft, i, &out_node) != CDS_FT_STATUS_OK ||
+					to_test_node(out_node)->key != i) {
+				ret = -1;
+				break;
+			}
+		}
+		rcu_read_unlock();
+		drain_and_destroy(ft, group);
+	}
+	return ret;
+}
+
+/*
  * Alloc/free of many slots; verify each pointer is unique and
  * the freelist correctly recycles slots after a free round.
  */
@@ -13905,7 +14096,7 @@ static int test_external_arena_alloc_free_recycle(void)
 	void *q[N];
 	int ret = -1;
 
-	a = cds_ft_external_arena_create();
+	a = cds_ft_external_arena_create(NULL);
 	if (!a)
 		return -1;
 	for (int i = 0; i < N; i++) {
@@ -13947,7 +14138,7 @@ static int test_external_arena_split(void)
 	uintptr_t base;
 	int ret = -1;
 
-	a = cds_ft_external_arena_create();
+	a = cds_ft_external_arena_create(NULL);
 	if (!a)
 		return -1;
 	p256_a = cds_ft_external_arena_alloc(a, 256);
@@ -13979,7 +14170,7 @@ static int test_external_arena_merge(void)
 	void *p128_a, *p64_a, *p64_b, *p128_b;
 	int ret = -1;
 
-	a = cds_ft_external_arena_create();
+	a = cds_ft_external_arena_create(NULL);
 	if (!a)
 		return -1;
 	/*
@@ -14023,7 +14214,7 @@ out:
  */
 static int test_external_arena_multi_range(void)
 {
-	struct cds_ft_external_arena *a = cds_ft_external_arena_create();
+	struct cds_ft_external_arena *a = cds_ft_external_arena_create(NULL);
 	if (!a)
 		return -1;
 	/* Each range fits ~64 1 MiB slots (after header + guard).
@@ -14061,7 +14252,7 @@ out:
  */
 static int test_external_arena_alignment(void)
 {
-	struct cds_ft_external_arena *a = cds_ft_external_arena_create();
+	struct cds_ft_external_arena *a = cds_ft_external_arena_create(NULL);
 	if (!a)
 		return -1;
 	int ret = -1;
@@ -14083,7 +14274,7 @@ out:
  */
 static int test_external_arena_oversize_reject(void)
 {
-	struct cds_ft_external_arena *a = cds_ft_external_arena_create();
+	struct cds_ft_external_arena *a = cds_ft_external_arena_create(NULL);
 	if (!a)
 		return -1;
 	void *p = cds_ft_external_arena_alloc(a, (1UL << 22) + 1);
@@ -14788,6 +14979,9 @@ int main(int argc, char **argv)
 
 	diag("External-node arena allocator tests");
 	RUN_TEST(test_external_arena_basic);
+	RUN_TEST(test_optimize_attr_api);
+	RUN_TEST(test_optimize_external_thp);
+	RUN_TEST(test_optimize_group_functional);
 	RUN_TEST(test_external_arena_alloc_free_recycle);
 	RUN_TEST(test_external_arena_split);
 	RUN_TEST(test_external_arena_merge);

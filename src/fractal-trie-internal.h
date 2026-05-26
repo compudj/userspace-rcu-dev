@@ -601,6 +601,12 @@ struct cds_ft_group {
 	 *   benchmarking without recompiling).
 	 */
 	enum cds_ft_numa_policy numa_policy;
+	/*
+	 * @optimize: page-size policy for the internal + compressed node
+	 *   arenas (CDS_FT_OPTIMIZE_THROUGHPUT -> 2 MiB, _RSS -> 4 KiB).
+	 *   See cds_ft_group_attr_set_optimize.  Default: THROUGHPUT.
+	 */
+	enum cds_ft_optimize optimize;
 };
 
 

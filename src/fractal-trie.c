@@ -130,6 +130,7 @@ struct cds_ft_group_attr {
 	unsigned int flags;
 	bool speculative;	/* See cds_ft_lookup_optimization. */
 	enum cds_ft_numa_policy numa_policy;	/* See cds_ft_group_attr_set_numa_policy. */
+	enum cds_ft_optimize optimize;		/* See cds_ft_group_attr_set_optimize. */
 };
 
 struct cds_ft_attr {
@@ -15306,6 +15307,7 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	 * cds_ft_group_attr_set_numa_policy.
 	 */
 	attr->numa_policy = CDS_FT_NUMA_DEFAULT;
+	attr->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
 	*result = attr;
 	return CDS_FT_STATUS_OK;
 }
@@ -15378,6 +15380,19 @@ enum cds_ft_status cds_ft_group_attr_set_numa_policy(
 	case CDS_FT_NUMA_INTERLEAVE:
 	case CDS_FT_NUMA_LOCAL:
 		attr->numa_policy = policy;
+		return CDS_FT_STATUS_OK;
+	}
+	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+}
+
+enum cds_ft_status cds_ft_group_attr_set_optimize(
+		struct cds_ft_group_attr *attr,
+		enum cds_ft_optimize opt)
+{
+	switch (opt) {
+	case CDS_FT_OPTIMIZE_THROUGHPUT:
+	case CDS_FT_OPTIMIZE_RSS:
+		attr->optimize = opt;
 		return CDS_FT_STATUS_OK;
 	}
 	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -15550,6 +15565,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->flags = attr->flags;
 		ft_group->speculative = attr->speculative;
 		ft_group->numa_policy = attr->numa_policy;
+		ft_group->optimize = attr->optimize;
 	} else {
 		/*
 		 * NULL attr: mirror the defaults set by
@@ -15564,6 +15580,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 			ft_group->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
 		ft_group->numa_policy = CDS_FT_NUMA_INTERLEAVE;
+		ft_group->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
 	}
 	*result_ft_group = ft_group;
 	FT_TP(group_create, (const void *) ft_group);

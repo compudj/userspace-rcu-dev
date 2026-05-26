@@ -243,35 +243,33 @@ int ft_interleave_env_forces_skip(void)
  * virtually indexed from the page offset, the L2/L3 (and the L3 slice hash)
  * are physically indexed, and a 2 MiB-vs-4 KiB mapping over the *same physical
  * frames* gives identical cache behaviour (verified by a same-frames
- * split-the-PMD experiment).  So THP is purely a TLB / hardware-prefetcher
- * tradeoff — and that tradeoff has OPPOSITE sign for the two arenas
- * (load-names dns, Zen 4, perf-verified):
+ * split-the-PMD experiment).  So THP is purely a TLB tradeoff, selected per
+ * arena by the caller-supplied @huge (from the group / external-arena
+ * cds_ft_optimize attribute; default CDS_FT_OPTIMIZE_THROUGHPUT -> huge):
  *
- *   External (leaf) arena -> opt OUT (MADV_NOHUGEPAGE).
- *     Leaf access is random: one cold leaf per lookup, no reuse, no stride.
- *     The HW prefetcher can never usefully prefetch it; under 2 MiB pages it
- *     only pays the cost (fetching useless neighbours across the former 4 KiB
- *     prefetch fences) with zero benefit.  Measured ~-13% with hugepages.
+ *   huge (THROUGHPUT) -> MADV_HUGEPAGE.  2 MiB pages cut DTLB misses ~1000x;
+ *     on the internal node arena (structured descent, reused hot top) this is
+ *     measured +7% T1 / +14% T192.  On the external (leaf) arena it is
+ *     throughput-neutral but banks DTLB headroom for large tries.  Costs a
+ *     ~2 MiB RSS floor per range (a hugepage faults whole on first touch).
  *
- *   Internal node arena -> opt IN (MADV_HUGEPAGE).
- *     The descent is a structured pointer-chase with a small hot top, over a
- *     working set that thrashes the 4 KiB DTLB; 2 MiB pages cut DTLB misses
- *     ~1000x and that win dominates (no prefetch pollution, unlike the random
- *     leaves).  Measured ~+7% with hugepages.  Advice only (no eager
- *     populate) so worker first-touch still places pages on the local NUMA
- *     node; the 2 MiB-granular mbind interleave (ft_apply_interleave) is
- *     orthogonal and unaffected.
+ *   !huge (RSS) -> MADV_NOHUGEPAGE.  4 KiB pages, no hugepage floor: a small /
+ *     sparse trie faults only what it touches.  Right for many small tries.
+ *
+ * Advice only (no eager populate) so worker first-touch still places pages on
+ * the local NUMA node; the 2 MiB-granular mbind interleave (ft_apply_interleave)
+ * is orthogonal and unaffected.
  */
 static
-void ft_apply_thp_policy(void *base, size_t size, int is_external)
+void ft_apply_thp_policy(void *base, size_t size, int huge)
 {
-	if (is_external) {
-#ifdef MADV_NOHUGEPAGE
-		(void) madvise(base, size, MADV_NOHUGEPAGE);
-#endif
-	} else {
+	if (huge) {
 #ifdef MADV_HUGEPAGE
 		(void) madvise(base, size, MADV_HUGEPAGE);
+#endif
+	} else {
+#ifdef MADV_NOHUGEPAGE
+		(void) madvise(base, size, MADV_NOHUGEPAGE);
 #endif
 	}
 }
@@ -437,7 +435,7 @@ static inline void ft_apply_interleave(void *base __attribute__((unused)),
  */
 static __attribute__((unused))
 struct cds_ft_alloc_superblock *superblock_create(size_t min_size,
-		enum cds_ft_numa_policy numa_policy)
+		enum cds_ft_numa_policy numa_policy, int huge)
 {
 	struct cds_ft_alloc_superblock *sb;
 	size_t size;
@@ -451,7 +449,7 @@ struct cds_ft_alloc_superblock *superblock_create(size_t min_size,
 	if (base == MAP_FAILED)
 		return NULL;
 	ft_apply_interleave(base, size, numa_policy);
-	ft_apply_thp_policy(base, size, 0 /* internal node arena */);
+	ft_apply_thp_policy(base, size, huge);
 	sb = malloc(sizeof(*sb));
 	if (!sb) {
 		munmap(base, size);
@@ -515,6 +513,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	struct cds_ft_alloc_range *range;
 	void *raw, *base;
 	uintptr_t pre, post;
+	int huge = (arena->ft_group->optimize == CDS_FT_OPTIMIZE_THROUGHPUT);
 
 	raw = mmap(NULL, raw_size, PROT_READ | PROT_WRITE,
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -528,7 +527,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	if (post)
 		(void) munmap((char *) base + mapped, post);
 	ft_apply_interleave(base, mapped, arena->ft_group->numa_policy);
-	ft_apply_thp_policy(base, mapped, 0 /* internal node arena */);
+	ft_apply_thp_policy(base, mapped, huge /* internal: group cds_ft_optimize */);
 	range = (struct cds_ft_alloc_range *) ((char *) base + FT_FAR_MACRO_SIZE);
 	range->arena = arena;
 	range->next_unused = 0;
@@ -543,6 +542,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	struct cds_ft_alloc_superblock *sb;
 	struct cds_ft_alloc_range *range;
 	void *ptr;
+	int huge = (arena->ft_group->optimize == CDS_FT_OPTIMIZE_THROUGHPUT);
 
 	if (cds_list_empty(&arena->superblocks))
 		goto create_sb;
@@ -553,7 +553,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	goto carve;
 create_sb:
 	sb = superblock_create(alloc_size_aligned,
-			arena->ft_group->numa_policy);
+			arena->ft_group->numa_policy, huge);
 	if (!sb)
 		return NULL;
 	cds_list_add(&sb->node, &arena->superblocks);
@@ -1327,7 +1327,42 @@ struct cds_ft_external_arena {
 	struct cds_list_head ranges;
 	struct cds_ft_external_arena_range *active_range;
 	struct cds_ft_external_arena_freenode *freelist[FT_EXT_ARENA_NR_CLASSES];
+	int huge;	/* THP policy for ranges: from the create-time cds_ft_optimize. */
 };
+
+/* External-arena attributes (cds_ft_external_arena_attr_*). */
+struct cds_ft_external_arena_attr {
+	enum cds_ft_optimize optimize;
+};
+
+enum cds_ft_status cds_ft_external_arena_attr_create(
+		struct cds_ft_external_arena_attr **attr)
+{
+	struct cds_ft_external_arena_attr *a = calloc(1, sizeof(*a));
+
+	if (!a)
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	a->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
+	*attr = a;
+	return CDS_FT_STATUS_OK;
+}
+
+void cds_ft_external_arena_attr_destroy(struct cds_ft_external_arena_attr *attr)
+{
+	free(attr);
+}
+
+enum cds_ft_status cds_ft_external_arena_attr_set_optimize(
+		struct cds_ft_external_arena_attr *attr, enum cds_ft_optimize opt)
+{
+	switch (opt) {
+	case CDS_FT_OPTIMIZE_THROUGHPUT:
+	case CDS_FT_OPTIMIZE_RSS:
+		attr->optimize = opt;
+		return CDS_FT_STATUS_OK;
+	}
+	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+}
 
 static
 int ft_ext_arena_order_for_size(size_t size)
@@ -1362,7 +1397,7 @@ size_t ft_ext_arena_cell_index(const void *ptr)
 
 static
 struct cds_ft_external_arena_range *
-ft_ext_arena_range_create(void)
+ft_ext_arena_range_create(int huge)
 {
 	void *raw, *aligned;
 	uintptr_t pre, post;
@@ -1392,8 +1427,8 @@ ft_ext_arena_range_create(void)
 	 */
 	ft_apply_interleave(aligned, FT_EXT_ARENA_RANGE_SIZE,
 			CDS_FT_NUMA_DEFAULT);
-	/* Opt out of THP for the external/leaf arena — see ft_apply_thp_policy. */
-	ft_apply_thp_policy(aligned, FT_EXT_ARENA_RANGE_SIZE, 1 /* external node arena */);
+	/* THP per the arena's create-time cds_ft_optimize; see ft_apply_thp_policy. */
+	ft_apply_thp_policy(aligned, FT_EXT_ARENA_RANGE_SIZE, huge);
 
 	r = (struct cds_ft_external_arena_range *) aligned;
 	CDS_INIT_LIST_HEAD(&r->node);
@@ -1460,7 +1495,7 @@ void *ft_ext_arena_bump_alloc(struct cds_ft_external_arena *a, int order)
 	void *p;
 
 	if (!a->active_range) {
-		r = ft_ext_arena_range_create();
+		r = ft_ext_arena_range_create(a->huge);
 		if (!r)
 			return NULL;
 		cds_list_add(&r->node, &a->ranges);
@@ -1471,7 +1506,7 @@ void *ft_ext_arena_bump_alloc(struct cds_ft_external_arena *a, int order)
 	if (aligned_bump + slot_size + FT_EXT_ARENA_GUARD_SIZE
 			> FT_EXT_ARENA_RANGE_SIZE) {
 		/* Doesn't fit; start a fresh range. */
-		r = ft_ext_arena_range_create();
+		r = ft_ext_arena_range_create(a->huge);
 		if (!r)
 			return NULL;
 		cds_list_add(&r->node, &a->ranges);
@@ -1486,8 +1521,11 @@ void *ft_ext_arena_bump_alloc(struct cds_ft_external_arena *a, int order)
 	return p;
 }
 
-struct cds_ft_external_arena *cds_ft_external_arena_create(void)
+struct cds_ft_external_arena *cds_ft_external_arena_create(
+		const struct cds_ft_external_arena_attr *attr)
 {
+	enum cds_ft_optimize optimize = attr ? attr->optimize :
+			CDS_FT_OPTIMIZE_THROUGHPUT;
 	struct cds_ft_external_arena *a;
 	int i;
 
@@ -1499,6 +1537,7 @@ struct cds_ft_external_arena *cds_ft_external_arena_create(void)
 	pthread_mutex_init(&a->lock, NULL);
 	CDS_INIT_LIST_HEAD(&a->ranges);
 	a->active_range = NULL;
+	a->huge = (optimize == CDS_FT_OPTIMIZE_THROUGHPUT);
 	for (i = 0; i < FT_EXT_ARENA_NR_CLASSES; i++)
 		a->freelist[i] = NULL;
 	return a;
