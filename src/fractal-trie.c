@@ -796,7 +796,6 @@ int64_t cds_ft_key_to_s64(const struct cds_ft *ft, const uint8_t *key,
 	unsigned int shift;
 	uint64_t u;
 
-	assert(key_len <= 8);
 	if (key_len == 0 || key_len > 8)
 		return 0;
 	u = cds_ft_key_to_u64(ft, key, _key_len);
@@ -819,7 +818,6 @@ void cds_ft_s64_to_key(const struct cds_ft *ft, int64_t v, uint8_t *key,
 	size_t key_len = ft_key_len(ft, _key_len);
 	unsigned int shift;
 
-	assert(key_len <= 8);
 	if (key_len == 0 || key_len > 8)
 		return;
 	shift = key_len * 8;
@@ -834,7 +832,6 @@ int32_t cds_ft_key_to_s32(const struct cds_ft *ft, const uint8_t *key,
 	unsigned int shift;
 	uint32_t u;
 
-	assert(key_len <= 4);
 	if (key_len == 0 || key_len > 4)
 		return 0;
 	u = cds_ft_key_to_u32(ft, key, _key_len);
@@ -857,7 +854,6 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key,
 	size_t key_len = ft_key_len(ft, _key_len);
 	unsigned int shift;
 
-	assert(key_len <= 4);
 	if (key_len == 0 || key_len > 4)
 		return;
 	shift = key_len * 8;
