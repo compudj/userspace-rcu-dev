@@ -48,7 +48,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 203
+#define NR_TESTS 204
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -14119,6 +14119,122 @@ extern void cds_ft_debug_arena_resident(const struct cds_ft *ft,
 		size_t *range_bytes) __attribute__((weak));
 
 /*
+ * Build a dense 3-byte keyspace into @ft (~N/256 full 256-child nodes).
+ * Returns 0 on success.
+ */
+static int dense_populate(struct cds_ft *ft, unsigned int N)
+{
+	unsigned int i;
+
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "dense_populate: insert %u failed\n", i);
+			node_free(n);
+			return -1;
+		}
+		rcu_read_unlock();
+		if ((i & 8191) == 8191)
+			rcu_quiescent_state();
+	}
+	return 0;
+}
+
+/* Remove every key from @ft (freeing leaves) but keep the trie alive. */
+static int dense_drain(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+	int ret = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		return -1;
+	rcu_read_lock();
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
+
+		if (cds_ft_remove_all(ft, iter, &head) < 0) {
+			ret = -1;
+			break;
+		}
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+			node_free_rcu(to_test_node(head));
+	}
+	rcu_read_unlock();
+	rcu_barrier();		/* drain node_free_rcu + internal-node reclaim */
+	cds_ft_iter_destroy(iter);
+	return ret;
+}
+
+/*
+ * Regression: compacting a dense trie whose deepest level forms full 256-child
+ * nodes must not corrupt nr_child.  ft_node_recompact rebuilds nr_child from
+ * per-child increments, so it must start at 0; a node carved from a recycled
+ * range carries a stale nr_child (the far-metadata region is not re-zeroed on
+ * range reuse: reclaim only MADV_DONTNEEDs the node body), and a relocated full
+ * node would wrap the 9-bit field (stale 256 + 256 copied = 512 -> 0).
+ *
+ * The trigger needs a *recycled* range, so populate-then-drain a dense keyspace
+ * first to leave the group arena holding ranges with stale far-metadata, then
+ * rebuild + compact so the relocations reuse them.  A single fresh build allocs
+ * only from mmap-zeroed ranges and does not reproduce.  cds_ft_verify catches
+ * the nr_child mismatch.
+ */
+static int test_compact_dense_full_node(void)
+{
+	/*
+	 * N must fill and fully drain at least one far range of order-11
+	 * nodes (~1000 nodes, i.e. ~256k dense 3-byte keys) so phase 1 leaves
+	 * the arena holding recycled ranges; phase 2 then reuses them.  300k
+	 * clears that floor in every node-layout config tested.
+	 */
+	const char *nenv = getenv("FT_TEST_N");
+	const unsigned int N = nenv ? (unsigned int) atoi(nenv) : 300000;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(3, &group);
+	unsigned int i;
+	int ret = 0;
+
+	/* Phase 1: populate then drain to recycle stale-metadata ranges. */
+	if (dense_populate(ft, N) < 0 || dense_drain(ft) < 0)
+		return -1;
+	/* Phase 2: rebuild into the recycled ranges, then compact. */
+	if (dense_populate(ft, N) < 0)
+		return -1;
+	/*
+	 * On corruption, a wrong nr_child makes iteration loop forever, so
+	 * report and bail before any walk (drain_and_destroy included): the
+	 * leaked trie is harmless because the test has already failed.
+	 */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compact_dense: post-rebuild verify failed (nr_child corruption)\n");
+		return -1;
+	}
+	cds_ft_compact(ft);
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compact_dense: post-compaction verify failed (nr_child corruption)\n");
+		return -1;
+	}
+	/* Spot-check that every key still resolves to its node. */
+	rcu_read_lock();
+	for (i = 0; i < N; i += 997) {
+		struct cds_ft_node *out_node = NULL;
+
+		if (lookup_u64(ft, i, &out_node) != CDS_FT_STATUS_OK ||
+				to_test_node(out_node)->key != i) {
+			fprintf(stderr, "compact_dense: key %u lost after compaction\n", i);
+			ret = -1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
  * Regression: removing every key must free the compressed (path-edge) nodes,
  * not just the internal branch nodes.  Keys (i << 32) leave a 4-byte zero
  * suffix per leaf, so the build creates ~N compressed nodes.  After removing
@@ -14685,6 +14801,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_concurrent_mutation);
 	RUN_TEST(test_compact_forgotten_end);
 	RUN_TEST(test_remove_compressed_no_leak);
+	RUN_TEST(test_compact_dense_full_node);
 
 	rcu_barrier();
 	rcu_unregister_thread();
