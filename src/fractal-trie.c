@@ -2829,14 +2829,20 @@ static inline void ft_maybe_prefetch(const void *ptr)
 	 * So: prefetch raw, accept the dropped 3%.  Do NOT re-add the clear
 	 * without a skip-heavy workload that shows a real win.
 	 *
-	 * EXPERIMENT: external (leaf) targets — tag bits 0-1 clear — are
-	 * accessed randomly and once (no reuse), so prefetch them
-	 * NON-TEMPORALLY to avoid polluting L2/L3 with use-once leaf lines.
-	 * Internal children are re-touched -> normal temporal prefetch.
+	 * Prefetch INTERNAL (tagged) children only.  External (leaf) children
+	 * (tag bits clear) are random and use-once, and prefetching them is at
+	 * best useless and at worst harmful (measured, EPYC 9654 / dns
+	 * load-names):
+	 *   - under 4 KiB leaf pages it is a no-op -- the leaf-arena TLB miss
+	 *     drops the prefetch before its translation resolves;
+	 *   - under 2 MiB leaf pages the translation resolves, so the prefetches
+	 *     flood the memory controller (~5x more software-prefetch fills
+	 *     reach DRAM) and inflate demand-load latency: -27% throughput.
+	 * Removing it is neutral at 4 KiB (it was dropped anyway) and removes
+	 * that 2 MiB foot-gun.  Internal nodes have descent locality + reuse and
+	 * do not flood, so they keep a temporal prefetch.
 	 */
-	if (((unsigned long) ptr & FT_TAG_MASK) == 0)
-		__builtin_prefetch(ptr, 0, 0);	/* prefetchnta */
-	else
+	if (((unsigned long) ptr & FT_TAG_MASK) != 0)
 		__builtin_prefetch(ptr);
 }
 
@@ -2847,8 +2853,11 @@ static inline void ft_maybe_prefetch(const void *ptr)
  * non-canonical and its prefetch is silently dropped -- keeping the
  * common-case prefetch un-delayed beats prefetching the rare skip child).
  *
- * ft_dereference_prefetch_external: for plain (non-tagged) pointers
- * like external_nodes.  Direct prefetch, no tag check needed.
+ * ft_dereference_prefetch_external: for external (leaf) pointers like
+ * external_nodes.  Now a plain rcu_dereference -- external children are
+ * deliberately NOT prefetched (see ft_maybe_prefetch: random/use-once
+ * leaves drop the prefetch on a 4 KiB TLB miss or flood the memory
+ * controller under 2 MiB).  Kept as a distinct name to mark leaf loads.
  */
 #define ft_dereference_prefetch(p)		\
 	({							\
@@ -2857,13 +2866,7 @@ static inline void ft_maybe_prefetch(const void *ptr)
 		__ft_tmp;					\
 	})
 
-#define ft_dereference_prefetch_external(p)	\
-	({							\
-		__typeof__(p) __ft_tmp = rcu_dereference(p);	\
-		if (__ft_tmp)					\
-			__builtin_prefetch(__ft_tmp, 0, 0); /* non-temporal: random leaf */ \
-		__ft_tmp;					\
-	})
+#define ft_dereference_prefetch_external(p)	rcu_dereference(p)
 
 #define ft_dereference_acquire_prefetch(p)	\
 	({							\
@@ -2926,14 +2929,11 @@ void ft_prefetch_child_meta(const void *ptr)
 	 */
 	if ((v & FT_INTERNAL_MASK) == 0) {
 		/*
-		 * External (bits 0-2 == 0): no FT metadata.  Prefetch the
-		 * node body, which the META-hint caller typically reads
-		 * next (user_data / ->next for the duplicate chain).
-		 * Compressed children: their handlers prefetch their own
-		 * targets; skip here.
+		 * External (leaf) / compressed child: no FT metadata, and not
+		 * prefetched.  External leaves are random/use-once (see
+		 * ft_maybe_prefetch -- they flood the MC under 2 MiB / drop under
+		 * 4 KiB); compressed handlers prefetch their own targets.
 		 */
-		if ((v & FT_TAG_MASK) == 0)
-			__builtin_prefetch((const void *) v);
 		return;
 	}
 	{
@@ -2955,8 +2955,7 @@ void ft_prefetch_child_bitmap_meta(const void *ptr)
 		return;
 	/* Experiment: skip the high-bit clear (see ft_prefetch_child_meta). */
 	if ((v & FT_INTERNAL_MASK) == 0) {
-		if ((v & FT_TAG_MASK) == 0)
-			__builtin_prefetch((const void *) v);
+		/* External (leaf) / compressed: not prefetched (see ft_maybe_prefetch). */
 		return;
 	}
 	{
