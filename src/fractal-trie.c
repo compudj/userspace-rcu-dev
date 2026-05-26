@@ -15418,12 +15418,9 @@ enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	/*
-	 * Leave threshold and multipliers at 0 (calloc'd) as a "use
-	 * library default" sentinel; cds_ft_create resolves them to
-	 * mode-aware defaults that depend on the group's skip-compressed
-	 * setting.  Fields explicitly set via the attr setters take
-	 * precedence (the setters validate >= 100 or DISABLED, so 0
-	 * cannot leak in by accident).
+	 * The per-instance attr currently carries only the exclusive-
+	 * access flag (see cds_ft_attr_set_exclusive); calloc leaves it
+	 * false (concurrent RCU readers permitted) as the default.
 	 */
 	*result = attr;
 	return CDS_FT_STATUS_OK;
