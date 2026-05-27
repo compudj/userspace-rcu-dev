@@ -1702,7 +1702,7 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
  * are intentionally inconsistent for a brief window) get whatever
  * the back-pointer currently says.  Reader paths that must observe
  * a self-consistent slot+cn pair use ft_skip_to_compressed_validate
- * (with retry at the caller level).
+ * (re-anchoring via ft_skip_reanchor on mismatch).
  *
  * Read-side safe (rcu_dereference on both fields).  Callers must be
  * in an RCU read-side critical section (or QSBR equivalent).
@@ -1727,10 +1727,10 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
  * the recovery against the slot's skip_len.  Returns NULL on mismatch,
  * indicating a concurrent writer is mid-split/merge: the child's
  * back-pointer has been updated in-place but the parent slot value
- * hasn't been republished yet.  The caller is expected to be in the
- * reader role: re-read the slot from its source and retry, bounded
- * by the writer's structural mutation window (microseconds — between
- * ft_set_parent and ft_publish_to_parent on the writer side).
+ * hasn't been republished yet (or the slot's holder was recompacted
+ * away and never will be).  On NULL the caller does NOT spin re-reading
+ * the slot — it re-anchors on the live structure via ft_skip_reanchor
+ * (the skip child's parent chain), which converges in bounded steps.
  *
  * The validation works because:
  *   - Split always shortens: sfx->len < CN->len.
@@ -6330,8 +6330,9 @@ descend_loop:
 					 * than spin on a slot that may never republish.
 					 */
 					unsigned int rewind;
+					struct cds_ft_inode_flag *at_pos;
 					struct cds_ft_inode_flag *anchor =
-						ft_skip_reanchor(node_flag, &rewind, NULL);
+						ft_skip_reanchor(node_flag, &rewind, &at_pos);
 
 					if (caa_unlikely(!anchor)) {
 						/* child detached / above root: re-descend live. */
@@ -6341,18 +6342,38 @@ descend_loop:
 							path_cur = path_nodes + 1;
 						goto reanchor_root;
 					}
-					/*
-					 * Rewind one (the byte just consumed for this slot) plus
-					 * the merge overshoot, re-anchor @node_flag, and re-enter
-					 * the descent.  path_cur tracks key in lockstep
-					 * (path_nodes + 1 + depth).
-					 */
-					node_flag = anchor;
-					key -= (size_t) rewind + 1;
-					if (path_nodes)
-						path_cur = path_nodes + 1 +
-							(size_t) (key - orig_key);
-					goto descend_loop;
+					if (rewind == 0) {
+						/*
+						 * Split (or same-length replace): @at_pos is
+						 * the live node at the failing slot's encoded
+						 * depth — exactly what the validate-success
+						 * path resolves @cn to.  Descend INTO it by
+						 * falling through to the post-step handler with
+						 * @key / @path_cur unchanged (identical to the
+						 * cn != NULL case, just sourced from the live
+						 * parent-chain walk).  This bypasses the
+						 * holder's stale slot, so we never re-read a
+						 * slot that may mismatch again: each re-anchor
+						 * advances the descent one level — wait-free.
+						 */
+						node_flag = at_pos;
+					} else {
+						/*
+						 * Merge overshoot: the failing level was
+						 * absorbed into a longer compressed that begins
+						 * ABOVE this depth, so @at_pos cannot be entered
+						 * with the unchanged cursor.  Re-anchor at the
+						 * holder and re-descend through the normal loop
+						 * (path bookkeeping stays on the proven path;
+						 * this rarer case remains lock-free).
+						 */
+						node_flag = anchor;
+						key -= (size_t) rewind + 1;
+						if (path_nodes)
+							path_cur = path_nodes + 1 +
+								(size_t) (key - orig_key);
+						goto descend_loop;
+					}
 				}
 			}
 #endif
