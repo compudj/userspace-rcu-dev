@@ -14777,6 +14777,84 @@ static int run_split_oom_insert(const char *label,
 }
 
 /*
+ * As run_split_oom_insert, but the compressed split is driven by cds_ft_graft:
+ * grafting a staging trie at @gkey, which diverges inside the live trie's
+ * compressed path, runs ft_split_compressed_graft.  Its branch holds only the
+ * old direction during the split (the graft payload is attached afterward), so
+ * for suffix_len == 0 that branch is a 1-child cluster-leaf.  After every
+ * allocation-failure point, the live trie must still pass cds_ft_verify.
+ *
+ * @nr_faults bounds the failure points to the split's OWN allocations (plus
+ * the pre-descent fresh-root alloc): the build-invisible split leaves dst
+ * untouched on OOM, and the descent propagates the failure so graft aborts
+ * before publishing the source root.  Beyond that window, OOM falls in graft's
+ * ATTACH machinery (ft_store_at_graft_point / ft_build_branch / payload
+ * compression), which is not yet transaction-atomic: an attach OOM can leave
+ * the split's already-published branch a non-canonical 1-child internal.  That
+ * is a separate follow-up (graft transaction atomicity), out of scope for the
+ * split-function conversion this test guards.
+ */
+static int run_split_oom_graft(const char *label,
+		const uint8_t *gkey, size_t glen, int nr_faults)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *live = create_varlen_ft(&group);
+		struct cds_ft *staging;
+		struct ft_test_node *a = node_alloc(1);
+		struct ft_test_node *b = node_alloc(2);
+		struct ft_test_node *s1 = node_alloc(3);
+		enum cds_ft_status s;
+		int verified;
+
+		if (cds_ft_create(group, NULL, &staging) < 0) {
+			fprintf(stderr, "split_oom[%s]: staging create failed\n", label);
+			return -1;
+		}
+
+		/* live: compressed("aaaaaaa") -> internal {a, b}. */
+		if (cds_ft_insert(live, (const uint8_t *)"aaaaaaaa", 8, &a->node) < 0 ||
+		    cds_ft_insert(live, (const uint8_t *)"aaaaaaab", 8, &b->node) < 0)
+			rc = -1;
+		/* staging: one key, becomes the payload under the graft point. */
+		if (cds_ft_insert(staging, (const uint8_t *)"z", 1, &s1->node) < 0)
+			rc = -1;
+
+		/* Fail the (n+1)-th allocation performed by the graft. */
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_graft(live, gkey, glen, staging);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(live, stderr) == CDS_FT_STATUS_OK);
+		rcu_read_unlock();
+		if (!verified) {
+			fprintf(stderr,
+				"split_oom[%s]: live verify FAILED after fault n=%d (graft=%s)\n",
+				label, n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+
+		/*
+		 * On success the payload moved to live; on OOM the graft rolled
+		 * back and staging still owns it.  Drain both either way.
+		 */
+		if (drain_trie(live) < 0 || drain_trie(staging) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(live);
+		cds_ft_destroy(staging);
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+/*
  * Fault-injection regression for the compressed-split create-cluster-then-
  * publish discipline.  Requires the alloc fault hook (FEATURE_FT_FAULT_INJECT).
  */
@@ -14815,6 +14893,22 @@ static int test_split_oom_backpointer(void)
 		rc = -1;
 	if (run_split_oom_insert("key_shorter-suffix==0",
 			(const uint8_t *)"aaaaaa", 6) < 0)
+		rc = -1;
+	/*
+	 * Graft diverging inside the compressed path: ft_split_compressed_graft.
+	 * "aaaXmas" diverges at index 3 (suffix_len == 3: compressed suffix wraps
+	 * the old child); "aaaaaaX" at index 6 (suffix_len == 0: the 1-child
+	 * branch is the cluster-leaf, holding the live old child directly).
+	 *
+	 * The fault count is bounded to the split's own allocation points
+	 * (fresh-root + sfx + branch + prefix for the diverge case; fresh-root +
+	 * branch + prefix when there is no suffix node) — see run_split_oom_graft.
+	 */
+	if (run_split_oom_graft("graft-suffix>=1",
+			(const uint8_t *)"aaaXmas", 7, 4) < 0)
+		rc = -1;
+	if (run_split_oom_graft("graft-suffix==0",
+			(const uint8_t *)"aaaaaaX", 7, 3) < 0)
 		rc = -1;
 	return rc;
 }

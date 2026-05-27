@@ -11599,6 +11599,17 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
 	unsigned long old_child_nr_keys;
 	int ret;
+	/*
+	 * Build-invisible / publish / reclaim (see rcu-mutation pattern).
+	 * Defer the single back-pointer of the live old child (cn->child) into
+	 * the new suffix / branch to the phase-2 publish, so an allocation
+	 * failure frees the never-observed cluster with cn->child untouched.
+	 */
+	bool branch_cluster_leaf = (suffix_len == 0);
+	struct cds_ft_inode_flag *sfx_skip_flag = NULL;
+	struct cds_ft_inode_flag *deferred_child = NULL;
+	struct cds_ft_inode_flag *deferred_parent = NULL;
+	struct cds_ft_inode_flag **deferred_slot = NULL;
 
 	/* Compute old child's nr_keys. */
 	if (!ft_node_external(cn->child)) {
@@ -11636,17 +11647,30 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		sfx_meta->nr_child = 1;
 		ft_nr_keys_store(sfx_meta, old_child_nr_keys,
 			CMM_RELAXED);
-		old_suffix_flag = ft_compressed_node_flag(sfx);
-		ft_set_parent(cn->child, old_suffix_flag, &sfx->child);
-		old_suffix_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
-		created[nr_created++] = old_suffix_flag;
+		old_suffix_flag = ft_compressed_node_flag(sfx);	/* PLAIN: install + recover sfx directly */
+		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);	/* skip form for the slot */
+		created[nr_created++] = old_suffix_flag;	/* track PLAIN so the error path frees sfx directly */
+		/*
+		 * Defer re-parenting the live old child into the new suffix:
+		 * writing cn->child's back-pointer now would expose the
+		 * unpublished cluster from below, and the branch install below
+		 * would recover sfx through it.  sfx->child already points at
+		 * cn->child (a write into the new sfx only).
+		 */
+		deferred_child = cn->child;
+		deferred_parent = old_suffix_flag;	/* PLAIN sfx flag */
+		deferred_slot = &sfx->child;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
 
+		/*
+		 * 1-child internal suffix (non-SC): the live cn->child is its
+		 * only child, so this node is a cluster-leaf — defer cn->child.
+		 */
 		ret = ft_node_set_nth(ft, &dest,
 				cn->key_bytes[diverge_pos + 1],
 				cn->child, NULL, NULL,
-				d->depth + diverge_pos + 1, false);
+				d->depth + diverge_pos + 1, true);
 		if (ret) goto error;
 		{
 			struct cds_ft_metadata *m =
@@ -11656,6 +11680,10 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		}
 		old_suffix_flag = dest;
 		created[nr_created++] = dest;
+		deferred_child = cn->child;
+		deferred_parent = dest;
+		ft_node_get_nth_skip(dest, &deferred_slot,
+			cn->key_bytes[diverge_pos + 1], FT_PF_NONE);
 	} else {
 		old_suffix_flag = cn->child;
 	}
@@ -11667,7 +11695,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 
 		ret = ft_node_set_nth(ft, &dest, old_ordinal,
 				old_suffix_flag, NULL, NULL,
-				d->depth + diverge_pos, false);
+				d->depth + diverge_pos, branch_cluster_leaf);
 		if (ret) goto error;
 		created[nr_created++] = dest;
 		branch_flag = dest;
@@ -11675,6 +11703,31 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(branch_meta, old_child_nr_keys,
 			CMM_RELAXED);
+
+		if (branch_cluster_leaf) {
+			/*
+			 * suffix_len == 0: the branch is the cluster-leaf and its
+			 * old direction is the live cn->child.  Record the deferred
+			 * edge against the final branch.
+			 */
+			deferred_child = cn->child;
+			deferred_parent = branch_flag;
+			ft_node_get_nth_skip(branch_flag, &deferred_slot,
+				old_ordinal, FT_PF_NONE);
+		} else if (sfx_skip_flag && sfx_skip_flag != old_suffix_flag) {
+			/*
+			 * suffix_len >= 1 compressed: sfx was installed via its
+			 * PLAIN flag so ft_set_parent recovered it directly.
+			 * Re-encode the branch's old-direction slot to sfx's skip
+			 * form — a value write into the still-unpublished branch.
+			 */
+			struct cds_ft_inode_flag **oslot = NULL;
+
+			ft_node_get_nth_skip(branch_flag, &oslot, old_ordinal,
+				FT_PF_NONE);
+			if (oslot)
+				rcu_assign_pointer(*oslot, sfx_skip_flag);
+		}
 	}
 
 	/* 3. Build prefix -> branch (if needed). */
@@ -11784,8 +11837,16 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		top_flag = branch_flag;
 	}
 
-	/* 4. Publish the split structure. */
+	/*
+	 * 4. Publish the split structure — no failures past here.  Link the
+	 * top's back-pointer, then wire the deferred live-old-child edge
+	 * (bottom publish), then swing the parent's forward slot (top publish).
+	 * Ordered so an up-walk from cn->child enters the fully back-linked
+	 * cluster before it becomes forward-reachable.
+	 */
 	ft_set_parent(top_flag, d->pnf, d->nfp);
+	if (deferred_child)
+		ft_set_parent(deferred_child, deferred_parent, deferred_slot);
 	ft_publish_to_parent(ft, d->pnf, d->nfp, top_flag);
 
 	/*
@@ -11881,7 +11942,8 @@ enum ft_descent_action ft_descend_to_graft_point_compressed(
 		size_t key_len,
 		struct cds_ft_inode_flag **snapshot,
 		unsigned int *snapshot_depth,
-		int *nr_snapshot)
+		int *nr_snapshot,
+		int *split_ret)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
 	const uint8_t *ik = *ik_p;
@@ -11897,18 +11959,26 @@ enum ft_descent_action ft_descend_to_graft_point_compressed(
 		return FT_DESCENT_CONTINUE;
 	}
 	if (j < cmp) {
-		/* Divergence: split compressed node at the mismatch point. */
-		if (ft_split_compressed_graft(ft, d, ik, j))
+		/*
+		 * Divergence: split compressed node at the mismatch point.
+		 * On allocation failure the build-invisible split leaves cn
+		 * untouched; report it so the graft aborts cleanly instead of
+		 * proceeding with the un-split node.
+		 */
+		if (ft_split_compressed_graft(ft, d, ik, j)) {
+			*split_ret = -ENOMEM;
 			return FT_DESCENT_BREAK;
+		}
 		*ik_p = ik + j + 1;
 		return FT_DESCENT_BREAK;
 	}
 	/*
 	 * Key shorter than compressed path: split into prefix ->
 	 * suffix at the key endpoint.  The graft point is at the
-	 * junction.
+	 * junction.  Propagate allocation failure (cn left untouched).
 	 */
-	(void) ft_split_compressed_graft_key_shorter(ft, d, remaining);
+	if (ft_split_compressed_graft_key_shorter(ft, d, remaining))
+		*split_ret = -ENOMEM;
 	return FT_DESCENT_BREAK;
 }
 
@@ -11918,12 +11988,14 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 		struct ft_descent *d,
 		struct cds_ft_inode_flag **snapshot,
 		unsigned int *snapshot_depth,
-		int *nr_snapshot)
+		int *nr_snapshot,
+		int *split_ret)
 {
 	const uint8_t *ik = key;
 
 	ft_descent_init(d, ft);
 	*nr_snapshot = 0;
+	*split_ret = 0;
 
 	for (; d->depth < key_len; ) {
 		uint8_t kv;
@@ -11937,7 +12009,7 @@ void ft_descend_to_graft_point(struct cds_ft *ft,
 
 			act = ft_descend_to_graft_point_compressed(ft, d,
 				&ik, key_len, snapshot, snapshot_depth,
-				nr_snapshot);
+				nr_snapshot, split_ret);
 			if (act == FT_DESCENT_BREAK)
 				break;
 			assert(act == FT_DESCENT_CONTINUE);
@@ -11975,6 +12047,21 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 	struct cds_ft_inode_flag *suffix_flag;
 	struct cds_ft_inode_flag *prefix_flag;
 	unsigned long child_nr_keys;
+	/*
+	 * Build-invisible / publish / reclaim (see rcu-mutation pattern).
+	 * Defer the live old child's (cn->child) back-pointer into the new
+	 * suffix to the failure-free tail, so a later allocation failure frees
+	 * the never-observed cluster with cn->child untouched.  When the suffix
+	 * is a compressed node it is installed via its PLAIN flag (so each
+	 * prefix's ft_set_parent recovers it directly, without reading
+	 * cn->child's still-old back-pointer); @sfx_slot records the slot
+	 * holding it so the tail re-encodes it to the skip form.
+	 */
+	struct cds_ft_inode_flag *sfx_skip_flag = NULL;
+	struct cds_ft_inode_flag **sfx_slot = NULL;
+	struct cds_ft_inode_flag *deferred_child = NULL;
+	struct cds_ft_inode_flag *deferred_parent = NULL;
+	struct cds_ft_inode_flag **deferred_slot = NULL;
 
 	if (!ft_node_external(cn->child)) {
 		struct cds_ft_metadata *cm =
@@ -12000,17 +12087,20 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		sfx_meta->nr_child = 1;
 		ft_nr_keys_store(sfx_meta, child_nr_keys,
 			CMM_RELAXED);
-		suffix_flag = ft_compressed_node_flag(sfx);
-		ft_set_parent(cn->child, suffix_flag, &sfx->child);
-		suffix_flag = ft_publish_compressed(ft, sfx, suffix_flag);
+		suffix_flag = ft_compressed_node_flag(sfx);	/* PLAIN: install + recover sfx directly */
+		sfx_skip_flag = ft_publish_compressed(ft, sfx, suffix_flag);	/* skip form for the slot */
+		deferred_child = cn->child;
+		deferred_parent = suffix_flag;	/* PLAIN sfx flag */
+		deferred_slot = &sfx->child;
 	} else {
 		struct cds_ft_inode_flag *dest = NULL;
 		int ret;
 
+		/* 1-child internal suffix: cluster-leaf, defer cn->child. */
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining],
 			cn->child, NULL, NULL,
-			d->depth + remaining, false);
+			d->depth + remaining, true);
 		if (ret) return -1;
 		{
 			struct cds_ft_metadata *m =
@@ -12019,6 +12109,10 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 				CMM_RELAXED);
 		}
 		suffix_flag = dest;
+		deferred_child = cn->child;
+		deferred_parent = dest;
+		ft_node_get_nth_skip(dest, &deferred_slot,
+			cn->key_bytes[remaining], FT_PF_NONE);
 	}
 
 	/* Build prefix → suffix. */
@@ -12043,6 +12137,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 			CMM_RELAXED);
 		prefix_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(suffix_flag, prefix_flag, &pfx->child);
+		sfx_slot = &pfx->child;
 		prefix_flag = ft_publish_compressed(ft, pfx, prefix_flag);
 	} else if (prefix_len >= 2 && cn_meta->external_nodes) {
 		/* Compressed prefix must not carry external_nodes.
@@ -12073,6 +12168,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 				CMM_RELAXED);
 			pfx_child = ft_compressed_node_flag(pfx);
 			ft_set_parent(suffix_flag, pfx_child, &pfx->child);
+			sfx_slot = &pfx->child;	/* suffix sits under the sub-prefix */
 			pfx_child = ft_publish_compressed(ft, pfx, pfx_child);
 		}
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
@@ -12092,6 +12188,13 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		ft_nr_keys_store(int_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		ft_metadata_set_external_nodes(dest, int_meta, cn_meta->external_nodes);
+		/*
+		 * prefix_len == 2: no sub-prefix, so the suffix sits directly in
+		 * the internal wrapper's slot for cn->key_bytes[0].
+		 */
+		if (prefix_len == 2)
+			ft_node_get_nth_skip(dest, &sfx_slot, cn->key_bytes[0],
+				FT_PF_NONE);
 		prefix_flag = dest;
 	} else {
 		/* prefix_len == 1 */
@@ -12141,6 +12244,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 				CMM_RELAXED);
 			prefix_flag = ft_compressed_node_flag(pfx);
 			ft_set_parent(suffix_flag, prefix_flag, &pfx->child);
+			sfx_slot = &pfx->child;
 			if (!ft_node_skip_compressed(suffix_flag) &&
 			    !ft_node_compressed(suffix_flag))
 				prefix_flag = ft_publish_compressed(ft, pfx,
@@ -12167,12 +12271,28 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 				CMM_RELAXED);
 			if (cn_meta->external_nodes)
 				ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
+			ft_node_get_nth_skip(dest, &sfx_slot, cn->key_bytes[0],
+				FT_PF_NONE);
 			prefix_flag = dest;
 		}
 	}
 
-	/* Publish and set descent state. */
+	/*
+	 * The suffix was installed via its PLAIN flag so each prefix's
+	 * ft_set_parent recovered it directly.  Re-encode its slot to the skip
+	 * form now — a value write into the still-unpublished cluster.
+	 */
+	if (sfx_skip_flag && sfx_skip_flag != suffix_flag && sfx_slot)
+		rcu_assign_pointer(*sfx_slot, sfx_skip_flag);
+
+	/*
+	 * Publish — no failures past here.  Link the prefix's back-pointer,
+	 * wire the deferred live-old-child edge (bottom publish), then swing
+	 * the parent's forward slot (top publish).
+	 */
 	ft_set_parent(prefix_flag, d->pnf, d->nfp);
+	if (deferred_child)
+		ft_set_parent(deferred_child, deferred_parent, deferred_slot);
 	ft_publish_to_parent(ft, d->pnf, d->nfp, prefix_flag);
 
 	d->ppnf = d->pnf;
@@ -12184,7 +12304,13 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		ft_node_get_nth(prefix_flag, &d->pnfp,
 				cn->key_bytes[0], FT_PF_NONE,
 				false /* writer */);
-	d->nf = suffix_flag;
+	/*
+	 * d->nf must match the value actually in the slot: when the suffix is
+	 * a compressed node we re-encoded the slot to its skip form above, so
+	 * report that (not the PLAIN flag used for installation).
+	 */
+	d->nf = (sfx_skip_flag && sfx_skip_flag != suffix_flag) ?
+		sfx_skip_flag : suffix_flag;
 	d->nfp = d->pnfp;
 	d->depth += remaining;
 
@@ -12814,6 +12940,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *graft_snapshot[FT_MAX_DEPTH];
 		unsigned int graft_snapshot_depth[FT_MAX_DEPTH];
 		int nr_graft_snapshot;
+		int split_ret;
 		unsigned long src_count = ft_nr_keys_get(src_rmeta);
 		struct cds_ft_inode_flag *old_src_root;
 
@@ -12828,7 +12955,17 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 
 		ft_descend_to_graft_point(dst_ft, key, key_len, &d,
 				graft_snapshot, graft_snapshot_depth,
-				&nr_graft_snapshot);
+				&nr_graft_snapshot, &split_ret);
+		/*
+		 * A compressed split during the descent failed to allocate.
+		 * The build-invisible split left dst_ft untouched; abort before
+		 * the source-root publish (the point of no return), so nothing
+		 * needs rolling back.
+		 */
+		if (split_ret) {
+			free_cds_ft_node(src_ft, fresh_node);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
 
 		/*
 		 * "Jump out" prevention: a reader that has descended
@@ -13066,13 +13203,23 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *graft_snapshot[FT_MAX_DEPTH];
 		unsigned int graft_snapshot_depth[FT_MAX_DEPTH];
 		int nr_graft_snapshot;
+		int split_ret;
 		bool swap_empty;
 		bool need_fresh;
 		unsigned long old_count, swap_count;
 
 		ft_descend_to_graft_point(dst_ft, key, key_len, &d,
 				graft_snapshot, graft_snapshot_depth,
-				&nr_graft_snapshot);
+				&nr_graft_snapshot, &split_ret);
+		/*
+		 * A compressed split during the descent failed to allocate; the
+		 * build-invisible split left dst_ft untouched.  Abort before any
+		 * swap state changes (nothing to roll back).
+		 */
+		if (split_ret) {
+			FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
 
 		if (d.depth < key_len) {
 			enum cds_ft_status s;
