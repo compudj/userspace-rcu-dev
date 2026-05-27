@@ -14779,20 +14779,14 @@ static int run_split_oom_insert(const char *label,
 /*
  * As run_split_oom_insert, but the compressed split is driven by cds_ft_graft:
  * grafting a staging trie at @gkey, which diverges inside the live trie's
- * compressed path, runs ft_split_compressed_graft.  Its branch holds only the
- * old direction during the split (the graft payload is attached afterward), so
- * for suffix_len == 0 that branch is a 1-child cluster-leaf.  After every
- * allocation-failure point, the live trie must still pass cds_ft_verify.
- *
- * @nr_faults bounds the failure points to the split's OWN allocations (plus
- * the pre-descent fresh-root alloc): the build-invisible split leaves dst
- * untouched on OOM, and the descent propagates the failure so graft aborts
- * before publishing the source root.  Beyond that window, OOM falls in graft's
- * ATTACH machinery (ft_store_at_graft_point / ft_build_branch / payload
- * compression), which is not yet transaction-atomic: an attach OOM can leave
- * the split's already-published branch a non-canonical 1-child internal.  That
- * is a separate follow-up (graft transaction atomicity), out of scope for the
- * split-function conversion this test guards.
+ * compressed path, runs the build-invisible diverge split + inline payload
+ * attach (ft_split_compressed_graft_build).  The ENTIRE attach cluster — the
+ * split rearrangement AND the grafted payload — is built from fresh nodes
+ * before the source root is unlinked, so on any allocation failure both tries
+ * must still pass cds_ft_verify (the cluster is freed, nothing published,
+ * nothing rolled back).  @nr_faults sweeps the whole allocation window
+ * (fresh-root + every node in the cluster), exercising the graft transaction's
+ * atomicity end to end — not just the split's own allocations.
  */
 static int run_split_oom_graft(const char *label,
 		const uint8_t *gkey, size_t glen, int nr_faults)
@@ -14829,12 +14823,17 @@ static int run_split_oom_graft(const char *label,
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
 
+		/*
+		 * Verify BOTH tries: a failed (OOM) graft must leave the
+		 * source pristine too, not just the destination.
+		 */
 		rcu_read_lock();
-		verified = (cds_ft_verify(live, stderr) == CDS_FT_STATUS_OK);
+		verified = (cds_ft_verify(live, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(staging, stderr) == CDS_FT_STATUS_OK);
 		rcu_read_unlock();
 		if (!verified) {
 			fprintf(stderr,
-				"split_oom[%s]: live verify FAILED after fault n=%d (graft=%s)\n",
+				"split_oom[%s]: verify FAILED after fault n=%d (graft=%s)\n",
 				label, n, cds_ft_status_to_string(s));
 			rc = -1;
 			continue;	/* corrupt: abandon (leak) this iteration */
@@ -14849,6 +14848,7 @@ static int run_split_oom_graft(const char *label,
 		rcu_barrier();
 		cds_ft_destroy(live);
 		cds_ft_destroy(staging);
+		rcu_barrier();	/* flush destroy's deferred frees before the leak check */
 		cds_ft_group_destroy(group);
 	}
 	return rc;
@@ -14895,20 +14895,19 @@ static int test_split_oom_backpointer(void)
 			(const uint8_t *)"aaaaaa", 6) < 0)
 		rc = -1;
 	/*
-	 * Graft diverging inside the compressed path: ft_split_compressed_graft.
-	 * "aaaXmas" diverges at index 3 (suffix_len == 3: compressed suffix wraps
-	 * the old child); "aaaaaaX" at index 6 (suffix_len == 0: the 1-child
-	 * branch is the cluster-leaf, holding the live old child directly).
-	 *
-	 * The fault count is bounded to the split's own allocation points
-	 * (fresh-root + sfx + branch + prefix for the diverge case; fresh-root +
-	 * branch + prefix when there is no suffix node) — see run_split_oom_graft.
+	 * Graft diverging inside the compressed path: the build-invisible
+	 * diverge split + inline payload attach.  "aaaXmas" diverges at index 3
+	 * (suffix_len == 3: compressed suffix wraps the old child, payload sits
+	 * under a "mas" path); "aaaaaaX" at index 6 (suffix_len == 0: the branch
+	 * is the cluster-leaf holding the live old child, payload attaches
+	 * directly).  The fault sweep covers the WHOLE allocation window: the
+	 * graft transaction is atomic, so every OOM leaves both tries verifiable.
 	 */
 	if (run_split_oom_graft("graft-suffix>=1",
-			(const uint8_t *)"aaaXmas", 7, 4) < 0)
+			(const uint8_t *)"aaaXmas", 7, 16) < 0)
 		rc = -1;
 	if (run_split_oom_graft("graft-suffix==0",
-			(const uint8_t *)"aaaaaaX", 7, 3) < 0)
+			(const uint8_t *)"aaaaaaX", 7, 16) < 0)
 		rc = -1;
 	return rc;
 }
