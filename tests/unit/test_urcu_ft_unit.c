@@ -14854,6 +14854,118 @@ static int run_split_oom_graft(const char *label,
 	return rc;
 }
 
+/* Exact-key presence check for a NUL-terminated string key. */
+static int graft_swap_oom_has_key(struct cds_ft *ft, const char *k)
+{
+	struct cds_ft_node *out = NULL;
+	size_t len = strlen(k);
+
+	return cds_ft_eager_lookup_key(ft, (const uint8_t *) k, len, len,
+			&out) == CDS_FT_STATUS_OK;
+}
+
+/*
+ * As run_split_oom_graft, but for cds_ft_graft_swap.  A swap is two coupled
+ * clusters: (A) swap_ft's content, canonicalized, inserted at the graft point
+ * in place of the displaced dst old-child; and (B) that displaced old-child
+ * materialized as swap_ft's new root (ft_make_root_internal).  Both must be
+ * built from fresh nodes BEFORE swap_ft's root is unlinked and a grace period
+ * taken, so any allocation failure leaves BOTH tries pristine (MEMORY_ERROR,
+ * nothing published, nothing lost).
+ *
+ * @live_keys / @nr_live build the dst trie; swap_ft always holds the single
+ * key "Z" (a 1-child internal root, exercising the insert-side
+ * canonicalization).  @gkey / @glen select the graft point: an exact existing
+ * node, or a point strictly inside a compressed path (key-shorter split).
+ *
+ * The fault sweep covers the whole allocation window.  Pre-fix it exposes two
+ * hazards: (a) an insert-cluster OOM AFTER the swap unlink+sync leaves swap
+ * emptied and the dst content orphaned (DATA LOSS — caught by the key-presence
+ * check below, which structural verify alone would miss), and (b)
+ * ft_make_root_internal OOM calls abort() (SIGABRT).  Post-fix every OOM
+ * returns MEMORY_ERROR with both tries verifiable and pristine.
+ */
+static int run_split_oom_graft_swap(const char *label,
+		const char *const *live_keys, int nr_live,
+		const uint8_t *gkey, size_t glen, int nr_faults)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *live = create_varlen_ft(&group);
+		struct cds_ft *swap;
+		struct ft_test_node *zn;
+		enum cds_ft_status s;
+		int i, verified, pristine_ok = 1;
+
+		if (cds_ft_create(group, NULL, &swap) < 0) {
+			fprintf(stderr, "graft_swap_oom[%s]: swap create failed\n", label);
+			return -1;
+		}
+
+		for (i = 0; i < nr_live; i++) {
+			struct ft_test_node *nd = node_alloc((uint64_t) i);
+
+			if (cds_ft_insert(live, (const uint8_t *) live_keys[i],
+					strlen(live_keys[i]), &nd->node) < 0) {
+				node_free(nd);
+				rc = -1;
+			}
+		}
+		zn = node_alloc(1000);
+		if (cds_ft_insert(swap, (const uint8_t *) "Z", 1, &zn->node) < 0) {
+			node_free(zn);
+			rc = -1;
+		}
+
+		/* Fail the (n+1)-th allocation performed by the swap. */
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_graft_swap(live, gkey, glen, swap);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(live, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(swap, stderr) == CDS_FT_STATUS_OK);
+		/*
+		 * On OOM the swap is a no-op: live keeps every key and swap
+		 * still owns "Z".  A vanished key here is the data-loss hazard
+		 * (swap emptied, dst content orphaned) that structural verify
+		 * does not catch.  Only walk the trie when it is structurally
+		 * sound — a failed verify means the structure is corrupt and a
+		 * lookup would chase a dangling pointer.
+		 */
+		if (verified && s != CDS_FT_STATUS_OK) {
+			for (i = 0; i < nr_live; i++)
+				if (!graft_swap_oom_has_key(live, live_keys[i]))
+					pristine_ok = 0;
+			if (!graft_swap_oom_has_key(swap, "Z"))
+				pristine_ok = 0;
+		}
+		rcu_read_unlock();
+		if (!verified || !pristine_ok) {
+			fprintf(stderr,
+				"graft_swap_oom[%s]: %s after fault n=%d (graft_swap=%s)\n",
+				label,
+				!verified ? "verify FAILED" : "DATA LOST (key vanished)",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+
+		if (drain_trie(live) < 0 || drain_trie(swap) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(live);
+		cds_ft_destroy(swap);
+		rcu_barrier();	/* flush destroy's deferred frees before the leak check */
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
 /*
  * Fault-injection regression for the compressed-split create-cluster-then-
  * publish discipline.  Requires the alloc fault hook (FEATURE_FT_FAULT_INJECT).
@@ -14909,6 +15021,59 @@ static int test_split_oom_backpointer(void)
 	if (run_split_oom_graft("graft-suffix==0",
 			(const uint8_t *)"aaaaaaX", 7, 16) < 0)
 		rc = -1;
+	/*
+	 * graft_swap, key-shorter graft point: "aaX" lands strictly inside the
+	 * compressed path "aaXcdef" (cn -> internal {g, h}).  The graft point is
+	 * the prefix/suffix boundary; the displaced old-child is the compressed
+	 * suffix "cdef", so the insert side canonicalizes + chain-merges the swap
+	 * content into the prefix AND the extract side runs ft_make_root_internal
+	 * on a compressed old-child.  Pre-fix: insert-cluster OOM loses data, then
+	 * ft_make_root_internal OOM aborts.
+	 */
+	{
+		static const char *const ks_keys[] = {
+			"aaXcdefg", "aaXcdefh",
+		};
+
+		if (run_split_oom_graft_swap("graft_swap-key_shorter",
+				ks_keys, 2, (const uint8_t *)"aaX", 3, 16) < 0)
+			rc = -1;
+	}
+	/*
+	 * graft_swap, exact graft point: "aaX" reaches an existing node (the X
+	 * child of the branch under "aa"), whose subtree is the compressed
+	 * "cdef" -> internal {g, h}.  The displaced old-child is that compressed
+	 * node, so the extract side again runs ft_make_root_internal; the insert
+	 * side lands at a (non-compressed) branch slot, so no chain-merge.
+	 */
+	{
+		static const char *const ex_keys[] = {
+			"aaXcdefg", "aaXcdefh", "aaWxyz",
+		};
+
+		if (run_split_oom_graft_swap("graft_swap-exact",
+				ex_keys, 3, (const uint8_t *)"aaX", 3, 16) < 0)
+			rc = -1;
+	}
+	/*
+	 * graft_swap, exact graft point UNDER a compressed parent: "aaX" reaches
+	 * the multi-child internal {p, q} whose parent is the compressed node
+	 * "aaX".  With a 1-child swap content ("Z" canonicalizes to a compressed),
+	 * the insert side fuses the compressed parent with the compressed swap
+	 * content into one node (the build-invisible merged_cn path under
+	 * SKIP_COMPRESSED) -- a fallible allocation that, pre-fix, ran after the
+	 * swap unlink+sync and lost data on OOM.  Under non-SC / nocompress this
+	 * degrades to a plain replace (still a valid scenario).
+	 */
+	{
+		static const char *const merge_keys[] = {
+			"aaXp", "aaXq",
+		};
+
+		if (run_split_oom_graft_swap("graft_swap-exact-merge",
+				merge_keys, 2, (const uint8_t *)"aaX", 3, 16) < 0)
+			rc = -1;
+	}
 	return rc;
 }
 #endif /* FEATURE_FT_FAULT_INJECT */
