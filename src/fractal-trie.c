@@ -287,8 +287,13 @@ const struct cds_ft_type ft_types[] = {
 		.max_child = ft_type_4_max_child, .order = 9 },
 
 	/*
-	 * Upon node removal below min_child, if a popcount_1l node would
-	 * otherwise be filled beyond capacity, we roll back to pigeon.
+	 * Pigeon shrinks to the popcount_1l type directly below it once a
+	 * removal brings it down to min_child.  That target's max_child is
+	 * >= pigeon's min_child, and popcount_1l capacity is purely
+	 * count-bound (its 256-bit bitmap addresses any byte value, and the
+	 * pointer table is sized to max_child), so the shrink target always
+	 * has room regardless of key distribution: the recompaction cannot
+	 * fail for capacity and never rolls back to pigeon.
 	 */
 	[5] = { .type_class = FT_PIGEON,
 		.min_child = 51,
@@ -376,8 +381,13 @@ const struct cds_ft_type ft_types[] = {
 		.order = 10, .bitmap = FT_NO_BITMAP },
 
 	/*
-	 * Upon node removal below min_child, if a popcount_1l node would
-	 * otherwise be filled beyond capacity, we roll back to pigeon.
+	 * Pigeon shrinks to the popcount_1l type directly below it once a
+	 * removal brings it down to min_child.  That target's max_child is
+	 * >= pigeon's min_child, and popcount_1l capacity is purely
+	 * count-bound (its 256-bit bitmap addresses any byte value, and the
+	 * pointer table is sized to max_child), so the shrink target always
+	 * has room regardless of key distribution: the recompaction cannot
+	 * fail for capacity and never rolls back to pigeon.
 	 */
 	[6] = { .type_class = FT_PIGEON, .min_child = 95, .max_child = ft_type_6_max_child, .order = 11, .bitmap = FT_BITMAP },
 
