@@ -12587,13 +12587,18 @@ ft_make_root_internal(struct cds_ft *ft,
  *                       unchanged.
  *
  * Returns the converted compressed/skip-encoded flag on success.
- * Returns @child unchanged when conversion isn't applicable:
+ * Returns @child unchanged when conversion isn't applicable (and the
+ * unchanged @child is itself canonical at the target position):
  *   - skip-compressed mode is disabled,
  *   - @child is not an internal node,
  *   - @child has more than one child,
  *   - @child has external_nodes attached,
- *   - chain-merge length would overflow FT_SKIP_LEN_MAX,
- *   - allocation failure.
+ *   - chain-merge length would overflow FT_SKIP_LEN_MAX.
+ * Returns (void *)(long)-ENOMEM on allocation failure: conversion WAS
+ * required (a non-root 1-child internal) but could not be done, so the
+ * caller must NOT publish @child non-canonically -- it must fail the
+ * mutation.  @child is left untouched in that case (nothing freed), so
+ * the caller can still roll it back.
  *
  * On successful conversion the old internal is freed.  Write-side
  * only (mutex held); the caller is the sole owner of @child.
@@ -12682,7 +12687,7 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 
 	cn = alloc_compressed_node(ft, cn_len, &cn_meta);
 	if (!cn)
-		return child;
+		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
 	cn->len = (uint8_t) cn_len;
 	cn->key_bytes[0] = byte;
 	if (single_cn) {
@@ -12760,6 +12765,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		graft_payload = ft_compress_single_child_if_needed(ft,
 			graft_payload);
+		if (graft_payload == (struct cds_ft_inode_flag *) (long) -ENOMEM)
+			return CDS_FT_STATUS_MEMORY_ERROR;
 
 		pmeta = cds_ft_item_to_metadata(ft_node_ptr(d->pnf));
 
@@ -12788,6 +12795,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		graft_payload = ft_compress_single_child_if_needed(ft,
 			graft_payload);
+		if (graft_payload == (struct cds_ft_inode_flag *) (long) -ENOMEM)
+			return CDS_FT_STATUS_MEMORY_ERROR;
 
 		branch = ft_build_branch(ft, key, i, key_len, graft_payload,
 				graft_external_count, displaced != NULL);
@@ -13338,6 +13347,20 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			old_swap_root =
 				ft_compress_single_child_if_needed(dst_ft,
 					old_swap_root);
+			if (old_swap_root ==
+			    (struct cds_ft_inode_flag *) (long) -ENOMEM) {
+				/*
+				 * Canonicalization of the swap payload could not
+				 * allocate.  Consistent with the merged_cn OOM
+				 * path just below: fail rather than publish a
+				 * non-canonical 1-child internal at the non-root
+				 * slot.  (graft_swap's broader past-sync rollback
+				 * is a separate, pre-existing concern.)
+				 */
+				FT_TP(graft_swap_exit,
+					(int) CDS_FT_STATUS_MEMORY_ERROR);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			{
 				struct cds_ft_compressed_node *parent_cn = NULL;
