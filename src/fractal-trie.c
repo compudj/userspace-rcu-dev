@@ -5259,6 +5259,13 @@ unsigned int find_nearest_type_index(unsigned int type_index,
 /*
  * ft_node_recompact_add: recompact a node, adding a new child.
  * Return 0 on success or negative error value on error.
+ *
+ * @cluster_leaf: when true, the target node sits at the lower boundary of an
+ * as-yet-unpublished cluster (a cluster-leaf): its children point at live
+ * nodes from the old structure, and the mutator wires every one of those
+ * back-pointers itself at publish time.  Children are still copied into the
+ * new node's slots, but the re-parent loop is skipped entirely.  See
+ * ft_node_set_nth and the rcu-mutation build-invisible pattern.
  */
 static
 int ft_node_recompact(enum ft_recompact mode,
@@ -5272,7 +5279,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		struct cds_ft_inode_flag **nullify_node_flag_ptr,
 		struct cds_ft_inode **old_node_ret,
 		bool is_root,
-		unsigned int node_depth __attribute__((unused)))
+		unsigned int node_depth __attribute__((unused)),
+		bool cluster_leaf)
 {
 	unsigned int new_type_index;
 	struct cds_ft_inode *new_node;
@@ -5506,8 +5514,14 @@ skip_copy:
 	 * children) still reference the old node, which will be
 	 * freed after a grace period.  ft_set_parent updates both
 	 * parent and skip_slot in one call.
+	 *
+	 * Skip this entirely for a cluster-leaf node: it sits at the
+	 * lower boundary of an as-yet-unpublished cluster, its children
+	 * point at live nodes, and the mutator wires every one of those
+	 * back-pointers itself at publish time.  Re-parenting any of them
+	 * here would expose the unpublished cluster from below.
 	 */
-	{
+	if (!cluster_leaf) {
 		switch (new_type->type_class) {
 		case FT_POPCOUNT:
 		{
@@ -5568,6 +5582,18 @@ end:
 
 /*
  * Return 0 on success or negative error value on error.
+ *
+ * @cluster_leaf: when true, the target node is a cluster-leaf — the lower
+ * boundary of an as-yet-unpublished cluster (rcu-mutation build-invisible
+ * pattern).  Its children are live nodes also still reachable through the old
+ * structure, so writing their back-pointers to this unpublished node would
+ * expose the cluster from below and, on a later allocation failure, leave a
+ * dangling back-pointer.  The forward slot is still set, but NO child's
+ * back-pointer is written here (neither in-place nor through recompaction);
+ * the mutator wires every child of the node itself at publish time, using the
+ * final node flag it tracks across recompactions.  Callers building such a
+ * node must pass true for ALL of its set_nth calls (no per-child exception).
+ * false for the ordinary published-node case.
  */
 static
 int ft_node_set_nth(struct cds_ft *ft,
@@ -5575,7 +5601,8 @@ int ft_node_set_nth(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child_node_flag,
 		struct cds_ft_inode **old_node_ret,
 		struct cds_ft_metadata *metadata,
-		unsigned int node_depth)
+		unsigned int node_depth,
+		bool cluster_leaf)
 {
 	int ret;
 	unsigned int type_index;
@@ -5615,6 +5642,8 @@ int ft_node_set_nth(struct cds_ft *ft,
 		 */
 		struct cds_ft_inode_flag **slot_ptr = NULL;
 
+		if (cluster_leaf)
+			break;	/* child back-pointers set by mutator at publish */
 		if (ft_node_skip_compressed(child_node_flag) ||
 		    ft_node_compressed(child_node_flag))
 			ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
@@ -5625,13 +5654,13 @@ int ft_node_set_nth(struct cds_ft *ft,
 		/* Not enough space in node, need to recompact to next type. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					old_node_ret, false, node_depth);
+					old_node_ret, false, node_depth, cluster_leaf);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					old_node_ret, false, node_depth);
+					old_node_ret, false, node_depth, cluster_leaf);
 		break;
 	}
 	if (ret == 0)
@@ -5673,7 +5702,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		/* Should try recompaction. */
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
-				node_flag_ptr, old_node_ret, is_root, node_depth);
+				node_flag_ptr, old_node_ret, is_root, node_depth,
+				false);
 	}
 	if (ret == 0)
 		FT_TP(tree_edge_set, (const void *) ft,
@@ -8480,7 +8510,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 		/* First child: old direction. */
 		ret = ft_node_set_nth(ft, &dest, old_ordinal, old_suffix_flag, NULL, NULL,
-				junction_depth);
+				junction_depth, false);
 		if (ret) goto error;
 		created[nr_created++] = dest;
 		branch_flag = dest;
@@ -8491,7 +8521,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 			branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 			ret = ft_node_set_nth(ft, &dest, new_ordinal, new_branch_flag,
-					&old_recompacted, branch_meta, junction_depth);
+					&old_recompacted, branch_meta, junction_depth, false);
 			if (ret) goto error;
 			if (old_recompacted) {
 				free_cds_ft_node(ft, old_recompacted);
@@ -8578,7 +8608,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 			struct cds_ft_metadata *int_meta;
 
 			ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-					pfx_child, NULL, NULL, node_depth);
+					pfx_child, NULL, NULL, node_depth, false);
 			if (ret) goto error;
 			int_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 			ft_nr_keys_store(int_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
@@ -8618,7 +8648,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		struct cds_ft_metadata *pfx_meta;
 
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				branch_flag, NULL, NULL, node_depth);
+				branch_flag, NULL, NULL, node_depth, false);
 		if (ret) goto error;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
@@ -8772,7 +8802,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining + 1],
 			cn->child, NULL, NULL,
-			node_depth + remaining + 1);
+			node_depth + remaining + 1, false);
 		if (ret) goto error;
 		{
 			struct cds_ft_metadata *m =
@@ -8794,7 +8824,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining],
 			suffix_flag, NULL, NULL,
-			node_depth + remaining);
+			node_depth + remaining, false);
 		if (ret) goto error;
 		jct_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(jct_meta, child_nr_keys,
@@ -8850,7 +8880,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			struct cds_ft_metadata *int_meta;
 
 			ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				pfx_child, NULL, NULL, node_depth);
+				pfx_child, NULL, NULL, node_depth, false);
 			if (ret) goto error;
 			int_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 			ft_nr_keys_store(int_meta, ft_nr_keys_get(cn_meta),
@@ -8890,7 +8920,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			struct cds_ft_metadata *pfx_meta;
 
 			ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				jct_flag, NULL, NULL, node_depth);
+				jct_flag, NULL, NULL, node_depth, false);
 			if (ret) goto error;
 			pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
@@ -9152,7 +9182,7 @@ int ft_attach_node(struct cds_ft *ft,
 					i, (unsigned int) key_value);
 			iter_dest_node_flag = NULL;
 			ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag, NULL, NULL,
-					i - 1);
+					i - 1, false);
 			if (ret) {
 				dbg_printf("branch creation error %d\n", ret);
 				goto check_error;
@@ -9187,7 +9217,7 @@ int ft_attach_node(struct cds_ft *ft,
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
 		ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, iter_node_flag,
-				&old_recompacted_node, metadata, level - 1);
+				&old_recompacted_node, metadata, level - 1, false);
 		if (ret) {
 			dbg_printf("branch publish error %d\n", ret);
 			goto check_error;
@@ -9368,7 +9398,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		if (!inner)
 			return -ENOMEM;
 		ret = ft_node_set_nth(ft, &dest, key[br_start],
-			inner, NULL, NULL, br_start);
+			inner, NULL, NULL, br_start, false);
 		if (ret)
 			return -ENOMEM;
 		branch = dest;
@@ -11510,7 +11540,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		ret = ft_node_set_nth(ft, &dest,
 				cn->key_bytes[diverge_pos + 1],
 				cn->child, NULL, NULL,
-				d->depth + diverge_pos + 1);
+				d->depth + diverge_pos + 1, false);
 		if (ret) goto error;
 		{
 			struct cds_ft_metadata *m =
@@ -11531,7 +11561,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 
 		ret = ft_node_set_nth(ft, &dest, old_ordinal,
 				old_suffix_flag, NULL, NULL,
-				d->depth + diverge_pos);
+				d->depth + diverge_pos, false);
 		if (ret) goto error;
 		created[nr_created++] = dest;
 		branch_flag = dest;
@@ -11583,7 +11613,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 			created[nr_created++] = pfx_child;
 		}
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				pfx_child, NULL, NULL, d->depth);
+				pfx_child, NULL, NULL, d->depth, false);
 		if (ret) goto error;
 		int_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(int_meta, ft_nr_keys_get(cn_meta),
@@ -11623,7 +11653,7 @@ int ft_split_compressed_graft(struct cds_ft *ft,
 		struct cds_ft_metadata *pfx_meta;
 
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				branch_flag, NULL, NULL, d->depth);
+				branch_flag, NULL, NULL, d->depth, false);
 		if (ret) goto error;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
@@ -11874,7 +11904,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining],
 			cn->child, NULL, NULL,
-			d->depth + remaining);
+			d->depth + remaining, false);
 		if (ret) return -1;
 		{
 			struct cds_ft_metadata *m =
@@ -11940,7 +11970,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 			pfx_child = ft_publish_compressed(ft, pfx, pfx_child);
 		}
 		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				pfx_child, NULL, NULL, d->depth);
+				pfx_child, NULL, NULL, d->depth, false);
 		if (ret) {
 			if (prefix_len >= 3 && ft_node_compressed(pfx_child))
 				free_compressed_node_unpublished(ft,
@@ -12017,7 +12047,7 @@ int ft_split_compressed_graft_key_shorter(struct cds_ft *ft,
 			int ret;
 
 			ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				suffix_flag, NULL, NULL, d->depth);
+				suffix_flag, NULL, NULL, d->depth, false);
 			if (ret) {
 				if (ft_node_compressed(suffix_flag))
 					free_compressed_node_unpublished(ft,
@@ -12126,7 +12156,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		int ret;
 
 		ret = ft_node_set_nth(ft, &dest, key[i], cur,
-			NULL, NULL, i);
+			NULL, NULL, i, false);
 		if (ret) {
 			/*
 			 * Free the created internal chain and, if
@@ -12293,7 +12323,7 @@ ft_make_root_internal(struct cds_ft *ft,
 	}
 	dest = ft_node_flag(root_node, 0);
 	ret = ft_node_set_nth(ft, &dest, first_byte, slot_value,
-			NULL, root_meta, 0);
+			NULL, root_meta, 0, false);
 	if (ret) {
 		if (new_cn)
 			free_compressed_node(ft, new_cn);
@@ -12505,7 +12535,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		ret = ft_node_set_nth(ft, &dest,
 			key[key_len - 1],
 			graft_payload, &old_recompacted_node, pmeta,
-			d->depth - 1);
+			d->depth - 1, false);
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -12560,7 +12590,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 			ret = ft_node_set_nth(ft, &dest,
 				key[i - 1],
 				branch, &old_recompacted_node, pmeta,
-				d->depth - 1);
+				d->depth - 1, false);
 			if (ret) {
 				ft_free_branch(ft, key, i, key_len, branch);
 				return CDS_FT_STATUS_MEMORY_ERROR;
@@ -16593,7 +16623,8 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 
 	(void) ft_node_recompact(FT_RECOMPACT_RELOCATE, ft, type_index,
 			&ft_types[type_index], node, meta, holder,
-			0, NULL, NULL, &old_ret, holder == &ft->root, 0);
+			0, NULL, NULL, &old_ret, holder == &ft->root, 0,
+			false);
 	/*
 	 * The old node was just unpublished; concurrent readers may still
 	 * hold it, so free it after a grace period.  Its range's nr_live
