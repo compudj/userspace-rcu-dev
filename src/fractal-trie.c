@@ -8425,14 +8425,25 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	unsigned long old_child_nr_keys;
 	int ret;
 	/*
-	 * Two-phase publish (suffix_len >= 1): build the cluster invisibly,
-	 * then re-parent the live old child (cn->child) into the new suffix
-	 * and swing the parent slot, at the end.  See the rcu-mutation pattern.
+	 * Two-phase publish: build the cluster invisibly, then wire the
+	 * deferred back-pointers and swing the parent slot, at the end.
+	 * See the rcu-mutation build-invisible pattern.
+	 *
+	 * suffix_len >= 1: the branch's children (suffix, new) are new cluster
+	 * nodes — set their back-pointers normally; only the live old child
+	 * into the new suffix (cn->child -> sfx) is deferred (deferred edge 1).
+	 * suffix_len == 0: the branch is a cluster-leaf (old direction is the
+	 * live cn->child, new direction the new subtree); set_nth defers BOTH
+	 * its children, wired here at publish to the final branch_flag (deferred
+	 * edges 1 and 2).
 	 */
 	struct cds_ft_inode_flag *sfx_skip_flag = NULL;
 	struct cds_ft_inode_flag *deferred_child = NULL;
 	struct cds_ft_inode_flag *deferred_parent = NULL;
 	struct cds_ft_inode_flag **deferred_slot = NULL;
+	struct cds_ft_inode_flag *deferred_child2 = NULL;
+	struct cds_ft_inode_flag **deferred_slot2 = NULL;
+	bool branch_cluster_leaf = (suffix_len == 0);
 
 	unsigned int junction_depth = node_depth + diverge_pos;
 
@@ -8510,7 +8521,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 		/* First child: old direction. */
 		ret = ft_node_set_nth(ft, &dest, old_ordinal, old_suffix_flag, NULL, NULL,
-				junction_depth, false);
+				junction_depth, branch_cluster_leaf);
 		if (ret) goto error;
 		created[nr_created++] = dest;
 		branch_flag = dest;
@@ -8521,7 +8532,8 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 			branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 			ret = ft_node_set_nth(ft, &dest, new_ordinal, new_branch_flag,
-					&old_recompacted, branch_meta, junction_depth, false);
+					&old_recompacted, branch_meta, junction_depth,
+					branch_cluster_leaf);
 			if (ret) goto error;
 			if (old_recompacted) {
 				free_cds_ft_node(ft, old_recompacted);
@@ -8550,6 +8562,23 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 					FT_PF_NONE);
 			if (oslot)
 				rcu_assign_pointer(*oslot, sfx_skip_flag);
+		}
+
+		/*
+		 * suffix_len == 0: the branch is a cluster-leaf, so set_nth left
+		 * both of its children unparented.  Record both deferred edges
+		 * (old = live cn->child, new = the new subtree) against the now-
+		 * final branch_flag; phase 2 wires them.  The forward slots are
+		 * already correct (value-copied by set_nth / recompaction).
+		 */
+		if (branch_cluster_leaf) {
+			ft_node_get_nth_skip(branch_flag, &deferred_slot,
+					old_ordinal, FT_PF_NONE);
+			ft_node_get_nth_skip(branch_flag, &deferred_slot2,
+					new_ordinal, FT_PF_NONE);
+			deferred_child = cn->child;
+			deferred_parent = branch_flag;
+			deferred_child2 = new_branch_flag;
 		}
 	}
 
@@ -8686,14 +8715,21 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		(uint8_t) iter_key[-1],
 		(const void *) top_flag);
 	/*
-	 * Phase 2 (publish) — no failures past here.  First re-parent the live
-	 * old child into the new suffix (bottom publish: the branch's skip slot
-	 * now resolves to sfx); then swing the parent's forward slot to the new
-	 * cluster (top publish).  Ordered so an up-walk from cn->child enters
-	 * the new cluster before the cluster becomes forward-reachable.
+	 * Phase 2 (publish) — no failures past here.  First wire the deferred
+	 * back-pointers (bottom publish), then swing the parent's forward slot
+	 * to the new cluster (top publish).  Ordered so an up-walk from a
+	 * deferred child enters the new cluster before it becomes
+	 * forward-reachable.
+	 *
+	 * suffix_len >= 1: edge 1 is the live old child into the new suffix
+	 * (cn->child -> sfx).  suffix_len == 0: edges 1 and 2 are the cluster-
+	 * leaf branch's two children (old = live cn->child, new = new subtree),
+	 * both -> branch_flag.
 	 */
 	if (deferred_child)
 		ft_set_parent(deferred_child, deferred_parent, deferred_slot);
+	if (deferred_child2)
+		ft_set_parent(deferred_child2, deferred_parent, deferred_slot2);
 	ft_publish_to_parent(ft, cn_meta->parent, parent_slot, top_flag);
 
 	/* 7. Free the old compressed node. */

@@ -14711,17 +14711,23 @@ out:
 extern long cds_ft_fault_alloc_countdown;
 
 /*
- * Fault-injection regression for the compressed-split create-cluster-then-
- * publish discipline.  Drives ft_split_compressed_insert through each of its
- * allocation-failure points while a compressed node is live, and asserts the
- * trie stays structurally consistent after every failed split (cds_ft_verify
- * checks each node's parent back-pointer).  Catches the bug where the split
- * publishes cn->child's back-pointer mid-build and, on a later OOM, frees the
- * transiently-observable new node without restoring it: the back-pointer must
- * not be written until the failure-free commit tail.  Requires the alloc
- * fault hook (FEATURE_FT_FAULT_INJECT).
+ * Drive a compressed-split insert through each of its allocation-failure
+ * points while a compressed node is live, and assert the trie stays
+ * structurally consistent after every failed split (cds_ft_verify checks
+ * each node's parent back-pointer).  Catches the bug where the split
+ * publishes a live node's back-pointer mid-build and, on a later OOM, frees
+ * the transiently-observable new node without restoring it: no back-pointer
+ * into the cluster may be written until the failure-free commit tail.
+ *
+ * The base trie is compressed("aaaaaaa") -> internal {a, b}.  @dkey selects
+ * which split path the insert exercises:
+ *   - diverge inside the path (suffix_len >= 1): a new suffix node wraps the
+ *     old child; the cluster-leaf is that suffix node.
+ *   - diverge at the last path byte (suffix_len == 0): the branch itself is
+ *     the cluster-leaf (its old direction points straight at the live child).
  */
-static int test_split_oom_backpointer(void)
+static int run_split_oom_insert(const char *label,
+		const uint8_t *dkey, size_t dlen)
 {
 	int n, rc = 0;
 
@@ -14737,14 +14743,13 @@ static int test_split_oom_backpointer(void)
 		/* Build compressed("aaaaaaa") -> internal child {a, b}. */
 		if (cds_ft_insert(ft, (const uint8_t *)"aaaaaaaa", 8, &a->node) < 0 ||
 		    cds_ft_insert(ft, (const uint8_t *)"aaaaaaab", 8, &b->node) < 0) {
-			fprintf(stderr, "split_oom: build failed\n");
+			fprintf(stderr, "split_oom[%s]: build failed\n", label);
 			rc = -1;
 		}
 
-		/* Diverge inside the compressed path (suffix_len >= 1), failing
-		 * the (n+1)-th allocation performed by the split. */
+		/* Fail the (n+1)-th allocation performed by the split. */
 		cds_ft_fault_alloc_countdown = n;
-		s = cds_ft_insert(ft, (const uint8_t *)"aaaXaaaa", 8, &c->node);
+		s = cds_ft_insert(ft, dkey, dlen, &c->node);
 		cds_ft_fault_alloc_countdown = -1;
 
 		rcu_read_lock();
@@ -14752,8 +14757,8 @@ static int test_split_oom_backpointer(void)
 		rcu_read_unlock();
 		if (!verified) {
 			fprintf(stderr,
-				"split_oom: verify FAILED after fault n=%d (insert=%s)\n",
-				n, cds_ft_status_to_string(s));
+				"split_oom[%s]: verify FAILED after fault n=%d (insert=%s)\n",
+				label, n, cds_ft_status_to_string(s));
 			rc = -1;
 			/*
 			 * The trie is corrupt; draining it would follow the
@@ -14768,6 +14773,29 @@ static int test_split_oom_backpointer(void)
 		if (drain_and_destroy(ft, group) < 0)
 			rc = -1;
 	}
+	return rc;
+}
+
+/*
+ * Fault-injection regression for the compressed-split create-cluster-then-
+ * publish discipline.  Requires the alloc fault hook (FEATURE_FT_FAULT_INJECT).
+ */
+static int test_split_oom_backpointer(void)
+{
+	int rc = 0;
+
+	/* Diverge inside the compressed path: suffix_len >= 1. */
+	if (run_split_oom_insert("insert-suffix>=1",
+			(const uint8_t *)"aaaXaaaa", 8) < 0)
+		rc = -1;
+	/*
+	 * Diverge at the last path byte ('a' at index 6 of "aaaaaaa" vs 'X'):
+	 * suffix_len == 0, so the branch is the cluster-leaf with the live old
+	 * child on its old direction and a fresh "mas" -> leaf on the new one.
+	 */
+	if (run_split_oom_insert("insert-suffix==0",
+			(const uint8_t *)"aaaaaaXmas", 10) < 0)
+		rc = -1;
 	return rc;
 }
 #endif /* FEATURE_FT_FAULT_INJECT */
