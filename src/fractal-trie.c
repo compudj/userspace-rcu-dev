@@ -1748,6 +1748,96 @@ struct cds_ft_compressed_node *ft_skip_to_compressed_validate(
 }
 
 /*
+ * ft_skip_reanchor: the single concurrency-handling mechanism for skip-
+ * compressed pointers, used when ft_skip_to_compressed_validate reports a
+ * mismatch (the slot's encoded skip_len no longer matches the live compressed
+ * node recovered via the skip child's back-pointer).
+ *
+ * Spinning to re-read the slot does NOT converge when the slot lives on a node
+ * that was recompacted away (frozen-stale) while the skip child was reparented
+ * to a different-length compressed by a concurrent split/merge: the frozen
+ * slot is never republished, so the reader would loop forever.  The skip child
+ * @G, however, is reachable in the LIVE trie (a live leaf or live internal), so
+ * its parent chain runs through live nodes that converge.  Walk it up,
+ * accumulating consumed path length (a compressed spans its len, an internal
+ * one byte), until the accumulated length reaches the slot's skip_len: that
+ * locates the live tree position the failing slot encoded.
+ *
+ *   - split (live path lengthened into prefix+branch+suffix at the same total
+ *     length): the accumulation lands exactly, @*rewind == 0; re-anchor at the
+ *     live node at the same depth.
+ *   - merge (live path shortened by absorbing the slot's level into a longer
+ *     compressed): the first hop already exceeds skip_len; the encoded position
+ *     is now interior to that compressed.  Re-anchor shallower (its parent) and
+ *     have the caller rewind its descent cursor by @*rewind bytes.
+ *
+ * @skip_ptr: the failing skip pointer (encodes child @G + skip_len).
+ * @rewind:   out — bytes the caller must back its descent cursor/level up by.
+ * @at_pos:   out (may be NULL) — the live node spanning/at the encoded position
+ *            (the merge target for rewind > 0).  Accumulator walkers (nth /
+ *            iter_skip) descend INTO it on rewind > 0, because re-scanning the
+ *            shallower holder would re-count its already-counted contributions.
+ *            Idempotent walkers (inequality minmax/sibling) and the precise
+ *            lookup ignore it and just re-scan / re-read the returned holder.
+ *
+ * Returns the live node holding the slot equivalent to the failing one (the
+ * caller re-anchors its descent there and re-reads / re-descends), or NULL when
+ * @G has been detached or the position is above the root — the caller then
+ * re-descends from ft->root (or terminates NOT_FOUND, per its semantics).
+ *
+ * Read-side only (rcu_dereference on every back-pointer); the caller must be in
+ * an RCU read-side critical section.
+ */
+static
+struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft_inode_flag *skip_ptr,
+		unsigned int *rewind, struct cds_ft_inode_flag **at_pos)
+{
+	unsigned int want = ft_skip_len(skip_ptr);
+	unsigned int acc = 0;
+	struct cds_ft_inode_flag *cur = ft_skip_child_ptr(skip_ptr);	/* G */
+	int guard;
+
+	*rewind = 0;
+	if (at_pos)
+		*at_pos = NULL;
+	for (guard = 0; guard < (int) FT_MAX_DEPTH + 2; guard++) {
+		struct cds_ft_inode_flag *parent;
+		void *pitem;
+
+		if (ft_node_external(cur))
+			parent = rcu_dereference(((struct cds_ft_node *) cur)->prev);
+		else
+			parent = rcu_dereference(cds_ft_item_to_metadata(
+				ft_node_ptr(cur))->parent);
+		if (!parent)
+			return NULL;		/* detached / above root */
+		pitem = ft_node_compressed(parent) ?
+			(void *) ft_compressed_node_ptr(parent) :
+			(void *) ft_node_ptr(parent);
+		acc += ft_node_compressed(parent) ?
+			ft_compressed_node_ptr(parent)->len : 1U;
+		if (acc >= want) {
+			/*
+			 * @parent is the node spanning (rewind > 0, a merge) or
+			 * sitting at (rewind == 0) the failing slot's encoded
+			 * position.  Return the node HOLDING the slot (its parent,
+			 * = the scanned node's live version for rewind == 0); also
+			 * hand back @parent itself via @at_pos so accumulator
+			 * walkers can descend INTO it for rewind > 0 (where
+			 * re-scanning the shallower holder would double-count).
+			 */
+			*rewind = acc - want;
+			if (at_pos)
+				*at_pos = parent;
+			return rcu_dereference(cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) pitem)->parent);
+		}
+		cur = parent;
+	}
+	return NULL;	/* pathological (cycle?): caller re-descends from root */
+}
+
+/*
  * ft_get_parent_rcu: read the parent pointer of @node via
  * rcu_dereference.
  *
@@ -4544,11 +4634,14 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 
 /*
  * @validate_lookup: when true, validate the skip-compressed resolution
- * against the slot's skip_len and retry on mismatch.  RCU readers
- * must pass true; writers must pass false (a writer mid-mutation
- * reading its own in-flight state would loop forever — the writer
- * IS the race partner).  With static inlining and a constant arg,
- * the unused branch is DCE'd at each call site.
+ * against the slot's skip_len.  On mismatch the RAW (still skip-compressed)
+ * pointer is returned as a re-anchor signal; the reader-level caller resolves
+ * it via ft_skip_reanchor (a validated result is never skip-compressed, so the
+ * signal is unambiguous).  RCU readers must pass true and MUST handle the
+ * skip-compressed return.  Writers must pass false (no validation: a writer
+ * reads its own in-flight state and is the race partner, not a victim of it).
+ * With static inlining and a constant arg, the unused branch is DCE'd at each
+ * call site.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_flag,
@@ -4572,34 +4665,41 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	type_index = ft_node_type(node_flag);
 	type = &ft_types[type_index];
 
-	for (;;) {
-		switch (type->type_class) {
-		case FT_POPCOUNT:
-			child = ft_popcount_node_get_direction(type, node, n, result_key, dir);
-			break;
-		case FT_PIGEON:
-			child = ft_pigeon_node_get_direction(type, node, n, result_key, dir);
-			break;
-		default:
-			assert(0);
-			return (void *) -1UL;
-		}
-		if (!validate_lookup)
-			return ft_resolve_skip_compressed(child);
-		if (!child || !ft_node_skip_compressed(child))
-			return child;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-		{
-			struct cds_ft_compressed_node *cn =
-				ft_skip_to_compressed_validate(child);
-			if (caa_likely(cn != NULL))
-				return ft_compressed_node_flag(cn);
-		}
-		caa_cpu_relax();
-#else
-		return child;
-#endif
+	switch (type->type_class) {
+	case FT_POPCOUNT:
+		child = ft_popcount_node_get_direction(type, node, n, result_key, dir);
+		break;
+	case FT_PIGEON:
+		child = ft_pigeon_node_get_direction(type, node, n, result_key, dir);
+		break;
+	default:
+		assert(0);
+		return (void *) -1UL;
 	}
+	if (!validate_lookup)
+		return ft_resolve_skip_compressed(child);
+	if (!child || !ft_node_skip_compressed(child))
+		return child;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	{
+		struct cds_ft_compressed_node *cn =
+			ft_skip_to_compressed_validate(child);
+		if (caa_likely(cn != NULL))
+			return ft_compressed_node_flag(cn);
+	}
+	/*
+	 * Validation failed: the slot is inconsistent with the live compressed
+	 * node — our @node was recompacted away (frozen-stale) while the skip
+	 * child was reparented by a concurrent split/merge.  Return the RAW skip
+	 * pointer as a re-anchor signal: it is still skip-compressed, which a
+	 * validated result never is, so the reader-level caller detects it and
+	 * resolves via ft_skip_reanchor (the single skip concurrency mechanism)
+	 * instead of us spinning here on a slot that may never republish.
+	 */
+	return child;
+#else
+	return child;
+#endif
 }
 
 static inline_lookup
@@ -6077,7 +6177,15 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	 * Skip-encoded root is not currently produced by any mutator
 	 * path, but resolve it defensively for completeness — cost is
 	 * one shr+jne, DCE'd when skip_compressed compile-time false.
+	 *
+	 * @reanchor_root is re-entered by the skip re-anchor fallback below
+	 * (ft_skip_reanchor returned NULL: the skip child was detached or its
+	 * position is above the root) with @node_flag reset to ft->root and the
+	 * cursor rewound to the start — a full live re-descent.
 	 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+reanchor_root:
+#endif
 	if (skip_compressed &&
 	    caa_unlikely(ft_node_skip_compressed(node_flag))) {
 		if (!descend_cand) {
@@ -6132,6 +6240,9 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		}
 	}
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+descend_loop:
+#endif
 	while (key < key_end) {
 		uint8_t iter_key;
 
@@ -6170,58 +6281,79 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 			 * time literal folds the SUB into the body load's
 			 * displacement.
 			 *
-			 * Retry loop guards the precise-descent skip-encoded
-			 * resolution: a concurrent writer mid-split/merge
-			 * may have updated the child's back-pointer chain in
-			 * place but not yet republished the slot, so
-			 * ft_skip_to_compressed_validate can return NULL.
-			 * On NULL we re-read the slot via the pretyped
-			 * scanner (the writer will eventually republish; the
-			 * second read either gets the new value or a still-
-			 * stale value that matches a stable cn).  Candidate
-			 * descent doesn't need the cn — it advances via
-			 * ft_skip_child_ptr — so the retry loop only spins
-			 * in the !descend_cand branch.
+			 * Precise-descent skip-encoded resolution: validate the
+			 * skip slot against the live compressed node.  On a
+			 * mismatch (a concurrent writer split/merge reparented the
+			 * skip child, possibly while @parent_node_flag was
+			 * recompacted away) re-anchor on the live structure via
+			 * ft_skip_reanchor instead of spinning — a frozen slot may
+			 * never republish.  Candidate descent doesn't need the cn
+			 * (it advances via ft_skip_child_ptr below), so only the
+			 * !descend_cand branch resolves/re-anchors here.
 			 */
 			struct cds_ft_inode_flag *parent_node_flag = node_flag;
 			unsigned long _raw = (unsigned long) parent_node_flag;
 			unsigned int _type =
 				(unsigned int) ((_raw >> FT_INTERNAL_BITS) & 0x7);
 
-			for (;;) {
-				node_flag = ft_node_get_nth_skip_pretyped(parent_node_flag,
-						_type, NULL, iter_key, FT_PF_DATA);
-				if (!node_flag) {
-					status = CDS_FT_STATUS_NOT_FOUND;
-					goto end;
-				}
-				if (!skip_compressed
-				    || caa_likely(!ft_node_skip_compressed(node_flag)))
-					break;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-				if (!descend_cand) {
-					struct cds_ft_compressed_node *cn =
-						ft_skip_to_compressed_validate(node_flag);
-					if (caa_likely(cn != NULL)) {
-						node_flag = ft_compressed_node_flag(cn);
-						break;
-					}
-					/* validation failed: writer mid-mutation, retry */
-					caa_cpu_relax();
-					continue;
-				}
-#endif
-				/* candidate mode: skip-advance handled below */
-				break;
+			node_flag = ft_node_get_nth_skip_pretyped(parent_node_flag,
+					_type, NULL, iter_key, FT_PF_DATA);
+			if (!node_flag) {
+				status = CDS_FT_STATUS_NOT_FOUND;
+				goto end;
 			}
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			if (skip_compressed && !descend_cand
+			    && caa_unlikely(ft_node_skip_compressed(node_flag))) {
+				struct cds_ft_compressed_node *cn =
+					ft_skip_to_compressed_validate(node_flag);
+
+				if (caa_likely(cn != NULL)) {
+					node_flag = ft_compressed_node_flag(cn);
+				} else {
+					/*
+					 * Slot inconsistent with the live compressed node:
+					 * @parent_node_flag was recompacted away while the skip
+					 * child was reparented by a concurrent split/merge.
+					 * Re-anchor on the live structure via the child's parent
+					 * chain (the single skip concurrency mechanism) rather
+					 * than spin on a slot that may never republish.
+					 */
+					unsigned int rewind;
+					struct cds_ft_inode_flag *anchor =
+						ft_skip_reanchor(node_flag, &rewind, NULL);
+
+					if (caa_unlikely(!anchor)) {
+						/* child detached / above root: re-descend live. */
+						node_flag = ft_dereference_prefetch(ft->root);
+						key = orig_key;
+						if (path_nodes)
+							path_cur = path_nodes + 1;
+						goto reanchor_root;
+					}
+					/*
+					 * Rewind one (the byte just consumed for this slot) plus
+					 * the merge overshoot, re-anchor @node_flag, and re-enter
+					 * the descent.  path_cur tracks key in lockstep
+					 * (path_nodes + 1 + depth).
+					 */
+					node_flag = anchor;
+					key -= (size_t) rewind + 1;
+					if (path_nodes)
+						path_cur = path_nodes + 1 +
+							(size_t) (key - orig_key);
+					goto descend_loop;
+				}
+			}
+#endif
 		}
 		dbg_printf("cds_ft_lookup iter key lookup %u finds node_flag %p\n",
 				(unsigned int) iter_key, node_flag);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
 		 * Candidate-mode skip-advance for skip-encoded child slots.
-		 * Precise-mode resolution happened in the dispatcher retry
-		 * loop above.
+		 * Precise-mode resolution / re-anchor happened in the
+		 * dispatcher above.
 		 *
 		 * Tempting follow-up that does NOT work: adding a
 		 * ft_maybe_prefetch(node_flag) here to prefetch the skip
@@ -7848,6 +7980,45 @@ going_up:
 		node_flag = ft_node_get_leftright(iter_path_node(iter)[level - 1],
 				key_value, &ordinal_key[level - 1], dir,
 				true /* validate_lookup */);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		/*
+		 * Skip-validate failure: the parent we scanned for a sibling
+		 * (iter_path[level-1]) was recompacted away while the sibling's skip
+		 * child was reparented by a concurrent split/merge.  Re-anchor that
+		 * parent on the live structure via the child's parent chain and
+		 * re-scan it (the single skip concurrency mechanism), rather than spin.
+		 * @rewind > 0 (merge) means the parent merged shallower: drop @level
+		 * and recompute the dispatch byte at the new level.  NULL anchor: the
+		 * sibling vanished — treat as not-found and keep backing up.
+		 */
+		while (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
+			unsigned int rewind;
+			struct cds_ft_inode_flag *anchor =
+				ft_skip_reanchor(node_flag, &rewind, NULL);
+
+			if (caa_unlikely(!anchor)) {
+				node_flag = NULL;
+				break;
+			}
+			level -= (ssize_t) rewind;
+			iter_path_node(iter)[level - 1] = anchor;
+			switch (limit) {
+			case FT_LOOKUP_LIMIT_NONE:
+				key_value = ordinal_key[level - 1];
+				break;
+			case FT_LOOKUP_LIMIT_FIRST:
+				key_value = input_key[level - 1];
+				break;
+			case FT_LOOKUP_LIMIT_LAST:
+				key_value = ((size_t) level <= iter->prefix_len) ?
+					input_key[level - 1] : (uint8_t) 0xff;
+				break;
+			}
+			node_flag = ft_node_get_leftright(anchor, key_value,
+					&ordinal_key[level - 1], dir,
+					true /* validate_lookup */);
+		}
+#endif
 		dbg_printf("cds_ft_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
 				(unsigned int) key_value, (unsigned int) ordinal_key[level - 1],
 				node_flag);
@@ -8022,6 +8193,32 @@ descend_children:
 		skip_eq_external_nodes = false;
 		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir,
 				true /* validate_lookup */);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		/*
+		 * Skip-validate failure (the minmax descent read a slot inconsistent
+		 * with the live compressed node — the scanned node was recompacted away
+		 * while the skip child was reparented by a concurrent split/merge).
+		 * Re-anchor the scanned node on the live structure via the child's
+		 * parent chain and re-scan it, rather than spin (the single skip
+		 * concurrency mechanism).  @rewind > 0 (merge) re-anchors shallower;
+		 * @level -= rewind + 1 then the loop's level++ nets a -rewind step,
+		 * re-scanning the live node at the right depth.
+		 */
+		if (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
+			unsigned int rewind;
+			struct cds_ft_inode_flag *anchor =
+				ft_skip_reanchor(node_flag, &rewind, NULL);
+
+			if (caa_unlikely(!anchor)) {
+				level--;
+				going_up = true;
+				goto going_up;
+			}
+			level -= (ssize_t) rewind + 1;
+			node_flag = anchor;
+			continue;
+		}
+#endif
 		/*
 		 * Transiently empty internal node (linear/popcount/pigeon): a reader may
 		 * observe every slot of a reachable internal node as
@@ -14689,6 +14886,9 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 
 	ft_delay_reader();
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+nth_restart:
+#endif
 	for (level = 1; ; level++) {
 		struct cds_ft_metadata *metadata;
 		struct cds_ft_inode_flag *child;
@@ -14738,6 +14938,49 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		while (child) {
 			unsigned long child_keys;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * Skip-validate failure (a concurrent split/merge reparented
+			 * the skip child, possibly while @node_flag was recompacted
+			 * away): re-anchor on the live structure via the skip child's
+			 * parent chain — the same single mechanism the precise /
+			 * inequality readers use, never a spin or a frozen re-read.
+			 *   rewind == 0: @node_flag was recompacted in place; re-scan its
+			 *     live version from the same pivot (rank accumulation
+			 *     unchanged — we only re-scan children past @pivot).
+			 *   rewind > 0: a transient single-child @node_flag (pivot == -1,
+			 *     nothing accumulated for it yet) merged into a longer
+			 *     compressed; descend INTO that merged node (re-scanning the
+			 *     shallower holder would double-count).  level -= rewind + 1
+			 *     so the loop's level++ lands the compressed handler at the
+			 *     merged node's depth; remaining is unchanged.
+			 *   detached / above root: re-find rank @n on the live trie.
+			 */
+			if (caa_unlikely(ft_node_skip_compressed(child))) {
+				unsigned int rewind;
+				struct cds_ft_inode_flag *merged;
+				struct cds_ft_inode_flag *anchor =
+					ft_skip_reanchor(child, &rewind, &merged);
+
+				if (caa_likely(anchor && rewind == 0)) {
+					node_flag = anchor;
+					child = ft_node_get_direction(node_flag, pivot,
+							&child_key, FT_RIGHT, true);
+					continue;
+				}
+				if (merged) {
+					node_flag = merged;
+					level -= (int) rewind + 1;
+					goto next_level;
+				}
+				node_flag = ft_dereference_acquire_prefetch(ft->root);
+				iter_path_node(iter)[0] = node_flag;
+				remaining = n;
+				memset(ordinal_key, 0,
+					ft->group->max_key_len * sizeof(ordinal_key[0]));
+				goto nth_restart;
+			}
+#endif
 			child_keys = ft_child_key_count(child);
 
 			if (remaining < child_keys) {
@@ -14869,6 +15112,9 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 	node_flag = ft_dereference_acquire_prefetch(ft->root);
 	iter_path_node(iter)[0] = node_flag;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+nth_last_restart:
+#endif
 	for (level = 1; ; level++) {
 		struct cds_ft_metadata *metadata;
 		struct cds_ft_inode_flag *child;
@@ -14899,6 +15145,34 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 		while (child) {
 			unsigned long child_keys;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/* Skip-validate failure: re-anchor on the live structure
+			 * (see cds_ft_lookup_nth — same single mechanism). */
+			if (caa_unlikely(ft_node_skip_compressed(child))) {
+				unsigned int rewind;
+				struct cds_ft_inode_flag *merged;
+				struct cds_ft_inode_flag *anchor =
+					ft_skip_reanchor(child, &rewind, &merged);
+
+				if (caa_likely(anchor && rewind == 0)) {
+					node_flag = anchor;
+					child = ft_node_get_direction(node_flag, pivot,
+							&child_key, FT_LEFT, true);
+					continue;
+				}
+				if (merged) {
+					node_flag = merged;
+					level -= (int) rewind + 1;
+					goto next_level;
+				}
+				node_flag = ft_dereference_acquire_prefetch(ft->root);
+				iter_path_node(iter)[0] = node_flag;
+				remaining = n;
+				memset(ordinal_key, 0,
+					ft->group->max_key_len * sizeof(ordinal_key[0]));
+				goto nth_last_restart;
+			}
+#endif
 			child_keys = ft_child_key_count(child);
 
 			if (remaining < child_keys) {
@@ -15136,6 +15410,9 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 
 	iter_debug_path_snapshot(iter);
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+skip_fwd_restart:
+#endif
 	/* Rebuild path from root to current key. */
 	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
 			ordinal_key);
@@ -15201,8 +15478,33 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 				child = ft_node_get_direction(parent, pivot,
 						&child_key, FT_RIGHT, true);
 				while (child) {
-					unsigned long ck = ft_child_key_count(child);
+					unsigned long ck;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+					/*
+					 * Skip-validate failure: re-anchor on the live
+					 * structure (same single mechanism as the other
+					 * readers).  @parent carries external_nodes so it
+					 * cannot merge — rewind is always 0 (recompacted in
+					 * place); re-scan its live version.  A detached child
+					 * re-establishes the position from the iterator key.
+					 */
+					if (caa_unlikely(ft_node_skip_compressed(child))) {
+						unsigned int rewind;
+						struct cds_ft_inode_flag *anchor =
+							ft_skip_reanchor(child, &rewind, NULL);
+
+						if (caa_likely(anchor && rewind == 0)) {
+							parent = anchor;
+							child = ft_node_get_direction(parent,
+								pivot, &child_key, FT_RIGHT, true);
+							continue;
+						}
+						level = 0;
+						goto skip_fwd_restart;
+					}
+#endif
+					ck = ft_child_key_count(child);
 					if (remaining < ck) {
 						ordinal_key[depth] = child_key;
 						iter_path_node(iter)[depth + 1] = child;
@@ -15247,8 +15549,30 @@ skip_fwd_walk_up:
 		child = ft_node_get_direction(ancestor, pivot,
 				&child_key, FT_RIGHT, true);
 		while (child) {
-			unsigned long ck = ft_child_key_count(child);
+			unsigned long ck;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * Re-anchor: @ancestor has siblings to scan, so it is
+			 * multi-child and cannot merge — rewind is 0; re-scan its
+			 * live version.  Detached child -> re-establish from the key.
+			 */
+			if (caa_unlikely(ft_node_skip_compressed(child))) {
+				unsigned int rewind;
+				struct cds_ft_inode_flag *anchor =
+					ft_skip_reanchor(child, &rewind, NULL);
+
+				if (caa_likely(anchor && rewind == 0)) {
+					ancestor = anchor;
+					child = ft_node_get_direction(ancestor, pivot,
+							&child_key, FT_RIGHT, true);
+					continue;
+				}
+				level = 0;
+				goto skip_fwd_restart;
+			}
+#endif
+			ck = ft_child_key_count(child);
 			if (remaining <= ck) {
 				remaining--;  /* enter this subtree (1-indexed within) */
 				ordinal_key[level] = child_key;
@@ -15336,8 +15660,42 @@ descend_forward:
 			child = ft_node_get_direction(node_flag, pivot,
 					&child_key, FT_RIGHT, true);
 			while (child) {
-				unsigned long ck = ft_child_key_count(child);
+				unsigned long ck;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Re-anchor (descend phase; see cds_ft_lookup_nth).
+				 *   rewind == 0: @node_flag recompacted in place; re-scan.
+				 *   rewind > 0: a transient single-child @node_flag
+				 *     (pivot == -1, nothing accumulated) merged into a
+				 *     longer compressed; descend INTO it.  level -= rewind
+				 *     lands the compressed handler at the merged node's
+				 *     depth (ft_skip_forward_compressed fills from level);
+				 *     remaining unchanged.
+				 *   detached -> re-establish from the iterator key.
+				 */
+				if (caa_unlikely(ft_node_skip_compressed(child))) {
+					unsigned int rewind;
+					struct cds_ft_inode_flag *merged;
+					struct cds_ft_inode_flag *anchor =
+						ft_skip_reanchor(child, &rewind, &merged);
+
+					if (caa_likely(anchor && rewind == 0)) {
+						node_flag = anchor;
+						child = ft_node_get_direction(node_flag,
+							pivot, &child_key, FT_RIGHT, true);
+						continue;
+					}
+					if (merged) {
+						node_flag = merged;
+						level -= (int) rewind;
+						goto next_forward_level;
+					}
+					level = 0;
+					goto skip_fwd_restart;
+				}
+#endif
+				ck = ft_child_key_count(child);
 				if (remaining < ck) {
 					ordinal_key[level] = child_key;
 					level++;
@@ -15520,6 +15878,9 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 
 	iter_debug_path_snapshot(iter);
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+skip_rev_restart:
+#endif
 	/* Rebuild path from root to current key. */
 	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
 			ordinal_key);
@@ -15580,6 +15941,28 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		child = ft_node_get_direction(ancestor, pivot,
 				&child_key, FT_LEFT, true);
 		while (child) {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * Re-anchor: @ancestor has siblings to count -> multi-child,
+			 * cannot merge -> rewind 0; re-scan its live version (counting
+			 * resumes from @pivot, so left_keys stays consistent).
+			 * Detached -> re-establish from the iterator key.
+			 */
+			if (caa_unlikely(ft_node_skip_compressed(child))) {
+				unsigned int rewind;
+				struct cds_ft_inode_flag *anchor =
+					ft_skip_reanchor(child, &rewind, NULL);
+
+				if (caa_likely(anchor && rewind == 0)) {
+					ancestor = anchor;
+					child = ft_node_get_direction(ancestor, pivot,
+							&child_key, FT_LEFT, true);
+					continue;
+				}
+				level = 0;
+				goto skip_rev_restart;
+			}
+#endif
 			left_keys += ft_child_key_count(child);
 			pivot = child_key;
 			child = ft_node_get_direction(ancestor, pivot,
@@ -15606,9 +15989,31 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 				child = ft_node_get_direction(ancestor, pivot,
 						&child_key, FT_LEFT, true);
 				while (child) {
-					unsigned long ck =
-						ft_child_key_count(child);
+					unsigned long ck;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+					/*
+					 * Re-anchor: @ancestor is the multi-child node whose
+					 * leftward siblings we iterate -> cannot merge ->
+					 * rewind 0; re-scan its live version.  Detached ->
+					 * re-establish from the iterator key.
+					 */
+					if (caa_unlikely(ft_node_skip_compressed(child))) {
+						unsigned int rewind;
+						struct cds_ft_inode_flag *anchor =
+							ft_skip_reanchor(child, &rewind, NULL);
+
+						if (caa_likely(anchor && rewind == 0)) {
+							ancestor = anchor;
+							child = ft_node_get_direction(ancestor,
+								pivot, &child_key, FT_LEFT, true);
+							continue;
+						}
+						level = 0;
+						goto skip_rev_restart;
+					}
+#endif
+					ck = ft_child_key_count(child);
 					if (remaining <= ck) {
 						remaining--;
 						ordinal_key[level] = child_key;
@@ -15692,8 +16097,39 @@ descend_reverse:
 			child = ft_node_get_direction(node_flag, pivot,
 					&child_key, FT_LEFT, true);
 			while (child) {
-				unsigned long ck = ft_child_key_count(child);
+				unsigned long ck;
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Re-anchor (descend phase; see cds_ft_lookup_nth).
+				 *   rewind == 0: @node_flag recompacted in place; re-scan.
+				 *   rewind > 0: a transient single-child @node_flag merged
+				 *     into a longer compressed; descend INTO it (level -=
+				 *     rewind; remaining unchanged).
+				 *   detached -> re-establish from the iterator key.
+				 */
+				if (caa_unlikely(ft_node_skip_compressed(child))) {
+					unsigned int rewind;
+					struct cds_ft_inode_flag *merged;
+					struct cds_ft_inode_flag *anchor =
+						ft_skip_reanchor(child, &rewind, &merged);
+
+					if (caa_likely(anchor && rewind == 0)) {
+						node_flag = anchor;
+						child = ft_node_get_direction(node_flag,
+							pivot, &child_key, FT_LEFT, true);
+						continue;
+					}
+					if (merged) {
+						node_flag = merged;
+						level -= (int) rewind;
+						goto next_reverse_level;
+					}
+					level = 0;
+					goto skip_rev_restart;
+				}
+#endif
+				ck = ft_child_key_count(child);
 				if (remaining < ck) {
 					ordinal_key[level] = child_key;
 					level++;
