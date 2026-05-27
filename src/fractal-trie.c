@@ -8790,6 +8790,21 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	int nr_created = 0;
 	unsigned long child_nr_keys;
 	int ret;
+	/*
+	 * Build-invisible / publish / reclaim (see rcu-mutation pattern).
+	 * The live old child (cn->child) is re-parented into the new suffix or,
+	 * for suffix_len == 0, straight into the junction.  Defer that single
+	 * back-pointer to the failure-free tail so a later allocation failure
+	 * frees the never-observed cluster with cn->child untouched.  The caller
+	 * publishes the top right after we return, so this deferred (bottom)
+	 * publish precedes the top forward publish.
+	 */
+	uint8_t jct_ordinal = cn->key_bytes[remaining];
+	bool jct_cluster_leaf = (suffix_len == 0);
+	struct cds_ft_inode_flag *sfx_skip_flag = NULL;
+	struct cds_ft_inode_flag *deferred_child = NULL;
+	struct cds_ft_inode_flag *deferred_parent = NULL;
+	struct cds_ft_inode_flag **deferred_slot = NULL;
 
 	if (!ft_node_external(cn->child)) {
 		struct cds_ft_metadata *cm =
@@ -8828,17 +8843,31 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		sfx_meta->nr_child = 1;
 		ft_nr_keys_store(sfx_meta, child_nr_keys,
 			CMM_RELAXED);
-		suffix_flag = ft_compressed_node_flag(sfx);
-		ft_set_parent(cn->child, suffix_flag, &sfx->child);
-		suffix_flag = ft_publish_compressed(ft, sfx, suffix_flag);
-		created[nr_created++] = suffix_flag;
+		suffix_flag = ft_compressed_node_flag(sfx);	/* PLAIN: install + recover sfx directly */
+		sfx_skip_flag = ft_publish_compressed(ft, sfx, suffix_flag);	/* skip form for the slot */
+		created[nr_created++] = suffix_flag;	/* track PLAIN so the error path frees sfx directly */
+		/*
+		 * Defer re-parenting the live old child into the new suffix:
+		 * writing cn->child's back-pointer now would expose the
+		 * unpublished cluster from below, and the junction install
+		 * below would recover sfx through it.  sfx->child already
+		 * points at cn->child (a write into the new sfx only).
+		 */
+		deferred_child = cn->child;
+		deferred_parent = suffix_flag;	/* PLAIN sfx flag */
+		deferred_slot = &sfx->child;
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
 
+		/*
+		 * 1-child internal suffix (non-SC): the live cn->child is its
+		 * only child, so this node is a cluster-leaf — defer cn->child's
+		 * back-pointer.
+		 */
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining + 1],
 			cn->child, NULL, NULL,
-			node_depth + remaining + 1, false);
+			node_depth + remaining + 1, true);
 		if (ret) goto error;
 		{
 			struct cds_ft_metadata *m =
@@ -8848,6 +8877,10 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		}
 		suffix_flag = dest;
 		created[nr_created++] = dest;
+		deferred_child = cn->child;
+		deferred_parent = dest;
+		ft_node_get_nth_skip(dest, &deferred_slot,
+			cn->key_bytes[remaining + 1], FT_PF_NONE);
 	} else {
 		suffix_flag = cn->child;
 	}
@@ -8858,15 +8891,41 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		struct cds_ft_metadata *jct_meta;
 
 		ret = ft_node_set_nth(ft, &dest,
-			cn->key_bytes[remaining],
+			jct_ordinal,
 			suffix_flag, NULL, NULL,
-			node_depth + remaining, false);
+			node_depth + remaining, jct_cluster_leaf);
 		if (ret) goto error;
 		jct_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(jct_meta, child_nr_keys,
 			CMM_RELAXED);
 		jct_flag = dest;
 		created[nr_created++] = dest;
+
+		if (jct_cluster_leaf) {
+			/*
+			 * suffix_len == 0: the junction is the cluster-leaf and
+			 * its suffix-direction child is the live cn->child.
+			 * Record the deferred edge against the final junction.
+			 */
+			deferred_child = cn->child;
+			deferred_parent = jct_flag;
+			ft_node_get_nth_skip(jct_flag, &deferred_slot,
+				jct_ordinal, FT_PF_NONE);
+		} else if (sfx_skip_flag && sfx_skip_flag != suffix_flag) {
+			/*
+			 * suffix_len >= 1 compressed: sfx was installed via its
+			 * PLAIN flag so ft_set_parent recovered it directly.
+			 * Re-encode the junction's slot to sfx's skip form — a
+			 * value write into the still-unpublished junction; it
+			 * resolves once cn->child's back-pointer is set at the tail.
+			 */
+			struct cds_ft_inode_flag **oslot = NULL;
+
+			ft_node_get_nth_skip(jct_flag, &oslot, jct_ordinal,
+				FT_PF_NONE);
+			if (oslot)
+				rcu_assign_pointer(*oslot, sfx_skip_flag);
+		}
 	}
 
 	/* Prefix → junction. */
@@ -8985,6 +9044,14 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		top_flag = jct_flag;
 	}
 
+	/*
+	 * Failure-free tail: wire the single deferred back-pointer (the live old
+	 * child into the new suffix / junction).  No allocation happens past
+	 * here; the caller publishes the top forward immediately after we return.
+	 */
+	if (deferred_child)
+		ft_set_parent(deferred_child, deferred_parent, deferred_slot);
+
 	FT_TP(compressed_split, "key_shorter", (const void *) cn, cn->len,
 		(const void *) top_flag, remaining);
 	*top_ret = top_flag;
@@ -8999,6 +9066,9 @@ error:
 			if (ft_node_compressed(created[i]))
 				free_compressed_node_unpublished(ft,
 					ft_compressed_node_ptr(created[i]));
+			else if (ft_node_skip_compressed(created[i]))
+				free_compressed_node_unpublished(ft,
+					ft_skip_to_compressed(created[i]));
 			else
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(created[i]));

@@ -14796,6 +14796,26 @@ static int test_split_oom_backpointer(void)
 	if (run_split_oom_insert("insert-suffix==0",
 			(const uint8_t *)"aaaaaaXmas", 10) < 0)
 		rc = -1;
+	/*
+	 * Key shorter than the compressed path: ft_split_compressed_key_shorter.
+	 * "aaa" terminates at depth 3 (suffix_len == 3: a new compressed suffix
+	 * wraps the old child); "aaaaaa" at depth 6 (suffix_len == 0: the
+	 * junction itself is the cluster-leaf, holding the live old child).
+	 */
+	if (run_split_oom_insert("key_shorter-suffix>=1",
+			(const uint8_t *)"aaa", 3) < 0)
+		rc = -1;
+	/*
+	 * "aaaaa" terminates at depth 5 (suffix_len == 1): under SKIP_COMPRESSED
+	 * a 1-byte compressed suffix; under non-SC a 1-child internal suffix that
+	 * is itself the cluster-leaf holding the live old child.
+	 */
+	if (run_split_oom_insert("key_shorter-suffix==1",
+			(const uint8_t *)"aaaaa", 5) < 0)
+		rc = -1;
+	if (run_split_oom_insert("key_shorter-suffix==0",
+			(const uint8_t *)"aaaaaa", 6) < 0)
+		rc = -1;
 	return rc;
 }
 #endif /* FEATURE_FT_FAULT_INJECT */
