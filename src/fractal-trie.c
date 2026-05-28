@@ -1791,9 +1791,14 @@ struct cds_ft_compressed_node *ft_skip_to_compressed_validate(
  *            lookup ignore it and just re-scan / re-read the returned holder.
  *
  * Returns the live node holding the slot equivalent to the failing one (the
- * caller re-anchors its descent there and re-reads / re-descends), or NULL when
- * @G has been detached or the position is above the root — the caller then
- * re-descends from ft->root (or terminates NOT_FOUND, per its semantics).
+ * caller re-anchors its descent there and re-reads / re-descends).  Never
+ * returns NULL on a well-formed trie: the writer wires every fresh cluster's
+ * parent (including the cluster top's, into the live parent) before the
+ * cluster becomes reachable, so the up-walk never observes a NULL parent.  All
+ * call sites assert anchor != NULL and treat any NULL return as a bug.  The
+ * defensive `return NULL` paths inside the walk (assert(0) + return NULL under
+ * NDEBUG; pathological guard exhaustion) exist only so a debug build aborts at
+ * the violation site instead of dereferencing NULL.
  *
  * Read-side only (rcu_dereference on every back-pointer); the caller must be in
  * an RCU read-side critical section.
@@ -4606,10 +4611,11 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
  * many byte-depths the resolved node lies ABOVE the dispatched child (0 in the
  * common split / recompaction case; > 0 only when a concurrent chain-merge
  * moved the encoded position shallower -- the caller backs its descent cursor
- * up by that much, or re-descends).  A NULL re-anchor is a transient mid-commit
- * (the live child's chain converges once the writer's build-invisible commit
- * completes), so retry locally; never spin on the slot.  Returns the resolved
- * child flag (compressed/internal/external), or NULL for an empty slot.
+ * up by that much, or re-descends).  ft_skip_reanchor never returns NULL on a
+ * well-formed trie (the writer wires every fresh cluster's parent before the
+ * cluster becomes reachable, so the up-walk never observes a NULL parent);
+ * the result is asserted non-NULL.  Returns the resolved child flag
+ * (compressed/internal/external), or NULL for an empty slot.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth_reanchor(
@@ -4628,9 +4634,8 @@ struct cds_ft_inode_flag *ft_node_get_nth_reanchor(
 
 		if (caa_likely(cn != NULL))
 			return ft_compressed_node_flag(cn);
-		while ((anchor = ft_skip_reanchor(child, rewind_ret,
-				&at_pos)) == NULL)
-			caa_cpu_relax();
+		anchor = ft_skip_reanchor(child, rewind_ret, &at_pos);
+		assert(anchor != NULL);
 		return at_pos;
 	}
 #endif
@@ -6250,15 +6255,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	 * Skip-encoded root is not currently produced by any mutator
 	 * path, but resolve it defensively for completeness — cost is
 	 * one shr+jne, DCE'd when skip_compressed compile-time false.
-	 *
-	 * @reanchor_root is re-entered by the skip re-anchor fallback below
-	 * (ft_skip_reanchor returned NULL: the skip child was detached or its
-	 * position is above the root) with @node_flag reset to ft->root and the
-	 * cursor rewound to the start — a full live re-descent.
 	 */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-reanchor_root:
-#endif
 	if (skip_compressed &&
 	    caa_unlikely(ft_node_skip_compressed(node_flag))) {
 		if (!descend_cand) {
@@ -6397,14 +6394,7 @@ descend_loop:
 					struct cds_ft_inode_flag *anchor =
 						ft_skip_reanchor(node_flag, &rewind, &at_pos);
 
-					if (caa_unlikely(!anchor)) {
-						/* child detached / above root: re-descend live. */
-						node_flag = ft_dereference_prefetch(ft->root);
-						key = orig_key;
-						if (path_nodes)
-							path_cur = path_nodes + 1;
-						goto reanchor_root;
-					}
+					assert(anchor != NULL);
 					if (rewind == 0) {
 						/*
 						 * Split (or same-length replace): @at_pos is
@@ -8099,8 +8089,9 @@ going_up:
 		 * parent on the live structure via the child's parent chain and
 		 * re-scan it (the single skip concurrency mechanism), rather than spin.
 		 * @rewind > 0 (merge) means the parent merged shallower: drop @level
-		 * and recompute the dispatch byte at the new level.  NULL anchor: the
-		 * sibling vanished — treat as not-found and keep backing up.
+		 * and recompute the dispatch byte at the new level.  ft_skip_reanchor
+		 * never returns NULL on a well-formed trie (the writer wires every
+		 * fresh cluster's parent before the cluster becomes reachable).
 		 */
 		while (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
 			unsigned int rewind;
@@ -8108,10 +8099,7 @@ going_up:
 			struct cds_ft_inode_flag *anchor =
 				ft_skip_reanchor(node_flag, &rewind, &at_pos);
 
-			if (caa_unlikely(!anchor)) {
-				node_flag = NULL;
-				break;
-			}
+			assert(anchor != NULL);
 			if (caa_likely(rewind == 0)) {
 				/*
 				 * Surgical: @at_pos is the live resolved sibling at
@@ -8332,7 +8320,9 @@ descend_children:
 		 * parent chain and re-scan it, rather than spin (the single skip
 		 * concurrency mechanism).  @rewind > 0 (merge) re-anchors shallower;
 		 * @level -= rewind + 1 then the loop's level++ nets a -rewind step,
-		 * re-scanning the live node at the right depth.
+		 * re-scanning the live node at the right depth.  ft_skip_reanchor
+		 * never returns NULL on a well-formed trie (the writer wires every
+		 * fresh cluster's parent before the cluster becomes reachable).
 		 */
 		if (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
 			unsigned int rewind;
@@ -8340,11 +8330,7 @@ descend_children:
 			struct cds_ft_inode_flag *anchor =
 				ft_skip_reanchor(node_flag, &rewind, &at_pos);
 
-			if (caa_unlikely(!anchor)) {
-				level--;
-				going_up = true;
-				goto going_up;
-			}
+			assert(anchor != NULL);
 			if (caa_likely(rewind == 0)) {
 				/*
 				 * Surgical: @at_pos is the live minmax child at this
@@ -15138,23 +15124,19 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 				/*
 				 * Surgical re-anchor: resolve @child via the live skip
 				 * child's parent chain and continue forward — never
-				 * re-scan a slot or restart from the root.  A NULL result
-				 * is a transient: a concurrent insert's build-invisible
-				 * commit wires a re-parented live child's back-pointer
-				 * before the fresh ancestor's own parent, so an up-walk
-				 * momentarily sees a NULL parent.  The skip child is live
-				 * and its chain converges once that commit completes, so
-				 * retry locally — a root re-descent would re-count a
-				 * concurrently-growing trie and undercount the rank.
+				 * re-scan a slot or restart from the root.  Root re-descent
+				 * would re-count a concurrently-growing trie and undercount
+				 * the rank.  ft_skip_reanchor never returns NULL on a
+				 * well-formed trie (the writer wires every fresh cluster's
+				 * parent before the cluster becomes reachable).
 				 *   rewind == 0: @merged is the resolved live child at
 				 *     @child_key; use it and fall through to the rank
 				 *     accumulation (which only advances).
 				 *   rewind > 0:  @node_flag (a transient single child) was
 				 *     absorbed into a longer compressed; descend INTO it.
 				 */
-				while ((anchor = ft_skip_reanchor(child, &rewind,
-						&merged)) == NULL)
-					caa_cpu_relax();
+				anchor = ft_skip_reanchor(child, &rewind, &merged);
+				assert(anchor != NULL);
 				if (caa_likely(rewind == 0)) {
 					node_flag = anchor;
 					child = merged;
@@ -15338,12 +15320,11 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 				 * Surgical re-anchor (see cds_ft_lookup_nth): resolve
 				 * @child via the live skip child's parent chain and
 				 * continue forward — never re-scan or restart from root.
-				 * A NULL result is a transient mid-commit; the skip child
-				 * is live and its chain converges, so retry locally.
+				 * ft_skip_reanchor never returns NULL on a well-formed
+				 * trie (writer wires parents before publishing).
 				 */
-				while ((anchor = ft_skip_reanchor(child, &rewind,
-						&merged)) == NULL)
-					caa_cpu_relax();
+				anchor = ft_skip_reanchor(child, &rewind, &merged);
+				assert(anchor != NULL);
 				if (caa_likely(rewind == 0)) {
 					node_flag = anchor;
 					child = merged;
@@ -15607,9 +15588,6 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 
 	iter_debug_path_snapshot(iter);
 
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-skip_fwd_restart:
-#endif
 	/* Rebuild path from root to current key. */
 	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
 			ordinal_key);
@@ -15679,26 +15657,23 @@ skip_fwd_restart:
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					/*
-					 * Skip-validate failure: re-anchor on the live
-					 * structure (same single mechanism as the other
-					 * readers).  @parent carries external_nodes so it
-					 * cannot merge — rewind is always 0 (recompacted in
-					 * place); re-scan its live version.  A detached child
-					 * re-establishes the position from the iterator key.
+					 * Surgical re-anchor: @parent carries external_nodes so
+					 * it cannot merge — rewind is always 0 (recompacted in
+					 * place).  @at_pos is the live resolved sibling at
+					 * @child_key; use it directly.  ft_skip_reanchor never
+					 * returns NULL on a well-formed trie.
 					 */
 					if (caa_unlikely(ft_node_skip_compressed(child))) {
 						unsigned int rewind;
+						struct cds_ft_inode_flag *at_pos;
 						struct cds_ft_inode_flag *anchor =
-							ft_skip_reanchor(child, &rewind, NULL);
+							ft_skip_reanchor(child, &rewind, &at_pos);
 
-						if (caa_likely(anchor && rewind == 0)) {
-							parent = anchor;
-							child = ft_node_get_direction(parent,
-								pivot, &child_key, FT_RIGHT, true);
-							continue;
-						}
-						level = 0;
-						goto skip_fwd_restart;
+						assert(anchor != NULL);
+						assert(rewind == 0);
+						parent = anchor;
+						child = at_pos;
+						continue;
 					}
 #endif
 					ck = ft_child_key_count(child);
@@ -15750,23 +15725,22 @@ skip_fwd_walk_up:
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
-			 * Re-anchor: @ancestor has siblings to scan, so it is
-			 * multi-child and cannot merge — rewind is 0; re-scan its
-			 * live version.  Detached child -> re-establish from the key.
+			 * Surgical re-anchor: @ancestor has siblings to scan, so it is
+			 * multi-child and cannot merge — rewind is 0.  @at_pos is the
+			 * live resolved sibling at @child_key; use it directly.
+			 * ft_skip_reanchor never returns NULL on a well-formed trie.
 			 */
 			if (caa_unlikely(ft_node_skip_compressed(child))) {
 				unsigned int rewind;
+				struct cds_ft_inode_flag *at_pos;
 				struct cds_ft_inode_flag *anchor =
-					ft_skip_reanchor(child, &rewind, NULL);
+					ft_skip_reanchor(child, &rewind, &at_pos);
 
-				if (caa_likely(anchor && rewind == 0)) {
-					ancestor = anchor;
-					child = ft_node_get_direction(ancestor, pivot,
-							&child_key, FT_RIGHT, true);
-					continue;
-				}
-				level = 0;
-				goto skip_fwd_restart;
+				assert(anchor != NULL);
+				assert(rewind == 0);
+				ancestor = anchor;
+				child = at_pos;
+				continue;
 			}
 #endif
 			ck = ft_child_key_count(child);
@@ -15861,15 +15835,16 @@ descend_forward:
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				/*
-				 * Re-anchor (descend phase; see cds_ft_lookup_nth).
-				 *   rewind == 0: @node_flag recompacted in place; re-scan.
+				 * Surgical re-anchor (descend phase; see cds_ft_lookup_nth).
+				 *   rewind == 0: @merged is the live resolved child at
+				 *     @child_key; use it directly.
 				 *   rewind > 0: a transient single-child @node_flag
 				 *     (pivot == -1, nothing accumulated) merged into a
 				 *     longer compressed; descend INTO it.  level -= rewind
 				 *     lands the compressed handler at the merged node's
 				 *     depth (ft_skip_forward_compressed fills from level);
 				 *     remaining unchanged.
-				 *   detached -> re-establish from the iterator key.
+				 * ft_skip_reanchor never returns NULL on a well-formed trie.
 				 */
 				if (caa_unlikely(ft_node_skip_compressed(child))) {
 					unsigned int rewind;
@@ -15877,19 +15852,15 @@ descend_forward:
 					struct cds_ft_inode_flag *anchor =
 						ft_skip_reanchor(child, &rewind, &merged);
 
-					if (caa_likely(anchor && rewind == 0)) {
+					assert(anchor != NULL);
+					if (caa_likely(rewind == 0)) {
 						node_flag = anchor;
-						child = ft_node_get_direction(node_flag,
-							pivot, &child_key, FT_RIGHT, true);
+						child = merged;
 						continue;
 					}
-					if (merged) {
-						node_flag = merged;
-						level -= (int) rewind;
-						goto next_forward_level;
-					}
-					level = 0;
-					goto skip_fwd_restart;
+					node_flag = merged;
+					level -= (int) rewind;
+					goto next_forward_level;
 				}
 #endif
 				ck = ft_child_key_count(child);
@@ -16075,9 +16046,6 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 
 	iter_debug_path_snapshot(iter);
 
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-skip_rev_restart:
-#endif
 	/* Rebuild path from root to current key. */
 	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
 			ordinal_key);
@@ -16140,24 +16108,22 @@ skip_rev_restart:
 		while (child) {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
-			 * Re-anchor: @ancestor has siblings to count -> multi-child,
-			 * cannot merge -> rewind 0; re-scan its live version (counting
-			 * resumes from @pivot, so left_keys stays consistent).
-			 * Detached -> re-establish from the iterator key.
+			 * Surgical re-anchor: @ancestor has siblings to count ->
+			 * multi-child, cannot merge -> rewind 0.  @at_pos is the live
+			 * resolved sibling at @child_key; use it directly.
+			 * ft_skip_reanchor never returns NULL on a well-formed trie.
 			 */
 			if (caa_unlikely(ft_node_skip_compressed(child))) {
 				unsigned int rewind;
+				struct cds_ft_inode_flag *at_pos;
 				struct cds_ft_inode_flag *anchor =
-					ft_skip_reanchor(child, &rewind, NULL);
+					ft_skip_reanchor(child, &rewind, &at_pos);
 
-				if (caa_likely(anchor && rewind == 0)) {
-					ancestor = anchor;
-					child = ft_node_get_direction(ancestor, pivot,
-							&child_key, FT_LEFT, true);
-					continue;
-				}
-				level = 0;
-				goto skip_rev_restart;
+				assert(anchor != NULL);
+				assert(rewind == 0);
+				ancestor = anchor;
+				child = at_pos;
+				continue;
 			}
 #endif
 			left_keys += ft_child_key_count(child);
@@ -16190,24 +16156,23 @@ skip_rev_restart:
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					/*
-					 * Re-anchor: @ancestor is the multi-child node whose
-					 * leftward siblings we iterate -> cannot merge ->
-					 * rewind 0; re-scan its live version.  Detached ->
-					 * re-establish from the iterator key.
+					 * Surgical re-anchor: @ancestor is the multi-child node
+					 * whose leftward siblings we iterate -> cannot merge ->
+					 * rewind 0.  @at_pos is the live resolved sibling at
+					 * @child_key; use it directly.  ft_skip_reanchor never
+					 * returns NULL on a well-formed trie.
 					 */
 					if (caa_unlikely(ft_node_skip_compressed(child))) {
 						unsigned int rewind;
+						struct cds_ft_inode_flag *at_pos;
 						struct cds_ft_inode_flag *anchor =
-							ft_skip_reanchor(child, &rewind, NULL);
+							ft_skip_reanchor(child, &rewind, &at_pos);
 
-						if (caa_likely(anchor && rewind == 0)) {
-							ancestor = anchor;
-							child = ft_node_get_direction(ancestor,
-								pivot, &child_key, FT_LEFT, true);
-							continue;
-						}
-						level = 0;
-						goto skip_rev_restart;
+						assert(anchor != NULL);
+						assert(rewind == 0);
+						ancestor = anchor;
+						child = at_pos;
+						continue;
 					}
 #endif
 					ck = ft_child_key_count(child);
@@ -16298,12 +16263,13 @@ descend_reverse:
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				/*
-				 * Re-anchor (descend phase; see cds_ft_lookup_nth).
-				 *   rewind == 0: @node_flag recompacted in place; re-scan.
+				 * Surgical re-anchor (descend phase; see cds_ft_lookup_nth).
+				 *   rewind == 0: @merged is the live resolved child at
+				 *     @child_key; use it directly.
 				 *   rewind > 0: a transient single-child @node_flag merged
 				 *     into a longer compressed; descend INTO it (level -=
 				 *     rewind; remaining unchanged).
-				 *   detached -> re-establish from the iterator key.
+				 * ft_skip_reanchor never returns NULL on a well-formed trie.
 				 */
 				if (caa_unlikely(ft_node_skip_compressed(child))) {
 					unsigned int rewind;
@@ -16311,19 +16277,15 @@ descend_reverse:
 					struct cds_ft_inode_flag *anchor =
 						ft_skip_reanchor(child, &rewind, &merged);
 
-					if (caa_likely(anchor && rewind == 0)) {
+					assert(anchor != NULL);
+					if (caa_likely(rewind == 0)) {
 						node_flag = anchor;
-						child = ft_node_get_direction(node_flag,
-							pivot, &child_key, FT_LEFT, true);
+						child = merged;
 						continue;
 					}
-					if (merged) {
-						node_flag = merged;
-						level -= (int) rewind;
-						goto next_reverse_level;
-					}
-					level = 0;
-					goto skip_rev_restart;
+					node_flag = merged;
+					level -= (int) rewind;
+					goto next_reverse_level;
 				}
 #endif
 				ck = ft_child_key_count(child);
