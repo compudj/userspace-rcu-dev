@@ -1819,8 +1819,23 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft_inode_flag *skip_ptr,
 		else
 			parent = rcu_dereference(cds_ft_item_to_metadata(
 				ft_node_ptr(cur))->parent);
-		if (!parent)
-			return NULL;		/* detached / above root */
+		if (caa_unlikely(!parent)) {
+			/*
+			 * A NULL parent on the up-walk is a bug.  The walk runs
+			 * through LIVE nodes whose parents are wired before the node
+			 * becomes reader-reachable: a build-invisible commit connects
+			 * the whole fresh cluster's parents (including the top's)
+			 * before any live gateway exposes it
+			 * (ft_graft_glue_apply_deferred), and a detach nulls parent
+			 * only after a grace period (unobservable to an in-flight
+			 * reader).  The only legitimate NULL parent is the root's,
+			 * and the accumulation reaches @want at or below it -- there
+			 * are no root-level skip pointers -- so the walk never steps
+			 * onto it.
+			 */
+			assert(0);
+			return NULL;		/* defensive under NDEBUG */
+		}
 		pitem = ft_node_compressed(parent) ?
 			(void *) ft_compressed_node_ptr(parent) :
 			(void *) ft_node_ptr(parent);
@@ -1836,11 +1851,20 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft_inode_flag *skip_ptr,
 			 * walkers can descend INTO it for rewind > 0 (where
 			 * re-scanning the shallower holder would double-count).
 			 */
+			struct cds_ft_inode_flag *holder;
+
 			*rewind = acc - want;
 			if (at_pos)
 				*at_pos = parent;
-			return rcu_dereference(cds_ft_item_to_metadata(
+			holder = rcu_dereference(cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) pitem)->parent);
+			/*
+			 * The holder is NULL only if @parent is the root -- the
+			 * encoded position is the root itself, i.e. a root-level
+			 * skip pointer, which mutators never produce.
+			 */
+			assert(holder != NULL);
+			return holder;
 		}
 		cur = parent;
 	}
