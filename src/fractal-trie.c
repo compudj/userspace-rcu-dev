@@ -6281,19 +6281,16 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	    caa_unlikely(ft_node_skip_compressed(node_flag))) {
 		if (!descend_cand) {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			for (;;) {
-				struct cds_ft_compressed_node *cn =
-					ft_skip_to_compressed_validate(node_flag);
-				if (caa_likely(cn != NULL)) {
-					node_flag = ft_compressed_node_flag(cn);
-					break;
-				}
-				/* validation failed: re-read root and retry */
-				node_flag = ft_dereference_prefetch(ft->root);
-				if (!ft_node_skip_compressed(node_flag))
-					break;
-				caa_cpu_relax();
-			}
+			/*
+			 * Mutators do not produce a skip-encoded root.  Resolve
+			 * it once for completeness, with an assert as the
+			 * oracle for any future regression — never spin on a
+			 * defensive retry that could hide a real race.
+			 */
+			struct cds_ft_compressed_node *cn =
+				ft_skip_to_compressed_validate(node_flag);
+			assert(cn != NULL);
+			node_flag = ft_compressed_node_flag(cn);
 #endif
 		} else {
 			unsigned int skip = ft_skip_len(node_flag);
