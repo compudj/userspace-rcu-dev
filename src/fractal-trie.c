@@ -8080,13 +8080,32 @@ going_up:
 		 */
 		while (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
 			unsigned int rewind;
+			struct cds_ft_inode_flag *at_pos;
 			struct cds_ft_inode_flag *anchor =
-				ft_skip_reanchor(node_flag, &rewind, NULL);
+				ft_skip_reanchor(node_flag, &rewind, &at_pos);
 
 			if (caa_unlikely(!anchor)) {
 				node_flag = NULL;
 				break;
 			}
+			if (caa_likely(rewind == 0)) {
+				/*
+				 * Surgical: @at_pos is the live resolved sibling at
+				 * this depth that re-scanning @anchor for the
+				 * unchanged dispatch byte ordinal_key[level - 1] would
+				 * find -- the sibling byte was already recorded by the
+				 * ft_node_get_leftright above, so use @at_pos directly
+				 * instead of re-scanning.  Keep the path's parent entry
+				 * live.
+				 */
+				iter_path_node(iter)[level - 1] = anchor;
+				node_flag = at_pos;
+				break;
+			}
+			/*
+			 * @rewind > 0 (merge): the parent merged shallower; drop
+			 * @level and re-scan the live parent at the new level.
+			 */
 			level -= (ssize_t) rewind;
 			iter_path_node(iter)[level - 1] = anchor;
 			switch (limit) {
@@ -8293,17 +8312,36 @@ descend_children:
 		 */
 		if (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
 			unsigned int rewind;
+			struct cds_ft_inode_flag *at_pos;
 			struct cds_ft_inode_flag *anchor =
-				ft_skip_reanchor(node_flag, &rewind, NULL);
+				ft_skip_reanchor(node_flag, &rewind, &at_pos);
 
 			if (caa_unlikely(!anchor)) {
 				level--;
 				going_up = true;
 				goto going_up;
 			}
-			level -= (ssize_t) rewind + 1;
-			node_flag = anchor;
-			continue;
+			if (caa_likely(rewind == 0)) {
+				/*
+				 * Surgical: @at_pos is the live minmax child at this
+				 * depth that re-scanning @anchor would find (its byte
+				 * was already recorded by the ft_node_get_minmax
+				 * above); descend into it directly by falling through
+				 * to the record-and-descend below, rather than
+				 * re-scanning the holder.
+				 */
+				node_flag = at_pos;
+			} else {
+				/*
+				 * @rewind > 0 (merge): the child merged shallower;
+				 * re-scan the live holder at the corrected depth
+				 * (@level -= rewind + 1, then the loop's level++ nets
+				 * a -rewind step).
+				 */
+				level -= (ssize_t) rewind + 1;
+				node_flag = anchor;
+				continue;
+			}
 		}
 #endif
 		/*
