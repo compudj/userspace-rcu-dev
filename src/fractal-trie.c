@@ -9500,23 +9500,34 @@ struct ft_graft_free_item {
 };
 
 /*
- * Sizing: an attach cluster spans at most a compressed prefix + branch +
- * suffix + a payload path of up to FT_MAX_DEPTH nodes + a
- * canonicalization wrapper.  Deferred edges and freed nodes are few
+ * Inline floor sizing: a graft / graft_swap attach cluster spans at most a
+ * compressed prefix + branch + suffix + a payload path of up to FT_MAX_DEPTH
+ * nodes + a canonicalization wrapper, with few deferred edges and freed nodes
  * (old-child; payload top / grandchild; old cn, old src root, absorbed
- * sub-cn).  Size generously.
+ * sub-cn).  These fit the inline arrays, so graft / graft_swap never allocate
+ * a backing buffer and never grow past the floor.
+ *
+ * cds_ft_merge_at instead builds a TREE-shaped spine (one deferred edge per
+ * disjoint subtree, one free per copied node), which can far exceed the floor.
+ * It calls ft_graft_glue_reserve() to move the three arrays onto a malloc'd
+ * backing sized by a read-only counting pre-pass; ft_graft_glue_abort() and
+ * ft_graft_glue_fini() release it.  Every accessor indexes through the
+ * pointers, so the growth is invisible to the helpers.
  */
-#define FT_GRAFT_GLUE_MAX_BUILT		(2 * FT_MAX_DEPTH + 8)
-#define FT_GRAFT_GLUE_MAX_DEFERRED	8
-#define FT_GRAFT_GLUE_MAX_FREE		8
+#define FT_GRAFT_GLUE_FLOOR_BUILT	(2 * FT_MAX_DEPTH + 8)
+#define FT_GRAFT_GLUE_FLOOR_DEFERRED	8
+#define FT_GRAFT_GLUE_FLOOR_FREE	8
 
 struct ft_graft_glue {
-	struct ft_graft_deferred_edge deferred[FT_GRAFT_GLUE_MAX_DEFERRED];
+	struct ft_graft_deferred_edge *deferred;
 	int nr_deferred;
-	struct ft_graft_free_item free_list[FT_GRAFT_GLUE_MAX_FREE];
+	int cap_deferred;
+	struct ft_graft_free_item *free_list;
 	int nr_free;
-	struct cds_ft_inode_flag *built[FT_GRAFT_GLUE_MAX_BUILT];
+	int cap_free;
+	struct cds_ft_inode_flag **built;
 	int nr_built;
+	int cap_built;
 	/*
 	 * The single forward store that splices the cluster into dst at
 	 * commit: parent_slot is swung to top.  publish_parent is the
@@ -9532,6 +9543,14 @@ struct ft_graft_glue {
 	 * whose parent the external-count propagation starts at commit.
 	 */
 	struct cds_ft_inode_flag *attached_nf;
+	/*
+	 * Inline floor backing.  ft_graft_glue_init points the three arrays
+	 * here; graft / graft_swap never outgrow it.  ft_graft_glue_reserve
+	 * repoints to a malloc'd buffer when a count would exceed its floor.
+	 */
+	struct ft_graft_deferred_edge deferred_floor[FT_GRAFT_GLUE_FLOOR_DEFERRED];
+	struct ft_graft_free_item free_floor[FT_GRAFT_GLUE_FLOOR_FREE];
+	struct cds_ft_inode_flag *built_floor[FT_GRAFT_GLUE_FLOOR_BUILT];
 };
 
 static void ft_graft_glue_track(struct ft_graft_glue *g,
@@ -12437,9 +12456,15 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 static
 void ft_graft_glue_init(struct ft_graft_glue *g)
 {
+	g->deferred = g->deferred_floor;
 	g->nr_deferred = 0;
+	g->cap_deferred = FT_GRAFT_GLUE_FLOOR_DEFERRED;
+	g->free_list = g->free_floor;
 	g->nr_free = 0;
+	g->cap_free = FT_GRAFT_GLUE_FLOOR_FREE;
+	g->built = g->built_floor;
 	g->nr_built = 0;
+	g->cap_built = FT_GRAFT_GLUE_FLOOR_BUILT;
 	g->publish_parent = NULL;
 	g->publish_slot = NULL;
 	g->top = NULL;
@@ -12447,9 +12472,92 @@ void ft_graft_glue_init(struct ft_graft_glue *g)
 }
 
 /*
+ * Release a glue's malloc'd backing (when it grew past the inline floor) and
+ * reset the arrays to the floor, so a second call is a no-op.  Both the abort
+ * path (via ft_graft_glue_abort) and the success path call this; graft /
+ * graft_swap stay on the floor, so it does nothing for them.
+ */
+static
+void ft_graft_glue_fini(struct ft_graft_glue *g)
+{
+	if (g->deferred != g->deferred_floor) {
+		free(g->deferred);
+		g->deferred = g->deferred_floor;
+		g->cap_deferred = FT_GRAFT_GLUE_FLOOR_DEFERRED;
+	}
+	if (g->free_list != g->free_floor) {
+		free(g->free_list);
+		g->free_list = g->free_floor;
+		g->cap_free = FT_GRAFT_GLUE_FLOOR_FREE;
+	}
+	if (g->built != g->built_floor) {
+		free(g->built);
+		g->built = g->built_floor;
+		g->cap_built = FT_GRAFT_GLUE_FLOOR_BUILT;
+	}
+}
+
+/*
+ * Grow the three arrays onto a malloc'd backing so the build can hold a
+ * cluster larger than the inline floor (cds_ft_merge_at's tree-shaped spine).
+ * Sizes come from a read-only counting pre-pass; call once, right after init,
+ * before any track / defer.  A request at or below a floor leaves that array
+ * inline.  Returns 0, or -ENOMEM (whatever already grew is released by a
+ * later abort / fini, so the caller need only surface the error).
+ */
+static __attribute__((unused))
+int ft_graft_glue_reserve(struct ft_graft_glue *g,
+		int nr_built, int nr_deferred, int nr_free)
+{
+	if (nr_built > g->cap_built) {
+		struct cds_ft_inode_flag **p =
+			malloc((size_t) nr_built * sizeof(*p));
+
+		if (!p)
+			return -ENOMEM;
+		memcpy(p, g->built, (size_t) g->nr_built * sizeof(*p));
+		if (g->built != g->built_floor)
+			free(g->built);
+		g->built = p;
+		g->cap_built = nr_built;
+	}
+	if (nr_deferred > g->cap_deferred) {
+		struct ft_graft_deferred_edge *p =
+			malloc((size_t) nr_deferred * sizeof(*p));
+
+		if (!p)
+			return -ENOMEM;
+		memcpy(p, g->deferred, (size_t) g->nr_deferred * sizeof(*p));
+		if (g->deferred != g->deferred_floor)
+			free(g->deferred);
+		g->deferred = p;
+		g->cap_deferred = nr_deferred;
+	}
+	if (nr_free > g->cap_free) {
+		struct ft_graft_free_item *p =
+			malloc((size_t) nr_free * sizeof(*p));
+
+		if (!p)
+			return -ENOMEM;
+		memcpy(p, g->free_list, (size_t) g->nr_free * sizeof(*p));
+		if (g->free_list != g->free_floor)
+			free(g->free_list);
+		g->free_list = p;
+		g->cap_free = nr_free;
+	}
+	return 0;
+}
+
+/*
  * Record the single forward publish that splices the built cluster into
- * dst, and the cluster top's deferred back-pointer into its parent.  The
- * builders call this once the cluster is fully built.
+ * dst, and wire the cluster top's back-pointer into its (live)
+ * publish_parent.  The builders call this once the cluster is fully
+ * built.  top is fresh and unpublished, so ft_graft_glue_defer_edge
+ * stores top->parent IMMEDIATELY (its fresh-child fast path); the store
+ * lands before any other commit-time mutation, so by the time
+ * apply_deferred flips any live back-pointer into the cluster, the
+ * up-walk path from cluster nodes through top into publish_parent is
+ * already wired.
  */
 static
 void ft_graft_glue_set_publish(struct ft_graft_glue *g,
@@ -12468,7 +12576,7 @@ static
 void ft_graft_glue_track(struct ft_graft_glue *g,
 		struct cds_ft_inode_flag *nf)
 {
-	assert(g->nr_built < FT_GRAFT_GLUE_MAX_BUILT);
+	assert(g->nr_built < g->cap_built);
 	g->built[g->nr_built++] = nf;
 }
 
@@ -12501,14 +12609,69 @@ void ft_graft_glue_untrack(struct ft_graft_glue *g, void *node_ptr)
 }
 
 /*
- * Record a deferred re-parent of a LIVE @child into glue node @parent
- * (slot @slot within @parent holds @child).  Applied at commit, after
- * the source has been drained, before the cluster is published.
+ * Test whether @child names a node currently in the glue's tracked
+ * (fresh, unpublished) set.  Match by underlying node identity so a
+ * plain-flag tracking entry is found even when @child is the skip-
+ * encoded form (or vice versa).
+ */
+static
+bool ft_graft_glue_is_fresh(struct ft_graft_glue *g,
+		struct cds_ft_inode_flag *child)
+{
+	void *cp;
+	int i;
+
+	if (!child)
+		return false;
+	if (ft_node_compressed(child))
+		cp = ft_compressed_node_ptr(child);
+	else if (ft_node_skip_compressed(child))
+		cp = ft_skip_to_compressed(child);
+	else if (ft_node_external(child))
+		return false;	/* externals are never glue-tracked */
+	else
+		cp = ft_node_ptr(child);
+	for (i = 0; i < g->nr_built; i++) {
+		struct cds_ft_inode_flag *nf = g->built[i];
+		void *bp;
+
+		if (ft_node_compressed(nf))
+			bp = ft_compressed_node_ptr(nf);
+		else if (ft_node_skip_compressed(nf))
+			bp = ft_skip_to_compressed(nf);
+		else
+			bp = ft_node_ptr(nf);
+		if (bp == cp)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Wire a back-pointer (@child->parent = @parent, slot @slot) within a
+ * build-invisible graft cluster.
  *
- * De-duplicated by @child: when a node is re-parented more than once
- * during the build (a canonicalization wrapper later absorbed by a
- * chain-merge into a deeper compressed), the LAST recorded parent wins —
- * matching the final back-pointer the non-deferred path would have left.
+ * Two regimes by @child kind, the rule that the user pinned down:
+ *
+ *   - Internal-to-glue (@child is a freshly-allocated, glue-tracked node):
+ *     store IMMEDIATELY.  The child is unpublished, so the rcu_assign_pointer
+ *     is invisible to readers; doing it now (rather than deferring) means
+ *     the entire intra-cluster back-pointer chain is fully wired by the
+ *     time apply_deferred flips any LIVE-data back-pointer into the
+ *     cluster.  An up-walk from re-parented live data then sees a coherent
+ *     chain from the live edge through the cluster up into publish_parent
+ *     -- no transient NULL parents along the way.
+ *
+ *   - External-to-glue (@child is a LIVE node being re-parented INTO the
+ *     glue cluster, e.g. the displaced old child of a diverge split or
+ *     the source-payload leaf at the bottom of the new branch): record
+ *     the (child, parent, slot) tuple and defer the ft_set_parent until
+ *     ft_graft_glue_apply_deferred at commit time, after the source has
+ *     been drained.  Flipping a live back-pointer during the build would
+ *     be a publication-visible mutation before the cluster is observable.
+ *
+ *   Deferred entries are de-duplicated by @child so a canonicalization
+ *   wrapper later absorbed by a chain-merge keeps only its final mapping.
  */
 static
 void ft_graft_glue_defer_edge(struct ft_graft_glue *g,
@@ -12518,6 +12681,10 @@ void ft_graft_glue_defer_edge(struct ft_graft_glue *g,
 {
 	int i;
 
+	if (ft_graft_glue_is_fresh(g, child)) {
+		ft_set_parent(child, parent, slot);
+		return;
+	}
 	for (i = 0; i < g->nr_deferred; i++) {
 		if (g->deferred[i].child == child) {
 			g->deferred[i].parent = parent;
@@ -12525,7 +12692,7 @@ void ft_graft_glue_defer_edge(struct ft_graft_glue *g,
 			return;
 		}
 	}
-	assert(g->nr_deferred < FT_GRAFT_GLUE_MAX_DEFERRED);
+	assert(g->nr_deferred < g->cap_deferred);
 	g->deferred[g->nr_deferred].child = child;
 	g->deferred[g->nr_deferred].parent = parent;
 	g->deferred[g->nr_deferred].slot = slot;
@@ -12537,16 +12704,16 @@ static
 void ft_graft_glue_defer_free(struct ft_graft_glue *g,
 		void *node, bool compressed)
 {
-	assert(g->nr_free < FT_GRAFT_GLUE_MAX_FREE);
+	assert(g->nr_free < g->cap_free);
 	g->free_list[g->nr_free].node = node;
 	g->free_list[g->nr_free].compressed = compressed;
 	g->nr_free++;
 }
 
 /*
- * Abort the build: free every freshly-built (never-observed) glue node.
- * Both tries are left pristine — no deferred edge was applied, so no
- * live back-pointer references the glue.
+ * Abort the build: free every freshly-built (never-observed) glue node, then
+ * release the malloc'd backing.  Both tries are left pristine — no deferred
+ * edge was applied, so no live back-pointer references the glue.
  */
 static
 void ft_graft_glue_abort(struct cds_ft *ft, struct ft_graft_glue *g)
@@ -12565,13 +12732,23 @@ void ft_graft_glue_abort(struct cds_ft *ft, struct ft_graft_glue *g)
 		else
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(nf));
 	}
+	ft_graft_glue_fini(g);
 }
 
 /*
- * Commit step 1: wire the deferred live back-pointers.  Call after the
+ * Commit step 1: wire the deferred LIVE back-pointers.  Call after the
  * source unlink + grace period, before the forward publish of the
  * cluster top, so an up-walk from any re-parented live node enters the
  * new cluster before the old nodes are forward-detached and freed.
+ *
+ * Only edges whose CHILD is a live (observable) node are deferred --
+ * setting a live node's parent is a publication-visible mutation that
+ * must wait for sync_rcu.  Fresh-to-fresh edges inside the cluster are
+ * set IMMEDIATELY during the build (the child is unpublished, the store
+ * has no reader-visible effect, and by commit time the entire internal
+ * chain from any live re-parent target up to publish_parent is already
+ * in place).  Iteration order here therefore does not matter: each live
+ * back-pointer flip lands on an already-fully-wired cluster.
  */
 static
 void ft_graft_glue_apply_deferred(struct ft_graft_glue *g)
@@ -12585,10 +12762,12 @@ void ft_graft_glue_apply_deferred(struct ft_graft_glue *g)
 
 /*
  * Commit step 2: the single forward publish that makes the whole cluster
- * reachable in dst.  Call after ft_graft_glue_apply_deferred (so every
- * live back-pointer — including the cluster top's, into publish_parent —
- * already points into the new cluster before it becomes forward-reachable
- * and the old nodes are detached).
+ * reachable in dst.  Call after ft_graft_glue_apply_deferred.  The
+ * cluster top's parent is wired into publish_parent at set_publish time
+ * (build phase, fresh-child store) and the rest of the cluster's
+ * internal back-pointers are also already set, so by the time we publish
+ * every back-pointer needed for an up-walk from any re-parented live
+ * node up through the cluster to publish_parent is in place.
  */
 static
 void ft_graft_glue_publish(struct cds_ft *ft, struct ft_graft_glue *g)
@@ -13129,41 +13308,36 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		pmeta = cds_ft_item_to_metadata(ft_node_ptr(d->pnf));
 
 		/*
-		 * Build-invisible commit ordering for the NOSPLIT in-place
-		 * attach:
+		 * Build-invisible commit pattern (mirrors PREP_GLUE):
 		 *
 		 *   (a) Pre-set graft_payload's back-pointer into d->pnf
-		 *       BEFORE the live-data flip.  graft_payload is a freshly
-		 *       allocated cluster node still invisible to readers, so
-		 *       this store has no reader-visible effect; doing it now
-		 *       means that when apply_deferred flips G.parent INTO
-		 *       graft_payload below, an up-walk from G already has a
-		 *       valid graft_payload.parent to follow.  Slot ptr is
-		 *       best-effort (NULL for popcount nodes where the slot
-		 *       doesn't materialize pre-insert) -- the skip_slot_offset
-		 *       is fixed up by ft_node_set_nth's own ft_set_parent
-		 *       below.
+		 *       BEFORE the live-data flip.  graft_payload is freshly
+		 *       allocated and not yet reachable, so this store is
+		 *       invisible to readers; doing it now means that when
+		 *       apply_deferred flips G.parent INTO graft_payload, an
+		 *       up-walk from G already has a valid graft_payload.parent
+		 *       to follow.  Slot ptr is best-effort (NULL for popcount
+		 *       nodes where the slot doesn't materialize pre-insert) --
+		 *       the skip_slot_offset is fixed up by ft_node_set_nth's
+		 *       own ft_set_parent below.
 		 *
-		 *   (b) apply_deferred: flip G.parent = graft_payload (and any
-		 *       other deferred live edges).  G is still invisible via
-		 *       dst (the slot in d->pnf hasn't been written yet), so a
-		 *       reader cannot reach G through dst.
+		 *   (b) apply_deferred: flip G.parent = graft_payload.  G is
+		 *       still invisible via dst (the slot in d->pnf hasn't been
+		 *       written yet), so a reader cannot reach G through dst.
 		 *
-		 *   (c) ft_node_set_nth: in-place insert into d->pnf's slot --
-		 *       the single forward publication that exposes
-		 *       graft_payload to dst readers.  By the time the slot
-		 *       value is observable, the chain
-		 *       G -> graft_payload -> d->pnf is already wired.
+		 *   (c) ft_node_set_nth: in-place insert into d->pnf's slot
+		 *       (or recompact onto a new dest, which is invisible until
+		 *       the ft_publish_to_parent below).  THIS is the single
+		 *       forward publication that exposes graft_payload to dst
+		 *       readers; by then the chain G -> graft_payload ->
+		 *       d->pnf is already wired.
 		 *
-		 * Without (a) and the (b)-before-(c) ordering, an in-flight
-		 * dst reader can descend into the freshly-published slot,
-		 * dereference the skip-compressed slot value, and validate it
-		 * via G's back-pointer -- which would still point into the
-		 * orphaned source (e.g. the prior detach's D-root), tripping
-		 * ft_skip_reanchor's holder!=NULL assert when the walk reaches
-		 * that orphaned root and reads NULL parent.  The recompact
-		 * branch of ft_node_set_nth is already safe because its new
-		 * dest is invisible until the ft_publish_to_parent below.
+		 * Without this ordering an in-flight reader could descend into
+		 * the freshly-published slot, dereference the skip-compressed
+		 * slot value, and validate it via G's back-pointer -- which
+		 * would still point into the orphaned source (D-root from the
+		 * prior detach), tripping ft_skip_reanchor's holder!=NULL
+		 * assert when the walk reaches D-root and reads NULL parent.
 		 */
 		ft_node_get_nth_skip(d->pnf, &slot, key[key_len - 1],
 			FT_PF_NONE);
@@ -13820,6 +13994,55 @@ enum ft_graft_swap_case ft_graft_swap_descend(struct cds_ft *ft,
 	if (!d->nf)
 		return FT_GRAFT_SWAP_DELEGATE;	/* empty slot at key */
 	return FT_GRAFT_SWAP_EXACT;
+}
+
+/*
+ * Read-only locate of a merge point at the end of @key.  Reuses
+ * ft_graft_swap_descend (the same three outcomes, publishes nothing) and
+ * additionally reports the cursor's compressed offset and the subtree's key
+ * count, both needed by cds_ft_merge_at:
+ *
+ *   FT_GRAFT_SWAP_EXACT:       @d->nf is the live subtree at @key; @off_ret 0;
+ *                              @count_ret its nr_keys (1 for an external / dup
+ *                              chain — one unique key).
+ *   FT_GRAFT_SWAP_KEY_SHORTER: @key ends inside compressed @d->nf; @off_ret =
+ *                              key_len - d->depth (bytes consumed into the
+ *                              node); @count_ret the node's subtree nr_keys.
+ *   FT_GRAFT_SWAP_DELEGATE:    no content under @key (src side -> the merge is
+ *                              a no-op; dst side -> the atomic fast-path graft).
+ *
+ * @off_ret / @count_ret are 0 for DELEGATE.
+ */
+static __attribute__((unused))
+enum ft_graft_swap_case ft_merge_descend(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, struct ft_descent *d,
+		unsigned int *off_ret, unsigned long *count_ret)
+{
+	enum ft_graft_swap_case kase = ft_graft_swap_descend(ft, key, key_len, d);
+
+	switch (kase) {
+	case FT_GRAFT_SWAP_KEY_SHORTER:
+	{
+		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
+
+		*off_ret = (unsigned int) (key_len - d->depth);
+		*count_ret = ft_nr_keys_get(
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn));
+		break;
+	}
+	case FT_GRAFT_SWAP_EXACT:
+		*off_ret = 0;
+		if (ft_node_external(d->nf))
+			*count_ret = 1;	/* one key (possibly a dup chain) */
+		else
+			*count_ret = ft_nr_keys_get(ft_flag_to_metadata(d->nf));
+		break;
+	default:	/* FT_GRAFT_SWAP_DELEGATE */
+		*off_ret = 0;
+		*count_ret = 0;
+		break;
+	}
+	return kase;
 }
 
 enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,

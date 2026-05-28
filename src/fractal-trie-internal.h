@@ -22,6 +22,7 @@
 #include <urcu/arch.h>
 #include <urcu/call-rcu.h>
 #include <urcu/uatomic.h>
+#include <urcu/fractal-trie.h>	/* enum cds_ft_numa_policy, cds_ft_optimize */
 #include <assert.h>
 
 /*
