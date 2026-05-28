@@ -1255,9 +1255,6 @@ static inline void ft_delay_reader(void) { }
  *
  * Labels describe the underlying structure without requiring the
  * reader to know the build's pointer width:
- *   - LINEAR_<bytes>: byte-keys + ptr-table; total node size in bytes
- *     (= 2^order).  Only the smallest tier remains LINEAR; larger
- *     tiers use popcount-bitmap layouts.
  *   - P2L_<bytes>: popcount_2l (2-level root_bm + sub_bm[] popcount
  *     layout; sub_bm bit width varies by tier and target pointer
  *     width); total node size in bytes.

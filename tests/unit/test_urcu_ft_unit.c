@@ -7555,20 +7555,19 @@ static int test_show_smoke(void)
  * Adversarial key patterns and per-node child distributions.
  *
  * These tests are designed to stress internal node configurations
- * (linear, 1D pool, 2D pool, pigeon) by constructing key populations
- * that force transitions through every node type, trigger pool
- * fallback paths, exercise hysteresis boundaries, and verify
- * correctness under pathological key distributions.
+ * (popcount-bitmap, pigeon) by constructing key populations that
+ * force transitions through every node type, exercise hysteresis
+ * boundaries, and verify correctness under pathological key
+ * distributions.
  *
  * The node configuration thresholds on 64-bit are:
- *   Type 0 LINEAR:  1 child       (16 B)
- *   Type 1 LINEAR:  1-3 children  (32 B)
- *   Type 2 LINEAR:  3-7 children  (64 B)
- *   Type 3 LINEAR:  5-14 children (128 B)
- *   Type 4 LINEAR:  10-28 children(256 B)
- *   Type 5 POOL 1D: 22-54 children(512 B)  pool uses 1 bit
- *   Type 6 POOL 2D: 51-104 children(1024 B) pool uses 2 bits
- *   Type 7 PIGEON:  95-256 children(2048 B)
+ *   Type 0 popcount_2l:  1-3 children    (32 B)
+ *   Type 1 popcount_2l:  3-6 children    (64 B)
+ *   Type 2 popcount_2l:  5-14 children   (128 B)
+ *   Type 3 popcount_1l:  10-28 children  (256 B)
+ *   Type 4 popcount_1l:  22-60 children  (512 B)
+ *   Type 5 popcount_1l:  51-124 children (1024 B)
+ *   Type 6 PIGEON:       95-256 children (2048 B)
  *
  * On 32-bit the thresholds differ; the tests use counts that cover
  * both architectures by targeting the wider 64-bit thresholds.
@@ -7707,9 +7706,9 @@ out:
 
 /*
  * Insert keys sharing a common first byte, all 256 second-byte values.
- * Forces a single internal node through every configuration: linear
- * (types 0..4), 1D pool (type 5), 2D pool (type 6), and pigeon
- * (type 7). Verifies count and sorted iteration.
+ * Forces a single internal node through every configuration: popcount_2l
+ * (types 0..2), popcount_1l (types 3..5), and pigeon (type 6).  Verifies
+ * count and sorted iteration.
  */
 static int test_adversarial_ramp_all_configs(void)
 {
@@ -7928,9 +7927,9 @@ static int test_adversarial_two_bit_cluster(void)
 }
 
 /*
- * Repeatedly insert and remove keys near the linear-to-pool
- * transition. Insert 30 children (above type 4 max on 64-bit),
- * remove 10 (below type 5 min), re-insert 10. Repeat 3 cycles.
+ * Repeatedly insert and remove keys near a popcount_2l/popcount_1l
+ * tier transition.  Insert 30 children (above type 3 max on 64-bit),
+ * remove 10 (below type 4 min), re-insert 10. Repeat 3 cycles.
  * Verifies that hysteresis-driven recompaction preserves order.
  */
 static int test_adversarial_transition_oscillation(void)
@@ -8019,7 +8018,7 @@ out:
  * Fill a node to 256 children (pigeon), remove every other child
  * (128 removals), then continue removing until only 1 remains.
  * Verifies iteration order at each phase, exercising the full
- * pigeon-to-linear shrink path.
+ * pigeon-to-popcount_2l shrink path.
  */
 static int test_adversarial_sparse_removal(void)
 {
@@ -9674,7 +9673,7 @@ static int test_iter_uncached_copy(void)
 /*
  * Stress test: iterate 256 1-byte keys in UNCACHED mode, dropping
  * the lock at every step. Exercises all internal node configurations
- * (linear, pool, pigeon) under the uncached path.
+ * (popcount_2l, popcount_1l, pigeon) under the uncached path.
  */
 static int test_iter_uncached_all_configs(void)
 {
@@ -11351,8 +11350,8 @@ static int test_verify_empty(void)
 
 /*
  * Insert keys one at a time into a single trie level, growing through
- * all internal node configurations (linear, linear_wide, 1D pool,
- * 2D pool, pigeon).  Verify integrity after every insert.
+ * all internal node configurations (popcount_2l, popcount_1l, pigeon).
+ * Verify integrity after every insert.
  */
 static int test_verify_recompact_grow(void)
 {
@@ -11387,7 +11386,7 @@ static int test_verify_recompact_grow(void)
 
 /*
  * Fill a node to 256 children (pigeon), then remove keys one at a
- * time, shrinking through pigeon -> 2D pool -> 1D pool -> linear.
+ * time, shrinking through pigeon -> popcount_1l -> popcount_2l.
  * Verify integrity after every removal.
  */
 static int test_verify_recompact_shrink(void)
@@ -11856,7 +11855,7 @@ static int test_verify_oscillation(void)
 	unsigned int round, i;
 	enum cds_ft_status s;
 	/*
-	 * On 64-bit: type boundary at max_child=14 (linear) with
+	 * On 64-bit: type boundary at max_child=14 (popcount_2l) with
 	 * min_child=10 for the next type.  Insert 14, remove down to
 	 * 10, repeat.
 	 */

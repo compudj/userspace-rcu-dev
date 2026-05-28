@@ -33,24 +33,23 @@
  * Internal node configurations:
  *
  * Internal nodes self-adapt to the key population using several
- * configurations (linear, popcount-bitmap, pigeon), each with a
- * different indexing strategy suited to its child density.  The
- * appropriate configuration is chosen automatically based on the
- * number of children.  Node sizes are powers of 2 between 16 bytes
- * and 2048 bytes on 64-bit architectures (1024 bytes on 32-bit).
- * Mutations use in-place updates when possible to minimize node
- * recompaction, and hysteresis at size thresholds prevents repeated
- * recompaction when the child count oscillates near a boundary.
+ * configurations (popcount-bitmap, pigeon), each with a different
+ * indexing strategy suited to its child density.  The appropriate
+ * configuration is chosen automatically based on the number of
+ * children.  Node sizes are powers of 2 between 32 bytes and 2048
+ * bytes on 64-bit architectures (1024 bytes on 32-bit).  Mutations
+ * use in-place updates when possible to minimize node recompaction,
+ * and hysteresis at size thresholds prevents repeated recompaction
+ * when the child count oscillates near a boundary.
  *
  * The popcount-bitmap configurations (cascaded 2-level bitmaps for
  * small/medium fan-out, single 256-bit byte bitmap for large
  * fan-out) record which key bytes are populated in a fixed-position
  * bitmap and dispatch matches through a popcount-derived rank.
- * This provides a range of intermediate node sizes between the
- * compact linear configuration and the full 256-entry pigeon
- * configuration, allowing memory-efficient representation of
- * medium-density populations without requiring the full pigeon
- * footprint.  Alternative approaches such as Judy use a population
+ * This provides a range of intermediate node sizes up to the full
+ * 256-entry pigeon configuration, allowing memory-efficient
+ * representation of medium-density populations without requiring
+ * the full pigeon footprint.  Alternative approaches such as Judy use a population
  * bitmap with a dense child array, which requires recompacting the
  * array on every insertion or removal -- incompatible with wait-free
  * RCU lookups because a reader could observe a partially recompacted
