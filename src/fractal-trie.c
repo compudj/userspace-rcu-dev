@@ -14142,9 +14142,29 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 					(long) swap_count - (long) old_count);
 
 		/*
+		 * Drain dst-side readers that may still hold the displaced
+		 * subtree (or any node within it) in their RCU snapshot with
+		 * its OLD parent pointing into dst.  Without this sync, the
+		 * extract apply_deferred below rewires that parent to point
+		 * into cluster B (in swap_ft), and a reader walking up via
+		 * the rewired pointer would CROSS-TRIE-ESCAPE from dst into
+		 * swap_ft — observing top_B's NULL parent at non-root depth.
+		 * The earlier sync at the swap unlink only drains swap_ft
+		 * readers; this one drains dst_ft readers that captured the
+		 * displaced data before it was detached from dst by the
+		 * insert-side publish above.
+		 *
+		 * Exclusive dst carries no RCU readers, so the sync is
+		 * skipped in that case.
+		 */
+		if (!dst_ft->exclusive)
+			dst_ft->group->flavor->update_synchronize_rcu();
+
+		/*
 		 * Extract side: wire cluster B's deferred back-pointer, then install
 		 * swap_ft's new root.  This re-parents the displaced subtree AFTER it
-		 * has been detached from dst by the publish above.
+		 * has been detached from dst by the publish above and after the
+		 * dst-side drain above.
 		 */
 		ft_graft_glue_apply_deferred(&glue_extract);
 		if (top_B) {
