@@ -4575,6 +4575,45 @@ struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 }
 
 /*
+ * Surgical reader descent step: fetch @node_flag's child at byte @n, resolving
+ * a skip-compressed slot mismatch via the live skip-child parent chain instead
+ * of spinning on a (possibly frozen) slot like ft_node_get_nth's validate path.
+ * On a mismatch ft_skip_reanchor locates the live position; *@rewind_ret is how
+ * many byte-depths the resolved node lies ABOVE the dispatched child (0 in the
+ * common split / recompaction case; > 0 only when a concurrent chain-merge
+ * moved the encoded position shallower -- the caller backs its descent cursor
+ * up by that much, or re-descends).  A NULL re-anchor is a transient mid-commit
+ * (the live child's chain converges once the writer's build-invisible commit
+ * completes), so retry locally; never spin on the slot.  Returns the resolved
+ * child flag (compressed/internal/external), or NULL for an empty slot.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_node_get_nth_reanchor(
+		struct cds_ft_inode_flag *node_flag, uint8_t n,
+		unsigned int *rewind_ret)
+{
+	struct cds_ft_inode_flag *child =
+		ft_node_get_nth_skip(node_flag, NULL, n, FT_PF_NONE);
+
+	*rewind_ret = 0;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (caa_unlikely(child && ft_node_skip_compressed(child))) {
+		struct cds_ft_compressed_node *cn =
+			ft_skip_to_compressed_validate(child);
+		struct cds_ft_inode_flag *at_pos, *anchor;
+
+		if (caa_likely(cn != NULL))
+			return ft_compressed_node_flag(cn);
+		while ((anchor = ft_skip_reanchor(child, rewind_ret,
+				&at_pos)) == NULL)
+			caa_cpu_relax();
+		return at_pos;
+	}
+#endif
+	return child;
+}
+
+/*
  * ft_node_find_child: reverse lookup — given a parent internal node and
  * a child pointer, find the key byte and slot that lead to that child.
  *
@@ -7815,7 +7854,24 @@ slow_path:
 		 * must be set regardless of whether descent continues.
 		 */
 		ordinal_key[level - 1] = key_value;
-		node_flag = ft_node_get_nth(node_flag, NULL, key_value, FT_PF_NONE, true /* reader */);
+		{
+			unsigned int rewind;
+
+			/*
+			 * Surgical re-anchor on a skip-compressed mismatch (no
+			 * spin on a frozen slot).  rewind > 0: a concurrent
+			 * chain-merge moved the encoded position shallower;
+			 * re-descend the fixed key path from the root, exactly
+			 * like the fast-path fallback above.
+			 */
+			node_flag = ft_node_get_nth_reanchor(node_flag,
+					key_value, &rewind);
+			if (caa_unlikely(rewind)) {
+				node_flag = ft_dereference_prefetch(ft->root);
+				iter_key = input_key;
+				goto slow_path;
+			}
+		}
 		if (!node_flag) {
 			FT_TP(slowpath_step, (int) level, key_value,
 				(const void *) node_flag, 1);
@@ -14796,7 +14852,24 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 			continue;
 		}
 		kv = prefix[i];
-		node_flag = ft_node_get_nth(node_flag, NULL, kv, FT_PF_NONE, true /* reader */);
+		{
+			unsigned int rewind;
+
+			/*
+			 * Surgical re-anchor on a skip-compressed mismatch (no
+			 * spin on a frozen slot).  rewind > 0 means a concurrent
+			 * chain-merge moved the encoded position shallower; the
+			 * count is over a fixed prefix, so just re-descend from
+			 * the root (idempotent, no rank to undercount).
+			 */
+			node_flag = ft_node_get_nth_reanchor(node_flag, kv,
+					&rewind);
+			if (caa_unlikely(rewind)) {
+				node_flag = ft_dereference_acquire_prefetch(ft->root);
+				i = (unsigned int) -1;	/* loop ++ -> restart at 0 */
+				continue;
+			}
+		}
 	}
 
 	if (!node_flag) {
@@ -15357,7 +15430,23 @@ int ft_rebuild_path(struct cds_ft *ft,
 		}
 		ordinal = key[i];
 		ordinal_key[i] = ordinal;
-		node_flag = ft_node_get_nth(node_flag, NULL, ordinal, FT_PF_NONE, true /* reader */);
+		{
+			unsigned int rewind;
+
+			/*
+			 * Surgical re-anchor (no frozen-slot spin).  rewind > 0:
+			 * a concurrent chain-merge moved the position shallower;
+			 * rebuild this fixed path from the root (idempotent).
+			 */
+			node_flag = ft_node_get_nth_reanchor(node_flag, ordinal,
+					&rewind);
+			if (caa_unlikely(rewind)) {
+				node_flag = ft_dereference_acquire_prefetch(ft->root);
+				iter_path_node(iter)[0] = node_flag;
+				i = (unsigned int) -1;	/* loop ++ -> restart at 0 */
+				continue;
+			}
+		}
 		if (!node_flag)
 			return -1;
 		iter_path_node(iter)[i + 1] = node_flag;
