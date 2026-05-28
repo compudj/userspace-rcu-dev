@@ -3373,6 +3373,18 @@ void ft_popcount_node_get_ith_pos(const struct cds_ft_type *type,
  *   header = 8 B (root_bm + 3 sub_bm)
  *   ptrs   = 24 B (3 child pointers)
  *
+ * scan_16_16_max_3 reads the header as one u64 load and decomposes
+ * via fixed bit-shifts: low 16 bits = root_bm, upper 48 bits =
+ * sub_bm[0..2] in popcount order with sub_bm[0] at bits 16..31.  The
+ * rank `popcount(subs & ((1ULL << bit_pos) - 1))` thus requires
+ * sub_bm[0] in the low bits of the loaded u64.  In memory that maps
+ * to first-to-last byte order on little-endian and last-to-first on
+ * big-endian, so the writer flips the in-memory offsets accordingly
+ * (see ft_popcount_2l_root_bm_addr / ft_popcount_2l_sub_bm_addr).
+ * max_lc=5 uses per-u16 reads (scan_16_16_max_5) and keeps the
+ * canonical "root_bm at offset 0, sub_bm[k] at 2+2k" layout on both
+ * arches.
+ *
  * The lookup is branch-free past the two presence tests and uses
  * portable __builtin_popcount{,ll} -- no SIMD intrinsics, so the
  * same code compiles for any architecture with a popcount intrinsic
@@ -3382,6 +3394,39 @@ struct ft_popcount_2l_header {
 	uint16_t root_bm;
 	uint16_t sub_bm[];	/* length = type->max_child */
 };
+
+/*
+ * Endian-aware addressing of the root_bm and sub_bm[k] u16 slots in
+ * a 2-level popcount header.  See the layout comment above for why
+ * max_lc=3 reverses on big-endian.
+ */
+static inline_lookup
+uint16_t *ft_popcount_2l_root_bm_addr(struct cds_ft_inode *node,
+		unsigned int max_lc)
+{
+	unsigned int offset = 0;
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	if (max_lc == 3)
+		offset = 2U * max_lc;	/* root_bm follows reversed sub_bm[] */
+#endif
+	(void) max_lc;
+	return (uint16_t *) &node->data[offset];
+}
+
+static inline_lookup
+uint16_t *ft_popcount_2l_sub_bm_addr(struct cds_ft_inode *node,
+		unsigned int max_lc, unsigned int k)
+{
+	unsigned int offset = 2U + 2U * k;
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	if (max_lc == 3)
+		offset = 2U * (max_lc - 1U - k);	/* sub_bm[0] highest */
+#endif
+	(void) max_lc;
+	return (uint16_t *) &node->data[offset];
+}
 
 static inline_lookup
 unsigned int ft_popcount_2l_header_bytes(unsigned int max_lc)
@@ -3679,12 +3724,11 @@ uint8_t ft_popcount_2l_node_get_nr_child(const struct cds_ft_type *type,
 		return (uint8_t) __builtin_popcountll(bms);
 	}
 	{
-		struct ft_popcount_2l_header *hdr =
-			(struct ft_popcount_2l_header *) &node->data[0];
 		unsigned int total = 0, k;
 
 		for (k = 0; k < max_lc; k++)
-			total += (unsigned int) __builtin_popcount(hdr->sub_bm[k]);
+			total += (unsigned int) __builtin_popcount(
+					*ft_popcount_2l_sub_bm_addr(node, max_lc, k));
 		return (uint8_t) total;
 	}
 }
@@ -3752,15 +3796,13 @@ void ft_popcount_2l_node_get_ith_pos(const struct cds_ft_type *type,
 		return;
 	}
 	{
-		struct ft_popcount_2l_header *hdr =
-			(struct ft_popcount_2l_header *) &node->data[0];
-		uint16_t root = hdr->root_bm;
+		uint16_t root = *ft_popcount_2l_root_bm_addr(node, max_lc);
 		unsigned int target = i, k, hi, lo;
 		uint16_t sub = 0, root_walk;
 		unsigned int sub_pop = 0;
 
 		for (k = 0; k < max_lc; k++) {
-			sub = hdr->sub_bm[k];
+			sub = *ft_popcount_2l_sub_bm_addr(node, max_lc, k);
 			sub_pop = (unsigned int) __builtin_popcount(sub);
 			if (target < sub_pop)
 				break;
@@ -3978,23 +4020,21 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 	}
 
 	{
-	struct ft_popcount_2l_header *hdr =
-		(struct ft_popcount_2l_header *) &node->data[0];
 	unsigned int hi = (unsigned int) n >> 4;
 	unsigned int lo = (unsigned int) n & 0xFU;
 	uint16_t root, sub;
 	unsigned int slot1, ptr_idx, nr_child, k;
 
 	if (is_init) {
-		memset(hdr, 0, ft_popcount_2l_header_bytes(max_lc));
-		hdr->root_bm = (uint16_t) (1U << hi);
-		hdr->sub_bm[0] = (uint16_t) (1U << lo);
+		memset(&node->data[0], 0, ft_popcount_2l_header_bytes(max_lc));
+		*ft_popcount_2l_root_bm_addr(node, max_lc) = (uint16_t) (1U << hi);
+		*ft_popcount_2l_sub_bm_addr(node, max_lc, 0) = (uint16_t) (1U << lo);
 		pointers[0] = child_node_flag;
 		metadata->nr_child++;
 		return 0;
 	}
 
-	root = hdr->root_bm;
+	root = *ft_popcount_2l_root_bm_addr(node, max_lc);
 	nr_child = ft_popcount_2l_node_get_nr_child(type, node);
 	assert(nr_child < max_lc);
 	slot1 = (unsigned int) __builtin_popcount(root & ((1U << hi) - 1U));
@@ -4007,18 +4047,21 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 		 */
 		unsigned int nr_used = (unsigned int) __builtin_popcount(root);
 		for (k = nr_used; k > slot1; k--)
-			hdr->sub_bm[k] = hdr->sub_bm[k - 1];
-		hdr->sub_bm[slot1] = 0;
-		hdr->root_bm = (uint16_t) (root | (1U << hi));
+			*ft_popcount_2l_sub_bm_addr(node, max_lc, k) =
+				*ft_popcount_2l_sub_bm_addr(node, max_lc, k - 1);
+		*ft_popcount_2l_sub_bm_addr(node, max_lc, slot1) = 0;
+		*ft_popcount_2l_root_bm_addr(node, max_lc) =
+			(uint16_t) (root | (1U << hi));
 	}
-	sub = hdr->sub_bm[slot1];
+	sub = *ft_popcount_2l_sub_bm_addr(node, max_lc, slot1);
 	assert(!((sub >> lo) & 1U));	/* duplicate key would be a bug */
 
 	/* Compute pointer insertion index across full layout. */
 	{
 		uint64_t subs_below = 0;
 		for (k = 0; k < slot1; k++)
-			subs_below += (uint64_t) __builtin_popcount(hdr->sub_bm[k]);
+			subs_below += (uint64_t) __builtin_popcount(
+				*ft_popcount_2l_sub_bm_addr(node, max_lc, k));
 		subs_below += (uint64_t) __builtin_popcount(
 				(unsigned int) sub & ((1U << lo) - 1U));
 		ptr_idx = (unsigned int) subs_below;
@@ -4029,7 +4072,8 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 		pointers[k] = pointers[k - 1];
 	pointers[ptr_idx] = child_node_flag;
 
-	hdr->sub_bm[slot1] = (uint16_t) (sub | (1U << lo));
+	*ft_popcount_2l_sub_bm_addr(node, max_lc, slot1) =
+		(uint16_t) (sub | (1U << lo));
 	metadata->nr_child++;
 	return 0;
 	}
@@ -5149,8 +5193,8 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 		return 0;
 	}
 	if (type->popcount_2l) {
-		struct ft_popcount_2l_header *qp_hdr;
 		struct cds_ft_inode_flag **qp_pointers;
+		unsigned int qp_max_lc = type->max_child;
 		unsigned int qp_hi, qp_lo, qp_slot1, qp_ptr_idx;
 		uint16_t qp_root, qp_sub;
 
@@ -5162,16 +5206,16 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 				*_replace_old_ptr = false;
 			return ret;
 		}
-		qp_hdr = (struct ft_popcount_2l_header *) &node->data[0];
 		qp_pointers = ft_popcount_2l_pointers(node, type);
-		qp_root = qp_hdr->root_bm;
+		qp_root = *ft_popcount_2l_root_bm_addr(node, qp_max_lc);
 		qp_hi = (unsigned int) n >> 4;
 		qp_lo = (unsigned int) n & 0xFU;
 		qp_slot1 = (unsigned int) __builtin_popcount(
 				qp_root & ((1U << qp_hi) - 1U));
 
 		if ((qp_root >> qp_hi) & 1U) {
-			qp_sub = qp_hdr->sub_bm[qp_slot1];
+			qp_sub = *ft_popcount_2l_sub_bm_addr(node,
+					qp_max_lc, qp_slot1);
 			if ((qp_sub >> qp_lo) & 1U) {
 				/* Case 1: key already present, in-place replace. */
 				uint64_t subs_below = 0;
@@ -5180,7 +5224,8 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 				for (k = 0; k < qp_slot1; k++)
 					subs_below += (uint64_t)
 						__builtin_popcount(
-							qp_hdr->sub_bm[k]);
+							*ft_popcount_2l_sub_bm_addr(
+								node, qp_max_lc, k));
 				subs_below += (uint64_t) __builtin_popcount(
 						(unsigned int) qp_sub
 						& ((1U << qp_lo) - 1U));
@@ -5218,7 +5263,8 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 				return -ENOSPC;
 			rcu_assign_pointer(qp_pointers[qp_ptr_idx],
 					child_node_flag);
-			uatomic_store(&qp_hdr->sub_bm[qp_slot1],
+			uatomic_store(ft_popcount_2l_sub_bm_addr(node,
+					qp_max_lc, qp_slot1),
 					(uint16_t) (qp_sub | (1U << qp_lo)),
 					CMM_RELAXED);
 			metadata->nr_child++;
@@ -5242,10 +5288,11 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 			ft_popcount_2l_node_get_nr_child(type, node);
 		if (qp_ptr_idx >= type->max_child)
 			return -ENOSPC;
-		uatomic_store(&qp_hdr->sub_bm[qp_slot1],
+		uatomic_store(ft_popcount_2l_sub_bm_addr(node,
+				qp_max_lc, qp_slot1),
 				(uint16_t) (1U << qp_lo), CMM_RELAXED);
 		rcu_assign_pointer(qp_pointers[qp_ptr_idx], child_node_flag);
-		uatomic_store(&qp_hdr->root_bm,
+		uatomic_store(ft_popcount_2l_root_bm_addr(node, qp_max_lc),
 				(uint16_t) (qp_root | (1U << qp_hi)),
 				CMM_RELAXED);
 		metadata->nr_child++;
