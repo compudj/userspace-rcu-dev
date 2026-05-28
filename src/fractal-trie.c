@@ -9061,17 +9061,19 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		(uint8_t) iter_key[-1],
 		(const void *) top_flag);
 	/*
-	 * Phase 2 (publish) — no failures past here.  First wire the deferred
-	 * back-pointers (bottom publish), then swing the parent's forward slot
-	 * to the new cluster (top publish).  Ordered so an up-walk from a
-	 * deferred child enters the new cluster before it becomes
-	 * forward-reachable.
+	 * Phase 2 (publish) — no failures past here.  First wire the cluster
+	 * top's back-pointer into the live parent and the deferred bottom
+	 * back-pointers, THEN swing the parent's forward slot to the new
+	 * cluster.  Ordered so an up-walk that lands on the new cluster from
+	 * either direction (its top or any re-parented live child) sees every
+	 * back-pointer wired before the cluster becomes forward-reachable.
 	 *
 	 * suffix_len >= 1: edge 1 is the live old child into the new suffix
 	 * (cn->child -> sfx).  suffix_len == 0: edges 1 and 2 are the cluster-
 	 * leaf branch's two children (old = live cn->child, new = new subtree),
 	 * both -> branch_flag.
 	 */
+	ft_set_parent(top_flag, cn_meta->parent, parent_slot);
 	if (deferred_child)
 		ft_set_parent(deferred_child, deferred_parent, deferred_slot);
 	if (deferred_child2)
@@ -10024,7 +10026,11 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 		j, node, d->depth);
 	if (dret)
 		return dret;
-	ft_set_parent(*d->nfp, d->pnf, d->nfp);
+	/*
+	 * ft_split_compressed_insert wires top_flag's back-pointer into the
+	 * live parent before publishing the cluster's forward slot, so the
+	 * caller does not need to set the parent here.
+	 */
 
 	ft_propagate_external_count_parent(ft, d->pnf, 1);
 	return 0;
@@ -10857,16 +10863,21 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			cn = ft_skip_to_compressed(iter_node_flag);
 		else
 			cn = ft_compressed_node_ptr(iter_node_flag);
-		ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
-			&cn->child,
-			(struct cds_ft_inode_flag *) topmost_external_nodes);
 		/*
-		 * Set the external's prev so that ft_skip_to_compressed
-		 * can recover the compressed node from the skip pointer.
+		 * Wire the external's prev to cn BEFORE publishing cn->child:
+		 * after the publish, a skip pointer at cn's grandparent slot
+		 * resolves through cn->child = topmost_external_nodes, and
+		 * ft_skip_to_compressed walks topmost->prev to recover cn.
+		 * Setting prev after the publish leaves a window where prev
+		 * still points at the about-to-be-detached old holder, so
+		 * skip-recovery returns the wrong compressed node.
 		 */
 		ft_set_parent(
 			(struct cds_ft_inode_flag *) topmost_external_nodes,
 			ft_compressed_node_flag(cn), &cn->child);
+		ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
+			&cn->child,
+			(struct cds_ft_inode_flag *) topmost_external_nodes);
 		*nr_clear = 0;
 		return 0;
 	}
