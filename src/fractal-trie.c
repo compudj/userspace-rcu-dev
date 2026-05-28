@@ -1480,9 +1480,18 @@ bool ft_node_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
 #endif
 
 /*
- * ft_metadata_set_external_nodes: set external_nodes on a node's metadata.
+ * ft_metadata_set_external_nodes: Phase 1 — set the cluster-internal
+ * forward pointer (metadata->external_nodes) on a freshly-built node.
  * Asserts that the node is not a compressed node (compressed nodes
  * must not carry metadata->external_nodes).
+ *
+ * This is the cluster-init step.  The matching back-channel publish
+ * (external_nodes->prev = node_flag) is intentionally NOT done here:
+ * setting prev makes the cluster reachable to up-walkers via the live
+ * external's back-pointer, so it must follow node_flag's own parent
+ * being wired.  Use ft_publish_external_nodes_prev for that, ordered
+ * after the cluster top's parent is set and immediately before (or as
+ * part of) the forward publish.
  *
  * @node_flag: tagged pointer to the node (used for type check).
  * @metadata: the node's metadata.
@@ -1498,10 +1507,27 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
 		abort();
 	}
 	metadata->external_nodes = external_nodes;
-	if (external_nodes)
-		external_nodes->prev = node_flag;
 	FT_TP(metadata_set_external_nodes, (const void *) node_flag,
 		(const void *) external_nodes);
+}
+
+/*
+ * ft_publish_external_nodes_prev: Phase 2 — publish the back-channel
+ * pointer external_nodes->prev = node_flag via rcu_assign_pointer.
+ *
+ * Call AFTER node_flag's own parent is wired (so an up-walker arriving
+ * via the new prev lands on a parent-wired cluster top, not a NULL
+ * parent), and at-or-just-before the forward publish that makes the
+ * cluster reachable through node_flag's slot.  No-op when @external_nodes
+ * is NULL (callers commonly guard on metadata->external_nodes).
+ */
+static inline
+void ft_publish_external_nodes_prev(struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_node *external_nodes)
+{
+	if (!external_nodes)
+		return;
+	rcu_assign_pointer(external_nodes->prev, node_flag);
 }
 
 /*
@@ -4566,41 +4592,26 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip_pretyped(
 }
 
 /*
- * ft_node_get_nth: child slot access with skip-compressed resolution.
- * If the child is a skip pointer, converts it to the underlying
- * compressed node flag so callers see it as a regular compressed node.
- * Used by all paths except candidate lookup.
+ * ft_node_get_nth: child slot access with skip-compressed resolution
+ * for writer / debug callers.
  *
- * @validate_lookup: when true, validate the skip-compressed resolution
- * against the slot's skip_len and retry on mismatch.  RCU readers
- * pass true; writers must pass false (a writer mid-mutation reading
- * its own in-flight state would loop forever).
+ * Resolves any skip pointer via the slot value directly (no validation,
+ * no concurrency handling).  All RCU reader paths use
+ * ft_node_get_nth_reanchor instead, which validates the skip pointer
+ * against the live compressed node and re-anchors via the child's
+ * parent chain on a mismatch (the single concurrency mechanism — see
+ * ft_skip_reanchor).  The historical validate=true spin loop here is
+ * therefore gone; the @validate_lookup parameter is dropped.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth(struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
-		uint8_t n, enum ft_pf_target pf_hint, bool validate_lookup)
+		uint8_t n, enum ft_pf_target pf_hint)
 {
-	for (;;) {
-		struct cds_ft_inode_flag *child =
-			ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
+	struct cds_ft_inode_flag *child =
+		ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
 
-		if (!validate_lookup)
-			return ft_resolve_skip_compressed(child);
-		if (!child || !ft_node_skip_compressed(child))
-			return child;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-		{
-			struct cds_ft_compressed_node *cn =
-				ft_skip_to_compressed_validate(child);
-			if (caa_likely(cn != NULL))
-				return ft_compressed_node_flag(cn);
-		}
-		caa_cpu_relax();
-#else
-		return child;
-#endif
-	}
+	return ft_resolve_skip_compressed(child);
 }
 
 /*
@@ -4680,7 +4691,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 				if (n_ret)
 					*n_ret = v;
 				if (slot_ret)
-					ft_node_get_nth(parent_nf, slot_ret, v, FT_PF_NONE, false /* writer */);
+					ft_node_get_nth(parent_nf, slot_ret, v, FT_PF_NONE);
 				return true;
 			}
 		}
@@ -4698,7 +4709,7 @@ bool ft_node_find_child(struct cds_ft_inode_flag *parent_nf,
 				if (n_ret)
 					*n_ret = (uint8_t) i;
 				if (slot_ret)
-					ft_node_get_nth(parent_nf, slot_ret, i, FT_PF_NONE, false /* writer */);
+					ft_node_get_nth(parent_nf, slot_ret, i, FT_PF_NONE);
 				return true;
 			}
 		}
@@ -5526,8 +5537,18 @@ int ft_node_recompact(enum ft_recompact mode,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			new_metadata->skip_slot_offset = metadata->skip_slot_offset;
 #endif
+			/*
+			 * Recompact: new_metadata->parent is already inherited
+			 * above, so the back-channel prev = new_node_flag is
+			 * safe to publish here (up-walkers reach a parent-wired
+			 * node).  Split into the Phase-1 metadata write + the
+			 * Phase-2 prev publish for consistency with the other
+			 * external-nodes attach sites.
+			 */
 			ft_metadata_set_external_nodes(new_node_flag,
 				new_metadata, metadata->external_nodes);
+			ft_publish_external_nodes_prev(new_node_flag,
+				metadata->external_nodes);
 			ft_nr_keys_store(new_metadata,
 				ft_nr_keys_get(metadata), CMM_RELAXED);
 		}
@@ -9101,6 +9122,12 @@ error:
  * node as external_nodes on the junction and handles publication,
  * propagation, and freeing of the old compressed node.
  *
+ * @parent_slot: address of the slot in cn's parent that holds cn.  Used
+ * to wire top_flag's own back-pointer into the live parent BEFORE the
+ * deferred (back-channel) re-parent of cn->child into the new suffix.
+ * Otherwise an up-walk from cn->child enters the new cluster and walks
+ * up to top_flag, which would have parent == NULL.
+ *
  * On success, sets *top_ret to the topmost node (prefix or junction)
  * and *jct_ret to the junction node.  Returns 0.
  * On failure, frees any partially created nodes and returns -ENOMEM.
@@ -9108,6 +9135,7 @@ error:
 static
 int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		struct cds_ft_inode_flag *compressed_flag,
+		struct cds_ft_inode_flag **parent_slot,
 		unsigned int remaining,
 		struct cds_ft_inode_flag **top_ret,
 		struct cds_ft_inode_flag **jct_ret,
@@ -9379,10 +9407,14 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	}
 
 	/*
-	 * Failure-free tail: wire the single deferred back-pointer (the live old
-	 * child into the new suffix / junction).  No allocation happens past
-	 * here; the caller publishes the top forward immediately after we return.
+	 * Failure-free tail.  First wire top_flag's own back-pointer into
+	 * cn's live parent (so an up-walk that enters the cluster via the
+	 * deferred back-channel below finds a parent-wired top), THEN wire
+	 * the single deferred back-pointer (the live old child into the new
+	 * suffix / junction).  No allocation happens past here; the caller
+	 * publishes the top forward immediately after we return.
 	 */
+	ft_set_parent(top_flag, cn_meta->parent, parent_slot);
 	if (deferred_child)
 		ft_set_parent(deferred_child, deferred_parent, deferred_slot);
 
@@ -9774,7 +9806,18 @@ int ft_attach_node(struct cds_ft *ft,
 			struct cds_ft_metadata *iter_node_metadata;
 
 			iter_node_metadata = cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
-			ft_metadata_set_external_nodes(iter_node_flag, iter_node_metadata, external_nodes);
+			/*
+			 * Phase 1 (build-invisible): write the cluster top's
+			 * cluster-internal external_nodes pointer.  The
+			 * back-channel publish (external_nodes->prev =
+			 * iter_node_flag) is deferred to Phase 2 below, after
+			 * set_nth wires iter_node_flag's parent — otherwise an
+			 * up-walk from external_nodes (still reachable through
+			 * the old slot at attach_node_flag_ptr) lands on
+			 * iter_node_flag with parent == NULL.
+			 */
+			ft_metadata_set_external_nodes(iter_node_flag,
+				iter_node_metadata, external_nodes);
 			ft_nr_keys_store(iter_node_metadata,
 				ft_nr_keys_get(iter_node_metadata) + 1, CMM_RELAXED);
 		}
@@ -9796,6 +9839,13 @@ int ft_attach_node(struct cds_ft *ft,
 			dbg_printf("branch publish error %d\n", ret);
 			goto check_error;
 		}
+		/*
+		 * Phase 2: iter_node_flag's parent is now wired (by
+		 * ft_node_set_nth above, either in-place or via recompact's
+		 * reparent loop).  Wire the back-channel from the live
+		 * displaced external before the outer forward publish.
+		 */
+		ft_publish_external_nodes_prev(iter_node_flag, external_nodes);
 		/* Attach branch (unlink the old node from the trie).
 		 * ft_publish_to_parent handles skip pointer update
 		 * if the attach target is a compressed node's child.
@@ -9862,7 +9912,7 @@ struct cds_ft_inode_flag *ft_descent_step(struct ft_descent *d,
 	d->ppnfp = d->pnfp;
 	d->pnf   = d->nf;
 	d->pnfp  = d->nfp;
-	d->nf    = ft_node_get_nth(d->pnf, &d->nfp, key_value, FT_PF_NONE, false /* writer */);
+	d->nf    = ft_node_get_nth(d->pnf, &d->nfp, key_value, FT_PF_NONE);
 	d->depth++;
 	return d->nf;
 }
@@ -9977,6 +10027,14 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 			return -ENOMEM;
 		branch = dest;
 		br_meta = cds_ft_item_to_metadata(ft_node_ptr(branch));
+		/*
+		 * Phase 1 (build-invisible): wire branch's own parent and its
+		 * cluster-internal external_nodes pointer.  The back-channel
+		 * publish (cn->child->prev = branch) is deferred to Phase 2
+		 * below — otherwise an up-walk from cn->child (still reachable
+		 * through the unmodified cn) lands on branch with parent NULL.
+		 */
+		ft_set_parent(branch, d->nf, &cn->child);
 		ft_metadata_set_external_nodes(branch, br_meta,
 			(struct cds_ft_node *) cn->child);
 		/*
@@ -9986,7 +10044,8 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		 */
 		ft_nr_keys_store(br_meta, 1, CMM_RELAXED);
 	}
-	ft_set_parent(branch, d->nf, &cn->child);
+	/* Phase 2: back-channel + forward publish. */
+	ft_publish_external_nodes_prev(branch, (struct cds_ft_node *) cn->child);
 	ft_publish_to_parent(ft, d->nf, &cn->child, branch);
 	ft_propagate_external_count_parent(ft, branch, 1);
 	return 0;
@@ -10041,10 +10100,14 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	int sret;
 
 	sret = ft_split_compressed_key_shorter(ft,
-		d->nf, remaining, &top_flag, &jct_flag, d->depth);
+		d->nf, d->nfp, remaining, &top_flag, &jct_flag, d->depth);
 	if (sret)
 		return sret;
-	ft_set_parent(top_flag, d->pnf, d->nfp);
+	/*
+	 * ft_split_compressed_key_shorter wires top_flag's back-pointer into
+	 * the live parent before its deferred back-channel re-parent of
+	 * cn->child, so the caller does not need to set the parent here.
+	 */
 	ft_publish_to_parent(ft, d->pnf, d->nfp, top_flag);
 	{
 		struct cds_ft_metadata *jct_meta =
@@ -10720,7 +10783,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			continue;
 		}
 		key_value = *(iter_key++);
-		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value, FT_PF_NONE, false /* writer */);
+		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value, FT_PF_NONE);
 		if (!node_flag) {
 			s = CDS_FT_STATUS_NOT_FOUND;
 			FT_TP(replace_exit, (int) s);
@@ -11248,8 +11311,7 @@ int ft_detach_node(struct cds_ft *ft,
 							next = ft_node_get_nth(
 								walk_nf, NULL,
 								(uint8_t) key,
-								FT_PF_NONE,
-								false /* writer */);
+								FT_PF_NONE);
 							if (next)
 								break;
 						}
@@ -11382,8 +11444,8 @@ int ft_detach_node(struct cds_ft *ft,
 						for (key = 0; key < 256; key++) {
 							next = ft_node_get_nth(
 								walk_nf, NULL,
-								(uint8_t) key, FT_PF_NONE,
-								false /* writer */);
+								(uint8_t) key,
+								FT_PF_NONE);
 							if (next)
 								break;
 						}
@@ -11426,8 +11488,8 @@ int ft_detach_node(struct cds_ft *ft,
 								for (key = 0; key < 256; key++) {
 									next = ft_node_get_nth(
 										walk_nf, NULL,
-										(uint8_t) key, FT_PF_NONE,
-										false /* writer */);
+										(uint8_t) key,
+										FT_PF_NONE);
 									if (next)
 										break;
 								}
@@ -12664,7 +12726,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 					struct cds_ft_inode_flag *next;
 					uint8_t kv = key[i + 1];
 
-					next = ft_node_get_nth(cur, NULL, kv, FT_PF_NONE, false /* writer */);
+					next = ft_node_get_nth(cur, NULL, kv, FT_PF_NONE);
 					free_cds_ft_node(ft, ft_node_ptr(cur));
 					cur = next;
 					i++;
@@ -13126,21 +13188,26 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		if (displaced) {
 			struct cds_ft_metadata *bm =
 				ft_flag_to_metadata(branch);
+			/*
+			 * Phase 1 (build-invisible): wire branch's own back-
+			 * pointer into d->pnf and the cluster-internal
+			 * external_nodes pointer.  The back-channel publish
+			 * (displaced->prev = branch) is deferred to Phase 2
+			 * below; otherwise an up-walk from displaced (still
+			 * reachable through d->pnf's unmodified slot) lands on
+			 * branch with parent == NULL.  The payload leaf's
+			 * back-pointer is applied via @glue just before the
+			 * forward publish below.
+			 */
+			ft_set_parent(branch, d->pnf, d->nfp);
 			ft_metadata_set_external_nodes(branch, bm, displaced);
 			ft_nr_keys_store(bm, ft_nr_keys_get(bm) + 1,
 				CMM_RELAXED);
 		}
 
 		if (displaced) {
-			/*
-			 * Publish the branch into d->pnf's existing slot (the
-			 * one that held the displaced external): a single slot
-			 * swing, no recompaction.  branch is fresh, so its own
-			 * back-pointer is safe to set now; the payload leaf's
-			 * back-pointer is applied via @glue just before the
-			 * publish.
-			 */
-			ft_set_parent(branch, d->pnf, d->nfp);
+			/* Phase 2: back-channel + glue deferred + forward publish. */
+			ft_publish_external_nodes_prev(branch, displaced);
 			ft_graft_glue_apply_deferred(glue);
 			ft_publish_to_parent(ft, d->pnf, d->nfp, branch);
 			if (i >= 1)
@@ -14112,6 +14179,15 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			if (old_child) {
 				ft_metadata_set_external_nodes(root_nf, rm,
 					(struct cds_ft_node *) ft_node_ptr(old_child));
+				/*
+				 * Root: parent is legitimately NULL.  Publishing
+				 * prev here is safe (no fresh non-root cluster
+				 * node in this back-pointer chain); kept paired
+				 * with the metadata write for consistency with
+				 * the other attach sites.
+				 */
+				ft_publish_external_nodes_prev(root_nf,
+					(struct cds_ft_node *) ft_node_ptr(old_child));
 				ft_nr_keys_store(rm, old_count, CMM_RELEASE);
 			}
 		}
@@ -14445,8 +14521,8 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						for (kv = 0; kv < 256; kv++) {
 							next = ft_node_get_nth(
 								chain_head, NULL,
-								(uint8_t) kv, FT_PF_NONE,
-								false /* writer */);
+								(uint8_t) kv,
+								FT_PF_NONE);
 							if (next)
 								break;
 						}
@@ -14543,6 +14619,13 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				struct cds_ft_metadata *dmeta =
 					ft_root_metadata(detached);
 				ft_metadata_set_external_nodes(detached->root, dmeta,
+					(struct cds_ft_node *)
+					ft_node_ptr(child));
+				/*
+				 * detached->root: parent is legitimately NULL.
+				 * Pair the prev publish for consistency.
+				 */
+				ft_publish_external_nodes_prev(detached->root,
 					(struct cds_ft_node *)
 					ft_node_ptr(child));
 				ft_nr_keys_store(dmeta, detached_count, CMM_RELAXED);
@@ -18020,7 +18103,7 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 	for (key = 0; key < 256; key++) {
 		struct cds_ft_inode_flag *child_node_flag;
 
-		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE, false /* debug */);
+		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 		if (!child_node_flag)
 			continue;
 		if (ft_node_internal(child_node_flag)) {
@@ -18222,7 +18305,7 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 		for (key = 0; key < 256; key++) {
 			struct cds_ft_inode_flag *child;
 
-			child = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE, false /* debug */);
+			child = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 			if (!child)
 				continue;
 			if (printed++) fprintf(out, ",");
@@ -18328,7 +18411,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 	for (key = 0; key < 256; key++) {
 		struct cds_ft_inode_flag *child_node_flag;
 
-		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE, false /* debug */);
+		child_node_flag = ft_node_get_nth(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
 		if (!child_node_flag)
 			continue;
 		if (ft_node_internal(child_node_flag)) {
