@@ -13128,6 +13128,49 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		pmeta = cds_ft_item_to_metadata(ft_node_ptr(d->pnf));
 
+		/*
+		 * Build-invisible commit ordering for the NOSPLIT in-place
+		 * attach:
+		 *
+		 *   (a) Pre-set graft_payload's back-pointer into d->pnf
+		 *       BEFORE the live-data flip.  graft_payload is a freshly
+		 *       allocated cluster node still invisible to readers, so
+		 *       this store has no reader-visible effect; doing it now
+		 *       means that when apply_deferred flips G.parent INTO
+		 *       graft_payload below, an up-walk from G already has a
+		 *       valid graft_payload.parent to follow.  Slot ptr is
+		 *       best-effort (NULL for popcount nodes where the slot
+		 *       doesn't materialize pre-insert) -- the skip_slot_offset
+		 *       is fixed up by ft_node_set_nth's own ft_set_parent
+		 *       below.
+		 *
+		 *   (b) apply_deferred: flip G.parent = graft_payload (and any
+		 *       other deferred live edges).  G is still invisible via
+		 *       dst (the slot in d->pnf hasn't been written yet), so a
+		 *       reader cannot reach G through dst.
+		 *
+		 *   (c) ft_node_set_nth: in-place insert into d->pnf's slot --
+		 *       the single forward publication that exposes
+		 *       graft_payload to dst readers.  By the time the slot
+		 *       value is observable, the chain
+		 *       G -> graft_payload -> d->pnf is already wired.
+		 *
+		 * Without (a) and the (b)-before-(c) ordering, an in-flight
+		 * dst reader can descend into the freshly-published slot,
+		 * dereference the skip-compressed slot value, and validate it
+		 * via G's back-pointer -- which would still point into the
+		 * orphaned source (e.g. the prior detach's D-root), tripping
+		 * ft_skip_reanchor's holder!=NULL assert when the walk reaches
+		 * that orphaned root and reads NULL parent.  The recompact
+		 * branch of ft_node_set_nth is already safe because its new
+		 * dest is invisible until the ft_publish_to_parent below.
+		 */
+		ft_node_get_nth_skip(d->pnf, &slot, key[key_len - 1],
+			FT_PF_NONE);
+		ft_set_parent(graft_payload, d->pnf, slot);
+
+		ft_graft_glue_apply_deferred(glue);
+
 		dest = d->pnf;
 		ret = ft_node_set_nth(ft, &dest,
 			key[key_len - 1],
@@ -13140,8 +13183,9 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		 * graft_payload is a PLAIN compressed flag in glue mode
 		 * (compress returns plain so its back-pointer recovers
 		 * directly).  Re-encode the holding slot to the skip form for
-		 * canonicality; it resolves once the deferred grandchild
-		 * back-pointer is applied below.
+		 * canonicality.  At this point apply_deferred has already
+		 * applied the grandchild back-pointer, so the skip form
+		 * resolves consistently.
 		 */
 		if (ft_node_compressed(graft_payload)) {
 			struct cds_ft_inode_flag *skip;
@@ -13155,7 +13199,6 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 				rcu_assign_pointer(*slot, skip);
 		}
 
-		ft_graft_glue_apply_deferred(glue);
 		ft_publish_to_parent(ft, pmeta->parent, d->pnfp, dest);
 
 		if (old_recompacted_node)
