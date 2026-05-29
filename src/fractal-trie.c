@@ -4863,6 +4863,16 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 		assert(0);
 		return (void *) -1UL;
 	}
+	/*
+	 * Resolve a cds_ft_merge_at flip proxy (type 7) transiently occupying an
+	 * interior merge-point slot, so every ordered traversal reaching a
+	 * directional child through this accessor (iteration via
+	 * ft_node_get_leftright / ft_node_get_minmax and the relational lookups)
+	 * sees the view-appropriate old-or-merged child.  Predicted-not-taken
+	 * when no merge is in flight; NULL and skip-encoded children pass through
+	 * unchanged (a skip child's low nibble is its tag, never the 0xF proxy).
+	 */
+	child = ft_resolve_flip_proxy(child);
 	if (!validate_lookup)
 		return ft_resolve_skip_compressed(child);
 	/*
@@ -6518,6 +6528,15 @@ descend_loop:
 				status = CDS_FT_STATUS_NOT_FOUND;
 				goto end;
 			}
+			/*
+			 * A cds_ft_merge_at flip transiently installs a type-7
+			 * proxy in an interior merge-point slot; resolve it to the
+			 * view-appropriate (old or merged) child before the skip /
+			 * kind handlers classify it.  Predicted-not-taken when no
+			 * merge is in flight (the proxy tag 0xF never matches an
+			 * internal / external / compressed / skip child).
+			 */
+			node_flag = ft_resolve_flip_proxy(node_flag);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			if (skip_compressed && !descend_cand
 			    && caa_unlikely(ft_node_skip_compressed(node_flag))) {
@@ -16089,13 +16108,14 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
  * @src_ft merged at @src_key (@d_src its EXACT subtree, @cnt_src its key count)
  * into @d_dst, an EXACT non-empty dst subtree.  A root src (src_key_len == 0)
  * unlinks via the ft->root swap; a non-root src unlinks its branch in place at
- * commit (the only post-build fallible step).  Compressed overlaps are handled.
- * A non-root DST merge point (d_dst->pnf) still delegates: its interior forward
- * slot would need read-side flip-proxy resolution at child dispatch, not yet
- * wired -- *delegated is set and the caller uses the per-entry fallback.
+ * commit (the only post-build fallible step).  Both root and non-root dst merge
+ * points are handled: a non-root point flips the interior forward slot through
+ * a type-7 proxy that the read-side descent resolves at every child fetch.
+ * Compressed overlaps are handled.  @delegated is retained for shapes a future
+ * caller may not handle; it is currently never set (every EXACT/EXACT-non-empty
+ * shape commits here).
  *
- * Returns OK on a committed merge, MEMORY_ERROR on OOM (pristine), or (with
- * *delegated set) an unused status.
+ * Returns OK on a committed merge, or MEMORY_ERROR on OOM (both tries pristine).
  */
 static
 enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
@@ -16118,11 +16138,23 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	*delegated = false;
 
 	/*
-	 * Non-root dst merge point: the flip would proxy an interior child slot
-	 * that the read-side descent does not resolve at child dispatch (only
-	 * the root read resolves flip proxies).  Delegate to the per-entry path.
+	 * Both root and internal-parent non-root dst merge points are handled:
+	 * the flip proxies the interior forward slot *d_dst->nfp, the read-side
+	 * descent resolves the type-7 proxy at every child fetch
+	 * (ft_resolve_flip_proxy), and M's parent is wired to d_dst->pnf by
+	 * ft_graft_glue_set_publish, so a descent and an up-walk see a coherent
+	 * old-XOR-merged view across the flip.
+	 *
+	 * A non-root merge point still delegates unless BOTH the merge point and
+	 * its parent are plain internal nodes: a COMPRESSED parent would proxy a
+	 * cn->child slot (different read sites + a grandparent skip pointer to
+	 * re-encode), and a COMPRESSED/EXTERNAL merge point would publish a
+	 * non-internal cluster whose back-pointers the flip's settle does not
+	 * yet rewrite.  Those shapes use the per-entry fallback.
 	 */
-	if (d_dst->pnf) {
+	if (d_dst->pnf &&
+	    (ft_node_compressed(ft_resolve_skip_compressed(d_dst->pnf)) ||
+	     !ft_node_internal(ft_resolve_skip_compressed(d_dst->nf)))) {
 		*delegated = true;
 		return CDS_FT_STATUS_OK;	/* ignored by caller */
 	}

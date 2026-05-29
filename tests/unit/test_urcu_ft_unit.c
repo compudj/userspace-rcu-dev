@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 214
+#define NR_TESTS 216
 #else
-#define NR_TESTS 209
+#define NR_TESTS 210
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -14062,6 +14062,101 @@ out_dst:
 }
 
 /*
+ * Merge into a NON-ROOT dst merge point: the merged cluster publishes through
+ * an interior forward slot, so the flip installs a type-7 proxy there and
+ * readers descending past it resolve it at child dispatch.  dst_key "P" lands
+ * at a depth-1 INTERNAL subtree (its parent is the root, so d_dst->pnf != NULL);
+ * single-byte children keep that merge point a plain internal branch (a
+ * compressed / external merge point still delegates).  A disjoint "Z" subtree
+ * confirms the rest of dst is intact.
+ *
+ *   dst {Pa, Pb, Z}                  src {a, c}  (root src)
+ *   merge_at(dst, "P", src, "") -> dst {Pa x2, Pb, Pc, Z}, src empty
+ */
+static int test_merge_at_nonroot_dst(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	static const char *const dkeys[] = { "Pa", "Pb", "Z" };
+	static const char *const skeys[] = { "a", "c" };
+	const struct merge_expected dst_after[] = {
+		{ "Pa", 2 }, { "Pb", 2 }, { "Pc", 2 }, { "Z", 1 },
+	};
+	unsigned int i;
+	unsigned long total;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < CAA_ARRAY_SIZE(dkeys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(dst, (const uint8_t *) dkeys[i],
+				strlen(dkeys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	for (i = 0; i < CAA_ARRAY_SIZE(skeys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(src, (const uint8_t *) skeys[i],
+				strlen(skeys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_nonroot_dst: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_at_nonroot_dst: src not empty\n");
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < CAA_ARRAY_SIZE(dst_after); i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (cds_ft_eager_lookup_key(dst,
+				(const uint8_t *) dst_after[i].key,
+				dst_after[i].key_len, dst_after[i].key_len,
+				&found) != CDS_FT_STATUS_OK || !found) {
+			rcu_read_unlock();
+			fprintf(stderr, "merge_at_nonroot_dst: dst missing '%s'\n",
+				dst_after[i].key);
+			goto out;
+		}
+	}
+	total = cds_ft_count_entries(dst);
+	rcu_read_unlock();
+	if (total != 5) {	/* Pa is a 2-entry chain. */
+		fprintf(stderr, "merge_at_nonroot_dst: dst %lu entries, expected 5\n",
+			total);
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "merge_at_nonroot_dst: verify failed\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Fixed-length group rejects cross-key merge with mismatched key
  * lengths.
  */
@@ -15707,6 +15802,98 @@ static int test_merge_oom_nonroot_src(void)
 {
 	return run_merge_oom_nonroot_src(24);
 }
+
+/*
+ * As run_merge_oom_compressed, but into a NON-ROOT dst merge point (the merged
+ * cluster publishes through an interior slot via the flip's type-7 proxy).  A
+ * disjoint "Q" subtree in dst must stay intact on every OOM.  On success dst
+ * holds the merged union under "P" plus "Q"; on OOM both tries are pristine.
+ */
+static int run_merge_oom_nonroot_dst(int nr_faults)
+{
+	static const char *const dkeys[] = { "Pa", "Pb", "Z" };
+	static const char *const skeys[] = { "a", "c" };
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group);
+		struct cds_ft *src;
+		enum cds_ft_status s;
+		int verified, keys_ok;
+		unsigned int i;
+
+		if (cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom_nonroot_dst: src create failed\n");
+			return -1;
+		}
+		for (i = 0; i < CAA_ARRAY_SIZE(dkeys); i++) {
+			struct ft_test_node *dn = node_alloc(100 + i);
+
+			if (cds_ft_insert(dst, (const uint8_t *) dkeys[i],
+					strlen(dkeys[i]), &dn->node) < 0)
+				rc = -1;
+		}
+		for (i = 0; i < CAA_ARRAY_SIZE(skeys); i++) {
+			struct ft_test_node *sn = node_alloc(200 + i);
+
+			if (cds_ft_insert(src, (const uint8_t *) skeys[i],
+					strlen(skeys[i]), &sn->node) < 0)
+				rc = -1;
+		}
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		if (s == CDS_FT_STATUS_OK) {
+			keys_ok = graft_swap_oom_has_key(dst, "Pa") &&
+				graft_swap_oom_has_key(dst, "Pb") &&
+				graft_swap_oom_has_key(dst, "Pc") &&
+				graft_swap_oom_has_key(dst, "Z") &&
+				cds_ft_count_entries(dst) == 5 &&
+				cds_ft_empty(src);
+		} else {
+			/* OOM: both tries pristine. */
+			keys_ok = graft_swap_oom_has_key(dst, "Pa") &&
+				graft_swap_oom_has_key(dst, "Pb") &&
+				!graft_swap_oom_has_key(dst, "Pc") &&
+				graft_swap_oom_has_key(dst, "Z") &&
+				cds_ft_count_entries(dst) == 3 &&
+				graft_swap_oom_has_key(src, "a") &&
+				graft_swap_oom_has_key(src, "c") &&
+				cds_ft_count_entries(src) == 2;
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom_nonroot_dst: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_nonroot_dst(void)
+{
+	return run_merge_oom_nonroot_dst(20);
+}
 #endif /* FEATURE_FT_FAULT_INJECT */
 
 int main(int argc, char **argv)
@@ -15984,6 +16171,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_at_fixed_rekey);
 	RUN_TEST(test_merge_at_overlap);
 	RUN_TEST(test_merge_at_nonroot_src);
+	RUN_TEST(test_merge_at_nonroot_dst);
 	RUN_TEST(test_merge_at_fixed_unequal_keylen);
 
 	diag("External-node arena allocator tests");
@@ -16011,6 +16199,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom_overlap);
 	RUN_TEST(test_merge_oom_compressed);
 	RUN_TEST(test_merge_oom_nonroot_src);
+	RUN_TEST(test_merge_oom_nonroot_dst);
 #endif
 
 	rcu_barrier();

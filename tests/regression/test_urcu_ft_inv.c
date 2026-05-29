@@ -65,7 +65,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	13
+#define NR_TESTS	14
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -3231,6 +3231,184 @@ static int inv_merge_no_escape(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 11: Merge into a NON-ROOT dst never escapes             */
+/*                                                                    */
+/*   As invariant 10, but the writer merges its private root source    */
+/*   {ac,ad,bc,bd} into dst at the INTERIOR key "T" (re-keying to      */
+/*   {Tac,Tad,Tbc,Tbd}).  dst base {Taa,Tab,Tba,Tbb} keeps "T" a live  */
+/*   internal subtree, so the build-invisible spine copy publishes      */
+/*   through an interior forward slot via a type-7 flip proxy.  An      */
+/*   ordered reader traversing dst across the flip window must resolve  */
+/*   that proxy at child dispatch (point descent + ft_node_get_         */
+/*   direction); a missed resolve surfaces a garbage child or a key     */
+/*   outside {T}{a,b}{a..d}.  The dst reader of invariant 10 is reused  */
+/*   verbatim (same namespace).                                        */
+/* ================================================================== */
+
+static const char *const inv_merge_nrd_base_keys[] = {
+	"Taa", "Tab", "Tba", "Tbb",
+};
+static const char *const inv_merge_nrd_src_keys[] = { "ac", "ad", "bc", "bd" };
+static const char *const inv_merge_nrd_merged_keys[] = {
+	"Tac", "Tad", "Tbc", "Tbd",
+};
+
+static void *inv_merge_nonroot_dst_writer(void *arg)
+{
+	struct inv_merge_ctx *ctx = (struct inv_merge_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int i;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		enum cds_ft_status s;
+
+		/* Merge the root source into dst at the interior key "T". */
+		pthread_mutex_lock(&ctx->lock);
+		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "T", 1,
+				ctx->src, NULL, 0);
+		pthread_mutex_unlock(&ctx->lock);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_merge_nonroot_dst writer: %s\n",
+				cds_ft_status_to_string(s));
+			break;
+		}
+		rcu_quiescent_state();
+
+		/* Reset: pull the merged keys back out, re-populate src. */
+		rcu_read_lock();
+		cds_ft_iter_invalidate_path(iter);
+		pthread_mutex_lock(&ctx->lock);
+		for (i = 0; i < 4; i++)
+			inv_merge_remove_key(ctx->dst, iter,
+				inv_merge_nrd_merged_keys[i]);
+		for (i = 0; i < 4; i++) {
+			struct ft_test_node *n = node_alloc(300 + i);
+
+			cds_ft_insert(ctx->src,
+				(const uint8_t *) inv_merge_nrd_src_keys[i],
+				strlen(inv_merge_nrd_src_keys[i]), &n->node);
+		}
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_merge_nonroot_dst_no_escape(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct inv_merge_ctx ctx;
+	struct inv_merge_reader_arg rargs[2 * NR_READERS_DEFAULT];
+	struct timespec t0;
+	pthread_t readers[2 * NR_READERS_DEFAULT], writer;
+	unsigned int i;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(gattr, 16) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	if (cds_ft_group_create(gattr, &group) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(gattr);
+
+	if (cds_ft_create(group, NULL, &dst) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &src) < 0) {
+		cds_ft_destroy(dst);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	for (i = 0; i < 4; i++) {
+		struct ft_test_node *dn = node_alloc(i);
+		struct ft_test_node *sn = node_alloc(300 + i);
+
+		cds_ft_insert(dst, (const uint8_t *) inv_merge_nrd_base_keys[i],
+			strlen(inv_merge_nrd_base_keys[i]), &dn->node);
+		cds_ft_insert(src, (const uint8_t *) inv_merge_nrd_src_keys[i],
+			strlen(inv_merge_nrd_src_keys[i]), &sn->node);
+	}
+	rcu_read_unlock();
+
+	ctx.dst = dst;
+	ctx.src = src;
+	ctx.group = group;
+	ctx.test_name = "inv_merge_nonroot_dst_no_escape";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	/* All readers traverse dst; namespace {T}{a,b}{a..d} across the merge. */
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
+		rargs[i].ctx = &ctx;
+		rargs[i].trie = dst;
+		rargs[i].c2_lo = (uint8_t) 'a';
+		rargs[i].c2_hi = (uint8_t) 'd';
+		rargs[i].which = "dst";
+		pthread_create(&readers[i], NULL,
+			inv_merge_no_escape_reader, &rargs[i]);
+	}
+	pthread_create(&writer, NULL, inv_merge_nonroot_dst_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	pthread_join(writer, NULL);
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_nonroot_dst_no_escape: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+
+	drain_trie_local(dst);
+	drain_trie_local(src);
+	rcu_barrier();
+	cds_ft_destroy(dst);
+	cds_ft_destroy(src);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -3282,6 +3460,9 @@ int main(int argc, char **argv)
 
 	diag("10. Piecewise merge never escapes the destination");
 	RUN_TEST(inv_merge_no_escape);
+
+	diag("11. Merge into a non-root destination never escapes");
+	RUN_TEST(inv_merge_nonroot_dst_no_escape);
 
 	rcu_barrier();
 	rcu_unregister_thread();
