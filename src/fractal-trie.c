@@ -23,6 +23,7 @@
 #include <urcu-pointer.h>
 #include <urcu/uatomic.h>
 #include "urcu-utils.h"
+#include "urcu-flip-latch.h"
 
 #include "fractal-trie-internal.h"
 
@@ -1647,6 +1648,62 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
 	return type;
 }
 
+/*
+ * Flip-proxy encoding (see src/urcu-flip-latch.h).  cds_ft_merge_at needs
+ * to switch a whole set of back-pointers (and the merge-point forward
+ * slot) from their old to their new target with no mixed-regime window.
+ * Each such slot transiently holds a tagged pointer to a urcu_flip_proxy
+ * latch; a single urcu_flip_commit store flips them all atomically.
+ *
+ * A proxy is tagged as a synthetic INTERNAL node of type-index 7 -- the
+ * FT_NULL slot (ft_types[7]) that no real node ever occupies -- so a flag
+ * whose low nibble equals (FT_INTERNAL_MASK | FT_TYPE_MASK) == 0xF is a
+ * proxy and nothing else (real internal nodes use type 0..6; external,
+ * compressed, NULL and skip pointers never set all of bits 0..3).  The
+ * proxy is 16-byte aligned (low 4 bits free for the tag) and lives at a
+ * userspace address with the skip-len high bits clear, so
+ * _ft_node_mask_ptr recovers it exactly.  The same encoding is valid in
+ * both forward child slots and parent slots, since both resolve a flag
+ * through this dispatch.
+ */
+#define FT_FLIP_PROXY_TYPE	7U
+#define FT_FLIP_PROXY_TAG	(FT_INTERNAL_MASK | (FT_FLIP_PROXY_TYPE << FT_INTERNAL_BITS))
+
+static inline_lookup
+bool ft_node_flip_proxy(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & (FT_INTERNAL_MASK | FT_TYPE_MASK))
+		== FT_FLIP_PROXY_TAG;
+}
+
+static inline_lookup
+struct urcu_flip_proxy *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
+{
+	return (struct urcu_flip_proxy *) _ft_node_mask_ptr(node);
+}
+
+static
+struct cds_ft_inode_flag *ft_flip_proxy_flag(struct urcu_flip_proxy *proxy)
+{
+	return (struct cds_ft_inode_flag *)
+		((unsigned long) proxy | FT_FLIP_PROXY_TAG);
+}
+
+/*
+ * Resolve a possibly-proxied flag to its current target.  Sits right
+ * after a parent / root pointer load on the read side; the common case
+ * (no merge in flight) is a single predicted-not-taken mask-compare, and
+ * the proxy deref is reached only during a merge's brief flip window.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
+{
+	if (caa_unlikely(ft_node_flip_proxy(node)))
+		return (struct cds_ft_inode_flag *)
+			urcu_flip_proxy_get(ft_flip_proxy_ptr(node));
+	return node;
+}
+
 static
 struct cds_ft_inode_flag *ft_compressed_node_flag(
 		struct cds_ft_compressed_node *node)
@@ -1661,6 +1718,55 @@ struct cds_ft_compressed_node *ft_compressed_node_ptr(
 {
 	return (struct cds_ft_compressed_node *)
 		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
+}
+
+/*
+ * ft_get_parent_rcu: read the parent pointer of @node via
+ * rcu_dereference.
+ *
+ * For external (leaf) nodes: returns cds_ft_node.prev.  @node must
+ * be the head of its duplicate chain (non-head duplicates' prev
+ * points to the preceding node in the chain, not to the parent).
+ * Iterators and lookups maintain this invariant by convention —
+ * iter->node always refers to the chain head.
+ *
+ * For internal/compressed nodes: returns metadata->parent.
+ *
+ * Returns NULL when @node is at the root position, or when @node
+ * has been orphaned by a concurrent detach / graft_swap that
+ * cleared its parent link.  A read-side parent-pointer walk that
+ * observes NULL terminates cleanly in either case.
+ *
+ * Read-side safe; the caller must be in an RCU read-side critical
+ * section (or QSBR equivalent).
+ *
+ * An assertion verifies the returned parent is never external: an
+ * external result would mean the caller passed a non-head duplicate
+ * chain entry (whose prev points at the preceding duplicate, not
+ * at the parent).
+ *
+ * Config-agnostic (only the flip-proxy resolve, a merge primitive,
+ * and basic accessors): kept here, ahead of the FEATURE_FT_SKIP_COMPRESSED
+ * block, so cds_ft_merge_at can use it in all build configs.
+ */
+static inline
+struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft_inode_flag *node)
+{
+	struct cds_ft_inode_flag *parent;
+
+	if (ft_node_external(node))
+		parent = rcu_dereference(((struct cds_ft_node *) node)->prev);
+	else
+		parent = rcu_dereference(cds_ft_item_to_metadata(
+			ft_node_ptr(node))->parent);
+	/*
+	 * The parent slot may transiently hold a flip-proxy during a
+	 * cds_ft_merge_at commit; resolve it to the view-appropriate
+	 * (old or merged) parent before returning.
+	 */
+	parent = ft_resolve_flip_proxy(parent);
+	assert(!parent || !ft_node_external(parent));
+	return parent;
 }
 
 /* Skip-compressed pointer helpers. */
@@ -1727,8 +1833,9 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
  * writers in mid-mutation, where the back-pointer and slot value
  * are intentionally inconsistent for a brief window) get whatever
  * the back-pointer currently says.  Reader paths that must observe
- * a self-consistent slot+cn pair use ft_skip_to_compressed_validate
- * (re-anchoring via ft_skip_reanchor on mismatch).
+ * a self-consistent slot+cn pair re-anchor via ft_skip_reanchor,
+ * which walks the skip child's live parent chain to the tree
+ * position the slot's skip_len encodes.
  *
  * Read-side safe (rcu_dereference on both fields).  Callers must be
  * in an RCU read-side critical section (or QSBR equivalent).
@@ -1748,46 +1855,14 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
 	return ft_compressed_node_ptr(parent);
 }
 
-/*
- * ft_skip_to_compressed_validate: reader-only variant that validates
- * the recovery against the slot's skip_len.  Returns NULL on mismatch,
- * indicating a concurrent writer is mid-split/merge: the child's
- * back-pointer has been updated in-place but the parent slot value
- * hasn't been republished yet (or the slot's holder was recompacted
- * away and never will be).  On NULL the caller does NOT spin re-reading
- * the slot — it re-anchors on the live structure via ft_skip_reanchor
- * (the skip child's parent chain), which converges in bounded steps.
- *
- * The validation works because:
- *   - Split always shortens: sfx->len < CN->len.
- *   - Chain-merge always lengthens: CN_merged->len = CN1->len + CN2->len.
- * So every problematic in-place mutation lands at a cn whose len
- * differs from the slot's skip_len.  Same-length spurious matches
- * are correct: the only structurally relevant property for the
- * caller (ordinal_key byte count, cn->key_bytes content) is the
- * length; same-length cn replacement consumes the same byte count.
- *
- * Writers must NOT use this function: a writer mid-mutation reading
- * its own in-flight state would loop forever (it IS the race partner).
- * Writers use ft_skip_to_compressed (no validation).
- */
-static inline
-struct cds_ft_compressed_node *ft_skip_to_compressed_validate(
-		struct cds_ft_inode_flag *skip_ptr)
-{
-	unsigned int skip_len_slot = ft_skip_len(skip_ptr);
-	struct cds_ft_compressed_node *cn = ft_skip_to_compressed(skip_ptr);
-
-	if (caa_unlikely(!cn || cn->len != skip_len_slot))
-		return NULL;
-	return cn;
-}
 
 /*
  * ft_skip_reanchor: the single concurrency-handling mechanism for skip-
- * compressed pointers, used when ft_skip_to_compressed_validate reports a
- * mismatch (the slot's encoded skip_len no longer matches the live compressed
- * node recovered via the skip child's back-pointer).
+ * compressed pointers.  A skip slot encodes a length (skip_len), but the live
+ * compressed node recovered via the skip child's back-pointer may no longer
+ * match it (a concurrent split/merge changed the path between the slot and the
+ * child), so readers resolve the slot by re-anchoring rather than trusting the
+ * recovered node directly.
  *
  * Spinning to re-read the slot does NOT converge when the slot lives on a node
  * that was recompacted away (frozen-stale) while the skip child was reparented
@@ -1850,6 +1925,8 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft_inode_flag *skip_ptr,
 		else
 			parent = rcu_dereference(cds_ft_item_to_metadata(
 				ft_node_ptr(cur))->parent);
+		/* A picked child's parent may be a flip-proxy mid-merge. */
+		parent = ft_resolve_flip_proxy(parent);
 		if (caa_unlikely(!parent)) {
 			/*
 			 * A NULL parent on the up-walk is a bug.  The walk runs
@@ -1887,8 +1964,10 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft_inode_flag *skip_ptr,
 			*rewind = acc - want;
 			if (at_pos)
 				*at_pos = parent;
-			holder = rcu_dereference(cds_ft_item_to_metadata(
-				(struct cds_ft_inode *) pitem)->parent);
+			/* Same flip-proxy resolve as the up-walk read above. */
+			holder = ft_resolve_flip_proxy(rcu_dereference(
+				cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) pitem)->parent));
 			/*
 			 * The holder is NULL only if @parent is the root -- the
 			 * encoded position is the root itself, i.e. a root-level
@@ -1900,45 +1979,6 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft_inode_flag *skip_ptr,
 		cur = parent;
 	}
 	return NULL;	/* pathological (cycle?): caller re-descends from root */
-}
-
-/*
- * ft_get_parent_rcu: read the parent pointer of @node via
- * rcu_dereference.
- *
- * For external (leaf) nodes: returns cds_ft_node.prev.  @node must
- * be the head of its duplicate chain (non-head duplicates' prev
- * points to the preceding node in the chain, not to the parent).
- * Iterators and lookups maintain this invariant by convention —
- * iter->node always refers to the chain head.
- *
- * For internal/compressed nodes: returns metadata->parent.
- *
- * Returns NULL when @node is at the root position, or when @node
- * has been orphaned by a concurrent detach / graft_swap that
- * cleared its parent link.  A read-side parent-pointer walk that
- * observes NULL terminates cleanly in either case.
- *
- * Read-side safe; the caller must be in an RCU read-side critical
- * section (or QSBR equivalent).
- *
- * An assertion verifies the returned parent is never external: an
- * external result would mean the caller passed a non-head duplicate
- * chain entry (whose prev points at the preceding duplicate, not
- * at the parent).
- */
-static inline
-struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft_inode_flag *node)
-{
-	struct cds_ft_inode_flag *parent;
-
-	if (ft_node_external(node))
-		parent = rcu_dereference(((struct cds_ft_node *) node)->prev);
-	else
-		parent = rcu_dereference(cds_ft_item_to_metadata(
-			ft_node_ptr(node))->parent);
-	assert(!parent || !ft_node_external(parent));
-	return parent;
 }
 
 static inline
@@ -2024,12 +2064,6 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
 	return ft_compressed_node_ptr(skip_ptr);
 }
 
-static inline
-struct cds_ft_compressed_node *ft_skip_to_compressed_validate(
-		struct cds_ft_inode_flag *skip_ptr)
-{
-	return ft_compressed_node_ptr(skip_ptr);
-}
 
 static inline
 bool ft_group_skip_compressed(const struct cds_ft_group *group __attribute__((unused)))
@@ -2163,6 +2197,41 @@ void ft_publish_to_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child)
 {
+	/*
+	 * Publication-ordering invariant: a child becomes observable by
+	 * downward traversal the instant it is published into a live parent
+	 * slot, so its parent back-pointer MUST already be wired.  Otherwise
+	 * a concurrent reader that descends to it and walks back up
+	 * (ft_skip_reanchor / ordered up-walk) reads a NULL/uninitialized
+	 * parent.  Applies to ALL child kinds (external -> prev,
+	 * internal/compressed -> metadata->parent); the root slot is the sole
+	 * exception (the root has no parent).  Catches forward-before-parent
+	 * bugs at their source.
+	 */
+#ifndef NDEBUG
+	if (new_child && parent_slot != &ft->root) {
+		struct cds_ft_inode_flag *cp;
+
+		/*
+		 * Check skip-compressed FIRST: a SKIP_X flag carries its
+		 * (external) child's low tag bits, so ft_node_external() would
+		 * misclassify it and dereference the tagged flag as a node.
+		 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_node_skip_compressed(new_child)) {
+			cp = cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_skip_to_compressed(new_child))->parent;
+		} else
+#endif
+		if (ft_node_external(new_child)) {
+			cp = ((struct cds_ft_node *) new_child)->prev;
+		} else {
+			cp = cds_ft_item_to_metadata(
+				ft_node_ptr(new_child))->parent;
+		}
+		assert(cp != NULL);
+	}
+#endif /* !NDEBUG */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
 	 * For compressed-form @new_child (SKIP_X or plain COMPRESSED):
@@ -3031,6 +3100,22 @@ static inline void ft_maybe_prefetch(const void *ptr)
 
 #define ft_dereference_acquire(p)	\
 	(__typeof__(p)) uatomic_load(&(p), CMM_ACQUIRE)
+
+/*
+ * Root-slot dereference for read-side descents: like
+ * ft_dereference_*(ft->root) but additionally resolves a flip-proxy that
+ * a cds_ft_merge_at commit may transiently install at the merge-point
+ * forward slot (here, the root).  The resolved flag then flows into the
+ * cached path, the key_len==0 / longest-match metadata access, and the
+ * child dispatch.  The common case (no merge in flight) is a single
+ * predicted-not-taken mask-compare in ft_resolve_flip_proxy.
+ */
+#define ft_root_dereference_prefetch(ft)				\
+	ft_resolve_flip_proxy(ft_dereference_prefetch((ft)->root))
+#define ft_root_dereference_acquire_prefetch(ft)			\
+	ft_resolve_flip_proxy(ft_dereference_acquire_prefetch((ft)->root))
+#define ft_root_dereference(ft)						\
+	ft_resolve_flip_proxy(rcu_dereference((ft)->root))
 
 /*
  * Per-caller prefetch hint for ft_node_get_nth_skip / ft_node_get_nth
@@ -4639,12 +4724,8 @@ struct cds_ft_inode_flag *ft_node_get_nth_reanchor(
 	*rewind_ret = 0;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (caa_unlikely(child && ft_node_skip_compressed(child))) {
-		struct cds_ft_compressed_node *cn =
-			ft_skip_to_compressed_validate(child);
 		struct cds_ft_inode_flag *at_pos, *anchor;
 
-		if (caa_likely(cn != NULL))
-			return ft_compressed_node_flag(cn);
 		anchor = ft_skip_reanchor(child, rewind_ret, &at_pos);
 		assert(anchor != NULL);
 		return at_pos;
@@ -4767,28 +4848,18 @@ struct cds_ft_inode_flag *ft_node_get_direction(struct cds_ft_inode_flag *node_f
 	}
 	if (!validate_lookup)
 		return ft_resolve_skip_compressed(child);
-	if (!child || !ft_node_skip_compressed(child))
-		return child;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	{
-		struct cds_ft_compressed_node *cn =
-			ft_skip_to_compressed_validate(child);
-		if (caa_likely(cn != NULL))
-			return ft_compressed_node_flag(cn);
-	}
 	/*
-	 * Validation failed: the slot is inconsistent with the live compressed
-	 * node — our @node was recompacted away (frozen-stale) while the skip
-	 * child was reparented by a concurrent split/merge.  Return the RAW skip
-	 * pointer as a re-anchor signal: it is still skip-compressed, which a
-	 * validated result never is, so the reader-level caller detects it and
-	 * resolves via ft_skip_reanchor (the single skip concurrency mechanism)
-	 * instead of us spinning here on a slot that may never republish.
+	 * Precise (validating) lookup: return a skip-compressed child RAW as a
+	 * re-anchor signal.  It is still skip-compressed, which a resolved
+	 * result never is, so the reader-level caller detects it and resolves
+	 * via ft_skip_reanchor (the single skip concurrency mechanism).  We must
+	 * NOT resolve it here by assuming the skip child's back-pointer is a
+	 * compressed node: mid-split (e.g. a suffix_len==0 branch re-parenting
+	 * the old external child before the slot is republished) it can
+	 * transiently be an INTERNAL node, and reading that as a compressed
+	 * len/key_bytes yields a garbage key.
 	 */
 	return child;
-#else
-	return child;
-#endif
 }
 
 static inline_lookup
@@ -6179,7 +6250,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
-	node_flag = ft_dereference_prefetch(ft->root);
+	node_flag = ft_root_dereference_prefetch(ft);
 
 	{
 	/*
@@ -6283,14 +6354,13 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
 			 * Mutators do not produce a skip-encoded root.  Resolve
-			 * it once for completeness, with an assert as the
-			 * oracle for any future regression — never spin on a
-			 * defensive retry that could hide a real race.
+			 * it defensively for completeness via the non-validating
+			 * resolver: a root has no concurrent re-parent of its
+			 * skip child, so the back-pointer is a stable compressed
+			 * node (no mid-split internal-node transient as in the
+			 * interior dispatch, which re-anchors instead).
 			 */
-			struct cds_ft_compressed_node *cn =
-				ft_skip_to_compressed_validate(node_flag);
-			assert(cn != NULL);
-			node_flag = ft_compressed_node_flag(cn);
+			node_flag = ft_resolve_skip_compressed(node_flag);
 #endif
 		} else {
 			unsigned int skip = ft_skip_len(node_flag);
@@ -6393,19 +6463,17 @@ descend_loop:
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			if (skip_compressed && !descend_cand
 			    && caa_unlikely(ft_node_skip_compressed(node_flag))) {
-				struct cds_ft_compressed_node *cn =
-					ft_skip_to_compressed_validate(node_flag);
-
-				if (caa_likely(cn != NULL)) {
-					node_flag = ft_compressed_node_flag(cn);
-				} else {
+				{
 					/*
-					 * Slot inconsistent with the live compressed node:
-					 * @parent_node_flag was recompacted away while the skip
-					 * child was reparented by a concurrent split/merge.
-					 * Re-anchor on the live structure via the child's parent
-					 * chain (the single skip concurrency mechanism) rather
-					 * than spin on a slot that may never republish.
+					 * Resolve the skip-compressed slot via the live
+					 * skip-child parent chain (ft_skip_reanchor, the
+					 * single skip concurrency mechanism).  Never assume
+					 * the skip child's back-pointer is a compressed node
+					 * and read its len/key_bytes directly: mid-split it
+					 * can transiently be an INTERNAL node (e.g. a
+					 * suffix_len==0 branch re-parenting the old external
+					 * child before the slot's skip pointer is
+					 * republished), which would resolve to a garbage key.
 					 */
 					unsigned int rewind;
 					struct cds_ft_inode_flag *at_pos;
@@ -7745,7 +7813,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	FT_TP(ineq_enter, (int) mode, input_key, key_len);
 
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
-	node_flag = ft_dereference_prefetch(ft->root);
+	node_flag = ft_root_dereference_prefetch(ft);
 	iter_path_node(iter)[0] = node_flag;
 
 	/*
@@ -7817,7 +7885,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		 */
 		if (ft_node_compressed(node_flag) ||
 		    ft_node_skip_compressed(node_flag)) {
-			node_flag = ft_dereference_prefetch(ft->root);
+			node_flag = ft_root_dereference_prefetch(ft);
 			iter_key = input_key;
 			goto slow_path;
 		}
@@ -7899,7 +7967,7 @@ slow_path:
 			node_flag = ft_node_get_nth_reanchor(node_flag,
 					key_value, &rewind);
 			if (caa_unlikely(rewind)) {
-				node_flag = ft_dereference_prefetch(ft->root);
+				node_flag = ft_root_dereference_prefetch(ft);
 				iter_key = input_key;
 				goto slow_path;
 			}
@@ -9492,11 +9560,42 @@ struct ft_graft_deferred_edge {
 	struct cds_ft_inode_flag *child;	/* live node to re-parent */
 	struct cds_ft_inode_flag *parent;	/* glue node it will point to */
 	struct cds_ft_inode_flag **slot;	/* slot in parent holding child */
+	/*
+	 * cds_ft_merge_at references live subtrees from BOTH tries.  A
+	 * src-origin child is drained by the early src unlink (applied at
+	 * apply_deferred); a dst-origin child stays reachable via the old dst
+	 * spine until the forward publish + dst drain, so its back-pointer flip
+	 * must wait (applied at apply_deferred_dst).  graft / graft_swap only
+	 * ever re-parent src-origin nodes, so this defaults to false and their
+	 * single apply_deferred call still wires every edge.
+	 */
+	bool dst_origin;
 };
 
 struct ft_graft_free_item {
 	void *node;		/* cds_ft_inode * or cds_ft_compressed_node * */
 	bool compressed;
+};
+
+/*
+ * A deferred duplicate-chain splice, used only by cds_ft_merge_at when the
+ * SAME full key exists in both tries: the two LIVE external chains must be
+ * concatenated under the fresh merged node @owner.  graft / graft_swap never
+ * concatenate two live chains, so this is merge-only.
+ *
+ * @dst_head is kept as the surviving chain head: its forward owner (a fresh
+ * merged node's metadata->external_nodes, or a fresh merged node's child slot)
+ * and its back-pointer (@dst_head->prev = that node) are wired by the ordinary
+ * Phase-1 set + deferred edge, exactly like any other re-parented external.
+ * This struct carries ONLY the concatenation, which is publication-visible on
+ * two live chains and is applied at commit by ft_graft_glue_apply_splices,
+ * AFTER the source has been detached + drained: the @src_head chain is appended
+ * to @dst_head's tail (prev-before-next, the ft_chain_node idiom, but preserving
+ * src_head->next so the rest of the src chain rides along).
+ */
+struct ft_graft_splice {
+	struct cds_ft_node *dst_head;		/* surviving head (kept first) */
+	struct cds_ft_node *src_head;		/* appended to dst_head's tail */
 };
 
 /*
@@ -9517,6 +9616,7 @@ struct ft_graft_free_item {
 #define FT_GRAFT_GLUE_FLOOR_BUILT	(2 * FT_MAX_DEPTH + 8)
 #define FT_GRAFT_GLUE_FLOOR_DEFERRED	8
 #define FT_GRAFT_GLUE_FLOOR_FREE	8
+#define FT_GRAFT_GLUE_FLOOR_SPLICE	8
 
 struct ft_graft_glue {
 	struct ft_graft_deferred_edge *deferred;
@@ -9528,6 +9628,9 @@ struct ft_graft_glue {
 	struct cds_ft_inode_flag **built;
 	int nr_built;
 	int cap_built;
+	struct ft_graft_splice *splices;
+	int nr_splices;
+	int cap_splices;
 	/*
 	 * The single forward store that splices the cluster into dst at
 	 * commit: parent_slot is swung to top.  publish_parent is the
@@ -9551,6 +9654,7 @@ struct ft_graft_glue {
 	struct ft_graft_deferred_edge deferred_floor[FT_GRAFT_GLUE_FLOOR_DEFERRED];
 	struct ft_graft_free_item free_floor[FT_GRAFT_GLUE_FLOOR_FREE];
 	struct cds_ft_inode_flag *built_floor[FT_GRAFT_GLUE_FLOOR_BUILT];
+	struct ft_graft_splice splices_floor[FT_GRAFT_GLUE_FLOOR_SPLICE];
 };
 
 static void ft_graft_glue_track(struct ft_graft_glue *g,
@@ -12465,6 +12569,9 @@ void ft_graft_glue_init(struct ft_graft_glue *g)
 	g->built = g->built_floor;
 	g->nr_built = 0;
 	g->cap_built = FT_GRAFT_GLUE_FLOOR_BUILT;
+	g->splices = g->splices_floor;
+	g->nr_splices = 0;
+	g->cap_splices = FT_GRAFT_GLUE_FLOOR_SPLICE;
 	g->publish_parent = NULL;
 	g->publish_slot = NULL;
 	g->top = NULL;
@@ -12495,6 +12602,11 @@ void ft_graft_glue_fini(struct ft_graft_glue *g)
 		g->built = g->built_floor;
 		g->cap_built = FT_GRAFT_GLUE_FLOOR_BUILT;
 	}
+	if (g->splices != g->splices_floor) {
+		free(g->splices);
+		g->splices = g->splices_floor;
+		g->cap_splices = FT_GRAFT_GLUE_FLOOR_SPLICE;
+	}
 }
 
 /*
@@ -12505,9 +12617,9 @@ void ft_graft_glue_fini(struct ft_graft_glue *g)
  * inline.  Returns 0, or -ENOMEM (whatever already grew is released by a
  * later abort / fini, so the caller need only surface the error).
  */
-static __attribute__((unused))
+static
 int ft_graft_glue_reserve(struct ft_graft_glue *g,
-		int nr_built, int nr_deferred, int nr_free)
+		int nr_built, int nr_deferred, int nr_free, int nr_splices)
 {
 	if (nr_built > g->cap_built) {
 		struct cds_ft_inode_flag **p =
@@ -12544,6 +12656,18 @@ int ft_graft_glue_reserve(struct ft_graft_glue *g,
 			free(g->free_list);
 		g->free_list = p;
 		g->cap_free = nr_free;
+	}
+	if (nr_splices > g->cap_splices) {
+		struct ft_graft_splice *p =
+			malloc((size_t) nr_splices * sizeof(*p));
+
+		if (!p)
+			return -ENOMEM;
+		memcpy(p, g->splices, (size_t) g->nr_splices * sizeof(*p));
+		if (g->splices != g->splices_floor)
+			free(g->splices);
+		g->splices = p;
+		g->cap_splices = nr_splices;
 	}
 	return 0;
 }
@@ -12674,10 +12798,11 @@ bool ft_graft_glue_is_fresh(struct ft_graft_glue *g,
  *   wrapper later absorbed by a chain-merge keeps only its final mapping.
  */
 static
-void ft_graft_glue_defer_edge(struct ft_graft_glue *g,
+void ft_graft_glue_defer_edge_origin(struct ft_graft_glue *g,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *parent,
-		struct cds_ft_inode_flag **slot)
+		struct cds_ft_inode_flag **slot,
+		bool dst_origin)
 {
 	int i;
 
@@ -12689,6 +12814,7 @@ void ft_graft_glue_defer_edge(struct ft_graft_glue *g,
 		if (g->deferred[i].child == child) {
 			g->deferred[i].parent = parent;
 			g->deferred[i].slot = slot;
+			g->deferred[i].dst_origin = dst_origin;
 			return;
 		}
 	}
@@ -12696,7 +12822,18 @@ void ft_graft_glue_defer_edge(struct ft_graft_glue *g,
 	g->deferred[g->nr_deferred].child = child;
 	g->deferred[g->nr_deferred].parent = parent;
 	g->deferred[g->nr_deferred].slot = slot;
+	g->deferred[g->nr_deferred].dst_origin = dst_origin;
 	g->nr_deferred++;
+}
+
+static
+void ft_graft_glue_defer_edge(struct ft_graft_glue *g,
+		struct cds_ft_inode_flag *child,
+		struct cds_ft_inode_flag *parent,
+		struct cds_ft_inode_flag **slot)
+{
+	ft_graft_glue_defer_edge_origin(g, child, parent, slot,
+		/*dst_origin*/ false);
 }
 
 /* Record an old (replaced) live node to reclaim deferred at commit. */
@@ -12755,9 +12892,64 @@ void ft_graft_glue_apply_deferred(struct ft_graft_glue *g)
 {
 	int i;
 
+	/*
+	 * Apply only src-origin edges (dst_origin == false).  graft and
+	 * graft_swap record every edge as src-origin (the default), so this
+	 * wires all of theirs.  cds_ft_merge_at additionally records
+	 * dst-origin edges, which it does NOT re-parent here: a dst child
+	 * stays reachable via the old dst spine until the forward publish, so
+	 * its back-pointer is switched atomically (with the merge-point
+	 * forward slot) by the flip-latch, after this call.
+	 */
 	for (i = 0; i < g->nr_deferred; i++)
-		ft_set_parent(g->deferred[i].child, g->deferred[i].parent,
-			g->deferred[i].slot);
+		if (!g->deferred[i].dst_origin)
+			ft_set_parent(g->deferred[i].child, g->deferred[i].parent,
+				g->deferred[i].slot);
+}
+
+/*
+ * Record a deferred duplicate-chain splice (cds_ft_merge_at, same full key in
+ * both tries): the @src_head chain is to be appended to @dst_head's chain.
+ * The @dst_head chain's forward owner and back-pointer are wired separately
+ * (Phase-1 set + deferred edge), like any other re-parented external; this
+ * records only the concatenation, applied at commit.
+ */
+static
+void ft_graft_glue_record_splice(struct ft_graft_glue *g,
+		struct cds_ft_node *dst_head,
+		struct cds_ft_node *src_head)
+{
+	assert(g->nr_splices < g->cap_splices);
+	g->splices[g->nr_splices].dst_head = dst_head;
+	g->splices[g->nr_splices].src_head = src_head;
+	g->nr_splices++;
+}
+
+/*
+ * Commit: apply the deferred duplicate-chain splices.  Call AFTER the source
+ * has been detached + drained (so the appended @src_head chain has no second
+ * owner traversing it from the source tree).
+ *
+ * Per splice: append the whole src chain to dst's tail, prev-before-next (the
+ * ft_chain_node idiom, but preserving src_head->next so the rest of the src
+ * chain rides along).  @dst_head stays the head, so in-flight dst snapshots
+ * keep their ordering.
+ */
+static
+void ft_graft_glue_apply_splices(struct ft_graft_glue *g)
+{
+	int i;
+
+	for (i = 0; i < g->nr_splices; i++) {
+		struct cds_ft_node *dst_head = g->splices[i].dst_head;
+		struct cds_ft_node *src_head = g->splices[i].src_head;
+		struct cds_ft_node *tail = dst_head;
+
+		while (tail->next)
+			tail = tail->next;
+		src_head->prev = tail;	/* write-side only, plain store */
+		rcu_assign_pointer(tail->next, src_head);
+	}
 }
 
 /*
@@ -14013,7 +14205,7 @@ enum ft_graft_swap_case ft_graft_swap_descend(struct cds_ft *ft,
  *
  * @off_ret / @count_ret are 0 for DELEGATE.
  */
-static __attribute__((unused))
+static
 enum ft_graft_swap_case ft_merge_descend(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, struct ft_descent *d,
 		unsigned int *off_ret, unsigned long *count_ret)
@@ -14043,6 +14235,253 @@ enum ft_graft_swap_case ft_merge_descend(struct cds_ft *ft,
 		break;
 	}
 	return kase;
+}
+
+/*
+ * cds_ft_merge_at build-invisible spine-copy.  ft_merge_build recursively
+ * COPIES the overlapping spine of two subtrees S (from src) and D (from dst),
+ * both rooted at the same suffix position, and REFERENCES every disjoint
+ * subtree by pointer (recorded as a deferred re-parent edge applied at commit).
+ * All allocation happens here, build-invisibly; OOM frees the fresh copies and
+ * leaves both tries pristine -- no rollback.
+ *
+ * Returns the PLAIN flag of the freshly-built merged node (or, when the merged
+ * position is leaf-only, the surviving external head), or one of:
+ *   FT_MERGE_OOM       allocation failed; caller aborts both glues.
+ *   FT_MERGE_DELEGATE  a compressed overlap node (not yet handled); caller
+ *                      aborts and falls back to the per-entry merge.
+ * On success *nr_keys_ret holds the merged subtree's unique-key count.
+ */
+#define FT_MERGE_OOM		((struct cds_ft_inode_flag *) (long) -ENOMEM)
+#define FT_MERGE_DELEGATE	((struct cds_ft_inode_flag *) (long) -EOPNOTSUPP)
+
+struct ft_merge_ctx {
+	struct cds_ft *dst_ft;		/* all fresh merged nodes live here */
+	struct ft_graft_glue *gd;	/* dst cluster: built/deferred/dst frees/splices */
+	struct ft_graft_glue *gs;	/* src side: src-overlap frees (+ prune later) */
+};
+
+/* Upper-bound counters for the read-only pre-pass that sizes the glues. */
+struct ft_merge_counts {
+	int nb;		/* fresh built nodes (-> gd) */
+	int nd;		/* deferred re-parent edges (-> gd) */
+	int nf_dst;	/* dst-overlap frees (-> gd) */
+	int nf_src;	/* src-overlap frees (-> gs) */
+	int ns;		/* duplicate-chain splices (-> gd) */
+};
+
+/* nr_keys of a (possibly skip-encoded) child subtree referenced by pointer. */
+static
+unsigned long ft_merge_child_count(struct cds_ft_inode_flag *c)
+{
+	if (ft_node_external(ft_resolve_skip_compressed(c)))
+		return 1;
+	return ft_nr_keys_get(ft_flag_to_metadata(c));
+}
+
+static
+struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
+		struct cds_ft_inode_flag *S, struct cds_ft_inode_flag *D,
+		unsigned int depth, unsigned long *nr_keys_ret)
+{
+	struct cds_ft *ft = c->dst_ft;
+	struct cds_ft_node *S_leaf, *D_leaf, *M_ext;
+	bool S_ext, D_ext;
+	struct cds_ft_inode_flag *M = NULL;
+	struct cds_ft_metadata *Mmeta = NULL;
+	unsigned long total_keys = 0;
+	bool tracked = false;
+	unsigned int b;
+
+	S = ft_resolve_skip_compressed(S);
+	D = ft_resolve_skip_compressed(D);
+
+	/* Slice 1: a compressed overlap node is not yet handled. */
+	if (ft_node_compressed(S) || ft_node_compressed(D))
+		return FT_MERGE_DELEGATE;
+
+	S_ext = ft_node_external(S);
+	D_ext = ft_node_external(D);
+	S_leaf = S_ext ? (struct cds_ft_node *) ft_node_ptr(S)
+		: cds_ft_item_to_metadata(ft_node_ptr(S))->external_nodes;
+	D_leaf = D_ext ? (struct cds_ft_node *) ft_node_ptr(D)
+		: cds_ft_item_to_metadata(ft_node_ptr(D))->external_nodes;
+
+	/*
+	 * Both leaf-only -> the SAME full key terminates on both sides.
+	 * Splice src after dst and return the (leaf-only) dst head; the
+	 * parent frame wires the slot and the dst head's back-pointer.
+	 */
+	if (S_ext && D_ext) {
+		ft_graft_glue_record_splice(c->gd, D_leaf, S_leaf);
+		*nr_keys_ret = 1;
+		return D;
+	}
+
+	/*
+	 * At least one side is internal -> build a fresh internal M.
+	 * Pass 1: add every union child's forward slot (cluster_leaf: no
+	 * child back-pointer is written here -- a later set_nth may
+	 * reallocate M).  Recurse on shared bytes; reference one-side bytes.
+	 */
+	for (b = 0; b < FT_ENTRY_PER_NODE; b++) {
+		struct cds_ft_inode_flag *sc = NULL, *dc = NULL, *child;
+		struct cds_ft_inode *old = NULL;
+		unsigned long ck;
+		int ret;
+
+		if (!S_ext)
+			sc = ft_node_get_nth_skip(S, NULL, (uint8_t) b, FT_PF_NONE);
+		if (!D_ext)
+			dc = ft_node_get_nth_skip(D, NULL, (uint8_t) b, FT_PF_NONE);
+		if (!sc && !dc)
+			continue;
+		if (sc && dc) {
+			child = ft_merge_build(c, sc, dc, depth + 1, &ck);
+			if (child == FT_MERGE_OOM || child == FT_MERGE_DELEGATE)
+				return child;
+		} else if (sc) {
+			child = sc;		/* reference live src subtree */
+			ck = ft_merge_child_count(sc);
+		} else {
+			child = dc;		/* reference live dst subtree */
+			ck = ft_merge_child_count(dc);
+		}
+		ret = ft_node_set_nth(ft, &M, (uint8_t) b, child, &old, Mmeta,
+				depth, /*cluster_leaf*/ true);
+		if (ret)
+			return FT_MERGE_OOM;
+		if (old) {
+			ft_graft_glue_untrack(c->gd, old);
+			free_cds_ft_node_unpublished(ft, old);
+		}
+		if (!tracked) {
+			ft_graft_glue_track(c->gd, M);
+			tracked = true;
+			Mmeta = cds_ft_item_to_metadata(ft_node_ptr(M));
+			/*
+			 * Clear the recycled allocation's stale parent before
+			 * any later set_nth reallocation copies it forward.
+			 */
+			rcu_assign_pointer(Mmeta->parent, NULL);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			Mmeta->skip_slot_offset = 0;
+#endif
+		} else if (old) {
+			ft_graft_glue_track(c->gd, M);
+		}
+		Mmeta = cds_ft_item_to_metadata(ft_node_ptr(M));
+		total_keys += ck;
+	}
+
+	/* Merged external_nodes (the key terminating at M itself). */
+	if (S_leaf && D_leaf) {
+		M_ext = D_leaf;
+		ft_graft_glue_record_splice(c->gd, D_leaf, S_leaf);
+	} else if (D_leaf) {
+		M_ext = D_leaf;
+	} else {
+		M_ext = S_leaf;		/* may be NULL */
+	}
+	if (M_ext) {
+		ft_metadata_set_external_nodes(M, Mmeta, M_ext);
+		total_keys += 1;
+	}
+
+	/*
+	 * Pass 2: wire every child's back-pointer (deferred) plus M's
+	 * external back-channel.  Fetch slots only now -- the Pass-1 set_nth
+	 * reallocations may have moved them.  A fresh (recursed) child stores
+	 * its parent immediately via defer_edge's is_fresh fast path; a
+	 * referenced live child truly defers to commit.
+	 */
+	for (b = 0; b < FT_ENTRY_PER_NODE; b++) {
+		struct cds_ft_inode_flag **slot;
+		struct cds_ft_inode_flag *child =
+			ft_node_get_nth_skip(M, &slot, (uint8_t) b, FT_PF_NONE);
+		bool dst_origin;
+
+		if (!child)
+			continue;
+		/*
+		 * A referenced one-side child is dst-origin iff D still holds a
+		 * child at this byte (a shared byte was recursed into a fresh
+		 * cluster node, applied immediately by defer_edge's is_fresh
+		 * path, so its origin is irrelevant).  dst-origin back-pointers
+		 * are switched by the flip-latch after the forward publish, not
+		 * by apply_deferred.
+		 */
+		dst_origin = !D_ext &&
+			ft_node_get_nth_skip(D, NULL, (uint8_t) b, FT_PF_NONE) != NULL;
+		ft_graft_glue_defer_edge_origin(c->gd, child, M, slot, dst_origin);
+	}
+	if (M_ext)
+		ft_graft_glue_defer_edge_origin(c->gd,
+			(struct cds_ft_inode_flag *) M_ext, M, NULL,
+			/*dst_origin=*/ D_leaf != NULL);
+
+	/* Reclaim the overlap nodes M copied (to the right trie at commit). */
+	if (!S_ext)
+		ft_graft_glue_defer_free(c->gs, ft_node_ptr(S), false);
+	if (!D_ext)
+		ft_graft_glue_defer_free(c->gd, ft_node_ptr(D), false);
+
+	ft_nr_keys_store(Mmeta, total_keys, CMM_RELAXED);
+	*nr_keys_ret = total_keys;
+	return M;
+}
+
+/*
+ * Read-only pre-pass mirroring ft_merge_build's control flow, accumulating
+ * upper bounds for ft_graft_glue_reserve so the build never asserts on a full
+ * inline floor.  No allocation, no mutation.
+ */
+static
+void ft_merge_count(struct cds_ft_inode_flag *S, struct cds_ft_inode_flag *D,
+		struct ft_merge_counts *cnt)
+{
+	bool S_ext, D_ext;
+	struct cds_ft_node *S_leaf, *D_leaf;
+	unsigned int b;
+
+	S = ft_resolve_skip_compressed(S);
+	D = ft_resolve_skip_compressed(D);
+	if (ft_node_compressed(S) || ft_node_compressed(D))
+		return;		/* DELEGATE: the counts go unused */
+	S_ext = ft_node_external(S);
+	D_ext = ft_node_external(D);
+	S_leaf = S_ext ? (struct cds_ft_node *) ft_node_ptr(S)
+		: cds_ft_item_to_metadata(ft_node_ptr(S))->external_nodes;
+	D_leaf = D_ext ? (struct cds_ft_node *) ft_node_ptr(D)
+		: cds_ft_item_to_metadata(ft_node_ptr(D))->external_nodes;
+	if (S_ext && D_ext) {
+		cnt->ns++;
+		return;
+	}
+	cnt->nb++;
+	for (b = 0; b < FT_ENTRY_PER_NODE; b++) {
+		struct cds_ft_inode_flag *sc = NULL, *dc = NULL;
+
+		if (!S_ext)
+			sc = ft_node_get_nth_skip(S, NULL, (uint8_t) b, FT_PF_NONE);
+		if (!D_ext)
+			dc = ft_node_get_nth_skip(D, NULL, (uint8_t) b, FT_PF_NONE);
+		if (!sc && !dc)
+			continue;
+		cnt->nd++;
+		if (sc && dc)
+			ft_merge_count(sc, dc, cnt);
+	}
+	if (S_leaf && D_leaf) {
+		cnt->ns++;
+		cnt->nd++;
+	} else if (S_leaf || D_leaf) {
+		cnt->nd++;
+	}
+	if (!S_ext)
+		cnt->nf_src++;
+	if (!D_ext)
+		cnt->nf_dst++;
 }
 
 enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
@@ -14963,6 +15402,307 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 	return status;
 }
 
+/*
+ * Flip-latch batch for cds_ft_merge_at: a urcu_flip_group plus its
+ * proxies, allocated as one block and reclaimed together via call_rcu
+ * once the proxied slots have been settled to their direct new targets.
+ * ft_flip_proxy is 16-byte aligned so each proxy's address carries the
+ * type-7 proxy tag (ft_flip_proxy_flag); malloc returns 16-byte-aligned
+ * blocks at userspace addresses with the skip-len high bits clear.
+ */
+struct ft_flip_proxy {
+	struct urcu_flip_proxy proxy;
+} __attribute__((aligned(16)));
+
+struct ft_flip_batch {
+	struct rcu_head rcu_head;
+	struct cds_ft *ft;
+	struct urcu_flip_group group;
+	unsigned int nr;
+	unsigned int cap;
+	struct ft_flip_proxy proxies[];
+};
+
+static
+void ft_flip_batch_free_rcu(struct rcu_head *head)
+{
+	free(caa_container_of(head, struct ft_flip_batch, rcu_head));
+}
+
+static
+struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft, unsigned int cap)
+{
+	struct ft_flip_batch *b;
+
+	b = malloc(sizeof(*b) + (size_t) cap * sizeof(struct ft_flip_proxy));
+	if (!b)
+		return NULL;
+	b->ft = ft;
+	urcu_flip_group_init(&b->group);
+	b->nr = 0;
+	b->cap = cap;
+	return b;
+}
+
+/*
+ * Record a proxy {old_nf, new_nf} and return its tagged flag, to be stored
+ * (sel == 0 -> old_nf, transparent) into the slot being flipped.
+ */
+static
+struct cds_ft_inode_flag *ft_flip_batch_add(struct ft_flip_batch *b,
+		struct cds_ft_inode_flag *old_nf,
+		struct cds_ft_inode_flag *new_nf)
+{
+	struct urcu_flip_proxy *p;
+
+	assert(b->nr < b->cap);
+	p = &b->proxies[b->nr++].proxy;
+	urcu_flip_proxy_init(p, &b->group, old_nf, new_nf);
+	return ft_flip_proxy_flag(p);
+}
+
+/* Reclaim the batch after settle (deferred for in-flight readers). */
+static
+void ft_flip_batch_reclaim(struct ft_flip_batch *b)
+{
+	if (b->ft->exclusive)
+		free(b);
+	else
+		b->ft->group->flavor->update_call_rcu(&b->rcu_head,
+			ft_flip_batch_free_rcu);
+}
+
+/*
+ * Set @child's parent back-pointer to a raw flag @value (a flip-proxy)
+ * verbatim, WITHOUT touching skip_slot_offset.  Mirrors ft_set_parent's
+ * child-kind dispatch; the settle step later replaces @value with the
+ * real parent via ft_set_parent (which does maintain skip_slot).
+ */
+static
+void ft_set_parent_raw(struct cds_ft_inode_flag *child,
+		struct cds_ft_inode_flag *value)
+{
+	if (!child)
+		return;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(child)) {
+		struct cds_ft_compressed_node *cn = ft_skip_to_compressed(child);
+
+		rcu_assign_pointer(cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) cn)->parent, value);
+		return;
+	}
+	if (ft_node_compressed(child)) {
+		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(child);
+
+		rcu_assign_pointer(cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) cn)->parent, value);
+		return;
+	}
+#endif
+	if (ft_node_external(child)) {
+		rcu_assign_pointer(((struct cds_ft_node *) child)->prev, value);
+		return;
+	}
+	rcu_assign_pointer(cds_ft_item_to_metadata(ft_node_ptr(child))->parent,
+		value);
+}
+
+/*
+ * Build-invisible spine-copy merge of all of @src_ft (its root) into @dst_ft
+ * at the live EXACT subtree @d_dst.  All allocation is in the build phase, so
+ * any OOM frees the fresh copies and leaves both tries pristine -- no rollback.
+ *
+ * Slice 1 scope: @src_ft merged at its root (src_key_len == 0), @d_dst an
+ * EXACT non-empty subtree, and the overlap free of compressed nodes.  When the
+ * overlap contains a compressed node ft_merge_build delegates: *delegated is
+ * set, both glues are aborted (pristine), and the caller falls back to the
+ * per-entry path.
+ *
+ * Returns OK on a committed merge, MEMORY_ERROR on OOM (pristine), or (with
+ * *delegated set) an unused status.
+ */
+static
+enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
+		struct cds_ft *src_ft, struct ft_descent *d_dst,
+		unsigned long cnt_dst, bool *delegated)
+{
+	struct ft_graft_glue gd, gs;
+	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
+	struct ft_merge_counts cnt = { 0, 0, 0, 0, 0 };
+	struct cds_ft_inode_flag *S = src_ft->root;
+	struct cds_ft_inode_flag *D = d_dst->nf;
+	struct cds_ft_inode_flag *M;
+	struct cds_ft_inode *fresh_root;
+	struct cds_ft_metadata *fresh_meta;
+	struct ft_flip_batch *flip;
+	unsigned long merged_keys = 0;
+
+	*delegated = false;
+
+	/*
+	 * The flip-latch publishes the merged cluster through the merge-point
+	 * forward slot.  For a root dst merge that slot is ft->root, resolved
+	 * at the descent's root read; a non-root merge point would proxy an
+	 * interior child slot, which a descent only meets at the child
+	 * dispatch (not yet wired).  Restrict the flip path to a root dst and
+	 * delegate the rest to the per-entry fallback.
+	 */
+	if (d_dst->pnf) {
+		*delegated = true;
+		return CDS_FT_STATUS_OK;	/* ignored by caller */
+	}
+
+	/* Size both glues from a read-only pre-pass (with headroom). */
+	ft_merge_count(S, D, &cnt);
+	ft_graft_glue_init(&gd);
+	ft_graft_glue_init(&gs);
+	if (ft_graft_glue_reserve(&gd, cnt.nb + 8, cnt.nd + 8,
+				cnt.nf_dst + 8, cnt.ns + 8) ||
+	    ft_graft_glue_reserve(&gs, 0, 0, cnt.nf_src + 8, 0)) {
+		ft_graft_glue_fini(&gd);
+		ft_graft_glue_fini(&gs);
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+
+	/* Pre-allocate src's fresh empty root for the commit-time unlink. */
+	fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
+	if (!fresh_root) {
+		ft_graft_glue_fini(&gd);
+		ft_graft_glue_fini(&gs);
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+	rcu_assign_pointer(fresh_meta->parent, NULL);
+	ft_nr_keys_store(fresh_meta, 0, CMM_RELAXED);
+
+	/* Build the merged cluster invisibly (the only fallible phase). */
+	M = ft_merge_build(&ctx, S, D, 0, &merged_keys);
+	if (M == FT_MERGE_DELEGATE || M == FT_MERGE_OOM) {
+		free_cds_ft_node_unpublished(src_ft, fresh_root);
+		ft_graft_glue_abort(dst_ft, &gd);
+		ft_graft_glue_abort(src_ft, &gs);
+		if (M == FT_MERGE_DELEGATE) {
+			*delegated = true;
+			return CDS_FT_STATUS_OK;	/* ignored by caller */
+		}
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+
+	/*
+	 * Allocate the flip batch: one proxy per dst-origin re-parent edge,
+	 * plus one for the merge-point forward slot.  Fallible -> abort the
+	 * still-invisible build; both tries stay pristine.
+	 */
+	{
+		unsigned int nr_dst = 0;
+		int j;
+
+		for (j = 0; j < gd.nr_deferred; j++)
+			if (gd.deferred[j].dst_origin)
+				nr_dst++;
+		flip = ft_flip_batch_alloc(dst_ft, nr_dst + 1);
+	}
+	if (!flip) {
+		free_cds_ft_node_unpublished(src_ft, fresh_root);
+		ft_graft_glue_abort(dst_ft, &gd);
+		ft_graft_glue_abort(src_ft, &gs);
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+	ft_graft_glue_set_publish(&gd, d_dst->pnf, d_dst->nfp, M);
+
+	/* ===== COMMIT (failure-free) ===== */
+
+	/* 1. Unlink src's root + drain src readers of the moved content. */
+	rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
+	FT_TP(root_publish, (const void *) src_ft, (const void *) src_ft->root);
+	if (!src_ft->exclusive)
+		src_ft->group->flavor->update_synchronize_rcu();
+
+	/*
+	 * 2. Re-parent the SRC-origin referenced subtrees directly: the src
+	 *    drain above made them unreachable to readers, and the cluster is
+	 *    not yet forward-published, so this is invisible.  dst-origin
+	 *    edges are NOT applied here -- they go through the flip.
+	 */
+	ft_graft_glue_apply_deferred(&gd);
+
+	/*
+	 * 3. Stage the flip: point every dst-origin child's parent, and the
+	 *    merge-point forward slot, at a proxy that still resolves to the
+	 *    OLD target (selector 0).  Transparent to readers: up-walks and
+	 *    the root descent still see the pre-merge dst.
+	 */
+	{
+		int j;
+
+		for (j = 0; j < gd.nr_deferred; j++) {
+			struct cds_ft_inode_flag *child, *old_parent, *pf;
+
+			if (!gd.deferred[j].dst_origin)
+				continue;
+			child = gd.deferred[j].child;
+			/*
+			 * Current parent = the old dst overlap node.  Resolve a
+			 * skip-encoded picked child to its compressed node first:
+			 * ft_get_parent_rcu reads node metadata and cannot take a
+			 * skip pointer (ft_set_parent_raw below resolves itself).
+			 */
+			old_parent = ft_get_parent_rcu(
+				ft_resolve_skip_compressed(child));
+			pf = ft_flip_batch_add(flip, old_parent,
+				gd.deferred[j].parent);
+			ft_set_parent_raw(child, pf);
+		}
+		/* Merge-point forward slot: old dst subtree -> merged cluster. */
+		rcu_assign_pointer(*d_dst->nfp, ft_flip_batch_add(flip, D, M));
+	}
+
+	/*
+	 * 4. Flip: one release store switches every dst-origin parent AND the
+	 *    forward slot from old to merged, atomically.  Because the forward
+	 *    slot flips with the back-pointers, a reader (which descends then
+	 *    walks up) only ever progresses old->merged, never regresses.
+	 */
+	urcu_flip_commit(&flip->group);
+
+	/* 5. Concatenate same-key duplicate chains (dst now reachable via M). */
+	ft_graft_glue_apply_splices(&gd);
+
+	/* 6. Propagate the dst key-count delta through the ancestors. */
+	if (d_dst->pnf && merged_keys != cnt_dst)
+		ft_propagate_external_count_parent(dst_ft, d_dst->pnf,
+			(long) merged_keys - (long) cnt_dst);
+
+	/*
+	 * 7. Settle: rewrite each proxied slot to its direct merged target
+	 *    (idempotent for readers -- the proxy already resolves to merged),
+	 *    so the proxies become unreferenced and reclaimable.
+	 */
+	{
+		int j;
+
+		for (j = 0; j < gd.nr_deferred; j++)
+			if (gd.deferred[j].dst_origin)
+				ft_set_parent(gd.deferred[j].child,
+					gd.deferred[j].parent,
+					gd.deferred[j].slot);
+		rcu_assign_pointer(*d_dst->nfp, M);
+	}
+
+	/*
+	 * 8. Reclaim, all deferred: the flip batch (proxies now unreferenced)
+	 *    and the old overlap spines (src-side to src, dst-side to dst).
+	 *    No dst synchronize_rcu -- the flip subsumed the dst drain.
+	 */
+	ft_flip_batch_reclaim(flip);
+	ft_graft_glue_free_old(src_ft, &gs);
+	ft_graft_glue_free_old(dst_ft, &gd);
+
+	ft_graft_glue_fini(&gd);
+	ft_graft_glue_fini(&gs);
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
@@ -14970,6 +15710,11 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 {
 	struct cds_ft *subtree = NULL;
 	enum cds_ft_status status;
+	struct ft_descent d_src, d_dst;
+	unsigned int off_src, off_dst;
+	unsigned long cnt_src, cnt_dst;
+	enum ft_graft_swap_case ks, kd;
+	bool delegated = false;
 
 	FT_TP(merge_enter, (const void *) dst_ft, (const void *) src_ft);
 
@@ -15006,62 +15751,61 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 
-	dst_ft->group->flavor->read_lock();
+	/*
+	 * merge_at is a mutator; the application provides mutual exclusion
+	 * between mutators.  Take the reentrant writer-validation scope (like
+	 * cds_ft_graft_swap), NOT a flavor read lock -- the spine-copy commit
+	 * calls update_synchronize_rcu, which would deadlock inside a
+	 * read-side critical section.
+	 */
+	CDS_FT_SCOPED_WRITER(dst_ft);
+	CDS_FT_SCOPED_WRITER(src_ft);
 
 	/*
-	 * Step 1: detach @src_ft at @src_key into a transient @subtree.
-	 *
-	 * cds_ft_detach drains in-flight RCU readers of the moved
-	 * sub-tree (one grace period unless @src_ft is exclusive), so
-	 * @subtree is returned in exclusive mode.  This is what frees
-	 * @src_ft from a "must be exclusive" requirement: the rest of
-	 * the merge operates entirely on @subtree (which is provably
-	 * exclusive) instead of touching @src_ft's payload.
-	 *
-	 * @subtree's keys are stripped of the @src_key prefix, so on a
-	 * fixed-length group @subtree's per-key length is shorter than
-	 * the group's nominal fixed length.  This handle does NOT
-	 * conform to the group's public-API key-length invariant; we
-	 * keep it strictly internal and only touch it via the
-	 * keylen-bypassing helpers (ft_keys_lcp, ft_detach_keylen,
-	 * ft_graft_keylen) and cds_ft_destroy.
-	 *
-	 * NOT_FOUND from the detach means @src_ft has no content under
-	 * @src_key: the merge is a no-op.
+	 * Locate both merge points read-only (a writer descends its own
+	 * stable state).  No content under @src_key -> the merge is a no-op;
+	 * cnt_src == 0 covers an empty @src_ft root (src_key_len == 0, where
+	 * the descent still reports EXACT at the always-present root).
 	 */
-	status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
-	if (status == CDS_FT_STATUS_NOT_FOUND) {
-		dst_ft->group->flavor->read_unlock();
+	ks = ft_merge_descend(src_ft, src_key, src_key_len, &d_src,
+			&off_src, &cnt_src);
+	if (ks == FT_GRAFT_SWAP_DELEGATE || cnt_src == 0) {
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
-	if (status < 0)
-		goto out_unlock;
+	kd = ft_merge_descend(dst_ft, dst_key, dst_key_len, &d_dst,
+			&off_dst, &cnt_dst);
+	(void) off_src;
+	(void) off_dst;
 
 	/*
-	 * Step 2: pick the fast path or per-entry fallback based on
-	 * whether @dst_ft has any content under @dst_key.
-	 *
-	 * Fast path: ft_graft_keylen(@dst_ft, @dst_key, @subtree)
-	 * re-prepends @dst_key to each of @subtree's stripped keys,
-	 * placing the original keys (or re-keyed ones for cross-key
-	 * merges) in @dst_ft.
-	 *
-	 * The keylen-bypassing helpers skip the public API's
-	 * fixed-length-vs-non-root rejection, so the fast path
-	 * applies uniformly to variable-length and fixed-length
-	 * groups.
-	 *
-	 * (A future optimization, not implemented here: when @dst_ft
-	 * has content under @dst_key but not under @dst_key
-	 * concatenated with @subtree's LCP, a nested detach+graft at
-	 * the deeper attach point would let the fast path apply more
-	 * often.  The current implementation conservatively falls
-	 * back to per-entry in that case because ft_store_at_graft_point
-	 * wraps an external-nodes-only graft payload in a fresh
-	 * internal node, which leaves an invariant-breaking empty
-	 * internal in @dst_ft after the chain is later removed.)
+	 * Atomic build-invisible spine-copy: only when @src_ft is merged at
+	 * its root and @dst_ft ends exactly at a non-empty subtree.
+	 * ft_merge_spine_copy delegates (sets @delegated, leaving both tries
+	 * pristine) when the overlap contains a compressed node, which is not
+	 * yet handled; every other shape uses the detach-based path below.
 	 */
+	if (src_key_len == 0 && ks == FT_GRAFT_SWAP_EXACT
+			&& kd == FT_GRAFT_SWAP_EXACT && cnt_dst > 0) {
+		status = ft_merge_spine_copy(dst_ft, src_ft, &d_dst,
+				cnt_dst, &delegated);
+		if (!delegated) {
+			FT_TP(merge_exit, (int) status);
+			return status;
+		}
+	}
+
+	/*
+	 * Detach-based path: move @src_ft@src_key into a transient exclusive
+	 * @subtree, then graft (dst empty under @dst_key) or merge per-entry.
+	 * Retained for the shapes the spine-copy builder does not yet handle;
+	 * the per-entry fallback is not atomic across an OOM (the bug
+	 * ft_merge_spine_copy exists to remove).  @subtree's keys are stripped
+	 * of @src_key, so it is touched only via keylen-bypassing helpers.
+	 */
+	status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
+	if (status < 0)
+		goto out;	/* NOT_FOUND impossible: @src_ft had content. */
 	if (cds_ft_count_keys_prefix(dst_ft, dst_key, dst_key_len) == 0) {
 		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len,
 				subtree);
@@ -15110,25 +15854,20 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		goto out_rollback;
 
 	cds_ft_destroy(subtree);
-	dst_ft->group->flavor->read_unlock();
 	FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
 	return CDS_FT_STATUS_OK;
 
 out_rollback:
 	/*
-	 * Best-effort rollback: re-graft @subtree (with whatever
-	 * content remains in it) back into @src_ft at @src_key.
-	 * @src_ft was emptied of all content under @src_key by the
-	 * initial detach, so this graft cannot collide and only fails
-	 * on memory exhaustion.  On rollback failure @subtree's
-	 * externals are leaked (cds_ft_destroy releases the wrapper
-	 * but cannot drain externals).  The original error is
+	 * Best-effort rollback: re-graft @subtree back into @src_ft at
+	 * @src_key.  @src_ft was emptied under @src_key by the detach, so
+	 * this graft cannot collide and only fails on memory exhaustion (on
+	 * which @subtree's externals are leaked).  The original error is
 	 * propagated.
 	 */
 	(void) ft_graft_keylen(src_ft, src_key, src_key_len, subtree);
 	cds_ft_destroy(subtree);
-out_unlock:
-	dst_ft->group->flavor->read_unlock();
+out:
 	FT_TP(merge_exit, (int) status);
 	return status;
 }
@@ -15173,7 +15912,7 @@ bool cds_ft_empty(struct cds_ft *ft)
 	CDS_FT_SCOPED_READER(ft);
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
-	root_flag = rcu_dereference(ft->root);
+	root_flag = ft_root_dereference(ft);
 	root_node = ft_node_ptr(root_flag);
 
 	/*
@@ -15257,7 +15996,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 		prefix = ordinal_buf;
 	}
 
-	node_flag = ft_dereference_acquire_prefetch(ft->root);
+	node_flag = ft_root_dereference_acquire_prefetch(ft);
 
 	for (i = 0; i < prefix_len; i++) {
 		uint8_t kv;
@@ -15290,7 +16029,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 			node_flag = ft_node_get_nth_reanchor(node_flag, kv,
 					&rewind);
 			if (caa_unlikely(rewind)) {
-				node_flag = ft_dereference_acquire_prefetch(ft->root);
+				node_flag = ft_root_dereference_acquire_prefetch(ft);
 				i = (unsigned int) -1;	/* loop ++ -> restart at 0 */
 				continue;
 			}
@@ -15410,7 +16149,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 
-	node_flag = ft_dereference_acquire_prefetch(ft->root);
+	node_flag = ft_root_dereference_acquire_prefetch(ft);
 	iter_path_node(iter)[0] = node_flag;
 
 	ft_delay_reader();
@@ -15641,7 +16380,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 
-	node_flag = ft_dereference_acquire_prefetch(ft->root);
+	node_flag = ft_root_dereference_acquire_prefetch(ft);
 	iter_path_node(iter)[0] = node_flag;
 
 	for (level = 1; ; level++) {
@@ -15829,7 +16568,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 	struct cds_ft_inode_flag *node_flag;
 	unsigned int i;
 
-	node_flag = ft_dereference_acquire_prefetch(ft->root);
+	node_flag = ft_root_dereference_acquire_prefetch(ft);
 	iter_path_node(iter)[0] = node_flag;
 
 	for (i = 0; i < key_len; i++) {
@@ -15861,7 +16600,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 			node_flag = ft_node_get_nth_reanchor(node_flag, ordinal,
 					&rewind);
 			if (caa_unlikely(rewind)) {
-				node_flag = ft_dereference_acquire_prefetch(ft->root);
+				node_flag = ft_root_dereference_acquire_prefetch(ft);
 				iter_path_node(iter)[0] = node_flag;
 				i = (unsigned int) -1;	/* loop ++ -> restart at 0 */
 				continue;
@@ -18089,14 +18828,15 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 /*
  * Relocate a compressed node @cn into a fresh slot, keeping the same length.
  * Because the length is unchanged, the skip pointer's encoded length still
- * matches (ft_skip_to_compressed_validate's cn->len == skip_len holds whether a
- * reader resolves the old or the new node), and the parent-pointer flip is
- * exactly what that reader-side validation already tolerates; the old node
- * stays alive until its grace period.  A compressed node never carries
- * external_nodes (that would fork a path that must remain skippable), so the
- * only reference to redirect is its child's back-pointer.  The grandparent slot
- * is repointed only for a traditional (non-skip) compressed node -- a skip
- * pointer addresses the target, not @cn, so it needs no change.
+ * matches the relocated node (cn2->len == skip_len, whether a reader resolves
+ * the old or the new node via the skip child's back-pointer), and the
+ * parent-pointer flip is exactly the transient that ft_skip_reanchor already
+ * tolerates; the old node stays alive until its grace period.  A compressed
+ * node never carries external_nodes (that would fork a path that must remain
+ * skippable), so the only reference to redirect is its child's back-pointer.
+ * The grandparent slot is repointed only for a traditional (non-skip)
+ * compressed node -- a skip pointer addresses the target, not @cn, so it needs
+ * no change.
  *
  * @gp_slot: grandparent slot holding the cn flag (traditional), or NULL (skip).
  * Returns the new compressed node (or @cn unchanged on allocation failure).

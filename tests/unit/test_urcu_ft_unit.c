@@ -249,6 +249,10 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
 			skip(1, "filtered out: " #fn);			\
 			break;						\
 		}							\
+		if (exclude && strstr(exclude, #fn)) {			\
+			skip(1, "excluded: " #fn);			\
+			break;						\
+		}							\
 		leak_reset();						\
 		rcu_quiescent_state();					\
 		ok((fn)() == 0 && leak_check() == 0, "%s", #fn);	\
@@ -15076,11 +15080,203 @@ static int test_split_oom_backpointer(void)
 	}
 	return rc;
 }
+
+/*
+ * OOM coverage for cds_ft_merge_at's build-invisible spine-copy.  All of src
+ * is merged at its root into a non-empty dst whose top-level byte ('b') is
+ * DISJOINT from src's ('a'), so ft_merge_build copies only the merge-point
+ * root and REFERENCES both sides' subtrees: the spine-copy path is taken under
+ * every build (no compressed overlap forces a per-entry delegation), and the
+ * pristine guarantee below holds uniformly.
+ *
+ * The fault sweep covers the whole build window.  The merge is build-invisible,
+ * so every OOM must leave BOTH tries pristine -- dst keeps exactly its own keys,
+ * src keeps exactly its own keys (no detach, no rollback, no leak).  On success
+ * dst holds the union and src is empty.
+ */
+static int run_merge_oom(int nr_faults)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group);
+		struct cds_ft *src;
+		struct ft_test_node *d1 = node_alloc(1);
+		struct ft_test_node *d2 = node_alloc(2);
+		struct ft_test_node *s1 = node_alloc(3);
+		struct ft_test_node *s2 = node_alloc(4);
+		enum cds_ft_status s;
+		int verified, keys_ok;
+
+		if (cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom: src create failed\n");
+			return -1;
+		}
+		/* dst: "ax","ay"; src: "bx","by" -- disjoint top byte. */
+		if (cds_ft_insert(dst, (const uint8_t *)"ax", 2, &d1->node) < 0 ||
+		    cds_ft_insert(dst, (const uint8_t *)"ay", 2, &d2->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *)"bx", 2, &s1->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *)"by", 2, &s2->node) < 0)
+			rc = -1;
+
+		/* Fail the (n+1)-th allocation performed by the merge. */
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge(dst, NULL, 0, src);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		if (s == CDS_FT_STATUS_OK) {
+			keys_ok = graft_swap_oom_has_key(dst, "ax") &&
+				graft_swap_oom_has_key(dst, "ay") &&
+				graft_swap_oom_has_key(dst, "bx") &&
+				graft_swap_oom_has_key(dst, "by") &&
+				!graft_swap_oom_has_key(src, "bx") &&
+				!graft_swap_oom_has_key(src, "by");
+		} else {
+			/* OOM: both tries pristine. */
+			keys_ok = graft_swap_oom_has_key(dst, "ax") &&
+				graft_swap_oom_has_key(dst, "ay") &&
+				!graft_swap_oom_has_key(dst, "bx") &&
+				!graft_swap_oom_has_key(dst, "by") &&
+				graft_swap_oom_has_key(src, "bx") &&
+				graft_swap_oom_has_key(src, "by");
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom(void)
+{
+	return run_merge_oom(12);
+}
+
+/*
+ * OOM coverage for the PIECEWISE merge: dst already has nodes that overlap
+ * src's, so ft_merge_build must recurse INTO the shared spine -- copying the
+ * shared branch nodes, splicing the same full keys ("aa", "ba"), and
+ * referencing only the divergent children ("ab"/"bb" in dst, "ac"/"bc" in
+ * src).  The shared path runs through multi-child branches (root -> {a,b};
+ * each -> {a,...}), never a single-child run, so no compressed node appears on
+ * it and the spine-copy is taken under every build.  Because per-entry
+ * delegation would leave dst with a partial key set on a mid-loop OOM, this
+ * test passing the pristine assertion is itself proof the spine-copy path ran.
+ *
+ * Every OOM across the (larger) build window must leave BOTH tries pristine;
+ * success yields the union in dst (with "aa"/"ba" as 2-deep duplicate chains)
+ * and an empty src.
+ */
+static int run_merge_oom_overlap(int nr_faults)
+{
+	static const char *const dkeys[] = { "aa", "ab", "ba", "bb" };
+	static const char *const skeys[] = { "aa", "ac", "ba", "bc" };
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group);
+		struct cds_ft *src;
+		enum cds_ft_status s;
+		int verified, keys_ok;
+		unsigned int i;
+
+		if (cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom_overlap: src create failed\n");
+			return -1;
+		}
+		for (i = 0; i < 4; i++) {
+			struct ft_test_node *dn = node_alloc(100 + i);
+			struct ft_test_node *sn = node_alloc(200 + i);
+
+			if (cds_ft_insert(dst, (const uint8_t *) dkeys[i], 2,
+					&dn->node) < 0 ||
+			    cds_ft_insert(src, (const uint8_t *) skeys[i], 2,
+					&sn->node) < 0)
+				rc = -1;
+		}
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge(dst, NULL, 0, src);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		if (s == CDS_FT_STATUS_OK) {
+			/* dst holds the union; src is empty. */
+			keys_ok = graft_swap_oom_has_key(dst, "aa") &&
+				graft_swap_oom_has_key(dst, "ab") &&
+				graft_swap_oom_has_key(dst, "ac") &&
+				graft_swap_oom_has_key(dst, "ba") &&
+				graft_swap_oom_has_key(dst, "bb") &&
+				graft_swap_oom_has_key(dst, "bc") &&
+				!graft_swap_oom_has_key(src, "aa") &&
+				!graft_swap_oom_has_key(src, "ac");
+		} else {
+			/* OOM: both tries pristine (no key moved, none lost). */
+			keys_ok = graft_swap_oom_has_key(dst, "aa") &&
+				graft_swap_oom_has_key(dst, "ab") &&
+				!graft_swap_oom_has_key(dst, "ac") &&
+				graft_swap_oom_has_key(dst, "bb") &&
+				!graft_swap_oom_has_key(dst, "bc") &&
+				graft_swap_oom_has_key(src, "aa") &&
+				graft_swap_oom_has_key(src, "ac") &&
+				graft_swap_oom_has_key(src, "bc");
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom_overlap: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_overlap(void)
+{
+	return run_merge_oom_overlap(16);
+}
 #endif /* FEATURE_FT_FAULT_INJECT */
 
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
+	const char *exclude = getenv("FT_TEST_EXCLUDE");
 	int err;
 
 	err = create_all_cpu_call_rcu_data(0);
@@ -15373,6 +15569,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_dense_full_node);
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_split_oom_backpointer);
+	RUN_TEST(test_merge_oom);
+	RUN_TEST(test_merge_oom_overlap);
 #endif
 
 	rcu_barrier();
