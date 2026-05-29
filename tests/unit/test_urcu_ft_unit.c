@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 208
+#define NR_TESTS 212
 #else
-#define NR_TESTS 207
+#define NR_TESTS 208
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13173,6 +13173,125 @@ out_dst:
 }
 
 /*
+ * Merge where the overlap between src and dst contains COMPRESSED nodes:
+ * shared multi-byte runs, mid-run divergence (suffix == bare child, and
+ * suffix == a fresh compressed wrapper), a compressed run meeting an
+ * internal node that carries external_nodes, same-key splices, and a
+ * disjoint reference.  Exercises ft_merge_build's compressed cases (the
+ * build-invisible spine-copy when src is merged at its root into a
+ * non-empty dst), falling back to the per-entry path only for shapes the
+ * builder still delegates.  Verifies the full key union, the spliced
+ * duplicate count, structural integrity, and an emptied src.
+ *
+ *   Group A (identical run + branch + splice):
+ *       dst {aaaa1, aaaa2}            src {aaaa1, aaaa3}
+ *   Group B (diverge mid-run, suffix == bare leaf child):
+ *       dst {bbbbbX}                  src {bbbbbY}
+ *   Group C (diverge mid-run, suffix == fresh compressed wrapper):
+ *       dst {ccccPQR}                 src {ccccXYZ}
+ *   Group D (compressed run meets internal node with external_nodes):
+ *       dst {dd, ddmn}                src {ddpq}
+ *   Group E (disjoint reference):
+ *       dst {zzzz}                    src {wwww}
+ */
+static int test_merge_compressed_overlap(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	static const char *const dst_keys[] = {
+		"aaaa1", "aaaa2", "bbbbbX", "ccccPQR", "dd", "ddmn", "zzzz",
+	};
+	static const char *const src_keys[] = {
+		"aaaa1", "aaaa3", "bbbbbY", "ccccXYZ", "ddpq", "wwww",
+	};
+	const struct merge_expected expected[] = {
+		{ "aaaa1", 5 }, { "aaaa2", 5 }, { "aaaa3", 5 },
+		{ "bbbbbX", 6 }, { "bbbbbY", 6 },
+		{ "ccccPQR", 7 }, { "ccccXYZ", 7 },
+		{ "dd", 2 }, { "ddmn", 4 }, { "ddpq", 4 },
+		{ "zzzz", 4 }, { "wwww", 4 },
+	};
+	unsigned int i;
+	unsigned long total;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < CAA_ARRAY_SIZE(dst_keys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(dst, (const uint8_t *) dst_keys[i],
+				strlen(dst_keys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	for (i = 0; i < CAA_ARRAY_SIZE(src_keys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(src, (const uint8_t *) src_keys[i],
+				strlen(src_keys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	s = cds_ft_merge(dst, NULL, 0, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_compressed_overlap: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_compressed_overlap: src not empty\n");
+		goto out;
+	}
+	/*
+	 * Every distinct key survives, and the entry total equals the sum of
+	 * both inputs (the shared key "aaaa1" becomes a 2-entry chain, so the
+	 * per-key presence check is used directly rather than
+	 * verify_keys_present, which assumes count == distinct keys).
+	 */
+	rcu_read_lock();
+	for (i = 0; i < CAA_ARRAY_SIZE(expected); i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (cds_ft_eager_lookup_key(dst,
+				(const uint8_t *) expected[i].key,
+				expected[i].key_len, expected[i].key_len,
+				&found) != CDS_FT_STATUS_OK || !found) {
+			rcu_read_unlock();
+			fprintf(stderr, "merge_compressed_overlap: missing '%s'\n",
+				expected[i].key);
+			goto out;
+		}
+	}
+	total = cds_ft_count_entries(dst);
+	rcu_read_unlock();
+	if (total != CAA_ARRAY_SIZE(dst_keys) + CAA_ARRAY_SIZE(src_keys)) {
+		fprintf(stderr, "merge_compressed_overlap: %lu entries, expected %zu\n",
+			total, CAA_ARRAY_SIZE(dst_keys) + CAA_ARRAY_SIZE(src_keys));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "merge_compressed_overlap: dst verify failed\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Merge with an empty src: no-op, dst unchanged.
  */
 static int test_merge_empty_source(void)
@@ -14383,6 +14502,21 @@ static int dense_drain(struct cds_ft *ft)
  */
 static int test_compact_dense_full_node(void)
 {
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+	/*
+	 * This regression drives ~900k mutations (populate + drain + repopulate
+	 * of a dense 300k keyspace).  Under per-mutation verification every one
+	 * of them triggers a full-trie cds_ft_verify, turning the run into hours
+	 * of O(keys^2) work -- while detecting nothing the test's own end-state
+	 * cds_ft_verify (below) does not.  Gate it behind FT_TEST_SLOW so the
+	 * VERIFY_AT_MUTATION config is not forced to pay it on every smoke run;
+	 * the fast configs always exercise the regression.
+	 */
+	if (!getenv("FT_TEST_SLOW")) {
+		diag("test_compact_dense_full_node: skipped under FEATURE_FT_VERIFY_AT_MUTATION (set FT_TEST_SLOW=1 to force; O(keys^2) per-mutation verify)");
+		return 0;
+	}
+#endif
 	/*
 	 * N must fill and fully drain at least one far range of order-11
 	 * nodes (~1000 nodes, i.e. ~256k dense 3-byte keys) so phase 1 leaves
@@ -15271,6 +15405,105 @@ static int test_merge_oom_overlap(void)
 {
 	return run_merge_oom_overlap(16);
 }
+
+/*
+ * As run_merge_oom_overlap, but the src/dst overlap contains COMPRESSED
+ * nodes, so the spine-copy builder allocates fresh compressed runs and
+ * suffix wrappers in addition to internal branch nodes:
+ *
+ *   dst {aaaa1, aaaa2, ccccPQR}      src {aaaa1, aaaa3, ccccXYZ}
+ *
+ * "aaaa" is a shared run resolving to a {1,2,3} branch (with "aaaa1" a
+ * spliced 2-entry chain); "cccc" is a shared run diverging at P/X into a
+ * branch whose two children are freshly-built "QR"/"YZ" compressed
+ * wrappers.  Every OOM across the build window must leave BOTH tries
+ * pristine -- the property the per-entry fallback (which moves keys one at
+ * a time) cannot provide and which the build-invisible spine copy exists
+ * to restore.  On success dst holds the 6-entry union and src is empty.
+ */
+static int run_merge_oom_compressed(int nr_faults)
+{
+	static const char *const dkeys[] = { "aaaa1", "aaaa2", "ccccPQR" };
+	static const char *const skeys[] = { "aaaa1", "aaaa3", "ccccXYZ" };
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group);
+		struct cds_ft *src;
+		enum cds_ft_status s;
+		int verified, keys_ok;
+		unsigned int i;
+
+		if (cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom_compressed: src create failed\n");
+			return -1;
+		}
+		for (i = 0; i < CAA_ARRAY_SIZE(dkeys); i++) {
+			struct ft_test_node *dn = node_alloc(100 + i);
+			struct ft_test_node *sn = node_alloc(200 + i);
+
+			if (cds_ft_insert(dst, (const uint8_t *) dkeys[i],
+					strlen(dkeys[i]), &dn->node) < 0 ||
+			    cds_ft_insert(src, (const uint8_t *) skeys[i],
+					strlen(skeys[i]), &sn->node) < 0)
+				rc = -1;
+		}
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge(dst, NULL, 0, src);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		if (s == CDS_FT_STATUS_OK) {
+			/* dst holds the union (aaaa1 a 2-chain); src is empty. */
+			keys_ok = graft_swap_oom_has_key(dst, "aaaa1") &&
+				graft_swap_oom_has_key(dst, "aaaa2") &&
+				graft_swap_oom_has_key(dst, "aaaa3") &&
+				graft_swap_oom_has_key(dst, "ccccPQR") &&
+				graft_swap_oom_has_key(dst, "ccccXYZ") &&
+				cds_ft_count_entries(dst) == 6 &&
+				cds_ft_empty(src);
+		} else {
+			/* OOM: both tries pristine (no key moved, none lost). */
+			keys_ok = graft_swap_oom_has_key(dst, "aaaa1") &&
+				graft_swap_oom_has_key(dst, "aaaa2") &&
+				!graft_swap_oom_has_key(dst, "aaaa3") &&
+				graft_swap_oom_has_key(dst, "ccccPQR") &&
+				!graft_swap_oom_has_key(dst, "ccccXYZ") &&
+				graft_swap_oom_has_key(src, "aaaa1") &&
+				graft_swap_oom_has_key(src, "aaaa3") &&
+				graft_swap_oom_has_key(src, "ccccXYZ");
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom_compressed: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_compressed(void)
+{
+	return run_merge_oom_compressed(20);
+}
 #endif /* FEATURE_FT_FAULT_INJECT */
 
 int main(int argc, char **argv)
@@ -15535,6 +15768,7 @@ int main(int argc, char **argv)
 	diag("cds_ft_merge tests");
 	RUN_TEST(test_merge_disjoint_prefix_fast_path);
 	RUN_TEST(test_merge_overlapping_per_entry);
+	RUN_TEST(test_merge_compressed_overlap);
 	RUN_TEST(test_merge_empty_source);
 	RUN_TEST(test_merge_at_root_empty_dst);
 	RUN_TEST(test_merge_duplicate_chains);
@@ -15571,6 +15805,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_merge_oom);
 	RUN_TEST(test_merge_oom_overlap);
+	RUN_TEST(test_merge_oom_compressed);
 #endif
 
 	rcu_barrier();
