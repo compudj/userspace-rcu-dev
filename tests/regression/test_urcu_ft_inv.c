@@ -3091,6 +3091,15 @@ static void *inv_merge_no_escape_writer(void *arg)
 		 * the next round.
 		 */
 		rcu_read_lock();
+		/*
+		 * The iterator is reused across the writer's read-side critical
+		 * sections, with grace periods (and this writer's own merge /
+		 * remove mutations) in between.  Flush the cached path so the
+		 * point lookups below re-descend from the live root rather than
+		 * following a path that may have been freed
+		 * (CDS_FT_ITER_PATH_CACHED contract), mirroring the reader.
+		 */
+		cds_ft_iter_invalidate_path(iter);
 		pthread_mutex_lock(&ctx->lock);
 		for (i = 0; i < 4; i++)
 			inv_merge_remove_key(ctx->dst, iter, inv_merge_src_keys[i]);
@@ -3272,18 +3281,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_ordered_no_escape_graft);
 
 	diag("10. Piecewise merge never escapes the destination");
-	/*
-	 * Temporarily skipped: surfaces a pre-existing skip-reanchor
-	 * residual (a reader reanchors to a compressed node whose parent
-	 * reads NULL) under aggressive empty->rebuild churn.  Confirmed NOT
-	 * a merge bug: a no-merge remove-all/reinsert isolation reproduces
-	 * it, and FEATURE_FT_VERIFY_AT_MUTATION stays green (transient, not a
-	 * structural corruption).  Re-enable once the residual is fixed
-	 * (next: audit direct rcu_assign_pointer child publishes that bypass
-	 * ft_publish_to_parent's publication-ordering guard).
-	 */
-	(void) inv_merge_no_escape;
-	skip(1, "inv_merge_no_escape: pre-existing skip-reanchor residual under empty->rebuild churn (not a merge bug); tracked separately");
+	RUN_TEST(inv_merge_no_escape);
 
 	rcu_barrier();
 	rcu_unregister_thread();

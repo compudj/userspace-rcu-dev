@@ -4914,16 +4914,34 @@ struct cds_ft_inode_flag *ft_node_get_minmax(struct cds_ft_inode_flag *node_flag
  *
  *   - otherwise: -ERANGE, forcing the caller to recompact.
  */
+/* Forward decl: ft_set_parent_raw is defined later (merge area). */
+static void ft_set_parent_raw(struct cds_ft_inode_flag *child,
+		struct cds_ft_inode_flag *value);
+
 static
 int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
 		bool *_replace_old_ptr,
-		bool is_init)
+		bool is_init,
+		bool defer_parent)
 {
 	assert(ft_type_is_popcount(type->type_class));
+
+	/*
+	 * Parent-first: wire the (fresh, not-yet-published) child's parent
+	 * back-pointer before any in-place store below, so a reader that
+	 * descends to it and walks back up never observes a NULL/stale parent.
+	 * Skipped when @defer_parent: a recompact child-copy (new node is
+	 * unpublished, reparented post-assembly) or a build-invisible cluster-
+	 * leaf (mutator wires parents at publish).  skip_slot is still set by
+	 * the wrapper's post-store ft_set_parent.
+	 */
+	if (!defer_parent)
+		ft_set_parent_raw(child_node_flag, node_flag);
 
 	if (type->popcount_2l && type->max_linear_child == 6) {
 		/* Flat 5+3 layout (max_lc=6 on 64-bit). */
@@ -5321,14 +5339,19 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 static
 int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		uint8_t n,
-		struct cds_ft_inode_flag *child_node_flag)
+		struct cds_ft_inode_flag *child_node_flag,
+		bool defer_parent)
 {
 	struct cds_ft_inode_flag **ptr;
 	bool replace_old_ptr = false;
 
 	assert(ft_type_is_pigeon(type->type_class));
+	/* Parent-first (see ft_popcount_node_set_nth). */
+	if (!defer_parent)
+		ft_set_parent_raw(child_node_flag, node_flag);
 	ptr = &((struct cds_ft_inode_flag **) node->data)[n];
 	if (*ptr)
 		replace_old_ptr = true;
@@ -5370,20 +5393,21 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
 static
 int _ft_node_set_nth(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
-		struct cds_ft_inode_flag *node_flag __attribute__((unused)),
+		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
-		bool is_init)
+		bool is_init,
+		bool defer_parent)
 {
 	int ret;
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
-		ret = ft_popcount_node_set_nth(type, node, metadata, n, child_node_flag, NULL, is_init);
+		ret = ft_popcount_node_set_nth(type, node, node_flag, metadata, n, child_node_flag, NULL, is_init, defer_parent);
 		break;
 	case FT_PIGEON:
-		ret = ft_pigeon_node_set_nth(type, node, metadata, n, child_node_flag);
+		ret = ft_pigeon_node_set_nth(type, node, node_flag, metadata, n, child_node_flag, defer_parent);
 		break;
 	case FT_NULL:
 		return -ENOSPC;
@@ -5402,6 +5426,7 @@ int _ft_node_set_nth(const struct cds_ft_type *type,
 static
 int ft_popcount_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
+		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		struct cds_ft_inode_flag *newptr)
@@ -5417,6 +5442,15 @@ int ft_popcount_node_replace_ptr(const struct cds_ft_type *type,
 	}
 	dbg_printf("popcount replace ptr: node %p\n", node);
 	assert(*node_flag_ptr != NULL);
+	/*
+	 * Parent-first: wire the replacement's back-pointer before the
+	 * forward publish (a reader descending here then walking back up must
+	 * not see a NULL/stale parent).  Placed past the -EFBIG check: the
+	 * recompaction path re-parents via its rebuilt copy itself, so setting
+	 * it here would re-parent through a copy recompaction frees.  (NULL
+	 * newptr == delete: ft_set_parent is a no-op.)
+	 */
+	ft_set_parent(newptr, node_flag, node_flag_ptr);
 	rcu_assign_pointer(*node_flag_ptr, newptr);
 	if (!newptr)
 		metadata->nr_child--;
@@ -5430,6 +5464,7 @@ int ft_popcount_node_replace_ptr(const struct cds_ft_type *type,
 static
 int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
 		struct cds_ft_inode *node __attribute__((unused)),
+		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		uint8_t n __attribute__((unused)),
@@ -5444,6 +5479,9 @@ int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
 	}
 	dbg_printf("ft_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
 	assert(*node_flag_ptr != NULL);
+	/* Parent-first: wire the back-pointer before the forward publish,
+	 * past the -EFBIG recompaction check (see popcount variant). */
+	ft_set_parent(newptr, node_flag, node_flag_ptr);
 	rcu_assign_pointer(*node_flag_ptr, newptr);
 	if (!newptr) {
 #ifdef FEATURE_USE_BITMAP_SCAN
@@ -5473,10 +5511,10 @@ int _ft_node_replace_ptr(const struct cds_ft_type *type,
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
-		ret = ft_popcount_node_replace_ptr(type, node, metadata, node_flag_ptr, newptr);
+		ret = ft_popcount_node_replace_ptr(type, node, node_flag, metadata, node_flag_ptr, newptr);
 		break;
 	case FT_PIGEON:
-		ret = ft_pigeon_node_replace_ptr(type, node, metadata, node_flag_ptr, n, newptr);
+		ret = ft_pigeon_node_replace_ptr(type, node, node_flag, metadata, node_flag_ptr, n, newptr);
 		break;
 	case FT_NULL:
 		return -ENOENT;
@@ -5484,8 +5522,8 @@ int _ft_node_replace_ptr(const struct cds_ft_type *type,
 		assert(0);
 		return -EINVAL;
 	}
-	if (!ret)
-		ft_set_parent(newptr, node_flag, node_flag_ptr);
+	/* Parent back-pointer is now wired inside the per-class body, ahead of
+	 * the forward store (previously set here, after it). */
 	return ret;
 }
 
@@ -5672,7 +5710,8 @@ int ft_node_recompact(enum ft_recompact mode,
 						RECOMPACT_IS_INIT(v));
 			else
 			ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
-					new_metadata, v, iter, RECOMPACT_IS_INIT(v));
+					new_metadata, v, iter,
+					RECOMPACT_IS_INIT(v), true);
 			assert(!ret);
 		}
 		break;
@@ -5704,7 +5743,8 @@ int ft_node_recompact(enum ft_recompact mode,
 						RECOMPACT_IS_INIT((uint8_t)i));
 			else
 			ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
-					new_metadata, i, iter, RECOMPACT_IS_INIT((uint8_t)i));
+					new_metadata, i, iter,
+					RECOMPACT_IS_INIT((uint8_t)i), true);
 			assert(!ret);
 		}
 		break;
@@ -5729,7 +5769,7 @@ skip_copy:
 		else
 		ret = _ft_node_set_nth(new_type, new_node, new_node_flag,
 				new_metadata, n, child_node_flag,
-				RECOMPACT_IS_INIT(n));
+				RECOMPACT_IS_INIT(n), true);
 		assert(!ret);
 	}
 
@@ -5891,7 +5931,8 @@ int ft_node_set_nth(struct cds_ft *ft,
 	 * false; fresh-init cases funnel here via -ENOSPC / -ERANGE to
 	 * ft_node_recompact, which uses is_init internally.
 	 */
-	ret = _ft_node_set_nth(type, node, *node_flag, metadata, n, child_node_flag, false);
+	ret = _ft_node_set_nth(type, node, *node_flag, metadata, n,
+			child_node_flag, false, cluster_leaf);
 	switch (ret) {
 	case 0:
 	{
@@ -9133,23 +9174,33 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		(uint8_t) iter_key[-1],
 		(const void *) top_flag);
 	/*
-	 * Phase 2 (publish) — no failures past here.  First wire the cluster
-	 * top's back-pointer into the live parent and the deferred bottom
-	 * back-pointers, THEN swing the parent's forward slot to the new
-	 * cluster.  Ordered so an up-walk that lands on the new cluster from
-	 * either direction (its top or any re-parented live child) sees every
-	 * back-pointer wired before the cluster becomes forward-reachable.
+	 * Phase 2 (publish) — no failures past here.  Wire every back-pointer
+	 * before swinging the parent's forward slot, so an up-walk that lands
+	 * on the new cluster from either direction sees the back-pointers wired
+	 * before the cluster becomes reader-reachable.
 	 *
-	 * suffix_len >= 1: edge 1 is the live old child into the new suffix
-	 * (cn->child -> sfx).  suffix_len == 0: edges 1 and 2 are the cluster-
-	 * leaf branch's two children (old = live cn->child, new = new subtree),
-	 * both -> branch_flag.
+	 * ORDER among the deferred edges matters.  deferred_child is always the
+	 * LIVE old child (cn->child) re-parented into the cluster; setting its
+	 * back-pointer is itself a back-channel publish — a reader up-walking
+	 * from cn->child immediately enters the new cluster and can then scan
+	 * the cluster's other (sibling) slots.  deferred_child2 is the FRESH
+	 * new subtree, observable only through the cluster.  So wire the cluster
+	 * top's own back-pointer and the fresh edge FIRST, and the live edge
+	 * LAST: otherwise a reader entering via the live child reads a sibling
+	 * slot pointing at the fresh subtree whose parent is not yet set, and
+	 * its consume chain — anchored at the live back-pointer store — has no
+	 * happens-before edge to the later fresh-parent store, so it observes a
+	 * stale NULL parent (ft_skip_reanchor holder == NULL).
+	 *
+	 * suffix_len >= 1: only the live edge exists (cn->child -> sfx).
+	 * suffix_len == 0: cluster-leaf branch's two children (live cn->child
+	 * and fresh new subtree), both -> branch_flag.
 	 */
 	ft_set_parent(top_flag, cn_meta->parent, parent_slot);
-	if (deferred_child)
-		ft_set_parent(deferred_child, deferred_parent, deferred_slot);
 	if (deferred_child2)
 		ft_set_parent(deferred_child2, deferred_parent, deferred_slot2);
+	if (deferred_child)
+		ft_set_parent(deferred_child, deferred_parent, deferred_slot);
 	ft_publish_to_parent(ft, cn_meta->parent, parent_slot, top_flag);
 
 	/* 7. Free the old compressed node. */
