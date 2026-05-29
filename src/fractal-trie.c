@@ -2013,8 +2013,17 @@ void ft_set_skip_slot(struct cds_ft_metadata *meta,
 
 /*
  * ft_get_skip_slot: recover the skip pointer slot address from the
- * stored pointer-stride offset.  Returns NULL if skip_slot_offset
- * is 0 and parent is non-NULL (slot was never set).
+ * stored pointer-stride offset.
+ *
+ * The node body IS the packed child-pointer array (metadata lives in a
+ * sibling page), so offset 0 is a valid slot — the node's first/lowest
+ * child.  A placed non-root skip-compressed child therefore always has a
+ * meaningful offset, including 0; the "no recorded slot" state is fully
+ * captured by parent == NULL (the root's child, recovered as &ft->root
+ * below).  Do NOT treat offset 0 as "unset": that aliases the lowest
+ * child of every node and silently drops its skip re-encode
+ * (ft_publish_to_parent / ft_node_recompact would skip it on a
+ * child-change, leaving a stale skip pointer in the parent slot).
  *
  * @ft is needed for the root case (parent == NULL).
  */
@@ -2024,8 +2033,6 @@ struct cds_ft_inode_flag **ft_get_skip_slot(const struct cds_ft_metadata *meta,
 {
 	if (!meta->parent)
 		return &ft->root;
-	if (!meta->skip_slot_offset)
-		return NULL;
 	return (struct cds_ft_inode_flag **)
 		((char *) ft_node_ptr(meta->parent) +
 		 (unsigned int) meta->skip_slot_offset * sizeof(void *));
@@ -18646,8 +18653,9 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 		/* Walk all 256 child slots. */
 		for (key = 0; key < 256; key++) {
+			struct cds_ft_inode_flag **slot = NULL;
 			struct cds_ft_inode_flag *child_raw =
-				ft_node_get_nth_skip(node_flag, NULL, (uint8_t) key, FT_PF_NONE);
+				ft_node_get_nth_skip(node_flag, &slot, (uint8_t) key, FT_PF_NONE);
 			struct cds_ft_inode_flag *child;
 
 			if (!child_raw)
@@ -18659,6 +18667,35 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			 */
 			if (ft_verify_skip_encoding(out, child_raw, depth + 1))
 				return -1;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * Slot-centric skip-slot invariant: a slot holding
+			 * skip(cn) must be the very slot cn records as its
+			 * skip_slot (the inverse of the cn-centric round-trip
+			 * check above).  rec != slot names a dangling/aliased
+			 * skip slot directly: a reparent left cn's skip_slot
+			 * pointing elsewhere, or a placement never recorded it.
+			 */
+			if (ft_node_skip_compressed(child_raw) && slot) {
+				struct cds_ft_compressed_node *scn =
+					ft_skip_to_compressed(child_raw);
+				struct cds_ft_metadata *scnm =
+					cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) scn);
+				struct cds_ft_inode_flag **rec =
+					ft_get_skip_slot(scnm,
+						(struct cds_ft *) ft);
+
+				if (rec != slot) {
+					if (out)
+						fprintf(out, "ft_verify: depth %u: node %p key %u slot %p holds skip(cn %p) but cn->skip_slot names %p (dangling skip slot)\n",
+							depth, node_flag, key,
+							(void *) slot, (void *) scn,
+							(void *) rec);
+					return -1;
+				}
+			}
+#endif
 			child = ft_resolve_skip_compressed(child_raw);
 			counted_children++;
 			/*
