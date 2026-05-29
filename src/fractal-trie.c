@@ -15888,6 +15888,18 @@ struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft, unsigned int cap)
 }
 
 /*
+ * Free a flip batch that was allocated but never installed (no proxy stored
+ * in any live slot, group never committed): a plain free, no grace period,
+ * since no reader can reference it.  Used by the merge's last-fallible src
+ * unlink abort path.
+ */
+static
+void ft_flip_batch_free_unpublished(struct ft_flip_batch *b)
+{
+	free(b);
+}
+
+/*
  * Record a proxy {old_nf, new_nf} and return its tagged flag, to be stored
  * (sel == 0 -> old_nf, transparent) into the slot being flipped.
  */
@@ -15952,31 +15964,153 @@ void ft_set_parent_raw(struct cds_ft_inode_flag *child,
 }
 
 /*
- * Build-invisible spine-copy merge of all of @src_ft (its root) into @dst_ft
- * at the live EXACT subtree @d_dst.  All allocation is in the build phase, so
+ * Unlink the EXACT subtree at @src_key from @src_ft IN PLACE, preserving the
+ * subtree node so the spine-copy merge can keep referencing it (it is
+ * re-parented into the merged cluster at commit).  This is the non-root-src
+ * analogue of the root-src ft->root swap: it removes the merge source from
+ * @src_ft and prunes the now-empty single-child branch above it.
+ *
+ * The descent + ft_detach_node + chain reclaim mirror ft_detach_keylen's
+ * non-root path, but with @free_detached_subtree = false and WITHOUT wrapping
+ * the subtree in a transient trie (the merge owns it via @gd's referenced
+ * edges; wrapping it would double-own it).  @detached_count is the subtree's
+ * unique-key count (from ft_merge_descend), propagated out of the ancestors.
+ *
+ * The caller invokes this as the LAST fallible commit step: on -ENOMEM
+ * (ft_detach_node recompaction failed) @src_ft is left pristine, so the caller
+ * aborts the still-invisible build with both tries intact -- no rollback.  On
+ * success the caller drains @src_ft and runs the failure-free commit tail.
+ */
+static
+int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
+		const uint8_t *_src_key, size_t src_key_len,
+		unsigned long detached_count)
+{
+	const struct cds_ft_key_map *km = &src_ft->group->key_map;
+	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
+	const uint8_t *key, *ik;
+	struct ft_detach_descent dd;
+	struct cds_ft_inode_flag *child, *chain_head;
+	int ret;
+
+	if (caa_likely(km->identity)) {
+		key = _src_key;
+	} else {
+		ft_key_to_ordinals(ordinal_buf, _src_key, src_key_len, km);
+		key = ordinal_buf;
+	}
+	ik = key;
+
+	ft_detach_descent_init(&dd, src_ft);
+	for (; dd.d.depth < src_key_len; ) {
+		const struct cds_ft_metadata *meta;
+		uint8_t kv;
+
+		/* Caller already established EXACT, so the path is present. */
+		if (ft_node_compressed(dd.d.nf)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(dd.d.nf);
+			const struct cds_ft_metadata *cn_meta =
+				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+
+			ft_detach_descent_track(&dd, cn_meta);
+			ft_descent_traverse_compressed(&dd.d, cn, &ik);
+			if (dd.d.nf && dd.pending) {
+				dd.det_nfp = dd.d.nfp;
+				dd.pending = false;
+			}
+			continue;
+		}
+		meta = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
+		ft_detach_descent_track(&dd, meta);
+		kv = *(ik++);
+		ft_detach_descent_step(&dd, kv);
+	}
+	child = dd.d.nf;
+
+	/* Propagate the removal through ancestors before touching freed slots. */
+	ft_propagate_external_count_parent(src_ft, dd.d.pnf,
+			-(long) detached_count);
+
+	/*
+	 * Unlink the branch, preserving @child.  Save the slot value first:
+	 * ft_detach_node nulls it, and the single-child chain between the
+	 * topmost branch point and @child must be reclaimed explicitly (the
+	 * move-style detach does not free it).
+	 */
+	chain_head = *dd.det_nfp;
+	ret = ft_detach_node(src_ft, dd.det_nfp, dd.det_pfp, dd.det_depth,
+			/*free_detached_subtree=*/ false);
+	if (ret < 0) {
+		/* Recompaction OOM: undo the propagation; src is pristine. */
+		ft_propagate_external_count_parent(src_ft, dd.d.pnf,
+				(long) detached_count);
+		return -ENOMEM;
+	}
+	while (chain_head && chain_head != child && !ft_node_external(chain_head)) {
+		struct cds_ft_inode_flag *next = NULL;
+
+		if (ft_node_compressed(chain_head)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(ft_skip_child_ptr(chain_head));
+			struct cds_ft_metadata *cm =
+				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+
+			if (cm->nr_child != 1 || cm->external_nodes)
+				break;
+			next = cn->child;
+			free_compressed_node(src_ft, cn);
+		} else {
+			struct cds_ft_metadata *m =
+				cds_ft_item_to_metadata(ft_node_ptr(chain_head));
+			unsigned int kv;
+
+			if (m->nr_child != 1 || m->external_nodes)
+				break;
+			for (kv = 0; kv < 256; kv++) {
+				next = ft_node_get_nth(chain_head, NULL,
+						(uint8_t) kv, FT_PF_NONE);
+				if (next)
+					break;
+			}
+			free_cds_ft_node(src_ft, ft_node_ptr(chain_head));
+		}
+		chain_head = next;
+	}
+	return 0;
+}
+
+/*
+ * Build-invisible spine-copy merge of @src_ft's subtree at @src_key into
+ * @dst_ft at the live EXACT subtree @d_dst.  All allocation is in the build
+ * phase (plus the single fallible src unlink at commit for a non-root src), so
  * any OOM frees the fresh copies and leaves both tries pristine -- no rollback.
  *
- * Slice 1 scope: @src_ft merged at its root (src_key_len == 0), @d_dst an
- * EXACT non-empty subtree, and the overlap free of compressed nodes.  When the
- * overlap contains a compressed node ft_merge_build delegates: *delegated is
- * set, both glues are aborted (pristine), and the caller falls back to the
- * per-entry path.
+ * @src_ft merged at @src_key (@d_src its EXACT subtree, @cnt_src its key count)
+ * into @d_dst, an EXACT non-empty dst subtree.  A root src (src_key_len == 0)
+ * unlinks via the ft->root swap; a non-root src unlinks its branch in place at
+ * commit (the only post-build fallible step).  Compressed overlaps are handled.
+ * A non-root DST merge point (d_dst->pnf) still delegates: its interior forward
+ * slot would need read-side flip-proxy resolution at child dispatch, not yet
+ * wired -- *delegated is set and the caller uses the per-entry fallback.
  *
  * Returns OK on a committed merge, MEMORY_ERROR on OOM (pristine), or (with
  * *delegated set) an unused status.
  */
 static
 enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
-		struct cds_ft *src_ft, struct ft_descent *d_dst,
-		unsigned long cnt_dst, bool *delegated)
+		struct cds_ft *src_ft, struct ft_descent *d_src,
+		const uint8_t *src_key, size_t src_key_len, unsigned long cnt_src,
+		struct ft_descent *d_dst, unsigned long cnt_dst, bool *delegated)
 {
 	struct ft_graft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
 	struct ft_merge_counts cnt = { 0, 0, 0, 0, 0 };
-	struct cds_ft_inode_flag *S = src_ft->root;
+	bool root_src = (src_key_len == 0);
+	struct cds_ft_inode_flag *S = d_src->nf;
 	struct cds_ft_inode_flag *D = d_dst->nf;
 	struct cds_ft_inode_flag *M;
-	struct cds_ft_inode *fresh_root;
+	struct cds_ft_inode *fresh_root = NULL;
 	struct cds_ft_metadata *fresh_meta;
 	struct ft_flip_batch *flip;
 	unsigned long merged_keys = 0;
@@ -15984,12 +16118,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	*delegated = false;
 
 	/*
-	 * The flip-latch publishes the merged cluster through the merge-point
-	 * forward slot.  For a root dst merge that slot is ft->root, resolved
-	 * at the descent's root read; a non-root merge point would proxy an
-	 * interior child slot, which a descent only meets at the child
-	 * dispatch (not yet wired).  Restrict the flip path to a root dst and
-	 * delegate the rest to the per-entry fallback.
+	 * Non-root dst merge point: the flip would proxy an interior child slot
+	 * that the read-side descent does not resolve at child dispatch (only
+	 * the root read resolves flip proxies).  Delegate to the per-entry path.
 	 */
 	if (d_dst->pnf) {
 		*delegated = true;
@@ -16008,20 +16139,23 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
-	/* Pre-allocate src's fresh empty root for the commit-time unlink. */
-	fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
-	if (!fresh_root) {
-		ft_graft_glue_fini(&gd);
-		ft_graft_glue_fini(&gs);
-		return CDS_FT_STATUS_MEMORY_ERROR;
+	/* Root src: pre-allocate the fresh empty root for the commit swap. */
+	if (root_src) {
+		fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
+		if (!fresh_root) {
+			ft_graft_glue_fini(&gd);
+			ft_graft_glue_fini(&gs);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+		rcu_assign_pointer(fresh_meta->parent, NULL);
+		ft_nr_keys_store(fresh_meta, 0, CMM_RELAXED);
 	}
-	rcu_assign_pointer(fresh_meta->parent, NULL);
-	ft_nr_keys_store(fresh_meta, 0, CMM_RELAXED);
 
-	/* Build the merged cluster invisibly (the only fallible phase). */
+	/* Build the merged cluster invisibly (the only build-phase fallible step). */
 	M = ft_merge_build(&ctx, S, 0, D, 0, 0, &merged_keys);
 	if (M == FT_MERGE_DELEGATE || M == FT_MERGE_OOM) {
-		free_cds_ft_node_unpublished(src_ft, fresh_root);
+		if (fresh_root)
+			free_cds_ft_node_unpublished(src_ft, fresh_root);
 		ft_graft_glue_abort(dst_ft, &gd);
 		ft_graft_glue_abort(src_ft, &gs);
 		if (M == FT_MERGE_DELEGATE) {
@@ -16046,18 +16180,34 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		flip = ft_flip_batch_alloc(dst_ft, nr_dst + 1);
 	}
 	if (!flip) {
-		free_cds_ft_node_unpublished(src_ft, fresh_root);
+		if (fresh_root)
+			free_cds_ft_node_unpublished(src_ft, fresh_root);
 		ft_graft_glue_abort(dst_ft, &gd);
 		ft_graft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft_graft_glue_set_publish(&gd, d_dst->pnf, d_dst->nfp, M);
 
-	/* ===== COMMIT (failure-free) ===== */
-
-	/* 1. Unlink src's root + drain src readers of the moved content. */
-	rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
-	FT_TP(root_publish, (const void *) src_ft, (const void *) src_ft->root);
+	/*
+	 * 1. Unlink the merge source from src.  Root src: swap in the pre-
+	 *    allocated empty root.  Non-root src: detach its branch in place --
+	 *    the LAST fallible step.  On its OOM both tries are pristine (the
+	 *    detach self-undoes, the cluster is still unpublished), so abort the
+	 *    build; this preserves the no-rollback property.  Then drain src
+	 *    readers of the moved content.
+	 *
+	 *    ===== Everything from the drain onward is failure-free. =====
+	 */
+	if (root_src) {
+		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
+		FT_TP(root_publish, (const void *) src_ft, (const void *) src_ft->root);
+	} else if (ft_merge_unlink_src_subtree(src_ft, src_key, src_key_len,
+				cnt_src) < 0) {
+		ft_flip_batch_free_unpublished(flip);
+		ft_graft_glue_abort(dst_ft, &gd);
+		ft_graft_glue_abort(src_ft, &gs);
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
 
@@ -16222,16 +16372,17 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	(void) off_dst;
 
 	/*
-	 * Atomic build-invisible spine-copy: only when @src_ft is merged at
-	 * its root and @dst_ft ends exactly at a non-empty subtree.
-	 * ft_merge_spine_copy delegates (sets @delegated, leaving both tries
-	 * pristine) when the overlap contains a compressed node, which is not
-	 * yet handled; every other shape uses the detach-based path below.
+	 * Atomic build-invisible spine-copy: @src_ft's EXACT subtree at
+	 * @src_key (root or interior) merged into @dst_ft's EXACT non-empty
+	 * subtree at @dst_key.  ft_merge_spine_copy delegates (sets @delegated,
+	 * leaving both tries pristine) for a non-root dst merge point; that and
+	 * the dst-empty / key-shorter shapes use the detach-based path below.
 	 */
-	if (src_key_len == 0 && ks == FT_GRAFT_SWAP_EXACT
-			&& kd == FT_GRAFT_SWAP_EXACT && cnt_dst > 0) {
-		status = ft_merge_spine_copy(dst_ft, src_ft, &d_dst,
-				cnt_dst, &delegated);
+	if (ks == FT_GRAFT_SWAP_EXACT && kd == FT_GRAFT_SWAP_EXACT
+			&& cnt_dst > 0) {
+		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
+				src_key, src_key_len, cnt_src,
+				&d_dst, cnt_dst, &delegated);
 		if (!delegated) {
 			FT_TP(merge_exit, (int) status);
 			return status;
