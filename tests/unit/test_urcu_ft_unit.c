@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 216
+#define NR_TESTS 219
 #else
-#define NR_TESTS 210
+#define NR_TESTS 212
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -14157,6 +14157,182 @@ out_dst:
 }
 
 /*
+ * Merge into an EXTERNAL non-root dst merge point: dst_key is a single leaf
+ * (no subtree below it) whose parent is a plain internal node.  Merging a
+ * src subtree under it builds a fresh INTERNAL M that carries the original
+ * leaf as M's external_nodes (the key terminating at the merge point) plus
+ * src's re-keyed children.  M is internal, so it publishes through the
+ * interior forward slot exactly like the all-internal case.
+ *
+ *   dst {P, Z}                       src {a, c}  (root src)
+ *   merge_at(dst, "P", src, "") -> dst {P, Pa, Pc, Z}, src empty
+ *
+ * "P" survives as a key (now a prefix of Pa/Pc) and a disjoint "Z" confirms
+ * the rest of dst is intact.
+ */
+static int test_merge_at_external_dst(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	static const char *const dkeys[] = { "P", "Z" };
+	static const char *const skeys[] = { "a", "c" };
+	const struct merge_expected dst_after[] = {
+		{ "P", 1 }, { "Pa", 2 }, { "Pc", 2 }, { "Z", 1 },
+	};
+	unsigned int i;
+	unsigned long total;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < CAA_ARRAY_SIZE(dkeys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(dst, (const uint8_t *) dkeys[i],
+				strlen(dkeys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	for (i = 0; i < CAA_ARRAY_SIZE(skeys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(src, (const uint8_t *) skeys[i],
+				strlen(skeys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_external_dst: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_at_external_dst: src not empty\n");
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < CAA_ARRAY_SIZE(dst_after); i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (cds_ft_eager_lookup_key(dst,
+				(const uint8_t *) dst_after[i].key,
+				dst_after[i].key_len, dst_after[i].key_len,
+				&found) != CDS_FT_STATUS_OK || !found) {
+			rcu_read_unlock();
+			fprintf(stderr, "merge_at_external_dst: dst missing '%s'\n",
+				dst_after[i].key);
+			goto out;
+		}
+	}
+	total = cds_ft_count_entries(dst);
+	rcu_read_unlock();
+	if (total != 4) {
+		fprintf(stderr, "merge_at_external_dst: dst %lu entries, expected 4\n",
+			total);
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "merge_at_external_dst: verify failed\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Merge a single-leaf non-root SRC into an EXTERNAL non-root dst merge point:
+ * the SAME full key terminates on both sides, so the merge is a pure
+ * duplicate-chain splice (M is the surviving dst external head, non-internal).
+ *
+ *   dst {P, Z}   src {Sx} (x has the same suffix as P? no -- exact key match)
+ * To make the keys coincide, both sides hold key "P" at the merge points:
+ *   dst {P, Z}, src {QP}  merge_at(dst, "P", src, "Q")
+ * src@"Q" is the single leaf "P"-suffix... simpler: merge_at(dst,"P",src,"Q")
+ * where src={Q} so src@Q is a leaf; result re-keys Q's (empty) suffix under P
+ * -> dst "P" becomes a 2-entry chain.
+ */
+static int test_merge_at_external_dst_splice(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct cds_ft_node *out_node = NULL;
+	struct cds_ft_node *tmp;
+	enum cds_ft_status s;
+	int ret = -1;
+	unsigned int dups = 0;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	{
+		struct ft_test_node *a = node_alloc(0);
+		struct ft_test_node *b = node_alloc(0);
+		struct ft_test_node *c = node_alloc(0);
+
+		if (cds_ft_insert(dst, (const uint8_t *) "P", 1, &a->node) < 0 ||
+		    cds_ft_insert(dst, (const uint8_t *) "Z", 1, &b->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *) "Q", 1, &c->node) < 0)
+			goto out;
+	}
+
+	/* src@"Q" (single leaf) re-keyed under dst@"P" -> "P" gets a 2nd entry. */
+	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1,
+			src, (const uint8_t *) "Q", 1);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_external_dst_splice: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_at_external_dst_splice: src not empty\n");
+		goto out;
+	}
+	rcu_read_lock();
+	s = cds_ft_eager_lookup_key(dst, (const uint8_t *) "P", 1, 1, &out_node);
+	if (s == CDS_FT_STATUS_OK && out_node)
+		cds_ft_for_each_duplicate_safe_rcu(out_node, tmp)
+			dups++;
+	rcu_read_unlock();
+	if (dups != 2) {
+		fprintf(stderr, "merge_at_external_dst_splice: P has %u dups, expected 2\n",
+			dups);
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "merge_at_external_dst_splice: verify failed\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Fixed-length group rejects cross-key merge with mismatched key
  * lengths.
  */
@@ -15894,6 +16070,100 @@ static int test_merge_oom_nonroot_dst(void)
 {
 	return run_merge_oom_nonroot_dst(20);
 }
+
+/*
+ * As run_merge_oom_nonroot_dst, but the dst merge point is EXTERNAL (dst_key
+ * "P" is a single leaf, parent internal): merging a src subtree under it
+ * builds a fresh internal M carrying the leaf as external_nodes.  Every OOM
+ * across the build window must leave both tries pristine; a disjoint "Z"
+ * confirms the rest of dst is untouched.
+ *
+ *   dst {P, Z}   src {a, c}  ->  dst {P, Pa, Pc, Z}, src empty
+ */
+static int run_merge_oom_external_dst(int nr_faults)
+{
+	static const char *const dkeys[] = { "P", "Z" };
+	static const char *const skeys[] = { "a", "c" };
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group);
+		struct cds_ft *src;
+		enum cds_ft_status s;
+		int verified, keys_ok;
+		unsigned int i;
+
+		if (cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom_external_dst: src create failed\n");
+			return -1;
+		}
+		for (i = 0; i < CAA_ARRAY_SIZE(dkeys); i++) {
+			struct ft_test_node *dn = node_alloc(100 + i);
+
+			if (cds_ft_insert(dst, (const uint8_t *) dkeys[i],
+					strlen(dkeys[i]), &dn->node) < 0)
+				rc = -1;
+		}
+		for (i = 0; i < CAA_ARRAY_SIZE(skeys); i++) {
+			struct ft_test_node *sn = node_alloc(200 + i);
+
+			if (cds_ft_insert(src, (const uint8_t *) skeys[i],
+					strlen(skeys[i]), &sn->node) < 0)
+				rc = -1;
+		}
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		if (s == CDS_FT_STATUS_OK) {
+			keys_ok = graft_swap_oom_has_key(dst, "P") &&
+				graft_swap_oom_has_key(dst, "Pa") &&
+				graft_swap_oom_has_key(dst, "Pc") &&
+				graft_swap_oom_has_key(dst, "Z") &&
+				cds_ft_count_entries(dst) == 4 &&
+				cds_ft_empty(src);
+		} else {
+			keys_ok = graft_swap_oom_has_key(dst, "P") &&
+				!graft_swap_oom_has_key(dst, "Pa") &&
+				!graft_swap_oom_has_key(dst, "Pc") &&
+				graft_swap_oom_has_key(dst, "Z") &&
+				cds_ft_count_entries(dst) == 2 &&
+				graft_swap_oom_has_key(src, "a") &&
+				graft_swap_oom_has_key(src, "c") &&
+				cds_ft_count_entries(src) == 2;
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom_external_dst: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_external_dst(void)
+{
+	return run_merge_oom_external_dst(20);
+}
 #endif /* FEATURE_FT_FAULT_INJECT */
 
 int main(int argc, char **argv)
@@ -16172,6 +16442,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_at_overlap);
 	RUN_TEST(test_merge_at_nonroot_src);
 	RUN_TEST(test_merge_at_nonroot_dst);
+	RUN_TEST(test_merge_at_external_dst);
+	RUN_TEST(test_merge_at_external_dst_splice);
 	RUN_TEST(test_merge_at_fixed_unequal_keylen);
 
 	diag("External-node arena allocator tests");
@@ -16200,6 +16472,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom_compressed);
 	RUN_TEST(test_merge_oom_nonroot_src);
 	RUN_TEST(test_merge_oom_nonroot_dst);
+	RUN_TEST(test_merge_oom_external_dst);
 #endif
 
 	rcu_barrier();

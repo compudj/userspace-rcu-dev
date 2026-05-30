@@ -16145,16 +16145,18 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * ft_graft_glue_set_publish, so a descent and an up-walk see a coherent
 	 * old-XOR-merged view across the flip.
 	 *
-	 * A non-root merge point still delegates unless BOTH the merge point and
-	 * its parent are plain internal nodes: a COMPRESSED parent would proxy a
-	 * cn->child slot (different read sites + a grandparent skip pointer to
-	 * re-encode), and a COMPRESSED/EXTERNAL merge point would publish a
-	 * non-internal cluster whose back-pointers the flip's settle does not
-	 * yet rewrite.  Those shapes use the per-entry fallback.
+	 * A non-root merge point still delegates when its PARENT is compressed (a
+	 * COMPRESSED parent would proxy a cn->child slot -- different read sites
+	 * plus a grandparent skip pointer to re-encode) or when the merge point
+	 * itself is COMPRESSED (handled separately).  An EXTERNAL merge point is
+	 * fine: merging a subtree under it builds a fresh internal M that carries
+	 * the leaf as M's external_nodes (or, when both sides hold the same single
+	 * key, M is the surviving dst external head -- a pure splice, published
+	 * back into the same slot with no child re-parents).
 	 */
 	if (d_dst->pnf &&
 	    (ft_node_compressed(ft_resolve_skip_compressed(d_dst->pnf)) ||
-	     !ft_node_internal(ft_resolve_skip_compressed(d_dst->nf)))) {
+	     ft_node_compressed(ft_resolve_skip_compressed(d_dst->nf)))) {
 		*delegated = true;
 		return CDS_FT_STATUS_OK;	/* ignored by caller */
 	}
