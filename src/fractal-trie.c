@@ -16129,7 +16129,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	bool root_src = (src_key_len == 0);
 	struct cds_ft_inode_flag *S = d_src->nf;
 	struct cds_ft_inode_flag *D = d_dst->nf;
-	struct cds_ft_inode_flag *M;
+	struct cds_ft_inode_flag *M, *M_slot = NULL;
 	struct cds_ft_inode *fresh_root = NULL;
 	struct cds_ft_metadata *fresh_meta;
 	struct ft_flip_batch *flip;
@@ -16155,8 +16155,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * back into the same slot with no child re-parents).
 	 */
 	if (d_dst->pnf &&
-	    (ft_node_compressed(ft_resolve_skip_compressed(d_dst->pnf)) ||
-	     ft_node_compressed(ft_resolve_skip_compressed(d_dst->nf)))) {
+	    ft_node_compressed(ft_resolve_skip_compressed(d_dst->pnf))) {
 		*delegated = true;
 		return CDS_FT_STATUS_OK;	/* ignored by caller */
 	}
@@ -16200,6 +16199,35 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	}
 
 	/*
+	 * Canonicalize a non-root single-child internal merge top.  When S and D
+	 * contribute exactly one shared byte at the merge point (e.g. a churned
+	 * "ab"-prefix shape), ft_merge_build returns M as a 1-child internal with
+	 * no external_nodes -- forbidden at a non-root position under skip mode
+	 * (chain-compress invariant; cds_ft_verify catches it at the merge depth).
+	 * Collapse it to a 1-byte compressed (chain-merging a compressed child),
+	 * build-invisibly via the glue.  Only the TOP M can hit this: interior
+	 * recursion runs on already-canonical non-root subtrees, where a single-
+	 * child-no-external internal cannot exist.  M's lone child here is always
+	 * a FRESH recursion result (both sides shared that byte -> recursed), so
+	 * the helper's deferred child edge carries dst_origin=false correctly and
+	 * disturbs no flip edge.  A root dst merge point (d_dst->pnf == NULL) is
+	 * exempt: a 1-child internal is canonical at the root.
+	 */
+	if (d_dst->pnf) {
+		struct cds_ft_inode_flag *Mc =
+			ft_compress_single_child_if_needed(dst_ft, M, &gd);
+
+		if (Mc == (struct cds_ft_inode_flag *) (long) -ENOMEM) {
+			if (fresh_root)
+				free_cds_ft_node_unpublished(src_ft, fresh_root);
+			ft_graft_glue_abort(dst_ft, &gd);
+			ft_graft_glue_abort(src_ft, &gs);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+		M = Mc;
+	}
+
+	/*
 	 * Allocate the flip batch: one proxy per dst-origin re-parent edge,
 	 * plus one for the merge-point forward slot.  Fallible -> abort the
 	 * still-invisible build; both tries stay pristine.
@@ -16221,6 +16249,20 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft_graft_glue_set_publish(&gd, d_dst->pnf, d_dst->nfp, M);
+
+	/*
+	 * Slot-canonical form of M for the interior forward-slot stores (both the
+	 * flip proxy's new target and the settle): a compressed M is published
+	 * SKIP-ENCODED, exactly as a direct slot write would store it, so a reader
+	 * resolving the proxy gets a value identical in encoding to a normal slot
+	 * read and runs the same skip handling.  set_publish wired M's parent +
+	 * skip_slot via the plain flag already; an internal M needs no re-encode.
+	 */
+	if (ft_node_compressed(M))
+		M_slot = ft_publish_compressed(dst_ft,
+				ft_compressed_node_ptr(M), M);
+	else
+		M_slot = M;
 
 	/*
 	 * 1. Unlink the merge source from src.  Root src: swap in the pre-
@@ -16281,7 +16323,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ft_set_parent_raw(child, pf);
 		}
 		/* Merge-point forward slot: old dst subtree -> merged cluster. */
-		rcu_assign_pointer(*d_dst->nfp, ft_flip_batch_add(flip, D, M));
+		rcu_assign_pointer(*d_dst->nfp, ft_flip_batch_add(flip, D, M_slot));
 	}
 
 	/*
@@ -16313,7 +16355,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				ft_set_parent(gd.deferred[j].child,
 					gd.deferred[j].parent,
 					gd.deferred[j].slot);
-		rcu_assign_pointer(*d_dst->nfp, M);
+		rcu_assign_pointer(*d_dst->nfp, M_slot);
 	}
 
 	/*

@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 219
+#define NR_TESTS 222
 #else
-#define NR_TESTS 212
+#define NR_TESTS 214
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -14333,6 +14333,182 @@ out_dst:
 }
 
 /*
+ * Merge into a COMPRESSED non-root dst merge point where the result M is a
+ * fresh INTERNAL branch: dst_key "P" lands exactly at a compressed node
+ * ("Pabc" the only key under it), root src diverges at the first byte -> M
+ * branches.
+ *
+ *   dst {Pabc, Z}   src {x, y}  ->  dst {Pabc, Px, Py, Z}, src empty
+ */
+static int test_merge_at_compressed_dst_internal(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	static const char *const dkeys[] = { "Pabc", "Z" };
+	static const char *const skeys[] = { "x", "y" };
+	const struct merge_expected dst_after[] = {
+		{ "Pabc", 4 }, { "Px", 2 }, { "Py", 2 }, { "Z", 1 },
+	};
+	unsigned int i;
+	unsigned long total;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < CAA_ARRAY_SIZE(dkeys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(dst, (const uint8_t *) dkeys[i],
+				strlen(dkeys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	for (i = 0; i < CAA_ARRAY_SIZE(skeys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(src, (const uint8_t *) skeys[i],
+				strlen(skeys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_compressed_dst_internal: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_at_compressed_dst_internal: src not empty\n");
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < CAA_ARRAY_SIZE(dst_after); i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (cds_ft_eager_lookup_key(dst,
+				(const uint8_t *) dst_after[i].key,
+				dst_after[i].key_len, dst_after[i].key_len,
+				&found) != CDS_FT_STATUS_OK || !found) {
+			rcu_read_unlock();
+			fprintf(stderr, "merge_at_compressed_dst_internal: missing '%s'\n",
+				dst_after[i].key);
+			goto out;
+		}
+	}
+	total = cds_ft_count_entries(dst);
+	rcu_read_unlock();
+	if (total != 4) {
+		fprintf(stderr, "merge_at_compressed_dst_internal: %lu entries, expected 4\n",
+			total);
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "merge_at_compressed_dst_internal: verify failed\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Merge into a COMPRESSED non-root dst merge point where the result M is
+ * itself COMPRESSED (both sides compressed runs sharing a prefix), published
+ * into the interior slot SKIP-ENCODED (the M_slot path).
+ *
+ *   dst {Pxyz, Z}   src {Qxyw}  ->  dst {Pxyz, Pxyw, Z}, src empty
+ */
+static int test_merge_at_compressed_dst_compressed(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	const struct merge_expected dst_after[] = {
+		{ "Pxyz", 4 }, { "Pxyw", 4 }, { "Z", 1 },
+	};
+	unsigned int i;
+	unsigned long total;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	{
+		struct ft_test_node *a = node_alloc(0);
+		struct ft_test_node *b = node_alloc(0);
+		struct ft_test_node *c = node_alloc(0);
+
+		if (cds_ft_insert(dst, (const uint8_t *) "Pxyz", 4, &a->node) < 0 ||
+		    cds_ft_insert(dst, (const uint8_t *) "Z", 1, &b->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *) "Qxyw", 4, &c->node) < 0)
+			goto out;
+	}
+
+	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1,
+			src, (const uint8_t *) "Q", 1);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_compressed_dst_compressed: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_at_compressed_dst_compressed: src not empty\n");
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < CAA_ARRAY_SIZE(dst_after); i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (cds_ft_eager_lookup_key(dst,
+				(const uint8_t *) dst_after[i].key,
+				dst_after[i].key_len, dst_after[i].key_len,
+				&found) != CDS_FT_STATUS_OK || !found) {
+			rcu_read_unlock();
+			fprintf(stderr, "merge_at_compressed_dst_compressed: missing '%s'\n",
+				dst_after[i].key);
+			goto out;
+		}
+	}
+	total = cds_ft_count_entries(dst);
+	rcu_read_unlock();
+	if (total != 3) {
+		fprintf(stderr, "merge_at_compressed_dst_compressed: %lu entries, expected 3\n",
+			total);
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "merge_at_compressed_dst_compressed: verify failed\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Fixed-length group rejects cross-key merge with mismatched key
  * lengths.
  */
@@ -16164,6 +16340,88 @@ static int test_merge_oom_external_dst(void)
 {
 	return run_merge_oom_external_dst(20);
 }
+
+/*
+ * As run_merge_oom_external_dst, but the dst merge point is COMPRESSED and the
+ * merged result M is itself a fresh compressed run published skip-encoded (the
+ * M_slot path).  Every OOM across the build window must leave both tries
+ * pristine.
+ *
+ *   dst {Pxyz, Z}   src {Qxyw}  ->  dst {Pxyz, Pxyw, Z}, src empty
+ */
+static int run_merge_oom_compressed_dst(int nr_faults)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group);
+		struct cds_ft *src;
+		struct ft_test_node *a, *b, *c;
+		enum cds_ft_status s;
+		int verified, keys_ok;
+
+		if (cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom_compressed_dst: src create failed\n");
+			return -1;
+		}
+		a = node_alloc(100);
+		b = node_alloc(101);
+		c = node_alloc(200);
+		if (cds_ft_insert(dst, (const uint8_t *) "Pxyz", 4, &a->node) < 0 ||
+		    cds_ft_insert(dst, (const uint8_t *) "Z", 1, &b->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *) "Qxyw", 4, &c->node) < 0)
+			rc = -1;
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1,
+				src, (const uint8_t *) "Q", 1);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		if (s == CDS_FT_STATUS_OK) {
+			keys_ok = graft_swap_oom_has_key(dst, "Pxyz") &&
+				graft_swap_oom_has_key(dst, "Pxyw") &&
+				graft_swap_oom_has_key(dst, "Z") &&
+				cds_ft_count_entries(dst) == 3 &&
+				cds_ft_empty(src);
+		} else {
+			keys_ok = graft_swap_oom_has_key(dst, "Pxyz") &&
+				!graft_swap_oom_has_key(dst, "Pxyw") &&
+				graft_swap_oom_has_key(dst, "Z") &&
+				cds_ft_count_entries(dst) == 2 &&
+				graft_swap_oom_has_key(src, "Qxyw") &&
+				cds_ft_count_entries(src) == 1;
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom_compressed_dst: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_compressed_dst(void)
+{
+	return run_merge_oom_compressed_dst(24);
+}
 #endif /* FEATURE_FT_FAULT_INJECT */
 
 int main(int argc, char **argv)
@@ -16444,6 +16702,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_at_nonroot_dst);
 	RUN_TEST(test_merge_at_external_dst);
 	RUN_TEST(test_merge_at_external_dst_splice);
+	RUN_TEST(test_merge_at_compressed_dst_internal);
+	RUN_TEST(test_merge_at_compressed_dst_compressed);
 	RUN_TEST(test_merge_at_fixed_unequal_keylen);
 
 	diag("External-node arena allocator tests");
@@ -16473,6 +16733,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom_nonroot_src);
 	RUN_TEST(test_merge_oom_nonroot_dst);
 	RUN_TEST(test_merge_oom_external_dst);
+	RUN_TEST(test_merge_oom_compressed_dst);
 #endif
 
 	rcu_barrier();
