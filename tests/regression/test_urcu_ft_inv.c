@@ -65,7 +65,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	18
+#define NR_TESTS	19
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -4247,6 +4247,215 @@ static int inv_merge_compressed_parent_dst_no_escape(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 16: merge_at is ATOMIC -- the flip publishes the whole   */
+/*   source set at once, so no value is ever MISSING after it.          */
+/*                                                                    */
+/*   Two disjoint sets share the prefix "AA": set A holds the           */
+/*   odd-byte-valued suffixes (a,c,e,...  -- in @dst), set B the even    */
+/*   ones (b,d,f,...  -- in @src), exactly Mathieu's "AAaceg"/"AAbdfh"   */
+/*   example.  A single cds_ft_merge_at folds B into @dst at "AA", so    */
+/*   the merged set is the DENSE range "AA"+{a..z}.  Readers iterate     */
+/*   @dst across the flip; once a reader has observed BOTH an A (odd)    */
+/*   and a B (even) suffix -- proving its traversal is past the flip --  */
+/*   every following key MUST be the immediate successor (forward) or    */
+/*   predecessor (reverse).  The atomic flip reveals all of B at once,   */
+/*   so a torn / partial merge would surface as a forward gap.  Keys     */
+/*   BEHIND the detection point are not required (the flip may land      */
+/*   mid-traversal) -- "all combinations, going forward".                */
+/*                                                                    */
+/*   One-shot per round (build A+B, run readers, merge once, join): a    */
+/*   repeated merge/un-merge would legitimately make B vanish and is     */
+/*   not what this probes.                                              */
+/* ================================================================== */
+
+/* Suffix letters: A = odd byte values {a,c,...,y}, B = even {b,d,...,z}. */
+#define INV_ATOMIC_LO	'a'
+#define INV_ATOMIC_HI	'z'
+
+struct inv_atomic_ctx {
+	struct cds_ft *dst;
+	const char *test_name;
+	volatile int go;
+	volatile int stop;
+};
+
+static void *inv_merge_atomic_reader(void *arg)
+{
+	struct inv_atomic_ctx *ctx = (struct inv_atomic_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
+		abort();
+	while (!ctx->go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!ctx->stop) {
+		bool reverse = (iters & 1) != 0;
+		enum cds_ft_status s;
+		int prev = -1;
+		bool saw_a = false, saw_b = false;
+
+		rcu_read_lock();
+		cds_ft_iter_invalidate_path(iter);
+		s = reverse ? cds_ft_lookup_last(ctx->dst, iter)
+			: cds_ft_lookup_first(ctx->dst, iter);
+		while (s == CDS_FT_STATUS_OK) {
+			uint8_t k[8];
+			size_t kl;
+			int v;
+
+			cds_ft_iter_get_key(iter, k, sizeof(k), &kl);
+			if (kl != 3 || k[0] != 'A' || k[1] != 'A' ||
+			    k[2] < INV_ATOMIC_LO || k[2] > INV_ATOMIC_HI) {
+				report_violation(ctx->test_name,
+					"out-of-namespace key (len %zu) — merge escape "
+					"(%s)", kl, reverse ? "reverse" : "forward");
+				break;
+			}
+			v = k[2];
+			if (v & 1)
+				saw_a = true;	/* odd byte: set A */
+			else
+				saw_b = true;	/* even byte: set B */
+			/*
+			 * Both partitions observed -> this traversal is in the
+			 * post-flip regime, where the set is the dense range
+			 * a..z.  Every subsequent key must be the immediate
+			 * successor / predecessor; a gap means a value is missing
+			 * after the atomic flip (a non-atomic / torn merge).
+			 */
+			if (saw_a && saw_b && prev >= 0) {
+				int expect = reverse ? prev - 1 : prev + 1;
+
+				if (v != expect) {
+					report_violation(ctx->test_name,
+						"missing value: suffix '%c' follows '%c' "
+						"(%s) after both sets observed — non-atomic merge",
+						v, prev, reverse ? "reverse" : "forward");
+					break;
+				}
+			}
+			prev = v;
+			s = reverse ? cds_ft_lookup_lt(ctx->dst, iter)
+				: cds_ft_lookup_gt(ctx->dst, iter);
+		}
+		rcu_read_unlock();
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_merge_atomic_completeness(void)
+{
+	struct timespec t0;
+	int ret = 0;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS &&
+			atomic_load(&violation_count) == 0) {
+		struct cds_ft_group_attr *gattr;
+		struct cds_ft_group *group;
+		struct cds_ft *dst, *src;
+		struct inv_atomic_ctx ctx;
+		pthread_t readers[NR_READERS_DEFAULT];
+		enum cds_ft_status s;
+		unsigned int i;
+		int v;
+
+		if (cds_ft_group_attr_create(&gattr) < 0)
+			return -1;
+		if (cds_ft_group_attr_set_max_key_len(gattr, 16) < 0) {
+			cds_ft_group_attr_destroy(gattr);
+			return -1;
+		}
+		if (cds_ft_group_create(gattr, &group) < 0) {
+			cds_ft_group_attr_destroy(gattr);
+			return -1;
+		}
+		cds_ft_group_attr_destroy(gattr);
+		if (cds_ft_create(group, NULL, &dst) < 0)
+			abort();
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+
+		/*
+		 * dst <- set A (odd-byte suffixes "AA"+{a,c,...}); src <- set B
+		 * (even-byte suffixes as single-byte keys {b,d,...}, which the
+		 * merge re-keys under "AA").
+		 */
+		for (v = INV_ATOMIC_LO; v <= INV_ATOMIC_HI; v++) {
+			struct ft_test_node *n = node_alloc((uint64_t) v);
+			uint8_t key[3] = { 'A', 'A', (uint8_t) v };
+
+			if (v & 1)
+				s = cds_ft_insert(dst, key, 3, &n->node);
+			else
+				s = cds_ft_insert(src, &key[2], 1, &n->node);
+			if (s != CDS_FT_STATUS_OK) {
+				node_free(n);
+				ret = -1;
+				goto round_teardown;
+			}
+		}
+
+		ctx.dst = dst;
+		ctx.test_name = "inv_merge_atomic_completeness";
+		ctx.go = 0;
+		ctx.stop = 0;
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+		for (i = 0; i < NR_READERS_DEFAULT; i++)
+			pthread_create(&readers[i], NULL,
+				inv_merge_atomic_reader, &ctx);
+
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		ctx.go = 1;
+		usleep(300);	/* readers stream pre-flip (A-only) traversals */
+
+		s = cds_ft_merge_at(dst, (const uint8_t *) "AA", 2, src, NULL, 0);
+
+		usleep(1000);	/* readers stream across + post-flip traversals */
+		ctx.stop = 1;
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		for (i = 0; i < NR_READERS_DEFAULT; i++)
+			pthread_join(readers[i], NULL);
+
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_merge_atomic_completeness: merge %s\n",
+				cds_ft_status_to_string(s));
+			ret = -1;
+		}
+round_teardown:
+		/* @src is emptied by a successful merge; @dst holds the union. */
+		drain_trie_local(dst);
+		drain_trie_local(src);
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		cds_ft_group_destroy(group);
+		if (ret)
+			return ret;
+	}
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_atomic_completeness: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -4313,6 +4522,9 @@ int main(int argc, char **argv)
 
 	diag("15. Merge into a compressed-parent destination never escapes");
 	RUN_TEST(inv_merge_compressed_parent_dst_no_escape);
+
+	diag("16. Merge is atomic: no value missing after the flip");
+	RUN_TEST(inv_merge_atomic_completeness);
 
 	rcu_barrier();
 	rcu_unregister_thread();
