@@ -14333,14 +14333,11 @@ enum ft_graft_swap_case ft_merge_descend(struct cds_ft *ft,
  * leaves both tries pristine -- no rollback.
  *
  * Returns the PLAIN flag of the freshly-built merged node (or, when the merged
- * position is leaf-only, the surviving external head), or one of:
- *   FT_MERGE_OOM       allocation failed; caller aborts both glues.
- *   FT_MERGE_DELEGATE  a compressed overlap node (not yet handled); caller
- *                      aborts and falls back to the per-entry merge.
- * On success *nr_keys_ret holds the merged subtree's unique-key count.
+ * position is leaf-only, the surviving external head), or FT_MERGE_OOM on
+ * allocation failure (the caller aborts both glues).  On success *nr_keys_ret
+ * holds the merged subtree's unique-key count.
  */
 #define FT_MERGE_OOM		((struct cds_ft_inode_flag *) (long) -ENOMEM)
-#define FT_MERGE_DELEGATE	((struct cds_ft_inode_flag *) (long) -EOPNOTSUPP)
 
 struct ft_merge_ctx {
 	struct cds_ft *dst_ft;		/* all fresh merged nodes live here */
@@ -14480,7 +14477,7 @@ struct cds_ft_inode_flag *ft_merge_materialize_suffix(struct ft_merge_ctx *c,
  * fresh branch -- never another compressed -- because a canonical compressed
  * node's child is never compressed, so no two adjacent compresseds result.
  * Returns the run's PLAIN flag (parent Pass 2 re-encodes the slot to skip), or
- * FT_MERGE_OOM/FT_MERGE_DELEGATE.
+ * FT_MERGE_OOM.
  */
 static
 struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
@@ -14498,7 +14495,7 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 	ft_merge_advance(cn_s, off_s + p, &adv_s, &aoff_s);
 	ft_merge_advance(cn_d, off_d + p, &adv_d, &aoff_d);
 	child = ft_merge_build(c, adv_s, aoff_s, adv_d, aoff_d, depth + p, &ck);
-	if (child == FT_MERGE_OOM || child == FT_MERGE_DELEGATE)
+	if (child == FT_MERGE_OOM)
 		return child;
 
 #ifndef FEATURE_FT_SKIP_COMPRESSED
@@ -14689,7 +14686,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 				od = 0;
 			}
 			child = ft_merge_build(c, ts, os, td, od, depth + 1, &ck);
-			if (child == FT_MERGE_OOM || child == FT_MERGE_DELEGATE)
+			if (child == FT_MERGE_OOM)
 				return child;
 		} else if (sc_present) {
 			if (S_comp) {
@@ -16195,9 +16192,7 @@ struct cds_ft_inode_flag *ft_merge_wrap_prefix(struct ft_merge_ctx *c,
  * @d_dst->nf, whose prefix bytes are wrapped around the merged cluster by
  * ft_merge_wrap_prefix).
  *
- * @delegated is set (leaving both tries pristine) for the one remaining shape:
- * a COMPRESSED parent of the dst merge point (a cn->child forward slot reached
- * via a grandparent skip pointer).
+ * Every (EXACT | KEY_SHORTER) src x (EXACT | KEY_SHORTER) dst shape is handled.
  *
  * Returns OK on a committed merge, or MEMORY_ERROR on OOM (both tries pristine).
  */
@@ -16206,7 +16201,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		struct cds_ft *src_ft, struct ft_descent *d_src,
 		const uint8_t *src_key, size_t src_key_len, unsigned long cnt_src,
 		unsigned int off_src, struct ft_descent *d_dst,
-		unsigned long cnt_dst, unsigned int off_dst, bool *delegated)
+		unsigned long cnt_dst, unsigned int off_dst)
 {
 	struct ft_graft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -16223,15 +16218,13 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	struct ft_flip_batch *flip;
 	unsigned long merged_keys = 0;
 
-	*delegated = false;
-
 	/*
-	 * Every dst merge-point shape is handled; @delegated is retained only for
-	 * defensive scaffolding and never set.  The flip proxies the publish slot
-	 * @pub_slot, the read-side descent resolves the type-7 proxy at every child
-	 * fetch (ft_resolve_flip_proxy, before the skip handler), and the published
-	 * node's parent is wired to @pub_parent by ft_graft_glue_set_publish, so a
-	 * descent and an up-walk see a coherent old-XOR-merged view across the flip.
+	 * Every dst merge-point shape is handled.  The flip proxies the publish
+	 * slot @pub_slot, the read-side descent resolves the type-7 proxy at every
+	 * child fetch (ft_resolve_flip_proxy, before the skip handler), and the
+	 * published node's parent is wired to @pub_parent by
+	 * ft_graft_glue_set_publish, so a descent and an up-walk see a coherent
+	 * old-XOR-merged view across the flip.
 	 *
 	 * Edge D: the merge point's PARENT is a COMPRESSED node cn_p reached via a
 	 * grandparent skip slot.  cn_p's own parent cannot be compressed ("no two
@@ -16273,15 +16266,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 
 	/* Build the merged cluster invisibly (the only build-phase fallible step). */
 	M = ft_merge_build(&ctx, S, off_src, D, off_dst, 0, &merged_keys);
-	if (M == FT_MERGE_DELEGATE || M == FT_MERGE_OOM) {
+	if (M == FT_MERGE_OOM) {
 		if (fresh_root)
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
 		ft_graft_glue_abort(dst_ft, &gd);
 		ft_graft_glue_abort(src_ft, &gs);
-		if (M == FT_MERGE_DELEGATE) {
-			*delegated = true;
-			return CDS_FT_STATUS_OK;	/* ignored by caller */
-		}
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
@@ -16525,7 +16514,6 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	unsigned int off_src, off_dst;
 	unsigned long cnt_src, cnt_dst;
 	enum ft_graft_swap_case ks, kd;
-	bool delegated = false;
 
 	FT_TP(merge_enter, (const void *) dst_ft, (const void *) src_ft);
 
@@ -16588,14 +16576,14 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 			&off_dst, &cnt_dst);
 
 	/*
-	 * Atomic build-invisible spine-copy: @src_ft's subtree at @src_key merged
-	 * into @dst_ft's non-empty subtree at @dst_key.  Each side is EXACT
-	 * (@off == 0, the subtree at @d->nf) or KEY_SHORTER (@off > 0, the key
-	 * ends inside a compressed node -- the src node is reclaimed by the
-	 * commit's unlink, the dst node is wrapped under its prefix).
-	 * ft_merge_spine_copy delegates (sets @delegated, leaving both tries
-	 * pristine) for a compressed-parent dst merge point; that and the dst-empty
-	 * shape use the detach-based path below.
+	 * Atomic build-invisible spine-copy of @src_ft's subtree at @src_key into
+	 * @dst_ft's non-empty subtree at @dst_key.  Each side is EXACT (@off == 0,
+	 * the subtree at @d->nf) or KEY_SHORTER (@off > 0, the key ends inside a
+	 * compressed node -- the src node is reclaimed by the commit's unlink, the
+	 * dst node is wrapped under its prefix).  ft_merge_spine_copy handles every
+	 * such shape (internal, external, compressed and compressed-parent dst
+	 * merge points); only a dst that is empty under @dst_key falls through to
+	 * the detach-based graft below.
 	 */
 	if ((ks == FT_GRAFT_SWAP_EXACT || ks == FT_GRAFT_SWAP_KEY_SHORTER)
 			&& cnt_dst > 0
@@ -16603,68 +16591,27 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 				|| kd == FT_GRAFT_SWAP_KEY_SHORTER)) {
 		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
 				src_key, src_key_len, cnt_src, off_src,
-				&d_dst, cnt_dst, off_dst, &delegated);
-		if (!delegated) {
-			FT_TP(merge_exit, (int) status);
-			return status;
-		}
+				&d_dst, cnt_dst, off_dst);
+		FT_TP(merge_exit, (int) status);
+		return status;
 	}
 
 	/*
-	 * Detach-based path: move @src_ft@src_key into a transient exclusive
-	 * @subtree, then graft (dst empty under @dst_key) or merge per-entry.
-	 * Retained for the shapes the spine-copy builder does not yet handle;
-	 * the per-entry fallback is not atomic across an OOM (the bug
-	 * ft_merge_spine_copy exists to remove).  @subtree's keys are stripped
-	 * of @src_key, so it is touched only via keylen-bypassing helpers.
+	 * Detach-based graft: @dst has no subtree at @dst_key here -- either
+	 * cnt_dst == 0 (an empty @dst root) or the descent diverged / dead-ended
+	 * (kd == FT_GRAFT_SWAP_DELEGATE), both of which mean no key has @dst_key as
+	 * a prefix.  Move @src_ft@src_key into a transient exclusive @subtree and
+	 * graft it atomically at @dst_key (ft_graft is itself a build-invisible
+	 * transaction).  Every NON-empty-dst shape committed in ft_merge_spine_copy
+	 * above, so the old non-atomic per-entry merge loop is gone (a non-empty
+	 * graft point would return POPULATED_ERROR and roll back, never corrupt).
+	 * @subtree's keys are stripped of @src_key, so it is touched only via
+	 * keylen-bypassing helpers.
 	 */
 	status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
 	if (status < 0)
 		goto out;	/* NOT_FOUND impossible: @src_ft had content. */
-	if (cds_ft_count_keys_prefix(dst_ft, dst_key, dst_key_len) == 0) {
-		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len,
-				subtree);
-	} else {
-		struct cds_ft_iter *iter = NULL;
-
-		status = cds_ft_iter_create(subtree, &iter);
-		if (status != CDS_FT_STATUS_OK)
-			goto out_rollback;
-		while (cds_ft_lookup_first(subtree, iter)
-				== CDS_FT_STATUS_OK) {
-			uint8_t sub_key[FT_MAX_KEY_LEN];
-			uint8_t dst_full[FT_MAX_KEY_LEN];
-			size_t sub_key_len = 0;
-			struct cds_ft_node *head, *tmp;
-
-			status = cds_ft_iter_get_key(iter, sub_key,
-					sizeof(sub_key), &sub_key_len);
-			if (status != CDS_FT_STATUS_OK)
-				break;
-			if (dst_key_len + sub_key_len > sizeof(dst_full)) {
-				status = CDS_FT_STATUS_OVERFLOW_ERROR;
-				break;
-			}
-			memcpy(dst_full, dst_key, dst_key_len);
-			memcpy(dst_full + dst_key_len, sub_key, sub_key_len);
-
-			status = cds_ft_remove_all(subtree, iter, &head);
-			if (status != CDS_FT_STATUS_OK)
-				break;
-			cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
-				cds_ft_node_init(head);
-				status = cds_ft_insert(dst_ft, dst_full,
-						dst_key_len + sub_key_len,
-						head);
-				if (status != CDS_FT_STATUS_OK)
-					break;
-			}
-			if (status != CDS_FT_STATUS_OK)
-				break;
-		}
-		cds_ft_iter_destroy(iter);
-	}
-
+	status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, subtree);
 	if (status != CDS_FT_STATUS_OK)
 		goto out_rollback;
 
