@@ -65,7 +65,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	19
+#define NR_TESTS	20
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -4456,6 +4456,199 @@ round_teardown:
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 17: merge_at atomicity with a DEEP overlap.              */
+/*                                                                    */
+/*   Same no-missing-value property as #16, but the sets share          */
+/*   branching structure so the merge RECURSES: keys are "AA"+P+L over   */
+/*   prefix bytes P in 'a'..'h' and leaf letters L in 'a'..'z'.  Set A   */
+/*   (dst) holds odd-L, set B (src) holds even-L, so at "AA" both sides  */
+/*   carry every P (a stitch node + a recursion per P), and under each   */
+/*   P the odd/even leaves interleave -- a multi-level spine copy with   */
+/*   re-parents at several depths, vs #16's single wide node.  Sorted    */
+/*   order is row-major (P,L); the dense merged set linearizes to        */
+/*   idx = (P-'a')*26 + (L-'a'), so the same "once both parities seen,    */
+/*   every forward key is the immediate successor" check applies.        */
+/* ================================================================== */
+
+#define INV_ATOMIC_DEEP_PLO	'a'
+#define INV_ATOMIC_DEEP_PHI	'h'	/* 8 shared prefix bytes */
+#define INV_ATOMIC_NL		(INV_ATOMIC_HI - INV_ATOMIC_LO + 1)	/* 26 */
+
+static void *inv_merge_atomic_deep_reader(void *arg)
+{
+	struct inv_atomic_ctx *ctx = (struct inv_atomic_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
+		abort();
+	while (!ctx->go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!ctx->stop) {
+		bool reverse = (iters & 1) != 0;
+		enum cds_ft_status s;
+		int prev = -1;
+		bool saw_a = false, saw_b = false;
+
+		rcu_read_lock();
+		cds_ft_iter_invalidate_path(iter);
+		s = reverse ? cds_ft_lookup_last(ctx->dst, iter)
+			: cds_ft_lookup_first(ctx->dst, iter);
+		while (s == CDS_FT_STATUS_OK) {
+			uint8_t k[8];
+			size_t kl;
+			int idx, l;
+
+			cds_ft_iter_get_key(iter, k, sizeof(k), &kl);
+			if (kl != 4 || k[0] != 'A' || k[1] != 'A' ||
+			    k[2] < INV_ATOMIC_DEEP_PLO || k[2] > INV_ATOMIC_DEEP_PHI ||
+			    k[3] < INV_ATOMIC_LO || k[3] > INV_ATOMIC_HI) {
+				report_violation(ctx->test_name,
+					"out-of-namespace key (len %zu) — deep merge escape "
+					"(%s)", kl, reverse ? "reverse" : "forward");
+				break;
+			}
+			l = k[3];
+			idx = (k[2] - INV_ATOMIC_DEEP_PLO) * INV_ATOMIC_NL
+				+ (l - INV_ATOMIC_LO);
+			if (l & 1)
+				saw_a = true;	/* odd leaf: set A */
+			else
+				saw_b = true;	/* even leaf: set B */
+			if (saw_a && saw_b && prev >= 0) {
+				int expect = reverse ? prev - 1 : prev + 1;
+
+				if (idx != expect) {
+					report_violation(ctx->test_name,
+						"missing value: idx %d follows %d (%s) "
+						"after both sets observed — non-atomic deep merge",
+						idx, prev, reverse ? "reverse" : "forward");
+					break;
+				}
+			}
+			prev = idx;
+			s = reverse ? cds_ft_lookup_lt(ctx->dst, iter)
+				: cds_ft_lookup_gt(ctx->dst, iter);
+		}
+		rcu_read_unlock();
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_merge_atomic_completeness_deep(void)
+{
+	struct timespec t0;
+	int ret = 0;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS &&
+			atomic_load(&violation_count) == 0) {
+		struct cds_ft_group_attr *gattr;
+		struct cds_ft_group *group;
+		struct cds_ft *dst, *src;
+		struct inv_atomic_ctx ctx;
+		pthread_t readers[NR_READERS_DEFAULT];
+		enum cds_ft_status s;
+		unsigned int i;
+		int p, l;
+
+		if (cds_ft_group_attr_create(&gattr) < 0)
+			return -1;
+		if (cds_ft_group_attr_set_max_key_len(gattr, 16) < 0) {
+			cds_ft_group_attr_destroy(gattr);
+			return -1;
+		}
+		if (cds_ft_group_create(gattr, &group) < 0) {
+			cds_ft_group_attr_destroy(gattr);
+			return -1;
+		}
+		cds_ft_group_attr_destroy(gattr);
+		if (cds_ft_create(group, NULL, &dst) < 0)
+			abort();
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+
+		/*
+		 * Both sides carry every prefix byte P, so the merge recurses at
+		 * "AA" (one stitch node per P) and again under each P (odd/even
+		 * leaves).  dst <- odd-L "AA"+P+L; src <- even-L P+L (re-keyed
+		 * under "AA" by the merge).
+		 */
+		for (p = INV_ATOMIC_DEEP_PLO; p <= INV_ATOMIC_DEEP_PHI; p++) {
+			for (l = INV_ATOMIC_LO; l <= INV_ATOMIC_HI; l++) {
+				struct ft_test_node *n = node_alloc((uint64_t) l);
+				uint8_t key[4] = { 'A', 'A', (uint8_t) p, (uint8_t) l };
+
+				if (l & 1)
+					s = cds_ft_insert(dst, key, 4, &n->node);
+				else
+					s = cds_ft_insert(src, &key[2], 2, &n->node);
+				if (s != CDS_FT_STATUS_OK) {
+					node_free(n);
+					ret = -1;
+					goto round_teardown;
+				}
+			}
+		}
+
+		ctx.dst = dst;
+		ctx.test_name = "inv_merge_atomic_completeness_deep";
+		ctx.go = 0;
+		ctx.stop = 0;
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+		for (i = 0; i < NR_READERS_DEFAULT; i++)
+			pthread_create(&readers[i], NULL,
+				inv_merge_atomic_deep_reader, &ctx);
+
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		ctx.go = 1;
+		usleep(300);	/* readers stream pre-flip (A-only) traversals */
+
+		s = cds_ft_merge_at(dst, (const uint8_t *) "AA", 2, src, NULL, 0);
+
+		usleep(1000);	/* readers stream across + post-flip traversals */
+		ctx.stop = 1;
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		for (i = 0; i < NR_READERS_DEFAULT; i++)
+			pthread_join(readers[i], NULL);
+
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_merge_atomic_completeness_deep: merge %s\n",
+				cds_ft_status_to_string(s));
+			ret = -1;
+		}
+round_teardown:
+		drain_trie_local(dst);
+		drain_trie_local(src);
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		cds_ft_group_destroy(group);
+		if (ret)
+			return ret;
+	}
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_atomic_completeness_deep: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -4525,6 +4718,9 @@ int main(int argc, char **argv)
 
 	diag("16. Merge is atomic: no value missing after the flip");
 	RUN_TEST(inv_merge_atomic_completeness);
+
+	diag("17. Merge is atomic across a deep (recursive) overlap");
+	RUN_TEST(inv_merge_atomic_completeness_deep);
 
 	rcu_barrier();
 	rcu_unregister_thread();
