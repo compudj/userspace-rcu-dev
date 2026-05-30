@@ -65,7 +65,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	17
+#define NR_TESTS	18
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -4040,6 +4040,213 @@ static int inv_merge_key_shorter_src_no_escape(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 15: Merge into a COMPRESSED-PARENT dst merge point        */
+/*   never escapes (Edge D: the merge point's parent is a compressed     */
+/*   node reached via a grandparent skip slot, which the flip re-encodes  */
+/*   to a fresh copy of that compressed parent).                        */
+/*                                                                    */
+/*   dst persistently holds {"aXYc","aXYd"} -> under 'a' a COMPRESSED     */
+/*   "XY" -> internal{c,d}; the merge point "aXY" has a compressed parent. */
+/*   Each round the writer merges a private root src {"P"} at "aXY",      */
+/*   re-encoding root['a'] (skip("XY")) to a fresh "XY" copy whose child   */
+/*   is internal{c,d,P}, then resets (remove "aXYP", re-insert "P").  An   */
+/*   ordered reader must only ever see {"aXYc","aXYd","aXYP"}.            */
+/* ================================================================== */
+
+static void *inv_merge_compressed_parent_dst_reader(void *arg)
+{
+	struct inv_merge_reader_arg *ra = (struct inv_merge_reader_arg *) arg;
+	struct inv_merge_ctx *ctx = ra->ctx;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+	const unsigned int max_count = 16;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ra->trie, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		bool reverse = (iters & 1) != 0;
+		enum cds_ft_status s;
+		unsigned int count = 0;
+
+		rcu_read_lock();
+		cds_ft_iter_invalidate_path(iter);
+		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
+			: cds_ft_lookup_first(ra->trie, iter);
+		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
+			uint8_t k[16];
+			size_t kl;
+
+			cds_ft_iter_get_key(iter, k, sizeof(k), &kl);
+			if (kl != 4 || k[0] != 'a' || k[1] != 'X' ||
+			    k[2] != 'Y' ||
+			    (k[3] != 'c' && k[3] != 'd' && k[3] != 'P')) {
+				report_violation(ctx->test_name,
+					"reader saw out-of-namespace key "
+					"(len %zu, %.4s) — compressed-parent-dst merge escape "
+					"(iter #%lu, %s)",
+					kl, kl ? (const char *) k : "",
+					iters, reverse ? "reverse" : "forward");
+				break;
+			}
+			s = reverse ? cds_ft_lookup_lt(ra->trie, iter)
+				: cds_ft_lookup_gt(ra->trie, iter);
+		}
+		if (count >= max_count)
+			report_violation(ctx->test_name,
+				"ordered traversal returned >= %u keys — "
+				"escape/loop (iter #%lu, %s)",
+				max_count, iters, reverse ? "reverse" : "forward");
+		rcu_read_unlock();
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_merge_compressed_parent_dst_writer(void *arg)
+{
+	struct inv_merge_ctx *ctx = (struct inv_merge_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		enum cds_ft_status s;
+		struct ft_test_node *n;
+
+		pthread_mutex_lock(&ctx->lock);
+		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "aXY", 3,
+				ctx->src, NULL, 0);
+		pthread_mutex_unlock(&ctx->lock);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_merge_compressed_parent_dst writer: %s\n",
+				cds_ft_status_to_string(s));
+			break;
+		}
+		rcu_quiescent_state();
+
+		rcu_read_lock();
+		cds_ft_iter_invalidate_path(iter);
+		pthread_mutex_lock(&ctx->lock);
+		inv_merge_remove_key(ctx->dst, iter, "aXYP");
+		n = node_alloc(300);
+		cds_ft_insert(ctx->src, (const uint8_t *) "P", 1, &n->node);
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_merge_compressed_parent_dst_no_escape(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct inv_merge_ctx ctx;
+	struct inv_merge_reader_arg rargs[2 * NR_READERS_DEFAULT];
+	struct timespec t0;
+	pthread_t readers[2 * NR_READERS_DEFAULT], writer;
+	struct ft_test_node *a, *b, *sn;
+	unsigned int i;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(gattr, 16) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	if (cds_ft_group_create(gattr, &group) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(gattr);
+
+	if (cds_ft_create(group, NULL, &dst) < 0)
+		abort();
+	if (cds_ft_create(group, NULL, &src) < 0)
+		abort();
+
+	/* Persistent {aXYc,aXYd} keeps "aXY" a compressed-parent merge point. */
+	a = node_alloc(0);
+	cds_ft_insert(dst, (const uint8_t *) "aXYc", 4, &a->node);
+	b = node_alloc(0);
+	cds_ft_insert(dst, (const uint8_t *) "aXYd", 4, &b->node);
+	sn = node_alloc(300);
+	cds_ft_insert(src, (const uint8_t *) "P", 1, &sn->node);
+
+	ctx.dst = dst;
+	ctx.src = src;
+	ctx.group = group;
+	ctx.test_name = "inv_merge_compressed_parent_dst_no_escape";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
+		rargs[i].ctx = &ctx;
+		rargs[i].trie = dst;
+		rargs[i].which = "dst";
+		pthread_create(&readers[i], NULL,
+			inv_merge_compressed_parent_dst_reader, &rargs[i]);
+	}
+	pthread_create(&writer, NULL, inv_merge_compressed_parent_dst_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	pthread_join(writer, NULL);
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_compressed_parent_dst_no_escape: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+
+	drain_trie_local(dst);
+	drain_trie_local(src);
+	rcu_barrier();
+	cds_ft_destroy(dst);
+	cds_ft_destroy(src);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*                           MAIN                                     */
 /*                                                                    */
 /* ================================================================== */
@@ -4103,6 +4310,9 @@ int main(int argc, char **argv)
 
 	diag("14. Merge from a key-shorter source never escapes");
 	RUN_TEST(inv_merge_key_shorter_src_no_escape);
+
+	diag("15. Merge into a compressed-parent destination never escapes");
+	RUN_TEST(inv_merge_compressed_parent_dst_no_escape);
 
 	rcu_barrier();
 	rcu_unregister_thread();

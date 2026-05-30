@@ -16213,9 +16213,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	struct ft_merge_counts cnt = { 0, 0, 0, 0, 0 };
 	bool root_src = (src_key_len == 0);
 	bool ks_dst = (off_dst > 0);
+	bool ed;
 	struct cds_ft_inode_flag *S = d_src->nf;
 	struct cds_ft_inode_flag *D = d_dst->nf;
 	struct cds_ft_inode_flag *M, *M_slot = NULL, *pub, *D_old;
+	struct cds_ft_inode_flag *pub_parent = d_dst->pnf, **pub_slot = d_dst->nfp;
 	struct cds_ft_inode *fresh_root = NULL;
 	struct cds_ft_metadata *fresh_meta;
 	struct ft_flip_batch *flip;
@@ -16224,29 +16226,26 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	*delegated = false;
 
 	/*
-	 * Both root and internal-parent non-root dst merge points are handled:
-	 * the flip proxies the interior forward slot *d_dst->nfp, the read-side
-	 * descent resolves the type-7 proxy at every child fetch
-	 * (ft_resolve_flip_proxy), and M's parent is wired to d_dst->pnf by
-	 * ft_graft_glue_set_publish, so a descent and an up-walk see a coherent
-	 * old-XOR-merged view across the flip.
+	 * Every dst merge-point shape is handled; @delegated is retained only for
+	 * defensive scaffolding and never set.  The flip proxies the publish slot
+	 * @pub_slot, the read-side descent resolves the type-7 proxy at every child
+	 * fetch (ft_resolve_flip_proxy, before the skip handler), and the published
+	 * node's parent is wired to @pub_parent by ft_graft_glue_set_publish, so a
+	 * descent and an up-walk see a coherent old-XOR-merged view across the flip.
 	 *
-	 * A non-root merge point still delegates when its PARENT is compressed (a
-	 * COMPRESSED parent would proxy a cn->child slot -- different read sites
-	 * plus a grandparent skip pointer to re-encode).  A merge point that is
-	 * itself COMPRESSED is handled here: KEY_SHORTER (the dst key ends inside
-	 * the node) builds the prefix wrap; an EXACT compressed subtree at @d_dst
-	 * (Edge B) recurses as a compressed overlap.  An EXTERNAL merge point is
-	 * fine: merging a subtree under it builds a fresh internal M that carries
-	 * the leaf as M's external_nodes (or, when both sides hold the same single
-	 * key, M is the surviving dst external head -- a pure splice, published
-	 * back into the same slot with no child re-parents).
+	 * Edge D: the merge point's PARENT is a COMPRESSED node cn_p reached via a
+	 * grandparent skip slot.  cn_p's own parent cannot be compressed ("no two
+	 * adjacent compressed" invariant), so the grandparent slot d_dst->pnfp is a
+	 * plain internal slot that merely *holds* skip(cn_p).  Handle it one level
+	 * up: the merge is EXACT at d_dst->nf (off_dst == 0), M is wrapped under a
+	 * fresh copy of the WHOLE cn_p, and that copy is published into d_dst->pnfp
+	 * in place of skip(cn_p) -- identical machinery to a KEY_SHORTER dst wrap,
+	 * just with cn_p as the wrapped node and the grandparent as the publish
+	 * point.  ks_dst and ed are mutually exclusive (a KEY_SHORTER merge point
+	 * sits inside cn_d, whose parent is internal).
 	 */
-	if (d_dst->pnf &&
-	    ft_node_compressed(ft_resolve_skip_compressed(d_dst->pnf))) {
-		*delegated = true;
-		return CDS_FT_STATUS_OK;	/* ignored by caller */
-	}
+	ed = (d_dst->pnf &&
+	      ft_node_compressed(ft_resolve_skip_compressed(d_dst->pnf)));
 
 	/* Size both glues from a read-only pre-pass (with headroom). */
 	ft_merge_count(S, off_src, D, off_dst, &cnt);
@@ -16287,40 +16286,53 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * Compute @pub, the value to publish into the merge-point forward slot
-	 * d_dst->nfp.
+	 * Compute @pub (the value to publish), @pub_parent / @pub_slot (where) and,
+	 * for the compressed shapes, reclaim the replaced node.
 	 *
 	 * KEY_SHORTER dst (off_dst > 0): the merge point sits off_dst bytes inside
-	 * the compressed node D, whose prefix bytes D->key_bytes[0..off_dst) lie
-	 * above it (consumed by @dst_key during the descent).  Reclaim the whole
-	 * old node D -- the off_dst > 0 entry of ft_merge_build did NOT record its
-	 * free (that guard fires only at off == 0) -- and wrap M under a fresh
-	 * prefix carrying those bytes.  ft_merge_wrap_prefix canonicalizes a
-	 * single-child M and preserves the dst_origin of a compressed M's child.
-	 * A compressed node is always below the always-internal root, so a
-	 * KEY_SHORTER merge point is necessarily non-root (d_dst->pnf != NULL).
+	 * the compressed node cn_d = D, whose prefix bytes lie above it; wrap M
+	 * under cn_d->key_bytes[0..off_dst) and replace cn_d at its own slot
+	 * (d_dst->nfp).  Edge D (ed): the merge point's parent is the compressed
+	 * node cn_p; wrap M under the WHOLE cn_p and replace cn_p at the grandparent
+	 * slot d_dst->pnfp (pub_parent = d_dst->ppnf).  Either way reclaim the
+	 * replaced compressed node -- ft_merge_build entered it (or, for Edge D, did
+	 * not touch it) without recording the free.  ft_merge_wrap_prefix
+	 * canonicalizes a single-child M and preserves the dst_origin of a
+	 * compressed M's child.
 	 *
-	 * EXACT dst (off_dst == 0): M itself replaces the subtree.  Canonicalize a
-	 * non-root single-child internal merge top: when S and D contribute exactly
-	 * one shared byte (a churned "ab"-prefix shape), ft_merge_build returns M
-	 * as a 1-child internal with no external_nodes -- forbidden at a non-root
-	 * position under skip mode (chain-compress invariant; cds_ft_verify catches
-	 * it at the merge depth).  Collapse it to a 1-byte compressed (chain-merging
-	 * a compressed child) via the glue.  Only the TOP M can hit this; its lone
-	 * child is always a FRESH recursion result, so the deferred child edge
-	 * carries dst_origin=false correctly and disturbs no flip edge.  A root dst
-	 * merge point (d_dst->pnf == NULL) is exempt: a 1-child internal is
-	 * canonical at the root.
+	 * EXACT dst with an internal/absent parent (off_dst == 0, !ed): M itself
+	 * replaces the subtree.  Canonicalize a non-root single-child internal merge
+	 * top: when S and D contribute exactly one shared byte (a churned "ab"-prefix
+	 * shape), ft_merge_build returns M as a 1-child internal with no
+	 * external_nodes -- forbidden at a non-root position under skip mode
+	 * (chain-compress invariant; cds_ft_verify catches it at the merge depth).
+	 * Collapse it to a 1-byte compressed via the glue.  Only the TOP M can hit
+	 * this; its lone child is always a FRESH recursion result, so the deferred
+	 * child edge carries dst_origin=false correctly and disturbs no flip edge.
+	 * A root dst merge point (d_dst->pnf == NULL) is exempt: a 1-child internal
+	 * is canonical at the root.
 	 */
-	if (ks_dst) {
-		struct cds_ft_compressed_node *cn_d = ft_compressed_node_ptr(D);
+	if (ks_dst || ed) {
+		struct cds_ft_compressed_node *wrap_cn;
 		uint8_t kbuf[FT_MAX_KEY_LEN];
-		unsigned int d_depth = (unsigned int) d_dst->depth;
+		unsigned int wrap_depth, wrap_len;
 
-		ft_graft_glue_defer_free(&gd, cn_d, true);
-		memcpy(&kbuf[d_depth], cn_d->key_bytes, off_dst);
-		pub = ft_merge_wrap_prefix(&ctx, kbuf, d_depth,
-				d_depth + off_dst, M, merged_keys);
+		if (ed) {
+			wrap_cn = ft_compressed_node_ptr(
+				ft_resolve_skip_compressed(d_dst->pnf));
+			wrap_len = wrap_cn->len;
+			wrap_depth = (unsigned int) d_dst->depth - wrap_len;
+			pub_parent = d_dst->ppnf;
+			pub_slot = d_dst->pnfp;
+		} else {	/* ks_dst */
+			wrap_cn = ft_compressed_node_ptr(D);
+			wrap_len = off_dst;
+			wrap_depth = (unsigned int) d_dst->depth;
+		}
+		ft_graft_glue_defer_free(&gd, wrap_cn, true);
+		memcpy(&kbuf[wrap_depth], wrap_cn->key_bytes, wrap_len);
+		pub = ft_merge_wrap_prefix(&ctx, kbuf, wrap_depth,
+				wrap_depth + wrap_len, M, merged_keys);
 		if (pub == FT_MERGE_OOM) {
 			if (fresh_root)
 				free_cds_ft_node_unpublished(src_ft, fresh_root);
@@ -16328,7 +16340,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ft_graft_glue_abort(src_ft, &gs);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
-	} else if (d_dst->pnf) {
+	} else if (pub_parent) {
 		pub = ft_compress_single_child_if_needed(dst_ft, M, &gd);
 		if (pub == (struct cds_ft_inode_flag *) (long) -ENOMEM) {
 			if (fresh_root)
@@ -16362,29 +16374,29 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		ft_graft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
-	ft_graft_glue_set_publish(&gd, d_dst->pnf, d_dst->nfp, pub);
+	ft_graft_glue_set_publish(&gd, pub_parent, pub_slot, pub);
 
 	/*
-	 * Slot-canonical form of @pub for the interior forward-slot stores (both
-	 * the flip proxy's new target and the settle): a compressed @pub is
-	 * published SKIP-ENCODED, exactly as a direct slot write would store it, so
-	 * a reader resolving the proxy gets a value identical in encoding to a
-	 * normal slot read and runs the same skip handling.  set_publish wired
-	 * @pub's parent + skip_slot via the plain flag already; an internal @pub
-	 * (EXACT only -- a KEY_SHORTER @pub is always the compressed prefix wrap)
-	 * needs no re-encode.
+	 * Slot-canonical form of @pub for the @pub_slot stores (both the flip
+	 * proxy's new target and the settle): a compressed @pub is published
+	 * SKIP-ENCODED, exactly as a direct slot write would store it, so a reader
+	 * resolving the proxy gets a value identical in encoding to a normal slot
+	 * read and runs the same skip handling.  set_publish wired @pub's parent +
+	 * skip_slot via the plain flag already; an internal @pub (EXACT only -- a
+	 * compressed-wrap @pub is always compressed) needs no re-encode.
 	 *
-	 * @D_old is the flip proxy's old target -- what the slot currently holds.
-	 * For EXACT that is D (== *d_dst->nfp).  For KEY_SHORTER D was resolved to
-	 * the PLAIN compressed flag by the descent, while the slot holds the SKIP-
-	 * encoded form, so take the live slot value (untouched until the flip).
+	 * @D_old is the flip proxy's old target -- the value @pub_slot currently
+	 * holds.  Read it from the live slot: for the compressed shapes the descent
+	 * resolved d->nf / d->pnf to the PLAIN flag while the slot holds the SKIP
+	 * form, and *pub_slot is untouched until the flip (the build is invisible
+	 * and apply_deferred wires back-pointers, not this forward slot).
 	 */
 	if (ft_node_compressed(pub))
 		M_slot = ft_publish_compressed(dst_ft,
 				ft_compressed_node_ptr(pub), pub);
 	else
 		M_slot = pub;
-	D_old = ks_dst ? *d_dst->nfp : D;
+	D_old = *pub_slot;
 
 	/*
 	 * 1. Unlink the merge source from src.  Root src: swap in the pre-
@@ -16444,8 +16456,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				gd.deferred[j].parent);
 			ft_set_parent_raw(child, pf);
 		}
-		/* Merge-point forward slot: old dst subtree -> merged cluster. */
-		rcu_assign_pointer(*d_dst->nfp,
+		/* Publish slot: old dst subtree -> merged cluster. */
+		rcu_assign_pointer(*pub_slot,
 				ft_flip_batch_add(flip, D_old, M_slot));
 	}
 
@@ -16460,9 +16472,16 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	/* 5. Concatenate same-key duplicate chains (dst now reachable via M). */
 	ft_graft_glue_apply_splices(&gd);
 
-	/* 6. Propagate the dst key-count delta through the ancestors. */
-	if (d_dst->pnf && merged_keys != cnt_dst)
-		ft_propagate_external_count_parent(dst_ft, d_dst->pnf,
+	/*
+	 * 6. Propagate the dst key-count delta through the ancestors, starting at
+	 *    @pub_parent (the parent of the replaced node -- d_dst->pnf for an
+	 *    EXACT / KEY_SHORTER point, the grandparent d_dst->ppnf for Edge D).
+	 *    @pub is a fresh node already carrying merged_keys, so the walk must
+	 *    begin one level up; @pub_parent is a plain internal flag (cn_p's
+	 *    parent cannot be compressed), safe for ft_node_ptr.
+	 */
+	if (pub_parent && merged_keys != cnt_dst)
+		ft_propagate_external_count_parent(dst_ft, pub_parent,
 			(long) merged_keys - (long) cnt_dst);
 
 	/*
@@ -16478,7 +16497,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				ft_set_parent(gd.deferred[j].child,
 					gd.deferred[j].parent,
 					gd.deferred[j].slot);
-		rcu_assign_pointer(*d_dst->nfp, M_slot);
+		rcu_assign_pointer(*pub_slot, M_slot);
 	}
 
 	/*
