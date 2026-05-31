@@ -7834,6 +7834,32 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 	return FT_DESCENT_CONTINUE;
 }
 
+#ifdef FEATURE_FT_PP_BACKTRACK
+/*
+ * Return @node's external_nodes (the dup-chain head hanging off an
+ * internal or compressed node).  @node must be internal or compressed.
+ * Used to recover a cached iterator position's deepest trie node without
+ * an iter_path[] read: a prefix key sits at an internal/compressed node
+ * whose external_nodes == iter->node.
+ */
+static inline_lookup
+struct cds_ft_node *ft_node_external_nodes(struct cds_ft_inode_flag *node)
+{
+	struct cds_ft_metadata *metadata;
+
+	assert(!ft_node_external(node));
+	if (ft_node_compressed(node))
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node));
+	else {
+		const struct cds_ft_type *type = &ft_types[ft_node_type(node)];
+
+		metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node),
+				type->order);
+	}
+	return ft_dereference_prefetch_external(metadata->external_nodes);
+}
+#endif
+
 static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
@@ -7957,8 +7983,26 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 * lock continuously for the cached pointers to remain valid.
 	 */
 	iter_debug_path_check(iter);
+#ifdef FEATURE_FT_PP_BACKTRACK
+	/*
+	 * Continuation fast path (PP): recover the position from iter->node
+	 * (not iter_path[]).  Reuse only when the cached position is for
+	 * EXACTLY this key -- path_len == key_depth and iter->node set.
+	 * set_key keeps path_valid only for a subset (prefix) key, and a
+	 * same-length subset is the same key, so path_len == key_depth
+	 * <=> the current key equals the cached result key, i.e. iter->node
+	 * is the deepest position for this key.  A strict-prefix reuse
+	 * (path_len > key_depth) falls to slow_path: iter->node is deeper
+	 * than key_depth-1, so it is not the right cursor.  (The non-PP
+	 * array path tolerates it via depth-indexed iter_path[].)
+	 */
+	if (iter->path_valid && iter->node &&
+			(ssize_t)iter->path_len == key_depth &&
+			key_depth > 1) {
+#else
 	if (iter->path_valid && (ssize_t)iter->path_len >= key_depth &&
 			key_depth > 1) {
+#endif
 		for (level = 1; level < key_depth; level++) {
 			switch (limit) {
 			case FT_LOOKUP_LIMIT_NONE:
@@ -7978,7 +8022,33 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 				break;
 			}
 		}
+#ifdef FEATURE_FT_PP_BACKTRACK
+		{
+			/*
+			 * Cross-call continuation: recover the deepest trie node
+			 * for iter->key from the cached position iter->node (the
+			 * dup-chain head), not from iter_path[].  A prefix key
+			 * sits at an internal/compressed holder whose
+			 * external_nodes == iter->node; otherwise iter->node is a
+			 * leaf child (a tag-0 external flag).  ft_get_parent_rcu
+			 * on the head reaches the holder in O(1) (head->prev ==
+			 * holder) and never walks the dup chain.
+			 */
+			struct cds_ft_inode_flag *cur =
+				(struct cds_ft_inode_flag *) iter->node;
+			struct cds_ft_inode_flag *holder =
+				ft_get_parent_rcu(cur);
+
+			if (holder && !ft_node_external(holder) &&
+			    ft_node_external_nodes(holder) ==
+					(struct cds_ft_node *) iter->node)
+				node_flag = holder;
+			else
+				node_flag = cur;
+		}
+#else
 		node_flag = iter_path_node(iter)[key_depth - 1];
+#endif
 		/*
 		 * If the cached path entry is a compressed node, the
 		 * fast path cannot determine the correct loop exit
@@ -20720,8 +20790,20 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 		ft_key_to_ordinals(ordinal_buf, key, key_len, km);
 		key_ordinals = ordinal_buf;
 	}
+#ifndef FEATURE_FT_PP_BACKTRACK
+	/*
+	 * Subset (prefix) reuse: the cached path for the longer key is also
+	 * a valid path for this prefix (depth-indexed iter_path[] yields the
+	 * node at the prefix's depth).  Disabled under PP backtrack: the
+	 * iter->node-based continuation fast path needs the cached position
+	 * to be at exactly key_depth-1, but a strict prefix's position is
+	 * shallower than iter->node (the full cached result).  So PP always
+	 * re-descends on set_key (cheap for a short prefix); the fast path is
+	 * reserved for true continuation (next/prev without set_key).
+	 */
 	if (key_len <= iter->key_len && !memcmp(key_ordinals, iter_key(iter), key_len))
 		subset = true;
+#endif
 	/*
 	 * If new key is a subset of current key, the path stays valid,
 	 * otherwise invalidate the path.
