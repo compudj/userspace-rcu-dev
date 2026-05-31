@@ -54,6 +54,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -4653,10 +4654,51 @@ round_teardown:
 /*                                                                    */
 /* ================================================================== */
 
+#ifdef FT_ENABLE_TRACING
+/*
+ * Root-cause scaffolding: on a fatal fault, dump the flight-recorder
+ * ring (the writer/reanchor tracepoints leading up to the crash) before
+ * dying, then re-raise for a core.  Enabled only when both built with
+ * FT_ENABLE_TRACING and run with FT_INV_SNAPSHOT_ON_SEGV set under an
+ * `lttng ... --snapshot` session.  system() in a signal handler is
+ * async-signal-unsafe but adequate here (the fault is a bad read, not
+ * heap corruption).
+ */
+static void ft_segv_snapshot_handler(int sig, siginfo_t *si, void *uc)
+{
+	char buf[160];
+	int n;
+
+	(void) uc;
+	n = snprintf(buf, sizeof buf,
+		"\n[fault] sig=%d fault_addr=%p — recording lttng snapshot\n",
+		sig, si ? si->si_addr : NULL);
+	if (n > 0) {
+		ssize_t w = write(STDERR_FILENO, buf, (size_t) n);
+		(void) w;
+	}
+	(void) system("lttng snapshot record 1>&2");
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+#endif
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
 	int err;
+
+#ifdef FT_ENABLE_TRACING
+	if (getenv("FT_INV_SNAPSHOT_ON_SEGV")) {
+		struct sigaction sa;
+
+		memset(&sa, 0, sizeof sa);
+		sa.sa_sigaction = ft_segv_snapshot_handler;
+		sa.sa_flags = SA_SIGINFO;
+		(void) sigaction(SIGSEGV, &sa, NULL);
+		(void) sigaction(SIGABRT, &sa, NULL);
+	}
+#endif
 
 	err = create_all_cpu_call_rcu_data(0);
 	if (err)

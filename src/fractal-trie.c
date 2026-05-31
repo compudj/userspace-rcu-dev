@@ -1926,6 +1926,7 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft_inode_flag *skip_ptr,
 	*rewind = 0;
 	if (at_pos)
 		*at_pos = NULL;
+	FT_TP(reanchor_enter, (const void *) skip_ptr, (const void *) cur, want);
 	for (guard = 0; guard < (int) FT_MAX_DEPTH + 2; guard++) {
 		struct cds_ft_inode_flag *parent;
 		void *pitem;
@@ -1937,6 +1938,7 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft_inode_flag *skip_ptr,
 				ft_node_ptr(cur))->parent);
 		/* A picked child's parent may be a flip-proxy mid-merge. */
 		parent = ft_resolve_flip_proxy(parent);
+		FT_TP(reanchor_walk, (const void *) cur, (const void *) parent, acc);
 		if (caa_unlikely(!parent)) {
 			/*
 			 * A NULL parent on the up-walk is a bug.  The walk runs

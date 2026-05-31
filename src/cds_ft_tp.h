@@ -833,6 +833,39 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, inv_violation,
 	)
 )
 
+/*
+ * Skip-reanchor up-walk diagnostics (root-cause scaffolding for the
+ * dangling-skip-slot UAF).  @skip_ptr is the raw skip-compressed slot
+ * value; @cur is the decoded skip child (the node whose parent chain is
+ * walked); @want the encoded skip length.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, reanchor_enter,
+	LTTNG_UST_TP_ARGS(
+		const void *, skip_ptr,
+		const void *, cur,
+		unsigned int, want
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, skip_ptr, (uintptr_t) skip_ptr)
+		lttng_ust_field_integer_hex(uintptr_t, cur, (uintptr_t) cur)
+		lttng_ust_field_integer(unsigned int, want, want)
+	)
+)
+
+/* One up-walk step: @cur's resolved @parent at accumulated span @acc. */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, reanchor_walk,
+	LTTNG_UST_TP_ARGS(
+		const void *, cur,
+		const void *, parent,
+		unsigned int, acc
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, cur, (uintptr_t) cur)
+		lttng_ust_field_integer_hex(uintptr_t, parent, (uintptr_t) parent)
+		lttng_ust_field_integer(unsigned int, acc, acc)
+	)
+)
+
 #endif /* _FT_TP_H */
 
 #include <lttng/tracepoint-event.h>
