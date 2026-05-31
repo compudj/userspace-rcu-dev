@@ -12332,6 +12332,31 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		} else {
 			/* Removing duplicate, not last: key count unchanged. */
 			ft_unchain_node((struct cds_ft_node **) dd.d.nfp, match);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * If the duplicate chain hung directly off a compressed
+			 * node (dd.d.nfp == &cn->child), unchaining the head
+			 * replaced cn->child with the next chain entry -- but the
+			 * grandparent's skip-compressed slot still encodes the
+			 * OLD head, which the caller is about to call_rcu-free.
+			 * A candidate descent or ft_skip_reanchor up-walk that
+			 * follows the stale skip pointer would then dereference
+			 * the freed node (the dangling-skip-slot UAF).  Re-encode
+			 * the slot to the new cn->child; this is ordered before
+			 * the caller's free, as required.
+			 *
+			 * dd.d.pnfp is the exact slot traversed during this
+			 * descent (the skip pointer resolved at the top of the
+			 * loop), so the refresh does not depend on cn's
+			 * skip_slot_offset bookkeeping.  ft_update_skip_pointer
+			 * no-ops when the slot holds a plain (non-skip)
+			 * compressed pointer, which references cn itself rather
+			 * than its child and so never dangles.
+			 */
+			if (ft_node_compressed(dd.d.pnf))
+				ft_update_skip_pointer(dd.d.pnfp,
+					ft_compressed_node_ptr(dd.d.pnf));
+#endif
 			ret = 0;
 		}
 	}
