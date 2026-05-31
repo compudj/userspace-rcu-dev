@@ -7849,6 +7849,22 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = 0;
 	bool going_up = false, skip_eq_external_nodes;
+#ifdef FEATURE_FT_PP_BACKTRACK
+	/*
+	 * Parent-pointer going-up cursor (P4 structural up_node form,
+	 * mirroring the iter_skip walk-up).  @up_node is the deepest live
+	 * node descent established; @up_node_lo is the shallowest depth it
+	 * covers -- its TRUE shallow boundary (several levels below @up_node
+	 * for a compressed run).  Tracked as descent proceeds so the going-up
+	 * seed is live (no iter_path[] read), then climbed via
+	 * ft_get_parent_rcu up to the going-up @level.  Seeding from the
+	 * deepest node + true shallow boundary (rather than from @node_flag
+	 * and the end-of-key-adjusted @level) avoids both the level
+	 * adjustment desync and the compressed-span boundary ambiguity.
+	 */
+	struct cds_ft_inode_flag *up_node = NULL;
+	ssize_t up_node_lo = 0;
+#endif
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
@@ -7897,6 +7913,10 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 	node_flag = ft_root_dereference_prefetch(ft);
 	iter_path_node(iter)[0] = node_flag;
+#ifdef FEATURE_FT_PP_BACKTRACK
+	up_node = node_flag;		/* root covers depth 0 */
+	up_node_lo = 0;
+#endif
 
 	/*
 	 * Empty root short-circuit: when the root has no children,
@@ -7983,6 +8003,17 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			level = key_depth;
 		else
 			level = key_depth - 1;
+#ifdef FEATURE_FT_PP_BACKTRACK
+		/*
+		 * Cross-call fast path: the cached deepest node is the going-up
+		 * seed.  It is never compressed/skip here (those fall back to
+		 * slow_path above), so its shallow boundary is its own depth.
+		 * Transitional iter_path[] read; removed in P5 with
+		 * cds_ft_iter_bind.
+		 */
+		up_node = node_flag;
+		up_node_lo = key_depth - 1;
+#endif
 		FT_TP(fastpath_enter, (int) mode,
 			(const void *) node_flag, (int) level);
 		goto post_traversal;
@@ -7996,13 +8027,36 @@ slow_path:
 
 		if (ft_node_compressed(node_flag)) {
 			enum ft_descent_action act;
+#ifdef FEATURE_FT_PP_BACKTRACK
+			ssize_t cmp_entry_level = level;
+#endif
 
 			act = ft_inequality_compressed(&node_flag,
 				&level, key_depth, mode, limit,
 				&iter_key, input_key, iter,
 				ordinal_key, &skip_eq_external_nodes);
-			if (act == FT_DESCENT_GOING_UP)
+			if (act == FT_DESCENT_GOING_UP) {
+#ifdef FEATURE_FT_PP_BACKTRACK
+				/*
+				 * @node_flag is the compressed node; it occupies
+				 * depths [cmp_entry_level-1, +cn->len).  Seed the
+				 * cursor at its TRUE shallow boundary so the
+				 * going-up climb reaches its internal parent.
+				 */
+				up_node = node_flag;
+				up_node_lo = cmp_entry_level - 1;
+#endif
 				goto going_up;
+			}
+#ifdef FEATURE_FT_PP_BACKTRACK
+			/*
+			 * Descend / break / continue: @node_flag is cn->child
+			 * at the advanced @level (span 1 -- chain-merge forbids
+			 * compressed-under-compressed).
+			 */
+			up_node = node_flag;
+			up_node_lo = level;
+#endif
 			if (act == FT_DESCENT_DESCEND_CHILDREN)
 				goto descend_children;
 			if (act == FT_DESCENT_BREAK)
@@ -8060,6 +8114,10 @@ slow_path:
 			break;
 		}
 		iter_path_node(iter)[level] = node_flag;
+#ifdef FEATURE_FT_PP_BACKTRACK
+		up_node = node_flag;		/* child established at @level (span 1) */
+		up_node_lo = level;
+#endif
 		FT_TP(slowpath_step, (int) level, key_value,
 			(const void *) node_flag, 0);
 		dbg_printf("cds_ft_lookup_inequality iter key lookup %u finds node_flag %p\n",
@@ -8196,14 +8254,41 @@ going_up:
 	 * possibly-NULL node-at-level.  It is read only inside the LE/LT block
 	 * below, which the first iteration (going_up == false) skips.
 	 */
-	struct cds_ft_inode_flag *up_parent = iter_path_node(iter)[level - 1];
-	struct cds_ft_inode_flag *up_node = iter_path_node(iter)[level];
-	ssize_t up_parent_lo = level - 1;
+	struct cds_ft_inode_flag *up_parent;
+	ssize_t up_parent_lo;
 	bool up_first = true;
 
-	while (up_parent_lo > (ssize_t) iter->prefix_len &&
-	       iter_path_node(iter)[up_parent_lo - 1] == up_parent)
-		up_parent_lo--;
+	/*
+	 * Climb @up_node (the deepest live node descent established) up to
+	 * the node covering the going-up @level: the loop @level may have
+	 * been knocked back one by the end-of-key adjustment, and a
+	 * compressed run spans several levels.  @up_node then is node-at-level
+	 * (read by the LE/LT block, carried by the loop).
+	 */
+	while (level < up_node_lo) {
+		struct cds_ft_inode_flag *gp = ft_get_parent_rcu(up_node);
+
+		up_node_lo -= (gp && ft_node_compressed(gp)) ?
+			(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
+		up_node = gp;
+	}
+	/*
+	 * Derive @up_parent = node at @level-1 (the dispatcher scanned for a
+	 * sibling).  If @up_node already covers @level-1 it IS the dispatcher
+	 * -- a compressed run (no within-span sibling, skipped by the
+	 * !ft_node_internal test below) or a dead-end whose dispatcher we
+	 * never descended past.  Otherwise it is @up_node's parent, one depth
+	 * shallower (parenthood is by slot).
+	 */
+	if (up_node_lo <= level - 1) {
+		up_parent = up_node;
+		up_parent_lo = up_node_lo;
+	} else {
+		up_parent = ft_get_parent_rcu(up_node);
+		up_parent_lo = (up_parent && ft_node_compressed(up_parent)) ?
+			level - (ssize_t) ft_compressed_node_ptr(up_parent)->len :
+			level - 1;
+	}
 #endif
 	for (; level > (ssize_t) iter->prefix_len; level--) {
 		uint8_t key_value;
@@ -8375,6 +8460,16 @@ going_up:
 		if (node_flag) {
 			/* Record the sibling in the path. */
 			iter_path_node(iter)[level] = node_flag;
+#ifdef FEATURE_FT_PP_BACKTRACK
+			/*
+			 * Seed the cursor at the found sibling (depth @level, its
+			 * shallow boundary) before descend_children -> minmax, so a
+			 * transiently-empty first minmax step re-enters going-up
+			 * with the cursor live.
+			 */
+			up_node = node_flag;
+			up_node_lo = level;
+#endif
 			FT_TP(ineq_going_up_step, level,
 				(const void *) up_parent,
 				1, ordinal_key[level - 1]);
@@ -8537,6 +8632,10 @@ descend_children:
 			if (act == FT_DESCENT_BREAK)
 				break;
 			assert(act == FT_DESCENT_CONTINUE);
+#ifdef FEATURE_FT_PP_BACKTRACK
+			up_node = node_flag;	/* minmax cn->child at the advanced @level */
+			up_node_lo = level;
+#endif
 			continue;
 		}
 		skip_eq_external_nodes = false;
@@ -8581,6 +8680,10 @@ descend_children:
 				 */
 				level -= (ssize_t) rewind + 1;
 				node_flag = anchor;
+#ifdef FEATURE_FT_PP_BACKTRACK
+				up_node = anchor;	/* re-anchored holder; re-scanned next iter */
+				up_node_lo = level;
+#endif
 				continue;
 			}
 		}
@@ -8605,6 +8708,10 @@ descend_children:
 			goto going_up;
 		}
 		iter_path_node(iter)[level] = node_flag;
+#ifdef FEATURE_FT_PP_BACKTRACK
+		up_node = node_flag;		/* minmax child established at @level */
+		up_node_lo = level;
+#endif
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) ordinal_key[level - 1], node_flag);
 		if (ft_node_external(node_flag))
