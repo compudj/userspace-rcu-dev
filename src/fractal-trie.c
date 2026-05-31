@@ -17491,7 +17491,8 @@ static inline_lookup
 int ft_rebuild_path(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		const uint8_t *key, size_t key_len,
-		uint8_t *ordinal_key)
+		uint8_t *ordinal_key,
+		struct cds_ft_inode_flag **deepest_p)
 {
 	struct cds_ft_inode_flag *node_flag;
 	unsigned int i;
@@ -17538,6 +17539,12 @@ int ft_rebuild_path(struct cds_ft *ft,
 			return -1;
 		iter_path_node(iter)[i + 1] = node_flag;
 	}
+	/*
+	 * Deepest node reached (== iter_path[key_len]); always placed at
+	 * depth key_len as a child, so its shallow boundary is key_len.
+	 * Lets the going-up cursor seed live (no iter_path[] read).
+	 */
+	*deepest_p = node_flag;
 	return (int) key_len;
 }
 
@@ -17600,6 +17607,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	unsigned long remaining;
 	int depth, level = 0;
 	bool at_external_nodes;
+	struct cds_ft_inode_flag *deepest = NULL;
 
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP(iter_skip_forward_enter, n);
@@ -17619,9 +17627,10 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 
 	/* Rebuild path from root to current key. */
 	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
-			ordinal_key);
+			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
+	(void) deepest;		/* used by the going-up seed under PP backtrack */
 
 	remaining = n;
 
@@ -17731,14 +17740,14 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 * of the child we came from.  Parent-pointer backtrack (P3):
 	 * @up_node is the live node covering depth @level, climbed via
 	 * ft_get_parent_rcu as @level decrements (span compressed=cn->len,
-	 * internal=1), replacing the descent-stack read iter_path[level].
+	 * internal=1).  Seeded live from ft_rebuild_path's deepest node
+	 * (@deepest == node at @level==@depth, placed there as a child so its
+	 * shallow boundary is @level), replacing the descent-stack read
+	 * iter_path[level] + dense-fill.
 	 */
 #ifdef FEATURE_FT_PP_BACKTRACK
-	struct cds_ft_inode_flag *up_node = iter_path_node(iter)[level];
+	struct cds_ft_inode_flag *up_node = deepest;
 	ssize_t up_node_lo = level;
-
-	while (up_node_lo > 0 && iter_path_node(iter)[up_node_lo - 1] == up_node)
-		up_node_lo--;
 #endif
 	for (level--; level >= 0; level--) {
 #ifdef FEATURE_FT_PP_BACKTRACK
@@ -18081,6 +18090,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	unsigned long remaining;
 	int depth, level;
 	bool at_external_nodes;
+	struct cds_ft_inode_flag *deepest = NULL;
 
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP(iter_skip_reverse_enter, n);
@@ -18100,9 +18110,10 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 
 	/* Rebuild path from root to current key. */
 	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
-			ordinal_key);
+			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
+	(void) deepest;		/* used by the going-up seed under PP backtrack */
 
 	remaining = n;
 
@@ -18125,15 +18136,14 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	 * of the child we came from, plus external_nodes at the ancestor
 	 * (which sort before all children).  Parent-pointer backtrack
 	 * (P3): @up_node is the live node covering depth @level, climbed via
-	 * ft_get_parent_rcu as @level decrements, replacing the descent-
-	 * stack read iter_path[level].
+	 * ft_get_parent_rcu as @level decrements.  Seeded live from
+	 * ft_rebuild_path's deepest node (@deepest == node at @level==@depth,
+	 * placed there as a child so its shallow boundary is @level),
+	 * replacing the descent-stack read iter_path[level] + dense-fill.
 	 */
 #ifdef FEATURE_FT_PP_BACKTRACK
-	struct cds_ft_inode_flag *up_node = iter_path_node(iter)[level];
+	struct cds_ft_inode_flag *up_node = deepest;
 	ssize_t up_node_lo = level;
-
-	while (up_node_lo > 0 && iter_path_node(iter)[up_node_lo - 1] == up_node)
-		up_node_lo--;
 #endif
 	for (level--; level >= 0; level--) {
 #ifdef FEATURE_FT_PP_BACKTRACK
