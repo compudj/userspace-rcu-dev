@@ -11022,10 +11022,9 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		struct cds_ft_node *old_node,
 		struct cds_ft_node *new_node)
 {
-	unsigned int i, key_depth;
-	struct cds_ft_inode_flag *node_flag;
-	struct cds_ft_inode_flag **node_flag_ptr;
-	struct cds_ft_node *iter_node, **head_slot, *match;
+	struct cds_ft_inode_flag *holder_flag;
+	struct cds_ft_inode_flag **pub_slot;
+	struct cds_ft_compressed_node *cn = NULL;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
 	enum cds_ft_status s;
@@ -11054,136 +11053,109 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		return s;
 	}
 
-	key_depth = key_len + 1;
 	iter_key = iter_key(iter);
 
 	dbg_printf("cds_ft_replace: old_node %p new_node %p\n", old_node, new_node);
 
-	node_flag = ft->root;
-	node_flag_ptr = &ft->root;
-
 	/*
-	 * Trie root is always an internal node (invariant enforced by
-	 * ft_make_root_internal at the few sites that could otherwise
-	 * publish a compressed or skip-compressed root).  No need to
-	 * dispatch on tag here.
+	 * No top-down descent.  As in cds_ft_remove, @old_node is
+	 * application-owned and -- with the RCU read-side lock held
+	 * continuously since it was obtained -- alive; the writer mutex held
+	 * here freezes the structure, so @old_node->prev is a settled live
+	 * pointer to its holder.  @new_node takes @old_node's exact place in
+	 * the duplicate chain, so the key count and trie shape are unchanged:
+	 * only the chain link (or head slot) that points at @old_node is
+	 * repointed at @new_node.  That slot is derived from the holder -- the
+	 * predecessor's next for a non-head duplicate, else the head slot
+	 * cds_ft_remove recovers (a compressed holder's &cn->child, an
+	 * internal holder's external_nodes, or an internal body slot keyed by
+	 * the last key byte).
 	 */
-
-	/*
-	 * Handle NIL key (key_len == 0).
-	 */
-	if (!key_len) {
-		struct cds_ft_metadata *metadata;
-
-		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		if (!metadata->external_nodes) {
-			s = CDS_FT_STATUS_NOT_FOUND;
-			FT_TP(replace_exit, (int) s);
-			return s;
-		}
-		head_slot = (struct cds_ft_node **) &metadata->external_nodes;
-		iter_node = metadata->external_nodes;
-		goto find_and_replace;
+	if (ft_node_is_removed(old_node)) {
+		/* Already unlinked from the trie. */
+		s = CDS_FT_STATUS_NOT_FOUND;
+		FT_TP(replace_exit, (int) s);
+		return s;
 	}
-
-	/* Traverse internal levels. */
-	for (i = 1; i < key_depth; i++) {
-		uint8_t key_value;
-
-		if (ft_node_external(node_flag)) {
-			s = CDS_FT_STATUS_NOT_FOUND;
-			FT_TP(replace_exit, (int) s);
-			return s;
-		}
-		if (ft_node_compressed(node_flag)) {
-			bool nf = false;
-			enum ft_descent_action act;
-
-			act = ft_traverse_compressed(&node_flag,
-				&node_flag_ptr, &iter_key, &i,
-				key_depth, &nf);
-			if (nf) {
-				s = CDS_FT_STATUS_NOT_FOUND;
-				FT_TP(replace_exit, (int) s);
-				return s;
-			}
-			if (act == FT_DESCENT_BREAK)
-				break;
-			continue;
-		}
-		key_value = *(iter_key++);
-		node_flag = ft_node_get_nth(node_flag, &node_flag_ptr, key_value, FT_PF_NONE);
-		if (!node_flag) {
-			s = CDS_FT_STATUS_NOT_FOUND;
-			FT_TP(replace_exit, (int) s);
-			return s;
-		}
-	}
-
-	/* Reached end of key. Locate the duplicate chain. */
-	if (!ft_node_external(node_flag)) {
-		struct cds_ft_metadata *metadata;
-
-		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		if (!metadata->external_nodes) {
-			s = CDS_FT_STATUS_NOT_FOUND;
-			FT_TP(replace_exit, (int) s);
-			return s;
-		}
-		head_slot = (struct cds_ft_node **) &metadata->external_nodes;
-		iter_node = metadata->external_nodes;
-	} else {
-		head_slot = (struct cds_ft_node **) node_flag_ptr;
-		iter_node = (struct cds_ft_node *) ft_node_ptr(node_flag);
-	}
-
-find_and_replace:
-	/* Walk the duplicate chain to find old_node. */
-	match = NULL;
-	cds_ft_for_each_duplicate(iter_node) {
-		if (iter_node == old_node) {
-			match = iter_node;
-			break;
-		}
-	}
-
-	if (!match) {
+	holder_flag = (struct cds_ft_inode_flag *) old_node->prev;
+	if (!holder_flag) {
+		/* Never inserted (a freshly-initialized node). */
 		s = CDS_FT_STATUS_NOT_FOUND;
 		FT_TP(replace_exit, (int) s);
 		return s;
 	}
 
+	if (ft_node_external(holder_flag)) {
+		/* Non-head duplicate: repoint the predecessor's next. */
+		pub_slot = (struct cds_ft_inode_flag **)
+			&((struct cds_ft_node *) holder_flag)->next;
+	} else if (ft_node_compressed(holder_flag) ||
+		   ft_node_skip_compressed(holder_flag)) {
+		/* Compressed holder: @old_node is its single external child. */
+		cn = ft_node_skip_compressed(holder_flag) ?
+			ft_skip_to_compressed(holder_flag) :
+			ft_compressed_node_ptr(holder_flag);
+		if ((struct cds_ft_node *) ft_node_ptr(cn->child) != old_node) {
+			s = CDS_FT_STATUS_NOT_FOUND;
+			FT_TP(replace_exit, (int) s);
+			return s;
+		}
+		pub_slot = &cn->child;
+	} else if (ft_node_external_nodes(holder_flag) ==
+			(struct cds_ft_node *) old_node) {
+		/* Internal holder: @old_node heads its external_nodes chain. */
+		pub_slot = (struct cds_ft_inode_flag **)
+			&cds_ft_item_to_metadata(ft_node_ptr(holder_flag))->external_nodes;
+	} else {
+		/* Internal holder: @old_node is a body child (leaf key). */
+		struct cds_ft_inode_flag *child;
+
+		child = ft_node_get_nth_skip(holder_flag, &pub_slot,
+			iter_key[key_len - 1], FT_PF_NONE);
+		if (!child ||
+		    (struct cds_ft_node *) ft_node_ptr(child) != old_node) {
+			s = CDS_FT_STATUS_NOT_FOUND;
+			FT_TP(replace_exit, (int) s);
+			return s;
+		}
+	}
+
 	/*
-	 * Splice new_node into the chain in place of old_node.
-	 * new_node inherits old_node's prev and next pointers.
-	 * The write barrier within rcu_assign_pointer ensures
-	 * new_node->next is visible before the pointer that
-	 * publishes new_node.
+	 * Splice @new_node into the chain in place of @old_node: it inherits
+	 * @old_node's prev and next, the successor (if any) is repointed back
+	 * at it, and rcu_assign_pointer publishes it into the slot, ordering
+	 * those stores before it becomes reachable.
 	 */
 	new_node->prev = old_node->prev;
 	new_node->next = ft_node_next(old_node);
 	if (new_node->next)
 		new_node->next->prev = new_node;
-	if (ft_node_external((struct cds_ft_inode_flag *) old_node->prev)) {
-		/* Non-head: update predecessor's next pointer. */
-		struct cds_ft_node *prev_node =
-			(struct cds_ft_node *) old_node->prev;
-		rcu_assign_pointer(prev_node->next, new_node);
-	} else {
-		/* Head: update the head slot. */
-		rcu_assign_pointer(*head_slot, new_node);
-	}
+	rcu_assign_pointer(*pub_slot, (struct cds_ft_inode_flag *) new_node);
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * A compressed-head replace changed cn->child; re-encode the
+	 * grandparent's skip-compressed slot to the new child so a skip
+	 * descent or ft_skip_reanchor up-walk does not follow the stale
+	 * pointer into the about-to-be-freed @old_node (the dangling-skip
+	 * UAF that cds_ft_remove guards against on its compressed-head
+	 * unchain).  No-ops for a plain (non-skip) compressed slot.
+	 */
+	if (cn)
+		ft_update_skip_pointer(ft_get_parent_slot(
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn), ft), cn);
+#endif
 
 	/*
-	 * old_node has left the trie (replaced by new_node): tombstone it.
+	 * @old_node has left the trie (replaced by @new_node): tombstone it.
 	 * Its next pointer is preserved so a concurrent reader positioned on
-	 * old_node still follows the chain.
+	 * @old_node still follows the chain.
 	 */
 	ft_node_mark_removed(old_node);
 
 	/*
-	 * The trie structure is unchanged (no recompaction), so the
-	 * iterator path remains valid in cached mode.
+	 * The trie structure is unchanged (no recompaction), so the iterator
+	 * path remains valid in cached mode.
 	 */
 	iter_auto_invalidate_path(iter);
 	s = CDS_FT_STATUS_OK;
