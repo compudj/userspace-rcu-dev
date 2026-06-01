@@ -7872,16 +7872,14 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 */
 	iter_debug_path_check(iter);
 	/*
-	 * Continuation fast path (PP): recover the position from iter->node
-	 * (not iter_path[]).  Reuse only when the cached position is for
-	 * EXACTLY this key -- path_len == key_depth and iter->node set.
-	 * set_key keeps cache_valid only for a subset (prefix) key, and a
-	 * same-length subset is the same key, so path_len == key_depth
-	 * <=> the current key equals the cached result key, i.e. iter->node
-	 * is the deepest position for this key.  A strict-prefix reuse
-	 * (path_len > key_depth) falls to slow_path: iter->node is deeper
-	 * than key_depth-1, so it is not the right cursor.  (The non-PP
-	 * array path tolerates it via depth-indexed iter_path[].)
+	 * Continuation fast path: recover the position from iter->node by
+	 * backtracking up the live parent chain.  Reuse it only when the
+	 * cached position is EXACTLY at this key (path_len == key_depth and
+	 * iter->node set) -- iter->node is then the deepest position for the
+	 * key.  A deeper cached position (path_len > key_depth, e.g. an
+	 * inequality result that landed on a longer key) is not the right
+	 * cursor for this key and falls to slow_path.  The caller must hold
+	 * the RCU read-side lock continuously for iter->node to stay valid.
 	 */
 	if (iter->cache_valid && iter->node &&
 			(ssize_t)iter->path_len == key_depth &&
@@ -20506,7 +20504,6 @@ enum cds_ft_status cds_ft_iter_get_prefix(struct cds_ft_iter *iter,
 enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *key, size_t key_len)
 {
 	const struct cds_ft_key_map *km = &iter->ft->group->key_map;
-	bool subset = false;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
 	const uint8_t *key_ordinals;
 
@@ -20523,27 +20520,16 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 		key_ordinals = ordinal_buf;
 	}
 	/*
-	 * If new key is a subset of current key, the path stays valid,
-	 * otherwise invalidate the path.
+	 * Setting a new key invalidates the cached position: the next
+	 * operation re-descends from the root by the new key.
 	 */
-	if (!subset) {
-		memcpy(iter_key(iter), key_ordinals, key_len);
-		iter->cache_valid = false;
-		iter_debug_path_clear(iter);
-		iter->path_len = 0;
-	} else if (iter->path_len > key_len + 1) {
-		/*
-		 * Subset key reuses the existing path, but a prior
-		 * lookup that returned NOT_FOUND may have truncated
-		 * path_len below the previous key_len.  Only shrink
-		 * path_len down to the new key's depth; never extend
-		 * it past what was actually validated.
-		 */
-		iter->path_len = key_len + 1;
-	}
+	memcpy(iter_key(iter), key_ordinals, key_len);
+	iter->cache_valid = false;
+	iter_debug_path_clear(iter);
+	iter->path_len = 0;
 	iter->key_len = key_len;
 	FT_TP(iter_set_key_exit, (const void *) iter->ft, (const void *) iter,
-		(int) subset, (int) iter->path_len);
+		(int) iter->path_len);
 	return CDS_FT_STATUS_OK;
 }
 

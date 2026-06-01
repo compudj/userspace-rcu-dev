@@ -712,13 +712,11 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, iter_set_key_exit,
 	LTTNG_UST_TP_ARGS(
 		const void *, ft,
 		const void *, iter,
-		int, subset,
 		int, path_len
 	),
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
 		lttng_ust_field_integer_hex(uintptr_t, iter, (uintptr_t) iter)
-		lttng_ust_field_integer(int, subset, subset)
 		lttng_ust_field_integer(int, path_len, path_len)
 	)
 )
