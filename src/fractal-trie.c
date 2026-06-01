@@ -431,7 +431,7 @@ void static_array_size_check(void)
 	CAA_BUILD_BUG_ON(CAA_ARRAY_SIZE(ft_types) < FT_TYPE_MAX_NR);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
-	 * skip_slot_offset is 8 bits and stores byte_offset / sizeof(void *).
+	 * parent_slot_offset is 8 bits and stores byte_offset / sizeof(void *).
 	 * Ensure the largest node (pigeon, 2^11 = 2048 bytes) fits:
 	 * 2048 / sizeof(void *) = 256 slots, max index 255.  Only enabled
 	 * on 64-bit architectures, where sizeof(void *) == 8 and the
@@ -441,7 +441,7 @@ void static_array_size_check(void)
 #endif
 	/*
 	 * Metadata packed bitfield must fit in a uint32_t.
-	 * Layout: nr_child(9) + [skip_slot_offset(8)] + alloc_index
+	 * Layout: nr_child(9) + [parent_slot_offset(8)] + alloc_index
 	 *         (near: FT_ALLOC_INDEX_BITS + 3; far: a separate uint32_t).
 	 */
 	CAA_BUILD_BUG_ON(9
@@ -1977,57 +1977,6 @@ bool ft_group_skip_compressed(const struct cds_ft_group *group)
 {
 	return group->flags & CDS_FT_FLAG_SKIP_COMPRESSED;
 }
-
-/*
- * ft_set_skip_slot: encode the skip pointer slot address as a
- * pointer-stride offset from the parent node.  The raw byte offset
- * is divided by sizeof(void *) (always 8 on 64-bit) so that the
- * 8-bit field can cover the full pigeon node (2048 bytes / 8 = 256
- * slots, max index 255).
- *
- * When parent is NULL (root's child), the offset is unused —
- * ft_get_skip_slot recovers &ft->root.
- */
-static inline
-void ft_set_skip_slot(struct cds_ft_metadata *meta,
-		struct cds_ft_inode_flag **slot)
-{
-	if (!slot)
-		return;	/* Slot unknown — preserve existing offset. */
-	if (!meta->parent) {
-		meta->skip_slot_offset = 0;
-		return;
-	}
-	meta->skip_slot_offset = (unsigned int)((char *) slot -
-		(char *) ft_node_ptr(meta->parent)) / sizeof(void *);
-}
-
-/*
- * ft_get_skip_slot: recover the skip pointer slot address from the
- * stored pointer-stride offset.
- *
- * The node body IS the packed child-pointer array (metadata lives in a
- * sibling page), so offset 0 is a valid slot — the node's first/lowest
- * child.  A placed non-root skip-compressed child therefore always has a
- * meaningful offset, including 0; the "no recorded slot" state is fully
- * captured by parent == NULL (the root's child, recovered as &ft->root
- * below).  Do NOT treat offset 0 as "unset": that aliases the lowest
- * child of every node and silently drops its skip re-encode
- * (ft_publish_to_parent / ft_node_recompact would skip it on a
- * child-change, leaving a stale skip pointer in the parent slot).
- *
- * @ft is needed for the root case (parent == NULL).
- */
-static inline
-struct cds_ft_inode_flag **ft_get_skip_slot(const struct cds_ft_metadata *meta,
-		struct cds_ft *ft)
-{
-	if (!meta->parent)
-		return &ft->root;
-	return (struct cds_ft_inode_flag **)
-		((char *) ft_node_ptr(meta->parent) +
-		 (unsigned int) meta->skip_slot_offset * sizeof(void *));
-}
 #else
 static inline
 bool ft_node_skip_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
@@ -2069,38 +2018,63 @@ bool ft_group_skip_compressed(const struct cds_ft_group *group __attribute__((un
 	return false;
 }
 
+#endif /* FEATURE_FT_SKIP_COMPRESSED */
+
 /*
- * Non-skip builds use the same parent-slot offset bookkeeping (it is no
- * longer skip-specific — every internal/compressed node records its slot
- * within its parent for the parent-pointer backtrack).  TODO(1b): unify
- * this with the FEATURE_FT_SKIP_COMPRESSED copy above under one
- * definition and rename to ft_{set,get}_parent_slot.
+ * ft_set_parent_slot: record a node's slot within its parent as a
+ * pointer-stride offset (parent_slot_offset).  The raw byte offset is
+ * divided by sizeof(void *) (always 8 on 64-bit) so that the 8-bit
+ * field can cover the full pigeon node (2048 bytes / 8 = 256 slots,
+ * max index 255).
+ *
+ * Maintained for every internal/compressed node, not just
+ * skip-compressed ones: it lets the parent-pointer backtrack recover a
+ * node's parent slot in O(1) without re-descending, and it backs the
+ * skip-compressed dual-pointer publish / chain-merge canonicalization.
+ *
+ * When parent is NULL (root's child), the offset is unused —
+ * ft_get_parent_slot recovers &ft->root.
  */
 static inline
-void ft_set_skip_slot(struct cds_ft_metadata *meta,
+void ft_set_parent_slot(struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag **slot)
 {
 	if (!slot)
 		return;	/* Slot unknown — preserve existing offset. */
 	if (!meta->parent) {
-		meta->skip_slot_offset = 0;
+		meta->parent_slot_offset = 0;
 		return;
 	}
-	meta->skip_slot_offset = (unsigned int)((char *) slot -
+	meta->parent_slot_offset = (unsigned int)((char *) slot -
 		(char *) ft_node_ptr(meta->parent)) / sizeof(void *);
 }
 
+/*
+ * ft_get_parent_slot: recover a node's parent-slot address from the
+ * stored pointer-stride offset.
+ *
+ * The node body IS the packed child-pointer array (metadata lives in a
+ * sibling page), so offset 0 is a valid slot — the node's first/lowest
+ * child.  A placed non-root child therefore always has a meaningful
+ * offset, including 0; the "no recorded slot" state is fully captured by
+ * parent == NULL (the root's child, recovered as &ft->root below).  Do
+ * NOT treat offset 0 as "unset": that aliases the lowest child of every
+ * node and silently drops its skip re-encode (ft_publish_to_parent /
+ * ft_node_recompact would skip it on a child-change, leaving a stale
+ * skip pointer in the parent slot).
+ *
+ * @ft is needed for the root case (parent == NULL).
+ */
 static inline
-struct cds_ft_inode_flag **ft_get_skip_slot(const struct cds_ft_metadata *meta,
+struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta,
 		struct cds_ft *ft)
 {
 	if (!meta->parent)
 		return &ft->root;
 	return (struct cds_ft_inode_flag **)
 		((char *) ft_node_ptr(meta->parent) +
-		 (unsigned int) meta->skip_slot_offset * sizeof(void *));
+		 (unsigned int) meta->parent_slot_offset * sizeof(void *));
 }
-#endif /* FEATURE_FT_SKIP_COMPRESSED */
 
 /*
  * ft_flag_to_metadata: get the metadata for any node flag, including
@@ -2191,13 +2165,13 @@ void ft_update_skip_pointer(struct cds_ft_inode_flag **parent_slot,
  * new child before exact/inequality readers (which follow cn->child).
  *
  * For compressed-form @new_child (SKIP_X or plain COMPRESSED), also
- * maintains the underlying compressed node's skip_slot_offset so it
+ * maintains the underlying compressed node's parent_slot_offset so it
  * records @parent_slot's offset in @parent_nf — required by
- * ft_get_skip_slot lookups (the dual-pointer dance above, and the
+ * ft_get_parent_slot lookups (the dual-pointer dance above, and the
  * chain-merge canonicalization in ft_detach_node that publishes a
  * replacement at the cn's same grandparent slot).  Without this,
  * compressed nodes installed via ft_publish_to_parent rather than via
- * ft_node_set_nth → ft_set_parent leave skip_slot_offset == 0 — a
+ * ft_node_set_nth → ft_set_parent leave parent_slot_offset == 0 — a
  * latent gap that silently disabled the dual-pointer SKIP_X update
  * and tripped chain-merge.  This intentionally does NOT update
  * @new_child's parent linkage; callers manage that via their own
@@ -2249,9 +2223,9 @@ void ft_publish_to_parent(struct cds_ft *ft,
 	}
 #endif /* !NDEBUG */
 	/*
-	 * Maintain @new_child's parent-slot offset (skip_slot_offset) so
+	 * Maintain @new_child's parent-slot offset (parent_slot_offset) so
 	 * that it records the slot holding it within its parent node.  This
-	 * is the value ft_get_skip_slot(child_meta) recovers later — used by
+	 * is the value ft_get_parent_slot(child_meta) recovers later — used by
 	 * the parent-pointer backtrack to find a node's slot in O(1) without
 	 * re-descending, by dual-pointer publishes from cn->child
 	 * (ft_publish_to_parent itself, when called with parent_nf = cn) and
@@ -2262,7 +2236,7 @@ void ft_publish_to_parent(struct cds_ft *ft,
 	 * compressed): the offset field is no longer skip-specific.  On
 	 * skip-on builds, without this, compressed nodes installed via
 	 * ft_publish_to_parent (rather than via ft_node_set_nth, which routes
-	 * through ft_set_parent) leave skip_slot_offset == 0 — a latent gap
+	 * through ft_set_parent) leave parent_slot_offset == 0 — a latent gap
 	 * that silently disabled the dual-pointer SKIP_X update at the
 	 * grandparent slot and tripped chain-merge that *needs* the slot.
 	 * On plain-internal builds, the same gap would break the
@@ -2274,12 +2248,12 @@ void ft_publish_to_parent(struct cds_ft *ft,
 	 *
 	 * We do NOT touch @new_child's parent linkage here; callers manage
 	 * that via their own ft_set_parent (or by direct meta->parent
-	 * assignment) before calling us.  ft_set_skip_slot computes the
+	 * assignment) before calling us.  ft_set_parent_slot computes the
 	 * offset relative to child_meta->parent, which callers have already
 	 * pointed at @parent_nf (the node holding @parent_slot).
 	 *
 	 * Skip the update at the root slot (&ft->root): root nodes have
-	 * no parent, and ft_set_skip_slot's offset computation assumes
+	 * no parent, and ft_set_parent_slot's offset computation assumes
 	 * the slot lives inside a node-arena chunk.
 	 */
 	if (new_child && parent_slot != &ft->root) {
@@ -2293,7 +2267,7 @@ void ft_publish_to_parent(struct cds_ft *ft,
 			child_meta = cds_ft_item_to_metadata(
 				ft_node_ptr(new_child));
 		if (child_meta && child_meta->parent)
-			ft_set_skip_slot(child_meta, parent_slot);
+			ft_set_parent_slot(child_meta, parent_slot);
 	}
 
 	if (parent_nf && ft_node_compressed(parent_nf)) {
@@ -2310,7 +2284,7 @@ void ft_publish_to_parent(struct cds_ft *ft,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		{
 			struct cds_ft_inode_flag **skip_slot =
-				ft_get_skip_slot(cn_meta, ft);
+				ft_get_parent_slot(cn_meta, ft);
 			if (skip_slot &&
 			    ft_node_skip_compressed(*skip_slot))
 				rcu_assign_pointer(*skip_slot,
@@ -2433,7 +2407,7 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
 		rcu_assign_pointer(cn_meta->parent, parent_nf);
-		ft_set_skip_slot(cn_meta, slot);
+		ft_set_parent_slot(cn_meta, slot);
 		return;
 	}
 	if (ft_node_compressed(child_nf)) {
@@ -2441,10 +2415,10 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 		 * Plain COMPRESSED form (no SKIP_X wrap): typically
 		 * arises when ft_publish_compressed gates SKIP-X off
 		 * for a non-spec EXT child.  Maintain the cn's
-		 * skip_slot_offset just like the SKIP_X branch above so
+		 * parent_slot_offset just like the SKIP_X branch above so
 		 * later ft_publish_to_parent / chain-merge calls can
 		 * recover the slot in cn's parent via
-		 * ft_get_skip_slot.
+		 * ft_get_parent_slot.
 		 */
 		struct cds_ft_compressed_node *cn =
 			ft_compressed_node_ptr(child_nf);
@@ -2452,7 +2426,7 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
 		rcu_assign_pointer(cn_meta->parent, parent_nf);
-		ft_set_skip_slot(cn_meta, slot);
+		ft_set_parent_slot(cn_meta, slot);
 		return;
 	}
 #endif
@@ -2466,14 +2440,14 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 		/*
 		 * Plain internal child: record its parent AND its slot offset
 		 * within the parent, so the parent-pointer backtrack can recover
-		 * the slot in O(1) (ft_get_skip_slot) without re-descending.
-		 * ft_set_skip_slot reads meta->parent, so set it first.
+		 * the slot in O(1) (ft_get_parent_slot) without re-descending.
+		 * ft_set_parent_slot reads meta->parent, so set it first.
 		 */
 		struct cds_ft_metadata *meta =
 			cds_ft_item_to_metadata(ft_node_ptr(child_nf));
 
 		rcu_assign_pointer(meta->parent, parent_nf);
-		ft_set_skip_slot(meta, slot);
+		ft_set_parent_slot(meta, slot);
 	}
 }
 
@@ -5714,7 +5688,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		if (metadata) {
 			new_metadata->parent = metadata->parent;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			new_metadata->skip_slot_offset = metadata->skip_slot_offset;
+			new_metadata->parent_slot_offset = metadata->parent_slot_offset;
 #endif
 			/*
 			 * Recompact: new_metadata->parent is already inherited
@@ -5871,7 +5845,7 @@ skip_copy:
 		 * skip-specific — it backs the parent-pointer backtrack's O(1)
 		 * slot recovery for plain-internal nodes too).
 		 */
-		new_metadata->skip_slot_offset = old_meta->skip_slot_offset;
+		new_metadata->parent_slot_offset = old_meta->parent_slot_offset;
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (old_parent && ft_node_compressed(old_parent)) {
@@ -5881,7 +5855,7 @@ skip_copy:
 				cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) cn);
 			struct cds_ft_inode_flag **skip_slot =
-				ft_get_skip_slot(cn_meta, ft);
+				ft_get_parent_slot(cn_meta, ft);
 
 			if (skip_slot &&
 			    ft_node_skip_compressed(*skip_slot))
@@ -6018,12 +5992,12 @@ int ft_node_set_nth(struct cds_ft *ft,
 		 *
 		 * Fetch the parent's child slot for both SKIP_X and plain
 		 * COMPRESSED children: ft_set_parent's compressed branches
-		 * use it to record skip_slot_offset, which chain-merge
+		 * use it to record parent_slot_offset, which chain-merge
 		 * canonicalization (ft_detach_node) recovers via
-		 * ft_get_skip_slot to publish the replacement at the same
+		 * ft_get_parent_slot to publish the replacement at the same
 		 * slot.  Without it, plain-COMPRESSED children (the path
 		 * taken when CDS_FT_FLAG_SKIP_COMPRESSED is unset on the
-		 * group) leave skip_slot_offset == 0 — a latent gap that
+		 * group) leave parent_slot_offset == 0 — a latent gap that
 		 * trips chain-merge with parent-cn=plain-COMPRESSED.
 		 */
 		struct cds_ft_inode_flag **slot_ptr = NULL;
@@ -11330,7 +11304,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				iter_node_flag));
 		fresh_meta->parent = src_meta->parent;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		fresh_meta->skip_slot_offset = src_meta->skip_slot_offset;
+		fresh_meta->parent_slot_offset = src_meta->parent_slot_offset;
 #endif
 		ft_publish_to_parent(ft, src_meta->parent,
 			detach_parent_flag_ptr,
@@ -11375,7 +11349,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * @iter_meta:      its metadata.
  * @slot_ptr:       parent slot pointing to @iter_node_flag.  Used only
  *                  when the parent is non-compressed; compressed parents
- *                  resolve their own slot via skip_slot_offset.
+ *                  resolve their own slot via parent_slot_offset.
  */
 static
 void ft_canonicalize_chain_compress(struct cds_ft *ft,
@@ -11444,13 +11418,13 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		 */
 		new_cn_meta->parent = parent_cn_meta->parent;
 		publish_parent = parent_cn_meta->parent;
-		publish_slot = ft_get_skip_slot(parent_cn_meta, ft);
+		publish_slot = ft_get_parent_slot(parent_cn_meta, ft);
 	} else {
 		new_cn_meta->parent = iter_meta->parent;
 		publish_parent = iter_meta->parent;
 		publish_slot = slot_ptr;
 	}
-	ft_set_skip_slot(new_cn_meta, publish_slot);
+	ft_set_parent_slot(new_cn_meta, publish_slot);
 
 	new_cn_flag = ft_compressed_node_flag(new_cn);
 	ft_set_parent(new_cn->child, new_cn_flag, &new_cn->child);
@@ -12283,7 +12257,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * dd.d.pnfp is the exact slot traversed during this
 			 * descent (the skip pointer resolved at the top of the
 			 * loop), so the refresh does not depend on cn's
-			 * skip_slot_offset bookkeeping.  ft_update_skip_pointer
+			 * parent_slot_offset bookkeeping.  ft_update_skip_pointer
 			 * no-ops when the slot holds a plain (non-skip)
 			 * compressed pointer, which references cn itself rather
 			 * than its child and so never dangles.
@@ -12680,7 +12654,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 
 		bm->parent = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		bm->skip_slot_offset = 0;
+		bm->parent_slot_offset = 0;
 #endif
 	}
 	/*
@@ -13802,7 +13776,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		 *       up-walk from G already has a valid graft_payload.parent
 		 *       to follow.  Slot ptr is best-effort (NULL for popcount
 		 *       nodes where the slot doesn't materialize pre-insert) --
-		 *       the skip_slot_offset is fixed up by ft_node_set_nth's
+		 *       the parent_slot_offset is fixed up by ft_node_set_nth's
 		 *       own ft_set_parent below.
 		 *
 		 *   (b) apply_deferred: flip G.parent = graft_payload.  G is
@@ -14934,7 +14908,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			 */
 			rcu_assign_pointer(Mmeta->parent, NULL);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			Mmeta->skip_slot_offset = 0;
+			Mmeta->parent_slot_offset = 0;
 #endif
 		} else if (old) {
 			ft_graft_glue_track(c->gd, M);
@@ -15371,8 +15345,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 					ft_nr_keys_get(pcn_meta), CMM_RELAXED);
 				merged_meta->parent = pcn_meta->parent;
 				pub_parent = pcn_meta->parent;
-				pub_slot = ft_get_skip_slot(pcn_meta, dst_ft);
-				ft_set_skip_slot(merged_meta, pub_slot);
+				pub_slot = ft_get_parent_slot(pcn_meta, dst_ft);
+				ft_set_parent_slot(merged_meta, pub_slot);
 				merged_flag = ft_compressed_node_flag(merged);
 				ft_graft_glue_track(&glue_insert, merged_flag);
 				ft_graft_glue_defer_edge(&glue_insert, ccn->child,
@@ -15542,7 +15516,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 
 			rcu_assign_pointer(bm->parent, NULL);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			bm->skip_slot_offset = 0;
+			bm->parent_slot_offset = 0;
 #endif
 			rcu_assign_pointer(swap_ft->root, top_B);
 			FT_TP(root_publish, (const void *) swap_ft,
@@ -15721,7 +15695,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				ft_node_ptr(detached->root));
 			rcu_assign_pointer(m->parent, NULL);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			m->skip_slot_offset = 0;
+			m->parent_slot_offset = 0;
 #endif
 		}
 		uatomic_store(&detached->max_used_key_len,
@@ -15998,7 +15972,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						ft_node_ptr(child));
 					rcu_assign_pointer(m->parent, NULL);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-					m->skip_slot_offset = 0;
+					m->parent_slot_offset = 0;
 #endif
 				}
 			} else {
@@ -16150,7 +16124,7 @@ void ft_flip_batch_reclaim(struct ft_flip_batch *b)
 
 /*
  * Set @child's parent back-pointer to a raw flag @value (a flip-proxy)
- * verbatim, WITHOUT touching skip_slot_offset.  Mirrors ft_set_parent's
+ * verbatim, WITHOUT touching parent_slot_offset.  Mirrors ft_set_parent's
  * child-kind dispatch; the settle step later replaces @value with the
  * real parent via ft_set_parent (which does maintain skip_slot).
  */
@@ -19384,13 +19358,13 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 * NULL slot means the offset was never set (offset == 0 with a
 	 * non-NULL parent — e.g. compressed reached only via a raw
 	 * compressed pointer that doesn't exercise the skip path).  No
-	 * round-trip to verify in that case.  ft_get_skip_slot wants a
+	 * round-trip to verify in that case.  ft_get_parent_slot wants a
 	 * non-const ft for the root case (parent == NULL); cast away
 	 * const since we only read *slot.
 	 */
 	{
 		struct cds_ft_inode_flag **skip_slot =
-			ft_get_skip_slot(cn_meta, (struct cds_ft *) ft);
+			ft_get_parent_slot(cn_meta, (struct cds_ft *) ft);
 
 		if (skip_slot) {
 			struct cds_ft_inode_flag *slot_val = *skip_slot;
@@ -19403,7 +19377,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 				target_cn = ft_compressed_node_ptr(slot_val);
 			if (target_cn != cn) {
 				if (out)
-					fprintf(out, "ft_verify: depth %u: compressed %p skip_slot_offset round-trip mismatch: slot %p holds %p (resolves to cn %p, expected %p)\n",
+					fprintf(out, "ft_verify: depth %u: compressed %p parent_slot_offset round-trip mismatch: slot %p holds %p (resolves to cn %p, expected %p)\n",
 						depth, node_flag, skip_slot,
 						slot_val, target_cn, cn);
 				return -1;
@@ -19528,7 +19502,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 		/*
 		 * Slot-offset round-trip (non-root): the recorded
-		 * skip_slot_offset must resolve, in the parent body, to the
+		 * parent_slot_offset must resolve, in the parent body, to the
 		 * slot that holds this node.  Catches a stale/unset offset
 		 * (e.g. a placement that passed a NULL slot to ft_set_parent)
 		 * at the mutation that introduced it, rather than as a
@@ -19536,7 +19510,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		 */
 		if (metadata->parent) {
 			struct cds_ft_inode_flag **slot =
-				ft_get_skip_slot(metadata,
+				ft_get_parent_slot(metadata,
 						(struct cds_ft *) ft);
 
 			if (!slot ||
@@ -19639,7 +19613,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 					cds_ft_item_to_metadata(
 						(struct cds_ft_inode *) scn);
 				struct cds_ft_inode_flag **rec =
-					ft_get_skip_slot(scnm,
+					ft_get_parent_slot(scnm,
 						(struct cds_ft *) ft);
 
 				if (rec != slot) {
@@ -19905,7 +19879,7 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	memcpy(cn2->key_bytes, cn->key_bytes, len);
 	cn2_meta->parent = cn_meta->parent;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-	cn2_meta->skip_slot_offset = cn_meta->skip_slot_offset;
+	cn2_meta->parent_slot_offset = cn_meta->parent_slot_offset;
 #endif
 	cn2_meta->nr_child = cn_meta->nr_child;		/* == 1 for a compressed node */
 	cn2_meta->external_nodes = NULL;		/* never set on a compressed node */

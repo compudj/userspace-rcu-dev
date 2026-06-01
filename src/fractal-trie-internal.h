@@ -447,7 +447,7 @@ struct cds_ft_alloc_arena;
  *   offset  0: 8-byte parent pointer
  *   offset  8: 8-byte external_nodes pointer
  *   offset 16: 8-byte nr_keys (unsigned long, total keys in subtree)
- *   offset 24: 4-byte packed bitfield (nr_child, skip_slot_offset,
+ *   offset 24: 4-byte packed bitfield (nr_child, parent_slot_offset,
  *              alloc_index)
  *   offset 28: 4-byte tail padding
  *
@@ -479,7 +479,7 @@ struct cds_ft_metadata {
 	 * Packed bitfield — small fields in a single uint32_t.
 	 *
 	 * nr_child:               9 bits (max 256)
-	 * skip_slot_offset:       8 bits — pointer-stride offset of this
+	 * parent_slot_offset:       8 bits — pointer-stride offset of this
 	 *                         node's slot within its parent node body
 	 *                         (byte_offset / sizeof(void *)).  Maintained
 	 *                         for every internal/compressed node (not just
@@ -492,14 +492,14 @@ struct cds_ft_metadata {
 	 *                         uint32_t (see below).
 	 */
 	uint32_t nr_child:9;
-	uint32_t skip_slot_offset:8;
+	uint32_t parent_slot_offset:8;
 #ifdef FT_FAR_METADATA
 	/*
 	 * A 2 MiB far macro-block holds far more than 256 items (e.g. ~18 700
 	 * order-5 nodes), overflowing the FT_ALLOC_INDEX_BITS (8-bit) packed
 	 * field.  Store alloc_index as its own uint32_t — it lands in the
 	 * struct's existing 4-byte tail padding, so the struct stays 32 B and
-	 * the hot descent bitfield (nr_child/skip_slot_offset) is untouched.
+	 * the hot descent bitfield (nr_child/parent_slot_offset) is untouched.
 	 */
 	uint32_t alloc_index;
 #else
