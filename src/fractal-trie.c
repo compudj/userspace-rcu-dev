@@ -17741,6 +17741,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	int depth, level = 0;
 	bool at_external_nodes;
 	struct cds_ft_inode_flag *deepest = NULL;
+	struct cds_ft_inode_flag *descend_from = NULL;
 
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP(iter_skip_forward_enter, n);
@@ -17772,7 +17773,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 * compressed node's external_nodes (variable-length prefix key)
 	 * or at a leaf child.
 	 */
-	at_external_nodes = !ft_node_external(iter_path_node(iter)[depth]);
+	at_external_nodes = !ft_node_external(deepest);
 
 	/*
 	 * If at external_nodes of an internal/compressed node, all
@@ -17780,7 +17781,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 * skip within them.
 	 */
 	if (at_external_nodes) {
-		struct cds_ft_inode_flag *parent = iter_path_node(iter)[depth];
+		struct cds_ft_inode_flag *parent = deepest;
 		struct cds_ft_metadata *pmeta =
 			cds_ft_item_to_metadata(ft_node_ptr(parent));
 		unsigned long right_keys = ft_nr_keys_load(pmeta) - 1; /* exclude self */
@@ -17812,6 +17813,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 					level = depth + cn->len;
 					iter_path_node(iter)[level] =
 						cn->child;
+					descend_from = cn->child;
 					goto descend_forward;
 				}
 				remaining -= ck;
@@ -17851,6 +17853,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 						ordinal_key[depth] = child_key;
 						iter_path_node(iter)[depth + 1] = child;
 						level = depth + 1;
+						descend_from = child;
 						goto descend_forward;
 					}
 					remaining -= ck;
@@ -17946,6 +17949,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 				ordinal_key[level] = child_key;
 				iter_path_node(iter)[level + 1] = child;
 				level = level + 1;
+				descend_from = child;
 				goto descend_forward;
 			}
 			remaining -= ck;
@@ -17976,8 +17980,12 @@ descend_forward:
 	 * ascending ordinal order.
 	 */
 	{
-		struct cds_ft_inode_flag *node_flag =
-			iter_path_node(iter)[level];
+		/*
+		 * @descend_from is the node placed at @level by the going-up
+		 * / at-external block right before its goto here; it equals the
+		 * descent-stack entry iter_path[level] without the array read.
+		 */
+		struct cds_ft_inode_flag *node_flag = descend_from;
 
 		for (;;) {
 			struct cds_ft_metadata *metadata;
@@ -18080,8 +18088,8 @@ next_forward_level:
 		}
 
 		/* Reached a leaf. */
-		if (ft_node_ptr(iter_path_node(iter)[level]) &&
-		    ft_node_external(iter_path_node(iter)[level]) &&
+		if (ft_node_ptr(node_flag) &&
+		    ft_node_external(node_flag) &&
 		    remaining == 0) {
 			int j;
 
@@ -18089,7 +18097,7 @@ next_forward_level:
 			for (j = 0; j < level; j++)
 				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = (struct cds_ft_node *)
-				ft_node_ptr(iter_path_node(iter)[level]);
+				ft_node_ptr(node_flag);
 			iter->path_valid = true;
 			iter_debug_path_update(iter);
 			iter->path_len = level + 1;
