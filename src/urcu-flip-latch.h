@@ -75,9 +75,12 @@ struct urcu_flip_group {
 	unsigned long selector;
 };
 
+/*
+ * ptr[0] is the old target, ptr[1] the new one: the selector (0 -> old,
+ * 1 -> new) indexes this array directly in urcu_flip_proxy_get().
+ */
 struct urcu_flip_proxy {
-	void *old_ptr;
-	void *new_ptr;
+	void *ptr[2];
 	struct urcu_flip_group *group;
 };
 
@@ -91,8 +94,8 @@ static inline
 void urcu_flip_proxy_init(struct urcu_flip_proxy *proxy,
 		struct urcu_flip_group *group, void *old_ptr, void *new_ptr)
 {
-	proxy->old_ptr = old_ptr;
-	proxy->new_ptr = new_ptr;
+	proxy->ptr[0] = old_ptr;
+	proxy->ptr[1] = new_ptr;
 	proxy->group = group;
 }
 
@@ -105,13 +108,14 @@ void urcu_flip_proxy_init(struct urcu_flip_proxy *proxy,
  * selector is the only mutable field: load it with acquire so the new
  * target's contents -- published before urcu_flip_commit()'s release store
  * -- are visible whenever selector == 1 is observed.
+ *
+ * The selector indexes proxy->ptr[] directly, so resolution is a pure data
+ * dependency rather than a conditional branch.
  */
 static inline
 void *urcu_flip_proxy_get(const struct urcu_flip_proxy *proxy)
 {
-	if (uatomic_load(&proxy->group->selector, CMM_ACQUIRE))
-		return proxy->new_ptr;
-	return proxy->old_ptr;
+	return proxy->ptr[uatomic_load(&proxy->group->selector, CMM_ACQUIRE)];
 }
 
 /*
