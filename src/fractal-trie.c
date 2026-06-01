@@ -7859,7 +7859,6 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 	return FT_DESCENT_CONTINUE;
 }
 
-#ifdef FEATURE_FT_PP_BACKTRACK
 /*
  * Return @node's external_nodes (the dup-chain head hanging off an
  * internal or compressed node).  @node must be internal or compressed.
@@ -7883,7 +7882,6 @@ struct cds_ft_node *ft_node_external_nodes(struct cds_ft_inode_flag *node)
 	}
 	return ft_dereference_prefetch_external(metadata->external_nodes);
 }
-#endif
 
 static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -7900,7 +7898,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = 0;
 	bool going_up = false, skip_eq_external_nodes;
-#ifdef FEATURE_FT_PP_BACKTRACK
 	/*
 	 * Parent-pointer going-up cursor (P4 structural up_node form,
 	 * mirroring the iter_skip walk-up).  @up_node is the deepest live
@@ -7915,7 +7912,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 */
 	struct cds_ft_inode_flag *up_node = NULL;
 	ssize_t up_node_lo = 0;
-#endif
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
@@ -7964,10 +7960,8 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 	node_flag = ft_root_dereference_prefetch(ft);
 	iter_path_node(iter)[0] = node_flag;
-#ifdef FEATURE_FT_PP_BACKTRACK
 	up_node = node_flag;		/* root covers depth 0 */
 	up_node_lo = 0;
-#endif
 
 	/*
 	 * Empty root short-circuit: when the root has no children,
@@ -8008,7 +8002,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 * lock continuously for the cached pointers to remain valid.
 	 */
 	iter_debug_path_check(iter);
-#ifdef FEATURE_FT_PP_BACKTRACK
 	/*
 	 * Continuation fast path (PP): recover the position from iter->node
 	 * (not iter_path[]).  Reuse only when the cached position is for
@@ -8024,10 +8017,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	if (iter->path_valid && iter->node &&
 			(ssize_t)iter->path_len == key_depth &&
 			key_depth > 1) {
-#else
-	if (iter->path_valid && (ssize_t)iter->path_len >= key_depth &&
-			key_depth > 1) {
-#endif
 		for (level = 1; level < key_depth; level++) {
 			switch (limit) {
 			case FT_LOOKUP_LIMIT_NONE:
@@ -8047,7 +8036,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 				break;
 			}
 		}
-#ifdef FEATURE_FT_PP_BACKTRACK
 		{
 			/*
 			 * Cross-call continuation: recover the deepest trie node
@@ -8071,9 +8059,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			else
 				node_flag = cur;
 		}
-#else
-		node_flag = iter_path_node(iter)[key_depth - 1];
-#endif
 		/*
 		 * If the cached path entry is a compressed node, the
 		 * fast path cannot determine the correct loop exit
@@ -8098,7 +8083,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 			level = key_depth;
 		else
 			level = key_depth - 1;
-#ifdef FEATURE_FT_PP_BACKTRACK
 		/*
 		 * Cross-call fast path: the cached deepest node is the going-up
 		 * seed.  It is never compressed/skip here (those fall back to
@@ -8108,7 +8092,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		 */
 		up_node = node_flag;
 		up_node_lo = key_depth - 1;
-#endif
 		FT_TP(fastpath_enter, (int) mode,
 			(const void *) node_flag, (int) level);
 		goto post_traversal;
@@ -8122,16 +8105,13 @@ slow_path:
 
 		if (ft_node_compressed(node_flag)) {
 			enum ft_descent_action act;
-#ifdef FEATURE_FT_PP_BACKTRACK
 			ssize_t cmp_entry_level = level;
-#endif
 
 			act = ft_inequality_compressed(&node_flag,
 				&level, key_depth, mode, limit,
 				&iter_key, input_key, iter,
 				ordinal_key, &skip_eq_external_nodes);
 			if (act == FT_DESCENT_GOING_UP) {
-#ifdef FEATURE_FT_PP_BACKTRACK
 				/*
 				 * @node_flag is the compressed node; it occupies
 				 * depths [cmp_entry_level-1, +cn->len).  Seed the
@@ -8140,10 +8120,8 @@ slow_path:
 				 */
 				up_node = node_flag;
 				up_node_lo = cmp_entry_level - 1;
-#endif
 				goto going_up;
 			}
-#ifdef FEATURE_FT_PP_BACKTRACK
 			/*
 			 * Descend / break / continue: @node_flag is cn->child
 			 * at the advanced @level (span 1 -- chain-merge forbids
@@ -8151,7 +8129,6 @@ slow_path:
 			 */
 			up_node = node_flag;
 			up_node_lo = level;
-#endif
 			if (act == FT_DESCENT_DESCEND_CHILDREN)
 				goto descend_children;
 			if (act == FT_DESCENT_BREAK)
@@ -8209,10 +8186,8 @@ slow_path:
 			break;
 		}
 		iter_path_node(iter)[level] = node_flag;
-#ifdef FEATURE_FT_PP_BACKTRACK
 		up_node = node_flag;		/* child established at @level (span 1) */
 		up_node_lo = level;
-#endif
 		FT_TP(slowpath_step, (int) level, key_value,
 			(const void *) node_flag, 0);
 		dbg_printf("cds_ft_lookup_inequality iter key lookup %u finds node_flag %p\n",
@@ -8329,7 +8304,6 @@ going_up:
 	default:
 		assert(0);
 	}
-#ifdef FEATURE_FT_PP_BACKTRACK
 	/*
 	 * Parent-pointer going-up cursor (P1a).  Replaces the two descent-
 	 * stack reads iter_path[level] (node at @level) and iter_path[level-1]
@@ -8384,12 +8358,10 @@ going_up:
 			level - (ssize_t) ft_compressed_node_ptr(up_parent)->len :
 			level - 1;
 	}
-#endif
 	for (; level > (ssize_t) iter->prefix_len; level--) {
 		uint8_t key_value;
 
 		ft_delay_reader();
-#ifdef FEATURE_FT_PP_BACKTRACK
 		if (!up_first) {
 			/*
 			 * Climbed one level (level-- since last iter): the old
@@ -8407,10 +8379,6 @@ going_up:
 			}
 		}
 		up_first = false;
-#else
-		struct cds_ft_inode_flag *up_node = iter_path_node(iter)[level];
-		struct cds_ft_inode_flag *up_parent = iter_path_node(iter)[level - 1];
-#endif
 		/*
 		 * Return external node if trying to find LE/LT
 		 * inequality and encountering an external node when
@@ -8519,7 +8487,6 @@ going_up:
 			 */
 			level -= (ssize_t) rewind;
 			iter_path_node(iter)[level - 1] = anchor;
-#ifdef FEATURE_FT_PP_BACKTRACK
 			/*
 			 * P1b: the merge rewound @level and re-anchored the live
 			 * holder at the new level-1.  Re-sync the parent cursor to
@@ -8530,7 +8497,6 @@ going_up:
 			 */
 			up_parent = anchor;
 			up_parent_lo = level - 1;
-#endif
 			switch (limit) {
 			case FT_LOOKUP_LIMIT_NONE:
 				key_value = ordinal_key[level - 1];
@@ -8555,7 +8521,6 @@ going_up:
 		if (node_flag) {
 			/* Record the sibling in the path. */
 			iter_path_node(iter)[level] = node_flag;
-#ifdef FEATURE_FT_PP_BACKTRACK
 			/*
 			 * Seed the cursor at the found sibling (depth @level, its
 			 * shallow boundary) before descend_children -> minmax, so a
@@ -8564,7 +8529,6 @@ going_up:
 			 */
 			up_node = node_flag;
 			up_node_lo = level;
-#endif
 			FT_TP(ineq_going_up_step, level,
 				(const void *) up_parent,
 				1, ordinal_key[level - 1]);
@@ -8593,7 +8557,6 @@ going_up:
 	 */
 	if (going_up && level == (ssize_t) iter->prefix_len) {
 		if (dir == FT_LEFT) {
-#ifdef FEATURE_FT_PP_BACKTRACK
 			/*
 			 * Node at prefix_len is the going-up cursor's @up_parent.
 			 * This block is reached only via normal loop exit (no
@@ -8604,10 +8567,6 @@ going_up:
 			 * stack read iter_path[prefix_len].
 			 */
 			struct cds_ft_inode_flag *pfx_flag = up_parent;
-#else
-			struct cds_ft_inode_flag *pfx_flag =
-				iter_path_node(iter)[iter->prefix_len];
-#endif
 
 			if (!ft_node_external(pfx_flag)) {
 				struct cds_ft_metadata *metadata;
@@ -8740,10 +8699,8 @@ descend_children:
 			if (act == FT_DESCENT_BREAK)
 				break;
 			assert(act == FT_DESCENT_CONTINUE);
-#ifdef FEATURE_FT_PP_BACKTRACK
 			up_node = node_flag;	/* minmax cn->child at the advanced @level */
 			up_node_lo = level;
-#endif
 			continue;
 		}
 		skip_eq_external_nodes = false;
@@ -8788,10 +8745,8 @@ descend_children:
 				 */
 				level -= (ssize_t) rewind + 1;
 				node_flag = anchor;
-#ifdef FEATURE_FT_PP_BACKTRACK
 				up_node = anchor;	/* re-anchored holder; re-scanned next iter */
 				up_node_lo = level;
-#endif
 				continue;
 			}
 		}
@@ -8816,10 +8771,8 @@ descend_children:
 			goto going_up;
 		}
 		iter_path_node(iter)[level] = node_flag;
-#ifdef FEATURE_FT_PP_BACKTRACK
 		up_node = node_flag;		/* minmax child established at @level */
 		up_node_lo = level;
-#endif
 		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
 				(unsigned int) ordinal_key[level - 1], node_flag);
 		if (ft_node_external(node_flag))
@@ -17881,21 +17834,14 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 * shallow boundary is @level), replacing the descent-stack read
 	 * iter_path[level] + dense-fill.
 	 */
-#ifdef FEATURE_FT_PP_BACKTRACK
 	struct cds_ft_inode_flag *up_node = deepest;
 	ssize_t up_node_lo = level;
-#endif
 	for (level--; level >= 0; level--) {
-#ifdef FEATURE_FT_PP_BACKTRACK
 		struct cds_ft_inode_flag *ancestor;
-#else
-		struct cds_ft_inode_flag *ancestor = iter_path_node(iter)[level];
-#endif
 		struct cds_ft_inode_flag *child;
 		uint8_t child_key = 0;
 		int pivot;
 
-#ifdef FEATURE_FT_PP_BACKTRACK
 		while (level < up_node_lo) {
 			struct cds_ft_inode_flag *gp = ft_get_parent_rcu(up_node);
 
@@ -17904,7 +17850,6 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 			up_node = gp;
 		}
 		ancestor = up_node;
-#endif
 		if (ft_node_external(ancestor))
 			continue;
 		/*
@@ -17935,10 +17880,8 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 				assert(anchor != NULL);
 				assert(rewind == 0);
 				ancestor = anchor;
-#ifdef FEATURE_FT_PP_BACKTRACK
 				up_node = anchor;	/* live holder at @level (internal, span 1) */
 				up_node_lo = level;
-#endif
 				child = at_pos;
 				continue;
 			}
@@ -18284,23 +18227,16 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	 * placed there as a child so its shallow boundary is @level),
 	 * replacing the descent-stack read iter_path[level] + dense-fill.
 	 */
-#ifdef FEATURE_FT_PP_BACKTRACK
 	struct cds_ft_inode_flag *up_node = deepest;
 	ssize_t up_node_lo = level;
-#endif
 	for (level--; level >= 0; level--) {
-#ifdef FEATURE_FT_PP_BACKTRACK
 		struct cds_ft_inode_flag *ancestor;
-#else
-		struct cds_ft_inode_flag *ancestor = iter_path_node(iter)[level];
-#endif
 		struct cds_ft_inode_flag *child;
 		struct cds_ft_metadata *ameta;
 		uint8_t child_key = 0;
 		unsigned long left_keys = 0;
 		int pivot;
 
-#ifdef FEATURE_FT_PP_BACKTRACK
 		while (level < up_node_lo) {
 			struct cds_ft_inode_flag *gp = ft_get_parent_rcu(up_node);
 
@@ -18309,7 +18245,6 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 			up_node = gp;
 		}
 		ancestor = up_node;
-#endif
 		if (ft_node_external(ancestor))
 			continue;
 		/*
@@ -18328,13 +18263,8 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 			 * equals level there.  Non-PP: the descent stack repeats
 			 * the same node at adjacent in-span levels.
 			 */
-#ifdef FEATURE_FT_PP_BACKTRACK
 			at_shallow_boundary = (level == 0) ||
 				(up_node_lo == level);
-#else
-			at_shallow_boundary = !(level > 0 &&
-				iter_path_node(iter)[level - 1] == ancestor);
-#endif
 			if (!at_shallow_boundary)
 				continue;
 			act = ft_skip_reverse_walk_up_compressed(ancestor,
@@ -18368,10 +18298,8 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 				assert(anchor != NULL);
 				assert(rewind == 0);
 				ancestor = anchor;
-#ifdef FEATURE_FT_PP_BACKTRACK
 				up_node = anchor;
 				up_node_lo = level;
-#endif
 				child = at_pos;
 				continue;
 			}
@@ -18421,10 +18349,8 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 						assert(anchor != NULL);
 						assert(rewind == 0);
 						ancestor = anchor;
-#ifdef FEATURE_FT_PP_BACKTRACK
 						up_node = anchor;
 						up_node_lo = level;
-#endif
 						child = at_pos;
 						continue;
 					}
@@ -20885,20 +20811,6 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 		ft_key_to_ordinals(ordinal_buf, key, key_len, km);
 		key_ordinals = ordinal_buf;
 	}
-#ifndef FEATURE_FT_PP_BACKTRACK
-	/*
-	 * Subset (prefix) reuse: the cached path for the longer key is also
-	 * a valid path for this prefix (depth-indexed iter_path[] yields the
-	 * node at the prefix's depth).  Disabled under PP backtrack: the
-	 * iter->node-based continuation fast path needs the cached position
-	 * to be at exactly key_depth-1, but a strict prefix's position is
-	 * shallower than iter->node (the full cached result).  So PP always
-	 * re-descends on set_key (cheap for a short prefix); the fast path is
-	 * reserved for true continuation (next/prev without set_key).
-	 */
-	if (key_len <= iter->key_len && !memcmp(key_ordinals, iter_key(iter), key_len))
-		subset = true;
-#endif
 	/*
 	 * If new key is a subset of current key, the path stays valid,
 	 * otherwise invalidate the path.
