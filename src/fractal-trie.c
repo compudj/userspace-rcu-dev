@@ -8593,8 +8593,21 @@ going_up:
 	 */
 	if (going_up && level == (ssize_t) iter->prefix_len) {
 		if (dir == FT_LEFT) {
+#ifdef FEATURE_FT_PP_BACKTRACK
+			/*
+			 * Node at prefix_len is the going-up cursor's @up_parent.
+			 * This block is reached only via normal loop exit (no
+			 * sibling found while backtracking down to prefix_len),
+			 * whose last iteration ran at level == prefix_len + 1 with
+			 * the P1a invariant up_parent == node at level - 1 ==
+			 * node at prefix_len.  Live read, replacing the descent-
+			 * stack read iter_path[prefix_len].
+			 */
+			struct cds_ft_inode_flag *pfx_flag = up_parent;
+#else
 			struct cds_ft_inode_flag *pfx_flag =
 				iter_path_node(iter)[iter->prefix_len];
+#endif
 
 			if (!ft_node_external(pfx_flag)) {
 				struct cds_ft_metadata *metadata;
