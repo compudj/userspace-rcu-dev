@@ -7743,7 +7743,6 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 		ssize_t *level_p,
 		struct cds_ft_node **ret_node_p,
 		bool *skip_eq_external_nodes_p,
-		struct cds_ft_iter *iter,
 		uint8_t *ordinal_key,
 		enum ft_direction dir)
 {
@@ -8632,7 +8631,7 @@ descend_children:
 			act = ft_inequality_minmax_compressed(
 				&node_flag, &level, &ret_node,
 				&skip_eq_external_nodes,
-				iter, ordinal_key, dir);
+				ordinal_key, dir);
 			if (act == FT_DESCENT_FOUND_MINMAX)
 				goto found_minmax;
 			if (act == FT_DESCENT_BREAK)
@@ -16935,8 +16934,7 @@ unsigned long ft_child_key_count(struct cds_ft_inode_flag *child)
 static
 enum ft_descent_action ft_lookup_nth_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
-		int *level_p, uint8_t *ordinal_key,
-		struct cds_ft_iter *iter)
+		int *level_p, uint8_t *ordinal_key)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	int level = *level_p;
@@ -17030,7 +17028,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 			enum ft_descent_action act;
 
 			act = ft_lookup_nth_compressed(&node_flag,
-				&level, ordinal_key, iter);
+				&level, ordinal_key);
 			if (act == FT_DESCENT_BREAK)
 				break;
 			continue;
@@ -17154,7 +17152,7 @@ static
 enum ft_descent_action ft_lookup_nth_last_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		int *level_p, unsigned long *remaining_p,
-		uint8_t *ordinal_key, struct cds_ft_iter *iter)
+		uint8_t *ordinal_key)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	int level = *level_p;
@@ -17229,7 +17227,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 
 			act = ft_lookup_nth_last_compressed(
 				&node_flag, &level, &remaining,
-				ordinal_key, iter);
+				ordinal_key);
 			if (act == FT_DESCENT_BREAK)
 				break;
 			if (act == FT_DESCENT_END)
@@ -17355,8 +17353,7 @@ enum ft_descent_action ft_rebuild_path_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		unsigned int *i_p,
 		const uint8_t *key, size_t key_len,
-		uint8_t *ordinal_key,
-		struct cds_ft_iter *iter)
+		uint8_t *ordinal_key)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
@@ -17386,7 +17383,6 @@ enum ft_descent_action ft_rebuild_path_compressed(
  */
 static inline_lookup
 int ft_rebuild_path(struct cds_ft *ft,
-		struct cds_ft_iter *iter,
 		const uint8_t *key, size_t key_len,
 		uint8_t *ordinal_key,
 		struct cds_ft_inode_flag **deepest_p)
@@ -17406,7 +17402,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 			enum ft_descent_action act;
 
 			act = ft_rebuild_path_compressed(&node_flag, &i,
-				key, key_len, ordinal_key, iter);
+				key, key_len, ordinal_key);
 			if (act == FT_DESCENT_END)
 				return -1;
 			assert(act == FT_DESCENT_CONTINUE);
@@ -17455,8 +17451,7 @@ int ft_rebuild_path(struct cds_ft *ft,
 static inline_lookup
 enum ft_descent_action ft_skip_forward_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
-		int *level_p, uint8_t *ordinal_key,
-		struct cds_ft_iter *iter)
+		int *level_p, uint8_t *ordinal_key)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	int level = *level_p;
@@ -17518,7 +17513,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 
 	/* Rebuild path from root to current key. */
-	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
+	depth = ft_rebuild_path(ft, iter_key(iter), iter->key_len,
 			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
@@ -17768,7 +17763,7 @@ descend_forward:
 
 				act = ft_skip_forward_compressed(
 					&node_flag, &level,
-					ordinal_key, iter);
+					ordinal_key);
 				if (act == FT_DESCENT_BREAK)
 					break;
 				continue;
@@ -17869,7 +17864,7 @@ static inline_lookup
 enum ft_descent_action ft_skip_reverse_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		int *level_p, unsigned long *remaining_p,
-		uint8_t *ordinal_key, struct cds_ft_iter *iter)
+		uint8_t *ordinal_key)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	int level = *level_p;
@@ -17988,7 +17983,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 
 	/* Rebuild path from root to current key. */
-	depth = ft_rebuild_path(ft, iter, iter_key(iter), iter->key_len,
+	depth = ft_rebuild_path(ft, iter_key(iter), iter->key_len,
 			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
@@ -18224,7 +18219,7 @@ descend_reverse:
 
 				act = ft_skip_reverse_compressed(
 					&node_flag, &level, &remaining,
-					ordinal_key, iter);
+					ordinal_key);
 				if (act == FT_DESCENT_BREAK)
 					break;
 				if (act == FT_DESCENT_END)
