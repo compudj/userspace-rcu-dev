@@ -18189,10 +18189,11 @@ enum ft_descent_action ft_skip_reverse_walk_up_compressed(
 	struct cds_ft_metadata *ameta;
 	struct cds_ft_node *a_ext;
 
-	/* Skip intermediate compressed path levels. */
-	if (level > 0 && iter_path_node(iter)[level - 1] == ancestor)
-		return FT_DESCENT_CONTINUE;
-
+	/*
+	 * Caller (cds_ft_iter_skip_reverse) guarantees this is the
+	 * compressed ancestor's shallow boundary -- the intermediate-level
+	 * skip is decided there, so no descent-stack read is needed here.
+	 */
 	ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
 	a_ext = ft_dereference_acquire(ameta->external_nodes);
 	if (a_ext) {
@@ -18232,6 +18233,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	int depth, level;
 	bool at_external_nodes;
 	struct cds_ft_inode_flag *deepest = NULL;
+	struct cds_ft_inode_flag *descend_from = NULL;
 
 	CDS_FT_SCOPED_READER(ft);
 	FT_TP(iter_skip_reverse_enter, n);
@@ -18262,7 +18264,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	 * Determine whether the current key sits at an internal or
 	 * compressed node's external_nodes or at a leaf child.
 	 */
-	at_external_nodes = !ft_node_external(iter_path_node(iter)[depth]);
+	at_external_nodes = !ft_node_external(deepest);
 	(void) at_external_nodes;
 
 	/*
@@ -18317,7 +18319,24 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		 */
 		if (ft_node_compressed(ancestor)) {
 			enum ft_descent_action act;
+			bool at_shallow_boundary;
 
+			/*
+			 * Process the compressed ancestor's external_nodes only
+			 * at its shallow boundary; skip the intermediate in-span
+			 * levels.  PP: the live cursor's shallow bound up_node_lo
+			 * equals level there.  Non-PP: the descent stack repeats
+			 * the same node at adjacent in-span levels.
+			 */
+#ifdef FEATURE_FT_PP_BACKTRACK
+			at_shallow_boundary = (level == 0) ||
+				(up_node_lo == level);
+#else
+			at_shallow_boundary = !(level > 0 &&
+				iter_path_node(iter)[level - 1] == ancestor);
+#endif
+			if (!at_shallow_boundary)
+				continue;
 			act = ft_skip_reverse_walk_up_compressed(ancestor,
 				level, &remaining, ordinal_key, iter);
 			if (act == FT_DESCENT_END)
@@ -18417,6 +18436,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 						iter_path_node(iter)[level + 1]
 							= child;
 						level = level + 1;
+						descend_from = child;
 						goto descend_reverse;
 					}
 					remaining -= ck;
@@ -18463,8 +18483,12 @@ descend_reverse:
 	 * order first, then check external_nodes last.
 	 */
 	{
-		struct cds_ft_inode_flag *node_flag =
-			iter_path_node(iter)[level];
+		/*
+		 * @descend_from carries the node placed at @level by the
+		 * going-up block right before its goto here; it equals the
+		 * descent-stack entry iter_path[level] without the array read.
+		 */
+		struct cds_ft_inode_flag *node_flag = descend_from;
 
 		for (;;) {
 			struct cds_ft_metadata *metadata;
@@ -18564,8 +18588,8 @@ next_reverse_level:
 		}
 
 		/* Reached a leaf. */
-		if (ft_node_ptr(iter_path_node(iter)[level]) &&
-		    ft_node_external(iter_path_node(iter)[level]) &&
+		if (ft_node_ptr(node_flag) &&
+		    ft_node_external(node_flag) &&
 		    remaining == 0) {
 			int j;
 
@@ -18573,7 +18597,7 @@ next_reverse_level:
 			for (j = 0; j < level; j++)
 				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = (struct cds_ft_node *)
-				ft_node_ptr(iter_path_node(iter)[level]);
+				ft_node_ptr(node_flag);
 			iter->path_valid = true;
 			iter_debug_path_update(iter);
 			iter->path_len = level + 1;
