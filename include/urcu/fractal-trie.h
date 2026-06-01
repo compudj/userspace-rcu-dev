@@ -212,9 +212,10 @@
  *
  * The iterator reuses its current position (the result node) to
  * accelerate subsequent sequential operations like cds_ft_next(),
- * cds_ft_prev(), or cds_ft_remove(): they continue from it by
+ * cds_ft_prev(), or cds_ft_remove_all(): they continue from it by
  * backtracking up the live parent chain rather than re-descending
- * from the root.
+ * from the root.  (cds_ft_remove() and cds_ft_replace() take the target
+ * node explicitly; see their note below.)
  *
  * Because the position is an RCU-protected pointer, the RCU read-side
  * lock must be held CONTINUOUSLY between the operation that populates
@@ -228,25 +229,35 @@
  * - cds_ft_iter_invalidate_path()
  *
  * Calling this function clears the cached position while keeping your
- * key intact. The next operation (e.g., cds_ft_remove) will
- * automatically fall back to a safe, fresh top-down traversal.
+ * key intact. The next position-reusing operation (e.g.,
+ * cds_ft_remove_all) then falls back to a safe, fresh top-down
+ * traversal by the key.
  *
- * Example A (Continuous Lock - Fast):
+ * Example A (Continuous lock — fast):
  * rcu_read_lock();
  * cds_ft_lookup(ft, iter);
- * cds_ft_remove(ft, iter, node); // Reuses cached position
+ * cds_ft_remove(ft, iter, cds_ft_iter_node(iter)); // node still live; no re-descent
  * rcu_read_unlock();
  *
- * Example B (Dropped Lock - CDS_FT_ITER_PATH_CACHED only):
- * rcu_read_lock();
- * cds_ft_lookup(ft, iter);
- * rcu_read_unlock();
- * // ... time passes, lock is dropped ...
+ * Example B (Dropped lock — re-derive from the key):
+ * After dropping the RCU read-side lock the cached position is stale, so
+ * invalidate it; a position-reusing operation then re-descends by the
+ * iterator's key.  cds_ft_remove_all takes no node argument and derives
+ * everything from the key, so it is safe under the writer mutex alone:
  *
  * lock(&writer_mutex);
- * cds_ft_iter_invalidate_path(iter); // Flush the stale RCU cache
- * cds_ft_remove(ft, iter, node);     // Safe: Fresh traversal protected by writer lock
+ * cds_ft_iter_invalidate_path(iter); // discard the stale cached position
+ * cds_ft_remove_all(ft, iter, &head); // re-descends by the key
  * unlock(&writer_mutex);
+ *
+ * cds_ft_remove() and cds_ft_replace() take the target node explicitly
+ * (@node / @old_node — normally cds_ft_iter_node(iter), the iterator's
+ * current position) and dereference it directly via @node->prev, with no
+ * re-descent.  The RCU read-side lock must therefore be held CONTINUOUSLY
+ * from when that node was obtained until the call, so the node has not
+ * been reclaimed.  After a dropped lock the node is stale: re-look it up
+ * (under the lock) and pass the fresh node — invalidate_path() resets the
+ * iterator's cached position but cannot refresh a node you already hold.
  *
  * Note: CDS_FT_ITER_PATH_UNCACHED iterators do not require
  * cds_ft_iter_invalidate_path() — the cached position is discarded
@@ -1310,16 +1321,18 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 /*
  * cds_ft_replace - Replace an existing node by a new node at the same key.
  * @ft: The Fractal Trie.
- * @iter: Iterator position at which @old_node is expected.
- *        If the iterator holds a valid path from a prior lookup,
- *        the replace operation may use it to avoid a full traversal.
- *        WARNING (CDS_FT_ITER_PATH_CACHED only): If the RCU read-side
- *        lock was dropped since the last iterator operation, you must
- *        call cds_ft_iter_invalidate_path() to invalidate the cached
- *        path before calling this function. CDS_FT_ITER_PATH_UNCACHED
- *        iterators handle this automatically and do not require
- *        cds_ft_iter_invalidate_path().
- * @old_node: Node to replace. Must be currently present in the trie.
+ * @iter: Identifies the key at which @old_node sits (set by the lookup
+ *        that returned @old_node).  Used only for its key, to locate
+ *        @old_node's slot; cds_ft_replace does not re-descend.
+ * @old_node: Node to replace (normally cds_ft_iter_node(iter)), currently
+ *            present in the trie.  Dereferenced directly via
+ *            @old_node->prev, so it must be live: hold the RCU read-side
+ *            lock continuously from when @old_node was obtained until this
+ *            call (concurrent mode; in exclusive mode the caller's mutual
+ *            exclusion replaces that).  After a dropped lock, re-look up
+ *            @old_node first — cds_ft_iter_invalidate_path() resets the
+ *            iterator's cached position but cannot refresh a node you
+ *            already hold.
  * @new_node: Node to insert in place of @old_node. Must be
  *            initialized with cds_ft_node_init() before this call.
  *
@@ -1345,16 +1358,17 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 /*
  * cds_ft_remove - Remove @node at @iter position.
  * @ft: The Fractal Trie.
- * @iter: Iterator position at which @node is expected.
- *        If the iterator holds a valid path from a prior lookup,
- *        the remove operation may use it to avoid a full traversal.
- *        WARNING (CDS_FT_ITER_PATH_CACHED only): If the RCU read-side
- *        lock was dropped since the last iterator operation, you must
- *        call cds_ft_iter_invalidate_path() to invalidate the cached
- *        path before calling this function. CDS_FT_ITER_PATH_UNCACHED
- *        iterators handle this automatically and do not require
- *        cds_ft_iter_invalidate_path().
- * @node: Node to remove.
+ * @iter: Identifies the key at which @node sits (set by the lookup that
+ *        returned @node).  Used only for its key, to locate @node's
+ *        slot; cds_ft_remove does not re-descend.
+ * @node: Node to remove (normally cds_ft_iter_node(iter)).  Dereferenced
+ *        directly via @node->prev, so it must be live: hold the RCU
+ *        read-side lock continuously from when @node was obtained until
+ *        this call (concurrent mode; in exclusive mode the caller's
+ *        mutual exclusion replaces that).  After a dropped lock, re-look
+ *        up @node first — cds_ft_iter_invalidate_path() resets the
+ *        iterator's cached position but cannot refresh a node you already
+ *        hold.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * the node is not found, or a negative cds_ft_status on error.
@@ -1371,14 +1385,14 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * cds_ft_remove_all - Remove the entire duplicate chain at @iter position.
  * @ft: The Fractal Trie.
  * @iter: Iterator position identifying the key.
- *        If the iterator holds a valid path from a prior lookup,
- *        the remove operation may use it to avoid a full traversal.
+ *        If the iterator holds a valid cached position from a prior
+ *        lookup, remove_all reuses it to avoid a full traversal.
  *        WARNING (CDS_FT_ITER_PATH_CACHED only): If the RCU read-side
  *        lock was dropped since the last iterator operation, you must
  *        call cds_ft_iter_invalidate_path() to invalidate the cached
- *        path before calling this function. CDS_FT_ITER_PATH_UNCACHED
- *        iterators handle this automatically and do not require
- *        cds_ft_iter_invalidate_path().
+ *        position before calling this function; it then re-descends by
+ *        the key.  CDS_FT_ITER_PATH_UNCACHED iterators handle this
+ *        automatically and do not require cds_ft_iter_invalidate_path().
  * @result_node: Node output. Set to the head of the removed duplicate
  *               chain on success, or NULL if no node is found or on
  *               error.
