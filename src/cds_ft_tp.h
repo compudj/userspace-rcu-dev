@@ -493,12 +493,12 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, post_traversal,
 LTTNG_UST_TRACEPOINT_EVENT(cds_ft, slowpath_enter,
 	LTTNG_UST_TP_ARGS(
 		int, mode,
-		int, path_valid,
+		int, cache_valid,
 		int, path_len
 	),
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_enum(cds_ft, ft_lookup_mode, int, mode, mode)
-		lttng_ust_field_integer(int, path_valid, path_valid)
+		lttng_ust_field_integer(int, cache_valid, cache_valid)
 		lttng_ust_field_integer(int, path_len, path_len)
 	)
 )
@@ -685,7 +685,7 @@ LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_iter_event_class, cds_ft,
 	iter_destroy,
 	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_iter_event_class, cds_ft,
-	iter_invalidate_path,
+	iter_invalidate_cache,
 	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_iter_event_class, cds_ft,
 	iter_reset,

@@ -560,12 +560,12 @@ enum ft_direction {
 struct cds_ft_iter {
 	struct cds_ft *ft;		/* Point to the associated Fractal Trie. */
 	struct cds_ft_node *node;	/* Current external node. */
-	size_t path_len;		/* Populated path_node array length. */
+	size_t path_len;		/* Key-path length of the cached position. */
 	size_t key_len;			/* Key length of the current node. */
 	size_t prefix_len;		/* Key prefix length. */
 	enum cds_ft_status status;	/* Iteration status. */
-	enum cds_ft_iter_path_mode path_mode;	/* Position-reuse mode (CACHED/UNCACHED). */
-	bool path_valid;		/* Whether the cached position is valid. */
+	enum cds_ft_iter_cache_mode cache_mode;	/* Position-reuse mode (CACHED/UNCACHED). */
+	bool cache_valid;		/* Whether the cached position is valid. */
 
 #ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
 	struct urcu_gp_poll_state gp_state;	/* GP snapshot when path was populated. */
@@ -613,7 +613,7 @@ struct cds_ft_iter {
  *      tighter detection window.
  *
  *  iter_debug_path_clear() — unconditionally resets the snapshot
- *      validity.  Used by iter_auto_invalidate_path() and by
+ *      validity.  Used by iter_auto_invalidate_cache() and by
  *      operations that structurally modify the trie (replace, remove),
  *      after which the cached path is stale regardless of RCU state.
  */
@@ -643,9 +643,9 @@ void iter_debug_path_check(const struct cds_ft_iter *iter)
 {
 	const struct rcu_flavor_struct *flavor = iter->ft->group->flavor;
 
-	if (iter->path_mode != CDS_FT_ITER_PATH_CACHED)
+	if (iter->cache_mode != CDS_FT_ITER_CACHED)
 		return;
-	if (!iter->path_valid)
+	if (!iter->cache_valid)
 		return;
 	if (!iter->gp_state_valid)
 		return;
@@ -672,7 +672,7 @@ void iter_debug_path_check(const struct cds_ft_iter *iter)
 static inline
 void iter_debug_path_update(struct cds_ft_iter *iter)
 {
-	if (!iter->path_valid)
+	if (!iter->cache_valid)
 		iter->gp_state_valid = false;
 }
 
@@ -709,10 +709,10 @@ void iter_debug_path_clear(struct cds_ft_iter *iter __attribute__((unused)))
  * Preserves iter->node so the caller can read the result.
  */
 static inline
-void iter_auto_invalidate_path(struct cds_ft_iter *iter)
+void iter_auto_invalidate_cache(struct cds_ft_iter *iter)
 {
-	if (iter->path_mode == CDS_FT_ITER_PATH_UNCACHED) {
-		iter->path_valid = false;
+	if (iter->cache_mode == CDS_FT_ITER_UNCACHED) {
+		iter->cache_valid = false;
 		iter->path_len = 0;
 		iter_debug_path_clear(iter);
 	}
@@ -6279,7 +6279,7 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	 * length at the terminal.
 	 */
 	const bool cache_path =
-		iter && iter->path_mode == CDS_FT_ITER_PATH_CACHED;
+		iter && iter->cache_mode == CDS_FT_ITER_CACHED;
 
 	if (iter)
 		iter_debug_path_snapshot(iter);
@@ -6614,7 +6614,7 @@ terminal:
 	 * path_len is the number of path levels (root + one per consumed
 	 * key byte) used by a CACHED iter's continuation fast path; derive
 	 * it from the consumed key length.  Zero for UNCACHED / no-iter
-	 * (unused there: UNCACHED clears path_valid in the epilogue).
+	 * (unused there: UNCACHED clears cache_valid in the epilogue).
 	 */
 	if (cache_path)
 		iter_path_len = (size_t) (key - orig_key) + 1;
@@ -6670,9 +6670,9 @@ end:
 		 * successfully descended into the trie, even if the
 		 * exact key was not found.
 		 */
-		iter->path_valid = (status == CDS_FT_STATUS_OK);
+		iter->cache_valid = (status == CDS_FT_STATUS_OK);
 		iter_debug_path_update(iter);
-		iter_auto_invalidate_path(iter);
+		iter_auto_invalidate_cache(iter);
 	}
 	if (track) {
 		*tracking_match_len = match_key_pos ?
@@ -7402,10 +7402,10 @@ enum cds_ft_status ft_lookup_longest_match_iter_finish(
 	iter->key_len = longest_len;
 	iter->path_len = longest_len + 1;
 	iter->status = match_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_INTERNAL_MATCH;
-	iter->path_valid = true;
+	iter->cache_valid = true;
 	iter_debug_path_snapshot(iter);
 end:
-	iter_auto_invalidate_path(iter);
+	iter_auto_invalidate_cache(iter);
 	return iter->status;
 }
 
@@ -7790,7 +7790,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		key_len = ft_key_len(ft, iter->key_len);
 		if (!valid_key_len(ft, key_len)) {
 			iter->node = NULL;
-			iter->path_valid = false;
+			iter->cache_valid = false;
 			iter_debug_path_update(iter);
 			iter->status = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 			goto end;
@@ -7854,7 +7854,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		if (metadata->nr_child == 0 &&
 				!uatomic_load(&metadata->external_nodes, CMM_RELAXED)) {
 			iter->node = NULL;
-			iter->path_valid = true;
+			iter->cache_valid = true;
 			iter_debug_path_snapshot(iter);
 			iter->path_len = 1;
 			iter->status = CDS_FT_STATUS_NOT_FOUND;
@@ -7875,7 +7875,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 * Continuation fast path (PP): recover the position from iter->node
 	 * (not iter_path[]).  Reuse only when the cached position is for
 	 * EXACTLY this key -- path_len == key_depth and iter->node set.
-	 * set_key keeps path_valid only for a subset (prefix) key, and a
+	 * set_key keeps cache_valid only for a subset (prefix) key, and a
 	 * same-length subset is the same key, so path_len == key_depth
 	 * <=> the current key equals the cached result key, i.e. iter->node
 	 * is the deepest position for this key.  A strict-prefix reuse
@@ -7883,7 +7883,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 * than key_depth-1, so it is not the right cursor.  (The non-PP
 	 * array path tolerates it via depth-indexed iter_path[].)
 	 */
-	if (iter->path_valid && iter->node &&
+	if (iter->cache_valid && iter->node &&
 			(ssize_t)iter->path_len == key_depth &&
 			key_depth > 1) {
 		for (level = 1; level < key_depth; level++) {
@@ -7967,7 +7967,7 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	}
 
 slow_path:
-	FT_TP(slowpath_enter, (int) mode, (int) iter->path_valid,
+	FT_TP(slowpath_enter, (int) mode, (int) iter->cache_valid,
 		(int) iter->path_len);
 	for (level = 1; level < key_depth; level++) {
 		uint8_t key_value;
@@ -8101,7 +8101,7 @@ post_traversal:
 				iter->key_len = key_len;
 				memcpy(iter_key(iter), input_key, key_len);
 				iter->node = external_nodes;
-				iter->path_valid = true;
+				iter->cache_valid = true;
 				iter_debug_path_update(iter);
 				iter->path_len = level + 1;
 				iter->status = CDS_FT_STATUS_OK;
@@ -8276,7 +8276,7 @@ going_up:
 					for (j = 0; j < level; j++)
 						iter_key(iter)[j] = ordinal_key[j];
 					iter->node = external_nodes;
-					iter->path_valid = true;
+					iter->cache_valid = true;
 					iter_debug_path_update(iter);
 					iter->path_len = level + 1;
 					iter->status = CDS_FT_STATUS_OK;
@@ -8456,7 +8456,7 @@ going_up:
 						for (j = 0; j < (int) iter->prefix_len; j++)
 							iter_key(iter)[j] = ordinal_key[j];
 						iter->node = external_nodes;
-						iter->path_valid = true;
+						iter->cache_valid = true;
 						iter_debug_path_update(iter);
 						iter->path_len = iter->prefix_len + 1;
 						iter->status = CDS_FT_STATUS_OK;
@@ -8465,7 +8465,7 @@ going_up:
 				}
 			}
 			iter->node = NULL;
-			iter->path_valid = true;
+			iter->cache_valid = true;
 			iter_debug_path_update(iter);
 			iter->path_len = iter->prefix_len + 1;
 			iter->status = CDS_FT_STATUS_NOT_FOUND;
@@ -8482,7 +8482,7 @@ descend_children:
 		for (j = 0; j < level; j++)
 			iter_key(iter)[j] = ordinal_key[j];
 		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
-		iter->path_valid = true;
+		iter->cache_valid = true;
 		iter_debug_path_update(iter);
 		iter->path_len = level + 1;
 		iter->status = CDS_FT_STATUS_OK;
@@ -8668,7 +8668,7 @@ found_minmax:
 		for (j = 0; j < level; j++)
 			iter_key(iter)[j] = ordinal_key[j];
 		iter->node = ret_node;
-		iter->path_valid = true;
+		iter->cache_valid = true;
 		iter_debug_path_update(iter);
 		iter->path_len = level + 1;
 		iter->status = ret_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
@@ -8679,7 +8679,7 @@ end:
 		iter->node ? iter_key(iter) : NULL,
 		iter->node ? iter->key_len : 0,
 		(int) iter->status);
-	iter_auto_invalidate_path(iter);
+	iter_auto_invalidate_cache(iter);
 	return iter->status;
 }
 
@@ -10962,7 +10962,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	 * If the iterator has a valid path, the RCU read-side lock must
 	 * be held.
 	 */
-	if (iter->path_valid)
+	if (iter->cache_valid)
 		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 	iter_debug_path_check(iter);
 
@@ -11083,7 +11083,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	 * The trie structure is unchanged (no recompaction), so the iterator
 	 * path remains valid in cached mode.
 	 */
-	iter_auto_invalidate_path(iter);
+	iter_auto_invalidate_cache(iter);
 	s = CDS_FT_STATUS_OK;
 	FT_TP(replace_exit, (int) s);
 	return s;
@@ -11984,7 +11984,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * If the iterator has a valid path, the RCU read-side lock must
 	 * be held.
 	 */
-	if (iter->path_valid)
+	if (iter->cache_valid)
 		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 	iter_debug_path_check(iter);
 
@@ -12174,7 +12174,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * changed due to node recompaction during detach, making the
 	 * cached path stale.
 	 */
-	iter->path_valid = false;
+	iter->cache_valid = false;
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
 
@@ -12264,7 +12264,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 * If the iterator has a valid path, the RCU read-side lock must
 	 * be held.
 	 */
-	if (iter->path_valid)
+	if (iter->cache_valid)
 		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 	iter_debug_path_check(iter);
 
@@ -12308,7 +12308,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 * descent, NOT a remove-specific re-descent) and locate from there.
 	 */
 	chain_head = NULL;
-	if (iter->path_valid && iter->node && !ft_node_is_removed(iter->node) &&
+	if (iter->cache_valid && iter->node && !ft_node_is_removed(iter->node) &&
 	    ft_locate_chain_head(iter->node, iter_key, key_len,
 		    &holder_flag, &head_slot, &is_prefix))
 		chain_head = iter->node;
@@ -12383,7 +12383,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 */
 	assert(ret != -ENOENT);
 
-	iter->path_valid = false;
+	iter->cache_valid = false;
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
 
@@ -16915,7 +16915,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 						iter_key(iter)[j] = ordinal_key[j];
 				}
 				iter->node = ext;
-				iter->path_valid = true;
+				iter->cache_valid = true;
 				iter_debug_path_update(iter);
 				iter->path_len = level;
 				iter->status = CDS_FT_STATUS_OK;
@@ -17018,7 +17018,7 @@ next_level:
 				iter_key(iter)[j] = ordinal_key[j];
 		}
 		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
-		iter->path_valid = true;
+		iter->cache_valid = true;
 		iter_debug_path_update(iter);
 		iter->path_len = level;
 		iter->status = CDS_FT_STATUS_OK;
@@ -17026,13 +17026,13 @@ next_level:
 	}
 
 	iter->node = NULL;
-	iter->path_valid = true;
+	iter->cache_valid = true;
 	iter_debug_path_update(iter);
 	iter->path_len = 0;
 	iter->status = CDS_FT_STATUS_NOT_FOUND;
 
 end:
-	iter_auto_invalidate_path(iter);
+	iter_auto_invalidate_cache(iter);
 	FT_TP(lookup_nth_exit, (int) iter->status);
 	return iter->status;
 }
@@ -17193,7 +17193,7 @@ check_ext_nth_last:
 						iter_key(iter)[j] = ordinal_key[j];
 				}
 				iter->node = ext;
-				iter->path_valid = true;
+				iter->cache_valid = true;
 				iter_debug_path_update(iter);
 				iter->path_len = level;
 				iter->status = CDS_FT_STATUS_OK;
@@ -17219,7 +17219,7 @@ next_level:
 				iter_key(iter)[j] = ordinal_key[j];
 		}
 		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
-		iter->path_valid = true;
+		iter->cache_valid = true;
 		iter_debug_path_update(iter);
 		iter->path_len = level;
 		iter->status = CDS_FT_STATUS_OK;
@@ -17227,13 +17227,13 @@ next_level:
 	}
 
 	iter->node = NULL;
-	iter->path_valid = true;
+	iter->cache_valid = true;
 	iter_debug_path_update(iter);
 	iter->path_len = 0;
 	iter->status = CDS_FT_STATUS_NOT_FOUND;
 
 end:
-	iter_auto_invalidate_path(iter);
+	iter_auto_invalidate_cache(iter);
 	FT_TP(lookup_nth_last_exit, (int) iter->status);
 	return iter->status;
 }
@@ -17604,7 +17604,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	/* Exhausted the trie. */
 not_found:
 	iter->node = NULL;
-	iter->path_valid = true;
+	iter->cache_valid = true;
 	iter_debug_path_update(iter);
 	iter->path_len = 0;
 	iter->status = CDS_FT_STATUS_NOT_FOUND;
@@ -17650,7 +17650,7 @@ descend_forward:
 					for (j = 0; j < level; j++)
 						iter_key(iter)[j] = ordinal_key[j];
 					iter->node = ext;
-					iter->path_valid = true;
+					iter->cache_valid = true;
 					iter_debug_path_update(iter);
 					iter->path_len = level + 1;
 					iter->status = CDS_FT_STATUS_OK;
@@ -17735,7 +17735,7 @@ next_forward_level:
 				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = (struct cds_ft_node *)
 				ft_node_ptr(node_flag);
-			iter->path_valid = true;
+			iter->cache_valid = true;
 			iter_debug_path_update(iter);
 			iter->path_len = level + 1;
 			iter->status = CDS_FT_STATUS_OK;
@@ -17745,7 +17745,7 @@ next_forward_level:
 	}
 
 end:
-	iter_auto_invalidate_path(iter);
+	iter_auto_invalidate_cache(iter);
 	FT_TP(iter_skip_forward_exit, (int) iter->status);
 	return iter->status;
 }
@@ -17837,7 +17837,7 @@ enum ft_descent_action ft_skip_reverse_walk_up_compressed(
 			for (j = 0; j < level; j++)
 				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = a_ext;
-			iter->path_valid = true;
+			iter->cache_valid = true;
 			iter_debug_path_update(iter);
 			iter->path_len = level + 1;
 			iter->status = CDS_FT_STATUS_OK;
@@ -18069,7 +18069,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 						for (j = 0; j < level; j++)
 							iter_key(iter)[j] = ordinal_key[j];
 						iter->node = a_ext;
-					iter->path_valid = true;
+					iter->cache_valid = true;
 					iter_debug_path_update(iter);
 					iter->path_len = level + 1;
 					iter->status = CDS_FT_STATUS_OK;
@@ -18086,7 +18086,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	/* Exhausted the trie. */
 not_found:
 	iter->node = NULL;
-	iter->path_valid = true;
+	iter->cache_valid = true;
 	iter_debug_path_update(iter);
 	iter->path_len = 0;
 	iter->status = CDS_FT_STATUS_NOT_FOUND;
@@ -18189,7 +18189,7 @@ check_ext_descend_reverse:
 				for (j = 0; j < level; j++)
 					iter_key(iter)[j] = ordinal_key[j];
 				iter->node = ext;
-				iter->path_valid = true;
+				iter->cache_valid = true;
 				iter_debug_path_update(iter);
 				iter->path_len = level + 1;
 				iter->status = CDS_FT_STATUS_OK;
@@ -18213,7 +18213,7 @@ next_reverse_level:
 				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = (struct cds_ft_node *)
 				ft_node_ptr(node_flag);
-			iter->path_valid = true;
+			iter->cache_valid = true;
 			iter_debug_path_update(iter);
 			iter->path_len = level + 1;
 			iter->status = CDS_FT_STATUS_OK;
@@ -18223,7 +18223,7 @@ next_reverse_level:
 	}
 
 end:
-	iter_auto_invalidate_path(iter);
+	iter_auto_invalidate_cache(iter);
 	FT_TP(iter_skip_reverse_exit, (int) iter->status);
 	return iter->status;
 }
@@ -19873,7 +19873,7 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 	 * references become eligible for the grace-period free once unlocked.
 	 * The iterator's key is retained, so the next step re-descends from it.
 	 */
-	cds_ft_iter_invalidate_path(st->iter);
+	cds_ft_iter_invalidate_cache(st->iter);
 	flavor->read_unlock();
 	ft_recompact_alloc_set_active(NULL);
 	return !st->done;
@@ -20464,7 +20464,7 @@ enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **re
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	iter->ft = ft;
-	iter->path_mode = CDS_FT_ITER_PATH_CACHED;
+	iter->cache_mode = CDS_FT_ITER_CACHED;
 	*result_iter = iter;
 	FT_TP(iter_create, (const void *) ft, (const void *) *result_iter);
 	return CDS_FT_STATUS_OK;
@@ -20528,7 +20528,7 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 	 */
 	if (!subset) {
 		memcpy(iter_key(iter), key_ordinals, key_len);
-		iter->path_valid = false;
+		iter->cache_valid = false;
 		iter_debug_path_clear(iter);
 		iter->path_len = 0;
 	} else if (iter->path_len > key_len + 1) {
@@ -20567,7 +20567,7 @@ enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t p
 void cds_ft_iter_reset(struct cds_ft_iter *iter)
 {
 	FT_TP(iter_reset, (const void *) iter->ft, (const void *) iter);
-	iter->path_valid = false;
+	iter->cache_valid = false;
 	iter_debug_path_clear(iter);
 	iter->status = CDS_FT_STATUS_OK;
 	iter->path_len = 0;
@@ -20584,10 +20584,10 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 #endif
 }
 
-void cds_ft_iter_invalidate_path(struct cds_ft_iter *iter)
+void cds_ft_iter_invalidate_cache(struct cds_ft_iter *iter)
 {
-	FT_TP(iter_invalidate_path, (const void *) iter->ft, (const void *) iter);
-	iter->path_valid = false;
+	FT_TP(iter_invalidate_cache, (const void *) iter->ft, (const void *) iter);
+	iter->cache_valid = false;
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
 	iter->node = NULL;
@@ -20596,8 +20596,8 @@ void cds_ft_iter_invalidate_path(struct cds_ft_iter *iter)
 void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 {
 	dst->status = src->status;
-	dst->path_mode = src->path_mode;
-	dst->path_valid = src->path_valid;
+	dst->cache_mode = src->cache_mode;
+	dst->cache_valid = src->cache_valid;
 	dst->path_len = src->path_len;
 	dst->key_len = src->key_len;
 	dst->prefix_len = src->prefix_len;
@@ -20614,20 +20614,20 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
 	return iter->node;
 }
 
-enum cds_ft_status cds_ft_iter_set_path_mode(struct cds_ft_iter *iter,
-		enum cds_ft_iter_path_mode mode)
+enum cds_ft_status cds_ft_iter_set_cache_mode(struct cds_ft_iter *iter,
+		enum cds_ft_iter_cache_mode mode)
 {
 	switch (mode) {
-	case CDS_FT_ITER_PATH_CACHED:
+	case CDS_FT_ITER_CACHED:
 		break;
-	case CDS_FT_ITER_PATH_UNCACHED:
+	case CDS_FT_ITER_UNCACHED:
 		/*
 		 * Switching to uncached mode: any previously cached
 		 * path may become stale if the caller drops the RCU
 		 * read-side lock, so invalidate it now.
 		 */
-		if (iter->path_mode == CDS_FT_ITER_PATH_CACHED) {
-			iter->path_valid = false;
+		if (iter->cache_mode == CDS_FT_ITER_CACHED) {
+			iter->cache_valid = false;
 			iter_debug_path_clear(iter);
 			iter->path_len = 0;
 		}
@@ -20635,12 +20635,12 @@ enum cds_ft_status cds_ft_iter_set_path_mode(struct cds_ft_iter *iter,
 	default:
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
-	iter->path_mode = mode;
+	iter->cache_mode = mode;
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_iter_path_mode cds_ft_iter_get_path_mode(
+enum cds_ft_iter_cache_mode cds_ft_iter_get_cache_mode(
 		const struct cds_ft_iter *iter)
 {
-	return iter->path_mode;
+	return iter->cache_mode;
 }

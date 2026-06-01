@@ -9161,7 +9161,7 @@ static int test_adversarial_replace_churn(void)
  * Default path mode is CACHED. get/set roundtrip works. Invalid mode
  * returns INVALID_ARGUMENT_ERROR.
  */
-static int test_iter_path_mode_default(void)
+static int test_iter_cache_mode_default(void)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_ft(2, &group);
@@ -9174,25 +9174,25 @@ static int test_iter_path_mode_default(void)
 		return -1;
 	}
 
-	if (cds_ft_iter_get_path_mode(iter) != CDS_FT_ITER_PATH_CACHED) {
-		fprintf(stderr, "path_mode_default: expected CACHED\n");
+	if (cds_ft_iter_get_cache_mode(iter) != CDS_FT_ITER_CACHED) {
+		fprintf(stderr, "cache_mode_default: expected CACHED\n");
 		cds_ft_iter_destroy(iter);
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
 		return -1;
 	}
 
-	s = cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	s = cds_ft_iter_set_cache_mode(iter, CDS_FT_ITER_UNCACHED);
 	if (s != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "path_mode_default: set UNCACHED: %s\n",
+		fprintf(stderr, "cache_mode_default: set UNCACHED: %s\n",
 			cds_ft_status_to_string(s));
 		cds_ft_iter_destroy(iter);
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_iter_get_path_mode(iter) != CDS_FT_ITER_PATH_UNCACHED) {
-		fprintf(stderr, "path_mode_default: get after set UNCACHED\n");
+	if (cds_ft_iter_get_cache_mode(iter) != CDS_FT_ITER_UNCACHED) {
+		fprintf(stderr, "cache_mode_default: get after set UNCACHED\n");
 		cds_ft_iter_destroy(iter);
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
@@ -9200,9 +9200,9 @@ static int test_iter_path_mode_default(void)
 	}
 
 	/* Invalid mode value. */
-	s = cds_ft_iter_set_path_mode(iter, (enum cds_ft_iter_path_mode) 99);
+	s = cds_ft_iter_set_cache_mode(iter, (enum cds_ft_iter_cache_mode) 99);
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
-		fprintf(stderr, "path_mode_default: expected error for mode 99, got %s\n",
+		fprintf(stderr, "cache_mode_default: expected error for mode 99, got %s\n",
 			cds_ft_status_to_string(s));
 		cds_ft_iter_destroy(iter);
 		cds_ft_destroy(ft);
@@ -9245,7 +9245,7 @@ static int test_iter_uncached_forward(void)
 		rcu_read_unlock();
 	}
 
-	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	cds_ft_iter_set_cache_mode(iter, CDS_FT_ITER_UNCACHED);
 
 	/* Iterate with explicit per-step RCU lock/unlock. */
 	rcu_read_lock();
@@ -9322,7 +9322,7 @@ static int test_iter_uncached_reverse(void)
 		rcu_read_unlock();
 	}
 
-	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	cds_ft_iter_set_cache_mode(iter, CDS_FT_ITER_UNCACHED);
 
 	rcu_read_lock();
 	for (cds_ft_lookup_last(ft, iter);
@@ -9372,7 +9372,7 @@ static int test_iter_uncached_reverse(void)
 /*
  * Uncached lookup followed by remove, with the RCU lock dropped
  * between the two operations. This is the pattern that would be
- * unsafe in CACHED mode without cds_ft_iter_invalidate_path().
+ * unsafe in CACHED mode without cds_ft_iter_invalidate_cache().
  */
 static int test_iter_uncached_lookup_remove(void)
 {
@@ -9403,7 +9403,7 @@ static int test_iter_uncached_lookup_remove(void)
 		return -1;
 	}
 
-	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	cds_ft_iter_set_cache_mode(iter, CDS_FT_ITER_UNCACHED);
 
 	/* Lookup under RCU. */
 	rcu_read_lock();
@@ -9487,7 +9487,7 @@ static int test_iter_uncached_prefix_scoped(void)
 		rcu_read_unlock();
 	}
 
-	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	cds_ft_iter_set_cache_mode(iter, CDS_FT_ITER_UNCACHED);
 	cds_ft_iter_set_key(iter, (const uint8_t *)"ap", 2);
 	cds_ft_iter_set_prefix_len(iter, 2);
 
@@ -9522,7 +9522,7 @@ static int test_iter_uncached_prefix_scoped(void)
  * Switching from CACHED to UNCACHED invalidates the path. Switching
  * back to CACHED is safe and re-enables path caching.
  */
-static int test_iter_path_mode_switch(void)
+static int test_iter_cache_mode_switch(void)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_ft(2, &group);
@@ -9546,7 +9546,7 @@ static int test_iter_path_mode_switch(void)
 	}
 
 	/* Phase 1: iterate in UNCACHED mode with per-step lock dropping. */
-	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	cds_ft_iter_set_cache_mode(iter, CDS_FT_ITER_UNCACHED);
 	count = 0;
 	rcu_read_lock();
 	for (cds_ft_lookup_first(ft, iter);
@@ -9567,8 +9567,8 @@ static int test_iter_path_mode_switch(void)
 	}
 
 	/* Phase 2: switch back to CACHED, iterate normally. */
-	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_CACHED);
-	if (cds_ft_iter_get_path_mode(iter) != CDS_FT_ITER_PATH_CACHED) {
+	cds_ft_iter_set_cache_mode(iter, CDS_FT_ITER_CACHED);
+	if (cds_ft_iter_get_cache_mode(iter) != CDS_FT_ITER_CACHED) {
 		fprintf(stderr, "mode_switch: mode not CACHED after switch\n");
 		cds_ft_iter_destroy(iter);
 		drain_and_destroy(ft, group);
@@ -9628,7 +9628,7 @@ static int test_iter_uncached_copy(void)
 	}
 
 	/* Set iter_a to UNCACHED and position it. */
-	cds_ft_iter_set_path_mode(iter_a, CDS_FT_ITER_PATH_UNCACHED);
+	cds_ft_iter_set_cache_mode(iter_a, CDS_FT_ITER_UNCACHED);
 
 	rcu_read_lock();
 	cds_ft_lookup_first(ft, iter_a);
@@ -9637,7 +9637,7 @@ static int test_iter_uncached_copy(void)
 	/* Copy iter_a → iter_b. iter_b should inherit UNCACHED mode. */
 	cds_ft_iter_copy(iter_b, iter_a);
 
-	if (cds_ft_iter_get_path_mode(iter_b) != CDS_FT_ITER_PATH_UNCACHED) {
+	if (cds_ft_iter_get_cache_mode(iter_b) != CDS_FT_ITER_UNCACHED) {
 		fprintf(stderr, "uncached_copy: copy did not inherit path mode\n");
 		cds_ft_iter_destroy(iter_a);
 		cds_ft_iter_destroy(iter_b);
@@ -9698,7 +9698,7 @@ static int test_iter_uncached_all_configs(void)
 		rcu_read_unlock();
 	}
 
-	cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
+	cds_ft_iter_set_cache_mode(iter, CDS_FT_ITER_UNCACHED);
 
 	count = 0;
 	rcu_read_lock();
@@ -17362,12 +17362,12 @@ int main(int argc, char **argv)
 
 	/* 12. Uncached iterator path mode tests */
 	diag("Uncached iterator path mode tests");
-	RUN_TEST(test_iter_path_mode_default);
+	RUN_TEST(test_iter_cache_mode_default);
 	RUN_TEST(test_iter_uncached_forward);
 	RUN_TEST(test_iter_uncached_reverse);
 	RUN_TEST(test_iter_uncached_lookup_remove);
 	RUN_TEST(test_iter_uncached_prefix_scoped);
-	RUN_TEST(test_iter_path_mode_switch);
+	RUN_TEST(test_iter_cache_mode_switch);
 	RUN_TEST(test_iter_uncached_copy);
 	RUN_TEST(test_iter_uncached_all_configs);
 
