@@ -479,18 +479,20 @@ struct cds_ft_metadata {
 	 * Packed bitfield — small fields in a single uint32_t.
 	 *
 	 * nr_child:               9 bits (max 256)
-	 * skip_slot_offset:       8 bits (byte_offset / sizeof(void *)
-	 *                         from parent node; ifdef-gated, 0 when
-	 *                         disabled)
+	 * skip_slot_offset:       8 bits — pointer-stride offset of this
+	 *                         node's slot within its parent node body
+	 *                         (byte_offset / sizeof(void *)).  Maintained
+	 *                         for every internal/compressed node (not just
+	 *                         skip-compressed): it lets a backtrack recover
+	 *                         the parent slot in O(1) without re-descending.
+	 *                         0 (and unused) at the root.
 	 * alloc_index:            near: FT_ALLOC_INDEX_BITS + 3 spare bits of
 	 *                         headroom above the page_size >>
 	 *                         FT_ALLOC_ORDER_MIN minimum; far: a separate
 	 *                         uint32_t (see below).
 	 */
 	uint32_t nr_child:9;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
 	uint32_t skip_slot_offset:8;
-#endif
 #ifdef FT_FAR_METADATA
 	/*
 	 * A 2 MiB far macro-block holds far more than 256 items (e.g. ~18 700
