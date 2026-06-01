@@ -524,24 +524,18 @@ struct cds_ft_iter {
 #endif
 
 	/*
-	 * Keep a copy of each rcu_dereferenced nodes encountered within
-	 * traversal along with their associated keys, thus forming a
-	 * path for backtracking.
+	 * Trailing buffer holding the ordinal key bytes of the current
+	 * iterator position.  The going-up backtrack recovers per-level
+	 * nodes from the live parent chain, so no path-node array is kept.
 	 *
-	 * Flexible array member for trailing data.
-	 * Explicitly aligned to safely cast the start of the buffer to a pointer array.
-	 * Layout: [ path_node array ] followed immediately by [ key array ]
+	 * Flexible array member, pointer-aligned.
 	 */
 	char data[] __attribute__((__aligned__(sizeof(struct cds_ft_inode_flag *))));
 };
 
-/* Start of the data buffer to path_node pointer array. */
-#define iter_path_node(iter) \
-	((struct cds_ft_inode_flag **)((iter)->data))
-
 /* Start of the uint8_t key array. */
 #define iter_key(iter) \
-	((uint8_t *)((iter)->data + ((iter)->ft->group->max_tree_depth * sizeof(struct cds_ft_inode_flag *))))
+	((uint8_t *)((iter)->data))
 
 /*
  * Debug helpers for detecting stale cached iterator paths.
@@ -8194,7 +8188,6 @@ going_up:
 
 	/*
 	 * Find highest value left/right of current node.
-	 * Current node is iter_path_node(iter)[level].
 	 * Start at current level. If we cannot find any key left/right
 	 * of ours, go one level up, seek highest value left/right of
 	 * current (recursively), and when we find one, get the
@@ -20613,9 +20606,7 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 
 enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **result_iter)
 {
-	size_t max_depth = ft->group->max_tree_depth;
 	size_t max_key_len = ft->group->max_key_len;
-	size_t path_size = max_depth * sizeof(struct cds_ft_inode_flag *);
 	/*
 	 * Tail pad of FT_KEY_READABLE_PAD bytes after the key buffer so
 	 * the descent can SIMD-load 32 bytes past key[key_len-1] without
@@ -20623,7 +20614,7 @@ enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **re
 	 * as @key_readable_pad (bytes safely loadable past key end).
 	 */
 	size_t key_size  = (max_key_len + FT_KEY_READABLE_PAD) * sizeof(uint8_t);
-	struct cds_ft_iter *iter = calloc(1, sizeof(*iter) + path_size + key_size);
+	struct cds_ft_iter *iter = calloc(1, sizeof(*iter) + key_size);
 
 	CDS_FT_SCOPED_READER(ft);
 	if (!iter) {
@@ -20746,7 +20737,6 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 		const struct cds_ft_group *ft_group = iter->ft->group;
 
 		/* Reset to 0 for debugging. */
-		memset(iter_path_node(iter), 0, ft_group->max_tree_depth * sizeof(struct cds_ft_inode_flag *));
 		memset(iter_key(iter), 0, ft_group->max_key_len * sizeof(uint8_t));
 	}
 #endif
@@ -20774,7 +20764,6 @@ void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 	dst->gp_state = src->gp_state;
 	dst->gp_state_valid = src->gp_state_valid;
 #endif
-	memcpy(iter_path_node(dst), iter_path_node(src), src->path_len * sizeof(struct cds_ft_inode_flag *));
 	memcpy(iter_key(dst), iter_key(src), src->key_len);
 }
 
