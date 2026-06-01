@@ -2950,7 +2950,7 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 
 /*
  * Forward declarations for the 1-level byte-popcount node helpers
- * (single 256-bit bitmap, used for type-4 / qp_28).
+ * (a single 256-bit occupancy bitmap, no second-level summary).
  */
 static inline_lookup
 uint8_t ft_popcount_1l_node_get_nr_child(const struct cds_ft_type *type,
@@ -3007,35 +3007,6 @@ uint8_t ft_popcount_node_get_nr_child(const struct cds_ft_type *type,
  * removing the dependency on the URCU_DEREFERENCE_USE_VOLATILE
  * escape hatch.
  */
-/*
- * Selective prefetch: dereference a child pointer and prefetch the
- * target node.  Use on read-side hot paths where the loaded pointer
- * will be immediately traversed.
- *
- * Skip when the scanner's first read does NOT live at the start of
- * the node body (so prefetching `v` would fetch the wrong cache
- * line):
- * - FT_PIGEON: dense `pointers[256]`; the scanner reads
- *   `pointers[n]` at offset n*8.  First cache line covers only
- *   pointers[0..7], ~3% of random keys.
- *
- * Layouts whose first read IS at offset 0 of the node body benefit
- * from prefetch:
- * - popcount_2l (types 0/1/2 on 64-bit, 0/1 on 32-bit): bitmap
- *   header at offset 0.
- * - popcount_1l (types 3/4/5 on 64-bit, 2/3/4 on 32-bit): 32-byte
- *   bitmap header at offset 0.
- *
- * Encoding:
- *   popcount build: no skip test -- always prefetch.  Measurement
- *     on dns ft_specv (single-thread and 192-thread load-names)
- *     shows the type-equality check earns nothing on this build:
- *     PIGEON is rare on real workloads, the wrong-cache-line cost
- *     for the few PIGEON visits that do happen is tiny relative to
- *     the per-call cost of running the test on every other call,
- *     and the hot-path branch is one fewer instruction without it.
- */
-
 static inline void ft_maybe_prefetch(const void *ptr)
 {
 	/*
@@ -3134,95 +3105,11 @@ static inline void ft_maybe_prefetch(const void *ptr)
  *   FT_PF_DATA:        prefetch child's data (node body).  Right for
  *                      candidate lookup and non-skip exact lookup
  *                      that traverse the returned child's data next.
- *   FT_PF_META:        prefetch child's metadata cache line.  Right
- *                      for inequality / lookup_nth / count_keys,
- *                      which read metadata->external_nodes /
- *                      metadata->nr_keys before further descent.
- *                      For external children, prefetches the node
- *                      body instead (no FT metadata exists).  For
- *                      compressed children, skips — their own
- *                      handlers prefetch cn->child.
- *   FT_PF_BITMAP_META: same as META plus prefetches the bitmap
- *                      cache line for bitmap-bearing children
- *                      (used by ordered get_direction traversal).
- *
- * The item's alloc order is derived from the tag bits directly
- * (type_index + FT_INTERNAL_ORDER_MIN) without loading ft_types[],
- * and the node base address is derived from the tagged pointer via
- * alignment masking (bits below the order are all zero because
- * allocations are order-aligned).
  */
 enum ft_pf_target {
 	FT_PF_NONE,
 	FT_PF_DATA,
-	FT_PF_META,
-	FT_PF_BITMAP_META,
 };
-
-static inline __attribute__((always_inline))
-void ft_prefetch_child_meta(const void *ptr)
-{
-	unsigned long v = (unsigned long) ptr;
-
-	if (!v)
-		return;
-	/*
-	 * Experiment: skip the high-bit clear.  The tag-bit tests below
-	 * only consult low bits, and the align_mask path's metadata
-	 * prefetch is a hint that tolerates non-canonical addresses.
-	 */
-	if ((v & FT_INTERNAL_MASK) == 0) {
-		/*
-		 * External (leaf) / compressed child: no FT metadata, and not
-		 * prefetched.  External leaves are random/use-once (see
-		 * ft_maybe_prefetch -- they flood the MC under 2 MiB / drop under
-		 * 4 KiB); compressed handlers prefetch their own targets.
-		 */
-		return;
-	}
-	{
-		size_t order = ((v & FT_TYPE_MASK) >> FT_INTERNAL_BITS)
-				+ FT_INTERNAL_ORDER_MIN;
-		unsigned long align_mask = ~((1UL << order) - 1UL);
-		void *node = (void *) (v & align_mask);
-
-		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
-	}
-}
-
-static inline __attribute__((always_inline))
-void ft_prefetch_child_bitmap_meta(const void *ptr)
-{
-	unsigned long v = (unsigned long) ptr;
-
-	if (!v)
-		return;
-	/* Experiment: skip the high-bit clear (see ft_prefetch_child_meta). */
-	if ((v & FT_INTERNAL_MASK) == 0) {
-		/* External (leaf) / compressed: not prefetched (see ft_maybe_prefetch). */
-		return;
-	}
-	{
-		unsigned int type_index = (v & FT_TYPE_MASK) >> FT_INTERNAL_BITS;
-		size_t order = type_index + FT_INTERNAL_ORDER_MIN;
-		unsigned long align_mask = ~((1UL << order) - 1UL);
-		void *node = (void *) (v & align_mask);
-
-		__builtin_prefetch(cds_ft_item_to_metadata_fast(node, order));
-		/*
-		 * Only pigeon attaches a 32B bitmap in metadata; popcount
-		 * tiers carry their bitmaps inline in the node body.  Pigeon
-		 * is the last type index on both arches (5 on 32-bit,
-		 * 6 on 64-bit) so a single arch-conditional literal suffices.
-		 */
-#if (CAA_BITS_PER_LONG < 64)
-		if (type_index == 5)
-#else
-		if (type_index == 6)
-#endif
-			__builtin_prefetch(cds_ft_item_to_bitmap(node, order));
-	}
-}
 
 static inline __attribute__((always_inline))
 void ft_maybe_prefetch_hint(const void *ptr, enum ft_pf_target hint)
@@ -3232,12 +3119,6 @@ void ft_maybe_prefetch_hint(const void *ptr, enum ft_pf_target hint)
 		break;
 	case FT_PF_DATA:
 		ft_maybe_prefetch(ptr);
-		break;
-	case FT_PF_META:
-		ft_prefetch_child_meta(ptr);
-		break;
-	case FT_PF_BITMAP_META:
-		ft_prefetch_child_bitmap_meta(ptr);
 		break;
 	}
 }
