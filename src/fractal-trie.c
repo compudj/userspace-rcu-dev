@@ -2759,35 +2759,6 @@ void ft_descent_traverse_compressed(struct ft_descent *d,
 	*iter_key += cn->len;
 }
 
-/*
- * Extended descent state for remove / detach operations.
- * Adds the detach-point bookkeeping used by ft_detach_node()
- * on top of the common descent cursor.
- *
- * During descent, the detach point is updated at potential
- * upward-walk termination points (multi-child nodes, nodes
- * with external_nodes, and the root).  After descent,
- * det_nfp / det_pfp are passed straight to ft_detach_node().
- */
-struct ft_detach_descent {
-	struct ft_descent d;
-	struct cds_ft_inode_flag **det_nfp;	/* Detach-point node slot. */
-	struct cds_ft_inode_flag **det_pfp;	/* Detach-point parent slot. */
-	unsigned int det_depth;			/* Depth of *det_nfp when captured. */
-	bool pending;				/* Waiting to capture det_nfp. */
-};
-
-static
-void ft_detach_descent_init(struct ft_detach_descent *dd,
-		struct cds_ft *ft)
-{
-	ft_descent_init(&dd->d, ft);
-	dd->det_nfp = NULL;
-	dd->det_pfp = &ft->root;
-	dd->det_depth = 0;
-	dd->pending = true;
-}
-
 static
 bool valid_key_len(struct cds_ft *ft, size_t key_len)
 {
@@ -10328,59 +10299,6 @@ struct cds_ft_inode_flag *ft_descent_step(struct ft_descent *d,
 }
 
 /*
- * Update detach-point pointers based on the node metadata at the
- * current position.  Call BEFORE ft_detach_descent_step().
- *
- * At call time, d.nf is the node being inspected, d.nfp is its slot
- * in its parent, d.pnfp is the parent's slot in the grandparent.
- */
-static inline
-void ft_detach_descent_track(struct ft_detach_descent *dd,
-		const struct cds_ft_metadata *metadata)
-{
-	if (metadata->nr_child > 1) {
-		/*
-		 * Multi-child node: upward walk terminates here.
-		 * Save this node's slot as the publish point; the
-		 * actual det_nfp is captured on the next step
-		 * (pending).
-		 */
-		dd->det_pfp = dd->d.nfp;
-		dd->pending = true;
-	} else if (dd->d.depth > 0 && metadata->external_nodes) {
-		/*
-		 * Single-child node with external_nodes: the upward
-		 * walk terminates one level above, so save this
-		 * node's slot and the parent's slot.
-		 */
-		dd->det_nfp = dd->d.nfp;
-		dd->det_pfp = dd->d.pnfp;
-		dd->det_depth = dd->d.depth;
-		dd->pending = false;
-	}
-}
-
-/*
- * Advance one level and resolve any pending detach-point capture.
- * Combines ft_descent_step() with the post-step pending logic.
- */
-static inline
-struct cds_ft_inode_flag *ft_detach_descent_step(
-		struct ft_detach_descent *dd,
-		uint8_t key_value)
-{
-	struct cds_ft_inode_flag *nf;
-
-	nf = ft_descent_step(&dd->d, key_value);
-	if (nf && dd->pending) {
-		dd->det_nfp = dd->d.nfp;
-		dd->det_depth = dd->d.depth;
-		dd->pending = false;
-	}
-	return nf;
-}
-
-/*
  * There are a few cases to cover for add:
  *
  * 1) There is already an external node at that key. Chain this new node
@@ -11528,9 +11446,19 @@ int ft_detach_node(struct cds_ft *ft,
 	 * Check the node being replaced (the child at detach_node_flag_ptr)
 	 * for external_nodes.  After the child's last internal child was
 	 * removed (triggering this detach), the child may still hold
-	 * variable-length key entries that must be preserved.
+	 * variable-length key entries that must be preserved by promoting
+	 * them to the replacement slot.
+	 *
+	 * Only for a destroy-style detach (free_detached_subtree): a
+	 * move-style detach PRESERVES the target subtree (it becomes another
+	 * trie's content), so the target keeps its own external_nodes and
+	 * must NOT have them promoted into the source.  This matters once a
+	 * move-style caller bootstraps from the target itself (the climb
+	 * starts at *detach_node_flag_ptr == the target); the descent-based
+	 * callers passed the single-child chain head here, which never
+	 * carries external_nodes, so this gate is a no-op for them.
 	 */
-	{
+	if (free_detached_subtree) {
 		struct cds_ft_inode_flag *detach_child = *detach_node_flag_ptr;
 
 		/*
@@ -11886,6 +11814,31 @@ int ft_detach_node(struct cds_ft *ft,
 				       nr_to_free < FT_MAX_DEPTH) {
 					struct cds_ft_inode_flag *next = NULL;
 
+					if (ft_node_skip_compressed(walk_nf)) {
+						/*
+						 * Skip-encoded elevated link: the slot
+						 * value encodes the child BELOW the
+						 * elided skip-target compressed node
+						 * (which carries the path bytes).  The
+						 * orphaned node is that skip-target; the
+						 * child is the next link down.  Queue the
+						 * target's plain compressed flag and
+						 * advance to the child.  ft_node_ptr /
+						 * ft_compressed_node_ptr on the raw skip
+						 * value would mis-free the child (taken
+						 * from its low tag) and leak the target --
+						 * this is the move-style detach's single-
+						 * byte-prefix case, where the child below
+						 * is the preserved move target.
+						 */
+						struct cds_ft_compressed_node *cn =
+							ft_skip_to_compressed(walk_nf);
+
+						to_free[nr_to_free++] =
+							ft_compressed_node_flag(cn);
+						walk_nf = ft_skip_child_ptr(walk_nf);
+						continue;
+					}
 					if (ft_node_compressed(walk_nf)) {
 						struct cds_ft_compressed_node *cn;
 
@@ -15759,46 +15712,38 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 	}
 
 	/*
-	 * key_len > 0: descent with snapshot tracking for
-	 * ft_detach_node's upward pruning walk.
+	 * key_len > 0: a plain key-guided descent to the detach target
+	 * @child.  No branch-point snapshot is tracked here: ft_detach_node
+	 * is bootstrapped from @child's own slot and recovers the surviving
+	 * ancestor by climbing parent pointers (the same upward walk used by
+	 * cds_ft_remove's count==1 prune), so the descent only has to locate
+	 * @child, its slot, and its parent.
 	 */
 	{
-		struct ft_detach_descent dd;
+		struct ft_descent d;
 		const uint8_t *ik = key;
 
-		ft_detach_descent_init(&dd, ft);
+		ft_descent_init(&d, ft);
 
-		for (; dd.d.depth < key_len; ) {
+		for (; d.depth < key_len; ) {
 			uint8_t kv;
-			const struct cds_ft_metadata *meta;
 
-			if (!dd.d.nf)
+			if (!d.nf)
 				return CDS_FT_STATUS_NOT_FOUND;
-			if (ft_node_external(dd.d.nf))
+			if (ft_node_external(d.nf))
 				return CDS_FT_STATUS_NOT_FOUND;
-			if (ft_node_compressed(dd.d.nf)) {
+			if (ft_node_compressed(d.nf)) {
 				struct cds_ft_compressed_node *cn =
-					ft_compressed_node_ptr(dd.d.nf);
-				const struct cds_ft_metadata *cn_meta =
-					cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) cn);
+					ft_compressed_node_ptr(d.nf);
 
-				ft_detach_descent_track(&dd, cn_meta);
-				ft_descent_traverse_compressed(&dd.d, cn, &ik);
-				if (dd.d.nf && dd.pending) {
-					dd.det_nfp = dd.d.nfp;
-					dd.pending = false;
-				}
+				ft_descent_traverse_compressed(&d, cn, &ik);
 				continue;
 			}
-			meta = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
-			ft_detach_descent_track(&dd, meta);
-
 			kv = *(ik++);
-			ft_detach_descent_step(&dd, kv);
+			ft_descent_step(&d, kv);
 		}
 
-		child = dd.d.nf;
+		child = d.nf;
 
 		if (!child)
 			return CDS_FT_STATUS_NOT_FOUND;
@@ -15841,7 +15786,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 * Propagate count removal through ancestors
 			 * before detach to avoid writing freed metadata.
 			 */
-			ft_propagate_external_count_parent(ft, dd.d.pnf,
+			ft_propagate_external_count_parent(ft, d.pnf,
 				-(long) detached_count);
 
 			/*
@@ -15852,27 +15797,23 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 */
 			{
 				/*
-				 * Save the slot value at @dd.det_nfp before
-				 * ft_detach_node nulls it: this is the head
-				 * of the single-child chain between the
-				 * source's topmost branch point and the move
-				 * target.  Move-style ft_detach_node
-				 * preserves @child but does NOT free the
-				 * intermediate chain; we free it explicitly
-				 * after the detach so it is not leaked.
-				 */
-				struct cds_ft_inode_flag *chain_head = *dd.det_nfp;
-				/*
-				 * Subtree-move detach: preserve @child as
-				 * the root of the new @detached trie.  The
-				 * caller's saved @child pointer keeps the
-				 * detached subtree alive; ft_detach_node
-				 * must not free it.
+				 * Subtree-move detach (free_detached_subtree
+				 * == false): preserve @child as the root of
+				 * the new @detached trie.  Bootstrapped from
+				 * @child's own slot, ft_detach_node climbs
+				 * parent pointers to the surviving ancestor,
+				 * unlinks the branch there, and its free-walk
+				 * phase 1 reclaims the intermediate single-
+				 * child chain between that ancestor and
+				 * @child (the @nr_clear elevated links) while
+				 * phase 2 -- which would free @child and
+				 * below -- is gated off for move-style.  No
+				 * explicit chain reclaim is needed here.
 				 */
 				int ret = ft_detach_node(ft,
-							 dd.det_nfp,
-							 dd.det_pfp,
-							 dd.det_depth,
+							 d.nfp,
+							 d.pnfp,
+							 d.depth,
 							 false);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
@@ -15881,63 +15822,10 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					 * Undo propagation and abort.
 					 */
 					ft_propagate_external_count_parent(ft,
-						dd.d.pnf,
+						d.pnf,
 						(long) detached_count);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
-				}
-				/*
-				 * Walk from @chain_head down toward @child,
-				 * reclaiming every compressed / internal
-				 * single-child no-external link in between.
-				 * Stop at @child (move target, preserved) or
-				 * any earlier divergence we did not expect.
-				 *
-				 * After ft_detach_node + ft_node_replace_ptr
-				 * the chain is unreachable from the source
-				 * root and call_rcu via free_*_node defers
-				 * reclamation until in-flight readers have
-				 * left.
-				 */
-				while (chain_head &&
-				       chain_head != child &&
-				       !ft_node_external(chain_head)) {
-					struct cds_ft_inode_flag *next = NULL;
-
-					if (ft_node_compressed(chain_head)) {
-						struct cds_ft_compressed_node *cn;
-						struct cds_ft_metadata *cm;
-
-						cn = ft_compressed_node_ptr(
-							ft_skip_child_ptr(chain_head));
-						cm = cds_ft_item_to_metadata(
-							(struct cds_ft_inode *) cn);
-						if (cm->nr_child != 1 ||
-						    cm->external_nodes)
-							break;
-						next = cn->child;
-						free_compressed_node(ft, cn);
-					} else {
-						struct cds_ft_metadata *m =
-							cds_ft_item_to_metadata(
-								ft_node_ptr(chain_head));
-						unsigned int kv;
-
-						if (m->nr_child != 1 ||
-						    m->external_nodes)
-							break;
-						for (kv = 0; kv < 256; kv++) {
-							next = ft_node_get_nth(
-								chain_head, NULL,
-								(uint8_t) kv,
-								FT_PF_NONE);
-							if (next)
-								break;
-						}
-						free_cds_ft_node(ft,
-							ft_node_ptr(chain_head));
-					}
-					chain_head = next;
 				}
 			}
 
@@ -15998,7 +15886,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					 * undo mirrors the original detach.
 					 */
 					ft_propagate_external_count_parent(ft,
-						dd.d.pnf,
+						d.pnf,
 						(long) detached_count);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
@@ -16232,8 +16120,7 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 	const struct cds_ft_key_map *km = &src_ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
 	const uint8_t *key, *ik;
-	struct ft_detach_descent dd;
-	struct cds_ft_inode_flag *child, *chain_head;
+	struct ft_descent d;
 	int ret;
 
 	if (caa_likely(km->identity)) {
@@ -16244,81 +16131,50 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 	}
 	ik = key;
 
-	ft_detach_descent_init(&dd, src_ft);
-	for (; dd.d.depth < src_key_len; ) {
-		const struct cds_ft_metadata *meta;
+	/*
+	 * Plain key-guided descent to the merge source's subtree root.  As in
+	 * ft_detach_keylen, no branch-point snapshot is tracked: ft_detach_node
+	 * is bootstrapped from the target's own slot and climbs parent pointers
+	 * to the surviving ancestor.  A KEY_SHORTER source (the key ends inside
+	 * a compressed node) overshoots that node -- @d.nf becomes its child --
+	 * and the climb's free walk reclaims the whole compressed node while
+	 * preserving @d.nf, matching the old explicit chain reclaim.
+	 */
+	ft_descent_init(&d, src_ft);
+	for (; d.depth < src_key_len; ) {
 		uint8_t kv;
 
 		/* Caller already established EXACT, so the path is present. */
-		if (ft_node_compressed(dd.d.nf)) {
+		if (ft_node_compressed(d.nf)) {
 			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(dd.d.nf);
-			const struct cds_ft_metadata *cn_meta =
-				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+				ft_compressed_node_ptr(d.nf);
 
-			ft_detach_descent_track(&dd, cn_meta);
-			ft_descent_traverse_compressed(&dd.d, cn, &ik);
-			if (dd.d.nf && dd.pending) {
-				dd.det_nfp = dd.d.nfp;
-				dd.pending = false;
-			}
+			ft_descent_traverse_compressed(&d, cn, &ik);
 			continue;
 		}
-		meta = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
-		ft_detach_descent_track(&dd, meta);
 		kv = *(ik++);
-		ft_detach_descent_step(&dd, kv);
+		ft_descent_step(&d, kv);
 	}
-	child = dd.d.nf;
 
 	/* Propagate the removal through ancestors before touching freed slots. */
-	ft_propagate_external_count_parent(src_ft, dd.d.pnf,
+	ft_propagate_external_count_parent(src_ft, d.pnf,
 			-(long) detached_count);
 
 	/*
-	 * Unlink the branch, preserving @child.  Save the slot value first:
-	 * ft_detach_node nulls it, and the single-child chain between the
-	 * topmost branch point and @child must be reclaimed explicitly (the
-	 * move-style detach does not free it).
+	 * Unlink the branch in place, preserving the move target (@d.nf, the
+	 * subtree root the spine-copy merge keeps referencing).  Bootstrapped
+	 * from the target's own slot, ft_detach_node climbs to the surviving
+	 * ancestor and its free-walk phase 1 reclaims the intermediate single-
+	 * child chain (compressed / skip-target nodes included) while phase 2 --
+	 * which would free the target -- stays gated off for move-style.
 	 */
-	chain_head = *dd.det_nfp;
-	ret = ft_detach_node(src_ft, dd.det_nfp, dd.det_pfp, dd.det_depth,
+	ret = ft_detach_node(src_ft, d.nfp, d.pnfp, d.depth,
 			/*free_detached_subtree=*/ false);
 	if (ret < 0) {
 		/* Recompaction OOM: undo the propagation; src is pristine. */
-		ft_propagate_external_count_parent(src_ft, dd.d.pnf,
+		ft_propagate_external_count_parent(src_ft, d.pnf,
 				(long) detached_count);
 		return -ENOMEM;
-	}
-	while (chain_head && chain_head != child && !ft_node_external(chain_head)) {
-		struct cds_ft_inode_flag *next = NULL;
-
-		if (ft_node_compressed(chain_head)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(ft_skip_child_ptr(chain_head));
-			struct cds_ft_metadata *cm =
-				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
-
-			if (cm->nr_child != 1 || cm->external_nodes)
-				break;
-			next = cn->child;
-			free_compressed_node(src_ft, cn);
-		} else {
-			struct cds_ft_metadata *m =
-				cds_ft_item_to_metadata(ft_node_ptr(chain_head));
-			unsigned int kv;
-
-			if (m->nr_child != 1 || m->external_nodes)
-				break;
-			for (kv = 0; kv < 256; kv++) {
-				next = ft_node_get_nth(chain_head, NULL,
-						(uint8_t) kv, FT_PF_NONE);
-				if (next)
-					break;
-			}
-			free_cds_ft_node(src_ft, ft_node_ptr(chain_head));
-		}
-		chain_head = next;
 	}
 	return 0;
 }
