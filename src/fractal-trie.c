@@ -11556,7 +11556,15 @@ int ft_detach_node(struct cds_ft *ft,
 	 * Stop when reaching a multi-child node, a node with
 	 * external_nodes, or the root (parent == NULL).
 	 */
-	cur = *detach_parent_flag_ptr;
+	/*
+	 * Resolve a skip-compressed initial parent slot.  When the detach is
+	 * bootstrapped from a leaf whose holder is a compressed node (e.g.
+	 * cds_ft_remove deriving the position from node->prev), the slot that
+	 * holds the holder is skip-encoded (SKIP_X(cn->child)); ft_node_ptr
+	 * does not strip the skip high bits, so resolve to the plain
+	 * compressed flag here.  No-op for a plain (descent-supplied) slot.
+	 */
+	cur = ft_resolve_skip_compressed(*detach_parent_flag_ptr);
 	cur_depth = detach_depth - ft_parent_depth_span(cur, *detach_node_flag_ptr);
 
 	while (cur) {
@@ -11572,7 +11580,24 @@ int ft_detach_node(struct cds_ft *ft,
 			nr_clear++;
 		}
 		nr_branch++;
-		if (prev_external_nodes_found || metadata->nr_child > 1 || metadata->external_nodes || is_root) {
+		/*
+		 * Stop the upward prune at a surviving boundary: a multi-child
+		 * node, the root, a level past one whose external_nodes were
+		 * promoted (prev_external_nodes_found), or a node that keeps its
+		 * own key (external_nodes) once a deeper promotion is already in
+		 * flight (topmost_external_nodes set).  A SINGLE-child node that
+		 * carries external_nodes does NOT stop here: pruning its only
+		 * (on-path) child empties it, so it cannot stay — its external
+		 * chain is promoted into its own parent slot and the climb
+		 * continues past it (handled just below).  When the detach was
+		 * bootstrapped from a node that already carried external_nodes
+		 * (descent callers, topmost set at start), that node is the one
+		 * being promoted and a further external ancestor is a genuine
+		 * boundary — hence the `&& topmost_external_nodes` guard.
+		 */
+		if (prev_external_nodes_found || metadata->nr_child > 1 ||
+		    (metadata->external_nodes && topmost_external_nodes) ||
+		    is_root) {
 			if (!is_root) {
 				struct cds_ft_metadata *parent_meta =
 					cds_ft_item_to_metadata(
@@ -11589,6 +11614,14 @@ int ft_detach_node(struct cds_ft *ft,
 					&n, NULL);
 			break;
 		}
+		/*
+		 * Single-child node made childless by the prune that carries a
+		 * shorter key: promote its external chain (the deepest such node
+		 * on the path is the one promoted; prev_external_nodes_found then
+		 * stops the climb at the next, surviving level).
+		 */
+		if (metadata->external_nodes && !topmost_external_nodes)
+			topmost_external_nodes = metadata->external_nodes;
 		if (topmost_external_nodes)
 			prev_external_nodes_found = true;
 
@@ -11622,22 +11655,30 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			{
 				/*
-				 * The slot in cur's parent (parent_nf) that holds
-				 * cur is recovered in O(1) from cur's own metadata
-				 * parent-slot offset (maintained for every
-				 * internal/compressed node), instead of a
-				 * pointer-match scan of parent_nf's children.
-				 * ft_get_parent_slot handles all parent kinds: root
-				 * (parent == NULL) -> &ft->root, compressed parent ->
-				 * &pcn->child, plain internal -> the body slot.
+				 * Climb one level: cur (and its child-on-path,
+				 * already at detach_node_flag_ptr's level) is pruned,
+				 * so the detach target becomes cur and its parent
+				 * becomes parent_nf.  The new detach_parent_flag_ptr
+				 * must therefore point to PARENT_NF's slot in its own
+				 * parent (so *detach_parent_flag_ptr == parent_nf ==
+				 * the new cur), recovered in O(1) from parent_nf's
+				 * metadata parent-slot offset.  ft_get_parent_slot
+				 * handles all kinds: root (parent == NULL) -> &ft->root,
+				 * compressed -> its grandparent slot, plain internal ->
+				 * the body slot.  (The previous code recovered cur's own
+				 * slot here, which aliases detach_parent_flag_ptr and
+				 * left *detach_parent_flag_ptr != cur after the climb — a
+				 * latent bug, never reached because descent callers pass
+				 * the surviving-ancestor detach point and break above.)
 				 */
+				struct cds_ft_metadata *parent_nf_meta =
+					cds_ft_item_to_metadata(ft_node_ptr(parent_nf));
 				struct cds_ft_inode_flag **new_parent_flag_ptr =
-					ft_get_parent_slot(metadata, ft);
+					ft_get_parent_slot(parent_nf_meta, ft);
 				/*
-				 * If the resolved grandparent slot is the
-				 * same as the current detach_parent_flag_ptr,
-				 * stop: advancing would put both pointers at
-				 * the same slot, breaking the replace which
+				 * Defensive: if the recovered slot aliases the current
+				 * detach_parent_flag_ptr, advancing would put both
+				 * pointers at the same slot, breaking the replace which
 				 * assumes detach_node_flag_ptr is WITHIN
 				 * iter_node_flag's child array.
 				 */
@@ -12117,11 +12158,12 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
 {
-	struct ft_detach_descent dd;
-	struct cds_ft_node *iter_node, *match;
-	int ret, count = 0;
+	struct cds_ft_inode_flag *holder_flag;
+	struct cds_ft_metadata *holder_meta;
+	struct cds_ft_inode_flag **head_slot = NULL;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, iter->key_len);
+	int ret;
 
 	CDS_FT_SCOPED_WRITER(ft);
 	FT_TP(remove_enter, (const void *) ft, (const void *) iter,
@@ -12143,190 +12185,169 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	iter_key = iter_key(iter);
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
-	ft_detach_descent_init(&dd, ft);
-
-	/* Iterate on all internal levels */
-	for (; dd.d.depth < key_len; ) {
-		uint8_t key_value;
-		const struct cds_ft_metadata *metadata;
-
-		dbg_printf("cds_ft_remove iter nf %p\n",
-				dd.d.nf);
-		if (!dd.d.nf) {
-			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-			return CDS_FT_STATUS_NOT_FOUND;
-		}
-		/* Resolve skip-compressed pointer. */
-		dd.d.nf = ft_resolve_skip_compressed(dd.d.nf);
-
-		/*
-		 * Compressed node: compare remaining key bytes with
-		 * the compressed path.  If they match, traverse
-		 * through to the child.  If they diverge, the key
-		 * is not present.
-		 */
-		if (ft_node_compressed(dd.d.nf)) {
-			enum cds_ft_status s;
-
-			s = ft_remove_descent_compressed(&dd, &iter_key,
-							 key_len);
-			if (s != CDS_FT_STATUS_OK) {
-				FT_TP(remove_exit, (int) s);
-				return s;
-			}
-			continue;
-		}
-
-		/*
-		 * Track pointers for the detach point during descent.
-		 * Update when encountering a potential upward-walk
-		 * termination point.
-		 */
-		metadata = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
-		ft_detach_descent_track(&dd, metadata);
-
-		key_value = *(iter_key++);
-		ft_detach_descent_step(&dd, key_value);
-		dbg_printf("cds_ft_remove iter key lookup %u finds nf %p, nfp %p\n",
-				(unsigned int) key_value, dd.d.nf,
-				dd.d.nfp);
-	}
 	/*
-	 * We reached end of key, try to find the node we are trying to
-	 * remove. Fail if we cannot find it.
+	 * No top-down descent.  @node is application-owned and, with the RCU
+	 * read-side lock held continuously since it was obtained, stays
+	 * alive; the writer mutex held here freezes the structure, so
+	 * node->prev is a settled live pointer to the node's holder and the
+	 * slot that holds @node can be derived directly:
+	 *
+	 *  - INTERNAL ancestors recover their parent slot from their own
+	 *    metadata (parent + parent_slot_offset), used by ft_detach_node's
+	 *    upward prune walk.
+	 *  - the metadata-less EXTERNAL head's slot in its holder is
+	 *    re-derived from the key here (a compressed holder's &cn->child,
+	 *    or an internal holder's body slot for the key's last byte).
 	 */
-	if (!dd.d.nf) {
-		dbg_printf("cds_ft_remove: no node found for key\n");
+
+	/*
+	 * A removed node carries the tombstone on node->next (set by a prior
+	 * unchain/detach).  Re-removing it is an idempotent miss; this also
+	 * guards against operating on a node already unlinked from the trie.
+	 */
+	if (ft_node_is_removed(node)) {
+		dbg_printf("cds_ft_remove: node %p already removed\n", node);
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 
-	if (!ft_node_external(dd.d.nf)) {
-		/* Found internal or compressed node at end of key. */
-		struct cds_ft_node *external_nodes;
-		struct cds_ft_metadata *metadata;
+	holder_flag = (struct cds_ft_inode_flag *) node->prev;
+	if (!holder_flag) {
+		/* Never inserted (a freshly-initialized node). */
+		dbg_printf("cds_ft_remove: node %p has no parent\n", node);
+		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
 
-		metadata = cds_ft_item_to_metadata(ft_node_ptr(dd.d.nf));
-		external_nodes = metadata->external_nodes;
-		if (external_nodes) {
-			/* Find our node in the duplicate chain. */
-			iter_node = (struct cds_ft_node *) external_nodes;
-			match = NULL;
-			cds_ft_for_each_duplicate(iter_node) {
-				dbg_printf("cds_ft_remove: compare %p with iter_node %p\n", node, iter_node);
-				if (iter_node == node) {
-					match = iter_node;
-					break;
-				}
-			}
-			if (!match) {
-				dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
-				FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-				return CDS_FT_STATUS_NOT_FOUND;
-			}
+	if (ft_node_external(holder_flag)) {
+		/*
+		 * node->prev is a cds_ft_node: @node is a non-head duplicate.
+		 * Unlink it from its chain (ft_unchain_node relinks the pinned
+		 * predecessor/successor and tombstones @node).  The key count is
+		 * unchanged (other duplicates remain) and the chain head — and
+		 * any grandparent skip pointer to it — is untouched, so no head
+		 * slot is needed.
+		 */
+		ft_unchain_node(NULL, node);
+		ret = 0;
+	} else if (ft_node_compressed(holder_flag) ||
+		   ft_node_skip_compressed(holder_flag)) {
+		/*
+		 * Compressed holder: @node is its single external child
+		 * (cn->child).  Leaf key.
+		 */
+		struct cds_ft_compressed_node *cn =
+			ft_node_skip_compressed(holder_flag) ?
+				ft_skip_to_compressed(holder_flag) :
+				ft_compressed_node_ptr(holder_flag);
+
+		holder_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+		head_slot = &cn->child;
+		if ((struct cds_ft_node *) ft_node_ptr(*head_slot) != node) {
+			dbg_printf("cds_ft_remove: node %p not at compressed child slot\n", node);
+			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
+		if (!ft_node_next(node)) {
 			/*
-			 * Propagate -1 before unchain if this is the last
-			 * entry in the chain (undercount ordering: decrement
-			 * nr_keys before detaching the pointer).
+			 * Last/only entry: prune the now-empty branch.
+			 * ft_detach_node bootstraps from the holder slot (recovered
+			 * from the holder's own metadata offset) and walks up via
+			 * metadata->parent.  Propagate -1 before detach, which may
+			 * free internal nodes.
 			 */
-			if (!ft_node_external((struct cds_ft_inode_flag *) match->prev)
-			    && !ft_node_next(match)) {
-				ft_propagate_external_count_parent(ft, dd.d.nf, -1);
-			}
-			ft_unchain_node((struct cds_ft_node **) &metadata->external_nodes, match);
+			ft_propagate_external_count_parent(ft, holder_flag, -1);
+			ret = ft_detach_node(ft, head_slot,
+				ft_get_parent_slot(holder_meta, ft),
+				key_len, true);
+			if (ret)
+				ft_propagate_external_count_parent(ft, holder_flag, 1);
+			else
+				ft_node_mark_removed(node);
+		} else {
+			/* Removing the head, duplicates remain: key count unchanged. */
+			ft_unchain_node((struct cds_ft_node **) head_slot, node);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
-			 * If the unchain emptied the external chain and the
-			 * node now has exactly one child + no external,
-			 * canonicalize via chain-compress to restore the
-			 * SKIP_COMPRESSED invariant (no non-root 1-child
-			 * internal without external).
+			 * Unchaining replaced cn->child with the next entry, but
+			 * the grandparent's skip-compressed slot still encodes the
+			 * OLD head, which the caller is about to call_rcu-free.  A
+			 * candidate descent or ft_skip_reanchor up-walk following
+			 * the stale skip pointer would dereference the freed node
+			 * (the dangling-skip-slot UAF).  Re-encode the grandparent
+			 * slot (recovered from cn's parent-slot offset) to the new
+			 * cn->child; ordered before the caller's free.
+			 * ft_update_skip_pointer no-ops when the slot holds a plain
+			 * (non-skip) compressed pointer.
 			 */
-			if (ft_group_skip_compressed(ft->group) &&
-			    !metadata->external_nodes &&
-			    metadata->nr_child == 1 &&
-			    metadata->parent != NULL) {
-				ft_canonicalize_chain_compress(ft, dd.d.nf,
-					metadata, dd.d.nfp);
-			}
+			ft_update_skip_pointer(ft_get_parent_slot(holder_meta, ft),
+				cn);
 #endif
 			ret = 0;
-		} else {
-			dbg_printf("cds_ft_remove: no metadata external node found for key\n");
-			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-			return CDS_FT_STATUS_NOT_FOUND;
 		}
-	} else {
-		/* Found external node at end of key. */
-
+	} else if (ft_node_external_nodes(holder_flag) ==
+			(struct cds_ft_node *) node) {
 		/*
-		 * Find our node in the duplicate chain and count
-		 * total entries to decide detach vs unchain.
+		 * Internal holder whose external_nodes chain head is @node:
+		 * prefix key (the key terminates at an internal node that also
+		 * has longer-key children).  The holder stays; unlink @node from
+		 * its external_nodes chain.  Propagate -1 only when @node is the
+		 * last entry (the chain becomes empty).
 		 */
-		iter_node = (struct cds_ft_node *) ft_node_ptr(dd.d.nf);
-		count = 0;
-		match = NULL;
-		cds_ft_for_each_duplicate(iter_node) {
-			count++;
-			dbg_printf("cds_ft_remove: compare %p with iter_node %p\n", node, iter_node);
-			if (!match && iter_node == node)
-				match = iter_node;
+		holder_meta = cds_ft_item_to_metadata(ft_node_ptr(holder_flag));
+		if (!ft_node_next(node))
+			ft_propagate_external_count_parent(ft, holder_flag, -1);
+		ft_unchain_node((struct cds_ft_node **) &holder_meta->external_nodes,
+			node);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		/*
+		 * If the unchain emptied the external chain and the holder now
+		 * has exactly one child + no external, canonicalize via
+		 * chain-compress to restore the SKIP_COMPRESSED invariant (no
+		 * non-root 1-child internal without external).  The holder's own
+		 * slot in its parent is recovered from its metadata offset.
+		 */
+		if (ft_group_skip_compressed(ft->group) &&
+		    !holder_meta->external_nodes &&
+		    holder_meta->nr_child == 1 &&
+		    holder_meta->parent != NULL) {
+			ft_canonicalize_chain_compress(ft, holder_flag,
+				holder_meta, ft_get_parent_slot(holder_meta, ft));
 		}
-		if (!match) {
-			dbg_printf("cds_ft_remove: no node match for node %p key\n", node);
+#endif
+		ret = 0;
+	} else {
+		/*
+		 * Internal holder, @node is a body child: leaf key.  Recover the
+		 * holder's body slot for @node from the key's last byte.
+		 */
+		struct cds_ft_inode_flag *child;
+
+		holder_meta = cds_ft_item_to_metadata(ft_node_ptr(holder_flag));
+		child = ft_node_get_nth_skip(holder_flag, &head_slot,
+			iter_key[key_len - 1], FT_PF_NONE);
+		if (!child ||
+		    (struct cds_ft_node *) ft_node_ptr(child) != node) {
+			dbg_printf("cds_ft_remove: node %p not at key slot\n", node);
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
-		assert(count > 0);
-		if (count == 1) {
+		if (!ft_node_next(node)) {
 			/*
-			 * Removing last of duplicates. Last snapshot
-			 * does not have metadata (external leafs).
-			 *
-			 * Propagate -1 before detach, which may free
-			 * internal nodes in the snapshot.
+			 * Last/only entry: prune the now-empty branch.
+			 * Propagate -1 before detach, which may free internal nodes.
 			 */
-			ft_propagate_external_count_parent(ft, dd.d.pnf, -1);
-			ret = ft_detach_node(ft,
-					dd.det_nfp,
-					dd.det_pfp,
-					dd.det_depth,
-					true);
-			if (ret) {
-				/* Undo propagation on failure. */
-				ft_propagate_external_count_parent(ft, dd.d.pnf, 1);
-			} else {
-				/* match (the sole duplicate) has left the trie. */
-				ft_node_mark_removed(match);
-			}
+			ft_propagate_external_count_parent(ft, holder_flag, -1);
+			ret = ft_detach_node(ft, head_slot,
+				ft_get_parent_slot(holder_meta, ft),
+				key_len, true);
+			if (ret)
+				ft_propagate_external_count_parent(ft, holder_flag, 1);
+			else
+				ft_node_mark_removed(node);
 		} else {
-			/* Removing duplicate, not last: key count unchanged. */
-			ft_unchain_node((struct cds_ft_node **) dd.d.nfp, match);
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-			/*
-			 * If the duplicate chain hung directly off a compressed
-			 * node (dd.d.nfp == &cn->child), unchaining the head
-			 * replaced cn->child with the next chain entry -- but the
-			 * grandparent's skip-compressed slot still encodes the
-			 * OLD head, which the caller is about to call_rcu-free.
-			 * A candidate descent or ft_skip_reanchor up-walk that
-			 * follows the stale skip pointer would then dereference
-			 * the freed node (the dangling-skip-slot UAF).  Re-encode
-			 * the slot to the new cn->child; this is ordered before
-			 * the caller's free, as required.
-			 *
-			 * dd.d.pnfp is the exact slot traversed during this
-			 * descent (the skip pointer resolved at the top of the
-			 * loop), so the refresh does not depend on cn's
-			 * parent_slot_offset bookkeeping.  ft_update_skip_pointer
-			 * no-ops when the slot holds a plain (non-skip)
-			 * compressed pointer, which references cn itself rather
-			 * than its child and so never dangles.
-			 */
-			if (ft_node_compressed(dd.d.pnf))
-				ft_update_skip_pointer(dd.d.pnfp,
-					ft_compressed_node_ptr(dd.d.pnf));
-#endif
+			/* Removing the head, duplicates remain: key count unchanged. */
+			ft_unchain_node((struct cds_ft_node **) head_slot, node);
 			ret = 0;
 		}
 	}
