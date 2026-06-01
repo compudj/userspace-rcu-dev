@@ -193,22 +193,22 @@ struct cds_ft_type {
  * Layout naming: scan_<root_bits>_<sub_bm_bits>(_max_<N>).  The
  * trailing _max_<N> appears only on the generic-2L variants
  * (scan_16_16_*) where the ptr offset depends on the static
- * sub_bm[] tail length (max_lc).  The flat-layout scanners
+ * sub_bm[] tail length (max_child).  The flat-layout scanners
  * (scan_32_8 with 5+3 byte split and u8 nibbles; scan_64_4 with
  * 6+2 byte split and u4 nibbles) pack root_bm + packed_bms into a
  * fixed 12 B or 16 B header, so the ptr offset is constant (+16
- * after alignment) and one function serves multiple max_lc values.
+ * after alignment) and one function serves multiple max_child values.
  *
- * 32-bit max_lc tuning: the flat scanners (scan_32_8, scan_64_4)
- * are layout-only -- headers do not grow with max_lc and packed_bms
+ * 32-bit max_child tuning: the flat scanners (scan_32_8, scan_64_4)
+ * are layout-only -- headers do not grow with max_child and packed_bms
  * supports up to 64 distinct (hi, lo) pairs.  On 32-bit ptrs,
- * scan_64_4 hosts max_lc=12 in 64 B and max_lc=16 in 128 B (the
+ * scan_64_4 hosts max_child=12 in 64 B and max_child=16 in 128 B (the
  * latter is bitmap-bound; trailing 48 B is layout slack).  The
  * layout helpers (header_bytes, get_nr_child, get_ith_pos,
- * set_nth) accept all canonical max_lc values; the dispatcher
- * routes by max_lc.
+ * set_nth) accept all canonical max_child values; the dispatcher
+ * routes by max_child.
  *
- * scan_16_16_max_3 stays at max_lc=3 on both arches: the 8 B header
+ * scan_16_16_max_3 stays at max_child=3 on both arches: the 8 B header
  * packs root_bm + 3 sub_bm exactly and cannot grow without changing
  * the load shape.  scan_16_16_max_5 (32-bit only) extends the same
  * generic 2L layout with two extra sub_bm slots so the 12 B header
@@ -225,7 +225,7 @@ enum {
 	 *   idx 1  scan_64_4         64 B  hdr 16 B + 12 x 4 B = 64 B exact
 	 *                            (flat 6+2; node-size cap 12, bitmap cap 16)
 	 *   idx 2  popcount_1l      128 B  hdr 32 B + 24 x 4 B = 128 B exact
-	 *                            (was scan_64_4 max_lc=16 with 48 B slack;
+	 *                            (was scan_64_4 max_child=16 with 48 B slack;
 	 *                            popcount_1l unlocks the full pointer table)
 	 *   idx 3  popcount_1l      256 B  hdr 32 B + 56 x 4 B = 256 B exact
 	 *   idx 4  popcount_1l      512 B  hdr 32 B + 120 x 4 B = 512 B exact
@@ -305,8 +305,8 @@ const struct cds_ft_type ft_types[] = {
 /* 64-bit pointers */
 enum {
 	ft_type_0_max_child = 3,
-	ft_type_1_max_child = 6,	/* scan_32_8 (per-slot 5+3, qp_6) */
-	ft_type_2_max_child = 14,	/* scan_64_4 (flat 6+2, qp_14) */
+	ft_type_1_max_child = 6,	/* scan_32_8 (per-slot 5+3) */
+	ft_type_2_max_child = 14,	/* scan_64_4 (flat 6+2) */
 	ft_type_3_max_child = 28,
 	ft_type_4_max_child = 60,
 	ft_type_5_max_child = 124,
@@ -315,11 +315,11 @@ enum {
 };
 
 /*
- * scan_32_8 (per-slot 5+3 byte split, max_lc=6): 12-byte popcount
+ * scan_32_8 (per-slot 5+3 byte split, max_child=6): 12-byte popcount
  * header (4B root + 8B packed sub_bms) + 6 x 8-byte pointers into
  * the 64B order-6 node.
  *
- * scan_64_4 (flat 6+2 byte split, max_lc=14): 16-byte popcount
+ * scan_64_4 (flat 6+2 byte split, max_child=14): 16-byte popcount
  * header (8B root + 8B packed_bms with 14 x 4-bit sub_bms =
  * 56 bits used) + 14 x 8-byte pointers into the 128B order-7
  * node (16 + 14 * 8 = 128 exactly).
@@ -3248,7 +3248,7 @@ void ft_popcount_node_get_ith_pos(const struct cds_ft_type *type,
 /*
  * Generic 2-level popcount-bitmap node header (4+4 byte split).
  *
- * Used by the scan_16_16_max_<N> family (max_lc=3 and max_lc=5).
+ * Used by the scan_16_16_max_<N> family (max_child=3 and max_child=5).
  * Other 2L variants use flat layouts and access node->data
  * directly without this struct (scan_32_8 / scan_64_4).
  *
@@ -3274,7 +3274,7 @@ void ft_popcount_node_get_ith_pos(const struct cds_ft_type *type,
  * to first-to-last byte order on little-endian and last-to-first on
  * big-endian, so the writer flips the in-memory offsets accordingly
  * (see ft_popcount_2l_root_bm_addr / ft_popcount_2l_sub_bm_addr).
- * max_lc=5 uses per-u16 reads (scan_16_16_max_5) and keeps the
+ * max_child=5 uses per-u16 reads (scan_16_16_max_5) and keeps the
  * canonical "root_bm at offset 0, sub_bm[k] at 2+2k" layout on both
  * arches.
  *
@@ -3291,7 +3291,7 @@ struct ft_popcount_2l_header {
 /*
  * Endian-aware addressing of the root_bm and sub_bm[k] u16 slots in
  * a 2-level popcount header.  See the layout comment above for why
- * max_lc=3 reverses on big-endian.
+ * max_child=3 reverses on big-endian.
  */
 static inline_lookup
 uint16_t *ft_popcount_2l_root_bm_addr(struct cds_ft_inode *node,
@@ -3340,11 +3340,11 @@ struct cds_ft_inode_flag **ft_popcount_2l_pointers(
 
 	/*
 	 * Flat scan_32_8 (12 B hdr + 4 B pad) and scan_64_4 (16 B hdr)
-	 * scanners hardcode the ptr table at node+16.  max_lc=12 and 16
+	 * scanners hardcode the ptr table at node+16.  max_child=12 and 16
 	 * reuse the scan_64_4 layout on 32-bit -- the 16-slot bitmap
 	 * caps the safe distinct-hi count at 16 (cf. scan_32_8's 8-slot
 	 * cap, which is too tight for 12+ children in the worst case).
-	 * max_lc=16 lives in a 128 B order-7 node with 48 B trailing
+	 * max_child=16 lives in a 128 B order-7 node with 48 B trailing
 	 * slack; the bitmap cap is binding, not the node size.
 	 */
 	if (max_lc == 6 || max_lc == 12 || max_lc == 14 || max_lc == 16)
@@ -3426,8 +3426,8 @@ not_found:
  * loop of 0..4 iterations over sub_bm[0..slot1-1]; the compiler can
  * predict / unroll given the bounded count.
  *
- * Trade-off vs scan_16_16_max_3 (max_lc=3): one variable-length
- * prefix loop in exchange for max_lc 3 -> 5 (recovers the 12 B of
+ * Trade-off vs scan_16_16_max_3 (max_child=3): one variable-length
+ * prefix loop in exchange for max_child 3 -> 5 (recovers the 12 B of
  * trailing waste per 32 B node).
  */
 static inline_lookup
@@ -3481,8 +3481,8 @@ not_found:
  *   [12..15] padding
  *   [16..63] 6 x cds_ft_inode_flag *
  *
- * The byte split is 5-bit hi + 3-bit lo (departs from the QP 4+4
- * convention to fit all sub_bms in one u64).  packed_bms is a flat
+ * The byte split is 5-bit hi + 3-bit lo (departs from the quadbit-popcount
+ * (QP) 4+4 convention to fit all sub_bms in one u64).  packed_bms is a flat
  * 64-bit view: bit at position (slot1*8 + lo) is set iff (hi, lo)
  * is a populated child.  The single packed bitmap collapses prior
  * + chunk-select + sub_bm popcount into one popcount(bms & mask).
@@ -3493,7 +3493,7 @@ not_found:
  *   ptr_idx = popcount(bms & ((1<<p)-1))
  *
  * No chunk-select cmov, no per-slot prior cache: a single packed
- * bitmap suffices because max_lc=6 fits in 48 bits (well within u64).
+ * bitmap suffices because max_child=6 fits in 48 bits (well within u64).
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_popcount_2l_scan_32_8(
@@ -3783,7 +3783,7 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 
 /*
  * Insert (n, child_node_flag) into a freshly-allocated, unpublished
- * QP node.  Called only from the recompact path: the new node is
+ * popcount_2l node.  Called only from the recompact path: the new node is
  * not yet wired into the trie, so direct in-place mutation (shifts
  * of sub_bm[] and pointers[]) is race-free.
  *
@@ -4372,26 +4372,26 @@ ft_check_popcount_1l_idx_assumptions(void)
  * layout.
  *
  * 64-bit type-index -> scanner:
- *   0:  popcount_2l_scan_16_16_max_3 (32 B,  max_lc=3)
- *   1:  popcount_2l_scan_32_8        (64 B,  max_lc=6)
- *   2:  popcount_2l_scan_64_4        (128 B, max_lc=14)
- *   3:  popcount_1l_scan_28          (256 B, max_lc=28)
- *   4:  popcount_1l_scan_28          (512 B, max_lc=60)
- *   5:  popcount_1l_scan_28         (1024 B, max_lc=124)
+ *   0:  popcount_2l_scan_16_16_max_3 (32 B,  max_child=3)
+ *   1:  popcount_2l_scan_32_8        (64 B,  max_child=6)
+ *   2:  popcount_2l_scan_64_4        (128 B, max_child=14)
+ *   3:  popcount_1l_scan_28          (256 B, max_child=28)
+ *   4:  popcount_1l_scan_28          (512 B, max_child=60)
+ *   5:  popcount_1l_scan_28         (1024 B, max_child=124)
  *   6:  pigeon                      (2048 B)
  *
  * 32-bit type-index -> scanner:
- *   0:  popcount_2l_scan_16_16_max_5 (32 B,  max_lc=5)
- *   1:  popcount_2l_scan_64_4        (64 B,  max_lc=12)
- *   2:  popcount_1l_scan_28          (128 B, max_lc=24)
- *   3:  popcount_1l_scan_28          (256 B, max_lc=56)
- *   4:  popcount_1l_scan_28          (512 B, max_lc=120)
+ *   0:  popcount_2l_scan_16_16_max_5 (32 B,  max_child=5)
+ *   1:  popcount_2l_scan_64_4        (64 B,  max_child=12)
+ *   2:  popcount_1l_scan_28          (128 B, max_child=24)
+ *   3:  popcount_1l_scan_28          (256 B, max_child=56)
+ *   4:  popcount_1l_scan_28          (512 B, max_child=120)
  *   5:  pigeon                      (1024 B)
  *
  * The popcount scanners are pure integer math (popcount + bitmap
  * indexing); no SSE / SIMD dependency.  The hot caa_likely branch
  * targets the most-frequent type observed across the comprehensive
- * benchmark (popcount_2l max_lc=3 on 64-bit: ~46% of dispatches).
+ * benchmark (popcount_2l max_child=3 on 64-bit: ~46% of dispatches).
  */
 
 /*
@@ -4886,7 +4886,7 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 		ft_set_parent_raw(child_node_flag, node_flag);
 
 	if (type->popcount_2l && type->max_child == 6) {
-		/* Flat 5+3 layout (max_lc=6 on 64-bit). */
+		/* Flat 5+3 layout (max_child=6 on 64-bit). */
 		struct cds_ft_inode_flag **qp_pointers =
 			ft_popcount_2l_pointers(node, type);
 		unsigned int qp_hi = (unsigned int) n >> 3;
@@ -4987,7 +4987,7 @@ int ft_popcount_node_set_nth(const struct cds_ft_type *type,
 	if (type->popcount_2l && (type->max_child == 12
 				|| type->max_child == 14
 				|| type->max_child == 16)) {
-		/* Flat 6+2 layout (max_lc=14 on 64-bit, 12/16 on 32-bit). */
+		/* Flat 6+2 layout (max_child=14 on 64-bit, 12/16 on 32-bit). */
 		struct cds_ft_inode_flag **qp_pointers =
 			ft_popcount_2l_pointers(node, type);
 		unsigned int qp_hi = (unsigned int) n >> 2;
