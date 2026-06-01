@@ -11621,23 +11621,18 @@ int ft_detach_node(struct cds_ft *ft,
 			 * previous level), which becomes detach_node_flag_ptr.
 			 */
 			{
-				struct cds_ft_inode_flag **new_parent_flag_ptr;
-
-				if (is_root)
-					new_parent_flag_ptr = &ft->root;
-				else if (ft_node_compressed(parent_nf) ||
-					 ft_node_skip_compressed(parent_nf)) {
-					struct cds_ft_compressed_node *pcn;
-
-					if (ft_node_skip_compressed(parent_nf))
-						pcn = ft_skip_to_compressed(parent_nf);
-					else
-						pcn = ft_compressed_node_ptr(parent_nf);
-					new_parent_flag_ptr = &pcn->child;
-				} else {
-					ft_node_find_child(parent_nf, cur, NULL,
-						&new_parent_flag_ptr);
-				}
+				/*
+				 * The slot in cur's parent (parent_nf) that holds
+				 * cur is recovered in O(1) from cur's own metadata
+				 * parent-slot offset (maintained for every
+				 * internal/compressed node), instead of a
+				 * pointer-match scan of parent_nf's children.
+				 * ft_get_parent_slot handles all parent kinds: root
+				 * (parent == NULL) -> &ft->root, compressed parent ->
+				 * &pcn->child, plain internal -> the body slot.
+				 */
+				struct cds_ft_inode_flag **new_parent_flag_ptr =
+					ft_get_parent_slot(metadata, ft);
 				/*
 				 * If the resolved grandparent slot is the
 				 * same as the current detach_parent_flag_ptr,
