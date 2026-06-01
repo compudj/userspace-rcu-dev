@@ -515,8 +515,8 @@ struct cds_ft_iter {
 	size_t key_len;			/* Key length of the current node. */
 	size_t prefix_len;		/* Key prefix length. */
 	enum cds_ft_status status;	/* Iteration status. */
-	enum cds_ft_iter_path_mode path_mode;	/* Path caching mode. */
-	bool path_valid;		/* Whether this iterator has a valid path. */
+	enum cds_ft_iter_path_mode path_mode;	/* Position-reuse mode (CACHED/UNCACHED). */
+	bool path_valid;		/* Whether the cached position is valid. */
 
 #ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
 	struct urcu_gp_poll_state gp_state;	/* GP snapshot when path was populated. */
@@ -655,7 +655,7 @@ void iter_debug_path_clear(struct cds_ft_iter *iter __attribute__((unused)))
 #endif
 
 /*
- * Discard the cached path if the iterator is in uncached mode.
+ * Discard the cached position if the iterator is in uncached mode.
  * Called at the end of each public iterator-based operation.
  * Preserves iter->node so the caller can read the result.
  */
@@ -7903,8 +7903,8 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	}
 
 	/*
-	 * Fast path: reuse the iterator's cached path from a prior
-	 * traversal when it is still valid and covers the full key
+	 * Fast path: reuse the iterator's cached position from a prior
+	 * lookup when it is still valid and covers the full key
 	 * depth.  This avoids redundant per-level ft_node_get_nth()
 	 * lookups (which are the expensive, cache-miss-prone part of
 	 * the downward walk).  The caller must hold the RCU read-side

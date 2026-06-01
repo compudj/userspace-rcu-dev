@@ -210,29 +210,31 @@
  *
  * CDS_FT_ITER_PATH_CACHED (default):
  *
- * The iterator caches the traversal path (RCU protected pointers) to
+ * The iterator reuses its current position (the result node) to
  * accelerate subsequent sequential operations like cds_ft_next(),
- * cds_ft_prev(), or cds_ft_remove().
+ * cds_ft_prev(), or cds_ft_remove(): they continue from it by
+ * backtracking up the live parent chain rather than re-descending
+ * from the root.
  *
- * Because of this caching, the RCU read-side lock must be held
- * CONTINUOUSLY between the operation that populates the iterator
- * (e.g., cds_ft_lookup) and the operation that consumes it. If the
- * RCU read-side lock is dropped, the cached path may point to freed
- * memory.
+ * Because the position is an RCU-protected pointer, the RCU read-side
+ * lock must be held CONTINUOUSLY between the operation that populates
+ * the iterator (e.g., cds_ft_lookup) and the operation that reuses it.
+ * If the RCU read-side lock is dropped, the cached position may
+ * reference memory reclaimed after a grace period.
  *
  * If you need to drop the RCU read-side lock between operations, you
- * MUST invalidate the iterator's cached path before reusing it. This
- * is done by calling:
+ * MUST invalidate the iterator's cached position before reusing it.
+ * This is done by calling:
  * - cds_ft_iter_invalidate_path()
  *
- * Calling this function clears the internal path state while keeping
- * your key intact. The next operation (e.g., cds_ft_remove) will
+ * Calling this function clears the cached position while keeping your
+ * key intact. The next operation (e.g., cds_ft_remove) will
  * automatically fall back to a safe, fresh top-down traversal.
  *
  * Example A (Continuous Lock - Fast):
  * rcu_read_lock();
  * cds_ft_lookup(ft, iter);
- * cds_ft_remove(ft, iter, node); // Uses cached path O(1)
+ * cds_ft_remove(ft, iter, node); // Reuses cached position
  * rcu_read_unlock();
  *
  * Example B (Dropped Lock - CDS_FT_ITER_PATH_CACHED only):
@@ -247,26 +249,26 @@
  * unlock(&writer_mutex);
  *
  * Note: CDS_FT_ITER_PATH_UNCACHED iterators do not require
- * cds_ft_iter_invalidate_path() — the path is discarded
+ * cds_ft_iter_invalidate_path() — the cached position is discarded
  * automatically after each operation.
  *
  * Debug validation (URCU_FRACTAL_TRIE_DEBUG_PATH):
  *
  * Building with URCU_FRACTAL_TRIE_DEBUG_PATH defined enables run-time
- * detection of stale cached paths.  Each path population records an RCU
- * grace-period snapshot (via the flavor's
- * update_start_poll_synchronize_rcu); each path consumption polls it
- * (via update_poll_state_synchronize_rcu).  If a full grace period has
- * elapsed since the path was populated, the cached pointers may
+ * detection of stale cached positions.  Each position population records
+ * an RCU grace-period snapshot (via the flavor's
+ * update_start_poll_synchronize_rcu); each reuse polls it (via
+ * update_poll_state_synchronize_rcu).  If a full grace period has
+ * elapsed since the position was populated, the cached pointer may
  * reference freed memory — the program aborts with a diagnostic.
  * Since struct cds_ft_iter is opaque, this option does not affect the
  * application ABI — only the library needs to be rebuilt.
  *
  * CDS_FT_ITER_PATH_UNCACHED:
  *
- * The iterator automatically discards the traversal path after each
- * operation returns. Every subsequent operation performs a fresh
- * top-down traversal from the current key. The RCU read-side lock
+ * The iterator discards its cached position after each operation
+ * returns. Every subsequent operation performs a fresh top-down
+ * traversal from the root for the current key. The RCU read-side lock
  * only needs to be held during each individual operation and while
  * accessing the returned node — it may be dropped between operations.
  *
@@ -441,25 +443,27 @@ enum cds_ft_numa_policy {
 /*
  * Iterator path mode.
  *
- * Controls whether the iterator retains or discards its internal
- * traversal path between operations.
+ * Controls whether the iterator reuses its cached position across
+ * operations or re-descends from the root each time.
  */
 enum cds_ft_iter_path_mode {
 	/*
 	 * CDS_FT_ITER_PATH_CACHED (default):
-	 *   The iterator retains the traversal path between operations,
-	 *   allowing O(1) next/prev/remove from the current position.
-	 *   The RCU read-side lock must be held CONTINUOUSLY between
-	 *   the operation that populates the iterator and any operation
-	 *   that consumes the path.
+	 *   The iterator reuses its current position between operations,
+	 *   letting next/prev/remove continue from it by backtracking up
+	 *   the live parent chain instead of descending from the root.
+	 *   The RCU read-side lock must be held CONTINUOUSLY between the
+	 *   operation that populates the iterator and any operation that
+	 *   reuses its position; otherwise the position may reference
+	 *   memory reclaimed after a grace period.
 	 */
 	CDS_FT_ITER_PATH_CACHED = 0,
 
 	/*
 	 * CDS_FT_ITER_PATH_UNCACHED:
-	 *   The iterator automatically discards the traversal path
-	 *   after each operation returns. Every subsequent operation
-	 *   performs a fresh top-down traversal from the current key.
+	 *   The iterator discards its cached position after each
+	 *   operation returns. Every subsequent operation performs a
+	 *   fresh top-down traversal from the root for the current key.
 	 *   The RCU read-side lock must be held only during each
 	 *   individual operation and while accessing the returned
 	 *   node — it may be dropped between operations.
@@ -1086,10 +1090,11 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * operations (cds_ft_lookup_first, cds_ft_next) and while accessing
  * the returned node. For CDS_FT_ITER_PATH_CACHED iterators, this
  * means the RCU read-side critical section must span the entire
- * loop, since the cached path references internal nodes that could
- * be reclaimed after a grace period. For CDS_FT_ITER_PATH_UNCACHED
- * iterators, the lock may be dropped and reacquired within the loop
- * body, because the path is discarded after each operation:
+ * loop, since the cached position references internal nodes that
+ * could be reclaimed after a grace period. For
+ * CDS_FT_ITER_PATH_UNCACHED iterators, the lock may be dropped and
+ * reacquired within the loop body, because the cached position is
+ * discarded after each operation:
  *
  *   cds_ft_iter_set_path_mode(iter, CDS_FT_ITER_PATH_UNCACHED);
  *   rcu_read_lock();
@@ -2357,9 +2362,9 @@ void cds_ft_iter_destroy(struct cds_ft_iter *iter);
  * @mode: Path mode to set.
  *
  * Switching from CDS_FT_ITER_PATH_CACHED to CDS_FT_ITER_PATH_UNCACHED
- * immediately invalidates any cached path (equivalent to calling
+ * immediately invalidates any cached position (equivalent to calling
  * cds_ft_iter_invalidate_path()). Switching from UNCACHED to CACHED
- * is always safe since there is no stale path.
+ * is always safe since there is no stale position.
  *
  * May be called at any point in the iterator's lifetime.
  *
@@ -2447,21 +2452,21 @@ enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t p
 void cds_ft_iter_reset(struct cds_ft_iter *iter);
 
 /*
- * cds_ft_iter_invalidate_path - Invalidate the iterator's cached path.
+ * cds_ft_iter_invalidate_path - Invalidate the iterator's cached position.
  * @iter: The iterator.
  *
- * Invalidates the RCU-protected traversal path cached in the iterator.
+ * Invalidates the RCU-protected position cached in the iterator.
  * The next operation on this iterator will be forced to perform a
  * fresh top-down traversal using the current key. The key and prefix
  * length are preserved.
  *
  * For CDS_FT_ITER_PATH_CACHED iterators, this function must be called
  * if the RCU read-side lock is dropped between operations on the same
- * iterator, to prevent use-after-free of the cached pointers.
+ * iterator, to prevent use-after-free of the cached position.
  *
  * CDS_FT_ITER_PATH_UNCACHED iterators do not require this call — the
- * path is discarded automatically after each operation. Calling it on
- * an uncached iterator is harmless but unnecessary.
+ * cached position is discarded automatically after each operation.
+ * Calling it on an uncached iterator is harmless but unnecessary.
  */
 void cds_ft_iter_invalidate_path(struct cds_ft_iter *iter);
 
