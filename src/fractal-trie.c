@@ -456,12 +456,61 @@ void static_array_size_check(void)
 }
 
 /*
+ * Writer-side helpers for the cds_ft_node.next removal tombstone (low
+ * bit, see CDS_FT_NODE_REMOVED_FLAG).  These run under the writer mutex
+ * (or RCU read lock on the chain-walk side), so a plain masked load is
+ * sufficient; readers use cds_ft_node_next_rcu() instead.
+ *
+ *   ft_node_next        masked successor (the actual chain link)
+ *   ft_node_is_removed  has @node been removed from the trie?
+ *   ft_node_mark_removed set the tombstone, preserving the successor
+ *                        pointer (relaxed store; readers mask the bit
+ *                        and the pointer value is unchanged).
+ */
+static inline
+struct cds_ft_node *ft_node_next(const struct cds_ft_node *node)
+{
+	return (struct cds_ft_node *) ((uintptr_t) node->next &
+			~CDS_FT_NODE_REMOVED_FLAG);
+}
+
+static inline
+bool ft_node_is_removed(const struct cds_ft_node *node)
+{
+	return ((uintptr_t) node->next & CDS_FT_NODE_REMOVED_FLAG) != 0;
+}
+
+static inline
+void ft_node_mark_removed(struct cds_ft_node *node)
+{
+	CMM_STORE_SHARED(node->next, (struct cds_ft_node *)
+			((uintptr_t) node->next | CDS_FT_NODE_REMOVED_FLAG));
+}
+
+/*
+ * Mark every node in a duplicate chain as removed (used by
+ * cds_ft_remove_all, which detaches a whole chain at once).  The
+ * successor pointers stay intact so the caller can still traverse the
+ * returned chain to reclaim it.
+ */
+static inline
+void ft_chain_mark_removed(struct cds_ft_node *head)
+{
+	while (head) {
+		struct cds_ft_node *next = ft_node_next(head);
+
+		ft_node_mark_removed(head);
+		head = next;
+	}
+}
+
+/*
  * Iterate through duplicates returned by cds_ft_lookup*()
  * Receives a struct cds_ft_node * as parameter, which is used as start
- * of duplicate list and loop cursor.
+ * of duplicate list and loop cursor.  Masks the removal tombstone.
  */
 #define cds_ft_for_each_duplicate(pos)				\
-       for (; (pos) != NULL; (pos) = (pos)->next)
+       for (; (pos) != NULL; (pos) = ft_node_next(pos))
 
 enum ft_recompact {
 	FT_RECOMPACT_ADD_SAME,
@@ -10489,8 +10538,8 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 			 */
 			struct cds_ft_node *last = jct_meta->external_nodes;
 
-			while (last->next)
-				last = last->next;
+			while (ft_node_next(last))
+				last = ft_node_next(last);
 			ft_chain_node(last, node);
 			/* Skip ft_propagate_external_count_parent below:
 			 * duplicate at existing key, no new unique key. */
@@ -10611,7 +10660,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	}
 	iter_key = key;
 	/* Expect zeroed prev/next pointers. This catches some double-insert misuses. */
-	if (node->prev || node->next)
+	if (node->prev || ft_node_next(node))
 		return -EINVAL;
 
 	key_depth = key_len + 1;
@@ -10881,7 +10930,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		key = ordinal_buf;
 	}
 	/* Expect zeroed prev/next pointers. */
-	if (node->prev || node->next)
+	if (node->prev || ft_node_next(node))
 		return -EINVAL;
 
 	key_depth = key_len + 1;
@@ -11080,7 +11129,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		return s;
 	}
 	/* Expect zeroed next and prev pointers on new_node. */
-	if (new_node->next || new_node->prev) {
+	if (ft_node_next(new_node) || new_node->prev) {
 		s = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 		FT_TP(replace_exit, (int) s);
 		return s;
@@ -11193,7 +11242,7 @@ find_and_replace:
 	 * publishes new_node.
 	 */
 	new_node->prev = old_node->prev;
-	new_node->next = old_node->next;
+	new_node->next = ft_node_next(old_node);
 	if (new_node->next)
 		new_node->next->prev = new_node;
 	if (ft_node_external((struct cds_ft_inode_flag *) old_node->prev)) {
@@ -11205,6 +11254,13 @@ find_and_replace:
 		/* Head: update the head slot. */
 		rcu_assign_pointer(*head_slot, new_node);
 	}
+
+	/*
+	 * old_node has left the trie (replaced by new_node): tombstone it.
+	 * Its next pointer is preserved so a concurrent reader positioned on
+	 * old_node still follows the chain.
+	 */
+	ft_node_mark_removed(old_node);
 
 	/*
 	 * The trie structure is unchanged (no recompaction), so the
@@ -11974,7 +12030,7 @@ static
 void ft_unchain_node(struct cds_ft_node **head_slot,
 		struct cds_ft_node *node)
 {
-	struct cds_ft_node *next_node = node->next;
+	struct cds_ft_node *next_node = ft_node_next(node);
 
 	FT_TP(unchain_node, (const void *) head_slot, (const void *) node,
 		!ft_node_external((struct cds_ft_inode_flag *) node->prev));
@@ -11989,6 +12045,13 @@ void ft_unchain_node(struct cds_ft_node **head_slot,
 		/* Head: prev is parent (flagged internal node pointer). */
 		rcu_assign_pointer(*head_slot, next_node);
 	}
+	/*
+	 * @node has left the trie: tombstone it.  Its next pointer is
+	 * preserved (still == next_node) so a concurrent reader positioned
+	 * on @node still follows the chain; the bit only marks removal for a
+	 * later position-based remove.
+	 */
+	ft_node_mark_removed(node);
 }
 
 /*
@@ -12172,7 +12235,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * nr_keys before detaching the pointer).
 			 */
 			if (!ft_node_external((struct cds_ft_inode_flag *) match->prev)
-			    && !match->next) {
+			    && !ft_node_next(match)) {
 				ft_propagate_external_count_parent(ft, dd.d.nf, -1);
 			}
 			ft_unchain_node((struct cds_ft_node **) &metadata->external_nodes, match);
@@ -12237,6 +12300,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			if (ret) {
 				/* Undo propagation on failure. */
 				ft_propagate_external_count_parent(ft, dd.d.pnf, 1);
+			} else {
+				/* match (the sole duplicate) has left the trie. */
+				ft_node_mark_removed(match);
 			}
 		} else {
 			/* Removing duplicate, not last: key count unchanged. */
@@ -12339,6 +12405,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_nr_keys_store(metadata, ft_nr_keys_get(metadata) - 1,
 			CMM_RELEASE);
 		rcu_assign_pointer(metadata->external_nodes, NULL);
+		/* The whole chain has left the trie: tombstone every node. */
+		ft_chain_mark_removed(external_nodes);
 		return CDS_FT_STATUS_OK;
 	}
 
@@ -12420,6 +12488,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		*result_node = external_nodes;
 		ft_propagate_external_count_parent(ft, dd.d.nf, -1);
 		rcu_assign_pointer(metadata->external_nodes, NULL);
+		/* The whole chain has left the trie: tombstone every node. */
+		ft_chain_mark_removed(external_nodes);
 		ret = 0;
 
 		/*
@@ -12474,6 +12544,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		if (ret) {
 			/* Undo propagation on failure. */
 			ft_propagate_external_count_parent(ft, dd.d.pnf, 1);
+		} else {
+			/* The whole chain has left the trie: tombstone it. */
+			ft_chain_mark_removed(*result_node);
 		}
 	}
 
@@ -13211,8 +13284,8 @@ void ft_graft_glue_apply_splices(struct ft_graft_glue *g)
 		struct cds_ft_node *src_head = g->splices[i].src_head;
 		struct cds_ft_node *tail = dst_head;
 
-		while (tail->next)
-			tail = tail->next;
+		while (ft_node_next(tail))
+			tail = ft_node_next(tail);
 		src_head->prev = tail;	/* write-side only, plain store */
 		rcu_assign_pointer(tail->next, src_head);
 	}
@@ -19155,7 +19228,7 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 		(void) path;
 		(void) group;
 		prev = node;
-		node = node->next;
+		node = ft_node_next(node);
 	}
 	return 0;
 }

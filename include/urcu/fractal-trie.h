@@ -537,6 +537,29 @@ struct cds_ft_node {
 	struct cds_ft_node *next;
 };
 
+/*
+ * Library-internal: the low bit of cds_ft_node.next is a removal
+ * tombstone.  The mutation side sets it when the node leaves the trie
+ * (so a position-based remove can detect an already-removed node in
+ * O(1) without re-descending), and every chain traversal masks it off.
+ * Node pointers are at least 2-byte aligned, so bit 0 is always free.
+ *
+ * Applications MUST walk duplicate chains through the
+ * cds_ft_for_each_duplicate*() macros (which mask the bit) and treat a
+ * removed node as opaque until re-initialized with cds_ft_node_init().
+ */
+#define CDS_FT_NODE_REMOVED_FLAG	1UL
+
+/*
+ * Masked rcu_dereference of a duplicate's successor.  A macro (not an
+ * inline) so rcu_dereference resolves at the caller's translation unit,
+ * matching the cds_ft_for_each_duplicate*() macros — this header does
+ * not itself pull in the URCU flavor primitives.
+ */
+#define cds_ft_node_next_rcu(node)					\
+	((struct cds_ft_node *) ((uintptr_t) rcu_dereference((node)->next) \
+		& ~CDS_FT_NODE_REMOVED_FLAG))
+
 #define cds_ft_entry(ptr, type, member)		caa_container_of(ptr, type, member)
 
 /*
@@ -2892,7 +2915,7 @@ const char *cds_ft_status_to_string(enum cds_ft_status status);
  * _NOT_ safe against node removal within iteration.
  */
 #define cds_ft_for_each_duplicate_rcu(pos)				\
-	for (; (pos) != NULL; (pos) = rcu_dereference((pos)->next))
+	for (; (pos) != NULL; (pos) = cds_ft_node_next_rcu(pos))
 
 /*
  * cds_ft_for_each_duplicate_entry_rcu - Iterate through duplicate entries.
@@ -2912,7 +2935,7 @@ const char *cds_ft_status_to_string(enum cds_ft_status status);
 	for (; (node) != NULL ?						\
 			((pos) = cds_ft_entry(node,			\
 				__typeof__(*(pos)), member), 1) : 0;	\
-			(node) = rcu_dereference((node)->next))
+			(node) = cds_ft_node_next_rcu(node))
 
 /*
  * cds_ft_for_each_duplicate_safe_rcu - Iterate through duplicates.
@@ -2925,7 +2948,7 @@ const char *cds_ft_status_to_string(enum cds_ft_status status);
  */
 #define cds_ft_for_each_duplicate_safe_rcu(pos, p)			\
 	for (; (pos) != NULL ?						\
-			((p) = rcu_dereference((pos)->next), 1) : 0;	\
+			((p) = cds_ft_node_next_rcu(pos), 1) : 0;	\
 			(pos) = (p))
 
 /*
@@ -2947,7 +2970,7 @@ const char *cds_ft_status_to_string(enum cds_ft_status status);
 	for (; (node) != NULL ?						\
 			((pos) = cds_ft_entry(node,			\
 				__typeof__(*(pos)), member),		\
-			(p) = rcu_dereference((node)->next), 1) : 0;	\
+			(p) = cds_ft_node_next_rcu(node), 1) : 0;	\
 			(node) = (p))
 
 #ifdef __cplusplus
