@@ -8264,285 +8264,287 @@ going_up:
 	 * possibly-NULL node-at-level.  It is read only inside the LE/LT block
 	 * below, which the first iteration (going_up == false) skips.
 	 */
-	struct cds_ft_inode_flag *up_parent;
-	ssize_t up_parent_lo;
-	bool up_first = true;
+	{	/* Scope the going-up cursor locals so they fall out of scope before descend_children/end (avoids -Wjump-misses-init false positives). */
+		struct cds_ft_inode_flag *up_parent;
+		ssize_t up_parent_lo;
+		bool up_first = true;
 
-	/*
-	 * Climb @up_node (the deepest live node descent established) up to
-	 * the node covering the going-up @level: the loop @level may have
-	 * been knocked back one by the end-of-key adjustment, and a
-	 * compressed run spans several levels.  @up_node then is node-at-level
-	 * (read by the LE/LT block, carried by the loop).
-	 */
-	while (level < up_node_lo) {
-		struct cds_ft_inode_flag *gp = ft_get_parent_rcu(up_node);
-
-		up_node_lo -= (gp && ft_node_compressed(gp)) ?
-			(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
-		up_node = gp;
-	}
-	/*
-	 * Derive @up_parent = node at @level-1 (the dispatcher scanned for a
-	 * sibling).  If @up_node already covers @level-1 it IS the dispatcher
-	 * -- a compressed run (no within-span sibling, skipped by the
-	 * !ft_node_internal test below) or a dead-end whose dispatcher we
-	 * never descended past.  Otherwise it is @up_node's parent, one depth
-	 * shallower (parenthood is by slot).
-	 */
-	if (up_node_lo <= level - 1) {
-		up_parent = up_node;
-		up_parent_lo = up_node_lo;
-	} else {
-		up_parent = ft_get_parent_rcu(up_node);
-		up_parent_lo = (up_parent && ft_node_compressed(up_parent)) ?
-			level - (ssize_t) ft_compressed_node_ptr(up_parent)->len :
-			level - 1;
-	}
-	for (; level > (ssize_t) iter->prefix_len; level--) {
-		uint8_t key_value;
-
-		ft_delay_reader();
-		if (!up_first) {
-			/*
-			 * Climbed one level (level-- since last iter): the old
-			 * dispatcher becomes the new node-at-level, and the new
-			 * dispatcher is its parent once we cross below its span.
-			 */
-			up_node = up_parent;
-			if (level - 1 < up_parent_lo) {
-				struct cds_ft_inode_flag *gp =
-					ft_get_parent_rcu(up_parent);
-
-				up_parent_lo -= (gp && ft_node_compressed(gp)) ?
-					(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
-				up_parent = gp;
-			}
-		}
-		up_first = false;
 		/*
-		 * Return external node if trying to find LE/LT
-		 * inequality and encountering an external node when
-		 * going upward.
+		 * Climb @up_node (the deepest live node descent established) up to
+		 * the node covering the going-up @level: the loop @level may have
+		 * been knocked back one by the end-of-key adjustment, and a
+		 * compressed run spans several levels.  @up_node then is node-at-level
+		 * (read by the LE/LT block, carried by the loop).
 		 */
-		if (going_up && dir == FT_LEFT &&
-		    !ft_node_external(up_node)) {
-			struct cds_ft_metadata *metadata;
+		while (level < up_node_lo) {
+			struct cds_ft_inode_flag *gp = ft_get_parent_rcu(up_node);
 
-			if (ft_node_compressed(up_node))
-				metadata = cds_ft_item_to_metadata(
-					ft_node_ptr(up_node));
-			else {
-				const struct cds_ft_type *type = &ft_types[ft_node_type(up_node)];
-				metadata = cds_ft_item_to_metadata_fast(
-					ft_node_ptr(up_node),
-					type->order);
-			}
-			{
-			struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
-
-			if (external_nodes) {
-				int j;
-
-				assert(level <= (int) ft->group->max_key_len);
-				iter->key_len = level;
-				for (j = 0; j < level; j++)
-					iter_key(iter)[j] = ordinal_key[j];
-				iter->node = external_nodes;
-				iter->path_valid = true;
-				iter_debug_path_update(iter);
-				iter->path_len = level + 1;
-				iter->status = CDS_FT_STATUS_OK;
-				goto end;
-			}
-			}
-		}
-
-		switch (limit) {
-		case FT_LOOKUP_LIMIT_NONE:
-			key_value = *(--iter_key);
-			break;
-		case FT_LOOKUP_LIMIT_FIRST:
-			key_value = input_key[level - 1];
-			break;
-		case FT_LOOKUP_LIMIT_LAST:
-			if ((size_t) level <= iter->prefix_len)
-				key_value = input_key[level - 1];
-			else
-				key_value = 0xff;
-			break;
+			up_node_lo -= (gp && ft_node_compressed(gp)) ?
+				(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
+			up_node = gp;
 		}
 		/*
-		 * Standard sibling lookup. Parent is level - 1. We are
-		 * looking for sibling of the byte at ordinal_key[level - 1].
-		 * Skip levels where the path entry is not an internal node
-		 * (compressed or external entries from compressed path
-		 * traversal have no siblings).
+		 * Derive @up_parent = node at @level-1 (the dispatcher scanned for a
+		 * sibling).  If @up_node already covers @level-1 it IS the dispatcher
+		 * -- a compressed run (no within-span sibling, skipped by the
+		 * !ft_node_internal test below) or a dead-end whose dispatcher we
+		 * never descended past.  Otherwise it is @up_node's parent, one depth
+		 * shallower (parenthood is by slot).
 		 */
-		if (!ft_node_internal(up_parent)) {
-			FT_TP(ineq_going_up_step, level,
-				(const void *) up_parent,
-				0, (uint8_t) key_value);
-			going_up = true;
-			continue;
+		if (up_node_lo <= level - 1) {
+			up_parent = up_node;
+			up_parent_lo = up_node_lo;
+		} else {
+			up_parent = ft_get_parent_rcu(up_node);
+			up_parent_lo = (up_parent && ft_node_compressed(up_parent)) ?
+				level - (ssize_t) ft_compressed_node_ptr(up_parent)->len :
+				level - 1;
 		}
-		node_flag = ft_node_get_leftright(up_parent,
-				key_value, &ordinal_key[level - 1], dir,
-				true /* validate_lookup */);
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-		/*
-		 * Skip-validate failure: the parent we scanned for a sibling
-		 * (iter_path[level-1]) was recompacted away while the sibling's skip
-		 * child was reparented by a concurrent split/merge.  Re-anchor that
-		 * parent on the live structure via the child's parent chain and
-		 * re-scan it (the single skip concurrency mechanism), rather than spin.
-		 * @rewind > 0 (merge) means the parent merged shallower: drop @level
-		 * and recompute the dispatch byte at the new level.  ft_skip_reanchor
-		 * never returns NULL on a well-formed trie (the writer wires every
-		 * fresh cluster's parent before the cluster becomes reachable).
-		 */
-		while (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
-			unsigned int rewind;
-			struct cds_ft_inode_flag *at_pos;
-			struct cds_ft_inode_flag *anchor =
-				ft_skip_reanchor(node_flag, &rewind, &at_pos);
+		for (; level > (ssize_t) iter->prefix_len; level--) {
+			uint8_t key_value;
 
-			assert(anchor != NULL);
-			if (caa_likely(rewind == 0)) {
+			ft_delay_reader();
+			if (!up_first) {
 				/*
-				 * Surgical: @at_pos is the live resolved sibling at
-				 * this depth that re-scanning @anchor for the
-				 * unchanged dispatch byte ordinal_key[level - 1] would
-				 * find -- the sibling byte was already recorded by the
-				 * ft_node_get_leftright above, so use @at_pos directly
-				 * instead of re-scanning.  Keep the path's parent entry
-				 * live.
+				 * Climbed one level (level-- since last iter): the old
+				 * dispatcher becomes the new node-at-level, and the new
+				 * dispatcher is its parent once we cross below its span.
 				 */
-				node_flag = at_pos;
-				break;
+				up_node = up_parent;
+				if (level - 1 < up_parent_lo) {
+					struct cds_ft_inode_flag *gp =
+						ft_get_parent_rcu(up_parent);
+
+					up_parent_lo -= (gp && ft_node_compressed(gp)) ?
+						(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
+					up_parent = gp;
+				}
 			}
+			up_first = false;
 			/*
-			 * @rewind > 0 (merge): the parent merged shallower; drop
-			 * @level and re-scan the live parent at the new level.
+			 * Return external node if trying to find LE/LT
+			 * inequality and encountering an external node when
+			 * going upward.
 			 */
-			level -= (ssize_t) rewind;
-			/*
-			 * P1b: the merge rewound @level and re-anchored the live
-			 * holder at the new level-1.  Re-sync the parent cursor to
-			 * @anchor (an internal node, span 1).  If the re-scan below
-			 * finds no sibling, the for-loop's level-- then carries
-			 * up_node = anchor = node at the new level, keeping the walk
-			 * consistent with the rewound descent position.
-			 */
-			up_parent = anchor;
-			up_parent_lo = level - 1;
+			if (going_up && dir == FT_LEFT &&
+			    !ft_node_external(up_node)) {
+				struct cds_ft_metadata *metadata;
+
+				if (ft_node_compressed(up_node))
+					metadata = cds_ft_item_to_metadata(
+						ft_node_ptr(up_node));
+				else {
+					const struct cds_ft_type *type = &ft_types[ft_node_type(up_node)];
+					metadata = cds_ft_item_to_metadata_fast(
+						ft_node_ptr(up_node),
+						type->order);
+				}
+				{
+				struct cds_ft_node *external_nodes = ft_dereference_prefetch_external(metadata->external_nodes);
+
+				if (external_nodes) {
+					int j;
+
+					assert(level <= (int) ft->group->max_key_len);
+					iter->key_len = level;
+					for (j = 0; j < level; j++)
+						iter_key(iter)[j] = ordinal_key[j];
+					iter->node = external_nodes;
+					iter->path_valid = true;
+					iter_debug_path_update(iter);
+					iter->path_len = level + 1;
+					iter->status = CDS_FT_STATUS_OK;
+					goto end;
+				}
+				}
+			}
+
 			switch (limit) {
 			case FT_LOOKUP_LIMIT_NONE:
-				key_value = ordinal_key[level - 1];
+				key_value = *(--iter_key);
 				break;
 			case FT_LOOKUP_LIMIT_FIRST:
 				key_value = input_key[level - 1];
 				break;
 			case FT_LOOKUP_LIMIT_LAST:
-				key_value = ((size_t) level <= iter->prefix_len) ?
-					input_key[level - 1] : (uint8_t) 0xff;
+				if ((size_t) level <= iter->prefix_len)
+					key_value = input_key[level - 1];
+				else
+					key_value = 0xff;
 				break;
 			}
-			node_flag = ft_node_get_leftright(anchor, key_value,
-					&ordinal_key[level - 1], dir,
-					true /* validate_lookup */);
-		}
-#endif
-		dbg_printf("cds_ft_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
-				(unsigned int) key_value, (unsigned int) ordinal_key[level - 1],
-				node_flag);
-		/* If found left/right sibling, find rightmost/leftmost child. */
-		if (node_flag) {
-			/* Record the sibling in the path. */
 			/*
-			 * Seed the cursor at the found sibling (depth @level, its
-			 * shallow boundary) before descend_children -> minmax, so a
-			 * transiently-empty first minmax step re-enters going-up
-			 * with the cursor live.
+			 * Standard sibling lookup. Parent is level - 1. We are
+			 * looking for sibling of the byte at ordinal_key[level - 1].
+			 * Skip levels where the path entry is not an internal node
+			 * (compressed or external entries from compressed path
+			 * traversal have no siblings).
 			 */
-			up_node = node_flag;
-			up_node_lo = level;
+			if (!ft_node_internal(up_parent)) {
+				FT_TP(ineq_going_up_step, level,
+					(const void *) up_parent,
+					0, (uint8_t) key_value);
+				going_up = true;
+				continue;
+			}
+			node_flag = ft_node_get_leftright(up_parent,
+					key_value, &ordinal_key[level - 1], dir,
+					true /* validate_lookup */);
+	#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * Skip-validate failure: the parent we scanned for a sibling
+			 * (iter_path[level-1]) was recompacted away while the sibling's skip
+			 * child was reparented by a concurrent split/merge.  Re-anchor that
+			 * parent on the live structure via the child's parent chain and
+			 * re-scan it (the single skip concurrency mechanism), rather than spin.
+			 * @rewind > 0 (merge) means the parent merged shallower: drop @level
+			 * and recompute the dispatch byte at the new level.  ft_skip_reanchor
+			 * never returns NULL on a well-formed trie (the writer wires every
+			 * fresh cluster's parent before the cluster becomes reachable).
+			 */
+			while (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
+				unsigned int rewind;
+				struct cds_ft_inode_flag *at_pos;
+				struct cds_ft_inode_flag *anchor =
+					ft_skip_reanchor(node_flag, &rewind, &at_pos);
+
+				assert(anchor != NULL);
+				if (caa_likely(rewind == 0)) {
+					/*
+					 * Surgical: @at_pos is the live resolved sibling at
+					 * this depth that re-scanning @anchor for the
+					 * unchanged dispatch byte ordinal_key[level - 1] would
+					 * find -- the sibling byte was already recorded by the
+					 * ft_node_get_leftright above, so use @at_pos directly
+					 * instead of re-scanning.  Keep the path's parent entry
+					 * live.
+					 */
+					node_flag = at_pos;
+					break;
+				}
+				/*
+				 * @rewind > 0 (merge): the parent merged shallower; drop
+				 * @level and re-scan the live parent at the new level.
+				 */
+				level -= (ssize_t) rewind;
+				/*
+				 * P1b: the merge rewound @level and re-anchored the live
+				 * holder at the new level-1.  Re-sync the parent cursor to
+				 * @anchor (an internal node, span 1).  If the re-scan below
+				 * finds no sibling, the for-loop's level-- then carries
+				 * up_node = anchor = node at the new level, keeping the walk
+				 * consistent with the rewound descent position.
+				 */
+				up_parent = anchor;
+				up_parent_lo = level - 1;
+				switch (limit) {
+				case FT_LOOKUP_LIMIT_NONE:
+					key_value = ordinal_key[level - 1];
+					break;
+				case FT_LOOKUP_LIMIT_FIRST:
+					key_value = input_key[level - 1];
+					break;
+				case FT_LOOKUP_LIMIT_LAST:
+					key_value = ((size_t) level <= iter->prefix_len) ?
+						input_key[level - 1] : (uint8_t) 0xff;
+					break;
+				}
+				node_flag = ft_node_get_leftright(anchor, key_value,
+						&ordinal_key[level - 1], dir,
+						true /* validate_lookup */);
+			}
+	#endif
+			dbg_printf("cds_ft_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
+					(unsigned int) key_value, (unsigned int) ordinal_key[level - 1],
+					node_flag);
+			/* If found left/right sibling, find rightmost/leftmost child. */
+			if (node_flag) {
+				/* Record the sibling in the path. */
+				/*
+				 * Seed the cursor at the found sibling (depth @level, its
+				 * shallow boundary) before descend_children -> minmax, so a
+				 * transiently-empty first minmax step re-enters going-up
+				 * with the cursor live.
+				 */
+				up_node = node_flag;
+				up_node_lo = level;
+				FT_TP(ineq_going_up_step, level,
+					(const void *) up_parent,
+					1, ordinal_key[level - 1]);
+				break;
+			}
 			FT_TP(ineq_going_up_step, level,
 				(const void *) up_parent,
-				1, ordinal_key[level - 1]);
-			break;
+				0, (uint8_t) key_value);
+			going_up = true;
 		}
-		FT_TP(ineq_going_up_step, level,
-			(const void *) up_parent,
-			0, (uint8_t) key_value);
-		going_up = true;
-	}
 
-	/*
-	 * Prefix-scoped traversal: if backtracking exhausted the
-	 * scope without finding a sibling, handle the prefix
-	 * boundary.
-	 *
-	 * For LE/LT the prefix key itself (shorter than the search
-	 * key) may be the closest match: return its external_nodes
-	 * if present.
-	 *
-	 * For GE/GT no key within the scope satisfies the inequality.
-	 *
-	 * When going_up is false (e.g. LIMIT_FIRST/LIMIT_LAST
-	 * reaching the prefix node without backtracking), we fall
-	 * through to the downward min/max search below.
-	 */
-	if (going_up && level == (ssize_t) iter->prefix_len) {
-		if (dir == FT_LEFT) {
-			/*
-			 * Node at prefix_len is the going-up cursor's @up_parent.
-			 * This block is reached only via normal loop exit (no
-			 * sibling found while backtracking down to prefix_len),
-			 * whose last iteration ran at level == prefix_len + 1 with
-			 * the P1a invariant up_parent == node at level - 1 ==
-			 * node at prefix_len.  Live read, replacing the descent-
-			 * stack read iter_path[prefix_len].
-			 */
-			struct cds_ft_inode_flag *pfx_flag = up_parent;
+		/*
+		 * Prefix-scoped traversal: if backtracking exhausted the
+		 * scope without finding a sibling, handle the prefix
+		 * boundary.
+		 *
+		 * For LE/LT the prefix key itself (shorter than the search
+		 * key) may be the closest match: return its external_nodes
+		 * if present.
+		 *
+		 * For GE/GT no key within the scope satisfies the inequality.
+		 *
+		 * When going_up is false (e.g. LIMIT_FIRST/LIMIT_LAST
+		 * reaching the prefix node without backtracking), we fall
+		 * through to the downward min/max search below.
+		 */
+		if (going_up && level == (ssize_t) iter->prefix_len) {
+			if (dir == FT_LEFT) {
+				/*
+				 * Node at prefix_len is the going-up cursor's @up_parent.
+				 * This block is reached only via normal loop exit (no
+				 * sibling found while backtracking down to prefix_len),
+				 * whose last iteration ran at level == prefix_len + 1 with
+				 * the P1a invariant up_parent == node at level - 1 ==
+				 * node at prefix_len.  Live read, replacing the descent-
+				 * stack read iter_path[prefix_len].
+				 */
+				struct cds_ft_inode_flag *pfx_flag = up_parent;
 
-			if (!ft_node_external(pfx_flag)) {
-				struct cds_ft_metadata *metadata;
+				if (!ft_node_external(pfx_flag)) {
+					struct cds_ft_metadata *metadata;
 
-				if (ft_node_compressed(pfx_flag))
-					metadata = cds_ft_item_to_metadata(
-						ft_node_ptr(pfx_flag));
-				else {
-					const struct cds_ft_type *type =
-						&ft_types[ft_node_type(pfx_flag)];
-					metadata = cds_ft_item_to_metadata_fast(
-						ft_node_ptr(pfx_flag),
-						type->order);
-				}
-				struct cds_ft_node *external_nodes =
-					ft_dereference_prefetch_external(metadata->external_nodes);
+					if (ft_node_compressed(pfx_flag))
+						metadata = cds_ft_item_to_metadata(
+							ft_node_ptr(pfx_flag));
+					else {
+						const struct cds_ft_type *type =
+							&ft_types[ft_node_type(pfx_flag)];
+						metadata = cds_ft_item_to_metadata_fast(
+							ft_node_ptr(pfx_flag),
+							type->order);
+					}
+					struct cds_ft_node *external_nodes =
+						ft_dereference_prefetch_external(metadata->external_nodes);
 
-				if (external_nodes) {
-					int j;
+					if (external_nodes) {
+						int j;
 
-					iter->key_len = iter->prefix_len;
-					for (j = 0; j < (int) iter->prefix_len; j++)
-						iter_key(iter)[j] = ordinal_key[j];
-					iter->node = external_nodes;
-					iter->path_valid = true;
-					iter_debug_path_update(iter);
-					iter->path_len = iter->prefix_len + 1;
-					iter->status = CDS_FT_STATUS_OK;
-					goto end;
+						iter->key_len = iter->prefix_len;
+						for (j = 0; j < (int) iter->prefix_len; j++)
+							iter_key(iter)[j] = ordinal_key[j];
+						iter->node = external_nodes;
+						iter->path_valid = true;
+						iter_debug_path_update(iter);
+						iter->path_len = iter->prefix_len + 1;
+						iter->status = CDS_FT_STATUS_OK;
+						goto end;
+					}
 				}
 			}
+			iter->node = NULL;
+			iter->path_valid = true;
+			iter_debug_path_update(iter);
+			iter->path_len = iter->prefix_len + 1;
+			iter->status = CDS_FT_STATUS_NOT_FOUND;
+			goto end;
 		}
-		iter->node = NULL;
-		iter->path_valid = true;
-		iter_debug_path_update(iter);
-		iter->path_len = iter->prefix_len + 1;
-		iter->status = CDS_FT_STATUS_NOT_FOUND;
-		goto end;
 	}
 
 descend_children:
@@ -17628,75 +17630,77 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 * shallow boundary is @level), replacing the descent-stack read
 	 * iter_path[level] + dense-fill.
 	 */
-	struct cds_ft_inode_flag *up_node = deepest;
-	ssize_t up_node_lo = level;
-	for (level--; level >= 0; level--) {
-		struct cds_ft_inode_flag *ancestor;
-		struct cds_ft_inode_flag *child;
-		uint8_t child_key = 0;
-		int pivot;
+	{	/* Scope the going-up cursor locals so they are out of scope at not_found/descend_* (avoids -Wjump-misses-init false positives). */
+		struct cds_ft_inode_flag *up_node = deepest;
+		ssize_t up_node_lo = level;
+		for (level--; level >= 0; level--) {
+			struct cds_ft_inode_flag *ancestor;
+			struct cds_ft_inode_flag *child;
+			uint8_t child_key = 0;
+			int pivot;
 
-		while (level < up_node_lo) {
-			struct cds_ft_inode_flag *gp = ft_get_parent_rcu(up_node);
+			while (level < up_node_lo) {
+				struct cds_ft_inode_flag *gp = ft_get_parent_rcu(up_node);
 
-			up_node_lo -= (gp && ft_node_compressed(gp)) ?
-				(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
-			up_node = gp;
-		}
-		ancestor = up_node;
-		if (ft_node_external(ancestor))
-			continue;
-		/*
-		 * Compressed path levels have no siblings: skip.
-		 */
-		if (ft_node_compressed(ancestor))
-			continue;
-
-		pivot = ordinal_key[level];
-		child = ft_node_get_direction(ancestor, pivot,
-				&child_key, FT_RIGHT, true);
-		while (child) {
-			unsigned long ck;
-
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-			/*
-			 * Surgical re-anchor: @ancestor has siblings to scan, so it is
-			 * multi-child and cannot merge — rewind is 0.  @at_pos is the
-			 * live resolved sibling at @child_key; use it directly.
-			 * ft_skip_reanchor never returns NULL on a well-formed trie.
-			 */
-			if (caa_unlikely(ft_node_skip_compressed(child))) {
-				unsigned int rewind;
-				struct cds_ft_inode_flag *at_pos;
-				struct cds_ft_inode_flag *anchor =
-					ft_skip_reanchor(child, &rewind, &at_pos);
-
-				assert(anchor != NULL);
-				assert(rewind == 0);
-				ancestor = anchor;
-				up_node = anchor;	/* live holder at @level (internal, span 1) */
-				up_node_lo = level;
-				child = at_pos;
+				up_node_lo -= (gp && ft_node_compressed(gp)) ?
+					(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
+				up_node = gp;
+			}
+			ancestor = up_node;
+			if (ft_node_external(ancestor))
 				continue;
-			}
-#endif
-			ck = ft_child_key_count(child);
-			if (remaining <= ck) {
-				remaining--;  /* enter this subtree (1-indexed within) */
-				ordinal_key[level] = child_key;
-				level = level + 1;
-				descend_from = child;
-				goto descend_forward;
-			}
-			remaining -= ck;
-			pivot = child_key;
+			/*
+			 * Compressed path levels have no siblings: skip.
+			 */
+			if (ft_node_compressed(ancestor))
+				continue;
+
+			pivot = ordinal_key[level];
 			child = ft_node_get_direction(ancestor, pivot,
 					&child_key, FT_RIGHT, true);
+			while (child) {
+				unsigned long ck;
+
+	#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Surgical re-anchor: @ancestor has siblings to scan, so it is
+				 * multi-child and cannot merge — rewind is 0.  @at_pos is the
+				 * live resolved sibling at @child_key; use it directly.
+				 * ft_skip_reanchor never returns NULL on a well-formed trie.
+				 */
+				if (caa_unlikely(ft_node_skip_compressed(child))) {
+					unsigned int rewind;
+					struct cds_ft_inode_flag *at_pos;
+					struct cds_ft_inode_flag *anchor =
+						ft_skip_reanchor(child, &rewind, &at_pos);
+
+					assert(anchor != NULL);
+					assert(rewind == 0);
+					ancestor = anchor;
+					up_node = anchor;	/* live holder at @level (internal, span 1) */
+					up_node_lo = level;
+					child = at_pos;
+					continue;
+				}
+	#endif
+				ck = ft_child_key_count(child);
+				if (remaining <= ck) {
+					remaining--;  /* enter this subtree (1-indexed within) */
+					ordinal_key[level] = child_key;
+					level = level + 1;
+					descend_from = child;
+					goto descend_forward;
+				}
+				remaining -= ck;
+				pivot = child_key;
+				child = ft_node_get_direction(ancestor, pivot,
+						&child_key, FT_RIGHT, true);
+			}
+			/*
+			 * No external_nodes to count going up in forward direction
+			 * (they sort before children, so they're behind us).
+			 */
 		}
-		/*
-		 * No external_nodes to count going up in forward direction
-		 * (they sort before children, so they're behind us).
-		 */
 	}
 
 	/* Exhausted the trie. */
@@ -18015,167 +18019,169 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	 * placed there as a child so its shallow boundary is @level),
 	 * replacing the descent-stack read iter_path[level] + dense-fill.
 	 */
-	struct cds_ft_inode_flag *up_node = deepest;
-	ssize_t up_node_lo = level;
-	for (level--; level >= 0; level--) {
-		struct cds_ft_inode_flag *ancestor;
-		struct cds_ft_inode_flag *child;
-		struct cds_ft_metadata *ameta;
-		uint8_t child_key = 0;
-		unsigned long left_keys = 0;
-		int pivot;
+	{	/* Scope the going-up cursor locals so they are out of scope at not_found/descend_* (avoids -Wjump-misses-init false positives). */
+		struct cds_ft_inode_flag *up_node = deepest;
+		ssize_t up_node_lo = level;
+		for (level--; level >= 0; level--) {
+			struct cds_ft_inode_flag *ancestor;
+			struct cds_ft_inode_flag *child;
+			struct cds_ft_metadata *ameta;
+			uint8_t child_key = 0;
+			unsigned long left_keys = 0;
+			int pivot;
 
-		while (level < up_node_lo) {
-			struct cds_ft_inode_flag *gp = ft_get_parent_rcu(up_node);
+			while (level < up_node_lo) {
+				struct cds_ft_inode_flag *gp = ft_get_parent_rcu(up_node);
 
-			up_node_lo -= (gp && ft_node_compressed(gp)) ?
-				(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
-			up_node = gp;
-		}
-		ancestor = up_node;
-		if (ft_node_external(ancestor))
-			continue;
-		/*
-		 * Skip intermediate compressed path levels (same
-		 * compressed node at adjacent levels).  At the entry
-		 * level, only external_nodes matter (no siblings).
-		 */
-		if (ft_node_compressed(ancestor)) {
-			enum ft_descent_action act;
-			bool at_shallow_boundary;
-
-			/*
-			 * Process the compressed ancestor's external_nodes only
-			 * at its shallow boundary; skip the intermediate in-span
-			 * levels.  PP: the live cursor's shallow bound up_node_lo
-			 * equals level there.  Non-PP: the descent stack repeats
-			 * the same node at adjacent in-span levels.
-			 */
-			at_shallow_boundary = (level == 0) ||
-				(up_node_lo == level);
-			if (!at_shallow_boundary)
+				up_node_lo -= (gp && ft_node_compressed(gp)) ?
+					(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
+				up_node = gp;
+			}
+			ancestor = up_node;
+			if (ft_node_external(ancestor))
 				continue;
-			act = ft_skip_reverse_walk_up_compressed(ancestor,
-				level, &remaining, ordinal_key, iter);
-			if (act == FT_DESCENT_END)
-				goto end;
-			assert(act == FT_DESCENT_CONTINUE);
-			continue;
-		}
-
-		ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
-
-		/* Count leftward siblings. */
-		pivot = ordinal_key[level];
-		child = ft_node_get_direction(ancestor, pivot,
-				&child_key, FT_LEFT, true);
-		while (child) {
-#ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
-			 * Surgical re-anchor: @ancestor has siblings to count ->
-			 * multi-child, cannot merge -> rewind 0.  @at_pos is the live
-			 * resolved sibling at @child_key; use it directly.
-			 * ft_skip_reanchor never returns NULL on a well-formed trie.
+			 * Skip intermediate compressed path levels (same
+			 * compressed node at adjacent levels).  At the entry
+			 * level, only external_nodes matter (no siblings).
 			 */
-			if (caa_unlikely(ft_node_skip_compressed(child))) {
-				unsigned int rewind;
-				struct cds_ft_inode_flag *at_pos;
-				struct cds_ft_inode_flag *anchor =
-					ft_skip_reanchor(child, &rewind, &at_pos);
+			if (ft_node_compressed(ancestor)) {
+				enum ft_descent_action act;
+				bool at_shallow_boundary;
 
-				assert(anchor != NULL);
-				assert(rewind == 0);
-				ancestor = anchor;
-				up_node = anchor;
-				up_node_lo = level;
-				child = at_pos;
+				/*
+				 * Process the compressed ancestor's external_nodes only
+				 * at its shallow boundary; skip the intermediate in-span
+				 * levels.  PP: the live cursor's shallow bound up_node_lo
+				 * equals level there.  Non-PP: the descent stack repeats
+				 * the same node at adjacent in-span levels.
+				 */
+				at_shallow_boundary = (level == 0) ||
+					(up_node_lo == level);
+				if (!at_shallow_boundary)
+					continue;
+				act = ft_skip_reverse_walk_up_compressed(ancestor,
+					level, &remaining, ordinal_key, iter);
+				if (act == FT_DESCENT_END)
+					goto end;
+				assert(act == FT_DESCENT_CONTINUE);
 				continue;
 			}
-#endif
-			left_keys += ft_child_key_count(child);
-			pivot = child_key;
+
+			ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
+
+			/* Count leftward siblings. */
+			pivot = ordinal_key[level];
 			child = ft_node_get_direction(ancestor, pivot,
 					&child_key, FT_LEFT, true);
-		}
-
-		/* External_nodes at ancestor sort before all children. */
-		{
-			struct cds_ft_node *a_ext =
-				ft_dereference_acquire(ameta->external_nodes);
-
-			if (a_ext)
-				left_keys++;
-
-			if (remaining <= left_keys) {
+			while (child) {
+	#ifdef FEATURE_FT_SKIP_COMPRESSED
 				/*
-				 * Target is among the leftward siblings or
-				 * external_nodes.  Descend in reverse order:
-				 * iterate leftward siblings from the current
-				 * child in descending ordinal order, then
-				 * check external_nodes last.
+				 * Surgical re-anchor: @ancestor has siblings to count ->
+				 * multi-child, cannot merge -> rewind 0.  @at_pos is the live
+				 * resolved sibling at @child_key; use it directly.
+				 * ft_skip_reanchor never returns NULL on a well-formed trie.
 				 */
-				pivot = ordinal_key[level];
+				if (caa_unlikely(ft_node_skip_compressed(child))) {
+					unsigned int rewind;
+					struct cds_ft_inode_flag *at_pos;
+					struct cds_ft_inode_flag *anchor =
+						ft_skip_reanchor(child, &rewind, &at_pos);
+
+					assert(anchor != NULL);
+					assert(rewind == 0);
+					ancestor = anchor;
+					up_node = anchor;
+					up_node_lo = level;
+					child = at_pos;
+					continue;
+				}
+	#endif
+				left_keys += ft_child_key_count(child);
+				pivot = child_key;
 				child = ft_node_get_direction(ancestor, pivot,
 						&child_key, FT_LEFT, true);
-				while (child) {
-					unsigned long ck;
-
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-					/*
-					 * Surgical re-anchor: @ancestor is the multi-child node
-					 * whose leftward siblings we iterate -> cannot merge ->
-					 * rewind 0.  @at_pos is the live resolved sibling at
-					 * @child_key; use it directly.  ft_skip_reanchor never
-					 * returns NULL on a well-formed trie.
-					 */
-					if (caa_unlikely(ft_node_skip_compressed(child))) {
-						unsigned int rewind;
-						struct cds_ft_inode_flag *at_pos;
-						struct cds_ft_inode_flag *anchor =
-							ft_skip_reanchor(child, &rewind, &at_pos);
-
-						assert(anchor != NULL);
-						assert(rewind == 0);
-						ancestor = anchor;
-						up_node = anchor;
-						up_node_lo = level;
-						child = at_pos;
-						continue;
-					}
-#endif
-					ck = ft_child_key_count(child);
-					if (remaining <= ck) {
-						remaining--;
-						ordinal_key[level] = child_key;
-						level = level + 1;
-						descend_from = child;
-						goto descend_reverse;
-					}
-					remaining -= ck;
-					pivot = child_key;
-					child = ft_node_get_direction(
-							ancestor, pivot,
-							&child_key, FT_LEFT, true);
-				}
-
-				/* Must be the external_nodes. */
-				if (a_ext && remaining == 1) {
-					int j;
-
-					iter->key_len = level;
-					for (j = 0; j < level; j++)
-						iter_key(iter)[j] = ordinal_key[j];
-					iter->node = a_ext;
-				iter->path_valid = true;
-				iter_debug_path_update(iter);
-				iter->path_len = level + 1;
-				iter->status = CDS_FT_STATUS_OK;
-				goto end;
 			}
-			/* Shouldn't happen if left_keys was correct. */
-			goto not_found;
-		}
-		remaining -= left_keys;
+
+			/* External_nodes at ancestor sort before all children. */
+			{
+				struct cds_ft_node *a_ext =
+					ft_dereference_acquire(ameta->external_nodes);
+
+				if (a_ext)
+					left_keys++;
+
+				if (remaining <= left_keys) {
+					/*
+					 * Target is among the leftward siblings or
+					 * external_nodes.  Descend in reverse order:
+					 * iterate leftward siblings from the current
+					 * child in descending ordinal order, then
+					 * check external_nodes last.
+					 */
+					pivot = ordinal_key[level];
+					child = ft_node_get_direction(ancestor, pivot,
+							&child_key, FT_LEFT, true);
+					while (child) {
+						unsigned long ck;
+
+	#ifdef FEATURE_FT_SKIP_COMPRESSED
+						/*
+						 * Surgical re-anchor: @ancestor is the multi-child node
+						 * whose leftward siblings we iterate -> cannot merge ->
+						 * rewind 0.  @at_pos is the live resolved sibling at
+						 * @child_key; use it directly.  ft_skip_reanchor never
+						 * returns NULL on a well-formed trie.
+						 */
+						if (caa_unlikely(ft_node_skip_compressed(child))) {
+							unsigned int rewind;
+							struct cds_ft_inode_flag *at_pos;
+							struct cds_ft_inode_flag *anchor =
+								ft_skip_reanchor(child, &rewind, &at_pos);
+
+							assert(anchor != NULL);
+							assert(rewind == 0);
+							ancestor = anchor;
+							up_node = anchor;
+							up_node_lo = level;
+							child = at_pos;
+							continue;
+						}
+	#endif
+						ck = ft_child_key_count(child);
+						if (remaining <= ck) {
+							remaining--;
+							ordinal_key[level] = child_key;
+							level = level + 1;
+							descend_from = child;
+							goto descend_reverse;
+						}
+						remaining -= ck;
+						pivot = child_key;
+						child = ft_node_get_direction(
+								ancestor, pivot,
+								&child_key, FT_LEFT, true);
+					}
+
+					/* Must be the external_nodes. */
+					if (a_ext && remaining == 1) {
+						int j;
+
+						iter->key_len = level;
+						for (j = 0; j < level; j++)
+							iter_key(iter)[j] = ordinal_key[j];
+						iter->node = a_ext;
+					iter->path_valid = true;
+					iter_debug_path_update(iter);
+					iter->path_len = level + 1;
+					iter->status = CDS_FT_STATUS_OK;
+					goto end;
+				}
+				/* Shouldn't happen if left_keys was correct. */
+				goto not_found;
+			}
+			remaining -= left_keys;
+			}
 		}
 	}
 
