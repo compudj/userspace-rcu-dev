@@ -4112,9 +4112,17 @@ void ft_popcount_1l_node_get_ith_pos(const struct cds_ft_type *type,
 }
 
 /*
- * Walk all populated entries in byte order (which matches popcount
- * order, since the bitmap iterates low-to-high) to find the
- * leftmost (largest v < n) or rightmost (smallest v > n) match.
+ * Find the leftmost (largest v < n) or rightmost (smallest v > n)
+ * populated entry.
+ *
+ * Under FEATURE_USE_BITMAP_SCAN, scan the inline 256-bit occupancy
+ * bitmap for the nearest set bit toward @dir with cds_find_prev_bit /
+ * cds_find_next_bit (as ft_pigeon_node_get_direction does), then map
+ * that byte value to its compact pointer via ft_popcount_1l_scan_28.
+ * The bitmap is only a hint: a soft-deleted entry keeps its bit set but
+ * holds a NULL pointer, so on NULL continue the scan past that bit.
+ * This finds the answer in a handful of word scans instead of the
+ * O(nr_child) byte-order walk used by the #else fallback below.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_popcount_1l_node_get_direction(
@@ -4123,49 +4131,86 @@ struct cds_ft_inode_flag *ft_popcount_1l_node_get_direction(
 		int n, uint8_t *result_key,
 		enum ft_direction dir)
 {
-	uint8_t nr_child;
-	struct cds_ft_inode_flag *match_ptr = NULL;
-	int match_v;
-	unsigned int i;
-
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
-	nr_child = ft_popcount_1l_node_get_nr_child(type, node);
-	cmm_smp_rmb();
+#ifdef FEATURE_USE_BITMAP_SCAN
+	{
+		struct ft_popcount_1l_header *hdr =
+			(struct ft_popcount_1l_header *) &node->data[0];
+		unsigned long *bm = (unsigned long *) hdr->bm;
+		int i;
 
-	if (dir == FT_LEFT)
-		match_v = -1;
-	else
-		match_v = FT_ENTRY_PER_NODE;
+		(void) type;	/* inline bitmap: the vtable type arg is unused here */
+retry:
+		if (dir == FT_LEFT)
+			i = cds_find_prev_bit(bm, FT_ENTRY_PER_NODE, n - 1);
+		else
+			i = cds_find_next_bit(bm, FT_ENTRY_PER_NODE, n + 1);
+		if (i < 0)
+			return NULL;
+		{
+			struct cds_ft_inode_flag *ptr =
+				ft_popcount_1l_scan_28(node, NULL,
+					(uint8_t) i, FT_PF_NONE);
 
-	for (i = 0; i < nr_child; i++) {
-		struct cds_ft_inode_flag *ptr;
-		uint8_t v;
-
-		ft_popcount_1l_node_get_ith_pos(type, node, (uint8_t) i, &v, &ptr);
-		if (!ptr)
-			continue;
-		if (dir == FT_LEFT) {
-			if ((int) v < n && (int) v > match_v) {
-				match_v = v;
-				match_ptr = ptr;
-				if (match_v == n - 1)
-					break;
+			if (!ptr) {
+				/*
+				 * Soft-deleted: the bit is still set but the
+				 * pointer load (source of truth) is NULL.
+				 * Continue the bitmap scan past this bit.
+				 */
+				n = i;
+				goto retry;
 			}
-		} else {
-			if ((int) v > n && (int) v < match_v) {
-				match_v = v;
-				match_ptr = ptr;
-				if (match_v == n + 1)
-					break;
-			}
+			*result_key = (uint8_t) i;
+			return ptr;
 		}
 	}
-	if (!match_ptr)
-		return NULL;
-	assert(match_v >= 0 && match_v < FT_ENTRY_PER_NODE);
-	*result_key = (uint8_t) match_v;
-	return match_ptr;
+#else
+	{
+		uint8_t nr_child;
+		struct cds_ft_inode_flag *match_ptr = NULL;
+		int match_v;
+		unsigned int i;
+
+		nr_child = ft_popcount_1l_node_get_nr_child(type, node);
+		cmm_smp_rmb();
+
+		if (dir == FT_LEFT)
+			match_v = -1;
+		else
+			match_v = FT_ENTRY_PER_NODE;
+
+		for (i = 0; i < nr_child; i++) {
+			struct cds_ft_inode_flag *ptr;
+			uint8_t v;
+
+			ft_popcount_1l_node_get_ith_pos(type, node, (uint8_t) i, &v, &ptr);
+			if (!ptr)
+				continue;
+			if (dir == FT_LEFT) {
+				if ((int) v < n && (int) v > match_v) {
+					match_v = v;
+					match_ptr = ptr;
+					if (match_v == n - 1)
+						break;
+				}
+			} else {
+				if ((int) v > n && (int) v < match_v) {
+					match_v = v;
+					match_ptr = ptr;
+					if (match_v == n + 1)
+						break;
+				}
+			}
+		}
+		if (!match_ptr)
+			return NULL;
+		assert(match_v >= 0 && match_v < FT_ENTRY_PER_NODE);
+		*result_key = (uint8_t) match_v;
+		return match_ptr;
+	}
+#endif
 }
 
 /*
