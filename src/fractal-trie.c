@@ -19430,26 +19430,23 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 				cn->child);
 		return -1;
 	}
-#ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
-	 * Skip-slot offset round-trip.  Each compressed records a
-	 * pointer-stride offset from its parent to the slot that holds
-	 * the (skip-encoded) pointer to itself; ft_publish_to_parent
-	 * uses this to refresh the skip slot when cn->child is replaced.
-	 * Verify the offset still resolves to a slot whose contents
-	 * encode this very compressed (either skip-encoded or as a raw
-	 * compressed flag — both are valid publish states).  A stale
-	 * offset left after a recompact / graft would be the same bug
-	 * family as the recent parent_depth_span and double-wrap fixes;
-	 * surfacing it at the mutation that introduced it is much
-	 * cheaper than chasing a corrupted skip pointer at lookup time.
+	 * Parent-slot offset round-trip.  Each compressed node records a
+	 * pointer-stride offset from its parent to the slot that holds the
+	 * pointer to itself (skip-encoded under FEATURE_FT_SKIP_COMPRESSED,
+	 * a raw compressed flag otherwise).  ft_publish_to_parent uses it to
+	 * refresh the slot when cn->child is replaced, and the parent-pointer
+	 * backtrack (e.g. position-based remove) uses it to recover the slot.
+	 * Verify the offset still resolves to a slot whose contents encode
+	 * this very compressed.  A stale offset left after a recompact /
+	 * graft / relocate is surfaced at the mutation that introduced it
+	 * rather than as a corrupted slot at lookup / remove time.  Checked
+	 * on every build (the offset is no longer skip-specific).
 	 *
 	 * NULL slot means the offset was never set (offset == 0 with a
-	 * non-NULL parent — e.g. compressed reached only via a raw
-	 * compressed pointer that doesn't exercise the skip path).  No
-	 * round-trip to verify in that case.  ft_get_parent_slot wants a
-	 * non-const ft for the root case (parent == NULL); cast away
-	 * const since we only read *slot.
+	 * non-NULL parent).  No round-trip to verify in that case.
+	 * ft_get_parent_slot wants a non-const ft for the root case
+	 * (parent == NULL); cast away const since we only read *slot.
 	 */
 	{
 		struct cds_ft_inode_flag **skip_slot =
@@ -19473,7 +19470,6 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 			}
 		}
 	}
-#endif
 	/*
 	 * Path tracking: write the compressed key bytes into the path
 	 * buffer at positions [depth..depth+cn->len-1].  Subsequent
@@ -19967,9 +19963,15 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	cn2->child = cn->child;
 	memcpy(cn2->key_bytes, cn->key_bytes, len);
 	cn2_meta->parent = cn_meta->parent;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * The relocated compressed node keeps the SAME slot in the SAME
+	 * parent, so its parent-slot offset is identical.  Copy it on every
+	 * build: the offset is no longer skip-specific (it backs the
+	 * parent-pointer backtrack's O(1) slot recovery), and a position-
+	 * based remove that climbs via ft_get_parent_slot would otherwise
+	 * read a fresh-zeroed offset and resolve the wrong slot.
+	 */
 	cn2_meta->parent_slot_offset = cn_meta->parent_slot_offset;
-#endif
 	cn2_meta->nr_child = cn_meta->nr_child;		/* == 1 for a compressed node */
 	cn2_meta->external_nodes = NULL;		/* never set on a compressed node */
 	ft_nr_keys_store(cn2_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
