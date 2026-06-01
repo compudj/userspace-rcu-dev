@@ -6101,7 +6101,6 @@ static inline_lookup
 enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag_p,
 		const uint8_t **key_p, const uint8_t *key_end,
 		const uint8_t *key_safe_end,
-		struct cds_ft_inode_flag ***path_cur_pp,
 		bool track, bool track_longest,
 		const uint8_t **match_key_pos_p, struct cds_ft_node **match_node_p,
 		struct cds_ft_node **found_ret,
@@ -6110,7 +6109,6 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	const uint8_t *key = *key_p;
-	struct cds_ft_inode_flag **path_cur = *path_cur_pp;
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
 	int remaining_key = (int) (key_end - key);
 	int remaining_safe = (int) (key_safe_end - key);
@@ -6171,30 +6169,10 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 		return FT_DESCENT_END;
 	}
 
-	/*
-	 * Advance past the compressed path.  Caller passes @path_cur at
-	 * its iter-top value (no `i--` shift), so the per-byte fill is
-	 * path_cur[0..cn->len-1], the final child write lands on
-	 * path_cur[cn->len - 1] (overwriting the last fill slot — matches
-	 * the legacy i-based code's semantics), and we leave @path_cur
-	 * advanced by cn->len for the caller's next iter.
-	 */
+	/* Advance past the compressed path. */
 	key += cn->len;
-	if (path_cur) {
-		int k;
-
-		for (k = 0; k < cn->len; k++)
-			path_cur[k] =
-				(struct cds_ft_inode_flag *)
-				ft_compressed_node_flag(cn);
-	}
 	node_flag = ft_dereference_acquire_prefetch(cn->child);
 	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
-	if (path_cur) {
-		path_cur[cn->len - 1] = node_flag;
-		path_cur += cn->len;
-		*path_cur_pp = path_cur;
-	}
 
 	*node_flag_p = node_flag;
 	*key_p = key;
@@ -6337,40 +6315,19 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 
 	{
 	/*
-	 * Capture the path-node array base BEFORE spilling @iter so the
-	 * loop body and the inlined compressed-node handler can write
-	 * the per-step path entry through @path_nodes without rehydrating
-	 * @iter from its stack slot at every access.  NULL @iter yields a
-	 * NULL @path_nodes, and the path-write conditionals fold away at
-	 * compile time for callers without an iter (cds_ft_eager_lookup_key).
+	 * Whether this iter caches its position for continuation reuse
+	 * (CACHED mode under a continuously-held RCU read lock).  Captured
+	 * before spilling @iter so the terminal path_len computation need
+	 * not rehydrate @iter.  No path array is populated during descent:
+	 * the going-up backtrack recovers per-level nodes from the live
+	 * parent chain, and path_len is derived from the consumed key
+	 * length at the terminal.
 	 */
-	/*
-	 * Gate path tracking on CACHED mode: UNCACHED iters have their
-	 * path discarded by iter_auto_invalidate_path() in the epilogue,
-	 * so populating it byte-by-byte across the descent is pure
-	 * waste.  Set @path_nodes = NULL upfront and the existing
-	 * `if (path_nodes)` gates in the loop / compressed handler all
-	 * DCE.  Defensive: keeps the iter prologue snapshot intact for
-	 * callers that read iter->node etc. — they're independent of
-	 * the path array.
-	 */
-	struct cds_ft_inode_flag ** const path_nodes =
-		(iter && iter->path_mode == CDS_FT_ITER_PATH_CACHED) ?
-			iter_path_node(iter) : NULL;
-	/*
-	 * Optional path-write cursor.  Tracks the slot for the current
-	 * iteration's path write (advances at skip and at iter-end via
-	 * lockstep with the loop's level counter).  NULL when no iter,
-	 * so the per-iter advance and per-write store are compile-time
-	 * DCE'd for the no-iter callers.
-	 */
-	struct cds_ft_inode_flag **path_cur =
-		path_nodes ? path_nodes + 1 : NULL;
+	const bool cache_path =
+		iter && iter->path_mode == CDS_FT_ITER_PATH_CACHED;
 
 	if (iter)
 		iter_debug_path_snapshot(iter);
-	if (path_nodes)
-		path_nodes[0] = node_flag;
 	/*
 	 * Spill @iter to its stack slot after the prologue's last
 	 * in-register use of it.  The register holding @iter is then
@@ -6453,8 +6410,6 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 				goto end;
 			}
 			key += skip;
-			if (path_nodes)
-				path_cur += skip;
 			node_flag = ft_skip_child_ptr(node_flag);
 		}
 	}
@@ -6464,7 +6419,6 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 
 			act = ft_lookup_compressed(&node_flag, &key, key_end,
 				key_safe_end,
-				&path_cur,
 				track, track_longest,
 				&match_key_pos, &match_node, &found, &status,
 				descend_cand);
@@ -6580,7 +6534,7 @@ descend_loop:
 						 * depth — exactly what the validate-success
 						 * path resolves @cn to.  Descend INTO it by
 						 * falling through to the post-step handler with
-						 * @key / @path_cur unchanged (identical to the
+						 * @key unchanged (identical to the
 						 * cn != NULL case, just sourced from the live
 						 * parent-chain walk).  This bypasses the
 						 * holder's stale slot, so we never re-read a
@@ -6600,9 +6554,6 @@ descend_loop:
 						 */
 						node_flag = anchor;
 						key -= (size_t) rewind + 1;
-						if (path_nodes)
-							path_cur = path_nodes + 1 +
-								(size_t) (key - orig_key);
 						goto descend_loop;
 					}
 				}
@@ -6640,13 +6591,9 @@ descend_loop:
 				goto end;
 			}
 			key += skip;
-			if (path_nodes)
-				path_cur += skip;
 			node_flag = ft_skip_child_ptr(node_flag);
 		}
 #endif
-		if (path_nodes)
-			*path_cur = node_flag;
 		/*
 		 * Merged post-step handler for non-internal results.
 		 * Bundles what was a loop-top !internal slow path with
@@ -6665,18 +6612,8 @@ descend_loop:
 			if (caa_unlikely(ft_node_compressed(node_flag))) {
 				enum ft_descent_action act;
 
-				/*
-				 * The *path_cur = node_flag write above filled
-				 * path[K] with compressed_flag.  Advance one slot
-				 * so ft_lookup_compressed's fill/overwrite land
-				 * at the right depth (matches OLD loop-top
-				 * compressed-handler semantics).
-				 */
-				if (path_nodes)
-					path_cur++;
 				act = ft_lookup_compressed(&node_flag, &key, key_end,
 					key_safe_end,
-					&path_cur,
 					track, track_longest,
 					&match_key_pos, &match_node, &found, &status,
 					descend_cand);
@@ -6695,7 +6632,7 @@ descend_loop:
 					status = CDS_FT_STATUS_NOT_FOUND;
 					goto end;
 				}
-				/* terminal external — fall through to path_cur++ */
+				/* terminal external — fall through. */
 			} else {
 				status = CDS_FT_STATUS_NOT_FOUND;
 				goto end;
@@ -6715,22 +6652,17 @@ descend_loop:
 				match_node = external_nodes;
 			}
 		}
-		/* Iter-end advance for lockstep with key/level. */
-		if (path_nodes)
-			path_cur++;
 	}
 
 terminal:
 	/*
-	 * Compute iter_path_len at end from @path_cur (last write
-	 * position + 1 advance per iter, all in lockstep with the
-	 * level counter).  Also reached from the pre-loop non-internal
-	 * root handler, which already advanced path_cur via
-	 * ft_lookup_compressed (compressed root) or left it at the
-	 * initial slot (external root).
+	 * path_len is the number of path levels (root + one per consumed
+	 * key byte) used by a CACHED iter's continuation fast path; derive
+	 * it from the consumed key length.  Zero for UNCACHED / no-iter
+	 * (unused there: UNCACHED clears path_valid in the epilogue).
 	 */
-	if (path_nodes)
-		iter_path_len = path_cur - path_nodes;
+	if (cache_path)
+		iter_path_len = (size_t) (key - orig_key) + 1;
 	}
 
 	/*
