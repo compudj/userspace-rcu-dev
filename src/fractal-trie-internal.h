@@ -26,11 +26,6 @@
 #include <assert.h>
 
 /*
- * Configuration tweak. Comment out the define to disable the feature.
- */
-#define FEATURE_INLINE_LOOKUP
-
-/*
  * If the internal bit is set in a pointer, it points to an internal
  * Fractal Trie node, else it points to a node outside of the Fractal Trie.
  * This can be used for variable length keys to identify the end of key.
@@ -294,6 +289,18 @@
 # if !defined(__BMI2__)
 #  warning "Fractal trie: building for x86 without -mbmi2; bzhi-style masked popcount on the popcount_2l byte-step degrades to a 5-insn fallback (~10% slower on the dns workload). Add -mbmi2 or -march=native, or define CDS_FT_SUPPRESS_ISA_WARNING to silence."
 # endif
+#endif
+
+/*
+ * FEATURE_INLINE_LOOKUP: force-inline the lookup hot-path helpers --
+ * inline_lookup expands to inline __attribute__((always_inline)), so the
+ * descent dispatches through no call boundaries.  Disabling lets the
+ * compiler choose, trading lookup latency for smaller code.
+ *
+ * Enabled by default.  Disable with -DNO_FEATURE_INLINE_LOOKUP.
+ */
+#ifndef NO_FEATURE_INLINE_LOOKUP
+# define FEATURE_INLINE_LOOKUP
 #endif
 
 /*
