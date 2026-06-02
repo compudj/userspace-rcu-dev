@@ -3724,39 +3724,51 @@ void ft_popcount_2l_node_get_ith_pos(const struct cds_ft_type *type,
 }
 
 /*
- * Bit-scan core for the u64-packed 2-level layouts (scan_16_16_max_3,
- * scan_32_8, scan_64_4).  Their sub-bitmaps are concatenated in popcount
- * order in @subs: bit (slot1*G + lo) is set iff lo-value @lo is present
- * under the slot1-th populated hi-group, where G = 1 << @lo_bits and
- * slot1 = popcount(root & ((1<<hi)-1)).  Find the nearest set bit toward
- * @dir from byte @n and return its byte value (hi << lo_bits | lo, with
- * hi recovered by selecting the slot1-th set bit of @root), or -1 if there
- * is none in that direction.
+ * Bit-scan core for the 2-level layouts.  Their sub-bitmaps are
+ * concatenated in popcount order: bit (slot1*G + lo) is set iff lo-value
+ * @lo is present under the slot1-th populated hi-group, where G =
+ * 1 << @lo_bits and slot1 = popcount(root & ((1<<hi)-1)).  The concat is
+ * passed split as @subs_lo (bits 0..63) and @subs_hi (bits 64..127); the
+ * three u64-packed layouts (scan_16_16_max_3, scan_32_8, scan_64_4) fit in
+ * @subs_lo alone (@subs_hi = 0), while scan_16_16_max_5 (32-bit; 5x16 = 80
+ * bits) carries its top group in @subs_hi.
  *
- * @nr_groups = popcount(root); @subs bits at or above nr_groups*G are
- * unused (held 0), and the scan is bounded there so a transient stray bit
- * in an unused slot during a concurrent insert shift is ignored.
+ * Find the nearest set bit toward @dir from byte @n and return its byte
+ * value (hi << lo_bits | lo, with hi recovered by selecting the slot1-th
+ * set bit of @root), or -1 if there is none in that direction.  The scan
+ * itself is the shared cds_find_{next,prev}_bit primitive (the same one
+ * popcount_1l / pigeon use) over the concat materialized as an unsigned
+ * long array; it naturally spans the >64-bit max_5 concat and bounds the
+ * scan at @total = nr_groups*G, so a transient stray bit in an unused slot
+ * (>= total) during a concurrent insert shift is ignored.
+ *
+ * @n is the EXCLUSIVE byte bound and may be the get_minmax sentinels (-1
+ * for FT_RIGHT/leftmost, FT_ENTRY_PER_NODE for FT_LEFT/rightmost), which
+ * are NOT valid bytes -- decode hi/lo only for an in-range byte.  The
+ * resulting inclusive start bit maps 1:1 onto the primitive's start_bit
+ * (which also handles the out-of-range start that the sentinels produce).
  */
 static inline_lookup
-int ft_popcount_2l_dir_byte_u64(uint64_t root, uint64_t subs,
+int ft_popcount_2l_dir_byte(uint64_t root, uint64_t subs_lo, uint64_t subs_hi,
 		unsigned int lo_bits, unsigned int nr_groups,
 		int n, enum ft_direction dir)
 {
-	unsigned int G = 1U << lo_bits;
-	unsigned int lo_mask = G - 1U;
-	unsigned int total = nr_groups * G;
-	unsigned int p, slot1p, lop, hip, j;
-	uint64_t m, r;
-	int start;
+	unsigned int lo_mask = (1U << lo_bits) - 1U;
+	unsigned int total = nr_groups << lo_bits;	/* <= 80 */
+	unsigned int slot1p, lop, hip, j;
+	uint64_t r;
+	int start, p;
+#if (CAA_BITS_PER_LONG >= 64)
+	unsigned long bm[2] = { (unsigned long) subs_lo, (unsigned long) subs_hi };
+#else
+	unsigned long bm[4] = {
+		(unsigned long) subs_lo, (unsigned long) (subs_lo >> 32),
+		(unsigned long) subs_hi, (unsigned long) (subs_hi >> 32),
+	};
+#endif
 
 	if (total == 0)
 		return -1;
-	/*
-	 * @n is the EXCLUSIVE bound, and may be the get_minmax sentinels
-	 * (-1 for FT_RIGHT/leftmost, FT_ENTRY_PER_NODE for FT_LEFT/rightmost)
-	 * which are NOT valid bytes -- decode hi/lo only for an in-range byte
-	 * so the hi shift never goes out of bounds.
-	 */
 	if (dir == FT_RIGHT) {
 		if (n < 0) {
 			start = 0;				/* find first (smallest byte) */
@@ -3769,16 +3781,9 @@ int ft_popcount_2l_dir_byte_u64(uint64_t root, uint64_t subs,
 					root & (((uint64_t) 1 << hi) - 1U));
 
 			start = ((root >> hi) & 1ULL) ?
-				(int) (slot1 * G + lo + 1) : (int) (slot1 * G);
+				(int) ((slot1 << lo_bits) + lo + 1U) : (int) (slot1 << lo_bits);
 		}
-		if (start >= (int) total)
-			return -1;
-		m = subs & (~0ULL << start);
-		if (total < 64)
-			m &= ((uint64_t) 1 << total) - 1U;	/* ignore unused-slot bits */
-		if (!m)
-			return -1;
-		p = (unsigned int) __builtin_ctzll(m);
+		p = cds_find_next_bit(bm, total, start);
 	} else {
 		if (n > 255) {
 			start = (int) total - 1;		/* find last (largest byte) */
@@ -3791,19 +3796,15 @@ int ft_popcount_2l_dir_byte_u64(uint64_t root, uint64_t subs,
 					root & (((uint64_t) 1 << hi) - 1U));
 
 			start = (((root >> hi) & 1ULL) ?
-				(int) (slot1 * G + lo) : (int) (slot1 * G)) - 1;
+				(int) ((slot1 << lo_bits) + lo) : (int) (slot1 << lo_bits)) - 1;
 		}
-		if (start < 0)
-			return -1;
-		m = subs & ((start >= 63) ? ~0ULL
-					  : (((uint64_t) 1 << (start + 1)) - 1U));
-		if (!m)
-			return -1;
-		p = 63U - (unsigned int) __builtin_clzll(m);
+		p = cds_find_prev_bit(bm, total, start);
 	}
+	if (p < 0)
+		return -1;
 	/* p -> (slot1p, lop); recover hi by selecting the slot1p-th set bit. */
-	slot1p = p >> lo_bits;
-	lop = p & lo_mask;
+	slot1p = (unsigned int) p >> lo_bits;
+	lop = (unsigned int) p & lo_mask;
 	r = root;
 	for (j = 0; j < slot1p; j++)
 		r &= r - 1;		/* clear the lowest set bit */
@@ -3815,15 +3816,14 @@ int ft_popcount_2l_dir_byte_u64(uint64_t root, uint64_t subs,
  * Find the leftmost (FT_LEFT: largest v < n) or rightmost (FT_RIGHT:
  * smallest v > n) populated entry.
  *
- * The u64-packed layouts (scan_16_16_max_3, scan_32_8, scan_64_4) bit-scan
- * their concatenated sub-bitmaps toward @dir with
- * ft_popcount_2l_dir_byte_u64: the sub_bms are stored contiguously in
- * popcount order, so one scan crosses hi-groups and a single select on
- * root_bm recovers the hi nibble.  The byte is mapped to its pointer by
- * the layout's scan primitive; the bitmap is only a hint, so a
- * soft-deleted entry (bit set, pointer NULL) makes the scan continue past
- * it.  scan_16_16_max_5 (32-bit; sub_bms span > 64 bits) falls back to the
- * byte-order walk over get_ith_pos.
+ * Every 2-level layout bit-scans its concatenated sub-bitmap toward @dir
+ * with ft_popcount_2l_dir_byte (which delegates the scan to the shared
+ * cds_find_{next,prev}_bit, the same primitive popcount_1l / pigeon use):
+ * the sub_bms are stored contiguously in popcount order, so one scan
+ * crosses hi-groups and a single select on root_bm recovers the hi nibble.
+ * The byte is mapped to its pointer by the layout's scan primitive; the
+ * bitmap is only a hint, so a soft-deleted entry (bit set, pointer NULL)
+ * makes the scan continue past it.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
@@ -3832,97 +3832,65 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 		int n, uint8_t *result_key,
 		enum ft_direction dir)
 {
-	uint8_t nr_child;
-	struct cds_ft_inode_flag *match_ptr = NULL;
-	int match_v;
-	unsigned int i;
+	unsigned int max_lc = type->max_child;
+	uint64_t root, subs_lo, subs_hi = 0;
+	unsigned int lo_bits, nr_groups;
 
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
-	{
-		unsigned int max_lc = type->max_child;
+	if (max_lc == 6) {			/* scan_32_8: 5+3 */
+		root = *(const uint32_t *) &node->data[0];
+		subs_lo = *(const uint64_t *) &node->data[4];
+		lo_bits = 3;
+	} else if (max_lc == 3) {		/* scan_16_16_max_3: 4+4 packed */
+		uint64_t bms = *(const uint64_t *) &node->data[0];
 
-		if (max_lc != 5) {
-			uint64_t root, subs;
-			unsigned int lo_bits, nr_groups;
+		root = (uint16_t) bms;
+		subs_lo = bms >> 16;
+		lo_bits = 4;
+#if (CAA_BITS_PER_LONG < 64)
+	} else if (max_lc == 5) {		/* scan_16_16_max_5: 5 x u16, 80-bit concat */
+		const uint16_t *s = (const uint16_t *) &node->data[2];
 
-			if (max_lc == 6) {		/* scan_32_8: 5+3 */
-				root = *(const uint32_t *) &node->data[0];
-				subs = *(const uint64_t *) &node->data[4];
-				lo_bits = 3;
-			} else if (max_lc == 3) {	/* scan_16_16_max_3: 4+4 packed */
-				uint64_t bms = *(const uint64_t *) &node->data[0];
-
-				root = (uint16_t) bms;
-				subs = bms >> 16;
-				lo_bits = 4;
-			} else {			/* scan_64_4: 6+2 (max 12/14/16) */
-				root = *(const uint64_t *) &node->data[0];
-				subs = *(const uint64_t *) &node->data[8];
-				lo_bits = 2;
-			}
-			nr_groups = (unsigned int) __builtin_popcountll(root);
-			cmm_smp_rmb();	/* read bitmaps before pointers */
-			for (;;) {
-				int byte = ft_popcount_2l_dir_byte_u64(root,
-						subs, lo_bits, nr_groups, n, dir);
-				struct cds_ft_inode_flag *ptr;
-
-				if (byte < 0)
-					return NULL;
-				ptr = (max_lc == 6) ?
-					ft_popcount_2l_scan_32_8(node, NULL,
-						(uint8_t) byte, FT_PF_NONE) :
-				      (max_lc == 3) ?
-					ft_popcount_2l_scan_16_16_max_3(node, NULL,
-						(uint8_t) byte, FT_PF_NONE) :
-					ft_popcount_2l_scan_64_4(node, NULL,
-						(uint8_t) byte, FT_PF_NONE);
-				if (ptr) {
-					*result_key = (uint8_t) byte;
-					return ptr;
-				}
-				n = byte;	/* soft-deleted: scan past this bit */
-			}
-		}
+		root = *(const uint16_t *) &node->data[0];
+		subs_lo = (uint64_t) s[0] | ((uint64_t) s[1] << 16)
+			| ((uint64_t) s[2] << 32) | ((uint64_t) s[3] << 48);
+		subs_hi = s[4];		/* top group -> bits 64..79 */
+		lo_bits = 4;
+#endif
+	} else {				/* scan_64_4: 6+2 (max 12/14/16) */
+		root = *(const uint64_t *) &node->data[0];
+		subs_lo = *(const uint64_t *) &node->data[8];
+		lo_bits = 2;
 	}
-	/* scan_16_16_max_5 (32-bit): byte-order walk. */
-	nr_child = ft_popcount_2l_node_get_nr_child(type, node);
-	cmm_smp_rmb();	/* read counts/bitmaps before pointers */
-
-	if (dir == FT_LEFT)
-		match_v = -1;
-	else
-		match_v = FT_ENTRY_PER_NODE;
-
-	for (i = 0; i < nr_child; i++) {
+	nr_groups = (unsigned int) __builtin_popcountll(root);
+	cmm_smp_rmb();	/* read bitmaps before pointers */
+	for (;;) {
+		int byte = ft_popcount_2l_dir_byte(root, subs_lo, subs_hi,
+				lo_bits, nr_groups, n, dir);
 		struct cds_ft_inode_flag *ptr;
-		uint8_t v;
 
-		ft_popcount_2l_node_get_ith_pos(type, node, (uint8_t) i, &v, &ptr);
-		if (!ptr)
-			continue;
-		if (dir == FT_LEFT) {
-			if ((int) v < n && (int) v > match_v) {
-				match_v = v;
-				match_ptr = ptr;
-				if (match_v == n - 1)
-					break;
-			}
-		} else {
-			if ((int) v > n && (int) v < match_v) {
-				match_v = v;
-				match_ptr = ptr;
-				if (match_v == n + 1)
-					break;
-			}
+		if (byte < 0)
+			return NULL;
+		ptr = (max_lc == 6) ?
+			ft_popcount_2l_scan_32_8(node, NULL,
+				(uint8_t) byte, FT_PF_NONE) :
+		      (max_lc == 3) ?
+			ft_popcount_2l_scan_16_16_max_3(node, NULL,
+				(uint8_t) byte, FT_PF_NONE) :
+#if (CAA_BITS_PER_LONG < 64)
+		      (max_lc == 5) ?
+			ft_popcount_2l_scan_16_16_max_5(node, NULL,
+				(uint8_t) byte, FT_PF_NONE) :
+#endif
+			ft_popcount_2l_scan_64_4(node, NULL,
+				(uint8_t) byte, FT_PF_NONE);
+		if (ptr) {
+			*result_key = (uint8_t) byte;
+			return ptr;
 		}
+		n = byte;	/* soft-deleted: scan past this bit */
 	}
-	if (!match_ptr)
-		return NULL;
-	assert(match_v >= 0 && match_v < FT_ENTRY_PER_NODE);
-	*result_key = (uint8_t) match_v;
-	return match_ptr;
 }
 
 /*
