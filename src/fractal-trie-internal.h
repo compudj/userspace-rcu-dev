@@ -26,9 +26,8 @@
 #include <assert.h>
 
 /*
- * Configuration tweaks. Comment out those defines to disable features.
+ * Configuration tweak. Comment out the define to disable the feature.
  */
-#define FEATURE_USE_BITMAP_SCAN
 #define FEATURE_INLINE_LOOKUP
 
 /*
@@ -429,11 +428,7 @@ void ft_writer_scope_verify(struct cds_ft *ft);
 
 enum {
 	FT_NO_BITMAP = false,
-#ifdef FEATURE_USE_BITMAP_SCAN
 	FT_BITMAP = true,
-#else
-	FT_BITMAP = false,
-#endif
 };
 
 /* Never declared. Opaque type used to store flagged node pointers. */

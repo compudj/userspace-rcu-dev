@@ -3815,16 +3815,15 @@ int ft_popcount_2l_dir_byte_u64(uint64_t root, uint64_t subs,
  * Find the leftmost (FT_LEFT: largest v < n) or rightmost (FT_RIGHT:
  * smallest v > n) populated entry.
  *
- * Under FEATURE_USE_BITMAP_SCAN the u64-packed layouts (scan_16_16_max_3,
- * scan_32_8, scan_64_4) bit-scan their concatenated sub-bitmaps toward
- * @dir with ft_popcount_2l_dir_byte_u64: the sub_bms are stored
- * contiguously in popcount order, so one scan crosses hi-groups and a
- * single select on root_bm recovers the hi nibble.  The byte is mapped to
- * its pointer by the layout's scan primitive; the bitmap is only a hint,
- * so a soft-deleted entry (bit set, pointer NULL) makes the scan continue
- * past it.  scan_16_16_max_5 (32-bit; sub_bms span > 64 bits) and the
- * no-FEATURE_USE_BITMAP_SCAN build fall back to the byte-order walk over
- * get_ith_pos.
+ * The u64-packed layouts (scan_16_16_max_3, scan_32_8, scan_64_4) bit-scan
+ * their concatenated sub-bitmaps toward @dir with
+ * ft_popcount_2l_dir_byte_u64: the sub_bms are stored contiguously in
+ * popcount order, so one scan crosses hi-groups and a single select on
+ * root_bm recovers the hi nibble.  The byte is mapped to its pointer by
+ * the layout's scan primitive; the bitmap is only a hint, so a
+ * soft-deleted entry (bit set, pointer NULL) makes the scan continue past
+ * it.  scan_16_16_max_5 (32-bit; sub_bms span > 64 bits) falls back to the
+ * byte-order walk over get_ith_pos.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
@@ -3840,7 +3839,6 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
-#ifdef FEATURE_USE_BITMAP_SCAN
 	{
 		unsigned int max_lc = type->max_child;
 
@@ -3888,8 +3886,7 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 			}
 		}
 	}
-#endif
-	/* scan_16_16_max_5 (32-bit) or no bitmap scan: byte-order walk. */
+	/* scan_16_16_max_5 (32-bit): byte-order walk. */
 	nr_child = ft_popcount_2l_node_get_nr_child(type, node);
 	cmm_smp_rmb();	/* read counts/bitmaps before pointers */
 
@@ -4262,14 +4259,12 @@ void ft_popcount_1l_node_get_ith_pos(const struct cds_ft_type *type,
  * Find the leftmost (largest v < n) or rightmost (smallest v > n)
  * populated entry.
  *
- * Under FEATURE_USE_BITMAP_SCAN, scan the inline 256-bit occupancy
- * bitmap for the nearest set bit toward @dir with cds_find_prev_bit /
- * cds_find_next_bit (as ft_pigeon_node_get_direction does), then map
- * that byte value to its compact pointer via ft_popcount_1l_scan_28.
- * The bitmap is only a hint: a soft-deleted entry keeps its bit set but
- * holds a NULL pointer, so on NULL continue the scan past that bit.
- * This finds the answer in a handful of word scans instead of the
- * O(nr_child) byte-order walk used by the #else fallback below.
+ * Scan the inline 256-bit occupancy bitmap for the nearest set bit toward
+ * @dir with cds_find_prev_bit / cds_find_next_bit (as
+ * ft_pigeon_node_get_direction does), then map that byte value to its
+ * compact pointer via ft_popcount_1l_scan_28.  The bitmap is only a hint:
+ * a soft-deleted entry keeps its bit set but holds a NULL pointer, so on
+ * NULL continue the scan past that bit.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_popcount_1l_node_get_direction(
@@ -4280,7 +4275,6 @@ struct cds_ft_inode_flag *ft_popcount_1l_node_get_direction(
 {
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
-#ifdef FEATURE_USE_BITMAP_SCAN
 	{
 		struct ft_popcount_1l_header *hdr =
 			(struct ft_popcount_1l_header *) &node->data[0];
@@ -4313,51 +4307,6 @@ retry:
 			return ptr;
 		}
 	}
-#else
-	{
-		uint8_t nr_child;
-		struct cds_ft_inode_flag *match_ptr = NULL;
-		int match_v;
-		unsigned int i;
-
-		nr_child = ft_popcount_1l_node_get_nr_child(type, node);
-		cmm_smp_rmb();
-
-		if (dir == FT_LEFT)
-			match_v = -1;
-		else
-			match_v = FT_ENTRY_PER_NODE;
-
-		for (i = 0; i < nr_child; i++) {
-			struct cds_ft_inode_flag *ptr;
-			uint8_t v;
-
-			ft_popcount_1l_node_get_ith_pos(type, node, (uint8_t) i, &v, &ptr);
-			if (!ptr)
-				continue;
-			if (dir == FT_LEFT) {
-				if ((int) v < n && (int) v > match_v) {
-					match_v = v;
-					match_ptr = ptr;
-					if (match_v == n - 1)
-						break;
-				}
-			} else {
-				if ((int) v > n && (int) v < match_v) {
-					match_v = v;
-					match_ptr = ptr;
-					if (match_v == n + 1)
-						break;
-				}
-			}
-		}
-		if (!match_ptr)
-			return NULL;
-		assert(match_v >= 0 && match_v < FT_ENTRY_PER_NODE);
-		*result_key = (uint8_t) match_v;
-		return match_ptr;
-	}
-#endif
 }
 
 /*
@@ -4439,15 +4388,12 @@ struct cds_ft_inode_flag *ft_pigeon_node_get_direction(const struct cds_ft_type 
 {
 	struct cds_ft_inode_flag **child_node_flag_ptr;
 	struct cds_ft_inode_flag *child_node_flag;
-#ifdef FEATURE_USE_BITMAP_SCAN
 	struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
-#endif
 	int i;
 
 	assert(ft_type_is_pigeon(type->type_class));
 	assert(dir == FT_LEFT || dir == FT_RIGHT);
 
-#ifdef FEATURE_USE_BITMAP_SCAN
 retry:
 	if (dir == FT_LEFT)
 		i = cds_find_prev_bit(bitmap->bitmap, FT_ENTRY_PER_NODE, n - 1);
@@ -4469,33 +4415,6 @@ retry:
 		*result_key = (uint8_t) i;
 		return child_node_flag;
 	}
-#else
-	if (dir == FT_LEFT) {
-		/* n - 1 is first value left of n */
-		for (i = n - 1; i >= 0; i--) {
-			child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[i];
-			child_node_flag = ft_dereference_acquire(*child_node_flag_ptr);
-			if (child_node_flag) {
-				dbg_printf("ft_pigeon_node_get_left child_node_flag %p\n",
-					child_node_flag);
-				*result_key = (uint8_t) i;
-				return child_node_flag;
-			}
-		}
-	} else {
-		/* n + 1 is first value right of n */
-		for (i = n + 1; i < FT_ENTRY_PER_NODE; i++) {
-			child_node_flag_ptr = &((struct cds_ft_inode_flag **) node->data)[i];
-			child_node_flag = ft_dereference_acquire(*child_node_flag_ptr);
-			if (child_node_flag) {
-				dbg_printf("ft_pigeon_node_get_right child_node_flag %p\n",
-					child_node_flag);
-				*result_key = (uint8_t) i;
-				return child_node_flag;
-			}
-		}
-	}
-#endif
 	return NULL;
 }
 
@@ -5494,12 +5413,10 @@ int ft_pigeon_node_set_nth(const struct cds_ft_type *type,
 		replace_old_ptr = true;
 	rcu_assign_pointer(*ptr, child_node_flag);
 	if (!replace_old_ptr) {
-#ifdef FEATURE_USE_BITMAP_SCAN
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
 
 		/* Set n in bitmap. */
 		cds_set_bit_relaxed(bitmap->bitmap, n);
-#endif
 		metadata->nr_child++;
 	}
 	return 0;
@@ -5621,12 +5538,10 @@ int ft_pigeon_node_replace_ptr(const struct cds_ft_type *type,
 	ft_set_parent(newptr, node_flag, node_flag_ptr);
 	rcu_assign_pointer(*node_flag_ptr, newptr);
 	if (!newptr) {
-#ifdef FEATURE_USE_BITMAP_SCAN
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
 
 		/* Clear n in bitmap. */
 		cds_clear_bit_relaxed(bitmap->bitmap, n);
-#endif
 		metadata->nr_child--;
 	}
 	return 0;
