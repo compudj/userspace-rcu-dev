@@ -595,6 +595,19 @@ struct cds_ft_group {
 	 */
 	bool speculative;
 	/*
+	 * @speculative_key_offset: byte offset from the (struct cds_ft_node *)
+	 *   stored in the trie to the caller's key bytes, used by the
+	 *   speculative inequality lookup to copy a result key directly from
+	 *   the leaf (the leaf is the single source of the key, so the
+	 *   descent need not load compressed-node cache lines to rebuild it).
+	 *   @speculative_key_offset_set records whether it was configured;
+	 *   offset 0 is a valid value, so a separate flag is required.  Only
+	 *   consulted when @speculative and CDS_FT_FLAG_SKIP_COMPRESSED are
+	 *   set.  See cds_ft_group_attr_set_speculative_key_offset.
+	 */
+	size_t speculative_key_offset;
+	bool speculative_key_offset_set;
+	/*
 	 * @numa_policy: NUMA placement policy for the group's internal
 	 *   allocator superblocks.  See
 	 *   cds_ft_group_attr_set_numa_policy.  Default: INTERLEAVE at

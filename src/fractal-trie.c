@@ -130,6 +130,15 @@ struct cds_ft_group_attr {
 	struct cds_ft_key_map key_map;
 	unsigned int flags;
 	bool speculative;	/* See cds_ft_lookup_optimization. */
+	/*
+	 * Byte offset from the (struct cds_ft_node *) stored in the trie to
+	 * the start of the caller-stored key bytes, and whether it was
+	 * configured.  Lets the speculative inequality path copy a result
+	 * key from the leaf instead of rebuilding it from compressed-node
+	 * bytes.  See cds_ft_group_attr_set_speculative_key_offset.
+	 */
+	size_t speculative_key_offset;
+	bool speculative_key_offset_set;
 	enum cds_ft_numa_policy numa_policy;	/* See cds_ft_group_attr_set_numa_policy. */
 	enum cds_ft_optimize optimize;		/* See cds_ft_group_attr_set_optimize. */
 };
@@ -7783,6 +7792,43 @@ struct cds_ft_node *ft_node_external_nodes(struct cds_ft_inode_flag *node)
 	return ft_dereference_external(metadata->external_nodes);
 }
 
+/*
+ * Speculative inequality result-key capture: when the group is configured for
+ * speculative skip-compressed lookup with a leaf-key offset, the matched leaf
+ * @leaf stores the full result key — in the byte order the application passed
+ * to cds_ft_insert() — at that offset.  Transform @level bytes of it to the
+ * iterator's ordinal (trie) order into @dst and return true; the caller then
+ * need not rebuild the key from the descent's compressed-node bytes.
+ * ft_key_to_ordinals applies the group's key map, which is a plain copy for an
+ * identity map and a per-byte remap otherwise, so the fast path covers
+ * non-identity maps too (no identity restriction).  Returns false (copying
+ * nothing) on groups without the offset / skip-compressed encoding, so the
+ * caller falls back to the descent-built ordinal_key accumulation.
+ *
+ * This is the result-key source on a configured speculative group: the
+ * min-descent intentionally leaves dispatch-irrelevant holes in ordinal_key
+ * (it follows skip pointers without filling the spanned bytes), so the leaf
+ * copy -- not ordinal_key -- carries the full result key.  Correctness is
+ * validated end-to-end by the ordered-iteration / relational invariant tests.
+ */
+static inline_lookup
+bool ft_speculative_keycopy(const struct cds_ft *ft,
+		const struct cds_ft_node *leaf,
+		uint8_t *dst, ssize_t level)
+{
+	const struct cds_ft_group *group = ft->group;
+	const uint8_t *leaf_key;
+
+	if (!leaf || level < 0)
+		return false;
+	if (!group->speculative_key_offset_set || !group->speculative ||
+			!(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED))
+		return false;
+	leaf_key = (const uint8_t *) leaf + group->speculative_key_offset;
+	ft_key_to_ordinals(dst, leaf_key, (size_t) level, &group->key_map);
+	return true;
+}
+
 static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
@@ -7812,6 +7858,16 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	 */
 	struct cds_ft_inode_flag *up_node = NULL;
 	ssize_t up_node_lo = 0;
+	/*
+	 * Leaf-copy active: a configured speculative skip-compressed group
+	 * recovers the result key from the matched leaf, so the min-descent
+	 * follows skip pointers without reading the compressed node or filling
+	 * ordinal_key.  Otherwise the descent must rebuild ordinal_key from the
+	 * live compressed nodes (the fill + re-anchor path below).
+	 */
+	const bool use_keycopy = ft->group->speculative_key_offset_set &&
+		ft->group->speculative &&
+		(ft->group->flags & CDS_FT_FLAG_SKIP_COMPRESSED);
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
@@ -8127,7 +8183,9 @@ post_traversal:
 			if (external_nodes) {
 				/* End of key lookup succeded. We got an equal match. */
 				iter->key_len = key_len;
-				memcpy(iter_key(iter), input_key, key_len);
+				if (!ft_speculative_keycopy(ft, external_nodes,
+						iter_key(iter), (ssize_t) key_len))
+					memcpy(iter_key(iter), input_key, key_len);
 				iter->node = external_nodes;
 				iter->cache_valid = true;
 				iter_debug_path_update(iter);
@@ -8301,8 +8359,11 @@ going_up:
 
 					assert(level <= (int) ft->group->max_key_len);
 					iter->key_len = level;
-					for (j = 0; j < level; j++)
-						iter_key(iter)[j] = ordinal_key[j];
+					if (!ft_speculative_keycopy(ft, external_nodes,
+							iter_key(iter), level)) {
+						for (j = 0; j < level; j++)
+							iter_key(iter)[j] = ordinal_key[j];
+					}
 					iter->node = external_nodes;
 					iter->cache_valid = true;
 					iter_debug_path_update(iter);
@@ -8346,17 +8407,20 @@ going_up:
 					true /* validate_lookup */);
 	#ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
-			 * Skip-validate failure: the parent we scanned for a sibling
-			 * (iter_path[level-1]) was recompacted away while the sibling's skip
-			 * child was reparented by a concurrent split/merge.  Re-anchor that
-			 * parent on the live structure via the child's parent chain and
-			 * re-scan it (the single skip concurrency mechanism), rather than spin.
-			 * @rewind > 0 (merge) means the parent merged shallower: drop @level
-			 * and recompute the dispatch byte at the new level.  ft_skip_reanchor
-			 * never returns NULL on a well-formed trie (the writer wires every
-			 * fresh cluster's parent before the cluster becomes reachable).
+			 * Fill path only (!use_keycopy): a skip-encoded sibling must be
+			 * resolved to fill ordinal_key.  Re-anchor the scanned parent on
+			 * the live structure via the child's parent chain and re-scan it
+			 * (the single skip concurrency mechanism), rather than spin.
+			 * @rewind > 0 (merge) means the parent merged shallower: drop
+			 * @level and recompute the dispatch byte at the new level.
+			 * ft_skip_reanchor never returns NULL on a well-formed trie.
+			 *
+			 * Under use_keycopy the skip-encoded sibling is left raw and
+			 * followed by the descend_children skip-follow (the leaf copy
+			 * supplies the spanned bytes), so no re-anchor is needed here.
 			 */
-			while (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
+			while (!use_keycopy && node_flag &&
+					caa_unlikely(ft_node_skip_compressed(node_flag))) {
 				unsigned int rewind;
 				struct cds_ft_inode_flag *at_pos;
 				struct cds_ft_inode_flag *anchor =
@@ -8481,8 +8545,12 @@ going_up:
 						int j;
 
 						iter->key_len = iter->prefix_len;
-						for (j = 0; j < (int) iter->prefix_len; j++)
-							iter_key(iter)[j] = ordinal_key[j];
+						if (!ft_speculative_keycopy(ft, external_nodes,
+								iter_key(iter),
+								(ssize_t) iter->prefix_len)) {
+							for (j = 0; j < (int) iter->prefix_len; j++)
+								iter_key(iter)[j] = ordinal_key[j];
+						}
 						iter->node = external_nodes;
 						iter->cache_valid = true;
 						iter_debug_path_update(iter);
@@ -8502,13 +8570,23 @@ going_up:
 	}
 
 descend_children:
-	if (ft_node_external(node_flag)) {
+	/*
+	 * A skip-encoded sibling carried over from going_up (use_keycopy) is
+	 * resolved by the loop's skip-follow below, not tested as external here
+	 * -- its tag bits would otherwise be misread as an external node.
+	 */
+	if (!(use_keycopy && ft_node_skip_compressed(node_flag))
+			&& ft_node_external(node_flag)) {
 		int j;
 
 		assert(level <= (int) ft->group->max_key_len);
 		iter->key_len = level;
-		for (j = 0; j < level; j++)
-			iter_key(iter)[j] = ordinal_key[j];
+		if (!ft_speculative_keycopy(ft,
+				(const struct cds_ft_node *) ft_node_ptr(node_flag),
+				iter_key(iter), level)) {
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+		}
 		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
 		iter->cache_valid = true;
 		iter_debug_path_update(iter);
@@ -8551,6 +8629,37 @@ descend_children:
 		assert(0);
 	}
 	for (; level < (int) ft->group->max_tree_depth; level++) {
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		/*
+		 * Skip-encoded compressed child: follow it directly without
+		 * reading the compressed node.  The spanned length is in the
+		 * pointer's upper bits (ft_skip_len == cn->len), so this
+		 * reproduces ft_inequality_minmax_compressed's level advance
+		 * exactly; the only thing dropped is the ordinal_key span fill,
+		 * which the leaf-key copy supplies for the result.  A
+		 * skip-compressed node cannot carry external_nodes (a terminating
+		 * fork the encoding cannot express), so nothing terminates inside
+		 * the span -- no min/max candidate is skipped.  Resolving here, at
+		 * the loop top, also keeps the external / internal tests below
+		 * from misreading the skip pointer's tag bits.
+		 */
+		if (use_keycopy && caa_unlikely(ft_node_skip_compressed(node_flag))) {
+			level += (ssize_t) ft_skip_len(node_flag) - 1;
+			node_flag = ft_skip_child_ptr(node_flag);
+			skip_eq_external_nodes = false;
+			up_node = node_flag;	/* live child below the span */
+			up_node_lo = level;
+			/*
+			 * Mirror ft_inequality_minmax_compressed: an external child
+			 * is the leaf at the span end -- break with @level already at
+			 * the key length (no loop level++); an internal child
+			 * continues the descent (the loop level++ lands on it).
+			 */
+			if (ft_node_external(node_flag))
+				break;
+			continue;
+		}
+#endif
 		/*
 		 * Return external node associated to internal node if
 		 * trying to find GE/GT inequality and encountering an
@@ -8573,13 +8682,18 @@ descend_children:
 		if (ft_node_external(node_flag))
 			break;
 		/*
-		 * Skip-compressed: convert to compressed flag.
+		 * Resolve a skip-encoded node to its compressed form.  No-op under
+		 * use_keycopy (skip pointers were already followed at the loop
+		 * top); on the fill path it converts a skip pointer so the
+		 * compressed handler can read cn->key_bytes.
 		 */
 		node_flag = ft_resolve_skip_compressed(node_flag);
 		/*
-		 * Compressed node: traverse through the compressed
-		 * path to reach the child.  Fill ordinal_key and
-		 * iter path as we go.
+		 * Compressed node: traverse the compressed path to reach the
+		 * child, filling ordinal_key.  Under use_keycopy this is only the
+		 * regular (non-skip-encoded) form for spans longer than
+		 * FT_SKIP_LEN_MAX, and the fill is harmless (the result key comes
+		 * from the leaf copy).
 		 */
 		if (ft_node_compressed(node_flag)) {
 			enum ft_descent_action act;
@@ -8601,47 +8715,43 @@ descend_children:
 		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir,
 				true /* validate_lookup */);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		/*
-		 * Skip-validate failure (the minmax descent read a slot inconsistent
-		 * with the live compressed node — the scanned node was recompacted away
-		 * while the skip child was reparented by a concurrent split/merge).
-		 * Re-anchor the scanned node on the live structure via the child's
-		 * parent chain and re-scan it, rather than spin (the single skip
-		 * concurrency mechanism).  @rewind > 0 (merge) re-anchors shallower;
-		 * @level -= rewind + 1 then the loop's level++ nets a -rewind step,
-		 * re-scanning the live node at the right depth.  ft_skip_reanchor
-		 * never returns NULL on a well-formed trie (the writer wires every
-		 * fresh cluster's parent before the cluster becomes reachable).
-		 */
 		if (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
-			unsigned int rewind;
-			struct cds_ft_inode_flag *at_pos;
-			struct cds_ft_inode_flag *anchor =
-				ft_skip_reanchor(node_flag, &rewind, &at_pos);
-
-			assert(anchor != NULL);
-			if (caa_likely(rewind == 0)) {
+			if (use_keycopy) {
 				/*
-				 * Surgical: @at_pos is the live minmax child at this
-				 * depth that re-scanning @anchor would find (its byte
-				 * was already recorded by the ft_node_get_minmax
-				 * above); descend into it directly by falling through
-				 * to the record-and-descend below, rather than
-				 * re-scanning the holder.
+				 * Leaf-copy path: a skip-encoded min/max child is returned
+				 * raw and followed at the loop top next iteration -- the
+				 * key drives the descent and the leaf copy supplies the
+				 * spanned bytes, so no re-anchor.
 				 */
-				node_flag = at_pos;
-			} else {
-				/*
-				 * @rewind > 0 (merge): the child merged shallower;
-				 * re-scan the live holder at the corrected depth
-				 * (@level -= rewind + 1, then the loop's level++ nets
-				 * a -rewind step).
-				 */
-				level -= (ssize_t) rewind + 1;
-				node_flag = anchor;
-				up_node = anchor;	/* re-anchored holder; re-scanned next iter */
+				up_node = node_flag;
 				up_node_lo = level;
 				continue;
+			}
+			{
+				/*
+				 * Fill path (no leaf-key offset): ordinal_key must be
+				 * filled from the live compressed node, so re-anchor the
+				 * scanned node on the live structure via the child's parent
+				 * chain and re-scan, rather than spin.  @rewind > 0 (merge)
+				 * re-anchors shallower; @level -= rewind + 1 then the loop's
+				 * level++ nets a -rewind step.  ft_skip_reanchor never
+				 * returns NULL on a well-formed trie.
+				 */
+				unsigned int rewind;
+				struct cds_ft_inode_flag *at_pos;
+				struct cds_ft_inode_flag *anchor =
+					ft_skip_reanchor(node_flag, &rewind, &at_pos);
+
+				assert(anchor != NULL);
+				if (caa_likely(rewind == 0)) {
+					node_flag = at_pos;
+				} else {
+					level -= (ssize_t) rewind + 1;
+					node_flag = anchor;
+					up_node = anchor;
+					up_node_lo = level;
+					continue;
+				}
 			}
 		}
 #endif
@@ -8693,8 +8803,11 @@ found_minmax:
 		int j;
 
 		iter->key_len = level;
-		for (j = 0; j < level; j++)
-			iter_key(iter)[j] = ordinal_key[j];
+		if (!ft_speculative_keycopy(ft, ret_node, iter_key(iter),
+				level)) {
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+		}
 		iter->node = ret_node;
 		iter->cache_valid = true;
 		iter_debug_path_update(iter);
@@ -18426,6 +18539,17 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
 	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 }
 
+enum cds_ft_status cds_ft_group_attr_set_speculative_key_offset(
+		struct cds_ft_group_attr *attr,
+		size_t key_offset)
+{
+	if (!attr)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->speculative_key_offset = key_offset;
+	attr->speculative_key_offset_set = true;
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status cds_ft_group_attr_set_numa_policy(
 		struct cds_ft_group_attr *attr,
 		enum cds_ft_numa_policy policy)
@@ -18616,6 +18740,8 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->key_map = attr->key_map;
 		ft_group->flags = attr->flags;
 		ft_group->speculative = attr->speculative;
+		ft_group->speculative_key_offset = attr->speculative_key_offset;
+		ft_group->speculative_key_offset_set = attr->speculative_key_offset_set;
 		ft_group->numa_policy = attr->numa_policy;
 		ft_group->optimize = attr->optimize;
 	} else {

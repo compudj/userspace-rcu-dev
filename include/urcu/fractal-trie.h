@@ -2144,6 +2144,63 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
 		enum cds_ft_lookup_optimization opt);
 
 /*
+ * cds_ft_group_attr_set_speculative_key_offset - Provide the leaf-key
+ *                                                offset for speculative
+ *                                                inequality lookups.
+ * @attr: Fractal Trie group attributes.
+ * @key_offset: Byte offset from the (struct cds_ft_node *) stored in the
+ *              trie to the start of the caller-stored key bytes — the
+ *              same value passed to cds_ft_speculative_lookup_key,
+ *              typically offsetof(user_struct, key_field) -
+ *              offsetof(user_struct, ft_node_field).
+ *
+ * KEY REPRESENTATION CONTRACT: the bytes at @key_offset must be exactly
+ * the bytes the application passed to cds_ft_insert() / the lookup APIs
+ * for this node — NOT the application's native scalar.  For integer
+ * keys that is the big-endian form emitted by cds_ft_u64_to_key() and
+ * friends, not the host-order integer.  The library applies the group's
+ * key map to these bytes when copying them into the iterator's result
+ * key, so a non-identity cds_ft_key_map is supported (the stored key is
+ * remapped to ordinal order on copy); an identity map is a plain copy.
+ *
+ * This contract is why the requirement did not exist for candidate /
+ * speculative point lookups: there the validation memcmp runs
+ * application-side (inside cds_ft_speculative_lookup_key), so the
+ * library never interprets the stored bytes and the application may
+ * store the key in any representation it also looks up with.  Here the
+ * library reads the stored bytes and copies them (key-map-transformed)
+ * into the iterator's result key, read back via cds_ft_iter_get_key, so
+ * their byte order must match what the trie was built with.
+ *
+ * Optional, and only meaningful on a SPECULATIVE group with the
+ * skip-compressed pointer encoding available (64-bit supported archs).
+ * When provided, the ordered-inequality lookups (cds_ft_lookup_ge/gt/
+ * le/lt, cds_ft_next/prev) capture their result key by copying it from
+ * the matched leaf — the leaf already stores the full key for caller-
+ * side validation — instead of rebuilding it from compressed-node bytes
+ * during descent.  This lets the inequality descent run in candidate
+ * (speculative) form and bypass compressed-node cache lines, the way
+ * point lookups already do.
+ *
+ * When not set (or on an EAGER / non-skip-compressed group), the
+ * inequality lookups fall back to rebuilding the key from the trie
+ * structure during descent — same result, without the leaf-copy
+ * fast path.  Key length is taken from the group's fixed key_len (or
+ * the leaf's trie depth for variable-length keys), so no separate
+ * length offset is required.
+ *
+ * key_offset is interpreted modulo pointer arithmetic, so a key stored
+ * before the node in the embedding struct (a "negative" offset) is
+ * supported, exactly as for cds_ft_speculative_lookup_key.
+ *
+ * Returns CDS_FT_STATUS_OK on success,
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL @attr.
+ */
+enum cds_ft_status cds_ft_group_attr_set_speculative_key_offset(
+		struct cds_ft_group_attr *attr,
+		size_t key_offset);
+
+/*
  * cds_ft_group_attr_set_numa_policy - Select the trie group's NUMA
  *                                     placement policy for its internal
  *                                     allocator.
