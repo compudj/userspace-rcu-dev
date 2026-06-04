@@ -8722,6 +8722,17 @@ descend_children:
 		skip_eq_external_nodes = false;
 		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir,
 				true /* validate_lookup */);
+		/*
+		 * Prefetch the min/max child's body for the next iteration's scan.
+		 * ft_maybe_prefetch fires only on internal/compressed children
+		 * (external/NULL/non-canonical-skip are dropped), so it never
+		 * reintroduces the harmful external-leaf prefetch.  The lead comes
+		 * from the GE/GT external-nodes metadata read at the loop top, which
+		 * is enough to overlap the body miss: measured ~+3-4% on
+		 * single-thread cds_ft_next over the 1M-key DNS set (the going-up
+		 * sibling scan has no such lead and did NOT benefit -- not added).
+		 */
+		ft_maybe_prefetch(node_flag);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (node_flag && caa_unlikely(ft_node_skip_compressed(node_flag))) {
 			if (use_keycopy) {
