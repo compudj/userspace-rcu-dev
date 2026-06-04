@@ -7829,10 +7829,12 @@ bool ft_speculative_keycopy(const struct cds_ft *ft,
 	return true;
 }
 
-static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
+static inline_lookup
+enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
-		enum ft_lookup_limit limit)
+		enum ft_lookup_limit limit,
+		const bool use_keycopy)
 {
 	ssize_t key_depth, level;
 	struct cds_ft_inode_flag *node_flag;
@@ -7858,15 +7860,15 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	struct cds_ft_inode_flag *up_node = NULL;
 	ssize_t up_node_lo = 0;
 	/*
-	 * Leaf-copy active: a configured speculative skip-compressed group
-	 * recovers the result key from the matched leaf, so the min-descent
-	 * follows skip pointers without reading the compressed node or filling
-	 * ordinal_key.  Otherwise the descent must rebuild ordinal_key from the
-	 * live compressed nodes (the fill + re-anchor path below).
+	 * @use_keycopy is a compile-time literal at each instantiation (see the
+	 * two cds_ft_lookup_inequality_impl callers in the dispatcher below), so
+	 * always_inline constant-folds every per-call gate on it.  When set, a
+	 * configured speculative skip-compressed group recovers the result key
+	 * from the matched leaf and the min-descent follows skip pointers without
+	 * reading the compressed node or filling ordinal_key; otherwise the
+	 * descent rebuilds ordinal_key from the live compressed nodes (the fill +
+	 * re-anchor path).
 	 */
-	const bool use_keycopy = ft->group->speculative_key_offset_set &&
-		ft->group->speculative &&
-		(ft->group->flags & CDS_FT_FLAG_SKIP_COMPRESSED);
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
@@ -8828,6 +8830,26 @@ end:
 		(int) iter->status);
 	iter_auto_invalidate_cache(iter);
 	return iter->status;
+}
+
+/*
+ * Dispatcher: resolve the immutable @use_keycopy config (a speculative
+ * skip-compressed group with a leaf-key offset) once, then tail-call the
+ * matching always_inline instantiation so each variant's hot loop has the
+ * per-call use_keycopy gates constant-folded away.  Mirrors the
+ * do_cds_ft_lookup_inner (descend_cand, skip_compressed) specialization.
+ * The config is immutable after group create, so this branch is perfectly
+ * predicted and amortized over a full traversal.
+ */
+static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		enum ft_lookup_inequality mode,
+		enum ft_lookup_limit limit)
+{
+	if (ft->group->speculative_key_offset_set && ft->group->speculative &&
+			(ft->group->flags & CDS_FT_FLAG_SKIP_COMPRESSED))
+		return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, true);
+	return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, false);
 }
 
 /*
