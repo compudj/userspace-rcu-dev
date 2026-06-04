@@ -100,6 +100,14 @@ struct ft_test_node {
 	struct rcu_head head;
 	uint64_t key;		/* shadow copy for validation */
 	uint64_t value;
+	/*
+	 * Ordinal (big-endian, trie-order) key bytes, populated at insert.
+	 * This is the representation the speculative inequality lookup copies
+	 * from the leaf, so it must hold exactly the bytes the trie navigates
+	 * on (NOT the host-order @key shadow above).  create_fixed_ft points
+	 * speculative_key_offset here.
+	 */
+	uint8_t okey[8];
 };
 
 static inline
@@ -214,6 +222,14 @@ static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_o
 		abort();
 	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
 		abort();
+	/*
+	 * Exercise the speculative inequality leaf-key capture: the result
+	 * key is copied from the matched leaf's ordinal key bytes (okey),
+	 * stored at this offset from the embedded cds_ft_node.
+	 */
+	if (cds_ft_group_attr_set_speculative_key_offset(attr,
+			offsetof(struct ft_test_node, okey)) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -226,9 +242,11 @@ static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_o
 static enum cds_ft_status
 insert_u64(struct cds_ft *ft, uint64_t v, struct ft_test_node *n)
 {
-	uint8_t k[8];
+	uint8_t k[8] = { 0 };
 
 	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
+	/* Stash the ordinal key bytes for speculative leaf-key capture. */
+	memcpy(n->okey, k, sizeof(n->okey));
 	return cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n->node);
 }
 
@@ -1009,9 +1027,10 @@ static void populate_range(struct cds_ft *ft, uint64_t base, unsigned int count)
 
 	for (i = 0; i < count; i++) {
 		struct ft_test_node *n = node_alloc(base + i);
-		uint8_t k[4];
+		uint8_t k[8] = { 0 };
 
 		cds_ft_u64_to_key(ft, base + i, k, 4);
+		memcpy(n->okey, k, sizeof(n->okey));
 		cds_ft_insert(ft, k, 4, &n->node);
 	}
 }
