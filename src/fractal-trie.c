@@ -7839,7 +7839,6 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	struct cds_ft_node *ret_node;
 	uint8_t ordinal_key[FT_MAX_KEY_LEN];
 	enum ft_direction dir;
-	uint8_t input_key_buf[FT_MAX_KEY_LEN];
 	const uint8_t *input_key;
 	const uint8_t *iter_key;
 	size_t key_len = 0;
@@ -7903,12 +7902,15 @@ static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	}
 
 	/*
-	 * Snapshot the input key so that iter_key(iter) can be overwritten
-	 * with the result key without corrupting the input during the
-	 * backtracking phase (which re-reads the input via iter_key).
+	 * Read the input key in place from the iterator buffer -- no snapshot
+	 * copy.  Every write to iter_key(iter) (the result) is terminal (goto
+	 * end) or sourced from the separate ordinal_key / leaf-copy buffer, and
+	 * all input reads (the descent and the going-up backtrack) precede any
+	 * terminal write, so the input bytes are never overwritten while still
+	 * needed.  The lone self-aliasing case -- the equal-match write below --
+	 * is a no-op and is guarded.
 	 */
-	memcpy(input_key_buf, iter_key(iter), key_len);
-	input_key = input_key_buf;
+	input_key = iter_key(iter);
 	iter_key = input_key;
 
 	FT_TP(ineq_enter, (int) mode, input_key, key_len);
@@ -8181,10 +8183,14 @@ post_traversal:
 				external_nodes = (struct cds_ft_node *) node_flag;
 			}
 			if (external_nodes) {
-				/* End of key lookup succeded. We got an equal match. */
+				/* End of key lookup succeded. We got an equal match.
+				 * The result key equals the input, which is read in
+				 * place from iter_key(iter), so the memcpy is a no-op
+				 * self-copy unless a separate buffer is in use. */
 				iter->key_len = key_len;
 				if (!ft_speculative_keycopy(ft, external_nodes,
-						iter_key(iter), (ssize_t) key_len))
+						iter_key(iter), (ssize_t) key_len) &&
+						input_key != iter_key(iter))
 					memcpy(iter_key(iter), input_key, key_len);
 				iter->node = external_nodes;
 				iter->cache_valid = true;
