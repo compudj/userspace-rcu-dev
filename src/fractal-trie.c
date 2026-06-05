@@ -20894,6 +20894,22 @@ void cds_ft_iter_invalidate_cache(struct cds_ft_iter *iter)
 	iter->node = NULL;
 }
 
+void cds_ft_iter_bind_key(struct cds_ft_iter *iter)
+{
+	/*
+	 * Materialize a live leaf-referenced key into the iterator's own buffer
+	 * BEFORE detaching, so a cross-critical-section resume re-descends from
+	 * the stable buffer rather than the (post-unlock, possibly reclaimed)
+	 * leaf.  ft_iter_read_key resolves to iter_key(iter) itself when the key
+	 * is already a value (copy-mode / non-keycopy group / fresh set_key), in
+	 * which case the memcpy is a no-op self-copy and this is a plain
+	 * invalidate.  The bytes are ordinal (ft_iter_key_referenced requires an
+	 * identity key map), matching iter_key(iter)'s representation.
+	 */
+	ft_iter_materialize_key(iter);
+	cds_ft_iter_invalidate_cache(iter);
+}
+
 void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 {
 	dst->status = src->status;

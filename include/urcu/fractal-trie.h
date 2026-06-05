@@ -2564,6 +2564,58 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter);
 void cds_ft_iter_invalidate_cache(struct cds_ft_iter *iter);
 
 /*
+ * cds_ft_iter_bind_key - Snapshot the current key into the iterator for
+ *                        cross-critical-section resume.
+ * @iter: The iterator.
+ *
+ * In a speculative skip-compressed group configured with a leaf-key offset
+ * (cds_ft_group_attr_set_speculative_key_offset()), the iterator's current
+ * key after an ordered lookup (cds_ft_lookup_first / cds_ft_next / the
+ * relational lookups) is held as a LIVE REFERENCE into the matched leaf, valid
+ * only while the RCU read-side lock that produced it is still held.  To pause
+ * an ordered iteration and resume it in a LATER critical section, call
+ * cds_ft_iter_bind_key() WHILE STILL HOLDING the lock: it copies the current
+ * key into the iterator's own storage and invalidates the cached position
+ * (cds_ft_iter_invalidate_cache()), so the iterator no longer depends on the
+ * soon-to-be-reclaimable leaf.
+ *
+ * After bind the iterator is uncached-equivalent: cds_ft_iter_get_key() still
+ * returns the bound key, and the next cds_ft_next() in a fresh critical section
+ * re-descends from the root and yields the bound key's successor (robust even
+ * if the bound key was removed in the meantime).  cds_ft_iter_node() returns
+ * NULL until that re-descent.
+ *
+ * For groups without a configured leaf-key offset the current key is already a
+ * stable value, so this is exactly cds_ft_iter_invalidate_cache().
+ *
+ * Piecewise iteration:
+ *
+ *   bool resuming = false;
+ *   for (;;) {
+ *           rcu_read_lock();
+ *           if (resuming)
+ *                   cds_ft_next(ft, iter);          // successor of the bound key
+ *           else
+ *                   cds_ft_lookup_first(ft, iter);
+ *           while (cds_ft_iter_node(iter)) {
+ *                   cds_ft_iter_get_key(iter, ...); // process this key
+ *                   if (batch_full)
+ *                           break;
+ *                   cds_ft_next(ft, iter);
+ *           }
+ *           if (!cds_ft_iter_node(iter)) {          // reached the end
+ *                   rcu_read_unlock();
+ *                   break;
+ *           }
+ *           cds_ft_iter_bind_key(iter);             // snapshot before unlocking
+ *           rcu_read_unlock();
+ *           resuming = true;
+ *           // ... work outside the read-side critical section ...
+ *   }
+ */
+void cds_ft_iter_bind_key(struct cds_ft_iter *iter);
+
+/*
  * cds_ft_iter_copy - Copy an iterator's state.
  * @dst: Destination iterator.
  * @src: Source iterator.
