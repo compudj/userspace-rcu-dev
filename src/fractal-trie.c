@@ -8851,8 +8851,16 @@ end:
  * do_cds_ft_lookup_inner (descend_cand, skip_compressed) specialization.
  * The config is immutable after group create, so this branch is perfectly
  * predicted and amortized over a full traversal.
+ *
+ * inline_lookup (force-inline) into each entry point: cds_ft_lookup_le/ge/lt/gt
+ * pass compile-time-constant @mode and @limit (and cds_ft_next/prev resolve to
+ * _gt/_lt), so inlining lets @mode AND @limit -- not just @use_keycopy -- DCE
+ * each wrapper down to its single arm.  The six specialized bodies cost .so size
+ * but the HOT footprint shrinks (a workload runs one DCE'd wrapper, smaller than
+ * the shared generic): measured ~+10% ST and +4-22% MT on 1M-key DNS iterate.
  */
-static enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
+static inline_lookup
+enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit)
