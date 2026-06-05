@@ -596,6 +596,14 @@ struct cds_ft_iter {
 	((uint8_t *)((iter)->data))
 
 /*
+ * Materialize a live leaf-referenced key into iter_key(iter) (no-op when the
+ * key is already a value there).  Forward-declared so the early
+ * iter_auto_invalidate_cache() can detach a reference-keycopy position before
+ * dropping cache_valid; defined with the iterator key accessors below.
+ */
+static inline void ft_iter_materialize_key(struct cds_ft_iter *iter);
+
+/*
  * Debug helpers for detecting stale cached iterator paths.
  *
  * Three entry-point roles mirror the rculfhash pattern:
@@ -721,6 +729,12 @@ static inline
 void iter_auto_invalidate_cache(struct cds_ft_iter *iter)
 {
 	if (iter->cache_mode == CDS_FT_ITER_UNCACHED) {
+		/*
+		 * Save a reference-keycopy key into iter_key before dropping
+		 * cache_valid, else the next uncached descent (and get_key) would
+		 * read the stale iter_key buffer rather than the live leaf.
+		 */
+		ft_iter_materialize_key(iter);
 		iter->cache_valid = false;
 		iter->path_len = 0;
 		iter_debug_path_clear(iter);
@@ -7811,6 +7825,73 @@ struct cds_ft_node *ft_node_external_nodes(struct cds_ft_inode_flag *node)
  * copy -- not ordinal_key -- carries the full result key.  Correctness is
  * validated end-to-end by the ordered-iteration / relational invariant tests.
  */
+static inline
+bool ft_group_keycopy(const struct cds_ft_group *group)
+{
+	return group->speculative_key_offset_set && group->speculative &&
+		(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED);
+}
+
+/*
+ * The iterator's current key lives as a live RCU REFERENCE into iter->node
+ * (at speculative_key_offset), rather than as a value copied into iter_key.
+ * True only for a keycopy group with an identity key map (so the stored bytes
+ * are already ordinal) AND a valid cached node (cache_valid).  When it holds,
+ * the key bytes are read straight from the leaf -- no per-result copy -- but
+ * they are only valid while the RCU read-side lock that produced iter->node is
+ * still held; cds_ft_iter_bind_key() materializes them for cross-CS resume.
+ * When false (non-identity, fresh set_key, post-bind, or non-keycopy group),
+ * the key is the value in iter_key.
+ */
+static inline
+bool ft_iter_key_referenced(const struct cds_ft_iter *iter)
+{
+	const struct cds_ft_group *group = iter->ft->group;
+
+	return ft_group_keycopy(group) && group->key_map.identity &&
+		iter->cache_valid && iter->node;
+}
+
+/*
+ * Read the iterator's CURRENT-POSITION key.  This is the single accessor every
+ * iter-consuming operation (cds_ft_next anchor, get_key, remove, remove_all,
+ * replace, skip fwd/rev) must use to read "the key the iterator currently
+ * stands on", because in a reference-keycopy group that key is NOT materialized
+ * in iter_key(iter) -- it lives in the matched leaf at speculative_key_offset.
+ *
+ * Invariant that makes this always correct: for a keycopy group, every result
+ * store sets iter->node to the matched leaf, whose stored key IS the current
+ * key, so iter->node + offset is authoritative whenever cache_valid && node.
+ * cds_ft_iter_set_key() clears cache_valid AND iter->node, so a freshly-set
+ * SEARCH key (not yet a position) correctly falls back to the iter_key value.
+ * Valid only while the RCU lock that produced iter->node is still held (same
+ * contract as reusing the cached position; cds_ft_iter_bind_key for cross-CS).
+ */
+static inline
+const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
+{
+	if (ft_iter_key_referenced(iter))
+		return (const uint8_t *) iter->node +
+			iter->ft->group->speculative_key_offset;
+	return iter_key(iter);
+}
+
+/*
+ * Copy a live leaf-referenced current key into the iterator's own buffer so it
+ * survives the position being detached (UNCACHED auto-invalidate, bind, or any
+ * cache_valid clear).  A no-op self-copy when the key is already a value in
+ * iter_key (copy-mode / non-keycopy group / fresh set_key), guarded out.  The
+ * bytes are ordinal (ft_iter_key_referenced requires an identity map).
+ */
+static inline
+void ft_iter_materialize_key(struct cds_ft_iter *iter)
+{
+	const uint8_t *cur = ft_iter_read_key(iter);
+
+	if (cur != iter_key(iter))
+		memcpy(iter_key(iter), cur, iter->key_len);
+}
+
 static inline_lookup
 bool ft_speculative_keycopy(const struct cds_ft *ft,
 		const struct cds_ft_node *leaf,
@@ -7821,9 +7902,17 @@ bool ft_speculative_keycopy(const struct cds_ft *ft,
 
 	if (!leaf || level < 0)
 		return false;
-	if (!group->speculative_key_offset_set || !group->speculative ||
-			!(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED))
+	if (!ft_group_keycopy(group))
 		return false;
+	/*
+	 * Identity map: the result key is left AS A REFERENCE in the matched
+	 * leaf (iter->node, set by the caller) -- no copy.  get_key and the next
+	 * continuation read it via ft_iter_key_referenced().  Return true so the
+	 * caller skips the ordinal_key fallback without writing iter_key.
+	 */
+	if (group->key_map.identity)
+		return true;
+	/* Non-identity: must remap to ordinal order, so copy into iter_key. */
 	leaf_key = (const uint8_t *) leaf + group->speculative_key_offset;
 	ft_key_to_ordinals(dst, leaf_key, (size_t) level, &group->key_map);
 	return true;
@@ -7912,7 +8001,22 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	 * needed.  The lone self-aliasing case -- the equal-match write below --
 	 * is a no-op and is guarded.
 	 */
-	input_key = iter_key(iter);
+	/*
+	 * Input-key source.  Only a LIMIT_NONE continuation (cds_ft_next/prev and
+	 * the relational lookups) iterates from the iterator's CURRENT key, which
+	 * on an identity keycopy group is read IN PLACE from the live node (no
+	 * prior copy was made).  LIMIT_FIRST/LIMIT_LAST are absolute and key off
+	 * the prefix in iter_key, not the current position, so they must NOT
+	 * reference the node (a reused iterator's stale node would mis-seed the
+	 * search).  Otherwise (fresh set_key, post-bind, non-identity / non-keycopy
+	 * group) the key is the value in iter_key.  iter->node is rewritten only by
+	 * the terminal result store, so this pointer stays valid through the
+	 * descent and going-up reads.
+	 */
+	if (limit == FT_LOOKUP_LIMIT_NONE)
+		input_key = ft_iter_read_key(iter);
+	else
+		input_key = iter_key(iter);
 	iter_key = input_key;
 
 	FT_TP(ineq_enter, (int) mode, input_key, key_len);
@@ -7974,23 +8078,32 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	if (iter->cache_valid && iter->node &&
 			(ssize_t)iter->path_len == key_depth &&
 			key_depth > 1) {
-		for (level = 1; level < key_depth; level++) {
-			switch (limit) {
-			case FT_LOOKUP_LIMIT_NONE:
-				ordinal_key[level - 1] =
-					input_key[level - 1];
-				break;
-			case FT_LOOKUP_LIMIT_FIRST:
-				ordinal_key[level - 1] =
-					input_key[level - 1];
-				break;
-			case FT_LOOKUP_LIMIT_LAST:
-				if ((size_t) level <= iter->prefix_len)
+		/*
+		 * Whole-key ordinal_key fill (the going-up result accumulator).
+		 * Dead on a keycopy group -- the result comes from the leaf, not
+		 * ordinal_key -- and re-reading the whole referenced leaf key here
+		 * would defeat the no-copy, so skip it.  @level is reset by the
+		 * loop-exit reconstruction below either way.
+		 */
+		if (!use_keycopy) {
+			for (level = 1; level < key_depth; level++) {
+				switch (limit) {
+				case FT_LOOKUP_LIMIT_NONE:
 					ordinal_key[level - 1] =
 						input_key[level - 1];
-				else
-					ordinal_key[level - 1] = 0xff;
-				break;
+					break;
+				case FT_LOOKUP_LIMIT_FIRST:
+					ordinal_key[level - 1] =
+						input_key[level - 1];
+					break;
+				case FT_LOOKUP_LIMIT_LAST:
+					if ((size_t) level <= iter->prefix_len)
+						ordinal_key[level - 1] =
+							input_key[level - 1];
+					else
+						ordinal_key[level - 1] = 0xff;
+					break;
+				}
 			}
 		}
 		{
@@ -11159,7 +11272,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		return s;
 	}
 
-	iter_key = iter_key(iter);
+	iter_key = ft_iter_read_key(iter);
 
 	dbg_printf("cds_ft_replace: old_node %p new_node %p\n", old_node, new_node);
 
@@ -12173,7 +12286,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 
-	iter_key = iter_key(iter);
+	iter_key = ft_iter_read_key(iter);
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
 	/*
@@ -12477,7 +12590,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		return CDS_FT_STATUS_OK;
 	}
 
-	iter_key = iter_key(iter);
+	iter_key = ft_iter_read_key(iter);
 	dbg_printf("cds_ft_remove_all attempt\n");
 
 	/*
@@ -17593,7 +17706,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 
 	/* Rebuild path from root to current key. */
-	depth = ft_rebuild_path(ft, iter_key(iter), iter->key_len,
+	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), iter->key_len,
 			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
@@ -18065,7 +18178,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 
 	/* Rebuild path from root to current key. */
-	depth = ft_rebuild_path(ft, iter_key(iter), iter->key_len,
+	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), iter->key_len,
 			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
@@ -20680,7 +20793,14 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
 	*result_key_len = iter->key_len;
 	if (iter->key_len > result_key_max_len)
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	ft_ordinals_to_key(result_key, iter_key(iter), iter->key_len,
+	/*
+	 * When the key is a live reference into iter->node (keycopy + identity +
+	 * valid cache), read it from the leaf; otherwise from the iter_key value.
+	 * The RCU read-side lock that produced iter->node must still be held --
+	 * the same contract as reusing the cached position; cross-CS callers
+	 * cds_ft_iter_bind_key() first.
+	 */
+	ft_ordinals_to_key(result_key, ft_iter_read_key(iter), iter->key_len,
 			&iter->ft->group->key_map);
 	return CDS_FT_STATUS_OK;
 }
