@@ -223,15 +223,18 @@
  * If the RCU read-side lock is dropped, the cached position may
  * reference memory reclaimed after a grace period.
  *
- * If you need to drop the RCU read-side lock between operations, you
- * MUST invalidate the iterator's cached position before reusing it.
- * This is done by calling:
- * - cds_ft_iter_invalidate_cache()
+ * If you need to drop the RCU read-side lock between operations, call
+ * cds_ft_iter_bind_key() WHILE STILL HOLDING the lock, before dropping it:
+ * - cds_ft_iter_bind_key()
  *
- * Calling this function clears the cached position while keeping your
- * key intact. The next position-reusing operation (e.g.,
- * cds_ft_remove_all) then falls back to a safe, fresh top-down
- * traversal by the key.
+ * Bind snapshots the iterator's current key into its own storage and clears
+ * the cached position.  The next position-reusing operation (e.g.,
+ * cds_ft_remove_all) then falls back to a safe, fresh top-down traversal by
+ * that key.  Snapshotting (rather than merely clearing the node pointer)
+ * matters because in a speculative group configured with a leaf-key offset the
+ * cached key is held as a live REFERENCE into the result node, valid only
+ * while the lock is held; bind copies it out before that node can be
+ * reclaimed.
  *
  * Example A (Continuous lock — fast):
  * rcu_read_lock();
@@ -239,15 +242,20 @@
  * cds_ft_remove(ft, iter, cds_ft_iter_node(iter)); // node still live; no re-descent
  * rcu_read_unlock();
  *
- * Example B (Dropped lock — re-derive from the key):
- * After dropping the RCU read-side lock the cached position is stale, so
- * invalidate it; a position-reusing operation then re-descends by the
- * iterator's key.  cds_ft_remove_all takes no node argument and derives
- * everything from the key, so it is safe under the writer mutex alone:
+ * Example B (Dropped lock — snapshot the key, re-derive from it):
+ * Bind the key while STILL HOLDING the lock; after the unlock the cached
+ * position is gone but the key is retained, so a position-reusing operation
+ * re-descends by it.  cds_ft_remove_all takes no node argument and, with the
+ * cached position cleared, derives everything from the key under the writer
+ * mutex alone:
  *
+ * rcu_read_lock();
+ * cds_ft_lookup(ft, iter);
+ * cds_ft_iter_bind_key(iter);         // snapshot the key + drop cached position
+ * rcu_read_unlock();
+ * ...
  * lock(&writer_mutex);
- * cds_ft_iter_invalidate_cache(iter); // discard the stale cached position
- * cds_ft_remove_all(ft, iter, &head); // re-descends by the key
+ * cds_ft_remove_all(ft, iter, &head); // re-descends by the snapshotted key
  * unlock(&writer_mutex);
  *
  * cds_ft_remove() and cds_ft_replace() take the target node explicitly
@@ -256,12 +264,12 @@
  * re-descent.  The RCU read-side lock must therefore be held CONTINUOUSLY
  * from when that node was obtained until the call, so the node has not
  * been reclaimed.  After a dropped lock the node is stale: re-look it up
- * (under the lock) and pass the fresh node — invalidate_cache() resets the
- * iterator's cached position but cannot refresh a node you already hold.
+ * (under the lock) and pass the fresh node — bind resets the iterator's
+ * cached position but cannot refresh a node you already hold.
  *
- * Note: CDS_FT_ITER_UNCACHED iterators do not require
- * cds_ft_iter_invalidate_cache() — the cached position is discarded
- * automatically after each operation.
+ * Note: CDS_FT_ITER_UNCACHED iterators do not require this — the cached
+ * position is discarded (and any referenced key snapshotted) automatically
+ * after each operation.
  *
  * Debug validation (URCU_FRACTAL_TRIE_DEBUG_PATH):
  *
@@ -1330,7 +1338,7 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  *            lock continuously from when @old_node was obtained until this
  *            call (concurrent mode; in exclusive mode the caller's mutual
  *            exclusion replaces that).  After a dropped lock, re-look up
- *            @old_node first — cds_ft_iter_invalidate_cache() resets the
+ *            @old_node first — cds_ft_iter_bind_key() resets the
  *            iterator's cached position but cannot refresh a node you
  *            already hold.
  * @new_node: Node to insert in place of @old_node. Must be
@@ -1366,7 +1374,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  *        read-side lock continuously from when @node was obtained until
  *        this call (concurrent mode; in exclusive mode the caller's
  *        mutual exclusion replaces that).  After a dropped lock, re-look
- *        up @node first — cds_ft_iter_invalidate_cache() resets the
+ *        up @node first — cds_ft_iter_bind_key() resets the
  *        iterator's cached position but cannot refresh a node you already
  *        hold.
  *
@@ -1387,12 +1395,12 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * @iter: Iterator position identifying the key.
  *        If the iterator holds a valid cached position from a prior
  *        lookup, remove_all reuses it to avoid a full traversal.
- *        WARNING (CDS_FT_ITER_CACHED only): If the RCU read-side
- *        lock was dropped since the last iterator operation, you must
- *        call cds_ft_iter_invalidate_cache() to invalidate the cached
- *        position before calling this function; it then re-descends by
- *        the key.  CDS_FT_ITER_UNCACHED iterators handle this
- *        automatically and do not require cds_ft_iter_invalidate_cache().
+ *        WARNING (CDS_FT_ITER_CACHED only): If you intend to drop the
+ *        RCU read-side lock between the positioning lookup and this
+ *        call, you must call cds_ft_iter_bind_key() WHILE STILL HOLDING
+ *        that lock to snapshot the key and clear the cached position;
+ *        remove_all then re-descends by the key.  CDS_FT_ITER_UNCACHED
+ *        iterators handle this automatically.
  * @result_node: Node output. Set to the head of the removed duplicate
  *               chain on success, or NULL if no node is found or on
  *               error.
@@ -2456,9 +2464,9 @@ void cds_ft_iter_destroy(struct cds_ft_iter *iter);
  * @mode: Cache mode to set.
  *
  * Switching from CDS_FT_ITER_CACHED to CDS_FT_ITER_UNCACHED
- * immediately invalidates any cached position (equivalent to calling
- * cds_ft_iter_invalidate_cache()). Switching from UNCACHED to CACHED
- * is always safe since there is no stale position.
+ * immediately clears any cached position (snapshotting a referenced
+ * key first, as cds_ft_iter_bind_key() does). Switching from UNCACHED
+ * to CACHED is always safe since there is no stale position.
  *
  * May be called at any point in the iterator's lifetime.
  *
@@ -2545,48 +2553,34 @@ enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t p
 void cds_ft_iter_reset(struct cds_ft_iter *iter);
 
 /*
- * cds_ft_iter_invalidate_cache - Invalidate the iterator's cached position.
+ * cds_ft_iter_bind_key - Snapshot the current key into the iterator and drop
+ *                        the cached position (for cross-critical-section resume).
  * @iter: The iterator.
  *
- * Invalidates the RCU-protected position cached in the iterator.
- * The next operation on this iterator will be forced to perform a
- * fresh top-down traversal using the current key. The key and prefix
- * length are preserved.
+ * Drops the RCU-protected position cached in the iterator and snapshots its
+ * current key into the iterator's own storage: the next operation is forced to
+ * perform a fresh top-down traversal from that key.  The key and prefix length
+ * are preserved.
  *
- * For CDS_FT_ITER_CACHED iterators, this function must be called
- * if the RCU read-side lock is dropped between operations on the same
- * iterator, to prevent use-after-free of the cached position.
+ * For CDS_FT_ITER_CACHED iterators this must be called if the RCU read-side
+ * lock is dropped between operations on the same iterator, both to prevent
+ * use-after-free of the cached node AND -- in a speculative skip-compressed
+ * group configured with a leaf-key offset
+ * (cds_ft_group_attr_set_speculative_key_offset()) -- because the current key
+ * after an ordered lookup (cds_ft_lookup_first / cds_ft_next / the relational
+ * lookups) is held as a LIVE REFERENCE into the matched leaf, valid only while
+ * that lock is held.  Bind copies it out WHILE STILL HOLDING the lock, so the
+ * iterator no longer depends on the soon-to-be-reclaimable leaf.
  *
- * CDS_FT_ITER_UNCACHED iterators do not require this call — the
- * cached position is discarded automatically after each operation.
- * Calling it on an uncached iterator is harmless but unnecessary.
- */
-void cds_ft_iter_invalidate_cache(struct cds_ft_iter *iter);
-
-/*
- * cds_ft_iter_bind_key - Snapshot the current key into the iterator for
- *                        cross-critical-section resume.
- * @iter: The iterator.
- *
- * In a speculative skip-compressed group configured with a leaf-key offset
- * (cds_ft_group_attr_set_speculative_key_offset()), the iterator's current
- * key after an ordered lookup (cds_ft_lookup_first / cds_ft_next / the
- * relational lookups) is held as a LIVE REFERENCE into the matched leaf, valid
- * only while the RCU read-side lock that produced it is still held.  To pause
- * an ordered iteration and resume it in a LATER critical section, call
- * cds_ft_iter_bind_key() WHILE STILL HOLDING the lock: it copies the current
- * key into the iterator's own storage and invalidates the cached position
- * (cds_ft_iter_invalidate_cache()), so the iterator no longer depends on the
- * soon-to-be-reclaimable leaf.
+ * CDS_FT_ITER_UNCACHED iterators do not require this call -- the cached
+ * position is discarded (and any referenced key snapshotted) automatically
+ * after each operation.
  *
  * After bind the iterator is uncached-equivalent: cds_ft_iter_get_key() still
  * returns the bound key, and the next cds_ft_next() in a fresh critical section
  * re-descends from the root and yields the bound key's successor (robust even
  * if the bound key was removed in the meantime).  cds_ft_iter_node() returns
  * NULL until that re-descent.
- *
- * For groups without a configured leaf-key offset the current key is already a
- * stable value, so this is exactly cds_ft_iter_invalidate_cache().
  *
  * Piecewise iteration:
  *

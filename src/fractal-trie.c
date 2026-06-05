@@ -20177,9 +20177,12 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 	/*
 	 * Drop the cached path before releasing the read lock: the nodes it
 	 * references become eligible for the grace-period free once unlocked.
-	 * The iterator's key is retained, so the next step re-descends from it.
+	 * Bind (not just invalidate) so the iterator's key is materialized into
+	 * its own buffer -- on a reference-keycopy group the live key is a leaf
+	 * reference that does NOT survive the unlock, and the next step
+	 * re-descends from that key.
 	 */
-	cds_ft_iter_invalidate_cache(st->iter);
+	cds_ft_iter_bind_key(st->iter);
 	flavor->read_unlock();
 	ft_recompact_alloc_set_active(NULL);
 	return !st->done;
@@ -20885,29 +20888,24 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 #endif
 }
 
-void cds_ft_iter_invalidate_cache(struct cds_ft_iter *iter)
-{
-	FT_TP(iter_invalidate_cache, (const void *) iter->ft, (const void *) iter);
-	iter->cache_valid = false;
-	iter_debug_path_clear(iter);
-	iter->path_len = 0;
-	iter->node = NULL;
-}
-
 void cds_ft_iter_bind_key(struct cds_ft_iter *iter)
 {
+	FT_TP(iter_invalidate_cache, (const void *) iter->ft, (const void *) iter);
 	/*
 	 * Materialize a live leaf-referenced key into the iterator's own buffer
 	 * BEFORE detaching, so a cross-critical-section resume re-descends from
 	 * the stable buffer rather than the (post-unlock, possibly reclaimed)
 	 * leaf.  ft_iter_read_key resolves to iter_key(iter) itself when the key
 	 * is already a value (copy-mode / non-keycopy group / fresh set_key), in
-	 * which case the memcpy is a no-op self-copy and this is a plain
-	 * invalidate.  The bytes are ordinal (ft_iter_key_referenced requires an
-	 * identity key map), matching iter_key(iter)'s representation.
+	 * which case the memcpy is a no-op self-copy.  The bytes are ordinal
+	 * (ft_iter_key_referenced requires an identity key map), matching
+	 * iter_key(iter)'s representation.
 	 */
 	ft_iter_materialize_key(iter);
-	cds_ft_iter_invalidate_cache(iter);
+	iter->cache_valid = false;
+	iter_debug_path_clear(iter);
+	iter->path_len = 0;
+	iter->node = NULL;
 }
 
 void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
@@ -20941,9 +20939,13 @@ enum cds_ft_status cds_ft_iter_set_cache_mode(struct cds_ft_iter *iter,
 		/*
 		 * Switching to uncached mode: any previously cached
 		 * path may become stale if the caller drops the RCU
-		 * read-side lock, so invalidate it now.
+		 * read-side lock, so invalidate it now.  Materialize a
+		 * reference-keycopy key first (same as the per-op uncached
+		 * auto-invalidate), so the next re-descent reads the saved
+		 * key rather than a stale buffer.
 		 */
 		if (iter->cache_mode == CDS_FT_ITER_CACHED) {
+			ft_iter_materialize_key(iter);
 			iter->cache_valid = false;
 			iter_debug_path_clear(iter);
 			iter->path_len = 0;

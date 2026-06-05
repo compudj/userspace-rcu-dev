@@ -9372,7 +9372,7 @@ static int test_iter_uncached_reverse(void)
 /*
  * Uncached lookup followed by remove, with the RCU lock dropped
  * between the two operations. This is the pattern that would be
- * unsafe in CACHED mode without cds_ft_iter_invalidate_cache().
+ * unsafe in CACHED mode without cds_ft_iter_bind_key().
  */
 static int test_iter_uncached_lookup_remove(void)
 {
