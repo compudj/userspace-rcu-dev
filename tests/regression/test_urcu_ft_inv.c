@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	22
+#define NR_TESTS	21
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -518,164 +518,17 @@ static int inv_iteration_order(void)
 
 /* ================================================================== */
 /*                                                                    */
-/*   INVARIANT 1b: Cross-CS bind/resume preserves forward order       */
-/*                                                                    */
-/* ================================================================== */
-
-#define BIND_BATCH	7
-
-/*
- * Iterate forward in batches: after every BIND_BATCH keys, snapshot the
- * position with cds_ft_iter_bind_key(), drop the RCU read lock, pass a
- * quiescent state (so a concurrently-removed bound key can actually be
- * reclaimed), re-lock, and resume with cds_ft_next().  The resulting sequence
- * must still be strictly increasing -- bind must re-descend from the
- * materialized key, never from the (possibly freed) cached node.
- */
-static void *inv_bind_resume_reader(void *arg)
-{
-	struct inv_iter_ctx *ctx = (struct inv_iter_ctx *) arg;
-	struct cds_ft_iter *iter;
-	unsigned long iters = 0;
-
-	rcu_register_thread();
-
-	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
-		abort();
-
-	while (!test_go)
-		;
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-
-	while (!test_stop) {
-		uint64_t prev = 0;
-		int first = 1;
-		int in_batch = 0;
-		int count = 0;
-
-		rcu_read_lock();
-		cds_ft_lookup_first(ctx->ft, iter);
-		while (cds_ft_iter_node(iter)) {
-			uint8_t rk[8];
-			size_t rk_len;
-			uint64_t v;
-
-			cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
-			v = cds_ft_key_to_u64(ctx->ft, rk, CDS_FT_LEN_DEFAULT);
-			if (!first && v <= prev) {
-				report_violation(ctx->test_name,
-					"bind-resume forward order: %" PRIu64
-					" after %" PRIu64 " (iter #%lu, position %d)",
-					v, prev, iters, count);
-				break;
-			}
-			prev = v;
-			first = 0;
-			count++;
-			if (++in_batch >= BIND_BATCH) {
-				cds_ft_iter_bind_key(iter);
-				rcu_read_unlock();
-				rcu_quiescent_state();
-				rcu_read_lock();
-				cds_ft_next(ctx->ft, iter);
-				in_batch = 0;
-			} else {
-				cds_ft_next(ctx->ft, iter);
-			}
-		}
-		rcu_read_unlock();
-
-		iters++;
-		if ((iters & 0x3f) == 0)
-			rcu_quiescent_state();
-	}
-
-	cds_ft_iter_destroy(iter);
-	rcu_unregister_thread();
-	return NULL;
-}
-
-static int inv_bind_resume_order(void)
-{
-	struct cds_ft_group *group;
-	struct cds_ft *ft = create_fixed_ft(4, &group);
-	struct timespec t0;
-	struct {
-		struct inv_iter_ctx ctx;
-		pthread_mutex_t lock;
-	} shared;
-	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
-	unsigned int i;
-
-	shared.ctx.ft = ft;
-	shared.ctx.key_len = 4;
-	shared.ctx.test_name = "inv_bind_resume_order";
-	pthread_mutex_init(&shared.lock, NULL);
-
-	rcu_read_lock();
-	for (i = 0; i < WRITER_POOL_SIZE / 2; i++) {
-		struct ft_test_node *n = node_alloc(i);
-		insert_u64(ft, i, n);
-	}
-	rcu_read_unlock();
-
-	test_go = 0;
-	test_stop = 0;
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-
-	for (i = 0; i < NR_READERS_DEFAULT; i++)
-		pthread_create(&readers[i], NULL, inv_bind_resume_reader, &shared.ctx);
-	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
-		pthread_create(&writers[i], NULL, inv_iter_order_writer, &shared.ctx);
-
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
-
-	rcu_thread_offline();
-
-	clock_gettime(CLOCK_MONOTONIC, &t0);
-
-	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
-		usleep(1000);
-
-	test_stop = 1;
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-
-	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
-		pthread_join(writers[i], NULL);
-	for (i = 0; i < NR_READERS_DEFAULT; i++)
-		pthread_join(readers[i], NULL);
-
-	rcu_thread_online();
-
-	pthread_mutex_destroy(&shared.lock);
-
-	if (atomic_load(&violation_count) > 0) {
-		fprintf(stderr, "inv_bind_resume_order: %lu violation(s)\n",
-			atomic_load(&violation_count));
-		drain_and_destroy(ft, group);
-		return -1;
-	}
-	return drain_and_destroy(ft, group);
-}
-
-/* ================================================================== */
-/*                                                                    */
-/*   INVARIANT 1c: Resumable compaction terminates on a keycopy trie  */
+/*   Compaction terminates + preserves keys on a keycopy trie         */
 /*                                                                    */
 /* ================================================================== */
 
 /*
- * Exercise cds_ft_compact_step on a reference-keycopy trie.  The compactor
- * iterates with a CACHED iterator, dropping the read lock between windows and
- * re-descending from the iterator's retained key; on a keycopy trie that key
- * is a live leaf reference, so the cross-window detach must snapshot it
- * (cds_ft_iter_bind_key) rather than just clear the cached node (the old
- * cds_ft_iter_invalidate_cache).  This drives that path end to end and checks
- * that compaction terminates and preserves every surviving key in order.  The
- * step cap is a non-termination safety net; the full stale-key loop only
- * reproduces at the trie-benchmark's 1M-DNS-key scale (FT_BENCH_COMPACT), as
- * the simple u64 keyspace here compacts in too few windows to diverge.
+ * Exercise cds_ft_compact_step on a keycopy trie (a speculative leaf-key
+ * offset is configured).  Build, drain to sparsely-occupied ranges, then
+ * compact one relocation per window (batch 1) and verify it terminates and
+ * preserves every surviving key in order.  Compaction is keycopy-agnostic in
+ * copy mode -- across windows the iterator re-descends from its retained key
+ * value -- so this is a functional smoke; the step cap guards non-termination.
  */
 static int inv_compact_keycopy_terminates(void)
 {
@@ -1565,7 +1418,7 @@ static void *inv_relational_reader(void *arg)
 		 * real grace-period boundary that a cached path would
 		 * cross.
 		 */
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 
 		rcu_read_unlock();
 
@@ -3280,7 +3133,7 @@ static void *inv_merge_no_escape_reader(void *arg)
 		 * traversal re-descends from the live root (CDS_FT_ITER_CACHED
 		 * contract).
 		 */
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -3392,7 +3245,7 @@ static void *inv_merge_no_escape_writer(void *arg)
 		 * following a path that may have been freed
 		 * (CDS_FT_ITER_CACHED contract), mirroring the reader.
 		 */
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		pthread_mutex_lock(&ctx->lock);
 		for (i = 0; i < 4; i++)
 			inv_merge_remove_key(ctx->dst, iter, inv_merge_src_keys[i]);
@@ -3577,7 +3430,7 @@ static void *inv_merge_nonroot_dst_writer(void *arg)
 
 		/* Reset: pull the merged keys back out, re-populate src. */
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		pthread_mutex_lock(&ctx->lock);
 		for (i = 0; i < 4; i++)
 			inv_merge_remove_key(ctx->dst, iter,
@@ -3735,7 +3588,7 @@ static void *inv_merge_compressed_dst_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -3800,7 +3653,7 @@ static void *inv_merge_compressed_dst_writer(void *arg)
 		rcu_quiescent_state();
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		pthread_mutex_lock(&ctx->lock);
 		inv_merge_remove_key(ctx->dst, iter, "Tabw");
 		n = node_alloc(300);
@@ -3939,7 +3792,7 @@ static void *inv_merge_key_shorter_dst_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -4010,7 +3863,7 @@ static void *inv_merge_key_shorter_dst_writer(void *arg)
 		rcu_quiescent_state();
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		pthread_mutex_lock(&ctx->lock);
 		inv_merge_remove_key(ctx->dst, iter, "Taw");
 		n = node_alloc(300);
@@ -4150,7 +4003,7 @@ static void *inv_merge_key_shorter_src_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -4222,7 +4075,7 @@ static void *inv_merge_key_shorter_src_writer(void *arg)
 		rcu_quiescent_state();
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		pthread_mutex_lock(&ctx->lock);
 		inv_merge_remove_key(ctx->dst, iter, "QZ");
 		n = node_alloc(300);
@@ -4367,7 +4220,7 @@ static void *inv_merge_compressed_parent_dst_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -4433,7 +4286,7 @@ static void *inv_merge_compressed_parent_dst_writer(void *arg)
 		rcu_quiescent_state();
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		pthread_mutex_lock(&ctx->lock);
 		inv_merge_remove_key(ctx->dst, iter, "aXYP");
 		n = node_alloc(300);
@@ -4592,7 +4445,7 @@ static void *inv_merge_atomic_reader(void *arg)
 		bool saw_a = false, saw_b = false;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		s = reverse ? cds_ft_lookup_last(ctx->dst, iter)
 			: cds_ft_lookup_first(ctx->dst, iter);
 		while (s == CDS_FT_STATUS_OK) {
@@ -4787,7 +4640,7 @@ static void *inv_merge_atomic_deep_reader(void *arg)
 		bool saw_a = false, saw_b = false;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
+		cds_ft_iter_invalidate_cache(iter);
 		s = reverse ? cds_ft_lookup_last(ctx->dst, iter)
 			: cds_ft_lookup_first(ctx->dst, iter);
 		while (s == CDS_FT_STATUS_OK) {
@@ -5004,7 +4857,6 @@ int main(int argc, char **argv)
 
 	diag("1. Iteration ordering");
 	RUN_TEST(inv_iteration_order);
-	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_compact_keycopy_terminates);
 	RUN_TEST(inv_reverse_iteration_order);
 
