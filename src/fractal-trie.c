@@ -7524,7 +7524,8 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 		const uint8_t *input_key,
 		struct cds_ft_iter *iter,
 		uint8_t *ordinal_key,
-		bool *skip_eq_external_nodes_p)
+		bool *skip_eq_external_nodes_p,
+		const bool fill_ordinal)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
@@ -7572,9 +7573,9 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 					true, &mpos);
 
 	/* Fill ordinal_key and iter_path for the matched prefix. */
-	for (j = 0; j < (cmp_result ? (int)mpos : cmp); j++) {
-		ordinal_key[level - 1 + j] = cmp_key[j];
-	}
+	if (fill_ordinal)
+		for (j = 0; j < (cmp_result ? (int)mpos : cmp); j++)
+			ordinal_key[level - 1 + j] = cmp_key[j];
 	/* Advance iter_key for LIMIT_NONE. */
 	if (limit == FT_LOOKUP_LIMIT_NONE)
 		*iter_key_p += (cmp_result ? mpos + 1 : (unsigned int)cmp);
@@ -7587,7 +7588,8 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 		 * key > path at mismatch: GE/GT go up, LE/LT descend.
 		 * key < path at mismatch: GE/GT descend, LE/LT go up.
 		 */
-		ordinal_key[level - 1 + mpos] = cmp_key[mpos];
+		if (fill_ordinal)
+			ordinal_key[level - 1 + mpos] = cmp_key[mpos];
 		if ((cmp_result > 0 && (mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT)) ||
 		    (cmp_result < 0 && (mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT))) {
 			/*
@@ -7609,9 +7611,10 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 			return FT_DESCENT_GOING_UP;
 		}
 		/* Descend into compressed subtree. */
-		ordinal_key[level - 1 + mpos] = cn->key_bytes[mpos];
-		for (j = mpos + 1; j < cn->len; j++) {
-			ordinal_key[level - 1 + j] = cn->key_bytes[j];
+		if (fill_ordinal) {
+			ordinal_key[level - 1 + mpos] = cn->key_bytes[mpos];
+			for (j = mpos + 1; j < cn->len; j++)
+				ordinal_key[level - 1 + j] = cn->key_bytes[j];
 		}
 		level += cn->len - 1;
 		node_flag = ft_dereference_acquire_prefetch(cn->child);
@@ -7639,9 +7642,9 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 		if (mode == FT_LOOKUP_GE || mode == FT_LOOKUP_GT) {
 			int k;
 
-			for (k = cmp; k < cn->len; k++) {
-				ordinal_key[level - 1 + k] = cn->key_bytes[k];
-			}
+			if (fill_ordinal)
+				for (k = cmp; k < cn->len; k++)
+					ordinal_key[level - 1 + k] = cn->key_bytes[k];
 			level += cn->len - 1;
 			node_flag = ft_dereference_acquire_prefetch(cn->child);
 			assert(node_flag != NULL);	/* compressed node always has a live child */
@@ -7709,7 +7712,8 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 		struct cds_ft_node **ret_node_p,
 		bool *skip_eq_external_nodes_p,
 		uint8_t *ordinal_key,
-		enum ft_direction dir)
+		enum ft_direction dir,
+		const bool fill_ordinal)
 {
 	struct cds_ft_inode_flag *node_flag = *node_flag_p;
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
@@ -7733,7 +7737,8 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 	 * returns NULL for siblings, causing the going-up walk to
 	 * continue ascending).
 	 */
-	ft_fill_compressed_path(cn, ordinal_key, level - 1);
+	if (fill_ordinal)
+		ft_fill_compressed_path(cn, ordinal_key, level - 1);
 	level += cn->len - 1;
 	node_flag = ft_dereference_acquire_prefetch(cn->child);
 	if (!node_flag) {
@@ -8067,7 +8072,8 @@ slow_path:
 			act = ft_inequality_compressed(&node_flag,
 				&level, key_depth, mode, limit,
 				&iter_key, input_key, iter,
-				ordinal_key, &skip_eq_external_nodes);
+				ordinal_key, &skip_eq_external_nodes,
+				true);
 			if (act == FT_DESCENT_GOING_UP) {
 				/*
 				 * @node_flag is the compressed node; it occupies
@@ -8709,7 +8715,7 @@ descend_children:
 			act = ft_inequality_minmax_compressed(
 				&node_flag, &level, &ret_node,
 				&skip_eq_external_nodes,
-				ordinal_key, dir);
+				ordinal_key, dir, true);
 			if (act == FT_DESCENT_FOUND_MINMAX)
 				goto found_minmax;
 			if (act == FT_DESCENT_BREAK)
