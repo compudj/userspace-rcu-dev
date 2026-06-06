@@ -7046,12 +7046,36 @@ static enum cds_ft_status ft_lookup_longest_match_iter_sc(struct cds_ft *,
 		struct cds_ft_iter *);
 static enum cds_ft_status ft_lookup_longest_match_iter_nosc(struct cds_ft *,
 		struct cds_ft_iter *);
+/* Limit-none relational specializations (defined after the impl below). */
+static enum cds_ft_status ft_ineq_le_keycopy(struct cds_ft *, struct cds_ft_iter *);
+static enum cds_ft_status ft_ineq_le_eager(struct cds_ft *, struct cds_ft_iter *);
+static enum cds_ft_status ft_ineq_ge_keycopy(struct cds_ft *, struct cds_ft_iter *);
+static enum cds_ft_status ft_ineq_ge_eager(struct cds_ft *, struct cds_ft_iter *);
+static enum cds_ft_status ft_ineq_lt_keycopy(struct cds_ft *, struct cds_ft_iter *);
+static enum cds_ft_status ft_ineq_lt_eager(struct cds_ft *, struct cds_ft_iter *);
+static enum cds_ft_status ft_ineq_gt_keycopy(struct cds_ft *, struct cds_ft_iter *);
+static enum cds_ft_status ft_ineq_gt_eager(struct cds_ft *, struct cds_ft_iter *);
 
 static
 void ft_install_lookup_ops(struct cds_ft *ft)
 {
 	const struct cds_ft_group *group = ft->group;
 	bool sc = ft_group_skip_compressed(group);
+	/*
+	 * Limit-none relational entries: resolve the immutable use_keycopy config
+	 * once and install the matching specialization, so cds_ft_lookup_le/ge/lt/gt
+	 * (and cds_ft_next/prev) tail-call through @ft with no per-call config
+	 * branch.  Independent of key_map.identity (ft_speculative_keycopy handles
+	 * non-identity via ft_key_to_ordinals), so installed before the early
+	 * non-identity return below.
+	 */
+	bool kc = group->speculative_key_offset_set && group->speculative &&
+			(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED);
+
+	ft->lookup_le_fn = kc ? ft_ineq_le_keycopy : ft_ineq_le_eager;
+	ft->lookup_ge_fn = kc ? ft_ineq_ge_keycopy : ft_ineq_ge_eager;
+	ft->lookup_lt_fn = kc ? ft_ineq_lt_keycopy : ft_ineq_lt_eager;
+	ft->lookup_gt_fn = kc ? ft_ineq_gt_keycopy : ft_ineq_gt_eager;
 
 	/*
 	 * Iter-form lookup_iter_fn: iter always carries ordinals-mapped
@@ -8943,6 +8967,32 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 }
 
 /*
+ * Limit-none relational specializations, installed as fn-pointers by
+ * ft_install_lookup_ops.  Each bakes its mode, LIMIT_NONE, and use_keycopy
+ * into the force-inline cds_ft_lookup_inequality_impl so the body DCEs to a
+ * single arm; referenced only via the installed pointer, so they stay real
+ * out-of-line symbols and the public entry is a bare indirect tail-call.  The
+ * RCU read lock is taken here (mirroring the lookup-API inners).
+ */
+#define FT_INEQ_SPEC(name, mode, kc)					\
+	static enum cds_ft_status name(struct cds_ft *ft,		\
+			struct cds_ft_iter *iter)			\
+	{								\
+		CDS_FT_SCOPED_READER(ft);				\
+		return cds_ft_lookup_inequality_impl(ft, iter,		\
+				(mode), FT_LOOKUP_LIMIT_NONE, (kc));	\
+	}
+FT_INEQ_SPEC(ft_ineq_le_keycopy, FT_LOOKUP_LE, true)
+FT_INEQ_SPEC(ft_ineq_le_eager,   FT_LOOKUP_LE, false)
+FT_INEQ_SPEC(ft_ineq_ge_keycopy, FT_LOOKUP_GE, true)
+FT_INEQ_SPEC(ft_ineq_ge_eager,   FT_LOOKUP_GE, false)
+FT_INEQ_SPEC(ft_ineq_lt_keycopy, FT_LOOKUP_LT, true)
+FT_INEQ_SPEC(ft_ineq_lt_eager,   FT_LOOKUP_LT, false)
+FT_INEQ_SPEC(ft_ineq_gt_keycopy, FT_LOOKUP_GT, true)
+FT_INEQ_SPEC(ft_ineq_gt_eager,   FT_LOOKUP_GT, false)
+#undef FT_INEQ_SPEC
+
+/*
  * Iterator-based inequality lookup public API.
  * The caller sets the key via cds_ft_iter_set_key() before calling.
  * On return the iterator holds the result key, key length, node, path,
@@ -8951,37 +9001,25 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 enum cds_ft_status cds_ft_lookup_le(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
-	CDS_FT_SCOPED_READER(ft);
-	dbg_printf("cds_ft_lookup_le\n");
-	return cds_ft_lookup_inequality(ft, iter,
-			FT_LOOKUP_LE, FT_LOOKUP_LIMIT_NONE);
+	return (*ft->lookup_le_fn)(ft, iter);
 }
 
 enum cds_ft_status cds_ft_lookup_ge(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
-	CDS_FT_SCOPED_READER(ft);
-	dbg_printf("cds_ft_lookup_ge\n");
-	return cds_ft_lookup_inequality(ft, iter,
-			FT_LOOKUP_GE, FT_LOOKUP_LIMIT_NONE);
+	return (*ft->lookup_ge_fn)(ft, iter);
 }
 
 enum cds_ft_status cds_ft_lookup_lt(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
-	CDS_FT_SCOPED_READER(ft);
-	dbg_printf("cds_ft_lookup_lt\n");
-	return cds_ft_lookup_inequality(ft, iter,
-			FT_LOOKUP_LT, FT_LOOKUP_LIMIT_NONE);
+	return (*ft->lookup_lt_fn)(ft, iter);
 }
 
 enum cds_ft_status cds_ft_lookup_gt(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
-	CDS_FT_SCOPED_READER(ft);
-	dbg_printf("cds_ft_lookup_gt\n");
-	return cds_ft_lookup_inequality(ft, iter,
-			FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE);
+	return (*ft->lookup_gt_fn)(ft, iter);
 }
 
 enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,

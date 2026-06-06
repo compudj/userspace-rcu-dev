@@ -678,6 +678,17 @@ struct cds_ft {
 	cds_ft_lookup_iter_fn lookup_partial_iter_fn;
 	cds_ft_lookup_prefix_key_fn lookup_longest_match_key_fn;
 	cds_ft_lookup_iter_fn lookup_longest_match_iter_fn;
+	/*
+	 * Limit-none relational entries (cds_ft_lookup_le/ge/lt/gt, and
+	 * cds_ft_next/prev which resolve to gt/lt).  Installed once at create
+	 * (ft_install_lookup_ops) to the use_keycopy-appropriate specialization,
+	 * so the public entry is a single indirect tail-call with no per-call
+	 * config branch.  first/last stay on the inline dispatcher (cold path).
+	 */
+	cds_ft_lookup_iter_fn lookup_le_fn;
+	cds_ft_lookup_iter_fn lookup_ge_fn;
+	cds_ft_lookup_iter_fn lookup_lt_fn;
+	cds_ft_lookup_iter_fn lookup_gt_fn;
 
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
 
