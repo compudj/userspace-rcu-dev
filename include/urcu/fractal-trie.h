@@ -1655,33 +1655,31 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * @src_ft is moved into @dst_ft, and @src_ft becomes empty on
  * success.
  *
- * Algorithm (single call from the caller's POV):
+ * Atomicity: the entire merge is published to concurrent RCU
+ * readers of @dst_ft as a single atomic transition.  A reader
+ * sees either the complete pre-merge @dst_ft or the complete
+ * post-merge @dst_ft -- never a partially-applied merge, and
+ * never a half-spliced duplicate chain at any key.  The merge is
+ * built invisibly (no published intermediate state) and then
+ * committed in one of two ways, depending on @dst_ft at @key:
  *
- *   1. Detach @src_ft at @key into a transient internal sub-trie.
- *      For a concurrent-mode @src_ft this incurs one grace period
- *      (the same one cds_ft_detach already needs to drain readers
- *      of the moved subtree); for an exclusive @src_ft no grace
- *      period is required.  After this step the transient is
- *      exclusive and @src_ft retains only the keys outside @key.
- *   2. Compute the longest common prefix (LCP) of the transient's
- *      stripped keys.  The full attach point in @dst_ft is
- *      @key concatenated with that LCP.
- *   3. If @dst_ft has no content under @key||LCP, move the
- *      transient as a single sub-trie:
- *        - LCP empty: graft the transient into @dst_ft at @key.
- *        - LCP non-empty: nested-detach the transient at LCP and
- *          graft the inner sub-trie into @dst_ft at @key||LCP.
- *      Works uniformly for variable-length and fixed-length
- *      groups; the intermediate stripped-key state is purely
- *      internal.
- *   4. Otherwise, drain the transient one duplicate chain at a
- *      time, re-prepending @key to each stripped key, and insert
- *      into @dst_ft.
+ *   1. Empty destination at @key: @src_ft's subtree is moved and
+ *      published at @key with a single atomic pointer store -- the
+ *      same primitive cds_ft_graft uses.
  *
- * Concurrent RCU readers on @dst_ft observe a sequence of single
- * atomic publishes — either the fast-path graft or one per
- * per-entry insert — and never see a half-merged duplicate chain
- * at a given key.
+ *   2. Non-empty destination at @key (the union case): the source
+ *      subtree is spine-copied into a fresh merged cluster built
+ *      off to the side, then committed by a single flip-latch
+ *      store (see src/urcu-flip-latch.h).  One release store
+ *      switches the merge-point forward edge together with the
+ *      affected back-pointers from the old destination subtree to
+ *      the merged cluster, so the whole set flips atomically for
+ *      readers with no grace-period drain.  Same-key duplicate
+ *      chains are concatenated as part of the committed cluster.
+ *
+ * @src_ft's moved nodes are reclaimed under the usual RCU
+ * discipline (deferred via call_rcu); @src_ft retains only the
+ * keys that do not start with @key.
  *
  * Returns CDS_FT_STATUS_OK on success (including the no-op case
  * where @src_ft has no content under @key).
@@ -1690,10 +1688,13 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * the same group, or if @key_len exceeds the group's maximum key
  * length.
  * Returns a negative cds_ft_status on memory allocation failure.
- * On failure the function makes a best-effort rollback of the
- * initial detach by grafting the transient back into @src_ft at
- * @key; if the rollback itself fails, the affected externals are
- * leaked.  Both tries remain individually valid in any case.
+ * Because the merge is built invisibly before it is committed, an
+ * allocation failure leaves both tries pristine.  In the
+ * empty-destination path only, a failure after the source subtree
+ * has been detached triggers a best-effort rollback that re-grafts
+ * it back into @src_ft at @key; if that rollback itself fails, the
+ * affected externals are leaked.  Both tries remain individually
+ * valid in any case.
  *
  * Mutual exclusion between writers on both @dst_ft and @src_ft is
  * the caller's responsibility.
@@ -1726,14 +1727,20 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * partition rename) that cannot be expressed via the public
  * cds_ft_detach + cds_ft_graft pair on fixed-length groups.
  *
- * Same algorithm and same contract as cds_ft_merge, with @src_key
- * driving the initial detach and @dst_key driving the graft attach
- * point and per-entry key re-prepend.
+ * Same algorithm and same whole-operation-atomic contract as
+ * cds_ft_merge (the single-graft commit for an empty destination,
+ * the flip-latch commit for the union case), with @src_key
+ * selecting the source subtree to move and @dst_key serving as
+ * both the destination attach point and the prefix that replaces
+ * @src_key on each moved key.
  *
  * Returns the same statuses as cds_ft_merge.  In addition,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR is returned if either
  * @src_key_len or @dst_key_len exceeds the group's maximum key
- * length.
+ * length, or -- for a fixed-length key group -- if
+ * @dst_key_len != @src_key_len (a fixed-length group accepts only
+ * keys of its fixed length, so the moved keys keep that length
+ * only when the source and destination prefixes are equally long).
  */
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
