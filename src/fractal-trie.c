@@ -3055,6 +3055,20 @@ static inline void ft_maybe_prefetch(const void *ptr)
 }
 
 /*
+ * Non-temporal variant for stream-once spatial prefetch (the inequality
+ * adjacent-sibling: a near-future iteration target read once, not reused like a
+ * descent node).  prefetchnta fills with minimal cache-level allocation so the
+ * streamed siblings do not evict the hot working set -- aimed at the extra LLC
+ * traffic the temporal adjacent prefetch adds.  Same internal-only FT_TAG_MASK
+ * guard (leaves are the random/use-once 2 MiB-page foot-gun -- see above).
+ */
+static inline void ft_maybe_prefetch_nta(const void *ptr)
+{
+	if (((unsigned long) ptr & FT_TAG_MASK) != 0)
+		__builtin_prefetch(ptr, 0, 0);
+}
+
+/*
  * ft_dereference_prefetch: for tagged FT node pointers.  Prefetches the
  * raw pointer via ft_maybe_prefetch, which does NOT clear the
  * skip-compressed length bits (see there: a skip-encoded pointer is
@@ -3878,23 +3892,46 @@ struct cds_ft_inode_flag *ft_popcount_2l_node_get_direction(
 		int byte = ft_popcount_2l_dir_byte(root, subs_lo, subs_hi,
 				lo_bits, nr_groups, n, dir);
 		struct cds_ft_inode_flag *ptr;
+		struct cds_ft_inode_flag **slot = NULL;
 
 		if (byte < 0)
 			return NULL;
 		ptr = (max_lc == 6) ?
-			ft_popcount_2l_scan_32_8(node, NULL,
+			ft_popcount_2l_scan_32_8(node, &slot,
 				(uint8_t) byte, FT_PF_NONE) :
 		      (max_lc == 3) ?
-			ft_popcount_2l_scan_16_16_max_3(node, NULL,
+			ft_popcount_2l_scan_16_16_max_3(node, &slot,
 				(uint8_t) byte, FT_PF_NONE) :
 #if (CAA_BITS_PER_LONG < 64)
 		      (max_lc == 5) ?
-			ft_popcount_2l_scan_16_16_max_5(node, NULL,
+			ft_popcount_2l_scan_16_16_max_5(node, &slot,
 				(uint8_t) byte, FT_PF_NONE) :
 #endif
-			ft_popcount_2l_scan_64_4(node, NULL,
+			ft_popcount_2l_scan_64_4(node, &slot,
 				(uint8_t) byte, FT_PF_NONE);
 		if (ptr) {
+			/*
+			 * Spatial prefetch: the child pointers are a dense
+			 * byte-ordered array, so the adjacent sibling in
+			 * iteration order is slot[+1] (FT_RIGHT / next) or
+			 * slot[-1] (FT_LEFT / prev) -- a near-future
+			 * cds_ft_next/prev target.
+			 *
+			 * No bounds check: the one-element over/under-read cannot
+			 * fault, by allocator construction.
+			 *   - slot[+1] past the last pointer of a full node lands,
+			 *     in the worst case (node at the end of the 2 MiB
+			 *     node-body run), in the FT_FAR_METADATA metadata array
+			 *     the allocator places immediately after that run;
+			 *     within a node it is just an unused allocated slot.
+			 *   - slot[-1] before pointers[0] lands in the node's
+			 *     bitmap header, which precedes the pointer array.
+			 * Either way the load hits allocated memory; the word read
+			 * is unrelated to a real child pointer, but ft_maybe_prefetch
+			 * (__builtin_prefetch) silently drops NULL / non-canonical
+			 * addresses without faulting.
+			 */
+			ft_maybe_prefetch_nta(dir == FT_RIGHT ? slot[1] : slot[-1]);
 			*result_key = (uint8_t) byte;
 			return ptr;
 		}
@@ -4267,8 +4304,9 @@ retry:
 		if (i < 0)
 			return NULL;
 		{
+			struct cds_ft_inode_flag **slot = NULL;
 			struct cds_ft_inode_flag *ptr =
-				ft_popcount_1l_scan_28(node, NULL,
+				ft_popcount_1l_scan_28(node, &slot,
 					(uint8_t) i, FT_PF_NONE);
 
 			if (!ptr) {
@@ -4280,6 +4318,17 @@ retry:
 				n = i;
 				goto retry;
 			}
+			/*
+			 * Spatial prefetch (dense byte-ordered pointers): the
+			 * adjacent sibling is slot[+1] (FT_RIGHT) / slot[-1]
+			 * (FT_LEFT) -- a near-future cds_ft_next/prev target.
+			 * The unchecked slot[+-1] over/under-read is fault-free by
+			 * the same allocator construction documented in
+			 * ft_popcount_2l_node_get_direction (FT_FAR_METADATA after
+			 * the 2 MiB run for +1; bitmap header before pointers
+			 * for -1).
+			 */
+			ft_maybe_prefetch_nta(dir == FT_RIGHT ? slot[1] : slot[-1]);
 			*result_key = (uint8_t) i;
 			return ptr;
 		}
@@ -4387,6 +4436,24 @@ retry:
 			 */
 			n = i;
 			goto retry;
+		}
+		/*
+		 * Spatial prefetch: pigeon slots are byte-indexed (sparse), so
+		 * unlike the dense popcount layouts the adjacent present child is
+		 * NOT slot[+-1] -- one more bitmap scan in the iteration direction
+		 * locates it, and we prefetch it as a near-future cds_ft_next/prev
+		 * target.  The extra scan is cheap against a far-metadata/body miss.
+		 */
+		{
+			int adj = (dir == FT_RIGHT) ?
+				cds_find_next_bit(bitmap->bitmap,
+					FT_ENTRY_PER_NODE, i + 1) :
+				cds_find_prev_bit(bitmap->bitmap,
+					FT_ENTRY_PER_NODE, i - 1);
+
+			if (adj >= 0)
+				ft_maybe_prefetch_nta(((struct cds_ft_inode_flag **)
+					node->data)[adj]);
 		}
 		dbg_printf("ft_pigeon_node_get child_node_flag %p\n", child_node_flag);
 		*result_key = (uint8_t) i;
