@@ -439,6 +439,30 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, ineq_going_up_step,
 	)
 )
 
+/*
+ * No-key variant of ineq_going_up_step for the speculative limit-none lookup
+ * (use_keycopy && limit == LIMIT_NONE): ordinal_key is not maintained on that
+ * path (the result key comes from the matched leaf), so the dispatch byte is
+ * unavailable and this variant omits the ord_key field rather than report a
+ * synthesized value.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, ineq_going_up_step_nokey,
+	LTTNG_UST_TP_ARGS(
+		int, level,
+		const void *, path_entry,
+		int, found_sibling
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(int, level, level)
+		lttng_ust_field_integer_hex(uintptr_t, path_entry, (uintptr_t) path_entry)
+		lttng_ust_field_enum(cds_ft, ft_tp_node_kind, uint16_t, path_entry_kind,
+			ft_tp_node_kind((struct cds_ft_inode_flag *) path_entry))
+		lttng_ust_field_integer(uint16_t, path_entry_skip_len,
+			ft_tp_node_skip_len((struct cds_ft_inode_flag *) path_entry))
+		lttng_ust_field_integer(int, found_sibling, found_sibling)
+	)
+)
+
 LTTNG_UST_TRACEPOINT_EVENT(cds_ft, ineq_result,
 	LTTNG_UST_TP_ARGS(
 		int, mode,

@@ -7834,6 +7834,27 @@ bool ft_speculative_keycopy(const struct cds_ft *ft,
 	return true;
 }
 
+/*
+ * Unconditional variant of ft_speculative_keycopy for callers that have already
+ * resolved use_keycopy at compile time: the leaf-copy config gate
+ * (speculative_key_offset_set && speculative && SKIP_COMPRESSED) is then known
+ * to hold, so the runtime re-check folds away.  Copies @level ordinal bytes of
+ * @leaf's stored key into @dst; a NULL @leaf (NOT_FOUND) or @level < 0 copies
+ * nothing (the result key is then unused).
+ */
+static inline_lookup
+void ft_speculative_keycopy_unconditional(const struct cds_ft *ft,
+		const struct cds_ft_node *leaf, uint8_t *dst, ssize_t level)
+{
+	const struct cds_ft_group *group = ft->group;
+	const uint8_t *leaf_key;
+
+	if (!leaf || level < 0)
+		return;
+	leaf_key = (const uint8_t *) leaf + group->speculative_key_offset;
+	ft_key_to_ordinals(dst, leaf_key, (size_t) level, &group->key_map);
+}
+
 static inline_lookup
 enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -7845,6 +7866,19 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	struct cds_ft_inode_flag *node_flag;
 	struct cds_ft_node *ret_node;
 	uint8_t ordinal_key[FT_MAX_KEY_LEN];
+	/*
+	 * @keep_ordinal: compile-time true for every instantiation EXCEPT
+	 * (use_keycopy && limit == LIMIT_NONE).  In that one case the matched leaf
+	 * is the sole result-key source (ft_speculative_keycopy_unconditional) and
+	 * going-up dispatch reads input_key, so ordinal_key is dead: its memset,
+	 * per-level fills (here and in the compressed helpers via fill_ordinal),
+	 * byte-record output slots, and fallback copies all DCE.  @ord_scratch is
+	 * the write-only sink for the going-up sibling / minmax byte-record on that
+	 * path (ft_node_get_direction needs a valid output slot).
+	 */
+	const bool keep_ordinal = !(use_keycopy &&
+			limit == FT_LOOKUP_LIMIT_NONE);
+	uint8_t ord_scratch;
 	enum ft_direction dir;
 	const uint8_t *input_key;
 	const uint8_t *iter_key;
@@ -7922,7 +7956,8 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 
 	FT_TP(ineq_enter, (int) mode, input_key, key_len);
 
-	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
+	if (keep_ordinal)
+		memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
 	node_flag = ft_root_dereference_prefetch(ft);
 	up_node = node_flag;		/* root covers depth 0 */
 	up_node_lo = 0;
@@ -7980,6 +8015,8 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 			(ssize_t)iter->path_len == key_depth &&
 			key_depth > 1) {
 		for (level = 1; level < key_depth; level++) {
+			if (!keep_ordinal)
+				continue;
 			switch (limit) {
 			case FT_LOOKUP_LIMIT_NONE:
 				ordinal_key[level - 1] =
@@ -8073,7 +8110,7 @@ slow_path:
 				&level, key_depth, mode, limit,
 				&iter_key, input_key, iter,
 				ordinal_key, &skip_eq_external_nodes,
-				true);
+				keep_ordinal);
 			if (act == FT_DESCENT_GOING_UP) {
 				/*
 				 * @node_flag is the compressed node; it occupies
@@ -8124,7 +8161,8 @@ slow_path:
 		 * (iter_key desyncs once level steps by span > 1), so this
 		 * must be set regardless of whether descent continues.
 		 */
-		ordinal_key[level - 1] = key_value;
+		if (keep_ordinal)
+			ordinal_key[level - 1] = key_value;
 		{
 			unsigned int rewind;
 
@@ -8373,7 +8411,10 @@ going_up:
 
 					assert(level <= (int) ft->group->max_key_len);
 					iter->key_len = level;
-					if (!ft_speculative_keycopy(ft, external_nodes,
+					if (!keep_ordinal)
+						ft_speculative_keycopy_unconditional(ft,
+							external_nodes, iter_key(iter), level);
+					else if (!ft_speculative_keycopy(ft, external_nodes,
 							iter_key(iter), level)) {
 						for (j = 0; j < level; j++)
 							iter_key(iter)[j] = ordinal_key[j];
@@ -8416,9 +8457,9 @@ going_up:
 				going_up = true;
 				continue;
 			}
-			node_flag = ft_node_get_leftright(up_parent,
-					key_value, &ordinal_key[level - 1], dir,
-					true /* validate_lookup */);
+			node_flag = ft_node_get_leftright(up_parent, key_value,
+					keep_ordinal ? &ordinal_key[level - 1] : &ord_scratch,
+					dir, true /* validate_lookup */);
 	#ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
 			 * Fill path only (!use_keycopy): a skip-encoded sibling must be
@@ -8486,9 +8527,13 @@ going_up:
 						true /* validate_lookup */);
 			}
 	#endif
-			dbg_printf("cds_ft_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
-					(unsigned int) key_value, (unsigned int) ordinal_key[level - 1],
-					node_flag);
+			if (keep_ordinal)
+				dbg_printf("cds_ft_lookup_inequality find sibling from %u at %u finds node_flag %p\n",
+						(unsigned int) key_value, (unsigned int) ordinal_key[level - 1],
+						node_flag);
+			else
+				dbg_printf("cds_ft_lookup_inequality find sibling from %u finds node_flag %p\n",
+						(unsigned int) key_value, node_flag);
 			/* If found left/right sibling, find rightmost/leftmost child. */
 			if (node_flag) {
 				/* Record the sibling in the path. */
@@ -8500,9 +8545,13 @@ going_up:
 				 */
 				up_node = node_flag;
 				up_node_lo = level;
-				FT_TP(ineq_going_up_step, level,
-					(const void *) up_parent,
-					1, ordinal_key[level - 1]);
+				if (keep_ordinal)
+					FT_TP(ineq_going_up_step, level,
+						(const void *) up_parent,
+						1, ordinal_key[level - 1]);
+				else
+					FT_TP(ineq_going_up_step_nokey, level,
+						(const void *) up_parent, 1);
 				break;
 			}
 			FT_TP(ineq_going_up_step, level,
@@ -8559,7 +8608,11 @@ going_up:
 						int j;
 
 						iter->key_len = iter->prefix_len;
-						if (!ft_speculative_keycopy(ft, external_nodes,
+						if (!keep_ordinal)
+							ft_speculative_keycopy_unconditional(ft,
+								external_nodes, iter_key(iter),
+								(ssize_t) iter->prefix_len);
+						else if (!ft_speculative_keycopy(ft, external_nodes,
 								iter_key(iter),
 								(ssize_t) iter->prefix_len)) {
 							for (j = 0; j < (int) iter->prefix_len; j++)
@@ -8595,7 +8648,11 @@ descend_children:
 
 		assert(level <= (int) ft->group->max_key_len);
 		iter->key_len = level;
-		if (!ft_speculative_keycopy(ft,
+		if (!keep_ordinal)
+			ft_speculative_keycopy_unconditional(ft,
+				(const struct cds_ft_node *) ft_node_ptr(node_flag),
+				iter_key(iter), level);
+		else if (!ft_speculative_keycopy(ft,
 				(const struct cds_ft_node *) ft_node_ptr(node_flag),
 				iter_key(iter), level)) {
 			for (j = 0; j < level; j++)
@@ -8715,7 +8772,7 @@ descend_children:
 			act = ft_inequality_minmax_compressed(
 				&node_flag, &level, &ret_node,
 				&skip_eq_external_nodes,
-				ordinal_key, dir, true);
+				ordinal_key, dir, keep_ordinal);
 			if (act == FT_DESCENT_FOUND_MINMAX)
 				goto found_minmax;
 			if (act == FT_DESCENT_BREAK)
@@ -8726,7 +8783,8 @@ descend_children:
 			continue;
 		}
 		skip_eq_external_nodes = false;
-		node_flag = ft_node_get_minmax(node_flag, &ordinal_key[level - 1], dir,
+		node_flag = ft_node_get_minmax(node_flag,
+				keep_ordinal ? &ordinal_key[level - 1] : &ord_scratch, dir,
 				true /* validate_lookup */);
 		/*
 		 * Prefetch the min/max child's body for the next iteration's scan.
@@ -8801,8 +8859,12 @@ descend_children:
 		}
 		up_node = node_flag;		/* minmax child established at @level */
 		up_node_lo = level;
-		dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
-				(unsigned int) ordinal_key[level - 1], node_flag);
+		if (keep_ordinal)
+			dbg_printf("cds_ft_lookup_inequality find minmax at %u finds node_flag %p\n",
+					(unsigned int) ordinal_key[level - 1], node_flag);
+		else
+			dbg_printf("cds_ft_lookup_inequality find minmax finds node_flag %p\n",
+					node_flag);
 		if (ft_node_external(node_flag))
 			break;
 	}
@@ -8828,7 +8890,10 @@ found_minmax:
 		int j;
 
 		iter->key_len = level;
-		if (!ft_speculative_keycopy(ft, ret_node, iter_key(iter),
+		if (!keep_ordinal)
+			ft_speculative_keycopy_unconditional(ft, ret_node,
+				iter_key(iter), level);
+		else if (!ft_speculative_keycopy(ft, ret_node, iter_key(iter),
 				level)) {
 			for (j = 0; j < level; j++)
 				iter_key(iter)[j] = ordinal_key[j];
