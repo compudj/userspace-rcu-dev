@@ -344,6 +344,48 @@
 #endif
 
 /*
+ * FEATURE_FT_ORD_CELL: library-owned ordered sibling list ("Option E").
+ *
+ * Threads the duplicate-chain heads (one per distinct key) into a
+ * key-ordered doubly-linked list of LIBRARY-OWNED "ordinal cells"
+ * (struct ft_ord_cell), so cds_ft_next / cds_ft_prev walk the cell list
+ * in O(1) per step instead of an O(depth) trie descent + backtrack.  The
+ * order links live OUTSIDE the application leaf: struct cds_ft_node is
+ * unchanged (no ABI growth, no app offset), and the cell is reached via
+ * the head's cds_ft_node.prev.  A head's prev
+ * now points to its cell (tagged FT_INTERNAL_MASK, so the head-vs-dup test
+ * ft_node_external(prev)==false is preserved) and the head's parent moves
+ * into ft_ord_cell.parent.  The trie's DOWNWARD child slots still point
+ * directly at the external node, skipping the cell; the cell is interposed
+ * only on the UPWARD walk (parent recovery) and the ordered traversal.
+ *
+ * Because the cells are library-owned they are RELOCATABLE: cds_ft_compact
+ * packs them in key order so ordered iteration becomes a dense scan
+ * (the per-step random leaf load dependency is what makes the in-leaf
+ * chain latency-bound).  Cells are kept reader-coherent via the flip-latch.
+ *
+ * COMPILE-TIME (enable with -DFEATURE_FT_ORD_CELL) but RUNTIME-GATED per
+ * group (cds_ft_group_attr_set_ordered_list): an unset group is unchanged
+ * and pays nothing.
+ */
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * Library-owned ordinal cell: one per distinct-key duplicate-chain head.
+ *   @ord_prev/@ord_next: key-ordered doubly-linked list of cells.
+ *   @node:   the external head this cell indexes (cell -> leaf, for the key).
+ *   @parent: the head's flagged parent internal node (relocated out of
+ *            cds_ft_node.prev, which now points at this cell).
+ * Reached from a head as ft_ord_cell_ptr(rcu_dereference(head->prev)).
+ */
+struct ft_ord_cell {
+	struct ft_ord_cell *ord_prev;
+	struct ft_ord_cell *ord_next;
+	struct cds_ft_node *node;
+	struct cds_ft_inode_flag *parent;
+};
+#endif /* FEATURE_FT_ORD_CELL */
+
+/*
  * FEATURE_FT_EXCL_VALIDATE: runtime validation of the access-discipline
  * contract.  Writers claim a per-trie owner via atomic CAS at the
  * public API boundary; writer/writer overlap aborts the process with
@@ -608,6 +650,27 @@ struct cds_ft_group {
 	size_t speculative_key_offset;
 	bool speculative_key_offset_set;
 	/*
+	 * @key_len_offset: byte offset from the (struct cds_ft_node *) to a
+	 *   size_t holding the leaf's key length, and whether configured.  Lets
+	 *   the ordered cell list materialize a VARIABLE-length result key from
+	 *   the leaf (the descent normally derives the length as it walks; the
+	 *   cell fast path skips the descent).  Unused for fixed-length groups
+	 *   (length is group->key_len).  See cds_ft_group_attr_set_key_len_offset.
+	 */
+	size_t key_len_offset;
+	bool key_len_offset_set;
+	/*
+	 * @ordered_list_set: enable the library-owned ordered sibling list
+	 *   (FEATURE_FT_ORD_CELL "Option E").  The order links live in a
+	 *   library-owned relocatable "ordinal cell" (struct ft_ord_cell) hung off
+	 *   each duplicate-chain head's cds_ft_node.prev; the application leaf is
+	 *   unchanged (no ord fields, no offset to declare).  Requires
+	 *   speculative_key_offset (to materialize the result key from the leaf)
+	 *   and, for variable-length groups, key_len_offset.  See
+	 *   cds_ft_group_attr_set_ordered_list.
+	 */
+	bool ordered_list_set;
+	/*
 	 * @numa_policy: NUMA placement policy for the group's internal
 	 *   allocator superblocks.  See
 	 *   cds_ft_group_attr_set_numa_policy.  Default: INTERLEAVE at
@@ -711,6 +774,25 @@ struct cds_ft {
 	 * exclusion, like every other mutation.
 	 */
 	struct cds_ft_compact_state *active_compact;
+
+
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Writer-side scratch iterator for ordinal-cell predecessor discovery
+	 * (ft_ord_cell_splice).  Allocated eagerly in cds_ft_create when the
+	 * group enables the ordered list, reused across mutations (writers are
+	 * serialized).  Destroyed in cds_ft_destroy.
+	 */
+	struct cds_ft_iter *ord_cell_scratch_iter;
+	/*
+	 * Cached endpoints of the ordinal-cell list (min / max), for O(1)
+	 * cds_ft_lookup_first / cds_ft_lookup_last.  Maintained by the splice
+	 * helpers via rcu_assign_pointer; read via rcu_dereference.  NULL when
+	 * the list is empty or disabled.
+	 */
+	struct ft_ord_cell *ord_cell_head;
+	struct ft_ord_cell *ord_cell_tail;
+#endif
 
 #ifdef FEATURE_FT_EXCL_VALIDATE
 	/*

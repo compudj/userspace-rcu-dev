@@ -139,6 +139,21 @@ struct cds_ft_group_attr {
 	 */
 	size_t speculative_key_offset;
 	bool speculative_key_offset_set;
+	/*
+	 * Offset from the (struct cds_ft_node *) to a size_t holding the leaf's
+	 * key length in the caller's leaf, and whether configured.  Lets the
+	 * ordered-list fast path materialize a variable-length result key from
+	 * the leaf without the descent's per-level length computation.  See
+	 * cds_ft_group_attr_set_key_len_offset.
+	 */
+	size_t key_len_offset;
+	bool key_len_offset_set;
+	/*
+	 * Enable the library-owned ordered sibling list (FEATURE_FT_ORD_CELL):
+	 * order links live in library-owned ordinal cells, not the app leaf.
+	 * See cds_ft_group_attr_set_ordered_list.
+	 */
+	bool ordered_list_set;
 	enum cds_ft_numa_policy numa_policy;	/* See cds_ft_group_attr_set_numa_policy. */
 	enum cds_ft_optimize optimize;		/* See cds_ft_group_attr_set_optimize. */
 };
@@ -576,6 +591,21 @@ struct cds_ft_iter {
 	enum cds_ft_iter_cache_mode cache_mode;	/* Position-reuse mode (CACHED/UNCACHED). */
 	bool cache_valid;		/* Whether the cached position is valid. */
 
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Ordinal-cell walk cursor.  @ord_cell caches the cell of the current
+	 * head so cds_ft_next / cds_ft_prev advance via cell->ord_next/prev
+	 * without re-loading the head's leaf each step; @ord_cell_node records
+	 * the node it was cached for, so the cache is honoured only while
+	 * @ord_cell_node == iter->node (a point lookup or descent that re-seeded
+	 * iter->node leaves a mismatch, and the first step re-enters the walk via
+	 * iter->node->prev — the one leaf touch per walk entry).  No stale cell is
+	 * dereferenced: validity is a node-pointer compare, not a cell read.
+	 */
+	struct ft_ord_cell *ord_cell;
+	struct cds_ft_node *ord_cell_node;
+#endif
+
 #ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
 	struct urcu_gp_poll_state gp_state;	/* GP snapshot when path was populated. */
 	bool gp_state_valid;			/* Whether gp_state holds a meaningful value. */
@@ -713,6 +743,16 @@ void iter_debug_path_clear(struct cds_ft_iter *iter __attribute__((unused)))
 #endif
 
 /*
+ * Snapshot the iterator's current result key into its own buffer when that key
+ * is a live reference into the matched leaf (a lazy-ref ordinal-cell group), so
+ * a later re-descent reads a stable key rather than the soon-to-be-reclaimed
+ * leaf.  A no-op for groups whose key is already a value in iter_key(iter)
+ * (the descent filled it / a non-ordered-list group): the next re-descent uses
+ * that buffer directly.  Defined after ft_speculative_keycopy_unconditional.
+ */
+static inline void ft_iter_materialize_key(struct cds_ft_iter *iter);
+
+/*
  * Discard the cached position if the iterator is in uncached mode.
  * Called at the end of each public iterator-based operation.
  * Preserves iter->node so the caller can read the result.
@@ -721,6 +761,11 @@ static inline
 void iter_auto_invalidate_cache(struct cds_ft_iter *iter)
 {
 	if (iter->cache_mode == CDS_FT_ITER_UNCACHED) {
+		/*
+		 * Materialize a live leaf-referenced key BEFORE clearing, so the
+		 * next uncached re-descent reads the saved key, not a stale leaf.
+		 */
+		ft_iter_materialize_key(iter);
 		iter->cache_valid = false;
 		iter->path_len = 0;
 		iter_debug_path_clear(iter);
@@ -1550,23 +1595,15 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
 }
 
 /*
- * ft_publish_external_nodes_prev: Phase 2 — publish the back-channel
- * pointer external_nodes->prev = node_flag via rcu_assign_pointer.
- *
- * Call AFTER node_flag's own parent is wired (so an up-walker arriving
- * via the new prev lands on a parent-wired cluster top, not a NULL
- * parent), and at-or-just-before the forward publish that makes the
- * cluster reachable through node_flag's slot.  No-op when @external_nodes
- * is NULL (callers commonly guard on metadata->external_nodes).
+ * ft_publish_external_nodes_prev: Phase 2 — publish the back-channel from
+ * the displaced/transferred external head up to its (re-)parent node.
+ * Defined below, after the ordinal-cell accessors it depends on in a cell
+ * build (the head's prev is its cell, so the parent is recorded into
+ * cell->parent rather than overwriting prev).
  */
 static inline
 void ft_publish_external_nodes_prev(struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_node *external_nodes)
-{
-	if (!external_nodes)
-		return;
-	rcu_assign_pointer(external_nodes->prev, node_flag);
-}
+		struct cds_ft_node *external_nodes);
 
 /*
  * Pointer unmasking via speculative mask + conditional select.
@@ -1741,6 +1778,241 @@ struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
 	return node;
 }
 
+
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * Ordinal-cell tag + accessors ("Option E", cell-always model).
+ *
+ * Every duplicate-chain HEAD has a library-owned ordinal cell (struct
+ * ft_ord_cell), and the head's cds_ft_node.prev points to it.  The head's
+ * flagged parent is relocated into ft_ord_cell.parent; the cell is the
+ * external head's metadata record, peer to internal/compressed metadata.
+ *
+ * The cell pointer is tagged with FT_INTERNAL_MASK (bit 0) so the head-vs-dup
+ * test ft_node_external(prev)==false is preserved (a non-head dup's prev is an
+ * untagged external cds_ft_node, bits 0-1 == 0).  Bit 0 is the ONLY tag: in a
+ * cell build a head's prev is ALWAYS a cell, so there is nothing to
+ * distinguish and no per-pointer marker is needed (32-bit safe).  Cells are
+ * >= 2-byte aligned, so bit 0 is free.
+ *
+ * The DOWNWARD child slots still point straight at the external node; the cell
+ * is interposed only on the UPWARD walk (parent recovery) and ordered
+ * traversal.  Every reader of a head's prev-as-parent resolves through
+ * ft_resolve_head_prev (identity outside the feature).
+ */
+#define FT_ORD_CELL_TAG		FT_INTERNAL_MASK
+
+static inline_lookup
+void *ft_ord_cell_flag(struct ft_ord_cell *cell)
+{
+	return (void *) ((unsigned long) cell | FT_ORD_CELL_TAG);
+}
+
+static inline_lookup
+struct ft_ord_cell *ft_ord_cell_ptr(const void *prev)
+{
+	return (struct ft_ord_cell *)
+		((unsigned long) prev & ~(unsigned long) FT_ORD_CELL_TAG);
+}
+
+/*
+ * Resolve a head's flagged parent from its (already-rcu_dereference'd) prev.
+ * In the cell-always model prev is always a cell, so the parent is
+ * rcu_dereference(cell->parent).  Valid only for a head; a non-head dup's prev
+ * is the preceding node (callers gate on ft_node_external like before).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_resolve_head_prev(void *prev)
+{
+	return rcu_dereference(ft_ord_cell_ptr(prev)->parent);
+}
+
+/*
+ * Read an ordinal-cell ord_next / ord_prev slot, resolving an in-flight
+ * flip-proxy.  The slots hold RAW (untagged) ft_ord_cell pointers, but a
+ * point-op splice transiently installs a tagged flip-proxy (the same type-7
+ * encoding as ft_resolve_flip_proxy) so the two directional edges flip
+ * atomically for a bidirectional ordered reader.  Raw cells are >= 8-byte
+ * aligned (bits 0-1 clear, like an external node) and proxies carry the
+ * type-7 tag, so the proxy test is unambiguous.  Under writer exclusion no
+ * proxy is installed at rest (a no-op on the write side).
+ */
+static inline_lookup
+struct ft_ord_cell *ft_ord_cell_resolve_ord(struct ft_ord_cell *const *slot)
+{
+	struct ft_ord_cell *p = rcu_dereference(*slot);
+
+	if (caa_unlikely(ft_node_flip_proxy((struct cds_ft_inode_flag *) p)))
+		p = (struct ft_ord_cell *) urcu_flip_proxy_get(
+			ft_flip_proxy_ptr((struct cds_ft_inode_flag *) p));
+	return p;
+}
+#else
+/* Non-cell builds: a head's prev is the flagged parent directly. */
+#define ft_resolve_head_prev(prev)	((struct cds_ft_inode_flag *) (prev))
+#endif /* FEATURE_FT_ORD_CELL */
+
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * Cell lifecycle (Stage 3, malloc-backed; FT-allocator arena is Stage 6).
+ *
+ * The cell is the boxed allocation's first member, so the cell pointer
+ * handed to the trie equals the box pointer; a deferred free recovers the
+ * box (and its rcu_head) by container_of.  The 32B "logical" cell is what
+ * readers see via head->prev; the appended rcu_head is allocator overhead.
+ */
+struct ft_ord_cell_box {
+	struct ft_ord_cell cell;
+	struct rcu_head rcu;
+};
+
+static
+void ft_ord_cell_free_rcu(struct rcu_head *rcu_head)
+{
+	free(caa_container_of(rcu_head, struct ft_ord_cell_box, rcu));
+}
+
+/*
+ * Allocate a head's cell and wire it to @node with parent @parent (which
+ * may be NULL — a root head — or set later via ft_ord_cell_set_parent).
+ * The ord_prev / ord_next list links start empty; the ordered-list splice
+ * (runtime-gated by ordered_list_set) populates them later.  Returns the
+ * cell-tagged pointer to store into node->prev, or NULL on allocation
+ * failure (the caller fails the insert before mutating the trie).
+ */
+static
+void *ft_ord_cell_alloc(struct cds_ft *ft, struct cds_ft_node *node,
+		struct cds_ft_inode_flag *parent)
+{
+	struct ft_ord_cell_box *box = malloc(sizeof(*box));
+
+	if (!box)
+		return NULL;
+	box->cell.ord_prev = NULL;
+	box->cell.ord_next = NULL;
+	box->cell.node = node;
+	box->cell.parent = parent;
+	(void) ft;
+	return ft_ord_cell_flag(&box->cell);
+}
+
+/*
+ * Release a head's cell after its key leaves the trie.  Deferred via the
+ * group's RCU flavor so an in-flight reader parked on a head it up-walks
+ * (head->prev -> cell -> cell->parent) never dereferences freed memory;
+ * exclusive-mode tries (readers drained) free synchronously.
+ */
+static
+void ft_ord_cell_free(struct cds_ft *ft, struct ft_ord_cell *cell)
+{
+	struct ft_ord_cell_box *box =
+		caa_container_of(cell, struct ft_ord_cell_box, cell);
+
+#ifdef FT_IMMEDIATE_FREE
+	free(box);
+#else
+	if (ft->exclusive)
+		free(box);
+	else
+		ft->group->flavor->update_call_rcu(&box->rcu,
+			ft_ord_cell_free_rcu);
+#endif
+}
+
+/*
+ * Immediate free for a cell that was never published (an insert that ended
+ * a duplicate or failed before @node became reachable): no reader can hold a
+ * reference, so the grace-period defer would only delay the free.
+ */
+static inline
+void ft_ord_cell_free_unpublished(struct ft_ord_cell *cell)
+{
+	free(caa_container_of(cell, struct ft_ord_cell_box, cell));
+}
+
+/*
+ * Set a head's relocated parent: in the cell-always model head->prev is the
+ * cell (set once at alloc) and the flagged parent lives in cell->parent.
+ * rcu_assign_pointer for the read-side up-walk (ft_resolve_head_prev does
+ * rcu_dereference(cell->parent)); @head must already carry its cell.
+ */
+static inline
+void ft_ord_cell_set_parent(struct cds_ft_node *head,
+		struct cds_ft_inode_flag *parent)
+{
+	rcu_assign_pointer(ft_ord_cell_ptr(head->prev)->parent, parent);
+}
+#endif /* FEATURE_FT_ORD_CELL */
+
+/*
+ * ft_node_holder: write-side resolution of a node's holder (the slot owner
+ * "above" it), independent of the cell relocation.
+ *
+ *   - non-head duplicate: prev is the predecessor cds_ft_node (external).
+ *   - head: prev is the flagged parent directly (non-cell build) or the
+ *     cell whose ->parent holds the flagged parent (cell build).
+ *   - never-inserted (prev NULL): returns NULL.
+ *
+ * Mutex-held callers (remove / replace / locate-chain-head) that previously
+ * read node->prev as the holder route through this so the cell indirection
+ * is transparent.  Identity in non-cell builds.
+ */
+static inline
+struct cds_ft_inode_flag *ft_node_holder(const struct cds_ft_node *node)
+{
+	void *prev = node->prev;
+
+	if (ft_node_external((struct cds_ft_inode_flag *) prev))
+		return (struct cds_ft_inode_flag *) prev;
+	return ft_resolve_head_prev(prev);
+}
+
+/*
+ * Record a fresh head's flagged parent.  Non-cell builds store it directly
+ * into the (pre-publish) head's prev; cell builds store it into the head's
+ * pre-wired cell (node->prev already carries the cell), leaving prev intact.
+ * For the fresh-head wiring sites only (the subsequent forward publish
+ * orders this store); existing-head re-parents use ft_set_parent / the
+ * external-nodes choke point, which resolve the cell themselves.
+ */
+#ifdef FEATURE_FT_ORD_CELL
+#define ft_external_head_set_parent(node, parent)			\
+	ft_ord_cell_set_parent((node), (struct cds_ft_inode_flag *) (parent))
+#else
+#define ft_external_head_set_parent(node, parent)			\
+	do { (node)->prev = (parent); } while (0)
+#endif
+
+/*
+ * ft_publish_external_nodes_prev: Phase 2 — publish the back-channel pointer
+ * up from the displaced/transferred external head @external_nodes to its
+ * (re-)parent @node_flag via rcu_assign_pointer.
+ *
+ * Call AFTER node_flag's own parent is wired (so an up-walker arriving via
+ * the new back-channel lands on a parent-wired cluster top, not a NULL
+ * parent), and at-or-just-before the forward publish that makes the cluster
+ * reachable through node_flag's slot.  No-op when @external_nodes is NULL
+ * (callers commonly guard on metadata->external_nodes).
+ *
+ * Cell-always: @external_nodes is an existing head, so its prev already
+ * carries its cell; record the new parent into cell->parent (the head's
+ * prev — the cell pointer — is unchanged).  All choke-point callers
+ * re-parent an existing head (a fresh head's parent is wired by ft_set_parent
+ * via ft_node_set_nth), so the cell is guaranteed present.
+ */
+static inline
+void ft_publish_external_nodes_prev(struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_node *external_nodes)
+{
+	if (!external_nodes)
+		return;
+#ifdef FEATURE_FT_ORD_CELL
+	ft_ord_cell_set_parent(external_nodes, node_flag);
+#else
+	rcu_assign_pointer(external_nodes->prev, node_flag);
+#endif
+}
+
 static
 struct cds_ft_inode_flag *ft_compressed_node_flag(
 		struct cds_ft_compressed_node *node)
@@ -1792,7 +2064,8 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft_inode_flag *node)
 	struct cds_ft_inode_flag *parent;
 
 	if (ft_node_external(node))
-		parent = rcu_dereference(((struct cds_ft_node *) node)->prev);
+		parent = ft_resolve_head_prev(
+			rcu_dereference(((struct cds_ft_node *) node)->prev));
 	else if (ft_node_compressed(node))
 		/*
 		 * A compressed node's metadata lives at a FT_TAG_MASK-cleared
@@ -1895,7 +2168,8 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(
 	struct cds_ft_inode_flag *parent;
 
 	if (ft_node_external(child))
-		parent = rcu_dereference(((struct cds_ft_node *) child)->prev);
+		parent = ft_resolve_head_prev(
+			rcu_dereference(((struct cds_ft_node *) child)->prev));
 	else
 		parent = rcu_dereference(cds_ft_item_to_metadata(
 			ft_node_ptr(child))->parent);
@@ -1969,7 +2243,8 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft_inode_flag *skip_ptr,
 		void *pitem;
 
 		if (ft_node_external(cur))
-			parent = rcu_dereference(((struct cds_ft_node *) cur)->prev);
+			parent = ft_resolve_head_prev(
+				rcu_dereference(((struct cds_ft_node *) cur)->prev));
 		else
 			parent = rcu_dereference(cds_ft_item_to_metadata(
 				ft_node_ptr(cur))->parent);
@@ -2272,7 +2547,13 @@ void ft_publish_to_parent(struct cds_ft *ft,
 		} else
 #endif
 		if (ft_node_external(new_child)) {
-			cp = ((struct cds_ft_node *) new_child)->prev;
+			/*
+			 * Cell-always: prev is the (non-NULL) cell pointer even
+			 * when the parent is unset, so resolve through the cell to
+			 * preserve the forward-before-parent check on cell->parent.
+			 */
+			cp = ft_resolve_head_prev(
+				((struct cds_ft_node *) new_child)->prev);
 		} else {
 			cp = cds_ft_item_to_metadata(
 				ft_node_ptr(new_child))->parent;
@@ -2489,9 +2770,20 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 	}
 #endif
 	if (ft_node_external(child_nf)) {
+		/*
+		 * Cell-always: the head carries its cell in prev; record the
+		 * parent into cell->parent (fresh head: cell pre-wired at insert;
+		 * existing head re-parent: cell already present).  Non-cell: the
+		 * parent is the head's prev directly.  rcu_assign either way:
+		 * ft_set_parent re-parents live heads on the restructure path.
+		 */
+#ifdef FEATURE_FT_ORD_CELL
+		ft_ord_cell_set_parent((struct cds_ft_node *) child_nf, parent_nf);
+#else
 		rcu_assign_pointer(
 			((struct cds_ft_node *) child_nf)->prev,
 			parent_nf);
+#endif
 		return;
 	}
 	{
@@ -7946,6 +8238,144 @@ void ft_speculative_keycopy_unconditional(const struct cds_ft *ft,
 	ft_key_to_ordinals(dst, leaf_key, (size_t) level, &group->key_map);
 }
 
+/*
+ * Lazy-ref accessor model (re-applied from commit 1a21ca98, scoped to the
+ * ordinal-cell ordered list).  In a cell group with a leaf-key offset and an
+ * identity key map, the ordered-iteration result key is held as a LIVE
+ * REFERENCE into the matched leaf (iter->node + speculative_key_offset) instead
+ * of being copied into iter_key(iter) on every cell-walk step.  That removes
+ * the per-step key copy — the cell walk never touches the leaf otherwise (its
+ * node + ord_next co-reside in the 32B cell), so unlike the descent path the
+ * leaf load is genuinely saved (the descent's going-up anchor would load it
+ * regardless, which is why the by-reference key was a wash there).
+ *
+ * iter_key(iter) is therefore NOT the current key for such a position; every
+ * reader of the current-position key MUST go through ft_iter_read_key().
+ * Missing one silently corrupts (e.g. cds_ft_remove_all locating a wrong key).
+ */
+static inline
+bool ft_iter_key_referenced(const struct cds_ft_iter *iter)
+{
+	const struct cds_ft_group *group = iter->ft->group;
+
+	return group->ordered_list_set && group->speculative_key_offset_set &&
+		group->key_map.identity && iter->cache_valid && iter->node;
+}
+
+/*
+ * Read the iterator's CURRENT-POSITION key.  Returns the live leaf reference
+ * when referenced, else the iter_key value.  Correct because every cell-walk /
+ * descent result store sets iter->node to the matched leaf (whose stored key IS
+ * the current key) and cds_ft_iter_set_key() clears cache_valid AND iter->node,
+ * so iter->node + offset is authoritative exactly when cache_valid && node.
+ * Valid only while the RCU lock that produced iter->node is held (cross-CS
+ * callers cds_ft_iter_bind_key() first).
+ */
+static inline
+const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
+{
+	if (ft_iter_key_referenced(iter))
+		return (const uint8_t *) iter->node +
+			iter->ft->group->speculative_key_offset;
+	return iter_key(iter);
+}
+
+/*
+ * Copy a live leaf-referenced key into iter_key so it survives the position
+ * being detached (UNCACHED auto-invalidate, bind, any cache_valid clear).  A
+ * no-op self-copy when the key is already a value there.  Bytes are ordinal
+ * (ft_iter_key_referenced requires an identity map).
+ */
+static inline
+void ft_iter_materialize_key(struct cds_ft_iter *iter)
+{
+	const uint8_t *cur = ft_iter_read_key(iter);
+
+	if (cur != iter_key(iter))
+		memcpy(iter_key(iter), cur, iter->key_len);
+}
+
+
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * Land an ordinal-cell walk result on @iter: materialize the head's key from
+ * its leaf and cache the cell as the walk cursor.  @cell == NULL reports
+ * NOT_FOUND (end of list).  Shared by the cell fast path and the O(1)
+ * lookup_first / lookup_last endpoints.  Returns iter->status.
+ */
+static inline_lookup
+enum cds_ft_status ft_ord_cell_iter_land(struct cds_ft *ft,
+		struct cds_ft_iter *iter, struct ft_ord_cell *cell)
+{
+	struct cds_ft_node *node;
+	size_t rlen;
+
+	if (!cell) {
+		iter->node = NULL;
+		iter->ord_cell = NULL;
+		iter->ord_cell_node = NULL;
+		iter->cache_valid = false;
+		iter_debug_path_update(iter);
+		iter->status = CDS_FT_STATUS_NOT_FOUND;
+		return iter->status;
+	}
+	node = cell->node;
+	rlen = (ft->group->key_len != CDS_FT_LEN_VARIABLE) ?
+		ft->group->key_len :
+		*(const size_t *) ((const char *) node +
+			ft->group->key_len_offset);
+	iter->key_len = rlen;
+	iter->node = node;
+	iter->ord_cell = cell;
+	iter->ord_cell_node = node;
+	iter->cache_valid = true;
+	/*
+	 * Lazy-ref: with cache_valid + node now set, ft_iter_key_referenced()
+	 * holds for an identity group, so the result key is read straight from
+	 * @node's leaf by ft_iter_read_key() — NO per-step copy (the cell walk's
+	 * whole point).  A non-identity group must remap to ordinal order, so
+	 * copy into iter_key (then ft_iter_key_referenced is false and consumers
+	 * use the buffer).
+	 */
+	if (!ft->group->key_map.identity)
+		ft_speculative_keycopy_unconditional(ft, node, iter_key(iter),
+			(ssize_t) rlen);
+	iter_debug_path_update(iter);
+	iter->path_len = rlen + 1;
+	iter->status = CDS_FT_STATUS_OK;
+	return iter->status;
+}
+
+/*
+ * True when the ordinal-cell O(1) endpoints / fast path can serve @iter: the
+ * list is enabled, the result key + length are recoverable from the leaf, and
+ * the traversal is unscoped.
+ */
+static inline_lookup
+bool ft_ord_cell_fastpath_ok(const struct cds_ft *ft,
+		const struct cds_ft_iter *iter)
+{
+	return ft->group->ordered_list_set &&
+		ft->group->speculative_key_offset_set &&
+		(ft->group->key_len != CDS_FT_LEN_VARIABLE ||
+			ft->group->key_len_offset_set) &&
+		iter->prefix_len == 0;
+}
+
+/*
+ * Resolve the current head's cell for a cell-walk step: use the cached cursor
+ * when it still refers to iter->node (no leaf touch), else re-enter the walk
+ * via the head's prev (one leaf load — the per-walk-entry cost).
+ */
+static inline_lookup
+struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter)
+{
+	if (iter->ord_cell_node == iter->node)
+		return iter->ord_cell;
+	return ft_ord_cell_ptr(rcu_dereference(iter->node->prev));
+}
+#endif /* FEATURE_FT_ORD_CELL */
+
 static inline_lookup
 enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -8041,8 +8471,18 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	 * terminal write, so the input bytes are never overwritten while still
 	 * needed.  The lone self-aliasing case -- the equal-match write below --
 	 * is a no-op and is guarded.
+	 *
+	 * Input-key source: only a LIMIT_NONE continuation (cds_ft_next/prev, the
+	 * relational lookups) iterates from the iterator's CURRENT key, which on a
+	 * lazy-ref cell group is read IN PLACE from the live node (no prior copy).
+	 * LIMIT_FIRST/LIMIT_LAST are absolute and key off the prefix in iter_key,
+	 * NOT the current position, so they must NOT reference the node (a reused
+	 * iterator's stale node would mis-seed the search).
 	 */
-	input_key = iter_key(iter);
+	if (limit == FT_LOOKUP_LIMIT_NONE)
+		input_key = ft_iter_read_key(iter);
+	else
+		input_key = iter_key(iter);
 	iter_key = input_key;
 
 	FT_TP(ineq_enter, (int) mode, input_key, key_len);
@@ -8082,6 +8522,40 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 			goto end;
 		}
 	}
+
+
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Ordinal-cell fast path (Option E): cds_ft_next / cds_ft_prev (GT/LT,
+	 * LIMIT_NONE) on a cached head collapse to a single dependent load of the
+	 * cell's ord_next / ord_prev — no descent, no leaf touch for the step
+	 * (cell->node + cell->ord_* co-reside in the 32B cell).  The cursor is
+	 * the cached cell when it still refers to iter->node, else re-entered via
+	 * the head's prev (one leaf load per walk entry).
+	 */
+	if ((mode == FT_LOOKUP_GT || mode == FT_LOOKUP_LT) &&
+			limit == FT_LOOKUP_LIMIT_NONE &&
+			iter->cache_valid && iter->node &&
+			ft_ord_cell_fastpath_ok(ft, iter)) {
+		struct ft_ord_cell *cur = ft_ord_cell_cursor(iter);
+		struct ft_ord_cell *nxt = (mode == FT_LOOKUP_GT) ?
+			ft_ord_cell_resolve_ord(&cur->ord_next) :
+			ft_ord_cell_resolve_ord(&cur->ord_prev);
+
+		ft_ord_cell_iter_land(ft, iter, nxt);
+#ifndef FT_NO_ORD_PREFETCH
+		/* One-hop NTA prefetch of the cell the next call will land on. */
+		if (nxt) {
+			struct ft_ord_cell *nn = (mode == FT_LOOKUP_GT) ?
+				ft_ord_cell_resolve_ord(&nxt->ord_next) :
+				ft_ord_cell_resolve_ord(&nxt->ord_prev);
+			if (nn)
+				__builtin_prefetch((const void *) nn, 0, 0);
+		}
+#endif
+		goto end;
+	}
+#endif /* FEATURE_FT_ORD_CELL */
 
 	/*
 	 * Fast path: reuse the iterator's cached position from a prior
@@ -9112,6 +9586,12 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 
 	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_first\n");
+#ifdef FEATURE_FT_ORD_CELL
+	/* O(1) endpoint: the ordinal-cell list's minimum cell (unscoped only). */
+	if (ft_ord_cell_fastpath_ok(ft, iter))
+		return ft_ord_cell_iter_land(ft, iter,
+			rcu_dereference(ft->ord_cell_head));
+#endif
 	/*
 	 * LIMIT_FIRST sets key_len to prefix_len internally.
 	 * When prefix_len == 0 this corresponds to a traversal of the
@@ -9137,6 +9617,12 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 
 	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_last\n");
+#ifdef FEATURE_FT_ORD_CELL
+	/* O(1) endpoint: the ordinal-cell list's maximum cell (unscoped only). */
+	if (ft_ord_cell_fastpath_ok(ft, iter))
+		return ft_ord_cell_iter_land(ft, iter,
+			rcu_dereference(ft->ord_cell_tail));
+#endif
 	/*
 	 * LIMIT_LAST always uses key_len = max_key_len. When
 	 * prefix_len > 0, the traversal uses actual prefix key bytes
@@ -10769,7 +11255,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 			 * duplicate at existing key, no new unique key. */
 			goto skip_key_count_propagation;
 		}
-		node->prev = jct_flag;
+		ft_external_head_set_parent(node, jct_flag);
 		node->next = NULL;
 		rcu_assign_pointer(
 			jct_meta->external_nodes, node);
@@ -10856,6 +11342,20 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 }
 
 
+
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * Ordinal-cell point-op list helpers.  Defined after the flip-batch +
+ * inequality-lookup helpers (which they use); forward-declared here for the
+ * insert / remove / replace mutators below.  All gated by ordered_list_set.
+ */
+static void ft_ord_cell_splice(struct cds_ft *ft, const uint8_t *key,
+		size_t key_len, struct ft_ord_cell *cell);
+static void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell);
+static void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
+		struct ft_ord_cell *new_cell);
+#endif /* FEATURE_FT_ORD_CELL */
+
 static
 int _cds_ft_insert(struct cds_ft *ft,
 		const uint8_t *_key, size_t _key_len,
@@ -10873,6 +11373,9 @@ int _cds_ft_insert(struct cds_ft *ft,
 	unsigned int snapshot_depth[FT_MAX_DEPTH]; /* parallel depth tracking */
 	int nr_snapshot = 0;
 	int ret;
+#ifdef FEATURE_FT_ORD_CELL
+	struct ft_ord_cell *precell;
+#endif
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
@@ -10886,6 +11389,27 @@ int _cds_ft_insert(struct cds_ft *ft,
 	/* Expect zeroed prev/next pointers. This catches some double-insert misuses. */
 	if (node->prev || ft_node_next(node))
 		return -EINVAL;
+
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Cell-always: pre-wire @node's ordinal cell before any structural
+	 * mutation, so the only failure-prone allocation happens up front (a
+	 * clean -ENOMEM, nothing to roll back) and every fresh-head wiring site
+	 * downstream just records the flagged parent into the cell (node->prev
+	 * already carries it).  If @node ends up a duplicate (chained, not a
+	 * head) or the insert fails, the unused @precell is freed at insert_done
+	 * (a chained @node has its prev repointed at the predecessor, losing the
+	 * cell from node->prev, so the handle is kept here).
+	 */
+	{
+		void *cell = ft_ord_cell_alloc(ft, node, NULL);
+
+		if (!cell)
+			return -ENOMEM;
+		node->prev = cell;
+		precell = ft_ord_cell_ptr(cell);
+	}
+#endif
 
 	key_depth = key_len + 1;
 
@@ -10982,7 +11506,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 				if (unique_node_ret) {
 					*unique_node_ret = external_nodes;
-					return -EEXIST;
+					ret = -EEXIST;
+					goto insert_done;
 				}
 				/* Find last duplicate */
 				iter_node = external_nodes;
@@ -10997,7 +11522,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				ret = 0;
 			} else {
 				/* New key at this internal node. */
-				node->prev = d.nf;
+				ft_external_head_set_parent(node, d.nf);
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 				ret = 0;
@@ -11008,7 +11533,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 			if (unique_node_ret) {
 				*unique_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
-				return -EEXIST;
+				ret = -EEXIST;
+				goto insert_done;
 			}
 			/* Find last duplicate */
 			iter_node = (struct cds_ft_node *) ft_node_ptr(d.nf);
@@ -11053,6 +11579,25 @@ int _cds_ft_insert(struct cds_ft *ft,
 	}
 
 insert_done:
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * @node became a fresh head iff node->prev is still its (cell) carrier
+	 * — i.e. not external.  A duplicate append (ft_chain_node repointed
+	 * node->prev at the predecessor) or a failed insert leaves @precell
+	 * orphaned: free it, and on failure restore node->prev to its zeroed
+	 * state so the application may retry.  (Stage 3b will splice the kept
+	 * cell into the ordered list here when ordered_list_set.)
+	 */
+	if (ret != 0) {
+		node->prev = NULL;
+		ft_ord_cell_free_unpublished(precell);
+	} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
+		ft_ord_cell_free_unpublished(precell);
+	} else if (ft->group->ordered_list_set) {
+		/* @node became a fresh head: splice its kept cell into the list. */
+		ft_ord_cell_splice(ft, _key, _key_len, precell);
+	}
+#endif
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
@@ -11142,6 +11687,9 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	unsigned int snapshot_depth[FT_MAX_DEPTH];
 	int nr_snapshot = 0;
 	int ret;
+#ifdef FEATURE_FT_ORD_CELL
+	struct ft_ord_cell *precell;
+#endif
 
 	*old_node_ret = NULL;
 
@@ -11156,6 +11704,21 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	/* Expect zeroed prev/next pointers. */
 	if (node->prev || ft_node_next(node))
 		return -EINVAL;
+
+#ifdef FEATURE_FT_ORD_CELL
+	/* Cell-always: pre-wire @node's cell (see _cds_ft_insert).  A replace
+	 * always lands @node as the sole head on success, so the cell is kept
+	 * unless the insert fails (or the key_shorter path finds the key and
+	 * leaves @node uninstalled — both freed below). */
+	{
+		void *cell = ft_ord_cell_alloc(ft, node, NULL);
+
+		if (!cell)
+			return -ENOMEM;
+		node->prev = cell;
+		precell = ft_ord_cell_ptr(cell);
+	}
+#endif
 
 	key_depth = key_len + 1;
 
@@ -11225,8 +11788,19 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			 */
 			ret = ft_insert_compressed_key_shorter(ft, &d, 0,
 				node, old_node_ret);
-			if (ret == -EEXIST)
+			if (ret == -EEXIST) {
 				ret = 0;	/* Replace handled by key_shorter. */
+#ifdef FEATURE_FT_ORD_CELL
+				/*
+				 * key_shorter found the key already present and
+				 * left @node uninstalled (*old_node_ret names the
+				 * existing chain, which keeps its own cell).  Drop
+				 * the pre-wired cell from node->prev; insert_replace_done
+				 * frees the now-orphaned @precell.
+				 */
+				node->prev = NULL;
+#endif
+			}
 		} else if (!ft_node_external(d.nf)) {
 			struct cds_ft_node *external_nodes;
 			struct cds_ft_metadata *metadata;
@@ -11239,12 +11813,27 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						external_nodes);
 				/* Replace existing chain: key count unchanged. */
 				*old_node_ret = external_nodes;
-				node->prev = d.nf;
+				ft_external_head_set_parent(node, d.nf);
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
+#ifdef FEATURE_FT_ORD_CELL
+				/*
+				 * The replaced head's cell leaves the trie.  When the
+				 * ordered list is on, @node's pre-wired cell takes its
+				 * list slot first (O(1) swap, no re-descent).
+				 */
+				{
+					struct ft_ord_cell *old_cell =
+						ft_ord_cell_ptr(external_nodes->prev);
+
+					if (ft->group->ordered_list_set)
+						ft_ord_cell_swap(ft, old_cell, precell);
+					ft_ord_cell_free(ft, old_cell);
+				}
+#endif
 			} else {
 				/* No external nodes yet. New key. */
-				node->prev = d.nf;
+				ft_external_head_set_parent(node, d.nf);
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 				ft_propagate_external_count_parent(ft, d.nf, 1);
@@ -11255,10 +11844,21 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					ft_node_ptr(d.nf));
 			/* External node at end of key. Replace chain: key count unchanged. */
 			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
-			node->prev = d.pnf;
+			ft_external_head_set_parent(node, d.pnf);
 			node->next = NULL;
 			ft_publish_to_parent(ft, d.pnf, d.nfp,
 				(struct cds_ft_inode_flag *) node);
+#ifdef FEATURE_FT_ORD_CELL
+			/* Replaced head's cell leaves; @node's cell takes its slot. */
+			{
+				struct ft_ord_cell *old_cell =
+					ft_ord_cell_ptr((*old_node_ret)->prev);
+
+				if (ft->group->ordered_list_set)
+					ft_ord_cell_swap(ft, old_cell, precell);
+				ft_ord_cell_free(ft, old_cell);
+			}
+#endif
 			ret = 0;
 		}
 	} else {
@@ -11284,6 +11884,28 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	}
 
 insert_replace_done:
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * @node became the installed head iff node->prev still carries its
+	 * pre-wired cell (not external).  A duplicate append (descent through a
+	 * compressed node chained @node), the uninstalled key_shorter -EEXIST
+	 * path (prev NULLed above), or a failed insert leaves @precell orphaned
+	 * — free it, and on failure restore node->prev to its zeroed state.
+	 */
+	if (ret != 0) {
+		node->prev = NULL;
+		ft_ord_cell_free_unpublished(precell);
+	} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
+		ft_ord_cell_free_unpublished(precell);
+	} else if (ft->group->ordered_list_set && *old_node_ret == NULL) {
+		/*
+		 * Fresh head (no chain replaced): splice its kept cell.  A replace
+		 * (*old_node_ret set) already swapped @precell into the replaced
+		 * head's list slot at the replace site, so it must NOT splice again.
+		 */
+		ft_ord_cell_splice(ft, _key, _key_len, precell);
+	}
+#endif
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
@@ -11358,7 +11980,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		return s;
 	}
 
-	iter_key = iter_key(iter);
+	iter_key = ft_iter_read_key(iter);
 
 	dbg_printf("cds_ft_replace: old_node %p new_node %p\n", old_node, new_node);
 
@@ -11382,7 +12004,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		FT_TP(replace_exit, (int) s);
 		return s;
 	}
-	holder_flag = (struct cds_ft_inode_flag *) old_node->prev;
+	holder_flag = ft_node_holder(old_node);
 	if (!holder_flag) {
 		/* Never inserted (a freshly-initialized node). */
 		s = CDS_FT_STATUS_NOT_FOUND;
@@ -11437,6 +12059,19 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		new_node->next->prev = new_node;
 	rcu_assign_pointer(*pub_slot, (struct cds_ft_inode_flag *) new_node);
 
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Cell transfer: @new_node inherited @old_node's prev (its cell, when a
+	 * head) via the copy above, so it shares the same cell — now fully
+	 * assembled and published.  Retarget the cell at @new_node so up-walks
+	 * and ordered iteration resolve to the live node; the cell's parent and
+	 * ord-list position are preserved (no list surgery, no free).  A
+	 * non-head duplicate replace copied an external prev — nothing to do.
+	 */
+	if (!ft_node_external((struct cds_ft_inode_flag *) new_node->prev))
+		rcu_assign_pointer(ft_ord_cell_ptr(new_node->prev)->node, new_node);
+#endif
+
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
 	 * A compressed-head replace changed cn->child; re-encode the
@@ -11457,6 +12092,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	 * @old_node still follows the chain.
 	 */
 	ft_node_mark_removed(old_node);
+
 
 	/*
 	 * The trie structure is unchanged (no recompaction), so the iterator
@@ -12309,7 +12945,19 @@ void ft_unchain_node(struct cds_ft_node **head_slot,
 			(struct cds_ft_node *) node->prev;
 		rcu_assign_pointer(prev_node->next, next_node);
 	} else {
-		/* Head: prev is parent (flagged internal node pointer). */
+		/* Head: prev is the (cell-build) cell flag or the flagged parent. */
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Head promotion: @next_node inherited @node's prev (the cell) via
+		 * the copy above, so it becomes the new head sharing the same cell;
+		 * retarget the cell at the promoted head (ord-list position and
+		 * parent are preserved — no list surgery).  When @next_node is NULL
+		 * the key disappears and the caller frees the cell.
+		 */
+		if (next_node)
+			rcu_assign_pointer(ft_ord_cell_ptr(node->prev)->node,
+				next_node);
+#endif
 		rcu_assign_pointer(*head_slot, next_node);
 	}
 	/*
@@ -12372,7 +13020,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 
-	iter_key = iter_key(iter);
+	iter_key = ft_iter_read_key(iter);
 	dbg_printf("cds_ft_remove attempt: node %p\n", node);
 
 	/*
@@ -12401,13 +13049,33 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 
-	holder_flag = (struct cds_ft_inode_flag *) node->prev;
+	/*
+	 * Resolve @node's holder (its parent), transparently across the cell
+	 * indirection: a head's prev is its cell (parent in cell->parent), a
+	 * non-head duplicate's prev is its predecessor.  NULL => never inserted.
+	 */
+	holder_flag = ft_node_holder(node);
 	if (!holder_flag) {
 		/* Never inserted (a freshly-initialized node). */
 		dbg_printf("cds_ft_remove: node %p has no parent\n", node);
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
+
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Cell-always: @node heads its chain iff its prev is the cell (not an
+	 * external predecessor).  Capture the head's cell + successor BEFORE the
+	 * unlink: a head promotion retargets the cell at the successor (done in
+	 * ft_unchain_node), and a key disappearance (no successor) frees the
+	 * cell after the removal commits (ret == 0).
+	 */
+	bool cell_was_head =
+		!ft_node_external((struct cds_ft_inode_flag *) node->prev);
+	struct ft_ord_cell *dead_cell = cell_was_head ?
+		ft_ord_cell_ptr(node->prev) : NULL;
+	struct cds_ft_node *cell_succ = cell_was_head ? ft_node_next(node) : NULL;
+#endif
 
 	if (ft_node_external(holder_flag)) {
 		/*
@@ -12542,6 +13210,20 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		}
 	}
 
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Head with no successor: the key disappeared, so its cell is unspliced
+	 * from the ordered list (when enabled) and freed (deferred, for parked
+	 * up-walkers).  A promotion (cell_succ) keeps the cell in place — same
+	 * key, only cell->node retargeted in ft_unchain_node — so no list op.
+	 */
+	if (ret == 0 && cell_was_head && !cell_succ) {
+		if (ft->group->ordered_list_set)
+			ft_ord_cell_unsplice(ft, dead_cell);
+		ft_ord_cell_free(ft, dead_cell);
+	}
+#endif
+
 	/*
 	 * detach should not replace a NULL pointer because it has been
 	 * found by a mutex-protected traversal within this function.
@@ -12593,8 +13275,7 @@ bool ft_locate_chain_head(struct cds_ft_node *head,
 		struct cds_ft_inode_flag ***head_slot_p,
 		bool *is_prefix_p)
 {
-	struct cds_ft_inode_flag *holder_flag =
-		(struct cds_ft_inode_flag *) head->prev;
+	struct cds_ft_inode_flag *holder_flag = ft_node_holder(head);
 
 	if (!holder_flag || ft_node_external(holder_flag))
 		return false;	/* no holder, or @head is a non-head duplicate */
@@ -12671,12 +13352,23 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_nr_keys_store(metadata, ft_nr_keys_get(metadata) - 1,
 			CMM_RELEASE);
 		rcu_assign_pointer(metadata->external_nodes, NULL);
+#ifdef FEATURE_FT_ORD_CELL
+		/* The head's cell leaves the trie (capture before mark_removed,
+		 * though that only tombstones ->next). */
+		{
+			struct ft_ord_cell *dead = ft_ord_cell_ptr(external_nodes->prev);
+
+			if (ft->group->ordered_list_set)
+				ft_ord_cell_unsplice(ft, dead);
+			ft_ord_cell_free(ft, dead);
+		}
+#endif
 		/* The whole chain has left the trie: tombstone every node. */
 		ft_chain_mark_removed(external_nodes);
 		return CDS_FT_STATUS_OK;
 	}
 
-	iter_key = iter_key(iter);
+	iter_key = ft_iter_read_key(iter);
 	dbg_printf("cds_ft_remove_all attempt\n");
 
 	/*
@@ -12761,6 +13453,20 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 * found by a mutex-protected traversal within this function.
 	 */
 	assert(ret != -ENOENT);
+
+#ifdef FEATURE_FT_ORD_CELL
+	/* The whole key left the trie: its head's cell is unspliced (when the
+	 * ordered list is on) and freed (deferred).  chain_head->prev still
+	 * carries the cell (detach reshapes ancestors and head_slot, not the
+	 * head's prev). */
+	if (ret == 0) {
+		struct ft_ord_cell *dead = ft_ord_cell_ptr(chain_head->prev);
+
+		if (ft->group->ordered_list_set)
+			ft_ord_cell_unsplice(ft, dead);
+		ft_ord_cell_free(ft, dead);
+	}
+#endif
 
 	iter->cache_valid = false;
 	iter_debug_path_clear(iter);
@@ -13489,11 +14195,24 @@ void ft_graft_glue_apply_splices(struct ft_graft_glue *g)
 		struct cds_ft_node *dst_head = g->splices[i].dst_head;
 		struct cds_ft_node *src_head = g->splices[i].src_head;
 		struct cds_ft_node *tail = dst_head;
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * @src_head was a head in src (prev is its cell); it becomes a
+		 * non-head duplicate of @dst_head, so its cell leaves the trie.
+		 * The src chain is already detached + drained and @src_head is not
+		 * yet reachable in dst (published by the rcu_assign below), so the
+		 * cell is unreachable — free it synchronously.
+		 */
+		struct ft_ord_cell *src_cell = ft_ord_cell_ptr(src_head->prev);
+#endif
 
 		while (ft_node_next(tail))
 			tail = ft_node_next(tail);
 		src_head->prev = tail;	/* write-side only, plain store */
 		rcu_assign_pointer(tail->next, src_head);
+#ifdef FEATURE_FT_ORD_CELL
+		ft_ord_cell_free_unpublished(src_cell);
+#endif
 	}
 }
 
@@ -16336,6 +17055,187 @@ void ft_flip_batch_reclaim(struct ft_flip_batch *b)
 			ft_flip_batch_free_rcu);
 }
 
+
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * Ordinal-cell list maintenance (Option E).
+ *
+ * Mirrors the ORD_CHAIN chain maintenance, but the key-ordered doubly-linked
+ * list threads the library-owned cells (one per distinct-key head) via
+ * ft_ord_cell.ord_next / ord_prev instead of in-leaf fields.  Each point op
+ * flips the (<=2) live neighbour edges through one flip-batch so a
+ * bidirectional ordered reader sees the splice atomically; the spliced-in /
+ * replacement cell pre-sets its own links with plain stores (not yet ord-
+ * reachable), while an unspliced cell keeps its links for parked readers
+ * until its deferred free.  Runtime-gated by group->ordered_list_set: a
+ * point op consults these only when the list is enabled.
+ *
+ * RUNS UNDER WRITER EXCLUSION; no concurrent writer races, no proxy at rest.
+ * Promotion (ft_unchain_node) and replace (cds_ft_replace) need NO list op:
+ * the cell stays put and only cell->node is retargeted.  Bulk ops (merge /
+ * graft / graft_swap / detach) are NOT yet ord-maintained.
+ */
+
+struct ft_ord_cell_edge {
+	struct ft_ord_cell **slot;	/* a neighbour's ord_next / ord_prev slot */
+	struct ft_ord_cell *old_target;
+	struct ft_ord_cell *new_target;
+};
+
+static
+void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
+		unsigned int n)
+{
+	struct ft_flip_batch *b;
+	unsigned int i;
+
+	if (n == 0)
+		return;
+	b = ft_flip_batch_alloc(ft, n);
+	if (caa_unlikely(!b)) {
+		for (i = 0; i < n; i++)
+			rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
+		return;
+	}
+	for (i = 0; i < n; i++)
+		rcu_assign_pointer(*edges[i].slot,
+			(struct ft_ord_cell *) ft_flip_batch_add(b,
+				(struct cds_ft_inode_flag *) edges[i].old_target,
+				(struct cds_ft_inode_flag *) edges[i].new_target));
+	urcu_flip_commit(&b->group);
+	for (i = 0; i < n; i++)
+		rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
+	ft_flip_batch_reclaim(b);
+}
+
+/*
+ * Find the cell of the in-order predecessor (mode LT) / successor (mode GT)
+ * of @key via the eager relational descent on the writer's cell scratch
+ * iterator.  Returns NULL when none exists (@key is the new minimum/maximum).
+ */
+static
+struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
+		size_t key_len, enum ft_lookup_inequality mode)
+{
+	struct cds_ft_iter *it = ft->ord_cell_scratch_iter;
+	struct cds_ft_node *head;
+
+	if (cds_ft_iter_set_key(it, key, key_len) != CDS_FT_STATUS_OK)
+		return NULL;
+	it->prefix_len = 0;
+	it->node = NULL;
+	if (cds_ft_lookup_inequality_impl(ft, it, mode, FT_LOOKUP_LIMIT_NONE,
+			false) != CDS_FT_STATUS_OK)
+		return NULL;
+	head = cds_ft_iter_node(it);
+	if (!head)
+		return NULL;
+	return ft_ord_cell_ptr(rcu_dereference(head->prev));
+}
+
+/* Splice the cell of a freshly-inserted head into the ordered cell list. */
+static
+void ft_ord_cell_splice(struct cds_ft *ft, const uint8_t *key, size_t key_len,
+		struct ft_ord_cell *cell)
+{
+	struct ft_ord_cell *pred, *succ;
+	struct ft_ord_cell_edge edges[2];
+	unsigned int n = 0;
+
+	pred = ft_ord_cell_find_rel(ft, key, key_len, FT_LOOKUP_LT);
+	if (pred)
+		succ = ft_ord_cell_resolve_ord(&pred->ord_next);
+	else
+		succ = ft_ord_cell_find_rel(ft, key, key_len, FT_LOOKUP_GT);
+	/* Pre-set @cell's own links; not yet reachable via the list. */
+	cell->ord_prev = pred;
+	cell->ord_next = succ;
+	if (pred) {
+		edges[n].slot = &pred->ord_next;
+		edges[n].old_target = succ;
+		edges[n].new_target = cell;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = pred;
+		edges[n].new_target = cell;
+		n++;
+	}
+	ft_ord_cell_flip(ft, edges, n);
+	if (!pred)
+		rcu_assign_pointer(ft->ord_cell_head, cell);
+	if (!succ)
+		rcu_assign_pointer(ft->ord_cell_tail, cell);
+}
+
+/* Remove @cell from the ordered cell list (its key disappeared). */
+static
+void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell)
+{
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&cell->ord_prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&cell->ord_next);
+	struct ft_ord_cell_edge edges[2];
+	unsigned int n = 0;
+
+	if (pred) {
+		edges[n].slot = &pred->ord_next;
+		edges[n].old_target = cell;
+		edges[n].new_target = succ;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = cell;
+		edges[n].new_target = pred;
+		n++;
+	}
+	/* @cell keeps its links for parked readers until its deferred free. */
+	ft_ord_cell_flip(ft, edges, n);
+	if (ft->ord_cell_head == cell)
+		rcu_assign_pointer(ft->ord_cell_head, succ);
+	if (ft->ord_cell_tail == cell)
+		rcu_assign_pointer(ft->ord_cell_tail, pred);
+}
+
+/*
+ * Replace @old_cell with @new_cell at the same list position (insert_replace:
+ * a fresh head's cell takes the replaced head's cell slot).  @new_cell
+ * inherits @old_cell's neighbours; @old_cell keeps its links for parked
+ * readers until its deferred free.  O(1): reuses @old_cell's neighbours, no
+ * relational descent.
+ */
+static
+void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
+		struct ft_ord_cell *new_cell)
+{
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->ord_prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->ord_next);
+	struct ft_ord_cell_edge edges[2];
+	unsigned int n = 0;
+
+	new_cell->ord_prev = pred;
+	new_cell->ord_next = succ;
+	if (pred) {
+		edges[n].slot = &pred->ord_next;
+		edges[n].old_target = old_cell;
+		edges[n].new_target = new_cell;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = old_cell;
+		edges[n].new_target = new_cell;
+		n++;
+	}
+	ft_ord_cell_flip(ft, edges, n);
+	if (ft->ord_cell_head == old_cell)
+		rcu_assign_pointer(ft->ord_cell_head, new_cell);
+	if (ft->ord_cell_tail == old_cell)
+		rcu_assign_pointer(ft->ord_cell_tail, new_cell);
+}
+#endif /* FEATURE_FT_ORD_CELL */
+
 /*
  * Set @child's parent back-pointer to a raw flag @value (a flip-proxy)
  * verbatim, WITHOUT touching parent_slot_offset.  Mirrors ft_set_parent's
@@ -16365,7 +17265,18 @@ void ft_set_parent_raw(struct cds_ft_inode_flag *child,
 	}
 #endif
 	if (ft_node_external(child)) {
+		/*
+		 * Cell-always: store the raw flag (a flip-proxy) into the head's
+		 * cell->parent, not over its prev (which is the cell pointer).
+		 * The read path resolves cell->parent THEN the flip-proxy, so a
+		 * proxy parked in cell->parent settles correctly; the later
+		 * ft_set_parent replaces it with the real parent.
+		 */
+#ifdef FEATURE_FT_ORD_CELL
+		ft_ord_cell_set_parent((struct cds_ft_node *) child, value);
+#else
 		rcu_assign_pointer(((struct cds_ft_node *) child)->prev, value);
+#endif
 		return;
 	}
 	rcu_assign_pointer(cds_ft_item_to_metadata(ft_node_ptr(child))->parent,
@@ -17792,7 +18703,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 
 	/* Rebuild path from root to current key. */
-	depth = ft_rebuild_path(ft, iter_key(iter), iter->key_len,
+	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), iter->key_len,
 			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
@@ -18264,7 +19175,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 
 	/* Rebuild path from root to current key. */
-	depth = ft_rebuild_path(ft, iter_key(iter), iter->key_len,
+	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), iter->key_len,
 			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
@@ -18788,6 +19699,26 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_key_offset(
 	return CDS_FT_STATUS_OK;
 }
 
+enum cds_ft_status cds_ft_group_attr_set_key_len_offset(
+		struct cds_ft_group_attr *attr,
+		size_t offset)
+{
+	if (!attr)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->key_len_offset = offset;
+	attr->key_len_offset_set = true;
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_group_attr_set_ordered_list(
+		struct cds_ft_group_attr *attr)
+{
+	if (!attr)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->ordered_list_set = true;
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status cds_ft_group_attr_set_numa_policy(
 		struct cds_ft_group_attr *attr,
 		enum cds_ft_numa_policy policy)
@@ -18980,6 +19911,9 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->speculative = attr->speculative;
 		ft_group->speculative_key_offset = attr->speculative_key_offset;
 		ft_group->speculative_key_offset_set = attr->speculative_key_offset_set;
+		ft_group->key_len_offset = attr->key_len_offset;
+		ft_group->key_len_offset_set = attr->key_len_offset_set;
+		ft_group->ordered_list_set = attr->ordered_list_set;
 		ft_group->numa_policy = attr->numa_policy;
 		ft_group->optimize = attr->optimize;
 	} else {
@@ -19068,6 +20002,20 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->root = ft_node_flag(root_node, 0);
 	FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Ordinal-cell list enabled: eagerly allocate the writer-side scratch
+	 * iterator used for cell predecessor discovery (ft_ord_cell_splice).
+	 * ord_cell_head / ord_cell_tail are NULL from calloc.
+	 */
+	if (ft_group->ordered_list_set &&
+	    cds_ft_iter_create(ft, &ft->ord_cell_scratch_iter) != CDS_FT_STATUS_OK) {
+		free_cds_ft_node_unpublished(ft, root_node);
+		free(ft);
+		*result_ft = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+#endif
 
 	uatomic_inc(&ft_group->nr_ft_instances, CMM_RELAXED);
 	*result_ft = ft;
@@ -19128,6 +20076,10 @@ void cds_ft_destroy(struct cds_ft *ft)
 	/* Wait for in-flight call_rcu free to complete. */
 	flavor->barrier();
 	ft_final_checks(ft);
+#ifdef FEATURE_FT_ORD_CELL
+	if (ft->ord_cell_scratch_iter)
+		cds_ft_iter_destroy(ft->ord_cell_scratch_iter);
+#endif
 	uatomic_dec(&ft->group->nr_ft_instances, CMM_RELAXED);
 	free(ft);
 }
@@ -19336,6 +20288,32 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 					depth, node);
 			return -1;
 		}
+#ifdef FEATURE_FT_ORD_CELL
+		if (prev == NULL) {
+			/*
+			 * Cell-always head: prev is the head's cell (cell-tagged),
+			 * whose ->parent is the owner and ->node is this head.
+			 */
+			struct ft_ord_cell *cell = ft_ord_cell_ptr(node->prev);
+
+			if (ft_node_external((struct cds_ft_inode_flag *) node->prev) ||
+			    (void *) cell->parent != (void *) owner_flag ||
+			    cell->node != node) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: head %p cell %p {parent %p, node %p} != expected {owner %p, node %p}\n",
+						depth, node, (void *) cell,
+						(void *) (ft_node_external((struct cds_ft_inode_flag *) node->prev) ? NULL : cell->parent),
+						(void *) (ft_node_external((struct cds_ft_inode_flag *) node->prev) ? NULL : cell->node),
+						(void *) owner_flag, (void *) node);
+				return -1;
+			}
+		} else if (node->prev != expected_prev) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: external chain node %p prev %p != predecessor %p\n",
+					depth, node, node->prev, expected_prev);
+			return -1;
+		}
+#else
 		if (node->prev != expected_prev) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: external chain node %p prev %p != expected %p (%s)\n",
@@ -19346,6 +20324,7 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 						"non-head should point to predecessor");
 			return -1;
 		}
+#endif
 		(void) check_path;
 		(void) path;
 		(void) group;
@@ -19948,6 +20927,107 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 	}
 }
 
+
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * ft_verify_ord_cells: verify the ordinal-cell list against the trie.
+ *
+ * Walks the trie in key order via the relational descent and the cell list in
+ * lockstep, asserting: the list visits exactly the trie's distinct-key heads
+ * in the same order; each visited cell is the head's own cell (head->prev) and
+ * cell->node points back at that head; the back-edge invariant
+ * ord_next(c)->ord_prev == c holds; the minimum cell has ord_prev == NULL and
+ * the cached ord_cell_head / ord_cell_tail equal the trie minimum / maximum.
+ *
+ * The oracle stays independent of the cell list (cache_valid cleared before
+ * each step forces the full descent).  Runs under the caller's writer
+ * exclusion.  Returns 0 on success, -1 on the first violation.
+ */
+static
+int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
+{
+	struct cds_ft *ft = (struct cds_ft *) cft;
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *trie_head;
+	struct ft_ord_cell *cell, *max_cell = NULL;
+	int ret = 0;
+
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK) {
+		if (out)
+			fprintf(out, "ft_verify: ord-cell iter allocation failed\n");
+		return -1;
+	}
+	iter->key_len = 0;
+	iter->prefix_len = 0;
+	iter->cache_valid = false;	/* force descent oracle */
+	cds_ft_lookup_inequality_impl(ft, iter, FT_LOOKUP_GE,
+			FT_LOOKUP_LIMIT_FIRST, false);
+	trie_head = cds_ft_iter_node(iter);
+	cell = ft->ord_cell_head;
+	if (trie_head &&
+	    ft_ord_cell_resolve_ord(&ft_ord_cell_ptr(trie_head->prev)->ord_prev)
+		!= NULL) {
+		if (out)
+			fprintf(out, "ft_verify: ord-cell min head %p cell has ord_prev != NULL\n",
+				(void *) trie_head);
+		ret = -1;
+		goto out;
+	}
+	while ((trie_head = cds_ft_iter_node(iter)) != NULL) {
+		struct ft_ord_cell *head_cell =
+			ft_ord_cell_ptr(rcu_dereference(trie_head->prev));
+		struct ft_ord_cell *next_cell;
+
+		if (cell != head_cell) {
+			if (out)
+				fprintf(out, "ft_verify: ord-cell order mismatch: list cell %p vs trie head %p cell %p\n",
+					(void *) cell, (void *) trie_head,
+					(void *) head_cell);
+			ret = -1;
+			goto out;
+		}
+		if (cell->node != trie_head) {
+			if (out)
+				fprintf(out, "ft_verify: ord-cell %p node %p != trie head %p\n",
+					(void *) cell, (void *) cell->node,
+					(void *) trie_head);
+			ret = -1;
+			goto out;
+		}
+		max_cell = cell;
+		next_cell = ft_ord_cell_resolve_ord(&cell->ord_next);
+		if (next_cell &&
+		    ft_ord_cell_resolve_ord(&next_cell->ord_prev) != cell) {
+			if (out)
+				fprintf(out, "ft_verify: ord-cell back-edge broken at cell %p (ord_next %p whose ord_prev is %p)\n",
+					(void *) cell, (void *) next_cell,
+					(void *) ft_ord_cell_resolve_ord(&next_cell->ord_prev));
+			ret = -1;
+			goto out;
+		}
+		cell = next_cell;
+		iter->cache_valid = false;	/* force descent oracle */
+		cds_ft_lookup_inequality_impl(ft, iter, FT_LOOKUP_GT,
+				FT_LOOKUP_LIMIT_NONE, false);
+	}
+	if (cell != NULL) {
+		if (out)
+			fprintf(out, "ft_verify: ord-cell list longer than trie (extra cell %p)\n",
+				(void *) cell);
+		ret = -1;
+	}
+	if (ret == 0 && ft->ord_cell_tail != max_cell) {
+		if (out)
+			fprintf(out, "ft_verify: ord-cell ord_cell_tail %p != trie maximum cell %p\n",
+				(void *) ft->ord_cell_tail, (void *) max_cell);
+		ret = -1;
+	}
+out:
+	cds_ft_iter_destroy(iter);
+	return ret;
+}
+#endif /* FEATURE_FT_ORD_CELL */
+
 /*
  * cds_ft_verify - Verify integrity of the entire Fractal Trie.
  *
@@ -19989,6 +21069,10 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	ft_visited_destroy(&visited);
 	if (ret)
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
+#ifdef FEATURE_FT_ORD_CELL
+	if (ft->group->ordered_list_set && ft_verify_ord_cells(ft, out))
+		return CDS_FT_STATUS_INTEGRITY_ERROR;
+#endif
 	return CDS_FT_STATUS_OK;
 }
 
@@ -20263,9 +21347,12 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 	/*
 	 * Drop the cached path before releasing the read lock: the nodes it
 	 * references become eligible for the grace-period free once unlocked.
-	 * The iterator's key is retained, so the next step re-descends from it.
+	 * Bind (not just invalidate) so the iterator's key is materialized into
+	 * its own buffer -- on a reference-keycopy / ordinal-cell group the live
+	 * key is a leaf reference that does NOT survive the unlock, and the next
+	 * step re-descends from that key.
 	 */
-	cds_ft_iter_invalidate_cache(st->iter);
+	cds_ft_iter_bind_key(st->iter);
 	flavor->read_unlock();
 	ft_recompact_alloc_set_active(NULL);
 	return !st->done;
@@ -20879,7 +21966,13 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
 	*result_key_len = iter->key_len;
 	if (iter->key_len > result_key_max_len)
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
-	ft_ordinals_to_key(result_key, iter_key(iter), iter->key_len,
+	/*
+	 * Lazy-ref: when the current key is a live reference into iter->node,
+	 * read it from the leaf; else from the iter_key value.  Same continuous-
+	 * RCU-lock contract as reusing the cached position (cross-CS callers
+	 * cds_ft_iter_bind_key() first).
+	 */
+	ft_ordinals_to_key(result_key, ft_iter_read_key(iter), iter->key_len,
 			&iter->ft->group->key_map);
 	return CDS_FT_STATUS_OK;
 }
@@ -20964,9 +22057,17 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 #endif
 }
 
-void cds_ft_iter_invalidate_cache(struct cds_ft_iter *iter)
+void cds_ft_iter_bind_key(struct cds_ft_iter *iter)
 {
 	FT_TP(iter_invalidate_cache, (const void *) iter->ft, (const void *) iter);
+	/*
+	 * Materialize a live leaf-referenced key into the iterator's own buffer
+	 * BEFORE detaching, so a cross-critical-section resume re-descends from
+	 * the stable buffer rather than the (post-unlock, possibly reclaimed)
+	 * leaf.  A no-op self-copy for groups whose key is already a value, in
+	 * which case this is a plain invalidate.
+	 */
+	ft_iter_materialize_key(iter);
 	iter->cache_valid = false;
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
@@ -21004,9 +22105,13 @@ enum cds_ft_status cds_ft_iter_set_cache_mode(struct cds_ft_iter *iter,
 		/*
 		 * Switching to uncached mode: any previously cached
 		 * path may become stale if the caller drops the RCU
-		 * read-side lock, so invalidate it now.
+		 * read-side lock, so invalidate it now.  Materialize a
+		 * reference-keycopy key first (same as the per-op uncached
+		 * auto-invalidate), so the next re-descent reads the saved
+		 * key rather than a stale leaf.
 		 */
 		if (iter->cache_mode == CDS_FT_ITER_CACHED) {
+			ft_iter_materialize_key(iter);
 			iter->cache_valid = false;
 			iter_debug_path_clear(iter);
 			iter->path_len = 0;
