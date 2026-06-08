@@ -8636,6 +8636,21 @@ going_up:
 				 */
 				up_node = node_flag;
 				up_node_lo = level;
+				/*
+				 * Reaching a sibling IS backtracking (up to the
+				 * parent, then over to a strictly-greater/lesser
+				 * sibling subtree), even when the sibling is found on
+				 * the first iteration without climbing further.  Mark
+				 * @going_up so the minmax descent below does NOT set
+				 * skip_eq_external_nodes: the sibling subtree's first
+				 * external_nodes is a different (strictly greater for
+				 * GT) prefix key, not the search key's equal match, so
+				 * it must not be skipped.  Without this, GT into an
+				 * immediate sibling whose subtree root is a prefix key
+				 * (e.g. next("y") with keys "z" < "zz1") skips that
+				 * prefix key entirely.
+				 */
+				going_up = true;
 				if (keep_ordinal)
 					FT_TP(ineq_going_up_step, level,
 						(const void *) up_parent,

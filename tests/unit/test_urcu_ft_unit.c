@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 231
+#define NR_TESTS 232
 #else
-#define NR_TESTS 220
+#define NR_TESTS 221
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -2738,6 +2738,91 @@ static int test_iteration_forward_order(void)
 	if (count != sizeof(keys) / sizeof(keys[0])) {
 		fprintf(stderr, "forward iteration: %u nodes, expected %zu\n",
 			count, sizeof(keys) / sizeof(keys[0]));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Regression: ordered iteration must not skip a prefix key that terminates
+ * at an internal node reached as an immediate sibling.
+ *
+ * With keys "y" < "z" < "zz1" < "zzz", "z" terminates at an internal node
+ * (the 'z' subtree root) that also has the children "zz1"/"zzz".  next("y")
+ * backtracks to the root, finds 'z' as the immediate right sibling, and must
+ * descend to the smallest key in that subtree, which is the prefix key "z" —
+ * not jump straight to the leftmost leaf "zz1".  The bug: the inequality
+ * minmax descent set skip_eq_external_nodes whenever the sibling was found
+ * without climbing a level (going_up still false), wrongly skipping "z".
+ * "a"/"ab"/"abc" cover the analogous case where the prefix node is the min.
+ */
+static int test_iteration_prefix_key(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	/* Expected key order (sorted). */
+	static const char * const sorted[] = {
+		"a", "ab", "abc", "y", "z", "zz1", "zzz",
+	};
+	/* Insert deliberately out of order. */
+	static const char * const insert_order[] = {
+		"zzz", "abc", "z", "a", "zz1", "y", "ab",
+	};
+	const unsigned int nr = (unsigned int) (sizeof(sorted) / sizeof(sorted[0]));
+	unsigned int i, count = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	for (i = 0; i < nr; i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) insert_order[i],
+				strlen(insert_order[i]), &n->node)
+				!= CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "prefix_key: insert '%s' failed\n",
+				insert_order[i]);
+			node_free(n);
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+	}
+
+	/* Forward iteration must visit every key, in sorted order. */
+	rcu_read_lock();
+	cds_ft_for_each_rcu(ft, iter) {
+		uint8_t rk[16];
+		size_t rk_len = 0;
+
+		cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+		if (count >= nr || rk_len != strlen(sorted[count]) ||
+				memcmp(rk, sorted[count], rk_len) != 0) {
+			fprintf(stderr,
+				"prefix_key: step %u got '%.*s' (len %zu), expected '%s'\n",
+				count, (int) rk_len, (const char *) rk, rk_len,
+				count < nr ? sorted[count] : "<end>");
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		count++;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+
+	if (count != nr) {
+		fprintf(stderr,
+			"prefix_key: visited %u keys, expected %u (prefix key skipped?)\n",
+			count, nr);
 		drain_and_destroy(ft, group);
 		return -1;
 	}
@@ -17250,6 +17335,7 @@ int main(int argc, char **argv)
 	/* 4. Iteration */
 	diag("Iteration tests");
 	RUN_TEST(test_iteration_forward_order);
+	RUN_TEST(test_iteration_prefix_key);
 	RUN_TEST(test_iteration_reverse_order);
 	RUN_TEST(test_iteration_prefix_scoped);
 	RUN_TEST(test_iteration_for_each_entry);
