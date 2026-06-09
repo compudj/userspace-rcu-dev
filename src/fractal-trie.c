@@ -19963,7 +19963,9 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		 * NULL attr: mirror the defaults set by
 		 * cds_ft_group_attr_create — identity key map plus
 		 * SPECULATIVE lookup optimization with opportunistic
-		 * SKIP_COMPRESSED on supported archs.
+		 * SKIP_COMPRESSED on supported archs, and the DEFAULT NUMA
+		 * policy (interleave unless the process set an explicit
+		 * preference — see ft_apply_interleave).
 		 */
 		ft_group->key_map.identity = true;
 		ft_group->speculative = true;
@@ -19971,7 +19973,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		if (ft_skip_compressed_validate())
 			ft_group->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
-		ft_group->numa_policy = CDS_FT_NUMA_INTERLEAVE;
+		ft_group->numa_policy = CDS_FT_NUMA_DEFAULT;
 		ft_group->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
 	}
 	*result_ft_group = ft_group;

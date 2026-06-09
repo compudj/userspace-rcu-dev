@@ -419,16 +419,30 @@ enum cds_ft_lookup_optimization {
  */
 enum cds_ft_numa_policy {
 	/*
-	 * CDS_FT_NUMA_DEFAULT: defer to the process's libnuma / mempolicy
-	 * configuration.  The library applies no mbind() of its own — the
-	 * kernel honors whatever policy the application set (via
-	 * set_mempolicy(), numa_set_*(), or a numactl wrapper at launch),
-	 * falling back to first-touch placement if no process policy is
-	 * set.
+	 * CDS_FT_NUMA_DEFAULT: honor an explicit per-process NUMA policy, but
+	 * interleave the library's arenas when none is set.  Concretely:
 	 *
-	 * This is the default value of a freshly-created group attr.
-	 * Applications that want explicit library-side placement should
-	 * set INTERLEAVE or LOCAL.
+	 *   - process set MPOL_BIND / PREFERRED / LOCAL (numactl --membind /
+	 *     --preferred / --localalloc, set_mempolicy, numa_set_*): the
+	 *     library applies no mbind() of its own; the kernel honors that
+	 *     policy.  An explicit application intent is never overridden.
+	 *   - process set MPOL_INTERLEAVE (numactl --interleave): upgraded to
+	 *     the library's THP-friendly 2 MiB-granular interleave.
+	 *   - no process policy set (would be first-touch): the library
+	 *     interleaves its own arenas across the allowed nodes itself
+	 *     (equivalent to CDS_FT_NUMA_INTERLEAVE).
+	 *
+	 * That last case is why this is NOT plain first-touch: a Fractal Trie
+	 * is a shared, read-mostly, random-access structure, so first-touch
+	 * piles it onto the builder's node — one memory controller bottlenecks
+	 * every other node's readers, and Linux auto-NUMA-balancing thrashes
+	 * the unbound pages (PTE-scan + TLB-shootdown storms).  Interleaving the
+	 * library's OWN arenas (it never touches application memory) avoids that
+	 * by default while still deferring to any policy the application stated.
+	 *
+	 * This is the default value of a freshly-created group attr.  To force a
+	 * placement regardless of process policy use INTERLEAVE or LOCAL; the env
+	 * var CDS_FT_NUMA_INTERLEAVE=0 globally disables the library's mbind().
 	 */
 	CDS_FT_NUMA_DEFAULT = 0,
 
@@ -447,9 +461,11 @@ enum cds_ft_numa_policy {
 	/*
 	 * CDS_FT_NUMA_LOCAL: explicit first-touch placement — pages
 	 * land on whichever NUMA node first faults them (typically the
-	 * writer thread).  Mechanically the library skips mbind(); the
-	 * distinction from DEFAULT is intent: LOCAL declares "I want
-	 * first-touch", DEFAULT declares "I defer to process policy".
+	 * writer thread).  Mechanically the library skips its own mbind();
+	 * the distinction from DEFAULT is that LOCAL forces first-touch even
+	 * when no process policy is set, whereas DEFAULT interleaves in that
+	 * case.  Use LOCAL when you specifically want the trie on the faulting
+	 * thread's node.
 	 *
 	 * Best for single-threaded workloads and for tries accessed
 	 * exclusively by threads on the writer's node.  Multi-node-
@@ -2268,17 +2284,19 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  *          (DEFAULT, INTERLEAVE, LOCAL).
  *
  * Defaults to CDS_FT_NUMA_DEFAULT when the group attr is freshly
- * created: the library applies no mbind() of its own, deferring to
- * whatever NUMA policy the process has configured (numactl, libnuma,
- * set_mempolicy()).  Applications wanting explicit library-side
- * placement should opt in via INTERLEAVE or LOCAL.
+ * created: the library honors any explicit per-process NUMA policy but
+ * interleaves its own arenas when none is set (see the enum doc for the
+ * full rationale — first-touch is a performance cliff for a shared,
+ * random-access trie).  Applications can force a placement via INTERLEAVE
+ * or LOCAL.
  *
  * Selection guide:
- *   - DEFAULT:    library imposes nothing; process / libnuma policy
- *                 takes effect (typically first-touch absent a
- *                 process-wide policy).  Use when running under
- *                 numactl or when the application configures
- *                 set_mempolicy() itself.
+ *   - DEFAULT:    honor an explicit process policy (MPOL_BIND / PREFERRED /
+ *                 LOCAL set via numactl / set_mempolicy), upgrade an
+ *                 explicit MPOL_INTERLEAVE to 2 MiB granularity, and
+ *                 interleave when no process policy is set.  The good
+ *                 default for most callers; never overrides a stated
+ *                 process intent.
  *   - INTERLEAVE: 2 MiB-granular round-robin across allowed NUMA
  *                 nodes (mbind(MPOL_BIND) per chunk).  Best for
  *                 multi-reader workloads with readers distributed
@@ -2288,11 +2306,11 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  *                 contiguous physical memory).  Enables transparent
  *                 hugepage collapse by keeping each 2 MiB chunk on
  *                 a single node.
- *   - LOCAL:      explicit first-touch (skip mbind, like DEFAULT).
- *                 Same syscall sequence as DEFAULT; differs in
- *                 intent: LOCAL means "I want first-touch on my
- *                 thread's node", DEFAULT means "I defer to whatever
- *                 the process / libnuma decides".
+ *   - LOCAL:      explicit first-touch (skip mbind).  Forces first-touch
+ *                 even when no process policy is set, whereas DEFAULT
+ *                 interleaves in that case.  Use when you specifically
+ *                 want the trie on the faulting thread's node
+ *                 (single-threaded / single-node access).
  *
  * The CDS_FT_NUMA_INTERLEAVE=0 environment variable, if set, forces
  * the library to skip mbind regardless of the group's policy —
@@ -2300,8 +2318,9 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  * policy takes effect.
  *
  * No effect on caller-provided external node storage
- * (cds_ft_external_arena_create has no group context; today it
- * applies CDS_FT_NUMA_DEFAULT — defers to process policy).
+ * (cds_ft_external_arena_create has no group context; it applies
+ * CDS_FT_NUMA_DEFAULT — honors an explicit process policy, interleaves
+ * otherwise).
  *
  * Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @policy value.

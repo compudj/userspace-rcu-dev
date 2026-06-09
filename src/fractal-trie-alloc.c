@@ -338,13 +338,31 @@ void ft_apply_interleave(void *base, size_t size,
 
 	if (policy == CDS_FT_NUMA_DEFAULT) {
 		/*
-		 * Query process policy.  Translate INTERLEAVE upward so
-		 * the kernel's process-wide intent gets our THP-friendly
-		 * 2 MiB-granular placement.  Other modes: leave the
-		 * region untouched and let the kernel honor the process
-		 * policy at fault time.
+		 * Default policy: interleave the FT arenas across the allowed
+		 * nodes UNLESS the caller has expressed an explicit per-process
+		 * NUMA preference (then honor it -- never override a stated
+		 * intent).  Rationale: FT is a shared, read-mostly, random-access
+		 * structure; first-touch placement piles it onto the builder's
+		 * node, so a single memory controller bottlenecks every other
+		 * node's readers and auto-NUMA-balancing thrashes the unbound
+		 * pages.  Interleave (an explicit mbind) spreads the bandwidth and
+		 * exempts the pages from balancing.
+		 *
+		 *   MPOL_DEFAULT   (no preference)        -> interleave (good default)
+		 *   MPOL_INTERLEAVE(process asked for it) -> interleave, upgraded to
+		 *                                            our THP-friendly 2 MiB
+		 *                                            granularity
+		 *   MPOL_BIND / PREFERRED / LOCAL         -> honor it, leave the region
+		 *                                            to the process policy
+		 *
+		 * The interleave below uses the MEMS_ALLOWED node set, so a cpuset
+		 * that restricts nodes is still respected.  Opt out with env
+		 * CDS_FT_NUMA_INTERLEAVE=0 or an explicit CDS_FT_NUMA_LOCAL group
+		 * policy.
 		 */
-		if (ft_query_process_mempolicy_mode() != FT_MPOL_INTERLEAVE)
+		int mode = ft_query_process_mempolicy_mode();
+
+		if (mode != FT_MPOL_DEFAULT && mode != FT_MPOL_INTERLEAVE)
 			return;
 		policy = CDS_FT_NUMA_INTERLEAVE;
 	}
