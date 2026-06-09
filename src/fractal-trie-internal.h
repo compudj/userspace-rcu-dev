@@ -383,6 +383,17 @@ struct ft_ord_cell {
 	struct cds_ft_node *node;
 	struct cds_ft_inode_flag *parent;
 };
+
+/*
+ * Item-length order for the dedicated cell arena: the smallest power of two
+ * that holds a struct ft_ord_cell (32 B => order 5).  A 1<<order-aligned cell
+ * keeps bits 0-2 clear, so the FT_ORD_CELL_TAG (bit 0) and flip-proxy (type 7)
+ * encodings stay unambiguous.  Bump it if the cell grows (the assert guards).
+ */
+#define FT_ORD_CELL_ALLOC_ORDER		5
+urcu_static_assert(sizeof(struct ft_ord_cell) <= (1U << FT_ORD_CELL_ALLOC_ORDER),
+		"struct ft_ord_cell must fit the cell arena item size",
+		ord_cell_fits_alloc_order);
 #endif /* FEATURE_FT_ORD_CELL */
 
 /*
@@ -622,6 +633,19 @@ struct cds_ft_group {
 	 * groups where speculative is false.
 	 */
 	struct cds_ft_alloc_arena *compressed_arena_order[FT_ALLOC_ORDER_MAX + 1];
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Dedicated arena for ordinal cells (Option E, ordered_list_set
+	 * groups).  Separate from arena_order[] so the uniform 32 B cell
+	 * bodies pack contiguously in their own item region -- the dense
+	 * ord-walk stride that cds_ft_compact exploits -- instead of being
+	 * diluted among the internal-node ranges.  Lazily created on the
+	 * first cell allocation (single order: the cell is uniform 32 B).
+	 * cds_ft_free_item recovers the range (and its rcu_head) from the
+	 * cell pointer for reader-safe deferred reclaim + nr_live draining.
+	 */
+	struct cds_ft_alloc_arena *cell_arena;
+#endif
 	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
@@ -1158,6 +1182,16 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft, size_t item_len_order);
 
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * Allocate one ordinal cell (Option E) from the group's dedicated cell arena
+ * (FT_ORD_CELL_ALLOC_ORDER, no bitmap).  Returns a metadata whose item is the
+ * 32 B cell (cds_ft_metadata_to_item); freed via cds_ft_free_item.
+ */
+__attribute__((visibility("hidden")))
+struct cds_ft_metadata *cds_ft_alloc_cell_item(struct cds_ft *ft);
+#endif
+
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
 
@@ -1191,6 +1225,15 @@ struct ft_recompact_alloc_ctx {
 	 */
 	struct cds_ft_alloc_range *cur[FT_ALLOC_ORDER_MAX + 1];
 	struct cds_ft_alloc_range *cur_compressed[FT_ALLOC_ORDER_MAX + 1];
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Current private range for the dedicated cell arena (single: cells are
+	 * uniform FT_ORD_CELL_ALLOC_ORDER).  Keeps relocated cells off the
+	 * internal/compressed cursors of the same order so they pack into their
+	 * own dense range.
+	 */
+	struct cds_ft_alloc_range *cur_cell;
+#endif
 	struct cds_list_head all;
 };
 

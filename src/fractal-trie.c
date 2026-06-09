@@ -1854,23 +1854,15 @@ struct ft_ord_cell *ft_ord_cell_resolve_ord(struct ft_ord_cell *const *slot)
 
 #ifdef FEATURE_FT_ORD_CELL
 /*
- * Cell lifecycle (Stage 3, malloc-backed; FT-allocator arena is Stage 6).
+ * Cell lifecycle (Stage 6, FT-allocator arena).
  *
- * The cell is the boxed allocation's first member, so the cell pointer
- * handed to the trie equals the box pointer; a deferred free recovers the
- * box (and its rcu_head) by container_of.  The 32B "logical" cell is what
- * readers see via head->prev; the appended rcu_head is allocator overhead.
+ * The cell is an item of the group's dedicated cell arena (a uniform 32 B
+ * item region, FT_ORD_CELL_ALLOC_ORDER), so cells pack contiguously for the
+ * dense ord-walk and are RELOCATABLE by cds_ft_compact.  The paired metadata
+ * slot is unused except its rcu_head, which cds_ft_free_item reuses to defer
+ * the free past a grace period; cds_ft_metadata_to_item / _item_to_metadata
+ * map between the cell and its metadata via the range header.
  */
-struct ft_ord_cell_box {
-	struct ft_ord_cell cell;
-	struct rcu_head rcu;
-};
-
-static
-void ft_ord_cell_free_rcu(struct rcu_head *rcu_head)
-{
-	free(caa_container_of(rcu_head, struct ft_ord_cell_box, rcu));
-}
 
 /*
  * Allocate a head's cell and wire it to @node with parent @parent (which
@@ -1884,39 +1876,30 @@ static
 void *ft_ord_cell_alloc(struct cds_ft *ft, struct cds_ft_node *node,
 		struct cds_ft_inode_flag *parent)
 {
-	struct ft_ord_cell_box *box = malloc(sizeof(*box));
+	struct cds_ft_metadata *meta = cds_ft_alloc_cell_item(ft);
+	struct ft_ord_cell *cell;
 
-	if (!box)
+	if (!meta)
 		return NULL;
-	box->cell.ord_prev = NULL;
-	box->cell.ord_next = NULL;
-	box->cell.node = node;
-	box->cell.parent = parent;
-	(void) ft;
-	return ft_ord_cell_flag(&box->cell);
+	cell = (struct ft_ord_cell *) cds_ft_metadata_to_item(meta);
+	cell->ord_prev = NULL;
+	cell->ord_next = NULL;
+	cell->node = node;
+	cell->parent = parent;
+	return ft_ord_cell_flag(cell);
 }
 
 /*
- * Release a head's cell after its key leaves the trie.  Deferred via the
- * group's RCU flavor so an in-flight reader parked on a head it up-walks
- * (head->prev -> cell -> cell->parent) never dereferences freed memory;
- * exclusive-mode tries (readers drained) free synchronously.
+ * Release a head's cell after its key leaves the trie.  Routes through
+ * cds_ft_free_item, which defers the free past a grace period (concurrent
+ * mode) so an in-flight reader parked on a head it up-walks (head->prev ->
+ * cell -> cell->parent) never dereferences freed memory, frees synchronously
+ * in exclusive mode, and drains the cell range's nr_live for reclaim.
  */
 static
 void ft_ord_cell_free(struct cds_ft *ft, struct ft_ord_cell *cell)
 {
-	struct ft_ord_cell_box *box =
-		caa_container_of(cell, struct ft_ord_cell_box, cell);
-
-#ifdef FT_IMMEDIATE_FREE
-	free(box);
-#else
-	if (ft->exclusive)
-		free(box);
-	else
-		ft->group->flavor->update_call_rcu(&box->rcu,
-			ft_ord_cell_free_rcu);
-#endif
+	cds_ft_free_item(ft, cds_ft_item_to_metadata(cell));
 }
 
 /*
@@ -1925,9 +1908,9 @@ void ft_ord_cell_free(struct cds_ft *ft, struct ft_ord_cell *cell)
  * reference, so the grace-period defer would only delay the free.
  */
 static inline
-void ft_ord_cell_free_unpublished(struct ft_ord_cell *cell)
+void ft_ord_cell_free_unpublished(struct cds_ft *ft, struct ft_ord_cell *cell)
 {
-	free(caa_container_of(cell, struct ft_ord_cell_box, cell));
+	cds_ft_free_item_unpublished(ft, cds_ft_item_to_metadata(cell));
 }
 
 /*
@@ -8281,18 +8264,51 @@ const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 }
 
 /*
+ * Sentinel stored in iter->key_len by the ordinal-cell land for a VARIABLE-
+ * length identity group: the length is DEFERRED (it lives in the matched leaf
+ * at key_len_offset) and resolved on demand by ft_iter_resolve_key_len(), so a
+ * keyless cell walk reads neither the key nor the length from the leaf.
+ * SIZE_MAX is never a valid key length (bounded by max_key_len), so a consumer
+ * that forgets to resolve hits an obvious overflow, not a silently-stale value.
+ */
+#define FT_ITER_KEY_LEN_LAZY	((size_t) -1)
+
+/*
+ * Resolve (and cache) the iterator's current-position key length.  For a
+ * deferred-length cell position it reads node->key_len from the leaf once and
+ * caches it into iter->key_len (and path_len); otherwise returns iter->key_len
+ * unchanged (a no-op for fixed-length, non-identity, descent and non-cell
+ * positions).  EVERY reader of the current-position length (cds_ft_iter_get_key,
+ * cds_ft_remove*, the skip rebuilds, bind, the max-key-len scan) must call this
+ * before reading iter->key_len.  The LAZY sentinel is only ever set with
+ * cache_valid && node, so the leaf read is safe.
+ */
+static inline
+size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
+{
+	if (caa_unlikely(iter->key_len == FT_ITER_KEY_LEN_LAZY)) {
+		iter->key_len = *(const size_t *) ((const char *) iter->node +
+			iter->ft->group->key_len_offset);
+		iter->path_len = iter->key_len + 1;
+	}
+	return iter->key_len;
+}
+
+/*
  * Copy a live leaf-referenced key into iter_key so it survives the position
  * being detached (UNCACHED auto-invalidate, bind, any cache_valid clear).  A
  * no-op self-copy when the key is already a value there.  Bytes are ordinal
- * (ft_iter_key_referenced requires an identity map).
+ * (ft_iter_key_referenced requires an identity map).  Resolves the length first
+ * so a deferred-length position materializes both before its node is dropped.
  */
 static inline
 void ft_iter_materialize_key(struct cds_ft_iter *iter)
 {
+	size_t klen = ft_iter_resolve_key_len(iter);
 	const uint8_t *cur = ft_iter_read_key(iter);
 
 	if (cur != iter_key(iter))
-		memcpy(iter_key(iter), cur, iter->key_len);
+		memcpy(iter_key(iter), cur, klen);
 }
 
 
@@ -8320,28 +8336,46 @@ enum cds_ft_status ft_ord_cell_iter_land(struct cds_ft *ft,
 		return iter->status;
 	}
 	node = cell->node;
-	rlen = (ft->group->key_len != CDS_FT_LEN_VARIABLE) ?
-		ft->group->key_len :
-		*(const size_t *) ((const char *) node +
-			ft->group->key_len_offset);
-	iter->key_len = rlen;
 	iter->node = node;
 	iter->ord_cell = cell;
 	iter->ord_cell_node = node;
 	iter->cache_valid = true;
 	/*
-	 * Lazy-ref: with cache_valid + node now set, ft_iter_key_referenced()
-	 * holds for an identity group, so the result key is read straight from
-	 * @node's leaf by ft_iter_read_key() — NO per-step copy (the cell walk's
-	 * whole point).  A non-identity group must remap to ordinal order, so
-	 * copy into iter_key (then ft_iter_key_referenced is false and consumers
-	 * use the buffer).
+	 * Materialize as little as possible — the cell walk's point is that a
+	 * keyless / count traversal touches NO leaf:
+	 *
+	 *  - Identity map: the result key is a live reference into @node's leaf
+	 *    (ft_iter_read_key), so no key copy.  A VARIABLE-length group also
+	 *    DEFERS the length: iter->key_len is the LAZY sentinel, resolved from
+	 *    node->key_len on demand by ft_iter_resolve_key_len() only in the
+	 *    key-consuming ops (get_key / remove / skip / bind).  So a keyless
+	 *    variable-length walk reads neither the key nor the length from the
+	 *    leaf.  A FIXED-length group takes its length from group->key_len
+	 *    (no leaf touch either).
+	 *  - Non-identity map: the key must be remapped to ordinal order now,
+	 *    which needs the length now — read it (leaf, for variable) and copy
+	 *    into iter_key (ft_iter_key_referenced is then false, consumers use
+	 *    the buffer).
 	 */
-	if (!ft->group->key_map.identity)
+	if (caa_likely(ft->group->key_map.identity)) {
+		if (ft->group->key_len != CDS_FT_LEN_VARIABLE) {
+			iter->key_len = ft->group->key_len;
+			iter->path_len = ft->group->key_len + 1;
+		} else {
+			iter->key_len = FT_ITER_KEY_LEN_LAZY;
+			iter->path_len = 0;	/* materialized with the length */
+		}
+	} else {
+		rlen = (ft->group->key_len != CDS_FT_LEN_VARIABLE) ?
+			ft->group->key_len :
+			*(const size_t *) ((const char *) node +
+				ft->group->key_len_offset);
 		ft_speculative_keycopy_unconditional(ft, node, iter_key(iter),
 			(ssize_t) rlen);
+		iter->key_len = rlen;
+		iter->path_len = rlen + 1;
+	}
 	iter_debug_path_update(iter);
-	iter->path_len = rlen + 1;
 	iter->status = CDS_FT_STATUS_OK;
 	return iter->status;
 }
@@ -8401,7 +8435,7 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 			limit == FT_LOOKUP_LIMIT_NONE);
 	uint8_t ord_scratch;
 	enum ft_direction dir;
-	const uint8_t *input_key;
+	const uint8_t *input_key = NULL;	/* set below; init for the hoisted cell-fastpath goto end */
 	const uint8_t *iter_key;
 	size_t key_len = 0;
 	bool going_up = false, skip_eq_external_nodes;
@@ -8432,9 +8466,50 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Ordinal-cell fast path (Option E): cds_ft_next / cds_ft_prev (GT/LT,
+	 * LIMIT_NONE) on a cached head collapse to a single dependent load of the
+	 * cell's ord_next / ord_prev — no descent, no leaf touch for the step
+	 * (cell->node + cell->ord_* co-reside in the 32B cell).  Hoisted ABOVE the
+	 * key_len computation so the common walk does NOT resolve the (deferred,
+	 * LAZY) length: the fast path advances via ord_next and never needs it.
+	 * Only a fall-through to the descent (cache invalid / scoped) resolves the
+	 * length where it is first used.
+	 */
+	if ((mode == FT_LOOKUP_GT || mode == FT_LOOKUP_LT) &&
+			limit == FT_LOOKUP_LIMIT_NONE &&
+			iter->cache_valid && iter->node &&
+			ft_ord_cell_fastpath_ok(ft, iter)) {
+		struct ft_ord_cell *cur = ft_ord_cell_cursor(iter);
+		struct ft_ord_cell *nxt = (mode == FT_LOOKUP_GT) ?
+			ft_ord_cell_resolve_ord(&cur->ord_next) :
+			ft_ord_cell_resolve_ord(&cur->ord_prev);
+
+		ft_ord_cell_iter_land(ft, iter, nxt);
+#ifndef FT_NO_ORD_PREFETCH
+		/* One-hop NTA prefetch of the cell the next call will land on. */
+		if (nxt) {
+			struct ft_ord_cell *nn = (mode == FT_LOOKUP_GT) ?
+				ft_ord_cell_resolve_ord(&nxt->ord_next) :
+				ft_ord_cell_resolve_ord(&nxt->ord_prev);
+			if (nn)
+				__builtin_prefetch((const void *) nn, 0, 0);
+		}
+#endif
+		goto end;
+	}
+#endif /* FEATURE_FT_ORD_CELL */
+
 	switch (limit) {
 	case FT_LOOKUP_LIMIT_NONE:
-		key_len = ft_key_len(ft, iter->key_len);
+		/*
+		 * Continuation from the current position: its length may be the
+		 * deferred LAZY sentinel (a cell walk that fell to the descent on a
+		 * scoped step) -- resolve it from the leaf.  No-op for fixed /
+		 * descent / set_key positions.
+		 */
+		key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 		if (!valid_key_len(ft, key_len)) {
 			iter->node = NULL;
 			iter->cache_valid = false;
@@ -8522,40 +8597,6 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 			goto end;
 		}
 	}
-
-
-#ifdef FEATURE_FT_ORD_CELL
-	/*
-	 * Ordinal-cell fast path (Option E): cds_ft_next / cds_ft_prev (GT/LT,
-	 * LIMIT_NONE) on a cached head collapse to a single dependent load of the
-	 * cell's ord_next / ord_prev — no descent, no leaf touch for the step
-	 * (cell->node + cell->ord_* co-reside in the 32B cell).  The cursor is
-	 * the cached cell when it still refers to iter->node, else re-entered via
-	 * the head's prev (one leaf load per walk entry).
-	 */
-	if ((mode == FT_LOOKUP_GT || mode == FT_LOOKUP_LT) &&
-			limit == FT_LOOKUP_LIMIT_NONE &&
-			iter->cache_valid && iter->node &&
-			ft_ord_cell_fastpath_ok(ft, iter)) {
-		struct ft_ord_cell *cur = ft_ord_cell_cursor(iter);
-		struct ft_ord_cell *nxt = (mode == FT_LOOKUP_GT) ?
-			ft_ord_cell_resolve_ord(&cur->ord_next) :
-			ft_ord_cell_resolve_ord(&cur->ord_prev);
-
-		ft_ord_cell_iter_land(ft, iter, nxt);
-#ifndef FT_NO_ORD_PREFETCH
-		/* One-hop NTA prefetch of the cell the next call will land on. */
-		if (nxt) {
-			struct ft_ord_cell *nn = (mode == FT_LOOKUP_GT) ?
-				ft_ord_cell_resolve_ord(&nxt->ord_next) :
-				ft_ord_cell_resolve_ord(&nxt->ord_prev);
-			if (nn)
-				__builtin_prefetch((const void *) nn, 0, 0);
-		}
-#endif
-		goto end;
-	}
-#endif /* FEATURE_FT_ORD_CELL */
 
 	/*
 	 * Fast path: reuse the iterator's cached position from a prior
@@ -11590,9 +11631,9 @@ insert_done:
 	 */
 	if (ret != 0) {
 		node->prev = NULL;
-		ft_ord_cell_free_unpublished(precell);
+		ft_ord_cell_free_unpublished(ft, precell);
 	} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
-		ft_ord_cell_free_unpublished(precell);
+		ft_ord_cell_free_unpublished(ft, precell);
 	} else if (ft->group->ordered_list_set) {
 		/* @node became a fresh head: splice its kept cell into the list. */
 		ft_ord_cell_splice(ft, _key, _key_len, precell);
@@ -11894,9 +11935,9 @@ insert_replace_done:
 	 */
 	if (ret != 0) {
 		node->prev = NULL;
-		ft_ord_cell_free_unpublished(precell);
+		ft_ord_cell_free_unpublished(ft, precell);
 	} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
-		ft_ord_cell_free_unpublished(precell);
+		ft_ord_cell_free_unpublished(ft, precell);
 	} else if (ft->group->ordered_list_set && *old_node_ret == NULL) {
 		/*
 		 * Fresh head (no chain replaced): splice its kept cell.  A replace
@@ -14187,7 +14228,8 @@ void ft_graft_glue_record_splice(struct ft_graft_glue *g,
  * keep their ordering.
  */
 static
-void ft_graft_glue_apply_splices(struct ft_graft_glue *g)
+void ft_graft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
+		struct ft_graft_glue *g)
 {
 	int i;
 
@@ -14211,7 +14253,7 @@ void ft_graft_glue_apply_splices(struct ft_graft_glue *g)
 		src_head->prev = tail;	/* write-side only, plain store */
 		rcu_assign_pointer(tail->next, src_head);
 #ifdef FEATURE_FT_ORD_CELL
-		ft_ord_cell_free_unpublished(src_cell);
+		ft_ord_cell_free_unpublished(ft, src_cell);
 #endif
 	}
 }
@@ -17731,7 +17773,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	urcu_flip_commit(&flip->group);
 
 	/* 5. Concatenate same-key duplicate chains (dst now reachable via M). */
-	ft_graft_glue_apply_splices(&gd);
+	ft_graft_glue_apply_splices(dst_ft, &gd);
 
 	/*
 	 * 6. Propagate the dst key-count delta through the ancestors, starting at
@@ -18703,7 +18745,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 
 	/* Rebuild path from root to current key. */
-	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), iter->key_len,
+	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), ft_iter_resolve_key_len(iter),
 			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
@@ -19175,7 +19217,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	iter_debug_path_snapshot(iter);
 
 	/* Rebuild path from root to current key. */
-	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), iter->key_len,
+	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), ft_iter_resolve_key_len(iter),
 			ordinal_key, &deepest);
 	if (depth < 0)
 		goto not_found;
@@ -21174,6 +21216,47 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	return cn2;
 }
 
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * Relocate one ordinal cell into a fresh slot from the dedicated cell arena.
+ * The active recompaction context routes the allocation into a private cell
+ * range, so cells relocated in key-traversal order pack densely there -- the
+ * dense ord-walk stride that makes ordered iteration a sequential scan rather
+ * than a random pointer chase.  Returns the new cell, or @old unchanged on
+ * allocation failure (best-effort: leave it in place).
+ *
+ * Atomicity reuses ft_ord_cell_swap for the two ordered-list edges
+ * (pred->ord_next / succ->ord_prev flip together via the flip-latch, so a
+ * bidirectional ordered reader never sees a half-relocated list; ord_cell_head
+ * /tail follow).  The head's UPWARD reference (head->prev) is then re-pointed
+ * with a PLAIN RCU store: an up-walk reader resolves the old or the new cell,
+ * both carrying an IDENTICAL parent (compaction runs under writer exclusion, so
+ * @old->parent is settled), and @old stays live until its grace period -- so no
+ * flip is needed, and head->prev must never hold a flip-proxy (ft_resolve_head_
+ * prev does not resolve one).  @old keeps its own links for parked ordered
+ * readers and is RCU-freed (its general-arena range drains for reclaim).
+ */
+static
+struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
+		struct ft_ord_cell *old)
+{
+	struct cds_ft_metadata *meta = cds_ft_alloc_cell_item(ft);
+	struct cds_ft_node *head = old->node;
+	struct ft_ord_cell *new_cell;
+
+	if (!meta)
+		return old;		/* OOM: best-effort, leave in place */
+	new_cell = (struct ft_ord_cell *) cds_ft_metadata_to_item(meta);
+	new_cell->node = head;
+	new_cell->parent = old->parent;
+	/* ord_prev / ord_next are set from @old's neighbours by the swap. */
+	ft_ord_cell_swap(ft, old, new_cell);
+	rcu_assign_pointer(head->prev, ft_ord_cell_flag(new_cell));
+	ft_ord_cell_free(ft, old);
+	return new_cell;
+}
+#endif /* FEATURE_FT_ORD_CELL */
+
 /*
  * Forward relocate-descent: walk from the root to the leaf for @key
  * (the user key), relocating every internal node on the path that has
@@ -21343,6 +21426,26 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 			break;
 		}
 		ft_compact_descend(ft, key, key_len, &relocated);
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Relocate this key's cell into a dense private cell range, in the
+		 * same key order the iterator visits -- so the ordered cell list
+		 * becomes a near-sequential scan.  iter->node is the chain head;
+		 * its cell is head->prev.  Skip a cell already moved this pass
+		 * (its range is recompact_private), mirroring the node descent, so
+		 * the pass is idempotent and re-visits do not re-allocate.
+		 */
+		if (ft->group->ordered_list_set && st->iter->node) {
+			struct ft_ord_cell *cell = ft_ord_cell_ptr(
+				rcu_dereference(st->iter->node->prev));
+
+			if (!cds_ft_metadata_in_recompact_private(
+					cds_ft_item_to_metadata(cell))) {
+				ft_compact_relocate_cell(ft, cell);
+				relocated++;
+			}
+		}
+#endif
 	}
 	/*
 	 * Drop the cached path before releasing the read lock: the nodes it
@@ -21697,8 +21800,10 @@ enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft)
 	if (status != CDS_FT_STATUS_OK)
 		return status;
 	cds_ft_for_each_rcu(ft, iter) {
-		if (iter->key_len > max_len)
-			max_len = iter->key_len;
+		size_t klen = ft_iter_resolve_key_len(iter);
+
+		if (klen > max_len)
+			max_len = klen;
 	}
 	status = cds_ft_iter_status(iter);
 	cds_ft_iter_destroy(iter);
@@ -21963,16 +22068,19 @@ enum cds_ft_status cds_ft_iter_status(const struct cds_ft_iter *iter)
 enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
 		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
 {
-	*result_key_len = iter->key_len;
-	if (iter->key_len > result_key_max_len)
+	size_t klen = ft_iter_resolve_key_len(iter);
+
+	*result_key_len = klen;
+	if (klen > result_key_max_len)
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
 	/*
 	 * Lazy-ref: when the current key is a live reference into iter->node,
-	 * read it from the leaf; else from the iter_key value.  Same continuous-
-	 * RCU-lock contract as reusing the cached position (cross-CS callers
-	 * cds_ft_iter_bind_key() first).
+	 * read it from the leaf; else from the iter_key value.  ft_iter_resolve_
+	 * key_len above materialized a deferred (variable-length) length from the
+	 * same leaf.  Same continuous-RCU-lock contract as reusing the cached
+	 * position (cross-CS callers cds_ft_iter_bind_key() first).
 	 */
-	ft_ordinals_to_key(result_key, ft_iter_read_key(iter), iter->key_len,
+	ft_ordinals_to_key(result_key, ft_iter_read_key(iter), klen,
 			&iter->ft->group->key_map);
 	return CDS_FT_STATUS_OK;
 }
@@ -22026,7 +22134,7 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
  */
 enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t prefix_len)
 {
-	if (prefix_len > iter->key_len) {
+	if (prefix_len > ft_iter_resolve_key_len(iter)) {
 		FT_TP(iter_set_prefix_len, (const void *) iter->ft,
 			(const void *) iter, (int) prefix_len);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -22087,7 +22195,16 @@ void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 	dst->gp_state = src->gp_state;
 	dst->gp_state_valid = src->gp_state_valid;
 #endif
-	memcpy(iter_key(dst), iter_key(src), src->key_len);
+	/*
+	 * Copy the key buffer only when the source key is a VALUE there.  When it
+	 * is a live leaf reference (identity cell position, incl. a deferred-length
+	 * LAZY one), iter_key(src) is stale and src->key_len may be the LAZY
+	 * sentinel — @dst shares src->node + cache_valid, so it reads the key (and
+	 * resolves the length) from the same leaf, and the buffer copy is both
+	 * unnecessary and unsafe (a SIZE_MAX memcpy).
+	 */
+	if (!ft_iter_key_referenced(src))
+		memcpy(iter_key(dst), iter_key(src), src->key_len);
 }
 
 struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
