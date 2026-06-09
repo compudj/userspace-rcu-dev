@@ -2351,10 +2351,18 @@ bool ft_group_skip_compressed(const struct cds_ft_group *group __attribute__((un
  * When parent is NULL (root's child), the offset is unused —
  * ft_get_parent_slot recovers &ft->root.
  */
+/* Recover the branch byte indexing @slot in internal parent @node (defined
+ * after the popcount layout helpers). */
+static uint8_t ft_slot_to_byte(const struct cds_ft_type *type,
+		struct cds_ft_inode *node, struct cds_ft_inode_flag **slot);
+
 static inline
 void ft_set_parent_slot(struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag **slot)
 {
+	struct cds_ft_inode_flag *p;
+	bool parent_compressed;
+
 	if (!slot)
 		return;	/* Slot unknown — preserve existing offset. */
 	if (!meta->parent) {
@@ -2363,6 +2371,25 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 	}
 	meta->parent_slot_offset = (unsigned int)((char *) slot -
 		(char *) ft_node_ptr(meta->parent)) / sizeof(void *);
+	/*
+	 * Record this node's incoming branch byte for the up-walk key rebuild
+	 * (ft_rebuild_key_upwalk).  This is THE central populate point for every
+	 * slot-placed node (internal + compressed) -- it runs from ft_set_parent
+	 * AND ft_publish_to_parent, so all publish paths are covered without
+	 * threading the byte to each call site.  Derive it by inverting @slot
+	 * against the parent's bitmap (cold path).  Only meaningful when the
+	 * parent is an internal (slot-array) node: a compressed parent has no
+	 * slot array -- the edge byte lives in its key_bytes -- so skip it (the
+	 * up-walk likewise skips a node whose parent is compressed).
+	 */
+	p = meta->parent;
+	parent_compressed = ft_node_compressed(p);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	parent_compressed = parent_compressed || ft_node_skip_compressed(p);
+#endif
+	if (!parent_compressed)
+		meta->incoming_byte = ft_slot_to_byte(
+			&ft_types[ft_node_type(p)], ft_node_ptr(p), slot);
 }
 
 /*
@@ -4545,6 +4572,35 @@ void ft_popcount_1l_node_get_ith_pos(const struct cds_ft_type *type,
 }
 
 /*
+ * Recover the branch byte indexing @slot within internal parent @node (the
+ * inverse of byte -> child slot).  Pigeon: the body is a 256-entry array
+ * indexed by byte, so the slot offset IS the byte.  Popcount: children are
+ * packed by set-bit rank, so the slot's index in the packed pointer array
+ * (slot - pointers_base) is its rank, mapped to the byte via get_ith_pos.
+ * @node is always an internal (pigeon/popcount) node -- ft_set_parent_slot
+ * guards out compressed parents (which have no slot array).
+ */
+static
+uint8_t ft_slot_to_byte(const struct cds_ft_type *type,
+		struct cds_ft_inode *node, struct cds_ft_inode_flag **slot)
+{
+	if (ft_type_is_pigeon(type->type_class))
+		return (uint8_t) (slot -
+			(struct cds_ft_inode_flag **) node->data);
+	{
+		struct cds_ft_inode_flag **base = type->popcount_2l ?
+			ft_popcount_2l_pointers(node, type) :
+			ft_popcount_1l_pointers(node);
+		uint8_t v;
+		struct cds_ft_inode_flag *child;
+
+		ft_popcount_node_get_ith_pos(type, node,
+			(uint8_t) (slot - base), &v, &child);
+		return v;
+	}
+}
+
+/*
  * Find the leftmost (largest v < n) or rightmost (smallest v > n)
  * populated entry.
  *
@@ -6014,6 +6070,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		dbg_printf("Recompact inherit from %p\n", metadata);
 		if (metadata) {
 			new_metadata->parent = metadata->parent;
+			/* The retyped node keeps its own incoming edge byte. */
+			new_metadata->incoming_byte = metadata->incoming_byte;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			new_metadata->parent_slot_offset = metadata->parent_slot_offset;
 #endif
@@ -8254,14 +8312,139 @@ bool ft_iter_key_referenced(const struct cds_ft_iter *iter)
  * Valid only while the RCU lock that produced iter->node is held (cross-CS
  * callers cds_ft_iter_bind_key() first).
  */
+#ifdef FEATURE_FT_ORD_CELL
+static inline_lookup
+struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter);
+static size_t ft_rebuild_key_upwalk(const struct cds_ft *ft,
+		struct ft_ord_cell *cell, uint8_t *out, size_t max_len);
+#endif
+
 static inline
 const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 {
+	const struct cds_ft_group *group = iter->ft->group;
+
 	if (ft_iter_key_referenced(iter))
-		return (const uint8_t *) iter->node +
-			iter->ft->group->speculative_key_offset;
+		return (const uint8_t *) iter->node + group->speculative_key_offset;
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * EAGER ordered-list walk (no in-leaf key): rematerialize the current
+	 * key STRUCTURALLY via the parent up-walk into iter_key.  Reached only
+	 * when a key consumer asks for the key -- a keyless/count walk never
+	 * calls this, so the O(depth) walk is paid strictly on demand.  Identity
+	 * map => ordinal bytes ARE the key.  Fixed-length only for now (a
+	 * variable-length walk would derive the length from the walk itself --
+	 * follow-up); ft_ord_cell_fastpath_ok keeps variable EAGER off the cell
+	 * path until then.
+	 */
+	if (group->ordered_list_set && !group->speculative_key_offset_set &&
+			group->key_map.identity && iter->cache_valid &&
+			iter->node && group->key_len != CDS_FT_LEN_VARIABLE) {
+		struct ft_ord_cell *cell = ft_ord_cell_cursor(iter);
+		uint8_t *buf = iter_key(iter);
+
+		if (cell && ft_rebuild_key_upwalk(iter->ft, cell, buf,
+				group->max_key_len))
+			return buf;
+	}
+#endif
 	return iter_key(iter);
 }
+
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * Rebuild the ORDINAL key for a cell head @cell of length @key_len by walking
+ * UP the parent chain, recovering each level's branch byte structurally:
+ *   - external head: its last byte = the head's cell-metadata incoming_byte
+ *     (unless its parent is a compressed node, whose key_bytes already span
+ *     through the head's position).
+ *   - internal node: metadata->incoming_byte (skip the root, which has none).
+ *   - compressed node: its key_bytes[] span PLUS metadata->incoming_byte (the
+ *     slot byte under which it hangs in its parent -- separate from key_bytes).
+ * Fills @out[0..key_len) (caller-sized >= key_len) and returns true when the
+ * walk accounts for exactly key_len bytes.
+ *
+ * This is the structural key source for the ordered-list walk that needs NO
+ * speculative_key_offset (in-leaf key) and NO parent-bitmap inversion -- it
+ * makes the ordered list usable on an EAGER / no-leaf-key trie.  Valid only
+ * while the RCU lock that produced @cell is held continuously.
+ */
+static
+size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
+		uint8_t *out, size_t max_len)
+{
+	struct cds_ft_inode_flag *nf;
+	size_t n = 0, i, j;
+
+	(void) ft;
+	if (!cell)
+		return 0;
+
+	nf = rcu_dereference(cell->parent);
+
+	/*
+	 * Accumulate bytes DEEPEST-FIRST into out[0..n), then reverse -- so the
+	 * length is DERIVED from the walk (no key_len needed: works for variable-
+	 * length keys with no in-leaf length either).  Each step appends its
+	 * contribution; on overflow past @max_len, fail (return 0).
+	 *
+	 * Head's last byte: when it hangs off an internal node it sits in a slot
+	 * whose byte is the head's cell-metadata incoming_byte; when its parent is
+	 * a compressed node the head is that node's child and carries no separate
+	 * edge byte (the compressed key_bytes run through the head's position).
+	 */
+	if (!nf || !ft_node_compressed(ft_resolve_skip_compressed(nf))) {
+		struct cds_ft_metadata *hmeta = cds_ft_item_to_metadata(cell);
+
+		if (n >= max_len)
+			return 0;
+		out[n++] = (uint8_t) hmeta->incoming_byte;
+	}
+
+	while (nf) {
+		struct cds_ft_inode_flag *rnf = ft_resolve_skip_compressed(nf);
+		struct cds_ft_metadata *meta = ft_flag_to_metadata(nf);
+
+		if (ft_node_compressed(rnf)) {
+			const struct cds_ft_compressed_node *cn =
+				(const struct cds_ft_compressed_node *)
+				ft_node_ptr(rnf);
+			unsigned int k = cn->len;
+
+			/* Compressed span, deepest byte first: key_bytes[len-1..0]. */
+			while (k-- > 0) {
+				if (n >= max_len)
+					return 0;
+				out[n++] = cn->key_bytes[k];
+			}
+		}
+		/*
+		 * This node's incoming edge byte (the slot byte in its parent).
+		 * Contributed only when the PARENT is an internal (slot-array)
+		 * node: a compressed parent's last key_byte already IS this edge,
+		 * counted when that parent is processed -- so skip it here (mirrors
+		 * the head's skip when its parent is compressed).  The root has no
+		 * parent and contributes none.
+		 */
+		if (meta->parent &&
+				!ft_node_compressed(ft_resolve_skip_compressed(meta->parent))) {
+			if (n >= max_len)
+				return 0;
+			out[n++] = (uint8_t) meta->incoming_byte;
+		}
+		nf = rcu_dereference(meta->parent);
+	}
+
+	/* Reverse out[0..n) from deepest-first into key order. */
+	for (i = 0, j = n; i < j; ) {
+		uint8_t t = out[i];
+
+		out[i++] = out[--j];
+		out[j] = t;
+	}
+	return n;
+}
+#endif /* FEATURE_FT_ORD_CELL */
 
 /*
  * Sentinel stored in iter->key_len by the ordinal-cell land for a VARIABLE-
@@ -8390,9 +8573,18 @@ bool ft_ord_cell_fastpath_ok(const struct cds_ft *ft,
 		const struct cds_ft_iter *iter)
 {
 	return ft->group->ordered_list_set &&
-		ft->group->speculative_key_offset_set &&
+		/* length obtainable: fixed key_len, or variable + key_len_offset */
 		(ft->group->key_len != CDS_FT_LEN_VARIABLE ||
 			ft->group->key_len_offset_set) &&
+		/*
+		 * Result key obtainable: an in-leaf key (speculative_key_offset)
+		 * serves any length; without it, the structural up-walk rebuild
+		 * (ft_iter_read_key) covers FIXED-length keys -- so a fixed-length
+		 * EAGER trie needs no in-leaf key.  Variable-length still needs the
+		 * leaf key until the up-walk derives the length (follow-up).
+		 */
+		(ft->group->speculative_key_offset_set ||
+			ft->group->key_len != CDS_FT_LEN_VARIABLE) &&
 		iter->prefix_len == 0;
 }
 
@@ -11449,6 +11641,16 @@ int _cds_ft_insert(struct cds_ft *ft,
 			return -ENOMEM;
 		node->prev = cell;
 		precell = ft_ord_cell_ptr(cell);
+		/*
+		 * Head's last edge byte for the up-walk key rebuild: the cell is
+		 * the head's metadata record and @key is ordinal here, so
+		 * key[key_len - 1] is the byte the head hangs under (ignored by the
+		 * up-walk when the head's parent is a compressed node, whose
+		 * key_bytes already span the head's position).
+		 */
+		if (key_len)
+			cds_ft_item_to_metadata(precell)->incoming_byte =
+				(uint8_t) key[key_len - 1];
 	}
 #endif
 
@@ -11758,6 +11960,16 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			return -ENOMEM;
 		node->prev = cell;
 		precell = ft_ord_cell_ptr(cell);
+		/*
+		 * Head's last edge byte for the up-walk key rebuild: the cell is
+		 * the head's metadata record and @key is ordinal here, so
+		 * key[key_len - 1] is the byte the head hangs under (ignored by the
+		 * up-walk when the head's parent is a compressed node, whose
+		 * key_bytes already span the head's position).
+		 */
+		if (key_len)
+			cds_ft_item_to_metadata(precell)->incoming_byte =
+				(uint8_t) key[key_len - 1];
 	}
 #endif
 
@@ -21206,6 +21418,8 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	 * read a fresh-zeroed offset and resolve the wrong slot.
 	 */
 	cn2_meta->parent_slot_offset = cn_meta->parent_slot_offset;
+	/* Same slot in the same parent => same incoming edge byte (up-walk source). */
+	cn2_meta->incoming_byte = cn_meta->incoming_byte;
 	cn2_meta->nr_child = cn_meta->nr_child;		/* == 1 for a compressed node */
 	cn2_meta->external_nodes = NULL;		/* never set on a compressed node */
 	ft_nr_keys_store(cn2_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
@@ -21251,6 +21465,8 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 	new_cell = (struct ft_ord_cell *) cds_ft_metadata_to_item(meta);
 	new_cell->node = head;
 	new_cell->parent = old->parent;
+	/* Carry the head's edge byte across the relocation (up-walk key source). */
+	meta->incoming_byte = cds_ft_item_to_metadata(old)->incoming_byte;
 	/* ord_prev / ord_next are set from @old's neighbours by the swap. */
 	ft_ord_cell_swap(ft, old, new_cell);
 	rcu_assign_pointer(head->prev, ft_ord_cell_flag(new_cell));

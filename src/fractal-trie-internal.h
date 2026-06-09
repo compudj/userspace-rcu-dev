@@ -552,11 +552,14 @@ struct cds_ft_metadata {
 	/*
 	 * A 2 MiB far macro-block holds far more than 256 items (e.g. ~18 700
 	 * order-5 nodes), overflowing the FT_ALLOC_INDEX_BITS (8-bit) packed
-	 * field.  Store alloc_index as its own uint32_t — it lands in the
-	 * struct's existing 4-byte tail padding, so the struct stays 32 B and
-	 * the hot descent bitfield (nr_child/parent_slot_offset) is untouched.
+	 * field.  Store alloc_index in its own word — it lands in the struct's
+	 * existing 4-byte tail padding, so the struct stays 32 B and the hot
+	 * descent bitfield (nr_child/parent_slot_offset) is untouched.  24 bits
+	 * (16 M) is ample for a 2 MiB block; the top 8 bits carry incoming_byte
+	 * (below), keeping the struct 32 B without a separate tail byte.
 	 */
-	uint32_t alloc_index;
+	uint32_t alloc_index:24;
+	uint32_t incoming_byte:8;
 #else
 	/*
 	 * Near metadata: alloc_index is packed into this word, sized with
@@ -564,6 +567,21 @@ struct cds_ft_metadata {
 	 * needed to index a page-sized range.
 	 */
 	uint32_t alloc_index:(FT_ALLOC_INDEX_BITS + 3);
+	/*
+	 * Branch byte on the parent->this edge: the key byte consumed entering
+	 * this node.  Maintained at every child placement so an UPWARD key
+	 * rebuild (ft_rebuild_key_upwalk) recovers each level's byte in O(1) --
+	 * no in-leaf key copy and no parent-bitmap inversion.  This is the
+	 * structural key source that lets the ordered-list walk materialize its
+	 * result key WITHOUT a speculative_key_offset (e.g. an EAGER trie).
+	 *   - internal node: the single incoming edge byte.
+	 *   - compressed node: unused -- key_bytes[0] already IS that byte.
+	 *   - external head: stored in the head's CELL metadata (the cell is the
+	 *     head's metadata record), set to the key's last byte at insert.
+	 * Near layout: occupies the 32 B struct's offset-28 tail padding; the
+	 * hot descent bitfield is untouched.
+	 */
+	uint8_t incoming_byte;
 #endif
 };
 
