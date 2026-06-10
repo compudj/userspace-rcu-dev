@@ -9189,6 +9189,45 @@ post_traversal:
 		assert(0);
 	}
 
+	/*
+	 * LE/LT dead-ended at an external LEAF that is a PROPER PREFIX of the
+	 * search key: the descent matched the leaf's whole key (depth @level)
+	 * but the search key is longer, so leaf_key < search_key.  A leaf has
+	 * no extensions, so no key lies strictly between it and the search key
+	 * on this path -- it is the largest key <= the search key, larger than
+	 * any left-sibling branch (which diverges at a smaller byte).  going_up
+	 * skips external leaves (it only returns internal/compressed nodes'
+	 * external_nodes), so return the leaf here.  The exact-length match
+	 * (@level == key_depth - 1) is already handled by the LE/GE arm above
+	 * (LE) or excluded by strictness (LT), so this is only the proper-prefix
+	 * case.
+	 */
+	if (limit == FT_LOOKUP_LIMIT_NONE &&
+			(mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) &&
+			ft_node_external(node_flag) &&
+			level < key_depth - 1) {
+		int j;
+
+		assert(level <= (int) ft->group->max_key_len);
+		iter->key_len = level;
+		if (!keep_ordinal)
+			ft_speculative_keycopy_unconditional(ft,
+				(const struct cds_ft_node *) ft_node_ptr(node_flag),
+				iter_key(iter), level);
+		else if (!ft_speculative_keycopy(ft,
+				(const struct cds_ft_node *) ft_node_ptr(node_flag),
+				iter_key(iter), level)) {
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+		}
+		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+		iter->cache_valid = true;
+		iter_debug_path_update(iter);
+		iter->path_len = level + 1;
+		iter->status = CDS_FT_STATUS_OK;
+		goto end;
+	}
+
 	/* If we reach end of key, we need to go one level backward. */
 	if (level >= key_depth)
 		level = key_depth - 1;

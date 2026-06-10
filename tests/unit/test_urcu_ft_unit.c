@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 233
+#define NR_TESTS 234
 #else
-#define NR_TESTS 222
+#define NR_TESTS 223
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4162,6 +4162,94 @@ static int test_inequality_prefix_key(void)
 			rk[rl] = '\0';
 			if (strcmp((char *) rk, cases[i].expect) != 0) {
 				fprintf(stderr, "ineq('%s'): got '%s', expected '%s'\n",
+					cases[i].q, (char *) rk, cases[i].expect);
+				rcu_read_unlock();
+				goto out;
+			}
+		}
+		rcu_read_unlock();
+	}
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Inequality lookups where the search key EXTENDS an existing leaf key (the
+ * leaf is a proper prefix of the search key).  Regression for cds_ft_lookup_lt
+ * / cds_ft_lookup_le returning NOT_FOUND instead of that leaf -- a leaf has no
+ * extensions, so it is the largest key <= the search key on its path, but the
+ * going-up backtrack skips external leaves.  "ab" is a leaf; "abcd" extends it.
+ */
+static int test_inequality_extends_prefix(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	const char *words[] = { "ab", "m" };
+	struct ext_case {
+		const char *q;
+		enum cds_ft_status (*fn)(struct cds_ft *, struct cds_ft_iter *);
+		const char *expect;	/* NULL = expect NOT_FOUND */
+	} cases[] = {
+		{ "abcd", cds_ft_lookup_lt, "ab" },	/* ab < abcd, leaf predecessor */
+		{ "abcd", cds_ft_lookup_le, "ab" },
+		{ "abcd", cds_ft_lookup_gt, "m" },
+		{ "abcd", cds_ft_lookup_ge, "m" },
+		{ "a",    cds_ft_lookup_lt, NULL },	/* nothing < "a" */
+	};
+	unsigned int i;
+	int ret = -1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) words[i],
+				  strlen(words[i]), &n->node) < 0) {
+			fprintf(stderr, "insert '%s' failed\n", words[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		enum cds_ft_status s;
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) cases[i].q,
+			strlen(cases[i].q));
+		s = cases[i].fn(ft, iter);
+		if (cases[i].expect == NULL) {
+			if (s == CDS_FT_STATUS_OK && cds_ft_iter_node(iter)) {
+				fprintf(stderr, "ext('%s'): expected NOT_FOUND\n",
+					cases[i].q);
+				rcu_read_unlock();
+				goto out;
+			}
+		} else {
+			uint8_t rk[64]; size_t rl;
+
+			if (s != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+				fprintf(stderr, "ext('%s'): not found, expected '%s'\n",
+					cases[i].q, cases[i].expect);
+				rcu_read_unlock();
+				goto out;
+			}
+			cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+			rk[rl] = '\0';
+			if (strcmp((char *) rk, cases[i].expect) != 0) {
+				fprintf(stderr, "ext('%s'): got '%s', expected '%s'\n",
 					cases[i].q, (char *) rk, cases[i].expect);
 				rcu_read_unlock();
 				goto out;
@@ -17462,6 +17550,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_order_after_mid_insert);
 	RUN_TEST(test_varlen_string_basic);
 	RUN_TEST(test_inequality_prefix_key);
+	RUN_TEST(test_inequality_extends_prefix);
 
 	/* 9. Graft, graft_swap & detach */
 	diag("Graft, graft_swap & detach tests");
