@@ -18296,26 +18296,130 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 				FT_LOOKUP_LIMIT_NONE, false) != CDS_FT_STATUS_OK)
 			return;
 	}
-	for (i = 0; i < merged_keys; i++) {
-		struct cds_ft_node *head = cds_ft_iter_node(it);
-		struct ft_ord_cell *cell;
+	/*
+	 * Single-flip re-weave.  Walk the merged region in key order; pre-set
+	 * each surviving src cell's links with plain stores (the cell is not yet
+	 * ord-reachable in @dst, so this is invisible) and accumulate ONLY the
+	 * VISIBLE boundary edges -- a dst-original cell's ord_next / ord_prev, or
+	 * @dst's head / tail -- into one batch.  A single ft_ord_cell_flip then
+	 * commits the entire interleave atomically, so a concurrent ordered reader
+	 * never observes a partially re-woven list (the per-splice path was N
+	 * independent flips).  Dst-original cells keep their relative order, so a
+	 * dst<->dst step needs no edge; each survivor RUN costs at most two edges
+	 * (one entering, one leaving), so 2 * merged_keys + 2 bounds the batch.
+	 * On -ENOMEM of the edge buffer, fall back to the per-survivor splice
+	 * (still correct, but non-atomic).
+	 */
+	{
+		struct ft_ord_cell_edge *edges;
+		struct ft_ord_cell *prev = prev_placed;
+		bool prev_is_dst = (prev_placed != NULL);
+		unsigned int n = 0, cap = 2u * (unsigned int) merged_keys + 2u;
 
-		if (!head)
-			break;
-		cell = ft_ord_cell_ptr(rcu_dereference(head->prev));
-		if (cell == ord_cursor) {
-			/* dst-original head, already linked; advance both. */
-			prev_placed = ord_cursor;
-			ord_cursor = ft_ord_cell_resolve_ord(&ord_cursor->ord_next);
-		} else {
-			/* surviving src head: splice after the last placed cell. */
-			ft_ord_cell_splice_after(dst, prev_placed, cell);
-			prev_placed = cell;
+		edges = malloc((size_t) cap * sizeof(*edges));
+		if (!edges) {
+			for (i = 0; i < merged_keys; i++) {
+				struct cds_ft_node *head = cds_ft_iter_node(it);
+				struct ft_ord_cell *cell;
+
+				if (!head)
+					break;
+				cell = ft_ord_cell_ptr(rcu_dereference(head->prev));
+				if (cell == ord_cursor) {
+					prev_placed = ord_cursor;
+					ord_cursor = ft_ord_cell_resolve_ord(
+						&ord_cursor->ord_next);
+				} else {
+					ft_ord_cell_splice_after(dst, prev_placed,
+						cell);
+					prev_placed = cell;
+				}
+				it->cache_valid = false;
+				if (cds_ft_lookup_inequality_impl(dst, it,
+						FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE,
+						false) != CDS_FT_STATUS_OK)
+					break;
+			}
+			return;
 		}
-		it->cache_valid = false;	/* force the descent oracle */
-		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GT,
-				FT_LOOKUP_LIMIT_NONE, false) != CDS_FT_STATUS_OK)
-			break;
+
+		for (i = 0; i < merged_keys; i++) {
+			struct cds_ft_node *head = cds_ft_iter_node(it);
+			struct ft_ord_cell *cell;
+
+			if (!head)
+				break;
+			cell = ft_ord_cell_ptr(rcu_dereference(head->prev));
+			if (cell == ord_cursor) {
+				/*
+				 * Dst-original cell: stays put, already linked in
+				 * key order.  Its back edge changes only when a
+				 * survivor run was just placed before it.
+				 */
+				if (prev && !prev_is_dst) {
+					prev->ord_next = cell;	/* survivor: invisible */
+					edges[n].slot = &cell->ord_prev;
+					edges[n].old_target =
+						ft_ord_cell_resolve_ord(&cell->ord_prev);
+					edges[n].new_target = prev;
+					n++;
+				}
+				prev = cell;
+				prev_is_dst = true;
+				ord_cursor = ft_ord_cell_resolve_ord(
+					&ord_cursor->ord_next);
+			} else {
+				/* Surviving src cell: pre-set its back link. */
+				cell->ord_prev = prev;	/* invisible */
+				if (!prev) {
+					/* new list minimum: flip @dst head. */
+					edges[n].slot = &dst->ord_cell_head;
+					edges[n].old_target =
+						ft_ord_cell_resolve_ord(&dst->ord_cell_head);
+					edges[n].new_target = cell;
+					n++;
+				} else if (prev_is_dst) {
+					/* dst -> survivor: flip the dst cell's fwd edge. */
+					edges[n].slot = &prev->ord_next;
+					edges[n].old_target =
+						ft_ord_cell_resolve_ord(&prev->ord_next);
+					edges[n].new_target = cell;
+					n++;
+				} else {
+					prev->ord_next = cell;	/* survivor: invisible */
+				}
+				prev = cell;
+				prev_is_dst = false;
+			}
+			it->cache_valid = false;	/* force the descent oracle */
+			if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GT,
+					FT_LOOKUP_LIMIT_NONE, false) != CDS_FT_STATUS_OK)
+				break;
+		}
+		/*
+		 * Close the trailing edge: if the last placed cell is a survivor,
+		 * link it to the region successor (@ord_cursor, advanced past the
+		 * last dst-original; NULL at the list tail) and flip that
+		 * neighbour's back edge -- or @dst's tail when there is none.
+		 */
+		if (prev && !prev_is_dst) {
+			prev->ord_next = ord_cursor;	/* survivor: invisible */
+			if (!ord_cursor) {
+				edges[n].slot = &dst->ord_cell_tail;
+				edges[n].old_target =
+					ft_ord_cell_resolve_ord(&dst->ord_cell_tail);
+				edges[n].new_target = prev;
+				n++;
+			} else {
+				edges[n].slot = &ord_cursor->ord_prev;
+				edges[n].old_target =
+					ft_ord_cell_resolve_ord(&ord_cursor->ord_prev);
+				edges[n].new_target = prev;
+				n++;
+			}
+		}
+		ft_ord_cell_flip(dst, edges, n);
+		free(edges);
 	}
 }
 #endif /* FEATURE_FT_ORD_CELL */
