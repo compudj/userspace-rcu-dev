@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 235
+#define NR_TESTS 236
 #else
-#define NR_TESTS 224
+#define NR_TESTS 225
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4355,6 +4355,85 @@ out:
 		ret = drain_and_destroy(ft, group);
 	else
 		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Ordered cell list maintained across a fixed-length root merge.  Regression
+ * for ft_merge_ord_interleave seeding the merge-region walk with a zero-length
+ * key: cds_ft_iter_set_key rejects a zero-length key on a fixed-length group,
+ * so the interleave bailed and the source run was never spliced into the dst
+ * cell list -- leaving the merged-in heads out of the list.
+ */
+static int test_merge_ordered_fixed_root(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	unsigned int i;
+	int ret = -1;
+	uint8_t k[4];
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	cds_ft_group_attr_set_key_len(attr, 4);
+	cds_ft_group_attr_set_ordered_list(attr);
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &src) < 0) {
+		cds_ft_destroy(dst);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	/* dst in the 0x000000.. range; src in the disjoint 0xff0000.. range. */
+	for (i = 0; i < 5; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		cds_ft_u64_to_key(dst, i, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		s = cds_ft_insert(dst, k, 4, &n->node);
+		rcu_read_unlock();
+		if (s < 0) goto out;
+	}
+	for (i = 0; i < 5; i++) {
+		uint64_t v = 0xff000000ull | i;
+		struct ft_test_node *n = node_alloc(v);
+
+		cds_ft_u64_to_key(src, v, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		s = cds_ft_insert(src, k, 4, &n->node);
+		rcu_read_unlock();
+		if (s < 0) goto out;
+	}
+	rcu_read_lock();
+	s = cds_ft_merge(dst, NULL, 0, src);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_ordered_fixed_root: merge: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	/* The cell list must hold all 10 merged heads (structural verify). */
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_ordered_fixed_root: verify failed\n");
+		goto out;
+	}
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
 	return ret;
 }
 
@@ -17643,6 +17722,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_inequality_prefix_key);
 	RUN_TEST(test_inequality_extends_prefix);
 	RUN_TEST(test_inequality_empty_key);
+	RUN_TEST(test_merge_ordered_fixed_root);
 
 	/* 9. Graft, graft_swap & detach */
 	diag("Graft, graft_swap & detach tests");

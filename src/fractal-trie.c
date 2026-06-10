@@ -18247,19 +18247,36 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 	struct cds_ft_iter *it = dst->ord_cell_scratch_iter;
 	unsigned long i;
 
-	if (cds_ft_iter_set_key(it, dst_key, dst_key_len) != CDS_FT_STATUS_OK)
-		return;
-	it->prefix_len = 0;
+	/*
+	 * Seed at the merge region's minimum, via the descent oracle
+	 * (cache_valid = false: the cell list is mid-update, so the cell fast
+	 * path must not be used).  A root merge (@dst_key_len == 0) merges the
+	 * whole trie -> seed at the GLOBAL minimum with LIMIT_FIRST, which ignores
+	 * the search key (a zero-length key is invalid for cds_ft_iter_set_key /
+	 * a relational GE on a FIXED-length group, so the relational path would
+	 * bail and leave the src run unspliced).  A scoped merge (@dst_key_len >
+	 * 0) needs the first key >= @dst_key, so it sets @dst_key and uses the
+	 * relational GE (LIMIT_NONE), which honors @dst_key.
+	 */
 	it->node = NULL;
 	it->cache_valid = false;
-	/*
-	 * Relational GE (LIMIT_NONE), NOT LIMIT_FIRST: seed at the first key
-	 * >= @dst_key (the merge region's minimum), not the trie's global
-	 * minimum.  (LIMIT_FIRST is lookup_first and ignores @dst_key.)
-	 */
-	if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
-			FT_LOOKUP_LIMIT_NONE, false) != CDS_FT_STATUS_OK)
-		return;
+	if (dst_key_len == 0) {
+		it->key_len = 0;
+		it->prefix_len = 0;
+		it->key_off = 0;
+		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
+				FT_LOOKUP_LIMIT_FIRST, false) != CDS_FT_STATUS_OK)
+			return;
+	} else {
+		if (cds_ft_iter_set_key(it, dst_key, dst_key_len) != CDS_FT_STATUS_OK)
+			return;
+		it->prefix_len = 0;
+		it->node = NULL;
+		it->cache_valid = false;
+		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
+				FT_LOOKUP_LIMIT_NONE, false) != CDS_FT_STATUS_OK)
+			return;
+	}
 	for (i = 0; i < merged_keys; i++) {
 		struct cds_ft_node *head = cds_ft_iter_node(it);
 		struct ft_ord_cell *cell;
