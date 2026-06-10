@@ -23206,6 +23206,82 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
 	return iter->node;
 }
 
+/*
+ * Batched ordinal-cell gather core, shared by the forward (cds_ft_iter_next_
+ * batch) and reverse (cds_ft_iter_prev_batch) variants.  @forward is a compile-
+ * time literal at both call sites, so always_inline folds the direction branches
+ * out of the hot loop (ord_next/+stride vs ord_prev/-stride).
+ *
+ * Emits @iter's current head + run into @buf and advances the cell cursor for
+ * the whole batch inside one call, so the per-step library-call boundary (and
+ * the cds_ft_next/prev mode/limit/cache gate it re-checks each call) is paid
+ * once per @cap nodes, not per node.
+ *
+ * Physical-next prediction: post-compaction the cells are contiguous in key
+ * order at @stride, so a head's ord_next/ord_prev usually resolves to
+ * cur ± stride.  cmm_ptr_eq validates that arithmetic @guess and lets the
+ * compiler address the NEXT body load (cur->node) off @guess instead of the
+ * loaded link, breaking the dependent-load chain so the gather pipelines (MLP).
+ * A miss (scattered arena, arena-range boundary, live flip proxy) falls back to
+ * the loaded pointer -- always correct; the prediction only pays on a compacted
+ * arena and is a no-op otherwise.  It is a measured non-earner in the per-step
+ * cds_ft_next/prev path (the un-inlined .so call serializes regardless), so it
+ * lives only here.  iter is repositioned once at the end (not per element) to
+ * keep the per-step body to the contiguity-addressed node load.
+ */
+static inline __attribute__((always_inline))
+size_t ft_iter_batch_dir(struct cds_ft *ft, struct cds_ft_iter *iter,
+		struct cds_ft_node **buf, size_t cap, const bool forward)
+{
+	size_t n = 0;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+	if (caa_unlikely(cap == 0))
+		return 0;
+#ifdef FEATURE_FT_ORD_CELL
+	if (iter->cache_valid && iter->node && ft_ord_cell_fastpath_ok(ft, iter)) {
+		struct ft_ord_cell *cur = ft_ord_cell_cursor(iter);
+		const uintptr_t stride = (uintptr_t) 1 << FT_ORD_CELL_ALLOC_ORDER;
+
+		while (n < cap && cur) {
+			struct ft_ord_cell *loaded, *guess;
+
+			buf[n++] = cur->node;
+			loaded = forward ?
+				ft_ord_cell_resolve_ord(&cur->ord_next) :
+				ft_ord_cell_resolve_ord(&cur->ord_prev);
+			guess = (struct ft_ord_cell *) (forward ?
+				(uintptr_t) cur + stride :
+				(uintptr_t) cur - stride);
+			cur = (loaded && cmm_ptr_eq(loaded, guess)) ? guess : loaded;
+		}
+		ft_ord_cell_iter_land(ft, iter, cur);
+		return n;
+	}
+#endif
+	/* Non-cell / descent / scoped: per-step advance (no amortization). */
+	while (n < cap && iter->node) {
+		buf[n++] = iter->node;
+		if (forward)
+			cds_ft_next(ft, iter);
+		else
+			cds_ft_prev(ft, iter);
+	}
+	return n;
+}
+
+size_t cds_ft_iter_next_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
+		struct cds_ft_node **buf, size_t cap)
+{
+	return ft_iter_batch_dir(ft, iter, buf, cap, true);
+}
+
+size_t cds_ft_iter_prev_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
+		struct cds_ft_node **buf, size_t cap)
+{
+	return ft_iter_batch_dir(ft, iter, buf, cap, false);
+}
+
 enum cds_ft_status cds_ft_iter_set_cache_mode(struct cds_ft_iter *iter,
 		enum cds_ft_iter_cache_mode mode)
 {

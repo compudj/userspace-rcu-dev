@@ -1205,6 +1205,89 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
 			cds_ft_next((ft), (iter)))
 
 /*
+ * cds_ft_iter_next_batch - Fetch the next run of in-order nodes into a buffer.
+ * @ft: The Fractal Trie.
+ * @iter: Iterator positioned at the first node to emit (e.g. by
+ *        cds_ft_lookup_first); advanced past the emitted run.
+ * @buf: Caller buffer receiving up to @cap (struct cds_ft_node *) in key order.
+ * @cap: Capacity of @buf.
+ *
+ * Returns the number of nodes written (0 at end of trie).  The ordered
+ * cell-list walk (Option E) advances the whole run inside this one call, so
+ * the per-step library-call boundary is amortized across @cap nodes -- the
+ * batched basis of cds_ft_for_each_batched_rcu().  Falls back to per-step
+ * cds_ft_next() when the cell fast path is unavailable.  RCU read lock rules
+ * are those of cds_ft_for_each_rcu().
+ */
+size_t cds_ft_iter_next_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
+		struct cds_ft_node **buf, size_t cap);
+
+/*
+ * cds_ft_for_each_batched_rcu - In-order traversal, batched (amortized calls).
+ * @ft: The Fractal Trie (struct cds_ft *).
+ * @iter: Iterator (struct cds_ft_iter *), used as loop cursor.
+ * @node: Loop variable (struct cds_ft_node *), set to each head in key order.
+ * @buf: Caller scratch array of struct cds_ft_node *[@cap].
+ * @cap: Capacity of @buf (a larger batch amortizes the call boundary further;
+ *       32-64 is plenty).
+ *
+ * A drop-in for cds_ft_for_each_rcu() that hides batching: it refills @buf via
+ * one cds_ft_iter_next_batch() library call per @cap nodes, then iterates the
+ * buffer INLINE -- so the ordered cell-list walk pays the call boundary once
+ * per batch instead of once per node.  Use @node directly (or
+ * cds_ft_entry(@node, ...)); same RCU read-lock requirement.
+ *
+ * TODO / limitation: @iter is advanced once per batch, not per node, so it is
+ * NOT positioned at @node inside the loop body -- cds_ft_iter_get_key(@iter,...)
+ * and other iterator-position ops return the batch boundary, not @node.  This
+ * macro is for counting / node (cds_ft_entry) access; per-node key
+ * materialization needs per-step repositioning (buffer the cells, or land each
+ * node), a follow-up.
+ *
+ *   struct cds_ft_node *node, *batch[64];
+ *   rcu_read_lock();
+ *   cds_ft_for_each_batched_rcu(ft, iter, node, batch, 64) {
+ *           ...use node...
+ *   }
+ *   rcu_read_unlock();
+ */
+#define cds_ft_for_each_batched_rcu(ft, iter, node, buf, cap)			\
+	for (size_t _ftb_n = (cds_ft_lookup_first((ft), (iter)),		\
+				cds_ft_iter_next_batch((ft), (iter), (buf), (cap))), \
+			_ftb_i = 0;						\
+			_ftb_n != 0;						\
+			_ftb_n = cds_ft_iter_next_batch((ft), (iter), (buf), (cap)), \
+			_ftb_i = 0)						\
+		for (; _ftb_i < _ftb_n &&					\
+				(((node) = (buf)[_ftb_i]), 1); _ftb_i++)
+
+/*
+ * cds_ft_iter_prev_batch - Fetch the next run of REVERSE in-order nodes.
+ * The descending-key-order counterpart of cds_ft_iter_next_batch(): emits
+ * @iter's current node and its predecessors (via the ordered cell list's
+ * ord_prev) into @buf, up to @cap, advancing @iter; returns the count (0 at the
+ * start of the trie).  Start at cds_ft_lookup_last().
+ */
+size_t cds_ft_iter_prev_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
+		struct cds_ft_node **buf, size_t cap);
+
+/*
+ * cds_ft_for_each_reverse_batched_rcu - Reverse in-order traversal, batched.
+ * The descending-key-order counterpart of cds_ft_for_each_batched_rcu(): visits
+ * every head from the largest key down, batching via cds_ft_iter_prev_batch().
+ * Same arguments and RCU read-lock rules.
+ */
+#define cds_ft_for_each_reverse_batched_rcu(ft, iter, node, buf, cap)		\
+	for (size_t _ftb_n = (cds_ft_lookup_last((ft), (iter)),			\
+				cds_ft_iter_prev_batch((ft), (iter), (buf), (cap))), \
+			_ftb_i = 0;						\
+			_ftb_n != 0;						\
+			_ftb_n = cds_ft_iter_prev_batch((ft), (iter), (buf), (cap)), \
+			_ftb_i = 0)						\
+		for (; _ftb_i < _ftb_n &&					\
+				(((node) = (buf)[_ftb_i]), 1); _ftb_i++)
+
+/*
  * cds_ft_for_each_reverse_rcu - Iterate through all (or prefix-scoped) nodes in reverse key order.
  * @ft: The Fractal Trie (struct cds_ft *).
  * @iter: Iterator (struct cds_ft_iter *), used as loop cursor.
