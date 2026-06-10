@@ -5147,23 +5147,16 @@ static void bulk_drain(struct cds_ft *ft)
 	rcu_read_lock();
 	for (;;) {
 		struct cds_ft_node *head, *tmp;
-		uint8_t kb[8];
-		size_t kl;
 
 		cds_ft_lookup_first(ft, iter);
 		if (!cds_ft_iter_node(iter))
 			break;
 		/*
-		 * Re-seed from the materialized key before remove_all: on a
-		 * variable-length lazy-key trie the cell-walk lookup_first leaves
-		 * the iter key buffer unpopulated, so remove_all (which locates
-		 * the chain from that buffer) needs an explicit set_key + lookup.
+		 * remove_all directly at the cell-walk position: on a
+		 * variable-length lazy-key trie it resolves the LAZY key length
+		 * (parent up-walk) before validating, so no set_key re-seed is
+		 * needed.
 		 */
-		cds_ft_iter_get_key(iter, kb, sizeof(kb), &kl);
-		cds_ft_iter_set_key(iter, kb, kl);
-		cds_ft_lookup(ft, iter);
-		if (!cds_ft_iter_node(iter))
-			break;
 		if (cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK)
 			break;
 		cds_ft_for_each_duplicate_safe_rcu(head, tmp)

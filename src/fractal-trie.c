@@ -12346,7 +12346,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	struct cds_ft_inode_flag **pub_slot;
 	struct cds_ft_compressed_node *cn = NULL;
 	const uint8_t *iter_key;
-	size_t key_len = ft_key_len(ft, iter->key_len);
+	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 	enum cds_ft_status s;
 
 	CDS_FT_SCOPED_WRITER(ft);
@@ -13393,7 +13393,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	struct cds_ft_metadata *holder_meta;
 	struct cds_ft_inode_flag **head_slot = NULL;
 	const uint8_t *iter_key;
-	size_t key_len = ft_key_len(ft, iter->key_len);
+	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 	int ret;
 
 	CDS_FT_SCOPED_WRITER(ft);
@@ -13710,7 +13710,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	bool is_prefix;
 	int ret;
 	const uint8_t *iter_key;
-	size_t key_len = ft_key_len(ft, iter->key_len);
+	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 
 	CDS_FT_SCOPED_WRITER(ft);
 	/*
