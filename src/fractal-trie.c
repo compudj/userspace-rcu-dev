@@ -18438,6 +18438,10 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 #ifdef FEATURE_FT_ORD_CELL
 	bool ms_ord = dst_ft->group->ordered_list_set;
 	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL;
+#else
+	/* @dst_key / @dst_key_len drive the ordered-list interleave only. */
+	(void) dst_key;
+	(void) dst_key_len;
 #endif
 
 	/*
