@@ -11706,6 +11706,27 @@ static void ft_ord_cell_splice(struct cds_ft *ft, const uint8_t *key,
 static void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell);
 static void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		struct ft_ord_cell *new_cell);
+/* Bulk-op ordered-list maintenance (Phase 3). */
+static struct cds_ft_node *ft_subtree_minmax_head(
+		struct cds_ft_inode_flag *nf, bool want_max);
+static void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
+		struct cds_ft_node *first_head, struct cds_ft_node *last_head);
+static void ft_ord_cell_run_splice(struct cds_ft *dst,
+		struct ft_ord_cell *run_first, struct ft_ord_cell *run_last,
+		struct ft_ord_cell *pred, struct ft_ord_cell *succ);
+static void ft_ord_cell_find_splice_pos(struct cds_ft *dst,
+		const uint8_t *key, size_t key_len,
+		struct ft_ord_cell **pred_out, struct ft_ord_cell **succ_out);
+static void ft_ord_cell_run_replace(struct cds_ft *dst,
+		struct ft_ord_cell *d_first, struct ft_ord_cell *d_last,
+		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last);
+static void ft_ord_cell_splice_after(struct cds_ft *dst,
+		struct ft_ord_cell *prev, struct ft_ord_cell *cell);
+static void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
+		size_t dst_key_len, unsigned long merged_keys,
+		struct ft_ord_cell *ord_cursor, struct ft_ord_cell *prev_placed);
+static void ft_ord_cell_run_unlink(struct cds_ft *ft,
+		struct cds_ft_node *first_head, struct cds_ft_node *last_head);
 #endif /* FEATURE_FT_ORD_CELL */
 
 static
@@ -15452,6 +15473,22 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		FT_TP(root_publish, (const void *) src_ft,
 			(const void *) src_ft->root);
 		free_cds_ft_node(dst_ft, old_dst_root);
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Ordered list: dst was empty (checked above), so src's WHOLE
+		 * ordered list becomes dst's.  Cells' internal links unchanged;
+		 * only the head/tail endpoints transfer (mirrors the root swap,
+		 * which likewise needs no synchronize_rcu).
+		 */
+		if (dst_ft->group->ordered_list_set) {
+			rcu_assign_pointer(dst_ft->ord_cell_head,
+				src_ft->ord_cell_head);
+			rcu_assign_pointer(dst_ft->ord_cell_tail,
+				src_ft->ord_cell_tail);
+			src_ft->ord_cell_head = NULL;
+			src_ft->ord_cell_tail = NULL;
+		}
+#endif
 		goto done;
 	}
 
@@ -15464,6 +15501,10 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		unsigned long src_count = ft_nr_keys_get(src_rmeta);
 		struct cds_ft_inode_flag *old_src_root;
 		struct cds_ft_inode_flag *attached_nf = NULL;
+#ifdef FEATURE_FT_ORD_CELL
+		struct ft_ord_cell *graft_run_first = NULL, *graft_run_last = NULL;
+		struct ft_ord_cell *graft_pred = NULL, *graft_succ = NULL;
+#endif
 
 		/*
 		 * Preallocate a fresh empty root for the source trie
@@ -15492,6 +15533,18 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Ordered list: locate the dst splice neighbours NOW, while dst is
+		 * still payload-free (the attach is built invisibly / not yet
+		 * published) -- a relational descent after the payload is live
+		 * would return a payload head as the boundary.
+		 */
+		if (dst_ft->group->ordered_list_set)
+			ft_ord_cell_find_splice_pos(dst_ft, _key, key_len,
+				&graft_pred, &graft_succ);
+#endif
+
 		/*
 		 * "Jump out" prevention: a reader that has descended
 		 * into src_ft's root subtree would, once the subtree's
@@ -15515,6 +15568,22 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
 		FT_TP(root_publish, (const void *) src_ft,
 			(const void *) src_ft->root);
+
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Ordered list: capture src's whole list (the run to graft) and
+		 * unlink it from src here, paired with the structural src-root
+		 * unlink, so the synchronize_rcu below drains src ord-readers too.
+		 * The run is spliced into dst after the structural publish (same
+		 * commit point).  Restored on the OOM rollback below.
+		 */
+		if (dst_ft->group->ordered_list_set) {
+			graft_run_first = src_ft->ord_cell_head;
+			graft_run_last = src_ft->ord_cell_tail;
+			src_ft->ord_cell_head = NULL;
+			src_ft->ord_cell_tail = NULL;
+		}
+#endif
 
 		if (!src_ft->exclusive)
 			src_ft->group->flavor->update_synchronize_rcu();
@@ -15554,6 +15623,15 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			if (status != CDS_FT_STATUS_OK) {
 				ft_graft_glue_abort(dst_ft, &glue);
 				rcu_assign_pointer(src_ft->root, old_src_root);
+#ifdef FEATURE_FT_ORD_CELL
+				/* Roll the captured run back into src's list. */
+				if (graft_run_first) {
+					rcu_assign_pointer(src_ft->ord_cell_head,
+						graft_run_first);
+					rcu_assign_pointer(src_ft->ord_cell_tail,
+						graft_run_last);
+				}
+#endif
 				FT_TP(root_publish, (const void *) src_ft,
 					(const void *) src_ft->root);
 				if (!src_ft->exclusive)
@@ -15581,6 +15659,19 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 				ft_propagate_external_count_parent(dst_ft,
 					am->parent, (long) src_count);
 		}
+
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Ordered list: src is now structurally empty + drained; the
+		 * payload is published under @key in dst.  Splice the captured run
+		 * (src's whole former list) into dst's ordered cell list at the
+		 * @key position (an empty range in dst -> no interleave).  Same
+		 * commit point as the structural publish above.
+		 */
+		if (graft_run_first)
+			ft_ord_cell_run_splice(dst_ft, graft_run_first,
+				graft_run_last, graft_pred, graft_succ);
+#endif
 
 	}
 
@@ -16570,6 +16661,21 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		FT_TP(root_publish, (const void *) swap_ft,
 			(const void *) swap_ft->root);
 
+#ifdef FEATURE_FT_ORD_CELL
+		/* Ordered list: swap whole lists (head/tail), mirroring the roots. */
+		if (dst_ft->group->ordered_list_set) {
+			struct ft_ord_cell *dh = dst_ft->ord_cell_head;
+			struct ft_ord_cell *dt = dst_ft->ord_cell_tail;
+
+			rcu_assign_pointer(dst_ft->ord_cell_head,
+				swap_ft->ord_cell_head);
+			rcu_assign_pointer(dst_ft->ord_cell_tail,
+				swap_ft->ord_cell_tail);
+			rcu_assign_pointer(swap_ft->ord_cell_head, dh);
+			rcu_assign_pointer(swap_ft->ord_cell_tail, dt);
+		}
+#endif
+
 		dm = uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED);
 		if (swap_max > dm)
 			uatomic_store(&dst_ft->max_used_key_len,
@@ -16603,6 +16709,12 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		bool old_child_external = false;
 		bool have_insert = false;
 		unsigned long old_count = 0, swap_count;
+#ifdef FEATURE_FT_ORD_CELL
+		/* run_D = dst's subtree-at-key heads; run_S = swap's whole list. */
+		struct ft_ord_cell *gs_d_first = NULL, *gs_d_last = NULL;
+		struct ft_ord_cell *gs_s_first = NULL, *gs_s_last = NULL;
+		bool gs_ord = dst_ft->group->ordered_list_set;
+#endif
 
 		/*
 		 * Read-only descent: nothing is published, so the whole swap can be
@@ -16807,6 +16919,24 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 
 		/* ===== COMMIT (failure-free) ===== */
 
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Ordered list: capture both runs while both lists are intact.
+		 * run_D = dst's subtree-at-key (old_child's heads), which becomes
+		 * swap_ft's whole list; run_S = swap_ft's whole list, which replaces
+		 * run_D in dst.  The mutations land at the matching structural
+		 * sub-points below so the existing per-side syncs drain each side.
+		 */
+		if (gs_ord) {
+			gs_d_first = ft_ord_cell_ptr(rcu_dereference(
+				ft_subtree_minmax_head(old_child, false)->prev));
+			gs_d_last = ft_ord_cell_ptr(rcu_dereference(
+				ft_subtree_minmax_head(old_child, true)->prev));
+			gs_s_first = swap_ft->ord_cell_head;	/* NULL if swap empty */
+			gs_s_last = swap_ft->ord_cell_tail;
+		}
+#endif
+
 		/*
 		 * "Jump out" prevention: unlink old_swap_root from swap_ft (install
 		 * @fresh) and drain its readers BEFORE its parent pointer is flipped
@@ -16817,6 +16947,18 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
 			FT_TP(root_publish, (const void *) swap_ft,
 				(const void *) swap_ft->root);
+#ifdef FEATURE_FT_ORD_CELL
+			/*
+			 * run_S is captured; unlink it from swap's ordered list here
+			 * (paired with the structural root unlink) so this sync drains
+			 * swap ord-readers of run_S too.  run_D is installed as swap's
+			 * list after the extract publish below.
+			 */
+			if (gs_ord) {
+				swap_ft->ord_cell_head = NULL;
+				swap_ft->ord_cell_tail = NULL;
+			}
+#endif
 			if (!swap_ft->exclusive)
 				swap_ft->group->flavor->update_synchronize_rcu();
 		}
@@ -16854,6 +16996,18 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (swap_count != old_count)
 			ft_propagate_external_count_parent(dst_ft, d.pnf,
 					(long) swap_count - (long) old_count);
+
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Replace run_D with run_S in dst's ordered list (run_S now lives at
+		 * @key structurally; run_S NULL for an empty swap -> run_D just
+		 * leaves).  Paired with the dst-side drain below, which removes any
+		 * reader still holding run_D in dst.
+		 */
+		if (gs_ord)
+			ft_ord_cell_run_replace(dst_ft, gs_d_first, gs_d_last,
+				gs_s_first, gs_s_last);
+#endif
 
 		/*
 		 * Drain dst-side readers that may still hold the displaced
@@ -16922,6 +17076,21 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				ft_nr_keys_store(rm, old_count, CMM_RELEASE);
 			}
 		}
+
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Install run_D (the extracted subtree's heads) as swap_ft's whole
+		 * ordered list, mirroring the extract root publish above.  swap_ft
+		 * was drained at the unlink sync, so clearing run_D's boundary links
+		 * is a plain store; the head/tail publish uses rcu_assign.
+		 */
+		if (gs_ord) {
+			gs_d_first->ord_prev = NULL;
+			gs_d_last->ord_next = NULL;
+			rcu_assign_pointer(swap_ft->ord_cell_head, gs_d_first);
+			rcu_assign_pointer(swap_ft->ord_cell_tail, gs_d_last);
+		}
+#endif
 
 		/* Reclaim the old (replaced) live nodes after the publishes. */
 		ft_graft_glue_free_old(dst_ft, &glue_insert);
@@ -17077,6 +17246,22 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		rcu_assign_pointer(ft->root, ft_node_flag(fresh_node, 0));
 		FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * Ordered list: a root detach moves the WHOLE trie, so @ft's
+		 * entire ordered cell list becomes @detached's.  The cells'
+		 * internal links are unchanged; only the head/tail endpoints
+		 * transfer.  Matches the root-swap above (a concurrent reader
+		 * mid-iteration follows its RCU snapshot into @detached).
+		 */
+		if (ft->group->ordered_list_set) {
+			detached->ord_cell_head = ft->ord_cell_head;
+			detached->ord_cell_tail = ft->ord_cell_tail;
+			ft->ord_cell_head = NULL;
+			ft->ord_cell_tail = NULL;
+		}
+#endif
+
 		*result_ft = detached;
 		return CDS_FT_STATUS_OK;
 	}
@@ -17198,6 +17383,29 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
 			}
+
+#ifdef FEATURE_FT_ORD_CELL
+			/*
+			 * Ordered list: the detached subtree's keys form a
+			 * contiguous run in @ft's ordered cell list.  Move that
+			 * run out of @ft and install it as @detached's entire
+			 * list.  @child's subtree is intact (move-style detach),
+			 * so its structural min/max heads are the run endpoints
+			 * (the detach-point external_nodes, if any, are the run
+			 * minimum -- they become @detached's NIL-key entries).
+			 * The flip is atomic for a concurrent ordered reader; the
+			 * internal-child branch's synchronize_rcu below then drains
+			 * any @ft reader parked in the run.
+			 */
+			if (ft->group->ordered_list_set) {
+				struct cds_ft_node *rfirst =
+					ft_subtree_minmax_head(child, false);
+				struct cds_ft_node *rlast =
+					ft_subtree_minmax_head(child, true);
+
+				ft_ord_cell_run_detach(ft, detached, rfirst, rlast);
+			}
+#endif
 
 			/*
 			 * If the detached child is an internal node, it
@@ -17455,6 +17663,9 @@ struct ft_ord_cell_edge {
 	struct ft_ord_cell *new_target;
 };
 
+static void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
+		unsigned int n);
+
 /*
  * Append an endpoint (ord_cell_head / ord_cell_tail) update to a flip-edge batch
  * when @slot currently holds @match, so the endpoint transitions ATOMICALLY with
@@ -17476,6 +17687,94 @@ unsigned int ft_ord_cell_endpoint_edge(struct ft_ord_cell **slot,
 		n++;
 	}
 	return n;
+}
+
+/*
+ * Structural min/max dup-chain HEAD of the subtree rooted at @nf, under WRITER
+ * EXCLUSION (no concurrent mutation -> no skip re-anchor / flip-proxy / transient
+ * empty states to handle, unlike the reader-side minmax descent).  Mirrors the
+ * key ordering the ordered cell list uses: a key that ends at an internal node
+ * (metadata->external_nodes, a prefix key) sorts BEFORE every longer key under
+ * it, so it is the subtree minimum.  Used to locate the endpoints of the
+ * contiguous ordered-list run a bulk op relocates.
+ */
+static
+struct cds_ft_node *ft_subtree_minmax_head(struct cds_ft_inode_flag *nf,
+		bool want_max)
+{
+	enum ft_direction dir = want_max ? FT_RIGHTMOST : FT_LEFTMOST;
+	uint8_t scratch;
+
+	for (;;) {
+		nf = ft_resolve_skip_compressed(nf);
+		if (ft_node_external(nf))
+			return (struct cds_ft_node *) ft_node_ptr(nf);
+		if (ft_node_compressed(nf)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(nf);
+
+			nf = rcu_dereference(cn->child);
+			continue;
+		}
+		/* Internal node. */
+		if (!want_max) {
+			struct cds_ft_metadata *m =
+				cds_ft_item_to_metadata(ft_node_ptr(nf));
+			struct cds_ft_node *ext =
+				ft_dereference_external(m->external_nodes);
+
+			if (ext)
+				return ext;	/* prefix key: subtree minimum */
+		}
+		nf = ft_node_get_minmax(nf, &scratch, dir, false);
+		assert(nf != NULL);
+	}
+}
+
+/*
+ * Move the contiguous ordered-list run whose endpoints are the cells of
+ * @first_head .. @last_head (heads, in key order) OUT of @ft's ordered cell
+ * list and install it as the ENTIRE ordered list of @into -- the cds_ft_detach
+ * shape, where @into is a fresh EXCLUSIVE trie receiving exactly that subtree.
+ * The run's internal ord links are preserved; only its two boundary edges in
+ * @ft are flipped (atomic for a concurrent ordered reader, per the flip-latch),
+ * @ft's head/tail are repaired, and @into's head/tail are set.  @into being
+ * exclusive, clearing the run's new boundary links is a plain store.  Caller
+ * gates on ordered_list_set.
+ */
+static
+void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
+		struct cds_ft_node *first_head, struct cds_ft_node *last_head)
+{
+	struct ft_ord_cell *first =
+		ft_ord_cell_ptr(rcu_dereference(first_head->prev));
+	struct ft_ord_cell *last =
+		ft_ord_cell_ptr(rcu_dereference(last_head->prev));
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->ord_prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->ord_next);
+	struct ft_ord_cell_edge edges[4];
+	unsigned int n = 0;
+
+	if (pred) {
+		edges[n].slot = &pred->ord_next;
+		edges[n].old_target = first;
+		edges[n].new_target = succ;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = last;
+		edges[n].new_target = pred;
+		n++;
+	}
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, first, succ, edges, n);
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, last, pred, edges, n);
+	ft_ord_cell_flip(ft, edges, n);
+	/* @into is exclusive: no readers, plain stores. */
+	first->ord_prev = NULL;
+	last->ord_next = NULL;
+	into->ord_cell_head = first;
+	into->ord_cell_tail = last;
 }
 
 static
@@ -17624,6 +17923,255 @@ void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, old_cell, new_cell, edges, n);
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, old_cell, new_cell, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
+}
+
+/*
+ * Locate the ordered-list neighbours (@pred, @succ) that a run grafted at @key
+ * will splice between.  MUST be called while @dst is still payload-free (before
+ * the structural attach publishes the grafted subtree), else the relational
+ * descent would return a payload head as the boundary.  @key is APPLICATION form
+ * (find_rel remaps).  Since the attach point is empty, @pred = last @dst key <
+ * @key and @succ = first @dst key > @key (nothing of @dst's lies in the run's
+ * range in between).
+ */
+static
+void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
+		size_t key_len, struct ft_ord_cell **pred_out,
+		struct ft_ord_cell **succ_out)
+{
+	struct ft_ord_cell *pred, *succ;
+
+	pred = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_LT);
+	if (pred)
+		succ = ft_ord_cell_resolve_ord(&pred->ord_next);
+	else
+		succ = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_GT);
+	*pred_out = pred;
+	*succ_out = succ;
+}
+
+/*
+ * Splice the contiguous ordered-list run [@run_first .. @run_last] (already
+ * linked internally, in key order) into @dst's ordered cell list BETWEEN the
+ * given neighbours @pred and @succ -- the cds_ft_graft shape, where the run is
+ * the source trie's whole list attached at an EMPTY point in @dst (graft returns
+ * POPULATED_ERROR otherwise, so no @dst key interleaves the run's range).
+ *
+ * @pred / @succ MUST be located BEFORE the structural attach publishes the
+ * payload into @dst (see ft_ord_cell_find_splice_pos): a relational descent run
+ * after the payload is live would return a PAYLOAD head (part of the run itself)
+ * as the boundary.  @pred / @succ are @dst-original cells, which graft never
+ * moves, so they stay valid until this splice.
+ *
+ * Pre-sets the run's outer links (run not yet reachable in @dst), flips the
+ * <=2 boundary edges atomically (for @dst's live readers), and repairs @dst
+ * head/tail.  The run's source trie must already have released it (head/tail
+ * cleared + a grace period) so no source reader is mid-run.
+ */
+static
+void ft_ord_cell_run_splice(struct cds_ft *dst, struct ft_ord_cell *run_first,
+		struct ft_ord_cell *run_last, struct ft_ord_cell *pred,
+		struct ft_ord_cell *succ)
+{
+	struct ft_ord_cell_edge edges[4];
+	unsigned int n = 0;
+
+	/* Pre-set the run's outer links; not yet reachable via @dst's list. */
+	run_first->ord_prev = pred;
+	run_last->ord_next = succ;
+	if (pred) {
+		edges[n].slot = &pred->ord_next;
+		edges[n].old_target = succ;
+		edges[n].new_target = run_first;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = pred;
+		edges[n].new_target = run_last;
+		n++;
+	}
+	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_head, succ, run_first, edges, n);
+	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_tail, pred, run_last, edges, n);
+	ft_ord_cell_flip(dst, edges, n);
+}
+
+/*
+ * Replace the run [@d_first .. @d_last] currently in @dst's ordered list with
+ * the run [@s_first .. @s_last] at the SAME position -- the cds_ft_graft_swap
+ * shape, where @dst's subtree-at-key (run_D) is swapped out for the swap trie's
+ * content (run_S).  @s_first may be NULL (empty swap -> run_D just leaves and the
+ * gap closes).  The position is taken from run_D's own neighbours (no relational
+ * descent: the swap exchanges two subtrees at the same key, so run_S lands
+ * exactly where run_D was).  Atomic for @dst's live readers via one flip of the
+ * <=2 boundary edges.  run_D keeps its links for parked readers; the caller
+ * re-homes run_D into the swap trie afterwards.
+ */
+static
+void ft_ord_cell_run_replace(struct cds_ft *dst,
+		struct ft_ord_cell *d_first, struct ft_ord_cell *d_last,
+		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last)
+{
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&d_first->ord_prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&d_last->ord_next);
+	struct ft_ord_cell *new_first = s_first ? s_first : succ;
+	struct ft_ord_cell *new_last = s_last ? s_last : pred;
+	struct ft_ord_cell_edge edges[4];
+	unsigned int n = 0;
+
+	if (s_first) {
+		/* Pre-set run_S's outer links; not yet reachable via @dst. */
+		s_first->ord_prev = pred;
+		s_last->ord_next = succ;
+	}
+	if (pred) {
+		edges[n].slot = &pred->ord_next;
+		edges[n].old_target = d_first;
+		edges[n].new_target = new_first;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = d_last;
+		edges[n].new_target = new_last;
+		n++;
+	}
+	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_head, d_first, new_first, edges, n);
+	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_tail, d_last, new_last, edges, n);
+	ft_ord_cell_flip(dst, edges, n);
+}
+
+/*
+ * Splice @cell into @dst's ordered list immediately AFTER @prev (a cell already
+ * in the list, or NULL to splice at the head).  Atomic for live readers via one
+ * flip of the <=2 boundary edges.  Used by the merge interleave walk, which
+ * already knows the insertion point (the last placed cell) and so needs no
+ * relational descent.
+ */
+static
+void ft_ord_cell_splice_after(struct cds_ft *dst, struct ft_ord_cell *prev,
+		struct ft_ord_cell *cell)
+{
+	struct ft_ord_cell *succ = prev ?
+		ft_ord_cell_resolve_ord(&prev->ord_next) :
+		ft_ord_cell_resolve_ord(&dst->ord_cell_head);
+	struct ft_ord_cell_edge edges[4];
+	unsigned int n = 0;
+
+	cell->ord_prev = prev;
+	cell->ord_next = succ;
+	if (prev) {
+		edges[n].slot = &prev->ord_next;
+		edges[n].old_target = succ;
+		edges[n].new_target = cell;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = prev;
+		edges[n].new_target = cell;
+		n++;
+	}
+	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_head, succ, cell, edges, n);
+	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_tail, prev, cell, edges, n);
+	ft_ord_cell_flip(dst, edges, n);
+}
+
+/*
+ * Remove the contiguous run [@first_head .. @last_head] from @ft's ordered list
+ * WITHOUT re-homing it -- the cds_ft_merge source side, where the run's cells
+ * disperse (survivors are spliced into dst, collided heads are freed).  Relink
+ * the two boundary edges (atomic for @ft's live readers) and repair head/tail;
+ * the run cells keep their stale links (caller no longer references them as a
+ * run).  Whole-list removal (pred == succ == NULL) clears head/tail.
+ */
+static
+void ft_ord_cell_run_unlink(struct cds_ft *ft, struct cds_ft_node *first_head,
+		struct cds_ft_node *last_head)
+{
+	struct ft_ord_cell *first =
+		ft_ord_cell_ptr(rcu_dereference(first_head->prev));
+	struct ft_ord_cell *last =
+		ft_ord_cell_ptr(rcu_dereference(last_head->prev));
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->ord_prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->ord_next);
+	struct ft_ord_cell_edge edges[4];
+	unsigned int n = 0;
+
+	if (pred) {
+		edges[n].slot = &pred->ord_next;
+		edges[n].old_target = first;
+		edges[n].new_target = succ;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = last;
+		edges[n].new_target = pred;
+		n++;
+	}
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, first, succ, edges, n);
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, last, pred, edges, n);
+	ft_ord_cell_flip(ft, edges, n);
+}
+
+/*
+ * Interleave the surviving source cells into @dst's ordered list after a
+ * cds_ft_merge_at spine-copy commit.  Walks the merged subtree at @dst_key in
+ * key order (@merged_keys distinct heads) via the structural inequality oracle,
+ * two-pointering against @dst's ORIGINAL region cells: @ord_cursor steps through
+ * those (captured before the commit, min head of the dst merge subtree), and any
+ * walked head that is NOT the cursor cell is a surviving src head -> splice it
+ * after the last placed cell.  Dst-original cells are left untouched (their
+ * relative order is preserved by the merge); collided src heads were demoted to
+ * duplicates + their cells freed, so the walk never sees them.  @prev_placed
+ * starts at the region's predecessor (@ord_cursor's ord_prev).
+ *
+ * Identity key_map only (the seed uses @dst_key directly; matches the rest of
+ * the ordered-list machinery).  Uses @dst's writer-exclusive scratch iterator.
+ */
+static
+void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
+		size_t dst_key_len, unsigned long merged_keys,
+		struct ft_ord_cell *ord_cursor, struct ft_ord_cell *prev_placed)
+{
+	struct cds_ft_iter *it = dst->ord_cell_scratch_iter;
+	unsigned long i;
+
+	if (cds_ft_iter_set_key(it, dst_key, dst_key_len) != CDS_FT_STATUS_OK)
+		return;
+	it->prefix_len = 0;
+	it->node = NULL;
+	it->cache_valid = false;
+	/*
+	 * Relational GE (LIMIT_NONE), NOT LIMIT_FIRST: seed at the first key
+	 * >= @dst_key (the merge region's minimum), not the trie's global
+	 * minimum.  (LIMIT_FIRST is lookup_first and ignores @dst_key.)
+	 */
+	if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
+			FT_LOOKUP_LIMIT_NONE, false) != CDS_FT_STATUS_OK)
+		return;
+	for (i = 0; i < merged_keys; i++) {
+		struct cds_ft_node *head = cds_ft_iter_node(it);
+		struct ft_ord_cell *cell;
+
+		if (!head)
+			break;
+		cell = ft_ord_cell_ptr(rcu_dereference(head->prev));
+		if (cell == ord_cursor) {
+			/* dst-original head, already linked; advance both. */
+			prev_placed = ord_cursor;
+			ord_cursor = ft_ord_cell_resolve_ord(&ord_cursor->ord_next);
+		} else {
+			/* surviving src head: splice after the last placed cell. */
+			ft_ord_cell_splice_after(dst, prev_placed, cell);
+			prev_placed = cell;
+		}
+		it->cache_valid = false;	/* force the descent oracle */
+		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GT,
+				FT_LOOKUP_LIMIT_NONE, false) != CDS_FT_STATUS_OK)
+			break;
+	}
 }
 #endif /* FEATURE_FT_ORD_CELL */
 
@@ -17864,7 +18412,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		struct cds_ft *src_ft, struct ft_descent *d_src,
 		const uint8_t *src_key, size_t src_key_len, unsigned long cnt_src,
 		unsigned int off_src, struct ft_descent *d_dst,
-		unsigned long cnt_dst, unsigned int off_dst)
+		unsigned long cnt_dst, unsigned int off_dst,
+		const uint8_t *dst_key, size_t dst_key_len)
 {
 	struct ft_graft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -17880,6 +18429,10 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	struct cds_ft_metadata *fresh_meta;
 	struct ft_flip_batch *flip;
 	unsigned long merged_keys = 0;
+#ifdef FEATURE_FT_ORD_CELL
+	bool ms_ord = dst_ft->group->ordered_list_set;
+	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL;
+#endif
 
 	/*
 	 * Every dst merge-point shape is handled.  The flip proxies the publish
@@ -18050,6 +18603,29 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		M_slot = pub;
 	D_old = *pub_slot;
 
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Ordered list: capture the dst merge subtree's min head (the cursor for
+	 * the post-commit interleave walk) and the region predecessor, while D is
+	 * still intact (the build only copied its spine; the flip below moves its
+	 * leaves into M).  The surviving src cells are spliced in after the commit.
+	 */
+	if (ms_ord) {
+		ms_cursor = ft_ord_cell_ptr(rcu_dereference(
+			ft_subtree_minmax_head(D, false)->prev));
+		ms_prev = ft_ord_cell_resolve_ord(&ms_cursor->ord_prev);
+		/*
+		 * Remove src's merged subtree (S) run from src's ordered list:
+		 * its cells disperse to dst (survivors) or are freed (collisions).
+		 * Done here, before the src unlink + drain below, so that sync
+		 * drains src ord-readers of the run too.
+		 */
+		ft_ord_cell_run_unlink(src_ft,
+			ft_subtree_minmax_head(S, false),
+			ft_subtree_minmax_head(S, true));
+	}
+#endif
+
 	/*
 	 * 1. Unlink the merge source from src.  Root src: swap in the pre-
 	 *    allocated empty root.  Non-root src: detach its branch in place --
@@ -18161,6 +18737,21 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	ft_graft_glue_free_old(src_ft, &gs);
 	ft_graft_glue_free_old(dst_ft, &gd);
 
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * 9. Ordered list: splice the surviving src cells into dst's ordered
+	 * list at their merged positions.  Done AFTER the settle (step 7) so the
+	 * merged structure carries direct pointers -- the interleave's GT
+	 * continuation backtracks via parent pointers, which are flip proxies
+	 * until settled.  Collided src cells were demoted to duplicates + freed
+	 * by apply_splices, so the merged-region walk never sees them; dst-
+	 * original cells keep their links.
+	 */
+	if (ms_ord)
+		ft_merge_ord_interleave(dst_ft, dst_key, dst_key_len, merged_keys,
+			ms_cursor, ms_prev);
+#endif
+
 	ft_graft_glue_fini(&gd);
 	ft_graft_glue_fini(&gs);
 	return CDS_FT_STATUS_OK;
@@ -18254,7 +18845,7 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 				|| kd == FT_GRAFT_SWAP_KEY_SHORTER)) {
 		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
 				src_key, src_key_len, cnt_src, off_src,
-				&d_dst, cnt_dst, off_dst);
+				&d_dst, cnt_dst, off_dst, dst_key, dst_key_len);
 		FT_TP(merge_exit, (int) status);
 		return status;
 	}

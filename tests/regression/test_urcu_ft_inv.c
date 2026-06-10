@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	22
+#define NR_TESTS	23
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -5010,6 +5010,415 @@ static void ft_segv_snapshot_handler(int sig, siginfo_t *si, void *uc)
 }
 #endif
 
+/* ================================================================== */
+/*                                                                    */
+/*   Ordered-list bulk-op consistency (Phase 3)                       */
+/*                                                                    */
+/*   A concurrent ordered (cell-list) traversal of @A stays strictly  */
+/*   sorted and bounded while a writer churns the ordered cell list    */
+/*   with BULK ops: detach+graft round-trips (run move), graft_swap    */
+/*   (run replace), and merge (interleave) + per-key reset.  Exercises */
+/*   the bulk-op ordered-list maintenance and the head/tail flip-proxy */
+/*   under live readers.  Variable-length group with both offsets so   */
+/*   cds_ft_next walks the CELL list (not the descent fallback).       */
+/* ================================================================== */
+
+struct bulk_node {
+	struct cds_ft_node node;
+	struct rcu_head head;
+	uint8_t kbytes[8];
+	size_t klen;			/* read by the lib at key_len_offset */
+};
+
+static unsigned long bulk_alloc, bulk_freed;
+
+static void bulk_set_key(uint8_t *out, uint32_t v)
+{
+	out[0] = (uint8_t)(v >> 24); out[1] = (uint8_t)(v >> 16);
+	out[2] = (uint8_t)(v >> 8);  out[3] = (uint8_t) v;
+}
+
+static uint32_t bulk_key_val(const uint8_t *k)
+{
+	return ((uint32_t) k[0] << 24) | ((uint32_t) k[1] << 16) |
+		((uint32_t) k[2] << 8) | k[3];
+}
+
+static struct bulk_node *bulk_node_alloc(uint32_t v)
+{
+	struct bulk_node *n = (struct bulk_node *) calloc(1, sizeof(*n));
+
+	if (!n)
+		abort();
+	cds_ft_node_init(&n->node);
+	bulk_set_key(n->kbytes, v);
+	n->klen = 4;
+	__atomic_add_fetch(&bulk_alloc, 1, __ATOMIC_RELAXED);
+	return n;
+}
+
+static void bulk_node_free_cb(struct rcu_head *h)
+{
+	struct bulk_node *n = caa_container_of(h, struct bulk_node, head);
+
+	memset(n, 0xfe, sizeof(*n));
+	free(n);
+	__atomic_add_fetch(&bulk_freed, 1, __ATOMIC_RELAXED);
+}
+
+static void bulk_node_free_rcu(struct bulk_node *n)
+{
+	call_rcu(&n->head, bulk_node_free_cb);
+}
+
+static struct cds_ft_group *bulk_group_create(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_max_key_len(attr, 8);
+	/*
+	 * EAGER: NO speculative_key_offset and NO key_len_offset.  The ordered
+	 * cell walk rematerializes each key (and its length) STRUCTURALLY via the
+	 * parent up-walk -- so a re-prefixing bulk op (non-root graft_swap below)
+	 * leaves no stale in-leaf key behind, and the reader still sees the right
+	 * key for the moved nodes.
+	 */
+	cds_ft_group_attr_set_ordered_list(attr);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	return group;
+}
+
+/* Insert a @len-byte key into @ft (single-threaded setup or writer-locked). */
+static void bulk_insert_len(struct cds_ft *ft, const uint8_t *kb, size_t len)
+{
+	struct bulk_node *n = (struct bulk_node *) calloc(1, sizeof(*n));
+	struct cds_ft_node *res;
+
+	if (!n)
+		abort();
+	cds_ft_node_init(&n->node);
+	memcpy(n->kbytes, kb, len);
+	n->klen = len;
+	__atomic_add_fetch(&bulk_alloc, 1, __ATOMIC_RELAXED);
+	if (cds_ft_insert_unique(ft, n->kbytes, len, &n->node, &res)
+			!= CDS_FT_STATUS_OK) {
+		free(n);
+		__atomic_add_fetch(&bulk_freed, 1, __ATOMIC_RELAXED);
+	}
+}
+
+static void bulk_insert4(struct cds_ft *ft, uint32_t v)
+{
+	uint8_t kb[4];
+
+	bulk_set_key(kb, v);
+	bulk_insert_len(ft, kb, 4);
+}
+
+/* Remove a 4-byte key from @ft and defer-free its node (writer-locked). */
+static void bulk_remove4(struct cds_ft *ft, struct cds_ft_iter *iter, uint32_t v)
+{
+	struct cds_ft_node *head, *tmp;
+	uint8_t kb[4];
+
+	bulk_set_key(kb, v);
+	cds_ft_iter_set_key(iter, kb, 4);
+	cds_ft_lookup(ft, iter);
+	if (!cds_ft_iter_node(iter))
+		return;
+	if (cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK)
+		return;
+	cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+		bulk_node_free_rcu(caa_container_of(head, struct bulk_node, node));
+}
+
+static void bulk_drain(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	for (;;) {
+		struct cds_ft_node *head, *tmp;
+		uint8_t kb[8];
+		size_t kl;
+
+		cds_ft_lookup_first(ft, iter);
+		if (!cds_ft_iter_node(iter))
+			break;
+		/*
+		 * Re-seed from the materialized key before remove_all: on a
+		 * variable-length lazy-key trie the cell-walk lookup_first leaves
+		 * the iter key buffer unpopulated, so remove_all (which locates
+		 * the chain from that buffer) needs an explicit set_key + lookup.
+		 */
+		cds_ft_iter_get_key(iter, kb, sizeof(kb), &kl);
+		cds_ft_iter_set_key(iter, kb, kl);
+		cds_ft_lookup(ft, iter);
+		if (!cds_ft_iter_node(iter))
+			break;
+		if (cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK)
+			break;
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+			bulk_node_free_rcu(caa_container_of(head,
+				struct bulk_node, node));
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+}
+
+struct bulk_ctx {
+	struct cds_ft *A;
+	struct cds_ft_group *group;
+	pthread_mutex_t lock;
+	const char *test_name;
+};
+
+#define BULK_M		200		/* keys per movable prefix */
+#define BULK_CAP	100000		/* iteration bound (loop/escape guard) */
+static const uint8_t bulk_move_pfx[] = { 0x10, 0x20 };
+#define BULK_SWAP_PFX	0x50
+#define BULK_MERGE_PFX	0x10		/* C interleaves into A's 0x10 region */
+#define BULK_NMERGE	8
+
+static void *bulk_reader(void *arg)
+{
+	struct bulk_ctx *ctx = (struct bulk_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->A, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint32_t prev = 0;
+		int first = 1;
+		unsigned int count = 0;
+
+		rcu_read_lock();
+		cds_ft_iter_bind_key(iter);	/* flush stale cache after GPs */
+		cds_ft_lookup_first(ctx->A, iter);
+		while (cds_ft_iter_node(iter) && count < BULK_CAP) {
+			uint8_t rk[8];
+			size_t rkl;
+			uint32_t v;
+
+			cds_ft_iter_get_key(iter, rk, sizeof(rk), &rkl);
+			if (rkl != 4) {
+				report_violation(ctx->test_name,
+					"key len %zu != 4 (iter #%lu, pos %u)",
+					rkl, iters, count);
+				break;
+			}
+			v = bulk_key_val(rk);
+			if (!first && v <= prev) {
+				report_violation(ctx->test_name,
+					"out-of-order 0x%08x after 0x%08x "
+					"(iter #%lu, pos %u)",
+					v, prev, iters, count);
+				break;
+			}
+			prev = v;
+			first = 0;
+			count++;
+			cds_ft_next(ctx->A, iter);
+		}
+		if (count >= BULK_CAP)
+			report_violation(ctx->test_name,
+				"ordered traversal returned >= %u keys — "
+				"loop/escape (iter #%lu)", BULK_CAP, iters);
+		rcu_read_unlock();
+
+		if ((++iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *bulk_writer(void *arg)
+{
+	struct bulk_ctx *ctx = (struct bulk_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->A, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned int op = iters % 3;
+
+		if (op == 0) {
+			/* detach + graft-back round-trip (run move, multi-key) */
+			uint8_t P = bulk_move_pfx[iters % 2];
+			struct cds_ft *D = NULL;
+
+			pthread_mutex_lock(&ctx->lock);
+			if (cds_ft_detach(ctx->A, &P, 1, &D) == CDS_FT_STATUS_OK
+					&& D) {
+				cds_ft_graft(ctx->A, &P, 1, D);
+				cds_ft_destroy(D);
+			}
+			pthread_mutex_unlock(&ctx->lock);
+			rcu_quiescent_state();
+		} else if (op == 1) {
+			/*
+			 * NON-ROOT graft_swap round-trip (RE-PREFIXING): swap A's
+			 * subtree at prefix 0x50 with donor B's whole content.  B's
+			 * 3-byte keys gain the 0x50 prefix when moved into A@0x50 (and
+			 * A's old 0x50 keys lose it into B) -- so a reader iterating A
+			 * sees nodes whose trie key differs from anything an in-leaf key
+			 * could hold; the EAGER up-walk rematerializes them correctly.
+			 */
+			uint8_t P = BULK_SWAP_PFX;
+			struct cds_ft *B;
+			unsigned int i;
+
+			if (cds_ft_create(ctx->group, NULL, &B) < 0)
+				abort();
+			for (i = 0; i < 32; i++) {	/* 3-byte donor keys */
+				uint8_t kb[3] = { 0xAA, (uint8_t)(i >> 8),
+						  (uint8_t) i };
+				bulk_insert_len(B, kb, 3);
+			}
+			pthread_mutex_lock(&ctx->lock);
+			cds_ft_graft_swap(ctx->A, &P, 1, B);	/* A@0x50 <-> B */
+			cds_ft_graft_swap(ctx->A, &P, 1, B);	/* back */
+			pthread_mutex_unlock(&ctx->lock);
+			rcu_quiescent_state();
+			bulk_drain(B);
+			cds_ft_destroy(B);
+			rcu_quiescent_state();
+		} else {
+			/* merge a fresh donor into A (interleave), then reset */
+			struct cds_ft *C;
+			unsigned int i;
+
+			if (cds_ft_create(ctx->group, NULL, &C) < 0)
+				abort();
+			/* 0x10-prefix, odd low bytes -> interleave A's evens */
+			for (i = 0; i < BULK_NMERGE; i++)
+				bulk_insert4(C, ((uint32_t) BULK_MERGE_PFX << 24)
+					| (2 * i + 1));
+			pthread_mutex_lock(&ctx->lock);
+			cds_ft_merge(ctx->A, NULL, 0, C);	/* C -> A, C empty */
+			pthread_mutex_unlock(&ctx->lock);
+			rcu_quiescent_state();
+
+			pthread_mutex_lock(&ctx->lock);
+			cds_ft_iter_bind_key(iter);
+			for (i = 0; i < BULK_NMERGE; i++)
+				bulk_remove4(ctx->A,
+					iter, ((uint32_t) BULK_MERGE_PFX << 24)
+						| (2 * i + 1));
+			pthread_mutex_unlock(&ctx->lock);
+			cds_ft_destroy(C);
+			rcu_quiescent_state();
+		}
+		iters++;
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_ordered_bulk_consistency(void)
+{
+	struct cds_ft_group *group = bulk_group_create();
+	struct cds_ft *A;
+	struct bulk_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writer;
+	unsigned int i, j;
+	int ret = 0;
+
+	if (cds_ft_create(group, NULL, &A) < 0)
+		abort();
+
+	/* A: movable prefixes (even low bytes), a static prefix, a swap zone. */
+	rcu_read_lock();
+	for (j = 0; j < 2; j++)
+		for (i = 0; i < BULK_M; i++)
+			bulk_insert4(A, ((uint32_t) bulk_move_pfx[j] << 24)
+				| (2 * i));
+	for (i = 0; i < BULK_M; i++)
+		bulk_insert4(A, (0x40u << 24) | i);		/* static */
+	for (i = 0; i < 16; i++)
+		bulk_insert4(A, ((uint32_t) BULK_SWAP_PFX << 24) | i);	/* swap zone */
+	rcu_read_unlock();
+
+	ctx.A = A;
+	ctx.group = group;
+	ctx.test_name = "inv_ordered_bulk_consistency";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, bulk_reader, &ctx);
+	pthread_create(&writer, NULL, bulk_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	pthread_join(writer, NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_ordered_bulk_consistency: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+
+	bulk_drain(A);
+	rcu_barrier();
+	cds_ft_destroy(A);
+	cds_ft_group_destroy(group);
+	{
+		unsigned long na = __atomic_load_n(&bulk_alloc, __ATOMIC_RELAXED);
+		unsigned long nf = __atomic_load_n(&bulk_freed, __ATOMIC_RELAXED);
+
+		if (na != nf) {
+			fprintf(stderr, "inv_ordered_bulk_consistency: node leak "
+				"alloc %lu != freed %lu\n", na, nf);
+			ret = -1;
+		}
+	}
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -5040,6 +5449,7 @@ int main(int argc, char **argv)
 	diag("1. Iteration ordering");
 	RUN_TEST(inv_iteration_order);
 	RUN_TEST(inv_bind_resume_order);
+	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);
 	RUN_TEST(inv_reverse_iteration_order);
 
