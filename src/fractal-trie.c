@@ -1895,6 +1895,8 @@ void *ft_ord_cell_alloc(struct cds_ft *ft, struct cds_ft_node *node,
 	cell->ord_next = NULL;
 	cell->node = node;
 	cell->parent = parent;
+	if (ft_debug_counters())
+		uatomic_inc(&ft->group->nr_cells_allocated);
 	return ft_ord_cell_flag(cell);
 }
 
@@ -1908,6 +1910,8 @@ void *ft_ord_cell_alloc(struct cds_ft *ft, struct cds_ft_node *node,
 static
 void ft_ord_cell_free(struct cds_ft *ft, struct ft_ord_cell *cell)
 {
+	if (ft_debug_counters())
+		uatomic_inc(&ft->group->nr_cells_freed);
 	cds_ft_free_item(ft, cds_ft_item_to_metadata(cell));
 }
 
@@ -1919,6 +1923,8 @@ void ft_ord_cell_free(struct cds_ft *ft, struct ft_ord_cell *cell)
 static inline
 void ft_ord_cell_free_unpublished(struct cds_ft *ft, struct ft_ord_cell *cell)
 {
+	if (ft_debug_counters())
+		uatomic_inc(&ft->group->nr_cells_freed);
 	cds_ft_free_item_unpublished(ft, cds_ft_item_to_metadata(cell));
 }
 
@@ -20926,11 +20932,46 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 	if (uatomic_load(&ft_group->nr_ft_instances, CMM_RELAXED) != 0)
 		return CDS_FT_STATUS_BUSY_ERROR;
 	FT_TP(group_destroy, (const void *) ft_group);
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * All tries are destroyed (nr_ft_instances == 0) and each
+	 * cds_ft_destroy drained its deferred frees, so every ordered-list
+	 * cell that was allocated should have had its free issued.
+	 */
+	if (ft_debug_counters() &&
+	    ft_group->nr_cells_allocated != ft_group->nr_cells_freed) {
+		fprintf(stderr,
+			"[error] Fractal Trie leaked %ld ordered-list cells. Allocated: %lu, freed: %lu.\n",
+			(long) (ft_group->nr_cells_allocated - ft_group->nr_cells_freed),
+			ft_group->nr_cells_allocated, ft_group->nr_cells_freed);
+	}
+#endif
 	cds_ft_free_all_arenas(ft_group);
 	pthread_mutex_destroy(&ft_group->arena_lock);
 	free(ft_group);
 	return CDS_FT_STATUS_OK;
 }
+
+#if defined(DEBUG_COUNTERS) && defined(FEATURE_FT_ORD_CELL)
+/*
+ * DEBUG_COUNTERS-only cell leak introspection (no public header decl; tests
+ * weak-reference it).  Reports the group's ordered-list cell alloc / free
+ * balance.  Cells migrate between the group's tries via the bulk ops, so the
+ * balance is meaningful only at group granularity; after every trie is drained
+ * @allocated should equal @freed.  Caller must ensure no concurrent cell
+ * mutation.
+ */
+void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
+		unsigned long *allocated, unsigned long *freed);
+void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
+		unsigned long *allocated, unsigned long *freed)
+{
+	if (allocated)
+		*allocated = group->nr_cells_allocated;
+	if (freed)
+		*freed = group->nr_cells_freed;
+}
+#endif
 
 enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		const struct cds_ft_attr *attr,
@@ -22190,6 +22231,8 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 
 	if (!meta)
 		return old;		/* OOM: best-effort, leave in place */
+	if (ft_debug_counters())
+		uatomic_inc(&ft->group->nr_cells_allocated);
 	new_cell = (struct ft_ord_cell *) cds_ft_metadata_to_item(meta);
 	new_cell->node = head;
 	new_cell->parent = old->parent;

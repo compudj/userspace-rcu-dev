@@ -5138,6 +5138,15 @@ static void bulk_remove4(struct cds_ft *ft, struct cds_ft_iter *iter, uint32_t v
 		bulk_node_free_rcu(caa_container_of(head, struct bulk_node, node));
 }
 
+/*
+ * DEBUG_COUNTERS-only group cell-balance accessor (weak: NULL on a library
+ * built without DEBUG_COUNTERS, in which case the cell-balance assertion is
+ * skipped).  Lets the bulk test confirm the ordered-list cells are reclaimed
+ * by a drained destroy across all the bulk-op cell moves.
+ */
+extern void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
+		unsigned long *allocated, unsigned long *freed) __attribute__((weak));
+
 static void bulk_drain(struct cds_ft *ft)
 {
 	struct cds_ft_iter *iter;
@@ -5398,6 +5407,23 @@ static int inv_ordered_bulk_consistency(void)
 	bulk_drain(A);
 	rcu_barrier();
 	cds_ft_destroy(A);
+	/*
+	 * The trie is drained and destroyed: every ordered-list cell allocated
+	 * over the run (including the ones the bulk ops migrated between tries)
+	 * must have been reclaimed.  Checked at group granularity, before the
+	 * group is torn down.  Only meaningful on a DEBUG_COUNTERS library; the
+	 * weak symbol is NULL otherwise.
+	 */
+	if (cds_ft_debug_cell_balance) {
+		unsigned long ca = 0, cf = 0;
+
+		cds_ft_debug_cell_balance(group, &ca, &cf);
+		if (ca != cf) {
+			fprintf(stderr, "inv_ordered_bulk_consistency: cell leak "
+				"alloc %lu != freed %lu\n", ca, cf);
+			ret = -1;
+		}
+	}
 	cds_ft_group_destroy(group);
 	{
 		unsigned long na = __atomic_load_n(&bulk_alloc, __ATOMIC_RELAXED);

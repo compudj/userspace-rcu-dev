@@ -663,6 +663,16 @@ struct cds_ft_group {
 	 * cell pointer for reader-safe deferred reclaim + nr_live draining.
 	 */
 	struct cds_ft_alloc_arena *cell_arena;
+	/*
+	 * Cell leak accounting (ft_debug_counters only): cells migrate
+	 * between the group's tries via the bulk ops (allocated in one
+	 * trie, freed in another), so the balance is meaningful only at
+	 * group granularity.  cds_ft_group_destroy reports a mismatch.
+	 * Counted synchronously at the free request (not the deferred
+	 * reclaim), so allocated == freed means every cell's free was
+	 * issued.
+	 */
+	unsigned long nr_cells_allocated, nr_cells_freed;
 #endif
 	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
