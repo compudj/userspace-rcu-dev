@@ -3308,14 +3308,6 @@ static void *inv_merge_no_escape_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		/*
-		 * The lock was dropped between traversals (so the writer's
-		 * grace periods can complete) and the merge may have swapped
-		 * the root meanwhile.  Flush the cached iterator position so this
-		 * traversal re-descends from the live root (CDS_FT_ITER_CACHED
-		 * contract).
-		 */
-		cds_ft_iter_bind_key(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -3419,15 +3411,6 @@ static void *inv_merge_no_escape_writer(void *arg)
 		 * the next round.
 		 */
 		rcu_read_lock();
-		/*
-		 * The iterator is reused across the writer's read-side critical
-		 * sections, with grace periods (and this writer's own merge /
-		 * remove mutations) in between.  Flush the cached path so the
-		 * point lookups below re-descend from the live root rather than
-		 * following a path that may have been freed
-		 * (CDS_FT_ITER_CACHED contract), mirroring the reader.
-		 */
-		cds_ft_iter_bind_key(iter);
 		pthread_mutex_lock(&ctx->lock);
 		for (i = 0; i < 4; i++)
 			inv_merge_remove_key(ctx->dst, iter, inv_merge_src_keys[i]);
@@ -3612,7 +3595,6 @@ static void *inv_merge_nonroot_dst_writer(void *arg)
 
 		/* Reset: pull the merged keys back out, re-populate src. */
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		pthread_mutex_lock(&ctx->lock);
 		for (i = 0; i < 4; i++)
 			inv_merge_remove_key(ctx->dst, iter,
@@ -3770,7 +3752,6 @@ static void *inv_merge_compressed_dst_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -3835,7 +3816,6 @@ static void *inv_merge_compressed_dst_writer(void *arg)
 		rcu_quiescent_state();
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		pthread_mutex_lock(&ctx->lock);
 		inv_merge_remove_key(ctx->dst, iter, "Tabw");
 		n = node_alloc(300);
@@ -3974,7 +3954,6 @@ static void *inv_merge_key_shorter_dst_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -4045,7 +4024,6 @@ static void *inv_merge_key_shorter_dst_writer(void *arg)
 		rcu_quiescent_state();
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		pthread_mutex_lock(&ctx->lock);
 		inv_merge_remove_key(ctx->dst, iter, "Taw");
 		n = node_alloc(300);
@@ -4185,7 +4163,6 @@ static void *inv_merge_key_shorter_src_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -4257,7 +4234,6 @@ static void *inv_merge_key_shorter_src_writer(void *arg)
 		rcu_quiescent_state();
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		pthread_mutex_lock(&ctx->lock);
 		inv_merge_remove_key(ctx->dst, iter, "QZ");
 		n = node_alloc(300);
@@ -4402,7 +4378,6 @@ static void *inv_merge_compressed_parent_dst_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
 			: cds_ft_lookup_first(ra->trie, iter);
 		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
@@ -4468,7 +4443,6 @@ static void *inv_merge_compressed_parent_dst_writer(void *arg)
 		rcu_quiescent_state();
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		pthread_mutex_lock(&ctx->lock);
 		inv_merge_remove_key(ctx->dst, iter, "aXYP");
 		n = node_alloc(300);
@@ -4627,7 +4601,6 @@ static void *inv_merge_atomic_reader(void *arg)
 		bool saw_a = false, saw_b = false;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		s = reverse ? cds_ft_lookup_last(ctx->dst, iter)
 			: cds_ft_lookup_first(ctx->dst, iter);
 		while (s == CDS_FT_STATUS_OK) {
@@ -4822,7 +4795,6 @@ static void *inv_merge_atomic_deep_reader(void *arg)
 		bool saw_a = false, saw_b = false;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);
 		s = reverse ? cds_ft_lookup_last(ctx->dst, iter)
 			: cds_ft_lookup_first(ctx->dst, iter);
 		while (s == CDS_FT_STATUS_OK) {
@@ -5209,7 +5181,6 @@ static void *bulk_reader(void *arg)
 		unsigned int count = 0;
 
 		rcu_read_lock();
-		cds_ft_iter_bind_key(iter);	/* flush stale cache after GPs */
 		cds_ft_lookup_first(ctx->A, iter);
 		while (cds_ft_iter_node(iter) && count < BULK_CAP) {
 			uint8_t rk[8];
@@ -5325,7 +5296,6 @@ static void *bulk_writer(void *arg)
 			rcu_quiescent_state();
 
 			pthread_mutex_lock(&ctx->lock);
-			cds_ft_iter_bind_key(iter);
 			for (i = 0; i < BULK_NMERGE; i++)
 				bulk_remove4(ctx->A,
 					iter, ((uint32_t) BULK_MERGE_PFX << 24)
