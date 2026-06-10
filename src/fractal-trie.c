@@ -9055,6 +9055,21 @@ slow_path:
 				break;
 			if (level + 1 >= key_depth) {
 				skip_eq_external_nodes = false;
+				/*
+				 * A compressed full-match consumed the whole key and
+				 * landed on cn->child (which may hold this key as a
+				 * prefix-key external).  For GE/GT (RIGHT) descend into
+				 * that subtree: its leftmost is the smallest key >= the
+				 * search key.  But for LE/LT (LEFT) every key in the
+				 * subtree is >= the search key, so descending would
+				 * return the subtree MAX, which is strictly greater --
+				 * wrong.  Break to post_traversal instead, exactly as the
+				 * non-compressed path does: it returns cn->child's own
+				 * external_nodes for LE (the equal match) and climbs for
+				 * LT's strict predecessor.
+				 */
+				if (mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT)
+					break;
 				goto descend_children;
 			}
 			continue;

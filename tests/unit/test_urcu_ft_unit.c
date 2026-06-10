@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 232
+#define NR_TESTS 233
 #else
-#define NR_TESTS 221
+#define NR_TESTS 222
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4077,6 +4077,98 @@ static int test_varlen_string_basic(void)
 		goto out;
 	}
 
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Inequality lookups on an exact prefix-key match reached through compressed
+ * nodes.  Regression for cds_ft_lookup_lt / cds_ft_lookup_le returning a
+ * GREATER key (the compressed subtree's max) instead of the strict predecessor
+ * / equal match.  "app" is a prefix of "apple" / "application", inserted after
+ * them so it lands as a prefix key on the compressed node spanning "app".
+ */
+static int test_inequality_prefix_key(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	const char *words[] = { "apple", "application", "app" };
+	struct ineq_case {
+		const char *q;
+		enum cds_ft_status (*fn)(struct cds_ft *, struct cds_ft_iter *);
+		const char *expect;	/* NULL = expect NOT_FOUND */
+	} cases[] = {
+		{ "app",   cds_ft_lookup_lt, NULL },	/* nothing < "app" */
+		{ "app",   cds_ft_lookup_le, "app" },	/* equal match */
+		{ "app",   cds_ft_lookup_gt, "apple" },
+		{ "app",   cds_ft_lookup_ge, "app" },
+		{ "apple", cds_ft_lookup_lt, "app" },
+	};
+	unsigned int i;
+	int ret = -1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) words[i],
+				  strlen(words[i]), &n->node) < 0) {
+			fprintf(stderr, "insert '%s' failed\n", words[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		enum cds_ft_status s;
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) cases[i].q,
+			strlen(cases[i].q));
+		s = cases[i].fn(ft, iter);
+		if (cases[i].expect == NULL) {
+			if (s == CDS_FT_STATUS_OK && cds_ft_iter_node(iter)) {
+				uint8_t rk[64]; size_t rl;
+
+				cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+				rk[rl] = '\0';
+				fprintf(stderr, "ineq('%s'): got '%s', expected NOT_FOUND\n",
+					cases[i].q, (char *) rk);
+				rcu_read_unlock();
+				goto out;
+			}
+		} else {
+			uint8_t rk[64]; size_t rl;
+
+			if (s != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+				fprintf(stderr, "ineq('%s'): not found, expected '%s'\n",
+					cases[i].q, cases[i].expect);
+				rcu_read_unlock();
+				goto out;
+			}
+			cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+			rk[rl] = '\0';
+			if (strcmp((char *) rk, cases[i].expect) != 0) {
+				fprintf(stderr, "ineq('%s'): got '%s', expected '%s'\n",
+					cases[i].q, (char *) rk, cases[i].expect);
+				rcu_read_unlock();
+				goto out;
+			}
+		}
+		rcu_read_unlock();
+	}
 	ret = 0;
 out:
 	cds_ft_iter_destroy(iter);
@@ -17369,6 +17461,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_double_remove);
 	RUN_TEST(test_order_after_mid_insert);
 	RUN_TEST(test_varlen_string_basic);
+	RUN_TEST(test_inequality_prefix_key);
 
 	/* 9. Graft, graft_swap & detach */
 	diag("Graft, graft_swap & detach tests");
