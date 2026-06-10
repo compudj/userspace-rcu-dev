@@ -236,7 +236,7 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
 	uint8_t k[8];
 
 	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
-	return cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, out);
+	return cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, 0, out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3839,14 +3839,14 @@ static int test_prefix_split(void)
 	node_free_rcu(n1);
 
 	/* "abd" should still be there. */
-	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"abd", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"abd", 3, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "'abd' unreachable after removing 'abc'\n");
 		rcu_read_unlock();
 		goto fail;
 	}
 	/* "abc" should be gone. */
-	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"abc", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"abc", 3, 0, &found);
 	if (found != NULL) {
 		fprintf(stderr, "'abc' still present after removal\n");
 		rcu_read_unlock();
@@ -4127,7 +4127,7 @@ static int test_varlen_string_basic(void)
 
 		rcu_read_lock();
 		if (cds_ft_eager_lookup_key(ft, (const uint8_t *)words[i],
-				      strlen(words[i]), strlen(words[i]), &found) != CDS_FT_STATUS_OK
+				      strlen(words[i]), 0, &found) != CDS_FT_STATUS_OK
 		    || !found) {
 			fprintf(stderr, "lookup '%s' failed\n", words[i]);
 			rcu_read_unlock();
@@ -4616,14 +4616,14 @@ static int test_graft_basic(void)
 
 	/* Live trie should contain "helo" and "help". */
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"helo", 4, 4, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"helo", 4, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "graft_basic: lookup 'helo': %s\n",
 			cds_ft_status_to_string(s));
 		rcu_read_unlock();
 		goto fail;
 	}
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"help", 4, 4, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"help", 4, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "graft_basic: lookup 'help': %s\n",
 			cds_ft_status_to_string(s));
@@ -4937,7 +4937,7 @@ static int test_graft_at_root(void)
 
 	/* Key should be "abc" — no prefix prepended. */
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abc", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abc", 3, 0, &found);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "graft_at_root: lookup 'abc': %s\n",
@@ -5240,7 +5240,7 @@ static int test_graft_swap_basic(void)
 
 	/* Live should now have "abZ" (value 99), not "abX"/"abY". */
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abZ", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abZ", 3, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "graft_swap_basic: lookup 'abZ' failed: %s\n",
 			cds_ft_status_to_string(s));
@@ -5252,7 +5252,7 @@ static int test_graft_swap_basic(void)
 		rcu_read_unlock();
 		goto fail;
 	}
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abX", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abX", 3, 0, &found);
 	if (s != CDS_FT_STATUS_NOT_FOUND) {
 		fprintf(stderr, "graft_swap_basic: 'abX' should be gone\n");
 		rcu_read_unlock();
@@ -5338,7 +5338,7 @@ static int test_graft_swap_into_empty(void)
 
 	/* Live should contain "abcd". */
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abcd", 4, 4, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abcd", 4, 0, &found);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "graft_swap_into_empty: lookup 'abcd': %s\n",
@@ -5413,7 +5413,7 @@ static int test_graft_swap_at_root(void)
 	rcu_read_lock();
 	live_count = cds_ft_count_entries(live);
 	swap_count = cds_ft_count_entries(swap);
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"xx", 2, 2, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"xx", 2, 0, &found);
 	rcu_read_unlock();
 
 	if (live_count != 1 || s != CDS_FT_STATUS_OK || !found) {
@@ -5553,7 +5553,7 @@ static int test_detach_basic(void)
 	/* Original trie should only have "cd". */
 	rcu_read_lock();
 	count = cds_ft_count_entries(ft);
-	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"abX", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"abX", 3, 0, &found);
 	rcu_read_unlock();
 	if (count != 1) {
 		fprintf(stderr, "detach_basic: original count %lu, expected 1\n", count);
@@ -5567,7 +5567,7 @@ static int test_detach_basic(void)
 	/* Detached trie should have "X" and "Y" (prefix "ab" stripped). */
 	rcu_read_lock();
 	count = cds_ft_count_entries(detached);
-	s = cds_ft_eager_lookup_key(detached, (const uint8_t *)"X", 1, 1, &found);
+	s = cds_ft_eager_lookup_key(detached, (const uint8_t *)"X", 1, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "detach_basic: lookup 'X' in detached: %s\n",
 			cds_ft_status_to_string(s));
@@ -5579,7 +5579,7 @@ static int test_detach_basic(void)
 		rcu_read_unlock();
 		goto fail;
 	}
-	s = cds_ft_eager_lookup_key(detached, (const uint8_t *)"Y", 1, 1, &found);
+	s = cds_ft_eager_lookup_key(detached, (const uint8_t *)"Y", 1, 0, &found);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "detach_basic: lookup 'Y' in detached: %s\n",
@@ -5722,7 +5722,7 @@ static int test_detach_not_found(void)
 	{
 		struct cds_ft_node *found;
 
-		s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"foo", 3, 3, &found);
+		s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"foo", 3, 0, &found);
 		if (s != CDS_FT_STATUS_OK || !found) {
 			fprintf(stderr, "detach_not_found: 'foo' missing after failed detach\n");
 			rcu_read_unlock();
@@ -5790,13 +5790,13 @@ static int test_detach_then_graft(void)
 
 	/* Original "ab*" keys should be gone; "zz*" should exist. */
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"abX", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"abX", 3, 0, &found);
 	if (s != CDS_FT_STATUS_NOT_FOUND) {
 		fprintf(stderr, "detach_then_graft: 'abX' still present\n");
 		rcu_read_unlock();
 		goto fail;
 	}
-	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"zzX", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"zzX", 3, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "detach_then_graft: lookup 'zzX': %s\n",
 			cds_ft_status_to_string(s));
@@ -5955,7 +5955,7 @@ static int test_graft_swap_fixed_key(void)
 	rcu_read_lock();
 	count = cds_ft_count_entries(live);
 	cds_ft_u64_to_key(live, 300, k, klen);
-	s = cds_ft_eager_lookup_key(live, k, klen, klen, &found);
+	s = cds_ft_eager_lookup_key(live, k, klen, 0, &found);
 	rcu_read_unlock();
 	if (count != 3 || s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "graft_swap_fixed_key: live count %lu, lookup 300: %s\n",
@@ -6063,7 +6063,7 @@ static int test_fixed_graft_at_root(void)
 	rcu_read_lock();
 	count = cds_ft_count_entries(live);
 	cds_ft_u64_to_key(live, 10, k, klen);
-	s = cds_ft_eager_lookup_key(live, k, klen, klen, &found);
+	s = cds_ft_eager_lookup_key(live, k, klen, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "fixed_graft_at_root: lookup 10: %s\n",
 			cds_ft_status_to_string(s));
@@ -6071,7 +6071,7 @@ static int test_fixed_graft_at_root(void)
 		goto fail;
 	}
 	cds_ft_u64_to_key(live, 30, k, klen);
-	s = cds_ft_eager_lookup_key(live, k, klen, klen, &found);
+	s = cds_ft_eager_lookup_key(live, k, klen, 0, &found);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "fixed_graft_at_root: lookup 30: %s\n",
@@ -6261,7 +6261,7 @@ static int test_fixed_graft_swap_at_root(void)
 	rcu_read_lock();
 	count = cds_ft_count_entries(live);
 	cds_ft_u64_to_key(live, 300, k, klen);
-	s = cds_ft_eager_lookup_key(live, k, klen, klen, &found);
+	s = cds_ft_eager_lookup_key(live, k, klen, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "fixed_graft_swap_at_root: lookup 300: %s\n",
 			cds_ft_status_to_string(s));
@@ -6275,7 +6275,7 @@ static int test_fixed_graft_swap_at_root(void)
 	}
 	/* Key 100 should no longer be in live. */
 	cds_ft_u64_to_key(live, 100, k, klen);
-	s = cds_ft_eager_lookup_key(live, k, klen, klen, &found);
+	s = cds_ft_eager_lookup_key(live, k, klen, 0, &found);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_NOT_FOUND) {
 		fprintf(stderr, "fixed_graft_swap_at_root: key 100 still in live\n");
@@ -6291,7 +6291,7 @@ static int test_fixed_graft_swap_at_root(void)
 	rcu_read_lock();
 	count = cds_ft_count_entries(swap);
 	cds_ft_u64_to_key(swap, 100, k, klen);
-	s = cds_ft_eager_lookup_key(swap, k, klen, klen, &found);
+	s = cds_ft_eager_lookup_key(swap, k, klen, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "fixed_graft_swap_at_root: lookup 100 in swap: %s\n",
 			cds_ft_status_to_string(s));
@@ -6472,7 +6472,7 @@ static int test_fixed_detach_at_root(void)
 	rcu_read_lock();
 	count = cds_ft_count_entries(detached);
 	cds_ft_u64_to_key(detached, 5, k, klen);
-	s = cds_ft_eager_lookup_key(detached, k, klen, klen, &found);
+	s = cds_ft_eager_lookup_key(detached, k, klen, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "fixed_detach_at_root: lookup 5 in detached: %s\n",
 			cds_ft_status_to_string(s));
@@ -6485,7 +6485,7 @@ static int test_fixed_detach_at_root(void)
 		goto fail;
 	}
 	cds_ft_u64_to_key(detached, 15, k, klen);
-	s = cds_ft_eager_lookup_key(detached, k, klen, klen, &found);
+	s = cds_ft_eager_lookup_key(detached, k, klen, 0, &found);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "fixed_detach_at_root: lookup 15 in detached: %s\n",
@@ -7623,7 +7623,7 @@ static int test_graft_reuse_after_drain(void)
 
 	/* Verify live has "abY" with value 2. */
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abY", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"abY", 3, 0, &found);
 	count = cds_ft_count_entries(live);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK || !found) {
@@ -7698,13 +7698,13 @@ static int test_multiple_tries_same_group(void)
 
 	/* Verify isolation: "AAA" not in ft2, "BBB" not in ft1. */
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(ft1, (const uint8_t *)"BBB", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(ft1, (const uint8_t *)"BBB", 3, 0, &found);
 	if (s != CDS_FT_STATUS_NOT_FOUND) {
 		fprintf(stderr, "multiple_tries: 'BBB' found in ft1\n");
 		rcu_read_unlock();
 		goto fail;
 	}
-	s = cds_ft_eager_lookup_key(ft2, (const uint8_t *)"AAA", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(ft2, (const uint8_t *)"AAA", 3, 0, &found);
 	if (s != CDS_FT_STATUS_NOT_FOUND) {
 		fprintf(stderr, "multiple_tries: 'AAA' found in ft2\n");
 		rcu_read_unlock();
@@ -8697,13 +8697,13 @@ static int test_adversarial_boundary_bytes(void)
 
 	rcu_read_lock();
 	for (i = 1; i <= 16; i++) {
-		s = cds_ft_eager_lookup_key(ft, zero_key, i, i, &found);
+		s = cds_ft_eager_lookup_key(ft, zero_key, i, 0, &found);
 		if (s != CDS_FT_STATUS_OK || !found) {
 			fprintf(stderr, "boundary: lookup zero len %u failed\n", i);
 			rcu_read_unlock();
 			goto out;
 		}
-		s = cds_ft_eager_lookup_key(ft, ff_key, i, i, &found);
+		s = cds_ft_eager_lookup_key(ft, ff_key, i, 0, &found);
 		if (s != CDS_FT_STATUS_OK || !found) {
 			fprintf(stderr, "boundary: lookup ff len %u failed\n", i);
 			rcu_read_unlock();
@@ -8768,7 +8768,7 @@ static int test_adversarial_prefix_nesting(void)
 	for (i = 1; i <= depth; i++) {
 		struct cds_ft_node *found;
 
-		s = cds_ft_eager_lookup_key(ft, key, i, i, &found);
+		s = cds_ft_eager_lookup_key(ft, key, i, 0, &found);
 		if (s != CDS_FT_STATUS_OK || !found) {
 			fprintf(stderr, "prefix_nesting: lookup len %u: %s\n",
 				i, cds_ft_status_to_string(s));
@@ -8855,7 +8855,7 @@ static int test_adversarial_mass_duplicates(void)
 	}
 
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &head);
+	s = cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, 0, &head);
 	if (s != CDS_FT_STATUS_OK || !head) {
 		rcu_read_unlock();
 		cds_ft_iter_destroy(iter);
@@ -9045,15 +9045,15 @@ static int test_adversarial_max_depth(void)
 	s = cds_ft_insert(ft, key_alt, max_klen, &n3->node);
 	if (s < 0) { rcu_read_unlock(); goto out; }
 
-	s = cds_ft_eager_lookup_key(ft, key_zero, max_klen, max_klen, &found);
+	s = cds_ft_eager_lookup_key(ft, key_zero, max_klen, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found || to_test_node(found)->value != 1) {
 		rcu_read_unlock(); goto out;
 	}
-	s = cds_ft_eager_lookup_key(ft, key_ff, max_klen, max_klen, &found);
+	s = cds_ft_eager_lookup_key(ft, key_ff, max_klen, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found || to_test_node(found)->value != 2) {
 		rcu_read_unlock(); goto out;
 	}
-	s = cds_ft_eager_lookup_key(ft, key_alt, max_klen, max_klen, &found);
+	s = cds_ft_eager_lookup_key(ft, key_alt, max_klen, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found || to_test_node(found)->value != 3) {
 		rcu_read_unlock(); goto out;
 	}
@@ -9491,7 +9491,7 @@ static int test_adversarial_shared_suffix(void)
 		struct cds_ft_node *found;
 		enum cds_ft_status s;
 
-		s = cds_ft_eager_lookup_key(ft, key, 4, 4, &found);
+		s = cds_ft_eager_lookup_key(ft, key, 4, 0, &found);
 		if (s != CDS_FT_STATUS_OK || !found ||
 		    to_test_node(found)->key != 0x42) {
 			rcu_read_unlock();
@@ -9665,7 +9665,7 @@ static int test_adversarial_replace_churn(void)
 	{
 		struct cds_ft_node *found;
 
-		s = cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
+		s = cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, 0, &found);
 		if (s != CDS_FT_STATUS_OK || !found ||
 		    to_test_node(found)->value != 128) {
 			rcu_read_unlock();
@@ -10508,8 +10508,8 @@ static int test_compress_varlen_external_nodes(void)
 		return drain_and_destroy(ft, group) | -1;
 	}
 	/* Both should be findable. */
-	if (cds_ft_eager_lookup_key(ft, k1, 3, 3, &found) != CDS_FT_STATUS_OK || !found ||
-	    cds_ft_eager_lookup_key(ft, k2, 6, 6, &found) != CDS_FT_STATUS_OK || !found) {
+	if (cds_ft_eager_lookup_key(ft, k1, 3, 0, &found) != CDS_FT_STATUS_OK || !found ||
+	    cds_ft_eager_lookup_key(ft, k2, 6, 0, &found) != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "compress_varlen_ext: lookup failed\n");
 		rcu_read_unlock();
 		cds_ft_iter_destroy(iter);
@@ -10531,7 +10531,7 @@ static int test_compress_varlen_external_nodes(void)
 		return drain_and_destroy(ft, group) | -1;
 	}
 	node_free_rcu(n1);
-	if (cds_ft_eager_lookup_key(ft, k2, 6, 6, &found) != CDS_FT_STATUS_OK || !found) {
+	if (cds_ft_eager_lookup_key(ft, k2, 6, 0, &found) != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "compress_varlen_ext: long key gone after short remove\n");
 		rcu_read_unlock();
 		cds_ft_iter_destroy(iter);
@@ -10589,7 +10589,7 @@ static int test_compress_graft_diverge(void)
 	}
 
 	/* Original key should still exist. */
-	if (cds_ft_eager_lookup_key(ft, k1, 6, 6, &found) != CDS_FT_STATUS_OK || !found) {
+	if (cds_ft_eager_lookup_key(ft, k1, 6, 0, &found) != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "compress_graft_diverge: lookup original failed\n");
 		rcu_read_unlock();
 		cds_ft_destroy(src);
@@ -10599,7 +10599,7 @@ static int test_compress_graft_diverge(void)
 	{
 		const uint8_t *k_full = (const uint8_t *)"abxQR";
 
-		if (cds_ft_eager_lookup_key(ft, k_full, 5, 5, &found) != CDS_FT_STATUS_OK || !found) {
+		if (cds_ft_eager_lookup_key(ft, k_full, 5, 0, &found) != CDS_FT_STATUS_OK || !found) {
 			fprintf(stderr, "compress_graft_diverge: lookup grafted key failed\n");
 			rcu_read_unlock();
 			cds_ft_destroy(src);
@@ -10637,12 +10637,12 @@ static int test_compress_detach_through(void)
 		return drain_and_destroy(ft, group) | -1;
 	}
 	/* k2 should remain, k1 should be in detached (under relative key). */
-	if (cds_ft_eager_lookup_key(ft, k2, 6, 6, &found) != CDS_FT_STATUS_OK || !found) {
+	if (cds_ft_eager_lookup_key(ft, k2, 6, 0, &found) != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "compress_detach_through: k2 missing after detach\n");
 		rcu_read_unlock();
 		goto fail_detach;
 	}
-	if (cds_ft_eager_lookup_key(ft, k1, 6, 6, &found) == CDS_FT_STATUS_OK) {
+	if (cds_ft_eager_lookup_key(ft, k1, 6, 0, &found) == CDS_FT_STATUS_OK) {
 		fprintf(stderr, "compress_detach_through: k1 still in trie\n");
 		rcu_read_unlock();
 		goto fail_detach;
@@ -10873,8 +10873,8 @@ static int test_compress_nested(void)
 	cds_ft_insert(ft, k1, 6, &n1->node);
 	cds_ft_insert(ft, k2, 6, &n2->node);
 
-	if (cds_ft_eager_lookup_key(ft, k1, 6, 6, &found) != CDS_FT_STATUS_OK || !found ||
-	    cds_ft_eager_lookup_key(ft, k2, 6, 6, &found) != CDS_FT_STATUS_OK || !found) {
+	if (cds_ft_eager_lookup_key(ft, k1, 6, 0, &found) != CDS_FT_STATUS_OK || !found ||
+	    cds_ft_eager_lookup_key(ft, k2, 6, 0, &found) != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "compress_nested: lookup failed\n");
 		rcu_read_unlock();
 		cds_ft_iter_destroy(iter);
@@ -10894,7 +10894,7 @@ static int test_compress_nested(void)
 	cds_ft_lookup(ft, iter);
 	cds_ft_remove(ft, iter, &n1->node);
 	node_free_rcu(n1);
-	if (cds_ft_eager_lookup_key(ft, k2, 6, 6, &found) != CDS_FT_STATUS_OK || !found) {
+	if (cds_ft_eager_lookup_key(ft, k2, 6, 0, &found) != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "compress_nested: k2 missing after k1 remove\n");
 		rcu_read_unlock();
 		cds_ft_iter_destroy(iter);
@@ -10944,14 +10944,14 @@ static int test_compress_replace_through(void)
 	}
 	node_free_rcu(n2);
 	/* Verify replacement. */
-	if (cds_ft_eager_lookup_key(ft, k2, 6, 6, &found) != CDS_FT_STATUS_OK ||
+	if (cds_ft_eager_lookup_key(ft, k2, 6, 0, &found) != CDS_FT_STATUS_OK ||
 	    found != &repl->node) {
 		fprintf(stderr, "compress_replace: wrong node after replace\n");
 		rcu_read_unlock();
 		goto fail;
 	}
 	/* Other key should be unaffected. */
-	if (cds_ft_eager_lookup_key(ft, k1, 6, 6, &found) != CDS_FT_STATUS_OK ||
+	if (cds_ft_eager_lookup_key(ft, k1, 6, 0, &found) != CDS_FT_STATUS_OK ||
 	    found != &n1->node) {
 		fprintf(stderr, "compress_replace: other key damaged\n");
 		rcu_read_unlock();
@@ -10987,7 +10987,7 @@ static int test_compress_recompact_external_nodes(void)
 	/* Short prefix key: triggers decompression, stored as external_nodes. */
 	cds_ft_insert(ft, (const uint8_t *)"abc", 3, &n2->node);
 
-	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abc", 3, 3, &found) != CDS_FT_STATUS_OK ||
+	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abc", 3, 0, &found) != CDS_FT_STATUS_OK ||
 	    found != &n2->node) {
 		fprintf(stderr, "compress_recompact_ext: abc missing before diverge\n");
 		rcu_read_unlock();
@@ -11004,19 +11004,19 @@ static int test_compress_recompact_external_nodes(void)
 		return drain_and_destroy(ft, group) | -1;
 	}
 	/* Verify all three keys survive. */
-	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abc", 3, 3, &found) != CDS_FT_STATUS_OK ||
+	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abc", 3, 0, &found) != CDS_FT_STATUS_OK ||
 	    found != &n2->node) {
 		fprintf(stderr, "compress_recompact_ext: abc lost after diverge\n");
 		rcu_read_unlock();
 		return drain_and_destroy(ft, group) | -1;
 	}
-	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abcdef", 6, 6, &found) != CDS_FT_STATUS_OK ||
+	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abcdef", 6, 0, &found) != CDS_FT_STATUS_OK ||
 	    found != &n1->node) {
 		fprintf(stderr, "compress_recompact_ext: abcdef lost\n");
 		rcu_read_unlock();
 		return drain_and_destroy(ft, group) | -1;
 	}
-	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abcxyz", 6, 6, &found) != CDS_FT_STATUS_OK ||
+	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abcxyz", 6, 0, &found) != CDS_FT_STATUS_OK ||
 	    found != &n3->node) {
 		fprintf(stderr, "compress_recompact_ext: abcxyz lost\n");
 		rcu_read_unlock();
@@ -11186,13 +11186,13 @@ static int test_compress_graft_swap_key_shorter(void)
 		goto fail;
 	}
 	/* "abQR" should exist in ft (from swap source). */
-	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abQR", 4, 4, &found) != CDS_FT_STATUS_OK || !found) {
+	if (cds_ft_eager_lookup_key(ft, (const uint8_t *)"abQR", 4, 0, &found) != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "compress_graft_swap_shorter: abQR not found\n");
 		rcu_read_unlock();
 		goto fail;
 	}
 	/* "cdef" should exist in swap trie (relative key). */
-	if (cds_ft_eager_lookup_key(swap, (const uint8_t *)"cdef", 4, 4, &found) != CDS_FT_STATUS_OK || !found) {
+	if (cds_ft_eager_lookup_key(swap, (const uint8_t *)"cdef", 4, 0, &found) != CDS_FT_STATUS_OK || !found) {
 		fprintf(stderr, "compress_graft_swap_shorter: cdef not in swap\n");
 		rcu_read_unlock();
 		goto fail;
@@ -11287,7 +11287,7 @@ static int test_skip_compressed_unit(void)
 	rcu_read_lock();
 	for (i = 0; i < NKEYS; i++) {
 		s = cds_ft_eager_lookup_key(ft, (const uint8_t *)keys[i],
-			strlen(keys[i]), strlen(keys[i]), &found);
+			strlen(keys[i]), 0, &found);
 		if (s != CDS_FT_STATUS_OK || found != &nodes[i]->node) {
 			fprintf(stderr, "skip_compressed_unit: exact lookup '%s' failed\n",
 				keys[i]);
@@ -11301,7 +11301,7 @@ static int test_skip_compressed_unit(void)
 	rcu_read_lock();
 	for (i = 0; i < NKEYS; i++) {
 		s = cds_ft_lookup_candidate_key(ft, (const uint8_t *)keys[i],
-			strlen(keys[i]), strlen(keys[i]), &found);
+			strlen(keys[i]), 0, &found);
 		if (s != CDS_FT_STATUS_OK || found != &nodes[i]->node) {
 			fprintf(stderr, "skip_compressed_unit: candidate lookup '%s' failed\n",
 				keys[i]);
@@ -11313,7 +11313,7 @@ static int test_skip_compressed_unit(void)
 
 	/* Non-existent key: exact lookup should return NOT_FOUND. */
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"helloX", 6, 6, &found);
+	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"helloX", 6, 0, &found);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_NOT_FOUND) {
 		fprintf(stderr, "skip_compressed_unit: non-existent key returned %s\n",
@@ -11598,7 +11598,7 @@ static int test_specv_fixed_basic(void)
 		}
 	}
 	for (i = 0; i < NKEYS; i++) {
-		s = cds_ft_eager_lookup_key(ft, nodes[i]->key, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT,
+		s = cds_ft_eager_lookup_key(ft, nodes[i]->key, CDS_FT_LEN_DEFAULT, 0,
 			&found);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "specv_fixed_basic: lookup %u: %s\n",
@@ -11661,7 +11661,7 @@ static int test_specv_varlen_basic(void)
 		}
 	}
 	for (i = 0; i < NKEYS; i++) {
-		s = cds_ft_eager_lookup_key(ft, nodes[i]->key, nodes[i]->key_len, nodes[i]->key_len,
+		s = cds_ft_eager_lookup_key(ft, nodes[i]->key, nodes[i]->key_len, 0,
 			&found);
 		if (s != CDS_FT_STATUS_OK || found != &nodes[i]->node) {
 			fprintf(stderr, "specv_varlen_basic: lookup '%s' status %s found %p (expected %p)\n",
@@ -11725,7 +11725,7 @@ static int test_specv_long_compressed_prefix(void)
 		}
 	}
 	for (i = 0; i < NKEYS; i++) {
-		s = cds_ft_eager_lookup_key(ft, nodes[i]->key, nodes[i]->key_len, nodes[i]->key_len,
+		s = cds_ft_eager_lookup_key(ft, nodes[i]->key, nodes[i]->key_len, 0,
 			&found);
 		if (s != CDS_FT_STATUS_OK || found != &nodes[i]->node) {
 			fprintf(stderr, "specv_long_compressed_prefix: lookup %u status %s found %p\n",
@@ -11781,7 +11781,7 @@ static int test_specv_mismatch_rejected(void)
 		}
 	}
 	s = cds_ft_eager_lookup_key(ft, (const uint8_t *) missing,
-		strlen(missing), strlen(missing), &found);
+		strlen(missing), 0, &found);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_NOT_FOUND) {
 		fprintf(stderr, "specv_mismatch_rejected: missing key returned %s\n",
@@ -11826,7 +11826,7 @@ static int test_specv_prefix_key_mismatch(void)
 	}
 	/* Short key not inserted: must NOT_FOUND. */
 	s = cds_ft_eager_lookup_key(ft, (const uint8_t *) short_key,
-		strlen(short_key), strlen(short_key), &found);
+		strlen(short_key), 0, &found);
 	if (s != CDS_FT_STATUS_NOT_FOUND) {
 		fprintf(stderr, "specv_prefix_key_mismatch: short key returned %s\n",
 			cds_ft_status_to_string(s));
@@ -11834,7 +11834,7 @@ static int test_specv_prefix_key_mismatch(void)
 		goto out;
 	}
 	/* Long key inserted: must hit. */
-	s = cds_ft_eager_lookup_key(ft, node->key, node->key_len, node->key_len, &found);
+	s = cds_ft_eager_lookup_key(ft, node->key, node->key_len, 0, &found);
 	if (s != CDS_FT_STATUS_OK || found != &node->node) {
 		fprintf(stderr, "specv_prefix_key_mismatch: long key status %s\n",
 			cds_ft_status_to_string(s));
@@ -13131,12 +13131,12 @@ static int test_exclusive_graft_from_exclusive(void)
 	if (!cds_ft_empty(staging))
 		goto out_both;
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"helo", 4, 4, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"helo", 4, 0, &found);
 	if (s != CDS_FT_STATUS_OK || !found) {
 		rcu_read_unlock();
 		goto out_both;
 	}
-	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"help", 4, 4, &found);
+	s = cds_ft_eager_lookup_key(live, (const uint8_t *)"help", 4, 0, &found);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK || !found)
 		goto out_both;
@@ -13348,7 +13348,7 @@ static void *excl_neg_reader(void *arg)
 		uint8_t key[4] = { 0 };
 
 		rcu_read_lock();
-		(void) cds_ft_eager_lookup_key(ctx->ft, key, 4, 4, &found);
+		(void) cds_ft_eager_lookup_key(ctx->ft, key, 4, 0, &found);
 		rcu_read_unlock();
 	}
 	rcu_unregister_thread();
@@ -13407,7 +13407,7 @@ static void *excl_neg_reader_no_rcu(void *arg)
 		struct cds_ft_node *found;
 		uint8_t key[4] = { 0 };
 
-		(void) cds_ft_eager_lookup_key(ctx->ft, key, 4, 4, &found);
+		(void) cds_ft_eager_lookup_key(ctx->ft, key, 4, 0, &found);
 	}
 	rcu_thread_online();
 	rcu_unregister_thread();
@@ -13567,7 +13567,7 @@ static int verify_keys_present(struct cds_ft *ft,
 		enum cds_ft_status s;
 
 		s = cds_ft_eager_lookup_key(ft, (const uint8_t *) exp[i].key,
-				exp[i].key_len, exp[i].key_len, &found);
+				exp[i].key_len, 0, &found);
 		if (s != CDS_FT_STATUS_OK || !found) {
 			fprintf(stderr, "verify_keys_present: missing '%.*s'\n",
 				(int) exp[i].key_len, exp[i].key);
@@ -13783,7 +13783,7 @@ static int test_merge_compressed_overlap(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) expected[i].key,
-				expected[i].key_len, expected[i].key_len,
+				expected[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_compressed_overlap: missing '%s'\n",
@@ -13960,7 +13960,7 @@ static int test_merge_duplicate_chains(void)
 	if (cds_ft_iter_create(dst, &iter) != CDS_FT_STATUS_OK)
 		goto out;
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(dst, (const uint8_t *)"dup", 3, 3, &found);
+	s = cds_ft_eager_lookup_key(dst, (const uint8_t *)"dup", 3, 0, &found);
 	count = 0;
 	if (s == CDS_FT_STATUS_OK) {
 		struct cds_ft_node *p;
@@ -14536,7 +14536,7 @@ static int test_merge_at_nonroot_src(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) dst_after[i].key,
-				dst_after[i].key_len, dst_after[i].key_len,
+				dst_after[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_at_nonroot_src: dst missing '%s'\n",
@@ -14557,8 +14557,8 @@ static int test_merge_at_nonroot_src(void)
 		unsigned long src_total;
 
 		rcu_read_lock();
-		(void) cds_ft_eager_lookup_key(src, (const uint8_t *) "Tzz", 3, 3, &tn);
-		(void) cds_ft_eager_lookup_key(src, (const uint8_t *) "Saaaa", 5, 5, &sn);
+		(void) cds_ft_eager_lookup_key(src, (const uint8_t *) "Tzz", 3, 0, &tn);
+		(void) cds_ft_eager_lookup_key(src, (const uint8_t *) "Saaaa", 5, 0, &sn);
 		src_total = cds_ft_count_entries(src);
 		rcu_read_unlock();
 		if (!tn || sn || src_total != 1) {
@@ -14648,7 +14648,7 @@ static int test_merge_at_nonroot_dst(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) dst_after[i].key,
-				dst_after[i].key_len, dst_after[i].key_len,
+				dst_after[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_at_nonroot_dst: dst missing '%s'\n",
@@ -14745,7 +14745,7 @@ static int test_merge_at_external_dst(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) dst_after[i].key,
-				dst_after[i].key_len, dst_after[i].key_len,
+				dst_after[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_at_external_dst: dst missing '%s'\n",
@@ -14829,7 +14829,7 @@ static int test_merge_at_external_dst_splice(void)
 		goto out;
 	}
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(dst, (const uint8_t *) "P", 1, 1, &out_node);
+	s = cds_ft_eager_lookup_key(dst, (const uint8_t *) "P", 1, 0, &out_node);
 	if (s == CDS_FT_STATUS_OK && out_node)
 		cds_ft_for_each_duplicate_safe_rcu(out_node, tmp)
 			dups++;
@@ -14915,7 +14915,7 @@ static int test_merge_at_compressed_dst_internal(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) dst_after[i].key,
-				dst_after[i].key_len, dst_after[i].key_len,
+				dst_after[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_at_compressed_dst_internal: missing '%s'\n",
@@ -15000,7 +15000,7 @@ static int test_merge_at_compressed_dst_compressed(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) dst_after[i].key,
-				dst_after[i].key_len, dst_after[i].key_len,
+				dst_after[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_at_compressed_dst_compressed: missing '%s'\n",
@@ -15093,7 +15093,7 @@ static int test_merge_at_key_shorter_dst_internal(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) dst_after[i].key,
-				dst_after[i].key_len, dst_after[i].key_len,
+				dst_after[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_at_key_shorter_dst_internal: missing '%s'\n",
@@ -15171,7 +15171,7 @@ static int test_merge_at_key_shorter_dst_splice(void)
 		goto out;
 	}
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(dst, (const uint8_t *) "PQRS", 4, 4, &found);
+	s = cds_ft_eager_lookup_key(dst, (const uint8_t *) "PQRS", 4, 0, &found);
 	count = 0;
 	if (s == CDS_FT_STATUS_OK) {
 		cds_ft_for_each_duplicate_safe_rcu(found, p)
@@ -15258,7 +15258,7 @@ static int test_merge_at_key_shorter_src(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) dst_after[i].key,
-				dst_after[i].key_len, dst_after[i].key_len,
+				dst_after[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_at_key_shorter_src: missing '%s'\n",
@@ -15341,7 +15341,7 @@ static int test_merge_at_key_shorter_src_both(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) dst_after[i].key,
-				dst_after[i].key_len, dst_after[i].key_len,
+				dst_after[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_at_key_shorter_src_both: missing '%s'\n",
@@ -15431,7 +15431,7 @@ static int test_merge_at_compressed_parent_internal(void)
 
 		if (cds_ft_eager_lookup_key(dst,
 				(const uint8_t *) dst_after[i].key,
-				dst_after[i].key_len, dst_after[i].key_len,
+				dst_after[i].key_len, 0,
 				&found) != CDS_FT_STATUS_OK || !found) {
 			rcu_read_unlock();
 			fprintf(stderr, "merge_at_compressed_parent_internal: missing '%s'\n",
@@ -15513,7 +15513,7 @@ static int test_merge_at_compressed_parent_splice(void)
 		goto out;
 	}
 	rcu_read_lock();
-	s = cds_ft_eager_lookup_key(dst, (const uint8_t *) "aXYc", 4, 4, &found);
+	s = cds_ft_eager_lookup_key(dst, (const uint8_t *) "aXYc", 4, 0, &found);
 	count = 0;
 	if (s == CDS_FT_STATUS_OK) {
 		cds_ft_for_each_duplicate_safe_rcu(found, p)
@@ -16593,7 +16593,7 @@ static int graft_swap_oom_has_key(struct cds_ft *ft, const char *k)
 	struct cds_ft_node *out = NULL;
 	size_t len = strlen(k);
 
-	return cds_ft_eager_lookup_key(ft, (const uint8_t *) k, len, len,
+	return cds_ft_eager_lookup_key(ft, (const uint8_t *) k, len, 0,
 			&out) == CDS_FT_STATUS_OK;
 }
 
