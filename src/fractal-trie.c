@@ -23365,13 +23365,16 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 		klen = (group->key_len != CDS_FT_LEN_VARIABLE) ? group->key_len :
 			*(const size_t *) ((const char *) node +
 				group->key_len_offset);
+	} else {
 #ifdef FEATURE_FT_ORD_CELL
-	} else if (group->ordered_list_set) {
 		/*
 		 * No in-leaf key: rebuild the ordinal key by the structural parent
-		 * up-walk from the head's cell (the EAGER ordered-list source, also
-		 * used by cds_ft_iter_get_key).  The walk fills @scratch from the
-		 * tail and returns the length; the key starts at @scratch[max-len].
+		 * up-walk from the head's cell (the same EAGER source cds_ft_iter_
+		 * get_key uses).  The cell is allocated for every head whenever
+		 * FEATURE_FT_ORD_CELL is compiled -- independent of ordered_list_set --
+		 * and cell->parent is wired, so the up-walk works even with the ordered
+		 * LIST disabled at runtime.  The walk fills @scratch from the tail and
+		 * returns the length; the key starts at @scratch[max-len].
 		 */
 		struct ft_ord_cell *cell = ft_ord_cell_ptr(
 			rcu_dereference(((struct cds_ft_node *) node)->prev));
@@ -23379,10 +23382,10 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 
 		klen = ft_rebuild_key_upwalk(ft, cell, scratch, max_len);
 		ordinals = scratch + (max_len - klen);
-#endif
-	} else {
-		/* No in-leaf key and no ordered list: not materializable alone. */
+#else
+		/* No in-leaf key and no cells: not materializable from a node alone. */
 		return CDS_FT_STATUS_NOT_FOUND;
+#endif
 	}
 	*result_key_len = klen;
 	if (klen > result_key_max_len)
@@ -23593,6 +23596,81 @@ size_t cds_ft_iter_prev_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
 		struct cds_ft_node **buf, size_t cap)
 {
 	return ft_iter_batch_dir(ft, iter, buf, cap, false);
+}
+
+/*
+ * Iterator-free ordered batched gather, shared by cds_ft_node_next_batch /
+ * cds_ft_node_prev_batch.  Walks @ft's ordered cell list from @cursor (NULL =
+ * the list minimum for forward, maximum for reverse), emits up to @cap head
+ * pointers into @buf, and writes the resume node -- the one after the last
+ * emitted, NULL at the end -- to @next_cursor.  Same cmm_ptr_eq physical-next
+ * prediction as ft_iter_batch_dir; @forward is a literal at both call sites so
+ * always_inline folds the direction out.
+ *
+ * ORDERED-LIST ONLY: the step IS the cell ord_next / ord_prev walk.  A group
+ * with no ordered list (ordered_list_set false, or a non-cell build) has no
+ * "next in key order" reachable from a bare node -- returns 0, *next_cursor =
+ * NULL; use the iterator (cds_ft_next / cds_ft_prev, structural descent) there.
+ *
+ * RCU CONTRACT: @cursor and every emitted node are valid only while the read
+ * lock that produced @cursor is held continuously (see cds_ft_node_get_key).
+ */
+static inline __attribute__((always_inline))
+size_t ft_node_batch_dir(struct cds_ft *ft, const struct cds_ft_node *cursor,
+		struct cds_ft_node **buf, size_t cap,
+		const struct cds_ft_node **next_cursor, const bool forward)
+{
+	size_t n = 0;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+	*next_cursor = NULL;
+	if (caa_unlikely(cap == 0))
+		return 0;
+#ifdef FEATURE_FT_ORD_CELL
+	if (ft->group->ordered_list_set) {
+		const uintptr_t stride = (uintptr_t) 1 << FT_ORD_CELL_ALLOC_ORDER;
+		struct ft_ord_cell *cur;
+
+		if (cursor)
+			cur = ft_ord_cell_ptr(rcu_dereference(
+				((struct cds_ft_node *) cursor)->prev));
+		else
+			cur = ft_ord_cell_resolve_ord(forward ?
+				&ft->ord_cell_head : &ft->ord_cell_tail);
+		while (n < cap && cur) {
+			struct ft_ord_cell *loaded, *guess;
+
+			buf[n++] = cur->node;
+			loaded = forward ?
+				ft_ord_cell_resolve_ord(&cur->ord_next) :
+				ft_ord_cell_resolve_ord(&cur->ord_prev);
+			guess = (struct ft_ord_cell *) (forward ?
+				(uintptr_t) cur + stride :
+				(uintptr_t) cur - stride);
+			cur = (loaded && cmm_ptr_eq(loaded, guess)) ? guess : loaded;
+		}
+		*next_cursor = cur ? cur->node : NULL;
+		return n;
+	}
+#else
+	(void) cursor;
+	(void) buf;
+#endif
+	return 0;
+}
+
+size_t cds_ft_node_next_batch(struct cds_ft *ft, const struct cds_ft_node *cursor,
+		struct cds_ft_node **buf, size_t cap,
+		const struct cds_ft_node **next_cursor)
+{
+	return ft_node_batch_dir(ft, cursor, buf, cap, next_cursor, true);
+}
+
+size_t cds_ft_node_prev_batch(struct cds_ft *ft, const struct cds_ft_node *cursor,
+		struct cds_ft_node **buf, size_t cap,
+		const struct cds_ft_node **next_cursor)
+{
+	return ft_node_batch_dir(ft, cursor, buf, cap, next_cursor, false);
 }
 
 enum cds_ft_status cds_ft_iter_set_cache_mode(struct cds_ft_iter *iter,

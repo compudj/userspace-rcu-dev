@@ -2706,6 +2706,54 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 		size_t result_key_max_len, size_t *result_key_len);
 
 /*
+ * cds_ft_node_next_batch - Iterator-free ordered batched walk from a node.
+ * @ft: The Fractal Trie.
+ * @cursor: Node to start AT (inclusive); NULL starts at the list minimum.
+ * @buf: Output array of up to @cap head pointers, in ascending key order.
+ * @cap: Capacity of @buf.
+ * @next_cursor: Output -- the node to pass as @cursor next, or NULL at the end.
+ *
+ * Walks @ft's ordered cell list without an iterator object, emitting head
+ * pointers a batch at a time so the per-call boundary is paid once per @cap
+ * nodes.  Pair with cds_ft_node_get_key() to turn the returned nodes into keys.
+ * Stop when @cursor comes back NULL (NOT when the count is 0): a NULL @cursor
+ * is BOTH the start sentinel and the end signal, so terminate on the returned
+ * cursor, not the count, or the walk restarts from the minimum:
+ *
+ *   const struct cds_ft_node *cur = NULL;
+ *   size_t n, i;
+ *   do {
+ *           n = cds_ft_node_next_batch(ft, cur, buf, N, &cur);
+ *           for (i = 0; i < n; i++)
+ *                   cds_ft_node_get_key(ft, buf[i], k, sizeof k, &kl);
+ *   } while (cur);
+ *
+ * ORDERED-LIST ONLY: the step is the cell ord_next walk.  A group without the
+ * ordered list (cds_ft_group_attr_set_no_ordered_list, or a build without the
+ * ordered cell list) returns 0 and *next_cursor == NULL -- there is no "next in
+ * key order" from a bare node; use cds_ft_next() with an iterator instead.
+ *
+ * RCU CONTRACT: like cds_ft_node_get_key(), @cursor and the returned nodes are
+ * valid only while the RCU read-side lock that produced @cursor is held
+ * CONTINUOUSLY.  A bare node pointer must not outlive its critical section; for
+ * a resumable scan that spans grace periods, use the iterator (which can carry
+ * a materialized key across a CS).
+ *
+ * Returns the number of nodes written to @buf (0 at the end / when unsupported).
+ */
+size_t cds_ft_node_next_batch(struct cds_ft *ft, const struct cds_ft_node *cursor,
+		struct cds_ft_node **buf, size_t cap,
+		const struct cds_ft_node **next_cursor);
+
+/*
+ * cds_ft_node_prev_batch - Reverse (descending-key-order) cds_ft_node_next_batch.
+ * @cursor NULL starts at the list maximum; otherwise identical, stepping down.
+ */
+size_t cds_ft_node_prev_batch(struct cds_ft *ft, const struct cds_ft_node *cursor,
+		struct cds_ft_node **buf, size_t cap,
+		const struct cds_ft_node **next_cursor);
+
+/*
  * cds_ft_iter_get_prefix - Retrieve the current prefix from an iterator.
  * @iter: The iterator.
  * @result_key: Output buffer for the prefix.

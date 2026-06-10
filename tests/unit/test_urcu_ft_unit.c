@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 237
+#define NR_TESTS 239
 #else
-#define NR_TESTS 226
+#define NR_TESTS 228
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1679,6 +1679,181 @@ static int test_node_get_key(void)
 	return drain_and_destroy(ft, group);
 fail:
 	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_node_next_batch / cds_ft_node_prev_batch: the fully iterator-free
+ * ordered scan.  Walk all keys forward (cursor seeded NULL = list minimum) and
+ * reverse (NULL = maximum) with a small batch buffer (forcing several batches),
+ * resolving each node's key via cds_ft_node_get_key, and check the order.
+ * A build with no ordered cell list returns 0 immediately -- treated as N/A.
+ */
+static int test_node_batch(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_node *buf[4];
+	const struct cds_ft_node *cur;
+	unsigned long i, seen;
+	size_t n, b;
+
+	for (i = 0; i < 10; i++) {
+		struct ft_test_node *nd = node_alloc(i);
+
+		rcu_read_lock();
+		if (insert_u64(ft, i, nd) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			goto fail;
+		}
+		rcu_read_unlock();
+	}
+
+	/* Forward: cap 4 over 10 keys forces multiple batches. */
+	rcu_read_lock();
+	cur = NULL;
+	seen = 0;
+	do {
+		n = cds_ft_node_next_batch(ft, cur, buf, 4, &cur);
+		for (b = 0; b < n; b++) {
+			uint8_t k[4];
+			size_t kl;
+
+			if (cds_ft_node_get_key(ft, buf[b], k, sizeof k, &kl)
+					!= CDS_FT_STATUS_OK ||
+					cds_ft_key_to_u64(ft, k, 4) != seen) {
+				rcu_read_unlock();
+				fprintf(stderr, "node_batch fwd: mismatch at %lu\n",
+					seen);
+				goto fail;
+			}
+			seen++;
+		}
+	} while (cur);
+	rcu_read_unlock();
+	if (seen == 0)
+		/* No ordered list in this build -- not applicable. */
+		return drain_and_destroy(ft, group);
+	if (seen != 10) {
+		fprintf(stderr, "node_batch fwd: saw %lu of 10\n", seen);
+		goto fail;
+	}
+
+	/* Reverse: NULL cursor starts at the maximum, stepping down. */
+	rcu_read_lock();
+	cur = NULL;
+	seen = 0;
+	do {
+		n = cds_ft_node_prev_batch(ft, cur, buf, 4, &cur);
+		for (b = 0; b < n; b++) {
+			uint8_t k[4];
+			size_t kl;
+
+			if (cds_ft_node_get_key(ft, buf[b], k, sizeof k, &kl)
+					!= CDS_FT_STATUS_OK ||
+					cds_ft_key_to_u64(ft, k, 4) != 9 - seen) {
+				rcu_read_unlock();
+				fprintf(stderr, "node_batch rev: mismatch at %lu\n",
+					seen);
+				goto fail;
+			}
+			seen++;
+		}
+	} while (cur);
+	rcu_read_unlock();
+	if (seen != 10) {
+		fprintf(stderr, "node_batch rev: saw %lu of 10\n", seen);
+		goto fail;
+	}
+
+	return drain_and_destroy(ft, group);
+fail:
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_node_get_key with the ordered LIST disabled at runtime
+ * (cds_ft_group_attr_set_no_ordered_list).  On a cell build the head still has
+ * a cell (cell-always), so the parent up-walk -- hence node_get_key -- works
+ * even with the list off; the iterator-free stepper, which IS the ord-list
+ * walk, returns nothing.  A non-cell build can't materialize from the node
+ * (no in-leaf key, no cell): node_get_key returns NOT_FOUND -- treated as N/A.
+ */
+static int test_node_get_key_no_list(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_node *buf[4];
+	const struct cds_ft_node *cur;
+	unsigned long i;
+	size_t n;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_key_len(attr, 4) < 0 ||
+			cds_ft_group_attr_set_no_ordered_list(attr) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	for (i = 0; i < 10; i++) {
+		struct ft_test_node *nd = node_alloc(i);
+
+		rcu_read_lock();
+		if (insert_u64(ft, i, nd) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			goto fail;
+		}
+		rcu_read_unlock();
+	}
+
+	for (i = 0; i < 10; i++) {
+		uint8_t kb[4], k[4];
+		struct cds_ft_node *found = NULL;
+		size_t kl;
+		enum cds_ft_status s;
+
+		cds_ft_u64_to_key(ft, i, kb, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		if (cds_ft_eager_lookup_key(ft, kb, 4, 0, &found)
+				!= CDS_FT_STATUS_OK || !found) {
+			rcu_read_unlock();
+			goto fail;
+		}
+		s = cds_ft_node_get_key(ft, found, k, sizeof k, &kl);
+		rcu_read_unlock();
+		if (s == CDS_FT_STATUS_NOT_FOUND)
+			break;	/* non-cell build: N/A for the rest */
+		if (s != CDS_FT_STATUS_OK || cds_ft_key_to_u64(ft, k, 4) != i) {
+			fprintf(stderr, "node no-list get_key: bad at %lu\n", i);
+			goto fail;
+		}
+	}
+
+	/* The iterator-free stepper needs the list -> empty. */
+	rcu_read_lock();
+	n = cds_ft_node_next_batch(ft, NULL, buf, 4, &cur);
+	rcu_read_unlock();
+	if (n != 0 || cur != NULL) {
+		fprintf(stderr, "node no-list next_batch: %zu / %p\n", n,
+			(const void *) cur);
+		goto fail;
+	}
+
+	return drain_and_destroy(ft, group);
+fail:
 	drain_and_destroy(ft, group);
 	return -1;
 }
@@ -17753,6 +17928,8 @@ int main(int argc, char **argv)
 	diag("Rank-based lookup tests");
 	RUN_TEST(test_lookup_nth_empty);
 	RUN_TEST(test_node_get_key);
+	RUN_TEST(test_node_batch);
+	RUN_TEST(test_node_get_key_no_list);
 	RUN_TEST(test_lookup_nth_basic);
 	RUN_TEST(test_lookup_nth_last);
 	RUN_TEST(test_lookup_nth_duplicates);
