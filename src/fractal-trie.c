@@ -20833,6 +20833,16 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	if (ft_skip_compressed_validate())
 		attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Ordered sibling list ON by default: the library-owned cell is allocated
+	 * per head regardless, so the key-ordered cds_ft_next / cds_ft_prev /
+	 * cds_ft_for_each*_batched fast paths are available out of the box.  A
+	 * group that never iterates in key order and wants to skip the per-mutation
+	 * splice / unsplice opts out with cds_ft_group_attr_set_no_ordered_list.
+	 */
+	attr->ordered_list_set = true;
+#endif
 	/*
 	 * NUMA placement default: defer to process / libnuma policy.
 	 * The library applies no mbind() of its own; the kernel honors
@@ -20951,6 +20961,15 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
 	if (!attr)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	attr->ordered_list_set = true;
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_group_attr_set_no_ordered_list(
+		struct cds_ft_group_attr *attr)
+{
+	if (!attr)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->ordered_list_set = false;
 	return CDS_FT_STATUS_OK;
 }
 
@@ -21165,6 +21184,9 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (ft_skip_compressed_validate())
 			ft_group->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
+#endif
+#ifdef FEATURE_FT_ORD_CELL
+		ft_group->ordered_list_set = true;	/* on by default; see attr_create */
 #endif
 		ft_group->numa_policy = CDS_FT_NUMA_DEFAULT;
 		ft_group->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;

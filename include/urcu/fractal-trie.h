@@ -2338,24 +2338,48 @@ enum cds_ft_status cds_ft_group_attr_set_key_len_offset(
 
 /*
  * cds_ft_group_attr_set_ordered_list - Enable the library-owned ordered
- *   sibling list (no application-leaf storage required).
+ *   sibling list (this is the DEFAULT; see
+ *   cds_ft_group_attr_set_no_ordered_list to opt out).
  *
  * The library threads the duplicate-chain heads (one per distinct key) into a
  * key-ordered list of library-owned cells and uses it to accelerate
- * cds_ft_next / cds_ft_prev.  The order links live entirely inside the library:
- * struct cds_ft_node is unchanged and the application declares no offset for
- * them.  The cell is reached via the head's node, and the head's parent is
- * relocated into the cell, so the downward lookup path is unaffected.
+ * cds_ft_next / cds_ft_prev and cds_ft_for_each*_batched.  The order links live
+ * entirely inside the library: struct cds_ft_node is unchanged and the
+ * application declares no offset for them.  The cell is reached via the head's
+ * node, and the head's parent is relocated into the cell, so the downward
+ * lookup path is unaffected.
  *
- * Requires cds_ft_group_attr_set_speculative_key_offset (the result key is
- * materialized from the matched leaf), and, for a variable-length-key group,
- * cds_ft_group_attr_set_key_len_offset.  Optional; when unset there is zero
- * cost.  Only effective in a library built with -DFEATURE_FT_ORD_CELL.
+ * On by default in a library built with FEATURE_FT_ORD_CELL (the default
+ * build), so this setter is normally redundant; it re-affirms the default,
+ * e.g. after a cds_ft_group_attr_set_no_ordered_list().  The iteration result
+ * key is recovered from the matched leaf when
+ * cds_ft_group_attr_set_speculative_key_offset (plus
+ * cds_ft_group_attr_set_key_len_offset for a variable-length-key group) is
+ * configured, otherwise structurally by an upward walk for an identity-mapped
+ * group -- either way no application-leaf order storage is needed.
  *
  * Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL @attr.
  */
 enum cds_ft_status cds_ft_group_attr_set_ordered_list(
+		struct cds_ft_group_attr *attr);
+
+/*
+ * cds_ft_group_attr_set_no_ordered_list - Disable the ordered sibling list
+ *   for this group (it is enabled by default).
+ *
+ * Opt out to skip the per-mutation cell splice / unsplice -- worthwhile for a
+ * write-heavy group that never iterates in key order (cds_ft_next /
+ * cds_ft_prev / cds_ft_for_each*).  The per-head library cell is still
+ * allocated (it carries the head's parent), so opting out does not recover
+ * that per-head cost; a cell-optional layout is a separate matter.  No effect
+ * in a library built with -DNO_FEATURE_FT_ORD_CELL (the list is already
+ * absent).
+ *
+ * Returns CDS_FT_STATUS_OK on success,
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL @attr.
+ */
+enum cds_ft_status cds_ft_group_attr_set_no_ordered_list(
 		struct cds_ft_group_attr *attr);
 
 /*
