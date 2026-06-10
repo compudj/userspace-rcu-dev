@@ -2676,6 +2676,36 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
 		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len);
 
 /*
+ * cds_ft_node_get_key - Materialize a key from a bare external node pointer.
+ * @ft: The Fractal Trie @node belongs to.
+ * @node: An external head node (e.g. one returned by cds_ft_iter_next_batch).
+ * @result_key: Output buffer for the key.
+ * @result_key_max_len: Size of the @result_key buffer.
+ * @result_key_len: Length of the key written (output).
+ *
+ * Reconstructs @node's key without an iterator object: an in-leaf key
+ * (declared via the speculative key offset) is read in place; otherwise, for an
+ * ordered-list group with no in-leaf key, the key is rebuilt by the structural
+ * parent up-walk -- the same sources cds_ft_iter_get_key() uses.
+ *
+ * RCU CONTRACT: @node, and (for the up-walk) its parent chain, are valid only
+ * while the RCU read-side lock that produced @node is held CONTINUOUSLY.
+ * Unlike an iterator -- which an UNCACHED caller can carry across a critical
+ * section because it materializes the key into its own storage -- a bare node
+ * pointer must NOT outlive its read-side critical section.  This is the
+ * within-CS companion to the iterator, for tight batched scans (pair it with
+ * cds_ft_iter_next_batch() / cds_ft_iter_prev_batch()).
+ *
+ * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the buffer is too small.
+ * Returns CDS_FT_STATUS_NOT_FOUND if the group has neither an in-leaf key nor
+ * an ordered list, so a key cannot be materialized from a node alone.
+ */
+enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
+		const struct cds_ft_node *node, uint8_t *result_key,
+		size_t result_key_max_len, size_t *result_key_len);
+
+/*
  * cds_ft_iter_get_prefix - Retrieve the current prefix from an iterator.
  * @iter: The iterator.
  * @result_key: Output buffer for the prefix.

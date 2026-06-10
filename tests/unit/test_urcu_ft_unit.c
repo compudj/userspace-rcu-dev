@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 236
+#define NR_TESTS 237
 #else
-#define NR_TESTS 225
+#define NR_TESTS 226
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1589,6 +1589,98 @@ static int test_count_keys_prefix_fixed(void)
 	rcu_read_unlock();
 
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * cds_ft_node_get_key: materialize a key from a bare external node pointer,
+ * without an iterator.  Drive a batched cell-walk to gather node pointers, then
+ * reconstruct each one's key via cds_ft_node_get_key and check it matches both
+ * the iterator's own get_key and the expected in-order value.  Exercises the
+ * EAGER parent up-walk source (a fixed-length ordered group has no in-leaf key).
+ */
+static int test_node_get_key(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *buf[16];
+	unsigned long i, seen = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	for (i = 0; i < 10; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		rcu_read_lock();
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			goto fail;
+		}
+		rcu_read_unlock();
+	}
+
+	/* One continuous read-side critical section: node pointers are valid. */
+	rcu_read_lock();
+	if (cds_ft_lookup_first(ft, iter) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "node_get_key: lookup_first failed\n");
+		goto fail;
+	}
+	for (;;) {
+		size_t got = cds_ft_iter_next_batch(ft, iter, buf, 16);
+		size_t b;
+
+		if (!got)
+			break;
+		for (b = 0; b < got; b++) {
+			uint8_t k[4];
+			size_t klen;
+			uint64_t v;
+			enum cds_ft_status s = cds_ft_node_get_key(ft, buf[b],
+					k, sizeof(k), &klen);
+
+			if (s == CDS_FT_STATUS_NOT_FOUND) {
+				/*
+				 * A build with neither an in-leaf key nor an
+				 * ordered list (e.g. -DNO_FEATURE_FT_ORD_CELL)
+				 * cannot materialize a key from a node alone.
+				 * Not applicable -- pass.
+				 */
+				rcu_read_unlock();
+				cds_ft_iter_destroy(iter);
+				return drain_and_destroy(ft, group);
+			}
+			if (s != CDS_FT_STATUS_OK || klen != 4) {
+				rcu_read_unlock();
+				fprintf(stderr, "node_get_key: bad result at %lu\n",
+					seen);
+				goto fail;
+			}
+			v = cds_ft_key_to_u64(ft, k, 4);
+			if (v != seen) {
+				rcu_read_unlock();
+				fprintf(stderr, "node_get_key: got %lu expected %lu\n",
+					(unsigned long) v, seen);
+				goto fail;
+			}
+			seen++;
+		}
+	}
+	rcu_read_unlock();
+	if (seen != 10) {
+		fprintf(stderr, "node_get_key: saw %lu of 10 keys\n", seen);
+		goto fail;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+fail:
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
 }
 
 /*
@@ -17660,6 +17752,7 @@ int main(int argc, char **argv)
 	/* Rank-based lookup (cds_ft_lookup_nth) tests */
 	diag("Rank-based lookup tests");
 	RUN_TEST(test_lookup_nth_empty);
+	RUN_TEST(test_node_get_key);
 	RUN_TEST(test_lookup_nth_basic);
 	RUN_TEST(test_lookup_nth_last);
 	RUN_TEST(test_lookup_nth_duplicates);

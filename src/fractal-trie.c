@@ -23343,6 +23343,54 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
 	return CDS_FT_STATUS_OK;
 }
 
+enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
+		const struct cds_ft_node *node, uint8_t *result_key,
+		size_t result_key_max_len, size_t *result_key_len)
+{
+	const struct cds_ft_group *group = ft->group;
+	const uint8_t *ordinals;
+	size_t klen;
+#ifdef FEATURE_FT_ORD_CELL
+	uint8_t scratch[FT_MAX_KEY_LEN];
+#endif
+
+	if (!node)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (group->speculative_key_offset_set) {
+		/*
+		 * In-leaf key: the head stores its ordinal key bytes (and, for a
+		 * variable-length group, its length) directly.  Read them in place.
+		 */
+		ordinals = (const uint8_t *) node + group->speculative_key_offset;
+		klen = (group->key_len != CDS_FT_LEN_VARIABLE) ? group->key_len :
+			*(const size_t *) ((const char *) node +
+				group->key_len_offset);
+#ifdef FEATURE_FT_ORD_CELL
+	} else if (group->ordered_list_set) {
+		/*
+		 * No in-leaf key: rebuild the ordinal key by the structural parent
+		 * up-walk from the head's cell (the EAGER ordered-list source, also
+		 * used by cds_ft_iter_get_key).  The walk fills @scratch from the
+		 * tail and returns the length; the key starts at @scratch[max-len].
+		 */
+		struct ft_ord_cell *cell = ft_ord_cell_ptr(
+			rcu_dereference(((struct cds_ft_node *) node)->prev));
+		size_t max_len = group->max_key_len;
+
+		klen = ft_rebuild_key_upwalk(ft, cell, scratch, max_len);
+		ordinals = scratch + (max_len - klen);
+#endif
+	} else {
+		/* No in-leaf key and no ordered list: not materializable alone. */
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	*result_key_len = klen;
+	if (klen > result_key_max_len)
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
+	ft_ordinals_to_key(result_key, ordinals, klen, &group->key_map);
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status cds_ft_iter_get_prefix(struct cds_ft_iter *iter,
 		uint8_t *result_key, size_t result_key_max_len, size_t *result_key_len)
 {
