@@ -590,6 +590,15 @@ struct cds_ft_iter {
 	enum cds_ft_status status;	/* Iteration status. */
 	enum cds_ft_iter_cache_mode cache_mode;	/* Position-reuse mode (CACHED/UNCACHED). */
 	bool cache_valid;		/* Whether the cached position is valid. */
+	/*
+	 * Byte offset within the @data buffer at which the current-position key
+	 * begins.  0 for a descent / set_key key (filled at the front); the
+	 * structural up-walk fills the key at the TAIL and sets this to
+	 * (max_key_len - key_len) so ft_iter_read_key returns the right pointer
+	 * even after the cached position is invalidated (bind / UNCACHED), with
+	 * no copy to normalize the key to the front.
+	 */
+	size_t key_off;
 
 #ifdef FEATURE_FT_ORD_CELL
 	/*
@@ -8319,6 +8328,41 @@ static size_t ft_rebuild_key_upwalk(const struct cds_ft *ft,
 		struct ft_ord_cell *cell, uint8_t *out, size_t max_len);
 #endif
 
+/*
+ * Sentinel stored in iter->key_len by the ordinal-cell land for a VARIABLE-
+ * length identity group: the length is DEFERRED and resolved on demand by
+ * ft_iter_resolve_key_len() -- from the leaf (key_len_offset) when present, else
+ * from the parent up-walk -- so a keyless cell walk reads neither key nor length.
+ * SIZE_MAX is never a valid key length (bounded by max_key_len), so a consumer
+ * that forgets to resolve hits an obvious overflow, not a silently-stale value.
+ */
+#define FT_ITER_KEY_LEN_LAZY	((size_t) -1)
+
+#ifdef FEATURE_FT_ORD_CELL
+/*
+ * One-shot structural materialization for a VARIABLE-length EAGER ordered-list
+ * iterator (no in-leaf key, no key_len_offset): the parent up-walk derives BOTH
+ * the key bytes (into iter_key) AND the length in a SINGLE walk.  Caches the
+ * length in iter->key_len (clearing the LAZY sentinel) so a later read_key /
+ * resolve_key_len in the same step reuses it instead of walking again.  Returns
+ * the length (0 on a NIL key / overflow / missing cell).
+ */
+static
+size_t ft_iter_upwalk_into_buf(struct cds_ft_iter *iter)
+{
+	size_t max_len = iter->ft->group->max_key_len;
+	struct ft_ord_cell *cell = ft_ord_cell_cursor(iter);
+	size_t n = 0;
+
+	if (cell)
+		n = ft_rebuild_key_upwalk(iter->ft, cell, iter_key(iter), max_len);
+	iter->key_len = n;
+	iter->key_off = max_len - n;	/* key lives at iter_key[key_off ..) */
+	iter->path_len = n + 1;
+	return n;
+}
+#endif
+
 static inline
 const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 {
@@ -8332,23 +8376,39 @@ const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 	 * key STRUCTURALLY via the parent up-walk into iter_key.  Reached only
 	 * when a key consumer asks for the key -- a keyless/count walk never
 	 * calls this, so the O(depth) walk is paid strictly on demand.  Identity
-	 * map => ordinal bytes ARE the key.  Fixed-length only for now (a
-	 * variable-length walk would derive the length from the walk itself --
-	 * follow-up); ft_ord_cell_fastpath_ok keeps variable EAGER off the cell
-	 * path until then.
+	 * map => ordinal bytes ARE the key.  FIXED-length walks into the buffer
+	 * (length is group->key_len).  VARIABLE-length derives the length from the
+	 * SAME walk, cached via ft_iter_upwalk_into_buf and coordinated with
+	 * ft_iter_resolve_key_len through the LAZY sentinel so one walk serves both.
 	 */
 	if (group->ordered_list_set && !group->speculative_key_offset_set &&
 			group->key_map.identity && iter->cache_valid &&
-			iter->node && group->key_len != CDS_FT_LEN_VARIABLE) {
-		struct ft_ord_cell *cell = ft_ord_cell_cursor(iter);
-		uint8_t *buf = iter_key(iter);
+			iter->node) {
+		if (group->key_len == CDS_FT_LEN_VARIABLE) {
+			/*
+			 * The up-walk fills the key at the buffer TAIL and records
+			 * iter->key_off; coordinated with ft_iter_resolve_key_len
+			 * through the LAZY sentinel so one walk serves both.
+			 */
+			if (iter->key_len == FT_ITER_KEY_LEN_LAZY)
+				ft_iter_upwalk_into_buf(
+					(struct cds_ft_iter *) iter);
+			return iter_key(iter) + iter->key_off;
+		} else {
+			struct ft_ord_cell *cell = ft_ord_cell_cursor(iter);
+			size_t max_len = group->max_key_len;
+			size_t n;
 
-		if (cell && ft_rebuild_key_upwalk(iter->ft, cell, buf,
-				group->max_key_len))
-			return buf;
+			if (cell && (n = ft_rebuild_key_upwalk(iter->ft, cell,
+					iter_key(iter), max_len)) != 0) {
+				((struct cds_ft_iter *) iter)->key_off =
+					max_len - n;
+				return iter_key(iter) + (max_len - n);
+			}
+		}
 	}
 #endif
-	return iter_key(iter);
+	return iter_key(iter) + iter->key_off;
 }
 
 #ifdef FEATURE_FT_ORD_CELL
@@ -8374,32 +8434,65 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		uint8_t *out, size_t max_len)
 {
 	struct cds_ft_inode_flag *nf;
-	size_t n = 0, i, j;
+	size_t pos = max_len;	/* fill DEEPEST-byte-first leftward from the end */
 
 	(void) ft;
 	if (!cell)
 		return 0;
 
-	nf = rcu_dereference(cell->parent);
+	/*
+	 * Resolve a cds_ft_merge / graft_swap flip proxy on every parent load: a
+	 * concurrent bulk op re-parents nodes via a type-7 proxy installed BEFORE
+	 * its drain, so an up-walk running under the reader's RCU lock would
+	 * otherwise dereference the proxy as a node.  Gives the view-appropriate
+	 * (old-or-merged) parent, consistent across the walk.
+	 */
+	nf = ft_resolve_flip_proxy(rcu_dereference(cell->parent));
 
 	/*
-	 * Accumulate bytes DEEPEST-FIRST into out[0..n), then reverse -- so the
-	 * length is DERIVED from the walk (no key_len needed: works for variable-
-	 * length keys with no in-leaf length either).  Each step appends its
-	 * contribution; on overflow past @max_len, fail (return 0).
+	 * Fill the buffer FROM THE END: write the deepest (leaf-edge) byte at
+	 * out[max_len-1] and grow leftward, so the key ends up in correct order
+	 * occupying out[pos .. max_len) with NO reversal and the length DERIVED
+	 * from the walk (pos drops by however many bytes the walk contributes --
+	 * no key_len needed, so variable-length keys with no in-leaf length work).
+	 * A compressed span lands as one contiguous forward memcpy (its key_bytes
+	 * are already in key order); on underflow past out[0], fail (return 0).
+	 * The key STARTS at out[max_len - returned]; the caller keeps that offset.
 	 *
 	 * Head's last byte: when it hangs off an internal node it sits in a slot
 	 * whose byte is the head's cell-metadata incoming_byte; when its parent is
 	 * a compressed node the head is that node's child and carries no separate
 	 * edge byte (the compressed key_bytes run through the head's position).
 	 */
-	if (!nf || !ft_node_compressed(ft_resolve_skip_compressed(nf))) {
+	if (!nf) {
+		/* Parentless head: its byte stands alone. */
 		struct cds_ft_metadata *hmeta = cds_ft_item_to_metadata(cell);
 
-		if (n >= max_len)
+		if (pos == 0)
 			return 0;
-		out[n++] = (uint8_t) hmeta->incoming_byte;
+		out[--pos] = (uint8_t) hmeta->incoming_byte;
+	} else if (!ft_node_compressed(ft_resolve_skip_compressed(nf))) {
+		/*
+		 * Parent is an internal (slot-array) node.  Write the head's edge
+		 * byte ONLY when the head hangs off a SLOT.  A PREFIX key sits at the
+		 * parent's external_nodes -- the key ENDS at the parent, so its last
+		 * byte IS the parent's own incoming edge (written when the parent is
+		 * processed below) and must not be double-counted here.  Fixed-length
+		 * tries have no prefix keys, so this is always a slot head there.
+		 */
+		struct cds_ft_metadata *nmeta = ft_flag_to_metadata(nf);
+
+		if (cell->node !=
+				ft_dereference_external(nmeta->external_nodes)) {
+			struct cds_ft_metadata *hmeta =
+				cds_ft_item_to_metadata(cell);
+
+			if (pos == 0)
+				return 0;
+			out[--pos] = (uint8_t) hmeta->incoming_byte;
+		}
 	}
+	/* else parent compressed: the head byte is covered by its key_bytes. */
 
 	while (nf) {
 		struct cds_ft_inode_flag *rnf = ft_resolve_skip_compressed(nf);
@@ -8409,52 +8502,46 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 			const struct cds_ft_compressed_node *cn =
 				(const struct cds_ft_compressed_node *)
 				ft_node_ptr(rnf);
-			unsigned int k = cn->len;
+			unsigned int len = cn->len;
 
-			/* Compressed span, deepest byte first: key_bytes[len-1..0]. */
-			while (k-- > 0) {
-				if (n >= max_len)
-					return 0;
-				out[n++] = cn->key_bytes[k];
-			}
+			/*
+			 * Compressed span in key order (key_bytes[0..len)): it sits
+			 * immediately to the LEFT of what we've written so far, so a
+			 * single forward memcpy places it correctly.
+			 */
+			if (pos < len)
+				return 0;
+			pos -= len;
+			memcpy(&out[pos], cn->key_bytes, len);
 		}
 		/*
 		 * This node's incoming edge byte (the slot byte in its parent).
-		 * Contributed only when the PARENT is an internal (slot-array)
-		 * node: a compressed parent's last key_byte already IS this edge,
-		 * counted when that parent is processed -- so skip it here (mirrors
-		 * the head's skip when its parent is compressed).  The root has no
-		 * parent and contributes none.
+		 * Read meta->parent ONCE (resolving a concurrent bulk op's flip
+		 * proxy) and use it for both the compressed-parent test and the
+		 * advance.  Contributed only when the PARENT is an internal
+		 * (slot-array) node: a compressed parent's last key_byte already IS
+		 * this edge, counted when that parent is processed -- so skip it here
+		 * (mirrors the head's skip when its parent is compressed).  The root
+		 * has no parent and contributes none.
 		 */
-		if (meta->parent &&
-				!ft_node_compressed(ft_resolve_skip_compressed(meta->parent))) {
-			if (n >= max_len)
-				return 0;
-			out[n++] = (uint8_t) meta->incoming_byte;
+		{
+			struct cds_ft_inode_flag *parent =
+				ft_resolve_flip_proxy(rcu_dereference(meta->parent));
+
+			if (parent && !ft_node_compressed(
+					ft_resolve_skip_compressed(parent))) {
+				if (pos == 0)
+					return 0;
+				out[--pos] = (uint8_t) meta->incoming_byte;
+			}
+			nf = parent;
 		}
-		nf = rcu_dereference(meta->parent);
 	}
 
-	/* Reverse out[0..n) from deepest-first into key order. */
-	for (i = 0, j = n; i < j; ) {
-		uint8_t t = out[i];
-
-		out[i++] = out[--j];
-		out[j] = t;
-	}
-	return n;
+	/* Key now occupies out[pos .. max_len) in key order; length = max_len - pos. */
+	return max_len - pos;
 }
 #endif /* FEATURE_FT_ORD_CELL */
-
-/*
- * Sentinel stored in iter->key_len by the ordinal-cell land for a VARIABLE-
- * length identity group: the length is DEFERRED (it lives in the matched leaf
- * at key_len_offset) and resolved on demand by ft_iter_resolve_key_len(), so a
- * keyless cell walk reads neither the key nor the length from the leaf.
- * SIZE_MAX is never a valid key length (bounded by max_key_len), so a consumer
- * that forgets to resolve hits an obvious overflow, not a silently-stale value.
- */
-#define FT_ITER_KEY_LEN_LAZY	((size_t) -1)
 
 /*
  * Resolve (and cache) the iterator's current-position key length.  For a
@@ -8470,6 +8557,19 @@ static inline
 size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
 {
 	if (caa_unlikely(iter->key_len == FT_ITER_KEY_LEN_LAZY)) {
+#ifdef FEATURE_FT_ORD_CELL
+		/*
+		 * VARIABLE-length EAGER ordered-list (no in-leaf length at
+		 * key_len_offset): the parent up-walk derives the length -- and
+		 * fills iter_key in the same walk, which a following read_key then
+		 * reuses (the cell-walk's whole point: pay the O(depth) walk once,
+		 * on demand).  Otherwise read node->key_len from the leaf.
+		 */
+		if (!iter->ft->group->key_len_offset_set) {
+			ft_iter_upwalk_into_buf(iter);
+			return iter->key_len;
+		}
+#endif
 		iter->key_len = *(const size_t *) ((const char *) iter->node +
 			iter->ft->group->key_len_offset);
 		iter->path_len = iter->key_len + 1;
@@ -8490,8 +8590,19 @@ void ft_iter_materialize_key(struct cds_ft_iter *iter)
 	size_t klen = ft_iter_resolve_key_len(iter);
 	const uint8_t *cur = ft_iter_read_key(iter);
 
-	if (cur != iter_key(iter))
-		memcpy(iter_key(iter), cur, klen);
+	/*
+	 * Pin the current key at the FRONT of iter_key (key_off = 0).  The hot
+	 * cell-walk read keeps the up-walk key at the buffer TAIL (no move), but
+	 * materialize is the bind / UNCACHED path: the saved key must then be
+	 * re-descended from, and the relational descent reads its search key and
+	 * writes its result into the SAME iter_key buffer -- which is only safe
+	 * (result == search before divergence) when the key starts at offset 0.
+	 * memmove because @cur (the up-walk tail, or a leaf reference) may overlap.
+	 */
+	if (cur != iter_key(iter)) {
+		memmove(iter_key(iter), cur, klen);
+		iter->key_off = 0;
+	}
 }
 
 
@@ -8572,19 +8683,24 @@ static inline_lookup
 bool ft_ord_cell_fastpath_ok(const struct cds_ft *ft,
 		const struct cds_ft_iter *iter)
 {
+	/*
+	 * EAGER structural up-walk: an identity ordered-list group with NO in-leaf
+	 * key (no speculative_key_offset) gets BOTH the result key AND its length
+	 * from the parent up-walk (ft_iter_read_key / ft_iter_resolve_key_len), for
+	 * fixed OR variable length -- no in-leaf key and no key_len_offset needed.
+	 */
+	bool up_walk = ft->group->ordered_list_set &&
+		!ft->group->speculative_key_offset_set &&
+		ft->group->key_map.identity;
+
 	return ft->group->ordered_list_set &&
-		/* length obtainable: fixed key_len, or variable + key_len_offset */
-		(ft->group->key_len != CDS_FT_LEN_VARIABLE ||
+		(up_walk ||
+		 /* otherwise: length obtainable (fixed, or variable+key_len_offset) */
+		 (((ft->group->key_len != CDS_FT_LEN_VARIABLE ||
 			ft->group->key_len_offset_set) &&
-		/*
-		 * Result key obtainable: an in-leaf key (speculative_key_offset)
-		 * serves any length; without it, the structural up-walk rebuild
-		 * (ft_iter_read_key) covers FIXED-length keys -- so a fixed-length
-		 * EAGER trie needs no in-leaf key.  Variable-length still needs the
-		 * leaf key until the up-walk derives the length (follow-up).
-		 */
-		(ft->group->speculative_key_offset_set ||
-			ft->group->key_len != CDS_FT_LEN_VARIABLE) &&
+		 /* and key obtainable (in-leaf key, or fixed-length up-walk) */
+		   (ft->group->speculative_key_offset_set ||
+			ft->group->key_len != CDS_FT_LEN_VARIABLE)))) &&
 		iter->prefix_len == 0;
 }
 
@@ -22341,6 +22457,7 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
 	iter->key_len = key_len;
+	iter->key_off = 0;	/* search key sits at the front of iter_key */
 	FT_TP(iter_set_key_exit, (const void *) iter->ft, (const void *) iter,
 		(int) iter->path_len);
 	return CDS_FT_STATUS_OK;
