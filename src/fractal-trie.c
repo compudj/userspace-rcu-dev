@@ -8748,7 +8748,8 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
-		const bool use_keycopy)
+		const bool use_keycopy,
+		const bool seed_from_node)
 {
 	ssize_t key_depth, level;
 	struct cds_ft_inode_flag *node_flag;
@@ -8809,8 +8810,17 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	 * LAZY) length: the fast path advances via ord_next and never needs it.
 	 * Only a fall-through to the descent (cache invalid / scoped) resolves the
 	 * length where it is first used.
+	 *
+	 * @seed_from_node (a compile-time literal at every public instantiation, so
+	 * the gate DCEs there) suppresses this fast path for the splice-time
+	 * predecessor seed: that caller positions @iter at a FRESH head whose cell
+	 * is not yet spliced (its ord_prev/ord_next are unset), so the cell cursor
+	 * would resolve garbage.  It instead wants the cross-call node-recovery fast
+	 * path below, which reconstructs the going-up seed from iter->node and runs
+	 * the structural backtrack -- the predecessor among the ALREADY-linked keys.
 	 */
-	if ((mode == FT_LOOKUP_GT || mode == FT_LOOKUP_LT) &&
+	if (!seed_from_node &&
+			(mode == FT_LOOKUP_GT || mode == FT_LOOKUP_LT) &&
 			limit == FT_LOOKUP_LIMIT_NONE &&
 			iter->cache_valid && iter->node &&
 			ft_ord_cell_fastpath_ok(ft, iter)) {
@@ -9995,8 +10005,8 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 {
 	if (ft->group->speculative_key_offset_set && ft->group->speculative &&
 			(ft->group->flags & CDS_FT_FLAG_SKIP_COMPRESSED))
-		return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, true);
-	return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, false);
+		return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, true, false);
+	return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, false, false);
 }
 
 /*
@@ -10013,7 +10023,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	{								\
 		CDS_FT_SCOPED_READER(ft);				\
 		return cds_ft_lookup_inequality_impl(ft, iter,		\
-				(mode), FT_LOOKUP_LIMIT_NONE, (kc));	\
+				(mode), FT_LOOKUP_LIMIT_NONE, (kc), false); \
 	}
 FT_INEQ_SPEC(ft_ineq_le_keycopy, FT_LOOKUP_LE, true)
 FT_INEQ_SPEC(ft_ineq_le_eager,   FT_LOOKUP_LE, false)
@@ -17948,12 +17958,62 @@ struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
 	it->prefix_len = 0;
 	it->node = NULL;
 	if (cds_ft_lookup_inequality_impl(ft, it, mode, FT_LOOKUP_LIMIT_NONE,
-			false) != CDS_FT_STATUS_OK)
+			false, false) != CDS_FT_STATUS_OK)
 		return NULL;
 	head = cds_ft_iter_node(it);
 	if (!head)
 		return NULL;
 	return ft_ord_cell_ptr(rcu_dereference(head->prev));
+}
+
+/*
+ * Find the cell of the in-order predecessor of the freshly-inserted head
+ * carried by @cell, WITHOUT re-descending from the root.  The insert just
+ * walked root->leaf to attach the head, so its deepest node is the going-up
+ * seed: position the writer's scratch iterator AT the new head (a live cursor)
+ * and re-enter the relational lookup, which recovers the deepest node from
+ * iter->node via the parent chain (its cross-call fast path) and runs the SAME
+ * structural backtrack the key-based descent would -- but starting at the
+ * divergence point instead of the root.  @seed_from_node suppresses the
+ * ordinal-cell fast path (the new head's cell is not yet spliced).
+ *
+ * @key / @key_len are the head's APPLICATION-form key (set_key remaps): the
+ * search key is written straight into iter_key (a memcpy, no up-walk), and the
+ * cursor fields are seeded on top so read_key returns that buffer.
+ *
+ * Returns the predecessor cell, or NULL when the head's key is the new minimum.
+ * A compressed/skip-compressed holder makes the impl fall back to a root
+ * re-descent internally (correctness preserved, no descent saved for that key).
+ */
+static
+struct ft_ord_cell *ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, struct ft_ord_cell *cell)
+{
+	struct cds_ft_iter *it = ft->ord_cell_scratch_iter;
+	struct cds_ft_node *pred_head;
+
+	/*
+	 * Write the search key into iter_key (set_key clears cache_valid/node and
+	 * sets key_len + key_off=0, path_len=0), then seed a live cursor AT the new
+	 * head on top: cache_valid + node + path_len==key_depth drive the
+	 * cross-call node-recovery fast path; prefix 0 = unscoped; ord_cell_node
+	 * cleared so a fall-back cell cursor re-resolves from node->prev.
+	 */
+	it->node = NULL;
+	if (cds_ft_iter_set_key(it, key, key_len) != CDS_FT_STATUS_OK)
+		return NULL;
+	it->node = cell->node;
+	it->cache_valid = true;
+	it->ord_cell_node = NULL;
+	it->prefix_len = 0;
+	it->path_len = it->key_len + 1;
+	if (cds_ft_lookup_inequality_impl(ft, it, FT_LOOKUP_LT,
+			FT_LOOKUP_LIMIT_NONE, false, true) != CDS_FT_STATUS_OK)
+		return NULL;
+	pred_head = cds_ft_iter_node(it);
+	if (!pred_head)
+		return NULL;
+	return ft_ord_cell_ptr(rcu_dereference(pred_head->prev));
 }
 
 /* Splice the cell of a freshly-inserted head into the ordered cell list. */
@@ -17965,11 +18025,12 @@ void ft_ord_cell_splice(struct cds_ft *ft, const uint8_t *key, size_t key_len,
 	struct ft_ord_cell_edge edges[4];
 	unsigned int n = 0;
 
-	pred = ft_ord_cell_find_rel(ft, key, key_len, FT_LOOKUP_LT);
+	pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell);
 	if (pred)
 		succ = ft_ord_cell_resolve_ord(&pred->ord_next);
 	else
-		succ = ft_ord_cell_find_rel(ft, key, key_len, FT_LOOKUP_GT);
+		/* New minimum: successor is the old list head (O(1), no descent). */
+		succ = ft_ord_cell_resolve_ord(&ft->ord_cell_head);
 	/* Pre-set @cell's own links; not yet reachable via the list. */
 	cell->ord_prev = pred;
 	cell->ord_next = succ;
@@ -18284,7 +18345,7 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		it->prefix_len = 0;
 		it->key_off = 0;
 		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
-				FT_LOOKUP_LIMIT_FIRST, false) != CDS_FT_STATUS_OK)
+				FT_LOOKUP_LIMIT_FIRST, false, false) != CDS_FT_STATUS_OK)
 			return;
 	} else {
 		if (cds_ft_iter_set_key(it, dst_key, dst_key_len) != CDS_FT_STATUS_OK)
@@ -18293,7 +18354,7 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		it->node = NULL;
 		it->cache_valid = false;
 		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
-				FT_LOOKUP_LIMIT_NONE, false) != CDS_FT_STATUS_OK)
+				FT_LOOKUP_LIMIT_NONE, false, false) != CDS_FT_STATUS_OK)
 			return;
 	}
 	/*
@@ -18337,7 +18398,7 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 				it->cache_valid = false;
 				if (cds_ft_lookup_inequality_impl(dst, it,
 						FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE,
-						false) != CDS_FT_STATUS_OK)
+						false, false) != CDS_FT_STATUS_OK)
 					break;
 			}
 			return;
@@ -18393,7 +18454,7 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 			}
 			it->cache_valid = false;	/* force the descent oracle */
 			if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GT,
-					FT_LOOKUP_LIMIT_NONE, false) != CDS_FT_STATUS_OK)
+					FT_LOOKUP_LIMIT_NONE, false, false) != CDS_FT_STATUS_OK)
 				break;
 		}
 		/*
@@ -22255,7 +22316,7 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 	iter->prefix_len = 0;
 	iter->cache_valid = false;	/* force descent oracle */
 	cds_ft_lookup_inequality_impl(ft, iter, FT_LOOKUP_GE,
-			FT_LOOKUP_LIMIT_FIRST, false);
+			FT_LOOKUP_LIMIT_FIRST, false, false);
 	trie_head = cds_ft_iter_node(iter);
 	cell = ft->ord_cell_head;
 	if (trie_head &&
@@ -22302,7 +22363,7 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 		cell = next_cell;
 		iter->cache_valid = false;	/* force descent oracle */
 		cds_ft_lookup_inequality_impl(ft, iter, FT_LOOKUP_GT,
-				FT_LOOKUP_LIMIT_NONE, false);
+				FT_LOOKUP_LIMIT_NONE, false, false);
 	}
 	if (cell != NULL) {
 		if (out)
