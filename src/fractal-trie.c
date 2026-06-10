@@ -9936,10 +9936,12 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_first\n");
 #ifdef FEATURE_FT_ORD_CELL
-	/* O(1) endpoint: the ordinal-cell list's minimum cell (unscoped only). */
+	/* O(1) endpoint: the ordinal-cell list's minimum cell (unscoped only).
+	 * Resolve a flip proxy: head/tail transition atomically with the
+	 * neighbour edges during a concurrent splice/unsplice/run move. */
 	if (ft_ord_cell_fastpath_ok(ft, iter))
 		return ft_ord_cell_iter_land(ft, iter,
-			rcu_dereference(ft->ord_cell_head));
+			ft_ord_cell_resolve_ord(&ft->ord_cell_head));
 #endif
 	/*
 	 * LIMIT_FIRST sets key_len to prefix_len internally.
@@ -9967,10 +9969,11 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_last\n");
 #ifdef FEATURE_FT_ORD_CELL
-	/* O(1) endpoint: the ordinal-cell list's maximum cell (unscoped only). */
+	/* O(1) endpoint: the ordinal-cell list's maximum cell (unscoped only).
+	 * Resolve a flip proxy (see cds_ft_lookup_first). */
 	if (ft_ord_cell_fastpath_ok(ft, iter))
 		return ft_ord_cell_iter_land(ft, iter,
-			rcu_dereference(ft->ord_cell_tail));
+			ft_ord_cell_resolve_ord(&ft->ord_cell_tail));
 #endif
 	/*
 	 * LIMIT_LAST always uses key_len = max_key_len. When
@@ -17452,6 +17455,29 @@ struct ft_ord_cell_edge {
 	struct ft_ord_cell *new_target;
 };
 
+/*
+ * Append an endpoint (ord_cell_head / ord_cell_tail) update to a flip-edge batch
+ * when @slot currently holds @match, so the endpoint transitions ATOMICALLY with
+ * the neighbour edges in the same flip: a reader resolving ord_cell_head/tail via
+ * ft_ord_cell_resolve_ord then sees a consistent old-XOR-new view (it never
+ * observes the old head pointer together with an already-flipped back-edge).
+ * @match/@newval may be NULL (empty-list transitions); the proxy mechanism and
+ * the *slot == @match guard both handle NULL.  Returns the new edge count.
+ */
+static
+unsigned int ft_ord_cell_endpoint_edge(struct ft_ord_cell **slot,
+		struct ft_ord_cell *match, struct ft_ord_cell *newval,
+		struct ft_ord_cell_edge *edges, unsigned int n)
+{
+	if (*slot == match) {
+		edges[n].slot = slot;
+		edges[n].old_target = match;
+		edges[n].new_target = newval;
+		n++;
+	}
+	return n;
+}
+
 static
 void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		unsigned int n)
@@ -17509,7 +17535,7 @@ void ft_ord_cell_splice(struct cds_ft *ft, const uint8_t *key, size_t key_len,
 		struct ft_ord_cell *cell)
 {
 	struct ft_ord_cell *pred, *succ;
-	struct ft_ord_cell_edge edges[2];
+	struct ft_ord_cell_edge edges[4];
 	unsigned int n = 0;
 
 	pred = ft_ord_cell_find_rel(ft, key, key_len, FT_LOOKUP_LT);
@@ -17532,11 +17558,10 @@ void ft_ord_cell_splice(struct cds_ft *ft, const uint8_t *key, size_t key_len,
 		edges[n].new_target = cell;
 		n++;
 	}
+	/* New min (!pred) => head was @succ; new max (!succ) => tail was @pred. */
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, succ, cell, edges, n);
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, pred, cell, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
-	if (!pred)
-		rcu_assign_pointer(ft->ord_cell_head, cell);
-	if (!succ)
-		rcu_assign_pointer(ft->ord_cell_tail, cell);
 }
 
 /* Remove @cell from the ordered cell list (its key disappeared). */
@@ -17545,7 +17570,7 @@ void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell)
 {
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&cell->ord_prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&cell->ord_next);
-	struct ft_ord_cell_edge edges[2];
+	struct ft_ord_cell_edge edges[4];
 	unsigned int n = 0;
 
 	if (pred) {
@@ -17560,12 +17585,10 @@ void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell)
 		edges[n].new_target = pred;
 		n++;
 	}
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, cell, succ, edges, n);
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, cell, pred, edges, n);
 	/* @cell keeps its links for parked readers until its deferred free. */
 	ft_ord_cell_flip(ft, edges, n);
-	if (ft->ord_cell_head == cell)
-		rcu_assign_pointer(ft->ord_cell_head, succ);
-	if (ft->ord_cell_tail == cell)
-		rcu_assign_pointer(ft->ord_cell_tail, pred);
 }
 
 /*
@@ -17581,7 +17604,7 @@ void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 {
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->ord_prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->ord_next);
-	struct ft_ord_cell_edge edges[2];
+	struct ft_ord_cell_edge edges[4];
 	unsigned int n = 0;
 
 	new_cell->ord_prev = pred;
@@ -17598,11 +17621,9 @@ void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		edges[n].new_target = new_cell;
 		n++;
 	}
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, old_cell, new_cell, edges, n);
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, old_cell, new_cell, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
-	if (ft->ord_cell_head == old_cell)
-		rcu_assign_pointer(ft->ord_cell_head, new_cell);
-	if (ft->ord_cell_tail == old_cell)
-		rcu_assign_pointer(ft->ord_cell_tail, new_cell);
 }
 #endif /* FEATURE_FT_ORD_CELL */
 
