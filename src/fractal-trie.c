@@ -2821,6 +2821,25 @@ void ft_set_parent(struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_metadata *meta =
 			cds_ft_item_to_metadata(ft_node_ptr(child_nf));
 
+		/*
+		 * Publish the up-walk key byte BEFORE the parent pointer.  A node
+		 * re-homed from a COMPRESSED parent (which skips incoming_byte,
+		 * leaving it 0) to an INTERNAL parent gets its real branch byte
+		 * here.  If we published meta->parent first (as ft_set_parent_slot
+		 * needs, to compute the offset) a concurrent up-walk that follows
+		 * the new parent would read the still-stale 0 byte and reconstruct
+		 * a key with a hole at this level.  Pre-store it under the explicit
+		 * @parent_nf and let the rcu_assign release order it; ft_set_parent_
+		 * slot below recomputes the same byte (idempotent) plus the offset.
+		 */
+		if (slot && parent_nf && !ft_node_compressed(parent_nf)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				&& !ft_node_skip_compressed(parent_nf)
+#endif
+		   )
+			meta->incoming_byte = ft_slot_to_byte(
+				&ft_types[ft_node_type(parent_nf)],
+				ft_node_ptr(parent_nf), slot);
 		rcu_assign_pointer(meta->parent, parent_nf);
 		ft_set_parent_slot(meta, slot);
 	}
