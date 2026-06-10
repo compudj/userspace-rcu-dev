@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 234
+#define NR_TESTS 235
 #else
-#define NR_TESTS 223
+#define NR_TESTS 224
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4257,6 +4257,97 @@ static int test_inequality_extends_prefix(void)
 		}
 		rcu_read_unlock();
 	}
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Inequality lookups of the EMPTY (NIL) key.  Regression for cds_ft_lookup_lt
+ * / cds_ft_lookup_le returning the global max instead of NOT_FOUND: the empty
+ * key is the global minimum, so nothing is < "" (LT) and the only <= match is
+ * the "" key itself (LE).  The going-up backtrack does not run for a
+ * zero-length key, so the search wrongly fell through to a max descent.
+ */
+static int test_inequality_empty_key(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	const char *words[] = { "a", "ab", "abc" };
+	unsigned int i;
+	int ret = -1;
+	uint8_t rk[64]; size_t rl;
+	struct ft_test_node *niln;
+	enum cds_ft_status s;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) words[i],
+				  strlen(words[i]), &n->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+	rcu_read_lock();
+	/* No "" key yet: LT/LE of "" are NOT_FOUND; GT/GE of "" are "a". */
+	cds_ft_iter_set_key(iter, (const uint8_t *) "", 0);
+	s = cds_ft_lookup_lt(ft, iter);
+	if (s == CDS_FT_STATUS_OK && cds_ft_iter_node(iter)) {
+		fprintf(stderr, "LT(\"\"): expected NOT_FOUND\n");
+		rcu_read_unlock(); goto out;
+	}
+	cds_ft_iter_set_key(iter, (const uint8_t *) "", 0);
+	s = cds_ft_lookup_le(ft, iter);
+	if (s == CDS_FT_STATUS_OK && cds_ft_iter_node(iter)) {
+		fprintf(stderr, "LE(\"\"): expected NOT_FOUND (no \"\" key)\n");
+		rcu_read_unlock(); goto out;
+	}
+	cds_ft_iter_set_key(iter, (const uint8_t *) "", 0);
+	if (cds_ft_lookup_ge(ft, iter) != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+		fprintf(stderr, "GE(\"\"): expected \"a\"\n");
+		rcu_read_unlock(); goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof rk, &rl); rk[rl] = '\0';
+	if (rl != 1 || rk[0] != 'a') {
+		fprintf(stderr, "GE(\"\"): got '%s', expected 'a'\n", (char *) rk);
+		rcu_read_unlock(); goto out;
+	}
+	rcu_read_unlock();
+	/* Now insert "" : LE("") returns "", LT("") still NOT_FOUND. */
+	niln = node_alloc(0);
+	rcu_read_lock();
+	if (cds_ft_insert(ft, NULL, 0, &niln->node) < 0) { rcu_read_unlock(); goto out; }
+	cds_ft_iter_set_key(iter, (const uint8_t *) "", 0);
+	if (cds_ft_lookup_le(ft, iter) != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+		fprintf(stderr, "LE(\"\") with \"\" present: expected the \"\" key\n");
+		rcu_read_unlock(); goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+	if (rl != 0) {
+		fprintf(stderr, "LE(\"\"): expected zero-length key, got len %zu\n", rl);
+		rcu_read_unlock(); goto out;
+	}
+	cds_ft_iter_set_key(iter, (const uint8_t *) "", 0);
+	s = cds_ft_lookup_lt(ft, iter);
+	if (s == CDS_FT_STATUS_OK && cds_ft_iter_node(iter)) {
+		fprintf(stderr, "LT(\"\") with \"\" present: expected NOT_FOUND\n");
+		rcu_read_unlock(); goto out;
+	}
+	rcu_read_unlock();
 	ret = 0;
 out:
 	cds_ft_iter_destroy(iter);
@@ -17551,6 +17642,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_varlen_string_basic);
 	RUN_TEST(test_inequality_prefix_key);
 	RUN_TEST(test_inequality_extends_prefix);
+	RUN_TEST(test_inequality_empty_key);
 
 	/* 9. Graft, graft_swap & detach */
 	diag("Graft, graft_swap & detach tests");

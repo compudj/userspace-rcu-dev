@@ -9254,6 +9254,55 @@ post_traversal:
 			!ft_node_external(node_flag))
 		goto descend_children;
 
+	/*
+	 * LE/LT, relational (LIMIT_NONE), with the search key exhausted at or
+	 * above the prefix boundary: the empty key (level == prefix_len == 0), or
+	 * a query equal to the scope prefix.  The going-up loop below would not
+	 * run (no shorter key to back-track to) and control would fall through to
+	 * descend_children, wrongly returning the subtree MAX.  No key is strictly
+	 * less than the boundary; the only <= match is the boundary node's own
+	 * external_nodes, which LE returns and LT excludes -> NOT_FOUND otherwise.
+	 * (LIMIT_FIRST/LAST want the subtree min/max here, so they are excluded.)
+	 */
+	if (limit == FT_LOOKUP_LIMIT_NONE &&
+			(mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) &&
+			level <= (ssize_t) iter->prefix_len && node_flag &&
+			!ft_node_external(node_flag)) {
+		struct cds_ft_node *ext = NULL;
+
+		if (mode == FT_LOOKUP_LE) {
+			struct cds_ft_metadata *m;
+
+			if (ft_node_compressed(node_flag))
+				m = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+			else
+				m = cds_ft_item_to_metadata_fast(ft_node_ptr(node_flag),
+					ft_types[ft_node_type(node_flag)].order);
+			ext = ft_dereference_external(m->external_nodes);
+		}
+		if (ext) {
+			int j;
+
+			iter->key_len = iter->prefix_len;
+			if (!keep_ordinal)
+				ft_speculative_keycopy_unconditional(ft, ext,
+					iter_key(iter), (ssize_t) iter->prefix_len);
+			else if (!ft_speculative_keycopy(ft, ext, iter_key(iter),
+					(ssize_t) iter->prefix_len)) {
+				for (j = 0; j < (int) iter->prefix_len; j++)
+					iter_key(iter)[j] = ordinal_key[j];
+			}
+			iter->node = ext;
+		} else {
+			iter->node = NULL;
+		}
+		iter->cache_valid = true;
+		iter_debug_path_update(iter);
+		iter->path_len = iter->prefix_len + 1;
+		iter->status = ext ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+		goto end;
+	}
+
 going_up:
 	/* Ensure iter_key is exactly at the position matching the level we stopped at. */
 	iter_key = input_key + level;
