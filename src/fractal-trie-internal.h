@@ -371,7 +371,7 @@
  * through the cell), so a group that never enables ordered_list still pays that
  * per-head cell + parent indirection.
  */
-#ifndef NO_FEATURE_FT_ORD_CELL
+#if !defined(NO_FEATURE_FT_ORD_CELL) && !defined(FEATURE_FT_ORD_CELL)
 # define FEATURE_FT_ORD_CELL
 #endif
 
