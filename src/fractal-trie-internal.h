@@ -364,10 +364,17 @@
  * (the per-step random leaf load dependency is what makes the in-leaf
  * chain latency-bound).  Cells are kept reader-coherent via the flip-latch.
  *
- * COMPILE-TIME (enable with -DFEATURE_FT_ORD_CELL) but RUNTIME-GATED per
- * group (cds_ft_group_attr_set_ordered_list): an unset group is unchanged
- * and pays nothing.
+ * Compiled in by DEFAULT; disable with -DNO_FEATURE_FT_ORD_CELL.  The ordered
+ * sibling LIST is runtime-gated per group (cds_ft_group_attr_set_ordered_list):
+ * an unset group skips all list maintenance.  The library-owned cell itself is
+ * allocated per head regardless ("cell-always", so the head's parent is reached
+ * through the cell), so a group that never enables ordered_list still pays that
+ * per-head cell + parent indirection.
  */
+#ifndef NO_FEATURE_FT_ORD_CELL
+# define FEATURE_FT_ORD_CELL
+#endif
+
 #ifdef FEATURE_FT_ORD_CELL
 /*
  * Library-owned ordinal cell: one per distinct-key duplicate-chain head.
