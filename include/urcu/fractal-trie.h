@@ -1205,26 +1205,6 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
 			cds_ft_next((ft), (iter)))
 
 /*
- * cds_ft_iter_next_batch - Fetch the next run of in-order nodes into a buffer.
- * @ft: The Fractal Trie.
- * @iter: Iterator positioned at the first node to emit (e.g. by
- *        cds_ft_lookup_first); advanced past the emitted run.
- * @buf: Caller buffer receiving up to @cap (struct cds_ft_node *) in key order.
- * @cap: Capacity of @buf.
- *
- * Returns the number of nodes written (0 at end of trie).  The ordered
- * cell-list walk (Option E) advances the whole run inside this one call, so
- * the per-step library-call boundary is amortized across @cap nodes; it falls
- * back to per-step cds_ft_next() when the cell fast path is unavailable, so
- * unlike the node-cursor cds_ft_node_next_batch() this iterator-based variant
- * works on a list-off trie too (the iterator carries the key).  RCU read lock
- * rules are those of cds_ft_for_each_rcu().  (The cds_ft_for_each_batched_rcu
- * macro is built on the iterator-free cds_ft_node_next_batch(), not this.)
- */
-size_t cds_ft_iter_next_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
-		struct cds_ft_node **buf, size_t cap);
-
-/*
  * cds_ft_for_each_batched_rcu - In-order traversal, batched (amortized calls).
  * @ft: The Fractal Trie (struct cds_ft *).
  * @node: Loop variable (struct cds_ft_node *), set to each head in key order.
@@ -1267,16 +1247,6 @@ size_t cds_ft_iter_next_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
 		)								\
 		for (; _ftb.i < _ftb.n &&					\
 				(((node) = (buf)[_ftb.i]), 1); _ftb.i++)
-
-/*
- * cds_ft_iter_prev_batch - Fetch the next run of REVERSE in-order nodes.
- * The descending-key-order counterpart of cds_ft_iter_next_batch(): emits
- * @iter's current node and its predecessors (via the ordered cell list's
- * ord_prev) into @buf, up to @cap, advancing @iter; returns the count (0 at the
- * start of the trie).  Start at cds_ft_lookup_last().
- */
-size_t cds_ft_iter_prev_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
-		struct cds_ft_node **buf, size_t cap);
 
 /*
  * cds_ft_for_each_reverse_batched_rcu - Reverse in-order traversal, batched.
@@ -2686,7 +2656,7 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
 /*
  * cds_ft_node_get_key - Materialize a key from a bare external node pointer.
  * @ft: The Fractal Trie @node belongs to.
- * @node: An external head node (e.g. one returned by cds_ft_iter_next_batch).
+ * @node: An external head node (e.g. one returned by cds_ft_node_next_batch).
  * @result_key: Output buffer for the key.
  * @result_key_max_len: Size of the @result_key buffer.
  * @result_key_len: Length of the key written (output).
@@ -2702,7 +2672,7 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
  * section because it materializes the key into its own storage -- a bare node
  * pointer must NOT outlive its read-side critical section.  This is the
  * within-CS companion to the iterator, for tight batched scans (pair it with
- * cds_ft_iter_next_batch() / cds_ft_iter_prev_batch()).
+ * cds_ft_node_next_batch() / cds_ft_node_prev_batch()).
  *
  * Returns CDS_FT_STATUS_OK on success.
  * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the buffer is too small.

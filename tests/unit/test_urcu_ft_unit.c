@@ -1602,15 +1602,11 @@ static int test_node_get_key(void)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_ft(4, &group);
-	struct cds_ft_iter *iter;
 	struct cds_ft_node *buf[16];
+	const struct cds_ft_node *cur;
 	unsigned long i, seen = 0;
+	size_t got, b;
 
-	if (cds_ft_iter_create(ft, &iter) < 0) {
-		cds_ft_destroy(ft);
-		cds_ft_group_destroy(group);
-		return -1;
-	}
 	for (i = 0; i < 10; i++) {
 		struct ft_test_node *n = node_alloc(i);
 
@@ -1622,38 +1618,34 @@ static int test_node_get_key(void)
 		rcu_read_unlock();
 	}
 
-	/* One continuous read-side critical section: node pointers are valid. */
+	/*
+	 * One continuous read-side critical section: node pointers are valid.
+	 * Gather heads with the iterator-free node-cursor batch (NO iterator),
+	 * then materialize each key with cds_ft_node_get_key.
+	 */
 	rcu_read_lock();
-	if (cds_ft_lookup_first(ft, iter) != CDS_FT_STATUS_OK) {
-		rcu_read_unlock();
-		fprintf(stderr, "node_get_key: lookup_first failed\n");
-		goto fail;
-	}
-	for (;;) {
-		size_t got = cds_ft_iter_next_batch(ft, iter, buf, 16);
-		size_t b;
+	cur = NULL;
+	do {
+		enum cds_ft_status bs = cds_ft_node_next_batch(ft, cur, buf, 16,
+				&got, &cur);
 
-		if (!got)
-			break;
+		if (bs == CDS_FT_STATUS_NOT_SUPPORTED) {
+			/* No ordered list (and no in-leaf key): N/A -- pass. */
+			rcu_read_unlock();
+			return drain_and_destroy(ft, group);
+		}
+		if (bs != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "node_get_key: batch status %d\n", (int) bs);
+			goto fail;
+		}
 		for (b = 0; b < got; b++) {
 			uint8_t k[4];
 			size_t klen;
 			uint64_t v;
-			enum cds_ft_status s = cds_ft_node_get_key(ft, buf[b],
-					k, sizeof(k), &klen);
 
-			if (s == CDS_FT_STATUS_NOT_FOUND) {
-				/*
-				 * A build with neither an in-leaf key nor an
-				 * ordered list (e.g. -DNO_FEATURE_FT_ORD_CELL)
-				 * cannot materialize a key from a node alone.
-				 * Not applicable -- pass.
-				 */
-				rcu_read_unlock();
-				cds_ft_iter_destroy(iter);
-				return drain_and_destroy(ft, group);
-			}
-			if (s != CDS_FT_STATUS_OK || klen != 4) {
+			if (cds_ft_node_get_key(ft, buf[b], k, sizeof(k), &klen)
+					!= CDS_FT_STATUS_OK || klen != 4) {
 				rcu_read_unlock();
 				fprintf(stderr, "node_get_key: bad result at %lu\n",
 					seen);
@@ -1668,17 +1660,15 @@ static int test_node_get_key(void)
 			}
 			seen++;
 		}
-	}
+	} while (cur);
 	rcu_read_unlock();
 	if (seen != 10) {
 		fprintf(stderr, "node_get_key: saw %lu of 10 keys\n", seen);
 		goto fail;
 	}
 
-	cds_ft_iter_destroy(iter);
 	return drain_and_destroy(ft, group);
 fail:
-	cds_ft_iter_destroy(iter);
 	drain_and_destroy(ft, group);
 	return -1;
 }
