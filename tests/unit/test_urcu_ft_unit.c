@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 239
+#define NR_TESTS 240
 #else
-#define NR_TESTS 228
+#define NR_TESTS 229
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1855,6 +1855,203 @@ static int test_node_get_key_no_list(void)
 
 	return drain_and_destroy(ft, group);
 fail:
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * Full point-operation battery on a runtime ordered-list-OFF trie
+ * (cds_ft_group_attr_set_no_ordered_list): with the list off the library
+ * allocates NO ordinal cells, so a head's prev IS its flagged parent directly
+ * and every op runs the no-cell branch (insert / point lookup / ordered
+ * iteration via descent / remove / duplicate-head promotion / remove_all).
+ * Structure is checked by FEATURE_FT_VERIFY_AT_MUTATION on every mutation;
+ * results are checked against the nodes' shadow keys (a no-in-leaf trie cannot
+ * materialize a key from a node alone with the list off, so iteration reads the
+ * node returned by the iterator, not cds_ft_node_get_key).
+ */
+static int test_list_off_ops(void)
+{
+	static const uint64_t in[] = { 30, 10, 40, 20, 50, 90, 25, 60 };
+	static const uint64_t sorted[] = { 10, 20, 25, 30, 40, 50, 60, 90 };
+	const unsigned int N = 8;
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *found, *head, *tmp;
+	struct ft_test_node *dup;
+	unsigned int i, seen;
+	uint64_t prev;
+	enum cds_ft_status s;
+	uint8_t k[8];
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_key_len(attr, 8) < 0 ||
+			cds_ft_group_attr_set_no_ordered_list(attr) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Insert the distinct keys (no cell: list off). */
+	for (i = 0; i < N; i++) {
+		rcu_read_lock();
+		s = insert_u64(ft, in[i], node_alloc(in[i]));
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "list_off: insert %lu\n", (unsigned long) in[i]);
+			goto fail;
+		}
+	}
+	/* A duplicate at key 10 -> a dup chain (head-removal promotion below). */
+	dup = node_alloc(10);
+	rcu_read_lock();
+	s = insert_u64(ft, 10, dup);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK)
+		goto fail;
+
+	/* Point lookups: every distinct key present + shadow match; a phantom is absent. */
+	for (i = 0; i < N; i++) {
+		rcu_read_lock();
+		s = lookup_u64(ft, in[i], &found);
+		if (s != CDS_FT_STATUS_OK || !found ||
+				to_test_node(found)->key != in[i]) {
+			rcu_read_unlock();
+			fprintf(stderr, "list_off: lookup %lu\n", (unsigned long) in[i]);
+			goto fail;
+		}
+		rcu_read_unlock();
+	}
+	rcu_read_lock();
+	s = lookup_u64(ft, 999, &found);
+	rcu_read_unlock();
+	if (s == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "list_off: phantom hit\n");
+		goto fail;
+	}
+
+	/* Forward ordered iteration via DESCENT (no cell list): lookup_first + next,
+	 * reading each head node's shadow key -> must be ascending == sorted. */
+	rcu_read_lock();
+	seen = 0;
+	prev = 0;
+	for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_next(ft, iter)) {
+		uint64_t v = to_test_node(cds_ft_iter_node(iter))->key;
+
+		if (seen >= N || v != sorted[seen] || (seen && v <= prev)) {
+			rcu_read_unlock();
+			fprintf(stderr, "list_off: fwd[%u]=%lu\n", seen,
+				(unsigned long) v);
+			goto fail;
+		}
+		prev = v;
+		seen++;
+	}
+	rcu_read_unlock();
+	if (seen != N) {
+		fprintf(stderr, "list_off: fwd saw %u/%u\n", seen, N);
+		goto fail;
+	}
+
+	/* Reverse iteration: lookup_last + prev -> descending. */
+	rcu_read_lock();
+	seen = 0;
+	for (s = cds_ft_lookup_last(ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_prev(ft, iter)) {
+		uint64_t v = to_test_node(cds_ft_iter_node(iter))->key;
+
+		if (seen >= N || v != sorted[N - 1 - seen]) {
+			rcu_read_unlock();
+			fprintf(stderr, "list_off: rev[%u]=%lu\n", seen,
+				(unsigned long) v);
+			goto fail;
+		}
+		seen++;
+	}
+	rcu_read_unlock();
+	if (seen != N)
+		goto fail;
+
+	/* Remove a distinct key (40): absent afterwards. */
+	rcu_read_lock();
+	cds_ft_u64_to_key(ft, 40, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	found = cds_ft_iter_node(iter);
+	if (!found || cds_ft_remove(ft, iter, found) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "list_off: remove 40\n");
+		goto fail;
+	}
+	node_free_rcu(to_test_node(found));
+	rcu_read_unlock();
+	rcu_read_lock();
+	s = lookup_u64(ft, 40, &found);
+	rcu_read_unlock();
+	if (s == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "list_off: 40 survived remove\n");
+		goto fail;
+	}
+
+	/* Remove the dup key's chain HEAD: promotion keeps key 10 present. */
+	rcu_read_lock();
+	cds_ft_u64_to_key(ft, 10, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	found = cds_ft_iter_node(iter);
+	if (!found || cds_ft_remove(ft, iter, found) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto fail;
+	}
+	node_free_rcu(to_test_node(found));
+	rcu_read_unlock();
+	rcu_read_lock();
+	s = lookup_u64(ft, 10, &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !found || to_test_node(found)->key != 10) {
+		fprintf(stderr, "list_off: 10 lost on head-promotion\n");
+		goto fail;
+	}
+
+	/* remove_all the remaining 10: key disappears. */
+	rcu_read_lock();
+	cds_ft_u64_to_key(ft, 10, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	if (cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto fail;
+	}
+	cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+		node_free_rcu(to_test_node(head));
+	rcu_read_unlock();
+	rcu_read_lock();
+	s = lookup_u64(ft, 10, &found);
+	rcu_read_unlock();
+	if (s == CDS_FT_STATUS_OK)
+		goto fail;
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+fail:
+	cds_ft_iter_destroy(iter);
 	drain_and_destroy(ft, group);
 	return -1;
 }
@@ -17931,6 +18128,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_node_get_key);
 	RUN_TEST(test_node_batch);
 	RUN_TEST(test_node_get_key_no_list);
+	RUN_TEST(test_list_off_ops);
 	RUN_TEST(test_lookup_nth_basic);
 	RUN_TEST(test_lookup_nth_last);
 	RUN_TEST(test_lookup_nth_duplicates);

@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	23
+#define NR_TESTS	24
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -273,6 +273,38 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen, struct cds_ft_group **gro
 			offsetof(struct ft_test_node, okey)) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * Like create_fixed_ft, but UNCONDITIONALLY disables the ordered list
+ * (cds_ft_group_attr_set_no_ordered_list), so the group allocates NO ordinal
+ * cells: a head's prev is the flagged parent directly.  Used by the dedicated
+ * no-cell concurrent invariant so the runtime cell-optional read path
+ * (ft_resolve_head_prev prev-direct, skip resolution, parent backtrack) is
+ * exercised in the default test pass regardless of FT_INV_NO_ORDERED_LIST.
+ */
+static struct cds_ft *create_fixed_nolist_ft(size_t klen, struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_speculative_key_offset(attr,
+			offsetof(struct ft_test_node, okey)) < 0)
+		abort();
+	if (cds_ft_group_attr_set_no_ordered_list(attr) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -1242,6 +1274,90 @@ static int inv_dup_chain_acyclicity(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_dup_chain_acyclicity: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
+/*   INVARIANT: Ordered-list-OFF (no-cell) consistency                */
+/*                                                                    */
+/*   A group with the ordered list disabled allocates NO ordinal      */
+/*   cells: a head's prev is the flagged parent directly, so the      */
+/*   read path resolves it prev-direct (ft_resolve_head_prev), and    */
+/*   skip resolution / parent backtrack run the no-cell branch.       */
+/*   Stress that path under concurrent insert/remove: lookups must    */
+/*   return the right node (shadow-key check) and duplicate chains    */
+/*   must stay acyclic.  This gives the runtime cell-optional path     */
+/*   standing concurrent coverage in the default pass, independent of */
+/*   the FT_INV_NO_ORDERED_LIST env knob.                             */
+/*                                                                    */
+/* ================================================================== */
+
+static int inv_no_ordered_list_consistency(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_nolist_ft(4, &group);
+	struct inv_lookup_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_no_ordered_list_consistency";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	/* Pre-populate. */
+	rcu_read_lock();
+	for (i = 0; i < WRITER_POOL_SIZE / 2; i++) {
+		struct ft_test_node *n = node_alloc(i);
+		insert_u64(ft, i, n);
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	/*
+	 * Half the readers verify lookup consistency (right node for the key),
+	 * half walk duplicate chains for acyclicity; the writers churn
+	 * insert/remove.  All reuse the shared inv_lookup_ctx thread bodies.
+	 */
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			(i & 1) ? inv_dup_chain_reader :
+				inv_lookup_consistency_reader, &ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL,
+			inv_lookup_consistency_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_no_ordered_list_consistency: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		drain_and_destroy(ft, group);
 		return -1;
@@ -5458,6 +5574,9 @@ int main(int argc, char **argv)
 
 	diag("3. Duplicate chain acyclicity");
 	RUN_TEST(inv_dup_chain_acyclicity);
+
+	diag("Ordered-list-OFF (no-cell) consistency");
+	RUN_TEST(inv_no_ordered_list_consistency);
 
 	diag("4. Graft-swap atomicity");
 	RUN_TEST(inv_graft_swap_atomicity);
