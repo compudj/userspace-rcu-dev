@@ -103,9 +103,7 @@ struct cds_ft_alloc_arena {
 	char *name;
 	bool bitmap;
 	bool compressed;	/* Dedicated compressed-node arena (speculative groups). */
-#ifdef FEATURE_FT_ORD_CELL
 	bool cell;		/* Dedicated ordinal-cell arena (ordered_list groups). */
-#endif
 };
 
 static
@@ -781,9 +779,7 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	 */
 	arena->compressed = arena_name &&
 		!strcmp(arena_name, "cds_ft_alloc_compressed");
-#ifdef FEATURE_FT_ORD_CELL
 	arena->cell = arena_name && !strcmp(arena_name, "cds_ft_alloc_cell");
-#endif
 	CDS_INIT_LIST_HEAD(&arena->ranges);
 	CDS_INIT_LIST_HEAD(&arena->partial_ranges);
 	CDS_INIT_LIST_HEAD(&arena->free_ranges);
@@ -841,9 +837,7 @@ void ft_recompact_alloc_init(struct ft_recompact_alloc_ctx *ctx)
 		ctx->cur[i] = NULL;
 		ctx->cur_compressed[i] = NULL;
 	}
-#ifdef FEATURE_FT_ORD_CELL
 	ctx->cur_cell = NULL;
-#endif
 	CDS_INIT_LIST_HEAD(&ctx->all);
 }
 
@@ -936,11 +930,9 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 			 */
 			struct cds_ft_alloc_range **curp;
 
-#ifdef FEATURE_FT_ORD_CELL
 			if (arena->cell)
 				curp = &ctx->cur_cell;
 			else
-#endif
 			if (arena->compressed)
 				curp = &ctx->cur_compressed[order];
 			else
@@ -1129,7 +1121,6 @@ struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft,
 		item_len_order, false);
 }
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Ordinal-cell allocation (Option E): routes to the group's dedicated cell
  * arena so the uniform 32 B cells pack contiguously in their own item region,
@@ -1142,7 +1133,6 @@ struct cds_ft_metadata *cds_ft_alloc_cell_item(struct cds_ft *ft)
 	return cds_ft_alloc_item_from(ft, &ft->group->cell_arena,
 		"cds_ft_alloc_cell", FT_ORD_CELL_ALLOC_ORDER, false);
 }
-#endif
 
 /*
  * Synchronous free body shared by the call_rcu callback and the
@@ -1312,12 +1302,10 @@ void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
 			ft_group->compressed_arena_order[i] = NULL;
 		}
 	}
-#ifdef FEATURE_FT_ORD_CELL
 	if (ft_group->cell_arena) {
 		cds_ft_arena_destroy(ft_group->cell_arena);
 		ft_group->cell_arena = NULL;
 	}
-#endif
 }
 
 /*

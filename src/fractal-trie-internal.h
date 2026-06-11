@@ -344,7 +344,7 @@
 #endif
 
 /*
- * FEATURE_FT_ORD_CELL: library-owned ordered sibling list ("Option E").
+ * Library-owned ordered sibling list ("Option E").
  *
  * Threads the duplicate-chain heads (one per distinct key) into a
  * key-ordered doubly-linked list of LIBRARY-OWNED "ordinal cells"
@@ -364,18 +364,16 @@
  * (the per-step random leaf load dependency is what makes the in-leaf
  * chain latency-bound).  Cells are kept reader-coherent via the flip-latch.
  *
- * Compiled in by DEFAULT; disable with -DNO_FEATURE_FT_ORD_CELL.  The ordered
- * sibling LIST is runtime-gated per group (cds_ft_group_attr_set_ordered_list):
- * an unset group skips all list maintenance.  The library-owned cell itself is
- * allocated per head regardless ("cell-always", so the head's parent is reached
- * through the cell), so a group that never enables ordered_list still pays that
- * per-head cell + parent indirection.
+ * Always compiled in (mandatory; there is no non-cell build).  Both the cell
+ * and its ordered LIST are runtime-gated per group via
+ * cds_ft_group_attr_set_ordered_list, recorded as the trie's immutable
+ * ft->ordered_list flag (read on the hot path): an enabled group allocates a
+ * cell per distinct-key head (the head's parent is reached through the cell)
+ * and maintains the key-ordered list; an unset group allocates NO cells
+ * (head->prev IS the flagged parent directly) and skips all list maintenance,
+ * so it pays neither the per-head cell nor the indirection.
  */
-#if !defined(NO_FEATURE_FT_ORD_CELL) && !defined(FEATURE_FT_ORD_CELL)
-# define FEATURE_FT_ORD_CELL
-#endif
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Library-owned ordinal cell: one per distinct-key duplicate-chain head.
  *   @ord_prev/@ord_next: key-ordered doubly-linked list of cells.
@@ -401,7 +399,6 @@ struct ft_ord_cell {
 urcu_static_assert(sizeof(struct ft_ord_cell) <= (1U << FT_ORD_CELL_ALLOC_ORDER),
 		"struct ft_ord_cell must fit the cell arena item size",
 		ord_cell_fits_alloc_order);
-#endif /* FEATURE_FT_ORD_CELL */
 
 /*
  * FEATURE_FT_EXCL_VALIDATE: runtime validation of the access-discipline
@@ -658,7 +655,6 @@ struct cds_ft_group {
 	 * groups where speculative is false.
 	 */
 	struct cds_ft_alloc_arena *compressed_arena_order[FT_ALLOC_ORDER_MAX + 1];
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Dedicated arena for ordinal cells (Option E, ordered_list_set
 	 * groups).  Separate from arena_order[] so the uniform 32 B cell
@@ -680,7 +676,6 @@ struct cds_ft_group {
 	 * issued.
 	 */
 	unsigned long nr_cells_allocated, nr_cells_freed;
-#endif
 	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
@@ -824,7 +819,6 @@ struct cds_ft {
 	 */
 	bool exclusive;
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Mirror of group->ordered_list_set, cached on the trie so the read-side
 	 * head-parent resolver (ft_resolve_head_prev, on the descent / skip /
@@ -836,7 +830,6 @@ struct cds_ft {
 	 * cell RSS and its list maintenance are paid only when the list is enabled.
 	 */
 	bool ordered_list;
-#endif
 
 	/*
 	 * In-progress compaction state (cds_ft_compact_begin), or NULL.
@@ -849,7 +842,6 @@ struct cds_ft {
 	struct cds_ft_compact_state *active_compact;
 
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Writer-side scratch iterator for ordinal-cell predecessor discovery
 	 * (ft_ord_cell_splice).  Allocated eagerly in cds_ft_create when the
@@ -865,7 +857,6 @@ struct cds_ft {
 	 */
 	struct ft_ord_cell *ord_cell_head;
 	struct ft_ord_cell *ord_cell_tail;
-#endif
 
 #ifdef FEATURE_FT_EXCL_VALIDATE
 	/*
@@ -1231,7 +1222,6 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft, size_t item_len_order);
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Allocate one ordinal cell (Option E) from the group's dedicated cell arena
  * (FT_ORD_CELL_ALLOC_ORDER, no bitmap).  Returns a metadata whose item is the
@@ -1239,7 +1229,6 @@ struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft, size_t i
  */
 __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_alloc_cell_item(struct cds_ft *ft);
-#endif
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
@@ -1274,7 +1263,6 @@ struct ft_recompact_alloc_ctx {
 	 */
 	struct cds_ft_alloc_range *cur[FT_ALLOC_ORDER_MAX + 1];
 	struct cds_ft_alloc_range *cur_compressed[FT_ALLOC_ORDER_MAX + 1];
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Current private range for the dedicated cell arena (single: cells are
 	 * uniform FT_ORD_CELL_ALLOC_ORDER).  Keeps relocated cells off the
@@ -1282,7 +1270,6 @@ struct ft_recompact_alloc_ctx {
 	 * own dense range.
 	 */
 	struct cds_ft_alloc_range *cur_cell;
-#endif
 	struct cds_list_head all;
 };
 

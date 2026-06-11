@@ -2368,13 +2368,12 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  * cds_ft_group_attr_set_no_ordered_list - Disable the ordered sibling list
  *   for this group (it is enabled by default).
  *
- * Opt out to skip the per-mutation cell splice / unsplice -- worthwhile for a
- * write-heavy group that never iterates in key order (cds_ft_next /
- * cds_ft_prev / cds_ft_for_each*).  The per-head library cell is still
- * allocated (it carries the head's parent), so opting out does not recover
- * that per-head cost; a cell-optional layout is a separate matter.  No effect
- * in a library built with -DNO_FEATURE_FT_ORD_CELL (the list is already
- * absent).
+ * Opt out for a write-heavy group that never iterates in key order (cds_ft_next
+ * / cds_ft_prev / cds_ft_for_each*): it skips the per-mutation cell splice /
+ * unsplice AND allocates NO per-head library cell at all, so a head's parent is
+ * reached directly with no cell indirection.  Opting out therefore recovers the
+ * full per-head cell cost (lower memory + faster mutations); the only thing
+ * given up is ordered iteration and the node-pointer key/step helpers.
  *
  * Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL @attr.

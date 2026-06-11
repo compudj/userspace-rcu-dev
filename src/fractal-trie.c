@@ -600,7 +600,6 @@ struct cds_ft_iter {
 	 */
 	size_t key_off;
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Ordinal-cell walk cursor.  @ord_cell caches the cell of the current
 	 * head so cds_ft_next / cds_ft_prev advance via cell->ord_next/prev
@@ -613,7 +612,6 @@ struct cds_ft_iter {
 	 */
 	struct ft_ord_cell *ord_cell;
 	struct cds_ft_node *ord_cell_node;
-#endif
 
 #ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
 	struct urcu_gp_poll_state gp_state;	/* GP snapshot when path was populated. */
@@ -1789,7 +1787,6 @@ struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
 }
 
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Ordinal-cell tag + accessors ("Option E", cell-always model).
  *
@@ -1862,17 +1859,7 @@ struct ft_ord_cell *ft_ord_cell_resolve_ord(struct ft_ord_cell *const *slot)
 			ft_flip_proxy_ptr((struct cds_ft_inode_flag *) p));
 	return p;
 }
-#else
-/* Non-cell builds: a head's prev is the flagged parent directly. */
-static inline_lookup
-struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *prev)
-{
-	(void) ft;
-	return (struct cds_ft_inode_flag *) prev;
-}
-#endif /* FEATURE_FT_ORD_CELL */
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Cell lifecycle (Stage 6, FT-allocator arena).
  *
@@ -1951,7 +1938,6 @@ void ft_ord_cell_set_parent(struct cds_ft_node *head,
 {
 	rcu_assign_pointer(ft_ord_cell_ptr(head->prev)->parent, parent);
 }
-#endif /* FEATURE_FT_ORD_CELL */
 
 /*
  * ft_node_holder: write-side resolution of a node's holder (the slot owner
@@ -1985,7 +1971,6 @@ struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
  * orders this store); existing-head re-parents use ft_set_parent / the
  * external-nodes choke point, which resolve the cell themselves.
  */
-#ifdef FEATURE_FT_ORD_CELL
 #define ft_external_head_set_parent(ft, node, parent)			\
 	do {								\
 		if ((ft)->ordered_list)					\
@@ -1994,10 +1979,6 @@ struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
 		else							\
 			(node)->prev = (parent);			\
 	} while (0)
-#else
-#define ft_external_head_set_parent(ft, node, parent)			\
-	do { (node)->prev = (parent); } while (0)
-#endif
 
 /*
  * ft_publish_external_nodes_prev: Phase 2 — publish the back-channel pointer
@@ -2024,15 +2005,10 @@ void ft_publish_external_nodes_prev(struct cds_ft *ft,
 {
 	if (!external_nodes)
 		return;
-#ifdef FEATURE_FT_ORD_CELL
 	if (ft->ordered_list)
 		ft_ord_cell_set_parent(external_nodes, node_flag);
 	else
 		rcu_assign_pointer(external_nodes->prev, node_flag);
-#else
-	(void) ft;
-	rcu_assign_pointer(external_nodes->prev, node_flag);
-#endif
 }
 
 static
@@ -2842,7 +2818,6 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 		 * the parent is the head's prev directly.  rcu_assign either way:
 		 * ft_set_parent re-parents live heads on the restructure path.
 		 */
-#ifdef FEATURE_FT_ORD_CELL
 		if (ft->ordered_list)
 			ft_ord_cell_set_parent((struct cds_ft_node *) child_nf,
 				parent_nf);
@@ -2850,11 +2825,6 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 			rcu_assign_pointer(
 				((struct cds_ft_node *) child_nf)->prev,
 				parent_nf);
-#else
-		rcu_assign_pointer(
-			((struct cds_ft_node *) child_nf)->prev,
-			parent_nf);
-#endif
 		return;
 	}
 	{
@@ -8393,12 +8363,10 @@ bool ft_iter_key_referenced(const struct cds_ft_iter *iter)
  * Valid only while the RCU lock that produced iter->node is held (cross-CS
  * callers cds_ft_iter_bind_key() first).
  */
-#ifdef FEATURE_FT_ORD_CELL
 static inline_lookup
 struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter);
 static size_t ft_rebuild_key_upwalk(const struct cds_ft *ft,
 		struct ft_ord_cell *cell, uint8_t *out, size_t max_len);
-#endif
 
 /*
  * Sentinel stored in iter->key_len by the ordinal-cell land for a VARIABLE-
@@ -8410,7 +8378,6 @@ static size_t ft_rebuild_key_upwalk(const struct cds_ft *ft,
  */
 #define FT_ITER_KEY_LEN_LAZY	((size_t) -1)
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * One-shot structural materialization for a VARIABLE-length EAGER ordered-list
  * iterator (no in-leaf key, no key_len_offset): the parent up-walk derives BOTH
@@ -8433,7 +8400,6 @@ size_t ft_iter_upwalk_into_buf(struct cds_ft_iter *iter)
 	iter->path_len = n + 1;
 	return n;
 }
-#endif
 
 static inline
 const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
@@ -8442,7 +8408,6 @@ const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 
 	if (ft_iter_key_referenced(iter))
 		return (const uint8_t *) iter->node + group->speculative_key_offset;
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * EAGER ordered-list walk (no in-leaf key): rematerialize the current
 	 * key STRUCTURALLY via the parent up-walk into iter_key.  Reached only
@@ -8479,11 +8444,9 @@ const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 			}
 		}
 	}
-#endif
 	return iter_key(iter) + iter->key_off;
 }
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Rebuild the ORDINAL key for a cell head @cell of length @key_len by walking
  * UP the parent chain, recovering each level's branch byte structurally:
@@ -8613,7 +8576,6 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	/* Key now occupies out[pos .. max_len) in key order; length = max_len - pos. */
 	return max_len - pos;
 }
-#endif /* FEATURE_FT_ORD_CELL */
 
 /*
  * Resolve (and cache) the iterator's current-position key length.  For a
@@ -8629,7 +8591,6 @@ static inline
 size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
 {
 	if (caa_unlikely(iter->key_len == FT_ITER_KEY_LEN_LAZY)) {
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * VARIABLE-length EAGER ordered-list (no in-leaf length at
 		 * key_len_offset): the parent up-walk derives the length -- and
@@ -8641,7 +8602,6 @@ size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
 			ft_iter_upwalk_into_buf(iter);
 			return iter->key_len;
 		}
-#endif
 		iter->key_len = *(const size_t *) ((const char *) iter->node +
 			iter->ft->group->key_len_offset);
 		iter->path_len = iter->key_len + 1;
@@ -8678,7 +8638,6 @@ void ft_iter_materialize_key(struct cds_ft_iter *iter)
 }
 
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Land an ordinal-cell walk result on @iter: materialize the head's key from
  * its leaf and cache the cell as the walk cursor.  @cell == NULL reports
@@ -8788,7 +8747,6 @@ struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter)
 		return iter->ord_cell;
 	return ft_ord_cell_ptr(rcu_dereference(iter->node->prev));
 }
-#endif /* FEATURE_FT_ORD_CELL */
 
 static inline_lookup
 enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
@@ -8847,7 +8805,6 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Ordinal-cell fast path (Option E): cds_ft_next / cds_ft_prev (GT/LT,
 	 * LIMIT_NONE) on a cached head collapse to a single dependent load of the
@@ -8889,7 +8846,6 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 #endif
 		goto end;
 	}
-#endif /* FEATURE_FT_ORD_CELL */
 
 	switch (limit) {
 	case FT_LOOKUP_LIMIT_NONE:
@@ -10120,14 +10076,12 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 
 	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_first\n");
-#ifdef FEATURE_FT_ORD_CELL
 	/* O(1) endpoint: the ordinal-cell list's minimum cell (unscoped only).
 	 * Resolve a flip proxy: head/tail transition atomically with the
 	 * neighbour edges during a concurrent splice/unsplice/run move. */
 	if (ft_ord_cell_fastpath_ok(ft, iter))
 		return ft_ord_cell_iter_land(ft, iter,
 			ft_ord_cell_resolve_ord(&ft->ord_cell_head));
-#endif
 	/*
 	 * LIMIT_FIRST sets key_len to prefix_len internally.
 	 * When prefix_len == 0 this corresponds to a traversal of the
@@ -10153,13 +10107,11 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 
 	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_last\n");
-#ifdef FEATURE_FT_ORD_CELL
 	/* O(1) endpoint: the ordinal-cell list's maximum cell (unscoped only).
 	 * Resolve a flip proxy (see cds_ft_lookup_first). */
 	if (ft_ord_cell_fastpath_ok(ft, iter))
 		return ft_ord_cell_iter_land(ft, iter,
 			ft_ord_cell_resolve_ord(&ft->ord_cell_tail));
-#endif
 	/*
 	 * LIMIT_LAST always uses key_len = max_key_len. When
 	 * prefix_len > 0, the traversal uses actual prefix key bytes
@@ -11880,7 +11832,6 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 
 
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Ordinal-cell point-op list helpers.  Defined after the flip-batch +
  * inequality-lookup helpers (which they use); forward-declared here for the
@@ -11912,7 +11863,6 @@ static void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		struct ft_ord_cell *ord_cursor, struct ft_ord_cell *prev_placed);
 static void ft_ord_cell_run_unlink(struct cds_ft *ft,
 		struct cds_ft_node *first_head, struct cds_ft_node *last_head);
-#endif /* FEATURE_FT_ORD_CELL */
 
 static
 int _cds_ft_insert(struct cds_ft *ft,
@@ -11931,9 +11881,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	unsigned int snapshot_depth[FT_MAX_DEPTH]; /* parallel depth tracking */
 	int nr_snapshot = 0;
 	int ret;
-#ifdef FEATURE_FT_ORD_CELL
 	struct ft_ord_cell *precell;
-#endif
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
@@ -11948,7 +11896,6 @@ int _cds_ft_insert(struct cds_ft *ft,
 	if (node->prev || ft_node_next(node))
 		return -EINVAL;
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Ordered-list trie: pre-wire @node's ordinal cell before any structural
 	 * mutation, so the only failure-prone allocation happens up front (a
@@ -11982,7 +11929,6 @@ int _cds_ft_insert(struct cds_ft *ft,
 			cds_ft_item_to_metadata(precell)->incoming_byte =
 				(uint8_t) key[key_len - 1];
 	}
-#endif
 
 	key_depth = key_len + 1;
 
@@ -12152,7 +12098,6 @@ int _cds_ft_insert(struct cds_ft *ft,
 	}
 
 insert_done:
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * @node became a fresh head iff node->prev is still its (cell) carrier
 	 * — i.e. not external.  A duplicate append (ft_chain_node repointed
@@ -12174,7 +12119,6 @@ insert_done:
 			ft_ord_cell_splice(ft, _key, _key_len, precell);
 		}
 	}
-#endif
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
@@ -12264,9 +12208,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	unsigned int snapshot_depth[FT_MAX_DEPTH];
 	int nr_snapshot = 0;
 	int ret;
-#ifdef FEATURE_FT_ORD_CELL
 	struct ft_ord_cell *precell;
-#endif
 
 	*old_node_ret = NULL;
 
@@ -12282,7 +12224,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	if (node->prev || ft_node_next(node))
 		return -EINVAL;
 
-#ifdef FEATURE_FT_ORD_CELL
 	/* Ordered-list trie: pre-wire @node's cell (see _cds_ft_insert).  A replace
 	 * always lands @node as the sole head on success, so the cell is kept
 	 * unless the insert fails (or the key_shorter path finds the key and
@@ -12306,7 +12247,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			cds_ft_item_to_metadata(precell)->incoming_byte =
 				(uint8_t) key[key_len - 1];
 	}
-#endif
 
 	key_depth = key_len + 1;
 
@@ -12378,7 +12318,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				node, old_node_ret);
 			if (ret == -EEXIST) {
 				ret = 0;	/* Replace handled by key_shorter. */
-#ifdef FEATURE_FT_ORD_CELL
 				/*
 				 * key_shorter found the key already present and
 				 * left @node uninstalled (*old_node_ret names the
@@ -12387,7 +12326,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				 * frees the now-orphaned @precell.
 				 */
 				node->prev = NULL;
-#endif
 			}
 		} else if (!ft_node_external(d.nf)) {
 			struct cds_ft_node *external_nodes;
@@ -12404,7 +12342,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
-#ifdef FEATURE_FT_ORD_CELL
 				/*
 				 * Ordered list on: the replaced head's cell leaves the
 				 * trie; @node's pre-wired cell takes its list slot (O(1)
@@ -12418,7 +12355,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					ft_ord_cell_swap(ft, old_cell, precell);
 					ft_ord_cell_free(ft, old_cell);
 				}
-#endif
 			} else {
 				/* No external nodes yet. New key. */
 				ft_external_head_set_parent(ft, node, d.nf);
@@ -12436,7 +12372,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			node->next = NULL;
 			ft_publish_to_parent(ft, d.pnf, d.nfp,
 				(struct cds_ft_inode_flag *) node);
-#ifdef FEATURE_FT_ORD_CELL
 			/* Ordered list on: replaced head's cell leaves; @node's cell
 			 * takes its slot, then the old cell is freed.  List off: none. */
 			if (ft->ordered_list) {
@@ -12446,7 +12381,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				ft_ord_cell_swap(ft, old_cell, precell);
 				ft_ord_cell_free(ft, old_cell);
 			}
-#endif
 			ret = 0;
 		}
 	} else {
@@ -12472,7 +12406,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	}
 
 insert_replace_done:
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * @node became the installed head iff node->prev still carries its
 	 * pre-wired cell (not external).  A duplicate append (descent through a
@@ -12497,7 +12430,6 @@ insert_replace_done:
 			ft_ord_cell_splice(ft, _key, _key_len, precell);
 		}
 	}
-#endif
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
@@ -12651,7 +12583,6 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		new_node->next->prev = new_node;
 	rcu_assign_pointer(*pub_slot, (struct cds_ft_inode_flag *) new_node);
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Cell transfer: @new_node inherited @old_node's prev (its cell, when a
 	 * head) via the copy above, so it shares the same cell — now fully
@@ -12665,7 +12596,6 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	if (ft->ordered_list &&
 	    !ft_node_external((struct cds_ft_inode_flag *) new_node->prev))
 		rcu_assign_pointer(ft_ord_cell_ptr(new_node->prev)->node, new_node);
-#endif
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	/*
@@ -13541,7 +13471,6 @@ void ft_unchain_node(struct cds_ft *ft, struct cds_ft_node **head_slot,
 		rcu_assign_pointer(prev_node->next, next_node);
 	} else {
 		/* Head: prev is the (cell-build) cell flag or the flagged parent. */
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Head promotion: @next_node inherited @node's prev (the cell) via
 		 * the copy above, so it becomes the new head sharing the same cell;
@@ -13553,7 +13482,6 @@ void ft_unchain_node(struct cds_ft *ft, struct cds_ft_node **head_slot,
 		if (ft->ordered_list && next_node)
 			rcu_assign_pointer(ft_ord_cell_ptr(node->prev)->node,
 				next_node);
-#endif
 		rcu_assign_pointer(*head_slot, next_node);
 	}
 	/*
@@ -13658,7 +13586,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Cell-always: @node heads its chain iff its prev is the cell (not an
 	 * external predecessor).  Capture the head's cell + successor BEFORE the
@@ -13671,7 +13598,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	struct ft_ord_cell *dead_cell = cell_was_head ?
 		ft_ord_cell_ptr(node->prev) : NULL;
 	struct cds_ft_node *cell_succ = cell_was_head ? ft_node_next(node) : NULL;
-#endif
 
 	if (ft_node_external(holder_flag)) {
 		/*
@@ -13806,7 +13732,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		}
 	}
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Head with no successor: the key disappeared, so its cell is unspliced
 	 * from the ordered list (when enabled) and freed (deferred, for parked
@@ -13818,7 +13743,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		ft_ord_cell_unsplice(ft, dead_cell);
 		ft_ord_cell_free(ft, dead_cell);
 	}
-#endif
 
 	/*
 	 * detach should not replace a NULL pointer because it has been
@@ -13948,7 +13872,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_nr_keys_store(metadata, ft_nr_keys_get(metadata) - 1,
 			CMM_RELEASE);
 		rcu_assign_pointer(metadata->external_nodes, NULL);
-#ifdef FEATURE_FT_ORD_CELL
 		/* Ordered list on: the head's cell leaves the trie (capture before
 		 * mark_removed, though that only tombstones ->next).  List off: none. */
 		if (ft->ordered_list) {
@@ -13957,7 +13880,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			ft_ord_cell_unsplice(ft, dead);
 			ft_ord_cell_free(ft, dead);
 		}
-#endif
 		/* The whole chain has left the trie: tombstone every node. */
 		ft_chain_mark_removed(external_nodes);
 		return CDS_FT_STATUS_OK;
@@ -14049,7 +13971,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 */
 	assert(ret != -ENOENT);
 
-#ifdef FEATURE_FT_ORD_CELL
 	/* Ordered list on: the whole key left the trie: its head's cell is
 	 * unspliced and freed (deferred).  chain_head->prev still carries the cell
 	 * (detach reshapes ancestors and head_slot, not the head's prev).  List
@@ -14060,7 +13981,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_ord_cell_unsplice(ft, dead);
 		ft_ord_cell_free(ft, dead);
 	}
-#endif
 
 	iter->cache_valid = false;
 	iter_debug_path_clear(iter);
@@ -14790,7 +14710,6 @@ void ft_graft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
 		struct cds_ft_node *dst_head = g->splices[i].dst_head;
 		struct cds_ft_node *src_head = g->splices[i].src_head;
 		struct cds_ft_node *tail = dst_head;
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Ordered list on: @src_head was a head in src (prev is its cell);
 		 * it becomes a non-head duplicate of @dst_head, so its cell leaves
@@ -14801,16 +14720,13 @@ void ft_graft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
 		 */
 		struct ft_ord_cell *src_cell = ft->ordered_list ?
 			ft_ord_cell_ptr(src_head->prev) : NULL;
-#endif
 
 		while (ft_node_next(tail))
 			tail = ft_node_next(tail);
 		src_head->prev = tail;	/* write-side only, plain store */
 		rcu_assign_pointer(tail->next, src_head);
-#ifdef FEATURE_FT_ORD_CELL
 		if (src_cell)
 			ft_ord_cell_free_unpublished(ft, src_cell);
-#endif
 	}
 }
 
@@ -15677,7 +15593,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		FT_TP(root_publish, (const void *) src_ft,
 			(const void *) src_ft->root);
 		free_cds_ft_node(dst_ft, old_dst_root);
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Ordered list: dst was empty (checked above), so src's WHOLE
 		 * ordered list becomes dst's.  Cells' internal links unchanged;
@@ -15692,7 +15607,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			src_ft->ord_cell_head = NULL;
 			src_ft->ord_cell_tail = NULL;
 		}
-#endif
 		goto done;
 	}
 
@@ -15705,10 +15619,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		unsigned long src_count = ft_nr_keys_get(src_rmeta);
 		struct cds_ft_inode_flag *old_src_root;
 		struct cds_ft_inode_flag *attached_nf = NULL;
-#ifdef FEATURE_FT_ORD_CELL
 		struct ft_ord_cell *graft_run_first = NULL, *graft_run_last = NULL;
 		struct ft_ord_cell *graft_pred = NULL, *graft_succ = NULL;
-#endif
 
 		/*
 		 * Preallocate a fresh empty root for the source trie
@@ -15737,7 +15649,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Ordered list: locate the dst splice neighbours NOW, while dst is
 		 * still payload-free (the attach is built invisibly / not yet
@@ -15747,7 +15658,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		if (dst_ft->group->ordered_list_set)
 			ft_ord_cell_find_splice_pos(dst_ft, _key, key_len,
 				&graft_pred, &graft_succ);
-#endif
 
 		/*
 		 * "Jump out" prevention: a reader that has descended
@@ -15773,7 +15683,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		FT_TP(root_publish, (const void *) src_ft,
 			(const void *) src_ft->root);
 
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Ordered list: capture src's whole list (the run to graft) and
 		 * unlink it from src here, paired with the structural src-root
@@ -15787,7 +15696,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			src_ft->ord_cell_head = NULL;
 			src_ft->ord_cell_tail = NULL;
 		}
-#endif
 
 		if (!src_ft->exclusive)
 			src_ft->group->flavor->update_synchronize_rcu();
@@ -15827,7 +15735,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			if (status != CDS_FT_STATUS_OK) {
 				ft_graft_glue_abort(dst_ft, &glue);
 				rcu_assign_pointer(src_ft->root, old_src_root);
-#ifdef FEATURE_FT_ORD_CELL
 				/* Roll the captured run back into src's list. */
 				if (graft_run_first) {
 					rcu_assign_pointer(src_ft->ord_cell_head,
@@ -15835,7 +15742,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 					rcu_assign_pointer(src_ft->ord_cell_tail,
 						graft_run_last);
 				}
-#endif
 				FT_TP(root_publish, (const void *) src_ft,
 					(const void *) src_ft->root);
 				if (!src_ft->exclusive)
@@ -15864,7 +15770,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 					am->parent, (long) src_count);
 		}
 
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Ordered list: src is now structurally empty + drained; the
 		 * payload is published under @key in dst.  Splice the captured run
@@ -15875,7 +15780,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		if (graft_run_first)
 			ft_ord_cell_run_splice(dst_ft, graft_run_first,
 				graft_run_last, graft_pred, graft_succ);
-#endif
 
 	}
 
@@ -16865,7 +16769,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		FT_TP(root_publish, (const void *) swap_ft,
 			(const void *) swap_ft->root);
 
-#ifdef FEATURE_FT_ORD_CELL
 		/* Ordered list: swap whole lists (head/tail), mirroring the roots. */
 		if (dst_ft->group->ordered_list_set) {
 			struct ft_ord_cell *dh = dst_ft->ord_cell_head;
@@ -16878,7 +16781,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			rcu_assign_pointer(swap_ft->ord_cell_head, dh);
 			rcu_assign_pointer(swap_ft->ord_cell_tail, dt);
 		}
-#endif
 
 		dm = uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED);
 		if (swap_max > dm)
@@ -16913,12 +16815,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		bool old_child_external = false;
 		bool have_insert = false;
 		unsigned long old_count = 0, swap_count;
-#ifdef FEATURE_FT_ORD_CELL
 		/* run_D = dst's subtree-at-key heads; run_S = swap's whole list. */
 		struct ft_ord_cell *gs_d_first = NULL, *gs_d_last = NULL;
 		struct ft_ord_cell *gs_s_first = NULL, *gs_s_last = NULL;
 		bool gs_ord = dst_ft->group->ordered_list_set;
-#endif
 
 		/*
 		 * Read-only descent: nothing is published, so the whole swap can be
@@ -17123,7 +17023,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 
 		/* ===== COMMIT (failure-free) ===== */
 
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Ordered list: capture both runs while both lists are intact.
 		 * run_D = dst's subtree-at-key (old_child's heads), which becomes
@@ -17139,7 +17038,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			gs_s_first = swap_ft->ord_cell_head;	/* NULL if swap empty */
 			gs_s_last = swap_ft->ord_cell_tail;
 		}
-#endif
 
 		/*
 		 * "Jump out" prevention: unlink old_swap_root from swap_ft (install
@@ -17151,7 +17049,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
 			FT_TP(root_publish, (const void *) swap_ft,
 				(const void *) swap_ft->root);
-#ifdef FEATURE_FT_ORD_CELL
 			/*
 			 * run_S is captured; unlink it from swap's ordered list here
 			 * (paired with the structural root unlink) so this sync drains
@@ -17162,7 +17059,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				swap_ft->ord_cell_head = NULL;
 				swap_ft->ord_cell_tail = NULL;
 			}
-#endif
 			if (!swap_ft->exclusive)
 				swap_ft->group->flavor->update_synchronize_rcu();
 		}
@@ -17201,7 +17097,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			ft_propagate_external_count_parent(dst_ft, d.pnf,
 					(long) swap_count - (long) old_count);
 
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Replace run_D with run_S in dst's ordered list (run_S now lives at
 		 * @key structurally; run_S NULL for an empty swap -> run_D just
@@ -17211,7 +17106,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (gs_ord)
 			ft_ord_cell_run_replace(dst_ft, gs_d_first, gs_d_last,
 				gs_s_first, gs_s_last);
-#endif
 
 		/*
 		 * Drain dst-side readers that may still hold the displaced
@@ -17281,7 +17175,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			}
 		}
 
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Install run_D (the extracted subtree's heads) as swap_ft's whole
 		 * ordered list, mirroring the extract root publish above.  swap_ft
@@ -17294,7 +17187,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			rcu_assign_pointer(swap_ft->ord_cell_head, gs_d_first);
 			rcu_assign_pointer(swap_ft->ord_cell_tail, gs_d_last);
 		}
-#endif
 
 		/* Reclaim the old (replaced) live nodes after the publishes. */
 		ft_graft_glue_free_old(dst_ft, &glue_insert);
@@ -17450,7 +17342,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		rcu_assign_pointer(ft->root, ft_node_flag(fresh_node, 0));
 		FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Ordered list: a root detach moves the WHOLE trie, so @ft's
 		 * entire ordered cell list becomes @detached's.  The cells'
@@ -17464,7 +17355,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			ft->ord_cell_head = NULL;
 			ft->ord_cell_tail = NULL;
 		}
-#endif
 
 		*result_ft = detached;
 		return CDS_FT_STATUS_OK;
@@ -17588,7 +17478,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				}
 			}
 
-#ifdef FEATURE_FT_ORD_CELL
 			/*
 			 * Ordered list: the detached subtree's keys form a
 			 * contiguous run in @ft's ordered cell list.  Move that
@@ -17609,7 +17498,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 
 				ft_ord_cell_run_detach(ft, detached, rfirst, rlast);
 			}
-#endif
 
 			/*
 			 * If the detached child is an internal node, it
@@ -17841,7 +17729,6 @@ void ft_flip_batch_reclaim(struct ft_flip_batch *b)
 }
 
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Ordinal-cell list maintenance (Option E).
  *
@@ -18549,7 +18436,6 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		free(edges);
 	}
 }
-#endif /* FEATURE_FT_ORD_CELL */
 
 /*
  * Set @child's parent back-pointer to a raw flag @value (a flip-proxy)
@@ -18589,14 +18475,10 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 		 * replaces it with the real parent.  List off / non-cell: the head's
 		 * prev IS the flagged parent, so store the proxy directly there.
 		 */
-#ifdef FEATURE_FT_ORD_CELL
 		if (ft->ordered_list)
 			ft_ord_cell_set_parent((struct cds_ft_node *) child, value);
 		else
 			rcu_assign_pointer(((struct cds_ft_node *) child)->prev, value);
-#else
-		rcu_assign_pointer(((struct cds_ft_node *) child)->prev, value);
-#endif
 		return;
 	}
 	rcu_assign_pointer(cds_ft_item_to_metadata(ft_node_ptr(child))->parent,
@@ -18810,14 +18692,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	struct cds_ft_metadata *fresh_meta;
 	struct ft_flip_batch *flip;
 	unsigned long merged_keys = 0;
-#ifdef FEATURE_FT_ORD_CELL
 	bool ms_ord = dst_ft->group->ordered_list_set;
 	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL;
-#else
-	/* @dst_key / @dst_key_len drive the ordered-list interleave only. */
-	(void) dst_key;
-	(void) dst_key_len;
-#endif
 
 	/*
 	 * Every dst merge-point shape is handled.  The flip proxies the publish
@@ -18988,7 +18864,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		M_slot = pub;
 	D_old = *pub_slot;
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Ordered list: capture the dst merge subtree's min head (the cursor for
 	 * the post-commit interleave walk) and the region predecessor, while D is
@@ -19009,7 +18884,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ft_subtree_minmax_head(dst_ft, S, false),
 			ft_subtree_minmax_head(dst_ft, S, true));
 	}
-#endif
 
 	/*
 	 * 1. Unlink the merge source from src.  Root src: swap in the pre-
@@ -19122,7 +18996,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	ft_graft_glue_free_old(src_ft, &gs);
 	ft_graft_glue_free_old(dst_ft, &gd);
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * 9. Ordered list: splice the surviving src cells into dst's ordered
 	 * list at their merged positions.  Done AFTER the settle (step 7) so the
@@ -19135,7 +19008,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	if (ms_ord)
 		ft_merge_ord_interleave(dst_ft, dst_key, dst_key_len, merged_keys,
 			ms_cursor, ms_prev);
-#endif
 
 	ft_graft_glue_fini(&gd);
 	ft_graft_glue_fini(&gs);
@@ -20965,7 +20837,6 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	if (ft_skip_compressed_validate())
 		attr->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Ordered sibling list ON by default: the library-owned cell is allocated
 	 * per head regardless, so the key-ordered cds_ft_next / cds_ft_prev /
@@ -20974,7 +20845,6 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	 * splice / unsplice opts out with cds_ft_group_attr_set_no_ordered_list.
 	 */
 	attr->ordered_list_set = true;
-#endif
 	/*
 	 * NUMA placement default: defer to process / libnuma policy.
 	 * The library applies no mbind() of its own; the kernel honors
@@ -21317,9 +21187,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		if (ft_skip_compressed_validate())
 			ft_group->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
-#ifdef FEATURE_FT_ORD_CELL
 		ft_group->ordered_list_set = true;	/* on by default; see attr_create */
-#endif
 		ft_group->numa_policy = CDS_FT_NUMA_DEFAULT;
 		ft_group->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
 	}
@@ -21333,7 +21201,6 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 	if (uatomic_load(&ft_group->nr_ft_instances, CMM_RELAXED) != 0)
 		return CDS_FT_STATUS_BUSY_ERROR;
 	FT_TP(group_destroy, (const void *) ft_group);
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * All tries are destroyed (nr_ft_instances == 0) and each
 	 * cds_ft_destroy drained its deferred frees, so every ordered-list
@@ -21346,14 +21213,13 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 			(long) (ft_group->nr_cells_allocated - ft_group->nr_cells_freed),
 			ft_group->nr_cells_allocated, ft_group->nr_cells_freed);
 	}
-#endif
 	cds_ft_free_all_arenas(ft_group);
 	pthread_mutex_destroy(&ft_group->arena_lock);
 	free(ft_group);
 	return CDS_FT_STATUS_OK;
 }
 
-#if defined(DEBUG_COUNTERS) && defined(FEATURE_FT_ORD_CELL)
+#ifdef DEBUG_COUNTERS
 /*
  * DEBUG_COUNTERS-only cell leak introspection (no public header decl; tests
  * weak-reference it).  Reports the group's ordered-list cell alloc / free
@@ -21389,10 +21255,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->group = ft_group;
-#ifdef FEATURE_FT_ORD_CELL
 	/* Cache the group's ordered-list mode for the read-side cell gate. */
 	ft->ordered_list = ft_group->ordered_list_set;
-#endif
 	ft_install_lookup_ops(ft);
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
@@ -21432,7 +21296,6 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->root = ft_node_flag(root_node, 0);
 	FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
-#ifdef FEATURE_FT_ORD_CELL
 	/*
 	 * Ordinal-cell list enabled: eagerly allocate the writer-side scratch
 	 * iterator used for cell predecessor discovery (ft_ord_cell_splice).
@@ -21445,7 +21308,6 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		*result_ft = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
-#endif
 
 	uatomic_inc(&ft_group->nr_ft_instances, CMM_RELAXED);
 	*result_ft = ft;
@@ -21506,10 +21368,8 @@ void cds_ft_destroy(struct cds_ft *ft)
 	/* Wait for in-flight call_rcu free to complete. */
 	flavor->barrier();
 	ft_final_checks(ft);
-#ifdef FEATURE_FT_ORD_CELL
 	if (ft->ord_cell_scratch_iter)
 		cds_ft_iter_destroy(ft->ord_cell_scratch_iter);
-#endif
 	uatomic_dec(&ft->group->nr_ft_instances, CMM_RELAXED);
 	free(ft);
 }
@@ -21718,7 +21578,6 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 					depth, node);
 			return -1;
 		}
-#ifdef FEATURE_FT_ORD_CELL
 		if (prev == NULL && ft->ordered_list) {
 			/*
 			 * Ordered-list head: prev is the head's cell (cell-tagged),
@@ -21751,18 +21610,6 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 					depth, node, node->prev, expected_prev);
 			return -1;
 		}
-#else
-		if (node->prev != expected_prev) {
-			if (out)
-				fprintf(out, "ft_verify: depth %u: external chain node %p prev %p != expected %p (%s)\n",
-					depth, node, node->prev,
-					expected_prev,
-					prev == NULL ?
-						"head should point to owner" :
-						"non-head should point to predecessor");
-			return -1;
-		}
-#endif
 		(void) check_path;
 		(void) path;
 		(void) group;
@@ -22366,7 +22213,6 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 }
 
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * ft_verify_ord_cells: verify the ordinal-cell list against the trie.
  *
@@ -22464,7 +22310,6 @@ out:
 	cds_ft_iter_destroy(iter);
 	return ret;
 }
-#endif /* FEATURE_FT_ORD_CELL */
 
 /*
  * cds_ft_verify - Verify integrity of the entire Fractal Trie.
@@ -22507,10 +22352,8 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	ft_visited_destroy(&visited);
 	if (ret)
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
-#ifdef FEATURE_FT_ORD_CELL
 	if (ft->group->ordered_list_set && ft_verify_ord_cells(ft, out))
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
-#endif
 	return CDS_FT_STATUS_OK;
 }
 
@@ -22614,7 +22457,6 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	return cn2;
 }
 
-#ifdef FEATURE_FT_ORD_CELL
 /*
  * Relocate one ordinal cell into a fresh slot from the dedicated cell arena.
  * The active recompaction context routes the allocation into a private cell
@@ -22657,7 +22499,6 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 	ft_ord_cell_free(ft, old);
 	return new_cell;
 }
-#endif /* FEATURE_FT_ORD_CELL */
 
 /*
  * Forward relocate-descent: walk from the root to the leaf for @key
@@ -22828,7 +22669,6 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 			break;
 		}
 		ft_compact_descend(ft, key, key_len, &relocated);
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * Relocate this key's cell into a dense private cell range, in the
 		 * same key order the iterator visits -- so the ordered cell list
@@ -22847,7 +22687,6 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 				relocated++;
 			}
 		}
-#endif
 	}
 	/*
 	 * Drop the cached path before releasing the read lock: the nodes it
@@ -23494,9 +23333,7 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 	const struct cds_ft_group *group = ft->group;
 	const uint8_t *ordinals;
 	size_t klen;
-#ifdef FEATURE_FT_ORD_CELL
 	uint8_t scratch[FT_MAX_KEY_LEN];
-#endif
 
 	if (!node)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -23510,7 +23347,6 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 			*(const size_t *) ((const char *) node +
 				group->key_len_offset);
 	} else {
-#ifdef FEATURE_FT_ORD_CELL
 		/*
 		 * No in-leaf key: rebuild the ordinal key by the structural parent
 		 * up-walk from the head's cell (the same EAGER source cds_ft_iter_
@@ -23531,10 +23367,6 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 			/* List off: no cell, no in-leaf key -> not materializable. */
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
-#else
-		/* No in-leaf key and no cells: not materializable from a node alone. */
-		return CDS_FT_STATUS_NOT_FOUND;
-#endif
 	}
 	*result_key_len = klen;
 	if (klen > result_key_max_len)
@@ -23703,7 +23535,6 @@ size_t ft_iter_batch_dir(struct cds_ft *ft, struct cds_ft_iter *iter,
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 	if (caa_unlikely(cap == 0))
 		return 0;
-#ifdef FEATURE_FT_ORD_CELL
 	if (iter->cache_valid && iter->node && ft_ord_cell_fastpath_ok(ft, iter)) {
 		struct ft_ord_cell *cur = ft_ord_cell_cursor(iter);
 		const uintptr_t stride = (uintptr_t) 1 << FT_ORD_CELL_ALLOC_ORDER;
@@ -23723,7 +23554,6 @@ size_t ft_iter_batch_dir(struct cds_ft *ft, struct cds_ft_iter *iter,
 		ft_ord_cell_iter_land(ft, iter, cur);
 		return n;
 	}
-#endif
 	/* Non-cell / descent / scoped: per-step advance (no amortization). */
 	while (n < cap && iter->node) {
 		buf[n++] = iter->node;
@@ -23775,7 +23605,6 @@ size_t ft_node_batch_dir(struct cds_ft *ft, const struct cds_ft_node *cursor,
 	*next_cursor = NULL;
 	if (caa_unlikely(cap == 0))
 		return 0;
-#ifdef FEATURE_FT_ORD_CELL
 	if (ft->group->ordered_list_set) {
 		const uintptr_t stride = (uintptr_t) 1 << FT_ORD_CELL_ALLOC_ORDER;
 		struct ft_ord_cell *cur;
@@ -23801,10 +23630,6 @@ size_t ft_node_batch_dir(struct cds_ft *ft, const struct cds_ft_node *cursor,
 		*next_cursor = cur ? cur->node : NULL;
 		return n;
 	}
-#else
-	(void) cursor;
-	(void) buf;
-#endif
 	return 0;
 }
 
