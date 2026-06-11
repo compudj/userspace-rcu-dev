@@ -1813,7 +1813,7 @@ fail:
 
 /*
  * cds_ft_node_get_key with the ordered LIST disabled at runtime
- * (cds_ft_group_attr_set_no_ordered_list).  With the list off the trie
+ * (cds_ft_group_attr_set_ordered_list(attr, false)).  With the list off the trie
  * allocates NO ordinal cells (runtime cell-optional), so this no-in-leaf-key
  * group has no node-alone key source: node_get_key returns NOT_FOUND -- treated
  * as N/A here, same as a non-cell build.  (A group WITH an in-leaf key would
@@ -1833,7 +1833,7 @@ static int test_node_get_key_no_list(void)
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
 	if (cds_ft_group_attr_set_key_len(attr, 4) < 0 ||
-			cds_ft_group_attr_set_no_ordered_list(attr) < 0) {
+			cds_ft_group_attr_set_ordered_list(attr, false) < 0) {
 		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
@@ -1908,7 +1908,7 @@ fail:
 
 /*
  * Full point-operation battery on a runtime ordered-list-OFF trie
- * (cds_ft_group_attr_set_no_ordered_list): with the list off the library
+ * (cds_ft_group_attr_set_ordered_list(attr, false)): with the list off the library
  * allocates NO ordinal cells, so a head's prev IS its flagged parent directly
  * and every op runs the no-cell branch (insert / point lookup / ordered
  * iteration via descent / remove / duplicate-head promotion / remove_all).
@@ -1936,7 +1936,7 @@ static int test_list_off_ops(void)
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
 	if (cds_ft_group_attr_set_key_len(attr, 8) < 0 ||
-			cds_ft_group_attr_set_no_ordered_list(attr) < 0) {
+			cds_ft_group_attr_set_ordered_list(attr, false) < 0) {
 		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
@@ -4912,7 +4912,7 @@ static int test_merge_ordered_fixed_root(void)
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
 	cds_ft_group_attr_set_key_len(attr, 4);
-	cds_ft_group_attr_set_ordered_list(attr);
+	cds_ft_group_attr_set_ordered_list(attr, true);
 	if (cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_group_attr_destroy(attr);
 		return -1;

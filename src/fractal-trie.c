@@ -20865,7 +20865,7 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	 * per head regardless, so the key-ordered cds_ft_next / cds_ft_prev /
 	 * cds_ft_for_each*_batched fast paths are available out of the box.  A
 	 * group that never iterates in key order and wants to skip the per-mutation
-	 * splice / unsplice opts out with cds_ft_group_attr_set_no_ordered_list.
+	 * splice / unsplice opts out with cds_ft_group_attr_set_ordered_list(attr, false).
 	 */
 	attr->ordered_list_set = true;
 	/*
@@ -20981,20 +20981,11 @@ enum cds_ft_status cds_ft_group_attr_set_key_len_offset(
 }
 
 enum cds_ft_status cds_ft_group_attr_set_ordered_list(
-		struct cds_ft_group_attr *attr)
+		struct cds_ft_group_attr *attr, bool ordered_list)
 {
 	if (!attr)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	attr->ordered_list_set = true;
-	return CDS_FT_STATUS_OK;
-}
-
-enum cds_ft_status cds_ft_group_attr_set_no_ordered_list(
-		struct cds_ft_group_attr *attr)
-{
-	if (!attr)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	attr->ordered_list_set = false;
+	attr->ordered_list_set = ordered_list;
 	return CDS_FT_STATUS_OK;
 }
 

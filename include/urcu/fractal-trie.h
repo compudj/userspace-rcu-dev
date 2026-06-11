@@ -1221,7 +1221,7 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * node's key, materialize it from @node with cds_ft_node_get_key(ft, @node, ...).
  *
  * ORDERED-LIST ONLY: stepping node->node in key order needs the cell list, so on
- * a list-off trie (cds_ft_group_attr_set_no_ordered_list) this loop iterates
+ * a list-off trie (cds_ft_group_attr_set_ordered_list(attr, false)) this loop iterates
  * NOTHING (cds_ft_node_next_batch returns CDS_FT_STATUS_NOT_SUPPORTED, which the
  * macro cannot surface).  Code that may run on either kind of trie must branch
  * on cds_ft_ordered_list(ft) and use cds_ft_for_each_rcu() when it is false.
@@ -2316,49 +2316,35 @@ enum cds_ft_status cds_ft_group_attr_set_key_len_offset(
 		size_t offset);
 
 /*
- * cds_ft_group_attr_set_ordered_list - Enable the library-owned ordered
- *   sibling list (this is the DEFAULT; see
- *   cds_ft_group_attr_set_no_ordered_list to opt out).
+ * cds_ft_group_attr_set_ordered_list - Enable (@ordered_list true) or disable
+ *   (@ordered_list false) the library-owned ordered sibling list.  Enabled is
+ *   the DEFAULT in a library built with FEATURE_FT_ORD_CELL (the default build).
  *
- * The library threads the duplicate-chain heads (one per distinct key) into a
- * key-ordered list of library-owned cells and uses it to accelerate
+ * When ENABLED, the library threads the duplicate-chain heads (one per distinct
+ * key) into a key-ordered list of library-owned cells and uses it to accelerate
  * cds_ft_next / cds_ft_prev and cds_ft_for_each*_batched.  The order links live
  * entirely inside the library: struct cds_ft_node is unchanged and the
  * application declares no offset for them.  The cell is reached via the head's
- * node, and the head's parent is relocated into the cell, so the downward
- * lookup path is unaffected.
- *
- * On by default in a library built with FEATURE_FT_ORD_CELL (the default
- * build), so this setter is normally redundant; it re-affirms the default,
- * e.g. after a cds_ft_group_attr_set_no_ordered_list().  The iteration result
- * key is recovered from the matched leaf when
- * cds_ft_group_attr_set_speculative_key_offset (plus
+ * node, and the head's parent is relocated into the cell, so the downward lookup
+ * path is unaffected.  The iteration result key is recovered from the matched
+ * leaf when cds_ft_group_attr_set_speculative_key_offset (plus
  * cds_ft_group_attr_set_key_len_offset for a variable-length-key group) is
  * configured, otherwise structurally by an upward walk for an identity-mapped
  * group -- either way no application-leaf order storage is needed.
  *
- * Returns CDS_FT_STATUS_OK on success,
+ * When DISABLED (for a write-heavy group that never iterates in key order via
+ * cds_ft_next / cds_ft_prev / cds_ft_for_each*), the library skips the
+ * per-mutation cell splice / unsplice AND allocates NO per-head cell at all, so
+ * a head's parent is reached directly with no cell indirection -- recovering the
+ * full per-head cell cost (lower memory + faster mutations).  The only thing
+ * given up is ordered iteration and the node-pointer key/step helpers.
+ *
+ * On by default, so passing true is normally redundant (it re-affirms the
+ * default).  Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL @attr.
  */
 enum cds_ft_status cds_ft_group_attr_set_ordered_list(
-		struct cds_ft_group_attr *attr);
-
-/*
- * cds_ft_group_attr_set_no_ordered_list - Disable the ordered sibling list
- *   for this group (it is enabled by default).
- *
- * Opt out for a write-heavy group that never iterates in key order (cds_ft_next
- * / cds_ft_prev / cds_ft_for_each*): it skips the per-mutation cell splice /
- * unsplice AND allocates NO per-head library cell at all, so a head's parent is
- * reached directly with no cell indirection.  Opting out therefore recovers the
- * full per-head cell cost (lower memory + faster mutations); the only thing
- * given up is ordered iteration and the node-pointer key/step helpers.
- *
- * Returns CDS_FT_STATUS_OK on success,
- * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL @attr.
- */
-enum cds_ft_status cds_ft_group_attr_set_no_ordered_list(
-		struct cds_ft_group_attr *attr);
+		struct cds_ft_group_attr *attr, bool ordered_list);
 
 /*
  * cds_ft_group_attr_set_numa_policy - Select the trie group's NUMA
@@ -2710,7 +2696,7 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  *
  * ORDERED-LIST ONLY: the step IS the cell ord_next walk.  Stepping node->node in
  * key order needs the cell list; a bare node on a list-off trie
- * (cds_ft_group_attr_set_no_ordered_list) has no recoverable successor -- a leaf
+ * (cds_ft_group_attr_set_ordered_list(attr, false)) has no recoverable successor -- a leaf
  * key gives ONE key, not the NEXT one.  Such a trie returns
  * CDS_FT_STATUS_NOT_SUPPORTED (*@count = 0, *@next_cursor = NULL); use
  * cds_ft_next()/cds_ft_for_each_rcu() (a stateful iterator) there.  Query the
@@ -2741,7 +2727,7 @@ enum cds_ft_status cds_ft_node_prev_batch(struct cds_ft *ft,
  * cds_ft_ordered_list - Whether @ft maintains the key-ordered cell list.
  *
  * True when the group enabled the ordered list (the default;
- * cds_ft_group_attr_set_no_ordered_list disables it).  Immutable for the life of
+ * cds_ft_group_attr_set_ordered_list(attr, false) disables it).  Immutable for the life of
  * the trie.  It is the precondition for the node-cursor ordered walk
  * (cds_ft_node_next_batch / cds_ft_node_prev_batch and the
  * cds_ft_for_each_batched_rcu macros): a list-off trie cannot step node->node in

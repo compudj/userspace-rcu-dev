@@ -239,7 +239,7 @@ static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_o
 	 * stress the no-cell path concurrently.
 	 */
 	if (getenv("FT_INV_NO_ORDERED_LIST") &&
-			cds_ft_group_attr_set_no_ordered_list(attr) < 0)
+			cds_ft_group_attr_set_ordered_list(attr, false) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -272,7 +272,7 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen, struct cds_ft_group **gro
 	if (cds_ft_group_attr_set_speculative_key_offset(attr,
 			offsetof(struct ft_test_node, okey)) < 0)
 		abort();
-	if (cds_ft_group_attr_set_ordered_list(attr) < 0)
+	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -285,7 +285,7 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen, struct cds_ft_group **gro
 
 /*
  * Like create_fixed_ft, but UNCONDITIONALLY disables the ordered list
- * (cds_ft_group_attr_set_no_ordered_list), so the group allocates NO ordinal
+ * (cds_ft_group_attr_set_ordered_list(attr, false)), so the group allocates NO ordinal
  * cells: a head's prev is the flagged parent directly.  Used by the dedicated
  * no-cell concurrent invariant so the runtime cell-optional read path
  * (ft_resolve_head_prev prev-direct, skip resolution, parent backtrack) is
@@ -304,7 +304,7 @@ static struct cds_ft *create_fixed_nolist_ft(size_t klen, struct cds_ft_group **
 	if (cds_ft_group_attr_set_speculative_key_offset(attr,
 			offsetof(struct ft_test_node, okey)) < 0)
 		abort();
-	if (cds_ft_group_attr_set_no_ordered_list(attr) < 0)
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -5186,7 +5186,7 @@ static struct cds_ft_group *bulk_group_create(void)
 	 * leaves no stale in-leaf key behind, and the reader still sees the right
 	 * key for the moved nodes.
 	 */
-	cds_ft_group_attr_set_ordered_list(attr);
+	cds_ft_group_attr_set_ordered_list(attr, true);
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
