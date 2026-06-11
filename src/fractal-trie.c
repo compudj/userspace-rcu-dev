@@ -9176,6 +9176,20 @@ post_traversal:
 	FT_TP(post_traversal, (int) mode, (int) level,
 		(const void *) node_flag);
 	ft_delay_reader();
+	/*
+	 * If the descent consumed the whole key, normalize @level to the
+	 * end-of-key depth (key_depth - 1) BEFORE the equal-match check below.
+	 * The loop overshoots by one when the key terminates on an INTERNAL
+	 * node (level reaches key_depth) rather than breaking on an external
+	 * leaf (level == key_depth - 1): an internal node that holds the key as
+	 * a prefix-key external (it also has a longer-key subtree) is the exact
+	 * match, and the LE/GE arm's ft_node_internal branch returns its
+	 * external_nodes.  Without this normalization that arm is skipped and
+	 * the exact prefix-key match is missed (the non-compressed analogue of
+	 * the compressed full-match handled in the slow-path loop above).
+	 */
+	if (level >= key_depth)
+		level = key_depth - 1;
 	switch (mode) {
 	case FT_LOOKUP_LE:
 	case FT_LOOKUP_GE:
@@ -9259,10 +9273,6 @@ post_traversal:
 		iter->status = CDS_FT_STATUS_OK;
 		goto end;
 	}
-
-	/* If we reach end of key, we need to go one level backward. */
-	if (level >= key_depth)
-		level = key_depth - 1;
 
 	/*
 	 * For GE/GT: if the descent completed and the node at end-of-key
