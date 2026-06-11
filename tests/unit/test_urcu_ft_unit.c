@@ -1715,7 +1715,19 @@ static int test_node_batch(void)
 	cur = NULL;
 	seen = 0;
 	do {
-		n = cds_ft_node_next_batch(ft, cur, buf, 4, &cur);
+		enum cds_ft_status bs = cds_ft_node_next_batch(ft, cur, buf, 4,
+				&n, &cur);
+
+		if (bs == CDS_FT_STATUS_NOT_SUPPORTED) {
+			/* List-off trie: the node-cursor walk is N/A. */
+			rcu_read_unlock();
+			return drain_and_destroy(ft, group);
+		}
+		if (bs != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "node_batch fwd: status %d\n", (int) bs);
+			goto fail;
+		}
 		for (b = 0; b < n; b++) {
 			uint8_t k[4];
 			size_t kl;
@@ -1732,9 +1744,6 @@ static int test_node_batch(void)
 		}
 	} while (cur);
 	rcu_read_unlock();
-	if (seen == 0)
-		/* No ordered list in this build -- not applicable. */
-		return drain_and_destroy(ft, group);
 	if (seen != 10) {
 		fprintf(stderr, "node_batch fwd: saw %lu of 10\n", seen);
 		goto fail;
@@ -1745,7 +1754,12 @@ static int test_node_batch(void)
 	cur = NULL;
 	seen = 0;
 	do {
-		n = cds_ft_node_prev_batch(ft, cur, buf, 4, &cur);
+		if (cds_ft_node_prev_batch(ft, cur, buf, 4, &n, &cur)
+				!= CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "node_batch rev: bad status\n");
+			goto fail;
+		}
 		for (b = 0; b < n; b++) {
 			uint8_t k[4];
 			size_t kl;
@@ -1765,6 +1779,40 @@ static int test_node_batch(void)
 	if (seen != 10) {
 		fprintf(stderr, "node_batch rev: saw %lu of 10\n", seen);
 		goto fail;
+	}
+
+	/*
+	 * Exercise the node-cursor batched MACROS (no iterator in scope).  A tiny
+	 * @cap forces multiple internal batches; cross-check the key order.
+	 */
+	{
+		struct cds_ft_node *node, *mbuf[3];
+		unsigned long fwd = 0, rev = 0;
+
+		rcu_read_lock();
+		cds_ft_for_each_batched_rcu(ft, node, mbuf, 3) {
+			if (to_test_node(node)->key != fwd) {
+				rcu_read_unlock();
+				fprintf(stderr, "node_batch macro fwd: [%lu]=%llu\n", fwd,
+					(unsigned long long) to_test_node(node)->key);
+				goto fail;
+			}
+			fwd++;
+		}
+		cds_ft_for_each_reverse_batched_rcu(ft, node, mbuf, 3) {
+			if (to_test_node(node)->key != 9 - rev) {
+				rcu_read_unlock();
+				fprintf(stderr, "node_batch macro rev: [%lu]=%llu\n", rev,
+					(unsigned long long) to_test_node(node)->key);
+				goto fail;
+			}
+			rev++;
+		}
+		rcu_read_unlock();
+		if (fwd != 10 || rev != 10) {
+			fprintf(stderr, "node_batch macro: fwd %lu rev %lu\n", fwd, rev);
+			goto fail;
+		}
 	}
 
 	return drain_and_destroy(ft, group);
@@ -1843,14 +1891,23 @@ static int test_node_get_key_no_list(void)
 		}
 	}
 
-	/* The iterator-free stepper needs the list -> empty. */
-	rcu_read_lock();
-	n = cds_ft_node_next_batch(ft, NULL, buf, 4, &cur);
-	rcu_read_unlock();
-	if (n != 0 || cur != NULL) {
-		fprintf(stderr, "node no-list next_batch: %zu / %p\n", n,
-			(const void *) cur);
-		goto fail;
+	/* The iterator-free stepper needs the list -> NOT_SUPPORTED, not a silent
+	 * empty: cds_ft_ordered_list() must agree the list is off. */
+	{
+		enum cds_ft_status bs;
+
+		if (cds_ft_ordered_list(ft)) {
+			fprintf(stderr, "node no-list: cds_ft_ordered_list true on no-list trie\n");
+			goto fail;
+		}
+		rcu_read_lock();
+		bs = cds_ft_node_next_batch(ft, NULL, buf, 4, &n, &cur);
+		rcu_read_unlock();
+		if (bs != CDS_FT_STATUS_NOT_SUPPORTED || n != 0 || cur != NULL) {
+			fprintf(stderr, "node no-list next_batch: status %d n %zu cur %p\n",
+				(int) bs, n, (const void *) cur);
+			goto fail;
+		}
 	}
 
 	return drain_and_destroy(ft, group);
@@ -1988,6 +2045,28 @@ static int test_list_off_ops(void)
 	rcu_read_unlock();
 	if (seen != N)
 		goto fail;
+
+	/*
+	 * The node-cursor batched MACRO is ordered-list-only: on this list-off
+	 * trie it must iterate NOTHING (cds_ft_node_next_batch -> NOT_SUPPORTED),
+	 * not silently skip a populated trie.  Ordered iteration here goes through
+	 * the iterator (cds_ft_for_each_rcu / the lookup_first+next loop above).
+	 */
+	{
+		struct cds_ft_node *node, *mbuf[4];
+		unsigned int cnt = 0;
+
+		rcu_read_lock();
+		cds_ft_for_each_batched_rcu(ft, node, mbuf, 4) {
+			(void) node;
+			cnt++;
+		}
+		rcu_read_unlock();
+		if (cnt != 0) {
+			fprintf(stderr, "list_off: batched macro iterated %u\n", cnt);
+			goto fail;
+		}
+	}
 
 	/* Remove a distinct key (40): absent afterwards. */
 	rcu_read_lock();

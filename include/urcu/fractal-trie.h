@@ -363,7 +363,7 @@ enum cds_ft_status {
 	CDS_FT_STATUS_BUSY_ERROR		= -4,	/* Resource busy. */
 	CDS_FT_STATUS_POPULATED_ERROR		= -5,	/* Destination already populated. */
 	CDS_FT_STATUS_INTEGRITY_ERROR		= -6,	/* Integrity verification failure. */
-	CDS_FT_STATUS_NOT_SUPPORTED		= -7	/* Feature not compiled in. */
+	CDS_FT_STATUS_NOT_SUPPORTED		= -7	/* Operation unavailable for this trie's configuration (e.g. node-cursor ordered walk on a list-off trie), or feature not compiled in. */
 };
 
 /*
@@ -1214,10 +1214,12 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  *
  * Returns the number of nodes written (0 at end of trie).  The ordered
  * cell-list walk (Option E) advances the whole run inside this one call, so
- * the per-step library-call boundary is amortized across @cap nodes -- the
- * batched basis of cds_ft_for_each_batched_rcu().  Falls back to per-step
- * cds_ft_next() when the cell fast path is unavailable.  RCU read lock rules
- * are those of cds_ft_for_each_rcu().
+ * the per-step library-call boundary is amortized across @cap nodes; it falls
+ * back to per-step cds_ft_next() when the cell fast path is unavailable, so
+ * unlike the node-cursor cds_ft_node_next_batch() this iterator-based variant
+ * works on a list-off trie too (the iterator carries the key).  RCU read lock
+ * rules are those of cds_ft_for_each_rcu().  (The cds_ft_for_each_batched_rcu
+ * macro is built on the iterator-free cds_ft_node_next_batch(), not this.)
  */
 size_t cds_ft_iter_next_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
 		struct cds_ft_node **buf, size_t cap);
@@ -1225,41 +1227,46 @@ size_t cds_ft_iter_next_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
 /*
  * cds_ft_for_each_batched_rcu - In-order traversal, batched (amortized calls).
  * @ft: The Fractal Trie (struct cds_ft *).
- * @iter: Iterator (struct cds_ft_iter *), used as loop cursor.
  * @node: Loop variable (struct cds_ft_node *), set to each head in key order.
  * @buf: Caller scratch array of struct cds_ft_node *[@cap].
  * @cap: Capacity of @buf (a larger batch amortizes the call boundary further;
  *       32-64 is plenty).
  *
- * A drop-in for cds_ft_for_each_rcu() that hides batching: it refills @buf via
- * one cds_ft_iter_next_batch() library call per @cap nodes, then iterates the
- * buffer INLINE -- so the ordered cell-list walk pays the call boundary once
- * per batch instead of once per node.  Use @node directly (or
- * cds_ft_entry(@node, ...)); same RCU read-lock requirement.
+ * Batched in-order traversal built on the iterator-free cds_ft_node_next_batch():
+ * it refills @buf one library call per @cap nodes and iterates it INLINE, so the
+ * ordered cell-list walk pays the call boundary once per batch instead of once
+ * per node.  There is NO iterator object in scope -- the loop carries only a
+ * hidden NODE cursor -- so none of the stale-position hazards of an iterator
+ * apply; use @node directly (or cds_ft_entry(@node, ...)).  For the current
+ * node's key, materialize it from @node with cds_ft_node_get_key(ft, @node, ...).
  *
- * TODO / limitation: @iter is advanced once per batch, not per node, so it is
- * NOT positioned at @node inside the loop body -- cds_ft_iter_get_key(@iter,...)
- * and other iterator-position ops return the batch boundary, not @node.  This
- * macro is for counting / node (cds_ft_entry) access; per-node key
- * materialization needs per-step repositioning (buffer the cells, or land each
- * node), a follow-up.
+ * ORDERED-LIST ONLY: stepping node->node in key order needs the cell list, so on
+ * a list-off trie (cds_ft_group_attr_set_no_ordered_list) this loop iterates
+ * NOTHING (cds_ft_node_next_batch returns CDS_FT_STATUS_NOT_SUPPORTED, which the
+ * macro cannot surface).  Code that may run on either kind of trie must branch
+ * on cds_ft_ordered_list(ft) and use cds_ft_for_each_rcu() when it is false.
+ * Same RCU read-lock requirement as cds_ft_for_each_rcu().
  *
  *   struct cds_ft_node *node, *batch[64];
+ *   uint8_t key[256];		// >= cds_ft_max_key_len(ft)
+ *   size_t key_len;
  *   rcu_read_lock();
- *   cds_ft_for_each_batched_rcu(ft, iter, node, batch, 64) {
- *           ...use node...
+ *   cds_ft_for_each_batched_rcu(ft, node, batch, 64) {
+ *           cds_ft_node_get_key(ft, node, key, sizeof key, &key_len);
+ *           ...use node and its key...
  *   }
  *   rcu_read_unlock();
  */
-#define cds_ft_for_each_batched_rcu(ft, iter, node, buf, cap)			\
-	for (size_t _ftb_n = (cds_ft_lookup_first((ft), (iter)),		\
-				cds_ft_iter_next_batch((ft), (iter), (buf), (cap))), \
-			_ftb_i = 0;						\
-			_ftb_n != 0;						\
-			_ftb_n = cds_ft_iter_next_batch((ft), (iter), (buf), (cap)), \
-			_ftb_i = 0)						\
-		for (; _ftb_i < _ftb_n &&					\
-				(((node) = (buf)[_ftb_i]), 1); _ftb_i++)
+#define cds_ft_for_each_batched_rcu(ft, node, buf, cap)				\
+	for (struct { const struct cds_ft_node *cur; size_t n, i; int started; } \
+			_ftb = { NULL, 0, 0, 0 };				\
+		(!_ftb.started || _ftb.cur != NULL) &&				\
+			(cds_ft_node_next_batch((ft), _ftb.cur, (buf), (cap),	\
+				&_ftb.n, &_ftb.cur),				\
+			 _ftb.started = 1, _ftb.i = 0, 1);			\
+		)								\
+		for (; _ftb.i < _ftb.n &&					\
+				(((node) = (buf)[_ftb.i]), 1); _ftb.i++)
 
 /*
  * cds_ft_iter_prev_batch - Fetch the next run of REVERSE in-order nodes.
@@ -1274,18 +1281,20 @@ size_t cds_ft_iter_prev_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
 /*
  * cds_ft_for_each_reverse_batched_rcu - Reverse in-order traversal, batched.
  * The descending-key-order counterpart of cds_ft_for_each_batched_rcu(): visits
- * every head from the largest key down, batching via cds_ft_iter_prev_batch().
- * Same arguments and RCU read-lock rules.
+ * every head from the largest key down, batching via cds_ft_node_prev_batch().
+ * Same arguments, RCU rules, and ORDERED-LIST-ONLY contract (list-off iterates
+ * nothing; branch on cds_ft_ordered_list() and use cds_ft_for_each_reverse_rcu()).
  */
-#define cds_ft_for_each_reverse_batched_rcu(ft, iter, node, buf, cap)		\
-	for (size_t _ftb_n = (cds_ft_lookup_last((ft), (iter)),			\
-				cds_ft_iter_prev_batch((ft), (iter), (buf), (cap))), \
-			_ftb_i = 0;						\
-			_ftb_n != 0;						\
-			_ftb_n = cds_ft_iter_prev_batch((ft), (iter), (buf), (cap)), \
-			_ftb_i = 0)						\
-		for (; _ftb_i < _ftb_n &&					\
-				(((node) = (buf)[_ftb_i]), 1); _ftb_i++)
+#define cds_ft_for_each_reverse_batched_rcu(ft, node, buf, cap)			\
+	for (struct { const struct cds_ft_node *cur; size_t n, i; int started; } \
+			_ftb = { NULL, 0, 0, 0 };				\
+		(!_ftb.started || _ftb.cur != NULL) &&				\
+			(cds_ft_node_prev_batch((ft), _ftb.cur, (buf), (cap),	\
+				&_ftb.n, &_ftb.cur),				\
+			 _ftb.started = 1, _ftb.i = 0, 1);			\
+		)								\
+		for (; _ftb.i < _ftb.n &&					\
+				(((node) = (buf)[_ftb.i]), 1); _ftb.i++)
 
 /*
  * cds_ft_for_each_reverse_rcu - Iterate through all (or prefix-scoped) nodes in reverse key order.
@@ -2710,27 +2719,32 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  * @cursor: Node to start AT (inclusive); NULL starts at the list minimum.
  * @buf: Output array of up to @cap head pointers, in ascending key order.
  * @cap: Capacity of @buf.
+ * @count: Output -- number of nodes written to @buf (0 at the end of the walk).
  * @next_cursor: Output -- the node to pass as @cursor next, or NULL at the end.
  *
  * Walks @ft's ordered cell list without an iterator object, emitting head
  * pointers a batch at a time so the per-call boundary is paid once per @cap
  * nodes.  Pair with cds_ft_node_get_key() to turn the returned nodes into keys.
- * Stop when @cursor comes back NULL (NOT when the count is 0): a NULL @cursor
- * is BOTH the start sentinel and the end signal, so terminate on the returned
+ * Stop when @cursor comes back NULL (NOT when *@count is 0): a NULL @cursor is
+ * BOTH the start sentinel and the end signal, so terminate on the returned
  * cursor, not the count, or the walk restarts from the minimum:
  *
  *   const struct cds_ft_node *cur = NULL;
  *   size_t n, i;
  *   do {
- *           n = cds_ft_node_next_batch(ft, cur, buf, N, &cur);
+ *           if (cds_ft_node_next_batch(ft, cur, buf, N, &n, &cur) != CDS_FT_STATUS_OK)
+ *                   break;       // list off: use cds_ft_for_each_rcu() instead
  *           for (i = 0; i < n; i++)
  *                   cds_ft_node_get_key(ft, buf[i], k, sizeof k, &kl);
  *   } while (cur);
  *
- * ORDERED-LIST ONLY: the step is the cell ord_next walk.  A group without the
- * ordered list (cds_ft_group_attr_set_no_ordered_list, or a build without the
- * ordered cell list) returns 0 and *next_cursor == NULL -- there is no "next in
- * key order" from a bare node; use cds_ft_next() with an iterator instead.
+ * ORDERED-LIST ONLY: the step IS the cell ord_next walk.  Stepping node->node in
+ * key order needs the cell list; a bare node on a list-off trie
+ * (cds_ft_group_attr_set_no_ordered_list) has no recoverable successor -- a leaf
+ * key gives ONE key, not the NEXT one.  Such a trie returns
+ * CDS_FT_STATUS_NOT_SUPPORTED (*@count = 0, *@next_cursor = NULL); use
+ * cds_ft_next()/cds_ft_for_each_rcu() (a stateful iterator) there.  Query the
+ * mode up front with cds_ft_ordered_list().
  *
  * RCU CONTRACT: like cds_ft_node_get_key(), @cursor and the returned nodes are
  * valid only while the RCU read-side lock that produced @cursor is held
@@ -2738,19 +2752,35 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  * a resumable scan that spans grace periods, use the iterator (which can carry
  * a materialized key across a CS).
  *
- * Returns the number of nodes written to @buf (0 at the end / when unsupported).
+ * Returns CDS_FT_STATUS_OK (batch in @buf/@count, possibly 0 at the end), or
+ * CDS_FT_STATUS_NOT_SUPPORTED on a list-off trie.
  */
-size_t cds_ft_node_next_batch(struct cds_ft *ft, const struct cds_ft_node *cursor,
-		struct cds_ft_node **buf, size_t cap,
-		const struct cds_ft_node **next_cursor);
+enum cds_ft_status cds_ft_node_next_batch(struct cds_ft *ft,
+		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
+		size_t cap, size_t *count, const struct cds_ft_node **next_cursor);
 
 /*
  * cds_ft_node_prev_batch - Reverse (descending-key-order) cds_ft_node_next_batch.
  * @cursor NULL starts at the list maximum; otherwise identical, stepping down.
  */
-size_t cds_ft_node_prev_batch(struct cds_ft *ft, const struct cds_ft_node *cursor,
-		struct cds_ft_node **buf, size_t cap,
-		const struct cds_ft_node **next_cursor);
+enum cds_ft_status cds_ft_node_prev_batch(struct cds_ft *ft,
+		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
+		size_t cap, size_t *count, const struct cds_ft_node **next_cursor);
+
+/*
+ * cds_ft_ordered_list - Whether @ft maintains the key-ordered cell list.
+ *
+ * True when the group enabled the ordered list (the default;
+ * cds_ft_group_attr_set_no_ordered_list disables it).  Immutable for the life of
+ * the trie.  It is the precondition for the node-cursor ordered walk
+ * (cds_ft_node_next_batch / cds_ft_node_prev_batch and the
+ * cds_ft_for_each_batched_rcu macros): a list-off trie cannot step node->node in
+ * key order, so generic code should branch to cds_ft_for_each_rcu() when this
+ * returns false.  (Note: cds_ft_node_get_key() is broader -- it also works on a
+ * list-off trie that has an in-leaf key, since materializing ONE key needs no
+ * stepping.)
+ */
+bool cds_ft_ordered_list(const struct cds_ft *ft);
 
 /*
  * cds_ft_iter_get_prefix - Retrieve the current prefix from an iterator.

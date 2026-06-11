@@ -23586,65 +23586,73 @@ size_t cds_ft_iter_prev_batch(struct cds_ft *ft, struct cds_ft_iter *iter,
  * prediction as ft_iter_batch_dir; @forward is a literal at both call sites so
  * always_inline folds the direction out.
  *
- * ORDERED-LIST ONLY: the step IS the cell ord_next / ord_prev walk.  A group
- * with no ordered list (ordered_list_set false, or a non-cell build) has no
- * "next in key order" reachable from a bare node -- returns 0, *next_cursor =
- * NULL; use the iterator (cds_ft_next / cds_ft_prev, structural descent) there.
+ * ORDERED-LIST ONLY: the step IS the cell ord_next / ord_prev walk.  Stepping
+ * node->node in key order needs the cell list; a bare node on a list-off trie
+ * has no recoverable "next in key order" (a leaf key materializes ONE key but
+ * not the SUCCESSOR -- that needs the list or an iterator).  So a list-off trie
+ * yields CDS_FT_STATUS_NOT_SUPPORTED (*count = 0, *next_cursor = NULL): use the
+ * iterator (cds_ft_next / cds_ft_prev, structural descent) there.
  *
  * RCU CONTRACT: @cursor and every emitted node are valid only while the read
  * lock that produced @cursor is held continuously (see cds_ft_node_get_key).
  */
 static inline __attribute__((always_inline))
-size_t ft_node_batch_dir(struct cds_ft *ft, const struct cds_ft_node *cursor,
-		struct cds_ft_node **buf, size_t cap,
+enum cds_ft_status ft_node_batch_dir(struct cds_ft *ft,
+		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
+		size_t cap, size_t *count,
 		const struct cds_ft_node **next_cursor, const bool forward)
 {
 	size_t n = 0;
+	const uintptr_t stride = (uintptr_t) 1 << FT_ORD_CELL_ALLOC_ORDER;
+	struct ft_ord_cell *cur;
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 	*next_cursor = NULL;
+	*count = 0;
+	if (caa_unlikely(!ft->ordered_list))
+		return CDS_FT_STATUS_NOT_SUPPORTED;
 	if (caa_unlikely(cap == 0))
-		return 0;
-	if (ft->group->ordered_list_set) {
-		const uintptr_t stride = (uintptr_t) 1 << FT_ORD_CELL_ALLOC_ORDER;
-		struct ft_ord_cell *cur;
+		return CDS_FT_STATUS_OK;
+	if (cursor)
+		cur = ft_ord_cell_ptr(rcu_dereference(
+			((struct cds_ft_node *) cursor)->prev));
+	else
+		cur = ft_ord_cell_resolve_ord(forward ?
+			&ft->ord_cell_head : &ft->ord_cell_tail);
+	while (n < cap && cur) {
+		struct ft_ord_cell *loaded, *guess;
 
-		if (cursor)
-			cur = ft_ord_cell_ptr(rcu_dereference(
-				((struct cds_ft_node *) cursor)->prev));
-		else
-			cur = ft_ord_cell_resolve_ord(forward ?
-				&ft->ord_cell_head : &ft->ord_cell_tail);
-		while (n < cap && cur) {
-			struct ft_ord_cell *loaded, *guess;
-
-			buf[n++] = cur->node;
-			loaded = forward ?
-				ft_ord_cell_resolve_ord(&cur->ord_next) :
-				ft_ord_cell_resolve_ord(&cur->ord_prev);
-			guess = (struct ft_ord_cell *) (forward ?
-				(uintptr_t) cur + stride :
-				(uintptr_t) cur - stride);
-			cur = (loaded && cmm_ptr_eq(loaded, guess)) ? guess : loaded;
-		}
-		*next_cursor = cur ? cur->node : NULL;
-		return n;
+		buf[n++] = cur->node;
+		loaded = forward ?
+			ft_ord_cell_resolve_ord(&cur->ord_next) :
+			ft_ord_cell_resolve_ord(&cur->ord_prev);
+		guess = (struct ft_ord_cell *) (forward ?
+			(uintptr_t) cur + stride :
+			(uintptr_t) cur - stride);
+		cur = (loaded && cmm_ptr_eq(loaded, guess)) ? guess : loaded;
 	}
-	return 0;
+	*next_cursor = cur ? cur->node : NULL;
+	*count = n;
+	return CDS_FT_STATUS_OK;
 }
 
-size_t cds_ft_node_next_batch(struct cds_ft *ft, const struct cds_ft_node *cursor,
-		struct cds_ft_node **buf, size_t cap,
-		const struct cds_ft_node **next_cursor)
+enum cds_ft_status cds_ft_node_next_batch(struct cds_ft *ft,
+		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
+		size_t cap, size_t *count, const struct cds_ft_node **next_cursor)
 {
-	return ft_node_batch_dir(ft, cursor, buf, cap, next_cursor, true);
+	return ft_node_batch_dir(ft, cursor, buf, cap, count, next_cursor, true);
 }
 
-size_t cds_ft_node_prev_batch(struct cds_ft *ft, const struct cds_ft_node *cursor,
-		struct cds_ft_node **buf, size_t cap,
-		const struct cds_ft_node **next_cursor)
+enum cds_ft_status cds_ft_node_prev_batch(struct cds_ft *ft,
+		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
+		size_t cap, size_t *count, const struct cds_ft_node **next_cursor)
 {
-	return ft_node_batch_dir(ft, cursor, buf, cap, next_cursor, false);
+	return ft_node_batch_dir(ft, cursor, buf, cap, count, next_cursor, false);
+}
+
+bool cds_ft_ordered_list(const struct cds_ft *ft)
+{
+	return ft->ordered_list;
 }
 
 enum cds_ft_status cds_ft_iter_set_cache_mode(struct cds_ft_iter *iter,
