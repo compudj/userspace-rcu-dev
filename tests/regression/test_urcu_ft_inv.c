@@ -230,6 +230,17 @@ static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_o
 	if (cds_ft_group_attr_set_speculative_key_offset(attr,
 			offsetof(struct ft_test_node, okey)) < 0)
 		abort();
+	/*
+	 * FT_INV_NO_ORDERED_LIST forces the ordered list OFF on this (default)
+	 * group, exercising the runtime cell-optional path: a cell build then
+	 * allocates NO ordinal cells (head->prev is the flagged parent directly).
+	 * The ordered invariants use create_fixed_ord_ft (explicit set_ordered_list)
+	 * so they are unaffected; run the NON-ordered invariants under this env to
+	 * stress the no-cell path concurrently.
+	 */
+	if (getenv("FT_INV_NO_ORDERED_LIST") &&
+			cds_ft_group_attr_set_no_ordered_list(attr) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);

@@ -1611,7 +1611,8 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
  * cell->parent rather than overwriting prev).
  */
 static inline
-void ft_publish_external_nodes_prev(struct cds_ft_inode_flag *node_flag,
+void ft_publish_external_nodes_prev(struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_node *external_nodes);
 
 /*
@@ -1836,8 +1837,9 @@ struct ft_ord_cell *ft_ord_cell_ptr(const void *prev)
 static inline_lookup
 struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *prev)
 {
-	(void) ft;
-	return rcu_dereference(ft_ord_cell_ptr(prev)->parent);
+	if (ft->ordered_list)
+		return rcu_dereference(ft_ord_cell_ptr(prev)->parent);
+	return (struct cds_ft_inode_flag *) prev;
 }
 
 /*
@@ -1984,10 +1986,16 @@ struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
  * external-nodes choke point, which resolve the cell themselves.
  */
 #ifdef FEATURE_FT_ORD_CELL
-#define ft_external_head_set_parent(node, parent)			\
-	ft_ord_cell_set_parent((node), (struct cds_ft_inode_flag *) (parent))
+#define ft_external_head_set_parent(ft, node, parent)			\
+	do {								\
+		if ((ft)->ordered_list)					\
+			ft_ord_cell_set_parent((node),			\
+				(struct cds_ft_inode_flag *) (parent));	\
+		else							\
+			(node)->prev = (parent);			\
+	} while (0)
 #else
-#define ft_external_head_set_parent(node, parent)			\
+#define ft_external_head_set_parent(ft, node, parent)			\
 	do { (node)->prev = (parent); } while (0)
 #endif
 
@@ -2002,21 +2010,27 @@ struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
  * reachable through node_flag's slot.  No-op when @external_nodes is NULL
  * (callers commonly guard on metadata->external_nodes).
  *
- * Cell-always: @external_nodes is an existing head, so its prev already
+ * Ordered list on: @external_nodes is an existing head, so its prev already
  * carries its cell; record the new parent into cell->parent (the head's
  * prev — the cell pointer — is unchanged).  All choke-point callers
  * re-parent an existing head (a fresh head's parent is wired by ft_set_parent
- * via ft_node_set_nth), so the cell is guaranteed present.
+ * via ft_node_set_nth), so the cell is guaranteed present.  List off / non-cell:
+ * the head's prev IS the flagged parent, so re-parent it directly.
  */
 static inline
-void ft_publish_external_nodes_prev(struct cds_ft_inode_flag *node_flag,
+void ft_publish_external_nodes_prev(struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_node *external_nodes)
 {
 	if (!external_nodes)
 		return;
 #ifdef FEATURE_FT_ORD_CELL
-	ft_ord_cell_set_parent(external_nodes, node_flag);
+	if (ft->ordered_list)
+		ft_ord_cell_set_parent(external_nodes, node_flag);
+	else
+		rcu_assign_pointer(external_nodes->prev, node_flag);
 #else
+	(void) ft;
 	rcu_assign_pointer(external_nodes->prev, node_flag);
 #endif
 }
@@ -2822,14 +2836,20 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 #endif
 	if (ft_node_external(child_nf)) {
 		/*
-		 * Cell-always: the head carries its cell in prev; record the
+		 * Ordered list on: the head carries its cell in prev; record the
 		 * parent into cell->parent (fresh head: cell pre-wired at insert;
-		 * existing head re-parent: cell already present).  Non-cell: the
-		 * parent is the head's prev directly.  rcu_assign either way:
+		 * existing head re-parent: cell already present).  List off / non-cell:
+		 * the parent is the head's prev directly.  rcu_assign either way:
 		 * ft_set_parent re-parents live heads on the restructure path.
 		 */
 #ifdef FEATURE_FT_ORD_CELL
-		ft_ord_cell_set_parent((struct cds_ft_node *) child_nf, parent_nf);
+		if (ft->ordered_list)
+			ft_ord_cell_set_parent((struct cds_ft_node *) child_nf,
+				parent_nf);
+		else
+			rcu_assign_pointer(
+				((struct cds_ft_node *) child_nf)->prev,
+				parent_nf);
 #else
 		rcu_assign_pointer(
 			((struct cds_ft_node *) child_nf)->prev,
@@ -6146,7 +6166,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			 */
 			ft_metadata_set_external_nodes(new_node_flag,
 				new_metadata, metadata->external_nodes);
-			ft_publish_external_nodes_prev(new_node_flag,
+			ft_publish_external_nodes_prev(ft, new_node_flag,
 				metadata->external_nodes);
 			ft_nr_keys_store(new_metadata,
 				ft_nr_keys_get(metadata), CMM_RELAXED);
@@ -11535,7 +11555,7 @@ int ft_attach_node(struct cds_ft *ft,
 		 * reparent loop).  Wire the back-channel from the live
 		 * displaced external before the outer forward publish.
 		 */
-		ft_publish_external_nodes_prev(iter_node_flag, external_nodes);
+		ft_publish_external_nodes_prev(ft, iter_node_flag, external_nodes);
 		/* Attach branch (unlink the old node from the trie).
 		 * ft_publish_to_parent handles skip pointer update
 		 * if the attach target is a compressed node's child.
@@ -11682,7 +11702,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		ft_nr_keys_store(br_meta, 1, CMM_RELAXED);
 	}
 	/* Phase 2: back-channel + forward publish. */
-	ft_publish_external_nodes_prev(branch, (struct cds_ft_node *) cn->child);
+	ft_publish_external_nodes_prev(ft, branch, (struct cds_ft_node *) cn->child);
 	ft_publish_to_parent(ft, d->nf, &cn->child, branch);
 	ft_propagate_external_count_parent(ft, branch, 1);
 	return 0;
@@ -11772,7 +11792,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 			 * duplicate at existing key, no new unique key. */
 			goto skip_key_count_propagation;
 		}
-		ft_external_head_set_parent(node, jct_flag);
+		ft_external_head_set_parent(ft, node, jct_flag);
 		node->next = NULL;
 		rcu_assign_pointer(
 			jct_meta->external_nodes, node);
@@ -11930,7 +11950,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 #ifdef FEATURE_FT_ORD_CELL
 	/*
-	 * Cell-always: pre-wire @node's ordinal cell before any structural
+	 * Ordered-list trie: pre-wire @node's ordinal cell before any structural
 	 * mutation, so the only failure-prone allocation happens up front (a
 	 * clean -ENOMEM, nothing to roll back) and every fresh-head wiring site
 	 * downstream just records the flagged parent into the cell (node->prev
@@ -11938,8 +11958,13 @@ int _cds_ft_insert(struct cds_ft *ft,
 	 * head) or the insert fails, the unused @precell is freed at insert_done
 	 * (a chained @node has its prev repointed at the predecessor, losing the
 	 * cell from node->prev, so the handle is kept here).
+	 *
+	 * List off: no cell -- @node behaves like a non-cell build (its prev is
+	 * wired to the flagged parent directly by the fresh-head sites), saving
+	 * the per-key cell.  @precell stays NULL and the cell paths below no-op.
 	 */
-	{
+	precell = NULL;
+	if (ft->ordered_list) {
 		void *cell = ft_ord_cell_alloc(ft, node, NULL);
 
 		if (!cell)
@@ -12070,7 +12095,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 				ret = 0;
 			} else {
 				/* New key at this internal node. */
-				ft_external_head_set_parent(node, d.nf);
+				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 				ret = 0;
@@ -12133,17 +12158,21 @@ insert_done:
 	 * — i.e. not external.  A duplicate append (ft_chain_node repointed
 	 * node->prev at the predecessor) or a failed insert leaves @precell
 	 * orphaned: free it, and on failure restore node->prev to its zeroed
-	 * state so the application may retry.  (Stage 3b will splice the kept
-	 * cell into the ordered list here when ordered_list_set.)
+	 * state so the application may retry, then splice the kept cell into the
+	 * ordered list.  List off: no cell was allocated -- @node->prev is the
+	 * flagged parent (fresh head) or the predecessor (dup) or NULL (failed),
+	 * exactly as in a non-cell build, so there is nothing to free or splice.
 	 */
-	if (ret != 0) {
-		node->prev = NULL;
-		ft_ord_cell_free_unpublished(ft, precell);
-	} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
-		ft_ord_cell_free_unpublished(ft, precell);
-	} else if (ft->group->ordered_list_set) {
-		/* @node became a fresh head: splice its kept cell into the list. */
-		ft_ord_cell_splice(ft, _key, _key_len, precell);
+	if (ft->ordered_list) {
+		if (ret != 0) {
+			node->prev = NULL;
+			ft_ord_cell_free_unpublished(ft, precell);
+		} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
+			ft_ord_cell_free_unpublished(ft, precell);
+		} else {
+			/* @node became a fresh head: splice its cell into the list. */
+			ft_ord_cell_splice(ft, _key, _key_len, precell);
+		}
 	}
 #endif
 	if (ret == 0) {
@@ -12254,11 +12283,12 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		return -EINVAL;
 
 #ifdef FEATURE_FT_ORD_CELL
-	/* Cell-always: pre-wire @node's cell (see _cds_ft_insert).  A replace
+	/* Ordered-list trie: pre-wire @node's cell (see _cds_ft_insert).  A replace
 	 * always lands @node as the sole head on success, so the cell is kept
 	 * unless the insert fails (or the key_shorter path finds the key and
-	 * leaves @node uninstalled — both freed below). */
-	{
+	 * leaves @node uninstalled — both freed below).  List off: no cell. */
+	precell = NULL;
+	if (ft->ordered_list) {
 		void *cell = ft_ord_cell_alloc(ft, node, NULL);
 
 		if (!cell)
@@ -12371,27 +12401,27 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						external_nodes);
 				/* Replace existing chain: key count unchanged. */
 				*old_node_ret = external_nodes;
-				ft_external_head_set_parent(node, d.nf);
+				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 #ifdef FEATURE_FT_ORD_CELL
 				/*
-				 * The replaced head's cell leaves the trie.  When the
-				 * ordered list is on, @node's pre-wired cell takes its
-				 * list slot first (O(1) swap, no re-descent).
+				 * Ordered list on: the replaced head's cell leaves the
+				 * trie; @node's pre-wired cell takes its list slot (O(1)
+				 * swap, no re-descent), then the old cell is freed.  List
+				 * off: no cells, nothing to swap or free.
 				 */
-				{
+				if (ft->ordered_list) {
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr(external_nodes->prev);
 
-					if (ft->group->ordered_list_set)
-						ft_ord_cell_swap(ft, old_cell, precell);
+					ft_ord_cell_swap(ft, old_cell, precell);
 					ft_ord_cell_free(ft, old_cell);
 				}
 #endif
 			} else {
 				/* No external nodes yet. New key. */
-				ft_external_head_set_parent(node, d.nf);
+				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
 				rcu_assign_pointer(metadata->external_nodes, node);
 				ft_propagate_external_count_parent(ft, d.nf, 1);
@@ -12402,18 +12432,18 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					ft_node_ptr(d.nf));
 			/* External node at end of key. Replace chain: key count unchanged. */
 			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
-			ft_external_head_set_parent(node, d.pnf);
+			ft_external_head_set_parent(ft, node, d.pnf);
 			node->next = NULL;
 			ft_publish_to_parent(ft, d.pnf, d.nfp,
 				(struct cds_ft_inode_flag *) node);
 #ifdef FEATURE_FT_ORD_CELL
-			/* Replaced head's cell leaves; @node's cell takes its slot. */
-			{
+			/* Ordered list on: replaced head's cell leaves; @node's cell
+			 * takes its slot, then the old cell is freed.  List off: none. */
+			if (ft->ordered_list) {
 				struct ft_ord_cell *old_cell =
 					ft_ord_cell_ptr((*old_node_ret)->prev);
 
-				if (ft->group->ordered_list_set)
-					ft_ord_cell_swap(ft, old_cell, precell);
+				ft_ord_cell_swap(ft, old_cell, precell);
 				ft_ord_cell_free(ft, old_cell);
 			}
 #endif
@@ -12449,19 +12479,23 @@ insert_replace_done:
 	 * compressed node chained @node), the uninstalled key_shorter -EEXIST
 	 * path (prev NULLed above), or a failed insert leaves @precell orphaned
 	 * — free it, and on failure restore node->prev to its zeroed state.
+	 * List off: no cell, nothing to free or splice (the swap sites above are
+	 * gated too).
 	 */
-	if (ret != 0) {
-		node->prev = NULL;
-		ft_ord_cell_free_unpublished(ft, precell);
-	} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
-		ft_ord_cell_free_unpublished(ft, precell);
-	} else if (ft->group->ordered_list_set && *old_node_ret == NULL) {
-		/*
-		 * Fresh head (no chain replaced): splice its kept cell.  A replace
-		 * (*old_node_ret set) already swapped @precell into the replaced
-		 * head's list slot at the replace site, so it must NOT splice again.
-		 */
-		ft_ord_cell_splice(ft, _key, _key_len, precell);
+	if (ft->ordered_list) {
+		if (ret != 0) {
+			node->prev = NULL;
+			ft_ord_cell_free_unpublished(ft, precell);
+		} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
+			ft_ord_cell_free_unpublished(ft, precell);
+		} else if (*old_node_ret == NULL) {
+			/*
+			 * Fresh head (no chain replaced): splice its kept cell.  A replace
+			 * (*old_node_ret set) already swapped @precell into the replaced
+			 * head's list slot at the replace site, so it must NOT splice again.
+			 */
+			ft_ord_cell_splice(ft, _key, _key_len, precell);
+		}
 	}
 #endif
 	if (ret == 0) {
@@ -12625,8 +12659,11 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	 * and ordered iteration resolve to the live node; the cell's parent and
 	 * ord-list position are preserved (no list surgery, no free).  A
 	 * non-head duplicate replace copied an external prev — nothing to do.
+	 * List off: @new_node->prev is the flagged parent directly (inherited),
+	 * no cell to retarget.
 	 */
-	if (!ft_node_external((struct cds_ft_inode_flag *) new_node->prev))
+	if (ft->ordered_list &&
+	    !ft_node_external((struct cds_ft_inode_flag *) new_node->prev))
 		rcu_assign_pointer(ft_ord_cell_ptr(new_node->prev)->node, new_node);
 #endif
 
@@ -13488,7 +13525,7 @@ end:
  * rcu_dereference of child->prev.
  */
 static
-void ft_unchain_node(struct cds_ft_node **head_slot,
+void ft_unchain_node(struct cds_ft *ft, struct cds_ft_node **head_slot,
 		struct cds_ft_node *node)
 {
 	struct cds_ft_node *next_node = ft_node_next(node);
@@ -13510,9 +13547,10 @@ void ft_unchain_node(struct cds_ft_node **head_slot,
 		 * the copy above, so it becomes the new head sharing the same cell;
 		 * retarget the cell at the promoted head (ord-list position and
 		 * parent are preserved — no list surgery).  When @next_node is NULL
-		 * the key disappears and the caller frees the cell.
+		 * the key disappears and the caller frees the cell.  List off:
+		 * @next_node->prev is the flagged parent directly (inherited), no cell.
 		 */
-		if (next_node)
+		if (ft->ordered_list && next_node)
 			rcu_assign_pointer(ft_ord_cell_ptr(node->prev)->node,
 				next_node);
 #endif
@@ -13628,7 +13666,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * ft_unchain_node), and a key disappearance (no successor) frees the
 	 * cell after the removal commits (ret == 0).
 	 */
-	bool cell_was_head =
+	bool cell_was_head = ft->ordered_list &&
 		!ft_node_external((struct cds_ft_inode_flag *) node->prev);
 	struct ft_ord_cell *dead_cell = cell_was_head ?
 		ft_ord_cell_ptr(node->prev) : NULL;
@@ -13644,7 +13682,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		 * any grandparent skip pointer to it — is untouched, so no head
 		 * slot is needed.
 		 */
-		ft_unchain_node(NULL, node);
+		ft_unchain_node(ft, NULL, node);
 		ret = 0;
 	} else if (ft_node_compressed(holder_flag) ||
 		   ft_node_skip_compressed(holder_flag)) {
@@ -13682,7 +13720,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				ft_node_mark_removed(node);
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
-			ft_unchain_node((struct cds_ft_node **) head_slot, node);
+			ft_unchain_node(ft, (struct cds_ft_node **) head_slot, node);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
 			 * Unchaining replaced cn->child with the next entry, but
@@ -13713,7 +13751,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		holder_meta = cds_ft_item_to_metadata(ft_node_ptr(holder_flag));
 		if (!ft_node_next(node))
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
-		ft_unchain_node((struct cds_ft_node **) &holder_meta->external_nodes,
+		ft_unchain_node(ft, (struct cds_ft_node **) &holder_meta->external_nodes,
 			node);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
@@ -13763,7 +13801,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				ft_node_mark_removed(node);
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
-			ft_unchain_node((struct cds_ft_node **) head_slot, node);
+			ft_unchain_node(ft, (struct cds_ft_node **) head_slot, node);
 			ret = 0;
 		}
 	}
@@ -13776,8 +13814,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * key, only cell->node retargeted in ft_unchain_node — so no list op.
 	 */
 	if (ret == 0 && cell_was_head && !cell_succ) {
-		if (ft->group->ordered_list_set)
-			ft_ord_cell_unsplice(ft, dead_cell);
+		/* cell_was_head implies ordered_list, so the list op always runs. */
+		ft_ord_cell_unsplice(ft, dead_cell);
 		ft_ord_cell_free(ft, dead_cell);
 	}
 #endif
@@ -13911,13 +13949,12 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			CMM_RELEASE);
 		rcu_assign_pointer(metadata->external_nodes, NULL);
 #ifdef FEATURE_FT_ORD_CELL
-		/* The head's cell leaves the trie (capture before mark_removed,
-		 * though that only tombstones ->next). */
-		{
+		/* Ordered list on: the head's cell leaves the trie (capture before
+		 * mark_removed, though that only tombstones ->next).  List off: none. */
+		if (ft->ordered_list) {
 			struct ft_ord_cell *dead = ft_ord_cell_ptr(external_nodes->prev);
 
-			if (ft->group->ordered_list_set)
-				ft_ord_cell_unsplice(ft, dead);
+			ft_ord_cell_unsplice(ft, dead);
 			ft_ord_cell_free(ft, dead);
 		}
 #endif
@@ -14013,15 +14050,14 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	assert(ret != -ENOENT);
 
 #ifdef FEATURE_FT_ORD_CELL
-	/* The whole key left the trie: its head's cell is unspliced (when the
-	 * ordered list is on) and freed (deferred).  chain_head->prev still
-	 * carries the cell (detach reshapes ancestors and head_slot, not the
-	 * head's prev). */
-	if (ret == 0) {
+	/* Ordered list on: the whole key left the trie: its head's cell is
+	 * unspliced and freed (deferred).  chain_head->prev still carries the cell
+	 * (detach reshapes ancestors and head_slot, not the head's prev).  List
+	 * off: chain_head->prev is the flagged parent, no cell. */
+	if (ret == 0 && ft->ordered_list) {
 		struct ft_ord_cell *dead = ft_ord_cell_ptr(chain_head->prev);
 
-		if (ft->group->ordered_list_set)
-			ft_ord_cell_unsplice(ft, dead);
+		ft_ord_cell_unsplice(ft, dead);
 		ft_ord_cell_free(ft, dead);
 	}
 #endif
@@ -14756,13 +14792,15 @@ void ft_graft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
 		struct cds_ft_node *tail = dst_head;
 #ifdef FEATURE_FT_ORD_CELL
 		/*
-		 * @src_head was a head in src (prev is its cell); it becomes a
-		 * non-head duplicate of @dst_head, so its cell leaves the trie.
-		 * The src chain is already detached + drained and @src_head is not
-		 * yet reachable in dst (published by the rcu_assign below), so the
-		 * cell is unreachable — free it synchronously.
+		 * Ordered list on: @src_head was a head in src (prev is its cell);
+		 * it becomes a non-head duplicate of @dst_head, so its cell leaves
+		 * the trie.  The src chain is already detached + drained and
+		 * @src_head is not yet reachable in dst (published by the rcu_assign
+		 * below), so the cell is unreachable — free it synchronously.  List
+		 * off: src_head->prev is the flagged parent, no cell.
 		 */
-		struct ft_ord_cell *src_cell = ft_ord_cell_ptr(src_head->prev);
+		struct ft_ord_cell *src_cell = ft->ordered_list ?
+			ft_ord_cell_ptr(src_head->prev) : NULL;
 #endif
 
 		while (ft_node_next(tail))
@@ -14770,7 +14808,8 @@ void ft_graft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
 		src_head->prev = tail;	/* write-side only, plain store */
 		rcu_assign_pointer(tail->next, src_head);
 #ifdef FEATURE_FT_ORD_CELL
-		ft_ord_cell_free_unpublished(ft, src_cell);
+		if (src_cell)
+			ft_ord_cell_free_unpublished(ft, src_cell);
 #endif
 	}
 }
@@ -15436,7 +15475,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 
 		if (displaced) {
 			/* Phase 2: back-channel + glue deferred + forward publish. */
-			ft_publish_external_nodes_prev(branch, displaced);
+			ft_publish_external_nodes_prev(ft, branch, displaced);
 			ft_graft_glue_apply_deferred(ft, glue);
 			ft_publish_to_parent(ft, d->pnf, d->nfp, branch);
 			if (i >= 1)
@@ -17236,7 +17275,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				 * with the metadata write for consistency with
 				 * the other attach sites.
 				 */
-				ft_publish_external_nodes_prev(root_nf,
+				ft_publish_external_nodes_prev(dst_ft, root_nf,
 					(struct cds_ft_node *) ft_node_ptr(old_child));
 				ft_nr_keys_store(rm, old_count, CMM_RELEASE);
 			}
@@ -17664,7 +17703,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * detached->root: parent is legitimately NULL.
 				 * Pair the prev publish for consistency.
 				 */
-				ft_publish_external_nodes_prev(detached->root,
+				ft_publish_external_nodes_prev(ft, detached->root,
 					(struct cds_ft_node *)
 					ft_node_ptr(child));
 				ft_nr_keys_store(dmeta, detached_count, CMM_RELAXED);
@@ -18543,14 +18582,18 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 #endif
 	if (ft_node_external(child)) {
 		/*
-		 * Cell-always: store the raw flag (a flip-proxy) into the head's
-		 * cell->parent, not over its prev (which is the cell pointer).
-		 * The read path resolves cell->parent THEN the flip-proxy, so a
-		 * proxy parked in cell->parent settles correctly; the later
-		 * ft_set_parent replaces it with the real parent.
+		 * Ordered list on: store the raw flag (a flip-proxy) into the head's
+		 * cell->parent, not over its prev (which is the cell pointer).  The
+		 * read path resolves cell->parent THEN the flip-proxy, so a proxy
+		 * parked in cell->parent settles correctly; the later ft_set_parent
+		 * replaces it with the real parent.  List off / non-cell: the head's
+		 * prev IS the flagged parent, so store the proxy directly there.
 		 */
 #ifdef FEATURE_FT_ORD_CELL
-		ft_ord_cell_set_parent((struct cds_ft_node *) child, value);
+		if (ft->ordered_list)
+			ft_ord_cell_set_parent((struct cds_ft_node *) child, value);
+		else
+			rcu_assign_pointer(((struct cds_ft_node *) child)->prev, value);
 #else
 		rcu_assign_pointer(((struct cds_ft_node *) child)->prev, value);
 #endif
@@ -21346,6 +21389,10 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->group = ft_group;
+#ifdef FEATURE_FT_ORD_CELL
+	/* Cache the group's ordered-list mode for the read-side cell gate. */
+	ft->ordered_list = ft_group->ordered_list_set;
+#endif
 	ft_install_lookup_ops(ft);
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
@@ -21672,9 +21719,9 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 			return -1;
 		}
 #ifdef FEATURE_FT_ORD_CELL
-		if (prev == NULL) {
+		if (prev == NULL && ft->ordered_list) {
 			/*
-			 * Cell-always head: prev is the head's cell (cell-tagged),
+			 * Ordered-list head: prev is the head's cell (cell-tagged),
 			 * whose ->parent is the owner and ->node is this head.
 			 */
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(node->prev);
@@ -21688,6 +21735,14 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 						(void *) (ft_node_external((struct cds_ft_inode_flag *) node->prev) ? NULL : cell->parent),
 						(void *) (ft_node_external((struct cds_ft_inode_flag *) node->prev) ? NULL : cell->node),
 						(void *) owner_flag, (void *) node);
+				return -1;
+			}
+		} else if (prev == NULL) {
+			/* List off: a head's prev is the owner (flagged parent) directly. */
+			if ((void *) node->prev != (void *) owner_flag) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: head %p prev %p != owner %p\n",
+						depth, node, node->prev, (void *) owner_flag);
 				return -1;
 			}
 		} else if (node->prev != expected_prev) {
@@ -23459,18 +23514,23 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 		/*
 		 * No in-leaf key: rebuild the ordinal key by the structural parent
 		 * up-walk from the head's cell (the same EAGER source cds_ft_iter_
-		 * get_key uses).  The cell is allocated for every head whenever
-		 * FEATURE_FT_ORD_CELL is compiled -- independent of ordered_list_set --
-		 * and cell->parent is wired, so the up-walk works even with the ordered
-		 * LIST disabled at runtime.  The walk fills @scratch from the tail and
-		 * returns the length; the key starts at @scratch[max-len].
+		 * get_key uses).  Requires the cell to exist -- i.e. the ordered list
+		 * enabled, since a list-off trie allocates no cells (head->prev is the
+		 * flagged parent directly, which is NOT an up-walk source).  The walk
+		 * fills @scratch from the tail and returns the length; the key starts
+		 * at @scratch[max-len].
 		 */
-		struct ft_ord_cell *cell = ft_ord_cell_ptr(
-			rcu_dereference(((struct cds_ft_node *) node)->prev));
-		size_t max_len = group->max_key_len;
+		if (ft->ordered_list) {
+			struct ft_ord_cell *cell = ft_ord_cell_ptr(
+				rcu_dereference(((struct cds_ft_node *) node)->prev));
+			size_t max_len = group->max_key_len;
 
-		klen = ft_rebuild_key_upwalk(ft, cell, scratch, max_len);
-		ordinals = scratch + (max_len - klen);
+			klen = ft_rebuild_key_upwalk(ft, cell, scratch, max_len);
+			ordinals = scratch + (max_len - klen);
+		} else {
+			/* List off: no cell, no in-leaf key -> not materializable. */
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
 #else
 		/* No in-leaf key and no cells: not materializable from a node alone. */
 		return CDS_FT_STATUS_NOT_FOUND;

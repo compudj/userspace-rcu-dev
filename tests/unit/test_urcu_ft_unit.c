@@ -1775,11 +1775,12 @@ fail:
 
 /*
  * cds_ft_node_get_key with the ordered LIST disabled at runtime
- * (cds_ft_group_attr_set_no_ordered_list).  On a cell build the head still has
- * a cell (cell-always), so the parent up-walk -- hence node_get_key -- works
- * even with the list off; the iterator-free stepper, which IS the ord-list
- * walk, returns nothing.  A non-cell build can't materialize from the node
- * (no in-leaf key, no cell): node_get_key returns NOT_FOUND -- treated as N/A.
+ * (cds_ft_group_attr_set_no_ordered_list).  With the list off the trie
+ * allocates NO ordinal cells (runtime cell-optional), so this no-in-leaf-key
+ * group has no node-alone key source: node_get_key returns NOT_FOUND -- treated
+ * as N/A here, same as a non-cell build.  (A group WITH an in-leaf key would
+ * still resolve via the leaf even with the list off.)  The iterator-free
+ * stepper, which IS the ord-list walk, returns nothing.
  */
 static int test_node_get_key_no_list(void)
 {

@@ -824,6 +824,20 @@ struct cds_ft {
 	 */
 	bool exclusive;
 
+#ifdef FEATURE_FT_ORD_CELL
+	/*
+	 * Mirror of group->ordered_list_set, cached on the trie so the read-side
+	 * head-parent resolver (ft_resolve_head_prev, on the descent / skip /
+	 * backtrack hot paths) tests one local flag instead of chasing
+	 * ft->group->ordered_list_set.  Immutable after cds_ft_create (the group's
+	 * mode is fixed at attr time), so a concurrent reader's branch is race-free.
+	 * When false the trie allocates NO ordinal cells: a head's prev IS its
+	 * flagged parent directly, exactly as in a non-cell build -- the per-key
+	 * cell RSS and its list maintenance are paid only when the list is enabled.
+	 */
+	bool ordered_list;
+#endif
+
 	/*
 	 * In-progress compaction state (cds_ft_compact_begin), or NULL.
 	 * Set at begin, cleared at end.  Lets cds_ft_compact_begin reject a
