@@ -18704,6 +18704,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	unsigned long merged_keys = 0;
 	bool ms_ord = dst_ft->group->ordered_list_set;
 	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL;
+	struct cds_ft_node *ms_s_first = NULL, *ms_s_last = NULL;
 
 	/*
 	 * Every dst merge-point shape is handled.  The flip proxies the publish
@@ -18885,14 +18886,17 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ft_subtree_minmax_head(dst_ft, D, false)->prev));
 		ms_prev = ft_ord_cell_resolve_ord(&ms_cursor->ord_prev);
 		/*
-		 * Remove src's merged subtree (S) run from src's ordered list:
-		 * its cells disperse to dst (survivors) or are freed (collisions).
-		 * Done here, before the src unlink + drain below, so that sync
-		 * drains src ord-readers of the run too.
+		 * Capture src's merged-subtree (S) run endpoints now, while S is
+		 * still intact, but defer the actual run-unlink until AFTER the
+		 * last fallible step (ft_merge_unlink_src_subtree).  The run
+		 * unlink is an externally observable ordered-list mutation; doing
+		 * it here would leave src's list inconsistent if the src subtree
+		 * unlink below OOMs and we roll the whole merge back.  The unlink
+		 * still happens before the drain, so sync drains src ord-readers
+		 * of the run too.
 		 */
-		ft_ord_cell_run_unlink(src_ft,
-			ft_subtree_minmax_head(dst_ft, S, false),
-			ft_subtree_minmax_head(dst_ft, S, true));
+		ms_s_first = ft_subtree_minmax_head(dst_ft, S, false);
+		ms_s_last = ft_subtree_minmax_head(dst_ft, S, true);
 	}
 
 	/*
@@ -18915,6 +18919,15 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		ft_graft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
+	/*
+	 * Now that the last fallible step has committed, remove src's merged
+	 * subtree (S) run from src's ordered list: its cells disperse to dst
+	 * (survivors) or are freed (collisions).  Deferred to here so an OOM in
+	 * the src unlink above leaves src's list untouched on rollback; done
+	 * before the drain so sync drains src ord-readers of the run too.
+	 */
+	if (ms_ord)
+		ft_ord_cell_run_unlink(src_ft, ms_s_first, ms_s_last);
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
 
