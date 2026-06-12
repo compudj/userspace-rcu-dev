@@ -11186,6 +11186,15 @@ struct ft_graft_free_item {
 struct ft_graft_splice {
 	struct cds_ft_node *dst_head;		/* surviving head (kept first) */
 	struct cds_ft_node *src_head;		/* appended to dst_head's tail */
+	/*
+	 * The demoted @src_head's ordered-list cell, captured by
+	 * ft_graft_glue_apply_splices.  It stays REACHABLE through its src-run
+	 * neighbours' stale ord_prev/ord_next until the post-publish interleave
+	 * rewires them, so it is freed only by
+	 * ft_graft_glue_free_collided_cells, called after the interleave, via
+	 * the grace-period-deferred cell free.  NULL when the list is off.
+	 */
+	struct ft_ord_cell *src_cell;
 };
 
 /*
@@ -11904,11 +11913,12 @@ static void ft_ord_cell_find_splice_pos(struct cds_ft *dst,
 static void ft_ord_cell_run_replace(struct cds_ft *dst,
 		struct ft_ord_cell *d_first, struct ft_ord_cell *d_last,
 		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last);
-static void ft_ord_cell_splice_after(struct cds_ft *dst,
-		struct ft_ord_cell *prev, struct ft_ord_cell *cell);
+struct ft_ord_cell_edge;
+struct ft_flip_batch;
 static void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		size_t dst_key_len, unsigned long merged_keys,
-		struct ft_ord_cell *ord_cursor, struct ft_ord_cell *prev_placed);
+		struct ft_ord_cell *ord_cursor, struct ft_ord_cell *prev_placed,
+		struct ft_ord_cell_edge *edges, struct ft_flip_batch *flip_b);
 static void ft_ord_cell_run_unlink(struct cds_ft *ft,
 		struct cds_ft_node *first_head, struct cds_ft_node *last_head);
 
@@ -14735,6 +14745,7 @@ void ft_graft_glue_record_splice(struct ft_graft_glue *g,
 	assert(g->nr_splices < g->cap_splices);
 	g->splices[g->nr_splices].dst_head = dst_head;
 	g->splices[g->nr_splices].src_head = src_head;
+	g->splices[g->nr_splices].src_cell = NULL;
 	g->nr_splices++;
 }
 
@@ -14761,21 +14772,41 @@ void ft_graft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
 		/*
 		 * Ordered list on: @src_head was a head in src (prev is its cell);
 		 * it becomes a non-head duplicate of @dst_head, so its cell leaves
-		 * the trie.  The src chain is already detached + drained and
-		 * @src_head is not yet reachable in dst (published by the rcu_assign
-		 * below), so the cell is unreachable — free it synchronously.  List
-		 * off: src_head->prev is the flagged parent, no cell.
+		 * the trie.  The cell is NOT unreachable yet: on the merge spine
+		 * path this runs after the structural flip, and the surviving src
+		 * heads' cells -- already reachable in dst -- still carry the old
+		 * src-run ord_prev/ord_next, including links to THIS cell, until
+		 * the post-publish interleave rewires them.  Capture it in the
+		 * splice record; ft_graft_glue_free_collided_cells frees it after
+		 * the interleave through the grace-period-deferred cell free.
+		 * List off: src_head->prev is the flagged parent, no cell.
 		 */
-		struct ft_ord_cell *src_cell = ft->ordered_list ?
+		g->splices[i].src_cell = ft->ordered_list ?
 			ft_ord_cell_ptr(src_head->prev) : NULL;
 
 		while (ft_node_next(tail))
 			tail = ft_node_next(tail);
 		src_head->prev = tail;	/* write-side only, plain store */
 		rcu_assign_pointer(tail->next, src_head);
-		if (src_cell)
-			ft_ord_cell_free_unpublished(ft, src_cell);
 	}
+}
+
+/*
+ * Free the collided (demoted) src heads' cells.  Call AFTER the ordered-list
+ * interleave: only then has every surviving cell's stale src-run link been
+ * rewired away from these cells, making them unreachable to NEW readers; the
+ * grace-period defer inside ft_ord_cell_free then covers readers already
+ * holding a stale link or parked on a demoted head.
+ */
+static
+void ft_graft_glue_free_collided_cells(struct cds_ft *ft,
+		struct ft_graft_glue *g)
+{
+	int i;
+
+	for (i = 0; i < g->nr_splices; i++)
+		if (g->splices[i].src_cell)
+			ft_ord_cell_free(ft, g->splices[i].src_cell);
 }
 
 /*
@@ -17698,7 +17729,9 @@ void ft_flip_batch_reclaim(struct ft_flip_batch *b)
  * RUNS UNDER WRITER EXCLUSION; no concurrent writer races, no proxy at rest.
  * Promotion (ft_unchain_node) and replace (cds_ft_replace) need NO list op:
  * the cell stays put and only cell->node is retargeted.  Bulk ops (merge /
- * graft / graft_swap / detach) are NOT yet ord-maintained.
+ * graft / graft_swap / detach) maintain the list through the run helpers
+ * below (run_detach / run_splice / run_replace / run_unlink) and the merge
+ * interleave.
  */
 
 struct ft_ord_cell_edge {
@@ -17822,6 +17855,29 @@ void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
 }
 
 static
+void ft_ord_cell_flip_prealloc(struct cds_ft *ft __attribute__((unused)),
+		struct ft_ord_cell_edge *edges, unsigned int n,
+		struct ft_flip_batch *b)
+{
+	unsigned int i;
+
+	if (n == 0) {
+		ft_flip_batch_free_unpublished(b);
+		return;
+	}
+	assert(n <= b->cap);
+	for (i = 0; i < n; i++)
+		rcu_assign_pointer(*edges[i].slot,
+			(struct ft_ord_cell *) ft_flip_batch_add(b,
+				(struct cds_ft_inode_flag *) edges[i].old_target,
+				(struct cds_ft_inode_flag *) edges[i].new_target));
+	urcu_flip_commit(&b->group);
+	for (i = 0; i < n; i++)
+		rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
+	ft_flip_batch_reclaim(b);
+}
+
+static
 void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		unsigned int n)
 {
@@ -17832,19 +17888,19 @@ void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		return;
 	b = ft_flip_batch_alloc(ft, n);
 	if (caa_unlikely(!b)) {
+		/*
+		 * Degraded fallback (point-op splices only, <= 3 edges; the
+		 * merge interleave pre-allocates its batch in the fallible
+		 * build phase and never lands here): sequential edge stores.
+		 * A bidirectional reader between two stores can observe one
+		 * neighbour's edge updated and the mirrored one not yet --
+		 * transient and self-healing, never a dangling pointer.
+		 */
 		for (i = 0; i < n; i++)
 			rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
 		return;
 	}
-	for (i = 0; i < n; i++)
-		rcu_assign_pointer(*edges[i].slot,
-			(struct ft_ord_cell *) ft_flip_batch_add(b,
-				(struct cds_ft_inode_flag *) edges[i].old_target,
-				(struct cds_ft_inode_flag *) edges[i].new_target));
-	urcu_flip_commit(&b->group);
-	for (i = 0; i < n; i++)
-		rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
-	ft_flip_batch_reclaim(b);
+	ft_ord_cell_flip_prealloc(ft, edges, n, b);
 }
 
 /*
@@ -18035,6 +18091,44 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 		struct ft_ord_cell **succ_out)
 {
 	struct ft_ord_cell *pred, *succ;
+	size_t flen = dst->group->key_len;
+
+	if (flen != CDS_FT_LEN_VARIABLE && key_len != flen) {
+		/*
+		 * Internal graft on a FIXED-length group (ft_graft_keylen, e.g.
+		 * cds_ft_merge_at's detach+graft path): @key is the graft
+		 * PREFIX, shorter than the group's key length, which the public
+		 * relational lookups reject -- probing with it verbatim came
+		 * back empty and the grafted run was silently never spliced
+		 * (merged keys invisible to ordered iteration).  Probe with the
+		 * prefix PADDED to the fixed length instead: the attach point
+		 * is empty (graft returns POPULATED_ERROR otherwise), so no
+		 * @dst key starts with @key, and
+		 *   LT(key . min..min) = last @dst key below the prefix range,
+		 *   GT(key . max..max) = first @dst key above it.
+		 * Pad bytes are the ordinal-space extremes mapped back to
+		 * application form (find_rel remaps app -> ordinal).
+		 */
+		const struct cds_ft_key_map *km = &dst->group->key_map;
+		uint8_t pad_min = km->identity ? 0x00 : km->ordinal_to_key[0x00];
+		uint8_t pad_max = km->identity ? 0xff : km->ordinal_to_key[0xff];
+		uint8_t pad[FT_MAX_KEY_LEN];
+
+		assert(key_len < flen && flen <= FT_MAX_KEY_LEN);
+		memcpy(pad, key, key_len);
+		memset(pad + key_len, pad_min, flen - key_len);
+		pred = ft_ord_cell_find_rel(dst, pad, flen, FT_LOOKUP_LT);
+		if (pred) {
+			succ = ft_ord_cell_resolve_ord(&pred->ord_next);
+		} else {
+			memset(pad + key_len, pad_max, flen - key_len);
+			succ = ft_ord_cell_find_rel(dst, pad, flen,
+					FT_LOOKUP_GT);
+		}
+		*pred_out = pred;
+		*succ_out = succ;
+		return;
+	}
 
 	pred = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_LT);
 	if (pred)
@@ -18137,42 +18231,6 @@ void ft_ord_cell_run_replace(struct cds_ft *dst,
 }
 
 /*
- * Splice @cell into @dst's ordered list immediately AFTER @prev (a cell already
- * in the list, or NULL to splice at the head).  Atomic for live readers via one
- * flip of the <=2 boundary edges.  Used by the merge interleave walk, which
- * already knows the insertion point (the last placed cell) and so needs no
- * relational descent.
- */
-static
-void ft_ord_cell_splice_after(struct cds_ft *dst, struct ft_ord_cell *prev,
-		struct ft_ord_cell *cell)
-{
-	struct ft_ord_cell *succ = prev ?
-		ft_ord_cell_resolve_ord(&prev->ord_next) :
-		ft_ord_cell_resolve_ord(&dst->ord_cell_head);
-	struct ft_ord_cell_edge edges[4];
-	unsigned int n = 0;
-
-	cell->ord_prev = prev;
-	cell->ord_next = succ;
-	if (prev) {
-		edges[n].slot = &prev->ord_next;
-		edges[n].old_target = succ;
-		edges[n].new_target = cell;
-		n++;
-	}
-	if (succ) {
-		edges[n].slot = &succ->ord_prev;
-		edges[n].old_target = prev;
-		edges[n].new_target = cell;
-		n++;
-	}
-	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_head, succ, cell, edges, n);
-	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_tail, prev, cell, edges, n);
-	ft_ord_cell_flip(dst, edges, n);
-}
-
-/*
  * Remove the contiguous run [@first_head .. @last_head] from @ft's ordered list
  * WITHOUT re-homing it -- the cds_ft_merge source side, where the run's cells
  * disperse (survivors are spliced into dst, collided heads are freed).  Relink
@@ -18228,7 +18286,8 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct cds_ft_node *first_head,
 static
 void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		size_t dst_key_len, unsigned long merged_keys,
-		struct ft_ord_cell *ord_cursor, struct ft_ord_cell *prev_placed)
+		struct ft_ord_cell *ord_cursor, struct ft_ord_cell *prev_placed,
+		struct ft_ord_cell_edge *edges, struct ft_flip_batch *flip_b)
 {
 	struct cds_ft_iter *it = dst->ord_cell_scratch_iter;
 	unsigned long i;
@@ -18252,63 +18311,62 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		it->key_off = 0;
 		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
 				FT_LOOKUP_LIMIT_FIRST, false, false) != CDS_FT_STATUS_OK)
-			return;
+			goto unused;
 	} else {
-		if (cds_ft_iter_set_key(it, dst_key, dst_key_len) != CDS_FT_STATUS_OK)
-			return;
+		const uint8_t *seed_key = dst_key;
+		size_t seed_len = dst_key_len;
+		size_t flen = dst->group->key_len;
+		uint8_t padbuf[FT_MAX_KEY_LEN];
+
+		/*
+		 * FIXED-length group with a mid-key merge point: @dst_key is
+		 * shorter than the group's key length, which set_key / the
+		 * relational GE reject -- pad it to the fixed length with the
+		 * ordinal-space minimum so GE finds the merged region's first
+		 * key (every key in the region extends @dst_key, hence sorts
+		 * at or above the padded probe; everything below the region
+		 * sorts under it).  Mirrors ft_ord_cell_find_splice_pos.
+		 */
+		if (flen != CDS_FT_LEN_VARIABLE && dst_key_len != flen) {
+			const struct cds_ft_key_map *km = &dst->group->key_map;
+			uint8_t pad_min = km->identity ?
+				0x00 : km->ordinal_to_key[0x00];
+
+			assert(dst_key_len < flen && flen <= FT_MAX_KEY_LEN);
+			memcpy(padbuf, dst_key, dst_key_len);
+			memset(padbuf + dst_key_len, pad_min,
+				flen - dst_key_len);
+			seed_key = padbuf;
+			seed_len = flen;
+		}
+		if (cds_ft_iter_set_key(it, seed_key, seed_len) != CDS_FT_STATUS_OK)
+			goto unused;
 		it->prefix_len = 0;
 		it->node = NULL;
 		it->cache_valid = false;
 		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
 				FT_LOOKUP_LIMIT_NONE, false, false) != CDS_FT_STATUS_OK)
-			return;
+			goto unused;
 	}
 	/*
 	 * Single-flip re-weave.  Walk the merged region in key order; pre-set
 	 * each surviving src cell's links with plain stores (the cell is not yet
 	 * ord-reachable in @dst, so this is invisible) and accumulate ONLY the
 	 * VISIBLE boundary edges -- a dst-original cell's ord_next / ord_prev, or
-	 * @dst's head / tail -- into one batch.  A single ft_ord_cell_flip then
-	 * commits the entire interleave atomically, so a concurrent ordered reader
-	 * never observes a partially re-woven list (the per-splice path was N
+	 * @dst's head / tail -- into one batch.  A single flip then commits the
+	 * entire interleave atomically, so a concurrent ordered reader never
+	 * observes a partially re-woven list (the per-splice path was N
 	 * independent flips).  Dst-original cells keep their relative order, so a
 	 * dst<->dst step needs no edge; each survivor RUN costs at most two edges
 	 * (one entering, one leaving), so 2 * merged_keys + 2 bounds the batch.
-	 * On -ENOMEM of the edge buffer, fall back to the per-survivor splice
-	 * (still correct, but non-atomic).
+	 * @edges and @flip_b are pre-allocated by the caller in the merge's
+	 * fallible BUILD phase (this runs in the failure-free commit tail, where
+	 * an alloc failure would force a non-atomic fallback).
 	 */
 	{
-		struct ft_ord_cell_edge *edges;
 		struct ft_ord_cell *prev = prev_placed;
 		bool prev_is_dst = (prev_placed != NULL);
-		unsigned int n = 0, cap = 2u * (unsigned int) merged_keys + 2u;
-
-		edges = malloc((size_t) cap * sizeof(*edges));
-		if (!edges) {
-			for (i = 0; i < merged_keys; i++) {
-				struct cds_ft_node *head = cds_ft_iter_node(it);
-				struct ft_ord_cell *cell;
-
-				if (!head)
-					break;
-				cell = ft_ord_cell_ptr(rcu_dereference(head->prev));
-				if (cell == ord_cursor) {
-					prev_placed = ord_cursor;
-					ord_cursor = ft_ord_cell_resolve_ord(
-						&ord_cursor->ord_next);
-				} else {
-					ft_ord_cell_splice_after(dst, prev_placed,
-						cell);
-					prev_placed = cell;
-				}
-				it->cache_valid = false;
-				if (cds_ft_lookup_inequality_impl(dst, it,
-						FT_LOOKUP_GT, FT_LOOKUP_LIMIT_NONE,
-						false, false) != CDS_FT_STATUS_OK)
-					break;
-			}
-			return;
-		}
+		unsigned int n = 0;
 
 		for (i = 0; i < merged_keys; i++) {
 			struct cds_ft_node *head = cds_ft_iter_node(it);
@@ -18385,9 +18443,12 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 				n++;
 			}
 		}
-		ft_ord_cell_flip(dst, edges, n);
-		free(edges);
+		ft_ord_cell_flip_prealloc(dst, edges, n, flip_b);
 	}
+	return;
+unused:
+	/* Seed failed (empty region): the pre-allocated batch goes unused. */
+	ft_flip_batch_free_unpublished(flip_b);
 }
 
 /*
@@ -18648,6 +18709,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	bool ms_ord = dst_ft->group->ordered_list_set;
 	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL;
 	struct cds_ft_node *ms_s_first = NULL, *ms_s_last = NULL;
+	struct ft_ord_cell_edge *ms_edges = NULL;
+	struct ft_flip_batch *ms_flip = NULL;
 
 	/*
 	 * Every dst merge-point shape is handled.  The flip proxies the publish
@@ -18840,6 +18903,33 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 */
 		ms_s_first = ft_subtree_minmax_head(dst_ft, S, false);
 		ms_s_last = ft_subtree_minmax_head(dst_ft, S, true);
+		/*
+		 * Pre-allocate the interleave's edge batch + flip batch NOW,
+		 * while the build is still abortable.  The interleave runs in
+		 * the failure-free commit tail; an alloc failure there would
+		 * have to degrade to a non-atomic per-edge fallback, exposing a
+		 * half-re-woven list to bidirectional ordered readers under
+		 * memory pressure.  Each survivor run costs at most two visible
+		 * edges, so 2 * merged_keys + 2 bounds both.
+		 */
+		{
+			unsigned int ms_cap =
+				2u * (unsigned int) merged_keys + 2u;
+
+			ms_edges = malloc((size_t) ms_cap * sizeof(*ms_edges));
+			if (ms_edges)
+				ms_flip = ft_flip_batch_alloc(dst_ft, ms_cap);
+			if (!ms_edges || !ms_flip) {
+				free(ms_edges);
+				ft_flip_batch_free_unpublished(flip);
+				if (fresh_root)
+					free_cds_ft_node_unpublished(src_ft,
+						fresh_root);
+				ft_graft_glue_abort(dst_ft, &gd);
+				ft_graft_glue_abort(src_ft, &gs);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+		}
 	}
 
 	/*
@@ -18857,6 +18947,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		FT_TP(root_publish, (const void *) src_ft, (const void *) src_ft->root);
 	} else if (ft_merge_unlink_src_subtree(src_ft, src_key, src_key_len,
 				cnt_src) < 0) {
+		free(ms_edges);
+		if (ms_flip)
+			ft_flip_batch_free_unpublished(ms_flip);
 		ft_flip_batch_free_unpublished(flip);
 		ft_graft_glue_abort(dst_ft, &gd);
 		ft_graft_glue_abort(src_ft, &gs);
@@ -18967,13 +19060,22 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * list at their merged positions.  Done AFTER the settle (step 7) so the
 	 * merged structure carries direct pointers -- the interleave's GT
 	 * continuation backtracks via parent pointers, which are flip proxies
-	 * until settled.  Collided src cells were demoted to duplicates + freed
-	 * by apply_splices, so the merged-region walk never sees them; dst-
-	 * original cells keep their links.
+	 * until settled.  Collided src cells were demoted to duplicates by
+	 * apply_splices (step 5), so the merged-region walk never sees them;
+	 * dst-original cells keep their links.  The edge + flip batches were
+	 * pre-allocated in the build phase, so this cannot fail.
+	 *
+	 * 10. Only now free the collided cells: the interleave rewired the
+	 * surviving cells' stale src-run links away from them, and the
+	 * grace-period defer inside the free covers readers already holding
+	 * such a link.
 	 */
-	if (ms_ord)
+	if (ms_ord) {
 		ft_merge_ord_interleave(dst_ft, dst_key, dst_key_len, merged_keys,
-			ms_cursor, ms_prev);
+			ms_cursor, ms_prev, ms_edges, ms_flip);
+		free(ms_edges);
+	}
+	ft_graft_glue_free_collided_cells(dst_ft, &gd);
 
 	ft_graft_glue_fini(&gd);
 	ft_graft_glue_fini(&gs);

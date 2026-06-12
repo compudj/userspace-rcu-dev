@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 246
+#define NR_TESTS 247
 #else
-#define NR_TESTS 234
+#define NR_TESTS 235
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -5484,6 +5484,135 @@ out:
 	cds_ft_destroy(dst);
 	cds_ft_group_destroy(group);
 	return ret;
+}
+
+/*
+ * Mid-key cds_ft_merge_at on a FIXED-length group: the merged keys must be
+ * spliced into dst's ordered cell list.  Regression for the splice-position
+ * probes passing the merge-point PREFIX (shorter than the group's fixed key
+ * length) to the relational lookups, which reject it: the grafted run got
+ * pred == succ == NULL and ft_ord_cell_run_splice emitted zero edges on a
+ * non-empty dst list -- merged keys visible to point lookups but permanently
+ * invisible to ordered iteration and first/last (2026-06 review, 2.11).  The
+ * probes now pad the prefix to the fixed length with the ordinal extremes.
+ * Part 0 exercises the detach+graft path (dst empty under the merge point),
+ * part 1 the spine-copy path's interleave seed (dst non-empty there).
+ */
+static int test_merge_at_fixed_ordered_splice(void)
+{
+	int part, ret = -1;
+
+	for (part = 0; part < 2; part++) {
+		struct cds_ft_group_attr *attr;
+		struct cds_ft_group *group;
+		struct cds_ft *dst = NULL, *src = NULL;
+		struct cds_ft_iter *iter = NULL;
+		enum cds_ft_status s;
+		const char *dst_keys[] = { "aaaaaaaa", "abmmmmmm", "zzzzzzzz" };
+		const char *src_keys[] = { "abcdefgh", "abzzzzzz" };
+		/* Expected ordered walk: union, sorted. */
+		const char *exp_fallback[] =
+			{ "aaaaaaaa", "abcdefgh", "abzzzzzz", "zzzzzzzz" };
+		const char *exp_spine[] =
+			{ "aaaaaaaa", "abcdefgh", "abmmmmmm", "abzzzzzz", "zzzzzzzz" };
+		const char **exp = part ? exp_spine : exp_fallback;
+		/* part 0: dst empty under "ab" -> detach+graft path. */
+		unsigned int nr_dst = part ? 3 : 2;
+		unsigned int nr_exp = part ? 5 : 4;
+		unsigned int i;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			return -1;
+		cds_ft_group_attr_set_key_len(attr, 8);
+		if (cds_ft_group_create(attr, &group) < 0) {
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &dst) < 0 ||
+		    cds_ft_create(group, NULL, &src) < 0 ||
+		    cds_ft_iter_create(dst, &iter) < 0)
+			abort();
+		for (i = 0; i < nr_dst; i++) {
+			const char *k = part ? dst_keys[i] :
+				(i == 0 ? dst_keys[0] : dst_keys[2]);
+			struct ft_test_node *n = node_alloc(0);
+
+			rcu_read_lock();
+			s = cds_ft_insert(dst, (const uint8_t *) k, 8, &n->node);
+			rcu_read_unlock();
+			if (s < 0) goto out;
+		}
+		for (i = 0; i < 2; i++) {
+			struct ft_test_node *n = node_alloc(0);
+
+			rcu_read_lock();
+			s = cds_ft_insert(src, (const uint8_t *) src_keys[i], 8,
+					&n->node);
+			rcu_read_unlock();
+			if (s < 0) goto out;
+		}
+		rcu_read_lock();
+		s = cds_ft_merge_at(dst, (const uint8_t *) "ab", 2,
+				src, (const uint8_t *) "ab", 2);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "merge_at_fixed[%d]: merge: %s\n",
+				part, cds_ft_status_to_string(s));
+			goto out;
+		}
+		rcu_read_lock();
+		if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+		    cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "merge_at_fixed[%d]: verify failed\n", part);
+			rcu_read_unlock();
+			goto out;
+		}
+		/* The ordered walk must surface every merged key, in order. */
+		s = cds_ft_lookup_first(dst, iter);
+		for (i = 0; i < nr_exp; i++) {
+			uint8_t rk[16]; size_t rl;
+
+			if (s != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+				fprintf(stderr,
+					"merge_at_fixed[%d]: walk ended at %u/%u (status %d)\n",
+					part, i, nr_exp, s);
+				rcu_read_unlock();
+				goto out;
+			}
+			cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+			if (rl != 8 || memcmp(rk, exp[i], 8) != 0) {
+				rk[rl < sizeof rk ? rl : sizeof rk - 1] = '\0';
+				fprintf(stderr,
+					"merge_at_fixed[%d]: step %u got '%s', expected '%s'\n",
+					part, i, (char *) rk, exp[i]);
+				rcu_read_unlock();
+				goto out;
+			}
+			s = cds_ft_next(dst, iter);
+		}
+		if (s != CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr, "merge_at_fixed[%d]: walk past end: %d\n",
+				part, s);
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+		ret = 0;
+out:
+		if (iter)
+			cds_ft_iter_destroy(iter);
+		drain_trie(dst);
+		drain_trie(src);
+		rcu_barrier();
+		cds_ft_destroy(src);
+		cds_ft_destroy(dst);
+		cds_ft_group_destroy(group);
+		if (ret < 0)
+			return -1;
+		ret = -1;	/* re-arm for part 1 */
+	}
+	return 0;
 }
 
 /* ================================================================== */
@@ -18873,6 +19002,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_nonidentity_ordered_iteration);
 	RUN_TEST(test_inequality_empty_key);
 	RUN_TEST(test_merge_ordered_fixed_root);
+	RUN_TEST(test_merge_at_fixed_ordered_splice);
 
 	/* 9. Graft, graft_swap & detach */
 	diag("Graft, graft_swap & detach tests");
