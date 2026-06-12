@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 247
+#define NR_TESTS 249
 #else
 #define NR_TESTS 235
 #endif
@@ -18790,6 +18790,216 @@ static int test_merge_oom_compressed_parent_dst(void)
 }
 
 /*
+ * Drive a fresh-key ATTACH with a compressed tail through each allocation-
+ * failure point.  Regression for the 2026-06 review's finding 2.1: the attach
+ * tracked ft_try_compress_chain's SKIP-ENCODED return in created_nodes[]; the
+ * ENOMEM unwind dispatched only on ft_node_compressed, so the skip flag fell
+ * into the plain-node arm and ran arena arithmetic on the APPLICATION'S
+ * pointer (the skip encoding carries the child's address), poisoning an arena
+ * freelist.  Also covers 2.5 for ordered tries: after a failed insert the
+ * node must be retryable (node->prev reset).
+ *
+ * The trie has root children 'm' and 'z'; inserting "a<tail>" dispatches at
+ * the root with a compressible 7-byte tail, and the root append of byte 'a'
+ * below the existing maximum forces a rank-preserving recompact -- the
+ * fallible step AFTER the compressed node was built and tracked.
+ */
+static int run_attach_oom(const char *label, bool ordered)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < 8; n++) {
+		struct cds_ft_group_attr *attr;
+		struct cds_ft_group *group;
+		struct cds_ft *ft;
+		struct ft_test_node *m = node_alloc(1);
+		struct ft_test_node *z = node_alloc(2);
+		struct ft_test_node *a = node_alloc(3);
+		enum cds_ft_status s;
+		int verified;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			abort();
+		cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+		cds_ft_group_attr_set_ordered_list(attr, ordered);
+		if (cds_ft_group_create(attr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0)
+			abort();
+
+		if (cds_ft_insert(ft, (const uint8_t *) "mmmmmmmm", 8, &m->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "zzzzzzzz", 8, &z->node) < 0) {
+			fprintf(stderr, "attach_oom[%s]: build failed\n", label);
+			rc = -1;
+		}
+
+		/* Fail the (n+1)-th allocation performed by the insert. */
+		cds_ft_fault_alloc_countdown = n;
+		s = cds_ft_insert(ft, (const uint8_t *) "aaaaaaaa", 8, &a->node);
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		rcu_read_unlock();
+		if (!verified) {
+			fprintf(stderr,
+				"attach_oom[%s]: verify FAILED after fault n=%d (insert=%s)\n",
+				label, n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+		if (s != CDS_FT_STATUS_OK) {
+			/* 2.5: the failed insert must leave @a retryable. */
+			s = cds_ft_insert(ft, (const uint8_t *) "aaaaaaaa", 8,
+					&a->node);
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr,
+					"attach_oom[%s]: retry after fault n=%d failed: %s\n",
+					label, n, cds_ft_status_to_string(s));
+				rc = -1;
+			}
+		}
+		if (!graft_swap_oom_has_key(ft, "aaaaaaaa") ||
+		    !graft_swap_oom_has_key(ft, "mmmmmmmm") ||
+		    !graft_swap_oom_has_key(ft, "zzzzzzzz")) {
+			fprintf(stderr, "attach_oom[%s]: key missing (n=%d)\n",
+				label, n);
+			rc = -1;
+		}
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		rcu_read_unlock();
+		if (!verified) {
+			fprintf(stderr,
+				"attach_oom[%s]: verify FAILED after retry (n=%d)\n",
+				label, n);
+			rc = -1;
+			continue;
+		}
+		if (drain_trie(ft) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_attach_oom_skip_unwind(void)
+{
+	if (run_attach_oom("ordered", true))
+		return -1;
+	return run_attach_oom("list_off", false);
+}
+
+/*
+ * Drive cds_ft_remove_all through allocation-failure points and assert its
+ * error contract (2026-06 review, 2.4):
+ *  - leaf key, detach ENOMEM: the removal rolls back cleanly -> status
+ *    CDS_FT_STATUS_MEMORY_ERROR (was NOT_FOUND), *result_node == NULL (was
+ *    the live chain -- inviting caller-side reclamation of reachable data),
+ *    key still present, counts consistent;
+ *  - prefix key whose emptied holder fails to prune: the removal itself
+ *    COMMITTED -> status OK, key gone, no count re-add (the old +1 undo left
+ *    a permanent ancestor overcount that cds_ft_verify flags), empty holder
+ *    tolerated.
+ */
+static int test_remove_all_oom_contract(void)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < 6; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_varlen_ft(&group);
+		struct cds_ft_iter *iter;
+		struct ft_test_node *ab = node_alloc(1);
+		struct ft_test_node *abc = node_alloc(2);
+		struct cds_ft_node *res = (struct cds_ft_node *) (long) -1;
+		enum cds_ft_status s;
+		int verified;
+
+		if (cds_ft_iter_create(ft, &iter) < 0)
+			abort();
+		/*
+		 * "ab" + "abc", then remove "abc": leaves "ab" as a prefix
+		 * key on an internal holder with nr_child == 0 (the holder
+		 * cannot collapse while it carries external_nodes).
+		 */
+		if (cds_ft_insert(ft, (const uint8_t *) "ab", 2, &ab->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "abc", 3, &abc->node) < 0) {
+			fprintf(stderr, "remove_all_oom: build failed\n");
+			rc = -1;
+		}
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) "abc", 3);
+		if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+		    cds_ft_remove_all(ft, iter, &res) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "remove_all_oom: abc removal failed\n");
+			rc = -1;
+		}
+		rcu_read_unlock();
+		node_free_rcu(abc);
+
+		/* Prefix-key removal under an allocation fault. */
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) "ab", 2);
+		s = cds_ft_lookup(ft, iter);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "remove_all_oom: ab lookup failed\n");
+			rc = -1;
+		}
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_remove_all(ft, iter, &res);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		rcu_read_unlock();
+		if (!verified) {
+			fprintf(stderr,
+				"remove_all_oom: verify FAILED after fault n=%d (%s)\n",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+		if (s == CDS_FT_STATUS_OK) {
+			if (res != &ab->node ||
+			    graft_swap_oom_has_key(ft, "ab")) {
+				fprintf(stderr,
+					"remove_all_oom: OK but inconsistent (n=%d)\n", n);
+				rc = -1;
+			}
+			node_free_rcu(ab);
+		} else if (s == CDS_FT_STATUS_MEMORY_ERROR) {
+			if (res != NULL || !graft_swap_oom_has_key(ft, "ab")) {
+				fprintf(stderr,
+					"remove_all_oom: MEMORY_ERROR contract broken (n=%d, res=%p)\n",
+					n, (void *) res);
+				rc = -1;
+			}
+		} else {
+			fprintf(stderr,
+				"remove_all_oom: unexpected status %s for existing key (n=%d)\n",
+				cds_ft_status_to_string(s), n);
+			rc = -1;
+		}
+		cds_ft_iter_destroy(iter);
+		if (drain_trie(ft) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+/*
  * Drive cds_ft_detach at a key whose child is a COMPRESSED node (so the
  * detached trie's root must be materialized as an internal node) through every
  * allocation-failure point, and assert atomicity: on MEMORY_ERROR the source
@@ -19217,6 +19427,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom_key_shorter_src);
 	RUN_TEST(test_merge_oom_compressed_parent_dst);
 	RUN_TEST(test_detach_oom_atomicity);
+	RUN_TEST(test_attach_oom_skip_unwind);
+	RUN_TEST(test_remove_all_oom_contract);
 #endif
 
 	rcu_barrier();

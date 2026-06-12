@@ -11422,6 +11422,8 @@ static struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		unsigned long subtree_external_count,
 		bool has_external_nodes,
 		struct ft_graft_glue *glue);
+static void ft_free_branch_unpublished(struct cds_ft *ft,
+		struct cds_ft_inode_flag *top, struct cds_ft_inode_flag *leaf);
 
 static struct cds_ft_inode_flag *ft_compress_single_child_if_needed(
 		struct cds_ft *ft, struct cds_ft_inode_flag *child,
@@ -11627,7 +11629,21 @@ int ft_attach_node(struct cds_ft *ft,
 		}
 		if (compressed) {
 			iter_node_flag = compressed;
-			created_nodes[nr_created_nodes++] = iter_node_flag;
+			/*
+			 * Track the PLAIN compressed flag, never the skip form
+			 * ft_try_compress_chain returns in skip-compressed
+			 * groups: a SKIP pointer encodes the CHILD's address
+			 * (the application's external node for a leaf attach),
+			 * so the kind dispatch in check_error's unwind would
+			 * misread it as a plain node and run arena arithmetic
+			 * on the application's pointer.  Same convention as the
+			 * glue builders (see ft_try_compress_chain's glue arm).
+			 */
+			created_nodes[nr_created_nodes++] =
+				ft_node_skip_compressed(compressed) ?
+				ft_compressed_node_flag(
+					ft_skip_to_compressed(ft, compressed)) :
+				compressed;
 			iter_key = key + compress_level;
 			/*
 			 * When external_nodes exist, compress_level = level + 1.
@@ -11891,6 +11907,13 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		ret = ft_node_set_nth(ft, &dest, key[br_start],
 			inner, NULL, NULL, br_start, false);
 		if (ret) {
+			/*
+			 * Free the built branch (it was leaked before): the
+			 * cluster is writer-private, nothing was published.
+			 * insert_done resets node->prev for the retry.
+			 */
+			ft_free_branch_unpublished(ft, inner,
+				(struct cds_ft_inode_flag *) node);
 			ret = -ENOMEM;
 			goto arm_unwind;
 		}
@@ -12457,10 +12480,19 @@ insert_done:
 	 * orphaned: free it, and on failure restore node->prev to its zeroed
 	 * state so the application may retry, then splice the kept cell into the
 	 * ordered list.  List off: no cell was allocated -- @node->prev is the
-	 * flagged parent (fresh head) or the predecessor (dup) or NULL (failed),
-	 * exactly as in a non-cell build, so there is nothing to free or splice.
+	 * flagged parent (fresh head) or the predecessor (dup), so there is
+	 * nothing to free or splice; a FAILED insert may still have wired
+	 * node->prev early (the build paths set the raw parent before their
+	 * fallible publish, e.g. ft_try_compress_chain -> ft_set_parent, the
+	 * split branch builders), and the failure unwind frees that cluster:
+	 * reset it so the dangling pointer cannot leak into a retry -- the
+	 * zeroed-prev check at entry would otherwise reject the node with
+	 * -EINVAL forever.
 	 */
-	if (ft->ordered_list) {
+	if (!ft->ordered_list) {
+		if (ret != 0)
+			node->prev = NULL;
+	} else {
 		if (ret != 0) {
 			node->prev = NULL;
 			ft_ord_cell_free_unpublished(ft, precell);
@@ -12790,9 +12822,14 @@ insert_replace_done:
 	 * path (prev NULLed above), or a failed insert leaves @precell orphaned
 	 * — free it, and on failure restore node->prev to its zeroed state.
 	 * List off: no cell, nothing to free or splice (the swap sites above are
-	 * gated too).
+	 * gated too) -- but a FAILED insert may have wired node->prev early in
+	 * a build path whose cluster the unwind then freed: reset it so the
+	 * retry does not hit the zeroed-prev entry check (see _cds_ft_insert).
 	 */
-	if (ft->ordered_list) {
+	if (!ft->ordered_list) {
+		if (ret != 0)
+			node->prev = NULL;
+	} else {
 		if (ret != 0) {
 			node->prev = NULL;
 			ft_ord_cell_free_unpublished(ft, precell);
@@ -14259,6 +14296,10 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		}
 		/* The whole chain has left the trie: tombstone every node. */
 		ft_chain_mark_removed(external_nodes);
+		/* The mutation invalidates the cached position (general-path parity). */
+		iter->cache_valid = false;
+		iter_debug_path_clear(iter);
+		iter->path_len = 0;
 		return CDS_FT_STATUS_OK;
 	}
 
@@ -14313,9 +14354,23 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				ft_get_parent_slot(holder_meta, ft),
 				ft_get_parent_slot(parent_meta, ft),
 				key_len, true);
-			if (ret)
-				ft_propagate_external_count_parent(ft,
-					holder_flag, 1);
+			if (ret) {
+				/*
+				 * Pruning the emptied holder branch failed
+				 * (recompact ENOMEM).  The REMOVAL itself
+				 * already committed above -- count propagated,
+				 * external_nodes cleared, chain tombstoned --
+				 * so the count must NOT be re-added (the key is
+				 * gone; the old +1 here left a permanent
+				 * ancestor overcount) and the operation did not
+				 * fail: report success, run the ordered-list
+				 * unsplice below, and leave the holder as a
+				 * reachable-but-empty internal (readers
+				 * dead-end at it, cds_ft_verify accepts it; a
+				 * later mutation through the slot prunes it).
+				 */
+				ret = 0;
+			}
 		}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		else if (ft_group_skip_compressed(ft->group) &&
@@ -14363,8 +14418,17 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	iter_debug_path_clear(iter);
 	iter->path_len = 0;
 
-	if (ret)
-		return CDS_FT_STATUS_NOT_FOUND;
+	if (ret) {
+		/*
+		 * Leaf-key detach ENOMEM: nothing was published (the chain is
+		 * still live in the trie; the count undo above restored the
+		 * ancestors).  Surface the real error with a NULL out-param --
+		 * the header contract -- so the caller cannot reclaim the
+		 * still-reachable chain.
+		 */
+		*result_node = NULL;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 
 	return CDS_FT_STATUS_OK;
 }
@@ -15302,6 +15366,48 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 	return cur;
 }
 
+/*
+ * Free a FRESH, never-published single-path branch built by ft_build_branch
+ * (legacy glue == NULL mode) after a LATER fallible step failed: walk the
+ * single-child chain from @top down to -- but not including -- @leaf (the
+ * caller's payload), freeing every fresh node.  Writer-private memory, so
+ * immediate frees are safe.  A skip-encoded link resolves through the leaf's
+ * back-pointer, which the build wired before returning.
+ */
+static
+void ft_free_branch_unpublished(struct cds_ft *ft,
+		struct cds_ft_inode_flag *top, struct cds_ft_inode_flag *leaf)
+{
+	while (top && top != leaf) {
+		struct cds_ft_inode_flag *next;
+
+		if (ft_node_skip_compressed(top)) {
+			struct cds_ft_compressed_node *cn =
+				ft_skip_to_compressed(ft, top);
+
+			next = cn->child;
+			free_compressed_node_unpublished(ft, cn);
+		} else if (ft_node_compressed(top)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(top);
+
+			next = cn->child;
+			free_compressed_node_unpublished(ft, cn);
+		} else if (ft_node_external(top)) {
+			/* Only @leaf may be external on a fresh branch. */
+			assert(top == leaf);
+			break;
+		} else {
+			uint8_t v;
+
+			next = ft_node_get_direction(ft, top, -1, &v,
+				FT_RIGHT, false);
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(top));
+		}
+		top = next;
+	}
+}
+
 
 /*
  * ft_compress_single_child_if_needed: convert a 1-child internal node
@@ -15541,6 +15647,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		struct cds_ft_metadata *pmeta;
 		struct cds_ft_inode_flag *dest;
 		struct cds_ft_inode_flag **slot = NULL;
+		struct cds_ft_inode_flag *slot_value, *pf;
+		struct ft_flip_batch *b;
 		int ret;
 
 		if (d->nf)

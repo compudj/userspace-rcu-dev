@@ -1498,7 +1498,13 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * no node is found at the iterator position, or a negative
- * cds_ft_status on error.
+ * cds_ft_status on error.  CDS_FT_STATUS_MEMORY_ERROR reports an
+ * allocation failure while restructuring the trie around the removed
+ * key: the key was NOT removed (the chain is still reachable;
+ * *@result_node is NULL) and the call may be retried.  An allocation
+ * failure while pruning an already-emptied internal holder is NOT an
+ * error: the removal succeeded (CDS_FT_STATUS_OK) and the empty holder
+ * is reclaimed by a later mutation through it.
  *
  * Mutual exclusion between updates (insert, insert_unique,
  * insert_replace, replace, remove, remove_all) is the user's
