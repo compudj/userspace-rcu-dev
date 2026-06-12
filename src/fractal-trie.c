@@ -12186,6 +12186,8 @@ static void ft_ord_cell_splice(struct cds_ft *ft, const uint8_t *key,
 static void ft_ord_cell_prefill_by_key(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, struct ft_ord_cell *cell,
 		struct ft_ord_cell **pred_out, struct ft_ord_cell **succ_out);
+static void ft_iter_set_key_ordinals(struct cds_ft_iter *iter,
+		const uint8_t *ordinals, size_t key_len);
 static void ft_ord_cell_splice_at(struct cds_ft *ft, struct ft_ord_cell *cell,
 		struct ft_ord_cell *pred, struct ft_ord_cell *succ);
 static void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell);
@@ -12207,6 +12209,7 @@ static void ft_ord_cell_run_replace(struct cds_ft *dst,
 		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last);
 struct ft_ord_cell_edge;
 struct ft_flip_batch;
+/* @dst_key in ORDINAL form (converted once at the cds_ft_merge_at entry). */
 static void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		size_t dst_key_len, unsigned long merged_keys,
 		struct ft_ord_cell *ord_cursor, struct ft_ord_cell *prev_placed,
@@ -17263,8 +17266,12 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * No content at @key: the swap reduces to inserting swap_ft's
 			 * content at @key, which empties swap_ft.  cds_ft_graft is itself
 			 * a build-invisible transaction and empties the source.
+			 * Pass the ORIGINAL application key: cds_ft_graft applies
+			 * the key map itself, and the already-remapped @key would
+			 * be remapped twice on a non-identity group (wrong graft
+			 * point, wrong splice position).
 			 */
-			enum cds_ft_status s = cds_ft_graft(dst_ft, key, _key_len,
+			enum cds_ft_status s = cds_ft_graft(dst_ft, _key, _key_len,
 					swap_ft);
 
 			FT_TP(graft_swap_exit, (int) s);
@@ -18977,27 +18984,24 @@ void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 
 		/*
 		 * FIXED-length group with a mid-key merge point: @dst_key is
-		 * shorter than the group's key length, which set_key / the
-		 * relational GE reject -- pad it to the fixed length with the
-		 * ordinal-space minimum so GE finds the merged region's first
-		 * key (every key in the region extends @dst_key, hence sorts
-		 * at or above the padded probe; everything below the region
-		 * sorts under it).  Mirrors ft_ord_cell_find_splice_pos.
+		 * shorter than the group's key length, which the relational GE
+		 * rejects -- pad it to the fixed length with the ordinal-space
+		 * minimum so GE finds the merged region's first key (every key
+		 * in the region extends @dst_key, hence sorts at or above the
+		 * padded probe; everything below the region sorts under it).
+		 * @dst_key is ALREADY ORDINAL here (cds_ft_merge_at converts
+		 * once at entry), so pad with raw 0x00 and set the iterator key
+		 * without the public set_key's key-map application.
 		 */
 		if (flen != CDS_FT_LEN_VARIABLE && dst_key_len != flen) {
-			const struct cds_ft_key_map *km = &dst->group->key_map;
-			uint8_t pad_min = km->identity ?
-				0x00 : km->ordinal_to_key[0x00];
-
 			assert(dst_key_len < flen && flen <= FT_MAX_KEY_LEN);
 			memcpy(padbuf, dst_key, dst_key_len);
-			memset(padbuf + dst_key_len, pad_min,
+			memset(padbuf + dst_key_len, 0x00,
 				flen - dst_key_len);
 			seed_key = padbuf;
 			seed_len = flen;
 		}
-		if (cds_ft_iter_set_key(it, seed_key, seed_len) != CDS_FT_STATUS_OK)
-			goto unused;
+		ft_iter_set_key_ordinals(it, seed_key, seed_len);
 		it->prefix_len = 0;
 		it->node = NULL;
 		it->cache_valid = false;
@@ -19183,18 +19187,15 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 		const uint8_t *_src_key, size_t src_key_len,
 		unsigned long detached_count)
 {
-	const struct cds_ft_key_map *km = &src_ft->group->key_map;
-	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
-	const uint8_t *key, *ik;
+	/*
+	 * @src_key is ALREADY ORDINAL (cds_ft_merge_at converts once at its
+	 * entry); a second key-map application here would descend a different
+	 * subtree than the one the spine build copied.
+	 */
+	const uint8_t *key = _src_key, *ik;
 	struct ft_descent d;
 	int ret;
 
-	if (caa_likely(km->identity)) {
-		key = _src_key;
-	} else {
-		ft_key_to_ordinals(ordinal_buf, _src_key, src_key_len, km);
-		key = ordinal_buf;
-	}
 	ik = key;
 
 	/*
@@ -19320,6 +19321,10 @@ struct cds_ft_inode_flag *ft_merge_wrap_prefix(struct ft_merge_ctx *c,
 }
 
 /*
+ * Keys in ORDINAL form (cds_ft_merge_at converts the caller's application
+ * keys once at its entry; every consumer below -- the spine build, the source
+ * unlink, the ordered-list interleave -- expects ordinal bytes).
+ *
  * Build-invisible spine-copy merge of @src_ft's subtree at @src_key into
  * @dst_ft at the live EXACT subtree @d_dst.  All allocation is in the build
  * phase (plus the single fallible src unlink at commit for a non-root src), so
@@ -19754,6 +19759,8 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	unsigned int off_src, off_dst;
 	unsigned long cnt_src, cnt_dst;
 	enum ft_graft_swap_case ks, kd;
+	uint8_t okey_dst_buf[FT_MAX_KEY_LEN], okey_src_buf[FT_MAX_KEY_LEN];
+	const uint8_t *okey_dst = dst_key, *okey_src = src_key;
 
 	FT_TP(merge_enter, (const void *) dst_ft, (const void *) src_ft);
 
@@ -19789,6 +19796,26 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
+	/*
+	 * Combined-length overflow validation (mirrors cds_ft_graft): a moved
+	 * key K becomes dst_key || (K - src_key prefix), of length
+	 * dst_key_len + len(K) - src_key_len.  Bound len(K) by the source's
+	 * max_used_key_len; without this check a variable-length merge with
+	 * dst_key_len > src_key_len could create keys exceeding the group's
+	 * max_key_len, overflowing the fixed-size key buffers downstream
+	 * (the spine's compressed-wrap kbuf, the iterator buffers).
+	 */
+	{
+		size_t src_max = uatomic_load(&src_ft->max_used_key_len,
+				CMM_RELAXED);
+
+		if (src_max > src_key_len &&
+				src_max - src_key_len >
+				dst_ft->group->max_key_len - dst_key_len) {
+			FT_TP(merge_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
+			return CDS_FT_STATUS_OVERFLOW_ERROR;
+		}
+	}
 
 	/*
 	 * merge_at is a mutator; the application provides mutual exclusion
@@ -19801,18 +19828,41 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	CDS_FT_SCOPED_WRITER(src_ft);
 
 	/*
+	 * Convert both keys to ORDINAL form ONCE; every internal consumer
+	 * (the merge-point descents, the spine build, the source-subtree
+	 * unlink, the ordered-list interleave) takes the ordinal form.  The
+	 * detach+graft fallback below instead receives the ORIGINAL
+	 * application keys -- those entry points remap internally.
+	 * Previously the descents consumed the application bytes raw while
+	 * the unlink remapped: on a non-identity key map the build copied one
+	 * subtree and the unlink targeted another.
+	 */
+	{
+		const struct cds_ft_key_map *km = &dst_ft->group->key_map;
+
+		if (caa_unlikely(!km->identity)) {
+			ft_key_to_ordinals(okey_dst_buf, dst_key, dst_key_len,
+				km);
+			ft_key_to_ordinals(okey_src_buf, src_key, src_key_len,
+				km);
+			okey_dst = okey_dst_buf;
+			okey_src = okey_src_buf;
+		}
+	}
+
+	/*
 	 * Locate both merge points read-only (a writer descends its own
 	 * stable state).  No content under @src_key -> the merge is a no-op;
 	 * cnt_src == 0 covers an empty @src_ft root (src_key_len == 0, where
 	 * the descent still reports EXACT at the always-present root).
 	 */
-	ks = ft_merge_descend(src_ft, src_key, src_key_len, &d_src,
+	ks = ft_merge_descend(src_ft, okey_src, src_key_len, &d_src,
 			&off_src, &cnt_src);
 	if (ks == FT_GRAFT_SWAP_DELEGATE || cnt_src == 0) {
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
-	kd = ft_merge_descend(dst_ft, dst_key, dst_key_len, &d_dst,
+	kd = ft_merge_descend(dst_ft, okey_dst, dst_key_len, &d_dst,
 			&off_dst, &cnt_dst);
 
 	/*
@@ -19830,8 +19880,27 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 			&& (kd == FT_GRAFT_SWAP_EXACT
 				|| kd == FT_GRAFT_SWAP_KEY_SHORTER)) {
 		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
-				src_key, src_key_len, cnt_src, off_src,
-				&d_dst, cnt_dst, off_dst, dst_key, dst_key_len);
+				okey_src, src_key_len, cnt_src, off_src,
+				&d_dst, cnt_dst, off_dst, okey_dst, dst_key_len);
+		if (status == CDS_FT_STATUS_OK) {
+			/*
+			 * Raise dst's max_used_key_len for the moved keys
+			 * (dst_key_len + the longest stripped suffix), as the
+			 * graft paths do -- later graft overflow validations
+			 * feed off it.
+			 */
+			size_t src_max = uatomic_load(&src_ft->max_used_key_len,
+					CMM_RELAXED);
+			size_t nm = src_max > src_key_len ?
+				dst_key_len + (src_max - src_key_len) :
+				dst_key_len;
+			size_t dm = uatomic_load(&dst_ft->max_used_key_len,
+					CMM_RELAXED);
+
+			if (nm > dm)
+				uatomic_store(&dst_ft->max_used_key_len, nm,
+					CMM_RELAXED);
+		}
 		FT_TP(merge_exit, (int) status);
 		return status;
 	}
@@ -24129,6 +24198,28 @@ enum cds_ft_status cds_ft_iter_get_prefix(struct cds_ft_iter *iter,
 	return CDS_FT_STATUS_OK;
 }
 
+/*
+ * Internal: set the iterator's search key from ALREADY-ORDINAL bytes (no key
+ * map application; the public cds_ft_iter_set_key remaps and validates).  Used
+ * by the bulk-op machinery, which converts the caller's key once at the public
+ * entry and threads the ordinal form internally.
+ */
+static
+void ft_iter_set_key_ordinals(struct cds_ft_iter *iter, const uint8_t *ordinals,
+		size_t key_len)
+{
+	/*
+	 * Setting a new key invalidates the cached position: the next
+	 * operation re-descends from the root by the new key.
+	 */
+	memcpy(iter_key(iter), ordinals, key_len);
+	iter->cache_valid = false;
+	iter_debug_path_clear(iter);
+	iter->path_len = 0;
+	iter->key_len = key_len;
+	iter->key_off = 0;	/* search key sits at the front of iter_key */
+}
+
 enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *key, size_t key_len)
 {
 	const struct cds_ft_key_map *km = &iter->ft->group->key_map;
@@ -24147,16 +24238,7 @@ enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *
 		ft_key_to_ordinals(ordinal_buf, key, key_len, km);
 		key_ordinals = ordinal_buf;
 	}
-	/*
-	 * Setting a new key invalidates the cached position: the next
-	 * operation re-descends from the root by the new key.
-	 */
-	memcpy(iter_key(iter), key_ordinals, key_len);
-	iter->cache_valid = false;
-	iter_debug_path_clear(iter);
-	iter->path_len = 0;
-	iter->key_len = key_len;
-	iter->key_off = 0;	/* search key sits at the front of iter_key */
+	ft_iter_set_key_ordinals(iter, key_ordinals, key_len);
 	FT_TP(iter_set_key_exit, (const void *) iter->ft, (const void *) iter,
 		(int) iter->path_len);
 	return CDS_FT_STATUS_OK;

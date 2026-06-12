@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 250
+#define NR_TESTS 252
 #else
-#define NR_TESTS 236
+#define NR_TESTS 238
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -237,6 +237,16 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
 
 	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
 	return cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, 0, out);
+}
+
+/* Exact-key presence check for a NUL-terminated string key. */
+static int ft_test_has_key(struct cds_ft *ft, const char *k)
+{
+	struct cds_ft_node *out = NULL;
+	size_t len = strlen(k);
+
+	return cds_ft_eager_lookup_key(ft, (const uint8_t *) k, len, 0,
+			&out) == CDS_FT_STATUS_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -5475,6 +5485,240 @@ static int test_merge_ordered_fixed_root(void)
 		fprintf(stderr, "merge_ordered_fixed_root: verify failed\n");
 		goto out;
 	}
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Bulk ops (merge_at spine, graft_swap DELEGATE) on a NON-IDENTITY key map.
+ * Regression for the 2026-06 review's finding 2.10: the merge-point descents
+ * consumed the caller's application bytes raw while the source unlink
+ * remapped them -- on a non-identity map the spine build copied one subtree
+ * and the unlink targeted another; and graft_swap's DELEGATE fallback passed
+ * its already-remapped key to cds_ft_graft, which remapped it AGAIN (wrong
+ * graft point, wrong splice position).  The keys are now converted once at
+ * the public entries and threaded in ordinal form.
+ */
+static int test_nonidentity_bulk_ops(void)
+{
+	uint8_t k2o[256], o2k[256];
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst = NULL, *src = NULL, *swap = NULL;
+	struct cds_ft_iter *iter = NULL;
+	const char *dst_keys[] = { "xyz" };
+	const char *src_keys[] = { "abc", "abd" };
+	const char *swap_keys[] = { "pqr", "pqs" };
+	/* dst after merge_at(dst@"xy" <- src@"ab"): xyc xyd xyz. */
+	const char *exp_merge[] = { "xyc", "xyd", "xyz" };
+	unsigned int i;
+	int ret = -1;
+	enum cds_ft_status s;
+
+	for (i = 0; i < 256; i++) {
+		k2o[i] = 255 - i;
+		o2k[255 - i] = i;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	if (cds_ft_group_attr_set_key_map(attr, k2o, o2k) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+	    cds_ft_create(group, NULL, &src) < 0 ||
+	    cds_ft_create(group, NULL, &swap) < 0 ||
+	    cds_ft_iter_create(dst, &iter) < 0)
+		abort();
+	for (i = 0; i < 1; i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		s = cds_ft_insert(dst, (const uint8_t *) dst_keys[i], 3, &n->node);
+		rcu_read_unlock();
+		if (s < 0) goto out;
+	}
+	for (i = 0; i < 2; i++) {
+		struct ft_test_node *n = node_alloc(0);
+		struct ft_test_node *m = node_alloc(0);
+
+		rcu_read_lock();
+		s = cds_ft_insert(src, (const uint8_t *) src_keys[i], 3, &n->node);
+		if (s == CDS_FT_STATUS_OK)
+			s = cds_ft_insert(swap, (const uint8_t *) swap_keys[i],
+					3, &m->node);
+		rcu_read_unlock();
+		if (s < 0) goto out;
+	}
+
+	/* merge_at through the spine path (dst non-empty under "xy"). */
+	rcu_read_lock();
+	s = cds_ft_merge_at(dst, (const uint8_t *) "xy", 2,
+			src, (const uint8_t *) "ab", 2);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "nonid_bulk: merge_at: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "nonid_bulk: post-merge verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	for (i = 0; i < 3; i++) {
+		if (!ft_test_has_key(dst, exp_merge[i])) {
+			fprintf(stderr, "nonid_bulk: '%s' missing after merge\n",
+				exp_merge[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	/* Ordered walk over dst: reversed map => xyz < xyd < xyc?  No --
+	 * iteration is in APPLICATION key order per the map; just count. */
+	s = cds_ft_lookup_first(dst, iter);
+	for (i = 0; s == CDS_FT_STATUS_OK && i < 16; i++)
+		s = cds_ft_next(dst, iter);
+	if (i != 3) {
+		fprintf(stderr, "nonid_bulk: ordered walk found %u keys, expected 3\n", i);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+
+	/* graft_swap DELEGATE: no content at "pq" in dst -> reduces to graft. */
+	rcu_read_lock();
+	s = cds_ft_graft_swap(dst, (const uint8_t *) "pq", 2, swap);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "nonid_bulk: graft_swap: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(swap, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "nonid_bulk: post-swap verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (!ft_test_has_key(dst, "pqpqr") ||
+	    !ft_test_has_key(dst, "pqpqs")) {
+		fprintf(stderr, "nonid_bulk: swapped keys missing\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	drain_trie(dst);
+	drain_trie(src);
+	drain_trie(swap);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * cds_ft_merge_at combined-length validation (2026-06 review, 2.12): a
+ * variable-length merge with dst_key_len > src_key_len must reject moved keys
+ * whose resulting length exceeds the group's max_key_len (previously
+ * unchecked: the spine's fixed-size key buffers overflowed downstream), and a
+ * successful spine merge must raise dst's max_used_key_len (previously left
+ * stale, under-feeding later graft validations).
+ */
+static int test_merge_at_overflow(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst = NULL, *src = NULL;
+	struct ft_test_node *a = node_alloc(1);
+	struct ft_test_node *b = node_alloc(2);
+	struct ft_test_node *c = node_alloc(3);
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_max_key_len(attr, 8);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+	    cds_ft_create(group, NULL, &src) < 0)
+		abort();
+	rcu_read_lock();
+	/* src: "abcde" at prefix "a" -> stripped suffix "bcde" (4 bytes). */
+	s = cds_ft_insert(src, (const uint8_t *) "abcde", 5, &a->node);
+	/* dst max_used stays 6: the max_used raise below must come from
+	 * the merge itself, not from these inserts. */
+	if (s == CDS_FT_STATUS_OK)
+		s = cds_ft_insert(dst, (const uint8_t *) "zzzzzz", 6, &b->node);
+	if (s == CDS_FT_STATUS_OK)
+		s = cds_ft_insert(dst, (const uint8_t *) "zzz1", 4, &c->node);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_overflow: build failed\n");
+		goto out;
+	}
+
+	/* 6 + (5-1) = 10 > max 8: must be rejected up front. */
+	rcu_read_lock();
+	s = cds_ft_merge_at(dst, (const uint8_t *) "zzzzzz", 6,
+			src, (const uint8_t *) "a", 1);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OVERFLOW_ERROR) {
+		fprintf(stderr, "merge_overflow: expected OVERFLOW, got %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!ft_test_has_key(src, "abcde")) {
+		fprintf(stderr, "merge_overflow: src key lost on rejection\n");
+		goto out;
+	}
+
+	/* 3 + (5-1) = 7 <= 8: succeeds and raises dst's max_used_key_len. */
+	rcu_read_lock();
+	s = cds_ft_merge_at(dst, (const uint8_t *) "zzz", 3,
+			src, (const uint8_t *) "a", 1);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(dst, "zzzbcde")) {
+		fprintf(stderr, "merge_overflow: valid merge failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_max_used_key_len(dst) < 7) {
+		fprintf(stderr,
+			"merge_overflow: max_used_key_len %zu, expected >= 7\n",
+			cds_ft_max_used_key_len(dst));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_overflow: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
 	ret = 0;
 out:
 	drain_trie(dst);
@@ -19294,6 +19538,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_inequality_empty_key);
 	RUN_TEST(test_merge_ordered_fixed_root);
 	RUN_TEST(test_merge_at_fixed_ordered_splice);
+	RUN_TEST(test_nonidentity_bulk_ops);
+	RUN_TEST(test_merge_at_overflow);
 
 	/* 9. Graft, graft_swap & detach */
 	diag("Graft, graft_swap & detach tests");
