@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 252
+#define NR_TESTS 253
 #else
-#define NR_TESTS 238
+#define NR_TESTS 239
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -316,6 +316,40 @@ static int test_lifecycle_defaults(void)
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
 	return 0;
+}
+
+/*
+ * cds_ft_group_create_flavor: the explicit-flavor creator (the form
+ * required when including <urcu/urcu-*.h> modern flavor headers, which
+ * clear the URCU API mapping) binds the group to the passed flavor.
+ * This test builds with the legacy QSBR include, so urcu_qsbr_flavor
+ * is the same flavor the mapped cds_ft_group_create() would pick.
+ */
+static int test_lifecycle_group_create_flavor(void)
+{
+	struct cds_ft_group *group;
+	struct ft_test_node *n;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+
+	if (cds_ft_group_create_flavor(NULL, &group, &urcu_qsbr_flavor) != CDS_FT_STATUS_OK)
+		return -1;
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	n = node_alloc(42);
+	rcu_read_lock();
+	s = cds_ft_insert(ft, (const uint8_t *) "flv", 3, &n->node);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "insert failed: %s\n", cds_ft_status_to_string(s));
+		node_free(n);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
 }
 
 /*
@@ -19434,6 +19468,7 @@ int main(int argc, char **argv)
 	/* 1. Lifecycle & attributes */
 	diag("Lifecycle & attribute tests");
 	RUN_TEST(test_lifecycle_defaults);
+	RUN_TEST(test_lifecycle_group_create_flavor);
 	RUN_TEST(test_lifecycle_fixed_key_lengths);
 	RUN_TEST(test_lifecycle_nil_only_trie);
 	RUN_TEST(test_lifecycle_max_key_len);

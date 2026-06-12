@@ -10,6 +10,12 @@
  *
  * Userspace RCU library - Fractal Trie
  *
+ * For use with URCU_API_MAP (API mapping of liburcu), include this
+ * file _after_ including your URCU flavor.  The modern
+ * <urcu/urcu-*.h> flavor headers clear the API mapping at the end of
+ * the header; with those, use cds_ft_group_create_flavor() (explicit
+ * flavor argument) instead of cds_ft_group_create().
+ *
  * A concurrent, RCU-protected ordered trie mapping variable or
  * fixed-length byte keys to user-defined nodes. Keys are opaque
  * byte sequences with no reserved or sentinel values; unlike
@@ -1849,21 +1855,56 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  * Trie lifecycle
  */
 
+/*
+ * _cds_ft_group_create - API used by the cds_ft_group_create wrappers
+ * below.  Do not use directly.
+ */
 enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		struct cds_ft_group **result_ft_group,
 		const struct rcu_flavor_struct *flavor);
 
+/*
+ * cds_ft_group_create_flavor - Create a Fractal Trie group tied to an
+ *                              explicit RCU flavor.
+ * @attr: Fractal Trie attributes.
+ * @result_ft_group: Fractal Trie group output. Set to the newly created
+ *                   trie group on success, or NULL on error.
+ * @flavor: Flavor of liburcu used to synchronize the group's tries
+ *          (e.g. &urcu_memb_flavor, &urcu_qsbr_flavor).
+ *
+ * The @attr pointer is used to specify the Fractal Trie attributes. If
+ * NULL, use default attribute values. The @attr can be destroyed
+ * by the caller immediately after cds_ft_group_create_flavor()
+ * returns. The caller keeps ownership of @attr. Default attributes
+ * select a variable key length.
+ *
+ * This is the form to use with the modern <urcu/urcu-*.h> flavor
+ * headers, which clear the URCU API mapping at the end of the header
+ * (urcu/map/clear.h), making cds_ft_group_create() unavailable.
+ * Mirrors cds_lfht_new_flavor().
+ *
+ * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
+ * on error.
+ */
+static inline
+enum cds_ft_status cds_ft_group_create_flavor(const struct cds_ft_group_attr *attr,
+		struct cds_ft_group **result_ft_group,
+		const struct rcu_flavor_struct *flavor)
+{
+	return _cds_ft_group_create(attr, result_ft_group, flavor);
+}
+
+#ifdef URCU_API_MAP
 /*
  * cds_ft_group_create - Create a Fractal Trie group.
  * @attr: Fractal Trie attributes.
  * @result_ft_group: Fractal Trie group output. Set to the newly created
  *                   trie group on success, or NULL on error.
  *
- * The @attr pointer is used to specify the Fractal Trie attributes. If
- * NULL, use default attribute values. The @attr can be destroyed
- * by the caller immediately after cds_ft_group_create() returns. The
- * caller keeps ownership of @attr. Default attributes select a variable
- * key length.
+ * Same as cds_ft_group_create_flavor(), binding the group to the RCU
+ * flavor selected by the URCU API mapping of the previously included
+ * flavor header (legacy <urcu.h> / <urcu-qsbr.h>-style include, or
+ * URCU_API_MAP defined before a modern flavor header).
  *
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
  * on error.
@@ -1874,6 +1915,7 @@ enum cds_ft_status cds_ft_group_create(const struct cds_ft_group_attr *attr,
 {
 	return _cds_ft_group_create(attr, result_ft_group, &rcu_flavor);
 }
+#endif /* URCU_API_MAP */
 
 /*
  * cds_ft_group_destroy - Destroy a Fractal Trie group.

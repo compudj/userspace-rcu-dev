@@ -18,6 +18,12 @@
 #include <urcu/debug.h>
 #include <urcu/defer.h>
 #include <urcu/flavor.h>
+/*
+ * Included without an active URCU API mapping (the modern flavor
+ * headers below clear it): regression test for the header parsing
+ * standalone; only cds_ft_group_create() requires the mapping.
+ */
+#include <urcu/fractal-trie.h>
 #include <urcu/futex.h>
 #include <urcu/hlist.h>
 #include <urcu/lfstack.h>
