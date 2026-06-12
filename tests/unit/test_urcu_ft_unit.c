@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 243
+#define NR_TESTS 244
 #else
-#define NR_TESTS 232
+#define NR_TESTS 233
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -5067,6 +5067,122 @@ out:
 		ret = drain_and_destroy(ft, group);
 	else
 		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Ordered iteration key read-back on an EAGER identity variable-length group
+ * WITH an in-leaf key length (key_len_offset set, no speculative_key_offset).
+ * Regression for ft_iter_resolve_key_len taking the leaf-length shortcut on
+ * such a group: it cleared the LAZY sentinel -- which doubles as "iter key
+ * buffer filled" for ft_iter_read_key -- without filling the buffer, so
+ * cds_ft_iter_get_key returned the resolved length with garbage key bytes.
+ * The shortcut is only valid when the key itself is leaf-referenced
+ * (speculative_key_offset set); an EAGER group must take the up-walk, which
+ * fills the buffer in the same walk (2026-06 review follow-up to 1.2).
+ */
+struct klen_test_node {
+	struct cds_ft_node node;
+	size_t klen;
+};
+
+static int test_eager_key_len_offset_iter_key(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	const char *words[] = { "aaa", "aab", "zzz" };
+	struct klen_test_node *nodes[3] = { NULL, NULL, NULL };
+	unsigned int i;
+	int ret = -1;
+	uint8_t rk[64]; size_t rl;
+	enum cds_ft_status s;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len_offset(attr,
+			offsetof(struct klen_test_node, klen) -
+			offsetof(struct klen_test_node, node)) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		goto out;
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		struct klen_test_node *n = (struct klen_test_node *)
+			calloc(1, sizeof(*n));
+
+		if (!n)
+			abort();
+		cds_ft_node_init(&n->node);
+		n->klen = strlen(words[i]);
+		nodes[i] = n;
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) words[i],
+				  strlen(words[i]), &n->node) < 0) {
+			fprintf(stderr, "insert '%s' failed\n", words[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+	rcu_read_lock();
+	s = cds_ft_lookup_first(ft, iter);
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		if (s != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+			fprintf(stderr, "step %u: status %d\n", i, s);
+			rcu_read_unlock();
+			goto out;
+		}
+		cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+		if (rl != strlen(words[i]) ||
+				memcmp(rk, words[i], rl) != 0) {
+			rk[rl < sizeof rk ? rl : sizeof rk - 1] = '\0';
+			fprintf(stderr, "step %u: got '%s' (len %zu), expected '%s'\n",
+				i, (char *) rk, rl, words[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		s = cds_ft_next(ft, iter);
+	}
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "past end: status %d, expected NOT_FOUND\n", s);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	rcu_read_lock();
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		if (!nodes[i])
+			continue;
+		if (cds_ft_iter_set_key(iter, (const uint8_t *) words[i],
+				strlen(words[i])) == CDS_FT_STATUS_OK &&
+				cds_ft_remove(ft, iter, &nodes[i]->node) ==
+					CDS_FT_STATUS_OK) {
+			/* freed below after a grace period */
+		} else if (ret == 0) {
+			fprintf(stderr, "cleanup remove '%s' failed\n", words[i]);
+			ret = -1;
+		}
+	}
+	rcu_read_unlock();
+	rcu_barrier();
+	synchronize_rcu();
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+		free(nodes[i]);
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
 	return ret;
 }
 
@@ -18531,6 +18647,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_inequality_deadend_empty_slot);
 	RUN_TEST(test_iter_key_off_cell_to_descent);
 	RUN_TEST(test_iter_copy_cell_positions);
+	RUN_TEST(test_eager_key_len_offset_iter_key);
 	RUN_TEST(test_inequality_empty_key);
 	RUN_TEST(test_merge_ordered_fixed_root);
 

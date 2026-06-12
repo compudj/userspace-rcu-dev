@@ -8592,13 +8592,18 @@ size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
 {
 	if (caa_unlikely(iter->key_len == FT_ITER_KEY_LEN_LAZY)) {
 		/*
-		 * VARIABLE-length EAGER ordered-list (no in-leaf length at
-		 * key_len_offset): the parent up-walk derives the length -- and
-		 * fills iter_key in the same walk, which a following read_key then
-		 * reuses (the cell-walk's whole point: pay the O(depth) walk once,
-		 * on demand).  Otherwise read node->key_len from the leaf.
+		 * VARIABLE-length EAGER ordered-list (no in-leaf KEY at
+		 * speculative_key_offset): the key source is the iter buffer, and
+		 * clearing the LAZY sentinel doubles as "buffer filled" for
+		 * ft_iter_read_key -- so the length MUST come from the parent
+		 * up-walk, which fills iter_key (+ key_off) in the same walk that
+		 * derives the length, even when an in-leaf LENGTH (key_len_offset)
+		 * is configured.  Only a leaf-referenced key (in-leaf key present)
+		 * may take the leaf-length shortcut: its key reads never touch the
+		 * buffer.
 		 */
-		if (!iter->ft->group->key_len_offset_set) {
+		if (!iter->ft->group->key_len_offset_set ||
+				!iter->ft->group->speculative_key_offset_set) {
 			ft_iter_upwalk_into_buf(iter);
 			return iter->key_len;
 		}
