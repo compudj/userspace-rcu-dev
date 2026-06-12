@@ -9212,13 +9212,17 @@ post_traversal:
 			if (external_nodes) {
 				/* End of key lookup succeded. We got an equal match.
 				 * The result key equals the input, which is read in
-				 * place from iter_key(iter), so the memcpy is a no-op
-				 * self-copy unless a separate buffer is in use. */
+				 * place from iter_key(iter), so the copy is a no-op
+				 * self-copy unless a separate buffer is in use.
+				 * memmove: @input_key may be the up-walk key at this
+				 * same buffer's TAIL (iter_key + key_off), which the
+				 * front write overlaps. */
 				iter->key_len = key_len;
+				iter->key_off = 0;
 				if (!ft_speculative_keycopy(ft, external_nodes,
 						iter_key(iter), (ssize_t) key_len) &&
 						input_key != iter_key(iter))
-					memcpy(iter_key(iter), input_key, key_len);
+					memmove(iter_key(iter), input_key, key_len);
 				iter->node = external_nodes;
 				iter->cache_valid = true;
 				iter_debug_path_update(iter);
@@ -9261,6 +9265,7 @@ post_traversal:
 
 		assert(level <= (int) ft->group->max_key_len);
 		iter->key_len = level;
+		iter->key_off = 0;
 		if (!keep_ordinal)
 			ft_speculative_keycopy_unconditional(ft,
 				(const struct cds_ft_node *) ft_node_ptr(node_flag),
@@ -9331,6 +9336,7 @@ post_traversal:
 			int j;
 
 			iter->key_len = iter->prefix_len;
+			iter->key_off = 0;
 			if (!keep_ordinal)
 				ft_speculative_keycopy_unconditional(ft, ext,
 					iter_key(iter), (ssize_t) iter->prefix_len);
@@ -9481,6 +9487,7 @@ going_up:
 
 					assert(level <= (int) ft->group->max_key_len);
 					iter->key_len = level;
+					iter->key_off = 0;
 					if (!keep_ordinal)
 						ft_speculative_keycopy_unconditional(ft,
 							external_nodes, iter_key(iter), level);
@@ -9693,6 +9700,7 @@ going_up:
 						int j;
 
 						iter->key_len = iter->prefix_len;
+						iter->key_off = 0;
 						if (!keep_ordinal)
 							ft_speculative_keycopy_unconditional(ft,
 								external_nodes, iter_key(iter),
@@ -9733,6 +9741,7 @@ descend_children:
 
 		assert(level <= (int) ft->group->max_key_len);
 		iter->key_len = level;
+		iter->key_off = 0;
 		if (!keep_ordinal)
 			ft_speculative_keycopy_unconditional(ft,
 				(const struct cds_ft_node *) ft_node_ptr(node_flag),
@@ -9975,6 +9984,7 @@ found_minmax:
 		int j;
 
 		iter->key_len = level;
+		iter->key_off = 0;
 		if (!keep_ordinal)
 			ft_speculative_keycopy_unconditional(ft, ret_node,
 				iter_key(iter), level);
@@ -19465,6 +19475,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 			if (remaining == 0) {
 				/* Found: the key at this node's depth. */
 				iter->key_len = level - 1;
+				iter->key_off = 0;
 				{
 					int j;
 
@@ -19568,6 +19579,7 @@ next_level:
 	/* Reached a leaf (external node). */
 	if (node_flag && ft_node_external(node_flag) && remaining == 0) {
 		iter->key_len = level - 1;
+		iter->key_off = 0;
 		{
 			int j;
 
@@ -19743,6 +19755,7 @@ check_ext_nth_last:
 		if (ext) {
 			if (remaining == 0) {
 				iter->key_len = level - 1;
+				iter->key_off = 0;
 				{
 					int j;
 
@@ -19769,6 +19782,7 @@ next_level:
 	/* Reached a leaf (external node). */
 	if (node_flag && ft_node_external(node_flag) && remaining == 0) {
 		iter->key_len = level - 1;
+		iter->key_off = 0;
 		{
 			int j;
 
@@ -20204,6 +20218,7 @@ descend_forward:
 					int j;
 
 					iter->key_len = level;
+					iter->key_off = 0;
 					for (j = 0; j < level; j++)
 						iter_key(iter)[j] = ordinal_key[j];
 					iter->node = ext;
@@ -20288,6 +20303,7 @@ next_forward_level:
 			int j;
 
 			iter->key_len = level;
+			iter->key_off = 0;
 			for (j = 0; j < level; j++)
 				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = (struct cds_ft_node *)
@@ -20391,6 +20407,7 @@ enum ft_descent_action ft_skip_reverse_walk_up_compressed(
 			int j;
 
 			iter->key_len = level;
+			iter->key_off = 0;
 			for (j = 0; j < level; j++)
 				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = a_ext;
@@ -20623,6 +20640,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 						int j;
 
 						iter->key_len = level;
+						iter->key_off = 0;
 						for (j = 0; j < level; j++)
 							iter_key(iter)[j] = ordinal_key[j];
 						iter->node = a_ext;
@@ -20743,6 +20761,7 @@ check_ext_descend_reverse:
 				int j;
 
 				iter->key_len = level;
+				iter->key_off = 0;
 				for (j = 0; j < level; j++)
 					iter_key(iter)[j] = ordinal_key[j];
 				iter->node = ext;
@@ -20766,6 +20785,7 @@ next_reverse_level:
 			int j;
 
 			iter->key_len = level;
+			iter->key_off = 0;
 			for (j = 0; j < level; j++)
 				iter_key(iter)[j] = ordinal_key[j];
 			iter->node = (struct cds_ft_node *)

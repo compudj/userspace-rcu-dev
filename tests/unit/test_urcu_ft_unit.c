@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 241
+#define NR_TESTS 242
 #else
-#define NR_TESTS 230
+#define NR_TESTS 231
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4878,6 +4878,90 @@ static int test_inequality_deadend_empty_slot(void)
 		}
 		rcu_read_unlock();
 	}
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Key read back after an ordered-cell-walk landing (key materialized by the
+ * parent up-walk at the iter buffer's TAIL, iter->key_off > 0) followed by a
+ * SCOPED step (descent path, result key written at the buffer FRONT).
+ * Regression for the descent's terminal result stores not resetting
+ * iter->key_off: ft_iter_read_key returned the previous position's stale
+ * tail bytes for the new node (2026-06 review, 1.3).
+ */
+static int test_iter_key_off_cell_to_descent(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	const char *words[] = { "aaa", "aab", "zzz" };
+	unsigned int i;
+	int ret = -1;
+	uint8_t rk[64]; size_t rl;
+	enum cds_ft_status s;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) words[i],
+				  strlen(words[i]), &n->node) < 0) {
+			fprintf(stderr, "insert '%s' failed\n", words[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+	rcu_read_lock();
+	/* Cell-walk landing: key_len LAZY, then up-walk tail-fills the key. */
+	s = cds_ft_lookup_first(ft, iter);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "lookup_first: status %d\n", s);
+		rcu_read_unlock();
+		goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+	if (rl != 3 || memcmp(rk, "aaa", 3) != 0) {
+		fprintf(stderr, "first: got len %zu, expected 'aaa'\n", rl);
+		rcu_read_unlock();
+		goto out;
+	}
+	/* Scoping disables the cell fast path: next steps via the descent. */
+	cds_ft_iter_set_prefix_len(iter, 1);
+	s = cds_ft_next(ft, iter);
+	if (s != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+		fprintf(stderr, "next(scoped): status %d\n", s);
+		rcu_read_unlock();
+		goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+	if (rl != 3 || memcmp(rk, "aab", 3) != 0) {
+		rk[rl < sizeof rk ? rl : sizeof rk - 1] = '\0';
+		fprintf(stderr, "next(scoped): got '%s' (len %zu), expected 'aab'\n",
+			(char *) rk, rl);
+		rcu_read_unlock();
+		goto out;
+	}
+	/* "zzz" is outside the 1-byte scope: the walk must end here. */
+	s = cds_ft_next(ft, iter);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "next(scoped) past end: status %d, expected NOT_FOUND\n", s);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
 	ret = 0;
 out:
 	cds_ft_iter_destroy(iter);
@@ -18347,6 +18431,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_inequality_prefix_key);
 	RUN_TEST(test_inequality_extends_prefix);
 	RUN_TEST(test_inequality_deadend_empty_slot);
+	RUN_TEST(test_iter_key_off_cell_to_descent);
 	RUN_TEST(test_inequality_empty_key);
 	RUN_TEST(test_merge_ordered_fixed_root);
 
