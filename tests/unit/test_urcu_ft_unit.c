@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 242
+#define NR_TESTS 243
 #else
-#define NR_TESTS 231
+#define NR_TESTS 232
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4965,6 +4965,104 @@ static int test_iter_key_off_cell_to_descent(void)
 	ret = 0;
 out:
 	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * cds_ft_iter_copy of ordered-cell-walk positions on an EAGER identity
+ * variable-length group (the default config).  Regression for two bugs
+ * (2026-06 review, 1.2):
+ *  - copying a fresh cell landing, whose key length is the deferred LAZY
+ *    sentinel ((size_t)-1), did memcpy(..., SIZE_MAX);
+ *  - iter->key_off was never copied, so copying an up-walk-materialized
+ *    position (key at the buffer TAIL) copied the wrong byte range and
+ *    left dst reading garbage at the front.
+ */
+static int test_iter_copy_cell_positions(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *src = NULL, *dst = NULL, *dst2 = NULL;
+	const char *words[] = { "aaa", "aab", "zzz" };
+	unsigned int i;
+	int ret = -1;
+	uint8_t rk[64]; size_t rl;
+	enum cds_ft_status s;
+
+	if (cds_ft_iter_create(ft, &src) < 0 ||
+			cds_ft_iter_create(ft, &dst) < 0 ||
+			cds_ft_iter_create(ft, &dst2) < 0)
+		goto out;
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) words[i],
+				  strlen(words[i]), &n->node) < 0) {
+			fprintf(stderr, "insert '%s' failed\n", words[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+	rcu_read_lock();
+	/* Fresh cell landing: key_len is the LAZY sentinel, nothing materialized. */
+	s = cds_ft_lookup_first(ft, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "lookup_first: status %d\n", s);
+		rcu_read_unlock();
+		goto out;
+	}
+	cds_ft_iter_copy(dst, src);
+	cds_ft_iter_get_key(dst, rk, sizeof rk, &rl);
+	if (rl != 3 || memcmp(rk, "aaa", 3) != 0) {
+		fprintf(stderr, "copy(lazy): got len %zu, expected 'aaa'\n", rl);
+		rcu_read_unlock();
+		goto out;
+	}
+	s = cds_ft_next(ft, dst);
+	cds_ft_iter_get_key(dst, rk, sizeof rk, &rl);
+	if (s != CDS_FT_STATUS_OK || rl != 3 || memcmp(rk, "aab", 3) != 0) {
+		fprintf(stderr, "copy(lazy)+next: status %d len %zu, expected 'aab'\n",
+			s, rl);
+		rcu_read_unlock();
+		goto out;
+	}
+	/* Materialize src's key (up-walk fills the buffer TAIL, key_off > 0). */
+	cds_ft_iter_get_key(src, rk, sizeof rk, &rl);
+	if (rl != 3 || memcmp(rk, "aaa", 3) != 0) {
+		fprintf(stderr, "src materialize: got len %zu, expected 'aaa'\n", rl);
+		rcu_read_unlock();
+		goto out;
+	}
+	cds_ft_iter_copy(dst2, src);
+	cds_ft_iter_get_key(dst2, rk, sizeof rk, &rl);
+	if (rl != 3 || memcmp(rk, "aaa", 3) != 0) {
+		fprintf(stderr, "copy(tail): got len %zu, expected 'aaa'\n", rl);
+		rcu_read_unlock();
+		goto out;
+	}
+	s = cds_ft_next(ft, dst2);
+	cds_ft_iter_get_key(dst2, rk, sizeof rk, &rl);
+	if (s != CDS_FT_STATUS_OK || rl != 3 || memcmp(rk, "aab", 3) != 0) {
+		fprintf(stderr, "copy(tail)+next: status %d len %zu, expected 'aab'\n",
+			s, rl);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (src)
+		cds_ft_iter_destroy(src);
+	if (dst)
+		cds_ft_iter_destroy(dst);
+	if (dst2)
+		cds_ft_iter_destroy(dst2);
 	if (ret == 0)
 		ret = drain_and_destroy(ft, group);
 	else
@@ -18432,6 +18530,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_inequality_extends_prefix);
 	RUN_TEST(test_inequality_deadend_empty_slot);
 	RUN_TEST(test_iter_key_off_cell_to_descent);
+	RUN_TEST(test_iter_copy_cell_positions);
 	RUN_TEST(test_inequality_empty_key);
 	RUN_TEST(test_merge_ordered_fixed_root);
 

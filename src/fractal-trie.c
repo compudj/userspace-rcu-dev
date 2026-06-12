@@ -23519,22 +23519,32 @@ void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src)
 	dst->cache_valid = src->cache_valid;
 	dst->path_len = src->path_len;
 	dst->key_len = src->key_len;
+	dst->key_off = src->key_off;
 	dst->prefix_len = src->prefix_len;
 	dst->node = src->node;
+	dst->ord_cell = src->ord_cell;
+	dst->ord_cell_node = src->ord_cell_node;
 #ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
 	dst->gp_state = src->gp_state;
 	dst->gp_state_valid = src->gp_state_valid;
 #endif
 	/*
-	 * Copy the key buffer only when the source key is a VALUE there.  When it
-	 * is a live leaf reference (identity cell position, incl. a deferred-length
-	 * LAZY one), iter_key(src) is stale and src->key_len may be the LAZY
-	 * sentinel — @dst shares src->node + cache_valid, so it reads the key (and
-	 * resolves the length) from the same leaf, and the buffer copy is both
-	 * unnecessary and unsafe (a SIZE_MAX memcpy).
+	 * Copy the key buffer only when the source key is a VALUE there.  It is
+	 * NOT one when:
+	 *  - the key is a live leaf reference (identity cell position with an
+	 *    in-leaf key): iter_key(src) is stale; @dst shares src->node +
+	 *    cache_valid, so it reads the key from the same leaf;
+	 *  - the length is the deferred LAZY sentinel (EAGER identity cell
+	 *    position, no in-leaf key): nothing was materialized yet; @dst
+	 *    shares the position and re-derives key + length from the up-walk
+	 *    on demand.  Copying would be a SIZE_MAX memcpy.
+	 * Copy at key_off: an up-walk-materialized key lives at the buffer
+	 * TAIL, mirrored to the same offset in @dst (key_off copied above).
 	 */
-	if (!ft_iter_key_referenced(src))
-		memcpy(iter_key(dst), iter_key(src), src->key_len);
+	if (!ft_iter_key_referenced(src) &&
+			src->key_len != FT_ITER_KEY_LEN_LAZY)
+		memcpy(iter_key(dst) + src->key_off,
+			iter_key(src) + src->key_off, src->key_len);
 }
 
 struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
