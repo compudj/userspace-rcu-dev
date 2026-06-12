@@ -23518,34 +23518,39 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
 }
 
 /*
- * Iterator-free ordered batched gather, shared by cds_ft_node_next_batch /
- * cds_ft_node_prev_batch.  Walks @ft's ordered cell list from @cursor (NULL =
- * the list minimum for forward, maximum for reverse), emits up to @cap head
- * pointers into @buf, and writes the resume node -- the one after the last
+ * Iterator-free ordered batched gather, shared by cds_ft_cell_next_batch /
+ * cds_ft_cell_prev_batch.  Walks @ft's ordered cell list from @cursor (NULL =
+ * the list minimum for forward, maximum for reverse), emits up to @cap opaque
+ * CELL handles into @buf, and writes the resume cell -- the one after the last
  * emitted, NULL at the end -- to @next_cursor.  The cmm_ptr_eq physical-next
  * prediction (post-compaction the cells are contiguous in key order at @stride,
- * so a head's ord_next/ord_prev usually resolves to cur ± stride; cmm_ptr_eq
- * validates the arithmetic guess and lets the compiler address the NEXT body
- * load off it, breaking the dependent-load chain so the gather pipelines)
- * pays only on a compacted arena and is a no-op otherwise.  @forward is a
- * literal at both call sites so always_inline folds the direction out.
+ * so a cell's ord_next/ord_prev usually resolves to cur ± stride; cmm_ptr_eq
+ * validates the arithmetic guess and lets the compiler address the NEXT load off
+ * it, breaking the dependent-load chain so the gather pipelines) pays only on a
+ * compacted arena and is a no-op otherwise.  @forward is a literal at both call
+ * sites so always_inline folds the direction out.
  *
- * ORDERED-LIST ONLY: the step IS the cell ord_next / ord_prev walk.  Stepping
- * node->node in key order needs the cell list; a bare node on a list-off trie
- * has no recoverable "next in key order" (a leaf key materializes ONE key but
- * not the SUCCESSOR -- that needs the list or an iterator).  So a list-off trie
- * yields CDS_FT_STATUS_NOT_SUPPORTED (*count = 0, *next_cursor = NULL): use the
- * iterator (cds_ft_next / cds_ft_prev, structural descent) there.
+ * Cell-native: the cursor, the emitted handles, and the resume cursor are all
+ * CELLS, so the walk never touches an external head node -- not to emit, not to
+ * resume (no node<->cell round-trip, hence no resume cache is needed).  The
+ * caller recovers the node from a cell via cds_ft_cell_node() (an inlined load
+ * of the hot cell line, not a cold node->prev) and materializes keys lazily via
+ * cds_ft_cell_get_key(); a keyless (no in-leaf key) ordered scan thus touches
+ * ZERO external-head cachelines in the library.
  *
- * RCU CONTRACT: @cursor and every emitted node are valid only while the read
- * lock that produced @cursor is held continuously (see cds_ft_node_get_key).
+ * ORDERED-LIST ONLY: the step IS the cell ord_next / ord_prev walk.  A list-off
+ * trie has no cell list, so it yields CDS_FT_STATUS_NOT_SUPPORTED (*count = 0,
+ * *next_cursor = NULL): use the iterator (cds_ft_next / cds_ft_prev, structural
+ * descent) there.
+ *
+ * RCU CONTRACT: @cursor and every emitted cell are valid only while the read
+ * lock that produced @cursor is held continuously (see cds_ft_cell_get_key).
  */
 static inline __attribute__((always_inline))
-enum cds_ft_status ft_node_batch_dir(struct cds_ft *ft,
-		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
+enum cds_ft_status ft_cell_batch_dir(struct cds_ft *ft,
+		const struct cds_ft_cell *cursor, const struct cds_ft_cell **buf,
 		size_t cap, size_t *count,
-		const struct cds_ft_node **next_cursor, void **pos,
-		const bool forward)
+		const struct cds_ft_cell **next_cursor, const bool forward)
 {
 	size_t n = 0;
 	const uintptr_t stride = (uintptr_t) 1 << FT_ORD_CELL_ALLOC_ORDER;
@@ -23558,29 +23563,15 @@ enum cds_ft_status ft_node_batch_dir(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_SUPPORTED;
 	if (caa_unlikely(cap == 0))
 		return CDS_FT_STATUS_OK;
-	/*
-	 * Resume position.  @pos, when supplied, caches the resume CELL across
-	 * batches so re-entry is O(1) and reads no node body: the prior batch
-	 * stored it here, so we skip deriving the cell from cursor->prev -- a
-	 * scattered external-head-node load that costs one cache miss per batch
-	 * (~66 ns) and, at small caps, dominates the bandwidth-bound walk.  @pos
-	 * takes precedence over @cursor; *pos == NULL (the first call) or @pos ==
-	 * NULL (opt out) falls back to deriving from @cursor, or the list endpoint
-	 * when @cursor is NULL.  Reset *pos = NULL to re-seek by @cursor.  @pos has
-	 * the same continuous-read-lock validity as @cursor / @next_cursor.
-	 */
-	if (pos && *pos)
-		cur = (struct ft_ord_cell *) *pos;
-	else if (cursor)
-		cur = ft_ord_cell_ptr(rcu_dereference(
-			((struct cds_ft_node *) cursor)->prev));
+	if (cursor)
+		cur = (struct ft_ord_cell *) cursor;	/* resume AT the cell */
 	else
 		cur = ft_ord_cell_resolve_ord(forward ?
 			&ft->ord_cell_head : &ft->ord_cell_tail);
 	while (n < cap && cur) {
 		struct ft_ord_cell *loaded, *guess;
 
-		buf[n++] = cur->node;
+		buf[n++] = (const struct cds_ft_cell *) cur;
 		loaded = forward ?
 			ft_ord_cell_resolve_ord(&cur->ord_next) :
 			ft_ord_cell_resolve_ord(&cur->ord_prev);
@@ -23589,27 +23580,67 @@ enum cds_ft_status ft_node_batch_dir(struct cds_ft *ft,
 			(uintptr_t) cur - stride);
 		cur = (loaded && cmm_ptr_eq(loaded, guess)) ? guess : loaded;
 	}
-	*next_cursor = cur ? cur->node : NULL;
-	if (pos)
-		*pos = cur;
+	*next_cursor = (const struct cds_ft_cell *) cur;
 	*count = n;
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_node_next_batch(struct cds_ft *ft,
-		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
-		size_t cap, size_t *count, const struct cds_ft_node **next_cursor,
-		void **pos)
+enum cds_ft_status cds_ft_cell_next_batch(struct cds_ft *ft,
+		const struct cds_ft_cell *cursor, const struct cds_ft_cell **buf,
+		size_t cap, size_t *count, const struct cds_ft_cell **next_cursor)
 {
-	return ft_node_batch_dir(ft, cursor, buf, cap, count, next_cursor, pos, true);
+	return ft_cell_batch_dir(ft, cursor, buf, cap, count, next_cursor, true);
 }
 
-enum cds_ft_status cds_ft_node_prev_batch(struct cds_ft *ft,
-		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
-		size_t cap, size_t *count, const struct cds_ft_node **next_cursor,
-		void **pos)
+enum cds_ft_status cds_ft_cell_prev_batch(struct cds_ft *ft,
+		const struct cds_ft_cell *cursor, const struct cds_ft_cell **buf,
+		size_t cap, size_t *count, const struct cds_ft_cell **next_cursor)
 {
-	return ft_node_batch_dir(ft, cursor, buf, cap, count, next_cursor, pos, false);
+	return ft_cell_batch_dir(ft, cursor, buf, cap, count, next_cursor, false);
+}
+
+/* Invariant offset of the head-node pointer within the opaque cell. */
+size_t cds_ft_cell_node_offset(void)
+{
+	return offsetof(struct ft_ord_cell, node);
+}
+
+/*
+ * Materialize a key from an opaque cell handle (the lazy companion to the cell
+ * batch).  Same sources as cds_ft_node_get_key -- in-leaf key when configured,
+ * else the parent up-walk -- but driven from the CELL, so the up-walk path never
+ * touches the external head node.
+ */
+enum cds_ft_status cds_ft_cell_get_key(const struct cds_ft *ft,
+		const struct cds_ft_cell *cell_opaque, uint8_t *result_key,
+		size_t result_key_max_len, size_t *result_key_len)
+{
+	const struct cds_ft_group *group = ft->group;
+	struct ft_ord_cell *cell = (struct ft_ord_cell *) cell_opaque;
+	const uint8_t *ordinals;
+	size_t klen;
+	uint8_t scratch[FT_MAX_KEY_LEN];
+
+	if (!cell)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (group->speculative_key_offset_set) {
+		const struct cds_ft_node *node = rcu_dereference(cell->node);
+
+		ordinals = (const uint8_t *) node + group->speculative_key_offset;
+		klen = (group->key_len != CDS_FT_LEN_VARIABLE) ? group->key_len :
+			*(const size_t *) ((const char *) node +
+				group->key_len_offset);
+	} else {
+		size_t max_len = group->max_key_len;
+
+		klen = ft_rebuild_key_upwalk(ft, cell, scratch, max_len);
+		ordinals = scratch + (max_len - klen);
+	}
+	*result_key_len = klen;
+	if (klen > result_key_max_len)
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
+	ft_ordinals_to_key(result_key, ordinals, klen, &group->key_map);
+	return CDS_FT_STATUS_OK;
 }
 
 bool cds_ft_ordered_list(const struct cds_ft *ft)

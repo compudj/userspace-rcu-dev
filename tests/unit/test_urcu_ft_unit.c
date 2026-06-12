@@ -1602,9 +1602,9 @@ static int test_node_get_key(void)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_ft(4, &group);
-	struct cds_ft_node *buf[16];
-	const struct cds_ft_node *cur;
-	void *pos = NULL;	/* O(1) resume cache (exercise the fast path) */
+	const struct cds_ft_cell *buf[16];
+	const struct cds_ft_cell *cur;
+	size_t off = cds_ft_cell_node_offset();
 	unsigned long i, seen = 0;
 	size_t got, b;
 
@@ -1620,15 +1620,16 @@ static int test_node_get_key(void)
 	}
 
 	/*
-	 * One continuous read-side critical section: node pointers are valid.
-	 * Gather heads with the iterator-free node-cursor batch (NO iterator),
-	 * then materialize each key with cds_ft_node_get_key.
+	 * One continuous read-side critical section: cell handles are valid.
+	 * Gather cells with the iterator-free cell batch (NO iterator), recover
+	 * each node with cds_ft_cell_node, and materialize its key with
+	 * cds_ft_node_get_key.
 	 */
 	rcu_read_lock();
 	cur = NULL;
 	do {
-		enum cds_ft_status bs = cds_ft_node_next_batch(ft, cur, buf, 16,
-				&got, &cur, &pos);
+		enum cds_ft_status bs = cds_ft_cell_next_batch(ft, cur, buf, 16,
+				&got, &cur);
 
 		if (bs == CDS_FT_STATUS_NOT_SUPPORTED) {
 			/* No ordered list (and no in-leaf key): N/A -- pass. */
@@ -1641,11 +1642,12 @@ static int test_node_get_key(void)
 			goto fail;
 		}
 		for (b = 0; b < got; b++) {
+			struct cds_ft_node *node = cds_ft_cell_node(buf[b], off);
 			uint8_t k[4];
 			size_t klen;
 			uint64_t v;
 
-			if (cds_ft_node_get_key(ft, buf[b], k, sizeof(k), &klen)
+			if (cds_ft_node_get_key(ft, node, k, sizeof(k), &klen)
 					!= CDS_FT_STATUS_OK || klen != 4) {
 				rcu_read_unlock();
 				fprintf(stderr, "node_get_key: bad result at %lu\n",
@@ -1675,19 +1677,19 @@ fail:
 }
 
 /*
- * cds_ft_node_next_batch / cds_ft_node_prev_batch: the fully iterator-free
+ * cds_ft_cell_next_batch / cds_ft_cell_prev_batch: the fully iterator-free
  * ordered scan.  Walk all keys forward (cursor seeded NULL = list minimum) and
  * reverse (NULL = maximum) with a small batch buffer (forcing several batches),
- * resolving each node's key via cds_ft_node_get_key, and check the order.
- * A build with no ordered cell list returns 0 immediately -- treated as N/A.
+ * resolving each cell's key via cds_ft_cell_get_key, and check the order.
+ * A build with no ordered cell list returns NOT_SUPPORTED -- treated as N/A.
  */
 static int test_node_batch(void)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_ft(4, &group);
-	struct cds_ft_node *buf[4];
-	const struct cds_ft_node *cur;
-	void *pos = NULL;	/* O(1) resume cache (exercise the fast path) */
+	const struct cds_ft_cell *buf[4];
+	const struct cds_ft_cell *cur;
+	size_t off = cds_ft_cell_node_offset();
 	unsigned long i, seen;
 	size_t n, b;
 
@@ -1705,14 +1707,13 @@ static int test_node_batch(void)
 	/* Forward: cap 4 over 10 keys forces multiple batches. */
 	rcu_read_lock();
 	cur = NULL;
-	pos = NULL;
 	seen = 0;
 	do {
-		enum cds_ft_status bs = cds_ft_node_next_batch(ft, cur, buf, 4,
-				&n, &cur, &pos);
+		enum cds_ft_status bs = cds_ft_cell_next_batch(ft, cur, buf, 4,
+				&n, &cur);
 
 		if (bs == CDS_FT_STATUS_NOT_SUPPORTED) {
-			/* List-off trie: the node-cursor walk is N/A. */
+			/* List-off trie: the cell-cursor walk is N/A. */
 			rcu_read_unlock();
 			return drain_and_destroy(ft, group);
 		}
@@ -1725,7 +1726,7 @@ static int test_node_batch(void)
 			uint8_t k[4];
 			size_t kl;
 
-			if (cds_ft_node_get_key(ft, buf[b], k, sizeof k, &kl)
+			if (cds_ft_cell_get_key(ft, buf[b], k, sizeof k, &kl)
 					!= CDS_FT_STATUS_OK ||
 					cds_ft_key_to_u64(ft, k, 4) != seen) {
 				rcu_read_unlock();
@@ -1745,10 +1746,9 @@ static int test_node_batch(void)
 	/* Reverse: NULL cursor starts at the maximum, stepping down. */
 	rcu_read_lock();
 	cur = NULL;
-	pos = NULL;
 	seen = 0;
 	do {
-		if (cds_ft_node_prev_batch(ft, cur, buf, 4, &n, &cur, &pos)
+		if (cds_ft_cell_prev_batch(ft, cur, buf, 4, &n, &cur)
 				!= CDS_FT_STATUS_OK) {
 			rcu_read_unlock();
 			fprintf(stderr, "node_batch rev: bad status\n");
@@ -1758,7 +1758,7 @@ static int test_node_batch(void)
 			uint8_t k[4];
 			size_t kl;
 
-			if (cds_ft_node_get_key(ft, buf[b], k, sizeof k, &kl)
+			if (cds_ft_cell_get_key(ft, buf[b], k, sizeof k, &kl)
 					!= CDS_FT_STATUS_OK ||
 					cds_ft_key_to_u64(ft, k, 4) != 9 - seen) {
 				rcu_read_unlock();
@@ -1776,28 +1776,28 @@ static int test_node_batch(void)
 	}
 
 	/*
-	 * Exercise the node-cursor batched MACROS (no iterator in scope).  A tiny
+	 * Exercise the cell-cursor batched MACROS (no iterator in scope).  A tiny
 	 * @cap forces multiple internal batches; cross-check the key order.
 	 */
 	{
-		struct cds_ft_node *node, *mbuf[3];
+		const struct cds_ft_cell *cell, *mbuf[3];
 		unsigned long fwd = 0, rev = 0;
 
 		rcu_read_lock();
-		cds_ft_for_each_batched_rcu(ft, node, mbuf, 3) {
-			if (to_test_node(node)->key != fwd) {
+		cds_ft_for_each_batched_rcu(ft, cell, mbuf, 3) {
+			if (to_test_node(cds_ft_cell_node(cell, off))->key != fwd) {
 				rcu_read_unlock();
 				fprintf(stderr, "node_batch macro fwd: [%lu]=%llu\n", fwd,
-					(unsigned long long) to_test_node(node)->key);
+					(unsigned long long) to_test_node(cds_ft_cell_node(cell, off))->key);
 				goto fail;
 			}
 			fwd++;
 		}
-		cds_ft_for_each_reverse_batched_rcu(ft, node, mbuf, 3) {
-			if (to_test_node(node)->key != 9 - rev) {
+		cds_ft_for_each_reverse_batched_rcu(ft, cell, mbuf, 3) {
+			if (to_test_node(cds_ft_cell_node(cell, off))->key != 9 - rev) {
 				rcu_read_unlock();
 				fprintf(stderr, "node_batch macro rev: [%lu]=%llu\n", rev,
-					(unsigned long long) to_test_node(node)->key);
+					(unsigned long long) to_test_node(cds_ft_cell_node(cell, off))->key);
 				goto fail;
 			}
 			rev++;
@@ -1829,8 +1829,8 @@ static int test_node_get_key_no_list(void)
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
-	struct cds_ft_node *buf[4];
-	const struct cds_ft_node *cur;
+	const struct cds_ft_cell *buf[4];
+	const struct cds_ft_cell *cur;
 	unsigned long i;
 	size_t n;
 
@@ -1895,7 +1895,7 @@ static int test_node_get_key_no_list(void)
 			goto fail;
 		}
 		rcu_read_lock();
-		bs = cds_ft_node_next_batch(ft, NULL, buf, 4, &n, &cur, NULL);
+		bs = cds_ft_cell_next_batch(ft, NULL, buf, 4, &n, &cur);
 		rcu_read_unlock();
 		if (bs != CDS_FT_STATUS_NOT_SUPPORTED || n != 0 || cur != NULL) {
 			fprintf(stderr, "node no-list next_batch: status %d n %zu cur %p\n",
@@ -2041,18 +2041,18 @@ static int test_list_off_ops(void)
 		goto fail;
 
 	/*
-	 * The node-cursor batched MACRO is ordered-list-only: on this list-off
-	 * trie it must iterate NOTHING (cds_ft_node_next_batch -> NOT_SUPPORTED),
+	 * The cell-cursor batched MACRO is ordered-list-only: on this list-off
+	 * trie it must iterate NOTHING (cds_ft_cell_next_batch -> NOT_SUPPORTED),
 	 * not silently skip a populated trie.  Ordered iteration here goes through
 	 * the iterator (cds_ft_for_each_rcu / the lookup_first+next loop above).
 	 */
 	{
-		struct cds_ft_node *node, *mbuf[4];
+		const struct cds_ft_cell *cell, *mbuf[4];
 		unsigned int cnt = 0;
 
 		rcu_read_lock();
-		cds_ft_for_each_batched_rcu(ft, node, mbuf, 4) {
-			(void) node;
+		cds_ft_for_each_batched_rcu(ft, cell, mbuf, 4) {
+			(void) cell;
 			cnt++;
 		}
 		rcu_read_unlock();
