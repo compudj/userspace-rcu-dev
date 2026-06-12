@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 245
+#define NR_TESTS 246
 #else
 #define NR_TESTS 234
 #endif
@@ -17558,7 +17558,7 @@ static int graft_swap_oom_has_key(struct cds_ft *ft, const char *k)
  * As run_split_oom_graft, but for cds_ft_graft_swap.  A swap is two coupled
  * clusters: (A) swap_ft's content, canonicalized, inserted at the graft point
  * in place of the displaced dst old-child; and (B) that displaced old-child
- * materialized as swap_ft's new root (ft_make_root_internal).  Both must be
+ * materialized as swap_ft's new root (ft_make_root_internal_glue).  Both must be
  * built from fresh nodes BEFORE swap_ft's root is unlinked and a grace period
  * taken, so any allocation failure leaves BOTH tries pristine (MEMORY_ERROR,
  * nothing published, nothing lost).
@@ -18659,6 +18659,98 @@ static int test_merge_oom_compressed_parent_dst(void)
 {
 	return run_merge_oom_compressed_parent_dst(24);
 }
+
+/*
+ * Drive cds_ft_detach at a key whose child is a COMPRESSED node (so the
+ * detached trie's root must be materialized as an internal node) through every
+ * allocation-failure point, and assert atomicity: on MEMORY_ERROR the source
+ * trie must still pass cds_ft_verify AND still contain every key.  Regression
+ * for the 2026-06 review's finding 2.9: the fallible root materialization ran
+ * AFTER the detach had published the unlink and taken a grace period, and the
+ * "re-attach the subtree" rollback did not exist -- an OOM there silently lost
+ * every detached key from BOTH tries (plus an ancestor count corruption and a
+ * UAF count undo).  The materialization now runs build-invisibly BEFORE any
+ * published mutation.
+ */
+static int test_detach_oom_atomicity(void)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < 10; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_varlen_ft(&group);
+		struct cds_ft *det = NULL;
+		struct ft_test_node *a = node_alloc(1);
+		struct ft_test_node *b = node_alloc(2);
+		enum cds_ft_status s;
+		int verified;
+
+		/* root slot 'a' -> compressed("bcdefg") -> internal {1, 2}. */
+		if (cds_ft_insert(ft, (const uint8_t *) "abcdefg1", 8, &a->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "abcdefg2", 8, &b->node) < 0) {
+			fprintf(stderr, "detach_oom: build failed\n");
+			rc = -1;
+		}
+
+		/* Fail the (n+1)-th allocation performed by the detach. */
+		cds_ft_fault_alloc_countdown = n;
+		s = cds_ft_detach(ft, (const uint8_t *) "a", 1, &det);
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		if (det)
+			verified = verified &&
+				(cds_ft_verify(det, stderr) == CDS_FT_STATUS_OK);
+		rcu_read_unlock();
+		if (!verified) {
+			fprintf(stderr,
+				"detach_oom: verify FAILED after fault n=%d (detach=%s)\n",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+
+		if (s == CDS_FT_STATUS_OK) {
+			/* Keys moved: present in @det under the stripped prefix. */
+			if (!det ||
+			    !graft_swap_oom_has_key(det, "bcdefg1") ||
+			    !graft_swap_oom_has_key(det, "bcdefg2")) {
+				fprintf(stderr,
+					"detach_oom: keys missing in detached trie (n=%d)\n", n);
+				rc = -1;
+			}
+		} else {
+			/* OOM: the source must be UNCHANGED (no silent loss). */
+			if (s != CDS_FT_STATUS_MEMORY_ERROR || det) {
+				fprintf(stderr,
+					"detach_oom: unexpected status %s (n=%d)\n",
+					cds_ft_status_to_string(s), n);
+				rc = -1;
+			}
+			if (!graft_swap_oom_has_key(ft, "abcdefg1") ||
+			    !graft_swap_oom_has_key(ft, "abcdefg2")) {
+				fprintf(stderr,
+					"detach_oom: keys LOST from source after OOM (n=%d)\n", n);
+				rc = -1;
+			}
+		}
+
+		if (det) {
+			if (drain_trie(det) < 0)
+				rc = -1;
+			rcu_barrier();
+			cds_ft_destroy(det);
+		}
+		if (drain_trie(ft) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
 #endif /* FEATURE_FT_FAULT_INJECT */
 
 int main(int argc, char **argv)
@@ -18994,6 +19086,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom_key_shorter_dst);
 	RUN_TEST(test_merge_oom_key_shorter_src);
 	RUN_TEST(test_merge_oom_compressed_parent_dst);
+	RUN_TEST(test_detach_oom_atomicity);
 #endif
 
 	rcu_barrier();
