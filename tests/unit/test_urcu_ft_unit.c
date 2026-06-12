@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 244
+#define NR_TESTS 245
 #else
-#define NR_TESTS 233
+#define NR_TESTS 234
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -5183,6 +5183,136 @@ out:
 		cds_ft_iter_destroy(iter);
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Ordered iteration on a NON-IDENTITY key map group with NO in-leaf key
+ * (no speculative_key_offset), fixed and variable length.  Regression for
+ * the ordinal-cell fast path materializing garbage keys on such a group:
+ * ft_ord_cell_iter_land remapped from the unconfigured leaf-key offset (0),
+ * copying cds_ft_node header bytes through the key map (2026-06 review,
+ * 1.4).  Fixed by serving any key map from the structural up-walk (ordinal
+ * bytes, remapped on copy-out).  The reversed byte map makes ordinal order
+ * the REVERSE of byte order, so a stale identity assumption also shows as a
+ * wrong iteration order.
+ */
+static int test_nonidentity_ordered_iteration(void)
+{
+	uint8_t k2o[256], o2k[256];
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	/* Ordinal (iteration) order under the reversed map: w < m < a. */
+	const char *fixed_words_ord[] = { "wxyz", "mmmm", "abcd" };
+	const char *var_words_ord[] = { "wxy", "ab" };
+	unsigned int i;
+	int part, ret = -1;
+
+	for (i = 0; i < 256; i++) {
+		k2o[i] = 255 - i;
+		o2k[255 - i] = i;
+	}
+	for (part = 0; part < 2; part++) {
+		const char **words = part ? var_words_ord : fixed_words_ord;
+		unsigned int nr_words = part ? 2 : 3;
+		enum cds_ft_status s;
+		uint8_t rk[64]; size_t rl;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			abort();
+		if (cds_ft_group_attr_set_key_len(attr,
+				part ? CDS_FT_LEN_VARIABLE : 4) < 0)
+			abort();
+		if (cds_ft_group_attr_set_key_map(attr, k2o, o2k) < 0)
+			abort();
+		if (cds_ft_group_create(attr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0)
+			abort();
+		if (cds_ft_iter_create(ft, &iter) < 0) {
+			cds_ft_destroy(ft);
+			cds_ft_group_destroy(group);
+			return -1;
+		}
+		for (i = 0; i < nr_words; i++) {
+			struct ft_test_node *n = node_alloc(0);
+
+			rcu_read_lock();
+			if (cds_ft_insert(ft, (const uint8_t *) words[i],
+					  strlen(words[i]), &n->node) < 0) {
+				fprintf(stderr, "part %d: insert '%s' failed\n",
+					part, words[i]);
+				rcu_read_unlock();
+				goto out;
+			}
+			rcu_read_unlock();
+		}
+		/* Forward walk: ordinal order. */
+		rcu_read_lock();
+		s = cds_ft_lookup_first(ft, iter);
+		for (i = 0; i < nr_words; i++) {
+			if (s != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+				fprintf(stderr, "part %d fwd step %u: status %d\n",
+					part, i, s);
+				rcu_read_unlock();
+				goto out;
+			}
+			cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+			if (rl != strlen(words[i]) ||
+					memcmp(rk, words[i], rl) != 0) {
+				rk[rl < sizeof rk ? rl : sizeof rk - 1] = '\0';
+				fprintf(stderr, "part %d fwd step %u: got '%s' (len %zu), expected '%s'\n",
+					part, i, (char *) rk, rl, words[i]);
+				rcu_read_unlock();
+				goto out;
+			}
+			s = cds_ft_next(ft, iter);
+		}
+		if (s != CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr, "part %d fwd past end: status %d\n", part, s);
+			rcu_read_unlock();
+			goto out;
+		}
+		/* Reverse walk. */
+		s = cds_ft_lookup_last(ft, iter);
+		for (i = nr_words; i-- > 0; ) {
+			if (s != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+				fprintf(stderr, "part %d rev step %u: status %d\n",
+					part, i, s);
+				rcu_read_unlock();
+				goto out;
+			}
+			cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+			if (rl != strlen(words[i]) ||
+					memcmp(rk, words[i], rl) != 0) {
+				rk[rl < sizeof rk ? rl : sizeof rk - 1] = '\0';
+				fprintf(stderr, "part %d rev step %u: got '%s' (len %zu), expected '%s'\n",
+					part, i, (char *) rk, rl, words[i]);
+				rcu_read_unlock();
+				goto out;
+			}
+			s = cds_ft_prev(ft, iter);
+		}
+		if (s != CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr, "part %d rev past end: status %d\n", part, s);
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		iter = NULL;
+		if (drain_and_destroy(ft, group) < 0)
+			return -1;
+		ft = NULL;
+	}
+	return 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
 	return ret;
 }
 
@@ -18648,6 +18778,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iter_key_off_cell_to_descent);
 	RUN_TEST(test_iter_copy_cell_positions);
 	RUN_TEST(test_eager_key_len_offset_iter_key);
+	RUN_TEST(test_nonidentity_ordered_iteration);
 	RUN_TEST(test_inequality_empty_key);
 	RUN_TEST(test_merge_ordered_fixed_root);
 

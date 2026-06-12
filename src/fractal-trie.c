@@ -8412,15 +8412,17 @@ const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 	 * EAGER ordered-list walk (no in-leaf key): rematerialize the current
 	 * key STRUCTURALLY via the parent up-walk into iter_key.  Reached only
 	 * when a key consumer asks for the key -- a keyless/count walk never
-	 * calls this, so the O(depth) walk is paid strictly on demand.  Identity
-	 * map => ordinal bytes ARE the key.  FIXED-length walks into the buffer
-	 * (length is group->key_len).  VARIABLE-length derives the length from the
-	 * SAME walk, cached via ft_iter_upwalk_into_buf and coordinated with
-	 * ft_iter_resolve_key_len through the LAZY sentinel so one walk serves both.
+	 * calls this, so the O(depth) walk is paid strictly on demand.  The
+	 * walk recovers ORDINAL bytes from the trie structure, which is what
+	 * iter_key holds for ANY key map (consumers remap via
+	 * ft_ordinals_to_key), so no identity requirement.  FIXED-length walks
+	 * into the buffer (length is group->key_len).  VARIABLE-length derives
+	 * the length from the SAME walk, cached via ft_iter_upwalk_into_buf and
+	 * coordinated with ft_iter_resolve_key_len through the LAZY sentinel so
+	 * one walk serves both.
 	 */
 	if (group->ordered_list_set && !group->speculative_key_offset_set &&
-			group->key_map.identity && iter->cache_valid &&
-			iter->node) {
+			iter->cache_valid && iter->node) {
 		if (group->key_len == CDS_FT_LEN_VARIABLE) {
 			/*
 			 * The up-walk fills the key at the buffer TAIL and records
@@ -8674,20 +8676,24 @@ enum cds_ft_status ft_ord_cell_iter_land(struct cds_ft *ft,
 	 * Materialize as little as possible — the cell walk's point is that a
 	 * keyless / count traversal touches NO leaf:
 	 *
-	 *  - Identity map: the result key is a live reference into @node's leaf
-	 *    (ft_iter_read_key), so no key copy.  A VARIABLE-length group also
-	 *    DEFERS the length: iter->key_len is the LAZY sentinel, resolved from
-	 *    node->key_len on demand by ft_iter_resolve_key_len() only in the
-	 *    key-consuming ops (get_key / remove / skip / bind).  So a keyless
-	 *    variable-length walk reads neither the key nor the length from the
-	 *    leaf.  A FIXED-length group takes its length from group->key_len
-	 *    (no leaf touch either).
-	 *  - Non-identity map: the key must be remapped to ordinal order now,
+	 *  - Identity map (key read in place from the leaf when an in-leaf key
+	 *    is configured, see ft_iter_key_referenced) or EAGER group (no
+	 *    in-leaf key; the up-walk in ft_iter_read_key recovers the ordinal
+	 *    bytes structurally, identity or not): no key copy.  A VARIABLE-
+	 *    length group also DEFERS the length: iter->key_len is the LAZY
+	 *    sentinel, resolved on demand by ft_iter_resolve_key_len() only in
+	 *    the key-consuming ops (get_key / remove / skip / bind).  So a
+	 *    keyless variable-length walk reads neither the key nor the length
+	 *    from the leaf.  A FIXED-length group takes its length from
+	 *    group->key_len (no leaf touch either).
+	 *  - Non-identity map WITH an in-leaf key: the leaf bytes are in
+	 *    application order, so they must be remapped to ordinal order now,
 	 *    which needs the length now — read it (leaf, for variable) and copy
 	 *    into iter_key (ft_iter_key_referenced is then false, consumers use
 	 *    the buffer).
 	 */
-	if (caa_likely(ft->group->key_map.identity)) {
+	if (caa_likely(ft->group->key_map.identity ||
+			!ft->group->speculative_key_offset_set)) {
 		if (ft->group->key_len != CDS_FT_LEN_VARIABLE) {
 			iter->key_len = ft->group->key_len;
 			iter->path_len = ft->group->key_len + 1;
@@ -8720,23 +8726,25 @@ bool ft_ord_cell_fastpath_ok(const struct cds_ft *ft,
 		const struct cds_ft_iter *iter)
 {
 	/*
-	 * EAGER structural up-walk: an identity ordered-list group with NO in-leaf
-	 * key (no speculative_key_offset) gets BOTH the result key AND its length
-	 * from the parent up-walk (ft_iter_read_key / ft_iter_resolve_key_len), for
-	 * fixed OR variable length -- no in-leaf key and no key_len_offset needed.
+	 * EAGER structural up-walk: an ordered-list group with NO in-leaf key
+	 * (no speculative_key_offset) gets BOTH the result key AND its length
+	 * from the parent up-walk (ft_iter_read_key / ft_iter_resolve_key_len),
+	 * for fixed OR variable length -- no in-leaf key and no key_len_offset
+	 * needed.  The walk recovers ORDINAL bytes, so it serves any key map
+	 * (a non-identity map is applied on result-key copy-out).
 	 */
 	bool up_walk = ft->group->ordered_list_set &&
-		!ft->group->speculative_key_offset_set &&
-		ft->group->key_map.identity;
+		!ft->group->speculative_key_offset_set;
 
 	return ft->group->ordered_list_set &&
 		(up_walk ||
-		 /* otherwise: length obtainable (fixed, or variable+key_len_offset) */
-		 (((ft->group->key_len != CDS_FT_LEN_VARIABLE ||
-			ft->group->key_len_offset_set) &&
-		 /* and key obtainable (in-leaf key, or fixed-length up-walk) */
-		   (ft->group->speculative_key_offset_set ||
-			ft->group->key_len != CDS_FT_LEN_VARIABLE)))) &&
+		 /*
+		  * In-leaf key (ft_ord_cell_iter_land reads/remaps it from the
+		  * leaf): needs the length too -- fixed, or variable with an
+		  * in-leaf length (key_len_offset).
+		  */
+		 (ft->group->key_len != CDS_FT_LEN_VARIABLE ||
+			ft->group->key_len_offset_set)) &&
 		iter->prefix_len == 0;
 }
 

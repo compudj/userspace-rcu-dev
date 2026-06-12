@@ -718,9 +718,11 @@ struct cds_ft_group {
 	 *   (FEATURE_FT_ORD_CELL "Option E").  The order links live in a
 	 *   library-owned relocatable "ordinal cell" (struct ft_ord_cell) hung off
 	 *   each duplicate-chain head's cds_ft_node.prev; the application leaf is
-	 *   unchanged (no ord fields, no offset to declare).  Requires
-	 *   speculative_key_offset (to materialize the result key from the leaf)
-	 *   and, for variable-length groups, key_len_offset.  See
+	 *   unchanged (no ord fields, no offset to declare).  The result key is
+	 *   materialized from the leaf when speculative_key_offset is configured
+	 *   (plus key_len_offset for a variable-length group), otherwise
+	 *   structurally by the parent up-walk (ft_rebuild_key_upwalk) -- the
+	 *   walk recovers ordinal bytes, so it serves any key map.  See
 	 *   cds_ft_group_attr_set_ordered_list.
 	 */
 	bool ordered_list_set;
