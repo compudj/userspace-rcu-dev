@@ -23544,7 +23544,8 @@ static inline __attribute__((always_inline))
 enum cds_ft_status ft_node_batch_dir(struct cds_ft *ft,
 		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
 		size_t cap, size_t *count,
-		const struct cds_ft_node **next_cursor, const bool forward)
+		const struct cds_ft_node **next_cursor, void **pos,
+		const bool forward)
 {
 	size_t n = 0;
 	const uintptr_t stride = (uintptr_t) 1 << FT_ORD_CELL_ALLOC_ORDER;
@@ -23557,7 +23558,20 @@ enum cds_ft_status ft_node_batch_dir(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_SUPPORTED;
 	if (caa_unlikely(cap == 0))
 		return CDS_FT_STATUS_OK;
-	if (cursor)
+	/*
+	 * Resume position.  @pos, when supplied, caches the resume CELL across
+	 * batches so re-entry is O(1) and reads no node body: the prior batch
+	 * stored it here, so we skip deriving the cell from cursor->prev -- a
+	 * scattered external-head-node load that costs one cache miss per batch
+	 * (~66 ns) and, at small caps, dominates the bandwidth-bound walk.  @pos
+	 * takes precedence over @cursor; *pos == NULL (the first call) or @pos ==
+	 * NULL (opt out) falls back to deriving from @cursor, or the list endpoint
+	 * when @cursor is NULL.  Reset *pos = NULL to re-seek by @cursor.  @pos has
+	 * the same continuous-read-lock validity as @cursor / @next_cursor.
+	 */
+	if (pos && *pos)
+		cur = (struct ft_ord_cell *) *pos;
+	else if (cursor)
 		cur = ft_ord_cell_ptr(rcu_dereference(
 			((struct cds_ft_node *) cursor)->prev));
 	else
@@ -23576,22 +23590,26 @@ enum cds_ft_status ft_node_batch_dir(struct cds_ft *ft,
 		cur = (loaded && cmm_ptr_eq(loaded, guess)) ? guess : loaded;
 	}
 	*next_cursor = cur ? cur->node : NULL;
+	if (pos)
+		*pos = cur;
 	*count = n;
 	return CDS_FT_STATUS_OK;
 }
 
 enum cds_ft_status cds_ft_node_next_batch(struct cds_ft *ft,
 		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
-		size_t cap, size_t *count, const struct cds_ft_node **next_cursor)
+		size_t cap, size_t *count, const struct cds_ft_node **next_cursor,
+		void **pos)
 {
-	return ft_node_batch_dir(ft, cursor, buf, cap, count, next_cursor, true);
+	return ft_node_batch_dir(ft, cursor, buf, cap, count, next_cursor, pos, true);
 }
 
 enum cds_ft_status cds_ft_node_prev_batch(struct cds_ft *ft,
 		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
-		size_t cap, size_t *count, const struct cds_ft_node **next_cursor)
+		size_t cap, size_t *count, const struct cds_ft_node **next_cursor,
+		void **pos)
 {
-	return ft_node_batch_dir(ft, cursor, buf, cap, count, next_cursor, false);
+	return ft_node_batch_dir(ft, cursor, buf, cap, count, next_cursor, pos, false);
 }
 
 bool cds_ft_ordered_list(const struct cds_ft *ft)

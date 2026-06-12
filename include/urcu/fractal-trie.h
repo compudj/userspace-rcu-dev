@@ -1216,9 +1216,11 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * it refills @buf one library call per @cap nodes and iterates it INLINE, so the
  * ordered cell-list walk pays the call boundary once per batch instead of once
  * per node.  There is NO iterator object in scope -- the loop carries only a
- * hidden NODE cursor -- so none of the stale-position hazards of an iterator
- * apply; use @node directly (or cds_ft_entry(@node, ...)).  For the current
- * node's key, materialize it from @node with cds_ft_node_get_key(ft, @node, ...).
+ * hidden NODE cursor plus an O(1) resume cache (so re-entry reads no node body;
+ * see cds_ft_node_next_batch's @pos) -- so none of the stale-position hazards of
+ * an iterator apply; use @node directly (or cds_ft_entry(@node, ...)).  For the
+ * current node's key, materialize it from @node with cds_ft_node_get_key(ft,
+ * @node, ...).
  *
  * ORDERED-LIST ONLY: stepping node->node in key order needs the cell list, so on
  * a list-off trie (cds_ft_group_attr_set_ordered_list(attr, false)) this loop iterates
@@ -1238,11 +1240,11 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  *   rcu_read_unlock();
  */
 #define cds_ft_for_each_batched_rcu(ft, node, buf, cap)				\
-	for (struct { const struct cds_ft_node *cur; size_t n, i; int started; } \
-			_ftb = { NULL, 0, 0, 0 };				\
+	for (struct { const struct cds_ft_node *cur; void *pos; size_t n, i; int started; } \
+			_ftb = { NULL, NULL, 0, 0, 0 };				\
 		(!_ftb.started || _ftb.cur != NULL) &&				\
 			(cds_ft_node_next_batch((ft), _ftb.cur, (buf), (cap),	\
-				&_ftb.n, &_ftb.cur),				\
+				&_ftb.n, &_ftb.cur, &_ftb.pos),			\
 			 _ftb.started = 1, _ftb.i = 0, 1);			\
 		)								\
 		for (; _ftb.i < _ftb.n &&					\
@@ -1256,11 +1258,11 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * nothing; branch on cds_ft_ordered_list() and use cds_ft_for_each_reverse_rcu()).
  */
 #define cds_ft_for_each_reverse_batched_rcu(ft, node, buf, cap)			\
-	for (struct { const struct cds_ft_node *cur; size_t n, i; int started; } \
-			_ftb = { NULL, 0, 0, 0 };				\
+	for (struct { const struct cds_ft_node *cur; void *pos; size_t n, i; int started; } \
+			_ftb = { NULL, NULL, 0, 0, 0 };				\
 		(!_ftb.started || _ftb.cur != NULL) &&				\
 			(cds_ft_node_prev_batch((ft), _ftb.cur, (buf), (cap),	\
-				&_ftb.n, &_ftb.cur),				\
+				&_ftb.n, &_ftb.cur, &_ftb.pos),			\
 			 _ftb.started = 1, _ftb.i = 0, 1);			\
 		)								\
 		for (; _ftb.i < _ftb.n &&					\
@@ -2677,6 +2679,8 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  * @cap: Capacity of @buf.
  * @count: Output -- number of nodes written to @buf (0 at the end of the walk).
  * @next_cursor: Output -- the node to pass as @cursor next, or NULL at the end.
+ * @pos: Optional in/out resume cache (initialize *@pos = NULL, then thread the
+ *       SAME @pos through unchanged); NULL to opt out.  See below.
  *
  * Walks @ft's ordered cell list without an iterator object, emitting head
  * pointers a batch at a time so the per-call boundary is paid once per @cap
@@ -2686,13 +2690,22 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  * cursor, not the count, or the walk restarts from the minimum:
  *
  *   const struct cds_ft_node *cur = NULL;
+ *   void *pos = NULL;
  *   size_t n, i;
  *   do {
- *           if (cds_ft_node_next_batch(ft, cur, buf, N, &n, &cur) != CDS_FT_STATUS_OK)
+ *           if (cds_ft_node_next_batch(ft, cur, buf, N, &n, &cur, &pos) != CDS_FT_STATUS_OK)
  *                   break;       // list off: use cds_ft_for_each_rcu() instead
  *           for (i = 0; i < n; i++)
  *                   cds_ft_node_get_key(ft, buf[i], k, sizeof k, &kl);
  *   } while (cur);
+ *
+ * @pos amortizes the resume to O(1): without it, each batch re-derives the cell
+ * from @cursor's node body (one scattered cache miss per batch that, at small
+ * @cap, dominates the bandwidth-bound walk); with it, the prior batch's resume
+ * cell is cached, so re-entry reads no node body.  *@pos takes precedence over
+ * @cursor when non-NULL; reset *@pos = NULL (and set @cursor) to re-seek.  It is
+ * an opaque, pointer-sized token with the SAME continuous-read-lock validity as
+ * @cursor.  Pass @pos = NULL to keep the prior (re-derive-each-batch) behavior.
  *
  * ORDERED-LIST ONLY: the step IS the cell ord_next walk.  Stepping node->node in
  * key order needs the cell list; a bare node on a list-off trie
@@ -2713,7 +2726,8 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  */
 enum cds_ft_status cds_ft_node_next_batch(struct cds_ft *ft,
 		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
-		size_t cap, size_t *count, const struct cds_ft_node **next_cursor);
+		size_t cap, size_t *count, const struct cds_ft_node **next_cursor,
+		void **pos);
 
 /*
  * cds_ft_node_prev_batch - Reverse (descending-key-order) cds_ft_node_next_batch.
@@ -2721,7 +2735,8 @@ enum cds_ft_status cds_ft_node_next_batch(struct cds_ft *ft,
  */
 enum cds_ft_status cds_ft_node_prev_batch(struct cds_ft *ft,
 		const struct cds_ft_node *cursor, struct cds_ft_node **buf,
-		size_t cap, size_t *count, const struct cds_ft_node **next_cursor);
+		size_t cap, size_t *count, const struct cds_ft_node **next_cursor,
+		void **pos);
 
 /*
  * cds_ft_ordered_list - Whether @ft maintains the key-ordered cell list.

@@ -1604,6 +1604,7 @@ static int test_node_get_key(void)
 	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct cds_ft_node *buf[16];
 	const struct cds_ft_node *cur;
+	void *pos = NULL;	/* O(1) resume cache (exercise the fast path) */
 	unsigned long i, seen = 0;
 	size_t got, b;
 
@@ -1627,7 +1628,7 @@ static int test_node_get_key(void)
 	cur = NULL;
 	do {
 		enum cds_ft_status bs = cds_ft_node_next_batch(ft, cur, buf, 16,
-				&got, &cur);
+				&got, &cur, &pos);
 
 		if (bs == CDS_FT_STATUS_NOT_SUPPORTED) {
 			/* No ordered list (and no in-leaf key): N/A -- pass. */
@@ -1686,6 +1687,7 @@ static int test_node_batch(void)
 	struct cds_ft *ft = create_fixed_ft(4, &group);
 	struct cds_ft_node *buf[4];
 	const struct cds_ft_node *cur;
+	void *pos = NULL;	/* O(1) resume cache (exercise the fast path) */
 	unsigned long i, seen;
 	size_t n, b;
 
@@ -1703,10 +1705,11 @@ static int test_node_batch(void)
 	/* Forward: cap 4 over 10 keys forces multiple batches. */
 	rcu_read_lock();
 	cur = NULL;
+	pos = NULL;
 	seen = 0;
 	do {
 		enum cds_ft_status bs = cds_ft_node_next_batch(ft, cur, buf, 4,
-				&n, &cur);
+				&n, &cur, &pos);
 
 		if (bs == CDS_FT_STATUS_NOT_SUPPORTED) {
 			/* List-off trie: the node-cursor walk is N/A. */
@@ -1742,9 +1745,10 @@ static int test_node_batch(void)
 	/* Reverse: NULL cursor starts at the maximum, stepping down. */
 	rcu_read_lock();
 	cur = NULL;
+	pos = NULL;
 	seen = 0;
 	do {
-		if (cds_ft_node_prev_batch(ft, cur, buf, 4, &n, &cur)
+		if (cds_ft_node_prev_batch(ft, cur, buf, 4, &n, &cur, &pos)
 				!= CDS_FT_STATUS_OK) {
 			rcu_read_unlock();
 			fprintf(stderr, "node_batch rev: bad status\n");
@@ -1891,7 +1895,7 @@ static int test_node_get_key_no_list(void)
 			goto fail;
 		}
 		rcu_read_lock();
-		bs = cds_ft_node_next_batch(ft, NULL, buf, 4, &n, &cur);
+		bs = cds_ft_node_next_batch(ft, NULL, buf, 4, &n, &cur, NULL);
 		rcu_read_unlock();
 		if (bs != CDS_FT_STATUS_NOT_SUPPORTED || n != 0 || cur != NULL) {
 			fprintf(stderr, "node no-list next_batch: status %d n %zu cur %p\n",
