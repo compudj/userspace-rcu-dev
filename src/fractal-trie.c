@@ -17788,6 +17788,18 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			ft->ord_cell_tail = NULL;
 		}
 
+		/*
+		 * Drain @ft's readers that entered before the root swap and may
+		 * still be inside the moved subtree (or parked in the moved
+		 * ordered run): the exclusivity promise on @detached -- which a
+		 * subsequent graft relies on to skip ITS grace period, and
+		 * which makes mutation frees on @detached SYNCHRONOUS -- must
+		 * hold at return, not eventually.  Skip for exclusive sources,
+		 * which carry no RCU readers by construction.
+		 */
+		if (!ft->exclusive)
+			ft->group->flavor->update_synchronize_rcu();
+
 		*result_ft = detached;
 		return CDS_FT_STATUS_OK;
 	}
@@ -18042,6 +18054,26 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			} else {
 				struct cds_ft_metadata *dmeta =
 					ft_root_metadata(detached);
+
+				/*
+				 * Drain source-trie readers here too: they may
+				 * still be parked on the detached external
+				 * chain (a lookup that returned the head, a
+				 * duplicate-chain walk) or in the moved ordered
+				 * run.  The exclusivity promise on @detached
+				 * must hold AT RETURN -- a subsequent graft of
+				 * @detached legitimately skips its own grace
+				 * period, and exclusive-mode mutations free
+				 * SYNCHRONOUSLY, so a parked reader would
+				 * dereference freed memory.  The drain also
+				 * precedes the prev re-point below, so no
+				 * reader's up-walk from the chain head can
+				 * escape into @detached's root.  Skip for
+				 * exclusive sources (no RCU readers by
+				 * construction).
+				 */
+				if (!ft->exclusive)
+					ft->group->flavor->update_synchronize_rcu();
 				ft_metadata_set_external_nodes(detached->root, dmeta,
 					(struct cds_ft_node *)
 					ft_node_ptr(child));
