@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	24
+#define NR_TESTS	25
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -1152,6 +1152,141 @@ static int inv_lookup_consistency(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_lookup_consistency: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
+/*   INVARIANT 3b: Insert commits both indexes atomically             */
+/*                                                                    */
+/*   An insert makes the fresh head reachable in the structural       */
+/*   index and spliced into the ordered cell list in ONE flip         */
+/*   commit, so a reader can never exact-look-up a key whose cell is  */
+/*   not yet in the list (2026-06 review, 2.13: the structural        */
+/*   publish used to precede the splice, and a reader landing on the  */
+/*   fresh head inside that window followed its NULL ord links and    */
+/*   reported a spurious end-of-traversal).  A permanent sentinel     */
+/*   key (the maximum, never removed) guarantees every pool key has   */
+/*   a successor, so any NOT_FOUND from next-after-exact-lookup is a  */
+/*   violation.                                                       */
+/*                                                                    */
+/* ================================================================== */
+
+static void *inv_splice_window_reader(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+	unsigned long checks = 0;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
+		uint8_t k[8];
+		enum cds_ft_status s;
+
+		cds_ft_u64_to_key(ctx->ft, key, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+				cds_ft_iter_node(iter)) {
+			s = cds_ft_next(ctx->ft, iter);
+			if (s == CDS_FT_STATUS_NOT_FOUND) {
+				/*
+				 * The sentinel (max key) is never removed, so
+				 * every pool key has a successor.
+				 */
+				report_violation(ctx->test_name,
+					"next after exact lookup of %" PRIu64
+					" reported end-of-traversal (sentinel present)",
+					key);
+			}
+		}
+		rcu_read_unlock();
+
+		checks++;
+		if ((checks & 0x3ff) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_insert_splice_window(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct inv_lookup_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_insert_splice_window";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	/* The permanent sentinel: the maximum key, never removed. */
+	rcu_read_lock();
+	{
+		struct ft_test_node *n = node_alloc(0xffffffffull);
+
+		if (insert_u64(ft, 0xffffffffull, n) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	/* Pre-populate half the writer pool. */
+	for (i = 0; i < WRITER_POOL_SIZE / 2; i++) {
+		struct ft_test_node *n = node_alloc(i);
+		insert_u64(ft, i, n);
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_splice_window_reader, &ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL, inv_lookup_consistency_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_insert_splice_window: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		drain_and_destroy(ft, group);
 		return -1;
@@ -5571,6 +5706,7 @@ int main(int argc, char **argv)
 
 	diag("2. Lookup consistency");
 	RUN_TEST(inv_lookup_consistency);
+	RUN_TEST(inv_insert_splice_window);
 
 	diag("3. Duplicate chain acyclicity");
 	RUN_TEST(inv_dup_chain_acyclicity);
