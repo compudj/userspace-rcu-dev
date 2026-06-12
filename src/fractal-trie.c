@@ -6194,6 +6194,16 @@ int ft_node_recompact(enum ft_recompact mode,
 
 	assert(mode != FT_RECOMPACT_ADD_NEXT || old_type->type_class != FT_PIGEON);
 
+	/*
+	 * A DEL must never prune the node to NODE_INDEX_NULL: the remove
+	 * paths route a node emptying its last child through ft_detach_node
+	 * (which unlinks the whole branch) instead of a DEL recompact, so
+	 * @new_node below is non-NULL whenever the copy/parent-inherit tail
+	 * dereferences it.  That invariant is enforced several call layers
+	 * away -- catch a regression here, at the dereference site.
+	 */
+	assert(mode != FT_RECOMPACT_DEL || new_type_index != NODE_INDEX_NULL);
+
 	if (new_type_index == NODE_INDEX_NULL)
 		goto skip_copy;
 
@@ -7054,6 +7064,19 @@ descend_loop:
 						 * this rarer case remains lock-free).
 						 */
 						node_flag = anchor;
+						/*
+						 * The merged run begins within the
+						 * span this descent already consumed:
+						 * a rewind past @orig_key would mean
+						 * the re-anchor walked above the
+						 * search root -- impossible on a
+						 * well-formed trie; catch a
+						 * corruption-driven underflow here
+						 * rather than reading before the
+						 * caller's buffer.
+						 */
+						assert((size_t) (key - orig_key) >=
+							(size_t) rewind + 1);
 						key -= (size_t) rewind + 1;
 						goto descend_loop;
 					}
@@ -7195,8 +7218,14 @@ terminal:
 		}
 	} else {
 		found = (struct cds_ft_node *) node_flag;
-		status = CDS_FT_STATUS_OK;
-		if (track) {
+		/*
+		 * NULL also matches the external tag: pathological re-anchor
+		 * exhaustion can deliver it here.  Report NOT_FOUND rather
+		 * than OK with a NULL result node (an NDEBUG build has no
+		 * assert left to catch the contradiction).
+		 */
+		status = found ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
+		if (track && (found || track_longest)) {
 			match_key_pos = key_end;
 			match_node = found;
 		}
@@ -10559,6 +10588,14 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	struct cds_ft_metadata *cn_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
+	/*
+	 * Compressed metadata never carries external_nodes
+	 * (ft_metadata_set_external_nodes aborts on a compressed target).
+	 * The prefix builders below rely on it; the dead external-carrying
+	 * arms they used to carry hid latent bugs (wrong nr_keys, a dropped
+	 * prefix byte) that this assert retires.
+	 */
+	assert(!cn_meta->external_nodes);
 	FT_TP(split_compressed_insert_enter, (const void *) cn,
 		cn->len, diverge_pos);
 	struct cds_ft_inode_flag *old_suffix_flag, *new_branch_flag;
@@ -10729,116 +10766,34 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		}
 	}
 
-	/* 4. Build prefix → branch (if needed). */
-	if (diverge_pos >= 2) {
-		struct cds_ft_inode_flag *pfx_child = branch_flag;
-
-		/*
-		 * When external_nodes exist, the prefix compressed
-		 * node must not carry them.  Shorten the prefix by
-		 * 1 byte (compressed len = diverge_pos - 1) and add
-		 * an internal node at node_depth that holds
-		 * external_nodes and dispatches on the first byte.
-		 */
-		if (cn_meta->external_nodes && diverge_pos >= 3) {
-			struct cds_ft_compressed_node *pfx;
-			struct cds_ft_metadata *pfx_meta;
-
-			pfx = alloc_compressed_node(ft, diverge_pos - 1, &pfx_meta);
-			if (!pfx) goto error;
-			pfx->child = branch_flag;
-			pfx->len = diverge_pos - 1;
-			memcpy(pfx->key_bytes, &cn->key_bytes[1], diverge_pos - 1);
-			pfx_meta->nr_child = 1;
-			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
-			pfx_child = ft_compressed_node_flag(pfx);
-			ft_set_parent(ft, branch_flag, pfx_child, NULL);
-			pfx_child = ft_publish_compressed(ft, pfx, pfx_child);
-			created[nr_created++] = pfx_child;
-		} else if (cn_meta->external_nodes) {
-			/* diverge_pos == 2: sub-prefix is 1 byte, handled
-			 * by the internal node dispatch below. */
-		} else {
-			struct cds_ft_compressed_node *pfx;
-			struct cds_ft_metadata *pfx_meta;
-
-			pfx = alloc_compressed_node(ft, diverge_pos, &pfx_meta);
-			if (!pfx) goto error;
-			pfx->child = branch_flag;
-			pfx->len = diverge_pos;
-			memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
-			pfx_meta->nr_child = 1;
-			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
-			pfx_child = ft_compressed_node_flag(pfx);
-			ft_set_parent(ft, branch_flag, pfx_child, NULL);
-			pfx_child = ft_publish_compressed(ft, pfx, pfx_child);
-			created[nr_created++] = pfx_child;
-			top_flag = pfx_child;
-			goto prefix_done;
-		}
-
-		/* Internal node at node_depth: dispatches on first
-		 * prefix byte, holds external_nodes if present. */
-		{
-			struct cds_ft_inode_flag *dest = NULL;
-			struct cds_ft_metadata *int_meta;
-
-			ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-					pfx_child, NULL, NULL, node_depth, false);
-			if (ret) goto error;
-			int_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-			ft_nr_keys_store(int_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
-			if (cn_meta->external_nodes)
-				ft_metadata_set_external_nodes(dest, int_meta, cn_meta->external_nodes);
-			top_flag = dest;
-			created[nr_created++] = dest;
-		}
-	prefix_done:
-		(void) 0;
-	} else if (diverge_pos == 1 && !cn_meta->external_nodes) {
-		/*
-		 * 1-byte prefix without external_nodes: emit a 1-byte
-		 * compressed node instead of a 1-child internal — canonical
-		 * form under FEATURE_FT_SKIP_COMPRESSED.
-		 */
+	/*
+	 * 4. Build prefix -> branch (if needed).  @cn carries no
+	 * external_nodes (asserted at entry), so the prefix is always a
+	 * plain compressed run over key_bytes[0 .. diverge_pos).
+	 */
+	if (diverge_pos >= 1) {
 		struct cds_ft_compressed_node *pfx;
 		struct cds_ft_metadata *pfx_meta;
-		struct cds_ft_inode_flag *pfx_flag;
+		struct cds_ft_inode_flag *pfx_child;
 
-		pfx = alloc_compressed_node(ft, 1, &pfx_meta);
+		pfx = alloc_compressed_node(ft, diverge_pos, &pfx_meta);
 		if (!pfx) goto error;
 		pfx->child = branch_flag;
-		pfx->len = 1;
-		pfx->key_bytes[0] = cn->key_bytes[0];
+		pfx->len = diverge_pos;
+		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
 		pfx_meta->nr_child = 1;
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
-		pfx_flag = ft_compressed_node_flag(pfx);
-		ft_set_parent(ft, branch_flag, pfx_flag, &pfx->child);
-		pfx_flag = ft_publish_compressed(ft, pfx, pfx_flag);
-		top_flag = pfx_flag;
-		created[nr_created++] = top_flag;
-	} else if (diverge_pos == 1) {
-		/* diverge_pos == 1 with external_nodes: must remain internal
-		 * (compressed nodes cannot carry external_nodes). */
-		struct cds_ft_inode_flag *dest = NULL;
-		struct cds_ft_metadata *pfx_meta;
-
-		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				branch_flag, NULL, NULL, node_depth, false);
-		if (ret) goto error;
-		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
-		ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
-		top_flag = dest;
-		created[nr_created++] = dest;
+		pfx_child = ft_compressed_node_flag(pfx);
+		ft_set_parent(ft, branch_flag, pfx_child, &pfx->child);
+		pfx_child = ft_publish_compressed(ft, pfx, pfx_child);
+		created[nr_created++] = pfx_child;
+		top_flag = pfx_child;
 	} else {
 		/* diverge_pos == 0: branch IS the top. */
 		struct cds_ft_metadata *branch_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(branch_flag));
 		ft_nr_keys_store(branch_meta, ft_nr_keys_get(cn_meta) + 1,
 				CMM_RELAXED);
-		if (cn_meta->external_nodes)
-			ft_metadata_set_external_nodes(branch_flag, branch_meta, cn_meta->external_nodes);
 		top_flag = branch_flag;
 	}
 
@@ -10958,6 +10913,10 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	struct cds_ft_metadata *cn_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	unsigned int suffix_len = cn->len - remaining - 1;
+
+	/* Compressed metadata never carries external_nodes (see
+	 * ft_split_compressed_insert); the prefix builders rely on it. */
+	assert(!cn_meta->external_nodes);
 	struct cds_ft_inode_flag *suffix_flag;
 	struct cds_ft_inode_flag *jct_flag;
 	struct cds_ft_inode_flag *top_flag;
@@ -11103,8 +11062,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		}
 	}
 
-	/* Prefix → junction. */
-	if (remaining >= 2 && !cn_meta->external_nodes) {
+	/* Prefix → junction (no external_nodes on @cn: asserted at entry). */
+	if (remaining >= 2) {
 		struct cds_ft_compressed_node *pfx;
 		struct cds_ft_metadata *pfx_meta;
 
@@ -11120,53 +11079,13 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		ft_set_parent(ft, jct_flag, top_flag, NULL);
 		top_flag = ft_publish_compressed(ft, pfx, top_flag);
 		created[nr_created++] = top_flag;
-	} else if (remaining >= 2 && cn_meta->external_nodes) {
-		/*
-		 * Compressed prefix must not carry external_nodes.
-		 * Create compressed(len=remaining-1) + internal at
-		 * node_depth holding external_nodes.
-		 */
-		struct cds_ft_inode_flag *pfx_child = jct_flag;
-
-		if (remaining >= 3) {
-			struct cds_ft_compressed_node *pfx;
-			struct cds_ft_metadata *pfx_meta;
-
-			pfx = alloc_compressed_node(ft, remaining - 1, &pfx_meta);
-			if (!pfx) goto error;
-			pfx->child = jct_flag;
-			pfx->len = remaining - 1;
-			memcpy(pfx->key_bytes, &cn->key_bytes[1], remaining - 1);
-			pfx_meta->nr_child = 1;
-			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
-				CMM_RELAXED);
-			pfx_child = ft_compressed_node_flag(pfx);
-			ft_set_parent(ft, jct_flag, pfx_child, NULL);
-			pfx_child = ft_publish_compressed(ft, pfx, pfx_child);
-			created[nr_created++] = pfx_child;
-		}
-		{
-			struct cds_ft_inode_flag *dest = NULL;
-			struct cds_ft_metadata *int_meta;
-
-			ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				pfx_child, NULL, NULL, node_depth, false);
-			if (ret) goto error;
-			int_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-			ft_nr_keys_store(int_meta, ft_nr_keys_get(cn_meta),
-				CMM_RELAXED);
-			ft_metadata_set_external_nodes(dest, int_meta, cn_meta->external_nodes);
-			top_flag = dest;
-			created[nr_created++] = dest;
-		}
 	} else if (remaining == 1) {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		if (ft_group_skip_compressed(ft->group) &&
-		    !cn_meta->external_nodes) {
+		if (ft_group_skip_compressed(ft->group)) {
 			/*
-			 * 1-byte prefix without external_nodes: emit a
-			 * 1-byte compressed instead of a 1-child internal
-			 * (canonical form under SKIP_COMPRESSED).
+			 * 1-byte prefix: emit a 1-byte compressed instead of a
+			 * 1-child internal (canonical form under
+			 * SKIP_COMPRESSED).
 			 */
 			struct cds_ft_compressed_node *pfx;
 			struct cds_ft_metadata *pfx_meta;
@@ -11195,27 +11114,11 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 				CMM_RELAXED);
-			if (cn_meta->external_nodes)
-				ft_metadata_set_external_nodes(dest, pfx_meta, cn_meta->external_nodes);
 			top_flag = dest;
 			created[nr_created++] = dest;
 		}
 	} else {
-		/* remaining == 0: no prefix, junction IS the top.
-		 * Transfer any existing external_nodes from the old
-		 * compressed node to the junction.  Add +1 to nr_keys
-		 * for the transferred external key (child_nr_keys
-		 * counted cn->child's subtree but not cn_meta's own
-		 * external_nodes).
-		 */
-		if (cn_meta->external_nodes) {
-			struct cds_ft_metadata *jct_meta =
-				cds_ft_item_to_metadata(ft_node_ptr(jct_flag));
-			ft_metadata_set_external_nodes(jct_flag, jct_meta,
-				cn_meta->external_nodes);
-			ft_nr_keys_store(jct_meta,
-				ft_nr_keys_get(jct_meta) + 1, CMM_RELAXED);
-		}
+		/* remaining == 0: no prefix, junction IS the top. */
 		top_flag = jct_flag;
 	}
 
@@ -14491,6 +14394,12 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
 	struct cds_ft_metadata *cn_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+
+	/* Compressed metadata never carries external_nodes (see
+	 * ft_split_compressed_insert); the dead external-carrying prefix
+	 * arms this retires included a latent diverge_pos == 2 sub-case
+	 * that dropped prefix byte key_bytes[1]. */
+	assert(!cn_meta->external_nodes);
 	unsigned int suffix_len = cn->len - diverge_pos - 1;
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
 	uint8_t new_ordinal = key[d->depth + diverge_pos];
@@ -14656,8 +14565,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	}
 	ft_graft_glue_defer_edge(ft, glue, new_dir, branch_flag, slot);
 
-	/* 4. Build prefix -> branch (mirrors the legacy split's 4 cases). */
-	if (diverge_pos >= 2 && !cn_meta->external_nodes) {
+	/* 4. Build prefix -> branch (no external_nodes on @cn). */
+	if (diverge_pos >= 2) {
 		struct cds_ft_compressed_node *pfx;
 		struct cds_ft_metadata *pfx_meta;
 
@@ -14671,45 +14580,12 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, branch_flag, top_flag, NULL);
-		top_flag = ft_publish_compressed(ft, pfx, top_flag);
+		/* Track the PLAIN form; the skip form is for the publish. */
 		ft_graft_glue_track(glue, top_flag);
-	} else if (diverge_pos >= 2 && cn_meta->external_nodes) {
-		struct cds_ft_inode_flag *pfx_child = branch_flag;
-		struct cds_ft_inode_flag *dest = NULL;
-		struct cds_ft_metadata *int_meta;
-
-		if (diverge_pos >= 3) {
-			struct cds_ft_compressed_node *pfx;
-			struct cds_ft_metadata *pfx_meta;
-
-			pfx = alloc_compressed_node(ft, diverge_pos - 1, &pfx_meta);
-			if (!pfx)
-				return -ENOMEM;
-			pfx->child = branch_flag;
-			pfx->len = diverge_pos - 1;
-			memcpy(pfx->key_bytes, &cn->key_bytes[1], diverge_pos - 1);
-			pfx_meta->nr_child = 1;
-			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
-				CMM_RELAXED);
-			pfx_child = ft_compressed_node_flag(pfx);
-			ft_set_parent(ft, branch_flag, pfx_child, NULL);
-			pfx_child = ft_publish_compressed(ft, pfx, pfx_child);
-			ft_graft_glue_track(glue, pfx_child);
-		}
-		ret = ft_node_set_nth(ft, &dest, cn->key_bytes[0],
-				pfx_child, NULL, NULL, d->depth, false);
-		if (ret)
-			return -ENOMEM;
-		int_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		ft_nr_keys_store(int_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
-		ft_metadata_set_external_nodes(dest, int_meta,
-			cn_meta->external_nodes);
-		top_flag = dest;
-		ft_graft_glue_track(glue, dest);
+		top_flag = ft_publish_compressed(ft, pfx, top_flag);
 	} else if (diverge_pos == 1) {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		if (ft_group_skip_compressed(ft->group) &&
-		    !cn_meta->external_nodes) {
+		if (ft_group_skip_compressed(ft->group)) {
 			struct cds_ft_compressed_node *pfx;
 			struct cds_ft_metadata *pfx_meta;
 
@@ -14724,8 +14600,9 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 				CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
 			ft_set_parent(ft, branch_flag, top_flag, &pfx->child);
-			top_flag = ft_publish_compressed(ft, pfx, top_flag);
+			/* Track the PLAIN form; skip form for the publish. */
 			ft_graft_glue_track(glue, top_flag);
+			top_flag = ft_publish_compressed(ft, pfx, top_flag);
 			goto after_prefix;
 		}
 #endif
@@ -14739,9 +14616,6 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 			return -ENOMEM;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
-		if (cn_meta->external_nodes)
-			ft_metadata_set_external_nodes(dest, pfx_meta,
-				cn_meta->external_nodes);
 		top_flag = dest;
 		ft_graft_glue_track(glue, dest);
 		}
@@ -14753,10 +14627,6 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		/* diverge_pos == 0: branch IS the top. */
 		ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
 			ft_nr_keys_get(cn_meta), CMM_RELAXED);
-		if (cn_meta->external_nodes)
-			ft_metadata_set_external_nodes(branch_flag,
-				cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
-				cn_meta->external_nodes);
 		top_flag = branch_flag;
 	}
 
@@ -14922,6 +14792,14 @@ void ft_graft_glue_track(struct ft_graft_glue *g,
 		struct cds_ft_inode_flag *nf)
 {
 	assert(g->nr_built < g->cap_built);
+	/*
+	 * PLAIN forms only: a SKIP pointer encodes the CHILD's address, so
+	 * the abort path's kind dispatch would free the wrong node (the 2.1
+	 * corruption shape) and the identity helpers would have to chase the
+	 * child's back-pointer mid-build.  Callers track the plain compressed
+	 * flag and re-encode separately for the slot publish.
+	 */
+	assert(!ft_node_skip_compressed(nf));
 	g->built[g->nr_built++] = nf;
 }
 
