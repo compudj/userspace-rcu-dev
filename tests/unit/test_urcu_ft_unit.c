@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 249
+#define NR_TESTS 250
 #else
-#define NR_TESTS 235
+#define NR_TESTS 236
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -17464,6 +17464,87 @@ out:
 }
 
 /*
+ * Compaction of an EXCLUSIVE trie.  Regression for the 2026-06 review's
+ * finding 2.14a: the relocation passes freed every old copy through
+ * cds_ft_free_item, whose exclusive-mode arm frees SYNCHRONOUSLY -- threading
+ * the freelist link through the just-unpublished slot while the step's own
+ * walk may still navigate relative to it.  The compactor now defers every
+ * old-copy free past a grace period regardless of the trie mode.  Also the
+ * first coverage of the exclusive + compact combination.
+ */
+static int test_compact_exclusive(void)
+{
+	const unsigned int N = 2000;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_compact_state *st;
+	unsigned int i;
+	int ret = 0, more;
+
+	ft = create_fixed_ft(8, &group);
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			node_free(n);
+			ret = -1;
+			goto out;
+		}
+	}
+	cds_ft_make_exclusive(ft);
+
+	st = cds_ft_compact_begin(ft);
+	if (!st) {
+		ret = -1;
+		goto out_concurrent;
+	}
+	do {
+		more = cds_ft_compact_step(st, 64);
+	} while (more);
+	cds_ft_compact_end(st);
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "exclusive compact: verify failed\n");
+		ret = -1;
+		goto out_concurrent;
+	}
+	/* Mutate post-compaction: exclusive-mode frees must stay coherent. */
+	for (i = 0; i < 64; i++) {
+		struct ft_test_node *n = node_alloc(N + i);
+
+		if (insert_u64(ft, N + i, n) != CDS_FT_STATUS_OK) {
+			node_free(n);
+			ret = -1;
+			goto out_concurrent;
+		}
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "exclusive compact: post-mutation verify failed\n");
+		ret = -1;
+		goto out_concurrent;
+	}
+	for (i = 0; i < N + 64; i++) {
+		struct cds_ft_node *out_node = NULL;
+
+		if (lookup_u64(ft, i, &out_node) != CDS_FT_STATUS_OK ||
+				to_test_node(out_node)->key != i) {
+			fprintf(stderr, "exclusive compact: key %u missing\n", i);
+			ret = -1;
+			break;
+		}
+	}
+out_concurrent:
+	cds_ft_make_concurrent(ft);
+	rcu_barrier();	/* flush the compactor's deferred old-copy frees */
+out:
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Forgotten cds_ft_compact_end: start a compaction, run a couple of steps
  * (partial), then never call _end.  cds_ft_destroy must finalize the abandoned
  * compaction (merge its private ranges, free its state) -- no crash, no leak.
@@ -19412,6 +19493,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_integrity);
 	RUN_TEST(test_compact_concurrent_mutation);
 	RUN_TEST(test_compact_forgotten_end);
+	RUN_TEST(test_compact_exclusive);
 	RUN_TEST(test_remove_compressed_no_leak);
 	RUN_TEST(test_compact_dense_full_node);
 #ifdef FEATURE_FT_FAULT_INJECT

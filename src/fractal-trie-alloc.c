@@ -859,12 +859,31 @@ void ft_recompact_alloc_merge(struct ft_recompact_alloc_ctx *ctx)
 	 */
 	cds_list_for_each_entry_safe(range, tmp, &ctx->all, node) {
 		struct cds_ft_alloc_arena *arena = range->arena;
+		bool reclaim = false;
 
 		pthread_mutex_lock(&arena->lock);
 		cds_list_del(&range->node);
 		range->recompact_private = false;
-		cds_list_add(&range->node, &arena->ranges);
+		if (range->nr_live == 0 &&
+		    range->next_unused == arena->max_nr_items_per_range) {
+			/* Fully drained while private: reclaim it now. */
+			reclaim = true;
+		} else {
+			cds_list_add(&range->node, &arena->ranges);
+			/*
+			 * Slots freed while the range was private were threaded
+			 * on its own free list WITHOUT the partial_ranges
+			 * listing (see cds_ft_do_free_item): restore the
+			 * "listed iff free_list_head != NULL" invariant so the
+			 * general allocator can reuse them.
+			 */
+			if (range->free_list_head)
+				cds_list_add(&range->partial_node,
+					&arena->partial_ranges);
+		}
 		pthread_mutex_unlock(&arena->lock);
+		if (reclaim)
+			ft_arena_reclaim_range(arena, range);
 	}
 }
 
@@ -1176,6 +1195,26 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 		pthread_mutex_lock(&arena->lock);
 		assert(range->nr_live > 0);
 		range->nr_live--;
+		if (caa_unlikely(range->recompact_private)) {
+			/*
+			 * The range belongs to an in-flight compaction's private
+			 * context: range->node sits on the context's own list
+			 * (ctx->all, mutated by the compactor thread under per-
+			 * arena locks of OTHER arenas), so unlinking it here (the
+			 * reclaim arm below) would corrupt that list; and pushing
+			 * the range onto partial_ranges would let unrelated
+			 * allocations land INSIDE the private range and be
+			 * misclassified as already-relocated by
+			 * cds_ft_metadata_in_recompact_private.  Thread the slot
+			 * on the range's own free list only;
+			 * ft_recompact_alloc_merge restores the partial/reclaim
+			 * invariants when the range becomes ordinary.
+			 */
+			metadata_alloc->free_list_next = range->free_list_head;
+			range->free_list_head = metadata_alloc;
+			pthread_mutex_unlock(&arena->lock);
+			return;
+		}
 		if (range->nr_live == 0 &&
 				range->next_unused == arena->max_nr_items_per_range) {
 			/*
@@ -1286,6 +1325,31 @@ void cds_ft_free_item_unpublished(struct cds_ft *ft __attribute__((unused)),
 		struct cds_ft_metadata *metadata)
 {
 	cds_ft_do_free_item(metadata);
+}
+
+/*
+ * Always-deferred free for the compactor: routes through call_rcu even on
+ * an EXCLUSIVE trie.  The compaction step keeps navigating relative to
+ * nodes it has just unpublished, and the exclusive-mode synchronous free
+ * threads the freelist link through the freed slot immediately -- the
+ * compactor must never free synchronously.  (FT_IMMEDIATE_FREE testing
+ * mode keeps its poison-now behavior, like cds_ft_free_item.)
+ */
+void cds_ft_free_item_deferred(struct cds_ft *ft __attribute__((unused)),
+		struct cds_ft_metadata *metadata)
+{
+#ifdef FT_IMMEDIATE_FREE
+	cds_ft_do_free_item(metadata);
+#else
+	struct cds_ft_metadata_alloc *metadata_alloc =
+		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
+	struct cds_ft_alloc_range *range =
+		cds_ft_metadata_to_range(metadata);
+	struct cds_ft_alloc_arena *arena = range->arena;
+	const struct rcu_flavor_struct *flavor = arena->ft_group->flavor;
+
+	flavor->update_call_rcu(&metadata_alloc->rcu_head, cds_ft_free_item_rcu);
+#endif
 }
 
 void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)

@@ -23124,9 +23124,13 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	 * The old node was just unpublished; concurrent readers may still
 	 * hold it, so free it after a grace period.  Its range's nr_live
 	 * decrements in the callback, so a fully-drained range self-reclaims.
+	 * ALWAYS deferred, even on an exclusive trie: the step's walk keeps
+	 * navigating relative to nodes it has just unpublished, and the
+	 * exclusive-mode synchronous free threads the freelist link through
+	 * the freed slot immediately.
 	 */
 	if (old_ret)
-		cds_ft_free_item(ft, cds_ft_item_to_metadata(old_ret));
+		cds_ft_free_item_deferred(ft, cds_ft_item_to_metadata(old_ret));
 }
 
 /*
@@ -23183,7 +23187,13 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	ft_set_parent(ft, cn2->child, cn2_flag, &cn2->child);
 	if (gp_slot)
 		rcu_assign_pointer(*gp_slot, cn2_flag);
-	free_compressed_node(ft, cn);
+	/* Always-deferred free: see ft_compact_relocate_at. */
+	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(cn));
+	cds_ft_free_item_deferred(ft, cn_meta);
+	if (ft_debug_counters()) {
+		uatomic_inc(&ft->nr_nodes_freed);
+		uatomic_inc(&ft->nr_compressed_freed);
+	}
 	return cn2;
 }
 
@@ -23226,7 +23236,10 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 	/* ord_prev / ord_next are set from @old's neighbours by the swap. */
 	ft_ord_cell_swap(ft, old, new_cell);
 	rcu_assign_pointer(head->prev, ft_ord_cell_flag(new_cell));
-	ft_ord_cell_free(ft, old);
+	/* Always-deferred free: see ft_compact_relocate_at. */
+	if (ft_debug_counters())
+		uatomic_inc(&ft->group->nr_cells_freed);
+	cds_ft_free_item_deferred(ft, cds_ft_item_to_metadata(old));
 	return new_cell;
 }
 

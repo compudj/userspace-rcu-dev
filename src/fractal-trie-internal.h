@@ -1298,6 +1298,11 @@ void ft_recompact_alloc_merge(struct ft_recompact_alloc_ctx *ctx);
 __attribute__((visibility("hidden")))
 bool cds_ft_metadata_in_recompact_private(struct cds_ft_metadata *metadata);
 
+/* Always-deferred (call_rcu) free, even on exclusive tries: compactor use. */
+__attribute__((visibility("hidden")))
+void cds_ft_free_item_deferred(struct cds_ft *ft,
+		struct cds_ft_metadata *metadata);
+
 //#define DEBUG
 //#define DEBUG_COUNTERS
 //#define DEBUG_CLEAR_ITER
