@@ -10460,6 +10460,8 @@ static struct cds_ft_inode_flag *ft_flip_batch_add(struct ft_flip_batch *b,
 		struct cds_ft_inode_flag *old_nf,
 		struct cds_ft_inode_flag *new_nf);
 static void ft_flip_batch_free_unpublished(struct ft_flip_batch *b);
+static void ft_flip_batch_commit(struct ft_flip_batch *b);
+static void ft_flip_batch_reclaim(struct ft_flip_batch *b);
 static void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, struct ft_ord_cell *cell,
 		struct ft_insert_commit *ic);
@@ -15662,72 +15664,70 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		pmeta = cds_ft_item_to_metadata(ft_node_ptr(d->pnf));
 
 		/*
-		 * Build-invisible commit pattern (mirrors PREP_GLUE):
+		 * R8 ordering (no publish completed by a later fallible step):
+		 * the slot store and its possible recompact are the LAST
+		 * fallible steps of the graft, so they run FIRST, parking a
+		 * flip proxy that keeps resolving to the empty slot.  An ENOMEM
+		 * here leaves both tries untouched -- no live edge was flipped,
+		 * so the caller's ft_graft_glue_abort + source-root republish
+		 * find everything pristine (previously the payload's parent and
+		 * the deferred grandchild flips were applied BEFORE the fallible
+		 * set_nth: an OOM left a live grandchild's parent dangling into
+		 * the freed canonicalization wrapper and the restored source
+		 * root's parent pointing into dst).
 		 *
-		 *   (a) Pre-set graft_payload's back-pointer into d->pnf
-		 *       BEFORE the live-data flip.  graft_payload is freshly
-		 *       allocated and not yet reachable, so this store is
-		 *       invisible to readers; doing it now means that when
-		 *       apply_deferred flips G.parent INTO graft_payload, an
-		 *       up-walk from G already has a valid graft_payload.parent
-		 *       to follow.  Slot ptr is best-effort (NULL for popcount
-		 *       nodes where the slot doesn't materialize pre-insert) --
-		 *       the parent_slot_offset is fixed up by ft_node_set_nth's
-		 *       own ft_set_parent below.
+		 * The wiring then runs failure-free behind the parked proxy:
+		 *
+		 *   (a) graft_payload's back-pointer into @dest (parent + slot
+		 *       offset + incoming_byte; ft_node_set_nth skipped it for
+		 *       the proxy child, see ft_set_parent);
 		 *
 		 *   (b) apply_deferred: flip G.parent = graft_payload.  G is
-		 *       still invisible via dst (the slot in d->pnf hasn't been
-		 *       written yet), so a reader cannot reach G through dst.
+		 *       still invisible via dst (the parked slot resolves to
+		 *       NULL), and src's readers were drained by the caller;
 		 *
-		 *   (c) ft_node_set_nth: in-place insert into d->pnf's slot
-		 *       (or recompact onto a new dest, which is invisible until
-		 *       the ft_publish_to_parent below).  THIS is the single
-		 *       forward publication that exposes graft_payload to dst
-		 *       readers; by then the chain G -> graft_payload ->
-		 *       d->pnf is already wired.
-		 *
-		 * Without this ordering an in-flight reader could descend into
-		 * the freshly-published slot, dereference the skip-compressed
-		 * slot value, and validate it via G's back-pointer -- which
-		 * would still point into the orphaned source (D-root from the
-		 * prior detach), tripping ft_skip_reanchor's holder!=NULL
-		 * assert when the walk reaches D-root and reads NULL parent.
+		 *   (c) the commit: one release store flips the slot empty ->
+		 *       payload, with the chain G -> graft_payload -> dest
+		 *       already wired -- preserving the ordering that keeps a
+		 *       skip-validating reader's up-walk from ever reaching the
+		 *       orphaned source root (the holder != NULL fix).
 		 */
-		ft_node_get_nth_skip(d->pnf, &slot, key[key_len - 1],
-			FT_PF_NONE);
-		ft_set_parent(ft, graft_payload, d->pnf, slot);
-
-		ft_graft_glue_apply_deferred(ft, glue);
-
+		slot_value = graft_payload;
+		if (ft_node_compressed(graft_payload))
+			/* Slot-canonical (skip) encoding; pure arithmetic. */
+			slot_value = ft_publish_compressed(ft,
+				ft_compressed_node_ptr(graft_payload),
+				graft_payload);
+		b = ft_flip_batch_alloc(ft, 1);
+		if (!b)
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		pf = ft_flip_batch_add(b, NULL, slot_value);
 		dest = d->pnf;
 		ret = ft_node_set_nth(ft, &dest,
 			key[key_len - 1],
-			graft_payload, &old_recompacted_node, pmeta,
+			pf, &old_recompacted_node, pmeta,
 			d->depth - 1, false);
-		if (ret)
+		if (ret) {
+			ft_flip_batch_free_unpublished(b);
 			return CDS_FT_STATUS_MEMORY_ERROR;
-
-		/*
-		 * graft_payload is a PLAIN compressed flag in glue mode
-		 * (compress returns plain so its back-pointer recovers
-		 * directly).  Re-encode the holding slot to the skip form for
-		 * canonicality.  At this point apply_deferred has already
-		 * applied the grandchild back-pointer, so the skip form
-		 * resolves consistently.
-		 */
-		if (ft_node_compressed(graft_payload)) {
-			struct cds_ft_inode_flag *skip;
-
-			ft_node_get_nth_skip(dest, &slot, key[key_len - 1],
-				FT_PF_NONE);
-			skip = ft_publish_compressed(ft,
-				ft_compressed_node_ptr(graft_payload),
-				graft_payload);
-			if (skip != graft_payload && slot)
-				rcu_assign_pointer(*slot, skip);
 		}
 
+		/* ===== failure-free commit tail ===== */
+		ft_node_get_nth_skip(dest, &slot, key[key_len - 1],
+			FT_PF_NONE);
+		assert(slot);
+		ft_set_parent(ft, graft_payload, dest, slot);
+		ft_graft_glue_apply_deferred(ft, glue);
+		/*
+		 * Recompact case: swing the fresh copy live (its parked slot
+		 * still resolves to NULL); in-place case this is a same-value
+		 * no-op store.
+		 */
 		ft_publish_to_parent(ft, pmeta->parent, d->pnfp, dest);
+		/* THE publish: empty slot -> fully-wired payload. */
+		ft_flip_batch_commit(b);
+		rcu_assign_pointer(*slot, slot_value);
+		ft_flip_batch_reclaim(b);
 
 		if (old_recompacted_node)
 			free_cds_ft_node(ft, old_recompacted_node);
@@ -15774,9 +15774,18 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		}
 
 		if (displaced) {
-			/* Phase 2: back-channel + glue deferred + forward publish. */
-			ft_publish_external_nodes_prev(ft, branch, displaced);
+			/*
+			 * Phase 2: glue deferred FIRST -- the payload's live
+			 * back-pointers must be wired before any dst-REACHABLE
+			 * live edge (displaced->prev) flips into the fresh
+			 * cluster: a reader up-walking from @displaced can
+			 * skip-validate through the branch's slots into the
+			 * payload, whose grandchild back-pointer must no longer
+			 * point into the orphaned source root.  Then the
+			 * back-channel, then the forward publish.
+			 */
 			ft_graft_glue_apply_deferred(ft, glue);
+			ft_publish_external_nodes_prev(ft, branch, displaced);
 			ft_publish_to_parent(ft, d->pnf, d->nfp, branch);
 			if (i >= 1)
 				FT_TP(tree_edge_set, (const void *) ft,
@@ -15787,22 +15796,50 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		} else {
 			struct cds_ft_inode_flag *dest = d->pnf;
 			struct cds_ft_metadata *pmeta;
+			struct cds_ft_inode_flag **slot = NULL;
+			struct cds_ft_inode_flag *pf;
+			struct ft_flip_batch *b;
 			int ret;
 
 			pmeta = cds_ft_item_to_metadata(
 					ft_node_ptr(d->pnf));
 
+			/*
+			 * Same R8 + fresh-before-live discipline as the
+			 * d->depth == key_len arm: park a flip proxy so the
+			 * fallible slot store runs FIRST, and the deferred
+			 * live flips plus the branch's own back-pointer wiring
+			 * complete invisibly before the one-store commit.  The
+			 * in-place set_nth otherwise exposed the branch before
+			 * apply_deferred wired the payload's back-pointers --
+			 * a skip-validating reader could up-walk into the
+			 * orphaned source root.
+			 */
+			b = ft_flip_batch_alloc(ft, 1);
+			if (!b)
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			pf = ft_flip_batch_add(b, NULL, branch);
 			ret = ft_node_set_nth(ft, &dest,
 				key[i - 1],
-				branch, &old_recompacted_node, pmeta,
+				pf, &old_recompacted_node, pmeta,
 				d->depth - 1, false);
-			if (ret)
+			if (ret) {
+				ft_flip_batch_free_unpublished(b);
 				/* branch + path are tracked in @glue; the
 				 * caller's abort reclaims them. */
 				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+			/* ===== failure-free commit tail ===== */
+			ft_node_get_nth_skip(dest, &slot, key[i - 1],
+				FT_PF_NONE);
+			assert(slot);
+			ft_set_parent(ft, branch, dest, slot);
 			ft_graft_glue_apply_deferred(ft, glue);
 			ft_publish_to_parent(ft, pmeta->parent,
 				d->pnfp, dest);
+			ft_flip_batch_commit(b);
+			rcu_assign_pointer(*slot, branch);
+			ft_flip_batch_reclaim(b);
 
 			if (old_recompacted_node)
 				free_cds_ft_node(ft, old_recompacted_node);
@@ -18109,6 +18146,13 @@ static
 void ft_flip_batch_free_unpublished(struct ft_flip_batch *b)
 {
 	free(b);
+}
+
+/* One release store: every proxy in the batch flips old -> new atomically. */
+static
+void ft_flip_batch_commit(struct ft_flip_batch *b)
+{
+	urcu_flip_commit(&b->group);
 }
 
 /*
