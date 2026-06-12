@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 253
+#define NR_TESTS 255
 #else
-#define NR_TESTS 239
+#define NR_TESTS 241
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1857,6 +1857,159 @@ static int test_node_batch(void)
 fail:
 	drain_and_destroy(ft, group);
 	return -1;
+}
+
+/*
+ * `break` inside cds_ft_for_each_batched_rcu / _reverse_ terminates the
+ * whole traversal.  The macros used to expand to a refill loop nested
+ * around a batch loop, so a user break only exited the current batch
+ * and iteration silently resumed with the next refill (2026-06 review
+ * finding 5.4).  With cap 4 over 10 keys, breaking at the 6th visit
+ * crosses a batch boundary: the buggy shape resumed and visited all 10.
+ */
+static int test_batched_break(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	const struct cds_ft_cell *cell, *mbuf[4];
+	size_t off = cds_ft_cell_node_offset();
+	unsigned long seen;
+	uint64_t i;
+
+	rcu_read_lock();
+	for (i = 0; i < 10; i++) {
+		if (insert_u64(ft, i, node_alloc(i)) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "batched_break: insert %llu failed\n",
+				(unsigned long long) i);
+			goto fail;
+		}
+	}
+
+	seen = 0;
+	cds_ft_for_each_batched_rcu(ft, cell, mbuf, 4) {
+		if (to_test_node(cds_ft_cell_node(cell, off))->key != seen) {
+			rcu_read_unlock();
+			fprintf(stderr, "batched_break fwd: order mismatch\n");
+			goto fail;
+		}
+		if (++seen == 6)
+			break;
+	}
+	if (seen != 6) {
+		rcu_read_unlock();
+		fprintf(stderr, "batched_break fwd: visited %lu, want 6\n", seen);
+		goto fail;
+	}
+
+	seen = 0;
+	cds_ft_for_each_reverse_batched_rcu(ft, cell, mbuf, 4) {
+		if (to_test_node(cds_ft_cell_node(cell, off))->key != 9 - seen) {
+			rcu_read_unlock();
+			fprintf(stderr, "batched_break rev: order mismatch\n");
+			goto fail;
+		}
+		if (++seen == 6)
+			break;
+	}
+	if (seen != 6) {
+		rcu_read_unlock();
+		fprintf(stderr, "batched_break rev: visited %lu, want 6\n", seen);
+		goto fail;
+	}
+
+	/* `continue` skips to the next cell, batch boundaries included. */
+	seen = 0;
+	cds_ft_for_each_batched_rcu(ft, cell, mbuf, 4) {
+		if (to_test_node(cds_ft_cell_node(cell, off))->key & 1)
+			continue;
+		seen++;
+	}
+	if (seen != 5) {
+		rcu_read_unlock();
+		fprintf(stderr, "batched_break continue: %lu even, want 5\n", seen);
+		goto fail;
+	}
+	rcu_read_unlock();
+
+	return drain_and_destroy(ft, group);
+fail:
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+/*
+ * cds_ft_lookup_first/last on a miss must leave the iterator's key
+ * length unchanged.  Both overwrite iter->key_len with the descent's
+ * working length (prefix_len for first, max_key_len for last) and used
+ * to restore the caller's length only on error (< 0): a NOT_FOUND left
+ * the working length behind (2026-06 review finding 5.4).
+ */
+static int test_first_last_keylen_on_miss(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node *n;
+	enum cds_ft_status s;
+	uint8_t rk[64];
+	size_t rl;
+	int ret = -1;
+
+	if (cds_ft_group_create(NULL, &group) < 0)
+		return -1;
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	n = node_alloc(0);
+	rcu_read_lock();
+	s = cds_ft_insert(ft, (const uint8_t *) "zz", 2, &n->node);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "keylen_on_miss: insert failed\n");
+		node_free(n);
+		goto out;
+	}
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		goto out;
+
+	rcu_read_lock();
+	/* Scope to 'a': nothing matches, both endpoint lookups miss. */
+	cds_ft_iter_set_key(iter, (const uint8_t *) "abc", 3);
+	cds_ft_iter_set_prefix_len(iter, 1);
+	s = cds_ft_lookup_first(ft, iter);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		rcu_read_unlock();
+		fprintf(stderr, "keylen_on_miss: first status %d\n", s);
+		goto out;
+	}
+	cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+	if (rl != 3 || rk[0] != 'a') {
+		rcu_read_unlock();
+		fprintf(stderr, "keylen_on_miss: first left len %zu (want 3)\n", rl);
+		goto out;
+	}
+	s = cds_ft_lookup_last(ft, iter);
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		rcu_read_unlock();
+		fprintf(stderr, "keylen_on_miss: last status %d\n", s);
+		goto out;
+	}
+	if (cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) != CDS_FT_STATUS_OK ||
+			rl != 3 || rk[0] != 'a') {
+		rcu_read_unlock();
+		fprintf(stderr, "keylen_on_miss: last left len %zu (want 3)\n", rl);
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	if (drain_and_destroy(ft, group))
+		return -1;
+	return ret;
 }
 
 /*
@@ -19502,6 +19655,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_nth_empty);
 	RUN_TEST(test_node_get_key);
 	RUN_TEST(test_node_batch);
+	RUN_TEST(test_batched_break);
+	RUN_TEST(test_first_last_keylen_on_miss);
 	RUN_TEST(test_node_get_key_no_list);
 	RUN_TEST(test_list_off_ops);
 	RUN_TEST(test_lookup_nth_basic);

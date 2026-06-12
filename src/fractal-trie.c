@@ -9827,6 +9827,26 @@ going_up:
 		}
 	}
 
+	/*
+	 * Fall-through dead-end within the scope prefix: the descent broke
+	 * on an empty slot at level <= prefix_len (the prefix path itself
+	 * does not exist), so the going-up loop above -- bounded at
+	 * prefix_len -- never ran and the going_up NOT_FOUND arm did not
+	 * trigger.  descend_children below would misread the NULL (tag 0)
+	 * as an external-node match and return OK with iter->node == NULL.
+	 * No key with the scope prefix exists: report NOT_FOUND.  Every
+	 * `goto descend_children` jumps past this guard with a non-NULL
+	 * @node_flag; only the fall-through path can carry NULL.
+	 */
+	if (!node_flag) {
+		iter->node = NULL;
+		iter->cache_valid = true;
+		iter_debug_path_update(iter);
+		iter->path_len = iter->prefix_len + 1;
+		iter->status = CDS_FT_STATUS_NOT_FOUND;
+		goto end;
+	}
+
 descend_children:
 	/*
 	 * A skip-encoded sibling carried over from going_up (use_keycopy) is
@@ -10223,7 +10243,7 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	iter->key_len = iter->prefix_len;
 	status = cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_GE, FT_LOOKUP_LIMIT_FIRST);
-	if (status < 0)
+	if (status != CDS_FT_STATUS_OK)
 		iter->key_len = saved_key_len;
 	return status;
 }
@@ -10256,7 +10276,7 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	iter->key_len = ft->group->max_key_len;
 	status = cds_ft_lookup_inequality(ft, iter,
 			FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);
-	if (status < 0)
+	if (status != CDS_FT_STATUS_OK)
 		iter->key_len = saved_key_len;
 	return status;
 }

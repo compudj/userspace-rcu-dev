@@ -629,10 +629,11 @@ void cds_ft_node_init(struct cds_ft_node *node)
  * Pattern: app embeds struct cds_ft_node in its own leaf struct,
  * allocates each leaf from this arena via cds_ft_external_arena_alloc,
  * and inserts into the trie.  The arena grows on demand as a linked
- * list of mmap'd ranges (default ~64 MiB each); each range reserves
- * a trailing guard page so the library's SIMD leaf compare can safely
- * over-read 32 bytes past any allocation's last byte without faulting,
- * regardless of where the allocation sits within its range.
+ * list of mmap'd ranges (16 MiB each); each range reserves a
+ * trailing readable pad, never handed out to any allocation, so the
+ * library's SIMD leaf compare can safely over-read 32 bytes past any
+ * allocation's last byte without faulting, regardless of where the
+ * allocation sits within its range.
  *
  * Lifetime: all-or-nothing.  cds_ft_external_arena_destroy frees
  * every allocation served by the arena.  The caller is responsible
@@ -710,7 +711,7 @@ struct cds_ft_external_arena *cds_ft_external_arena_create(
  * @size:  Number of bytes the caller needs.  Rounded up internally
  *         to the next power of two (the slot's "size class");
  *         requests below 16 bytes are bumped to 16 bytes, requests
- *         above 1 MiB are rejected with NULL.
+ *         above 4 MiB are rejected with NULL.
  *
  * Returns a pointer aligned to its size class with the slot
  * zero-initialised, or NULL if the size class is out of range or
@@ -842,7 +843,9 @@ enum cds_ft_status cds_ft_speculative_lookup_key(struct cds_ft *ft,
 			key_readable_pad, &found);
 	if (status != CDS_FT_STATUS_OK)
 		return status;
-	if (memcmp(key, (const uint8_t *) found + key_offset, key_len) != 0) {
+	/* key_len == 0: nothing to validate (and @key may be NULL). */
+	if (key_len != 0 &&
+			memcmp(key, (const uint8_t *) found + key_offset, key_len) != 0) {
 		if (result_node)
 			*result_node = NULL;
 		return CDS_FT_STATUS_NOT_FOUND;
@@ -1085,8 +1088,11 @@ enum cds_ft_status cds_ft_lookup_gt(struct cds_ft *ft,
  *        node, status, and backtracking path.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
- * the trie is empty, or a negative cds_ft_status on error. The
- * status is also stored in the iterator (cds_ft_iter_status()).
+ * the trie holds no key within the iterator's scoped prefix (or is
+ * empty), or a negative cds_ft_status on error. The status is also
+ * stored in the iterator (cds_ft_iter_status()).  On NOT_FOUND or
+ * error, the iterator's key length is left unchanged (the key buffer
+ * past the scoped prefix is unspecified).
  */
 enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 		struct cds_ft_iter *iter);
@@ -1098,8 +1104,11 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
  *        node, status, and backtracking path.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
- * the trie is empty, or a negative cds_ft_status on error. The
- * status is also stored in the iterator (cds_ft_iter_status()).
+ * the trie holds no key within the iterator's scoped prefix (or is
+ * empty), or a negative cds_ft_status on error. The status is also
+ * stored in the iterator (cds_ft_iter_status()).  On NOT_FOUND or
+ * error, the iterator's key length is left unchanged (the key buffer
+ * past the scoped prefix is unspecified).
  */
 enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 		struct cds_ft_iter *iter);
@@ -1237,6 +1246,10 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * on cds_ft_ordered_list(ft) and use cds_ft_for_each_rcu() when it is false.
  * Same RCU read-lock requirement as cds_ft_for_each_rcu().
  *
+ * Despite the batching, this expands to a SINGLE flat loop: `break` and
+ * `continue` in the body behave exactly as in a plain for loop (`break`
+ * terminates the whole traversal, not just the current batch).
+ *
  *   const struct cds_ft_cell *cell, *batch[64];
  *   size_t off = cds_ft_cell_node_offset();
  *   uint8_t key[256];		// >= cds_ft_max_key_len(ft)
@@ -1252,13 +1265,13 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
 #define cds_ft_for_each_batched_rcu(ft, cell, buf, cap)				\
 	for (struct { const struct cds_ft_cell *cur; size_t n, i; int started; } \
 			_ftb = { NULL, 0, 0, 0 };				\
-		(!_ftb.started || _ftb.cur != NULL) &&				\
+		(_ftb.i < _ftb.n ||						\
+			((!_ftb.started || _ftb.cur != NULL) &&			\
 			(cds_ft_cell_next_batch((ft), _ftb.cur, (buf), (cap),	\
 				&_ftb.n, &_ftb.cur),				\
-			 _ftb.started = 1, _ftb.i = 0, 1);			\
-		)								\
-		for (; _ftb.i < _ftb.n &&					\
-				(((cell) = (buf)[_ftb.i]), 1); _ftb.i++)
+			 _ftb.started = 1, _ftb.i = 0, _ftb.n > 0))) &&		\
+			(((cell) = (buf)[_ftb.i]), 1);				\
+		_ftb.i++)
 
 /*
  * cds_ft_for_each_reverse_batched_rcu - Reverse in-order traversal, batched.
@@ -1270,13 +1283,13 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
 #define cds_ft_for_each_reverse_batched_rcu(ft, cell, buf, cap)			\
 	for (struct { const struct cds_ft_cell *cur; size_t n, i; int started; } \
 			_ftb = { NULL, 0, 0, 0 };				\
-		(!_ftb.started || _ftb.cur != NULL) &&				\
+		(_ftb.i < _ftb.n ||						\
+			((!_ftb.started || _ftb.cur != NULL) &&			\
 			(cds_ft_cell_prev_batch((ft), _ftb.cur, (buf), (cap),	\
 				&_ftb.n, &_ftb.cur),				\
-			 _ftb.started = 1, _ftb.i = 0, 1);			\
-		)								\
-		for (; _ftb.i < _ftb.n &&					\
-				(((cell) = (buf)[_ftb.i]), 1); _ftb.i++)
+			 _ftb.started = 1, _ftb.i = 0, _ftb.n > 0))) &&		\
+			(((cell) = (buf)[_ftb.i]), 1);				\
+		_ftb.i++)
 
 /*
  * cds_ft_for_each_reverse_rcu - Iterate through all (or prefix-scoped) nodes in reverse key order.
@@ -1343,7 +1356,9 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * @node: Node to insert.
  *
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
- * on error.
+ * on error.  On failure, @node has not been published and is left
+ * reusable: the same node may be passed to a subsequent insert
+ * attempt.
  *
  * Mutual exclusion between updates (insert, insert_unique, remove) is
  * the user's responsibility.
@@ -1368,7 +1383,9 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
  * Returns CDS_FT_STATUS_OK on success (node inserted, *@result_node
  * is @node). Returns CDS_FT_STATUS_DUPLICATE_FOUND if a duplicate
  * exists (*@result_node is the existing node). Returns a negative
- * cds_ft_status on error.
+ * cds_ft_status on error.  On failure (including DUPLICATE_FOUND),
+ * @node has not been published and is left reusable for a subsequent
+ * insert attempt.
  *
  * Mutual exclusion between updates (insert, insert_unique, remove) is
  * the user's responsibility.
@@ -1405,7 +1422,9 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * Returns CDS_FT_STATUS_OK on success (node inserted, no prior node
  * existed). Returns CDS_FT_STATUS_DUPLICATE_FOUND on success when a
  * prior duplicate chain was replaced (*@result_node is the old head).
- * Returns a negative cds_ft_status on error.
+ * Returns a negative cds_ft_status on error.  On error, @node has
+ * not been published and is left reusable for a subsequent insert
+ * attempt.
  *
  * Mutual exclusion between updates (insert, insert_unique,
  * insert_replace, replace, remove, remove_all) is the user's
@@ -1568,7 +1587,11 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *
  * Both source and destination tries must belong to the same group.
  * Mutual exclusion between writers on all affected tries is the
- * caller's responsibility. An RCU read-side lock must be held.
+ * caller's responsibility. Do NOT call these operations from within
+ * an RCU read-side critical section: they can block internally on
+ * synchronize_rcu() to drain readers, which deadlocks (or never
+ * completes) inside a read-side critical section. No RCU read-side
+ * lock is required.
  * The source trie must not be the same object as the destination trie.
  *
  * Efficient bulk-removal pattern:
@@ -1608,7 +1631,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * @key_len: Key length in bytes:
  * - > 0: Explicit key length.
  * - 0: Graft at the root (NIL prefix).
- * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  * @src_ft: Source Fractal Trie. Must be in the same group as @dst_ft.
  *          On success, @src_ft becomes empty. The caller retains
  *          ownership of the (now empty) @src_ft object.
@@ -1650,7 +1672,6 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * @key_len: Key length in bytes:
  * - > 0: Explicit key length.
  * - 0: Graft at the root (NIL prefix).
- * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  * @swap_ft: Fractal Trie to exchange content with. Must be in the same
  *           group as @dst_ft. On entry, its content is grafted into
  *           @dst_ft at @key. On success, it receives the content that
@@ -1698,7 +1719,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  * @key_len: Key length in bytes:
  * - > 0: Explicit key length.
  * - 0: Detach at the root (detach everything).
- * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
  * @result_ft: Output. On success, set to a new trie containing
  *             the content that was at @key. The new trie belongs to
  *             the same group. The caller takes ownership.
@@ -1780,6 +1800,11 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  *      the merged cluster, so the whole set flips atomically for
  *      readers with no grace-period drain.  Same-key duplicate
  *      chains are concatenated as part of the committed cluster.
+ *
+ *   On an ordered-list group, the moved keys' ordered-list links
+ *   are spliced within the same commit (pointer store or flip), so
+ *   ordered iteration over @dst_ft likewise observes the merge
+ *   atomically.
  *
  * @src_ft's moved nodes are reclaimed under the usual RCU
  * discipline (deferred via call_rcu); @src_ft retains only the
@@ -1952,6 +1977,14 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
  * There should be no more concurrent insert, delete, nor look-up
  * performed on the Fractal Trie while it is being destroyed (ensured
  * by the caller).
+ *
+ * The trie should be drained first: destroying a non-empty trie does
+ * not reclaim its remaining internal nodes and ordered-list cells
+ * (they stay in the group-shared arenas until the group itself is
+ * destroyed) and leaves the application's external nodes unreachable
+ * with their linkage fields dangling.  See the "Efficient
+ * bulk-removal pattern" above for draining a trie with a single
+ * grace period.
  */
 void cds_ft_destroy(struct cds_ft *ft);
 
