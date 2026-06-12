@@ -6411,8 +6411,18 @@ skip_copy:
 	FT_TP(node_recompact, (const void *) *old_node_flag_ptr,
 		(const void *) new_node_flag, (int) new_type_index);
 
-	/* Return pointer to new recompacted node through old_node_flag_ptr */
-	*old_node_flag_ptr = new_node_flag;
+	/*
+	 * Return the new recompacted node through old_node_flag_ptr.  For the
+	 * ADD/SAME/DEL mutators this is a local out-param, re-published with
+	 * rcu_assign_pointer by the caller; but ft_compact_relocate_at passes
+	 * the LIVE slot (&ft->root, a parent child slot, &cn->child) and never
+	 * re-publishes, so this store IS the reader-visible publication of the
+	 * relocated node: use a release store so the node-body and metadata
+	 * stores above are ordered before it (a plain store would let a
+	 * weakly-ordered architecture expose an unwired copy).  Free for the
+	 * local-out-param callers.
+	 */
+	rcu_assign_pointer(*old_node_flag_ptr, new_node_flag);
 	if (old_node && old_node_ret)
 		*old_node_ret = old_node;
 
