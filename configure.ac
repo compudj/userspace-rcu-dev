@@ -226,6 +226,24 @@ AS_IF([echo " $CFLAGS $CPPFLAGS " | $GREP -q -- '-DFT_ENABLE_TRACING'],
   ])
 AC_SUBST([FT_TRACING_LIBS])
 
+# Fractal Trie lookup-layout linker script support.
+#
+# src/Makefile.am injects ft-lookup-layout.ld (GNU-ld SECTIONS /
+# INSERT syntax) into the liburcu-cds link so each public lookup
+# dispatch stub is co-located with its specialized inners in a
+# page-aligned cluster.  Probe whether the linker accepts the
+# script and fall back to the default text layout when it does not
+# (e.g. gold, ld64, or other non-GNU linkers).
+AC_MSG_CHECKING([whether the linker accepts ft-lookup-layout.ld])
+ft_lookup_layout_saved_LDFLAGS="$LDFLAGS"
+LDFLAGS="$LDFLAGS -Wl,-T,$srcdir/ft-lookup-layout.ld"
+AC_LINK_IFELSE([AC_LANG_PROGRAM([], [])],
+  [ft_lookup_layout_ld=yes],
+  [ft_lookup_layout_ld=no])
+LDFLAGS="$ft_lookup_layout_saved_LDFLAGS"
+AC_MSG_RESULT([$ft_lookup_layout_ld])
+AM_CONDITIONAL([HAVE_FT_LOOKUP_LAYOUT_LD], [test "x$ft_lookup_layout_ld" = "xyes"])
+
 
 ##                             ##
 ## Optional features selection ##

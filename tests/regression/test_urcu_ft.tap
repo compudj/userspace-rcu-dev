@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+#
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# SPDX-FileCopyrightText: 2026 EfficiOS Inc.
+#
+# Bounded TAP smoke run of the test_urcu_ft stress tool.  The full
+# sweep (30 seconds per configuration, dozens of configurations)
+# lives in runft.sh / runft_vam.sh and is too long for the test
+# suite; this wrapper runs a few seconds of the key configurations.
+
+if [ "x${URCU_TESTS_SRCDIR:-}" != "x" ]; then
+	UTILSSH="$URCU_TESTS_SRCDIR/utils/utils.sh"
+else
+	UTILSSH="$(dirname "$0")/../utils/utils.sh"
+fi
+
+# shellcheck source=../utils/utils.sh
+source "$UTILSSH"
+
+TESTPROG="${URCU_TESTS_BUILDDIR}/regression/test_urcu_ft"
+
+echo "1..4"
+
+testnum=1
+run_one() {
+	if "$TESTPROG" "$@" > /dev/null 2>&1; then
+		echo "ok ${testnum} - test_urcu_ft $*"
+	else
+		echo "not ok ${testnum} - test_urcu_ft $*"
+	fi
+	testnum=$((testnum + 1))
+}
+
+run_one 0 4 2 --sanity-test
+run_one 0 4 2 --sanity-test-varlen
+run_one 2 2 3 --key-len 4 --lookup-pool-size 1000 --write-pool-size 1000 --init-pool-size 1000
+run_one 2 2 3 --insert-unique --leak-detection --key-len 4 --populate --lookup-pool-size 10000 --write-pool-size 10000 --init-pool-size 10000

@@ -55,8 +55,16 @@ liburcu_cds_la_LIBADD = liburcu-common.la $(FT_TRACING_LIBS)
 # Inject the FT lookup-API cluster placement script so the linker
 # co-locates each public dispatch entry with its specialized
 # inners in a page-aligned cluster.  See ft-lookup-layout.ld at
-# the top of the tree for details.
-liburcu_cds_la_LDFLAGS = $(AM_LDFLAGS) -Wl,-T,$(top_srcdir)/ft-lookup-layout.ld
+# the top of the tree for details.  Skipped when configure found
+# the linker does not accept the script (non-GNU linkers); the
+# library is fully functional without it, only the lookup-cluster
+# page placement is lost.
+if HAVE_FT_LOOKUP_LAYOUT_LD
+FT_LOOKUP_LAYOUT_LDFLAGS = -Wl,-T,$(top_srcdir)/ft-lookup-layout.ld
+else
+FT_LOOKUP_LAYOUT_LDFLAGS =
+endif
+liburcu_cds_la_LDFLAGS = $(AM_LDFLAGS) $(FT_LOOKUP_LAYOUT_LDFLAGS)
 
 pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = liburcu-cds.pc liburcu.pc liburcu-bp.pc liburcu-qsbr.pc \

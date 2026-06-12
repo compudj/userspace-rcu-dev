@@ -264,7 +264,7 @@ enum {
 	ft_type_6_max_child = 0,	/* NULL */
 };
 
-const struct cds_ft_type ft_types[] = {
+static const struct cds_ft_type ft_types[] = {
 	[0] = {
 		.type_class = FT_POPCOUNT,
 		.popcount_2l = true,
@@ -349,7 +349,7 @@ enum {
  * node (16 + 14 * 8 = 128 exactly).
  */
 
-const struct cds_ft_type ft_types[] = {
+static const struct cds_ft_type ft_types[] = {
 	[0] = {
 		.type_class = FT_POPCOUNT,
 		.popcount_2l = true,

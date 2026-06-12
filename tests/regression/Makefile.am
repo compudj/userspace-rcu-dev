@@ -84,6 +84,8 @@ rcutorture_urcu_bp_cxx_LDADD = $(URCU_BP_LIB) $(TAP_LIB)
 urcutorture.c: ../common/api.h
 
 dist_check_SCRIPTS = \
+	test_urcu_ft.tap \
+	test_urcu_ft_inv.tap \
 	test_rcutorture_urcu_bp_perf_global.tap \
 	test_rcutorture_urcu_bp_perf_global_cxx.tap \
 	test_rcutorture_urcu_bp_perf_percpu.tap \
@@ -190,6 +192,8 @@ TESTS =
 REGTEST_TESTS = \
 	test_urcu_fork.tap \
 	test_urcu_fork_cxx.tap \
+	test_urcu_ft.tap \
+	test_urcu_ft_inv.tap \
 	test_rcutorture_urcu_bp_perf_global.tap \
 	test_rcutorture_urcu_bp_perf_global_cxx.tap \
 	test_rcutorture_urcu_bp_perf_percpu.tap \
