@@ -10116,10 +10116,16 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	dbg_printf("cds_ft_lookup_first\n");
 	/* O(1) endpoint: the ordinal-cell list's minimum cell (unscoped only).
 	 * Resolve a flip proxy: head/tail transition atomically with the
-	 * neighbour edges during a concurrent splice/unsplice/run move. */
-	if (ft_ord_cell_fastpath_ok(ft, iter))
-		return ft_ord_cell_iter_land(ft, iter,
+	 * neighbour edges during a concurrent splice/unsplice/run move.
+	 * iter_auto_invalidate_cache: honour the UNCACHED contract like every
+	 * other epilogue -- materialize the lazy leaf-referenced key and drop
+	 * the cached position so it is not reused across a lock window. */
+	if (ft_ord_cell_fastpath_ok(ft, iter)) {
+		status = ft_ord_cell_iter_land(ft, iter,
 			ft_ord_cell_resolve_ord(&ft->ord_cell_head));
+		iter_auto_invalidate_cache(iter);
+		return status;
+	}
 	/*
 	 * LIMIT_FIRST sets key_len to prefix_len internally.
 	 * When prefix_len == 0 this corresponds to a traversal of the
@@ -10146,10 +10152,14 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_last\n");
 	/* O(1) endpoint: the ordinal-cell list's maximum cell (unscoped only).
-	 * Resolve a flip proxy (see cds_ft_lookup_first). */
-	if (ft_ord_cell_fastpath_ok(ft, iter))
-		return ft_ord_cell_iter_land(ft, iter,
+	 * Resolve a flip proxy (see cds_ft_lookup_first, incl. the UNCACHED
+	 * auto-invalidate rationale). */
+	if (ft_ord_cell_fastpath_ok(ft, iter)) {
+		status = ft_ord_cell_iter_land(ft, iter,
 			ft_ord_cell_resolve_ord(&ft->ord_cell_tail));
+		iter_auto_invalidate_cache(iter);
+		return status;
+	}
 	/*
 	 * LIMIT_LAST always uses key_len = max_key_len. When
 	 * prefix_len > 0, the traversal uses actual prefix key bytes
