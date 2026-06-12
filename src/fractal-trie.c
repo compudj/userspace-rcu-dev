@@ -9247,10 +9247,15 @@ post_traversal:
 	 * (@level == key_depth - 1) is already handled by the LE/GE arm above
 	 * (LE) or excluded by strictness (LT), so this is only the proper-prefix
 	 * case.
+	 *
+	 * node_flag may be NULL here (the descent's empty-slot break), which
+	 * ft_node_external() also matches: that is a mid-key dead-end, NOT a
+	 * proper-prefix leaf -- fall through to going_up, which backtracks to
+	 * the nearest lesser key.
 	 */
 	if (limit == FT_LOOKUP_LIMIT_NONE &&
 			(mode == FT_LOOKUP_LE || mode == FT_LOOKUP_LT) &&
-			ft_node_external(node_flag) &&
+			node_flag && ft_node_external(node_flag) &&
 			level < key_depth - 1) {
 		int j;
 

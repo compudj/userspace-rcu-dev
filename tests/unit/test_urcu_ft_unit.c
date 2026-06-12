@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 240
+#define NR_TESTS 241
 #else
-#define NR_TESTS 229
+#define NR_TESTS 230
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4792,6 +4792,89 @@ static int test_inequality_extends_prefix(void)
 				rcu_read_unlock();
 				goto out;
 			}
+		}
+		rcu_read_unlock();
+	}
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	if (ret == 0)
+		ret = drain_and_destroy(ft, group);
+	else
+		drain_and_destroy(ft, group);
+	return ret;
+}
+
+/*
+ * Inequality lookups whose descent dead-ends on an EMPTY SLOT more than one
+ * byte before the key end ("mmm" between "aaa" and "zzz" dead-ends at the
+ * root).  Regression for cds_ft_lookup_le / cds_ft_lookup_lt returning
+ * CDS_FT_STATUS_OK with a NULL node: the proper-prefix-leaf early return
+ * tested ft_node_external(node_flag), which also matches NULL, instead of
+ * falling through to the going-up backtrack (2026-06 review, 1.1).  This also
+ * silently terminated cds_ft_prev / reverse iteration early.
+ */
+static int test_inequality_deadend_empty_slot(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ft(&group);
+	struct cds_ft_iter *iter;
+	const char *words[] = { "aaa", "zzz" };
+	struct dead_case {
+		const char *q;
+		enum cds_ft_status (*fn)(struct cds_ft *, struct cds_ft_iter *);
+		const char *expect;	/* NULL = expect NOT_FOUND */
+	} cases[] = {
+		{ "mmm", cds_ft_lookup_le, "aaa" },
+		{ "mmm", cds_ft_lookup_lt, "aaa" },
+		{ "mmm", cds_ft_lookup_ge, "zzz" },
+		{ "mmm", cds_ft_lookup_gt, "zzz" },
+		/* Dead-end below an existing first byte. */
+		{ "amm", cds_ft_lookup_le, "aaa" },
+		{ "amm", cds_ft_lookup_ge, "zzz" },
+	};
+	unsigned int i;
+	int ret = -1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) words[i],
+				  strlen(words[i]), &n->node) < 0) {
+			fprintf(stderr, "insert '%s' failed\n", words[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		enum cds_ft_status s;
+		uint8_t rk[64]; size_t rl;
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) cases[i].q,
+			strlen(cases[i].q));
+		s = cases[i].fn(ft, iter);
+		if (s != CDS_FT_STATUS_OK || !cds_ft_iter_node(iter)) {
+			fprintf(stderr, "deadend('%s'): status %d node %p, expected '%s'\n",
+				cases[i].q, s, (void *) cds_ft_iter_node(iter),
+				cases[i].expect);
+			rcu_read_unlock();
+			goto out;
+		}
+		cds_ft_iter_get_key(iter, rk, sizeof rk, &rl);
+		rk[rl] = '\0';
+		if (strcmp((char *) rk, cases[i].expect) != 0) {
+			fprintf(stderr, "deadend('%s'): got '%s', expected '%s'\n",
+				cases[i].q, (char *) rk, cases[i].expect);
+			rcu_read_unlock();
+			goto out;
 		}
 		rcu_read_unlock();
 	}
@@ -18263,6 +18346,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_varlen_string_basic);
 	RUN_TEST(test_inequality_prefix_key);
 	RUN_TEST(test_inequality_extends_prefix);
+	RUN_TEST(test_inequality_deadend_empty_slot);
 	RUN_TEST(test_inequality_empty_key);
 	RUN_TEST(test_merge_ordered_fixed_root);
 
