@@ -1798,6 +1798,18 @@ void cds_ft_external_arena_free(struct cds_ft_external_arena *a, void *ptr)
 	r = ft_ext_arena_range_of(ptr);
 	cell = r->cells[ft_ext_arena_cell_index(ptr)];
 	order = ft_ext_arena_cell_order(cell);
+	/*
+	 * Guard against freeing a pointer this arena never handed out, or a
+	 * double free.  An unallocated cell is FT_EXT_ARENA_CELL_NONE (0),
+	 * which decodes to order 3 -- below FT_EXT_ARENA_MIN_ORDER -- so the
+	 * freelist index (order - FT_EXT_ARENA_MIN_ORDER) would be -1 and the
+	 * push below would scribble freelist[-1]; an already-free cell has the
+	 * is_free bit set.  Catch either as a diagnosable abort instead of
+	 * silently corrupting the heap.
+	 */
+	assert(order >= FT_EXT_ARENA_MIN_ORDER &&
+			order <= FT_EXT_ARENA_MAX_ORDER &&
+			!ft_ext_arena_cell_is_free(cell));
 
 	pthread_mutex_lock(&a->lock);
 	/* Try to merge upward with the buddy at each order. */
