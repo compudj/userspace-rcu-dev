@@ -234,7 +234,17 @@
  * FT_NEAR_METADATA to fall back to the original page_size-range layout.
  */
 #if !defined(FT_NEAR_METADATA) && !defined(FT_FAR_METADATA)
-#define FT_FAR_METADATA
+# if (CAA_BITS_PER_LONG < 64)
+/*
+ * 32-bit: FT_FAR carves the address space into 2 MiB macro ranges, reserving
+ * virtual address space in 2 MiB units even though each range faults in
+ * lazily.  That is too VA-hungry for a ~3 GiB user address space, so default
+ * to the page_size-range near layout there.
+ */
+#  define FT_NEAR_METADATA
+# else
+#  define FT_FAR_METADATA
+# endif
 #endif
 
 #ifdef FT_FAR_METADATA
