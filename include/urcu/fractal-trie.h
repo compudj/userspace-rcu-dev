@@ -241,14 +241,13 @@
  * Debug validation (URCU_FRACTAL_TRIE_DEBUG_PATH):
  *
  * Building with URCU_FRACTAL_TRIE_DEBUG_PATH defined enables run-time
- * detection of stale cached positions.  Each position population records
- * an RCU grace-period snapshot (via the flavor's
- * update_start_poll_synchronize_rcu); each reuse polls it (via
- * update_poll_state_synchronize_rcu).  If a full grace period has
- * elapsed since the position was populated, the cached pointer may
- * reference freed memory — the program aborts with a diagnostic.
- * Since struct cds_ft_iter is opaque, this option does not affect the
- * application ABI — only the library needs to be rebuilt.
+ * detection of stale cached positions.  Each position records an RCU
+ * grace-period snapshot when populated and checks it on reuse; if a
+ * full grace period has elapsed since the position was populated the
+ * cached pointer may reference freed memory, so the program aborts
+ * with a diagnostic.  Since struct cds_ft_iter is opaque, this option
+ * does not affect the application ABI — only the library needs to be
+ * rebuilt.
  *
  * CDS_FT_ITER_UNCACHED:
  *
@@ -434,8 +433,8 @@ enum cds_ft_iter_cache_mode {
 	/*
 	 * CDS_FT_ITER_CACHED (default):
 	 *   The iterator reuses its current position between operations,
-	 *   letting next/prev/remove_all continue from it by backtracking up
-	 *   the live parent chain instead of descending from the root.
+	 *   so next/prev/remove_all continue from it instead of
+	 *   re-descending from the root.
 	 *   The RCU read-side lock must be held CONTINUOUSLY between the
 	 *   operation that populates the iterator and any operation that
 	 *   reuses its position; otherwise the position may reference
@@ -894,15 +893,16 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
  * Iterator-based lookup API
  *
  * These functions use a cds_ft_iter to hold input key, output key,
- * result node, status, and backtracking state. Set the input key
+ * result node, status, and cached position. Set the input key
  * with cds_ft_iter_set_key() before calling. On return, the iterator
  * holds the result key (cds_ft_iter_get_key()), result node
- * (cds_ft_iter_node()), status (cds_ft_iter_status()), and
- * backtracking path. The status is also returned by the function for
+ * (cds_ft_iter_node()), status (cds_ft_iter_status()), and cached
+ * position. The status is also returned by the function for
  * convenience.
  *
  * The RCU read-side lock must be held while calling these functions
- * and while accessing the returned node or reusing the iterator path.
+ * and while accessing the returned node or reusing the iterator's
+ * cached position.
  */
 
 /*
@@ -910,7 +910,7 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Iterator with key set via cds_ft_iter_set_key().
  *        On return, the iterator holds the result node, status,
- *        and backtracking path.
+ *        and cached position.
  *
  * Returns CDS_FT_STATUS_OK on success (match found),
  * CDS_FT_STATUS_NOT_FOUND if no match, or a negative cds_ft_status
@@ -926,7 +926,7 @@ enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Iterator with key set via cds_ft_iter_set_key().
  *        On return, the iterator holds the result node, status,
- *        and backtracking path. The iterator's key length is set to
+ *        and cached position. The iterator's key length is set to
  *        the matching sub-key length, and the result node is the
  *        closest ancestor with external nodes.
  *
@@ -951,7 +951,7 @@ enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
  *        duplicate chain if the longest match has an external node
  *        (status is CDS_FT_STATUS_OK), or NULL if the longest match
  *        ends at an internal node (status is
- *        CDS_FT_STATUS_INTERNAL_MATCH). The backtracking path is
+ *        CDS_FT_STATUS_INTERNAL_MATCH). The cached position is
  *        populated.
  *
  * Returns CDS_FT_STATUS_OK if the longest match has an external node.
@@ -970,7 +970,7 @@ enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Iterator with key set via cds_ft_iter_set_key().
  *        On return, the iterator holds the result key, key length,
- *        node, status, and backtracking path.
+ *        node, status, and cached position.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * no node with key <= the iterator key exists, or a negative
@@ -985,7 +985,7 @@ enum cds_ft_status cds_ft_lookup_le(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Iterator with key set via cds_ft_iter_set_key().
  *        On return, the iterator holds the result key, key length,
- *        node, status, and backtracking path.
+ *        node, status, and cached position.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * no node with key >= the iterator key exists, or a negative
@@ -1000,7 +1000,7 @@ enum cds_ft_status cds_ft_lookup_ge(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Iterator with key set via cds_ft_iter_set_key().
  *        On return, the iterator holds the result key, key length,
- *        node, status, and backtracking path.
+ *        node, status, and cached position.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * no node with key < the iterator key exists, or a negative
@@ -1015,7 +1015,7 @@ enum cds_ft_status cds_ft_lookup_lt(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Iterator with key set via cds_ft_iter_set_key().
  *        On return, the iterator holds the result key, key length,
- *        node, status, and backtracking path.
+ *        node, status, and cached position.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * no node with key > the iterator key exists, or a negative
@@ -1029,7 +1029,7 @@ enum cds_ft_status cds_ft_lookup_gt(struct cds_ft *ft,
  * cds_ft_lookup_first - Look up the node with the lowest key.
  * @ft: The Fractal Trie.
  * @iter: Iterator. On return, holds the result key, key length,
- *        node, status, and backtracking path.
+ *        node, status, and cached position.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * the trie holds no key within the iterator's scoped prefix (or is
@@ -1045,7 +1045,7 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
  * cds_ft_lookup_last - Look up the node with the greatest key.
  * @ft: The Fractal Trie.
  * @iter: Iterator. On return, holds the result key, key length,
- *        node, status, and backtracking path.
+ *        node, status, and cached position.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * the trie holds no key within the iterator's scoped prefix (or is
@@ -1062,8 +1062,8 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Iterator positioned at the current node.
  *        On return, advanced to the next node. The iterator holds
- *        the result key, key length, node, status, and backtracking
- *        path.
+ *        the result key, key length, node, status, and cached
+ *        position.
  *
  * Equivalent to cds_ft_lookup_gt().
  */
@@ -1079,8 +1079,8 @@ enum cds_ft_status cds_ft_next(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Iterator positioned at the current node.
  *        On return, moved to the previous node. The iterator holds
- *        the result key, key length, node, status, and backtracking
- *        path.
+ *        the result key, key length, node, status, and cached
+ *        position.
  *
  * Equivalent to cds_ft_lookup_lt().
  */
