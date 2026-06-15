@@ -710,7 +710,12 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  *                    bytes are reserved as a never-allocated but mapped
  *                    over-read pad -- not a protected guard page, which
  *                    would fault) satisfies any value up to that
- *                    region's size trivially.
+ *                    region's size trivially.  The library trusts this
+ *                    promise -- it issues unmasked reads of up to
+ *                    @key_readable_pad bytes past @key -- so a value
+ *                    larger than the bytes actually safe to read is
+ *                    undefined behavior (an out-of-bounds read that may
+ *                    fault).
  * @result_node: Candidate node output. Set to a node if a candidate is
  *               found, or NULL if not found or on error.
  *
