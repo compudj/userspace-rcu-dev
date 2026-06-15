@@ -395,9 +395,9 @@ enum cds_ft_numa_policy {
 	CDS_FT_NUMA_DEFAULT = 0,
 
 	/*
-	 * CDS_FT_NUMA_INTERLEAVE: round-robin allocator superblocks
+	 * CDS_FT_NUMA_INTERLEAVE: round-robin the trie's memory
 	 * across the calling thread's allowed NUMA nodes in 2 MiB
-	 * chunks (mbind(MPOL_BIND) per chunk).  Best for workloads
+	 * chunks.  Best for workloads
 	 * with concurrent readers distributed across NUMA nodes: every
 	 * reader sees the same balanced cross-node access pattern, so
 	 * the worst-case cross-NUMA cost is bounded by (NR_NODES - 1) /
@@ -1685,7 +1685,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  * inside it at return (the handle is freshly returned, and any
  * in-flight reader of the moved subtree has been drained by the
  * detach path itself).  A subsequent graft of the detached trie
- * therefore skips its internal synchronize_rcu(), coalescing
+ * therefore needs no grace-period drain of its own, coalescing
  * detach+graft into a single grace period.  Callers that publish
  * the detached trie to concurrent readers must call
  * cds_ft_make_concurrent() first.
