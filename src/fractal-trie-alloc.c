@@ -195,6 +195,16 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 #define FT_MAX_NUMA_NODES	1024
 #define FT_NODEMASK_LONGS	(FT_MAX_NUMA_NODES / (sizeof(unsigned long) * 8))
 #define FT_NODEMASK_BITS_PER_LONG	(sizeof(unsigned long) * 8)
+/*
+ * FT_NODEMASK_LONGS divides, so FT_MAX_NUMA_NODES must be a whole number of
+ * words -- otherwise the nodemask[] array rounds DOWN and the
+ * FT_MAX_NUMA_NODES-bounded scan in ft_apply_interleave reads past it.  (A
+ * machine with more NUMA nodes than this ceiling makes get_mempolicy() return
+ * EINVAL, which the caller already treats as "skip the interleave".)
+ */
+urcu_static_assert(FT_MAX_NUMA_NODES % (sizeof(unsigned long) * 8) == 0,
+		"FT_MAX_NUMA_NODES must be a whole number of words",
+		ft_nodemask_whole_words);
 #define FT_HUGEPAGE_SIZE	(2UL * 1024 * 1024)	/* 2 MiB */
 
 /*
