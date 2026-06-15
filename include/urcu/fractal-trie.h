@@ -62,17 +62,15 @@
  *
  * The graft, graft-swap, detach, and merge operations move (or,
  * for merge, combine) entire sub-tries between trie instances
- * within the same group. The write-side cost is more than a
- * pointer store — descent to the operation point, key-count
- * propagation up the destination's ancestors, allocation of the
- * result-trie wrapper for detach, and metadata fix-up. Each of
- * these ops also unlinks content from a source trie (graft-swap
- * from the destination too), so — when concurrent readers are
- * possible — it may issue a synchronize_rcu to drain readers of
- * the unlinked content before its nodes are reclaimed. What
- * concurrent readers see, however, is published atomically: a
- * reader observes either the complete prior state or the complete
- * result, never a partial state.
+ * within the same group. The write-side cost is more than a single
+ * pointer store (so "O(1)" below means independent of subtree size,
+ * not literally one store). Each of these ops also unlinks content
+ * from a source trie (graft-swap from the destination too), so —
+ * when concurrent readers are possible — it may issue a
+ * synchronize_rcu to drain readers of the unlinked content before its
+ * nodes are reclaimed. What concurrent readers see, however, is
+ * published atomically: a reader observes either the complete prior
+ * state or the complete result, never a partial state.
  *
  * - Graft (cds_ft_graft) attaches the content of a source trie
  *   at a key position in a destination trie. The destination
@@ -485,15 +483,9 @@ enum cds_ft_iter_cache_mode {
  * The node needs to be zeroed or initialized with cds_ft_node_init
  * before being inserted into a Fractal Trie.
  *
- * The first node's prev pointer points to the parent internal node
- * (a flagged pointer distinguishable via ft_node_external() returning
- * false). Non-head nodes' prev pointers point to the preceding
- * cds_ft_node in the duplicate chain.
- *
- * The prev pointer is written by the mutation side (mutex-held) and
- * read on both the write and read sides via rcu_dereference; it is not
- * accessed on the candidate lookup fast path, where RCU readers only
- * follow next pointers.
+ * The prev pointer is library-internal and must not be accessed by the
+ * application; walk duplicate chains through next, via the
+ * cds_ft_for_each_duplicate*() macros.
  *
  * Note that removal from a Fractal Trie does _not_ reset node->next,
  * because it can still be accessed by concurrent RCU readers. After
@@ -504,15 +496,7 @@ enum cds_ft_iter_cache_mode {
  * This structure is required to be naturally aligned.
  */
 struct cds_ft_node {
-	/*
-	 * prev pointer: for the head of the duplicate chain, this points
-	 * to the parent internal node (a flagged, library-internal
-	 * back-reference). For non-head duplicates, this points to the
-	 * preceding cds_ft_node. Written by the mutation side via
-	 * rcu_assign_pointer; read on the read side via rcu_dereference.
-	 * Not accessed on the candidate lookup fast path.
-	 */
-	void *prev;
+	void *prev;			/* library-internal back-reference; do not access */
 	struct cds_ft_node *next;
 };
 
@@ -530,10 +514,8 @@ struct cds_ft_node {
 #define CDS_FT_NODE_REMOVED_FLAG	1UL
 
 /*
- * Masked rcu_dereference of a duplicate's successor.  A macro (not an
- * inline) so rcu_dereference resolves at the caller's translation unit,
- * matching the cds_ft_for_each_duplicate*() macros — this header does
- * not itself pull in the URCU flavor primitives.
+ * Masked rcu_dereference of a duplicate's successor (masks the removal
+ * tombstone, CDS_FT_NODE_REMOVED_FLAG).
  */
 #define cds_ft_node_next_rcu(node)					\
 	((struct cds_ft_node *) ((uintptr_t) rcu_dereference((node)->next) \
@@ -558,19 +540,16 @@ void cds_ft_node_init(struct cds_ft_node *node)
  */
 
 /*
- * External-node arena: bump-allocator with end-of-zone over-read
- * safety, suitable for embedding application leaf structures (those
- * containing a struct cds_ft_node) when the caller needs a trailing
- * readable pad past stored keys for SIMD-friendly comparison.
+ * External-node arena with end-of-zone over-read safety, suitable for
+ * embedding application leaf structures (those containing a struct
+ * cds_ft_node) when the caller needs a trailing readable pad past
+ * stored keys for SIMD-friendly comparison.
  *
  * Pattern: app embeds struct cds_ft_node in its own leaf struct,
  * allocates each leaf from this arena via cds_ft_external_arena_alloc,
- * and inserts into the trie.  The arena grows on demand as a linked
- * list of mmap'd ranges (16 MiB each); each range reserves a
- * trailing readable pad, never handed out to any allocation, so the
- * library's SIMD leaf compare can safely over-read 32 bytes past any
- * allocation's last byte without faulting, regardless of where the
- * allocation sits within its range.
+ * and inserts into the trie.  Every allocation is guaranteed at least
+ * 32 bytes of safely-over-readable padding past its last byte, so the
+ * library's SIMD leaf compare never faults reading past a stored key.
  *
  * Lifetime: all-or-nothing.  cds_ft_external_arena_destroy frees
  * every allocation served by the arena.  The caller is responsible
