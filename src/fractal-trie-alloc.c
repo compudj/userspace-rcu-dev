@@ -1796,6 +1796,18 @@ void cds_ft_external_arena_free(struct cds_ft_external_arena *a, void *ptr)
 	if (!a || !ptr)
 		return;
 	r = ft_ext_arena_range_of(ptr);
+	/*
+	 * Read the block's cell metadata before taking a->lock.  cells[] is
+	 * otherwise mutated only under the lock, but the cell that starts an
+	 * allocated block is immutable until that block is freed: buddy merge
+	 * only combines free blocks (the merge guard below requires the buddy
+	 * be free), and split / alloc only write the cell of the block they
+	 * carve or hand out -- never an allocated block's start cell.  The
+	 * caller owns @ptr's still-allocated block (freeing an unowned or
+	 * already-freed pointer is caller misuse, caught by the assert below),
+	 * so no other thread can be writing this cell concurrently and the
+	 * order decoded here is still valid once the lock is held.
+	 */
 	cell = r->cells[ft_ext_arena_cell_index(ptr)];
 	order = ft_ext_arena_cell_order(cell);
 	/*
