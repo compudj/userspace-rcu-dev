@@ -65,18 +65,14 @@
  * within the same group. The write-side cost is more than a
  * pointer store — descent to the operation point, key-count
  * propagation up the destination's ancestors, allocation of the
- * result-trie wrapper for detach, metadata fix-up, and the
- * spine-copy build when a merge lands on a non-empty destination.
- * Each of these ops also unlinks content from a source trie
- * (graft-swap from the destination too), so — when concurrent
- * readers are possible — it issues a synchronize_rcu to drain
- * readers of the unlinked content before its nodes are reclaimed;
- * the lone exception is merge's destination-side flip-latch commit,
- * which needs no such drain. What concurrent readers see,
- * however, is published by a single atomic commit — a pointer
- * store, or a flip-latch for the merge union case (see
- * src/urcu-flip-latch.h): a reader observes either the complete
- * prior state or the complete result, never a partial state.
+ * result-trie wrapper for detach, and metadata fix-up. Each of
+ * these ops also unlinks content from a source trie (graft-swap
+ * from the destination too), so — when concurrent readers are
+ * possible — it may issue a synchronize_rcu to drain readers of
+ * the unlinked content before its nodes are reclaimed. What
+ * concurrent readers see, however, is published atomically: a
+ * reader observes either the complete prior state or the complete
+ * result, never a partial state.
  *
  * - Graft (cds_ft_graft) attaches the content of a source trie
  *   at a key position in a destination trie. The destination
@@ -1750,28 +1746,11 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * readers of @dst_ft as a single atomic transition.  A reader
  * sees either the complete pre-merge @dst_ft or the complete
  * post-merge @dst_ft -- never a partially-applied merge, and
- * never a half-spliced duplicate chain at any key.  The merge is
- * built invisibly (no published intermediate state) and then
- * committed in one of two ways, depending on @dst_ft at @key:
- *
- *   1. Empty destination at @key: @src_ft's subtree is moved and
- *      published at @key with a single atomic pointer store -- the
- *      same primitive cds_ft_graft uses.
- *
- *   2. Non-empty destination at @key (the union case): the source
- *      subtree is spine-copied into a fresh merged cluster built
- *      off to the side, then committed by a single flip-latch
- *      store (see src/urcu-flip-latch.h).  One release store
- *      switches the merge-point forward edge together with the
- *      affected back-pointers from the old destination subtree to
- *      the merged cluster, so the whole set flips atomically for
- *      readers with no grace-period drain.  Same-key duplicate
- *      chains are concatenated as part of the committed cluster.
- *
- *   On an ordered-list group, the moved keys' ordered-list links
- *   are spliced within the same commit (pointer store or flip), so
- *   ordered iteration over @dst_ft likewise observes the merge
- *   atomically.
+ * never a half-spliced duplicate chain at any key.  Same-key
+ * duplicate chains under @key are concatenated.  On an ordered-list
+ * group the moved keys' ordered-list links are spliced as part of
+ * the same atomic commit, so ordered iteration over @dst_ft observes
+ * the merge atomically too.
  *
  * @src_ft's moved nodes are reclaimed under the usual RCU
  * discipline (deferred via call_rcu); @src_ft retains only the
@@ -1823,11 +1802,9 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * partition rename) that cannot be expressed via the public
  * cds_ft_detach + cds_ft_graft pair on fixed-length groups.
  *
- * Same algorithm and same whole-operation-atomic contract as
- * cds_ft_merge (the single-graft commit for an empty destination,
- * the flip-latch commit for the union case), with @src_key
- * selecting the source subtree to move and @dst_key serving as
- * both the destination attach point and the prefix that replaces
+ * Same whole-operation-atomic contract as cds_ft_merge, with
+ * @src_key selecting the source subtree to move and @dst_key serving
+ * as both the destination attach point and the prefix that replaces
  * @src_key on each moved key.
  *
  * Returns the same statuses as cds_ft_merge.  In addition,
