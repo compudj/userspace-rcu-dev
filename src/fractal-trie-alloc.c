@@ -237,6 +237,17 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 #endif
 
 /*
+ * MAP_NORESERVE: the arena maps are multi-MiB but fault in lazily and stay
+ * mostly untouched, so do not reserve swap/commit for them up front.  Under
+ * strict overcommit (vm.overcommit_memory=2) reserving the whole range would
+ * otherwise fail the mmap even though almost none of it ever becomes resident.
+ * Defined to 0 where the platform lacks the flag (then it is a plain map).
+ */
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE		0
+#endif
+
+/*
  * Returns 1 if the env var CDS_FT_NUMA_INTERLEAVE=0 is set — a debug
  * override telling the library to skip ALL mbind() calls regardless of
  * group policy.  Defers entirely to whatever the kernel / process
@@ -488,7 +499,7 @@ struct cds_ft_alloc_superblock *superblock_create(size_t min_size,
 	/* Round up to page boundary. */
 	size = (size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
 	base = mmap(NULL, size, PROT_READ | PROT_WRITE,
-			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (base == MAP_FAILED)
 		return NULL;
 	ft_apply_interleave(base, size, numa_policy);
@@ -559,7 +570,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	int huge = (arena->ft_group->optimize == CDS_FT_OPTIMIZE_THROUGHPUT);
 
 	raw = mmap(NULL, raw_size, PROT_READ | PROT_WRITE,
-			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (raw == MAP_FAILED)
 		return NULL;
 	base = (void *) (((uintptr_t) raw + FT_FAR_MACRO_MASK) & ~(uintptr_t) FT_FAR_MACRO_MASK);
@@ -1574,7 +1585,7 @@ ft_ext_arena_range_create(int huge)
 	struct cds_ft_external_arena_range *r;
 
 	raw = mmap(NULL, raw_size, PROT_READ | PROT_WRITE,
-		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (raw == MAP_FAILED)
 		return NULL;
 	aligned = (void *)(((uintptr_t) raw + FT_EXT_ARENA_RANGE_MASK) &
