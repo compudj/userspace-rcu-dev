@@ -36,88 +36,27 @@
  * - Lookup: At most 2 cache-line accesses per key byte.
  * - Ordered traversal: At most 3 cache-line accesses per node.
  *
- * Internal node configurations:
+ * Prefix / path compression:
  *
- * Internal nodes self-adapt to the key population using several
- * configurations (popcount-bitmap, pigeon), each with a different
- * indexing strategy suited to its child density.  The appropriate
- * configuration is chosen automatically based on the number of
- * children.  Node sizes are powers of 2 between 32 bytes and 2048
- * bytes on 64-bit architectures (1024 bytes on 32-bit).  Mutations
- * use in-place updates when possible to minimize node recompaction,
- * and hysteresis at size thresholds prevents repeated recompaction
- * when the child count oscillates near a boundary.
+ * Chains of single-child nodes along a shared prefix are
+ * path-compressed automatically and transparently; no configuration
+ * is required.  Compression can be disabled at compile time with
+ * -DNO_FEATURE_FT_COMPRESS, and the related skip-compressed lookup
+ * optimization with -DNO_FEATURE_FT_SKIP_COMPRESSED.
  *
- * The popcount-bitmap configurations (cascaded 2-level bitmaps for
- * small/medium fan-out, single 256-bit byte bitmap for large
- * fan-out) record which key bytes are populated in a fixed-position
- * bitmap and dispatch matches through a popcount-derived rank.
- * This provides a range of intermediate node sizes up to the full
- * 256-entry pigeon configuration, allowing memory-efficient
- * representation of medium-density populations without requiring
- * the full pigeon footprint.
+ * Memory use:
  *
- * Node type and configuration are encoded in the low bits of
- * child pointers (tagged pointers), so determining a node's
- * layout during lookup requires no extra memory access.
+ * Internal nodes are reclaimed via RCU (call_rcu), so readers never
+ * access freed memory even for the trie's own internal structure.
+ * Internal nodes adapt to the key population automatically; memory
+ * efficiency is comparable to adaptive radix tree schemes with no
+ * user tuning or configuration.
  *
- * Pigeon and the largest popcount-bitmap node both carry a 32-byte
- * presence bitmap that locates populated children via bit scanning,
- * reducing the number of cache-line accesses needed for ordered
- * traversal.
- *
- * Prefix compression (path compaction):
- *
- * Chains of single-child internal nodes are automatically
- * replaced with compressed path nodes that store the key bytes
- * inline with a direct child pointer. This is similar to the
- * path compaction used in Patricia tries and adaptive radix
- * trees (ART). A compressed node replaces N single-child
- * internal nodes with a single allocation storing N key bytes,
- * reducing both memory usage and traversal time for tries with
- * long shared prefixes.
- *
- * Compressed nodes are created transparently during insert when
- * a chain of two or more single-child levels would otherwise be
- * built. All mutation operations (insert, remove, graft, detach)
- * handle compressed nodes without decompressing them: inserts
- * split compressed paths at the divergence or key-endpoint,
- * removes traverse through them, and grafts split or traverse
- * as needed. Read-side operations (lookup, inequality, iteration,
- * skip, count) traverse compressed paths in O(1) per compressed
- * byte with no extra memory accesses beyond the single compressed
- * node.
- *
- * Prefix compression is enabled by default and can be disabled
- * at compile time with -DNO_FEATURE_FT_COMPRESS for a simpler
- * trie with no path compaction. The pointer tag encoding uses
- * bit 1 for the compressed flag (0b10), orthogonal to the
- * internal flag in bit 0 (0b01), and the external tag (0b00).
- *
- * 64-bit architectures with unused pointer high bits allow
- * candidate and speculative lookups to skip over compressed nodes
- * without loading their node through a "skip compress" mechanism.
- * Skipping compressed nodes can be disabled at compile time with
- * -DNO_FEATURE_FT_SKIP_COMPRESSED.
- *
- * Memory layout:
- *
- * Per-node metadata is stored in a separate page via a strided
- * allocator and reached by pointer offset from the node address,
- * keeping metadata out of the node's cache lines. This avoids
- * padding overhead within nodes and ensures that lookups and
- * traversals only touch the data they need. Internal nodes are
- * reclaimed via RCU (call_rcu), so readers never access freed
- * memory even for the trie's own internal structure.
- *
- * This provides memory efficiency comparable to adaptive radix
- * tree schemes without requiring user tuning or configuration.
- *
- * An important effect of this strided allocator segmentation between
- * fast-path data and slow-path metadata is that memory use (RSS)
- * does not reflect the actual *cache hot* working set. Fractal Trie
- * can therefore achieve denser cache-hot working set than other trie
- * implementations even though its RSS is higher.
+ * Because node metadata is kept separate from the node data the
+ * lookup hot path touches, resident memory (RSS) does not reflect the
+ * actual *cache-hot* working set: Fractal Trie can keep a denser
+ * cache-hot set than other trie implementations even though its RSS
+ * is higher.
  *
  * Graft, graft-swap, detach, and merge:
  *
