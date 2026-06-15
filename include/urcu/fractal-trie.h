@@ -612,7 +612,8 @@ enum cds_ft_optimize {
 /*
  * cds_ft_external_arena_attr_create - Allocate a default external-arena attr
  * (CDS_FT_OPTIMIZE_THROUGHPUT).  Destroy with
- * cds_ft_external_arena_attr_destroy.  Returns CDS_FT_STATUS_OK on success.
+ * cds_ft_external_arena_attr_destroy.  Returns CDS_FT_STATUS_OK on success,
+ * or CDS_FT_STATUS_MEMORY_ERROR on allocation failure.
  */
 enum cds_ft_status cds_ft_external_arena_attr_create(
 		struct cds_ft_external_arena_attr **attr);
@@ -2660,6 +2661,7 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
  * batched ordered scan use the cell batch (cds_ft_cell_get_key()) instead.
  *
  * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @node is NULL.
  * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the buffer is too small.
  * Returns CDS_FT_STATUS_NOT_FOUND if the group has neither an in-leaf key nor
  * an ordered list, so a key cannot be materialized from a node alone.
@@ -2752,8 +2754,8 @@ size_t cds_ft_cell_node_offset(void);
  * companion to the cell batch).  Same key sources as cds_ft_node_get_key.
  * Same RCU contract as cds_ft_cell_next_batch().
  *
- * Returns CDS_FT_STATUS_OK, or CDS_FT_STATUS_OVERFLOW_ERROR if @result_key is
- * too small.
+ * Returns CDS_FT_STATUS_OK, CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @cell is
+ * NULL, or CDS_FT_STATUS_OVERFLOW_ERROR if @result_key is too small.
  */
 enum cds_ft_status cds_ft_cell_get_key(const struct cds_ft *ft,
 		const struct cds_ft_cell *cell, uint8_t *result_key,
@@ -3200,7 +3202,9 @@ struct cds_ft_compact_state;
  * cds_ft_compact_begin - Start a resumable compaction of @ft.
  *
  * Returns an opaque state to drive with cds_ft_compact_step, or NULL on
- * allocation failure. The returned state must be released with
+ * allocation failure or if a compaction is already in progress on @ft
+ * (only one may be in flight per trie at a time; end the current one with
+ * cds_ft_compact_end first). The returned state must be released with
  * cds_ft_compact_end.
  */
 struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft);
