@@ -2223,45 +2223,22 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  * @opt: One of enum cds_ft_lookup_optimization
  *       (SPECULATIVE or EAGER).
  *
- * Defaults to CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE when the group attr is
- * freshly created.  Callers that need strict eager descent (per-step
- * exact compare via cds_ft_eager_lookup_key, no skip-compressed
- * encoding) should select CDS_FT_LOOKUP_OPTIMIZE_EAGER explicitly.
+ * SPECULATIVE is the default for a freshly created group attr and the
+ * faster descent; it skips redundant work at compressed nodes.  EAGER
+ * does a strict per-step exact compare at every node (via
+ * cds_ft_eager_lookup_key); select it explicitly if you need that.
+ * Both modes return identical results and differ only in descent cost.
  *
- * Speculative mode at the implementation level:
- *
- *   Speculative descent skips byte comparisons at compressed nodes.
- *   On architectures where the skip-compressed pointer encoding is
- *   available (64-bit with sufficient free high pointer bits), the
- *   compressed-node cache line is also bypassed entirely: the
- *   compressed path length and child pointer are encoded in the
- *   parent slot.  Compressed paths longer than the architecture
- *   limit fall back to traditional compressed node pointers
- *   transparently.  On architectures without the encoding, the
- *   compressed cache line is still loaded but no byte comparison
- *   runs — speculative descent still wins versus eager mode.
- *
- *   Caller requirement (skip-compressed-capable archs only):
- *   external node pointers (struct cds_ft_node *) stored in the
- *   trie must not carry metadata in their upper bits.  Pointer
- *   authentication (AArch64 PAC) or memory tagging (MTE)
- *   signatures must be stripped before the pointer is passed to
- *   the trie insertion API.
- *
- * Eager mode at the implementation level:
- *
- *   Precise descent reads compressed nodes via direct pointers; no
- *   skip-encoded unwrap is needed before fetching the node.
- *   cds_ft_lookup_candidate_key and cds_ft_speculative_lookup_key
- *   continue to work on eager-tuned tries but lose the
- *   skip-compressed encoding's CL bypass on supported archs.
+ * Requirement: on 64-bit architectures where SPECULATIVE uses the
+ * skip-compressed encoding (which stores data in unused high pointer
+ * bits), the external node pointers (struct cds_ft_node *) stored in
+ * the trie must not carry metadata in their upper bits -- strip any
+ * pointer authentication (AArch64 PAC) or memory tagging (MTE)
+ * signature before passing the pointer to the insertion API.
  *
  * Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @opt value.
- * Never returns NOT_SUPPORTED: both modes work on every arch.  On
- * architectures without skip-compressed support, OPTIMIZE_SPECULATIVE
- * loses only the compressed-CL bypass; the per-step byte-compare
- * skip is unaffected.
+ * Never returns NOT_SUPPORTED: both modes work on every architecture.
  */
 enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
 		struct cds_ft_group_attr *attr,
