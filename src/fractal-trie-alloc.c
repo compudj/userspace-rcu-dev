@@ -507,7 +507,7 @@ struct cds_ft_alloc_superblock *superblock_create(size_t min_size,
 
 	size = FT_SUPERBLOCK_SIZE > min_size ? FT_SUPERBLOCK_SIZE : min_size;
 	/* Round up to page boundary. */
-	size = (size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
+	size = (size + cds_ft_get_page_size() - 1) & ~(cds_ft_get_page_size() - 1);
 	base = mmap(NULL, size, PROT_READ | PROT_WRITE,
 			MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (base == MAP_FAILED)
@@ -572,7 +572,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	 * carved from a superblock.
 	 */
 	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
-	size_t mapped = (alloc_size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
+	size_t mapped = (alloc_size + cds_ft_get_page_size() - 1) & ~(cds_ft_get_page_size() - 1);
 	size_t raw_size = mapped + FT_FAR_MACRO_SIZE;
 	struct cds_ft_alloc_range *range;
 	void *raw, *base;
@@ -602,7 +602,7 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	return range;
 #else
 	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
-	size_t alloc_size_aligned = (alloc_size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
+	size_t alloc_size_aligned = (alloc_size + cds_ft_get_page_size() - 1) & ~(cds_ft_get_page_size() - 1);
 	struct cds_ft_alloc_superblock *sb;
 	struct cds_ft_alloc_range *range;
 	void *ptr;
@@ -625,7 +625,7 @@ carve:
 	ptr = (char *) sb->base + sb->used;
 	sb->used += alloc_size_aligned;
 	/* mmap'd anonymous pages are zero-initialized; no memset needed. */
-	range = (struct cds_ft_alloc_range *) ((char *) ptr + cds_ft_page_size);
+	range = (struct cds_ft_alloc_range *) ((char *) ptr + cds_ft_get_page_size());
 	range->arena = arena;
 	/* next_unused / nr_live / free_list_head are zero from the fresh mmap. */
 	CDS_INIT_LIST_HEAD(&range->partial_node);
@@ -647,7 +647,7 @@ void range_destroy(struct cds_ft_alloc_range *range)
 	{
 		size_t alloc_size = cds_ft_arena_range_alloc_size(
 				range->arena->item_len_order, range->arena->bitmap);
-		size_t mapped = (alloc_size + cds_ft_page_size - 1) & ~(cds_ft_page_size - 1);
+		size_t mapped = (alloc_size + cds_ft_get_page_size() - 1) & ~(cds_ft_get_page_size() - 1);
 
 		/* base == range - 2 MiB (items occupy the leading 2 MiB). */
 		(void) munmap((char *) range - FT_FAR_MACRO_SIZE, mapped);
@@ -761,11 +761,12 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	struct cds_ft_alloc_arena *arena;
 	size_t max_items_per_range;
 
-	if (!cds_ft_page_size)
-		cds_ft_page_size = urcu_get_page_len();
+	if (!uatomic_load(&cds_ft_page_size, CMM_RELAXED))
+		uatomic_store(&cds_ft_page_size, urcu_get_page_len(),
+				CMM_RELAXED);
 
 	/* Reject page sizes larger than the compile-time maximum. */
-	if (cds_ft_page_size > (1UL << FT_MAX_PAGE_ORDER)) {
+	if (cds_ft_get_page_size() > (1UL << FT_MAX_PAGE_ORDER)) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -776,13 +777,13 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	 * size at runtime.  Reject otherwise — a mismatch would corrupt
 	 * item-to-metadata address derivation on the read-side fast path.
 	 */
-	if (cds_ft_page_size != FT_PAGE_SIZE_FIXED) {
+	if (cds_ft_get_page_size() != FT_PAGE_SIZE_FIXED) {
 		errno = EINVAL;
 		return NULL;
 	}
 #endif
 	/* item_len must be no larger than cds_ft_page_size. */
-	if ((1UL << item_len_order) > cds_ft_page_size) {
+	if ((1UL << item_len_order) > cds_ft_get_page_size()) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -797,11 +798,11 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 		return NULL;
 	}
 #else
-	max_items_per_range = cds_ft_page_size >> item_len_order;
+	max_items_per_range = cds_ft_get_page_size() >> item_len_order;
 	/* Ensure that range header, metadata array and bitmaps fit in a page. */
 	if (bitmap && (sizeof(struct cds_ft_alloc_range) +
 			max_items_per_range * (sizeof(struct cds_ft_metadata_alloc) +
-				sizeof(struct cds_ft_bitmap)) > cds_ft_page_size)) {
+				sizeof(struct cds_ft_bitmap)) > cds_ft_get_page_size())) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -1140,9 +1141,10 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 		cds_ft_fault_alloc_countdown--;
 	}
 #endif
-	if (!cds_ft_page_size)
-		cds_ft_page_size = urcu_get_page_len();
-	if ((1UL << item_len_order) > cds_ft_page_size) {
+	if (!uatomic_load(&cds_ft_page_size, CMM_RELAXED))
+		uatomic_store(&cds_ft_page_size, urcu_get_page_len(),
+				CMM_RELAXED);
+	if ((1UL << item_len_order) > cds_ft_get_page_size()) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -1717,8 +1719,9 @@ struct cds_ft_external_arena *cds_ft_external_arena_create(
 	struct cds_ft_external_arena *a;
 	int i;
 
-	if (!cds_ft_page_size)
-		cds_ft_page_size = urcu_get_page_len();
+	if (!uatomic_load(&cds_ft_page_size, CMM_RELAXED))
+		uatomic_store(&cds_ft_page_size, urcu_get_page_len(),
+				CMM_RELAXED);
 	a = calloc(1, sizeof(*a));
 	if (!a)
 		return NULL;

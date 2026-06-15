@@ -1167,7 +1167,14 @@ static inline size_t cds_ft_get_page_size(void)
 #ifdef FT_PAGE_SIZE_FIXED
 	return FT_PAGE_SIZE_FIXED;
 #else
-	return cds_ft_page_size;
+	/*
+	 * cds_ft_page_size is lazily initialized with an atomic check-and-set
+	 * (see the allocator entry points) and never changes afterward, so a
+	 * relaxed load suffices: it cannot tear and carries no dependent data.
+	 * Routing every read through this accessor keeps all accesses to the
+	 * global atomic.
+	 */
+	return uatomic_load(&cds_ft_page_size, CMM_RELAXED);
 #endif
 }
 
