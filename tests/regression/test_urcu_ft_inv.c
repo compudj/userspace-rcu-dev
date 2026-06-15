@@ -5381,6 +5381,17 @@ static void bulk_remove4(struct cds_ft *ft, struct cds_ft_iter *iter, uint32_t v
 extern void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
 		unsigned long *allocated, unsigned long *freed) __attribute__((weak));
 
+/*
+ * DEBUG_COUNTERS-only group node-balance accessor (weak: NULL on a library
+ * built without DEBUG_COUNTERS, in which case the node-balance assertion is
+ * skipped).  Lets the bulk test confirm internal/compressed nodes are
+ * reclaimed by a drained destroy across all the bulk-op node moves (a graft
+ * allocates a node accounted to one trie and frees it accounted to another,
+ * so the balance is only meaningful at group granularity).
+ */
+extern void cds_ft_debug_node_balance(const struct cds_ft_group *group,
+		unsigned long *allocated, unsigned long *freed) __attribute__((weak));
+
 static void bulk_drain(struct cds_ft *ft)
 {
 	struct cds_ft_iter *iter;
@@ -5653,6 +5664,22 @@ static int inv_ordered_bulk_consistency(void)
 		if (ca != cf) {
 			fprintf(stderr, "inv_ordered_bulk_consistency: cell leak "
 				"alloc %lu != freed %lu\n", ca, cf);
+			ret = -1;
+		}
+	}
+	/*
+	 * Same idea for the library's internal/compressed structural nodes:
+	 * the bulk ops migrate nodes between the group's tries, so a drained
+	 * destroy of every trie must leave the group-scoped node balance at
+	 * zero.  Read before cds_ft_group_destroy frees the group.
+	 */
+	if (cds_ft_debug_node_balance) {
+		unsigned long na = 0, nf = 0;
+
+		cds_ft_debug_node_balance(group, &na, &nf);
+		if (na != nf) {
+			fprintf(stderr, "inv_ordered_bulk_consistency: internal node leak "
+				"alloc %lu != freed %lu\n", na, nf);
 			ret = -1;
 		}
 	}

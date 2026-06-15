@@ -676,6 +676,18 @@ struct cds_ft_group {
 	 * issued.
 	 */
 	unsigned long nr_cells_allocated, nr_cells_freed;
+	/*
+	 * Node leak accounting (ft_debug_counters only).  Like the cells
+	 * above, internal and compressed nodes migrate between the group's
+	 * tries via the bulk ops (a graft allocates a node accounted to the
+	 * source trie and frees it accounted to the destination), so a
+	 * per-trie balance reports false leaks; the balance is meaningful
+	 * only at group granularity.  cds_ft_group_destroy reports a
+	 * mismatch once every trie has drained its deferred frees.
+	 */
+	unsigned long nr_nodes_allocated, nr_nodes_freed;
+	unsigned long nr_internal_alloc, nr_internal_freed;
+	unsigned long nr_compressed_alloc, nr_compressed_freed;
 	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */
@@ -874,11 +886,6 @@ struct cds_ft {
 	unsigned long excl_writer_depth;
 	unsigned long excl_nr_readers;
 #endif
-
-	/* For debugging */
-	unsigned long nr_nodes_allocated, nr_nodes_freed;
-	unsigned long nr_internal_alloc, nr_internal_freed;
-	unsigned long nr_compressed_alloc, nr_compressed_freed;
 
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*

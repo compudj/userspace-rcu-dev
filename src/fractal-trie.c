@@ -3161,8 +3161,8 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 	 * lookups return NULL; nr_child derived from popcount returns 0).
 	 */
 	if (ft_debug_counters()) {
-		uatomic_inc(&ft->nr_nodes_allocated);
-		uatomic_inc(&ft->nr_internal_alloc);
+		uatomic_inc(&ft->group->nr_nodes_allocated);
+		uatomic_inc(&ft->group->nr_internal_alloc);
 	}
 	*_metadata = metadata;
 	return p;
@@ -3175,8 +3175,8 @@ void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 
 	cds_ft_free_item(ft, metadata);
 	if (ft_debug_counters() && node) {
-		uatomic_inc(&ft->nr_nodes_freed);
-		uatomic_inc(&ft->nr_internal_freed);
+		uatomic_inc(&ft->group->nr_nodes_freed);
+		uatomic_inc(&ft->group->nr_internal_freed);
 	}
 }
 
@@ -3193,8 +3193,8 @@ void free_cds_ft_node_unpublished(struct cds_ft *ft, struct cds_ft_inode *node)
 
 	cds_ft_free_item_unpublished(ft, metadata);
 	if (ft_debug_counters() && node) {
-		uatomic_inc(&ft->nr_nodes_freed);
-		uatomic_inc(&ft->nr_internal_freed);
+		uatomic_inc(&ft->group->nr_nodes_freed);
+		uatomic_inc(&ft->group->nr_internal_freed);
 	}
 }
 
@@ -3228,8 +3228,8 @@ struct cds_ft_compressed_node *alloc_compressed_node(struct cds_ft *ft,
 		return NULL;
 	p = cds_ft_metadata_to_item(metadata);
 	if (ft_debug_counters()) {
-		uatomic_inc(&ft->nr_nodes_allocated);
-		uatomic_inc(&ft->nr_compressed_alloc);
+		uatomic_inc(&ft->group->nr_nodes_allocated);
+		uatomic_inc(&ft->group->nr_compressed_alloc);
 	}
 	*_metadata = metadata;
 	return p;
@@ -3245,8 +3245,8 @@ void free_compressed_node(struct cds_ft *ft,
 	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(node));
 	cds_ft_free_item(ft, metadata);
 	if (ft_debug_counters() && node) {
-		uatomic_inc(&ft->nr_nodes_freed);
-		uatomic_inc(&ft->nr_compressed_freed);
+		uatomic_inc(&ft->group->nr_nodes_freed);
+		uatomic_inc(&ft->group->nr_compressed_freed);
 	}
 }
 
@@ -3265,8 +3265,8 @@ void free_compressed_node_unpublished(struct cds_ft *ft,
 	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(node));
 	cds_ft_free_item_unpublished(ft, metadata);
 	if (ft_debug_counters() && node) {
-		uatomic_inc(&ft->nr_nodes_freed);
-		uatomic_inc(&ft->nr_compressed_freed);
+		uatomic_inc(&ft->group->nr_nodes_freed);
+		uatomic_inc(&ft->group->nr_compressed_freed);
 	}
 }
 
@@ -21901,7 +21901,9 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 	/*
 	 * All tries are destroyed (nr_ft_instances == 0) and each
 	 * cds_ft_destroy drained its deferred frees, so every ordered-list
-	 * cell that was allocated should have had its free issued.
+	 * cell and every internal/compressed node that was allocated should
+	 * have had its free issued.  Both balances are group-scoped because
+	 * the bulk ops migrate cells and nodes between the group's tries.
 	 */
 	if (ft_debug_counters() &&
 	    ft_group->nr_cells_allocated != ft_group->nr_cells_freed) {
@@ -21909,6 +21911,18 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
 			"[error] Fractal Trie leaked %ld ordered-list cells. Allocated: %lu, freed: %lu.\n",
 			(long) (ft_group->nr_cells_allocated - ft_group->nr_cells_freed),
 			ft_group->nr_cells_allocated, ft_group->nr_cells_freed);
+	}
+	if (ft_debug_counters() &&
+	    ft_group->nr_nodes_allocated != ft_group->nr_nodes_freed) {
+		fprintf(stderr, "[error] Fractal Trie leaked %ld nodes. Allocated: %lu, freed: %lu.\n",
+			(long) (ft_group->nr_nodes_allocated - ft_group->nr_nodes_freed),
+			ft_group->nr_nodes_allocated, ft_group->nr_nodes_freed);
+		fprintf(stderr, "  internal: alloc=%lu freed=%lu leaked=%ld\n",
+			ft_group->nr_internal_alloc, ft_group->nr_internal_freed,
+			(long) (ft_group->nr_internal_alloc - ft_group->nr_internal_freed));
+		fprintf(stderr, "  compressed: alloc=%lu freed=%lu leaked=%ld\n",
+			ft_group->nr_compressed_alloc, ft_group->nr_compressed_freed,
+			(long) (ft_group->nr_compressed_alloc - ft_group->nr_compressed_freed));
 	}
 	cds_ft_free_all_arenas(ft_group);
 	pthread_mutex_destroy(&ft_group->arena_lock);
@@ -21934,6 +21948,25 @@ void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
 		*allocated = group->nr_cells_allocated;
 	if (freed)
 		*freed = group->nr_cells_freed;
+}
+
+/*
+ * DEBUG_COUNTERS-only node leak introspection (no public header decl; tests
+ * weak-reference it).  Reports the group's internal/compressed node alloc /
+ * free balance.  Nodes migrate between the group's tries via the bulk ops, so
+ * the balance is meaningful only at group granularity; after every trie is
+ * drained @allocated should equal @freed.  Caller must ensure no concurrent
+ * node mutation.
+ */
+void cds_ft_debug_node_balance(const struct cds_ft_group *group,
+		unsigned long *allocated, unsigned long *freed);
+void cds_ft_debug_node_balance(const struct cds_ft_group *group,
+		unsigned long *allocated, unsigned long *freed)
+{
+	if (allocated)
+		*allocated = group->nr_nodes_allocated;
+	if (freed)
+		*freed = group->nr_nodes_freed;
 }
 #endif
 
@@ -22012,31 +22045,6 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	return CDS_FT_STATUS_OK;
 }
 
-static
-void ft_final_checks(struct cds_ft *ft)
-{
-	unsigned long na, nf;
-
-	if (!ft_debug_counters())
-		return;
-
-	na = uatomic_read(&ft->nr_nodes_allocated);
-	nf = uatomic_read(&ft->nr_nodes_freed);
-
-	if (na != nf) {
-		fprintf(stderr, "[error] Fractal Trie leaked %ld nodes. Allocated: %lu, freed: %lu.\n",
-			(long) na - nf, na, nf);
-		fprintf(stderr, "  internal: alloc=%lu freed=%lu leaked=%ld\n",
-			uatomic_read(&ft->nr_internal_alloc),
-			uatomic_read(&ft->nr_internal_freed),
-			(long)(uatomic_read(&ft->nr_internal_alloc) - uatomic_read(&ft->nr_internal_freed)));
-		fprintf(stderr, "  compressed: alloc=%lu freed=%lu leaked=%ld\n",
-			uatomic_read(&ft->nr_compressed_alloc),
-			uatomic_read(&ft->nr_compressed_freed),
-			(long)(uatomic_read(&ft->nr_compressed_alloc) - uatomic_read(&ft->nr_compressed_freed)));
-	}
-}
-
 /*
  * There should be no more concurrent add, delete, nor look-up performed
  * on the Fractal Trie while it is being destroyed (ensured by the
@@ -22062,9 +22070,13 @@ void cds_ft_destroy(struct cds_ft *ft)
 	FT_TP(ft_destroy, (const void *) ft);
 	/* Free root node. No concurrent readers at this point. */
 	free_cds_ft_node(ft, ft_node_ptr(ft->root));
-	/* Wait for in-flight call_rcu free to complete. */
+	/*
+	 * Wait for in-flight call_rcu free to complete, so every deferred
+	 * node free this trie issued is counted (group-scoped) before the
+	 * trie's instance count is dropped.  The group-level node-leak check
+	 * runs in cds_ft_group_destroy, once all tries have drained.
+	 */
 	flavor->barrier();
-	ft_final_checks(ft);
 	if (ft->ord_cell_scratch_iter)
 		cds_ft_iter_destroy(ft->ord_cell_scratch_iter);
 	uatomic_dec(&ft->group->nr_ft_instances, CMM_RELAXED);
@@ -23158,8 +23170,8 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(cn));
 	cds_ft_free_item_deferred(ft, cn_meta);
 	if (ft_debug_counters()) {
-		uatomic_inc(&ft->nr_nodes_freed);
-		uatomic_inc(&ft->nr_compressed_freed);
+		uatomic_inc(&ft->group->nr_nodes_freed);
+		uatomic_inc(&ft->group->nr_compressed_freed);
 	}
 	return cn2;
 }
