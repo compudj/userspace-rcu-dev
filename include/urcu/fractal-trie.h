@@ -1874,9 +1874,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
  * by the caller).
  *
  * The trie should be drained first: destroying a non-empty trie does
- * not reclaim its remaining internal nodes and ordered-list cells
- * (they stay in the group-shared arenas until the group itself is
- * destroyed) and leaves the application's external nodes unreachable
+ * not reclaim its remaining internal nodes and ordered-list cells, and
+ * leaves the application's external nodes unreachable
  * with their linkage fields dangling.  See the "Efficient
  * bulk-removal pattern" above for draining a trie with a single
  * grace period.
@@ -1904,9 +1903,7 @@ bool cds_ft_empty(struct cds_ft *ft);
  * @ft: The Fractal Trie.
  *
  * Returns the number of distinct keys that have at least one external
- * node. Duplicates at the same key are counted as one. The count is
- * maintained via per-node subtree counters propagated upward on each
- * mutation.
+ * node. Duplicates at the same key are counted as one.
  *
  * This function has O(1) time complexity. The RCU read-side lock must
  * be held while calling this function. Concurrent updates may occur,
@@ -2428,8 +2425,9 @@ void cds_ft_make_exclusive(struct cds_ft *ft);
  * handle to reader threads.
  *
  * After this call, graft / graft_swap operations with this trie as
- * source will internally synchronize_rcu() to drain readers before
- * re-parenting the content into another trie.
+ * source must drain readers (one grace period) before moving the
+ * content elsewhere -- unlike an exclusive trie, which skips that
+ * drain.
  */
 void cds_ft_make_concurrent(struct cds_ft *ft);
 
@@ -2484,22 +2482,17 @@ bool cds_ft_verify_at_mutation_enabled(void);
  *                                        sampling period for @ft.
  *
  * When the library is built with -DFEATURE_FT_VERIFY_AT_MUTATION,
- * the writer scope-exit hook runs cds_ft_verify once every @period
- * mutations:
+ * cds_ft_verify is run automatically once every @period mutations:
  *
- *   period == 0 : disable the verify walk on this trie (the
- *                 increment-and-compare in the hook still runs);
+ *   period == 0 : disable the verify walk on this trie;
  *   period == 1 : verify every mutation (the historical
  *                 -DFEATURE_FT_VERIFY_AT_MUTATION cadence; this is
  *                 the default at cds_ft_create() time);
  *   period >  1 : verify every @period mutations — useful on large
  *                 tries where O(N) per mutation is impractical.
  *
- * The internal counter is reset to 0 on each period boundary, so it
- * never exceeds @period - 1 and there is no overflow / cadence-drift
- * concern on long-running workloads.  Setting a new period also
- * resets the counter, so the next verify lands @period mutations
- * from now.
+ * Setting a new period resets the cadence, so the next verify lands
+ * @period mutations from now.
  *
  * Returns CDS_FT_STATUS_OK on success, or
  * CDS_FT_STATUS_NOT_SUPPORTED when the library was built without
@@ -3082,14 +3075,9 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t 
  * @out: File stream for diagnostic output on failure (may be NULL
  *       to suppress output).
  *
- * Recursively walks every internal and compressed node starting
- * from the root, checking that:
- * - nr_child matches the actual count of non-NULL child slots.
- * - nr_keys equals the sum of children's nr_keys plus the count
- *   of unique keys from local external node chains.
- * - Parent pointers of children point back to the correct parent.
- * - Compressed node invariants (len >= 1, no external_nodes on
- *   the compressed node itself).
+ * Walks the whole trie checking its internal structural invariants
+ * (child and key counts, parent back-pointers, compressed-node
+ * invariants).
  *
  * Must be called with mutual exclusion wrt updaters.
  *
@@ -3101,10 +3089,8 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
 /*
  * cds_ft_compact - Defragment a trie's internal-node arenas in place.
  *
- * Relocates every internal node into freshly-allocated, densely-packed slots
- * in descent order; the now-empty source ranges drain and their memory is
- * reclaimed. Recovers the descent locality and resident memory that churn or
- * graft-based population fragmentation cost over time.
+ * Recovers the descent locality and resident memory that churn or
+ * graft-based population fragmentation cost a trie over time.
  *
  * One-shot convenience wrapper around cds_ft_compact_begin/step/end: the
  * caller must exclude concurrent writers on @ft for the whole call (the same
@@ -3137,9 +3123,9 @@ void cds_ft_compact(struct cds_ft *ft);
  * Lets a long compaction be interleaved with concurrent mutations of the
  * SAME trie: the caller drives it, holding its writer mutex only around each
  * cds_ft_compact_step and releasing it between steps so other writers (and
- * grace periods that drain reclaimed ranges) get a window. Each step uses the
- * leaf key reached so far as a resume cursor and re-descends from the root, so
- * it tolerates the structure changing between steps.
+ * grace periods that drain reclaimed ranges) get a window. Each step
+ * tolerates the structure changing between steps (a writer may mutate
+ * the trie while the lock is dropped).
  *
  *   struct cds_ft_compact_state *st = cds_ft_compact_begin(ft);
  *   do {
