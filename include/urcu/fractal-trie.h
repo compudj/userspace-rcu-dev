@@ -679,11 +679,9 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  * @key_readable_pad: Number of bytes guaranteed safely loadable PAST
  *                    the last byte of @key (i.e. starting at
  *                    key + key_len) without faulting.  0 means "no
- *                    over-read promised"; the library uses a
- *                    page-cross-safe fallback compare.  Values >= 32
- *                    let the library use unmasked SIMD loads on the
- *                    input side, avoiding page-cross checks on the
- *                    hot path.  A memory allocator that gives every
+ *                    over-read promised" (the safe default); a value
+ *                    >= 32 lets the library use its fastest comparison
+ *                    path.  A memory allocator that gives every
  *                    allocation a non-faulting trailing region (e.g.
  *                    cds_ft_external_arena, whose per-range trailing
  *                    bytes are reserved as a never-allocated but mapped
@@ -698,13 +696,12 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  * @result_node: Candidate node output. Set to a node if a candidate is
  *               found, or NULL if not found or on error.
  *
- * The fastest lookup: the descent skips key comparison at compressed
- * nodes, so the returned node is a CANDIDATE that may not be an exact
- * match.  The caller MUST compare the returned node's key against the
- * lookup key to confirm; if the keys do not match, the lookup key is
- * not in the trie.  cds_ft_speculative_lookup_key wraps this with the
- * validating compare and is the recommended entry point for callers
- * that want an exact match.
+ * The fastest lookup: the returned node is a CANDIDATE that may not be
+ * an exact match.  The caller MUST compare the returned node's key
+ * against the lookup key to confirm; if the keys do not match, the
+ * lookup key is not in the trie.  cds_ft_speculative_lookup_key wraps
+ * this with the validating compare and is the recommended entry point
+ * for callers that want an exact match.
  *
  * Returns CDS_FT_STATUS_OK on success (candidate found),
  * CDS_FT_STATUS_NOT_FOUND if no candidate, or a negative cds_ft_status
@@ -735,18 +732,10 @@ enum cds_ft_status cds_ft_lookup_candidate_key(struct cds_ft *ft,
  * @result_node: Result output. Set to the matched node on OK, NULL on
  *               NOT_FOUND.
  *
- * Equivalent to cds_ft_lookup_candidate_key followed by a memcmp
- * against the candidate's stored key bytes.  Inlined into the caller
- * so the offset and length are visible to the compiler at the compare
- * site (typically allowing constant-folding when the caller knows
- * them).  The validation memcmp uses libc's optimized variant (e.g.
- * EVEX/AVX-512 on x86) resolved through the PLT at runtime.
- *
- * Validation is done caller-side (this memcmp) rather than in the
- * descent function, so the library pays no inline SIMD validation cost
- * on the hot path and the caller's memcmp inlines at the use site where
- * @key_offset and @key_len are typically constant.  cds_ft_eager_lookup_key
- * returns the same result with library-side validation instead.
+ * Equivalent to cds_ft_lookup_candidate_key followed by a memcmp of
+ * @key against the candidate's stored key bytes (at @key_offset).
+ * cds_ft_eager_lookup_key returns the same result with library-side
+ * validation instead.
  *
  * Returns CDS_FT_STATUS_OK on success (match found),
  * CDS_FT_STATUS_NOT_FOUND if no match, or a negative cds_ft_status
@@ -1092,8 +1081,8 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * operations (cds_ft_lookup_first, cds_ft_next) and while accessing
  * the returned node. For CDS_FT_ITER_CACHED iterators, this
  * means the RCU read-side critical section must span the entire
- * loop, since the cached position references internal nodes that
- * could be reclaimed after a grace period. For
+ * loop, since the cached position can reference memory reclaimed
+ * after a grace period. For
  * CDS_FT_ITER_UNCACHED iterators, the lock may be dropped and
  * reacquired within the loop body, because the cached position is
  * discarded after each operation:
@@ -1159,13 +1148,11 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * Batched in-order traversal built on the iterator-free cds_ft_cell_next_batch():
  * it refills @buf one library call per @cap cells and iterates it INLINE, so the
  * ordered cell-list walk pays the call boundary once per batch instead of once
- * per cell.  There is NO iterator object in scope -- the loop carries only a
- * hidden CELL cursor (self-sufficient as a resume token, so the walk touches no
- * external-head node body) -- so none of the stale-position hazards of an
- * iterator apply.  From @cell, recover the head node with cds_ft_cell_node(@cell,
- * off) (off = cds_ft_cell_node_offset(), cached once outside the loop) and the
- * key with cds_ft_cell_get_key(ft, @cell, ...).  A key-only scan that never calls
- * cds_ft_cell_node() touches NO external-head cachelines at all.
+ * per cell.  There is NO iterator object in scope, so none of the
+ * stale-position hazards of an iterator apply.  From @cell, recover the
+ * head node with cds_ft_cell_node(@cell, off) (off =
+ * cds_ft_cell_node_offset(), cached once outside the loop) and the key
+ * with cds_ft_cell_get_key(ft, @cell, ...).
  *
  * ORDERED-LIST ONLY: stepping in key order needs the cell list, so on a list-off
  * trie (cds_ft_group_attr_set_ordered_list(attr, false)) this loop iterates
@@ -2673,11 +2660,9 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  *
  * Walks @ft's ordered cell list without an iterator object, emitting opaque CELL
  * handles a batch at a time so the per-call boundary is paid once per @cap cells.
- * The cursor is itself a cell, so the walk is cell-native end to end: it never
- * touches an external head node, and needs no resume cache.  From each handle,
- * recover the node with cds_ft_cell_node() (cheap, off the cached
- * cds_ft_cell_node_offset()) and the key with cds_ft_cell_get_key(); a key-only
- * scan touches no external-head cachelines.  Stop when @next_cursor comes back
+ * From each handle, recover the node with cds_ft_cell_node() (off the
+ * cached cds_ft_cell_node_offset()) and the key with
+ * cds_ft_cell_get_key().  Stop when @next_cursor comes back
  * NULL (NOT when *@count is 0): a NULL cursor is BOTH the start sentinel and the
  * end signal, so terminate on the returned cursor, not the count:
  *
@@ -2719,8 +2704,8 @@ enum cds_ft_status cds_ft_cell_prev_batch(struct cds_ft *ft,
 
 /*
  * cds_ft_cell_node_offset - Byte offset of the head-node pointer within an
- * opaque cell handle.  Invariant for the process (a compile-time constant of the
- * cell layout); fetch it ONCE, cache it, and pass it to cds_ft_cell_node() per
+ * opaque cell handle.  Invariant for the process; fetch it ONCE, cache it, and
+ * pass it to cds_ft_cell_node() per
  * element with no library call.  Exposed as a runtime getter (not a header
  * constant) so the cell stays opaque and the offset is ABI-stable -- a caller
  * that fetches it at runtime keeps working if the layout ever changes.
@@ -2813,8 +2798,8 @@ enum cds_ft_status cds_ft_iter_set_prefix_len(struct cds_ft_iter *iter, size_t p
  * cds_ft_iter_reset - Reset an iterator to its initial state.
  * @iter: The iterator.
  *
- * Clears path, key, prefix, status, and node. The iterator remains
- * bound to its Fractal Trie.
+ * Clears the key, prefix, cached position, status, and result node.
+ * The iterator remains bound to its Fractal Trie.
  */
 void cds_ft_iter_reset(struct cds_ft_iter *iter);
 
