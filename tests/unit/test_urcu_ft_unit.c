@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 255
+#define NR_TESTS 256
 #else
-#define NR_TESTS 241
+#define NR_TESTS 242
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -17825,6 +17825,68 @@ out:
 }
 
 /*
+ * Compaction over skip-compressed-over-external-leaf shapes.  Keys of the form
+ * (i << 32) share a four-byte zero suffix, so each key's unique tail compresses
+ * into a skip-compressed node whose single child is the external leaf.
+ * cds_ft_compact must relocate those compressed nodes too -- recovered from the
+ * skip pointer via ft_skip_to_compressed, whose external-target back-pointer is
+ * cell-indirect -- and keep every key reachable.  A DEBUG_COUNTERS build
+ * additionally confirms the extra relocations leave no compressed-node leak
+ * once the trie drains (checked at destroy / group destroy).
+ */
+static int test_compact_skip_over_leaf(void)
+{
+	const unsigned int N = 1024;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	unsigned int i;
+	int ret = 0;
+
+	ft = create_fixed_ft(8, &group);
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc((uint64_t) i << 32);
+
+		if (insert_u64(ft, (uint64_t) i << 32, n) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compact_skip_over_leaf: insert %u failed\n", i);
+			node_free(n);
+			ret = -1;
+			goto out;
+		}
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compact_skip_over_leaf: pre-compaction verify failed\n");
+		ret = -1;
+		goto out;
+	}
+
+	cds_ft_compact(ft);
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compact_skip_over_leaf: post-compaction verify failed\n");
+		ret = -1;
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < N; i++) {
+		struct cds_ft_node *out_node = NULL;
+
+		if (lookup_u64(ft, (uint64_t) i << 32, &out_node) != CDS_FT_STATUS_OK ||
+				to_test_node(out_node)->key != ((uint64_t) i << 32)) {
+			fprintf(stderr, "compact_skip_over_leaf: key %u not found after compaction\n",
+				i);
+			ret = -1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+out:
+	drain_trie(ft);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Resumable compaction interleaved with mutations: drive begin/step/end with a
  * tiny batch and insert a fresh key between each step.  Exercises the headline
  * capability -- the cached iterator re-descending by key onto a structure that
@@ -19927,6 +19989,7 @@ int main(int argc, char **argv)
 	/* Compaction */
 	diag("Compaction tests");
 	RUN_TEST(test_compact_integrity);
+	RUN_TEST(test_compact_skip_over_leaf);
 	RUN_TEST(test_compact_concurrent_mutation);
 	RUN_TEST(test_compact_forgotten_end);
 	RUN_TEST(test_compact_exclusive);

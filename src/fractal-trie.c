@@ -23082,14 +23082,14 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
  * cds_ft_free_item), so a reader observes the old or the new node, never a
  * freed one.  Compressed nodes are relocated too, via
  * ft_compact_relocate_compressed: a traditional compressed node through its
- * grandparent slot, a skip-compressed node through the target's parent
- * back-pointer (the grandparent holds a skip pointer to the target, not to cn,
- * so it needs no repoint).  The skip target itself is then relocated through
- * cn->child, and ft_node_recompact's dual-pointer publish updates both
- * cn->child and the skip pointer.  One gap remains: a compressed node whose
- * skip target is external (a leaf) is left in place, because the descent ends
- * at the leaf before reaching the relocate call.  That only leaves that node's
- * range less compacted; correctness is unaffected.
+ * grandparent slot, a skip-compressed node recovered from its skip pointer
+ * with ft_skip_to_compressed with no grandparent repoint (the slot holds a
+ * skip pointer to the target, not to cn).  This covers a skip whose target is
+ * an external leaf: cn is relocated, the leaf is not (leaves are
+ * application-owned), and the descent ends at the loop's ft_node_external
+ * check.  An internal skip target is then relocated through cn->child, where
+ * ft_node_recompact's dual-pointer publish updates both cn->child and the skip
+ * pointer.
  */
 /* Relocate the internal node at *@holder into a fresh slot; RCU-free the old. */
 static
@@ -23267,19 +23267,21 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			return;		/* child absent (e.g. concurrent removal) */
 		depth++;		/* child-index byte (matches iter_key = *key++) */
 		if (ft_node_skip_compressed(raw)) {
-			struct cds_ft_inode_flag *target = ft_skip_child_ptr(raw);
-			struct cds_ft_compressed_node *cn;
+			struct cds_ft_compressed_node *cn =
+				ft_skip_to_compressed(ft, raw);
 
 			depth += ft_skip_len(raw);
-			if (ft_node_external(target))
-				return;
-			cn = ft_compressed_node_ptr(rcu_dereference(
-				cds_ft_item_to_metadata(ft_node_ptr(target))->parent));
 			/*
-			 * Relocate the compressed node too.  The grandparent slot
-			 * is a skip pointer addressing the target, not cn, so it
-			 * needs no repoint (NULL).  The target is then relocated via
-			 * cn->child on the next iteration.
+			 * Relocate the compressed node carrying the skip.
+			 * ft_skip_to_compressed recovers it through the child's
+			 * back-pointer, so a skip whose target is an external leaf is
+			 * handled too (its parent is cell-indirect; compaction's
+			 * writer exclusion keeps the back-pointer settled).  The
+			 * grandparent slot is a skip pointer addressing the target,
+			 * not cn, so it needs no repoint (NULL).  Continue at
+			 * cn->child: an internal target is relocated next iteration,
+			 * while an external leaf (not itself relocatable) ends the
+			 * descent at the loop's ft_node_external check.
 			 */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
