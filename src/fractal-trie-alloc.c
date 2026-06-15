@@ -216,6 +216,27 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
 #endif
 
 /*
+ * Whether MADV_DONTNEED on private anonymous memory zero-fills on refault.
+ * Linux guarantees it (madvise(2): the range reads as zero-fill-on-demand
+ * after MADV_DONTNEED), and the allocator relies on it -- a reclaimed range's
+ * node-body region is released with MADV_DONTNEED and later handed back out by
+ * the bump-allocation paths WITHOUT an explicit memset, trusting the refault
+ * to read zero (a fresh node must start zeroed).  Platforms where
+ * MADV_DONTNEED does NOT zero on refault (e.g. FreeBSD) keep the previous
+ * life's bytes instead, so there the recycled body must be cleared on reuse;
+ * ft_clear_recycled_slot does that when this is 0.
+ *
+ * NOTE: the non-Linux path is provided for correctness, but FT additionally
+ * depends on Linux-only NUMA syscalls, so non-Linux support as a whole is
+ * incomplete and UNTESTED.
+ */
+#ifdef __linux__
+#define FT_MADV_DONTNEED_ZEROES	1
+#else
+#define FT_MADV_DONTNEED_ZEROES	0
+#endif
+
+/*
  * Returns 1 if the env var CDS_FT_NUMA_INTERLEAVE=0 is set — a debug
  * override telling the library to skip ALL mbind() calls regardless of
  * group policy.  Defers entirely to whatever the kernel / process
@@ -902,9 +923,11 @@ bool cds_ft_metadata_in_recompact_private(struct cds_ft_metadata *metadata)
  * (0xfe poison written on free, or stale counts / occupancy bits).  Clearing
  * them here makes a bump slot from a recycled range equivalent to one from a
  * fresh range, the same guarantee the freelist path provides for reused slots.
- * The node body itself is not touched: it re-faults zero (DONTNEED on far,
- * fresh mmap otherwise).  alloc_index must be assigned before the bitmap
- * address is derived (cds_ft_metadata_to_item reads it).
+ * On Linux the node body itself is not touched: it re-faults zero (DONTNEED on
+ * far, fresh mmap otherwise).  On platforms where MADV_DONTNEED does not zero
+ * on refault it is cleared explicitly below (see FT_MADV_DONTNEED_ZEROES).
+ * alloc_index must be assigned before the bitmap address is derived
+ * (cds_ft_metadata_to_item reads it).
  */
 static
 void ft_clear_recycled_slot(struct cds_ft_alloc_arena *arena,
@@ -917,6 +940,17 @@ void ft_clear_recycled_slot(struct cds_ft_alloc_arena *arena,
 
 		memset(cds_ft_item_to_bitmap(p, arena->item_len_order), 0,
 				sizeof(struct cds_ft_bitmap));
+	}
+	if (!FT_MADV_DONTNEED_ZEROES) {
+		/*
+		 * Where MADV_DONTNEED does not zero on refault, a recycled
+		 * range's node body still holds the previous life's bytes, so
+		 * clear it like the freelist-reuse path does.  Compiled out on
+		 * Linux, where the body re-faults zero.
+		 */
+		void *p = cds_ft_metadata_to_item(&item->metadata);
+
+		memset(p, 0, 1UL << arena->item_len_order);
 	}
 }
 
