@@ -2633,13 +2633,13 @@ enum cds_ft_status cds_ft_iter_get_key(struct cds_ft_iter *iter,
  * @result_key_max_len: Size of the @result_key buffer.
  * @result_key_len: Length of the key written (output).
  *
- * Reconstructs @node's key without an iterator object: an in-leaf key
- * (declared via the speculative key offset) is read in place; otherwise, for an
- * ordered-list group with no in-leaf key, the key is rebuilt by the structural
- * parent up-walk -- the same sources cds_ft_iter_get_key() uses.
+ * Reconstructs @node's key without an iterator object -- the same key
+ * cds_ft_iter_get_key() would return.  The key comes from an in-leaf key when
+ * the group declares a speculative key offset, otherwise from the trie
+ * structure (ordered-list groups only).
  *
- * RCU CONTRACT: @node, and (for the up-walk) its parent chain, are valid only
- * while the RCU read-side lock that produced @node is held CONTINUOUSLY.
+ * RCU CONTRACT: @node, and the trie structure its key is read from, are valid
+ * only while the RCU read-side lock that produced @node is held CONTINUOUSLY.
  * Unlike an iterator -- which an UNCACHED caller can carry across a critical
  * section because it materializes the key into its own storage -- a bare node
  * pointer must NOT outlive its read-side critical section.  This is the
@@ -2724,11 +2724,10 @@ size_t cds_ft_cell_node_offset(void);
  * cds_ft_cell_node - Recover the head node from an opaque cell handle, given a
  * cached @node_offset from cds_ft_cell_node_offset().  A MACRO (not an inline) so
  * rcu_dereference resolves in the CALLER's translation unit, where the RCU
- * flavor is included.  No library call; reads the hot cell line, not a cold
- * node->prev.  The cell's node pointer is concurrently retargeted on
- * duplicate-head promotion / replace, so this is an rcu_dereference snapshot --
- * valid old-or-new under a continuously held read lock, like the iterator's node
- * read.  @cell and @node_offset are each evaluated once.
+ * flavor is included.  The cell's node pointer can change under concurrent
+ * mutation, so this is an rcu_dereference snapshot -- valid old-or-new under a
+ * continuously held read lock, like the iterator's node read.  @cell and
+ * @node_offset are each evaluated once.
  */
 #define cds_ft_cell_node(cell, node_offset)				\
 	((struct cds_ft_node *) rcu_dereference(			\
@@ -2737,10 +2736,8 @@ size_t cds_ft_cell_node_offset(void);
 
 /*
  * cds_ft_cell_get_key - Materialize a key from an opaque cell handle (the lazy
- * companion to the cell batch).  Same sources as cds_ft_node_get_key -- an
- * in-leaf key when configured, else the parent up-walk -- but driven from the
- * CELL, so the up-walk path never touches the external head node.  Same RCU
- * contract as cds_ft_cell_next_batch().
+ * companion to the cell batch).  Same key sources as cds_ft_node_get_key.
+ * Same RCU contract as cds_ft_cell_next_batch().
  *
  * Returns CDS_FT_STATUS_OK, or CDS_FT_STATUS_OVERFLOW_ERROR if @result_key is
  * too small.
