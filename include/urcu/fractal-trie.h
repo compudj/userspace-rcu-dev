@@ -2779,13 +2779,10 @@ enum cds_ft_status cds_ft_iter_get_prefix(struct cds_ft_iter *iter,
  * @key: The key to set.
  * @key_len: Key length in bytes.
  *
- * If the new key is a prefix of the current iterator key, the
- * cached position remains valid; otherwise it is invalidated.
- *
- * Note: Calling this function safely invalidates the cached position
- * (if the key differs). This is the required mechanism to safely
- * reuse an iterator if the RCU read-side lock was dropped since the
- * last operation.
+ * Setting a key always invalidates the iterator's cached position; the
+ * next lookup re-descends from the root by the new key.  This is the
+ * required mechanism to safely reuse an iterator after the RCU
+ * read-side lock was dropped since the last operation.
  *
  * Returns CDS_FT_STATUS_OK on success, or a negative cds_ft_status
  * on error.
