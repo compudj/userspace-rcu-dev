@@ -55,14 +55,7 @@
  * This provides a range of intermediate node sizes up to the full
  * 256-entry pigeon configuration, allowing memory-efficient
  * representation of medium-density populations without requiring
- * the full pigeon footprint.  Alternative approaches such as Judy use a population
- * bitmap with a dense child array, which requires recompacting the
- * array on every insertion or removal -- incompatible with wait-free
- * RCU lookups because a reader could observe a partially recompacted
- * array.  The popcount-bitmap approach avoids that by using fixed
- * bit positions derived from key bytes, allowing children to be
- * added or removed with single-pointer updates visible atomically
- * to concurrent readers.
+ * the full pigeon footprint.
  *
  * Node type and configuration are encoded in the low bits of
  * child pointers (tagged pointers), so determining a node's
@@ -101,6 +94,12 @@
  * bit 1 for the compressed flag (0b10), orthogonal to the
  * internal flag in bit 0 (0b01), and the external tag (0b00).
  *
+ * 64-bit architectures with unused pointer high bits allow
+ * candidate and speculative lookups to skip over compressed nodes
+ * without loading their node through a "skip compress" mechanism.
+ * Skipping compressed nodes can be disabled at compile time with
+ * -DNO_FEATURE_FT_SKIP_COMPRESSED.
+ *
  * Memory layout:
  *
  * Per-node metadata is stored in a separate page via a strided
@@ -114,18 +113,31 @@
  * This provides memory efficiency comparable to adaptive radix
  * tree schemes without requiring user tuning or configuration.
  *
- * Graft, graft-swap, and detach:
+ * An important effect of this strided allocator segmentation between
+ * fast-path data and slow-path metadata is that memory use (RSS)
+ * does not reflect the actual *cache hot* working set. Fractal Trie
+ * can therefore achieve denser cache-hot working set than other trie
+ * implementations even though its RSS is higher.
  *
- * The graft, graft-swap, and detach operations move entire
- * sub-tries between trie instances within the same group. The
- * write-side cost is more than a pointer store — descent to the
- * graft/detach point, key-count propagation up the destination's
- * ancestors, allocation of the result-trie wrapper for detach,
- * metadata fix-up, and (in detach with concurrent readers
- * possible) one synchronize_rcu before the dependent reclamation.
- * What concurrent readers see, however, is published by a single
- * atomic pointer update: a reader observes either the complete
- * sub-trie or nothing, never a partial state.
+ * Graft, graft-swap, detach, and merge:
+ *
+ * The graft, graft-swap, detach, and merge operations move (or,
+ * for merge, combine) entire sub-tries between trie instances
+ * within the same group. The write-side cost is more than a
+ * pointer store — descent to the operation point, key-count
+ * propagation up the destination's ancestors, allocation of the
+ * result-trie wrapper for detach, metadata fix-up, and the
+ * spine-copy build when a merge lands on a non-empty destination.
+ * Each of these ops also unlinks content from a source trie
+ * (graft-swap from the destination too), so — when concurrent
+ * readers are possible — it issues a synchronize_rcu to drain
+ * readers of the unlinked content before its nodes are reclaimed;
+ * the lone exception is merge's destination-side flip-latch commit,
+ * which needs no such drain. What concurrent readers see,
+ * however, is published by a single atomic commit — a pointer
+ * store, or a flip-latch for the merge union case (see
+ * src/urcu-flip-latch.h): a reader observes either the complete
+ * prior state or the complete result, never a partial state.
  *
  * - Graft (cds_ft_graft) attaches the content of a source trie
  *   at a key position in a destination trie. The destination
@@ -145,6 +157,23 @@
  *   a key position and returns it as a new, independent trie
  *   instance whose key lengths are relative to the detach
  *   point.
+ *
+ * - Merge-at (cds_ft_merge_at) combines a source sub-trie into a
+ *   destination while re-keying it: the content under a source
+ *   prefix is unioned into the destination under a possibly
+ *   different prefix, each moved key keeping whatever suffix
+ *   follows the prefix. Unlike graft, the destination may already
+ *   hold entries under that prefix — the two sub-tries are unioned
+ *   and same-key duplicate chains are concatenated. It expresses
+ *   re-keying patterns (archive moves, tier promotion, partition
+ *   rename) that a detach + graft pair cannot on a fixed-length
+ *   group, where the source and destination prefixes must be of
+ *   equal length so the moved keys keep the fixed length.
+ *
+ * - Merge (cds_ft_merge) is the same-prefix case of merge-at: a
+ *   single key is both the source selector and the destination
+ *   attach point, so nothing is re-keyed; a zero-length key merges
+ *   two whole tries at the root.
  *
  * Root-level operations (key_len 0) work with both fixed-length
  * and variable-length key groups. Non-root operations (key_len
@@ -218,10 +247,9 @@
  *
  * The iterator reuses its current position (the result node) to
  * accelerate subsequent sequential operations like cds_ft_next(),
- * cds_ft_prev(), or cds_ft_remove_all(): they continue from it by
- * backtracking up the live parent chain rather than re-descending
- * from the root.  (cds_ft_remove() and cds_ft_replace() take the target
- * node explicitly; see their note below.)
+ * cds_ft_prev(), or cds_ft_remove_all() (cds_ft_remove() and
+ * cds_ft_replace() take the target node explicitly; see their note
+ * below.)
  *
  * Because the position is an RCU-protected pointer, the RCU read-side
  * lock must be held CONTINUOUSLY between the operation that populates
@@ -231,16 +259,14 @@
  *
  * If you need to drop the RCU read-side lock between operations, call
  * cds_ft_iter_bind_key() WHILE STILL HOLDING the lock, before dropping it:
- * - cds_ft_iter_bind_key()
- *
- * Bind snapshots the iterator's current key into its own storage and clears
- * the cached position.  The next position-reusing operation (e.g.,
- * cds_ft_remove_all) then falls back to a safe, fresh top-down traversal by
- * that key.  Snapshotting (rather than merely clearing the node pointer)
- * matters because in a speculative group configured with a leaf-key offset the
- * cached key is held as a live REFERENCE into the result node, valid only
- * while the lock is held; bind copies it out before that node can be
- * reclaimed.
+ * cds_ft_iter_bind_key() snapshots the iterator's current key into its
+ * own storage and clears the cached position.  The next position-reusing
+ * operation (e.g., cds_ft_remove_all) then falls back to a safe, fresh
+ * top-down traversal by that key.  Snapshotting (rather than merely
+ * clearing the node pointer) matters because in a speculative group
+ * configured with a leaf-key offset the cached key is held as a live
+ * REFERENCE into the result node, valid only while the read-side lock
+ * is held; bind copies it out before that node can be reclaimed.
  *
  * Example A (Continuous lock — fast):
  * rcu_read_lock();
