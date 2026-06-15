@@ -23080,11 +23080,16 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
  * other writers for the whole walk; concurrent RCU readers are fine.  Each
  * node is republished and its old copy RCU-freed (ft_node_recompact +
  * cds_ft_free_item), so a reader observes the old or the new node, never a
- * freed one.  Compressed nodes are left in place (off the speculative descent
- * path).  A skip target (a plain internal node reached through a skip pointer)
- * IS relocated, routed through the compressed node's cn->child slot so
- * ft_node_recompact's dual-pointer publish updates both cn->child and the
- * skip pointer.
+ * freed one.  Compressed nodes are relocated too, via
+ * ft_compact_relocate_compressed: a traditional compressed node through its
+ * grandparent slot, a skip-compressed node through the target's parent
+ * back-pointer (the grandparent holds a skip pointer to the target, not to cn,
+ * so it needs no repoint).  The skip target itself is then relocated through
+ * cn->child, and ft_node_recompact's dual-pointer publish updates both
+ * cn->child and the skip pointer.  One gap remains: a compressed node whose
+ * skip target is external (a leaf) is left in place, because the descent ends
+ * at the leaf before reaching the relocate call.  That only leaves that node's
+ * range less compacted; correctness is unaffected.
  */
 /* Relocate the internal node at *@holder into a fresh slot; RCU-free the old. */
 static
