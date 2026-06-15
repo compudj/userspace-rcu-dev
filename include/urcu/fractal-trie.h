@@ -894,7 +894,11 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
  *
  * These functions use a cds_ft_iter to hold input key, output key,
  * result node, status, and cached position. Set the input key
- * with cds_ft_iter_set_key() before calling. On return, the iterator
+ * with cds_ft_iter_set_key() before calling. The @ft argument must be
+ * the trie the iterator was created for (cds_ft_iter_create): the
+ * descent uses @ft while the key handling uses the iterator's bound
+ * trie, so passing a different trie mixes their key mappings and
+ * produces undefined results. On return, the iterator
  * holds the result key (cds_ft_iter_get_key()), result node
  * (cds_ft_iter_node()), status (cds_ft_iter_status()), and cached
  * position. The status is also returned by the function for
@@ -1988,7 +1992,10 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
  *
  * Descends from the right (largest children first) using per-node key
  * counters, so concurrent updates to the low end of the key space do
- * not affect the traversal. O(depth) time complexity.
+ * not affect the traversal. O(depth) time complexity.  On success the
+ * iterator points at the nth-from-last key (cds_ft_iter_node() /
+ * cds_ft_iter_get_key()); on NOT_FOUND it is left unpositioned
+ * (cds_ft_iter_node() returns NULL).
  * Returns CDS_FT_STATUS_NOT_FOUND if @n >= the number of keys.
  * The RCU read-side lock must be held.
  */
@@ -2007,8 +2014,11 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
  * counters, then descends into the target subtree. Only touches nodes
  * between the start and end positions, so concurrent mutations in
  * unrelated key ranges do not affect the result. O(depth) time
- * complexity. Returns CDS_FT_STATUS_NOT_FOUND if the target is out
- * of range. The RCU read-side lock must be held.
+ * complexity.  On success the iterator is repositioned at the target
+ * key (cds_ft_iter_node() / cds_ft_iter_get_key()); on NOT_FOUND it is
+ * left unpositioned (cds_ft_iter_node() returns NULL).  Returns
+ * CDS_FT_STATUS_NOT_FOUND if the target is out of range. The RCU
+ * read-side lock must be held.
  */
 enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -2025,8 +2035,11 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
  * counters, then descends into the target subtree. Only touches nodes
  * between the start and end positions, so concurrent mutations in
  * unrelated key ranges do not affect the result. O(depth) time
- * complexity. Returns CDS_FT_STATUS_NOT_FOUND if @n exceeds the
- * number of preceding keys. The RCU read-side lock must be held.
+ * complexity.  On success the iterator is repositioned at the target
+ * key (cds_ft_iter_node() / cds_ft_iter_get_key()); on NOT_FOUND it is
+ * left unpositioned (cds_ft_iter_node() returns NULL).  Returns
+ * CDS_FT_STATUS_NOT_FOUND if @n exceeds the number of preceding keys.
+ * The RCU read-side lock must be held.
  */
 enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -2875,6 +2888,14 @@ void cds_ft_iter_bind_key(struct cds_ft_iter *iter);
  * @src: Source iterator.
  *
  * Both iterators must be bound to the same Fractal Trie.
+ *
+ * The copy carries @src's cached position (and, when @src's result key
+ * is held as a live reference into a leaf, that dependency too), so @dst
+ * is valid only while the RCU read-side lock that produced @src's
+ * position is held continuously; reusing @dst's position then carries
+ * the same stale-position hazard as @src's.  To carry @dst across a
+ * critical section, cds_ft_iter_bind_key() it (or @src before copying)
+ * while the lock is held.
  */
 void cds_ft_iter_copy(struct cds_ft_iter *dst, const struct cds_ft_iter *src);
 
