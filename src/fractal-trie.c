@@ -21492,29 +21492,47 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft)
 
 /*
  * Validate that the pointer bits used by the skip-compressed encoding
- * are outside the kernel's virtual address range.  Attempt to mmap a
- * page at the encoding boundary; if the mapping succeeds or fails
- * with EEXIST the bit is within the VA range and skip-compressed
- * cannot be used safely.  Only ENOMEM (address beyond TASK_SIZE)
- * confirms the bit is available; any other failure (EPERM, EINVAL,
- * EAGAIN, seccomp, ...) is treated conservatively as unavailable.
+ * are outside the process's virtual address range.  Attempt to mmap a
+ * page at the encoding boundary; if the mapping succeeds (or fails with
+ * EEXIST) the bit is within the VA range and skip-compressed cannot be
+ * used safely.  Only ENOMEM (address beyond TASK_SIZE) confirms the bit
+ * is available, and only after a positive control rules out a spurious
+ * ENOMEM from a global mmap failure (see below); any other failure
+ * (EPERM, EINVAL, EAGAIN, seccomp, ...) is treated conservatively as
+ * unavailable.
  */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 static
 bool ft_skip_compressed_validate(void)
 {
-	void *p;
+	size_t page = urcu_get_page_len();
+	void *p, *ctrl;
 
-	p = mmap((void *)(1UL << FT_SKIP_LEN_SHIFT), urcu_get_page_len(),
-		 PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-		 -1, 0);
-	if (p == MAP_FAILED) {
-		/* Only ENOMEM proves the address is outside the VA range. */
-		return errno == ENOMEM;
+	p = mmap((void *)(1UL << FT_SKIP_LEN_SHIFT), page, PROT_NONE,
+		 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (p != MAP_FAILED) {
+		/* Mapping succeeded: the bit is within the VA range. */
+		munmap(p, page);
+		return false;
 	}
-	/* Mapping succeeded: the bit is within the VA range. */
-	munmap(p, urcu_get_page_len());
-	return false;
+	if (errno != ENOMEM)
+		return false;	/* EEXIST / EPERM / EINVAL / seccomp / ... */
+	/*
+	 * ENOMEM is overloaded: besides "address beyond TASK_SIZE" (what we
+	 * want to confirm) it is also returned for a global mmap failure --
+	 * notably vm.max_map_count exhaustion -- regardless of the address.
+	 * Cross-check with a positive control: map one page at a
+	 * kernel-chosen address.  If the control succeeds, mmap is healthy
+	 * and the boundary ENOMEM was a genuine out-of-range rejection, so
+	 * the bit is available.  If the control also fails, mmap is failing
+	 * globally and the boundary ENOMEM proves nothing -- stay
+	 * conservative and leave skip-compressed disabled.
+	 */
+	ctrl = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (ctrl == MAP_FAILED)
+		return false;
+	munmap(ctrl, page);
+	return true;
 }
 #endif
 
