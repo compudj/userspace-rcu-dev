@@ -23948,15 +23948,28 @@ void do_show_stats(const struct cds_ft *ft, FILE *out, const struct cds_ft_stats
 void cds_ft_show_stats(const struct cds_ft *ft, FILE *out)
 {
 	struct cds_ft_inode_flag *node_flag;
-	struct cds_ft_stats stats = {};
+	struct cds_ft_stats *stats;
 	int level = 0;
+
+	/*
+	 * struct cds_ft_stats is several MiB: a per-level node-type
+	 * distribution histogram (257 buckets) for each of FT_MAX_DEPTH
+	 * levels.  That is far too large for the stack on threads with a
+	 * small stack (e.g. musl's 128 KiB default), so heap-allocate it.
+	 */
+	stats = calloc(1, sizeof(*stats));
+	if (!stats) {
+		fprintf(out, "Fractal Trie (%p) Statistics: out of memory\n", ft);
+		return;
+	}
 
 	node_flag = rcu_dereference(ft->root);
 
 	/* Root is always present and always internal. */
-	calc_stats_node(ft, node_flag, &stats, level);
-	calc_stats_node_recursive(ft, node_flag, &stats, level + 1);
-	do_show_stats(ft, out, &stats);
+	calc_stats_node(ft, node_flag, stats, level);
+	calc_stats_node_recursive(ft, node_flag, stats, level + 1);
+	do_show_stats(ft, out, stats);
+	free(stats);
 }
 
 const char *cds_ft_status_to_string(enum cds_ft_status status)
