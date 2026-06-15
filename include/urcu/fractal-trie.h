@@ -345,36 +345,17 @@ enum cds_ft_status {
 enum cds_ft_lookup_optimization {
 	/*
 	 * CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE (default):
-	 *
-	 *   Optimize for cds_ft_lookup_candidate_key and
-	 *   cds_ft_speculative_lookup_key.  Compressed-node bytes are
-	 *   skipped during descent; the candidate match is returned
-	 *   without per-step verification.
-	 *
-	 *   On architectures where the skip-compressed pointer
-	 *   encoding is available (64-bit with sufficient free high
-	 *   pointer bits) the descent also bypasses the compressed
-	 *   node's cache-line load entirely.  On other architectures
-	 *   the compressed cache line is still loaded but the byte
-	 *   comparison is skipped — speculative descent still wins.
-	 *
-	 *   cds_ft_eager_lookup_key works on speculative-tuned tries;
-	 *   on skip-compressed-capable archs the precise descent pays
-	 *   a small extra cost (unwrap the skip-encoded pointer before
-	 *   fetching the compressed node), but correctness is
-	 *   unchanged.
+	 *   Cheapest for cds_ft_lookup_candidate_key and
+	 *   cds_ft_speculative_lookup_key.  cds_ft_eager_lookup_key
+	 *   still works, at a small extra per-step cost.
 	 */
 	CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE = 0,
 
 	/*
 	 * CDS_FT_LOOKUP_OPTIMIZE_EAGER:
-	 *
-	 *   Optimize for cds_ft_eager_lookup_key.  Precise descent
-	 *   reads compressed nodes via direct pointers (no
-	 *   skip-encoded unwrap).  cds_ft_lookup_candidate_key and
-	 *   cds_ft_speculative_lookup_key still work but lose the
-	 *   skip-compressed encoding's bypass of compressed cache
-	 *   lines on supported archs.
+	 *   Cheapest for cds_ft_eager_lookup_key.
+	 *   cds_ft_lookup_candidate_key and cds_ft_speculative_lookup_key
+	 *   still work, without the speculative descent's savings.
 	 */
 	CDS_FT_LOOKUP_OPTIMIZE_EAGER,
 };
@@ -2273,22 +2254,19 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
  * into the iterator's result key, read back via cds_ft_iter_get_key, so
  * their byte order must match what the trie was built with.
  *
- * Optional, and only meaningful on a SPECULATIVE group with the
- * skip-compressed pointer encoding available (64-bit supported archs).
- * When provided, the ordered-inequality lookups (cds_ft_lookup_ge/gt/
- * le/lt, cds_ft_next/prev) capture their result key by copying it from
- * the matched leaf — the leaf already stores the full key for caller-
- * side validation — instead of rebuilding it from compressed-node bytes
- * during descent.  This lets the inequality descent run in candidate
- * (speculative) form and bypass compressed-node cache lines, the way
- * point lookups already do.
+ * Optional, and only meaningful on a SPECULATIVE group on a
+ * skip-compressed-capable arch (64-bit).  When provided, the
+ * ordered-inequality lookups (cds_ft_lookup_ge/gt/le/lt,
+ * cds_ft_next/prev) capture their result key by copying it from the
+ * matched leaf — which already stores the full key for caller-side
+ * validation — which is faster than rebuilding it from the trie
+ * structure during descent.
  *
- * When not set (or on an EAGER / non-skip-compressed group), the
- * inequality lookups fall back to rebuilding the key from the trie
- * structure during descent — same result, without the leaf-copy
- * fast path.  Key length is taken from the group's fixed key_len (or
- * the leaf's trie depth for variable-length keys), so no separate
- * length offset is required.
+ * When not set (or on an EAGER / non-skip-compressed group) the
+ * inequality lookups rebuild the key from the trie structure instead
+ * — same result, without the leaf-copy fast path.  Key length is
+ * taken from the group's fixed key_len (or the leaf's trie depth for
+ * variable-length keys), so no separate length offset is required.
  *
  * key_offset is interpreted modulo pointer arithmetic, so a key stored
  * before the node in the embedding struct (a "negative" offset) is
