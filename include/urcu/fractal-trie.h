@@ -1309,7 +1309,8 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * reusable: the same node may be passed to a subsequent insert
  * attempt.
  *
- * Mutual exclusion between updates (insert, insert_unique, remove) is
+ * Mutual exclusion between updates (insert, insert_unique, insert_replace,
+ * replace, remove, remove_all) is
  * the user's responsibility.
  */
 enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
@@ -1336,7 +1337,8 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
  * @node has not been published and is left reusable for a subsequent
  * insert attempt.
  *
- * Mutual exclusion between updates (insert, insert_unique, remove) is
+ * Mutual exclusion between updates (insert, insert_unique, insert_replace,
+ * replace, remove, remove_all) is
  * the user's responsibility.
  * Pointers to existing nodes returned by this function are only safe to
  * dereference as long as the writer mutual exclusion is held, or if the
@@ -1440,7 +1442,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  * the node is not found, or a negative cds_ft_status on error.
  * A grace period must be observed (e.g., synchronize_rcu, call_rcu)
  * after success before reclaiming @node memory.
- * Mutual exclusion between updates (insert, insert_unique, remove) is
+ * Mutual exclusion between updates (insert, insert_unique, insert_replace,
+ * replace, remove, remove_all) is
  * the user's responsibility.
  */
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
@@ -1639,6 +1642,12 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * is non-empty, the "Efficient bulk-removal pattern" described above
  * applies: after a single grace period, the caller can drain
  * @swap_ft locally without per-node grace periods.
+ *
+ * On success @swap_ft also inherits @dst_ft's access discipline: its
+ * exclusive/concurrent mode is set to match @dst_ft.  This changes the
+ * RCU rules the caller must follow on @swap_ft afterward (including the
+ * drain above), so re-establish the desired mode with
+ * cds_ft_make_exclusive() / cds_ft_make_concurrent() if it matters.
  *
  * The operation validates that @key_len plus the maximum used key
  * length of @swap_ft does not exceed the group's maximum key length.
@@ -2274,7 +2283,11 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
  * cds_ft_next/prev) capture their result key by copying it from the
  * matched leaf — which already stores the full key for caller-side
  * validation — which is faster than rebuilding it from the trie
- * structure during descent.
+ * structure during descent.  Because those lookups read the bytes from
+ * the live leaf, the key bytes at @key_offset must be present before
+ * the node is inserted and must not change while the node is in the
+ * trie (the same stability requirement
+ * cds_ft_group_attr_set_key_len_offset states for the length).
  *
  * When not set (or on an EAGER / non-skip-compressed group) the
  * inequality lookups rebuild the key from the trie structure instead
