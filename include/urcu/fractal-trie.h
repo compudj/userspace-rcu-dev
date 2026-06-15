@@ -507,12 +507,9 @@ enum cds_ft_iter_cache_mode {
 struct cds_ft_node {
 	/*
 	 * prev pointer: for the head of the duplicate chain, this points
-	 * to the parent internal node (flagged pointer, used by
-	 * CDS_FT_FLAG_SKIP_COMPRESSED to recover the compressed node
-	 * from a skip pointer, and by the ordered-traversal upward walk
-	 * to reach the parent without consulting a cached iterator
-	 * path). For non-head duplicates, this points to the preceding
-	 * cds_ft_node. Written by the mutation side via
+	 * to the parent internal node (a flagged, library-internal
+	 * back-reference). For non-head duplicates, this points to the
+	 * preceding cds_ft_node. Written by the mutation side via
 	 * rcu_assign_pointer; read on the read side via rcu_dereference.
 	 * Not accessed on the candidate lookup fast path.
 	 */
@@ -811,11 +808,10 @@ enum cds_ft_status cds_ft_speculative_lookup_key(struct cds_ft *ft,
  *               if a match is found, or NULL if not found or on error.
  *
  * Same result as cds_ft_speculative_lookup_key, but the library validates
- * the key during a precise descent (reading compressed-node bytes
- * directly), so no @key_offset is needed.  Strongest when the group is
- * tuned with CDS_FT_LOOKUP_OPTIMIZE_EAGER; on the default speculative-
- * tuned trie it still works but pays a small extra cost to unwrap
- * skip-encoded pointers before fetching compressed nodes.
+ * the key during a precise descent, so no @key_offset is needed.  Strongest
+ * when the group is tuned with CDS_FT_LOOKUP_OPTIMIZE_EAGER; on the default
+ * speculative-tuned trie it still works but pays a small extra per-step
+ * cost.
  *
  * Returns CDS_FT_STATUS_OK on success (match found),
  * CDS_FT_STATUS_NOT_FOUND if no match, or a negative cds_ft_status
