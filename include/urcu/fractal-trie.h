@@ -491,10 +491,9 @@ enum cds_ft_iter_cache_mode {
  * cds_ft_node in the duplicate chain.
  *
  * The prev pointer is written by the mutation side (mutex-held) and
- * read by the write side and by the read side (exact lookup via
- * ft_skip_to_compressed, ordered-traversal parent-pointer walk via
- * ft_get_parent_rcu).  It is not accessed on the candidate lookup
- * fast path — RCU candidate readers only follow next pointers.
+ * read on both the write and read sides via rcu_dereference; it is not
+ * accessed on the candidate lookup fast path, where RCU readers only
+ * follow next pointers.
  *
  * Note that removal from a Fractal Trie does _not_ reset node->next,
  * because it can still be accessed by concurrent RCU readers. After
@@ -2436,10 +2435,10 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
  *                         access discipline.
  * @ft: The Fractal Trie.
  *
- * Blocks in synchronize_rcu() to drain any in-flight RCU readers,
+ * Blocks until in-flight RCU readers have drained (one grace period),
  * then marks the trie as exclusive.  Subsequent graft / graft_swap
- * operations with this trie as source skip their internal
- * synchronize_rcu().
+ * operations with this trie as source then need no grace-period drain
+ * of their own.
  *
  * The caller asserts that no new RCU readers will enter the trie
  * after this call returns (e.g. single-threaded access, or
