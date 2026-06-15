@@ -1357,7 +1357,7 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Identifies the key at which @old_node sits (set by the lookup
  *        that returned @old_node).  Used only for its key, to locate
- *        @old_node's slot; cds_ft_replace does not re-descend.
+ *        @old_node's slot.
  * @old_node: Node to replace (normally cds_ft_iter_node(iter)), currently
  *            present in the trie.  Dereferenced directly via
  *            @old_node->prev, so it must be live: hold the RCU read-side
@@ -1394,7 +1394,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  * @ft: The Fractal Trie.
  * @iter: Identifies the key at which @node sits (set by the lookup that
  *        returned @node).  Used only for its key, to locate @node's
- *        slot; cds_ft_remove does not re-descend.
+ *        slot.
  * @node: Node to remove (normally cds_ft_iter_node(iter)).  Dereferenced
  *        directly via @node->prev, so it must be live: hold the RCU
  *        read-side lock continuously from when @node was obtained until
@@ -1446,8 +1446,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * key: the key was NOT removed (the chain is still reachable;
  * *@result_node is NULL) and the call may be retried.  An allocation
  * failure while pruning an already-emptied internal holder is NOT an
- * error: the removal succeeded (CDS_FT_STATUS_OK) and the empty holder
- * is reclaimed by a later mutation through it.
+ * error: the removal succeeded (CDS_FT_STATUS_OK).
  *
  * Mutual exclusion between updates (insert, insert_unique,
  * insert_replace, replace, remove, remove_all) is the user's
@@ -1482,10 +1481,10 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * into the main trie in a single O(1) operation. Because the source
  * trie has no concurrent readers or writers during population, no RCU
  * read-side lock and no mutual exclusion are needed for the inserts.
- * Concurrent RCU readers see the graft published by a single atomic
- * pointer update — either the pre-graft state or the post-graft state,
- * never a partial view — so the duration of writer mutual exclusion on
- * the main trie is short and bounded (independent of the number of
+ * Concurrent RCU readers see either the pre-graft state or the
+ * post-graft state, never a partial view — so the duration of writer
+ * mutual exclusion on the main trie is short and bounded (independent
+ * of the number of
  * nodes being grafted, modulo the O(depth) descent and key-count
  * propagation). This pattern is well suited for batch loading,
  * sharding, and periodic bulk updates where minimizing the writer
@@ -1598,9 +1597,8 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  *
  * Exchanges the content at @key in @dst_ft with the content of
  * @swap_ft.  Concurrent RCU readers traversing @dst_ft observe
- * the swap published by a single atomic pointer update: they see
- * either the old content or the new content, never an empty
- * intermediate state.
+ * the swap atomically: they see either the old content or the new
+ * content, never an empty intermediate state.
  *
  * On success, the previous content at the graft point (if any) is
  * placed into @swap_ft. The caller can check cds_ft_empty(@swap_ft)
@@ -1662,9 +1660,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  * requires a variable-length key group (CDS_FT_LEN_VARIABLE).
  *
  * The returned trie is in exclusive mode: no RCU reader can be
- * inside it at return (the handle is freshly returned, and any
- * in-flight reader of the moved subtree has been drained by the
- * detach path itself).  A subsequent graft of the detached trie
+ * inside it at return.  A subsequent graft of the detached trie
  * therefore needs no grace-period drain of its own, coalescing
  * detach+graft into a single grace period.  Callers that publish
  * the detached trie to concurrent readers must call
@@ -1713,9 +1709,8 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * the same atomic commit, so ordered iteration over @dst_ft observes
  * the merge atomically too.
  *
- * @src_ft's moved nodes are reclaimed under the usual RCU
- * discipline (deferred via call_rcu); @src_ft retains only the
- * keys that do not start with @key.
+ * @src_ft's moved nodes are reclaimed under the usual RCU discipline;
+ * @src_ft retains only the keys that do not start with @key.
  *
  * Returns CDS_FT_STATUS_OK on success (including the no-op case
  * where @src_ft has no content under @key).
@@ -1723,14 +1718,10 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * pointer is NULL, if @dst_ft == @src_ft, if the tries are not in
  * the same group, or if @key_len exceeds the group's maximum key
  * length.
- * Returns a negative cds_ft_status on memory allocation failure.
- * Because the merge is built invisibly before it is committed, an
- * allocation failure leaves both tries pristine.  In the
- * empty-destination path only, a failure after the source subtree
- * has been detached triggers a best-effort rollback that re-grafts
- * it back into @src_ft at @key; if that rollback itself fails, the
- * affected externals are leaked.  Both tries remain individually
- * valid in any case.
+ * Returns a negative cds_ft_status on memory allocation failure.  On
+ * allocation failure both tries are left individually valid; in a rare
+ * nested failure (an allocation failing during the rollback of a
+ * partially-applied merge) some moved external nodes may be leaked.
  *
  * Mutual exclusion between writers on both @dst_ft and @src_ft is
  * the caller's responsibility.
@@ -1931,9 +1922,8 @@ unsigned long cds_ft_count_keys(struct cds_ft *ft);
  * @prefix_len: Length of the prefix in bytes. Use 0 to count all keys
  *              (equivalent to cds_ft_count_keys).
  *
- * Returns the number of distinct keys whose key starts with @prefix.
- * This descends through the trie following the prefix bytes, then reads
- * the subtree's propagated key counter.
+ * Returns the number of distinct keys whose key starts with @prefix,
+ * in O(prefix_len) (it reads a maintained count, not a full scan).
  *
  * This function has O(prefix_len) time complexity. The RCU read-side
  * lock must be held while calling this function.
@@ -1947,8 +1937,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
  * @iter: Iterator (must be created via cds_ft_iter_create).
  * @n: 0-indexed rank from the first (smallest) key.
  *
- * Finds the key at rank @n in the trie's sorted key order using
- * per-node key counters to skip entire subtrees. On success the
+ * Finds the key at rank @n in the trie's sorted key order. On success the
  * iterator points to the first external node of the nth key and the
  * result key is accessible via cds_ft_iter_get_key().
  *
@@ -1985,9 +1974,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
  * @iter: Iterator positioned at a valid key.
  * @n: Number of keys to skip forward. 0 is a no-op.
  *
- * Traverses locally from the current position: walks up the trie from
- * the current leaf counting rightward siblings using per-node key
- * counters, then descends into the target subtree. Only touches nodes
+ * Traverses locally from the current position, touching only nodes
  * between the start and end positions, so concurrent mutations in
  * unrelated key ranges do not affect the result. O(depth) time
  * complexity.  On success the iterator is repositioned at the target
@@ -2006,9 +1993,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
  * @iter: Iterator positioned at a valid key.
  * @n: Number of keys to skip backward. 0 is a no-op.
  *
- * Traverses locally from the current position: walks up the trie from
- * the current leaf counting leftward siblings using per-node key
- * counters, then descends into the target subtree. Only touches nodes
+ * Traverses locally from the current position, touching only nodes
  * between the start and end positions, so concurrent mutations in
  * unrelated key ranges do not affect the result. O(depth) time
  * complexity.  On success the iterator is repositioned at the target
