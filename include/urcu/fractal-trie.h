@@ -768,9 +768,11 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  *                    input side, avoiding page-cross checks on the
  *                    hot path.  A memory allocator that gives every
  *                    allocation a non-faulting trailing region (e.g.
- *                    cds_ft_external_arena's per-range guard page,
- *                    or a guard-page allocator) satisfies any value
- *                    up to that trailing-region size trivially.
+ *                    cds_ft_external_arena, whose per-range trailing
+ *                    bytes are reserved as a never-allocated but mapped
+ *                    over-read pad -- not a protected guard page, which
+ *                    would fault) satisfies any value up to that
+ *                    region's size trivially.
  * @result_node: Candidate node output. Set to a node if a candidate is
  *               found, or NULL if not found or on error.
  *
