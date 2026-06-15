@@ -642,9 +642,8 @@ void *cds_ft_external_arena_alloc(struct cds_ft_external_arena *arena,
  * @arena: Arena that allocated @ptr.
  * @ptr:   Pointer previously returned by cds_ft_external_arena_alloc.
  *
- * The slot's size class is recovered from the containing range
- * header (no size argument needed).  Slots returned to the
- * freelist are reused by subsequent allocations of the same class.
+ * No size argument is needed.  The freed slot becomes available for
+ * reuse by subsequent allocations.
  *
  * Caller must ensure no RCU reader still references @ptr (e.g.
  * via synchronize_rcu after removal from any published trie) — the
@@ -2179,9 +2178,9 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  *       (SPECULATIVE or EAGER).
  *
  * SPECULATIVE is the default for a freshly created group attr and the
- * faster descent; it skips redundant work at compressed nodes.  EAGER
- * does a strict per-step exact compare at every node (via
- * cds_ft_eager_lookup_key); select it explicitly if you need that.
+ * faster descent.  EAGER does a strict per-step exact compare at every
+ * node (via cds_ft_eager_lookup_key); select it explicitly if you need
+ * that.
  * Both modes return identical results and differ only in descent cost.
  *
  * Requirement: on 64-bit architectures where SPECULATIVE uses the
@@ -2219,14 +2218,10 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
  * key, so a non-identity cds_ft_key_map is supported (the stored key is
  * remapped to ordinal order on copy); an identity map is a plain copy.
  *
- * This contract is why the requirement did not exist for candidate /
- * speculative point lookups: there the validation memcmp runs
- * application-side (inside cds_ft_speculative_lookup_key), so the
- * library never interprets the stored bytes and the application may
- * store the key in any representation it also looks up with.  Here the
- * library reads the stored bytes and copies them (key-map-transformed)
- * into the iterator's result key, read back via cds_ft_iter_get_key, so
- * their byte order must match what the trie was built with.
+ * Their byte order must therefore match what the trie was built with
+ * (unlike the candidate / speculative point lookups, where the
+ * caller-side validation never makes the library interpret the stored
+ * bytes).
  *
  * Optional, and only meaningful on a SPECULATIVE group on a
  * skip-compressed-capable arch (64-bit).  When provided, the
@@ -2284,24 +2279,20 @@ enum cds_ft_status cds_ft_group_attr_set_key_len_offset(
  *   (@ordered_list false) the library-owned ordered sibling list.  Enabled is
  *   the DEFAULT in a library built with FEATURE_FT_ORD_CELL (the default build).
  *
- * When ENABLED, the library threads the duplicate-chain heads (one per distinct
- * key) into a key-ordered list of library-owned cells and uses it to accelerate
- * cds_ft_next / cds_ft_prev and cds_ft_for_each*_batched.  The order links live
- * entirely inside the library: struct cds_ft_node is unchanged and the
- * application declares no offset for them.  The cell is reached via the head's
- * node, and the head's parent is relocated into the cell, so the downward lookup
- * path is unaffected.  The iteration result key is recovered from the matched
- * leaf when cds_ft_group_attr_set_speculative_key_offset (plus
- * cds_ft_group_attr_set_key_len_offset for a variable-length-key group) is
- * configured, otherwise structurally by an upward walk for an identity-mapped
- * group -- either way no application-leaf order storage is needed.
+ * When ENABLED, the library maintains the distinct keys in key order to
+ * accelerate cds_ft_next / cds_ft_prev and cds_ft_for_each*_batched.  This is
+ * entirely library-internal: struct cds_ft_node is unchanged and the
+ * application declares no offset and stores no ordering fields.  Forming the
+ * iteration result key does require a key source, though: either
+ * cds_ft_group_attr_set_speculative_key_offset (plus
+ * cds_ft_group_attr_set_key_len_offset for a variable-length-key group), or an
+ * identity-mapped group (where the key is recovered from the trie structure).
+ * No application-leaf order storage is ever needed.
  *
- * When DISABLED (for a write-heavy group that never iterates in key order via
- * cds_ft_next / cds_ft_prev / cds_ft_for_each*), the library skips the
- * per-mutation cell splice / unsplice AND allocates NO per-head cell at all, so
- * a head's parent is reached directly with no cell indirection -- recovering the
- * full per-head cell cost (lower memory + faster mutations).  The only thing
- * given up is ordered iteration and the node-pointer key/step helpers.
+ * When DISABLED (for a write-heavy group that never iterates in key order),
+ * the group uses less memory per key and mutates faster, giving up ordered
+ * iteration (cds_ft_next / cds_ft_prev / cds_ft_for_each*) and the
+ * node-pointer key/step helpers.
  *
  * On by default, so passing true is normally redundant (it re-affirms the
  * default).  Returns CDS_FT_STATUS_OK on success,
@@ -2333,7 +2324,7 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  *                 default for most callers; never overrides a stated
  *                 process intent.
  *   - INTERLEAVE: 2 MiB-granular round-robin across allowed NUMA
- *                 nodes (mbind(MPOL_BIND) per chunk).  Best for
+ *                 nodes.  Best for
  *                 multi-reader workloads with readers distributed
  *                 across NUMA nodes.  Single-threaded performance is
  *                 within noise of LOCAL on modern x86 (the L2/L3
