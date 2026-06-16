@@ -544,35 +544,42 @@ void superblock_destroy(struct cds_ft_alloc_superblock *sb)
 }
 
 /*
- * Carve a range out of the arena's current head superblock.  If the
- * head has insufficient room (or there are no superblocks yet),
- * allocate a new one and prepend it.
+ * Recycle a previously reclaimed range (both layouts), or return NULL if none
+ * is parked on the arena's free list.  A recycled range's node-body region was
+ * MADV_DONTNEED'd and re-faults zero on use, while its header + metadata page
+ * stays mapped and retains the range's NUMA / THP policy, so reusing it avoids
+ * a fresh mmap + re-policy.  Resets the per-range bookkeeping before returning.
  *
  * Caller must hold arena->lock.
  */
 static
-struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
+struct cds_ft_alloc_range *range_recycle(struct cds_ft_alloc_arena *arena)
 {
-	/*
-	 * Recycle a previously reclaimed range first (both layouts): its
-	 * node-body region was MADV_DONTNEED'd and re-faults zero on use,
-	 * while its header + metadata page stays mapped and retains the
-	 * range's NUMA / THP policy.  Reset the per-range bookkeeping and
-	 * hand it back, avoiding a fresh mmap + re-policy.
-	 */
-	if (!cds_list_empty(&arena->free_ranges)) {
-		struct cds_ft_alloc_range *range = cds_list_first_entry(
-				&arena->free_ranges, struct cds_ft_alloc_range, node);
+	struct cds_ft_alloc_range *range;
 
-		cds_list_del(&range->node);
-		range->next_unused = 0;
-		range->nr_live = 0;
-		range->free_list_head = NULL;
-		range->recompact_private = false;
-		CDS_INIT_LIST_HEAD(&range->partial_node);
-		return range;
-	}
+	if (cds_list_empty(&arena->free_ranges))
+		return NULL;
+	range = cds_list_first_entry(&arena->free_ranges,
+			struct cds_ft_alloc_range, node);
+	cds_list_del(&range->node);
+	range->next_unused = 0;
+	range->nr_live = 0;
+	range->free_list_head = NULL;
+	range->recompact_private = false;
+	CDS_INIT_LIST_HEAD(&range->partial_node);
+	return range;
+}
+
+/*
+ * Allocate a fresh range when no recycled range is available.  Two layouts:
+ * far-metadata gets its own 2 MiB-aligned mmap; near-metadata carves from the
+ * arena's superblock pool (creating a new superblock when the head is
+ * exhausted).  Caller must hold arena->lock.
+ */
 #ifdef FT_FAR_METADATA
+static
+struct cds_ft_alloc_range *range_create_fresh(struct cds_ft_alloc_arena *arena)
+{
 	/*
 	 * Far-metadata range: a 2 MiB-aligned mmap whose leading 2 MiB is one
 	 * dense run of node bodies and whose remainder (starting at base + 2 MiB)
@@ -610,7 +617,11 @@ struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
 	range->recompact_private = false;
 	CDS_INIT_LIST_HEAD(&range->partial_node);
 	return range;
+}
 #else
+static
+struct cds_ft_alloc_range *range_create_fresh(struct cds_ft_alloc_arena *arena)
+{
 	size_t alloc_size = cds_ft_arena_range_alloc_size(arena->item_len_order, arena->bitmap);
 	size_t alloc_size_aligned = (alloc_size + cds_ft_get_page_size() - 1) & ~(cds_ft_get_page_size() - 1);
 	struct cds_ft_alloc_superblock *sb;
@@ -640,7 +651,22 @@ carve:
 	/* next_unused / nr_live / free_list_head are zero from the fresh mmap. */
 	CDS_INIT_LIST_HEAD(&range->partial_node);
 	return range;
+}
 #endif /* FT_FAR_METADATA */
+
+/*
+ * Obtain a range for the arena: hand back a recycled range if one is parked,
+ * otherwise allocate a fresh one.  Caller must hold arena->lock.
+ */
+static
+struct cds_ft_alloc_range *range_create(struct cds_ft_alloc_arena *arena)
+{
+	struct cds_ft_alloc_range *range;
+
+	range = range_recycle(arena);
+	if (range)
+		return range;
+	return range_create_fresh(arena);
 }
 
 /*
