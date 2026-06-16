@@ -292,7 +292,7 @@ static int test_lifecycle_defaults(void)
 		cds_ft_group_destroy(group);
 		return -1;
 	}
-	if (cds_ft_key_len(ft) != CDS_FT_LEN_VARIABLE) {
+	if (cds_ft_group_key_len(group) != CDS_FT_LEN_VARIABLE) {
 		fprintf(stderr, "expected variable key length\n");
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
@@ -363,13 +363,13 @@ static int test_lifecycle_fixed_key_lengths(void)
 	for (klen = 1; klen <= 8; klen++) {
 		struct cds_ft *ft = create_fixed_ft(klen, &group);
 
-		if (cds_ft_key_len(ft) != klen) {
+		if (cds_ft_group_key_len(group) != klen) {
 			fprintf(stderr, "key_len mismatch for %u-byte trie\n", klen);
 			cds_ft_destroy(ft);
 			cds_ft_group_destroy(group);
 			return -1;
 		}
-		if (cds_ft_max_key_len(ft) < klen) {
+		if (cds_ft_group_max_key_len(group) < klen) {
 			fprintf(stderr, "max_key_len < key_len for %u-byte trie\n", klen);
 			cds_ft_destroy(ft);
 			cds_ft_group_destroy(group);
@@ -389,7 +389,7 @@ static int test_lifecycle_nil_only_trie(void)
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_ft(0, &group);
 
-	if (cds_ft_key_len(ft) != 0) {
+	if (cds_ft_group_key_len(group) != 0) {
 		fprintf(stderr, "expected key_len == 0\n");
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
@@ -426,7 +426,7 @@ static int test_lifecycle_max_key_len(void)
 		return -1;
 	}
 
-	if (cds_ft_max_key_len(ft) != 32) {
+	if (cds_ft_group_max_key_len(group) != 32) {
 		fprintf(stderr, "max_key_len not honoured\n");
 		cds_ft_destroy(ft);
 		cds_ft_group_destroy(group);
@@ -477,7 +477,7 @@ static int test_lifecycle_key_map(void)
 		return -1;
 	}
 
-	s = cds_ft_key_map(ft, k2o_out, o2k_out);
+	s = cds_ft_group_key_map(group, k2o_out, o2k_out);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "key_map returned unexpected status: %s\n",
 			cds_ft_status_to_string(s));
@@ -9693,10 +9693,10 @@ verify_2byte_order(struct cds_ft *ft, struct cds_ft_iter *iter,
  * @expected_count nodes in non-descending lexicographic order.
  */
 static int
-verify_varlen_order(struct cds_ft *ft, struct cds_ft_iter *iter,
-		    unsigned int expected_count)
+verify_varlen_order(struct cds_ft_group *group, struct cds_ft *ft,
+		    struct cds_ft_iter *iter, unsigned int expected_count)
 {
-	size_t max_klen = cds_ft_max_key_len(ft);
+	size_t max_klen = cds_ft_group_max_key_len(group);
 	uint8_t *prev_key, *rk;
 	unsigned int count = 0;
 	size_t prev_len = 0;
@@ -10011,7 +10011,7 @@ static int test_adversarial_transition_oscillation(void)
 
 			cds_ft_u64_to_key(ft, (0x50 << 8) | i, k, CDS_FT_LEN_DEFAULT);
 			rcu_read_lock();
-			cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+			cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 			cds_ft_lookup(ft, iter);
 			if (cds_ft_remove(ft, iter, &nodes[i]->node) < 0) {
 				rcu_read_unlock();
@@ -10096,7 +10096,7 @@ static int test_adversarial_sparse_removal(void)
 
 		cds_ft_u64_to_key(ft, (0xCC << 8) | i, k, CDS_FT_LEN_DEFAULT);
 		rcu_read_lock();
-		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 		cds_ft_lookup(ft, iter);
 		if (cds_ft_remove(ft, iter, &nodes[i]->node) < 0) {
 			rcu_read_unlock();
@@ -10131,7 +10131,7 @@ static int test_adversarial_sparse_removal(void)
 
 		cds_ft_u64_to_key(ft, (0xCC << 8) | i, k, CDS_FT_LEN_DEFAULT);
 		rcu_read_lock();
-		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 		cds_ft_lookup(ft, iter);
 		if (cds_ft_remove(ft, iter, &nodes[i]->node) < 0) {
 			rcu_read_unlock();
@@ -10229,7 +10229,7 @@ static int test_adversarial_boundary_bytes(void)
 	}
 	rcu_read_unlock();
 
-	if (verify_varlen_order(ft, iter, nr_keys) < 0)
+	if (verify_varlen_order(group, ft, iter, nr_keys) < 0)
 		goto out;
 
 	ret = 0;
@@ -10311,7 +10311,7 @@ static int test_adversarial_prefix_nesting(void)
 	}
 	rcu_read_unlock();
 
-	if (verify_varlen_order(ft, iter, depth) < 0)
+	if (verify_varlen_order(group, ft, iter, depth) < 0)
 		goto out;
 
 	ret = 0;
@@ -10392,7 +10392,7 @@ static int test_adversarial_mass_duplicates(void)
 	}
 
 	rcu_read_lock();
-	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 	cds_ft_lookup(ft, iter);
 	s = cds_ft_remove_all(ft, iter, &head);
 	if (s != CDS_FT_STATUS_OK) {
@@ -10484,7 +10484,7 @@ out:
  *
  * The maximum key length is not hardcoded; it is discovered at
  * runtime by creating a default variable-length trie and querying
- * cds_ft_max_key_len().
+ * cds_ft_group_max_key_len().
  */
 static int test_adversarial_max_depth(void)
 {
@@ -10510,7 +10510,7 @@ static int test_adversarial_max_depth(void)
 		cds_ft_group_destroy(probe_group);
 		return -1;
 	}
-	max_klen = cds_ft_max_key_len(probe_ft);
+	max_klen = cds_ft_group_max_key_len(probe_group);
 	cds_ft_destroy(probe_ft);
 	cds_ft_group_destroy(probe_group);
 
@@ -10762,7 +10762,7 @@ static int test_adversarial_interleaved_grow(void)
 		cds_ft_u64_to_key(ft, (0xBB << 8) | remove_idx, k,
 				  CDS_FT_LEN_DEFAULT);
 		rcu_read_lock();
-		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 		cds_ft_lookup(ft, iter);
 		if (cds_ft_remove(ft, iter, &remove_nodes[cycle]->node) < 0) {
 			rcu_read_unlock();
@@ -10835,7 +10835,7 @@ static int test_adversarial_relational_gap(void)
 
 	/* le(0x80) -> 0x0F */
 	cds_ft_u64_to_key(ft, 0x80, k, CDS_FT_LEN_DEFAULT);
-	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 	s = cds_ft_lookup_le(ft, iter);
 	if (s != CDS_FT_STATUS_OK) { rcu_read_unlock(); goto fail; }
 	found = cds_ft_iter_node(iter);
@@ -10848,7 +10848,7 @@ static int test_adversarial_relational_gap(void)
 
 	/* ge(0x80) -> 0xF0 */
 	cds_ft_u64_to_key(ft, 0x80, k, CDS_FT_LEN_DEFAULT);
-	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 	s = cds_ft_lookup_ge(ft, iter);
 	if (s != CDS_FT_STATUS_OK) { rcu_read_unlock(); goto fail; }
 	found = cds_ft_iter_node(iter);
@@ -10859,7 +10859,7 @@ static int test_adversarial_relational_gap(void)
 
 	/* gt(0x0F) -> 0xF0 */
 	cds_ft_u64_to_key(ft, 0x0F, k, CDS_FT_LEN_DEFAULT);
-	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 	s = cds_ft_lookup_gt(ft, iter);
 	if (s != CDS_FT_STATUS_OK) { rcu_read_unlock(); goto fail; }
 	found = cds_ft_iter_node(iter);
@@ -10870,7 +10870,7 @@ static int test_adversarial_relational_gap(void)
 
 	/* lt(0xF0) -> 0x0F */
 	cds_ft_u64_to_key(ft, 0xF0, k, CDS_FT_LEN_DEFAULT);
-	cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+	cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 	s = cds_ft_lookup_lt(ft, iter);
 	if (s != CDS_FT_STATUS_OK) { rcu_read_unlock(); goto fail; }
 	found = cds_ft_iter_node(iter);
@@ -11000,7 +11000,7 @@ static int test_adversarial_shared_suffix(void)
 	rcu_read_unlock();
 	if (ft_count != 256) goto out;
 
-	if (verify_varlen_order(ft, iter, 256) < 0) goto out;
+	if (verify_varlen_order(group, ft, iter, 256) < 0) goto out;
 
 	rcu_read_lock();
 	{
@@ -13478,7 +13478,7 @@ static int test_verify_recompact_shrink(void)
 		struct cds_ft_node *removed;
 
 		cds_ft_u64_to_key(ft, (0xBB << 8) | i, k, CDS_FT_LEN_DEFAULT);
-		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 		s = cds_ft_lookup(ft, iter);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "verify_recompact_shrink: lookup %u failed\n", i);
@@ -13943,7 +13943,7 @@ static int test_verify_oscillation(void)
 			struct cds_ft_node *removed;
 
 			cds_ft_u64_to_key(ft, (0xCC << 8) | (i - 1), k, CDS_FT_LEN_DEFAULT);
-			cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+			cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 			s = cds_ft_lookup(ft, iter);
 			if (s != CDS_FT_STATUS_OK) {
 				fprintf(stderr, "verify_oscillation: lookup %u failed round %u\n",
@@ -14080,7 +14080,7 @@ static int test_density_remove_through_compress(void)
 		struct cds_ft_node *removed;
 
 		cds_ft_u64_to_key(ft, keys[i], k, CDS_FT_LEN_DEFAULT);
-		cds_ft_iter_set_key(iter, k, cds_ft_key_len(ft));
+		cds_ft_iter_set_key(iter, k, cds_ft_group_key_len(group));
 		s = cds_ft_lookup(ft, iter);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "density_rm_compress: lookup key %u for remove failed\n", i);

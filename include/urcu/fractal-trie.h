@@ -1171,7 +1171,7 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  *
  *   const struct cds_ft_cell *cell, *batch[64];
  *   size_t off = cds_ft_cell_node_offset();
- *   uint8_t key[256];		// >= cds_ft_max_key_len(ft)
+ *   uint8_t key[256];		// >= cds_ft_group_max_key_len(group)
  *   size_t key_len;
  *   rcu_read_lock();
  *   cds_ft_for_each_batched_rcu(ft, cell, batch, 64) {
@@ -2142,27 +2142,27 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 unsigned long cds_ft_count_entries(struct cds_ft *ft);
 
 /*
- * cds_ft_key_len - Return the key length of a Fractal Trie.
- * @ft: The Fractal Trie.
+ * cds_ft_group_key_len - Return the key length configured for a group.
+ * @group: The Fractal Trie group.
  *
- * Returns the fixed key length if the trie is in fixed-length mode.
- * Returns CDS_FT_LEN_VARIABLE if the trie supports variable-length keys.
+ * Returns the fixed key length if the group is in fixed-length mode.
+ * Returns CDS_FT_LEN_VARIABLE if the group supports variable-length keys.
  */
-size_t cds_ft_key_len(const struct cds_ft *ft);
+size_t cds_ft_group_key_len(const struct cds_ft_group *group);
 
 /*
- * cds_ft_max_key_len - Return the maximum key length allowed by the trie.
- * @ft: The Fractal Trie.
+ * cds_ft_group_max_key_len - Return the maximum key length allowed by a group.
+ * @group: The Fractal Trie group.
  *
  * Returns the maximum length (in bytes) of any key that can be stored
- * in this trie instance.
+ * in a trie of this group.
  *
  * This value is intended for use by callers to allocate buffers for
- * output parameters (e.g., result_key). Even if the trie is configured
+ * output parameters (e.g., result_key). Even if the group is configured
  * as "unlimited," this function returns a finite, implementation-defined
  * maximum.
  */
-size_t cds_ft_max_key_len(const struct cds_ft *ft);
+size_t cds_ft_group_max_key_len(const struct cds_ft_group *group);
 
 /*
  * cds_ft_max_used_key_len - Return the maximum key length inserted.
@@ -2199,18 +2199,20 @@ size_t cds_ft_max_used_key_len(const struct cds_ft *ft);
 enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft);
 
 /*
- * cds_ft_key_map - Return the key map of a Fractal Trie.
- * @ft: The Fractal Trie.
+ * cds_ft_group_key_map - Return the key map configured for a group.
+ * @group: The Fractal Trie group.
  * @key_to_ordinal: Mapping from external key to ordered values.
  *                  (output, caller-provided array of CDS_FT_KEY_MAP_SIZE elements)
  * @ordinal_to_key: Mapping from ordered values to external key.
  *                  (output, caller-provided array of CDS_FT_KEY_MAP_SIZE elements)
  *
- * Returns CDS_FT_STATUS_OK if there is a key mapping (output
- * parameters are populated). Returns CDS_FT_STATUS_NOT_FOUND if
- * the key map is the identity function.
+ * The key map is the order-preserving byte permutation set at group
+ * creation; see cds_ft_group_attr_set_key_map for its meaning and
+ * constraints.  Returns CDS_FT_STATUS_OK if a non-identity map is
+ * configured (the output arrays are populated), or CDS_FT_STATUS_NOT_FOUND
+ * if the key map is the identity function.
  */
-enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key);
+enum cds_ft_status cds_ft_group_key_map(const struct cds_ft_group *group, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key);
 
 /*
  * Attributes

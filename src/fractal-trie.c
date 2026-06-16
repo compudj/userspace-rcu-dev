@@ -19969,14 +19969,14 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
 	return cds_ft_merge_at(dst_ft, key, key_len, src_ft, key, key_len);
 }
 
-size_t cds_ft_key_len(const struct cds_ft *ft)
+size_t cds_ft_group_key_len(const struct cds_ft_group *group)
 {
-	return ft->group->key_len;
+	return group->key_len;
 }
 
-size_t cds_ft_max_key_len(const struct cds_ft *ft)
+size_t cds_ft_group_max_key_len(const struct cds_ft_group *group)
 {
-	return ft->group->max_key_len;
+	return group->max_key_len;
 }
 
 size_t cds_ft_max_used_key_len(const struct cds_ft *ft)
@@ -19984,12 +19984,12 @@ size_t cds_ft_max_used_key_len(const struct cds_ft *ft)
 	return uatomic_load(&ft->max_used_key_len, CMM_RELAXED);
 }
 
-enum cds_ft_status cds_ft_key_map(const struct cds_ft *ft, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key)
+enum cds_ft_status cds_ft_group_key_map(const struct cds_ft_group *group, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key)
 {
-	if (ft->group->key_map.identity)
+	if (group->key_map.identity)
 		return CDS_FT_STATUS_NOT_FOUND;
-	memcpy(key_to_ordinal, ft->group->key_map.key_to_ordinal, sizeof(ft->group->key_map.key_to_ordinal));
-	memcpy(ordinal_to_key, ft->group->key_map.ordinal_to_key, sizeof(ft->group->key_map.ordinal_to_key));
+	memcpy(key_to_ordinal, group->key_map.key_to_ordinal, sizeof(group->key_map.key_to_ordinal));
+	memcpy(ordinal_to_key, group->key_map.ordinal_to_key, sizeof(group->key_map.ordinal_to_key));
 	return CDS_FT_STATUS_OK;
 }
 
