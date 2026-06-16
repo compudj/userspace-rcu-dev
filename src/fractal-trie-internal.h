@@ -972,7 +972,6 @@ struct cds_ft {
 	 */
 	struct cds_ft_compact_state *active_compact;
 
-
 	/*
 	 * Writer-side scratch iterator for ordinal-cell predecessor discovery
 	 * (ft_ord_cell_splice).  Allocated eagerly in cds_ft_create when the
