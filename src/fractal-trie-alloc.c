@@ -1080,16 +1080,9 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 			range->nr_live++;
 			item = &range->metadata[item_index];
 			/*
-			 * A bump slot is zero in a fresh mmap range, but a
-			 * recycled far range keeps its metadata + bitmap region
-			 * mapped (reclaim MADV_DONTNEEDs only the node body), so
-			 * the slot may carry the previous life's metadata (0xfe
-			 * poison from free, or stale counts) and a stale
-			 * occupancy bitmap -- the latter leaves a bit set over a
-			 * NULL body slot.  Clear both like the freelist path so
-			 * the node starts empty.  Near keeps them in the body,
-			 * which already re-faults zero, so this only touches
-			 * lines the node fill is about to fault anyway.
+			 * Clear the bump slot: a recycled far range's kept-mapped
+			 * metadata/bitmap may carry the previous life's contents.
+			 * See ft_clear_recycled_slot.
 			 */
 			ft_clear_recycled_slot(arena, item, item_index);
 			pthread_mutex_unlock(&arena->lock);
@@ -1154,8 +1147,8 @@ room_left:
 	item_index = range->next_unused++;
 	range->nr_live++;
 	item = &range->metadata[item_index];
-	/* Clear stale/poisoned metadata + bitmap from a recycled far range
-	 * (see the recompaction bump path above for the rationale). */
+	/* Clear stale/poisoned metadata + bitmap from a recycled far range;
+	 * see ft_clear_recycled_slot. */
 	ft_clear_recycled_slot(arena, item, item_index);
 	pthread_mutex_unlock(&arena->lock);
 	return &item->metadata;
