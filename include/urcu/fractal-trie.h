@@ -1887,6 +1887,15 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 
 /*
  * Trie lifecycle
+ *
+ * A group is a set of Fractal Trie instances that share allocation
+ * arenas and configuration (key length, lookup optimization, NUMA /
+ * page-size policy, ordered-list mode).  Groups exist for the bulk
+ * operations (cds_ft_graft, cds_ft_graft_swap, cds_ft_detach,
+ * cds_ft_merge): those move or combine whole sub-tries between tries,
+ * which is sound and cheap only when the tries share a group's arenas
+ * and key mapping.  Create a group with cds_ft_group_create(), then
+ * create tries within it with cds_ft_create().
  */
 
 /*
