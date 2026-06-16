@@ -11,6 +11,57 @@
  * Userspace RCU library - Fractal Trie Internal Header
  */
 
+/*
+ * ============================ Build options ============================
+ *
+ * Compile-time toggles for the Fractal Trie.  This is the index; the
+ * rationale and exact semantics of each option live at its definition
+ * site further down (or in the noted file).  None of these change the
+ * public API or the on-the-wire contract -- they trade implementation
+ * features, memory layout, or diagnostics.
+ *
+ * Functional features (enabled by default; disable for a simpler trie):
+ *   FEATURE_FT_COMPRESS         prefix (path) compression of single-child
+ *                               chains.  -DNO_FEATURE_FT_COMPRESS.
+ *   FEATURE_FT_SKIP_COMPRESSED  pack the skip length + child pointer into
+ *                               the parent slot's high bits so a descent
+ *                               bypasses the compressed cache line.  Auto
+ *                               on 64-bit arches that define FT_SKIP_LEN_BITS
+ *                               and pass the runtime VA probe; requires
+ *                               FEATURE_FT_COMPRESS.  -DNO_FEATURE_FT_SKIP_COMPRESSED.
+ *   FEATURE_INLINE_LOOKUP       force-inline the lookup hot path (no call
+ *                               boundaries on descent).  -DNO_FEATURE_INLINE_LOOKUP.
+ *
+ * (The library-owned ordered-cell index is always compiled in; it is
+ * gated per group at runtime via cds_ft_group_attr_set_ordered_list,
+ * not at build time.)
+ *
+ * Memory layout (architecture-defaulted; override to force):
+ *   FT_NEAR_METADATA            page_size-range item/metadata striding;
+ *                               default on 64-bit.  -DFT_NEAR_METADATA.
+ *   FT_FAR_METADATA             2 MiB macro-range layout; default on 32-bit.
+ *                               -DFT_FAR_METADATA.
+ *
+ * Validation and debugging (disabled by default; testing only, non-trivial
+ * overhead):
+ *   FEATURE_FT_VERIFY_AT_MUTATION  cds_ft_verify the whole trie at the exit
+ *                                  of every public write.  -DFEATURE_FT_VERIFY_AT_MUTATION.
+ *   FEATURE_FT_EXCL_VALIDATE       runtime check of the writer/reader
+ *                                  access-discipline contract.  -DFEATURE_FT_EXCL_VALIDATE.
+ *   DEBUG_COUNTERS                 group-scoped node / cell alloc balance
+ *                                  accounting.  Uncomment below or -DDEBUG_COUNTERS.
+ *   DEBUG / DEBUG_CLEAR_ITER       verbose dbg_printf / poison recycled
+ *                                  iterator state.  Uncomment below.
+ *
+ * Diagnostics and tracing:
+ *   CDS_FT_SUPPRESS_ISA_WARNING    silence the x86 -mpopcnt / -mbmi build
+ *                                  #warnings.  -DCDS_FT_SUPPRESS_ISA_WARNING.
+ *   FT_ENABLE_TRACING              emit LTTng-UST tracepoints from the read /
+ *                                  mutation paths (see fractal-trie.c).
+ *                                  -DFT_ENABLE_TRACING.
+ * =======================================================================
+ */
+
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
