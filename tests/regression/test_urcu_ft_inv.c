@@ -3997,12 +3997,19 @@ static int inv_merge_nonroot_dst_no_escape(void)
 /*   reader must never escape UP into dst.                              */
 /* ================================================================== */
 
+/*
+ * @shape selects the (source-root, dst-point) combination:
+ *   0  external src  -> GLUE diverge ("mb" inside "mango")
+ *   1  compressed src-> GLUE diverge ("mb" inside "mango")
+ *   2  external src  -> NOSPLIT at-node (empty slot of dst {za,zb} at "zc")
+ *   3  compressed src-> NOSPLIT build-branch (dst {m}, key "mxyz")
+ */
 struct inv_rerooted_ctx {
 	struct cds_ft *dst;
 	struct cds_ft *src;
 	const char *test_name;
 	pthread_mutex_t lock;
-	int shape;			/* 0 external, 1 compressed */
+	int shape;
 };
 
 struct inv_rerooted_reader_arg {
@@ -4080,9 +4087,26 @@ static void *inv_rerooted_reader(void *arg)
 	return NULL;
 }
 
+/* Per-shape merge parameters: dst/src merge keys, the moved (merged) dst keys to
+ * remove on reset, and whether the source root is compressed (two src keys). */
+struct inv_rerooted_shape {
+	const char *dst_key;
+	const char *src_key;
+	const char *merged[2];		/* NULL-terminated */
+	bool compressed_src;		/* src holds xabc/xabd vs a/b */
+};
+
+static const struct inv_rerooted_shape inv_rerooted_shapes[] = {
+	{ "mb",   "a", { "mb", NULL },              false },
+	{ "mb",   "x", { "mbabc", "mbabd" },        true  },
+	{ "zc",   "a", { "zc", NULL },              false },
+	{ "mxyz", "x", { "mxyzabc", "mxyzabd" },    true  },
+};
+
 static void *inv_rerooted_writer(void *arg)
 {
 	struct inv_rerooted_ctx *ctx = (struct inv_rerooted_ctx *) arg;
+	const struct inv_rerooted_shape *sh = &inv_rerooted_shapes[ctx->shape];
 	struct cds_ft_iter *iter;
 
 	rcu_register_thread();
@@ -4095,14 +4119,13 @@ static void *inv_rerooted_writer(void *arg)
 
 	while (!test_stop) {
 		enum cds_ft_status s;
+		unsigned int i;
 
 		pthread_mutex_lock(&ctx->lock);
-		if (ctx->shape == 0)
-			s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "mb", 2,
-					ctx->src, (const uint8_t *) "a", 1);
-		else
-			s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "mb", 2,
-					ctx->src, (const uint8_t *) "x", 1);
+		s = cds_ft_merge_at(ctx->dst,
+				(const uint8_t *) sh->dst_key, strlen(sh->dst_key),
+				ctx->src,
+				(const uint8_t *) sh->src_key, strlen(sh->src_key));
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "inv_rerooted writer: %s\n",
@@ -4114,22 +4137,21 @@ static void *inv_rerooted_writer(void *arg)
 		/* Reset: pull the merged keys out of dst, re-populate src. */
 		rcu_read_lock();
 		pthread_mutex_lock(&ctx->lock);
-		if (ctx->shape == 0) {
-			struct ft_test_node *n = node_alloc(401);
-
-			inv_merge_remove_key(ctx->dst, iter, "mb");
-			cds_ft_insert(ctx->src, (const uint8_t *) "a", 1,
-				&n->node);
-		} else {
+		for (i = 0; i < 2 && sh->merged[i]; i++)
+			inv_merge_remove_key(ctx->dst, iter, sh->merged[i]);
+		if (sh->compressed_src) {
 			struct ft_test_node *n1 = node_alloc(411);
 			struct ft_test_node *n2 = node_alloc(412);
 
-			inv_merge_remove_key(ctx->dst, iter, "mbabc");
-			inv_merge_remove_key(ctx->dst, iter, "mbabd");
 			cds_ft_insert(ctx->src, (const uint8_t *) "xabc", 4,
 				&n1->node);
 			cds_ft_insert(ctx->src, (const uint8_t *) "xabd", 4,
 				&n2->node);
+		} else {
+			struct ft_test_node *n = node_alloc(401);
+
+			cds_ft_insert(ctx->src, (const uint8_t *) "a", 1,
+				&n->node);
 		}
 		pthread_mutex_unlock(&ctx->lock);
 		rcu_read_unlock();
@@ -4141,12 +4163,18 @@ static void *inv_rerooted_writer(void *arg)
 	return NULL;
 }
 
-static int inv_merge_rerooted_glue_run(int shape, const char *name)
+static int inv_merge_rerooted_run(int shape, const char *name)
 {
-	static const char *const dst_ext[] = { "mango", "mb", NULL };
-	static const char *const src_ext[] = { "a", "b", NULL };
-	static const char *const dst_cmp[] = { "mango", "mbabc", "mbabd", NULL };
-	static const char *const src_cmp[] = { "xabc", "xabd", NULL };
+	/* dst-reader namespaces per shape (base dst keys + transient merged). */
+	static const char *const dst_allow[][4] = {
+		{ "mango", "mb", NULL },		/* 0 ext glue */
+		{ "mango", "mbabc", "mbabd", NULL },	/* 1 cmp glue */
+		{ "za", "zb", "zc", NULL },		/* 2 ext at-node */
+		{ "m", "mxyzabc", "mxyzabd", NULL },	/* 3 cmp branch */
+	};
+	static const char *const src_ab[] = { "a", "b", NULL };
+	static const char *const src_x[] = { "xabc", "xabd", NULL };
+	const struct inv_rerooted_shape *sh = &inv_rerooted_shapes[shape];
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
@@ -4182,21 +4210,29 @@ static int inv_merge_rerooted_glue_run(int shape, const char *name)
 
 	rcu_read_lock();
 	{
-		struct ft_test_node *dn = node_alloc(1);
-
-		cds_ft_insert(dst, (const uint8_t *) "mango", 5, &dn->node);
-		if (shape == 0) {
-			struct ft_test_node *a = node_alloc(2);
-			struct ft_test_node *b = node_alloc(3);
-
-			cds_ft_insert(src, (const uint8_t *) "a", 1, &a->node);
-			cds_ft_insert(src, (const uint8_t *) "b", 1, &b->node);
+		/* dst base keys: the merge target diverges / lands inside these. */
+		if (shape == 2) {
+			cds_ft_insert(dst, (const uint8_t *) "za", 2,
+				&node_alloc(1)->node);
+			cds_ft_insert(dst, (const uint8_t *) "zb", 2,
+				&node_alloc(2)->node);
+		} else if (shape == 3) {
+			cds_ft_insert(dst, (const uint8_t *) "m", 1,
+				&node_alloc(1)->node);
 		} else {
-			struct ft_test_node *c = node_alloc(2);
-			struct ft_test_node *d = node_alloc(3);
-
-			cds_ft_insert(src, (const uint8_t *) "xabc", 4, &c->node);
-			cds_ft_insert(src, (const uint8_t *) "xabd", 4, &d->node);
+			cds_ft_insert(dst, (const uint8_t *) "mango", 5,
+				&node_alloc(1)->node);
+		}
+		if (sh->compressed_src) {
+			cds_ft_insert(src, (const uint8_t *) "xabc", 4,
+				&node_alloc(3)->node);
+			cds_ft_insert(src, (const uint8_t *) "xabd", 4,
+				&node_alloc(4)->node);
+		} else {
+			cds_ft_insert(src, (const uint8_t *) "a", 1,
+				&node_alloc(3)->node);
+			cds_ft_insert(src, (const uint8_t *) "b", 1,
+				&node_alloc(4)->node);
 		}
 	}
 	rcu_read_unlock();
@@ -4216,9 +4252,8 @@ static int inv_merge_rerooted_glue_run(int shape, const char *name)
 
 		rargs[i].ctx = &ctx;
 		rargs[i].trie = on_dst ? dst : src;
-		rargs[i].allowed = on_dst
-			? (shape == 0 ? dst_ext : dst_cmp)
-			: (shape == 0 ? src_ext : src_cmp);
+		rargs[i].allowed = on_dst ? dst_allow[shape]
+			: (sh->compressed_src ? src_x : src_ab);
 		rargs[i].which = on_dst ? "dst" : "src";
 		pthread_create(&readers[i], NULL, inv_rerooted_reader,
 			&rargs[i]);
@@ -4260,9 +4295,13 @@ static int inv_merge_rerooted_glue_run(int shape, const char *name)
 
 static int inv_merge_rerooted_glue_no_escape(void)
 {
-	if (inv_merge_rerooted_glue_run(0, "inv_merge_rerooted_glue_ext") < 0)
+	if (inv_merge_rerooted_run(0, "inv_merge_rerooted_glue_ext") < 0)
 		return -1;
-	return inv_merge_rerooted_glue_run(1, "inv_merge_rerooted_glue_compressed");
+	if (inv_merge_rerooted_run(1, "inv_merge_rerooted_glue_compressed") < 0)
+		return -1;
+	if (inv_merge_rerooted_run(2, "inv_merge_rerooted_nosplit_atnode") < 0)
+		return -1;
+	return inv_merge_rerooted_run(3, "inv_merge_rerooted_nosplit_branch");
 }
 
 /* ================================================================== */

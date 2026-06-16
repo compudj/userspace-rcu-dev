@@ -11461,6 +11461,8 @@ struct ft_graft_glue {
 static void ft_graft_glue_track(struct ft_graft_glue *g,
 		struct cds_ft_inode_flag *nf);
 static void ft_graft_glue_untrack(struct cds_ft *ft, struct ft_graft_glue *g, void *node_ptr);
+static bool ft_graft_glue_is_fresh(struct cds_ft *ft, struct ft_graft_glue *g,
+		struct cds_ft_inode_flag *child);
 static void ft_graft_glue_defer_edge(struct cds_ft *ft, struct ft_graft_glue *g,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *parent,
@@ -11574,10 +11576,15 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 			 * Build-invisible (graft): cn->child is LIVE — either
 			 * the merged-away child_cn's grandchild or the leaf
 			 * itself.  Record its back-pointer for the post-sync
-			 * commit instead of flipping it now.  An absorbed
-			 * child_cn is a fresh canonicalization wrapper: drop it
-			 * from glue tracking as it is freed here so the abort
-			 * path cannot double-free it.
+			 * commit instead of flipping it now.
+			 *
+			 * The absorbed child_cn is freed one of two ways: a fresh
+			 * canonicalization wrapper (tracked in @glue) is dropped
+			 * from tracking and freed here, so the abort path cannot
+			 * double-free it; a LIVE compressed leaf (a re-rooted-in-
+			 * place merge source absorbed into the branch run, never
+			 * tracked) is still reader-reachable until the commit, so
+			 * its free is DEFERRED past the grace period instead.
 			 *
 			 * Track the PLAIN @cflag (not the skip form returned to
 			 * the caller): the abort path resolves a tracked node
@@ -11588,8 +11595,15 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 			ft_graft_glue_defer_edge(ft, glue, cn->child, cflag,
 				&cn->child);
 			if (child_cn) {
-				ft_graft_glue_untrack(ft, glue, child_cn);
-				free_compressed_node_unpublished(ft, child_cn);
+				if (ft_graft_glue_is_fresh(ft, glue,
+						ft_compressed_node_flag(child_cn))) {
+					ft_graft_glue_untrack(ft, glue, child_cn);
+					free_compressed_node_unpublished(ft,
+						child_cn);
+				} else {
+					ft_graft_glue_defer_free(glue, child_cn,
+						true);
+				}
 			}
 			ft_graft_glue_track(glue, cflag);
 			/*
@@ -19806,15 +19820,85 @@ int ft_merge_reserve_add_built(struct cds_ft *ft, struct cds_ft_alloc_reserve *r
  * nothing can strand the moved externals on an allocation failure -- no
  * rollback, hence no leak (contrast the legacy detach-then-graft fallback).
  *
- * This increment covers the GLUE diverge dst shape only (the dst key diverges
- * inside a compressed node, so ft_graft_build assembles the whole split cluster
- * invisibly -- no reserve needed).  *handled is left false for the NOSPLIT /
- * KEY_SHORTER-src shapes, so the caller falls through to the legacy path.
+ * Covers both diverged-dst shapes: a GLUE diverge (the dst key diverges inside a
+ * compressed node, so ft_graft_build assembles the whole split cluster invisibly
+ * -- no reserve) and a NOSPLIT point (an empty slot at @dst_key, or a built
+ * branch / displaced external -- ft_store_at_graft_point grafts it post-drain
+ * drawing from a pre-filled reserve so it cannot fail on the arena).  *handled is
+ * always set true here (an EXACT off_src == 0 source); the KEY_SHORTER source
+ * (off_src > 0) is gated out by the caller for now.
  *
  * @okey_dst / @okey_src are ORDINAL; @dst_key is the APPLICATION dst key (the
  * ordered-list splice-pos descent remaps it).  @payload is d_src->nf (EXACT src,
  * off_src == 0); @cnt_src is its unique-key count.
  */
+/*
+ * Reserve EXACTLY the nodes ft_store_at_graft_point will allocate for a NOSPLIT
+ * in-place graft of @payload at the located point @d, so the post-drain store
+ * draws them and cannot fail on an arena allocation.  @d is ft_graft_build's
+ * NOSPLIT descent.  Two shapes:
+ *  - at-node (@d->depth == @key_len, empty slot): the only commit node alloc is
+ *    an optional grow-recompact of the attach node @d->pnf.
+ *  - build-a-branch (@d->depth < @key_len): ft_build_branch's nodes, learned by
+ *    a build-and-abort pass (it builds into a throwaway glue with no dst
+ *    mutation), plus an optional grow when an empty slot ADDS a child (a
+ *    displaced external is REPLACED at its slot, no grow).
+ * The payload needs NO canonicalize allocation: ft_compress_single_child_if_
+ * needed only allocates for a 1-child internal under skip mode, and a skip-mode
+ * trie never holds a 1-child internal as a subtree root (it is canonicalized at
+ * creation), so a re-rooted payload is never that shape.  The flip batch is a
+ * malloc (not arena), so it is not reserved.  Returns 0, or -ENOMEM (learn build
+ * or fill OOM; the caller drains the reserve).
+ */
+static
+int ft_merge_nosplit_reserve(struct cds_ft *dst_ft, const uint8_t *okey_dst,
+		size_t dst_key_len, struct cds_ft_inode_flag *payload,
+		unsigned long cnt_src, struct ft_descent *d,
+		struct cds_ft_alloc_reserve *reserve)
+{
+	struct cds_ft_inode_flag *displaced;
+	struct ft_graft_glue lg;
+	struct cds_ft_inode_flag *branch;
+	bool grow = false;
+	int rret = 0, bi;
+
+	if (d->depth == dst_key_len && !d->nf) {
+		grow = true;			/* at-node: only the grow, if any */
+	} else {
+		displaced = (d->nf && ft_node_external(d->nf)) ? d->nf : NULL;
+		ft_graft_glue_init(&lg);
+		branch = ft_build_branch(dst_ft, okey_dst, d->depth, dst_key_len,
+			payload, cnt_src, displaced != NULL, &lg);
+		if (!branch) {
+			ft_graft_glue_fini(&lg);
+			return -ENOMEM;
+		}
+		for (bi = 0; bi < lg.nr_built && !rret; bi++)
+			rret = ft_merge_reserve_add_built(dst_ft, reserve,
+				lg.built[bi]);
+		ft_graft_glue_abort(dst_ft, &lg);	/* frees the learn nodes */
+		if (rret)
+			return rret;
+		grow = (displaced == NULL);	/* an empty slot ADDS a child */
+	}
+
+	if (grow) {
+		struct cds_ft_metadata *am =
+			cds_ft_item_to_metadata(ft_node_ptr(d->pnf));
+		unsigned int aidx = ft_node_type(d->pnf);
+
+		if (am->nr_child + 1 > ft_types[aidx].max_child) {
+			unsigned int gidx = find_nearest_type_index(aidx,
+				am->nr_child + 1, am->parent == NULL);
+
+			rret = cds_ft_alloc_reserve_add(dst_ft, reserve,
+				CDS_FT_ALLOC_KIND_NODE, ft_types[gidx].order,
+				ft_types[gidx].bitmap, 1);
+		}
+	}
+	return rret;
+}
+
 static
 enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		struct cds_ft *src_ft,
@@ -19824,6 +19908,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		bool *handled)
 {
 	struct ft_graft_glue glue;
+	struct cds_ft_alloc_reserve reserve;
 	struct ft_descent d;
 	enum ft_graft_prep prep;
 	struct cds_ft_inode_flag *attached_nf, *aparent;
@@ -19838,16 +19923,16 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	/*
 	 * Classify the dst graft point with a build-invisible prep.  A GLUE
 	 * diverge builds the whole split cluster into @glue (referencing @payload
-	 * by deferred edge); a NOSPLIT outcome is deferred to the legacy / reserve
-	 * path (next increment).
+	 * by deferred edge), published failure-free after the drain.  A NOSPLIT
+	 * point is grafted post-drain by ft_store_at_graft_point drawing from a
+	 * pre-filled reserve, so it likewise cannot fail on an arena allocation.
+	 * Either way the source unlink is the single last fallible step, so an OOM
+	 * leaves both tries pristine -- no rollback, no leak.
 	 */
 	ft_graft_glue_init(&glue);
+	memset(&reserve, 0, sizeof(reserve));
 	prep = ft_graft_build(dst_ft, okey_dst, dst_key_len, payload, cnt_src,
 			&d, &glue);
-	if (prep == FT_GRAFT_PREP_NOSPLIT) {
-		ft_graft_glue_fini(&glue);
-		return CDS_FT_STATUS_OK;		/* not handled */
-	}
 	*handled = true;
 	if (prep == FT_GRAFT_PREP_OOM) {
 		ft_graft_glue_abort(dst_ft, &glue);
@@ -19858,7 +19943,16 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		ft_graft_glue_fini(&glue);
 		return CDS_FT_STATUS_POPULATED_ERROR;
 	}
-	/* prep == FT_GRAFT_PREP_GLUE: cluster built invisibly, dst still pristine. */
+	if (prep == FT_GRAFT_PREP_NOSPLIT) {
+		/* Pre-fill the manifest while both tries are still pristine. */
+		if (ft_merge_nosplit_reserve(dst_ft, okey_dst, dst_key_len,
+				payload, cnt_src, &d, &reserve)) {
+			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+			ft_graft_glue_fini(&glue);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+	}
+	/* GLUE: cluster built invisibly.  NOSPLIT: reserve filled, @d located. */
 
 	/*
 	 * Ordered list: locate the dst splice neighbours while dst is still
@@ -19877,15 +19971,16 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	/*
 	 * Last fallible step: unlink the source subtree in place, preserving
 	 * @payload.  On OOM the unlink self-undoes (src pristine) and the still-
-	 * invisible cluster is aborted (dst pristine) -- the no-rollback property.
+	 * invisible cluster / reserve is released (dst pristine) -- no rollback.
 	 */
 	if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
 			cnt_src) < 0) {
+		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		ft_graft_glue_abort(dst_ft, &glue);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
-	/* ===== Everything from here on is failure-free. ===== */
+	/* ===== Everything from here on is failure-free (bar a flip-batch malloc). ===== */
 
 	/*
 	 * Remove the source run from src's ordered list now (the cells keep their
@@ -19898,17 +19993,42 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
 
-	/*
-	 * Failure-free commit of the build-invisible diverge cluster: wire the
-	 * deferred live back-pointers (the payload, the displaced old child, the
-	 * cluster top), splice the cluster in with the single forward publish,
-	 * then reclaim the replaced compressed node.
-	 */
-	ft_graft_glue_apply_deferred(dst_ft, &glue);
-	ft_graft_glue_publish(dst_ft, &glue);
-	attached_nf = glue.attached_nf;
-	ft_graft_glue_free_old(dst_ft, &glue);
-	ft_graft_glue_fini(&glue);
+	if (prep == FT_GRAFT_PREP_GLUE) {
+		/*
+		 * Failure-free commit of the build-invisible diverge cluster: wire
+		 * the deferred live back-pointers (the payload, the displaced old
+		 * child, the cluster top), splice the cluster in with the single
+		 * forward publish, then reclaim the replaced compressed node.
+		 */
+		ft_graft_glue_apply_deferred(dst_ft, &glue);
+		ft_graft_glue_publish(dst_ft, &glue);
+		attached_nf = glue.attached_nf;
+		ft_graft_glue_free_old(dst_ft, &glue);
+		ft_graft_glue_fini(&glue);
+	} else {
+		/*
+		 * NOSPLIT: graft the in-place payload at @d, drawing every node
+		 * allocation from the reserve so the store cannot fail on the arena.
+		 * The flip batch is a malloc (not reserved): a true malloc OOM there
+		 * is the single remaining residual -- the source is already unlinked,
+		 * so the moved externals would strand (production-only, never under
+		 * the arena fault injection).  Free the unpublished build on that.
+		 */
+		unsigned int adepth = 0;
+		enum cds_ft_status st;
+
+		cds_ft_alloc_reserve_activate(dst_ft, &reserve);
+		st = ft_store_at_graft_point(dst_ft, okey_dst, dst_key_len, &d,
+				payload, cnt_src, &attached_nf, &adepth, &glue);
+		cds_ft_alloc_reserve_deactivate(dst_ft);
+		if (st != CDS_FT_STATUS_OK) {
+			ft_graft_glue_abort(dst_ft, &glue);
+			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+			return st;
+		}
+		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+		ft_graft_glue_fini(&glue);
+	}
 
 	/*
 	 * Propagate the moved key count up dst's ancestor chain, starting from
@@ -20362,8 +20482,9 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	 * Re-rooted source (compressed/external/1-child d_src.nf), diverged dst:
 	 * graft the source subtree IN PLACE (no detach, no re-root) so the build-
 	 * invisible cluster references it directly and the source unlink is the
-	 * last fallible step -- the leak-free reorder.  Handles the GLUE diverge
-	 * dst shape; NOSPLIT / KEY_SHORTER fall through (handled stays false).
+	 * last fallible step -- the leak-free reorder.  Handles both the GLUE
+	 * diverge and the NOSPLIT (at-node / build-branch) dst shapes for an EXACT
+	 * source; a KEY_SHORTER source (off_src > 0) still falls through.
 	 */
 	if (ks == FT_GRAFT_SWAP_EXACT && off_src == 0) {
 		bool handled;
