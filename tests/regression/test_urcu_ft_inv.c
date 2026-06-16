@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	25
+#define NR_TESTS	26
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -3981,6 +3981,292 @@ static int inv_merge_nonroot_dst_no_escape(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 11b: RE-ROOTED source, GLUE-diverge dst, ORDERED list   */
+/*                                                                    */
+/*   The writer merges a SUB-position source whose subtree root is     */
+/*   re-rooted (an EXTERNAL leaf, shape 0; or a COMPRESSED run, shape   */
+/*   1) at dst key "mb", which DIVERGES inside dst's compressed         */
+/*   "mango" -- the build-invisible in-place graft reorder             */
+/*   (ft_merge_graft_subpos_inplace), not the legacy detach path.  The */
+/*   group has the ORDERED CELL list ON, so the writer also moves the  */
+/*   source's ordered run into dst and (external shape) refreshes the   */
+/*   moved head's cell edge byte; concurrent ordered readers iterating  */
+/*   dst (cell-list path) across the flip must see ONLY dst's namespace */
+/*   with correct keys -- a missed flip-proxy resolve, a mis-spliced    */
+/*   run, or a stale edge byte surfaces an out-of-namespace key.  A src */
+/*   reader must never escape UP into dst.                              */
+/* ================================================================== */
+
+struct inv_rerooted_ctx {
+	struct cds_ft *dst;
+	struct cds_ft *src;
+	const char *test_name;
+	pthread_mutex_t lock;
+	int shape;			/* 0 external, 1 compressed */
+};
+
+struct inv_rerooted_reader_arg {
+	struct inv_rerooted_ctx *ctx;
+	struct cds_ft *trie;
+	const char *const *allowed;	/* NULL-terminated allowed key set */
+	const char *which;
+};
+
+static bool inv_rerooted_key_allowed(const char *const *allowed,
+		const uint8_t *k, size_t kl)
+{
+	for (; *allowed; allowed++)
+		if (strlen(*allowed) == kl && memcmp(*allowed, k, kl) == 0)
+			return true;
+	return false;
+}
+
+static void *inv_rerooted_reader(void *arg)
+{
+	struct inv_rerooted_reader_arg *ra =
+		(struct inv_rerooted_reader_arg *) arg;
+	struct inv_rerooted_ctx *ctx = ra->ctx;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+	const unsigned int max_count = 32;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ra->trie, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		bool reverse = (iters & 1) != 0;
+		enum cds_ft_status s;
+		unsigned int count = 0;
+
+		rcu_read_lock();
+		s = reverse ? cds_ft_lookup_last(ra->trie, iter)
+			: cds_ft_lookup_first(ra->trie, iter);
+		while (s == CDS_FT_STATUS_OK && count++ < max_count) {
+			uint8_t k[16];
+			size_t kl;
+
+			cds_ft_iter_get_key(iter, k, sizeof(k), &kl);
+			if (!inv_rerooted_key_allowed(ra->allowed, k, kl))
+				report_violation(ctx->test_name,
+					"%s reader saw out-of-namespace key "
+					"(len %zu, %.*s) — merge re-parent / cell "
+					"escape (iter #%lu, %s)",
+					ra->which, kl, (int) kl,
+					kl ? (const char *) k : "",
+					iters, reverse ? "reverse" : "forward");
+			s = reverse ? cds_ft_lookup_lt(ra->trie, iter)
+				: cds_ft_lookup_gt(ra->trie, iter);
+		}
+		if (count >= max_count)
+			report_violation(ctx->test_name,
+				"%s ordered traversal returned >= %u keys — "
+				"escape/loop (iter #%lu, %s)",
+				ra->which, max_count, iters,
+				reverse ? "reverse" : "forward");
+		rcu_read_unlock();
+
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_rerooted_writer(void *arg)
+{
+	struct inv_rerooted_ctx *ctx = (struct inv_rerooted_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->dst, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		enum cds_ft_status s;
+
+		pthread_mutex_lock(&ctx->lock);
+		if (ctx->shape == 0)
+			s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "mb", 2,
+					ctx->src, (const uint8_t *) "a", 1);
+		else
+			s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "mb", 2,
+					ctx->src, (const uint8_t *) "x", 1);
+		pthread_mutex_unlock(&ctx->lock);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_rerooted writer: %s\n",
+				cds_ft_status_to_string(s));
+			break;
+		}
+		rcu_quiescent_state();
+
+		/* Reset: pull the merged keys out of dst, re-populate src. */
+		rcu_read_lock();
+		pthread_mutex_lock(&ctx->lock);
+		if (ctx->shape == 0) {
+			struct ft_test_node *n = node_alloc(401);
+
+			inv_merge_remove_key(ctx->dst, iter, "mb");
+			cds_ft_insert(ctx->src, (const uint8_t *) "a", 1,
+				&n->node);
+		} else {
+			struct ft_test_node *n1 = node_alloc(411);
+			struct ft_test_node *n2 = node_alloc(412);
+
+			inv_merge_remove_key(ctx->dst, iter, "mbabc");
+			inv_merge_remove_key(ctx->dst, iter, "mbabd");
+			cds_ft_insert(ctx->src, (const uint8_t *) "xabc", 4,
+				&n1->node);
+			cds_ft_insert(ctx->src, (const uint8_t *) "xabd", 4,
+				&n2->node);
+		}
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_merge_rerooted_glue_run(int shape, const char *name)
+{
+	static const char *const dst_ext[] = { "mango", "mb", NULL };
+	static const char *const src_ext[] = { "a", "b", NULL };
+	static const char *const dst_cmp[] = { "mango", "mbabc", "mbabd", NULL };
+	static const char *const src_cmp[] = { "xabc", "xabd", NULL };
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct inv_rerooted_ctx ctx;
+	struct inv_rerooted_reader_arg rargs[2 * NR_READERS_DEFAULT];
+	struct timespec t0;
+	pthread_t readers[2 * NR_READERS_DEFAULT], writer;
+	unsigned int i;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(gattr, 16) < 0 ||
+	    cds_ft_group_attr_set_ordered_list(gattr, true) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	if (cds_ft_group_create(gattr, &group) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(gattr);
+
+	if (cds_ft_create(group, NULL, &dst) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &src) < 0) {
+		cds_ft_destroy(dst);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	{
+		struct ft_test_node *dn = node_alloc(1);
+
+		cds_ft_insert(dst, (const uint8_t *) "mango", 5, &dn->node);
+		if (shape == 0) {
+			struct ft_test_node *a = node_alloc(2);
+			struct ft_test_node *b = node_alloc(3);
+
+			cds_ft_insert(src, (const uint8_t *) "a", 1, &a->node);
+			cds_ft_insert(src, (const uint8_t *) "b", 1, &b->node);
+		} else {
+			struct ft_test_node *c = node_alloc(2);
+			struct ft_test_node *d = node_alloc(3);
+
+			cds_ft_insert(src, (const uint8_t *) "xabc", 4, &c->node);
+			cds_ft_insert(src, (const uint8_t *) "xabd", 4, &d->node);
+		}
+	}
+	rcu_read_unlock();
+
+	ctx.dst = dst;
+	ctx.src = src;
+	ctx.test_name = name;
+	ctx.shape = shape;
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
+		bool on_dst = (i & 1) == 0;
+
+		rargs[i].ctx = &ctx;
+		rargs[i].trie = on_dst ? dst : src;
+		rargs[i].allowed = on_dst
+			? (shape == 0 ? dst_ext : dst_cmp)
+			: (shape == 0 ? src_ext : src_cmp);
+		rargs[i].which = on_dst ? "dst" : "src";
+		pthread_create(&readers[i], NULL, inv_rerooted_reader,
+			&rargs[i]);
+	}
+	pthread_create(&writer, NULL, inv_rerooted_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	pthread_join(writer, NULL);
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "%s: %lu violation(s)\n", name,
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+
+	drain_trie_local(dst);
+	drain_trie_local(src);
+	rcu_barrier();
+	cds_ft_destroy(dst);
+	cds_ft_destroy(src);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int inv_merge_rerooted_glue_no_escape(void)
+{
+	if (inv_merge_rerooted_glue_run(0, "inv_merge_rerooted_glue_ext") < 0)
+		return -1;
+	return inv_merge_rerooted_glue_run(1, "inv_merge_rerooted_glue_compressed");
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*   INVARIANT 12: Merge into a COMPRESSED dst merge point never       */
 /*   escapes (the M_slot skip-encoded interior publish via flip proxy) */
 /*                                                                    */
@@ -5766,6 +6052,9 @@ int main(int argc, char **argv)
 
 	diag("11. Merge into a non-root destination never escapes");
 	RUN_TEST(inv_merge_nonroot_dst_no_escape);
+
+	diag("11b. Re-rooted source, GLUE-diverge dst, ordered list");
+	RUN_TEST(inv_merge_rerooted_glue_no_escape);
 
 	diag("12. Merge into a compressed destination never escapes");
 	RUN_TEST(inv_merge_compressed_dst_no_escape);

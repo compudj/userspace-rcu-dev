@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 262
+#define NR_TESTS 266
 #else
-#define NR_TESTS 242
+#define NR_TESTS 244
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -5681,6 +5681,135 @@ out:
 	cds_ft_destroy(dst);
 	cds_ft_group_destroy(group);
 	return ret;
+}
+
+/*
+ * Ordered-list correctness across a RE-ROOTED source, GLUE diverge merge_at:
+ * exercises ft_merge_graft_subpos_inplace's ordered-cell run capture / unlink /
+ * splice.  The OOM unit tests run with the list OFF, so this is the
+ * deterministic ordered check.  src@"a" (an EXTERNAL leaf, @shape 0) or src@"x"
+ * (a COMPRESSED "ab" run, @shape 1) merges at "mb", which diverges inside dst's
+ * compressed "mango"; the moved run must land in dst's cell list in key order
+ * ("mango" < "mb..."), with src's list left consistent.
+ */
+static int merge_rerooted_glue_ordered(int shape)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst = NULL, *src = NULL;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	int ret = -1;
+	const char *exp_dst[3];
+	unsigned int nexp_dst, i;
+	struct ft_test_node *d1 = node_alloc(1);
+	struct ft_test_node *s1 = node_alloc(3);
+	struct ft_test_node *s2 = node_alloc(4);
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_ordered_list(attr, true);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+	    cds_ft_create(group, NULL, &src) < 0 ||
+	    cds_ft_iter_create(dst, &iter) < 0)
+		abort();
+
+	rcu_read_lock();
+	if (cds_ft_insert(dst, (const uint8_t *) "mango", 5, &d1->node) < 0) {
+		rcu_read_unlock();
+		goto out;
+	}
+	if (shape == 0) {
+		if (cds_ft_insert(src, (const uint8_t *) "a", 1, &s1->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *) "b", 1, &s2->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		s = cds_ft_merge_at(dst, (const uint8_t *) "mb", 2, src,
+				(const uint8_t *) "a", 1);
+	} else {
+		if (cds_ft_insert(src, (const uint8_t *) "xabc", 4, &s1->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *) "xabd", 4, &s2->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+		s = cds_ft_merge_at(dst, (const uint8_t *) "mb", 2, src,
+				(const uint8_t *) "x", 1);
+	}
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rerooted_glue_ord[%d]: merge: %s\n", shape,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	if (shape == 0) {
+		exp_dst[0] = "mango"; exp_dst[1] = "mb"; nexp_dst = 2;
+	} else {
+		exp_dst[0] = "mango"; exp_dst[1] = "mbabc"; exp_dst[2] = "mbabd";
+		nexp_dst = 3;
+	}
+
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rerooted_glue_ord[%d]: verify failed\n", shape);
+		rcu_read_unlock();
+		goto out;
+	}
+	/* Ordered walk over dst must yield exactly exp_dst, in key order. */
+	s = cds_ft_lookup_first(dst, iter);
+	for (i = 0; i < nexp_dst; i++) {
+		uint8_t rk[64];
+		size_t rl;
+
+		if (s != CDS_FT_STATUS_OK ||
+		    cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
+				CDS_FT_STATUS_OK ||
+		    rl != strlen(exp_dst[i]) ||
+		    memcmp(rk, exp_dst[i], rl) != 0) {
+			fprintf(stderr,
+				"rerooted_glue_ord[%d]: dst pos %u mismatch (status=%d got '%.*s' want '%s')\n",
+				shape, i, (int) s, (int) rl, (const char *) rk,
+				exp_dst[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		s = cds_ft_next(dst, iter);
+	}
+	if (s == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rerooted_glue_ord[%d]: dst has extra keys\n",
+			shape);
+		rcu_read_unlock();
+		goto out;
+	}
+	/* src keeps a consistent, non-empty (shape 0) or empty (shape 1) list. */
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_merge_rerooted_glue_ordered_ext(void)
+{
+	return merge_rerooted_glue_ordered(0);
+}
+
+static int test_merge_rerooted_glue_ordered_compressed(void)
+{
+	return merge_rerooted_glue_ordered(1);
 }
 
 /*
@@ -19057,6 +19186,122 @@ static int test_merge_oom_subpos_branch(void)
 }
 
 /*
+ * OOM coverage for the RE-ROOTED source, GLUE diverge dst: a sub-position
+ * source whose subtree root is EXTERNAL (@shape 0: src@"a", a single key) or
+ * COMPRESSED (@shape 1: src@"x", a compressed "ab" run), merged at "mb" which
+ * diverges inside dst's compressed "mango".  These shapes used to fall to the
+ * leaky detach-then-graft path because detach RE-ROOTS the payload; instead
+ * cds_ft_merge_at now grafts the subtree IN PLACE (no re-root) so the GLUE
+ * cluster is built invisibly referencing it and the source unlink is the last
+ * fallible step.  Every injected OOM hits the cluster build or the unlink (both
+ * leaving the tries pristine), or is armed past them and the move succeeds; the
+ * external shape additionally exercises the external-payload count propagation
+ * (attached_nf is the external itself).  RUN_TEST's leak_check catches any
+ * stranded external on the no-rollback property.
+ */
+static int run_merge_oom_rerooted_glue(int nr_faults, int shape)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group);
+		struct cds_ft *src;
+		struct ft_test_node *d1 = node_alloc(1);
+		struct ft_test_node *s1 = node_alloc(3);
+		struct ft_test_node *s2 = node_alloc(4);
+		enum cds_ft_status s;
+		int verified, keys_ok;
+
+		if (cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom_rerooted_glue: src create failed\n");
+			return -1;
+		}
+		if (cds_ft_insert(dst, (const uint8_t *)"mango", 5, &d1->node) < 0)
+			rc = -1;
+		if (shape == 0) {
+			/* src@"a" is an EXTERNAL leaf; "b" stays behind. */
+			if (cds_ft_insert(src, (const uint8_t *)"a", 1, &s1->node) < 0 ||
+			    cds_ft_insert(src, (const uint8_t *)"b", 1, &s2->node) < 0)
+				rc = -1;
+		} else {
+			/* src@"x" is a COMPRESSED "ab" run over {c,d}. */
+			if (cds_ft_insert(src, (const uint8_t *)"xabc", 4, &s1->node) < 0 ||
+			    cds_ft_insert(src, (const uint8_t *)"xabd", 4, &s2->node) < 0)
+				rc = -1;
+		}
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		if (shape == 0)
+			s = cds_ft_merge_at(dst, (const uint8_t *)"mb", 2,
+					src, (const uint8_t *)"a", 1);
+		else
+			s = cds_ft_merge_at(dst, (const uint8_t *)"mb", 2,
+					src, (const uint8_t *)"x", 1);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		keys_ok = graft_swap_oom_has_key(dst, "mango");
+		if (shape == 0) {
+			keys_ok = keys_ok && graft_swap_oom_has_key(src, "b");
+			if (s == CDS_FT_STATUS_OK)
+				keys_ok = keys_ok &&
+					graft_swap_oom_has_key(dst, "mb") &&
+					!graft_swap_oom_has_key(src, "a");
+			else
+				keys_ok = keys_ok &&
+					!graft_swap_oom_has_key(dst, "mb") &&
+					graft_swap_oom_has_key(src, "a");
+		} else {
+			if (s == CDS_FT_STATUS_OK)
+				keys_ok = keys_ok &&
+					graft_swap_oom_has_key(dst, "mbabc") &&
+					graft_swap_oom_has_key(dst, "mbabd") &&
+					!graft_swap_oom_has_key(src, "xabc") &&
+					!graft_swap_oom_has_key(src, "xabd");
+			else
+				keys_ok = keys_ok &&
+					!graft_swap_oom_has_key(dst, "mbabc") &&
+					!graft_swap_oom_has_key(dst, "mbabd") &&
+					graft_swap_oom_has_key(src, "xabc") &&
+					graft_swap_oom_has_key(src, "xabd");
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom_rerooted_glue[shape=%d]: %s after fault n=%d (merge=%s)\n",
+				shape, !verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_rerooted_glue_ext(void)
+{
+	return run_merge_oom_rerooted_glue(12, 0);
+}
+
+static int test_merge_oom_rerooted_glue_compressed(void)
+{
+	return run_merge_oom_rerooted_glue(16, 1);
+}
+
+/*
  * OOM coverage for the PIECEWISE merge: dst already has nodes that overlap
  * src's, so ft_merge_build must recurse INTO the shared spine -- copying the
  * shared branch nodes, splicing the same full keys ("aa", "ba"), and
@@ -20469,6 +20714,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_inequality_empty_key);
 	RUN_TEST(test_merge_ordered_fixed_root);
 	RUN_TEST(test_merge_at_fixed_ordered_splice);
+	RUN_TEST(test_merge_rerooted_glue_ordered_ext);
+	RUN_TEST(test_merge_rerooted_glue_ordered_compressed);
 	RUN_TEST(test_nonidentity_bulk_ops);
 	RUN_TEST(test_merge_at_overflow);
 
@@ -20682,6 +20929,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom_subpos_residual);
 	RUN_TEST(test_merge_oom_subpos_glue);
 	RUN_TEST(test_merge_oom_subpos_branch);
+	RUN_TEST(test_merge_oom_rerooted_glue_ext);
+	RUN_TEST(test_merge_oom_rerooted_glue_compressed);
 	RUN_TEST(test_merge_oom_overlap);
 	RUN_TEST(test_merge_oom_compressed);
 	RUN_TEST(test_merge_oom_nonroot_src);

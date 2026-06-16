@@ -19794,6 +19794,163 @@ int ft_merge_reserve_add_built(struct cds_ft *ft, struct cds_ft_alloc_reserve *r
 	}
 }
 
+/*
+ * Build-invisible graft of a SUB-position source subtree into a dst position
+ * ABSENT at @dst_key (the diverged-dst case) WITHOUT re-rooting the payload --
+ * the leak-free reorder for cds_ft_merge_at's residual shapes.  Modeled on
+ * ft_graft_keylen's commit, but the source side is ft_merge_spine_copy's: the
+ * payload stays @payload (= d_src->nf, referenced in place, not detached into a
+ * fresh root), and ft_merge_unlink_src_subtree is the single last fallible step
+ * (it self-undoes on OOM, preserving @payload).  Because the dst attach is built
+ * invisibly BEFORE that unlink and published failure-free AFTER the drain,
+ * nothing can strand the moved externals on an allocation failure -- no
+ * rollback, hence no leak (contrast the legacy detach-then-graft fallback).
+ *
+ * This increment covers the GLUE diverge dst shape only (the dst key diverges
+ * inside a compressed node, so ft_graft_build assembles the whole split cluster
+ * invisibly -- no reserve needed).  *handled is left false for the NOSPLIT /
+ * KEY_SHORTER-src shapes, so the caller falls through to the legacy path.
+ *
+ * @okey_dst / @okey_src are ORDINAL; @dst_key is the APPLICATION dst key (the
+ * ordered-list splice-pos descent remaps it).  @payload is d_src->nf (EXACT src,
+ * off_src == 0); @cnt_src is its unique-key count.
+ */
+static
+enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
+		struct cds_ft *src_ft,
+		const uint8_t *okey_dst, const uint8_t *dst_key, size_t dst_key_len,
+		const uint8_t *okey_src, size_t src_key_len,
+		struct cds_ft_inode_flag *payload, unsigned long cnt_src,
+		bool *handled)
+{
+	struct ft_graft_glue glue;
+	struct ft_descent d;
+	enum ft_graft_prep prep;
+	struct cds_ft_inode_flag *attached_nf, *aparent;
+	bool ms_ord = dst_ft->group->ordered_list_set;
+	struct ft_ord_cell *pred = NULL, *succ = NULL;
+	struct ft_ord_cell *run_first = NULL, *run_last = NULL;
+	struct cds_ft_node *s_first = NULL, *s_last = NULL;
+	size_t src_max, nm, dm;
+
+	*handled = false;
+
+	/*
+	 * Classify the dst graft point with a build-invisible prep.  A GLUE
+	 * diverge builds the whole split cluster into @glue (referencing @payload
+	 * by deferred edge); a NOSPLIT outcome is deferred to the legacy / reserve
+	 * path (next increment).
+	 */
+	ft_graft_glue_init(&glue);
+	prep = ft_graft_build(dst_ft, okey_dst, dst_key_len, payload, cnt_src,
+			&d, &glue);
+	if (prep == FT_GRAFT_PREP_NOSPLIT) {
+		ft_graft_glue_fini(&glue);
+		return CDS_FT_STATUS_OK;		/* not handled */
+	}
+	*handled = true;
+	if (prep == FT_GRAFT_PREP_OOM) {
+		ft_graft_glue_abort(dst_ft, &glue);
+		return CDS_FT_STATUS_MEMORY_ERROR;	/* both tries pristine */
+	}
+	if (prep == FT_GRAFT_PREP_POPULATED) {
+		/* Defensive: cnt_dst == 0 should never yield an occupied point. */
+		ft_graft_glue_fini(&glue);
+		return CDS_FT_STATUS_POPULATED_ERROR;
+	}
+	/* prep == FT_GRAFT_PREP_GLUE: cluster built invisibly, dst still pristine. */
+
+	/*
+	 * Ordered list: locate the dst splice neighbours while dst is still
+	 * payload-free, and capture the source subtree's run endpoints + cells
+	 * while the subtree is still intact in src.
+	 */
+	if (ms_ord) {
+		ft_ord_cell_find_splice_pos(dst_ft, dst_key, dst_key_len,
+			&pred, &succ);
+		s_first = ft_subtree_minmax_head(src_ft, payload, false);
+		s_last = ft_subtree_minmax_head(src_ft, payload, true);
+		run_first = ft_ord_cell_ptr(rcu_dereference(s_first->prev));
+		run_last = ft_ord_cell_ptr(rcu_dereference(s_last->prev));
+	}
+
+	/*
+	 * Last fallible step: unlink the source subtree in place, preserving
+	 * @payload.  On OOM the unlink self-undoes (src pristine) and the still-
+	 * invisible cluster is aborted (dst pristine) -- the no-rollback property.
+	 */
+	if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
+			cnt_src) < 0) {
+		ft_graft_glue_abort(dst_ft, &glue);
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+
+	/* ===== Everything from here on is failure-free. ===== */
+
+	/*
+	 * Remove the source run from src's ordered list now (the cells keep their
+	 * internal links for the splice into dst below) -- before the drain, so
+	 * sync drains src ord-readers of the run too.
+	 */
+	if (ms_ord)
+		ft_ord_cell_run_unlink(src_ft, s_first, s_last);
+
+	if (!src_ft->exclusive)
+		src_ft->group->flavor->update_synchronize_rcu();
+
+	/*
+	 * Failure-free commit of the build-invisible diverge cluster: wire the
+	 * deferred live back-pointers (the payload, the displaced old child, the
+	 * cluster top), splice the cluster in with the single forward publish,
+	 * then reclaim the replaced compressed node.
+	 */
+	ft_graft_glue_apply_deferred(dst_ft, &glue);
+	ft_graft_glue_publish(dst_ft, &glue);
+	attached_nf = glue.attached_nf;
+	ft_graft_glue_free_old(dst_ft, &glue);
+	ft_graft_glue_fini(&glue);
+
+	/*
+	 * Propagate the moved key count up dst's ancestor chain, starting from
+	 * @attached_nf's parent (its own nr_keys already carries @cnt_src).
+	 * ft_get_parent_rcu handles every payload node type (external / compressed
+	 * / internal) and resolves the merge-point flip proxy.
+	 */
+	aparent = ft_get_parent_rcu(dst_ft,
+		ft_resolve_skip_compressed(dst_ft, attached_nf));
+	if (aparent)
+		ft_propagate_external_count_parent(dst_ft, aparent, (long) cnt_src);
+
+	if (ms_ord) {
+		/*
+		 * An EXTERNAL payload is re-parented directly under a new internal
+		 * slot, so its edge byte changes (src_key's last byte -> dst_key's).
+		 * That byte lives in the head's CELL metadata (ft_rebuild_key_upwalk
+		 * reads it for the ordered key rebuild) and ft_set_parent does NOT
+		 * maintain it for externals, so refresh it here.  The moved external
+		 * sits at exactly @dst_key (it was an EXACT leaf at @src_key, no
+		 * suffix), so its new edge byte is the last byte of @dst_key.  An
+		 * internal / compressed payload keeps every leaf's edge byte (the
+		 * subtree moves wholesale), so no per-leaf fix-up is needed.
+		 */
+		if (ft_node_external(payload))
+			cds_ft_item_to_metadata(run_first)->incoming_byte =
+				okey_dst[dst_key_len - 1];
+		/* Splice the moved run into dst at the located position. */
+		ft_ord_cell_run_splice(dst_ft, run_first, run_last, pred, succ);
+	}
+
+	/* Raise dst's max_used_key_len for the moved keys (dst_key || suffix). */
+	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
+	nm = src_max > src_key_len ? dst_key_len + (src_max - src_key_len) :
+		dst_key_len;
+	dm = uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED);
+	if (nm > dm)
+		uatomic_store(&dst_ft->max_used_key_len, nm, CMM_RELAXED);
+
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
@@ -20198,6 +20355,25 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 				return CDS_FT_STATUS_OK;
 			}
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+		}
+	}
+
+	/*
+	 * Re-rooted source (compressed/external/1-child d_src.nf), diverged dst:
+	 * graft the source subtree IN PLACE (no detach, no re-root) so the build-
+	 * invisible cluster references it directly and the source unlink is the
+	 * last fallible step -- the leak-free reorder.  Handles the GLUE diverge
+	 * dst shape; NOSPLIT / KEY_SHORTER fall through (handled stays false).
+	 */
+	if (ks == FT_GRAFT_SWAP_EXACT && off_src == 0) {
+		bool handled;
+
+		status = ft_merge_graft_subpos_inplace(dst_ft, src_ft,
+			okey_dst, dst_key, dst_key_len, okey_src, src_key_len,
+			d_src.nf, cnt_src, &handled);
+		if (handled) {
+			FT_TP(merge_exit, (int) status);
+			return status;
 		}
 	}
 
