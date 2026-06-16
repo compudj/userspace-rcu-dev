@@ -6873,9 +6873,9 @@ enum ft_descent_action ft_traverse_compressed(
  * every call site (the four specialization wrappers below pass true /
  * false literals).  always_inline + literal arguments lets the compiler
  * constant-fold the per-iter branches on these flags:
- *   - loop-top skip-compressed resolution (line 5621 area)
- *   - get_nth dispatch (line 5687 area)
- *   - post-get_nth skip-compressed resolution (line 5719 area)
+ *   - loop-top skip-compressed resolution
+ *   - get_nth dispatch
+ *   - post-get_nth skip-compressed resolution
  * Eliminates the per-iter `test %sil, %sil` hot spot identified via
  * perf annotate.
  */
