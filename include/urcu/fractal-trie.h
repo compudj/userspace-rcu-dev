@@ -763,8 +763,7 @@ enum cds_ft_status cds_ft_speculative_lookup_key(struct cds_ft *ft,
 	if (status != CDS_FT_STATUS_OK)
 		return status;
 	/* key_len == 0: nothing to validate (and @key may be NULL). */
-	if (key_len != 0 &&
-			memcmp(key, (const uint8_t *) found + key_offset, key_len) != 0) {
+	if (key_len != 0 && memcmp(key, (const uint8_t *) found + key_offset, key_len) != 0) {
 		if (result_node)
 			*result_node = NULL;
 		return CDS_FT_STATUS_NOT_FOUND;
