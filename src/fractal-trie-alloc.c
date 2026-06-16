@@ -988,7 +988,10 @@ bool cds_ft_metadata_in_recompact_private(struct cds_ft_metadata *metadata)
  * range only had its node-body region returned via MADV_DONTNEED at reclaim;
  * its metadata[] array and the reverse bitmap[] array live in the kept-mapped
  * region (range + FT_FAR_MACRO_SIZE) and retain the previous life's contents
- * (0xfe poison written on free, or stale counts / occupancy bits).  Clearing
+ * (0xfe poison written on free, or stale counts / occupancy bits).  That region
+ * is deliberately kept mapped (not MADV_DONTNEED'd) because it holds the range
+ * header carrying the recycle linkage and preserves the range's NUMA / THP
+ * policy for a syscall-free reuse -- see ft_arena_reclaim_range.  Clearing
  * them here makes a bump slot from a recycled range equivalent to one from a
  * fresh range, the same guarantee the freelist path provides for reused slots.
  * On Linux the node body itself is not touched: it re-faults zero (DONTNEED on
