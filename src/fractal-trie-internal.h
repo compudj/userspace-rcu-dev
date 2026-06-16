@@ -616,7 +616,7 @@ struct cds_ft_metadata {
 						 * (ft_skip_to_compressed, ft_get_parent_rcu)
 						 * via rcu_dereference.
 						 */
-	struct cds_ft_node *external_nodes;	/* List of external nodes at this tree location. */
+	struct cds_ft_node *external_nodes;	/* List of external nodes at this trie location. */
 
 	/*
 	 * Total unique keys in subtree.

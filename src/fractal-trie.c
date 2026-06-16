@@ -263,7 +263,7 @@ struct cds_ft_attr {
 enum cds_ft_type_class {
 	FT_POPCOUNT = 0,	/* Popcount-bitmap: popcount_1l / popcount_2l */
 	FT_PIGEON = 1,		/* Pigeon: direct indexed */
-	/* Leaf nodes are implicit from their height in the tree */
+	/* Leaf nodes are implicit from their height in the trie */
 	FT_NR_TYPES = 2,
 
 	FT_NULL,	/* not an encoded type, but keeps code regular */
@@ -2254,7 +2254,7 @@ struct cds_ft_inode_flag *ft_skip_compressed_flag(
  * are intentionally inconsistent for a brief window) get whatever
  * the back-pointer currently says.  Reader paths that must observe
  * a self-consistent slot+cn pair re-anchor via ft_skip_reanchor,
- * which walks the skip child's live parent chain to the tree
+ * which walks the skip child's live parent chain to the trie
  * position the slot's skip_len encodes.
  *
  * Read-side safe (rcu_dereference on both fields).  Callers must be
@@ -2850,7 +2850,7 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
  * External (leaf) nodes: sets cds_ft_node.prev (head of duplicate chain).
  *
  * For skip-compressed pointers: the skip pointer represents a
- * compressed node in the tree.  Set the compressed node's parent
+ * compressed node in the trie.  Set the compressed node's parent
  * (not the compressed node's child's parent, which is the
  * compressed node itself and was set at creation time).
  *
@@ -11285,7 +11285,7 @@ error:
  * ft_attach_node() ensures that a lookup will _never_ see a branch that
  * leads to a dead-end: before attaching a branch, the entire content of
  * the new branch is populated, thus creating a cluster, before
- * attaching the cluster to the rest of the tree, thus making it visible
+ * attaching the cluster to the rest of the trie, thus making it visible
  * to lookups.
  *
  * @external_node argument is either NULL or a pointer to the external
@@ -11893,7 +11893,7 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
  *         node. Need to transform this external node into an internal
  *         node with associated external node, attach a new cluster as
  *         child of this internal node, and populate this new internal
- *         node into the tree to replace the prior external node.
+ *         node into the trie to replace the prior external node.
  */
 
 /*
@@ -12483,7 +12483,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 		 * If the last node encountered during traversal is an external node,
 		 * transform this external node into an internal node with associated
 		 * external node, attach a new cluster as child of this internal node, and
-		 * populate this new internal node into the tree to replace the prior
+		 * populate this new internal node into the trie to replace the prior
 		 * external node.
 		 * It's the same for NULL node, only that there is no need to chain any
 		 * external node.
