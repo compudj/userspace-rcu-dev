@@ -1463,9 +1463,9 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  *            lock continuously from when @old_node was obtained until this
  *            call (concurrent mode; in exclusive mode the caller's mutual
  *            exclusion replaces that).  After a dropped lock, re-look up
- *            @old_node first — cds_ft_iter_bind_key() resets the
- *            iterator's cached position but cannot refresh a node you
- *            already hold.
+ *            @old_node first — cds_ft_iter_bind_key() snapshots the
+ *            iterator's key to resume across the dropped lock, but
+ *            cannot refresh a node you already hold.
  * @new_node: Node to insert in place of @old_node. Must be
  *            initialized with cds_ft_node_init() before this call.
  *
@@ -1495,9 +1495,9 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  *        read-side lock continuously from when @node was obtained until
  *        this call (concurrent mode; in exclusive mode the caller's
  *        mutual exclusion replaces that).  After a dropped lock, re-look
- *        up @node first — cds_ft_iter_bind_key() resets the
- *        iterator's cached position but cannot refresh a node you already
- *        hold.
+ *        up @node first — cds_ft_iter_bind_key() snapshots the
+ *        iterator's key to resume across the dropped lock, but cannot
+ *        refresh a node you already hold.
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * the node is not found, or a negative cds_ft_status on error.
