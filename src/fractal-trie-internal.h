@@ -877,7 +877,7 @@ struct cds_ft_group {
  * group flags (key_map.identity, CDS_FT_FLAG_SKIP_COMPRESSED bit) are
  * immutable after group creation, so a single load + indirect jmp on
  * the hot path is all the dispatch cost vs the ~22 ns regression seen
- * from runtime-gated dispatch (see [[ft-lookup-inline-keep]]).
+ * from runtime-gated dispatch.
  */
 struct cds_ft;
 struct cds_ft_node;
