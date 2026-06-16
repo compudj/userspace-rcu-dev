@@ -2360,8 +2360,10 @@ enum cds_ft_status cds_ft_group_attr_set_numa_policy(
 		enum cds_ft_numa_policy policy);
 
 /*
- * cds_ft_group_attr_set_optimize - Select the page-size policy for the group's
- * internal + compressed node arenas (see enum cds_ft_optimize).  Default:
+ * cds_ft_group_attr_set_optimize - Select the group's page-size policy.
+ *
+ * Sets the page-size policy for the group's internal + compressed node
+ * arenas (see enum cds_ft_optimize); the default is
  * CDS_FT_OPTIMIZE_THROUGHPUT.  Returns CDS_FT_STATUS_OK, or
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @opt.
  */
@@ -2679,12 +2681,13 @@ enum cds_ft_status cds_ft_cell_prev_batch(struct cds_ft *ft,
 		size_t cap, size_t *count, const struct cds_ft_cell **next_cursor);
 
 /*
- * cds_ft_cell_node_offset - Byte offset of the head-node pointer within an
- * opaque cell handle.  Invariant for the process; fetch it ONCE, cache it, and
- * pass it to cds_ft_cell_node() per
- * element with no library call.  Exposed as a runtime getter (not a header
- * constant) so the cell stays opaque and the offset is ABI-stable -- a caller
- * that fetches it at runtime keeps working if the layout ever changes.
+ * cds_ft_cell_node_offset - Byte offset of the head-node pointer in a cell.
+ *
+ * Invariant for the process: fetch it once, cache it, and pass it to
+ * cds_ft_cell_node() per element with no further library call.  It is a
+ * runtime getter rather than a header constant so the cell stays opaque and
+ * the offset stays ABI-stable: a caller that fetches it at runtime keeps
+ * working if the layout ever changes.
  */
 size_t cds_ft_cell_node_offset(void);
 
