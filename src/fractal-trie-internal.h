@@ -284,6 +284,13 @@
  *
  * A runtime check in cds_ft_arena_create() rejects page sizes larger
  * than (1 << FT_MAX_PAGE_ORDER).
+ *
+ * "Page size" here is the kernel BASE page size (urcu_get_page_len),
+ * never a huge page.  Transparent huge pages are orthogonal: THP only
+ * remaps the same frames at a coarser TLB granularity, so it changes
+ * neither cds_ft_get_page_size() nor the items-per-range count.  (The
+ * 2 MiB FT_FAR_METADATA layout is a separate compile-time path that
+ * sizes alloc_index independently; it does not use FT_MAX_PAGE_ORDER.)
  */
 #if defined(URCU_ARCH_AMD64)
 # define FT_MAX_PAGE_ORDER	12	/* x86-64: 4 KiB pages. */
