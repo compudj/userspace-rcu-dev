@@ -1,4 +1,19 @@
 
+======================================================================
+HISTORICAL DESIGN NOTE
+
+This document is an UNIMPLEMENTED design exploration (single-cache-line
+internal nodes via combination bit selection). As recorded in the note
+just below, analysis showed the approach would degrade functional
+density, so it was NOT implemented. It is kept for historical context
+only and does not describe the current Fractal Trie.
+
+For the authoritative present-day reference, see:
+  - include/urcu/fractal-trie.h   the caller-facing API contract
+  - src/fractal-trie.c            the "High-level architecture"
+                                  comment at the top of the file
+======================================================================
+
 Fractal Trie design: bit selection combinations
 
 Mathieu Desnoyers

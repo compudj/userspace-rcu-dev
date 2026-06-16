@@ -1,3 +1,20 @@
+======================================================================
+HISTORICAL DESIGN NOTE
+
+This document captures the ORIGINAL design rationale of the Fractal
+Trie -- the data-structure choices, node-type thresholds, and the
+early RCU analysis. It is kept for historical context and does NOT
+track the current implementation, which has since evolved
+considerably (skip-compressed pointer encoding, library-owned ordinal
+cells for ordered iteration, parent-pointer backtracking, and the
+spine-copy bulk operations).
+
+For the authoritative present-day reference, see:
+  - include/urcu/fractal-trie.h   the caller-facing API contract
+  - src/fractal-trie.c            the "High-level architecture"
+                                  comment at the top of the file
+======================================================================
+
 Fractal Trie Design
 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 2012-2026
