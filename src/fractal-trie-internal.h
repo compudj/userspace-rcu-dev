@@ -778,8 +778,8 @@ struct cds_ft_group {
 	/*
 	 * Cell leak accounting (ft_debug_counters only): cells migrate
 	 * between the group's tries via the bulk ops (allocated in one
-	 * trie, freed in another), so the balance is meaningful only at
-	 * group granularity.  cds_ft_group_destroy reports a mismatch.
+	 * trie, freed in another), so they are accounted at group
+	 * granularity.  cds_ft_group_destroy reports a mismatch.
 	 * Counted synchronously at the free request (not the deferred
 	 * reclaim), so allocated == freed means every cell's free was
 	 * issued.
@@ -789,10 +789,9 @@ struct cds_ft_group {
 	 * Node leak accounting (ft_debug_counters only).  Like the cells
 	 * above, internal and compressed nodes migrate between the group's
 	 * tries via the bulk ops (a graft allocates a node accounted to the
-	 * source trie and frees it accounted to the destination), so a
-	 * per-trie balance reports false leaks; the balance is meaningful
-	 * only at group granularity.  cds_ft_group_destroy reports a
-	 * mismatch once every trie has drained its deferred frees.
+	 * source trie and frees it accounted to the destination), so they
+	 * are accounted at group granularity.  cds_ft_group_destroy reports
+	 * a mismatch once every trie has drained its deferred frees.
 	 */
 	unsigned long nr_nodes_allocated, nr_nodes_freed;
 	unsigned long nr_internal_alloc, nr_internal_freed;
