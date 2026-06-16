@@ -19936,6 +19936,24 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	}
 
 	/*
+	 * Whole-source move (src_key_len == 0): the entire @src_ft is the
+	 * payload, so graft it directly -- no detach, no fallible rollback.
+	 * ft_graft is itself leak-free: a diverge split is built invisibly and
+	 * a NOSPLIT attach restores the saved old source root allocation-free
+	 * on OOM, so an allocation failure leaves both tries pristine.  This
+	 * covers an empty dst root and a diverged dst_key alike, and is the
+	 * leak-free path for "rekey within a trie" (detach a sub-trie, then
+	 * merge_at it at a new, currently-absent key in the same group).  A
+	 * dst_key occupied by an empty-internal leftover yields POPULATED_ERROR
+	 * here, exactly as the detach-then-graft path did.
+	 */
+	if (src_key_len == 0) {
+		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, src_ft);
+		FT_TP(merge_exit, (int) status);
+		return status;
+	}
+
+	/*
 	 * Empty dst ROOT (dst_key_len == 0, so the whole @dst_ft is empty at
 	 * the merge point): move @src_ft@src_key in WITHOUT a fallible graft,
 	 * so no rollback can strand the moved externals.  Pre-allocate the
@@ -20003,18 +20021,23 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * Diverged / empty-internal dst: kd == FT_GRAFT_SWAP_DELEGATE (no key
-	 * has @dst_key as a prefix) or an empty internal node left at @dst_key.
-	 * The publish point is non-root, so this still uses the detach-then-
-	 * graft path (ft_graft is itself a build-invisible transaction).  A
-	 * non-empty graft point would return POPULATED_ERROR and roll back,
-	 * never corrupt.  @subtree's keys are stripped of @src_key, so it is
-	 * touched only via keylen-bypassing helpers.
+	 * Residual case: a SUB-position source (src_key_len > 0) moved into a
+	 * diverged / empty-internal dst (kd == FT_GRAFT_SWAP_DELEGATE, or an
+	 * empty internal node left at @dst_key).  The source content must first
+	 * be isolated with a detach (it is not a whole trie root), and the dst
+	 * publish point is non-root, so this still uses the detach-then-graft
+	 * path with a best-effort rollback.  A non-empty graft point returns
+	 * POPULATED_ERROR and rolls back, never corrupts.  @subtree's keys are
+	 * stripped of @src_key, so it is touched only via keylen-bypassing
+	 * helpers.
 	 *
-	 * TODO: give this the same build-invisible reorder as the empty-root
-	 * case above.  Until then its double-allocation-failure rollback can
-	 * strand the moved externals (the sole leak documented in
-	 * cds_ft_merge_at).
+	 * This is the one path still carrying the documented cds_ft_merge_at
+	 * leak: a rare DOUBLE allocation failure (the dst graft OOMs, then the
+	 * rollback re-graft into @src_ft also OOMs) strands the moved externals.
+	 * The whole-source (src_key_len == 0) and empty-dst-root cases above are
+	 * already leak-free; giving this sub-position case the same build-
+	 * invisible reorder (via ft_store_at_graft_point_prepare/_commit) is the
+	 * remaining follow-up.
 	 */
 	status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
 	if (status < 0)

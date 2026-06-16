@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 258
+#define NR_TESTS 259
 #else
 #define NR_TESTS 242
 #endif
@@ -18661,6 +18661,126 @@ static int test_merge_oom_empty_dst(void)
 }
 
 /*
+ * OOM coverage for the diverged-dst WHOLE-SOURCE merge (src_key_len == 0 into a
+ * @dst that is populated but has no key with @dst_key as a prefix -- the
+ * "rekey to a fresh prefix" shape).  This takes the direct-graft path (the
+ * source trie is the payload; ft_graft is leak-free on its own), so every OOM
+ * must leave both tries pristine with no stranded external (RUN_TEST's
+ * leak_check).  Two dst layouts exercise a NOSPLIT diverge (an empty slot on a
+ * multi-child root) and a GLUE diverge (inside a compressed run).
+ */
+static int run_merge_oom_diverged_dst(int nr_faults)
+{
+	static const struct {
+		const char *dkeys[2];
+		unsigned int ndk;
+		const char *mkey;
+	} layouts[] = {
+		{ { "ax", "zx" }, 2, "m" },	/* 'm' is an empty root slot */
+		{ { "max", NULL }, 1, "mb" },	/* 'mb' diverges inside "max" */
+	};
+	unsigned int L;
+	int rc = 0;
+
+	for (L = 0; L < 2; L++) {
+		const char *mkey = layouts[L].mkey;
+		size_t mklen = strlen(mkey);
+		char m1[16], m2[16];
+		unsigned int j;
+		int n;
+
+		snprintf(m1, sizeof m1, "%sbx", mkey);
+		snprintf(m2, sizeof m2, "%sby", mkey);
+
+		for (n = 0; n < nr_faults; n++) {
+			struct cds_ft_group *group;
+			struct cds_ft *dst = create_varlen_ft(&group);
+			struct cds_ft *src;
+			struct ft_test_node *s1 = node_alloc(1);
+			struct ft_test_node *s2 = node_alloc(2);
+			enum cds_ft_status s;
+			int verified, keys_ok = 1;
+
+			if (cds_ft_create(group, NULL, &src) < 0) {
+				fprintf(stderr,
+					"merge_oom_diverged_dst: src create\n");
+				return -1;
+			}
+			for (j = 0; j < layouts[L].ndk; j++) {
+				struct ft_test_node *dn = node_alloc(100 + j);
+				if (cds_ft_insert(dst,
+						(const uint8_t *) layouts[L].dkeys[j],
+						strlen(layouts[L].dkeys[j]),
+						&dn->node) < 0) {
+					node_free(dn);
+					rc = -1;
+				}
+			}
+			if (cds_ft_insert(src, (const uint8_t *) "bx", 2,
+					&s1->node) < 0 ||
+			    cds_ft_insert(src, (const uint8_t *) "by", 2,
+					&s2->node) < 0)
+				rc = -1;
+
+			cds_ft_fault_alloc_countdown = n;
+			rcu_read_lock();
+			s = cds_ft_merge_at(dst, (const uint8_t *) mkey, mklen,
+					src, NULL, 0);
+			rcu_read_unlock();
+			cds_ft_fault_alloc_countdown = -1;
+
+			rcu_read_lock();
+			verified = (cds_ft_verify(dst, stderr) ==
+					CDS_FT_STATUS_OK) &&
+				(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+			/* dst keeps its own keys either way. */
+			for (j = 0; j < layouts[L].ndk; j++)
+				keys_ok = keys_ok &&
+					graft_swap_oom_has_key(dst,
+						layouts[L].dkeys[j]);
+			if (s == CDS_FT_STATUS_OK) {
+				keys_ok = keys_ok &&
+					graft_swap_oom_has_key(dst, m1) &&
+					graft_swap_oom_has_key(dst, m2) &&
+					!graft_swap_oom_has_key(src, "bx") &&
+					!graft_swap_oom_has_key(src, "by");
+			} else {
+				/* OOM: src intact, dst gained nothing. */
+				keys_ok = keys_ok &&
+					!graft_swap_oom_has_key(dst, m1) &&
+					!graft_swap_oom_has_key(dst, m2) &&
+					graft_swap_oom_has_key(src, "bx") &&
+					graft_swap_oom_has_key(src, "by");
+			}
+			rcu_read_unlock();
+			if (!verified || !keys_ok) {
+				fprintf(stderr,
+					"merge_oom_diverged_dst: %s after fault n=%d L=%u (merge=%s)\n",
+					!verified ? "verify FAILED" :
+						"KEY SET WRONG",
+					n, L, cds_ft_status_to_string(s));
+				rc = -1;
+				continue;
+			}
+
+			if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+				rc = -1;
+			rcu_barrier();
+			cds_ft_destroy(dst);
+			cds_ft_destroy(src);
+			rcu_barrier();
+			cds_ft_group_destroy(group);
+		}
+	}
+	return rc;
+}
+
+static int test_merge_oom_diverged_dst(void)
+{
+	return run_merge_oom_diverged_dst(10);
+}
+
+/*
  * OOM coverage for the PIECEWISE merge: dst already has nodes that overlap
  * src's, so ft_merge_build must recurse INTO the shared spine -- copying the
  * shared branch nodes, splicing the same full keys ("aa", "ba"), and
@@ -20282,6 +20402,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_merge_oom);
 	RUN_TEST(test_merge_oom_empty_dst);
+	RUN_TEST(test_merge_oom_diverged_dst);
 	RUN_TEST(test_merge_oom_overlap);
 	RUN_TEST(test_merge_oom_compressed);
 	RUN_TEST(test_merge_oom_nonroot_src);
