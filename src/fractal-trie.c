@@ -19825,12 +19825,15 @@ int ft_merge_reserve_add_built(struct cds_ft *ft, struct cds_ft_alloc_reserve *r
  * -- no reserve) and a NOSPLIT point (an empty slot at @dst_key, or a built
  * branch / displaced external -- ft_store_at_graft_point grafts it post-drain
  * drawing from a pre-filled reserve so it cannot fail on the arena).  *handled is
- * always set true here (an EXACT off_src == 0 source); the KEY_SHORTER source
- * (off_src > 0) is gated out by the caller for now.
+ * always set true here, so the caller never falls through.
  *
  * @okey_dst / @okey_src are ORDINAL; @dst_key is the APPLICATION dst key (the
- * ordered-list splice-pos descent remaps it).  @payload is d_src->nf (EXACT src,
- * off_src == 0); @cnt_src is its unique-key count.
+ * ordered-list splice-pos descent remaps it).  @payload is the source subtree to
+ * move with @cnt_src unique keys: d_src->nf for an EXACT source, or, for a
+ * KEY_SHORTER source, cn_s->child with @okey_dst / @dst_key / @dst_key_len
+ * already EXTENDED by the residual cn_s bytes (the caller's reduction to EXACT).
+ * @okey_src / @src_key_len remain the ORIGINAL source key (the unlink overshoots
+ * cn_s on its own).
  */
 /*
  * Reserve EXACTLY the nodes ft_store_at_graft_point will allocate for a NOSPLIT
@@ -20482,16 +20485,55 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	 * Re-rooted source (compressed/external/1-child d_src.nf), diverged dst:
 	 * graft the source subtree IN PLACE (no detach, no re-root) so the build-
 	 * invisible cluster references it directly and the source unlink is the
-	 * last fallible step -- the leak-free reorder.  Handles both the GLUE
-	 * diverge and the NOSPLIT (at-node / build-branch) dst shapes for an EXACT
-	 * source; a KEY_SHORTER source (off_src > 0) still falls through.
+	 * last fallible step -- the leak-free reorder.  Handles both GLUE diverge
+	 * and NOSPLIT (at-node / build-branch) dst shapes.
+	 *
+	 * A KEY_SHORTER source (the src key ends @off_src bytes inside the
+	 * compressed node @d_src.nf) reduces to the EXACT shape: the moved subtree
+	 * is @cn_s->child, and its keys gain the residual bytes cn_s->key_bytes
+	 * [off_src .. len) as a prefix, so graft @cn_s->child at @dst_key extended
+	 * by that residual.  ft_merge_unlink_src_subtree overshoots @cn_s (preserves
+	 * @cn_s->child) so the source side is identical; @cn_s itself is reclaimed
+	 * by that unlink.
 	 */
-	if (ks == FT_GRAFT_SWAP_EXACT && off_src == 0) {
+	if (ks == FT_GRAFT_SWAP_EXACT || ks == FT_GRAFT_SWAP_KEY_SHORTER) {
 		bool handled;
+		struct cds_ft_inode_flag *payload;
+		const uint8_t *gokey = okey_dst, *gappkey = dst_key;
+		size_t glen = dst_key_len;
+		uint8_t ext_okey[FT_MAX_KEY_LEN], ext_app[FT_MAX_KEY_LEN];
+
+		if (ks == FT_GRAFT_SWAP_EXACT) {
+			payload = d_src.nf;	/* off_src == 0 by construction */
+		} else {
+			struct cds_ft_compressed_node *cn_s =
+				ft_compressed_node_ptr(d_src.nf);
+			unsigned int rlen = cn_s->len - off_src, j;
+			const struct cds_ft_key_map *km =
+				&dst_ft->group->key_map;
+
+			payload = cn_s->child;
+			memcpy(ext_okey, okey_dst, dst_key_len);
+			memcpy(&ext_okey[dst_key_len], &cn_s->key_bytes[off_src],
+				rlen);
+			memcpy(ext_app, dst_key, dst_key_len);
+			if (km->identity) {
+				memcpy(&ext_app[dst_key_len],
+					&cn_s->key_bytes[off_src], rlen);
+			} else {
+				for (j = 0; j < rlen; j++)
+					ext_app[dst_key_len + j] =
+						km->ordinal_to_key[
+						cn_s->key_bytes[off_src + j]];
+			}
+			gokey = ext_okey;
+			gappkey = ext_app;
+			glen = dst_key_len + rlen;
+		}
 
 		status = ft_merge_graft_subpos_inplace(dst_ft, src_ft,
-			okey_dst, dst_key, dst_key_len, okey_src, src_key_len,
-			d_src.nf, cnt_src, &handled);
+			gokey, gappkey, glen, okey_src, src_key_len,
+			payload, cnt_src, &handled);
 		if (handled) {
 			FT_TP(merge_exit, (int) status);
 			return status;
