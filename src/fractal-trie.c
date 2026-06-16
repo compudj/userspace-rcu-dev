@@ -24530,9 +24530,9 @@ enum cds_ft_status cds_ft_cell_get_key(const struct cds_ft *ft,
 	return CDS_FT_STATUS_OK;
 }
 
-bool cds_ft_ordered_list(const struct cds_ft *ft)
+bool cds_ft_group_ordered_list(const struct cds_ft_group *group)
 {
-	return ft->ordered_list;
+	return group->ordered_list_set;
 }
 
 enum cds_ft_status cds_ft_iter_set_cache_mode(struct cds_ft_iter *iter,

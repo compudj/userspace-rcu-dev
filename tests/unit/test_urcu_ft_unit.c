@@ -2083,12 +2083,12 @@ static int test_node_get_key_no_list(void)
 	}
 
 	/* The iterator-free stepper needs the list -> NOT_SUPPORTED, not a silent
-	 * empty: cds_ft_ordered_list() must agree the list is off. */
+	 * empty: cds_ft_group_ordered_list() must agree the list is off. */
 	{
 		enum cds_ft_status bs;
 
-		if (cds_ft_ordered_list(ft)) {
-			fprintf(stderr, "node no-list: cds_ft_ordered_list true on no-list trie\n");
+		if (cds_ft_group_ordered_list(group)) {
+			fprintf(stderr, "node no-list: cds_ft_group_ordered_list true on no-list trie\n");
 			goto fail;
 		}
 		rcu_read_lock();

@@ -1162,7 +1162,7 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * trie (cds_ft_group_attr_set_ordered_list(attr, false)) this loop iterates
  * NOTHING (cds_ft_cell_next_batch returns CDS_FT_STATUS_NOT_SUPPORTED, which the
  * macro cannot surface).  Code that may run on either kind of trie must branch
- * on cds_ft_ordered_list(ft) and use cds_ft_for_each_rcu() when it is false.
+ * on cds_ft_group_ordered_list(group) and use cds_ft_for_each_rcu() when it is false.
  * Same RCU read-lock requirement as cds_ft_for_each_rcu().
  *
  * Despite the batching, this expands to a SINGLE flat loop: `break` and
@@ -1197,7 +1197,7 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * The descending-key-order counterpart of cds_ft_for_each_batched_rcu(): visits
  * every cell from the largest key down, batching via cds_ft_cell_prev_batch().
  * Same arguments, RCU rules, and ORDERED-LIST-ONLY contract (list-off iterates
- * nothing; branch on cds_ft_ordered_list() and use cds_ft_for_each_reverse_rcu()).
+ * nothing; branch on cds_ft_group_ordered_list() and use cds_ft_for_each_reverse_rcu()).
  */
 #define cds_ft_for_each_reverse_batched_rcu(ft, cell, buf, cap)			\
 	for (struct { const struct cds_ft_cell *cur; size_t n, i; int started; } \
@@ -2773,7 +2773,7 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  * ORDERED-LIST ONLY: a list-off trie (cds_ft_group_attr_set_ordered_list(attr,
  * false)) has no cell list, so it returns CDS_FT_STATUS_NOT_SUPPORTED (*@count =
  * 0, *@next_cursor = NULL); use cds_ft_next()/cds_ft_for_each_rcu() (a stateful
- * iterator) there.  Query the mode up front with cds_ft_ordered_list().
+ * iterator) there.  Query the mode up front with cds_ft_group_ordered_list().
  *
  * RCU CONTRACT: @cursor and every returned cell are valid only while the RCU
  * read-side lock that produced @cursor is held CONTINUOUSLY.  A cell handle (and
@@ -2833,18 +2833,20 @@ enum cds_ft_status cds_ft_cell_get_key(const struct cds_ft *ft,
 		size_t result_key_max_len, size_t *result_key_len);
 
 /*
- * cds_ft_ordered_list - Whether @ft maintains the key-ordered cell list.
+ * cds_ft_group_ordered_list - Whether a group maintains the key-ordered cell list.
+ * @group: The Fractal Trie group.
  *
  * True when the group enabled the ordered list (the default;
- * cds_ft_group_attr_set_ordered_list(attr, false) disables it).  Immutable for the life of
- * the trie.  It is the precondition for the cell-cursor ordered walk
- * (cds_ft_cell_next_batch / cds_ft_cell_prev_batch and the
- * cds_ft_for_each_batched_rcu macros): a list-off trie has no cell list to step,
- * so generic code should branch to cds_ft_for_each_rcu() when this returns
- * false.  (Note: cds_ft_node_get_key() is broader -- it also works on a list-off
- * trie that has an in-leaf key, since materializing ONE key needs no stepping.)
+ * cds_ft_group_attr_set_ordered_list(attr, false) disables it).  Immutable for
+ * the life of the group.  It is the precondition for the cell-cursor ordered
+ * walk (cds_ft_cell_next_batch / cds_ft_cell_prev_batch and the
+ * cds_ft_for_each_batched_rcu macros): a list-off group has no cell list to
+ * step, so generic code should branch to cds_ft_for_each_rcu() when this
+ * returns false.  (Note: cds_ft_node_get_key() is broader -- it also works on a
+ * list-off trie that has an in-leaf key, since materializing ONE key needs no
+ * stepping.)
  */
-bool cds_ft_ordered_list(const struct cds_ft *ft);
+bool cds_ft_group_ordered_list(const struct cds_ft_group *group);
 
 /*
  * cds_ft_iter_get_prefix - Retrieve the current prefix from an iterator.
