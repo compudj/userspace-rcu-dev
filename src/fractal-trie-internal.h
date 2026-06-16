@@ -490,7 +490,9 @@ urcu_static_assert(sizeof(struct ft_ord_cell) <= (1U << FT_ORD_CELL_ALLOC_ORDER)
  * public API boundary; writer/writer overlap aborts the process with
  * a violation report.
  *
- * Reader validation depends on the trie mode:
+ * The writer/writer check above is mode-independent (the contract
+ * serializes writers in both modes); only reader validation depends on
+ * the trie mode:
  *
  *   Exclusive mode: readers are counted; a writer entering with any
  *   reader present (or a reader entering with a writer present)
