@@ -602,10 +602,15 @@ struct cds_ft_alloc_arena;
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
 	struct cds_ft_inode_flag *parent;	/*
-						 * Tagged pointer to parent node.  NULL at
-						 * the root node and during the brief window
-						 * between a detach / graft_swap clearing the
-						 * link and the new placement completing.
+						 * Tagged pointer to parent node.  The only
+						 * NULL a reader can observe is at the root.
+						 * It is also transiently NULL on the write
+						 * side (between a detach / graft_swap
+						 * clearing the link and the new placement
+						 * completing), but such a node is not
+						 * reader-reachable: publication wires the
+						 * parent before the node is reachable, and
+						 * synchronize_rcu separates the phases.
 						 * Written by the mutation side via
 						 * rcu_assign_pointer; read by the read side
 						 * (ft_skip_to_compressed, ft_get_parent_rcu)
