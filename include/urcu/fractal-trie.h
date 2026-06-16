@@ -2333,8 +2333,8 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
  * KEY REPRESENTATION CONTRACT: the bytes at @key_offset must be exactly
  * the bytes the application passed to cds_ft_insert() / the lookup APIs
  * for this node — NOT the application's native scalar.  For integer
- * keys that is the big-endian form emitted by cds_ft_u64_to_key() and
- * friends, not the host-order integer.  The library applies the group's
+ * keys that is the big-endian form emitted by the cds_ft_u64_to_key()
+ * API family, not the host-order integer.  The library applies the group's
  * key map to these bytes when copying them into the iterator's result
  * key, so a non-identity cds_ft_key_map is supported (the stored key is
  * remapped to ordinal order on copy); an identity map is a plain copy.
