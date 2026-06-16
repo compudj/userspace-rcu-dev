@@ -584,7 +584,6 @@ enum {
 /* Never declared. Opaque type used to store flagged node pointers. */
 struct cds_ft_inode_flag;
 struct cds_ft_inode;
-
 struct cds_ft_alloc_arena;
 
 /*
@@ -624,7 +623,7 @@ struct cds_ft_metadata {
 	 * Packed bitfield — small fields in a single uint32_t.
 	 *
 	 * nr_child:               9 bits (max 256)
-	 * parent_slot_offset:       8 bits — pointer-stride offset of this
+	 * parent_slot_offset:     8 bits — pointer-stride offset of this
 	 *                         node's slot within its parent node body
 	 *                         (byte_offset / sizeof(void *)).  Maintained
 	 *                         for every internal/compressed node (not just
