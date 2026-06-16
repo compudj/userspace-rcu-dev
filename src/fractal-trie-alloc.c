@@ -1188,6 +1188,14 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 
 		if (*cnt)
 			return r->items[kind][item_len_order][--(*cnt)];
+		/*
+		 * Reserve active but exhausted for this (kind, order): the op's
+		 * manifest under-counted what it allocates.  Surface it in debug
+		 * — the op would otherwise fall through to a fallible allocation
+		 * here, defeating the reserve's no-fail guarantee.  Production
+		 * falls through (degrading to the pre-reserve behaviour).
+		 */
+		assert(0);
 	}
 
 #ifdef FEATURE_FT_FAULT_INJECT

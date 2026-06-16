@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 259
+#define NR_TESTS 260
 #else
 #define NR_TESTS 242
 #endif
@@ -18781,6 +18781,104 @@ static int test_merge_oom_diverged_dst(void)
 }
 
 /*
+ * OOM coverage for the SUB-position residual reserve fast path: a multi-child
+ * internal source subtree (src@"ca", holding "cax"/"cay") moved to an empty
+ * slot of an existing dst node (dst_key "zc", dst holding "za"/"zb").  This is
+ * the src_key_len > 0 + at-node-empty dst shape, which cds_ft_merge_at handles
+ * by pre-reserving graft's node allocations and drawing them, so graft cannot
+ * fail on an arena allocation.  Consequence under single-shot fault injection:
+ * a fault during the reserve fill or the detach makes merge_at fail with BOTH
+ * tries pristine; a fault armed past those (where the legacy path would fail
+ * mid-graft and roll back) instead never fires inside graft (its allocations
+ * draw from the reserve, above the fault hook), so the move SUCCEEDS.  Either
+ * way leak_check sees no stranded external, and the reserve's completeness
+ * assert (abort on a drawn-but-empty bucket) proves the manifest is complete.
+ */
+static int run_merge_oom_subpos_residual(int nr_faults)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group);
+		struct cds_ft *src;
+		struct ft_test_node *d1 = node_alloc(1);
+		struct ft_test_node *d2 = node_alloc(2);
+		struct ft_test_node *s1 = node_alloc(3);
+		struct ft_test_node *s2 = node_alloc(4);
+		enum cds_ft_status s;
+		int verified, keys_ok;
+
+		if (cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom_subpos: src create failed\n");
+			return -1;
+		}
+		/*
+		 * dst: "za","zb" (root -> "z" -> {a,b}); src: "cax","cay"
+		 * (src@"ca" is a 2-child internal).  merge_at at "zc" lands on
+		 * the empty 'c' slot of dst's {a,b} node.
+		 */
+		if (cds_ft_insert(dst, (const uint8_t *)"za", 2, &d1->node) < 0 ||
+		    cds_ft_insert(dst, (const uint8_t *)"zb", 2, &d2->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *)"cax", 3, &s1->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *)"cay", 3, &s2->node) < 0)
+			rc = -1;
+
+		/* Fail the (n+1)-th allocation performed by the merge. */
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge_at(dst, (const uint8_t *)"zc", 2,
+				src, (const uint8_t *)"ca", 2);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		/* dst keeps its own keys either way. */
+		keys_ok = graft_swap_oom_has_key(dst, "za") &&
+			graft_swap_oom_has_key(dst, "zb");
+		if (s == CDS_FT_STATUS_OK) {
+			keys_ok = keys_ok &&
+				graft_swap_oom_has_key(dst, "zcx") &&
+				graft_swap_oom_has_key(dst, "zcy") &&
+				!graft_swap_oom_has_key(src, "cax") &&
+				!graft_swap_oom_has_key(src, "cay");
+		} else {
+			/* OOM during fill/detach: both tries pristine. */
+			keys_ok = keys_ok &&
+				!graft_swap_oom_has_key(dst, "zcx") &&
+				!graft_swap_oom_has_key(dst, "zcy") &&
+				graft_swap_oom_has_key(src, "cax") &&
+				graft_swap_oom_has_key(src, "cay");
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom_subpos: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_subpos_residual(void)
+{
+	return run_merge_oom_subpos_residual(12);
+}
+
+/*
  * OOM coverage for the PIECEWISE merge: dst already has nodes that overlap
  * src's, so ft_merge_build must recurse INTO the shared spine -- copying the
  * shared branch nodes, splicing the same full keys ("aa", "ba"), and
@@ -20403,6 +20501,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom);
 	RUN_TEST(test_merge_oom_empty_dst);
 	RUN_TEST(test_merge_oom_diverged_dst);
+	RUN_TEST(test_merge_oom_subpos_residual);
 	RUN_TEST(test_merge_oom_overlap);
 	RUN_TEST(test_merge_oom_compressed);
 	RUN_TEST(test_merge_oom_nonroot_src);

@@ -19764,6 +19764,52 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	return CDS_FT_STATUS_OK;
 }
 
+/*
+ * Read-only classifier for cds_ft_merge_at's reserve fast path.  Returns true
+ * iff @dst_key lands exactly on an EMPTY slot of an already-present internal
+ * node — the "NOSPLIT at-node" shape, where ft_graft_build returns NOSPLIT
+ * with d->depth == key_len and d->nf == NULL, and ft_store_at_graft_point's
+ * ONLY node allocation is the optional grow-recompact of d->pnf.  Fills @d_out
+ * with that descent so the caller can size the grow node.  Returns false for a
+ * diverge-in-compressed (GLUE: builds a whole cluster), a key-shorter
+ * (POPULATED), an occupied slot, or a descent that stops short of key_len
+ * (needs a built branch of intermediate nodes): those have a larger or more
+ * shape-dependent node need and stay on the legacy detach-then-graft path.
+ * Mirrors ft_graft_build's descent without building anything.
+ */
+static
+bool ft_merge_dst_at_node_empty(struct cds_ft *dst, const uint8_t *key,
+		size_t key_len, struct ft_descent *d_out)
+{
+	struct ft_descent d;
+	const uint8_t *ik = key;
+
+	ft_descent_init(&d, dst);
+	for (; d.depth < key_len; ) {
+		if (ft_node_external(d.nf))
+			return false;	/* stops short: needs a built branch */
+		d.nf = ft_resolve_skip_compressed(dst, d.nf);
+		if (ft_node_compressed(d.nf)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(d.nf);
+			int remaining = (int) (key_len - d.depth);
+			int cmp = cn->len < remaining ? cn->len : remaining;
+			int j = ft_match_compressed_key(ik, cn, cmp);
+
+			if (j == cmp && cn->len <= remaining) {
+				ft_descent_traverse_compressed(&d, cn, &ik);
+				continue;
+			}
+			return false;	/* GLUE diverge / POPULATED key-shorter */
+		}
+		ft_descent_step(dst, &d, *(ik++));
+	}
+	if (d.nf)
+		return false;		/* slot occupied (POPULATED) */
+	*d_out = d;
+	return true;
+}
+
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
@@ -20007,23 +20053,99 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * Residual case: a SUB-position source (src_key_len > 0) moved into a
-	 * diverged / empty-internal dst (kd == FT_GRAFT_SWAP_DELEGATE, or an
-	 * empty internal node left at @dst_key).  The source content must first
-	 * be isolated with a detach (it is not a whole trie root), and the dst
-	 * publish point is non-root, so this still uses the detach-then-graft
-	 * path with a best-effort rollback.  A non-empty graft point returns
-	 * POPULATED_ERROR and rolls back, never corrupts.  @subtree's keys are
-	 * stripped of @src_key, so it is touched only via keylen-bypassing
-	 * helpers.
+	 * Reserve fast path for the sub-position residual: when the source at
+	 * @src_key is a plain multi-child (or NIL-key-bearing) internal node and
+	 * @dst_key lands on an empty slot of an already-present dst node, graft's
+	 * ONLY node allocations are the fresh subtree root (ft_types[0]) and an
+	 * optional grow-recompact at the attach node.  Pre-reserve exactly those,
+	 * then detach (clean on its own failure) and graft DRAWING from the
+	 * reserve: graft's node allocations cannot fail, so there is no rollback
+	 * to strand the moved externals.  The reserve is activated on @subtree
+	 * (fresh root) and @dst_ft (grow), drawn under their writer mutexes.
+	 *
+	 * The NOSPLIT flip batch is a malloc (not arena-backed, not covered by
+	 * the reserve) and can still fail on true OOM, falling through to the
+	 * rollback below — narrowing the documented leak to that one malloc.
+	 */
+	{
+		struct cds_ft_inode_flag *p =
+			ft_resolve_skip_compressed(src_ft, d_src.nf);
+		struct ft_descent d_attach;
+
+		if (ks == FT_GRAFT_SWAP_EXACT && off_src == 0
+				&& !ft_node_external(p) && !ft_node_compressed(p)
+				&& ft_merge_dst_at_node_empty(dst_ft, okey_dst,
+					dst_key_len, &d_attach)) {
+			struct cds_ft_metadata *pm = ft_flag_to_metadata(src_ft, p);
+
+			if (pm->nr_child >= 2 || pm->external_nodes) {
+				struct cds_ft_metadata *am =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(d_attach.pnf));
+				unsigned int aidx = ft_node_type(d_attach.pnf);
+				struct cds_ft_alloc_reserve reserve;
+				int rret;
+
+				memset(&reserve, 0, sizeof(reserve));
+				/* Fresh subtree root: always 1x ft_types[0]. */
+				rret = cds_ft_alloc_reserve_add(dst_ft, &reserve,
+					CDS_FT_ALLOC_KIND_NODE, ft_types[0].order,
+					ft_types[0].bitmap, 1);
+				/* Grow-recompact iff adding a child overflows. */
+				if (!rret && am->nr_child + 1 >
+						ft_types[aidx].max_child) {
+					unsigned int gidx =
+						find_nearest_type_index(aidx,
+							am->nr_child + 1,
+							am->parent == NULL);
+
+					rret = cds_ft_alloc_reserve_add(dst_ft,
+						&reserve, CDS_FT_ALLOC_KIND_NODE,
+						ft_types[gidx].order,
+						ft_types[gidx].bitmap, 1);
+				}
+				if (rret) {
+					cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+					status = CDS_FT_STATUS_MEMORY_ERROR;
+					goto out;
+				}
+
+				status = ft_detach_keylen(src_ft, src_key,
+					src_key_len, &subtree);
+				if (status < 0) {
+					cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+					goto out;	/* NOT_FOUND impossible. */
+				}
+				cds_ft_alloc_reserve_activate(subtree, &reserve);
+				cds_ft_alloc_reserve_activate(dst_ft, &reserve);
+				status = ft_graft_keylen(dst_ft, dst_key,
+					dst_key_len, subtree);
+				cds_ft_alloc_reserve_deactivate(subtree);
+				cds_ft_alloc_reserve_deactivate(dst_ft);
+				cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+				if (status != CDS_FT_STATUS_OK)
+					goto out_rollback;	/* flip-batch malloc only */
+				cds_ft_destroy(subtree);
+				FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
+				return CDS_FT_STATUS_OK;
+			}
+		}
+	}
+
+	/*
+	 * Residual (legacy) case: a SUB-position source not covered by the
+	 * reserve fast path above (compressed/external/1-child source root, or a
+	 * dst that diverges inside a compressed node / needs a built branch).
+	 * The source content is isolated with a detach and grafted with a
+	 * best-effort rollback.  A non-empty graft point returns POPULATED_ERROR
+	 * and rolls back, never corrupts.  @subtree's keys are stripped of
+	 * @src_key, so it is touched only via keylen-bypassing helpers.
 	 *
 	 * This is the one path still carrying the documented cds_ft_merge_at
 	 * leak: a rare DOUBLE allocation failure (the dst graft OOMs, then the
 	 * rollback re-graft into @src_ft also OOMs) strands the moved externals.
-	 * The whole-source (src_key_len == 0) and empty-dst-root cases above are
-	 * already leak-free; giving this sub-position case the same build-
-	 * invisible reorder (via ft_store_at_graft_point_prepare/_commit) is the
-	 * remaining follow-up.
+	 * Extending the reserve fast path to these shapes is the remaining
+	 * follow-up.
 	 */
 	status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
 	if (status < 0)
