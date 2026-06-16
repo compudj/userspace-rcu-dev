@@ -979,6 +979,7 @@ struct cds_ft {
 	 * serialized).  Destroyed in cds_ft_destroy.
 	 */
 	struct cds_ft_iter *ord_cell_scratch_iter;
+
 	/*
 	 * Cached endpoints of the ordinal-cell list (min / max), for O(1)
 	 * cds_ft_lookup_first / cds_ft_lookup_last.  Maintained by the splice
