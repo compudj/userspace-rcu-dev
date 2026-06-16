@@ -1558,9 +1558,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * *@result_node is NULL) and the call may be retried.  An allocation
  * failure while pruning an already-emptied internal holder is NOT an
  * error: the key's removal is published before the holder is pruned, so
- * the removal has already succeeded (CDS_FT_STATUS_OK); the failed prune
- * just leaves a harmless empty internal node in place, which a later
- * mutation can reclaim.
+ * the removal has already succeeded (CDS_FT_STATUS_OK).  Completing the
+ * prune is deferred to a later mutation through that slot.
  *
  * Mutual exclusion between updates (cds_ft_insert, cds_ft_insert_unique,
  * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all)
