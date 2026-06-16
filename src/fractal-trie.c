@@ -24326,7 +24326,7 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter)
 
 void cds_ft_iter_bind_key(struct cds_ft_iter *iter)
 {
-	FT_TP(iter_invalidate_cache, (const void *) iter->ft, (const void *) iter);
+	FT_TP(iter_bind_key, (const void *) iter->ft, (const void *) iter);
 	/*
 	 * Materialize a live leaf-referenced key into the iterator's own buffer
 	 * BEFORE detaching, so a cross-critical-section resume re-descends from

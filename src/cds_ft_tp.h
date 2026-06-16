@@ -709,7 +709,7 @@ LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_iter_event_class, cds_ft,
 	iter_destroy,
 	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_iter_event_class, cds_ft,
-	iter_invalidate_cache,
+	iter_bind_key,
 	LTTNG_UST_TP_ARGS(const void *, ft, const void *, iter))
 LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_iter_event_class, cds_ft,
 	iter_reset,
