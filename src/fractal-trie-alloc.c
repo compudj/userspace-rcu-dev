@@ -5,9 +5,12 @@
 /*
  * RCU Fractal Trie allocator for internal nodes.
  *
- * This allocator maximizes cache locality for read-side fast paths
- * (lookups and traversals) by placing item data and metadata on
- * different cache lines.
+ * This allocator maximizes cache and TLB locality for read-side fast
+ * paths (lookups and traversals) by separating item data from metadata:
+ * they sit on different cache lines and, because each range places the
+ * item array and the metadata array in separate pages (see the layout
+ * below), in different pages -- so a lookup or traversal that touches
+ * only item data keeps the metadata pages out of its DTLB working set.
  *
  * A consequence of this data/metadata separation is that resident
  * memory (RSS) overstates the cache-hot working set: a lookup or
