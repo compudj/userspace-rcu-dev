@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 256
+#define NR_TESTS 257
 #else
 #define NR_TESTS 242
 #endif
@@ -19573,6 +19573,190 @@ static int test_remove_all_oom_contract(void)
 	return rc;
 }
 
+/* Collect the trie's keys in ordered forward (or reverse) traversal into
+ * @out (@max slots of 8 bytes), with lengths in @lens.  Returns -1 on a
+ * runaway (more than @max keys -- suspected loop or corruption) or a get_key
+ * failure, else 0 with the count in *@count.  Caller holds the RCU read lock. */
+static int remove_oom_collect_ordered(struct cds_ft *ft, struct cds_ft_iter *iter,
+		char out[][8], size_t *lens, int max, int reverse, int *count)
+{
+	enum cds_ft_status s;
+	int n = 0;
+
+	s = reverse ? cds_ft_lookup_last(ft, iter) : cds_ft_lookup_first(ft, iter);
+	while (s == CDS_FT_STATUS_OK) {
+		size_t kl = 0;
+
+		if (n >= max)
+			return -1;	/* runaway: suspected loop / empty-holder corruption */
+		if (cds_ft_iter_get_key(iter, (uint8_t *) out[n], 8, &kl) != CDS_FT_STATUS_OK)
+			return -1;
+		lens[n++] = kl;
+		s = reverse ? cds_ft_prev(ft, iter) : cds_ft_next(ft, iter);
+	}
+	*count = n;
+	return 0;
+}
+
+/* True if the (buf, len) key equals the NUL-terminated literal @lit. */
+static int remove_oom_keq(const char *buf, size_t len, const char *lit)
+{
+	return len == strlen(lit) && memcmp(buf, lit, len) == 0;
+}
+
+/*
+ * #F regression (companion to test_remove_all_oom_contract): when a prefix-key
+ * remove_all's emptied-holder prune fails with -ENOMEM, the holder is left as a
+ * reachable nr_child==0 internal node (the key removal was already published, so
+ * remove_all returns OK).  Ordered traversal must step PAST that empty holder,
+ * not dead-end on it or loop.
+ *
+ * Shape: "a0", "ab", "abc", "az" share the byte-'a' internal node.  Removing
+ * "abc" leaves "ab" as a prefix key on internal holder N (nr_child==0).
+ * Removing "ab" under an allocation fault can fail the detach/prune of N,
+ * leaving N empty between its siblings "a0" and "az".  Forward AND reverse
+ * ordered traversals must then visit "a0" and "az" (and "ab" iff the remove
+ * OOM'd, in which case ab's external is still present so N is not empty), in
+ * order, mutually consistent, and terminate.
+ */
+static int test_remove_emptied_holder_traversal_oom(void)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < 10; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_varlen_ft(&group);
+		struct cds_ft_iter *iter;
+		struct ft_test_node *a0 = node_alloc(1);
+		struct ft_test_node *ab = node_alloc(2);
+		struct ft_test_node *abc = node_alloc(3);
+		struct ft_test_node *az = node_alloc(4);
+		struct cds_ft_node *res = NULL;
+		enum cds_ft_status s;
+		int verified, removed_ab, ok = 1, i, fc = 0, rvc = 0;
+		char fwd[8][8], rev[8][8];
+		size_t fwl[8], rvl[8];
+
+		if (cds_ft_iter_create(ft, &iter) < 0)
+			abort();
+		if (cds_ft_insert(ft, (const uint8_t *) "a0", 2, &a0->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "ab", 2, &ab->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "abc", 3, &abc->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "az", 2, &az->node) < 0) {
+			fprintf(stderr, "emptied_holder: build failed\n");
+			rc = -1;
+		}
+
+		/* Remove "abc": "ab" becomes a prefix key on an nr_child==0 holder. */
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) "abc", 3);
+		if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+		    cds_ft_remove_all(ft, iter, &res) != CDS_FT_STATUS_OK)
+			rc = -1;
+		rcu_read_unlock();
+		node_free_rcu(abc);
+
+		/* Remove the prefix key "ab" under the (n+1)-th allocation fault. */
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) "ab", 2);
+		s = cds_ft_lookup(ft, iter);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK)
+			rc = -1;
+		res = NULL;
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_remove_all(ft, iter, &res);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+		removed_ab = (s == CDS_FT_STATUS_OK);
+
+		/* Verify + ordered traversal over the (possibly empty-holder) trie. */
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		if (verified &&
+		    (remove_oom_collect_ordered(ft, iter, fwd, fwl, 8, 0, &fc) < 0 ||
+		     remove_oom_collect_ordered(ft, iter, rev, rvl, 8, 1, &rvc) < 0)) {
+			fprintf(stderr,
+				"emptied_holder: traversal runaway/failure (n=%d)\n", n);
+			ok = 0;
+		}
+		rcu_read_unlock();
+		if (!verified) {
+			fprintf(stderr,
+				"emptied_holder: verify FAILED after fault n=%d (%s)\n",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+		if (ok) {
+			int expect = removed_ab ? 2 : 3;	/* {a0,az} or {a0,ab,az} */
+
+			/* Forward and reverse must agree (reverse == forward reversed). */
+			if (fc != expect || rvc != fc) {
+				fprintf(stderr,
+					"emptied_holder: count fwd=%d rev=%d expect=%d (n=%d, removed_ab=%d)\n",
+					fc, rvc, expect, n, removed_ab);
+				ok = 0;
+			}
+			for (i = 0; ok && i < fc; i++) {
+				if (fwl[i] != rvl[fc - 1 - i] ||
+				    memcmp(fwd[i], rev[fc - 1 - i], fwl[i]) != 0) {
+					fprintf(stderr,
+						"emptied_holder: fwd/rev mismatch at %d (n=%d)\n", i, n);
+					ok = 0;
+				}
+			}
+			/* Strictly increasing forward, and the siblings are present. */
+			if (ok && (!remove_oom_keq(fwd[0], fwl[0], "a0") ||
+				   !remove_oom_keq(fwd[fc - 1], fwl[fc - 1], "az"))) {
+				fprintf(stderr,
+					"emptied_holder: siblings a0/az not at the ends (n=%d)\n", n);
+				ok = 0;
+			}
+			for (i = 1; ok && i < fc; i++) {
+				size_t m = fwl[i - 1] < fwl[i] ? fwl[i - 1] : fwl[i];
+				int c = memcmp(fwd[i - 1], fwd[i], m);
+
+				if (c > 0 || (c == 0 && fwl[i - 1] >= fwl[i])) {
+					fprintf(stderr,
+						"emptied_holder: not strictly increasing at %d (n=%d)\n", i, n);
+					ok = 0;
+				}
+			}
+			/* "ab" present iff the removal OOM'd (then N is not empty). */
+			if (ok) {
+				int has_ab = 0;
+
+				for (i = 0; i < fc; i++)
+					if (remove_oom_keq(fwd[i], fwl[i], "ab"))
+						has_ab = 1;
+				if (has_ab == removed_ab) {
+					fprintf(stderr,
+						"emptied_holder: ab presence=%d but removed_ab=%d (n=%d)\n",
+						has_ab, removed_ab, n);
+					ok = 0;
+				}
+			}
+		}
+		if (!ok)
+			rc = -1;
+		if (removed_ab) {
+			if (res != &ab->node)
+				rc = -1;
+			node_free_rcu(ab);	/* removed: drain won't see it */
+		}
+		cds_ft_iter_destroy(iter);
+		if (drain_trie(ft) < 0)	/* frees a0, az (+ ab if it stayed) */
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
 /*
  * Drive cds_ft_detach at a key whose child is a COMPRESSED node (so the
  * detached trie's root must be materialized as an internal node) through every
@@ -20010,6 +20194,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_detach_oom_atomicity);
 	RUN_TEST(test_attach_oom_skip_unwind);
 	RUN_TEST(test_remove_all_oom_contract);
+	RUN_TEST(test_remove_emptied_holder_traversal_oom);
 #endif
 
 	rcu_barrier();
