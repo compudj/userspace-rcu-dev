@@ -443,8 +443,8 @@
  * in O(1) per step instead of an O(depth) trie descent + backtrack.  The
  * order links live OUTSIDE the application leaf: struct cds_ft_node is
  * unchanged (no ABI growth, no app offset), and the cell is reached via
- * the head's cds_ft_node.prev.  A head's prev
- * now points to its cell (tagged FT_INTERNAL_MASK, so the head-vs-dup test
+ * the head's cds_ft_node.prev.  A head's prev now points to its cell
+ * (tagged FT_INTERNAL_MASK, so the head-vs-dup test
  * ft_node_external(prev)==false is preserved) and the head's parent moves
  * into ft_ord_cell.parent.  The trie's DOWNWARD child slots still point
  * directly at the external node, skipping the cell; the cell is interposed
