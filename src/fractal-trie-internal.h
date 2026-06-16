@@ -237,9 +237,6 @@
 #endif
 
 #define FT_ENTRY_PER_NODE	256
-#define FT_LOG2_BITS_PER_BYTE	3U
-#define FT_BITS_PER_BYTE	(1U << FT_LOG2_BITS_PER_BYTE)
-
 #define FT_MAX_KEY_LEN	256			/* Maximum key length supported. */
 #define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 1)	/* Maximum depth, including root. */
 
