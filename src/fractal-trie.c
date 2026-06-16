@@ -14393,48 +14393,34 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 
 	if (is_prefix) {
 		/*
-		 * Prefix key: the whole chain hangs off the internal holder's
+		 * Prefix key: the chain hangs off the internal holder's
 		 * external_nodes.  Clear it (one key) and tombstone the chain.
-		 * The holder stays while it has children; if clearing leaves it
-		 * empty (nr_child == 0) detach its branch, else canonicalize a
-		 * now-single-child node (skip builds).  Propagate -1 before any
-		 * detach (undercount ordering).
+		 * Propagate -1 before clearing (undercount ordering).
+		 *
+		 * The holder always KEEPS at least one child here.  An is_prefix
+		 * holder is an internal node carrying external_nodes, and by
+		 * construction such a node has nr_child >= 1: a node that holds only
+		 * external keys with no children is never represented as an internal
+		 * node -- it is stored as an external-chain pointer in the parent
+		 * slot (ft_detach_node promotes a childless holder's external_nodes
+		 * to the parent when its last child is removed), and ft_locate_chain
+		 * _head would classify it as a LEAF, not a prefix.  So clearing
+		 * external_nodes leaves a valid branch with children -- never a
+		 * childless (dead-end) internal, which a trie WITHOUT the optional
+		 * ordinal cell list would break on (its ordered traversal descends
+		 * the structure and a dead-end branch has no entry to find).  The
+		 * only follow-up is canonicalizing a now-single-child holder under
+		 * skip builds.
 		 */
 		ft_propagate_external_count_parent(ft, holder_flag, -1);
 		rcu_assign_pointer(holder_meta->external_nodes, NULL);
 		ft_chain_mark_removed(chain_head);
 		ret = 0;
-		if (holder_meta->nr_child == 0 && holder_meta->parent) {
-			struct cds_ft_metadata *parent_meta =
-				cds_ft_item_to_metadata(
-					ft_node_ptr(holder_meta->parent));
-
-			ret = ft_detach_node(ft,
-				ft_get_parent_slot(holder_meta, ft),
-				ft_get_parent_slot(parent_meta, ft),
-				key_len, true);
-			if (ret) {
-				/*
-				 * Pruning the emptied holder branch failed
-				 * (recompact ENOMEM).  The REMOVAL itself
-				 * already committed above -- count propagated,
-				 * external_nodes cleared, chain tombstoned --
-				 * so the count must NOT be re-added (the key is
-				 * gone; the old +1 here left a permanent
-				 * ancestor overcount) and the operation did not
-				 * fail: report success, run the ordered-list
-				 * unsplice below, and leave the holder as a
-				 * reachable-but-empty internal (readers
-				 * dead-end at it, cds_ft_verify accepts it; a
-				 * later mutation through the slot prunes it).
-				 */
-				ret = 0;
-			}
-		}
+		assert(holder_meta->nr_child > 0);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		else if (ft_group_skip_compressed(ft->group) &&
-			 holder_meta->nr_child == 1 &&
-			 holder_meta->parent != NULL) {
+		if (ft_group_skip_compressed(ft->group) &&
+		    holder_meta->nr_child == 1 &&
+		    holder_meta->parent != NULL) {
 			ft_canonicalize_chain_compress(ft, holder_flag,
 				holder_meta, ft_get_parent_slot(holder_meta, ft));
 		}
