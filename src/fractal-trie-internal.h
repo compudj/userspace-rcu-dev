@@ -335,10 +335,6 @@
  * starts at the CONSTANT offset base + 2 MiB — no per-order offset table, the
  * hot-path item->metadata / item->bitmap helpers are the default formulas with
  * page_size replaced by FT_FAR_MACRO_SIZE.
- *
- * Goal: test whether a dense 2 MiB body run + internal-arena THP lets the HW
- * prefetcher's (now unfenced within the 2 MiB) speculative neighbour fetches
- * land on useful node bodies instead of interleaved metadata pages.
  */
 #define FT_FAR_MACRO_ORDER	21			/* 2 MiB macro page. */
 #define FT_FAR_MACRO_SIZE	(1UL << FT_FAR_MACRO_ORDER)
