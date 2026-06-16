@@ -6,6 +6,104 @@
  * src/fractal-trie.c
  *
  * Userspace RCU library - Fractal Trie
+ *
+ * ===================== High-level architecture =====================
+ *
+ * The Fractal Trie is a concurrent, RCU-protected ordered map from
+ * opaque byte keys to application-owned nodes.  Lookups and ordered
+ * traversals are wait-free under the RCU read-side lock and run
+ * concurrently with mutations; writers are serialized by a
+ * caller-provided mutex.  The public contract (semantics, guarantees,
+ * locking rules, error codes) lives in <urcu/fractal-trie.h>; this
+ * comment is the implementation map.
+ *
+ * Source layout
+ * -------------
+ *   fractal-trie.c          core: read descent; point / range / rank
+ *                           lookups; ordered iteration; insert / remove /
+ *                           replace; the bulk ops; compaction.
+ *   fractal-trie-internal.h struct layouts, tagged-pointer encodings, the
+ *                           node-type table, and inline helpers.
+ *   fractal-trie-alloc.c    the strided internal-node allocator and the
+ *                           external (leaf) buddy arena.
+ *   urcu-flip-latch.h       the atomic multi-pointer "flip" primitive
+ *                           used to commit a set of edges at once.
+ *
+ * Node model
+ * ----------
+ * Internal nodes self-adapt to child density: cascaded popcount bitmaps
+ * for small / medium fan-out and a 256-entry "pigeon" array for dense
+ * nodes, sized in powers of two.  The node type / configuration is
+ * encoded in the low (tag) bits of the child pointer, so the read path
+ * dispatches with no extra load.  External (leaf) nodes are
+ * application-owned (they embed struct cds_ft_node); same-key duplicates
+ * form a next-linked chain off the head.
+ *
+ * Path compression
+ * ----------------
+ * Single-child chains collapse into compressed (Patricia / ART-style)
+ * nodes that store the shared bytes inline.  On 64-bit arches with free
+ * high pointer bits, the "skip-compressed" encoding packs the skip
+ * length and child pointer into the parent slot, so a speculative
+ * descent bypasses the compressed node's cache line entirely
+ * (FEATURE_FT_SKIP_COMPRESSED; -DNO_FEATURE_FT_COMPRESS disables
+ * compression altogether).
+ *
+ * Memory layout
+ * -------------
+ * The internal-node allocator strides item data and metadata onto
+ * separate cache lines, so the read hot path touches only the dense item
+ * region -- which is why resident memory overstates the cache-hot
+ * working set (see fractal-trie-alloc.c).  Internal nodes are reclaimed
+ * via call_rcu.
+ *
+ * Ordered iteration
+ * -----------------
+ * When enabled (the default), the library threads the duplicate-chain
+ * heads into a key-ordered list of small library-owned "ordinal cells",
+ * kept off the descent hot path; cds_ft_next / cds_ft_prev and the
+ * batched cell walk step that list.  Disabling it
+ * (cds_ft_group_attr_set_ordered_list false) drops the per-key cell for
+ * lower memory and faster mutations, at the cost of ordered iteration.
+ *
+ * Read descent
+ * ------------
+ * Two descent encodings per group (enum cds_ft_lookup_optimization):
+ * SPECULATIVE skips per-node byte comparison and returns a candidate the
+ * caller (or the speculative-lookup wrapper) validates; EAGER compares
+ * exactly at each step.  Both return verified results.  Inequality and
+ * rank / skip queries use per-node key counters to skip whole subtrees
+ * in O(depth).  Going back up -- for next / prev / remove and for key
+ * reconstruction -- follows parent back-pointers (and the cell list for
+ * ordered walks) rather than a recorded descent path.
+ *
+ * Mutation and concurrency model
+ * ------------------------------
+ * Writers are serialized by a caller-provided mutex (CDS_FT_SCOPED_WRITER
+ * only VALIDATES that exclusion; it is not itself a lock).  Every change
+ * to published state follows a build-invisibly -> publish -> reclaim
+ * discipline: a new node cluster is assembled where readers cannot reach
+ * it, made visible by a single release store (or, for a multi-edge
+ * commit such as a non-empty merge, one urcu-flip-latch commit that flips
+ * all affected edges at once), and the displaced nodes are freed after a
+ * grace period.  A reader therefore always observes a complete
+ * prior-or-result state, never a partial one.  The discipline is spelled
+ * out in the rcu-mutation rules and checked by the verify-at-mutation
+ * build option (-DFEATURE_FT_VERIFY_AT_MUTATION).
+ *
+ * The bulk ops (graft, graft-swap, detach, merge, merge_at) move or
+ * combine whole sub-tries between tries of one group; the union cases
+ * spine-copy the overlap and commit through the flip latch.  A trie is
+ * either exclusive (no concurrent readers; reclaim is synchronous and a
+ * source graft skips its drain) or concurrent (RCU readers permitted).
+ *
+ * Reclamation
+ * -----------
+ * Deferred frees go through call_rcu; a fully-drained allocator range
+ * releases its pages (MADV_DONTNEED on Linux) from inside the callback.
+ * cds_ft_compact relocates live nodes into dense fresh ranges to recover
+ * fragmentation; the emptied ranges reclaim after a grace period.
+ * ===================================================================
  */
 
 #define _LGPL_SOURCE
