@@ -2922,11 +2922,13 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter);
  * position is discarded (and any referenced key snapshotted) automatically
  * after each operation.
  *
- * After bind the iterator is uncached-equivalent: cds_ft_iter_get_key() still
- * returns the bound key, and the next cds_ft_next() in a fresh critical section
- * re-descends from the root and yields the bound key's successor (robust even
- * if the bound key was removed in the meantime).  cds_ft_iter_node() returns
- * NULL until that re-descent.
+ * After bind the iterator resumes like an uncached one: cds_ft_iter_get_key()
+ * still returns the bound key, and the next cds_ft_next() in a fresh critical
+ * section re-descends from the root and yields the bound key's successor
+ * (robust even if the bound key was removed in the meantime).  Note that bind
+ * also drops the current result -- cds_ft_iter_node() returns NULL until that
+ * re-descent -- whereas a plain uncached iterator keeps the last operation's
+ * result node readable until its next operation.
  *
  * Piecewise iteration:
  *
