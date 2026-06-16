@@ -9,6 +9,13 @@
  * (lookups and traversals) by placing item data and metadata on
  * different cache lines.
  *
+ * A consequence of this data/metadata separation is that resident
+ * memory (RSS) overstates the cache-hot working set: a lookup or
+ * ordered traversal touches only the densely-packed item region, never
+ * the metadata (or bitmap) regions, so the Fractal Trie keeps a denser
+ * cache-hot set than other trie implementations even though its RSS is
+ * higher.
+ *
  * This is achieved using a strided allocation approach with the
  * following layout:
  *

@@ -52,11 +52,9 @@
  * efficiency is comparable to adaptive radix tree schemes with no
  * user tuning or configuration.
  *
- * Because node metadata is kept separate from the node data the
- * lookup hot path touches, resident memory (RSS) does not reflect the
- * actual *cache-hot* working set: Fractal Trie can keep a denser
- * cache-hot set than other trie implementations even though its RSS
- * is higher.
+ * Resident memory (RSS) overstates the actual *cache-hot* working set:
+ * Fractal Trie can keep a denser cache-hot set than other trie
+ * implementations even though its RSS is higher.
  *
  * Graft, graft-swap, detach, and merge:
  *
