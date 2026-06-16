@@ -404,15 +404,19 @@
 
 /*
  * Skip-compressed pointers encode the compressed path length in the
- * high bits of pointers (bits 57-63).  This requires architectures
- * where those bits are guaranteed zero for userspace pointers.
+ * high bits of pointers (FT_SKIP_LEN_BITS bits starting at
+ * FT_SKIP_LEN_SHIFT -- e.g. bits 57-63 on x86-64, 56-63 on AArch64;
+ * see the per-architecture encoding parameters above).  This requires
+ * architectures where those bits are guaranteed zero for userspace
+ * pointers.
  *
- * Enabled on architectures that define FT_SKIP_LEN_BITS (see
- * per-architecture encoding parameters above).  A runtime
+ * Enabled on architectures that define FT_SKIP_LEN_BITS.  A runtime
  * validation (mmap probe) at flag-set time rejects the feature
  * if the encoding bits fall within the kernel's VA range.
  *
- * Not supported on s390x (full 64-bit virtual addresses).
+ * Not supported on 32-bit architectures (no spare high pointer bits;
+ * FT_SKIP_LEN_BITS is left undefined there) nor on s390x (full 64-bit
+ * virtual addresses).
  *
  * Requires FEATURE_FT_COMPRESS (skip-compressed is meaningless
  * without compressed nodes).
