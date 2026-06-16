@@ -21,44 +21,56 @@
  * features, memory layout, or diagnostics.
  *
  * Functional features (enabled by default; disable for a simpler trie):
- *   FEATURE_FT_COMPRESS         prefix (path) compression of single-child
- *                               chains.  -DNO_FEATURE_FT_COMPRESS.
- *   FEATURE_FT_SKIP_COMPRESSED  pack the skip length + child pointer into
+ *
+ *   FEATURE_FT_COMPRESS         Prefix (path) compression of single-child
+ *                               chains.  Disable with -DNO_FEATURE_FT_COMPRESS.
+ *   FEATURE_FT_SKIP_COMPRESSED  Pack the skip length + child pointer into
  *                               the parent slot's high bits so a descent
  *                               bypasses the compressed cache line.  Auto
  *                               on 64-bit arches that define FT_SKIP_LEN_BITS
  *                               and pass the runtime VA probe; requires
- *                               FEATURE_FT_COMPRESS.  -DNO_FEATURE_FT_SKIP_COMPRESSED.
- *   FEATURE_INLINE_LOOKUP       force-inline the lookup hot path (no call
- *                               boundaries on descent).  -DNO_FEATURE_INLINE_LOOKUP.
+ *                               FEATURE_FT_COMPRESS.
+ *                               Disable with -DNO_FEATURE_FT_SKIP_COMPRESSED.
+ *   FEATURE_INLINE_LOOKUP       Force-inline the lookup hot path (no call
+ *                               boundaries on descent).
+ *                               Disable with -DNO_FEATURE_INLINE_LOOKUP.
  *
  * (The library-owned ordered-cell index is always compiled in; it is
  * gated per group at runtime via cds_ft_group_attr_set_ordered_list,
  * not at build time.)
  *
  * Memory layout (architecture-defaulted; override to force):
+ *
  *   FT_NEAR_METADATA            page_size-range item/metadata striding;
- *                               default on 64-bit.  -DFT_NEAR_METADATA.
+ *                               default on 64-bit.
+ *                               Force selection with -DFT_NEAR_METADATA.
  *   FT_FAR_METADATA             2 MiB macro-range layout; default on 32-bit.
- *                               -DFT_FAR_METADATA.
+ *                               Force selection with -DFT_FAR_METADATA.
  *
  * Validation and debugging (disabled by default; testing only, non-trivial
  * overhead):
+ *
  *   FEATURE_FT_VERIFY_AT_MUTATION  cds_ft_verify the whole trie at the exit
- *                                  of every public write.  -DFEATURE_FT_VERIFY_AT_MUTATION.
- *   FEATURE_FT_EXCL_VALIDATE       runtime check of the writer/reader
- *                                  access-discipline contract.  -DFEATURE_FT_EXCL_VALIDATE.
- *   DEBUG_COUNTERS                 group-scoped node / cell alloc balance
- *                                  accounting.  Uncomment below or -DDEBUG_COUNTERS.
- *   DEBUG / DEBUG_CLEAR_ITER       verbose dbg_printf / poison recycled
- *                                  iterator state.  Uncomment below.
+ *                                  of every public write.
+ *                                  Enable with -DFEATURE_FT_VERIFY_AT_MUTATION.
+ *   FEATURE_FT_EXCL_VALIDATE       Runtime check of the writer/reader
+ *                                  access-discipline contract.
+ *                                  Enable with -DFEATURE_FT_EXCL_VALIDATE.
+ *   DEBUG_COUNTERS                 Group-scoped node / cell alloc balance
+ *                                  accounting.
+ *                                  Enable with -DDEBUG_COUNTERS.
+ *   DEBUG / DEBUG_CLEAR_ITER       Verbose dbg_printf / poison recycled
+ *                                  iterator state.
+ *                                  Enable with -DDEBUG, -DDEBUG_CLEAR_ITER.
  *
  * Diagnostics and tracing:
- *   CDS_FT_SUPPRESS_ISA_WARNING    silence the x86 -mpopcnt / -mbmi build
- *                                  #warnings.  -DCDS_FT_SUPPRESS_ISA_WARNING.
- *   FT_ENABLE_TRACING              emit LTTng-UST tracepoints from the read /
+ *
+ *   CDS_FT_SUPPRESS_ISA_WARNING    Silence the x86 -mpopcnt / -mbmi build
+ *                                  #warnings.
+ *                                  Enable with -DCDS_FT_SUPPRESS_ISA_WARNING.
+ *   FT_ENABLE_TRACING              Emit LTTng-UST tracepoints from the read /
  *                                  mutation paths (see fractal-trie.c).
- *                                  -DFT_ENABLE_TRACING.
+ *                                  Enable with -DFT_ENABLE_TRACING.
  * =======================================================================
  */
 
@@ -98,7 +110,7 @@
 #define FT_TAG_MASK		(FT_COMPRESSED_MASK | FT_INTERNAL_MASK)	/* 0b011 — for compressed ptr unmasking */
 
 /*
- * This if followed by a number of bits reserved to represent the child
+ * This is followed by a number of bits reserved to represent the child
  * type.
  */
 #define FT_TYPE_BITS	3
@@ -1377,10 +1389,6 @@ bool cds_ft_metadata_in_recompact_private(struct cds_ft_metadata *metadata);
 __attribute__((visibility("hidden")))
 void cds_ft_free_item_deferred(struct cds_ft *ft,
 		struct cds_ft_metadata *metadata);
-
-//#define DEBUG
-//#define DEBUG_COUNTERS
-//#define DEBUG_CLEAR_ITER
 
 #ifdef __linux__
 #include <syscall.h>
