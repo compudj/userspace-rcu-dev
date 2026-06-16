@@ -1364,10 +1364,9 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  *
  * "Atomically" in this section is with respect to concurrent RCU readers:
  * a reader observes either the complete prior state or the complete result,
- * never a partial one.  It does not provide atomicity with respect to other
- * updates -- mutual exclusion between updates (cds_ft_insert,
- * cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
- * cds_ft_remove, cds_ft_remove_all) is the caller's responsibility.
+ * never a partial one.  It does NOT make an operation atomic against other
+ * concurrent updates; each operation below states the caller's
+ * mutual-exclusion requirement.
  */
 
 /*
@@ -1384,6 +1383,10 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * on error.  On failure, @node has not been published and is left
  * reusable: the same node may be passed to a subsequent insert
  * attempt.
+ *
+ * Mutual exclusion between updates (cds_ft_insert, cds_ft_insert_unique,
+ * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all)
+ * is the caller's responsibility.
  */
 enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -1413,6 +1416,10 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
  * dereference as long as the writer mutual exclusion is held, or if the
  * caller wraps the operation in their own RCU read-side critical
  * section.
+ *
+ * Mutual exclusion between updates (cds_ft_insert, cds_ft_insert_unique,
+ * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all)
+ * is the caller's responsibility.
  */
 enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -1445,6 +1452,10 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * Returns a negative cds_ft_status on error.  On error, @node has
  * not been published and is left reusable for a subsequent insert
  * attempt.
+ *
+ * Mutual exclusion between updates (cds_ft_insert, cds_ft_insert_unique,
+ * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all)
+ * is the caller's responsibility.
  */
 enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -1478,6 +1489,10 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * @old_node is not found at the iterator position, or a negative
  * cds_ft_status on error.
+ *
+ * Mutual exclusion between updates (cds_ft_insert, cds_ft_insert_unique,
+ * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all)
+ * is the caller's responsibility.
  */
 enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -1503,6 +1518,10 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  * the node is not found, or a negative cds_ft_status on error.
  * A grace period must be observed (e.g., synchronize_rcu, call_rcu)
  * after success before reclaiming @node memory.
+ *
+ * Mutual exclusion between updates (cds_ft_insert, cds_ft_insert_unique,
+ * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all)
+ * is the caller's responsibility.
  */
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -1539,6 +1558,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * *@result_node is NULL) and the call may be retried.  An allocation
  * failure while pruning an already-emptied internal holder is NOT an
  * error: the removal succeeded (CDS_FT_STATUS_OK).
+ *
+ * Mutual exclusion between updates (cds_ft_insert, cds_ft_insert_unique,
+ * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all)
+ * is the caller's responsibility.
  */
 enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
