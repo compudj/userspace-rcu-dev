@@ -1169,9 +1169,26 @@ static
 struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 		struct cds_ft_alloc_arena **arena_p,
 		const char *arena_name,
-		size_t item_len_order, bool bitmap)
+		size_t item_len_order, bool bitmap,
+		enum cds_ft_alloc_kind kind)
 {
 	struct cds_ft_alloc_arena *arena;
+
+	/*
+	 * Draw from the active node-allocation reserve, ABOVE the fault hook
+	 * and the arena: a bulk op that pre-filled a reserve cannot fail here
+	 * mid-commit, and the fault hook only bites during the fill (before the
+	 * reserve is activated).  Cells are never reserved.  The reserve is
+	 * touched only by the single writer that activated it (writer mutex
+	 * held), so no synchronization is needed.
+	 */
+	if (kind != CDS_FT_ALLOC_KIND_CELL && ft->active_reserve) {
+		struct cds_ft_alloc_reserve *r = ft->active_reserve;
+		unsigned int *cnt = &r->count[kind][item_len_order];
+
+		if (*cnt)
+			return r->items[kind][item_len_order][--(*cnt)];
+	}
 
 #ifdef FEATURE_FT_FAULT_INJECT
 	if (cds_ft_fault_alloc_countdown >= 0) {
@@ -1211,7 +1228,8 @@ struct cds_ft_metadata *cds_ft_alloc_item(struct cds_ft *ft, size_t item_len_ord
 {
 	return cds_ft_alloc_item_from(ft,
 		&ft->group->arena_order[item_len_order],
-		"cds_ft_alloc", item_len_order, bitmap);
+		"cds_ft_alloc", item_len_order, bitmap,
+		CDS_FT_ALLOC_KIND_NODE);
 }
 
 /*
@@ -1236,7 +1254,9 @@ struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft,
 		arena_p = &ft->group->arena_order[item_len_order];
 	return cds_ft_alloc_item_from(ft, arena_p,
 		ft->group->speculative ? "cds_ft_alloc_compressed" : "cds_ft_alloc",
-		item_len_order, false);
+		item_len_order, false,
+		ft->group->speculative ? CDS_FT_ALLOC_KIND_COMPRESSED :
+			CDS_FT_ALLOC_KIND_NODE);
 }
 
 /*
@@ -1249,7 +1269,8 @@ __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_alloc_cell_item(struct cds_ft *ft)
 {
 	return cds_ft_alloc_item_from(ft, &ft->group->cell_arena,
-		"cds_ft_alloc_cell", FT_ORD_CELL_ALLOC_ORDER, false);
+		"cds_ft_alloc_cell", FT_ORD_CELL_ALLOC_ORDER, false,
+		CDS_FT_ALLOC_KIND_CELL);
 }
 
 /*
@@ -1349,6 +1370,67 @@ void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 			ft_arena_reclaim_range(arena, range);
 	}
 #endif
+}
+
+/*
+ * Node-allocation reserve (see struct cds_ft_alloc_reserve + the API docstrings
+ * in fractal-trie-internal.h).  Fill uses the low-level alloc entries
+ * (cds_ft_alloc_item / cds_ft_alloc_compressed_item) so the items are NOT
+ * leak-counted here (the count lives in alloc_cds_ft_node); a drawn-and-used
+ * item is counted once there, and a drained (unused) item is freed uncounted,
+ * keeping the debug node accounting balanced.
+ */
+int cds_ft_alloc_reserve_add(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
+		enum cds_ft_alloc_kind kind, size_t item_len_order, bool bitmap,
+		unsigned int n)
+{
+	unsigned int i;
+
+	assert(kind == CDS_FT_ALLOC_KIND_NODE ||
+		kind == CDS_FT_ALLOC_KIND_COMPRESSED);
+	assert(item_len_order <= FT_ALLOC_ORDER_MAX);
+	assert(!ft->active_reserve);	/* fill before activate: real allocations */
+	assert(r->count[kind][item_len_order] + n <= CDS_FT_ALLOC_RESERVE_CAP);
+	for (i = 0; i < n; i++) {
+		struct cds_ft_metadata *m;
+
+		if (kind == CDS_FT_ALLOC_KIND_COMPRESSED)
+			m = cds_ft_alloc_compressed_item(ft, item_len_order);
+		else
+			m = cds_ft_alloc_item(ft, item_len_order, bitmap);
+		if (!m)
+			return -ENOMEM;
+		r->items[kind][item_len_order][r->count[kind][item_len_order]++] = m;
+	}
+	return 0;
+}
+
+void cds_ft_alloc_reserve_activate(struct cds_ft *ft,
+		struct cds_ft_alloc_reserve *r)
+{
+	assert(!ft->active_reserve);
+	ft->active_reserve = r;
+}
+
+void cds_ft_alloc_reserve_deactivate(struct cds_ft *ft)
+{
+	ft->active_reserve = NULL;
+}
+
+void cds_ft_alloc_reserve_drain(struct cds_ft *ft,
+		struct cds_ft_alloc_reserve *r)
+{
+	unsigned int k, o, i;
+
+	assert(!ft->active_reserve);	/* deactivate before drain */
+	(void) ft;
+	for (k = 0; k < CDS_FT_ALLOC_RESERVE_NR_KIND; k++) {
+		for (o = 0; o <= FT_ALLOC_ORDER_MAX; o++) {
+			for (i = 0; i < r->count[k][o]; i++)
+				cds_ft_do_free_item(r->items[k][o][i]);
+			r->count[k][o] = 0;
+		}
+	}
 }
 
 static

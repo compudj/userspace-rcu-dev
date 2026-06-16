@@ -743,6 +743,32 @@ struct cds_ft_key_map {
  * cds_ft_group_attr_create); individual tries are added with
  * cds_ft_create.
  */
+
+/*
+ * Node-allocation reserve (see cds_ft_group::active_reserve).  Holds nodes
+ * pre-allocated by a bulk op so its commit phase can draw them without an
+ * arena allocation that could fail.  Keyed by [kind][item_len_order]: kind 0 is
+ * the regular internal-node arena (CDS_FT_ALLOC_KIND_NODE), kind 1 the
+ * compressed-node arena (CDS_FT_ALLOC_KIND_COMPRESSED).  Cells are never
+ * reserved (the bulk ops move existing cells, they do not allocate new ones).
+ * Per-bucket capacity is small because each bulk op's exact node need is O(1)
+ * per (kind, order); reserve fills assert against it.
+ */
+#define CDS_FT_ALLOC_RESERVE_NR_KIND	2
+#define CDS_FT_ALLOC_RESERVE_CAP	8
+
+enum cds_ft_alloc_kind {
+	CDS_FT_ALLOC_KIND_NODE = 0,
+	CDS_FT_ALLOC_KIND_COMPRESSED = 1,
+	CDS_FT_ALLOC_KIND_CELL = 2,	/* never reserved */
+};
+
+struct cds_ft_alloc_reserve {
+	struct cds_ft_metadata *items[CDS_FT_ALLOC_RESERVE_NR_KIND]
+			[FT_ALLOC_ORDER_MAX + 1][CDS_FT_ALLOC_RESERVE_CAP];
+	unsigned int count[CDS_FT_ALLOC_RESERVE_NR_KIND][FT_ALLOC_ORDER_MAX + 1];
+};
+
 struct cds_ft_group {
 	size_t max_tree_depth;
 	size_t key_len;
@@ -939,6 +965,20 @@ struct cds_ft {
 	cds_ft_lookup_iter_fn lookup_gt_fn;
 
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
+
+	/*
+	 * Active node-allocation reserve for this trie (NULL when none).  A bulk
+	 * op that must complete without an allocation failure (cds_ft_merge_at's
+	 * sub-position residual) pre-fills a reserve with the exact nodes it will
+	 * need, then activates it on every trie it allocates into: a subsequent
+	 * cds_ft_alloc_item for this trie DRAWS from the reserve (above the fault
+	 * hook) instead of touching the group arena, so the op cannot fail
+	 * mid-commit.  Per-trie, not per-group: mutual exclusion is per-trie, so
+	 * a concurrent writer on a DIFFERENT trie of the same group must not see
+	 * (and draw from) this op's reserve.  Touched only by the single writer
+	 * holding this trie's mutex, so no synchronization is needed.
+	 */
+	struct cds_ft_alloc_reserve *active_reserve;
 
 	/*
 	 * Access discipline. When true, access is serialized
@@ -1365,6 +1405,43 @@ struct cds_ft_metadata *cds_ft_alloc_cell_item(struct cds_ft *ft);
 
 __attribute__((visibility("hidden")))
 void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata);
+
+/*
+ * Node-allocation reserve API (see struct cds_ft_alloc_reserve).  A bulk op
+ * with a deterministic node need pre-fills a zero-initialized reserve with the
+ * exact items it will allocate, activates it, runs its commit drawing from the
+ * reserve (no arena allocation, no failure), deactivates, then drains any
+ * unused items.  Fill is the only fallible step; on its failure the caller
+ * drains and aborts with nothing mutated.
+ *
+ * Add @n items of (@kind, @item_len_order) to @r.  @bitmap is the node type's
+ * bitmap flag (order uniquely determines it; ignored for COMPRESSED).  Returns
+ * 0, or -ENOMEM (caller drains @r and aborts).  Must run with the reserve NOT
+ * yet active (these are real arena allocations).  Asserts the running total
+ * fits CDS_FT_ALLOC_RESERVE_CAP.
+ */
+__attribute__((visibility("hidden")))
+int cds_ft_alloc_reserve_add(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
+		enum cds_ft_alloc_kind kind, size_t item_len_order, bool bitmap,
+		unsigned int n);
+
+/*
+ * Make @r the active reserve for @ft (this trie's writer mutex held).  A bulk
+ * op allocating into several tries (e.g. merge: src, dst, and the transient
+ * subtree) activates the SAME @r on each; the shared reserve is safe because
+ * the op holds all their writer mutexes.
+ */
+__attribute__((visibility("hidden")))
+void cds_ft_alloc_reserve_activate(struct cds_ft *ft,
+		struct cds_ft_alloc_reserve *r);
+
+/* Clear the active reserve for @ft. */
+__attribute__((visibility("hidden")))
+void cds_ft_alloc_reserve_deactivate(struct cds_ft *ft);
+
+/* Free every item still held in @r (the op drew fewer than it reserved). */
+__attribute__((visibility("hidden")))
+void cds_ft_alloc_reserve_drain(struct cds_ft *ft, struct cds_ft_alloc_reserve *r);
 
 /*
  * cds_ft_free_item_unpublished - immediate free for items that were
