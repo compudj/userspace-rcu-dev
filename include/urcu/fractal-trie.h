@@ -20,9 +20,14 @@
  * fixed-length byte keys to user-defined nodes. Keys are opaque
  * byte sequences with no reserved or sentinel values; unlike
  * tries that rely on NUL or other terminal characters, any byte
- * value may appear at any position in a key. Lookups and
- * traversals are wait-free under the RCU read-side lock and can
- * proceed concurrently with mutations. The internal structure is
+ * value may appear at any position in a key. Keys are ordered
+ * most-significant-byte first: the byte at offset 0 is most
+ * significant and the last byte least significant -- i.e.
+ * lexicographically by byte sequence, the big-endian form of
+ * an integer key. This is the order used by ordered iteration
+ * and the range queries (<=, >=, <, >). Lookups and traversals
+ * are wait-free under the RCU read-side lock and can proceed
+ * concurrently with mutations. The internal structure is
  * acyclic by construction: no sequence of concurrent updates can
  * introduce a cycle, ensuring that all lookups and traversals
  * complete in bounded time. Supports exact lookup, partial
@@ -532,11 +537,6 @@ void cds_ft_node_init(struct cds_ft_node *node)
 	node->prev = NULL;
 	node->next = NULL;
 }
-
-/*
- * The Fractal Trie keys most significant byte is first, and least
- * significant byte is last. This corresponds to a big endian integer.
- */
 
 /*
  * External-node arena with end-of-zone over-read safety, suitable for
