@@ -88,3 +88,16 @@ are supported. Provides "uniquify add" and "replace add"
 operations, along with associated read-side traversal uniqueness
 guarantees. Automatic hash table resize based on number of
 elements is supported. See the API for more details.
+
+
+### `urcu/fractal-trie.h`
+
+RCU ordered map from opaque variable-length byte keys to
+application-owned nodes. RCU used to provide existence guarantees.
+Provides wait-free read-side point lookups, range / inequality
+lookups, rank and skip queries, and ordered (key-sorted) forward
+and reverse traversal; updates are serialized by a caller-provided
+mutex. Unique and duplicate keys are supported. Provides bulk
+sub-trie operations (graft, graft-swap, detach, merge) that move
+or combine whole key ranges between tries of a group atomically
+with respect to readers. See the API for more details.
