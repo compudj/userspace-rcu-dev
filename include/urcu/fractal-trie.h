@@ -557,9 +557,13 @@ void cds_ft_node_init(struct cds_ft_node *node)
  *
  * Allocations are 8-byte aligned and zero-initialised.
  *
- * NUMA: pages lazy-fault onto the first-touching thread's local
- * node.  Callers that want a specific NUMA policy should pre-touch
- * the arena from the desired thread.
+ * NUMA: each range is placed with CDS_FT_NUMA_DEFAULT, deferring to the
+ * process NUMA policy.  Under a process interleave policy (e.g. numactl
+ * --interleave) the range is interleaved in 2 MiB chunks (MPOL_BIND per
+ * chunk); under LOCAL/PREFERRED/BIND the kernel honors that at fault
+ * time; with no process policy, pages fall back to first-touch.  Prefer
+ * setting a process NUMA policy over first-touching from one thread,
+ * which would pin the whole arena to a single node.
  *
  * Thread-safety: cds_ft_external_arena_alloc is internally
  * synchronised by a per-arena mutex, so multiple writer threads may
@@ -868,6 +872,10 @@ enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,
  * (cds_ft_iter_node()), status (cds_ft_iter_status()), and cached
  * position. The status is also returned by the function for
  * convenience.
+ *
+ * Scope: a scoped iterator (cds_ft_iter_set_prefix_len()) confines
+ * cds_ft_next() / _prev() / _first() / _last() and the range lookups to
+ * keys sharing that prefix.
  *
  * The RCU read-side lock must be held while calling these functions
  * and while accessing the returned node or reusing the iterator's
