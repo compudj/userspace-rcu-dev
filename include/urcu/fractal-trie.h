@@ -1626,23 +1626,23 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * Efficient bulk-removal pattern:
  *
  * Detach (or graft_swap) removes an entire sub-trie from the live
- * trie in a single O(1) operation. After a single grace period, no
+ * trie in a single O(1) operation and drains it before returning:
+ * the operation performs one internal grace period, after which no
  * concurrent reader can still hold a reference to any node in the
- * detached sub-trie. At that point, the detached trie is purely
- * local: the caller can iterate it and free all external nodes
- * directly, without observing a grace period for each individual
+ * detached sub-trie. The returned trie is therefore purely local —
+ * the caller can iterate it and free all external nodes directly,
+ * with no further synchronize_rcu and no grace period per individual
  * node. This reduces the cost of removing N nodes from N grace
- * periods (or N call_rcu callbacks) to a single grace period
- * followed by a local iteration.
+ * periods (or N call_rcu callbacks) to the single grace period the
+ * operation already performed, followed by a local iteration.
  *
  *   // Phase 1: detach from the live trie, O(1) under lock.
  *   lock(&writer_mutex);
  *   cds_ft_detach(live_trie, prefix, prefix_len, &detached);
  *   unlock(&writer_mutex);
  *
- *   // Phase 2: wait for readers, then drain locally.
- *   synchronize_rcu();
- *   // detached is now purely local — no readers can access it.
+ *   // Phase 2: detach already drained in-flight readers and returned
+ *   // a purely local trie, so free directly — no synchronize_rcu here.
  *   while (cds_ft_lookup_first(detached, iter) == CDS_FT_STATUS_OK) {
  *           struct cds_ft_node *node, *p;
  *           cds_ft_remove_all(detached, iter, &node);
