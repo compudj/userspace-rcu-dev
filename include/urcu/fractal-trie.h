@@ -3227,16 +3227,10 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
  * walking, the affected node is left at its current address and the walk
  * continues. The trie remains valid and correct, only less fully compacted.
  *
- * Memory reclaim is deferred, like every other mutator: each relocated node's
- * old copy is freed through the RCU grace-period mechanism, and a drained
- * source range only releases its pages (MADV_DONTNEED) from inside that
- * deferred-free callback. So resident memory does NOT drop synchronously when
- * this returns -- it falls once a grace period elapses and the callbacks run.
- * A caller that wants the reclaim to have completed (e.g. to observe the lower
- * RSS, or before measuring) must wait for a grace period itself, for example
- * rcu_barrier(), ideally batched with the reclamation it already performs. The
- * library deliberately does not force this wait, to keep the caller in control
- * of grace-period timing (the resumable form below depends on that).
+ * Memory reclaim is deferred (RCU grace period): resident memory does not
+ * drop synchronously when this returns, but once a grace period has
+ * elapsed.  A caller that needs to observe the lower RSS (e.g. before
+ * measuring) must wait for a grace period itself, for example rcu_barrier().
  *
  * To defragment a whole group, call this on each trie the group contains.
  */
@@ -3304,11 +3298,10 @@ void cds_ft_compact_end(struct cds_ft_compact_state *st);
  * CDS_FT_SHOW_JSON:   machine-readable JSON tree.  The root document
  *   is an object with "ft" (pointer) and "root" (node).  Each node
  *   carries "ptr", "kind", "level", optional "nr_child", and a
- *   "children" array whose entries are
- *   {"key_byte": N, "child": <node>}.  Compressed nodes additionally
- *   carry "path_len" and "child".  External nodes carry just "ptr"
- *   and "kind".  Intended for programmatic consumption (visualizers,
- *   test assertions).
+ *   "children" array whose entries are {"key_byte": N, "child": <node>}.
+ *   Compressed nodes additionally carry "path_len" and "child".  External
+ *   nodes carry just "ptr" and "kind".  Intended for programmatic
+ *   consumption (visualizers, test assertions).
  */
 enum cds_ft_show_format {
 	CDS_FT_SHOW_PRETTY,
