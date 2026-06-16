@@ -746,8 +746,8 @@ struct cds_ft_group {
 	 */
 	struct cds_ft_alloc_arena *compressed_arena_order[FT_ALLOC_ORDER_MAX + 1];
 	/*
-	 * Dedicated arena for ordinal cells (ordered_list_set
-	 * groups).  Separate from arena_order[] so the uniform 32 B cell
+	 * Dedicated arena for ordinal cells (ordered_list_set groups).
+	 * Separate from arena_order[] so the uniform 32 B cell
 	 * bodies pack contiguously in their own item region -- the dense
 	 * ord-walk stride that cds_ft_compact exploits -- instead of being
 	 * diluted among the internal-node ranges.  Lazily created on the
