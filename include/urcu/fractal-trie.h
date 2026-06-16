@@ -2382,13 +2382,12 @@ enum cds_ft_status cds_ft_group_attr_set_speculative_key_offset(
  * @offset: byte offset from the (struct cds_ft_node *) stored in the trie to a
  *   size_t in the caller's leaf holding that entry's key length.
  *
- * Optional, and only meaningful together with cds_ft_group_attr_set_ordered_list
- * on a VARIABLE-length-key group: cds_ft_next / cds_ft_prev then materialize the
- * result key from the leaf without descending (the descent normally derives the
- * length as it walks).  Unused for fixed-length groups (the length is the
- * group's fixed key_len) — and without it, variable-length cds_ft_next / prev
- * simply fall back to the descent.  The caller must store the length as a size_t
- * at @offset before insertion and not change it while the node is in the trie.
+ * Optional, and only meaningful together with
+ * cds_ft_group_attr_set_ordered_list on a VARIABLE-length-key group: it
+ * lets cds_ft_next / cds_ft_prev obtain the result key length directly from
+ * the leaf.  Unused for fixed-length groups (the length is the group's
+ * fixed key_len).  The caller must store the length as a size_t at @offset
+ * before insertion and not change it while the node is in the trie.
  *
  * Returns CDS_FT_STATUS_OK on success,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL @attr.
@@ -2429,8 +2428,7 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  *                                     placement policy for its internal
  *                                     allocator.
  * @attr: Fractal Trie group attributes.
- * @policy: One of enum cds_ft_numa_policy
- *          (DEFAULT, INTERLEAVE, LOCAL).
+ * @policy: One of enum cds_ft_numa_policy (DEFAULT, INTERLEAVE, LOCAL).
  *
  * Defaults to CDS_FT_NUMA_DEFAULT when the group attr is freshly
  * created: the library honors any explicit per-process NUMA policy but
@@ -2446,15 +2444,13 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  *                 interleave when no process policy is set.  The good
  *                 default for most callers; never overrides a stated
  *                 process intent.
- *   - INTERLEAVE: 2 MiB-granular round-robin across allowed NUMA
- *                 nodes.  Best for
- *                 multi-reader workloads with readers distributed
- *                 across NUMA nodes.  Single-threaded performance is
- *                 within noise of LOCAL on modern x86 (the L2/L3
- *                 prefetcher works fine over 2 MiB chunks of
- *                 contiguous physical memory).  Enables transparent
- *                 hugepage collapse by keeping each 2 MiB chunk on
- *                 a single node.
+ *   - INTERLEAVE: 2 MiB-granular round-robin across allowed NUMA nodes.
+ *                 Best for multi-reader workloads with readers distributed
+ *                 across NUMA nodes.  Single-threaded performance is within
+ *                 noise of LOCAL on modern x86 (the L2/L3 prefetcher works
+ *                 fine over 2 MiB chunks of contiguous physical memory).
+ *                 Enables transparent hugepage collapse by keeping each
+ *                 2 MiB chunk on a single node.
  *   - LOCAL:      explicit first-touch (skip mbind).  Forces first-touch
  *                 even when no process policy is set, whereas DEFAULT
  *                 interleaves in that case.  Use when you specifically
