@@ -8257,10 +8257,9 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 			 * its internal parent is the dispatcher at @level-1), not the
 			 * interior divergence position @level+mpos: the divergence
 			 * offset inside a compressed span is irrelevant to going-up
-			 * (a compressed node has no within-span siblings).  Both the
-			 * array walk (skips the now-absent no-op down-steps) and the
-			 * parent-pointer cursor (seeds up_parent = the internal parent
-			 * directly) reach the same sibling search.
+			 * (a compressed node has no within-span siblings).  The
+			 * parent-pointer cursor seeds up_parent = the internal parent
+			 * directly and proceeds to the sibling search.
 			 */
 			*level_p = level;
 			iter_debug_path_snapshot(iter);
@@ -8278,12 +8277,11 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 		node_flag = ft_dereference_acquire_prefetch(cn->child);
 		assert(node_flag != NULL);	/* compressed node always has a live child */
 		/*
-		 * iter_path[level] is the dispatcher for byte at index
-		 * level - 1 (i.e. the byte AFTER the compressed prefix).
-		 * That dispatcher is cn->child, not the compressed node
-		 * itself, so overwrite the fill-loop's compressed entry at
-		 * this position. going_up relies on this to find the
-		 * sibling of the failing byte in cn->child.
+		 * The descent result at this position is cn->child -- the
+		 * dispatcher for the byte at index level - 1 (the byte AFTER
+		 * the compressed prefix), not the compressed node itself.
+		 * going_up relies on this to find the sibling of the failing
+		 * byte in cn->child.
 		 */
 		*skip_eq_external_nodes_p = false;
 		*node_flag_p = node_flag;
@@ -8435,7 +8433,7 @@ enum ft_descent_action ft_inequality_minmax_compressed(
  * Return @node's external_nodes (the dup-chain head hanging off an
  * internal or compressed node).  @node must be internal or compressed.
  * Used to recover a cached iterator position's deepest trie node without
- * an iter_path[] read: a prefix key sits at an internal/compressed node
+ * re-descending: a prefix key sits at an internal/compressed node
  * whose external_nodes == iter->node.
  */
 static inline_lookup
@@ -8980,8 +8978,9 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	 * node descent established; @up_node_lo is the shallowest depth it
 	 * covers -- its TRUE shallow boundary (several levels below @up_node
 	 * for a compressed run).  Tracked as descent proceeds so the going-up
-	 * seed is live (no iter_path[] read), then climbed via
-	 * ft_get_parent_rcu up to the going-up @level.  Seeding from the
+	 * seed is live (taken from the descent, not read back from a
+	 * recorded path), then climbed via ft_get_parent_rcu up to the
+	 * going-up @level.  Seeding from the
 	 * deepest node + true shallow boundary (rather than from @node_flag
 	 * and the end-of-key-adjusted @level) avoids both the level
 	 * adjustment desync and the compressed-span boundary ambiguity.
@@ -9187,8 +9186,8 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 			/*
 			 * Cross-call continuation: recover the deepest trie node
 			 * for iter->key from the cached position iter->node (the
-			 * dup-chain head), not from iter_path[].  A prefix key
-			 * sits at an internal/compressed holder whose
+			 * dup-chain head), not from a recorded descent path.  A
+			 * prefix key sits at an internal/compressed holder whose
 			 * external_nodes == iter->node; otherwise iter->node is a
 			 * leaf child (a tag-0 external flag).  ft_get_parent_rcu
 			 * on the head reaches the holder in O(1) (head->prev ==
@@ -9234,8 +9233,6 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 		 * Cross-call fast path: the cached deepest node is the going-up
 		 * seed.  It is never compressed/skip here (those fall back to
 		 * slow_path above), so its shallow boundary is its own depth.
-		 * Transitional iter_path[] read; removed in P5 with
-		 * cds_ft_iter_bind.
 		 */
 		up_node = node_flag;
 		up_node_lo = key_depth - 1;
@@ -9582,9 +9579,9 @@ going_up:
 		assert(0);
 	}
 	/*
-	 * Parent-pointer going-up cursor (P1a).  Replaces the two descent-
-	 * stack reads iter_path[level] (node at @level) and iter_path[level-1]
-	 * (the dispatcher scanned for a sibling) with live back-pointer reads,
+	 * Parent-pointer going-up cursor (P1a).  The node at @level and the
+	 * dispatcher at @level-1 (scanned for a sibling) are obtained via live
+	 * back-pointer reads,
 	 * which may observe a fresher version than the descent snapshot
 	 * (intentional -- freshness -- and semantically valid).
 	 *
@@ -9871,8 +9868,8 @@ going_up:
 				 * sibling found while backtracking down to prefix_len),
 				 * whose last iteration ran at level == prefix_len + 1 with
 				 * the P1a invariant up_parent == node at level - 1 ==
-				 * node at prefix_len.  Live read, replacing the descent-
-				 * stack read iter_path[prefix_len].
+				 * node at prefix_len.  Obtained via a live back-pointer
+				 * read.
 				 */
 				struct cds_ft_inode_flag *pfx_flag = up_parent;
 
@@ -10159,8 +10156,8 @@ descend_children:
 		 * ancestor, so a slot-emptied internal is never left in
 		 * place).  Treat as "empty at this step" and let
 		 * going_up find the next sibling at a higher level.
-		 * Back level one step so iter_path[level] holds the
-		 * parent the prior iter recorded.
+		 * Back level one step so the going-up cursor resumes at
+		 * the parent.
 		 */
 		if (caa_unlikely(!node_flag)) {
 			level--;
@@ -20657,9 +20654,9 @@ int ft_rebuild_path(struct cds_ft *ft,
 			return -1;
 	}
 	/*
-	 * Deepest node reached (== iter_path[key_len]); always placed at
+	 * Deepest node reached (the node at depth key_len); always placed at
 	 * depth key_len as a child, so its shallow boundary is key_len.
-	 * Lets the going-up cursor seed live (no iter_path[] read).
+	 * Lets the going-up cursor seed live from the descent.
 	 */
 	*deepest_p = node_flag;
 	return (int) key_len;
@@ -20852,8 +20849,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 	 * ft_get_parent_rcu as @level decrements (span compressed=cn->len,
 	 * internal=1).  Seeded live from ft_rebuild_path's deepest node
 	 * (@deepest == node at @level==@depth, placed there as a child so its
-	 * shallow boundary is @level), replacing the descent-stack read
-	 * iter_path[level] + dense-fill.
+	 * shallow boundary is @level).
 	 */
 	{	/* Scope the going-up cursor locals so they are out of scope at not_found/descend_* (avoids -Wjump-misses-init false positives). */
 		struct cds_ft_inode_flag *up_node = deepest;
@@ -20947,8 +20943,8 @@ descend_forward:
 	{
 		/*
 		 * @descend_from is the node placed at @level by the going-up
-		 * / at-external block right before its goto here; it equals the
-		 * descent-stack entry iter_path[level] without the array read.
+		 * / at-external block right before its goto here; it is the
+		 * node at descent level @level.
 		 */
 		struct cds_ft_inode_flag *node_flag = descend_from;
 
@@ -21154,7 +21150,7 @@ enum ft_descent_action ft_skip_reverse_walk_up_compressed(
 	/*
 	 * Caller (cds_ft_iter_skip_reverse) guarantees this is the
 	 * compressed ancestor's shallow boundary -- the intermediate-level
-	 * skip is decided there, so no descent-stack read is needed here.
+	 * skip is decided there, so this code need not re-derive it.
 	 */
 	ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
 	a_ext = ft_dereference_acquire(ameta->external_nodes);
@@ -21244,8 +21240,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	 * (P3): @up_node is the live node covering depth @level, climbed via
 	 * ft_get_parent_rcu as @level decrements.  Seeded live from
 	 * ft_rebuild_path's deepest node (@deepest == node at @level==@depth,
-	 * placed there as a child so its shallow boundary is @level),
-	 * replacing the descent-stack read iter_path[level] + dense-fill.
+	 * placed there as a child so its shallow boundary is @level).
 	 */
 	{	/* Scope the going-up cursor locals so they are out of scope at not_found/descend_* (avoids -Wjump-misses-init false positives). */
 		struct cds_ft_inode_flag *up_node = deepest;
@@ -21280,9 +21275,8 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 				/*
 				 * Process the compressed ancestor's external_nodes only
 				 * at its shallow boundary; skip the intermediate in-span
-				 * levels.  PP: the live cursor's shallow bound up_node_lo
-				 * equals level there.  Non-PP: the descent stack repeats
-				 * the same node at adjacent in-span levels.
+				 * levels.  The live cursor's shallow bound up_node_lo
+				 * equals level there.
 				 */
 				at_shallow_boundary = (level == 0) ||
 					(up_node_lo == level);
@@ -21432,8 +21426,8 @@ descend_reverse:
 	{
 		/*
 		 * @descend_from carries the node placed at @level by the
-		 * going-up block right before its goto here; it equals the
-		 * descent-stack entry iter_path[level] without the array read.
+		 * going-up block right before its goto here; it is the
+		 * node at descent level @level.
 		 */
 		struct cds_ft_inode_flag *node_flag = descend_from;
 
