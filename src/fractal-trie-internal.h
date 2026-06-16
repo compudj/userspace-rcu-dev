@@ -405,7 +405,7 @@
 #endif
 
 /*
- * Library-owned ordered sibling list ("Option E").
+ * Library-owned ordered sibling list.
  *
  * Threads the duplicate-chain heads (one per distinct key) into a
  * key-ordered doubly-linked list of LIBRARY-OWNED "ordinal cells"
@@ -717,7 +717,7 @@ struct cds_ft_group {
 	 */
 	struct cds_ft_alloc_arena *compressed_arena_order[FT_ALLOC_ORDER_MAX + 1];
 	/*
-	 * Dedicated arena for ordinal cells (Option E, ordered_list_set
+	 * Dedicated arena for ordinal cells (ordered_list_set
 	 * groups).  Separate from arena_order[] so the uniform 32 B cell
 	 * bodies pack contiguously in their own item region -- the dense
 	 * ord-walk stride that cds_ft_compact exploits -- instead of being
@@ -788,7 +788,7 @@ struct cds_ft_group {
 	bool key_len_offset_set;
 	/*
 	 * @ordered_list_set: enable the library-owned ordered sibling list
-	 *   (FEATURE_FT_ORD_CELL "Option E").  The order links live in a
+	 *   (FEATURE_FT_ORD_CELL).  The order links live in a
 	 *   library-owned relocatable "ordinal cell" (struct ft_ord_cell) hung off
 	 *   each duplicate-chain head's cds_ft_node.prev; the application leaf is
 	 *   unchanged (no ord fields, no offset to declare).  The result key is
@@ -1300,7 +1300,7 @@ __attribute__((visibility("hidden")))
 struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft, size_t item_len_order);
 
 /*
- * Allocate one ordinal cell (Option E) from the group's dedicated cell arena
+ * Allocate one ordinal cell from the group's dedicated cell arena
  * (FT_ORD_CELL_ALLOC_ORDER, no bitmap).  Returns a metadata whose item is the
  * 32 B cell (cds_ft_metadata_to_item); freed via cds_ft_free_item.
  */

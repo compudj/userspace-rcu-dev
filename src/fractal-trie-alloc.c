@@ -1205,7 +1205,7 @@ struct cds_ft_metadata *cds_ft_alloc_compressed_item(struct cds_ft *ft,
 }
 
 /*
- * Ordinal-cell allocation (Option E): routes to the group's dedicated cell
+ * Ordinal-cell allocation: routes to the group's dedicated cell
  * arena so the uniform 32 B cells pack contiguously in their own item region,
  * the dense stride cds_ft_compact relocates them into.  Never mixed with the
  * internal-node or compressed-node arenas.

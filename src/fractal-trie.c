@@ -1886,7 +1886,7 @@ struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
 
 
 /*
- * Ordinal-cell tag + accessors ("Option E", cell-always model).
+ * Ordinal-cell tag + accessors (cell-always model).
  *
  * Every duplicate-chain HEAD has a library-owned ordinal cell (struct
  * ft_ord_cell), and the head's cds_ft_node.prev points to it.  The head's
@@ -1959,7 +1959,7 @@ struct ft_ord_cell *ft_ord_cell_resolve_ord(struct ft_ord_cell *const *slot)
 }
 
 /*
- * Cell lifecycle (Stage 6, FT-allocator arena).
+ * Cell lifecycle (FT-allocator arena).
  *
  * The cell is an item of the group's dedicated cell arena (a uniform 32 B
  * item region, FT_ORD_CELL_ALLOC_ORDER), so cells pack contiguously for the
@@ -8512,7 +8512,7 @@ void ft_speculative_keycopy_unconditional(const struct cds_ft *ft,
 }
 
 /*
- * Lazy-ref accessor model (re-applied from commit 1a21ca98, scoped to the
+ * Lazy-ref accessor model (scoped to the
  * ordinal-cell ordered list).  In a cell group with a leaf-key offset and an
  * identity key map, the ordered-iteration result key is held as a LIVE
  * REFERENCE into the matched leaf (iter->node + speculative_key_offset) instead
@@ -8973,7 +8973,7 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	size_t key_len = 0;
 	bool going_up = false, skip_eq_external_nodes;
 	/*
-	 * Parent-pointer going-up cursor (P4 structural up_node form,
+	 * Parent-pointer going-up cursor (structural up_node form,
 	 * mirroring the iter_skip walk-up).  @up_node is the deepest live
 	 * node descent established; @up_node_lo is the shallowest depth it
 	 * covers -- its TRUE shallow boundary (several levels below @up_node
@@ -9001,7 +9001,7 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	/*
-	 * Ordinal-cell fast path (Option E): cds_ft_next / cds_ft_prev (GT/LT,
+	 * Ordinal-cell fast path: cds_ft_next / cds_ft_prev (GT/LT,
 	 * LIMIT_NONE) on a cached head collapse to a single dependent load of the
 	 * cell's ord_next / ord_prev — no descent, no leaf touch for the step
 	 * (cell->node + cell->ord_* co-reside in the 32B cell).  Hoisted ABOVE the
@@ -9579,7 +9579,7 @@ going_up:
 		assert(0);
 	}
 	/*
-	 * Parent-pointer going-up cursor (P1a).  The node at @level and the
+	 * Parent-pointer going-up cursor.  The node at @level and the
 	 * dispatcher at @level-1 (scanned for a sibling) are obtained via live
 	 * back-pointer reads,
 	 * which may observe a fresher version than the descent snapshot
@@ -9771,7 +9771,7 @@ going_up:
 				 */
 				level -= (ssize_t) rewind;
 				/*
-				 * P1b: the merge rewound @level and re-anchored the live
+				 * The merge rewound @level and re-anchored the live
 				 * holder at the new level-1.  Re-sync the parent cursor to
 				 * @anchor (an internal node, span 1).  If the re-scan below
 				 * finds no sibling, the for-loop's level-- then carries
@@ -9867,7 +9867,7 @@ going_up:
 				 * This block is reached only via normal loop exit (no
 				 * sibling found while backtracking down to prefix_len),
 				 * whose last iteration ran at level == prefix_len + 1 with
-				 * the P1a invariant up_parent == node at level - 1 ==
+				 * the invariant up_parent == node at level - 1 ==
 				 * node at prefix_len.  Obtained via a live back-pointer
 				 * read.
 				 */
@@ -12211,7 +12211,7 @@ static void ft_ord_cell_splice_at(struct cds_ft *ft, struct ft_ord_cell *cell,
 static void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell);
 static void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		struct ft_ord_cell *new_cell);
-/* Bulk-op ordered-list maintenance (Phase 3). */
+/* Bulk-op ordered-list maintenance. */
 static struct cds_ft_node *ft_subtree_minmax_head(
 		struct cds_ft *ft, struct cds_ft_inode_flag *nf, bool want_max);
 static void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
@@ -13689,8 +13689,8 @@ int ft_detach_node(struct cds_ft *ft,
 				 *
 				 *   Otherwise (neither external nor
 				 *   compressed) the pointer is an internal
-				 *   node (possibly with FT_SKIP_MASK from a
-				 *   Stage 4b internal skip-target; dormant
+				 *   node (possibly with FT_SKIP_MASK from an
+				 *   internal skip-target; dormant
 				 *   today).
 				 */
 				/* Phase 1: elevated ancestors. */
@@ -18227,7 +18227,7 @@ void ft_flip_batch_reclaim(struct ft_flip_batch *b)
 
 
 /*
- * Ordinal-cell list maintenance (Option E).
+ * Ordinal-cell list maintenance.
  *
  * Mirrors the ORD_CHAIN chain maintenance, but the key-ordered doubly-linked
  * list threads the library-owned cells (one per distinct-key head) via
@@ -20844,7 +20844,7 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 
 	/*
 	 * Walk up: at each ancestor, count keys in rightward siblings
-	 * of the child we came from.  Parent-pointer backtrack (P3):
+	 * of the child we came from.  Parent-pointer backtrack:
 	 * @up_node is the live node covering depth @level, climbed via
 	 * ft_get_parent_rcu as @level decrements (span compressed=cn->len,
 	 * internal=1).  Seeded live from ft_rebuild_path's deepest node
@@ -21236,8 +21236,8 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 	/*
 	 * Walk up: at each ancestor, count keys in leftward siblings
 	 * of the child we came from, plus external_nodes at the ancestor
-	 * (which sort before all children).  Parent-pointer backtrack
-	 * (P3): @up_node is the live node covering depth @level, climbed via
+	 * (which sort before all children).  Parent-pointer backtrack:
+	 * @up_node is the live node covering depth @level, climbed via
 	 * ft_get_parent_rcu as @level decrements.  Seeded live from
 	 * ft_rebuild_path's deepest node (@deepest == node at @level==@depth,
 	 * placed there as a child so its shallow boundary is @level).
