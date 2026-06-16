@@ -1830,12 +1830,13 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * pointer is NULL, if @dst_ft == @src_ft, if the tries are not in
  * the same group, or if @key_len exceeds the group's maximum key
  * length.
- * Returns a negative cds_ft_status on memory allocation failure.  Both
- * tries are then left individually valid.  The sole exception is a rare
- * double allocation failure when @dst_ft is empty at @key: the move into
- * @dst_ft fails and the subsequent rollback that restores @src_ft also
- * fails, leaving some moved external nodes unreachable (leaked).  A merge
- * into a @dst_ft that already has content at @key never leaks.
+ * Returns a negative cds_ft_status on memory allocation failure, with both
+ * tries left individually valid AND no moved entry stranded.  The merge is
+ * built invisibly and the source is emptied only once the destination
+ * placement is fully secured (every node drawn from a pre-filled reserve, the
+ * single publish slot pre-allocated), so the source unlink is the last
+ * fallible step and any allocation shortfall rolls the whole operation back
+ * cleanly: the merge never leaks.
  *
  * Mutual exclusion between writers on both @dst_ft and @src_ft is
  * the caller's responsibility.
