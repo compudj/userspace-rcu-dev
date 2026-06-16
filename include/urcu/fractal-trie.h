@@ -588,19 +588,27 @@ enum cds_ft_optimize {
 };
 
 /*
- * cds_ft_external_arena_attr_create - Allocate a default external-arena attr
- * (CDS_FT_OPTIMIZE_THROUGHPUT).  Destroy with
- * cds_ft_external_arena_attr_destroy.  Returns CDS_FT_STATUS_OK on success,
+ * cds_ft_external_arena_attr_create - Allocate an external-arena attr.
+ *
+ * Initialized to the defaults (CDS_FT_OPTIMIZE_THROUGHPUT).  Destroy it with
+ * cds_ft_external_arena_attr_destroy().  Returns CDS_FT_STATUS_OK on success,
  * or CDS_FT_STATUS_MEMORY_ERROR on allocation failure.
  */
 enum cds_ft_status cds_ft_external_arena_attr_create(
 		struct cds_ft_external_arena_attr **attr);
 
+/*
+ * cds_ft_external_arena_attr_destroy - Free an external-arena attr.
+ *
+ * Frees an attr allocated by cds_ft_external_arena_attr_create().  @attr may
+ * be NULL, in which case this is a no-op.
+ */
 void cds_ft_external_arena_attr_destroy(struct cds_ft_external_arena_attr *attr);
 
 /*
- * cds_ft_external_arena_attr_set_optimize - Set the arena's page-size policy
- * (see enum cds_ft_optimize).  Returns CDS_FT_STATUS_OK, or
+ * cds_ft_external_arena_attr_set_optimize - Set the arena's page-size policy.
+ *
+ * See enum cds_ft_optimize.  Returns CDS_FT_STATUS_OK, or
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @opt.
  */
 enum cds_ft_status cds_ft_external_arena_attr_set_optimize(
