@@ -1835,11 +1835,14 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
  * Each such slot transiently holds a tagged pointer to a urcu_flip_proxy
  * latch; a single urcu_flip_commit store flips them all atomically.
  *
- * A proxy is tagged as a synthetic INTERNAL node of type-index 7 -- the
- * FT_NULL slot (ft_types[7]) that no real node ever occupies -- so a flag
- * whose low nibble equals (FT_INTERNAL_MASK | FT_TYPE_MASK) == 0xF is a
- * proxy and nothing else (real internal nodes use type 0..6; external,
- * compressed, NULL and skip pointers never set all of bits 0..3).  The
+ * A proxy is tagged as a synthetic INTERNAL node of type-index 7, the
+ * maximal tag value (low nibble (FT_INTERNAL_MASK | FT_TYPE_MASK) == 0xF).
+ * ft_types[7] is FT_NULL on every arch -- the canonical NULL slot on
+ * 64-bit (NODE_INDEX_NULL == 7), and reserved padding on 32-bit (where
+ * NODE_INDEX_NULL == 6 and real types stop at 5) -- so no real node ever
+ * carries type 7 in either tier.  A flag whose low nibble is 0xF is thus a
+ * proxy and nothing else (external, compressed, NULL and skip pointers
+ * never set all of bits 0..3).  The
  * proxy is 16-byte aligned (low 4 bits free for the tag) and lives at a
  * userspace address with the skip-len high bits clear, so
  * _ft_node_mask_ptr recovers it exactly.  The same encoding is valid in
