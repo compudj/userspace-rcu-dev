@@ -1192,9 +1192,14 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 		 * Reserve active but exhausted for this (kind, order): the op's
 		 * manifest under-counted what it allocates.  Surface it in debug
 		 * — the op would otherwise fall through to a fallible allocation
-		 * here, defeating the reserve's no-fail guarantee.  Production
-		 * falls through (degrading to the pre-reserve behaviour).
+		 * here, defeating the reserve's no-fail guarantee.  The report
+		 * names the missing bucket so a manifest can be extended to a new
+		 * shape.  Production falls through (degrading to pre-reserve
+		 * behaviour).
 		 */
+		fprintf(stderr,
+			"ft alloc reserve underflow: kind=%d order=%zu\n",
+			(int) kind, item_len_order);
 		assert(0);
 	}
 

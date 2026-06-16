@@ -19765,49 +19765,33 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 }
 
 /*
- * Read-only classifier for cds_ft_merge_at's reserve fast path.  Returns true
- * iff @dst_key lands exactly on an EMPTY slot of an already-present internal
- * node — the "NOSPLIT at-node" shape, where ft_graft_build returns NOSPLIT
- * with d->depth == key_len and d->nf == NULL, and ft_store_at_graft_point's
- * ONLY node allocation is the optional grow-recompact of d->pnf.  Fills @d_out
- * with that descent so the caller can size the grow node.  Returns false for a
- * diverge-in-compressed (GLUE: builds a whole cluster), a key-shorter
- * (POPULATED), an occupied slot, or a descent that stops short of key_len
- * (needs a built branch of intermediate nodes): those have a larger or more
- * shape-dependent node need and stay on the legacy detach-then-graft path.
- * Mirrors ft_graft_build's descent without building anything.
+ * Reserve one node mirroring a freshly-built graft-cluster node @nf, so the
+ * real graft (which rebuilds the same cluster) can draw it instead of
+ * allocating.  Compressed node — the compressed kind/order for its byte
+ * length; internal node — its type's order and bitmap.  Used to AUTO-LEARN a
+ * GLUE diverge's node manifest from a build-and-abort learn pass, without hand-
+ * coding the split's per-node arithmetic.
  */
 static
-bool ft_merge_dst_at_node_empty(struct cds_ft *dst, const uint8_t *key,
-		size_t key_len, struct ft_descent *d_out)
+int ft_merge_reserve_add_built(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
+		struct cds_ft_inode_flag *nf)
 {
-	struct ft_descent d;
-	const uint8_t *ik = key;
+	struct cds_ft_inode_flag *p = ft_resolve_skip_compressed(ft, nf);
 
-	ft_descent_init(&d, dst);
-	for (; d.depth < key_len; ) {
-		if (ft_node_external(d.nf))
-			return false;	/* stops short: needs a built branch */
-		d.nf = ft_resolve_skip_compressed(dst, d.nf);
-		if (ft_node_compressed(d.nf)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(d.nf);
-			int remaining = (int) (key_len - d.depth);
-			int cmp = cn->len < remaining ? cn->len : remaining;
-			int j = ft_match_compressed_key(ik, cn, cmp);
+	if (ft_node_compressed(p)) {
+		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(p);
+		enum cds_ft_alloc_kind kind = ft->group->speculative ?
+			CDS_FT_ALLOC_KIND_COMPRESSED : CDS_FT_ALLOC_KIND_NODE;
 
-			if (j == cmp && cn->len <= remaining) {
-				ft_descent_traverse_compressed(&d, cn, &ik);
-				continue;
-			}
-			return false;	/* GLUE diverge / POPULATED key-shorter */
-		}
-		ft_descent_step(dst, &d, *(ik++));
+		return cds_ft_alloc_reserve_add(ft, r, kind,
+			ft_compressed_order(cn->len), false, 1);
 	}
-	if (d.nf)
-		return false;		/* slot occupied (POPULATED) */
-	*d_out = d;
-	return true;
+	{
+		unsigned int ti = ft_node_type(p);
+
+		return cds_ft_alloc_reserve_add(ft, r, CDS_FT_ALLOC_KIND_NODE,
+			ft_types[ti].order, ft_types[ti].bitmap, 1);
+	}
 }
 
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
@@ -20053,15 +20037,26 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * Reserve fast path for the sub-position residual: when the source at
-	 * @src_key is a plain multi-child (or NIL-key-bearing) internal node and
-	 * @dst_key lands on an empty slot of an already-present dst node, graft's
-	 * ONLY node allocations are the fresh subtree root (ft_types[0]) and an
-	 * optional grow-recompact at the attach node.  Pre-reserve exactly those,
-	 * then detach (clean on its own failure) and graft DRAWING from the
-	 * reserve: graft's node allocations cannot fail, so there is no rollback
-	 * to strand the moved externals.  The reserve is activated on @subtree
-	 * (fresh root) and @dst_ft (grow), drawn under their writer mutexes.
+	 * Reserve fast path for the sub-position residual.  When the source at
+	 * @src_key is a plain multi-child (or NIL-key-bearing) internal node — so
+	 * its move payload needs no canonicalize and detach re-roots it in place
+	 * (subtree root == @d_src.nf) — pre-reserve EXACTLY the nodes graft will
+	 * allocate, then detach (clean on its own failure) and graft DRAWING from
+	 * the reserve: graft's node allocations cannot fail, so there is no
+	 * rollback to strand the moved externals.
+	 *
+	 * The manifest is learned from a build-and-abort pass of graft's
+	 * build-invisible prep against the live source subtree:
+	 *  - GLUE diverge: ft_graft_build builds the whole split cluster into a
+	 *    throwaway glue; mirror its built[] nodes into the reserve, then abort
+	 *    (nothing was published, so @dst_ft stays pristine).  The real graft
+	 *    rebuilds the identical cluster (same payload node) drawing from it.
+	 *  - NOSPLIT at-node (descent reaches key_len on an empty slot): the only
+	 *    commit-time node allocation is an optional grow-recompact of the
+	 *    attach node; reserve that.
+	 *  - anything else (build-a-branch, occupied, or an OOM during the learn
+	 *    build): fall through to the legacy detach-then-graft path.
+	 * The fresh subtree root (ft_types[0]) is always reserved.
 	 *
 	 * The NOSPLIT flip batch is a malloc (not arena-backed, not covered by
 	 * the reserve) and can still fail on true OOM, falling through to the
@@ -20070,30 +20065,38 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	{
 		struct cds_ft_inode_flag *p =
 			ft_resolve_skip_compressed(src_ft, d_src.nf);
-		struct ft_descent d_attach;
+		struct cds_ft_metadata *pm = (!ft_node_external(p)
+				&& !ft_node_compressed(p)) ?
+			ft_flag_to_metadata(src_ft, p) : NULL;
 
-		if (ks == FT_GRAFT_SWAP_EXACT && off_src == 0
-				&& !ft_node_external(p) && !ft_node_compressed(p)
-				&& ft_merge_dst_at_node_empty(dst_ft, okey_dst,
-					dst_key_len, &d_attach)) {
-			struct cds_ft_metadata *pm = ft_flag_to_metadata(src_ft, p);
+		if (ks == FT_GRAFT_SWAP_EXACT && off_src == 0 && pm
+				&& (pm->nr_child >= 2 || pm->external_nodes)) {
+			struct cds_ft_alloc_reserve reserve;
+			struct ft_graft_glue lg;
+			struct ft_descent dl;
+			enum ft_graft_prep prep;
+			bool chosen = false;
+			int rret = 0;
 
-			if (pm->nr_child >= 2 || pm->external_nodes) {
+			memset(&reserve, 0, sizeof(reserve));
+			ft_graft_glue_init(&lg);
+			prep = ft_graft_build(dst_ft, okey_dst, dst_key_len,
+				d_src.nf, cnt_src, &dl, &lg);
+			if (prep == FT_GRAFT_PREP_GLUE) {
+				int bi;
+
+				for (bi = 0; bi < lg.nr_built && !rret; bi++)
+					rret = ft_merge_reserve_add_built(dst_ft,
+						&reserve, lg.built[bi]);
+				chosen = true;
+			} else if (prep == FT_GRAFT_PREP_NOSPLIT
+					&& dl.depth == dst_key_len && !dl.nf) {
 				struct cds_ft_metadata *am =
 					cds_ft_item_to_metadata(
-						ft_node_ptr(d_attach.pnf));
-				unsigned int aidx = ft_node_type(d_attach.pnf);
-				struct cds_ft_alloc_reserve reserve;
-				int rret;
+						ft_node_ptr(dl.pnf));
+				unsigned int aidx = ft_node_type(dl.pnf);
 
-				memset(&reserve, 0, sizeof(reserve));
-				/* Fresh subtree root: always 1x ft_types[0]. */
-				rret = cds_ft_alloc_reserve_add(dst_ft, &reserve,
-					CDS_FT_ALLOC_KIND_NODE, ft_types[0].order,
-					ft_types[0].bitmap, 1);
-				/* Grow-recompact iff adding a child overflows. */
-				if (!rret && am->nr_child + 1 >
-						ft_types[aidx].max_child) {
+				if (am->nr_child + 1 > ft_types[aidx].max_child) {
 					unsigned int gidx =
 						find_nearest_type_index(aidx,
 							am->nr_child + 1,
@@ -20104,12 +20107,28 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 						ft_types[gidx].order,
 						ft_types[gidx].bitmap, 1);
 				}
+				chosen = true;
+			}
+			/*
+			 * The learn build (GLUE only) published nothing; abort
+			 * frees its fresh cluster, leaving @dst_ft pristine.
+			 * NOSPLIT/other built nothing, so abort is a no-op.
+			 */
+			ft_graft_glue_abort(dst_ft, &lg);
+			ft_graft_glue_fini(&lg);
+
+			if (chosen) {
+				/* Fresh subtree root: always 1x ft_types[0]. */
+				if (!rret)
+					rret = cds_ft_alloc_reserve_add(dst_ft,
+						&reserve, CDS_FT_ALLOC_KIND_NODE,
+						ft_types[0].order,
+						ft_types[0].bitmap, 1);
 				if (rret) {
 					cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 					status = CDS_FT_STATUS_MEMORY_ERROR;
 					goto out;
 				}
-
 				status = ft_detach_keylen(src_ft, src_key,
 					src_key_len, &subtree);
 				if (status < 0) {
@@ -20129,6 +20148,7 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 				FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
 				return CDS_FT_STATUS_OK;
 			}
+			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		}
 	}
 
