@@ -787,7 +787,7 @@ enum cds_ft_status cds_ft_speculative_lookup_key(struct cds_ft *ft,
  *               if a match is found, or NULL if not found or on error.
  *
  * Same result as cds_ft_speculative_lookup_key, but the library validates
- * the key during a precise descent, so no @key_offset is needed.  Strongest
+ * the key during a precise descent, so no @key_offset is needed.  Fastest
  * when the group is tuned with CDS_FT_LOOKUP_OPTIMIZE_EAGER; on the default
  * speculative-tuned trie it still works but pays a small extra per-step
  * cost.
