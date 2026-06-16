@@ -186,6 +186,13 @@
  * concurrent readers may observe pre-mutation or post-mutation
  * state, never a mix of both within a single traversal.
  *
+ * This ordered two-step publish is for SINGLE-EDGE replacement.  A
+ * multi-edge commit that includes this edge (cds_ft_merge_at) instead
+ * switches the slot through the flip latch (FT_FLIP_PROXY, see
+ * src/urcu-flip-latch.h): the slot transiently holds a flip proxy, one
+ * commit flips the whole set old->new atomically, and the skip view is
+ * re-established when the flip settles.
+ *
  * The child's metadata->parent (and cds_ft_node.prev for the head
  * of an external duplicate chain) is read by ft_skip_to_compressed
  * on the read side and written by ft_set_parent on the write side.
