@@ -886,6 +886,16 @@ void cds_ft_arena_destroy(struct cds_ft_alloc_arena *arena)
 	if (!arena)
 		return;
 	pthread_mutex_destroy(&arena->lock);
+	/*
+	 * No separate partial_ranges drain is needed: partial_ranges is an
+	 * auxiliary index (linked via range->partial_node) over ranges that
+	 * are simultaneously on arena->ranges (linked via range->node), so the
+	 * ranges + free_ranges walks below already free every range.  The
+	 * partial_node links are left dangling on teardown; this is safe ONLY
+	 * because partial_ranges is never traversed once the ranges are freed.
+	 * Any future teardown step that walks partial_ranges must run BEFORE
+	 * these loops.
+	 */
 	cds_list_for_each_entry_safe(range, range_tmp, &arena->ranges, node)
 		range_destroy(range);
 	/*
