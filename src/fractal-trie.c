@@ -731,6 +731,20 @@ struct cds_ft_iter {
 	((uint8_t *)((iter)->data))
 
 /*
+ * Validate the iterator-based lookup contract: @ft must be the trie the
+ * iterator was created for (cds_ft_iter_create).  The descent uses @ft while
+ * key handling uses iter->ft, so passing a different trie mixes their key
+ * mappings and produces undefined results.  Debug-only; compiled out under
+ * NDEBUG.
+ */
+static inline
+void ft_iter_assert_bound(const struct cds_ft *ft __attribute__((unused)),
+		const struct cds_ft_iter *iter __attribute__((unused)))
+{
+	assert(ft == iter->ft);
+}
+
+/*
  * Debug helpers for detecting stale cached iterator paths.
  *
  * Three entry-point roles mirror the rculfhash pattern:
@@ -7836,6 +7850,7 @@ FT_LOOKUP_DISPATCH("lookup")
 enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	ft_iter_assert_bound(ft, iter);
 	return (*ft->lookup_iter_fn)(ft, iter);
 }
 
@@ -7972,6 +7987,7 @@ FT_LOOKUP_DISPATCH("lookup_partial")
 enum cds_ft_status cds_ft_lookup_partial(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	ft_iter_assert_bound(ft, iter);
 	return (*ft->lookup_partial_iter_fn)(ft, iter);
 }
 
@@ -8145,6 +8161,7 @@ FT_LOOKUP_DISPATCH("lookup_longest_match")
 enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	ft_iter_assert_bound(ft, iter);
 	return (*ft->lookup_longest_match_iter_fn)(ft, iter);
 }
 
@@ -10288,24 +10305,28 @@ FT_INEQ_SPEC(ft_ineq_gt_eager,   FT_LOOKUP_GT, false)
 enum cds_ft_status cds_ft_lookup_le(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	ft_iter_assert_bound(ft, iter);
 	return (*ft->lookup_le_fn)(ft, iter);
 }
 
 enum cds_ft_status cds_ft_lookup_ge(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	ft_iter_assert_bound(ft, iter);
 	return (*ft->lookup_ge_fn)(ft, iter);
 }
 
 enum cds_ft_status cds_ft_lookup_lt(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	ft_iter_assert_bound(ft, iter);
 	return (*ft->lookup_lt_fn)(ft, iter);
 }
 
 enum cds_ft_status cds_ft_lookup_gt(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
 {
+	ft_iter_assert_bound(ft, iter);
 	return (*ft->lookup_gt_fn)(ft, iter);
 }
 
@@ -10315,6 +10336,7 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	size_t saved_key_len = iter->key_len;
 	enum cds_ft_status status;
 
+	ft_iter_assert_bound(ft, iter);
 	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_first\n");
 	/* O(1) endpoint: the ordinal-cell list's minimum cell (unscoped only).
@@ -10352,6 +10374,7 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	size_t saved_key_len = iter->key_len;
 	enum cds_ft_status status;
 
+	ft_iter_assert_bound(ft, iter);
 	CDS_FT_SCOPED_READER(ft);
 	dbg_printf("cds_ft_lookup_last\n");
 	/* O(1) endpoint: the ordinal-cell list's maximum cell (unscoped only).
