@@ -682,23 +682,14 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *arena);
  * - > 0: Explicit key length (must not exceed trie's max length).
  * - 0: NIL key (zero-length).
  * - CDS_FT_LEN_DEFAULT: Use the trie's configured fixed length.
- * @key_readable_pad: Number of bytes guaranteed safely loadable PAST
- *                    the last byte of @key (i.e. starting at
- *                    key + key_len) without faulting.  0 means "no
- *                    over-read promised" (the safe default); a value
- *                    >= 32 lets the library use its fastest comparison
- *                    path.  A memory allocator that gives every
- *                    allocation a non-faulting trailing region (e.g.
- *                    cds_ft_external_arena, whose per-range trailing
- *                    bytes are reserved as a never-allocated but mapped
- *                    over-read pad -- not a protected guard page, which
- *                    would fault) satisfies any value up to that
- *                    region's size trivially.  The library trusts this
- *                    promise -- it issues unmasked reads of up to
- *                    @key_readable_pad bytes past @key -- so a value
- *                    larger than the bytes actually safe to read is
- *                    undefined behavior (an out-of-bounds read that may
- *                    fault).
+ * @key_readable_pad: Number of bytes past the end of @key (starting at
+ *                    key + key_len) that are safe to load without
+ *                    faulting.  0 means none is promised (the safe
+ *                    default); a value >= 32 enables the fastest
+ *                    comparison path.  cds_ft_external_arena reserves
+ *                    such a trailing pad on every allocation.  Passing a
+ *                    value larger than what is actually safe to read is
+ *                    undefined behavior.
  * @result_node: Candidate node output. Set to a node if a candidate is
  *               found, or NULL if not found or on error.
  *
