@@ -1557,7 +1557,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * key: the key was NOT removed (the chain is still reachable;
  * *@result_node is NULL) and the call may be retried.  An allocation
  * failure while pruning an already-emptied internal holder is NOT an
- * error: the removal succeeded (CDS_FT_STATUS_OK).
+ * error: the key's removal is published before the holder is pruned, so
+ * the removal has already succeeded (CDS_FT_STATUS_OK); the failed prune
+ * just leaves a harmless empty internal node in place, which a later
+ * mutation can reclaim.
  *
  * Mutual exclusion between updates (cds_ft_insert, cds_ft_insert_unique,
  * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all)
@@ -1595,9 +1598,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * Concurrent RCU readers see either the pre-graft state or the
  * post-graft state, never a partial view — so the duration of writer
  * mutual exclusion on the main trie is short and bounded (independent
- * of the number of
- * nodes being grafted, modulo the O(depth) descent and key-count
- * propagation). This pattern is well suited for batch loading,
+ * of the number of nodes being grafted, modulo the O(depth) descent and
+ * key-count propagation). This pattern is well suited for batch loading,
  * sharding, and periodic bulk updates where minimizing the writer
  * critical section on the live trie is important.
  *
@@ -1618,9 +1620,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * caller's responsibility. Do NOT call these operations from within
  * an RCU read-side critical section: they can block internally on
  * synchronize_rcu() to drain readers, which deadlocks (or never
- * completes) inside a read-side critical section. No RCU read-side
- * lock is required.
- * The source trie must not be the same object as the destination trie.
+ * completes) inside a read-side critical section. No RCU read-side lock
+ * is required. The source trie must not be the same object as the
+ * destination trie.
  *
  * Efficient bulk-removal pattern:
  *
