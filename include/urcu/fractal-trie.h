@@ -1261,6 +1261,105 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
 			cds_ft_prev((ft), (iter)))
 
 /*
+ * Duplicate traversal macros
+ *
+ * Expected usage patterns:
+ *
+ * (1) Unique keys (or only the chain head matters):
+ *     Use cds_ft_for_each_entry_rcu() directly:
+ *
+ *       cds_ft_for_each_entry_rcu(ft, iter, entry, ft_node) {
+ *               ...use entry...
+ *       }
+ *
+ * (2) Duplicate keys:
+ *     Use cds_ft_for_each_rcu() for the outer trie traversal,
+ *     then a cds_ft_for_each_duplicate_entry*_rcu() inner loop
+ *     to walk the chain with typed entries:
+ *
+ *       cds_ft_for_each_rcu(ft, iter) {
+ *               struct cds_ft_node *node = cds_ft_iter_node(iter);
+ *               cds_ft_for_each_duplicate_entry_rcu(entry, node, ft_node) {
+ *                       ...use entry...
+ *               }
+ *       }
+ *
+ *     The outer loop positions the iterator at each distinct key;
+ *     extracting the containing struct there would be redundant
+ *     since the inner loop re-derives it starting from the same
+ *     chain head.
+ */
+
+/*
+ * cds_ft_for_each_duplicate_rcu - Iterate through duplicates.
+ * @pos: struct cds_ft_node *, start of duplicate list and loop cursor.
+ *
+ * Iterate through duplicates returned by cds_ft_lookup*()
+ * This must be done while rcu_read_lock() is held.
+ * Receives a struct cds_ft_node * as parameter, which is used as start
+ * of duplicate list and loop cursor.
+ * _NOT_ safe against node removal within iteration.
+ */
+#define cds_ft_for_each_duplicate_rcu(pos)				\
+	for (; (pos) != NULL; (pos) = cds_ft_node_next_rcu(pos))
+
+/*
+ * cds_ft_for_each_duplicate_entry_rcu - Iterate through duplicate entries.
+ * @pos: Pointer to the containing structure (__typeof__(*(pos)) *),
+ *       set at each iteration step.
+ * @node: struct cds_ft_node *, start of duplicate list and loop cursor.
+ * @member: Name of the struct cds_ft_node member within @pos's type.
+ *
+ * This is the cds_ft_entry() equivalent of cds_ft_for_each_duplicate_rcu().
+ * Iterate through duplicates returned by cds_ft_lookup*().
+ * This must be done while rcu_read_lock() is held.
+ * @pos is only valid when @node is non-NULL; it must not be used
+ * after the loop exits.
+ * _NOT_ safe against node removal within iteration.
+ */
+#define cds_ft_for_each_duplicate_entry_rcu(pos, node, member)		\
+	for (; (node) != NULL ?						\
+			((pos) = cds_ft_entry(node,			\
+				__typeof__(*(pos)), member), 1) : 0;	\
+			(node) = cds_ft_node_next_rcu(node))
+
+/*
+ * cds_ft_for_each_duplicate_safe_rcu - Iterate through duplicates.
+ * @pos: struct cds_ft_node *, start of duplicate list and loop cursor.
+ * @p: struct cds_ft_node *, temporary pointer to next.
+ *
+ * Iterate through duplicates returned by cds_ft_lookup*().
+ * Safe against node removal within iteration.
+ * This must be done while rcu_read_lock() is held.
+ */
+#define cds_ft_for_each_duplicate_safe_rcu(pos, p)			\
+	for (; (pos) != NULL ?						\
+			((p) = cds_ft_node_next_rcu(pos), 1) : 0;	\
+			(pos) = (p))
+
+/*
+ * cds_ft_for_each_duplicate_entry_safe_rcu - Iterate through duplicate entries.
+ * @pos: Pointer to the containing structure (__typeof__(*(pos)) *),
+ *       set at each iteration step.
+ * @node: struct cds_ft_node *, start of duplicate list and loop cursor.
+ * @p: struct cds_ft_node *, temporary pointer to next.
+ * @member: Name of the struct cds_ft_node member within @pos's type.
+ *
+ * This is the cds_ft_entry() equivalent of cds_ft_for_each_duplicate_safe_rcu().
+ * Iterate through duplicates returned by cds_ft_lookup*().
+ * Safe against node removal within iteration.
+ * This must be done while rcu_read_lock() is held.
+ * @pos is only valid when @node is non-NULL; it must not be used
+ * after the loop exits.
+ */
+#define cds_ft_for_each_duplicate_entry_safe_rcu(pos, node, p, member)	\
+	for (; (node) != NULL ?						\
+			((pos) = cds_ft_entry(node,			\
+				__typeof__(*(pos)), member),		\
+			(p) = cds_ft_node_next_rcu(node), 1) : 0;	\
+			(node) = (p))
+
+/*
  * Mutation API
  */
 
@@ -3221,105 +3320,6 @@ void cds_ft_show_stats(const struct cds_ft *ft, FILE *out);
  * Return a pointer to a const string representing the status.
  */
 const char *cds_ft_status_to_string(enum cds_ft_status status);
-
-/*
- * Duplicate traversal macros
- *
- * Expected usage patterns:
- *
- * (1) Unique keys (or only the chain head matters):
- *     Use cds_ft_for_each_entry_rcu() directly:
- *
- *       cds_ft_for_each_entry_rcu(ft, iter, entry, ft_node) {
- *               ...use entry...
- *       }
- *
- * (2) Duplicate keys:
- *     Use cds_ft_for_each_rcu() for the outer trie traversal,
- *     then a cds_ft_for_each_duplicate_entry*_rcu() inner loop
- *     to walk the chain with typed entries:
- *
- *       cds_ft_for_each_rcu(ft, iter) {
- *               struct cds_ft_node *node = cds_ft_iter_node(iter);
- *               cds_ft_for_each_duplicate_entry_rcu(entry, node, ft_node) {
- *                       ...use entry...
- *               }
- *       }
- *
- *     The outer loop positions the iterator at each distinct key;
- *     extracting the containing struct there would be redundant
- *     since the inner loop re-derives it starting from the same
- *     chain head.
- */
-
-/*
- * cds_ft_for_each_duplicate_rcu - Iterate through duplicates.
- * @pos: struct cds_ft_node *, start of duplicate list and loop cursor.
- *
- * Iterate through duplicates returned by cds_ft_lookup*()
- * This must be done while rcu_read_lock() is held.
- * Receives a struct cds_ft_node * as parameter, which is used as start
- * of duplicate list and loop cursor.
- * _NOT_ safe against node removal within iteration.
- */
-#define cds_ft_for_each_duplicate_rcu(pos)				\
-	for (; (pos) != NULL; (pos) = cds_ft_node_next_rcu(pos))
-
-/*
- * cds_ft_for_each_duplicate_entry_rcu - Iterate through duplicate entries.
- * @pos: Pointer to the containing structure (__typeof__(*(pos)) *),
- *       set at each iteration step.
- * @node: struct cds_ft_node *, start of duplicate list and loop cursor.
- * @member: Name of the struct cds_ft_node member within @pos's type.
- *
- * This is the cds_ft_entry() equivalent of cds_ft_for_each_duplicate_rcu().
- * Iterate through duplicates returned by cds_ft_lookup*().
- * This must be done while rcu_read_lock() is held.
- * @pos is only valid when @node is non-NULL; it must not be used
- * after the loop exits.
- * _NOT_ safe against node removal within iteration.
- */
-#define cds_ft_for_each_duplicate_entry_rcu(pos, node, member)		\
-	for (; (node) != NULL ?						\
-			((pos) = cds_ft_entry(node,			\
-				__typeof__(*(pos)), member), 1) : 0;	\
-			(node) = cds_ft_node_next_rcu(node))
-
-/*
- * cds_ft_for_each_duplicate_safe_rcu - Iterate through duplicates.
- * @pos: struct cds_ft_node *, start of duplicate list and loop cursor.
- * @p: struct cds_ft_node *, temporary pointer to next.
- *
- * Iterate through duplicates returned by cds_ft_lookup*().
- * Safe against node removal within iteration.
- * This must be done while rcu_read_lock() is held.
- */
-#define cds_ft_for_each_duplicate_safe_rcu(pos, p)			\
-	for (; (pos) != NULL ?						\
-			((p) = cds_ft_node_next_rcu(pos), 1) : 0;	\
-			(pos) = (p))
-
-/*
- * cds_ft_for_each_duplicate_entry_safe_rcu - Iterate through duplicate entries.
- * @pos: Pointer to the containing structure (__typeof__(*(pos)) *),
- *       set at each iteration step.
- * @node: struct cds_ft_node *, start of duplicate list and loop cursor.
- * @p: struct cds_ft_node *, temporary pointer to next.
- * @member: Name of the struct cds_ft_node member within @pos's type.
- *
- * This is the cds_ft_entry() equivalent of cds_ft_for_each_duplicate_safe_rcu().
- * Iterate through duplicates returned by cds_ft_lookup*().
- * Safe against node removal within iteration.
- * This must be done while rcu_read_lock() is held.
- * @pos is only valid when @node is non-NULL; it must not be used
- * after the loop exits.
- */
-#define cds_ft_for_each_duplicate_entry_safe_rcu(pos, node, p, member)	\
-	for (; (node) != NULL ?						\
-			((pos) = cds_ft_entry(node,			\
-				__typeof__(*(pos)), member),		\
-			(p) = cds_ft_node_next_rcu(node), 1) : 0;	\
-			(node) = (p))
 
 #ifdef __cplusplus
 }
