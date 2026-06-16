@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 261
+#define NR_TESTS 262
 #else
 #define NR_TESTS 242
 #endif
@@ -18968,6 +18968,95 @@ static int test_merge_oom_subpos_glue(void)
 }
 
 /*
+ * OOM coverage for the sub-position residual BUILD-A-BRANCH shape: dst_key
+ * "mxyz" extends past dst's structure (dst holds only "m"), so the descent
+ * stops short and graft builds an intermediate branch that also absorbs the
+ * displaced "m" external.  cds_ft_merge_at auto-learns the branch's node
+ * manifest by running ft_build_branch as a learn pass (it builds into the glue
+ * with no dst mutation) and mirroring its built[] into the reserve, so the real
+ * graft draws every branch node.  As before, every injected OOM hits the learn
+ * build / reserve fill / detach (BOTH tries pristine) or is armed past them and
+ * the move succeeds; the completeness assert proves the manifest is complete.
+ */
+static int run_merge_oom_subpos_branch(int nr_faults)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group);
+		struct cds_ft *src;
+		struct ft_test_node *d1 = node_alloc(1);
+		struct ft_test_node *s1 = node_alloc(3);
+		struct ft_test_node *s2 = node_alloc(4);
+		enum cds_ft_status s;
+		int verified, keys_ok;
+
+		if (cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom_subpos_branch: src create failed\n");
+			return -1;
+		}
+		/*
+		 * dst: single key "m"; src: "cax","cay" (src@"ca" a 2-child
+		 * internal).  merge_at at "mxyz" stops short at depth 1 on the
+		 * displaced "m" external -> build-a-branch.
+		 */
+		if (cds_ft_insert(dst, (const uint8_t *)"m", 1, &d1->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *)"cax", 3, &s1->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *)"cay", 3, &s2->node) < 0)
+			rc = -1;
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge_at(dst, (const uint8_t *)"mxyz", 4,
+				src, (const uint8_t *)"ca", 2);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		keys_ok = graft_swap_oom_has_key(dst, "m");
+		if (s == CDS_FT_STATUS_OK) {
+			keys_ok = keys_ok &&
+				graft_swap_oom_has_key(dst, "mxyzx") &&
+				graft_swap_oom_has_key(dst, "mxyzy") &&
+				!graft_swap_oom_has_key(src, "cax") &&
+				!graft_swap_oom_has_key(src, "cay");
+		} else {
+			keys_ok = keys_ok &&
+				!graft_swap_oom_has_key(dst, "mxyzx") &&
+				!graft_swap_oom_has_key(dst, "mxyzy") &&
+				graft_swap_oom_has_key(src, "cax") &&
+				graft_swap_oom_has_key(src, "cay");
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom_subpos_branch: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_subpos_branch(void)
+{
+	return run_merge_oom_subpos_branch(16);
+}
+
+/*
  * OOM coverage for the PIECEWISE merge: dst already has nodes that overlap
  * src's, so ft_merge_build must recurse INTO the shared spine -- copying the
  * shared branch nodes, splicing the same full keys ("aa", "ba"), and
@@ -20592,6 +20681,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom_diverged_dst);
 	RUN_TEST(test_merge_oom_subpos_residual);
 	RUN_TEST(test_merge_oom_subpos_glue);
+	RUN_TEST(test_merge_oom_subpos_branch);
 	RUN_TEST(test_merge_oom_overlap);
 	RUN_TEST(test_merge_oom_compressed);
 	RUN_TEST(test_merge_oom_nonroot_src);

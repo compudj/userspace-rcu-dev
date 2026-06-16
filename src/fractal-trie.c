@@ -20108,11 +20108,60 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 						ft_types[gidx].bitmap, 1);
 				}
 				chosen = true;
+			} else if (prep == FT_GRAFT_PREP_NOSPLIT
+					&& dl.depth < dst_key_len) {
+				/*
+				 * Build-a-branch: descent stopped short of key_len
+				 * (a displaced external or an empty mid-key slot).
+				 * ft_build_branch builds the intermediate path into
+				 * the glue with no dst mutation, so learn it directly
+				 * and mirror its built[].  A displaced external is
+				 * REPLACED at its slot (no grow); an empty mid-key
+				 * slot ADDS a child (optional grow at dl.pnf).
+				 */
+				struct cds_ft_inode_flag *displaced =
+					(dl.nf && ft_node_external(dl.nf)) ?
+						dl.nf : NULL;
+				struct cds_ft_inode_flag *branch;
+
+				branch = ft_build_branch(dst_ft, okey_dst,
+					dl.depth, dst_key_len, d_src.nf,
+					cnt_src, displaced != NULL, &lg);
+				if (branch) {
+					int bi;
+
+					for (bi = 0; bi < lg.nr_built && !rret; bi++)
+						rret = ft_merge_reserve_add_built(
+							dst_ft, &reserve, lg.built[bi]);
+					if (!rret && !displaced) {
+						struct cds_ft_metadata *am =
+							cds_ft_item_to_metadata(
+								ft_node_ptr(dl.pnf));
+						unsigned int aidx = ft_node_type(dl.pnf);
+
+						if (am->nr_child + 1 >
+							ft_types[aidx].max_child) {
+							unsigned int gidx =
+								find_nearest_type_index(aidx,
+									am->nr_child + 1,
+									am->parent == NULL);
+
+							rret = cds_ft_alloc_reserve_add(
+								dst_ft, &reserve,
+								CDS_FT_ALLOC_KIND_NODE,
+								ft_types[gidx].order,
+								ft_types[gidx].bitmap, 1);
+						}
+					}
+					chosen = true;
+				}
+				/* branch NULL: learn-build OOM -> legacy. */
 			}
 			/*
-			 * The learn build (GLUE only) published nothing; abort
-			 * frees its fresh cluster, leaving @dst_ft pristine.
-			 * NOSPLIT/other built nothing, so abort is a no-op.
+			 * The learn build (GLUE cluster or build-a-branch)
+			 * published nothing; abort frees its fresh nodes,
+			 * leaving @dst_ft pristine.  At-node / other built
+			 * nothing, so abort is a no-op there.
 			 */
 			ft_graft_glue_abort(dst_ft, &lg);
 			ft_graft_glue_fini(&lg);
