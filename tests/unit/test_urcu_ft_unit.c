@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 257
+#define NR_TESTS 258
 #else
 #define NR_TESTS 242
 #endif
@@ -18562,6 +18562,105 @@ static int test_merge_oom(void)
 }
 
 /*
+ * OOM coverage for the EMPTY-dst-ROOT merge path (cds_ft_merge_at into a @dst
+ * that is empty at the merge point).  Unlike the spine-copy path, this moves
+ * the source subtree in via a detach plus a FAILURE-FREE root swap, with the
+ * source's replacement root pre-allocated up front, so nothing fallible follows
+ * the detach and there is no rollback to strand the moved externals.  Every OOM
+ * must therefore leave BOTH tries pristine -- @dst stays empty, @src keeps its
+ * keys -- with no leak (RUN_TEST's leak_check catches a stranded external); on
+ * success @dst holds src's keys and @src is empty.  The sweep covers both a
+ * whole-trie src (src_key_len 0, EXACT at root) and a sub-prefix src
+ * (src_key_len > 0, exercising the detach re-rooting that feeds the swap).
+ */
+static int run_merge_oom_empty_dst(int nr_faults)
+{
+	int n, rc = 0;
+	unsigned int shape;
+
+	/* shape 0: whole src ("bx","by", src_key NIL); 1: sub-prefix ("p"). */
+	for (shape = 0; shape < 2; shape++) {
+		const char *k1 = shape ? "px" : "bx";
+		const char *k2 = shape ? "py" : "by";
+		const uint8_t *src_key = shape ? (const uint8_t *) "p" : NULL;
+		size_t src_key_len = shape ? 1 : 0;
+		/* moved keys as they land in the (empty, NIL-prefix) dst. */
+		const char *m1 = shape ? "x" : "bx";
+		const char *m2 = shape ? "y" : "by";
+
+		for (n = 0; n < nr_faults; n++) {
+			struct cds_ft_group *group;
+			struct cds_ft *dst = create_varlen_ft(&group); /* empty */
+			struct cds_ft *src;
+			struct ft_test_node *s1 = node_alloc(1);
+			struct ft_test_node *s2 = node_alloc(2);
+			enum cds_ft_status s;
+			int verified, keys_ok;
+
+			if (cds_ft_create(group, NULL, &src) < 0) {
+				fprintf(stderr,
+					"merge_oom_empty_dst: src create failed\n");
+				return -1;
+			}
+			if (cds_ft_insert(src, (const uint8_t *) k1, 2,
+					&s1->node) < 0 ||
+			    cds_ft_insert(src, (const uint8_t *) k2, 2,
+					&s2->node) < 0)
+				rc = -1;
+
+			/* Fail the (n+1)-th allocation performed by the merge. */
+			cds_ft_fault_alloc_countdown = n;
+			rcu_read_lock();
+			s = cds_ft_merge_at(dst, NULL, 0, src, src_key,
+					src_key_len);
+			rcu_read_unlock();
+			cds_ft_fault_alloc_countdown = -1;
+
+			rcu_read_lock();
+			verified = (cds_ft_verify(dst, stderr) ==
+					CDS_FT_STATUS_OK) &&
+				(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+			if (s == CDS_FT_STATUS_OK) {
+				keys_ok = graft_swap_oom_has_key(dst, m1) &&
+					graft_swap_oom_has_key(dst, m2) &&
+					!graft_swap_oom_has_key(src, k1) &&
+					!graft_swap_oom_has_key(src, k2);
+			} else {
+				/* OOM: both pristine -- dst empty, src intact. */
+				keys_ok = !graft_swap_oom_has_key(dst, m1) &&
+					!graft_swap_oom_has_key(dst, m2) &&
+					graft_swap_oom_has_key(src, k1) &&
+					graft_swap_oom_has_key(src, k2);
+			}
+			rcu_read_unlock();
+			if (!verified || !keys_ok) {
+				fprintf(stderr,
+					"merge_oom_empty_dst: %s after fault n=%d shape=%u (merge=%s)\n",
+					!verified ? "verify FAILED" :
+						"KEY SET WRONG",
+					n, shape, cds_ft_status_to_string(s));
+				rc = -1;
+				continue;	/* corrupt: abandon this iteration */
+			}
+
+			if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+				rc = -1;
+			rcu_barrier();
+			cds_ft_destroy(dst);
+			cds_ft_destroy(src);
+			rcu_barrier();
+			cds_ft_group_destroy(group);
+		}
+	}
+	return rc;
+}
+
+static int test_merge_oom_empty_dst(void)
+{
+	return run_merge_oom_empty_dst(8);
+}
+
+/*
  * OOM coverage for the PIECEWISE merge: dst already has nodes that overlap
  * src's, so ft_merge_build must recurse INTO the shared spine -- copying the
  * shared branch nodes, splicing the same full keys ("aa", "ba"), and
@@ -20182,6 +20281,7 @@ int main(int argc, char **argv)
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_merge_oom);
+	RUN_TEST(test_merge_oom_empty_dst);
 	RUN_TEST(test_merge_oom_overlap);
 	RUN_TEST(test_merge_oom_compressed);
 	RUN_TEST(test_merge_oom_nonroot_src);

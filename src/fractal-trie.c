@@ -19925,16 +19925,85 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * Detach-based graft: @dst has no subtree at @dst_key here -- either
-	 * cnt_dst == 0 (an empty @dst root) or the descent diverged / dead-ended
-	 * (kd == FT_GRAFT_SWAP_DELEGATE), both of which mean no key has @dst_key as
-	 * a prefix.  Move @src_ft@src_key into a transient exclusive @subtree and
-	 * graft it atomically at @dst_key (ft_graft is itself a build-invisible
-	 * transaction).  Every NON-empty-dst shape committed in ft_merge_spine_copy
-	 * above, so the old non-atomic per-entry merge loop is gone (a non-empty
-	 * graft point would return POPULATED_ERROR and roll back, never corrupt).
-	 * @subtree's keys are stripped of @src_key, so it is touched only via
-	 * keylen-bypassing helpers.
+	 * Empty dst ROOT (dst_key_len == 0, so the whole @dst_ft is empty at
+	 * the merge point): move @src_ft@src_key in WITHOUT a fallible graft,
+	 * so no rollback can strand the moved externals.  Pre-allocate the
+	 * source's replacement root (fallible while @src_ft is still pristine),
+	 * detach the source subtree (clean on its own failure), then SWAP it
+	 * into @dst_ft's root.  The swap is a failure-free root-to-root move:
+	 * no parent-pointer change and no "jump out" window (both ends are
+	 * roots with parent NULL), and the detach already drained @src_ft's
+	 * readers -- the same reasoning as ft_graft's root path.  Because
+	 * nothing fallible follows the detach, this path has no rollback, so it
+	 * cannot leak (contrast the diverged path below).
+	 */
+	if (dst_key_len == 0 && cnt_dst == 0) {
+		struct cds_ft_inode *fresh_root;
+		struct cds_ft_metadata *fresh_meta;
+		struct cds_ft_inode *old_dst_root;
+		size_t sm;
+
+		fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
+		if (!fresh_root) {
+			status = CDS_FT_STATUS_MEMORY_ERROR;
+			goto out;
+		}
+		rcu_assign_pointer(fresh_meta->parent, NULL);
+		ft_nr_keys_store(fresh_meta, 0, CMM_RELAXED);
+
+		status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
+		if (status < 0) {
+			/* NOT_FOUND impossible: @src_ft had content. */
+			free_cds_ft_node_unpublished(src_ft, fresh_root);
+			goto out;
+		}
+
+		/*
+		 * Failure-free swap.  @subtree->root carries the moved content
+		 * with parent already NULL (set by the detach), so it drops
+		 * straight into @dst_ft's empty root slot.  @subtree keeps the
+		 * pre-allocated empty root so its destroy below frees nothing of
+		 * the moved content.  @dst_ft was empty, so it adopts @subtree's
+		 * whole ordered cell list wholesale (head/tail endpoints only).
+		 */
+		old_dst_root = ft_node_ptr(dst_ft->root);
+		rcu_assign_pointer(dst_ft->root, subtree->root);
+		FT_TP(root_publish, (const void *) dst_ft,
+			(const void *) dst_ft->root);
+		if (dst_ft->group->ordered_list_set) {
+			rcu_assign_pointer(dst_ft->ord_cell_head,
+				subtree->ord_cell_head);
+			rcu_assign_pointer(dst_ft->ord_cell_tail,
+				subtree->ord_cell_tail);
+			subtree->ord_cell_head = NULL;
+			subtree->ord_cell_tail = NULL;
+		}
+		rcu_assign_pointer(subtree->root, ft_node_flag(fresh_root, 0));
+		free_cds_ft_node(dst_ft, old_dst_root);
+
+		/* dst_key_len == 0: dst keys equal the moved keys, same lengths. */
+		sm = uatomic_load(&subtree->max_used_key_len, CMM_RELAXED);
+		if (sm > uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED))
+			uatomic_store(&dst_ft->max_used_key_len, sm, CMM_RELAXED);
+
+		cds_ft_destroy(subtree);
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
+		return CDS_FT_STATUS_OK;
+	}
+
+	/*
+	 * Diverged / empty-internal dst: kd == FT_GRAFT_SWAP_DELEGATE (no key
+	 * has @dst_key as a prefix) or an empty internal node left at @dst_key.
+	 * The publish point is non-root, so this still uses the detach-then-
+	 * graft path (ft_graft is itself a build-invisible transaction).  A
+	 * non-empty graft point would return POPULATED_ERROR and roll back,
+	 * never corrupt.  @subtree's keys are stripped of @src_key, so it is
+	 * touched only via keylen-bypassing helpers.
+	 *
+	 * TODO: give this the same build-invisible reorder as the empty-root
+	 * case above.  Until then its double-allocation-failure rollback can
+	 * strand the moved externals (the sole leak documented in
+	 * cds_ft_merge_at).
 	 */
 	status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
 	if (status < 0)
