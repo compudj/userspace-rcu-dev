@@ -718,12 +718,31 @@ struct cds_ft_bitmap {
 	unsigned long bitmap[FT_BITMAP_LEN / sizeof(unsigned long)];
 } __attribute__((__aligned__(FT_BITMAP_LEN)));
 
+/*
+ * Per-group byte collation map: a bijection between raw key bytes and
+ * their ordinal (sort) position, letting the trie order keys by the
+ * application's collation instead of by raw byte value.  @key_to_ordinal
+ * and @ordinal_to_key are inverse 256-entry permutations; @identity is
+ * set when the map is the identity (byte == ordinal), which the hot
+ * paths special-case to skip the remap.
+ */
 struct cds_ft_key_map {
 	bool identity;
 	uint8_t key_to_ordinal[256];
 	uint8_t ordinal_to_key[256];
 };
 
+/*
+ * A group of Fractal Trie instances (struct cds_ft) that share
+ * allocation arenas, a key collation map, and creation-time
+ * configuration (key length, lookup optimization, NUMA / page-size
+ * policy, ordered-list mode).  The bulk operations (graft, graft_swap,
+ * detach, merge) move whole sub-tries between tries of the SAME group,
+ * which is why the arenas and the leak accounting live here rather than
+ * per-trie.  Created by cds_ft_group_create (configured via
+ * cds_ft_group_attr_create); individual tries are added with
+ * cds_ft_create.
+ */
 struct cds_ft_group {
 	size_t max_tree_depth;
 	size_t key_len;
@@ -881,6 +900,15 @@ typedef enum cds_ft_status (*cds_ft_lookup_prefix_key_fn)(
 
 struct cds_ft_compact_state;
 
+/*
+ * A single Fractal Trie instance: one ordered map from byte keys to
+ * application-owned nodes, rooted at @root and belonging to a @group
+ * (whose arenas and configuration it uses).  Caches the specialized
+ * per-API lookup dispatch pointers (installed once at cds_ft_create),
+ * the access-discipline mode (@exclusive vs concurrent RCU readers), the
+ * ordered-list mirror flag with the cached list endpoints, and any
+ * in-progress compaction state.  Created by cds_ft_create.
+ */
 struct cds_ft {
 	struct cds_ft_group *group;
 
