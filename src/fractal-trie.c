@@ -303,46 +303,36 @@ struct cds_ft_type {
 
 #if (CAA_BITS_PER_LONG < 64)
 
-/* 32-bit pointers */
-enum {
-	/*
-	 * 32-bit max-density popcount tiers:
-	 *   idx 0  scan_16_16_max_5  32 B  hdr 12 B +  5 x 4 B = 32 B exact
-	 *   idx 1  scan_64_4         64 B  hdr 16 B + 12 x 4 B = 64 B exact
-	 *                            (flat 6+2; node-size cap 12, bitmap cap 16)
-	 *   idx 2  popcount_1l      128 B  hdr 32 B + 24 x 4 B = 128 B exact
-	 *   idx 3  popcount_1l      256 B  hdr 32 B + 56 x 4 B = 256 B exact
-	 *   idx 4  popcount_1l      512 B  hdr 32 B + 120 x 4 B = 512 B exact
-	 *   idx 5  pigeon          1024 B  256 x 4 B pointers
-	 */
-	ft_type_0_max_child = 5,
-	ft_type_1_max_child = 12,
-	ft_type_2_max_child = 24,
-	ft_type_3_max_child = 56,
-	ft_type_4_max_child = 120,
-	ft_type_5_max_child = 256,
-	ft_type_6_max_child = 0,	/* NULL */
-};
-
+/*
+ * 32-bit pointers.  Max-density popcount tiers (max_child inlined into
+ * ft_types[] below):
+ *   idx 0  scan_16_16_max_5  32 B  hdr 12 B +  5 x 4 B = 32 B exact
+ *   idx 1  scan_64_4         64 B  hdr 16 B + 12 x 4 B = 64 B exact
+ *                            (flat 6+2; node-size cap 12, bitmap cap 16)
+ *   idx 2  popcount_1l      128 B  hdr 32 B + 24 x 4 B = 128 B exact
+ *   idx 3  popcount_1l      256 B  hdr 32 B + 56 x 4 B = 256 B exact
+ *   idx 4  popcount_1l      512 B  hdr 32 B + 120 x 4 B = 512 B exact
+ *   idx 5  pigeon          1024 B  256 x 4 B pointers
+ */
 static const struct cds_ft_type ft_types[] = {
 	[0] = {
 		.type_class = FT_POPCOUNT,
 		.popcount_2l = true,
 		.min_child = 1,
-		.max_child = ft_type_0_max_child, .order = 5, .bitmap = FT_NO_BITMAP,
+		.max_child = 5, .order = 5, .bitmap = FT_NO_BITMAP,
 	},
 	[1] = {
 		.type_class = FT_POPCOUNT,
 		.popcount_2l = true,
 		.min_child = 3,
-		.max_child = ft_type_1_max_child, .order = 6, .bitmap = FT_NO_BITMAP,
+		.max_child = 12, .order = 6, .bitmap = FT_NO_BITMAP,
 	},
 	[2] = {
 		/* 32 B bitmap + 24 x 4 B ptrs = 128 B (order-7). */
 		.type_class = FT_POPCOUNT,
 		.popcount_1l = true,
 		.min_child = 7,
-		.max_child = ft_type_2_max_child, .order = 7, .bitmap = FT_NO_BITMAP,
+		.max_child = 24, .order = 7, .bitmap = FT_NO_BITMAP,
 	},
 
 	/*
@@ -354,14 +344,14 @@ static const struct cds_ft_type ft_types[] = {
 		.type_class = FT_POPCOUNT,
 		.popcount_1l = true,
 		.min_child = 10,
-		.max_child = ft_type_3_max_child, .order = 8, .bitmap = FT_NO_BITMAP },
+		.max_child = 56, .order = 8, .bitmap = FT_NO_BITMAP },
 	[4] = {
 		/* 32 B bitmap + 120 * 4 B ptrs = 512 B (order-9). */
 		.type_class = FT_POPCOUNT,
 		.popcount_1l = true,
 		.min_child = 28,
 		.bitmap = FT_NO_BITMAP,
-		.max_child = ft_type_4_max_child, .order = 9 },
+		.max_child = 120, .order = 9 },
 
 	/*
 	 * Pigeon shrinks to the popcount_1l type directly below it once a
@@ -374,9 +364,9 @@ static const struct cds_ft_type ft_types[] = {
 	 */
 	[5] = { .type_class = FT_PIGEON,
 		.min_child = 51,
-		.max_child = ft_type_5_max_child, .order = 10, .bitmap = FT_BITMAP },
+		.max_child = 256, .order = 10, .bitmap = FT_BITMAP },
 
-	[6] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_6_max_child, .bitmap = FT_NO_BITMAP },
+	[6] = { .type_class = FT_NULL, .min_child = 0, .max_child = 0 /* NULL */, .bitmap = FT_NO_BITMAP },
 	/*
 	 * Slot 7 padding: FT_TYPE_BITS = 3 ⇒ tag-encodable type_index
 	 * range is 0..7.  The 32-bit tier uses only indices 0..6 (real
@@ -386,17 +376,7 @@ static const struct cds_ft_type ft_types[] = {
 	[7] = { .type_class = FT_NULL, .min_child = 0, .max_child = 0, .bitmap = FT_NO_BITMAP },
 };
 #else /* !(CAA_BITS_PER_LONG < 64) */
-/* 64-bit pointers */
-enum {
-	ft_type_0_max_child = 3,
-	ft_type_1_max_child = 6,	/* scan_32_8 (per-slot 5+3) */
-	ft_type_2_max_child = 14,	/* scan_64_4 (flat 6+2) */
-	ft_type_3_max_child = 28,
-	ft_type_4_max_child = 60,
-	ft_type_5_max_child = 124,
-	ft_type_6_max_child = 256,
-	ft_type_7_max_child = 256,
-};
+/* 64-bit pointers.  Max-child caps are inlined into ft_types[] below. */
 
 /*
  * scan_32_8 (per-slot 5+3 byte-split, max_child=6): 12-byte popcount
@@ -413,22 +393,22 @@ static const struct cds_ft_type ft_types[] = {
 	[0] = {
 		.type_class = FT_POPCOUNT,
 		.popcount_2l = true,
-		.min_child = 1, .max_child = ft_type_0_max_child, .order = 5, .bitmap = FT_NO_BITMAP,
+		.min_child = 1, .max_child = 3, .order = 5, .bitmap = FT_NO_BITMAP,
 	},
-	[1] = {
+	[1] = {	/* scan_32_8 (per-slot 5+3) */
 		.type_class = FT_POPCOUNT,
 		.popcount_2l = true,
-		.min_child = 3, .max_child = ft_type_1_max_child, .order = 6, .bitmap = FT_NO_BITMAP,
+		.min_child = 3, .max_child = 6, .order = 6, .bitmap = FT_NO_BITMAP,
 	},
-	[2] = {
+	[2] = {	/* scan_64_4 (flat 6+2) */
 		.type_class = FT_POPCOUNT,
 		.popcount_2l = true,
-		.min_child = 5, .max_child = ft_type_2_max_child, .order = 7, .bitmap = FT_NO_BITMAP,
+		.min_child = 5, .max_child = 14, .order = 7, .bitmap = FT_NO_BITMAP,
 	},
 	[3] = {
 		.type_class = FT_POPCOUNT,
 		.popcount_1l = true,
-		.min_child = 10, .max_child = ft_type_3_max_child, .order = 8, .bitmap = FT_NO_BITMAP,
+		.min_child = 10, .max_child = 28, .order = 8, .bitmap = FT_NO_BITMAP,
 	},
 
 	/*
@@ -440,14 +420,14 @@ static const struct cds_ft_type ft_types[] = {
 		.type_class = FT_POPCOUNT,
 		.popcount_1l = true,
 		.min_child = 22,
-		.max_child = ft_type_4_max_child,
+		.max_child = 60,
 		.order = 9, .bitmap = FT_NO_BITMAP },
 	[5] = {
 		/* 32B bitmap + 124 * 8B ptrs = 1024B order-10. */
 		.type_class = FT_POPCOUNT,
 		.popcount_1l = true,
 		.min_child = 51,
-		.max_child = ft_type_5_max_child,
+		.max_child = 124,
 		.order = 10, .bitmap = FT_NO_BITMAP },
 
 	/*
@@ -459,9 +439,9 @@ static const struct cds_ft_type ft_types[] = {
 	 * has room regardless of key distribution: the recompaction cannot
 	 * fail for capacity and never rolls back to pigeon.
 	 */
-	[6] = { .type_class = FT_PIGEON, .min_child = 95, .max_child = ft_type_6_max_child, .order = 11, .bitmap = FT_BITMAP },
+	[6] = { .type_class = FT_PIGEON, .min_child = 95, .max_child = 256, .order = 11, .bitmap = FT_BITMAP },
 
-	[7] = { .type_class = FT_NULL, .min_child = 0, .max_child = ft_type_7_max_child, .bitmap = FT_NO_BITMAP },
+	[7] = { .type_class = FT_NULL, .min_child = 0, .max_child = 256, .bitmap = FT_NO_BITMAP },
 };
 #endif /* !(BITS_PER_LONG < 64) */
 
