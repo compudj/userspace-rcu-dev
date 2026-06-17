@@ -10638,6 +10638,8 @@ static struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft,
 		unsigned int cap);
 static struct ft_flip_batch *ft_flip_batch_take(struct cds_ft *ft,
 		unsigned int cap, struct ft_flip_batch **pre);
+static int ft_bulk_node_reserve_fill(struct cds_ft *ft,
+		struct cds_ft_alloc_reserve *r);
 static struct cds_ft_inode_flag *ft_flip_batch_add(struct ft_flip_batch *b,
 		struct cds_ft_inode_flag *old_nf,
 		struct cds_ft_inode_flag *new_nf);
@@ -16095,6 +16097,18 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct ft_ord_cell *graft_run_first = NULL, *graft_run_last = NULL;
 		struct ft_ord_cell *graft_pred = NULL, *graft_succ = NULL;
 		/*
+		 * Self-secured NOSPLIT attach: when no caller reserve is active, this
+		 * graft reserves its own commit nodes + flip batch before publishing
+		 * the empty source root, so the post-publish store cannot fail and
+		 * needs no reader-observable source-root rollback.  Empty (NULL @pre)
+		 * under a caller reserve -- the rekey, whose reserve + @pre_flip
+		 * already make the store unfailable.
+		 */
+		struct cds_ft_alloc_reserve graft_reserve;
+		struct ft_flip_batch *graft_flip = NULL;
+		struct ft_flip_batch **store_pre_flip = pre_flip;
+		bool self_secured = false;
+		/*
 		 * NIL-key-only source: the whole source is a single prefix key,
 		 * stored as the root's external_nodes (a childless internal -- valid
 		 * only AT a root).  Grafting that wrapper internal to a non-root
@@ -16136,6 +16150,17 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			free_cds_ft_node(src_ft, fresh_node);
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
+		/*
+		 * NOSPLIT graft point already occupied (the store would report this
+		 * post-swap): surface POPULATED here, BEFORE the source-root swap, so
+		 * the source stays pristine -- no rollback, no reader-observable
+		 * empty-then-full flicker.  Same condition the store checks at
+		 * d->depth == key_len.
+		 */
+		if (prep == FT_GRAFT_PREP_NOSPLIT && d.depth == key_len && d.nf) {
+			free_cds_ft_node(src_ft, fresh_node);
+			return CDS_FT_STATUS_POPULATED_ERROR;
+		}
 
 		/*
 		 * Ordered list: locate the dst splice neighbours NOW, while dst is
@@ -16146,6 +16171,36 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		if (dst_ft->group->ordered_list_set)
 			ft_ord_cell_find_splice_pos(dst_ft, _key, key_len,
 				&graft_pred, &graft_succ);
+
+		/*
+		 * Self-secure the NOSPLIT store BEFORE the point of no return (the
+		 * source-root swap below).  A generous node reserve + a flip batch,
+		 * drawn here where failure is clean (nothing published yet), make the
+		 * post-swap ft_store_at_graft_point unfailable -- so the old rollback
+		 * that re-published the source root on a store OOM (a reader-observable
+		 * flicker of the source: empty, then full again) is gone.  Skipped when
+		 * a caller reserve is already active (the rekey), which secures it via
+		 * @pre_flip + that reserve.  The flip is freed below if the store's
+		 * shape (a displaced external) did not consume it.
+		 */
+		if (prep == FT_GRAFT_PREP_NOSPLIT && !dst_ft->active_reserve) {
+			memset(&graft_reserve, 0, sizeof(graft_reserve));
+			if (ft_bulk_node_reserve_fill(dst_ft, &graft_reserve)) {
+				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
+				ft_graft_glue_abort(dst_ft, &glue);
+				free_cds_ft_node(src_ft, fresh_node);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+			graft_flip = ft_flip_batch_alloc(dst_ft, 1);
+			if (!graft_flip) {
+				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
+				ft_graft_glue_abort(dst_ft, &glue);
+				free_cds_ft_node(src_ft, fresh_node);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+			store_pre_flip = &graft_flip;
+			self_secured = true;
+		}
 
 		/*
 		 * "Jump out" prevention: a reader that has descended
@@ -16204,39 +16259,35 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		} else {
 			/*
 			 * Non-split attach: the payload subtrie is built into
-			 * @glue with its back-pointers deferred, recompacted
-			 * into the live graft-point node, and published — all
-			 * inside ft_store_at_graft_point.  On OOM nothing was
-			 * published and the payload is pristine (deferred edges
-			 * never applied): free the glue and roll the source root
-			 * back cleanly (a second grace period drains readers
-			 * that may have observed the fresh empty root).
+			 * @glue with its back-pointers deferred, recompacted into
+			 * the live graft-point node, and published -- all inside
+			 * ft_store_at_graft_point.  Every node draws from the
+			 * reserve (self-secured above, or the caller's) and the
+			 * proxy parks in the pre-secured flip batch, so the store
+			 * has no fallible step left: it cannot fail, and there is
+			 * NO source-root rollback (which would have flickered the
+			 * source empty-then-full to a reader).
 			 */
 			unsigned int attached_depth = 0;
 
+			if (self_secured)
+				cds_ft_alloc_reserve_activate(dst_ft,
+					&graft_reserve);
 			status = ft_store_at_graft_point(dst_ft, key, key_len,
 							  &d, graft_payload,
 							  src_count,
 							  &attached_nf,
 							  &attached_depth,
-							  &glue, pre_flip);
-			if (status != CDS_FT_STATUS_OK) {
-				ft_graft_glue_abort(dst_ft, &glue);
-				rcu_assign_pointer(src_ft->root, old_src_root);
-				/* Roll the captured run back into src's list. */
-				if (graft_run_first) {
-					rcu_assign_pointer(src_ft->ord_cell_head,
-						graft_run_first);
-					rcu_assign_pointer(src_ft->ord_cell_tail,
-						graft_run_last);
-				}
-				FT_TP(root_publish, (const void *) src_ft,
-					(const void *) src_ft->root);
-				if (!src_ft->exclusive)
-					src_ft->group->flavor->update_synchronize_rcu();
-				free_cds_ft_node(src_ft, fresh_node);
-				return status;
+							  &glue, store_pre_flip);
+			if (self_secured) {
+				cds_ft_alloc_reserve_deactivate(dst_ft);
+				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
 			}
+			assert(status == CDS_FT_STATUS_OK);
+			(void) status;
+			/* Free the flip batch if a displaced-external shape skipped it. */
+			if (graft_flip)
+				ft_flip_batch_free_unpublished(graft_flip);
 		}
 
 		/*
@@ -19987,19 +20038,19 @@ int ft_merge_nosplit_reserve(struct cds_ft *dst_ft, const uint8_t *okey_dst,
 }
 
 /*
- * Fill @r with a generous SUPERSET of the nodes a same-trie rekey's placement
- * merge can allocate -- CDS_FT_ALLOC_RESERVE_CAP of every internal node type
- * (its own order + bitmap), the minimal order, and (speculative groups) the
- * compressed-node orders.  Drawn before the detach, this lets the post-detach
- * merge draw and never fail on an arena allocation, so the detach is the last
- * fallible step and no rollback strands the moved subtree.  A generous superset
- * avoids predicting the post-detach manifest (the detach recompacts and re-roots
- * the shared ancestor, which can flip the placement NOSPLIT<->GLUE); a rekey
- * already pays two RCU grace periods, so the handful of throwaway arena
+ * Fill @r with a generous SUPERSET of the nodes a bulk op's commit can allocate
+ * -- CDS_FT_ALLOC_RESERVE_CAP of every internal node type (its own order +
+ * bitmap), the minimal order, and (speculative groups) the compressed-node
+ * orders.  Drawn before the op's last fallible step, this lets the commit draw
+ * and never fail on an arena allocation, so nothing after that step needs a
+ * reader-observable rollback.  Used by the same-trie rekey (before its detach)
+ * and by ft_graft_keylen's NOSPLIT attach (before it publishes the empty source
+ * root).  A generous superset avoids predicting the exact manifest; a bulk op
+ * already pays an RCU grace period, so the handful of throwaway arena
  * pops/pushes is negligible.  Returns 0, or -ENOMEM (caller drains).
  */
 static
-int ft_rekey_reserve_fill(struct cds_ft *ft, struct cds_ft_alloc_reserve *r)
+int ft_bulk_node_reserve_fill(struct cds_ft *ft, struct cds_ft_alloc_reserve *r)
 {
 	unsigned int ntypes = (unsigned int) (sizeof(ft_types) / sizeof(ft_types[0]));
 	unsigned int i;
@@ -20484,7 +20535,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * detach is the LAST fallible step (clean on its own failure).
 		 */
 		memset(&reserve, 0, sizeof(reserve));
-		if (ft_rekey_reserve_fill(dst_ft, &reserve)) {
+		if (ft_bulk_node_reserve_fill(dst_ft, &reserve)) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 			ft_flip_batch_free_unpublished(pf_flip);
 			if (pf_ms)

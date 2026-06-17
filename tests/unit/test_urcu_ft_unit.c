@@ -18614,6 +18614,90 @@ static int graft_swap_oom_has_key(struct cds_ft *ft, const char *k)
 }
 
 /*
+ * cds_ft_graft into a NOSPLIT graft point (a free sibling slot under an existing
+ * internal -- here "az" beside "ax"/"ay") under allocation fault injection.
+ * This is the path that SELF-SECURES its commit: a generous node reserve + a
+ * flip batch are drawn BEFORE the source-root swap, so the post-swap store
+ * cannot fail and there is NO source-root rollback.  A fault therefore can only
+ * hit the pre-swap fresh-root / reserve-fill / flip allocation, leaving BOTH
+ * tries PRISTINE (staging still owns the payload); once those succeed the store
+ * always commits ("az" appears in live, staging empties).  Pre-fix this path
+ * re-published the source root on a store OOM -- a flicker (source empty, then
+ * full again) a concurrent reader could observe; it can no longer occur, and the
+ * in-code assert(status == OK) would fire here if the reserve under-counted.
+ * The reserve fill is alloc-heavy, so the sweep is wide enough to reach the
+ * committing case too.
+ */
+static int run_graft_oom_nosplit(int nr_faults)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *live = create_varlen_ft(&group);
+		struct cds_ft *staging;
+		struct ft_test_node *a = node_alloc(1);
+		struct ft_test_node *b = node_alloc(2);
+		struct ft_test_node *s1 = node_alloc(3);
+		enum cds_ft_status s;
+		int verified, keys_ok;
+
+		if (cds_ft_create(group, NULL, &staging) < 0) {
+			fprintf(stderr, "graft_oom_nosplit: staging create failed\n");
+			return -1;
+		}
+		if (cds_ft_insert(live, (const uint8_t *)"ax", 2, &a->node) < 0 ||
+		    cds_ft_insert(live, (const uint8_t *)"ay", 2, &b->node) < 0 ||
+		    cds_ft_insert(staging, (const uint8_t *)"z", 1, &s1->node) < 0)
+			rc = -1;
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_graft(live, (const uint8_t *)"az", 2, staging);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(live, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(staging, stderr) == CDS_FT_STATUS_OK);
+		/*
+		 * "ax"/"ay" always survive in live.  Graft prepends prefix "az" to
+		 * staging's key "z", so a successful move yields "azz" in live.
+		 */
+		keys_ok = graft_swap_oom_has_key(live, "ax") &&
+			graft_swap_oom_has_key(live, "ay");
+		if (s == CDS_FT_STATUS_OK) {
+			keys_ok = keys_ok &&
+				graft_swap_oom_has_key(live, "azz") &&
+				!graft_swap_oom_has_key(staging, "z");
+		} else {
+			/* Pristine: payload still in staging, "azz" absent from live. */
+			keys_ok = keys_ok &&
+				!graft_swap_oom_has_key(live, "azz") &&
+				graft_swap_oom_has_key(staging, "z");
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"graft_oom_nosplit: %s after fault n=%d (graft=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(live) < 0 || drain_trie(staging) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(live);
+		cds_ft_destroy(staging);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+/*
  * As run_split_oom_graft, but for cds_ft_graft_swap.  A swap is two coupled
  * clusters: (A) swap_ft's content, canonicalized, inserted at the graft point
  * in place of the displaced dst old-child; and (B) that displaced old-child
@@ -18769,6 +18853,14 @@ static int test_split_oom_backpointer(void)
 		rc = -1;
 	if (run_split_oom_graft("graft-suffix==0",
 			(const uint8_t *)"aaaaaaX", 7, 16) < 0)
+		rc = -1;
+	/*
+	 * Graft into a NOSPLIT graft point (free sibling slot): the self-secured
+	 * commit path.  Sweep wide enough to cross the reserve fill (alloc-heavy)
+	 * into the committing case -- every fault leaves both tries pristine or
+	 * fully grafted, never a re-published (flickered) source root.
+	 */
+	if (run_graft_oom_nosplit(120) < 0)
 		rc = -1;
 	/*
 	 * graft_swap, key-shorter graft point: "aaX" lands strictly inside the
