@@ -19875,11 +19875,14 @@ static int test_merge_oom_subpos_external_nodes(void)
 
 /*
  * OOM coverage for the SAME-TRIE rekey: move "ax" -> "az" within one trie (the
- * deep shared ancestor 'a' canonicalizes on the move).  The implementation is
- * detach + cross-trie merge with a best-effort restore: on a single injected
- * fault the move either fully succeeds (content at "az") or leaves the trie
- * PRISTINE (content restored at "ax") -- a single fault cannot fail both the
- * inner merge and the restore -- so leak_check never sees a stranded external.
+ * deep shared ancestor 'a' canonicalizes on the move).  The implementation
+ * pre-reserves every node + flip batch BEFORE the detach, so the detach is the
+ * last fallible step and the post-detach placement merge cannot fail.  On a
+ * single injected fault the move therefore either leaves the trie PRISTINE
+ * (the fault hit during the reserve fill or the detach, before anything moved
+ * -- content still at "ax") or fully succeeds (content at "az").  There is no
+ * reader-observable rollback / restore, and leak_check never sees a stranded
+ * external.
  */
 static int run_merge_oom_rekey(int nr_faults)
 {
@@ -19915,7 +19918,7 @@ static int run_merge_oom_rekey(int nr_faults)
 				graft_swap_oom_has_key(ft, "azn") &&
 				!graft_swap_oom_has_key(ft, "axm");
 		} else {
-			/* Restored: content back at "ax", trie pristine. */
+			/* Fault before the detach committed: pristine, content at "ax". */
 			keys_ok = keys_ok &&
 				graft_swap_oom_has_key(ft, "axm") &&
 				graft_swap_oom_has_key(ft, "axn") &&

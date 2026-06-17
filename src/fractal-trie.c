@@ -10636,6 +10636,8 @@ struct ft_insert_commit {
 struct ft_flip_batch;
 static struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft,
 		unsigned int cap);
+static struct ft_flip_batch *ft_flip_batch_take(struct cds_ft *ft,
+		unsigned int cap, struct ft_flip_batch **pre);
 static struct cds_ft_inode_flag *ft_flip_batch_add(struct ft_flip_batch *b,
 		struct cds_ft_inode_flag *old_nf,
 		struct cds_ft_inode_flag *new_nf);
@@ -15682,7 +15684,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		struct cds_ft_inode_flag *graft_payload,
 		unsigned long graft_external_count,
 		struct ft_graft_glue *glue,
-		struct ft_flip_batch *pre_flip,
+		struct ft_flip_batch **pre_flip,
 		struct ft_graft_store_state *st)
 {
 	memset(st, 0, sizeof(*st));
@@ -15726,7 +15728,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			slot_value = ft_publish_compressed(ft,
 				ft_compressed_node_ptr(graft_payload),
 				graft_payload);
-		b = pre_flip ? pre_flip : ft_flip_batch_alloc(ft, 1);
+		b = ft_flip_batch_take(ft, 1, pre_flip);
 		if (!b)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		pf = ft_flip_batch_add(b, NULL, slot_value);
@@ -15734,9 +15736,8 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		ret = ft_node_set_nth(ft, &dest, key[key_len - 1], pf,
 			&st->old_recompacted_node, pmeta, d->depth - 1, false);
 		if (ret) {
-			/* The caller owns a pre-allocated batch on the error path. */
-			if (b != pre_flip)
-				ft_flip_batch_free_unpublished(b);
+			/* @b is owned here now (taken or freshly allocated). */
+			ft_flip_batch_free_unpublished(b);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 
@@ -15804,7 +15805,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			 * fallible slot store runs FIRST and the wiring
 			 * completes invisibly in commit.
 			 */
-			b = pre_flip ? pre_flip : ft_flip_batch_alloc(ft, 1);
+			b = ft_flip_batch_take(ft, 1, pre_flip);
 			if (!b)
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			pf = ft_flip_batch_add(b, NULL, branch);
@@ -15812,8 +15813,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 				&st->old_recompacted_node, pmeta,
 				d->depth - 1, false);
 			if (ret) {
-				if (b != pre_flip)
-					ft_flip_batch_free_unpublished(b);
+				ft_flip_batch_free_unpublished(b);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 
@@ -15889,7 +15889,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attached_nf,
 		unsigned int *attached_depth,
 		struct ft_graft_glue *glue,
-		struct ft_flip_batch *pre_flip)
+		struct ft_flip_batch **pre_flip)
 {
 	struct ft_graft_store_state st;
 	enum cds_ft_status status;
@@ -15995,7 +15995,8 @@ enum ft_graft_prep ft_graft_build(struct cds_ft *ft,
 static
 enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		const uint8_t *_key, size_t key_len,
-		struct cds_ft *src_ft)
+		struct cds_ft *src_ft,
+		struct ft_flip_batch **pre_flip)
 {
 	struct cds_ft_metadata *src_rmeta;
 	size_t src_max;
@@ -16218,7 +16219,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 							  src_count,
 							  &attached_nf,
 							  &attached_depth,
-							  &glue, NULL);
+							  &glue, pre_flip);
 			if (status != CDS_FT_STATUS_OK) {
 				ft_graft_glue_abort(dst_ft, &glue);
 				rcu_assign_pointer(src_ft->root, old_src_root);
@@ -16342,7 +16343,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		}
 	}
 
-	status = ft_graft_keylen(dst_ft, _key, key_len, src_ft);
+	status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
 	FT_TP(graft_exit, (int) status);
 	return status;
 }
@@ -18262,6 +18263,29 @@ struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft, unsigned int cap)
 }
 
 /*
+ * Take a caller-reserved flip batch when @pre supplies one, NULLing the
+ * caller's slot to transfer ownership: from here on the consuming op frees the
+ * batch (reclaim on commit, free_unpublished on its abort), and the caller
+ * frees only the slots it still holds.  Falls back to a fresh allocation when
+ * no batch was reserved (the standalone-op path) -- so a reserved op draws a
+ * pre-allocated, unfailable batch while a normal op allocates as before.  @cap
+ * is the fallback capacity; a reserved batch is already sized >= @cap by the
+ * caller's read-only count pass.
+ */
+static
+struct ft_flip_batch *ft_flip_batch_take(struct cds_ft *ft, unsigned int cap,
+		struct ft_flip_batch **pre)
+{
+	if (pre && *pre) {
+		struct ft_flip_batch *b = *pre;
+
+		*pre = NULL;
+		return b;
+	}
+	return ft_flip_batch_alloc(ft, cap);
+}
+
+/*
  * Free a flip batch that was allocated but never installed (no proxy stored
  * in any live slot, group never committed): a plain free, no grace period,
  * since no reader can reference it.  Used by the merge's last-fallible src
@@ -19443,7 +19467,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		const uint8_t *src_key, size_t src_key_len, unsigned long cnt_src,
 		unsigned int off_src, struct ft_descent *d_dst,
 		unsigned long cnt_dst, unsigned int off_dst,
-		const uint8_t *dst_key, size_t dst_key_len)
+		const uint8_t *dst_key, size_t dst_key_len,
+		struct ft_flip_batch **pre_flip,
+		struct ft_flip_batch **pre_ms_flip)
 {
 	struct ft_graft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -19601,7 +19627,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		for (j = 0; j < gd.nr_deferred; j++)
 			if (gd.deferred[j].dst_origin)
 				nr_dst++;
-		flip = ft_flip_batch_alloc(dst_ft, nr_dst + 1);
+		flip = ft_flip_batch_take(dst_ft, nr_dst + 1, pre_flip);
 	}
 	if (!flip) {
 		if (fresh_root)
@@ -19671,7 +19697,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 
 			ms_edges = malloc((size_t) ms_cap * sizeof(*ms_edges));
 			if (ms_edges)
-				ms_flip = ft_flip_batch_alloc(dst_ft, ms_cap);
+				ms_flip = ft_flip_batch_take(dst_ft, ms_cap,
+						pre_ms_flip);
 			if (!ms_edges || !ms_flip) {
 				free(ms_edges);
 				ft_flip_batch_free_unpublished(flip);
@@ -20146,7 +20173,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		cds_ft_alloc_reserve_activate(dst_ft, &reserve);
 		st = ft_store_at_graft_point(dst_ft, okey_dst, dst_key_len, &d,
 				payload, cnt_src, &attached_nf, &adepth, &glue,
-				pre_flip);
+				&pre_flip);
 		cds_ft_alloc_reserve_deactivate(dst_ft);
 		assert(st == CDS_FT_STATUS_OK);
 		(void) st;
@@ -20195,10 +20222,21 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
+/*
+ * @pre_flip / @pre_ms_flip carry flip batches the caller reserved before its
+ * own last fallible step, so the spine-copy / graft commit below draws an
+ * unfailable batch instead of allocating one.  Both NULL on the public path
+ * (cds_ft_merge_at), set only by the same-trie rekey, which pre-allocates them
+ * (sized from the O(1) subtree key counts) so its post-detach merge cannot fail
+ * -- no reader-observable rollback.  The consume sites NULL the slot they take,
+ * so the rekey frees exactly the batches a given merge shape left unused.
+ */
+static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
-		const uint8_t *src_key, size_t src_key_len)
+		const uint8_t *src_key, size_t src_key_len,
+		struct ft_flip_batch **pre_flip,
+		struct ft_flip_batch **pre_ms_flip)
 {
 	struct cds_ft *subtree = NULL;
 	enum cds_ft_status status;
@@ -20354,6 +20392,14 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *det_key = src_key, *mrg_key = dst_key;
 		size_t det_len = src_key_len, mrg_len = dst_key_len;
 		uint8_t det_buf[FT_MAX_KEY_LEN], mrg_buf[FT_MAX_KEY_LEN];
+		uint8_t omrg_buf[FT_MAX_KEY_LEN];
+		const uint8_t *omrg = okey_dst;		/* ordinal mrg key */
+		size_t omrg_len = dst_key_len;
+		struct cds_ft_alloc_reserve reserve;
+		struct ft_descent d_mrg;
+		unsigned int off_mrg;
+		unsigned long n = cnt_src, m;		/* moved / dst subtree counts */
+		struct ft_flip_batch *pf_flip = NULL, *pf_ms = NULL;
 
 		if (off_src > 0) {
 			struct cds_ft_compressed_node *cn_s =
@@ -20384,28 +20430,74 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 			det_len = base + cn_s->len;
 			mrg_key = mrg_buf;
 			mrg_len = dst_key_len + (cn_s->len - off_src);
+			/* Ordinal mrg key: dst prefix ++ residual cn_s (already ordinal). */
+			memcpy(omrg_buf, okey_dst, dst_key_len);
+			memcpy(&omrg_buf[dst_key_len], &cn_s->key_bytes[off_src],
+				cn_s->len - off_src);
+			omrg = omrg_buf;
+			omrg_len = mrg_len;
 		}
 
 		/*
-		 * Preallocate a generous node reserve BEFORE the detach so the
-		 * placement merge below draws from it and cannot fail on an arena
-		 * allocation -- the detach is then the last fallible step (clean on
-		 * its own failure), and there is no rollback to strand the moved
-		 * subtree.  The reserve covers the merge only; a flip-batch malloc
-		 * (not arena-backed) is the lone residual, never hit by the arena
-		 * fault injection, and the rare best-effort restore below covers it.
+		 * Read-only count pass at @mrg_key (writer lock held, so the counts
+		 * stay valid for the post-detach merge): @m, the dst subtree key
+		 * count, bounds the structural re-parent flips (nr_dst <= m); @n
+		 * (== cnt_src, the moved subtree) sizes the ordered interleave flips
+		 * (2n+2).  Both are O(1) reads off the subtree-root metadata.  The
+		 * detach preserves @n into @tmp and only reshapes the PATH to
+		 * @mrg_key (never its subtree), so nr_dst <= m still holds after.
+		 * m == 0 means @mrg_key is absent (the merge grafts).
 		 */
-		struct cds_ft_alloc_reserve reserve;
+		(void) ft_merge_descend(dst_ft, omrg, omrg_len, &d_mrg, &off_mrg,
+			&m);
 
+		/*
+		 * Pre-allocate the merge's flip batches HERE -- before the detach,
+		 * where a malloc failure is harmless (nothing has moved).  The
+		 * post-detach merge then has no fallible allocation left (every node
+		 * draws from @reserve, every flip proxy from these batches), so it
+		 * CANNOT fail and needs no reader-observable rollback.  @pf_flip
+		 * (cap m+1) feeds the structural re-parent or the graft store;
+		 * @pf_ms (cap 2n+2, only for an occupied ordered merge) feeds the
+		 * ordered-list interleave.  Caps are upper bounds; the merge uses
+		 * <= them and NULLs the slot it consumes, so we free the rest below.
+		 */
+		pf_flip = ft_flip_batch_alloc(dst_ft, (unsigned int) (m + 1));
+		if (!pf_flip) {
+			FT_TP(merge_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+		if (m > 0 && dst_ft->group->ordered_list_set) {
+			pf_ms = ft_flip_batch_alloc(dst_ft,
+				(unsigned int) (2 * n + 2));
+			if (!pf_ms) {
+				ft_flip_batch_free_unpublished(pf_flip);
+				FT_TP(merge_exit,
+					(int) CDS_FT_STATUS_MEMORY_ERROR);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+		}
+
+		/*
+		 * Generous node reserve, also before the detach, so the merge's node
+		 * allocations cannot fail either.  With both reserves in hand the
+		 * detach is the LAST fallible step (clean on its own failure).
+		 */
 		memset(&reserve, 0, sizeof(reserve));
 		if (ft_rekey_reserve_fill(dst_ft, &reserve)) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+			ft_flip_batch_free_unpublished(pf_flip);
+			if (pf_ms)
+				ft_flip_batch_free_unpublished(pf_ms);
 			FT_TP(merge_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		status = ft_detach_keylen(dst_ft, det_key, det_len, &tmp);
 		if (status < 0) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+			ft_flip_batch_free_unpublished(pf_flip);
+			if (pf_ms)
+				ft_flip_batch_free_unpublished(pf_ms);
 			FT_TP(merge_exit, (int) (status == CDS_FT_STATUS_NOT_FOUND
 				? CDS_FT_STATUS_OK : status));
 			return status == CDS_FT_STATUS_NOT_FOUND
@@ -20413,12 +20505,22 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		}
 		cds_ft_alloc_reserve_activate(dst_ft, &reserve);
 		cds_ft_alloc_reserve_activate(tmp, &reserve);
-		status = cds_ft_merge_at(dst_ft, mrg_key, mrg_len, tmp, NULL, 0);
+		/*
+		 * Unfailable placement: every node draws from @reserve and every
+		 * flip proxy from @pf_flip / @pf_ms, so the merge always commits the
+		 * move.  No failure path can strand @tmp's content back at @det_key
+		 * -- that re-graft was the reader-observable rollback we removed.
+		 */
+		status = ft_merge_at_inner(dst_ft, mrg_key, mrg_len, tmp, NULL, 0,
+			&pf_flip, &pf_ms);
 		cds_ft_alloc_reserve_deactivate(dst_ft);
 		cds_ft_alloc_reserve_deactivate(tmp);
-		if (status != CDS_FT_STATUS_OK)
-			(void) cds_ft_merge_at(dst_ft, det_key, det_len, tmp,
-					NULL, 0);
+		assert(status == CDS_FT_STATUS_OK);
+		/* Free the flip batches this merge shape did not consume. */
+		if (pf_flip)
+			ft_flip_batch_free_unpublished(pf_flip);
+		if (pf_ms)
+			ft_flip_batch_free_unpublished(pf_ms);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		cds_ft_destroy(tmp);
 		FT_TP(merge_exit, (int) status);
@@ -20444,7 +20546,8 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 				|| kd == FT_GRAFT_SWAP_KEY_SHORTER)) {
 		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
 				okey_src, src_key_len, cnt_src, off_src,
-				&d_dst, cnt_dst, off_dst, okey_dst, dst_key_len);
+				&d_dst, cnt_dst, off_dst, okey_dst, dst_key_len,
+				pre_flip, pre_ms_flip);
 		if (status == CDS_FT_STATUS_OK) {
 			/*
 			 * Raise dst's max_used_key_len for the moved keys
@@ -20481,7 +20584,8 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	 * here, exactly as the detach-then-graft path did.
 	 */
 	if (src_key_len == 0) {
-		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, src_ft);
+		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, src_ft,
+				pre_flip);
 		FT_TP(merge_exit, (int) status);
 		return status;
 	}
@@ -20629,6 +20733,15 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 out:
 	FT_TP(merge_exit, (int) status);
 	return status;
+}
+
+enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
+		const uint8_t *dst_key, size_t dst_key_len,
+		struct cds_ft *src_ft,
+		const uint8_t *src_key, size_t src_key_len)
+{
+	return ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
+			src_key, src_key_len, NULL, NULL);
 }
 
 enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
