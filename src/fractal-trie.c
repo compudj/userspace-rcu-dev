@@ -159,10 +159,10 @@ ft_delay_init(void)
 #endif
 
 struct cds_ft_group_attr {
-	size_t key_len;
-	size_t max_key_len;
-	struct cds_ft_key_map key_map;
-	unsigned int flags;
+	size_t key_len;		/* Fixed key length in bytes, or CDS_FT_LEN_VARIABLE. */
+	size_t max_key_len;	/* Maximum key length allowed (bounds key buffers). */
+	struct cds_ft_key_map key_map;	/* Per-position key<->ordinal byte remap; see cds_ft_group_attr_set_key_map. */
+	unsigned int flags;	/* CDS_FT_FLAG_* creation-time flags. */
 	bool speculative;	/* See cds_ft_lookup_optimization. */
 	/*
 	 * Byte offset from the (struct cds_ft_node *) stored in the trie to
@@ -193,7 +193,7 @@ struct cds_ft_group_attr {
 };
 
 struct cds_ft_attr {
-	bool exclusive;
+	bool exclusive;		/* Exclusive (single-writer, no concurrent readers) vs concurrent; see cds_ft_attr_set_exclusive. */
 };
 
 enum cds_ft_type_class {
