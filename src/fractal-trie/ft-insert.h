@@ -1008,7 +1008,20 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		child_cn = ft_compressed_node_ptr(child);
 	if (child_cn) {
 		child_len = child_cn->len;
+		/*
+		 * Cap the fused path at what one compressed node can hold.  Under
+		 * skip-compressed the merged node must also stay skip-encodable, so
+		 * the cap is FT_SKIP_LEN_MAX.  Without skip-compression (notably
+		 * 32-bit, where FT_SKIP_LEN_MAX is 0) the node is a plain compressed
+		 * and the only limit is its uint8_t len field -- cap at UINT8_MAX.
+		 * Using FT_SKIP_LEN_MAX unconditionally would never fuse there and
+		 * leave two adjacent compresseds, violating the invariant.
+		 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 		if ((unsigned int) path_len + child_len > FT_SKIP_LEN_MAX) {
+#else
+		if ((unsigned int) path_len + child_len > UINT8_MAX) {
+#endif
 			/* Overflow: leave adjacency in place. */
 			child_cn = NULL;
 			child_len = 0;
