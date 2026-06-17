@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	26
+#define NR_TESTS	27
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -4288,6 +4288,148 @@ static int inv_merge_rerooted_glue_no_escape(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 11c: SAME-TRIE rekey never escapes / corrupts          */
+/*                                                                    */
+/*   The writer rekeys "ax" <-> "az" within ONE trie (move "ax"'s     */
+/*   subtree {axm,axn} to "az" and back), reusing cds_ft_merge_at with */
+/*   src_ft == dst_ft.  Rekey is detach + cross-trie merge -- inherently */
+/*   multi-stage -- so a key may be transiently ABSENT (parked in the  */
+/*   transient trie) mid-move; a concurrent ordered reader must still  */
+/*   only ever see keys in {axm,axn,azm,azn,ayp} -- never a garbage /  */
+/*   out-of-namespace key, and never loop.  The disjoint "ayp" is a    */
+/*   fixed witness the shared 'a' ancestor stays consistent.           */
+/* ================================================================== */
+
+static void *inv_rekey_writer(void *arg)
+{
+	struct inv_rerooted_ctx *ctx = (struct inv_rerooted_ctx *) arg;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		enum cds_ft_status s;
+
+		pthread_mutex_lock(&ctx->lock);
+		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "az", 2,
+				ctx->dst, (const uint8_t *) "ax", 2);
+		pthread_mutex_unlock(&ctx->lock);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_rekey writer ax->az: %s\n",
+				cds_ft_status_to_string(s));
+			break;
+		}
+		rcu_quiescent_state();
+		pthread_mutex_lock(&ctx->lock);
+		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "ax", 2,
+				ctx->dst, (const uint8_t *) "az", 2);
+		pthread_mutex_unlock(&ctx->lock);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_rekey writer az->ax: %s\n",
+				cds_ft_status_to_string(s));
+			break;
+		}
+		rcu_quiescent_state();
+	}
+
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_no_escape(void)
+{
+	static const char *const allowed[] = {
+		"axm", "axn", "azm", "azn", "ayp", NULL,
+	};
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct inv_rerooted_ctx ctx;
+	struct inv_rerooted_reader_arg rargs[2 * NR_READERS_DEFAULT];
+	struct timespec t0;
+	pthread_t readers[2 * NR_READERS_DEFAULT], writer;
+	unsigned int i;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(gattr, 16) < 0 ||
+	    cds_ft_group_attr_set_ordered_list(gattr, true) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	if (cds_ft_group_create(gattr, &group) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(gattr);
+
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "axm", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "axn", 3, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "ayp", 3, &node_alloc(3)->node);
+	rcu_read_unlock();
+
+	ctx.dst = ft;
+	ctx.src = ft;
+	ctx.test_name = "inv_rekey_no_escape";
+	ctx.shape = 0;
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++) {
+		rargs[i].ctx = &ctx;
+		rargs[i].trie = ft;
+		rargs[i].allowed = allowed;
+		rargs[i].which = "ft";
+		pthread_create(&readers[i], NULL, inv_rerooted_reader,
+			&rargs[i]);
+	}
+	pthread_create(&writer, NULL, inv_rekey_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	pthread_join(writer, NULL);
+	for (i = 0; i < 2 * NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_rekey_no_escape: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+
+	drain_trie_local(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*   INVARIANT 12: Merge into a COMPRESSED dst merge point never       */
 /*   escapes (the M_slot skip-encoded interior publish via flip proxy) */
 /*                                                                    */
@@ -6076,6 +6218,9 @@ int main(int argc, char **argv)
 
 	diag("11b. Re-rooted source, GLUE-diverge dst, ordered list");
 	RUN_TEST(inv_merge_rerooted_glue_no_escape);
+
+	diag("11c. Same-trie rekey never escapes / corrupts");
+	RUN_TEST(inv_rekey_no_escape);
 
 	diag("12. Merge into a compressed destination never escapes");
 	RUN_TEST(inv_merge_compressed_dst_no_escape);

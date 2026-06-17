@@ -1852,8 +1852,8 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  *           @dst_key_len is 0.
  * @dst_key_len: Length of @dst_key in bytes.
  * @src_ft: Source Fractal Trie.  Must belong to the same group as
- *          @dst_ft and must not equal @dst_ft.  May be in either
- *          exclusive or concurrent mode.
+ *          @dst_ft.  May EQUAL @dst_ft (rekey within a trie -- see
+ *          below).  May be in either exclusive or concurrent mode.
  * @src_key: Source-side prefix selecting which @src_ft sub-trie to
  *           move.  May be NULL if @src_key_len is 0.
  * @src_key_len: Length of @src_key in bytes.
@@ -1869,18 +1869,29 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * partition rename) that cannot be expressed via the public
  * cds_ft_detach + cds_ft_graft pair on fixed-length groups.
  *
- * Same whole-operation-atomic contract as cds_ft_merge, with
- * @src_key selecting the source subtree to move and @dst_key serving
- * as both the destination attach point and the prefix that replaces
- * @src_key on each moved key.
+ * Cross-trie (@src_ft != @dst_ft): same whole-operation-atomic contract
+ * as cds_ft_merge, with @src_key selecting the source subtree to move and
+ * @dst_key serving as both the destination attach point and the prefix
+ * that replaces @src_key on each moved key.
+ *
+ * Rekey within a trie (@src_ft == @dst_ft): moves the subtree at @src_key
+ * to @dst_key in the same trie.  @src_key and @dst_key must be DISJOINT --
+ * neither a prefix of the other (else the move would be circular);
+ * otherwise CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.  An occupied @dst_key is
+ * MERGED into, as for cross-trie.  Unlike the cross-trie case the rekey is
+ * NOT a single atomic transition: it proceeds in stages, so a concurrent
+ * reader may briefly observe the moved keys as ABSENT (neither at @src_key
+ * nor yet at @dst_key) -- it never observes a corrupt or out-of-namespace
+ * key, and the per-key dst publish is itself atomic.  It never leaks.
  *
  * Returns the same statuses as cds_ft_merge.  In addition,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR is returned if either
  * @src_key_len or @dst_key_len exceeds the group's maximum key
- * length, or — for a fixed-length key group — if
- * @dst_key_len != @src_key_len (a fixed-length group accepts only
- * keys of its fixed length, so the moved keys keep that length
- * only when the source and destination prefixes are equally long).
+ * length; if -- for a fixed-length key group -- @dst_key_len !=
+ * @src_key_len (a fixed-length group accepts only keys of its fixed
+ * length, so the moved keys keep that length only when the source and
+ * destination prefixes are equally long); or if @src_ft == @dst_ft and
+ * the two keys overlap (one is a prefix of the other).
  */
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,

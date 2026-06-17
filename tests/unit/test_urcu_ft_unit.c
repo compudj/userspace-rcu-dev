@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 278
+#define NR_TESTS 280
 #else
-#define NR_TESTS 247
+#define NR_TESTS 248
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -5954,6 +5954,89 @@ static int test_merge_rerooted_nosplit_ordered_atnode(void)
 static int test_merge_rerooted_nosplit_ordered_branch(void)
 {
 	return merge_rerooted_nosplit_ordered(1);
+}
+
+/* Rekey helper: cds_ft_merge_at(ft, new, ft, old) within one trie. */
+static enum cds_ft_status ft_rekey(struct cds_ft *ft, const char *nw,
+		const char *old)
+{
+	return cds_ft_merge_at(ft, (const uint8_t *) nw, strlen(nw),
+			ft, (const uint8_t *) old, strlen(old));
+}
+
+/*
+ * Same-trie "rekey" (src_ft == dst_ft, old_key -> new_key): move a subtree to a
+ * new, disjoint key within ONE trie.  Covers a deep shared ancestor that
+ * canonicalizes after the move (a/x,y -> the unlink collapses 'a' to compressed
+ * "ay"), a root-level divergence, a KEY_SHORTER source (the old key ends inside
+ * a compressed run), an external source, an OCCUPIED destination (which MERGES),
+ * and the non-overlap guard (a prefix relationship / equal keys are rejected).
+ */
+static int test_merge_rekey_same_trie(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+
+	/* Deep shared ancestor 'a' canonicalizes when "ax" leaves. */
+	cds_ft_insert(ft, (const uint8_t *) "axm", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "axn", 3, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "ayp", 3, &node_alloc(3)->node);
+	s = ft_rekey(ft, "az", "ax");
+	if (s != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "azm") || !ft_test_has_key(ft, "azn") ||
+	    !ft_test_has_key(ft, "ayp") ||
+	    ft_test_has_key(ft, "axm") || ft_test_has_key(ft, "axn")) {
+		fprintf(stderr, "rekey: deep-canon failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* KEY_SHORTER source: "he" ends inside compressed "hello". */
+	cds_ft_insert(ft, (const uint8_t *) "hello", 5, &node_alloc(4)->node);
+	s = ft_rekey(ft, "we", "he");
+	if (s != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "wello") || ft_test_has_key(ft, "hello")) {
+		fprintf(stderr, "rekey: key-shorter failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* External source; occupied destination MERGES. */
+	cds_ft_insert(ft, (const uint8_t *) "q", 1, &node_alloc(5)->node);
+	cds_ft_insert(ft, (const uint8_t *) "azq", 3, &node_alloc(6)->node);
+	s = ft_rekey(ft, "az", "q");	/* "q" -> "az"; "az" already a subtree */
+	if (s != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "az") ||	/* the moved "q" lands at "az" */
+	    !ft_test_has_key(ft, "azq") ||	/* pre-existing subtree kept */
+	    !ft_test_has_key(ft, "azm") || ft_test_has_key(ft, "q")) {
+		fprintf(stderr, "rekey: occupied-merge failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* Non-overlap guard: prefix relationships + equal keys are rejected. */
+	if (ft_rekey(ft, "a", "az") != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR ||
+	    ft_rekey(ft, "azz", "az") != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR ||
+	    ft_rekey(ft, "az", "az") != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "rekey: non-overlap guard not enforced\n");
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 /*
@@ -19791,6 +19874,79 @@ static int test_merge_oom_subpos_external_nodes(void)
 }
 
 /*
+ * OOM coverage for the SAME-TRIE rekey: move "ax" -> "az" within one trie (the
+ * deep shared ancestor 'a' canonicalizes on the move).  The implementation is
+ * detach + cross-trie merge with a best-effort restore: on a single injected
+ * fault the move either fully succeeds (content at "az") or leaves the trie
+ * PRISTINE (content restored at "ax") -- a single fault cannot fail both the
+ * inner merge and the restore -- so leak_check never sees a stranded external.
+ */
+static int run_merge_oom_rekey(int nr_faults)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_varlen_ft(&group);
+		struct ft_test_node *a1 = node_alloc(1);
+		struct ft_test_node *a2 = node_alloc(2);
+		struct ft_test_node *a3 = node_alloc(3);
+		enum cds_ft_status s;
+		int verified, keys_ok;
+
+		if (cds_ft_insert(ft, (const uint8_t *)"axm", 3, &a1->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *)"axn", 3, &a2->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *)"ayp", 3, &a3->node) < 0)
+			rc = -1;
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge_at(ft, (const uint8_t *)"az", 2,
+				ft, (const uint8_t *)"ax", 2);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		keys_ok = graft_swap_oom_has_key(ft, "ayp");
+		if (s == CDS_FT_STATUS_OK) {
+			keys_ok = keys_ok &&
+				graft_swap_oom_has_key(ft, "azm") &&
+				graft_swap_oom_has_key(ft, "azn") &&
+				!graft_swap_oom_has_key(ft, "axm");
+		} else {
+			/* Restored: content back at "ax", trie pristine. */
+			keys_ok = keys_ok &&
+				graft_swap_oom_has_key(ft, "axm") &&
+				graft_swap_oom_has_key(ft, "axn") &&
+				!graft_swap_oom_has_key(ft, "azm");
+		}
+		rcu_read_unlock();
+		if (!verified || !keys_ok) {
+			fprintf(stderr,
+				"merge_oom_rekey: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" : "KEY SET WRONG",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(ft) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_rekey(void)
+{
+	return run_merge_oom_rekey(20);
+}
+
+/*
  * OOM coverage for the PIECEWISE merge: dst already has nodes that overlap
  * src's, so ft_merge_build must recurse INTO the shared spine -- copying the
  * shared branch nodes, splicing the same full keys ("aa", "ba"), and
@@ -21208,6 +21364,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_glue_ordered_key_shorter);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_atnode);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
+	RUN_TEST(test_merge_rekey_same_trie);
 	RUN_TEST(test_nonidentity_bulk_ops);
 	RUN_TEST(test_merge_at_overflow);
 
@@ -21432,6 +21589,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom_key_shorter_diverged_internal_glue);
 	RUN_TEST(test_merge_oom_key_shorter_diverged_internal_atnode);
 	RUN_TEST(test_merge_oom_subpos_external_nodes);
+	RUN_TEST(test_merge_oom_rekey);
 	RUN_TEST(test_merge_oom_overlap);
 	RUN_TEST(test_merge_oom_compressed);
 	RUN_TEST(test_merge_oom_nonroot_src);

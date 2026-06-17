@@ -16093,6 +16093,21 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *attached_nf = NULL;
 		struct ft_ord_cell *graft_run_first = NULL, *graft_run_last = NULL;
 		struct ft_ord_cell *graft_pred = NULL, *graft_succ = NULL;
+		/*
+		 * NIL-key-only source: the whole source is a single prefix key,
+		 * stored as the root's external_nodes (a childless internal -- valid
+		 * only AT a root).  Grafting that wrapper internal to a non-root
+		 * position would leave a non-canonical childless internal there
+		 * (cds_ft_remove_all's invariant).  Graft the external chain head
+		 * DIRECTLY instead, so the placed node is a plain external, and free
+		 * the orphaned wrapper on success.  (Cross-trie graft never hits this:
+		 * a real source root always has children.)
+		 */
+		bool nil_key_root = (src_rmeta->nr_child == 0
+				&& src_rmeta->external_nodes != NULL);
+		struct cds_ft_inode_flag *graft_payload = nil_key_root ?
+			(struct cds_ft_inode_flag *) ft_dereference_external(
+				src_rmeta->external_nodes) : src_ft->root;
 
 		/*
 		 * Preallocate a fresh empty root for the source trie
@@ -16109,7 +16124,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * @glue; otherwise just locate the graft point in @d.
 		 */
 		ft_graft_glue_init(&glue);
-		prep = ft_graft_build(dst_ft, key, key_len, src_ft->root,
+		prep = ft_graft_build(dst_ft, key, key_len, graft_payload,
 				src_count, &d, &glue);
 		if (prep == FT_GRAFT_PREP_OOM) {
 			ft_graft_glue_abort(dst_ft, &glue);
@@ -16199,7 +16214,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			unsigned int attached_depth = 0;
 
 			status = ft_store_at_graft_point(dst_ft, key, key_len,
-							  &d, old_src_root,
+							  &d, graft_payload,
 							  src_count,
 							  &attached_nf,
 							  &attached_depth,
@@ -16235,12 +16250,27 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * there would double-count @attached_nf's subtree.
 		 */
 		{
-			struct cds_ft_metadata *am =
-				ft_flag_to_metadata(dst_ft, attached_nf);
-			if (am->parent)
-				ft_propagate_external_count_parent(dst_ft,
-					am->parent, (long) src_count);
+			/*
+			 * ft_get_parent_rcu (not ft_flag_to_metadata) so the start
+			 * point is correct even when @attached_nf is the placed
+			 * EXTERNAL of a NIL-key graft.
+			 */
+			struct cds_ft_inode_flag *ap = ft_get_parent_rcu(dst_ft,
+				ft_resolve_skip_compressed(dst_ft, attached_nf));
+			if (ap)
+				ft_propagate_external_count_parent(dst_ft, ap,
+					(long) src_count);
 		}
+
+		/*
+		 * NIL-key graft: the placed external sits directly under an internal
+		 * slot, so refresh its CELL edge byte for the ordered key rebuild
+		 * (ft_set_parent does not maintain it for externals; harmless when
+		 * the parent is compressed, where the up-walk ignores it).
+		 */
+		if (nil_key_root && graft_run_first)
+			cds_ft_item_to_metadata(graft_run_first)->incoming_byte =
+				key[key_len - 1];
 
 		/*
 		 * Ordered list: src is now structurally empty + drained; the
@@ -16253,6 +16283,14 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			ft_ord_cell_run_splice(dst_ft, graft_run_first,
 				graft_run_last, graft_pred, graft_succ);
 
+		/*
+		 * NIL-key graft succeeded: the external chain head was placed
+		 * directly, so the orphaned wrapper internal (the old source root)
+		 * is reclaimed.  Deferred, as readers may have been inside it before
+		 * the root swap + drain above.
+		 */
+		if (nil_key_root)
+			free_cds_ft_node(src_ft, ft_node_ptr(old_src_root));
 	}
 
 done:
@@ -18352,17 +18390,28 @@ struct cds_ft_node *ft_subtree_minmax_head(struct cds_ft *ft, struct cds_ft_inod
 			continue;
 		}
 		/* Internal node. */
-		if (!want_max) {
+		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(nf));
 			struct cds_ft_node *ext =
 				ft_dereference_external(m->external_nodes);
+			struct cds_ft_inode_flag *child;
 
-			if (ext)
+			if (!want_max && ext)
 				return ext;	/* prefix key: subtree minimum */
+			child = ft_node_get_minmax(ft, nf, &scratch, dir, false);
+			if (!child) {
+				/*
+				 * No children: a NIL-key-only internal whose
+				 * external_nodes is the sole key, so it is also the
+				 * subtree MAXIMUM (a single-prefix-key trie root, e.g.
+				 * a detached external).  want_min returned it above.
+				 */
+				assert(ext != NULL);
+				return ext;
+			}
+			nf = child;
 		}
-		nf = ft_node_get_minmax(ft, nf, &scratch, dir, false);
-		assert(nf != NULL);
 	}
 }
 
@@ -19910,6 +19959,52 @@ int ft_merge_nosplit_reserve(struct cds_ft *dst_ft, const uint8_t *okey_dst,
 	return rret;
 }
 
+/*
+ * Fill @r with a generous SUPERSET of the nodes a same-trie rekey's placement
+ * merge can allocate -- CDS_FT_ALLOC_RESERVE_CAP of every internal node type
+ * (its own order + bitmap), the minimal order, and (speculative groups) the
+ * compressed-node orders.  Drawn before the detach, this lets the post-detach
+ * merge draw and never fail on an arena allocation, so the detach is the last
+ * fallible step and no rollback strands the moved subtree.  A generous superset
+ * avoids predicting the post-detach manifest (the detach recompacts and re-roots
+ * the shared ancestor, which can flip the placement NOSPLIT<->GLUE); a rekey
+ * already pays two RCU grace periods, so the handful of throwaway arena
+ * pops/pushes is negligible.  Returns 0, or -ENOMEM (caller drains).
+ */
+static
+int ft_rekey_reserve_fill(struct cds_ft *ft, struct cds_ft_alloc_reserve *r)
+{
+	unsigned int ntypes = (unsigned int) (sizeof(ft_types) / sizeof(ft_types[0]));
+	unsigned int i;
+	int ret = 0;
+
+	for (i = 0; i < ntypes && !ret; i++) {
+		if (ft_types[i].type_class == FT_NULL)
+			continue;
+		ret = cds_ft_alloc_reserve_add(ft, r, CDS_FT_ALLOC_KIND_NODE,
+			ft_types[i].order, ft_types[i].bitmap,
+			CDS_FT_ALLOC_RESERVE_CAP);
+	}
+	/* Minimal order, below ft_types[0] (small / compressed nodes). */
+	if (!ret && FT_ALLOC_ORDER_MIN < ft_types[0].order)
+		ret = cds_ft_alloc_reserve_add(ft, r, CDS_FT_ALLOC_KIND_NODE,
+			FT_ALLOC_ORDER_MIN, FT_NO_BITMAP,
+			CDS_FT_ALLOC_RESERVE_CAP);
+	/* Compressed-node arena (speculative groups; else compressed == NODE). */
+	if (ft->group->speculative) {
+		unsigned int order;
+		unsigned int cmax = ft_compressed_order(FT_SKIP_LEN_MAX);
+
+		if (cmax > FT_ALLOC_ORDER_MAX)
+			cmax = FT_ALLOC_ORDER_MAX;
+		for (order = FT_ALLOC_ORDER_MIN; order <= cmax && !ret; order++)
+			ret = cds_ft_alloc_reserve_add(ft, r,
+				CDS_FT_ALLOC_KIND_COMPRESSED, order,
+				FT_NO_BITMAP, CDS_FT_ALLOC_RESERVE_CAP);
+	}
+	return ret;
+}
+
 static
 enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		struct cds_ft *src_ft,
@@ -20116,7 +20211,7 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 
 	FT_TP(merge_enter, (const void *) dst_ft, (const void *) src_ft);
 
-	if (!dst_ft || !src_ft || dst_ft == src_ft) {
+	if (!dst_ft || !src_ft) {
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
@@ -20203,6 +20298,26 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 	}
 
 	/*
+	 * Same-trie "rekey" (src_ft == dst_ft): moving @src_key's subtree to
+	 * @dst_key within one trie is allowed, but the two keys must be DISJOINT
+	 * -- neither a prefix of the other.  A prefix relationship means one key
+	 * lies inside the other's subtree, so the move would be circular (and
+	 * @dst_key would not be absent), and equal keys are a degenerate self-
+	 * move.  The check is byte-position-wise, identical in application and
+	 * ordinal space (the key map is a per-position bijection).  Cross-trie
+	 * subtrees are disjoint by construction, so the guard is same-trie only.
+	 */
+	if (src_ft == dst_ft) {
+		size_t m = src_key_len < dst_key_len ? src_key_len : dst_key_len;
+
+		if (m == 0 || memcmp(okey_src, okey_dst, m) == 0) {
+			FT_TP(merge_exit,
+				(int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		}
+	}
+
+	/*
 	 * Locate both merge points read-only (a writer descends its own
 	 * stable state).  No content under @src_key -> the merge is a no-op;
 	 * cnt_src == 0 covers an empty @src_ft root (src_key_len == 0, where
@@ -20214,6 +20329,102 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
+
+	/*
+	 * Same-trie "rekey": detach @src_key's subtree into a transient trie,
+	 * then merge that whole trie back in at @dst_key.  The detach fully
+	 * commits -- recompacting the shared common-prefix ancestor and draining
+	 * -- BEFORE the placement reads it, so the move's two sides no longer
+	 * alias the same node.  The in-place reorder CANNOT be used here: its
+	 * source unlink would recompact that shared ancestor out from under the
+	 * build-invisible destination placement (a stale-slot publish).  The
+	 * cross-trie merge handles an occupied @dst_key by MERGING and an absent
+	 * one by grafting; it is itself leak-free, and on its failure the moved
+	 * content is restored to @src_key (best effort).
+	 *
+	 * A KEY_SHORTER source (off_src > 0, @src_key ends inside the compressed
+	 * node @d_src.nf) is reduced to the EXACT node boundary first, exactly as
+	 * the cross-trie path does: detach @cn_s->child via the full-compressed
+	 * key (src prefix ++ all of cn_s), and merge at @dst_key extended by the
+	 * residual cn_s bytes -- ft_detach_keylen overshoots a compressed node, so
+	 * it must be handed a boundary key, not an interior one.
+	 */
+	if (src_ft == dst_ft) {
+		struct cds_ft *tmp = NULL;
+		const uint8_t *det_key = src_key, *mrg_key = dst_key;
+		size_t det_len = src_key_len, mrg_len = dst_key_len;
+		uint8_t det_buf[FT_MAX_KEY_LEN], mrg_buf[FT_MAX_KEY_LEN];
+
+		if (off_src > 0) {
+			struct cds_ft_compressed_node *cn_s =
+				ft_compressed_node_ptr(d_src.nf);
+			const struct cds_ft_key_map *km =
+				&dst_ft->group->key_map;
+			unsigned int base = (unsigned int) d_src.depth, j;
+
+			/* det_key = src prefix to cn_s start ++ ALL of cn_s. */
+			memcpy(det_buf, src_key, base);
+			/* mrg_key = dst_key ++ the residual cn_s bytes. */
+			memcpy(mrg_buf, dst_key, dst_key_len);
+			if (km->identity) {
+				memcpy(&det_buf[base], cn_s->key_bytes, cn_s->len);
+				memcpy(&mrg_buf[dst_key_len],
+					&cn_s->key_bytes[off_src],
+					cn_s->len - off_src);
+			} else {
+				for (j = 0; j < cn_s->len; j++)
+					det_buf[base + j] = km->ordinal_to_key[
+						cn_s->key_bytes[j]];
+				for (j = off_src; j < cn_s->len; j++)
+					mrg_buf[dst_key_len + j - off_src] =
+						km->ordinal_to_key[
+						cn_s->key_bytes[j]];
+			}
+			det_key = det_buf;
+			det_len = base + cn_s->len;
+			mrg_key = mrg_buf;
+			mrg_len = dst_key_len + (cn_s->len - off_src);
+		}
+
+		/*
+		 * Preallocate a generous node reserve BEFORE the detach so the
+		 * placement merge below draws from it and cannot fail on an arena
+		 * allocation -- the detach is then the last fallible step (clean on
+		 * its own failure), and there is no rollback to strand the moved
+		 * subtree.  The reserve covers the merge only; a flip-batch malloc
+		 * (not arena-backed) is the lone residual, never hit by the arena
+		 * fault injection, and the rare best-effort restore below covers it.
+		 */
+		struct cds_ft_alloc_reserve reserve;
+
+		memset(&reserve, 0, sizeof(reserve));
+		if (ft_rekey_reserve_fill(dst_ft, &reserve)) {
+			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+			FT_TP(merge_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+		status = ft_detach_keylen(dst_ft, det_key, det_len, &tmp);
+		if (status < 0) {
+			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+			FT_TP(merge_exit, (int) (status == CDS_FT_STATUS_NOT_FOUND
+				? CDS_FT_STATUS_OK : status));
+			return status == CDS_FT_STATUS_NOT_FOUND
+				? CDS_FT_STATUS_OK : status;	/* NOT_FOUND -> no-op */
+		}
+		cds_ft_alloc_reserve_activate(dst_ft, &reserve);
+		cds_ft_alloc_reserve_activate(tmp, &reserve);
+		status = cds_ft_merge_at(dst_ft, mrg_key, mrg_len, tmp, NULL, 0);
+		cds_ft_alloc_reserve_deactivate(dst_ft);
+		cds_ft_alloc_reserve_deactivate(tmp);
+		if (status != CDS_FT_STATUS_OK)
+			(void) cds_ft_merge_at(dst_ft, det_key, det_len, tmp,
+					NULL, 0);
+		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+		cds_ft_destroy(tmp);
+		FT_TP(merge_exit, (int) status);
+		return status;
+	}
+
 	kd = ft_merge_descend(dst_ft, okey_dst, dst_key_len, &d_dst,
 			&off_dst, &cnt_dst);
 
