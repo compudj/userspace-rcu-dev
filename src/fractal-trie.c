@@ -20428,8 +20428,10 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * source unlink would recompact that shared ancestor out from under the
 	 * build-invisible destination placement (a stale-slot publish).  The
 	 * cross-trie merge handles an occupied @dst_key by MERGING and an absent
-	 * one by grafting; it is itself leak-free, and on its failure the moved
-	 * content is restored to @src_key (best effort).
+	 * one by grafting; it is made UNFAILABLE (its nodes + flip batches are
+	 * pre-reserved before the detach below), so it always commits the move --
+	 * there is no failure path that would restore the content to @src_key, i.e.
+	 * no reader-observable rollback.
 	 *
 	 * A KEY_SHORTER source (off_src > 0, @src_key ends inside the compressed
 	 * node @d_src.nf) is reduced to the EXACT node boundary first, exactly as
