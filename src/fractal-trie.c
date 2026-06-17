@@ -452,7 +452,7 @@ static const struct cds_ft_type ft_types[] = {
  * pointer-aligned byte array. The allocator sizes this array dynamically
  * based on the type's order (1 << type->order).
  *
- * Crucially, the allocator guarantees that each node is naturally aligned
+ * The allocator guarantees that each node is naturally aligned
  * to its exact size boundary. For example, a node with order 6 (64 bytes)
  * is guaranteed to be aligned on a 64-byte boundary in memory. This ensures
  * optimal cache-line alignment, prevents false sharing, and guarantees that
@@ -6103,8 +6103,8 @@ int _ft_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type,
 		assert(0);
 		return -EINVAL;
 	}
-	/* Parent back-pointer is now wired inside the per-class body, ahead of
-	 * the forward store (previously set here, after it). */
+	/* Parent back-pointer is wired inside the per-class body, ahead of
+	 * the forward store. */
 	return ret;
 }
 
@@ -7176,9 +7176,7 @@ descend_loop:
 		}
 #endif
 		/*
-		 * Merged post-step handler for non-internal results.
-		 * Bundles what was a loop-top !internal slow path with
-		 * the separate post-step external check.
+		 * Post-step handler for non-internal results.
 		 *
 		 * Compressed reachable in non-cand mode and also in
 		 * cand mode for compressed paths longer than
@@ -10549,8 +10547,8 @@ void ft_propagate_external_count_parent(struct cds_ft *ft,
  * insert_done then adds the ordered-list neighbour edges to the SAME batch and
  * makes the key reachable in the structural index AND spliced into the cell
  * list with one urcu_flip_commit -- a reader can never observe the fresh head
- * without its cell in the list (2026-06 review, 2.13).  @batch == NULL: legacy
- * direct publish (ordered list off, or a shape not yet converted).
+ * without its cell in the list (2026-06 review, 2.13).  @batch == NULL: direct
+ * publish (ordered list off, or a shape not yet converted).
  */
 struct ft_insert_commit {
 	struct ft_flip_batch *batch;		/* armed at the publish site */
@@ -10678,9 +10676,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	/*
 	 * Compressed metadata never carries external_nodes
 	 * (ft_metadata_set_external_nodes aborts on a compressed target).
-	 * The prefix builders below rely on it; the dead external-carrying
-	 * arms they used to carry hid latent bugs (wrong nr_keys, a dropped
-	 * prefix byte) that this assert retires.
+	 * The prefix builders below rely on it.
 	 */
 	assert(!cn_meta->external_nodes);
 	FT_TP(split_compressed_insert_enter, (const void *) cn,
@@ -12540,7 +12536,7 @@ insert_done:
 			/*
 			 * @node became a fresh head through a shape that
 			 * publishes without a parkable slot (insert_replace's
-			 * paths): legacy post-publish splice.
+			 * paths): post-publish splice.
 			 */
 			ft_ord_cell_splice(ft, _key, _key_len, precell);
 			if (ic.batch)
@@ -14483,9 +14479,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
 	/* Compressed metadata never carries external_nodes (see
-	 * ft_split_compressed_insert); the dead external-carrying prefix
-	 * arms this retires included a latent diverge_pos == 2 sub-case
-	 * that dropped prefix byte key_bytes[1]. */
+	 * ft_split_compressed_insert). */
 	assert(!cn_meta->external_nodes);
 	unsigned int suffix_len = cn->len - diverge_pos - 1;
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
