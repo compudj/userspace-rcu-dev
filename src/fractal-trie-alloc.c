@@ -193,7 +193,7 @@ size_t cds_ft_arena_range_alloc_size(size_t item_len_order, bool bitmap)
  */
 #ifdef __linux__
 /*
- * mempolicy mode numbers — match the linux/mempolicy.h enum.  Re-declared
+ * mempolicy mode numbers -- match the linux/mempolicy.h enum.  Re-declared
  * locally to avoid pulling in the libnuma headers.
  */
 #define FT_MPOL_DEFAULT		0
@@ -219,8 +219,8 @@ urcu_static_assert(FT_MAX_NUMA_NODES % (sizeof(unsigned long) * 8) == 0,
 
 /*
  * MADV_HUGEPAGE / MADV_NOHUGEPAGE (asm-generic/mman-common.h values 14/15).
- * glibc only exposes them under _GNU_SOURCE, so define them locally — like
- * the FT_MPOL_* numbers above — to guarantee ft_apply_thp_policy() can advise
+ * glibc only exposes them under _GNU_SOURCE, so define them locally -- like
+ * the FT_MPOL_* numbers above -- to guarantee ft_apply_thp_policy() can advise
  * THP per-arena regardless of the feature-test macros this translation unit
  * was built with.  Without these the madvise() silently compiles out and the
  * per-arena policy is NOT applied on a kernel with transparent_hugepage=always.
@@ -268,7 +268,7 @@ urcu_static_assert(FT_MAX_NUMA_NODES % (sizeof(unsigned long) * 8) == 0,
 #endif
 
 /*
- * Returns 1 if the env var CDS_FT_NUMA_INTERLEAVE=0 is set — a debug
+ * Returns 1 if the env var CDS_FT_NUMA_INTERLEAVE=0 is set -- a debug
  * override telling the library to skip ALL mbind() calls regardless of
  * group policy.  Defers entirely to whatever the kernel / process
  * policy decides.  Returns 0 otherwise.
@@ -353,7 +353,7 @@ int ft_query_process_mempolicy_mode(void)
  *     robin across the calling thread's allowed nodes.  Binding whole
  *     2 MiB spans (rather than the kernel's 4 KiB-fine interleave) keeps
  *     contiguous virtual ranges node-local, which the hardware
- *     prefetcher and NUMA locality favour — this coarse granularity is
+ *     prefetcher and NUMA locality favour -- this coarse granularity is
  *     the measured win.  (FT pages stay 4 KiB; THP is disabled, see
  *     ft_apply_thp_policy.)  Falls back to whole-region MPOL_INTERLEAVE at
  *     native page granularity when @base isn't 2 MiB-aligned, the region
@@ -429,7 +429,7 @@ void ft_apply_interleave(void *base, size_t size,
 		return;
 	}
 
-	/* CDS_FT_NUMA_INTERLEAVE — per-2 MiB-chunk MPOL_BIND round-robin. */
+	/* CDS_FT_NUMA_INTERLEAVE -- per-2 MiB-chunk MPOL_BIND round-robin. */
 	r = syscall(__NR_get_mempolicy, NULL, nodemask, (unsigned long) FT_MAX_NUMA_NODES,
 			NULL, FT_MPOL_F_MEMS_ALLOWED);
 	if (r < 0)
@@ -501,7 +501,7 @@ static inline void ft_apply_thp_policy(void *base __attribute__((unused)),
  * NUMA nodes.  The 2 MiB granularity (rather than the kernel's default
  * 4 KiB-fine interleave) keeps each contiguous 2 MiB virtual span on a
  * single node, which the hardware prefetcher and NUMA locality both
- * favour — this coarse interleave is the real measured win and is
+ * favour -- this coarse interleave is the real measured win and is
  * independent of page size.
  *
  * Transparent hugepages are advised ON for this internal node arena
@@ -810,7 +810,7 @@ struct cds_ft_alloc_arena *cds_ft_arena_create(struct cds_ft_group *ft_group,
 	/*
 	 * Architectures that hardcode page_size in the inline helpers
 	 * (cds_ft_get_page_size) must match the kernel's reported page
-	 * size at runtime.  Reject otherwise — a mismatch would corrupt
+	 * size at runtime.  Reject otherwise -- a mismatch would corrupt
 	 * item-to-metadata address derivation on the read-side fast path.
 	 */
 	if (cds_ft_get_page_size() != FT_PAGE_SIZE_FIXED) {
@@ -1093,7 +1093,7 @@ struct cds_ft_metadata *cds_ft_arena_alloc(struct cds_ft_alloc_arena *arena)
 	/*
 	 * Reuse a freed slot from the most-recently-used range that still
 	 * has one.  partial_ranges is kept MRU-ordered by cds_ft_do_free_item,
-	 * so its head holds the hottest just-freed slot — preserving the
+	 * so its head holds the hottest just-freed slot -- preserving the
 	 * locality the former single per-arena freelist provided.  A range
 	 * sits on partial_ranges exactly while its free_list_head != NULL.
 	 */
@@ -1191,7 +1191,7 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 		/*
 		 * Reserve active but exhausted for this (kind, order): the op's
 		 * manifest under-counted what it allocates.  Surface it in debug
-		 * — the op would otherwise fall through to a fallible allocation
+		 * -- the op would otherwise fall through to a fallible allocation
 		 * here, defeating the reserve's no-fail guarantee.  The report
 		 * names the missing bucket so a manifest can be extended to a new
 		 * shape.  Production falls through (degrading to pre-reserve
@@ -1509,7 +1509,7 @@ void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata)
 }
 
 /*
- * Immediate-free path for items that were never published — no reader
+ * Immediate-free path for items that were never published -- no reader
  * can hold a reference, so call_rcu would only delay arena reuse.
  * Always routes through the synchronous body, regardless of exclusive
  * mode or FT_IMMEDIATE_FREE configuration.  See declaration in
@@ -1579,12 +1579,12 @@ void cds_ft_free_all_arenas(struct cds_ft_group *ft_group)
  *
  * Cross-class buddy splitting: alloc(O) first checks freelist[O];
  * on miss, scans freelist[O+1..MAX] for a larger free block, pops
- * it, and splits it down to order O — each split pushes one
+ * it, and splits it down to order O -- each split pushes one
  * smaller-order half onto the corresponding freelist.
  *
  * Cross-class buddy merging: free(ptr) reads the block's order
  * from the cell map, then checks its buddy (at offset ^ (1 << O))
- * — if the buddy is also free at the same order, removes it from
+ * -- if the buddy is also free at the same order, removes it from
  * its freelist, marks one cell as "interior", merges into an
  * order-(O+1) block, and recurses upward.
  *
@@ -1635,7 +1635,7 @@ int ft_ext_arena_cell_is_free(uint8_t c)
 	return c & 0x01;
 }
 
-/* Doubly-linked freelist node — fits in 16 B (MIN_SLOT_SIZE). */
+/* Doubly-linked freelist node -- fits in 16 B (MIN_SLOT_SIZE). */
 struct cds_ft_external_arena_freenode {
 	struct cds_ft_external_arena_freenode *next;
 	struct cds_ft_external_arena_freenode *prev;

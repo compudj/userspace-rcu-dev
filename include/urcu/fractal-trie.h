@@ -22,7 +22,7 @@
  * tries that rely on NUL or other terminal characters, any byte
  * value may appear at any position in a key. Keys are ordered
  * most-significant-byte first: the byte at offset 0 is most
- * significant and the last byte least significant — i.e.
+ * significant and the last byte least significant -- i.e.
  * lexicographically by byte sequence, the big-endian form of
  * an integer key. This is the order used by ordered iteration
  * and the range queries (<=, >=, <, >). Lookups and traversals
@@ -68,8 +68,8 @@
  * within the same group. The write-side cost is more than a single
  * pointer store (so "O(1)" below means independent of subtree size,
  * not literally one store). Each of these ops also unlinks content
- * from a source trie (graft-swap from the destination too), so —
- * when concurrent readers are possible — it may issue a
+ * from a source trie (graft-swap from the destination too), so --
+ * when concurrent readers are possible -- it may issue a
  * synchronize_rcu to drain readers of the unlinked content before its
  * nodes are reclaimed. What concurrent readers see, however, is
  * published atomically: a reader observes either the complete prior
@@ -99,7 +99,7 @@
  *   prefix is unioned into the destination under a possibly
  *   different prefix, each moved key keeping whatever suffix
  *   follows the prefix. Unlike graft, the destination may already
- *   hold entries under that prefix — the two sub-tries are unioned
+ *   hold entries under that prefix -- the two sub-tries are unioned
  *   and same-key duplicate chains are concatenated. It expresses
  *   re-keying patterns (archive moves, tier promotion, partition
  *   rename) that a detach + graft pair cannot on a fixed-length
@@ -122,8 +122,8 @@
  *
  * Together, these operations serve as the transplant, exchange,
  * and split primitives for bulk operations. A typical bulk-load
- * pattern populates a staging trie offline — with no RCU or
- * locking overhead — and then grafts it into the live trie in
+ * pattern populates a staging trie offline -- with no RCU or
+ * locking overhead -- and then grafts it into the live trie in
  * a single O(1) step, keeping the writer critical section
  * minimal regardless of the number of nodes being moved. A
  * complementary bulk-removal pattern detaches (or graft-swaps)
@@ -154,7 +154,7 @@
  *
  * The library never calls rcu_read_lock() on the caller's behalf.
  * If FEATURE_FT_EXCL_VALIDATE is compiled in, the library
- * *validates* the discipline above and aborts on violation — it
+ * *validates* the discipline above and aborts on violation -- it
  * does not enforce the discipline.  Compliance is the caller's
  * responsibility.  The validator catches:
  *
@@ -204,13 +204,13 @@
  * REFERENCE into the result node, valid only while the read-side lock
  * is held; bind copies it out before that node can be reclaimed.
  *
- * Example A (Continuous lock — fast):
+ * Example A (Continuous lock -- fast):
  * rcu_read_lock();
  * cds_ft_lookup(ft, iter);
  * cds_ft_remove(ft, iter, cds_ft_iter_node(iter)); // node still live; no re-descent
  * rcu_read_unlock();
  *
- * Example B (Dropped lock — snapshot the key, re-derive from it):
+ * Example B (Dropped lock -- snapshot the key, re-derive from it):
  * Bind the key while STILL HOLDING the lock; after the unlock the cached
  * position is gone but the key is retained, so a position-reusing operation
  * re-descends by it.  cds_ft_remove_all takes no node argument and, with the
@@ -227,15 +227,15 @@
  * unlock(&writer_mutex);
  *
  * cds_ft_remove() and cds_ft_replace() take the target node explicitly
- * (@node / @old_node — normally cds_ft_iter_node(iter), the iterator's
+ * (@node / @old_node -- normally cds_ft_iter_node(iter), the iterator's
  * current position) and dereference it directly via @node->prev, with no
  * re-descent.  The RCU read-side lock must therefore be held CONTINUOUSLY
  * from when that node was obtained until the call, so the node has not
  * been reclaimed.  After a dropped lock the node is stale: re-look it up
- * (under the lock) and pass the fresh node — bind resets the iterator's
+ * (under the lock) and pass the fresh node -- bind resets the iterator's
  * cached position but cannot refresh a node you already hold.
  *
- * Note: CDS_FT_ITER_UNCACHED iterators do not require this — the cached
+ * Note: CDS_FT_ITER_UNCACHED iterators do not require this -- the cached
  * position is discarded (and any referenced key snapshotted) automatically
  * after each operation.
  *
@@ -247,7 +247,7 @@
  * full grace period has elapsed since the position was populated the
  * cached pointer may reference freed memory, so the program aborts
  * with a diagnostic.  Since struct cds_ft_iter is opaque, this option
- * does not affect the application ABI — only the library needs to be
+ * does not affect the application ABI -- only the library needs to be
  * rebuilt.
  *
  * CDS_FT_ITER_UNCACHED:
@@ -256,7 +256,7 @@
  * returns. Every subsequent operation performs a fresh top-down
  * traversal from the root for the current key. The RCU read-side lock
  * only needs to be held during each individual operation and while
- * accessing the returned node — it may be dropped between operations.
+ * accessing the returned node -- it may be dropped between operations.
  *
  * This mode is suited for iteration patterns where the caller needs
  * to drop the RCU read-side lock between steps (e.g. to perform
@@ -383,7 +383,7 @@ enum cds_ft_numa_policy {
 	 *
 	 * That last case is why this is NOT plain first-touch: a Fractal Trie
 	 * is a shared, read-mostly, random-access structure, so first-touch
-	 * piles it onto the builder's node — one memory controller bottlenecks
+	 * piles it onto the builder's node -- one memory controller bottlenecks
 	 * every other node's readers, and Linux auto-NUMA-balancing thrashes
 	 * the unbound pages (PTE-scan + TLB-shootdown storms).  Interleaving the
 	 * library's OWN arenas (it never touches application memory) avoids that
@@ -408,7 +408,7 @@ enum cds_ft_numa_policy {
 	CDS_FT_NUMA_INTERLEAVE,
 
 	/*
-	 * CDS_FT_NUMA_LOCAL: explicit first-touch placement — pages
+	 * CDS_FT_NUMA_LOCAL: explicit first-touch placement -- pages
 	 * land on whichever NUMA node first faults them (typically the
 	 * writer thread).  Mechanically the library skips its own mbind();
 	 * the distinction from DEFAULT is that LOCAL forces first-touch even
@@ -450,7 +450,7 @@ enum cds_ft_iter_cache_mode {
 	 *   fresh top-down traversal from the root for the current key.
 	 *   The RCU read-side lock must be held only during each
 	 *   individual operation and while accessing the returned
-	 *   node — it may be dropped between operations.
+	 *   node -- it may be dropped between operations.
 	 *
 	 *   This mode is suitable for iteration patterns where the
 	 *   caller needs to drop the RCU read-side lock between steps
@@ -582,7 +582,7 @@ struct cds_ft_external_arena_attr;
  *   first touch, so a small / sparse trie pays a ~2 MiB RSS floor per range.
  *
  * CDS_FT_OPTIMIZE_RSS: advise 4 KiB pages (MADV_NOHUGEPAGE).  No hugepage
- *   floor — a small or sparse trie faults only the pages it touches — at the
+ *   floor -- a small or sparse trie faults only the pages it touches -- at the
  *   cost of more DTLB pressure once the working set is large.  Choose this for
  *   workloads with many small tries / arenas.
  */
@@ -657,7 +657,7 @@ void *cds_ft_external_arena_alloc(struct cds_ft_external_arena *arena,
  * reuse by subsequent allocations.
  *
  * Caller must ensure no RCU reader still references @ptr (e.g.
- * via synchronize_rcu after removal from any published trie) — the
+ * via synchronize_rcu after removal from any published trie) -- the
  * arena does not defer reclamation.
  */
 void cds_ft_external_arena_free(struct cds_ft_external_arena *arena,
@@ -1474,7 +1474,7 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  *            lock continuously from when @old_node was obtained until this
  *            call (concurrent mode; in exclusive mode the caller's mutual
  *            exclusion replaces that).  After a dropped lock, re-look up
- *            @old_node first — cds_ft_iter_bind_key() snapshots the
+ *            @old_node first -- cds_ft_iter_bind_key() snapshots the
  *            iterator's key to resume across the dropped lock, but
  *            cannot refresh a node you already hold.
  * @new_node: Node to insert in place of @old_node. Must be
@@ -1510,7 +1510,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  *        read-side lock continuously from when @node was obtained until
  *        this call (concurrent mode; in exclusive mode the caller's
  *        mutual exclusion replaces that).  After a dropped lock, re-look
- *        up @node first — cds_ft_iter_bind_key() snapshots the
+ *        up @node first -- cds_ft_iter_bind_key() snapshots the
  *        iterator's key to resume across the dropped lock, but cannot
  *        refresh a node you already hold.
  *
@@ -1595,7 +1595,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * trie has no concurrent readers or writers during population, no RCU
  * read-side lock and no mutual exclusion are needed for the inserts.
  * Concurrent RCU readers see either the pre-graft state or the
- * post-graft state, never a partial view — so the duration of writer
+ * post-graft state, never a partial view -- so the duration of writer
  * mutual exclusion on the main trie is short and bounded (independent
  * of the number of nodes being grafted, modulo the O(depth) descent and
  * key-count propagation). This pattern is well suited for batch loading,
@@ -1629,7 +1629,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * trie in a single O(1) operation and drains it before returning:
  * the operation performs one internal grace period, after which no
  * concurrent reader can still hold a reference to any node in the
- * detached sub-trie. The returned trie is therefore purely local —
+ * detached sub-trie. The returned trie is therefore purely local --
  * the caller can iterate it and free all external nodes directly,
  * with no further synchronize_rcu and no grace period per individual
  * node. This reduces the cost of removing N nodes from N grace
@@ -1642,7 +1642,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *   unlock(&writer_mutex);
  *
  *   // Phase 2: detach already drained in-flight readers and returned
- *   // a purely local trie, so free directly — no synchronize_rcu here.
+ *   // a purely local trie, so free directly -- no synchronize_rcu here.
  *   while (cds_ft_lookup_first(detached, iter) == CDS_FT_STATUS_OK) {
  *           struct cds_ft_node *node, *p;
  *           cds_ft_remove_all(detached, iter, &node);
@@ -1814,7 +1814,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * Atomicity: the entire merge is published to concurrent RCU
  * readers of @dst_ft as a single atomic transition.  A reader
  * sees either the complete pre-merge @dst_ft or the complete
- * post-merge @dst_ft — never a partially-applied merge, and
+ * post-merge @dst_ft -- never a partially-applied merge, and
  * never a half-spliced duplicate chain at any key.  Same-key
  * duplicate chains under @key are concatenated.  On an ordered-list
  * group the moved keys' ordered-list links are spliced as part of
@@ -2240,7 +2240,7 @@ enum cds_ft_status cds_ft_group_key_map(const struct cds_ft_group *group, uint8_
  * walk (cds_ft_cell_next_batch / cds_ft_cell_prev_batch and the
  * cds_ft_for_each_batched_rcu macros): a list-off group has no cell list to
  * step, so generic code should branch to cds_ft_for_each_rcu() when this
- * returns false.  (Note: cds_ft_node_get_key() is broader — it also works on a
+ * returns false.  (Note: cds_ft_node_get_key() is broader -- it also works on a
  * list-off trie that has an in-leaf key, since materializing ONE key needs no
  * stepping.)
  */
@@ -2341,7 +2341,7 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
  * Requirement: on 64-bit architectures where SPECULATIVE uses the
  * skip-compressed encoding (which stores data in unused high pointer
  * bits), the external node pointers (struct cds_ft_node *) stored in
- * the trie must not carry metadata in their upper bits — strip any
+ * the trie must not carry metadata in their upper bits -- strip any
  * pointer authentication (AArch64 PAC) or memory tagging (MTE)
  * signature before passing the pointer to the insertion API.
  *
@@ -2359,14 +2359,14 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
  *                                                inequality lookups.
  * @attr: Fractal Trie group attributes.
  * @key_offset: Byte offset from the (struct cds_ft_node *) stored in the
- *              trie to the start of the caller-stored key bytes — the
+ *              trie to the start of the caller-stored key bytes -- the
  *              same value passed to cds_ft_speculative_lookup_key,
  *              typically offsetof(user_struct, key_field) -
  *              offsetof(user_struct, ft_node_field).
  *
  * KEY REPRESENTATION CONTRACT: the bytes at @key_offset must be exactly
  * the bytes the application passed to cds_ft_insert() / the lookup APIs
- * for this node — NOT the application's native scalar.  For integer
+ * for this node -- NOT the application's native scalar.  For integer
  * keys that is the big-endian form emitted by the cds_ft_u64_to_key()
  * API family, not the host-order integer.  The library applies the group's
  * key map to these bytes when copying them into the iterator's result
@@ -2382,8 +2382,8 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
  * skip-compressed-capable arch (64-bit).  When provided, the
  * ordered-inequality lookups (cds_ft_lookup_ge/gt/le/lt,
  * cds_ft_next/prev) capture their result key by copying it from the
- * matched leaf — which already stores the full key for caller-side
- * validation — which is faster than rebuilding it from the trie
+ * matched leaf -- which already stores the full key for caller-side
+ * validation -- which is faster than rebuilding it from the trie
  * structure during descent.  Because those lookups read the bytes from
  * the live leaf, the key bytes at @key_offset must be present before
  * the node is inserted and must not change while the node is in the
@@ -2392,7 +2392,7 @@ enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(
  *
  * When not set (or on an EAGER / non-skip-compressed group) the
  * inequality lookups rebuild the key from the trie structure instead
- * — same result, without the leaf-copy fast path.  Key length is
+ * -- same result, without the leaf-copy fast path.  Key length is
  * taken from the group's fixed key_len (or the leaf's trie depth for
  * variable-length keys), so no separate length offset is required.
  *
@@ -2465,7 +2465,7 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  * Defaults to CDS_FT_NUMA_DEFAULT when the group attr is freshly
  * created: the library honors any explicit per-process NUMA policy but
  * interleaves its own arenas when none is set (see the enum doc for the
- * full rationale — first-touch is a performance cliff for a shared,
+ * full rationale -- first-touch is a performance cliff for a shared,
  * random-access trie).  Applications can force a placement via INTERLEAVE
  * or LOCAL.
  *
@@ -2490,13 +2490,13 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  *                 (single-threaded / single-node access).
  *
  * The CDS_FT_NUMA_INTERLEAVE=0 environment variable, if set, forces
- * the library to skip mbind regardless of the group's policy —
+ * the library to skip mbind regardless of the group's policy --
  * useful for debugging without recompiling.  Otherwise the group's
  * policy takes effect.
  *
  * No effect on caller-provided external node storage
  * (cds_ft_external_arena_create has no group context; it applies
- * CDS_FT_NUMA_DEFAULT — honors an explicit process policy, interleaves
+ * CDS_FT_NUMA_DEFAULT -- honors an explicit process policy, interleaves
  * otherwise).
  *
  * Returns CDS_FT_STATUS_OK on success,
@@ -2582,7 +2582,7 @@ void cds_ft_make_exclusive(struct cds_ft *ft);
  *
  * After this call, graft / graft_swap operations with this trie as
  * source must drain readers (one grace period) before moving the
- * content elsewhere — unlike an exclusive trie, which skips that
+ * content elsewhere -- unlike an exclusive trie, which skips that
  * drain.
  */
 void cds_ft_make_concurrent(struct cds_ft *ft);
@@ -2644,7 +2644,7 @@ bool cds_ft_verify_at_mutation_enabled(void);
  *   period == 1 : verify every mutation (the historical
  *                 -DFEATURE_FT_VERIFY_AT_MUTATION cadence; this is
  *                 the default at cds_ft_create() time);
- *   period >  1 : verify every @period mutations — useful on large
+ *   period >  1 : verify every @period mutations -- useful on large
  *                 tries where O(N) per mutation is impractical.
  *
  * Setting a new period resets the cadence, so the next verify lands
@@ -2652,7 +2652,7 @@ bool cds_ft_verify_at_mutation_enabled(void);
  *
  * Returns CDS_FT_STATUS_OK on success, or
  * CDS_FT_STATUS_NOT_SUPPORTED when the library was built without
- * FEATURE_FT_VERIFY_AT_MUTATION — the call surfaces the mismatch
+ * FEATURE_FT_VERIFY_AT_MUTATION -- the call surfaces the mismatch
  * loudly so a test that relies on the verify cadence cannot
  * accidentally run with verify-at-mutation compiled out.  Use
  * cds_ft_verify_at_mutation_enabled() to gate the call.
@@ -2670,7 +2670,7 @@ enum cds_ft_status cds_ft_verify_at_mutation_period_set(struct cds_ft *ft,
  *
  * Returns CDS_FT_STATUS_OK on success, or
  * CDS_FT_STATUS_NOT_SUPPORTED when the library was built without
- * FEATURE_FT_VERIFY_AT_MUTATION — distinguishing build-disabled
+ * FEATURE_FT_VERIFY_AT_MUTATION -- distinguishing build-disabled
  * from a runtime period == 0.
  */
 enum cds_ft_status cds_ft_verify_at_mutation_period_get(
@@ -2806,16 +2806,16 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter);
  *
  * For CDS_FT_ITER_CACHED iterators this must be called if the RCU read-side
  * lock is dropped between operations on the same iterator, both to prevent
- * use-after-free of the cached node AND — in a speculative skip-compressed
+ * use-after-free of the cached node AND -- in a speculative skip-compressed
  * group configured with a leaf-key offset
  * (cds_ft_group_attr_set_speculative_key_offset()) or the library-owned
- * ordered list (cds_ft_group_attr_set_ordered_list()) — because the current
+ * ordered list (cds_ft_group_attr_set_ordered_list()) -- because the current
  * key after an ordered lookup (cds_ft_lookup_first / cds_ft_next / the
  * relational lookups) is held as a LIVE REFERENCE into the matched leaf, valid
  * only while that lock is held.  Bind copies it out WHILE STILL HOLDING the
  * lock, so the iterator no longer depends on the soon-to-be-reclaimable leaf.
  *
- * CDS_FT_ITER_UNCACHED iterators do not require this call — the cached
+ * CDS_FT_ITER_UNCACHED iterators do not require this call -- the cached
  * position is discarded (and any referenced key snapshotted) automatically
  * after each operation.
  *
@@ -2823,8 +2823,8 @@ void cds_ft_iter_reset(struct cds_ft_iter *iter);
  * still returns the bound key, and the next cds_ft_next() in a fresh critical
  * section re-descends from the root and yields the bound key's successor
  * (robust even if the bound key was removed in the meantime).  Note that bind
- * also drops the current result — cds_ft_iter_node() returns NULL until that
- * re-descent — whereas a plain uncached iterator keeps the last operation's
+ * also drops the current result -- cds_ft_iter_node() returns NULL until that
+ * re-descent -- whereas a plain uncached iterator keeps the last operation's
  * result node readable until its next operation.
  *
  * Piecewise iteration:
@@ -2901,15 +2901,15 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter);
  * @result_key_max_len: Size of the @result_key buffer.
  * @result_key_len: Length of the key written (output).
  *
- * Reconstructs @node's key without an iterator object — the same key
+ * Reconstructs @node's key without an iterator object -- the same key
  * cds_ft_iter_get_key() would return.  The key comes from an in-leaf key when
  * the group declares a speculative key offset, otherwise from the trie
  * structure (ordered-list groups only).
  *
  * RCU CONTRACT: @node, and the trie structure its key is read from, are valid
  * only while the RCU read-side lock that produced @node is held CONTINUOUSLY.
- * Unlike an iterator — which an UNCACHED caller can carry across a critical
- * section because it materializes the key into its own storage — a bare node
+ * Unlike an iterator -- which an UNCACHED caller can carry across a critical
+ * section because it materializes the key into its own storage -- a bare node
  * pointer must NOT outlive its read-side critical section.  This is the
  * within-CS companion to the iterator, for a node from a point lookup; for a
  * batched ordered scan use the cell batch (cds_ft_cell_get_key()) instead.
@@ -2930,8 +2930,8 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
  * @cursor: Cell to start AT (inclusive); NULL starts at the list minimum.
  * @buf: Output array of up to @cap opaque cell handles, in ascending key order.
  * @cap: Capacity of @buf.
- * @count: Output — number of cells written to @buf (0 at the end of the walk).
- * @next_cursor: Output — the cell to pass as @cursor next, or NULL at the end.
+ * @count: Output -- number of cells written to @buf (0 at the end of the walk).
+ * @next_cursor: Output -- the cell to pass as @cursor next, or NULL at the end.
  *
  * Walks @ft's ordered cell list without an iterator object, emitting opaque CELL
  * handles a batch at a time so the per-call boundary is paid once per @cap cells.
@@ -2993,7 +2993,7 @@ size_t cds_ft_cell_node_offset(void);
  * cached @node_offset from cds_ft_cell_node_offset().  A MACRO (not an inline) so
  * rcu_dereference resolves in the CALLER's translation unit, where the RCU
  * flavor is included.  The cell's node pointer can change under concurrent
- * mutation, so this is an rcu_dereference snapshot — valid old-or-new under a
+ * mutation, so this is an rcu_dereference snapshot -- valid old-or-new under a
  * continuously held read lock, like the iterator's node read.  @cell and
  * @node_offset are each evaluated once.
  */
@@ -3244,7 +3244,7 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
  * One-shot convenience wrapper around cds_ft_compact_begin/step/end: the
  * caller must exclude concurrent writers on @ft for the whole call (the same
  * mutual-exclusion contract as the other mutators). Concurrent RCU readers are
- * permitted throughout, and other tries sharing the group keep mutating — the
+ * permitted throughout, and other tries sharing the group keep mutating -- the
  * group stays online.
  *
  * Best-effort with respect to memory pressure: if an allocation fails while

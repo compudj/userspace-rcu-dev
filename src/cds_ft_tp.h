@@ -13,7 +13,7 @@
  * link with -llttng-ust -llttng-ust-common.
  *
  * Keys appear in tracepoint payloads as byte sequences
- * (lttng_ust_field_sequence_hex) — the trie is byte-oriented and
+ * (lttng_ust_field_sequence_hex) -- the trie is byte-oriented and
  * keys may have arbitrary length.
  *
  * Inequality-lookup mode, operation status, and compressed-handler
@@ -314,7 +314,7 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, root_publish,
 /*
  * Structural edge change: a parent node's child slot at ordinal
  * byte `key_byte` is now `child`.  Fired after ft_node_set_nth()
- * and ft_node_replace_ptr() succeed — these are the functions
+ * and ft_node_replace_ptr() succeed -- these are the functions
  * where the real (parent, key_byte, child, parent_level) is
  * unambiguously known.  child == NULL means the slot was cleared
  * (detach / removal).  This is the tracepoint a consumer should
@@ -660,7 +660,7 @@ LTTNG_UST_TRACEPOINT_EVENT_INSTANCE(cds_ft, ft_status_event_class, cds_ft,
 	LTTNG_UST_TP_ARGS(int, status))
 
 /*
- * Rank/skip ops — the "n" parameter is a numeric count, not a key.
+ * Rank/skip ops -- the "n" parameter is a numeric count, not a key.
  */
 LTTNG_UST_TRACEPOINT_EVENT(cds_ft, lookup_nth_enter,
 	LTTNG_UST_TP_ARGS(unsigned long, nth),

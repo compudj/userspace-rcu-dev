@@ -105,9 +105,9 @@
 /*
  * Pointer tag encoding (bits 0-1):
  *
- *   (ptr & 0b011) == 0b00   →  external node (leaf) or NULL
- *   (ptr & 0b001) == 0b001  →  internal node (bit 0 set), bits 1-3 = type index
- *   (ptr & 0b011) == 0b010  →  compressed path node
+ *   (ptr & 0b011) == 0b00   ->  external node (leaf) or NULL
+ *   (ptr & 0b001) == 0b001  ->  internal node (bit 0 set), bits 1-3 = type index
+ *   (ptr & 0b011) == 0b010  ->  compressed path node
  *
  * Internal nodes always have bit 0 set; the type index encoding lives
  * in bits 1-3.  Compressed nodes use bit 1 with bit 0 clear (16-byte
@@ -116,7 +116,7 @@
 #define FT_INTERNAL_BITS	1
 #define FT_INTERNAL_MASK	(1U << 0)
 #define FT_COMPRESSED_MASK	(1U << 1)
-#define FT_TAG_MASK		(FT_COMPRESSED_MASK | FT_INTERNAL_MASK)	/* 0b011 — for compressed ptr unmasking */
+#define FT_TAG_MASK		(FT_COMPRESSED_MASK | FT_INTERNAL_MASK)	/* 0b011 -- for compressed ptr unmasking */
 
 /*
  * This is followed by a number of bits reserved to represent the child
@@ -341,7 +341,7 @@
  *
  * So the items are one contiguous 2 MiB run (vs the default 4 KiB items page
  * diluted by an interleaved metadata page every 8 KiB), and the metadata array
- * starts at the CONSTANT offset base + 2 MiB — no per-order offset table, the
+ * starts at the CONSTANT offset base + 2 MiB -- no per-order offset table, the
  * hot-path item->metadata / item->bitmap helpers are the default formulas with
  * page_size replaced by FT_FAR_MACRO_SIZE.
  */
@@ -555,7 +555,7 @@ void ft_writer_scope_verify(struct cds_ft *ft);
  * no normal use of @var until the matching reload, gcc is free to
  * recycle the register that held @var.
  *
- * FT_RELOAD_FROM_STACK(var) is the matching reload — a volatile
+ * FT_RELOAD_FROM_STACK(var) is the matching reload -- a volatile
  * load from @var's stack slot into a fresh register.
  *
  * The two MUST be paired.  Every code path that reaches the
@@ -564,7 +564,7 @@ void ft_writer_scope_verify(struct cds_ft *ft);
  *
  * Implementation: an empty inline asm with `"=m"`/`"=r"`
  * constraints would declare the memory or register as touched
- * but emit no instructions — gcc's data-flow then folds the
+ * but emit no instructions -- gcc's data-flow then folds the
  * pair away and keeps @var live across the gap, defeating the
  * purpose.  The volatile cast emits the actual store and load.
  *
@@ -605,7 +605,7 @@ struct cds_ft_alloc_arena;
  *   offset 28: 4-byte tail padding
  *
  * In cds_ft_metadata_alloc, rcu_head is a separate field placed
- * before the metadata union — no overlap with metadata fields.
+ * before the metadata union -- no overlap with metadata fields.
  * All metadata fields remain valid throughout the RCU grace period.
  */
 struct cds_ft_metadata {
@@ -634,10 +634,10 @@ struct cds_ft_metadata {
 	unsigned long nr_keys;
 
 	/*
-	 * Packed bitfield — small fields in a single uint32_t.
+	 * Packed bitfield -- small fields in a single uint32_t.
 	 *
 	 * nr_child:               9 bits (max 256)
-	 * parent_slot_offset:     8 bits — pointer-stride offset of this
+	 * parent_slot_offset:     8 bits -- pointer-stride offset of this
 	 *                         node's slot within its parent node body
 	 *                         (byte_offset / sizeof(void *)).  Maintained
 	 *                         for every internal/compressed node (not just
@@ -655,7 +655,7 @@ struct cds_ft_metadata {
 	/*
 	 * A 2 MiB far macro-block holds far more than 256 items (e.g. ~18 700
 	 * order-5 nodes), overflowing the FT_ALLOC_INDEX_BITS (8-bit) packed
-	 * field.  Store alloc_index in its own word — it lands in the struct's
+	 * field.  Store alloc_index in its own word -- it lands in the struct's
 	 * existing 4-byte tail padding, so the struct stays 32 B and the hot
 	 * descent bitfield (nr_child/parent_slot_offset) is untouched.  24 bits
 	 * (16 M) is ample for a 2 MiB block; the top 8 bits carry incoming_byte
@@ -695,7 +695,7 @@ struct cds_ft_metadata {
  * cn->child can point to any node type: internal, compressed,
  * or external.  An external child means a key terminates at the
  * end of the compressed path.  However, the compressed node's
- * metadata->external_nodes must NOT be used — variable-length key
+ * metadata->external_nodes must NOT be used -- variable-length key
  * entries belong on internal nodes (which can have
  * metadata->external_nodes), or as child pointer of a compressed
  * node.
@@ -903,7 +903,7 @@ struct cds_ft_group {
  * Per-API lookup function pointers cached on struct cds_ft so the
  * public entry points dispatch via one indirect tail-call to a
  * fully-specialized inner (no per-call runtime branch on group
- * shape — the library picks the right inner once at cds_ft_create
+ * shape -- the library picks the right inner once at cds_ft_create
  * and caches it here).  See ft_install_lookup_ops in fractal-trie.c.
  *
  * Each pointer's signature matches the corresponding cds_ft_*
@@ -949,7 +949,7 @@ struct cds_ft {
 	struct cds_ft_inode_flag *root;		/* Root node (arena-allocated, always present, always internal). */
 
 	/*
-	 * Specialized lookup dispatch pointers — installed at
+	 * Specialized lookup dispatch pointers -- installed at
 	 * cds_ft_create based on group flags.  See the typedef
 	 * comment above.  Placed near @root so a single cache-line
 	 * fetch on lookup entry serves the descent.
@@ -1129,7 +1129,7 @@ void ft_excl_writer_enter(struct cds_ft *ft)
 			ft->excl_writer_depth++;
 			return;
 		}
-		ft_excl_abort("cds_ft=%p: writer conflict — owner 0x%lx, entering thread 0x%lx\n",
+		ft_excl_abort("cds_ft=%p: writer conflict -- owner 0x%lx, entering thread 0x%lx\n",
 			(void *) ft, prev, self);
 	}
 	ft->excl_writer_depth = 1;
@@ -1256,7 +1256,7 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
  * backward from (range base + 2*page_size) on bitmap-bearing arenas.
  *
  * The two cache lines most often prefetched from a tagged child
- * pointer — the item's metadata and (for bitmap types) its bitmap —
+ * pointer -- the item's metadata and (for bitmap types) its bitmap --
  * are derivable with pure pointer arithmetic given the item's order.
  * The helpers below live in this header so that the prefetch-hint
  * path can compute their addresses inline, without a cross-TU call
@@ -1626,7 +1626,7 @@ static inline void ft_delay_reader(void) { }
  * an invalid cached iterator path.  When enabled, three complementary
  * helpers track grace-period state inside the iterator:
  *
- *  iter_debug_path_snapshot() — unconditionally captures a fresh
+ *  iter_debug_path_snapshot() -- unconditionally captures a fresh
  *      grace-period poll state via the RCU flavor's
  *      update_start_poll_synchronize_rcu.  Called once at the entry of
  *      every fresh-population operation (lookup, longest-match lookup,
@@ -1634,15 +1634,15 @@ static inline void ft_delay_reader(void) { }
  *      overwrites the snapshot, an iterator that is reused across
  *      distinct RCU read-side critical sections gets a current baseline.
  *
- *  iter_debug_path_check() — polls the existing snapshot via the
+ *  iter_debug_path_check() -- polls the existing snapshot via the
  *      flavor's update_poll_state_synchronize_rcu.  Called at
  *      continuation entry points that consume a previously populated
  *      cached path (inequality lookup fast path, replace, remove).  If
  *      a full grace period has elapsed since the snapshot, the RCU
  *      read-side lock must have been dropped and the cached path is
- *      invalid — this is reported and abort() is called.
+ *      invalid -- this is reported and abort() is called.
  *
- *  iter_debug_path_update() — invalidates the snapshot when the path
+ *  iter_debug_path_update() -- invalidates the snapshot when the path
  *      becomes invalid (node not found / end of traversal).  It never
  *      captures a new snapshot; the one taken at the operation's entry
  *      persists as long as the path remains valid, giving a tighter
