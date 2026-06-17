@@ -158,24 +158,6 @@ ft_delay_init(void)
 #define abs_int(a)	((int) (a) > 0 ? (int) (a) : -((int) (a)))
 #endif
 
-#define CDS_FT_LEN_ERROR		SIZE_MAX
-
-#ifdef FEATURE_FT_EXCL_VALIDATE
-#include <stdarg.h>
-__attribute__((noreturn, format(printf, 1, 2)))
-void ft_excl_abort(const char *fmt, ...)
-{
-	va_list ap;
-
-	fprintf(stderr, "FT access-discipline violation: ");
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-	fflush(stderr);
-	abort();
-}
-#endif
-
 struct cds_ft_group_attr {
 	size_t key_len;
 	size_t max_key_len;

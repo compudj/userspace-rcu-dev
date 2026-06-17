@@ -89,6 +89,15 @@
 #include <assert.h>
 
 /*
+ * Internal sentinel returned by ft_key_len() when a key-length argument
+ * cannot be resolved (e.g. CDS_FT_LEN_DEFAULT passed to a variable-length
+ * group).  Numerically equal to the public CDS_FT_LEN_DEFAULT /
+ * CDS_FT_LEN_VARIABLE sentinels; it is distinguished by being an internal
+ * resolution *result* rather than a caller-supplied argument.
+ */
+#define CDS_FT_LEN_ERROR	SIZE_MAX
+
+/*
  * If the internal bit is set in a pointer, it points to an internal
  * Fractal Trie node, else it points to a node outside of the Fractal Trie.
  * This can be used for variable length keys to identify the end of key.
@@ -1093,8 +1102,18 @@ struct ft_excl_reader_scope {
 
 #ifdef FEATURE_FT_EXCL_VALIDATE
 
-__attribute__((noreturn, format(printf, 1, 2)))
-void ft_excl_abort(const char *fmt, ...);
+/*
+ * Report an access-discipline violation and abort.  A macro rather than a
+ * vfprintf wrapper: the caller's varargs forward straight to fprintf (which
+ * format-checks them via its own attribute), and abort() keeps it noreturn.
+ */
+#define ft_excl_abort(...)						\
+	do {								\
+		fprintf(stderr, "FT access-discipline violation: "	\
+			__VA_ARGS__);					\
+		fflush(stderr);						\
+		abort();						\
+	} while (0)
 
 static inline
 void ft_excl_writer_enter(struct cds_ft *ft)
