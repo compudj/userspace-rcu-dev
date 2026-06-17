@@ -1707,4 +1707,119 @@ enum ft_tp_node_kind {
 	FT_TP_NODE_UNKNOWN		= 13,
 };
 
+
+/*
+ * Central node-type definitions and small helpers moved here from the
+ * fractal-trie.c top matter so the master file is just the assembly unit.
+ * (The ft_types[] data table itself stays a single-TU definition in
+ * fractal-trie/ft-tables.h -- it cannot live in this multi-TU header.)
+ */
+#ifndef abs_int
+#define abs_int(a)	((int) (a) > 0 ? (int) (a) : -((int) (a)))
+#endif
+
+struct cds_ft_group_attr {
+	size_t key_len;		/* Fixed key length in bytes, or CDS_FT_LEN_VARIABLE. */
+	size_t max_key_len;	/* Maximum key length allowed (bounds key buffers). */
+	struct cds_ft_key_map key_map;	/* Per-position key<->ordinal byte remap; see cds_ft_group_attr_set_key_map. */
+	unsigned int flags;	/* CDS_FT_FLAG_* creation-time flags. */
+	bool speculative;	/* See cds_ft_lookup_optimization. */
+	/*
+	 * Byte offset from the (struct cds_ft_node *) stored in the trie to
+	 * the start of the caller-stored key bytes, and whether it was
+	 * configured.  Lets the speculative inequality path copy a result
+	 * key from the leaf instead of rebuilding it from compressed-node
+	 * bytes.  See cds_ft_group_attr_set_speculative_key_offset.
+	 */
+	size_t speculative_key_offset;
+	bool speculative_key_offset_set;
+	/*
+	 * Offset from the (struct cds_ft_node *) to a size_t holding the leaf's
+	 * key length in the caller's leaf, and whether configured.  Lets the
+	 * ordered-list fast path materialize a variable-length result key from
+	 * the leaf without the descent's per-level length computation.  See
+	 * cds_ft_group_attr_set_key_len_offset.
+	 */
+	size_t key_len_offset;
+	bool key_len_offset_set;
+	/*
+	 * Enable the library-owned ordered sibling list (FEATURE_FT_ORD_CELL):
+	 * order links live in library-owned ordinal cells, not the app leaf.
+	 * See cds_ft_group_attr_set_ordered_list.
+	 */
+	bool ordered_list_set;
+	enum cds_ft_numa_policy numa_policy;	/* See cds_ft_group_attr_set_numa_policy. */
+	enum cds_ft_optimize optimize;		/* See cds_ft_group_attr_set_optimize. */
+};
+
+struct cds_ft_attr {
+	bool exclusive;		/* Exclusive (single-writer, no concurrent readers) vs concurrent; see cds_ft_attr_set_exclusive. */
+};
+
+enum cds_ft_type_class {
+	FT_POPCOUNT = 0,	/* Popcount-bitmap: popcount_1l / popcount_2l */
+	FT_PIGEON = 1,		/* Pigeon: direct indexed */
+	/* Leaf nodes are implicit from their height in the trie */
+	FT_NR_TYPES = 2,
+
+	FT_NULL,	/* not an encoded type, but keeps code regular */
+};
+
+#define ft_type_is_popcount(tc)	((tc) == FT_POPCOUNT)
+#define ft_type_is_pigeon(tc)	((tc) == FT_PIGEON)
+
+struct cds_ft_type {
+	enum cds_ft_type_class type_class;
+	uint16_t min_child;		/* minimum number of children: 1 to 256 */
+	uint16_t max_child;		/* maximum number of children: 1 to 256 */
+	uint16_t order;			/* node size is (1 << order), in bytes */
+	bool bitmap;			/* allocate bitmap */
+	bool popcount_2l;		/* 2-level popcount-bitmap layout */
+	bool popcount_1l;		/* 1-level byte popcount layout */
+};
+
+/*
+ * The cds_ft_inode contains the compressed node data needed for
+ * the read-side traversal. Because the actual layout depends on the
+ * node's type_class (Popcount or Pigeon), the struct uses a single
+ * pointer-aligned byte array. The allocator sizes this array dynamically
+ * based on the type's order (1 << type->order).
+ *
+ * The allocator guarantees that each node is naturally aligned
+ * to its exact size boundary. For example, a node with order 6 (64 bytes)
+ * is guaranteed to be aligned on a 64-byte boundary in memory. This ensures
+ * optimal cache-line alignment, prevents false sharing, and guarantees that
+ * a node never straddles a memory page boundary. This ensures that accessing
+ * a single node hits at most one TLB entry, minimizing read-side latency.
+ *
+ * Memory Layouts by Type Class:
+ *
+ * 1. FT_POPCOUNT (two variants, popcount_2l and popcount_1l):
+ * - popcount_2l: header with a root_bm + per-chunk sub_bm packed
+ *   in a fixed-size header (8 B / 12 B / 16 B depending on
+ *   scan_<rootbits>_<subbits> variant), followed by an array of
+ *   child pointers indexed by bitmap rank.
+ * - popcount_1l: 32 B flat 256-bit bitmap header, followed by an
+ *   array of child pointers indexed by bitmap rank.
+ *
+ * 2. FT_PIGEON:
+ * - A direct, flat array of up to 256 (struct cds_ft_inode_flag *) pointers.
+ * - No key array is stored inside the node -- the key is implicit
+ *   from the pointer's array index.
+ * - Because 'data' is explicitly pointer-aligned, it can be safely cast
+ *   directly to (struct cds_ft_inode_flag **).
+ *
+ * Note: For all configurations, the true total number of children is
+ * strictly maintained in the out-of-line metadata (struct cds_ft_metadata).
+ *
+ * Note on array sizing: The size of this array is the maximum possible
+ * node size (Pigeon: 256 pointers) because C99 don't allow Flexible
+ * Array Members as first fields within a structure.
+ */
+
+struct cds_ft_inode {
+	uint8_t data[FT_ENTRY_PER_NODE * sizeof(struct cds_ft_inode_flag *)]
+		__attribute__((__aligned__(sizeof(struct cds_ft_inode_flag *))));
+};
+
 #endif /* _URCU_FT_INTERNAL_H */
