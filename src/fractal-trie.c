@@ -219,21 +219,36 @@ struct cds_ft_type {
 };
 
 /*
- * Iteration on the array to find the right node size for the number of
- * children stops when it reaches .max_child == 256 (this is the largest
- * possible node size, which contains 256 children).
- * The min_child overlaps with the previous max_child to provide an
- * hysteresis loop to reallocation for patterns of cyclic add/removal
- * within the same node.
- * The node the index within the following arrays is represented on 3
- * bits. It identifies the node type, min/max number of children, and
- * the size order.
- */
-
-/*
- * The smallest allocation order we can use is 4:
- * - 1 bit is reserved for internal vs external flag,
- * - 3 bits are reserved to encode the node type.
+ * Node-size tiers (the ft_types[] arrays below) and the tag budget that
+ * bounds them.
+ *
+ * Each node carries a type index naming its tier: the [min_child, max_child]
+ * child-count range it serves, its type class, and its size order (node size
+ * == 1 << order bytes).  Picking a tier on add/remove is NOT a search of the
+ * array: find_nearest_type_index() STEPS from the node's current tier to the
+ * adjacent one -- up one tier when a child add exceeds max_child, down one when
+ * a remove drops below min_child -- so the common +/- 1-child change moves at
+ * most one tier (it loops further only when the child count jumps by more).
+ * Each tier's min_child overlaps the previous tier's max_child: an intentional
+ * hysteresis that damps reallocation under cyclic add/remove within a node.
+ * The top tier has max_child == 256 (a full node); the bottom tier (index 0)
+ * holds the smallest nodes, including the 0-child root that is kept alive.
+ *
+ * The type index is carried in 3 bits of the node pointer's low tag bits, so
+ * it has 8 possible values: the real tiers plus NODE_INDEX_NULL (the absent /
+ * pruned-node sentinel) -- indices 0..6 real + 7 == NULL on 64-bit, 0..5 real
+ * + 6 == NULL on 32-bit.  The full pointer-tag scheme (canonical masks in
+ * fractal-trie-internal.h: FT_INTERNAL_MASK / FT_COMPRESSED_MASK) is:
+ *
+ *   bit0 = 0, bit1 = 0   external (leaf) pointer, or NULL
+ *   bit0 = 0, bit1 = 1   compressed (path) node
+ *   bit0 = 1             internal node; bits 1-3 carry the 3-bit type index
+ *
+ * Internal nodes spend the most tag bits -- 1 (internal/external flag) + 3
+ * (type index) = 4 low bits -- so every node must be 16-byte aligned to keep
+ * those bits free for the tag.  That is why the smallest usable allocation
+ * order is 4 (node size 1 << 4 == 16 bytes); compressed and external pointers
+ * fit within the same 4-bit budget (bit 1 set, and 0b00, respectively).
  */
 
 /*
@@ -248,14 +263,27 @@ struct cds_ft_type {
  * (the 32 B bitmap header is fixed).  The 32-bit ft_types[] below
  * tunes max_child accordingly.
  *
- * Layout naming: scan_<root_bits>_<sub_bm_bits>(_max_<N>).  The
+ * Two-level popcount bitmap.  A node's child-presence bitmap (which of the
+ * up-to-256 child slots are occupied) is stored two-level so that mapping an
+ * occupied slot to its dense child-pointer index costs a couple of popcounts
+ * rather than a scan: a ROOT bitmap (root_bm) sits over a row of SUB-bitmaps
+ * (sub_bm).  Each sub_bm holds the presence bits for one contiguous block of
+ * slots; the corresponding root_bm bit is set iff that sub_bm has any child.
+ * A slot's index is then popcount(sub_bm below the slot) plus the children in
+ * all lower non-empty sub-bitmaps (the root_bm summarizes which to add).
+ *
+ * Layout naming: scan_<root_bits>_<sub_bm_bits>(_max_<N>) -- e.g. scan_16_16
+ * is a 16-bit root_bm over 16-bit sub_bms (16 x 16 = 256 slots).  The
  * trailing _max_<N> appears only on the generic-2L variants
  * (scan_16_16_*) where the ptr offset depends on the static
- * sub_bm[] tail length (max_child).  The flat-layout scanners
- * (scan_32_8 with 5+3 byte split and u8 nibbles; scan_64_4 with
- * 6+2 byte split and u4 nibbles) pack root_bm + packed_bms into a
- * fixed 12 B or 16 B header, so the ptr offset is constant (+16
- * after alignment) and one function serves multiple max_child values.
+ * sub_bm[] tail length (max_child).  The flat-layout scanners split the
+ * 8-bit slot index (a byte) into a high field that selects the root_bm
+ * entry and a low field that selects the bit within the sub_bm -- a "5+3
+ * byte-split" is 5 high bits + 3 low bits, etc.  scan_32_8 uses a 5+3
+ * byte-split with u8 nibbles; scan_64_4 a 6+2 byte-split with u4 nibbles.
+ * Both pack root_bm + packed_bms into a fixed 12 B or 16 B header, so the
+ * ptr offset is constant (+16 after alignment) and one function serves
+ * multiple max_child values.
  *
  * 32-bit max_child tuning: the flat scanners (scan_32_8, scan_64_4)
  * are layout-only -- headers do not grow with max_child and packed_bms
@@ -283,8 +311,6 @@ enum {
 	 *   idx 1  scan_64_4         64 B  hdr 16 B + 12 x 4 B = 64 B exact
 	 *                            (flat 6+2; node-size cap 12, bitmap cap 16)
 	 *   idx 2  popcount_1l      128 B  hdr 32 B + 24 x 4 B = 128 B exact
-	 *                            (was scan_64_4 max_child=16 with 48 B slack;
-	 *                            popcount_1l unlocks the full pointer table)
 	 *   idx 3  popcount_1l      256 B  hdr 32 B + 56 x 4 B = 256 B exact
 	 *   idx 4  popcount_1l      512 B  hdr 32 B + 120 x 4 B = 512 B exact
 	 *   idx 5  pigeon          1024 B  256 x 4 B pointers
@@ -373,11 +399,11 @@ enum {
 };
 
 /*
- * scan_32_8 (per-slot 5+3 byte split, max_child=6): 12-byte popcount
+ * scan_32_8 (per-slot 5+3 byte-split, max_child=6): 12-byte popcount
  * header (4B root + 8B packed sub_bms) + 6 x 8-byte pointers into
  * the 64B order-6 node.
  *
- * scan_64_4 (flat 6+2 byte split, max_child=14): 16-byte popcount
+ * scan_64_4 (flat 6+2 byte-split, max_child=14): 16-byte popcount
  * header (8B root + 8B packed_bms with 14 x 4-bit sub_bms =
  * 56 bits used) + 14 x 8-byte pointers into the 128B order-7
  * node (16 + 14 * 8 = 128 exactly).
@@ -3682,7 +3708,7 @@ void ft_popcount_node_get_ith_pos(const struct cds_ft_type *type,
 }
 
 /*
- * Generic 2-level popcount-bitmap node header (4+4 byte split).
+ * Generic 2-level popcount-bitmap node header (4+4 byte-split).
  *
  * Used by the scan_16_16_max_<N> family (max_child=3 and max_child=5).
  * Other 2L variants use flat layouts and access node->data
@@ -3907,7 +3933,7 @@ not_found:
 }
 
 /*
- * Lookup primitive: per-slot flat popcount with 5+3 byte split,
+ * Lookup primitive: per-slot flat popcount with 5+3 byte-split,
  * max_child = 6.
  *
  * Layout in the 64-byte order-6 node (FLAT layout, NOT shared with
@@ -3968,7 +3994,7 @@ not_found:
 }
 
 /*
- * Lookup primitive: flat packed sub_bms with 6+2 byte split,
+ * Lookup primitive: flat packed sub_bms with 6+2 byte-split,
  * max_child = 14.
  *
  * Layout in the 128-byte order-7 node (6+2 FLAT, not shared with
