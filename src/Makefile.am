@@ -13,8 +13,9 @@ dist_noinst_HEADERS = urcu-die.h urcu-wait.h compat-getcpu.h \
 
 COMPAT = compat_futex.c
 
-FRACTAL_TRIE = fractal-trie.c fractal-trie-alloc.c fractal-trie-internal.h bitmap.h \
-	fractal-trie-trace.h cds_ft_tp.c cds_ft_tp.h
+FRACTAL_TRIE = fractal-trie/fractal-trie.c fractal-trie/fractal-trie-alloc.c \
+	fractal-trie/fractal-trie-internal.h fractal-trie/fractal-trie-trace.h \
+	fractal-trie/cds_ft_tp.c fractal-trie/cds_ft_tp.h
 
 RCULFHASH = rculfhash.c rculfhash-mm-order.c rculfhash-mm-chunk.c \
 		rculfhash-mm-mmap.c
