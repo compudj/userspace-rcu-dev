@@ -60,9 +60,21 @@
  * the head fills up.  Sized large enough that VMA fragmentation is
  * negligible and small enough to avoid wasting address space on tiny
  * tries.
+ *
+ * The mmap is MAP_NORESERVE (lazily faulted), so a superblock costs its
+ * full size in VIRTUAL address space but almost no physical memory.  On
+ * 32-bit a process has only ~3 GiB of address space, and a bulk op's node
+ * reserve eagerly creates one arena (hence one superblock) per node order
+ * and kind -- a dozen 64 MiB superblocks would exhaust it.  So keep the
+ * 32-bit superblock small; the slightly-more-frequent mmap is irrelevant
+ * next to staying inside the address space.
  */
 #ifndef FT_SUPERBLOCK_SIZE
-#define FT_SUPERBLOCK_SIZE (64UL * 1024 * 1024)
+# if (CAA_BITS_PER_LONG < 64)
+#  define FT_SUPERBLOCK_SIZE (2UL * 1024 * 1024)
+# else
+#  define FT_SUPERBLOCK_SIZE (64UL * 1024 * 1024)
+# endif
 #endif
 
 struct cds_ft_alloc_arena;
