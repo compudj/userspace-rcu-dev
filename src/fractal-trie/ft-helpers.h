@@ -1,0 +1,2870 @@
+// SPDX-FileCopyrightText: 2012-2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+//
+// SPDX-License-Identifier: LGPL-2.1-only
+
+/*
+ * src/fractal-trie/ft-helpers.h
+ *
+ * Userspace RCU library - Fractal Trie: general helpers: tag/node/metadata accessors, key conversion + compare, publish, flip-latch, ordinal-cell and skip-compressed primitives, allocation glue.
+ *
+ * Implementation unit: #included once by fractal-trie.c, in dependency
+ * order, into a single translation unit (preserves cross-module inlining).
+ * Not a standalone header.
+ */
+#ifndef FRACTAL_TRIE_IMPL
+#error "ft-helpers.h is an implementation unit; #include it from fractal-trie.c only"
+#endif
+
+static inline __attribute__((unused))
+void static_array_size_check(void)
+{
+	CAA_BUILD_BUG_ON(CAA_ARRAY_SIZE(ft_types) < FT_TYPE_MAX_NR);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * parent_slot_offset is 8 bits and stores byte_offset / sizeof(void *).
+	 * Ensure the largest node (pigeon, 2^11 = 2048 bytes) fits:
+	 * 2048 / sizeof(void *) = 256 slots, max index 255.  Only enabled
+	 * on 64-bit architectures, where sizeof(void *) == 8 and the
+	 * quotient is exactly 256.
+	 */
+	CAA_BUILD_BUG_ON((1U << 11) / sizeof(void *) > 256);
+#endif
+	/*
+	 * Metadata packed bitfield must fit in a uint32_t.
+	 * Layout: nr_child(9) + [parent_slot_offset(8)] + alloc_index
+	 *         (near: FT_ALLOC_INDEX_BITS + 3; far: a separate uint32_t).
+	 */
+	CAA_BUILD_BUG_ON(9
+#ifndef FT_FAR_METADATA
+		/* far-metadata stores alloc_index as its own uint32_t. */
+		+ (FT_ALLOC_INDEX_BITS + 3)
+#endif
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		+ 8
+#endif
+		> 32);
+}
+
+/*
+ * Writer-side helpers for the cds_ft_node.next removal tombstone (low
+ * bit, see CDS_FT_NODE_REMOVED_FLAG).  These run under the writer mutex
+ * (or RCU read lock on the chain-walk side), so a plain masked load is
+ * sufficient; readers use cds_ft_node_next_rcu() instead.
+ *
+ *   ft_node_next        masked successor (the actual chain link)
+ *   ft_node_is_removed  has @node been removed from the trie?
+ *   ft_node_mark_removed set the tombstone, preserving the successor
+ *                        pointer (relaxed store; readers mask the bit
+ *                        and the pointer value is unchanged).
+ */
+static inline
+struct cds_ft_node *ft_node_next(const struct cds_ft_node *node)
+{
+	return (struct cds_ft_node *) ((uintptr_t) node->next &
+			~CDS_FT_NODE_REMOVED_FLAG);
+}
+
+static inline
+bool ft_node_is_removed(const struct cds_ft_node *node)
+{
+	return ((uintptr_t) node->next & CDS_FT_NODE_REMOVED_FLAG) != 0;
+}
+
+static inline
+void ft_node_mark_removed(struct cds_ft_node *node)
+{
+	CMM_STORE_SHARED(node->next, (struct cds_ft_node *)
+			((uintptr_t) node->next | CDS_FT_NODE_REMOVED_FLAG));
+}
+
+/*
+ * Mark every node in a duplicate chain as removed (used by
+ * cds_ft_remove_all, which detaches a whole chain at once).  The
+ * successor pointers stay intact so the caller can still traverse the
+ * returned chain to reclaim it.
+ */
+static inline
+void ft_chain_mark_removed(struct cds_ft_node *head)
+{
+	while (head) {
+		struct cds_ft_node *next = ft_node_next(head);
+
+		ft_node_mark_removed(head);
+		head = next;
+	}
+}
+
+/*
+ * Iterate through duplicates returned by cds_ft_lookup*()
+ * Receives a struct cds_ft_node * as parameter, which is used as start
+ * of duplicate list and loop cursor.  Masks the removal tombstone.
+ */
+#define cds_ft_for_each_duplicate(pos)				\
+       for (; (pos) != NULL; (pos) = ft_node_next(pos))
+
+enum ft_recompact {
+	FT_RECOMPACT_ADD_SAME,
+	FT_RECOMPACT_ADD_NEXT,
+	FT_RECOMPACT_DEL,
+	/*
+	 * Pure relocation: same type and child set, copied verbatim into a
+	 * fresh allocation (new address), children reparented, republished
+	 * into the parent slot (and skip slot, via the shared publish path).
+	 * Used by cds_ft_compact() to defragment the node arenas.
+	 */
+	FT_RECOMPACT_RELOCATE,
+};
+
+enum ft_lookup_inequality {
+	FT_LOOKUP_GE,
+	FT_LOOKUP_LE,
+	FT_LOOKUP_GT,
+	FT_LOOKUP_LT,
+};
+
+enum ft_lookup_limit {
+	FT_LOOKUP_LIMIT_NONE,
+	FT_LOOKUP_LIMIT_FIRST,
+	FT_LOOKUP_LIMIT_LAST,
+};
+
+enum ft_direction {
+	FT_LEFT,
+	FT_RIGHT,
+	FT_LEFTMOST,
+	FT_RIGHTMOST,
+};
+
+/*
+ * Fractal Trie iterator object. Can be used to keep backtracking state
+ * across API calls. Path use for backtracking requires to keep RCU
+ * read-side lock held across calls.
+ *
+ * The iterator lifetime is bound to the Trie. The Trie must not be
+ * destroyed while iterators to that trie exist.
+ *
+ * The @prefix_len is the length of the key prefix within the key for
+ * traversal under a given key prefix. Iterate over the entire Trie when
+ * @prefix_len=0.
+ */
+struct cds_ft_iter {
+	struct cds_ft *ft;		/* Point to the associated Fractal Trie. */
+	struct cds_ft_node *node;	/* Current external node. */
+	size_t path_len;		/* Key-path length of the cached position. */
+	size_t key_len;			/* Key length of the current node. */
+	size_t prefix_len;		/* Key prefix length. */
+	enum cds_ft_status status;	/* Iteration status. */
+	enum cds_ft_iter_cache_mode cache_mode;	/* Position-reuse mode (CACHED/UNCACHED). */
+	bool cache_valid;		/* Whether the cached position is valid. */
+	/*
+	 * Byte offset within the @data buffer at which the current-position key
+	 * begins.  0 for a descent / set_key key (filled at the front); the
+	 * structural up-walk fills the key at the TAIL and sets this to
+	 * (max_key_len - key_len) so ft_iter_read_key returns the right pointer
+	 * even after the cached position is invalidated (bind / UNCACHED), with
+	 * no copy to normalize the key to the front.
+	 */
+	size_t key_off;
+
+	/*
+	 * Ordinal-cell walk cursor.  @ord_cell caches the cell of the current
+	 * head so cds_ft_next / cds_ft_prev advance via cell->ord_next/prev
+	 * without re-loading the head's leaf each step; @ord_cell_node records
+	 * the node it was cached for, so the cache is honoured only while
+	 * @ord_cell_node == iter->node (a point lookup or descent that re-seeded
+	 * iter->node leaves a mismatch, and the first step re-enters the walk via
+	 * iter->node->prev -- the one leaf touch per walk entry).  No stale cell is
+	 * dereferenced: validity is a node-pointer compare, not a cell read.
+	 */
+	struct ft_ord_cell *ord_cell;
+	struct cds_ft_node *ord_cell_node;
+
+#ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
+	struct urcu_gp_poll_state gp_state;	/* GP snapshot when path was populated. */
+	bool gp_state_valid;			/* Whether gp_state holds a meaningful value. */
+#endif
+
+	/*
+	 * Trailing buffer holding the ordinal key bytes of the current
+	 * iterator position.  The going-up backtrack recovers per-level
+	 * nodes from the live parent chain, so no path-node array is kept.
+	 *
+	 * Flexible array member, pointer-aligned.
+	 */
+	char data[] __attribute__((__aligned__(sizeof(struct cds_ft_inode_flag *))));
+};
+
+/* Start of the uint8_t key array. */
+#define iter_key(iter) \
+	((uint8_t *)((iter)->data))
+
+/*
+ * Validate the iterator-based lookup contract: @ft must be the trie the
+ * iterator was created for (cds_ft_iter_create).  The descent uses @ft while
+ * key handling uses iter->ft, so passing a different trie mixes their key
+ * mappings and produces undefined results.  Debug-only; compiled out under
+ * NDEBUG.
+ */
+static inline
+void ft_iter_assert_bound(const struct cds_ft *ft __attribute__((unused)),
+		const struct cds_ft_iter *iter __attribute__((unused)))
+{
+	assert(ft == iter->ft);
+}
+
+/*
+ * Debug helpers for detecting stale cached iterator paths.
+ *
+ * Three entry-point roles mirror the rculfhash pattern:
+ *
+ *  iter_debug_path_snapshot() -- unconditionally captures a fresh
+ *      grace-period poll state.  Called at the entry of every
+ *      fresh-population operation (lookup, longest-match lookup, and
+ *      the slow-path / early-exit branches of inequality lookup).
+ *      Because it always overwrites the snapshot, an iterator that is
+ *      reused across RCU read-side critical sections gets a current
+ *      baseline, preventing false positives on the next check.
+ *
+ *  iter_debug_path_check() -- polls the existing snapshot.  Called at
+ *      continuation entry points that consume a previously populated
+ *      cached path (inequality fast-path, replace, remove).  If a full
+ *      grace period has elapsed since the snapshot was taken, the RCU
+ *      read-side lock must have been dropped and the cached pointers
+ *      may reference freed memory -- the check aborts.
+ *
+ *  iter_debug_path_update() -- invalidates the snapshot when the path
+ *      becomes invalid (node not found / end of traversal).  It never
+ *      captures a new snapshot; the one taken at the operation's entry
+ *      point persists as long as the path remains valid, giving a
+ *      tighter detection window.
+ *
+ *  iter_debug_path_clear() -- unconditionally resets the snapshot
+ *      validity.  Used by iter_auto_invalidate_cache() and by
+ *      operations that structurally modify the trie (replace, remove),
+ *      after which the cached path is stale regardless of RCU state.
+ */
+#ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
+
+/*
+ * Unconditionally capture a fresh grace-period snapshot.  Called at
+ * the entry of fresh-population operations so that any prior stale
+ * state left by iterator reuse is replaced.
+ */
+static inline
+void iter_debug_path_snapshot(struct cds_ft_iter *iter)
+{
+	const struct rcu_flavor_struct *flavor = iter->ft->group->flavor;
+
+	iter->gp_state = flavor->update_start_poll_synchronize_rcu();
+	iter->gp_state_valid = true;
+}
+
+/*
+ * Validate that the RCU read-side lock has been held continuously
+ * since the snapshot was captured.  Called at continuation entry
+ * points before reusing a cached path.
+ */
+static inline
+void iter_debug_path_check(const struct cds_ft_iter *iter)
+{
+	const struct rcu_flavor_struct *flavor = iter->ft->group->flavor;
+
+	if (iter->cache_mode != CDS_FT_ITER_CACHED)
+		return;
+	if (!iter->cache_valid)
+		return;
+	if (!iter->gp_state_valid)
+		return;
+	if (caa_unlikely(flavor->update_poll_state_synchronize_rcu(
+				iter->gp_state))) {
+		fprintf(stderr,
+			"[Fatal] Fractal Trie: cached iterator path "
+			"used after a grace period elapsed (RCU "
+			"read-side lock was likely dropped). "
+			"%s:%d\n", __FILE__, __LINE__);
+		abort();
+	}
+}
+
+/*
+ * Update the snapshot validity after populating the iterator.  When
+ * the path is no longer valid (node not found or end of traversal),
+ * clear the snapshot so that any subsequent misuse is detected by
+ * iter_debug_path_check.  When the path is valid, the grace-period
+ * snapshot captured by iter_debug_path_snapshot at the operation's
+ * entry point remains current because the RCU read-side lock must be
+ * held continuously.
+ */
+static inline
+void iter_debug_path_update(struct cds_ft_iter *iter)
+{
+	if (!iter->cache_valid)
+		iter->gp_state_valid = false;
+}
+
+static inline
+void iter_debug_path_clear(struct cds_ft_iter *iter)
+{
+	iter->gp_state_valid = false;
+}
+#else
+static inline
+void iter_debug_path_snapshot(struct cds_ft_iter *iter __attribute__((unused)))
+{
+}
+
+static inline
+void iter_debug_path_check(const struct cds_ft_iter *iter __attribute__((unused)))
+{
+}
+
+static inline
+void iter_debug_path_update(struct cds_ft_iter *iter __attribute__((unused)))
+{
+}
+
+static inline
+void iter_debug_path_clear(struct cds_ft_iter *iter __attribute__((unused)))
+{
+}
+#endif
+
+/*
+ * Snapshot the iterator's current result key into its own buffer when that key
+ * is a live reference into the matched leaf (a lazy-ref ordinal-cell group), so
+ * a later re-descent reads a stable key rather than the soon-to-be-reclaimed
+ * leaf.  A no-op for groups whose key is already a value in iter_key(iter)
+ * (the descent filled it / a non-ordered-list group): the next re-descent uses
+ * that buffer directly.  Defined after ft_speculative_keycopy_unconditional.
+ */
+static inline void ft_iter_materialize_key(struct cds_ft_iter *iter);
+
+/*
+ * Discard the cached position if the iterator is in uncached mode.
+ * Called at the end of each public iterator-based operation.
+ * Preserves iter->node so the caller can read the result.
+ */
+static inline
+void iter_auto_invalidate_cache(struct cds_ft_iter *iter)
+{
+	if (iter->cache_mode == CDS_FT_ITER_UNCACHED) {
+		/*
+		 * Materialize a live leaf-referenced key BEFORE clearing, so the
+		 * next uncached re-descent reads the saved key, not a stale leaf.
+		 */
+		ft_iter_materialize_key(iter);
+		iter->cache_valid = false;
+		iter->path_len = 0;
+		iter_debug_path_clear(iter);
+	}
+}
+
+static
+size_t ft_key_len(const struct cds_ft *ft, size_t key_len)
+{
+	struct cds_ft_group *ft_group = ft->group;
+
+	if (key_len == CDS_FT_LEN_DEFAULT) {
+		if (ft_group->key_len == CDS_FT_LEN_VARIABLE)
+			return CDS_FT_LEN_ERROR;
+		return ft_group->key_len;
+	}
+	/* Validate that explicit and implicit key lengths match for fixed length Fractal Trie. */
+	if (ft_group->key_len != CDS_FT_LEN_VARIABLE && key_len != ft_group->key_len)
+		return CDS_FT_LEN_ERROR;
+	return key_len;
+}
+
+uint64_t cds_ft_key_to_u64(const struct cds_ft *ft, const uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	union {
+		uint64_t v64;
+		uint8_t array[8];
+	} u;
+
+	if (key_len == CDS_FT_LEN_ERROR || key_len > 8)
+		return 0;
+	u.v64 = 0;
+	/* Copy len LSB. */
+	memcpy(u.array + sizeof(u.array) - key_len , key, key_len);
+	/* Big endian to host endianness. */
+	return be64toh(u.v64);
+}
+
+void cds_ft_u64_to_key(const struct cds_ft *ft, uint64_t v, uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	union {
+		uint64_t v64;
+		uint8_t array[8];
+	} u;
+
+	if (key_len == CDS_FT_LEN_ERROR || key_len > 8)
+		return;
+	/* Host endianness to big endian. */
+	u.v64 = htobe64(v);
+	/* Copy len LSB. */
+	memcpy(key, u.array + sizeof(u.array) - key_len , key_len);
+}
+
+uint32_t cds_ft_key_to_u32(const struct cds_ft *ft, const uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	union {
+		uint32_t v32;
+		uint8_t array[4];
+	} u;
+
+	if (key_len == CDS_FT_LEN_ERROR || key_len > 4)
+		return 0;
+	u.v32 = 0;
+	/* Copy len LSB. */
+	memcpy(u.array + sizeof(u.array) - key_len , key, key_len);
+	/* Big endian to host endianness. */
+	return be32toh(u.v32);
+}
+
+void cds_ft_u32_to_key(const struct cds_ft *ft, uint32_t v, uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	union {
+		uint32_t v32;
+		uint8_t array[4];
+	} u;
+
+	if (key_len == CDS_FT_LEN_ERROR || key_len > 4)
+		return;
+	/* Host endianness to big endian. */
+	u.v32 = htobe32(v);
+	/* Copy len LSB. */
+	memcpy(key, u.array + sizeof(u.array) - key_len , key_len);
+}
+
+/*
+ * Signed integer key helpers.
+ *
+ * Signed integers need a sign-bit flip (XOR with the MSB of the
+ * key-width value) so that the big-endian byte ordering used by the
+ * Fractal Trie preserves the natural signed ordering.
+ *
+ * When the key is the full width of the integer type (e.g. 8 bytes
+ * for int64_t), the mapping is:
+ *
+ *   INT64_MIN  -> 0x0000000000000000   (sorts first)
+ *   -1         -> 0x7FFFFFFFFFFFFFFF
+ *    0         -> 0x8000000000000000
+ *   INT64_MAX  -> 0xFFFFFFFFFFFFFFFF   (sorts last)
+ *
+ * The same principle applies to 32-bit signed integers.
+ *
+ * When the key is narrower than the integer type (e.g. a 2-byte key
+ * representing a signed 16-bit range within a 64-bit integer), the
+ * sign bit is at position (key_len * 8 - 1), not at the MSB of the
+ * full integer.  The key-to-integer direction therefore sign-extends
+ * from the key's MSB to fill the integer.
+ */
+
+int64_t cds_ft_key_to_s64(const struct cds_ft *ft, const uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	unsigned int shift;
+	uint64_t u;
+
+	if (key_len == 0 || key_len > 8)
+		return 0;
+	u = cds_ft_key_to_u64(ft, key, _key_len);
+	shift = key_len * 8;
+	/* Flip sign bit (MSB of key-width value) to recover signed encoding. */
+	u ^= 1ULL << (shift - 1);
+	/* Sign-extend from key width to 64 bits. */
+	if (shift < 64) {
+		uint64_t sign_bit = 1ULL << (shift - 1);
+
+		if (u & sign_bit)
+			u |= ~((1ULL << shift) - 1);
+	}
+	return (int64_t) u;
+}
+
+void cds_ft_s64_to_key(const struct cds_ft *ft, int64_t v, uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	unsigned int shift;
+
+	if (key_len == 0 || key_len > 8)
+		return;
+	shift = key_len * 8;
+	/* Flip sign bit so that negative values sort before positive. */
+	cds_ft_u64_to_key(ft, (uint64_t) v ^ ( 1ULL << (shift - 1)), key, _key_len);
+}
+
+int32_t cds_ft_key_to_s32(const struct cds_ft *ft, const uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	unsigned int shift;
+	uint32_t u;
+
+	if (key_len == 0 || key_len > 4)
+		return 0;
+	u = cds_ft_key_to_u32(ft, key, _key_len);
+	shift = key_len * 8;
+	/* Flip sign bit (MSB of key-width value) to recover signed encoding. */
+	u ^= 1U << (shift - 1);
+	/* Sign-extend from key width to 32 bits. */
+	if (shift < 32) {
+		uint32_t sign_bit = 1U << (shift - 1);
+
+		if (u & sign_bit)
+			u |= ~((1U << shift) - 1);
+	}
+	return (int32_t) u;
+}
+
+void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key,
+		size_t _key_len)
+{
+	size_t key_len = ft_key_len(ft, _key_len);
+	unsigned int shift;
+
+	if (key_len == 0 || key_len > 4)
+		return;
+	shift = key_len * 8;
+	/* Flip sign bit so that negative values sort before positive. */
+	cds_ft_u32_to_key(ft, (uint32_t) v ^ (1U << (shift - 1)), key, _key_len);
+}
+
+static inline_lookup
+uint8_t key_to_ordinal(uint8_t key,
+		const struct cds_ft_key_map *km)
+{
+	if (caa_likely(km->identity))
+		return key;
+	return km->key_to_ordinal[key];
+}
+
+static inline_lookup
+uint8_t ordinal_to_key(const struct cds_ft *ft, uint8_t ordinal)
+{
+	if (caa_likely(ft->group->key_map.identity))
+		return ordinal;
+	return ft->group->key_map.ordinal_to_key[ordinal];
+}
+
+/*
+ * Bulk key-to-ordinal conversion.  Converts @len external key bytes
+ * into ordinals in @dst.  Identity maps short-circuit to memcpy.
+ */
+static inline void ft_key_to_ordinals(uint8_t *dst, const uint8_t *key,
+		size_t len, const struct cds_ft_key_map *km)
+{
+	size_t i;
+
+	if (caa_likely(km->identity)) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#pragma GCC diagnostic ignored "-Wrestrict"
+		memcpy(dst, key, len);
+#pragma GCC diagnostic pop
+		return;
+	}
+	for (i = 0; i < len; i++)
+		dst[i] = km->key_to_ordinal[key[i]];
+}
+
+/*
+ * Bulk ordinal-to-key conversion.  Converts @len ordinals in @src
+ * back to external key bytes in @dst.  Identity maps short-circuit
+ * to memcpy.
+ */
+static inline void ft_ordinals_to_key(uint8_t *dst, const uint8_t *ordinals,
+		size_t len, const struct cds_ft_key_map *km)
+{
+	size_t i;
+
+	if (caa_likely(km->identity)) {
+		memcpy(dst, ordinals, len);
+		return;
+	}
+	for (i = 0; i < len; i++)
+		dst[i] = km->ordinal_to_key[ordinals[i]];
+}
+
+/*
+ * Byte-swap an unsigned long for lexicographic word comparison on
+ * little-endian.  On big-endian this is a no-op: natural word order
+ * already matches memory (lexicographic) order.
+ */
+static inline unsigned long ft_bswap_long(unsigned long v)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if __SIZEOF_LONG__ == 8
+	return __builtin_bswap64(v);
+#else
+	return __builtin_bswap32(v);
+#endif
+#else
+	return v;
+#endif
+}
+
+/*
+ * Given two mismatching words loaded from position @base, return the
+ * appropriate non-zero result.
+ *
+ * When @signed_cmp is true, byte-swap on little-endian to get
+ * lexicographic word order, then return <0 or >0.
+ * When @signed_cmp is false, return 1 (unequal, sign unspecified).
+ *
+ * When @mismatch_pos is non-NULL, store the index of the first
+ * differing byte using ctz/clz on the XOR of the two words.
+ *
+ * Both checks are constant-folded when the function is inlined with
+ * literal arguments.
+ */
+static inline_lookup
+int ft_word_mismatch(unsigned long va, unsigned long vb,
+		unsigned int base, bool signed_cmp,
+		unsigned int *mismatch_pos)
+{
+	if (mismatch_pos) {
+		unsigned long diff = va ^ vb;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+		*mismatch_pos = base + (unsigned int)__builtin_ctzl(diff) / 8;
+#else
+		*mismatch_pos = base + (unsigned int)__builtin_clzl(diff) / 8;
+#endif
+	}
+	if (signed_cmp) {
+		va = ft_bswap_long(va);
+		vb = ft_bswap_long(vb);
+		return va < vb ? -1 : 1;
+	}
+	return 1;
+}
+
+/*
+ * ft_key_cmp_ordinals: compare @len bytes of ordinal data from two
+ * sources.  Both @a and @b must be in ordinal space.
+ *
+ * Returns 0 when equal, non-zero when unequal.
+ *
+ * @signed_cmp: when true, the return value encodes lexicographic
+ *   order (<0 means a < b, >0 means a > b).  When false, any
+ *   non-zero value may be returned (allows the compiler to
+ *   eliminate the bswap).
+ *
+ * @mismatch_pos: when non-NULL, receives the index of the first
+ *   mismatching byte (undefined on full match).  Gates the
+ *   bitscan instruction.
+ *
+ * All three use-cases (equality, mismatch position, signed
+ * cardinality) share the same comparison logic.  Since this
+ * function is force-inlined, both @signed_cmp and @mismatch_pos
+ * checks are constant-folded at each call site.
+ *
+ * Dispatch is ordered by frequency: short keys (< 8 bytes) are the
+ * most common case in trie traversal (compressed paths), followed
+ * by medium keys, then long keys where SIMD helps.
+ */
+
+/*
+ * Helper: resolve a mismatch found at byte position @pos by
+ * loading a full word from each array at that position and
+ * delegating to ft_word_mismatch.  The word load is safe because
+ * @remaining_key guarantees enough readable memory.
+ */
+static inline_lookup
+int ft_byte_mismatch(const uint8_t *a, const uint8_t *b,
+		unsigned int pos, bool signed_cmp,
+		unsigned int *mismatch_pos)
+{
+	if (mismatch_pos)
+		*mismatch_pos = pos;
+	if (signed_cmp)
+		return (int)a[pos] - (int)b[pos];
+	return 1;
+}
+
+#if defined(__AVX2__)
+#ifndef FT_IMMINTRIN_INCLUDED
+#define FT_IMMINTRIN_INCLUDED
+#include <immintrin.h>
+#endif
+#endif
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Helper: given a non-zero 32-bit mismatch mask from an AVX2
+ * comparison starting at @base, resolve the first differing byte.
+ */
+static inline_lookup
+int ft_avx2_mismatch(const uint8_t *a, const uint8_t *b,
+		unsigned int base, unsigned int mask,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	unsigned int pos = base + (unsigned int)__builtin_ctz(mask);
+
+	return ft_byte_mismatch(a, b, pos, signed_cmp, mismatch_pos);
+}
+#endif /* __AVX2__ && !FT_NO_SIMD_CMP */
+
+#if defined(__SSE2__)
+#ifndef FT_IMMINTRIN_INCLUDED
+#define FT_IMMINTRIN_INCLUDED
+#include <immintrin.h>
+#endif
+#endif
+#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Helper: given a non-zero 16-bit mismatch mask from an SSE2
+ * comparison starting at @base, resolve the first differing byte.
+ */
+static inline_lookup
+int ft_sse2_mismatch(const uint8_t *a, const uint8_t *b,
+		unsigned int base, unsigned int mask,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	unsigned int pos = base + (unsigned int)__builtin_ctz(mask);
+
+	return ft_byte_mismatch(a, b, pos, signed_cmp, mismatch_pos);
+}
+#endif /* __SSE2__ */
+
+/*
+ * Building blocks for key comparison.  Each is self-contained and
+ * handles its key length range completely, including tail.
+ */
+
+/* Compare len < 8 bytes.  Uses masked word or byte-by-byte. */
+static inline_lookup
+int ft_cmp_tiny(const uint8_t *a, const uint8_t *b,
+		unsigned int len, unsigned int remaining_key,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	if (remaining_key >= sizeof(unsigned long)) {
+		unsigned long va, vb, mask;
+
+		__builtin_memcpy(&va, a, sizeof(unsigned long));
+		__builtin_memcpy(&vb, b, sizeof(unsigned long));
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+		mask = (1UL << (len * 8)) - 1;
+#else
+		mask = ~((1UL << ((sizeof(unsigned long) - len) * 8)) - 1);
+#endif
+		va &= mask;
+		vb &= mask;
+		if (va != vb)
+			return ft_word_mismatch(va, vb, 0,
+						signed_cmp, mismatch_pos);
+	} else {
+		unsigned int j;
+
+		for (j = 0; j < len; j++) {
+			if (a[j] != b[j])
+				return ft_byte_mismatch(a, b, j,
+						signed_cmp, mismatch_pos);
+		}
+	}
+	return 0;
+}
+
+/* Compare len >= 8 bytes using word-at-a-time + overlapping tail. */
+static inline_lookup
+int ft_cmp_word(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	unsigned int j = 0;
+
+	while (j + sizeof(unsigned long) <= len) {
+		unsigned long va, vb;
+
+		__builtin_memcpy(&va, a + j, sizeof(unsigned long));
+		__builtin_memcpy(&vb, b + j, sizeof(unsigned long));
+		if (va != vb)
+			return ft_word_mismatch(va, vb, j,
+						signed_cmp, mismatch_pos);
+		j += sizeof(unsigned long);
+	}
+	if (j < len) {
+		unsigned long va, vb;
+		unsigned int tail = len - sizeof(unsigned long);
+
+		__builtin_memcpy(&va, a + tail, sizeof(unsigned long));
+		__builtin_memcpy(&vb, b + tail, sizeof(unsigned long));
+		if (va != vb)
+			return ft_word_mismatch(va, vb, tail,
+						signed_cmp, mismatch_pos);
+	}
+	return 0;
+}
+
+#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+/* Compare len >= 16 bytes using SSE2 + overlapping 16-byte tail. */
+static inline_lookup
+int ft_cmp_sse2(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	unsigned int j = 0;
+
+	while (j + 16 <= len) {
+		__m128i va = _mm_loadu_si128((const __m128i *)(a + j));
+		__m128i vb = _mm_loadu_si128((const __m128i *)(b + j));
+		__m128i eq = _mm_cmpeq_epi8(va, vb);
+		unsigned int mask = (unsigned int)_mm_movemask_epi8(eq);
+
+		if (mask != 0xFFFFU)
+			return ft_sse2_mismatch(a, b, j,
+						~mask & 0xFFFF,
+						signed_cmp, mismatch_pos);
+		j += 16;
+	}
+	if (j < len) {
+		unsigned int tail = len - 16;
+		__m128i va = _mm_loadu_si128((const __m128i *)(a + tail));
+		__m128i vb = _mm_loadu_si128((const __m128i *)(b + tail));
+		__m128i eq = _mm_cmpeq_epi8(va, vb);
+		unsigned int mask = (unsigned int)_mm_movemask_epi8(eq);
+
+		if (mask != 0xFFFFU)
+			return ft_sse2_mismatch(a, b, tail,
+						~mask & 0xFFFF,
+						signed_cmp, mismatch_pos);
+	}
+	return 0;
+}
+#endif /* __SSE2__ && !FT_NO_SIMD_CMP */
+
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Unmasked 32-byte AVX2 short-key compare for 1 <= len <= 32.
+ *
+ * Caller guarantees @a and @b each have at least 32 readable bytes.
+ * Load is unmasked; mask is applied only to the comparison result
+ * so bytes past @len don't influence the outcome.
+ *
+ * Cheapest short-key path when the contract permits it: one
+ * vmovdqu pair + vpcmpeqb + vpmovmskb + bzhi + andn + jne.  No
+ * page-cross check (caller-promised safe), no EVEX kmask setup,
+ * no overlapping tail load.  ~10 cycles on Zen 4 for the matching
+ * case.
+ */
+static inline_lookup
+int ft_cmp_short_unmasked_avx2(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	__m256i va = _mm256_loadu_si256((const __m256i *) a);
+	__m256i vb = _mm256_loadu_si256((const __m256i *) b);
+	__m256i eq = _mm256_cmpeq_epi8(va, vb);
+	uint32_t mask = (uint32_t) _mm256_movemask_epi8(eq);
+	uint32_t want = (uint32_t) _bzhi_u32(0xFFFFFFFFU, len);
+
+	if ((mask & want) == want)
+		return 0;
+	return ft_avx2_mismatch(a, b, 0, (~mask) & want,
+				signed_cmp, mismatch_pos);
+}
+#endif
+
+#if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Unmasked 16-byte SSE2 short-key compare for 1 <= len <= 16.
+ *
+ * Same idea as ft_cmp_short_unmasked_avx2 but 16-byte load width.
+ * Caller guarantees @a and @b each have at least 16 readable bytes.
+ */
+static inline_lookup
+int ft_cmp_short_unmasked_sse2(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	__m128i va = _mm_loadu_si128((const __m128i *) a);
+	__m128i vb = _mm_loadu_si128((const __m128i *) b);
+	__m128i eq = _mm_cmpeq_epi8(va, vb);
+	unsigned int mask = (unsigned int) _mm_movemask_epi8(eq);
+	unsigned int want = (1U << len) - 1U;
+
+	if ((mask & want) == want)
+		return 0;
+	return ft_sse2_mismatch(a, b, 0, (~mask) & want,
+				signed_cmp, mismatch_pos);
+}
+#endif
+
+#if defined(__AVX512VL__) && defined(__AVX512BW__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * AVX-512 short-key compare for 1 <= len <= 32 (BW + VL).
+ *
+ * Predicated load on BOTH sides + predicated compare.  The k-mask
+ * gates which byte lanes each load fetches -- bytes outside the mask
+ * are NOT read from memory (architectural guarantee in Intel SDM
+ * and AMD APM for AVX-512 masked memory operands).  Page-cross safe
+ * on both pointers by construction; no runtime check, no
+ * @readable_bytes contract needed beyond @readable_bytes >= @len.
+ *
+ * Cheaper than the AVX2 fallback (no page-cross branch, no separate
+ * mask-and-result step) and matches what glibc's __memcmp_evex_movbe
+ * emits for len <= 32.
+ */
+static inline_lookup
+int ft_cmp_short_avx512(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	__mmask32 k = (__mmask32) _bzhi_u32(0xFFFFFFFFU, len);
+	__m256i va = _mm256_maskz_loadu_epi8(k, (const void *) a);
+	__m256i vb = _mm256_maskz_loadu_epi8(k, (const void *) b);
+	__mmask32 ne = _mm256_mask_cmpneq_epu8_mask(k, va, vb);
+
+	if (ne == 0)
+		return 0;
+	return ft_avx2_mismatch(a, b, 0, (uint32_t) ne,
+				signed_cmp, mismatch_pos);
+}
+#endif
+
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+/*
+ * Page-cross-safe single-vector compare for 16 <= len <= 31.
+ *
+ * Loads 32 bytes from both pointers, compares all 32, masks the
+ * result to the first @len lanes.  Reading 7-15 bytes past the
+ * requested length is safe iff neither pointer is in the last 32
+ * bytes of its 4 KB page -- the page-cross check below.  If the
+ * check fails, fall back to the overlapping-pair SSE2 path which
+ * never reads past byte @len-1.
+ *
+ * The branch is highly predictable: in practice both @a and @b
+ * are typically in the first ~4000 bytes of their pages (slot
+ * bodies start CL-aligned and never span pages for our slot
+ * sizes), so the fast path is taken essentially 100% of the time.
+ *
+ * Used only when AVX-512 BW+VL is not available; the AVX-512 path
+ * above does the same job without the page-cross check.
+ */
+static inline_lookup
+int ft_cmp_short_avx2(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	/*
+	 * Page-cross check: a 32-byte load at @p is safe (cannot cross
+	 * a page boundary) iff (p & 0xFFF) <= 0xFE0.  Both pointers
+	 * must be safe; OR-ing the low 12 bits picks up the worst of
+	 * the two with a single AND.
+	 */
+	if (caa_likely((((uintptr_t)a | (uintptr_t)b) & 0xFFFu) <= 0xFE0u)) {
+		__m256i va = _mm256_loadu_si256((const __m256i *)a);
+		__m256i vb = _mm256_loadu_si256((const __m256i *)b);
+		__m256i eq = _mm256_cmpeq_epi8(va, vb);
+		uint32_t mask = (uint32_t)_mm256_movemask_epi8(eq);
+		uint32_t want = (uint32_t)((1ULL << len) - 1ULL);
+
+		if ((mask & want) != want)
+			return ft_avx2_mismatch(a, b, 0,
+						(~mask) & want,
+						signed_cmp, mismatch_pos);
+		return 0;
+	}
+	return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
+}
+
+/* Compare len >= 32 bytes using AVX2 + overlapping 32-byte tail. */
+static inline_lookup
+int ft_cmp_avx2(const uint8_t *a, const uint8_t *b,
+		unsigned int len,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	unsigned int j = 0;
+
+	while (j + 32 <= len) {
+		__m256i va = _mm256_loadu_si256((const __m256i *)(a + j));
+		__m256i vb = _mm256_loadu_si256((const __m256i *)(b + j));
+		__m256i eq = _mm256_cmpeq_epi8(va, vb);
+		uint32_t mask = (uint32_t)_mm256_movemask_epi8(eq);
+
+		if (mask != 0xFFFFFFFFU)
+			return ft_avx2_mismatch(a, b, j,
+						~mask, signed_cmp,
+						mismatch_pos);
+		j += 32;
+	}
+	if (j < len) {
+		unsigned int tail = len - 32;
+		__m256i va = _mm256_loadu_si256((const __m256i *)(a + tail));
+		__m256i vb = _mm256_loadu_si256((const __m256i *)(b + tail));
+		__m256i eq = _mm256_cmpeq_epi8(va, vb);
+		uint32_t mask = (uint32_t)_mm256_movemask_epi8(eq);
+
+		if (mask != 0xFFFFFFFFU)
+			return ft_avx2_mismatch(a, b, tail,
+						~mask, signed_cmp,
+						mismatch_pos);
+	}
+	return 0;
+}
+#endif /* __AVX2__ && !FT_NO_SIMD_CMP */
+
+/*
+ * ft_key_cmp_ordinals: compare @len bytes in ordinal space.
+ *
+ * @readable_bytes: contract from the caller -- @a and @b each have
+ *                  at least this many bytes safely readable (no
+ *                  fault on load).  Conservative callers pass
+ *                  @readable_bytes = @len (no over-read promised).
+ *                  Callers that know their buffers have trailing
+ *                  padding pass a larger value, unlocking the
+ *                  widest unmasked single-load fast path.
+ *
+ * Dispatch ordered by call-site frequency (hottest first):
+ *
+ *   1. len <= 32 && readable >= 32:    ft_cmp_short_unmasked_avx2
+ *                                      (1 vmovdqu pair + mask to @len)
+ *                                      -- HOT, single likely branch.
+ *
+ *   AVX-512 BW+VL build:
+ *   2. len <= 32 (any readable):       ft_cmp_short_avx512
+ *                                      (predicated load on both sides,
+ *                                       handles 1..32 contract-free)
+ *
+ *   Non-AVX-512 build (SWAR ladder):
+ *   2. len <= 16 && readable >= 16:    ft_cmp_short_unmasked_sse2
+ *   3. len < 8:                        tiny (masked 8-B word if
+ *                                       readable >= 8, else byte-by-byte)
+ *   4. 8 <= len < 16:                  word-overlap-pair
+ *   5. 16 <= len <= 32:                ft_cmp_short_avx2 (page-cross check)
+ *                                      / SSE2 overlapping pair
+ *
+ *   Final (any build):
+ *   6. len > 32:                       loop + overlapping tail
+ *                                      (contract-independent; rare).
+ *
+ * Key insight: when @readable_bytes >= 32, every short key
+ * (regardless of @len: 1..32) takes the same fast path.  The same
+ * code is emitted for len=5 and len=25 -- only the mask differs.
+ * When AVX-512 BW+VL is available, the predicated short path
+ * covers ALL of 1..32 without any contract, so the SWAR ladder is
+ * elided entirely.
+ */
+static inline_lookup
+int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
+		unsigned int len, unsigned int readable_bytes,
+		bool signed_cmp, unsigned int *mismatch_pos)
+{
+	if (caa_likely(len <= 32)) {
+		/*
+		 * Hot path: caller-promised 32-B readable horizon on
+		 * both sides -- single unmasked AVX2 load each side.
+		 */
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+		if (caa_likely(readable_bytes >= 32))
+			return ft_cmp_short_unmasked_avx2(a, b, len, signed_cmp, mismatch_pos);
+#endif
+#if defined(__AVX512VL__) && defined(__AVX512BW__) && !defined(FT_NO_SIMD_CMP)
+		/*
+		 * AVX-512 BW+VL: predicated loads on both sides are
+		 * page-cross safe and cover all 1..32 without further
+		 * dispatch.  Wins over the SWAR ladder for the common
+		 * short-key range (16..32) and matches glibc's
+		 * __memcmp_evex_movbe for shorter keys too.
+		 */
+		return ft_cmp_short_avx512(a, b, len, signed_cmp, mismatch_pos);
+#else
+		/* Short key, no 32-B contract.  Try 16-B contract. */
+# if defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+		if (len <= 16 && readable_bytes >= 16)
+			return ft_cmp_short_unmasked_sse2(a, b, len, signed_cmp, mismatch_pos);
+# endif
+		/* len < 8: tiny (byte/masked-word). */
+		if (len < sizeof(unsigned long))
+			return ft_cmp_tiny(a, b, len, readable_bytes,
+					   signed_cmp, mismatch_pos);
+		/* 8 <= len < 16: word-overlap-pair. */
+		if (len < 16)
+			return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
+		/* 16 <= len <= 32 without 32-B contract: safe fallback. */
+# if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+		return ft_cmp_short_avx2(a, b, len, signed_cmp, mismatch_pos);
+# elif defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+		return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
+# else
+		return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
+# endif
+#endif
+	}
+
+	/* Long key (>32): contract-independent loop. */
+#if defined(__AVX2__) && !defined(FT_NO_SIMD_CMP)
+	return ft_cmp_avx2(a, b, len, signed_cmp, mismatch_pos);
+#elif defined(__SSE2__) && !defined(FT_NO_SIMD_CMP)
+	return ft_cmp_sse2(a, b, len, signed_cmp, mismatch_pos);
+#else
+	return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
+#endif
+}
+
+
+static
+struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
+		unsigned long type)
+{
+	assert(type < (1UL << FT_TYPE_BITS));
+	return (struct cds_ft_inode_flag *) (((unsigned long) node) |
+		(type << FT_INTERNAL_BITS) |
+		FT_INTERNAL_MASK);
+}
+
+/*
+ * Test whether @node has the external tag (bits 0-1 == 0b00).
+ * This matches both non-NULL external leaf pointers AND NULL,
+ * since NULL has tag bits 0b00.  Callers that need to distinguish
+ * NULL from a valid external node should also check ft_node_ptr().
+ */
+static inline_lookup
+bool ft_node_external(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & FT_TAG_MASK) == 0;
+}
+
+#ifdef FEATURE_FT_COMPRESS
+static inline_lookup
+bool ft_node_compressed(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & FT_TAG_MASK) == FT_COMPRESSED_MASK;
+}
+#else
+static
+bool ft_node_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
+{
+	return false;
+}
+#endif
+
+/*
+ * ft_metadata_set_external_nodes: Phase 1 -- set the cluster-internal
+ * forward pointer (metadata->external_nodes) on a freshly-built node.
+ * Asserts that the node is not a compressed node (compressed nodes
+ * must not carry metadata->external_nodes).
+ *
+ * This is the cluster-init step.  The matching back-channel publish
+ * (external_nodes->prev = node_flag) is intentionally NOT done here:
+ * setting prev makes the cluster reachable to up-walkers via the live
+ * external's back-pointer, so it must follow node_flag's own parent
+ * being wired.  Use ft_publish_external_nodes_prev for that, ordered
+ * after the cluster top's parent is set and immediately before (or as
+ * part of) the forward publish.
+ *
+ * @node_flag: tagged pointer to the node (used for type check).
+ * @metadata: the node's metadata.
+ * @external_nodes: the external node list to set (may be NULL).
+ */
+static inline
+void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_metadata *metadata,
+		struct cds_ft_node *external_nodes)
+{
+	if (ft_node_compressed(node_flag)) {
+		fprintf(stderr, "BUG: ft_metadata_set_external_nodes called on compressed node %p\n", node_flag);
+		abort();
+	}
+	metadata->external_nodes = external_nodes;
+	FT_TP(metadata_set_external_nodes, (const void *) node_flag,
+		(const void *) external_nodes);
+}
+
+/*
+ * ft_publish_external_nodes_prev: Phase 2 -- publish the back-channel from
+ * the displaced/transferred external head up to its (re-)parent node.
+ * Defined below, after the ordinal-cell accessors it depends on in a cell
+ * build (the head's prev is its cell, so the parent is recorded into
+ * cell->parent rather than overwriting prev).
+ */
+static inline
+void ft_publish_external_nodes_prev(struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_node *external_nodes);
+
+/*
+ * Pointer unmasking via speculative mask + conditional select.
+ *
+ * Exploit the fact that each internal node type's allocation order
+ * equals 4 + type_idx (type 0 is 16B-aligned, type 1 is 32B, etc.)
+ * to compute the internal-node mask speculatively, in parallel with
+ * the bit-0 test:
+ *
+ *   mask_internal = (~15UL) << ((v >> 1) & 7)
+ *                 = ~0UL << (4 + type_idx)
+ *
+ * This clears all tag bits that sit below the type's alignment
+ * boundary.  The shift amount is derived purely from bits 1-3 with
+ * no dependency on bit 0.
+ *
+ * For non-internal nodes (bit 0 clear): external nodes are >= 8-byte
+ * aligned (bits 0-2 zero), compressed nodes are >= 16-byte aligned
+ * with tag in bit 1.  A fixed ~7UL mask suffices.
+ *
+ * The conditional select lets the two mask computations run in
+ * parallel; the compiler emits a CMOV, keeping the critical path
+ * to 4 cycles.
+ */
+/* Forward declarations for nr_keys helpers. */
+static inline unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m);
+static inline unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m);
+static inline void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo);
+
+/*
+ * ft_parent_depth_span: number of key bytes a parent's slot covers.
+ * Trivially 1 for every surviving node type (compressed/skip-compressed
+ * still resolve via metadata->parent on the multi-byte hop, but the
+ * caller of this helper iterates one ancestor at a time).
+ */
+#define ft_parent_depth_span(p, c)	((void)(p), (void)(c), 1U)
+
+static inline_lookup
+struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
+{
+	unsigned long v = (unsigned long) node;
+
+	/*
+	 * Compute mask from the original pointer: the skip-compressed
+	 * length bits (57-63) don't affect bits 0-3 used for type
+	 * dispatch, so this runs in parallel with the ADDR_MASK AND
+	 * below (full ILP).
+	 */
+	unsigned long mask_internal = (~15UL) << ((v >> 1) & 7);
+	unsigned long mask = (v & 1) ? mask_internal : ~7UL;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * Clear the top FT_SKIP_LEN_BITS (7 bits).  In a hot loop
+	 * the compiler hoists FT_ADDR_MASK into a register, making
+	 * this a single 1-cycle AND that runs in parallel with the
+	 * mask chain above.
+	 */
+	v &= FT_ADDR_MASK;
+#endif
+
+	return (struct cds_ft_inode *) (v & mask);
+}
+
+/*
+ * Lookup-hot variant: caller has already established that the
+ * internal-flag bit is set (e.g. ft_node_get_nth_skip checks
+ * !(tag & FT_INTERNAL_MASK) and returns NULL before this call).
+ * Skips the (v & 1) ? ... : ~7UL branch in ft_node_ptr() above,
+ * shaving the cmov/branch from the per-visit dependency chain on
+ * the lookup hot path.
+ */
+static inline_lookup
+struct cds_ft_inode *ft_node_ptr_internal(struct cds_ft_inode_flag *node)
+{
+	unsigned long v = (unsigned long) node;
+	unsigned long mask = (~15UL) << ((v >> 1) & 7);
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	v &= FT_ADDR_MASK;
+#endif
+
+	assert((v & FT_INTERNAL_MASK) || node == NULL);
+	return (struct cds_ft_inode *) (v & mask);
+}
+
+static
+struct cds_ft_inode *_ft_node_mask_ptr(struct cds_ft_inode_flag *node)
+{
+	unsigned long v = (unsigned long) node;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	v = (v << FT_SKIP_LEN_BITS) >> FT_SKIP_LEN_BITS;
+#endif
+	return (struct cds_ft_inode *) (v & FT_PTR_MASK);
+}
+
+static inline_lookup
+bool ft_node_internal(struct cds_ft_inode_flag *node)
+{
+	return (unsigned long) node & FT_INTERNAL_MASK;
+}
+
+static inline_lookup
+unsigned long ft_node_type(struct cds_ft_inode_flag *node)
+{
+	unsigned long type;
+
+	if (_ft_node_mask_ptr(node) == NULL) {
+		return NODE_INDEX_NULL;
+	}
+	/* Compressed nodes don't have a type index. */
+	assert(!ft_node_compressed(node));
+	type = (unsigned int) (((unsigned long) node & FT_TYPE_MASK) >> FT_INTERNAL_BITS);
+	assert(type < (1UL << FT_TYPE_BITS));
+	return type;
+}
+
+/*
+ * Flip-proxy encoding (see src/urcu-flip-latch.h).  cds_ft_merge_at needs
+ * to switch a whole set of back-pointers (and the merge-point forward
+ * slot) from their old to their new target with no mixed-regime window.
+ * Each such slot transiently holds a tagged pointer to a urcu_flip_proxy
+ * latch; a single urcu_flip_commit store flips them all atomically.
+ *
+ * A proxy is tagged as a synthetic INTERNAL node of type-index 7, the
+ * maximal tag value (low nibble (FT_INTERNAL_MASK | FT_TYPE_MASK) == 0xF).
+ * ft_types[7] is FT_NULL on every arch -- the canonical NULL slot on
+ * 64-bit (NODE_INDEX_NULL == 7), and reserved padding on 32-bit (where
+ * NODE_INDEX_NULL == 6 and real types stop at 5) -- so no real node ever
+ * carries type 7 in either tier.  A flag whose low nibble is 0xF is thus a
+ * proxy and nothing else (external, compressed, NULL and skip pointers
+ * never set all of bits 0..3).  The
+ * proxy is 16-byte aligned (low 4 bits free for the tag) and lives at a
+ * userspace address with the skip-len high bits clear, so
+ * _ft_node_mask_ptr recovers it exactly.  The same encoding is valid in
+ * both forward child slots and parent slots, since both resolve a flag
+ * through this dispatch.
+ */
+#define FT_FLIP_PROXY_TYPE	7U
+#define FT_FLIP_PROXY_TAG	(FT_INTERNAL_MASK | (FT_FLIP_PROXY_TYPE << FT_INTERNAL_BITS))
+
+static inline_lookup
+bool ft_node_flip_proxy(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & (FT_INTERNAL_MASK | FT_TYPE_MASK))
+		== FT_FLIP_PROXY_TAG;
+}
+
+static inline_lookup
+struct urcu_flip_proxy *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
+{
+	return (struct urcu_flip_proxy *) _ft_node_mask_ptr(node);
+}
+
+static
+struct cds_ft_inode_flag *ft_flip_proxy_flag(struct urcu_flip_proxy *proxy)
+{
+	return (struct cds_ft_inode_flag *)
+		((unsigned long) proxy | FT_FLIP_PROXY_TAG);
+}
+
+/*
+ * Resolve a possibly-proxied flag to its current target.  Sits right
+ * after a parent / root pointer load on the read side; the common case
+ * (no merge in flight) is a single predicted-not-taken mask-compare, and
+ * the proxy deref is reached only during a merge's brief flip window.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
+{
+	if (caa_unlikely(ft_node_flip_proxy(node)))
+		return (struct cds_ft_inode_flag *)
+			urcu_flip_proxy_get(ft_flip_proxy_ptr(node));
+	return node;
+}
+
+
+/*
+ * Ordinal-cell tag + accessors (cell-always model).
+ *
+ * Every duplicate-chain HEAD has a library-owned ordinal cell (struct
+ * ft_ord_cell), and the head's cds_ft_node.prev points to it.  The head's
+ * flagged parent is relocated into ft_ord_cell.parent; the cell is the
+ * external head's metadata record, peer to internal/compressed metadata.
+ *
+ * The cell pointer is tagged with FT_INTERNAL_MASK (bit 0) so the head-vs-dup
+ * test ft_node_external(prev)==false is preserved (a non-head dup's prev is an
+ * untagged external cds_ft_node, bits 0-1 == 0).  Bit 0 is the ONLY tag: in a
+ * cell build a head's prev is ALWAYS a cell, so there is nothing to
+ * distinguish and no per-pointer marker is needed (32-bit safe).  Cells are
+ * >= 2-byte aligned, so bit 0 is free.
+ *
+ * The DOWNWARD child slots still point straight at the external node; the cell
+ * is interposed only on the UPWARD walk (parent recovery) and ordered
+ * traversal.  Every reader of a head's prev-as-parent resolves through
+ * ft_resolve_head_prev (identity outside the feature).
+ */
+#define FT_ORD_CELL_TAG		FT_INTERNAL_MASK
+
+static inline_lookup
+void *ft_ord_cell_flag(struct ft_ord_cell *cell)
+{
+	return (void *) ((unsigned long) cell | FT_ORD_CELL_TAG);
+}
+
+static inline_lookup
+struct ft_ord_cell *ft_ord_cell_ptr(const void *prev)
+{
+	return (struct ft_ord_cell *)
+		((unsigned long) prev & ~(unsigned long) FT_ORD_CELL_TAG);
+}
+
+/*
+ * Resolve a head's flagged parent from its (already-rcu_dereference'd) prev.
+ * When the group runs an ordinal-cell list, prev is a cell and the parent is
+ * rcu_dereference(cell->parent); otherwise prev IS the flagged parent (no cell
+ * interposed).  @ft selects the mode (the runtime cell-optional gate is added
+ * later; for now the cell branch is unconditional in cell builds).  Valid only
+ * for a head; a non-head dup's prev is the preceding node (callers gate on
+ * ft_node_external like before).
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *prev)
+{
+	if (ft->ordered_list)
+		return rcu_dereference(ft_ord_cell_ptr(prev)->parent);
+	return (struct cds_ft_inode_flag *) prev;
+}
+
+/*
+ * Read an ordinal-cell ord_next / ord_prev slot, resolving an in-flight
+ * flip-proxy.  The slots hold RAW (untagged) ft_ord_cell pointers, but a
+ * point-op splice transiently installs a tagged flip-proxy (the same type-7
+ * encoding as ft_resolve_flip_proxy) so the two directional edges flip
+ * atomically for a bidirectional ordered reader.  Raw cells are >= 8-byte
+ * aligned (bits 0-1 clear, like an external node) and proxies carry the
+ * type-7 tag, so the proxy test is unambiguous.  Under writer exclusion no
+ * proxy is installed at rest (a no-op on the write side).
+ */
+static inline_lookup
+struct ft_ord_cell *ft_ord_cell_resolve_ord(struct ft_ord_cell *const *slot)
+{
+	struct ft_ord_cell *p = rcu_dereference(*slot);
+
+	if (caa_unlikely(ft_node_flip_proxy((struct cds_ft_inode_flag *) p)))
+		p = (struct ft_ord_cell *) urcu_flip_proxy_get(
+			ft_flip_proxy_ptr((struct cds_ft_inode_flag *) p));
+	return p;
+}
+
+/*
+ * Cell lifecycle (FT-allocator arena).
+ *
+ * The cell is an item of the group's dedicated cell arena (a uniform 32 B
+ * item region, FT_ORD_CELL_ALLOC_ORDER), so cells pack contiguously for the
+ * dense ord-walk and are RELOCATABLE by cds_ft_compact.  The paired metadata
+ * slot is unused except its rcu_head, which cds_ft_free_item reuses to defer
+ * the free past a grace period; cds_ft_metadata_to_item / _item_to_metadata
+ * map between the cell and its metadata via the range header.
+ */
+
+/*
+ * Allocate a head's cell and wire it to @node with parent @parent (which
+ * may be NULL -- a root head -- or set later via ft_ord_cell_set_parent).
+ * The ord_prev / ord_next list links start empty; the ordered-list splice
+ * (runtime-gated by ordered_list_set) populates them later.  Returns the
+ * cell-tagged pointer to store into node->prev, or NULL on allocation
+ * failure (the caller fails the insert before mutating the trie).
+ */
+static
+void *ft_ord_cell_alloc(struct cds_ft *ft, struct cds_ft_node *node,
+		struct cds_ft_inode_flag *parent)
+{
+	struct cds_ft_metadata *meta = cds_ft_alloc_cell_item(ft);
+	struct ft_ord_cell *cell;
+
+	if (!meta)
+		return NULL;
+	cell = (struct ft_ord_cell *) cds_ft_metadata_to_item(meta);
+	cell->ord_prev = NULL;
+	cell->ord_next = NULL;
+	cell->node = node;
+	cell->parent = parent;
+	if (ft_debug_counters())
+		uatomic_inc(&ft->group->nr_cells_allocated);
+	return ft_ord_cell_flag(cell);
+}
+
+/*
+ * Release a head's cell after its key leaves the trie.  Routes through
+ * cds_ft_free_item, which defers the free past a grace period (concurrent
+ * mode) so an in-flight reader parked on a head it up-walks (head->prev ->
+ * cell -> cell->parent) never dereferences freed memory, frees synchronously
+ * in exclusive mode, and drains the cell range's nr_live for reclaim.
+ */
+static
+void ft_ord_cell_free(struct cds_ft *ft, struct ft_ord_cell *cell)
+{
+	if (ft_debug_counters())
+		uatomic_inc(&ft->group->nr_cells_freed);
+	cds_ft_free_item(ft, cds_ft_item_to_metadata(cell));
+}
+
+/*
+ * Immediate free for a cell that was never published (an insert that ended
+ * a duplicate or failed before @node became reachable): no reader can hold a
+ * reference, so the grace-period defer would only delay the free.
+ */
+static inline
+void ft_ord_cell_free_unpublished(struct cds_ft *ft, struct ft_ord_cell *cell)
+{
+	if (ft_debug_counters())
+		uatomic_inc(&ft->group->nr_cells_freed);
+	cds_ft_free_item_unpublished(ft, cds_ft_item_to_metadata(cell));
+}
+
+/*
+ * Set a head's relocated parent: in the cell-always model head->prev is the
+ * cell (set once at alloc) and the flagged parent lives in cell->parent.
+ * rcu_assign_pointer for the read-side up-walk (ft_resolve_head_prev does
+ * rcu_dereference(cell->parent)); @head must already carry its cell.
+ */
+static inline
+void ft_ord_cell_set_parent(struct cds_ft_node *head,
+		struct cds_ft_inode_flag *parent)
+{
+	rcu_assign_pointer(ft_ord_cell_ptr(head->prev)->parent, parent);
+}
+
+/*
+ * ft_node_holder: write-side resolution of a node's holder (the slot owner
+ * "above" it), independent of the cell relocation.
+ *
+ *   - non-head duplicate: prev is the predecessor cds_ft_node (external).
+ *   - head: prev is the flagged parent directly (non-cell build) or the
+ *     cell whose ->parent holds the flagged parent (cell build).
+ *   - never-inserted (prev NULL): returns NULL.
+ *
+ * Mutex-held callers (remove / replace / locate-chain-head) that previously
+ * read node->prev as the holder route through this so the cell indirection
+ * is transparent.  Identity in non-cell builds.
+ */
+static inline
+struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
+		const struct cds_ft_node *node)
+{
+	void *prev = node->prev;
+
+	if (ft_node_external((struct cds_ft_inode_flag *) prev))
+		return (struct cds_ft_inode_flag *) prev;
+	return ft_resolve_head_prev(ft, prev);
+}
+
+/*
+ * Record a fresh head's flagged parent.  Non-cell builds store it directly
+ * into the (pre-publish) head's prev; cell builds store it into the head's
+ * pre-wired cell (node->prev already carries the cell), leaving prev intact.
+ * For the fresh-head wiring sites only (the subsequent forward publish
+ * orders this store); existing-head re-parents use ft_set_parent / the
+ * external-nodes choke point, which resolve the cell themselves.
+ */
+#define ft_external_head_set_parent(ft, node, parent)			\
+	do {								\
+		if ((ft)->ordered_list)					\
+			ft_ord_cell_set_parent((node),			\
+				(struct cds_ft_inode_flag *) (parent));	\
+		else							\
+			(node)->prev = (parent);			\
+	} while (0)
+
+/*
+ * ft_publish_external_nodes_prev: Phase 2 -- publish the back-channel pointer
+ * up from the displaced/transferred external head @external_nodes to its
+ * (re-)parent @node_flag via rcu_assign_pointer.
+ *
+ * Call AFTER node_flag's own parent is wired (so an up-walker arriving via
+ * the new back-channel lands on a parent-wired cluster top, not a NULL
+ * parent), and at-or-just-before the forward publish that makes the cluster
+ * reachable through node_flag's slot.  No-op when @external_nodes is NULL
+ * (callers commonly guard on metadata->external_nodes).
+ *
+ * Ordered list on: @external_nodes is an existing head, so its prev already
+ * carries its cell; record the new parent into cell->parent (the head's
+ * prev -- the cell pointer -- is unchanged).  All choke-point callers
+ * re-parent an existing head (a fresh head's parent is wired by ft_set_parent
+ * via ft_node_set_nth), so the cell is guaranteed present.  List off / non-cell:
+ * the head's prev IS the flagged parent, so re-parent it directly.
+ */
+static inline
+void ft_publish_external_nodes_prev(struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_node *external_nodes)
+{
+	if (!external_nodes)
+		return;
+	if (ft->ordered_list)
+		ft_ord_cell_set_parent(external_nodes, node_flag);
+	else
+		rcu_assign_pointer(external_nodes->prev, node_flag);
+}
+
+static
+struct cds_ft_inode_flag *ft_compressed_node_flag(
+		struct cds_ft_compressed_node *node)
+{
+	return (struct cds_ft_inode_flag *)
+		(((unsigned long) node) | FT_COMPRESSED_MASK);
+}
+
+static inline_lookup
+struct cds_ft_compressed_node *ft_compressed_node_ptr(
+		struct cds_ft_inode_flag *node)
+{
+	return (struct cds_ft_compressed_node *)
+		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
+}
+
+/*
+ * ft_get_parent_rcu: read the parent pointer of @node via
+ * rcu_dereference.
+ *
+ * For external (leaf) nodes: returns cds_ft_node.prev.  @node must
+ * be the head of its duplicate chain (non-head duplicates' prev
+ * points to the preceding node in the chain, not to the parent).
+ * Iterators and lookups maintain this invariant by convention --
+ * iter->node always refers to the chain head.
+ *
+ * For internal/compressed nodes: returns metadata->parent.
+ *
+ * Returns NULL when @node is at the root position, or when @node
+ * has been orphaned by a concurrent detach / graft_swap that
+ * cleared its parent link.  A read-side parent-pointer walk that
+ * observes NULL terminates cleanly in either case.
+ *
+ * Read-side safe; the caller must be in an RCU read-side critical
+ * section (or QSBR equivalent).
+ *
+ * An assertion verifies the returned parent is never external: an
+ * external result would mean the caller passed a non-head duplicate
+ * chain entry (whose prev points at the preceding duplicate, not
+ * at the parent).
+ *
+ * Config-agnostic (only the flip-proxy resolve, a merge primitive,
+ * and basic accessors): kept here, ahead of the FEATURE_FT_SKIP_COMPRESSED
+ * block, so cds_ft_merge_at can use it in all build configs.
+ */
+static inline
+struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft *ft,
+		struct cds_ft_inode_flag *node)
+{
+	struct cds_ft_inode_flag *parent;
+
+	if (ft_node_external(node))
+		parent = ft_resolve_head_prev(ft,
+			rcu_dereference(((struct cds_ft_node *) node)->prev));
+	else if (ft_node_compressed(node))
+		/*
+		 * A compressed node's metadata lives at a FT_TAG_MASK-cleared
+		 * offset, not the FT_TYPE_MASK-cleared one ft_node_ptr uses; a
+		 * referenced compressed child re-parented by a merge reaches
+		 * here (after the caller resolves any skip form to its raw
+		 * compressed flag).
+		 */
+		parent = rcu_dereference(cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) ft_compressed_node_ptr(node))->parent);
+	else
+		parent = rcu_dereference(cds_ft_item_to_metadata(
+			ft_node_ptr(node))->parent);
+	/*
+	 * The parent slot may transiently hold a flip-proxy during a
+	 * cds_ft_merge_at commit; resolve it to the view-appropriate
+	 * (old or merged) parent before returning.
+	 */
+	parent = ft_resolve_flip_proxy(parent);
+	assert(!parent || !ft_node_external(parent));
+	return parent;
+}
+
+/* Skip-compressed pointer helpers. */
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+static inline
+bool ft_node_skip_compressed(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node >> FT_SKIP_LEN_SHIFT) != 0;
+}
+
+static inline
+unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
+{
+	return (unsigned long) node >> FT_SKIP_LEN_SHIFT;
+}
+
+/*
+ * ft_skip_child_ptr: extract the child tagged pointer from a skip
+ * pointer by clearing the skip-length bits.
+ */
+static inline
+struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
+{
+	return (struct cds_ft_inode_flag *) ((unsigned long) node & FT_ADDR_MASK);
+}
+
+/*
+ * ft_skip_compressed_flag: encode a skip pointer from a child pointer
+ * and the compressed path length.
+ */
+static
+struct cds_ft_inode_flag *ft_skip_compressed_flag(
+		struct cds_ft_inode_flag *child, unsigned int len)
+{
+	assert(len > 0 && len <= FT_SKIP_LEN_MAX);
+	/*
+	 * The encoding ORs len into the high bits of child.  If child
+	 * already carries skip-length bits (i.e., is itself a skip-
+	 * compressed pointer), the OR conflicts with len and produces
+	 * a corrupted nested encoding from which neither len nor child
+	 * can be recovered cleanly.  Chain-compress canonicalization
+	 * is responsible for ensuring that cn->child is never skip-
+	 * compressed at publish time (the "no two adjacent compresseds"
+	 * invariant).  Assert the invariant here so any future regression
+	 * fails loudly under -UNDEBUG smoke tests rather than silently
+	 * corrupting the trie.
+	 */
+	assert(((unsigned long) child >> FT_SKIP_LEN_SHIFT) == 0);
+	return (struct cds_ft_inode_flag *)
+		((unsigned long) child |
+		 ((unsigned long) len << FT_SKIP_LEN_SHIFT));
+}
+
+/*
+ * ft_skip_to_compressed: recover the compressed node from a skip
+ * pointer by following the child's parent back-pointer.
+ *
+ * For internal/compressed children: uses metadata->parent.
+ * For external (leaf) children: uses cds_ft_node.prev (which points
+ * to the parent for the head of a duplicate chain).
+ *
+ * No validation against the slot's skip_len: callers (including
+ * writers in mid-mutation, where the back-pointer and slot value
+ * are intentionally inconsistent for a brief window) get whatever
+ * the back-pointer currently says.  Reader paths that must observe
+ * a self-consistent slot+cn pair re-anchor via ft_skip_reanchor,
+ * which walks the skip child's live parent chain to the trie
+ * position the slot's skip_len encodes.
+ *
+ * Read-side safe (rcu_dereference on both fields).  Callers must be
+ * in an RCU read-side critical section (or QSBR equivalent).
+ */
+static inline
+struct cds_ft_compressed_node *ft_skip_to_compressed(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *skip_ptr)
+{
+	struct cds_ft_inode_flag *child = ft_skip_child_ptr(skip_ptr);
+	struct cds_ft_inode_flag *parent;
+
+	if (ft_node_external(child))
+		/*
+		 * @child is a head; resolve its flagged parent through
+		 * ft_resolve_head_prev, which branches on the group's ordered_list
+		 * mode (cell-indirect vs prev-direct).  A structural tag test is NOT
+		 * usable here: a skip pointer with a STALE target (a concurrent
+		 * split/merge moved the encoded position) can transiently make this
+		 * head's parent an internal node -- FT_INTERNAL_MASK, bit 0, the same
+		 * tag a cell carries -- so only the mode flag disambiguates safely.
+		 */
+		parent = ft_resolve_head_prev(ft,
+			rcu_dereference(((struct cds_ft_node *) child)->prev));
+	else
+		parent = rcu_dereference(cds_ft_item_to_metadata(
+			ft_node_ptr(child))->parent);
+	return ft_compressed_node_ptr(parent);
+}
+
+
+/*
+ * ft_skip_reanchor: the single concurrency-handling mechanism for skip-
+ * compressed pointers.  A skip slot encodes a length (skip_len), but the live
+ * compressed node recovered via the skip child's back-pointer may no longer
+ * match it (a concurrent split/merge changed the path between the slot and the
+ * child), so readers resolve the slot by re-anchoring rather than trusting the
+ * recovered node directly.
+ *
+ * Spinning to re-read the slot does NOT converge when the slot lives on a node
+ * that was recompacted away (frozen-stale) while the skip child was reparented
+ * to a different-length compressed by a concurrent split/merge: the frozen
+ * slot is never republished, so the reader would loop forever.  The skip child
+ * @G, however, is reachable in the LIVE trie (a live leaf or live internal), so
+ * its parent chain runs through live nodes that converge.  Walk it up,
+ * accumulating consumed path length (a compressed spans its len, an internal
+ * one byte), until the accumulated length reaches the slot's skip_len: that
+ * locates the live tree position the failing slot encoded.
+ *
+ *   - split (live path lengthened into prefix+branch+suffix at the same total
+ *     length): the accumulation lands exactly, @*rewind == 0; re-anchor at the
+ *     live node at the same depth.
+ *   - merge (live path shortened by absorbing the slot's level into a longer
+ *     compressed): the first hop already exceeds skip_len; the encoded position
+ *     is now interior to that compressed.  Re-anchor shallower (its parent) and
+ *     have the caller rewind its descent cursor by @*rewind bytes.
+ *
+ * @skip_ptr: the failing skip pointer (encodes child @G + skip_len).
+ * @rewind:   out -- bytes the caller must back its descent cursor/level up by.
+ * @at_pos:   out (may be NULL) -- the live node spanning/at the encoded position
+ *            (the merge target for rewind > 0).  Accumulator walkers (nth /
+ *            iter_skip) descend INTO it on rewind > 0, because re-scanning the
+ *            shallower holder would re-count its already-counted contributions.
+ *            Idempotent walkers (inequality minmax/sibling) and the precise
+ *            lookup ignore it and just re-scan / re-read the returned holder.
+ *
+ * Returns the live node holding the slot equivalent to the failing one (the
+ * caller re-anchors its descent there and re-reads / re-descends).  Never
+ * returns NULL on a well-formed trie: the writer wires every fresh cluster's
+ * parent (including the cluster top's, into the live parent) before the
+ * cluster becomes reachable, so the up-walk never observes a NULL parent.  All
+ * call sites assert anchor != NULL and treat any NULL return as a bug.  The
+ * defensive `return NULL` paths inside the walk (assert(0) + return NULL under
+ * NDEBUG; pathological guard exhaustion) exist only so a debug build aborts at
+ * the violation site instead of dereferencing NULL.
+ *
+ * Read-side only (rcu_dereference on every back-pointer); the caller must be in
+ * an RCU read-side critical section.
+ */
+static
+struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
+		struct cds_ft_inode_flag *skip_ptr,
+		unsigned int *rewind, struct cds_ft_inode_flag **at_pos)
+{
+	unsigned int want = ft_skip_len(skip_ptr);
+	unsigned int acc = 0;
+	struct cds_ft_inode_flag *cur = ft_skip_child_ptr(skip_ptr);	/* G */
+	int guard;
+
+	*rewind = 0;
+	if (at_pos)
+		*at_pos = NULL;
+	FT_TP(reanchor_enter, (const void *) skip_ptr, (const void *) cur, want);
+	for (guard = 0; guard < (int) FT_MAX_DEPTH + 2; guard++) {
+		struct cds_ft_inode_flag *parent;
+		void *pitem;
+
+		if (ft_node_external(cur))
+			parent = ft_resolve_head_prev(ft,
+				rcu_dereference(((struct cds_ft_node *) cur)->prev));
+		else
+			parent = rcu_dereference(cds_ft_item_to_metadata(
+				ft_node_ptr(cur))->parent);
+		/* A picked child's parent may be a flip-proxy mid-merge. */
+		parent = ft_resolve_flip_proxy(parent);
+		FT_TP(reanchor_walk, (const void *) cur, (const void *) parent, acc);
+		if (caa_unlikely(!parent)) {
+			/*
+			 * A NULL parent on the up-walk is a bug.  The walk runs
+			 * through LIVE nodes whose parents are wired before the node
+			 * becomes reader-reachable: a build-invisible commit connects
+			 * the whole fresh cluster's parents (including the top's)
+			 * before any live gateway exposes it
+			 * (ft_graft_glue_apply_deferred), and a detach nulls parent
+			 * only after a grace period (unobservable to an in-flight
+			 * reader).  The only legitimate NULL parent is the root's,
+			 * and the accumulation reaches @want at or below it -- there
+			 * are no root-level skip pointers -- so the walk never steps
+			 * onto it.
+			 */
+			assert(0);
+			return NULL;		/* defensive under NDEBUG */
+		}
+		pitem = ft_node_compressed(parent) ?
+			(void *) ft_compressed_node_ptr(parent) :
+			(void *) ft_node_ptr(parent);
+		acc += ft_node_compressed(parent) ?
+			ft_compressed_node_ptr(parent)->len : 1U;
+		if (acc >= want) {
+			/*
+			 * @parent is the node spanning (rewind > 0, a merge) or
+			 * sitting at (rewind == 0) the failing slot's encoded
+			 * position.  Return the node HOLDING the slot (its parent,
+			 * = the scanned node's live version for rewind == 0); also
+			 * hand back @parent itself via @at_pos so accumulator
+			 * walkers can descend INTO it for rewind > 0 (where
+			 * re-scanning the shallower holder would double-count).
+			 */
+			struct cds_ft_inode_flag *holder;
+
+			*rewind = acc - want;
+			if (at_pos)
+				*at_pos = parent;
+			/* Same flip-proxy resolve as the up-walk read above. */
+			holder = ft_resolve_flip_proxy(rcu_dereference(
+				cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) pitem)->parent));
+			/*
+			 * The holder is NULL only if @parent is the root -- the
+			 * encoded position is the root itself, i.e. a root-level
+			 * skip pointer, which mutators never produce.
+			 */
+			assert(holder != NULL);
+			return holder;
+		}
+		cur = parent;
+	}
+	return NULL;	/* pathological (cycle?): caller re-descends from root */
+}
+
+static inline
+bool ft_group_skip_compressed(const struct cds_ft_group *group)
+{
+	return group->flags & CDS_FT_FLAG_SKIP_COMPRESSED;
+}
+#else
+static inline
+bool ft_node_skip_compressed(struct cds_ft_inode_flag *node __attribute__((unused)))
+{
+	return false;
+}
+
+static inline
+unsigned int ft_skip_len(struct cds_ft_inode_flag *node __attribute__((unused)))
+{
+	return 0;
+}
+
+static inline
+struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
+{
+	return node;
+}
+
+static
+struct cds_ft_inode_flag *ft_skip_compressed_flag(
+		struct cds_ft_inode_flag *child,
+		unsigned int len __attribute__((unused)))
+{
+	return child;
+}
+
+static inline
+struct cds_ft_compressed_node *ft_skip_to_compressed(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *skip_ptr)
+{
+	(void) ft;
+	return ft_compressed_node_ptr(skip_ptr);
+}
+
+
+static inline
+bool ft_group_skip_compressed(const struct cds_ft_group *group __attribute__((unused)))
+{
+	return false;
+}
+
+#endif /* FEATURE_FT_SKIP_COMPRESSED */
+
+/*
+ * ft_set_parent_slot: record a node's slot within its parent as a
+ * pointer-stride offset (parent_slot_offset).  The raw byte offset is
+ * divided by sizeof(void *) (always 8 on 64-bit) so that the 8-bit
+ * field can cover the full pigeon node (2048 bytes / 8 = 256 slots,
+ * max index 255).
+ *
+ * Maintained for every internal/compressed node, not just
+ * skip-compressed ones: it lets the parent-pointer backtrack recover a
+ * node's parent slot in O(1) without re-descending, and it backs the
+ * skip-compressed dual-pointer publish / chain-merge canonicalization.
+ *
+ * When parent is NULL (root's child), the offset is unused --
+ * ft_get_parent_slot recovers &ft->root.
+ */
+/* Recover the branch byte indexing @slot in internal parent @node (defined
+ * after the popcount layout helpers). */
+static uint8_t ft_slot_to_byte(const struct cds_ft_type *type,
+		struct cds_ft_inode *node, struct cds_ft_inode_flag **slot);
+
+static inline
+void ft_set_parent_slot(struct cds_ft_metadata *meta,
+		struct cds_ft_inode_flag **slot)
+{
+	struct cds_ft_inode_flag *p;
+	bool parent_compressed;
+
+	if (!slot)
+		return;	/* Slot unknown -- preserve existing offset. */
+	if (!meta->parent) {
+		meta->parent_slot_offset = 0;
+		return;
+	}
+	meta->parent_slot_offset = (unsigned int)((char *) slot -
+		(char *) ft_node_ptr(meta->parent)) / sizeof(void *);
+	/*
+	 * Record this node's incoming branch byte for the up-walk key rebuild
+	 * (ft_rebuild_key_upwalk).  This is THE central populate point for every
+	 * slot-placed node (internal + compressed) -- it runs from ft_set_parent
+	 * AND ft_publish_to_parent, so all publish paths are covered without
+	 * threading the byte to each call site.  Derive it by inverting @slot
+	 * against the parent's bitmap (cold path).  Only meaningful when the
+	 * parent is an internal (slot-array) node: a compressed parent has no
+	 * slot array -- the edge byte lives in its key_bytes -- so skip it (the
+	 * up-walk likewise skips a node whose parent is compressed).
+	 */
+	p = meta->parent;
+	parent_compressed = ft_node_compressed(p);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	parent_compressed = parent_compressed || ft_node_skip_compressed(p);
+#endif
+	if (!parent_compressed)
+		meta->incoming_byte = ft_slot_to_byte(
+			&ft_types[ft_node_type(p)], ft_node_ptr(p), slot);
+}
+
+/*
+ * ft_get_parent_slot: recover a node's parent-slot address from the
+ * stored pointer-stride offset.
+ *
+ * The node body IS the packed child-pointer array (metadata lives in a
+ * sibling page), so offset 0 is a valid slot -- the node's first/lowest
+ * child.  A placed non-root child therefore always has a meaningful
+ * offset, including 0; the "no recorded slot" state is fully captured by
+ * parent == NULL (the root's child, recovered as &ft->root below).  Do
+ * NOT treat offset 0 as "unset": that aliases the lowest child of every
+ * node and silently drops its skip re-encode (ft_publish_to_parent /
+ * ft_node_recompact would skip it on a child-change, leaving a stale
+ * skip pointer in the parent slot).
+ *
+ * @ft is needed for the root case (parent == NULL).
+ */
+static inline
+struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta,
+		struct cds_ft *ft)
+{
+	if (!meta->parent)
+		return &ft->root;
+	return (struct cds_ft_inode_flag **)
+		((char *) ft_node_ptr(meta->parent) +
+		 (unsigned int) meta->parent_slot_offset * sizeof(void *));
+}
+
+/*
+ * ft_flag_to_metadata: get the metadata for any node flag, including
+ * skip-compressed pointers.  For skip pointers, returns the
+ * compressed node's metadata.  For all others, returns
+ * cds_ft_item_to_metadata(ft_node_ptr(nf)).
+ *
+ * Caller must ensure nf is not NULL and not external.
+ */
+static inline
+struct cds_ft_metadata *ft_flag_to_metadata(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *nf)
+{
+	(void) ft;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_skip_to_compressed(ft, nf);
+		return cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) cn);
+	}
+#endif
+	return cds_ft_item_to_metadata(ft_node_ptr(nf));
+}
+
+/*
+ * If @nf is a skip-compressed pointer, return the underlying
+ * compressed node's flag pointer.  Otherwise return @nf unchanged.
+ *
+ * Use to "see through" the skip-compressed encoding when about to
+ * inspect or recurse into the underlying compressed node.  No-op for
+ * non-skip pointers; on archs without FEATURE_FT_SKIP_COMPRESSED the
+ * check is constant-folded to false and the call collapses to a copy.
+ */
+static inline
+struct cds_ft_inode_flag *ft_resolve_skip_compressed(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *nf)
+{
+	(void) ft;
+	if (ft_node_skip_compressed(nf))
+		return ft_compressed_node_flag(ft_skip_to_compressed(ft, nf));
+	return nf;
+}
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+/*
+ * ft_skip_to_compressed_meta: shorthand to get the compressed node's
+ * metadata from a skip pointer.
+ */
+static inline
+struct cds_ft_metadata *ft_skip_to_compressed_meta(struct cds_ft *ft,
+		struct cds_ft_inode_flag *skip_ptr)
+{
+	return cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) ft_skip_to_compressed(ft, skip_ptr));
+}
+#endif
+
+/*
+ * ft_update_skip_pointer: when a compressed node's child is replaced
+ * (e.g., by recompact), update the skip pointer in the parent's slot
+ * to encode the new child address.
+ *
+ * @parent_slot: pointer to the slot holding the skip pointer (in the
+ *               grandparent node or root).
+ * @cn: the compressed node whose child was replaced.
+ *
+ * If the slot doesn't hold a skip pointer, this is a no-op.
+ */
+static inline
+void ft_update_skip_pointer(struct cds_ft_inode_flag **parent_slot,
+		struct cds_ft_compressed_node *cn)
+{
+	struct cds_ft_inode_flag *slot_val;
+
+	if (!parent_slot)
+		return;
+	slot_val = rcu_dereference(*parent_slot);
+	if (!ft_node_skip_compressed(slot_val))
+		return;
+	rcu_assign_pointer(*parent_slot,
+		ft_skip_compressed_flag(cn->child, cn->len));
+}
+
+/*
+ * ft_publish_to_parent: atomically publish @new_child into @parent_slot.
+ *
+ * If the parent is a compressed node, also update the skip pointer
+ * at *skip_slot (if one exists) BEFORE writing *parent_slot.  This
+ * ensures candidate readers (which follow the skip pointer) see the
+ * new child before exact/inequality readers (which follow cn->child).
+ *
+ * For compressed-form @new_child (SKIP_X or plain COMPRESSED), also
+ * maintains the underlying compressed node's parent_slot_offset so it
+ * records @parent_slot's offset in @parent_nf -- required by
+ * ft_get_parent_slot lookups (the dual-pointer dance above, and the
+ * chain-merge canonicalization in ft_detach_node that publishes a
+ * replacement at the cn's same grandparent slot).  Without this,
+ * compressed nodes installed via ft_publish_to_parent rather than via
+ * ft_node_set_nth -> ft_set_parent leave parent_slot_offset == 0 -- a
+ * latent gap that silently disabled the dual-pointer SKIP_X update
+ * and tripped chain-merge.  This intentionally does NOT update
+ * @new_child's parent linkage; callers manage that via their own
+ * ft_set_parent (or by direct meta->parent assignment), with
+ * semantics that vary across call sites.
+ *
+ * Centralizes the dual-pointer RCU publication pattern so every
+ * write to cn->child automatically maintains the skip pointer.
+ */
+static
+void ft_publish_to_parent(struct cds_ft *ft,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **parent_slot,
+		struct cds_ft_inode_flag *new_child)
+{
+	/*
+	 * Publication-ordering invariant: a child becomes observable by
+	 * downward traversal the instant it is published into a live parent
+	 * slot, so its parent back-pointer MUST already be wired.  Otherwise
+	 * a concurrent reader that descends to it and walks back up
+	 * (ft_skip_reanchor / ordered up-walk) reads a NULL/uninitialized
+	 * parent.  Applies to ALL child kinds (external -> prev,
+	 * internal/compressed -> metadata->parent); the root slot is the sole
+	 * exception (the root has no parent).  Catches forward-before-parent
+	 * bugs at their source.
+	 */
+#ifndef NDEBUG
+	if (new_child && parent_slot != &ft->root) {
+		struct cds_ft_inode_flag *cp;
+
+		/*
+		 * Check skip-compressed FIRST: a SKIP_X flag carries its
+		 * (external) child's low tag bits, so ft_node_external() would
+		 * misclassify it and dereference the tagged flag as a node.
+		 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_node_skip_compressed(new_child)) {
+			cp = cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_skip_to_compressed(ft, new_child))->parent;
+		} else
+#endif
+		if (ft_node_external(new_child)) {
+			/*
+			 * Cell-always: prev is the (non-NULL) cell pointer even
+			 * when the parent is unset, so resolve through the cell to
+			 * preserve the forward-before-parent check on cell->parent.
+			 */
+			cp = ft_resolve_head_prev(ft,
+				((struct cds_ft_node *) new_child)->prev);
+		} else {
+			cp = cds_ft_item_to_metadata(
+				ft_node_ptr(new_child))->parent;
+		}
+		assert(cp != NULL);
+	}
+#endif /* !NDEBUG */
+	/*
+	 * Maintain @new_child's parent-slot offset (parent_slot_offset) so
+	 * that it records the slot holding it within its parent node.  This
+	 * is the value ft_get_parent_slot(child_meta) recovers later -- used by
+	 * the parent-pointer backtrack to find a node's slot in O(1) without
+	 * re-descending, by dual-pointer publishes from cn->child
+	 * (ft_publish_to_parent itself, when called with parent_nf = cn) and
+	 * by chain-merge canonicalization (ft_detach_node) that publishes a
+	 * replacement at the same slot.
+	 *
+	 * Maintained for EVERY internal/compressed child (not just
+	 * compressed): the offset field is no longer skip-specific.  On
+	 * skip-on builds, without this, compressed nodes installed via
+	 * ft_publish_to_parent (rather than via ft_node_set_nth, which routes
+	 * through ft_set_parent) leave parent_slot_offset == 0 -- a latent gap
+	 * that silently disabled the dual-pointer SKIP_X update at the
+	 * grandparent slot and tripped chain-merge that *needs* the slot.
+	 * On plain-internal builds, the same gap would break the
+	 * parent-pointer backtrack's O(1) slot recovery.
+	 *
+	 * Externals carry no metadata / offset; skip them.  Test
+	 * skip-compressed FIRST: a SKIP_X flag carries its external child's
+	 * low tag bits, so ft_node_external() would misclassify it.
+	 *
+	 * We do NOT touch @new_child's parent linkage here; callers manage
+	 * that via their own ft_set_parent (or by direct meta->parent
+	 * assignment) before calling us.  ft_set_parent_slot computes the
+	 * offset relative to child_meta->parent, which callers have already
+	 * pointed at @parent_nf (the node holding @parent_slot).
+	 *
+	 * Skip the update at the root slot (&ft->root): root nodes have
+	 * no parent, and ft_set_parent_slot's offset computation assumes
+	 * the slot lives inside a node-arena chunk.
+	 */
+	if (new_child && parent_slot != &ft->root) {
+		struct cds_ft_metadata *child_meta = NULL;
+
+		if (ft_node_skip_compressed(new_child))
+			child_meta = cds_ft_item_to_metadata(
+				(struct cds_ft_inode *)
+					ft_skip_to_compressed(ft, new_child));
+		else if (!ft_node_external(new_child))
+			child_meta = cds_ft_item_to_metadata(
+				ft_node_ptr(new_child));
+		if (child_meta && child_meta->parent)
+			ft_set_parent_slot(child_meta, parent_slot);
+	}
+
+	if (parent_nf && ft_node_compressed(parent_nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(parent_nf);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) cn);
+
+		/* Consumed via FEATURE_FT_SKIP_COMPRESSED and FT_TP only. */
+		(void) cn;
+		(void) cn_meta;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		{
+			struct cds_ft_inode_flag **skip_slot =
+				ft_get_parent_slot(cn_meta, ft);
+			if (skip_slot &&
+			    ft_node_skip_compressed(*skip_slot))
+				rcu_assign_pointer(*skip_slot,
+					ft_skip_compressed_flag(
+						new_child, cn->len));
+		}
+#endif
+		/*
+		 * Re-emit compressed_publish so consumers tracking
+		 * cn -> child relationships pick up the new subtree
+		 * attached under this compressed node.  The initial
+		 * creation-time compressed_publish event has
+		 * parent = NULL (the compressed node is not yet
+		 * attached); here we report cn_meta->parent since the
+		 * compressed node is already in the trie.
+		 */
+		FT_TP(compressed_publish,
+			(const void *) ft_compressed_node_flag(cn),
+			cn->len,
+			cn->key_bytes,
+			(const void *) new_child,
+			(const void *) cn_meta->parent);
+	}
+	FT_TP(publish_to_parent, (const void *) parent_nf,
+		(const void *) parent_slot,
+		(const void *) *parent_slot,
+		(const void *) new_child);
+	/*
+	 * When parent_slot points at ft->root, emit root_publish so
+	 * consumers can track the top of the trie through root
+	 * rewrites that have no structural parent node.
+	 */
+	if (parent_slot == &ft->root)
+		FT_TP(root_publish, (const void *) ft,
+			(const void *) new_child);
+	rcu_assign_pointer(*parent_slot, new_child);
+}
+
+/*
+ * ft_publish_compressed: convert a compressed node flag to a skip
+ * pointer if skip-compressed mode is enabled, the path length fits,
+ * and the child has metadata (is not external).
+ *
+ * Call AFTER ft_set_parent has been done with the real compressed
+ * flag (@cflag).  The returned value is what should be
+ * published/stored in parent child slots.
+ */
+static
+struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
+		struct cds_ft_compressed_node *cn,
+		struct cds_ft_inode_flag *cflag)
+{
+	/*
+	 * Emit creation-time compressed_publish so trace consumers
+	 * learn the cn->child binding for every newly-allocated
+	 * compressed node, regardless of which creation path built
+	 * it (ft_build_compressed_node, compressed-split sfx/pfx/nb,
+	 * graft-split suffix/prefix).  parent is NULL here: the cn
+	 * is about to be returned to the caller for attachment;
+	 * cn_meta->parent is still unset.  A subsequent
+	 * ft_publish_to_parent / ft_node_set_nth on the slot that
+	 * holds this cn fires tree_edge_set (with the cn as child),
+	 * which -- paired with this event -- gives the consumer both
+	 * ends: the parent->cn edge and the cn->child edge.
+	 */
+	FT_TP(compressed_publish,
+		(const void *) ft_compressed_node_flag(cn),
+		cn->len,
+		cn->key_bytes,
+		(const void *) cn->child,
+		(const void *) NULL);
+	if (ft_group_skip_compressed(ft->group) &&
+	    cn->len <= FT_SKIP_LEN_MAX) {
+		return ft_skip_compressed_flag(cn->child, cn->len);
+	}
+	return cflag;
+}
+
+/*
+ * ft_set_parent: set the parent pointer in child's metadata.
+ * Skips NULL children.
+ *
+ * External (leaf) nodes: sets cds_ft_node.prev (head of duplicate chain).
+ *
+ * For skip-compressed pointers: the skip pointer represents a
+ * compressed node in the trie.  Set the compressed node's parent
+ * (not the compressed node's child's parent, which is the
+ * compressed node itself and was set at creation time).
+ *
+ * Skip-compressed must be checked before external: a skip pointer
+ * whose child is external has low tag bits == 0, which would match
+ * ft_node_external on the raw value.
+ *
+ * Write-side only (mutex-held).
+ */
+/*
+ * ft_set_parent: set the parent pointer in child's metadata,
+ * and optionally set skip_slot for skip-compressed children.
+ *
+ * @child_nf:  child node flag (may be skip-compressed, external, etc.)
+ * @parent_nf: parent node flag to record.
+ * @slot:      address of the slot in the parent that holds @child_nf.
+ *             When @child_nf is skip-compressed and @slot is non-NULL,
+ *             the compressed node's skip_slot is set to @slot.
+ *             Pass NULL when the slot is unknown or irrelevant.
+ */
+static
+void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot)
+{
+	(void) ft;
+	if (!child_nf)
+		return;
+	/*
+	 * A type-7 flip proxy is a transient slot VALUE (a one-commit insert
+	 * or merge flip in progress), not a node: the REAL child's
+	 * back-pointer is wired by the parking mutator itself.  No-op so the
+	 * generic re-parent loops (recompact's child sweep, set_nth's
+	 * post-store wiring) flow over a parked slot unharmed -- dispatching
+	 * below would misread the proxy latch as internal-node metadata.
+	 */
+	if (caa_unlikely(ft_node_flip_proxy(child_nf)))
+		return;
+	FT_TP(set_parent, (const void *) child_nf, (const void *) parent_nf);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(child_nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_skip_to_compressed(ft, child_nf);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) cn);
+		rcu_assign_pointer(cn_meta->parent, parent_nf);
+		ft_set_parent_slot(cn_meta, slot);
+		return;
+	}
+	if (ft_node_compressed(child_nf)) {
+		/*
+		 * Plain COMPRESSED form (no SKIP_X wrap): typically
+		 * arises when ft_publish_compressed gates SKIP-X off
+		 * for a non-spec EXT child.  Maintain the cn's
+		 * parent_slot_offset just like the SKIP_X branch above so
+		 * later ft_publish_to_parent / chain-merge calls can
+		 * recover the slot in cn's parent via
+		 * ft_get_parent_slot.
+		 */
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(child_nf);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) cn);
+		rcu_assign_pointer(cn_meta->parent, parent_nf);
+		ft_set_parent_slot(cn_meta, slot);
+		return;
+	}
+#endif
+	if (ft_node_external(child_nf)) {
+		/*
+		 * Ordered list on: the head carries its cell in prev; record the
+		 * parent into cell->parent (fresh head: cell pre-wired at insert;
+		 * existing head re-parent: cell already present).  List off / non-cell:
+		 * the parent is the head's prev directly.  rcu_assign either way:
+		 * ft_set_parent re-parents live heads on the restructure path.
+		 */
+		if (ft->ordered_list)
+			ft_ord_cell_set_parent((struct cds_ft_node *) child_nf,
+				parent_nf);
+		else
+			rcu_assign_pointer(
+				((struct cds_ft_node *) child_nf)->prev,
+				parent_nf);
+		return;
+	}
+	{
+		/*
+		 * Plain internal child: record its parent AND its slot offset
+		 * within the parent, so the parent-pointer backtrack can recover
+		 * the slot in O(1) (ft_get_parent_slot) without re-descending.
+		 * ft_set_parent_slot reads meta->parent, so set it first.
+		 */
+		struct cds_ft_metadata *meta =
+			cds_ft_item_to_metadata(ft_node_ptr(child_nf));
+
+		/*
+		 * Publish the up-walk key byte BEFORE the parent pointer.  A node
+		 * re-homed from a COMPRESSED parent (which skips incoming_byte,
+		 * leaving it 0) to an INTERNAL parent gets its real branch byte
+		 * here.  If we published meta->parent first (as ft_set_parent_slot
+		 * needs, to compute the offset) a concurrent up-walk that follows
+		 * the new parent would read the still-stale 0 byte and reconstruct
+		 * a key with a hole at this level.  Pre-store it under the explicit
+		 * @parent_nf and let the rcu_assign release order it; ft_set_parent_
+		 * slot below recomputes the same byte (idempotent) plus the offset.
+		 */
+		if (slot && parent_nf && !ft_node_compressed(parent_nf)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				&& !ft_node_skip_compressed(parent_nf)
+#endif
+		   )
+			meta->incoming_byte = ft_slot_to_byte(
+				&ft_types[ft_node_type(parent_nf)],
+				ft_node_ptr(parent_nf), slot);
+		rcu_assign_pointer(meta->parent, parent_nf);
+		ft_set_parent_slot(meta, slot);
+	}
+}
+
+#ifdef FT_ENABLE_TRACING
+/*
+ * Map a tagged cds_ft_inode_flag pointer to a symbolic node-kind
+ * value (enum ft_tp_node_kind, defined in fractal-trie-internal.h
+ * and exposed as the LTTng enum ft_tp_node_kind in src/cds_ft_tp.h).
+ * Uses a single 16-entry compile-time dispatch table indexed by the
+ * type-selecting bits of the pointer, so the runtime helper reduces
+ * to a NULL/skip check plus one table load.
+ */
+
+/*
+ * Single dispatch table indexed by the low 4 bits of a tagged
+ * cds_ft_inode_flag pointer -- exactly the bits that select the node
+ * type:
+ *   - bit 0      = FT_INTERNAL_MASK (1 = internal node)
+ *   - bits 1..3  = type index (when internal) or class selector
+ *                  (when not: 00=external, 01=compressed)
+ *
+ * Compressed nodes are 16-byte aligned, so bit 3 is guaranteed zero
+ * for them.  External nodes need only 8-byte alignment (low 3 bits
+ * = 000), so bit 3 may be either value -- both [0b0000] and [0b1000]
+ * map to EXTERNAL.
+ *
+ * Skip-compressed pointers are special-cased before the table lookup
+ * (the only exception); the table itself is a pure pointer-bits
+ * dispatch.
+ *
+ * Slot value 0 (FT_TP_NODE_NULL) doubles as a "no entry" sentinel
+ * that resolves to FT_TP_NODE_UNKNOWN; NULL pointers are caught by
+ * the explicit nf != NULL check before any table access.
+ */
+#define FT_TP_KIND_TABLE_MASK	0xFU
+
+/* Pointer-bits encoding for internal-node type index `idx` (0..7). */
+#define FT_TP_INTERNAL_TAG(idx)	\
+	(((unsigned int) (idx) << FT_INTERNAL_BITS) | FT_INTERNAL_MASK)
+
+/*
+ * Compile-time pickers that map a single ft_types[] entry's sizing
+ * parameters to an FT_TP_NODE_* constant.  All arguments are integer
+ * constant expressions (sizing enums and order constants), so each
+ * conditional collapses to one constant during compilation.
+ */
+#define FT_TP_KIND_P2L(ord) (					\
+	(ord) == 5 ? FT_TP_NODE_P2L_32 :			\
+	(ord) == 6 ? FT_TP_NODE_P2L_64 :			\
+	(ord) == 7 ? FT_TP_NODE_P2L_128 :			\
+	FT_TP_NODE_UNKNOWN)
+#define FT_TP_KIND_P1L(ord) (					\
+	(ord) == 7  ? FT_TP_NODE_P1L_128 :			\
+	(ord) == 8  ? FT_TP_NODE_P1L_256 :			\
+	(ord) == 9  ? FT_TP_NODE_P1L_512 :			\
+	(ord) == 10 ? FT_TP_NODE_P1L_1024 :			\
+	FT_TP_NODE_UNKNOWN)
+#define FT_TP_KIND_PIGEON(ord) (				\
+	(ord) == 10 ? FT_TP_NODE_PIGEON_1024 :			\
+	(ord) == 11 ? FT_TP_NODE_PIGEON_2048 :			\
+	FT_TP_NODE_UNKNOWN)
+
+static const uint8_t ft_tp_kind_table[FT_TP_KIND_TABLE_MASK + 1] = {
+	/* External: low 3 bits = 000; bit 3 unconstrained. */
+	[0x0]				= FT_TP_NODE_EXTERNAL,
+	[0x8]				= FT_TP_NODE_EXTERNAL,
+	/* Compressed: low 3 bits = 010, bit 3 = 0 (16-byte aligned). */
+	[FT_COMPRESSED_MASK]		= FT_TP_NODE_COMPRESSED,
+	/*
+	 * Internal nodes: bit 0 set, bits 1..3 = type index.  Each
+	 * arch-specific ft_types[] is mapped via FT_TP_KIND_*().
+	 */
+#if (CAA_BITS_PER_LONG < 64)
+	[FT_TP_INTERNAL_TAG(0)]		= FT_TP_KIND_P2L(5),
+	[FT_TP_INTERNAL_TAG(1)]		= FT_TP_KIND_P2L(6),
+	[FT_TP_INTERNAL_TAG(2)]		= FT_TP_KIND_P1L(7),
+	[FT_TP_INTERNAL_TAG(3)]		= FT_TP_KIND_P1L(8),
+	[FT_TP_INTERNAL_TAG(4)]		= FT_TP_KIND_P1L(9),
+	[FT_TP_INTERNAL_TAG(5)]		= FT_TP_KIND_PIGEON(10),
+	/* idx 6 = NODE_INDEX_NULL: never encoded in a pointer. */
+#else
+	[FT_TP_INTERNAL_TAG(0)]		= FT_TP_KIND_P2L(5),
+	[FT_TP_INTERNAL_TAG(1)]		= FT_TP_KIND_P2L(6),
+	[FT_TP_INTERNAL_TAG(2)]		= FT_TP_KIND_P2L(7),
+	[FT_TP_INTERNAL_TAG(3)]		= FT_TP_KIND_P1L(8),
+	[FT_TP_INTERNAL_TAG(4)]		= FT_TP_KIND_P1L(9),
+	[FT_TP_INTERNAL_TAG(5)]		= FT_TP_KIND_P1L(10),
+	[FT_TP_INTERNAL_TAG(6)]		= FT_TP_KIND_PIGEON(11),
+#endif
+};
+
+uint16_t ft_tp_node_kind(struct cds_ft_inode_flag *nf)
+{
+	uint8_t kind;
+
+	if (!nf)
+		return FT_TP_NODE_NULL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * Skip-compression is orthogonal to the underlying node type: a
+	 * skip pointer still points to a real child (external or
+	 * internal).  Strip the skip-length bits so the dispatch table
+	 * sees the underlying child's tag bits; the companion
+	 * ft_tp_node_skip_len() field exposes the skip length separately.
+	 */
+	if (ft_node_skip_compressed(nf))
+		nf = ft_skip_child_ptr(nf);
+#endif
+	kind = ft_tp_kind_table[(unsigned long) nf & FT_TP_KIND_TABLE_MASK];
+	return kind ? kind : FT_TP_NODE_UNKNOWN;
+}
+
+/*
+ * Return the number of key bytes the skip pointer covers (i.e. the
+ * length of the skipped compressed path).  Zero means "not a skip
+ * pointer".  The value fits in a uint16_t since FT_SKIP_LEN_MAX is at
+ * most 255 on any supported architecture.
+ */
+uint16_t ft_tp_node_skip_len(struct cds_ft_inode_flag *nf)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (!nf || !ft_node_skip_compressed(nf))
+		return 0;
+	return (uint16_t) ft_skip_len(nf);
+#else
+	(void) nf;
+	return 0;
+#endif
+}
+#endif /* FT_ENABLE_TRACING */
+
+
+/*
+ * Return codes for compressed node traversal helpers.
+ * Used to tell callers which loop control action to take.
+ */
+enum ft_descent_action {
+	FT_DESCENT_CONTINUE,		/* Continue loop iteration. */
+	FT_DESCENT_BREAK,		/* Break from loop. */
+	FT_DESCENT_END,		/* Jump to function end (status set). */
+	FT_DESCENT_GOING_UP,		/* Jump to going_up backtracking. */
+	FT_DESCENT_DESCEND_CHILDREN,	/* Jump to descend_children. */
+	FT_DESCENT_FOUND_MINMAX,	/* Jump to found_minmax label. */
+};
+
+/*
+ * Compare @cmp key bytes starting at @key against the compressed
+ * node's path.  Returns the number of matching bytes.  A return
+ * value == @cmp means full match; < @cmp means divergence at that
+ * position.
+ */
+static inline
+unsigned int ft_match_compressed_key(const uint8_t *key,
+		const struct cds_ft_compressed_node *cn,
+		unsigned int cmp)
+{
+	unsigned int pos;
+
+	if (ft_key_cmp_ordinals(key, cn->key_bytes, cmp, cmp, false, &pos) != 0)
+		return pos;
+	return cmp;
+}
+
+/*
+ * Fill ordinal_key for every level spanned by a compressed node.  Used
+ * by read-side descent loops (lookup_nth, minmax, etc.) to record the
+ * ordinal key bytes through compressed nodes; the going-up backtrack
+ * recovers per-level nodes from the live parent chain, not a path array.
+ */
+static inline
+void ft_fill_compressed_path(struct cds_ft_compressed_node *cn,
+		uint8_t *ordinal_key, int base)
+{
+	int j;
+
+	for (j = 0; j < cn->len; j++)
+		ordinal_key[base + j] = cn->key_bytes[j];
+}
+
+static
+bool valid_external_node(struct cds_ft_node *node)
+{
+	return node != NULL && ft_node_external((struct cds_ft_inode_flag *) node);
+}
+
+/*
+ * Return the metadata of the root node.
+ *
+ * ft->root always points to an arena-allocated internal node, even
+ * when the trie is empty (nr_child == 0).  The node itself may be
+ * replaced by graft or graft-swap, but the invariant on the slot
+ * is maintained across all operations.  Its metadata holds:
+ *   - nr_child:       number of children in the root node.
+ *   - external_nodes: list of NIL-key (key_len == 0) entries.
+ *
+ * The root is a regular internal node whose metadata is accessed the
+ * same way as any other node's.  Its metadata carries the NIL-key
+ * entries, so transplanting a root node between tries is a single
+ * pointer swap with no metadata relocation.
+ *
+ * This function is only meant to be used from update functions, _not_
+ * safe for use by read-side.
+ */
+static inline
+struct cds_ft_metadata *ft_root_metadata(const struct cds_ft *ft)
+{
+	return cds_ft_item_to_metadata(ft_node_ptr(ft->root));
+}
+
+/*
+ * Descent cursor -- tracks current, parent, and grandparent positions
+ * during a key-guided traversal of the trie.
+ *
+ * Each level stores both the flagged-pointer value (nf / pnf / ppnf)
+ * and the address of the slot that holds it (nfp / pnfp / ppnfp).
+ * Callers that do not need every field may leave the unused ones
+ * NULL; the struct carries the superset so that a single descent
+ * helper can serve graft, insert, remove, and detach paths.
+ */
+struct ft_descent {
+	unsigned int depth;			/* Levels traversed (0 .. key_len). */
+	struct cds_ft_inode_flag *nf;		/* Current node-flag value. */
+	struct cds_ft_inode_flag **nfp;		/* Slot that holds @nf. */
+	struct cds_ft_inode_flag *pnf;		/* Parent node-flag value. */
+	struct cds_ft_inode_flag **pnfp;	/* Slot that holds @pnf. */
+	struct cds_ft_inode_flag *ppnf;		/* Grandparent node-flag value. */
+	struct cds_ft_inode_flag **ppnfp;	/* Slot that holds @ppnf. */
+};
+
+static
+void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
+{
+	d->depth = 0;
+	d->nf = ft->root;
+	d->nfp = &ft->root;
+	d->pnf = NULL;
+	d->pnfp = NULL;
+	d->ppnf = NULL;
+	d->ppnfp = NULL;
+}
+
+/*
+ * Advance descent state through a compressed node on full key match.
+ * Updates parent chain, current pointer, and depth.  The caller is
+ * responsible for snapshot, snapshot_n, and detach tracking before
+ * calling this helper.
+ */
+static inline_lookup
+void ft_descent_traverse_compressed(struct ft_descent *d,
+		struct cds_ft_compressed_node *cn,
+		const uint8_t **iter_key)
+{
+	d->ppnf  = d->pnf;
+	d->ppnfp = d->pnfp;
+	d->pnf   = d->nf;
+	d->pnfp  = d->nfp;
+	d->nf    = cn->child;
+	d->nfp   = &cn->child;
+	d->depth += cn->len;
+	*iter_key += cn->len;
+}
+
+static
+bool valid_key_len(struct cds_ft *ft, size_t key_len)
+{
+	size_t max_key_len = ft->group->max_key_len;
+
+	assert(max_key_len != CDS_FT_MAX_LEN_UNLIMITED);
+	if (key_len == CDS_FT_LEN_ERROR || key_len > max_key_len)
+		return false;
+	return true;
+}
+
+static
+struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
+		const struct cds_ft_type *ft_type,
+		struct cds_ft_metadata **_metadata)
+{
+	struct cds_ft_metadata *metadata;
+	void *p;
+
+	metadata = cds_ft_alloc_item(ft, ft_type->order, ft_type->bitmap);
+	if (!metadata) {
+		return NULL;
+	}
+	p = cds_ft_metadata_to_item(metadata);
+	/*
+	 * Popcount node data[] starts with a presence bitmap, followed
+	 * by the pointer table.  The allocator returns zeroed memory,
+	 * which is the initial "no children" state (bitmap = 0, so all
+	 * lookups return NULL; nr_child derived from popcount returns 0).
+	 */
+	if (ft_debug_counters()) {
+		uatomic_inc(&ft->group->nr_nodes_allocated);
+		uatomic_inc(&ft->group->nr_internal_alloc);
+	}
+	*_metadata = metadata;
+	return p;
+}
+
+static
+void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
+{
+	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
+
+	cds_ft_free_item(ft, metadata);
+	if (ft_debug_counters() && node) {
+		uatomic_inc(&ft->group->nr_nodes_freed);
+		uatomic_inc(&ft->group->nr_internal_freed);
+	}
+}
+
+/*
+ * Immediate-free variant for internal nodes that never escape the
+ * writer's stack (e.g., nodes built by an attach/split/recompact
+ * helper but freed by an -ENOMEM error path before publication).
+ * See cds_ft_free_item_unpublished for the safety contract.
+ */
+static
+void free_cds_ft_node_unpublished(struct cds_ft *ft, struct cds_ft_inode *node)
+{
+	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
+
+	cds_ft_free_item_unpublished(ft, metadata);
+	if (ft_debug_counters() && node) {
+		uatomic_inc(&ft->group->nr_nodes_freed);
+		uatomic_inc(&ft->group->nr_internal_freed);
+	}
+}
+
+/*
+ * Compute the arena allocation order for a compressed node with
+ * @path_len key bytes.  The compressed node layout is:
+ *   [child pointer] [len byte] [key_bytes...]
+ */
+static
+unsigned int ft_compressed_order(uint8_t path_len)
+{
+	size_t size = offsetof(struct cds_ft_compressed_node, key_bytes) + path_len;
+	int order = urcu_get_count_order_ulong(size);
+
+	if (order < 4)
+		order = 4;	/* Minimum arena order. */
+	return (unsigned int) order;
+}
+
+static
+struct cds_ft_compressed_node *alloc_compressed_node(struct cds_ft *ft,
+		uint8_t path_len,
+		struct cds_ft_metadata **_metadata)
+{
+	struct cds_ft_metadata *metadata;
+	void *p;
+	unsigned int order = ft_compressed_order(path_len);
+
+	metadata = cds_ft_alloc_compressed_item(ft, order);
+	if (!metadata)
+		return NULL;
+	p = cds_ft_metadata_to_item(metadata);
+	if (ft_debug_counters()) {
+		uatomic_inc(&ft->group->nr_nodes_allocated);
+		uatomic_inc(&ft->group->nr_compressed_alloc);
+	}
+	*_metadata = metadata;
+	return p;
+}
+
+static
+void free_compressed_node(struct cds_ft *ft,
+		struct cds_ft_compressed_node *node)
+{
+	struct cds_ft_metadata *metadata =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
+
+	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(node));
+	cds_ft_free_item(ft, metadata);
+	if (ft_debug_counters() && node) {
+		uatomic_inc(&ft->group->nr_nodes_freed);
+		uatomic_inc(&ft->group->nr_compressed_freed);
+	}
+}
+
+/*
+ * Immediate-free variant for compressed nodes that never escape the
+ * writer's stack (e.g., -ENOMEM error paths in build/split helpers).
+ * See cds_ft_free_item_unpublished for the safety contract.
+ */
+static
+void free_compressed_node_unpublished(struct cds_ft *ft,
+		struct cds_ft_compressed_node *node)
+{
+	struct cds_ft_metadata *metadata =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
+
+	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(node));
+	cds_ft_free_item_unpublished(ft, metadata);
+	if (ft_debug_counters() && node) {
+		uatomic_inc(&ft->group->nr_nodes_freed);
+		uatomic_inc(&ft->group->nr_compressed_freed);
+	}
+}
+
+#define __FT_ALIGN_MASK(v, mask)	(((v) + (mask)) & ~(mask))
+#define FT_ALIGN(v, align)		__FT_ALIGN_MASK(v, (typeof(v)) (align) - 1)
+#define __FT_FLOOR_MASK(v, mask)	((v) & ~(mask))
+#define FT_FLOOR(v, align)		__FT_FLOOR_MASK(v, (typeof(v)) (align) - 1)
+
+/*
+ * Push a node and its depth onto the snapshot stack, maintaining the
+ * parallel snapshot_depth[] array alongside snapshot[].
+ */
+#define ft_snapshot_push(snap, snap_depth, nr, node_flag, depth)	\
+	do {								\
+		(snap_depth)[(nr)] = (depth);				\
+		(snap)[(nr)++] = (node_flag);				\
+	} while (0)
+

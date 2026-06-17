@@ -15,7 +15,14 @@ COMPAT = compat_futex.c
 
 FRACTAL_TRIE = fractal-trie/fractal-trie.c fractal-trie/fractal-trie-alloc.c \
 	fractal-trie/fractal-trie-internal.h fractal-trie/fractal-trie-trace.h \
-	fractal-trie/cds_ft_tp.c fractal-trie/cds_ft_tp.h
+	fractal-trie/cds_ft_tp.c fractal-trie/cds_ft_tp.h \
+	fractal-trie/ft-helpers.h fractal-trie/ft-scanners.h \
+	fractal-trie/ft-descent.h fractal-trie/ft-lookup.h \
+	fractal-trie/ft-inequality.h fractal-trie/ft-insert.h \
+	fractal-trie/ft-remove.h fractal-trie/ft-graft.h \
+	fractal-trie/ft-detach.h fractal-trie/ft-merge.h \
+	fractal-trie/ft-lifecycle.h fractal-trie/ft-verify.h \
+	fractal-trie/ft-compact.h
 
 RCULFHASH = rculfhash.c rculfhash-mm-order.c rculfhash-mm-chunk.c \
 		rculfhash-mm-mmap.c
