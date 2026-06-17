@@ -15,12 +15,6 @@
 #error "ft-scanners.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
-static inline_lookup
-uint8_t *align_ptr_size(uint8_t *ptr)
-{
-	return (uint8_t *) FT_ALIGN((unsigned long) ptr, sizeof(void *));
-}
-
 /*
  * Forward declarations for the 2-level popcount-bitmap node helpers.
  * Definitions follow further down (after the ft_dereference_acquire_*
@@ -108,7 +102,8 @@ uint8_t ft_popcount_node_get_nr_child(const struct cds_ft_type *type,
  * removing the dependency on the URCU_DEREFERENCE_USE_VOLATILE
  * escape hatch.
  */
-static inline void ft_maybe_prefetch(const void *ptr)
+static inline_lookup
+void ft_maybe_prefetch(const void *ptr)
 {
 	/*
 	 * Prefetch the RAW pointer without clearing the skip-compressed
@@ -154,7 +149,8 @@ static inline void ft_maybe_prefetch(const void *ptr)
  * traffic the temporal adjacent prefetch adds.  Same internal-only FT_TAG_MASK
  * guard (leaves are the random/use-once 2 MiB-page foot-gun -- see above).
  */
-static inline void ft_maybe_prefetch_nta(const void *ptr)
+static inline_lookup
+void ft_maybe_prefetch_nta(const void *ptr)
 {
 	if (((unsigned long) ptr & FT_TAG_MASK) != 0)
 		__builtin_prefetch(ptr, 0, 0);
@@ -226,7 +222,7 @@ enum ft_pf_target {
 	FT_PF_DATA,
 };
 
-static inline __attribute__((always_inline))
+static inline_lookup
 void ft_maybe_prefetch_hint(const void *ptr, enum ft_pf_target hint)
 {
 	switch (hint) {
@@ -3464,7 +3460,7 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
  * On full match with external child, returns FT_DESCENT_BREAK.
  * On full match with non-external child, returns FT_DESCENT_CONTINUE.
  */
-static inline
+static inline_lookup
 enum ft_descent_action ft_traverse_compressed(
 		struct cds_ft_inode_flag **node_flag_p,
 		struct cds_ft_inode_flag ***node_flag_ptr_p,
@@ -3497,18 +3493,3 @@ enum ft_descent_action ft_traverse_compressed(
 		return FT_DESCENT_BREAK;
 	return FT_DESCENT_CONTINUE;
 }
-
-/*
- * do_cds_ft_lookup_inner: descent template.
- *
- * @descend_cand and @skip_compressed are compile-time constants at
- * every call site (the four specialization wrappers below pass true /
- * false literals).  always_inline + literal arguments lets the compiler
- * constant-fold the per-iter branches on these flags:
- *   - loop-top skip-compressed resolution
- *   - get_nth dispatch
- *   - post-get_nth skip-compressed resolution
- * Eliminates the per-iter `test %sil, %sil` hot spot identified via
- * perf annotate.
- */
-static inline_lookup

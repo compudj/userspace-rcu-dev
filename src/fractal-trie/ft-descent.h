@@ -15,6 +15,20 @@
 #error "ft-descent.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+/*
+ * do_cds_ft_lookup_inner: descent template.
+ *
+ * @descend_cand and @skip_compressed are compile-time constants at
+ * every call site (the four specialization wrappers below pass true /
+ * false literals).  always_inline + literal arguments lets the compiler
+ * constant-fold the per-iter branches on these flags:
+ *   - loop-top skip-compressed resolution
+ *   - get_nth dispatch
+ *   - post-get_nth skip-compressed resolution
+ * Eliminates the per-iter `test %sil, %sil` hot spot identified via
+ * perf annotate.
+ */
+static inline_lookup
 enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node,
