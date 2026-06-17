@@ -126,32 +126,6 @@
 #include "fractal-trie-internal.h"
 #include "fractal-trie-trace.h"
 
-#ifdef FT_DELAY_INJECT
-#include <unistd.h>
-#include <stdlib.h>
-enum ft_delay_mode ft_delay_mode = FT_DELAY_NONE;
-unsigned int ft_delay_us = 1;
-
-static void __attribute__((constructor))
-ft_delay_init(void)
-{
-	const char *mode = getenv("FT_DELAY_MODE");
-	const char *us = getenv("FT_DELAY_US");
-
-	if (mode) {
-		if (!strcmp(mode, "writer"))
-			ft_delay_mode = FT_DELAY_WRITER;
-		else if (!strcmp(mode, "reader"))
-			ft_delay_mode = FT_DELAY_READER;
-		else if (!strcmp(mode, "both"))
-			ft_delay_mode = FT_DELAY_BOTH;
-		else if (!strcmp(mode, "random"))
-			ft_delay_mode = FT_DELAY_RANDOM;
-	}
-	if (us)
-		ft_delay_us = (unsigned int) atoi(us);
-}
-#endif
 #include "bitmap.h"
 
 #ifndef abs_int
@@ -498,6 +472,7 @@ struct cds_ft_inode {
  * stray standalone inclusion.
  */
 #define FRACTAL_TRIE_IMPL
+#include "ft-delay.h"
 #include "ft-helpers.h"
 #include "ft-scanners.h"
 #include "ft-descent.h"
