@@ -5,7 +5,11 @@
 /*
  * src/fractal-trie/ft-insert.h
  *
- * Userspace RCU library - Fractal Trie: insert + one-commit publish + compressed-path split; shared flip-batch and node-reserve helpers live here.
+ * Userspace RCU library - Fractal Trie: the key-insert path -- descent to the
+ * attach point and ft_attach_node, the one-commit ordered-list publish
+ * (struct ft_insert_commit / ft_insert_one_commit) and the compressed-path
+ * split.  The flip-batch, node-reserve and node-cluster builders it uses now
+ * live in their own shared modules (ft-mutation-helpers.h, ft-cluster-build.h).
  *
  * Implementation unit: #included once by fractal-trie.c, in dependency
  * order, into a single translation unit (preserves cross-module inlining).
