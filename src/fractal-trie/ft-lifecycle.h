@@ -660,3 +660,60 @@ void cds_ft_destroy(struct cds_ft *ft)
 	uatomic_dec(&ft->group->nr_ft_instances, CMM_RELAXED);
 	free(ft);
 }
+
+/*
+ * Group / trie accessors: key lengths, key map, and emptiness query.
+ */
+size_t cds_ft_group_key_len(const struct cds_ft_group *group)
+{
+	return group->key_len;
+}
+
+size_t cds_ft_group_max_key_len(const struct cds_ft_group *group)
+{
+	return group->max_key_len;
+}
+
+size_t cds_ft_max_used_key_len(const struct cds_ft *ft)
+{
+	return uatomic_load(&ft->max_used_key_len, CMM_RELAXED);
+}
+
+enum cds_ft_status cds_ft_group_key_map(const struct cds_ft_group *group, uint8_t *key_to_ordinal, uint8_t *ordinal_to_key)
+{
+	if (group->key_map.identity)
+		return CDS_FT_STATUS_NOT_FOUND;
+	memcpy(key_to_ordinal, group->key_map.key_to_ordinal, sizeof(group->key_map.key_to_ordinal));
+	memcpy(ordinal_to_key, group->key_map.ordinal_to_key, sizeof(group->key_map.ordinal_to_key));
+	return CDS_FT_STATUS_OK;
+}
+
+bool cds_ft_empty(struct cds_ft *ft)
+{
+	struct cds_ft_inode_flag *root_flag;
+	struct cds_ft_inode *root_node;
+	struct cds_ft_metadata *rmeta;
+
+	CDS_FT_SCOPED_READER(ft);
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	root_flag = ft_root_dereference(ft);
+	root_node = ft_node_ptr(root_flag);
+
+	/*
+	 * The root is always an internal node (invariant enforced by
+	 * ft_make_root_internal_glue at every site that publishes
+	 * ft->root), so no tag dispatch is needed before reading metadata.
+	 */
+	rmeta = cds_ft_item_to_metadata(root_node);
+
+	/*
+	 * Empty trie: the root has no children and no NIL-key entries.
+	 * For popcount root, nr_child is derived from the bitmap and a
+	 * freshly-allocated (calloc'd) root with bitmap == 0 correctly
+	 * reports nr_child == 0.
+	 */
+	if (rmeta->nr_child != 0)
+		return false;
+	return !uatomic_load(&rmeta->external_nodes, CMM_RELAXED);
+}
