@@ -667,10 +667,23 @@ void ft_publish_external_nodes_prev(struct cds_ft *ft,
  * parallel; the compiler emits a CMOV, keeping the critical path
  * to 4 cycles.
  */
-/* Forward declarations for nr_keys helpers. */
-static inline unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m);
-static inline unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m);
-static inline void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo);
+static inline
+unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m)
+{
+	return m->nr_keys;
+}
+
+static inline
+unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
+{
+	return uatomic_load(&m->nr_keys, CMM_ACQUIRE);
+}
+
+static inline
+void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo)
+{
+	uatomic_store(&m->nr_keys, val, mo);
+}
 
 /*
  * ft_parent_depth_span: number of key bytes a parent's slot covers.

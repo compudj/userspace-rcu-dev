@@ -15,24 +15,6 @@
 #error "ft-insert.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
-static inline
-unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m)
-{
-	return m->nr_keys;
-}
-
-static inline
-unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
-{
-	return uatomic_load(&m->nr_keys, CMM_ACQUIRE);
-}
-
-static inline
-void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo)
-{
-	uatomic_store(&m->nr_keys, val, mo);
-}
-
 /*
  * ft_propagate_external_count_parent: propagate nr_keys delta
  * from @start up to the root via metadata->parent pointers.
