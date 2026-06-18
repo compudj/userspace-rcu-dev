@@ -188,3 +188,4 @@
 #include "ft-lifecycle.h"
 #include "ft-verify.h"
 #include "ft-compact.h"
+#include "ft-debug.h"
