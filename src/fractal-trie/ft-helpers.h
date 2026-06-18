@@ -2240,59 +2240,6 @@ struct cds_ft_metadata *ft_root_metadata(const struct cds_ft *ft)
 	return cds_ft_item_to_metadata(ft_node_ptr(ft->root));
 }
 
-/*
- * Descent cursor -- tracks current, parent, and grandparent positions
- * during a key-guided traversal of the trie.
- *
- * Each level stores both the flagged-pointer value (nf / pnf / ppnf)
- * and the address of the slot that holds it (nfp / pnfp / ppnfp).
- * Callers that do not need every field may leave the unused ones
- * NULL; the struct carries the superset so that a single descent
- * helper can serve graft, insert, remove, and detach paths.
- */
-struct ft_descent {
-	unsigned int depth;			/* Levels traversed (0 .. key_len). */
-	struct cds_ft_inode_flag *nf;		/* Current node-flag value. */
-	struct cds_ft_inode_flag **nfp;		/* Slot that holds @nf. */
-	struct cds_ft_inode_flag *pnf;		/* Parent node-flag value. */
-	struct cds_ft_inode_flag **pnfp;	/* Slot that holds @pnf. */
-	struct cds_ft_inode_flag *ppnf;		/* Grandparent node-flag value. */
-	struct cds_ft_inode_flag **ppnfp;	/* Slot that holds @ppnf. */
-};
-
-static
-void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
-{
-	d->depth = 0;
-	d->nf = ft->root;
-	d->nfp = &ft->root;
-	d->pnf = NULL;
-	d->pnfp = NULL;
-	d->ppnf = NULL;
-	d->ppnfp = NULL;
-}
-
-/*
- * Advance descent state through a compressed node on full key match.
- * Updates parent chain, current pointer, and depth.  The caller is
- * responsible for snapshot, snapshot_n, and detach tracking before
- * calling this helper.
- */
-static inline_lookup
-void ft_descent_traverse_compressed(struct ft_descent *d,
-		struct cds_ft_compressed_node *cn,
-		const uint8_t **iter_key)
-{
-	d->ppnf  = d->pnf;
-	d->ppnfp = d->pnfp;
-	d->pnf   = d->nf;
-	d->pnfp  = d->nfp;
-	d->nf    = cn->child;
-	d->nfp   = &cn->child;
-	d->depth += cn->len;
-	*iter_key += cn->len;
-}
-
 static
 bool valid_key_len(struct cds_ft *ft, size_t key_len)
 {
