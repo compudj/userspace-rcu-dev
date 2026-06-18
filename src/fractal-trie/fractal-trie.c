@@ -177,6 +177,7 @@
 #define ft_node_get_direction     ft_node_get_direction_shared
 #define ft_node_get_minmax        ft_node_get_minmax_shared
 #define cds_ft_lookup_inequality_impl cds_ft_lookup_inequality_impl_shared
+#include "ft-mutation-helpers.h"
 #include "ft-insert.h"
 #include "ft-remove.h"
 #include "ft-graft.h"
