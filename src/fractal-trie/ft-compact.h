@@ -388,20 +388,6 @@ void cds_ft_compact_end(struct cds_ft_compact_state *st)
 	free(st);
 }
 
-/*
- * Close the shared-scanner redirect (opened in fractal-trie.c before the
- * mutation modules).  The incremental compaction above is a cold writer path
- * and shares the out-of-line scanners; cds_ft_compact, the debug/stats
- * helpers, and the ft-iter.h pulled in at the end of this unit want the
- * inlined scanner originals.
- */
-#undef ft_node_get_nth
-#undef ft_node_get_nth_skip
-#undef ft_node_get_nth_reanchor
-#undef ft_node_get_direction
-#undef ft_node_get_minmax
-#undef cds_ft_lookup_inequality_impl
-
 void cds_ft_compact(struct cds_ft *ft)
 {
 	CDS_FT_SCOPED_WRITER(ft);

@@ -166,10 +166,10 @@
  * read-path helpers it would otherwise force-inline at every site: the node
  * scanners (ft-lookup-node.h) and the inequality descent (ft-inequality.h).  The
  * mutation modules call each once instead of duplicating it -- about -23% .text
- * together.  The read modules above keep the inlined originals.  ft-compact.h
- * closes the redirect in-file: its incremental-compaction machinery (a cold
- * writer path) keeps the shared copies, while cds_ft_compact and the ft-iter.h
- * it pulls in stay on the inlined originals below that in-file #undef.
+ * together.  The read modules above keep the inlined originals.  The redirect
+ * stays open through every module below -- the mutation path, compaction, and
+ * the ft-debug.h display renderers are all cold or write paths, so they all
+ * share the out-of-line copies; nothing hot follows, so it is never closed.
  */
 #define ft_node_get_nth           ft_node_get_nth_shared
 #define ft_node_get_nth_skip      ft_node_get_nth_skip_shared
