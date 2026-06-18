@@ -998,3 +998,33 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	return CDS_FT_STATUS_OK;
 }
 
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+/*
+ * Hook called from CDS_FT_SCOPED_WRITER's scope-exit, before the
+ * writer claim is released.  Sampled by the per-trie
+ * @verify_at_mutation_period: the cds_ft_verify walk runs once every
+ * @period mutations.  The counter is incremented and reset on the
+ * boundary so it never exceeds @period - 1, avoiding any overflow /
+ * cadence-drift issue on long-running workloads.  Period 0 disables
+ * the walk entirely (only the increment-and-compare runs).  On
+ * mismatch, abort with diagnostic.
+ */
+void ft_writer_scope_verify(struct cds_ft *ft)
+{
+	unsigned long period = ft->verify_at_mutation_period;
+
+	if (period == 0)
+		return;
+	ft->verify_at_mutation_counter++;
+	if (ft->verify_at_mutation_counter < period)
+		return;
+	ft->verify_at_mutation_counter = 0;
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "FT verify-at-mutation: invariant violation on ft=%p\n",
+			(void *) ft);
+		abort();
+	}
+}
+#endif
+
