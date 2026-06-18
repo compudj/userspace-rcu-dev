@@ -1603,4 +1603,25 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
  * alone, but all patterns use ft_dereference_acquire uniformly
  * for simplicity.
  */
+
+/*
+ * Shared, non-inlined copy of the inequality descent for the write path.  The
+ * ordered-cell maintenance in ft-detach (ft_ord_cell_find_rel,
+ * ft_ord_cell_find_pred_from_head, ft_merge_ord_interleave) reaches
+ * cds_ft_lookup_inequality_impl at five sites.  The impl is force-inlined for
+ * the read hot path -- the ft_ineq_* specializations DCE it on constant
+ * mode/limit -- so without this each of those write-side sites inlined the full
+ * ~20 KB descent, ~90 KB total.  The mutation modules are redirected to this one
+ * shared copy via #define in fractal-trie.c; read-side callers keep the inlined
+ * original.
+ */
+static enum cds_ft_status cds_ft_lookup_inequality_impl_shared(struct cds_ft *ft,
+		struct cds_ft_iter *iter, enum ft_lookup_inequality mode,
+		enum ft_lookup_limit limit, const bool use_keycopy,
+		const bool seed_from_node)
+{
+	return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, use_keycopy,
+			seed_from_node);
+}
+
 static inline

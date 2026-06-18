@@ -145,17 +145,19 @@
 #include "ft-inequality.h"
 
 /*
- * Redirect the write path to the shared, non-inlined scanner copies defined in
- * ft-scanners.h: the mutation modules call each once instead of force-inlining
- * these large scanners at every site (about -9% .text).  The read modules above
- * keep the inlined originals; ft-compact -- and ft-iter, which it pulls in --
- * stay on them too, below the #undef.
+ * Redirect the write path to the shared, non-inlined copies of the large
+ * read-path helpers it would otherwise force-inline at every site: the node
+ * scanners (ft-scanners.h) and the inequality descent (ft-inequality.h).  The
+ * mutation modules call each once instead of duplicating it -- about -23% .text
+ * together.  The read modules above keep the inlined originals; ft-compact --
+ * and ft-iter, which it pulls in -- stay on them too, below the #undef.
  */
 #define ft_node_get_nth           ft_node_get_nth_shared
 #define ft_node_get_nth_skip      ft_node_get_nth_skip_shared
 #define ft_node_get_nth_reanchor  ft_node_get_nth_reanchor_shared
 #define ft_node_get_direction     ft_node_get_direction_shared
 #define ft_node_get_minmax        ft_node_get_minmax_shared
+#define cds_ft_lookup_inequality_impl cds_ft_lookup_inequality_impl_shared
 #include "ft-insert.h"
 #include "ft-remove.h"
 #include "ft-graft.h"
@@ -168,4 +170,5 @@
 #undef ft_node_get_nth_reanchor
 #undef ft_node_get_direction
 #undef ft_node_get_minmax
+#undef cds_ft_lookup_inequality_impl
 #include "ft-compact.h"
