@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 /*
- * src/fractal-trie/ft-build.h
+ * src/fractal-trie/ft-cluster-build.h
  *
  * Userspace RCU library - Fractal Trie: node-cluster builders.  The shared
  * primitives that assemble a fresh, unpublished subtrie cluster for the
@@ -24,7 +24,7 @@
  * (preserves cross-module inlining).  Not a standalone header.
  */
 #ifndef FRACTAL_TRIE_IMPL
-#error "ft-build.h is an implementation unit; #include it from fractal-trie.c only"
+#error "ft-cluster-build.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
 /* Mutually-recursive builders -- forward decls to close the cycle. */
