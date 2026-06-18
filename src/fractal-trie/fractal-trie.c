@@ -139,7 +139,7 @@
 #include "ft-tables.h"
 #include "ft-delay.h"
 #include "ft-helpers.h"
-#include "ft-scanners.h"
+#include "ft-node-ops.h"
 #include "ft-descent.h"
 #include "ft-iter.h"
 #include "ft-lookup.h"
@@ -164,7 +164,7 @@
 /*
  * Redirect the write path to the shared, non-inlined copies of the large
  * read-path helpers it would otherwise force-inline at every site: the node
- * scanners (ft-scanners.h) and the inequality descent (ft-inequality.h).  The
+ * scanners (ft-node-ops.h) and the inequality descent (ft-inequality.h).  The
  * mutation modules call each once instead of duplicating it -- about -23% .text
  * together.  The read modules above keep the inlined originals.  ft-compact.h
  * closes the redirect in-file: its incremental-compaction machinery (a cold

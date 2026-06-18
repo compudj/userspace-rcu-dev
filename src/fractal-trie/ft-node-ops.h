@@ -3,16 +3,22 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 /*
- * src/fractal-trie/ft-scanners.h
+ * src/fractal-trie/ft-node-ops.h
  *
- * Userspace RCU library - Fractal Trie: internal node scanners (popcount 1L/2L, pigeon) + node grow / recompact / set_nth.
+ * Userspace RCU library - Fractal Trie: node-structure operations on the
+ * popcount (1L / 2L) and pigeon node layouts.  Holds both directions built on
+ * that one shared bitmap layout: the read scanners (get_nth / get_direction /
+ * get_minmax / get_ith_pos) and the write mutations (set_nth / replace_ptr /
+ * recompact / node grow).  Read and write live together here because they are
+ * the same layout viewed two ways -- the historical "scanners" name emphasised
+ * only the read half; this is the node-operation layer as a whole.
  *
  * Implementation unit: #included once by fractal-trie.c, in dependency
  * order, into a single translation unit (preserves cross-module inlining).
  * Not a standalone header.
  */
 #ifndef FRACTAL_TRIE_IMPL
-#error "ft-scanners.h is an implementation unit; #include it from fractal-trie.c only"
+#error "ft-node-ops.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
 /*
