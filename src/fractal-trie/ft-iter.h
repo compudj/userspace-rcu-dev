@@ -15,6 +15,16 @@
 #endif
 
 /*
+ * Sentinel stored in iter->key_len by the ordinal-cell land for a VARIABLE-
+ * length identity group: the length is DEFERRED and resolved on demand by
+ * ft_iter_resolve_key_len() -- from the leaf (key_len_offset) when present, else
+ * from the parent up-walk -- so a keyless cell walk reads neither key nor length.
+ * SIZE_MAX is never a valid key length (bounded by max_key_len), so a consumer
+ * that forgets to resolve hits an obvious overflow, not a silently-stale value.
+ */
+#define FT_ITER_KEY_LEN_LAZY	((size_t) -1)
+
+/*
  * Lazy-ref accessor model (scoped to the
  * ordinal-cell ordered list).  In a cell group with a leaf-key offset and an
  * identity key map, the ordered-iteration result key is held as a LIVE
@@ -29,7 +39,7 @@
  * reader of the current-position key MUST go through ft_iter_read_key().
  * Missing one silently corrupts (e.g. cds_ft_remove_all locating a wrong key).
  */
-static inline
+static inline_lookup
 bool ft_iter_key_referenced(const struct cds_ft_iter *iter)
 {
 	const struct cds_ft_group *group = iter->ft->group;
@@ -39,98 +49,16 @@ bool ft_iter_key_referenced(const struct cds_ft_iter *iter)
 }
 
 /*
- * Read the iterator's CURRENT-POSITION key.  Returns the live leaf reference
- * when referenced, else the iter_key value.  Correct because every cell-walk /
- * descent result store sets iter->node to the matched leaf (whose stored key IS
- * the current key) and cds_ft_iter_set_key() clears cache_valid AND iter->node,
- * so iter->node + offset is authoritative exactly when cache_valid && node.
- * Valid only while the RCU lock that produced iter->node is held (cross-CS
- * callers cds_ft_iter_bind_key() first).
+ * Resolve the current head's cell for a cell-walk step: use the cached cursor
+ * when it still refers to iter->node (no leaf touch), else re-enter the walk
+ * via the head's prev (one leaf load -- the per-walk-entry cost).
  */
 static inline_lookup
-struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter);
-static size_t ft_rebuild_key_upwalk(const struct cds_ft *ft,
-		struct ft_ord_cell *cell, uint8_t *out, size_t max_len);
-
-/*
- * Sentinel stored in iter->key_len by the ordinal-cell land for a VARIABLE-
- * length identity group: the length is DEFERRED and resolved on demand by
- * ft_iter_resolve_key_len() -- from the leaf (key_len_offset) when present, else
- * from the parent up-walk -- so a keyless cell walk reads neither key nor length.
- * SIZE_MAX is never a valid key length (bounded by max_key_len), so a consumer
- * that forgets to resolve hits an obvious overflow, not a silently-stale value.
- */
-#define FT_ITER_KEY_LEN_LAZY	((size_t) -1)
-
-/*
- * One-shot structural materialization for a VARIABLE-length EAGER ordered-list
- * iterator (no in-leaf key, no key_len_offset): the parent up-walk derives BOTH
- * the key bytes (into iter_key) AND the length in a SINGLE walk.  Caches the
- * length in iter->key_len (clearing the LAZY sentinel) so a later read_key /
- * resolve_key_len in the same step reuses it instead of walking again.  Returns
- * the length (0 on a NIL key / overflow / missing cell).
- */
-static
-size_t ft_iter_upwalk_into_buf(struct cds_ft_iter *iter)
+struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter)
 {
-	size_t max_len = iter->ft->group->max_key_len;
-	struct ft_ord_cell *cell = ft_ord_cell_cursor(iter);
-	size_t n = 0;
-
-	if (cell)
-		n = ft_rebuild_key_upwalk(iter->ft, cell, iter_key(iter), max_len);
-	iter->key_len = n;
-	iter->key_off = max_len - n;	/* key lives at iter_key[key_off ..) */
-	iter->path_len = n + 1;
-	return n;
-}
-
-static inline
-const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
-{
-	const struct cds_ft_group *group = iter->ft->group;
-
-	if (ft_iter_key_referenced(iter))
-		return (const uint8_t *) iter->node + group->speculative_key_offset;
-	/*
-	 * EAGER ordered-list walk (no in-leaf key): rematerialize the current
-	 * key STRUCTURALLY via the parent up-walk into iter_key.  Reached only
-	 * when a key consumer asks for the key -- a keyless/count walk never
-	 * calls this, so the O(depth) walk is paid strictly on demand.  The
-	 * walk recovers ORDINAL bytes from the trie structure, which is what
-	 * iter_key holds for ANY key map (consumers remap via
-	 * ft_ordinals_to_key), so no identity requirement.  FIXED-length walks
-	 * into the buffer (length is group->key_len).  VARIABLE-length derives
-	 * the length from the SAME walk, cached via ft_iter_upwalk_into_buf and
-	 * coordinated with ft_iter_resolve_key_len through the LAZY sentinel so
-	 * one walk serves both.
-	 */
-	if (group->ordered_list_set && !group->speculative_key_offset_set &&
-			iter->cache_valid && iter->node) {
-		if (group->key_len == CDS_FT_LEN_VARIABLE) {
-			/*
-			 * The up-walk fills the key at the buffer TAIL and records
-			 * iter->key_off; coordinated with ft_iter_resolve_key_len
-			 * through the LAZY sentinel so one walk serves both.
-			 */
-			if (iter->key_len == FT_ITER_KEY_LEN_LAZY)
-				ft_iter_upwalk_into_buf(
-					(struct cds_ft_iter *) iter);
-			return iter_key(iter) + iter->key_off;
-		} else {
-			struct ft_ord_cell *cell = ft_ord_cell_cursor(iter);
-			size_t max_len = group->max_key_len;
-			size_t n;
-
-			if (cell && (n = ft_rebuild_key_upwalk(iter->ft, cell,
-					iter_key(iter), max_len)) != 0) {
-				((struct cds_ft_iter *) iter)->key_off =
-					max_len - n;
-				return iter_key(iter) + (max_len - n);
-			}
-		}
-	}
-	return iter_key(iter) + iter->key_off;
+	if (iter->ord_cell_node == iter->node)
+		return iter->ord_cell;
+	return ft_ord_cell_ptr(rcu_dereference(iter->node->prev));
 }
 
 /*
@@ -150,7 +78,7 @@ const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
  * makes the ordered list usable on an EAGER / no-leaf-key trie.  Valid only
  * while the RCU lock that produced @cell is held continuously.
  */
-static
+static inline_lookup
 size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		uint8_t *out, size_t max_len)
 {
@@ -264,6 +192,77 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 }
 
 /*
+ * One-shot structural materialization for a VARIABLE-length EAGER ordered-list
+ * iterator (no in-leaf key, no key_len_offset): the parent up-walk derives BOTH
+ * the key bytes (into iter_key) AND the length in a SINGLE walk.  Caches the
+ * length in iter->key_len (clearing the LAZY sentinel) so a later read_key /
+ * resolve_key_len in the same step reuses it instead of walking again.  Returns
+ * the length (0 on a NIL key / overflow / missing cell).
+ */
+static inline_lookup
+size_t ft_iter_upwalk_into_buf(struct cds_ft_iter *iter)
+{
+	size_t max_len = iter->ft->group->max_key_len;
+	struct ft_ord_cell *cell = ft_ord_cell_cursor(iter);
+	size_t n = 0;
+
+	if (cell)
+		n = ft_rebuild_key_upwalk(iter->ft, cell, iter_key(iter), max_len);
+	iter->key_len = n;
+	iter->key_off = max_len - n;	/* key lives at iter_key[key_off ..) */
+	iter->path_len = n + 1;
+	return n;
+}
+
+static inline_lookup
+const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
+{
+	const struct cds_ft_group *group = iter->ft->group;
+
+	if (ft_iter_key_referenced(iter))
+		return (const uint8_t *) iter->node + group->speculative_key_offset;
+	/*
+	 * EAGER ordered-list walk (no in-leaf key): rematerialize the current
+	 * key STRUCTURALLY via the parent up-walk into iter_key.  Reached only
+	 * when a key consumer asks for the key -- a keyless/count walk never
+	 * calls this, so the O(depth) walk is paid strictly on demand.  The
+	 * walk recovers ORDINAL bytes from the trie structure, which is what
+	 * iter_key holds for ANY key map (consumers remap via
+	 * ft_ordinals_to_key), so no identity requirement.  FIXED-length walks
+	 * into the buffer (length is group->key_len).  VARIABLE-length derives
+	 * the length from the SAME walk, cached via ft_iter_upwalk_into_buf and
+	 * coordinated with ft_iter_resolve_key_len through the LAZY sentinel so
+	 * one walk serves both.
+	 */
+	if (group->ordered_list_set && !group->speculative_key_offset_set &&
+			iter->cache_valid && iter->node) {
+		if (group->key_len == CDS_FT_LEN_VARIABLE) {
+			/*
+			 * The up-walk fills the key at the buffer TAIL and records
+			 * iter->key_off; coordinated with ft_iter_resolve_key_len
+			 * through the LAZY sentinel so one walk serves both.
+			 */
+			if (iter->key_len == FT_ITER_KEY_LEN_LAZY)
+				ft_iter_upwalk_into_buf(
+					(struct cds_ft_iter *) iter);
+			return iter_key(iter) + iter->key_off;
+		} else {
+			struct ft_ord_cell *cell = ft_ord_cell_cursor(iter);
+			size_t max_len = group->max_key_len;
+			size_t n;
+
+			if (cell && (n = ft_rebuild_key_upwalk(iter->ft, cell,
+					iter_key(iter), max_len)) != 0) {
+				((struct cds_ft_iter *) iter)->key_off =
+					max_len - n;
+				return iter_key(iter) + (max_len - n);
+			}
+		}
+	}
+	return iter_key(iter) + iter->key_off;
+}
+
+/*
  * Resolve (and cache) the iterator's current-position key length.  For a
  * deferred-length cell position it reads node->key_len from the leaf once and
  * caches it into iter->key_len (and path_len); otherwise returns iter->key_len
@@ -273,7 +272,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
  * before reading iter->key_len.  The LAZY sentinel is only ever set with
  * cache_valid && node, so the leaf read is safe.
  */
-static inline
+static inline_lookup
 size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
 {
 	if (caa_unlikely(iter->key_len == FT_ITER_KEY_LEN_LAZY)) {
@@ -307,7 +306,7 @@ size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
  * (ft_iter_key_referenced requires an identity map).  Resolves the length first
  * so a deferred-length position materializes both before its node is dropped.
  */
-static inline
+static inline_lookup
 void ft_iter_materialize_key(struct cds_ft_iter *iter)
 {
 	size_t klen = ft_iter_resolve_key_len(iter);
@@ -430,19 +429,6 @@ bool ft_ord_cell_fastpath_ok(const struct cds_ft *ft,
 		 (ft->group->key_len != CDS_FT_LEN_VARIABLE ||
 			ft->group->key_len_offset_set)) &&
 		iter->prefix_len == 0;
-}
-
-/*
- * Resolve the current head's cell for a cell-walk step: use the cached cursor
- * when it still refers to iter->node (no leaf touch), else re-enter the walk
- * via the head's prev (one leaf load -- the per-walk-entry cost).
- */
-static inline_lookup
-struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter)
-{
-	if (iter->ord_cell_node == iter->node)
-		return iter->ord_cell;
-	return ft_ord_cell_ptr(rcu_dereference(iter->node->prev));
 }
 
 enum cds_ft_status cds_ft_iter_create(struct cds_ft *ft, struct cds_ft_iter **result_iter)
@@ -729,7 +715,7 @@ struct cds_ft_node *cds_ft_iter_node(const struct cds_ft_iter *iter)
  * RCU CONTRACT: @cursor and every emitted cell are valid only while the read
  * lock that produced @cursor is held continuously (see cds_ft_cell_get_key).
  */
-static inline __attribute__((always_inline))
+static inline_lookup
 enum cds_ft_status ft_cell_batch_dir(struct cds_ft *ft,
 		const struct cds_ft_cell *cursor, const struct cds_ft_cell **buf,
 		size_t cap, size_t *count,
