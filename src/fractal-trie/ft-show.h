@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 /*
- * src/fractal-trie/ft-debug.h
+ * src/fractal-trie/ft-show.h
  *
  * Userspace RCU library - Fractal Trie: human-readable trie DISPLAY renderers.
  * The pretty-printer (show_node_recursive / show_pretty) and the JSON emitter
@@ -16,7 +16,7 @@
  * (preserves cross-module inlining).  Not a standalone header.
  */
 #ifndef FRACTAL_TRIE_IMPL
-#error "ft-debug.h is an implementation unit; #include it from fractal-trie.c only"
+#error "ft-show.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
 static

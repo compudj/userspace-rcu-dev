@@ -168,7 +168,7 @@
  * mutation modules call each once instead of duplicating it -- about -23% .text
  * together.  The read modules above keep the inlined originals.  The redirect
  * stays open through every module below -- the mutation path, compaction, and
- * the ft-debug.h display renderers are all cold or write paths, so they all
+ * the ft-show.h display renderers are all cold or write paths, so they all
  * share the out-of-line copies; nothing hot follows, so it is never closed.
  */
 #define ft_node_get_nth           ft_node_get_nth_shared
@@ -189,4 +189,4 @@
 #include "ft-lifecycle.h"
 #include "ft-verify.h"
 #include "ft-compact.h"
-#include "ft-debug.h"
+#include "ft-show.h"

@@ -26,7 +26,7 @@ FRACTAL_TRIE = fractal-trie/fractal-trie.c fractal-trie/fractal-trie-alloc.c \
 	fractal-trie/ft-lookup-helpers.h fractal-trie/ft-iter.h fractal-trie/ft-delay.h fractal-trie/ft-tables.h \
 	fractal-trie/ft-mutation-helpers.h fractal-trie/ft-mutation-node.h \
 	fractal-trie/ft-cluster-build.h \
-	fractal-trie/ft-ordered-query.h fractal-trie/ft-debug.h
+	fractal-trie/ft-ordered-query.h fractal-trie/ft-show.h
 
 RCULFHASH = rculfhash.c rculfhash-mm-order.c rculfhash-mm-chunk.c \
 		rculfhash-mm-mmap.c
