@@ -751,6 +751,7 @@ enum cds_ft_status ft_lookup_cand_nosc(struct cds_ft *ft,
  * cds_ft_group_attr_set_key_map) so the extra dispatch hop is
  * not worth specializing further.
  */
+#ifdef FEATURE_FT_KEY_MAP
 static FT_LOOKUP_SLOW_PATH("lookup_key")
 enum cds_ft_status ft_lookup_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -794,6 +795,7 @@ enum cds_ft_status ft_lookup_candidate_key_nonidentity(struct cds_ft *ft,
 			FT_KEY_READABLE_PAD, result_node, NULL,
 			FT_PREFIX_TRACK_NONE, NULL, NULL, true);
 }
+#endif /* FEATURE_FT_KEY_MAP */
 
 /*
  * Install per-API lookup function pointers on @ft based on group
@@ -811,8 +813,10 @@ static enum cds_ft_status ft_lookup_partial_key_sc(struct cds_ft *,
 		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
 static enum cds_ft_status ft_lookup_partial_key_nosc(struct cds_ft *,
 		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+#ifdef FEATURE_FT_KEY_MAP
 static enum cds_ft_status ft_lookup_partial_key_nonidentity(struct cds_ft *,
 		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+#endif
 static enum cds_ft_status ft_lookup_partial_iter_sc(struct cds_ft *,
 		struct cds_ft_iter *);
 static enum cds_ft_status ft_lookup_partial_iter_nosc(struct cds_ft *,
@@ -821,8 +825,10 @@ static enum cds_ft_status ft_lookup_longest_match_key_sc(struct cds_ft *,
 		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
 static enum cds_ft_status ft_lookup_longest_match_key_nosc(struct cds_ft *,
 		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+#ifdef FEATURE_FT_KEY_MAP
 static enum cds_ft_status ft_lookup_longest_match_key_nonidentity(struct cds_ft *,
 		const uint8_t *, size_t, size_t *, struct cds_ft_node **);
+#endif
 static enum cds_ft_status ft_lookup_longest_match_iter_sc(struct cds_ft *,
 		struct cds_ft_iter *);
 static enum cds_ft_status ft_lookup_longest_match_iter_nosc(struct cds_ft *,
@@ -879,6 +885,7 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 	ft->lookup_longest_match_iter_fn = sc
 		? ft_lookup_longest_match_iter_sc
 		: ft_lookup_longest_match_iter_nosc;
+#ifdef FEATURE_FT_KEY_MAP
 	if (caa_unlikely(!group->key_map.identity)) {
 		ft->lookup_key_fn = ft_lookup_key_nonidentity;
 		ft->lookup_candidate_key_fn = ft_lookup_candidate_key_nonidentity;
@@ -886,6 +893,7 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 		ft->lookup_longest_match_key_fn = ft_lookup_longest_match_key_nonidentity;
 		return;
 	}
+#endif
 	ft->lookup_key_fn = sc
 		? ft_lookup_precise_sc : ft_lookup_precise_nosc;
 	ft->lookup_candidate_key_fn = sc

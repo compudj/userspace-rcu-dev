@@ -463,6 +463,11 @@ static int test_lifecycle_key_map(void)
 		return -1;
 	}
 	s = cds_ft_group_attr_set_key_map(attr, k2o, o2k);
+	if (s == CDS_FT_STATUS_NOT_SUPPORTED) {
+		/* Built with NO_FEATURE_FT_KEY_MAP -- skip the non-identity case. */
+		cds_ft_group_attr_destroy(attr);
+		return 0;
+	}
 	if (s < 0) {
 		cds_ft_group_attr_destroy(attr);
 		return -1;
@@ -5422,7 +5427,13 @@ static int test_nonidentity_ordered_iteration(void)
 		if (cds_ft_group_attr_set_key_len(attr,
 				part ? CDS_FT_LEN_VARIABLE : 4) < 0)
 			abort();
-		if (cds_ft_group_attr_set_key_map(attr, k2o, o2k) < 0)
+		s = cds_ft_group_attr_set_key_map(attr, k2o, o2k);
+		if (s == CDS_FT_STATUS_NOT_SUPPORTED) {
+			/* Built with NO_FEATURE_FT_KEY_MAP -- skip. */
+			cds_ft_group_attr_destroy(attr);
+			return 0;
+		}
+		if (s < 0)
 			abort();
 		if (cds_ft_group_create(attr, &group) < 0)
 			abort();
@@ -6072,7 +6083,13 @@ static int test_nonidentity_bulk_ops(void)
 	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
-	if (cds_ft_group_attr_set_key_map(attr, k2o, o2k) < 0)
+	s = cds_ft_group_attr_set_key_map(attr, k2o, o2k);
+	if (s == CDS_FT_STATUS_NOT_SUPPORTED) {
+		/* Built with NO_FEATURE_FT_KEY_MAP -- skip. */
+		cds_ft_group_attr_destroy(attr);
+		return 0;
+	}
+	if (s < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();

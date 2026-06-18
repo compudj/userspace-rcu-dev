@@ -163,6 +163,13 @@ enum cds_ft_status cds_ft_group_attr_set_max_key_len(struct cds_ft_group_attr *a
 enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 		const uint8_t *key_to_ordinal, const uint8_t *ordinal_to_key)
 {
+#ifndef FEATURE_FT_KEY_MAP
+	/* Built without non-identity key-map support (byte-ordinal keys only). */
+	(void) attr;
+	(void) key_to_ordinal;
+	(void) ordinal_to_key;
+	return CDS_FT_STATUS_NOT_SUPPORTED;
+#else
 	size_t i;
 
 	if (!key_to_ordinal || !ordinal_to_key)
@@ -182,6 +189,7 @@ enum cds_ft_status cds_ft_group_attr_set_key_map(struct cds_ft_group_attr *attr,
 	memcpy(attr->key_map.key_to_ordinal, key_to_ordinal, sizeof(attr->key_map.key_to_ordinal));
 	memcpy(attr->key_map.ordinal_to_key, ordinal_to_key, sizeof(attr->key_map.ordinal_to_key));
 	return CDS_FT_STATUS_OK;
+#endif /* FEATURE_FT_KEY_MAP */
 }
 
 enum cds_ft_status cds_ft_group_attr_set_lookup_optimization(

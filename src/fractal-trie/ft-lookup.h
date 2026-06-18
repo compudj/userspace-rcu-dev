@@ -145,6 +145,7 @@ enum cds_ft_status ft_lookup_partial_key_nosc(struct cds_ft *ft,
  * rare; ordinals[] is allocated on stack inside this fn so
  * call/return overhead is acceptable.
  */
+#ifdef FEATURE_FT_KEY_MAP
 static FT_LOOKUP_SLOW_PATH("lookup_partial_key")
 enum cds_ft_status ft_lookup_partial_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
@@ -169,6 +170,7 @@ enum cds_ft_status ft_lookup_partial_key_nonidentity(struct cds_ft *ft,
 	*result_node = partial_node;
 	return partial_node ? CDS_FT_STATUS_OK : CDS_FT_STATUS_NOT_FOUND;
 }
+#endif /* FEATURE_FT_KEY_MAP */
 
 FT_LOOKUP_DISPATCH("lookup_partial_key")
 enum cds_ft_status cds_ft_lookup_partial_key(struct cds_ft *ft,
@@ -298,6 +300,7 @@ enum cds_ft_status ft_lookup_longest_match_key_nosc(struct cds_ft *ft,
 			match_node, match_len, result_node);
 }
 
+#ifdef FEATURE_FT_KEY_MAP
 static FT_LOOKUP_SLOW_PATH("lookup_longest_match_key")
 enum cds_ft_status ft_lookup_longest_match_key_nonidentity(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t *match_len,
@@ -321,6 +324,7 @@ enum cds_ft_status ft_lookup_longest_match_key_nonidentity(struct cds_ft *ft,
 	return ft_lookup_longest_match_key_finish(ret, longest_len,
 			match_node, match_len, result_node);
 }
+#endif /* FEATURE_FT_KEY_MAP */
 
 FT_LOOKUP_DISPATCH("lookup_longest_match_key")
 enum cds_ft_status cds_ft_lookup_longest_match_key(struct cds_ft *ft,

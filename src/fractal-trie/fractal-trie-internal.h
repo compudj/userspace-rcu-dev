@@ -419,6 +419,20 @@
 #endif
 
 /*
+ * FEATURE_FT_KEY_MAP: support a non-identity key map (custom byte ordering set
+ * via cds_ft_group_attr_set_key_map -- e.g. case-insensitive or collation
+ * orders).  Identity maps (plain byte-ordinal keys) work either way.
+ *
+ * Enabled by default.  Disable with -DNO_FEATURE_FT_KEY_MAP for byte-key-only
+ * builds: it compiles out the per-key-API non-identity lookup specializations
+ * (~25 KiB of .text), and cds_ft_group_attr_set_key_map then returns
+ * CDS_FT_STATUS_NOT_SUPPORTED.
+ */
+#ifndef NO_FEATURE_FT_KEY_MAP
+# define FEATURE_FT_KEY_MAP
+#endif
+
+/*
  * Skip-compressed pointers encode the compressed path length in the
  * high bits of pointers (FT_SKIP_LEN_BITS bits starting at
  * FT_SKIP_LEN_SHIFT -- e.g. bits 57-63 on x86-64, 56-63 on AArch64;
