@@ -142,7 +142,23 @@
 #include "ft-scanners.h"
 #include "ft-descent.h"
 #include "ft-lookup.h"
+
+/*
+ * When the inequality descent is shared (FEATURE_INLINE_INEQUALITY_LOOKUP off)
+ * it is itself a cold tier-2 path, so route its up/down scanners through the
+ * same shared copies the write path uses -- one get_direction / get_minmax for
+ * the whole library, not an extra inlined copy in ft_ineq_descend.  With the
+ * flag on, the descent inlines them for speed.
+ */
+#ifndef FEATURE_INLINE_INEQUALITY_LOOKUP
+#define ft_node_get_direction	ft_node_get_direction_shared
+#define ft_node_get_minmax	ft_node_get_minmax_shared
+#endif
 #include "ft-inequality.h"
+#ifndef FEATURE_INLINE_INEQUALITY_LOOKUP
+#undef ft_node_get_direction
+#undef ft_node_get_minmax
+#endif
 
 /*
  * Redirect the write path to the shared, non-inlined copies of the large
