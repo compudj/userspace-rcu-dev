@@ -563,6 +563,8 @@ uint8_t ordinal_to_key(const struct cds_ft *ft, uint8_t ordinal)
  * into ordinals in @dst.  Identity maps short-circuit to memcpy.
  */
 #include "ft-key.h"
+
+static
 struct cds_ft_inode_flag *ft_node_flag(struct cds_ft_inode *node,
 		unsigned long type)
 {
@@ -841,8 +843,22 @@ struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
  */
 #define FT_ORD_CELL_TAG		FT_INTERNAL_MASK
 
-static inline_lookup
 #include "ft-ordcell.h"
+
+/*
+ * ft_node_holder: write-side resolution of a node's holder (the slot owner
+ * "above" it), independent of the cell relocation.
+ *
+ *   - non-head duplicate: prev is the predecessor cds_ft_node (external).
+ *   - head: prev is the flagged parent directly (non-cell build) or the
+ *     cell whose ->parent holds the flagged parent (cell build).
+ *   - never-inserted (prev NULL): returns NULL.
+ *
+ * Mutex-held callers (remove / replace / locate-chain-head) that previously
+ * read node->prev as the holder route through this so the cell indirection
+ * is transparent.  Identity in non-cell builds.
+ */
+static inline
 struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
 		const struct cds_ft_node *node)
 {

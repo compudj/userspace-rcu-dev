@@ -15,6 +15,7 @@
 #error "ft-insert.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+static inline
 unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m)
 {
 	return m->nr_keys;

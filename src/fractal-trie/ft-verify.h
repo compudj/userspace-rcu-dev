@@ -15,6 +15,50 @@
 #error "ft-verify.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+/*
+ * Integrity verification.
+ *
+ * ft_verify_node_recursive: recursively verify structural invariants
+ * starting at @node_flag (which may be internal or compressed).
+ * Returns 0 on success, -1 on first detected error (with details
+ * printed to @out).  Must be called with mutual exclusion wrt
+ * updaters.
+ *
+ * Checks performed:
+ * - nr_child matches the actual count of non-NULL child slots.
+ * - nr_keys equals the sum of children's nr_keys plus the count
+ *   of unique keys from external node chains attached to this node.
+ * - Parent pointers of children point back to the correct parent.
+ * - Compressed node invariants (len > 0, no external_nodes).
+ *
+ * @ft: the Fractal Trie (for group/flag access).
+ * @out: file stream for diagnostic output (may be NULL to suppress).
+ * @node_flag: tagged pointer to the node being verified.
+ * @expected_parent: tagged pointer that the node's metadata->parent
+ *                   should match (NULL for root).
+ * @depth: current depth (used for diagnostics).
+ * @out_nr_keys: output -- total nr_keys in the subtree rooted here
+ *               (written on success for parent aggregation).
+ */
+/*
+ * Visited-pointer set for cds_ft_verify subtree-uniqueness check.
+ *
+ * Linear-probing open-addressing hash table keyed by node allocation
+ * address (low tag bits stripped via ft_node_ptr).  Only used while a
+ * single verify walk is in progress; the entire table is freed at the
+ * end of cds_ft_verify.  Catches accidental sharing of a subtree
+ * between two parents (a rebase/recompact bug class) and detects
+ * parent-pointer cycles before the upward adjacency walk in
+ * ft_verify_node_compressed gets a chance to loop forever.
+ */
+struct ft_visited_set {
+	void **slots;		/* NULL = empty bucket. */
+	size_t cap;		/* Power of two. */
+	size_t mask;		/* cap - 1. */
+	size_t count;
+};
+
+static
 size_t ft_visited_hash(void *p)
 {
 	/*

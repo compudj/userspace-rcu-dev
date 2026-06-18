@@ -14,6 +14,7 @@
 #error "ft-ordcell.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+static inline_lookup
 void *ft_ord_cell_flag(struct ft_ord_cell *cell)
 {
 	return (void *) ((unsigned long) cell | FT_ORD_CELL_TAG);
@@ -142,18 +143,3 @@ void ft_ord_cell_set_parent(struct cds_ft_node *head,
 {
 	rcu_assign_pointer(ft_ord_cell_ptr(head->prev)->parent, parent);
 }
-
-/*
- * ft_node_holder: write-side resolution of a node's holder (the slot owner
- * "above" it), independent of the cell relocation.
- *
- *   - non-head duplicate: prev is the predecessor cds_ft_node (external).
- *   - head: prev is the flagged parent directly (non-cell build) or the
- *     cell whose ->parent holds the flagged parent (cell build).
- *   - never-inserted (prev NULL): returns NULL.
- *
- * Mutex-held callers (remove / replace / locate-chain-head) that previously
- * read node->prev as the holder route through this so the cell indirection
- * is transparent.  Identity in non-cell builds.
- */
-static inline

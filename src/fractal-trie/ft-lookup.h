@@ -1197,5 +1197,3 @@ struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter)
 		return iter->ord_cell;
 	return ft_ord_cell_ptr(rcu_dereference(iter->node->prev));
 }
-
-static inline_lookup

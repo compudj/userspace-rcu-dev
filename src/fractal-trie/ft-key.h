@@ -563,6 +563,3 @@ int ft_key_cmp_ordinals(const uint8_t *a, const uint8_t *b,
 	return ft_cmp_word(a, b, len, signed_cmp, mismatch_pos);
 #endif
 }
-
-
-static

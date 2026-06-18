@@ -15,6 +15,7 @@
 #error "ft-inequality.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+static inline_lookup
 enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
@@ -1623,5 +1624,3 @@ static enum cds_ft_status cds_ft_lookup_inequality_impl_shared(struct cds_ft *ft
 	return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, use_keycopy,
 			seed_from_node);
 }
-
-static inline
