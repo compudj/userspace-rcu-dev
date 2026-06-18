@@ -1716,48 +1716,6 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 	return FT_DESCENT_END;
 }
 
-
-
-/*
- * Ordinal-cell point-op list helpers.  Defined after the flip-batch +
- * inequality-lookup helpers (which they use); forward-declared here for the
- * insert / remove / replace mutators below.  All gated by ordered_list_set.
- */
-static void ft_ord_cell_splice(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, struct ft_ord_cell *cell);
-static void ft_ord_cell_prefill_by_key(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, struct ft_ord_cell *cell,
-		struct ft_ord_cell **pred_out, struct ft_ord_cell **succ_out);
-static void ft_iter_set_key_ordinals(struct cds_ft_iter *iter,
-		const uint8_t *ordinals, size_t key_len);
-static void ft_ord_cell_splice_at(struct cds_ft *ft, struct ft_ord_cell *cell,
-		struct ft_ord_cell *pred, struct ft_ord_cell *succ);
-static void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
-		struct ft_ord_cell *new_cell);
-/* Bulk-op ordered-list maintenance. */
-static struct cds_ft_node *ft_subtree_minmax_head(
-		struct cds_ft *ft, struct cds_ft_inode_flag *nf, bool want_max);
-static void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
-		struct cds_ft_node *first_head, struct cds_ft_node *last_head);
-static void ft_ord_cell_run_splice(struct cds_ft *dst,
-		struct ft_ord_cell *run_first, struct ft_ord_cell *run_last,
-		struct ft_ord_cell *pred, struct ft_ord_cell *succ);
-static void ft_ord_cell_find_splice_pos(struct cds_ft *dst,
-		const uint8_t *key, size_t key_len,
-		struct ft_ord_cell **pred_out, struct ft_ord_cell **succ_out);
-static void ft_ord_cell_run_replace(struct cds_ft *dst,
-		struct ft_ord_cell *d_first, struct ft_ord_cell *d_last,
-		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last);
-#ifdef FEATURE_FT_MERGE
-/* @dst_key in ORDINAL form (converted once at the cds_ft_merge_at entry). */
-static void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
-		size_t dst_key_len, unsigned long merged_keys,
-		struct ft_ord_cell *ord_cursor, struct ft_ord_cell *prev_placed,
-		struct ft_ord_cell_edge *edges, struct ft_flip_batch *flip_b);
-static void ft_ord_cell_run_unlink(struct cds_ft *ft,
-		struct cds_ft_node *first_head, struct cds_ft_node *last_head);
-#endif /* FEATURE_FT_MERGE */
-
 static
 int _cds_ft_insert(struct cds_ft *ft,
 		const uint8_t *_key, size_t _key_len,
