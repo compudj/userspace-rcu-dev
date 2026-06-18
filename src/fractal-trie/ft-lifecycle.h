@@ -518,8 +518,6 @@ enum cds_ft_status cds_ft_group_destroy(struct cds_ft_group *ft_group)
  * mutation.
  */
 void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
-		unsigned long *allocated, unsigned long *freed);
-void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
 		unsigned long *allocated, unsigned long *freed)
 {
 	if (allocated)
@@ -536,8 +534,6 @@ void cds_ft_debug_cell_balance(const struct cds_ft_group *group,
  * drained @allocated should equal @freed.  Caller must ensure no concurrent
  * node mutation.
  */
-void cds_ft_debug_node_balance(const struct cds_ft_group *group,
-		unsigned long *allocated, unsigned long *freed);
 void cds_ft_debug_node_balance(const struct cds_ft_group *group,
 		unsigned long *allocated, unsigned long *freed)
 {
