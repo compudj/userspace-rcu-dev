@@ -544,6 +544,74 @@ void cds_ft_debug_node_balance(const struct cds_ft_group *group,
 }
 #endif
 
+/*
+ * Install per-API lookup function pointers on @ft based on group
+ * flags.  Called once at cds_ft_create.  Pointers are stable for
+ * the trie's lifetime because the group flags (key_map.identity,
+ * CDS_FT_FLAG_SKIP_COMPRESSED) are immutable after group creation.
+ */
+static
+void ft_install_lookup_ops(struct cds_ft *ft)
+{
+	const struct cds_ft_group *group = ft->group;
+	bool sc = ft_group_skip_compressed(group);
+	/*
+	 * Limit-none relational entries: resolve the immutable use_keycopy config
+	 * once and install the matching specialization, so cds_ft_lookup_le/ge/lt/gt
+	 * (and cds_ft_next/prev) tail-call through @ft with no per-call config
+	 * branch.  Independent of key_map.identity (ft_speculative_keycopy handles
+	 * non-identity via ft_key_to_ordinals), so installed before the early
+	 * non-identity return below.
+	 */
+	bool kc = group->speculative_key_offset_set && group->speculative &&
+			(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED);
+
+	ft->lookup_le_fn = kc ? ft_ineq_le_keycopy : ft_ineq_le_eager;
+	ft->lookup_ge_fn = kc ? ft_ineq_ge_keycopy : ft_ineq_ge_eager;
+	ft->lookup_lt_fn = kc ? ft_ineq_lt_keycopy : ft_ineq_lt_eager;
+	ft->lookup_gt_fn = kc ? ft_ineq_gt_keycopy : ft_ineq_gt_eager;
+
+	/*
+	 * Iter-form lookup_iter_fn: iter always carries ordinals-mapped
+	 * key bytes (see cds_ft_iter_set_key), so the non-identity key_map
+	 * case is handled at iter-set time and the lookup-time inner only
+	 * needs (skip_compressed) specialization.
+	 */
+	ft->lookup_iter_fn = sc
+		? ft_lookup_iter_precise_sc : ft_lookup_iter_precise_nosc;
+	/*
+	 * Partial-match (tracking=PARTIAL) is precise descent.  Iter form
+	 * has no non-identity issue (iter holds ordinals already).
+	 */
+	ft->lookup_partial_iter_fn = sc
+		? ft_lookup_partial_iter_sc : ft_lookup_partial_iter_nosc;
+	/*
+	 * Longest-match (tracking=LONGEST) is also always precise
+	 * descent.  Same shape as partial.
+	 */
+	ft->lookup_longest_match_iter_fn = sc
+		? ft_lookup_longest_match_iter_sc
+		: ft_lookup_longest_match_iter_nosc;
+#ifdef FEATURE_FT_KEY_MAP
+	if (caa_unlikely(!group->key_map.identity)) {
+		ft->lookup_key_fn = ft_lookup_key_nonidentity;
+		ft->lookup_candidate_key_fn = ft_lookup_candidate_key_nonidentity;
+		ft->lookup_partial_key_fn = ft_lookup_partial_key_nonidentity;
+		ft->lookup_longest_match_key_fn = ft_lookup_longest_match_key_nonidentity;
+		return;
+	}
+#endif
+	ft->lookup_key_fn = sc
+		? ft_lookup_precise_sc : ft_lookup_precise_nosc;
+	ft->lookup_candidate_key_fn = sc
+		? ft_lookup_cand_sc : ft_lookup_cand_nosc;
+	ft->lookup_partial_key_fn = sc
+		? ft_lookup_partial_key_sc : ft_lookup_partial_key_nosc;
+	ft->lookup_longest_match_key_fn = sc
+		? ft_lookup_longest_match_key_sc
+		: ft_lookup_longest_match_key_nosc;
+}
+
 enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		const struct cds_ft_attr *attr,
 		struct cds_ft **result_ft)
