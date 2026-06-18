@@ -945,5 +945,3 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 		return "Unknown status value";
 	}
 }
-
-#include "ft-iter.h"

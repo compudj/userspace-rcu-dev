@@ -141,6 +141,7 @@
 #include "ft-helpers.h"
 #include "ft-scanners.h"
 #include "ft-descent.h"
+#include "ft-iter.h"
 #include "ft-lookup.h"
 
 /*

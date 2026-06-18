@@ -1021,6 +1021,64 @@ struct cds_ft_node *ft_node_external_nodes(struct cds_ft_inode_flag *node)
 }
 
 /*
+ * Speculative inequality result-key capture: when the group is configured for
+ * speculative skip-compressed lookup with a leaf-key offset, the matched leaf
+ * @leaf stores the full result key -- in the byte order the application passed
+ * to cds_ft_insert() -- at that offset.  Transform @level bytes of it to the
+ * iterator's ordinal (trie) order into @dst and return true; the caller then
+ * need not rebuild the key from the descent's compressed-node bytes.
+ * ft_key_to_ordinals applies the group's key map, which is a plain copy for an
+ * identity map and a per-byte remap otherwise, so the fast path covers
+ * non-identity maps too (no identity restriction).  Returns false (copying
+ * nothing) on groups without the offset / skip-compressed encoding, so the
+ * caller falls back to the descent-built ordinal_key accumulation.
+ *
+ * This is the result-key source on a configured speculative group: the
+ * min-descent intentionally leaves dispatch-irrelevant holes in ordinal_key
+ * (it follows skip pointers without filling the spanned bytes), so the leaf
+ * copy -- not ordinal_key -- carries the full result key.  Correctness is
+ * validated end-to-end by the ordered-iteration / relational invariant tests.
+ */
+static inline_lookup
+bool ft_speculative_keycopy(const struct cds_ft *ft,
+		const struct cds_ft_node *leaf,
+		uint8_t *dst, ssize_t level)
+{
+	const struct cds_ft_group *group = ft->group;
+	const uint8_t *leaf_key;
+
+	if (!leaf || level < 0)
+		return false;
+	if (!group->speculative_key_offset_set || !group->speculative ||
+			!(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED))
+		return false;
+	leaf_key = (const uint8_t *) leaf + group->speculative_key_offset;
+	ft_key_to_ordinals(dst, leaf_key, (size_t) level, &group->key_map);
+	return true;
+}
+
+/*
+ * Unconditional variant of ft_speculative_keycopy for callers that have already
+ * resolved use_keycopy at compile time: the leaf-copy config gate
+ * (speculative_key_offset_set && speculative && SKIP_COMPRESSED) is then known
+ * to hold, so the runtime re-check folds away.  Copies @level ordinal bytes of
+ * @leaf's stored key into @dst; a NULL @leaf (NOT_FOUND) or @level < 0 copies
+ * nothing (the result key is then unused).
+ */
+static inline_lookup
+void ft_speculative_keycopy_unconditional(const struct cds_ft *ft,
+		const struct cds_ft_node *leaf, uint8_t *dst, ssize_t level)
+{
+	const struct cds_ft_group *group = ft->group;
+	const uint8_t *leaf_key;
+
+	if (!leaf || level < 0)
+		return;
+	leaf_key = (const uint8_t *) leaf + group->speculative_key_offset;
+	ft_key_to_ordinals(dst, leaf_key, (size_t) level, &group->key_map);
+}
+
+/*
  * Ordinal-cell tag + accessors (cell-always model).
  *
  * Every duplicate-chain HEAD has a library-owned ordinal cell (struct
