@@ -1746,6 +1746,7 @@ static void ft_ord_cell_run_replace(struct cds_ft *dst,
 		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last);
 struct ft_ord_cell_edge;
 struct ft_flip_batch;
+#ifdef FEATURE_FT_MERGE
 /* @dst_key in ORDINAL form (converted once at the cds_ft_merge_at entry). */
 static void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		size_t dst_key_len, unsigned long merged_keys,
@@ -1753,6 +1754,7 @@ static void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
 		struct ft_ord_cell_edge *edges, struct ft_flip_batch *flip_b);
 static void ft_ord_cell_run_unlink(struct cds_ft *ft,
 		struct cds_ft_node *first_head, struct cds_ft_node *last_head);
+#endif /* FEATURE_FT_MERGE */
 
 static
 int _cds_ft_insert(struct cds_ft *ft,

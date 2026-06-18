@@ -15,6 +15,8 @@
 #error "ft-merge.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+#ifdef FEATURE_FT_MERGE
+
 /*
  * Read-only locate of a merge point at the end of @key.  Reuses
  * ft_graft_swap_descend (the same three outcomes, publishes nothing) and
@@ -2279,13 +2281,21 @@ out:
 	return status;
 }
 
+#endif /* FEATURE_FT_MERGE */
+
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
 		const uint8_t *src_key, size_t src_key_len)
 {
+#ifdef FEATURE_FT_MERGE
 	return ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
 			src_key, src_key_len, NULL, NULL);
+#else
+	(void) dst_ft; (void) dst_key; (void) dst_key_len;
+	(void) src_ft; (void) src_key; (void) src_key_len;
+	return CDS_FT_STATUS_NOT_SUPPORTED;
+#endif
 }
 
 enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,

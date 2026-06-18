@@ -844,6 +844,7 @@ void ft_ord_cell_run_replace(struct cds_ft *dst,
  * the run cells keep their stale links (caller no longer references them as a
  * run).  Whole-list removal (pred == succ == NULL) clears head/tail.
  */
+#ifdef FEATURE_FT_MERGE
 static
 void ft_ord_cell_run_unlink(struct cds_ft *ft, struct cds_ft_node *first_head,
 		struct cds_ft_node *last_head)
@@ -873,6 +874,7 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct cds_ft_node *first_head,
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, last, pred, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
 }
+#endif /* FEATURE_FT_MERGE */
 
 /*
  * Set @child's parent back-pointer to a raw flag @value (a flip-proxy)

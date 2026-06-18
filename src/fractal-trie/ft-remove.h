@@ -859,6 +859,7 @@ void ft_graft_glue_fini(struct ft_graft_glue *g)
  * inline.  Returns 0, or -ENOMEM (whatever already grew is released by a
  * later abort / fini, so the caller need only surface the error).
  */
+#ifdef FEATURE_FT_MERGE
 static
 int ft_graft_glue_reserve(struct ft_graft_glue *g,
 		int nr_built, int nr_deferred, int nr_free, int nr_splices)
@@ -913,6 +914,7 @@ int ft_graft_glue_reserve(struct ft_graft_glue *g,
 	}
 	return 0;
 }
+#endif /* FEATURE_FT_MERGE */
 
 /*
  * Record the single forward publish that splices the built cluster into
@@ -1164,6 +1166,7 @@ void ft_graft_glue_apply_deferred(struct cds_ft *ft, struct ft_graft_glue *g)
  * (Phase-1 set + deferred edge), like any other re-parented external; this
  * records only the concatenation, applied at commit.
  */
+#ifdef FEATURE_FT_MERGE
 static
 void ft_graft_glue_record_splice(struct ft_graft_glue *g,
 		struct cds_ft_node *dst_head,
@@ -1235,6 +1238,7 @@ void ft_graft_glue_free_collided_cells(struct cds_ft *ft,
 		if (g->splices[i].src_cell)
 			ft_ord_cell_free(ft, g->splices[i].src_cell);
 }
+#endif /* FEATURE_FT_MERGE */
 
 /*
  * Commit step 2: the single forward publish that makes the whole cluster

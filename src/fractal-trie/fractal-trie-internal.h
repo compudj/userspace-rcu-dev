@@ -433,6 +433,22 @@
 #endif
 
 /*
+ * FEATURE_FT_MERGE: the cds_ft_merge / cds_ft_merge_at bulk operation
+ * (atomic spine-copy merge of one trie into another at a key position).
+ *
+ * Enabled by default.  Disable with -DNO_FEATURE_FT_MERGE for builds
+ * that never merge tries: it compiles out the whole merge subsystem
+ * (~20 KiB of .text -- the recursive spine-copy build/count, the
+ * ordered-cell interleave, the in-place src unlink and the reserve
+ * pre-pass), and cds_ft_merge / cds_ft_merge_at then return
+ * CDS_FT_STATUS_NOT_SUPPORTED.  graft, graft_swap and detach are
+ * unaffected -- they remain part of the core bulk API.
+ */
+#ifndef NO_FEATURE_FT_MERGE
+# define FEATURE_FT_MERGE
+#endif
+
+/*
  * Skip-compressed pointers encode the compressed path length in the
  * high bits of pointers (FT_SKIP_LEN_BITS bits starting at
  * FT_SKIP_LEN_SHIFT -- e.g. bits 57-63 on x86-64, 56-63 on AArch64;
