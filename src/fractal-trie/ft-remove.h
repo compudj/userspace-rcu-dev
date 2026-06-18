@@ -1401,7 +1401,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * payload data: its back-pointer into the bottom branch node is deferred
  * to the post-sync commit, every fresh branch node is tracked in @glue,
  * and on OOM the function returns NULL WITHOUT freeing -- the caller's
- * ft_graft_glue_abort reclaims the tracked nodes.  When NULL, the legacy
+ * ft_glue_abort reclaims the tracked nodes.  When NULL, the legacy
  * immediate path runs (leaf back-pointer set now, self-free on OOM).
  */
 static
@@ -1410,7 +1410,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		struct cds_ft_inode_flag *leaf,
 		unsigned long subtree_external_count,
 		bool has_external_nodes,
-		struct ft_graft_glue *glue)
+		struct ft_glue *glue)
 {
 	/*
 	 * When the caller will attach external_nodes to the top,
@@ -1513,13 +1513,13 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 			cds_ft_item_to_metadata(ft_node_ptr(dest)),
 			subtree_external_count, CMM_RELAXED);
 		if (glue) {
-			ft_graft_glue_track(glue, dest);
+			ft_glue_track(glue, dest);
 			if (leaf_edge) {
 				struct cds_ft_inode_flag **slot = NULL;
 
 				ft_node_get_nth_skip(dest, &slot, key[i],
 					FT_PF_NONE);
-				ft_graft_glue_defer_edge(ft, glue, leaf, dest, slot);
+				ft_glue_defer_edge(ft, glue, leaf, dest, slot);
 			}
 		}
 		/*

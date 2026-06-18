@@ -28,7 +28,7 @@
  * Nothing is published, @cn is not freed, and every edge into LIVE data
  * (the displaced @old_child and the live @payload nodes) is recorded as a
  * deferred back-pointer in @glue.  An OOM frees the cluster via the
- * caller's ft_graft_glue_abort with both tries pristine.
+ * caller's ft_glue_abort with both tries pristine.
  *
  * The branch is built with BOTH children up front (two ft_node_set_nth
  * calls, the second possibly reallocating the node) using cluster_leaf so
@@ -43,7 +43,7 @@
  * @src_count:    payload key count, for the deferred propagate.
  *
  * Returns 0 (glue holds the cluster, its publish, and attached_nf), or
- * -ENOMEM (caller runs ft_graft_glue_abort).
+ * -ENOMEM (caller runs ft_glue_abort).
  */
 static
 int ft_split_compressed_graft_build(struct cds_ft *ft,
@@ -52,7 +52,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		unsigned int diverge_pos,
 		struct cds_ft_inode_flag *payload,
 		unsigned long src_count,
-		struct ft_graft_glue *glue)
+		struct ft_glue *glue)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
 	struct cds_ft_metadata *cn_meta =
@@ -111,8 +111,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		ft_nr_keys_store(sfx_meta, old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
 		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
-		ft_graft_glue_track(glue, old_suffix_flag);
-		ft_graft_glue_defer_edge(ft, glue, cn->child, old_suffix_flag,
+		ft_glue_track(glue, old_suffix_flag);
+		ft_glue_defer_edge(ft, glue, cn->child, old_suffix_flag,
 			&sfx->child);
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -127,10 +127,10 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(dest)),
 			old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = dest;
-		ft_graft_glue_track(glue, dest);
+		ft_glue_track(glue, dest);
 		ft_node_get_nth_skip(dest, &slot,
 			cn->key_bytes[diverge_pos + 1], FT_PF_NONE);
-		ft_graft_glue_defer_edge(ft, glue, cn->child, dest, slot);
+		ft_glue_defer_edge(ft, glue, cn->child, dest, slot);
 	} else {
 		old_suffix_flag = cn->child;	/* suffix_len == 0 */
 	}
@@ -163,7 +163,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 			NULL, NULL, d->depth + diverge_pos, true);
 	if (ret)
 		return -ENOMEM;
-	ft_graft_glue_track(glue, branch_flag);
+	ft_glue_track(glue, branch_flag);
 	/*
 	 * The branch is a fresh, unpublished node with no parent yet (it is
 	 * wired to its prefix only at commit).  Clear its parent / skip_slot
@@ -195,9 +195,9 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		return -ENOMEM;
 	if (old_branch) {
 		/* Reallocated: drop the order-1 copy from tracking + free it. */
-		ft_graft_glue_untrack(ft, glue, old_branch);
+		ft_glue_untrack(ft, glue, old_branch);
 		free_cds_ft_node_unpublished(ft, old_branch);
-		ft_graft_glue_track(glue, branch_flag);
+		ft_glue_track(glue, branch_flag);
 	}
 	ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
 		old_child_nr_keys, CMM_RELAXED);
@@ -206,7 +206,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	ft_node_get_nth_skip(branch_flag, &slot, old_ordinal, FT_PF_NONE);
 	if (sfx_skip_flag && sfx_skip_flag != old_suffix_flag && slot)
 		rcu_assign_pointer(*slot, sfx_skip_flag);
-	ft_graft_glue_defer_edge(ft, glue, old_suffix_flag, branch_flag, slot);
+	ft_glue_defer_edge(ft, glue, old_suffix_flag, branch_flag, slot);
 	/* Wire the NEW direction. */
 	ft_node_get_nth_skip(branch_flag, &slot, new_ordinal, FT_PF_NONE);
 	if (ft_node_compressed(new_dir) && slot) {
@@ -224,7 +224,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		if (skip != new_dir)
 			rcu_assign_pointer(*slot, skip);
 	}
-	ft_graft_glue_defer_edge(ft, glue, new_dir, branch_flag, slot);
+	ft_glue_defer_edge(ft, glue, new_dir, branch_flag, slot);
 
 	/* 4. Build prefix -> branch (no external_nodes on @cn). */
 	if (diverge_pos >= 2) {
@@ -242,7 +242,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, branch_flag, top_flag, NULL);
 		/* Track the PLAIN form; the skip form is for the publish. */
-		ft_graft_glue_track(glue, top_flag);
+		ft_glue_track(glue, top_flag);
 		top_flag = ft_publish_compressed(ft, pfx, top_flag);
 	} else if (diverge_pos == 1) {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -262,7 +262,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 			top_flag = ft_compressed_node_flag(pfx);
 			ft_set_parent(ft, branch_flag, top_flag, &pfx->child);
 			/* Track the PLAIN form; skip form for the publish. */
-			ft_graft_glue_track(glue, top_flag);
+			ft_glue_track(glue, top_flag);
 			top_flag = ft_publish_compressed(ft, pfx, top_flag);
 			goto after_prefix;
 		}
@@ -278,7 +278,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
 		top_flag = dest;
-		ft_graft_glue_track(glue, dest);
+		ft_glue_track(glue, dest);
 		}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	after_prefix:
@@ -297,8 +297,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	 * carries the payload's key count, and the propagate starts from its
 	 * parent.
 	 */
-	ft_graft_glue_set_publish(ft, glue, d->pnf, d->nfp, top_flag);
-	ft_graft_glue_defer_free(glue, cn, true);
+	ft_glue_set_publish(ft, glue, d->pnf, d->nfp, top_flag);
+	ft_glue_defer_free(glue, cn, true);
 	glue->attached_nf = new_dir;
 	return 0;
 }
@@ -310,20 +310,20 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
  * build-invisible builders that precede this point).
  */
 static
-void ft_graft_glue_init(struct ft_graft_glue *g)
+void ft_glue_init(struct ft_glue *g)
 {
 	g->deferred = g->deferred_floor;
 	g->nr_deferred = 0;
-	g->cap_deferred = FT_GRAFT_GLUE_FLOOR_DEFERRED;
+	g->cap_deferred = FT_GLUE_FLOOR_DEFERRED;
 	g->free_list = g->free_floor;
 	g->nr_free = 0;
-	g->cap_free = FT_GRAFT_GLUE_FLOOR_FREE;
+	g->cap_free = FT_GLUE_FLOOR_FREE;
 	g->built = g->built_floor;
 	g->nr_built = 0;
-	g->cap_built = FT_GRAFT_GLUE_FLOOR_BUILT;
+	g->cap_built = FT_GLUE_FLOOR_BUILT;
 	g->splices = g->splices_floor;
 	g->nr_splices = 0;
-	g->cap_splices = FT_GRAFT_GLUE_FLOOR_SPLICE;
+	g->cap_splices = FT_GLUE_FLOOR_SPLICE;
 	g->publish_parent = NULL;
 	g->publish_slot = NULL;
 	g->top = NULL;
@@ -333,31 +333,31 @@ void ft_graft_glue_init(struct ft_graft_glue *g)
 /*
  * Release a glue's malloc'd backing (when it grew past the inline floor) and
  * reset the arrays to the floor, so a second call is a no-op.  Both the abort
- * path (via ft_graft_glue_abort) and the success path call this; graft /
+ * path (via ft_glue_abort) and the success path call this; graft /
  * graft_swap stay on the floor, so it does nothing for them.
  */
 static
-void ft_graft_glue_fini(struct ft_graft_glue *g)
+void ft_glue_fini(struct ft_glue *g)
 {
 	if (g->deferred != g->deferred_floor) {
 		free(g->deferred);
 		g->deferred = g->deferred_floor;
-		g->cap_deferred = FT_GRAFT_GLUE_FLOOR_DEFERRED;
+		g->cap_deferred = FT_GLUE_FLOOR_DEFERRED;
 	}
 	if (g->free_list != g->free_floor) {
 		free(g->free_list);
 		g->free_list = g->free_floor;
-		g->cap_free = FT_GRAFT_GLUE_FLOOR_FREE;
+		g->cap_free = FT_GLUE_FLOOR_FREE;
 	}
 	if (g->built != g->built_floor) {
 		free(g->built);
 		g->built = g->built_floor;
-		g->cap_built = FT_GRAFT_GLUE_FLOOR_BUILT;
+		g->cap_built = FT_GLUE_FLOOR_BUILT;
 	}
 	if (g->splices != g->splices_floor) {
 		free(g->splices);
 		g->splices = g->splices_floor;
-		g->cap_splices = FT_GRAFT_GLUE_FLOOR_SPLICE;
+		g->cap_splices = FT_GLUE_FLOOR_SPLICE;
 	}
 }
 
@@ -371,7 +371,7 @@ void ft_graft_glue_fini(struct ft_graft_glue *g)
  */
 #ifdef FEATURE_FT_MERGE
 static
-int ft_graft_glue_reserve(struct ft_graft_glue *g,
+int ft_glue_reserve(struct ft_glue *g,
 		int nr_built, int nr_deferred, int nr_free, int nr_splices)
 {
 	if (nr_built > g->cap_built) {
@@ -387,7 +387,7 @@ int ft_graft_glue_reserve(struct ft_graft_glue *g,
 		g->cap_built = nr_built;
 	}
 	if (nr_deferred > g->cap_deferred) {
-		struct ft_graft_deferred_edge *p =
+		struct ft_glue_deferred_edge *p =
 			malloc((size_t) nr_deferred * sizeof(*p));
 
 		if (!p)
@@ -399,7 +399,7 @@ int ft_graft_glue_reserve(struct ft_graft_glue *g,
 		g->cap_deferred = nr_deferred;
 	}
 	if (nr_free > g->cap_free) {
-		struct ft_graft_free_item *p =
+		struct ft_glue_free_item *p =
 			malloc((size_t) nr_free * sizeof(*p));
 
 		if (!p)
@@ -411,7 +411,7 @@ int ft_graft_glue_reserve(struct ft_graft_glue *g,
 		g->cap_free = nr_free;
 	}
 	if (nr_splices > g->cap_splices) {
-		struct ft_graft_splice *p =
+		struct ft_glue_splice *p =
 			malloc((size_t) nr_splices * sizeof(*p));
 
 		if (!p)
@@ -430,7 +430,7 @@ int ft_graft_glue_reserve(struct ft_graft_glue *g,
  * Record the single forward publish that splices the built cluster into
  * dst, and wire the cluster top's back-pointer into its (live)
  * publish_parent.  The builders call this once the cluster is fully
- * built.  top is fresh and unpublished, so ft_graft_glue_defer_edge
+ * built.  top is fresh and unpublished, so ft_glue_defer_edge
  * stores top->parent IMMEDIATELY (its fresh-child fast path); the store
  * lands before any other commit-time mutation, so by the time
  * apply_deferred flips any live back-pointer into the cluster, the
@@ -438,7 +438,7 @@ int ft_graft_glue_reserve(struct ft_graft_glue *g,
  * already wired.
  */
 static
-void ft_graft_glue_set_publish(struct cds_ft *ft, struct ft_graft_glue *g,
+void ft_glue_set_publish(struct cds_ft *ft, struct ft_glue *g,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *top)
@@ -446,12 +446,12 @@ void ft_graft_glue_set_publish(struct cds_ft *ft, struct ft_graft_glue *g,
 	g->publish_parent = parent_nf;
 	g->publish_slot = parent_slot;
 	g->top = top;
-	ft_graft_glue_defer_edge(ft, g, top, parent_nf, parent_slot);
+	ft_glue_defer_edge(ft, g, top, parent_nf, parent_slot);
 }
 
 /* Record a fresh glue node so the abort path can free it. */
 static
-void ft_graft_glue_track(struct ft_graft_glue *g,
+void ft_glue_track(struct ft_glue *g,
 		struct cds_ft_inode_flag *nf)
 {
 	assert(g->nr_built < g->cap_built);
@@ -473,7 +473,7 @@ void ft_graft_glue_track(struct ft_graft_glue *g,
  * even when the absorbed reference is skip-encoded.  No-op if absent.
  */
 static
-void ft_graft_glue_untrack(struct cds_ft *ft, struct ft_graft_glue *g, void *node_ptr)
+void ft_glue_untrack(struct cds_ft *ft, struct ft_glue *g, void *node_ptr)
 {
 	int i;
 
@@ -501,7 +501,7 @@ void ft_graft_glue_untrack(struct cds_ft *ft, struct ft_graft_glue *g, void *nod
  * encoded form (or vice versa).
  */
 static
-bool ft_graft_glue_is_fresh(struct cds_ft *ft, struct ft_graft_glue *g,
+bool ft_glue_is_fresh(struct cds_ft *ft, struct ft_glue *g,
 		struct cds_ft_inode_flag *child)
 {
 	void *cp;
@@ -552,7 +552,7 @@ bool ft_graft_glue_is_fresh(struct cds_ft *ft, struct ft_graft_glue *g,
  *     glue cluster, e.g. the displaced old child of a diverge split or
  *     the source-payload leaf at the bottom of the new branch): record
  *     the (child, parent, slot) tuple and defer the ft_set_parent until
- *     ft_graft_glue_apply_deferred at commit time, after the source has
+ *     ft_glue_apply_deferred at commit time, after the source has
  *     been drained.  Flipping a live back-pointer during the build would
  *     be a publication-visible mutation before the cluster is observable.
  *
@@ -560,7 +560,7 @@ bool ft_graft_glue_is_fresh(struct cds_ft *ft, struct ft_graft_glue *g,
  *   wrapper later absorbed by a chain-merge keeps only its final mapping.
  */
 static
-void ft_graft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_graft_glue *g,
+void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *parent,
 		struct cds_ft_inode_flag **slot,
@@ -568,7 +568,7 @@ void ft_graft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_graft_glue *g,
 {
 	int i;
 
-	if (ft_graft_glue_is_fresh(ft, g, child)) {
+	if (ft_glue_is_fresh(ft, g, child)) {
 		ft_set_parent(ft, child, parent, slot);
 		return;
 	}
@@ -589,18 +589,18 @@ void ft_graft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_graft_glue *g,
 }
 
 static
-void ft_graft_glue_defer_edge(struct cds_ft *ft, struct ft_graft_glue *g,
+void ft_glue_defer_edge(struct cds_ft *ft, struct ft_glue *g,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *parent,
 		struct cds_ft_inode_flag **slot)
 {
-	ft_graft_glue_defer_edge_origin(ft, g, child, parent, slot,
+	ft_glue_defer_edge_origin(ft, g, child, parent, slot,
 		/*dst_origin*/ false);
 }
 
 /* Record an old (replaced) live node to reclaim deferred at commit. */
 static
-void ft_graft_glue_defer_free(struct ft_graft_glue *g,
+void ft_glue_defer_free(struct ft_glue *g,
 		void *node, bool compressed)
 {
 	assert(g->nr_free < g->cap_free);
@@ -615,7 +615,7 @@ void ft_graft_glue_defer_free(struct ft_graft_glue *g,
  * edge was applied, so no live back-pointer references the glue.
  */
 static
-void ft_graft_glue_abort(struct cds_ft *ft, struct ft_graft_glue *g)
+void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 {
 	int i;
 
@@ -631,7 +631,7 @@ void ft_graft_glue_abort(struct cds_ft *ft, struct ft_graft_glue *g)
 		else
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(nf));
 	}
-	ft_graft_glue_fini(g);
+	ft_glue_fini(g);
 }
 
 /*
@@ -650,7 +650,7 @@ void ft_graft_glue_abort(struct cds_ft *ft, struct ft_graft_glue *g)
  * back-pointer flip lands on an already-fully-wired cluster.
  */
 static
-void ft_graft_glue_apply_deferred(struct cds_ft *ft, struct ft_graft_glue *g)
+void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 {
 	int i;
 
@@ -678,7 +678,7 @@ void ft_graft_glue_apply_deferred(struct cds_ft *ft, struct ft_graft_glue *g)
  */
 #ifdef FEATURE_FT_MERGE
 static
-void ft_graft_glue_record_splice(struct ft_graft_glue *g,
+void ft_glue_record_splice(struct ft_glue *g,
 		struct cds_ft_node *dst_head,
 		struct cds_ft_node *src_head)
 {
@@ -700,8 +700,8 @@ void ft_graft_glue_record_splice(struct ft_graft_glue *g,
  * keep their ordering.
  */
 static
-void ft_graft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
-		struct ft_graft_glue *g)
+void ft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
+		struct ft_glue *g)
 {
 	int i;
 
@@ -717,7 +717,7 @@ void ft_graft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
 		 * heads' cells -- already reachable in dst -- still carry the old
 		 * src-run ord_prev/ord_next, including links to THIS cell, until
 		 * the post-publish interleave rewires them.  Capture it in the
-		 * splice record; ft_graft_glue_free_collided_cells frees it after
+		 * splice record; ft_glue_free_collided_cells frees it after
 		 * the interleave through the grace-period-deferred cell free.
 		 * List off: src_head->prev is the flagged parent, no cell.
 		 */
@@ -739,8 +739,8 @@ void ft_graft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
  * holding a stale link or parked on a demoted head.
  */
 static
-void ft_graft_glue_free_collided_cells(struct cds_ft *ft,
-		struct ft_graft_glue *g)
+void ft_glue_free_collided_cells(struct cds_ft *ft,
+		struct ft_glue *g)
 {
 	int i;
 
@@ -752,7 +752,7 @@ void ft_graft_glue_free_collided_cells(struct cds_ft *ft,
 
 /*
  * Commit step 2: the single forward publish that makes the whole cluster
- * reachable in dst.  Call after ft_graft_glue_apply_deferred.  The
+ * reachable in dst.  Call after ft_glue_apply_deferred.  The
  * cluster top's parent is wired into publish_parent at set_publish time
  * (build phase, fresh-child store) and the rest of the cluster's
  * internal back-pointers are also already set, so by the time we publish
@@ -760,7 +760,7 @@ void ft_graft_glue_free_collided_cells(struct cds_ft *ft,
  * node up through the cluster to publish_parent is in place.
  */
 static
-void ft_graft_glue_publish(struct cds_ft *ft, struct ft_graft_glue *g)
+void ft_glue_publish(struct cds_ft *ft, struct ft_glue *g)
 {
 	ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top);
 }
@@ -770,7 +770,7 @@ void ft_graft_glue_publish(struct cds_ft *ft, struct ft_graft_glue *g)
  * normal grace-period free.  Call after the forward publish.
  */
 static
-void ft_graft_glue_free_old(struct cds_ft *ft, struct ft_graft_glue *g)
+void ft_glue_free_old(struct cds_ft *ft, struct ft_glue *g)
 {
 	int i;
 
@@ -828,7 +828,7 @@ void ft_graft_glue_free_old(struct cds_ft *ft, struct ft_graft_glue *g)
 static
 struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child,
-		struct ft_graft_glue *glue)
+		struct ft_glue *glue)
 {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	struct cds_ft_inode *node;
@@ -932,11 +932,11 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 		 * records the PLAIN @cflag -- ft_set_parent recovers @cn
 		 * directly and records its skip_slot at commit.
 		 */
-		ft_graft_glue_track(glue, cflag);
-		ft_graft_glue_defer_edge(ft, glue, cn->child, cflag, &cn->child);
-		ft_graft_glue_defer_free(glue, node, false);
+		ft_glue_track(glue, cflag);
+		ft_glue_defer_edge(ft, glue, cn->child, cflag, &cn->child);
+		ft_glue_defer_free(glue, node, false);
 		if (single_cn)
-			ft_graft_glue_defer_free(glue, single_cn, true);
+			ft_glue_defer_free(glue, single_cn, true);
 		/*
 		 * Return the PLAIN flag, NOT the skip form: @cn->child's
 		 * back-pointer is deferred, so a skip pointer would not yet
@@ -989,12 +989,12 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
  * back-pointers route through @glue, ft_compress_single_child_if_needed is
  * non-destructive in glue mode, and the forward slot is parked behind a flip
  * proxy resolving to the (empty) old value -- so an OOM in prepare leaves both
- * the payload and the destination pristine (the caller runs ft_graft_glue_abort).
+ * the payload and the destination pristine (the caller runs ft_glue_abort).
  * commit applies the deferred edges, swings the forward publish and reclaims the
  * replaced source root (if canonicalized); it cannot fail.
  */
 struct ft_graft_store_state {
-	struct ft_graft_glue *glue;
+	struct ft_glue *glue;
 	bool displaced_shape;
 	struct cds_ft_inode_flag *attached;		/* payload (at-node) or branch */
 	unsigned int attached_depth;
@@ -1020,7 +1020,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		struct ft_descent *d,
 		struct cds_ft_inode_flag *graft_payload,
 		unsigned long graft_external_count,
-		struct ft_graft_glue *glue,
+		struct ft_glue *glue,
 		struct ft_flip_batch **pre_flip,
 		struct ft_graft_store_state *st)
 {
@@ -1179,7 +1179,7 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * must be wired before any dst-reachable live edge flips into the
 		 * fresh cluster), then the back-channel, then the forward publish.
 		 */
-		ft_graft_glue_apply_deferred(ft, st->glue);
+		ft_glue_apply_deferred(ft, st->glue);
 		ft_publish_external_nodes_prev(ft, st->attached, st->displaced);
 		ft_publish_to_parent(ft, st->pnf, st->nfp, st->attached);
 		if (st->tp_i >= 1)
@@ -1194,7 +1194,7 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		ft_node_get_nth_skip(st->dest, &slot, st->slot_byte, FT_PF_NONE);
 		assert(slot);
 		ft_set_parent(ft, st->attached, st->dest, slot);
-		ft_graft_glue_apply_deferred(ft, st->glue);
+		ft_glue_apply_deferred(ft, st->glue);
 		ft_publish_to_parent(ft, st->publish_pmeta->parent, st->pnfp,
 			st->dest);
 		ft_flip_batch_commit(st->b);
@@ -1204,7 +1204,7 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		if (st->old_recompacted_node)
 			free_cds_ft_node(ft, st->old_recompacted_node);
 	}
-	ft_graft_glue_free_old(ft, st->glue);
+	ft_glue_free_old(ft, st->glue);
 	*attached_nf = st->attached;
 	*attached_depth = st->attached_depth;
 }
@@ -1225,7 +1225,7 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		unsigned long graft_external_count,
 		struct cds_ft_inode_flag **attached_nf,
 		unsigned int *attached_depth,
-		struct ft_graft_glue *glue,
+		struct ft_glue *glue,
 		struct ft_flip_batch **pre_flip)
 {
 	struct ft_graft_store_state st;
@@ -1267,7 +1267,7 @@ static
 enum ft_graft_prep ft_graft_build(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		struct cds_ft_inode_flag *payload, unsigned long src_count,
-		struct ft_descent *d, struct ft_graft_glue *glue)
+		struct ft_descent *d, struct ft_glue *glue)
 {
 	const uint8_t *ik = key;
 
@@ -1424,7 +1424,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct ft_descent d;
 		struct cds_ft_inode *fresh_node;
 		struct cds_ft_metadata *fresh_meta;
-		struct ft_graft_glue glue;
+		struct ft_glue glue;
 		enum ft_graft_prep prep;
 		unsigned long src_count = ft_nr_keys_get(src_rmeta);
 		struct cds_ft_inode_flag *old_src_root;
@@ -1473,11 +1473,11 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * A diverge split builds its whole cluster invisibly into
 		 * @glue; otherwise just locate the graft point in @d.
 		 */
-		ft_graft_glue_init(&glue);
+		ft_glue_init(&glue);
 		prep = ft_graft_build(dst_ft, key, key_len, graft_payload,
 				src_count, &d, &glue);
 		if (prep == FT_GRAFT_PREP_OOM) {
-			ft_graft_glue_abort(dst_ft, &glue);
+			ft_glue_abort(dst_ft, &glue);
 			free_cds_ft_node(src_ft, fresh_node);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
@@ -1522,14 +1522,14 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			memset(&graft_reserve, 0, sizeof(graft_reserve));
 			if (ft_bulk_node_reserve_fill(dst_ft, &graft_reserve)) {
 				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
-				ft_graft_glue_abort(dst_ft, &glue);
+				ft_glue_abort(dst_ft, &glue);
 				free_cds_ft_node(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 			graft_flip = ft_flip_batch_alloc(dst_ft, 1);
 			if (!graft_flip) {
 				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
-				ft_graft_glue_abort(dst_ft, &glue);
+				ft_glue_abort(dst_ft, &glue);
 				free_cds_ft_node(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
@@ -1587,10 +1587,10 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * forward publish, then reclaim the old compressed
 			 * node and the source's old root.  Nothing can fail.
 			 */
-			ft_graft_glue_apply_deferred(dst_ft, &glue);
-			ft_graft_glue_publish(dst_ft, &glue);
+			ft_glue_apply_deferred(dst_ft, &glue);
+			ft_glue_publish(dst_ft, &glue);
 			attached_nf = glue.attached_nf;
-			ft_graft_glue_free_old(dst_ft, &glue);
+			ft_glue_free_old(dst_ft, &glue);
 		} else {
 			/*
 			 * Non-split attach: the payload subtrie is built into
@@ -1755,7 +1755,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  */
 static
 struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
-		struct ft_graft_glue *glue,
+		struct ft_glue *glue,
 		uint8_t first_byte, const uint8_t *rest, unsigned int rest_len,
 		struct cds_ft_inode_flag *child, unsigned long subtree_count)
 {
@@ -1782,9 +1782,9 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 		new_cn_meta->nr_child = 1;
 		ft_nr_keys_store(new_cn_meta, subtree_count, CMM_RELAXED);
 		slot_value = ft_compressed_node_flag(new_cn);	/* PLAIN */
-		ft_graft_glue_track(glue, slot_value);
+		ft_glue_track(glue, slot_value);
 		/* @child (live) -> new_cn, deferred to the post-sync commit. */
-		ft_graft_glue_defer_edge(ft, glue, child, slot_value, &new_cn->child);
+		ft_glue_defer_edge(ft, glue, child, slot_value, &new_cn->child);
 		/* Skip form for the root slot (resolves once the edge applies). */
 		skip_value = ft_publish_compressed(ft, new_cn, slot_value);
 	}
@@ -1803,11 +1803,11 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 			NULL, root_meta, 0, rest_len == 0 /* cluster_leaf */);
 	if (ret)
 		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
-	ft_graft_glue_track(glue, dest);
+	ft_glue_track(glue, dest);
 	ft_nr_keys_store(ft_flag_to_metadata(ft, dest), subtree_count, CMM_RELAXED);
 	ft_node_get_nth_skip(dest, &slot, first_byte, FT_PF_NONE);
 	if (rest_len == 0) {
-		ft_graft_glue_defer_edge(ft, glue, child, dest, slot);
+		ft_glue_defer_edge(ft, glue, child, dest, slot);
 	} else {
 		/* Re-encode the root slot to the skip form (new_cn is compressed). */
 		if (skip_value && skip_value != slot_value && slot)
@@ -1841,7 +1841,7 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
  */
 static
 struct cds_ft_inode_flag *ft_make_root_internal_glue(struct cds_ft *ft,
-		struct ft_graft_glue *glue, struct cds_ft_inode_flag *old_child)
+		struct ft_glue *glue, struct cds_ft_inode_flag *old_child)
 {
 	struct cds_ft_compressed_node *cn;
 	struct cds_ft_metadata *cn_meta;
@@ -1858,7 +1858,7 @@ struct cds_ft_inode_flag *ft_make_root_internal_glue(struct cds_ft *ft,
 	if (root == (struct cds_ft_inode_flag *) (long) -ENOMEM)
 		return root;
 	/* Reclaim the peeled-away compressed node after the commit. */
-	ft_graft_glue_defer_free(glue, cn, true);
+	ft_glue_defer_free(glue, cn, true);
 	return root;
 }
 
@@ -2037,7 +2037,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *old_child, *old_swap_root;
 		struct cds_ft_inode *fresh = NULL;
 		struct cds_ft_metadata *fresh_meta = NULL;
-		struct ft_graft_glue glue_insert, glue_extract;
+		struct ft_glue glue_insert, glue_extract;
 		struct cds_ft_inode_flag *canon = NULL;
 		struct cds_ft_inode_flag *top_B = NULL;	/* extracted swap root, NULL = external/none */
 		struct cds_ft_compressed_node *ks_cn = NULL;	/* key-shorter original cn */
@@ -2104,8 +2104,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				!ft_node_skip_compressed(old_child);
 		}
 
-		ft_graft_glue_init(&glue_insert);
-		ft_graft_glue_init(&glue_extract);
+		ft_glue_init(&glue_insert);
+		ft_glue_init(&glue_extract);
 
 		/* ===== PREP: build clusters A and B (both tries pristine) ===== */
 
@@ -2169,21 +2169,21 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				pub_slot = ft_get_parent_slot(pcn_meta, dst_ft);
 				ft_set_parent_slot(merged_meta, pub_slot);
 				merged_flag = ft_compressed_node_flag(merged);
-				ft_graft_glue_track(&glue_insert, merged_flag);
-				ft_graft_glue_defer_edge(dst_ft, &glue_insert, ccn->child,
+				ft_glue_track(&glue_insert, merged_flag);
+				ft_glue_defer_edge(dst_ft, &glue_insert, ccn->child,
 					merged_flag, &merged->child);
 				/*
 				 * @canon is the fresh wrapper just absorbed: drop it from
 				 * tracking and free it (its deferred child edge is superseded
 				 * by the one above via the defer-edge de-dup on @child).
 				 */
-				ft_graft_glue_untrack(dst_ft, &glue_insert, ccn);
+				ft_glue_untrack(dst_ft, &glue_insert, ccn);
 				free_compressed_node_unpublished(dst_ft, ccn);
 				merged_skip = ft_publish_compressed(dst_ft, merged,
 						merged_flag);
-				ft_graft_glue_set_publish(dst_ft, &glue_insert, pub_parent,
+				ft_glue_set_publish(dst_ft, &glue_insert, pub_parent,
 					pub_slot, merged_skip);
-				ft_graft_glue_defer_free(&glue_insert, pcn, true);
+				ft_glue_defer_free(&glue_insert, pcn, true);
 				d.pnf = merged_flag;	/* count updates land on merged */
 				have_insert = true;
 			}
@@ -2204,7 +2204,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 						canon, swap_count, false, &glue_insert);
 				if (!top_A)
 					goto prep_oom;
-				ft_graft_glue_defer_free(&glue_insert, ks_cn, true);
+				ft_glue_defer_free(&glue_insert, ks_cn, true);
 			} else {
 				/* EXACT, simple replace of d.nf at d.nfp by @canon. */
 				top_A = canon;
@@ -2212,7 +2212,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			/*
 			 * A compressed cluster top installs as the SKIP form in the live
 			 * parent slot; its child's back-pointer is deferred, so the skip
-			 * only resolves once ft_graft_glue_apply_deferred has run -- which
+			 * only resolves once ft_glue_apply_deferred has run -- which
 			 * it does (before the forward publish) at commit.  The set_publish
 			 * deferred edge (top -> d.pnf) is recorded LAST, so by the time it
 			 * is applied the child back-pointer is already in place.
@@ -2220,7 +2220,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			if (ft_node_compressed(top_A))
 				top_A = ft_publish_compressed(dst_ft,
 					ft_compressed_node_ptr(top_A), top_A);
-			ft_graft_glue_set_publish(dst_ft, &glue_insert, d.pnf, d.nfp, top_A);
+			ft_glue_set_publish(dst_ft, &glue_insert, d.pnf, d.nfp, top_A);
 			have_insert = true;
 		}
 
@@ -2303,8 +2303,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * content).  Empty swap publishes NULL (a remove).
 		 */
 		if (have_insert) {
-			ft_graft_glue_apply_deferred(dst_ft, &glue_insert);
-			ft_graft_glue_publish(dst_ft, &glue_insert);
+			ft_glue_apply_deferred(dst_ft, &glue_insert);
+			ft_glue_publish(dst_ft, &glue_insert);
 		} else {
 			ft_publish_to_parent(dst_ft, d.pnf, d.nfp, NULL);
 		}
@@ -2366,7 +2366,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * has been detached from dst by the publish above and after the
 		 * dst-side drain above.
 		 */
-		ft_graft_glue_apply_deferred(dst_ft, &glue_extract);
+		ft_glue_apply_deferred(dst_ft, &glue_extract);
 		if (top_B) {
 			struct cds_ft_metadata *bm =
 				cds_ft_item_to_metadata(ft_node_ptr(top_B));
@@ -2423,8 +2423,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		}
 
 		/* Reclaim the old (replaced) live nodes after the publishes. */
-		ft_graft_glue_free_old(dst_ft, &glue_insert);
-		ft_graft_glue_free_old(swap_ft, &glue_extract);
+		ft_glue_free_old(dst_ft, &glue_insert);
+		ft_glue_free_old(swap_ft, &glue_extract);
 
 		{
 			size_t nm = key_len + swap_max;
@@ -2452,8 +2452,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * No deferred edge was applied and nothing was published, so dst_ft and
 		 * swap_ft are both pristine -- there is nothing to roll back.
 		 */
-		ft_graft_glue_abort(dst_ft, &glue_insert);
-		ft_graft_glue_abort(swap_ft, &glue_extract);
+		ft_glue_abort(dst_ft, &glue_insert);
+		ft_glue_abort(swap_ft, &glue_extract);
 		if (fresh)
 			free_cds_ft_node(swap_ft, fresh);
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);

@@ -83,8 +83,8 @@ enum ft_graft_swap_case ft_merge_descend(struct cds_ft *ft,
 
 struct ft_merge_ctx {
 	struct cds_ft *dst_ft;		/* all fresh merged nodes live here */
-	struct ft_graft_glue *gd;	/* dst cluster: built/deferred/dst frees/splices */
-	struct ft_graft_glue *gs;	/* src side: src-overlap frees (+ prune later) */
+	struct ft_glue *gd;	/* dst cluster: built/deferred/dst frees/splices */
+	struct ft_glue *gs;	/* src side: src-overlap frees (+ prune later) */
 };
 
 /* Upper-bound counters for the read-only pre-pass that sizes the glues. */
@@ -154,7 +154,7 @@ struct cds_ft_inode_flag *ft_merge_materialize_suffix(struct ft_merge_ctx *c,
 		unsigned long *ck_ret)
 {
 	struct cds_ft *ft = c->dst_ft;
-	struct ft_graft_glue *g = c->gd;	/* all fresh merged nodes -> gd */
+	struct ft_glue *g = c->gd;	/* all fresh merged nodes -> gd */
 	unsigned int suffix_len = cn->len - off - 1;
 	unsigned long child_keys = ft_merge_child_count(ft, cn->child);
 	struct cds_ft_inode_flag **slot;
@@ -179,14 +179,14 @@ struct cds_ft_inode_flag *ft_merge_materialize_suffix(struct ft_merge_ctx *c,
 		sfx_meta->nr_child = 1;
 		ft_nr_keys_store(sfx_meta, child_keys, CMM_RELAXED);
 		plain = ft_compressed_node_flag(sfx);
-		ft_graft_glue_track(g, plain);
-		ft_graft_glue_defer_edge_origin(ft, g, cn->child, plain, &sfx->child,
+		ft_glue_track(g, plain);
+		ft_glue_defer_edge_origin(ft, g, cn->child, plain, &sfx->child,
 				dst_origin);
 		/*
 		 * Return the PLAIN flag: a fresh compressed node's skip form
 		 * cannot be resolved during the build (its child's back-pointer
 		 * is deferred), so the parent stores the plain form -- which
-		 * ft_graft_glue_is_fresh matches by direct identity -- and the
+		 * ft_glue_is_fresh matches by direct identity -- and the
 		 * parent's Pass 2 re-encodes the slot to the skip form.
 		 */
 		return plain;
@@ -200,10 +200,10 @@ struct cds_ft_inode_flag *ft_merge_materialize_suffix(struct ft_merge_ctx *c,
 			return FT_MERGE_OOM;
 		ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(dest)),
 				child_keys, CMM_RELAXED);
-		ft_graft_glue_track(g, dest);
+		ft_glue_track(g, dest);
 		ft_node_get_nth_skip(dest, &slot, cn->key_bytes[off + 1],
 				FT_PF_NONE);
-		ft_graft_glue_defer_edge_origin(ft, g, cn->child, dest, slot,
+		ft_glue_defer_edge_origin(ft, g, cn->child, dest, slot,
 				dst_origin);
 		return dest;
 	}
@@ -256,10 +256,10 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 			return FT_MERGE_OOM;
 		ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(dest)), ck,
 				CMM_RELAXED);
-		ft_graft_glue_track(c->gd, dest);
+		ft_glue_track(c->gd, dest);
 		ft_node_get_nth_skip(dest, &slot, cn_s->key_bytes[off_s],
 				FT_PF_NONE);
-		ft_graft_glue_defer_edge_origin(ft, c->gd, child, dest, slot,
+		ft_glue_defer_edge_origin(ft, c->gd, child, dest, slot,
 				/*dst_origin=*/ true);
 		*nr_keys_ret = ck;
 		return dest;
@@ -279,13 +279,13 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 	run_meta->nr_child = 1;
 	ft_nr_keys_store(run_meta, ck, CMM_RELAXED);
 	plain = ft_compressed_node_flag(run);
-	ft_graft_glue_track(c->gd, plain);
+	ft_glue_track(c->gd, plain);
 	/*
 	 * Wire run->child's back-pointer.  A fresh recursion result is stored
 	 * immediately (is_fresh); a live result can only be the dst splice head
 	 * the recursion returns, so dst_origin is safe either way.
 	 */
-	ft_graft_glue_defer_edge_origin(ft, c->gd, child, plain, &run->child,
+	ft_glue_defer_edge_origin(ft, c->gd, child, plain, &run->child,
 			/*dst_origin=*/ true);
 	/*
 	 * Return the PLAIN flag (like ft_merge_materialize_suffix): the parent
@@ -327,9 +327,9 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 * dst -> gd.  Internal overlap nodes are recorded at the tail instead.
 	 */
 	if (S_comp && off_s == 0)
-		ft_graft_glue_defer_free(c->gs, cn_s, true);
+		ft_glue_defer_free(c->gs, cn_s, true);
 	if (D_comp && off_d == 0)
-		ft_graft_glue_defer_free(c->gd, cn_d, true);
+		ft_glue_defer_free(c->gd, cn_d, true);
 
 	/*
 	 * Both compressed and sharing a prefix from their cursors -> collapse
@@ -364,7 +364,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 * parent frame wires the slot and the dst head's back-pointer.
 	 */
 	if (S_ext && D_ext) {
-		ft_graft_glue_record_splice(c->gd, D_leaf, S_leaf);
+		ft_glue_record_splice(c->gd, D_leaf, S_leaf);
 		*nr_keys_ret = 1;
 		return D;
 	}
@@ -458,11 +458,11 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 		if (ret)
 			return FT_MERGE_OOM;
 		if (old) {
-			ft_graft_glue_untrack(ft, c->gd, old);
+			ft_glue_untrack(ft, c->gd, old);
 			free_cds_ft_node_unpublished(ft, old);
 		}
 		if (!tracked) {
-			ft_graft_glue_track(c->gd, M);
+			ft_glue_track(c->gd, M);
 			tracked = true;
 			Mmeta = cds_ft_item_to_metadata(ft_node_ptr(M));
 			/*
@@ -474,7 +474,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			Mmeta->parent_slot_offset = 0;
 #endif
 		} else if (old) {
-			ft_graft_glue_track(c->gd, M);
+			ft_glue_track(c->gd, M);
 		}
 		Mmeta = cds_ft_item_to_metadata(ft_node_ptr(M));
 		total_keys += ck;
@@ -483,7 +483,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	/* Merged external_nodes (the key terminating at M itself). */
 	if (S_leaf && D_leaf) {
 		M_ext = D_leaf;
-		ft_graft_glue_record_splice(c->gd, D_leaf, S_leaf);
+		ft_glue_record_splice(c->gd, D_leaf, S_leaf);
 	} else if (D_leaf) {
 		M_ext = D_leaf;
 	} else {
@@ -522,7 +522,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 		else
 			dst_origin = !D_ext && ft_node_get_nth_skip(D, NULL,
 					(uint8_t) b, FT_PF_NONE) != NULL;
-		ft_graft_glue_defer_edge_origin(ft, c->gd, child, M, slot, dst_origin);
+		ft_glue_defer_edge_origin(ft, c->gd, child, M, slot, dst_origin);
 		/*
 		 * A freshly-built compressed child (run / suffix) was stored as
 		 * its PLAIN flag so is_fresh could match it by identity above;
@@ -539,7 +539,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 		}
 	}
 	if (M_ext)
-		ft_graft_glue_defer_edge_origin(ft, c->gd,
+		ft_glue_defer_edge_origin(ft, c->gd,
 			(struct cds_ft_inode_flag *) M_ext, M, NULL,
 			/*dst_origin=*/ D_leaf != NULL);
 
@@ -548,9 +548,9 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 * recorded on entry above).  src -> gs, dst -> gd.
 	 */
 	if (!S_ext && !S_comp)
-		ft_graft_glue_defer_free(c->gs, ft_node_ptr(S), false);
+		ft_glue_defer_free(c->gs, ft_node_ptr(S), false);
 	if (!D_ext && !D_comp)
-		ft_graft_glue_defer_free(c->gd, ft_node_ptr(D), false);
+		ft_glue_defer_free(c->gd, ft_node_ptr(D), false);
 
 	ft_nr_keys_store(Mmeta, total_keys, CMM_RELAXED);
 	*nr_keys_ret = total_keys;
@@ -559,7 +559,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 
 /*
  * Read-only pre-pass mirroring ft_merge_build's control flow, accumulating
- * upper bounds for ft_graft_glue_reserve so the build never asserts on a full
+ * upper bounds for ft_glue_reserve so the build never asserts on a full
  * inline floor.  No allocation, no mutation.
  */
 static
@@ -995,16 +995,16 @@ struct cds_ft_inode_flag *ft_merge_wrap_prefix(struct ft_merge_ctx *c,
 		merged_meta->nr_child = 1;
 		ft_nr_keys_store(merged_meta, mk, CMM_RELAXED);
 		mflag = ft_compressed_node_flag(merged);
-		ft_graft_glue_track(c->gd, mflag);
+		ft_glue_track(c->gd, mflag);
 		/*
 		 * Carry the run child's dst_origin (ft_merge_build_run records
 		 * it true): a fresh child applies via is_fresh, a live splice
 		 * head flips with the forward slot.  The defer de-dup supersedes
 		 * M's stale &mcn->child edge with this one (same @child).
 		 */
-		ft_graft_glue_defer_edge_origin(ft, c->gd, mcn->child, mflag,
+		ft_glue_defer_edge_origin(ft, c->gd, mcn->child, mflag,
 				&merged->child, /*dst_origin=*/ true);
-		ft_graft_glue_untrack(ft, c->gd, mcn);
+		ft_glue_untrack(ft, c->gd, mcn);
 		free_compressed_node_unpublished(ft, mcn);
 		return mflag;	/* PLAIN; caller skip-encodes before publish */
 	} else {
@@ -1061,7 +1061,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		struct ft_flip_batch **pre_flip,
 		struct ft_flip_batch **pre_ms_flip)
 {
-	struct ft_graft_glue gd, gs;
+	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
 	struct ft_merge_counts cnt = { 0, 0, 0, 0, 0 };
 	bool root_src = (src_key_len == 0);
@@ -1086,7 +1086,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * slot @pub_slot, the read-side descent resolves the type-7 proxy at every
 	 * child fetch (ft_resolve_flip_proxy, before the skip handler), and the
 	 * published node's parent is wired to @pub_parent by
-	 * ft_graft_glue_set_publish, so a descent and an up-walk see a coherent
+	 * ft_glue_set_publish, so a descent and an up-walk see a coherent
 	 * old-XOR-merged view across the flip.
 	 *
 	 * Edge D: the merge point's PARENT is a COMPRESSED node cn_p reached via a
@@ -1105,13 +1105,13 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 
 	/* Size both glues from a read-only pre-pass (with headroom). */
 	ft_merge_count(dst_ft, S, off_src, D, off_dst, &cnt);
-	ft_graft_glue_init(&gd);
-	ft_graft_glue_init(&gs);
-	if (ft_graft_glue_reserve(&gd, cnt.nb + 8, cnt.nd + 8,
+	ft_glue_init(&gd);
+	ft_glue_init(&gs);
+	if (ft_glue_reserve(&gd, cnt.nb + 8, cnt.nd + 8,
 				cnt.nf_dst + 8, cnt.ns + 8) ||
-	    ft_graft_glue_reserve(&gs, 0, 0, cnt.nf_src + 8, 0)) {
-		ft_graft_glue_fini(&gd);
-		ft_graft_glue_fini(&gs);
+	    ft_glue_reserve(&gs, 0, 0, cnt.nf_src + 8, 0)) {
+		ft_glue_fini(&gd);
+		ft_glue_fini(&gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
@@ -1119,8 +1119,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	if (root_src) {
 		fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
 		if (!fresh_root) {
-			ft_graft_glue_fini(&gd);
-			ft_graft_glue_fini(&gs);
+			ft_glue_fini(&gd);
+			ft_glue_fini(&gs);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		rcu_assign_pointer(fresh_meta->parent, NULL);
@@ -1132,8 +1132,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	if (M == FT_MERGE_OOM) {
 		if (fresh_root)
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
-		ft_graft_glue_abort(dst_ft, &gd);
-		ft_graft_glue_abort(src_ft, &gs);
+		ft_glue_abort(dst_ft, &gd);
+		ft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
@@ -1181,15 +1181,15 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			wrap_len = off_dst;
 			wrap_depth = (unsigned int) d_dst->depth;
 		}
-		ft_graft_glue_defer_free(&gd, wrap_cn, true);
+		ft_glue_defer_free(&gd, wrap_cn, true);
 		memcpy(&kbuf[wrap_depth], wrap_cn->key_bytes, wrap_len);
 		pub = ft_merge_wrap_prefix(&ctx, kbuf, wrap_depth,
 				wrap_depth + wrap_len, M, merged_keys);
 		if (pub == FT_MERGE_OOM) {
 			if (fresh_root)
 				free_cds_ft_node_unpublished(src_ft, fresh_root);
-			ft_graft_glue_abort(dst_ft, &gd);
-			ft_graft_glue_abort(src_ft, &gs);
+			ft_glue_abort(dst_ft, &gd);
+			ft_glue_abort(src_ft, &gs);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 	} else if (pub_parent) {
@@ -1197,8 +1197,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		if (pub == (struct cds_ft_inode_flag *) (long) -ENOMEM) {
 			if (fresh_root)
 				free_cds_ft_node_unpublished(src_ft, fresh_root);
-			ft_graft_glue_abort(dst_ft, &gd);
-			ft_graft_glue_abort(src_ft, &gs);
+			ft_glue_abort(dst_ft, &gd);
+			ft_glue_abort(src_ft, &gs);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 	} else {
@@ -1222,11 +1222,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	if (!flip) {
 		if (fresh_root)
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
-		ft_graft_glue_abort(dst_ft, &gd);
-		ft_graft_glue_abort(src_ft, &gs);
+		ft_glue_abort(dst_ft, &gd);
+		ft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
-	ft_graft_glue_set_publish(dst_ft, &gd, pub_parent, pub_slot, pub);
+	ft_glue_set_publish(dst_ft, &gd, pub_parent, pub_slot, pub);
 
 	/*
 	 * Slot-canonical form of @pub for the @pub_slot stores (both the flip
@@ -1295,8 +1295,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				if (fresh_root)
 					free_cds_ft_node_unpublished(src_ft,
 						fresh_root);
-				ft_graft_glue_abort(dst_ft, &gd);
-				ft_graft_glue_abort(src_ft, &gs);
+				ft_glue_abort(dst_ft, &gd);
+				ft_glue_abort(src_ft, &gs);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		}
@@ -1321,8 +1321,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		if (ms_flip)
 			ft_flip_batch_free_unpublished(ms_flip);
 		ft_flip_batch_free_unpublished(flip);
-		ft_graft_glue_abort(dst_ft, &gd);
-		ft_graft_glue_abort(src_ft, &gs);
+		ft_glue_abort(dst_ft, &gd);
+		ft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	/*
@@ -1343,7 +1343,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    not yet forward-published, so this is invisible.  dst-origin
 	 *    edges are NOT applied here -- they go through the flip.
 	 */
-	ft_graft_glue_apply_deferred(dst_ft, &gd);
+	ft_glue_apply_deferred(dst_ft, &gd);
 
 	/*
 	 * 3. Stage the flip: point every dst-origin child's parent, and the
@@ -1386,7 +1386,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	urcu_flip_commit(&flip->group);
 
 	/* 5. Concatenate same-key duplicate chains (dst now reachable via M). */
-	ft_graft_glue_apply_splices(dst_ft, &gd);
+	ft_glue_apply_splices(dst_ft, &gd);
 
 	/*
 	 * 6. Propagate the dst key-count delta through the ancestors, starting at
@@ -1422,8 +1422,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    No dst synchronize_rcu -- the flip subsumed the dst drain.
 	 */
 	ft_flip_batch_reclaim(flip);
-	ft_graft_glue_free_old(src_ft, &gs);
-	ft_graft_glue_free_old(dst_ft, &gd);
+	ft_glue_free_old(src_ft, &gs);
+	ft_glue_free_old(dst_ft, &gd);
 
 	/*
 	 * 9. Ordered list: splice the surviving src cells into dst's ordered
@@ -1445,10 +1445,10 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ms_cursor, ms_prev, ms_edges, ms_flip);
 		free(ms_edges);
 	}
-	ft_graft_glue_free_collided_cells(dst_ft, &gd);
+	ft_glue_free_collided_cells(dst_ft, &gd);
 
-	ft_graft_glue_fini(&gd);
-	ft_graft_glue_fini(&gs);
+	ft_glue_fini(&gd);
+	ft_glue_fini(&gs);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -1534,7 +1534,7 @@ int ft_merge_nosplit_reserve(struct cds_ft *dst_ft, const uint8_t *okey_dst,
 		struct cds_ft_alloc_reserve *reserve)
 {
 	struct cds_ft_inode_flag *displaced;
-	struct ft_graft_glue lg;
+	struct ft_glue lg;
 	struct cds_ft_inode_flag *branch;
 	bool grow = false;
 	int rret = 0, bi;
@@ -1543,17 +1543,17 @@ int ft_merge_nosplit_reserve(struct cds_ft *dst_ft, const uint8_t *okey_dst,
 		grow = true;			/* at-node: only the grow, if any */
 	} else {
 		displaced = (d->nf && ft_node_external(d->nf)) ? d->nf : NULL;
-		ft_graft_glue_init(&lg);
+		ft_glue_init(&lg);
 		branch = ft_build_branch(dst_ft, okey_dst, d->depth, dst_key_len,
 			payload, cnt_src, displaced != NULL, &lg);
 		if (!branch) {
-			ft_graft_glue_fini(&lg);
+			ft_glue_fini(&lg);
 			return -ENOMEM;
 		}
 		for (bi = 0; bi < lg.nr_built && !rret; bi++)
 			rret = ft_merge_reserve_add_built(dst_ft, reserve,
 				lg.built[bi]);
-		ft_graft_glue_abort(dst_ft, &lg);	/* frees the learn nodes */
+		ft_glue_abort(dst_ft, &lg);	/* frees the learn nodes */
 		if (rret)
 			return rret;
 		grow = (displaced == NULL);	/* an empty slot ADDS a child */
@@ -1584,7 +1584,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *payload, unsigned long cnt_src,
 		bool *handled)
 {
-	struct ft_graft_glue glue;
+	struct ft_glue glue;
 	struct cds_ft_alloc_reserve reserve;
 	struct ft_flip_batch *pre_flip = NULL;
 	struct ft_descent d;
@@ -1607,18 +1607,18 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * Either way the source unlink is the single last fallible step, so an OOM
 	 * leaves both tries pristine -- no rollback, no leak.
 	 */
-	ft_graft_glue_init(&glue);
+	ft_glue_init(&glue);
 	memset(&reserve, 0, sizeof(reserve));
 	prep = ft_graft_build(dst_ft, okey_dst, dst_key_len, payload, cnt_src,
 			&d, &glue);
 	*handled = true;
 	if (prep == FT_GRAFT_PREP_OOM) {
-		ft_graft_glue_abort(dst_ft, &glue);
+		ft_glue_abort(dst_ft, &glue);
 		return CDS_FT_STATUS_MEMORY_ERROR;	/* both tries pristine */
 	}
 	if (prep == FT_GRAFT_PREP_POPULATED) {
 		/* Defensive: cnt_dst == 0 should never yield an occupied point. */
-		ft_graft_glue_fini(&glue);
+		ft_glue_fini(&glue);
 		return CDS_FT_STATUS_POPULATED_ERROR;
 	}
 	if (prep == FT_GRAFT_PREP_NOSPLIT) {
@@ -1638,14 +1638,14 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		if (ft_merge_nosplit_reserve(dst_ft, okey_dst, dst_key_len,
 				payload, cnt_src, &d, &reserve)) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-			ft_graft_glue_fini(&glue);
+			ft_glue_fini(&glue);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		if (!displaced) {
 			pre_flip = ft_flip_batch_alloc(dst_ft, 1);
 			if (!pre_flip) {
 				cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-				ft_graft_glue_fini(&glue);
+				ft_glue_fini(&glue);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		}
@@ -1676,7 +1676,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		if (pre_flip)
 			ft_flip_batch_free_unpublished(pre_flip);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-		ft_graft_glue_abort(dst_ft, &glue);
+		ft_glue_abort(dst_ft, &glue);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
@@ -1700,11 +1700,11 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		 * child, the cluster top), splice the cluster in with the single
 		 * forward publish, then reclaim the replaced compressed node.
 		 */
-		ft_graft_glue_apply_deferred(dst_ft, &glue);
-		ft_graft_glue_publish(dst_ft, &glue);
+		ft_glue_apply_deferred(dst_ft, &glue);
+		ft_glue_publish(dst_ft, &glue);
 		attached_nf = glue.attached_nf;
-		ft_graft_glue_free_old(dst_ft, &glue);
-		ft_graft_glue_fini(&glue);
+		ft_glue_free_old(dst_ft, &glue);
+		ft_glue_fini(&glue);
 	} else {
 		/*
 		 * NOSPLIT: graft the in-place payload at @d.  Every node allocation
@@ -1722,7 +1722,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		assert(st == CDS_FT_STATUS_OK);
 		(void) st;
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-		ft_graft_glue_fini(&glue);
+		ft_glue_fini(&glue);
 	}
 
 	/*

@@ -838,7 +838,7 @@ error:
  * because ft_try_compress_chain, ft_build_branch and the build-only
  * graft split all reference the complete type.
  */
-struct ft_graft_deferred_edge {
+struct ft_glue_deferred_edge {
 	struct cds_ft_inode_flag *child;	/* live node to re-parent */
 	struct cds_ft_inode_flag *parent;	/* glue node it will point to */
 	struct cds_ft_inode_flag **slot;	/* slot in parent holding child */
@@ -854,7 +854,7 @@ struct ft_graft_deferred_edge {
 	bool dst_origin;
 };
 
-struct ft_graft_free_item {
+struct ft_glue_free_item {
 	void *node;		/* cds_ft_inode * or cds_ft_compressed_node * */
 	bool compressed;
 };
@@ -870,20 +870,20 @@ struct ft_graft_free_item {
  * and its back-pointer (@dst_head->prev = that node) are wired by the ordinary
  * Phase-1 set + deferred edge, exactly like any other re-parented external.
  * This struct carries ONLY the concatenation, which is publication-visible on
- * two live chains and is applied at commit by ft_graft_glue_apply_splices,
+ * two live chains and is applied at commit by ft_glue_apply_splices,
  * AFTER the source has been detached + drained: the @src_head chain is appended
  * to @dst_head's tail (prev-before-next, the ft_chain_node idiom, but preserving
  * src_head->next so the rest of the src chain rides along).
  */
-struct ft_graft_splice {
+struct ft_glue_splice {
 	struct cds_ft_node *dst_head;		/* surviving head (kept first) */
 	struct cds_ft_node *src_head;		/* appended to dst_head's tail */
 	/*
 	 * The demoted @src_head's ordered-list cell, captured by
-	 * ft_graft_glue_apply_splices.  It stays REACHABLE through its src-run
+	 * ft_glue_apply_splices.  It stays REACHABLE through its src-run
 	 * neighbours' stale ord_prev/ord_next until the post-publish interleave
 	 * rewires them, so it is freed only by
-	 * ft_graft_glue_free_collided_cells, called after the interleave, via
+	 * ft_glue_free_collided_cells, called after the interleave, via
 	 * the grace-period-deferred cell free.  NULL when the list is off.
 	 */
 	struct ft_ord_cell *src_cell;
@@ -899,27 +899,27 @@ struct ft_graft_splice {
  *
  * cds_ft_merge_at instead builds a TREE-shaped spine (one deferred edge per
  * disjoint subtree, one free per copied node), which can far exceed the floor.
- * It calls ft_graft_glue_reserve() to move the three arrays onto a malloc'd
- * backing sized by a read-only counting pre-pass; ft_graft_glue_abort() and
- * ft_graft_glue_fini() release it.  Every accessor indexes through the
+ * It calls ft_glue_reserve() to move the three arrays onto a malloc'd
+ * backing sized by a read-only counting pre-pass; ft_glue_abort() and
+ * ft_glue_fini() release it.  Every accessor indexes through the
  * pointers, so the growth is invisible to the helpers.
  */
-#define FT_GRAFT_GLUE_FLOOR_BUILT	(2 * FT_MAX_DEPTH + 8)
-#define FT_GRAFT_GLUE_FLOOR_DEFERRED	8
-#define FT_GRAFT_GLUE_FLOOR_FREE	8
-#define FT_GRAFT_GLUE_FLOOR_SPLICE	8
+#define FT_GLUE_FLOOR_BUILT	(2 * FT_MAX_DEPTH + 8)
+#define FT_GLUE_FLOOR_DEFERRED	8
+#define FT_GLUE_FLOOR_FREE	8
+#define FT_GLUE_FLOOR_SPLICE	8
 
-struct ft_graft_glue {
-	struct ft_graft_deferred_edge *deferred;
+struct ft_glue {
+	struct ft_glue_deferred_edge *deferred;
 	int nr_deferred;
 	int cap_deferred;
-	struct ft_graft_free_item *free_list;
+	struct ft_glue_free_item *free_list;
 	int nr_free;
 	int cap_free;
 	struct cds_ft_inode_flag **built;
 	int nr_built;
 	int cap_built;
-	struct ft_graft_splice *splices;
+	struct ft_glue_splice *splices;
 	int nr_splices;
 	int cap_splices;
 	/*
@@ -938,28 +938,28 @@ struct ft_graft_glue {
 	 */
 	struct cds_ft_inode_flag *attached_nf;
 	/*
-	 * Inline floor backing.  ft_graft_glue_init points the three arrays
-	 * here; graft / graft_swap never outgrow it.  ft_graft_glue_reserve
+	 * Inline floor backing.  ft_glue_init points the three arrays
+	 * here; graft / graft_swap never outgrow it.  ft_glue_reserve
 	 * repoints to a malloc'd buffer when a count would exceed its floor.
 	 */
-	struct ft_graft_deferred_edge deferred_floor[FT_GRAFT_GLUE_FLOOR_DEFERRED];
-	struct ft_graft_free_item free_floor[FT_GRAFT_GLUE_FLOOR_FREE];
-	struct cds_ft_inode_flag *built_floor[FT_GRAFT_GLUE_FLOOR_BUILT];
-	struct ft_graft_splice splices_floor[FT_GRAFT_GLUE_FLOOR_SPLICE];
+	struct ft_glue_deferred_edge deferred_floor[FT_GLUE_FLOOR_DEFERRED];
+	struct ft_glue_free_item free_floor[FT_GLUE_FLOOR_FREE];
+	struct cds_ft_inode_flag *built_floor[FT_GLUE_FLOOR_BUILT];
+	struct ft_glue_splice splices_floor[FT_GLUE_FLOOR_SPLICE];
 };
 
-static void ft_graft_glue_track(struct ft_graft_glue *g,
+static void ft_glue_track(struct ft_glue *g,
 		struct cds_ft_inode_flag *nf);
-static void ft_graft_glue_untrack(struct cds_ft *ft, struct ft_graft_glue *g, void *node_ptr);
-static bool ft_graft_glue_is_fresh(struct cds_ft *ft, struct ft_graft_glue *g,
+static void ft_glue_untrack(struct cds_ft *ft, struct ft_glue *g, void *node_ptr);
+static bool ft_glue_is_fresh(struct cds_ft *ft, struct ft_glue *g,
 		struct cds_ft_inode_flag *child);
-static void ft_graft_glue_defer_edge(struct cds_ft *ft, struct ft_graft_glue *g,
+static void ft_glue_defer_edge(struct cds_ft *ft, struct ft_glue *g,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *parent,
 		struct cds_ft_inode_flag **slot);
-static void ft_graft_glue_defer_free(struct ft_graft_glue *g,
+static void ft_glue_defer_free(struct ft_glue *g,
 		void *node, bool compressed);
-static void ft_graft_glue_set_publish(struct cds_ft *ft, struct ft_graft_glue *g,
+static void ft_glue_set_publish(struct cds_ft *ft, struct ft_glue *g,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *top);
@@ -969,13 +969,13 @@ static struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 		struct cds_ft_inode_flag *leaf,
 		unsigned long subtree_external_count,
 		bool has_external_nodes,
-		struct ft_graft_glue *glue);
+		struct ft_glue *glue);
 static void ft_free_branch_unpublished(struct cds_ft *ft,
 		struct cds_ft_inode_flag *top, struct cds_ft_inode_flag *leaf);
 
 static struct cds_ft_inode_flag *ft_compress_single_child_if_needed(
 		struct cds_ft *ft, struct cds_ft_inode_flag *child,
-		struct ft_graft_glue *glue);
+		struct ft_glue *glue);
 
 /*
  * Try to create a compressed path for a chain of single-child nodes.
@@ -994,7 +994,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, unsigned int level,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_node *external_nodes __attribute__((unused)),
-		struct ft_graft_glue *glue)
+		struct ft_glue *glue)
 {
 	uint8_t path_len = (uint8_t)(key_len - level);
 	struct cds_ft_compressed_node *cn;
@@ -1095,20 +1095,20 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 			 * cn->child's still-deferred back-pointer (which is how
 			 * a skip pointer recovers its compressed node).
 			 */
-			ft_graft_glue_defer_edge(ft, glue, cn->child, cflag,
+			ft_glue_defer_edge(ft, glue, cn->child, cflag,
 				&cn->child);
 			if (child_cn) {
-				if (ft_graft_glue_is_fresh(ft, glue,
+				if (ft_glue_is_fresh(ft, glue,
 						ft_compressed_node_flag(child_cn))) {
-					ft_graft_glue_untrack(ft, glue, child_cn);
+					ft_glue_untrack(ft, glue, child_cn);
 					free_compressed_node_unpublished(ft,
 						child_cn);
 				} else {
-					ft_graft_glue_defer_free(glue, child_cn,
+					ft_glue_defer_free(glue, child_cn,
 						true);
 				}
 			}
-			ft_graft_glue_track(glue, cflag);
+			ft_glue_track(glue, cflag);
 			/*
 			 * Emit the creation trace but return the PLAIN flag:
 			 * the caller installs @cn directly and resolves it via
@@ -1136,7 +1136,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(
 		unsigned int level __attribute__((unused)),
 		struct cds_ft_inode_flag *child __attribute__((unused)),
 		struct cds_ft_node *external_nodes __attribute__((unused)),
-		struct ft_graft_glue *glue __attribute__((unused)))
+		struct ft_glue *glue __attribute__((unused)))
 {
 	return NULL;
 }

@@ -203,7 +203,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 */
 		{
 			unsigned long detached_count;
-			struct ft_graft_glue glue;
+			struct ft_glue glue;
 			struct cds_ft_inode_flag *new_root = NULL;
 
 			if (!ft_node_external(child)) {
@@ -218,7 +218,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			status = cds_ft_create(ft->group, NULL, &detached);
 			if (status != CDS_FT_STATUS_OK)
 				return status;
-			ft_graft_glue_init(&glue);
+			ft_glue_init(&glue);
 			/*
 			 * The detached trie is returned exclusive: the
 			 * synchronize_rcu below drains in-flight readers of
@@ -254,7 +254,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						&glue, child);
 				if (new_root ==
 				    (struct cds_ft_inode_flag *) (long) -ENOMEM) {
-					ft_graft_glue_abort(detached, &glue);
+					ft_glue_abort(detached, &glue);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
@@ -304,7 +304,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					ft_propagate_external_count_parent(ft,
 						d.pnf,
 						(long) detached_count);
-					ft_graft_glue_abort(detached, &glue);
+					ft_glue_abort(detached, &glue);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
@@ -384,7 +384,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * subtree), install the root, then reclaim the
 				 * peeled-away compressed node.
 				 */
-				ft_graft_glue_apply_deferred(detached, &glue);
+				ft_glue_apply_deferred(detached, &glue);
 				free_cds_ft_node(detached,
 					ft_node_ptr(detached->root));
 				/* No readers in detached root yet. */
@@ -405,8 +405,8 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					m->parent_slot_offset = 0;
 #endif
 				}
-				ft_graft_glue_free_old(detached, &glue);
-				ft_graft_glue_fini(&glue);
+				ft_glue_free_old(detached, &glue);
+				ft_glue_fini(&glue);
 			} else {
 				struct cds_ft_metadata *dmeta =
 					ft_root_metadata(detached);
