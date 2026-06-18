@@ -2430,3 +2430,13 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 		return "Unknown status value";
 	}
 }
+
+/* Emit @level indentation tabs to @out (shared by the show + stats renderers). */
+static
+void print_indent(FILE *out, int level)
+{
+	int i;
+
+	for (i = 0; i < level; i++)
+		fprintf(out, "	");
+}
