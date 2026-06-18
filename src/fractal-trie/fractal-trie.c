@@ -179,6 +179,7 @@
 #define cds_ft_lookup_inequality_impl cds_ft_lookup_inequality_impl_shared
 #include "ft-mutation-helpers.h"
 #include "ft-mutation-node.h"
+#include "ft-build.h"
 #include "ft-insert.h"
 #include "ft-remove.h"
 #include "ft-graft.h"
