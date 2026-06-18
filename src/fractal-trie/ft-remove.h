@@ -879,6 +879,29 @@ void ft_unchain_node(struct cds_ft *ft, struct cds_ft_node **head_slot,
 	ft_node_mark_removed(node);
 }
 
+/*
+ * Called with RCU read lock held.
+ *
+ * There are a few cases to cover for delete:
+ *
+ * 1) The node belongs to a list of external nodes duplicates with two
+ *    or more items. Remove the node by unlinking it from its list.
+ * 2) There is only one external node within this node's list.
+ *    2.1) The node is within an external nodes list for which the list
+ *         head is an standalone external nodes pointer. The external
+ *         nodes list for this key should be removed. Removing an
+ *         external nodes list should prune the entire branch leading to
+ *         that list so no lookup observe empty internal nodes. This is
+ *         done by ft_detach_node(). Internal nodes are considered empty
+ *         if they have no internal and no external node children, *and*
+ *         their associated list of external nodes is empty. When
+ *         detaching an internal node which has no children, but has
+ *         an associated list of external nodes, it is replaced by a
+ *         pointer to the external nodes.
+ *    2.2) The node is within an external nodes list which is associated
+ *         with an internal node. Unlink the node from its list, leaving
+ *         the external nodes list empty.
+ */
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
