@@ -16,6 +16,141 @@
 #endif
 
 /*
+ * Sentinel value indicating that prefix tracking never recorded a
+ * match. Used by FT_PREFIX_TRACK_LONGEST to distinguish "empty trie"
+ * from "matched at root with no external nodes" (both have
+ * match_node == NULL, but the latter sets match_len = 0).
+ */
+#define FT_MATCH_LEN_NONE	SIZE_MAX
+
+/*
+ * Handle a compressed node during exact lookup descent.
+ *
+ * Compares key bytes against the compressed path, tracks
+ * partial/longest match if requested, advances key/index/node_flag
+ * past the compressed path, and fills iter_path entries.
+ *
+ * Returns FT_DESCENT_CONTINUE to continue the loop,
+ * FT_DESCENT_BREAK to break, or FT_DESCENT_END to jump to
+ * the function's end label (with *status_ret and *found_ret set).
+ */
+static inline_lookup
+enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag_p,
+		const uint8_t **key_p, const uint8_t *key_end,
+		const uint8_t *key_safe_end,
+		bool track, bool track_longest,
+		const uint8_t **match_key_pos_p, struct cds_ft_node **match_node_p,
+		struct cds_ft_node **found_ret,
+		enum cds_ft_status *status_ret,
+		bool candidate)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	const uint8_t *key = *key_p;
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
+	int remaining_key = (int) (key_end - key);
+	int remaining_safe = (int) (key_safe_end - key);
+	int cmp_len = cn->len < remaining_key ? cn->len : remaining_key;
+
+	/* Check external_nodes at the compressed node's depth. */
+	if (track) {
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+		struct cds_ft_node *ext =
+			ft_dereference_external(cn_meta->external_nodes);
+
+		if (ext || track_longest) {
+			*match_key_pos_p = key;
+			*match_node_p = ext;
+		}
+	}
+
+	/*
+	 * In candidate mode, skip key comparison -- just advance past
+	 * the compressed path.  The caller verifies the key at the leaf.
+	 */
+	if (!candidate) {
+		if (track_longest) {
+			unsigned int mpos;
+			int cmp = ft_key_cmp_ordinals(key, cn->key_bytes,
+					cmp_len, remaining_safe, false, &mpos);
+
+			if (cmp != 0) {
+				*match_key_pos_p = key + mpos;
+				*match_node_p = NULL;
+				*status_ret = CDS_FT_STATUS_NOT_FOUND;
+				return FT_DESCENT_END;
+			}
+			*match_key_pos_p = key + cmp_len;
+			*match_node_p = NULL;
+		} else {
+			if (ft_key_cmp_ordinals(key, cn->key_bytes,
+					cmp_len, remaining_safe, false, NULL) != 0) {
+				*status_ret = CDS_FT_STATUS_NOT_FOUND;
+				return FT_DESCENT_END;
+			}
+		}
+	}
+	if (cn->len > remaining_key) {
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata_fast(
+				(struct cds_ft_inode *) cn,
+				ft_compressed_order(cn->len));
+
+		*found_ret = ft_dereference_external(cn_meta->external_nodes);
+		*status_ret = *found_ret ? CDS_FT_STATUS_OK :
+				CDS_FT_STATUS_NOT_FOUND;
+		if (track && (*found_ret || track_longest)) {
+			*match_key_pos_p = key;
+			*match_node_p = *found_ret;
+		}
+		return FT_DESCENT_END;
+	}
+
+	/* Advance past the compressed path. */
+	key += cn->len;
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
+
+	*node_flag_p = node_flag;
+	*key_p = key;
+
+	if (key > key_end)
+		return FT_DESCENT_BREAK;
+
+	/*
+	 * External child before end of key: record for partial
+	 * tracking, set NOT_FOUND, and tell the caller to end.
+	 */
+	if (key < key_end && ft_node_external(node_flag)) {
+		if (track) {
+			*match_key_pos_p = key;
+			*match_node_p = (struct cds_ft_node *) node_flag;
+		}
+		*status_ret = CDS_FT_STATUS_NOT_FOUND;
+		return FT_DESCENT_END;
+	}
+
+	/*
+	 * Track prefix match at the child node (the node after the
+	 * compressed path) so callers that skip the normal tracking
+	 * code via continue don't miss it.
+	 */
+	if (track && key < key_end && !ft_node_external(node_flag)) {
+		struct cds_ft_metadata *metadata =
+			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		struct cds_ft_node *ext =
+			ft_dereference_external(metadata->external_nodes);
+
+		if (ext || track_longest) {
+			*match_key_pos_p = key;
+			*match_node_p = ext;
+		}
+	}
+
+	return FT_DESCENT_CONTINUE;
+}
+
+/*
  * do_cds_ft_lookup_inner: descent template.
  *
  * @descend_cand and @skip_compressed are compile-time constants at
