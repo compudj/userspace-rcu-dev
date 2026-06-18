@@ -16,7 +16,7 @@ COMPAT = compat_futex.c
 FRACTAL_TRIE = fractal-trie/fractal-trie.c fractal-trie/fractal-trie-alloc.c \
 	fractal-trie/fractal-trie-internal.h fractal-trie/fractal-trie-trace.h \
 	fractal-trie/cds_ft_tp.c fractal-trie/cds_ft_tp.h \
-	fractal-trie/ft-helpers.h fractal-trie/ft-node-ops.h \
+	fractal-trie/ft-helpers.h fractal-trie/ft-lookup-node.h \
 	fractal-trie/ft-descent.h fractal-trie/ft-lookup.h \
 	fractal-trie/ft-inequality.h fractal-trie/ft-insert.h \
 	fractal-trie/ft-remove.h fractal-trie/ft-graft.h \
@@ -24,7 +24,7 @@ FRACTAL_TRIE = fractal-trie/fractal-trie.c fractal-trie/fractal-trie-alloc.c \
 	fractal-trie/ft-lifecycle.h fractal-trie/ft-verify.h \
 	fractal-trie/ft-compact.h fractal-trie/ft-key.h \
 	fractal-trie/ft-lookup-helpers.h fractal-trie/ft-iter.h fractal-trie/ft-delay.h fractal-trie/ft-tables.h \
-	fractal-trie/ft-mutation-helpers.h \
+	fractal-trie/ft-mutation-helpers.h fractal-trie/ft-mutation-node.h \
 	fractal-trie/ft-ordered-query.h
 
 RCULFHASH = rculfhash.c rculfhash-mm-order.c rculfhash-mm-chunk.c \
