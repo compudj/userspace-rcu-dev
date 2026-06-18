@@ -16,37 +16,6 @@
 #endif
 
 /*
- * ft_propagate_external_count_parent: propagate nr_keys delta
- * from @start up to the root via metadata->parent pointers.
- *
- * @start: deepest internal/compressed node on the path (the node
- *         where the external was attached, or the deepest ancestor
- *         with metadata).  Must not be an external node or NULL.
- * @delta: +1 for insert, -1 for remove.
- *
- * Same ordering guarantees as the snapshot-based variant:
- * bottom-up CMM_RELEASE stores preserve the undercount invariant.
- */
-static
-void ft_propagate_external_count_parent(struct cds_ft *ft,
-		struct cds_ft_inode_flag *start, long delta)
-{
-	struct cds_ft_inode_flag *cur = start;
-
-	(void) ft;
-	ft_delay_writer();
-
-	while (cur) {
-		struct cds_ft_metadata *m =
-			cds_ft_item_to_metadata(ft_node_ptr(cur));
-		ft_nr_keys_store(m, ft_nr_keys_get(m) + delta, CMM_RELEASE);
-		ft_delay_writer();
-		cur = m->parent;
-	}
-}
-
-
-/*
  * One-commit insert state (ordered-list fresh-head insert): the attach
  * machinery parks a flip proxy in the structural slot (resolving to the OLD
  * value, so the key stays invisible) and records the settle information here;
