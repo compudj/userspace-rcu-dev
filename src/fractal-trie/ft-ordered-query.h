@@ -1,0 +1,1587 @@
+// SPDX-FileCopyrightText: 2012-2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+//
+// SPDX-License-Identifier: LGPL-2.1-only
+
+/*
+ * src/fractal-trie/ft-ordered-query.h
+ *
+ * Userspace RCU library - Fractal Trie: ordered-trie query operations --
+ * rank / select / skip.
+ *
+ *   rank   -- cds_ft_count_keys / cds_ft_count_keys_prefix
+ *   select -- cds_ft_lookup_nth / cds_ft_lookup_nth_last
+ *   skip   -- cds_ft_iter_skip_forward / cds_ft_iter_skip_reverse
+ *
+ * These read-only ordered-position queries walk the trie using the per-node
+ * key counters to skip whole subtrees in O(depth), plus ft_rebuild_path for
+ * the iterator-skip cursor.  They were parked at the tail of ft-merge.h after
+ * the merge consolidation; they have nothing to do with merge.
+ *
+ * Implementation unit: #included once by fractal-trie.c, in dependency order,
+ * directly after ft-merge.h.  It sits in the write zone (after the shared-
+ * scanner redirect) deliberately: rank/select/skip are cold relative to point
+ * lookups, so they share the out-of-line node scanners rather than inlining a
+ * copy at each site.  Not a standalone header.
+ */
+#ifndef FRACTAL_TRIE_IMPL
+#error "ft-ordered-query.h is an implementation unit; #include it from fractal-trie.c only"
+#endif
+
+/*
+ * Handle compressed node in cds_ft_count_keys_prefix().
+ *
+ * Returns FT_DESCENT_CONTINUE to advance past the compressed path,
+ * or FT_DESCENT_END when the prefix is fully consumed inside the
+ * compressed node (count written to *count_ret).
+ */
+static
+enum ft_descent_action ft_count_prefix_compressed(
+		struct cds_ft_inode_flag **node_flag_p,
+		unsigned int *i_p, const uint8_t *prefix,
+		size_t prefix_len, unsigned long *count_ret)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	unsigned int i = *i_p;
+	struct cds_ft_compressed_node *cn =
+		ft_compressed_node_ptr(node_flag);
+	unsigned int remaining = prefix_len - i;
+	unsigned int cmp = cn->len < remaining ? cn->len : remaining;
+	unsigned int j;
+
+	j = ft_match_compressed_key(&prefix[i], cn, cmp);
+	if (j < cmp) {
+		*count_ret = 0;
+		return FT_DESCENT_END;
+	}
+	if (cn->len >= remaining) {
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) cn);
+
+		*count_ret = ft_nr_keys_load(cn_meta);
+		return FT_DESCENT_END;
+	}
+	*i_p = i + cn->len - 1;
+	*node_flag_p = ft_dereference_acquire_prefetch(cn->child);
+	return FT_DESCENT_CONTINUE;
+}
+
+unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
+		const uint8_t *_prefix, size_t prefix_len)
+{
+	struct cds_ft_inode_flag *node_flag;
+	unsigned int i;
+	const struct cds_ft_key_map *km = &ft->group->key_map;
+	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
+	const uint8_t *prefix;
+	unsigned long count;
+
+	CDS_FT_SCOPED_READER(ft);
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	if (prefix_len > ft->group->max_key_len) {
+		count = 0;
+		goto out;
+	}
+	if (caa_likely(km->identity)) {
+		prefix = _prefix;
+	} else {
+		ft_key_to_ordinals(ordinal_buf, _prefix, prefix_len, km);
+		prefix = ordinal_buf;
+	}
+
+	node_flag = ft_root_dereference_acquire_prefetch(ft);
+
+	for (i = 0; i < prefix_len; i++) {
+		uint8_t kv;
+
+		if (ft_node_external(node_flag)) {
+			count = 0;
+			goto out;
+		}
+		if (ft_node_compressed(node_flag)) {
+			enum ft_descent_action act;
+
+			act = ft_count_prefix_compressed(
+				&node_flag, &i, prefix,
+				prefix_len, &count);
+			if (act == FT_DESCENT_END)
+				goto out;
+			continue;
+		}
+		kv = prefix[i];
+		{
+			unsigned int rewind;
+
+			/*
+			 * Surgical re-anchor on a skip-compressed mismatch (no
+			 * spin on a frozen slot).  rewind > 0 means a concurrent
+			 * chain-merge moved the encoded position shallower; the
+			 * count is over a fixed prefix, so just re-descend from
+			 * the root (idempotent, no rank to undercount).
+			 */
+			node_flag = ft_node_get_nth_reanchor(ft, node_flag, kv,
+					&rewind);
+			if (caa_unlikely(rewind)) {
+				node_flag = ft_root_dereference_acquire_prefetch(ft);
+				i = (unsigned int) -1;	/* loop ++ -> restart at 0 */
+				continue;
+			}
+		}
+	}
+
+	if (!node_flag) {
+		count = 0;
+		goto out;
+	}
+	if (ft_node_internal(node_flag)) {
+		struct cds_ft_metadata *metadata =
+			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		count = ft_nr_keys_load(metadata);
+		goto out;
+	}
+	if (ft_node_compressed(node_flag)) {
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+		count = ft_nr_keys_load(cn_meta);
+		goto out;
+	}
+	/* External node: one key (possibly with duplicates). */
+	count = 1;
+out:
+	FT_TP(count_prefix, count);
+	return count;
+}
+
+unsigned long cds_ft_count_keys(struct cds_ft *ft)
+{
+	return cds_ft_count_keys_prefix(ft, NULL, 0);
+}
+
+/*
+ * Count keys in a child node (nr_keys if internal, 1 if external).
+ */
+static inline
+unsigned long ft_child_key_count(struct cds_ft_inode_flag *child)
+{
+	if (!ft_node_external(child)) {
+		struct cds_ft_metadata *m =
+			cds_ft_item_to_metadata(ft_node_ptr(child));
+		return ft_nr_keys_load(m);
+	}
+	return 1;
+}
+
+/*
+ * Handle compressed node in cds_ft_lookup_nth().
+ *
+ * Fills the compressed path into ordinal_key and iter_path, advances
+ * level and node_flag past the compressed segment.
+ *
+ * Returns FT_DESCENT_CONTINUE on success, FT_DESCENT_BREAK if
+ * the child pointer is NULL.
+ */
+static
+enum ft_descent_action ft_lookup_nth_compressed(
+		struct cds_ft_inode_flag **node_flag_p,
+		int *level_p, uint8_t *ordinal_key)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	int level = *level_p;
+	struct cds_ft_compressed_node *cn =
+		ft_compressed_node_ptr(node_flag);
+
+	ft_fill_compressed_path(cn, ordinal_key, level - 1);
+	level += cn->len - 1;
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
+	if (ft_node_external(node_flag)) {
+		*node_flag_p = node_flag;
+		*level_p = level;
+		return FT_DESCENT_BREAK;
+	}
+	*node_flag_p = node_flag;
+	*level_p = level;
+	return FT_DESCENT_CONTINUE;
+}
+
+/*
+ * Lookup the nth key (0-indexed) in forward (smallest-first) order.
+ *
+ * Descends through the trie using per-node nr_keys counters to skip
+ * entire subtrees, yielding O(depth) time complexity rather than
+ * O(n) iteration.
+ *
+ * At each internal node:
+ * 1. If external_nodes are present, they represent the key at this
+ *    depth (shortest in the subtree). If n == 0, found. Else n -= 1.
+ * 2. Iterate children in ascending ordinal order. For each child,
+ *    determine its key count (nr_keys if internal, 1 if external).
+ *    If n < count, descend. Else n -= count and continue.
+ */
+enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	struct cds_ft_inode_flag *node_flag;
+	uint8_t ordinal_key[FT_MAX_KEY_LEN];
+	int level;
+	unsigned long remaining = n;
+
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP(lookup_nth_enter, n);
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	iter_debug_path_snapshot(iter);
+	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
+
+	node_flag = ft_root_dereference_acquire_prefetch(ft);
+
+	ft_delay_reader();
+
+	for (level = 1; ; level++) {
+		struct cds_ft_metadata *metadata;
+		struct cds_ft_inode_flag *child;
+		struct cds_ft_node *ext;
+		uint8_t child_key = 0;
+		int pivot;
+
+		if (ft_node_external(node_flag))
+			break;
+
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+
+		/* Keys at this node's depth come first in ordinal order. */
+		ext = ft_dereference_acquire(metadata->external_nodes);
+		if (ext) {
+			if (remaining == 0) {
+				/* Found: the key at this node's depth. */
+				iter->key_len = level - 1;
+				iter->key_off = 0;
+				{
+					int j;
+
+					for (j = 0; j < level - 1; j++)
+						iter_key(iter)[j] = ordinal_key[j];
+				}
+				iter->node = ext;
+				iter->cache_valid = true;
+				iter_debug_path_update(iter);
+				iter->path_len = level;
+				iter->status = CDS_FT_STATUS_OK;
+				goto end;
+			}
+			remaining--;
+		}
+
+		if (ft_node_compressed(node_flag)) {
+			enum ft_descent_action act;
+
+			act = ft_lookup_nth_compressed(&node_flag,
+				&level, ordinal_key);
+			if (act == FT_DESCENT_BREAK)
+				break;
+			continue;
+		}
+		/* Iterate children in ascending ordinal order. */
+		pivot = -1;
+		child = ft_node_get_direction(ft, node_flag, pivot, &child_key, FT_RIGHT, true);
+		while (child) {
+			unsigned long child_keys;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * Skip-validate failure (a concurrent split/merge reparented
+			 * the skip child, possibly while @node_flag was recompacted
+			 * away): re-anchor on the live structure via the skip child's
+			 * parent chain -- the same single mechanism the precise /
+			 * inequality readers use, never a spin or a frozen re-read.
+			 *   rewind == 0: @node_flag was recompacted in place; re-scan its
+			 *     live version from the same pivot (rank accumulation
+			 *     unchanged -- we only re-scan children past @pivot).
+			 *   rewind > 0: a transient single-child @node_flag (pivot == -1,
+			 *     nothing accumulated for it yet) merged into a longer
+			 *     compressed; descend INTO that merged node (re-scanning the
+			 *     shallower holder would double-count).  level -= rewind + 1
+			 *     so the loop's level++ lands the compressed handler at the
+			 *     merged node's depth; remaining is unchanged.
+			 *   detached / above root: re-find rank @n on the live trie.
+			 */
+			if (caa_unlikely(ft_node_skip_compressed(child))) {
+				unsigned int rewind;
+				struct cds_ft_inode_flag *merged;
+				struct cds_ft_inode_flag *anchor;
+
+				/*
+				 * Surgical re-anchor: resolve @child via the live skip
+				 * child's parent chain and continue forward -- never
+				 * re-scan a slot or restart from the root.  Root re-descent
+				 * would re-count a concurrently-growing trie and undercount
+				 * the rank.  ft_skip_reanchor never returns NULL on a
+				 * well-formed trie (the writer wires every fresh cluster's
+				 * parent before the cluster becomes reachable).
+				 *   rewind == 0: @merged is the resolved live child at
+				 *     @child_key; use it and fall through to the rank
+				 *     accumulation (which only advances).
+				 *   rewind > 0:  @node_flag (a transient single child) was
+				 *     absorbed into a longer compressed; descend INTO it.
+				 */
+				anchor = ft_skip_reanchor(ft, child, &rewind, &merged);
+				assert(anchor != NULL);
+				if (caa_likely(rewind == 0)) {
+					node_flag = anchor;
+					child = merged;
+				} else {
+					node_flag = merged;
+					level -= (int) rewind + 1;
+					goto next_level;
+				}
+			}
+#endif
+			child_keys = ft_child_key_count(child);
+
+			if (remaining < child_keys) {
+				/* Target is in this child's subtree. Descend. */
+				ordinal_key[level - 1] = child_key;
+				node_flag = child;
+				goto next_level;
+			}
+			remaining -= child_keys;
+			pivot = child_key;
+			child = ft_node_get_direction(ft, node_flag, pivot, &child_key, FT_RIGHT, true);
+		}
+
+		/* Exhausted all children without finding. */
+		break;
+
+next_level:
+		;
+	}
+
+	/* Reached a leaf (external node). */
+	if (node_flag && ft_node_external(node_flag) && remaining == 0) {
+		iter->key_len = level - 1;
+		iter->key_off = 0;
+		{
+			int j;
+
+			for (j = 0; j < level - 1; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+		}
+		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+		iter->cache_valid = true;
+		iter_debug_path_update(iter);
+		iter->path_len = level;
+		iter->status = CDS_FT_STATUS_OK;
+		goto end;
+	}
+
+	iter->node = NULL;
+	iter->cache_valid = true;
+	iter_debug_path_update(iter);
+	iter->path_len = 0;
+	iter->status = CDS_FT_STATUS_NOT_FOUND;
+
+end:
+	iter_auto_invalidate_cache(iter);
+	FT_TP(lookup_nth_exit, (int) iter->status);
+	return iter->status;
+}
+
+/*
+ * Handle compressed node in cds_ft_lookup_nth_last().
+ *
+ * In reverse order, process the child subtree first (larger keys),
+ * then fall through to external_nodes (smallest = last).
+ *
+ * Returns FT_DESCENT_CONTINUE when descending into the child,
+ * FT_DESCENT_BREAK when the child is NULL or external (leaf),
+ * or FT_DESCENT_END to signal the caller to fall through to
+ * check_ext_nth_last (remaining updated, child keys exhausted).
+ */
+static
+enum ft_descent_action ft_lookup_nth_last_compressed(
+		struct cds_ft_inode_flag **node_flag_p,
+		int *level_p, unsigned long *remaining_p,
+		uint8_t *ordinal_key)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	int level = *level_p;
+	struct cds_ft_compressed_node *cn =
+		ft_compressed_node_ptr(node_flag);
+
+	unsigned long child_keys;
+
+	assert(cn->child != NULL);	/* compressed node always has a live child */
+	child_keys = ft_child_key_count(cn->child);
+
+	if (*remaining_p < child_keys) {
+		ft_fill_compressed_path(cn,
+			ordinal_key, level - 1);
+		level += cn->len - 1;
+		node_flag = ft_dereference_acquire_prefetch(cn->child);
+		assert(node_flag != NULL);	/* compressed node always has a live child */
+		if (ft_node_external(node_flag)) {
+			*node_flag_p = node_flag;
+			*level_p = level;
+			return FT_DESCENT_BREAK;
+		}
+		*node_flag_p = node_flag;
+		*level_p = level;
+		return FT_DESCENT_CONTINUE;
+	}
+	*remaining_p -= child_keys;
+	return FT_DESCENT_END;
+}
+
+/*
+ * Lookup the nth key (0-indexed) in reverse (largest-first) order.
+ *
+ * Same principle as cds_ft_lookup_nth but descends from the right:
+ * at each internal node, iterate children in descending ordinal order
+ * first, then check external_nodes last (they are the smallest key
+ * in the subtree).
+ */
+enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	struct cds_ft_inode_flag *node_flag;
+	uint8_t ordinal_key[FT_MAX_KEY_LEN];
+	int level;
+	unsigned long remaining = n;
+
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP(lookup_nth_last_enter, n);
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	iter_debug_path_snapshot(iter);
+	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
+
+	node_flag = ft_root_dereference_acquire_prefetch(ft);
+
+	for (level = 1; ; level++) {
+		struct cds_ft_metadata *metadata;
+		struct cds_ft_inode_flag *child;
+		struct cds_ft_node *ext;
+		uint8_t child_key = 0;
+		int pivot;
+
+		if (ft_node_external(node_flag))
+			break;
+
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
+
+		if (ft_node_compressed(node_flag)) {
+			enum ft_descent_action act;
+
+			act = ft_lookup_nth_last_compressed(
+				&node_flag, &level, &remaining,
+				ordinal_key);
+			if (act == FT_DESCENT_BREAK)
+				break;
+			if (act == FT_DESCENT_END)
+				goto check_ext_nth_last;
+			continue;
+		}
+		/* Iterate children in descending ordinal order first. */
+		pivot = FT_ENTRY_PER_NODE;
+		child = ft_node_get_direction(ft, node_flag, pivot, &child_key, FT_LEFT, true);
+		while (child) {
+			unsigned long child_keys;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/* Skip-validate failure: re-anchor on the live structure
+			 * (see cds_ft_lookup_nth -- same single mechanism). */
+			if (caa_unlikely(ft_node_skip_compressed(child))) {
+				unsigned int rewind;
+				struct cds_ft_inode_flag *merged;
+				struct cds_ft_inode_flag *anchor;
+
+				/*
+				 * Surgical re-anchor (see cds_ft_lookup_nth): resolve
+				 * @child via the live skip child's parent chain and
+				 * continue forward -- never re-scan or restart from root.
+				 * ft_skip_reanchor never returns NULL on a well-formed
+				 * trie (writer wires parents before publishing).
+				 */
+				anchor = ft_skip_reanchor(ft, child, &rewind, &merged);
+				assert(anchor != NULL);
+				if (caa_likely(rewind == 0)) {
+					node_flag = anchor;
+					child = merged;
+				} else {
+					node_flag = merged;
+					level -= (int) rewind + 1;
+					goto next_level;
+				}
+			}
+#endif
+			child_keys = ft_child_key_count(child);
+
+			if (remaining < child_keys) {
+				/* Target is in this child's subtree. Descend. */
+				ordinal_key[level - 1] = child_key;
+				node_flag = child;
+				goto next_level;
+			}
+			remaining -= child_keys;
+			pivot = child_key;
+			child = ft_node_get_direction(ft, node_flag, pivot, &child_key, FT_LEFT, true);
+		}
+
+check_ext_nth_last:
+		/* External_nodes at this depth are the smallest (last in reverse). */
+		ext = ft_dereference_acquire(metadata->external_nodes);
+		if (ext) {
+			if (remaining == 0) {
+				iter->key_len = level - 1;
+				iter->key_off = 0;
+				{
+					int j;
+
+					for (j = 0; j < level - 1; j++)
+						iter_key(iter)[j] = ordinal_key[j];
+				}
+				iter->node = ext;
+				iter->cache_valid = true;
+				iter_debug_path_update(iter);
+				iter->path_len = level;
+				iter->status = CDS_FT_STATUS_OK;
+				goto end;
+			}
+			remaining--;
+		}
+
+		/* Exhausted all children without finding. */
+		break;
+
+next_level:
+		;
+	}
+
+	/* Reached a leaf (external node). */
+	if (node_flag && ft_node_external(node_flag) && remaining == 0) {
+		iter->key_len = level - 1;
+		iter->key_off = 0;
+		{
+			int j;
+
+			for (j = 0; j < level - 1; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+		}
+		iter->node = (struct cds_ft_node *) ft_node_ptr(node_flag);
+		iter->cache_valid = true;
+		iter_debug_path_update(iter);
+		iter->path_len = level;
+		iter->status = CDS_FT_STATUS_OK;
+		goto end;
+	}
+
+	iter->node = NULL;
+	iter->cache_valid = true;
+	iter_debug_path_update(iter);
+	iter->path_len = 0;
+	iter->status = CDS_FT_STATUS_NOT_FOUND;
+
+end:
+	iter_auto_invalidate_cache(iter);
+	FT_TP(lookup_nth_last_exit, (int) iter->status);
+	return iter->status;
+}
+
+/*
+ * Match a compressed node's path bytes against @key starting at @i
+ * and step past it.  On success, fills ordinal_key + iter_path
+ * across the compressed span, advances *i_p so the caller's
+ * for-loop increment lands on the next byte after the span,
+ * updates *node_flag_p to cn->child, and returns
+ * FT_DESCENT_CONTINUE.  On any mismatch (key shorter than the
+ * compressed path, byte-mismatch, or NULL child) returns
+ * FT_DESCENT_END.
+ */
+static inline_lookup
+enum ft_descent_action ft_rebuild_path_compressed(
+		struct cds_ft_inode_flag **node_flag_p,
+		unsigned int *i_p,
+		const uint8_t *key, size_t key_len,
+		uint8_t *ordinal_key)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(node_flag);
+	unsigned int i = *i_p;
+	unsigned int j;
+
+	if (i + cn->len > key_len)
+		return FT_DESCENT_END;
+	for (j = 0; j < cn->len; j++) {
+		uint8_t ord = key[i + j];
+
+		if (ord != cn->key_bytes[j])
+			return FT_DESCENT_END;
+		ordinal_key[i + j] = ord;
+	}
+	i += cn->len - 1;
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
+	*node_flag_p = node_flag;
+	*i_p = i;
+	return FT_DESCENT_CONTINUE;
+}
+
+/*
+ * Re-descend from the root following @key to rebuild the iterator path
+ * and ordinal_key arrays.  Returns the depth reached, or -1 on error.
+ */
+static inline_lookup
+int ft_rebuild_path(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len,
+		uint8_t *ordinal_key,
+		struct cds_ft_inode_flag **deepest_p)
+{
+	struct cds_ft_inode_flag *node_flag;
+	unsigned int i;
+
+	node_flag = ft_root_dereference_acquire_prefetch(ft);
+
+	for (i = 0; i < key_len; i++) {
+		uint8_t ordinal;
+
+		if (ft_node_external(node_flag))
+			return -1;
+
+		if (ft_node_compressed(node_flag)) {
+			enum ft_descent_action act;
+
+			act = ft_rebuild_path_compressed(&node_flag, &i,
+				key, key_len, ordinal_key);
+			if (act == FT_DESCENT_END)
+				return -1;
+			assert(act == FT_DESCENT_CONTINUE);
+			continue;
+		}
+		ordinal = key[i];
+		ordinal_key[i] = ordinal;
+		{
+			unsigned int rewind;
+
+			/*
+			 * Surgical re-anchor (no frozen-slot spin).  rewind > 0:
+			 * a concurrent chain-merge moved the position shallower;
+			 * rebuild this fixed path from the root (idempotent).
+			 */
+			node_flag = ft_node_get_nth_reanchor(ft, node_flag, ordinal,
+					&rewind);
+			if (caa_unlikely(rewind)) {
+				node_flag = ft_root_dereference_acquire_prefetch(ft);
+				i = (unsigned int) -1;	/* loop ++ -> restart at 0 */
+				continue;
+			}
+		}
+		if (!node_flag)
+			return -1;
+	}
+	/*
+	 * Deepest node reached (the node at depth key_len); always placed at
+	 * depth key_len as a child, so its shallow boundary is key_len.
+	 * Lets the going-up cursor seed live from the descent.
+	 */
+	*deepest_p = node_flag;
+	return (int) key_len;
+}
+
+/*
+ * Handle compressed node in cds_ft_iter_skip_forward's descend_forward
+ * loop.
+ *
+ * Fills ordinal_key and iter_path entries for the compressed path,
+ * then advances level and node_flag past the compressed segment.
+ *
+ * Returns FT_DESCENT_CONTINUE on success, FT_DESCENT_BREAK if
+ * the child pointer is NULL or is an external (leaf) node.
+ */
+static inline_lookup
+enum ft_descent_action ft_skip_forward_compressed(
+		struct cds_ft_inode_flag **node_flag_p,
+		int *level_p, uint8_t *ordinal_key)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	int level = *level_p;
+	struct cds_ft_compressed_node *cn =
+		ft_compressed_node_ptr(node_flag);
+	int j;
+
+	for (j = 0; j < cn->len; j++) {
+		ordinal_key[level + j] = cn->key_bytes[j];
+	}
+	level += cn->len;
+	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
+	if (ft_node_external(node_flag)) {
+		*node_flag_p = node_flag;
+		*level_p = level;
+		return FT_DESCENT_BREAK;
+	}
+	*node_flag_p = node_flag;
+	*level_p = level;
+	return FT_DESCENT_CONTINUE;
+}
+
+/*
+ * Skip forward by @n keys from the current iterator position using
+ * local traversal.
+ *
+ * Walks up from the current leaf, at each ancestor counting keys in
+ * rightward siblings until enough are accumulated, then descends into
+ * the target subtree using the lookup_nth algorithm.  Only touches
+ * nodes between the start and end positions, so concurrent mutations
+ * in unrelated key ranges do not affect the result.
+ */
+enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	uint8_t ordinal_key[FT_MAX_KEY_LEN];
+	unsigned long remaining;
+	int depth, level = 0;
+	bool at_external_nodes;
+	struct cds_ft_inode_flag *deepest = NULL;
+	struct cds_ft_inode_flag *descend_from = NULL;
+
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP(iter_skip_forward_enter, n);
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	if (!iter->node) {
+		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	if (n == 0) {
+		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_OK);
+		return CDS_FT_STATUS_OK;
+	}
+
+	iter_debug_path_snapshot(iter);
+
+	/* Rebuild path from root to current key. */
+	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), ft_iter_resolve_key_len(iter),
+			ordinal_key, &deepest);
+	if (depth < 0)
+		goto not_found;
+	(void) deepest;		/* used by the going-up seed under PP backtrack */
+
+	remaining = n;
+
+	/*
+	 * Determine whether the current key sits at an internal or
+	 * compressed node's external_nodes (variable-length prefix key)
+	 * or at a leaf child.
+	 */
+	at_external_nodes = !ft_node_external(deepest);
+
+	/*
+	 * If at external_nodes of an internal/compressed node, all
+	 * children of that node are to the right.  Try to satisfy the
+	 * skip within them.
+	 */
+	if (at_external_nodes) {
+		struct cds_ft_inode_flag *parent = deepest;
+		struct cds_ft_metadata *pmeta =
+			cds_ft_item_to_metadata(ft_node_ptr(parent));
+		unsigned long right_keys = ft_nr_keys_load(pmeta) - 1; /* exclude self */
+
+		if (remaining <= right_keys) {
+			/*
+			 * Target is among the children.  Use lookup_nth
+			 * descent within this subtree, skipping the
+			 * external_nodes (already behind us).
+			 */
+			remaining--;  /* skip external_nodes key (us) */
+
+			if (ft_node_compressed(parent)) {
+				struct cds_ft_compressed_node *cn =
+					ft_compressed_node_ptr(parent);
+				unsigned long ck;
+				int j;
+
+				assert(cn->child != NULL);	/* compressed node always has a live child */
+				ck = ft_child_key_count(cn->child);
+				if (remaining < ck) {
+					for (j = 0; j < cn->len; j++) {
+						ordinal_key[depth + j] =
+							cn->key_bytes[j];
+					}
+					level = depth + cn->len;
+					descend_from = cn->child;
+					goto descend_forward;
+				}
+				remaining -= ck;
+			} else {
+				struct cds_ft_inode_flag *child;
+				uint8_t child_key = 0;
+				int pivot = -1;
+
+				child = ft_node_get_direction(ft, parent, pivot,
+						&child_key, FT_RIGHT, true);
+				while (child) {
+					unsigned long ck;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+					/*
+					 * Surgical re-anchor: @parent carries external_nodes so
+					 * it cannot merge -- rewind is always 0 (recompacted in
+					 * place).  @at_pos is the live resolved sibling at
+					 * @child_key; use it directly.  ft_skip_reanchor never
+					 * returns NULL on a well-formed trie.
+					 */
+					if (caa_unlikely(ft_node_skip_compressed(child))) {
+						unsigned int rewind;
+						struct cds_ft_inode_flag *at_pos;
+						struct cds_ft_inode_flag *anchor =
+							ft_skip_reanchor(ft, child, &rewind, &at_pos);
+
+						assert(anchor != NULL);
+						assert(rewind == 0);
+						parent = anchor;
+						child = at_pos;
+						continue;
+					}
+#endif
+					ck = ft_child_key_count(child);
+					if (remaining < ck) {
+						ordinal_key[depth] = child_key;
+						level = depth + 1;
+						descend_from = child;
+						goto descend_forward;
+					}
+					remaining -= ck;
+					pivot = child_key;
+					child = ft_node_get_direction(ft, parent, pivot,
+							&child_key, FT_RIGHT, true);
+				}
+			}
+		}
+		remaining -= right_keys;
+		/* Continue walking up from depth-1. */
+		level = depth;
+	} else {
+		/* At a leaf child: start walking up from the parent. */
+		level = depth;
+	}
+
+	/*
+	 * Walk up: at each ancestor, count keys in rightward siblings
+	 * of the child we came from.  Parent-pointer backtrack:
+	 * @up_node is the live node covering depth @level, climbed via
+	 * ft_get_parent_rcu as @level decrements (span compressed=cn->len,
+	 * internal=1).  Seeded live from ft_rebuild_path's deepest node
+	 * (@deepest == node at @level==@depth, placed there as a child so its
+	 * shallow boundary is @level).
+	 */
+	{	/* Scope the going-up cursor locals so they are out of scope at not_found/descend_* (avoids -Wjump-misses-init false positives). */
+		struct cds_ft_inode_flag *up_node = deepest;
+		ssize_t up_node_lo = level;
+		for (level--; level >= 0; level--) {
+			struct cds_ft_inode_flag *ancestor;
+			struct cds_ft_inode_flag *child;
+			uint8_t child_key = 0;
+			int pivot;
+
+			while (level < up_node_lo) {
+				struct cds_ft_inode_flag *gp = ft_get_parent_rcu(ft, up_node);
+
+				up_node_lo -= (gp && ft_node_compressed(gp)) ?
+					(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
+				up_node = gp;
+			}
+			ancestor = up_node;
+			if (ft_node_external(ancestor))
+				continue;
+			/*
+			 * Compressed path levels have no siblings: skip.
+			 */
+			if (ft_node_compressed(ancestor))
+				continue;
+
+			pivot = ordinal_key[level];
+			child = ft_node_get_direction(ft, ancestor, pivot,
+					&child_key, FT_RIGHT, true);
+			while (child) {
+				unsigned long ck;
+
+	#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Surgical re-anchor: @ancestor has siblings to scan, so it is
+				 * multi-child and cannot merge -- rewind is 0.  @at_pos is the
+				 * live resolved sibling at @child_key; use it directly.
+				 * ft_skip_reanchor never returns NULL on a well-formed trie.
+				 */
+				if (caa_unlikely(ft_node_skip_compressed(child))) {
+					unsigned int rewind;
+					struct cds_ft_inode_flag *at_pos;
+					struct cds_ft_inode_flag *anchor =
+						ft_skip_reanchor(ft, child, &rewind, &at_pos);
+
+					assert(anchor != NULL);
+					assert(rewind == 0);
+					ancestor = anchor;
+					up_node = anchor;	/* live holder at @level (internal, span 1) */
+					up_node_lo = level;
+					child = at_pos;
+					continue;
+				}
+	#endif
+				ck = ft_child_key_count(child);
+				if (remaining <= ck) {
+					remaining--;  /* enter this subtree (1-indexed within) */
+					ordinal_key[level] = child_key;
+					level = level + 1;
+					descend_from = child;
+					goto descend_forward;
+				}
+				remaining -= ck;
+				pivot = child_key;
+				child = ft_node_get_direction(ft, ancestor, pivot,
+						&child_key, FT_RIGHT, true);
+			}
+			/*
+			 * No external_nodes to count going up in forward direction
+			 * (they sort before children, so they're behind us).
+			 */
+		}
+	}
+
+	/* Exhausted the trie. */
+not_found:
+	iter->node = NULL;
+	iter->cache_valid = true;
+	iter_debug_path_update(iter);
+	iter->path_len = 0;
+	iter->status = CDS_FT_STATUS_NOT_FOUND;
+	goto end;
+
+descend_forward:
+	/*
+	 * We found the subtree containing the target.  Now descend into
+	 * it using the forward lookup_nth algorithm: at each internal
+	 * node, check external_nodes first, then iterate children in
+	 * ascending ordinal order.
+	 */
+	{
+		/*
+		 * @descend_from is the node placed at @level by the going-up
+		 * / at-external block right before its goto here; it is the
+		 * node at descent level @level.
+		 */
+		struct cds_ft_inode_flag *node_flag = descend_from;
+
+		for (;;) {
+			struct cds_ft_metadata *metadata;
+			struct cds_ft_inode_flag *child;
+			uint8_t child_key = 0;
+			int pivot;
+
+			if (ft_node_external(node_flag))
+				break;
+
+			metadata = cds_ft_item_to_metadata(
+					ft_node_ptr(node_flag));
+
+			{
+				struct cds_ft_node *ext =
+					ft_dereference_acquire(
+						metadata->external_nodes);
+
+				if (ext) {
+				if (remaining == 0) {
+					int j;
+
+					iter->key_len = level;
+					iter->key_off = 0;
+					for (j = 0; j < level; j++)
+						iter_key(iter)[j] = ordinal_key[j];
+					iter->node = ext;
+					iter->cache_valid = true;
+					iter_debug_path_update(iter);
+					iter->path_len = level + 1;
+					iter->status = CDS_FT_STATUS_OK;
+					goto end;
+				}
+				remaining--;
+			}
+			} /* ext scope */
+
+			if (ft_node_compressed(node_flag)) {
+				enum ft_descent_action act;
+
+				act = ft_skip_forward_compressed(
+					&node_flag, &level,
+					ordinal_key);
+				if (act == FT_DESCENT_BREAK)
+					break;
+				continue;
+			}
+			pivot = -1;
+			child = ft_node_get_direction(ft, node_flag, pivot,
+					&child_key, FT_RIGHT, true);
+			while (child) {
+				unsigned long ck;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Surgical re-anchor (descend phase; see cds_ft_lookup_nth).
+				 *   rewind == 0: @merged is the live resolved child at
+				 *     @child_key; use it directly.
+				 *   rewind > 0: a transient single-child @node_flag
+				 *     (pivot == -1, nothing accumulated) merged into a
+				 *     longer compressed; descend INTO it.  level -= rewind
+				 *     lands the compressed handler at the merged node's
+				 *     depth (ft_skip_forward_compressed fills from level);
+				 *     remaining unchanged.
+				 * ft_skip_reanchor never returns NULL on a well-formed trie.
+				 */
+				if (caa_unlikely(ft_node_skip_compressed(child))) {
+					unsigned int rewind;
+					struct cds_ft_inode_flag *merged;
+					struct cds_ft_inode_flag *anchor =
+						ft_skip_reanchor(ft, child, &rewind, &merged);
+
+					assert(anchor != NULL);
+					if (caa_likely(rewind == 0)) {
+						node_flag = anchor;
+						child = merged;
+						continue;
+					}
+					node_flag = merged;
+					level -= (int) rewind;
+					goto next_forward_level;
+				}
+#endif
+				ck = ft_child_key_count(child);
+				if (remaining < ck) {
+					ordinal_key[level] = child_key;
+					level++;
+					node_flag = child;
+					goto next_forward_level;
+				}
+				remaining -= ck;
+				pivot = child_key;
+				child = ft_node_get_direction(ft, node_flag, pivot,
+						&child_key, FT_RIGHT, true);
+			}
+			break;
+
+next_forward_level:
+			;
+		}
+
+		/* Reached a leaf. */
+		if (ft_node_ptr(node_flag) &&
+		    ft_node_external(node_flag) &&
+		    remaining == 0) {
+			int j;
+
+			iter->key_len = level;
+			iter->key_off = 0;
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+			iter->node = (struct cds_ft_node *)
+				ft_node_ptr(node_flag);
+			iter->cache_valid = true;
+			iter_debug_path_update(iter);
+			iter->path_len = level + 1;
+			iter->status = CDS_FT_STATUS_OK;
+			goto end;
+		}
+		goto not_found;
+	}
+
+end:
+	iter_auto_invalidate_cache(iter);
+	FT_TP(iter_skip_forward_exit, (int) iter->status);
+	return iter->status;
+}
+
+/*
+ * Handle compressed node in cds_ft_iter_skip_reverse's descend_reverse
+ * loop.
+ *
+ * In reverse, process the child subtree first (larger keys), then
+ * fall through to external_nodes (smallest = last).
+ *
+ * Returns FT_DESCENT_CONTINUE when descending into the child,
+ * FT_DESCENT_BREAK when the child is NULL or external (leaf),
+ * or FT_DESCENT_END to signal the caller to fall through to
+ * check_ext_descend_reverse (remaining updated, child keys exhausted).
+ */
+static inline_lookup
+enum ft_descent_action ft_skip_reverse_compressed(
+		struct cds_ft_inode_flag **node_flag_p,
+		int *level_p, unsigned long *remaining_p,
+		uint8_t *ordinal_key)
+{
+	struct cds_ft_inode_flag *node_flag = *node_flag_p;
+	int level = *level_p;
+	struct cds_ft_compressed_node *cn =
+		ft_compressed_node_ptr(node_flag);
+
+	unsigned long ck;
+
+	assert(cn->child != NULL);	/* compressed node always has a live child */
+	ck = ft_child_key_count(cn->child);
+
+	if (*remaining_p < ck) {
+		int j;
+
+		for (j = 0; j < cn->len; j++) {
+			ordinal_key[level + j] = cn->key_bytes[j];
+		}
+		level += cn->len;
+		node_flag = ft_dereference_acquire_prefetch(cn->child);
+		assert(node_flag != NULL);	/* compressed node always has a live child */
+		if (ft_node_external(node_flag)) {
+			*node_flag_p = node_flag;
+			*level_p = level;
+			return FT_DESCENT_BREAK;
+		}
+		*node_flag_p = node_flag;
+		*level_p = level;
+		return FT_DESCENT_CONTINUE;
+	}
+	*remaining_p -= ck;
+	return FT_DESCENT_END;
+}
+
+/*
+ * Handle a compressed ancestor in cds_ft_iter_skip_reverse's walk-up
+ * loop.  Skips intermediate path levels (same compressed node at
+ * adjacent levels).  At the entry level, the only candidate is the
+ * compressed node's external_nodes (which sort before all children
+ * -- i.e. leftward of the current key); count or claim it.
+ *
+ * Returns FT_DESCENT_END when the external_nodes match: the iter
+ * has been written and *iter_status_p set to OK.  Otherwise returns
+ * FT_DESCENT_CONTINUE for the caller to keep walking up.
+ */
+static inline_lookup
+enum ft_descent_action ft_skip_reverse_walk_up_compressed(
+		struct cds_ft_inode_flag *ancestor,
+		int level,
+		unsigned long *remaining_p,
+		uint8_t *ordinal_key,
+		struct cds_ft_iter *iter)
+{
+	struct cds_ft_metadata *ameta;
+	struct cds_ft_node *a_ext;
+
+	/*
+	 * Caller (cds_ft_iter_skip_reverse) guarantees this is the
+	 * compressed ancestor's shallow boundary -- the intermediate-level
+	 * skip is decided there, so this code need not re-derive it.
+	 */
+	ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
+	a_ext = ft_dereference_acquire(ameta->external_nodes);
+	if (a_ext) {
+		if (*remaining_p == 1) {
+			int j;
+
+			iter->key_len = level;
+			iter->key_off = 0;
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+			iter->node = a_ext;
+			iter->cache_valid = true;
+			iter_debug_path_update(iter);
+			iter->path_len = level + 1;
+			iter->status = CDS_FT_STATUS_OK;
+			return FT_DESCENT_END;
+		}
+		(*remaining_p)--;
+	}
+	return FT_DESCENT_CONTINUE;
+}
+
+/*
+ * Skip backward by @n keys from the current iterator position using
+ * local traversal.
+ *
+ * Walks up from the current leaf, at each ancestor counting keys in
+ * leftward siblings (and external_nodes, which sort before children).
+ * When enough are accumulated, descends into the target subtree using
+ * the reverse lookup_nth_last algorithm.
+ */
+enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		unsigned long n)
+{
+	uint8_t ordinal_key[FT_MAX_KEY_LEN];
+	unsigned long remaining;
+	int depth, level;
+	bool at_external_nodes;
+	struct cds_ft_inode_flag *deepest = NULL;
+	struct cds_ft_inode_flag *descend_from = NULL;
+
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP(iter_skip_reverse_enter, n);
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	if (!iter->node) {
+		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	if (n == 0) {
+		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_OK);
+		return CDS_FT_STATUS_OK;
+	}
+
+	iter_debug_path_snapshot(iter);
+
+	/* Rebuild path from root to current key. */
+	depth = ft_rebuild_path(ft, ft_iter_read_key(iter), ft_iter_resolve_key_len(iter),
+			ordinal_key, &deepest);
+	if (depth < 0)
+		goto not_found;
+	(void) deepest;		/* used by the going-up seed under PP backtrack */
+
+	remaining = n;
+
+	/*
+	 * Determine whether the current key sits at an internal or
+	 * compressed node's external_nodes or at a leaf child.
+	 */
+	at_external_nodes = !ft_node_external(deepest);
+	(void) at_external_nodes;
+
+	/*
+	 * Whether at external_nodes or at a leaf child, we start the
+	 * upward walk from the same level.  (At external_nodes all
+	 * children are to the right, so there's nothing to the left.)
+	 */
+	level = depth;
+
+	/*
+	 * Walk up: at each ancestor, count keys in leftward siblings
+	 * of the child we came from, plus external_nodes at the ancestor
+	 * (which sort before all children).  Parent-pointer backtrack:
+	 * @up_node is the live node covering depth @level, climbed via
+	 * ft_get_parent_rcu as @level decrements.  Seeded live from
+	 * ft_rebuild_path's deepest node (@deepest == node at @level==@depth,
+	 * placed there as a child so its shallow boundary is @level).
+	 */
+	{	/* Scope the going-up cursor locals so they are out of scope at not_found/descend_* (avoids -Wjump-misses-init false positives). */
+		struct cds_ft_inode_flag *up_node = deepest;
+		ssize_t up_node_lo = level;
+		for (level--; level >= 0; level--) {
+			struct cds_ft_inode_flag *ancestor;
+			struct cds_ft_inode_flag *child;
+			struct cds_ft_metadata *ameta;
+			uint8_t child_key = 0;
+			unsigned long left_keys = 0;
+			int pivot;
+
+			while (level < up_node_lo) {
+				struct cds_ft_inode_flag *gp = ft_get_parent_rcu(ft, up_node);
+
+				up_node_lo -= (gp && ft_node_compressed(gp)) ?
+					(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
+				up_node = gp;
+			}
+			ancestor = up_node;
+			if (ft_node_external(ancestor))
+				continue;
+			/*
+			 * Skip intermediate compressed path levels (same
+			 * compressed node at adjacent levels).  At the entry
+			 * level, only external_nodes matter (no siblings).
+			 */
+			if (ft_node_compressed(ancestor)) {
+				enum ft_descent_action act;
+				bool at_shallow_boundary;
+
+				/*
+				 * Process the compressed ancestor's external_nodes only
+				 * at its shallow boundary; skip the intermediate in-span
+				 * levels.  The live cursor's shallow bound up_node_lo
+				 * equals level there.
+				 */
+				at_shallow_boundary = (level == 0) ||
+					(up_node_lo == level);
+				if (!at_shallow_boundary)
+					continue;
+				act = ft_skip_reverse_walk_up_compressed(ancestor,
+					level, &remaining, ordinal_key, iter);
+				if (act == FT_DESCENT_END)
+					goto end;
+				assert(act == FT_DESCENT_CONTINUE);
+				continue;
+			}
+
+			ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
+
+			/* Count leftward siblings. */
+			pivot = ordinal_key[level];
+			child = ft_node_get_direction(ft, ancestor, pivot,
+					&child_key, FT_LEFT, true);
+			while (child) {
+	#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Surgical re-anchor: @ancestor has siblings to count ->
+				 * multi-child, cannot merge -> rewind 0.  @at_pos is the live
+				 * resolved sibling at @child_key; use it directly.
+				 * ft_skip_reanchor never returns NULL on a well-formed trie.
+				 */
+				if (caa_unlikely(ft_node_skip_compressed(child))) {
+					unsigned int rewind;
+					struct cds_ft_inode_flag *at_pos;
+					struct cds_ft_inode_flag *anchor =
+						ft_skip_reanchor(ft, child, &rewind, &at_pos);
+
+					assert(anchor != NULL);
+					assert(rewind == 0);
+					ancestor = anchor;
+					up_node = anchor;
+					up_node_lo = level;
+					child = at_pos;
+					continue;
+				}
+	#endif
+				left_keys += ft_child_key_count(child);
+				pivot = child_key;
+				child = ft_node_get_direction(ft, ancestor, pivot,
+						&child_key, FT_LEFT, true);
+			}
+
+			/* External_nodes at ancestor sort before all children. */
+			{
+				struct cds_ft_node *a_ext =
+					ft_dereference_acquire(ameta->external_nodes);
+
+				if (a_ext)
+					left_keys++;
+
+				if (remaining <= left_keys) {
+					/*
+					 * Target is among the leftward siblings or
+					 * external_nodes.  Descend in reverse order:
+					 * iterate leftward siblings from the current
+					 * child in descending ordinal order, then
+					 * check external_nodes last.
+					 */
+					pivot = ordinal_key[level];
+					child = ft_node_get_direction(ft, ancestor, pivot,
+							&child_key, FT_LEFT, true);
+					while (child) {
+						unsigned long ck;
+
+	#ifdef FEATURE_FT_SKIP_COMPRESSED
+						/*
+						 * Surgical re-anchor: @ancestor is the multi-child node
+						 * whose leftward siblings we iterate -> cannot merge ->
+						 * rewind 0.  @at_pos is the live resolved sibling at
+						 * @child_key; use it directly.  ft_skip_reanchor never
+						 * returns NULL on a well-formed trie.
+						 */
+						if (caa_unlikely(ft_node_skip_compressed(child))) {
+							unsigned int rewind;
+							struct cds_ft_inode_flag *at_pos;
+							struct cds_ft_inode_flag *anchor =
+								ft_skip_reanchor(ft, child, &rewind, &at_pos);
+
+							assert(anchor != NULL);
+							assert(rewind == 0);
+							ancestor = anchor;
+							up_node = anchor;
+							up_node_lo = level;
+							child = at_pos;
+							continue;
+						}
+	#endif
+						ck = ft_child_key_count(child);
+						if (remaining <= ck) {
+							remaining--;
+							ordinal_key[level] = child_key;
+							level = level + 1;
+							descend_from = child;
+							goto descend_reverse;
+						}
+						remaining -= ck;
+						pivot = child_key;
+						child = ft_node_get_direction(ft, 
+								ancestor, pivot,
+								&child_key, FT_LEFT, true);
+					}
+
+					/* Must be the external_nodes. */
+					if (a_ext && remaining == 1) {
+						int j;
+
+						iter->key_len = level;
+						iter->key_off = 0;
+						for (j = 0; j < level; j++)
+							iter_key(iter)[j] = ordinal_key[j];
+						iter->node = a_ext;
+					iter->cache_valid = true;
+					iter_debug_path_update(iter);
+					iter->path_len = level + 1;
+					iter->status = CDS_FT_STATUS_OK;
+					goto end;
+				}
+				/* Shouldn't happen if left_keys was correct. */
+				goto not_found;
+			}
+			remaining -= left_keys;
+			}
+		}
+	}
+
+	/* Exhausted the trie. */
+not_found:
+	iter->node = NULL;
+	iter->cache_valid = true;
+	iter_debug_path_update(iter);
+	iter->path_len = 0;
+	iter->status = CDS_FT_STATUS_NOT_FOUND;
+	goto end;
+
+descend_reverse:
+	/*
+	 * Descend into the target subtree using the reverse algorithm:
+	 * at each internal node, iterate children in descending ordinal
+	 * order first, then check external_nodes last.
+	 */
+	{
+		/*
+		 * @descend_from carries the node placed at @level by the
+		 * going-up block right before its goto here; it is the
+		 * node at descent level @level.
+		 */
+		struct cds_ft_inode_flag *node_flag = descend_from;
+
+		for (;;) {
+			struct cds_ft_metadata *metadata;
+			struct cds_ft_inode_flag *child;
+			uint8_t child_key = 0;
+			int pivot;
+
+			if (ft_node_external(node_flag))
+				break;
+
+			metadata = cds_ft_item_to_metadata(
+					ft_node_ptr(node_flag));
+
+			if (ft_node_compressed(node_flag)) {
+				enum ft_descent_action act;
+
+				act = ft_skip_reverse_compressed(
+					&node_flag, &level, &remaining,
+					ordinal_key);
+				if (act == FT_DESCENT_BREAK)
+					break;
+				if (act == FT_DESCENT_END)
+					goto check_ext_descend_reverse;
+				continue;
+			}
+			pivot = FT_ENTRY_PER_NODE;
+			child = ft_node_get_direction(ft, node_flag, pivot,
+					&child_key, FT_LEFT, true);
+			while (child) {
+				unsigned long ck;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Surgical re-anchor (descend phase; see cds_ft_lookup_nth).
+				 *   rewind == 0: @merged is the live resolved child at
+				 *     @child_key; use it directly.
+				 *   rewind > 0: a transient single-child @node_flag merged
+				 *     into a longer compressed; descend INTO it (level -=
+				 *     rewind; remaining unchanged).
+				 * ft_skip_reanchor never returns NULL on a well-formed trie.
+				 */
+				if (caa_unlikely(ft_node_skip_compressed(child))) {
+					unsigned int rewind;
+					struct cds_ft_inode_flag *merged;
+					struct cds_ft_inode_flag *anchor =
+						ft_skip_reanchor(ft, child, &rewind, &merged);
+
+					assert(anchor != NULL);
+					if (caa_likely(rewind == 0)) {
+						node_flag = anchor;
+						child = merged;
+						continue;
+					}
+					node_flag = merged;
+					level -= (int) rewind;
+					goto next_reverse_level;
+				}
+#endif
+				ck = ft_child_key_count(child);
+				if (remaining < ck) {
+					ordinal_key[level] = child_key;
+					level++;
+					node_flag = child;
+					goto next_reverse_level;
+				}
+				remaining -= ck;
+				pivot = child_key;
+				child = ft_node_get_direction(ft, node_flag, pivot,
+						&child_key, FT_LEFT, true);
+			}
+
+check_ext_descend_reverse:
+			{
+				struct cds_ft_node *ext =
+					ft_dereference_acquire(
+						metadata->external_nodes);
+
+				if (ext && remaining == 0) {
+				int j;
+
+				iter->key_len = level;
+				iter->key_off = 0;
+				for (j = 0; j < level; j++)
+					iter_key(iter)[j] = ordinal_key[j];
+				iter->node = ext;
+				iter->cache_valid = true;
+				iter_debug_path_update(iter);
+				iter->path_len = level + 1;
+				iter->status = CDS_FT_STATUS_OK;
+				goto end;
+			}
+			}
+			break;
+
+next_reverse_level:
+			;
+		}
+
+		/* Reached a leaf. */
+		if (ft_node_ptr(node_flag) &&
+		    ft_node_external(node_flag) &&
+		    remaining == 0) {
+			int j;
+
+			iter->key_len = level;
+			iter->key_off = 0;
+			for (j = 0; j < level; j++)
+				iter_key(iter)[j] = ordinal_key[j];
+			iter->node = (struct cds_ft_node *)
+				ft_node_ptr(node_flag);
+			iter->cache_valid = true;
+			iter_debug_path_update(iter);
+			iter->path_len = level + 1;
+			iter->status = CDS_FT_STATUS_OK;
+			goto end;
+		}
+		goto not_found;
+	}
+
+end:
+	iter_auto_invalidate_cache(iter);
+	FT_TP(iter_skip_reverse_exit, (int) iter->status);
+	return iter->status;
+}
+

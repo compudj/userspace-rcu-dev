@@ -183,6 +183,7 @@
 #include "ft-graft.h"
 #include "ft-detach.h"
 #include "ft-merge.h"
+#include "ft-ordered-query.h"
 #include "ft-lifecycle.h"
 #include "ft-verify.h"
 #include "ft-compact.h"
