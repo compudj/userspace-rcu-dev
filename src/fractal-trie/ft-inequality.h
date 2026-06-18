@@ -15,13 +15,22 @@
 #error "ft-inequality.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
-static inline_lookup
-enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
+/*
+ * Tier-2 inequality descent: the relational key seek (LE/GE/LT/GT/first/last)
+ * and the up/down tree traversal it uses to cross subtree boundaries.  Reached
+ * only when the tier-1 ordered-cell fast path in cds_ft_lookup_inequality_impl
+ * did not apply (an uncached / scoped / first-or-last / seed-from-node entry, or
+ * a relational seek from a key).  Inlining governed by inline_ineq: default-off
+ * it is one shared, runtime-mode copy; with FEATURE_INLINE_INEQUALITY_LOOKUP it
+ * is force-inlined and per-mode specialized at each caller, as before.
+ */
+static inline_ineq
+enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
 		const bool use_keycopy,
-		const bool seed_from_node)
+		const bool seed_from_node __attribute__((unused)))
 {
 	ssize_t key_depth, level;
 	struct cds_ft_inode_flag *node_flag;
@@ -72,48 +81,6 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	 */
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
-
-	/*
-	 * Ordinal-cell fast path: cds_ft_next / cds_ft_prev (GT/LT,
-	 * LIMIT_NONE) on a cached head collapse to a single dependent load of the
-	 * cell's ord_next / ord_prev -- no descent, no leaf touch for the step
-	 * (cell->node + cell->ord_* co-reside in the 32B cell).  Hoisted ABOVE the
-	 * key_len computation so the common walk does NOT resolve the (deferred,
-	 * LAZY) length: the fast path advances via ord_next and never needs it.
-	 * Only a fall-through to the descent (cache invalid / scoped) resolves the
-	 * length where it is first used.
-	 *
-	 * @seed_from_node (a compile-time literal at every public instantiation, so
-	 * the gate DCEs there) suppresses this fast path for the splice-time
-	 * predecessor seed: that caller positions @iter at a FRESH head whose cell
-	 * is not yet spliced (its ord_prev/ord_next are unset), so the cell cursor
-	 * would resolve garbage.  It instead wants the cross-call node-recovery fast
-	 * path below, which reconstructs the going-up seed from iter->node and runs
-	 * the structural backtrack -- the predecessor among the ALREADY-linked keys.
-	 */
-	if (!seed_from_node &&
-			(mode == FT_LOOKUP_GT || mode == FT_LOOKUP_LT) &&
-			limit == FT_LOOKUP_LIMIT_NONE &&
-			iter->cache_valid && iter->node &&
-			ft_ord_cell_fastpath_ok(ft, iter)) {
-		struct ft_ord_cell *cur = ft_ord_cell_cursor(iter);
-		struct ft_ord_cell *nxt = (mode == FT_LOOKUP_GT) ?
-			ft_ord_cell_resolve_ord(&cur->ord_next) :
-			ft_ord_cell_resolve_ord(&cur->ord_prev);
-
-		ft_ord_cell_iter_land(ft, iter, nxt);
-#ifndef FT_NO_ORD_PREFETCH
-		/* One-hop NTA prefetch of the cell the next call will land on. */
-		if (nxt) {
-			struct ft_ord_cell *nn = (mode == FT_LOOKUP_GT) ?
-				ft_ord_cell_resolve_ord(&nxt->ord_next) :
-				ft_ord_cell_resolve_ord(&nxt->ord_prev);
-			if (nn)
-				__builtin_prefetch((const void *) nn, 0, 0);
-		}
-#endif
-		goto end;
-	}
 
 	switch (limit) {
 	case FT_LOOKUP_LIMIT_NONE:
@@ -1293,6 +1260,65 @@ end:
 		(int) iter->status);
 	iter_auto_invalidate_cache(iter);
 	return iter->status;
+}
+
+/*
+ * Inequality lookup entry point: tier-1 ordered-cell fast path, then the tier-2
+ * descent.  cds_ft_next / cds_ft_prev on a cached cursor (GT/LT, LIMIT_NONE)
+ * resolve the successor / predecessor cell with a single dependent load and
+ * never touch the tree; everything else (uncached / scoped / first / last /
+ * seed / relational seek) falls through to ft_ineq_descend.  Always inlined
+ * under FEATURE_INLINE_LOOKUP, so the cell hop stays a few loads regardless of
+ * the tier-2 inlining choice.
+ */
+static inline_lookup
+enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		enum ft_lookup_inequality mode,
+		enum ft_lookup_limit limit,
+		const bool use_keycopy,
+		const bool seed_from_node)
+{
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	/*
+	 * Tier-1 ordered-cell fast path.  Hoisted above the key_len computation:
+	 * it advances via ord_next / ord_prev and never resolves the (deferred,
+	 * LAZY) length.  @seed_from_node suppresses it for the splice-time
+	 * predecessor seed (a FRESH head whose cell is not yet spliced); that
+	 * caller wants the cross-call node-recovery path in the descent instead.
+	 */
+	if (!seed_from_node &&
+			(mode == FT_LOOKUP_GT || mode == FT_LOOKUP_LT) &&
+			limit == FT_LOOKUP_LIMIT_NONE &&
+			iter->cache_valid && iter->node &&
+			ft_ord_cell_fastpath_ok(ft, iter)) {
+		struct ft_ord_cell *cur = ft_ord_cell_cursor(iter);
+		struct ft_ord_cell *nxt = (mode == FT_LOOKUP_GT) ?
+			ft_ord_cell_resolve_ord(&cur->ord_next) :
+			ft_ord_cell_resolve_ord(&cur->ord_prev);
+
+		ft_ord_cell_iter_land(ft, iter, nxt);
+#ifndef FT_NO_ORD_PREFETCH
+		/* One-hop NTA prefetch of the cell the next call will land on. */
+		if (nxt) {
+			struct ft_ord_cell *nn = (mode == FT_LOOKUP_GT) ?
+				ft_ord_cell_resolve_ord(&nxt->ord_next) :
+				ft_ord_cell_resolve_ord(&nxt->ord_prev);
+			if (nn)
+				__builtin_prefetch((const void *) nn, 0, 0);
+		}
+#endif
+		FT_TP(ineq_result, (int) mode, NULL, 0,
+			iter->node ? iter_key(iter) : NULL,
+			iter->node ? iter->key_len : 0,
+			(int) iter->status);
+		iter_auto_invalidate_cache(iter);
+		return iter->status;
+	}
+
+	return ft_ineq_descend(ft, iter, mode, limit, use_keycopy,
+			seed_from_node);
 }
 
 /*

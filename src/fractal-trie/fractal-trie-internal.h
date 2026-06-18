@@ -393,6 +393,20 @@
 #endif
 
 /*
+ * FEATURE_INLINE_INEQUALITY_LOOKUP: also force-inline (and per-mode specialize)
+ * the inequality descent -- the relational seek and its up/down tree traversal.
+ *
+ * OFF by default (opt-in).  The ordered-cell list is the fast path for ordered
+ * traversal (cds_ft_next / cds_ft_prev resolve a cell pointer with no descent),
+ * so for groups using the ordered list the tree descent is only the amortized
+ * seek / seed and is better left as one shared, non-specialized function -- far
+ * smaller code.  Enable it for inequality-heavy workloads WITHOUT the ordered
+ * list, where the descent is the per-operation cost.  Governs only the tier-2
+ * descent (ft_ineq_descend); the tier-1 ordered-cell fast path is always inlined
+ * under FEATURE_INLINE_LOOKUP.
+ */
+
+/*
  * FEATURE_FT_COMPRESS: enable prefix compression (path compaction).
  * When enabled, chains of single-child internal nodes are replaced
  * with compressed path nodes.  Disabling compiles out all compressed
@@ -544,6 +558,17 @@ void ft_writer_scope_verify(struct cds_ft *ft);
 #define inline_lookup	inline __attribute__((always_inline))
 #else
 #define inline_lookup
+#endif
+
+/*
+ * inline_ineq: like inline_lookup but gated on FEATURE_INLINE_INEQUALITY_LOOKUP,
+ * for the tier-2 inequality descent (ft_ineq_descend).  Default-off -> plain
+ * static, one shared copy across all modes/limits.
+ */
+#ifdef FEATURE_INLINE_INEQUALITY_LOOKUP
+#define inline_ineq	inline_lookup
+#else
+#define inline_ineq
 #endif
 
 /*
