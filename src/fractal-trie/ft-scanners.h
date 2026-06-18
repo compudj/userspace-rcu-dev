@@ -3493,3 +3493,57 @@ enum ft_descent_action ft_traverse_compressed(
 		return FT_DESCENT_BREAK;
 	return FT_DESCENT_CONTINUE;
 }
+
+/*
+ * The read path (point lookups and the next / prev / min / max descent)
+ * force-inlines the node scanners.  Several are also called at many write-side
+ * sites, where the same force-inline duplicated each scanner across the mutation
+ * code.  Provide a single shared, non-inlined copy of each such scanner for the
+ * mutation path to call; read-side callers keep calling the always_inline
+ * originals.  The mutation modules are redirected to these *_shared variants via
+ * #define in fractal-trie.c.
+ *
+ * Only these five pay off (about -9% .text together): get_nth, get_nth_skip,
+ * get_nth_reanchor, get_direction, get_minmax.  An A/B over every node scanner
+ * showed the rest are either too small for sharing to beat inlining, or reached
+ * only from the read path.
+ */
+static struct cds_ft_inode_flag *ft_node_get_nth_shared(
+		const struct cds_ft *ft, struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint)
+{
+	return ft_node_get_nth(ft, node_flag, node_flag_ptr, n, pf_hint);
+}
+
+static struct cds_ft_inode_flag *ft_node_get_nth_skip_shared(
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag ***node_flag_ptr,
+		uint8_t n, enum ft_pf_target pf_hint)
+{
+	return ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
+}
+
+static struct cds_ft_inode_flag *ft_node_get_nth_reanchor_shared(
+		struct cds_ft *ft, struct cds_ft_inode_flag *node_flag,
+		uint8_t n, unsigned int *rewind_ret)
+{
+	return ft_node_get_nth_reanchor(ft, node_flag, n, rewind_ret);
+}
+
+static struct cds_ft_inode_flag *ft_node_get_direction_shared(
+		struct cds_ft *ft, struct cds_ft_inode_flag *node_flag,
+		int n, uint8_t *result_key,
+		enum ft_direction dir, bool validate_lookup)
+{
+	return ft_node_get_direction(ft, node_flag, n, result_key, dir,
+			validate_lookup);
+}
+
+static struct cds_ft_inode_flag *ft_node_get_minmax_shared(
+		struct cds_ft *ft, struct cds_ft_inode_flag *node_flag,
+		uint8_t *result_key,
+		enum ft_direction dir, bool validate_lookup)
+{
+	return ft_node_get_minmax(ft, node_flag, result_key, dir, validate_lookup);
+}
