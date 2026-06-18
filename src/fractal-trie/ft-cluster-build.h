@@ -580,3 +580,137 @@ struct cds_ft_inode_flag *ft_try_compress_chain(
 	return NULL;
 }
 #endif
+
+/*
+ * Root-cluster builders: assemble a fresh root internal node from a glue
+ * transaction -- used by the graft_swap re-root and by ft-detach when a detach
+ * re-roots the trie.  ft_make_root_internal_glue layers over
+ * ft_build_extracted_root_glue, so the latter precedes it.
+ */
+/*
+ * Build (invisibly) a swap_ft root node holding the extracted subtree
+ *   @first_byte ++ @rest[0 .. @rest_len-1]  ->  @child
+ * i.e. an internal root whose @first_byte slot leads (via a fresh compressed
+ * suffix when @rest_len >= 1) to the LIVE @child.  Used (via
+ * ft_make_root_internal_glue) by the extract side of cds_ft_graft_swap and by
+ * ft_detach_keylen's pre-publish root materialization.
+ *
+ * @child is LIVE data relocated into swap_ft: its back-pointer is recorded as
+ * a deferred edge in @glue rather than flipped now, and every fresh node is
+ * tracked so an OOM elsewhere in the swap build frees the cluster (both tries
+ * pristine, nothing published).  Nothing is freed here.
+ *
+ * @child is always a plain (internal / external) node -- a compressed node's
+ * child is plain by the chain-merge invariant, and the suffix path is held by
+ * the fresh compressed @rest -- so no chain-merge is needed.
+ *
+ * Returns the new internal-tagged root flag, or (void *)(long)-ENOMEM.
+ */
+static
+struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
+		struct ft_glue *glue,
+		uint8_t first_byte, const uint8_t *rest, unsigned int rest_len,
+		struct cds_ft_inode_flag *child, unsigned long subtree_count)
+{
+	struct cds_ft_inode_flag *slot_value;
+	struct cds_ft_inode_flag *skip_value = NULL;
+	struct cds_ft_compressed_node *new_cn = NULL;
+	struct cds_ft_inode *root_node;
+	struct cds_ft_metadata *root_meta;
+	struct cds_ft_inode_flag *dest;
+	struct cds_ft_inode_flag **slot = NULL;
+	int ret;
+
+	if (rest_len == 0) {
+		slot_value = child;	/* LIVE; back-pointer deferred below. */
+	} else {
+		struct cds_ft_metadata *new_cn_meta;
+
+		new_cn = alloc_compressed_node(ft, rest_len, &new_cn_meta);
+		if (!new_cn)
+			return (struct cds_ft_inode_flag *) (long) -ENOMEM;
+		new_cn->len = (uint8_t) rest_len;
+		new_cn->child = child;
+		memcpy(new_cn->key_bytes, rest, rest_len);
+		new_cn_meta->nr_child = 1;
+		ft_nr_keys_store(new_cn_meta, subtree_count, CMM_RELAXED);
+		slot_value = ft_compressed_node_flag(new_cn);	/* PLAIN */
+		ft_glue_track(glue, slot_value);
+		/* @child (live) -> new_cn, deferred to the post-sync commit. */
+		ft_glue_defer_edge(ft, glue, child, slot_value, &new_cn->child);
+		/* Skip form for the root slot (resolves once the edge applies). */
+		skip_value = ft_publish_compressed(ft, new_cn, slot_value);
+	}
+
+	root_node = alloc_cds_ft_node(ft, &ft_types[0], &root_meta);
+	if (!root_node)
+		/* new_cn (if any) is tracked in @glue; the caller's abort frees it. */
+		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
+	dest = ft_node_flag(root_node, 0);
+	/*
+	 * rest_len == 0: @child is live, so defer its back-pointer (cluster_leaf).
+	 * rest_len >= 1: the slot holds the fresh new_cn, whose own back-pointer
+	 * into @dest is a fresh-to-fresh edge that is safe to set during the build.
+	 */
+	ret = ft_node_set_nth(ft, &dest, first_byte, slot_value,
+			NULL, root_meta, 0, rest_len == 0 /* cluster_leaf */);
+	if (ret)
+		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
+	ft_glue_track(glue, dest);
+	ft_nr_keys_store(ft_flag_to_metadata(ft, dest), subtree_count, CMM_RELAXED);
+	ft_node_get_nth_skip(dest, &slot, first_byte, FT_PF_NONE);
+	if (rest_len == 0) {
+		ft_glue_defer_edge(ft, glue, child, dest, slot);
+	} else {
+		/* Re-encode the root slot to the skip form (new_cn is compressed). */
+		if (skip_value && skip_value != slot_value && slot)
+			rcu_assign_pointer(*slot, skip_value);
+		ft_set_parent(ft, slot_value, dest, slot);
+	}
+	return dest;
+}
+
+/*
+ * Build-invisible internal-root materialization, preserving the trie-wide
+ * invariant that the root pointer always tags an internal node (never
+ * compressed, never skip-compressed).  Used by cds_ft_graft_swap's extract
+ * side and by ft_detach_keylen.  Materializes an internal-node root from the
+ * LIVE displaced @old_child without publishing or mutating live data: fresh nodes are tracked in @glue, the moved grandchild's
+ * back-pointer is deferred, and the peeled-away compressed node is recorded for
+ * deferred free.  Nothing is freed here.
+ *
+ *   - @old_child internal:    returned unchanged (already a valid internal
+ *                             root; the caller clears its parent at commit).
+ *                             No glue node, no deferred edge.
+ *   - @old_child compressed:  peel the first path byte into a fresh internal
+ *                             root, the rest (if any) into a fresh compressed
+ *                             node; defer the live grandchild's back-pointer;
+ *                             record the old compressed node for deferred free.
+ *
+ * External @old_child must be filtered by the caller (externals attach as
+ * external_nodes, not via this helper).
+ *
+ * Returns the new internal-tagged root flag, or (void *)(long)-ENOMEM.
+ */
+static
+struct cds_ft_inode_flag *ft_make_root_internal_glue(struct cds_ft *ft,
+		struct ft_glue *glue, struct cds_ft_inode_flag *old_child)
+{
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_metadata *cn_meta;
+	struct cds_ft_inode_flag *root;
+
+	old_child = ft_resolve_skip_compressed(ft, old_child);
+	if (caa_likely(!ft_node_compressed(old_child)))
+		return old_child;	/* already internal */
+	cn = ft_compressed_node_ptr(old_child);
+	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	root = ft_build_extracted_root_glue(ft, glue,
+			cn->key_bytes[0], &cn->key_bytes[1], cn->len - 1,
+			cn->child, ft_nr_keys_get(cn_meta));
+	if (root == (struct cds_ft_inode_flag *) (long) -ENOMEM)
+		return root;
+	/* Reclaim the peeled-away compressed node after the commit. */
+	ft_glue_defer_free(glue, cn, true);
+	return root;
+}
