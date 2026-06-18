@@ -52,8 +52,6 @@ static struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft,
 		unsigned int cap);
 static struct ft_flip_batch *ft_flip_batch_take(struct cds_ft *ft,
 		unsigned int cap, struct ft_flip_batch **pre);
-static int ft_bulk_node_reserve_fill(struct cds_ft *ft,
-		struct cds_ft_alloc_reserve *r);
 static struct cds_ft_inode_flag *ft_flip_batch_add(struct ft_flip_batch *b,
 		struct cds_ft_inode_flag *old_nf,
 		struct cds_ft_inode_flag *new_nf);
