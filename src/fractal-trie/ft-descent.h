@@ -15,6 +15,12 @@
 #error "ft-descent.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+enum ft_prefix_tracking {
+	FT_PREFIX_TRACK_NONE,		/* No prefix tracking. */
+	FT_PREFIX_TRACK_PARTIAL,	/* Track closest ancestor with external nodes. */
+	FT_PREFIX_TRACK_LONGEST,	/* Track deepest match, even internal-only. */
+};
+
 /*
  * Sentinel value indicating that prefix tracking never recorded a
  * match. Used by FT_PREFIX_TRACK_LONGEST to distinguish "empty trie"

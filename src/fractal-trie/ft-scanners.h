@@ -3145,12 +3145,6 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	return ret;
 }
 
-enum ft_prefix_tracking {
-	FT_PREFIX_TRACK_NONE,		/* No prefix tracking. */
-	FT_PREFIX_TRACK_PARTIAL,	/* Track closest ancestor with external nodes. */
-	FT_PREFIX_TRACK_LONGEST,	/* Track deepest match, even internal-only. */
-};
-
 /*
  * The read path (point lookups and the next / prev / min / max descent)
  * force-inlines the node scanners.  Several are also called at many write-side
