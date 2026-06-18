@@ -47,6 +47,88 @@ struct ft_insert_commit {
 	bool spliced;				/* cell already spliced (B-lite shape) */
 };
 
+/*
+ * One-commit insert tail (see struct ft_insert_commit): the structural slot
+ * already holds a parked flip proxy (the fresh head is invisible -- the proxy
+ * resolves to the old slot value), and the head's parent chain is fully wired,
+ * so the splice-position search runs exactly as the post-publish splice did
+ * (the from-head seed walks the parent chain, never the parked slot).  Park
+ * the <= 4 ordered-list neighbour edges into the SAME batch, commit once --
+ * the head becomes reachable in the structural index AND spliced into the
+ * cell list atomically for every reader -- then settle all slots to their
+ * direct values and finalize the real top's parent bookkeeping (skip_slot,
+ * incoming_byte).
+ */
+static
+void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
+		size_t key_len, struct ft_ord_cell *cell,
+		struct ft_insert_commit *ic)
+{
+	struct ft_ord_cell *pred, *succ;
+	struct ft_ord_cell_edge edges[4];
+	unsigned int i, n = 0;
+
+	pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell);
+	if (pred)
+		succ = ft_ord_cell_resolve_ord(&pred->ord_next);
+	else
+		/* New minimum: successor is the old list head (O(1), no descent). */
+		succ = ft_ord_cell_resolve_ord(&ft->ord_cell_head);
+	/* Pre-set @cell's own links; not yet reachable via the list. */
+	cell->ord_prev = pred;
+	cell->ord_next = succ;
+	if (pred) {
+		edges[n].slot = &pred->ord_next;
+		edges[n].old_target = succ;
+		edges[n].new_target = cell;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = pred;
+		edges[n].new_target = cell;
+		n++;
+	}
+	/* New min (!pred) => head was @succ; new max (!succ) => tail was @pred. */
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, succ, cell, edges, n);
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, pred, cell, edges, n);
+	/* Park the ordered-list edges (each resolves to OLD until the commit). */
+	for (i = 0; i < n; i++)
+		rcu_assign_pointer(*edges[i].slot,
+			(struct ft_ord_cell *) ft_flip_batch_add(ic->batch,
+				(struct cds_ft_inode_flag *) edges[i].old_target,
+				(struct cds_ft_inode_flag *) edges[i].new_target));
+
+	/* THE commit: structural slot + ordered-list edges, atomically. */
+	urcu_flip_commit(&ic->batch->group);
+
+	/*
+	 * Settle: direct values in every parked slot (idempotent for readers,
+	 * the proxies already resolve to the new targets).  The real top's
+	 * full wiring (parent, slot offset, incoming_byte) was done at park
+	 * time, while still invisible.  A split-shape park settles through
+	 * ft_publish_to_parent for its dual skip-slot maintenance; the attach
+	 * shape's set_nth already did its own bookkeeping, so a direct store
+	 * of the same canonical value suffices.
+	 */
+	if (ic->publish_to_parent)
+		ft_publish_to_parent(ft, ic->parent_nf, ic->slot,
+			ic->slot_value);
+	else
+		rcu_assign_pointer(*ic->slot, ic->slot_value);
+	for (i = 0; i < n; i++)
+		rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
+	ft_flip_batch_reclaim(ic->batch);
+	ic->batch = NULL;
+	/*
+	 * The old compressed node a split replaced: readers resolved the
+	 * proxy to it until the commit above, so only now may its grace-
+	 * period-deferred free be queued.
+	 */
+	if (ic->free_old_cn)
+		free_compressed_node(ft, ic->free_old_cn);
+}
+
 /* Flip-batch helpers (defined with the flip machinery, after the readers). */
 static struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft,
 		unsigned int cap);
@@ -55,9 +137,6 @@ static struct ft_flip_batch *ft_flip_batch_take(struct cds_ft *ft,
 static struct cds_ft_inode_flag *ft_flip_batch_add(struct ft_flip_batch *b,
 		struct cds_ft_inode_flag *old_nf,
 		struct cds_ft_inode_flag *new_nf);
-static void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, struct ft_ord_cell *cell,
-		struct ft_insert_commit *ic);
 
 /*
  * Publish @new_top into @slot (owned by @parent_nf): direct via
