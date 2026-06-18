@@ -406,30 +406,6 @@ enum cds_ft_status cds_ft_lookup_longest_match(struct cds_ft *ft,
 }
 
 /*
- * Return @node's external_nodes (the dup-chain head hanging off an
- * internal or compressed node).  @node must be internal or compressed.
- * Used to recover a cached iterator position's deepest trie node without
- * re-descending: a prefix key sits at an internal/compressed node
- * whose external_nodes == iter->node.
- */
-static inline_lookup
-struct cds_ft_node *ft_node_external_nodes(struct cds_ft_inode_flag *node)
-{
-	struct cds_ft_metadata *metadata;
-
-	assert(!ft_node_external(node));
-	if (ft_node_compressed(node))
-		metadata = cds_ft_item_to_metadata(ft_node_ptr(node));
-	else {
-		const struct cds_ft_type *type = &ft_types[ft_node_type(node)];
-
-		metadata = cds_ft_item_to_metadata_fast(ft_node_ptr(node),
-				type->order);
-	}
-	return ft_dereference_external(metadata->external_nodes);
-}
-
-/*
  * Speculative inequality result-key capture: when the group is configured for
  * speculative skip-compressed lookup with a leaf-key offset, the matched leaf
  * @leaf stores the full result key -- in the byte order the application passed
