@@ -633,18 +633,6 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
 }
 
 /*
- * ft_publish_external_nodes_prev: Phase 2 -- publish the back-channel from
- * the displaced/transferred external head up to its (re-)parent node.
- * Defined below, after the ordinal-cell accessors it depends on in a cell
- * build (the head's prev is its cell, so the parent is recorded into
- * cell->parent rather than overwriting prev).
- */
-static inline
-void ft_publish_external_nodes_prev(struct cds_ft *ft,
-		struct cds_ft_inode_flag *node_flag,
-		struct cds_ft_node *external_nodes);
-
-/*
  * Pointer unmasking via speculative mask + conditional select.
  *
  * Exploit the fact that each internal node type's allocation order
