@@ -911,37 +911,3 @@ void cds_ft_show_stats(const struct cds_ft *ft, FILE *out)
 	do_show_stats(ft, out, stats);
 	free(stats);
 }
-
-const char *cds_ft_status_to_string(enum cds_ft_status status)
-{
-	switch (status) {
-	/* Success return codes (>= 0). */
-	case CDS_FT_STATUS_OK:
-		return "Operation completed successfully";
-	case CDS_FT_STATUS_NOT_FOUND:
-		return "No node found";
-	case CDS_FT_STATUS_DUPLICATE_FOUND:
-		return "Duplicate node exists";
-	case CDS_FT_STATUS_INTERNAL_MATCH:
-		return "Match ends at an internal node";
-
-	/* Error return codes (< 0). */
-	case CDS_FT_STATUS_INVALID_ARGUMENT_ERROR:
-		return "Invalid argument";
-	case CDS_FT_STATUS_MEMORY_ERROR:
-		return "Memory allocation failure";
-	case CDS_FT_STATUS_OVERFLOW_ERROR:
-		return "Buffer too small for key length";
-	case CDS_FT_STATUS_BUSY_ERROR:
-		return "Resource busy";
-	case CDS_FT_STATUS_POPULATED_ERROR:
-		return "Destination already populated";
-	case CDS_FT_STATUS_INTEGRITY_ERROR:
-		return "Integrity verification failure";
-	case CDS_FT_STATUS_NOT_SUPPORTED:
-		return "Feature not compiled in";
-
-	default:
-		return "Unknown status value";
-	}
-}
