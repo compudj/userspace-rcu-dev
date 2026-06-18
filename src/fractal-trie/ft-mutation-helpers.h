@@ -24,6 +24,25 @@
 #endif
 
 /*
+ * Advance the descent cursor one level down: rotate current -> parent ->
+ * grandparent, then descend into child @key_value.
+ *
+ * Returns the new d->nf (the child's flagged pointer, possibly NULL).
+ */
+static inline
+struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *d,
+		uint8_t key_value)
+{
+	d->ppnf  = d->pnf;
+	d->ppnfp = d->pnfp;
+	d->pnf   = d->nf;
+	d->pnfp  = d->nfp;
+	d->nf    = ft_node_get_nth(ft, d->pnf, &d->nfp, key_value, FT_PF_NONE);
+	d->depth++;
+	return d->nf;
+}
+
+/*
  * Flip-latch batch for cds_ft_merge_at: a urcu_flip_group plus its
  * proxies, allocated as one block and reclaimed together via call_rcu
  * once the proxied slots have been settled to their direct new targets.

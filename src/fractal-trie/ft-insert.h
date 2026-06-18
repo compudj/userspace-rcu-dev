@@ -79,7 +79,6 @@ struct ft_insert_commit {
 };
 
 /* Flip-batch helpers (defined with the flip machinery, after the readers). */
-struct ft_flip_batch;
 static struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft,
 		unsigned int cap);
 static struct ft_flip_batch *ft_flip_batch_take(struct cds_ft *ft,
@@ -89,9 +88,6 @@ static int ft_bulk_node_reserve_fill(struct cds_ft *ft,
 static struct cds_ft_inode_flag *ft_flip_batch_add(struct ft_flip_batch *b,
 		struct cds_ft_inode_flag *old_nf,
 		struct cds_ft_inode_flag *new_nf);
-static void ft_flip_batch_free_unpublished(struct ft_flip_batch *b);
-static void ft_flip_batch_commit(struct ft_flip_batch *b);
-static void ft_flip_batch_reclaim(struct ft_flip_batch *b);
 static void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, struct ft_ord_cell *cell,
 		struct ft_insert_commit *ic);
@@ -1359,25 +1355,6 @@ void ft_chain_node(struct cds_ft_node *last_node, struct cds_ft_node *node)
 }
 
 /*
- * Advance the descent cursor one level down: rotate current -> parent ->
- * grandparent, then descend into child @key_value.
- *
- * Returns the new d->nf (the child's flagged pointer, possibly NULL).
- */
-static inline
-struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *d,
-		uint8_t key_value)
-{
-	d->ppnf  = d->pnf;
-	d->ppnfp = d->pnfp;
-	d->pnf   = d->nf;
-	d->pnfp  = d->nfp;
-	d->nf    = ft_node_get_nth(ft, d->pnf, &d->nfp, key_value, FT_PF_NONE);
-	d->depth++;
-	return d->nf;
-}
-
-/*
  * There are a few cases to cover for add:
  *
  * 1) There is already an external node at that key. Chain this new node
@@ -1709,7 +1686,6 @@ static void ft_iter_set_key_ordinals(struct cds_ft_iter *iter,
 		const uint8_t *ordinals, size_t key_len);
 static void ft_ord_cell_splice_at(struct cds_ft *ft, struct ft_ord_cell *cell,
 		struct ft_ord_cell *pred, struct ft_ord_cell *succ);
-static void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell);
 static void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		struct ft_ord_cell *new_cell);
 /* Bulk-op ordered-list maintenance. */
@@ -1726,8 +1702,6 @@ static void ft_ord_cell_find_splice_pos(struct cds_ft *dst,
 static void ft_ord_cell_run_replace(struct cds_ft *dst,
 		struct ft_ord_cell *d_first, struct ft_ord_cell *d_last,
 		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last);
-struct ft_ord_cell_edge;
-struct ft_flip_batch;
 #ifdef FEATURE_FT_MERGE
 /* @dst_key in ORDINAL form (converted once at the cds_ft_merge_at entry). */
 static void ft_merge_ord_interleave(struct cds_ft *dst, const uint8_t *dst_key,
