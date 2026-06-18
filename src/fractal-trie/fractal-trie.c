@@ -139,6 +139,7 @@
 #include "ft-tables.h"
 #include "ft-delay.h"
 #include "ft-helpers.h"
+#include "ft-trace-helpers.h"
 #include "ft-lookup-node.h"
 #include "ft-descent.h"
 #include "ft-iter.h"
