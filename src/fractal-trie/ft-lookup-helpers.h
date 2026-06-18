@@ -3,15 +3,26 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 /*
- * src/fractal-trie/ft-ordcell.h
+ * src/fractal-trie/ft-lookup-helpers.h
  *
- * Userspace RCU library - Fractal Trie: ordinal-cell primitives: the ordered sibling-list cell, alloc/free, flag/resolve, batched cell iteration lives with the iterator.
+ * Userspace RCU library - Fractal Trie: read-path (lookup / ordered-iteration)
+ * helpers -- the ordinal-cell ACCESS primitives: the ordered sibling-list cell
+ * struct, its flag / pointer / ord-resolution accessors, and alloc / free.
+ * These are shared by the ordered read path (cds_ft_next, the iterator,
+ * inequality lookups) and the write path, so they live early, beside the other
+ * read helpers.
+ *
+ * NOTE: this is NOT every ord_cell function -- only the read-accessible
+ * primitives.  The ordered-list MAINTENANCE operations (splice / unsplice /
+ * swap / flip / run / find), which mutate the cell list and depend on the
+ * relational descent and node scanners, live in ft-mutation-helpers.h on the
+ * write side.  Batched cell iteration lives with the iterator (ft-iter.h).
  *
  * Implementation unit: #included once into the fractal-trie.c translation
  * unit (preserves cross-module inlining).  Not a standalone header.
  */
 #ifndef FRACTAL_TRIE_IMPL
-#error "ft-ordcell.h is an implementation unit; #include it from fractal-trie.c only"
+#error "ft-lookup-helpers.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
 static inline_lookup

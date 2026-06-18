@@ -1100,7 +1100,7 @@ void ft_speculative_keycopy_unconditional(const struct cds_ft *ft,
  */
 #define FT_ORD_CELL_TAG		FT_INTERNAL_MASK
 
-#include "ft-ordcell.h"
+#include "ft-lookup-helpers.h"
 
 /*
  * ft_node_holder: write-side resolution of a node's holder (the slot owner
