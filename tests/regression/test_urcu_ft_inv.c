@@ -41,7 +41,7 @@
 #include <urcu-call-rcu.h>
 
 #ifdef FT_ENABLE_TRACING
-#include "../../src/cds_ft_tp.h"
+#include "../../src/fractal-trie/cds_ft_tp.h"
 #define FT_TEST_TP(name, ...) \
 	lttng_ust_tracepoint(cds_ft, name, ##__VA_ARGS__)
 #else
