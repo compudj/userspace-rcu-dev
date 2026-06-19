@@ -1536,6 +1536,7 @@ static uint8_t ft_slot_to_byte(const struct cds_ft_type *type,
 
 static inline
 void ft_set_parent_slot(struct cds_ft_metadata *meta,
+		struct cds_ft_inode_flag *parent,
 		struct cds_ft_inode_flag **slot)
 {
 	struct cds_ft_inode_flag *p;
@@ -1543,12 +1544,12 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 
 	if (!slot)
 		return;	/* Slot unknown -- preserve existing offset. */
-	if (!meta->parent) {
+	if (!parent) {
 		meta->parent_slot_offset = 0;
 		return;
 	}
 	meta->parent_slot_offset = (unsigned int)((char *) slot -
-		(char *) ft_node_ptr(meta->parent)) / sizeof(void *);
+		(char *) ft_node_ptr(parent)) / sizeof(void *);
 	/*
 	 * Record this node's incoming branch byte for the up-walk key rebuild
 	 * (ft_rebuild_key_upwalk).  This is THE central populate point for every
@@ -1560,7 +1561,7 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 	 * slot array -- the edge byte lives in its key_bytes -- so skip it (the
 	 * up-walk likewise skips a node whose parent is compressed).
 	 */
-	p = meta->parent;
+	p = parent;
 	parent_compressed = ft_node_compressed(p);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	parent_compressed = parent_compressed || ft_node_skip_compressed(p);
@@ -1797,7 +1798,8 @@ void ft_publish_to_parent(struct cds_ft *ft,
 			child_meta = cds_ft_item_to_metadata(
 				ft_node_ptr(new_child));
 		if (child_meta && child_meta->parent)
-			ft_set_parent_slot(child_meta, parent_slot);
+			ft_set_parent_slot(child_meta, child_meta->parent,
+				parent_slot);
 	}
 
 	if (parent_nf && ft_node_compressed(parent_nf)) {
@@ -1948,7 +1950,7 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
 		rcu_assign_pointer(cn_meta->parent, parent_nf);
-		ft_set_parent_slot(cn_meta, slot);
+		ft_set_parent_slot(cn_meta, parent_nf, slot);
 		return;
 	}
 	if (ft_node_compressed(child_nf)) {
@@ -1967,7 +1969,7 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
 		rcu_assign_pointer(cn_meta->parent, parent_nf);
-		ft_set_parent_slot(cn_meta, slot);
+		ft_set_parent_slot(cn_meta, parent_nf, slot);
 		return;
 	}
 #endif
@@ -2018,7 +2020,7 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 				&ft_types[ft_node_type(parent_nf)],
 				ft_node_ptr(parent_nf), slot);
 		rcu_assign_pointer(meta->parent, parent_nf);
-		ft_set_parent_slot(meta, slot);
+		ft_set_parent_slot(meta, parent_nf, slot);
 	}
 }
 

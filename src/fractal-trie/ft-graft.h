@@ -1373,7 +1373,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				merged_meta->parent = pcn_meta->parent;
 				pub_parent = pcn_meta->parent;
 				pub_slot = ft_get_parent_slot(pcn_meta, dst_ft);
-				ft_set_parent_slot(merged_meta, pub_slot);
+				ft_set_parent_slot(merged_meta,
+					merged_meta->parent, pub_slot);
 				merged_flag = ft_compressed_node_flag(merged);
 				ft_glue_track(&glue_insert, merged_flag);
 				ft_glue_defer_edge(dst_ft, &glue_insert, ccn->child,

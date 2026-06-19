@@ -223,7 +223,7 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		publish_parent = iter_meta->parent;
 		publish_slot = slot_ptr;
 	}
-	ft_set_parent_slot(new_cn_meta, publish_slot);
+	ft_set_parent_slot(new_cn_meta, new_cn_meta->parent, publish_slot);
 
 	new_cn_flag = ft_compressed_node_flag(new_cn);
 	ft_set_parent(ft, new_cn->child, new_cn_flag, &new_cn->child);
