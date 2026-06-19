@@ -1762,7 +1762,6 @@ enum ft_tp_node_kind {
 	FT_TP_NODE_UNKNOWN		= 13,
 };
 
-
 /*
  * Central node-type definitions and small helpers moved here from the
  * fractal-trie.c top matter so the master file is just the assembly unit.
