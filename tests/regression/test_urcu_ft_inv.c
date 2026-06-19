@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	27
+#define NR_TESTS	28
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -324,6 +324,17 @@ insert_u64(struct cds_ft *ft, uint64_t v, struct ft_test_node *n)
 	/* Stash the ordinal key bytes for speculative leaf-key capture. */
 	memcpy(n->okey, k, sizeof(n->okey));
 	return cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n->node);
+}
+
+static enum cds_ft_status
+insert_replace_u64(struct cds_ft *ft, uint64_t v, struct ft_test_node *n,
+		struct cds_ft_node **old_ret)
+{
+	uint8_t k[8] = { 0 };
+
+	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
+	memcpy(n->okey, k, sizeof(n->okey));
+	return cds_ft_insert_replace(ft, k, CDS_FT_LEN_DEFAULT, &n->node, old_ret);
 }
 
 static enum cds_ft_status
@@ -1287,6 +1298,148 @@ static int inv_insert_splice_window(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_insert_splice_window: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Same splice-window invariant, but writers use cds_ft_insert_replace instead
+ * of cds_ft_insert.  insert_replace does NOT use the one-commit park, so a
+ * fresh head reaches readers structurally before its ordinal cell is spliced
+ * (post-publish splice / early-wired live edge in the compressed-split shapes)
+ * -- the same secondary-index channel window, exercised on the insert_replace
+ * paths that inv_insert_splice_window never drives.
+ */
+static void *inv_splice_window_replace_writer(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = (uint64_t)(rand_r(&seed) % WRITER_POOL_SIZE);
+		int do_insert = rand_r(&seed) & 1;
+
+		rcu_read_lock();
+		if (do_insert) {
+			struct ft_test_node *n = node_alloc(key);
+			struct cds_ft_node *old = NULL;
+
+			pthread_mutex_lock(&ctx->lock);
+			/*
+			 * Both OK (inserted, no prior node) and DUPLICATE_FOUND
+			 * (replaced an existing chain) are success codes (>= 0);
+			 * on a replace, @old is the old head and must be freed.
+			 */
+			if (insert_replace_u64(ctx->ft, key, n, &old) >= 0) {
+				if (old)
+					node_free_rcu(to_test_node(old));
+			}
+			pthread_mutex_unlock(&ctx->lock);
+		} else {
+			struct cds_ft_node *found;
+			uint8_t k[8];
+
+			cds_ft_u64_to_key(ctx->ft, key, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(ctx->ft, iter);
+			found = cds_ft_iter_node(iter);
+			if (found) {
+				struct ft_test_node *tn = to_test_node(found);
+
+				pthread_mutex_lock(&ctx->lock);
+				if (cds_ft_remove(ctx->ft, iter, &tn->node)
+				    == CDS_FT_STATUS_OK) {
+					node_free_rcu(tn);
+				}
+				pthread_mutex_unlock(&ctx->lock);
+			}
+		}
+		rcu_read_unlock();
+
+		if ((seed & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_insert_replace_splice_window(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct inv_lookup_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_insert_replace_splice_window";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	/* The permanent sentinel: the maximum key, never removed. */
+	rcu_read_lock();
+	{
+		struct ft_test_node *n = node_alloc(0xffffffffull);
+
+		if (insert_u64(ft, 0xffffffffull, n) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	/* Pre-populate half the writer pool. */
+	for (i = 0; i < WRITER_POOL_SIZE / 2; i++) {
+		struct ft_test_node *n = node_alloc(i);
+		insert_u64(ft, i, n);
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_splice_window_reader, &ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL,
+			inv_splice_window_replace_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_insert_replace_splice_window: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		drain_and_destroy(ft, group);
 		return -1;
@@ -6183,6 +6336,7 @@ int main(int argc, char **argv)
 	diag("2. Lookup consistency");
 	RUN_TEST(inv_lookup_consistency);
 	RUN_TEST(inv_insert_splice_window);
+	RUN_TEST(inv_insert_replace_splice_window);
 
 	diag("3. Duplicate chain acyclicity");
 	RUN_TEST(inv_dup_chain_acyclicity);
