@@ -670,8 +670,9 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 
 	/*
 	 * Ordinal-cell list enabled: eagerly allocate the writer-side scratch
-	 * iterator used for cell predecessor discovery (ft_ord_cell_splice).
-	 * ord_cell_head / ord_cell_tail are NULL from calloc.
+	 * iterator used for cell predecessor discovery
+	 * (ft_ord_cell_find_pred_from_head).  ord_cell_head / ord_cell_tail are
+	 * NULL from calloc.
 	 */
 	if (ft_group->ordered_list_set &&
 	    cds_ft_iter_create(ft, &ft->ord_cell_scratch_iter) != CDS_FT_STATUS_OK) {
