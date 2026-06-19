@@ -898,10 +898,14 @@ void ft_maybe_prefetch_nta(const void *ptr)
  * common-case prefetch un-delayed beats prefetching the rare skip child).
  *
  * ft_dereference_external: for external (leaf) pointers like
- * external_nodes.  Now a plain rcu_dereference -- external children are
- * deliberately NOT prefetched (see ft_maybe_prefetch: random/use-once
- * leaves drop the prefetch on a 4 KiB TLB miss or flood the memory
- * controller under 2 MiB).  Kept as a distinct name to mark leaf loads.
+ * external_nodes.  external children are deliberately NOT prefetched (see
+ * ft_maybe_prefetch: random/use-once leaves drop the prefetch on a 4 KiB TLB
+ * miss or flood the memory controller under 2 MiB).  It also RESOLVES a parked
+ * flip proxy: a "new key at an existing internal node" publish parks a proxy
+ * in external_nodes so it commits atomically with the ordinal-cell splice (one
+ * urcu_flip_commit), so a reader loading external_nodes must resolve it to the
+ * old/new head exactly as it does for a child slot.  The common case (a real
+ * head, proxy tag clear) is a single predicted-not-taken tag test.
  */
 #define ft_dereference_prefetch(p)		\
 	({							\
@@ -910,7 +914,9 @@ void ft_maybe_prefetch_nta(const void *ptr)
 		__ft_tmp;					\
 	})
 
-#define ft_dereference_external(p)	rcu_dereference(p)
+#define ft_dereference_external(p)					\
+	((__typeof__(p)) ft_resolve_flip_proxy(				\
+		(struct cds_ft_inode_flag *) rcu_dereference(p)))
 
 #define ft_dereference_acquire_prefetch(p)	\
 	({							\

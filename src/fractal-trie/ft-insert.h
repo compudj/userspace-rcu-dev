@@ -47,9 +47,76 @@ struct ft_insert_commit {
 	 * pre-commit would not cover readers that pick the proxy up later.
 	 */
 	struct cds_ft_compressed_node *free_old_cn;
+	/*
+	 * Deferred LIVE re-parent edge (split-compressed one-commit).  The live
+	 * old child's back-pointer is the back-channel publish that exposes the
+	 * fresh cluster to reanchor up-walkers; for a parked commit the forward
+	 * publish IS the single commit, so this edge must be wired THERE (after
+	 * the cell links are set), not during the build -- otherwise a reader
+	 * reanchoring through the re-parented child reaches the fresh head before
+	 * its cell is spliced (the inv_insert_splice_window race).  NULL = none.
+	 */
+	struct cds_ft_inode_flag *live_child;
+	struct cds_ft_inode_flag *live_parent;
+	struct cds_ft_inode_flag **live_slot;
 	bool publish_to_parent;			/* settle via ft_publish_to_parent */
-	bool spliced;				/* cell already spliced (B-lite shape) */
 };
+
+/*
+ * Park the deferred LIVE re-parent edge (split-compressed one-commit) into
+ * @batch, so the live old child's back-pointer flips to its new cluster parent
+ * ATOMICALLY with the forward structural edge and the ordered-list neighbour
+ * edges at the single urcu_flip_commit.  That back-pointer is the only field a
+ * reanchor up-walk reads to recover a skip-compressed node (ft_skip_reanchor,
+ * which resolves flip proxies on the parent read), so until the commit a reader
+ * resolves it to the OLD parent and never enters the fresh cluster -- closing
+ * the window where the head was tree-reachable (via the re-parented child) but
+ * not yet in the ordered list.
+ *
+ * The slot-offset / incoming-byte bookkeeping is set NOW, for the new parent: a
+ * reader gated at the OLD parent -- always the compressed node being split, so
+ * compressed -- skips incoming_byte, hence the early write is unobservable
+ * until the commit makes the (possibly internal) new parent current.  Returns
+ * the parent-field address to settle (a direct store of @new_parent) after the
+ * commit.
+ */
+static
+struct cds_ft_inode_flag **ft_park_live_parent_edge(struct cds_ft *ft,
+		struct cds_ft_inode_flag *child,
+		struct cds_ft_inode_flag *new_parent,
+		struct cds_ft_inode_flag **slot,
+		struct ft_flip_batch *batch)
+{
+	struct cds_ft_metadata *meta = NULL;
+	struct cds_ft_inode_flag **field;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(child))
+		meta = cds_ft_item_to_metadata((struct cds_ft_inode *)
+			ft_skip_to_compressed(ft, child));
+	else
+#endif
+	if (ft_node_compressed(child))
+		meta = cds_ft_item_to_metadata((struct cds_ft_inode *)
+			ft_compressed_node_ptr(child));
+	else if (!ft_node_external(child))
+		meta = cds_ft_item_to_metadata(ft_node_ptr(child));
+
+	if (meta) {
+		ft_set_parent_slot(meta, new_parent, slot);
+		field = &meta->parent;
+	} else {
+		/*
+		 * External head (the ordered list is on whenever a batch
+		 * exists): its parent lives in the cell carried by node->prev.
+		 */
+		field = &ft_ord_cell_ptr(
+			((struct cds_ft_node *) child)->prev)->parent;
+	}
+	rcu_assign_pointer(*field, (struct cds_ft_inode_flag *)
+		ft_flip_batch_add(batch, *field, new_parent));
+	return field;
+}
 
 /*
  * One-commit insert tail (see struct ft_insert_commit): the structural slot
@@ -70,9 +137,26 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 {
 	struct ft_ord_cell *pred, *succ;
 	struct ft_ord_cell_edge edges[4];
+	struct cds_ft_inode_flag **live_settle = NULL;
 	unsigned int i, n = 0;
 
-	pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell);
+	/*
+	 * Locate the predecessor.  From-HEAD (seed at the fresh head, walk the
+	 * live parent chain up) is the fast default and the only safe choice for
+	 * the attach shapes: a from-root LT would descend through the attach's own
+	 * mid-build re-parent edge and loop in the reanchor.  Two shapes need
+	 * from-ROOT instead, and neither loops there:
+	 *   - split-compressed (ic->live_child): the deferred live edge is parked,
+	 *     so a from-head LT would reanchor through the not-yet-wired edge; the
+	 *     old compressed node is intact, so from-root descends it cleanly.
+	 *   - external_nodes prefix key (!ic->publish_to_parent): the head sits at
+	 *     an internal node's external_nodes and sorts BEFORE its extensions, so
+	 *     a from-head seed mis-locates it; from-root descends only live nodes
+	 *     (the parked external_nodes resolves to "no head"), no live re-parent.
+	 * TODO(perf): the from-root cases re-descend; revisit if they show up hot.
+	 */
+	pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
+		ic->live_child != NULL || !ic->publish_to_parent);
 	if (pred)
 		succ = ft_ord_cell_resolve_ord(&pred->ord_next);
 	else
@@ -103,7 +187,22 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 				(struct cds_ft_inode_flag *) edges[i].old_target,
 				(struct cds_ft_inode_flag *) edges[i].new_target));
 
-	/* THE commit: structural slot + ordered-list edges, atomically. */
+	/*
+	 * Park the deferred LIVE re-parent edge (split-compressed shapes) into
+	 * the SAME batch: the live old child's back-pointer is the back-channel
+	 * a reanchor up-walk follows into the fresh cluster, so flipping it in
+	 * the one commit -- together with the forward edge and the neighbour
+	 * edges -- makes structural reachability and the ordered-list splice a
+	 * single atomic publication for every reader.
+	 */
+	if (ic->live_child)
+		live_settle = ft_park_live_parent_edge(ft, ic->live_child,
+			ic->live_parent, ic->live_slot, ic->batch);
+
+	/*
+	 * THE commit: forward structural slot + ordered-list edges + the live
+	 * re-parent edge, all atomically.
+	 */
 	urcu_flip_commit(&ic->batch->group);
 
 	/*
@@ -122,6 +221,9 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		rcu_assign_pointer(*ic->slot, ic->slot_value);
 	for (i = 0; i < n; i++)
 		rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
+	/* Settle the live re-parent edge to its direct value. */
+	if (live_settle)
+		rcu_assign_pointer(*live_settle, ic->live_parent);
 	ft_flip_batch_reclaim(ic->batch);
 	ic->batch = NULL;
 	/*
@@ -182,10 +284,37 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic)
 {
 	if (!ic || !ft->ordered_list)
 		return 0;
-	ic->batch = ft_flip_batch_alloc(ft, 5);
+	/* forward structural slot + <=4 cell neighbour edges + live re-parent. */
+	ic->batch = ft_flip_batch_alloc(ft, 6);
 	if (!ic->batch)
 		return -ENOMEM;
 	return 0;
+}
+
+/*
+ * Park a "new key at an existing internal node" publish into the one-commit
+ * batch.  The head is published by storing it into @metadata->external_nodes
+ * (not a child slot), so park a flip proxy THERE -- readers resolve it via
+ * ft_dereference_external -- and the structural publish then commits atomically
+ * with the ordinal-cell splice at the single urcu_flip_commit.  No transient
+ * half-spliced list state.  Settles direct (publish_to_parent false: there is
+ * no parent child-slot to re-encode).  @ic must be armed.  The fresh-key case
+ * parks old == NULL, so a reader resolves the proxy to "no head" until the
+ * commit.
+ */
+static
+void ft_insert_park_external_nodes(struct cds_ft *ft,
+		struct cds_ft_metadata *metadata, struct cds_ft_node *node,
+		struct ft_insert_commit *ic)
+{
+	(void) ft;
+	rcu_assign_pointer(metadata->external_nodes,
+		(struct cds_ft_node *) ft_flip_batch_add(ic->batch,
+			(struct cds_ft_inode_flag *) metadata->external_nodes,
+			(struct cds_ft_inode_flag *) node));
+	ic->slot = (struct cds_ft_inode_flag **) &metadata->external_nodes;
+	ic->slot_value = (struct cds_ft_inode_flag *) node;
+	ic->publish_to_parent = false;
 }
 
 /*
@@ -480,8 +609,26 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	ft_set_parent(ft, top_flag, cn_meta->parent, parent_slot);
 	if (deferred_child2)
 		ft_set_parent(ft, deferred_child2, deferred_parent, deferred_slot2);
-	if (deferred_child)
-		ft_set_parent(ft, deferred_child, deferred_parent, deferred_slot);
+	if (deferred_child) {
+		/*
+		 * deferred_child is the LIVE old child (cn->child).  Setting its
+		 * back-pointer is the back-channel publish that exposes this
+		 * fresh cluster to a reanchor up-walker.  For a parked one-commit
+		 * the forward publish is deferred to insert_done's single commit,
+		 * so defer this edge too (ft_insert_one_commit parks it into the
+		 * SAME flip batch -- structure + cell + this edge flip atomically;
+		 * the splice search runs from the root so it does not need it
+		 * wired early).  The direct (list-off) publish has no gap.
+		 */
+		if (ic && ic->batch) {
+			ic->live_child = deferred_child;
+			ic->live_parent = deferred_parent;
+			ic->live_slot = deferred_slot;
+		} else {
+			ft_set_parent(ft, deferred_child, deferred_parent,
+				deferred_slot);
+		}
+	}
 	ft_insert_publish_or_park(ft, cn_meta->parent, parent_slot, top_flag, ic);
 
 	/*
@@ -542,7 +689,17 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		unsigned int remaining,
 		struct cds_ft_inode_flag **top_ret,
 		struct cds_ft_inode_flag **jct_ret,
-		unsigned int node_depth)
+		unsigned int node_depth,
+		/*
+		 * The LIVE old-child re-parent edge (cn->child into the new
+		 * suffix/junction) is RETURNED, not wired: the caller defers it to
+		 * the parked one-commit (so it flips atomically with the cell) or
+		 * wires it directly (list-off / duplicate).  See the same shape in
+		 * ft_split_compressed_insert.  NULL out = no live edge.
+		 */
+		struct cds_ft_inode_flag **live_child_ret,
+		struct cds_ft_inode_flag **live_parent_ret,
+		struct cds_ft_inode_flag ***live_slot_ret)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
 	struct cds_ft_metadata *cn_meta =
@@ -766,8 +923,10 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	 * publishes the top forward immediately after we return.
 	 */
 	ft_set_parent(ft, top_flag, cn_meta->parent, parent_slot);
-	if (deferred_child)
-		ft_set_parent(ft, deferred_child, deferred_parent, deferred_slot);
+	/* Return the live edge; the caller defers (parked) or wires (direct). */
+	*live_child_ret = deferred_child;
+	*live_parent_ret = deferred_parent;
+	*live_slot_ret = deferred_slot;
 
 	FT_TP(compressed_split, "key_shorter", (const void *) cn, cn->len,
 		(const void *) top_flag, remaining);
@@ -1227,11 +1386,14 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 {
 	struct cds_ft_inode_flag *top_flag, *jct_flag;
 	struct cds_ft_metadata *jct_meta;
+	struct cds_ft_inode_flag *live_child, *live_parent;
+	struct cds_ft_inode_flag **live_slot;
 	bool fresh_head;
 	int sret;
 
 	sret = ft_split_compressed_key_shorter(ft,
-		d->nf, d->nfp, remaining, &top_flag, &jct_flag, d->depth);
+		d->nf, d->nfp, remaining, &top_flag, &jct_flag, d->depth,
+		&live_child, &live_parent, &live_slot);
 	if (sret)
 		return sret;
 	jct_meta = cds_ft_item_to_metadata(ft_node_ptr(jct_flag));
@@ -1261,6 +1423,10 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 			 */
 			jct_meta->external_nodes = NULL;
 			node->next = NULL;
+			/* Key-neutral restructure still re-parents cn->child. */
+			if (live_child)
+				ft_set_parent(ft, live_child, live_parent,
+					live_slot);
 			ft_publish_to_parent(ft, d->pnf, d->nfp, top_flag);
 			free_compressed_node(ft,
 				ft_compressed_node_ptr(d->nf));
@@ -1268,10 +1434,20 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		}
 	}
 	/*
-	 * ft_split_compressed_key_shorter wires top_flag's back-pointer into
-	 * the live parent before its deferred back-channel re-parent of
-	 * cn->child, so the caller does not need to set the parent here.
+	 * top_flag's own back-pointer was wired in the split (it is a fresh
+	 * cluster node).  The LIVE old-child re-parent is the back-channel that
+	 * exposes the cluster to a reanchor up-walk: defer it to the parked
+	 * one-commit so it flips atomically with the cell (fresh head + ordered
+	 * list); otherwise (duplicate, or list off) wire it directly before the
+	 * forward publish.
 	 */
+	if (fresh_head && ic && ic->batch) {
+		ic->live_child = live_child;
+		ic->live_parent = live_parent;
+		ic->live_slot = live_slot;
+	} else if (live_child) {
+		ft_set_parent(ft, live_child, live_parent, live_slot);
+	}
 	ft_insert_publish_or_park(ft, d->pnf, d->nfp, top_flag,
 		fresh_head ? ic : NULL);
 	if (!fresh_head) {
@@ -1401,7 +1577,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 	int nr_snapshot = 0;
 	int ret;
 	struct ft_ord_cell *precell;
-	struct ft_insert_commit ic = { NULL, NULL, NULL, NULL, NULL, NULL, false, false };
+	struct ft_insert_commit ic = { NULL, NULL, NULL, NULL, NULL, NULL,
+		NULL, NULL, NULL, false };
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
@@ -1574,32 +1751,28 @@ int _cds_ft_insert(struct cds_ft *ft,
 				node->next = NULL;
 				if (ft->ordered_list) {
 					/*
-					 * Readers do not resolve flip proxies
-					 * on external_nodes loads, so this
-					 * shape cannot park a one-commit
-					 * proxy.  B-lite instead: locate the
-					 * splice position and pre-fill the
-					 * cell's links BEFORE the head becomes
-					 * reachable -- a reader landing on the
-					 * fresh head always sees valid links
-					 * -- and flip the neighbour edges
-					 * right after the store.
+					 * Park the external_nodes publish into the
+					 * one-commit batch -- readers resolve the
+					 * proxy via ft_dereference_external -- so the
+					 * structural publish commits atomically with
+					 * the ordinal-cell splice at insert_done's
+					 * single flip (no transient half-spliced
+					 * list).  Count follows the commit
+					 * (ic.count_from).
 					 */
-					struct ft_ord_cell *pred, *succ;
-
-					ft_ord_cell_prefill_by_key(ft, _key,
-						_key_len, precell, &pred, &succ);
-					rcu_assign_pointer(
-						metadata->external_nodes, node);
-					ft_ord_cell_splice_at(ft, precell,
-						pred, succ);
-					ic.spliced = true;
+					ret = ft_insert_commit_arm(ft, &ic);
+					if (ret)
+						goto insert_done;
+					ft_insert_park_external_nodes(ft,
+						metadata, node, &ic);
+					ic.count_from = d.nf;
 				} else {
 					rcu_assign_pointer(
 						metadata->external_nodes, node);
+					ft_propagate_external_count_parent(ft,
+						d.nf, 1);
 				}
 				ret = 0;
-				ft_propagate_external_count_parent(ft, d.nf, 1);
 			}
 		} else {
 			struct cds_ft_node *iter_node, *last_node = NULL;
@@ -1696,18 +1869,14 @@ insert_done:
 			ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
 			ft_propagate_external_count_parent(ft,
 				ic.count_from ? ic.count_from : *d.pnfp, 1);
-		} else if (ic.spliced) {
-			/* B-lite shape: spliced at the attach site. */
-		} else {
-			/*
-			 * @node became a fresh head through a shape that
-			 * publishes without a parkable slot (insert_replace's
-			 * paths): post-publish splice.
-			 */
-			ft_ord_cell_splice(ft, _key, _key_len, precell);
-			if (ic.batch)
-				ft_flip_batch_free_unpublished(ic.batch);
 		}
+		/*
+		 * No final else: after the one-commit conversion every
+		 * published fresh head here parks a structural slot (ic.slot),
+		 * so the old B-lite (ic.spliced) and post-publish-splice
+		 * fallbacks are unreachable -- the cell is always spliced
+		 * atomically by ft_insert_one_commit above.
+		 */
 	}
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
@@ -1799,6 +1968,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	int nr_snapshot = 0;
 	int ret;
 	struct ft_ord_cell *precell;
+	struct ft_insert_commit ic = { NULL, NULL, NULL, NULL, NULL, NULL,
+		NULL, NULL, NULL, false };
 
 	*old_node_ret = NULL;
 
@@ -1859,7 +2030,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			act = ft_insert_compressed(ft, &d, &iter_key,
 				key, key_len, key_depth, node,
 				NULL, snapshot, snapshot_depth,
-				&nr_snapshot, &ret, NULL);
+				&nr_snapshot, &ret, &ic);
 			if (act == FT_DESCENT_END)
 				goto insert_replace_done;
 			if (act == FT_DESCENT_BREAK)
@@ -1889,9 +2060,11 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
-					NULL, NULL);
+					NULL, &ic);
 			if (ret == 0) {
-				ft_propagate_external_count_parent(ft, *d.pnfp, 1);
+				/* Parked one-commit: +1 follows the commit. */
+				if (!ic.slot)
+					ft_propagate_external_count_parent(ft, *d.pnfp, 1);
 				if (d.depth >= 2)
 					FT_TP(tree_edge_set, (const void *) ft,
 						(const void *) d.ppnf,
@@ -1905,7 +2078,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			 * Split: internal(external_nodes) + compressed(len-1).
 			 */
 			ret = ft_insert_compressed_key_shorter(ft, &d, 0,
-				node, old_node_ret, NULL);
+				node, old_node_ret, &ic);
 			if (ret == -EEXIST) {
 				ret = 0;	/* Replace handled by key_shorter. */
 				/*
@@ -1931,26 +2104,51 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				*old_node_ret = external_nodes;
 				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
-				rcu_assign_pointer(metadata->external_nodes, node);
 				/*
-				 * Ordered list on: the replaced head's cell leaves the
-				 * trie; @node's pre-wired cell takes its list slot (O(1)
-				 * swap, no re-descent), then the old cell is freed.  List
-				 * off: no cells, nothing to swap or free.
+				 * Ordered list on: publish the new head into
+				 * external_nodes AND swap its cell in ONE atomic flip
+				 * -- external_nodes is a plain pointer slot, readers
+				 * resolve a parked proxy via ft_dereference_external.
+				 * List off: a plain publish, no cell.
 				 */
 				if (ft->ordered_list) {
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr(external_nodes->prev);
 
-					ft_ord_cell_swap(ft, old_cell, precell);
+					ft_ord_cell_swap_publish(ft, old_cell, precell,
+						(struct cds_ft_inode_flag **)
+							&metadata->external_nodes,
+						(struct cds_ft_inode_flag *)
+							external_nodes,
+						(struct cds_ft_inode_flag *) node);
 					ft_ord_cell_free(ft, old_cell);
+				} else {
+					rcu_assign_pointer(metadata->external_nodes,
+						node);
 				}
 			} else {
-				/* No external nodes yet. New key. */
+				/* No external nodes yet. New key at this node. */
 				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
-				rcu_assign_pointer(metadata->external_nodes, node);
-				ft_propagate_external_count_parent(ft, d.nf, 1);
+				if (ft->ordered_list) {
+					/*
+					 * Park external_nodes -- readers resolve the
+					 * proxy via ft_dereference_external -- so it
+					 * commits atomically with the ordinal-cell
+					 * splice (no transient half-spliced list).
+					 */
+					ret = ft_insert_commit_arm(ft, &ic);
+					if (ret)
+						goto insert_replace_done;
+					ft_insert_park_external_nodes(ft,
+						metadata, node, &ic);
+					ic.count_from = d.nf;
+				} else {
+					rcu_assign_pointer(
+						metadata->external_nodes, node);
+					ft_propagate_external_count_parent(ft,
+						d.nf, 1);
+				}
 			}
 			ret = 0;
 		} else {
@@ -1960,16 +2158,52 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
 			ft_external_head_set_parent(ft, node, d.pnf);
 			node->next = NULL;
-			ft_publish_to_parent(ft, d.pnf, d.nfp,
-				(struct cds_ft_inode_flag *) node);
-			/* Ordered list on: replaced head's cell leaves; @node's cell
-			 * takes its slot, then the old cell is freed.  List off: none. */
 			if (ft->ordered_list) {
+				/*
+				 * Atomic replace: publish the new head into its single
+				 * reader-visible slot AND swap its cell in one flip.  The
+				 * reader-visible slot is d.nfp (plain external child, or a
+				 * plainly-reached compressed parent's cn->child) or, for a
+				 * leaf reached through a SKIP_X suffix, the grandparent skip
+				 * slot (re-encoded for @node, with cn->child set here -- the
+				 * reanchor up-walk never reads it, node->parent is already
+				 * cn = d.pnf).  Mirrors ft_publish_to_parent's stores.
+				 */
 				struct ft_ord_cell *old_cell =
 					ft_ord_cell_ptr((*old_node_ret)->prev);
+				struct cds_ft_inode_flag **rslot = d.nfp;
+				struct cds_ft_inode_flag *rold = d.nf;
+				struct cds_ft_inode_flag *rnew =
+					(struct cds_ft_inode_flag *) node;
 
-				ft_ord_cell_swap(ft, old_cell, precell);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				if (ft_node_compressed(d.pnf)) {
+					struct cds_ft_compressed_node *cn =
+						ft_compressed_node_ptr(d.pnf);
+					struct cds_ft_metadata *cn_meta =
+						cds_ft_item_to_metadata(
+							(struct cds_ft_inode *) cn);
+					struct cds_ft_inode_flag **sslot =
+						ft_get_parent_slot(cn_meta, ft);
+
+					if (sslot && ft_node_skip_compressed(*sslot)) {
+						rcu_assign_pointer(cn->child,
+							(struct cds_ft_inode_flag *)
+								node);
+						rslot = sslot;
+						rold = *sslot;
+						rnew = ft_skip_compressed_flag(
+							(struct cds_ft_inode_flag *)
+								node, cn->len);
+					}
+				}
+#endif
+				ft_ord_cell_swap_publish(ft, old_cell, precell,
+					rslot, rold, rnew);
 				ft_ord_cell_free(ft, old_cell);
+			} else {
+				ft_publish_to_parent(ft, d.pnf, d.nfp,
+					(struct cds_ft_inode_flag *) node);
 			}
 			ret = 0;
 		}
@@ -1983,9 +2217,11 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
-				(struct cds_ft_node *) ft_node_ptr(d.nf), NULL);
+				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic);
 		if (ret == 0) {
-			ft_propagate_external_count_parent(ft, *d.pnfp, 1);
+			/* Parked one-commit: +1 follows the commit. */
+			if (!ic.slot)
+				ft_propagate_external_count_parent(ft, *d.pnfp, 1);
 			if (d.depth >= 2)
 				FT_TP(tree_edge_set, (const void *) ft,
 					(const void *) d.ppnf,
@@ -2014,15 +2250,24 @@ insert_replace_done:
 		if (ret != 0) {
 			node->prev = NULL;
 			ft_ord_cell_free_unpublished(ft, precell);
+			if (ic.batch)
+				ft_flip_batch_free_unpublished(ic.batch);
 		} else if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
+			/* Duplicate append / -EEXIST (prev NULL): cell orphaned. */
 			ft_ord_cell_free_unpublished(ft, precell);
-		} else if (*old_node_ret == NULL) {
+			if (ic.batch)
+				ft_flip_batch_free_unpublished(ic.batch);
+		} else if (ic.slot) {
 			/*
-			 * Fresh head (no chain replaced): splice its kept cell.  A replace
-			 * (*old_node_ret set) already swapped @precell into the replaced
-			 * head's list slot at the replace site, so it must NOT splice again.
+			 * Fresh head, parked one-commit: structural publish +
+			 * ordinal-cell splice flip atomically.  A replace
+			 * (*old_node_ret set) does not park -- it swapped @precell
+			 * into the replaced head's list slot at the replace site,
+			 * so it falls through here untouched.
 			 */
-			ft_ord_cell_splice(ft, _key, _key_len, precell);
+			ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
+			ft_propagate_external_count_parent(ft,
+				ic.count_from ? ic.count_from : *d.pnfp, 1);
 		}
 	}
 	if (ret == 0) {

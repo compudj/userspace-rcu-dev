@@ -248,7 +248,8 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 	if (dir == FT_LEFTMOST) {
 		struct cds_ft_metadata *cn_meta = cds_ft_item_to_metadata(
 			(struct cds_ft_inode *) cn);
-		struct cds_ft_node *ext = rcu_dereference(cn_meta->external_nodes);
+		struct cds_ft_node *ext =
+			ft_dereference_external(cn_meta->external_nodes);
 
 		if (ext && !*skip_eq_external_nodes_p) {
 			*ret_node_p = ext;

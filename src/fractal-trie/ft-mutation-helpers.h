@@ -455,131 +455,48 @@ struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
  */
 static
 struct ft_ord_cell *ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len, struct ft_ord_cell *cell)
+		const uint8_t *key, size_t key_len, struct ft_ord_cell *cell,
+		bool from_root)
 {
 	struct cds_ft_iter *it = ft->ord_cell_scratch_iter;
 	struct cds_ft_node *pred_head;
 
 	/*
 	 * Write the search key into iter_key (set_key clears cache_valid/node and
-	 * sets key_len + key_off=0, path_len=0), then seed a live cursor AT the new
-	 * head on top: cache_valid + node + path_len==key_depth drive the
-	 * cross-call node-recovery fast path; prefix 0 = unscoped; ord_cell_node
-	 * cleared so a fall-back cell cursor re-resolves from node->prev.
+	 * sets key_len + key_off=0, path_len=0).
+	 *
+	 * @from_root false (the common live-structure splice): seed a live cursor
+	 * AT the new head on top: cache_valid + node + path_len==key_depth drive
+	 * the cross-call node-recovery fast path; prefix 0 = unscoped;
+	 * ord_cell_node cleared so a fall-back cell cursor re-resolves from
+	 * node->prev.
+	 *
+	 * @from_root true (split-compressed one-commit, the fresh cluster is
+	 * parked): the new head sits in an UNPUBLISHED cluster whose live old
+	 * child (cn->child) is re-parented only at the commit, so a from-head LT
+	 * would reanchor down through that not-yet-wired edge and mis-navigate.
+	 * Descend from the root instead -- the parked forward proxy resolves to
+	 * the OLD structure, where every existing key (hence the predecessor) is
+	 * reachable and consistent.  Costs one extra descent, on the split path
+	 * only.
 	 */
 	it->node = NULL;
 	if (cds_ft_iter_set_key(it, key, key_len) != CDS_FT_STATUS_OK)
 		return NULL;
-	it->node = cell->node;
-	it->cache_valid = true;
-	it->ord_cell_node = NULL;
-	it->prefix_len = 0;
-	it->path_len = it->key_len + 1;
+	if (!from_root) {
+		it->node = cell->node;
+		it->cache_valid = true;
+		it->ord_cell_node = NULL;
+		it->prefix_len = 0;
+		it->path_len = it->key_len + 1;
+	}
 	if (cds_ft_lookup_inequality_impl(ft, it, FT_LOOKUP_LT,
-			FT_LOOKUP_LIMIT_NONE, false, true) != CDS_FT_STATUS_OK)
+			FT_LOOKUP_LIMIT_NONE, false, !from_root) != CDS_FT_STATUS_OK)
 		return NULL;
 	pred_head = cds_ft_iter_node(it);
 	if (!pred_head)
 		return NULL;
 	return ft_ord_cell_ptr(rcu_dereference(pred_head->prev));
-}
-
-/*
- * Locate @cell's splice neighbours from its (parent-chain-wired) head and
- * pre-set the cell's own links -- invisible until the neighbour edges flip.
- * Shared by the legacy post-publish splice, the one-commit park and the
- * B-lite (external_nodes shape) pre-publish fill.
- */
-static
-void ft_ord_cell_prefill(struct cds_ft *ft, const uint8_t *key, size_t key_len,
-		struct ft_ord_cell *cell, struct ft_ord_cell **pred_out,
-		struct ft_ord_cell **succ_out)
-{
-	struct ft_ord_cell *pred, *succ;
-
-	pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell);
-	if (pred)
-		succ = ft_ord_cell_resolve_ord(&pred->ord_next);
-	else
-		/* New minimum: successor is the old list head (O(1), no descent). */
-		succ = ft_ord_cell_resolve_ord(&ft->ord_cell_head);
-	/* Pre-set @cell's own links; not yet reachable via the list. */
-	cell->ord_prev = pred;
-	cell->ord_next = succ;
-	*pred_out = pred;
-	*succ_out = succ;
-}
-
-/* Build the <= 4 visible neighbour edges for splicing @cell between
- * @pred / @succ.  Returns the edge count. */
-static
-unsigned int ft_ord_cell_splice_edges(struct cds_ft *ft,
-		struct ft_ord_cell *cell, struct ft_ord_cell *pred,
-		struct ft_ord_cell *succ, struct ft_ord_cell_edge *edges)
-{
-	unsigned int n = 0;
-
-	if (pred) {
-		edges[n].slot = &pred->ord_next;
-		edges[n].old_target = succ;
-		edges[n].new_target = cell;
-		n++;
-	}
-	if (succ) {
-		edges[n].slot = &succ->ord_prev;
-		edges[n].old_target = pred;
-		edges[n].new_target = cell;
-		n++;
-	}
-	/* New min (!pred) => head was @succ; new max (!succ) => tail was @pred. */
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, succ, cell, edges, n);
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, pred, cell, edges, n);
-	return n;
-}
-
-/*
- * As ft_ord_cell_prefill, but locates the neighbours by a relational descent
- * on the key (the new key is still absent).  For the shapes whose fresh head
- * attaches as a holder's external_nodes (prefix / NIL keys): the from-head
- * seed needs the holder relation, which is only wired by the attach itself.
- */
-static
-void ft_ord_cell_prefill_by_key(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, struct ft_ord_cell *cell,
-		struct ft_ord_cell **pred_out, struct ft_ord_cell **succ_out)
-{
-	struct ft_ord_cell *pred, *succ;
-
-	pred = ft_ord_cell_find_rel(ft, key, key_len, FT_LOOKUP_LT);
-	if (pred)
-		succ = ft_ord_cell_resolve_ord(&pred->ord_next);
-	else
-		succ = ft_ord_cell_resolve_ord(&ft->ord_cell_head);
-	cell->ord_prev = pred;
-	cell->ord_next = succ;
-	*pred_out = pred;
-	*succ_out = succ;
-}
-
-static
-void ft_ord_cell_splice_at(struct cds_ft *ft, struct ft_ord_cell *cell,
-		struct ft_ord_cell *pred, struct ft_ord_cell *succ)
-{
-	struct ft_ord_cell_edge edges[4];
-	unsigned int n;
-
-	n = ft_ord_cell_splice_edges(ft, cell, pred, succ, edges);
-	ft_ord_cell_flip(ft, edges, n);
-}
-
-static
-void ft_ord_cell_splice(struct cds_ft *ft, const uint8_t *key, size_t key_len,
-		struct ft_ord_cell *cell)
-{
-	struct ft_ord_cell *pred, *succ;
-
-	ft_ord_cell_prefill(ft, key, key_len, cell, &pred, &succ);
-	ft_ord_cell_splice_at(ft, cell, pred, succ);
 }
 
 /* Remove @cell from the ordered cell list (its key disappeared). */
@@ -627,6 +544,56 @@ void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 
 	new_cell->ord_prev = pred;
 	new_cell->ord_next = succ;
+	if (pred) {
+		edges[n].slot = &pred->ord_next;
+		edges[n].old_target = old_cell;
+		edges[n].new_target = new_cell;
+		n++;
+	}
+	if (succ) {
+		edges[n].slot = &succ->ord_prev;
+		edges[n].old_target = old_cell;
+		edges[n].new_target = new_cell;
+		n++;
+	}
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, old_cell, new_cell, edges, n);
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, old_cell, new_cell, edges, n);
+	ft_ord_cell_flip(ft, edges, n);
+}
+
+/*
+ * Replace: swap @new_cell into @old_cell's list slot AND publish the new head
+ * (@struct_new replaces @struct_old in @struct_slot) in ONE ft_ord_cell_flip, so
+ * the tree-head swap and the ordinal-cell swap commit atomically -- a reader
+ * observes the old head WITH its old cell, XOR the new head WITH its new cell,
+ * never a published new head whose cell links are not yet swapped.
+ *
+ * @struct_slot is the SINGLE reader-visible slot the descent reads to reach the
+ * head: external_nodes (internal chain), the child slot (plain external child),
+ * or the grandparent SKIP_X slot (a leaf reached through a suffix compressed
+ * node).  Readers resolve a parked proxy on all three (ft_dereference_external /
+ * the descent's ft_resolve_flip_proxy).  Non-reader-visible bookkeeping for the
+ * SKIP_X case (cn->child, node->parent) is set by the caller before the flip --
+ * the reanchor up-walk never reads cn->child, and node->parent is wired first.
+ */
+static
+void ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
+		struct ft_ord_cell *new_cell,
+		struct cds_ft_inode_flag **struct_slot,
+		struct cds_ft_inode_flag *struct_old,
+		struct cds_ft_inode_flag *struct_new)
+{
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->ord_prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->ord_next);
+	struct ft_ord_cell_edge edges[5];
+	unsigned int n = 0;
+
+	new_cell->ord_prev = pred;
+	new_cell->ord_next = succ;
+	edges[n].slot = (struct ft_ord_cell **) struct_slot;
+	edges[n].old_target = (struct ft_ord_cell *) struct_old;
+	edges[n].new_target = (struct ft_ord_cell *) struct_new;
+	n++;
 	if (pred) {
 		edges[n].slot = &pred->ord_next;
 		edges[n].old_target = old_cell;
