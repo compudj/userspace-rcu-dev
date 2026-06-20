@@ -817,24 +817,19 @@ int ft_detach_node(struct cds_ft *ft,
 		 * Recompaction publish (old_recompacted_node set => the holder
 		 * was rebuilt smaller; a NULL topmost_external_nodes => a pure
 		 * delete, no external-promote).  When fusion is requested, record
-		 * the publish's forward reader-visible edge and commit it in ONE
+		 * the publish's 1-2 reader-visible edges (forward slot + a
+		 * compressed grandparent's SKIP_X dual) and commit them in ONE
 		 * flip with @fuse_cell's unsplice -- the recompaction dual of the
 		 * in-place fusion above -- and signal it via pub->armed so the
-		 * caller skips the standalone unsplice.
-		 *
-		 * Gated to a PLAIN (non-compressed) grandparent: the forward slot
-		 * is then a body slot, which every reader resolves a flip proxy on
-		 * (the descent's ft_resolve_flip_proxy).  A COMPRESSED grandparent
-		 * publishes into cn->child, which several reader paths dereference
-		 * WITHOUT resolving a proxy -- fusing there needs those readers
-		 * hardened first; it stays two-commit for now.  Also direct for an
-		 * in-place redundant republish, external-promote, or list off.
+		 * caller skips the standalone unsplice.  A compressed grandparent
+		 * publishes into cn->child; every reader that descends a compressed
+		 * child now resolves a flip proxy there
+		 * (ft_cn_child_dereference_acquire_prefetch), so the parked forward
+		 * edge is safe.  Direct publish for an in-place redundant
+		 * republish, external-promote, or list off.
 		 */
 		if (fuse_cell && pub && !pub->armed &&
-		    old_recompacted_node && !topmost_external_nodes &&
-		    (!iter_meta->parent ||
-		     (!ft_node_compressed(iter_meta->parent) &&
-		      !ft_node_skip_compressed(iter_meta->parent)))) {
+		    old_recompacted_node && !topmost_external_nodes) {
 			struct ft_pub_rec rec = { .n = 0 };
 
 			_ft_publish_to_parent(ft, iter_meta->parent,

@@ -114,7 +114,7 @@ enum ft_descent_action ft_lookup_compressed(struct cds_ft_inode_flag **node_flag
 
 	/* Advance past the compressed path. */
 	key += cn->len;
-	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
 
 	*node_flag_p = node_flag;

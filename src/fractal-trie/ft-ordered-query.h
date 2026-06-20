@@ -62,7 +62,7 @@ enum ft_descent_action ft_count_prefix_compressed(
 		return FT_DESCENT_END;
 	}
 	*i_p = i + cn->len - 1;
-	*node_flag_p = ft_dereference_acquire_prefetch(cn->child);
+	*node_flag_p = ft_cn_child_dereference_acquire_prefetch(cn);
 	return FT_DESCENT_CONTINUE;
 }
 
@@ -193,7 +193,7 @@ enum ft_descent_action ft_lookup_nth_compressed(
 
 	ft_fill_compressed_path(cn, ordinal_key, level - 1);
 	level += cn->len - 1;
-	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
 	if (ft_node_external(node_flag)) {
 		*node_flag_p = node_flag;
@@ -414,13 +414,13 @@ enum ft_descent_action ft_lookup_nth_last_compressed(
 	unsigned long child_keys;
 
 	assert(cn->child != NULL);	/* compressed node always has a live child */
-	child_keys = ft_child_key_count(cn->child);
+	child_keys = ft_child_key_count(ft_resolve_flip_proxy(cn->child));
 
 	if (*remaining_p < child_keys) {
 		ft_fill_compressed_path(cn,
 			ordinal_key, level - 1);
 		level += cn->len - 1;
-		node_flag = ft_dereference_acquire_prefetch(cn->child);
+		node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 		assert(node_flag != NULL);	/* compressed node always has a live child */
 		if (ft_node_external(node_flag)) {
 			*node_flag_p = node_flag;
@@ -624,7 +624,7 @@ enum ft_descent_action ft_rebuild_path_compressed(
 		ordinal_key[i + j] = ord;
 	}
 	i += cn->len - 1;
-	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
 	*node_flag_p = node_flag;
 	*i_p = i;
@@ -717,7 +717,7 @@ enum ft_descent_action ft_skip_forward_compressed(
 		ordinal_key[level + j] = cn->key_bytes[j];
 	}
 	level += cn->len;
-	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
 	if (ft_node_external(node_flag)) {
 		*node_flag_p = node_flag;
@@ -808,14 +808,14 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 				int j;
 
 				assert(cn->child != NULL);	/* compressed node always has a live child */
-				ck = ft_child_key_count(cn->child);
+				ck = ft_child_key_count(ft_resolve_flip_proxy(cn->child));
 				if (remaining < ck) {
 					for (j = 0; j < cn->len; j++) {
 						ordinal_key[depth + j] =
 							cn->key_bytes[j];
 					}
 					level = depth + cn->len;
-					descend_from = cn->child;
+					descend_from = ft_resolve_flip_proxy(cn->child);
 					goto descend_forward;
 				}
 				remaining -= ck;
@@ -1131,7 +1131,7 @@ enum ft_descent_action ft_skip_reverse_compressed(
 	unsigned long ck;
 
 	assert(cn->child != NULL);	/* compressed node always has a live child */
-	ck = ft_child_key_count(cn->child);
+	ck = ft_child_key_count(ft_resolve_flip_proxy(cn->child));
 
 	if (*remaining_p < ck) {
 		int j;
@@ -1140,7 +1140,7 @@ enum ft_descent_action ft_skip_reverse_compressed(
 			ordinal_key[level + j] = cn->key_bytes[j];
 		}
 		level += cn->len;
-		node_flag = ft_dereference_acquire_prefetch(cn->child);
+		node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 		assert(node_flag != NULL);	/* compressed node always has a live child */
 		if (ft_node_external(node_flag)) {
 			*node_flag_p = node_flag;

@@ -947,6 +947,18 @@ void ft_maybe_prefetch_nta(const void *ptr)
 	ft_resolve_flip_proxy(rcu_dereference((ft)->root))
 
 /*
+ * cn->child dereference for read-side descents: like
+ * ft_dereference_acquire_prefetch(cn->child) but additionally resolves a
+ * flip-proxy that a key-disappearing remove's recompaction (or external
+ * promote) commit transiently installs at cn->child -- the forward edge it
+ * flips together with the ordered-cell unsplice.  EVERY reader that descends
+ * through a compressed node's child must resolve it; the common case (no such
+ * remove in flight) is a single predicted-not-taken mask-compare.
+ */
+#define ft_cn_child_dereference_acquire_prefetch(cn)			\
+	ft_resolve_flip_proxy(ft_dereference_acquire_prefetch((cn)->child))
+
+/*
  * Per-caller prefetch hint for ft_node_get_nth_skip / ft_node_get_nth
  * and the underlying scanners.  Compile-time constant at each call
  * site -- the branches inside ft_maybe_prefetch_hint fold away, leaving

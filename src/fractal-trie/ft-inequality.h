@@ -144,7 +144,7 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 				ordinal_key[level - 1 + j] = cn->key_bytes[j];
 		}
 		level += cn->len - 1;
-		node_flag = ft_dereference_acquire_prefetch(cn->child);
+		node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 		assert(node_flag != NULL);	/* compressed node always has a live child */
 		/*
 		 * The descent result at this position is cn->child -- the
@@ -172,7 +172,7 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 				for (k = cmp; k < cn->len; k++)
 					ordinal_key[level - 1 + k] = cn->key_bytes[k];
 			level += cn->len - 1;
-			node_flag = ft_dereference_acquire_prefetch(cn->child);
+			node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 			assert(node_flag != NULL);	/* compressed node always has a live child */
 			*skip_eq_external_nodes_p = false;
 			*node_flag_p = node_flag;
@@ -195,7 +195,7 @@ enum ft_descent_action ft_inequality_compressed(struct cds_ft_inode_flag **node_
 
 	/* Full match: advance past compressed path. */
 	level += cn->len - 1; /* -1: for loop increments */
-	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 	assert(node_flag != NULL);	/* compressed node always has a live child (by construction) */
 	if (ft_node_external(node_flag))
 		goto out_break;
@@ -267,7 +267,7 @@ enum ft_descent_action ft_inequality_minmax_compressed(
 	if (fill_ordinal)
 		ft_fill_compressed_path(cn, ordinal_key, level - 1);
 	level += cn->len - 1;
-	node_flag = ft_dereference_acquire_prefetch(cn->child);
+	node_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 	if (!node_flag) {
 		/*
 		 * Invariant violation: a reachable compressed node always
