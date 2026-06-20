@@ -686,6 +686,34 @@ void ft_remove_one_commit(struct cds_ft *ft,
 }
 
 /*
+ * Key-disappearing remove via recompaction: commit the recompacted node's
+ * 1-2 reader-visible structural stores -- recorded by ft_publish_to_parent
+ * into @rec (the forward parent slot, plus a compressed parent's SKIP_X dual
+ * pointer) -- ATOMICALLY with the dead head cell's ordered-list unsplice, in
+ * ONE flip.  Fusing the forward and skip-dual edges in a single flip also
+ * closes the candidate-before-exact ordering window the two-store publish
+ * relied on: a reader sees the whole old-XOR-new transition at once.
+ * @dead_cell may be NULL (list off): then only the recorded edges flip.
+ */
+static
+void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
+		struct ft_ord_cell *dead_cell)
+{
+	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 cell */
+	unsigned int n = 0, i;
+
+	for (i = 0; i < rec->n; i++) {
+		edges[n].slot = (struct ft_ord_cell **) rec->slot[i];
+		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
+		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
+		n++;
+	}
+	if (dead_cell)
+		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
+	ft_ord_cell_flip(ft, edges, n);
+}
+
+/*
  * Locate the ordered-list neighbours (@pred, @succ) that a run grafted at @key
  * will splice between.  MUST be called while @dst is still payload-free (before
  * the structural attach publishes the grafted subtree), else the relational

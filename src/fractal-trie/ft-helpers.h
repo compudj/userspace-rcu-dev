@@ -1711,12 +1711,32 @@ void ft_update_skip_pointer(struct cds_ft_inode_flag **parent_slot,
  *
  * Centralizes the dual-pointer RCU publication pattern so every
  * write to cn->child automatically maintains the skip pointer.
+ *
+ * When @rec is non-NULL, the (1-2) reader-visible stores -- the forward
+ * parent slot and a compressed parent's SKIP_X dual pointer -- are RECORDED
+ * into @rec instead of being performed, so a key-disappearing remove can
+ * commit them in one flip with the dead head cell's ordered-list unsplice
+ * (ft_detach_node).  All non-reader-visible bookkeeping (parent-slot offset,
+ * trace events) still runs.  The public ft_publish_to_parent wrapper passes
+ * NULL (direct stores, original behaviour).
  */
 static
-void ft_publish_to_parent(struct cds_ft *ft,
+void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
+		struct cds_ft_inode_flag *new_val)
+{
+	assert(rec->n < 2);
+	rec->slot[rec->n] = slot;
+	rec->old_val[rec->n] = *slot;
+	rec->new_val[rec->n] = new_val;
+	rec->n++;
+}
+
+static
+void _ft_publish_to_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
-		struct cds_ft_inode_flag *new_child)
+		struct cds_ft_inode_flag *new_child,
+		struct ft_pub_rec *rec)
 {
 	/*
 	 * Publication-ordering invariant: a child becomes observable by
@@ -1824,10 +1844,16 @@ void ft_publish_to_parent(struct cds_ft *ft,
 			struct cds_ft_inode_flag **skip_slot =
 				ft_get_parent_slot(cn_meta, ft);
 			if (skip_slot &&
-			    ft_node_skip_compressed(*skip_slot))
-				rcu_assign_pointer(*skip_slot,
-					ft_skip_compressed_flag(
-						new_child, cn->len));
+			    ft_node_skip_compressed(*skip_slot)) {
+				struct cds_ft_inode_flag *skip_new =
+					ft_skip_compressed_flag(new_child,
+						cn->len);
+
+				if (rec)
+					ft_pub_rec_add(rec, skip_slot, skip_new);
+				else
+					rcu_assign_pointer(*skip_slot, skip_new);
+			}
 		}
 #endif
 		/*
@@ -1858,7 +1884,20 @@ void ft_publish_to_parent(struct cds_ft *ft,
 	if (parent_slot == &ft->root)
 		FT_TP(root_publish, (const void *) ft,
 			(const void *) new_child);
-	rcu_assign_pointer(*parent_slot, new_child);
+	if (rec)
+		ft_pub_rec_add(rec, parent_slot, new_child);
+	else
+		rcu_assign_pointer(*parent_slot, new_child);
+}
+
+/* Direct publish (original behaviour): perform the stores immediately. */
+static
+void ft_publish_to_parent(struct cds_ft *ft,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **parent_slot,
+		struct cds_ft_inode_flag *new_child)
+{
+	_ft_publish_to_parent(ft, parent_nf, parent_slot, new_child, NULL);
 }
 
 /*

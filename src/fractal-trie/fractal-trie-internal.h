@@ -651,6 +651,25 @@ struct cds_ft_inode;
 struct cds_ft_alloc_arena;
 
 /*
+ * Recorder for ft_publish_to_parent's reader-visible edges.  When a
+ * key-disappearing remove recompacts a node, the rebuilt node must be
+ * published into its parent slot ATOMICALLY with the dead head cell's
+ * ordered-list unsplice (the remove dual of the insert splice window).  A
+ * non-NULL rec makes ft_publish_to_parent perform all of its non-reader-
+ * visible bookkeeping (parent-slot offset, trace events) but RECORD its 1-2
+ * reader-visible stores -- the forward parent slot, plus a compressed
+ * parent's SKIP_X dual pointer -- here instead of doing them, so the caller
+ * (ft_detach_node) can commit them in one flip with the cell edges.  At most
+ * two edges: forward slot + skip dual.
+ */
+struct ft_pub_rec {
+	struct cds_ft_inode_flag **slot[2];
+	struct cds_ft_inode_flag *old_val[2];
+	struct cds_ft_inode_flag *new_val[2];
+	unsigned int n;
+};
+
+/*
  * Struct layout (32 bytes, zero internal padding):
  *   offset  0: 8-byte parent pointer
  *   offset  8: 8-byte external_nodes pointer
