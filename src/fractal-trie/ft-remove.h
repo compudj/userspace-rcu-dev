@@ -600,17 +600,20 @@ int ft_detach_node(struct cds_ft *ft,
 			cur_depth, pub);
 		if (!ret) {
 			/*
-			 * In-place delete (the holder stayed above min_child, so
-			 * replace_ptr deferred its single forward NULL store into
-			 * @pub instead of doing it): commit that store fused with
-			 * @fuse_cell's ordered-list unsplice in ONE flip, then
-			 * settle the pigeon bitmap bit (a reader channel) after.
-			 * Recompaction (pub unarmed) published its rebuilt node
-			 * itself and stays two-commit -- the caller unsplices.
+			 * In-place key-disappearing remove (the holder stayed
+			 * above min_child, so replace_ptr deferred its single
+			 * reader-visible forward store into @pub instead of doing
+			 * it): commit that store -- @old_val -> @new_val (NULL for a
+			 * leaf delete, the promoted external chain head for an
+			 * external promote) -- fused with @fuse_cell's ordered-list
+			 * unsplice in ONE flip, then settle the pigeon bitmap bit (a
+			 * reader channel, delete only) after.  Recompaction (pub
+			 * unarmed) published its rebuilt node itself and stays
+			 * two-commit -- the caller unsplices.
 			 */
 			if (pub && pub->armed) {
 				ft_remove_one_commit(ft, pub->slot, pub->old_val,
-					NULL, fuse_cell);
+					pub->new_val, fuse_cell);
 				if (pub->pigeon_bitmap)
 					cds_clear_bit_relaxed(
 						pub->pigeon_bitmap->bitmap,

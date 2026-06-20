@@ -578,16 +578,23 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	dbg_printf("popcount replace ptr: node %p\n", node);
 	assert(*node_flag_ptr != NULL);
 	/*
-	 * In-place delete with fusion armed: DEFER the forward NULL store into
-	 * @pub so ft_detach_node commits it in one flip with the dead head
-	 * cell's unsplice.  nr_child-- still happens in place (reader-invisible
-	 * for navigation); ft_set_parent is a no-op for a NULL newptr.
+	 * Fusion armed: DEFER the forward store into @pub so ft_detach_node
+	 * commits it in one flip with the dead head cell's unsplice.  A delete
+	 * (NULL newptr) stores NULL and decrements nr_child in place
+	 * (reader-invisible for navigation); an external promote (non-NULL
+	 * newptr) replaces the child with the external chain head, so it wires
+	 * the promoted external's back-pointer first (parent-first) and leaves
+	 * nr_child unchanged.
 	 */
-	if (pub && !newptr) {
+	if (pub) {
+		if (newptr)
+			ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
 		pub->slot = node_flag_ptr;
 		pub->old_val = *node_flag_ptr;
+		pub->new_val = newptr;
 		pub->armed = true;
-		metadata->nr_child--;
+		if (!newptr)
+			metadata->nr_child--;
 		return 0;
 	}
 	/*
@@ -629,18 +636,26 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	dbg_printf("ft_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
 	assert(*node_flag_ptr != NULL);
 	/*
-	 * In-place delete with fusion armed: DEFER the forward NULL store into
-	 * @pub (committed in one flip with the dead head cell's unsplice).  The
-	 * bitmap bit-clear is a reader channel that must settle AFTER the flip,
-	 * so record it too; nr_child-- happens in place.  See popcount variant.
+	 * Fusion armed: DEFER the forward store into @pub (committed in one flip
+	 * with the dead head cell's unsplice).  A DELETE (NULL newptr) records
+	 * the bitmap bit-clear too -- a reader channel that must settle AFTER the
+	 * flip -- and decrements nr_child in place.  An external PROMOTE (non-NULL
+	 * newptr) wires the promoted external's back-pointer first (parent-first),
+	 * leaves the slot occupied (no bitmap change) and nr_child unchanged.  See
+	 * the popcount variant.
 	 */
-	if (pub && !newptr) {
+	if (pub) {
+		if (newptr)
+			ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
 		pub->slot = node_flag_ptr;
 		pub->old_val = *node_flag_ptr;
-		pub->pigeon_bitmap = cds_ft_item_to_bitmap(node, type->order);
-		pub->pigeon_bit = n;
+		pub->new_val = newptr;
 		pub->armed = true;
-		metadata->nr_child--;
+		if (!newptr) {
+			pub->pigeon_bitmap = cds_ft_item_to_bitmap(node, type->order);
+			pub->pigeon_bit = n;
+			metadata->nr_child--;
+		}
 		return 0;
 	}
 	/* Parent-first: wire the back-pointer before the forward publish,

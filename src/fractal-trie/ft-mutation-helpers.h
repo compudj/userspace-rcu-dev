@@ -239,22 +239,31 @@ struct ft_ord_cell_edge {
  * Deferred in-place leaf-delete publish (the remove dual of
  * ft_insert_commit).  When a leaf delete keeps the holder above min_child --
  * the common case, no recompaction -- its single reader-visible forward store
- * (the child slot -> NULL) is the moment the key leaves the structural index.
- * The popcount/pigeon replace_ptr RECORDS that store here instead of doing it,
- * so ft_detach_node can commit it in ONE flip together with the dead head
- * cell's ordered-list unsplice (ft_remove_one_commit): a reader then never
- * observes the key gone from one index but present in the other.
+ * is the moment the key leaves the structural index.  The popcount/pigeon
+ * replace_ptr RECORDS that store here (@slot transitions @old_val -> @new_val)
+ * instead of doing it, so ft_detach_node can commit it in ONE flip together
+ * with the dead head cell's ordered-list unsplice (ft_remove_one_commit): a
+ * reader then never observes the key gone from one index but present in the
+ * other.  Two store shapes share this:
+ *   - leaf delete: @new_val == NULL (the child slot clears to empty).
+ *   - external promote: a childless holder's external chain is promoted into
+ *     the parent slot, so @new_val == the external chain head (the same value
+ *     the immediate store would publish).  The promoted external's back-pointer
+ *     is wired (ft_set_parent) BEFORE the deferral, parent-first.
  *
  * @armed is set only on the in-place path; the recompaction (-EFBIG) path
  * publishes its rebuilt node itself and leaves this untouched.  nr_child-- is
- * applied IN PLACE by the primitive (writers and canonicalize read it; readers
- * do not navigate by it).  A pigeon node also clears its child bitmap bit, a
- * reader channel that must settle AFTER the flip: the primitive records it in
- * @pigeon_bitmap / @pigeon_bit and ft_detach_node clears it post-commit.
+ * applied IN PLACE by the primitive for a delete (writers and canonicalize read
+ * it; readers do not navigate by it); a promote replaces a child, so nr_child
+ * is unchanged.  A pigeon DELETE also clears its child bitmap bit, a reader
+ * channel that must settle AFTER the flip: the primitive records it in
+ * @pigeon_bitmap / @pigeon_bit and ft_detach_node clears it post-commit (a
+ * promote leaves the slot occupied, so no bitmap change).
  */
 struct ft_remove_pub {
 	struct cds_ft_inode_flag **slot;
 	struct cds_ft_inode_flag *old_val;
+	struct cds_ft_inode_flag *new_val;	/* NULL for delete; chain head for promote */
 	struct cds_ft_bitmap *pigeon_bitmap;	/* non-NULL => clear bit post-flip */
 	uint8_t pigeon_bit;
 	bool armed;
