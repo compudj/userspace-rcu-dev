@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	31
+#define NR_TESTS	33
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -1562,11 +1562,18 @@ static void *inv_remove_xview_drainer(void *arg)
 	return NULL;
 }
 
+/* Cross-view oracle pool sizes.  Overridable at build time (-D...) to run a
+ * small, fast variant -- e.g. under FEATURE_FT_VERIFY_AT_MUTATION, whose
+ * per-mutation full-trie verify makes the default sizes O(n^2)-slow. */
+#ifndef REMOVE_XVIEW_POOL
 #define REMOVE_XVIEW_POOL	100000
+#endif
 /* Sparse-pair pool: pairs (k*256, k*256+1) sharing a 3-byte prefix, so each pair
  * sits under its own branch that canonicalizes to a compressed holder as it
  * drains -- exercises the compressed-parent detach publish.  Keys stay < 16 MiB. */
+#ifndef REMOVE_XVIEW_PAIRS
 #define REMOVE_XVIEW_PAIRS	40000
+#endif
 
 /* Shared driver: @ft is pre-populated; spin up the cross-view @reader_fn threads
  * + the @drainer_fn, run to drain or timeout. */
@@ -1820,7 +1827,9 @@ static void *inv_remove_xview_drainer_max(void *arg)
 	return NULL;
 }
 
+#ifndef REMOVE_XVIEW_GROUPS
 #define REMOVE_XVIEW_GROUPS	20000
+#endif
 
 static int inv_remove_cross_view_compressed_parent(void)
 {
@@ -1849,6 +1858,220 @@ static int inv_remove_cross_view_compressed_parent(void)
 	return run_remove_cross_view(ft, group,
 		"inv_remove_cross_view_compressed_parent",
 		inv_remove_xview_reader_max, inv_remove_xview_drainer_max);
+}
+
+/*
+ * MIN-draining variant for the PREFIX-WITH-SIBLINGS removal shape, which the
+ * other oracles cannot reach: removing a prefix key whose holder KEEPS sibling
+ * children (its longer-key extensions).  A prefix sorts BEFORE its extensions,
+ * so MIN-draining removes the prefix Kp FIRST -- while its extension Kl still
+ * hangs off the same internal holder -- and Kp IS the current ordered minimum,
+ * so a lookup_first-based reader observes the present/absent/present window if
+ * the external_nodes clear and the cell unsplice are not one flip.  (Max-
+ * draining instead removes Kl first, promoting Kp to a leaf, so it never sees
+ * Kp as a prefix-with-siblings.)  Same variable-length prefix/extension keys as
+ * inv_remove_cross_view_compressed_parent: Kp(g)=[g_hi,g_lo,0,0] (4 B) and its
+ * extension Kl(g)=[g_hi,g_lo,0,0,0] (5 B).
+ */
+static void *inv_remove_xview_reader_minvl(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft_node *n1, *n2;
+		uint8_t k1[8], k2[8];
+		size_t l1, l2;
+		bool found;
+
+		rcu_read_lock();
+		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+		    (n1 = cds_ft_iter_node(iter)) != NULL) {
+			l1 = xview_node_key(n1, k1);
+			/* Structural point lookup of the ordered minimum. */
+			cds_ft_iter_set_key(iter, k1, l1);
+			found = cds_ft_lookup(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+				cds_ft_iter_node(iter) != NULL;
+			/* Re-confirm the ordered minimum is still the same key. */
+			if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+			    (n2 = cds_ft_iter_node(iter)) != NULL) {
+				l2 = xview_node_key(n2, k2);
+				if (l1 == l2 && memcmp(k1, k2, l1) == 0 && !found)
+					report_violation(ctx->test_name,
+						"ordered-min key (len %zu) present,"
+						" absent, present -- prefix-with-siblings"
+						" removal raced ahead of list unsplice",
+						l1);
+			}
+		}
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/* Min-draining via cds_ft_remove: exercises the cds_ft_remove is_prefix path. */
+static void *inv_remove_xview_drainer_minvl(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft_node *node;
+		uint8_t k[8];
+		size_t l;
+
+		rcu_read_lock();
+		pthread_mutex_lock(&ctx->lock);
+		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+		    (node = cds_ft_iter_node(iter)) != NULL) {
+			l = xview_node_key(node, k);
+			cds_ft_iter_set_key(iter, k, l);
+			if (cds_ft_lookup(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+			    (node = cds_ft_iter_node(iter)) != NULL &&
+			    cds_ft_remove(ctx->ft, iter, node) == CDS_FT_STATUS_OK)
+				node_free_rcu(to_test_node(node));
+		} else {
+			/* Trie drained. */
+			__atomic_store_n(&test_drained, 1, __ATOMIC_RELAXED);
+			pthread_mutex_unlock(&ctx->lock);
+			rcu_read_unlock();
+			break;
+		}
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * Min-draining via cds_ft_remove_all: exercises the cds_ft_remove_all is_prefix
+ * path AND, for the empty (NIL) key, the cds_ft_remove_all key_len==0 path --
+ * both of which clear an internal holder's external_nodes.  The empty key is
+ * the global minimum (a prefix of every key), so it drains first.
+ */
+static void *inv_remove_xview_drainer_minvl_all(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft_node *node, *removed;
+		uint8_t k[8];
+		size_t l;
+
+		rcu_read_lock();
+		pthread_mutex_lock(&ctx->lock);
+		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+		    (node = cds_ft_iter_node(iter)) != NULL) {
+			l = xview_node_key(node, k);
+			cds_ft_iter_set_key(iter, k, l);
+			if (cds_ft_lookup(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+			    cds_ft_iter_node(iter) != NULL &&
+			    cds_ft_remove_all(ctx->ft, iter, &removed) ==
+				    CDS_FT_STATUS_OK && removed != NULL)
+				node_free_rcu(to_test_node(removed));
+		} else {
+			/* Trie drained. */
+			__atomic_store_n(&test_drained, 1, __ATOMIC_RELAXED);
+			pthread_mutex_unlock(&ctx->lock);
+			rcu_read_unlock();
+			break;
+		}
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/* Build @ft with the varlen prefix/extension pairs (Kp 4 B, Kl 5 B). */
+static void prefix_siblings_populate(struct cds_ft *ft)
+{
+	unsigned int g;
+
+	for (g = 0; g < REMOVE_XVIEW_GROUPS; g++) {
+		uint8_t kp[4] = { (uint8_t)(g >> 8), (uint8_t)(g & 0xff), 0, 0 };
+		uint8_t kl[5] = { (uint8_t)(g >> 8), (uint8_t)(g & 0xff), 0, 0, 0 };
+		struct ft_test_node *np = node_alloc(g);
+		struct ft_test_node *nl = node_alloc(g);
+
+		np->value = 4;
+		memcpy(np->okey, kp, 4);
+		nl->value = 5;
+		memcpy(nl->okey, kl, 5);
+		if (cds_ft_insert(ft, kp, 4, &np->node) != CDS_FT_STATUS_OK)
+			abort();
+		if (cds_ft_insert(ft, kl, 5, &nl->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+}
+
+static int inv_remove_cross_view_prefix_siblings(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft(&group);
+
+	rcu_read_lock();
+	prefix_siblings_populate(ft);
+	rcu_read_unlock();
+
+	return run_remove_cross_view(ft, group,
+		"inv_remove_cross_view_prefix_siblings",
+		inv_remove_xview_reader_minvl, inv_remove_xview_drainer_minvl);
+}
+
+/*
+ * Same prefix-with-siblings invariant, drained via cds_ft_remove_all and with
+ * the empty (NIL) key added so the remove_all key_len==0 clear is exercised too.
+ */
+static int inv_remove_cross_view_prefix_siblings_all(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft(&group);
+	struct ft_test_node *ne = node_alloc(0);
+
+	rcu_read_lock();
+	ne->value = 0;			/* empty key: length 0, okey unused. */
+	if (cds_ft_insert(ft, ne->okey, 0, &ne->node) != CDS_FT_STATUS_OK)
+		abort();
+	prefix_siblings_populate(ft);
+	rcu_read_unlock();
+
+	return run_remove_cross_view(ft, group,
+		"inv_remove_cross_view_prefix_siblings_all",
+		inv_remove_xview_reader_minvl, inv_remove_xview_drainer_minvl_all);
 }
 
 /* ================================================================== */
@@ -6759,10 +6982,17 @@ int main(int argc, char **argv)
 	 * inv_remove_cross_view_compressed_parent is max-draining (a prefix key
 	 * sorts before its extensions, so only max-draining puts the
 	 * compressed-parent promote removal on the observed ordered endpoint).
+	 * inv_remove_cross_view_prefix_siblings{,_all} are min-draining over
+	 * variable-length prefix/extension keys, so the prefix key is removed
+	 * while its sibling extensions persist (the holder's external_nodes is
+	 * cleared in place): the _all variant drains via cds_ft_remove_all and
+	 * adds the empty key to cover the NIL-key clear too.
 	 */
 	RUN_TEST(inv_remove_cross_view);
 	RUN_TEST(inv_remove_cross_view_compressed);
 	RUN_TEST(inv_remove_cross_view_compressed_parent);
+	RUN_TEST(inv_remove_cross_view_prefix_siblings);
+	RUN_TEST(inv_remove_cross_view_prefix_siblings_all);
 
 	diag("3. Duplicate chain acyclicity");
 	RUN_TEST(inv_dup_chain_acyclicity);
