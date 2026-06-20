@@ -143,6 +143,32 @@ int ft_visited_add(struct ft_visited_set *vs, void *key)
 	return 1;
 }
 
+/*
+ * Flip-proxy-at-rest check.  cds_ft_verify runs under writer exclusion
+ * (FEATURE_FT_VERIFY_AT_MUTATION calls it after the writer's mutation
+ * completes), and a urcu flip parks a type-7 proxy in a slot only
+ * transiently -- between its park and its settle, inside a single mutator.
+ * So once the writer is between operations, NO reachable slot may hold a
+ * flip proxy: one found here is a fused flip that left a slot UNSETTLED
+ * (the "frozen-stale" slot that dangles after its batch is reclaimed).
+ * Reports the exact slot deterministically, single-threaded, with no
+ * trace-window dependence -- the recommended way to localize a remove /
+ * splice fusion bug.
+ */
+static
+int ft_verify_no_proxy_at_rest(FILE *out, const char *what,
+		struct cds_ft_inode_flag *val,
+		struct cds_ft_inode_flag *node_flag, unsigned int depth)
+{
+	if (caa_unlikely(ft_node_flip_proxy(val))) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: %s at node %p holds a flip proxy AT REST (%p) -- a fused flip left this slot unsettled\n",
+				depth, what, (void *) node_flag, (void *) val);
+		return -1;
+	}
+	return 0;
+}
+
 /* Forward declaration so the per-kind helpers below can recurse. */
 static
 int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
@@ -467,6 +493,9 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 			struct cds_ft_inode_flag *slot_val = *skip_slot;
 			struct cds_ft_compressed_node *target_cn = NULL;
 
+			if (ft_verify_no_proxy_at_rest(out, "compressed skip_slot",
+					slot_val, node_flag, depth))
+				return -1;
 			if (ft_node_skip_compressed(slot_val))
 				target_cn = ft_skip_to_compressed(ft, slot_val);
 			else if (slot_val &&
@@ -490,6 +519,9 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	if (path)
 		memcpy(path + depth, cn->key_bytes, cn->len);
 	/* Recurse into the child. */
+	if (ft_verify_no_proxy_at_rest(out, "compressed cn->child", cn->child,
+			node_flag, depth))
+		return -1;
 	if (cn->child) {
 		if (ft_node_external(cn->child)) {
 			/* External leaf chain at end of compressed path. */
@@ -671,6 +703,10 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			}
 		}
 		/* Count external nodes attached to this node's metadata. */
+		if (ft_verify_no_proxy_at_rest(out, "external_nodes",
+				(struct cds_ft_inode_flag *) external_nodes,
+				node_flag, depth))
+			return -1;
 		if (external_nodes) {
 			if (ft_verify_external_chain(ft, out, visited, path,
 					node_flag, external_nodes, depth))
@@ -686,6 +722,9 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 
 			if (!child_raw)
 				continue;
+			if (ft_verify_no_proxy_at_rest(out, "child slot",
+					child_raw, node_flag, depth))
+				return -1;
 			/*
 			 * Raw slot may be skip-encoded; verify the encoded
 			 * slen matches the underlying compressed's cn->len
@@ -975,6 +1014,8 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	uint8_t *path = NULL;
 	int ret;
 
+	if (ft_verify_no_proxy_at_rest(out, "root", root, NULL, 0))
+		return CDS_FT_STATUS_INTEGRITY_ERROR;
 	if (ft_visited_init(&visited)) {
 		if (out)
 			fprintf(out, "ft_verify: visited-set allocation failed\n");
