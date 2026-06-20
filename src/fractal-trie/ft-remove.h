@@ -28,6 +28,15 @@
  * @detach_node_flag_ptr: slot in parent pointing to the detached node.
  * @detach_parent_flag_ptr: slot in grandparent pointing to the parent.
  * @detach_depth: trie depth of the detached node.
+ * @fuse_cell: when a key-disappearing remove has the ordered list on, the
+ *   dead head's ord cell to unsplice ATOMICALLY with the structural unlink;
+ *   NULL otherwise (move/merge callers, or list off).
+ * @pub: armed by the in-place (no-recompaction) leaf delete so the forward
+ *   NULL store is deferred and committed in one flip with @fuse_cell's
+ *   unsplice (ft_remove_one_commit).  On return, @pub->armed tells the caller
+ *   whether the unsplice was fused here (true) or must be done separately
+ *   (false: recompaction or compressed-parent shape, still two-commit).  Both
+ *   NULL for non-fusing callers.
  */
 
 /*
@@ -243,7 +252,9 @@ int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **detach_node_flag_ptr,
 		struct cds_ft_inode_flag **detach_parent_flag_ptr,
 		unsigned int detach_depth,
-		bool free_detached_subtree)
+		bool free_detached_subtree,
+		struct ft_ord_cell *fuse_cell,
+		struct ft_remove_pub *pub)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
@@ -564,8 +575,25 @@ int ft_detach_node(struct cds_ft *ft,
 			metadata_stack[nr_branch - 1],
 			n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 			detach_parent_flag_ptr == &ft->root,
-			cur_depth);
+			cur_depth, pub);
 		if (!ret) {
+			/*
+			 * In-place delete (the holder stayed above min_child, so
+			 * replace_ptr deferred its single forward NULL store into
+			 * @pub instead of doing it): commit that store fused with
+			 * @fuse_cell's ordered-list unsplice in ONE flip, then
+			 * settle the pigeon bitmap bit (a reader channel) after.
+			 * Recompaction (pub unarmed) published its rebuilt node
+			 * itself and stays two-commit -- the caller unsplices.
+			 */
+			if (pub && pub->armed) {
+				ft_remove_one_commit(ft, pub->slot, pub->old_val,
+					NULL, fuse_cell);
+				if (pub->pigeon_bitmap)
+					cds_clear_bit_relaxed(
+						pub->pigeon_bitmap->bitmap,
+						pub->pigeon_bit);
+			}
 			/*
 			 * Free the old detach subtree.  After
 			 * ft_node_replace_ptr replaced it, the entire
@@ -984,6 +1012,16 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	struct ft_ord_cell *dead_cell = cell_was_head ?
 		ft_ord_cell_ptr(node->prev) : NULL;
 	struct cds_ft_node *cell_succ = cell_was_head ? ft_node_next(node) : NULL;
+	/*
+	 * Key-disappearing detach (head with no successor) + ordered list on:
+	 * fuse the structural unlink with @dead_cell's unsplice in one flip.
+	 * @pub.armed reports whether ft_detach_node fused it (in-place leaf
+	 * delete) or left it for the two-commit fallback below.
+	 */
+	bool fuse_remove = cell_was_head && !cell_succ;
+	struct ft_remove_pub pub = { .armed = false };
+	struct ft_remove_pub *pubp = fuse_remove ? &pub : NULL;
+	struct ft_ord_cell *fuse_cell = fuse_remove ? dead_cell : NULL;
 
 	if (ft_node_external(holder_flag)) {
 		/*
@@ -1025,7 +1063,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true);
+				key_len, true, fuse_cell, pubp);
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
 			else
@@ -1106,7 +1144,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true);
+				key_len, true, fuse_cell, pubp);
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
 			else
@@ -1123,10 +1161,13 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * from the ordered list (when enabled) and freed (deferred, for parked
 	 * up-walkers).  A promotion (cell_succ) keeps the cell in place -- same
 	 * key, only cell->node retargeted in ft_unchain_node -- so no list op.
+	 * An in-place leaf detach already fused the unsplice into its structural
+	 * flip (pub.armed); only the deferred cell free remains here.
 	 */
-	if (ret == 0 && cell_was_head && !cell_succ) {
+	if (ret == 0 && fuse_remove) {
 		/* cell_was_head implies ordered_list, so the list op always runs. */
-		ft_ord_cell_unsplice(ft, dead_cell);
+		if (!pub.armed)
+			ft_ord_cell_unsplice(ft, dead_cell);
 		ft_ord_cell_free(ft, dead_cell);
 	}
 
@@ -1304,6 +1345,16 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	holder_meta = cds_ft_item_to_metadata(ft_node_ptr(holder_flag));
 	*result_node = chain_head;
 
+	/*
+	 * Ordered list on: the whole key leaves the trie, so its head's cell is
+	 * unspliced + freed below.  An in-place leaf detach fuses that unsplice
+	 * into its structural flip (pub.armed); the prefix and recompaction /
+	 * compressed-parent shapes stay two-commit (pub unarmed).
+	 */
+	struct ft_remove_pub pub = { .armed = false };
+	struct ft_ord_cell *dead_cell = ft->ordered_list ?
+		ft_ord_cell_ptr(chain_head->prev) : NULL;
+
 	if (is_prefix) {
 		/*
 		 * Prefix key: the chain hangs off the internal holder's
@@ -1348,7 +1399,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 */
 		ft_propagate_external_count_parent(ft, holder_flag, -1);
 		ret = ft_detach_node(ft, head_slot,
-			ft_get_parent_slot(holder_meta, ft), key_len, true);
+			ft_get_parent_slot(holder_meta, ft), key_len, true,
+			dead_cell, ft->ordered_list ? &pub : NULL);
 		if (ret)
 			ft_propagate_external_count_parent(ft, holder_flag, 1);
 		else
@@ -1363,13 +1415,14 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 
 	/* Ordered list on: the whole key left the trie: its head's cell is
 	 * unspliced and freed (deferred).  chain_head->prev still carries the cell
-	 * (detach reshapes ancestors and head_slot, not the head's prev).  List
-	 * off: chain_head->prev is the flagged parent, no cell. */
+	 * (detach reshapes ancestors and head_slot, not the head's prev).  An
+	 * in-place leaf detach already fused the unsplice (pub.armed); only the
+	 * deferred free remains.  List off: chain_head->prev is the flagged
+	 * parent, no cell. */
 	if (ret == 0 && ft->ordered_list) {
-		struct ft_ord_cell *dead = ft_ord_cell_ptr(chain_head->prev);
-
-		ft_ord_cell_unsplice(ft, dead);
-		ft_ord_cell_free(ft, dead);
+		if (!pub.armed)
+			ft_ord_cell_unsplice(ft, dead_cell);
+		ft_ord_cell_free(ft, dead_cell);
 	}
 
 	iter->cache_valid = false;

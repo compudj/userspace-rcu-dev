@@ -563,7 +563,8 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
-		struct cds_ft_inode_flag *newptr)
+		struct cds_ft_inode_flag *newptr,
+		struct ft_remove_pub *pub)
 {
 	assert(ft_type_is_popcount(type->type_class));
 	assert(ft_popcount_node_get_nr_child(type, node) <= type->max_child);
@@ -576,6 +577,19 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	}
 	dbg_printf("popcount replace ptr: node %p\n", node);
 	assert(*node_flag_ptr != NULL);
+	/*
+	 * In-place delete with fusion armed: DEFER the forward NULL store into
+	 * @pub so ft_detach_node commits it in one flip with the dead head
+	 * cell's unsplice.  nr_child-- still happens in place (reader-invisible
+	 * for navigation); ft_set_parent is a no-op for a NULL newptr.
+	 */
+	if (pub && !newptr) {
+		pub->slot = node_flag_ptr;
+		pub->old_val = *node_flag_ptr;
+		pub->armed = true;
+		metadata->nr_child--;
+		return 0;
+	}
 	/*
 	 * Parent-first: wire the replacement's back-pointer before the
 	 * forward publish (a reader descending here then walking back up must
@@ -602,7 +616,8 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		uint8_t n __attribute__((unused)),
-		struct cds_ft_inode_flag *newptr)
+		struct cds_ft_inode_flag *newptr,
+		struct ft_remove_pub *pub)
 {
 	assert(ft_type_is_pigeon(type->type_class));
 
@@ -613,6 +628,21 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	}
 	dbg_printf("ft_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
 	assert(*node_flag_ptr != NULL);
+	/*
+	 * In-place delete with fusion armed: DEFER the forward NULL store into
+	 * @pub (committed in one flip with the dead head cell's unsplice).  The
+	 * bitmap bit-clear is a reader channel that must settle AFTER the flip,
+	 * so record it too; nr_child-- happens in place.  See popcount variant.
+	 */
+	if (pub && !newptr) {
+		pub->slot = node_flag_ptr;
+		pub->old_val = *node_flag_ptr;
+		pub->pigeon_bitmap = cds_ft_item_to_bitmap(node, type->order);
+		pub->pigeon_bit = n;
+		pub->armed = true;
+		metadata->nr_child--;
+		return 0;
+	}
 	/* Parent-first: wire the back-pointer before the forward publish,
 	 * past the -EFBIG recompaction check (see popcount variant). */
 	ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
@@ -637,16 +667,17 @@ int _ft_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
-		uint8_t n, struct cds_ft_inode_flag *newptr)
+		uint8_t n, struct cds_ft_inode_flag *newptr,
+		struct ft_remove_pub *pub)
 {
 	int ret;
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
-		ret = ft_popcount_node_replace_ptr(ft, type, node, node_flag, metadata, node_flag_ptr, newptr);
+		ret = ft_popcount_node_replace_ptr(ft, type, node, node_flag, metadata, node_flag_ptr, newptr, pub);
 		break;
 	case FT_PIGEON:
-		ret = ft_pigeon_node_replace_ptr(ft, type, node, node_flag, metadata, node_flag_ptr, n, newptr);
+		ret = ft_pigeon_node_replace_ptr(ft, type, node, node_flag, metadata, node_flag_ptr, n, newptr, pub);
 		break;
 	case FT_NULL:
 		return -ENOENT;
@@ -1160,7 +1191,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		uint8_t n,
 		struct cds_ft_inode_flag *newptr,
 		bool is_root,
-		unsigned int node_depth)
+		unsigned int node_depth,
+		struct ft_remove_pub *pub)
 {
 	int ret;
 	unsigned int type_index;
@@ -1173,7 +1205,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	node = ft_node_ptr(*parent_node_flag_ptr);
 	type_index = ft_node_type(*parent_node_flag_ptr);
 	type = &ft_types[type_index];
-	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr);
+	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr, pub);
 	if (ret == -EFBIG) {
 		assert(!newptr);
 		/* Should try recompaction. */

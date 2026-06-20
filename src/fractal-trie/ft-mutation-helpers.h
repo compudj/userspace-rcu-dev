@@ -235,6 +235,31 @@ struct ft_ord_cell_edge {
 	struct ft_ord_cell *new_target;
 };
 
+/*
+ * Deferred in-place leaf-delete publish (the remove dual of
+ * ft_insert_commit).  When a leaf delete keeps the holder above min_child --
+ * the common case, no recompaction -- its single reader-visible forward store
+ * (the child slot -> NULL) is the moment the key leaves the structural index.
+ * The popcount/pigeon replace_ptr RECORDS that store here instead of doing it,
+ * so ft_detach_node can commit it in ONE flip together with the dead head
+ * cell's ordered-list unsplice (ft_remove_one_commit): a reader then never
+ * observes the key gone from one index but present in the other.
+ *
+ * @armed is set only on the in-place path; the recompaction (-EFBIG) path
+ * publishes its rebuilt node itself and leaves this untouched.  nr_child-- is
+ * applied IN PLACE by the primitive (writers and canonicalize read it; readers
+ * do not navigate by it).  A pigeon node also clears its child bitmap bit, a
+ * reader channel that must settle AFTER the flip: the primitive records it in
+ * @pigeon_bitmap / @pigeon_bit and ft_detach_node clears it post-commit.
+ */
+struct ft_remove_pub {
+	struct cds_ft_inode_flag **slot;
+	struct cds_ft_inode_flag *old_val;
+	struct cds_ft_bitmap *pigeon_bitmap;	/* non-NULL => clear bit post-flip */
+	uint8_t pigeon_bit;
+	bool armed;
+};
+
 static void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		unsigned int n);
 
@@ -499,14 +524,21 @@ struct ft_ord_cell *ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
 	return ft_ord_cell_ptr(rcu_dereference(pred_head->prev));
 }
 
-/* Remove @cell from the ordered cell list (its key disappeared). */
+/*
+ * Append @cell's ordered-list unsplice edges (its <=2 neighbour back-edges plus
+ * any head/tail endpoint repair) to @edges, returning the new count.  @cell
+ * keeps its own links for parked readers until its deferred free.  Split out so
+ * a key-disappearing remove can fuse these edges with its structural unlink in
+ * a single flip (ft_remove_one_commit); ft_ord_cell_unsplice is the standalone
+ * (two-commit) wrapper.
+ */
 static
-void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell)
+unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
+		struct ft_ord_cell *cell, struct ft_ord_cell_edge *edges,
+		unsigned int n)
 {
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&cell->ord_prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&cell->ord_next);
-	struct ft_ord_cell_edge edges[4];
-	unsigned int n = 0;
 
 	if (pred) {
 		edges[n].slot = &pred->ord_next;
@@ -522,7 +554,16 @@ void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell)
 	}
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, cell, succ, edges, n);
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, cell, pred, edges, n);
-	/* @cell keeps its links for parked readers until its deferred free. */
+	return n;
+}
+
+/* Remove @cell from the ordered cell list (its key disappeared). */
+static
+void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell)
+{
+	struct ft_ord_cell_edge edges[4];
+	unsigned int n = ft_ord_cell_unsplice_edges(ft, cell, edges, 0);
+
 	ft_ord_cell_flip(ft, edges, n);
 }
 
@@ -608,6 +649,39 @@ void ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	}
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, old_cell, new_cell, edges, n);
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, old_cell, new_cell, edges, n);
+	ft_ord_cell_flip(ft, edges, n);
+}
+
+/*
+ * Key-disappearing remove, fused (the dual of ft_ord_cell_swap_publish): commit
+ * a key's single reader-visible structural unlink (@struct_slot transitions from
+ * @struct_old to @struct_new -- a leaf body slot or compressed cn->child cleared
+ * to NULL, or an internal holder's external_nodes cleared) ATOMICALLY with the
+ * dead head cell's ordered-list unsplice, in ONE flip.  A reader thus never
+ * observes the key gone from the structural index but still present in the
+ * ordered list (or vice versa).  @dead_cell may be NULL (ordered list off): then
+ * only the structural edge flips.
+ *
+ * @struct_slot must be the SOLE reader-visible slot whose change removes the
+ * key; shapes that touch a second reader-visible slot (a compressed parent's
+ * SKIP_X dual pointer, a recompacted node's grandparent edge) do NOT use this.
+ */
+static
+void ft_remove_one_commit(struct cds_ft *ft,
+		struct cds_ft_inode_flag **struct_slot,
+		struct cds_ft_inode_flag *struct_old,
+		struct cds_ft_inode_flag *struct_new,
+		struct ft_ord_cell *dead_cell)
+{
+	struct ft_ord_cell_edge edges[5];
+	unsigned int n = 0;
+
+	edges[n].slot = (struct ft_ord_cell **) struct_slot;
+	edges[n].old_target = (struct ft_ord_cell *) struct_old;
+	edges[n].new_target = (struct ft_ord_cell *) struct_new;
+	n++;
+	if (dead_cell)
+		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
 }
 

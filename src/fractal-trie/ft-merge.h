@@ -937,7 +937,7 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 	 * which would free the target -- stays gated off for move-style.
 	 */
 	ret = ft_detach_node(src_ft, d.nfp, d.pnfp, d.depth,
-			/*free_detached_subtree=*/ false);
+			/*free_detached_subtree=*/ false, NULL, NULL);
 	if (ret < 0) {
 		/* Recompaction OOM: undo the propagation; src is pristine. */
 		ft_propagate_external_count_parent(src_ft, d.pnf,

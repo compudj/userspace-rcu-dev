@@ -292,7 +292,8 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 							 d.nfp,
 							 d.pnfp,
 							 d.depth,
-							 false);
+							 false,
+							 NULL, NULL);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*
