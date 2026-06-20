@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	28
+#define NR_TESTS	31
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -351,6 +351,7 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
 /* ------------------------------------------------------------------ */
 
 static volatile int test_go, test_stop;
+static volatile int test_drained;	/* inv_remove_cross_view: pool emptied */
 
 static unsigned long long elapsed_ms(struct timespec *start)
 {
@@ -1445,6 +1446,409 @@ static int inv_insert_replace_splice_window(void)
 		return -1;
 	}
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * INVARIANT: a key's removal is atomic across the structural index and the
+ * ordered cell list -- there is no instant at which a key is reachable via one
+ * but not the other.
+ *
+ * Workload: a single drainer removes the ordered minimum monotonically with NO
+ * concurrent inserts (the pool only shrinks).  In one RCU critical section a
+ * reader runs three queries:
+ *   1) lookup_first    -> ordered-list minimum  (key k1)
+ *   2) point lookup(k1) -> structural descent    (found?)
+ *   3) lookup_first    -> ordered-list minimum  (key k2)
+ * If k1 == k2 (the same key is the ordered minimum before AND after) yet the
+ * structural lookup did NOT find it, that key is in the ordered list but absent
+ * from the structural index -- which can only happen if cds_ft_remove published
+ * the top child-pointer removal before the ordered-list unsplice (a non-atomic
+ * unpublish).  Because no inserts run, "present again" cannot be a legitimate
+ * re-add.  Comparison is key-based, not by node pointer: a freed node's address
+ * can be recycled by a later allocation (ABA).
+ */
+static void *inv_remove_xview_reader(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft_node *n1, *n2;
+		uint64_t k1, k2;
+		uint8_t kb[8];
+		bool found;
+
+		rcu_read_lock();
+		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+		    (n1 = cds_ft_iter_node(iter)) != NULL) {
+			k1 = to_test_node(n1)->key;
+			/* Structural point lookup of the ordered minimum. */
+			cds_ft_u64_to_key(ctx->ft, k1, kb, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, kb, CDS_FT_LEN_DEFAULT);
+			found = cds_ft_lookup(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+				cds_ft_iter_node(iter) != NULL;
+			/* Re-confirm the ordered minimum is still the same key. */
+			if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+			    (n2 = cds_ft_iter_node(iter)) != NULL) {
+				k2 = to_test_node(n2)->key;
+				if (k1 == k2 && !found)
+					report_violation(ctx->test_name,
+						"ordered-min key %" PRIu64
+						" present, absent, present -- structural"
+						" removal raced ahead of list unsplice",
+						k1);
+			}
+		}
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_remove_xview_drainer(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft_node *node;
+		uint64_t k;
+		uint8_t kb[8];
+
+		rcu_read_lock();
+		pthread_mutex_lock(&ctx->lock);
+		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+		    (node = cds_ft_iter_node(iter)) != NULL &&
+		    to_test_node(node)->key != 0xffffffffull) {
+			/* Position the iterator structurally, then remove the min. */
+			k = to_test_node(node)->key;
+			cds_ft_u64_to_key(ctx->ft, k, kb, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, kb, CDS_FT_LEN_DEFAULT);
+			if (cds_ft_lookup(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+			    (node = cds_ft_iter_node(iter)) != NULL &&
+			    cds_ft_remove(ctx->ft, iter, node) == CDS_FT_STATUS_OK)
+				node_free_rcu(to_test_node(node));
+		} else {
+			/* Only the permanent sentinel (max key) remains: drained. */
+			__atomic_store_n(&test_drained, 1, __ATOMIC_RELAXED);
+			pthread_mutex_unlock(&ctx->lock);
+			rcu_read_unlock();
+			break;
+		}
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+#define REMOVE_XVIEW_POOL	100000
+/* Sparse-pair pool: pairs (k*256, k*256+1) sharing a 3-byte prefix, so each pair
+ * sits under its own branch that canonicalizes to a compressed holder as it
+ * drains -- exercises the compressed-parent detach publish.  Keys stay < 16 MiB. */
+#define REMOVE_XVIEW_PAIRS	40000
+
+/* Shared driver: @ft is pre-populated; spin up the cross-view @reader_fn threads
+ * + the @drainer_fn, run to drain or timeout. */
+static int run_remove_cross_view(struct cds_ft *ft, struct cds_ft_group *group,
+		const char *test_name,
+		void *(*reader_fn)(void *), void *(*drainer_fn)(void *))
+{
+	struct inv_lookup_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], drainer;
+	unsigned int i;
+
+	ctx.ft = ft;
+	ctx.test_name = test_name;
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	test_go = 0;
+	test_stop = 0;
+	test_drained = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, reader_fn, &ctx);
+	pthread_create(&drainer, NULL, drainer_fn, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS &&
+	       !__atomic_load_n(&test_drained, __ATOMIC_RELAXED))
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	pthread_join(drainer, NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "%s: %lu violation(s)\n",
+			test_name, atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+static int inv_remove_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	unsigned int i;
+
+	/* The permanent sentinel (max key) is never removed: bounds the drain. */
+	rcu_read_lock();
+	{
+		struct ft_test_node *n = node_alloc(0xffffffffull);
+
+		if (insert_u64(ft, 0xffffffffull, n) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	for (i = 0; i < REMOVE_XVIEW_POOL; i++) {
+		struct ft_test_node *n = node_alloc(i);
+		insert_u64(ft, i, n);
+	}
+	rcu_read_unlock();
+
+	return run_remove_cross_view(ft, group, "inv_remove_cross_view",
+		inv_remove_xview_reader, inv_remove_xview_drainer);
+}
+
+/*
+ * Same cross-view atomicity invariant, but a sparse-pair distribution whose
+ * removals prune up to COMPRESSED holders (the ft_detach_node_replace_compressed_parent
+ * publish), which the dense inv_remove_cross_view never reaches.
+ */
+static int inv_remove_cross_view_compressed(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	unsigned int k;
+
+	rcu_read_lock();
+	{
+		struct ft_test_node *n = node_alloc(0xffffffffull);
+
+		if (insert_u64(ft, 0xffffffffull, n) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	for (k = 0; k < REMOVE_XVIEW_PAIRS; k++) {
+		struct ft_test_node *a = node_alloc((uint64_t) k * 256);
+		struct ft_test_node *b = node_alloc((uint64_t) k * 256 + 1);
+
+		insert_u64(ft, (uint64_t) k * 256, a);
+		insert_u64(ft, (uint64_t) k * 256 + 1, b);
+	}
+	rcu_read_unlock();
+
+	return run_remove_cross_view(ft, group, "inv_remove_cross_view_compressed",
+		inv_remove_xview_reader, inv_remove_xview_drainer);
+}
+
+/*
+ * MAX-draining variant for the compressed-PARENT removal shape (external
+ * promote), which the min-draining tests cannot reach: the promote fires when a
+ * node's last longer-key child is removed while its shorter PREFIX key still
+ * exists -- but a prefix sorts BEFORE its extensions, so min-draining removes
+ * the prefix first (emptying the external before the longer child).  Draining
+ * the MAX reverses that: the longer child is removed first, while its prefix
+ * persists to be promoted, AND the removed longer child IS the current ordered
+ * maximum -- so a lookup_last-based reader observes the present/absent/present
+ * window.  Requires variable-length prefix keys (fixed-length keys never
+ * terminate at an internal node, so cannot produce the external-on-internal
+ * shape).  Keys: per group g, Kp(g)=[g_hi,g_lo,0,0] (4 B) and its extension
+ * Kl(g)=[g_hi,g_lo,0,0,0] (5 B); the [0,0] run compresses, so Kp's holder sits
+ * under a compressed node and removing Kl promotes Kp into the compressed
+ * node's child slot.  The test node carries the key bytes in @okey and the
+ * length in @value (the eager trie never writes @okey -- no speculative offset).
+ */
+static struct cds_ft *create_varlen_ord_ft(struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	/* Variable-length: keep the default key_len (per-call lengths).  Eager
+	 * so the point lookup needs no speculative key offset and @okey is free
+	 * for the test to stash the byte key.  Ordered list ON (default). */
+	if (cds_ft_group_attr_set_lookup_optimization(attr,
+			CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/* Read a variable-length test node's stashed key bytes + length. */
+static size_t xview_node_key(struct cds_ft_node *node, uint8_t *out)
+{
+	struct ft_test_node *t = to_test_node(node);
+	size_t len = (size_t) t->value;
+
+	memcpy(out, t->okey, len);
+	return len;
+}
+
+static void *inv_remove_xview_reader_max(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft_node *n1, *n2;
+		uint8_t k1[8], k2[8];
+		size_t l1, l2;
+		bool found;
+
+		rcu_read_lock();
+		if (cds_ft_lookup_last(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+		    (n1 = cds_ft_iter_node(iter)) != NULL) {
+			l1 = xview_node_key(n1, k1);
+			/* Structural point lookup of the ordered maximum. */
+			cds_ft_iter_set_key(iter, k1, l1);
+			found = cds_ft_lookup(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+				cds_ft_iter_node(iter) != NULL;
+			/* Re-confirm the ordered maximum is still the same key. */
+			if (cds_ft_lookup_last(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+			    (n2 = cds_ft_iter_node(iter)) != NULL) {
+				l2 = xview_node_key(n2, k2);
+				if (l1 == l2 && memcmp(k1, k2, l1) == 0 && !found)
+					report_violation(ctx->test_name,
+						"ordered-max key (len %zu) present,"
+						" absent, present -- compressed-parent"
+						" removal raced ahead of list unsplice",
+						l1);
+			}
+		}
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_remove_xview_drainer_max(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft_node *node;
+		uint8_t k[8];
+		size_t l;
+
+		rcu_read_lock();
+		pthread_mutex_lock(&ctx->lock);
+		if (cds_ft_lookup_last(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+		    (node = cds_ft_iter_node(iter)) != NULL) {
+			l = xview_node_key(node, k);
+			cds_ft_iter_set_key(iter, k, l);
+			if (cds_ft_lookup(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+			    (node = cds_ft_iter_node(iter)) != NULL &&
+			    cds_ft_remove(ctx->ft, iter, node) == CDS_FT_STATUS_OK)
+				node_free_rcu(to_test_node(node));
+		} else {
+			/* Trie drained (no sentinel: max draining needs none). */
+			__atomic_store_n(&test_drained, 1, __ATOMIC_RELAXED);
+			pthread_mutex_unlock(&ctx->lock);
+			rcu_read_unlock();
+			break;
+		}
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_read_unlock();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+#define REMOVE_XVIEW_GROUPS	20000
+
+static int inv_remove_cross_view_compressed_parent(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft(&group);
+	unsigned int g;
+
+	rcu_read_lock();
+	for (g = 0; g < REMOVE_XVIEW_GROUPS; g++) {
+		uint8_t kp[4] = { (uint8_t)(g >> 8), (uint8_t)(g & 0xff), 0, 0 };
+		uint8_t kl[5] = { (uint8_t)(g >> 8), (uint8_t)(g & 0xff), 0, 0, 0 };
+		struct ft_test_node *np = node_alloc(g);
+		struct ft_test_node *nl = node_alloc(g);
+
+		np->value = 4;
+		memcpy(np->okey, kp, 4);
+		nl->value = 5;
+		memcpy(nl->okey, kl, 5);
+		if (cds_ft_insert(ft, kp, 4, &np->node) != CDS_FT_STATUS_OK)
+			abort();
+		if (cds_ft_insert(ft, kl, 5, &nl->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	return run_remove_cross_view(ft, group,
+		"inv_remove_cross_view_compressed_parent",
+		inv_remove_xview_reader_max, inv_remove_xview_drainer_max);
 }
 
 /* ================================================================== */
@@ -6313,6 +6717,8 @@ int main(int argc, char **argv)
 		sa.sa_flags = SA_SIGINFO;
 		(void) sigaction(SIGSEGV, &sa, NULL);
 		(void) sigaction(SIGABRT, &sa, NULL);
+		(void) sigaction(SIGILL, &sa, NULL);
+		(void) sigaction(SIGBUS, &sa, NULL);
 	}
 #endif
 
@@ -6337,6 +6743,26 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_lookup_consistency);
 	RUN_TEST(inv_insert_splice_window);
 	RUN_TEST(inv_insert_replace_splice_window);
+	/*
+	 * Remove cross-view oracles: a key-disappearing remove must leave the
+	 * structural index and the ordered cell list in ONE flip, else a reader
+	 * observes the head gone from one index but present in the other.  In one
+	 * RCU read section the reader does lookup_first/last -> point lookup(that
+	 * key) -> lookup_first/last again and flags present/absent/present
+	 * (k1==k2 yet the structural lookup missed); with no inserts, "present
+	 * again" can only be the non-atomic unpublish window.  Each is provably 0
+	 * now that the remove-side fusion has landed: in-place, recompaction,
+	 * compressed-parent recompaction, and external-promote all commit the
+	 * structural unlink together with the cell unsplice in one flip.
+	 *
+	 * inv_remove_cross_view{,_compressed} are min-draining;
+	 * inv_remove_cross_view_compressed_parent is max-draining (a prefix key
+	 * sorts before its extensions, so only max-draining puts the
+	 * compressed-parent promote removal on the observed ordered endpoint).
+	 */
+	RUN_TEST(inv_remove_cross_view);
+	RUN_TEST(inv_remove_cross_view_compressed);
+	RUN_TEST(inv_remove_cross_view_compressed_parent);
 
 	diag("3. Duplicate chain acyclicity");
 	RUN_TEST(inv_dup_chain_acyclicity);
