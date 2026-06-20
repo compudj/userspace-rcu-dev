@@ -1149,10 +1149,40 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		 * last entry (the chain becomes empty).
 		 */
 		holder_meta = cds_ft_item_to_metadata(ft_node_ptr(holder_flag));
-		if (!ft_node_next(node))
+		if (!ft_node_next(node)) {
+			/*
+			 * Last entry: the external chain empties, so the prefix
+			 * key disappears (the holder KEEPS its longer-key children
+			 * -- prefix-with-siblings).  When the ordered list is on
+			 * (fuse_remove), commit the external_nodes -> NULL store
+			 * together with @dead_cell's ordered-list unsplice in ONE
+			 * flip (the dual of the in-place leaf delete): a reader
+			 * never sees the key gone from the structural index but
+			 * present in the ordered list.  Readers resolve a parked
+			 * proxy on external_nodes via ft_dereference_external.
+			 * @pub.armed then tells the deferred-free block below the
+			 * unsplice already happened.
+			 */
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
-		ft_unchain_node(ft, (struct cds_ft_node **) &holder_meta->external_nodes,
-			node);
+			if (fuse_remove) {
+				ft_remove_one_commit(ft,
+					(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
+					(struct cds_ft_inode_flag *) node, NULL,
+					dead_cell);
+				ft_node_mark_removed(node);
+				pub.armed = true;
+			} else {
+				/* List off: the single store is atomic alone. */
+				ft_unchain_node(ft,
+					(struct cds_ft_node **) &holder_meta->external_nodes,
+					node);
+			}
+		} else {
+			/* Duplicates remain: head promotion, the cell stays put. */
+			ft_unchain_node(ft,
+				(struct cds_ft_node **) &holder_meta->external_nodes,
+				node);
+		}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
 		 * If the unchain emptied the external chain and the holder now
@@ -1348,14 +1378,25 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		/* Decrement before detach (undercount ordering). */
 		ft_nr_keys_store(metadata, ft_nr_keys_get(metadata) - 1,
 			CMM_RELEASE);
-		rcu_assign_pointer(metadata->external_nodes, NULL);
-		/* Ordered list on: the head's cell leaves the trie (capture before
-		 * mark_removed, though that only tombstones ->next).  List off: none. */
+		/*
+		 * Ordered list on: the NIL key is the global minimum (a prefix of
+		 * every key), so its removal is the prefix-with-siblings clear at
+		 * the root.  Fuse the root external_nodes -> NULL store with the
+		 * head cell's unsplice in ONE flip so a reader never sees the key
+		 * gone from one index but present in the other; readers resolve a
+		 * parked proxy on external_nodes via ft_dereference_external.  List
+		 * off: a plain NULL store, atomic alone.
+		 */
 		if (ft->ordered_list) {
 			struct ft_ord_cell *dead = ft_ord_cell_ptr(external_nodes->prev);
 
-			ft_ord_cell_unsplice(ft, dead);
+			ft_remove_one_commit(ft,
+				(struct cds_ft_inode_flag **) &metadata->external_nodes,
+				(struct cds_ft_inode_flag *) external_nodes, NULL,
+				dead);
 			ft_ord_cell_free(ft, dead);
+		} else {
+			rcu_assign_pointer(metadata->external_nodes, NULL);
 		}
 		/* The whole chain has left the trie: tombstone every node. */
 		ft_chain_mark_removed(external_nodes);
@@ -1427,7 +1468,24 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * skip builds.
 		 */
 		ft_propagate_external_count_parent(ft, holder_flag, -1);
-		rcu_assign_pointer(holder_meta->external_nodes, NULL);
+		/*
+		 * Fuse the external_nodes -> NULL store with the head cell's
+		 * ordered-list unsplice in ONE flip (the ordered list on): a
+		 * reader never sees the prefix key gone from the structural index
+		 * but present in the ordered list.  Readers resolve a parked proxy
+		 * on external_nodes via ft_dereference_external; @pub.armed tells
+		 * the deferred-free block below the unsplice already happened.
+		 * List off: a plain NULL store, atomic alone.
+		 */
+		if (ft->ordered_list) {
+			ft_remove_one_commit(ft,
+				(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
+				(struct cds_ft_inode_flag *) chain_head, NULL,
+				dead_cell);
+			pub.armed = true;
+		} else {
+			rcu_assign_pointer(holder_meta->external_nodes, NULL);
+		}
 		ft_chain_mark_removed(chain_head);
 		ret = 0;
 		assert(holder_meta->nr_child > 0);
