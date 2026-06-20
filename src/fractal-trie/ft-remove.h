@@ -63,7 +63,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag *iter_node_flag,
 		struct cds_ft_inode_flag **detach_parent_flag_ptr,
 		struct cds_ft_node *topmost_external_nodes,
-		int *nr_clear)
+		int *nr_clear,
+		struct ft_ord_cell *fuse_cell,
+		struct ft_remove_pub *pub)
 {
 	if (topmost_external_nodes) {
 		/*
@@ -93,9 +95,29 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		ft_set_parent(ft,
 			(struct cds_ft_inode_flag *) topmost_external_nodes,
 			ft_compressed_node_flag(cn), &cn->child);
-		ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
-			&cn->child,
-			(struct cds_ft_inode_flag *) topmost_external_nodes);
+		/*
+		 * External-promote publish into cn->child (the moment the
+		 * removed leaf key disappears for an exact reader, which
+		 * descends through cn->child).  When fusion is requested, record
+		 * the publish's reader-visible edges (cn->child, plus cn's
+		 * grandparent SKIP_X dual) and commit them in ONE flip with the
+		 * dead head cell's unsplice -- every cn->child reader resolves a
+		 * flip proxy now -- and signal it via pub->armed.
+		 */
+		if (fuse_cell && pub && !pub->armed) {
+			struct ft_pub_rec rec = { .n = 0 };
+
+			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
+				&cn->child,
+				(struct cds_ft_inode_flag *) topmost_external_nodes,
+				&rec);
+			ft_remove_commit_rec(ft, &rec, fuse_cell);
+			pub->armed = true;
+		} else {
+			ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
+				&cn->child,
+				(struct cds_ft_inode_flag *) topmost_external_nodes);
+		}
 		*nr_clear = 0;
 		return 0;
 	}
@@ -475,7 +497,7 @@ int ft_detach_node(struct cds_ft *ft,
 	    ft_node_skip_compressed(iter_node_flag)) {
 		ret = ft_detach_node_replace_compressed_parent(ft,
 			iter_node_flag, detach_parent_flag_ptr,
-			topmost_external_nodes, &nr_clear);
+			topmost_external_nodes, &nr_clear, fuse_cell, pub);
 		if (ret)
 			goto end;
 		/*
