@@ -1025,17 +1025,25 @@ void ft_ord_cell_flip_rec_run(struct cds_ft *ft, struct ft_pub_rec *rec,
  * <=2 boundary edges.  run_D keeps its links for parked readers; the caller
  * re-homes run_D into the swap trie afterwards.
  */
+/*
+ * Append the <=4 boundary edges that swap run_D [@d_first .. @d_last] out for
+ * run_S [@s_first .. @s_last] (at run_D's position) in @dst's ordered list.
+ * Split out (mirrors ft_ord_cell_run_splice_edges) so a bulk graft_swap can
+ * FUSE these edges with its structural attach publish in ONE flip
+ * (ft_ord_cell_flip_rec_replace), closing the sub-key cross-view window;
+ * ft_ord_cell_run_replace is the standalone (two-commit) wrapper.  @s_first NULL
+ * (empty swap) degrades to run_D removal.
+ */
 static
-void ft_ord_cell_run_replace(struct cds_ft *dst,
+unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
 		struct ft_ord_cell *d_first, struct ft_ord_cell *d_last,
-		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last)
+		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last,
+		struct ft_ord_cell_edge *edges, unsigned int n)
 {
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&d_first->ord_prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&d_last->ord_next);
 	struct ft_ord_cell *new_first = s_first ? s_first : succ;
 	struct ft_ord_cell *new_last = s_last ? s_last : pred;
-	struct ft_ord_cell_edge edges[4];
-	unsigned int n = 0;
 
 	if (s_first) {
 		/* Pre-set run_S's outer links; not yet reachable via @dst. */
@@ -1056,7 +1064,60 @@ void ft_ord_cell_run_replace(struct cds_ft *dst,
 	}
 	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_head, d_first, new_first, edges, n);
 	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_tail, d_last, new_last, edges, n);
+	return n;
+}
+
+static
+void ft_ord_cell_run_replace(struct cds_ft *dst,
+		struct ft_ord_cell *d_first, struct ft_ord_cell *d_last,
+		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last)
+{
+	struct ft_ord_cell_edge edges[4];
+	unsigned int n = ft_ord_cell_run_replace_edges(dst, d_first, d_last,
+		s_first, s_last, edges, 0);
+
 	ft_ord_cell_flip(dst, edges, n);
+}
+
+/*
+ * Sub-key graft_swap run-replace fusion descriptor (the swap analog of struct
+ * ft_graft_run): run_D [@d_first .. @d_last] leaves @dst's ordered list and
+ * run_S [@s_first .. @s_last] takes its place.  Threaded through the graft_swap
+ * structural publish so the run-replace boundary edges join the SAME flip -- a
+ * reader then never observes run_S's keys present in the structure but absent
+ * from the ordered list (or run_D the reverse).  @s_first / @s_last NULL =
+ * empty swap (run_D just leaves).  @armed reports the run was fused (so the
+ * caller skips the standalone two-commit ft_ord_cell_run_replace).
+ */
+struct ft_graft_swap_run {
+	struct ft_ord_cell *d_first, *d_last;	/* run_D (out) */
+	struct ft_ord_cell *s_first, *s_last;	/* run_S (in), NULL = empty swap */
+	bool armed;
+};
+
+/*
+ * Commit a graft_swap's RECORDED structural publish edges (@rec: the forward
+ * parent slot, plus a compressed parent's SKIP_X dual) ATOMICALLY with @run's
+ * ordered-list run-replace, in ONE ft_ord_cell_flip -- the run-replace analog of
+ * ft_ord_cell_flip_rec_run.  Arms @run.
+ */
+static
+void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct ft_pub_rec *rec,
+		struct ft_graft_swap_run *run)
+{
+	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 replace */
+	unsigned int n = 0, i;
+
+	for (i = 0; i < rec->n; i++) {
+		edges[n].slot = (struct ft_ord_cell **) rec->slot[i];
+		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
+		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
+		n++;
+	}
+	n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
+		run->s_first, run->s_last, edges, n);
+	ft_ord_cell_flip(ft, edges, n);
+	run->armed = true;
 }
 
 /*
@@ -2003,6 +2064,30 @@ void ft_glue_publish_run(struct cds_ft *ft, struct ft_glue *g,
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		&rec);
 	ft_ord_cell_flip_rec_run(ft, &rec, run);
+}
+
+/*
+ * GLUE-path graft_swap publish FUSED with an ordered-list run-REPLACE -- the
+ * sub-key graft_swap analog of ft_glue_publish_run.  When @run is set, RECORD
+ * the cluster's forward publish edge (plus a compressed parent's SKIP_X dual)
+ * via a ft_pub_rec instead of storing it, append the run-replace boundary edges,
+ * and commit them all in ONE ft_ord_cell_flip, so a reader never sees run_S's
+ * keys reachable in the structure but absent from the ordered list (or run_D the
+ * reverse).  @run NULL (ordered list off) falls back to the plain publish.
+ */
+static
+void ft_glue_publish_replace(struct cds_ft *ft, struct ft_glue *g,
+		struct ft_graft_swap_run *run)
+{
+	struct ft_pub_rec rec = { .n = 0 };
+
+	if (!run) {
+		ft_glue_publish(ft, g);
+		return;
+	}
+	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
+		&rec);
+	ft_ord_cell_flip_rec_replace(ft, &rec, run);
 }
 
 /*

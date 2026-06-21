@@ -1620,6 +1620,19 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			gs_s_first = swap_ft->ord_cell_head;	/* NULL if swap empty */
 			gs_s_last = swap_ft->ord_cell_tail;
 		}
+		/*
+		 * Fuse the run_D->run_S ordered-list replace into the SAME flip as
+		 * the structural publish below, so a reader never sees run_S present
+		 * in the structure at @key but the ordered list still showing run_D
+		 * (or run_D the reverse).  Armed by the publish shapes that record
+		 * their forward edge (have_insert glue / empty-swap publish-NULL);
+		 * the sole-child detach-prune (gs_reserved) leaves it unarmed and
+		 * falls back to the standalone two-commit run-replace below.
+		 */
+		struct ft_graft_swap_run swap_run = {
+			gs_d_first, gs_d_last, gs_s_first, gs_s_last, false
+		};
+		struct ft_graft_swap_run *swap_run_arg = gs_ord ? &swap_run : NULL;
 
 		/*
 		 * "Jump out" prevention: unlink old_swap_root from swap_ft (install
@@ -1652,7 +1665,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		if (have_insert) {
 			ft_glue_apply_deferred(dst_ft, &glue_insert);
-			ft_glue_publish(dst_ft, &glue_insert);
+			ft_glue_publish_replace(dst_ft, &glue_insert, swap_run_arg);
 		} else if (gs_reserved) {
 			/*
 			 * Empty-swap remove whose graft point is @d.pnf's SOLE child:
@@ -1678,6 +1691,13 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			(void) dret;
 			empty_pruned = true;
 		} else {
+			/*
+			 * Empty-swap remove at a non-sole-child graft point: publish
+			 * NULL.  NOT fused with run_D's removal here -- this and the
+			 * gs_reserved sole-child prune above are the two empty-swap
+			 * (single-run) corners left on the standalone run-replace below;
+			 * only the have_insert two-run swap is fused (see swap_run).
+			 */
 			ft_publish_to_parent(dst_ft, d.pnf, d.nfp, NULL);
 		}
 
@@ -1712,9 +1732,11 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * Replace run_D with run_S in dst's ordered list (run_S now lives at
 		 * @key structurally; run_S NULL for an empty swap -> run_D just
 		 * leaves).  Paired with the dst-side drain below, which removes any
-		 * reader still holding run_D in dst.
+		 * reader still holding run_D in dst.  Skipped when the publish above
+		 * already FUSED it into the structural flip (swap_run.armed); only
+		 * the sole-child detach-prune path still uses this standalone form.
 		 */
-		if (gs_ord)
+		if (gs_ord && !swap_run.armed)
 			ft_ord_cell_run_replace(dst_ft, gs_d_first, gs_d_last,
 				gs_s_first, gs_s_last);
 
