@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	36
+#define NR_TESTS	37
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2429,6 +2429,105 @@ static int inv_graft_cross_view(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_graft_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * BULK-OP (appear-side) cross-view oracle for cds_ft_merge_at -- the diverged /
+ * absent-dst-point merge shape (ft_merge_graft_subpos_inplace), which publishes
+ * the moved subtree structurally and THEN splices its run into dst's ordered
+ * list (on HEAD, a separate ft_ord_cell_run_splice flip).  Identical method to
+ * inv_graft_cross_view (it reuses inv_graft_xview_appear_reader): NON-CYCLING,
+ * the main thread merges a fresh src subtree into dst at a strictly DECREASING
+ * dst prefix, so each merge installs a new global minimum and the ordered-list
+ * minimum only ever decreases.  The reader compares lookup_first (cell list) vs
+ * lookup_ge (structural descent) under a front-stable sandwich.
+ */
+#ifndef MERGE_XVIEW_MERGES
+#define MERGE_XVIEW_MERGES	20000
+#endif
+
+static int inv_merge_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft(&group);
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct timespec t0;
+	unsigned int i, k;
+	static const uint8_t SRCK[1] = { 0x53 };	/* "S": the src sub-position */
+
+	/* Stable upper bulk: prefix {0xFF,0xFF}, always above every merged run. */
+	rcu_read_lock();
+	for (i = 0; i < 16; i++) {
+		uint8_t key[3] = { 0xFF, 0xFF, (uint8_t) i };
+		struct ft_test_node *n = node_alloc(0x2000 + i);
+
+		n->value = 3;
+		memcpy(n->okey, key, 3);
+		if (cds_ft_insert(ft, key, 3, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_merge_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_graft_xview_appear_reader, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	/*
+	 * Merge a fresh src subtree (at "S", keys {S,0},{S,1}) into dst at a
+	 * strictly DECREASING 2-byte prefix absent from dst -- the diverged-dst
+	 * graft-subpos shape.  The moved keys become {prefix,0},{prefix,1} in @ft
+	 * (the test node stashes the full @okey), each prefix a new global minimum.
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (k = 0; k < MERGE_XVIEW_MERGES; k++) {
+		unsigned int pv = 0xFEFF - k;	/* decreasing distinct prefix */
+		uint8_t prefix[2] = { (uint8_t)(pv >> 8), (uint8_t)(pv & 0xff) };
+		struct cds_ft *src;
+		unsigned int s;
+
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		rcu_read_lock();
+		for (s = 0; s < 2; s++) {
+			uint8_t skey[2] = { SRCK[0], (uint8_t) s };
+			uint8_t full[3] = { prefix[0], prefix[1], (uint8_t) s };
+			struct ft_test_node *n = node_alloc(pv * 4 + s);
+
+			n->value = 3;
+			memcpy(n->okey, full, 3);
+			if (cds_ft_insert(src, skey, 2, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+
+		if (cds_ft_merge_at(ft, prefix, 2, src, SRCK, 1) != CDS_FT_STATUS_OK)
+			abort();
+		cds_ft_destroy(src);		/* emptied by the merge */
+
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_cross_view: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		drain_and_destroy(ft, group);
 		return -1;
@@ -7423,6 +7522,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_remove_cross_view_prefix_siblings_all);
 	RUN_TEST(inv_root_always_internal);
 	RUN_TEST(inv_graft_cross_view);
+	RUN_TEST(inv_merge_cross_view);
 	RUN_TEST(inv_detach_cross_view);
 
 	diag("3. Duplicate chain acyclicity");
