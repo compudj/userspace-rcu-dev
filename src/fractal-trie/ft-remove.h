@@ -65,7 +65,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_node *topmost_external_nodes,
 		int *nr_clear,
 		struct ft_ord_cell *fuse_cell,
-		struct ft_remove_pub *pub)
+		struct ft_remove_pub *pub,
+		struct ft_detach_run *run)
 {
 	if (topmost_external_nodes) {
 		/*
@@ -104,14 +105,14 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 * dead head cell's unsplice -- every cn->child reader resolves a
 		 * flip proxy now -- and signal it via pub->armed.
 		 */
-		if (fuse_cell && pub && !pub->armed) {
+		if ((fuse_cell || run) && pub && !pub->armed) {
 			struct ft_pub_rec rec = { .n = 0 };
 
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				&rec);
-			ft_remove_commit_rec(ft, &rec, fuse_cell);
+			ft_remove_commit_rec(ft, &rec, fuse_cell, run);
 			pub->armed = true;
 		} else {
 			ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
@@ -276,7 +277,8 @@ int ft_detach_node(struct cds_ft *ft,
 		unsigned int detach_depth,
 		bool free_detached_subtree,
 		struct ft_ord_cell *fuse_cell,
-		struct ft_remove_pub *pub)
+		struct ft_remove_pub *pub,
+		struct ft_detach_run *run)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
@@ -497,7 +499,7 @@ int ft_detach_node(struct cds_ft *ft,
 	    ft_node_skip_compressed(iter_node_flag)) {
 		ret = ft_detach_node_replace_compressed_parent(ft,
 			iter_node_flag, detach_parent_flag_ptr,
-			topmost_external_nodes, &nr_clear, fuse_cell, pub);
+			topmost_external_nodes, &nr_clear, fuse_cell, pub, run);
 		if (ret)
 			goto end;
 		/*
@@ -613,7 +615,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (pub && pub->armed) {
 				ft_remove_one_commit(ft, pub->slot, pub->old_val,
-					pub->new_val, fuse_cell);
+					pub->new_val, fuse_cell, run);
 				if (pub->pigeon_bitmap)
 					cds_clear_bit_relaxed(
 						pub->pigeon_bitmap->bitmap,
@@ -853,13 +855,13 @@ int ft_detach_node(struct cds_ft *ft,
 		 * edge is safe.  Direct publish for an in-place redundant
 		 * republish, external-promote, or list off.
 		 */
-		if (fuse_cell && pub && !pub->armed &&
+		if ((fuse_cell || run) && pub && !pub->armed &&
 		    old_recompacted_node && !topmost_external_nodes) {
 			struct ft_pub_rec rec = { .n = 0 };
 
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
-			ft_remove_commit_rec(ft, &rec, fuse_cell);
+			ft_remove_commit_rec(ft, &rec, fuse_cell, run);
 			pub->armed = true;
 		} else {
 			ft_publish_to_parent(ft, iter_meta->parent,
@@ -1113,7 +1115,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true, fuse_cell, pubp);
+				key_len, true, fuse_cell, pubp, NULL);
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
 			else
@@ -1168,7 +1170,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 					(struct cds_ft_inode_flag *) node, NULL,
-					dead_cell);
+					dead_cell, NULL);
 				ft_node_mark_removed(node);
 				pub.armed = true;
 			} else {
@@ -1224,7 +1226,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true, fuse_cell, pubp);
+				key_len, true, fuse_cell, pubp, NULL);
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
 			else
@@ -1393,7 +1395,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			ft_remove_one_commit(ft,
 				(struct cds_ft_inode_flag **) &metadata->external_nodes,
 				(struct cds_ft_inode_flag *) external_nodes, NULL,
-				dead);
+				dead, NULL);
 			ft_ord_cell_free(ft, dead);
 		} else {
 			rcu_assign_pointer(metadata->external_nodes, NULL);
@@ -1481,7 +1483,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			ft_remove_one_commit(ft,
 				(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 				(struct cds_ft_inode_flag *) chain_head, NULL,
-				dead_cell);
+				dead_cell, NULL);
 			pub.armed = true;
 		} else {
 			rcu_assign_pointer(holder_meta->external_nodes, NULL);
@@ -1508,7 +1510,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_propagate_external_count_parent(ft, holder_flag, -1);
 		ret = ft_detach_node(ft, head_slot,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
-			dead_cell, ft->ordered_list ? &pub : NULL);
+			dead_cell, ft->ordered_list ? &pub : NULL, NULL);
 		if (ret)
 			ft_propagate_external_count_parent(ft, holder_flag, 1);
 		else

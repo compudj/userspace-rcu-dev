@@ -275,61 +275,58 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 */
 			{
 				/*
-				 * Subtree-move detach (free_detached_subtree
-				 * == false): preserve @child as the root of
-				 * the new @detached trie.  Bootstrapped from
-				 * @child's own slot, ft_detach_node climbs
-				 * parent pointers to the surviving ancestor,
-				 * unlinks the branch there, and its free-walk
-				 * phase 1 reclaims the intermediate single-
-				 * child chain between that ancestor and
-				 * @child (the @nr_clear elevated links) while
-				 * phase 2 -- which would free @child and
-				 * below -- is gated off for move-style.  No
-				 * explicit chain reclaim is needed here.
+				 * Subtree-move detach (free_detached_subtree == false): preserve
+				 * @child as the root of the new @detached trie.  Bootstrapped from
+				 * @child's own slot, ft_detach_node climbs parent pointers to the
+				 * surviving ancestor, unlinks the branch there, and its free-walk
+				 * phase 1 reclaims the intermediate single-child chain (the @nr_clear
+				 * elevated links) while phase 2 -- which would free @child and below
+				 * -- is gated off for move-style.
+				 *
+				 * Ordered list on: the detached subtree's keys form a contiguous run
+				 * in @ft's ordered cell list.  Capture that run's endpoints (the
+				 * structural min/max heads of the intact @child subtree -- a prefix
+				 * key at the detach point, if any, is the run minimum) and hand them,
+				 * with a deferred-publish @pub, to ft_detach_node so the structural
+				 * unlink and the ordered-cell run-detach commit in ONE flip: a reader
+				 * never sees the run gone from the structure but still present in the
+				 * ordered list (or vice versa).  @run.armed reports whether a path
+				 * fused it; the rare unfused shape (compressed fresh-internal root)
+				 * falls back to the standalone two-commit run-detach.  The
+				 * internal-child branch's synchronize_rcu below then drains any @ft
+				 * reader parked in the run.
 				 */
-				int ret = ft_detach_node(ft,
-							 d.nfp,
-							 d.pnfp,
-							 d.depth,
-							 false,
-							 NULL, NULL);
+				struct ft_remove_pub pub = { .armed = false };
+				struct ft_detach_run run = { .armed = false };
+				struct ft_remove_pub *pubp = NULL;
+				struct ft_detach_run *runp = NULL;
+				int ret;
+
+				if (ft->group->ordered_list_set) {
+					run.into = detached;
+					run.rfirst = ft_subtree_minmax_head(ft, child, false);
+					run.rlast = ft_subtree_minmax_head(ft, child, true);
+					pubp = &pub;
+					runp = &run;
+				}
+				ret = ft_detach_node(ft, d.nfp, d.pnfp, d.depth,
+						false, NULL, pubp, runp);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*
-					 * Recompaction failed (-ENOMEM).
-					 * Undo propagation and abort.  The
-					 * glue cluster is still invisible:
-					 * the abort leaves @ft pristine.
+					 * Recompaction -ENOMEM: nothing was published (the
+					 * deferred flip never ran, run.armed stays false); undo
+					 * propagation and abort, leaving @ft pristine.
 					 */
-					ft_propagate_external_count_parent(ft,
-						d.pnf,
+					ft_propagate_external_count_parent(ft, d.pnf,
 						(long) detached_count);
 					ft_glue_abort(detached, &glue);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
-			}
-
-			/*
-			 * Ordered list: the detached subtree's keys form a
-			 * contiguous run in @ft's ordered cell list.  Move that
-			 * run out of @ft and install it as @detached's entire
-			 * list.  @child's subtree is intact (move-style detach),
-			 * so its structural min/max heads are the run endpoints
-			 * (the detach-point external_nodes, if any, are the run
-			 * minimum -- they become @detached's NIL-key entries).
-			 * The flip is atomic for a concurrent ordered reader; the
-			 * internal-child branch's synchronize_rcu below then drains
-			 * any @ft reader parked in the run.
-			 */
-			if (ft->group->ordered_list_set) {
-				struct cds_ft_node *rfirst =
-					ft_subtree_minmax_head(ft, child, false);
-				struct cds_ft_node *rlast =
-					ft_subtree_minmax_head(ft, child, true);
-
-				ft_ord_cell_run_detach(ft, detached, rfirst, rlast);
+				if (ft->group->ordered_list_set && !run.armed)
+					ft_ord_cell_run_detach(ft, detached, run.rfirst,
+						run.rlast);
 			}
 
 			/*

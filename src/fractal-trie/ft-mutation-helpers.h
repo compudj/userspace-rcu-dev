@@ -359,9 +359,21 @@ struct cds_ft_node *ft_subtree_minmax_head(struct cds_ft *ft, struct cds_ft_inod
  * exclusive, clearing the run's new boundary links is a plain store.  Caller
  * gates on ordered_list_set.
  */
+/*
+ * Append the <=4 boundary edges that excise the contiguous run @first_head ..
+ * @last_head from @ft's ordered cell list (the two neighbour back-edges plus any
+ * head/tail repair); the run's internal links are preserved for re-homing.
+ * Stashes the run-endpoint cells in *@first_out / *@last_out for the caller's
+ * post-flip @into install.  Split out so a bulk detach can fuse these edges with
+ * its structural subtree unlink in ONE flip (ft_remove_one_commit / _rec with a
+ * struct ft_detach_run), exactly as ft_ord_cell_unsplice_edges does for a point
+ * remove; ft_ord_cell_run_detach is the standalone (two-commit) wrapper.
+ */
 static
-void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
-		struct cds_ft_node *first_head, struct cds_ft_node *last_head)
+unsigned int ft_ord_cell_run_detach_edges(struct cds_ft *ft,
+		struct cds_ft_node *first_head, struct cds_ft_node *last_head,
+		struct ft_ord_cell **first_out, struct ft_ord_cell **last_out,
+		struct ft_ord_cell_edge *edges, unsigned int n)
 {
 	struct ft_ord_cell *first =
 		ft_ord_cell_ptr(rcu_dereference(first_head->prev));
@@ -369,8 +381,6 @@ void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
 		ft_ord_cell_ptr(rcu_dereference(last_head->prev));
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->ord_prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->ord_next);
-	struct ft_ord_cell_edge edges[4];
-	unsigned int n = 0;
 
 	if (pred) {
 		edges[n].slot = &pred->ord_next;
@@ -386,13 +396,55 @@ void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
 	}
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, first, succ, edges, n);
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, last, pred, edges, n);
-	ft_ord_cell_flip(ft, edges, n);
-	/* @into is exclusive: no readers, plain stores. */
+	*first_out = first;
+	*last_out = last;
+	return n;
+}
+
+/*
+ * Install the excised run (its endpoint cells, captured by
+ * ft_ord_cell_run_detach_edges) as the ENTIRE ordered list of the exclusive
+ * @into trie.  @into has no readers, so plain stores.  MUST run after the flip
+ * that excised the run from @ft.
+ */
+static
+void ft_ord_cell_run_install(struct cds_ft *into, struct ft_ord_cell *first,
+		struct ft_ord_cell *last)
+{
 	first->ord_prev = NULL;
 	last->ord_next = NULL;
 	into->ord_cell_head = first;
 	into->ord_cell_tail = last;
 }
+
+static
+void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
+		struct cds_ft_node *first_head, struct cds_ft_node *last_head)
+{
+	struct ft_ord_cell_edge edges[4];
+	struct ft_ord_cell *first, *last;
+	unsigned int n = ft_ord_cell_run_detach_edges(ft, first_head, last_head,
+		&first, &last, edges, 0);
+
+	ft_ord_cell_flip(ft, edges, n);
+	ft_ord_cell_run_install(into, first, last);
+}
+
+/*
+ * Cell-side of a key-disappearing structural unlink, fused into ONE flip.  A
+ * point remove unsplices a single dead head cell (@cell); a bulk detach excises
+ * a contiguous RUN (@rfirst .. @rlast heads) out of @ft and re-homes it as the
+ * exclusive @into trie's whole list.  Exactly one of @cell / @into is set (the
+ * other zero); both zero means "structural edges only" (ordered list off).
+ * @armed is set once the fused commit runs (so a bulk caller knows the run was
+ * fused, not left for the standalone two-commit fallback).
+ */
+struct ft_detach_run {
+	struct cds_ft *into;			/* run re-home target (exclusive) */
+	struct cds_ft_node *rfirst, *rlast;	/* run endpoint heads, in key order */
+	struct ft_ord_cell *first, *last;	/* scratch: filled at flip time */
+	bool armed;
+};
 
 static
 void ft_ord_cell_flip_prealloc(struct cds_ft *ft __attribute__((unused)),
@@ -680,18 +732,26 @@ void ft_remove_one_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **struct_slot,
 		struct cds_ft_inode_flag *struct_old,
 		struct cds_ft_inode_flag *struct_new,
-		struct ft_ord_cell *dead_cell)
+		struct ft_ord_cell *dead_cell,
+		struct ft_detach_run *run)
 {
-	struct ft_ord_cell_edge edges[5];
+	struct ft_ord_cell_edge edges[5];	/* 1 structural + <=4 cell/run */
 	unsigned int n = 0;
 
 	edges[n].slot = (struct ft_ord_cell **) struct_slot;
 	edges[n].old_target = (struct ft_ord_cell *) struct_old;
 	edges[n].new_target = (struct ft_ord_cell *) struct_new;
 	n++;
-	if (dead_cell)
+	if (run)
+		n = ft_ord_cell_run_detach_edges(ft, run->rfirst, run->rlast,
+			&run->first, &run->last, edges, n);
+	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
+	if (run) {
+		ft_ord_cell_run_install(run->into, run->first, run->last);
+		run->armed = true;
+	}
 }
 
 /*
@@ -706,9 +766,9 @@ void ft_remove_one_commit(struct cds_ft *ft,
  */
 static
 void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
-		struct ft_ord_cell *dead_cell)
+		struct ft_ord_cell *dead_cell, struct ft_detach_run *run)
 {
-	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 cell */
+	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 cell/run */
 	unsigned int n = 0, i;
 
 	for (i = 0; i < rec->n; i++) {
@@ -717,9 +777,16 @@ void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
 		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
 		n++;
 	}
-	if (dead_cell)
+	if (run)
+		n = ft_ord_cell_run_detach_edges(ft, run->rfirst, run->rlast,
+			&run->first, &run->last, edges, n);
+	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
+	if (run) {
+		ft_ord_cell_run_install(run->into, run->first, run->last);
+		run->armed = true;
+	}
 }
 
 /*
