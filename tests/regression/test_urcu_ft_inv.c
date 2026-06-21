@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	39
+#define NR_TESTS	40
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2467,6 +2467,16 @@ static int inv_graft_cross_view(void)
 #define ROOTSWAP_XVIEW_GRAFTS	40000
 #endif
 
+/*
+ * The merge empty-dst path runs a synchronize_rcu (ft_detach_keylen) before the
+ * narrow root/head-store window, so it does far fewer ops than the sync-free
+ * graft path -- more concurrent readers compensate so the appear window is
+ * caught reliably.
+ */
+#ifndef ROOTSWAP_XVIEW_READERS
+#define ROOTSWAP_XVIEW_READERS	32
+#endif
+
 struct inv_rootswap_ctx {
 	struct cds_ft * volatile cur;	/* currently-watched empty->full dst */
 	const char *test_name;
@@ -2631,6 +2641,130 @@ static int inv_graft_root_swap_cross_view(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_graft_root_swap_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+	cds_ft_destroy(probe);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * BULK-OP cross-view oracle for the EMPTY-DST root-level MERGE -- the twin of
+ * inv_graft_root_swap_cross_view for cds_ft_merge_at(dst, "", 0, src, "", 0)
+ * with dst empty (the ft_merge_at dst_key_len == 0 && cnt_dst == 0 path).  That
+ * path detaches the whole source into a fresh EXCLUSIVE subtree and swaps it
+ * into the empty dst root, then transfers the subtree's whole ordered list
+ * (head/tail) -- on HEAD two separate stores, fused into ONE flip by the fix.
+ * Only the dst side has concurrent readers (the subtree is exclusive, no
+ * src-side disappear window), so the reader and its soundness argument are
+ * identical to the graft twin: it reuses inv_rootswap_appear_reader (the
+ * front-stable sandwich required by the monotone global flip selector).
+ */
+static int inv_merge_root_swap_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *probe = create_varlen_ord_ft(&group);
+	struct inv_rootswap_ctx ctx;
+	pthread_t readers[ROOTSWAP_XVIEW_READERS];
+	struct cds_ft **pool;
+	struct timespec t0;
+	unsigned int i, k, nmerges = 0;
+	int ret = 0;
+
+	pool = (struct cds_ft **) calloc(ROOTSWAP_XVIEW_GRAFTS, sizeof(*pool));
+	if (!pool)
+		abort();
+
+	ctx.cur = NULL;
+	ctx.test_name = "inv_merge_root_swap_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < ROOTSWAP_XVIEW_READERS; i++)
+		pthread_create(&readers[i], NULL,
+			inv_rootswap_appear_reader, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (k = 0; k < ROOTSWAP_XVIEW_GRAFTS; k++) {
+		struct cds_ft *dst, *src;
+		unsigned int s;
+
+		static const uint8_t SRC_PREFIX[1] = { 0x01 };
+
+		if (cds_ft_create(group, NULL, &dst) < 0)
+			abort();
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		/*
+		 * Source holds a fresh 2-key run UNDER prefix {0x01}.  A
+		 * src_key_len > 0 is what routes the merge to the empty-dst
+		 * root-swap path: a src_key_len == 0 whole-source move is instead
+		 * delegated to ft_graft_keylen (the graft empty-dst path, covered
+		 * by inv_graft_root_swap_cross_view).  Moved key K = {0x01}||S
+		 * becomes ""||S = S, so dst gains {0x00},{0x01} (>= the submin).
+		 */
+		rcu_read_lock();
+		for (s = 0; s < 2; s++) {
+			uint8_t key[2] = { 0x01, (uint8_t) s };
+			struct ft_test_node *n = node_alloc(k * 2 + s);
+
+			n->value = 2;
+			memcpy(n->okey, key, 2);
+			if (cds_ft_insert(src, key, 2, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+
+		/* Publish the empty dst, THEN merge src@{0x01} into it at "" (empty
+		 * -> full): dst_key_len == 0 + empty dst hits the root-swap path. */
+		pool[k] = dst;
+		nmerges = k + 1;
+		rcu_assign_pointer(ctx.cur, dst);
+		if (cds_ft_merge_at(dst, (const uint8_t *) "", 0, src, SRC_PREFIX, 1)
+				!= CDS_FT_STATUS_OK)
+			abort();
+		cds_ft_destroy(src);		/* emptied by the merge */
+
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < ROOTSWAP_XVIEW_READERS; i++)
+		pthread_join(readers[i], NULL);
+
+	/* Readers joined; drain and free every watched dst, then the group. */
+	rcu_assign_pointer(ctx.cur, NULL);
+	for (k = 0; k < nmerges; k++) {
+		struct cds_ft_iter *iter;
+
+		if (cds_ft_iter_create(pool[k], &iter) < 0)
+			abort();
+		rcu_read_lock();
+		while (cds_ft_lookup_first(pool[k], iter) == CDS_FT_STATUS_OK) {
+			struct cds_ft_node *head, *tmp;
+
+			if (cds_ft_remove_all(pool[k], iter, &head) < 0) {
+				ret = -1;
+				break;
+			}
+			cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+				node_free_rcu(to_test_node(head));
+		}
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+	}
+	rcu_barrier();
+	for (k = 0; k < nmerges; k++)
+		cds_ft_destroy(pool[k]);
+	free(pool);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_root_swap_cross_view: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		ret = -1;
 	}
@@ -7820,6 +7954,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_root_always_internal);
 	RUN_TEST(inv_graft_cross_view);
 	RUN_TEST(inv_graft_root_swap_cross_view);
+	RUN_TEST(inv_merge_root_swap_cross_view);
 	RUN_TEST(inv_merge_cross_view);
 	RUN_TEST(inv_merge_src_cross_view);
 	RUN_TEST(inv_detach_cross_view);
