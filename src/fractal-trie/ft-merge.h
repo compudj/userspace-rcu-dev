@@ -1453,36 +1453,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 }
 
 /*
- * Reserve one node mirroring a freshly-built graft-cluster node @nf, so the
- * real graft (which rebuilds the same cluster) can draw it instead of
- * allocating.  Compressed node -- the compressed kind/order for its byte
- * length; internal node -- its type's order and bitmap.  Used to AUTO-LEARN a
- * GLUE diverge's node manifest from a build-and-abort learn pass, without hand-
- * coding the split's per-node arithmetic.
- */
-static
-int ft_merge_reserve_add_built(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
-		struct cds_ft_inode_flag *nf)
-{
-	struct cds_ft_inode_flag *p = ft_resolve_skip_compressed(ft, nf);
-
-	if (ft_node_compressed(p)) {
-		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(p);
-		enum cds_ft_alloc_kind kind = ft->group->speculative ?
-			CDS_FT_ALLOC_KIND_COMPRESSED : CDS_FT_ALLOC_KIND_NODE;
-
-		return cds_ft_alloc_reserve_add(ft, r, kind,
-			ft_compressed_order(cn->len), false, 1);
-	}
-	{
-		unsigned int ti = ft_node_type(p);
-
-		return cds_ft_alloc_reserve_add(ft, r, CDS_FT_ALLOC_KIND_NODE,
-			ft_types[ti].order, ft_types[ti].bitmap, 1);
-	}
-}
-
-/*
  * Build-invisible graft of a SUB-position source subtree into a dst position
  * ABSENT at @dst_key (the diverged-dst case) WITHOUT re-rooting the payload --
  * the leak-free reorder for cds_ft_merge_at's residual shapes.  Modeled on
@@ -1509,73 +1479,6 @@ int ft_merge_reserve_add_built(struct cds_ft *ft, struct cds_ft_alloc_reserve *r
  * @okey_src / @src_key_len remain the ORIGINAL source key (the unlink overshoots
  * cn_s on its own).
  */
-/*
- * Reserve EXACTLY the nodes ft_store_at_graft_point will allocate for a NOSPLIT
- * in-place graft of @payload at the located point @d, so the post-drain store
- * draws them and cannot fail on an arena allocation.  @d is ft_graft_build's
- * NOSPLIT descent.  Two shapes:
- *  - at-node (@d->depth == @key_len, empty slot): the only commit node alloc is
- *    an optional grow-recompact of the attach node @d->pnf.
- *  - build-a-branch (@d->depth < @key_len): ft_build_branch's nodes, learned by
- *    a build-and-abort pass (it builds into a throwaway glue with no dst
- *    mutation), plus an optional grow when an empty slot ADDS a child (a
- *    displaced external is REPLACED at its slot, no grow).
- * The payload needs NO canonicalize allocation: ft_compress_single_child_if_
- * needed only allocates for a 1-child internal under skip mode, and a skip-mode
- * trie never holds a 1-child internal as a subtree root (it is canonicalized at
- * creation), so a re-rooted payload is never that shape.  The flip batch is a
- * malloc (not arena), so it is not reserved.  Returns 0, or -ENOMEM (learn build
- * or fill OOM; the caller drains the reserve).
- */
-static
-int ft_merge_nosplit_reserve(struct cds_ft *dst_ft, const uint8_t *okey_dst,
-		size_t dst_key_len, struct cds_ft_inode_flag *payload,
-		unsigned long cnt_src, struct ft_descent *d,
-		struct cds_ft_alloc_reserve *reserve)
-{
-	struct cds_ft_inode_flag *displaced;
-	struct ft_glue lg;
-	struct cds_ft_inode_flag *branch;
-	bool grow = false;
-	int rret = 0, bi;
-
-	if (d->depth == dst_key_len && !d->nf) {
-		grow = true;			/* at-node: only the grow, if any */
-	} else {
-		displaced = (d->nf && ft_node_external(d->nf)) ? d->nf : NULL;
-		ft_glue_init(&lg);
-		branch = ft_build_branch(dst_ft, okey_dst, d->depth, dst_key_len,
-			payload, cnt_src, displaced != NULL, &lg);
-		if (!branch) {
-			ft_glue_fini(&lg);
-			return -ENOMEM;
-		}
-		for (bi = 0; bi < lg.nr_built && !rret; bi++)
-			rret = ft_merge_reserve_add_built(dst_ft, reserve,
-				lg.built[bi]);
-		ft_glue_abort(dst_ft, &lg);	/* frees the learn nodes */
-		if (rret)
-			return rret;
-		grow = (displaced == NULL);	/* an empty slot ADDS a child */
-	}
-
-	if (grow) {
-		struct cds_ft_metadata *am =
-			cds_ft_item_to_metadata(ft_node_ptr(d->pnf));
-		unsigned int aidx = ft_node_type(d->pnf);
-
-		if (am->nr_child + 1 > ft_types[aidx].max_child) {
-			unsigned int gidx = find_nearest_type_index(aidx,
-				am->nr_child + 1, am->parent == NULL);
-
-			rret = cds_ft_alloc_reserve_add(dst_ft, reserve,
-				CDS_FT_ALLOC_KIND_NODE, ft_types[gidx].order,
-				ft_types[gidx].bitmap, 1);
-		}
-	}
-	return rret;
-}
-
 static
 enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		struct cds_ft *src_ft,
@@ -1623,20 +1526,27 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	}
 	if (prep == FT_GRAFT_PREP_NOSPLIT) {
 		/*
-		 * Pre-fill the store's manifest while both tries are still pristine:
-		 * the node allocations into the reserve, AND the one flip batch the
-		 * store parks its proxy in (a malloc, so not reservable).  A displaced
-		 * external is REPLACED via the back-channel with no flip batch; every
-		 * other NOSPLIT shape (at-node empty slot, built non-displaced branch)
-		 * needs exactly one.  Securing the flip batch here -- before the source
-		 * unlink -- makes the post-drain store wholly failure-free, so the
-		 * unlink is the true last fallible step and nothing strands.
+		 * Pre-fill the store's node reserve while both tries are still
+		 * pristine, AND the one flip batch the store parks its proxy in (a
+		 * malloc, so not reservable).  A displaced external is REPLACED via
+		 * the back-channel with no flip batch; every other NOSPLIT shape
+		 * (at-node empty slot, built non-displaced branch) needs exactly one.
+		 * Securing both here -- before the source unlink -- makes the
+		 * post-drain store wholly failure-free, so the unlink is the true last
+		 * fallible step and nothing strands.
+		 *
+		 * Use the GENEROUS superset fill (as ft_graft_keylen's NOSPLIT attach
+		 * does for the same ft_store_at_graft_point), not a hand-rolled exact
+		 * manifest: predicting the store's node set is fragile (e.g. attaching
+		 * a high byte forces a RANGE recompact of the attach node even within
+		 * its child capacity -- a grow an exact count heuristic misses, which
+		 * underflowed the reserve and aborted).  A bulk op already pays a grace
+		 * period, so the throwaway pops/pushes are negligible.
 		 */
 		bool displaced = (d.depth < dst_key_len && d.nf
 				&& ft_node_external(d.nf));
 
-		if (ft_merge_nosplit_reserve(dst_ft, okey_dst, dst_key_len,
-				payload, cnt_src, &d, &reserve)) {
+		if (ft_bulk_node_reserve_fill(dst_ft, &reserve)) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 			ft_glue_fini(&glue);
 			return CDS_FT_STATUS_MEMORY_ERROR;

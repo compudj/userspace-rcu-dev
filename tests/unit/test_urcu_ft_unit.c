@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 281
+#define NR_TESTS 282
 #else
-#define NR_TESTS 249
+#define NR_TESTS 250
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -5838,6 +5838,110 @@ static int test_merge_rerooted_glue_ordered_compressed(void)
 static int test_merge_rerooted_glue_ordered_key_shorter(void)
 {
 	return merge_rerooted_glue_ordered(2);
+}
+
+/*
+ * Node reserve for the NOSPLIT branch-build graft (cds_ft_merge_at into a dst
+ * ABSENT at @dst_key -- ft_merge_graft_subpos_inplace).  Attaching the new
+ * top-level branch byte to the dst root forces a RANGE recompact of the attach
+ * node (a grow even within its child capacity), which the old exact-manifest
+ * reserve did not account for -- it underflowed the pre-filled reserve and
+ * aborted ("ft alloc reserve underflow").  Deterministic single-threaded repro:
+ * a dst whose only branch is {0xFF,0xFF,*} (root holds one high child), merge a
+ * 2-key src subtree at the absent high prefix {0xFE,0xFF}.  The merge must
+ * commit and the moved keys land as dst's new minimum, in order.
+ */
+static int test_merge_subpos_branch_reserve(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst = NULL, *src = NULL;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	int ret = -1;
+	unsigned int i;
+	const uint8_t dk[2] = { 0xFE, 0xFF };	/* absent high dst prefix */
+	const uint8_t sk[1] = { 0x53 };		/* "S": the src sub-position */
+	const uint8_t want0[3] = { 0xFE, 0xFF, 0x00 };
+	const uint8_t want1[3] = { 0xFE, 0xFF, 0x01 };
+	uint8_t rk[64];
+	size_t rl;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_ordered_list(attr, true);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+	    cds_ft_create(group, NULL, &src) < 0 ||
+	    cds_ft_iter_create(dst, &iter) < 0)
+		abort();
+
+	rcu_read_lock();
+	for (i = 0; i < 16; i++) {
+		uint8_t k[3] = { 0xFF, 0xFF, (uint8_t) i };
+
+		if (cds_ft_insert(dst, k, 3, &node_alloc(0x100 + i)->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	{
+		uint8_t s0[2] = { 0x53, 0x00 }, s1[2] = { 0x53, 0x01 };
+
+		if (cds_ft_insert(src, s0, 2, &node_alloc(1)->node) < 0 ||
+		    cds_ft_insert(src, s1, 2, &node_alloc(2)->node) < 0) {
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	/* Aborted here before the reserve fix (underflow on the range recompact). */
+	s = cds_ft_merge_at(dst, dk, 2, src, sk, 1);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "subpos_branch_reserve: merge: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	rcu_read_lock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "subpos_branch_reserve: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	/* The two moved keys are dst's new minimum {0xFF,0xFE,0/1}, in order. */
+	s = cds_ft_lookup_first(dst, iter);
+	if (s != CDS_FT_STATUS_OK ||
+	    cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) != CDS_FT_STATUS_OK ||
+	    rl != 3 || memcmp(rk, want0, 3) != 0) {
+		fprintf(stderr, "subpos_branch_reserve: dst min mismatch\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	s = cds_ft_next(dst, iter);
+	if (s != CDS_FT_STATUS_OK ||
+	    cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) != CDS_FT_STATUS_OK ||
+	    rl != 3 || memcmp(rk, want1, 3) != 0) {
+		fprintf(stderr, "subpos_branch_reserve: dst 2nd mismatch\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 /*
@@ -21572,6 +21676,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_glue_ordered_ext);
 	RUN_TEST(test_merge_rerooted_glue_ordered_compressed);
 	RUN_TEST(test_merge_rerooted_glue_ordered_key_shorter);
+	RUN_TEST(test_merge_subpos_branch_reserve);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_atnode);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
