@@ -2157,17 +2157,29 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * whole ordered cell list wholesale (head/tail endpoints only).
 		 */
 		old_dst_root = ft_node_ptr(dst_ft->root);
-		rcu_assign_pointer(dst_ft->root, subtree->root);
-		FT_TP(root_publish, (const void *) dst_ft,
-			(const void *) dst_ft->root);
+		/*
+		 * Fuse the structural root swap with the ordered-list head/tail
+		 * transfer into ONE flip (ft_root_list_swap_publish), so a reader
+		 * never sees the moved keys reachable in @dst_ft's structure but
+		 * its ordered list still empty -- the dst-appear cross-view window,
+		 * closed the same way as the graft empty-dst path.  Only @dst_ft
+		 * has concurrent readers here: @subtree is the fresh EXCLUSIVE trie
+		 * the detach above just produced, so its root reset + head/tail
+		 * clear are plain stores (no src-side disappear window, unlike
+		 * ft_graft's cross-trie empty-dst).
+		 */
 		if (dst_ft->group->ordered_list_set) {
-			rcu_assign_pointer(dst_ft->ord_cell_head,
-				subtree->ord_cell_head);
-			rcu_assign_pointer(dst_ft->ord_cell_tail,
-				subtree->ord_cell_tail);
+			ft_root_list_swap_publish(dst_ft, &dst_ft->root,
+				dst_ft->root, subtree->root,
+				NULL, subtree->ord_cell_head,
+				NULL, subtree->ord_cell_tail);
 			subtree->ord_cell_head = NULL;
 			subtree->ord_cell_tail = NULL;
+		} else {
+			rcu_assign_pointer(dst_ft->root, subtree->root);
 		}
+		FT_TP(root_publish, (const void *) dst_ft,
+			(const void *) dst_ft->root);
 		rcu_assign_pointer(subtree->root, ft_node_flag(fresh_root, 0));
 		free_cds_ft_node(dst_ft, old_dst_root);
 
