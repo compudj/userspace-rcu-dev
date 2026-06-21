@@ -1326,15 +1326,31 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    ===== Everything from the drain onward is failure-free. =====
 	 */
 	if (root_src) {
-		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
+		/*
+		 * A root src moves the WHOLE source, so its run is the whole src
+		 * ordered list: fuse the src->root swap with the head/tail clear into
+		 * ONE flip (ft_root_list_swap_publish), so a src reader never sees src
+		 * structurally empty but its ordered-list front still populated.  The
+		 * run cells keep their internal links (only the head/tail endpoints
+		 * flip), so the post-commit interleave still re-homes them to dst.
+		 */
+		if (ms_ord) {
+			ft_root_list_swap_publish(src_ft, &src_ft->root,
+				src_ft->root, ft_node_flag(fresh_root, 0),
+				src_ft->ord_cell_head, NULL,
+				src_ft->ord_cell_tail, NULL);
+		} else {
+			rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
+		}
 		FT_TP(root_publish, (const void *) src_ft, (const void *) src_ft->root);
 	} else if (ft_merge_unlink_src_subtree(src_ft, src_key, src_key_len,
 				cnt_src, NULL) < 0) {
 		/*
-		 * @run NULL: the spine-copy's src-side run-unlink is NOT yet fused
-		 * (its disappear-side window, like the occupied-dst appear-side
+		 * @run NULL: the NON-root spine-copy's src-side run-unlink is NOT yet
+		 * fused (its disappear-side window, like the occupied-dst appear-side
 		 * interleave below, is a separate item -- the standalone
-		 * ft_ord_cell_run_unlink runs below).
+		 * ft_ord_cell_run_unlink runs below).  The root-src run-unlink IS
+		 * fused into the root swap above.
 		 */
 		free(ms_edges);
 		if (ms_flip)
@@ -1349,9 +1365,10 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * subtree (S) run from src's ordered list: its cells disperse to dst
 	 * (survivors) or are freed (collisions).  Deferred to here so an OOM in
 	 * the src unlink above leaves src's list untouched on rollback; done
-	 * before the drain so sync drains src ord-readers of the run too.
+	 * before the drain so sync drains src ord-readers of the run too.  Skipped
+	 * for a root src -- fused into the root swap above.
 	 */
-	if (ms_ord)
+	if (ms_ord && !root_src)
 		ft_ord_cell_run_unlink(src_ft, ms_s_first, ms_s_last);
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
