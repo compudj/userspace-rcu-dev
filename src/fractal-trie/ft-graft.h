@@ -1301,25 +1301,34 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (!swap_ft->exclusive || !dst_ft->exclusive)
 			dst_ft->group->flavor->update_synchronize_rcu();
 
-		rcu_assign_pointer(dst_ft->root, swap_ft->root);
-		FT_TP(root_publish, (const void *) dst_ft,
-			(const void *) dst_ft->root);
-		rcu_assign_pointer(swap_ft->root, tmp);
-		FT_TP(root_publish, (const void *) swap_ft,
-			(const void *) swap_ft->root);
-
-		/* Ordered list: swap whole lists (head/tail), mirroring the roots. */
+		/*
+		 * Swap both roots and (mirroring them) both ordered lists.  Fuse
+		 * EACH side's root swap with its ordered-list head/tail swap into
+		 * ONE flip (ft_root_list_swap_publish), so a reader never sees a
+		 * side's structure already showing the NEW content while its
+		 * ordered-list front is still the OLD -- the root graft_swap
+		 * cross-view window.  Capture the swap root and all four endpoints
+		 * up front: the two flips reference each other's pre-swap values.
+		 */
 		if (dst_ft->group->ordered_list_set) {
+			struct cds_ft_inode_flag *swap_root = swap_ft->root;
 			struct ft_ord_cell *dh = dst_ft->ord_cell_head;
 			struct ft_ord_cell *dt = dst_ft->ord_cell_tail;
+			struct ft_ord_cell *sh = swap_ft->ord_cell_head;
+			struct ft_ord_cell *st = swap_ft->ord_cell_tail;
 
-			rcu_assign_pointer(dst_ft->ord_cell_head,
-				swap_ft->ord_cell_head);
-			rcu_assign_pointer(dst_ft->ord_cell_tail,
-				swap_ft->ord_cell_tail);
-			rcu_assign_pointer(swap_ft->ord_cell_head, dh);
-			rcu_assign_pointer(swap_ft->ord_cell_tail, dt);
+			ft_root_list_swap_publish(dst_ft, &dst_ft->root,
+				tmp, swap_root, dh, sh, dt, st);
+			ft_root_list_swap_publish(swap_ft, &swap_ft->root,
+				swap_root, tmp, sh, dh, st, dt);
+		} else {
+			rcu_assign_pointer(dst_ft->root, swap_ft->root);
+			rcu_assign_pointer(swap_ft->root, tmp);
 		}
+		FT_TP(root_publish, (const void *) dst_ft,
+			(const void *) dst_ft->root);
+		FT_TP(root_publish, (const void *) swap_ft,
+			(const void *) swap_ft->root);
 
 		dm = uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED);
 		if (swap_max > dm)
