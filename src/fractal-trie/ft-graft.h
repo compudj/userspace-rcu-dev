@@ -786,27 +786,48 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * descent first.
 		 */
 		old_dst_root = ft_node_ptr(dst_ft->root);
-		rcu_assign_pointer(dst_ft->root, src_ft->root);
+		/*
+		 * Ordered list: dst was empty (checked above), so src's WHOLE
+		 * ordered list becomes dst's.  Cells' internal links are
+		 * unchanged; only the head/tail endpoints transfer.  Fuse each
+		 * side's structural root swap with its list-endpoint transfer in
+		 * ONE flip (ft_root_list_swap_publish), so a reader never sees
+		 * the keys present in one index but absent from the other:
+		 *  - dst (appear): publish src->root AND src's head/tail at once
+		 *    (dst's head/tail were NULL), closing the structure-present /
+		 *    list-empty window.
+		 *  - src (disappear): retire src->root to a fresh empty root AND
+		 *    clear src's head/tail at once, closing the symmetric
+		 *    structure-empty / list-present window on the drained source.
+		 * The dst side runs first so it captures src's still-live root
+		 * and head/tail before the src side retires them.
+		 */
+		if (dst_ft->group->ordered_list_set) {
+			ft_root_list_swap_publish(dst_ft, &dst_ft->root,
+				dst_ft->root, src_ft->root,
+				NULL, src_ft->ord_cell_head,
+				NULL, src_ft->ord_cell_tail);
+			ft_root_list_swap_publish(src_ft, &src_ft->root,
+				src_ft->root, ft_node_flag(fresh_root, 0),
+				src_ft->ord_cell_head, NULL,
+				src_ft->ord_cell_tail, NULL);
+			/* the src flip above cleared src's head/tail to NULL */
+		} else {
+			/*
+			 * No ordered list: the root pointer is the only
+			 * reader-visible slot, so a single rcu_assign_pointer is
+			 * already atomic -- no flip needed (and no synchronize_rcu,
+			 * both being root positions with parent == NULL).
+			 */
+			rcu_assign_pointer(dst_ft->root, src_ft->root);
+			rcu_assign_pointer(src_ft->root,
+				ft_node_flag(fresh_root, 0));
+		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);
-		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
 		FT_TP(root_publish, (const void *) src_ft,
 			(const void *) src_ft->root);
 		free_cds_ft_node(dst_ft, old_dst_root);
-		/*
-		 * Ordered list: dst was empty (checked above), so src's WHOLE
-		 * ordered list becomes dst's.  Cells' internal links unchanged;
-		 * only the head/tail endpoints transfer (mirrors the root swap,
-		 * which likewise needs no synchronize_rcu).
-		 */
-		if (dst_ft->group->ordered_list_set) {
-			rcu_assign_pointer(dst_ft->ord_cell_head,
-				src_ft->ord_cell_head);
-			rcu_assign_pointer(dst_ft->ord_cell_tail,
-				src_ft->ord_cell_tail);
-			src_ft->ord_cell_head = NULL;
-			src_ft->ord_cell_tail = NULL;
-		}
 		goto done;
 	}
 

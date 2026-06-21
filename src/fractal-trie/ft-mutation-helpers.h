@@ -296,6 +296,49 @@ unsigned int ft_ord_cell_endpoint_edge(struct ft_ord_cell **slot,
 }
 
 /*
+ * Whole-trie root + ordered-list endpoint swap, fused in ONE flip.  The
+ * empty-dst root-level graft (cds_ft_graft with key_len == 0) makes the empty
+ * @dst adopt @src's ENTIRE structure AND its ENTIRE ordered list at once: the
+ * root pointer transitions @struct_old -> @struct_new while ord_cell_head/tail
+ * transition @head_old/@tail_old -> @head_new/@tail_new.  Recording all (<= 3)
+ * edges in one ft_ord_cell_flip closes the appear-side cross-view window -- a
+ * reader never sees the keys reachable in the structure but the ordered list
+ * still empty (it resolves the root and the head/tail proxies to ONE flip
+ * phase, exactly as ft_ord_cell_swap_publish fuses a head swap with its cell
+ * swap).  The src side reuses this with the roles reversed (full -> empty: the
+ * root retires to a fresh empty root and head/tail clear to NULL) to close the
+ * symmetric disappear window on the drained source.
+ *
+ * The structural root edge always flips; an endpoint edge is added only when
+ * *slot == old (ft_ord_cell_endpoint_edge's proxy/NULL contract -- @head_old /
+ * @tail_old are NULL for the appear side, the live cells for the src side).
+ * The root slot resolves a flip proxy on EVERY reader load (ft_root_dereference
+ * and friends), so a transient proxy parked here is view-resolved like any
+ * other flipped slot.
+ */
+static
+void ft_root_list_swap_publish(struct cds_ft *ft,
+		struct cds_ft_inode_flag **struct_slot,
+		struct cds_ft_inode_flag *struct_old,
+		struct cds_ft_inode_flag *struct_new,
+		struct ft_ord_cell *head_old, struct ft_ord_cell *head_new,
+		struct ft_ord_cell *tail_old, struct ft_ord_cell *tail_new)
+{
+	struct ft_ord_cell_edge edges[3];	/* root + head + tail */
+	unsigned int n = 0;
+
+	edges[n].slot = (struct ft_ord_cell **) struct_slot;
+	edges[n].old_target = (struct ft_ord_cell *) struct_old;
+	edges[n].new_target = (struct ft_ord_cell *) struct_new;
+	n++;
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, head_old, head_new,
+			edges, n);
+	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, tail_old, tail_new,
+			edges, n);
+	ft_ord_cell_flip(ft, edges, n);
+}
+
+/*
  * Structural min/max dup-chain HEAD of the subtree rooted at @nf, under WRITER
  * EXCLUSION (no concurrent mutation -> no skip re-anchor / flip-proxy / transient
  * empty states to handle, unlike the reader-side minmax descent).  Mirrors the

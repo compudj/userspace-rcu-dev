@@ -556,7 +556,14 @@ void cds_ft_debug_node_balance(const struct cds_ft_group *group,
 int cds_ft_debug_root_is_internal(struct cds_ft *ft);
 int cds_ft_debug_root_is_internal(struct cds_ft *ft)
 {
-	struct cds_ft_inode_flag *rf = rcu_dereference(ft->root);
+	/*
+	 * Resolve a flip proxy: the empty-dst root-level graft fuses the root
+	 * swap with the ordered-list head/tail transfer in one flip, parking a
+	 * transient proxy here.  It resolves to an internal node in BOTH phases
+	 * (old empty root XOR new src root), so the root-always-internal
+	 * invariant this probe checks still holds through the flip.
+	 */
+	struct cds_ft_inode_flag *rf = ft_root_dereference(ft);
 
 	return ft_node_internal(rf) ? 1 : 0;
 }
