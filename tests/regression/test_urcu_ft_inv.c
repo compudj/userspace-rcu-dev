@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	40
+#define NR_TESTS	41
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -3507,6 +3507,179 @@ static int inv_graft_swap_atomicity(void)
 		return -1;
 	}
 
+	drain_trie_local(live);
+	rcu_barrier();
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * graft_swap CROSS-VIEW oracle (structure vs ordered list).  inv_graft_swap_
+ * atomicity checks only list-internal atomicity (cds_ft_for_each never mixes A
+ * and B).  This checks the OTHER axis: a root graft_swap publishes dst->root
+ * (structure) and dst's ord_cell_head/tail (list) in SEPARATE stores, so a
+ * reader between them sees the whole trie as range B structurally while the
+ * ordered-list front is still range A.  The fix fuses each side's root swap
+ * with its head/tail transfer into one flip (ft_root_list_swap_publish).
+ *
+ * The writer PING-PONGS the same two tries (graft_swap leaves the old content
+ * in @swap, so the next swap moves it back) -- no drain/repopulate, so it runs
+ * far more swaps (= windows) than inv_graft_swap_atomicity's writer.  That
+ * makes it CYCLING (A<->B at root), so the reader uses the front-stable
+ * SANDWICH (list-range, struct-range, list-range): it flags only when the
+ * list-range is STABLE yet the structure shows the OTHER range -- a mid-swap
+ * straddle changes the list-range between the two reads and is filtered, while
+ * the genuine structure-before-list window survives.  The two probes are the
+ * usual independent pair: lookup_first (cell-list front) vs lookup_ge from a
+ * submin (pure structural descent).
+ */
+static int graft_swap_range(struct cds_ft *ft, struct cds_ft_iter *iter,
+		bool use_list)
+{
+	static const uint8_t SUBMIN[1] = { 0x00 };
+	struct cds_ft_node *n;
+	enum cds_ft_status s;
+
+	if (use_list) {
+		s = cds_ft_lookup_first(ft, iter);
+	} else {
+		cds_ft_iter_set_key(iter, SUBMIN, 1);
+		s = cds_ft_lookup_ge(ft, iter);
+	}
+	if (s != CDS_FT_STATUS_OK || (n = cds_ft_iter_node(iter)) == NULL)
+		return -1;	/* empty */
+	/* The leaf carries its own u64 key, so no iter key materialization. */
+	return to_test_node(n)->key < GRAFT_SWAP_RANGE_B_BASE ? 0 : 1;
+}
+
+static void *inv_graft_swap_xview_reader(void *arg)
+{
+	struct inv_graft_ctx *ctx = (struct inv_graft_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->live, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		int rl1, rs, rl2;
+
+		rcu_read_lock();
+		rl1 = graft_swap_range(ctx->live, iter, true);	/* list front */
+		rs  = graft_swap_range(ctx->live, iter, false);	/* structural min */
+		rl2 = graft_swap_range(ctx->live, iter, true);	/* list front again */
+		if (rl1 >= 0 && rl1 == rl2 && rs >= 0 && rs != rl1)
+			report_violation(ctx->test_name,
+				"structural range != STABLE ordered-list front"
+				" range -- the root graft_swap published the root"
+				" before transferring the ordered-list head/tail", 0);
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_graft_swap_xview_writer(void *arg)
+{
+	struct inv_graft_ctx *ctx = (struct inv_graft_ctx *) arg;
+	struct cds_ft *swap;
+
+	rcu_register_thread();
+	if (cds_ft_create(ctx->group, NULL, &swap) < 0)
+		abort();
+	populate_range(swap, GRAFT_SWAP_RANGE_B_BASE, GRAFT_SWAP_POOL);
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	/* Ping-pong: graft_swap moves the old content into @swap, so the next
+	 * swap moves it straight back -- no drain/repopulate, far more windows. */
+	while (!test_stop) {
+		pthread_mutex_lock(&ctx->lock);
+		if (cds_ft_graft_swap(ctx->live, NULL, 0, swap) != CDS_FT_STATUS_OK)
+			abort();
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_quiescent_state();
+	}
+
+	drain_trie_local(swap);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_graft_swap_cross_view(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live;
+	struct inv_graft_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writer;
+	unsigned int i;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(attr, 4) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	populate_range(live, GRAFT_SWAP_RANGE_A_BASE, GRAFT_SWAP_POOL);
+
+	ctx.live = live;
+	ctx.group = group;
+	ctx.test_name = "inv_graft_swap_cross_view";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_graft_swap_xview_reader, &ctx);
+	pthread_create(&writer, NULL, inv_graft_swap_xview_writer, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	pthread_join(writer, NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_graft_swap_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_trie_local(live);
+		rcu_barrier();
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
 	drain_trie_local(live);
 	rcu_barrier();
 	cds_ft_destroy(live);
@@ -7967,6 +8140,7 @@ int main(int argc, char **argv)
 
 	diag("4. Graft-swap atomicity");
 	RUN_TEST(inv_graft_swap_atomicity);
+	RUN_TEST(inv_graft_swap_cross_view);
 
 	diag("5. Relational lookup consistency");
 	RUN_TEST(inv_relational_lookup);
