@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	41
+#define NR_TESTS	42
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -3673,6 +3673,153 @@ static int inv_graft_swap_cross_view(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_graft_swap_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_trie_local(live);
+		rcu_barrier();
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	drain_trie_local(live);
+	rcu_barrier();
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * SUB-KEY graft_swap cross-view oracle -- the "two-run" run_replace path
+ * (ft_ord_cell_run_replace), distinct from the root swap above.  A sub-key
+ * graft_swap exchanges dst's subtree-at-@key (run_D) with swap's content
+ * (run_S): it publishes run_S structurally at @key (one flip) and THEN swaps
+ * run_D out / run_S in in dst's ordered list (a SEPARATE ft_ord_cell_run_replace
+ * flip), so a reader between them sees run_S's keys structurally present at @key
+ * while the ordered-list front is still run_D (and vice versa).
+ *
+ * @key = {0x01} is kept the GLOBAL MINIMUM (a stable upper bulk lives at
+ * {0xFF}), so the cell-list front and the structural minimum both fall in @key's
+ * region -- the same independent probes and front-stable sandwich as the root
+ * oracle (reused inv_graft_swap_xview_reader / graft_swap_range).  run_D is
+ * range A, run_S is range B; the writer PING-PONGS the swap so the leaves'
+ * own u64 keys (hence ranges) are preserved across swaps.
+ */
+#define GRAFT_SWAP_SUB_POOL	8
+#define GRAFT_SWAP_SUB_BULK	4
+
+static void populate_at_prefix(struct cds_ft *ft, const uint8_t *prefix,
+		size_t prefix_len, uint64_t base, unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		struct ft_test_node *n = node_alloc(base + i);
+		uint8_t k[4] = { 0 };
+		size_t kl = prefix_len;
+
+		if (prefix_len)
+			memcpy(k, prefix, prefix_len);
+		k[kl++] = (uint8_t) i;		/* distinct suffix byte */
+		memcpy(n->okey, k, sizeof(n->okey));
+		if (cds_ft_insert(ft, k, kl, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+}
+
+static void *inv_graft_swap_sub_xview_writer(void *arg)
+{
+	struct inv_graft_ctx *ctx = (struct inv_graft_ctx *) arg;
+	struct cds_ft *swap;
+	static const uint8_t AT[1] = { 0x01 };
+
+	rcu_register_thread();
+	if (cds_ft_create(ctx->group, NULL, &swap) < 0)
+		abort();
+	/* run_S = range B at swap's root; becomes dst's subtree at {0x01}. */
+	populate_at_prefix(swap, NULL, 0, GRAFT_SWAP_RANGE_B_BASE,
+		GRAFT_SWAP_SUB_POOL);
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	/* Ping-pong the subtree at {0x01}: graft_swap leaves run_D in @swap, so
+	 * the next swap moves it back -- no drain, far more windows. */
+	while (!test_stop) {
+		pthread_mutex_lock(&ctx->lock);
+		if (cds_ft_graft_swap(ctx->live, AT, 1, swap) != CDS_FT_STATUS_OK)
+			abort();
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_quiescent_state();
+	}
+
+	drain_trie_local(swap);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_graft_swap_sub_cross_view(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live;
+	struct inv_graft_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writer;
+	static const uint8_t AT[1] = { 0x01 };
+	static const uint8_t HI[1] = { 0xFF };
+	unsigned int i;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(attr, 4) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	/* run_D = range A under {0x01} (the global min) + a stable bulk at {0xFF}
+	 * so {0x01} is a genuine sub-position (run_replace, not the root path). */
+	populate_at_prefix(live, AT, 1, GRAFT_SWAP_RANGE_A_BASE, GRAFT_SWAP_SUB_POOL);
+	populate_at_prefix(live, HI, 1, 9000, GRAFT_SWAP_SUB_BULK);
+
+	ctx.live = live;
+	ctx.group = group;
+	ctx.test_name = "inv_graft_swap_sub_cross_view";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_graft_swap_xview_reader, &ctx);
+	pthread_create(&writer, NULL, inv_graft_swap_sub_xview_writer, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	pthread_join(writer, NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_graft_swap_sub_cross_view: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		drain_trie_local(live);
 		rcu_barrier();
@@ -8141,6 +8288,7 @@ int main(int argc, char **argv)
 	diag("4. Graft-swap atomicity");
 	RUN_TEST(inv_graft_swap_atomicity);
 	RUN_TEST(inv_graft_swap_cross_view);
+	RUN_TEST(inv_graft_swap_sub_cross_view);
 
 	diag("5. Relational lookup consistency");
 	RUN_TEST(inv_relational_lookup);
