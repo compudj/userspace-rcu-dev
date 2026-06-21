@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 282
+#define NR_TESTS 283
 #else
-#define NR_TESTS 250
+#define NR_TESTS 251
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -6147,6 +6147,103 @@ static int test_merge_rekey_same_trie(void)
 	ret = 0;
 out:
 	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Same-trie ORDERED rekey into an OCCUPIED destination: drives the spine-copy
+ * merge's ordered-list interleave through the SAME-TRIE pre-reserved flip batch
+ * (the combined @pf_flip path -- structural re-parent + folded interleave in one
+ * batch and one flip).  "az" is a pre-occupied subtree {azm, azq}; rekeying the
+ * "q" subtree {qm, qx, qy} onto "az" merges (occupied dst => spine_copy), with
+ * "qm" -> "azm" COLLIDING (demoted to a duplicate, never an ordered head -- the
+ * collect runs before apply_splices, so this also checks that invariance).  The
+ * ordered walk must surface exactly the distinct merged heads, in key order.
+ */
+static int test_merge_rekey_same_trie_ordered(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = NULL;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	const char *exp[] = { "azm", "azq", "azx", "azy" };
+	unsigned int i;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_ordered_list(attr, true);
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0 ||
+	    cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "azm", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "azq", 3, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qm", 2, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qx", 2, &node_alloc(4)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qy", 2, &node_alloc(5)->node);
+	/* "q" subtree {qm,qx,qy} merges onto the occupied "az" {azm,azq}. */
+	s = cds_ft_merge_at(ft, (const uint8_t *) "az", 2,
+			ft, (const uint8_t *) "q", 1);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_ord: merge: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_ord: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	/* Ordered walk must yield exactly exp, in key order (collided qm hidden). */
+	s = cds_ft_lookup_first(ft, iter);
+	for (i = 0; i < 4; i++) {
+		uint8_t rk[64];
+		size_t rl;
+
+		if (s != CDS_FT_STATUS_OK ||
+		    cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
+				CDS_FT_STATUS_OK ||
+		    rl != strlen(exp[i]) || memcmp(rk, exp[i], rl) != 0) {
+			fprintf(stderr,
+				"rekey_ord: pos %u mismatch (status=%d got '%.*s' want '%s')\n",
+				i, (int) s, (int) rl, (const char *) rk, exp[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		s = cds_ft_next(ft, iter);
+	}
+	if (s == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_ord: extra keys after merge\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (!ft_test_has_key(ft, "azm") || !ft_test_has_key(ft, "azq") ||
+	    !ft_test_has_key(ft, "azx") || !ft_test_has_key(ft, "azy") ||
+	    ft_test_has_key(ft, "qm") || ft_test_has_key(ft, "qx")) {
+		fprintf(stderr, "rekey_ord: key membership wrong after merge\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
 	drain_trie(ft);
 	rcu_barrier();
 	cds_ft_destroy(ft);
@@ -21680,6 +21777,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_atnode);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
+	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_nonidentity_bulk_ops);
 	RUN_TEST(test_merge_at_overflow);
 

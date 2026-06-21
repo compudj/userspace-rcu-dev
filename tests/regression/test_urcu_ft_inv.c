@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	45
+#define NR_TESTS	46
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -3032,6 +3032,107 @@ static int inv_merge_cross_view(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_merge_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * BULK-OP (appear-side) cross-view oracle for the OCCUPIED-DST SPINE-COPY merge
+ * -- the step-4 structural flip vs step-9 ordered INTERLEAVE window.  Same
+ * decreasing-min method and reused reader (inv_graft_xview_appear_reader) as
+ * inv_merge_cross_view, but each merge point is PRE-OCCUPIED (a stable
+ * {prefix,0xFF} key) so the merge takes ft_merge_spine_copy rather than the
+ * diverged subpos path.  The src run ({prefix,0},{prefix,1}) becomes the merged
+ * region's new minimum; until the interleave splices its cells into dst's list,
+ * the structural minimum sits BELOW the stable ordered-list front -> the
+ * front-stable sandwich flags it.
+ */
+static int inv_merge_spinecopy_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft(&group);
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct timespec t0;
+	unsigned int i, k;
+	static const uint8_t SRCK[1] = { 0x53 };	/* "S": the src sub-position */
+
+	/* Stable upper bulk: prefix {0xFF,0xFF}, always above every merged run. */
+	rcu_read_lock();
+	for (i = 0; i < 16; i++) {
+		uint8_t key[3] = { 0xFF, 0xFF, (uint8_t) i };
+		struct ft_test_node *n = node_alloc(0x3000 + i);
+
+		n->value = 3;
+		memcpy(n->okey, key, 3);
+		if (cds_ft_insert(ft, key, 3, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_merge_spinecopy_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_graft_xview_appear_reader, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (k = 0; k < MERGE_XVIEW_MERGES; k++) {
+		unsigned int pv = 0xFEFF - k;	/* decreasing distinct prefix */
+		uint8_t prefix[2] = { (uint8_t)(pv >> 8), (uint8_t)(pv & 0xff) };
+		uint8_t occ[3] = { prefix[0], prefix[1], 0xFF };
+		struct ft_test_node *on = node_alloc(0x40000 + k);
+		struct cds_ft *src;
+		unsigned int s;
+
+		/* Pre-occupy dst at {prefix} (suffix 0xFF, above the src keys) so the
+		 * merge is spine-copy.  An insert is itself a fused single commit, so
+		 * it adds no cross-view window of its own. */
+		on->value = 3;
+		memcpy(on->okey, occ, 3);
+		rcu_read_lock();
+		if (cds_ft_insert(ft, occ, 3, &on->node) != CDS_FT_STATUS_OK)
+			abort();
+		rcu_read_unlock();
+
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		rcu_read_lock();
+		for (s = 0; s < 2; s++) {
+			uint8_t skey[2] = { SRCK[0], (uint8_t) s };
+			uint8_t full[3] = { prefix[0], prefix[1], (uint8_t) s };
+			struct ft_test_node *n = node_alloc(pv * 4 + s);
+
+			n->value = 3;
+			memcpy(n->okey, full, 3);
+			if (cds_ft_insert(src, skey, 2, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+
+		if (cds_ft_merge_at(ft, prefix, 2, src, SRCK, 1) != CDS_FT_STATUS_OK)
+			abort();
+		cds_ft_destroy(src);		/* emptied by the merge */
+
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_spinecopy_cross_view: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		drain_and_destroy(ft, group);
 		return -1;
@@ -8647,6 +8748,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_merge_root_swap_cross_view);
 	RUN_TEST(inv_merge_root_src_cross_view);
 	RUN_TEST(inv_merge_cross_view);
+	RUN_TEST(inv_merge_spinecopy_cross_view);
 	RUN_TEST(inv_merge_src_cross_view);
 	RUN_TEST(inv_merge_src_spinecopy_cross_view);
 	RUN_TEST(inv_detach_cross_view);
