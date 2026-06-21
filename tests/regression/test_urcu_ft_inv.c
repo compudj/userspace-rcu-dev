@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	37
+#define NR_TESTS	38
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2598,6 +2598,100 @@ static int inv_detach_cross_view(void)
 		return -1;
 	}
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * BULK-OP (disappear-side) cross-view oracle for cds_ft_merge_at's SOURCE side.
+ * A merge unlinks the moved subtree from @src structurally (ft_merge_unlink_src_
+ * subtree) and THEN removes its run from @src's ordered list (on HEAD, a separate
+ * ft_ord_cell_run_unlink flip) -- so a @src reader can observe the moved run gone
+ * from the structure but still present in the ordered list.  This is the
+ * src-side dual of inv_detach_cross_view, and reuses its min-drain reader
+ * (inv_remove_xview_reader_minvl: lookup_first -> point(min) -> lookup_first,
+ * flagged only when the min is stably present in the list but absent from the
+ * structure).  NON-CYCLING: the main thread merges @src's prefixes OUT to @dst in
+ * increasing order, so @src only ever SHRINKS -- a re-appearing min is
+ * impossible, which is what makes the present-absent-present check sound.
+ */
+#ifndef MERGE_SRC_XVIEW_PREFIXES
+#define MERGE_SRC_XVIEW_PREFIXES	6000
+#endif
+#define MERGE_SRC_XVIEW_PER		3
+
+static int inv_merge_src_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *src = create_varlen_ord_ft(&group);
+	struct cds_ft *dst;
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct timespec t0;
+	unsigned int i, p, s;
+
+	if (cds_ft_create(group, NULL, &dst) < 0)
+		abort();
+
+	rcu_read_lock();
+	for (p = 0; p < MERGE_SRC_XVIEW_PREFIXES; p++) {
+		for (s = 0; s < MERGE_SRC_XVIEW_PER; s++) {
+			uint8_t key[3] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff),
+				(uint8_t) s };
+			struct ft_test_node *n = node_alloc(p);
+
+			n->value = 3;
+			memcpy(n->okey, key, 3);
+			if (cds_ft_insert(src, key, 3, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+	}
+	rcu_read_unlock();
+
+	ctx.ft = src;			/* readers watch the DRAINED source */
+	ctx.test_name = "inv_merge_src_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
+			&ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	/* Merge each prefix's subtree OUT of @src into @dst (same key, distinct in
+	 * @dst), in increasing order so @src only shrinks.  Each merge is a grace
+	 * period, so the pool may not drain within the window. */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (p = 0; p < MERGE_SRC_XVIEW_PREFIXES; p++) {
+		uint8_t prefix[2] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff) };
+
+		(void) cds_ft_merge_at(dst, prefix, 2, src, prefix, 2);
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_src_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_trie_local(src);
+		drain_trie_local(dst);
+		rcu_barrier();
+		cds_ft_destroy(src);
+		cds_ft_destroy(dst);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	drain_trie_local(src);
+	drain_trie_local(dst);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return 0;
 }
 
 
@@ -7523,6 +7617,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_root_always_internal);
 	RUN_TEST(inv_graft_cross_view);
 	RUN_TEST(inv_merge_cross_view);
+	RUN_TEST(inv_merge_src_cross_view);
 	RUN_TEST(inv_detach_cross_view);
 
 	diag("3. Duplicate chain acyclicity");
