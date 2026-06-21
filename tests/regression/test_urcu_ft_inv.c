@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	38
+#define NR_TESTS	39
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2434,6 +2434,209 @@ static int inv_graft_cross_view(void)
 		return -1;
 	}
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * BULK-OP cross-view oracle for the EMPTY-DST root-level graft --
+ * cds_ft_graft(dst, "", 0, src) where dst is empty.  That path makes the empty
+ * @dst adopt @src's WHOLE structure as its root AND transfer @src's WHOLE
+ * ordered list (head/tail) to it.  On HEAD these were SEPARATE stores: the root
+ * published first, the ordered-list head/tail after, so a reader between them
+ * saw a grafted key reachable in the STRUCTURE but the ordered LIST empty.  The
+ * fix fuses each side's root swap with its head/tail transfer in ONE flip
+ * (ft_root_list_swap_publish).
+ *
+ * NON-CYCLING: each watched dst goes empty -> full exactly ONCE (key_len==0
+ * graft requires an empty dst, so the same dst is never re-grafted).  The
+ * watched dst changes every graft; the main thread publishes the fresh empty
+ * dst through ctx->cur and readers rcu_dereference it.  Every dst is kept alive
+ * in @pool until the readers join, so no reader dereferences a freed trie.
+ *
+ * The flip latch is a MONOTONE global selector, not a per-reader snapshot
+ * (urcu_flip_proxy_get reads the live selector), so two independent probes that
+ * straddle the commit see old-then-new -- a front-stable SANDWICH is required
+ * exactly as in inv_graft_cross_view.  The reader reads the LIST front (O(1)
+ * cell-list head) TWICE around a STRUCTURAL min descent (a pure trie descent,
+ * no cell list) and flags only when the front is STABLY ABSENT yet the
+ * structure holds a key: under the atomic flip the selector's monotonicity
+ * forbids absent (sel 0) -> present-struct (sel 1) -> absent (sel 0); only the
+ * genuine two-store window (root published before the head/tail transfer) lets
+ * a key be reachable structurally while the front cell is still NULL.
+ */
+#ifndef ROOTSWAP_XVIEW_GRAFTS
+#define ROOTSWAP_XVIEW_GRAFTS	40000
+#endif
+
+struct inv_rootswap_ctx {
+	struct cds_ft * volatile cur;	/* currently-watched empty->full dst */
+	const char *test_name;
+};
+
+static void *inv_rootswap_appear_reader(void *arg)
+{
+	struct inv_rootswap_ctx *ctx = (struct inv_rootswap_ctx *) arg;
+	struct cds_ft_iter *iter = NULL;
+	struct cds_ft *bound = NULL;	/* @iter is bound to this dst */
+	static const uint8_t SUBMIN[1] = { 0x00 };
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft *dst = rcu_dereference(ctx->cur);
+		bool front1, front2, struct_full;
+
+		if (!dst) {
+			rcu_quiescent_state();
+			continue;
+		}
+		/*
+		 * An iter is bound to one trie (a debug assertion enforces it),
+		 * but the watched dst advances every graft.  Re-bind only when it
+		 * changes -- the reader spins faster than the grafter, so it
+		 * usually re-checks the same dst (and catches its empty->full
+		 * window) on the cached iter.  Every dst is pool-pinned, so the
+		 * cached @bound never dangles.  Create outside the read section.
+		 */
+		if (dst != bound) {
+			if (iter)
+				cds_ft_iter_destroy(iter);
+			if (cds_ft_iter_create(dst, &iter) < 0)
+				abort();
+			bound = dst;
+		}
+
+		rcu_read_lock();
+		/* Front-stable sandwich: list front, structural min, list front. */
+		front1 = cds_ft_lookup_first(dst, iter) == CDS_FT_STATUS_OK
+			&& cds_ft_iter_node(iter) != NULL;
+		cds_ft_iter_set_key(iter, SUBMIN, 1);
+		struct_full = cds_ft_lookup_ge(dst, iter) == CDS_FT_STATUS_OK
+			&& cds_ft_iter_node(iter) != NULL;
+		front2 = cds_ft_lookup_first(dst, iter) == CDS_FT_STATUS_OK
+			&& cds_ft_iter_node(iter) != NULL;
+		if (struct_full && !front1 && !front2)
+			report_violation(ctx->test_name,
+				"a key is reachable in the structure but the"
+				" ordered-list front is stably empty -- the"
+				" empty-dst root graft published the root before"
+				" transferring the ordered-list head/tail", 0);
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_graft_root_swap_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *probe = create_varlen_ord_ft(&group);
+	struct inv_rootswap_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct cds_ft **pool;
+	struct timespec t0;
+	unsigned int i, k, ngrafts = 0;
+	int ret = 0;
+
+	pool = (struct cds_ft **) calloc(ROOTSWAP_XVIEW_GRAFTS, sizeof(*pool));
+	if (!pool)
+		abort();
+
+	ctx.cur = NULL;
+	ctx.test_name = "inv_graft_root_swap_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_rootswap_appear_reader, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (k = 0; k < ROOTSWAP_XVIEW_GRAFTS; k++) {
+		struct cds_ft *dst, *src;
+		unsigned int s;
+
+		if (cds_ft_create(group, NULL, &dst) < 0)
+			abort();
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		/* Source holds a fresh 2-key run (>= the 1-byte structural submin). */
+		rcu_read_lock();
+		for (s = 0; s < 2; s++) {
+			uint8_t key[2] = { 0x01, (uint8_t) s };
+			struct ft_test_node *n = node_alloc(k * 2 + s);
+
+			n->value = 2;
+			memcpy(n->okey, key, 2);
+			if (cds_ft_insert(src, key, 2, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+
+		/* Publish the empty dst, THEN graft src into it (empty -> full). */
+		pool[k] = dst;
+		ngrafts = k + 1;
+		rcu_assign_pointer(ctx.cur, dst);
+		if (cds_ft_graft(dst, (const uint8_t *) "", 0, src)
+				!= CDS_FT_STATUS_OK)
+			abort();
+		cds_ft_destroy(src);		/* emptied by the graft */
+
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	/*
+	 * Readers have joined; nothing dereferences ctx.cur any more.  Drain and
+	 * free every watched dst (their leaves are app-owned test nodes), then
+	 * destroy the tries and the shared group.
+	 */
+	rcu_assign_pointer(ctx.cur, NULL);
+	for (k = 0; k < ngrafts; k++) {
+		struct cds_ft_iter *iter;
+
+		if (cds_ft_iter_create(pool[k], &iter) < 0)
+			abort();
+		rcu_read_lock();
+		while (cds_ft_lookup_first(pool[k], iter) == CDS_FT_STATUS_OK) {
+			struct cds_ft_node *head, *tmp;
+
+			if (cds_ft_remove_all(pool[k], iter, &head) < 0) {
+				ret = -1;
+				break;
+			}
+			cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+				node_free_rcu(to_test_node(head));
+		}
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+	}
+	rcu_barrier();
+	for (k = 0; k < ngrafts; k++)
+		cds_ft_destroy(pool[k]);
+	free(pool);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_graft_root_swap_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+	cds_ft_destroy(probe);
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 /*
@@ -7616,6 +7819,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_remove_cross_view_prefix_siblings_all);
 	RUN_TEST(inv_root_always_internal);
 	RUN_TEST(inv_graft_cross_view);
+	RUN_TEST(inv_graft_root_swap_cross_view);
 	RUN_TEST(inv_merge_cross_view);
 	RUN_TEST(inv_merge_src_cross_view);
 	RUN_TEST(inv_detach_cross_view);
