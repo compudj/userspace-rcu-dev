@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	33
+#define NR_TESTS	34
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -1907,12 +1907,19 @@ static void *inv_remove_xview_reader_minvl(void *arg)
 				if (l1 == l2 && memcmp(k1, k2, l1) == 0 && !found)
 					report_violation(ctx->test_name,
 						"ordered-min key (len %zu) present,"
-						" absent, present -- prefix-with-siblings"
-						" removal raced ahead of list unsplice",
+						" absent, present -- structural index and"
+						" ordered list disagree (non-atomic unpublish)",
 						l1);
 			}
 		}
 		rcu_read_unlock();
+		/*
+		 * Report a quiescent state (QSBR): a bulk-op drainer (cds_ft_detach)
+		 * synchronize_rcu's, and would wait forever for a reader that never
+		 * passes a quiescent state.  Harmless for the point-remove drainers,
+		 * which never synchronize_rcu.
+		 */
+		rcu_quiescent_state();
 	}
 
 	cds_ft_iter_destroy(iter);
@@ -2072,6 +2079,96 @@ static int inv_remove_cross_view_prefix_siblings_all(void)
 	return run_remove_cross_view(ft, group,
 		"inv_remove_cross_view_prefix_siblings_all",
 		inv_remove_xview_reader_minvl, inv_remove_xview_drainer_minvl_all);
+}
+
+/*
+ * BULK-OP (disappear-side) cross-view oracle.  A bulk detach severs a whole
+ * sub-branch from @ft structurally (one publish) and then moves that run out of
+ * @ft's ordered cell list (a separate ft_ord_cell_run_detach flip) -- two
+ * commits, unlike the fused point remove.  So a reader doing the same
+ * lookup_first -> point(min) -> lookup_first check may observe the ordered
+ * minimum present in the list but absent from the structure, if the structural
+ * detach raced ahead of the run unsplice.
+ *
+ * @ft is pre-filled with keys [p_hi,p_lo,s] (a 2-byte prefix P plus a suffix s);
+ * the writer detaches prefixes in increasing order (cds_ft_detach at the 2-byte
+ * P), so each detach removes the current ordered-minimum run and @ft only ever
+ * SHRINKS -- no re-inserts, so "present again" can only be the non-atomic
+ * detach window.  The detached sub-tries are drained + destroyed (deferred node
+ * frees keep concurrent @ft readers safe).  Reuses the varlen min cross-view
+ * reader.  Mirrors inv_merge_atomic_completeness: the bulk op + drain run on the
+ * registered main thread (the FT bulk ops tolerate an online caller).
+ */
+#ifndef DETACH_XVIEW_PREFIXES
+#define DETACH_XVIEW_PREFIXES	6000
+#endif
+#define DETACH_XVIEW_PER	3
+
+static void drain_trie_local(struct cds_ft *ft);	/* defined below */
+
+static int inv_detach_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft(&group);
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct timespec t0;
+	unsigned int i, p, s;
+
+	rcu_read_lock();
+	for (p = 0; p < DETACH_XVIEW_PREFIXES; p++) {
+		for (s = 0; s < DETACH_XVIEW_PER; s++) {
+			uint8_t key[3] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff),
+				(uint8_t) s };
+			struct ft_test_node *n = node_alloc(p);
+
+			n->value = 3;
+			memcpy(n->okey, key, 3);
+			if (cds_ft_insert(ft, key, 3, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+	}
+	rcu_read_unlock();
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_detach_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
+			&ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	/* Time-bounded: each detach is a full grace period, so the whole pool
+	 * may not drain within the window -- drain_and_destroy reclaims the rest. */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (p = 0; p < DETACH_XVIEW_PREFIXES; p++) {
+		uint8_t prefix[2] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff) };
+		struct cds_ft *detached = NULL;
+
+		if (cds_ft_detach(ft, prefix, 2, &detached) == CDS_FT_STATUS_OK &&
+		    detached) {
+			drain_trie_local(detached);
+			cds_ft_destroy(detached);
+		}
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_detach_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
 }
 
 /* ================================================================== */
@@ -6993,6 +7090,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_remove_cross_view_compressed_parent);
 	RUN_TEST(inv_remove_cross_view_prefix_siblings);
 	RUN_TEST(inv_remove_cross_view_prefix_siblings_all);
+	RUN_TEST(inv_detach_cross_view);
 
 	diag("3. Duplicate chain acyclicity");
 	RUN_TEST(inv_dup_chain_acyclicity);
