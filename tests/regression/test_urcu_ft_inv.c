@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	44
+#define NR_TESTS	45
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -3180,6 +3180,106 @@ static int inv_merge_src_cross_view(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_merge_src_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_trie_local(src);
+		drain_trie_local(dst);
+		rcu_barrier();
+		cds_ft_destroy(src);
+		cds_ft_destroy(dst);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	drain_trie_local(src);
+	drain_trie_local(dst);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * BULK-OP (disappear-side) cross-view oracle for the NON-ROOT SPINE-COPY merge
+ * src side -- distinct from inv_merge_src_cross_view (which merges into an
+ * ABSENT dst point -> the subpos/diverged path).  Here every dst merge point is
+ * PRE-OCCUPIED, so the merge takes ft_merge_spine_copy's non-root-src branch:
+ * ft_merge_unlink_src_subtree unlinks the source subtree structurally and THEN a
+ * separate ft_ord_cell_run_unlink removes its run from src's ordered list, so a
+ * src reader between them sees the moved subtree gone from the structure but
+ * still in the ordered list.  The fix threads an EXCISE-ONLY run through
+ * ft_merge_unlink_src_subtree (as the subpos src side already does).
+ *
+ * Same NON-CYCLING min-drain method as inv_merge_src_cross_view (reused reader
+ * inv_remove_xview_reader_minvl): @src's prefixes are merged OUT in increasing
+ * order so @src only shrinks.  @dst is pre-populated with one stable key under
+ * EACH prefix (key suffix 0xFF) so cnt_dst > 0 at every merge point; the moved
+ * keys keep their own (distinct) suffixes, so @dst stays a trie, not dup chains.
+ */
+static int inv_merge_src_spinecopy_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *src = create_varlen_ord_ft(&group);
+	struct cds_ft *dst;
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct timespec t0;
+	unsigned int i, p, s;
+
+	if (cds_ft_create(group, NULL, &dst) < 0)
+		abort();
+
+	rcu_read_lock();
+	for (p = 0; p < MERGE_SRC_XVIEW_PREFIXES; p++) {
+		uint8_t dkey[3] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff), 0xFF };
+		struct ft_test_node *dn = node_alloc(0x10000 + p);
+
+		/* Pre-occupy dst at this prefix so the merge is spine-copy. */
+		dn->value = 3;
+		memcpy(dn->okey, dkey, 3);
+		if (cds_ft_insert(dst, dkey, 3, &dn->node) != CDS_FT_STATUS_OK)
+			abort();
+		for (s = 0; s < MERGE_SRC_XVIEW_PER; s++) {
+			uint8_t key[3] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff),
+				(uint8_t) s };
+			struct ft_test_node *n = node_alloc(p);
+
+			n->value = 3;
+			memcpy(n->okey, key, 3);
+			if (cds_ft_insert(src, key, 3, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+	}
+	rcu_read_unlock();
+
+	ctx.ft = src;			/* readers watch the DRAINED source */
+	ctx.test_name = "inv_merge_src_spinecopy_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
+			&ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	/* Merge each prefix's subtree OUT of @src into @dst at the SAME (occupied)
+	 * prefix -> spine-copy non-root-src.  Increasing order so @src only shrinks. */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (p = 0; p < MERGE_SRC_XVIEW_PREFIXES; p++) {
+		uint8_t prefix[2] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff) };
+
+		(void) cds_ft_merge_at(dst, prefix, 2, src, prefix, 2);
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_src_spinecopy_cross_view: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		drain_trie_local(src);
 		drain_trie_local(dst);
@@ -8548,6 +8648,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_merge_root_src_cross_view);
 	RUN_TEST(inv_merge_cross_view);
 	RUN_TEST(inv_merge_src_cross_view);
+	RUN_TEST(inv_merge_src_spinecopy_cross_view);
 	RUN_TEST(inv_detach_cross_view);
 
 	diag("3. Duplicate chain acyclicity");
