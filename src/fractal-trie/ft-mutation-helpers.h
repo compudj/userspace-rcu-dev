@@ -440,7 +440,11 @@ void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
  * fused, not left for the standalone two-commit fallback).
  */
 struct ft_detach_run {
-	struct cds_ft *into;			/* run re-home target (exclusive) */
+	struct cds_ft *into;			/* run re-home target (exclusive), or
+						 * NULL = EXCISE-ONLY: unlink the run
+						 * from @ft's list without re-homing it
+						 * (the merge source side, where the
+						 * cells disperse into dst) */
 	struct cds_ft_node *rfirst, *rlast;	/* run endpoint heads, in key order */
 	struct ft_ord_cell *first, *last;	/* scratch: filled at flip time */
 	bool armed;
@@ -749,7 +753,11 @@ void ft_remove_one_commit(struct cds_ft *ft,
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
 	if (run) {
-		ft_ord_cell_run_install(run->into, run->first, run->last);
+		/* @into NULL = EXCISE-ONLY (the merge source side): the run is
+		 * unlinked from @ft's list but not re-homed; its cells keep their
+		 * internal links for the dst splice/interleave. */
+		if (run->into)
+			ft_ord_cell_run_install(run->into, run->first, run->last);
 		run->armed = true;
 	}
 }
@@ -784,7 +792,11 @@ void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
 	if (run) {
-		ft_ord_cell_run_install(run->into, run->first, run->last);
+		/* @into NULL = EXCISE-ONLY (the merge source side): the run is
+		 * unlinked from @ft's list but not re-homed; its cells keep their
+		 * internal links for the dst splice/interleave. */
+		if (run->into)
+			ft_ord_cell_run_install(run->into, run->first, run->last);
 		run->armed = true;
 	}
 }

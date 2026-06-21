@@ -886,7 +886,7 @@ unused:
 static
 int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 		const uint8_t *_src_key, size_t src_key_len,
-		unsigned long detached_count)
+		unsigned long detached_count, struct ft_detach_run *run)
 {
 	/*
 	 * @src_key is ALREADY ORDINAL (cds_ft_merge_at converts once at its
@@ -936,8 +936,21 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 	 * child chain (compressed / skip-target nodes included) while phase 2 --
 	 * which would free the target -- stays gated off for move-style.
 	 */
-	ret = ft_detach_node(src_ft, d.nfp, d.pnfp, d.depth,
-			/*free_detached_subtree=*/ false, NULL, NULL, NULL);
+	{
+		/*
+		 * @run (EXCISE-ONLY, into==NULL) fuses the structural unlink with the
+		 * run's removal from src's ordered list in ONE flip -- but the fusion
+		 * in ft_detach_node is gated on a non-NULL @pub (the structural-publish
+		 * deferral it records and commits alongside the cell edges), so supply
+		 * one here exactly as ft_detach's move-style unlink does.  @run NULL
+		 * (list off) leaves both NULL = the unfused two-store unlink.
+		 */
+		struct ft_remove_pub pub = { .armed = false };
+		struct ft_remove_pub *pubp = run ? &pub : NULL;
+
+		ret = ft_detach_node(src_ft, d.nfp, d.pnfp, d.depth,
+				/*free_detached_subtree=*/ false, NULL, pubp, run);
+	}
 	if (ret < 0) {
 		/* Recompaction OOM: undo the propagation; src is pristine. */
 		ft_propagate_external_count_parent(src_ft, d.pnf,
@@ -1316,7 +1329,13 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
 		FT_TP(root_publish, (const void *) src_ft, (const void *) src_ft->root);
 	} else if (ft_merge_unlink_src_subtree(src_ft, src_key, src_key_len,
-				cnt_src) < 0) {
+				cnt_src, NULL) < 0) {
+		/*
+		 * @run NULL: the spine-copy's src-side run-unlink is NOT yet fused
+		 * (its disappear-side window, like the occupied-dst appear-side
+		 * interleave below, is a separate item -- the standalone
+		 * ft_ord_cell_run_unlink runs below).
+		 */
 		free(ms_edges);
 		if (ms_flip)
 			ft_flip_batch_free_unpublished(ms_flip);
@@ -1499,6 +1518,8 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	struct cds_ft_node *s_first = NULL, *s_last = NULL;
 	struct ft_graft_run mrun;
 	struct ft_graft_run *run_arg = NULL;
+	struct ft_detach_run srun = { .into = NULL, .armed = false };
+	struct ft_detach_run *srunp = NULL;
 	size_t src_max, nm, dm;
 
 	*handled = false;
@@ -1589,6 +1610,12 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		mrun.succ = succ;
 		mrun.armed = false;
 		run_arg = &mrun;
+		/* Src side: EXCISE-ONLY run so the structural unlink and the run's
+		 * removal from src's ordered list commit in ONE flip (the
+		 * disappear-side cross-view fix). */
+		srun.rfirst = s_first;
+		srun.rlast = s_last;
+		srunp = &srun;
 	}
 
 	/*
@@ -1597,7 +1624,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * invisible cluster / reserve is released (dst pristine) -- no rollback.
 	 */
 	if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
-			cnt_src) < 0) {
+			cnt_src, srunp) < 0) {
 		if (pre_flip)
 			ft_flip_batch_free_unpublished(pre_flip);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
@@ -1608,11 +1635,14 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	/* ===== Everything from here on is failure-free. ===== */
 
 	/*
-	 * Remove the source run from src's ordered list now (the cells keep their
-	 * internal links for the splice into dst below) -- before the drain, so
-	 * sync drains src ord-readers of the run too.
+	 * Remove the source run from src's ordered list (the cells keep their
+	 * internal links for the splice into dst below) -- BEFORE the drain, so sync
+	 * drains src ord-readers of the run too.  The structural unlink above FUSED
+	 * this into its flip (@srun.armed), so a src reader never sees the run gone
+	 * from the structure but still in the list; the standalone two-commit unlink
+	 * remains as a defensive fallback for any unfused unlink shape.
 	 */
-	if (ms_ord)
+	if (ms_ord && !srun.armed)
 		ft_ord_cell_run_unlink(src_ft, s_first, s_last);
 
 	if (!src_ft->exclusive)
