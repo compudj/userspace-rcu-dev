@@ -1681,17 +1681,36 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * live), then detach from the reserve secured in PREP so it cannot
 			 * fail.  The detach owns the parent nr_child + any prune, so the
 			 * post-publish nr_child-- / propagate are skipped (empty_pruned).
+			 *
+			 * Fuse run_D's ordered-list removal into the detach's structural
+			 * flip (EXCISE-ONLY ft_detach_run, into == NULL -- run_D is
+			 * re-homed to swap_ft below), closing the disappear-side cross-view
+			 * window: ft_detach_node arms @drun on whichever commit path it
+			 * takes (in-place / recompaction / compressed-external-promote),
+			 * @dpub is the gating/arm flag, and swap_run.armed then suppresses
+			 * the standalone run-replace.  run_D's heads are read while
+			 * @old_child is still intact (before the detach).
 			 */
 			int dret;
+			struct ft_remove_pub dpub = { .armed = false };
+			struct ft_detach_run drun = { .into = NULL };
 
+			if (gs_ord) {
+				drun.rfirst = ft_subtree_minmax_head(dst_ft, old_child,
+						false);
+				drun.rlast = ft_subtree_minmax_head(dst_ft, old_child,
+						true);
+			}
 			ft_propagate_external_count_parent(dst_ft, d.pnf,
 					-(long) old_count);
 			cds_ft_alloc_reserve_activate(dst_ft, &gs_reserve);
 			dret = ft_detach_node(dst_ft, d.nfp, d.pnfp, d.depth,
-					false, NULL, NULL, NULL);
+					false, NULL, gs_ord ? &dpub : NULL,
+					gs_ord ? &drun : NULL);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
 			assert(dret == 0);	/* reserve guarantees no -ENOMEM */
 			(void) dret;
+			swap_run.armed = drun.armed;
 			empty_pruned = true;
 		}
 
