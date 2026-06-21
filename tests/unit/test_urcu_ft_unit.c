@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 280
+#define NR_TESTS 281
 #else
-#define NR_TESTS 248
+#define NR_TESTS 249
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -7256,6 +7256,104 @@ fail:
 /*
  * graft_swap at root: exchange the entire trie content.
  */
+/*
+ * Regression: graft_swap that extracts a subtree into an EMPTY swap, where the
+ * graft point is the SOLE child of a COMPRESSED node, must PRUNE that parent --
+ * not leave it childless.  Before the fix, the empty-swap remove published NULL
+ * into the compressed parent's child slot, leaving a childless compressed node;
+ * the next relational descent (find_splice_pos in a later graft_swap, or any
+ * lookup_first with the ordered list on) then dereferenced its NULL child and
+ * aborted ("compressed node always has a live child").  Needs a long shared
+ * prefix (so the parent is compressed) + the ordered list (so a relational
+ * descent runs).  Round-trips extract + graft-back a few times.
+ */
+static int test_graft_swap_extract_empty_compressed_parent(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+	int ret = -1, it;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_iter_create(live, &iter) < 0)
+		abort();
+
+	/* Two keys sharing a long prefix -> compressed("ABCDEF") -> {x,y}. */
+	{
+		struct ft_test_node *a = node_alloc(0), *b = node_alloc(0);
+
+		rcu_read_lock();
+		cds_ft_insert(live, (const uint8_t *) "ABCDEFx", 7, &a->node);
+		cds_ft_insert(live, (const uint8_t *) "ABCDEFy", 7, &b->node);
+		rcu_read_unlock();
+	}
+
+	for (it = 0; it < 4; it++) {
+		/* Extract the whole "ABCDEF" subtree into the empty swap: the graft
+		 * point is the compressed node's sole child. */
+		rcu_read_lock();
+		s = cds_ft_graft_swap(live, (const uint8_t *) "ABCDEF", 6, swap);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "graft_swap_extract_empty: extract %s\n",
+				cds_ft_status_to_string(s));
+			goto out;
+		}
+		/* Relational descent on @live -- aborted before the fix. */
+		rcu_read_lock();
+		cds_ft_lookup_first(live, iter);
+		rcu_read_unlock();
+		/* Graft it back. */
+		rcu_read_lock();
+		s = cds_ft_graft_swap(live, (const uint8_t *) "ABCDEF", 6, swap);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "graft_swap_extract_empty: graft-back %s\n",
+				cds_ft_status_to_string(s));
+			goto out;
+		}
+	}
+	rcu_read_lock();
+	if (cds_ft_count_entries(live) != 2) {
+		rcu_read_unlock();
+		fprintf(stderr, "graft_swap_extract_empty: live count %lu != 2\n",
+			cds_ft_count_entries(live));
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	cds_ft_iter_destroy(iter);
+	drain_trie(live);
+	drain_trie(swap);
+	rcu_barrier();
+	cds_ft_destroy(live);
+	cds_ft_destroy(swap);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
 static int test_graft_swap_at_root(void)
 {
 	struct cds_ft_group *group;
@@ -21493,6 +21591,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_graft_overflow_error);
 	RUN_TEST(test_graft_swap_basic);
 	RUN_TEST(test_graft_swap_into_empty);
+	RUN_TEST(test_graft_swap_extract_empty_compressed_parent);
 	RUN_TEST(test_graft_swap_at_root);
 	RUN_TEST(test_graft_swap_self_error);
 	RUN_TEST(test_graft_swap_different_group_error);

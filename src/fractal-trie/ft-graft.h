@@ -1255,6 +1255,19 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct ft_ord_cell *gs_d_first = NULL, *gs_d_last = NULL;
 		struct ft_ord_cell *gs_s_first = NULL, *gs_s_last = NULL;
 		bool gs_ord = dst_ft->group->ordered_list_set;
+		/*
+		 * Empty-swap (remove) where the graft point is its parent's SOLE
+		 * child: publishing NULL would leave the parent a childless (invalid)
+		 * node -- a compressed node, or a single-child internal.  Prune it via
+		 * ft_detach_node (move-style: preserves the displaced subtree for the
+		 * extract side, frees the parent + the single-child chain).  The prune
+		 * can recompact a surviving ancestor, so a reserve is filled in the
+		 * fallible prep and the detach draws from it -- keeping the commit
+		 * failure-free.
+		 */
+		struct cds_ft_alloc_reserve gs_reserve;
+		bool gs_reserved = false;
+		bool empty_pruned = false;
 
 		/*
 		 * Read-only descent: nothing is published, so the whole swap can be
@@ -1314,6 +1327,22 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		ft_glue_init(&glue_extract);
 
 		/* ===== PREP: build clusters A and B (both tries pristine) ===== */
+
+		/*
+		 * Empty-swap remove that would orphan the graft point's parent
+		 * (its sole child leaves): secure a node reserve for the prune's
+		 * possible recompaction, build-invisibly (an OOM here leaves both
+		 * tries pristine).
+		 */
+		if (swap_empty &&
+		    cds_ft_item_to_metadata(ft_node_ptr(d.pnf))->nr_child == 1) {
+			memset(&gs_reserve, 0, sizeof(gs_reserve));
+			if (ft_bulk_node_reserve_fill(dst_ft, &gs_reserve)) {
+				cds_ft_alloc_reserve_drain(dst_ft, &gs_reserve);
+				goto prep_oom;
+			}
+			gs_reserved = true;
+		}
 
 		/*
 		 * Insert side (cluster A): canonicalized swap content, placed at the
@@ -1512,6 +1541,30 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (have_insert) {
 			ft_glue_apply_deferred(dst_ft, &glue_insert);
 			ft_glue_publish(dst_ft, &glue_insert);
+		} else if (gs_reserved) {
+			/*
+			 * Empty-swap remove whose graft point is @d.pnf's SOLE child:
+			 * publishing NULL would leave @d.pnf childless (a compressed
+			 * node, or a single-child internal).  Prune via a move-style
+			 * detach -- it preserves @old_child for the extract side below
+			 * and frees @d.pnf + the single-child chain up to a surviving
+			 * ancestor.  Propagate -@old_count FIRST (undercount ordering,
+			 * while @d.pnf is still live), then detach from the secured
+			 * reserve so it cannot fail.  The detach owns the surviving
+			 * ancestor's nr_child + the prune, so the post-publish
+			 * nr_child-- / propagate are skipped (and @d.pnf is now freed).
+			 */
+			int dret;
+
+			ft_propagate_external_count_parent(dst_ft, d.pnf,
+					-(long) old_count);
+			cds_ft_alloc_reserve_activate(dst_ft, &gs_reserve);
+			dret = ft_detach_node(dst_ft, d.nfp, d.pnfp, d.depth,
+					false, NULL, NULL, NULL);
+			cds_ft_alloc_reserve_deactivate(dst_ft);
+			assert(dret == 0);	/* reserve guarantees no -ENOMEM */
+			(void) dret;
+			empty_pruned = true;
 		} else {
 			ft_publish_to_parent(dst_ft, d.pnf, d.nfp, NULL);
 		}
@@ -1519,24 +1572,29 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		/*
 		 * graft_swap edits the subtree at @key via ft_publish_to_parent
 		 * directly (no ft_node_set_nth), so emit the structural edge for
-		 * consumers.
+		 * consumers.  The pruned case freed @d.pnf and emits its own
+		 * detach tracepoints.
 		 */
-		if (d.depth >= 1)
+		if (d.depth >= 1 && !empty_pruned)
 			FT_TP(tree_edge_set, (const void *) dst_ft,
 				(const void *) d.pnf,
 				(unsigned int) (d.depth - 1),
 				(uint8_t) _key[d.depth - 1],
 				(const void *) (have_insert ? glue_insert.top : NULL));
 
-		/* Parent nr_child on the non-NULL -> NULL transition (remove). */
-		pmeta = cds_ft_item_to_metadata(ft_node_ptr(d.pnf));
-		if (!have_insert)
-			pmeta->nr_child--;
-
-		/* Propagate the external-count delta through the ancestors. */
-		if (swap_count != old_count)
-			ft_propagate_external_count_parent(dst_ft, d.pnf,
-					(long) swap_count - (long) old_count);
+		/*
+		 * Parent nr_child on the non-NULL -> NULL transition (remove) +
+		 * external-count propagation.  Skipped for @empty_pruned: the detach
+		 * above owns nr_child and propagated the count first (@d.pnf is freed).
+		 */
+		if (!empty_pruned) {
+			pmeta = cds_ft_item_to_metadata(ft_node_ptr(d.pnf));
+			if (!have_insert)
+				pmeta->nr_child--;
+			if (swap_count != old_count)
+				ft_propagate_external_count_parent(dst_ft, d.pnf,
+						(long) swap_count - (long) old_count);
+		}
 
 		/*
 		 * Replace run_D with run_S in dst's ordered list (run_S now lives at
@@ -1649,6 +1707,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * access discipline for that content.  dst_ft keeps its own.
 		 */
 		swap_ft->exclusive = dst_ft->exclusive;
+		/* Free any unused empty-swap prune reserve. */
+		if (gs_reserved)
+			cds_ft_alloc_reserve_drain(dst_ft, &gs_reserve);
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 
@@ -1663,6 +1724,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		ft_glue_abort(swap_ft, &glue_extract);
 		if (fresh)
 			free_cds_ft_node(swap_ft, fresh);
+		if (gs_reserved)
+			cds_ft_alloc_reserve_drain(dst_ft, &gs_reserve);
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
