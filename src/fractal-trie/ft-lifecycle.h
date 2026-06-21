@@ -545,6 +545,23 @@ void cds_ft_debug_node_balance(const struct cds_ft_group *group,
 #endif
 
 /*
+ * Root-is-internal probe (no public header decl; the inv suite weak-references
+ * it).  Reads ft->root under the caller's RCU read lock and returns whether it
+ * tags a plain internal node.  Used by inv_root_always_internal to sample the
+ * root CONCURRENTLY with a re-rooting bulk op (graft_swap) -- a transient
+ * compressed / skip-compressed root, which no mutator should ever publish,
+ * would show up here even though a post-op probe (after canonicalization)
+ * cannot see it.
+ */
+int cds_ft_debug_root_is_internal(struct cds_ft *ft);
+int cds_ft_debug_root_is_internal(struct cds_ft *ft)
+{
+	struct cds_ft_inode_flag *rf = rcu_dereference(ft->root);
+
+	return ft_node_internal(rf) ? 1 : 0;
+}
+
+/*
  * Install per-API lookup function pointers on @ft based on group
  * flags.  Called once at cds_ft_create.  Pointers are stable for
  * the trie's lifetime because the group flags (key_map.identity,

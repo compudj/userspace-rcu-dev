@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	34
+#define NR_TESTS	35
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2106,6 +2106,159 @@ static int inv_remove_cross_view_prefix_siblings_all(void)
 
 static void drain_trie_local(struct cds_ft *ft);	/* defined below */
 
+/*
+ * ROOT-ALWAYS-INTERNAL invariant oracle.  ft->root must always tag a plain
+ * internal node (the read-side hot descent relies on it; the descent carries a
+ * defensive "non-internal root" resolver whose comment claims graft_swap can
+ * place a compressed node at the root).  Every re-rooting mutator materializes
+ * the new root through the build-invisible internal-root builders, so a compressed
+ * root should NEVER be published -- not even transiently.  A post-op probe cannot
+ * see a transient (it is canonical by op-end), so this samples ft->root
+ * CONCURRENTLY with a re-rooting bulk op.
+ *
+ * The writer round-trips a KEY_SHORTER graft_swap (the path that builds the
+ * extracted swap root from a split compressed prefix): @live holds keys under a
+ * long compressed prefix "ABCDEFG", and graft_swap at the SHORTER key "AB" moves
+ * that subtree to @swap (building @swap's new root) and back.  Readers hammer
+ * cds_ft_debug_root_is_internal() on BOTH tries.  If the descent's
+ * non-internal-root resolver is live, a reader catches a compressed root here;
+ * if it is dead (as expected), this is provably 0 and the resolver can be
+ * retired.
+ */
+extern int cds_ft_debug_root_is_internal(struct cds_ft *ft) __attribute__((weak));
+
+struct inv_root_ctx {
+	struct cds_ft *live, *swap;
+	const char *test_name;
+	pthread_mutex_t lock;
+};
+
+static void *inv_root_internal_reader(void *arg)
+{
+	struct inv_root_ctx *ctx = (struct inv_root_ctx *) arg;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		rcu_read_lock();
+		if (!cds_ft_debug_root_is_internal(ctx->live))
+			report_violation(ctx->test_name,
+				"LIVE root is non-internal during a re-rooting"
+				" bulk op (the descent's non-internal-root"
+				" resolver is live)", 0);
+		if (!cds_ft_debug_root_is_internal(ctx->swap))
+			report_violation(ctx->test_name,
+				"SWAP root is non-internal during a re-rooting"
+				" bulk op (the descent's non-internal-root"
+				" resolver is live)", 0);
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_root_internal_writer(void *arg)
+{
+	struct inv_root_ctx *ctx = (struct inv_root_ctx *) arg;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		pthread_mutex_lock(&ctx->lock);
+		/* KEY_SHORTER graft_swap: "AB" splits the compressed "ABCDEFG"
+		 * prefix; the displaced subtree builds @swap's new root.  Twice =
+		 * round-trip (content returns to @live). */
+		cds_ft_graft_swap(ctx->live, (const uint8_t *) "A", 1, ctx->swap);
+		cds_ft_graft_swap(ctx->live, (const uint8_t *) "A", 1, ctx->swap);
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_root_always_internal(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live = create_varlen_ord_ft(&group);
+	struct cds_ft *swap;
+	struct inv_root_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT], writer;
+	struct timespec t0;
+	unsigned int i;
+
+	if (!cds_ft_debug_root_is_internal) {
+		diag("inv_root_always_internal: probe unavailable, skipping");
+		drain_and_destroy(live, group);
+		return 0;
+	}
+	if (cds_ft_create(group, NULL, &swap) < 0)
+		abort();
+	rcu_read_lock();
+	{
+		struct ft_test_node *a = node_alloc(0), *b = node_alloc(0);
+		struct ft_test_node *anchor = node_alloc(0);
+
+		/* "A" + compressed "cdefg" + {x,y}: graft_swap at the 1-byte key
+		 * "A" extracts the compressed subtree (EXACT), which the build-
+		 * invisible ft_make_root_internal_glue re-roots as internal-root ->
+		 * compressed("defg")-child in @swap. */
+		cds_ft_insert(live, (const uint8_t *) "Acdefgx", 7, &a->node);
+		cds_ft_insert(live, (const uint8_t *) "Acdefgy", 7, &b->node);
+		/* Anchor key outside "A" so @live never empties. */
+		cds_ft_insert(live, (const uint8_t *) "Z", 1, &anchor->node);
+	}
+	rcu_read_unlock();
+
+	ctx.live = live;
+	ctx.swap = swap;
+	ctx.test_name = "inv_root_always_internal";
+	pthread_mutex_init(&ctx.lock, NULL);
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_root_internal_reader, &ctx);
+	pthread_create(&writer, NULL, inv_root_internal_writer, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	pthread_join(writer, NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_root_always_internal: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_trie_local(live);
+		drain_trie_local(swap);
+		rcu_barrier();
+		cds_ft_destroy(live);
+		cds_ft_destroy(swap);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	drain_trie_local(live);
+	drain_trie_local(swap);
+	rcu_barrier();
+	cds_ft_destroy(live);
+	cds_ft_destroy(swap);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
 static int inv_detach_cross_view(void)
 {
 	struct cds_ft_group *group;
@@ -2170,6 +2323,7 @@ static int inv_detach_cross_view(void)
 	}
 	return drain_and_destroy(ft, group);
 }
+
 
 /* ================================================================== */
 /*                                                                    */
@@ -7090,6 +7244,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_remove_cross_view_compressed_parent);
 	RUN_TEST(inv_remove_cross_view_prefix_siblings);
 	RUN_TEST(inv_remove_cross_view_prefix_siblings_all);
+	RUN_TEST(inv_root_always_internal);
 	RUN_TEST(inv_detach_cross_view);
 
 	diag("3. Duplicate chain acyclicity");

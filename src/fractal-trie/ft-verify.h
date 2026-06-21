@@ -1016,6 +1016,25 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 
 	if (ft_verify_no_proxy_at_rest(out, "root", root, NULL, 0))
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
+	/*
+	 * Root-is-internal invariant.  ft->root must ALWAYS tag a plain internal
+	 * node -- never compressed / skip-compressed / external -- which the read
+	 * path's hot descent relies on.  Every mutator that re-roots the trie
+	 * (graft / graft_swap / detach / merge) materializes the new root through
+	 * the build-invisible internal-root builders (ft_make_root_internal_glue /
+	 * ft_build_extracted_root_glue), so no compressed root is ever published.
+	 * Asserted here so any future mutator that violates it is caught at the
+	 * next mutation point (and so the descent's defensive non-internal-root
+	 * resolver can be retired once this is proven 0 across the bulk-op suite).
+	 */
+	if (!ft_node_internal(root)) {
+		if (out)
+			fprintf(out, "ft_verify: root %p is NOT internal (compressed=%d skip=%d external=%d)\n",
+				(void *) root, (int) ft_node_compressed(root),
+				(int) ft_node_skip_compressed(root),
+				(int) ft_node_external(root));
+		return CDS_FT_STATUS_INTEGRITY_ERROR;
+	}
 	if (ft_visited_init(&visited)) {
 		if (out)
 			fprintf(out, "ft_verify: visited-set allocation failed\n");
