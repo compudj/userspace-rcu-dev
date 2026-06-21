@@ -1325,6 +1325,18 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *
 	 *    ===== Everything from the drain onward is failure-free. =====
 	 */
+	struct ft_detach_run sdrun = { .into = NULL };
+
+	if (ms_ord && !root_src) {
+		/*
+		 * Non-root src: fuse the src run-unlink into ft_merge_unlink_src_
+		 * subtree's structural unlink flip (EXCISE-ONLY, into == NULL -- the
+		 * run cells disperse to dst via the post-commit interleave), exactly
+		 * as the subpos src side does, closing the src-side disappear window.
+		 */
+		sdrun.rfirst = ms_s_first;
+		sdrun.rlast = ms_s_last;
+	}
 	if (root_src) {
 		/*
 		 * A root src moves the WHOLE source, so its run is the whole src
@@ -1344,13 +1356,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		}
 		FT_TP(root_publish, (const void *) src_ft, (const void *) src_ft->root);
 	} else if (ft_merge_unlink_src_subtree(src_ft, src_key, src_key_len,
-				cnt_src, NULL) < 0) {
+				cnt_src, ms_ord ? &sdrun : NULL) < 0) {
 		/*
-		 * @run NULL: the NON-root spine-copy's src-side run-unlink is NOT yet
-		 * fused (its disappear-side window, like the occupied-dst appear-side
-		 * interleave below, is a separate item -- the standalone
-		 * ft_ord_cell_run_unlink runs below).  The root-src run-unlink IS
-		 * fused into the root swap above.
+		 * OOM in the last fallible step: @src_ft is left pristine (the run was
+		 * not yet applied -- it commits in ft_detach_node's flip, past the
+		 * fallible alloc), so abort the still-invisible build.
 		 */
 		free(ms_edges);
 		if (ms_flip)
@@ -1366,9 +1376,10 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * (survivors) or are freed (collisions).  Deferred to here so an OOM in
 	 * the src unlink above leaves src's list untouched on rollback; done
 	 * before the drain so sync drains src ord-readers of the run too.  Skipped
-	 * for a root src -- fused into the root swap above.
+	 * for a root src (fused into the root swap above) and for a non-root src
+	 * whose unlink already fused the run (sdrun.armed).
 	 */
-	if (ms_ord && !root_src)
+	if (ms_ord && !root_src && !sdrun.armed)
 		ft_ord_cell_run_unlink(src_ft, ms_s_first, ms_s_last);
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
