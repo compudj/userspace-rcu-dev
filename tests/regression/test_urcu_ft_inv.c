@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	42
+#define NR_TESTS	43
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -3830,6 +3830,109 @@ static int inv_graft_swap_sub_cross_view(void)
 	drain_trie_local(live);
 	rcu_barrier();
 	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return 0;
+}
+
+/*
+ * EMPTY-SWAP graft_swap cross-view oracle -- the disappear-side, single-run
+ * shapes.  graft_swap(live, @key, EMPTY_swap) with content at @key is a REMOVE:
+ * it unpublishes run_D at @key (structure) and THEN removes run_D from the
+ * ordered list (a separate ft_ord_cell_run_replace flip), so a reader between
+ * them sees run_D gone from the structure but still at the ordered-list front.
+ *
+ * NON-CYCLING (drain-only): the main thread extracts @live's 2-byte prefixes OUT
+ * in INCREASING order (each into the freshly re-emptied @swap), so @live only
+ * ever SHRINKS -- a re-appearing minimum is impossible, which is what makes the
+ * reused min-drain reader (inv_remove_xview_reader_minvl: lookup_first ->
+ * point(min) -> lookup_first, present/absent/present) sound.  A cycling
+ * extract+graft-back writer is NOT sound here: a full out-and-back between the
+ * reader's two list reads forges a "stable" front while the point lookup caught
+ * the transient absence.  Keys are {p_hi,p_lo,s}: extracting {p_hi,p_lo} clears
+ * p_lo's slot in the p_hi node, which is the publish-NULL (non-sole-child) shape
+ * while p_hi still has other p_lo children, and the gs_reserved (sole-child
+ * detach-prune) shape for the LAST p_lo under each p_hi -- so this one oracle
+ * exercises BOTH empty-swap corners.
+ */
+#ifndef GRAFT_SWAP_EMPTY_PREFIXES
+#define GRAFT_SWAP_EMPTY_PREFIXES	6000
+#endif
+#define GRAFT_SWAP_EMPTY_PER		3
+
+static int inv_graft_swap_empty_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *live = create_varlen_ord_ft(&group);
+	struct cds_ft *swap;
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct timespec t0;
+	unsigned int i, p, s;
+
+	if (cds_ft_create(group, NULL, &swap) < 0)
+		abort();
+
+	rcu_read_lock();
+	for (p = 0; p < GRAFT_SWAP_EMPTY_PREFIXES; p++) {
+		for (s = 0; s < GRAFT_SWAP_EMPTY_PER; s++) {
+			uint8_t key[3] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff),
+				(uint8_t) s };
+			struct ft_test_node *n = node_alloc(p);
+
+			n->value = 3;
+			memcpy(n->okey, key, 3);
+			if (cds_ft_insert(live, key, 3, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+	}
+	rcu_read_unlock();
+
+	ctx.ft = live;			/* readers watch the DRAINED live trie */
+	ctx.test_name = "inv_graft_swap_empty_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
+			&ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	/* Extract each prefix's subtree OUT of @live (empty-swap remove), in
+	 * increasing order so @live only shrinks, draining @swap back to empty
+	 * between extracts.  Each graft_swap is a grace period. */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (p = 0; p < GRAFT_SWAP_EMPTY_PREFIXES; p++) {
+		uint8_t prefix[2] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff) };
+
+		if (cds_ft_graft_swap(live, prefix, 2, swap) != CDS_FT_STATUS_OK)
+			abort();
+		drain_trie_local(swap);		/* re-empty @swap for the next extract */
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_graft_swap_empty_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_trie_local(live);
+		drain_trie_local(swap);
+		rcu_barrier();
+		cds_ft_destroy(live);
+		cds_ft_destroy(swap);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	drain_trie_local(live);
+	drain_trie_local(swap);
+	rcu_barrier();
+	cds_ft_destroy(live);
+	cds_ft_destroy(swap);
 	cds_ft_group_destroy(group);
 	return 0;
 }
@@ -8289,6 +8392,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_swap_atomicity);
 	RUN_TEST(inv_graft_swap_cross_view);
 	RUN_TEST(inv_graft_swap_sub_cross_view);
+	RUN_TEST(inv_graft_swap_empty_cross_view);
 
 	diag("5. Relational lookup consistency");
 	RUN_TEST(inv_relational_lookup);
