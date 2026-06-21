@@ -1441,13 +1441,13 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		/* ===== PREP: build clusters A and B (both tries pristine) ===== */
 
 		/*
-		 * Empty-swap remove that would orphan the graft point's parent
-		 * (its sole child leaves): secure a node reserve for the prune's
-		 * possible recompaction, build-invisibly (an OOM here leaves both
-		 * tries pristine).
+		 * Empty-swap remove: the COMMIT routes it through ft_detach_node
+		 * (correct parent bookkeeping for every shape -- sole-child prune,
+		 * multi-child in-place delete, recompaction).  Secure a node reserve
+		 * for any recompaction the detach may do, build-invisibly (an OOM
+		 * here leaves both tries pristine), so the commit detach cannot fail.
 		 */
-		if (swap_empty &&
-		    cds_ft_item_to_metadata(ft_node_ptr(d.pnf))->nr_child == 1) {
+		if (swap_empty) {
 			memset(&gs_reserve, 0, sizeof(gs_reserve));
 			if (ft_bulk_node_reserve_fill(dst_ft, &gs_reserve)) {
 				cds_ft_alloc_reserve_drain(dst_ft, &gs_reserve);
@@ -1666,18 +1666,21 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (have_insert) {
 			ft_glue_apply_deferred(dst_ft, &glue_insert);
 			ft_glue_publish_replace(dst_ft, &glue_insert, swap_run_arg);
-		} else if (gs_reserved) {
+		} else {
 			/*
-			 * Empty-swap remove whose graft point is @d.pnf's SOLE child:
-			 * publishing NULL would leave @d.pnf childless (a compressed
-			 * node, or a single-child internal).  Prune via a move-style
-			 * detach -- it preserves @old_child for the extract side below
-			 * and frees @d.pnf + the single-child chain up to a surviving
-			 * ancestor.  Propagate -@old_count FIRST (undercount ordering,
-			 * while @d.pnf is still live), then detach from the secured
-			 * reserve so it cannot fail.  The detach owns the surviving
-			 * ancestor's nr_child + the prune, so the post-publish
-			 * nr_child-- / propagate are skipped (and @d.pnf is now freed).
+			 * Empty-swap remove (a REMOVE of @old_child at @key): route it
+			 * through a move-style ft_detach_node so the parent's bookkeeping
+			 * is correct for EVERY graft-point shape -- not just a sole-child
+			 * prune (compressed / single-child internal: frees @d.pnf and the
+			 * chain to a surviving ancestor) but also a multi-child in-place
+			 * delete (clears the parent's pigeon bitmap bit / popcount slot,
+			 * which a raw ft_publish_to_parent(NULL) does NOT) and any
+			 * recompaction a shrinking parent needs.  free_detached_subtree ==
+			 * false preserves @old_child for the extract side below.  Propagate
+			 * -@old_count FIRST (undercount ordering, while @d.pnf is still
+			 * live), then detach from the reserve secured in PREP so it cannot
+			 * fail.  The detach owns the parent nr_child + any prune, so the
+			 * post-publish nr_child-- / propagate are skipped (empty_pruned).
 			 */
 			int dret;
 
@@ -1690,15 +1693,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			assert(dret == 0);	/* reserve guarantees no -ENOMEM */
 			(void) dret;
 			empty_pruned = true;
-		} else {
-			/*
-			 * Empty-swap remove at a non-sole-child graft point: publish
-			 * NULL.  NOT fused with run_D's removal here -- this and the
-			 * gs_reserved sole-child prune above are the two empty-swap
-			 * (single-run) corners left on the standalone run-replace below;
-			 * only the have_insert two-run swap is fused (see swap_run).
-			 */
-			ft_publish_to_parent(dst_ft, d.pnf, d.nfp, NULL);
 		}
 
 		/*
@@ -1733,8 +1727,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * @key structurally; run_S NULL for an empty swap -> run_D just
 		 * leaves).  Paired with the dst-side drain below, which removes any
 		 * reader still holding run_D in dst.  Skipped when the publish above
-		 * already FUSED it into the structural flip (swap_run.armed); only
-		 * the sole-child detach-prune path still uses this standalone form.
+		 * already FUSED it into the structural flip (swap_run.armed): only the
+		 * gs_reserved sole-child detach-prune path still uses this standalone
+		 * form (its prune commits separately via ft_detach_node).
 		 */
 		if (gs_ord && !swap_run.armed)
 			ft_ord_cell_run_replace(dst_ft, gs_d_first, gs_d_last,
