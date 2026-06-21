@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	35
+#define NR_TESTS	36
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2257,6 +2257,183 @@ static int inv_root_always_internal(void)
 	cds_ft_destroy(swap);
 	cds_ft_group_destroy(group);
 	return 0;
+}
+
+/*
+ * BULK-OP (appear-side) cross-view oracle -- the dual of inv_detach_cross_view.
+ * A graft publishes the grafted run into @dst structurally and THEN splices its
+ * cell run into @dst's ordered list (on HEAD, a separate ft_ord_cell_run_splice
+ * flip), so between the two commits a grafted key is reachable in the STRUCTURE
+ * but missing from the ordered LIST.  The fix fuses both into ONE flip.
+ *
+ * Like the disappear oracle, this is NON-CYCLING (keys only ever APPEAR), which
+ * is what makes the check sound: the main thread grafts a fresh run at a
+ * strictly DECREASING prefix, so each graft installs a new GLOBAL MINIMUM and
+ * the ordered-list minimum only ever decreases -- never re-appears.  The reader
+ * compares two independent views of the minimum:
+ *   - the ordered-list front  via cds_ft_lookup_first (the O(1) cell-list head),
+ *   - the structural minimum  via cds_ft_lookup_ge from a sub-minimal key (a
+ *     pure trie descent, no cell list).
+ * It reads the list front TWICE around the structural descent and flags only
+ * when the front is STABLE yet the structural minimum is a SMALLER key: that
+ * means a key is reachable in the structure below the ordered-list front, i.e.
+ * its run was published structurally but its cell not yet spliced.  The
+ * front-stable sandwich filters an atomic one-flip graft (which moves the front
+ * and the structural min together -- the two front reads then differ); only a
+ * genuine two-commit window survives.  Monotone-decreasing + add-only forbids
+ * the front from rising again, so there are no benign re-appear false positives.
+ */
+#ifndef GRAFT_XVIEW_GRAFTS
+#define GRAFT_XVIEW_GRAFTS	20000
+#endif
+
+/* Lexicographic compare of two byte keys (shorter sorts first on a tie). */
+static int xview_key_cmp(const uint8_t *a, size_t la, const uint8_t *b, size_t lb)
+{
+	size_t n = la < lb ? la : lb;
+	int c = memcmp(a, b, n);
+
+	if (c)
+		return c;
+	return la < lb ? -1 : (la > lb ? 1 : 0);
+}
+
+static void *inv_graft_xview_appear_reader(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+	static const uint8_t SUBMIN[3] = { 0x00, 0x00, 0x00 };
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft_node *n;
+		uint8_t kf1[8], kf2[8], ks[8];
+		size_t lf1, lf2, lks;
+
+		rcu_read_lock();
+		/* List front (cell-list head). */
+		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+		    (n = cds_ft_iter_node(iter)) != NULL) {
+			lf1 = xview_node_key(n, kf1);
+			/* Structural minimum via a pure trie descent (>= submin). */
+			cds_ft_iter_set_key(iter, SUBMIN, 3);
+			if (cds_ft_lookup_ge(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+			    (n = cds_ft_iter_node(iter)) != NULL) {
+				lks = xview_node_key(n, ks);
+				/* Re-read the list front: only a STABLE front lets us
+				 * compare the two views at one consistent moment. */
+				if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+				    (n = cds_ft_iter_node(iter)) != NULL) {
+					lf2 = xview_node_key(n, kf2);
+					if (xview_key_cmp(kf1, lf1, kf2, lf2) == 0 &&
+					    xview_key_cmp(ks, lks, kf1, lf1) < 0)
+						report_violation(ctx->test_name,
+							"structural minimum (len %zu) is BELOW"
+							" the stable ordered-list front (len %zu)"
+							" -- a grafted run is published in the"
+							" structure but not yet spliced into the"
+							" ordered list", lks, lf1);
+				}
+			}
+		}
+		rcu_read_unlock();
+		/* QSBR: cds_ft_graft synchronize_rcu's; never stall the grafter. */
+		rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_graft_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft(&group);
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct timespec t0;
+	unsigned int i, k;
+
+	/* Stable upper bulk: prefix {0xFF,0xFF}, always above every grafted run. */
+	rcu_read_lock();
+	for (i = 0; i < 16; i++) {
+		uint8_t key[3] = { 0xFF, 0xFF, (uint8_t) i };
+		struct ft_test_node *n = node_alloc(0x1000 + i);
+
+		n->value = 3;
+		memcpy(n->okey, key, 3);
+		if (cds_ft_insert(ft, key, 3, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_graft_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_graft_xview_appear_reader, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	/*
+	 * Graft a fresh 2-key run at a strictly DECREASING 2-byte prefix, so each
+	 * graft installs a new global minimum.  The source holds the run's SUFFIX
+	 * keys ({0x00},{0x01}); after the graft they become prefix-extended keys in
+	 * @ft (the test node stashes the full @okey).  Time-bounded: each graft is
+	 * a grace period, so the pool may not drain within the window.
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (k = 0; k < GRAFT_XVIEW_GRAFTS; k++) {
+		unsigned int pv = 0xFEFF - k;	/* decreasing distinct prefix */
+		uint8_t prefix[2] = { (uint8_t)(pv >> 8), (uint8_t)(pv & 0xff) };
+		struct cds_ft *src;
+		unsigned int s;
+
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		rcu_read_lock();
+		for (s = 0; s < 2; s++) {
+			uint8_t suffix[1] = { (uint8_t) s };
+			uint8_t full[3] = { prefix[0], prefix[1], (uint8_t) s };
+			struct ft_test_node *n = node_alloc(pv * 4 + s);
+
+			n->value = 3;
+			memcpy(n->okey, full, 3);
+			if (cds_ft_insert(src, suffix, 1, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+
+		if (cds_ft_graft(ft, prefix, 2, src) != CDS_FT_STATUS_OK)
+			abort();
+		cds_ft_destroy(src);		/* emptied by the graft */
+
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_graft_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
 }
 
 static int inv_detach_cross_view(void)
@@ -7245,6 +7422,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_remove_cross_view_prefix_siblings);
 	RUN_TEST(inv_remove_cross_view_prefix_siblings_all);
 	RUN_TEST(inv_root_always_internal);
+	RUN_TEST(inv_graft_cross_view);
 	RUN_TEST(inv_detach_cross_view);
 
 	diag("3. Duplicate chain acyclicity");
