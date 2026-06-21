@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	43
+#define NR_TESTS	44
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2770,6 +2770,173 @@ static int inv_merge_root_swap_cross_view(void)
 	}
 	cds_ft_destroy(probe);
 	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * BULK-OP (disappear-side) cross-view oracle for cds_ft_merge_at's ROOT-SRC
+ * spine-copy shape: merging a WHOLE source (src_key_len == 0) into an OCCUPIED
+ * dst sub-position (cnt_dst > 0) reaches ft_merge_spine_copy's root_src branch,
+ * which swaps src->root to a fresh empty root (structure) and THEN unlinks the
+ * source's whole run from src's ordered list (a separate ft_ord_cell_run_unlink
+ * flip), so a SRC reader between them sees src structurally empty but its
+ * ordered-list front still populated.  The fix fuses the root swap with the
+ * head/tail clear (ft_root_list_swap_publish).
+ *
+ * The disappear-side dual of inv_rootswap_appear_reader: the watched src changes
+ * every merge (a fresh src, emptied by the merge), published through ctx->cur
+ * and pool-pinned until the readers join; the reader rebinds its iter per src and
+ * uses the front-stable sandwich (front, struct, front), flagging when the front
+ * is STABLY PRESENT yet the structure is empty.  NON-CYCLING: each src goes
+ * full -> empty exactly once, so a re-populating front is impossible.
+ */
+static void *inv_rootswap_disappear_reader(void *arg)
+{
+	struct inv_rootswap_ctx *ctx = (struct inv_rootswap_ctx *) arg;
+	struct cds_ft_iter *iter = NULL;
+	struct cds_ft *bound = NULL;
+	static const uint8_t SUBMIN[1] = { 0x00 };
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct cds_ft *src = rcu_dereference(ctx->cur);
+		bool front1, front2, struct_full;
+
+		if (!src) {
+			rcu_quiescent_state();
+			continue;
+		}
+		if (src != bound) {
+			if (iter)
+				cds_ft_iter_destroy(iter);
+			if (cds_ft_iter_create(src, &iter) < 0)
+				abort();
+			bound = src;
+		}
+
+		rcu_read_lock();
+		front1 = cds_ft_lookup_first(src, iter) == CDS_FT_STATUS_OK
+			&& cds_ft_iter_node(iter) != NULL;
+		cds_ft_iter_set_key(iter, SUBMIN, 1);
+		struct_full = cds_ft_lookup_ge(src, iter) == CDS_FT_STATUS_OK
+			&& cds_ft_iter_node(iter) != NULL;
+		front2 = cds_ft_lookup_first(src, iter) == CDS_FT_STATUS_OK
+			&& cds_ft_iter_node(iter) != NULL;
+		if (front1 && front2 && !struct_full)
+			report_violation(ctx->test_name,
+				"the ordered-list front is stably present but the"
+				" structure is empty -- the root_src merge swapped"
+				" src->root to empty before clearing the"
+				" ordered-list head/tail", 0);
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_merge_root_src_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst = create_varlen_ord_ft(&group);
+	struct inv_rootswap_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct cds_ft **pool;
+	struct timespec t0;
+	static const uint8_t AT[1] = { 0x80 };
+	unsigned int i, k, nmerges = 0;
+	int ret = 0;
+
+	pool = (struct cds_ft **) calloc(ROOTSWAP_XVIEW_GRAFTS, sizeof(*pool));
+	if (!pool)
+		abort();
+
+	/* Occupy dst at {0x80} so each whole-src merge takes the spine-copy
+	 * root_src path (cnt_dst > 0 at the merge point). */
+	rcu_read_lock();
+	{
+		uint8_t key[2] = { 0x80, 0x00 };
+		struct ft_test_node *n = node_alloc(0);
+
+		n->value = 2;
+		memcpy(n->okey, key, 2);
+		if (cds_ft_insert(dst, key, 2, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	ctx.cur = NULL;
+	ctx.test_name = "inv_merge_root_src_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_rootswap_disappear_reader, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (k = 0; k < ROOTSWAP_XVIEW_GRAFTS; k++) {
+		struct cds_ft *src;
+		unsigned int s;
+
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		/* DISTINCT keys per merge (a per-k 2-byte suffix), so the merged
+		 * content accumulates in dst as a trie rather than long dup chains
+		 * (keeping each spine-copy merge and the final drain near O(log)). */
+		rcu_read_lock();
+		for (s = 0; s < 2; s++) {
+			uint8_t key[3] = { (uint8_t)(0x01 + s),
+				(uint8_t)(k >> 8), (uint8_t)(k & 0xff) };
+			struct ft_test_node *n = node_alloc(k * 2 + s);
+
+			n->value = 3;
+			memcpy(n->okey, key, 3);
+			if (cds_ft_insert(src, key, 3, &n->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+
+		/* Publish the full src, THEN merge it WHOLE into dst@{0x80} (occupied
+		 * -> spine-copy root_src): src goes full -> empty. */
+		pool[k] = src;
+		nmerges = k + 1;
+		rcu_assign_pointer(ctx.cur, src);
+		if (cds_ft_merge_at(dst, AT, 1, src, NULL, 0) != CDS_FT_STATUS_OK)
+			abort();
+
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	/* Srcs were emptied by the merges; dst holds all the merged content. */
+	rcu_assign_pointer(ctx.cur, NULL);
+	rcu_barrier();
+	for (k = 0; k < nmerges; k++)
+		cds_ft_destroy(pool[k]);
+	free(pool);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_merge_root_src_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		ret = -1;
 	return ret;
 }
 
@@ -8378,6 +8545,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_cross_view);
 	RUN_TEST(inv_graft_root_swap_cross_view);
 	RUN_TEST(inv_merge_root_swap_cross_view);
+	RUN_TEST(inv_merge_root_src_cross_view);
 	RUN_TEST(inv_merge_cross_view);
 	RUN_TEST(inv_merge_src_cross_view);
 	RUN_TEST(inv_detach_cross_view);
