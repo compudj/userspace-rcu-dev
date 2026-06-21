@@ -348,6 +348,13 @@ struct ft_graft_store_state {
 	unsigned int tp_i;
 };
 
+/*
+ * Flip-batch capacity for a run-fused graft store: 1 structural slot edge +
+ * the <=4 boundary edges of the ordered-list run-splice (ft_graft_run), all
+ * committed in ONE flip.  A run-less store needs only the single slot edge.
+ */
+#define FT_GRAFT_RUN_FLIP_CAP	5
+
 static
 enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -356,8 +363,11 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		unsigned long graft_external_count,
 		struct ft_glue *glue,
 		struct ft_flip_batch **pre_flip,
+		struct ft_graft_run *run,
 		struct ft_graft_store_state *st)
 {
+	unsigned int flip_cap = run ? FT_GRAFT_RUN_FLIP_CAP : 1;
+
 	memset(st, 0, sizeof(*st));
 	st->glue = glue;
 
@@ -399,7 +409,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			slot_value = ft_publish_compressed(ft,
 				ft_compressed_node_ptr(graft_payload),
 				graft_payload);
-		b = ft_flip_batch_take(ft, 1, pre_flip);
+		b = ft_flip_batch_take(ft, flip_cap, pre_flip);
 		if (!b)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		pf = ft_flip_batch_add(b, NULL, slot_value);
@@ -476,7 +486,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			 * fallible slot store runs FIRST and the wiring
 			 * completes invisibly in commit.
 			 */
-			b = ft_flip_batch_take(ft, 1, pre_flip);
+			b = ft_flip_batch_take(ft, flip_cap, pre_flip);
 			if (!b)
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			pf = ft_flip_batch_add(b, NULL, branch);
@@ -505,6 +515,7 @@ static
 void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attached_nf,
 		unsigned int *attached_depth,
+		struct ft_graft_run *run,
 		struct ft_graft_store_state *st)
 {
 	if (st->displaced_shape) {
@@ -512,10 +523,25 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * Phase 2: glue deferred FIRST (the payload's live back-pointers
 		 * must be wired before any dst-reachable live edge flips into the
 		 * fresh cluster), then the back-channel, then the forward publish.
+		 *
+		 * The forward publish is the edge that makes the grafted run
+		 * reachable, so it is FUSED with the ordered-list run-splice (record
+		 * it into @rec, then ft_ord_cell_flip_rec_run) when the list is on.
+		 * The displaced external's own cell stays put (it remains a key,
+		 * relocated under the branch); @run->pred/succ -- located before the
+		 * attach -- bracket it, so the run splices in beside it.
 		 */
 		ft_glue_apply_deferred(ft, st->glue);
 		ft_publish_external_nodes_prev(ft, st->attached, st->displaced);
-		ft_publish_to_parent(ft, st->pnf, st->nfp, st->attached);
+		if (run) {
+			struct ft_pub_rec rec = { .n = 0 };
+
+			_ft_publish_to_parent(ft, st->pnf, st->nfp, st->attached,
+				&rec);
+			ft_ord_cell_flip_rec_run(ft, &rec, run);
+		} else {
+			ft_publish_to_parent(ft, st->pnf, st->nfp, st->attached);
+		}
 		if (st->tp_i >= 1)
 			FT_TP(tree_edge_set, (const void *) ft,
 				(const void *) st->pnf,
@@ -524,6 +550,8 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 				(const void *) st->attached);
 	} else {
 		struct cds_ft_inode_flag **slot = NULL;
+		struct ft_ord_cell_edge redges[4];
+		unsigned int rn = 0, i;
 
 		ft_node_get_nth_skip(st->dest, &slot, st->slot_byte, FT_PF_NONE);
 		assert(slot);
@@ -531,9 +559,32 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		ft_glue_apply_deferred(ft, st->glue);
 		ft_publish_to_parent(ft, st->publish_pmeta->parent, st->pnfp,
 			st->dest);
+		/*
+		 * Fuse the ordered-list run-splice into the SAME flip as the
+		 * structural slot store: install the run's <=4 boundary-edge
+		 * proxies into @st->b (sized FT_GRAFT_RUN_FLIP_CAP in prepare) so
+		 * the single ft_flip_batch_commit makes the grafted key appear in
+		 * the structure and the ordered list atomically.  The slot proxy
+		 * was already parked in prepare (the last fallible step); the cell
+		 * edges have no fallible step, so they install here.
+		 */
+		if (run) {
+			rn = ft_ord_cell_run_splice_edges(ft, run->run_first,
+				run->run_last, run->pred, run->succ, redges, 0);
+			for (i = 0; i < rn; i++)
+				rcu_assign_pointer(*redges[i].slot,
+					(struct ft_ord_cell *) ft_flip_batch_add(
+						st->b,
+						(struct cds_ft_inode_flag *) redges[i].old_target,
+						(struct cds_ft_inode_flag *) redges[i].new_target));
+		}
 		ft_flip_batch_commit(st->b);
 		rcu_assign_pointer(*slot, st->slot_value);
+		for (i = 0; i < rn; i++)
+			rcu_assign_pointer(*redges[i].slot, redges[i].new_target);
 		ft_flip_batch_reclaim(st->b);
+		if (run)
+			run->armed = true;
 
 		if (st->old_recompacted_node)
 			free_cds_ft_node(ft, st->old_recompacted_node);
@@ -546,10 +597,13 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 /*
  * Combined NOSPLIT store: prepare + commit back-to-back -- cds_ft_graft's call
  * site, run after the source-root unlink + drain.  @pre_flip, when non-NULL, is
- * a caller-pre-allocated 1-entry flip batch the prepare uses instead of
- * allocating its own: a sub-position merge pre-allocates it BEFORE its source
- * unlink so this post-drain store has no fallible allocation left (the node
- * allocations draw from the reserve, the flip batch is pre-secured).
+ * a caller-pre-allocated flip batch the prepare uses instead of allocating its
+ * own: a sub-position merge pre-allocates it BEFORE its source unlink so this
+ * post-drain store has no fallible allocation left (the node allocations draw
+ * from the reserve, the flip batch is pre-secured).  @run, when non-NULL, fuses
+ * an ordered-list run-splice into the structural publish flip (both store shapes:
+ * the in-place slot proxy and the displaced-external forward publish) -- the
+ * caller must size @pre_flip to FT_GRAFT_RUN_FLIP_CAP for the slot shape.
  */
 static
 enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
@@ -560,16 +614,18 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attached_nf,
 		unsigned int *attached_depth,
 		struct ft_glue *glue,
-		struct ft_flip_batch **pre_flip)
+		struct ft_flip_batch **pre_flip,
+		struct ft_graft_run *run)
 {
 	struct ft_graft_store_state st;
 	enum cds_ft_status status;
 
 	status = ft_store_at_graft_point_prepare(ft, key, key_len, d,
-			graft_payload, graft_external_count, glue, pre_flip, &st);
+			graft_payload, graft_external_count, glue, pre_flip,
+			run, &st);
 	if (status != CDS_FT_STATUS_OK)
 		return status;
-	ft_store_at_graft_point_commit(ft, attached_nf, attached_depth, &st);
+	ft_store_at_graft_point_commit(ft, attached_nf, attached_depth, run, &st);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -765,6 +821,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *attached_nf = NULL;
 		struct ft_ord_cell *graft_run_first = NULL, *graft_run_last = NULL;
 		struct ft_ord_cell *graft_pred = NULL, *graft_succ = NULL;
+		struct ft_graft_run graft_run;
+		struct ft_graft_run *run_arg = NULL;
 		/*
 		 * Self-secured NOSPLIT attach: when no caller reserve is active, this
 		 * graft reserves its own commit nodes + flip batch before publishing
@@ -860,7 +918,9 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 				free_cds_ft_node(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
-			graft_flip = ft_flip_batch_alloc(dst_ft, 1);
+			graft_flip = ft_flip_batch_alloc(dst_ft,
+				dst_ft->group->ordered_list_set ?
+					FT_GRAFT_RUN_FLIP_CAP : 1);
 			if (!graft_flip) {
 				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
 				ft_glue_abort(dst_ft, &glue);
@@ -909,6 +969,33 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			src_ft->ord_cell_tail = NULL;
 		}
 
+		/*
+		 * Ordered list: arm the run-splice fusion so the NOSPLIT store
+		 * commits the structural attach and the ordered-list splice in ONE
+		 * flip (closing the appear-side cross-view window).  The GLUE path
+		 * and the displaced-external store shape leave @armed false, falling
+		 * back to the standalone two-commit splice below.
+		 */
+		if (graft_run_first) {
+			/*
+			 * NIL-key graft: stamp the spliced cell's key-rebuild byte
+			 * BEFORE it is fused into dst's ordered list -- once the
+			 * fused splice publishes the cell, a reader iterating to it
+			 * rematerializes the key via incoming_byte.  (ft_set_parent
+			 * does not maintain it for externals; harmless when the
+			 * parent is compressed, where the up-walk ignores it.)
+			 */
+			if (nil_key_root)
+				cds_ft_item_to_metadata(graft_run_first)->incoming_byte =
+					key[key_len - 1];
+			graft_run.run_first = graft_run_first;
+			graft_run.run_last = graft_run_last;
+			graft_run.pred = graft_pred;
+			graft_run.succ = graft_succ;
+			graft_run.armed = false;
+			run_arg = &graft_run;
+		}
+
 		if (!src_ft->exclusive)
 			src_ft->group->flavor->update_synchronize_rcu();
 
@@ -918,11 +1005,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * cluster: wire the deferred live back-pointers (the
 			 * displaced old child, the payload, and the cluster
 			 * top), splice the cluster into dst with a single
-			 * forward publish, then reclaim the old compressed
-			 * node and the source's old root.  Nothing can fail.
+			 * forward publish -- FUSED with the ordered-list
+			 * run-splice into ONE flip when the list is on -- then
+			 * reclaim the old compressed node and the source's old
+			 * root.  Nothing can fail.
 			 */
 			ft_glue_apply_deferred(dst_ft, &glue);
-			ft_glue_publish(dst_ft, &glue);
+			ft_glue_publish_run(dst_ft, &glue, run_arg);
 			attached_nf = glue.attached_nf;
 			ft_glue_free_old(dst_ft, &glue);
 		} else {
@@ -947,7 +1036,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 							  src_count,
 							  &attached_nf,
 							  &attached_depth,
-							  &glue, store_pre_flip);
+							  &glue, store_pre_flip,
+							  run_arg);
 			if (self_secured) {
 				cds_ft_alloc_reserve_deactivate(dst_ft);
 				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
@@ -984,23 +1074,15 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		}
 
 		/*
-		 * NIL-key graft: the placed external sits directly under an internal
-		 * slot, so refresh its CELL edge byte for the ordered key rebuild
-		 * (ft_set_parent does not maintain it for externals; harmless when
-		 * the parent is compressed, where the up-walk ignores it).
+		 * Ordered list: src is now structurally empty + drained; the payload
+		 * is published under @key in dst.  Every ordered graft shape (GLUE,
+		 * displaced-external, in-place slot) FUSES the run-splice into its
+		 * structural flip (@armed), so a reader never sees the run in one
+		 * index but not the other.  The standalone two-commit splice remains
+		 * as a defensive fallback for any not-yet-fused shape (none today);
+		 * without it an unfused shape would strand the run out of the list.
 		 */
-		if (nil_key_root && graft_run_first)
-			cds_ft_item_to_metadata(graft_run_first)->incoming_byte =
-				key[key_len - 1];
-
-		/*
-		 * Ordered list: src is now structurally empty + drained; the
-		 * payload is published under @key in dst.  Splice the captured run
-		 * (src's whole former list) into dst's ordered cell list at the
-		 * @key position (an empty range in dst -> no interleave).  Same
-		 * commit point as the structural publish above.
-		 */
-		if (graft_run_first)
+		if (graft_run_first && !graft_run.armed)
 			ft_ord_cell_run_splice(dst_ft, graft_run_first,
 				graft_run_last, graft_pred, graft_succ);
 

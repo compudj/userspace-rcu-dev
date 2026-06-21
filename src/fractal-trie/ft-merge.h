@@ -1717,7 +1717,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		cds_ft_alloc_reserve_activate(dst_ft, &reserve);
 		st = ft_store_at_graft_point(dst_ft, okey_dst, dst_key_len, &d,
 				payload, cnt_src, &attached_nf, &adepth, &glue,
-				&pre_flip);
+				&pre_flip, NULL);
 		cds_ft_alloc_reserve_deactivate(dst_ft);
 		assert(st == CDS_FT_STATUS_OK);
 		(void) st;
@@ -2007,8 +2007,19 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * @pf_ms (cap 2n+2, only for an occupied ordered merge) feeds the
 		 * ordered-list interleave.  Caps are upper bounds; the merge uses
 		 * <= them and NULLs the slot it consumes, so we free the rest below.
+		 *
+		 * When @mrg_key is ABSENT (m == 0) the merge GRAFTS, and an ordered
+		 * graft FUSES its run-splice into this same batch (the structural slot
+		 * edge plus the run's <=4 boundary edges -- FT_GRAFT_RUN_FLIP_CAP), so
+		 * size for that here.
 		 */
-		pf_flip = ft_flip_batch_alloc(dst_ft, (unsigned int) (m + 1));
+		{
+			unsigned int pf_cap = (unsigned int) (m + 1);
+
+			if (m == 0 && dst_ft->group->ordered_list_set)
+				pf_cap = FT_GRAFT_RUN_FLIP_CAP;
+			pf_flip = ft_flip_batch_alloc(dst_ft, pf_cap);
+		}
 		if (!pf_flip) {
 			FT_TP(merge_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 			return CDS_FT_STATUS_MEMORY_ERROR;

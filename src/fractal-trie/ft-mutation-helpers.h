@@ -865,19 +865,20 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
  * as the boundary.  @pred / @succ are @dst-original cells, which graft never
  * moves, so they stay valid until this splice.
  *
- * Pre-sets the run's outer links (run not yet reachable in @dst), flips the
- * <=2 boundary edges atomically (for @dst's live readers), and repairs @dst
- * head/tail.  The run's source trie must already have released it (head/tail
- * cleared + a grace period) so no source reader is mid-run.
+ * Pre-sets the run's outer links (run not yet reachable in @dst) and APPENDS
+ * the <=2 neighbour edges plus any @dst head/tail repair to @edges, leaving the
+ * caller to flip them.  Split out (the appear-side dual of
+ * ft_ord_cell_run_detach_edges) so a bulk graft can FUSE these edges with its
+ * structural attach publish in ONE flip (ft_store_at_graft_point's batch),
+ * closing the appear-side cross-view window; ft_ord_cell_run_splice is the
+ * standalone (two-commit) wrapper.
  */
 static
-void ft_ord_cell_run_splice(struct cds_ft *dst, struct ft_ord_cell *run_first,
-		struct ft_ord_cell *run_last, struct ft_ord_cell *pred,
-		struct ft_ord_cell *succ)
+unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
+		struct ft_ord_cell *run_first, struct ft_ord_cell *run_last,
+		struct ft_ord_cell *pred, struct ft_ord_cell *succ,
+		struct ft_ord_cell_edge *edges, unsigned int n)
 {
-	struct ft_ord_cell_edge edges[4];
-	unsigned int n = 0;
-
 	/* Pre-set the run's outer links; not yet reachable via @dst's list. */
 	run_first->ord_prev = pred;
 	run_last->ord_next = succ;
@@ -895,7 +896,67 @@ void ft_ord_cell_run_splice(struct cds_ft *dst, struct ft_ord_cell *run_first,
 	}
 	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_head, succ, run_first, edges, n);
 	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_tail, pred, run_last, edges, n);
+	return n;
+}
+
+/*
+ * Pre-sets the run's outer links (run not yet reachable in @dst), flips the
+ * <=2 boundary edges atomically (for @dst's live readers), and repairs @dst
+ * head/tail.  The run's source trie must already have released it (head/tail
+ * cleared + a grace period) so no source reader is mid-run.
+ */
+static
+void ft_ord_cell_run_splice(struct cds_ft *dst, struct ft_ord_cell *run_first,
+		struct ft_ord_cell *run_last, struct ft_ord_cell *pred,
+		struct ft_ord_cell *succ)
+{
+	struct ft_ord_cell_edge edges[4];
+	unsigned int n = ft_ord_cell_run_splice_edges(dst, run_first, run_last,
+		pred, succ, edges, 0);
+
 	ft_ord_cell_flip(dst, edges, n);
+}
+
+/*
+ * Appear-side run-splice fusion descriptor (the dual of struct ft_detach_run):
+ * a bulk graft attaches the source trie's whole former ordered-list run
+ * [@run_first .. @run_last] between @dst's @pred / @succ neighbours.  Threaded
+ * through ft_store_at_graft_point so the run-splice boundary edges join the
+ * SAME flip as the structural attach publish -- a reader then never observes a
+ * grafted key present in the structure but absent from the ordered list (or
+ * vice versa).  @armed reports that the run was fused (so cds_ft_graft skips the
+ * standalone two-commit ft_ord_cell_run_splice fallback).
+ */
+struct ft_graft_run {
+	struct ft_ord_cell *run_first, *run_last;	/* src's captured former list */
+	struct ft_ord_cell *pred, *succ;		/* dst splice neighbours */
+	bool armed;
+};
+
+/*
+ * Commit a graft's RECORDED structural publish edges (@rec: the forward parent
+ * slot, plus a compressed parent's SKIP_X dual) ATOMICALLY with @run's
+ * ordered-list run-splice, in ONE ft_ord_cell_flip -- the shared tail of the
+ * GLUE and displaced-external graft shapes whose publish is a direct store (not
+ * a parked flip-batch proxy like the in-place slot shape).  Arms @run.
+ */
+static
+void ft_ord_cell_flip_rec_run(struct cds_ft *ft, struct ft_pub_rec *rec,
+		struct ft_graft_run *run)
+{
+	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 cell */
+	unsigned int n = 0, i;
+
+	for (i = 0; i < rec->n; i++) {
+		edges[n].slot = (struct ft_ord_cell **) rec->slot[i];
+		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
+		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
+		n++;
+	}
+	n = ft_ord_cell_run_splice_edges(ft, run->run_first, run->run_last,
+		run->pred, run->succ, edges, n);
+	ft_ord_cell_flip(ft, edges, n);
+	run->armed = true;
 }
 
 /*
@@ -1862,6 +1923,31 @@ static
 void ft_glue_publish(struct cds_ft *ft, struct ft_glue *g)
 {
 	ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top);
+}
+
+/*
+ * GLUE-path graft publish FUSED with an ordered-list run-splice -- the
+ * appear-side dual of ft_remove_commit_rec.  When @run is set, RECORD the
+ * cluster's forward publish edge (plus a compressed parent's SKIP_X dual) via a
+ * ft_pub_rec instead of storing it, append the run's <=4 splice boundary edges,
+ * and commit them all in ONE ft_ord_cell_flip, so a reader never sees the
+ * grafted run reachable in the structure but absent from the ordered list (or
+ * vice versa).  @run->armed is set so the caller skips the standalone splice.
+ * @run NULL (ordered list off) falls back to the plain forward publish.
+ */
+static
+void ft_glue_publish_run(struct cds_ft *ft, struct ft_glue *g,
+		struct ft_graft_run *run)
+{
+	struct ft_pub_rec rec = { .n = 0 };
+
+	if (!run) {
+		ft_glue_publish(ft, g);
+		return;
+	}
+	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
+		&rec);
+	ft_ord_cell_flip_rec_run(ft, &rec, run);
 }
 
 /*
