@@ -276,63 +276,13 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 	}
 
 	/*
-	 * Pre-loop non-internal root handler.  graft_swap can place a
-	 * compressed node directly at ft->root when it splits inside a
-	 * compressed prefix and the displaced subtree becomes the swap's
-	 * root.  The hot loop assumes the dispatch parent is an internal
-	 * node; resolve a non-internal root once here so the loop body
-	 * stays lean (no tag-bit branch before each dispatch).
-	 *
-	 * Skip-encoded root is not currently produced by any mutator
-	 * path, but resolve it defensively for completeness -- cost is
-	 * one shr+jne, DCE'd when skip_compressed compile-time false.
+	 * Root is always internal (the trie-wide invariant: every re-rooting
+	 * mutator -- graft / graft_swap / detach / merge -- publishes an
+	 * internal-tagged root via the build-invisible internal-root builders;
+	 * cds_ft_verify asserts it).  So the hot loop below dispatches from the
+	 * root directly: no pre-loop non-internal-root resolver, no tag-bit
+	 * branch before the first dispatch.
 	 */
-	if (skip_compressed &&
-	    caa_unlikely(ft_node_skip_compressed(node_flag))) {
-		if (!descend_cand) {
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-			/*
-			 * Mutators do not produce a skip-encoded root.  Resolve
-			 * it defensively for completeness via the non-validating
-			 * resolver: a root has no concurrent re-parent of its
-			 * skip child, so the back-pointer is a stable compressed
-			 * node (no mid-split internal-node transient as in the
-			 * interior dispatch, which re-anchors instead).
-			 */
-			node_flag = ft_resolve_skip_compressed(ft, node_flag);
-#endif
-		} else {
-			unsigned int skip = ft_skip_len(node_flag);
-
-			if ((int) skip > (int) (key_end - key)) {
-				status = CDS_FT_STATUS_NOT_FOUND;
-				goto end;
-			}
-			key += skip;
-			node_flag = ft_skip_child_ptr(node_flag);
-		}
-	}
-	if (caa_unlikely(!ft_node_internal(node_flag))) {
-		if (ft_node_compressed(node_flag)) {
-			enum ft_descent_action act;
-
-			act = ft_lookup_compressed(&node_flag, &key, key_end,
-				key_safe_end,
-				track, track_longest,
-				&match_key_pos, &match_node, &found, &status,
-				descend_cand);
-			if (act == FT_DESCENT_END)
-				goto end;
-			if (act == FT_DESCENT_BREAK)
-				goto terminal;
-			/* CONTINUE: node_flag is now plain, fall through to loop. */
-		} else if (ft_node_external(node_flag)) {
-			goto terminal;
-		} else {
-			status = CDS_FT_STATUS_NOT_FOUND;
-			goto end;
-		}
-	}
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 descend_loop:
@@ -341,11 +291,10 @@ descend_loop:
 		uint8_t iter_key;
 
 		/*
-		 * Loop top is lean: node_flag is internal.  ft->root was
-		 * normalized by the pre-loop check above; subsequent
-		 * iterations land here only on the internal fall-through
-		 * path of the post-step merged handler.  No tag-bit branch
-		 * before dispatch.
+		 * Loop top is lean: node_flag is internal.  The first iteration
+		 * dispatches from ft->root (always internal, see above); subsequent
+		 * iterations land here only on the internal fall-through path of the
+		 * post-step merged handler.  No tag-bit branch before dispatch.
 		 */
 		iter_key = *(key++);
 		/*
