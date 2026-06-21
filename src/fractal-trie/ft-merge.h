@@ -1497,6 +1497,8 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	struct ft_ord_cell *pred = NULL, *succ = NULL;
 	struct ft_ord_cell *run_first = NULL, *run_last = NULL;
 	struct cds_ft_node *s_first = NULL, *s_last = NULL;
+	struct ft_graft_run mrun;
+	struct ft_graft_run *run_arg = NULL;
 	size_t src_max, nm, dm;
 
 	*handled = false;
@@ -1552,7 +1554,14 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		if (!displaced) {
-			pre_flip = ft_flip_batch_alloc(dst_ft, 1);
+			/*
+			 * Sized FT_GRAFT_RUN_FLIP_CAP when ordered so the store can
+			 * FUSE the run-splice boundary edges into the same flip as the
+			 * structural slot store (the appear-side cross-view fix); a
+			 * run-less store needs only the single slot edge.
+			 */
+			pre_flip = ft_flip_batch_alloc(dst_ft,
+				ms_ord ? FT_GRAFT_RUN_FLIP_CAP : 1);
 			if (!pre_flip) {
 				cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 				ft_glue_fini(&glue);
@@ -1574,6 +1583,12 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		s_last = ft_subtree_minmax_head(src_ft, payload, true);
 		run_first = ft_ord_cell_ptr(rcu_dereference(s_first->prev));
 		run_last = ft_ord_cell_ptr(rcu_dereference(s_last->prev));
+		mrun.run_first = run_first;
+		mrun.run_last = run_last;
+		mrun.pred = pred;
+		mrun.succ = succ;
+		mrun.armed = false;
+		run_arg = &mrun;
 	}
 
 	/*
@@ -1603,15 +1618,35 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
 
+	/*
+	 * An EXTERNAL payload is re-parented directly under a new internal slot, so
+	 * its edge byte changes (src_key's last byte -> dst_key's).  That byte lives
+	 * in the head's CELL metadata (ft_rebuild_key_upwalk reads it for the
+	 * ordered key rebuild) and ft_set_parent does NOT maintain it for externals.
+	 * Stamp it HERE -- AFTER the run leaves src's list (run_unlink) and the sync
+	 * drains any src reader mid-run, but BEFORE the store FUSES the run-splice
+	 * and publishes the cell into dst: the cell is in NEITHER list and
+	 * structurally invisible, so no reader rebuilds a key from it during the
+	 * stamp.  Stamping it at capture (while still in src's list) would let a src
+	 * reader rematerialize an out-of-namespace key -- a cross-view escape.  An
+	 * internal / compressed payload keeps every leaf's edge byte (the subtree
+	 * moves wholesale), so no per-leaf fix-up is needed.
+	 */
+	if (ms_ord && ft_node_external(payload))
+		cds_ft_item_to_metadata(run_first)->incoming_byte =
+			okey_dst[dst_key_len - 1];
+
 	if (prep == FT_GRAFT_PREP_GLUE) {
 		/*
 		 * Failure-free commit of the build-invisible diverge cluster: wire
 		 * the deferred live back-pointers (the payload, the displaced old
 		 * child, the cluster top), splice the cluster in with the single
-		 * forward publish, then reclaim the replaced compressed node.
+		 * forward publish -- FUSED with the ordered-list run-splice into ONE
+		 * flip when the list is on -- then reclaim the replaced compressed
+		 * node.
 		 */
 		ft_glue_apply_deferred(dst_ft, &glue);
-		ft_glue_publish(dst_ft, &glue);
+		ft_glue_publish_run(dst_ft, &glue, run_arg);
 		attached_nf = glue.attached_nf;
 		ft_glue_free_old(dst_ft, &glue);
 		ft_glue_fini(&glue);
@@ -1627,7 +1662,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		cds_ft_alloc_reserve_activate(dst_ft, &reserve);
 		st = ft_store_at_graft_point(dst_ft, okey_dst, dst_key_len, &d,
 				payload, cnt_src, &attached_nf, &adepth, &glue,
-				&pre_flip, NULL);
+				&pre_flip, run_arg);
 		cds_ft_alloc_reserve_deactivate(dst_ft);
 		assert(st == CDS_FT_STATUS_OK);
 		(void) st;
@@ -1646,24 +1681,16 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	if (aparent)
 		ft_propagate_external_count_parent(dst_ft, aparent, (long) cnt_src);
 
-	if (ms_ord) {
-		/*
-		 * An EXTERNAL payload is re-parented directly under a new internal
-		 * slot, so its edge byte changes (src_key's last byte -> dst_key's).
-		 * That byte lives in the head's CELL metadata (ft_rebuild_key_upwalk
-		 * reads it for the ordered key rebuild) and ft_set_parent does NOT
-		 * maintain it for externals, so refresh it here.  The moved external
-		 * sits at exactly @dst_key (it was an EXACT leaf at @src_key, no
-		 * suffix), so its new edge byte is the last byte of @dst_key.  An
-		 * internal / compressed payload keeps every leaf's edge byte (the
-		 * subtree moves wholesale), so no per-leaf fix-up is needed.
-		 */
-		if (ft_node_external(payload))
-			cds_ft_item_to_metadata(run_first)->incoming_byte =
-				okey_dst[dst_key_len - 1];
-		/* Splice the moved run into dst at the located position. */
+	/*
+	 * Ordered list: every attach shape (GLUE, displaced-external, in-place
+	 * slot) FUSED the run-splice into its structural flip (@armed) -- the
+	 * external edge-byte was stamped before that splice, above.  The standalone
+	 * two-commit splice remains as a defensive fallback for any not-yet-fused
+	 * shape (none today); without it an unfused shape would strand the moved
+	 * run out of the ordered list.
+	 */
+	if (ms_ord && !mrun.armed)
 		ft_ord_cell_run_splice(dst_ft, run_first, run_last, pred, succ);
-	}
 
 	/* Raise dst's max_used_key_len for the moved keys (dst_key || suffix). */
 	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
