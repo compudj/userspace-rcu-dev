@@ -419,3 +419,40 @@ consumers in order are `graft_swap`, then the merge spine (extend its existing f
 to the overlap spine), then the pure back-pointer-ordering publishes (the
 external-nodes two-phase publish and the split back-channel become no-ops by
 construction).
+
+### Implementation status (2026-06-22)
+
+- **Primitive DONE + validated (committed `f2ff0d07`).** `urcu_flip_txn` is
+  implemented in `src/urcu-flip-latch.h` (create / record / install / commit /
+  abort / destroy / free_rcu, chunk-list backing — head chunk reallocs in PREPARE,
+  fixed chunks append after install, one `tag` hook + embedder-driven reclaim;
+  install + commit-settle are RELEASE, the abort restore is RELAXED — it moves the
+  slot back to an already-published value).
+  Validated standalone (basic commit, PREPARE-abort, INSTALLED-abort,
+  post-install record, growth-by-realloc); compiles clean in the FT build,
+  unused so far.
+
+- **Graft-conversion reconnaissance — a sharper picture than §12 assumed.** The
+  glue map (ft-graft.h / ft-mutation-helpers.h:1455-2108) shows:
+  - The **simplest graft (NOSPLIT in-place)** already commits **one**
+    reader-visible edge atomically (the forward slot via `ft_flip_batch_commit`,
+    fused with ≤4 cell-splice edges when the list is on) plus one back-pointer
+    that is safe because it lands on a **drained-exclusive** payload. Little to
+    win there.
+  - The **~118-line deferred-edge ordering protocol** that the latch makes
+    unrepresentable (`struct ft_glue_deferred_edge`, `ft_glue_defer_edge`,
+    `ft_glue_defer_edge_origin`, `ft_glue_apply_deferred`, `ft_glue_is_fresh`,
+    `ft_glue_set_publish` + the glue deferred fields) lives in the **diverge/glue
+    shape**, and `struct ft_glue` is **shared with `graft_swap` and `merge`**. So
+    converting plain graft **alone does not delete it** — the deletion lands only
+    once all three consumers convert and the glue can retire.
+  - The one `update_synchronize_rcu` drain and the pre-commit reserve are
+    **irreducible** (§8): the cross-trie deep-subtree move needs the grace period,
+    and there is no abort after commit-1, so the reserve relocates, not deletes.
+  - `ft_glue_track`/`abort`/`free_old` (fresh-node + post-commit reclaim, ~96
+    lines) **relocate** into the txn's reclaim hooks rather than disappear.
+
+  Net: the graft pilot's honest near-term value is **validating the primitive +
+  the conversion pattern + measuring the per-op settle/reclaim cost** — the
+  ~118-line LOC deletion is a *cross-consumer* payoff realized across the
+  graft → graft_swap → merge migration, not from graft in isolation.
