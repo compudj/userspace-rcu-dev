@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	46
+#define NR_TESTS	47
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -5325,6 +5325,257 @@ static int inv_skip_reverse_stability(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 7b: rank/select readers resolve a parked external_nodes */
+/*                 proxy (regression for the ordered-query unresolved  */
+/*                 external_nodes read).                               */
+/*                                                                    */
+/*   An ordered-list insert/remove of a PREFIX key publishes its head  */
+/*   into an internal node's external_nodes via the one-commit splice, */
+/*   which transiently PARKS a flip proxy in that slot                 */
+/*   (ft_insert_park_external_nodes / ft_remove_one_commit).  The      */
+/*   rank/select readers (cds_ft_lookup_nth / _nth_last /              */
+/*   skip_forward / skip_reverse) descend through that node and must   */
+/*   RESOLVE the proxy (ft_dereference_external_acquire), never hand   */
+/*   the tagged proxy pointer back as iter->node.  Setup: stable 5-byte */
+/*   extension keys keep each 4-byte prefix terminating at an internal */
+/*   node; the writer churns the 4-byte prefixes (each insert/remove   */
+/*   parks the proxy); readers hammer all four rank/select queries and */
+/*   assert the returned node is a real external head, not a proxy.    */
+/*                                                                    */
+/* ================================================================== */
+
+#ifndef EXT_PARK_GROUPS
+#define EXT_PARK_GROUPS	4096		/* distinct prefixes (= nth/skip range) */
+#endif
+
+struct inv_ext_park_ctx {
+	struct cds_ft *ft;
+	const char *test_name;
+	unsigned int groups;
+	pthread_mutex_t *lock;
+};
+
+/* Stable 5-byte extension keys Kl(g) = {g>>8, g&0xff, 0, 0, 0}. */
+static void inv_ext_park_populate(struct cds_ft *ft)
+{
+	unsigned int g;
+
+	for (g = 0; g < EXT_PARK_GROUPS; g++) {
+		uint8_t kl[5] = { (uint8_t)(g >> 8), (uint8_t)(g & 0xff), 0, 0, 0 };
+		struct ft_test_node *nl = node_alloc(g);
+
+		nl->value = 5;			/* stash key length (xview_node_key) */
+		memcpy(nl->okey, kl, 5);
+		if (cds_ft_insert(ft, kl, 5, &nl->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+}
+
+static void *inv_ext_park_reader(void *arg)
+{
+	struct inv_ext_park_ctx *ctx = (struct inv_ext_park_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned long n = (unsigned long)(rand_r(&seed) % ctx->groups);
+		int which = rand_r(&seed) & 3;
+		const char *qname;
+		enum cds_ft_status s;
+
+		rcu_read_lock();
+		switch (which) {
+		case 0:
+			qname = "lookup_nth";
+			s = cds_ft_lookup_nth(ctx->ft, iter, n);
+			break;
+		case 1:
+			qname = "lookup_nth_last";
+			s = cds_ft_lookup_nth_last(ctx->ft, iter, n);
+			break;
+		case 2:
+			qname = "skip_forward";
+			s = cds_ft_lookup_nth(ctx->ft, iter, 0);
+			if (s == CDS_FT_STATUS_OK)
+				s = cds_ft_iter_skip_forward(ctx->ft, iter, n);
+			break;
+		default:
+			qname = "skip_reverse";
+			s = cds_ft_lookup_nth_last(ctx->ft, iter, 0);
+			if (s == CDS_FT_STATUS_OK)
+				s = cds_ft_iter_skip_reverse(ctx->ft, iter, n);
+			break;
+		}
+
+		if (s == CDS_FT_STATUS_OK) {
+			struct cds_ft_node *node = cds_ft_iter_node(iter);
+
+			if (node) {
+				/*
+				 * A parked flip proxy carries type-index 7 (low
+				 * nibble 0xF -- ft_node_flip_proxy /
+				 * FT_FLIP_PROXY_TAG in ft-helpers.h); a real
+				 * external head is >= 8-byte aligned (nibble 0).
+				 * If the rank/select read failed to resolve the
+				 * proxy, iter->node holds the tagged proxy.
+				 */
+				if (((uintptr_t) node & 0xFUL) == 0xFUL) {
+					report_violation(ctx->test_name,
+						"%s(%lu) returned a flip proxy as"
+						" iter->node (%p) -- external_nodes"
+						" read left unresolved",
+						qname, n, (void *) node);
+				} else {
+					size_t klen = (size_t) to_test_node(node)->value;
+
+					if (klen != 4 && klen != 5)
+						report_violation(ctx->test_name,
+							"%s(%lu) returned node with"
+							" corrupt key length %zu",
+							qname, n, klen);
+				}
+			}
+		}
+		rcu_read_unlock();
+
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/* Churn the 4-byte prefixes Kp(g) = {g>>8, g&0xff, 0, 0}: each insert/remove
+ * publishes/retires the prefix head via the one-commit external_nodes splice. */
+static void *inv_ext_park_writer(void *arg)
+{
+	struct inv_ext_park_ctx *ctx = (struct inv_ext_park_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned int g = (unsigned int)(rand_r(&seed) % ctx->groups);
+		uint8_t kp[4] = { (uint8_t)(g >> 8), (uint8_t)(g & 0xff), 0, 0 };
+		int do_insert = rand_r(&seed) & 1;
+		struct cds_ft_node *found;
+
+		rcu_read_lock();
+		pthread_mutex_lock(ctx->lock);
+		cds_ft_iter_set_key(iter, kp, 4);
+		cds_ft_lookup(ctx->ft, iter);
+		found = cds_ft_iter_node(iter);
+		if (do_insert) {
+			if (!found) {
+				struct ft_test_node *n = node_alloc(g);
+
+				n->value = 4;
+				memcpy(n->okey, kp, 4);
+				if (cds_ft_insert(ctx->ft, kp, 4, &n->node)
+				    != CDS_FT_STATUS_OK)
+					node_free(n);
+			}
+		} else if (found) {
+			struct ft_test_node *tn = to_test_node(found);
+
+			if (cds_ft_remove(ctx->ft, iter, &tn->node)
+			    == CDS_FT_STATUS_OK)
+				node_free_rcu(tn);
+		}
+		pthread_mutex_unlock(ctx->lock);
+		rcu_read_unlock();
+
+		if ((seed & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_nth_external_nodes_resolve(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft(&group);
+	struct timespec t0;
+	pthread_mutex_t lock;
+	struct inv_ext_park_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_nth_external_nodes_resolve";
+	ctx.groups = EXT_PARK_GROUPS;
+	pthread_mutex_init(&lock, NULL);
+	ctx.lock = &lock;
+
+	rcu_read_lock();
+	inv_ext_park_populate(ft);
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_ext_park_reader, &ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL, inv_ext_park_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+	pthread_mutex_destroy(&lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_nth_external_nodes_resolve: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*   INVARIANT 11: nr_keys undercount ordering                        */
 /*                                                                    */
 /*   The nr_keys metadata is updated with a specific ordering         */
@@ -8775,6 +9026,9 @@ int main(int argc, char **argv)
 	diag("7. Iterator skip stability");
 	RUN_TEST(inv_skip_forward_stability);
 	RUN_TEST(inv_skip_reverse_stability);
+
+	diag("7b. Rank/select readers resolve a parked external_nodes proxy");
+	RUN_TEST(inv_nth_external_nodes_resolve);
 
 	diag("8. nr_keys undercount ordering");
 	RUN_TEST(inv_nr_keys_undercount);
