@@ -949,6 +949,20 @@ void ft_maybe_prefetch_nta(const void *ptr)
 	(__typeof__(p)) uatomic_load(&(p), CMM_ACQUIRE)
 
 /*
+ * Acquire-ordered external-head dereference that ALSO resolves a flip proxy.
+ * The ordered-query / rank-select readers (cds_ft_lookup_nth and friends) load
+ * metadata->external_nodes with acquire ordering -- to order it against the
+ * metadata key counts they consume -- but a concurrent one-commit splice
+ * (ft_insert_park_external_nodes) parks a flip proxy in that slot.  Resolve it
+ * exactly as ft_dereference_external does for the consume-ordered descent
+ * readers, else a tagged proxy would be mistaken for the external head.  The
+ * common case (no splice in flight, tag clear) is one predicted-not-taken test.
+ */
+#define ft_dereference_external_acquire(p)				\
+	((__typeof__(p)) ft_resolve_flip_proxy(				\
+		(struct cds_ft_inode_flag *) ft_dereference_acquire(p)))
+
+/*
  * Root-slot dereference for read-side descents: like
  * ft_dereference_*(ft->root) but additionally resolves a flip-proxy that
  * a cds_ft_merge_at commit may transiently install at the merge-point

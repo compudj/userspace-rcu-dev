@@ -253,7 +253,7 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 
 		/* Keys at this node's depth come first in ordinal order. */
-		ext = ft_dereference_acquire(metadata->external_nodes);
+		ext = ft_dereference_external_acquire(metadata->external_nodes);
 		if (ext) {
 			if (remaining == 0) {
 				/* Found: the key at this node's depth. */
@@ -534,7 +534,7 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 
 check_ext_nth_last:
 		/* External_nodes at this depth are the smallest (last in reverse). */
-		ext = ft_dereference_acquire(metadata->external_nodes);
+		ext = ft_dereference_external_acquire(metadata->external_nodes);
 		if (ext) {
 			if (remaining == 0) {
 				iter->key_len = level - 1;
@@ -992,7 +992,7 @@ descend_forward:
 
 			{
 				struct cds_ft_node *ext =
-					ft_dereference_acquire(
+					ft_dereference_external_acquire(
 						metadata->external_nodes);
 
 				if (ext) {
@@ -1183,7 +1183,7 @@ enum ft_descent_action ft_skip_reverse_walk_up_compressed(
 	 * skip is decided there, so this code need not re-derive it.
 	 */
 	ameta = cds_ft_item_to_metadata(ft_node_ptr(ancestor));
-	a_ext = ft_dereference_acquire(ameta->external_nodes);
+	a_ext = ft_dereference_external_acquire(ameta->external_nodes);
 	if (a_ext) {
 		if (*remaining_p == 1) {
 			int j;
@@ -1358,7 +1358,7 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 			/* External_nodes at ancestor sort before all children. */
 			{
 				struct cds_ft_node *a_ext =
-					ft_dereference_acquire(ameta->external_nodes);
+					ft_dereference_external_acquire(ameta->external_nodes);
 
 				if (a_ext)
 					left_keys++;
@@ -1534,7 +1534,7 @@ descend_reverse:
 check_ext_descend_reverse:
 			{
 				struct cds_ft_node *ext =
-					ft_dereference_acquire(
+					ft_dereference_external_acquire(
 						metadata->external_nodes);
 
 				if (ext && remaining == 0) {
