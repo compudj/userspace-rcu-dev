@@ -60,10 +60,39 @@
  * snapshot (e.g. publishing the back edges of a re-parent through the
  * latch *before* the forward edge, so a reader -- which descends before it
  * walks back up -- can only ever progress old->new, never regress).
+ *
+ * Two layers
+ * ----------
+ * This header provides two layers:
+ *
+ *   1. The low-level flip group / proxy primitive above (urcu_flip_group,
+ *      urcu_flip_proxy, urcu_flip_proxy_get, urcu_flip_commit).  The embedder
+ *      allocates and reclaims the proxies, tags them, and routes resolution --
+ *      as in the four-step lifecycle described above.
+ *
+ *   2. A growable, abortable multi-edge transaction, urcu_flip_txn, built on
+ *      that primitive (defined lower in this file).  It owns proxy allocation,
+ *      installation, settle and reclaim, so an embedder records edges and
+ *      commits or aborts a whole set atomically instead of hand-managing
+ *      proxies.  Its lifecycle is a state machine:
+ *
+ *        create -> PREPARE --record--> ... --install--> INSTALLED --commit-->
+ *
+ *      record() in PREPARE appends an edge {slot, old, new} but installs
+ *      nothing (the head chunk grows by realloc, no proxy address is live);
+ *      install() parks every recorded proxy; commit() flips the group and
+ *      settles to new; abort() restores to old (a no-op before install).  The
+ *      single embedder hook is a tag function (proxy -> tagged slot value); the
+ *      embedder drives reclaim from commit()/abort()'s "owe a grace period"
+ *      return.  See the urcu_flip_txn block below and, for the design
+ *      rationale, doc/design/transactional-flip-latch.md.
  */
 
+#include <stdbool.h>
+#include <stdlib.h>
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
+#include <urcu/call-rcu.h>		/* struct rcu_head (embedder reclaim) */
 
 /*
  * Shared selector for a flip group.  selector == 0 -> proxies resolve to
@@ -127,6 +156,259 @@ static inline
 void urcu_flip_commit(struct urcu_flip_group *group)
 {
 	uatomic_store(&group->selector, 1, CMM_RELEASE);
+}
+
+/*
+ * Multi-edge flip transaction (urcu_flip_txn)
+ * ===========================================
+ *
+ * A growable, abortable transaction over a set of slots, built on the flip
+ * group above.  See doc/design/transactional-flip-latch.md.
+ *
+ *   create --> PREPARE --record--> PREPARE --install--> INSTALLED --commit--> committed
+ *                 |                                          |  ^
+ *                 | abort (no GP)                            |  | record (append + install)
+ *                 v                                          v  |
+ *               destroy                                  INSTALLED --abort--> aborted (GP)
+ *
+ * In PREPARE, record() appends a latch descriptor {slot, old, new} but installs
+ * NOTHING -- no proxy address is live, so the head chunk grows by realloc.
+ * install() freezes the head chunk and parks every recorded latch's tagged
+ * proxy into its slot (readers still resolve to old; selector == 0).  In
+ * INSTALLED, record() appends to a fresh chunk (never moving an installed
+ * proxy) and installs immediately.  commit() flips the group then settles every
+ * slot to its new value; abort() restores every installed slot to its old value
+ * (a no-op in PREPARE).  commit() and a post-install abort() return true ("owe a
+ * grace period" -- a reader may hold a proxy), so the embedder defers
+ * urcu_flip_txn_free_rcu via its call_rcu; a PREPARE abort returns false and the
+ * embedder frees immediately with urcu_flip_txn_destroy.  Fresh nodes are the
+ * embedder's; the txn never tracks them.
+ *
+ * The single embedder hook is @tag: given a recorded proxy, return the tagged
+ * pointer value to store in the slot (e.g. set a reserved type code).  The
+ * latch is 16-byte aligned so the tag may use the low 4 bits.
+ */
+
+enum urcu_flip_txn_state {
+	URCU_FLIP_TXN_PREPARE = 0,
+	URCU_FLIP_TXN_INSTALLED,
+};
+
+struct urcu_flip_latch {
+	struct urcu_flip_proxy proxy;	/* ptr[0]=old, ptr[1]=new, group */
+	void **slot;			/* install / settle / restore target */
+} __attribute__((aligned(16)));
+
+struct urcu_flip_chunk {
+	struct urcu_flip_chunk *next;
+	unsigned int nr;
+	unsigned int cap;
+	struct urcu_flip_latch latches[];
+};
+
+struct urcu_flip_txn {
+	struct urcu_flip_group group;
+	struct rcu_head rcu_head;	/* embedder's deferred-free handle */
+	void *(*tag)(struct urcu_flip_proxy *proxy);
+	enum urcu_flip_txn_state state;
+	struct urcu_flip_chunk *head;	/* chunk 0 (realloc in PREPARE) ... */
+	struct urcu_flip_chunk *tail;	/* ... appended fixed chunks */
+	unsigned int nr;
+};
+
+#define URCU_FLIP_CHUNK0_CAP	8	/* initial head-chunk capacity */
+#define URCU_FLIP_CHUNKN_CAP	8	/* fixed post-install chunk capacity */
+
+static inline
+struct urcu_flip_chunk *urcu_flip_chunk_alloc(unsigned int cap)
+{
+	struct urcu_flip_chunk *c;
+
+	c = (struct urcu_flip_chunk *) malloc(sizeof(*c) +
+			(size_t) cap * sizeof(struct urcu_flip_latch));
+	if (!c)
+		return NULL;
+	c->next = NULL;
+	c->nr = 0;
+	c->cap = cap;
+	return c;
+}
+
+static inline
+struct urcu_flip_txn *urcu_flip_txn_create(void *(*tag)(struct urcu_flip_proxy *))
+{
+	struct urcu_flip_txn *t;
+
+	t = (struct urcu_flip_txn *) malloc(sizeof(*t));
+	if (!t)
+		return NULL;
+	urcu_flip_group_init(&t->group);
+	t->tag = tag;
+	t->state = URCU_FLIP_TXN_PREPARE;
+	t->head = NULL;
+	t->tail = NULL;
+	t->nr = 0;
+	return t;
+}
+
+/* Free every chunk and the txn header (no grace period). */
+static inline
+void urcu_flip_txn_destroy(struct urcu_flip_txn *t)
+{
+	struct urcu_flip_chunk *c = t->head;
+
+	while (c) {
+		struct urcu_flip_chunk *next = c->next;
+
+		free(c);
+		c = next;
+	}
+	free(t);
+}
+
+/* call_rcu callback: deferred urcu_flip_txn_destroy. */
+static inline
+void urcu_flip_txn_free_rcu(struct rcu_head *head)
+{
+	urcu_flip_txn_destroy(caa_container_of(head, struct urcu_flip_txn,
+				rcu_head));
+}
+
+static inline
+void urcu_flip_latch_set(struct urcu_flip_txn *t, struct urcu_flip_latch *l,
+		void **slot, void *old_ptr, void *new_ptr)
+{
+	urcu_flip_proxy_init(&l->proxy, &t->group, old_ptr, new_ptr);
+	l->slot = slot;
+}
+
+/* Park latch @l's tagged proxy into its slot (readers resolve to old). */
+static inline
+void urcu_flip_latch_install(struct urcu_flip_txn *t, struct urcu_flip_latch *l)
+{
+	uatomic_store(l->slot, t->tag(&l->proxy), CMM_RELEASE);
+}
+
+/*
+ * Record one edge {*slot: old -> new}.  Returns false on OOM (the only failure);
+ * the caller then aborts.  In PREPARE the head chunk realloc-grows and nothing
+ * installs; in INSTALLED a fresh chunk is appended and the proxy installs now.
+ */
+static inline
+bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr)
+{
+	struct urcu_flip_chunk *c;
+	struct urcu_flip_latch *l;
+
+	if (t->state == URCU_FLIP_TXN_PREPARE) {
+		c = t->head;
+		if (!c) {
+			c = urcu_flip_chunk_alloc(URCU_FLIP_CHUNK0_CAP);
+			if (!c)
+				return false;
+			t->head = t->tail = c;
+		} else if (c->nr == c->cap) {
+			unsigned int newcap = c->cap * 2;
+			struct urcu_flip_chunk *nc;
+
+			/* No address is live yet -> realloc may move the chunk. */
+			nc = (struct urcu_flip_chunk *) realloc(c, sizeof(*c) +
+				(size_t) newcap * sizeof(struct urcu_flip_latch));
+			if (!nc)
+				return false;
+			nc->cap = newcap;
+			t->head = t->tail = c = nc;
+		}
+		l = &c->latches[c->nr++];
+		urcu_flip_latch_set(t, l, slot, old_ptr, new_ptr);
+		t->nr++;
+		return true;
+	}
+
+	/* INSTALLED: append to a fresh fixed chunk, install immediately. */
+	c = t->tail;
+	if (!c || c->nr == c->cap) {
+		struct urcu_flip_chunk *nc =
+			urcu_flip_chunk_alloc(URCU_FLIP_CHUNKN_CAP);
+
+		if (!nc)
+			return false;
+		if (t->tail)
+			t->tail->next = nc;
+		else
+			t->head = nc;
+		t->tail = nc;
+		c = nc;
+	}
+	l = &c->latches[c->nr++];
+	urcu_flip_latch_set(t, l, slot, old_ptr, new_ptr);
+	urcu_flip_latch_install(t, l);
+	t->nr++;
+	return true;
+}
+
+/* PREPARE -> INSTALLED: park every recorded latch's proxy into its slot. */
+static inline
+void urcu_flip_txn_install(struct urcu_flip_txn *t)
+{
+	struct urcu_flip_chunk *c;
+	unsigned int i;
+
+	t->state = URCU_FLIP_TXN_INSTALLED;
+	for (c = t->head; c; c = c->next)
+		for (i = 0; i < c->nr; i++)
+			urcu_flip_latch_install(t, &c->latches[i]);
+}
+
+/*
+ * Commit: flip the group (every proxy resolves to new atomically), then settle
+ * each slot to its direct new value.  Returns true: a reader may hold a proxy,
+ * so the embedder owes a grace period before urcu_flip_txn_destroy.
+ */
+static inline
+bool urcu_flip_txn_commit(struct urcu_flip_txn *t)
+{
+	struct urcu_flip_chunk *c;
+	unsigned int i;
+
+	urcu_flip_commit(&t->group);
+	for (c = t->head; c; c = c->next)
+		for (i = 0; i < c->nr; i++) {
+			struct urcu_flip_latch *l = &c->latches[i];
+
+			uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
+		}
+	return true;
+}
+
+/*
+ * Abort.  PREPARE: nothing is installed -> returns false (embedder frees
+ * immediately, no GP).  INSTALLED: restore each slot to its old value (a reader
+ * sees old via the proxy or old direct -- the same view) and return true (the
+ * proxy memory still owes a GP).  Either way the embedder frees its fresh nodes.
+ *
+ * The restore is RELAXED, not release: it moves the slot BACK to ptr[0], a value
+ * it already held before this transaction (already published, grace periods
+ * elapsed) -- nothing new is being published, so there is no prior write to
+ * release-order.  (Commit's settle, by contrast, publishes the freshly-built
+ * ptr[1] and must be a release.)
+ */
+static inline
+bool urcu_flip_txn_abort(struct urcu_flip_txn *t)
+{
+	struct urcu_flip_chunk *c;
+	unsigned int i;
+
+	if (t->state == URCU_FLIP_TXN_PREPARE)
+		return false;
+	for (c = t->head; c; c = c->next)
+		for (i = 0; i < c->nr; i++) {
+			struct urcu_flip_latch *l = &c->latches[i];
+
+			uatomic_store(l->slot, l->proxy.ptr[0], CMM_RELAXED);
+		}
+	return true;
 }
 
 #endif /* _URCU_FLIP_LATCH_H */

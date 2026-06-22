@@ -207,6 +207,38 @@ void ft_flip_batch_reclaim(struct ft_flip_batch *b)
 			ft_flip_batch_free_rcu);
 }
 
+/*
+ * FT bridge to the generic multi-edge transaction urcu_flip_txn
+ * (src/urcu-flip-latch.h).  ft_flip_txn_tag is the one embedder hook: a parked
+ * latch's address becomes a type-7 FT flip proxy (ft_flip_proxy_flag), resolved
+ * on every read hot path by ft_resolve_flip_proxy.  ft_flip_txn_reclaim is the
+ * reclaim shim: a committed / post-install-aborted txn owes a grace period (a
+ * reader may hold a proxy), deferred via the FT's RCU flavor -- except on the
+ * exclusive fast path, and a PREPARE abort owes none, both of which free now.
+ */
+static inline
+void *ft_flip_txn_tag(struct urcu_flip_proxy *proxy)
+{
+	return ft_flip_proxy_flag(proxy);
+}
+
+static inline
+struct urcu_flip_txn *ft_flip_txn_create(void)
+{
+	return urcu_flip_txn_create(ft_flip_txn_tag);
+}
+
+static inline
+void ft_flip_txn_reclaim(struct cds_ft *ft, struct urcu_flip_txn *t,
+		bool gp_owed)
+{
+	if (gp_owed && !ft->exclusive)
+		ft->group->flavor->update_call_rcu(&t->rcu_head,
+			urcu_flip_txn_free_rcu);
+	else
+		urcu_flip_txn_destroy(t);
+}
+
 
 /*
  * Ordinal-cell list maintenance.
