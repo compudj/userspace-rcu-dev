@@ -520,27 +520,49 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 {
 	if (st->displaced_shape) {
 		/*
-		 * Phase 2: glue deferred FIRST (the payload's live back-pointers
-		 * must be wired before any dst-reachable live edge flips into the
-		 * fresh cluster), then the back-channel, then the forward publish.
-		 *
-		 * The forward publish is the edge that makes the grafted run
-		 * reachable, so it is FUSED with the ordered-list run-splice (record
-		 * it into @rec, then ft_ord_cell_flip_rec_run) when the list is on.
-		 * The displaced external's own cell stays put (it remains a key,
-		 * relocated under the branch); @run->pred/succ -- located before the
-		 * attach -- bracket it, so the run splices in beside it.
+		 * The displaced external's own back-channel (displaced->prev /
+		 * cell->parent = branch) is published DIRECTLY, before any flip:
+		 * the displaced dst leaf stays reachable through the still-old slot
+		 * during the commit window, and the up-walk (ft_resolve_head_prev)
+		 * does NOT resolve a flip proxy on an external's parent, so that
+		 * field must hold a real, correctly-parented node -- branch, whose
+		 * own parent was wired build-invisibly.  Classic fresh-before-live;
+		 * it precedes both the txn and the legacy forward publish.
 		 */
-		ft_glue_apply_deferred(ft, st->glue);
 		ft_publish_external_nodes_prev(ft, st->attached, st->displaced);
-		if (run) {
-			struct ft_pub_rec rec = { .n = 0 };
-
-			_ft_publish_to_parent(ft, st->pnf, st->nfp, st->attached,
-				&rec);
-			ft_ord_cell_flip_rec_run(ft, &rec, run);
+		if (st->glue->txn) {
+			/*
+			 * Fuse the payload's live back-pointers, the forward publish,
+			 * and the ordered-list run-splice into ONE flip-txn (the GLUE
+			 * commit machinery): ft_glue_txn_commit records glue->deferred
+			 * + the forward edge + the <=4 cell edges, then commits with a
+			 * single selector flip -- no deferred-edge ordering window.
+			 */
+			st->glue->publish_parent = st->pnf;
+			st->glue->publish_slot = st->nfp;
+			st->glue->top = st->attached;
+			ft_glue_txn_commit(ft, st->glue, run);
 		} else {
-			ft_publish_to_parent(ft, st->pnf, st->nfp, st->attached);
+			/*
+			 * Legacy two-step: glue deferred FIRST (the payload's live
+			 * back-pointers wired before any dst-reachable live edge flips
+			 * into the fresh cluster), then the forward publish -- FUSED
+			 * with the ordered-list run-splice (record into @rec, then
+			 * ft_ord_cell_flip_rec_run) when the list is on.  @run->pred/
+			 * succ, located before the attach, bracket the displaced
+			 * external's relocated cell so the run splices in beside it.
+			 */
+			ft_glue_apply_deferred(ft, st->glue);
+			if (run) {
+				struct ft_pub_rec rec = { .n = 0 };
+
+				_ft_publish_to_parent(ft, st->pnf, st->nfp,
+					st->attached, &rec);
+				ft_ord_cell_flip_rec_run(ft, &rec, run);
+			} else {
+				ft_publish_to_parent(ft, st->pnf, st->nfp,
+					st->attached);
+			}
 		}
 		if (st->tp_i >= 1)
 			FT_TP(tree_edge_set, (const void *) ft,
@@ -942,13 +964,25 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 		/*
-		 * NOSPLIT (read-only build, nothing recorded into the txn): the
-		 * legacy post-drain store handles the attach.  Retire the unused
-		 * txn so glue.txn == NULL selects the legacy commit below.
+		 * NOSPLIT keeps the txn ONLY for the displaced-external store shape
+		 * (d->nf an external below key_len, relocated under a fresh branch
+		 * alongside the payload) -- structurally a GLUE-like invisible
+		 * attach whose payload back-pointers + forward publish + run-splice
+		 * fuse into the txn (the displaced external's own back-channel stays
+		 * a direct fresh-before-live assign; see
+		 * ft_store_at_graft_point_commit).  The in-place slot shapes (empty
+		 * graft point, or a recompacting slot store) park a flip-batch proxy
+		 * during their fallible build and stay on the legacy commit, so
+		 * retire the unused txn there.
 		 */
 		if (prep == FT_GRAFT_PREP_NOSPLIT && glue.txn) {
-			urcu_flip_txn_destroy(glue.txn);
-			glue.txn = NULL;
+			bool displaced_shape = d.depth < key_len && d.nf
+				&& ft_node_external(d.nf);
+
+			if (!displaced_shape) {
+				urcu_flip_txn_destroy(glue.txn);
+				glue.txn = NULL;
+			}
 		}
 
 		/*
