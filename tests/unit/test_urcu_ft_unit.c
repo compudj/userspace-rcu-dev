@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 283
+#define NR_TESTS 284
 #else
-#define NR_TESTS 251
+#define NR_TESTS 252
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -6984,6 +6984,118 @@ static int test_graft_canonicalize_at_intermediate_depth(void)
 
 	ret = 0;
 out:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Diverge graft with the ordered list OFF -- exercises the flip-txn fold
+ * (ft_glue_txn_commit): the diverge split's live re-parents + forward publish
+ * commit as ONE atomic flip instead of the deferred-edge ordering protocol.
+ *
+ * live holds "hello" (a compressed "ello" path under 'h').  Grafting staging at
+ * "help" diverges INSIDE that compressed node (h-e-l match, then the compressed
+ * 'l' vs the key 'p') -> FT_GRAFT_PREP_GLUE.  With the list off (and no caller
+ * pre_flip) cds_ft_graft drives the GLUE commit through urcu_flip_txn.
+ * SPECULATIVE so the verify walk's chain-compress + skip-compressed checks fire.
+ *
+ * Asserts: the structure verifies, and the pre-existing key plus both grafted
+ * keys ("help"+"o", "help"+"p") are reachable afterwards.
+ */
+static int test_graft_diverge_no_list(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	struct cds_ft_iter *iter = NULL;
+	const char *miss = NULL;
+	enum cds_ft_status s;
+	int ret = -1;
+	size_t i;
+	static const char * const want[] = { "hello", "helpo", "helpp" };
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	cds_ft_group_attr_set_lookup_optimization(attr,
+		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+
+	if (cds_ft_create(group, NULL, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Live: single multi-byte key -> a compressed "ello" path under 'h'. */
+	rcu_read_lock();
+	s = cds_ft_insert(live, (const uint8_t *)"hello", 5,
+			&node_alloc(0)->node);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) goto out;
+
+	/* Staging: two single-byte keys so the source root is multi-child. */
+	s = cds_ft_insert(staging, (const uint8_t *)"o", 1,
+			&node_alloc(1)->node);
+	if (s != CDS_FT_STATUS_OK) goto out;
+	s = cds_ft_insert(staging, (const uint8_t *)"p", 1,
+			&node_alloc(2)->node);
+	if (s != CDS_FT_STATUS_OK) goto out;
+
+	/* Graft at "help": diverges inside the compressed "ello" -> GLUE. */
+	rcu_read_lock();
+	s = cds_ft_graft(live, (const uint8_t *)"help", 4, staging);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_diverge_no_list: graft failed: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	if (cds_ft_verify(live, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_diverge_no_list: live verify failed\n");
+		goto out;
+	}
+
+	if (cds_ft_iter_create(live, &iter) < 0)
+		goto out;
+	rcu_read_lock();
+	for (i = 0; i < CAA_ARRAY_SIZE(want); i++) {
+		cds_ft_iter_set_key(iter, (const uint8_t *)want[i],
+			strlen(want[i]));
+		cds_ft_lookup(live, iter);
+		if (!cds_ft_iter_node(iter)) {
+			miss = want[i];
+			break;
+		}
+	}
+	rcu_read_unlock();
+	if (miss) {
+		fprintf(stderr, "graft_diverge_no_list: key \"%s\" missing\n",
+			miss);
+		goto out;
+	}
+
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
 	drain_trie(staging);
 	drain_trie(live);
 	rcu_barrier();
@@ -21787,6 +21899,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_graft_displaced_external_compressed);
 	RUN_TEST(test_graft_propagate_through_compressed);
 	RUN_TEST(test_graft_canonicalize_at_intermediate_depth);
+	RUN_TEST(test_graft_diverge_no_list);
 	RUN_TEST(test_graft_at_root);
 	RUN_TEST(test_graft_populated_error);
 	RUN_TEST(test_graft_different_group_error);

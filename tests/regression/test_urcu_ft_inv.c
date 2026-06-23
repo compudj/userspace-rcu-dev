@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	47
+#define NR_TESTS	50
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -176,6 +176,21 @@ static int drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
 		if (s < 0) {
 			ret = -1;
 			break;
+		}
+		/*
+		 * lookup_first just found a key, so remove_all MUST remove it; a
+		 * NOT_FOUND means the iterator's key disagrees with its node -- a
+		 * stale-iter bug (e.g. draining a detach-stripped trie with the
+		 * leaf's pre-detach speculative key still set, which violates the
+		 * speculative_key_offset contract).  Fail loud instead of looping
+		 * forever on a lookup_first that keeps re-finding the same head.
+		 */
+		if (s == CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr,
+				"drain_and_destroy: lookup_first found a key that "
+				"remove_all reports NOT_FOUND -- stale iterator key "
+				"(speculative key inconsistent with trie position?)\n");
+			abort();
 		}
 		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
 			node_free_rcu(to_test_node(head));
@@ -1726,6 +1741,67 @@ static struct cds_ft *create_varlen_ord_ft(struct cds_ft_group **group_out)
 	return ft;
 }
 
+/*
+ * Variable-length, ordered list OFF: exercises the graft GLUE flip-txn fold
+ * (ft_glue_txn_commit), which is gated on the list being off.  EAGER, NOT
+ * SPECULATIVE: an EAGER descent still traverses the skip-compressed nodes the
+ * txn flips (and can trigger a parent-pointer reanchor mid-descent) but carries
+ * no speculative leaf key, so draining the detached trie cannot hit the
+ * pre-existing keycopy-relational livelock (ft_ineq_descend spins on a leaf
+ * whose stale speculative key -- the pre-detach full key on a now-stripped
+ * detached position -- disagrees with its slot).
+ */
+static struct cds_ft *create_varlen_nolist_ft(struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_lookup_optimization(attr,
+			CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/* Drain every key from @ft and destroy the trie, leaving its group alive. */
+static void drain_trie_keep_group(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
+		enum cds_ft_status s = cds_ft_remove_all(ft, iter, &head);
+
+		if (s < 0)
+			abort();
+		/* No-progress guard: see drain_and_destroy. */
+		if (s == CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr,
+				"drain_trie_keep_group: lookup_first found a key "
+				"remove_all reports NOT_FOUND -- stale iterator key\n");
+			abort();
+		}
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+			node_free_rcu(to_test_node(head));
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	cds_ft_destroy(ft);
+}
+
 /* Read a variable-length test node's stashed key bytes + length. */
 static size_t xview_node_key(struct cds_ft_node *node, uint8_t *out)
 {
@@ -2429,6 +2505,306 @@ static int inv_graft_cross_view(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_graft_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Functional check for the per-trie EAGER opt-out
+ * (cds_ft_attr_set_speculative_keys false): a trie created EAGER inside a
+ * SPECULATIVE group must reconstruct the result key from the structure and
+ * NEVER read the leaf's stored speculative key.  Insert a key K but stamp the
+ * leaf's okey with a deliberately WRONG value W; lookup_first on the EAGER trie
+ * must return K, not W.  (On a normal speculative trie it would return W -- the
+ * stale-key footgun the opt-out exists to avoid.)  Single-threaded.
+ */
+static int inv_speculative_per_trie_eager(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft_attr *tattr;
+	struct cds_ft *eager = NULL;
+	struct cds_ft_iter *it = NULL;
+	struct ft_test_node *n;
+	uint8_t rk[16];
+	size_t rk_len = 0;
+	static const uint8_t K[3] = { 0x10, 0x20, 0x30 };
+	static const uint8_t W[3] = { 0xAA, 0xBB, 0xCC };	/* wrong okey */
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	cds_ft_group_attr_set_lookup_optimization(gattr,
+		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+	if (cds_ft_group_attr_set_speculative_key_offset(gattr,
+			offsetof(struct ft_test_node, okey)) < 0 ||
+	    cds_ft_group_create(gattr, &group) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(gattr);
+
+	if (cds_ft_attr_create(&tattr) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	cds_ft_attr_set_speculative_keys(tattr, false);		/* EAGER */
+	if (cds_ft_create(group, tattr, &eager) < 0) {
+		cds_ft_attr_destroy(tattr);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	cds_ft_attr_destroy(tattr);
+
+	n = node_alloc(0);
+	n->value = 3;
+	memcpy(n->okey, W, 3);					/* stamp the WRONG key */
+	rcu_read_lock();
+	if (cds_ft_insert(eager, K, 3, &n->node) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto out;
+	}
+	cds_ft_iter_create(eager, &it);
+	if (cds_ft_lookup_first(eager, it) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto out;
+	}
+	cds_ft_iter_get_key(it, rk, sizeof(rk), &rk_len);
+	rcu_read_unlock();
+	if (rk_len != 3 || memcmp(rk, K, 3) != 0) {
+		fprintf(stderr, "inv_speculative_per_trie_eager: result key "
+			"%02x%02x%02x len %zu, expected %02x%02x%02x -- EAGER "
+			"opt-out did not suppress the stamped speculative key\n",
+			rk[0], rk[1], rk[2], rk_len, K[0], K[1], K[2]);
+		goto out;
+	}
+	ret = 0;
+out:
+	if (it)
+		cds_ft_iter_destroy(it);
+	if (eager)
+		return drain_and_destroy(eager, group) == 0 ? ret : -1;
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * cds_ft_verify catches a leaf whose stored speculative key does not match its
+ * position (the verify-time safety net for re-keying moves: an app that stamps
+ * leaves with their destination key before a staging graft can verify the stamps
+ * are right; FEATURE_FT_VERIFY_AT_MUTATION then checks after every mutation).
+ * Correct stamp -> verify OK; a stale stamp -> verify FAILS.  Cleanup uses exact
+ * lookups (which descend by the query key, unaffected by the stale stored key).
+ */
+static int inv_speculative_key_verify(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft *spec = NULL;
+	struct ft_test_node *n1, *n2 = NULL;
+
+	/*
+	 * This test deliberately inserts a leaf with a wrong stored key, then
+	 * checks cds_ft_verify catches it.  Under verify-at-mutation the same
+	 * verify runs (and aborts) at the insert itself, before this explicit
+	 * call -- which IS the feature working, but it pre-empts the test.  Skip.
+	 */
+	if (cds_ft_verify_at_mutation_enabled())
+		return 0;
+	static const uint8_t K1[2] = { 0x11, 0x22 };
+	static const uint8_t K2[2] = { 0x33, 0x44 };
+	static const uint8_t WRONG[2] = { 0x99, 0x88 };
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	cds_ft_group_attr_set_lookup_optimization(gattr,
+		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+	if (cds_ft_group_attr_set_key_len(gattr, 2) < 0 ||
+	    cds_ft_group_attr_set_speculative_key_offset(gattr,
+			offsetof(struct ft_test_node, okey)) < 0 ||
+	    cds_ft_group_create(gattr, &group) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_create(group, NULL, &spec) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/* Correctly-stamped leaf: verify must pass. */
+	n1 = node_alloc(0);
+	memcpy(n1->okey, K1, 2);
+	rcu_read_lock();
+	if (cds_ft_insert(spec, K1, 2, &n1->node) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	if (cds_ft_verify(spec, NULL) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_speculative_key_verify: verify FAILED on a "
+			"correctly-stamped leaf\n");
+		goto out;
+	}
+
+	/* Stale-stamped leaf: verify must FAIL. */
+	n2 = node_alloc(1);
+	memcpy(n2->okey, WRONG, 2);
+	rcu_read_lock();
+	if (cds_ft_insert(spec, K2, 2, &n2->node) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	if (cds_ft_verify(spec, NULL) == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_speculative_key_verify: verify MISSED a stale "
+			"speculative key\n");
+		goto out;
+	}
+	ret = 0;
+out:
+	/*
+	 * Re-stamp the stale leaf with its correct key so the speculative drain
+	 * (lookup_first reads the stored key) can find and free it; otherwise the
+	 * deliberately-wrong okey would make the drain miss it and leak.
+	 */
+	if (n2)
+		memcpy(n2->okey, K2, 2);
+	return drain_and_destroy(spec, group) == 0 ? ret : -1;
+}
+
+/*
+ * Concurrent reader/writer invariant for the ordered-list-OFF graft GLUE
+ * flip-txn fold (ft_glue_txn_commit).  A fixed deep key STABLE lives under a
+ * compressed path; the writer repeatedly SPLITS that path (a diverge graft at a
+ * prefix that diverges inside it -> FT_GRAFT_PREP_GLUE, committed via the
+ * flip-txn) and HEALS it (detach of the grafted run recompacts the path back).
+ * STABLE is present the whole time -- it is the displaced old child of every
+ * split -- so an exact lookup of it must ALWAYS succeed.  A miss is a torn flip:
+ * the forward publish and the displaced-child re-parent observed out-of-step,
+ * the window the txn makes unrepresentable.  List off so the txn path (gated on
+ * !ordered_list_set) runs; EAGER readers (see create_varlen_nolist_ft).
+ */
+#ifndef GRAFT_NOLIST_ITERS
+#define GRAFT_NOLIST_ITERS	200000
+#endif
+
+/* STABLE: single deep key -> a compressed "C0 40 40 40" path under the root. */
+static const uint8_t NOLIST_STABLE[4] = { 0xC0, 0x40, 0x40, 0x40 };
+/* Graft prefix: byte 1 (0x20) diverges inside STABLE's compressed path. */
+static const uint8_t NOLIST_GRAFT_P[2] = { 0xC0, 0x20 };
+
+static void *inv_graft_nolist_reader(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, NOLIST_STABLE, sizeof(NOLIST_STABLE));
+		cds_ft_lookup(ctx->ft, iter);
+		if (!cds_ft_iter_node(iter))
+			report_violation(ctx->test_name,
+				"stable deep key vanished during a diverge graft"
+				" -- the GLUE flip-txn forward publish and the"
+				" displaced old child's re-parent were observed"
+				" out-of-step");
+		rcu_read_unlock();
+		/* QSBR: cds_ft_graft / cds_ft_detach synchronize_rcu. */
+		rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_graft_no_list_diverge(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_nolist_ft(&group);
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct ft_test_node *sn;
+	struct timespec t0;
+	unsigned int i, k;
+
+	/* STABLE is the only initial key -> one fully-compressed path. */
+	sn = node_alloc(0xC0404040UL);
+	sn->value = sizeof(NOLIST_STABLE);
+	memcpy(sn->okey, NOLIST_STABLE, sizeof(NOLIST_STABLE));
+	rcu_read_lock();
+	if (cds_ft_insert(ft, NOLIST_STABLE, sizeof(NOLIST_STABLE),
+			&sn->node) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_graft_no_list_diverge";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_graft_nolist_reader, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (k = 0; k < GRAFT_NOLIST_ITERS; k++) {
+		struct cds_ft *src, *detached;
+		unsigned int s;
+
+		/* Source: a 2-key run grafted under NOLIST_GRAFT_P. */
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		rcu_read_lock();
+		for (s = 0; s < 2; s++) {
+			uint8_t suffix[1] = { (uint8_t) s };
+			struct ft_test_node *n = node_alloc(k * 2 + s);
+
+			n->value = 3;
+			n->okey[0] = NOLIST_GRAFT_P[0];
+			n->okey[1] = NOLIST_GRAFT_P[1];
+			n->okey[2] = (uint8_t) s;
+			if (cds_ft_insert(src, suffix, 1, &n->node) !=
+					CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+
+		/* Split: diverge inside STABLE's compressed path (GLUE flip-txn). */
+		if (cds_ft_graft(ft, NOLIST_GRAFT_P, 2, src) != CDS_FT_STATUS_OK)
+			abort();
+		cds_ft_destroy(src);		/* emptied by the graft */
+
+		/* Heal: detach the run, recompacting the path back to STABLE-only. */
+		if (cds_ft_detach(ft, NOLIST_GRAFT_P, 2, &detached) !=
+				CDS_FT_STATUS_OK)
+			abort();
+		drain_trie_keep_group(detached);
+
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_graft_no_list_diverge: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		drain_and_destroy(ft, group);
 		return -1;
@@ -9009,6 +9385,9 @@ int main(int argc, char **argv)
 
 	diag("Ordered-list-OFF (no-cell) consistency");
 	RUN_TEST(inv_no_ordered_list_consistency);
+	RUN_TEST(inv_speculative_per_trie_eager);
+	RUN_TEST(inv_speculative_key_verify);
+	RUN_TEST(inv_graft_no_list_diverge);
 
 	diag("4. Graft-swap atomicity");
 	RUN_TEST(inv_graft_swap_atomicity);
