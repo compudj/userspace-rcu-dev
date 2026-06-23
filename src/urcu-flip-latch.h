@@ -393,12 +393,40 @@ void urcu_flip_txn_install(struct urcu_flip_txn *t)
  * Commit: flip the group (every proxy resolves to new atomically), then settle
  * each slot to its direct new value.  Returns true: a reader may hold a proxy,
  * so the embedder owes a grace period before urcu_flip_txn_destroy.
+ *
+ * Two PREPARE shortcuts let an embedder record then commit WITHOUT an explicit
+ * urcu_flip_txn_install():
+ *
+ *   - Single edge (nr == 1): one recorded edge has no cross-edge atomicity to
+ *     provide -- a lone release store to its slot IS already an atomic commit --
+ *     so no proxy is installed at all.  A reader of that slot observes the old
+ *     or the new target directly, never a proxy, so none can be held: NO grace
+ *     period is owed (returns false) and the embedder frees the txn at once.
+ *     This makes the common one-pointer publish as cheap as a bare
+ *     rcu_assign_pointer, with no proxy alloc / install / settle / GP reclaim
+ *     and no per-read proxy resolution.
+ *
+ *   - Multi-edge (nr >= 2): auto-install -- park every proxy first, then flip
+ *     the group as usual.  (An embedder that needs work BETWEEN install and the
+ *     flip, e.g. a record() in INSTALLED state, still calls install() itself.)
  */
 static inline
 bool urcu_flip_txn_commit(struct urcu_flip_txn *t)
 {
 	struct urcu_flip_chunk *c;
 	unsigned int i;
+
+	if (t->state == URCU_FLIP_TXN_PREPARE) {
+		if (t->nr == 1) {
+			struct urcu_flip_latch *l = &t->head->latches[0];
+
+			uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
+			return false;
+		}
+		if (t->nr == 0)
+			return false;		/* empty txn: nothing to do */
+		urcu_flip_txn_install(t);	/* auto-install before the flip */
+	}
 
 	urcu_flip_commit(&t->group);
 	for (c = t->head; c; c = c->next)

@@ -2181,7 +2181,15 @@ void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
 		run->armed = true;
 	}
 
-	urcu_flip_txn_install(g->txn);
+	/*
+	 * Commit WITHOUT an explicit install: urcu_flip_txn_commit auto-installs
+	 * a multi-edge set, but a publish that reduces to a SINGLE recorded edge
+	 * (e.g. a list-off attach into a plain parent with no deferred
+	 * back-pointers) commits as a bare release store -- no proxy, no group
+	 * flip, no grace-period reclaim -- so the common one-pointer publish pays
+	 * nothing for the transaction machinery.  gp_owed is false there and
+	 * ft_flip_txn_reclaim frees the txn immediately.
+	 */
 	gp_owed = urcu_flip_txn_commit(g->txn);
 	ft_flip_txn_reclaim(ft, g->txn, gp_owed);
 	g->txn = NULL;
