@@ -24,6 +24,8 @@ noinst_PROGRAMS = \
 	test_uatomic \
 	test_uatomic_cxx \
 	test_flip_latch \
+	test_rcu_bidir_list \
+	test_rcu_bidir_list_concurrent \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
 	test_urcu_multiflavor_dynlink \
@@ -57,6 +59,8 @@ TESTS = \
 	test_uatomic \
 	test_uatomic_cxx \
 	test_flip_latch \
+	test_rcu_bidir_list \
+	test_rcu_bidir_list_concurrent \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
 	test_urcu_multiflavor_dynlink \
@@ -111,6 +115,12 @@ test_uatomic_cxx_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_flip_latch_SOURCES = test_flip_latch.c
 test_flip_latch_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_bidir_list_SOURCES = test_rcu_bidir_list.c
+test_rcu_bidir_list_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_bidir_list_concurrent_SOURCES = test_rcu_bidir_list_concurrent.c
+test_rcu_bidir_list_concurrent_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_urcu_multiflavor_SOURCES = test_urcu_multiflavor.c \
 	test_urcu_multiflavor-memb.c \
