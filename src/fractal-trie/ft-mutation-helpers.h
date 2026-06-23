@@ -239,6 +239,22 @@ void ft_flip_txn_reclaim(struct cds_ft *ft, struct urcu_flip_txn *t,
 		urcu_flip_txn_destroy(t);
 }
 
+/*
+ * Record one edge into a txn that was reserved to its bounded record count up
+ * front (urcu_flip_txn_reserve), so the append cannot reallocate and cannot
+ * fail.  Used by the GLUE flip-txn fold, whose edge count is bounded by the
+ * attach cluster floor -- the same discipline as the glue's fixed floor arrays.
+ */
+static inline
+void ft_flip_txn_record_reserved(struct urcu_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr)
+{
+	bool ok = urcu_flip_txn_record(t, slot, old_ptr, new_ptr);
+
+	assert(ok);
+	(void) ok;	/* reserved up front -> never fails */
+}
+
 
 /*
  * Ordinal-cell list maintenance.
@@ -1602,6 +1618,17 @@ struct ft_glue {
 	 */
 	struct cds_ft_inode_flag *attached_nf;
 	/*
+	 * Multi-edge flip transaction (src/urcu-flip-latch.h).  When non-NULL
+	 * (the converted graft GLUE path, list off), every live back-pointer
+	 * re-parent AND the forward publish are RECORDED into @txn as the build
+	 * runs, then committed atomically with one selector flip -- so the
+	 * deferred-edge ordering protocol (@deferred + ft_glue_apply_deferred +
+	 * fresh-before-live) is bypassed and the whole publish-ordering window
+	 * is unrepresentable.  NULL keeps the legacy @deferred path (list on,
+	 * NOSPLIT, graft_swap, merge).  The caller owns its lifecycle.
+	 */
+	struct urcu_flip_txn *txn;
+	/*
 	 * Inline floor backing.  ft_glue_init points the three arrays
 	 * here; graft / graft_swap never outgrow it.  ft_glue_reserve
 	 * repoints to a malloc'd buffer when a count would exceed its floor.
@@ -1636,6 +1663,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_slot = NULL;
 	g->top = NULL;
 	g->attached_nf = NULL;
+	g->txn = NULL;
 }
 
 /*
@@ -1844,6 +1872,89 @@ bool ft_glue_is_fresh(struct cds_ft *ft, struct ft_glue *g,
  *   Deferred entries are de-duplicated by @child so a canonicalization
  *   wrapper later absorbed by a chain-merge keeps only its final mapping.
  */
+/*
+ * ft_glue_record_back_edge: the flip-txn dual of a deferred back-pointer.
+ * Instead of setting @child_nf's parent to @parent_nf now (or deferring it to a
+ * post-drain ft_set_parent), RECORD the parent-field transition {old ->
+ * @parent_nf} into @txn, so it flips atomically with the forward publish at
+ * commit.  Mirrors ft_set_parent's child-kind dispatch exactly for the field
+ * address + old value, and runs the SAME writer-only bookkeeping
+ * (parent_slot_offset / incoming_byte) EARLY -- safe because it is unobservable
+ * in the graft window: parent_slot_offset is read only by writers
+ * (ft_get_parent_slot), and incoming_byte is skipped by the reader up-walk while
+ * @child_nf's OLD parent is compressed/NULL, which holds for every graft live
+ * re-parent (the displaced child's old parent is the compressed node being
+ * split; every payload back-edge sits on a node unreachable until the forward
+ * flip).
+ *
+ * @child_nf is LIVE (the caller took the fresh fast path) and never a flip
+ * proxy.  List off only (the converted phase): an external head's parent is its
+ * prev directly.  Records cannot fail -- the caller reserved @txn to the bounded
+ * cluster size up front.
+ */
+static
+void ft_glue_record_back_edge(struct cds_ft *ft, struct urcu_flip_txn *txn,
+		struct cds_ft_inode_flag *child_nf,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(child_nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_skip_to_compressed(ft, child_nf);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+
+		ft_set_parent_slot(cn_meta, parent_nf, slot);
+		ft_flip_txn_record_reserved(txn, (void **) &cn_meta->parent,
+			cn_meta->parent, parent_nf);
+		return;
+	}
+	if (ft_node_compressed(child_nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(child_nf);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+
+		ft_set_parent_slot(cn_meta, parent_nf, slot);
+		ft_flip_txn_record_reserved(txn, (void **) &cn_meta->parent,
+			cn_meta->parent, parent_nf);
+		return;
+	}
+#endif
+	if (ft_node_external(child_nf)) {
+		struct cds_ft_node *en = (struct cds_ft_node *) child_nf;
+
+		assert(!ft->ordered_list);	/* list-off phase */
+		ft_flip_txn_record_reserved(txn, (void **) &en->prev,
+			en->prev, parent_nf);
+		return;
+	}
+	{
+		struct cds_ft_metadata *meta =
+			cds_ft_item_to_metadata(ft_node_ptr(child_nf));
+
+		/*
+		 * Mirror ft_set_parent's internal branch: pre-store incoming_byte
+		 * under an internal new parent (a node re-homed from a compressed
+		 * parent gets its real branch byte), then the offset + idempotent
+		 * byte via ft_set_parent_slot.  Both are unobservable now (see the
+		 * function header); the parent pointer itself flips via @txn.
+		 */
+		if (slot && parent_nf && !ft_node_compressed(parent_nf)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				&& !ft_node_skip_compressed(parent_nf)
+#endif
+		   )
+			meta->incoming_byte = ft_slot_to_byte(
+				&ft_types[ft_node_type(parent_nf)],
+				ft_node_ptr(parent_nf), slot);
+		ft_set_parent_slot(meta, parent_nf, slot);
+		ft_flip_txn_record_reserved(txn, (void **) &meta->parent,
+			meta->parent, parent_nf);
+	}
+}
+
 static
 void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 		struct cds_ft_inode_flag *child,
@@ -1975,6 +2086,63 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 		if (!g->deferred[i].dst_origin)
 			ft_set_parent(ft, g->deferred[i].child, g->deferred[i].parent,
 				g->deferred[i].slot);
+}
+
+/*
+ * Transactional commit of a GLUE attach (the flip-txn dual of
+ * ft_glue_apply_deferred + ft_glue_publish, used when g->txn is set: the
+ * converted graft GLUE path, list off).  Replaces the deferred-edge ordering
+ * protocol (apply-back-pointers-then-publish-forward, fresh-before-live) with a
+ * single atomic flip: every LIVE back-pointer re-parent AND the forward publish
+ * are recorded into g->txn, then committed together with one selector flip.  A
+ * reader -- which descends (forward) before it walks up (back) -- thus observes
+ * the whole attach as old XOR new, never a half-applied mix.
+ *
+ * Called AFTER the source unlink + drain, where abort is already impossible, so
+ * the back-edge bookkeeping (ft_set_parent_slot, recorded inside
+ * ft_glue_record_back_edge) runs here rather than during the build -- doing it
+ * during the build would corrupt a live node's parent_slot_offset if a later
+ * build step OOM'd and aborted.  The build itself is therefore unchanged: live
+ * edges still queue in g->deferred (this just replays them through the txn
+ * instead of ft_set_parent), and fresh-to-fresh edges + top->publish_parent were
+ * already wired immediately during the build.
+ *
+ * The records cannot fail: g->txn was reserved to the bounded cluster size up
+ * front (urcu_flip_txn_reserve).  Reclaims the txn (deferred via the flavor, or
+ * freed immediately on the exclusive fast path).
+ */
+static
+void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g)
+{
+	struct ft_pub_rec rec = { .n = 0 };
+	unsigned int j;
+	int i;
+	bool gp_owed;
+
+	/* Back-pointers: bookkeeping + record each into the txn. */
+	for (i = 0; i < g->nr_deferred; i++) {
+		assert(!g->deferred[i].dst_origin);	/* graft is all src-origin */
+		ft_glue_record_back_edge(ft, g->txn, g->deferred[i].child,
+			g->deferred[i].parent, g->deferred[i].slot);
+	}
+	/*
+	 * Forward publish: _ft_publish_to_parent(&rec) does top's parent-slot
+	 * bookkeeping + the compressed-parent SKIP_X dance, capturing its 1-2
+	 * reader-visible stores into @rec instead of performing them; replay
+	 * them into the txn.  *publish_slot still holds the old child here
+	 * (nothing published yet post-drain), so each old value is the pre-graft
+	 * one.
+	 */
+	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
+		&rec);
+	for (j = 0; j < rec.n; j++)
+		ft_flip_txn_record_reserved(g->txn, (void **) rec.slot[j],
+			rec.old_val[j], rec.new_val[j]);
+
+	urcu_flip_txn_install(g->txn);
+	gp_owed = urcu_flip_txn_commit(g->txn);
+	ft_flip_txn_reclaim(ft, g->txn, gp_owed);
+	g->txn = NULL;
 }
 
 /*

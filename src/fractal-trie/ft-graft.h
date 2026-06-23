@@ -887,14 +887,42 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * @glue; otherwise just locate the graft point in @d.
 		 */
 		ft_glue_init(&glue);
+		/*
+		 * Converted GLUE attach (the diverge split): drive its live
+		 * re-parents + forward publish through a flip-txn so they commit
+		 * atomically, retiring the deferred-edge ordering protocol.  The
+		 * cluster is floor-bounded, so reserve the txn to that bound up
+		 * front (records then can't fail mid-build, like the glue floor
+		 * arrays).  Gated OFF the ordered list (the list-on run-splice
+		 * fusion stays on the legacy publish) and OFF a caller @pre_flip
+		 * (the merge rekey, kept on the proven path).  Created before the
+		 * build only so its lifecycle is co-located here; the build records
+		 * nothing into it -- ft_glue_txn_commit replays g->deferred through
+		 * it post-drain.  Retired below if the build is NOSPLIT / POPULATED
+		 * (legacy store) rather than a GLUE diverge.
+		 */
+		if (!dst_ft->group->ordered_list_set && !pre_flip) {
+			glue.txn = ft_flip_txn_create();
+			if (!glue.txn || !urcu_flip_txn_reserve(glue.txn,
+					FT_GLUE_FLOOR_DEFERRED + 2)) {
+				if (glue.txn)
+					urcu_flip_txn_destroy(glue.txn);
+				free_cds_ft_node(src_ft, fresh_node);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+		}
 		prep = ft_graft_build(dst_ft, key, key_len, graft_payload,
 				src_count, &d, &glue);
 		if (prep == FT_GRAFT_PREP_OOM) {
 			ft_glue_abort(dst_ft, &glue);
+			if (glue.txn)
+				urcu_flip_txn_destroy(glue.txn);
 			free_cds_ft_node(src_ft, fresh_node);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		if (prep == FT_GRAFT_PREP_POPULATED) {
+			if (glue.txn)
+				urcu_flip_txn_destroy(glue.txn);
 			free_cds_ft_node(src_ft, fresh_node);
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
@@ -906,8 +934,19 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * d->depth == key_len.
 		 */
 		if (prep == FT_GRAFT_PREP_NOSPLIT && d.depth == key_len && d.nf) {
+			if (glue.txn)
+				urcu_flip_txn_destroy(glue.txn);
 			free_cds_ft_node(src_ft, fresh_node);
 			return CDS_FT_STATUS_POPULATED_ERROR;
+		}
+		/*
+		 * NOSPLIT (read-only build, nothing recorded into the txn): the
+		 * legacy post-drain store handles the attach.  Retire the unused
+		 * txn so glue.txn == NULL selects the legacy commit below.
+		 */
+		if (prep == FT_GRAFT_PREP_NOSPLIT && glue.txn) {
+			urcu_flip_txn_destroy(glue.txn);
+			glue.txn = NULL;
 		}
 
 		/*
@@ -1026,13 +1065,23 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * cluster: wire the deferred live back-pointers (the
 			 * displaced old child, the payload, and the cluster
 			 * top), splice the cluster into dst with a single
-			 * forward publish -- FUSED with the ordered-list
-			 * run-splice into ONE flip when the list is on -- then
-			 * reclaim the old compressed node and the source's old
-			 * root.  Nothing can fail.
+			 * forward publish -- then reclaim the old compressed
+			 * node and the source's old root.  Nothing can fail.
+			 *
+			 * glue.txn (list off): commit the back-pointers AND the
+			 * forward publish as ONE atomic flip-txn, so the whole
+			 * attach is observed old XOR new with no deferred-edge
+			 * ordering window.  Otherwise (list on) the legacy path:
+			 * apply the deferred back-pointers, then the forward
+			 * publish FUSED with the ordered-list run-splice into one
+			 * flip.
 			 */
-			ft_glue_apply_deferred(dst_ft, &glue);
-			ft_glue_publish_run(dst_ft, &glue, run_arg);
+			if (glue.txn) {
+				ft_glue_txn_commit(dst_ft, &glue);
+			} else {
+				ft_glue_apply_deferred(dst_ft, &glue);
+				ft_glue_publish_run(dst_ft, &glue, run_arg);
+			}
 			attached_nf = glue.attached_nf;
 			ft_glue_free_old(dst_ft, &glue);
 		} else {

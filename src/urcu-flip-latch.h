@@ -251,6 +251,34 @@ struct urcu_flip_txn *urcu_flip_txn_create(void *(*tag)(struct urcu_flip_proxy *
 	return t;
 }
 
+/*
+ * Pre-size the PREPARE head chunk to hold at least @cap latches.  Optional:
+ * record() already realloc-grows the head chunk on demand and aborts on OOM,
+ * which is the general (unbounded) model.  But an embedder whose edge count is
+ * bounded by construction can reserve that bound once, up front, where failure
+ * is clean -- then every subsequent record() in PREPARE appends without
+ * reallocating and so cannot fail.  This trades the design's "abort replaces
+ * the count pass" for a single up-front alloc, which is the right call for a
+ * bounded transaction whose records are interleaved through a build that does
+ * not otherwise thread an OOM return.  Call once, right after create, before
+ * any record.  Returns false on OOM (the caller destroys the txn).
+ */
+static inline
+bool urcu_flip_txn_reserve(struct urcu_flip_txn *t, unsigned int cap)
+{
+	struct urcu_flip_chunk *c;
+
+	if (t->head)
+		return cap <= t->head->cap;	/* already sized */
+	if (cap < URCU_FLIP_CHUNK0_CAP)
+		cap = URCU_FLIP_CHUNK0_CAP;
+	c = urcu_flip_chunk_alloc(cap);
+	if (!c)
+		return false;
+	t->head = t->tail = c;
+	return true;
+}
+
 /* Free every chunk and the txn header (no grace period). */
 static inline
 void urcu_flip_txn_destroy(struct urcu_flip_txn *t)
