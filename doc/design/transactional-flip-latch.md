@@ -611,7 +611,46 @@ flip, so every reader-observable pointer in a bulk op flips atomically:
   under concurrent readers by the existing merge inv suite.
 
 The legacy (no-txn) paths -- merge rekey NOSPLIT, and any future no-txn caller --
-keep fresh-before-live, which stays correct.  The only remaining unification is
-optional: migrate the merge spine-copy commit from the bespoke `ft_flip_batch`
-to the generic `urcu_flip_txn` so all bulk ops share one primitive (no
-behavioural change; the spine-copy path already obeys the rule).
+keep fresh-before-live, which stays correct.
+
+### All bulk ops unified on `urcu_flip_txn` (2026-06-23)
+
+The last unification is done: the **merge spine-copy commit** and the **graft
+in-place NOSPLIT point-store** -- the only bulk-op commits still on the bespoke
+`ft_flip_batch` -- now ride `urcu_flip_txn`, so every structural bulk commit
+(graft / graft_swap-diverge / merge spine-copy / merge rekey) shares one
+primitive.  `ft_flip_batch` survives only for the non-bulk users (point insert,
+the ordered-cell point ops, graft_swap's own batches).
+
+The one obstacle was the in-place store: it hands a flip proxy to
+`ft_node_set_nth` *before* the store runs, and a recompact may relocate the slot
+-- so the txn's record-then-install model (slot known at record time) did not
+fit.  Resolved with two additions to the primitive
+(`src/urcu-flip-latch.h`), the txn analogue of an embedder-managed
+`ft_flip_batch_add`:
+
+- **`urcu_flip_txn_reserve_slot(t, old, new, &latch)`** -- on a *reserved* txn
+  (stable latch addresses), append a latch and return its tagged proxy for the
+  embedder to place itself; the slot is not yet known.
+- **`urcu_flip_txn_bind_slot(latch, slot)`** -- bind the slot once the store has
+  placed the proxy (post-recompact address), so commit can settle it.
+
+A placed proxy is immediately reader-visible, so a new `placed` flag makes
+`commit()` flip the group rather than take the single-edge bare-store fast path,
+and `abort()` restore it even from PREPARE.  `ft_node_set_nth` is unchanged.
+
+Consequences: the shared `pre_flip` flip-batch reservation became a pre-reserved
+txn (`pre_txn`) threaded through `ft_merge_at_inner` and the same-trie rekey
+(sized per shape: `(m+1)+(2n+2)` for spine-copy, `FT_GLUE_FLOOR_DEFERRED+6` for
+graft); `ft_graft_keylen`'s `!pre_flip` gate is gone (`glue.txn` is always
+taken-or-created, never retired for NOSPLIT); and the now-dead
+`ft_flip_batch_take` / `ft_flip_batch_commit` / `ft_glue_publish_run` /
+`ft_ord_cell_flip_rec_run` were removed.  The merge spine-copy's
+interleave-collect-over-merged-view is unchanged: txn proxies and flip-batch
+proxies are the same type-7 tagged `urcu_flip_proxy`, so `ft_resolve_flip_proxy`
+(incl. the `ft_tls_resolve_merged` path) resolves both identically.
+
+Validated: 4 feature configs (default / no-skip / no-compress / both) unit
+252 / flip_latch 18 / inv 51 0-violations; VAM-targeted (period 1) on the
+merge/graft unit shapes + graft oracles; ASAN clean (no leaks); 20x cross-view
+stress on the spine-copy / graft-store / rekey oracles.
