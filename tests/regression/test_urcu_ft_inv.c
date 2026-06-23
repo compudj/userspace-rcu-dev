@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	50
+#define NR_TESTS	51
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -2805,6 +2805,132 @@ static int inv_graft_no_list_diverge(void)
 
 	if (atomic_load(&violation_count) > 0) {
 		fprintf(stderr, "inv_graft_no_list_diverge: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * NOSPLIT displaced-external graft cross-view.  A short external
+ * @DISPEXT_STABLE is present the whole time; each iteration grafts a LONGER key
+ * sharing its prefix, so the graft descent stops at the external BELOW key_len
+ * -- the NOSPLIT displaced-external store, which relocates the leaf under a
+ * fresh branch as its external_nodes -- then detaches to heal back.  With the
+ * displaced external's back-channel re-parent folded into the graft flip-txn
+ * (dst_origin), the forward publish and the displaced leaf's re-parent flip in
+ * ONE selector flip, so a concurrent lookup of @DISPEXT_STABLE must never see it
+ * vanish.  (Before the fold it was a fresh-before-live direct store; this
+ * exercises the converted path under readers.)
+ */
+static const uint8_t DISPEXT_STABLE[2] = { 0xC0, 0x40 };
+static const uint8_t DISPEXT_GRAFT[4]  = { 0xC0, 0x40, 0x70, 0x70 };
+#define GRAFT_DISPEXT_ITERS	200000
+
+static void *inv_graft_dispext_reader(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, DISPEXT_STABLE, sizeof(DISPEXT_STABLE));
+		cds_ft_lookup(ctx->ft, iter);
+		if (!cds_ft_iter_node(iter))
+			report_violation(ctx->test_name,
+				"displaced short external vanished during a"
+				" longer-key graft -- the forward publish and the"
+				" displaced external's re-parent were observed"
+				" out-of-step");
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_graft_displaced_external(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_nolist_ft(&group);
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[NR_READERS_DEFAULT];
+	struct ft_test_node *sn;
+	struct timespec t0;
+	unsigned int i, k;
+
+	sn = node_alloc(0xC04040UL);
+	sn->value = sizeof(DISPEXT_STABLE);
+	memcpy(sn->okey, DISPEXT_STABLE, sizeof(DISPEXT_STABLE));
+	rcu_read_lock();
+	if (cds_ft_insert(ft, DISPEXT_STABLE, sizeof(DISPEXT_STABLE),
+			&sn->node) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_graft_displaced_external";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_graft_dispext_reader, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (k = 0; k < GRAFT_DISPEXT_ITERS; k++) {
+		struct cds_ft *src, *detached;
+		unsigned int s;
+
+		/* Source: a 2-key run grafted under DISPEXT_GRAFT (the longer key). */
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		rcu_read_lock();
+		for (s = 0; s < 2; s++) {
+			uint8_t suffix[1] = { (uint8_t) s };
+			struct ft_test_node *n = node_alloc(k * 2 + s);
+
+			n->value = 5;
+			if (cds_ft_insert(src, suffix, 1, &n->node) !=
+					CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+
+		/* Graft the longer key over DISPEXT_STABLE -> NOSPLIT displaced ext. */
+		if (cds_ft_graft(ft, DISPEXT_GRAFT, sizeof(DISPEXT_GRAFT), src)
+				!= CDS_FT_STATUS_OK)
+			abort();
+		cds_ft_destroy(src);		/* emptied by the graft */
+
+		/* Heal: detach the grafted run, restoring DISPEXT_STABLE alone. */
+		if (cds_ft_detach(ft, DISPEXT_GRAFT, sizeof(DISPEXT_GRAFT),
+				&detached) != CDS_FT_STATUS_OK)
+			abort();
+		drain_trie_keep_group(detached);
+
+		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
+			break;
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_graft_displaced_external: %lu violation(s)\n",
 			atomic_load(&violation_count));
 		drain_and_destroy(ft, group);
 		return -1;
@@ -9388,6 +9514,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_speculative_per_trie_eager);
 	RUN_TEST(inv_speculative_key_verify);
 	RUN_TEST(inv_graft_no_list_diverge);
+	RUN_TEST(inv_graft_displaced_external);
 
 	diag("4. Graft-swap atomicity");
 	RUN_TEST(inv_graft_swap_atomicity);
