@@ -24,6 +24,7 @@ noinst_PROGRAMS = \
 	test_uatomic \
 	test_uatomic_cxx \
 	test_flip_latch \
+	test_flip_latch_lockfree \
 	test_rcu_bidir_list \
 	test_rcu_bidir_list_concurrent \
 	test_urcu_multiflavor \
@@ -59,6 +60,7 @@ TESTS = \
 	test_uatomic \
 	test_uatomic_cxx \
 	test_flip_latch \
+	test_flip_latch_lockfree \
 	test_rcu_bidir_list \
 	test_rcu_bidir_list_concurrent \
 	test_urcu_multiflavor \
@@ -115,6 +117,9 @@ test_uatomic_cxx_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_flip_latch_SOURCES = test_flip_latch.c
 test_flip_latch_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_flip_latch_lockfree_SOURCES = test_flip_latch_lockfree.c
+test_flip_latch_lockfree_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_bidir_list_SOURCES = test_rcu_bidir_list.c
 test_rcu_bidir_list_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
