@@ -96,88 +96,6 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 }
 
 /*
- * Flip-latch batch for cds_ft_merge_at: a urcu_flip_group plus its
- * proxies, allocated as one block and reclaimed together via call_rcu
- * once the proxied slots have been settled to their direct new targets.
- * ft_flip_proxy is 16-byte aligned so each proxy's address carries the
- * type-7 proxy tag (ft_flip_proxy_flag); malloc returns 16-byte-aligned
- * blocks at userspace addresses with the skip-len high bits clear.
- */
-struct ft_flip_proxy {
-	struct urcu_flip_proxy proxy;
-} __attribute__((aligned(16)));
-
-struct ft_flip_batch {
-	struct rcu_head rcu_head;
-	struct cds_ft *ft;
-	struct urcu_flip_group group;
-	unsigned int nr;
-	unsigned int cap;
-	struct ft_flip_proxy proxies[];
-};
-
-static
-void ft_flip_batch_free_rcu(struct rcu_head *head)
-{
-	free(caa_container_of(head, struct ft_flip_batch, rcu_head));
-}
-
-static
-struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft, unsigned int cap)
-{
-	struct ft_flip_batch *b;
-
-	b = malloc(sizeof(*b) + (size_t) cap * sizeof(struct ft_flip_proxy));
-	if (!b)
-		return NULL;
-	b->ft = ft;
-	urcu_flip_group_init(&b->group);
-	b->nr = 0;
-	b->cap = cap;
-	return b;
-}
-
-/*
- * Free a flip batch that was allocated but never installed (no proxy stored
- * in any live slot, group never committed): a plain free, no grace period,
- * since no reader can reference it.  Used by op abort paths (e.g. graft_swap,
- * insert) that bail after allocating the batch but before publishing it.
- */
-static
-void ft_flip_batch_free_unpublished(struct ft_flip_batch *b)
-{
-	free(b);
-}
-
-/*
- * Record a proxy {old_nf, new_nf} and return its tagged flag, to be stored
- * (sel == 0 -> old_nf, transparent) into the slot being flipped.
- */
-static
-struct cds_ft_inode_flag *ft_flip_batch_add(struct ft_flip_batch *b,
-		struct cds_ft_inode_flag *old_nf,
-		struct cds_ft_inode_flag *new_nf)
-{
-	struct urcu_flip_proxy *p;
-
-	assert(b->nr < b->cap);
-	p = &b->proxies[b->nr++].proxy;
-	urcu_flip_proxy_init(p, &b->group, old_nf, new_nf);
-	return ft_flip_proxy_flag(p);
-}
-
-/* Reclaim the batch after settle (deferred for in-flight readers). */
-static
-void ft_flip_batch_reclaim(struct ft_flip_batch *b)
-{
-	if (b->ft->exclusive)
-		free(b);
-	else
-		b->ft->group->flavor->update_call_rcu(&b->rcu_head,
-			ft_flip_batch_free_rcu);
-}
-
-/*
  * FT bridge to the generic multi-edge transaction urcu_flip_txn
  * (src/urcu-flip-latch.h).  ft_flip_txn_tag is the one embedder hook: a parked
  * latch's address becomes a type-7 FT flip proxy (ft_flip_proxy_flag), resolved
@@ -199,10 +117,10 @@ struct urcu_flip_txn *ft_flip_txn_create(void)
 }
 
 /*
- * Single-allocation bounded FT flip-txn: the one-malloc substitute for
- * ft_flip_batch_alloc, for the point-op commits (insert one-commit, ordered-cell
- * splice/unsplice/swap) whose edge count is bounded by construction.  Returns
- * NULL on OOM -> the caller degrades to a direct / sequential publish.
+ * Single-allocation bounded FT flip-txn: a one-malloc transaction for the
+ * point-op commits (insert one-commit, ordered-cell splice/unsplice/swap) whose
+ * edge count is bounded by construction.  Returns NULL on OOM -> the caller
+ * degrades to a direct / sequential publish.
  */
 static inline
 struct urcu_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
