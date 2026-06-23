@@ -1925,9 +1925,26 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct urcu_flip_txn *txn,
 	if (ft_node_external(child_nf)) {
 		struct cds_ft_node *en = (struct cds_ft_node *) child_nf;
 
-		assert(!ft->ordered_list);	/* list-off phase */
-		ft_flip_txn_record_reserved(txn, (void **) &en->prev,
-			en->prev, parent_nf);
+		/*
+		 * Mirror ft_set_parent's external branch for the field address +
+		 * old value.  Ordered list on: the head carries its cell in prev
+		 * and the parent transition is on cell->parent; list off: en->prev
+		 * IS the parent.  Either field flips via @txn so the reader up-walk
+		 * (ft_resolve_head_prev) observes old XOR new together with the
+		 * forward publish.  Every graft back-edge is src-origin (the
+		 * payload, asserted by the caller), so its node is reachable ONLY
+		 * through the forward edge -- the parked proxy on this field is
+		 * never observed at rest, exactly as the structural back-edges.
+		 */
+		if (ft->ordered_list) {
+			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
+
+			ft_flip_txn_record_reserved(txn,
+				(void **) &cell->parent, cell->parent, parent_nf);
+		} else {
+			ft_flip_txn_record_reserved(txn, (void **) &en->prev,
+				en->prev, parent_nf);
+		}
 		return;
 	}
 	{
@@ -2112,7 +2129,8 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
  * freed immediately on the exclusive fast path).
  */
 static
-void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g)
+void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
+		struct ft_graft_run *run)
 {
 	struct ft_pub_rec rec = { .n = 0 };
 	unsigned int j;
@@ -2138,6 +2156,30 @@ void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g)
 	for (j = 0; j < rec.n; j++)
 		ft_flip_txn_record_reserved(g->txn, (void **) rec.slot[j],
 			rec.old_val[j], rec.new_val[j]);
+	/*
+	 * Ordered list on: also record the <=4 run-splice boundary cell edges
+	 * (a neighbour's ord_next / ord_prev, plus a dst head/tail repair) into
+	 * the SAME txn, so the structure becomes reachable AND the ordered list
+	 * gains the run in one selector flip -- the cross-view atomicity the
+	 * standalone ft_ord_cell_flip_rec_run gives, now also fused with the
+	 * live back-pointer re-parents above.  Cell slots carry the same type-7
+	 * proxy tag as structural slots, so the txn's install parks a proxy a
+	 * cell reader resolves through ft_ord_cell_resolve_ord.
+	 * ft_ord_cell_run_splice_edges pre-sets the run's own outer links (plain
+	 * stores; the run is not ord-reachable in dst until the flip).  @run
+	 * armed so the caller skips the standalone two-commit splice.
+	 */
+	if (run) {
+		struct ft_ord_cell_edge cedges[4];
+		unsigned int cn = ft_ord_cell_run_splice_edges(ft, run->run_first,
+			run->run_last, run->pred, run->succ, cedges, 0), k;
+
+		for (k = 0; k < cn; k++)
+			ft_flip_txn_record_reserved(g->txn,
+				(void **) cedges[k].slot,
+				cedges[k].old_target, cedges[k].new_target);
+		run->armed = true;
+	}
 
 	urcu_flip_txn_install(g->txn);
 	gp_owed = urcu_flip_txn_commit(g->txn);

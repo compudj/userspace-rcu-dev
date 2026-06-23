@@ -893,18 +893,20 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * atomically, retiring the deferred-edge ordering protocol.  The
 		 * cluster is floor-bounded, so reserve the txn to that bound up
 		 * front (records then can't fail mid-build, like the glue floor
-		 * arrays).  Gated OFF the ordered list (the list-on run-splice
-		 * fusion stays on the legacy publish) and OFF a caller @pre_flip
-		 * (the merge rekey, kept on the proven path).  Created before the
-		 * build only so its lifecycle is co-located here; the build records
-		 * nothing into it -- ft_glue_txn_commit replays g->deferred through
-		 * it post-drain.  Retired below if the build is NOSPLIT / POPULATED
-		 * (legacy store) rather than a GLUE diverge.
+		 * arrays); the + 6 headroom covers the forward edge's 1-2 stores
+		 * and the <=4 ordered-list run-splice boundary cell edges, which
+		 * ft_glue_txn_commit folds into the SAME flip when the list is on.
+		 * Gated OFF a caller @pre_flip only (the merge rekey, kept on the
+		 * proven path).  Created before the build only so its lifecycle is
+		 * co-located here; the build records nothing into it --
+		 * ft_glue_txn_commit replays g->deferred through it post-drain.
+		 * Retired below if the build is NOSPLIT / POPULATED (legacy store)
+		 * rather than a GLUE diverge.
 		 */
-		if (!dst_ft->group->ordered_list_set && !pre_flip) {
+		if (!pre_flip) {
 			glue.txn = ft_flip_txn_create();
 			if (!glue.txn || !urcu_flip_txn_reserve(glue.txn,
-					FT_GLUE_FLOOR_DEFERRED + 2)) {
+					FT_GLUE_FLOOR_DEFERRED + 6)) {
 				if (glue.txn)
 					urcu_flip_txn_destroy(glue.txn);
 				free_cds_ft_node(src_ft, fresh_node);
@@ -1068,16 +1070,18 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * forward publish -- then reclaim the old compressed
 			 * node and the source's old root.  Nothing can fail.
 			 *
-			 * glue.txn (list off): commit the back-pointers AND the
-			 * forward publish as ONE atomic flip-txn, so the whole
-			 * attach is observed old XOR new with no deferred-edge
-			 * ordering window.  Otherwise (list on) the legacy path:
-			 * apply the deferred back-pointers, then the forward
-			 * publish FUSED with the ordered-list run-splice into one
-			 * flip.
+			 * glue.txn: commit the back-pointers, the forward
+			 * publish, AND (list on) the <=4 ordered-list run-splice
+			 * cell edges as ONE atomic flip-txn, so the whole attach
+			 * -- structure and ordered list -- is observed old XOR new
+			 * with no deferred-edge ordering window.  ft_glue_txn_commit
+			 * arms @run_arg, so the standalone splice below is skipped.
+			 * The legacy two-step (apply deferred back-pointers, then a
+			 * forward publish FUSED with the run-splice) only runs when
+			 * the txn was retired (NOSPLIT) or never created (@pre_flip).
 			 */
 			if (glue.txn) {
-				ft_glue_txn_commit(dst_ft, &glue);
+				ft_glue_txn_commit(dst_ft, &glue, run_arg);
 			} else {
 				ft_glue_apply_deferred(dst_ft, &glue);
 				ft_glue_publish_run(dst_ft, &glue, run_arg);
