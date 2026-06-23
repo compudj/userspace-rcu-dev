@@ -199,6 +199,18 @@ struct urcu_flip_txn *ft_flip_txn_create(void)
 }
 
 /*
+ * Single-allocation bounded FT flip-txn: the one-malloc substitute for
+ * ft_flip_batch_alloc, for the point-op commits (insert one-commit, ordered-cell
+ * splice/unsplice/swap) whose edge count is bounded by construction.  Returns
+ * NULL on OOM -> the caller degrades to a direct / sequential publish.
+ */
+static inline
+struct urcu_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
+{
+	return urcu_flip_txn_create_bounded(ft_flip_txn_tag, cap);
+}
+
+/*
  * Take a caller-reserved flip-txn when @pre supplies one, NULLing the caller's
  * slot to transfer ownership: from here on the consuming bulk op commits and
  * reclaims it, and the caller frees only what it still holds.  Returns NULL when
@@ -533,52 +545,41 @@ struct ft_detach_run {
 };
 
 static
-void ft_ord_cell_flip_prealloc(struct cds_ft *ft __attribute__((unused)),
-		struct ft_ord_cell_edge *edges, unsigned int n,
-		struct ft_flip_batch *b)
-{
-	unsigned int i;
-
-	if (n == 0) {
-		ft_flip_batch_free_unpublished(b);
-		return;
-	}
-	assert(n <= b->cap);
-	for (i = 0; i < n; i++)
-		rcu_assign_pointer(*edges[i].slot,
-			(struct ft_ord_cell *) ft_flip_batch_add(b,
-				(struct cds_ft_inode_flag *) edges[i].old_target,
-				(struct cds_ft_inode_flag *) edges[i].new_target));
-	urcu_flip_commit(&b->group);
-	for (i = 0; i < n; i++)
-		rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
-	ft_flip_batch_reclaim(b);
-}
-
-static
 void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		unsigned int n)
 {
-	struct ft_flip_batch *b;
+	struct urcu_flip_txn *t;
 	unsigned int i;
+	bool gp;
 
 	if (n == 0)
 		return;
-	b = ft_flip_batch_alloc(ft, n);
-	if (caa_unlikely(!b)) {
+	t = ft_flip_txn_create_bounded(n);
+	if (caa_unlikely(!t)) {
 		/*
 		 * Degraded fallback (point-op splices only, <= 3 edges; the
-		 * merge interleave pre-allocates its batch in the fallible
-		 * build phase and never lands here): sequential edge stores.
-		 * A bidirectional reader between two stores can observe one
-		 * neighbour's edge updated and the mirrored one not yet --
-		 * transient and self-healing, never a dangling pointer.
+		 * merge interleave reserves its txn in the fallible build phase
+		 * and never lands here): sequential edge stores.  A bidirectional
+		 * reader between two stores can observe one neighbour's edge
+		 * updated and the mirrored one not yet -- transient and self-
+		 * healing, never a dangling pointer.
 		 */
 		for (i = 0; i < n; i++)
 			rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
 		return;
 	}
-	ft_ord_cell_flip_prealloc(ft, edges, n, b);
+	/*
+	 * Record every edge (freeze-before-install), then commit: the txn parks
+	 * each proxy, flips the group, and settles to the direct new target.  A
+	 * lone edge reduces to a single bare release store (no proxy, no grace
+	 * period) -- a single ord-list slot store is atomic on its own.
+	 */
+	for (i = 0; i < n; i++)
+		ft_flip_txn_record_reserved(t, (void **) edges[i].slot,
+			(void *) edges[i].old_target,
+			(void *) edges[i].new_target);
+	gp = urcu_flip_txn_commit(t);
+	ft_flip_txn_reclaim(ft, t, gp);
 }
 
 /*
