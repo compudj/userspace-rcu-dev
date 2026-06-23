@@ -112,8 +112,19 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		old_suffix_flag = ft_compressed_node_flag(sfx);
 		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
 		ft_glue_track(glue, old_suffix_flag);
-		ft_glue_defer_edge(ft, glue, cn->child, old_suffix_flag,
-			&sfx->child);
+		/*
+		 * The displaced child @cn->child is LIVE: a reader can still descend
+		 * to it through @cn (the compressed node being split, untouched until
+		 * the forward publish replaces it).  So its re-parent onto the fresh
+		 * @sfx is a reader-observable pointer -- ride it on the flip-txn
+		 * (dst_origin) so it flips atomically with the forward edge.  Holds for
+		 * an external @cn->child too: the up-walk readers (ft_get_parent_rcu /
+		 * ft_skip_to_compressed / ft_skip_reanchor) resolve a flip proxy parked
+		 * on an external's parent.  The merge-rekey path has no txn (glue->txn
+		 * NULL); there it stays on the legacy fresh-before-live immediate store.
+		 */
+		ft_glue_defer_edge_origin(ft, glue, cn->child, old_suffix_flag,
+			&sfx->child, glue->txn != NULL);
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
 
@@ -130,7 +141,9 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		ft_glue_track(glue, dest);
 		ft_node_get_nth_skip(dest, &slot,
 			cn->key_bytes[diverge_pos + 1], FT_PF_NONE);
-		ft_glue_defer_edge(ft, glue, cn->child, dest, slot);
+		/* Displaced child: LIVE, ride the txn -- see the suffix_len>1 case. */
+		ft_glue_defer_edge_origin(ft, glue, cn->child, dest, slot,
+			glue->txn != NULL);
 	} else {
 		old_suffix_flag = cn->child;	/* suffix_len == 0 */
 	}
@@ -206,7 +219,14 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	ft_node_get_nth_skip(branch_flag, &slot, old_ordinal, FT_PF_NONE);
 	if (sfx_skip_flag && sfx_skip_flag != old_suffix_flag && slot)
 		rcu_assign_pointer(*slot, sfx_skip_flag);
-	ft_glue_defer_edge(ft, glue, old_suffix_flag, branch_flag, slot);
+	/*
+	 * suffix_len == 0: @old_suffix_flag IS the live @cn->child wired directly
+	 * under the branch (no fresh suffix node), so this edge re-parents a
+	 * reader-reachable node -- dst_origin (ride the txn).  suffix_len > 0:
+	 * @old_suffix_flag is the fresh sfx/dest, a hidden edge (src-origin).
+	 */
+	ft_glue_defer_edge_origin(ft, glue, old_suffix_flag, branch_flag, slot,
+		suffix_len == 0 && glue->txn != NULL);
 	/* Wire the NEW direction. */
 	ft_node_get_nth_skip(branch_flag, &slot, new_ordinal, FT_PF_NONE);
 	if (ft_node_compressed(new_dir) && slot) {
@@ -521,13 +541,16 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 	if (st->displaced_shape) {
 		/*
 		 * The displaced external's own back-channel (displaced->prev /
-		 * cell->parent = branch) is published DIRECTLY, before any flip:
-		 * the displaced dst leaf stays reachable through the still-old slot
-		 * during the commit window, and the up-walk (ft_resolve_head_prev)
-		 * does NOT resolve a flip proxy on an external's parent, so that
-		 * field must hold a real, correctly-parented node -- branch, whose
-		 * own parent was wired build-invisibly.  Classic fresh-before-live;
-		 * it precedes both the txn and the legacy forward publish.
+		 * cell->parent = branch) is published DIRECTLY, before any flip: the
+		 * displaced dst leaf stays reachable through the still-old slot during
+		 * the commit window, and @branch (its new parent) is fresh, its own
+		 * parent wired build-invisibly -- so a direct store is already
+		 * consistent for an up-walk reader.  Classic fresh-before-live; it
+		 * precedes both the txn and the legacy forward publish.  (It could
+		 * equally ride the flip-latch as a dst_origin edge -- the up-walk
+		 * readers DO resolve a flip proxy on an external's parent, via
+		 * ft_get_parent_rcu / ft_skip_to_compressed / ft_skip_reanchor -- but
+		 * the direct store is kept here for simplicity.)
 		 */
 		ft_publish_external_nodes_prev(ft, st->attached, st->displaced);
 		if (st->glue->txn) {
