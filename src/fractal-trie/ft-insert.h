@@ -238,8 +238,6 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 /* Flip-batch helpers (defined with the flip machinery, after the readers). */
 static struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft,
 		unsigned int cap);
-static struct ft_flip_batch *ft_flip_batch_take(struct cds_ft *ft,
-		unsigned int cap, struct ft_flip_batch **pre);
 static struct cds_ft_inode_flag *ft_flip_batch_add(struct ft_flip_batch *b,
 		struct cds_ft_inode_flag *old_nf,
 		struct cds_ft_inode_flag *new_nf);

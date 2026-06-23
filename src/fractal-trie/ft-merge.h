@@ -1075,7 +1075,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		unsigned int off_src, struct ft_descent *d_dst,
 		unsigned long cnt_dst, unsigned int off_dst,
 		const uint8_t *dst_key, size_t dst_key_len,
-		struct ft_flip_batch **pre_flip)
+		struct urcu_flip_txn **pre_txn)
 {
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -1089,7 +1089,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	struct cds_ft_inode_flag *pub_parent = d_dst->pnf, **pub_slot = d_dst->nfp;
 	struct cds_ft_inode *fresh_root = NULL;
 	struct cds_ft_metadata *fresh_meta;
-	struct ft_flip_batch *flip;
+	struct urcu_flip_txn *txn;
+	bool gp_owed;
 	unsigned long merged_keys = 0;
 	bool ms_ord = dst_ft->group->ordered_list_set;
 	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL;
@@ -1231,11 +1232,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * Allocate the flip batch: one proxy per dst-origin re-parent edge, one
-	 * for the merge-point forward slot, plus @ms_cap for the ordered-list
+	 * Take or create the flip-txn: one latch per dst-origin re-parent edge,
+	 * one for the merge-point forward slot, plus @ms_cap for the ordered-list
 	 * interleave's boundary edges -- structure and ordered list commit in ONE
-	 * flip, so they share this batch.  Fallible -> abort the still-invisible
-	 * build; both tries stay pristine.
+	 * flip, so they share this txn.  Reserve it up front to that bound so every
+	 * post-drain record (the structural edges and the INSTALLED-state cell
+	 * edges, which append into the reserved head chunk) is allocation-free.
+	 * The rekey hands in a pre-reserved txn (cannot fail); otherwise create one
+	 * here, where failure aborts the still-invisible build (both tries pristine).
 	 */
 	{
 		unsigned int nr_dst = 0;
@@ -1244,9 +1248,17 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		for (j = 0; j < gd.nr_deferred; j++)
 			if (gd.deferred[j].dst_origin)
 				nr_dst++;
-		flip = ft_flip_batch_take(dst_ft, nr_dst + 1 + ms_cap, pre_flip);
+		txn = ft_flip_txn_take(pre_txn);
+		if (!txn) {
+			txn = ft_flip_txn_create();
+			if (txn && !urcu_flip_txn_reserve(txn,
+					nr_dst + 1 + ms_cap)) {
+				urcu_flip_txn_destroy(txn);
+				txn = NULL;
+			}
+		}
 	}
-	if (!flip) {
+	if (!txn) {
 		if (fresh_root)
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
 		ft_glue_abort(dst_ft, &gd);
@@ -1302,14 +1314,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		/*
 		 * Pre-allocate the interleave's edge scratch NOW, while the build
 		 * is still abortable.  The interleave is collected pre-commit and
-		 * its proxies staged into the (already-sized) structural @flip, so
+		 * its proxies recorded into the (already-reserved) structural @txn, so
 		 * the commit tail has no allocation left and cannot degrade to a
 		 * non-atomic per-edge fallback.  Each survivor run costs at most
 		 * two visible edges, so @ms_cap (2*merged_keys+2) bounds @ms_edges.
 		 */
 		ms_edges = malloc((size_t) ms_cap * sizeof(*ms_edges));
 		if (!ms_edges) {
-			ft_flip_batch_free_unpublished(flip);
+			urcu_flip_txn_destroy(txn);
 			if (fresh_root)
 				free_cds_ft_node_unpublished(src_ft, fresh_root);
 			ft_glue_abort(dst_ft, &gd);
@@ -1366,7 +1378,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * fallible alloc), so abort the still-invisible build.
 		 */
 		free(ms_edges);
-		ft_flip_batch_free_unpublished(flip);
+		urcu_flip_txn_destroy(txn);
 		ft_glue_abort(dst_ft, &gd);
 		ft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
@@ -1394,76 +1406,72 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	ft_glue_apply_deferred(dst_ft, &gd);
 
 	/*
-	 * 3. Stage the flip: point every dst-origin child's parent, and the
-	 *    merge-point forward slot, at a proxy that still resolves to the
-	 *    OLD target (selector 0).  Transparent to readers: up-walks and
-	 *    the root descent still see the pre-merge dst.
+	 * 3. Record the structural edges into @txn (still PREPARE): every
+	 *    dst-origin child's parent re-parent and the merge-point forward slot.
+	 *    ft_glue_record_back_edge mirrors ft_set_parent's child-kind dispatch
+	 *    (reading the field's current value as the old target) and runs the
+	 *    writer-only slot bookkeeping early; the commit's settle below writes
+	 *    each field to its new parent, subsuming the old step-7 ft_set_parent.
+	 *    Nothing is parked yet -- install() (step 3b, or commit's auto-install)
+	 *    stages the proxies (selector 0, resolving to old) so up-walks and the
+	 *    root descent still see the pre-merge dst.
 	 */
 	{
 		int j;
 
 		for (j = 0; j < gd.nr_deferred; j++) {
-			struct cds_ft_inode_flag *child, *old_parent, *pf;
-
 			if (!gd.deferred[j].dst_origin)
 				continue;
-			child = gd.deferred[j].child;
-			/*
-			 * Current parent = the old dst overlap node.  Resolve a
-			 * skip-encoded picked child to its compressed node first:
-			 * ft_get_parent_rcu reads node metadata and cannot take a
-			 * skip pointer (ft_set_parent_raw below resolves itself).
-			 */
-			old_parent = ft_get_parent_rcu(dst_ft,
-				ft_resolve_skip_compressed(dst_ft, child));
-			pf = ft_flip_batch_add(flip, old_parent,
-				gd.deferred[j].parent);
-			ft_set_parent_raw(dst_ft, child, pf);
+			ft_glue_record_back_edge(dst_ft, txn,
+				gd.deferred[j].child, gd.deferred[j].parent,
+				gd.deferred[j].slot);
 		}
-		/* Publish slot: old dst subtree -> merged cluster. */
-		rcu_assign_pointer(*pub_slot,
-				ft_flip_batch_add(flip, D_old, M_slot));
+		/* Forward publish: old dst subtree -> merged cluster. */
+		ft_flip_txn_record_reserved(txn, (void **) pub_slot,
+			D_old, M_slot);
 	}
 
 	/*
-	 * 3b. Ordered list: collect the interleave over the MERGED view and stage
-	 *    its cell edges into the SAME flip batch, so structure + ordered list
-	 *    commit in ONE flip and a reader never sees the merged structural
-	 *    minimum ahead of the ordered-list front.  The structural proxies are
-	 *    staged (selector still 0) but resolve to their merged target under
-	 *    ft_tls_resolve_merged, so the collect's inequality descent + parent
-	 *    up-walk read the about-to-be-published structure.  The collect pre-sets
-	 *    the surviving cells' own links invisibly (not yet ord-reachable) and
-	 *    returns only the visible boundary edges; we add each as a proxy into
-	 *    @flip ({old_target} resolves transparently until the commit).  The
-	 *    collect runs before apply_splices (step 5), but collisions are
-	 *    invariant to it: a collided src head is a floating duplicate (only in
-	 *    the splice record), never a distinct reachable head, so the merged-
-	 *    region walk enumerates the same heads either way.
+	 * 3b. Ordered list: install the structural proxies (selector still 0,
+	 *    resolving to old) so the interleave collect reads the about-to-be-
+	 *    published merged structure through them under ft_tls_resolve_merged,
+	 *    then collect the interleave over the MERGED view and record its cell
+	 *    edges into the SAME txn (now INSTALLED -> each installs immediately,
+	 *    appended into the reserved head chunk's spare capacity, no allocation).
+	 *    Structure + ordered list thus commit in ONE flip: a reader never sees
+	 *    the merged structural minimum ahead of the ordered-list front.  The
+	 *    collect pre-sets the surviving cells' own links invisibly (not yet
+	 *    ord-reachable) and returns only the visible boundary edges.  It runs
+	 *    before apply_splices (step 5), but collisions are invariant: a collided
+	 *    src head is a floating duplicate (only in the splice record), never a
+	 *    distinct reachable head, so the walk enumerates the same heads either way.
 	 */
 	if (ms_ord) {
 		unsigned int i;
 
+		urcu_flip_txn_install(txn);
 		ft_tls_resolve_merged = true;
 		ms_n = ft_merge_ord_interleave_collect(dst_ft, dst_key,
 			dst_key_len, merged_keys, ms_cursor, ms_prev, ms_edges);
 		ft_tls_resolve_merged = false;
 		for (i = 0; i < ms_n; i++)
-			rcu_assign_pointer(*ms_edges[i].slot,
-				(struct ft_ord_cell *) ft_flip_batch_add(flip,
-				  (struct cds_ft_inode_flag *) ms_edges[i].old_target,
-				  (struct cds_ft_inode_flag *) ms_edges[i].new_target));
+			ft_flip_txn_record_reserved(txn,
+				(void **) ms_edges[i].slot,
+				(void *) ms_edges[i].old_target,
+				(void *) ms_edges[i].new_target);
 	}
 
 	/*
-	 * 4. Flip: one release store switches every dst-origin parent, the
+	 * 4. Commit: one selector flip switches every dst-origin parent, the
 	 *    forward slot, AND every interleave cell edge from old to merged,
-	 *    atomically.  Because the forward slot flips with the back-pointers,
-	 *    a reader (which descends then walks up) only ever progresses
-	 *    old->merged, never regresses; and the ordered-list front advances in
-	 *    the same instant the merged minimum becomes reachable.
+	 *    atomically, then settles each slot to its direct merged target.  (List
+	 *    off with no dst-origin re-parent reduces to a single release store of
+	 *    the forward slot -- no proxy, no grace period.)  Because the forward
+	 *    slot flips with the back-pointers, a reader (descend then up-walk) only
+	 *    progresses old->merged; and the ordered-list front advances in the same
+	 *    instant the merged minimum becomes reachable.
 	 */
-	urcu_flip_commit(&flip->group);
+	gp_owed = urcu_flip_txn_commit(txn);
 
 	/* 5. Concatenate same-key duplicate chains (dst now reachable via M). */
 	ft_glue_apply_splices(dst_ft, &gd);
@@ -1481,36 +1489,19 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			(long) merged_keys - (long) cnt_dst);
 
 	/*
-	 * 7. Settle: rewrite each proxied slot -- structural (dst-origin parents +
-	 *    the forward slot) AND interleave cell edges -- to its direct merged
-	 *    target (idempotent for readers, the proxy already resolves to merged),
-	 *    so the proxies become unreferenced and the shared batch reclaimable.
+	 * 7. Reclaim, all deferred: the flip-txn (commit settled every proxied slot
+	 *    -- the dst-origin parents, the forward slot and the interleave cell
+	 *    edges -- to its direct merged target, so the proxies are unreferenced;
+	 *    @gp_owed is false only when the commit reduced to a single bare store)
+	 *    and the old overlap spines (src-side to src, dst-side to dst).  No dst
+	 *    synchronize_rcu -- the flip subsumed the dst drain.
 	 */
-	{
-		int j;
-		unsigned int i;
-
-		for (j = 0; j < gd.nr_deferred; j++)
-			if (gd.deferred[j].dst_origin)
-				ft_set_parent(dst_ft, gd.deferred[j].child,
-					gd.deferred[j].parent,
-					gd.deferred[j].slot);
-		rcu_assign_pointer(*pub_slot, M_slot);
-		for (i = 0; i < ms_n; i++)
-			rcu_assign_pointer(*ms_edges[i].slot, ms_edges[i].new_target);
-	}
-
-	/*
-	 * 8. Reclaim, all deferred: the flip batch (proxies now unreferenced)
-	 *    and the old overlap spines (src-side to src, dst-side to dst).
-	 *    No dst synchronize_rcu -- the flip subsumed the dst drain.
-	 */
-	ft_flip_batch_reclaim(flip);
+	ft_flip_txn_reclaim(dst_ft, txn, gp_owed);
 	ft_glue_free_old(src_ft, &gs);
 	ft_glue_free_old(dst_ft, &gd);
 
 	/*
-	 * 9. Free the collided (demoted) src heads' cells.  The interleave (folded
+	 * 8. Free the collided (demoted) src heads' cells.  The interleave (folded
 	 * into the flip above) already rewired the surviving cells' stale src-run
 	 * links away from these cells, so they are unreachable to new readers, and
 	 * the grace-period defer inside the free covers readers already holding such
@@ -1562,7 +1553,6 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 {
 	struct ft_glue glue;
 	struct cds_ft_alloc_reserve reserve;
-	struct ft_flip_batch *pre_flip = NULL;
 	struct ft_descent d;
 	enum ft_graft_prep prep;
 	struct cds_ft_inode_flag *attached_nf, *aparent;
@@ -1590,10 +1580,11 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	ft_glue_init(&glue);
 	memset(&reserve, 0, sizeof(reserve));
 	/*
-	 * Drive a GLUE diverge's live re-parents through a flip-txn, exactly like
-	 * cds_ft_graft: the build (below) tags its displaced old child dst_origin
-	 * iff @glue.txn is set, so create it BEFORE the build.  Retired below for a
-	 * NOSPLIT / POPULATED point (the legacy store / fresh-before-live path).
+	 * Every attach shape -- GLUE diverge and the NOSPLIT in-place store --
+	 * commits through @glue.txn (exactly like cds_ft_graft): the build (below)
+	 * tags its displaced old child dst_origin, and the NOSPLIT store reserves
+	 * its slot proxy + run-splice edges, all out of this txn.  Create it BEFORE
+	 * the build; destroyed on a POPULATED point (nothing to commit).
 	 */
 	glue.txn = ft_flip_txn_create();
 	if (!glue.txn || !urcu_flip_txn_reserve(glue.txn,
@@ -1618,16 +1609,11 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_POPULATED_ERROR;
 	}
 	if (prep == FT_GRAFT_PREP_NOSPLIT) {
-		/* NOSPLIT keeps its legacy store / fresh-before-live path. */
-		urcu_flip_txn_destroy(glue.txn);
-		glue.txn = NULL;
 		/*
 		 * Pre-fill the store's node reserve while both tries are still
-		 * pristine, AND the one flip batch the store parks its proxy in (a
-		 * malloc, so not reservable).  A displaced external is REPLACED via
-		 * the back-channel with no flip batch; every other NOSPLIT shape
-		 * (at-node empty slot, built non-displaced branch) needs exactly one.
-		 * Securing both here -- before the source unlink -- makes the
+		 * pristine.  The store's slot proxy + run-splice edges draw from the
+		 * already-reserved @glue.txn, so no separate flip batch is needed.
+		 * Securing the reserve here -- before the source unlink -- makes the
 		 * post-drain store wholly failure-free, so the unlink is the true last
 		 * fallible step and nothing strands.
 		 *
@@ -1639,31 +1625,14 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		 * underflowed the reserve and aborted).  A bulk op already pays a grace
 		 * period, so the throwaway pops/pushes are negligible.
 		 */
-		bool displaced = (d.depth < dst_key_len && d.nf
-				&& ft_node_external(d.nf));
-
 		if (ft_bulk_node_reserve_fill(dst_ft, &reserve)) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+			urcu_flip_txn_destroy(glue.txn);
 			ft_glue_fini(&glue);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
-		if (!displaced) {
-			/*
-			 * Sized FT_GRAFT_RUN_FLIP_CAP when ordered so the store can
-			 * FUSE the run-splice boundary edges into the same flip as the
-			 * structural slot store (the appear-side cross-view fix); a
-			 * run-less store needs only the single slot edge.
-			 */
-			pre_flip = ft_flip_batch_alloc(dst_ft,
-				ms_ord ? FT_GRAFT_RUN_FLIP_CAP : 1);
-			if (!pre_flip) {
-				cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-				ft_glue_fini(&glue);
-				return CDS_FT_STATUS_MEMORY_ERROR;
-			}
-		}
 	}
-	/* GLUE: cluster built invisibly.  NOSPLIT: reserve + flip batch secured. */
+	/* GLUE: cluster built invisibly.  NOSPLIT: reserve secured (+ glue.txn). */
 
 	/*
 	 * Ordered list: locate the dst splice neighbours while dst is still
@@ -1698,12 +1667,9 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 */
 	if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
 			cnt_src, srunp) < 0) {
-		if (pre_flip)
-			ft_flip_batch_free_unpublished(pre_flip);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		ft_glue_abort(dst_ft, &glue);
-		if (glue.txn)			/* set on the GLUE path */
-			urcu_flip_txn_destroy(glue.txn);
+		urcu_flip_txn_destroy(glue.txn);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
@@ -1758,8 +1724,9 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	} else {
 		/*
 		 * NOSPLIT: graft the in-place payload at @d.  Every node allocation
-		 * draws from the reserve and the proxy parks in the pre-secured flip
-		 * batch, so the store has no fallible step left -- it cannot fail.
+		 * draws from the reserve and the slot proxy + run-splice edges draw
+		 * from the pre-reserved @glue.txn, so the store has no fallible step
+		 * left -- it cannot fail.
 		 */
 		unsigned int adepth = 0;
 		enum cds_ft_status st;
@@ -1767,7 +1734,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		cds_ft_alloc_reserve_activate(dst_ft, &reserve);
 		st = ft_store_at_graft_point(dst_ft, okey_dst, dst_key_len, &d,
 				payload, cnt_src, &attached_nf, &adepth, &glue,
-				&pre_flip, run_arg);
+				run_arg);
 		cds_ft_alloc_reserve_deactivate(dst_ft);
 		assert(st == CDS_FT_STATUS_OK);
 		(void) st;
@@ -1809,20 +1776,20 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 }
 
 /*
- * @pre_flip carries a flip batch the caller reserved before its own last
- * fallible step, so the spine-copy / graft commit below draws an unfailable
- * batch instead of allocating one.  NULL on the public path (cds_ft_merge_at),
- * set only by the same-trie rekey, which pre-allocates it (sized from the O(1)
- * subtree key counts, structural re-parent + folded ordered-list interleave
- * together) so its post-detach merge cannot fail -- no reader-observable
+ * @pre_txn carries a flip-txn the caller reserved before its own last fallible
+ * step, so the spine-copy / graft commit below draws an unfailable txn instead
+ * of allocating one.  NULL on the public path (cds_ft_merge_at), set only by the
+ * same-trie rekey, which pre-reserves it (sized from the O(1) subtree key counts:
+ * the structural re-parent + folded ordered-list interleave, or the graft
+ * cluster floor) so its post-detach merge cannot fail -- no reader-observable
  * rollback.  The consume site NULLs the slot it takes, so the rekey frees the
- * batch only when a given merge shape left it unused.
+ * txn only when a given merge shape left it unused.
  */
 static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
 		const uint8_t *src_key, size_t src_key_len,
-		struct ft_flip_batch **pre_flip)
+		struct urcu_flip_txn **pre_txn)
 {
 	struct cds_ft *subtree = NULL;
 	enum cds_ft_status status;
@@ -1987,7 +1954,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		struct ft_descent d_mrg;
 		unsigned int off_mrg;
 		unsigned long n = cnt_src, m;		/* moved / dst subtree counts */
-		struct ft_flip_batch *pf_flip = NULL;
+		struct urcu_flip_txn *pf_txn = NULL;
 
 		if (off_src > 0) {
 			struct cds_ft_compressed_node *cn_s =
@@ -2040,36 +2007,41 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			&m);
 
 		/*
-		 * Pre-allocate the merge's flip batch HERE -- before the detach,
-		 * where a malloc failure is harmless (nothing has moved).  The
-		 * post-detach merge then has no fallible allocation left (every node
-		 * draws from @reserve, every flip proxy from this batch), so it CANNOT
-		 * fail and needs no reader-observable rollback.  @pf_flip feeds the
-		 * structural re-parent or the graft store; for an OCCUPIED ordered
-		 * merge the spine-copy FOLDS its ordered-list interleave into the same
-		 * flip, so size for both: the structural re-parent (<= m+1) plus the
-		 * interleave's <= 2n+2 cell edges.  The cap is an upper bound; the
-		 * merge uses <= it and NULLs the slot it consumes, so we free it below
-		 * only if a given shape left it unused.
+		 * Pre-reserve the merge's flip-txn HERE -- before the detach, where a
+		 * malloc failure is harmless (nothing has moved).  The post-detach
+		 * merge then has no fallible allocation left (every node draws from
+		 * @reserve, every flip latch from this reserved txn), so it CANNOT fail
+		 * and needs no reader-observable rollback.  @pf_txn feeds the structural
+		 * re-parent or the graft commit; the consume site NULLs the slot it
+		 * takes, so we free it below only if a given shape left it unused.
 		 *
-		 * When @mrg_key is ABSENT (m == 0) the merge GRAFTS, and an ordered
-		 * graft FUSES its run-splice into this same batch (the structural slot
-		 * edge plus the run's <=4 boundary edges -- FT_GRAFT_RUN_FLIP_CAP), so
-		 * size for that here.
+		 * Size per shape (the rekey recursion lands on spine-copy when @mrg_key
+		 * is occupied, graft when absent):
+		 *   - m > 0 (spine-copy): the structural re-parent (<= m+1) plus, for an
+		 *     ordered merge, the folded interleave's <= 2n+2 cell edges.
+		 *   - m == 0 (graft): the cluster floor FT_GLUE_FLOOR_DEFERRED + 6, the
+		 *     bound ft_graft_keylen reserves its own txn to -- it covers a GLUE
+		 *     diverge's back-edges + forward + run-splice AND the NOSPLIT store's
+		 *     slot proxy + run edges (FT_GRAFT_RUN_FLIP_CAP), whichever the graft
+		 *     point turns out to be.
 		 */
 		{
-			unsigned int pf_cap = (unsigned int) (m + 1);
+			unsigned int pf_cap;
 
-			if (dst_ft->group->ordered_list_set) {
-				if (m == 0)
-					pf_cap = FT_GRAFT_RUN_FLIP_CAP;
-				else
-					pf_cap = (unsigned int) (m + 1) +
-						(unsigned int) (2 * n + 2);
+			if (m == 0)
+				pf_cap = FT_GLUE_FLOOR_DEFERRED + 6;
+			else if (dst_ft->group->ordered_list_set)
+				pf_cap = (unsigned int) (m + 1) +
+					(unsigned int) (2 * n + 2);
+			else
+				pf_cap = (unsigned int) (m + 1);
+			pf_txn = ft_flip_txn_create();
+			if (pf_txn && !urcu_flip_txn_reserve(pf_txn, pf_cap)) {
+				urcu_flip_txn_destroy(pf_txn);
+				pf_txn = NULL;
 			}
-			pf_flip = ft_flip_batch_alloc(dst_ft, pf_cap);
 		}
-		if (!pf_flip) {
+		if (!pf_txn) {
 			FT_TP(merge_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
@@ -2082,14 +2054,14 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		memset(&reserve, 0, sizeof(reserve));
 		if (ft_bulk_node_reserve_fill(dst_ft, &reserve)) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-			ft_flip_batch_free_unpublished(pf_flip);
+			urcu_flip_txn_destroy(pf_txn);
 			FT_TP(merge_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		status = ft_detach_keylen(dst_ft, det_key, det_len, &tmp);
 		if (status < 0) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-			ft_flip_batch_free_unpublished(pf_flip);
+			urcu_flip_txn_destroy(pf_txn);
 			FT_TP(merge_exit, (int) (status == CDS_FT_STATUS_NOT_FOUND
 				? CDS_FT_STATUS_OK : status));
 			return status == CDS_FT_STATUS_NOT_FOUND
@@ -2099,18 +2071,18 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		cds_ft_alloc_reserve_activate(tmp, &reserve);
 		/*
 		 * Unfailable placement: every node draws from @reserve and every
-		 * flip proxy from @pf_flip, so the merge always commits the move.  No
+		 * flip latch from @pf_txn, so the merge always commits the move.  No
 		 * failure path can strand @tmp's content back at @det_key -- that
 		 * re-graft was the reader-observable rollback we removed.
 		 */
 		status = ft_merge_at_inner(dst_ft, mrg_key, mrg_len, tmp, NULL, 0,
-			&pf_flip);
+			&pf_txn);
 		cds_ft_alloc_reserve_deactivate(dst_ft);
 		cds_ft_alloc_reserve_deactivate(tmp);
 		assert(status == CDS_FT_STATUS_OK);
-		/* Free the flip batch this merge shape did not consume. */
-		if (pf_flip)
-			ft_flip_batch_free_unpublished(pf_flip);
+		/* Free the flip-txn this merge shape did not consume. */
+		if (pf_txn)
+			urcu_flip_txn_destroy(pf_txn);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		cds_ft_destroy(tmp);
 		FT_TP(merge_exit, (int) status);
@@ -2137,7 +2109,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
 				okey_src, src_key_len, cnt_src, off_src,
 				&d_dst, cnt_dst, off_dst, okey_dst, dst_key_len,
-				pre_flip);
+				pre_txn);
 		if (status == CDS_FT_STATUS_OK) {
 			/*
 			 * Raise dst's max_used_key_len for the moved keys
@@ -2175,7 +2147,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 */
 	if (src_key_len == 0) {
 		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, src_ft,
-				pre_flip);
+				pre_txn);
 		FT_TP(merge_exit, (int) status);
 		return status;
 	}

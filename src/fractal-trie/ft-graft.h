@@ -353,7 +353,7 @@ struct ft_graft_store_state {
 	struct cds_ft_inode_flag *attached;		/* payload (at-node) or branch */
 	unsigned int attached_depth;
 	/* flip publish (slot-at-node and built-branch-flip shapes): */
-	struct ft_flip_batch *b;
+	struct urcu_flip_latch *slot_latch;	/* glue->txn latch for the slot proxy */
 	struct cds_ft_inode_flag *dest;
 	struct cds_ft_inode *old_recompacted_node;
 	struct cds_ft_metadata *publish_pmeta;
@@ -382,12 +382,8 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		struct cds_ft_inode_flag *graft_payload,
 		unsigned long graft_external_count,
 		struct ft_glue *glue,
-		struct ft_flip_batch **pre_flip,
-		struct ft_graft_run *run,
 		struct ft_graft_store_state *st)
 {
-	unsigned int flip_cap = run ? FT_GRAFT_RUN_FLIP_CAP : 1;
-
 	memset(st, 0, sizeof(*st));
 	st->glue = glue;
 
@@ -404,7 +400,6 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		struct cds_ft_metadata *pmeta;
 		struct cds_ft_inode_flag *dest;
 		struct cds_ft_inode_flag *slot_value, *pf;
-		struct ft_flip_batch *b;
 		int ret;
 
 		if (d->nf)
@@ -422,29 +417,27 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		 * LAST fallible steps, so they run FIRST, parking a flip proxy
 		 * that keeps resolving to the empty slot.  An ENOMEM here leaves
 		 * both tries untouched (no live edge flipped); the failure-free
-		 * wiring runs behind the parked proxy in commit.
+		 * wiring runs behind the parked proxy in commit.  The proxy is a
+		 * latch reserved out of glue->txn (whose slot is bound in commit,
+		 * once the recompact-relocated slot address is known), so the slot
+		 * store flips atomically with the back-pointers and the ordered-list
+		 * run-splice -- the appear-side cross-view fix -- in one txn commit.
 		 */
 		slot_value = graft_payload;
 		if (ft_node_compressed(graft_payload))
 			slot_value = ft_publish_compressed(ft,
 				ft_compressed_node_ptr(graft_payload),
 				graft_payload);
-		b = ft_flip_batch_take(ft, flip_cap, pre_flip);
-		if (!b)
-			return CDS_FT_STATUS_MEMORY_ERROR;
-		pf = ft_flip_batch_add(b, NULL, slot_value);
+		pf = (struct cds_ft_inode_flag *) urcu_flip_txn_reserve_slot(
+			glue->txn, NULL, slot_value, &st->slot_latch);
 		dest = d->pnf;
 		ret = ft_node_set_nth(ft, &dest, key[key_len - 1], pf,
 			&st->old_recompacted_node, pmeta, d->depth - 1, false);
-		if (ret) {
-			/* @b is owned here now (taken or freshly allocated). */
-			ft_flip_batch_free_unpublished(b);
+		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
-		}
 
 		st->attached = graft_payload;
 		st->attached_depth = (unsigned int) key_len;
-		st->b = b;
 		st->dest = dest;
 		st->publish_pmeta = pmeta;
 		st->pnfp = d->pnfp;
@@ -495,32 +488,27 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			struct cds_ft_inode_flag *dest = d->pnf;
 			struct cds_ft_metadata *pmeta;
 			struct cds_ft_inode_flag *pf;
-			struct ft_flip_batch *b;
 			int ret;
 
 			pmeta = cds_ft_item_to_metadata(ft_node_ptr(d->pnf));
 
 			/*
 			 * Same R8 + fresh-before-live discipline as the
-			 * d->depth == key_len arm: park a flip proxy so the
-			 * fallible slot store runs FIRST and the wiring
-			 * completes invisibly in commit.
+			 * d->depth == key_len arm: park a glue->txn slot
+			 * proxy so the fallible slot store runs FIRST and the
+			 * wiring completes invisibly in commit.
 			 */
-			b = ft_flip_batch_take(ft, flip_cap, pre_flip);
-			if (!b)
-				return CDS_FT_STATUS_MEMORY_ERROR;
-			pf = ft_flip_batch_add(b, NULL, branch);
+			pf = (struct cds_ft_inode_flag *)
+				urcu_flip_txn_reserve_slot(glue->txn,
+					NULL, branch, &st->slot_latch);
 			ret = ft_node_set_nth(ft, &dest, key[i - 1], pf,
 				&st->old_recompacted_node, pmeta,
 				d->depth - 1, false);
-			if (ret) {
-				ft_flip_batch_free_unpublished(b);
+			if (ret)
 				return CDS_FT_STATUS_MEMORY_ERROR;
-			}
 
 			st->attached = branch;
 			st->attached_depth = d->depth;
-			st->b = b;
 			st->dest = dest;
 			st->publish_pmeta = pmeta;
 			st->pnfp = d->pnfp;
@@ -539,53 +527,26 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		struct ft_graft_store_state *st)
 {
 	if (st->displaced_shape) {
-		if (st->glue->txn) {
-			/*
-			 * The displaced external is LIVE -- the dst leaf stays reachable
-			 * through the still-old slot until the forward publish replaces
-			 * it -- so its re-parent onto the fresh @branch (its back-channel
-			 * displaced->prev / cell->parent = branch) is a reader-observable
-			 * pointer.  Record it as a dst_origin edge so ft_glue_txn_commit
-			 * flips it atomically with the forward publish + the run-splice
-			 * cell edges, rather than a fresh-before-live store ahead of them.
-			 * (A flip proxy parked on an external's parent is resolved by the
-			 * up-walk readers -- ft_get_parent_rcu / ft_skip_to_compressed /
-			 * ft_skip_reanchor.)  The payload's hidden back-pointers are wired
-			 * immediately by ft_glue_apply_deferred inside the commit.
-			 */
-			ft_glue_defer_edge_origin(ft, st->glue,
-				(struct cds_ft_inode_flag *) st->displaced,
-				st->attached, NULL, /*dst_origin=*/ true);
-			st->glue->publish_parent = st->pnf;
-			st->glue->publish_slot = st->nfp;
-			st->glue->top = st->attached;
-			ft_glue_txn_commit(ft, st->glue, run);
-		} else {
-			/*
-			 * Legacy: the displaced external's back-channel (displaced->prev /
-			 * cell->parent = branch) is published DIRECTLY, before any flip --
-			 * @branch (its new parent) is fresh, its own parent wired
-			 * build-invisibly, so a direct store is already consistent for an
-			 * up-walk reader.  Classic fresh-before-live.  Then glue deferred
-			 * (the payload's live back-pointers), then the forward publish --
-			 * FUSED with the ordered-list run-splice (record into @rec, then
-			 * ft_ord_cell_flip_rec_run) when the list is on.  @run->pred/succ,
-			 * located before the attach, bracket the displaced external's
-			 * relocated cell so the run splices in beside it.
-			 */
-			ft_publish_external_nodes_prev(ft, st->attached, st->displaced);
-			ft_glue_apply_deferred(ft, st->glue);
-			if (run) {
-				struct ft_pub_rec rec = { .n = 0 };
-
-				_ft_publish_to_parent(ft, st->pnf, st->nfp,
-					st->attached, &rec);
-				ft_ord_cell_flip_rec_run(ft, &rec, run);
-			} else {
-				ft_publish_to_parent(ft, st->pnf, st->nfp,
-					st->attached);
-			}
-		}
+		/*
+		 * The displaced external is LIVE -- the dst leaf stays reachable
+		 * through the still-old slot until the forward publish replaces it --
+		 * so its re-parent onto the fresh @branch (its back-channel
+		 * displaced->prev / cell->parent = branch) is a reader-observable
+		 * pointer.  Record it as a dst_origin edge so ft_glue_txn_commit flips
+		 * it atomically with the forward publish + the run-splice cell edges,
+		 * rather than a fresh-before-live store ahead of them.  (A flip proxy
+		 * parked on an external's parent is resolved by the up-walk readers --
+		 * ft_get_parent_rcu / ft_skip_to_compressed / ft_skip_reanchor.)  The
+		 * payload's hidden back-pointers are wired immediately by
+		 * ft_glue_apply_deferred inside the commit.
+		 */
+		ft_glue_defer_edge_origin(ft, st->glue,
+			(struct cds_ft_inode_flag *) st->displaced,
+			st->attached, NULL, /*dst_origin=*/ true);
+		st->glue->publish_parent = st->pnf;
+		st->glue->publish_slot = st->nfp;
+		st->glue->top = st->attached;
+		ft_glue_txn_commit(ft, st->glue, run);
 		if (st->tp_i >= 1)
 			FT_TP(tree_edge_set, (const void *) ft,
 				(const void *) st->pnf,
@@ -596,6 +557,7 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **slot = NULL;
 		struct ft_ord_cell_edge redges[4];
 		unsigned int rn = 0, i;
+		bool gp;
 
 		ft_node_get_nth_skip(st->dest, &slot, st->slot_byte, FT_PF_NONE);
 		assert(slot);
@@ -604,29 +566,27 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		ft_publish_to_parent(ft, st->publish_pmeta->parent, st->pnfp,
 			st->dest);
 		/*
-		 * Fuse the ordered-list run-splice into the SAME flip as the
-		 * structural slot store: install the run's <=4 boundary-edge
-		 * proxies into @st->b (sized FT_GRAFT_RUN_FLIP_CAP in prepare) so
-		 * the single ft_flip_batch_commit makes the grafted key appear in
-		 * the structure and the ordered list atomically.  The slot proxy
-		 * was already parked in prepare (the last fallible step); the cell
-		 * edges have no fallible step, so they install here.
+		 * Bind the slot proxy reserved in prepare (now that the recompact-
+		 * relocated slot address is known), then fuse the ordered-list
+		 * run-splice into the SAME glue->txn: record the run's <=4 boundary
+		 * edges so one commit makes the grafted key appear in the structure
+		 * and the ordered list atomically.  The slot proxy was placed in
+		 * prepare (the last fallible step); the cell edges have no fallible
+		 * step, and all draw from the reserved txn (no allocation here).
 		 */
+		urcu_flip_txn_bind_slot(st->slot_latch, (void **) slot);
 		if (run) {
 			rn = ft_ord_cell_run_splice_edges(ft, run->run_first,
 				run->run_last, run->pred, run->succ, redges, 0);
 			for (i = 0; i < rn; i++)
-				rcu_assign_pointer(*redges[i].slot,
-					(struct ft_ord_cell *) ft_flip_batch_add(
-						st->b,
-						(struct cds_ft_inode_flag *) redges[i].old_target,
-						(struct cds_ft_inode_flag *) redges[i].new_target));
+				ft_flip_txn_record_reserved(st->glue->txn,
+					(void **) redges[i].slot,
+					redges[i].old_target,
+					redges[i].new_target);
 		}
-		ft_flip_batch_commit(st->b);
-		rcu_assign_pointer(*slot, st->slot_value);
-		for (i = 0; i < rn; i++)
-			rcu_assign_pointer(*redges[i].slot, redges[i].new_target);
-		ft_flip_batch_reclaim(st->b);
+		gp = urcu_flip_txn_commit(st->glue->txn);
+		ft_flip_txn_reclaim(ft, st->glue->txn, gp);
+		st->glue->txn = NULL;
 		if (run)
 			run->armed = true;
 
@@ -640,14 +600,13 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 
 /*
  * Combined NOSPLIT store: prepare + commit back-to-back -- cds_ft_graft's call
- * site, run after the source-root unlink + drain.  @pre_flip, when non-NULL, is
- * a caller-pre-allocated flip batch the prepare uses instead of allocating its
- * own: a sub-position merge pre-allocates it BEFORE its source unlink so this
- * post-drain store has no fallible allocation left (the node allocations draw
- * from the reserve, the flip batch is pre-secured).  @run, when non-NULL, fuses
- * an ordered-list run-splice into the structural publish flip (both store shapes:
- * the in-place slot proxy and the displaced-external forward publish) -- the
- * caller must size @pre_flip to FT_GRAFT_RUN_FLIP_CAP for the slot shape.
+ * site, run after the source-root unlink + drain.  The slot proxy and the
+ * ordered-list run-splice both ride @glue->txn (which the caller created /
+ * took and reserved before its last fallible step, so this post-drain store
+ * has no fallible allocation left -- node allocations draw from the reserve,
+ * flip latches from the reserved txn).  @run, when non-NULL, fuses an
+ * ordered-list run-splice into the structural publish flip (both store shapes:
+ * the in-place slot proxy and the displaced-external forward publish).
  */
 static
 enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
@@ -658,15 +617,13 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attached_nf,
 		unsigned int *attached_depth,
 		struct ft_glue *glue,
-		struct ft_flip_batch **pre_flip,
 		struct ft_graft_run *run)
 {
 	struct ft_graft_store_state st;
 	enum cds_ft_status status;
 
 	status = ft_store_at_graft_point_prepare(ft, key, key_len, d,
-			graft_payload, graft_external_count, glue, pre_flip,
-			run, &st);
+			graft_payload, graft_external_count, glue, &st);
 	if (status != CDS_FT_STATUS_OK)
 		return status;
 	ft_store_at_graft_point_commit(ft, attached_nf, attached_depth, run, &st);
@@ -767,7 +724,7 @@ static
 enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		const uint8_t *_key, size_t key_len,
 		struct cds_ft *src_ft,
-		struct ft_flip_batch **pre_flip)
+		struct urcu_flip_txn **pre_txn)
 {
 	struct cds_ft_metadata *src_rmeta;
 	size_t src_max;
@@ -890,15 +847,14 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct ft_graft_run *run_arg = NULL;
 		/*
 		 * Self-secured NOSPLIT attach: when no caller reserve is active, this
-		 * graft reserves its own commit nodes + flip batch before publishing
-		 * the empty source root, so the post-publish store cannot fail and
-		 * needs no reader-observable source-root rollback.  Empty (NULL @pre)
-		 * under a caller reserve -- the rekey, whose reserve + @pre_flip
-		 * already make the store unfailable.
+		 * graft reserves its own commit nodes before publishing the empty
+		 * source root, so the post-publish store cannot fail and needs no
+		 * reader-observable source-root rollback.  Skipped under a caller
+		 * reserve -- the rekey, whose reserve + pre-reserved @glue.txn already
+		 * make the store unfailable.  (The store's flip latches all draw from
+		 * @glue.txn, reserved below, so no separate flip batch is needed.)
 		 */
 		struct cds_ft_alloc_reserve graft_reserve;
-		struct ft_flip_batch *graft_flip = NULL;
-		struct ft_flip_batch **store_pre_flip = pre_flip;
 		bool self_secured = false;
 		/*
 		 * NIL-key-only source: the whole source is a single prefix key,
@@ -932,22 +888,22 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		ft_glue_init(&glue);
 		/*
-		 * Converted GLUE attach (the diverge split): drive its live
-		 * re-parents + forward publish through a flip-txn so they commit
-		 * atomically, retiring the deferred-edge ordering protocol.  The
-		 * cluster is floor-bounded, so reserve the txn to that bound up
-		 * front (records then can't fail mid-build, like the glue floor
-		 * arrays); the + 6 headroom covers the forward edge's 1-2 stores
-		 * and the <=4 ordered-list run-splice boundary cell edges, which
-		 * ft_glue_txn_commit folds into the SAME flip when the list is on.
-		 * Gated OFF a caller @pre_flip only (the merge rekey, kept on the
-		 * proven path).  Created before the build only so its lifecycle is
-		 * co-located here; the build records nothing into it --
-		 * ft_glue_txn_commit replays g->deferred through it post-drain.
-		 * Retired below if the build is NOSPLIT / POPULATED (legacy store)
-		 * rather than a GLUE diverge.
+		 * Every attach shape -- GLUE diverge, displaced-external, and the
+		 * in-place NOSPLIT slot store -- commits through @glue.txn, so its
+		 * live re-parents + forward publish + ordered-list run-splice flip
+		 * atomically with no deferred-edge ordering window.  Take the
+		 * caller's pre-reserved txn (the rekey, pre-sized before its detach so
+		 * the post-drain commit cannot fail) or create one here, reserved to
+		 * the floor-bounded cluster size up front (records then can't fail
+		 * mid-build, like the glue floor arrays); the + 6 headroom covers the
+		 * forward edge's 1-2 stores plus the <=4 run-splice cell edges (also
+		 * the in-place slot proxy + its run edges, FT_GRAFT_RUN_FLIP_CAP).
+		 * Created before the build only so its lifecycle is co-located here;
+		 * the build records nothing into it -- the commit replays g->deferred
+		 * (and the store reserves its slot proxy) through it post-drain.
 		 */
-		if (!pre_flip) {
+		glue.txn = ft_flip_txn_take(pre_txn);
+		if (!glue.txn) {
 			glue.txn = ft_flip_txn_create();
 			if (!glue.txn || !urcu_flip_txn_reserve(glue.txn,
 					FT_GLUE_FLOOR_DEFERRED + 6)) {
@@ -980,31 +936,9 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * d->depth == key_len.
 		 */
 		if (prep == FT_GRAFT_PREP_NOSPLIT && d.depth == key_len && d.nf) {
-			if (glue.txn)
-				urcu_flip_txn_destroy(glue.txn);
+			urcu_flip_txn_destroy(glue.txn);
 			free_cds_ft_node(src_ft, fresh_node);
 			return CDS_FT_STATUS_POPULATED_ERROR;
-		}
-		/*
-		 * NOSPLIT keeps the txn ONLY for the displaced-external store shape
-		 * (d->nf an external below key_len, relocated under a fresh branch
-		 * alongside the payload) -- structurally a GLUE-like invisible
-		 * attach whose payload back-pointers + forward publish + run-splice
-		 * fuse into the txn (the displaced external's own back-channel stays
-		 * a direct fresh-before-live assign; see
-		 * ft_store_at_graft_point_commit).  The in-place slot shapes (empty
-		 * graft point, or a recompacting slot store) park a flip-batch proxy
-		 * during their fallible build and stay on the legacy commit, so
-		 * retire the unused txn there.
-		 */
-		if (prep == FT_GRAFT_PREP_NOSPLIT && glue.txn) {
-			bool displaced_shape = d.depth < key_len && d.nf
-				&& ft_node_external(d.nf);
-
-			if (!displaced_shape) {
-				urcu_flip_txn_destroy(glue.txn);
-				glue.txn = NULL;
-			}
 		}
 
 		/*
@@ -1019,33 +953,24 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 
 		/*
 		 * Self-secure the NOSPLIT store BEFORE the point of no return (the
-		 * source-root swap below).  A generous node reserve + a flip batch,
-		 * drawn here where failure is clean (nothing published yet), make the
-		 * post-swap ft_store_at_graft_point unfailable -- so the old rollback
-		 * that re-published the source root on a store OOM (a reader-observable
-		 * flicker of the source: empty, then full again) is gone.  Skipped when
-		 * a caller reserve is already active (the rekey), which secures it via
-		 * @pre_flip + that reserve.  The flip is freed below if the store's
-		 * shape (a displaced external) did not consume it.
+		 * source-root swap below).  A generous node reserve, drawn here where
+		 * failure is clean (nothing published yet), makes the post-swap
+		 * ft_store_at_graft_point unfailable -- so the old rollback that
+		 * re-published the source root on a store OOM (a reader-observable
+		 * flicker of the source: empty, then full again) is gone.  The store's
+		 * flip latches draw from the pre-reserved @glue.txn.  Skipped when a
+		 * caller reserve is already active (the rekey), which secures it via
+		 * that reserve + the pre-reserved txn.
 		 */
 		if (prep == FT_GRAFT_PREP_NOSPLIT && !dst_ft->active_reserve) {
 			memset(&graft_reserve, 0, sizeof(graft_reserve));
 			if (ft_bulk_node_reserve_fill(dst_ft, &graft_reserve)) {
 				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
 				ft_glue_abort(dst_ft, &glue);
+				urcu_flip_txn_destroy(glue.txn);
 				free_cds_ft_node(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
-			graft_flip = ft_flip_batch_alloc(dst_ft,
-				dst_ft->group->ordered_list_set ?
-					FT_GRAFT_RUN_FLIP_CAP : 1);
-			if (!graft_flip) {
-				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
-				ft_glue_abort(dst_ft, &glue);
-				free_cds_ft_node(src_ft, fresh_node);
-				return CDS_FT_STATUS_MEMORY_ERROR;
-			}
-			store_pre_flip = &graft_flip;
 			self_secured = true;
 		}
 
@@ -1132,16 +1057,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * -- structure and ordered list -- is observed old XOR new
 			 * with no deferred-edge ordering window.  ft_glue_txn_commit
 			 * arms @run_arg, so the standalone splice below is skipped.
-			 * The legacy two-step (apply deferred back-pointers, then a
-			 * forward publish FUSED with the run-splice) only runs when
-			 * the txn was retired (NOSPLIT) or never created (@pre_flip).
 			 */
-			if (glue.txn) {
-				ft_glue_txn_commit(dst_ft, &glue, run_arg);
-			} else {
-				ft_glue_apply_deferred(dst_ft, &glue);
-				ft_glue_publish_run(dst_ft, &glue, run_arg);
-			}
+			ft_glue_txn_commit(dst_ft, &glue, run_arg);
 			attached_nf = glue.attached_nf;
 			ft_glue_free_old(dst_ft, &glue);
 		} else {
@@ -1151,10 +1068,10 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * the live graft-point node, and published -- all inside
 			 * ft_store_at_graft_point.  Every node draws from the
 			 * reserve (self-secured above, or the caller's) and the
-			 * proxy parks in the pre-secured flip batch, so the store
-			 * has no fallible step left: it cannot fail, and there is
-			 * NO source-root rollback (which would have flickered the
-			 * source empty-then-full to a reader).
+			 * slot proxy + run-splice edges draw from the pre-reserved
+			 * @glue.txn, so the store has no fallible step left: it
+			 * cannot fail, and there is NO source-root rollback (which
+			 * would have flickered the source empty-then-full).
 			 */
 			unsigned int attached_depth = 0;
 
@@ -1166,17 +1083,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 							  src_count,
 							  &attached_nf,
 							  &attached_depth,
-							  &glue, store_pre_flip,
-							  run_arg);
+							  &glue, run_arg);
 			if (self_secured) {
 				cds_ft_alloc_reserve_deactivate(dst_ft);
 				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
 			}
 			assert(status == CDS_FT_STATUS_OK);
 			(void) status;
-			/* Free the flip batch if a displaced-external shape skipped it. */
-			if (graft_flip)
-				ft_flip_batch_free_unpublished(graft_flip);
 		}
 
 		/*

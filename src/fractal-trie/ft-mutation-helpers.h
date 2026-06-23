@@ -138,45 +138,15 @@ struct ft_flip_batch *ft_flip_batch_alloc(struct cds_ft *ft, unsigned int cap)
 }
 
 /*
- * Take a caller-reserved flip batch when @pre supplies one, NULLing the
- * caller's slot to transfer ownership: from here on the consuming op frees the
- * batch (reclaim on commit, free_unpublished on its abort), and the caller
- * frees only the slots it still holds.  Falls back to a fresh allocation when
- * no batch was reserved (the standalone-op path) -- so a reserved op draws a
- * pre-allocated, unfailable batch while a normal op allocates as before.  @cap
- * is the fallback capacity; a reserved batch is already sized >= @cap by the
- * caller's read-only count pass.
- */
-static
-struct ft_flip_batch *ft_flip_batch_take(struct cds_ft *ft, unsigned int cap,
-		struct ft_flip_batch **pre)
-{
-	if (pre && *pre) {
-		struct ft_flip_batch *b = *pre;
-
-		*pre = NULL;
-		return b;
-	}
-	return ft_flip_batch_alloc(ft, cap);
-}
-
-/*
  * Free a flip batch that was allocated but never installed (no proxy stored
  * in any live slot, group never committed): a plain free, no grace period,
- * since no reader can reference it.  Used by the merge's last-fallible src
- * unlink abort path.
+ * since no reader can reference it.  Used by op abort paths (e.g. graft_swap,
+ * insert) that bail after allocating the batch but before publishing it.
  */
 static
 void ft_flip_batch_free_unpublished(struct ft_flip_batch *b)
 {
 	free(b);
-}
-
-/* One release store: every proxy in the batch flips old -> new atomically. */
-static
-void ft_flip_batch_commit(struct ft_flip_batch *b)
-{
-	urcu_flip_commit(&b->group);
 }
 
 /*
@@ -226,6 +196,27 @@ static inline
 struct urcu_flip_txn *ft_flip_txn_create(void)
 {
 	return urcu_flip_txn_create(ft_flip_txn_tag);
+}
+
+/*
+ * Take a caller-reserved flip-txn when @pre supplies one, NULLing the caller's
+ * slot to transfer ownership: from here on the consuming bulk op commits and
+ * reclaims it, and the caller frees only what it still holds.  Returns NULL when
+ * no txn was reserved (the standalone-op path) -- the consumer then creates and
+ * reserves its own.  A same-trie rekey pre-reserves the txn before its detach so
+ * the post-drain commit cannot fail, while a normal op reserves its own where
+ * failure is still clean.
+ */
+static inline
+struct urcu_flip_txn *ft_flip_txn_take(struct urcu_flip_txn **pre)
+{
+	if (pre && *pre) {
+		struct urcu_flip_txn *t = *pre;
+
+		*pre = NULL;
+		return t;
+	}
+	return NULL;
 }
 
 static inline
@@ -1037,32 +1028,6 @@ struct ft_graft_run {
 };
 
 /*
- * Commit a graft's RECORDED structural publish edges (@rec: the forward parent
- * slot, plus a compressed parent's SKIP_X dual) ATOMICALLY with @run's
- * ordered-list run-splice, in ONE ft_ord_cell_flip -- the shared tail of the
- * GLUE and displaced-external graft shapes whose publish is a direct store (not
- * a parked flip-batch proxy like the in-place slot shape).  Arms @run.
- */
-static
-void ft_ord_cell_flip_rec_run(struct cds_ft *ft, struct ft_pub_rec *rec,
-		struct ft_graft_run *run)
-{
-	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 cell */
-	unsigned int n = 0, i;
-
-	for (i = 0; i < rec->n; i++) {
-		edges[n].slot = (struct ft_ord_cell **) rec->slot[i];
-		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
-		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
-		n++;
-	}
-	n = ft_ord_cell_run_splice_edges(ft, run->run_first, run->run_last,
-		run->pred, run->succ, edges, n);
-	ft_ord_cell_flip(ft, edges, n);
-	run->armed = true;
-}
-
-/*
  * Replace the run [@d_first .. @d_last] currently in @dst's ordered list with
  * the run [@s_first .. @s_last] at the SAME position -- the cds_ft_graft_swap
  * shape, where @dst's subtree-at-key (run_D) is swapped out for the swap trie's
@@ -1146,8 +1111,8 @@ struct ft_graft_swap_run {
 /*
  * Commit a graft_swap's RECORDED structural publish edges (@rec: the forward
  * parent slot, plus a compressed parent's SKIP_X dual) ATOMICALLY with @run's
- * ordered-list run-replace, in ONE ft_ord_cell_flip -- the run-replace analog of
- * ft_ord_cell_flip_rec_run.  Arms @run.
+ * ordered-list run-replace, in ONE ft_ord_cell_flip (the legacy non-txn
+ * graft_swap commit path).  Arms @run.
  */
 static
 void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct ft_pub_rec *rec,
@@ -2346,33 +2311,8 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_glue *g)
 }
 
 /*
- * GLUE-path graft publish FUSED with an ordered-list run-splice -- the
- * appear-side dual of ft_remove_commit_rec.  When @run is set, RECORD the
- * cluster's forward publish edge (plus a compressed parent's SKIP_X dual) via a
- * ft_pub_rec instead of storing it, append the run's <=4 splice boundary edges,
- * and commit them all in ONE ft_ord_cell_flip, so a reader never sees the
- * grafted run reachable in the structure but absent from the ordered list (or
- * vice versa).  @run->armed is set so the caller skips the standalone splice.
- * @run NULL (ordered list off) falls back to the plain forward publish.
- */
-static
-void ft_glue_publish_run(struct cds_ft *ft, struct ft_glue *g,
-		struct ft_graft_run *run)
-{
-	struct ft_pub_rec rec = { .n = 0 };
-
-	if (!run) {
-		ft_glue_publish(ft, g);
-		return;
-	}
-	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		&rec);
-	ft_ord_cell_flip_rec_run(ft, &rec, run);
-}
-
-/*
- * GLUE-path graft_swap publish FUSED with an ordered-list run-REPLACE -- the
- * sub-key graft_swap analog of ft_glue_publish_run.  When @run is set, RECORD
+ * GLUE-path graft_swap publish FUSED with an ordered-list run-REPLACE (the
+ * legacy non-txn graft_swap commit path).  When @run is set, RECORD
  * the cluster's forward publish edge (plus a compressed parent's SKIP_X dual)
  * via a ft_pub_rec instead of storing it, append the run-replace boundary edges,
  * and commit them all in ONE ft_ord_cell_flip, so a reader never sees run_S's
