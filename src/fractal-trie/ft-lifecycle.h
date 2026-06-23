@@ -306,6 +306,15 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
+enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
+		bool enabled)
+{
+	if (!attr)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->speculative_keys_disabled = !enabled;
+	return CDS_FT_STATUS_OK;
+}
+
 void cds_ft_make_exclusive(struct cds_ft *ft)
 {
 	CDS_FT_SCOPED_WRITER(ft);
@@ -587,7 +596,7 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 	 * non-identity via ft_key_to_ordinals), so installed before the early
 	 * non-identity return below.
 	 */
-	bool kc = group->speculative_key_offset_set && group->speculative &&
+	bool kc = ft->speculative_key_offset_active && group->speculative &&
 			(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED);
 
 	ft->lookup_le_fn = kc ? ft_ineq_le_keycopy : ft_ineq_le_eager;
@@ -653,6 +662,15 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->group = ft_group;
 	/* Cache the group's ordered-list mode for the read-side cell gate. */
 	ft->ordered_list = ft_group->ordered_list_set;
+	/*
+	 * Effective per-trie speculative-key state: the group is configured for
+	 * speculative result-key capture AND this trie did not opt out via
+	 * cds_ft_attr_set_speculative_keys(attr, false).  Set BEFORE
+	 * ft_install_lookup_ops (which keys @kc off it) so an opted-out trie gets
+	 * the EAGER lookup specializations.
+	 */
+	ft->speculative_key_offset_active = ft_group->speculative_key_offset_set &&
+		(!attr || !attr->speculative_keys_disabled);
 	ft_install_lookup_ops(ft);
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*

@@ -1087,7 +1087,13 @@ bool ft_speculative_keycopy(const struct cds_ft *ft,
 
 	if (!leaf || level < 0)
 		return false;
-	if (!group->speculative_key_offset_set || !group->speculative ||
+	/*
+	 * Per-trie gate: a trie that opted out of speculative keys
+	 * (cds_ft_attr_set_speculative_keys false) must NOT copy from the leaf's
+	 * stored key here -- its leaves may hold a key that does not match their
+	 * position -- so the caller falls back to the descent-built ordinal_key.
+	 */
+	if (!ft->speculative_key_offset_active || !group->speculative ||
 			!(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED))
 		return false;
 	leaf_key = (const uint8_t *) leaf + group->speculative_key_offset;

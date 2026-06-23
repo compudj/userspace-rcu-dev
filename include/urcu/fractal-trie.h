@@ -2553,6 +2553,40 @@ enum cds_ft_status cds_ft_attr_set_exclusive(struct cds_ft_attr *attr,
 		bool exclusive);
 
 /*
+ * cds_ft_attr_set_speculative_keys - Per-trie opt-out of speculative leaf keys.
+ * @attr: Fractal Trie attributes.
+ * @enabled: true (default) -- this trie uses the group's speculative result-key
+ *           capture (cds_ft_group_attr_set_speculative_key_offset), reading each
+ *           matched leaf's stored key field on lookup.  false -- this trie
+ *           behaves as if the group had NO speculative key offset: every lookup
+ *           reconstructs the result key from the trie structure (the EAGER path)
+ *           and NEVER reads the stored leaf key.
+ *
+ * Has no effect on a group that was not configured with a speculative key
+ * offset (such a group is always EAGER).
+ *
+ * Use false for a trie whose leaves' stored keys do not match their positions:
+ *   - a STAGING source built for a non-root graft, whose leaves are stamped
+ *     with their FUTURE destination key (dst prefix + suffix) rather than their
+ *     current staging position;
+ *   - the DESTINATION of a graft_swap or a re-keying merge_at that you do not
+ *     speculative-look-up;
+ *   - (the result of a non-root cds_ft_detach is created this way automatically,
+ *     since the detach strips the key prefix).
+ *
+ * The library only ever READS the speculative key field; it cannot rewrite it
+ * across a re-keying move (it owns neither the field's layout nor its capacity),
+ * so maintaining "stored key == position" across such moves is the caller's
+ * responsibility.  This attribute is how a trie within a speculative group opts
+ * out of that responsibility by foregoing the speculative read.
+ *
+ * Default: true (inherit the group).  Returns CDS_FT_STATUS_OK, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @attr is NULL.
+ */
+enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
+		bool enabled);
+
+/*
  * cds_ft_make_exclusive - Transition a Fractal Trie to exclusive
  *                         access discipline.
  * @ft: The Fractal Trie.

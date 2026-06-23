@@ -1628,7 +1628,7 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit)
 {
-	if (ft->group->speculative_key_offset_set && ft->group->speculative &&
+	if (ft->speculative_key_offset_active && ft->group->speculative &&
 			(ft->group->flags & CDS_FT_FLAG_SKIP_COMPRESSED))
 		return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, true, false);
 	return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, false, false);

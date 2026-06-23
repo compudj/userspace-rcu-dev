@@ -1086,6 +1086,22 @@ struct cds_ft {
 	bool ordered_list;
 
 	/*
+	 * Effective per-trie speculative-leaf-key state: the group has a
+	 * speculative_key_offset AND this trie was NOT created with
+	 * cds_ft_attr_set_speculative_keys(attr, false).  When false, every
+	 * lookup on this trie reconstructs the result key from the trie
+	 * structure (the EAGER path) and NEVER reads the leaf's stored key
+	 * field, so the trie may safely hold leaves whose stored key does not
+	 * match their position (a staging graft source whose leaves are stamped
+	 * with their future destination key; a detach result whose leaves carry
+	 * their pre-detach key at a now-stripped position).  Set at create
+	 * before ft_install_lookup_ops; immutable after, so a concurrent
+	 * reader's branch is race-free.  Mirrors group->speculative_key_offset_set
+	 * but per-trie so individual tries in a speculative group can opt out.
+	 */
+	bool speculative_key_offset_active;
+
+	/*
 	 * In-progress compaction state (cds_ft_compact_begin), or NULL.
 	 * Set at begin, cleared at end.  Lets cds_ft_compact_begin reject a
 	 * second concurrent compaction on the same trie, and cds_ft_destroy
@@ -1827,6 +1843,7 @@ struct cds_ft_group_attr {
 
 struct cds_ft_attr {
 	bool exclusive;		/* Exclusive (single-writer, no concurrent readers) vs concurrent; see cds_ft_attr_set_exclusive. */
+	bool speculative_keys_disabled;	/* This trie ignores the group's speculative_key_offset (EAGER lookups); see cds_ft_attr_set_speculative_keys.  calloc default false = inherit the group. */
 };
 
 enum cds_ft_type_class {

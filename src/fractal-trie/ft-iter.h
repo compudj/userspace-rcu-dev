@@ -44,7 +44,7 @@ bool ft_iter_key_referenced(const struct cds_ft_iter *iter)
 {
 	const struct cds_ft_group *group = iter->ft->group;
 
-	return group->ordered_list_set && group->speculative_key_offset_set &&
+	return group->ordered_list_set && iter->ft->speculative_key_offset_active &&
 		group->key_map.identity && iter->cache_valid && iter->node;
 }
 
@@ -234,7 +234,7 @@ const uint8_t *ft_iter_read_key(const struct cds_ft_iter *iter)
 	 * coordinated with ft_iter_resolve_key_len through the LAZY sentinel so
 	 * one walk serves both.
 	 */
-	if (group->ordered_list_set && !group->speculative_key_offset_set &&
+	if (group->ordered_list_set && !iter->ft->speculative_key_offset_active &&
 			iter->cache_valid && iter->node) {
 		if (group->key_len == CDS_FT_LEN_VARIABLE) {
 			/*
@@ -288,7 +288,7 @@ size_t ft_iter_resolve_key_len(struct cds_ft_iter *iter)
 		 * buffer.
 		 */
 		if (!iter->ft->group->key_len_offset_set ||
-				!iter->ft->group->speculative_key_offset_set) {
+				!iter->ft->speculative_key_offset_active) {
 			ft_iter_upwalk_into_buf(iter);
 			return iter->key_len;
 		}
@@ -376,7 +376,7 @@ enum cds_ft_status ft_ord_cell_iter_land(struct cds_ft *ft,
 	 *    the buffer).
 	 */
 	if (caa_likely(ft->group->key_map.identity ||
-			!ft->group->speculative_key_offset_set)) {
+			!ft->speculative_key_offset_active)) {
 		if (ft->group->key_len != CDS_FT_LEN_VARIABLE) {
 			iter->key_len = ft->group->key_len;
 			iter->path_len = ft->group->key_len + 1;
@@ -417,7 +417,7 @@ bool ft_ord_cell_fastpath_ok(const struct cds_ft *ft,
 	 * (a non-identity map is applied on result-key copy-out).
 	 */
 	bool up_walk = ft->group->ordered_list_set &&
-		!ft->group->speculative_key_offset_set;
+		!ft->speculative_key_offset_active;
 
 	return ft->group->ordered_list_set &&
 		(up_walk ||
@@ -497,7 +497,7 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 
 	if (!node)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (group->speculative_key_offset_set) {
+	if (ft->speculative_key_offset_active) {
 		/*
 		 * In-leaf key: the head stores its ordinal key bytes (and, for a
 		 * variable-length group, its length) directly.  Read them in place.
@@ -792,7 +792,7 @@ enum cds_ft_status cds_ft_cell_get_key(const struct cds_ft *ft,
 
 	if (!cell)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	if (group->speculative_key_offset_set) {
+	if (ft->speculative_key_offset_active) {
 		const struct cds_ft_node *node = rcu_dereference(cell->node);
 
 		ordinals = (const uint8_t *) node + group->speculative_key_offset;

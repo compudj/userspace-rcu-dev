@@ -215,7 +215,24 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				detached_count = 1;	/* One key (possibly with duplicates). */
 			}
 
-			status = cds_ft_create(ft->group, NULL, &detached);
+			/*
+			 * Non-root detach STRIPS the @key prefix from every
+			 * moved leaf, so the detached leaves carry a key that no
+			 * longer matches their (now-shallower) position.  Create
+			 * the detached trie with speculative keys OFF: its
+			 * lookups reconstruct the key from the structure (EAGER)
+			 * and never read the stale stored field.  The app may
+			 * re-stamp the leaves and create a speculative trie if it
+			 * needs speculative lookups on the detached data.  (Root
+			 * detach, above, preserves every key and keeps the
+			 * group's speculative mode.)
+			 */
+			struct cds_ft_attr detached_attr = {
+				.speculative_keys_disabled = true,
+			};
+
+			status = cds_ft_create(ft->group, &detached_attr,
+					&detached);
 			if (status != CDS_FT_STATUS_OK)
 				return status;
 			ft_glue_init(&glue);
