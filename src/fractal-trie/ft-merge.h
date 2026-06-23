@@ -1589,19 +1589,38 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 */
 	ft_glue_init(&glue);
 	memset(&reserve, 0, sizeof(reserve));
+	/*
+	 * Drive a GLUE diverge's live re-parents through a flip-txn, exactly like
+	 * cds_ft_graft: the build (below) tags its displaced old child dst_origin
+	 * iff @glue.txn is set, so create it BEFORE the build.  Retired below for a
+	 * NOSPLIT / POPULATED point (the legacy store / fresh-before-live path).
+	 */
+	glue.txn = ft_flip_txn_create();
+	if (!glue.txn || !urcu_flip_txn_reserve(glue.txn,
+			FT_GLUE_FLOOR_DEFERRED + 6)) {
+		if (glue.txn)
+			urcu_flip_txn_destroy(glue.txn);
+		ft_glue_fini(&glue);
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 	prep = ft_graft_build(dst_ft, okey_dst, dst_key_len, payload, cnt_src,
 			&d, &glue);
 	*handled = true;
 	if (prep == FT_GRAFT_PREP_OOM) {
 		ft_glue_abort(dst_ft, &glue);
+		urcu_flip_txn_destroy(glue.txn);
 		return CDS_FT_STATUS_MEMORY_ERROR;	/* both tries pristine */
 	}
 	if (prep == FT_GRAFT_PREP_POPULATED) {
 		/* Defensive: cnt_dst == 0 should never yield an occupied point. */
+		urcu_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
 		return CDS_FT_STATUS_POPULATED_ERROR;
 	}
 	if (prep == FT_GRAFT_PREP_NOSPLIT) {
+		/* NOSPLIT keeps its legacy store / fresh-before-live path. */
+		urcu_flip_txn_destroy(glue.txn);
+		glue.txn = NULL;
 		/*
 		 * Pre-fill the store's node reserve while both tries are still
 		 * pristine, AND the one flip batch the store parks its proxy in (a
@@ -1683,6 +1702,8 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 			ft_flip_batch_free_unpublished(pre_flip);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		ft_glue_abort(dst_ft, &glue);
+		if (glue.txn)			/* set on the GLUE path */
+			urcu_flip_txn_destroy(glue.txn);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
@@ -1722,15 +1743,15 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 
 	if (prep == FT_GRAFT_PREP_GLUE) {
 		/*
-		 * Failure-free commit of the build-invisible diverge cluster: wire
-		 * the deferred live back-pointers (the payload, the displaced old
-		 * child, the cluster top), splice the cluster in with the single
-		 * forward publish -- FUSED with the ordered-list run-splice into ONE
-		 * flip when the list is on -- then reclaim the replaced compressed
-		 * node.
+		 * Failure-free commit of the build-invisible diverge cluster: the
+		 * displaced old child is LIVE (still reachable through the compressed
+		 * node being split until the forward publish), so via @glue.txn it
+		 * flips atomically with the forward publish and the ordered-list
+		 * run-splice -- the whole attach observed old XOR new.  The payload's
+		 * hidden back-pointers are wired immediately inside the commit.  Then
+		 * reclaim the replaced compressed node.
 		 */
-		ft_glue_apply_deferred(dst_ft, &glue);
-		ft_glue_publish_run(dst_ft, &glue, run_arg);
+		ft_glue_txn_commit(dst_ft, &glue, run_arg);
 		attached_nf = glue.attached_nf;
 		ft_glue_free_old(dst_ft, &glue);
 		ft_glue_fini(&glue);
