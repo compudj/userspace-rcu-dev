@@ -43,6 +43,7 @@ nobase_include_HEADERS = \
 	urcu/map/urcu-qsbr.h \
 	urcu/pointer.h \
 	urcu/rcu-bidir-list.h \
+	urcu/rcu-bidir-list-lockfree.h \
 	urcu/rcuhlist.h \
 	urcu/rculfhash.h \
 	urcu/rculfqueue.h \
