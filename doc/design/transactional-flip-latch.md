@@ -566,3 +566,29 @@ Remaining: merge already uses `dst_origin` for its live dst children; confirm it
 matches the unified `ft_glue_txn_commit_edges` shape.  The `g->deferred` array
 and `ft_glue_apply_deferred` stay -- they ARE the immediate-store mechanism for
 the hidden bucket under the rule, not legacy to delete.
+
+### Merge audited — already conforms (2026-06-23)
+
+`cds_ft_merge_at`'s spine-copy commit was effectively the template for the rule
+and already obeys it: step 2 `ft_glue_apply_deferred` wires the src-origin
+(hidden, drained) subtrees immediately ("dst-origin edges are NOT applied here
+-- they go through the flip"); step 3 stages every dst-origin (live) child
+re-parent + the forward publish slot into one `ft_flip_batch`; step 3b adds the
+ordered-list interleave cell edges to the SAME batch; step 4 `urcu_flip_commit`
+flips them together.  It uses the lower-level flip-batch rather than the generic
+`urcu_flip_txn`, but that is a primitive choice, not a rule deviation, and its
+merged-view interleave collect (`ft_tls_resolve_merged`) reads through the
+staged proxies -- a delicate path with no reason to churn.
+
+The only places any bulk op still applies a LIVE re-parent immediately are the
+no-flip fallbacks -- the merge same-trie **rekey** diverge (no txn; line ~1732)
+and the NOSPLIT **displaced-external** store -- both fresh-before-live by
+construction.  They are correct (the new parent is fresh / the cluster is
+drained) and could be flip-converted for uniformity, but are not required by the
+rule.  Optional follow-ups, in rough order: (1) flip-convert those two
+fresh-before-live fallbacks; (2) migrate merge from `ft_flip_batch` to
+`urcu_flip_txn` so all bulk ops share one primitive.
+
+Status: graft_swap, graft, and merge all follow "hidden immediate, live via the
+flip" on their primary paths.  `g->deferred` + `ft_glue_apply_deferred` are the
+hidden-bucket immediate-store mechanism and stay.
