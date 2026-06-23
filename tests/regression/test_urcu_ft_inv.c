@@ -4457,7 +4457,7 @@ static void populate_at_prefix(struct cds_ft *ft, const uint8_t *prefix,
 
 	for (i = 0; i < count; i++) {
 		struct ft_test_node *n = node_alloc(base + i);
-		uint8_t k[4] = { 0 };
+		uint8_t k[8] = { 0 };	/* sized to memcpy into n->okey[8] below */
 		size_t kl = prefix_len;
 
 		if (prefix_len)
