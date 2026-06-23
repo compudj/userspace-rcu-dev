@@ -1683,6 +1683,35 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				goto prep_oom;
 		}
 
+		/*
+		 * Insert side: commit the replace through a flip-txn following the
+		 * bulk-op rule -- a pointer NOT reader-observable during the commit
+		 * window is set immediately with a plain store, only a LIVE publish
+		 * rides the txn.  Here the whole inserted cluster is the swap content,
+		 * unlinked + drained below, so all its back-pointers are hidden:
+		 * ft_glue_txn_commit_replace sets them immediately (ft_glue_apply_
+		 * deferred) and rides only the forward replace edge into dst + the <=4
+		 * run-replace cell edges on the txn, so structure and ordered list flip
+		 * together in ONE selector flip (closing the cross-view window).
+		 * Reserve generous headroom (forward 1-2 stores + <=4 cell edges, plus
+		 * the deferred floor) up front so records can't fail mid-commit;
+		 * created before the failure-free section so an OOM here is still a
+		 * clean prep_oom.  The extract side stays on plain rcu_assign: it
+		 * publishes into the drained swap_ft where no reader is present.
+		 *
+		 * NOT for KEY_SHORTER (the swap key ends INSIDE a compressed node):
+		 * that shape wraps a LIVE dst compressed node whose re-parent is a live
+		 * pointer not yet classified for the txn; keep it on the legacy
+		 * apply-deferred + publish-replace path (glue_insert.txn == NULL
+		 * selects it) until that wrap re-parent is folded in.
+		 */
+		if (have_insert && kase != FT_GRAFT_SWAP_KEY_SHORTER) {
+			glue_insert.txn = ft_flip_txn_create();
+			if (!glue_insert.txn || !urcu_flip_txn_reserve(glue_insert.txn,
+					FT_GLUE_FLOOR_DEFERRED + 6))
+				goto prep_oom;
+		}
+
 		/* Transient empty swap root for the unlink window (fallible). */
 		if (!swap_empty) {
 			fresh = alloc_cds_ft_node(swap_ft, &ft_types[0], &fresh_meta);
@@ -1751,8 +1780,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * content).  Empty swap publishes NULL (a remove).
 		 */
 		if (have_insert) {
-			ft_glue_apply_deferred(dst_ft, &glue_insert);
-			ft_glue_publish_replace(dst_ft, &glue_insert, swap_run_arg);
+			if (glue_insert.txn)
+				ft_glue_txn_commit_replace(dst_ft, &glue_insert,
+					swap_run_arg);
+			else {
+				ft_glue_apply_deferred(dst_ft, &glue_insert);
+				ft_glue_publish_replace(dst_ft, &glue_insert,
+					swap_run_arg);
+			}
 		} else {
 			/*
 			 * Empty-swap remove (a REMOVE of @old_child at @key): route it
@@ -1957,6 +1992,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		ft_glue_abort(dst_ft, &glue_insert);
 		ft_glue_abort(swap_ft, &glue_extract);
+		if (glue_insert.txn)
+			urcu_flip_txn_destroy(glue_insert.txn);
 		if (fresh)
 			free_cds_ft_node(swap_ft, fresh);
 		if (gs_reserved)

@@ -2106,50 +2106,69 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 }
 
 /*
- * Transactional commit of a GLUE attach (the flip-txn dual of
- * ft_glue_apply_deferred + ft_glue_publish, used when g->txn is set: the
- * converted graft GLUE path, list off).  Replaces the deferred-edge ordering
- * protocol (apply-back-pointers-then-publish-forward, fresh-before-live) with a
- * single atomic flip: every LIVE back-pointer re-parent AND the forward publish
- * are recorded into g->txn, then committed together with one selector flip.  A
- * reader -- which descends (forward) before it walks up (back) -- thus observes
- * the whole attach as old XOR new, never a half-applied mix.
+ * Transactional commit of a GLUE attach/replace (used when g->txn is set).
+ * Follows the bulk-op rule: a pointer NOT reader-observable during the commit
+ * window is set IMMEDIATELY with a plain store; only a reader-observable
+ * ("live") pointer rides the txn, so its flip is atomic with the forward
+ * publish.  A reader -- which descends (forward) before it walks up (back) --
+ * thus observes the whole publish as old XOR new, never a half-applied mix.
+ *
+ *   - Hidden back-pointers (the drained payload + fresh cluster, tagged
+ *     !dst_origin): ft_glue_apply_deferred sets them immediately, in recorded
+ *     order.  Unreachable until the forward flip, so no atomicity is needed.
+ *   - Live back-pointers (a node reachable via the OLD spine until the forward
+ *     publish, tagged dst_origin) + the forward edge + the <=4 ordered-list
+ *     cell edges: recorded into g->txn and committed with one selector flip.
  *
  * Called AFTER the source unlink + drain, where abort is already impossible, so
- * the back-edge bookkeeping (ft_set_parent_slot, recorded inside
+ * the live back-edge bookkeeping (ft_set_parent_slot inside
  * ft_glue_record_back_edge) runs here rather than during the build -- doing it
  * during the build would corrupt a live node's parent_slot_offset if a later
- * build step OOM'd and aborted.  The build itself is therefore unchanged: live
- * edges still queue in g->deferred (this just replays them through the txn
- * instead of ft_set_parent), and fresh-to-fresh edges + top->publish_parent were
- * already wired immediately during the build.
+ * build step OOM'd and aborted.  The build is unchanged: edges queue in
+ * g->deferred, and fresh-to-fresh edges + top->publish_parent are wired during
+ * the build.
  *
  * The records cannot fail: g->txn was reserved to the bounded cluster size up
  * front (urcu_flip_txn_reserve).  Reclaims the txn (deferred via the flavor, or
  * freed immediately on the exclusive fast path).
  */
 static
-void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
-		struct ft_graft_run *run)
+void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
+		const struct ft_ord_cell_edge *cedges, unsigned int n_cedges)
 {
 	struct ft_pub_rec rec = { .n = 0 };
-	unsigned int j;
+	unsigned int j, k;
 	int i;
 	bool gp_owed;
 
-	/* Back-pointers: bookkeeping + record each into the txn. */
+	/*
+	 * Hidden back-pointers -- re-parents of nodes NOT reader-observable
+	 * during the commit window (the drained payload + the fresh cluster,
+	 * tagged !dst_origin) -- are set IMMEDIATELY with plain stores, in
+	 * recorded order: no reader can reach these nodes until the forward flip
+	 * below, so the stores need no atomicity, and the in-order application
+	 * lets a skip top resolve its compressed node (ft_skip_to_compressed
+	 * reads the child back-pointer a prior edge just wired).
+	 */
+	ft_glue_apply_deferred(ft, g);
+	/*
+	 * Live back-pointers -- a node still reachable via the OLD spine until
+	 * the forward publish (tagged dst_origin) -- ride @txn so their flip is
+	 * atomic with the forward edge: a reader sees the re-parent old XOR new.
+	 */
 	for (i = 0; i < g->nr_deferred; i++) {
-		assert(!g->deferred[i].dst_origin);	/* graft is all src-origin */
+		if (!g->deferred[i].dst_origin)
+			continue;
 		ft_glue_record_back_edge(ft, g->txn, g->deferred[i].child,
 			g->deferred[i].parent, g->deferred[i].slot);
 	}
 	/*
-	 * Forward publish: _ft_publish_to_parent(&rec) does top's parent-slot
-	 * bookkeeping + the compressed-parent SKIP_X dance, capturing its 1-2
-	 * reader-visible stores into @rec instead of performing them; replay
-	 * them into the txn.  *publish_slot still holds the old child here
-	 * (nothing published yet post-drain), so each old value is the pre-graft
-	 * one.
+	 * Forward publish: @g->top's parent back-pointer is already wired (a
+	 * hidden top immediately above; a live top via the txn), so
+	 * _ft_publish_to_parent runs its normal bookkeeping and captures its 1-2
+	 * reader-visible stores (forward slot + the compressed-parent SKIP_X
+	 * dance) into @rec; replay them into the txn.  *publish_slot still holds
+	 * the old child here (nothing published yet post-drain).
 	 */
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		&rec);
@@ -2157,29 +2176,23 @@ void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
 		ft_flip_txn_record_reserved(g->txn, (void **) rec.slot[j],
 			rec.old_val[j], rec.new_val[j]);
 	/*
-	 * Ordered list on: also record the <=4 run-splice boundary cell edges
-	 * (a neighbour's ord_next / ord_prev, plus a dst head/tail repair) into
-	 * the SAME txn, so the structure becomes reachable AND the ordered list
-	 * gains the run in one selector flip -- the cross-view atomicity the
-	 * standalone ft_ord_cell_flip_rec_run gives, now also fused with the
-	 * live back-pointer re-parents above.  Cell slots carry the same type-7
-	 * proxy tag as structural slots, so the txn's install parks a proxy a
-	 * cell reader resolves through ft_ord_cell_resolve_ord.
-	 * ft_ord_cell_run_splice_edges pre-sets the run's own outer links (plain
-	 * stores; the run is not ord-reachable in dst until the flip).  @run
-	 * armed so the caller skips the standalone two-commit splice.
+	 * Ordered list on: also record the <=4 boundary cell edges the caller
+	 * pre-computed (a run-SPLICE for a graft, a run-REPLACE for a graft_swap;
+	 * a neighbour's ord_next / ord_prev plus a dst head/tail repair) into the
+	 * SAME txn, so the structure becomes reachable AND the ordered list gains
+	 * (and, for replace, loses) the run in one selector flip -- the cross-view
+	 * atomicity the standalone ft_ord_cell_flip_rec_{run,replace} gives, now
+	 * fused with the forward publish (and any live re-parents) above.  Cell
+	 * slots carry the
+	 * same type-7 proxy tag as structural slots, so the txn's install parks a
+	 * proxy a cell reader resolves through ft_ord_cell_resolve_ord.  The
+	 * _edges helper already pre-set the run's own outer links (plain stores;
+	 * the run is not ord-reachable in dst until the flip) and the wrapper
+	 * armed the run descriptor so the caller skips the standalone splice.
 	 */
-	if (run) {
-		struct ft_ord_cell_edge cedges[4];
-		unsigned int cn = ft_ord_cell_run_splice_edges(ft, run->run_first,
-			run->run_last, run->pred, run->succ, cedges, 0), k;
-
-		for (k = 0; k < cn; k++)
-			ft_flip_txn_record_reserved(g->txn,
-				(void **) cedges[k].slot,
-				cedges[k].old_target, cedges[k].new_target);
-		run->armed = true;
-	}
+	for (k = 0; k < n_cedges; k++)
+		ft_flip_txn_record_reserved(g->txn, (void **) cedges[k].slot,
+			cedges[k].old_target, cedges[k].new_target);
 
 	/*
 	 * Commit WITHOUT an explicit install: urcu_flip_txn_commit auto-installs
@@ -2193,6 +2206,47 @@ void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
 	gp_owed = urcu_flip_txn_commit(g->txn);
 	ft_flip_txn_reclaim(ft, g->txn, gp_owed);
 	g->txn = NULL;
+}
+
+/*
+ * Splice wrapper (cds_ft_graft): fuse a run-splice into the attach flip-txn.
+ * Computes the <=4 run-splice boundary edges (which also pre-set @run's outer
+ * links), arms @run, and commits via the edge core.  @run NULL => list off.
+ */
+static
+void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
+		struct ft_graft_run *run)
+{
+	struct ft_ord_cell_edge cedges[4];
+	unsigned int n = 0;
+
+	if (run) {
+		n = ft_ord_cell_run_splice_edges(ft, run->run_first,
+			run->run_last, run->pred, run->succ, cedges, 0);
+		run->armed = true;
+	}
+	ft_glue_txn_commit_edges(ft, g, cedges, n);
+}
+
+/*
+ * Replace wrapper (cds_ft_graft_swap insert side): fuse a run-replace into the
+ * replace flip-txn.  run_D leaves dst's ordered list and run_S takes its place;
+ * the <=4 boundary edges (pre-setting run_S's outer links) join the structural
+ * replace publish.  Arms @run.  @run NULL => list off.
+ */
+static
+void ft_glue_txn_commit_replace(struct cds_ft *ft, struct ft_glue *g,
+		struct ft_graft_swap_run *run)
+{
+	struct ft_ord_cell_edge cedges[4];
+	unsigned int n = 0;
+
+	if (run) {
+		n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
+			run->s_first, run->s_last, cedges, 0);
+		run->armed = true;
+	}
+	ft_glue_txn_commit_edges(ft, g, cedges, n);
 }
 
 /*
