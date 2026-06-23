@@ -592,3 +592,26 @@ fresh-before-live fallbacks; (2) migrate merge from `ft_flip_batch` to
 Status: graft_swap, graft, and merge all follow "hidden immediate, live via the
 flip" on their primary paths.  `g->deferred` + `ft_glue_apply_deferred` are the
 hidden-bucket immediate-store mechanism and stay.
+
+### Fresh-before-live fallbacks flip-converted (2026-06-23)
+
+The two remaining spots that applied a LIVE re-parent immediately now ride the
+flip, so every reader-observable pointer in a bulk op flips atomically:
+
+- **NOSPLIT displaced-external** (`ft_store_at_graft_point_commit`): the
+  displaced leaf's back-channel (`displaced->prev` / `cell->parent = branch`) is
+  recorded as a `dst_origin` edge on the txn path, flipping with the forward
+  publish + run-splice instead of a fresh-before-live direct store.  A flip
+  proxy parked on an external's parent is resolved by the up-walk readers.  New
+  oracle `inv_graft_displaced_external` (confirmed to drive the path 75× in 2 s).
+- **Merge same-trie rekey diverge** (`ft_merge_graft_subpos_inplace`): mirrors
+  `cds_ft_graft` -- a glue flip-txn is created before the build (tagging the
+  displaced old child `dst_origin`) and the GLUE path commits via
+  `ft_glue_txn_commit`; NOSPLIT keeps its existing path.  Exercised 278k+ times
+  under concurrent readers by the existing merge inv suite.
+
+The legacy (no-txn) paths -- merge rekey NOSPLIT, and any future no-txn caller --
+keep fresh-before-live, which stays correct.  The only remaining unification is
+optional: migrate the merge spine-copy commit from the bespoke `ft_flip_batch`
+to the generic `urcu_flip_txn` so all bulk ops share one primitive (no
+behavioural change; the spine-copy path already obeys the rule).
