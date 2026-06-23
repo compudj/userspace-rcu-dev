@@ -536,3 +536,33 @@ on `_ft_publish_to_parent` (added by the folded-back-pointer sketch) is removed.
 Next: realign **graft** (re-tag the diverge-split's displaced `cn->child` as
 `dst_origin` — it is reachable via the old `cn` spine, hence live — so it rides
 the txn in every graft path, list-on included) and **merge** to the same rule.
+
+### Graft realigned (2026-06-23)
+
+The diverge-split graft now follows the same rule.  Its one live re-parent --
+the displaced `cn->child` (reachable through `cn` until the forward publish
+replaces it) -- is tagged `dst_origin` so it rides the flip-txn instead of
+`ft_glue_apply_deferred` setting it immediately ahead of the forward edge
+(`ft_split_compressed_graft_build`, all three suffix_len cases; gated on
+`glue->txn` so the merge-rekey no-txn path keeps fresh-before-live).
+
+This settled the external-parent question: a flip proxy parked on an **external
+node's parent** IS resolved by the up-walk readers (`ft_get_parent_rcu`,
+`ft_skip_to_compressed`, `ft_skip_reanchor`, each via the trailing
+`ft_resolve_flip_proxy`).  So an external `cn->child` -- the leaf of a
+fully-compressed path -- flips atomically like any other child; external
+parents are NOT an exception to "live → txn".  A stale comment on the NOSPLIT
+displaced-external store claimed those readers do not resolve such a proxy; it
+was corrected.  (That displaced-external back-channel still uses a direct
+fresh-before-live store, which is simplest there; it could equally ride the
+flip-latch.)
+
+Validated: 4 configs unit 252 / inv 50, 40× stress + VAM period-1 + ASAN on
+`inv_graft_no_list_diverge` (a single fully-compressed key split by a graft, so
+its external leaf is the displaced child, under concurrent point-lookup readers
+that descend through the skip path and resolve the parked proxy).
+
+Remaining: merge already uses `dst_origin` for its live dst children; confirm it
+matches the unified `ft_glue_txn_commit_edges` shape.  The `g->deferred` array
+and `ft_glue_apply_deferred` stay -- they ARE the immediate-store mechanism for
+the hidden bucket under the rule, not legacy to delete.
