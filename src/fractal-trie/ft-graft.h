@@ -539,42 +539,41 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		struct ft_graft_store_state *st)
 {
 	if (st->displaced_shape) {
-		/*
-		 * The displaced external's own back-channel (displaced->prev /
-		 * cell->parent = branch) is published DIRECTLY, before any flip: the
-		 * displaced dst leaf stays reachable through the still-old slot during
-		 * the commit window, and @branch (its new parent) is fresh, its own
-		 * parent wired build-invisibly -- so a direct store is already
-		 * consistent for an up-walk reader.  Classic fresh-before-live; it
-		 * precedes both the txn and the legacy forward publish.  (It could
-		 * equally ride the flip-latch as a dst_origin edge -- the up-walk
-		 * readers DO resolve a flip proxy on an external's parent, via
-		 * ft_get_parent_rcu / ft_skip_to_compressed / ft_skip_reanchor -- but
-		 * the direct store is kept here for simplicity.)
-		 */
-		ft_publish_external_nodes_prev(ft, st->attached, st->displaced);
 		if (st->glue->txn) {
 			/*
-			 * Fuse the payload's live back-pointers, the forward publish,
-			 * and the ordered-list run-splice into ONE flip-txn (the GLUE
-			 * commit machinery): ft_glue_txn_commit records glue->deferred
-			 * + the forward edge + the <=4 cell edges, then commits with a
-			 * single selector flip -- no deferred-edge ordering window.
+			 * The displaced external is LIVE -- the dst leaf stays reachable
+			 * through the still-old slot until the forward publish replaces
+			 * it -- so its re-parent onto the fresh @branch (its back-channel
+			 * displaced->prev / cell->parent = branch) is a reader-observable
+			 * pointer.  Record it as a dst_origin edge so ft_glue_txn_commit
+			 * flips it atomically with the forward publish + the run-splice
+			 * cell edges, rather than a fresh-before-live store ahead of them.
+			 * (A flip proxy parked on an external's parent is resolved by the
+			 * up-walk readers -- ft_get_parent_rcu / ft_skip_to_compressed /
+			 * ft_skip_reanchor.)  The payload's hidden back-pointers are wired
+			 * immediately by ft_glue_apply_deferred inside the commit.
 			 */
+			ft_glue_defer_edge_origin(ft, st->glue,
+				(struct cds_ft_inode_flag *) st->displaced,
+				st->attached, NULL, /*dst_origin=*/ true);
 			st->glue->publish_parent = st->pnf;
 			st->glue->publish_slot = st->nfp;
 			st->glue->top = st->attached;
 			ft_glue_txn_commit(ft, st->glue, run);
 		} else {
 			/*
-			 * Legacy two-step: glue deferred FIRST (the payload's live
-			 * back-pointers wired before any dst-reachable live edge flips
-			 * into the fresh cluster), then the forward publish -- FUSED
-			 * with the ordered-list run-splice (record into @rec, then
-			 * ft_ord_cell_flip_rec_run) when the list is on.  @run->pred/
-			 * succ, located before the attach, bracket the displaced
-			 * external's relocated cell so the run splices in beside it.
+			 * Legacy: the displaced external's back-channel (displaced->prev /
+			 * cell->parent = branch) is published DIRECTLY, before any flip --
+			 * @branch (its new parent) is fresh, its own parent wired
+			 * build-invisibly, so a direct store is already consistent for an
+			 * up-walk reader.  Classic fresh-before-live.  Then glue deferred
+			 * (the payload's live back-pointers), then the forward publish --
+			 * FUSED with the ordered-list run-splice (record into @rec, then
+			 * ft_ord_cell_flip_rec_run) when the list is on.  @run->pred/succ,
+			 * located before the attach, bracket the displaced external's
+			 * relocated cell so the run splices in beside it.
 			 */
+			ft_publish_external_nodes_prev(ft, st->attached, st->displaced);
 			ft_glue_apply_deferred(ft, st->glue);
 			if (run) {
 				struct ft_pub_rec rec = { .n = 0 };
