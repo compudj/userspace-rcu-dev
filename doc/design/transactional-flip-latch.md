@@ -456,3 +456,43 @@ construction).
   the conversion pattern + measuring the per-op settle/reclaim cost** — the
   ~118-line LOC deletion is a *cross-consumer* payoff realized across the
   graft → graft_swap → merge migration, not from graft in isolation.
+
+### First conversion landed — graft GLUE diverge, list off (2026-06-22)
+
+The diverge-split graft (`FT_GRAFT_PREP_GLUE`) now commits through `urcu_flip_txn`
+when the ordered list is off (gated `!ordered_list_set && !pre_flip`; list-on keeps
+the run-splice fusion, the merge rekey keeps the proven path). `ft_glue` gained a
+`txn` field; `ft_glue_txn_commit` (the dual of `ft_glue_apply_deferred` +
+`ft_glue_publish`) records every live back-pointer re-parent **and** the forward
+publish into one group and flips them atomically — the deferred-edge ordering
+window is gone for this shape.
+
+Two design points settled differently than §12's first sketch:
+
+- **Bookkeeping runs at commit, not during the build.** The §12 plan recorded
+  edges + ran `ft_set_parent_slot` *early* (build time). That is unsafe on the
+  **abort** path: early bookkeeping mutates a LIVE node's `parent_slot_offset`
+  (writer-read by `ft_get_parent_slot`), and a later build-step OOM would leave it
+  corrupt with `meta->parent` still old. So the build is left **unchanged** (live
+  edges still queue in `g->deferred`); `ft_glue_txn_commit` replays them through
+  the txn **after the drain**, where abort is already impossible. `g->deferred`
+  survives as a parameter carrier for this first cut (its *ordering role* is what
+  the txn retires); it disappears only when the build records straight into the
+  txn — deferred to the later phases.
+- **Bounded reserve, not fallible-record.** The cluster is floor-bounded, so the
+  txn is reserved to that bound up front (`urcu_flip_txn_reserve`, added to the
+  primitive) and records can't fail mid-replay — matching the existing glue floor
+  arrays. The abort-replaces-reserve model (§7) stays the plan for the unbounded
+  **merge** spine.
+
+Forward edge captured via the existing `_ft_publish_to_parent(&rec)` recorder
+(forward slot + compressed-parent SKIP_X dual), replayed into the txn — byte-for-byte
+the stores the legacy publish performs, now atomic with the back edges.
+
+Validated: unit `test_graft_diverge_no_list` + concurrent inv
+`inv_graft_no_list_diverge` (graft-split / detach-heal oscillation, EAGER readers —
+SPECULATIVE oscillation hits a *pre-existing* churn livelock, reproducible on the
+legacy path). 4 feature configs (default / no-skip / no-compress / both) unit
+252 / inv 48, VAM-targeted (period 1) on both new tests, ASAN clean (no leaks),
+20× stress. Next: list-on run-splice edges into the txn, then NOSPLIT, then
+graft_swap, then merge, then delete the dead deferred-edge machinery.
