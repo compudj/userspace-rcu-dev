@@ -496,3 +496,43 @@ legacy path). 4 feature configs (default / no-skip / no-compress / both) unit
 252 / inv 48, VAM-targeted (period 1) on both new tests, ASAN clean (no leaks),
 20× stress. Next: list-on run-splice edges into the txn, then NOSPLIT, then
 graft_swap, then merge, then delete the dead deferred-edge machinery.
+
+### Governing rule refined — hidden immediate, live via txn (2026-06-23)
+
+Converting `graft_swap` surfaced the rule that actually governs every bulk op,
+and it is simpler than "fold every back-pointer into the txn":
+
+> A pointer that is **not reader-observable** during the commit window is set
+> **immediately** with a plain store.  Only a **live** (reader-observable)
+> pointer rides the txn, so its flip is atomic with the forward publish.
+
+The discriminator already exists as `dst_origin`: `ft_glue_apply_deferred` sets
+the `!dst_origin` (hidden) edges immediately; the `dst_origin` (live, reachable
+via the OLD spine until the forward publish) edges are switched atomically by
+the flip.  So `ft_glue_txn_commit_edges` is: apply the hidden back-pointers
+immediately (in recorded order), then record only the live back-pointers + the
+forward edge + the `<=4` ordered-list cell edges into the txn and commit.
+
+Why this matters (the bug it fixes): the earlier "fold every back-pointer into
+the txn" sketch *deferred* the hidden back-pointers past the commit's own skip
+resolution.  `ft_skip_to_compressed(skip(cn))` recovers `cn` by reading the
+skip child's parent, and for a `graft_swap` replace that child is re-parented by
+a *sibling* edge in the same commit.  With the back-pointers deferred, the
+recorder read the child's **stale** parent and re-parented the wrong compressed
+node, leaving the published `cn` with a NULL parent — a dangling skip slot.
+Setting the hidden back-pointers immediately (in recorded order, the set-publish
+edge last) makes the skip resolve correctly, exactly as the legacy
+`apply_deferred` did.
+
+`graft_swap` replace (EXACT + diverge; KEY_SHORTER stays legacy) now commits
+this way: the whole inserted cluster is the drained swap content, so *all* its
+back-pointers are hidden — only the forward replace edge + the run-replace cell
+edges flip.  Validated: 4 feature configs unit 252 / inv 50, VAM period-1 on the
+five graft_swap unit shapes + the four `inv_graft_swap_*` oracles, 120× stress,
+ASAN clean (library; a pre-existing `populate_at_prefix` stack over-read in the
+test harness was fixed alongside).  The now-unnecessary `atomic_parent` plumbing
+on `_ft_publish_to_parent` (added by the folded-back-pointer sketch) is removed.
+
+Next: realign **graft** (re-tag the diverge-split's displaced `cn->child` as
+`dst_origin` — it is reachable via the old `cn` spine, hence live — so it rides
+the txn in every graft path, list-on included) and **merge** to the same rule.
