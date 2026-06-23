@@ -216,6 +216,7 @@ struct urcu_flip_txn {
 	struct urcu_flip_chunk *tail;	/* ... appended fixed chunks */
 	unsigned int nr;
 	bool placed;			/* a urcu_flip_txn_reserve_slot proxy is live */
+	bool head_inline;		/* head chunk embedded in this allocation */
 };
 
 #define URCU_FLIP_CHUNK0_CAP	8	/* initial head-chunk capacity */
@@ -251,6 +252,43 @@ struct urcu_flip_txn *urcu_flip_txn_create(void *(*tag)(struct urcu_flip_proxy *
 	t->tail = NULL;
 	t->nr = 0;
 	t->placed = false;
+	t->head_inline = false;
+	return t;
+}
+
+/*
+ * Single-allocation bounded txn: the header plus an inline head chunk sized for
+ * @cap latches, in ONE malloc -- so a transaction whose edge count is bounded
+ * by construction costs one allocation (and one free), like a flat bespoke flip
+ * batch, instead of create + reserve's two.  @cap must cover every record:
+ * record() never grows the inline chunk (the freeze-before-install model -- no
+ * append after install -- needs the edge set bounded up front anyway), so the
+ * embedder sizes @cap to its edge bound.  Returns NULL on OOM (the embedder
+ * falls back to a degraded direct/sequential publish).
+ */
+static inline
+struct urcu_flip_txn *urcu_flip_txn_create_bounded(
+		void *(*tag)(struct urcu_flip_proxy *), unsigned int cap)
+{
+	struct urcu_flip_txn *t;
+	struct urcu_flip_chunk *c;
+
+	t = (struct urcu_flip_txn *) malloc(sizeof(*t) +
+			sizeof(struct urcu_flip_chunk) +
+			(size_t) cap * sizeof(struct urcu_flip_latch));
+	if (!t)
+		return NULL;
+	urcu_flip_group_init(&t->group);
+	t->tag = tag;
+	t->state = URCU_FLIP_TXN_PREPARE;
+	c = (struct urcu_flip_chunk *) (t + 1);
+	c->next = NULL;
+	c->nr = 0;
+	c->cap = cap;
+	t->head = t->tail = c;
+	t->nr = 0;
+	t->placed = false;
+	t->head_inline = true;
 	return t;
 }
 
@@ -282,16 +320,21 @@ bool urcu_flip_txn_reserve(struct urcu_flip_txn *t, unsigned int cap)
 	return true;
 }
 
-/* Free every chunk and the txn header (no grace period). */
+/* Free every chunk and the txn header (no grace period).  A bounded txn's head
+ * chunk is embedded in the header allocation, so it is freed with the header,
+ * not separately. */
 static inline
 void urcu_flip_txn_destroy(struct urcu_flip_txn *t)
 {
+	struct urcu_flip_chunk *inl = t->head_inline ?
+		(struct urcu_flip_chunk *) (t + 1) : NULL;
 	struct urcu_flip_chunk *c = t->head;
 
 	while (c) {
 		struct urcu_flip_chunk *next = c->next;
 
-		free(c);
+		if (c != inl)
+			free(c);
 		c = next;
 	}
 	free(t);
@@ -343,6 +386,13 @@ bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
 			unsigned int newcap = c->cap * 2;
 			struct urcu_flip_chunk *nc;
 
+			/*
+			 * A bounded txn's head chunk is embedded in the header
+			 * allocation and sized to the embedder's edge bound, so it
+			 * must never grow -- realloc-ing it would move freed-with-
+			 * the-header memory.  Overflow here is an embedder sizing bug.
+			 */
+			urcu_posix_assert(!t->head_inline);
 			/* No address is live yet -> realloc may move the chunk. */
 			nc = (struct urcu_flip_chunk *) realloc(c, sizeof(*c) +
 				(size_t) newcap * sizeof(struct urcu_flip_latch));
