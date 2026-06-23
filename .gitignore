@@ -14,6 +14,7 @@ tests/unit/test_build_dynlink
 tests/unit/test_build_dynlink_cxx
 tests/unit/test_uatomic
 tests/unit/test_uatomic_cxx
+tests/unit/test_flip_latch
 tests/unit/test_urcu_multiflavor
 tests/unit/test_urcu_multiflavor_cxx
 tests/unit/test_urcu_multiflavor_dynlink

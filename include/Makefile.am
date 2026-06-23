@@ -29,6 +29,7 @@ nobase_include_HEADERS = \
 	urcu/debug.h \
 	urcu/defer.h \
 	urcu/flavor.h \
+	urcu/flip-latch.h \
 	urcu/futex.h \
 	urcu/hlist.h \
 	urcu/lfstack.h \

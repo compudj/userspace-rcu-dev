@@ -23,6 +23,7 @@ noinst_PROGRAMS = \
 	test_get_possible_cpus_array_len_cxx \
 	test_uatomic \
 	test_uatomic_cxx \
+	test_flip_latch \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
 	test_urcu_multiflavor_dynlink \
@@ -55,6 +56,7 @@ TESTS = \
 	test_get_possible_cpus_array_len_cxx \
 	test_uatomic \
 	test_uatomic_cxx \
+	test_flip_latch \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
 	test_urcu_multiflavor_dynlink \
@@ -106,6 +108,9 @@ test_uatomic_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_uatomic_cxx_SOURCES = test_uatomic_cxx.cpp
 test_uatomic_cxx_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_flip_latch_SOURCES = test_flip_latch.c
+test_flip_latch_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_urcu_multiflavor_SOURCES = test_urcu_multiflavor.c \
 	test_urcu_multiflavor-memb.c \
