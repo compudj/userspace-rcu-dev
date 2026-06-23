@@ -200,6 +200,56 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
  * Returns 0 on success, -1 on first violation.  No-op when @head is
  * NULL.
  */
+/*
+ * Speculative leaf-key correctness: when this trie reads leaf keys for result
+ * capture (ft->speculative_key_offset_active), every external leaf's STORED key
+ * must equal its STRUCTURAL position -- the ordinal path @path[0..@depth) to the
+ * leaf.  The library only ever reads that app-owned field; it cannot rewrite it
+ * across a re-keying move (graft / graft_swap / merge_at with src!=dst), so a
+ * mis-stamped or un-restamped leaf would make a speculative lookup return the
+ * wrong key.  Catching it here, in the verifier (and thus under
+ * FEATURE_FT_VERIFY_AT_MUTATION after every mutation), turns that silent
+ * corruption into a loud, located failure -- the verify-time check for the
+ * staging-graft workflow where the app stamps each leaf with its destination
+ * key.  EAGER tries (cds_ft_attr_set_speculative_keys false) never read the leaf
+ * key, so they are exempt.
+ */
+static
+int ft_verify_speculative_key(const struct cds_ft *ft, FILE *out,
+		const struct cds_ft_node *node, const uint8_t *path,
+		unsigned int depth)
+{
+	const struct cds_ft_group *group = ft->group;
+	const uint8_t *stored;
+	size_t klen;
+	uint8_t ord[FT_MAX_KEY_LEN];
+
+	if (!ft->speculative_key_offset_active || !path)
+		return 0;
+	stored = (const uint8_t *) node + group->speculative_key_offset;
+	if (group->key_len != CDS_FT_LEN_VARIABLE)
+		klen = group->key_len;
+	else if (group->key_len_offset_set)
+		klen = *(const size_t *) ((const char *) node +
+				group->key_len_offset);
+	else
+		klen = depth;	/* no length field: validate bytes only */
+	if (klen != depth) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: leaf %p speculative key length %zu != structural depth %u (stale leaf key after a re-keying move? re-stamp it, or create the trie with cds_ft_attr_set_speculative_keys(false))\n",
+				depth, (const void *) node, klen, depth);
+		return -1;
+	}
+	ft_key_to_ordinals(ord, stored, depth, &group->key_map);
+	if (depth && memcmp(ord, path, depth) != 0) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: leaf %p speculative key does not match its position (stale leaf key after a re-keying move? re-stamp it, or create the trie with cds_ft_attr_set_speculative_keys(false))\n",
+				depth, (const void *) node);
+		return -1;
+	}
+	return 0;
+}
+
 static
 int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 		struct ft_visited_set *visited,
@@ -278,8 +328,10 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 			return -1;
 		}
 		(void) check_path;
-		(void) path;
 		(void) group;
+		/* Every leaf in the chain shares this position; validate each. */
+		if (ft_verify_speculative_key(ft, out, node, path, depth))
+			return -1;
 		prev = node;
 		node = ft_node_next(node);
 	}
@@ -1011,7 +1063,16 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 	struct cds_ft_inode_flag *root = ft->root;
 	unsigned long root_nr_keys = 0;
 	struct ft_visited_set visited;
-	uint8_t *path = NULL;
+	uint8_t path_buf[FT_MAX_KEY_LEN];
+	/*
+	 * Track the structural key down to each leaf ONLY when this trie reads
+	 * leaf-stored keys (ft->speculative_key_offset_active): the external-chain
+	 * walk then compares each leaf's stored speculative key against its
+	 * position (ft_verify_speculative_key).  For an EAGER trie the leaf key is
+	 * not consulted, so path tracking is left off and every path write/compare
+	 * short-circuits, exactly as before this check existed.
+	 */
+	uint8_t *path = ft->speculative_key_offset_active ? path_buf : NULL;
 	int ret;
 
 	if (ft_verify_no_proxy_at_rest(out, "root", root, NULL, 0))
@@ -1041,11 +1102,9 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
 	}
 	/*
-	 * End-to-end path/key consistency (invariant 10) requires an
-	 * addressable copy of the inserted key at a group-known offset
-	 * on each leaf, which the library no longer tracks (the user
-	 * provides @key_offset per-call via cds_ft_speculative_lookup_key).
-	 * Pass path = NULL so all path-tracking writes / compares
+	 * @path is non-NULL only for a speculative-key-active trie (above), in
+	 * which case the leaf walk validates each stored key against its
+	 * position; otherwise it is NULL and all path-tracking writes / compares
 	 * short-circuit.
 	 */
 	ret = ft_verify_node_recursive(ft, out, &visited, path, root, NULL, 0,
