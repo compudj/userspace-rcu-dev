@@ -2216,8 +2216,22 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						(struct cds_ft_inode_flag *) node);
 					ft_ord_cell_free(ft, old_cell);
 				} else {
-					rcu_assign_pointer(metadata->external_nodes,
-						node);
+					/*
+					 * List off: external_nodes is the single
+					 * reader-visible slot (readers resolve via
+					 * ft_dereference_external).  Commit the swap as a
+					 * 1-edge flip -- a lone release store, infallible
+					 * and MCAS-expressible -- instead of a bare store.
+					 */
+					struct ft_ord_cell_edge edge = {
+						.slot = (struct ft_ord_cell **)
+							&metadata->external_nodes,
+						.old_target = (struct ft_ord_cell *)
+							external_nodes,
+						.new_target = (struct ft_ord_cell *) node,
+					};
+
+					ft_ord_cell_flip(ft, &edge, 1);
 				}
 			} else {
 				/* No external nodes yet. New key at this node. */
@@ -2251,19 +2265,18 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
 			ft_external_head_set_parent(ft, node, d.pnf);
 			node->next = NULL;
-			if (ft->ordered_list) {
+			{
 				/*
 				 * Atomic replace: publish the new head into its single
-				 * reader-visible slot AND swap its cell in one flip.  The
-				 * reader-visible slot is d.nfp (plain external child, or a
-				 * plainly-reached compressed parent's cn->child) or, for a
-				 * leaf reached through a SKIP_X suffix, the grandparent skip
-				 * slot (re-encoded for @node, with cn->child set here -- the
-				 * reanchor up-walk never reads it, node->parent is already
-				 * cn = d.pnf).  Mirrors ft_publish_to_parent's stores.
+				 * reader-visible slot.  That slot is d.nfp (plain external
+				 * child, or a plainly-reached compressed parent's
+				 * cn->child) or, for a leaf reached through a SKIP_X
+				 * suffix, the grandparent skip slot (re-encoded for @node,
+				 * with cn->child set here -- the reanchor up-walk never
+				 * reads it, node->parent is already cn = d.pnf).  Mirrors
+				 * ft_publish_to_parent's stores.  This rslot model is shared
+				 * by both ordered-list states.
 				 */
-				struct ft_ord_cell *old_cell =
-					ft_ord_cell_ptr((*old_node_ret)->prev);
 				struct cds_ft_inode_flag **rslot = d.nfp;
 				struct cds_ft_inode_flag *rold = d.nf;
 				struct cds_ft_inode_flag *rnew =
@@ -2291,12 +2304,29 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					}
 				}
 #endif
-				ft_ord_cell_swap_publish(ft, old_cell, precell,
-					rslot, rold, rnew);
-				ft_ord_cell_free(ft, old_cell);
-			} else {
-				ft_publish_to_parent(ft, d.pnf, d.nfp,
-					(struct cds_ft_inode_flag *) node);
+				if (ft->ordered_list) {
+					/* Swap the structural slot AND the head's cell
+					 * in one flip. */
+					struct ft_ord_cell *old_cell =
+						ft_ord_cell_ptr((*old_node_ret)->prev);
+
+					ft_ord_cell_swap_publish(ft, old_cell, precell,
+						rslot, rold, rnew);
+					ft_ord_cell_free(ft, old_cell);
+				} else {
+					/*
+					 * List off: no cell.  Commit the single
+					 * structural edge as a 1-edge flip -- a lone
+					 * release store, infallible and MCAS-expressible.
+					 */
+					struct ft_ord_cell_edge edge = {
+						.slot = (struct ft_ord_cell **) rslot,
+						.old_target = (struct ft_ord_cell *) rold,
+						.new_target = (struct ft_ord_cell *) rnew,
+					};
+
+					ft_ord_cell_flip(ft, &edge, 1);
+				}
 			}
 			ret = 0;
 		}
