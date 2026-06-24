@@ -807,20 +807,6 @@ struct cds_ft_inode_flag *ft_flip_proxy_flag(struct urcu_flip_proxy *proxy)
 }
 
 /*
- * Writer-only escape hatch for the spine-copy merge's pre-commit ordered-list
- * interleave (ft_merge_spine_copy).  When set, a flip proxy resolves to its
- * MERGED (new) target -- proxy->ptr[1] -- instead of via the shared selector.
- * The merge stages its structural proxies, walks the about-to-be-published
- * merged structure with this flag set to place the surviving source cells, then
- * commits structure + cells in ONE flip.  Concurrent readers never set it, so
- * they keep resolving via the selector to the old view; it is consulted only
- * inside the already-unlikely proxy branch, so the reader hot path pays at most
- * one extra predicted-not-taken test, and only while a merge is in flight.
- * Per-thread, set/cleared by the writer around the interleave walk alone.
- */
-static __thread bool ft_tls_resolve_merged;
-
-/*
  * Resolve a possibly-proxied flag to its current target.  Sits right
  * after a parent / root pointer load on the read side; the common case
  * (no merge in flight) is a single predicted-not-taken mask-compare, and
@@ -832,8 +818,6 @@ struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
 	if (caa_unlikely(ft_node_flip_proxy(node))) {
 		struct urcu_flip_proxy *p = ft_flip_proxy_ptr(node);
 
-		if (caa_unlikely(ft_tls_resolve_merged))
-			return (struct cds_ft_inode_flag *) p->ptr[1];
 		return (struct cds_ft_inode_flag *) urcu_flip_proxy_get(p);
 	}
 	return node;
@@ -1395,10 +1379,9 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(const struct cds_ft *ft,
 	 * staged through the latch.  Resolve it before masking to the compressed
 	 * node (otherwise the proxy's tag bits fold into a bogus pointer),
 	 * mirroring ft_get_parent_rcu and the descent's resolve-then-skip order.
-	 * The spine-copy merge's pre-commit interleave walk relies on this to
-	 * decode skip slots over its still-proxied merged structure
-	 * (ft_tls_resolve_merged selects the merged target); readers (flag clear)
-	 * resolve via the selector, a no-op when no merge is in flight.
+	 * A concurrent reader up-walking through the merge's flip window resolves
+	 * via the shared selector to the consistent old-or-merged view; a no-op
+	 * when no merge is in flight.
 	 */
 	return ft_compressed_node_ptr(ft_resolve_flip_proxy(parent));
 }

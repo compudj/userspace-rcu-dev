@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 284
+#define NR_TESTS 285
 #else
 #define NR_TESTS 252
 #endif
@@ -20764,6 +20764,144 @@ static int test_merge_oom_nonroot_src(void)
 }
 
 /*
+ * OOM atomicity for the ORDERED-list spine-copy interleave
+ * (ft_merge_ord_interleave_collect): with the ordered list ON, the spine-copy
+ * allocates an edge scratch AND PRE-CAPTURES the surviving src run's key
+ * suffixes (ms_src_caps / ms_src_pool) BEFORE the one post-build fallible step,
+ * ft_merge_unlink_src_subtree.  This uses the KEY_SHORTER src shape (as
+ * run_merge_oom_key_shorter_src) because there that unlink RECOMPACTS -- it
+ * allocates, so an injected fault can fail it AFTER the pre-capture, exercising
+ * the abort path that frees ms_src_caps + ms_src_pool + ms_edges (the EXACT-src
+ * unlink merely re-points, never reaching this).  dst holds {"Qa"}; src holds
+ * the compressed {"XYZ"}; merging src subtree at "XY" (ends inside "XYZ") into
+ * dst at "Q" re-homes the "Z" tail as "QZ" -- one surviving src cell spliced
+ * after "Qa".  Every injected fault must leave both tries pristine (dst keeps
+ * the ordered {"Qa"}, src keeps {"XYZ"}) with NO leak; only a fault-free run
+ * commits the ordered {"Qa","QZ"} and empties src.  cds_ft_verify validates the
+ * cell list against the trie on every iteration.
+ */
+static int merge_oom_ordered_src_iter_sorted(struct cds_ft *ft)
+{
+	struct cds_ft_iter *it;
+	char prev[8];
+	size_t prevl = 0;
+	int have_prev = 0, ok = 1;
+	enum cds_ft_status si;
+
+	if (cds_ft_iter_create(ft, &it) < 0)
+		return 0;
+	rcu_read_lock();
+	si = cds_ft_lookup_first(ft, it);
+	while (si == CDS_FT_STATUS_OK) {
+		char cur[8];
+		size_t curl = 0;
+
+		if (cds_ft_iter_get_key(it, (uint8_t *) cur, sizeof(cur), &curl)
+				!= CDS_FT_STATUS_OK) {
+			ok = 0;
+			break;
+		}
+		if (have_prev) {
+			size_t m = prevl < curl ? prevl : curl;
+			int c = memcmp(prev, cur, m);
+
+			if (c > 0 || (c == 0 && prevl > curl))
+				ok = 0;	/* not in sorted order */
+		}
+		memcpy(prev, cur, curl);
+		prevl = curl;
+		have_prev = 1;
+		si = cds_ft_next(ft, it);
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(it);
+	return ok;
+}
+
+static int run_merge_oom_ordered_src(int nr_faults)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group_attr *attr;
+		struct cds_ft_group *group;
+		struct cds_ft *dst, *src;
+		struct ft_test_node *a, *b;
+		enum cds_ft_status s;
+		int verified, keys_ok, order_ok;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			abort();
+		cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+		cds_ft_group_attr_set_ordered_list(attr, true);
+		if (cds_ft_group_create(attr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &dst) < 0 ||
+		    cds_ft_create(group, NULL, &src) < 0) {
+			fprintf(stderr, "merge_oom_ordered_src: create failed\n");
+			return -1;
+		}
+		a = node_alloc(100);
+		b = node_alloc(101);
+		if (cds_ft_insert(dst, (const uint8_t *) "Qa", 2, &a->node) < 0 ||
+		    cds_ft_insert(src, (const uint8_t *) "XYZ", 3, &b->node) < 0)
+			rc = -1;
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_merge_at(dst, (const uint8_t *) "Q", 1,
+				src, (const uint8_t *) "XY", 2);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(dst, stderr) == CDS_FT_STATUS_OK) &&
+			(cds_ft_verify(src, stderr) == CDS_FT_STATUS_OK);
+		if (s == CDS_FT_STATUS_OK) {
+			keys_ok = graft_swap_oom_has_key(dst, "Qa") &&
+				graft_swap_oom_has_key(dst, "QZ") &&
+				cds_ft_count_entries(dst) == 2 &&
+				cds_ft_empty(src);
+		} else {
+			/* OOM: both tries pristine. */
+			keys_ok = graft_swap_oom_has_key(dst, "Qa") &&
+				!graft_swap_oom_has_key(dst, "QZ") &&
+				cds_ft_count_entries(dst) == 1 &&
+				graft_swap_oom_has_key(src, "XYZ") &&
+				cds_ft_count_entries(src) == 1;
+		}
+		rcu_read_unlock();
+		/* The surviving ordered list must stay sorted either way. */
+		order_ok = merge_oom_ordered_src_iter_sorted(dst) &&
+			merge_oom_ordered_src_iter_sorted(src);
+		if (!verified || !keys_ok || !order_ok) {
+			fprintf(stderr,
+				"merge_oom_ordered_src: %s after fault n=%d (merge=%s)\n",
+				!verified ? "verify FAILED" :
+				(!keys_ok ? "KEY SET WRONG" : "ORDER WRONG"),
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;
+		}
+
+		if (drain_trie(dst) < 0 || drain_trie(src) < 0)
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(dst);
+		cds_ft_destroy(src);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	return rc;
+}
+
+static int test_merge_oom_ordered_src(void)
+{
+	return run_merge_oom_ordered_src(24);
+}
+
+/*
  * As run_merge_oom_compressed, but into a NON-ROOT dst merge point (the merged
  * cluster publishes through an interior slot via the flip's type-7 proxy).  A
  * disjoint "Q" subtree in dst must stay intact on every OOM.  On success dst
@@ -22120,6 +22258,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_oom_overlap);
 	RUN_TEST(test_merge_oom_compressed);
 	RUN_TEST(test_merge_oom_nonroot_src);
+	RUN_TEST(test_merge_oom_ordered_src);
 	RUN_TEST(test_merge_oom_nonroot_dst);
 	RUN_TEST(test_merge_oom_external_dst);
 	RUN_TEST(test_merge_oom_compressed_dst);

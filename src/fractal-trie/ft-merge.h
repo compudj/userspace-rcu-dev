@@ -686,184 +686,190 @@ void ft_merge_count(struct cds_ft *ft, struct cds_ft_inode_flag *S, unsigned int
 }
 
 /*
+ * A surviving source head captured for the spine-copy interleave: its cell plus
+ * the key SUFFIX below the src merge point (@suffix_off into the caller's packed
+ * pool, @suffix_len bytes).  Captured BEFORE the src unlink, while S is still
+ * attached and up-walkable; the merge below compares these against the LIVE dst
+ * suffixes.  See ft_merge_ord_interleave_collect.
+ */
+struct ft_merge_src_cap {
+	struct ft_ord_cell *cell;
+	size_t suffix_off;
+	size_t suffix_len;
+};
+
+/*
+ * Compare two ordinal key suffixes.  Matches the ordered-list key ordering: a
+ * shorter key that is a prefix of a longer one sorts FIRST (the prefix-key rule
+ * ft_subtree_minmax_head relies on).  Returns <0 / 0 / >0.
+ */
+static inline
+int ft_merge_suffix_cmp(const uint8_t *a, size_t la, const uint8_t *b, size_t lb)
+{
+	size_t m = la < lb ? la : lb;
+	int c = m ? memcmp(a, b, m) : 0;
+
+	if (c != 0)
+		return c;
+	if (la == lb)
+		return 0;
+	return la < lb ? -1 : 1;
+}
+
+/*
  * COLLECT the ordered-list edges that interleave the surviving source cells into
- * @dst's ordered list for a cds_ft_merge_at spine-copy.  Walks the merged subtree
- * at @dst_key in key order (@merged_keys distinct heads) via the structural
- * inequality oracle, two-pointering against @dst's ORIGINAL region cells:
- * @ord_cursor steps through those (captured before the commit, min head of the
- * dst merge subtree), and any walked head that is NOT the cursor cell is a
- * surviving src head -> splice it after the last placed cell.  Dst-original cells
- * are left untouched (their relative order is preserved by the merge); collided
- * src heads are floating duplicates (only in the splice record, never a distinct
- * reachable head), so the walk never sees them.  @prev_placed starts at the
- * region's predecessor (@ord_cursor's ord_prev).
+ * @dst's ordered list for a cds_ft_merge_at spine-copy, by a two-pointer
+ * KEY-ORDER MERGE of the two already-sorted LIVE cell runs:
+ *   - the dst merge region: @dst_first .. (exclusive) @dst_succ, walked via
+ *     ord_next.  Its heads are up-walked LIVE (ft_rebuild_key_upwalk over the
+ *     intact D, no proxy installed) and their key SUFFIX below the dst merge
+ *     point is suffix = full_key[@dst_key_len ..].
+ *   - the surviving src run: @src_caps[0 .. @nsrc), each carrying its
+ *     pre-captured suffix below the src merge point (captured by the caller
+ *     BEFORE ft_merge_unlink_src_subtree, while S was attached -- the detach
+ *     leaves S-root's parent stale, so a post-unlink src up-walk is unsafe).
+ * Both runs share the merge-point prefix, so they merge by comparing those
+ * suffixes; an equal-suffix step is a COLLISION (the dst head wins -- its dup
+ * chain absorbs the src head via ft_glue_apply_splices -- so the src head is
+ * dropped, a floating duplicate never reachable as a distinct head).
  *
- * This runs PRE-COMMIT: the caller has staged the structural flip proxies and set
- * ft_tls_resolve_merged, so the inequality descent + parent up-walk read the
- * about-to-be-published MERGED structure (every staged proxy resolves to its new
- * target).  The surviving cells' own links are pre-set with invisible plain
- * stores; only the <= 2*merged_keys+2 reader-VISIBLE boundary edges are written
- * into @edges and RETURNED as a count, for the caller to fold into the structural
- * flip batch so structure + interleave commit in ONE flip.  Returns 0 for an
- * empty region (seed failure): no edges, the structural flip still commits.
+ * Runs in the txn's PREPARE phase, with NO structural proxy installed: the
+ * merged ORDER is reconstructed from the two live runs rather than by walking
+ * the about-to-be-published merged structure, so the collect needs neither the
+ * staged proxies nor a writer-side merged-view resolution -- and there is no
+ * append-after-install (every edge is recorded before install).  Pre-sets each surviving
+ * cell's own links with plain stores (the cell is not ord-reachable in @dst --
+ * never was -- and the caller already unlinked it from src), and accumulates
+ * ONLY the <= 2*merged_keys+2 reader-VISIBLE boundary edges -- a dst-original
+ * cell's ord_next / ord_prev, or @dst's head / tail -- into @edges, RETURNED as a
+ * count for the caller to record into the structural flip txn so structure +
+ * interleave commit in ONE flip.  @prev_placed seeds at the region predecessor
+ * (@dst_first's ord_prev).
  *
- * Identity key_map only (the seed uses @dst_key directly; matches the rest of
- * the ordered-list machinery).  Uses @dst's writer-exclusive scratch iterator.
+ * Identity key_map only (matches the rest of the ordered-list machinery).
  */
 static
 unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
-		const uint8_t *dst_key, size_t dst_key_len,
-		unsigned long merged_keys, struct ft_ord_cell *ord_cursor,
-		struct ft_ord_cell *prev_placed, struct ft_ord_cell_edge *edges)
+		size_t dst_key_len, struct ft_ord_cell *dst_first,
+		struct ft_ord_cell *dst_succ, struct ft_ord_cell *prev_placed,
+		const struct ft_merge_src_cap *src_caps, unsigned long nsrc,
+		const uint8_t *src_pool, struct ft_ord_cell_edge *edges)
 {
-	struct cds_ft_iter *it = dst->ord_cell_scratch_iter;
-	unsigned long i;
+	size_t max_len = dst->group->max_key_len;
+	uint8_t dbuf[FT_MAX_KEY_LEN];
+	struct ft_ord_cell *dcur = dst_first;
+	struct ft_ord_cell *prev = prev_placed;
+	bool prev_is_dst = (prev_placed != NULL);
+	unsigned long si = 0;
 	unsigned int n = 0;
+	const uint8_t *dsuf = NULL;
+	size_t dsuf_len = 0;
+	bool dsuf_valid = false;
 
 	/*
-	 * Seed at the merge region's minimum, via the descent oracle
-	 * (cache_valid = false: the cell list is mid-update, so the cell fast
-	 * path must not be used).  A root merge (@dst_key_len == 0) merges the
-	 * whole trie -> seed at the GLOBAL minimum with LIMIT_FIRST, which ignores
-	 * the search key (a zero-length key is invalid for cds_ft_iter_set_key /
-	 * a relational GE on a FIXED-length group, so the relational path would
-	 * bail and leave the src run unspliced).  A scoped merge (@dst_key_len >
-	 * 0) needs the first key >= @dst_key, so it sets @dst_key and uses the
-	 * relational GE (LIMIT_NONE), which honors @dst_key.
+	 * Two-pointer key-order merge of the dst region run and the src survivor
+	 * run.  Each step emits the smaller-suffix head: a dst-original head stays
+	 * put (its back edge changes only when a survivor run precedes it); a
+	 * surviving src head splices in after the last placed cell.  A tie is a
+	 * collision -> emit the dst head, drop the src head.  Dst-original cells
+	 * keep their relative order, so a dst<->dst step needs no edge; each
+	 * survivor RUN costs at most two edges (one entering, one leaving), so
+	 * 2 * merged_keys + 2 bounds @edges.
 	 */
-	it->node = NULL;
-	it->cache_valid = false;
-	if (dst_key_len == 0) {
-		it->key_len = 0;
-		it->prefix_len = 0;
-		it->key_off = 0;
-		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
-				FT_LOOKUP_LIMIT_FIRST, false, false) != CDS_FT_STATUS_OK)
-			return 0;
-	} else {
-		const uint8_t *seed_key = dst_key;
-		size_t seed_len = dst_key_len;
-		size_t flen = dst->group->key_len;
-		uint8_t padbuf[FT_MAX_KEY_LEN];
+	while (dcur != dst_succ || si < nsrc) {
+		bool take_dst;
 
-		/*
-		 * FIXED-length group with a mid-key merge point: @dst_key is
-		 * shorter than the group's key length, which the relational GE
-		 * rejects -- pad it to the fixed length with the ordinal-space
-		 * minimum so GE finds the merged region's first key (every key
-		 * in the region extends @dst_key, hence sorts at or above the
-		 * padded probe; everything below the region sorts under it).
-		 * @dst_key is ALREADY ORDINAL here (cds_ft_merge_at converts
-		 * once at entry), so pad with raw 0x00 and set the iterator key
-		 * without the public set_key's key-map application.
-		 */
-		if (flen != CDS_FT_LEN_VARIABLE && dst_key_len != flen) {
-			assert(dst_key_len < flen && flen <= FT_MAX_KEY_LEN);
-			memcpy(padbuf, dst_key, dst_key_len);
-			memset(padbuf + dst_key_len, 0x00,
-				flen - dst_key_len);
-			seed_key = padbuf;
-			seed_len = flen;
+		if (dcur == dst_succ) {
+			take_dst = false;		/* dst run exhausted */
+		} else if (si == nsrc) {
+			take_dst = true;		/* src run exhausted */
+		} else {
+			int cmp;
+
+			if (!dsuf_valid) {
+				size_t dfl = ft_rebuild_key_upwalk(dst, dcur,
+						dbuf, max_len);
+
+				assert(dfl >= dst_key_len);
+				dsuf = dbuf + (max_len - dfl) + dst_key_len;
+				dsuf_len = dfl - dst_key_len;
+				dsuf_valid = true;
+			}
+			cmp = ft_merge_suffix_cmp(dsuf, dsuf_len,
+					src_pool + src_caps[si].suffix_off,
+					src_caps[si].suffix_len);
+			/* Tie: dst head wins, drop the colliding src head. */
+			if (cmp == 0)
+				si++;
+			take_dst = (cmp <= 0);
 		}
-		ft_iter_set_key_ordinals(it, seed_key, seed_len);
-		it->prefix_len = 0;
-		it->node = NULL;
-		it->cache_valid = false;
-		if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GE,
-				FT_LOOKUP_LIMIT_NONE, false, false) != CDS_FT_STATUS_OK)
-			return 0;
+
+		if (take_dst) {
+			struct ft_ord_cell *cell = dcur;
+
+			/*
+			 * Dst-original cell: stays put, already linked in key
+			 * order.  Its back edge changes only when a survivor run
+			 * was just placed before it.
+			 */
+			if (prev && !prev_is_dst) {
+				prev->ord_next = cell;	/* survivor: invisible */
+				edges[n].slot = &cell->ord_prev;
+				edges[n].old_target =
+					ft_ord_cell_resolve_ord(&cell->ord_prev);
+				edges[n].new_target = prev;
+				n++;
+			}
+			prev = cell;
+			prev_is_dst = true;
+			dcur = ft_ord_cell_resolve_ord(&dcur->ord_next);
+			dsuf_valid = false;
+		} else {
+			struct ft_ord_cell *cell = src_caps[si].cell;
+
+			/* Surviving src cell: pre-set its back link. */
+			cell->ord_prev = prev;		/* invisible */
+			if (!prev) {
+				/* new list minimum: flip @dst head. */
+				edges[n].slot = &dst->ord_cell_head;
+				edges[n].old_target =
+					ft_ord_cell_resolve_ord(&dst->ord_cell_head);
+				edges[n].new_target = cell;
+				n++;
+			} else if (prev_is_dst) {
+				/* dst -> survivor: flip the dst cell's fwd edge. */
+				edges[n].slot = &prev->ord_next;
+				edges[n].old_target =
+					ft_ord_cell_resolve_ord(&prev->ord_next);
+				edges[n].new_target = cell;
+				n++;
+			} else {
+				prev->ord_next = cell;	/* survivor: invisible */
+			}
+			prev = cell;
+			prev_is_dst = false;
+			si++;
+		}
 	}
 	/*
-	 * Single-flip re-weave.  Walk the merged region in key order; pre-set
-	 * each surviving src cell's links with plain stores (the cell is not yet
-	 * ord-reachable in @dst, so this is invisible) and accumulate ONLY the
-	 * VISIBLE boundary edges -- a dst-original cell's ord_next / ord_prev, or
-	 * @dst's head / tail -- into @edges.  The caller folds these into the
-	 * structural flip batch, so one flip commits the entire interleave together
-	 * with the structural re-parent -- a concurrent ordered reader never
-	 * observes a partially re-woven list, nor the merged structure ahead of the
-	 * ordered list.  Dst-original cells keep their relative order, so a
-	 * dst<->dst step needs no edge; each survivor RUN costs at most two edges
-	 * (one entering, one leaving), so 2 * merged_keys + 2 bounds @edges.
+	 * Close the trailing edge: if the last placed cell is a survivor, link it
+	 * to the region successor (@dst_succ; NULL at the list tail) and flip that
+	 * neighbour's back edge -- or @dst's tail when there is none.
 	 */
-	{
-		struct ft_ord_cell *prev = prev_placed;
-		bool prev_is_dst = (prev_placed != NULL);
-
-		for (i = 0; i < merged_keys; i++) {
-			struct cds_ft_node *head = cds_ft_iter_node(it);
-			struct ft_ord_cell *cell;
-
-			if (!head)
-				break;
-			cell = ft_ord_cell_ptr(rcu_dereference(head->prev));
-			if (cell == ord_cursor) {
-				/*
-				 * Dst-original cell: stays put, already linked in
-				 * key order.  Its back edge changes only when a
-				 * survivor run was just placed before it.
-				 */
-				if (prev && !prev_is_dst) {
-					prev->ord_next = cell;	/* survivor: invisible */
-					edges[n].slot = &cell->ord_prev;
-					edges[n].old_target =
-						ft_ord_cell_resolve_ord(&cell->ord_prev);
-					edges[n].new_target = prev;
-					n++;
-				}
-				prev = cell;
-				prev_is_dst = true;
-				ord_cursor = ft_ord_cell_resolve_ord(
-					&ord_cursor->ord_next);
-			} else {
-				/* Surviving src cell: pre-set its back link. */
-				cell->ord_prev = prev;	/* invisible */
-				if (!prev) {
-					/* new list minimum: flip @dst head. */
-					edges[n].slot = &dst->ord_cell_head;
-					edges[n].old_target =
-						ft_ord_cell_resolve_ord(&dst->ord_cell_head);
-					edges[n].new_target = cell;
-					n++;
-				} else if (prev_is_dst) {
-					/* dst -> survivor: flip the dst cell's fwd edge. */
-					edges[n].slot = &prev->ord_next;
-					edges[n].old_target =
-						ft_ord_cell_resolve_ord(&prev->ord_next);
-					edges[n].new_target = cell;
-					n++;
-				} else {
-					prev->ord_next = cell;	/* survivor: invisible */
-				}
-				prev = cell;
-				prev_is_dst = false;
-			}
-			it->cache_valid = false;	/* force the descent oracle */
-			if (cds_ft_lookup_inequality_impl(dst, it, FT_LOOKUP_GT,
-					FT_LOOKUP_LIMIT_NONE, false, false) != CDS_FT_STATUS_OK)
-				break;
-		}
-		/*
-		 * Close the trailing edge: if the last placed cell is a survivor,
-		 * link it to the region successor (@ord_cursor, advanced past the
-		 * last dst-original; NULL at the list tail) and flip that
-		 * neighbour's back edge -- or @dst's tail when there is none.
-		 */
-		if (prev && !prev_is_dst) {
-			prev->ord_next = ord_cursor;	/* survivor: invisible */
-			if (!ord_cursor) {
-				edges[n].slot = &dst->ord_cell_tail;
-				edges[n].old_target =
-					ft_ord_cell_resolve_ord(&dst->ord_cell_tail);
-				edges[n].new_target = prev;
-				n++;
-			} else {
-				edges[n].slot = &ord_cursor->ord_prev;
-				edges[n].old_target =
-					ft_ord_cell_resolve_ord(&ord_cursor->ord_prev);
-				edges[n].new_target = prev;
-				n++;
-			}
+	if (prev && !prev_is_dst) {
+		prev->ord_next = dst_succ;	/* survivor: invisible */
+		if (!dst_succ) {
+			edges[n].slot = &dst->ord_cell_tail;
+			edges[n].old_target =
+				ft_ord_cell_resolve_ord(&dst->ord_cell_tail);
+			edges[n].new_target = prev;
+			n++;
+		} else {
+			edges[n].slot = &dst_succ->ord_prev;
+			edges[n].old_target =
+				ft_ord_cell_resolve_ord(&dst_succ->ord_prev);
+			edges[n].new_target = prev;
+			n++;
 		}
 	}
 	return n;
@@ -1074,7 +1080,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		const uint8_t *src_key, size_t src_key_len, unsigned long cnt_src,
 		unsigned int off_src, struct ft_descent *d_dst,
 		unsigned long cnt_dst, unsigned int off_dst,
-		const uint8_t *dst_key, size_t dst_key_len,
+		size_t dst_key_len,
 		struct urcu_flip_txn **pre_txn)
 {
 	struct ft_glue gd, gs;
@@ -1093,9 +1099,12 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	bool gp_owed;
 	unsigned long merged_keys = 0;
 	bool ms_ord = dst_ft->group->ordered_list_set;
-	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL;
+	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL, *ms_succ = NULL;
 	struct cds_ft_node *ms_s_first = NULL, *ms_s_last = NULL;
 	struct ft_ord_cell_edge *ms_edges = NULL;
+	struct ft_merge_src_cap *ms_src_caps = NULL;	/* src survivor suffixes, pre-captured */
+	uint8_t *ms_src_pool = NULL;			/* packed suffix byte pool */
+	unsigned long ms_nsrc = 0;			/* src run cells captured */
 	unsigned int ms_cap = 0;	/* interleave edge cap, set once merged_keys is known */
 	unsigned int ms_n = 0;		/* interleave edges collected (staged pre-commit) */
 
@@ -1300,6 +1309,13 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ft_subtree_minmax_head(dst_ft, D, false)->prev));
 		ms_prev = ft_ord_cell_resolve_ord(&ms_cursor->ord_prev);
 		/*
+		 * The dst region run is [@ms_cursor .. D's max head]; @ms_succ is
+		 * the cell following it (NULL at the list tail), the stop boundary
+		 * for the interleave walk and the trailing survivor's successor.
+		 */
+		ms_succ = ft_ord_cell_resolve_ord(&ft_ord_cell_ptr(rcu_dereference(
+			ft_subtree_minmax_head(dst_ft, D, true)->prev))->ord_next);
+		/*
 		 * Capture src's merged-subtree (S) run endpoints now, while S is
 		 * still intact, but defer the actual run-unlink until AFTER the
 		 * last fallible step (ft_merge_unlink_src_subtree).  The run
@@ -1321,6 +1337,83 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 */
 		ms_edges = malloc((size_t) ms_cap * sizeof(*ms_edges));
 		if (!ms_edges) {
+			urcu_flip_txn_destroy(txn);
+			if (fresh_root)
+				free_cds_ft_node_unpublished(src_ft, fresh_root);
+			ft_glue_abort(dst_ft, &gd);
+			ft_glue_abort(src_ft, &gs);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+		/*
+		 * Capture the src run's key SUFFIXES (below the src merge point)
+		 * NOW, while S is still attached and up-walkable.  The post-commit
+		 * interleave merges them against the LIVE dst suffixes to rebuild
+		 * the merged order WITHOUT walking the about-to-be-published merged
+		 * structure -- so no proxy need be installed before the collect.
+		 * Capturing them here (not at the collect) is mandatory:
+		 * ft_merge_unlink_src_subtree below leaves S-root's parent stale,
+		 * so a src up-walk after the unlink could run into freed / relocated
+		 * structure.  The run length is bounded by @cnt_src (the src
+		 * subtree's key count >= its distinct heads); the variable-length
+		 * suffix bytes pack into a realloc-growable pool addressed by offset
+		 * (a byte pointer would dangle across the realloc).  Fallible
+		 * pre-pass before the last fallible step -> any OOM aborts the
+		 * still-invisible build, both tries pristine.
+		 */
+		ms_src_caps = malloc((size_t) (cnt_src + 8) * sizeof(*ms_src_caps));
+		if (ms_src_caps) {
+			struct ft_ord_cell *sc = ft_ord_cell_ptr(
+				rcu_dereference(ms_s_first->prev));
+			struct ft_ord_cell *slast = ft_ord_cell_ptr(
+				rcu_dereference(ms_s_last->prev));
+			size_t s_max_len = dst_ft->group->max_key_len;
+			size_t pool_cap = 0, pool_len = 0;
+			uint8_t sbuf[FT_MAX_KEY_LEN];
+			bool oom = false;
+
+			for (;;) {
+				size_t sfl = ft_rebuild_key_upwalk(dst_ft, sc,
+						sbuf, s_max_len);
+				size_t suf_len;
+
+				assert(sfl >= src_key_len &&
+					ms_nsrc < cnt_src + 8);
+				suf_len = sfl - src_key_len;
+				if (pool_len + suf_len > pool_cap) {
+					size_t ncap = pool_cap ? pool_cap * 2 : 256;
+					uint8_t *np;
+
+					while (ncap < pool_len + suf_len)
+						ncap *= 2;
+					np = realloc(ms_src_pool, ncap);
+					if (!np) {
+						oom = true;
+						break;
+					}
+					ms_src_pool = np;
+					pool_cap = ncap;
+				}
+				memcpy(ms_src_pool + pool_len,
+					sbuf + (s_max_len - sfl) + src_key_len,
+					suf_len);
+				ms_src_caps[ms_nsrc].cell = sc;
+				ms_src_caps[ms_nsrc].suffix_off = pool_len;
+				ms_src_caps[ms_nsrc].suffix_len = suf_len;
+				pool_len += suf_len;
+				ms_nsrc++;
+				if (sc == slast)
+					break;
+				sc = ft_ord_cell_resolve_ord(&sc->ord_next);
+			}
+			if (oom) {
+				free(ms_src_pool);
+				ms_src_pool = NULL;
+				free(ms_src_caps);
+				ms_src_caps = NULL;
+			}
+		}
+		if (!ms_src_caps) {
+			free(ms_edges);
 			urcu_flip_txn_destroy(txn);
 			if (fresh_root)
 				free_cds_ft_node_unpublished(src_ft, fresh_root);
@@ -1377,6 +1470,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * not yet applied -- it commits in ft_detach_node's flip, past the
 		 * fallible alloc), so abort the still-invisible build.
 		 */
+		free(ms_src_pool);
+		free(ms_src_caps);
 		free(ms_edges);
 		urcu_flip_txn_destroy(txn);
 		ft_glue_abort(dst_ft, &gd);
@@ -1412,9 +1507,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    (reading the field's current value as the old target) and runs the
 	 *    writer-only slot bookkeeping early; the commit's settle below writes
 	 *    each field to its new parent, subsuming the old step-7 ft_set_parent.
-	 *    Nothing is parked yet -- install() (step 3b, or commit's auto-install)
-	 *    stages the proxies (selector 0, resolving to old) so up-walks and the
-	 *    root descent still see the pre-merge dst.
+	 *    Nothing is parked yet -- commit's auto-install stages every proxy
+	 *    (selector 0, resolving to old) so up-walks and the root descent still
+	 *    see the pre-merge dst until the flip.
 	 */
 	{
 		int j;
@@ -1432,28 +1527,28 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * 3b. Ordered list: install the structural proxies (selector still 0,
-	 *    resolving to old) so the interleave collect reads the about-to-be-
-	 *    published merged structure through them under ft_tls_resolve_merged,
-	 *    then collect the interleave over the MERGED view and record its cell
-	 *    edges into the SAME txn (now INSTALLED -> each installs immediately,
-	 *    appended into the reserved head chunk's spare capacity, no allocation).
-	 *    Structure + ordered list thus commit in ONE flip: a reader never sees
+	 * 3b. Ordered list: collect the interleave and record its cell edges into
+	 *    the SAME txn, STILL IN PREPARE -- no install before the collect.
+	 *    The merged order is reconstructed by a two-pointer merge of the two
+	 *    LIVE cell runs (the dst region up-walked over the intact D, and the
+	 *    src run's suffixes captured pre-unlink), so the collect does NOT need
+	 *    the about-to-be-published merged structure -- the last
+	 *    append-after-install is gone, and every edge is recorded before
+	 *    install.  Structure + ordered list thus commit in ONE flip (commit
+	 *    auto-installs every recorded proxy, then flips): a reader never sees
 	 *    the merged structural minimum ahead of the ordered-list front.  The
 	 *    collect pre-sets the surviving cells' own links invisibly (not yet
 	 *    ord-reachable) and returns only the visible boundary edges.  It runs
 	 *    before apply_splices (step 5), but collisions are invariant: a collided
 	 *    src head is a floating duplicate (only in the splice record), never a
-	 *    distinct reachable head, so the walk enumerates the same heads either way.
+	 *    distinct reachable head, so the merge enumerates the same heads either way.
 	 */
 	if (ms_ord) {
 		unsigned int i;
 
-		urcu_flip_txn_install(txn);
-		ft_tls_resolve_merged = true;
-		ms_n = ft_merge_ord_interleave_collect(dst_ft, dst_key,
-			dst_key_len, merged_keys, ms_cursor, ms_prev, ms_edges);
-		ft_tls_resolve_merged = false;
+		ms_n = ft_merge_ord_interleave_collect(dst_ft, dst_key_len,
+			ms_cursor, ms_succ, ms_prev, ms_src_caps, ms_nsrc,
+			ms_src_pool, ms_edges);
 		for (i = 0; i < ms_n; i++)
 			ft_flip_txn_record_reserved(txn,
 				(void **) ms_edges[i].slot,
@@ -1507,8 +1602,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * the grace-period defer inside the free covers readers already holding such
 	 * a link or parked on a demoted head.
 	 */
-	if (ms_ord)
+	if (ms_ord) {
 		free(ms_edges);
+		free(ms_src_caps);
+		free(ms_src_pool);
+	}
 	ft_glue_free_collided_cells(dst_ft, &gd);
 
 	ft_glue_fini(&gd);
@@ -2108,7 +2206,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 				|| kd == FT_GRAFT_SWAP_KEY_SHORTER)) {
 		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
 				okey_src, src_key_len, cnt_src, off_src,
-				&d_dst, cnt_dst, off_dst, okey_dst, dst_key_len,
+				&d_dst, cnt_dst, off_dst, dst_key_len,
 				pre_txn);
 		if (status == CDS_FT_STATUS_OK) {
 			/*
