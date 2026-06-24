@@ -39,13 +39,17 @@
  * a terminal descriptor in a slot is *correct*, not a bug -- which is why no
  * RDCSS is needed.
  *
- * Liveness.  Records are installed in a single global order (sorted by slot
- * address) so two conflicting transactions always meet at their lowest shared
- * slot, where exactly one CAS wins; the loser HELPS the winner forward (never
- * aborts it) and retries.  A transaction aborts only *itself*, and only
- * because a foreign transaction committed under it (read-set invalid) -- so
- * every self-abort is paid for by real global progress.  This is lock-free,
- * not wait-free.
+ * Liveness.  Records install in one global order (sorted by slot address), so
+ * two conflicting transactions always meet at their lowest shared slot.  There
+ * a strict per-transaction priority picks the winner -- the transaction that
+ * has retried more, ties broken by descriptor address (urcu_flip_lf_outranks());
+ * a starved transaction's priority climbs until it can no longer be bypassed
+ * (bounded bypass).  The lower-priority transaction is aborted and the winner
+ * STEALS the slot in a single CAS -- its parked record replaces the loser's
+ * directly, rather than the slot first reverting to a plain value a newcomer
+ * could grab.  Because the priority order is total and both parties compute it
+ * identically, the two never abort each other, so eviction cannot livelock.
+ * This is lock-free, not wait-free.
  *
  * Existence.  Mutators run as RCU readers (rcu_read_lock around the whole
  * operation).  Any descriptor a helper reaches through a slot stays alive
@@ -86,6 +90,16 @@
 extern "C" {
 #endif
 
+/*
+ * Optional instrumentation hook.  Compiles to nothing unless the embedder
+ * defines URCU_FLIP_LF_STAT(counter) before including this header (the fairness
+ * falsifier uses it to count helping/eviction/steal work).  Not part of the
+ * engine contract.
+ */
+#ifndef URCU_FLIP_LF_STAT
+#define URCU_FLIP_LF_STAT(counter)	do { } while (0)
+#endif
+
 enum urcu_flip_lf_status {
 	URCU_FLIP_LF_UNDECIDED = 0,
 	URCU_FLIP_LF_SUCCEEDED = 1,
@@ -99,20 +113,22 @@ struct urcu_flip_lf_record {
 	void *old_ptr;			/* expected old value */
 	void *new_ptr;			/* committed new value */
 	struct urcu_flip_lf_txn *txn;	/* back-pointer (status + sibling records) */
-};
+} __attribute__((aligned(16)));
 
 /*
  * The records are stored inline after the header and a parked slot holds the
  * tagged address of one record (urcu_flip_lf_tag()).  The engine itself owns
- * only tag bit 0, but the txn is 16-byte aligned and both the recs[] offset and
- * the record stride are multiples of 16, so every inline record address has its
- * low 4 bits free.  An embedder that tags a transacted slot with a wider type
+ * only tag bit 0, but the txn and each inline record are 16-byte aligned (so the
+ * recs[] offset and the record stride are both multiples of 16), so every inline
+ * record address has its low 4 bits free.  An embedder that tags a transacted slot
+ * with a wider type
  * code (e.g. the fractal trie's low-4-bit pointer tags) can thus park records
  * through this engine without losing tag room.  The static asserts below pin
  * that guarantee against future field changes.
  */
 struct urcu_flip_lf_txn {
 	unsigned long status;		/* enum urcu_flip_lf_status, CAS-updated */
+	unsigned long retry;		/* aging priority: prior retries of this op */
 	struct rcu_head rcu_head;	/* owner's deferred-free handle */
 	unsigned int nr;
 	unsigned int cap;
@@ -155,6 +171,24 @@ unsigned long urcu_flip_lf_status(struct urcu_flip_lf_txn *t)
 }
 
 /*
+ * Strict total priority order over two distinct transactions: the one that has
+ * retried more wins; ties break by descriptor address (lower wins).  Both
+ * fields are immutable for a descriptor's life, so the two parties to a slot
+ * conflict compute the identical verdict -- the order is antisymmetric, so they
+ * never each abort the other (which would livelock).  Returns true if @a
+ * outranks @b.  @a and @b must differ (a txn never conflicts with itself: its
+ * records target pairwise-distinct slots).
+ */
+static inline
+bool urcu_flip_lf_outranks(const struct urcu_flip_lf_txn *a,
+		const struct urcu_flip_lf_txn *b)
+{
+	if (a->retry != b->retry)
+		return a->retry > b->retry;
+	return (uintptr_t) a < (uintptr_t) b;
+}
+
+/*
  * Resolve a value loaded from a transacted slot to the value it currently
  * denotes.  A plain value passes through; a parked record resolves through its
  * transaction's status word.  Call from within an RCU read-side section.
@@ -184,6 +218,8 @@ void urcu_flip_lf_drive(struct urcu_flip_lf_txn *t)
 	unsigned long st = urcu_flip_lf_status(t);
 	unsigned int i;
 
+	URCU_FLIP_LF_STAT(drive);
+
 	/* --- install phase (only while UNDECIDED) --- */
 	if (st == URCU_FLIP_LF_UNDECIDED) {
 		for (i = 0; i < t->nr; i++) {
@@ -202,11 +238,49 @@ void urcu_flip_lf_drive(struct urcu_flip_lf_txn *t)
 				if (urcu_flip_lf_is_proxy(v)) {
 					struct urcu_flip_lf_record *fr =
 						urcu_flip_lf_untag(v);
+					struct urcu_flip_lf_txn *e = fr->txn;
+					unsigned long est;
 
-					if (fr->txn != t)
-						urcu_flip_lf_drive(fr->txn);
-					else
-						break;	/* own (distinct-slot inv.) */
+					if (e == t)
+						break;	/* own proxy (distinct-slot inv.) */
+					est = urcu_flip_lf_status(e);
+					if (est == URCU_FLIP_LF_UNDECIDED) {
+						if (!urcu_flip_lf_outranks(t, e)) {
+							/* E outranks us: yield, help it, retry. */
+							urcu_flip_lf_drive(e);
+							continue;
+						}
+						/* We outrank E: evict the lower priority. */
+						URCU_FLIP_LF_STAT(evict);
+						uatomic_cmpxchg(&e->status,
+							URCU_FLIP_LF_UNDECIDED,
+							URCU_FLIP_LF_FAILED);
+						est = urcu_flip_lf_status(e);
+					}
+					if (est == URCU_FLIP_LF_FAILED &&
+							fr->old_ptr == r->old_ptr) {
+						/*
+						 * Steal the slot in one CAS: E's parked
+						 * record -> ours, never through a plain
+						 * value a newcomer could grab.  Sound
+						 * because E is FAILED and we are UNDECIDED,
+						 * so both resolve this slot to the shared
+						 * old (fr->old_ptr == r->old_ptr) -- the
+						 * logical value is unchanged by the steal.
+						 */
+						if (uatomic_cmpxchg(r->slot, v, tagv) == v) {
+							URCU_FLIP_LF_STAT(steal);
+							break;	/* installed */
+						}
+						continue;	/* raced: re-read */
+					}
+					/*
+					 * E committed here (SUCCEEDED), or failed with a
+					 * different old: drive it to a clean slot and
+					 * re-read.  The plain path below then installs or
+					 * detects our read-set is invalid.
+					 */
+					urcu_flip_lf_drive(e);
 					continue;	/* re-read this slot */
 				}
 				if (v != r->old_ptr) {
@@ -254,8 +328,16 @@ void *urcu_flip_lf_read(void **slot)
 	}
 }
 
+/*
+ * Create a transaction with room for @cap records.  @retry is the caller's
+ * aging-priority: the number of times this logical operation has already retried
+ * (0 on the first attempt, incremented and passed back in on each retry).  A
+ * higher value wins contended slots, so a starved operation eventually cannot be
+ * bypassed -- see urcu_flip_lf_outranks().
+ */
 static inline
-struct urcu_flip_lf_txn *urcu_flip_lf_txn_create(unsigned int cap)
+struct urcu_flip_lf_txn *urcu_flip_lf_txn_create(unsigned int cap,
+		unsigned long retry)
 {
 	struct urcu_flip_lf_txn *t;
 
@@ -264,6 +346,7 @@ struct urcu_flip_lf_txn *urcu_flip_lf_txn_create(unsigned int cap)
 	if (!t)
 		return NULL;
 	t->status = URCU_FLIP_LF_UNDECIDED;
+	t->retry = retry;
 	t->nr = 0;
 	t->cap = cap;
 	return t;

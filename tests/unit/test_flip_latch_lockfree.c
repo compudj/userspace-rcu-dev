@@ -17,6 +17,15 @@
  * deadlock in the helping protocol would hang the test (caught as a timeout),
  * and the committed-op total must equal the attempts.
  *
+ * Fairness (the priority + steal engine): a second, deliberately hot phase
+ * (few words, many writers) measures the worst single-operation bypass, i.e.
+ * the highest retry count any one operation reached before committing.  With the
+ * aging-priority contention manager this stays bounded (a starved op's priority
+ * climbs until it can no longer be bypassed); without it a writer could be
+ * starved unboundedly.  The phase also reports helping work -- drive() passes
+ * beyond each op's own owner-drive -- which is the evidence for or against a
+ * per-slot waiter queue (combining) as a follow-up.
+ *
  * Each slot packs a per-word monotonic version (see lf_bump below) so a stored
  * word never repeats a bit pattern, and bit 0 stays free for the engine's record
  * tag.  The versioning models the real target: slots holding RCU-managed
@@ -33,27 +42,60 @@
 
 #include <inttypes.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
+
+/*
+ * Engine instrumentation hook: count helping (drive), eviction and steal events
+ * per thread.  Must be defined before the header so its inline functions pick it
+ * up; compiles to nothing in any other translation unit.
+ */
+struct lf_stat {
+	unsigned long drive;	/* drive() entries: owner-drives + helping */
+	unsigned long evict;	/* foreign txns aborted by priority */
+	unsigned long steal;	/* slots stolen proxy->proxy */
+};
+static __thread struct lf_stat t_stat;
+#define URCU_FLIP_LF_STAT(counter)	(t_stat.counter++)
+
 #include <urcu/flip-latch-lockfree.h>
 
 #include "tap.h"
 
-#define NR_TESTS	2
-#define NR_WORDS	16		/* small => heavy contention */
+#define NR_TESTS	5
 #define NR_WORKERS	8
-#define OPS_PER_WORKER	60000
 
-static void *g_word[NR_WORDS];		/* all start at (void *) 0 */
+#define MILD_WORDS	16		/* moderate contention: atomicity focus */
+#define MILD_OPS	60000
+#define HOT_WORDS	4		/* heavy contention: fairness focus */
+#define HOT_OPS		20000
+
+/*
+ * Worst tolerated single-op bypass in the hot phase.  Generous: under the aging
+ * priority a starved op is bypassed at most O(concurrency) before its retry
+ * count dominates; a regression (raw-race arbitration / broken aging) blows past
+ * this.  Calibrated from observed runs (typ. low tens) with wide headroom.
+ */
+#define HOT_RETRY_BOUND	512
+
+static void *g_word[MILD_WORDS];	/* all start at (void *) 0 */
 
 struct worker_arg {
 	unsigned int seed;
+	unsigned int nwords;
+	long ops;
+	/* outputs */
 	long committed;
+	unsigned long retries_sum;	/* total failed attempts (sum of per-op retry) */
+	unsigned long max_op_retry;	/* worst single-op bypass */
+	struct lf_stat st;
 };
 
 static unsigned int xs(unsigned int x)
@@ -91,24 +133,26 @@ static void *worker(void *arg)
 {
 	struct worker_arg *wa = (struct worker_arg *) arg;
 	unsigned int rng = wa->seed;
+	unsigned int nwords = wa->nwords;
 	long n;
 
 	rcu_register_thread();
-	for (n = 0; n < OPS_PER_WORKER; n++) {
+	for (n = 0; n < wa->ops; n++) {
 		int i, j, k, three;
+		unsigned long retry = 0;
 		bool ok;
 
 		rng = xs(rng);
-		three = rng & 1;
-		i = (int) ((rng >> 1) % NR_WORDS);
+		three = (int) (rng & 1);
+		i = (int) ((rng >> 1) % nwords);
 		rng = xs(rng);
-		j = (int) (rng % NR_WORDS);
+		j = (int) (rng % nwords);
 		if (j == i)
-			j = (j + 1) % NR_WORDS;
+			j = (j + 1) % (int) nwords;
 		rng = xs(rng);
-		k = (int) (rng % NR_WORDS);
+		k = (int) (rng % nwords);
 		while (k == i || k == j)
-			k = (k + 1) % NR_WORDS;
+			k = (k + 1) % (int) nwords;
 
 		do {
 			struct urcu_flip_lf_txn *t;
@@ -121,7 +165,7 @@ static void *worker(void *arg)
 			 * quiescent states), but required for the memb/mb flavors.
 			 */
 			rcu_read_lock();
-			t = urcu_flip_lf_txn_create(3);
+			t = urcu_flip_lf_txn_create(3, retry);
 			if (!t)
 				abort();
 			oi = (uintptr_t) urcu_flip_lf_read(&g_word[i]);
@@ -140,48 +184,117 @@ static void *worker(void *arg)
 			}
 			ok = urcu_flip_lf_txn_commit(t, call_rcu);
 			rcu_read_unlock();
+			if (!ok)
+				retry++;
 		} while (!ok);
 
 		wa->committed++;
+		wa->retries_sum += retry;
+		if (retry > wa->max_op_retry)
+			wa->max_op_retry = retry;
 		rcu_quiescent_state();
 	}
 	rcu_unregister_thread();
+	wa->st = t_stat;
 	return NULL;
 }
 
-int main(void)
+/*
+ * Run one phase: @nwords shared words, @ops per worker.  Returns the final sum
+ * (0 iff atomic); fills *@out_committed, *@out_max_retry and the aggregate
+ * drive/evict/steal/attempt counters.
+ */
+static intptr_t run_phase(unsigned int nwords, long ops,
+		long *out_committed, unsigned long *out_max_retry,
+		struct lf_stat *out_st, unsigned long *out_attempts)
 {
 	pthread_t th[NR_WORKERS];
 	struct worker_arg args[NR_WORKERS];
-	long total_committed = 0;
+	long committed = 0;
+	unsigned long max_retry = 0, attempts = 0;
+	struct lf_stat st = { 0, 0, 0 };
 	intptr_t sum = 0;
-	int i;
+	unsigned int i;
 
-	plan_tests(NR_TESTS);
-	rcu_register_thread();
+	for (i = 0; i < nwords; i++)
+		g_word[i] = (void *) 0;
 
 	for (i = 0; i < NR_WORKERS; i++) {
-		args[i].seed = 0x9e3779b9u + (unsigned int) i * 2654435761u;
+		args[i].seed = 0x9e3779b9u + i * 2654435761u;
+		args[i].nwords = nwords;
+		args[i].ops = ops;
 		args[i].committed = 0;
+		args[i].retries_sum = 0;
+		args[i].max_op_retry = 0;
+		args[i].st.drive = args[i].st.evict = args[i].st.steal = 0;
 		pthread_create(&th[i], NULL, worker, &args[i]);
 	}
 	rcu_thread_offline();		/* don't stall grace periods while joined */
 	for (i = 0; i < NR_WORKERS; i++) {
 		pthread_join(th[i], NULL);
-		total_committed += args[i].committed;
+		committed += args[i].committed;
+		attempts += (unsigned long) args[i].committed + args[i].retries_sum;
+		if (args[i].max_op_retry > max_retry)
+			max_retry = args[i].max_op_retry;
+		st.drive += args[i].st.drive;
+		st.evict += args[i].st.evict;
+		st.steal += args[i].st.steal;
 	}
 	rcu_thread_online();
 
-	for (i = 0; i < NR_WORDS; i++)
+	for (i = 0; i < nwords; i++)
 		sum += lf_val((uintptr_t) g_word[i]);
 
-	diag("%d workers x %d ops = %ld committed; final sum = %" PRIdPTR,
-		NR_WORKERS, OPS_PER_WORKER, total_committed, sum);
+	*out_committed = committed;
+	*out_max_retry = max_retry;
+	*out_st = st;
+	*out_attempts = attempts;
+	return sum;
+}
 
+int main(void)
+{
+	long committed;
+	unsigned long max_retry, attempts;
+	struct lf_stat st;
+	intptr_t sum;
+
+	plan_tests(NR_TESTS);
+	rcu_register_thread();
+
+	/* --- Phase 1: moderate contention -- atomicity + progress. --- */
+	sum = run_phase(MILD_WORDS, MILD_OPS, &committed, &max_retry, &st, &attempts);
+	diag("mild: %d workers x %d ops over %d words = %ld committed; sum = %"
+		PRIdPTR "; max single-op retry = %lu",
+		NR_WORKERS, MILD_OPS, MILD_WORDS, committed, sum, max_retry);
 	ok(sum == 0,
-		"k-CAS stayed atomic across concurrent transfers (sum invariant)");
-	ok(total_committed == (long) NR_WORKERS * OPS_PER_WORKER,
-		"every transaction eventually committed (lock-free progress)");
+		"mild: k-CAS stayed atomic across concurrent transfers (sum invariant)");
+	ok(committed == (long) NR_WORKERS * MILD_OPS,
+		"mild: every transaction eventually committed (lock-free progress)");
+
+	/* --- Phase 2: heavy contention -- fairness + helping cost. --- */
+	sum = run_phase(HOT_WORDS, HOT_OPS, &committed, &max_retry, &st, &attempts);
+	{
+		/*
+		 * owner-drives = one drive() per attempt (every commit of a
+		 * >=2-edge txn drives once); the rest is helping foreign txns.
+		 */
+		double dpc = (double) st.drive / (double) committed;
+		double helppc = (double) (st.drive - attempts) / (double) committed;
+
+		diag("hot:  %d workers x %d ops over %d words = %ld committed; sum = %"
+			PRIdPTR, NR_WORKERS, HOT_OPS, HOT_WORDS, committed, sum);
+		diag("hot:  max single-op retry = %lu (bound %d); attempts = %lu",
+			max_retry, HOT_RETRY_BOUND, attempts);
+		diag("hot:  drive=%lu (%.2f/commit) help=%.2f/commit evict=%lu steal=%lu",
+			st.drive, dpc, helppc, st.evict, st.steal);
+	}
+	ok(sum == 0,
+		"hot: k-CAS stayed atomic under heavy contention (sum invariant)");
+	ok(committed == (long) NR_WORKERS * HOT_OPS,
+		"hot: every transaction eventually committed (lock-free progress)");
+	ok(max_retry < HOT_RETRY_BOUND,
+		"hot: worst single-op bypass stayed bounded (priority fairness)");
 
 	rcu_barrier();
 	rcu_unregister_thread();

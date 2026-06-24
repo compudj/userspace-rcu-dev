@@ -92,6 +92,8 @@ static void sorted_insert(int key)
 
 	if (!n)
 		abort();
+	unsigned long retry = 0;
+
 	n->key = key;
 	for (;;) {
 		struct cds_bidir_list_lf_node *prev = &g_head, *succ;
@@ -108,7 +110,7 @@ static void sorted_insert(int key)
 		}
 		n->node.next = succ;
 		n->node.prev = prev;
-		t = urcu_flip_lf_txn_create(2);
+		t = urcu_flip_lf_txn_create(2, retry);
 		if (!t)
 			abort();
 		/* validates prev->next == succ and succ->prev == prev */
@@ -118,6 +120,7 @@ static void sorted_insert(int key)
 		rcu_read_unlock();
 		if (ok)
 			return;
+		retry++;
 		/* aborted (position shifted / anchor gone): re-find and retry */
 	}
 }

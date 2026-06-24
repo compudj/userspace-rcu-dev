@@ -198,6 +198,8 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 		struct cds_bidir_list_lf_node *pos,
 		cds_bidir_list_lf_call_rcu_fn call_rcu_fn)
 {
+	unsigned long retry = 0;
+
 	for (;;) {
 		void *pn = urcu_flip_lf_read((void **) &pos->next);
 		struct cds_bidir_list_lf_node *succ;
@@ -211,7 +213,7 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 		newp->next = succ;
 		newp->prev = pos;
 
-		t = urcu_flip_lf_txn_create(2);
+		t = urcu_flip_lf_txn_create(2, retry);
 		if (caa_unlikely(!t))
 			return -ENOMEM;
 		/*
@@ -226,6 +228,7 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 		urcu_flip_lf_txn_add(t, (void **) &succ->prev, pos, newp);
 		if (urcu_flip_lf_txn_commit(t, call_rcu_fn))
 			return 0;
+		retry++;
 		/* aborted: a neighbour changed -- re-read, retry, maybe -ENOENT */
 	}
 }
@@ -238,6 +241,8 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 		struct cds_bidir_list_lf_node *pos,
 		cds_bidir_list_lf_call_rcu_fn call_rcu_fn)
 {
+	unsigned long retry = 0;
+
 	for (;;) {
 		void *pn = urcu_flip_lf_read((void **) &pos->next);
 		struct cds_bidir_list_lf_node *prev;
@@ -251,7 +256,7 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 		newp->next = pos;
 		newp->prev = prev;
 
-		t = urcu_flip_lf_txn_create(2);
+		t = urcu_flip_lf_txn_create(2, retry);
 		if (caa_unlikely(!t))
 			return -ENOMEM;
 		/*
@@ -265,6 +270,7 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 		urcu_flip_lf_txn_add(t, (void **) &pos->prev, prev, newp);
 		if (urcu_flip_lf_txn_commit(t, call_rcu_fn))
 			return 0;
+		retry++;
 	}
 }
 
@@ -295,6 +301,8 @@ static inline
 int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
 		cds_bidir_list_lf_call_rcu_fn call_rcu_fn)
 {
+	unsigned long retry = 0;
+
 	for (;;) {
 		void *en = urcu_flip_lf_read((void **) &elem->next);
 		struct cds_bidir_list_lf_node *next, *prev;
@@ -306,7 +314,7 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
 		prev = cds_bidir_list_lf_unmark(
 				urcu_flip_lf_read((void **) &elem->prev));
 
-		t = urcu_flip_lf_txn_create(3);
+		t = urcu_flip_lf_txn_create(3, retry);
 		if (caa_unlikely(!t))
 			return -ENOMEM;
 		/*
@@ -324,6 +332,7 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
 		urcu_flip_lf_txn_add(t, (void **) &next->prev, elem, prev);
 		if (urcu_flip_lf_txn_commit(t, call_rcu_fn))
 			return 1;			/* removed by this call */
+		retry++;
 		/* aborted: neighbours changed -- retry, maybe find it deleted */
 	}
 }
