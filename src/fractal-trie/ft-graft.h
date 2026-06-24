@@ -353,7 +353,6 @@ struct ft_graft_store_state {
 	struct cds_ft_inode_flag *attached;		/* payload (at-node) or branch */
 	unsigned int attached_depth;
 	/* flip publish (slot-at-node and built-branch-flip shapes): */
-	struct urcu_flip_latch *slot_latch;	/* glue->txn latch for the slot proxy */
 	struct cds_ft_inode_flag *dest;
 	struct cds_ft_inode *old_recompacted_node;
 	struct cds_ft_metadata *publish_pmeta;
@@ -399,7 +398,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 	if (d->depth == key_len) {
 		struct cds_ft_metadata *pmeta;
 		struct cds_ft_inode_flag *dest;
-		struct cds_ft_inode_flag *slot_value, *pf;
+		struct cds_ft_inode_flag *slot_value;
 		int ret;
 
 		if (d->nf)
@@ -414,24 +413,24 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 
 		/*
 		 * R8 ordering: the slot store and its possible recompact are the
-		 * LAST fallible steps, so they run FIRST, parking a flip proxy
-		 * that keeps resolving to the empty slot.  An ENOMEM here leaves
-		 * both tries untouched (no live edge flipped); the failure-free
-		 * wiring runs behind the parked proxy in commit.  The proxy is a
-		 * latch reserved out of glue->txn (whose slot is bound in commit,
-		 * once the recompact-relocated slot address is known), so the slot
-		 * store flips atomically with the back-pointers and the ordered-list
-		 * run-splice -- the appear-side cross-view fix -- in one txn commit.
+		 * LAST fallible steps, so they run FIRST (reserved-byte model):
+		 * key[key_len-1]'s slot is occupied with a reserved bit-set+NULL
+		 * byte that reads as not-present.  An ENOMEM here leaves both
+		 * tries untouched (no live edge flipped); the failure-free wiring
+		 * runs behind the still-empty slot in commit.  The slot edge
+		 * (NULL -> slot_value) is recorded against the FINAL slot in
+		 * commit (once the recompact-relocated address is known), so the
+		 * slot store flips atomically with the back-pointers and the
+		 * ordered-list run-splice -- the appear-side cross-view fix -- in
+		 * one txn commit.  Nothing is stored in the slot during the build.
 		 */
 		slot_value = graft_payload;
 		if (ft_node_compressed(graft_payload))
 			slot_value = ft_publish_compressed(ft,
 				ft_compressed_node_ptr(graft_payload),
 				graft_payload);
-		pf = (struct cds_ft_inode_flag *) urcu_flip_txn_reserve_slot(
-			glue->txn, NULL, slot_value, &st->slot_latch);
 		dest = d->pnf;
-		ret = ft_node_set_nth(ft, &dest, key[key_len - 1], pf,
+		ret = ft_node_set_nth(ft, &dest, key[key_len - 1], NULL,
 			&st->old_recompacted_node, pmeta, d->depth - 1, false);
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
@@ -487,21 +486,20 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		} else {
 			struct cds_ft_inode_flag *dest = d->pnf;
 			struct cds_ft_metadata *pmeta;
-			struct cds_ft_inode_flag *pf;
 			int ret;
 
 			pmeta = cds_ft_item_to_metadata(ft_node_ptr(d->pnf));
 
 			/*
 			 * Same R8 + fresh-before-live discipline as the
-			 * d->depth == key_len arm: park a glue->txn slot
-			 * proxy so the fallible slot store runs FIRST and the
-			 * wiring completes invisibly in commit.
+			 * d->depth == key_len arm (reserved-byte model):
+			 * reserve key[i-1]'s slot (bit-set+NULL, reads
+			 * not-present) so the fallible slot store runs FIRST;
+			 * the slot edge (NULL -> branch) is recorded against
+			 * the final slot and the wiring completes invisibly in
+			 * commit.
 			 */
-			pf = (struct cds_ft_inode_flag *)
-				urcu_flip_txn_reserve_slot(glue->txn,
-					NULL, branch, &st->slot_latch);
-			ret = ft_node_set_nth(ft, &dest, key[i - 1], pf,
+			ret = ft_node_set_nth(ft, &dest, key[i - 1], NULL,
 				&st->old_recompacted_node, pmeta,
 				d->depth - 1, false);
 			if (ret)
@@ -566,15 +564,18 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		ft_publish_to_parent(ft, st->publish_pmeta->parent, st->pnfp,
 			st->dest);
 		/*
-		 * Bind the slot proxy reserved in prepare (now that the recompact-
-		 * relocated slot address is known), then fuse the ordered-list
-		 * run-splice into the SAME glue->txn: record the run's <=4 boundary
-		 * edges so one commit makes the grafted key appear in the structure
-		 * and the ordered list atomically.  The slot proxy was placed in
-		 * prepare (the last fallible step); the cell edges have no fallible
-		 * step, and all draw from the reserved txn (no allocation here).
+		 * Record the slot edge against the FINAL slot (now that the
+		 * recompact-relocated address is known): NULL -> slot_value, so
+		 * the reserved bit-set+NULL byte settles to the grafted child at
+		 * commit.  Then fuse the ordered-list run-splice into the SAME
+		 * glue->txn: record the run's <=4 boundary edges so one commit
+		 * makes the grafted key appear in the structure and the ordered
+		 * list atomically.  The reserve set_nth was the last fallible
+		 * step in prepare; the slot + cell edges have none, and all draw
+		 * from the reserved txn (no allocation here).
 		 */
-		urcu_flip_txn_bind_slot(st->slot_latch, (void **) slot);
+		ft_flip_txn_record_reserved(st->glue->txn, (void **) slot,
+			NULL, (void *) st->slot_value);
 		if (run) {
 			rn = ft_ord_cell_run_splice_edges(ft, run->run_first,
 				run->run_last, run->pred, run->succ, redges, 0);
