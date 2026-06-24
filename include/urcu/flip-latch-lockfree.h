@@ -39,6 +39,17 @@
  * a terminal descriptor in a slot is *correct*, not a bug -- which is why no
  * RDCSS is needed.
  *
+ * Settle is owner-only.  A helper drives a foreign transaction's *install*
+ * forward (so a stalled writer never blocks others) but never settles it: only
+ * the owner, in commit(), rewrites its own parked records back to plain values.
+ * A terminal descriptor therefore lingers in its slots until the owner reclaims
+ * it; readers and contenders resolve it through the status word in the meantime.
+ * The payoff is that a contended slot never reverts to a plain value mid-episode
+ * -- so it is never momentarily up for grabs by a newcomer's plain CAS -- it is
+ * handed owner-to-owner by steals and only decays to plain once quiescent.  The
+ * cost is that readers resolve a lingering proxy rather than load a settled
+ * value; an aborted transaction settles right after, so the window is short.
+ *
  * Liveness.  Records install in one global order (sorted by slot address), so
  * two conflicting transactions always meet at their lowest shared slot.  There
  * a strict per-transaction priority picks the winner -- the transaction that
@@ -206,103 +217,120 @@ void *urcu_flip_lf_resolve(void *v)
 }
 
 /*
- * Drive transaction @t to a terminal, fully-settled state.  Safe to call on
- * one's own transaction or on any foreign transaction encountered in a slot
- * (helping).  Idempotent and re-entrant under the global install order:
- * helping follows strictly increasing slot addresses, so recursion is bounded
- * by the number of concurrently-conflicting transactions.
+ * Install phase: drive transaction @t to a terminal status (SUCCEEDED or
+ * FAILED) by installing its records in slot-address order.  Does NOT settle the
+ * slots -- settle is owner-only (urcu_flip_lf_settle), so a terminal proxy may
+ * linger in a slot until its owner reclaims it; readers and contenders resolve
+ * it through the status word rather than waiting for a plain value.  Safe to
+ * call on one's own transaction or on any foreign one met in a slot (helping
+ * its install forward, never settling it).  Idempotent and re-entrant under the
+ * global install order: helping follows strictly increasing slot addresses, so
+ * recursion is bounded by the number of concurrently-conflicting transactions.
  */
 static inline
-void urcu_flip_lf_drive(struct urcu_flip_lf_txn *t)
+void urcu_flip_lf_drive_install(struct urcu_flip_lf_txn *t)
 {
 	unsigned long st = urcu_flip_lf_status(t);
 	unsigned int i;
 
 	URCU_FLIP_LF_STAT(drive);
 
-	/* --- install phase (only while UNDECIDED) --- */
-	if (st == URCU_FLIP_LF_UNDECIDED) {
-		for (i = 0; i < t->nr; i++) {
-			struct urcu_flip_lf_record *r = &t->recs[i];
-			void *tagv = urcu_flip_lf_tag(r);
+	if (st != URCU_FLIP_LF_UNDECIDED)
+		return;			/* already terminal */
+	for (i = 0; i < t->nr; i++) {
+		struct urcu_flip_lf_record *r = &t->recs[i];
+		void *tagv = urcu_flip_lf_tag(r);
 
-			for (;;) {
-				void *v;
+		for (;;) {
+			void *v;
 
-				st = urcu_flip_lf_status(t);
-				if (st != URCU_FLIP_LF_UNDECIDED)
-					goto settle;	/* decided by a helper */
-				v = uatomic_load(r->slot, CMM_ACQUIRE);
-				if (v == tagv)
-					break;		/* already installed */
-				if (urcu_flip_lf_is_proxy(v)) {
-					struct urcu_flip_lf_record *fr =
-						urcu_flip_lf_untag(v);
-					struct urcu_flip_lf_txn *e = fr->txn;
-					unsigned long est;
+			st = urcu_flip_lf_status(t);
+			if (st != URCU_FLIP_LF_UNDECIDED)
+				return;		/* decided by a helper/evictor */
+			v = uatomic_load(r->slot, CMM_ACQUIRE);
+			if (v == tagv)
+				break;		/* already installed */
+			if (urcu_flip_lf_is_proxy(v)) {
+				struct urcu_flip_lf_record *fr =
+					urcu_flip_lf_untag(v);
+				struct urcu_flip_lf_txn *e = fr->txn;
+				unsigned long est;
+				void *resolved;
 
-					if (e == t)
-						break;	/* own proxy (distinct-slot inv.) */
+				if (e == t)
+					break;	/* own proxy (distinct-slot inv.) */
+				est = urcu_flip_lf_status(e);
+				if (est == URCU_FLIP_LF_UNDECIDED) {
+					if (!urcu_flip_lf_outranks(t, e)) {
+						/* E outranks us: help it decide
+						 * (install only), then re-read. */
+						urcu_flip_lf_drive_install(e);
+						continue;
+					}
+					/* We outrank E: evict the lower priority. */
+					URCU_FLIP_LF_STAT(evict);
+					uatomic_cmpxchg(&e->status,
+						URCU_FLIP_LF_UNDECIDED,
+						URCU_FLIP_LF_FAILED);
 					est = urcu_flip_lf_status(e);
-					if (est == URCU_FLIP_LF_UNDECIDED) {
-						if (!urcu_flip_lf_outranks(t, e)) {
-							/* E outranks us: yield, help it, retry. */
-							urcu_flip_lf_drive(e);
-							continue;
-						}
-						/* We outrank E: evict the lower priority. */
-						URCU_FLIP_LF_STAT(evict);
-						uatomic_cmpxchg(&e->status,
-							URCU_FLIP_LF_UNDECIDED,
-							URCU_FLIP_LF_FAILED);
-						est = urcu_flip_lf_status(e);
-					}
-					if (est == URCU_FLIP_LF_FAILED &&
-							fr->old_ptr == r->old_ptr) {
-						/*
-						 * Steal the slot in one CAS: E's parked
-						 * record -> ours, never through a plain
-						 * value a newcomer could grab.  Sound
-						 * because E is FAILED and we are UNDECIDED,
-						 * so both resolve this slot to the shared
-						 * old (fr->old_ptr == r->old_ptr) -- the
-						 * logical value is unchanged by the steal.
-						 */
-						if (uatomic_cmpxchg(r->slot, v, tagv) == v) {
-							URCU_FLIP_LF_STAT(steal);
-							break;	/* installed */
-						}
-						continue;	/* raced: re-read */
-					}
-					/*
-					 * E committed here (SUCCEEDED), or failed with a
-					 * different old: drive it to a clean slot and
-					 * re-read.  The plain path below then installs or
-					 * detects our read-set is invalid.
-					 */
-					urcu_flip_lf_drive(e);
-					continue;	/* re-read this slot */
 				}
-				if (v != r->old_ptr) {
+				/*
+				 * E is terminal now (possibly still unsettled --
+				 * owner-only settle).  It resolves this slot to its
+				 * new (SUCCEEDED) or old (FAILED).
+				 */
+				resolved = (est == URCU_FLIP_LF_SUCCEEDED) ?
+						fr->new_ptr : fr->old_ptr;
+				if (resolved != r->old_ptr) {
 					/* read-set invalid -> abort this txn */
 					uatomic_cmpxchg(&t->status,
 						URCU_FLIP_LF_UNDECIDED,
 						URCU_FLIP_LF_FAILED);
-					goto settle;
+					return;
 				}
-				if (uatomic_cmpxchg(r->slot, r->old_ptr, tagv) == r->old_ptr)
-					break;		/* installed */
-				/* slot changed under us -> re-evaluate */
+				/*
+				 * Steal E's terminal proxy in one CAS: our parked
+				 * record replaces it directly, never through a plain
+				 * value a newcomer could grab.  Sound because the
+				 * slot's logical value (resolved == r->old_ptr) is
+				 * unchanged by the handoff.
+				 */
+				if (uatomic_cmpxchg(r->slot, v, tagv) == v) {
+					URCU_FLIP_LF_STAT(steal);
+					break;	/* installed */
+				}
+				continue;	/* raced (owner settled / stolen): re-read */
 			}
+			if (v != r->old_ptr) {
+				/* read-set invalid -> abort this txn */
+				uatomic_cmpxchg(&t->status,
+					URCU_FLIP_LF_UNDECIDED,
+					URCU_FLIP_LF_FAILED);
+				return;
+			}
+			if (uatomic_cmpxchg(r->slot, r->old_ptr, tagv) == r->old_ptr)
+				break;		/* installed */
+			/* slot changed under us -> re-evaluate */
 		}
-		/* every record installed -> commit */
-		uatomic_cmpxchg(&t->status, URCU_FLIP_LF_UNDECIDED,
-				URCU_FLIP_LF_SUCCEEDED);
 	}
+	/* every record installed -> commit */
+	uatomic_cmpxchg(&t->status, URCU_FLIP_LF_UNDECIDED,
+			URCU_FLIP_LF_SUCCEEDED);
+}
 
-settle:
-	/* --- settle (SUCCEEDED) or restore (FAILED) -- both idempotent CAS --- */
-	st = urcu_flip_lf_status(t);
+/*
+ * Settle phase (owner-only): make @t's own slots plain -- its new value on
+ * SUCCEEDED, its old on FAILED.  Called from commit() once @t is terminal.  A
+ * slot a higher-priority transaction already stole holds that thief's proxy, so
+ * the CAS just fails and is ignored; once settle returns, no slot still names a
+ * record of @t, so the descriptor can be reclaimed.  Idempotent.
+ */
+static inline
+void urcu_flip_lf_settle(struct urcu_flip_lf_txn *t)
+{
+	unsigned long st = urcu_flip_lf_status(t);
+	unsigned int i;
+
 	for (i = 0; i < t->nr; i++) {
 		struct urcu_flip_lf_record *r = &t->recs[i];
 		void *want = (st == URCU_FLIP_LF_SUCCEEDED) ? r->new_ptr : r->old_ptr;
@@ -312,19 +340,29 @@ settle:
 }
 
 /*
- * Load @slot and, if it holds a parked record, help that transaction settle so
- * a plain value is returned.  Use this to read the current value of a word you
- * intend to transact (its old).  Call within an RCU read-side section.
+ * Load @slot and return the value it currently denotes: a plain value as-is, or,
+ * for a parked record, the value resolved through its transaction's status.  If
+ * that transaction is still UNDECIDED, help drive its install to a decision
+ * first (so the returned value is stable), but never settle it -- the proxy is
+ * left in place (owner-only settle) and the value returned is the *logical* one.
+ * Use this to read the current value of a word you intend to transact (its old);
+ * commit() then reconciles that logical old against whatever physical value --
+ * plain or a foreign proxy -- the slot holds at install time.  Call within an
+ * RCU read-side section.
  */
 static inline
 void *urcu_flip_lf_read(void **slot)
 {
 	for (;;) {
 		void *v = uatomic_load(slot, CMM_ACQUIRE);
+		struct urcu_flip_lf_txn *e;
 
 		if (caa_likely(!urcu_flip_lf_is_proxy(v)))
 			return v;
-		urcu_flip_lf_drive(urcu_flip_lf_untag(v)->txn);
+		e = urcu_flip_lf_untag(v)->txn;
+		if (urcu_flip_lf_status(e) != URCU_FLIP_LF_UNDECIDED)
+			return urcu_flip_lf_resolve(v);	/* terminal: logical value */
+		urcu_flip_lf_drive_install(e);		/* help decide, then re-read */
 	}
 }
 
@@ -429,7 +467,8 @@ bool urcu_flip_lf_txn_commit(struct urcu_flip_lf_txn *t,
 		return committed;
 	}
 	urcu_flip_lf_txn_sort(t);
-	urcu_flip_lf_drive(t);
+	urcu_flip_lf_drive_install(t);		/* install to a decision (helpers help) */
+	urcu_flip_lf_settle(t);			/* owner-only: make our own slots plain */
 	committed = urcu_flip_lf_status(t) == URCU_FLIP_LF_SUCCEEDED;
 	call_rcu_fn(&t->rcu_head, urcu_flip_lf_txn_free_rcu);
 	return committed;
