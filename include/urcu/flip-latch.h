@@ -214,11 +214,13 @@ struct urcu_flip_latch {
  * installed yet (no slot points into the array), and once commit() parks proxies
  * the array is frozen and never reallocated again.
  *
- * The header is 16-byte aligned, matching the lock-free txn and keeping &t->group
- * with its low 4 bits free.  The tagged proxies an embedder actually stores in
- * its slots live in @latches; struct urcu_flip_latch's own 16-byte alignment
- * keeps each one 16-byte aligned (low 4 bits free), so a low-4-bit pointer-tagging
- * embedder (e.g. the fractal trie) can route its slots through this engine.
+ * The header carries no alignment of its own: &t->group is stored in each proxy
+ * as a plain pointer and only dereferenced (proxy->group->selector) -- it is
+ * never tagged, so it needs no free low bits.  The tag room that matters is on
+ * the tagged proxies an embedder actually stores in its slots; those live in
+ * @latches, and struct urcu_flip_latch's own 16-byte alignment keeps each one
+ * 16-byte aligned (low 4 bits free), so a low-4-bit pointer-tagging embedder
+ * (e.g. the fractal trie) can route its slots through this engine.
  */
 struct urcu_flip_txn {
 	struct urcu_flip_group group;
@@ -228,7 +230,7 @@ struct urcu_flip_txn {
 	struct urcu_flip_latch *latches;	/* record array (realloc-grown) */
 	unsigned int nr;
 	unsigned int cap;
-} __attribute__((aligned(16)));
+};
 
 #define URCU_FLIP_TXN_CAP	8	/* initial record-array capacity */
 

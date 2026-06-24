@@ -129,13 +129,15 @@ struct urcu_flip_lf_record {
 /*
  * The records are stored inline after the header and a parked slot holds the
  * tagged address of one record (urcu_flip_lf_tag()).  The engine itself owns
- * only tag bit 0, but the txn and each inline record are 16-byte aligned (so the
- * recs[] offset and the record stride are both multiples of 16), so every inline
- * record address has its low 4 bits free.  An embedder that tags a transacted slot
- * with a wider type
- * code (e.g. the fractal trie's low-4-bit pointer tags) can thus park records
- * through this engine without losing tag room.  The static asserts below pin
- * that guarantee against future field changes.
+ * only tag bit 0, but each inline record is 16-byte aligned -- which makes the
+ * recs[] offset and the record stride both multiples of 16, and (since recs[] is
+ * a member) gives the txn itself 16-byte alignment -- so every inline record
+ * address has its low 4 bits free.  An embedder that tags a transacted slot with
+ * a wider type code (e.g. the fractal trie's low-4-bit pointer tags) can thus
+ * park records through this engine without losing tag room.  The static asserts
+ * below pin that guarantee against future field changes.  (The record's own
+ * alignment carries all of this -- the txn needs no alignment attribute of its
+ * own; only records, never the txn or its status word, are tagged into a slot.)
  */
 struct urcu_flip_lf_txn {
 	unsigned long status;		/* enum urcu_flip_lf_status, CAS-updated */
@@ -144,7 +146,7 @@ struct urcu_flip_lf_txn {
 	unsigned int nr;
 	unsigned int cap;
 	struct urcu_flip_lf_record recs[];	/* frozen + slot-sorted at commit */
-} __attribute__((aligned(16)));
+};
 
 urcu_static_assert(!(offsetof(struct urcu_flip_lf_txn, recs) % 16),
 		"urcu_flip_lf_txn.recs must be 16-byte aligned within the txn",
@@ -152,6 +154,9 @@ urcu_static_assert(!(offsetof(struct urcu_flip_lf_txn, recs) % 16),
 urcu_static_assert(!(sizeof(struct urcu_flip_lf_record) % 16),
 		"urcu_flip_lf_record stride must keep inline records 16-byte aligned",
 		urcu_flip_lf_record_stride_aligned);
+urcu_static_assert(!(__alignof__(struct urcu_flip_lf_txn) % 16),
+		"urcu_flip_lf_txn must inherit 16-byte alignment from its recs[] member",
+		urcu_flip_lf_txn_aligned);
 
 /* The reserved tag bit marking a slot value as a parked record (proxy). */
 #define URCU_FLIP_LF_TAG	1UL
