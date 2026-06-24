@@ -103,85 +103,103 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 	if (meta) {
 		ft_set_parent_slot(meta, new_parent, slot);
 		field = &meta->parent;
-	} else {
+	} else if (ft->ordered_list) {
 		/*
-		 * External head (the ordered list is on whenever a batch
-		 * exists): its parent lives in the cell carried by node->prev.
+		 * External head, ordered list ON: its parent lives in the cell
+		 * carried by node->prev.
 		 */
 		field = &ft_ord_cell_ptr(
 			((struct cds_ft_node *) child)->prev)->parent;
+	} else {
+		/*
+		 * External head, ordered list OFF: there is no cell -- the
+		 * parent is stored directly in node->prev (see ft_set_parent's
+		 * external branch, which rcu_assigns prev = parent).  Re-parent
+		 * that field, matching the immediate ft_set_parent the non-parked
+		 * path would have done.
+		 */
+		field = (struct cds_ft_inode_flag **)
+			&((struct cds_ft_node *) child)->prev;
 	}
 	ft_flip_txn_record_reserved(txn, (void **) field, *field, new_parent);
 }
 
 /*
- * One-commit insert tail (see struct ft_insert_commit): the structural slot
- * already holds a parked flip proxy (the fresh head is invisible -- the proxy
- * resolves to the old slot value), and the head's parent chain is fully wired,
- * so the splice-position search runs exactly as the post-publish splice did
- * (the from-head seed walks the parent chain, never the parked slot).  Park
- * the <= 4 ordered-list neighbour edges into the SAME batch, commit once --
- * the head becomes reachable in the structural index AND spliced into the
- * cell list atomically for every reader -- then settle all slots to their
- * direct values and finalize the real top's parent bookkeeping (skip_slot,
- * incoming_byte).
+ * One-commit insert tail (see struct ft_insert_commit): the structural slot is
+ * recorded as a txn edge (the fresh head is invisible -- the slot still reads
+ * its old value), and the head's parent chain is fully wired, so the
+ * splice-position search runs exactly as the post-publish splice did (the
+ * from-head seed walks the parent chain, never the recorded slot).
+ *
+ * Ordered list ON (@cell != NULL): park the <= 4 ordered-list neighbour edges
+ * into the SAME txn, commit once -- the head becomes reachable in the structural
+ * index AND spliced into the cell list atomically for every reader.  Ordered
+ * list OFF (@cell == NULL): there is no cell to splice; the txn carries only the
+ * structural edges (the slot publish recorded at the publish site, plus any
+ * split-compressed live re-parent), and the single commit below makes that
+ * structural publish atomic and freeze-before-install all the same.  Either way
+ * it then settles all slots to their direct values; the real top's writer-only
+ * wiring (parent, slot offset, incoming_byte) was done at record time.
  */
 static
 void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, struct ft_ord_cell *cell,
 		struct ft_insert_commit *ic)
 {
-	struct ft_ord_cell *pred, *succ;
-	struct ft_ord_cell_edge edges[4];
-	unsigned int i, n = 0;
 	bool gp;
 
-	/*
-	 * Locate the predecessor.  From-HEAD (seed at the fresh head, walk the
-	 * live parent chain up) is the fast default and the only safe choice for
-	 * the attach shapes: a from-root LT would descend through the attach's own
-	 * mid-build re-parent edge and loop in the reanchor.  Two shapes need
-	 * from-ROOT instead, and neither loops there:
-	 *   - split-compressed (ic->live_child): the deferred live edge is parked,
-	 *     so a from-head LT would reanchor through the not-yet-wired edge; the
-	 *     old compressed node is intact, so from-root descends it cleanly.
-	 *   - external_nodes prefix key (!ic->publish_to_parent): the head sits at
-	 *     an internal node's external_nodes and sorts BEFORE its extensions, so
-	 *     a from-head seed mis-locates it; from-root descends only live nodes
-	 *     (the parked external_nodes resolves to "no head"), no live re-parent.
-	 * TODO(perf): the from-root cases re-descend; revisit if they show up hot.
-	 */
-	pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
-		ic->live_child != NULL || !ic->publish_to_parent);
-	if (pred)
-		succ = ft_ord_cell_resolve_ord(&pred->ord_next);
-	else
-		/* New minimum: successor is the old list head (O(1), no descent). */
-		succ = ft_ord_cell_resolve_ord(&ft->ord_cell_head);
-	/* Pre-set @cell's own links; not yet reachable via the list. */
-	cell->ord_prev = pred;
-	cell->ord_next = succ;
-	if (pred) {
-		edges[n].slot = &pred->ord_next;
-		edges[n].old_target = succ;
-		edges[n].new_target = cell;
-		n++;
+	if (cell) {
+		struct ft_ord_cell *pred, *succ;
+		struct ft_ord_cell_edge edges[4];
+		unsigned int i, n = 0;
+
+		/*
+		 * Locate the predecessor.  From-HEAD (seed at the fresh head, walk the
+		 * live parent chain up) is the fast default and the only safe choice for
+		 * the attach shapes: a from-root LT would descend through the attach's own
+		 * mid-build re-parent edge and loop in the reanchor.  Two shapes need
+		 * from-ROOT instead, and neither loops there:
+		 *   - split-compressed (ic->live_child): the deferred live edge is parked,
+		 *     so a from-head LT would reanchor through the not-yet-wired edge; the
+		 *     old compressed node is intact, so from-root descends it cleanly.
+		 *   - external_nodes prefix key (!ic->publish_to_parent): the head sits at
+		 *     an internal node's external_nodes and sorts BEFORE its extensions, so
+		 *     a from-head seed mis-locates it; from-root descends only live nodes
+		 *     (the parked external_nodes resolves to "no head"), no live re-parent.
+		 * TODO(perf): the from-root cases re-descend; revisit if they show up hot.
+		 */
+		pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
+			ic->live_child != NULL || !ic->publish_to_parent);
+		if (pred)
+			succ = ft_ord_cell_resolve_ord(&pred->ord_next);
+		else
+			/* New minimum: successor is the old list head (O(1), no descent). */
+			succ = ft_ord_cell_resolve_ord(&ft->ord_cell_head);
+		/* Pre-set @cell's own links; not yet reachable via the list. */
+		cell->ord_prev = pred;
+		cell->ord_next = succ;
+		if (pred) {
+			edges[n].slot = &pred->ord_next;
+			edges[n].old_target = succ;
+			edges[n].new_target = cell;
+			n++;
+		}
+		if (succ) {
+			edges[n].slot = &succ->ord_prev;
+			edges[n].old_target = pred;
+			edges[n].new_target = cell;
+			n++;
+		}
+		/* New min (!pred) => head was @succ; new max (!succ) => tail was @pred. */
+		n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, succ, cell, edges, n);
+		n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, pred, cell, edges, n);
+		/* Record the ordered-list edges (freeze-before-install; each resolves
+		 * to OLD until the commit installs + flips). */
+		for (i = 0; i < n; i++)
+			ft_flip_txn_record_reserved(ic->txn, (void **) edges[i].slot,
+				(void *) edges[i].old_target,
+				(void *) edges[i].new_target);
 	}
-	if (succ) {
-		edges[n].slot = &succ->ord_prev;
-		edges[n].old_target = pred;
-		edges[n].new_target = cell;
-		n++;
-	}
-	/* New min (!pred) => head was @succ; new max (!succ) => tail was @pred. */
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, succ, cell, edges, n);
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, pred, cell, edges, n);
-	/* Record the ordered-list edges (freeze-before-install; each resolves
-	 * to OLD until the commit installs + flips). */
-	for (i = 0; i < n; i++)
-		ft_flip_txn_record_reserved(ic->txn, (void **) edges[i].slot,
-			(void *) edges[i].old_target,
-			(void *) edges[i].new_target);
 
 	/*
 	 * Record the deferred LIVE re-parent edge (split-compressed shapes) into
@@ -253,18 +271,22 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 
 /*
  * Arm the one-commit txn just before a fresh-head publish (fallible; the
- * caller's error unwind runs with nothing published).  No-op when the ordered
- * list is off or no @ic is threaded (insert_replace, bulk builders).  Returns
- * 0, or -ENOMEM.
+ * caller's error unwind runs with nothing published).  No-op when no @ic is
+ * threaded (bulk builders).  Armed for BOTH ordered-list states: the structural
+ * slot publish commits through the txn either way (freeze-before-install, MCAS
+ * Invariant-1); with the list on it additionally carries the cell-splice edges,
+ * with the list off it carries only the structural edges (and insert_done
+ * commits it with @cell == NULL).  Returns 0, or -ENOMEM.
  */
 static
 int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic)
 {
-	if (!ic || !ft->ordered_list)
+	(void) ft;
+	if (!ic)
 		return 0;
 	/*
 	 * Forward publish (<=2: the slot store + a compressed parent's skip-slot
-	 * dual) + <=4 cell neighbour edges + the live re-parent edge.
+	 * dual) + <=4 cell neighbour edges (list-on) + the live re-parent edge.
 	 */
 	ic->txn = ft_flip_txn_create_bounded(7);
 	if (!ic->txn)
@@ -1147,9 +1169,12 @@ int ft_attach_node(struct cds_ft *ft,
 				(const void *) iter_node_flag);
 		} else {
 			/*
-			 * Direct publish (ordered list off, or no one-commit
-			 * txn): store the fresh top into key_value's slot
-			 * straight away; set_nth wires its parent back-pointer.
+			 * No one-commit txn (no @ic, or arm failed): store the
+			 * fresh top into key_value's slot straight away; set_nth
+			 * wires its parent back-pointer.  (Both ordered-list
+			 * states arm a txn now, so the armed branch above is the
+			 * normal insert path; this is the bulk-builder / OOM
+			 * fallback.)
 			 */
 			ret = ft_node_set_nth(ft, &iter_dest_node_flag,
 				key_value, iter_node_flag, &old_recompacted_node,
@@ -1844,8 +1869,28 @@ insert_done:
 	 * -EINVAL forever.
 	 */
 	if (!ft->ordered_list) {
-		if (ret != 0)
+		if (ret != 0) {
 			node->prev = NULL;
+			if (ic.txn)
+				urcu_flip_txn_destroy(ic.txn);
+		} else if (ic.slot) {
+			/*
+			 * One-commit: the structural slot publish was recorded
+			 * into ic.txn (the key is invisible -- the slot reads
+			 * its old value).  No cell to splice (list off), so
+			 * commit the structural edges alone (@cell == NULL); a
+			 * reader flips from not-present to the new key
+			 * atomically.  Count propagation follows the commit.
+			 */
+			ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
+			ft_propagate_external_count_parent(ft,
+				ic.count_from ? ic.count_from : *d.pnfp, 1);
+		} else if (ic.txn) {
+			/* Armed but nothing parked (duplicate append): no
+			 * structural publish to commit. */
+			urcu_flip_txn_destroy(ic.txn);
+			ic.txn = NULL;
+		}
 	} else {
 		if (ret != 0) {
 			node->prev = NULL;
@@ -2243,8 +2288,26 @@ insert_replace_done:
 	 * retry does not hit the zeroed-prev entry check (see _cds_ft_insert).
 	 */
 	if (!ft->ordered_list) {
-		if (ret != 0)
+		if (ret != 0) {
 			node->prev = NULL;
+			if (ic.txn)
+				urcu_flip_txn_destroy(ic.txn);
+		} else if (ic.slot) {
+			/*
+			 * One-commit (list off): commit the recorded structural
+			 * publish alone (@cell == NULL), then propagate the
+			 * count.  A pure replace does not park (ic.slot unset)
+			 * and falls through untouched.
+			 */
+			ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
+			ft_propagate_external_count_parent(ft,
+				ic.count_from ? ic.count_from : *d.pnfp, 1);
+		} else if (ic.txn) {
+			/* Armed but nothing parked (duplicate append): no
+			 * structural publish to commit. */
+			urcu_flip_txn_destroy(ic.txn);
+			ic.txn = NULL;
+		}
 	} else {
 		if (ret != 0) {
 			node->prev = NULL;
