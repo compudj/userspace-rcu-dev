@@ -1,9 +1,11 @@
-# Transactional flip-latch — design notes (DRAFT, 2026-06-22)
+# Transactional flip-latch — design notes (2026-06-22, implemented through 2026-06-24)
 
-Status: DESIGN / not implemented. Successor to the cross-view fusion + graft_swap
-work. This revision replaces the original sketch with a concrete **state-machine**
-design for a growable, abortable multi-edge transaction, worked out to the point a
-prototype can build to it.
+Status: IMPLEMENTED. The `urcu_flip_txn` primitive (state machine below) is built,
+and EVERY FT mutation commit now rides it — `ft_flip_batch` is retired. The
+sections from "All bulk ops unified" onward record what landed; the final two
+sections record the lock-free (MCAS) direction this serves and the one remaining
+rework (the merge spine-copy interleave) that is designed but not yet implemented.
+The original design body below (§§1–12) is kept as the rationale of record.
 
 Related: the generic latch core in `src/urcu-flip-latch.h`; the current per-op
 machinery in `src/fractal-trie/ft-mutation-helpers.h` (`ft_flip_batch`,
@@ -654,3 +656,76 @@ Validated: 4 feature configs (default / no-skip / no-compress / both) unit
 252 / flip_latch 18 / inv 51 0-violations; VAM-targeted (period 1) on the
 merge/graft unit shapes + graft oracles; ASAN clean (no leaks); 20x cross-view
 stress on the spine-copy / graft-store / rekey oracles.
+
+### Every mutation on `urcu_flip_txn`; `ft_flip_batch` retired (2026-06-24)
+
+The two remaining mutation commits on the bespoke `ft_flip_batch` -- the
+ordered-cell point ops and the insert one-commit -- moved to `urcu_flip_txn`,
+and `ft_flip_batch` (struct + `ft_flip_proxy` + alloc / add / reclaim /
+free_unpublished) was deleted.  Every FT mutation commit now expresses its edge
+set through the one `urcu_flip_txn` descriptor.
+
+To keep the point paths' single allocation, the txn gained a single-allocation
+bounded mode (`urcu_flip_txn_create_bounded`: header + an inline head chunk in
+one malloc; a `head_inline` flag so destroy frees it with the header).  The
+ordered-cell point-op flip (`ft_ord_cell_flip`) records its `<=4` edges and
+commits; a lone edge takes the bare-store fast path.  The insert one-commit
+(`ft_insert_one_commit`) maps its three forward-publish shapes onto the txn: the
+set_nth branch via `urcu_flip_txn_reserve_slot`/`bind_slot` (the slot the
+recompact-capable `ft_node_set_nth` relocates), the `external_nodes` prefix-key
+publish via a plain record, and the publish-to-parent shape via
+`_ft_publish_to_parent(&rec)` capture-then-record -- so the compressed-parent
+skip-slot dual now flips ATOMICALLY with the forward edge instead of just after
+it.  The live re-parent edge and the `<=4` ordered-list neighbour edges record
+into the same txn.  Insert/remove perf A/B (list-on, 1 writer, -O2 -DNDEBUG) was
+neutral (+0.3%).
+
+### Lock-free (MCAS) direction and the one remaining rework (2026-06-24)
+
+The motivation for unifying every mutation onto `urcu_flip_txn` is that the
+flip-latch is a *single-writer* MCAS: the same `{slot, old, new}` descriptor; the
+install is plain stores of a tagged proxy plus one selector flip (safe only
+because the app holds the writer mutex), where a true MCAS would CAS each slot
+`old -> descriptor` in sorted address order, flip a status word, and retry on
+contention.  The reader side (RCU + descriptor resolution) is nearly identical.
+So once every mutation is a descriptor, swapping the commit *body* for an MCAS
+gives **multi-producer lock-free writers** as one localized change.
+
+MCAS adds a hard constraint: **install in sorted address order** (deadlock-free
+acquisition) -> the edge set must be **frozen before install**; *no append after
+install*.  Every FT mutation commit obeys this today EXCEPT one: the
+`cds_ft_merge_at` spine-copy ordered-list interleave (`ft_merge_ord_interleave_
+collect`).  Its iterator *advances* via parent pointers (up-walk), which the
+merged structure's back-edges have not set pre-commit, so it installs the
+structural proxies, walks the merged view (`ft_tls_resolve_merged` makes a staged
+proxy resolve to merged), then *appends* the cell edges -- the one forbidden
+append-after-install, and the `urcu_flip_txn` INSTALLED-state append exists only
+to serve it.
+
+**Planned rework (designed, not yet implemented).** Enumerate the merged-region
+heads in key order WITHOUT installed proxies, by a two-pointer key-order MERGE of
+the two already-sorted LIVE cell runs: the dst region (`ms_cursor` .. D's max
+head, via `ord_next`) and the surviving src run (`ms_s_first .. ms_s_last`).  Both
+share the merge-point prefix, so they merge by comparing key SUFFIXES below it
+(`ft_rebuild_key_upwalk` then slice `[dst_key_len..]` / `[src_key_len..]` -- the
+offsets differ for a variable-length merge); an equal-suffix step is a collision
+(the dst head wins, its chain already absorbed the src head, and the src head is
+dropped).  The existing cursor-block / survivor-block / trailing-edge splice
+logic is reused verbatim, just driven by the suffix compare instead of the
+structural walk.  Then the spine-copy drops the `urcu_flip_txn_install` +
+`ft_tls_resolve_merged` dance and records the cell edges in PREPARE; the
+`urcu_flip_txn` INSTALLED-state append can finally be deleted.
+
+The one wrinkle: the collect runs AFTER `ft_merge_unlink_src_subtree` detaches S,
+and that detach does not reliably NULL S-root's parent, so a src head's up-walk
+could run past S into stale src structure.  Capture the src-head SUFFIXES BEFORE
+the unlink (while S is fully attached -- a fallible pre-pass, sized `cnt_src`,
+before the last fallible step), then merge those against the LIVE dst suffixes
+(D stays intact until the flip) at the post-unlink collect.
+
+A merge-interleave defect is an intermittent cross-view race that the suite may
+not catch deterministically, so the rework wants a hard gate: VAM (period 1) on
+the merge tests + the merge cross-view oracles (`inv_merge_spinecopy_cross_view`,
+`inv_merge_src_spinecopy_cross_view`, `inv_merge_cross_view`) at high repetition
++ ASAN, with the LTTng flight-recorder ready for any smell.  Identity key_map
+only (the existing collect constraint).
