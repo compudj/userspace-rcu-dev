@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	51
+#define NR_TESTS	52
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -1462,6 +1462,206 @@ static int inv_insert_replace_splice_window(void)
 	}
 	return drain_and_destroy(ft, group);
 }
+
+/*
+ * SKIP_X-suffix variant of inv_insert_replace_splice_window.  Keys are SPARSE
+ * (idx << 16) so every leaf hangs off a len-2 compressed suffix node
+ * ([0x00,0x00]) reached from its grandparent via a SKIP_X pointer.  A concurrent
+ * cds_ft_insert_replace at such a leaf drives the DUAL forward publish --
+ * cn->child (read by the exact descent) AND the grandparent SKIP_X slot (read by
+ * the candidate descent), both naming the leaf -- which is now fused with the
+ * head cell swap into ONE flip (ft_ord_cell_swap_publish_multi; the 2-edge
+ * ft_ord_cell_flip when the ordered list is off).  A reader must never observe
+ * cn->child and the skip target name different heads mid-replace, nor follow a
+ * stale skip target into the freed old leaf.  The dense-key
+ * inv_insert_replace_splice_window never forms the SKIP_X-at-leaf shape, so this
+ * is the only invariant that drives the dual fusion concurrently.  Run also
+ * under FT_INV_NO_ORDERED_LIST to cover the list-off 2-edge flip.
+ */
+#define INV_SKIPX_KEY(idx)	((uint64_t)(idx) << 16)
+
+static void *inv_skipx_replace_reader(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+	unsigned long checks = 0;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = INV_SKIPX_KEY(rand_r(&seed) % WRITER_POOL_SIZE);
+		uint8_t k[8];
+		enum cds_ft_status s;
+
+		cds_ft_u64_to_key(ctx->ft, key, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(ctx->ft, iter) == CDS_FT_STATUS_OK &&
+				cds_ft_iter_node(iter)) {
+			s = cds_ft_next(ctx->ft, iter);
+			if (s == CDS_FT_STATUS_NOT_FOUND) {
+				/*
+				 * The sentinel (max key) is never removed, so
+				 * every pool key has a successor.
+				 */
+				report_violation(ctx->test_name,
+					"next after exact lookup of %" PRIu64
+					" reported end-of-traversal (sentinel present)",
+					key);
+			}
+		}
+		rcu_read_unlock();
+
+		checks++;
+		if ((checks & 0x3ff) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_skipx_replace_writer(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = INV_SKIPX_KEY(rand_r(&seed) % WRITER_POOL_SIZE);
+		int do_insert = rand_r(&seed) & 1;
+
+		rcu_read_lock();
+		if (do_insert) {
+			struct ft_test_node *n = node_alloc(key);
+			struct cds_ft_node *old = NULL;
+
+			pthread_mutex_lock(&ctx->lock);
+			/* Replace at an existing key drives the dual publish. */
+			if (insert_replace_u64(ctx->ft, key, n, &old) >= 0) {
+				if (old)
+					node_free_rcu(to_test_node(old));
+			}
+			pthread_mutex_unlock(&ctx->lock);
+		} else {
+			struct cds_ft_node *found;
+			uint8_t k[8];
+
+			cds_ft_u64_to_key(ctx->ft, key, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(ctx->ft, iter);
+			found = cds_ft_iter_node(iter);
+			if (found) {
+				struct ft_test_node *tn = to_test_node(found);
+
+				pthread_mutex_lock(&ctx->lock);
+				if (cds_ft_remove(ctx->ft, iter, &tn->node)
+				    == CDS_FT_STATUS_OK) {
+					node_free_rcu(tn);
+				}
+				pthread_mutex_unlock(&ctx->lock);
+			}
+		}
+		rcu_read_unlock();
+
+		if ((seed & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_insert_replace_skipx_splice_window(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct inv_lookup_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_insert_replace_skipx_splice_window";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	/* The permanent sentinel: the maximum key, never removed. */
+	rcu_read_lock();
+	{
+		struct ft_test_node *n = node_alloc(0xffffffffull);
+
+		if (insert_u64(ft, 0xffffffffull, n) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	/* Pre-populate half the writer pool with SPARSE keys (SKIP_X leaves). */
+	for (i = 0; i < WRITER_POOL_SIZE / 2; i++) {
+		struct ft_test_node *n = node_alloc(INV_SKIPX_KEY(i));
+		insert_u64(ft, INV_SKIPX_KEY(i), n);
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_skipx_replace_reader, &ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL,
+			inv_skipx_replace_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_insert_replace_skipx_splice_window: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+#undef INV_SKIPX_KEY
 
 /*
  * INVARIANT: a key's removal is atomic across the structural index and the
@@ -9468,6 +9668,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_lookup_consistency);
 	RUN_TEST(inv_insert_splice_window);
 	RUN_TEST(inv_insert_replace_splice_window);
+	RUN_TEST(inv_insert_replace_skipx_splice_window);
 	/*
 	 * Remove cross-view oracles: a key-disappearing remove must leave the
 	 * structural index and the ordered cell list in ONE flip, else a reader
