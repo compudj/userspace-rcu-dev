@@ -669,38 +669,25 @@ void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 }
 
 /*
- * Replace: swap @new_cell into @old_cell's list slot AND publish the new head
- * (@struct_new replaces @struct_old in @struct_slot) in ONE ft_ord_cell_flip, so
- * the tree-head swap and the ordinal-cell swap commit atomically -- a reader
- * observes the old head WITH its old cell, XOR the new head WITH its new cell,
- * never a published new head whose cell links are not yet swapped.
- *
- * @struct_slot is the SINGLE reader-visible slot the descent reads to reach the
- * head: external_nodes (internal chain), the child slot (plain external child),
- * or the grandparent SKIP_X slot (a leaf reached through a suffix compressed
- * node).  Readers resolve a parked proxy on all three (ft_dereference_external /
- * the descent's ft_resolve_flip_proxy).  Non-reader-visible bookkeeping for the
- * SKIP_X case (cn->child, node->parent) is set by the caller before the flip --
- * the reanchor up-walk never reads cn->child, and node->parent is wired first.
+ * Append @old_cell -> @new_cell's in-place list-slot swap edges (its <=2
+ * neighbour back-edges plus any head/tail endpoint repair) to @edges, returning
+ * the new count.  The cell keeps its list POSITION; only its identity moves, so
+ * @new_cell inherits @old_cell's resolved predecessor/successor.  Split out of
+ * ft_ord_cell_swap_publish so a replace that touches a SECOND reader-visible
+ * structural slot (a compressed head's cn->child forward edge + the grandparent
+ * SKIP_X dual) can fuse both structural edges with the cell swap in one flip
+ * (ft_ord_cell_swap_publish_multi).
  */
 static
-void ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
-		struct ft_ord_cell *new_cell,
-		struct cds_ft_inode_flag **struct_slot,
-		struct cds_ft_inode_flag *struct_old,
-		struct cds_ft_inode_flag *struct_new)
+unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
+		struct ft_ord_cell *old_cell, struct ft_ord_cell *new_cell,
+		struct ft_ord_cell_edge *edges, unsigned int n)
 {
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->ord_prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->ord_next);
-	struct ft_ord_cell_edge edges[5];
-	unsigned int n = 0;
 
 	new_cell->ord_prev = pred;
 	new_cell->ord_next = succ;
-	edges[n].slot = (struct ft_ord_cell **) struct_slot;
-	edges[n].old_target = (struct ft_ord_cell *) struct_old;
-	edges[n].new_target = (struct ft_ord_cell *) struct_new;
-	n++;
 	if (pred) {
 		edges[n].slot = &pred->ord_next;
 		edges[n].old_target = old_cell;
@@ -715,6 +702,64 @@ void ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	}
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, old_cell, new_cell, edges, n);
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, old_cell, new_cell, edges, n);
+	return n;
+}
+
+/*
+ * Replace: swap @new_cell into @old_cell's list slot AND publish the new head
+ * (@struct_new replaces @struct_old in @struct_slot) in ONE ft_ord_cell_flip, so
+ * the tree-head swap and the ordinal-cell swap commit atomically -- a reader
+ * observes the old head WITH its old cell, XOR the new head WITH its new cell,
+ * never a published new head whose cell links are not yet swapped.
+ *
+ * @struct_slot is the SINGLE reader-visible slot the descent reads to reach the
+ * head: external_nodes (internal chain) or a plain external child slot.  Readers
+ * resolve a parked proxy on it (ft_dereference_external / the descent's
+ * ft_resolve_flip_proxy).  A leaf reached through a SKIP_X suffix touches TWO
+ * reader-visible slots (cn->child + grandparent skip) and uses the multi-edge
+ * variant ft_ord_cell_swap_publish_multi instead.
+ */
+static
+void ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
+		struct ft_ord_cell *new_cell,
+		struct cds_ft_inode_flag **struct_slot,
+		struct cds_ft_inode_flag *struct_old,
+		struct cds_ft_inode_flag *struct_new)
+{
+	struct ft_ord_cell_edge edges[5];
+	unsigned int n = 0;
+
+	edges[n].slot = (struct ft_ord_cell **) struct_slot;
+	edges[n].old_target = (struct ft_ord_cell *) struct_old;
+	edges[n].new_target = (struct ft_ord_cell *) struct_new;
+	n++;
+	n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, n);
+	ft_ord_cell_flip(ft, edges, n);
+}
+
+/*
+ * Replace touching up to 2 reader-visible structural slots, fused with the head
+ * cell's in-place swap in ONE flip: the multi-structural-edge analog of
+ * ft_ord_cell_swap_publish (and the swap-dual of ft_remove_commit_rec).  Used by
+ * the ordered-list-on external-leaf replace reached through a SKIP_X suffix,
+ * where the new head must appear atomically at BOTH the exact-descent forward
+ * slot (cn->child) AND the candidate-descent grandparent SKIP_X slot -- a reader
+ * never sees the two disagree.  @sedges holds @n_sedge (1..2) structural edges;
+ * @old_cell/@new_cell may be NULL (then only the structural edges flip, as the
+ * list-off caller does by flipping @sedges directly).
+ */
+static
+void ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
+		struct ft_ord_cell *old_cell, struct ft_ord_cell *new_cell,
+		const struct ft_ord_cell_edge *sedges, unsigned int n_sedge)
+{
+	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 cell */
+	unsigned int n = 0, i;
+
+	for (i = 0; i < n_sedge; i++)
+		edges[n++] = sedges[i];
+	if (new_cell)
+		n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, n);
 	ft_ord_cell_flip(ft, edges, n);
 }
 

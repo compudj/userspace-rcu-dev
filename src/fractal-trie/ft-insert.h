@@ -2267,20 +2267,28 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			node->next = NULL;
 			{
 				/*
-				 * Atomic replace: publish the new head into its single
-				 * reader-visible slot.  That slot is d.nfp (plain external
-				 * child, or a plainly-reached compressed parent's
-				 * cn->child) or, for a leaf reached through a SKIP_X
-				 * suffix, the grandparent skip slot (re-encoded for @node,
-				 * with cn->child set here -- the reanchor up-walk never
-				 * reads it, node->parent is already cn = d.pnf).  Mirrors
-				 * ft_publish_to_parent's stores.  This rslot model is shared
-				 * by both ordered-list states.
+				 * Atomic replace: publish the new head into every
+				 * reader-visible slot in ONE flip.  The plain case is a
+				 * single forward edge at d.nfp (a plain external child, or
+				 * a plainly-reached compressed parent's cn->child).  A leaf
+				 * reached through a SKIP_X suffix is a DUAL: the exact
+				 * descent reads cn->child while the candidate descent reads
+				 * the grandparent skip slot, and BOTH name the leaf -- so
+				 * the new head must appear at both atomically or a reader
+				 * sees them disagree (and the old leaf is freed after this).
+				 * Recording cn->child as a second flip edge (not a separate
+				 * bare store) fuses the pair, mirroring the remove
+				 * external-promote dual (ft_remove_commit_rec).  This sedge
+				 * model is shared by both ordered-list states; the cell swap
+				 * rides the same flip when the list is on.
 				 */
-				struct cds_ft_inode_flag **rslot = d.nfp;
-				struct cds_ft_inode_flag *rold = d.nf;
-				struct cds_ft_inode_flag *rnew =
-					(struct cds_ft_inode_flag *) node;
+				struct ft_ord_cell_edge sedges[2];
+				unsigned int n_sedge = 0;
+
+				sedges[0].slot = (struct ft_ord_cell **) d.nfp;
+				sedges[0].old_target = (struct ft_ord_cell *) d.nf;
+				sedges[0].new_target = (struct ft_ord_cell *) node;
+				n_sedge = 1;
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				if (ft_node_compressed(d.pnf)) {
@@ -2293,39 +2301,44 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						ft_get_parent_slot(cn_meta, ft);
 
 					if (sslot && ft_node_skip_compressed(*sslot)) {
-						rcu_assign_pointer(cn->child,
-							(struct cds_ft_inode_flag *)
-								node);
-						rslot = sslot;
-						rold = *sslot;
-						rnew = ft_skip_compressed_flag(
-							(struct cds_ft_inode_flag *)
-								node, cn->len);
+						/* edge 0: grandparent SKIP_X dual. */
+						sedges[0].slot =
+							(struct ft_ord_cell **) sslot;
+						sedges[0].old_target =
+							(struct ft_ord_cell *) *sslot;
+						sedges[0].new_target =
+							(struct ft_ord_cell *)
+							ft_skip_compressed_flag(
+								(struct cds_ft_inode_flag *)
+									node, cn->len);
+						/* edge 1: cn->child forward (exact descent). */
+						sedges[1].slot =
+							(struct ft_ord_cell **) &cn->child;
+						sedges[1].old_target =
+							(struct ft_ord_cell *) cn->child;
+						sedges[1].new_target =
+							(struct ft_ord_cell *) node;
+						n_sedge = 2;
 					}
 				}
 #endif
 				if (ft->ordered_list) {
-					/* Swap the structural slot AND the head's cell
-					 * in one flip. */
+					/* Swap the structural slot(s) AND the head's
+					 * cell in one flip. */
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr((*old_node_ret)->prev);
 
-					ft_ord_cell_swap_publish(ft, old_cell, precell,
-						rslot, rold, rnew);
+					ft_ord_cell_swap_publish_multi(ft, old_cell,
+						precell, sedges, n_sedge);
 					ft_ord_cell_free(ft, old_cell);
 				} else {
 					/*
-					 * List off: no cell.  Commit the single
-					 * structural edge as a 1-edge flip -- a lone
-					 * release store, infallible and MCAS-expressible.
+					 * List off: no cell.  Commit the 1-2 structural
+					 * edges as a flip -- a lone edge reduces to a
+					 * single release store, infallible and
+					 * MCAS-expressible.
 					 */
-					struct ft_ord_cell_edge edge = {
-						.slot = (struct ft_ord_cell **) rslot,
-						.old_target = (struct ft_ord_cell *) rold,
-						.new_target = (struct ft_ord_cell *) rnew,
-					};
-
-					ft_ord_cell_flip(ft, &edge, 1);
+					ft_ord_cell_flip(ft, sedges, n_sedge);
 				}
 			}
 			ret = 0;
