@@ -561,8 +561,33 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		assert(slot);
 		ft_set_parent(ft, st->attached, st->dest, slot);
 		ft_glue_apply_deferred(ft, st->glue);
-		ft_publish_to_parent(ft, st->publish_pmeta->parent, st->pnfp,
-			st->dest);
+		if (st->old_recompacted_node) {
+			struct ft_pub_rec rec = { .n = 0 };
+			unsigned int k;
+
+			/*
+			 * The reserve recompacted (relocated) the dst attach node:
+			 * fold its grandparent re-point (and a compressed
+			 * grandparent's SKIP_X dual) into glue->txn -- pre-reserved
+			 * before the build, so no allocation here -- so the
+			 * relocation flips ATOMICALLY with the grafted slot edge and
+			 * the run-splice in the single commit below.  The src drain
+			 * does not cover dst, and the old dst node stays resolved-to
+			 * via the parked grandparent proxy until the commit (freed
+			 * below, after it).
+			 */
+			_ft_publish_to_parent(ft, st->publish_pmeta->parent,
+				st->pnfp, st->dest, &rec);
+			for (k = 0; k < rec.n; k++)
+				ft_flip_txn_record_reserved(st->glue->txn,
+					(void **) rec.slot[k],
+					(void *) rec.old_val[k],
+					(void *) rec.new_val[k]);
+		} else {
+			/* In-place reserve: a redundant same-value republish. */
+			ft_publish_to_parent(ft, st->publish_pmeta->parent,
+				st->pnfp, st->dest);
+		}
 		/*
 		 * Record the slot edge against the FINAL slot (now that the
 		 * recompact-relocated address is known): NULL -> slot_value, so
