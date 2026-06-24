@@ -2,9 +2,10 @@
 
 Status: IMPLEMENTED. The `urcu_flip_txn` primitive (state machine below) is built,
 and EVERY FT mutation commit now rides it — `ft_flip_batch` is retired. The
-sections from "All bulk ops unified" onward record what landed; the final two
-sections record the lock-free (MCAS) direction this serves and the one remaining
-rework (the merge spine-copy interleave) that is designed but not yet implemented.
+sections from "All bulk ops unified" onward record what landed; the final
+sections record the lock-free (MCAS) direction this serves and the merge
+spine-copy interleave rework (the last append-after-install), now DONE — the txn
+is freeze-before-install everywhere and its INSTALLED-state append is deleted.
 The original design body below (§§1–12) is kept as the rationale of record.
 
 Related: the generic latch core in `src/urcu-flip-latch.h`; the current per-op
@@ -693,39 +694,63 @@ gives **multi-producer lock-free writers** as one localized change.
 
 MCAS adds a hard constraint: **install in sorted address order** (deadlock-free
 acquisition) -> the edge set must be **frozen before install**; *no append after
-install*.  Every FT mutation commit obeys this today EXCEPT one: the
-`cds_ft_merge_at` spine-copy ordered-list interleave (`ft_merge_ord_interleave_
-collect`).  Its iterator *advances* via parent pointers (up-walk), which the
-merged structure's back-edges have not set pre-commit, so it installs the
-structural proxies, walks the merged view (`ft_tls_resolve_merged` makes a staged
-proxy resolve to merged), then *appends* the cell edges -- the one forbidden
-append-after-install, and the `urcu_flip_txn` INSTALLED-state append exists only
-to serve it.
+install*.  Every FT mutation commit now obeys this.  The last exception -- the
+`cds_ft_merge_at` spine-copy ordered-list interleave -- was reworked on 2026-06-24
+(below), and the `urcu_flip_txn` INSTALLED-state append, which existed only to
+serve it, was deleted.
 
-**Planned rework (designed, not yet implemented).** Enumerate the merged-region
-heads in key order WITHOUT installed proxies, by a two-pointer key-order MERGE of
-the two already-sorted LIVE cell runs: the dst region (`ms_cursor` .. D's max
-head, via `ord_next`) and the surviving src run (`ms_s_first .. ms_s_last`).  Both
-share the merge-point prefix, so they merge by comparing key SUFFIXES below it
-(`ft_rebuild_key_upwalk` then slice `[dst_key_len..]` / `[src_key_len..]` -- the
-offsets differ for a variable-length merge); an equal-suffix step is a collision
-(the dst head wins, its chain already absorbed the src head, and the src head is
-dropped).  The existing cursor-block / survivor-block / trailing-edge splice
-logic is reused verbatim, just driven by the suffix compare instead of the
-structural walk.  Then the spine-copy drops the `urcu_flip_txn_install` +
-`ft_tls_resolve_merged` dance and records the cell edges in PREPARE; the
-`urcu_flip_txn` INSTALLED-state append can finally be deleted.
+### The merge spine-copy interleave: two-pointer suffix merge (2026-06-24)
+
+The interleave (`ft_merge_ord_interleave_collect`) re-homes the surviving source
+cells into dst's ordered list.  It used to *append after install*: it installed
+the structural proxies, set `ft_tls_resolve_merged` so an up-walk over the staged
+structure resolved to the merged view, walked that merged structure with the
+inequality oracle to enumerate the heads in key order, then recorded the cell
+edges while INSTALLED.  Its iterator could only advance via the merged
+back-edges, which were not set pre-commit -- hence the install-first dance.
+
+It now reconstructs the merged ORDER WITHOUT any installed proxy, by a two-pointer
+key-order MERGE of the two already-sorted LIVE cell runs:
+  - the dst region (`ms_cursor` .. D's max head, walked via `ord_next`), up-walked
+    LIVE over the still-intact D (`ft_rebuild_key_upwalk`), suffix =
+    `full_key[dst_key_len..]`;
+  - the surviving src run (`ms_s_first .. ms_s_last`), each carrying its key
+    suffix `full_key[src_key_len..]`.
+
+Both share the merge-point prefix, so they merge by comparing the suffixes (an
+equal-suffix step is a collision: the dst head wins, its chain already absorbs
+the src head via `ft_glue_apply_splices`, so the src head is dropped -- a floating
+duplicate, never a distinct reachable head).  The cursor-block / survivor-block /
+trailing-edge splice logic is reused verbatim, driven by the suffix compare
+instead of the structural walk.  The cell edges are recorded into the txn in
+PREPARE; commit auto-installs.  `ft_tls_resolve_merged` is gone.
 
 The one wrinkle: the collect runs AFTER `ft_merge_unlink_src_subtree` detaches S,
-and that detach does not reliably NULL S-root's parent, so a src head's up-walk
-could run past S into stale src structure.  Capture the src-head SUFFIXES BEFORE
-the unlink (while S is fully attached -- a fallible pre-pass, sized `cnt_src`,
-before the last fallible step), then merge those against the LIVE dst suffixes
-(D stays intact until the flip) at the post-unlink collect.
+and that detach does not reliably NULL S-root's parent, so a post-unlink src
+up-walk could run past S into stale src structure.  The src-head suffixes are
+therefore CAPTURED BEFORE the unlink (a fallible pre-pass while S is fully
+attached -- the run is bounded by `cnt_src`; the variable-length suffix bytes
+pack into a realloc-growable pool addressed by offset, since a byte pointer would
+dangle across the realloc), then merged against the LIVE dst suffixes (D stays
+intact until the flip) at the post-unlink collect.  Identity key_map only (the
+existing collect constraint).
 
-A merge-interleave defect is an intermittent cross-view race that the suite may
-not catch deterministically, so the rework wants a hard gate: VAM (period 1) on
-the merge tests + the merge cross-view oracles (`inv_merge_spinecopy_cross_view`,
-`inv_merge_src_spinecopy_cross_view`, `inv_merge_cross_view`) at high repetition
-+ ASAN, with the LTTng flight-recorder ready for any smell.  Identity key_map
-only (the existing collect constraint).
+With the append gone, `urcu_flip_txn` is a single-chunk transaction: `record()`
+is valid only in PREPARE (asserts it), the chunk realloc-grows while nothing is
+installed, and `install` / `commit` / `abort` / `destroy` operate on the one head
+chunk -- the `next` / `tail` / fixed-`CHUNKN` append machinery was removed.  One
+subtlety surfaced by that removal: the single-allocation bounded txn embeds its
+chunk at `t + 1`, and the chunk's `latches[]` are `aligned(16)`, so the header's
+size must be a multiple of 16 (else the compiler's aligned vector moves on a
+misaligned latch fault).  This was holding only because the field count happened
+to sum to 64; it is now made explicit with `aligned(16)` on `struct
+urcu_flip_txn`.
+
+A merge-interleave defect is an intermittent cross-view race the suite may not
+catch deterministically, so the rework was gated hard (all GREEN): 4 feature
+configs (default / NO_SKIP / NO_COMPRESS / both) ft_unit + flip_latch + ft_inv
+(0 violations); VAM (period 1) on the ordered-list merge shapes + the merge
+cross-view oracles (`inv_merge_spinecopy_cross_view`,
+`inv_merge_src_spinecopy_cross_view`, `inv_merge_cross_view`, `_src_cross_view`,
+`_root_src_cross_view`) at 8x; those oracles + the atomicity / no-escape oracles
+at 20x; ASAN clean (no leak / overflow / use-after-free).
