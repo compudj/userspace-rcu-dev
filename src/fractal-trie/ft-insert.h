@@ -1085,8 +1085,6 @@ int ft_attach_node(struct cds_ft *ft,
 	/* Publish branch. */
 	{
 		uint8_t key_value;
-		struct cds_ft_inode_flag *slot_child = iter_node_flag;
-		struct urcu_flip_latch *slot_latch = NULL;
 
 		key_value = *(--iter_key);
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
@@ -1094,54 +1092,72 @@ int ft_attach_node(struct cds_ft *ft,
 		ret = ft_insert_commit_arm(ft, ic);
 		if (ret)
 			goto check_error;
-		if (ic && ic->txn) {
-			/*
-			 * One-commit insert: reserve a txn slot proxy and hand it
-			 * to set_nth (which may recompact + relocate the slot).
-			 * It resolves to the OLD slot value (the displaced
-			 * external, or NULL) until insert_done commits it together
-			 * with the ordered-list edges, so the fresh key stays
-			 * invisible here.  set_nth skips proxy children (see
-			 * ft_set_parent); the real top's wiring + the slot bind
-			 * follow below, once the final slot is known.
-			 */
-			slot_child = (struct cds_ft_inode_flag *)
-				urcu_flip_txn_reserve_slot(ic->txn,
-					old_node_flag, iter_node_flag,
-					&slot_latch);
-		}
 
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
-		ret = ft_node_set_nth(ft, &iter_dest_node_flag, key_value, slot_child,
-				&old_recompacted_node, metadata, level - 1, false);
-		if (ret) {
-			dbg_printf("branch publish error %d\n", ret);
-			goto check_error;
-		}
 		if (ic && ic->txn) {
 			struct cds_ft_inode_flag **slot_ptr = NULL;
 
 			/*
-			 * Fully wire the real top NOW (parent, slot offset,
-			 * incoming_byte) -- every write lands in the FRESH
-			 * top's own metadata/cell, invisible while the slot
-			 * holds the proxy, and the splice-position search at
-			 * insert_done depends on it (the structural up-walk
-			 * rebuilds the new key through these fields).  A
-			 * recompact replaced the target with a fresh copy (the
-			 * proxy slot rode along; the copied LIVE children were
-			 * re-parented by the recompact sweep, which skips the
-			 * proxy) -- wire against the copy, then bind the latch's
-			 * slot so the commit settles the (relocated) slot.
+			 * One-commit insert (reserved-byte model): occupy
+			 * key_value's slot but leave it resolving to its OLD
+			 * value, then RECORD the slot edge (old -> the fresh
+			 * top) into ic->txn so it settles atomically with the
+			 * ordered-list edges at insert_done.  Nothing foreign is
+			 * stored in the slot during the build -- the fresh key
+			 * stays invisible because the slot still reads its old
+			 * value (NULL for a new byte, or the displaced external).
+			 *
+			 *  - new byte (old_node_flag == NULL): RESERVE it via a
+			 *    set_nth with a NULL child -- sets the bitmap bit and
+			 *    bumps nr_child, leaving a bit-set+NULL slot that
+			 *    reads as not-present, and may recompact + relocate
+			 *    the node (the reserved byte rides along; the edge is
+			 *    recorded against the FINAL slot below).
+			 *  - displaced external (old_node_flag != NULL): the slot
+			 *    already holds it; no set_nth (a NULL store would drop
+			 *    the live external before the commit).
+			 *
+			 * Then fully wire the fresh top NOW (parent, slot offset,
+			 * incoming_byte) -- invisible while the slot reads old --
+			 * so the splice-position search at insert_done can rebuild
+			 * the new key through the parent chain.
 			 */
+			if (!old_node_flag) {
+				ret = ft_node_set_nth(ft, &iter_dest_node_flag,
+					key_value, NULL, &old_recompacted_node,
+					metadata, level - 1, false);
+				if (ret) {
+					dbg_printf("branch publish error %d\n", ret);
+					goto check_error;
+				}
+			}
 			ft_node_get_nth_skip(iter_dest_node_flag, &slot_ptr,
 				key_value, FT_PF_NONE);
 			assert(slot_ptr);
 			ft_set_parent(ft, iter_node_flag, iter_dest_node_flag,
 				slot_ptr);
-			urcu_flip_txn_bind_slot(slot_latch, (void **) slot_ptr);
+			ft_flip_txn_record_reserved(ic->txn, (void **) slot_ptr,
+				(void *) old_node_flag,
+				(void *) iter_node_flag);
 			ic->slot = slot_ptr;
+			FT_TP(tree_edge_set, (const void *) ft,
+				(const void *) iter_dest_node_flag,
+				(unsigned int) (level - 1), (uint8_t) key_value,
+				(const void *) iter_node_flag);
+		} else {
+			/*
+			 * Direct publish (ordered list off, or no one-commit
+			 * txn): store the fresh top into key_value's slot
+			 * straight away; set_nth wires its parent back-pointer.
+			 */
+			ret = ft_node_set_nth(ft, &iter_dest_node_flag,
+				key_value, iter_node_flag, &old_recompacted_node,
+				metadata, level - 1, false);
+			if (ret) {
+				dbg_printf("branch publish error %d\n", ret);
+				goto check_error;
+			}
 		}
 		/*
 		 * Phase 2: iter_node_flag's parent is now wired (by
@@ -1172,8 +1188,10 @@ check_error:
 		 * All goto-check_error paths in this function are before
 		 * ft_publish_to_parent, so created_nodes[] never escaped
 		 * the writer's stack -- immediate-free is safe.  An armed
-		 * one-commit txn never had its proxy stored anywhere visible
-		 * (the final set_nth failed before storing): destroy it.
+		 * one-commit txn has no recorded edges yet (the slot edge is
+		 * recorded only after the last fallible step, the reserve
+		 * set_nth, succeeds; nothing is ever stored in a live slot
+		 * during the build): destroy it.
 		 */
 		if (ic && ic->txn) {
 			urcu_flip_txn_destroy(ic->txn);
