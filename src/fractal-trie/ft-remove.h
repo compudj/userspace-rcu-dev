@@ -115,9 +115,22 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			ft_remove_commit_rec(ft, &rec, fuse_cell, run);
 			pub->armed = true;
 		} else {
-			ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
+			struct ft_pub_rec rec = { .n = 0 };
+
+			/*
+			 * Non-fused external-promote (no cell to unsplice -- list
+			 * off, or fusion not requested / already armed): still route
+			 * the publish through the op flip-txn so the forward slot AND
+			 * a compressed grandparent's SKIP_X dual flip atomically (no
+			 * torn forward/skip window).  A lone edge reduces to a single
+			 * release store in ft_ord_cell_flip, so this stays allocation-
+			 * free and infallible for the common plain-parent case.
+			 */
+			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
-				(struct cds_ft_inode_flag *) topmost_external_nodes);
+				(struct cds_ft_inode_flag *) topmost_external_nodes,
+				&rec);
+			ft_remove_commit_rec(ft, &rec, NULL, NULL);
 		}
 		*nr_clear = 0;
 		return 0;
@@ -137,9 +150,20 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		fresh_meta->parent_slot_offset = src_meta->parent_slot_offset;
 #endif
-		ft_publish_to_parent(ft, src_meta->parent,
-			detach_parent_flag_ptr,
-			ft_node_flag(fresh, 0));
+		{
+			struct ft_pub_rec rec = { .n = 0 };
+
+			/*
+			 * Compressed -> fresh-internal recompaction publish: route
+			 * the forward slot (+ a compressed grandparent's SKIP_X dual)
+			 * through the op flip-txn so they flip atomically; lone edge
+			 * stays a single release store.
+			 */
+			_ft_publish_to_parent(ft, src_meta->parent,
+				detach_parent_flag_ptr,
+				ft_node_flag(fresh, 0), &rec);
+			ft_remove_commit_rec(ft, &rec, NULL, NULL);
+		}
 		free_compressed_node(ft,
 			ft_compressed_node_ptr(iter_node_flag));
 	}
@@ -260,7 +284,20 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 	new_cn_flag = ft_compressed_node_flag(new_cn);
 	ft_set_parent(ft, new_cn->child, new_cn_flag, &new_cn->child);
 	new_cn_flag = ft_publish_compressed(ft, new_cn, new_cn_flag);
-	ft_publish_to_parent(ft, publish_parent, publish_slot, new_cn_flag);
+	{
+		struct ft_pub_rec rec = { .n = 0 };
+
+		/*
+		 * Chain-compress canonicalization publish: the merged compressed
+		 * node replaces the collapsed chain at publish_slot.  Route the
+		 * forward slot (+ a compressed grandparent's SKIP_X dual) through
+		 * the op flip-txn so they flip atomically (no torn forward/skip
+		 * window); a lone edge stays a single release store.
+		 */
+		_ft_publish_to_parent(ft, publish_parent, publish_slot,
+			new_cn_flag, &rec);
+		ft_remove_commit_rec(ft, &rec, NULL, NULL);
+	}
 
 	free_cds_ft_node(ft, ft_node_ptr(iter_node_flag));
 	if (parent_cn)
@@ -864,8 +901,18 @@ int ft_detach_node(struct cds_ft *ft,
 			ft_remove_commit_rec(ft, &rec, fuse_cell, run);
 			pub->armed = true;
 		} else {
-			ft_publish_to_parent(ft, iter_meta->parent,
-				detach_parent_flag_ptr, iter_node_flag);
+			struct ft_pub_rec rec = { .n = 0 };
+
+			/*
+			 * Non-fused recompaction / external-promote / in-place
+			 * redundant republish: route through the op flip-txn so the
+			 * forward slot AND a compressed grandparent's SKIP_X dual flip
+			 * atomically.  A lone edge reduces to a single release store
+			 * in ft_ord_cell_flip (allocation-free, infallible).
+			 */
+			_ft_publish_to_parent(ft, iter_meta->parent,
+				detach_parent_flag_ptr, iter_node_flag, &rec);
+			ft_remove_commit_rec(ft, &rec, NULL, NULL);
 		}
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
