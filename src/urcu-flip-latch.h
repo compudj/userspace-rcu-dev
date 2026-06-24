@@ -167,23 +167,24 @@ void urcu_flip_commit(struct urcu_flip_group *group)
  * group above.  See doc/design/transactional-flip-latch.md.
  *
  *   create --> PREPARE --record--> PREPARE --install--> INSTALLED --commit--> committed
- *                 |                                          |  ^
- *                 | abort (no GP)                            |  | record (append + install)
- *                 v                                          v  |
- *               destroy                                  INSTALLED --abort--> aborted (GP)
+ *                 |                                          |
+ *                 | abort (no GP)                            |
+ *                 v                                          v
+ *               destroy                              INSTALLED --abort--> aborted (GP)
  *
  * In PREPARE, record() appends a latch descriptor {slot, old, new} but installs
- * NOTHING -- no proxy address is live, so the head chunk grows by realloc.
- * install() freezes the head chunk and parks every recorded latch's tagged
- * proxy into its slot (readers still resolve to old; selector == 0).  In
- * INSTALLED, record() appends to a fresh chunk (never moving an installed
- * proxy) and installs immediately.  commit() flips the group then settles every
- * slot to its new value; abort() restores every installed slot to its old value
- * (a no-op in PREPARE).  commit() and a post-install abort() return true ("owe a
- * grace period" -- a reader may hold a proxy), so the embedder defers
- * urcu_flip_txn_free_rcu via its call_rcu; a PREPARE abort returns false and the
- * embedder frees immediately with urcu_flip_txn_destroy.  Fresh nodes are the
- * embedder's; the txn never tracks them.
+ * NOTHING -- no proxy address is live, so the single edge chunk grows by realloc.
+ * record() is valid ONLY in PREPARE: the edge set must be FROZEN before install
+ * (no append after install), which is what a future MCAS commit body needs -- it
+ * acquires the slots in sorted address order, so the set cannot grow once any
+ * proxy is live.  install() freezes the chunk and parks every recorded latch's
+ * tagged proxy into its slot (readers still resolve to old; selector == 0).
+ * commit() flips the group then settles every slot to its new value; abort()
+ * restores every installed slot to its old value (a no-op in PREPARE).  commit()
+ * and a post-install abort() return true ("owe a grace period" -- a reader may
+ * hold a proxy), so the embedder defers urcu_flip_txn_free_rcu via its call_rcu;
+ * a PREPARE abort returns false and the embedder frees immediately with
+ * urcu_flip_txn_destroy.  Fresh nodes are the embedder's; the txn never tracks them.
  *
  * The single embedder hook is @tag: given a recorded proxy, return the tagged
  * pointer value to store in the slot (e.g. set a reserved type code).  The
@@ -201,26 +202,31 @@ struct urcu_flip_latch {
 } __attribute__((aligned(16)));
 
 struct urcu_flip_chunk {
-	struct urcu_flip_chunk *next;
 	unsigned int nr;
 	unsigned int cap;
 	struct urcu_flip_latch latches[];
 };
 
+/*
+ * aligned(16): a bounded txn embeds its head chunk immediately after the header
+ * (at `t + 1`) in one allocation, and that chunk's latches[] are aligned(16).
+ * Forcing the header's size to a multiple of 16 keeps `t + 1` -- hence the
+ * inline latches -- 16-aligned (otherwise the compiler's aligned vector moves on
+ * an aligned(16) latch fault).  Making it explicit avoids depending on the field
+ * count happening to sum to a multiple of 16.
+ */
 struct urcu_flip_txn {
 	struct urcu_flip_group group;
 	struct rcu_head rcu_head;	/* embedder's deferred-free handle */
 	void *(*tag)(struct urcu_flip_proxy *proxy);
 	enum urcu_flip_txn_state state;
-	struct urcu_flip_chunk *head;	/* chunk 0 (realloc in PREPARE) ... */
-	struct urcu_flip_chunk *tail;	/* ... appended fixed chunks */
+	struct urcu_flip_chunk *head;	/* the single edge chunk (realloc-grows in PREPARE) */
 	unsigned int nr;
 	bool placed;			/* a urcu_flip_txn_reserve_slot proxy is live */
 	bool head_inline;		/* head chunk embedded in this allocation */
-};
+} __attribute__((aligned(16)));
 
 #define URCU_FLIP_CHUNK0_CAP	8	/* initial head-chunk capacity */
-#define URCU_FLIP_CHUNKN_CAP	8	/* fixed post-install chunk capacity */
 
 static inline
 struct urcu_flip_chunk *urcu_flip_chunk_alloc(unsigned int cap)
@@ -231,7 +237,6 @@ struct urcu_flip_chunk *urcu_flip_chunk_alloc(unsigned int cap)
 			(size_t) cap * sizeof(struct urcu_flip_latch));
 	if (!c)
 		return NULL;
-	c->next = NULL;
 	c->nr = 0;
 	c->cap = cap;
 	return c;
@@ -249,7 +254,6 @@ struct urcu_flip_txn *urcu_flip_txn_create(void *(*tag)(struct urcu_flip_proxy *
 	t->tag = tag;
 	t->state = URCU_FLIP_TXN_PREPARE;
 	t->head = NULL;
-	t->tail = NULL;
 	t->nr = 0;
 	t->placed = false;
 	t->head_inline = false;
@@ -282,10 +286,9 @@ struct urcu_flip_txn *urcu_flip_txn_create_bounded(
 	t->tag = tag;
 	t->state = URCU_FLIP_TXN_PREPARE;
 	c = (struct urcu_flip_chunk *) (t + 1);
-	c->next = NULL;
 	c->nr = 0;
 	c->cap = cap;
-	t->head = t->tail = c;
+	t->head = c;
 	t->nr = 0;
 	t->placed = false;
 	t->head_inline = true;
@@ -316,27 +319,18 @@ bool urcu_flip_txn_reserve(struct urcu_flip_txn *t, unsigned int cap)
 	c = urcu_flip_chunk_alloc(cap);
 	if (!c)
 		return false;
-	t->head = t->tail = c;
+	t->head = c;
 	return true;
 }
 
-/* Free every chunk and the txn header (no grace period).  A bounded txn's head
- * chunk is embedded in the header allocation, so it is freed with the header,
- * not separately. */
+/* Free the edge chunk and the txn header (no grace period).  A bounded txn's
+ * head chunk is embedded in the header allocation, so it is freed with the
+ * header, not separately. */
 static inline
 void urcu_flip_txn_destroy(struct urcu_flip_txn *t)
 {
-	struct urcu_flip_chunk *inl = t->head_inline ?
-		(struct urcu_flip_chunk *) (t + 1) : NULL;
-	struct urcu_flip_chunk *c = t->head;
-
-	while (c) {
-		struct urcu_flip_chunk *next = c->next;
-
-		if (c != inl)
-			free(c);
-		c = next;
-	}
+	if (t->head && !t->head_inline)
+		free(t->head);
 	free(t);
 }
 
@@ -365,66 +359,45 @@ void urcu_flip_latch_install(struct urcu_flip_txn *t, struct urcu_flip_latch *l)
 
 /*
  * Record one edge {*slot: old -> new}.  Returns false on OOM (the only failure);
- * the caller then aborts.  In PREPARE the head chunk realloc-grows and nothing
- * installs; in INSTALLED a fresh chunk is appended and the proxy installs now.
+ * the caller then aborts.  Valid ONLY in PREPARE: the freeze-before-install model
+ * forbids appending after install (the MCAS sorted-address-acquisition constraint
+ * -- the edge set must be frozen before any proxy goes live), so the txn has a
+ * single chunk that realloc-grows while nothing is installed.
  */
 static inline
 bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
-	struct urcu_flip_chunk *c;
+	struct urcu_flip_chunk *c = t->head;
 	struct urcu_flip_latch *l;
 
-	if (t->state == URCU_FLIP_TXN_PREPARE) {
-		c = t->head;
-		if (!c) {
-			c = urcu_flip_chunk_alloc(URCU_FLIP_CHUNK0_CAP);
-			if (!c)
-				return false;
-			t->head = t->tail = c;
-		} else if (c->nr == c->cap) {
-			unsigned int newcap = c->cap * 2;
-			struct urcu_flip_chunk *nc;
+	urcu_posix_assert(t->state == URCU_FLIP_TXN_PREPARE);
+	if (!c) {
+		c = urcu_flip_chunk_alloc(URCU_FLIP_CHUNK0_CAP);
+		if (!c)
+			return false;
+		t->head = c;
+	} else if (c->nr == c->cap) {
+		unsigned int newcap = c->cap * 2;
+		struct urcu_flip_chunk *nc;
 
-			/*
-			 * A bounded txn's head chunk is embedded in the header
-			 * allocation and sized to the embedder's edge bound, so it
-			 * must never grow -- realloc-ing it would move freed-with-
-			 * the-header memory.  Overflow here is an embedder sizing bug.
-			 */
-			urcu_posix_assert(!t->head_inline);
-			/* No address is live yet -> realloc may move the chunk. */
-			nc = (struct urcu_flip_chunk *) realloc(c, sizeof(*c) +
-				(size_t) newcap * sizeof(struct urcu_flip_latch));
-			if (!nc)
-				return false;
-			nc->cap = newcap;
-			t->head = t->tail = c = nc;
-		}
-		l = &c->latches[c->nr++];
-		urcu_flip_latch_set(t, l, slot, old_ptr, new_ptr);
-		t->nr++;
-		return true;
-	}
-
-	/* INSTALLED: append to a fresh fixed chunk, install immediately. */
-	c = t->tail;
-	if (!c || c->nr == c->cap) {
-		struct urcu_flip_chunk *nc =
-			urcu_flip_chunk_alloc(URCU_FLIP_CHUNKN_CAP);
-
+		/*
+		 * A bounded txn's head chunk is embedded in the header allocation
+		 * and sized to the embedder's edge bound, so it must never grow --
+		 * realloc-ing it would move freed-with-the-header memory.  Overflow
+		 * here is an embedder sizing bug.
+		 */
+		urcu_posix_assert(!t->head_inline);
+		/* No address is live yet -> realloc may move the chunk. */
+		nc = (struct urcu_flip_chunk *) realloc(c, sizeof(*c) +
+			(size_t) newcap * sizeof(struct urcu_flip_latch));
 		if (!nc)
 			return false;
-		if (t->tail)
-			t->tail->next = nc;
-		else
-			t->head = nc;
-		t->tail = nc;
-		c = nc;
+		nc->cap = newcap;
+		t->head = c = nc;
 	}
 	l = &c->latches[c->nr++];
 	urcu_flip_latch_set(t, l, slot, old_ptr, new_ptr);
-	urcu_flip_latch_install(t, l);
 	t->nr++;
 	return true;
 }
@@ -484,11 +457,11 @@ void urcu_flip_txn_bind_slot(struct urcu_flip_latch *l, void **slot)
 static inline
 void urcu_flip_txn_install(struct urcu_flip_txn *t)
 {
-	struct urcu_flip_chunk *c;
+	struct urcu_flip_chunk *c = t->head;
 	unsigned int i;
 
 	t->state = URCU_FLIP_TXN_INSTALLED;
-	for (c = t->head; c; c = c->next)
+	if (c)
 		for (i = 0; i < c->nr; i++)
 			urcu_flip_latch_install(t, &c->latches[i]);
 }
@@ -542,7 +515,8 @@ bool urcu_flip_txn_commit(struct urcu_flip_txn *t)
 	}
 
 	urcu_flip_commit(&t->group);
-	for (c = t->head; c; c = c->next)
+	c = t->head;
+	if (c)
 		for (i = 0; i < c->nr; i++) {
 			struct urcu_flip_latch *l = &c->latches[i];
 
@@ -574,7 +548,8 @@ bool urcu_flip_txn_abort(struct urcu_flip_txn *t)
 
 	if (t->state == URCU_FLIP_TXN_PREPARE && !t->placed)
 		return false;
-	for (c = t->head; c; c = c->next)
+	c = t->head;
+	if (c)
 		for (i = 0; i < c->nr; i++) {
 			struct urcu_flip_latch *l = &c->latches[i];
 
