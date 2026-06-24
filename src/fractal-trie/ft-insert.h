@@ -47,6 +47,14 @@ struct ft_insert_commit {
 	 */
 	struct cds_ft_compressed_node *free_old_cn;
 	/*
+	 * Old internal node replaced by a recompact-relocation forward publish
+	 * folded into the one-commit (ft_attach_node): the parked grandparent
+	 * proxy resolves to it until the commit flips, so its grace-period-
+	 * deferred free must be queued only AFTER the commit, like free_old_cn.
+	 * NULL = no relocation (in-place reserve).
+	 */
+	struct cds_ft_inode *free_old_node;
+	/*
 	 * Deferred LIVE re-parent edge (split-compressed one-commit).  The live
 	 * old child's back-pointer is the back-channel publish that exposes the
 	 * fresh cluster to reanchor up-walkers; for a parked commit the forward
@@ -226,12 +234,15 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 	ft_flip_txn_reclaim(ft, ic->txn, gp);
 	ic->txn = NULL;
 	/*
-	 * The old compressed node a split replaced: readers resolved the
-	 * proxy to it until the commit above, so only now may its grace-
-	 * period-deferred free be queued.
+	 * The old compressed node a split replaced, or the old internal node a
+	 * recompact-relocation publish replaced: readers resolved the parked
+	 * proxy to it until the commit above, so only now may its grace-period-
+	 * deferred free be queued.
 	 */
 	if (ic->free_old_cn)
 		free_compressed_node(ft, ic->free_old_cn);
+	if (ic->free_old_node)
+		free_cds_ft_node(ft, ic->free_old_node);
 }
 
 /*
@@ -288,7 +299,13 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic)
 	 * Forward publish (<=2: the slot store + a compressed parent's skip-slot
 	 * dual) + <=4 cell neighbour edges (list-on) + the live re-parent edge.
 	 */
-	ic->txn = ft_flip_txn_create_bounded(7);
+	/*
+	 * Edge budget: the forward publish (<=2: slot + a compressed parent's
+	 * skip-slot dual) OR -- attach path -- the new key's reserved slot edge
+	 * (1) plus the recompact-relocation grandparent publish (<=2) folded in;
+	 * + <=4 cell neighbour edges (list-on) + the live re-parent edge.
+	 */
+	ic->txn = ft_flip_txn_create_bounded(9);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
@@ -1196,10 +1213,42 @@ int ft_attach_node(struct cds_ft *ft,
 		 * ft_publish_to_parent handles skip pointer update
 		 * if the attach target is a compressed node's child.
 		 */
-		ft_publish_to_parent(ft, attach_node_flag,
-			attach_node_flag_ptr, iter_dest_node_flag);
+		if (ic && ic->txn && iter_dest_node_flag != attach_node_flag) {
+			struct ft_pub_rec rec = { .n = 0 };
+			unsigned int k;
 
-		/* Reclaim safely after unlink. */
+			/*
+			 * One-commit AND the reserve recompacted the attach node:
+			 * the relocation swaps the OLD attach node for the fresh
+			 * copy at its grandparent slot.  Fold that forward edge (and
+			 * a compressed grandparent's SKIP_X dual) into ic->txn so it
+			 * flips ATOMICALLY with the new key's slot edge -- "relocate
+			 * + new key" is one publication.  ic->txn was armed before
+			 * the build, so no allocation (hence no failure) here.  The
+			 * old node stays resolved-to via the parked grandparent proxy
+			 * until the commit, so defer its free past insert_done.
+			 */
+			_ft_publish_to_parent(ft, attach_node_flag,
+				attach_node_flag_ptr, iter_dest_node_flag, &rec);
+			for (k = 0; k < rec.n; k++)
+				ft_flip_txn_record_reserved(ic->txn,
+					(void **) rec.slot[k],
+					(void *) rec.old_val[k],
+					(void *) rec.new_val[k]);
+			ic->free_old_node = old_recompacted_node;
+			old_recompacted_node = NULL;
+		} else {
+			/*
+			 * In-place reserve (dest == attach node: a redundant
+			 * same-value republish), or no one-commit txn (bulk): the
+			 * direct publish handles the skip-slot bookkeeping.
+			 */
+			ft_publish_to_parent(ft, attach_node_flag,
+				attach_node_flag_ptr, iter_dest_node_flag);
+		}
+
+		/* Reclaim safely after unlink (deferred to the commit when the
+		 * relocation was folded into ic->txn above). */
 		if (old_recompacted_node)
 			free_cds_ft_node(ft, old_recompacted_node);
 	}
