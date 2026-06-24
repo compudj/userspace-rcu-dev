@@ -222,7 +222,6 @@ struct urcu_flip_txn {
 	enum urcu_flip_txn_state state;
 	struct urcu_flip_chunk *head;	/* the single edge chunk (realloc-grows in PREPARE) */
 	unsigned int nr;
-	bool placed;			/* a urcu_flip_txn_reserve_slot proxy is live */
 	bool head_inline;		/* head chunk embedded in this allocation */
 } __attribute__((aligned(16)));
 
@@ -255,7 +254,6 @@ struct urcu_flip_txn *urcu_flip_txn_create(void *(*tag)(struct urcu_flip_proxy *
 	t->state = URCU_FLIP_TXN_PREPARE;
 	t->head = NULL;
 	t->nr = 0;
-	t->placed = false;
 	t->head_inline = false;
 	return t;
 }
@@ -290,7 +288,6 @@ struct urcu_flip_txn *urcu_flip_txn_create_bounded(
 	c->cap = cap;
 	t->head = c;
 	t->nr = 0;
-	t->placed = false;
 	t->head_inline = true;
 	return t;
 }
@@ -402,57 +399,6 @@ bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
 	return true;
 }
 
-/*
- * Reserve one slot-flip latch whose target slot is not yet known, and return
- * its tagged proxy for the embedder to place itself.  The txn analogue of an
- * embedder-managed flip-batch "add": use it when the value to flip must be
- * handed to a builder that decides WHERE it lands (e.g. a node insert that may
- * relocate the slot by recompacting), so the proxy is needed BEFORE the slot
- * address exists.  The returned proxy belongs to the txn's group and resolves
- * to @old_ptr until commit; the embedder stores the returned tagged pointer
- * wherever the value ends up, then records the final slot with
- * urcu_flip_txn_bind_slot once known so commit can settle it (and a post-place
- * abort can restore it).  *@latch returns the latch handle for that later bind.
- *
- * Valid ONLY on a txn RESERVED (urcu_flip_txn_reserve) to cover this latch and
- * still in PREPARE: the returned proxy address must stay stable, but an
- * unreserved PREPARE head chunk realloc-grows and would move it.  Asserts the
- * reservation; never reallocates and never installs (there is no slot yet) --
- * subsequent record()s still append into the reserved head chunk without
- * allocating.  Because the placed proxy is immediately reader-visible once the
- * embedder stores it, commit() must flip the group rather than take the
- * single-edge bare-store fast path: @placed records that, so the embedder need
- * not call install() explicitly.  The embedder MUST bind the slot before commit.
- */
-static inline
-void *urcu_flip_txn_reserve_slot(struct urcu_flip_txn *t, void *old_ptr,
-		void *new_ptr, struct urcu_flip_latch **latch)
-{
-	struct urcu_flip_chunk *c = t->head;
-	struct urcu_flip_latch *l;
-
-	urcu_posix_assert(t->state == URCU_FLIP_TXN_PREPARE);
-	urcu_posix_assert(c && c->nr < c->cap);	/* reserved -> stable, no realloc */
-	l = &c->latches[c->nr++];
-	urcu_flip_proxy_init(&l->proxy, &t->group, old_ptr, new_ptr);
-	l->slot = NULL;				/* bound via urcu_flip_txn_bind_slot */
-	t->nr++;
-	t->placed = true;
-	*latch = l;
-	return t->tag(&l->proxy);
-}
-
-/*
- * Bind the target slot of a latch obtained from urcu_flip_txn_reserve_slot,
- * once the embedder knows where it placed the proxy.  commit() then settles
- * @slot to the new target (and a post-place abort() restores it to old).
- */
-static inline
-void urcu_flip_txn_bind_slot(struct urcu_flip_latch *l, void **slot)
-{
-	l->slot = slot;
-}
-
 /* PREPARE -> INSTALLED: park every recorded latch's proxy into its slot. */
 static inline
 void urcu_flip_txn_install(struct urcu_flip_txn *t)
@@ -495,22 +441,18 @@ bool urcu_flip_txn_commit(struct urcu_flip_txn *t)
 
 	if (t->state == URCU_FLIP_TXN_PREPARE) {
 		/*
-		 * The PREPARE shortcuts assume no proxy is live yet.  A
-		 * urcu_flip_txn_reserve_slot proxy IS already live in its slot
-		 * (the embedder placed it), so a reader may hold it: skip the
-		 * shortcuts and flip the group (install re-parks it idempotently).
+		 * Freeze-before-install: nothing is ever stored in a slot until
+		 * install/commit, so no proxy is live in PREPARE and the
+		 * shortcuts always apply.
 		 */
-		if (!t->placed) {
-			if (t->nr == 1) {
-				struct urcu_flip_latch *l = &t->head->latches[0];
+		if (t->nr == 1) {
+			struct urcu_flip_latch *l = &t->head->latches[0];
 
-				uatomic_store(l->slot, l->proxy.ptr[1],
-						CMM_RELEASE);
-				return false;
-			}
-			if (t->nr == 0)
-				return false;	/* empty txn: nothing to do */
+			uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
+			return false;
 		}
+		if (t->nr == 0)
+			return false;	/* empty txn: nothing to do */
 		urcu_flip_txn_install(t);	/* auto-install before the flip */
 	}
 
@@ -526,13 +468,11 @@ bool urcu_flip_txn_commit(struct urcu_flip_txn *t)
 }
 
 /*
- * Abort.  PREPARE with nothing placed: nothing is installed -> returns false
- * (embedder frees immediately, no GP).  INSTALLED, or PREPARE holding a live
- * urcu_flip_txn_reserve_slot proxy: restore each slot to its old value (a reader
- * sees old via the proxy or old direct -- the same view) and return true (the
- * proxy memory still owes a GP).  Either way the embedder frees its fresh nodes.
- * Slots not yet bound (a reserve_slot latch whose placement failed before
- * urcu_flip_txn_bind_slot) hold no proxy and are skipped.
+ * Abort.  PREPARE: nothing is installed (freeze-before-install -- no slot holds
+ * a proxy yet) -> returns false (embedder frees immediately, no GP).  INSTALLED:
+ * restore each slot to its old value (a reader sees old via the proxy or old
+ * direct -- the same view) and return true (the proxy memory still owes a GP).
+ * Either way the embedder frees its fresh nodes.
  *
  * The restore is RELAXED, not release: it moves the slot BACK to ptr[0], a value
  * it already held before this transaction (already published, grace periods
@@ -546,16 +486,14 @@ bool urcu_flip_txn_abort(struct urcu_flip_txn *t)
 	struct urcu_flip_chunk *c;
 	unsigned int i;
 
-	if (t->state == URCU_FLIP_TXN_PREPARE && !t->placed)
+	if (t->state == URCU_FLIP_TXN_PREPARE)
 		return false;
 	c = t->head;
 	if (c)
 		for (i = 0; i < c->nr; i++) {
 			struct urcu_flip_latch *l = &c->latches[i];
 
-			if (l->slot)
-				uatomic_store(l->slot, l->proxy.ptr[0],
-						CMM_RELAXED);
+			uatomic_store(l->slot, l->proxy.ptr[0], CMM_RELAXED);
 		}
 	return true;
 }
