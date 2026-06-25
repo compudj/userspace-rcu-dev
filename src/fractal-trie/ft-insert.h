@@ -1841,8 +1841,23 @@ int _cds_ft_insert(struct cds_ft *ft,
 						metadata, node, &ic);
 					ic.count_from = d.nf;
 				} else {
-					rcu_assign_pointer(
-						metadata->external_nodes, node);
+					/*
+					 * List off: external_nodes is the single
+					 * reader-visible slot (readers resolve via
+					 * ft_dereference_external).  Commit the NEW-key
+					 * publish as a 1-edge flip -- a lone release
+					 * store, infallible and MCAS-expressible --
+					 * instead of a bare store.
+					 */
+					struct ft_ord_cell_edge edge = {
+						.slot = (struct ft_ord_cell **)
+							&metadata->external_nodes,
+						.old_target = NULL,
+						.new_target = (struct ft_ord_cell *)
+							node,
+					};
+
+					ft_ord_cell_flip(ft, &edge, 1);
 					ft_propagate_external_count_parent(ft,
 						d.nf, 1);
 				}
@@ -2251,8 +2266,23 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						metadata, node, &ic);
 					ic.count_from = d.nf;
 				} else {
-					rcu_assign_pointer(
-						metadata->external_nodes, node);
+					/*
+					 * List off: external_nodes is the single
+					 * reader-visible slot (readers resolve via
+					 * ft_dereference_external).  Commit the NEW-key
+					 * publish as a 1-edge flip -- a lone release
+					 * store, infallible and MCAS-expressible --
+					 * instead of a bare store.
+					 */
+					struct ft_ord_cell_edge edge = {
+						.slot = (struct ft_ord_cell **)
+							&metadata->external_nodes,
+						.old_target = NULL,
+						.new_target = (struct ft_ord_cell *)
+							node,
+					};
+
+					ft_ord_cell_flip(ft, &edge, 1);
 					ft_propagate_external_count_parent(ft,
 						d.nf, 1);
 				}
