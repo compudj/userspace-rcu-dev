@@ -816,46 +816,40 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		/*
 		 * Ordered list: dst was empty (checked above), so src's WHOLE
 		 * ordered list becomes dst's.  Cells' internal links are
-		 * unchanged; only the head/tail endpoints transfer.  Fuse each
-		 * side's structural root swap with its list-endpoint transfer in
-		 * ONE flip (ft_root_list_swap_publish), so a reader never sees
-		 * the keys present in one index but absent from the other:
-		 *  - dst (appear): publish src->root AND src's head/tail at once
-		 *    (dst's head/tail were NULL), closing the structure-present /
-		 *    list-empty window.
+		 * unchanged; only the head/tail endpoints transfer.  Fuse BOTH
+		 * sides into ONE cross-trie flip (dst and src share a group, so a
+		 * single epoch flip settles every root/endpoint proxy at once):
+		 *  - dst (appear): src->root AND src's head/tail (dst's were NULL);
 		 *  - src (disappear): retire src->root to a fresh empty root AND
-		 *    clear src's head/tail at once, closing the symmetric
-		 *    structure-empty / list-present window on the drained source.
-		 * The dst side runs first so it captures src's still-live root
-		 * and head/tail before the src side retires them.
+		 *    clear src's head/tail.
+		 * A reader resolves all slots to ONE phase, so it never sees the
+		 * key reachable in BOTH tries (appear done, disappear pending) or
+		 * in NEITHER.  Capture src's live root and endpoints first -- the
+		 * flip overwrites them.  (List off: head/tail are unused; the
+		 * swap reduces to the two lone root edges, MCAS-expressible like
+		 * the list-on path.  Both are root positions with parent == NULL,
+		 * so no internal synchronize_rcu is required.)
 		 */
-		if (dst_ft->group->ordered_list_set) {
-			ft_root_list_swap_publish(dst_ft, &dst_ft->root,
-				dst_ft->root, src_ft->root,
-				NULL, src_ft->ord_cell_head,
-				NULL, src_ft->ord_cell_tail);
-			ft_root_list_swap_publish(src_ft, &src_ft->root,
-				src_ft->root, ft_node_flag(fresh_root, 0),
-				src_ft->ord_cell_head, NULL,
-				src_ft->ord_cell_tail, NULL);
-			/* the src flip above cleared src's head/tail to NULL */
-		} else {
-			/*
-			 * No ordered list: the root pointer is the only
-			 * reader-visible slot per side (and no synchronize_rcu --
-			 * both are root positions with parent == NULL).  Express
-			 * each lone root edge as a single-edge flip descriptor
-			 * (commits as one release store, like a bare
-			 * rcu_assign_pointer) so the swap is MCAS-expressible like
-			 * the list-on path above.  Capture src's root before the
-			 * appear flip, since the disappear flip overwrites it.
-			 */
+		{
+			struct cds_ft_inode_flag *dst_old = dst_ft->root;
 			struct cds_ft_inode_flag *src_root = src_ft->root;
+			struct ft_ord_cell *src_head = src_ft->ord_cell_head;
+			struct ft_ord_cell *src_tail = src_ft->ord_cell_tail;
+			struct ft_root_swap_side appear = {
+				.ft = dst_ft, .slot = &dst_ft->root,
+				.old_root = dst_old, .new_root = src_root,
+				.head_old = NULL, .head_new = src_head,
+				.tail_old = NULL, .tail_new = src_tail,
+			};
+			struct ft_root_swap_side disappear = {
+				.ft = src_ft, .slot = &src_ft->root,
+				.old_root = src_root,
+				.new_root = ft_node_flag(fresh_root, 0),
+				.head_old = src_head, .head_new = NULL,
+				.tail_old = src_tail, .tail_new = NULL,
+			};
 
-			ft_root_edge_flip(dst_ft, &dst_ft->root,
-				dst_ft->root, src_root);
-			ft_root_edge_flip(src_ft, &src_ft->root,
-				src_root, ft_node_flag(fresh_root, 0));
+			ft_root_list_swap_publish_dual(&appear, &disappear);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);
@@ -1357,38 +1351,38 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			dst_ft->group->flavor->update_synchronize_rcu();
 
 		/*
-		 * Swap both roots and (mirroring them) both ordered lists.  Fuse
-		 * EACH side's root swap with its ordered-list head/tail swap into
-		 * ONE flip (ft_root_list_swap_publish), so a reader never sees a
-		 * side's structure already showing the NEW content while its
-		 * ordered-list front is still the OLD -- the root graft_swap
-		 * cross-view window.  Capture the swap root and all four endpoints
-		 * up front: the two flips reference each other's pre-swap values.
+		 * Swap both roots and (mirroring them) both ordered lists, fused
+		 * into ONE cross-trie flip (dst and swap share a group, so a
+		 * single epoch flip settles every root/endpoint proxy at once).
+		 * A reader resolves all slots to ONE phase, so it never sees a
+		 * side's structure showing NEW content while its ordered-list
+		 * front is still OLD (the intra-trie window), nor a key reachable
+		 * in both tries or neither (the cross-trie window).  Capture the
+		 * swap root and all four endpoints up front: the two sides
+		 * reference each other's pre-swap values.  (List off: head/tail
+		 * are unused; the swap reduces to the two lone root edges,
+		 * MCAS-expressible like the list-on path.)
 		 */
-		if (dst_ft->group->ordered_list_set) {
+		{
 			struct cds_ft_inode_flag *swap_root = swap_ft->root;
 			struct ft_ord_cell *dh = dst_ft->ord_cell_head;
 			struct ft_ord_cell *dt = dst_ft->ord_cell_tail;
 			struct ft_ord_cell *sh = swap_ft->ord_cell_head;
 			struct ft_ord_cell *st = swap_ft->ord_cell_tail;
+			struct ft_root_swap_side dst_side = {
+				.ft = dst_ft, .slot = &dst_ft->root,
+				.old_root = tmp, .new_root = swap_root,
+				.head_old = dh, .head_new = sh,
+				.tail_old = dt, .tail_new = st,
+			};
+			struct ft_root_swap_side swap_side = {
+				.ft = swap_ft, .slot = &swap_ft->root,
+				.old_root = swap_root, .new_root = tmp,
+				.head_old = sh, .head_new = dh,
+				.tail_old = st, .tail_new = dt,
+			};
 
-			ft_root_list_swap_publish(dst_ft, &dst_ft->root,
-				tmp, swap_root, dh, sh, dt, st);
-			ft_root_list_swap_publish(swap_ft, &swap_ft->root,
-				swap_root, tmp, sh, dh, st, dt);
-		} else {
-			/*
-			 * No ordered list: each side's root is its only
-			 * reader-visible slot.  Express each lone root edge as a
-			 * single-edge flip descriptor (one release store each, like
-			 * a bare rcu_assign_pointer) so the swap is MCAS-expressible
-			 * like the list-on path.  Capture swap's root before the
-			 * flips, which reference each other's pre-swap values.
-			 */
-			struct cds_ft_inode_flag *swap_root = swap_ft->root;
-
-			ft_root_edge_flip(dst_ft, &dst_ft->root, tmp, swap_root);
-			ft_root_edge_flip(swap_ft, &swap_ft->root, swap_root, tmp);
+			ft_root_list_swap_publish_dual(&dst_side, &swap_side);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);

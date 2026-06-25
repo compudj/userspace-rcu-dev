@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	55
+#define NR_TESTS	56
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -4743,6 +4743,7 @@ static int inv_no_ordered_list_consistency(void)
 
 struct inv_graft_ctx {
 	struct cds_ft *live;
+	struct cds_ft *swap;	/* cross-trie oracle: the second trie, shared */
 	struct cds_ft_group *group;
 	const char *test_name;
 	pthread_mutex_t lock;
@@ -5171,6 +5172,179 @@ static int inv_graft_swap_cross_view(void)
 	cds_ft_destroy(live);
 	cds_ft_group_destroy(group);
 	return 0;
+}
+
+/*
+ * CROSS-TRIE root graft_swap oracle.  The two oracles above check each TRIE's
+ * own structure-vs-ordered-list axis; this checks the axis BETWEEN the two
+ * tries.  A whole-trie graft_swap historically published dst->root and
+ * swap->root in two SEPARATE flips (an ft_root_list_swap_publish per side), so
+ * between them BOTH roots transiently pointed at the same content: a key was
+ * reachable in BOTH tries (the content moved in) or in NEITHER (the content
+ * moved out).  The fix fuses both sides' root (and head/tail) swaps into ONE
+ * cross-trie flip (ft_root_list_swap_publish_dual -- dst and swap share a group,
+ * hence a flip selector), so a reader resolves both roots to ONE phase and a
+ * moved key is in EXACTLY ONE trie.
+ *
+ * Both tries are shared with the readers (ctx->live and ctx->swap).  The writer
+ * ping-pongs graft_swap(live, swap): the content bounces live<->swap with no
+ * drain, maximising windows.  Probe key K is a fixed member of range A (present
+ * in whichever trie currently holds A).  Each reader sandwiches the cross-trie
+ * probe -- live-present, swap-present, live-present -- and flags only when K's
+ * presence in @live is STABLE across the probe (pl1 == pl2): then no full swap
+ * straddled the reads and K must be in exactly one trie.  An unstable presence
+ * is a straddle and is filtered (the window being hunted shows pl1 == pl2 == 0,
+ * ps == 0, i.e. K in NEITHER, within one stable view).
+ */
+static int xtrie_present(struct cds_ft *ft, struct cds_ft_iter *iter,
+		const uint8_t *k, size_t klen)
+{
+	cds_ft_iter_set_key(iter, k, klen);
+	return cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK;
+}
+
+/* Narrow root-store window (each swap is a grace period -> few writer ops); use
+ * more readers than the default to catch it reliably, as inv_detach_root_cross_
+ * view does. */
+#ifndef GRAFT_SWAP_XTRIE_READERS
+#define GRAFT_SWAP_XTRIE_READERS	32
+#endif
+
+static void *inv_graft_swap_xtrie_reader(void *arg)
+{
+	struct inv_graft_ctx *ctx = (struct inv_graft_ctx *) arg;
+	struct cds_ft_iter *it_live, *it_swap;
+	uint8_t k[8] = { 0 };
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->live, &it_live) < 0)
+		abort();
+	if (cds_ft_iter_create(ctx->swap, &it_swap) < 0)
+		abort();
+	cds_ft_u64_to_key(ctx->live, GRAFT_SWAP_RANGE_A_BASE, k, 4);
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		int pl1, ps, pl2;
+
+		rcu_read_lock();
+		pl1 = xtrie_present(ctx->live, it_live, k, 4);
+		ps  = xtrie_present(ctx->swap, it_swap, k, 4);
+		pl2 = xtrie_present(ctx->live, it_live, k, 4);
+		if (pl1 == pl2 && pl1 + ps != 1)
+			report_violation(ctx->test_name,
+				"key reachable in BOTH tries or NEITHER -- the root"
+				" graft_swap published the two roots in separate flips");
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(it_live);
+	cds_ft_iter_destroy(it_swap);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_graft_swap_xtrie_writer(void *arg)
+{
+	struct inv_graft_ctx *ctx = (struct inv_graft_ctx *) arg;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	/* Ping-pong: graft_swap moves live's content into swap, so the next swap
+	 * moves it straight back -- no drain/repopulate, far more windows. */
+	while (!test_stop) {
+		pthread_mutex_lock(&ctx->lock);
+		if (cds_ft_graft_swap(ctx->live, NULL, 0, ctx->swap) != CDS_FT_STATUS_OK)
+			abort();
+		pthread_mutex_unlock(&ctx->lock);
+		rcu_quiescent_state();
+	}
+
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_graft_swap_root_cross_trie(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	struct inv_graft_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[GRAFT_SWAP_XTRIE_READERS], writer;
+	unsigned int i;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(attr, 4) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	populate_range(live, GRAFT_SWAP_RANGE_A_BASE, GRAFT_SWAP_POOL);
+	populate_range(swap, GRAFT_SWAP_RANGE_B_BASE, GRAFT_SWAP_POOL);
+
+	ctx.live = live;
+	ctx.swap = swap;
+	ctx.group = group;
+	ctx.test_name = "inv_graft_swap_root_cross_trie";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < GRAFT_SWAP_XTRIE_READERS; i++)
+		pthread_create(&readers[i], NULL, inv_graft_swap_xtrie_reader, &ctx);
+	pthread_create(&writer, NULL, inv_graft_swap_xtrie_writer, &ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	pthread_join(writer, NULL);
+	for (i = 0; i < GRAFT_SWAP_XTRIE_READERS; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_graft_swap_root_cross_trie: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+	drain_trie_local(live);
+	drain_trie_local(swap);
+	rcu_barrier();
+	cds_ft_destroy(live);
+	cds_ft_destroy(swap);
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 /*
@@ -10139,6 +10313,7 @@ int main(int argc, char **argv)
 	diag("4. Graft-swap atomicity");
 	RUN_TEST(inv_graft_swap_atomicity);
 	RUN_TEST(inv_graft_swap_cross_view);
+	RUN_TEST(inv_graft_swap_root_cross_trie);
 	RUN_TEST(inv_graft_swap_sub_cross_view);
 	RUN_TEST(inv_graft_swap_empty_cross_view);
 
