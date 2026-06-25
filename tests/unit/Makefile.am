@@ -26,6 +26,7 @@ noinst_PROGRAMS = \
 	test_flip_latch \
 	test_flip_latch_lockfree \
 	test_flip_latch_txn \
+	test_flip_latch_txn_grow \
 	test_rcu_bidir_list \
 	test_rcu_bidir_list_concurrent \
 	test_rcu_bidir_list_lockfree \
@@ -64,6 +65,7 @@ TESTS = \
 	test_flip_latch \
 	test_flip_latch_lockfree \
 	test_flip_latch_txn \
+	test_flip_latch_txn_grow \
 	test_rcu_bidir_list \
 	test_rcu_bidir_list_concurrent \
 	test_rcu_bidir_list_lockfree \
@@ -127,6 +129,9 @@ test_flip_latch_lockfree_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_flip_latch_txn_SOURCES = test_flip_latch_txn.c
 test_flip_latch_txn_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_flip_latch_txn_grow_SOURCES = test_flip_latch_txn_grow.c
+test_flip_latch_txn_grow_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_bidir_list_SOURCES = test_rcu_bidir_list.c
 test_rcu_bidir_list_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)

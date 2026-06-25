@@ -16,6 +16,8 @@ tests/unit/test_uatomic
 tests/unit/test_uatomic_cxx
 tests/unit/test_flip_latch
 tests/unit/test_flip_latch_lockfree
+tests/unit/test_flip_latch_txn
+tests/unit/test_flip_latch_txn_grow
 tests/unit/test_rcu_bidir_list
 tests/unit/test_rcu_bidir_list_concurrent
 tests/unit/test_rcu_bidir_list_lockfree
