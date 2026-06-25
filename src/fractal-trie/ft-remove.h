@@ -1263,9 +1263,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * grandparent SKIP_X dual (via _ft_publish_to_parent on cn's
 			 * plain flag) and the cell swap in ONE flip -- so a candidate
 			 * descent or ft_skip_reanchor up-walk never follows the stale
-			 * skip pointer into the about-to-be-freed old head (the
-			 * dangling-skip-slot UAF the standalone ft_update_skip_pointer
-			 * re-encode used to close).
+			 * skip pointer into the about-to-be-freed old head.
 			 */
 			ft_unchain_node(ft, ft_compressed_node_flag(cn),
 				(struct cds_ft_node **) head_slot, node);
@@ -1518,7 +1516,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * head cell's unsplice in ONE flip so a reader never sees the key
 		 * gone from one index but present in the other; readers resolve a
 		 * parked proxy on external_nodes via ft_dereference_external.  List
-		 * off: a plain NULL store, atomic alone.
+		 * off: external_nodes is the single reader-visible slot, so express
+		 * the node -> NULL clear as a 1-edge flip (a lone release store,
+		 * MCAS-expressible) rather than a bare store.
 		 */
 		if (ft->ordered_list) {
 			struct ft_ord_cell *dead = ft_ord_cell_ptr(external_nodes->prev);
@@ -1529,7 +1529,15 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				dead, NULL);
 			ft_ord_cell_free(ft, dead);
 		} else {
-			rcu_assign_pointer(metadata->external_nodes, NULL);
+			struct ft_ord_cell_edge edge = {
+				.slot = (struct ft_ord_cell **)
+					&metadata->external_nodes,
+				.old_target = (struct ft_ord_cell *)
+					external_nodes,
+				.new_target = NULL,
+			};
+
+			ft_ord_cell_flip(ft, &edge, 1);
 		}
 		/* The whole chain has left the trie: tombstone every node. */
 		ft_chain_mark_removed(external_nodes);
@@ -1608,7 +1616,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * but present in the ordered list.  Readers resolve a parked proxy
 		 * on external_nodes via ft_dereference_external; @pub.armed tells
 		 * the deferred-free block below the unsplice already happened.
-		 * List off: a plain NULL store, atomic alone.
+		 * List off: external_nodes is the single reader-visible slot, so
+		 * express the node -> NULL clear as a 1-edge flip (a lone release
+		 * store, MCAS-expressible) rather than a bare store.
 		 */
 		if (ft->ordered_list) {
 			ft_remove_one_commit(ft,
@@ -1617,7 +1627,15 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				dead_cell, NULL);
 			pub.armed = true;
 		} else {
-			rcu_assign_pointer(holder_meta->external_nodes, NULL);
+			struct ft_ord_cell_edge edge = {
+				.slot = (struct ft_ord_cell **)
+					&holder_meta->external_nodes,
+				.old_target = (struct ft_ord_cell *)
+					chain_head,
+				.new_target = NULL,
+			};
+
+			ft_ord_cell_flip(ft, &edge, 1);
 		}
 		ft_chain_mark_removed(chain_head);
 		ret = 0;
