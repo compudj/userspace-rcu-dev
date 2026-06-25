@@ -1391,8 +1391,24 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		 */
 		ft_nr_keys_store(br_meta, 1, CMM_RELAXED);
 	}
-	/* Phase 2: back-channel + forward publish. */
-	ft_publish_external_nodes_prev(ft, branch, (struct cds_ft_node *) cn->child);
+	/*
+	 * Phase 2: park the LIVE displaced-external-head re-parent (the old
+	 * external cn->child's cell->parent / prev -> branch) into the
+	 * one-commit so it flips ATOMICALLY with the forward publish below: a
+	 * reader never sees cn->child re-parented onto branch while the
+	 * grandparent slot still points at cn (or vice versa).  ft_insert_one_
+	 * commit replays it via ft_park_live_parent_edge (which resolves the
+	 * external head's cell->parent / prev).  Direct/bulk fallback (no txn)
+	 * wires it immediately, as before.
+	 */
+	if (ic && ic->txn) {
+		ic->live_child = (struct cds_ft_inode_flag *) cn->child;
+		ic->live_parent = branch;
+		ic->live_slot = NULL;
+	} else {
+		ft_publish_external_nodes_prev(ft, branch,
+			(struct cds_ft_node *) cn->child);
+	}
 	ft_insert_publish_or_park(ft, d->nf, &cn->child, branch, ic);
 	/* One-commit (parked): the +1 follows the commit at insert_done. */
 	if (ic && ic->slot)
