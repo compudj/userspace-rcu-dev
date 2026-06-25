@@ -369,8 +369,84 @@ Cross-trie operations — graft's **src-disappear** side and `cds_ft_merge_at` �
 `synchronize_rcu` **between** the src-unlink and the dst-publish, so a reader can
 only ever progress old -> merged, never observe both or neither. These cannot
 become a single atomic edge-set; the MCAS-ready shape is a documented **two-txn
-protocol**, not an Invariant-1 gap. (This should be confirmed as acceptable for the
-MCAS model rather than treated as a defect to "fix.")
+protocol**, not an Invariant-1 gap.
+
+### 7.1 commit1 is irrevocable; commit2 is restartable, never undone
+
+The structure is `commit1 (src-unlink) -> synchronize_rcu (drain) -> commit2
+(dst-publish)`. The drain is a **reader** temporal invariant (jump-out), so once it
+runs, src-empty has been globally observed and **commit1 can never be rolled back** —
+linearizability forbids un-emptying src after a reader saw it empty. Therefore, past
+commit1 the op can only be **driven forward**, never aborted.
+
+Under multi-writer MCAS this is the decisive constraint: commit2's MCAS can lose its
+CAS to a concurrent writer that reshaped the dst graft point. "Abort commit2" must
+therefore mean **re-plan and retry**, not undo and not give up — commit2 must always
+*eventually* complete. (The existing "no rollback after the src retire" property is
+not a limitation to remove; it is exactly correct for MCAS too.)
+
+What makes unconditional forward progress tractable: **after commit1 + drain the
+payload is an exclusive, op-owned, RCU-live cluster** (the same shape `cds_ft_detach`
+produces). So commit2 is "graft an *exclusive* subtree into dst," whose only
+contended surface is the **single dst boundary edge**. On a conflict (CAS fails, or
+the target was frozen / relocated by a concurrent op), commit2 **re-descends dst
+fresh and retries the boundary MCAS**. Progress holds because the payload can wait
+indefinitely (live, owned, untouchable by others) and dst always admits *some* valid
+landing for the keys.
+
+### 7.2 The crux: reserve capacity from the payload, re-record targets from dst
+
+A restartable commit2 collides with pre-reservation (§3/§6, the
+`urcu_flip_txn` built before commit1 so commit2 cannot OOM): pre-reservation assumes
+the commit2 **edge set is fixed and known before commit1**, but a retry may re-plan
+against a *changed* dst, so the edge *targets* differ per attempt. The resolution is
+to **split reserve from record**:
+
+- **Reserve *capacity* — payload-derived and invariant.** commit2's edge *count* is a
+  function of the payload's **boundary**, not of dst's size or shape: the root-attach
+  edge(s) plus the ordered-run **endpoint** splice edges. The detached cluster is
+  frozen at commit1 (exclusive), so its boundary — hence the worst-case edge count —
+  is fixed the instant commit1 happens. Reserve that worst case before commit1 and
+  commit2 never allocates, across any number of retries.
+- **Re-record *targets* — dst-derived, per attempt.** Each commit2 try re-descends
+  dst and records *which* slot / *which* pred·succ cells into the pre-reserved
+  capacity; a conflict resets and records against the new dst. Targets move; the
+  count does not.
+
+**Keep the bound dst-independent.** A few edges are conditioned on dst (e.g. the
+structural boundary needs the extra SKIP_X dual only when the dst attach parent is
+compressed — a dst property that can flip between retries). So reserve the
+**dst-independent upper bound** (always budget the potential dual and the full
+endpoint splice set); each attempt records `<=` that. Concretely:
+
+```
+commit2_bound(payload) = root_attach (<=2: slot + maybe SKIP_X dual)
+                       + run_splice_endpoints (<=4: pred·next, succ·prev,
+                                                     run_first·prev, run_last·next)
+```
+
+a fixed small cap, computed and reserved at the src retire.
+
+### 7.3 What it needs (both small)
+
+1. **`commit2_bound(payload)`** — the worst-case derivation above, used to size the
+   reserved txn before commit1.
+2. **A reset/re-record txn mode.** Today a `urcu_flip_txn` is *record-once -> freeze
+   -> install* (the freeze before install is deliberate: the sorted-address MCAS
+   needs the edge set frozen once any proxy is live). A restartable commit2 needs
+   *abort-to-PREPARE -> re-record (reusing capacity) -> re-freeze -> re-install*.
+   `urcu_flip_txn_abort` already returns the txn to a clean state; the new piece is
+   "reset-and-reuse-capacity" rather than "abort-and-destroy," and the
+   freeze-before-install invariant still holds **within** each attempt.
+
+### 7.4 Progress level and the optional helping upgrade
+
+As described, commit2 is **obstruction-free across the grace period**: it retries
+until it lands, and RCU writers already block on grace periods, so a bounded wait is
+in-model. For full **lock-freedom** at the dst boundary, publish the pending move as a
+descriptor so a writer colliding there **helps** complete it (idempotently) instead
+of merely losing its CAS. Obstruction-free-with-retry is the recommended initial bar;
+helping is a later refinement, not a correctness prerequisite.
 
 ---
 
@@ -400,5 +476,9 @@ writers inside it (§5.3).
    need neither (§5.2).
 3. **Compaction**: concurrent (pay the freeze) vs brief-exclusive (§6).
 4. **Standing completeness oracle** for Invariant 1 (§2).
-5. Confirm the **two-txn protocol** for the inherently two-commit cross-trie ops
-   (§7) is acceptable for the MCAS model.
+5. ~~Confirm the **two-txn protocol** for the inherently two-commit cross-trie ops
+   (§7) is acceptable for the MCAS model.~~ — **RESOLVED (§7, 2026-06-25):** commit1
+   irrevocable; commit2 a *restartable* boundary MCAS over the exclusive payload —
+   **reserve capacity from the payload (invariant), re-record targets from dst (per
+   retry)**. Needs `commit2_bound(payload)` + a reset/re-record txn mode. Obstruction-
+   free across the GP; descriptor-helping is an optional later lock-freedom upgrade.
