@@ -68,6 +68,24 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct ft_remove_pub *pub,
 		struct ft_detach_run *run)
 {
+	struct urcu_flip_txn *txn;
+
+	/*
+	 * Pre-reserve the publish flip-txn before any side-effect (sub-case 1
+	 * wires the promoted external's parent to cn BEFORE the cn->child publish;
+	 * sub-case 2 allocates the fresh internal).  Both publish into / around a
+	 * compressed node, so the forward edge plus a SKIP_X grandparent dual /
+	 * cell unsplice make the commit multi-edge; reserving here makes the
+	 * single publish below commit through ft_ord_cell_flip_into (infallible),
+	 * so the pre-flip ft_set_parent reaches an allocation-free point of no
+	 * return.  Reservation failure aborts the detach before any side-effect
+	 * (the caller rolls back the count).  This branch is not the remove hot
+	 * path (the plain branch is), so reserving unconditionally -- even for a
+	 * lone-edge publish -- is acceptable.
+	 */
+	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES);
+	if (!txn)
+		return -ENOMEM;
 	if (topmost_external_nodes) {
 		/*
 		 * Keep the compressed node -- its path is needed for
@@ -112,7 +130,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				&rec);
-			ft_remove_commit_rec(ft, &rec, fuse_cell, run, NULL);
+			ft_remove_commit_rec(ft, &rec, fuse_cell, run, txn);
 			pub->armed = true;
 		} else {
 			struct ft_pub_rec rec = { .n = 0 };
@@ -130,7 +148,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				&rec);
-			ft_remove_commit_rec(ft, &rec, NULL, NULL, NULL);
+			ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
 		}
 		*nr_clear = 0;
 		return 0;
@@ -141,8 +159,10 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_metadata *src_meta;
 
 		fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
-		if (!fresh)
+		if (!fresh) {
+			urcu_flip_txn_destroy(txn);	/* unused: no publish */
 			return -ENOMEM;
+		}
 		src_meta = cds_ft_item_to_metadata(
 			(struct cds_ft_inode *) ft_compressed_node_ptr(
 				iter_node_flag));
@@ -162,7 +182,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, src_meta->parent,
 				detach_parent_flag_ptr,
 				ft_node_flag(fresh, 0), &rec);
-			ft_remove_commit_rec(ft, &rec, NULL, NULL, NULL);
+			ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
 		}
 		free_compressed_node(ft,
 			ft_compressed_node_ptr(iter_node_flag));
