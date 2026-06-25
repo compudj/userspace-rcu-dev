@@ -914,6 +914,14 @@ int ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 }
 
 /*
+ * Edges ft_ord_cell_swap_publish_multi commits: <=2 structural (the forward
+ * publish + a compressed parent's SKIP_X dual) + <=4 cell (two neighbour
+ * back-edges + the head/tail endpoint repairs).  A caller that must pre-reserve
+ * its flip-txn sizes it to this.
+ */
+#define FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES	6
+
+/*
  * Replace touching up to 2 reader-visible structural slots, fused with the head
  * cell's in-place swap in ONE flip: the multi-structural-edge analog of
  * ft_ord_cell_swap_publish (and the swap-dual of ft_remove_commit_rec).  Used by
@@ -923,20 +931,37 @@ int ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
  * never sees the two disagree.  @sedges holds @n_sedge (1..2) structural edges;
  * @old_cell/@new_cell may be NULL (then only the structural edges flip, as the
  * list-off caller does by flipping @sedges directly).
+ *
+ * @txn (optional, the pre-reserve-or-grow split): when the caller performs a
+ * LIVE back-pointer plain store BEFORE this flip -- the swapped-in head's prev
+ * (ft_promote_head) or the chain successor's prev (cds_ft_replace) -- that store
+ * must stay SETTLED for a concurrent reader and the SKIP_X resolution
+ * (ft_resolve_head_prev reads a head's prev RAW), so it CANNOT ride the flip;
+ * the caller instead PRE-RESERVES @txn (>= FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES)
+ * in its fallible prefix, before the live store, and the commit here goes through
+ * the infallible ft_ord_cell_flip_into (returns 0).  @txn NULL = the fresh-head
+ * case (no live store precedes the flip, so the flip is the op's sole
+ * side-effect): self-allocate via ft_ord_cell_flip_try, returning 0 or -ENOMEM
+ * with NOTHING applied (abort clean).
  */
 static
-void ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
+int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 		struct ft_ord_cell *old_cell, struct ft_ord_cell *new_cell,
-		const struct ft_ord_cell_edge *sedges, unsigned int n_sedge)
+		const struct ft_ord_cell_edge *sedges, unsigned int n_sedge,
+		struct urcu_flip_txn *txn)
 {
-	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 cell */
+	struct ft_ord_cell_edge edges[FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES];
 	unsigned int n = 0, i;
 
 	for (i = 0; i < n_sedge; i++)
 		edges[n++] = sedges[i];
 	if (new_cell)
 		n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, n);
-	ft_ord_cell_flip(ft, edges, n);
+	if (txn) {
+		ft_ord_cell_flip_into(ft, txn, edges, n);
+		return 0;
+	}
+	return ft_ord_cell_flip_try(ft, edges, n);
 }
 
 /*

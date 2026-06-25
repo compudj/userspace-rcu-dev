@@ -992,11 +992,15 @@ end:
  *
  * @parent_nf is the holder flag used by _ft_publish_to_parent to locate the
  * SKIP_X dual: a compressed node's PLAIN flag for a compressed holder, else the
- * internal holder flag (no dual).  List off (no cell), or a cell-alloc OOM,
- * degrade to the in-place publish (the prior behavior): the structural forward
- * and SKIP_X dual still flip atomically, only cell->node is retargeted in place
- * (transiently breaking write-once under memory pressure -- self-healing, and no
- * proxy is ever parked there).
+ * internal holder flag (no dual).  The list-on promotion is fully abortable: the
+ * fresh-cell alloc AND the flip-txn pre-reservation both fail cleanly on OOM
+ * (-ENOMEM, nothing published, the chain intact and retriable).  @next_node's
+ * prev (its node->cell link) is a SETTLED plain store -- a concurrent skip
+ * resolution reads a head's prev RAW (ft_resolve_head_prev), so it cannot ride
+ * the flip as a parked proxy -- so the flip is made infallible by pre-reserving
+ * its txn BEFORE that store, never a bare in-place cell->node retarget under
+ * memory pressure.  List off (no cell) inherits the flagged parent on the
+ * not-yet-published successor (build-invisible).
  */
 static
 int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
@@ -1013,29 +1017,42 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 	if (old_cell) {
 		/*
 		 * Ordered list on: cell->node is write-once, so head promotion
-		 * publishes a FRESH cell and swaps it in.  Allocate it FIRST,
-		 * before any reader-visible change; on OOM abort here -- nothing
-		 * is published and the chain is untouched, so the caller returns
-		 * CDS_FT_STATUS_MEMORY_ERROR (the promotion may be retried).  No
-		 * bare in-place cell->node retarget on OOM: that would commit a
-		 * reader-visible store outside the descriptor protocol.
+		 * publishes a FRESH cell and swaps it in.  Allocate the cell AND
+		 * pre-reserve the flip-txn FIRST, before any reader-visible change;
+		 * on either OOM abort here -- nothing is published and the chain is
+		 * untouched, so the caller returns CDS_FT_STATUS_MEMORY_ERROR (the
+		 * promotion may be retried).  No bare in-place cell->node retarget
+		 * on OOM: that would commit a reader-visible store outside the
+		 * descriptor protocol.
 		 */
 		void *new_cell_flag = ft_ord_cell_alloc(ft, next_node,
 			old_cell->parent);
 		struct ft_ord_cell *new_cell;
+		struct urcu_flip_txn *txn;
 
 		if (!new_cell_flag)
 			return -ENOMEM;
+		txn = ft_flip_txn_create_bounded(FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES);
+		if (!txn) {
+			ft_ord_cell_free_unpublished(ft,
+				ft_ord_cell_ptr(new_cell_flag));
+			return -ENOMEM;
+		}
 		new_cell = ft_ord_cell_ptr(new_cell_flag);
 		cds_ft_item_to_metadata(new_cell)->incoming_byte =
 			cds_ft_item_to_metadata(old_cell)->incoming_byte;
-		/* Back-pointer wired before the forward publish (parent-first). */
+		/*
+		 * Back-pointer wired before the forward publish (parent-first),
+		 * a SETTLED store (skip resolution reads it raw); the txn is
+		 * already reserved so the commit through it cannot fail.
+		 */
 		next_node->prev = new_cell_flag;
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
-		ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell, sedges, n_s);
+		ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell, sedges,
+			n_s, txn);
 		ft_ord_cell_free(ft, old_cell);
 	} else {
 		/*

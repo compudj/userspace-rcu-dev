@@ -2404,12 +2404,20 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 #endif
 				if (ft->ordered_list) {
 					/* Swap the structural slot(s) AND the head's
-					 * cell in one flip. */
+					 * cell in one flip.  The new head is fresh, so
+					 * the flip is the op's sole side-effect: self-
+					 * allocate (NULL txn); on OOM nothing is applied,
+					 * the old head's cell is NOT freed and the replace
+					 * aborts retriably. */
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr((*old_node_ret)->prev);
 
-					ft_ord_cell_swap_publish_multi(ft, old_cell,
-						precell, sedges, n_sedge);
+					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
+							precell, sedges, n_sedge,
+							NULL) != 0) {
+						ret = -ENOMEM;
+						goto insert_replace_done;
+					}
 					ft_ord_cell_free(ft, old_cell);
 				} else {
 					/*
@@ -2683,36 +2691,63 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 				return s;
 			}
 		}
-		/* Successor repoint (all cases), ordered before the publish. */
+		/* @new_node's successor link is build-invisible (it is fresh). */
 		new_node->next = ft_node_next(old_node);
-		if (new_node->next)
-			new_node->next->prev = new_node;
 		if (!is_head) {
 			/*
 			 * Non-head duplicate: the predecessor->next forward link
 			 * (old_node -> new_node) is the single reader-visible
 			 * publish -> express it as a single-edge flip descriptor.
+			 * The successor's prev back-edge is a plain store ordered
+			 * before that infallible lone-edge flip.
 			 */
+			if (new_node->next)
+				new_node->next->prev = new_node;
 			new_node->prev = old_node->prev;
 			ft_chain_next_flip(ft, (struct cds_ft_node **) pub_slot,
 				old_node, new_node);
 		} else if (old_cell) {
-			/* Head, list on: fresh-cell swap fused with the publish. */
+			/*
+			 * Head, list on: fresh-cell swap fused with the publish.
+			 * The successor's prev is a LIVE settled store (a skip
+			 * resolution reads a head's prev raw, so it cannot ride the
+			 * flip), so make the flip infallible by pre-reserving its
+			 * txn BEFORE that store; on OOM abort with the successor
+			 * untouched and the replace retriable.
+			 */
 			struct ft_ord_cell *new_cell =
 				ft_ord_cell_ptr(new_cell_flag);
+			struct urcu_flip_txn *txn =
+				ft_flip_txn_create_bounded(
+					FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES);
 
+			if (!txn) {
+				new_node->next = NULL;
+				ft_ord_cell_free_unpublished(ft, new_cell);
+				s = CDS_FT_STATUS_MEMORY_ERROR;
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
+			if (new_node->next)
+				new_node->next->prev = new_node;
 			cds_ft_item_to_metadata(new_cell)->incoming_byte =
 				cds_ft_item_to_metadata(old_cell)->incoming_byte;
-			/* Back-pointer wired before the forward publish. */
+			/* Fresh @new_node -> cell: build-invisible. */
 			new_node->prev = new_cell_flag;
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node, &rec);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
-				sedges, n_s);
+				sedges, n_s, txn);
 			ft_ord_cell_free(ft, old_cell);
 		} else {
-			/* Head, list off: no cell; flip the structural + SKIP_X dual. */
+			/*
+			 * Head, list off: no cell; flip the structural + SKIP_X
+			 * dual.  The successor's prev back-edge is a plain store
+			 * ordered before the (still bare-fallback) flip.
+			 */
+			if (new_node->next)
+				new_node->next->prev = new_node;
 			new_node->prev = old_node->prev;
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node, &rec);
