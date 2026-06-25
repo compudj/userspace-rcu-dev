@@ -1004,7 +1004,8 @@ void ft_remove_one_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag *struct_old,
 		struct cds_ft_inode_flag *struct_new,
 		struct ft_ord_cell *dead_cell,
-		struct ft_detach_run *run)
+		struct ft_detach_run *run,
+		struct urcu_flip_txn *txn)
 {
 	struct ft_ord_cell_edge edges[5];	/* 1 structural + <=4 cell/run */
 	unsigned int n = 0;
@@ -1018,7 +1019,18 @@ void ft_remove_one_commit(struct cds_ft *ft,
 			&run->first, &run->last, edges, n);
 	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
-	ft_ord_cell_flip(ft, edges, n);
+	/*
+	 * @txn: when non-NULL, a caller-PRE-RESERVED bounded txn -- the flip
+	 * commits through it (ft_ord_cell_flip_into, infallible) so a caller that
+	 * has already wired a pre-flip side-effect (e.g. metadata->nr_child--)
+	 * reaches an allocation-free point of no return.  NULL keeps the
+	 * transitional self-allocating flip (bare-store fallback) for callers not
+	 * yet migrated.
+	 */
+	if (txn)
+		ft_ord_cell_flip_into(ft, txn, edges, n);
+	else
+		ft_ord_cell_flip(ft, edges, n);
 	if (run) {
 		/* @into NULL = EXCISE-ONLY (the merge source side): the run is
 		 * unlinked from @ft's list but not re-homed; its cells keep their

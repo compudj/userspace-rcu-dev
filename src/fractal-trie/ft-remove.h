@@ -406,6 +406,17 @@ int ft_detach_node(struct cds_ft *ft,
 	struct cds_ft_inode *old_recompacted_node = NULL;
 	int ret, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
 	uint8_t n = 0;
+	/*
+	 * Pre-reserved commit flip-txn for the plain-branch key-removal commit
+	 * (in-place delete OR recompaction publish), reserved before
+	 * ft_node_replace_ptr's pre-flip side-effects (nr_child-- / eager child
+	 * re-parent) when that commit will be multi-edge (a cell unsplice, or a
+	 * compressed-parent SKIP_X dual) -- a lone edge stays the infallible
+	 * on-stack release store.  Consumed by ft_ord_cell_flip_into at whichever
+	 * commit fires; freed at @end if reserved but unused.
+	 */
+	struct urcu_flip_txn *commit_txn = NULL;
+	bool commit_txn_used = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
 	bool prev_external_nodes_found = false;
 	/*
@@ -782,7 +793,28 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 		}
 #endif
-		if (!boundary_fused)
+		if (!boundary_fused) {
+			/*
+			 * Pre-reserve the in-place commit txn BEFORE ft_node_replace_ptr's
+			 * pre-flip metadata->nr_child-- (the pub-armed in-place delete
+			 * commits the deferred slot store fused with the cell unsplice via
+			 * ft_remove_one_commit below).  Reserve only when that commit is
+			 * multi-edge -- a cell unsplice / run is present; an in-place delete
+			 * with neither is a direct lone release store inside
+			 * ft_node_replace_ptr that never reaches ft_remove_one_commit.
+			 * Reservation failure aborts before any side-effect (the upward
+			 * walk is read-only).  If ft_node_replace_ptr recompacts instead
+			 * (no in-place commit), the txn is freed unused at @end -- the
+			 * recompaction publish below stays on the transitional path.
+			 */
+			if (fuse_cell || run) {
+				commit_txn = ft_flip_txn_create_bounded(
+					FT_REMOVE_COMMIT_REC_MAX_EDGES);
+				if (!commit_txn) {
+					ret = -ENOMEM;
+					goto end;
+				}
+			}
 			ret = ft_node_replace_ptr(ft,
 				detach_node_flag_ptr,
 				&iter_node_flag,
@@ -791,6 +823,7 @@ int ft_detach_node(struct cds_ft *ft,
 				n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 				detach_parent_flag_ptr == &ft->root,
 				cur_depth, pub);
+		}
 		if (!ret) {
 			/*
 			 * In-place key-disappearing remove (the holder stayed
@@ -806,7 +839,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (!boundary_fused && pub && pub->armed) {
 				ft_remove_one_commit(ft, pub->slot, pub->old_val,
-					pub->new_val, fuse_cell, run);
+					pub->new_val, fuse_cell, run, commit_txn);
+				commit_txn_used = (commit_txn != NULL);
 				if (pub->pigeon_bitmap)
 					cds_clear_bit_relaxed(
 						pub->pigeon_bitmap->bitmap,
@@ -1088,6 +1122,13 @@ int ft_detach_node(struct cds_ft *ft,
 #endif
 	}
 end:
+	/*
+	 * Free a pre-reserved commit txn that no commit consumed (reservation
+	 * succeeded but ft_node_replace_ptr recompacted / failed, or shape-D
+	 * fused with its own txn).  PREPARE state -> no grace period.
+	 */
+	if (commit_txn && !commit_txn_used)
+		urcu_flip_txn_destroy(commit_txn);
 	/* Reclaim safely after replacement. */
 	if (old_recompacted_node)
 		free_cds_ft_node(ft, old_recompacted_node);
@@ -1529,7 +1570,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) node, NULL,
-						dead_cell, NULL);
+						dead_cell, NULL, NULL);
 					ft_node_mark_removed(node);
 					pub.armed = true;
 					ret = 0;
@@ -1760,7 +1801,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			ft_remove_one_commit(ft,
 				(struct cds_ft_inode_flag **) &metadata->external_nodes,
 				(struct cds_ft_inode_flag *) external_nodes, NULL,
-				dead, NULL);
+				dead, NULL, NULL);
 			ft_ord_cell_free(ft, dead);
 		} else {
 			struct ft_ord_cell_edge edge = {
@@ -1903,7 +1944,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) chain_head, NULL,
-						dead_cell, NULL);
+						dead_cell, NULL, NULL);
 					pub.armed = true;
 				} else {
 					struct ft_ord_cell_edge edge = {
