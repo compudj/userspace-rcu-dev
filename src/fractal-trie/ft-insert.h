@@ -1304,7 +1304,8 @@ check_error:
 }
 
 static
-void ft_chain_node(struct cds_ft_node *last_node, struct cds_ft_node *node)
+void ft_chain_node(struct cds_ft *ft, struct cds_ft_node *last_node,
+		struct cds_ft_node *node)
 {
 	FT_TP(chain_node, (const void *) last_node, (const void *) node);
 	/*
@@ -1314,11 +1315,13 @@ void ft_chain_node(struct cds_ft_node *last_node, struct cds_ft_node *node)
 	 * on the same key. Safe against concurrent RCU read traversals.
 	 *
 	 * The prev pointer is write-side only (mutex-held), so a plain
-	 * store is sufficient.
+	 * store is sufficient.  The forward link is the reader-visible
+	 * publish: express it as a single-edge flip descriptor (a lone
+	 * release store, like rcu_assign_pointer) so it is MCAS-expressible.
 	 */
 	node->prev = last_node;
 	node->next = NULL;
-	rcu_assign_pointer(last_node->next, node);
+	ft_chain_next_flip(ft, &last_node->next, NULL, node);
 }
 
 /*
@@ -1578,7 +1581,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 
 			while (ft_node_next(last))
 				last = ft_node_next(last);
-			ft_chain_node(last, node);
+			ft_chain_node(ft, last, node);
 		}
 		free_compressed_node(ft, ft_compressed_node_ptr(d->nf));
 		return 0;
@@ -1853,7 +1856,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 						d.ppnf, d.pnf, d.nfp, d.nf);
 
 				/* Adding duplicate at existing key: no key count change. */
-				ft_chain_node(last_node, node);
+				ft_chain_node(ft, last_node, node);
 				ret = 0;
 			} else {
 				/* New key at this internal node. */
@@ -1916,7 +1919,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 					d.ppnf, d.pnf, d.nfp, d.nf);
 
 			/* Adding duplicate at existing key: no key count change. */
-			ft_chain_node(last_node, node);
+			ft_chain_node(ft, last_node, node);
 			ret = 0;
 		}
 	} else {
@@ -2674,10 +2677,14 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		if (new_node->next)
 			new_node->next->prev = new_node;
 		if (!is_head) {
-			/* Non-head duplicate: a single predecessor->next store. */
+			/*
+			 * Non-head duplicate: the predecessor->next forward link
+			 * (old_node -> new_node) is the single reader-visible
+			 * publish -> express it as a single-edge flip descriptor.
+			 */
 			new_node->prev = old_node->prev;
-			rcu_assign_pointer(*pub_slot,
-				(struct cds_ft_inode_flag *) new_node);
+			ft_chain_next_flip(ft, (struct cds_ft_node **) pub_slot,
+				old_node, new_node);
 		} else if (old_cell) {
 			/* Head, list on: fresh-cell swap fused with the publish. */
 			struct ft_ord_cell *new_cell =

@@ -335,6 +335,30 @@ void ft_root_edge_flip(struct cds_ft *ft,
 }
 
 /*
+ * Publish a duplicate-chain forward link (@slot transitions @old -> @new) as a
+ * single-edge flip descriptor.  @slot is a LIVE chain node's `next' pointer
+ * (cds_ft_node.next), read by cds_ft_for_each_duplicate_rcu; @new is either a
+ * fully-built leaf being appended (ft_chain_node: NULL -> node) or an
+ * already-published successor a remove relinks past (ft_unchain_node: node ->
+ * next_node).  Neither exposes any build-invisible cluster -- the appended leaf
+ * is complete and the relink target is already reachable -- so a lone-edge flip
+ * (one release store, byte-identical to rcu_assign_pointer) is the right and
+ * sufficient MCAS-expressible form; no fusion with another edge is needed.
+ */
+static
+void ft_chain_next_flip(struct cds_ft *ft, struct cds_ft_node **slot,
+		struct cds_ft_node *old, struct cds_ft_node *new)
+{
+	struct ft_ord_cell_edge edge = {
+		.slot = (struct ft_ord_cell **) slot,
+		.old_target = (struct ft_ord_cell *) old,
+		.new_target = (struct ft_ord_cell *) new,
+	};
+
+	ft_ord_cell_flip(ft, &edge, 1);
+}
+
+/*
  * One side of a two-trie root swap: a root slot transition plus (when the group
  * runs an ordered list) the trie's head/tail endpoint transfer.  The head/tail
  * fields are ignored when the group's ordered list is off.
@@ -2388,7 +2412,10 @@ void ft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
 		while (ft_node_next(tail))
 			tail = ft_node_next(tail);
 		src_head->prev = tail;	/* write-side only, plain store */
-		rcu_assign_pointer(tail->next, src_head);
+		/* @src_head (an already-published src head) becomes a duplicate
+		 * at the tail of @dst_head's chain: the forward link is the
+		 * reader-visible publish -> single-edge flip descriptor. */
+		ft_chain_next_flip(ft, &tail->next, NULL, src_head);
 	}
 }
 

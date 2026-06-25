@@ -1054,7 +1054,13 @@ void ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 
 		if (next_node)
 			next_node->prev = node->prev;
-		rcu_assign_pointer(prev_node->next, next_node);
+		/*
+		 * Relink the chain past @node: prev_node->next transitions from
+		 * @node to its successor.  @next_node is already published, so a
+		 * lone-edge flip (one release store) expresses the reader-visible
+		 * forward link as an MCAS descriptor edge.
+		 */
+		ft_chain_next_flip(ft, &prev_node->next, node, next_node);
 	} else if (next_node) {
 		/*
 		 * Head with a successor: prev is the cell flag (list on) or the
