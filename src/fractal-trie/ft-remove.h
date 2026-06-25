@@ -1377,33 +1377,97 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			/*
 			 * Last entry: the external chain empties, so the prefix
 			 * key disappears (the holder KEEPS its longer-key children
-			 * -- prefix-with-siblings).  When the ordered list is on
-			 * (fuse_remove), commit the external_nodes -> NULL store
-			 * together with @dead_cell's ordered-list unsplice in ONE
-			 * flip (the dual of the in-place leaf delete): a reader
-			 * never sees the key gone from the structural index but
-			 * present in the ordered list.  Readers resolve a parked
-			 * proxy on external_nodes via ft_dereference_external.
-			 * @pub.armed then tells the deferred-free block below the
-			 * unsplice already happened.
+			 * -- prefix-with-siblings).
 			 */
+			bool last_fused = false;
+
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
-			if (fuse_remove) {
-				ft_remove_one_commit(ft,
-					(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
-					(struct cds_ft_inode_flag *) node, NULL,
-					dead_cell, NULL);
-				ft_node_mark_removed(node);
-				pub.armed = true;
-				ret = 0;
-			} else {
-				/* List off: the single store is atomic alone. */
-				ret = ft_unchain_node(ft, holder_flag,
-					(struct cds_ft_node **) &holder_meta->external_nodes,
-					node);
-				if (ret)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * Fuse the chain-compress prune INTO the key-removal
+			 * commit: when the holder is left a non-root 1-child
+			 * no-external internal, its SKIP_COMPRESSED canonical form
+			 * is a merged compressed node, so build that node and let
+			 * it REPLACE the holder -- subsuming the external_nodes ->
+			 * NULL clear -- carrying @dead_cell's unsplice in the SAME
+			 * flip.  No separate clear, no transient non-canonical
+			 * state.  Allocation failure aborts the whole removal (key
+			 * not removed, count rolled back, retriable MEMORY_ERROR).
+			 * The surviving body child is the holder's sole non-NIL
+			 * branch (the external entry being removed is not a body
+			 * child), stable across the removal.
+			 */
+			if (ft_group_skip_compressed(ft->group) &&
+			    holder_meta->nr_child == 1 &&
+			    holder_meta->parent != NULL) {
+				uint8_t s_byte = 0;
+				struct cds_ft_inode_flag *s_child =
+					ft_node_get_minmax(ft, holder_flag,
+						&s_byte, FT_LEFTMOST, false);
+				int cret = ft_chain_compress_fused(ft,
+					holder_flag, holder_meta,
+					ft_get_parent_slot(holder_meta, ft),
+					s_child, s_byte, fuse_cell, NULL);
+
+				if (cret == 0) {
+					ft_node_mark_removed(node);
+					if (fuse_remove)
+						pub.armed = true;
+					ret = 0;
+					last_fused = true;
+				} else if (cret < 0) {
 					ft_propagate_external_count_parent(ft,
 						holder_flag, 1);
+					ret = cret;
+					last_fused = true;
+				}
+				/* cret > 0: merge out of bound -- fall back. */
+			}
+#endif
+			if (!last_fused) {
+				/*
+				 * Non-fused: clear external_nodes -> NULL on its own.
+				 * When the ordered list is on (fuse_remove), commit
+				 * that store together with @dead_cell's unsplice in
+				 * ONE flip (a reader never sees the key gone from the
+				 * structural index but present in the ordered list;
+				 * readers resolve a parked proxy on external_nodes via
+				 * ft_dereference_external).  @pub.armed tells the
+				 * deferred-free block below the unsplice happened.
+				 */
+				if (fuse_remove) {
+					ft_remove_one_commit(ft,
+						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
+						(struct cds_ft_inode_flag *) node, NULL,
+						dead_cell, NULL);
+					ft_node_mark_removed(node);
+					pub.armed = true;
+					ret = 0;
+				} else {
+					/* List off: the single store is atomic alone. */
+					ret = ft_unchain_node(ft, holder_flag,
+						(struct cds_ft_node **) &holder_meta->external_nodes,
+						node);
+					if (ret)
+						ft_propagate_external_count_parent(ft,
+							holder_flag, 1);
+				}
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Out-of-bound residue (the merge above did not apply
+				 * because merged_len exceeds the compressed bound):
+				 * best-effort post-prune via the standalone second
+				 * flip, leaving a 1-child internal if it still cannot
+				 * merge.  Only on a successful unlink.
+				 */
+				if (ret == 0 && ft_group_skip_compressed(ft->group) &&
+				    !holder_meta->external_nodes &&
+				    holder_meta->nr_child == 1 &&
+				    holder_meta->parent != NULL) {
+					ft_canonicalize_chain_compress(ft, holder_flag,
+						holder_meta, ft_get_parent_slot(holder_meta, ft));
+				}
+#endif
 			}
 		} else {
 			/* Duplicates remain: head promotion (fresh-cell swap). */
@@ -1411,24 +1475,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				(struct cds_ft_node **) &holder_meta->external_nodes,
 				node);
 		}
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-		/*
-		 * If the unchain emptied the external chain and the holder now
-		 * has exactly one child + no external, canonicalize via
-		 * chain-compress to restore the SKIP_COMPRESSED invariant (no
-		 * non-root 1-child internal without external).  The holder's own
-		 * slot in its parent is recovered from its metadata offset.
-		 * Only on a successful unlink (a promotion that aborted on OOM
-		 * left the chain unchanged).
-		 */
-		if (ret == 0 && ft_group_skip_compressed(ft->group) &&
-		    !holder_meta->external_nodes &&
-		    holder_meta->nr_child == 1 &&
-		    holder_meta->parent != NULL) {
-			ft_canonicalize_chain_compress(ft, holder_flag,
-				holder_meta, ft_get_parent_slot(holder_meta, ft));
-		}
-#endif
 	} else {
 		/*
 		 * Internal holder, @node is a body child: leaf key.  Recover the
@@ -1707,45 +1753,97 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * skip builds.
 		 */
 		ft_propagate_external_count_parent(ft, holder_flag, -1);
-		/*
-		 * Fuse the external_nodes -> NULL store with the head cell's
-		 * ordered-list unsplice in ONE flip (the ordered list on): a
-		 * reader never sees the prefix key gone from the structural index
-		 * but present in the ordered list.  Readers resolve a parked proxy
-		 * on external_nodes via ft_dereference_external; @pub.armed tells
-		 * the deferred-free block below the unsplice already happened.
-		 * List off: external_nodes is the single reader-visible slot, so
-		 * express the node -> NULL clear as a 1-edge flip (a lone release
-		 * store, MCAS-expressible) rather than a bare store.
-		 */
-		if (ft->ordered_list) {
-			ft_remove_one_commit(ft,
-				(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
-				(struct cds_ft_inode_flag *) chain_head, NULL,
-				dead_cell, NULL);
-			pub.armed = true;
-		} else {
-			struct ft_ord_cell_edge edge = {
-				.slot = (struct ft_ord_cell **)
-					&holder_meta->external_nodes,
-				.old_target = (struct ft_ord_cell *)
-					chain_head,
-				.new_target = NULL,
-			};
-
-			ft_ord_cell_flip_one(&edge);
-		}
-		ft_chain_mark_removed(chain_head);
-		ret = 0;
-		assert(holder_meta->nr_child > 0);
+		{
+			bool prefix_fused = false;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		if (ft_group_skip_compressed(ft->group) &&
-		    holder_meta->nr_child == 1 &&
-		    holder_meta->parent != NULL) {
-			ft_canonicalize_chain_compress(ft, holder_flag,
-				holder_meta, ft_get_parent_slot(holder_meta, ft));
-		}
+			/*
+			 * Fuse the chain-compress prune INTO the key-removal
+			 * commit (see cds_ft_remove): when the holder is left a
+			 * non-root 1-child no-external internal, the merged
+			 * compressed node REPLACES the holder -- subsuming the
+			 * external_nodes -> NULL clear -- and carries @dead_cell's
+			 * unsplice in the SAME flip.  No separate clear, no
+			 * transient non-canonical state.  Allocation failure
+			 * aborts the whole removal (key not removed, count rolled
+			 * back, retriable MEMORY_ERROR with a NULL out-param).
+			 */
+			if (ft_group_skip_compressed(ft->group) &&
+			    holder_meta->nr_child == 1 &&
+			    holder_meta->parent != NULL) {
+				uint8_t s_byte = 0;
+				struct cds_ft_inode_flag *s_child =
+					ft_node_get_minmax(ft, holder_flag,
+						&s_byte, FT_LEFTMOST, false);
+				int cret = ft_chain_compress_fused(ft,
+					holder_flag, holder_meta,
+					ft_get_parent_slot(holder_meta, ft),
+					s_child, s_byte,
+					ft->ordered_list ? dead_cell : NULL,
+					NULL);
+
+				if (cret == 0) {
+					ft_chain_mark_removed(chain_head);
+					if (ft->ordered_list)
+						pub.armed = true;
+					ret = 0;
+					prefix_fused = true;
+				} else if (cret < 0) {
+					ft_propagate_external_count_parent(ft,
+						holder_flag, 1);
+					ret = cret;
+					prefix_fused = true;
+				}
+				/* cret > 0: merge out of bound -- fall back. */
+			}
 #endif
+			if (!prefix_fused) {
+				/*
+				 * Non-fused external_nodes -> NULL clear.  Ordered
+				 * list on: fuse with the head cell's unsplice in ONE
+				 * flip (a reader never sees the prefix key gone from
+				 * the structural index but present in the ordered
+				 * list; readers resolve a parked proxy on
+				 * external_nodes via ft_dereference_external;
+				 * @pub.armed tells the deferred-free block below the
+				 * unsplice happened).  List off: express the node ->
+				 * NULL clear as a 1-edge flip (a lone release store,
+				 * MCAS-expressible) rather than a bare store.
+				 */
+				if (ft->ordered_list) {
+					ft_remove_one_commit(ft,
+						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
+						(struct cds_ft_inode_flag *) chain_head, NULL,
+						dead_cell, NULL);
+					pub.armed = true;
+				} else {
+					struct ft_ord_cell_edge edge = {
+						.slot = (struct ft_ord_cell **)
+							&holder_meta->external_nodes,
+						.old_target = (struct ft_ord_cell *)
+							chain_head,
+						.new_target = NULL,
+					};
+
+					ft_ord_cell_flip_one(&edge);
+				}
+				ft_chain_mark_removed(chain_head);
+				ret = 0;
+				assert(holder_meta->nr_child > 0);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * Out-of-bound residue: best-effort post-prune via
+				 * the standalone second flip (leaves a 1-child
+				 * internal if it still cannot merge).
+				 */
+				if (ft_group_skip_compressed(ft->group) &&
+				    holder_meta->nr_child == 1 &&
+				    holder_meta->parent != NULL) {
+					ft_canonicalize_chain_compress(ft, holder_flag,
+						holder_meta, ft_get_parent_slot(holder_meta, ft));
+				}
+#endif
+			}
+		}
 	} else {
 		/*
 		 * Leaf key: the whole chain sits at head_slot (a body slot, or
