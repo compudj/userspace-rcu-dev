@@ -565,13 +565,39 @@ struct ft_detach_run {
 	bool armed;
 };
 
+/*
+ * Commit @n edges through the caller-PRE-RESERVED txn @t (already sized for at
+ * least @n via ft_flip_txn_create_bounded in the op's fallible build phase):
+ * record every edge (freeze-before-install -- record_reserved cannot fail),
+ * commit (park each proxy, flip the group, settle to the new target -- a lone
+ * edge reduces to a single release store with no proxy / no grace period), then
+ * reclaim the txn (deferred-freed when a proxy is owed).  Infallible -- no
+ * allocation, hence no bare-store fallback.  @t is consumed (do not reuse / free
+ * it).  This is the "pre-reserve always" commit: an op reserves its txn where
+ * failure is clean (the build prefix, before any reader-visible change) and
+ * commits through it here where failure is impossible.
+ */
+static
+void ft_ord_cell_flip_into(struct cds_ft *ft, struct urcu_flip_txn *t,
+		struct ft_ord_cell_edge *edges, unsigned int n)
+{
+	unsigned int i;
+	bool gp;
+
+	for (i = 0; i < n; i++)
+		ft_flip_txn_record_reserved(t, (void **) edges[i].slot,
+			(void *) edges[i].old_target,
+			(void *) edges[i].new_target);
+	gp = urcu_flip_txn_commit(t);
+	ft_flip_txn_reclaim(ft, t, gp);
+}
+
 static
 void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		unsigned int n)
 {
 	struct urcu_flip_txn *t;
 	unsigned int i;
-	bool gp;
 
 	if (n == 0)
 		return;
@@ -606,26 +632,15 @@ void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		 * reader between two stores can observe one neighbour's edge
 		 * updated and the mirrored one not yet -- transient and self-
 		 * healing, never a dangling pointer.  (Lone edges took the
-		 * infallible on-stack path above; this n >= 2 fallback is the
-		 * last bare-store escape hatch, pending the grow-and-abort
-		 * conversion.)
+		 * infallible on-stack path above; this n >= 2 self-allocating
+		 * fallback is the last bare-store escape hatch, being retired as
+		 * callers migrate to a pre-reserved txn + ft_ord_cell_flip_into.)
 		 */
 		for (i = 0; i < n; i++)
 			rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
 		return;
 	}
-	/*
-	 * Record every edge (freeze-before-install), then commit: the txn parks
-	 * each proxy, flips the group, and settles to the direct new target.  A
-	 * lone edge reduces to a single bare release store (no proxy, no grace
-	 * period) -- a single ord-list slot store is atomic on its own.
-	 */
-	for (i = 0; i < n; i++)
-		ft_flip_txn_record_reserved(t, (void **) edges[i].slot,
-			(void *) edges[i].old_target,
-			(void *) edges[i].new_target);
-	gp = urcu_flip_txn_commit(t);
-	ft_flip_txn_reclaim(ft, t, gp);
+	ft_ord_cell_flip_into(ft, t, edges, n);
 }
 
 /*
