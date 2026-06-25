@@ -17,10 +17,13 @@
  * no read-set) but keeps in-bracket reads routed through the handle.  begin/end
  * mark the scope, and only writes are buffered:
  *
+ *     struct urcu_flip_lf_txn_domain domain;   // once, shared per structure
+ *     urcu_flip_lf_txn_domain_init(&domain);
+ *     ...
  *     struct urcu_flip_lf_txn txn;
  *     int ret;
  *
- *     urcu_flip_lf_txn_init(&txn);
+ *     urcu_flip_lf_txn_init(&txn, &domain);    // or NULL: no fallback
  *     do {
  *         urcu_flip_lf_txn_begin(&txn);
  *         succ = urcu_flip_lf_txn_load(&txn, (void **) &pos->next);
@@ -56,9 +59,31 @@
  * later attempts start pre-sized rather than growing into it.  Optional -- store()
  * allocates lazily and grows on its own without it.
  *
- * Wait-free fallback.  A wait-free escalation lane (an exclusive FIFO turn
- * taken once the retry count crosses a threshold) is NOT implemented; the
- * bracket and the retry count are its intended insertion points.
+ * Escalation fallback.  The optimistic retry above is lock-free but not
+ * starvation-free: a large or repeatedly-bypassed transaction can be
+ * defeated by a stream of smaller ones (the single-edge fast path and the
+ * read->install window let a committer change a footprint slot between this
+ * op's read and its install).  When a handle crosses a threshold it
+ * escalates into a per-domain FIFO turnstile (urcu/fifo.h) -- a fair,
+ * lock-free handoff -- and publishes domain->active so every *future*
+ * transaction funnels through the same lane.  That closes the
+ * optimistic-writer set: the escalated op then contends only with the
+ * finite in-flight set (bounded by thread count) and commits within a
+ * bounded number of retries while holding its turn -- progress is
+ * guaranteed with no quiescence (no synchronize_rcu).  The lane only
+ * serializes *who pushes with top priority*; commits still go through the
+ * concurrency-safe MCAS path, so the residual in-flight optimistic writers
+ * stay correct.  Two triggers escalate a handle (both gated on a non-NULL
+ * domain -- NULL never escalates):
+ *   - retry >= URCU_FLIP_LF_TXN_FALLBACK : a starved op, reactively;
+ *   - size  >= URCU_FLIP_LF_TXN_BIG      : a large op, proactively -- a
+ *     reserve(n >= BIG) escalates immediately, before building any nodes,
+ *     and a handle whose realized write-set reached BIG escalates on its
+ *     next attempt.
+ * A handle keeps its turn across aborts (retry in place -- releasing would
+ * forfeit the guaranteed turn) and releases it only on a terminal outcome
+ * (commit, error, or a bail that ends the bracket); the last holder out
+ * clears domain->active and the domain reverts to the optimistic regime.
  *
  * RCU.  The bracket opens an RCU read-side section per attempt, and commit
  * uses the flavor's call_rcu, so include this header AFTER an RCU flavor
@@ -69,6 +94,7 @@
 #include <errno.h>
 
 #include <urcu/compiler.h>
+#include <urcu/fifo.h>
 #include <urcu/flip-latch-lockfree.h>
 
 #ifdef __cplusplus
@@ -86,13 +112,47 @@ extern "C" {
 #endif
 
 /*
+ * Escalation thresholds (override before include).  A handle escalates into the
+ * domain's FIFO lane when its retry count reaches URCU_FLIP_LF_TXN_FALLBACK
+ * (reactive: a starved op) or its write-set size reaches URCU_FLIP_LF_TXN_BIG
+ * (proactive: a large op, e.g. a wide merge).  FALLBACK sits well above the
+ * engine's single-edge URCU_FLIP_LF_ESCALATE so ordinary contention rides the
+ * optimistic path; BIG should sit above typical small-mutation edge counts so
+ * only genuinely large transactions take the lane up front.
+ */
+#ifndef URCU_FLIP_LF_TXN_FALLBACK
+#define URCU_FLIP_LF_TXN_FALLBACK	64
+#endif
+#ifndef URCU_FLIP_LF_TXN_BIG
+#define URCU_FLIP_LF_TXN_BIG		16
+#endif
+
+/*
  * Sticky out-of-memory marker parked in txn->mcas by a failed store: distinct
  * from NULL (no write buffered yet) and from any real descriptor, so commit can
  * tell "nothing to do" from "a store could not allocate".
  */
 #define URCU_FLIP_LF_TXN_ENOMEM	((struct urcu_flip_lf_mcas *) -1L)
 
+/*
+ * Per-contention-domain escalation state, shared by every handle that transacts
+ * the same structure.  Pass &domain to urcu_flip_lf_txn_init(), or NULL to
+ * disable the fallback (pure optimistic retry).
+ */
+struct urcu_flip_lf_txn_domain {
+	struct cds_fifo_turnstile fifo;	/* the fair escalation lane */
+	unsigned long active;		/* a fallback episode is in progress */
+};
+
+static inline
+void urcu_flip_lf_txn_domain_init(struct urcu_flip_lf_txn_domain *d)
+{
+	cds_fifo_turnstile_init(&d->fifo);
+	d->active = 0;
+}
+
 struct urcu_flip_lf_txn {
+	struct urcu_flip_lf_txn_domain *domain;	/* escalation domain, or NULL */
 	unsigned long retry;		/* attempts so far; aging priority for the MCAS */
 	unsigned int min_alloc;		/* floor for the attempt's initial descriptor
 					 * capacity, grown past if exceeded (0 -> INIT
@@ -100,21 +160,78 @@ struct urcu_flip_lf_txn {
 					 * realized size at commit so retries don't re-grow. */
 	struct urcu_flip_lf_mcas *mcas;	/* this attempt's descriptor: NULL (none yet),
 					 * a live descriptor, or the ENOMEM marker */
+	struct cds_fifo_waiter waiter;	/* our node while awaiting the turn */
+	int in_fallback;		/* we currently hold the FIFO turn */
+	int retrying;			/* commit asked retry: keep the turn */
 };
 
 /* Initialize a handle before its retry loop (retry := 0, no reservation). */
 static inline
-void urcu_flip_lf_txn_init(struct urcu_flip_lf_txn *txn)
+void urcu_flip_lf_txn_init(struct urcu_flip_lf_txn *txn,
+		struct urcu_flip_lf_txn_domain *domain)
 {
+	txn->domain = domain;
 	txn->retry = 0;
 	txn->min_alloc = 0;
 	txn->mcas = NULL;
+	txn->in_fallback = 0;
+	txn->retrying = 0;
+}
+
+/*
+ * Take the domain's FIFO turn (blocks until we are the head) and publish that a
+ * fallback episode is in progress, so future transactions funnel into the lane.
+ * Caller must NOT hold the RCU read-side section: cds_fifo_enter may block.
+ */
+static inline
+void urcu_flip_lf_txn__enter_fallback(struct urcu_flip_lf_txn *txn)
+{
+	cds_fifo_enter(&txn->domain->fifo, &txn->waiter);
+	uatomic_store(&txn->domain->active, 1, CMM_RELEASE);
+	txn->in_fallback = 1;
+}
+
+/*
+ * Release the FIFO turn; if we were the last holder, end the episode by
+ * clearing domain->active so new transactions resume the optimistic path.
+ */
+static inline
+void urcu_flip_lf_txn__exit_fallback(struct urcu_flip_lf_txn *txn)
+{
+	if (cds_fifo_exit(&txn->domain->fifo, &txn->waiter))
+		uatomic_store(&txn->domain->active, 0, CMM_RELEASE);
+	txn->in_fallback = 0;
+}
+
+/*
+ * Whether this attempt should escalate into the FIFO lane before opening: a
+ * starved (retry) or already-known large (min_alloc) handle initiates an
+ * episode, and domain->active funnels every other handle into the same lane
+ * for the episode's duration -- that funnelling is what closes the optimistic-
+ * writer set and bounds the escalated op's progress.
+ */
+static inline
+int urcu_flip_lf_txn__want_fallback(struct urcu_flip_lf_txn *txn)
+{
+	return txn->domain && !txn->in_fallback &&
+		(uatomic_load(&txn->domain->active, CMM_ACQUIRE) ||
+		 txn->retry >= URCU_FLIP_LF_TXN_FALLBACK ||
+		 txn->min_alloc >= URCU_FLIP_LF_TXN_BIG);
 }
 
 /* Begin one attempt: clear the write-set and open the RCU read-side section. */
 static inline
 void urcu_flip_lf_txn_begin(struct urcu_flip_lf_txn *txn)
 {
+	txn->retrying = 0;
+	/*
+	 * Escalate before opening the attempt: a starved (retry) or
+	 * already-known large (min_alloc) handle takes its FIFO turn here.
+	 * cds_fifo_enter may block, so it must run outside the RCU read-side
+	 * section.
+	 */
+	if (urcu_flip_lf_txn__want_fallback(txn))
+		urcu_flip_lf_txn__enter_fallback(txn);
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
 	rcu_read_lock();
 }
@@ -135,6 +252,18 @@ int urcu_flip_lf_txn_reserve(struct urcu_flip_lf_txn *txn, unsigned int n)
 	struct urcu_flip_lf_mcas *m;
 
 	txn->min_alloc = n;
+	/*
+	 * A large op declares its size here: escalate immediately, before
+	 * building any nodes, so it never runs a disruptive optimistic
+	 * attempt.  We are inside the bracket's RCU read-side section but have
+	 * read nothing yet, so we can step out around the (possibly blocking)
+	 * FIFO enter and back in.
+	 */
+	if (txn->domain && !txn->in_fallback && n >= URCU_FLIP_LF_TXN_BIG) {
+		rcu_read_unlock();
+		urcu_flip_lf_txn__enter_fallback(txn);
+		rcu_read_lock();
+	}
 	if (caa_unlikely(txn->mcas == URCU_FLIP_LF_TXN_ENOMEM))
 		return -ENOMEM;		/* sticky: an earlier alloc already failed */
 	if (!n)
@@ -239,6 +368,7 @@ int urcu_flip_lf_txn_commit(struct urcu_flip_lf_txn *txn)
 	if (urcu_flip_lf_mcas_commit(m, call_rcu))
 		return 1;
 	txn->retry++;			/* aged for the next attempt */
+	txn->retrying = 1;		/* keep the turn across the retry */
 	return 0;
 }
 
@@ -258,6 +388,13 @@ void urcu_flip_lf_txn_end(struct urcu_flip_lf_txn *txn)
 		urcu_flip_lf_mcas_destroy(m);
 	txn->mcas = NULL;
 	rcu_read_unlock();
+	/*
+	 * Release the FIFO turn on a terminal outcome (commit, error, or a
+	 * bail that ends the bracket).  On a retry (commit returned 0 ->
+	 * retrying) keep the turn and re-attempt as the same head.
+	 */
+	if (txn->in_fallback && !txn->retrying)
+		urcu_flip_lf_txn__exit_fallback(txn);
 }
 
 #ifdef __cplusplus

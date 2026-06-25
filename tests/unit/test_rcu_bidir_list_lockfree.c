@@ -95,7 +95,7 @@ static void sorted_insert(int key)
 	if (!n)
 		abort();
 	n->key = key;
-	urcu_flip_lf_txn_init(&txn);
+	urcu_flip_lf_txn_init(&txn, NULL);
 	do {
 		struct cds_bidir_list_lf_node *prev = &g_head, *succ;
 

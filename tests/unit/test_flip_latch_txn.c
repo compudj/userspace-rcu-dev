@@ -87,7 +87,7 @@ static void *worker(void *arg)
 		rng = xs(rng);
 		k = (int) (rng % NR_WORDS); while (k == i || k == j) k = (k + 1) % NR_WORDS;
 
-		urcu_flip_lf_txn_init(&tx);
+		urcu_flip_lf_txn_init(&tx, NULL);
 		do {
 			uintptr_t oi, oj, ok2;
 

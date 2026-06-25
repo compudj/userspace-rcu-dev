@@ -204,7 +204,7 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 	struct urcu_flip_lf_txn txn;
 	int ret;
 
-	urcu_flip_lf_txn_init(&txn);
+	urcu_flip_lf_txn_init(&txn, NULL);
 	do {
 		void *pn;
 		struct cds_bidir_list_lf_node *succ;
@@ -248,7 +248,7 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 	struct urcu_flip_lf_txn txn;
 	int ret;
 
-	urcu_flip_lf_txn_init(&txn);
+	urcu_flip_lf_txn_init(&txn, NULL);
 	do {
 		void *pn;
 		struct cds_bidir_list_lf_node *prev;
@@ -307,7 +307,7 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem)
 	struct urcu_flip_lf_txn txn;
 	int ret;
 
-	urcu_flip_lf_txn_init(&txn);
+	urcu_flip_lf_txn_init(&txn, NULL);
 	do {
 		void *en;
 		struct cds_bidir_list_lf_node *next, *prev;

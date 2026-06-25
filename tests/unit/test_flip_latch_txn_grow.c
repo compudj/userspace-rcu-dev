@@ -114,7 +114,7 @@ static void *ph1_worker(void *arg)
 			t = idx[i]; idx[i] = idx[j]; idx[j] = t;
 		}
 
-		urcu_flip_lf_txn_init(&tx);
+		urcu_flip_lf_txn_init(&tx, NULL);
 		do {
 			urcu_flip_lf_txn_begin(&tx);
 			/* odd ops reserve(); even grow lazily */
@@ -211,7 +211,7 @@ static void *ph2_writer(void *arg)
 		 * must grow from INIT to PH2_N (so relocate) for this
 		 * phase to mean anything.
 		 */
-		urcu_flip_lf_txn_init(&tx);
+		urcu_flip_lf_txn_init(&tx, NULL);
 		do {
 			urcu_flip_lf_txn_begin(&tx);
 			for (i = 0; i < PH2_N; i++)
