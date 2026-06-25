@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	54
+#define NR_TESTS	55
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -4031,6 +4031,115 @@ static int inv_detach_cross_view(void)
 		return -1;
 	}
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * BULK-OP (disappear-side) cross-view oracle for the WHOLE-TRIE root detach
+ * (cds_ft_detach(ft, NULL, 0)) -- the disappear dual of the empty-dst root
+ * graft window covered by inv_graft_root_swap_cross_view.  A root detach retires
+ * @ft's root to a fresh empty node AND clears @ft's ordered-list head/tail.  On
+ * HEAD those were separate bare stores (root publish, then head/tail clear), so
+ * a reader could observe @ft structurally EMPTY but its ordered list still
+ * pointing at the (now-detached) run.  The fix fuses the root swap with the
+ * head/tail clear into ONE flip (the src/disappear side of
+ * ft_root_list_swap_publish).
+ *
+ * The writer round-trips: detach the whole trie out (@ft -> @detached, @ft now
+ * empty), then graft @detached back at the root (@ft empty -> full again),
+ * keeping @ft repeatedly populated so the disappear window recurs every cycle.
+ * The key set is FIXED, so the ordered minimum is a single STABLE key -- which
+ * is what makes the reused min-drain reader (inv_remove_xview_reader_minvl)
+ * sound: it flags only when that min is stably present in the list (k1 == k2)
+ * yet absent from the structure within one RCU read-side critical section.  The
+ * graft-back is itself a fused appear flip, so it adds no false positive.  The
+ * detach drains @ft (it is concurrent); the graft-back of the EXCLUSIVE detached
+ * trie at the root is sync-free.
+ */
+#ifndef DETACH_ROOT_XVIEW_KEYS
+#define DETACH_ROOT_XVIEW_KEYS	2000
+#endif
+/*
+ * The disappear window is a single narrow root-store-then-head-clear gap per
+ * detach (and each detach is a grace period, so the writer does relatively few
+ * ops).  Use more concurrent readers than the default to catch it reliably --
+ * the same compensation inv_graft_root_swap_cross_view notes for its appear
+ * window.
+ */
+#ifndef DETACH_ROOT_XVIEW_READERS
+#define DETACH_ROOT_XVIEW_READERS	32
+#endif
+
+static int inv_detach_root_cross_view(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft(&group);
+	struct inv_lookup_ctx ctx;
+	pthread_t readers[DETACH_ROOT_XVIEW_READERS];
+	struct timespec t0;
+	unsigned int i, k;
+	int ret = 0;
+
+	rcu_read_lock();
+	for (k = 0; k < DETACH_ROOT_XVIEW_KEYS; k++) {
+		uint8_t key[3] = { (uint8_t)(k >> 8), (uint8_t)(k & 0xff), 0 };
+		struct ft_test_node *n = node_alloc(k);
+
+		n->value = 3;
+		memcpy(n->okey, key, 3);
+		if (cds_ft_insert(ft, key, 3, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_detach_root_cross_view";
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < DETACH_ROOT_XVIEW_READERS; i++)
+		pthread_create(&readers[i], NULL, inv_remove_xview_reader_minvl,
+			&ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	/*
+	 * Round-trip the whole trie out and back.  Each detach is a grace
+	 * period (the source is concurrent); the graft-back is sync-free
+	 * (exclusive src, root swap).
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS) {
+		struct cds_ft *detached = NULL;
+
+		if (cds_ft_detach(ft, NULL, 0, &detached) != CDS_FT_STATUS_OK ||
+		    !detached) {
+			fprintf(stderr, "inv_detach_root_cross_view: detach failed\n");
+			ret = -1;
+			break;
+		}
+		/* @ft is now empty; graft the whole detached trie back at root. */
+		if (cds_ft_graft(ft, NULL, 0, detached) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_detach_root_cross_view: graft-back failed\n");
+			cds_ft_destroy(detached);
+			ret = -1;
+			break;
+		}
+		cds_ft_destroy(detached);	/* emptied by the graft-back */
+	}
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < DETACH_ROOT_XVIEW_READERS; i++)
+		pthread_join(readers[i], NULL);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_detach_root_cross_view: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		ret = -1;
+	}
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
 }
 
 /*
@@ -10014,6 +10123,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_merge_src_cross_view);
 	RUN_TEST(inv_merge_src_spinecopy_cross_view);
 	RUN_TEST(inv_detach_cross_view);
+	RUN_TEST(inv_detach_root_cross_view);
 
 	diag("3. Duplicate chain acyclicity");
 	RUN_TEST(inv_dup_chain_acyclicity);
