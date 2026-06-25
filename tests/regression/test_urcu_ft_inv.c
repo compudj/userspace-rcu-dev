@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	52
+#define NR_TESTS	53
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -4223,6 +4223,187 @@ static int inv_dup_chain_acyclicity(void)
 	}
 	return drain_and_destroy(ft, group);
 }
+
+/*
+ * SKIP_X head-promotion: SPARSE keys (idx << 16) put each duplicate chain's head
+ * at a leaf reached through a SKIP_X suffix compressed node.  Removing such a
+ * head with duplicates remaining drives ft_promote_head's COMPRESSED-holder
+ * path -- the cn->child republish AND the grandparent SKIP_X dual fused with the
+ * fresh-cell swap in ONE flip.  The dense-key inv_dup_chain_acyclicity only
+ * reaches the plain internal-holder promotion, so this is the only invariant
+ * that drives the compressed-holder dual concurrently.  Readers walk the dup
+ * chain (acyclicity) -- a torn promotion (stale skip target into the freed old
+ * head, or a cell pointing at the removed head) would corrupt the walk.
+ */
+#define INV_SKIPX_KEY(idx)	((uint64_t)(idx) << 16)
+
+static void *inv_skipx_promote_reader(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	unsigned int seed;
+	unsigned long checks = 0;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = INV_SKIPX_KEY(rand_r(&seed) % WRITER_POOL_SIZE);
+		struct cds_ft_node *found;
+
+		rcu_read_lock();
+		if (lookup_u64(ctx->ft, key, &found) == CDS_FT_STATUS_OK && found) {
+			int count = 0;
+			struct cds_ft_node *pos = found;
+
+			cds_ft_for_each_duplicate_rcu(pos) {
+				count++;
+				if (count > MAX_DUP_CHAIN_LEN) {
+					report_violation(ctx->test_name,
+						"duplicate chain for key %" PRIu64
+						" exceeds %d — probable cycle",
+						key, MAX_DUP_CHAIN_LEN);
+					break;
+				}
+			}
+		}
+		rcu_read_unlock();
+
+		checks++;
+		if ((checks & 0x3ff) == 0)
+			rcu_quiescent_state();
+	}
+
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *inv_skipx_promote_writer(void *arg)
+{
+	struct inv_lookup_ctx *ctx = (struct inv_lookup_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed;
+
+	rcu_register_thread();
+	seed = (unsigned int)(uintptr_t)pthread_self() ^ (unsigned int)time(NULL);
+
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = INV_SKIPX_KEY(rand_r(&seed) % WRITER_POOL_SIZE);
+		int do_insert = rand_r(&seed) & 1;
+
+		rcu_read_lock();
+		if (do_insert) {
+			struct ft_test_node *n = node_alloc(key);
+
+			pthread_mutex_lock(&ctx->lock);
+			insert_u64(ctx->ft, key, n);
+			pthread_mutex_unlock(&ctx->lock);
+		} else {
+			struct cds_ft_node *found;
+			uint8_t k[8];
+
+			cds_ft_u64_to_key(ctx->ft, key, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(ctx->ft, iter);
+			/* Lookup returns the chain HEAD: removing it promotes a dup. */
+			found = cds_ft_iter_node(iter);
+			if (found) {
+				struct ft_test_node *tn = to_test_node(found);
+
+				pthread_mutex_lock(&ctx->lock);
+				if (cds_ft_remove(ctx->ft, iter, &tn->node)
+				    == CDS_FT_STATUS_OK) {
+					node_free_rcu(tn);
+				}
+				pthread_mutex_unlock(&ctx->lock);
+			}
+		}
+		rcu_read_unlock();
+
+		if ((seed & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_dup_chain_skipx_head_promotion(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct inv_lookup_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	ctx.ft = ft;
+	ctx.test_name = "inv_dup_chain_skipx_head_promotion";
+	pthread_mutex_init(&ctx.lock, NULL);
+
+	/* Pre-populate SPARSE keys (SKIP_X leaves) each with a duplicate chain. */
+	rcu_read_lock();
+	for (i = 0; i < WRITER_POOL_SIZE / 4; i++) {
+		unsigned int j;
+
+		for (j = 0; j < 3; j++) {
+			struct ft_test_node *n = node_alloc(INV_SKIPX_KEY(i));
+			insert_u64(ft, INV_SKIPX_KEY(i), n);
+		}
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_skipx_promote_reader, &ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL, inv_skipx_promote_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+
+	rcu_thread_online();
+
+	pthread_mutex_destroy(&ctx.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_dup_chain_skipx_head_promotion: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+#undef INV_SKIPX_KEY
 
 /* ================================================================== */
 /*                                                                    */
@@ -9709,6 +9890,7 @@ int main(int argc, char **argv)
 
 	diag("3. Duplicate chain acyclicity");
 	RUN_TEST(inv_dup_chain_acyclicity);
+	RUN_TEST(inv_dup_chain_skipx_head_promotion);
 
 	diag("Ordered-list-OFF (no-cell) consistency");
 	RUN_TEST(inv_no_ordered_list_consistency);
