@@ -124,7 +124,7 @@ extern "C" {
 #define URCU_FLIP_LF_TXN_FALLBACK	64
 #endif
 #ifndef URCU_FLIP_LF_TXN_BIG
-#define URCU_FLIP_LF_TXN_BIG		16
+#define URCU_FLIP_LF_TXN_BIG		128
 #endif
 
 /*
