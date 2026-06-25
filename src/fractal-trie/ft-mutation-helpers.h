@@ -889,9 +889,14 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
  * ft_resolve_flip_proxy).  A leaf reached through a SKIP_X suffix touches TWO
  * reader-visible slots (cn->child + grandparent skip) and uses the multi-edge
  * variant ft_ord_cell_swap_publish_multi instead.
+ *
+ * Returns 0, or -ENOMEM with NOTHING applied (ft_ord_cell_flip_try).  The new
+ * head is FRESH (build-invisible) and no live slot is touched before the flip,
+ * so the flip is the op's sole side-effect: on OOM the structure is untouched
+ * and the caller returns CDS_FT_STATUS_MEMORY_ERROR (the replace is retriable).
  */
 static
-void ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
+int ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		struct ft_ord_cell *new_cell,
 		struct cds_ft_inode_flag **struct_slot,
 		struct cds_ft_inode_flag *struct_old,
@@ -905,7 +910,7 @@ void ft_ord_cell_swap_publish(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	edges[n].new_target = (struct ft_ord_cell *) struct_new;
 	n++;
 	n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, n);
-	ft_ord_cell_flip(ft, edges, n);
+	return ft_ord_cell_flip_try(ft, edges, n);
 }
 
 /*

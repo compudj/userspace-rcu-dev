@@ -2262,12 +2262,23 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr(external_nodes->prev);
 
-					ft_ord_cell_swap_publish(ft, old_cell, precell,
-						(struct cds_ft_inode_flag **)
-							&metadata->external_nodes,
-						(struct cds_ft_inode_flag *)
-							external_nodes,
-						(struct cds_ft_inode_flag *) node);
+					/*
+					 * The flip is the op's sole side-effect (the
+					 * new head is fresh); on OOM nothing is applied,
+					 * the old chain is intact (do NOT free its cell)
+					 * and the replace aborts retriably.
+					 */
+					if (ft_ord_cell_swap_publish(ft, old_cell,
+							precell,
+							(struct cds_ft_inode_flag **)
+								&metadata->external_nodes,
+							(struct cds_ft_inode_flag *)
+								external_nodes,
+							(struct cds_ft_inode_flag *)
+								node) != 0) {
+						ret = -ENOMEM;
+						goto insert_replace_done;
+					}
 					ft_ord_cell_free(ft, old_cell);
 				} else {
 					/*

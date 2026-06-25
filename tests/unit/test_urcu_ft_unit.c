@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 286
+#define NR_TESTS 287
 #else
 #define NR_TESTS 252
 #endif
@@ -21827,6 +21827,129 @@ static int test_remove_emptied_holder_traversal_oom(void)
 }
 
 /*
+ * insert_replace OOM contract (cds_ft_insert_replace of a PREFIX-key head, list
+ * on).  A prefix key whose head lives in an internal node's external_nodes chain
+ * is replaced by swapping a fresh ordered-list cell into the list AND
+ * republishing external_nodes in ONE flip (ft_ord_cell_swap_publish).  The new
+ * head is fresh and no live slot is touched before the flip, so the flip is the
+ * op's sole side-effect; its multi-edge txn allocates.  On any allocation failing
+ * (the cell pre-alloc OR the flip txn) the op must ABORT before any reader-visible
+ * change -- the OLD head stays (the key keeps its old value), the call returns
+ * CDS_FT_STATUS_MEMORY_ERROR and is retriable -- rather than degrade to a bare
+ * store.  Walk every allocation-fault point: the trie must verify and the live
+ * head at the prefix key must match the outcome (old on MEMORY_ERROR, new on
+ * DUPLICATE_FOUND).
+ *
+ * Shape: keys "K", "KX", "M".  "K" is a prefix of "KX", so the "K" head sits in
+ * the external_nodes chain of the internal node where "KX" diverges (the
+ * ft_ord_cell_swap_publish replace path), and "M" gives a non-trivial ordered
+ * list so the swap flips >= 2 edges (an allocating txn).
+ */
+static int run_insert_replace_prefix_oom(int nr_faults)
+{
+	int n, rc = 0, saw_mem_err = 0, saw_ok = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group_attr *attr;
+		struct cds_ft_group *group;
+		struct cds_ft *ft;
+		struct ft_test_node *a, *x, *m, *repl;
+		struct cds_ft_iter *iter;
+		struct cds_ft_node *old = NULL, *removed = NULL, *live_head = NULL;
+		enum cds_ft_status s;
+		int verified, ok = 1, repl_inserted = 0;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			abort();
+		cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+		cds_ft_group_attr_set_ordered_list(attr, true);
+		if (cds_ft_group_create(attr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0 ||
+		    cds_ft_iter_create(ft, &iter) < 0) {
+			fprintf(stderr, "insert_replace_prefix_oom: create failed\n");
+			return -1;
+		}
+		a = node_alloc(1);
+		x = node_alloc(2);
+		m = node_alloc(3);
+		repl = node_alloc(4);
+		if (cds_ft_insert(ft, (const uint8_t *) "K", 1, &a->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "KX", 2, &x->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "M", 1, &m->node) < 0)
+			rc = -1;
+
+		cds_ft_fault_alloc_countdown = n;
+		s = cds_ft_insert_replace(ft, (const uint8_t *) "K", 1,
+			&repl->node, &old);
+		cds_ft_fault_alloc_countdown = -1;
+		if (s == CDS_FT_STATUS_DUPLICATE_FOUND) {
+			removed = old;		/* old head, now out of the trie */
+			repl_inserted = 1;
+		}
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		cds_ft_iter_set_key(iter, (const uint8_t *) "K", 1);
+		if (verified &&
+		    cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK)
+			live_head = cds_ft_iter_node(iter);
+		rcu_read_unlock();
+
+		if (!verified) {
+			fprintf(stderr,
+				"insert_replace_prefix_oom: verify FAILED after fault n=%d (%s)\n",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+		if (s == CDS_FT_STATUS_DUPLICATE_FOUND) {
+			saw_ok = 1;
+			if (live_head != &repl->node || old != &a->node)
+				ok = 0;
+		} else if (s == CDS_FT_STATUS_MEMORY_ERROR) {
+			saw_mem_err = 1;
+			if (live_head != &a->node)	/* aborted: old head stays */
+				ok = 0;
+		} else {
+			ok = 0;
+		}
+		if (!ok) {
+			fprintf(stderr,
+				"insert_replace_prefix_oom: %s but live_head mismatch (n=%d)\n",
+				cds_ft_status_to_string(s), n);
+			rc = -1;
+		}
+
+		if (drain_trie(ft) < 0)
+			rc = -1;
+		cds_ft_iter_destroy(iter);
+		rcu_barrier();
+		if (removed)		/* replaced old head: drain won't free it */
+			node_free(to_test_node(removed));
+		if (!repl_inserted)	/* OOM: repl was never inserted */
+			node_free(repl);
+		cds_ft_destroy(ft);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	/* The abort path is the point of the test: it must actually be exercised. */
+	if (!saw_mem_err || !saw_ok) {
+		fprintf(stderr,
+			"insert_replace_prefix_oom: coverage gap (mem_err=%d ok=%d)\n",
+			saw_mem_err, saw_ok);
+		rc = -1;
+	}
+	return rc;
+}
+
+static int test_insert_replace_prefix_oom(void)
+{
+	return run_insert_replace_prefix_oom(14);
+}
+
+/*
  * Head-promotion OOM contract (cds_ft_remove of a duplicate-chain HEAD, list
  * on).  Removing the head of a key's duplicate chain while a successor remains
  * needs a FRESH ordered-list cell (cell->node is write-once), allocated in
@@ -22418,6 +22541,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_remove_all_oom_contract);
 	RUN_TEST(test_remove_emptied_holder_traversal_oom);
 	RUN_TEST(test_remove_head_promote_oom);
+	RUN_TEST(test_insert_replace_prefix_oom);
 #endif
 
 	rcu_barrier();
