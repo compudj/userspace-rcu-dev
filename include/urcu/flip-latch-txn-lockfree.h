@@ -12,9 +12,10 @@
  * (urcu_flip_lf_mcas_*): a set of {slot, old, new} records committed atomically.
  * This header wraps it in a begin / store / commit / end transaction whose state
  * is a small on-stack handle, so a mutator reads and buffers writes imperatively
- * while the engine handles the retry bookkeeping.  Loads are plain
- * urcu_flip_lf_read() calls inside the bracket; begin/end mark the scope, and
- * only writes are buffered:
+ * while the engine handles the retry bookkeeping.  Loads inside the bracket go
+ * through urcu_flip_lf_txn_load(): it forwards to urcu_flip_lf_read() (there is
+ * no read-set) but keeps in-bracket reads routed through the handle.  begin/end
+ * mark the scope, and only writes are buffered:
  *
  *     struct urcu_flip_lf_txn txn;
  *     int ret;
@@ -22,7 +23,7 @@
  *     urcu_flip_lf_txn_init(&txn);
  *     do {
  *         urcu_flip_lf_txn_begin(&txn);
- *         succ = urcu_flip_lf_read((void **) &pos->next);
+ *         succ = urcu_flip_lf_txn_load(&txn, (void **) &pos->next);
  *         if (is_marked(succ)) { urcu_flip_lf_txn_end(&txn); return -ENOENT; }
  *         urcu_flip_lf_txn_store(&txn, (void **) &pos->next, succ, newp);
  *         urcu_flip_lf_txn_store(&txn, (void **) &succ->prev, pos,  newp);
@@ -157,6 +158,25 @@ int urcu_flip_lf_txn_reserve(struct urcu_flip_lf_txn *txn, unsigned int n)
 		txn->mcas = m;
 	}
 	return 0;
+}
+
+/*
+ * Read @slot within the bracket and return its current logical value -- the old
+ * for a word this attempt intends to transact.  Forwards to urcu_flip_lf_read():
+ * there is no read-set, so the read is not recorded; commit reconciles it
+ * through the slot == old check on whatever store consumes it (read subset of
+ * write).  @txn is taken regardless -- it binds the read to the bracket's RCU
+ * read-side section structurally (a live handle exists only between begin and
+ * end), and it is the seam where the wait-free escalation lane would add read
+ * validation: route in-bracket reads here, not through urcu_flip_lf_read(), so
+ * that day is a one-line change.  A plain observer outside any transaction reads
+ * with urcu_flip_lf_read() directly.
+ */
+static inline
+void *urcu_flip_lf_txn_load(struct urcu_flip_lf_txn *txn, void **slot)
+{
+	(void) txn;			/* no read-set today -- this is the seam */
+	return urcu_flip_lf_read(slot);
 }
 
 /*

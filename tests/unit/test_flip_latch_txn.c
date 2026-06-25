@@ -92,11 +92,11 @@ static void *worker(void *arg)
 			uintptr_t oi, oj, ok2;
 
 			urcu_flip_lf_txn_begin(&tx);
-			oi = (uintptr_t) urcu_flip_lf_read(&g_word[i]);
-			oj = (uintptr_t) urcu_flip_lf_read(&g_word[j]);
+			oi = (uintptr_t) urcu_flip_lf_txn_load(&tx, &g_word[i]);
+			oj = (uintptr_t) urcu_flip_lf_txn_load(&tx, &g_word[j]);
 			urcu_flip_lf_txn_store(&tx, &g_word[i], (void *) oi, (void *) lf_bump(oi, 2));
 			if (three) {
-				ok2 = (uintptr_t) urcu_flip_lf_read(&g_word[k]);
+				ok2 = (uintptr_t) urcu_flip_lf_txn_load(&tx, &g_word[k]);
 				urcu_flip_lf_txn_store(&tx, &g_word[j], (void *) oj, (void *) lf_bump(oj, 2));
 				urcu_flip_lf_txn_store(&tx, &g_word[k], (void *) ok2, (void *) lf_bump(ok2, -4));
 			} else {

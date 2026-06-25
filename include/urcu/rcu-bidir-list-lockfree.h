@@ -210,7 +210,7 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 		struct cds_bidir_list_lf_node *succ;
 
 		urcu_flip_lf_txn_begin(&txn);
-		pn = urcu_flip_lf_read((void **) &pos->next);
+		pn = urcu_flip_lf_txn_load(&txn, (void **) &pos->next);
 		if (cds_bidir_list_lf_is_marked(pn)) {
 			urcu_flip_lf_txn_end(&txn);
 			return -ENOENT;			/* @pos was deleted */
@@ -254,13 +254,13 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 		struct cds_bidir_list_lf_node *prev;
 
 		urcu_flip_lf_txn_begin(&txn);
-		pn = urcu_flip_lf_read((void **) &pos->next);
+		pn = urcu_flip_lf_txn_load(&txn, (void **) &pos->next);
 		if (cds_bidir_list_lf_is_marked(pn)) {
 			urcu_flip_lf_txn_end(&txn);
 			return -ENOENT;			/* @pos was deleted */
 		}
 		prev = cds_bidir_list_lf_unmark(
-				urcu_flip_lf_read((void **) &pos->prev));
+				urcu_flip_lf_txn_load(&txn, (void **) &pos->prev));
 
 		newp->next = pos;
 		newp->prev = prev;
@@ -313,14 +313,14 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem)
 		struct cds_bidir_list_lf_node *next, *prev;
 
 		urcu_flip_lf_txn_begin(&txn);
-		en = urcu_flip_lf_read((void **) &elem->next);
+		en = urcu_flip_lf_txn_load(&txn, (void **) &elem->next);
 		if (cds_bidir_list_lf_is_marked(en)) {
 			urcu_flip_lf_txn_end(&txn);
 			return 0;			/* already deleted by a peer */
 		}
 		next = (struct cds_bidir_list_lf_node *) en;
 		prev = cds_bidir_list_lf_unmark(
-				urcu_flip_lf_read((void **) &elem->prev));
+				urcu_flip_lf_txn_load(&txn, (void **) &elem->prev));
 
 		/*
 		 * Mark elem (logical delete), then unlink both neighbour edges.

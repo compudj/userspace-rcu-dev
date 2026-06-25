@@ -121,8 +121,8 @@ static void *ph1_worker(void *arg)
 			if (n & 1)
 				(void) urcu_flip_lf_txn_reserve(&tx, PH1_TXN);
 			for (i = 0; i < PH1_TXN; i++) {
-				uintptr_t old = (uintptr_t) urcu_flip_lf_read(
-						&ph1_word[idx[i]]);
+				uintptr_t old = (uintptr_t) urcu_flip_lf_txn_load(
+						&tx, &ph1_word[idx[i]]);
 				intptr_t delta = (i < PH1_TXN / 2) ? +3 : -3;
 
 				urcu_flip_lf_txn_store(&tx, &ph1_word[idx[i]],
