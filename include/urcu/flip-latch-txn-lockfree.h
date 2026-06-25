@@ -186,7 +186,17 @@ void urcu_flip_lf_txn_init(struct urcu_flip_lf_txn *txn,
 static inline
 void urcu_flip_lf_txn__enter_fallback(struct urcu_flip_lf_txn *txn)
 {
+	/*
+	 * cds_fifo_enter may park on a futex until our turn.  A QSBR reader
+	 * that blocks while online stalls grace periods -- and thus the
+	 * engine's call_rcu reclaim -- for the whole wait, so go RCU-offline
+	 * around it.  We are outside the bracket's read-side section here
+	 * (begin escalates before rcu_read_lock; reserve unlocks first), so
+	 * this is safe; other flavors implement the pair too (flavor API).
+	 */
+	rcu_thread_offline();
 	cds_fifo_enter(&txn->domain->fifo, &txn->waiter);
+	rcu_thread_online();
 	uatomic_store(&txn->domain->active, 1, CMM_RELEASE);
 	txn->in_fallback = 1;
 }
