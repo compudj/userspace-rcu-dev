@@ -592,24 +592,34 @@ void ft_ord_cell_flip_into(struct cds_ft *ft, struct urcu_flip_txn *t,
 	ft_flip_txn_reclaim(ft, t, gp);
 }
 
+/*
+ * Fallible self-allocating flip: returns 0, or -ENOMEM with NOTHING installed.
+ * For an ABORTABLE caller -- the flip is the op's commit / abort boundary, so on
+ * OOM the op returns CDS_FT_STATUS_MEMORY_ERROR with the structure untouched.  A
+ * single check, no per-edge handling: the edge count @n is known, so it is one
+ * bounded malloc whose failure is reported here (freeze-before-install means an
+ * un-built txn installs nothing).  A lone edge takes the infallible on-stack path
+ * and always returns 0.  (Un-abortable post-drain commits do NOT use this -- they
+ * pre-reserve a txn in the build phase and commit through ft_ord_cell_flip_into,
+ * which cannot fail.)
+ */
 static
-void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
+int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		unsigned int n)
 {
 	struct urcu_flip_txn *t;
-	unsigned int i;
 
 	if (n == 0)
-		return;
+		return 0;
 	if (n == 1) {
 		/*
 		 * Lone edge: commit on an ON-STACK bounded txn.  No allocation
-		 * (hence no OOM and no degraded bare store), and none is needed
-		 * afterwards: a single-edge commit is a lone release store that
-		 * parks no proxy and owes no grace period, so nothing references
-		 * the txn once it returns and the stack frame reclaims it.  It is
-		 * still a {slot, old, new} descriptor commit, not a bare
-		 * rcu_assign_pointer, so a future MCAS covers the slot uniformly.
+		 * (hence no OOM), and none is needed afterwards: a single-edge
+		 * commit is a lone release store that parks no proxy and owes no
+		 * grace period, so nothing references the txn once it returns and
+		 * the stack frame reclaims it.  Still a {slot, old, new}
+		 * descriptor commit, not a bare rcu_assign_pointer, so a future
+		 * MCAS covers the slot uniformly.
 		 */
 		union {
 			struct urcu_flip_txn t;
@@ -621,26 +631,33 @@ void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 			(void *) edges[0].old_target,
 			(void *) edges[0].new_target);
 		(void) urcu_flip_txn_commit(&u.t);
-		return;
+		return 0;
 	}
 	t = ft_flip_txn_create_bounded(n);
-	if (caa_unlikely(!t)) {
-		/*
-		 * Degraded fallback (multi-edge point-op splices, 2 <= n <= 6; the
-		 * merge interleave reserves its txn in the fallible build phase
-		 * and never lands here): sequential edge stores.  A bidirectional
-		 * reader between two stores can observe one neighbour's edge
-		 * updated and the mirrored one not yet -- transient and self-
-		 * healing, never a dangling pointer.  (Lone edges took the
-		 * infallible on-stack path above; this n >= 2 self-allocating
-		 * fallback is the last bare-store escape hatch, being retired as
-		 * callers migrate to a pre-reserved txn + ft_ord_cell_flip_into.)
-		 */
+	if (caa_unlikely(!t))
+		return -ENOMEM;
+	ft_ord_cell_flip_into(ft, t, edges, n);
+	return 0;
+}
+
+/*
+ * Transitional degraded flip for callers not yet migrated to ft_ord_cell_flip_try
+ * (abortable) or ft_ord_cell_flip_into (pre-reserved): on a multi-edge txn-alloc
+ * OOM, sequential bare stores.  A bidirectional reader between two stores can
+ * observe one neighbour's edge updated and the mirror not yet -- transient and
+ * self-healing, never a dangling pointer.  This is the last bare-store escape
+ * hatch, deleted once every caller has migrated.
+ */
+static
+void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
+		unsigned int n)
+{
+	if (caa_unlikely(ft_ord_cell_flip_try(ft, edges, n) != 0)) {
+		unsigned int i;
+
 		for (i = 0; i < n; i++)
 			rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
-		return;
 	}
-	ft_ord_cell_flip_into(ft, t, edges, n);
 }
 
 /*

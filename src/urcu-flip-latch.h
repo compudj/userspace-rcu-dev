@@ -223,6 +223,7 @@ struct urcu_flip_txn {
 	struct urcu_flip_chunk *head;	/* the single edge chunk (realloc-grows in PREPARE) */
 	unsigned int nr;
 	bool head_inline;		/* head chunk embedded in this allocation */
+	bool failed;			/* sticky: a record() OOM'd -> commit installs nothing */
 } __attribute__((aligned(16)));
 
 #define URCU_FLIP_CHUNK0_CAP	8	/* initial head-chunk capacity */
@@ -268,19 +269,10 @@ struct urcu_flip_txn *urcu_flip_txn_create(void *(*tag)(struct urcu_flip_proxy *
 	t->head = NULL;
 	t->nr = 0;
 	t->head_inline = false;
+	t->failed = false;
 	return t;
 }
 
-/*
- * Single-allocation bounded txn: the header plus an inline head chunk sized for
- * @cap latches, in ONE malloc -- so a transaction whose edge count is bounded
- * by construction costs one allocation (and one free), like a flat bespoke flip
- * batch, instead of create + reserve's two.  @cap must cover every record:
- * record() never grows the inline chunk (the freeze-before-install model -- no
- * append after install -- needs the edge set bounded up front anyway), so the
- * embedder sizes @cap to its edge bound.  Returns NULL on OOM (the embedder
- * falls back to a degraded direct/sequential publish).
- */
 /*
  * Initialize a bounded txn in caller-provided storage @t, which must be at least
  * URCU_FLIP_TXN_BOUNDED_BYTES(cap) and aligned to alignof(struct urcu_flip_txn)
@@ -305,8 +297,18 @@ void urcu_flip_txn_init_bounded(struct urcu_flip_txn *t,
 	t->head = c;
 	t->nr = 0;
 	t->head_inline = true;
+	t->failed = false;
 }
 
+/*
+ * Single-allocation bounded txn: the header plus an inline head chunk sized for
+ * @cap latches, in ONE malloc -- so a transaction whose edge count is bounded
+ * by construction costs one allocation (and one free), like a flat bespoke flip
+ * batch, instead of create + reserve's two.  @cap must cover every record:
+ * record() never grows the inline chunk (the freeze-before-install model -- no
+ * append after install -- needs the edge set bounded up front anyway), so the
+ * embedder sizes @cap to its edge bound.  Returns NULL on OOM.
+ */
 static inline
 struct urcu_flip_txn *urcu_flip_txn_create_bounded(
 		void *(*tag)(struct urcu_flip_proxy *), unsigned int cap)
@@ -384,10 +386,16 @@ void urcu_flip_latch_install(struct urcu_flip_txn *t, struct urcu_flip_latch *l)
 
 /*
  * Record one edge {*slot: old -> new}.  Returns false on OOM (the only failure);
- * the caller then aborts.  Valid ONLY in PREPARE: the freeze-before-install model
- * forbids appending after install (the MCAS sorted-address-acquisition constraint
- * -- the edge set must be frozen before any proxy goes live), so the txn has a
- * single chunk that realloc-grows while nothing is installed.
+ * the caller may check per-record, or defer: an OOM sets a STICKY @failed flag,
+ * after which further record()s are no-ops (return false) and commit() installs
+ * NOTHING and reports the failure (urcu_flip_txn_failed).  Because nothing is
+ * stored into a slot until install/commit (freeze-before-install), a poisoned
+ * txn commits to an empty edge set -- the structure is untouched, so a recorder
+ * that records freely through a build and checks once at the end aborts cleanly.
+ * Valid ONLY in PREPARE: the freeze-before-install model forbids appending after
+ * install (the MCAS sorted-address-acquisition constraint -- the edge set must be
+ * frozen before any proxy goes live), so the txn has a single chunk that
+ * realloc-grows while nothing is installed.
  */
 static inline
 bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
@@ -397,10 +405,14 @@ bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
 	struct urcu_flip_latch *l;
 
 	urcu_posix_assert(t->state == URCU_FLIP_TXN_PREPARE);
+	if (t->failed)
+		return false;		/* sticky: a prior record OOM'd */
 	if (!c) {
 		c = urcu_flip_chunk_alloc(URCU_FLIP_CHUNK0_CAP);
-		if (!c)
+		if (!c) {
+			t->failed = true;
 			return false;
+		}
 		t->head = c;
 	} else if (c->nr == c->cap) {
 		unsigned int newcap = c->cap * 2;
@@ -416,8 +428,10 @@ bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
 		/* No address is live yet -> realloc may move the chunk. */
 		nc = (struct urcu_flip_chunk *) realloc(c, sizeof(*c) +
 			(size_t) newcap * sizeof(struct urcu_flip_latch));
-		if (!nc)
+		if (!nc) {
+			t->failed = true;
 			return false;
+		}
 		nc->cap = newcap;
 		t->head = c = nc;
 	}
@@ -425,6 +439,15 @@ bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
 	urcu_flip_latch_set(t, l, slot, old_ptr, new_ptr);
 	t->nr++;
 	return true;
+}
+
+/* Whether a record() OOM'd (sticky).  A failed txn commits nothing -> the
+ * recorder aborts and frees it (urcu_flip_txn_destroy); the structure was never
+ * touched (freeze-before-install). */
+static inline
+bool urcu_flip_txn_failed(const struct urcu_flip_txn *t)
+{
+	return t->failed;
 }
 
 /* PREPARE -> INSTALLED: park every recorded latch's proxy into its slot. */
@@ -473,6 +496,8 @@ bool urcu_flip_txn_commit(struct urcu_flip_txn *t)
 		 * install/commit, so no proxy is live in PREPARE and the
 		 * shortcuts always apply.
 		 */
+		if (t->failed)
+			return false;	/* a record OOM'd: install nothing, no GP */
 		if (t->nr == 1) {
 			struct urcu_flip_latch *l = &t->head->latches[0];
 
