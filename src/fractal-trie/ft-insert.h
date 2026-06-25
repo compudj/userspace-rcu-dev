@@ -1205,10 +1205,30 @@ int ft_attach_node(struct cds_ft *ft,
 		 * Phase 2: iter_node_flag's parent is now wired (by
 		 * ft_node_set_nth above, either in-place or via recompact's
 		 * reparent loop; by the explicit raw store for a one-commit
-		 * insert).  Wire the back-channel from the live displaced
-		 * external before the outer forward publish.
+		 * insert).  Re-parent the LIVE displaced external head onto the
+		 * fresh cluster top iter_node_flag.  external_nodes is
+		 * reader-reachable through its old slot until the forward publish,
+		 * so an up-walk would follow its prev / cell->parent INTO the
+		 * not-yet-published cluster (and from there its build-invisible
+		 * internals).  So this re-parent must flip ATOMICALLY with the
+		 * forward publish below, not before it: park it into the
+		 * one-commit (ic->live_child), which ft_insert_one_commit replays
+		 * via ft_park_live_parent_edge (resolving the external head's
+		 * cell->parent / prev).  The cluster then becomes reachable via
+		 * BOTH its forward slot and this back-pointer in one flip.  The
+		 * direct/bulk fallback (no txn) wires it immediately, as before.
 		 */
-		ft_publish_external_nodes_prev(ft, iter_node_flag, external_nodes);
+		if (external_nodes) {
+			if (ic && ic->txn) {
+				ic->live_child =
+					(struct cds_ft_inode_flag *) external_nodes;
+				ic->live_parent = iter_node_flag;
+				ic->live_slot = NULL;
+			} else {
+				ft_publish_external_nodes_prev(ft, iter_node_flag,
+					external_nodes);
+			}
+		}
 		/* Attach branch (unlink the old node from the trie).
 		 * ft_publish_to_parent handles skip pointer update
 		 * if the attach target is a compressed node's child.
