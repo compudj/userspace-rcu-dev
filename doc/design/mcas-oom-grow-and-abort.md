@@ -116,6 +116,22 @@ a fresh write-once cell), so it is *already* allowed to ENOMEM. The carve-out #2
 concern dissolves: the right model for the remove family is grow-and-abort, not
 inline storage.
 
+**Revision (2026-06-25c) — the chain-compress canonicalization prune is NOT a
+deferrable best-effort tail.** Under `FEATURE_FT_SKIP_COMPRESSED` the verifier
+*enforces* canonical form (`ft-verify.h`: no two adjacent compresseds; a non-root
+1-child no-external internal must be a 1-byte compressed), so a removed-but-non-
+canonical trie FAILS `cds_ft_verify` and the deferred-prune tail above cannot
+apply to it. Resolution (Mathieu, option (b) — build-everything / commit-all): the
+chain-compress prune is FUSED into the key-removal commit. A canonicalize-firing
+removal builds the merged compressed node INVISIBLY and the merge IS the removal's
+single commit (`ft_chain_compress_fused`); no intermediate 1-child node is ever
+published, so no transient non-canonical state exists. The prune's allocation
+(`new_cn` + a pre-reserved flip-txn) is part of the op's fallible PREFIX, so its
+OOM ABORTS the whole removal (`MEMORY_ERROR`, key not removed, trie canonical) —
+moving the prune from "after the commit, deferred-benign" to "before the first
+side-effect, in the atomic envelope". So §4's deferred-prune tail still describes
+the emptied-holder external-promote, but NOT the chain-compress canonicalization.
+
 The precedent is in the code: `ft-remove.h` `cds_ft_remove` calls
 `ft_detach_node`, which **returns** a status, and the caller rolls back:
 
