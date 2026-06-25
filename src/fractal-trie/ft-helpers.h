@@ -1707,32 +1707,6 @@ struct cds_ft_metadata *ft_skip_to_compressed_meta(struct cds_ft *ft,
 #endif
 
 /*
- * ft_update_skip_pointer: when a compressed node's child is replaced
- * (e.g., by recompact), update the skip pointer in the parent's slot
- * to encode the new child address.
- *
- * @parent_slot: pointer to the slot holding the skip pointer (in the
- *               grandparent node or root).
- * @cn: the compressed node whose child was replaced.
- *
- * If the slot doesn't hold a skip pointer, this is a no-op.
- */
-static inline
-void ft_update_skip_pointer(struct cds_ft_inode_flag **parent_slot,
-		struct cds_ft_compressed_node *cn)
-{
-	struct cds_ft_inode_flag *slot_val;
-
-	if (!parent_slot)
-		return;
-	slot_val = rcu_dereference(*parent_slot);
-	if (!ft_node_skip_compressed(slot_val))
-		return;
-	rcu_assign_pointer(*parent_slot,
-		ft_skip_compressed_flag(cn->child, cn->len));
-}
-
-/*
  * ft_publish_to_parent: atomically publish @new_child into @parent_slot.
  *
  * If the parent is a compressed node, also update the skip pointer
