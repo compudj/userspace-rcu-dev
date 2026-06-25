@@ -794,20 +794,29 @@ int ft_detach_node(struct cds_ft *ft,
 		}
 #endif
 		if (!boundary_fused) {
+			struct cds_ft_inode_flag *bparent =
+				metadata_stack[nr_branch - 1]->parent;
 			/*
-			 * Pre-reserve the in-place commit txn BEFORE ft_node_replace_ptr's
-			 * pre-flip metadata->nr_child-- (the pub-armed in-place delete
+			 * Pre-reserve the commit txn BEFORE ft_node_replace_ptr's pre-flip
+			 * side-effects -- the in-place delete's metadata->nr_child-- (it
 			 * commits the deferred slot store fused with the cell unsplice via
-			 * ft_remove_one_commit below).  Reserve only when that commit is
-			 * multi-edge -- a cell unsplice / run is present; an in-place delete
-			 * with neither is a direct lone release store inside
+			 * ft_remove_one_commit below) OR the recompaction's eager re-parent
+			 * of the rebuilt node's children (it publishes via the tail
+			 * ft_remove_commit_rec).  Reserve only when that commit will be
+			 * multi-edge: a cell unsplice / run is present, or the boundary's
+			 * parent is compressed so the forward publish carries a SKIP_X dual.
+			 * A lone edge (non-compressed parent, no cell) stays the infallible
+			 * on-stack release store, so no txn is needed -- and an in-place
+			 * delete with neither is a direct lone store inside
 			 * ft_node_replace_ptr that never reaches ft_remove_one_commit.
 			 * Reservation failure aborts before any side-effect (the upward
-			 * walk is read-only).  If ft_node_replace_ptr recompacts instead
-			 * (no in-place commit), the txn is freed unused at @end -- the
-			 * recompaction publish below stays on the transitional path.
+			 * walk is read-only).  Whichever commit fires consumes the txn; if
+			 * none does (e.g. an n==1 publish, or replace_ptr failed) it is
+			 * freed unused at @end.
 			 */
-			if (fuse_cell || run) {
+			if (fuse_cell || run ||
+			    (bparent && (ft_node_compressed(bparent) ||
+					 ft_node_skip_compressed(bparent)))) {
 				commit_txn = ft_flip_txn_create_bounded(
 					FT_REMOVE_COMMIT_REC_MAX_EDGES);
 				if (!commit_txn) {
@@ -1089,7 +1098,15 @@ int ft_detach_node(struct cds_ft *ft,
 
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
-			ft_remove_commit_rec(ft, &rec, fuse_cell, run, NULL);
+			/*
+			 * Recompaction (its eager child re-parent already ran in
+			 * ft_node_replace_ptr) so the publish commits through the
+			 * pre-reserved txn (reserved above; this arm requires
+			 * fuse_cell/run) and cannot fail.
+			 */
+			ft_remove_commit_rec(ft, &rec, fuse_cell, run,
+				commit_txn_used ? NULL : commit_txn);
+			commit_txn_used = (commit_txn != NULL);
 			pub->armed = true;
 		} else {
 			struct ft_pub_rec rec = { .n = 0 };
@@ -1098,12 +1115,18 @@ int ft_detach_node(struct cds_ft *ft,
 			 * Non-fused recompaction / external-promote / in-place
 			 * redundant republish: route through the op flip-txn so the
 			 * forward slot AND a compressed grandparent's SKIP_X dual flip
-			 * atomically.  A lone edge reduces to a single release store
-			 * in ft_ord_cell_flip (allocation-free, infallible).
+			 * atomically.  A recompaction's eager child re-parent already ran,
+			 * so it commits through the pre-reserved @commit_txn (infallible).
+			 * An in-place / external-promote republish here is redundant
+			 * (old == new) -- @commit_txn was already consumed by the in-place
+			 * commit above (commit_txn_used), so this passes NULL and the no-op
+			 * lone/redundant store needs no txn.
 			 */
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
-			ft_remove_commit_rec(ft, &rec, NULL, NULL, NULL);
+			ft_remove_commit_rec(ft, &rec, NULL, NULL,
+				commit_txn_used ? NULL : commit_txn);
+			commit_txn_used = (commit_txn != NULL);
 		}
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
