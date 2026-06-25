@@ -150,27 +150,12 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			/*
 			 * No ordered list: the root pointer is the only
 			 * reader-visible slot.  Express it as a single-edge flip
-			 * descriptor anyway (a lone edge commits as one release
-			 * store -- no proxy, no grace period -- exactly like a
-			 * bare rcu_assign_pointer) so the root swap is captured as
-			 * a {slot, old, new} edge like every other structural
-			 * publish.  A future multi-writer MCAS commit then covers
-			 * this slot uniformly: a bare store would discard @old
-			 * (the compare-and-swap "expected" value) and sit outside
-			 * the descriptor protocol, yet ft->root can be in a
-			 * concurrent writer's word-set (e.g. a near-root insert
-			 * that recompacts and republishes the root).  The bulk op
-			 * already does a grace period, so the bounded-txn alloc is
-			 * negligible here.
+			 * descriptor anyway (commits as one release store, like a
+			 * bare rcu_assign_pointer) so the root swap is
+			 * MCAS-expressible like every other structural publish.
 			 */
-			struct ft_ord_cell_edge edge = {
-				.slot = (struct ft_ord_cell **) &ft->root,
-				.old_target = (struct ft_ord_cell *) ft->root,
-				.new_target = (struct ft_ord_cell *)
-					ft_node_flag(fresh_node, 0),
-			};
-
-			ft_ord_cell_flip(ft, &edge, 1);
+			ft_root_edge_flip(ft, &ft->root, ft->root,
+				ft_node_flag(fresh_node, 0));
 		}
 		FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 

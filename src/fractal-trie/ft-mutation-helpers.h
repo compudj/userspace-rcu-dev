@@ -308,6 +308,33 @@ void ft_root_list_swap_publish(struct cds_ft *ft,
 }
 
 /*
+ * Publish a lone structural root edge as a single-edge flip descriptor.  A lone
+ * edge commits as one release store (no proxy, no group flip, no grace period)
+ * -- byte-identical to a bare rcu_assign_pointer -- but it is captured as a
+ * {slot, old, new} descriptor edge so a future multi-writer MCAS commit covers
+ * the root slot uniformly: a bare store would discard @old (the compare-and-swap
+ * "expected" value) and sit outside the descriptor protocol, yet a root slot can
+ * be in a concurrent writer's word-set (e.g. a near-root insert that recompacts
+ * and republishes the root).  This is the ordered-list-OFF arm of every Class-G
+ * root swap (detach / graft / graft_swap / merge), where there is no head/tail
+ * endpoint to fuse and ft_root_list_swap_publish would reduce to this anyway.
+ */
+static
+void ft_root_edge_flip(struct cds_ft *ft,
+		struct cds_ft_inode_flag **struct_slot,
+		struct cds_ft_inode_flag *struct_old,
+		struct cds_ft_inode_flag *struct_new)
+{
+	struct ft_ord_cell_edge edge = {
+		.slot = (struct ft_ord_cell **) struct_slot,
+		.old_target = (struct ft_ord_cell *) struct_old,
+		.new_target = (struct ft_ord_cell *) struct_new,
+	};
+
+	ft_ord_cell_flip(ft, &edge, 1);
+}
+
+/*
  * Structural min/max dup-chain HEAD of the subtree rooted at @nf, under WRITER
  * EXCLUSION (no concurrent mutation -> no skip re-anchor / flip-proxy / transient
  * empty states to handle, unlike the reader-side minmax descent).  Mirrors the
@@ -2291,7 +2318,22 @@ void ft_glue_free_collided_cells(struct cds_ft *ft,
 static
 void ft_glue_publish(struct cds_ft *ft, struct ft_glue *g)
 {
-	ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top);
+	struct ft_pub_rec rec = { .n = 0 };
+	struct ft_ord_cell_edge sedges[2];	/* forward slot + compressed SKIP_X dual */
+	unsigned int n;
+
+	/*
+	 * Record the 1-2 reader-visible structural stores (the forward slot and,
+	 * for a compressed parent, its SKIP_X dual) and commit them in ONE flip
+	 * instead of a bare ft_publish_to_parent.  A lone edge still reduces to a
+	 * single release store, but both stores now ride a {slot, old, new}
+	 * descriptor: the compressed dual flips atomically (no torn window) and a
+	 * future MCAS commit covers the publish uniformly.
+	 */
+	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
+		&rec);
+	n = ft_pub_rec_sedges(&rec, sedges);
+	ft_ord_cell_flip(ft, sedges, n);
 }
 
 /*

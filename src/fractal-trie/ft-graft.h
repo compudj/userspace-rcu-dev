@@ -842,13 +842,20 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		} else {
 			/*
 			 * No ordered list: the root pointer is the only
-			 * reader-visible slot, so a single rcu_assign_pointer is
-			 * already atomic -- no flip needed (and no synchronize_rcu,
-			 * both being root positions with parent == NULL).
+			 * reader-visible slot per side (and no synchronize_rcu --
+			 * both are root positions with parent == NULL).  Express
+			 * each lone root edge as a single-edge flip descriptor
+			 * (commits as one release store, like a bare
+			 * rcu_assign_pointer) so the swap is MCAS-expressible like
+			 * the list-on path above.  Capture src's root before the
+			 * appear flip, since the disappear flip overwrites it.
 			 */
-			rcu_assign_pointer(dst_ft->root, src_ft->root);
-			rcu_assign_pointer(src_ft->root,
-				ft_node_flag(fresh_root, 0));
+			struct cds_ft_inode_flag *src_root = src_ft->root;
+
+			ft_root_edge_flip(dst_ft, &dst_ft->root,
+				dst_ft->root, src_root);
+			ft_root_edge_flip(src_ft, &src_ft->root,
+				src_root, ft_node_flag(fresh_root, 0));
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);
@@ -1370,8 +1377,18 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			ft_root_list_swap_publish(swap_ft, &swap_ft->root,
 				swap_root, tmp, sh, dh, st, dt);
 		} else {
-			rcu_assign_pointer(dst_ft->root, swap_ft->root);
-			rcu_assign_pointer(swap_ft->root, tmp);
+			/*
+			 * No ordered list: each side's root is its only
+			 * reader-visible slot.  Express each lone root edge as a
+			 * single-edge flip descriptor (one release store each, like
+			 * a bare rcu_assign_pointer) so the swap is MCAS-expressible
+			 * like the list-on path.  Capture swap's root before the
+			 * flips, which reference each other's pre-swap values.
+			 */
+			struct cds_ft_inode_flag *swap_root = swap_ft->root;
+
+			ft_root_edge_flip(dst_ft, &dst_ft->root, tmp, swap_root);
+			ft_root_edge_flip(swap_ft, &swap_ft->root, swap_root, tmp);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);

@@ -2312,7 +2312,16 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			subtree->ord_cell_head = NULL;
 			subtree->ord_cell_tail = NULL;
 		} else {
-			rcu_assign_pointer(dst_ft->root, subtree->root);
+			/*
+			 * No ordered list: dst's root is the only reader-visible
+			 * slot.  Express the lone appear edge as a single-edge flip
+			 * descriptor (one release store, like a bare
+			 * rcu_assign_pointer) so it is MCAS-expressible like the
+			 * list-on path.  (@subtree is the fresh EXCLUSIVE trie, so
+			 * its root reset below stays a plain store.)
+			 */
+			ft_root_edge_flip(dst_ft, &dst_ft->root,
+				dst_ft->root, subtree->root);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);
