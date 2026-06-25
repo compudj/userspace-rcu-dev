@@ -112,7 +112,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				&rec);
-			ft_remove_commit_rec(ft, &rec, fuse_cell, run);
+			ft_remove_commit_rec(ft, &rec, fuse_cell, run, NULL);
 			pub->armed = true;
 		} else {
 			struct ft_pub_rec rec = { .n = 0 };
@@ -130,7 +130,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				&rec);
-			ft_remove_commit_rec(ft, &rec, NULL, NULL);
+			ft_remove_commit_rec(ft, &rec, NULL, NULL, NULL);
 		}
 		*nr_clear = 0;
 		return 0;
@@ -162,7 +162,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, src_meta->parent,
 				detach_parent_flag_ptr,
 				ft_node_flag(fresh, 0), &rec);
-			ft_remove_commit_rec(ft, &rec, NULL, NULL);
+			ft_remove_commit_rec(ft, &rec, NULL, NULL, NULL);
 		}
 		free_compressed_node(ft,
 			ft_compressed_node_ptr(iter_node_flag));
@@ -256,6 +256,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_inode_flag *new_cn_flag;
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *publish_parent;
+	struct urcu_flip_txn *txn;
 
 	assert(surviving_child);
 	parent_compressed = ft_node_compressed(iter_meta->parent);
@@ -275,9 +276,24 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 
 	if (merged_len > FT_SKIP_LEN_MAX)
 		return 1;	/* merge does not apply: caller falls back */
+	/*
+	 * Pre-reserve the commit flip-txn BEFORE any pre-flip side-effect.  The
+	 * surviving child's parent-slot offset is wired by ft_pub_rec_add_back_edge
+	 * below (write-side, unobserved only while the parked parent proxy makes an
+	 * up-walk reanchor) -- an aborted flip would leave that offset mismatched
+	 * against the still-old parent, with no proxy to trigger a reanchor.  With
+	 * the txn reserved the publish commits through ft_ord_cell_flip_into and
+	 * cannot fail, so the only failure points are this reservation and the
+	 * new_cn allocation, both BEFORE the build's first side-effect.
+	 */
+	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES);
+	if (!txn)
+		return -ENOMEM;	/* nothing touched: caller aborts */
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
-	if (!new_cn)
+	if (!new_cn) {
+		urcu_flip_txn_destroy(txn);	/* PREPARE state: no grace period */
 		return -ENOMEM;	/* nothing published: caller aborts */
+	}
 
 	/* Compose merged path bytes. */
 	if (parent_cn)
@@ -327,15 +343,16 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * takes the published (possibly skip-encoded) flag.  Because the
 		 * back-edge is deferred, the publish takes new_cn_meta explicitly
 		 * (ft_skip_to_compressed would otherwise read the not-yet-stored
-		 * back-edge to resolve a SKIP_X forward flag).  A lone edge stays
-		 * a single release store.
+		 * back-edge to resolve a SKIP_X forward flag).  The commit rides
+		 * the pre-reserved @txn (ft_ord_cell_flip_into), so it is
+		 * allocation-free past this point and cannot fail.
 		 */
 		ft_pub_rec_add_back_edge(ft, &rec, new_cn->child, new_cn_flag,
 			&new_cn->child);
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
 			new_cn_pub, new_cn_meta, &rec);
-		ft_remove_commit_rec(ft, &rec, dead_cell, run);
+		ft_remove_commit_rec(ft, &rec, dead_cell, run, txn);
 	}
 
 	free_cds_ft_node(ft, ft_node_ptr(iter_node_flag));
@@ -1038,7 +1055,7 @@ int ft_detach_node(struct cds_ft *ft,
 
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
-			ft_remove_commit_rec(ft, &rec, fuse_cell, run);
+			ft_remove_commit_rec(ft, &rec, fuse_cell, run, NULL);
 			pub->armed = true;
 		} else {
 			struct ft_pub_rec rec = { .n = 0 };
@@ -1052,7 +1069,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
-			ft_remove_commit_rec(ft, &rec, NULL, NULL);
+			ft_remove_commit_rec(ft, &rec, NULL, NULL, NULL);
 		}
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED

@@ -1091,12 +1091,22 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
  * closes the candidate-before-exact ordering window the two-store publish
  * relied on: a reader sees the whole old-XOR-new transition at once.
  * @dead_cell may be NULL (list off): then only the recorded edges flip.
+ *
+ * @txn: when non-NULL, a caller-PRE-RESERVED bounded txn (capacity >=
+ * FT_REMOVE_COMMIT_REC_MAX_EDGES) reserved in the op's fallible build phase --
+ * the flip then commits through it (ft_ord_cell_flip_into) and CANNOT fail, so
+ * a caller that has already wired a pre-flip side-effect (e.g. a child's
+ * parent-slot offset via ft_pub_rec_add_back_edge) reaches an allocation-free
+ * point of no return.  NULL keeps the transitional self-allocating flip (bare-
+ * store fallback) for callers not yet migrated.
  */
+#define FT_REMOVE_COMMIT_REC_MAX_EDGES	7	/* <=3 structural (+back-edge) + <=4 cell/run */
 static
 void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
-		struct ft_ord_cell *dead_cell, struct ft_detach_run *run)
+		struct ft_ord_cell *dead_cell, struct ft_detach_run *run,
+		struct urcu_flip_txn *txn)
 {
-	struct ft_ord_cell_edge edges[7];	/* <=3 structural (+back-edge) + <=4 cell/run */
+	struct ft_ord_cell_edge edges[FT_REMOVE_COMMIT_REC_MAX_EDGES];
 	unsigned int n = 0, i;
 
 	for (i = 0; i < rec->n; i++) {
@@ -1110,7 +1120,10 @@ void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
 			&run->first, &run->last, edges, n);
 	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
-	ft_ord_cell_flip(ft, edges, n);
+	if (txn)
+		ft_ord_cell_flip_into(ft, txn, edges, n);
+	else
+		ft_ord_cell_flip(ft, edges, n);
 	if (run) {
 		/* @into NULL = EXCISE-ONLY (the merge source side): the run is
 		 * unlinked from @ft's list but not re-homed; its cells keep their
