@@ -206,14 +206,47 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  *                  when the parent is non-compressed; compressed parents
  *                  resolve their own slot via parent_slot_offset.
  */
+/*
+ * ft_chain_compress_fused: the fused-merge primitive behind the
+ * chain-compress canonicalization.  Builds the merged compressed @new_cn
+ * INVISIBLY (rcu-mutation build phase) from the caller-supplied surviving
+ * child, then commits the whole transition -- forward slot publish + the
+ * surviving child's LIVE re-parent back-edge + a compressed grandparent's
+ * SKIP_X dual + @dead_cell / @run's ordered-cell unsplice -- in ONE flip.
+ *
+ * Because the merge IS the build-invisible commit, the key-disappearing
+ * removal that triggers it can publish through this single flip directly
+ * (no intermediate recompacted / in-place node, no transient non-canonical
+ * state ever): the merged @new_cn REPLACES the boundary node, subsuming the
+ * boundary's child-slot clear (shape D) or external_nodes clear (shape P).
+ *
+ * @surviving_child / @surviving_byte: the boundary's sole post-removal child
+ * and its incoming byte, computed by the caller from PRE-commit state (so
+ * this runs as the removal's commit, not a second flip after it).  Both are
+ * stable across the removal: the merge never rebuilds the parent or the
+ * surviving child.
+ * @dead_cell / @run: the dead key's ordered-list unsplice, folded into the
+ * merge flip (NULL when the ordered list is off / no fusion).
+ *
+ * Returns 0 when the merge committed; -ENOMEM when @new_cn could not be
+ * allocated (NOTHING was published -- the caller aborts the whole removal,
+ * structure untouched); a positive value when the merge does not apply
+ * because the merged length would exceed the compressed-node bound (caller
+ * falls back to the non-fused removal, leaving the boundary 1-child internal
+ * as before).  The replaced nodes (@boundary, @parent_cn, @child_cn) are
+ * enumerated explicitly at the commit so a future MCAS can fold each one's
+ * sequence counter into the same transaction.
+ */
 static
-void ft_canonicalize_chain_compress(struct cds_ft *ft,
+int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag *iter_node_flag,
 		struct cds_ft_metadata *iter_meta,
-		struct cds_ft_inode_flag **slot_ptr)
+		struct cds_ft_inode_flag **slot_ptr,
+		struct cds_ft_inode_flag *surviving_child,
+		uint8_t surviving_byte,
+		struct ft_ord_cell *dead_cell,
+		struct ft_detach_run *run)
 {
-	uint8_t surviving_byte = 0;
-	struct cds_ft_inode_flag *surviving_child;
 	bool parent_compressed, child_compressed;
 	struct cds_ft_compressed_node *parent_cn, *child_cn;
 	struct cds_ft_metadata *parent_cn_meta;
@@ -224,11 +257,7 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *publish_parent;
 
-	surviving_child = ft_node_get_minmax(ft, iter_node_flag,
-		&surviving_byte, FT_LEFTMOST,
-		false /* writer; no validation */);
-	if (!surviving_child)
-		return;
+	assert(surviving_child);
 	parent_compressed = ft_node_compressed(iter_meta->parent);
 	child_compressed = ft_node_compressed(surviving_child);
 	parent_cn = parent_compressed
@@ -245,10 +274,10 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 	merged_len = parent_len + 1 + child_len;
 
 	if (merged_len > FT_SKIP_LEN_MAX)
-		return;
+		return 1;	/* merge does not apply: caller falls back */
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
 	if (!new_cn)
-		return;
+		return -ENOMEM;	/* nothing published: caller aborts */
 
 	/* Compose merged path bytes. */
 	if (parent_cn)
@@ -306,7 +335,7 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
 			new_cn_pub, new_cn_meta, &rec);
-		ft_remove_commit_rec(ft, &rec, NULL, NULL);
+		ft_remove_commit_rec(ft, &rec, dead_cell, run);
 	}
 
 	free_cds_ft_node(ft, ft_node_ptr(iter_node_flag));
@@ -314,6 +343,34 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		free_compressed_node(ft, parent_cn);
 	if (child_cn)
 		free_compressed_node(ft, child_cn);
+	return 0;
+}
+
+/*
+ * Post-removal chain-compress prune as a standalone second flip: compute the
+ * surviving child from the (already-committed) 1-child boundary and fuse no
+ * ordered-cell edge.  The fused-merge primitive above is the preferred path
+ * (the prune rides the removal's own flip); this thin wrapper remains for the
+ * out-of-bound (>FT_SKIP_LEN_MAX) residue case, where the boundary stays a
+ * 1-child internal and an allocation failure is silently skipped (the prune
+ * is best-effort once the removal has already published).
+ */
+static
+void ft_canonicalize_chain_compress(struct cds_ft *ft,
+		struct cds_ft_inode_flag *iter_node_flag,
+		struct cds_ft_metadata *iter_meta,
+		struct cds_ft_inode_flag **slot_ptr)
+{
+	uint8_t surviving_byte = 0;
+	struct cds_ft_inode_flag *surviving_child;
+
+	surviving_child = ft_node_get_minmax(ft, iter_node_flag,
+		&surviving_byte, FT_LEFTMOST,
+		false /* writer; no validation */);
+	if (!surviving_child)
+		return;
+	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_meta,
+		slot_ptr, surviving_child, surviving_byte, NULL, NULL);
 }
 #endif
 
