@@ -227,6 +227,19 @@ struct urcu_flip_txn {
 
 #define URCU_FLIP_CHUNK0_CAP	8	/* initial head-chunk capacity */
 
+/*
+ * Byte size of a bounded txn holding up to @cap edges: the header, the inline
+ * head chunk, and @cap latches, laid out exactly as urcu_flip_txn_create_bounded
+ * mallocs them.  Lets an embedder back a bounded txn with caller storage (e.g. a
+ * 16-aligned on-stack buffer) and urcu_flip_txn_init_bounded it -- no allocation,
+ * hence no failure -- for a commit whose edge count is small and bounded (e.g. a
+ * lone-edge flip, which parks no proxy and owes no grace period, so the txn need
+ * not outlive the call and is never freed).
+ */
+#define URCU_FLIP_TXN_BOUNDED_BYTES(cap)				\
+	(sizeof(struct urcu_flip_txn) + sizeof(struct urcu_flip_chunk)	\
+	 + (size_t) (cap) * sizeof(struct urcu_flip_latch))
+
 static inline
 struct urcu_flip_chunk *urcu_flip_chunk_alloc(unsigned int cap)
 {
@@ -268,18 +281,21 @@ struct urcu_flip_txn *urcu_flip_txn_create(void *(*tag)(struct urcu_flip_proxy *
  * embedder sizes @cap to its edge bound.  Returns NULL on OOM (the embedder
  * falls back to a degraded direct/sequential publish).
  */
+/*
+ * Initialize a bounded txn in caller-provided storage @t, which must be at least
+ * URCU_FLIP_TXN_BOUNDED_BYTES(cap) and aligned to alignof(struct urcu_flip_txn)
+ * (16).  No allocation, so it cannot fail.  The head chunk is inline (at t + 1),
+ * sized to @cap; record() never grows it.  The caller owns @t's storage: such a
+ * txn must NOT be passed to urcu_flip_txn_destroy / freed -- use it only where
+ * the txn need not outlive the call (a lone-edge commit parks no proxy and owes
+ * no grace period, so nothing references it after commit returns).
+ */
 static inline
-struct urcu_flip_txn *urcu_flip_txn_create_bounded(
+void urcu_flip_txn_init_bounded(struct urcu_flip_txn *t,
 		void *(*tag)(struct urcu_flip_proxy *), unsigned int cap)
 {
-	struct urcu_flip_txn *t;
 	struct urcu_flip_chunk *c;
 
-	t = (struct urcu_flip_txn *) malloc(sizeof(*t) +
-			sizeof(struct urcu_flip_chunk) +
-			(size_t) cap * sizeof(struct urcu_flip_latch));
-	if (!t)
-		return NULL;
 	urcu_flip_group_init(&t->group);
 	t->tag = tag;
 	t->state = URCU_FLIP_TXN_PREPARE;
@@ -289,6 +305,18 @@ struct urcu_flip_txn *urcu_flip_txn_create_bounded(
 	t->head = c;
 	t->nr = 0;
 	t->head_inline = true;
+}
+
+static inline
+struct urcu_flip_txn *urcu_flip_txn_create_bounded(
+		void *(*tag)(struct urcu_flip_proxy *), unsigned int cap)
+{
+	struct urcu_flip_txn *t;
+
+	t = (struct urcu_flip_txn *) malloc(URCU_FLIP_TXN_BOUNDED_BYTES(cap));
+	if (!t)
+		return NULL;
+	urcu_flip_txn_init_bounded(t, tag, cap);
 	return t;
 }
 

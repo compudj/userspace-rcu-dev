@@ -575,15 +575,40 @@ void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 
 	if (n == 0)
 		return;
+	if (n == 1) {
+		/*
+		 * Lone edge: commit on an ON-STACK bounded txn.  No allocation
+		 * (hence no OOM and no degraded bare store), and none is needed
+		 * afterwards: a single-edge commit is a lone release store that
+		 * parks no proxy and owes no grace period, so nothing references
+		 * the txn once it returns and the stack frame reclaims it.  It is
+		 * still a {slot, old, new} descriptor commit, not a bare
+		 * rcu_assign_pointer, so a future MCAS covers the slot uniformly.
+		 */
+		union {
+			struct urcu_flip_txn t;
+			char buf[URCU_FLIP_TXN_BOUNDED_BYTES(1)];
+		} u;
+
+		urcu_flip_txn_init_bounded(&u.t, ft_flip_txn_tag, 1);
+		ft_flip_txn_record_reserved(&u.t, (void **) edges[0].slot,
+			(void *) edges[0].old_target,
+			(void *) edges[0].new_target);
+		(void) urcu_flip_txn_commit(&u.t);
+		return;
+	}
 	t = ft_flip_txn_create_bounded(n);
 	if (caa_unlikely(!t)) {
 		/*
-		 * Degraded fallback (point-op splices only, <= 3 edges; the
+		 * Degraded fallback (multi-edge point-op splices, 2 <= n <= 6; the
 		 * merge interleave reserves its txn in the fallible build phase
 		 * and never lands here): sequential edge stores.  A bidirectional
 		 * reader between two stores can observe one neighbour's edge
 		 * updated and the mirrored one not yet -- transient and self-
-		 * healing, never a dangling pointer.
+		 * healing, never a dangling pointer.  (Lone edges took the
+		 * infallible on-stack path above; this n >= 2 fallback is the
+		 * last bare-store escape hatch, pending the grow-and-abort
+		 * conversion.)
 		 */
 		for (i = 0; i < n; i++)
 			rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
