@@ -82,13 +82,19 @@
  *
  * Read / write contract
  * ---------------------
- * Every reader AND writer must run within an RCU read-side critical section
- * (rcu_read_lock()/unlock()) -- the read lock is what keeps an in-flight MCAS
- * descriptor alive while peers help drive it.  Read next/prev only through the
- * accessors below (they resolve the proxy and strip the mark); never touch the
- * raw fields.  Mutators take the flavor's call_rcu (for descriptor reclaim) and
- * loop internally until they commit or definitively fail; they return 0 / 1 on
- * success, -ENOENT if the anchor was deleted, -ENOMEM on descriptor OOM.
+ * Include this header AFTER an RCU flavor (e.g. <urcu-qsbr.h>): the mutators
+ * commit through the transaction bracket <urcu/flip-latch-txn-lockfree.h>,
+ * which opens an RCU read-side section per attempt and defers descriptor
+ * reclaim through the flavor's call_rcu -- the read lock is what keeps an
+ * in-flight MCAS descriptor alive while peers help drive it.  A mutator thus
+ * brackets its own section; the caller still holds a read-side section across
+ * the call so the node arguments (@pos / @elem, and whatever a traversal
+ * reached them through) stay alive -- this nests harmlessly inside the
+ * mutator's section.  Readers likewise run within an RCU read-side section,
+ * and read next/prev only through the accessors below (they resolve the proxy
+ * and strip the mark); never touch the raw fields.  Mutators loop internally
+ * until they commit or definitively fail; they return 0 / 1 on success,
+ * -ENOENT if the anchor was deleted, -ENOMEM on descriptor OOM.
  */
 
 #include <errno.h>
@@ -100,6 +106,7 @@
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>
 #include <urcu/flip-latch-lockfree.h>
+#include <urcu/flip-latch-txn-lockfree.h>
 #include <urcu-pointer.h>
 
 #ifdef __cplusplus
@@ -109,9 +116,6 @@ extern "C" {
 struct cds_bidir_list_lf_node {
 	struct cds_bidir_list_lf_node *next, *prev;
 };
-
-typedef void (*cds_bidir_list_lf_call_rcu_fn)(struct rcu_head *head,
-		void (*func)(struct rcu_head *head));
 
 #define CDS_BIDIR_LIST_LF_HEAD_INIT(name)	{ .next = &(name), .prev = &(name) }
 
@@ -195,42 +199,43 @@ int cds_bidir_list_lf_empty(struct cds_bidir_list_lf_node *head)
  */
 static inline
 int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *pos,
-		cds_bidir_list_lf_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_lf_node *pos)
 {
-	unsigned long retry = 0;
+	struct urcu_flip_lf_txn txn;
+	int ret;
 
-	for (;;) {
-		void *pn = urcu_flip_lf_read((void **) &pos->next);
+	urcu_flip_lf_txn_init(&txn);
+	do {
+		void *pn;
 		struct cds_bidir_list_lf_node *succ;
-		struct urcu_flip_lf_mcas *t;
 
-		if (cds_bidir_list_lf_is_marked(pn))
+		urcu_flip_lf_txn_begin(&txn);
+		pn = urcu_flip_lf_read((void **) &pos->next);
+		if (cds_bidir_list_lf_is_marked(pn)) {
+			urcu_flip_lf_txn_end(&txn);
 			return -ENOENT;			/* @pos was deleted */
+		}
 		succ = (struct cds_bidir_list_lf_node *) pn;	/* unmarked successor */
 
 		/* Build the fresh node invisibly. */
 		newp->next = succ;
 		newp->prev = pos;
 
-		t = urcu_flip_lf_mcas_create(2, retry);
-		if (caa_unlikely(!t))
-			return -ENOMEM;
 		/*
 		 * pos->next: succ -> newp ; succ->prev: pos -> newp.
 		 * &pos->next is the slot that serializes us against deletion:
 		 * del(pos) marks it, and del(succ) rewrites it to skip succ --
-		 * either makes this CAS fail its old value, so we abort and
+		 * either makes this store fail its old value, so we abort and
 		 * retry (and on a marked pos, return -ENOENT above).  See the
 		 * "next"-only mark rationale at the top of this file.
 		 */
-		urcu_flip_lf_mcas_add(t, (void **) &pos->next, succ, newp);
-		urcu_flip_lf_mcas_add(t, (void **) &succ->prev, pos, newp);
-		if (urcu_flip_lf_mcas_commit(t, call_rcu_fn))
-			return 0;
-		retry++;
-		/* aborted: a neighbour changed -- re-read, retry, maybe -ENOENT */
-	}
+		urcu_flip_lf_txn_store(&txn, (void **) &pos->next, succ, newp);
+		urcu_flip_lf_txn_store(&txn, (void **) &succ->prev, pos, newp);
+		ret = urcu_flip_lf_txn_commit(&txn);
+		urcu_flip_lf_txn_end(&txn);
+		/* ret == 0: a neighbour changed -- re-read, retry, maybe -ENOENT */
+	} while (ret == 0);
+	return ret > 0 ? 0 : ret;		/* 0 committed, -ENOMEM on OOM */
 }
 
 /*
@@ -238,27 +243,28 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
  */
 static inline
 int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *pos,
-		cds_bidir_list_lf_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_lf_node *pos)
 {
-	unsigned long retry = 0;
+	struct urcu_flip_lf_txn txn;
+	int ret;
 
-	for (;;) {
-		void *pn = urcu_flip_lf_read((void **) &pos->next);
+	urcu_flip_lf_txn_init(&txn);
+	do {
+		void *pn;
 		struct cds_bidir_list_lf_node *prev;
-		struct urcu_flip_lf_mcas *t;
 
-		if (cds_bidir_list_lf_is_marked(pn))
+		urcu_flip_lf_txn_begin(&txn);
+		pn = urcu_flip_lf_read((void **) &pos->next);
+		if (cds_bidir_list_lf_is_marked(pn)) {
+			urcu_flip_lf_txn_end(&txn);
 			return -ENOENT;			/* @pos was deleted */
+		}
 		prev = cds_bidir_list_lf_unmark(
 				urcu_flip_lf_read((void **) &pos->prev));
 
 		newp->next = pos;
 		newp->prev = prev;
 
-		t = urcu_flip_lf_mcas_create(2, retry);
-		if (caa_unlikely(!t))
-			return -ENOMEM;
 		/*
 		 * prev->next: pos -> newp ; pos->prev: prev -> newp.
 		 * &prev->next is the slot shared with del(prev) (which marks it)
@@ -266,30 +272,28 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 		 * predecessor-next aborts us, and a marked pos is caught on the
 		 * re-read above.  See the "next"-only mark rationale at the top.
 		 */
-		urcu_flip_lf_mcas_add(t, (void **) &prev->next, pos, newp);
-		urcu_flip_lf_mcas_add(t, (void **) &pos->prev, prev, newp);
-		if (urcu_flip_lf_mcas_commit(t, call_rcu_fn))
-			return 0;
-		retry++;
-	}
+		urcu_flip_lf_txn_store(&txn, (void **) &prev->next, pos, newp);
+		urcu_flip_lf_txn_store(&txn, (void **) &pos->prev, prev, newp);
+		ret = urcu_flip_lf_txn_commit(&txn);
+		urcu_flip_lf_txn_end(&txn);
+	} while (ret == 0);
+	return ret > 0 ? 0 : ret;		/* 0 committed, -ENOMEM on OOM */
 }
 
 /* Add @newp at the head (just after @head).  Always succeeds (head is immortal). */
 static inline
 int cds_bidir_list_lf_add_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *head,
-		cds_bidir_list_lf_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_lf_node *head)
 {
-	return cds_bidir_list_lf_insert_after_rcu(newp, head, call_rcu_fn);
+	return cds_bidir_list_lf_insert_after_rcu(newp, head);
 }
 
 /* Add @newp at the tail (just before @head).  Always succeeds. */
 static inline
 int cds_bidir_list_lf_add_tail_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *head,
-		cds_bidir_list_lf_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_lf_node *head)
 {
-	return cds_bidir_list_lf_insert_before_rcu(newp, head, call_rcu_fn);
+	return cds_bidir_list_lf_insert_before_rcu(newp, head);
 }
 
 /*
@@ -298,25 +302,26 @@ int cds_bidir_list_lf_add_tail_rcu(struct cds_bidir_list_lf_node *newp,
  * reclaim), or -ENOMEM on descriptor allocation failure.
  */
 static inline
-int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
-		cds_bidir_list_lf_call_rcu_fn call_rcu_fn)
+int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem)
 {
-	unsigned long retry = 0;
+	struct urcu_flip_lf_txn txn;
+	int ret;
 
-	for (;;) {
-		void *en = urcu_flip_lf_read((void **) &elem->next);
+	urcu_flip_lf_txn_init(&txn);
+	do {
+		void *en;
 		struct cds_bidir_list_lf_node *next, *prev;
-		struct urcu_flip_lf_mcas *t;
 
-		if (cds_bidir_list_lf_is_marked(en))
+		urcu_flip_lf_txn_begin(&txn);
+		en = urcu_flip_lf_read((void **) &elem->next);
+		if (cds_bidir_list_lf_is_marked(en)) {
+			urcu_flip_lf_txn_end(&txn);
 			return 0;			/* already deleted by a peer */
+		}
 		next = (struct cds_bidir_list_lf_node *) en;
 		prev = cds_bidir_list_lf_unmark(
 				urcu_flip_lf_read((void **) &elem->prev));
 
-		t = urcu_flip_lf_mcas_create(3, retry);
-		if (caa_unlikely(!t))
-			return -ENOMEM;
 		/*
 		 * Mark elem (logical delete), then unlink both neighbour edges.
 		 * &prev->next (old value elem) is the slot a racing
@@ -326,15 +331,15 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
 		 * (or insert_before(elem)) terminate with -ENOENT.  See the
 		 * "next"-only mark rationale at the top of this file.
 		 */
-		urcu_flip_lf_mcas_add(t, (void **) &elem->next, next,
+		urcu_flip_lf_txn_store(&txn, (void **) &elem->next, next,
 				cds_bidir_list_lf_set_mark(next));
-		urcu_flip_lf_mcas_add(t, (void **) &prev->next, elem, next);
-		urcu_flip_lf_mcas_add(t, (void **) &next->prev, elem, prev);
-		if (urcu_flip_lf_mcas_commit(t, call_rcu_fn))
-			return 1;			/* removed by this call */
-		retry++;
-		/* aborted: neighbours changed -- retry, maybe find it deleted */
-	}
+		urcu_flip_lf_txn_store(&txn, (void **) &prev->next, elem, next);
+		urcu_flip_lf_txn_store(&txn, (void **) &next->prev, elem, prev);
+		ret = urcu_flip_lf_txn_commit(&txn);
+		urcu_flip_lf_txn_end(&txn);
+		/* ret == 0: neighbours changed -- retry, maybe find it deleted */
+	} while (ret == 0);
+	return ret > 0 ? 1 : ret;		/* 1 removed by this call, -ENOMEM */
 }
 
 #define cds_bidir_list_lf_entry(ptr, type, member) \

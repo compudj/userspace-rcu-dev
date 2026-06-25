@@ -38,7 +38,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/flip-latch-lockfree.h>
+#include <urcu/flip-latch-txn-lockfree.h>
 #include <urcu/rcu-bidir-list-lockfree.h>
 
 #include "tap.h"
@@ -85,22 +85,21 @@ static unsigned int xs(unsigned int x)
 	return x;
 }
 
-/* Insert @key keeping the list non-decreasing.  Single-attempt MCAS + re-find. */
+/* Insert @key keeping the list non-decreasing, via the transaction bracket. */
 static void sorted_insert(int key)
 {
 	struct lnode *n = (struct lnode *) malloc(sizeof(*n));
+	struct urcu_flip_lf_txn txn;
+	int ret;
 
 	if (!n)
 		abort();
-	unsigned long retry = 0;
-
 	n->key = key;
-	for (;;) {
+	urcu_flip_lf_txn_init(&txn);
+	do {
 		struct cds_bidir_list_lf_node *prev = &g_head, *succ;
-		struct urcu_flip_lf_mcas *t;
-		bool ok;
 
-		rcu_read_lock();
+		urcu_flip_lf_txn_begin(&txn);
 		/* prev = last node with key <= @key; succ = first with key > @key */
 		for (;;) {
 			succ = cds_bidir_list_lf_next_rcu(prev);
@@ -110,19 +109,15 @@ static void sorted_insert(int key)
 		}
 		n->node.next = succ;
 		n->node.prev = prev;
-		t = urcu_flip_lf_mcas_create(2, retry);
-		if (!t)
-			abort();
 		/* validates prev->next == succ and succ->prev == prev */
-		urcu_flip_lf_mcas_add(t, (void **) &prev->next, succ, &n->node);
-		urcu_flip_lf_mcas_add(t, (void **) &succ->prev, prev, &n->node);
-		ok = urcu_flip_lf_mcas_commit(t, call_rcu);
-		rcu_read_unlock();
-		if (ok)
-			return;
-		retry++;
-		/* aborted (position shifted / anchor gone): re-find and retry */
-	}
+		urcu_flip_lf_txn_store(&txn, (void **) &prev->next, succ, &n->node);
+		urcu_flip_lf_txn_store(&txn, (void **) &succ->prev, prev, &n->node);
+		ret = urcu_flip_lf_txn_commit(&txn);
+		urcu_flip_lf_txn_end(&txn);
+		if (ret < 0)
+			abort();		/* -ENOMEM */
+		/* ret == 0 (position shifted / anchor gone): re-find and retry */
+	} while (ret == 0);
 }
 
 /* Delete the first node with key == @key, if present. */
@@ -144,7 +139,7 @@ static void delete_key(int key)
 			break;			/* sorted: past @key, absent */
 	}
 	if (target) {
-		int r = cds_bidir_list_lf_del_rcu(&target->node, call_rcu);
+		int r = cds_bidir_list_lf_del_rcu(&target->node);
 
 		rcu_read_unlock();
 		if (r == 1)			/* this call removed it -> reclaim */
@@ -312,7 +307,7 @@ int main(void)
 		struct lnode *n = caa_container_of(p, struct lnode, node);
 		struct cds_bidir_list_lf_node *nextp = cds_bidir_list_lf_next_rcu(p);
 
-		if (cds_bidir_list_lf_del_rcu(&n->node, call_rcu) == 1)
+		if (cds_bidir_list_lf_del_rcu(&n->node) == 1)
 			call_rcu(&n->rh, lnode_free);
 		p = nextp;
 	}
