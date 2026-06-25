@@ -28,7 +28,7 @@ nobase_include_HEADERS = \
 	urcu/compiler.h \
 	urcu/debug.h \
 	urcu/defer.h \
-	urcu/fifo.h \
+	urcu/fair-mutex.h \
 	urcu/flavor.h \
 	urcu/flip-latch.h \
 	urcu/flip-latch-lockfree.h \

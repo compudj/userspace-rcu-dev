@@ -64,8 +64,8 @@
  * defeated by a stream of smaller ones (the single-edge fast path and the
  * read->install window let a committer change a footprint slot between this
  * op's read and its install).  When a handle crosses a threshold it
- * escalates into a per-domain FIFO turnstile (urcu/fifo.h) -- a fair,
- * lock-free handoff -- and publishes domain->active so every *future*
+ * escalates into a per-domain fair mutex (urcu/fair-mutex.h) -- an
+ * MCS-style lock -- and publishes domain->active so every *future*
  * transaction funnels through the same lane.  That closes the
  * optimistic-writer set: the escalated op then contends only with the
  * finite in-flight set (bounded by thread count) and commits within a
@@ -94,7 +94,7 @@
 #include <errno.h>
 
 #include <urcu/compiler.h>
-#include <urcu/fifo.h>
+#include <urcu/fair-mutex.h>
 #include <urcu/flip-latch-lockfree.h>
 
 #ifdef __cplusplus
@@ -113,7 +113,7 @@ extern "C" {
 
 /*
  * Escalation thresholds (override before include).  A handle escalates into the
- * domain's FIFO lane when its retry count reaches URCU_FLIP_LF_TXN_FALLBACK
+ * domain's lock when its retry count reaches URCU_FLIP_LF_TXN_FALLBACK
  * (reactive: a starved op) or its write-set size reaches URCU_FLIP_LF_TXN_BIG
  * (proactive: a large op, e.g. a wide merge).  FALLBACK sits well above the
  * engine's single-edge URCU_FLIP_LF_ESCALATE so ordinary contention rides the
@@ -140,14 +140,14 @@ extern "C" {
  * disable the fallback (pure optimistic retry).
  */
 struct urcu_flip_lf_txn_domain {
-	struct cds_fifo_turnstile fifo;	/* the fair escalation lane */
+	struct cds_fair_mutex lock;	/* the fair escalation lane */
 	unsigned long active;		/* a fallback episode is in progress */
 };
 
 static inline
 void urcu_flip_lf_txn_domain_init(struct urcu_flip_lf_txn_domain *d)
 {
-	cds_fifo_turnstile_init(&d->fifo);
+	cds_fair_mutex_init(&d->lock);
 	d->active = 0;
 }
 
@@ -160,8 +160,8 @@ struct urcu_flip_lf_txn {
 					 * realized size at commit so retries don't re-grow. */
 	struct urcu_flip_lf_mcas *mcas;	/* this attempt's descriptor: NULL (none yet),
 					 * a live descriptor, or the ENOMEM marker */
-	struct cds_fifo_waiter waiter;	/* our node while awaiting the turn */
-	int in_fallback;		/* we currently hold the FIFO turn */
+	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
+	int in_fallback;		/* we currently hold the lock */
 	int retrying;			/* commit asked retry: keep the turn */
 };
 
@@ -179,15 +179,15 @@ void urcu_flip_lf_txn_init(struct urcu_flip_lf_txn *txn,
 }
 
 /*
- * Take the domain's FIFO turn (blocks until we are the head) and publish that a
+ * Take the domain's lock (blocks until we are the head) and publish that a
  * fallback episode is in progress, so future transactions funnel into the lane.
- * Caller must NOT hold the RCU read-side section: cds_fifo_enter may block.
+ * Caller must NOT hold the RCU read-side section: cds_fair_mutex_lock may block.
  */
 static inline
 void urcu_flip_lf_txn__enter_fallback(struct urcu_flip_lf_txn *txn)
 {
 	/*
-	 * cds_fifo_enter may park on a futex until our turn.  A QSBR reader
+	 * cds_fair_mutex_lock may park on a futex until our turn.  A QSBR reader
 	 * that blocks while online stalls grace periods -- and thus the
 	 * engine's call_rcu reclaim -- for the whole wait, so go RCU-offline
 	 * around it.  We are outside the bracket's read-side section here
@@ -195,26 +195,26 @@ void urcu_flip_lf_txn__enter_fallback(struct urcu_flip_lf_txn *txn)
 	 * this is safe; other flavors implement the pair too (flavor API).
 	 */
 	rcu_thread_offline();
-	cds_fifo_enter(&txn->domain->fifo, &txn->waiter);
+	cds_fair_mutex_lock(&txn->domain->lock, &txn->waiter);
 	rcu_thread_online();
 	uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
 	txn->in_fallback = 1;
 }
 
 /*
- * Release the FIFO turn; if we were the last holder, end the episode by
+ * Release the lock; if we were the last holder, end the episode by
  * clearing domain->active so new transactions resume the optimistic path.
  */
 static inline
 void urcu_flip_lf_txn__exit_fallback(struct urcu_flip_lf_txn *txn)
 {
-	if (cds_fifo_exit(&txn->domain->fifo, &txn->waiter))
+	if (cds_fair_mutex_unlock(&txn->domain->lock, &txn->waiter))
 		uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
 	txn->in_fallback = 0;
 }
 
 /*
- * Whether this attempt should escalate into the FIFO lane before opening: a
+ * Whether this attempt should escalate into the lock before opening: a
  * starved (retry) or already-known large (min_alloc) handle initiates an
  * episode, and domain->active funnels every other handle into the same lane
  * for the episode's duration -- that funnelling is what closes the optimistic-
@@ -240,7 +240,7 @@ void urcu_flip_lf_txn_begin(struct urcu_flip_lf_txn *txn)
 	/*
 	 * Escalate before opening the attempt: a starved (retry) or
 	 * already-known large (min_alloc) handle takes its FIFO turn here.
-	 * cds_fifo_enter may block, so it must run outside the RCU read-side
+	 * cds_fair_mutex_lock may block, so it must run outside the RCU read-side
 	 * section.
 	 */
 	if (urcu_flip_lf_txn__want_fallback(txn))

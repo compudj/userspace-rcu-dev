@@ -3,18 +3,17 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Unit test for the wfcqueue FIFO turnstile (src/urcu-fifo.h).
+ * Unit test for the fair (FIFO) mutex (urcu/fair-mutex.h).
  *
  * Validates:
- *   - single-threaded enter/exit sanity;
+ *   - single-threaded lock/unlock sanity;
  *   - mutual exclusion under contention: a non-atomic counter incremented
  *     inside the critical section must equal the number of acquisitions, and
  *     the concurrent-holder count must never exceed 1;
  *   - liveness: all threads complete (no deadlock).
  *
- * FIFO ordering is by construction (the wait-free enqueue xchg is the single
- * linearization point) and is not asserted here, since the ticket read and the
- * enqueue are not a single atomic step.
+ * FIFO acquisition order is by construction (the wait-free enqueue xchg is the
+ * single linearization point) and is not asserted here.
  */
 
 #define _LGPL_SOURCE
@@ -26,11 +25,11 @@
 
 #include "tap.h"
 #include <urcu/uatomic.h>
-#include <urcu/fifo.h>
+#include <urcu/fair-mutex.h>
 
 #define NR_TESTS	4
 
-static struct cds_fifo_turnstile turnstile;
+static struct cds_fair_mutex mutex;
 
 /* Non-atomic: only consistent if mutual exclusion holds. The whole point. */
 static unsigned long protected_counter;
@@ -65,12 +64,12 @@ static void *worker(void *arg)
 {
 	unsigned long i;
 	unsigned int seed = (unsigned int)(uintptr_t)arg + 1;
-	struct cds_fifo_waiter w;
+	struct cds_fair_mutex_node w;
 
 	for (i = 0; i < nr_iter; i++) {
-		cds_fifo_enter(&turnstile, &w);
+		cds_fair_mutex_lock(&mutex, &w);
 		critical_section(&seed);
-		cds_fifo_exit(&turnstile, &w);
+		cds_fair_mutex_unlock(&mutex, &w);
 	}
 	return NULL;
 }
@@ -88,19 +87,19 @@ int main(int argc, char **argv)
 
 	plan_tests(NR_TESTS);
 
-	cds_fifo_turnstile_init(&turnstile);
+	cds_fair_mutex_init(&mutex);
 
-	/* 1. Single-threaded enter/exit sanity. */
+	/* 1. Single-threaded lock/unlock sanity. */
 	{
-		struct cds_fifo_waiter w;
+		struct cds_fair_mutex_node w;
 
 		for (i = 0; i < (int)st_iter; i++) {
-			cds_fifo_enter(&turnstile, &w);
+			cds_fair_mutex_lock(&mutex, &w);
 			protected_counter++;
-			cds_fifo_exit(&turnstile, &w);
+			cds_fair_mutex_unlock(&mutex, &w);
 		}
 		ok(protected_counter == st_iter,
-			"single-threaded: %lu enter/exit cycles, counter exact",
+			"single-threaded: %lu lock/unlock cycles, counter exact",
 			st_iter);
 	}
 
