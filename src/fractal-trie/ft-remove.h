@@ -968,25 +968,6 @@ end:
  * rcu_dereference of child->prev.
  */
 /*
- * Record @rec's <=2 structural edges (forward parent slot + a compressed
- * parent's SKIP_X dual, populated by _ft_publish_to_parent) into @sedges.
- * Returns the edge count.
- */
-static
-unsigned int ft_pub_rec_sedges(struct ft_pub_rec *rec,
-		struct ft_ord_cell_edge *sedges)
-{
-	unsigned int i;
-
-	for (i = 0; i < rec->n; i++) {
-		sedges[i].slot = (struct ft_ord_cell **) rec->slot[i];
-		sedges[i].old_target = (struct ft_ord_cell *) rec->old_val[i];
-		sedges[i].new_target = (struct ft_ord_cell *) rec->new_val[i];
-	}
-	return rec->n;
-}
-
-/*
  * Head promotion: @node, the head of a duplicate chain, leaves the trie and
  * @next_node (its next duplicate, non-NULL) takes its place at the same key.
  *

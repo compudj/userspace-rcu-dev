@@ -2566,44 +2566,76 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	}
 
 	/*
-	 * Splice @new_node into the chain in place of @old_node: it inherits
-	 * @old_node's prev and next, the successor (if any) is repointed back
-	 * at it, and rcu_assign_pointer publishes it into the slot, ordering
-	 * those stores before it becomes reachable.
+	 * Splice @new_node into @old_node's chain position.  When @old_node is a
+	 * chain HEAD with the ordered list on, publish a FRESH cell for @new_node
+	 * (its node field set while the cell is hidden -- cell->node stays
+	 * WRITE-ONCE, the way the public cds_ft_cell_node reads it as a plain
+	 * pointer) and swap it in for @old_node's cell FUSED with the structural
+	 * forward publish and -- for a compressed holder -- the grandparent SKIP_X
+	 * dual, in ONE flip: a reader never sees @new_node at one index but
+	 * @old_node (about to be freed) at another, nor a stale skip target into
+	 * @old_node (the dangling-skip UAF).  A non-head duplicate (no cell) is a
+	 * single predecessor->next store; a list-off head inherits the flagged
+	 * parent and flips the structural + SKIP_X dual.  Mirrors ft_promote_head.
 	 */
-	new_node->prev = old_node->prev;
-	new_node->next = ft_node_next(old_node);
-	if (new_node->next)
-		new_node->next->prev = new_node;
-	rcu_assign_pointer(*pub_slot, (struct cds_ft_inode_flag *) new_node);
+	{
+		bool is_head = !ft_node_external(
+			(struct cds_ft_inode_flag *) old_node->prev);
+		struct cds_ft_inode_flag *parent_nf = cn ?
+			ft_compressed_node_flag(cn) : holder_flag;
+		struct ft_ord_cell *old_cell = (ft->ordered_list && is_head) ?
+			ft_ord_cell_ptr(old_node->prev) : NULL;
+		void *new_cell_flag = NULL;
+		struct ft_pub_rec rec = { .n = 0 };
+		struct ft_ord_cell_edge sedges[2];
+		unsigned int n_s;
 
-	/*
-	 * Cell transfer: @new_node inherited @old_node's prev (its cell, when a
-	 * head) via the copy above, so it shares the same cell -- now fully
-	 * assembled and published.  Retarget the cell at @new_node so up-walks
-	 * and ordered iteration resolve to the live node; the cell's parent and
-	 * ord-list position are preserved (no list surgery, no free).  A
-	 * non-head duplicate replace copied an external prev -- nothing to do.
-	 * List off: @new_node->prev is the flagged parent directly (inherited),
-	 * no cell to retarget.
-	 */
-	if (ft->ordered_list &&
-	    !ft_node_external((struct cds_ft_inode_flag *) new_node->prev))
-		rcu_assign_pointer(ft_ord_cell_ptr(new_node->prev)->node, new_node);
+		/*
+		 * Alloc the fresh cell BEFORE any mutation so OOM aborts cleanly
+		 * (@new_node still carries its zeroed links, @old_node is intact).
+		 */
+		if (old_cell) {
+			new_cell_flag = ft_ord_cell_alloc(ft, new_node,
+				old_cell->parent);
+			if (!new_cell_flag) {
+				s = CDS_FT_STATUS_MEMORY_ERROR;
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
+		}
+		/* Successor repoint (all cases), ordered before the publish. */
+		new_node->next = ft_node_next(old_node);
+		if (new_node->next)
+			new_node->next->prev = new_node;
+		if (!is_head) {
+			/* Non-head duplicate: a single predecessor->next store. */
+			new_node->prev = old_node->prev;
+			rcu_assign_pointer(*pub_slot,
+				(struct cds_ft_inode_flag *) new_node);
+		} else if (old_cell) {
+			/* Head, list on: fresh-cell swap fused with the publish. */
+			struct ft_ord_cell *new_cell =
+				ft_ord_cell_ptr(new_cell_flag);
 
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	/*
-	 * A compressed-head replace changed cn->child; re-encode the
-	 * grandparent's skip-compressed slot to the new child so a skip
-	 * descent or ft_skip_reanchor up-walk does not follow the stale
-	 * pointer into the about-to-be-freed @old_node (the dangling-skip
-	 * UAF that cds_ft_remove guards against on its compressed-head
-	 * unchain).  No-ops for a plain (non-skip) compressed slot.
-	 */
-	if (cn)
-		ft_update_skip_pointer(ft_get_parent_slot(
-			cds_ft_item_to_metadata((struct cds_ft_inode *) cn), ft), cn);
-#endif
+			cds_ft_item_to_metadata(new_cell)->incoming_byte =
+				cds_ft_item_to_metadata(old_cell)->incoming_byte;
+			/* Back-pointer wired before the forward publish. */
+			new_node->prev = new_cell_flag;
+			_ft_publish_to_parent(ft, parent_nf, pub_slot,
+				(struct cds_ft_inode_flag *) new_node, &rec);
+			n_s = ft_pub_rec_sedges(&rec, sedges);
+			ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
+				sedges, n_s);
+			ft_ord_cell_free(ft, old_cell);
+		} else {
+			/* Head, list off: no cell; flip the structural + SKIP_X dual. */
+			new_node->prev = old_node->prev;
+			_ft_publish_to_parent(ft, parent_nf, pub_slot,
+				(struct cds_ft_inode_flag *) new_node, &rec);
+			n_s = ft_pub_rec_sedges(&rec, sedges);
+			ft_ord_cell_flip(ft, sedges, n_s);
+		}
+	}
 
 	/*
 	 * @old_node has left the trie (replaced by @new_node): tombstone it.

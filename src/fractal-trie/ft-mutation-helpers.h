@@ -764,6 +764,26 @@ void ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 }
 
 /*
+ * Copy @rec's <=2 structural edges (the forward parent slot plus a compressed
+ * parent's SKIP_X dual, populated by _ft_publish_to_parent) into @sedges for a
+ * fused commit (ft_ord_cell_swap_publish_multi / ft_ord_cell_flip).  Returns the
+ * edge count.
+ */
+static
+unsigned int ft_pub_rec_sedges(struct ft_pub_rec *rec,
+		struct ft_ord_cell_edge *sedges)
+{
+	unsigned int i;
+
+	for (i = 0; i < rec->n; i++) {
+		sedges[i].slot = (struct ft_ord_cell **) rec->slot[i];
+		sedges[i].old_target = (struct ft_ord_cell *) rec->old_val[i];
+		sedges[i].new_target = (struct ft_ord_cell *) rec->new_val[i];
+	}
+	return rec->n;
+}
+
+/*
  * Key-disappearing remove, fused (the dual of ft_ord_cell_swap_publish): commit
  * a key's single reader-visible structural unlink (@struct_slot transitions from
  * @struct_old to @struct_new -- a leaf body slot or compressed cn->child cleared
