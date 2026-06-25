@@ -126,23 +126,53 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			      uatomic_load(&ft->max_used_key_len, CMM_RELAXED),
 			      CMM_RELAXED);
 
-		/* Give source a fresh empty root. */
-		rcu_assign_pointer(ft->root, ft_node_flag(fresh_node, 0));
-		FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
-
 		/*
-		 * Ordered list: a root detach moves the WHOLE trie, so @ft's
-		 * entire ordered cell list becomes @detached's.  The cells'
-		 * internal links are unchanged; only the head/tail endpoints
-		 * transfer.  Matches the root-swap above (a concurrent reader
-		 * mid-iteration follows its RCU snapshot into @detached).
+		 * Give source a fresh empty root.  A root detach moves the
+		 * WHOLE trie, so when the ordered list is enabled @ft's entire
+		 * ordered cell list becomes @detached's: the cells' internal
+		 * links are unchanged; only the head/tail endpoints transfer.
+		 * Capture @ft's endpoints into @detached first (build-invisible:
+		 * no reader is in @detached yet), then fuse the root swap with
+		 * @ft's head/tail clear into ONE flip (ft_root_list_swap_publish,
+		 * src/disappear side) so a concurrent reader never observes @ft
+		 * with its structure emptied but its ordered list still populated
+		 * (or vice versa) -- a reader mid-iteration follows its RCU
+		 * snapshot into @detached.
 		 */
 		if (ft->group->ordered_list_set) {
 			detached->ord_cell_head = ft->ord_cell_head;
 			detached->ord_cell_tail = ft->ord_cell_tail;
-			ft->ord_cell_head = NULL;
-			ft->ord_cell_tail = NULL;
+			ft_root_list_swap_publish(ft, &ft->root,
+				ft->root, ft_node_flag(fresh_node, 0),
+				ft->ord_cell_head, NULL,
+				ft->ord_cell_tail, NULL);
+		} else {
+			/*
+			 * No ordered list: the root pointer is the only
+			 * reader-visible slot.  Express it as a single-edge flip
+			 * descriptor anyway (a lone edge commits as one release
+			 * store -- no proxy, no grace period -- exactly like a
+			 * bare rcu_assign_pointer) so the root swap is captured as
+			 * a {slot, old, new} edge like every other structural
+			 * publish.  A future multi-writer MCAS commit then covers
+			 * this slot uniformly: a bare store would discard @old
+			 * (the compare-and-swap "expected" value) and sit outside
+			 * the descriptor protocol, yet ft->root can be in a
+			 * concurrent writer's word-set (e.g. a near-root insert
+			 * that recompacts and republishes the root).  The bulk op
+			 * already does a grace period, so the bounded-txn alloc is
+			 * negligible here.
+			 */
+			struct ft_ord_cell_edge edge = {
+				.slot = (struct ft_ord_cell **) &ft->root,
+				.old_target = (struct ft_ord_cell *) ft->root,
+				.new_target = (struct ft_ord_cell *)
+					ft_node_flag(fresh_node, 0),
+			};
+
+			ft_ord_cell_flip(ft, &edge, 1);
 		}
+		FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
 		/*
 		 * Drain @ft's readers that entered before the root swap and may
