@@ -1729,19 +1729,27 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * root install below.
 		 */
 		if (!swap_empty) {
-			rcu_assign_pointer(swap_ft->root, ft_node_flag(fresh, 0));
+			struct cds_ft_inode_flag *empty = ft_node_flag(fresh, 0);
+
+			/*
+			 * Retire swap's root to an empty node AND (paired) unlink run_S
+			 * from swap's ordered list, FUSED in ONE flip so a reader never
+			 * sees swap structurally empty while its ordered list still shows
+			 * run_S -- the disappear-side cross-view window.  The following
+			 * sync then drains swap's readers of the old content; run_D is
+			 * installed as swap's list after the extract publish below.
+			 * (List off: just the lone root edge.)
+			 */
+			if (gs_ord)
+				ft_root_list_swap_publish(swap_ft, &swap_ft->root,
+					swap_ft->root, empty,
+					swap_ft->ord_cell_head, NULL,
+					swap_ft->ord_cell_tail, NULL);
+			else
+				ft_root_edge_flip(swap_ft, &swap_ft->root,
+					swap_ft->root, empty);
 			FT_TP(root_publish, (const void *) swap_ft,
 				(const void *) swap_ft->root);
-			/*
-			 * run_S is captured; unlink it from swap's ordered list here
-			 * (paired with the structural root unlink) so this sync drains
-			 * swap ord-readers of run_S too.  run_D is installed as swap's
-			 * list after the extract publish below.
-			 */
-			if (gs_ord) {
-				swap_ft->ord_cell_head = NULL;
-				swap_ft->ord_cell_tail = NULL;
-			}
 			if (!swap_ft->exclusive)
 				swap_ft->group->flavor->update_synchronize_rcu();
 		}
@@ -1874,59 +1882,86 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * dst-side drain above.
 		 */
 		ft_glue_apply_deferred(dst_ft, &glue_extract);
-		if (top_B) {
-			struct cds_ft_metadata *bm =
-				cds_ft_item_to_metadata(ft_node_ptr(top_B));
+		{
+			struct ft_ord_cell_edge edges[3];	/* root + head + tail */
+			unsigned int n = 0;
 
-			rcu_assign_pointer(bm->parent, NULL);
+			if (top_B) {
+				struct cds_ft_metadata *bm =
+					cds_ft_item_to_metadata(ft_node_ptr(top_B));
+
+				/* top_B is freshly built (invisible); wire its root parent. */
+				rcu_assign_pointer(bm->parent, NULL);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			bm->parent_slot_offset = 0;
+				bm->parent_slot_offset = 0;
 #endif
-			rcu_assign_pointer(swap_ft->root, top_B);
+				/*
+				 * Structural root install, deferred into the fused flip
+				 * below so it commits atomically with run_D's head/tail --
+				 * the appear-side cross-view window (structure-present /
+				 * list-empty).
+				 */
+				edges[n].slot = (struct ft_ord_cell **) &swap_ft->root;
+				edges[n].old_target =
+					(struct ft_ord_cell *) swap_ft->root;
+				edges[n].new_target = (struct ft_ord_cell *) top_B;
+				n++;
+			} else {
+				/*
+				 * External (or absent) displaced content: attach it as
+				 * external_nodes on swap_ft's root (the transient @fresh for a
+				 * non-empty swap, or old_swap_root's empty root for an empty swap).
+				 * The preceding dst-side drain makes this displaced
+				 * (pre-existing) content's plain forward store safe, and the
+				 * target is a NULL-parent root (DRAIN_EXEMPT).
+				 */
+				struct cds_ft_inode_flag *root_nf = swap_empty ?
+					old_swap_root : ft_node_flag(fresh, 0);
+				struct cds_ft_metadata *rm = swap_empty ?
+					swap_rmeta : fresh_meta;
+
+				if (old_child) {
+					ft_metadata_set_external_nodes(root_nf, rm,
+						(struct cds_ft_node *) ft_node_ptr(old_child));
+					/*
+					 * Root: parent is legitimately NULL.  Publishing
+					 * prev here is safe (no fresh non-root cluster
+					 * node in this back-pointer chain); kept paired
+					 * with the metadata write for consistency with
+					 * the other attach sites.
+					 */
+					ft_publish_external_nodes_prev(dst_ft, root_nf,
+						(struct cds_ft_node *) ft_node_ptr(old_child));
+					ft_nr_keys_store(rm, old_count, CMM_RELEASE);
+				}
+			}
+
+			/*
+			 * Install run_D (the extracted subtree's heads) as swap_ft's
+			 * whole ordered list, FUSED with the structural root install
+			 * above (top_B case) into ONE flip so a reader never sees swap
+			 * structure-present / list-empty.  swap_ft was drained at the
+			 * unlink sync, so clearing run_D's boundary links is a plain store.
+			 */
+			if (gs_ord) {
+				gs_d_first->ord_prev = NULL;
+				gs_d_last->ord_next = NULL;
+				n = ft_ord_cell_endpoint_edge(&swap_ft->ord_cell_head,
+					swap_ft->ord_cell_head, gs_d_first, edges, n);
+				n = ft_ord_cell_endpoint_edge(&swap_ft->ord_cell_tail,
+					swap_ft->ord_cell_tail, gs_d_last, edges, n);
+			}
+			if (n)
+				ft_ord_cell_flip(swap_ft, edges, n);
 			FT_TP(root_publish, (const void *) swap_ft,
 				(const void *) swap_ft->root);
-			if (swap_empty)
-				free_cds_ft_node(swap_ft, ft_node_ptr(old_swap_root));
-			else
-				free_cds_ft_node(swap_ft, fresh);
-		} else {
-			/*
-			 * External (or absent) displaced content: attach it as
-			 * external_nodes on swap_ft's root (the transient @fresh for a
-			 * non-empty swap, or old_swap_root's empty root for an empty swap).
-			 */
-			struct cds_ft_inode_flag *root_nf = swap_empty ?
-				old_swap_root : ft_node_flag(fresh, 0);
-			struct cds_ft_metadata *rm = swap_empty ?
-				swap_rmeta : fresh_meta;
-
-			if (old_child) {
-				ft_metadata_set_external_nodes(root_nf, rm,
-					(struct cds_ft_node *) ft_node_ptr(old_child));
-				/*
-				 * Root: parent is legitimately NULL.  Publishing
-				 * prev here is safe (no fresh non-root cluster
-				 * node in this back-pointer chain); kept paired
-				 * with the metadata write for consistency with
-				 * the other attach sites.
-				 */
-				ft_publish_external_nodes_prev(dst_ft, root_nf,
-					(struct cds_ft_node *) ft_node_ptr(old_child));
-				ft_nr_keys_store(rm, old_count, CMM_RELEASE);
+			if (top_B) {
+				if (swap_empty)
+					free_cds_ft_node(swap_ft,
+						ft_node_ptr(old_swap_root));
+				else
+					free_cds_ft_node(swap_ft, fresh);
 			}
-		}
-
-		/*
-		 * Install run_D (the extracted subtree's heads) as swap_ft's whole
-		 * ordered list, mirroring the extract root publish above.  swap_ft
-		 * was drained at the unlink sync, so clearing run_D's boundary links
-		 * is a plain store; the head/tail publish uses rcu_assign.
-		 */
-		if (gs_ord) {
-			gs_d_first->ord_prev = NULL;
-			gs_d_last->ord_next = NULL;
-			rcu_assign_pointer(swap_ft->ord_cell_head, gs_d_first);
-			rcu_assign_pointer(swap_ft->ord_cell_tail, gs_d_last);
 		}
 
 		/* Reclaim the old (replaced) live nodes after the publishes. */
