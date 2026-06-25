@@ -153,10 +153,13 @@ void cds_fifo_enter(struct cds_fifo_turnstile *t, struct cds_fifo_waiter *w)
 }
 
 /*
- * Release the turnstile and hand off to the FIFO successor.
+ * Release the turnstile and hand off to the FIFO successor.  Returns true if we
+ * were the last holder (the queue is now empty), false if a successor was
+ * granted the token.  The "last" return lets a caller tear down episode-scoped
+ * shared state exactly when the turnstile drains.
  */
 static inline
-void cds_fifo_exit(struct cds_fifo_turnstile *t, struct cds_fifo_waiter *w)
+bool cds_fifo_exit(struct cds_fifo_turnstile *t, struct cds_fifo_waiter *w)
 {
 	struct cds_wfcq_node *self, *succ;
 	int state = 0;
@@ -177,7 +180,7 @@ void cds_fifo_exit(struct cds_fifo_turnstile *t, struct cds_fifo_waiter *w)
 		 * released the token. The next enqueuer will find the queue
 		 * empty and self-elect. Nobody to grant.
 		 */
-		return;
+		return true;
 	}
 
 	/*
@@ -187,6 +190,7 @@ void cds_fifo_exit(struct cds_fifo_turnstile *t, struct cds_fifo_waiter *w)
 	succ = __cds_wfcq_first_blocking(&t->head, &t->tail);
 	urcu_posix_assert(succ != NULL);
 	cds_fifo_grant(caa_container_of(succ, struct cds_fifo_waiter, node));
+	return false;
 }
 
 #ifdef __cplusplus
