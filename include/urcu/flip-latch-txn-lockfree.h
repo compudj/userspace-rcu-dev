@@ -197,7 +197,7 @@ void urcu_flip_lf_txn__enter_fallback(struct urcu_flip_lf_txn *txn)
 	rcu_thread_offline();
 	cds_fifo_enter(&txn->domain->fifo, &txn->waiter);
 	rcu_thread_online();
-	uatomic_store(&txn->domain->active, 1, CMM_RELEASE);
+	uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
 	txn->in_fallback = 1;
 }
 
@@ -209,7 +209,7 @@ static inline
 void urcu_flip_lf_txn__exit_fallback(struct urcu_flip_lf_txn *txn)
 {
 	if (cds_fifo_exit(&txn->domain->fifo, &txn->waiter))
-		uatomic_store(&txn->domain->active, 0, CMM_RELEASE);
+		uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
 	txn->in_fallback = 0;
 }
 
@@ -218,13 +218,16 @@ void urcu_flip_lf_txn__exit_fallback(struct urcu_flip_lf_txn *txn)
  * starved (retry) or already-known large (min_alloc) handle initiates an
  * episode, and domain->active funnels every other handle into the same lane
  * for the episode's duration -- that funnelling is what closes the optimistic-
- * writer set and bounds the escalated op's progress.
+ * writer set and bounds the escalated op's progress.  domain->active is
+ * advisory: a stale read only mis-routes one bounded attempt (the MCAS commit
+ * is correct under the resulting concurrency), so it needs no acquire/release,
+ * only atomicity.
  */
 static inline
 int urcu_flip_lf_txn__want_fallback(struct urcu_flip_lf_txn *txn)
 {
 	return txn->domain && !txn->in_fallback &&
-		(uatomic_load(&txn->domain->active, CMM_ACQUIRE) ||
+		(uatomic_load(&txn->domain->active, CMM_RELAXED) ||
 		 txn->retry >= URCU_FLIP_LF_TXN_FALLBACK ||
 		 txn->min_alloc >= URCU_FLIP_LF_TXN_BIG);
 }
