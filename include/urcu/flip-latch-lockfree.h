@@ -411,7 +411,14 @@ struct urcu_flip_lf_mcas *urcu_flip_lf_mcas_create(unsigned int cap,
 	return t;
 }
 
-/* Append one edge {*slot: old -> new}.  Before commit only.  No install yet. */
+/*
+ * Append one edge {*slot: old -> new}.  Before commit only; no install yet.
+ * Returns false if the descriptor is full -- the caller grows it first
+ * (urcu_flip_lf_mcas_grow) and retries.  The record's back-pointer (r->mcas) is
+ * deliberately NOT set here: a pre-commit grow reallocs the descriptor and may
+ * move it, which would strand any add-time back-pointer.  It is filled in once,
+ * at commit, after the write-set has stopped growing (see mcas_commit).
+ */
 static inline
 bool urcu_flip_lf_mcas_add(struct urcu_flip_lf_mcas *t, void **slot,
 		void *old_ptr, void *new_ptr)
@@ -424,8 +431,29 @@ bool urcu_flip_lf_mcas_add(struct urcu_flip_lf_mcas *t, void **slot,
 	r->slot = slot;
 	r->old_ptr = old_ptr;
 	r->new_ptr = new_ptr;
-	r->mcas = t;
 	return true;
+}
+
+/*
+ * Grow @t's record capacity (room for at least one more), returning the
+ * possibly-moved descriptor, or NULL on OOM with @t left intact for the caller
+ * to free.  Valid only before commit: the descriptor is not yet parked in any
+ * slot, so it may move freely; realloc preserves malloc's alignment, so the
+ * 16-byte tag-room guarantee holds across the move.  Back-pointers are set at
+ * commit, after the last grow, so a move here strands nothing.
+ */
+static inline
+struct urcu_flip_lf_mcas *urcu_flip_lf_mcas_grow(struct urcu_flip_lf_mcas *t)
+{
+	unsigned int newcap = t->cap < 2 ? 2 : t->cap * 2;
+	struct urcu_flip_lf_mcas *n;
+
+	n = (struct urcu_flip_lf_mcas *) realloc(t, sizeof(*t) +
+			(size_t) newcap * sizeof(struct urcu_flip_lf_record));
+	if (!n)
+		return NULL;
+	n->cap = newcap;
+	return n;
 }
 
 static inline
@@ -479,6 +507,7 @@ bool urcu_flip_lf_mcas_commit(struct urcu_flip_lf_mcas *t,
 			void (*)(struct rcu_head *)))
 {
 	bool committed;
+	unsigned int i;
 
 	if (t->nr == 0) {
 		urcu_flip_lf_mcas_destroy(t);
@@ -500,6 +529,14 @@ bool urcu_flip_lf_mcas_commit(struct urcu_flip_lf_mcas *t,
 	if (t->nr == 1)
 		URCU_FLIP_LF_STAT(escalate);	/* single edge, retried past the threshold */
 	urcu_flip_lf_mcas_sort(t);
+	/*
+	 * Set the record back-pointers now, deferred from add time.  The
+	 * write-set may have been grown (realloc'd, hence moved) while it was
+	 * being buffered; from here the descriptor is frozen and about to be
+	 * parked, so every record can finally name its now-stable descriptor.
+	 */
+	for (i = 0; i < t->nr; i++)
+		t->recs[i].mcas = t;
 	urcu_flip_lf_drive_install(t);		/* install to a decision (helpers help) */
 	urcu_flip_lf_settle(t);			/* owner-only: make our own slots plain */
 	committed = urcu_flip_lf_status(t) == URCU_FLIP_LF_SUCCEEDED;
