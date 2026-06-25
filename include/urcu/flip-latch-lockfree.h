@@ -111,6 +111,22 @@ extern "C" {
 #define URCU_FLIP_LF_STAT(counter)	do { } while (0)
 #endif
 
+/*
+ * Single-edge escalation threshold.  A one-record transaction normally commits
+ * with a bare CAS and no descriptor (cheap, but invisible to the priority /
+ * steal protocol, so it can only win when the slot is plain -- it accrues no
+ * priority and cannot break into a slot a multi-edge transaction keeps proxied).
+ * Once such an op has retried this many times it stops taking the fast path and
+ * commits through the full descriptor protocol instead, so it installs a real
+ * proxy and contends on the same priority-ordered footing as everyone else (at
+ * the cost of a descriptor and one grace period).  This lifts a *lockout*; it
+ * does not make the op wait-free -- the engine is lock-free, not wait-free.  The
+ * retry count the caller threads into urcu_flip_lf_txn_create() drives this.
+ */
+#ifndef URCU_FLIP_LF_ESCALATE
+#define URCU_FLIP_LF_ESCALATE 16
+#endif
+
 enum urcu_flip_lf_status {
 	URCU_FLIP_LF_UNDECIDED = 0,
 	URCU_FLIP_LF_SUCCEEDED = 1,
@@ -447,8 +463,13 @@ void urcu_flip_lf_txn_sort(struct urcu_flip_lf_txn *t)
  * Commit @t: install in slot-address order, decide, settle.  Returns true if
  * the transaction committed (SUCCEEDED), false if it aborted (FAILED) -- the
  * caller re-reads and retries an aborted transaction.  Reclaim is deferred
- * through @call_rcu_fn (the flavor's call_rcu); a single-edge transaction
- * commits with a bare CAS and frees immediately (no proxy, no grace period).
+ * through @call_rcu_fn (the flavor's call_rcu); an un-escalated single-edge
+ * transaction commits with a bare CAS and frees immediately (no proxy, no grace
+ * period).  A single-edge op that has retried past URCU_FLIP_LF_ESCALATE falls
+ * through to the full descriptor path so it installs a real proxy and contends
+ * on the same priority-ordered footing as everyone else, instead of being shut
+ * out of a slot a multi-edge op keeps proxied.  (This lifts a lockout; like any
+ * transaction here it remains lock-free, not wait-free.)
  *
  * Call within an RCU read-side section (descriptor existence for helpers).
  */
@@ -463,14 +484,21 @@ bool urcu_flip_lf_txn_commit(struct urcu_flip_lf_txn *t,
 		urcu_flip_lf_txn_destroy(t);
 		return true;
 	}
-	if (t->nr == 1) {
-		/* Single edge: the CAS itself is the atomic commit. */
+	if (t->nr == 1 && t->retry < URCU_FLIP_LF_ESCALATE) {
+		/*
+		 * Single edge, not yet starved: the CAS itself is the atomic
+		 * commit.  Fast and -- while the slot is plain -- fair; once it
+		 * has retried enough to suspect a proxy is locking it out, the
+		 * escalation below makes it a real, visible transaction instead.
+		 */
 		struct urcu_flip_lf_record *r = &t->recs[0];
 
 		committed = uatomic_cmpxchg(r->slot, r->old_ptr, r->new_ptr) == r->old_ptr;
 		urcu_flip_lf_txn_destroy(t);
 		return committed;
 	}
+	if (t->nr == 1)
+		URCU_FLIP_LF_STAT(escalate);	/* single edge, retried past the threshold */
 	urcu_flip_lf_txn_sort(t);
 	urcu_flip_lf_drive_install(t);		/* install to a decision (helpers help) */
 	urcu_flip_lf_settle(t);			/* owner-only: make our own slots plain */

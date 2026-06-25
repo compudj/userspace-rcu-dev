@@ -61,21 +61,40 @@ struct lf_stat {
 	unsigned long drive;	/* drive() entries: owner-drives + helping */
 	unsigned long evict;	/* foreign txns aborted by priority */
 	unsigned long steal;	/* slots stolen proxy->proxy */
+	unsigned long escalate;	/* single-edge ops promoted to the descriptor path */
 };
 static __thread struct lf_stat t_stat;
 #define URCU_FLIP_LF_STAT(counter)	(t_stat.counter++)
+
+/*
+ * Force single-edge escalation to fire promptly so the mixed phase reliably
+ * exercises that path (the shipped default is higher); the mechanism is what's
+ * under test, not the threshold value.
+ */
+#define URCU_FLIP_LF_ESCALATE	4
 
 #include <urcu/flip-latch-lockfree.h>
 
 #include "tap.h"
 
-#define NR_TESTS	5
+#define NR_TESTS	9
 #define NR_WORKERS	8
 
 #define MILD_WORDS	16		/* moderate contention: atomicity focus */
 #define MILD_OPS	60000
 #define HOT_WORDS	4		/* heavy contention: fairness focus */
 #define HOT_OPS		20000
+
+/*
+ * Mixed phase: a few workers run single-edge +1 ops on a tiny hot set while the
+ * rest keep it proxied with multi-edge transfers.  Tests that a single-edge op
+ * is not starved by the lingering proxies -- it escalates into a real, visible
+ * transaction once it has retried enough.  Multi-edge transfers are net-zero, so
+ * the final sum equals the number of committed single-edge increments.
+ */
+#define MIX_WORDS	3
+#define MIX_OPS		20000
+#define MIX_SINGLE	2		/* single-edge workers; the rest are multi-edge */
 
 /*
  * Worst tolerated single-op bypass in the hot phase.  Generous: under the aging
@@ -91,6 +110,7 @@ struct worker_arg {
 	unsigned int seed;
 	unsigned int nwords;
 	long ops;
+	int single;			/* 1: single-edge +1 ops; 0: multi-edge transfers */
 	/* outputs */
 	long committed;
 	unsigned long retries_sum;	/* total failed attempts (sum of per-op retry) */
@@ -138,55 +158,85 @@ static void *worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < wa->ops; n++) {
-		int i, j, k, three;
 		unsigned long retry = 0;
 		bool ok;
 
-		rng = xs(rng);
-		three = (int) (rng & 1);
-		i = (int) ((rng >> 1) % nwords);
-		rng = xs(rng);
-		j = (int) (rng % nwords);
-		if (j == i)
-			j = (j + 1) % (int) nwords;
-		rng = xs(rng);
-		k = (int) (rng % nwords);
-		while (k == i || k == j)
-			k = (k + 1) % (int) nwords;
-
-		do {
-			struct urcu_flip_lf_txn *t;
-			uintptr_t oi, oj, ok2;
-
+		if (wa->single) {
 			/*
-			 * The updater is an RCU reader: this critical section is
-			 * what keeps a descriptor alive while peers help drive
-			 * it.  A no-op in QSBR (the thread is a reader between
-			 * quiescent states), but required for the memb/mb flavors.
+			 * Single-edge +1 on one hot word.  Its bare CAS fails
+			 * whenever a multi-edge op keeps the word proxied; once it
+			 * has retried past the escalation threshold the engine
+			 * promotes it to a real descriptor so it cannot starve.
 			 */
-			rcu_read_lock();
-			t = urcu_flip_lf_txn_create(3, retry);
-			if (!t)
-				abort();
-			oi = (uintptr_t) urcu_flip_lf_read(&g_word[i]);
-			oj = (uintptr_t) urcu_flip_lf_read(&g_word[j]);
-			urcu_flip_lf_txn_add(t, &g_word[i],
-				(void *) oi, (void *) lf_bump(oi, 2));
-			if (three) {
-				ok2 = (uintptr_t) urcu_flip_lf_read(&g_word[k]);
-				urcu_flip_lf_txn_add(t, &g_word[j],
-					(void *) oj, (void *) lf_bump(oj, 2));
-				urcu_flip_lf_txn_add(t, &g_word[k],
-					(void *) ok2, (void *) lf_bump(ok2, -4));
-			} else {
-				urcu_flip_lf_txn_add(t, &g_word[j],
-					(void *) oj, (void *) lf_bump(oj, -2));
-			}
-			ok = urcu_flip_lf_txn_commit(t, call_rcu);
-			rcu_read_unlock();
-			if (!ok)
-				retry++;
-		} while (!ok);
+			int w;
+
+			rng = xs(rng);
+			w = (int) (rng % nwords);
+			do {
+				struct urcu_flip_lf_txn *t;
+				uintptr_t ow;
+
+				rcu_read_lock();
+				t = urcu_flip_lf_txn_create(1, retry);
+				if (!t)
+					abort();
+				ow = (uintptr_t) urcu_flip_lf_read(&g_word[w]);
+				urcu_flip_lf_txn_add(t, &g_word[w],
+					(void *) ow, (void *) lf_bump(ow, 1));
+				ok = urcu_flip_lf_txn_commit(t, call_rcu);
+				rcu_read_unlock();
+				if (!ok)
+					retry++;
+			} while (!ok);
+		} else {
+			int i, j, k, three;
+
+			rng = xs(rng);
+			three = (nwords >= 3) ? (int) (rng & 1) : 0;
+			i = (int) ((rng >> 1) % nwords);
+			rng = xs(rng);
+			j = (int) (rng % nwords);
+			if (j == i)
+				j = (j + 1) % (int) nwords;
+			rng = xs(rng);
+			k = (int) (rng % nwords);
+			while (k == i || k == j)
+				k = (k + 1) % (int) nwords;
+
+			do {
+				struct urcu_flip_lf_txn *t;
+				uintptr_t oi, oj, ok2;
+
+				/*
+				 * The updater is an RCU reader: this critical
+				 * section keeps a descriptor alive while peers
+				 * help drive it.  A no-op in QSBR, required for
+				 * the memb/mb flavors.
+				 */
+				rcu_read_lock();
+				t = urcu_flip_lf_txn_create(3, retry);
+				if (!t)
+					abort();
+				oi = (uintptr_t) urcu_flip_lf_read(&g_word[i]);
+				oj = (uintptr_t) urcu_flip_lf_read(&g_word[j]);
+				urcu_flip_lf_txn_add(t, &g_word[i],
+					(void *) oi, (void *) lf_bump(oi, 2));
+				if (three) {
+					ok2 = (uintptr_t) urcu_flip_lf_read(&g_word[k]);
+					urcu_flip_lf_txn_add(t, &g_word[j],
+						(void *) oj, (void *) lf_bump(oj, 2));
+					urcu_flip_lf_txn_add(t, &g_word[k],
+						(void *) ok2, (void *) lf_bump(ok2, -4));
+				} else {
+					urcu_flip_lf_txn_add(t, &g_word[j],
+						(void *) oj, (void *) lf_bump(oj, -2));
+				}
+				ok = urcu_flip_lf_txn_commit(t, call_rcu);
+				rcu_read_unlock();
+				if (!ok)
+					retry++;
+			} while (!ok);
+		}
 
 		wa->committed++;
 		wa->retries_sum += retry;
@@ -212,7 +262,7 @@ static intptr_t run_phase(unsigned int nwords, long ops,
 	struct worker_arg args[NR_WORKERS];
 	long committed = 0;
 	unsigned long max_retry = 0, attempts = 0;
-	struct lf_stat st = { 0, 0, 0 };
+	struct lf_stat st = { 0, 0, 0, 0 };
 	intptr_t sum = 0;
 	unsigned int i;
 
@@ -223,10 +273,11 @@ static intptr_t run_phase(unsigned int nwords, long ops,
 		args[i].seed = 0x9e3779b9u + i * 2654435761u;
 		args[i].nwords = nwords;
 		args[i].ops = ops;
+		args[i].single = 0;
 		args[i].committed = 0;
 		args[i].retries_sum = 0;
 		args[i].max_op_retry = 0;
-		args[i].st.drive = args[i].st.evict = args[i].st.steal = 0;
+		args[i].st = st;	/* zero */
 		pthread_create(&th[i], NULL, worker, &args[i]);
 	}
 	rcu_thread_offline();		/* don't stall grace periods while joined */
@@ -249,6 +300,61 @@ static intptr_t run_phase(unsigned int nwords, long ops,
 	*out_max_retry = max_retry;
 	*out_st = st;
 	*out_attempts = attempts;
+	return sum;
+}
+
+/*
+ * Mixed phase: @nsingle single-edge workers + (NR_WORKERS - @nsingle) multi-edge
+ * workers on @nwords hot words.  Returns the final sum (== committed single-edge
+ * increments iff no update was lost); fills the single-edge committed count and
+ * worst bypass, the total committed across all workers, and the escalation count.
+ */
+static intptr_t run_mixed_phase(unsigned int nwords, long ops, unsigned int nsingle,
+		long *out_single_committed, unsigned long *out_single_max_retry,
+		long *out_total_committed, unsigned long *out_escalate)
+{
+	pthread_t th[NR_WORKERS];
+	struct worker_arg args[NR_WORKERS];
+	long single_committed = 0, total_committed = 0;
+	unsigned long single_max_retry = 0, escalate = 0;
+	struct lf_stat zero = { 0, 0, 0, 0 };
+	intptr_t sum = 0;
+	unsigned int i;
+
+	for (i = 0; i < nwords; i++)
+		g_word[i] = (void *) 0;
+
+	for (i = 0; i < NR_WORKERS; i++) {
+		args[i].seed = 0x9e3779b9u + i * 2654435761u;
+		args[i].nwords = nwords;
+		args[i].ops = ops;
+		args[i].single = (i < nsingle);
+		args[i].committed = 0;
+		args[i].retries_sum = 0;
+		args[i].max_op_retry = 0;
+		args[i].st = zero;
+		pthread_create(&th[i], NULL, worker, &args[i]);
+	}
+	rcu_thread_offline();
+	for (i = 0; i < NR_WORKERS; i++) {
+		pthread_join(th[i], NULL);
+		total_committed += args[i].committed;
+		escalate += args[i].st.escalate;
+		if (args[i].single) {
+			single_committed += args[i].committed;
+			if (args[i].max_op_retry > single_max_retry)
+				single_max_retry = args[i].max_op_retry;
+		}
+	}
+	rcu_thread_online();
+
+	for (i = 0; i < nwords; i++)
+		sum += lf_val((uintptr_t) g_word[i]);
+
+	*out_single_committed = single_committed;
+	*out_single_max_retry = single_max_retry;
+	*out_total_committed = total_committed;
+	*out_escalate = escalate;
 	return sum;
 }
 
@@ -295,6 +401,29 @@ int main(void)
 		"hot: every transaction eventually committed (lock-free progress)");
 	ok(max_retry < HOT_RETRY_BOUND,
 		"hot: worst single-op bypass stayed bounded (priority fairness)");
+
+	/* --- Phase 3: single-edge ops vs. proxy-holding multi-edge ops. --- */
+	{
+		long single_committed, total_committed;
+		unsigned long single_max_retry, escalate;
+
+		sum = run_mixed_phase(MIX_WORDS, MIX_OPS, MIX_SINGLE,
+			&single_committed, &single_max_retry,
+			&total_committed, &escalate);
+		diag("mix:  %d single-edge + %d multi-edge workers x %d ops over %d words",
+			MIX_SINGLE, NR_WORKERS - MIX_SINGLE, MIX_OPS, MIX_WORDS);
+		diag("mix:  single committed = %ld; sum = %" PRIdPTR
+			"; single max retry = %lu (bound %d); escalations = %lu",
+			single_committed, sum, single_max_retry, HOT_RETRY_BOUND, escalate);
+		ok(sum == (intptr_t) single_committed,
+			"mix: single-edge increments not lost amid lingering proxies");
+		ok(total_committed == (long) NR_WORKERS * MIX_OPS,
+			"mix: every worker completed -- single-edge ops not starved");
+		ok(single_max_retry < HOT_RETRY_BOUND,
+			"mix: single-edge worst bypass stayed bounded (escalation fairness)");
+		ok(escalate > 0,
+			"mix: single-edge ops actually escalated (mechanism exercised)");
+	}
 
 	rcu_barrier();
 	rcu_unregister_thread();
