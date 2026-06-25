@@ -1021,23 +1021,30 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * is skipped in that case.
 		 */
 		old_src_root = src_ft->root;
-		rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_node, 0));
-		FT_TP(root_publish, (const void *) src_ft,
-			(const void *) src_ft->root);
 
 		/*
-		 * Ordered list: capture src's whole list (the run to graft) and
-		 * unlink it from src here, paired with the structural src-root
-		 * unlink, so the synchronize_rcu below drains src ord-readers too.
-		 * The run is spliced into dst after the structural publish (same
-		 * commit point).  Restored on the OOM rollback below.
+		 * Ordered list: capture src's whole list (the run to graft) and,
+		 * paired with the structural src-root retire, unlink it from src
+		 * -- FUSED into ONE flip so a src reader never sees src
+		 * structurally empty while its ordered list still shows the run
+		 * (or vice versa).  The synchronize_rcu below then drains src
+		 * readers of the old content; the run is spliced into dst after
+		 * the structural publish (same commit point).  No rollback: every
+		 * failure mode (OOM / populated) returned above, before this
+		 * retire.  (List off: just the lone root edge.)
 		 */
 		if (dst_ft->group->ordered_list_set) {
 			graft_run_first = src_ft->ord_cell_head;
 			graft_run_last = src_ft->ord_cell_tail;
-			src_ft->ord_cell_head = NULL;
-			src_ft->ord_cell_tail = NULL;
+			ft_root_list_swap_publish(src_ft, &src_ft->root,
+				old_src_root, ft_node_flag(fresh_node, 0),
+				graft_run_first, NULL, graft_run_last, NULL);
+		} else {
+			ft_root_edge_flip(src_ft, &src_ft->root,
+				old_src_root, ft_node_flag(fresh_node, 0));
 		}
+		FT_TP(root_publish, (const void *) src_ft,
+			(const void *) src_ft->root);
 
 		/*
 		 * Ordered list: arm the run-splice fusion so the NOSPLIT store

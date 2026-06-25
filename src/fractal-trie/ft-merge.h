@@ -1460,7 +1460,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				src_ft->ord_cell_head, NULL,
 				src_ft->ord_cell_tail, NULL);
 		} else {
-			rcu_assign_pointer(src_ft->root, ft_node_flag(fresh_root, 0));
+			/*
+			 * No ordered list: src->root is the only reader-visible slot.
+			 * Express the lone root edge as a single-edge flip descriptor
+			 * (one release store, like a bare rcu_assign_pointer) so the
+			 * swap is MCAS-expressible like the list-on path.
+			 */
+			ft_root_edge_flip(src_ft, &src_ft->root,
+				src_ft->root, ft_node_flag(fresh_root, 0));
 		}
 		FT_TP(root_publish, (const void *) src_ft, (const void *) src_ft->root);
 	} else if (ft_merge_unlink_src_subtree(src_ft, src_key, src_key_len,
