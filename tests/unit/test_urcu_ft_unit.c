@@ -759,7 +759,22 @@ static int test_dup_chain_head_promotion(void)
 			found);
 		goto fail_rcu;
 	}
-	if (n[1]->node.prev != parent) {
+	/*
+	 * The promoted head's back-pointer.  With the ordered list ON, head
+	 * promotion publishes a FRESH cell for the new head (cell->node is
+	 * write-once -- the public cds_ft_cell_node reads a plain pointer, never a
+	 * retargeted live cell), so n[1]->prev is a NEW cell, not the old head's.
+	 * With the list OFF there is no cell: n[1]->prev is the flagged parent,
+	 * inherited unchanged.
+	 */
+	if (cds_ft_group_ordered_list(group)) {
+		if (!n[1]->node.prev || n[1]->node.prev == parent) {
+			fprintf(stderr,
+				"dup_chain_head_promotion: n[1] prev %p not a fresh cell (old head cell %p)\n",
+				n[1]->node.prev, parent);
+			goto fail_rcu;
+		}
+	} else if (n[1]->node.prev != parent) {
 		fprintf(stderr,
 			"dup_chain_head_promotion: n[1] prev %p != parent %p\n",
 			n[1]->node.prev, parent);
@@ -803,7 +818,15 @@ static int test_dup_chain_head_promotion(void)
 			cds_ft_status_to_string(s));
 		goto fail_rcu;
 	}
-	if (n[3]->node.prev != parent) {
+	/* Same write-once contract for the second promotion (n[3] -> head). */
+	if (cds_ft_group_ordered_list(group)) {
+		if (!n[3]->node.prev || n[3]->node.prev == parent) {
+			fprintf(stderr,
+				"dup_chain_head_promotion: n[3] prev after second promotion %p not a fresh cell (old head cell %p)\n",
+				n[3]->node.prev, parent);
+			goto fail_rcu;
+		}
+	} else if (n[3]->node.prev != parent) {
 		fprintf(stderr,
 			"dup_chain_head_promotion: n[3] prev after second promotion %p != parent %p\n",
 			n[3]->node.prev, parent);
