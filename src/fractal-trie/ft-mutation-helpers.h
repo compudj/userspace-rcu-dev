@@ -242,6 +242,32 @@ static void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		unsigned int n);
 
 /*
+ * Commit a single edge as a lone flip descriptor on an ON-STACK bounded txn.
+ * Infallible: it allocates nothing (hence cannot OOM) and needs no reclaim -- a
+ * single-edge commit is one release store that parks no proxy and owes no grace
+ * period, so nothing references the txn once it returns and the stack frame
+ * reclaims it.  Byte-identical in effect to a bare rcu_assign_pointer, but
+ * captured as a {slot, old, new} descriptor so a future multi-writer MCAS covers
+ * the slot uniformly (a bare store would discard @old and sit outside the
+ * descriptor protocol).  The lone-edge publish helpers (ft_root_edge_flip,
+ * ft_chain_next_flip, and the point insert/remove single-slot external_nodes
+ * publishes) and ft_ord_cell_flip_try's n==1 fast path all commit through here.
+ */
+static
+void ft_ord_cell_flip_one(struct ft_ord_cell_edge *edge)
+{
+	union {
+		struct urcu_flip_txn t;
+		char buf[URCU_FLIP_TXN_BOUNDED_BYTES(1)];
+	} u;
+
+	urcu_flip_txn_init_bounded(&u.t, ft_flip_txn_tag, 1);
+	ft_flip_txn_record_reserved(&u.t, (void **) edge->slot,
+		(void *) edge->old_target, (void *) edge->new_target);
+	(void) urcu_flip_txn_commit(&u.t);
+}
+
+/*
  * Append an endpoint (ord_cell_head / ord_cell_tail) update to a flip-edge batch
  * when @slot currently holds @match, so the endpoint transitions ATOMICALLY with
  * the neighbour edges in the same flip: a reader resolving ord_cell_head/tail via
@@ -331,7 +357,8 @@ void ft_root_edge_flip(struct cds_ft *ft,
 		.new_target = (struct ft_ord_cell *) struct_new,
 	};
 
-	ft_ord_cell_flip(ft, &edge, 1);
+	(void) ft;	/* a lone edge commits on an on-stack txn (no reclaim) */
+	ft_ord_cell_flip_one(&edge);
 }
 
 /*
@@ -355,7 +382,8 @@ void ft_chain_next_flip(struct cds_ft *ft, struct cds_ft_node **slot,
 		.new_target = (struct ft_ord_cell *) new,
 	};
 
-	ft_ord_cell_flip(ft, &edge, 1);
+	(void) ft;	/* a lone edge commits on an on-stack txn (no reclaim) */
+	ft_ord_cell_flip_one(&edge);
 }
 
 /*
@@ -612,25 +640,8 @@ int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 	if (n == 0)
 		return 0;
 	if (n == 1) {
-		/*
-		 * Lone edge: commit on an ON-STACK bounded txn.  No allocation
-		 * (hence no OOM), and none is needed afterwards: a single-edge
-		 * commit is a lone release store that parks no proxy and owes no
-		 * grace period, so nothing references the txn once it returns and
-		 * the stack frame reclaims it.  Still a {slot, old, new}
-		 * descriptor commit, not a bare rcu_assign_pointer, so a future
-		 * MCAS covers the slot uniformly.
-		 */
-		union {
-			struct urcu_flip_txn t;
-			char buf[URCU_FLIP_TXN_BOUNDED_BYTES(1)];
-		} u;
-
-		urcu_flip_txn_init_bounded(&u.t, ft_flip_txn_tag, 1);
-		ft_flip_txn_record_reserved(&u.t, (void **) edges[0].slot,
-			(void *) edges[0].old_target,
-			(void *) edges[0].new_target);
-		(void) urcu_flip_txn_commit(&u.t);
+		/* Lone edge: the infallible on-stack single-store commit. */
+		ft_ord_cell_flip_one(&edges[0]);
 		return 0;
 	}
 	t = ft_flip_txn_create_bounded(n);

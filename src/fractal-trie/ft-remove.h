@@ -1561,7 +1561,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				.new_target = NULL,
 			};
 
-			ft_ord_cell_flip(ft, &edge, 1);
+			ft_ord_cell_flip_one(&edge);
 		}
 		/* The whole chain has left the trie: tombstone every node. */
 		ft_chain_mark_removed(external_nodes);
@@ -1659,7 +1659,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				.new_target = NULL,
 			};
 
-			ft_ord_cell_flip(ft, &edge, 1);
+			ft_ord_cell_flip_one(&edge);
 		}
 		ft_chain_mark_removed(chain_head);
 		ret = 0;

@@ -1896,7 +1896,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 							node,
 					};
 
-					ft_ord_cell_flip(ft, &edge, 1);
+					ft_ord_cell_flip_one(&edge);
 					ft_propagate_external_count_parent(ft,
 						d.nf, 1);
 				}
@@ -2285,7 +2285,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						.new_target = (struct ft_ord_cell *) node,
 					};
 
-					ft_ord_cell_flip(ft, &edge, 1);
+					ft_ord_cell_flip_one(&edge);
 				}
 			} else {
 				/* No external nodes yet. New key at this node. */
@@ -2321,7 +2321,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 							node,
 					};
 
-					ft_ord_cell_flip(ft, &edge, 1);
+					ft_ord_cell_flip_one(&edge);
 					ft_propagate_external_count_parent(ft,
 						d.nf, 1);
 				}
