@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 285
+#define NR_TESTS 286
 #else
 #define NR_TESTS 252
 #endif
@@ -21827,6 +21827,131 @@ static int test_remove_emptied_holder_traversal_oom(void)
 }
 
 /*
+ * Head-promotion OOM contract (cds_ft_remove of a duplicate-chain HEAD, list
+ * on).  Removing the head of a key's duplicate chain while a successor remains
+ * needs a FRESH ordered-list cell (cell->node is write-once), allocated in
+ * ft_promote_head.  On that allocation failing the op must ABORT before any
+ * reader-visible change -- the chain stays intact (head present, the key keeps
+ * both duplicates), cds_ft_remove returns CDS_FT_STATUS_MEMORY_ERROR, and the
+ * removal can be retried -- rather than degrade to a bare in-place cell->node
+ * retarget outside the descriptor protocol.  Walk every allocation-fault point:
+ * at each the trie must verify and the surviving duplicate count must match the
+ * outcome (2 on MEMORY_ERROR, 1 on OK).
+ */
+static int run_remove_head_promote_oom(int nr_faults)
+{
+	int n, rc = 0, saw_mem_err = 0, saw_ok = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group_attr *attr;
+		struct cds_ft_group *group;
+		struct cds_ft *ft;
+		struct ft_test_node *a, *b, *c;
+		struct cds_ft_iter *iter;
+		struct cds_ft_node *head, *removed = NULL;
+		enum cds_ft_status s;
+		int verified, dups = 0, ok = 1;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			abort();
+		cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+		cds_ft_group_attr_set_ordered_list(attr, true);
+		if (cds_ft_group_create(attr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0 ||
+		    cds_ft_iter_create(ft, &iter) < 0) {
+			fprintf(stderr, "remove_head_promote_oom: create failed\n");
+			return -1;
+		}
+		a = node_alloc(1);
+		b = node_alloc(2);
+		c = node_alloc(3);	/* neighbour key -> a non-trivial ordered list */
+		if (cds_ft_insert(ft, (const uint8_t *) "K", 1, &a->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "K", 1, &b->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "M", 1, &c->node) < 0)
+			rc = -1;
+
+		/*
+		 * Hold the read lock across lookup + remove (the node must stay
+		 * live from when it is obtained until the remove).  The chain head
+		 * at "K" is what a head-promotion remove targets.
+		 */
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) "K", 1);
+		if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK)
+			rc = -1;
+		head = cds_ft_iter_node(iter);
+		cds_ft_fault_alloc_countdown = n;
+		s = cds_ft_remove(ft, iter, head);
+		cds_ft_fault_alloc_countdown = -1;
+		rcu_read_unlock();
+		if (s == CDS_FT_STATUS_OK)
+			removed = head;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		cds_ft_iter_set_key(iter, (const uint8_t *) "K", 1);
+		if (verified &&
+		    cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK) {
+			struct cds_ft_node *h = cds_ft_iter_node(iter);
+
+			cds_ft_for_each_duplicate_rcu(h)
+				dups++;
+		}
+		rcu_read_unlock();
+
+		if (!verified) {
+			fprintf(stderr,
+				"remove_head_promote_oom: verify FAILED after fault n=%d (%s)\n",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+		if (s == CDS_FT_STATUS_OK) {
+			saw_ok = 1;
+			if (dups != 1)		/* head removed, successor promoted */
+				ok = 0;
+		} else if (s == CDS_FT_STATUS_MEMORY_ERROR) {
+			saw_mem_err = 1;
+			if (dups != 2)		/* aborted: chain intact */
+				ok = 0;
+		} else {
+			ok = 0;
+		}
+		if (!ok) {
+			fprintf(stderr,
+				"remove_head_promote_oom: %s but dups=%d (n=%d)\n",
+				cds_ft_status_to_string(s), dups, n);
+			rc = -1;
+		}
+
+		if (drain_trie(ft) < 0)
+			rc = -1;
+		cds_ft_iter_destroy(iter);
+		rcu_barrier();
+		if (removed)		/* removed from the trie: drain won't free it */
+			node_free(to_test_node(removed));
+		cds_ft_destroy(ft);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	/* The abort path is the point of the test: it must actually be exercised. */
+	if (!saw_mem_err || !saw_ok) {
+		fprintf(stderr,
+			"remove_head_promote_oom: coverage gap (mem_err=%d ok=%d)\n",
+			saw_mem_err, saw_ok);
+		rc = -1;
+	}
+	return rc;
+}
+
+static int test_remove_head_promote_oom(void)
+{
+	return run_remove_head_promote_oom(12);
+}
+
+/*
  * Drive cds_ft_detach at a key whose child is a COMPRESSED node (so the
  * detached trie's root must be materialized as an internal node) through every
  * allocation-failure point, and assert atomicity: on MEMORY_ERROR the source
@@ -22292,6 +22417,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_attach_oom_skip_unwind);
 	RUN_TEST(test_remove_all_oom_contract);
 	RUN_TEST(test_remove_emptied_holder_traversal_oom);
+	RUN_TEST(test_remove_head_promote_oom);
 #endif
 
 	rcu_barrier();

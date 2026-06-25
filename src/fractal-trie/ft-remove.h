@@ -999,23 +999,34 @@ end:
  * proxy is ever parked there).
  */
 static
-void ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
+int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_node **head_slot, struct cds_ft_node *node,
 		struct cds_ft_node *next_node)
 {
 	struct ft_ord_cell *old_cell = ft->ordered_list ?
 		ft_ord_cell_ptr(node->prev) : NULL;
-	void *new_cell_flag = old_cell ?
-		ft_ord_cell_alloc(ft, next_node, old_cell->parent) : NULL;
 	struct ft_pub_rec rec = { .n = 0 };
 	struct ft_ord_cell_edge sedges[2];
 	unsigned int n_s;
 
 	assert(next_node != NULL);
-	if (old_cell && new_cell_flag) {
-		/* Fresh-cell swap: cell->node stays write-once. */
-		struct ft_ord_cell *new_cell = ft_ord_cell_ptr(new_cell_flag);
+	if (old_cell) {
+		/*
+		 * Ordered list on: cell->node is write-once, so head promotion
+		 * publishes a FRESH cell and swaps it in.  Allocate it FIRST,
+		 * before any reader-visible change; on OOM abort here -- nothing
+		 * is published and the chain is untouched, so the caller returns
+		 * CDS_FT_STATUS_MEMORY_ERROR (the promotion may be retried).  No
+		 * bare in-place cell->node retarget on OOM: that would commit a
+		 * reader-visible store outside the descriptor protocol.
+		 */
+		void *new_cell_flag = ft_ord_cell_alloc(ft, next_node,
+			old_cell->parent);
+		struct ft_ord_cell *new_cell;
 
+		if (!new_cell_flag)
+			return -ENOMEM;
+		new_cell = ft_ord_cell_ptr(new_cell_flag);
 		cds_ft_item_to_metadata(new_cell)->incoming_byte =
 			cds_ft_item_to_metadata(old_cell)->incoming_byte;
 		/* Back-pointer wired before the forward publish (parent-first). */
@@ -1027,20 +1038,23 @@ void ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell, sedges, n_s);
 		ft_ord_cell_free(ft, old_cell);
 	} else {
-		/* List off, or cell-alloc OOM: in-place publish (degraded). */
-		next_node->prev = node->prev;	/* inherit old cell / parent */
-		if (old_cell)			/* OOM: retarget in place */
-			rcu_assign_pointer(old_cell->node, next_node);
+		/*
+		 * List off: the head's prev IS the flagged parent, inherited in
+		 * place on the not-yet-published successor (build-invisible), then
+		 * published.  No allocation, so no failure path.
+		 */
+		next_node->prev = node->prev;	/* inherit parent */
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		ft_ord_cell_flip(ft, sedges, n_s);
 	}
+	return 0;
 }
 
 static
-void ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
+int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_node **head_slot, struct cds_ft_node *node)
 {
 	struct cds_ft_node *next_node = ft_node_next(node);
@@ -1065,9 +1079,16 @@ void ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		/*
 		 * Head with a successor: prev is the cell flag (list on) or the
 		 * flagged parent (list off).  Promote @next_node via a fresh
-		 * cell swap fused with the structural publish.
+		 * cell swap fused with the structural publish.  A list-on
+		 * promotion allocates the fresh cell; on OOM it aborts before any
+		 * reader-visible change (@node stays chained, not tombstoned) and
+		 * the caller maps the failure to CDS_FT_STATUS_MEMORY_ERROR.
 		 */
-		ft_promote_head(ft, parent_nf, head_slot, node, next_node);
+		int ret = ft_promote_head(ft, parent_nf, head_slot, node,
+			next_node);
+
+		if (ret)
+			return ret;
 	} else {
 		/*
 		 * Head with no successor: the key disappears (only reached for a
@@ -1093,6 +1114,7 @@ void ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 	 * later position-based remove.
 	 */
 	ft_node_mark_removed(node);
+	return 0;
 }
 
 /*
@@ -1220,8 +1242,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		 * any grandparent skip pointer to it -- is untouched, so no head
 		 * slot is needed.
 		 */
-		ft_unchain_node(ft, NULL, NULL, node);
-		ret = 0;
+		ret = ft_unchain_node(ft, NULL, NULL, node);
 	} else if (ft_node_compressed(holder_flag) ||
 		   ft_node_skip_compressed(holder_flag)) {
 		/*
@@ -1265,9 +1286,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * descent or ft_skip_reanchor up-walk never follows the stale
 			 * skip pointer into the about-to-be-freed old head.
 			 */
-			ft_unchain_node(ft, ft_compressed_node_flag(cn),
+			ret = ft_unchain_node(ft, ft_compressed_node_flag(cn),
 				(struct cds_ft_node **) head_slot, node);
-			ret = 0;
 		}
 	} else if (ft_node_external_nodes(holder_flag) ==
 			(struct cds_ft_node *) node) {
@@ -1301,15 +1321,19 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					dead_cell, NULL);
 				ft_node_mark_removed(node);
 				pub.armed = true;
+				ret = 0;
 			} else {
 				/* List off: the single store is atomic alone. */
-				ft_unchain_node(ft, holder_flag,
+				ret = ft_unchain_node(ft, holder_flag,
 					(struct cds_ft_node **) &holder_meta->external_nodes,
 					node);
+				if (ret)
+					ft_propagate_external_count_parent(ft,
+						holder_flag, 1);
 			}
 		} else {
 			/* Duplicates remain: head promotion (fresh-cell swap). */
-			ft_unchain_node(ft, holder_flag,
+			ret = ft_unchain_node(ft, holder_flag,
 				(struct cds_ft_node **) &holder_meta->external_nodes,
 				node);
 		}
@@ -1320,8 +1344,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		 * chain-compress to restore the SKIP_COMPRESSED invariant (no
 		 * non-root 1-child internal without external).  The holder's own
 		 * slot in its parent is recovered from its metadata offset.
+		 * Only on a successful unlink (a promotion that aborted on OOM
+		 * left the chain unchanged).
 		 */
-		if (ft_group_skip_compressed(ft->group) &&
+		if (ret == 0 && ft_group_skip_compressed(ft->group) &&
 		    !holder_meta->external_nodes &&
 		    holder_meta->nr_child == 1 &&
 		    holder_meta->parent != NULL) {
@@ -1329,7 +1355,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				holder_meta, ft_get_parent_slot(holder_meta, ft));
 		}
 #endif
-		ret = 0;
 	} else {
 		/*
 		 * Internal holder, @node is a body child: leaf key.  Recover the
@@ -1361,9 +1386,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				ft_node_mark_removed(node);
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
-			ft_unchain_node(ft, holder_flag,
+			ret = ft_unchain_node(ft, holder_flag,
 				(struct cds_ft_node **) head_slot, node);
-			ret = 0;
 		}
 	}
 
