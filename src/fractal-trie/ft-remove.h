@@ -391,6 +391,16 @@ int ft_detach_node(struct cds_ft *ft,
 	uint8_t n = 0;
 	struct cds_ft_node *topmost_external_nodes = NULL;
 	bool prev_external_nodes_found = false;
+	/*
+	 * Set when the pure-delete leaves the surviving boundary a non-root
+	 * 1-child no-external internal whose SKIP_X canonical form is a merged
+	 * compressed node: the chain-compress prune is then FUSED into the
+	 * key-removal commit (build the merged node, replace the boundary in ONE
+	 * flip), bypassing ft_node_replace_ptr and the standalone post-detach
+	 * canonicalize -- no intermediate recompacted/in-place node, no transient
+	 * non-canonical state.  See ft_chain_compress_fused.
+	 */
+	bool boundary_fused = false;
 	struct cds_ft_inode_flag *cur;
 	unsigned int cur_depth;
 	/*
@@ -695,15 +705,75 @@ int ft_detach_node(struct cds_ft *ft,
 		 * Density was already propagated above (before
 		 * structural changes).
 		 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		/*
+		 * Shape-D fusion: a pure delete (no external promote) that leaves
+		 * the surviving boundary a non-root 1-child no-external internal
+		 * folds the chain-compress prune INTO the key-removal commit -- build
+		 * the merged compressed node and let it REPLACE the boundary in ONE
+		 * flip (forward + surviving-child re-parent + a SKIP_X dual + the
+		 * dead cell's unsplice), bypassing ft_node_replace_ptr entirely (no
+		 * intermediate 1-child node is ever published) AND the standalone
+		 * post-detach canonicalize below.  The boundary has exactly 2 live
+		 * children here (it drops to 1); the surviving child is the one NOT
+		 * being detached, read from pre-commit state.  On the merged-node
+		 * allocation failing the whole detach aborts before any reader-
+		 * visible store (the caller rolls back the count).  Out of bound
+		 * (merged_len > FT_SKIP_LEN_MAX) falls through to replace_ptr.
+		 */
+		{
+			struct cds_ft_metadata *bmeta =
+				cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
 
-		ret = ft_node_replace_ptr(ft,
-			detach_node_flag_ptr,
-			&iter_node_flag,
-			&old_recompacted_node,
-			metadata_stack[nr_branch - 1],
-			n, (struct cds_ft_inode_flag *) topmost_external_nodes,
-			detach_parent_flag_ptr == &ft->root,
-			cur_depth, pub);
+			if (ft_group_skip_compressed(ft->group) &&
+			    !topmost_external_nodes &&
+			    bmeta->nr_child == 2 &&
+			    !bmeta->external_nodes &&
+			    bmeta->parent != NULL) {
+				struct cds_ft_inode_flag *s_child = NULL;
+				uint8_t s_byte = 0;
+				unsigned int b;
+
+				for (b = 0; b < 256; b++) {
+					struct cds_ft_inode_flag *c;
+
+					if ((uint8_t) b == n)
+						continue;
+					c = ft_node_get_nth(ft, iter_node_flag,
+						NULL, (uint8_t) b, FT_PF_NONE);
+					if (c) {
+						s_child = c;
+						s_byte = (uint8_t) b;
+						break;
+					}
+				}
+				if (s_child) {
+					int cret = ft_chain_compress_fused(ft,
+						iter_node_flag, bmeta,
+						detach_parent_flag_ptr,
+						s_child, s_byte, fuse_cell, run);
+
+					if (cret == 0) {
+						ret = 0;
+						boundary_fused = true;
+					} else if (cret < 0) {
+						ret = cret;
+						goto end;
+					}
+					/* cret > 0: out of bound -- replace_ptr below. */
+				}
+			}
+		}
+#endif
+		if (!boundary_fused)
+			ret = ft_node_replace_ptr(ft,
+				detach_node_flag_ptr,
+				&iter_node_flag,
+				&old_recompacted_node,
+				metadata_stack[nr_branch - 1],
+				n, (struct cds_ft_inode_flag *) topmost_external_nodes,
+				detach_parent_flag_ptr == &ft->root,
+				cur_depth, pub);
 		if (!ret) {
 			/*
 			 * In-place key-disappearing remove (the holder stayed
@@ -717,7 +787,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 * unarmed) published its rebuilt node itself and stays
 			 * two-commit -- the caller unsplices.
 			 */
-			if (pub && pub->armed) {
+			if (!boundary_fused && pub && pub->armed) {
 				ft_remove_one_commit(ft, pub->slot, pub->old_val,
 					pub->new_val, fuse_cell, run);
 				if (pub->pigeon_bitmap)
@@ -935,9 +1005,12 @@ int ft_detach_node(struct cds_ft *ft,
 	/*
 	 * Update address of parent ptr in its parent.
 	 * Skip for compressed parents: the replacement was already
-	 * published inline above.
+	 * published inline above.  Skip entirely when shape-D fusion already
+	 * committed the merged compressed node in place of the boundary (the
+	 * boundary is freed, there is no forward republish or separate prune).
 	 */
-	if (!ft_node_compressed(iter_node_flag) &&
+	if (!boundary_fused &&
+	    !ft_node_compressed(iter_node_flag) &&
 	    !ft_node_skip_compressed(iter_node_flag)) {
 		struct cds_ft_metadata *iter_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));

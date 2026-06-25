@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 289
+#define NR_TESTS 290
 #else
 #define NR_TESTS 252
 #endif
@@ -22072,6 +22072,126 @@ static int test_remove_prefix_canonicalize_oom(void)
 }
 
 /*
+ * Fused-remove canonicalize OOM contract, shape D (a leaf-key detach whose
+ * pruned branch leaves a surviving 2-child boundary dropping to a non-root
+ * 1-child no-external internal).  Here the chain-compress prune is fused INTO
+ * the detach commit by BYPASSING ft_node_replace_ptr: the merged compressed
+ * node replaces the boundary in ONE flip, never publishing an intermediate
+ * 1-child node.  The merge allocates new_cn before any reader-visible store,
+ * so an allocation failure ABORTS the whole detach (the leaf stays, the count
+ * is rolled back, MEMORY_ERROR is retriable) rather than leave a non-canonical
+ * trie.  Walk every fault point: the trie must verify, the leaf is present iff
+ * the removal OOM'd, and the surviving sibling subtree + filler key survive.
+ *
+ * Shape: keys "XA" (leaf), "XBC" (the boundary's other child, a compressed
+ * extension), "Y" (keeps the root multi-child so the "X" boundary is a plain
+ * internal).  Removing "XA" drops the "X" boundary 2 -> 1 child -> shape-D
+ * fused merge of the boundary with the surviving "BC" compressed branch.
+ */
+static int run_remove_leaf_canonicalize_oom(int nr_faults)
+{
+	int n, rc = 0, saw_mem_err = 0, saw_ok = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_varlen_ft(&group);
+		struct cds_ft_iter *iter;
+		struct ft_test_node *xa = node_alloc(1);
+		struct ft_test_node *xbc = node_alloc(2);
+		struct ft_test_node *y = node_alloc(3);
+		struct cds_ft_node *res = NULL;
+		enum cds_ft_status s;
+		int verified, has_xa = 0, has_xbc = 0, has_y = 0;
+		int removed_xa, ok = 1;
+
+		if (cds_ft_iter_create(ft, &iter) < 0)
+			abort();
+		if (cds_ft_insert(ft, (const uint8_t *) "XA", 2, &xa->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "XBC", 3, &xbc->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "Y", 1, &y->node) < 0) {
+			fprintf(stderr, "remove_leaf_canon_oom: build failed\n");
+			rc = -1;
+		}
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) "XA", 2);
+		s = cds_ft_lookup(ft, iter);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK)
+			rc = -1;
+
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_remove_all(ft, iter, &res);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+		removed_xa = (s == CDS_FT_STATUS_OK);
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		if (verified) {
+			has_xa = ft_test_has_key(ft, "XA");
+			has_xbc = ft_test_has_key(ft, "XBC");
+			has_y = ft_test_has_key(ft, "Y");
+		}
+		rcu_read_unlock();
+
+		if (!verified) {
+			fprintf(stderr,
+				"remove_leaf_canon_oom: verify FAILED after fault n=%d (%s)\n",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+		if (s == CDS_FT_STATUS_OK) {
+			saw_ok = 1;
+			if (has_xa || res != &xa->node)	/* removed: XA gone, chain returned */
+				ok = 0;
+		} else if (s == CDS_FT_STATUS_MEMORY_ERROR) {
+			saw_mem_err = 1;
+			if (!has_xa)			/* aborted: XA stays */
+				ok = 0;
+		} else {
+			ok = 0;
+		}
+		if (!has_xbc || !has_y)			/* siblings always survive */
+			ok = 0;
+		if (!ok) {
+			fprintf(stderr,
+				"remove_leaf_canon_oom: %s state mismatch (n=%d xa=%d xbc=%d y=%d)\n",
+				cds_ft_status_to_string(s), n, has_xa, has_xbc, has_y);
+			rc = -1;
+		}
+
+		if (removed_xa) {
+			if (res != &xa->node)
+				rc = -1;
+			node_free_rcu(xa);	/* removed: drain won't see it */
+		}
+		cds_ft_iter_destroy(iter);
+		if (drain_trie(ft) < 0)		/* frees XBC, Y (+ XA if it stayed) */
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	/* The abort path is the point of the test: it must actually be exercised. */
+	if (!saw_mem_err || !saw_ok) {
+		fprintf(stderr,
+			"remove_leaf_canon_oom: coverage gap (mem_err=%d ok=%d)\n",
+			saw_mem_err, saw_ok);
+		rc = -1;
+	}
+	return rc;
+}
+
+static int test_remove_leaf_canonicalize_oom(void)
+{
+	return run_remove_leaf_canonicalize_oom(10);
+}
+
+/*
  * Replace OOM contract (cds_ft_replace of a duplicate-chain HEAD, list on).
  * Replacing the head of a key's chain while a successor remains swaps a FRESH
  * ordered-list cell in for the head's (cell->node is write-once) AND republishes
@@ -22790,6 +22910,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_remove_all_oom_contract);
 	RUN_TEST(test_remove_emptied_holder_traversal_oom);
 	RUN_TEST(test_remove_prefix_canonicalize_oom);
+	RUN_TEST(test_remove_leaf_canonicalize_oom);
 	RUN_TEST(test_remove_head_promote_oom);
 	RUN_TEST(test_insert_replace_prefix_oom);
 	RUN_TEST(test_replace_head_oom);
