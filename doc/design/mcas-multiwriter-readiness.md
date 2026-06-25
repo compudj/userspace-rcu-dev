@@ -208,6 +208,65 @@ reach a tombstoned slot — proxy and node die together. Constraint: *tombstone
 proxies reclaim no earlier than the nodes whose slots hold them* — automatically
 satisfied by the existing same-GP reclaim.
 
+### DECISION REVISED (2026-06-24): lean to (B) — a metadata **seqcount** word folded into the flip-latch record
+
+Reconsidering (A): a forwarding tombstone *per freed slot* means a wide popcount
+node (up to 256 child slots) contributes up to 256 proxy edges to a single detach
+txn — inelegant, a large freeze set, and (A) extends proxy resolution onto the
+**hot internal-descent path** for the detach window. (B)'s metadata word keeps
+child pointers byte-intact (**zero reader cost**) and bounds the freeze to **one
+word per freed node**. The objection to (B) was "writers must cooperate (read +
+include the mark)" — but under the campaign every writer already commits through
+the flip-latch record, so including one more word is the *existing* mechanism, not
+new cooperation. So (B) is now the leading direction for the general (wide-node)
+case; (A) may still win locally where a freed node is narrow and the txn already
+tiny.
+
+**The mark must be a seqcount, not a dead bit.** In (A) the inverse race
+(insert-lands-first ⇒ remover abandons the collapse, §3.2) was free because the
+freeze word *is* the inserter's CAS target — same-word contention. In (B) the
+freeze word (metadata) is **disjoint** from the slot the inserter CASes, so that
+automatic catch is **lost**: a remover that set a bare `dead` bit would still
+succeed even though an insert just added a child to a free slot — losing it (the
+I-then-R hazard, the dual of §3.2). Fix: make the word a **monotonic sequence
+count** that *every op mutating the node bumps*; the remover **validates the seq it
+read** at prune-decision time (`expected = seq_at_decision`). An intervening insert
+bumped the seq ⇒ the remover's commit fails its compare ⇒ it re-reads the node and
+abandons the collapse. (The seq is the writer/writer serialization; the dead state
+is freeze-on-free. Both live in the one word.)
+
+**Encoding.**
+
+```
+state = (seq << 2) | phase      phase ∈ { LIVE = 0, FLIP = 1, DEAD = 2 }
+```
+
+- insert / child-add: `expected (seq<<2 | LIVE)` → `((seq+1)<<2 | LIVE)`
+- remove / collapse:  `expected (seq<<2 | LIVE)` → `(seq<<2 | DEAD)`  (validate seq, freeze)
+- recompact (= fused remove-old + install-new): deads old N's word; the fresh N′
+  starts at `0 | LIVE`.
+
+**Scalar in the flip-latch.** A metadata word is a scalar; it cannot hold a
+tagged-pointer proxy, so the in-band `FLIP = 1` phase is its transient ("a commit
+is in flight on this word") — the scalar analogue of the type-7 proxy. Because the
+word is **writer-side only** — lookups descend via the child/external pointer
+slots, which carry their own flip proxies, and never read the state word — `FLIP`
+only has to be interpreted by *another writer* mid-commit (help/retry, standard
+MCAS); it need not carry old/new for readers, which is exactly what lets a bare
+in-band sentinel suffice (a pointer proxy would have to carry both).
+
+**seq width / ABA.** The seq need only be unique across the in-flight window. RCU
+already forbids freeing+reusing a node until a grace period elapses, so a modest
+high-bit field is ABA-safe in practice.
+
+**The campaign bridge (why it can land before MCAS).** Recording the state word as
+one more flip-latch edge is **behavior-identical under the single writer** (a
+redundant scalar store / no-op validate) and becomes the real CAS-with-expected in
+the MCAS word-set later. So the field + the every-mutating-op-records-it rule can be
+added and validated under the *current* suite (the gate stays green) well before any
+MCAS commit body exists — the same "express now, swap the commit later" discipline
+Invariant 1 uses.
+
 ---
 
 ## 5. Cost tiers and exclusivity
@@ -320,7 +379,7 @@ MCAS model rather than treated as a defect to "fix.")
 | | meaning | status | validated by |
 |---|---|---|---|
 | **Invariant 1** | every reader-visible edge is a flip-latch descriptor edge | NOT met (~62 gaps) | re-run the edge audit (functional tests cannot detect a miss) |
-| **Invariant 2** | freeze-on-free: a freed node fails a concurrent writer's CAS, still resolves for readers; writer re-validates | mechanism chosen (§4: `old==new` tombstone proxy), not implemented | (TBD — needs a multi-writer stress harness) |
+| **Invariant 2** | freeze-on-free: a freed node fails a concurrent writer's CAS, still resolves for readers; writer re-validates | mechanism leaning to (B) metadata **seqcount** word folded into the flip-latch record (§4 revised); (A) `old==new` proxy kept for narrow-node local use; not implemented | (TBD — needs a multi-writer stress harness) |
 
 Invariant 1 is the prerequisite the campaign closes. **Invariant 2 is the actual
 lock-free enabler** — without it, a fully edge-expressible structure is still
