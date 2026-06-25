@@ -97,7 +97,7 @@ static void sorted_insert(int key)
 	n->key = key;
 	for (;;) {
 		struct cds_bidir_list_lf_node *prev = &g_head, *succ;
-		struct urcu_flip_lf_txn *t;
+		struct urcu_flip_lf_mcas *t;
 		bool ok;
 
 		rcu_read_lock();
@@ -110,13 +110,13 @@ static void sorted_insert(int key)
 		}
 		n->node.next = succ;
 		n->node.prev = prev;
-		t = urcu_flip_lf_txn_create(2, retry);
+		t = urcu_flip_lf_mcas_create(2, retry);
 		if (!t)
 			abort();
 		/* validates prev->next == succ and succ->prev == prev */
-		urcu_flip_lf_txn_add(t, (void **) &prev->next, succ, &n->node);
-		urcu_flip_lf_txn_add(t, (void **) &succ->prev, prev, &n->node);
-		ok = urcu_flip_lf_txn_commit(t, call_rcu);
+		urcu_flip_lf_mcas_add(t, (void **) &prev->next, succ, &n->node);
+		urcu_flip_lf_mcas_add(t, (void **) &succ->prev, prev, &n->node);
+		ok = urcu_flip_lf_mcas_commit(t, call_rcu);
 		rcu_read_unlock();
 		if (ok)
 			return;

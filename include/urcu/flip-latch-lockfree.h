@@ -34,7 +34,7 @@
  * identity disambiguates).
  *
  * Resolution.  A reader (or a writer traversing) that loads a slot holding
- * flip(r) reads r->txn->status: SUCCEEDED resolves to r->new_ptr, UNDECIDED or
+ * flip(r) reads r->mcas->status: SUCCEEDED resolves to r->new_ptr, UNDECIDED or
  * FAILED to r->old_ptr.  Because resolution goes through the status word, planting
  * a terminal descriptor in a slot is *correct*, not a bug -- which is why no
  * RDCSS is needed.
@@ -121,7 +121,7 @@ extern "C" {
  * proxy and contends on the same priority-ordered footing as everyone else (at
  * the cost of a descriptor and one grace period).  This lifts a *lockout*; it
  * does not make the op wait-free -- the engine is lock-free, not wait-free.  The
- * retry count the caller threads into urcu_flip_lf_txn_create() drives this.
+ * retry count the caller threads into urcu_flip_lf_mcas_create() drives this.
  */
 #ifndef URCU_FLIP_LF_ESCALATE
 #define URCU_FLIP_LF_ESCALATE 16
@@ -133,13 +133,13 @@ enum urcu_flip_lf_status {
 	URCU_FLIP_LF_FAILED    = 2,
 };
 
-struct urcu_flip_lf_txn;
+struct urcu_flip_lf_mcas;
 
 struct urcu_flip_lf_record {
 	void **slot;			/* transacted word (bit 0 must be free) */
 	void *old_ptr;			/* expected old value */
 	void *new_ptr;			/* committed new value */
-	struct urcu_flip_lf_txn *txn;	/* back-pointer (status + sibling records) */
+	struct urcu_flip_lf_mcas *mcas;	/* back-pointer (status + sibling records) */
 } __attribute__((aligned(16)));
 
 /*
@@ -155,7 +155,7 @@ struct urcu_flip_lf_record {
  * alignment carries all of this -- the txn needs no alignment attribute of its
  * own; only records, never the txn or its status word, are tagged into a slot.)
  */
-struct urcu_flip_lf_txn {
+struct urcu_flip_lf_mcas {
 	unsigned long status;		/* enum urcu_flip_lf_status, CAS-updated */
 	unsigned long retry;		/* aging priority: prior retries of this op */
 	struct rcu_head rcu_head;	/* owner's deferred-free handle */
@@ -164,15 +164,15 @@ struct urcu_flip_lf_txn {
 	struct urcu_flip_lf_record recs[];	/* frozen + slot-sorted at commit */
 };
 
-urcu_static_assert(!(offsetof(struct urcu_flip_lf_txn, recs) % 16),
-		"urcu_flip_lf_txn.recs must be 16-byte aligned within the txn",
-		urcu_flip_lf_txn_recs_aligned);
+urcu_static_assert(!(offsetof(struct urcu_flip_lf_mcas, recs) % 16),
+		"urcu_flip_lf_mcas.recs must be 16-byte aligned within the txn",
+		urcu_flip_lf_mcas_recs_aligned);
 urcu_static_assert(!(sizeof(struct urcu_flip_lf_record) % 16),
 		"urcu_flip_lf_record stride must keep inline records 16-byte aligned",
 		urcu_flip_lf_record_stride_aligned);
-urcu_static_assert(!(__alignof__(struct urcu_flip_lf_txn) % 16),
-		"urcu_flip_lf_txn must inherit 16-byte alignment from its recs[] member",
-		urcu_flip_lf_txn_aligned);
+urcu_static_assert(!(__alignof__(struct urcu_flip_lf_mcas) % 16),
+		"urcu_flip_lf_mcas must inherit 16-byte alignment from its recs[] member",
+		urcu_flip_lf_mcas_aligned);
 
 /* The reserved tag bit marking a slot value as a parked record (proxy). */
 #define URCU_FLIP_LF_TAG	1UL
@@ -197,7 +197,7 @@ void *urcu_flip_lf_tag(struct urcu_flip_lf_record *r)
 }
 
 static inline
-unsigned long urcu_flip_lf_status(struct urcu_flip_lf_txn *t)
+unsigned long urcu_flip_lf_status(struct urcu_flip_lf_mcas *t)
 {
 	return uatomic_load(&t->status, CMM_ACQUIRE);
 }
@@ -212,8 +212,8 @@ unsigned long urcu_flip_lf_status(struct urcu_flip_lf_txn *t)
  * records target pairwise-distinct slots).
  */
 static inline
-bool urcu_flip_lf_outranks(const struct urcu_flip_lf_txn *a,
-		const struct urcu_flip_lf_txn *b)
+bool urcu_flip_lf_outranks(const struct urcu_flip_lf_mcas *a,
+		const struct urcu_flip_lf_mcas *b)
 {
 	if (a->retry != b->retry)
 		return a->retry > b->retry;
@@ -233,7 +233,7 @@ void *urcu_flip_lf_resolve(void *v)
 	if (caa_likely(!urcu_flip_lf_is_proxy(v)))
 		return v;
 	r = urcu_flip_lf_untag(v);
-	return urcu_flip_lf_status(r->txn) == URCU_FLIP_LF_SUCCEEDED ?
+	return urcu_flip_lf_status(r->mcas) == URCU_FLIP_LF_SUCCEEDED ?
 			r->new_ptr : r->old_ptr;
 }
 
@@ -249,7 +249,7 @@ void *urcu_flip_lf_resolve(void *v)
  * recursion is bounded by the number of concurrently-conflicting transactions.
  */
 static inline
-void urcu_flip_lf_drive_install(struct urcu_flip_lf_txn *t)
+void urcu_flip_lf_drive_install(struct urcu_flip_lf_mcas *t)
 {
 	unsigned long st = urcu_flip_lf_status(t);
 	unsigned int i;
@@ -274,7 +274,7 @@ void urcu_flip_lf_drive_install(struct urcu_flip_lf_txn *t)
 			if (urcu_flip_lf_is_proxy(v)) {
 				struct urcu_flip_lf_record *fr =
 					urcu_flip_lf_untag(v);
-				struct urcu_flip_lf_txn *e = fr->txn;
+				struct urcu_flip_lf_mcas *e = fr->mcas;
 				unsigned long est;
 				void *resolved;
 
@@ -347,7 +347,7 @@ void urcu_flip_lf_drive_install(struct urcu_flip_lf_txn *t)
  * record of @t, so the descriptor can be reclaimed.  Idempotent.
  */
 static inline
-void urcu_flip_lf_settle(struct urcu_flip_lf_txn *t)
+void urcu_flip_lf_settle(struct urcu_flip_lf_mcas *t)
 {
 	unsigned long st = urcu_flip_lf_status(t);
 	unsigned int i;
@@ -376,11 +376,11 @@ void *urcu_flip_lf_read(void **slot)
 {
 	for (;;) {
 		void *v = uatomic_load(slot, CMM_ACQUIRE);
-		struct urcu_flip_lf_txn *e;
+		struct urcu_flip_lf_mcas *e;
 
 		if (caa_likely(!urcu_flip_lf_is_proxy(v)))
 			return v;
-		e = urcu_flip_lf_untag(v)->txn;
+		e = urcu_flip_lf_untag(v)->mcas;
 		if (urcu_flip_lf_status(e) != URCU_FLIP_LF_UNDECIDED)
 			return urcu_flip_lf_resolve(v);	/* terminal: logical value */
 		urcu_flip_lf_drive_install(e);		/* help decide, then re-read */
@@ -395,12 +395,12 @@ void *urcu_flip_lf_read(void **slot)
  * bypassed -- see urcu_flip_lf_outranks().
  */
 static inline
-struct urcu_flip_lf_txn *urcu_flip_lf_txn_create(unsigned int cap,
+struct urcu_flip_lf_mcas *urcu_flip_lf_mcas_create(unsigned int cap,
 		unsigned long retry)
 {
-	struct urcu_flip_lf_txn *t;
+	struct urcu_flip_lf_mcas *t;
 
-	t = (struct urcu_flip_lf_txn *) malloc(sizeof(*t) +
+	t = (struct urcu_flip_lf_mcas *) malloc(sizeof(*t) +
 			(size_t) cap * sizeof(struct urcu_flip_lf_record));
 	if (!t)
 		return NULL;
@@ -413,7 +413,7 @@ struct urcu_flip_lf_txn *urcu_flip_lf_txn_create(unsigned int cap,
 
 /* Append one edge {*slot: old -> new}.  Before commit only.  No install yet. */
 static inline
-bool urcu_flip_lf_txn_add(struct urcu_flip_lf_txn *t, void **slot,
+bool urcu_flip_lf_mcas_add(struct urcu_flip_lf_mcas *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
 	struct urcu_flip_lf_record *r;
@@ -424,27 +424,27 @@ bool urcu_flip_lf_txn_add(struct urcu_flip_lf_txn *t, void **slot,
 	r->slot = slot;
 	r->old_ptr = old_ptr;
 	r->new_ptr = new_ptr;
-	r->txn = t;
+	r->mcas = t;
 	return true;
 }
 
 static inline
-void urcu_flip_lf_txn_destroy(struct urcu_flip_lf_txn *t)
+void urcu_flip_lf_mcas_destroy(struct urcu_flip_lf_mcas *t)
 {
 	free(t);
 }
 
 /* call_rcu callback: deferred destroy. */
 static inline
-void urcu_flip_lf_txn_free_rcu(struct rcu_head *head)
+void urcu_flip_lf_mcas_free_rcu(struct rcu_head *head)
 {
-	urcu_flip_lf_txn_destroy(caa_container_of(head,
-			struct urcu_flip_lf_txn, rcu_head));
+	urcu_flip_lf_mcas_destroy(caa_container_of(head,
+			struct urcu_flip_lf_mcas, rcu_head));
 }
 
 /* Sort records by slot address (insertion sort -- transactions are small). */
 static inline
-void urcu_flip_lf_txn_sort(struct urcu_flip_lf_txn *t)
+void urcu_flip_lf_mcas_sort(struct urcu_flip_lf_mcas *t)
 {
 	unsigned int i, j;
 
@@ -474,14 +474,14 @@ void urcu_flip_lf_txn_sort(struct urcu_flip_lf_txn *t)
  * Call within an RCU read-side section (descriptor existence for helpers).
  */
 static inline
-bool urcu_flip_lf_txn_commit(struct urcu_flip_lf_txn *t,
+bool urcu_flip_lf_mcas_commit(struct urcu_flip_lf_mcas *t,
 		void (*call_rcu_fn)(struct rcu_head *,
 			void (*)(struct rcu_head *)))
 {
 	bool committed;
 
 	if (t->nr == 0) {
-		urcu_flip_lf_txn_destroy(t);
+		urcu_flip_lf_mcas_destroy(t);
 		return true;
 	}
 	if (t->nr == 1 && t->retry < URCU_FLIP_LF_ESCALATE) {
@@ -494,16 +494,16 @@ bool urcu_flip_lf_txn_commit(struct urcu_flip_lf_txn *t,
 		struct urcu_flip_lf_record *r = &t->recs[0];
 
 		committed = uatomic_cmpxchg(r->slot, r->old_ptr, r->new_ptr) == r->old_ptr;
-		urcu_flip_lf_txn_destroy(t);
+		urcu_flip_lf_mcas_destroy(t);
 		return committed;
 	}
 	if (t->nr == 1)
 		URCU_FLIP_LF_STAT(escalate);	/* single edge, retried past the threshold */
-	urcu_flip_lf_txn_sort(t);
+	urcu_flip_lf_mcas_sort(t);
 	urcu_flip_lf_drive_install(t);		/* install to a decision (helpers help) */
 	urcu_flip_lf_settle(t);			/* owner-only: make our own slots plain */
 	committed = urcu_flip_lf_status(t) == URCU_FLIP_LF_SUCCEEDED;
-	call_rcu_fn(&t->rcu_head, urcu_flip_lf_txn_free_rcu);
+	call_rcu_fn(&t->rcu_head, urcu_flip_lf_mcas_free_rcu);
 	return committed;
 }
 
