@@ -663,9 +663,9 @@ struct cds_ft_alloc_arena;
  * two edges: forward slot + skip dual.
  */
 struct ft_pub_rec {
-	struct cds_ft_inode_flag **slot[2];
-	struct cds_ft_inode_flag *old_val[2];
-	struct cds_ft_inode_flag *new_val[2];
+	struct cds_ft_inode_flag **slot[3];
+	struct cds_ft_inode_flag *old_val[3];
+	struct cds_ft_inode_flag *new_val[3];
 	unsigned int n;
 };
 

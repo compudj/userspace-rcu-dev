@@ -282,20 +282,30 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 	ft_set_parent_slot(new_cn_meta, new_cn_meta->parent, publish_slot);
 
 	new_cn_flag = ft_compressed_node_flag(new_cn);
-	ft_set_parent(ft, new_cn->child, new_cn_flag, &new_cn->child);
-	new_cn_flag = ft_publish_compressed(ft, new_cn, new_cn_flag);
 	{
 		struct ft_pub_rec rec = { .n = 0 };
+		struct cds_ft_inode_flag *new_cn_pub;
 
 		/*
 		 * Chain-compress canonicalization publish: the merged compressed
-		 * node replaces the collapsed chain at publish_slot.  Route the
-		 * forward slot (+ a compressed grandparent's SKIP_X dual) through
-		 * the op flip-txn so they flip atomically (no torn forward/skip
-		 * window); a lone edge stays a single release store.
+		 * node replaces the collapsed chain at publish_slot.  Fuse the
+		 * LIVE child re-parent (new_cn->child -> new_cn) with the forward
+		 * slot (+ a compressed grandparent's SKIP_X dual) into ONE flip,
+		 * so a reader never sees new_cn->child re-parented onto new_cn
+		 * while the grandparent slot still points at the collapsed chain
+		 * (or vice versa).  The back-pointer takes the PLAIN compressed
+		 * flag (as the prior bare ft_set_parent did); the forward slot
+		 * takes the published (possibly skip-encoded) flag.  Because the
+		 * back-edge is deferred, the publish takes new_cn_meta explicitly
+		 * (ft_skip_to_compressed would otherwise read the not-yet-stored
+		 * back-edge to resolve a SKIP_X forward flag).  A lone edge stays
+		 * a single release store.
 		 */
-		_ft_publish_to_parent(ft, publish_parent, publish_slot,
-			new_cn_flag, &rec);
+		ft_pub_rec_add_back_edge(ft, &rec, new_cn->child, new_cn_flag,
+			&new_cn->child);
+		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
+		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
+			new_cn_pub, new_cn_meta, &rec);
 		ft_remove_commit_rec(ft, &rec, NULL, NULL);
 	}
 

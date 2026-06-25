@@ -908,6 +908,59 @@ void ft_remove_one_commit(struct cds_ft *ft,
 }
 
 /*
+ * Record a LIVE child's parent back-edge into @rec so it rides the SAME flip as
+ * the forward publish (instead of a bare ft_set_parent before it): the child's
+ * parent field transitions old -> @new_parent atomically with the structural
+ * publish, closing the re-parent-before-publish window and making the back-edge
+ * an MCAS descriptor edge.  Resolves the field per child kind exactly as
+ * ft_set_parent / ft_park_live_parent_edge do (metadata->parent for
+ * internal/compressed, cell->parent / node->prev for an external head), and
+ * sets the slot offset up front (write-side; the parked parent proxy makes a
+ * concurrent up-walk reanchor, so the early offset is unobserved until settle).
+ * Because the back-edge is deferred, the paired forward publish MUST use
+ * _ft_publish_to_parent_meta with @new_parent's metadata: a SKIP_X forward flag
+ * is otherwise resolved via ft_skip_to_compressed, which reads this very
+ * (not-yet-stored) field.  @new_parent must be a COMPRESSED/internal flag whose
+ * incoming_byte the child inherits via the parent's own slot, so no
+ * incoming_byte write is needed here (matching ft_park_live_parent_edge).
+ */
+static
+void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
+		struct cds_ft_inode_flag *child,
+		struct cds_ft_inode_flag *new_parent,
+		struct cds_ft_inode_flag **slot)
+{
+	struct cds_ft_metadata *meta = NULL;
+	struct cds_ft_inode_flag **field;
+
+	if (!child)
+		return;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(child))
+		meta = cds_ft_item_to_metadata((struct cds_ft_inode *)
+			ft_skip_to_compressed(ft, child));
+	else
+#endif
+	if (ft_node_compressed(child))
+		meta = cds_ft_item_to_metadata((struct cds_ft_inode *)
+			ft_compressed_node_ptr(child));
+	else if (!ft_node_external(child))
+		meta = cds_ft_item_to_metadata(ft_node_ptr(child));
+
+	if (meta) {
+		ft_set_parent_slot(meta, new_parent, slot);
+		field = &meta->parent;
+	} else if (ft->ordered_list) {
+		field = &ft_ord_cell_ptr(
+			((struct cds_ft_node *) child)->prev)->parent;
+	} else {
+		field = (struct cds_ft_inode_flag **)
+			&((struct cds_ft_node *) child)->prev;
+	}
+	ft_pub_rec_add(rec, field, new_parent);
+}
+
+/*
  * Key-disappearing remove via recompaction: commit the recompacted node's
  * 1-2 reader-visible structural stores -- recorded by ft_publish_to_parent
  * into @rec (the forward parent slot, plus a compressed parent's SKIP_X dual
@@ -921,7 +974,7 @@ static
 void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
 		struct ft_ord_cell *dead_cell, struct ft_detach_run *run)
 {
-	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 cell/run */
+	struct ft_ord_cell_edge edges[7];	/* <=3 structural (+back-edge) + <=4 cell/run */
 	unsigned int n = 0, i;
 
 	for (i = 0; i < rec->n; i++) {

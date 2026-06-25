@@ -1769,7 +1769,7 @@ static
 void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
 		struct cds_ft_inode_flag *new_val)
 {
-	assert(rec->n < 2);
+	assert(rec->n < 3);
 	rec->slot[rec->n] = slot;
 	rec->old_val[rec->n] = *slot;
 	rec->new_val[rec->n] = new_val;
@@ -1777,13 +1777,23 @@ void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
 }
 
 static
-void _ft_publish_to_parent(struct cds_ft *ft,
+void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child,
+		struct cds_ft_metadata *new_child_meta,
 		struct ft_pub_rec *rec)
 {
 	/*
+	 * @new_child_meta (optional): @new_child's metadata, supplied by the
+	 * caller so we DON'T recover it from the slot value.  Required when the
+	 * caller defers @new_child's back-pointer into the same flip-txn as this
+	 * publish: a SKIP_X @new_child is resolved to its compressed node via
+	 * ft_skip_to_compressed, which reads new_child's child's parent -- which
+	 * is precisely the deferred (not-yet-stored) back-edge.  Passing the
+	 * metadata directly avoids that stale read.  NULL = recover as before
+	 * (the back-edge was wired up front).
+	 *
 	 * Publication-ordering invariant: a child becomes observable by
 	 * downward traversal the instant it is published into a live parent
 	 * slot, so its parent back-pointer MUST already be wired.  Otherwise
@@ -1802,7 +1812,12 @@ void _ft_publish_to_parent(struct cds_ft *ft,
 		 * Check skip-compressed FIRST: a SKIP_X flag carries its
 		 * (external) child's low tag bits, so ft_node_external() would
 		 * misclassify it and dereference the tagged flag as a node.
+		 * The caller-supplied metadata short-circuits the SKIP_X recovery
+		 * (which would read the deferred back-edge).
 		 */
+		if (new_child_meta) {
+			cp = new_child_meta->parent;
+		} else
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (ft_node_skip_compressed(new_child)) {
 			cp = cds_ft_item_to_metadata((struct cds_ft_inode *)
@@ -1859,15 +1874,17 @@ void _ft_publish_to_parent(struct cds_ft *ft,
 	 * the slot lives inside a node-arena chunk.
 	 */
 	if (new_child && parent_slot != &ft->root) {
-		struct cds_ft_metadata *child_meta = NULL;
+		struct cds_ft_metadata *child_meta = new_child_meta;
 
-		if (ft_node_skip_compressed(new_child))
-			child_meta = cds_ft_item_to_metadata(
-				(struct cds_ft_inode *)
-					ft_skip_to_compressed(ft, new_child));
-		else if (!ft_node_external(new_child))
-			child_meta = cds_ft_item_to_metadata(
-				ft_node_ptr(new_child));
+		if (!child_meta) {
+			if (ft_node_skip_compressed(new_child))
+				child_meta = cds_ft_item_to_metadata(
+					(struct cds_ft_inode *)
+						ft_skip_to_compressed(ft, new_child));
+			else if (!ft_node_external(new_child))
+				child_meta = cds_ft_item_to_metadata(
+					ft_node_ptr(new_child));
+		}
 		if (child_meta && child_meta->parent)
 			ft_set_parent_slot(child_meta, child_meta->parent,
 				parent_slot);
@@ -1933,6 +1950,21 @@ void _ft_publish_to_parent(struct cds_ft *ft,
 		ft_pub_rec_add(rec, parent_slot, new_child);
 	else
 		rcu_assign_pointer(*parent_slot, new_child);
+}
+
+/*
+ * Publish, recovering @new_child's metadata from the slot value (the
+ * back-pointer was wired up front) -- the original behaviour.
+ */
+static
+void _ft_publish_to_parent(struct cds_ft *ft,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **parent_slot,
+		struct cds_ft_inode_flag *new_child,
+		struct ft_pub_rec *rec)
+{
+	_ft_publish_to_parent_meta(ft, parent_nf, parent_slot, new_child,
+		NULL, rec);
 }
 
 /* Direct publish (original behaviour): perform the stores immediately. */
