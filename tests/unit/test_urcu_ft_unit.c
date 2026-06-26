@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 290
+#define NR_TESTS 291
 #else
 #define NR_TESTS 252
 #endif
@@ -18909,6 +18909,7 @@ out:
 
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_alloc_countdown;
+extern long cds_ft_fault_flip_countdown;
 
 /*
  * Drive a compressed-split insert through each of its allocation-failure
@@ -22192,6 +22193,124 @@ static int test_remove_leaf_canonicalize_oom(void)
 }
 
 /*
+ * Non-fused shape-P remove OOM contract: removing a prefix key whose internal
+ * holder keeps TWO body children (so the holder stays multi-child -- no
+ * chain-compress canonicalization fires) clears external_nodes -> NULL fused
+ * with the dead cell's unsplice in ONE flip via ft_remove_one_commit.  That
+ * commit is the op's abort boundary (no pre-flip side-effect), so on the
+ * multi-edge flip-txn OOM it returns -ENOMEM with nothing installed and the
+ * removal aborts: the -1 count is rolled back, the prefix key stays, and
+ * MEMORY_ERROR is retriable -- never a bare-store fallback.  Walk every fault
+ * point: the trie verifies, the prefix key is present iff the removal OOM'd,
+ * and both sibling extensions always survive.
+ *
+ * Shape: keys "P" (prefix), "PA" and "PB" (two extensions -> the "P" holder has
+ * external_nodes={P} + two body children, multi-child after the clear).
+ */
+static int run_remove_prefix_siblings_oom(int nr_faults)
+{
+	int n, rc = 0, saw_mem_err = 0, saw_ok = 0;
+
+	for (n = 0; n < nr_faults; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_varlen_ft(&group);
+		struct cds_ft_iter *iter;
+		struct ft_test_node *p = node_alloc(1);
+		struct ft_test_node *pa = node_alloc(2);
+		struct ft_test_node *pb = node_alloc(3);
+		struct cds_ft_node *res = NULL;
+		enum cds_ft_status s;
+		int verified, has_p = 0, has_pa = 0, has_pb = 0;
+		int removed_p, ok = 1;
+
+		if (cds_ft_iter_create(ft, &iter) < 0)
+			abort();
+		if (cds_ft_insert(ft, (const uint8_t *) "P", 1, &p->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "PA", 2, &pa->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *) "PB", 2, &pb->node) < 0) {
+			fprintf(stderr, "remove_prefix_siblings_oom: build failed\n");
+			rc = -1;
+		}
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) "P", 1);
+		s = cds_ft_lookup(ft, iter);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK)
+			rc = -1;
+
+		cds_ft_fault_flip_countdown = n;
+		rcu_read_lock();
+		s = cds_ft_remove_all(ft, iter, &res);
+		rcu_read_unlock();
+		cds_ft_fault_flip_countdown = -1;
+		removed_p = (s == CDS_FT_STATUS_OK);
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		if (verified) {
+			has_p = ft_test_has_key(ft, "P");
+			has_pa = ft_test_has_key(ft, "PA");
+			has_pb = ft_test_has_key(ft, "PB");
+		}
+		rcu_read_unlock();
+
+		if (!verified) {
+			fprintf(stderr,
+				"remove_prefix_siblings_oom: verify FAILED after fault n=%d (%s)\n",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+		if (s == CDS_FT_STATUS_OK) {
+			saw_ok = 1;
+			if (has_p || res != &p->node)	/* removed: P gone, chain returned */
+				ok = 0;
+		} else if (s == CDS_FT_STATUS_MEMORY_ERROR) {
+			saw_mem_err = 1;
+			if (!has_p)			/* aborted: P stays */
+				ok = 0;
+		} else {
+			ok = 0;
+		}
+		if (!has_pa || !has_pb)			/* siblings always survive */
+			ok = 0;
+		if (!ok) {
+			fprintf(stderr,
+				"remove_prefix_siblings_oom: %s state mismatch (n=%d p=%d pa=%d pb=%d)\n",
+				cds_ft_status_to_string(s), n, has_p, has_pa, has_pb);
+			rc = -1;
+		}
+
+		if (removed_p) {
+			if (res != &p->node)
+				rc = -1;
+			node_free_rcu(p);	/* removed: drain won't see it */
+		}
+		cds_ft_iter_destroy(iter);
+		if (drain_trie(ft) < 0)		/* frees PA, PB (+ P if it stayed) */
+			rc = -1;
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		rcu_barrier();
+		cds_ft_group_destroy(group);
+	}
+	/* The abort path is the point of the test: it must actually be exercised. */
+	if (!saw_mem_err || !saw_ok) {
+		fprintf(stderr,
+			"remove_prefix_siblings_oom: coverage gap (mem_err=%d ok=%d)\n",
+			saw_mem_err, saw_ok);
+		rc = -1;
+	}
+	return rc;
+}
+
+static int test_remove_prefix_siblings_oom(void)
+{
+	return run_remove_prefix_siblings_oom(10);
+}
+
+/*
  * Replace OOM contract (cds_ft_replace of a duplicate-chain HEAD, list on).
  * Replacing the head of a key's chain while a successor remains swaps a FRESH
  * ordered-list cell in for the head's (cell->node is write-once) AND republishes
@@ -22911,6 +23030,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_remove_emptied_holder_traversal_oom);
 	RUN_TEST(test_remove_prefix_canonicalize_oom);
 	RUN_TEST(test_remove_leaf_canonicalize_oom);
+	RUN_TEST(test_remove_prefix_siblings_oom);
 	RUN_TEST(test_remove_head_promote_oom);
 	RUN_TEST(test_insert_replace_prefix_oom);
 	RUN_TEST(test_replace_head_oom);

@@ -1175,6 +1175,15 @@ room_left:
  * path; both cds_ft_alloc_item and cds_ft_alloc_compressed_item route here.
  */
 long cds_ft_fault_alloc_countdown = -1;
+/*
+ * Separate fault counter for flip-transaction allocations
+ * (ft_flip_txn_create_bounded).  Same arm-to-N semantics, but independent of
+ * the arena counter above: flip-txns are raw malloc, not arena items, so a
+ * test arms THIS to drive the grow-and-abort / pre-reserve commit paths
+ * (ft_ord_cell_flip_try abort, ft_chain_compress_fused / ft_detach_node txn
+ * pre-reservation failure) without perturbing the arena-fault tests.
+ */
+long cds_ft_fault_flip_countdown = -1;
 #endif
 
 static

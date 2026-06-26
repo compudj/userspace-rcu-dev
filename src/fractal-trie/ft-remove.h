@@ -1610,13 +1610,22 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				 * deferred-free block below the unsplice happened.
 				 */
 				if (fuse_remove) {
-					ft_remove_one_commit(ft,
+					/*
+					 * Abortable: the flip is the op's commit, no
+					 * pre-flip side-effect, so on OOM the removal
+					 * aborts -- roll back the -1 count, leave the key.
+					 */
+					ret = ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) node, NULL,
 						dead_cell, NULL, NULL);
-					ft_node_mark_removed(node);
-					pub.armed = true;
-					ret = 0;
+					if (ret) {
+						ft_propagate_external_count_parent(ft,
+							holder_flag, 1);
+					} else {
+						ft_node_mark_removed(node);
+						pub.armed = true;
+					}
 				} else {
 					/* List off: the single store is atomic alone. */
 					ret = ft_unchain_node(ft, holder_flag,
@@ -1841,10 +1850,20 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		if (ft->ordered_list) {
 			struct ft_ord_cell *dead = ft_ord_cell_ptr(external_nodes->prev);
 
-			ft_remove_one_commit(ft,
+			/*
+			 * Abortable: the flip is the op's commit (no pre-flip
+			 * reader-visible side-effect).  On OOM roll back the -1 count,
+			 * reset the out-param, leave the key -- retriable MEMORY_ERROR.
+			 */
+			if (ft_remove_one_commit(ft,
 				(struct cds_ft_inode_flag **) &metadata->external_nodes,
 				(struct cds_ft_inode_flag *) external_nodes, NULL,
-				dead, NULL, NULL);
+				dead, NULL, NULL)) {
+				ft_nr_keys_store(metadata,
+					ft_nr_keys_get(metadata) + 1, CMM_RELEASE);
+				*result_node = NULL;
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
 			ft_ord_cell_free(ft, dead);
 		} else {
 			struct ft_ord_cell_edge edge = {
@@ -1984,11 +2003,20 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				 * MCAS-expressible) rather than a bare store.
 				 */
 				if (ft->ordered_list) {
-					ft_remove_one_commit(ft,
+					/*
+					 * Abortable: the flip is the op's commit (no
+					 * pre-flip side-effect).  On OOM roll back the -1
+					 * count, leave the key -- retriable MEMORY_ERROR.
+					 */
+					ret = ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) chain_head, NULL,
 						dead_cell, NULL, NULL);
-					pub.armed = true;
+					if (ret)
+						ft_propagate_external_count_parent(ft,
+							holder_flag, 1);
+					else
+						pub.armed = true;
 				} else {
 					struct ft_ord_cell_edge edge = {
 						.slot = (struct ft_ord_cell **)
@@ -1999,23 +2027,25 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					};
 
 					ft_ord_cell_flip_one(&edge);
+					ret = 0;
 				}
-				ft_chain_mark_removed(chain_head);
-				ret = 0;
-				assert(holder_meta->nr_child > 0);
+				if (ret == 0) {
+					ft_chain_mark_removed(chain_head);
+					assert(holder_meta->nr_child > 0);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-				/*
-				 * Out-of-bound residue: best-effort post-prune via
-				 * the standalone second flip (leaves a 1-child
-				 * internal if it still cannot merge).
-				 */
-				if (ft_group_skip_compressed(ft->group) &&
-				    holder_meta->nr_child == 1 &&
-				    holder_meta->parent != NULL) {
-					ft_canonicalize_chain_compress(ft, holder_flag,
-						holder_meta, ft_get_parent_slot(holder_meta, ft));
-				}
+					/*
+					 * Out-of-bound residue: best-effort post-prune
+					 * via the standalone second flip (leaves a
+					 * 1-child internal if it still cannot merge).
+					 */
+					if (ft_group_skip_compressed(ft->group) &&
+					    holder_meta->nr_child == 1 &&
+					    holder_meta->parent != NULL) {
+						ft_canonicalize_chain_compress(ft, holder_flag,
+							holder_meta, ft_get_parent_slot(holder_meta, ft));
+					}
 #endif
+				}
 			}
 		}
 	} else {

@@ -122,9 +122,28 @@ struct urcu_flip_txn *ft_flip_txn_create(void)
  * edge count is bounded by construction.  Returns NULL on OOM -> the caller
  * degrades to a direct / sequential publish.
  */
+#ifdef FEATURE_FT_FAULT_INJECT
+extern long cds_ft_fault_flip_countdown;
+#endif
 static inline
 struct urcu_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 {
+#ifdef FEATURE_FT_FAULT_INJECT
+	/*
+	 * Test-only flip-txn allocation fault injection (see
+	 * cds_ft_fault_flip_countdown).  Drives the grow-and-abort / pre-reserve
+	 * commit paths: ft_ord_cell_flip_try returns -ENOMEM (abort), and a
+	 * pre-reservation (ft_chain_compress_fused / ft_detach_node) fails before
+	 * its first side-effect.
+	 */
+	if (cds_ft_fault_flip_countdown >= 0) {
+		if (cds_ft_fault_flip_countdown == 0) {
+			cds_ft_fault_flip_countdown = -1;
+			return NULL;
+		}
+		cds_ft_fault_flip_countdown--;
+	}
+#endif
 	return urcu_flip_txn_create_bounded(ft_flip_txn_tag, cap);
 }
 
@@ -999,7 +1018,7 @@ unsigned int ft_pub_rec_sedges(struct ft_pub_rec *rec,
  * SKIP_X dual pointer, a recompacted node's grandparent edge) do NOT use this.
  */
 static
-void ft_remove_one_commit(struct cds_ft *ft,
+int ft_remove_one_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **struct_slot,
 		struct cds_ft_inode_flag *struct_old,
 		struct cds_ft_inode_flag *struct_new,
@@ -1020,17 +1039,23 @@ void ft_remove_one_commit(struct cds_ft *ft,
 	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 	/*
-	 * @txn: when non-NULL, a caller-PRE-RESERVED bounded txn -- the flip
-	 * commits through it (ft_ord_cell_flip_into, infallible) so a caller that
-	 * has already wired a pre-flip side-effect (e.g. metadata->nr_child--)
-	 * reaches an allocation-free point of no return.  NULL keeps the
-	 * transitional self-allocating flip (bare-store fallback) for callers not
-	 * yet migrated.
+	 * @txn non-NULL: a caller-PRE-RESERVED bounded txn -- the flip commits
+	 * through it (ft_ord_cell_flip_into, infallible) so a caller that has
+	 * already wired a pre-flip side-effect (e.g. metadata->nr_child--) reaches
+	 * an allocation-free point of no return; returns 0.  @txn NULL: the flip
+	 * is the op's ABORT BOUNDARY -- commit via ft_ord_cell_flip_try, which
+	 * installs nothing on OOM (a lone edge is the infallible on-stack store),
+	 * and return -ENOMEM so the (no-pre-flip-side-effect) caller aborts the
+	 * removal with the structure untouched.
 	 */
-	if (txn)
+	if (txn) {
 		ft_ord_cell_flip_into(ft, txn, edges, n);
-	else
-		ft_ord_cell_flip(ft, edges, n);
+	} else {
+		int cret = ft_ord_cell_flip_try(ft, edges, n);
+
+		if (cret)
+			return cret;	/* nothing installed: caller aborts */
+	}
 	if (run) {
 		/* @into NULL = EXCISE-ONLY (the merge source side): the run is
 		 * unlinked from @ft's list but not re-homed; its cells keep their
@@ -1039,6 +1064,7 @@ void ft_remove_one_commit(struct cds_ft *ft,
 			ft_ord_cell_run_install(run->into, run->first, run->last);
 		run->armed = true;
 	}
+	return 0;
 }
 
 /*
