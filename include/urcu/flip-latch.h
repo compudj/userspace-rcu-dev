@@ -100,6 +100,7 @@
 
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include <urcu/assert.h>
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
@@ -219,7 +220,8 @@ void urcu_flip_commit(struct urcu_flip_group *group)
  *
  * The single embedder hook is @tag: given a recorded proxy, return the tagged
  * pointer value to store in the slot (e.g. set a reserved type code).  The
- * latch is 16-byte aligned so the tag may use the low 4 bits.
+ * latch array is allocated 16-byte aligned (posix_memalign), so each latch --
+ * hence each tagged proxy -- has its low 4 bits free for the embedder's tag.
  */
 
 enum urcu_flip_txn_state {
@@ -251,15 +253,16 @@ struct urcu_flip_group_block {
 
 /*
  * Transaction handle: a small on-stack object with no allocation of its own.
- * The record array @latches realloc-grows in PREPARE -- safe because no proxy is
+ * The record array @latches grows in PREPARE -- safe because no proxy is
  * installed yet (no slot points into it) -- and is frozen once commit() parks
  * proxies.  @block is the lazily-allocated persistent group block (NULL until
  * proxies are parked); commit() hands @latches to it so a held proxy and its
  * selector are reclaimed together after a grace period.  The tag room that
- * matters is on the tagged proxies stored in slots; those live in @latches, and
- * struct urcu_flip_latch's 16-byte alignment keeps each 16-byte aligned (low 4
- * bits free), so a low-4-bit pointer-tagging embedder (e.g. the fractal trie)
- * can route its slots through this engine.
+ * matters is on the tagged proxies stored in slots; those live in @latches,
+ * allocated 16-byte aligned (posix_memalign) so each latch -- hence each
+ * tagged proxy -- keeps its low 4 bits free, letting a low-4-bit
+ * pointer-tagging embedder (e.g. the fractal trie) route its slots through
+ * this engine.
  */
 struct urcu_flip_txn {
 	void *(*tag)(struct urcu_flip_proxy *proxy);
@@ -290,6 +293,23 @@ void urcu_flip_txn_init(struct urcu_flip_txn *t,
 }
 
 /*
+ * Allocate a record array of @size bytes, 16-byte aligned.  Each latch's proxy
+ * is tagged into a slot, so the array base must be 16-byte aligned for every
+ * latch -- hence every tagged proxy -- to keep its low 4 bits free for the
+ * embedder's tag.  posix_memalign guarantees that portably; plain malloc would
+ * only promise max_align_t (8 on some 32-bit ABIs).  Returns NULL on OOM.
+ */
+static inline
+struct urcu_flip_latch *urcu_flip_txn__latches_alloc(size_t size)
+{
+	void *p;
+
+	if (posix_memalign(&p, 16, size))
+		return NULL;
+	return (struct urcu_flip_latch *) p;
+}
+
+/*
  * Pre-size the PREPARE record array to hold at least @cap latches.  Optional:
  * record() already realloc-grows the array on demand and fails cleanly on OOM,
  * which is the general (unbounded) model.  But an embedder whose edge count is
@@ -313,7 +333,7 @@ bool urcu_flip_txn_reserve(struct urcu_flip_txn *t, unsigned int cap)
 		return cap <= t->cap;		/* already sized */
 	if (cap < URCU_FLIP_TXN_CAP)
 		cap = URCU_FLIP_TXN_CAP;
-	l = (struct urcu_flip_latch *) malloc((size_t) cap * sizeof(*l));
+	l = urcu_flip_txn__latches_alloc((size_t) cap * sizeof(*l));
 	if (!l) {
 		t->state = URCU_FLIP_TXN_OOM;	/* sticky: commit reports it */
 		return false;
@@ -386,13 +406,19 @@ bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
 		unsigned int newcap = t->cap ? t->cap * 2 : URCU_FLIP_TXN_CAP;
 		struct urcu_flip_latch *nl;
 
-		/* No proxy address is live yet -> realloc may move the array. */
-		nl = (struct urcu_flip_latch *) realloc(t->latches,
+		/*
+		 * No proxy address is live yet -> the array may move.  No
+		 * aligned realloc exists, so allocate a fresh 16-byte-aligned
+		 * block, copy the buffered records, and free the old one.
+		 */
+		nl = urcu_flip_txn__latches_alloc(
 				(size_t) newcap * sizeof(*nl));
 		if (!nl) {
 			t->state = URCU_FLIP_TXN_OOM;	/* sticky: commit reports it */
 			return false;
 		}
+		memcpy(nl, t->latches, (size_t) t->nr * sizeof(*nl));
+		free(t->latches);
 		t->latches = nl;
 		t->cap = newcap;
 	}

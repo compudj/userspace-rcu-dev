@@ -80,6 +80,7 @@
  */
 
 #include <stdlib.h>
+#include <stdint.h>
 
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
@@ -123,7 +124,7 @@ void cds_bidir_list_init(struct cds_bidir_list_head *head)
 static inline
 void *cds_bidir_list_proxy_tag(struct urcu_flip_proxy *proxy)
 {
-	return (void *) ((unsigned long) proxy | CDS_BIDIR_LIST_PROXY_TAG);
+	return (void *) ((uintptr_t) proxy | CDS_BIDIR_LIST_PROXY_TAG);
 }
 
 /*
@@ -134,11 +135,11 @@ void *cds_bidir_list_proxy_tag(struct urcu_flip_proxy *proxy)
 static inline
 struct cds_bidir_list_head *cds_bidir_list_resolve(struct cds_bidir_list_head *ptr)
 {
-	unsigned long v = (unsigned long) ptr;
+	uintptr_t v = (uintptr_t) ptr;
 
 	if (caa_unlikely(v & CDS_BIDIR_LIST_PROXY_TAG)) {
 		struct urcu_flip_proxy *proxy = (struct urcu_flip_proxy *)
-				(v & ~CDS_BIDIR_LIST_PROXY_TAG);
+				(v & ~(uintptr_t) CDS_BIDIR_LIST_PROXY_TAG);
 
 		return (struct cds_bidir_list_head *)
 				urcu_flip_proxy_get(proxy);

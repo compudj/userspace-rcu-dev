@@ -92,7 +92,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
+#include <urcu/assert.h>
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head */
@@ -144,16 +146,25 @@ struct urcu_flip_lf_record {
 
 /*
  * The records are stored inline after the header and a parked slot holds the
- * tagged address of one record (urcu_flip_lf_tag()).  The engine itself owns
- * only tag bit 0, but each inline record is 16-byte aligned -- which makes the
- * recs[] offset and the record stride both multiples of 16, and (since recs[] is
- * a member) gives the txn itself 16-byte alignment -- so every inline record
- * address has its low 4 bits free.  An embedder that tags a transacted slot with
- * a wider type code (e.g. the fractal trie's low-4-bit pointer tags) can thus
- * park records through this engine without losing tag room.  The static asserts
- * below pin that guarantee against future field changes.  (The record's own
- * alignment carries all of this -- the txn needs no alignment attribute of its
- * own; only records, never the txn or its status word, are tagged into a slot.)
+ * tagged address of one record (urcu_flip_lf_tag()).  The engine's HARD
+ * requirement is only tag bit 0 of a record address; the wider guarantee below
+ * is what lets an embedder share a transacted slot with its own tag bits.
+ *
+ * Each inline record is 16-byte aligned -- the recs[] offset and the record
+ * stride are both multiples of 16 (and, recs[] being a member, the txn
+ * itself is 16-byte aligned) -- so every inline record address has its low 4
+ * bits free.  An embedder that tags a transacted slot with a wider type code
+ * (e.g. the fractal trie's low-4-bit pointer tags) can thus park records
+ * through this engine without losing tag room.  The descriptor is allocated
+ * with posix_memalign(16) (urcu_flip_lf_mcas_alloc), so the 16-byte base
+ * alignment holds PORTABLY -- not merely where plain malloc happens to return
+ * blocks aligned to >= 16 (max_align_t is only 8 on some 32-bit ABIs).  The
+ * static asserts below pin the record TYPE's layout (offset and stride both
+ * multiples of 16) so that, given that aligned base, every inline record
+ * inherits it; they constrain the struct, not the allocator.  (The record's
+ * own alignment carries all of this -- the txn needs no alignment attribute
+ * of its own; only records, never the txn or its status word, are tagged into
+ * a slot.)
  */
 struct urcu_flip_lf_mcas {
 	unsigned long status;		/* enum urcu_flip_lf_status, CAS-updated */
@@ -388,6 +399,24 @@ void *urcu_flip_lf_read(void **slot)
 }
 
 /*
+ * Allocate a descriptor blob of @size bytes, 16-byte aligned.  The descriptor
+ * holds the inline records that get tagged into slots, so its base must be
+ * 16-byte aligned for every inline record to keep its low 4 bits free (see the
+ * layout note above struct urcu_flip_lf_mcas).  posix_memalign guarantees that
+ * portably; plain malloc would only promise max_align_t (8 on some 32-bit
+ * ABIs).  Returns NULL on OOM.
+ */
+static inline
+struct urcu_flip_lf_mcas *urcu_flip_lf_mcas_alloc(size_t size)
+{
+	void *p;
+
+	if (posix_memalign(&p, 16, size))
+		return NULL;
+	return (struct urcu_flip_lf_mcas *) p;
+}
+
+/*
  * Create a transaction with room for @cap records.  @retry is the caller's
  * aging-priority: the number of times this logical operation has already retried
  * (0 on the first attempt, incremented and passed back in on each retry).  A
@@ -400,7 +429,7 @@ struct urcu_flip_lf_mcas *urcu_flip_lf_mcas_create(unsigned int cap,
 {
 	struct urcu_flip_lf_mcas *t;
 
-	t = (struct urcu_flip_lf_mcas *) malloc(sizeof(*t) +
+	t = urcu_flip_lf_mcas_alloc(sizeof(*t) +
 			(size_t) cap * sizeof(struct urcu_flip_lf_record));
 	if (!t)
 		return NULL;
@@ -438,9 +467,11 @@ bool urcu_flip_lf_mcas_add(struct urcu_flip_lf_mcas *t, void **slot,
  * Grow @t's record capacity (room for at least one more), returning the
  * possibly-moved descriptor, or NULL on OOM with @t left intact for the caller
  * to free.  Valid only before commit: the descriptor is not yet parked in any
- * slot, so it may move freely; realloc preserves malloc's alignment, so the
- * 16-byte tag-room guarantee holds across the move.  Back-pointers are set at
- * commit, after the last grow, so a move here strands nothing.
+ * slot, so it may move freely.  There is no aligned realloc, so rather than
+ * realloc (which would preserve only malloc's max_align_t alignment, not the
+ * 16-byte tag room) we allocate a fresh 16-byte-aligned block, copy the header
+ * and the records buffered so far, and free the old one.  Back-pointers are set
+ * at commit, after the last grow, so a move here strands nothing.
  */
 static inline
 struct urcu_flip_lf_mcas *urcu_flip_lf_mcas_grow(struct urcu_flip_lf_mcas *t)
@@ -448,11 +479,14 @@ struct urcu_flip_lf_mcas *urcu_flip_lf_mcas_grow(struct urcu_flip_lf_mcas *t)
 	unsigned int newcap = t->cap < 2 ? 2 : t->cap * 2;
 	struct urcu_flip_lf_mcas *n;
 
-	n = (struct urcu_flip_lf_mcas *) realloc(t, sizeof(*t) +
+	n = urcu_flip_lf_mcas_alloc(sizeof(*t) +
 			(size_t) newcap * sizeof(struct urcu_flip_lf_record));
 	if (!n)
 		return NULL;
+	memcpy(n, t, sizeof(*t) +
+			(size_t) t->nr * sizeof(struct urcu_flip_lf_record));
 	n->cap = newcap;
+	free(t);
 	return n;
 }
 
@@ -529,6 +563,16 @@ bool urcu_flip_lf_mcas_commit(struct urcu_flip_lf_mcas *t,
 	if (t->nr == 1)
 		URCU_FLIP_LF_STAT(escalate);	/* single edge, retried past the threshold */
 	urcu_flip_lf_mcas_sort(t);
+	/*
+	 * Engine precondition: a transaction's records must target pairwise-
+	 * distinct slots (the install/steal protocol's "own proxy"
+	 * short-circuit and the read-set checks assume it).  After the
+	 * slot-address sort a duplicate shows up as an adjacent equal slot, so
+	 * a single linear pass catches an embedder that buffered the same slot
+	 * twice.  Debug-only: no cost under NDEBUG.
+	 */
+	for (i = 1; i < t->nr; i++)
+		urcu_assert_debug(t->recs[i].slot != t->recs[i - 1].slot);
 	/*
 	 * Set the record back-pointers now, deferred from add time.  The
 	 * write-set may have been grown (realloc'd, hence moved) while it was
