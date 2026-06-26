@@ -210,6 +210,12 @@ satisfied by the existing same-GP reclaim.
 
 ### DECISION REVISED (2026-06-24): lean to (B) — a metadata **seqcount** word folded into the flip-latch record
 
+> **SUPERSEDED (2026-06-26) — the seqcount is RETIRED.** See "DECISION FINAL"
+> below: once the two in-place node mutations are eliminated, a one-way `deleted`
+> flag replaces the seqcount entirely. This subsection is kept for the reasoning
+> trail (why a disjoint freeze word *would* need a count if any in-place mutator
+> survived).
+
 Reconsidering (A): a forwarding tombstone *per freed slot* means a wide popcount
 node (up to 256 child slots) contributes up to 256 proxy edges to a single detach
 txn — inelegant, a large freeze set, and (A) extends proxy resolution onto the
@@ -310,6 +316,76 @@ Two coupled refinements to weigh against the seqcount decision above.
 bitmap site is recompacted. Confirm that completeness before adopting the flag over
 the seqcount; the seqcount remains the safe default while any in-place mutator
 survives.)*
+
+### DECISION FINAL (2026-06-26, Mathieu): the one-way `deleted` flag — the seqcount is retired; the dup-chain is refinement-1's second site
+
+**Decision: adopt the one-way `deleted` latch (`LIVE → DEAD`, §4.B above); retire
+the seqcount / version counter entirely.** The version was only ever the patch for
+a *disjoint* freeze word (metadata word ≠ the inserter's CAS target). Once no
+in-place node mutation survives, every op that touches a node contends on the
+**same** word as a concurrent remover, the disjoint-word catch is no longer needed,
+and the count collapses to a bit.
+
+Refinement 1 ("eliminate every in-place node mutation") therefore has **two** sites,
+not one — and it is total only when **both** are converted:
+
+1. **The occupancy-bitmap insert-without-rerank** (refinement 1 above): recompact
+   the node instead of setting the bitmap bit in place.
+
+2. **The duplicate-node chain** — the second in-place node mutation, missed by the
+   §2 edge audit because (like the bitmap) the hazard is not where Invariant 1 looks.
+   *The dup-chain is part of the trie, not a side structure: its mutations must fold
+   into the op's transaction commit.* The concrete hazard is the §3.1 disjoint-word
+   race re-instanced in the chain:
+
+   - A duplicate **append** is an in-place mutation of a *live* node:
+     `tail->next : NULL → D`.
+   - A **remover of that tail** unlinks it by CASing the **predecessor's** word
+     (`pred->next : tail → tail->next`) and defer-frees `tail`.
+   - `tail->next` and `pred->next` are **disjoint words** ⇒ per-slot MCAS serializes
+     neither ⇒ both CASes succeed ⇒ **D is appended onto a freed `tail`: a lost key
+     and a use-after-free** — the exact §3.1 obstacle, at the chain.
+
+   **Fix — fold the chain into the op transaction, same-word (§4.A, applied to the
+   chain):** the remover **tombstones the freed node's *own* `next`** (the word the
+   appender CASes), *recorded as an edge in the remove txn* — not a bare bit-set.
+   Then an append-after-a-dying-node finds its expected-value CAS on `tail->next`
+   fail against the tombstone and re-descends; the inverse (append-lands-first ⇒ the
+   tail is no longer the chain end ⇒ remover re-reads) is caught by the same
+   contention. The append's `next` store is already an expected-value flip
+   descriptor (Invariant-1 class-E, `ft_chain_next_flip`); head/promotion changes
+   already fuse the chain relink with the trie slot + cell swap (class-D,
+   `ft_promote_head`). What remains is to make the **remove-side tombstone a txn
+   edge on the freed node's own `next`**, so the freeze contends in the MCAS
+   word-set rather than sitting outside it as a plain store.
+
+**Why this needs no seqcount and no separate chain mechanism.** The chain leaf's
+freeze and the internal node's freeze become the **same one-way `DEAD` mark in two
+different words**:
+
+| Node kind | freeze word | reader cost |
+|---|---|---|
+| internal / compressed | a `deleted` bit in node metadata (§4.B) | zero — lookups never read it |
+| duplicate-chain leaf | the `CDS_FT_NODE_REMOVED_FLAG` tombstone in `next` (§4.A) | already paid — readers already mask it in `cds_ft_node_next_rcu` |
+
+For the chain leaf the §4.A "same-word, no cooperation" property is the *natural*
+fit (the inserter's CAS target **is** `next`, and the reader cost §4.A worried about
+is already a single mask that exists today), exactly where §4.A's wide-node
+objection (256 proxies) does not apply. Neither word is a count: both are a
+monotonic `LIVE → DEAD` latch with the in-band `FLIP` transient, validated by any op
+that targets the node, freeing the node and its txn from the same commit GP.
+
+**Precondition stands.** This is sound **only when refinement 1 is total** — both
+the bitmap recompact **and** the chain fold landed, with a re-audit confirming no
+other reader-visible in-place node-word mutation survives (the §2 edge audit covers
+pointer edges, not metadata/word mutations, so it must be re-run with that lens).
+Until then the seqcount remains the safe fallback for any surviving in-place mutator.
+
+**Campaign bridge (unchanged).** The `deleted` flag and the chain's remove-side
+tombstone-edge both record into the flip-latch: behavior-identical under the single
+writer (a redundant store / no-op validate), real CAS-with-expected in the MCAS
+word-set later — so both land and validate under the current suite before any MCAS
+commit body exists.
 
 ---
 
