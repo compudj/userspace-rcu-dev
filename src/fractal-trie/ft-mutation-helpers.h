@@ -257,8 +257,6 @@ struct ft_remove_pub {
 	bool armed;
 };
 
-static void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
-		unsigned int n);
 static void ft_ord_cell_flip_into(struct cds_ft *ft, struct urcu_flip_txn *t,
 		struct ft_ord_cell_edge *edges, unsigned int n);
 
@@ -317,7 +315,7 @@ unsigned int ft_ord_cell_endpoint_edge(struct ft_ord_cell **slot,
  * @dst adopt @src's ENTIRE structure AND its ENTIRE ordered list at once: the
  * root pointer transitions @struct_old -> @struct_new while ord_cell_head/tail
  * transition @head_old/@tail_old -> @head_new/@tail_new.  Recording all (<= 3)
- * edges in one ft_ord_cell_flip closes the appear-side cross-view window -- a
+ * edges in one flip closes the appear-side cross-view window -- a
  * reader never sees the keys reachable in the structure but the ordered list
  * still empty (it resolves the root and the head/tail proxies to ONE flip
  * phase, exactly as ft_ord_cell_swap_publish fuses a head swap with its cell
@@ -433,7 +431,7 @@ struct ft_root_swap_side {
  * historically as two separate ft_root_list_swap_publish flips, leaving a
  * cross-trie window where a reader sees a key reachable in BOTH tries (appear
  * committed, disappear not yet) or in NEITHER.  Recording both sides' root (and,
- * list-on, head/tail) edges in ONE ft_ord_cell_flip closes that window: the two
+ * list-on, head/tail) edges in ONE flip closes that window: the two
  * tries share a group, hence a flip selector, so a single epoch flip settles all
  * <= 6 edges atomically -- a reader resolves every root/endpoint proxy to ONE
  * phase and sees the key in exactly one trie.  All @old values must be captured
@@ -698,32 +696,6 @@ int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 }
 
 /*
- * Transitional degraded flip: on a multi-edge txn-alloc OOM, sequential bare
- * stores.  A bidirectional reader between two stores can observe one neighbour's
- * edge updated and the mirror not yet -- transient and self-healing, never a
- * dangling pointer.  This is the last bare-store escape hatch.
- *
- * Every mutation-path caller has migrated to ft_ord_cell_flip_try (abortable) or
- * ft_ord_cell_flip_into (pre-reserved).  The SOLE remaining caller is the
- * compaction cell-swap (ft_ord_cell_swap below, reached only from
- * ft-compact.h): migrating compaction's cell swap to a pre-reserved /
- * descriptor commit is a separate MCAS-readiness decision (readiness §6), and
- * this wrapper -- with its forward declaration above -- is deleted once that
- * decision lands and compaction stops using it.
- */
-static
-void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
-		unsigned int n)
-{
-	if (caa_unlikely(ft_ord_cell_flip_try(ft, edges, n) != 0)) {
-		unsigned int i;
-
-		for (i = 0; i < n; i++)
-			rcu_assign_pointer(*edges[i].slot, edges[i].new_target);
-	}
-}
-
-/*
  * Find the cell of the in-order predecessor (mode LT) / successor (mode GT)
  * of @key via the eager relational descent on the writer's cell scratch
  * iterator.  Returns NULL when none exists (@key is the new minimum/maximum).
@@ -867,26 +839,32 @@ void ft_ord_cell_unsplice(struct cds_ft *ft, struct urcu_flip_txn *txn,
 	ft_ord_cell_flip_into(ft, txn, edges, n);
 }
 
+/* Max edges a relocation cell-swap commits: <=2 neighbour back-edges + head + tail. */
+#define FT_ORD_CELL_SWAP_MAX_EDGES	4
+
 /*
  * Replace @old_cell with @new_cell at the same list position.  @new_cell
  * inherits @old_cell's neighbours; @old_cell keeps its links for parked
  * readers until its deferred free.  O(1): reuses @old_cell's neighbours, no
  * relational descent.
  *
- * The compaction cell relocation (ft-compact.h) is the sole caller, and hence
- * the sole remaining ft_ord_cell_flip (transitional bare-store) caller -- every
- * other commit primitive now uses a pre-reserved (ft_ord_cell_flip_into) or
- * abortable (ft_ord_cell_flip_try) commit.  Migrating this swap to a
- * pre-reserved txn is the separate MCAS-readiness decision that unblocks
- * deleting ft_ord_cell_flip (readiness §6).
+ * The compaction cell relocation (ft-compact.h) is the sole caller, and it is
+ * a best-effort relocation that ABORTS by leaving a node in place on OOM, so
+ * the swap is its commit boundary: commit through the self-allocating
+ * ft_ord_cell_flip_try and propagate its status.  Returns 0 (swapped), or
+ * -ENOMEM with NOTHING installed -- @old_cell stays fully in the list and the
+ * caller discards the never-published @new_cell.  This was the last
+ * ft_ord_cell_flip (transitional bare-store) caller; with it on a flip-txn
+ * descriptor, ft_ord_cell_flip is gone and every reader-visible cell commit
+ * rides the latch (readiness §6).
  */
 static
-void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
+int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		struct ft_ord_cell *new_cell)
 {
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->ord_prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->ord_next);
-	struct ft_ord_cell_edge edges[4];
+	struct ft_ord_cell_edge edges[FT_ORD_CELL_SWAP_MAX_EDGES];
 	unsigned int n = 0;
 
 	new_cell->ord_prev = pred;
@@ -905,7 +883,7 @@ void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	}
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, old_cell, new_cell, edges, n);
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, old_cell, new_cell, edges, n);
-	ft_ord_cell_flip(ft, edges, n);
+	return ft_ord_cell_flip_try(ft, edges, n);
 }
 
 /*
@@ -947,7 +925,7 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
 
 /*
  * Replace: swap @new_cell into @old_cell's list slot AND publish the new head
- * (@struct_new replaces @struct_old in @struct_slot) in ONE ft_ord_cell_flip, so
+ * (@struct_new replaces @struct_old in @struct_slot) in ONE flip, so
  * the tree-head swap and the ordinal-cell swap commit atomically -- a reader
  * observes the old head WITH its old cell, XOR the new head WITH its new cell,
  * never a published new head whose cell links are not yet swapped.
@@ -1039,7 +1017,7 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 /*
  * Copy @rec's <=2 structural edges (the forward parent slot plus a compressed
  * parent's SKIP_X dual, populated by _ft_publish_to_parent) into @sedges for a
- * fused commit (ft_ord_cell_swap_publish_multi / ft_ord_cell_flip).  Returns the
+ * fused commit (ft_ord_cell_swap_publish_multi).  Returns the
  * edge count.
  */
 static

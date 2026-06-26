@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 291
+#define NR_TESTS 293
 #else
-#define NR_TESTS 252
+#define NR_TESTS 253
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -195,6 +195,29 @@ static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_o
 	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
 	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/* Fixed-length trie with the ordered cell list ENABLED (library-owned cells). */
+static struct cds_ft *create_fixed_ord_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -18632,6 +18655,112 @@ out:
 }
 
 /*
+ * Compaction on an ORDERED-LIST trie: each library-owned ordinal cell is
+ * relocated through ft_ord_cell_swap (the flip-latch cell-swap, the migrated
+ * sole former ft_ord_cell_flip caller).  Build a fixed-key ordered trie, drain
+ * to sparse ranges (forcing many cell relocations), compact, then confirm the
+ * relocated ordered list is intact: cds_ft_verify walks the ordered cell list
+ * when it is on, and a forward ordered scan yields exactly the surviving keys
+ * in strictly increasing order.  (The standalone tests/ordcell harness exercises
+ * the same path but is not built by this suite -- this is the committed-suite
+ * coverage for the cell-swap relocation.)
+ */
+static int test_compact_ordered_list(void)
+{
+	const unsigned int N = 4096;
+	const unsigned int STRIDE = 4;		/* keep every 4th key */
+	const unsigned int SURVIVORS = N / STRIDE;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ord_ft(8, &group);
+	struct cds_ft_iter *iter = NULL;
+	unsigned int i, count = 0;
+	uint64_t prev = 0;
+	int ret = 0, first = 1;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		ret = -1;
+		goto out;
+	}
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compact_ordered_list: insert %u failed\n", i);
+			node_free(n);
+			ret = -1;
+			goto out_iter;
+		}
+	}
+	/* Drain all but every STRIDE-th key, leaving sparse ranges to relocate. */
+	for (i = 0; i < N; i++) {
+		struct cds_ft_node *found;
+		uint8_t k[8];
+
+		if (i % STRIDE == 0)
+			continue;
+		rcu_read_lock();
+		cds_ft_u64_to_key(ft, i, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_lookup(ft, iter);
+		found = cds_ft_iter_node(iter);
+		if (found) {
+			struct ft_test_node *tn = to_test_node(found);
+
+			if (cds_ft_remove(ft, iter, &tn->node) == CDS_FT_STATUS_OK)
+				node_free_rcu(tn);
+		}
+		rcu_read_unlock();
+	}
+
+	cds_ft_compact(ft);
+
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compact_ordered_list: post-compact verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	/* Every survivor remains, reachable in strictly increasing order. */
+	rcu_read_lock();
+	cds_ft_for_each_rcu(ft, iter) {
+		uint8_t rk[8];
+		size_t rk_len;
+		uint64_t v;
+
+		cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+		v = cds_ft_key_to_u64(ft, rk, CDS_FT_LEN_DEFAULT);
+		if (v % STRIDE != 0) {
+			fprintf(stderr, "compact_ordered_list: stray key %" PRIu64 "\n", v);
+			ret = -1;
+			break;
+		}
+		if (!first && v <= prev) {
+			fprintf(stderr, "compact_ordered_list: order %" PRIu64
+				" after %" PRIu64 "\n", v, prev);
+			ret = -1;
+			break;
+		}
+		prev = v;
+		first = 0;
+		count++;
+	}
+	rcu_read_unlock();
+	if (ret == 0 && count != SURVIVORS) {
+		fprintf(stderr, "compact_ordered_list: count %u, expected %u\n",
+			count, SURVIVORS);
+		ret = -1;
+	}
+out_iter:
+	cds_ft_iter_destroy(iter);
+out:
+	drain_trie(ft);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Compaction over skip-compressed-over-external-leaf shapes.  Keys of the form
  * (i << 32) share a four-byte zero suffix, so each key's unique tail compresses
  * into a skip-compressed node whose single child is the external leaf.
@@ -22653,6 +22782,122 @@ static int test_detach_oom_atomicity(void)
 	}
 	return rc;
 }
+
+/*
+ * Compaction cell-swap OOM (flip-txn allocation fault).  During cds_ft_compact
+ * on an ordered-list trie the ONLY flip-txn allocation is the per-cell
+ * relocation swap -- the structural node relocations publish through release
+ * stores (rcu_assign_pointer), never the flip latch -- so arming
+ * cds_ft_fault_flip_countdown = n fails exactly the (n+1)-th cell-swap.
+ * ft_ord_cell_swap then installs nothing and returns -ENOMEM, and
+ * ft_compact_relocate_cell leaves that cell in place (best-effort); compaction
+ * reports no error.  The relocation that aborts keeps a fully consistent list
+ * (an un-relocated cell stays correctly linked between its -- possibly already
+ * relocated -- neighbours), so the trie must remain entirely valid: every
+ * survivor present, the ordered list intact and in order, no leak.  Sweeping n
+ * drives the abort path across many distinct relocations.
+ */
+static int test_compact_ordered_list_oom(void)
+{
+	const unsigned int N = 1024;
+	const unsigned int STRIDE = 4;
+	const unsigned int SURVIVORS = N / STRIDE;
+	int n, rc = 0, saw_abort = 0;
+
+	for (n = 0; n < 64; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_fixed_ord_ft(8, &group);
+		struct cds_ft_iter *iter = NULL;
+		unsigned int i, count = 0;
+		uint64_t prev = 0;
+		int first = 1, ok = 1;
+
+		if (cds_ft_iter_create(ft, &iter) < 0)
+			abort();
+		for (i = 0; i < N; i++) {
+			struct ft_test_node *tn = node_alloc(i);
+
+			if (insert_u64(ft, i, tn) != CDS_FT_STATUS_OK) {
+				node_free(tn);
+				ok = 0;
+				break;
+			}
+		}
+		for (i = 0; ok && i < N; i++) {
+			struct cds_ft_node *found;
+			uint8_t k[8];
+
+			if (i % STRIDE == 0)
+				continue;
+			rcu_read_lock();
+			cds_ft_u64_to_key(ft, i, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(ft, iter);
+			found = cds_ft_iter_node(iter);
+			if (found) {
+				struct ft_test_node *tn = to_test_node(found);
+
+				if (cds_ft_remove(ft, iter, &tn->node) == CDS_FT_STATUS_OK)
+					node_free_rcu(tn);
+			}
+			rcu_read_unlock();
+		}
+
+		/* Fail the (n+1)-th cell-swap flip-txn allocation during compaction. */
+		cds_ft_fault_flip_countdown = n;
+		cds_ft_compact(ft);
+		if (cds_ft_fault_flip_countdown < 0)
+			saw_abort = 1;		/* the fault fired -> a cell-swap aborted */
+		cds_ft_fault_flip_countdown = -1;
+
+		rcu_read_lock();
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compact_ordered_list_oom: verify FAILED at n=%d\n", n);
+			ok = 0;
+		}
+		rcu_read_unlock();
+
+		rcu_read_lock();
+		cds_ft_for_each_rcu(ft, iter) {
+			uint8_t rk[8];
+			size_t rk_len;
+			uint64_t v;
+
+			cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+			v = cds_ft_key_to_u64(ft, rk, CDS_FT_LEN_DEFAULT);
+			if (v % STRIDE != 0 || (!first && v <= prev)) {
+				fprintf(stderr, "compact_ordered_list_oom: bad scan n=%d "
+					"v=%" PRIu64 " prev=%" PRIu64 "\n", n, v, prev);
+				ok = 0;
+				break;
+			}
+			prev = v;
+			first = 0;
+			count++;
+		}
+		rcu_read_unlock();
+		if (count != SURVIVORS) {
+			fprintf(stderr, "compact_ordered_list_oom: n=%d count %u != %u\n",
+				n, count, SURVIVORS);
+			ok = 0;
+		}
+		if (!ok)
+			rc = -1;
+
+		cds_ft_iter_destroy(iter);
+		drain_trie(ft);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		if (!ok)
+			break;
+	}
+	if (rc == 0 && !saw_abort) {
+		fprintf(stderr, "compact_ordered_list_oom: abort path never hit "
+			"(no cell-swap faulted across the sweep)\n");
+		rc = -1;
+	}
+	return rc;
+}
 #endif /* FEATURE_FT_FAULT_INJECT */
 
 int main(int argc, char **argv)
@@ -22988,6 +23233,7 @@ int main(int argc, char **argv)
 	/* Compaction */
 	diag("Compaction tests");
 	RUN_TEST(test_compact_integrity);
+	RUN_TEST(test_compact_ordered_list);
 	RUN_TEST(test_compact_skip_over_leaf);
 	RUN_TEST(test_compact_concurrent_mutation);
 	RUN_TEST(test_compact_forgotten_end);
@@ -23034,6 +23280,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_remove_head_promote_oom);
 	RUN_TEST(test_insert_replace_prefix_oom);
 	RUN_TEST(test_replace_head_oom);
+	RUN_TEST(test_compact_ordered_list_oom);
 #endif
 
 	rcu_barrier();

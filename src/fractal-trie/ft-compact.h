@@ -141,7 +141,10 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
  * Atomicity reuses ft_ord_cell_swap for the two ordered-list edges
  * (pred->ord_next / succ->ord_prev flip together via the flip-latch, so a
  * bidirectional ordered reader never sees a half-relocated list; ord_cell_head
- * /tail follow).  The head's UPWARD reference (head->prev) is then re-pointed
+ * /tail follow).  That swap is the abortable commit boundary: on a flip-txn
+ * OOM it installs nothing and returns -ENOMEM, and this relocation leaves @old
+ * in place (best-effort), discarding the never-published @new cell.  The head's
+ * UPWARD reference (head->prev) is then re-pointed
  * with a PLAIN RCU store: an up-walk reader resolves the old or the new cell,
  * both carrying an IDENTICAL parent (compaction runs under writer exclusion, so
  * @old->parent is settled), and @old stays live until its grace period -- so no
@@ -167,7 +170,19 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 	/* Carry the head's edge byte across the relocation (up-walk key source). */
 	meta->incoming_byte = cds_ft_item_to_metadata(old)->incoming_byte;
 	/* ord_prev / ord_next are set from @old's neighbours by the swap. */
-	ft_ord_cell_swap(ft, old, new_cell);
+	if (ft_ord_cell_swap(ft, old, new_cell) != 0) {
+		/*
+		 * OOM reserving the swap flip-txn: the abortable commit
+		 * installed nothing, so @old stays fully in the ordered list.
+		 * Discard @new_cell (never published -- no reader can reach it)
+		 * and leave @old in place, the same best-effort contract as the
+		 * cell-allocation failure above.
+		 */
+		if (ft_debug_counters())
+			uatomic_inc(&ft->group->nr_cells_freed);
+		cds_ft_free_item_unpublished(ft, meta);
+		return old;
+	}
 	rcu_assign_pointer(head->prev, ft_ord_cell_flag(new_cell));
 	/* Always-deferred free: see ft_compact_relocate_at. */
 	if (ft_debug_counters())

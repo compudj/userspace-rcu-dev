@@ -141,7 +141,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * the publish through the op flip-txn so the forward slot AND
 			 * a compressed grandparent's SKIP_X dual flip atomically (no
 			 * torn forward/skip window).  A lone edge reduces to a single
-			 * release store in ft_ord_cell_flip, so this stays allocation-
+			 * release store (ft_ord_cell_flip_one), so this stays allocation-
 			 * free and infallible for the common plain-parent case.
 			 */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
