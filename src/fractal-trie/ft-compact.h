@@ -40,6 +40,8 @@
  * ft_node_recompact's dual-pointer publish updates both cn->child and the skip
  * pointer.
  */
+/* A relocation publish is at most the forward edge + a compressed parent's SKIP_X dual. */
+#define FT_RELOCATE_COMMIT_MAX_EDGES	2
 /* Relocate the internal node at *@holder into a fresh slot; RCU-free the old. */
 static
 void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder)
@@ -48,11 +50,50 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	unsigned int type_index = ft_node_type(nf);
 	struct cds_ft_inode *node = ft_node_ptr(nf), *old_ret = NULL;
 	struct cds_ft_metadata *meta = cds_ft_item_to_metadata(node);
+	struct cds_ft_inode_flag *parent = meta->parent;
+	struct ft_pub_rec rec = { .n = 0 };
+	struct urcu_flip_txn *txn = NULL;
+	int ret;
 
-	(void) ft_node_recompact(FT_RECOMPACT_RELOCATE, ft, type_index,
+	/*
+	 * The recompacted node's forward publish carries a SKIP_X dual (a second
+	 * reader-visible edge) when its parent is compressed, making the commit
+	 * multi-edge.  Pre-reserve the bounded txn BEFORE ft_node_recompact
+	 * eagerly re-parents the rebuilt node's children: that re-parent is a
+	 * point of no return (a clean _try abort would orphan the children onto
+	 * an unpublished node), so the multi-edge commit must be infallible.
+	 * Reservation failure leaves the node in place -- the same best-effort
+	 * contract as a node / cell allocation failure.  A lone forward edge
+	 * (non-compressed parent) needs no txn: ft_remove_commit_rec commits it
+	 * as an infallible on-stack release store (ft_ord_cell_flip_one).
+	 */
+	if (parent && (ft_node_compressed(parent) ||
+			ft_node_skip_compressed(parent))) {
+		txn = ft_flip_txn_create_bounded(FT_RELOCATE_COMMIT_MAX_EDGES);
+		if (!txn)
+			return;		/* OOM: best-effort, leave in place */
+	}
+	ret = ft_node_recompact(FT_RECOMPACT_RELOCATE, ft, type_index,
 			&ft_types[type_index], node, meta, holder,
 			0, NULL, NULL, &old_ret, holder == &ft->root, 0,
-			false);
+			false, &rec);
+	if (ret != 0) {
+		/*
+		 * Node allocation failed inside the recompact before any
+		 * reader-visible store (nothing recorded into @rec, *holder
+		 * unchanged): best-effort, leave the node in place.
+		 */
+		if (txn)
+			urcu_flip_txn_destroy(txn);	/* reserved, unused */
+		return;
+	}
+	/*
+	 * Commit the recorded forward publish (and a compressed parent's SKIP_X
+	 * dual) atomically: through the pre-reserved @txn when multi-edge, or as
+	 * a lone on-stack store when @txn is NULL.  This is the moment the
+	 * relocated node becomes reader-reachable at *holder.
+	 */
+	ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
 	/*
 	 * The old node was just unpublished; concurrent readers may still
 	 * hold it, so free it after a grace period.  Its range's nr_live
@@ -118,8 +159,25 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	cn2_flag = ft_compressed_node_flag(cn2);
 	/* Redirect the child's back-reference (internal: parent; external: prev). */
 	ft_set_parent(ft, cn2->child, cn2_flag, &cn2->child);
-	if (gp_slot)
-		rcu_assign_pointer(*gp_slot, cn2_flag);
+	if (gp_slot) {
+		/*
+		 * Forward publish into the live grandparent slot.  A traditional
+		 * compressed node is reached via a PLAIN child slot of a plain
+		 * internal grandparent (the descent never chains two compressed
+		 * nodes), so this is a lone structural edge with no SKIP_X dual:
+		 * commit it as a single on-stack release store captured as a
+		 * {slot, old, new} flip descriptor (byte-identical to a bare
+		 * rcu_assign_pointer, but MCAS-expressible -- a bare store would
+		 * discard the compare-and-swap "expected" value).
+		 */
+		struct ft_ord_cell_edge edge = {
+			.slot = (struct ft_ord_cell **) gp_slot,
+			.old_target = (struct ft_ord_cell *) *gp_slot,
+			.new_target = (struct ft_ord_cell *) cn2_flag,
+		};
+
+		ft_ord_cell_flip_one(&edge);
+	}
 	/* Always-deferred free: see ft_compact_relocate_at. */
 	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(cn));
 	cds_ft_free_item_deferred(ft, cn_meta);

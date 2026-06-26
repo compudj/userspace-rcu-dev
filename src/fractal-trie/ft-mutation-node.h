@@ -741,6 +741,14 @@ unsigned int find_nearest_type_index(unsigned int type_index,
  * back-pointers itself at publish time.  Children are still copied into the
  * new node's slots, but the re-parent loop is skipped entirely.  See
  * ft_node_set_nth and the rcu-mutation build-invisible pattern.
+ *
+ * @rec: when non-NULL, the two reader-visible forward stores -- the forward
+ * publish into @old_node_flag_ptr and a compressed parent's SKIP_X dual -- are
+ * RECORDED into @rec (ft_pub_rec_add) instead of being bare rcu_assign_pointer
+ * stores, so the caller commits them atomically through one flip (the
+ * standalone-compaction relocation path: ft_compact_relocate_at).  NULL keeps
+ * the bare stores for the ADD/SAME/DEL mutators, whose @old_node_flag_ptr is a
+ * LOCAL out-param re-published by the caller (build-invisible).
  */
 static
 int ft_node_recompact(enum ft_recompact mode,
@@ -755,7 +763,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		struct cds_ft_inode **old_node_ret,
 		bool is_root,
 		unsigned int node_depth __attribute__((unused)),
-		bool cluster_leaf)
+		bool cluster_leaf,
+		struct ft_pub_rec *rec)
 {
 	unsigned int new_type_index;
 	struct cds_ft_inode *new_node;
@@ -1003,10 +1012,16 @@ skip_copy:
 				ft_get_parent_slot(cn_meta, ft);
 
 			if (skip_slot &&
-			    ft_node_skip_compressed(*skip_slot))
-				rcu_assign_pointer(*skip_slot,
-					ft_skip_compressed_flag(
-						new_node_flag, cn->len));
+			    ft_node_skip_compressed(*skip_slot)) {
+				struct cds_ft_inode_flag *skip_new =
+					ft_skip_compressed_flag(new_node_flag,
+						cn->len);
+
+				if (rec)
+					ft_pub_rec_add(rec, skip_slot, skip_new);
+				else
+					rcu_assign_pointer(*skip_slot, skip_new);
+			}
 		}
 #endif
 	}
@@ -1077,15 +1092,21 @@ skip_copy:
 	/*
 	 * Return the new recompacted node through old_node_flag_ptr.  For the
 	 * ADD/SAME/DEL mutators this is a local out-param, re-published with
-	 * rcu_assign_pointer by the caller; but ft_compact_relocate_at passes
-	 * the LIVE slot (&ft->root, a parent child slot, &cn->child) and never
-	 * re-publishes, so this store IS the reader-visible publication of the
-	 * relocated node: use a release store so the node-body and metadata
-	 * stores above are ordered before it (a plain store would let a
-	 * weakly-ordered architecture expose an unwired copy).  Free for the
-	 * local-out-param callers.
+	 * rcu_assign_pointer by the caller (@rec == NULL); but
+	 * ft_compact_relocate_at passes the LIVE slot (&ft->root, a parent child
+	 * slot, &cn->child) and never re-publishes, so this store IS the
+	 * reader-visible publication of the relocated node.  In that case (@rec
+	 * != NULL) the publish is RECORDED into @rec so it commits through a flip
+	 * descriptor together with the SKIP_X dual above (one atomic edge-set the
+	 * caller flips after the eager child re-parent), instead of a bare store.
+	 * For the local-out-param callers the bare release store orders the
+	 * node-body and metadata stores above it (a plain store would let a
+	 * weakly-ordered architecture expose an unwired copy).
 	 */
-	rcu_assign_pointer(*old_node_flag_ptr, new_node_flag);
+	if (rec)
+		ft_pub_rec_add(rec, old_node_flag_ptr, new_node_flag);
+	else
+		rcu_assign_pointer(*old_node_flag_ptr, new_node_flag);
 	if (old_node && old_node_ret)
 		*old_node_ret = old_node;
 
@@ -1177,13 +1198,15 @@ int ft_node_set_nth(struct cds_ft *ft,
 		/* Not enough space in node, need to recompact to next type. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					old_node_ret, false, node_depth, cluster_leaf);
+					old_node_ret, false, node_depth, cluster_leaf,
+					NULL);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					old_node_ret, false, node_depth, cluster_leaf);
+					old_node_ret, false, node_depth, cluster_leaf,
+					NULL);
 		break;
 	}
 	if (ret == 0)
@@ -1227,7 +1250,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
 				node_flag_ptr, old_node_ret, is_root, node_depth,
-				false);
+				false, NULL);
 	}
 	if (ret == 0)
 		FT_TP(tree_edge_set, (const void *) ft,
