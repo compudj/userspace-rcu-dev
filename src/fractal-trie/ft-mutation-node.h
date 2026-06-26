@@ -750,10 +750,16 @@ unsigned int find_nearest_type_index(unsigned int type_index,
  *    caller, so the forward stays a bare store into that local.
  *  - A compressed parent's SKIP_X dual (the live grandparent skip slot) is
  *    recorded into @rec whenever @rec is non-NULL: for RELOCATE, AND for an
- *    ADD/SAME/DEL relocation whose LIVE caller threads its own commit rec so the
+ *    ADD/SAME relocation whose LIVE caller threads its own commit rec so the
  *    dual flips ATOMICALLY with that caller's forward publish (else the dual
  *    would be a bare store ordered BEFORE the deferred forward).  @rec == NULL
- *    keeps the bare SKIP_X store for build-invisible recompacts.
+ *    keeps the bare SKIP_X store for build-invisible ADD recompacts.
+ *  - FT_RECOMPACT_DEL is the exception: it reaches here with @rec == NULL but
+ *    its node is LIVE, so a bare SKIP_X store would be the same premature
+ *    non-atomic window.  Its caller (ft_detach_node) republishes the forward
+ *    via _ft_publish_to_parent(parent_nf = the compressed parent), which RECORDS
+ *    this SKIP_X dual itself, so DEL defers the dual entirely (records nothing
+ *    here -- see the inline note at the skip slot).
  */
 static
 int ft_node_recompact(enum ft_recompact mode,
@@ -1018,14 +1024,36 @@ skip_copy:
 
 			if (skip_slot &&
 			    ft_node_skip_compressed(*skip_slot)) {
-				struct cds_ft_inode_flag *skip_new =
-					ft_skip_compressed_flag(new_node_flag,
-						cn->len);
+				/*
+				 * FT_RECOMPACT_DEL relocates the rebuilt
+				 * (smaller) node into a LOCAL out-param that
+				 * ft_detach_node republishes via
+				 * _ft_publish_to_parent(parent_nf = this very
+				 * compressed parent), which RECORDS this SKIP_X
+				 * dual into the op's commit rec so it flips
+				 * ATOMICALLY with the forward cn->child store.
+				 * Performing (or recording) it here too would be
+				 * a premature store ordered BEFORE that deferred
+				 * forward -- a non-atomic window where a candidate
+				 * reader follows the skip to the new node while an
+				 * exact reader following cn->child still sees the
+				 * old.  Defer it entirely to the caller's publish.
+				 * (DEL is the lone live-slot mutator reaching here
+				 * with rec == NULL; the other rec == NULL cases are
+				 * build-invisible ADD recompacts.)
+				 */
+				if (mode != FT_RECOMPACT_DEL) {
+					struct cds_ft_inode_flag *skip_new =
+						ft_skip_compressed_flag(
+							new_node_flag, cn->len);
 
-				if (rec)
-					ft_pub_rec_add(rec, skip_slot, skip_new);
-				else
-					rcu_assign_pointer(*skip_slot, skip_new);
+					if (rec)
+						ft_pub_rec_add(rec, skip_slot,
+							skip_new);
+					else
+						rcu_assign_pointer(*skip_slot,
+							skip_new);
+				}
 			}
 		}
 #endif
