@@ -64,7 +64,7 @@ struct lnode {
 	int key;
 };
 
-static struct cds_bidir_list_lf_node g_head = CDS_BIDIR_LIST_LF_HEAD_INIT(g_head);
+static struct cds_bidir_list_lf_head g_head;
 static int g_stop;
 
 static int key_of(struct cds_bidir_list_lf_node *n)
@@ -95,15 +95,15 @@ static void sorted_insert(int key)
 	if (!n)
 		abort();
 	n->key = key;
-	urcu_flip_lf_txn_init(&txn, NULL);
+	urcu_flip_lf_txn_init(&txn, &g_head.domain);
 	do {
-		struct cds_bidir_list_lf_node *prev = &g_head, *succ;
+		struct cds_bidir_list_lf_node *prev = &g_head.node, *succ;
 
 		urcu_flip_lf_txn_begin(&txn);
 		/* prev = last node with key <= @key; succ = first with key > @key */
 		for (;;) {
 			succ = cds_bidir_list_lf_next_rcu(prev);
-			if (succ == &g_head || key_of(succ) > key)
+			if (succ == &g_head.node || key_of(succ) > key)
 				break;
 			prev = succ;
 		}
@@ -127,7 +127,7 @@ static void delete_key(int key)
 	struct lnode *target = NULL;
 
 	rcu_read_lock();
-	for (p = cds_bidir_list_lf_next_rcu(&g_head); p != &g_head;
+	for (p = cds_bidir_list_lf_next_rcu(&g_head.node); p != &g_head.node;
 			p = cds_bidir_list_lf_next_rcu(p)) {
 		int k = key_of(p);
 
@@ -139,7 +139,7 @@ static void delete_key(int key)
 			break;			/* sorted: past @key, absent */
 	}
 	if (target) {
-		int r = cds_bidir_list_lf_del_rcu(&target->node);
+		int r = cds_bidir_list_lf_del_rcu(&target->node, &g_head);
 
 		rcu_read_unlock();
 		if (r == 1)			/* this call removed it -> reclaim */
@@ -195,7 +195,7 @@ static void *reader(void *arg)
 		rcu_read_lock();
 		prev_key = INT_MIN;
 		steps = 0;
-		for (p = cds_bidir_list_lf_next_rcu(&g_head); p != &g_head;
+		for (p = cds_bidir_list_lf_next_rcu(&g_head.node); p != &g_head.node;
 				p = cds_bidir_list_lf_next_rcu(p)) {
 			int k = key_of(p);
 
@@ -212,7 +212,7 @@ static void *reader(void *arg)
 		rcu_read_lock();
 		prev_key = INT_MAX;
 		steps = 0;
-		for (p = cds_bidir_list_lf_prev_rcu(&g_head); p != &g_head;
+		for (p = cds_bidir_list_lf_prev_rcu(&g_head.node); p != &g_head.node;
 				p = cds_bidir_list_lf_prev_rcu(p)) {
 			int k = key_of(p);
 
@@ -239,12 +239,12 @@ static int check_mirror_coherent(void)
 	struct cds_bidir_list_lf_node *p;
 	int nf = 0, nr = 0, i;
 
-	for (p = cds_bidir_list_lf_next_rcu(&g_head);
-			p != &g_head && nf < STEP_LIMIT;
+	for (p = cds_bidir_list_lf_next_rcu(&g_head.node);
+			p != &g_head.node && nf < STEP_LIMIT;
 			p = cds_bidir_list_lf_next_rcu(p))
 		fwd[nf++] = key_of(p);
-	for (p = cds_bidir_list_lf_prev_rcu(&g_head);
-			p != &g_head && nr < STEP_LIMIT;
+	for (p = cds_bidir_list_lf_prev_rcu(&g_head.node);
+			p != &g_head.node && nr < STEP_LIMIT;
 			p = cds_bidir_list_lf_prev_rcu(p))
 		rev[nr++] = key_of(p);
 	if (nf != nr)
@@ -266,6 +266,7 @@ int main(void)
 
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
+	cds_bidir_list_lf_init(&g_head);
 
 	for (i = 0; i < NR_READERS; i++) {
 		rs[i].walks = 0;
@@ -303,11 +304,11 @@ int main(void)
 
 	/* Drain the remaining nodes. */
 	rcu_read_lock();
-	for (p = cds_bidir_list_lf_next_rcu(&g_head); p != &g_head; ) {
+	for (p = cds_bidir_list_lf_next_rcu(&g_head.node); p != &g_head.node; ) {
 		struct lnode *n = caa_container_of(p, struct lnode, node);
 		struct cds_bidir_list_lf_node *nextp = cds_bidir_list_lf_next_rcu(p);
 
-		if (cds_bidir_list_lf_del_rcu(&n->node) == 1)
+		if (cds_bidir_list_lf_del_rcu(&n->node, &g_head) == 1)
 			call_rcu(&n->rh, lnode_free);
 		p = nextp;
 	}

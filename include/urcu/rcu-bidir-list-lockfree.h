@@ -94,7 +94,11 @@
  * and read next/prev only through the accessors below (they resolve the proxy
  * and strip the mark); never touch the raw fields.  Mutators loop internally
  * until they commit or definitively fail; they return 0 / 1 on success,
- * -ENOENT if the anchor was deleted, -ENOMEM on descriptor OOM.
+ * -ENOENT if the anchor was deleted, -ENOMEM on descriptor OOM.  Each transacts
+ * through the list head's escalation domain, so a mutator repeatedly bypassed
+ * on the optimistic path escalates into the domain's fair lane and commits
+ * within a bounded number of retries -- the list is starvation-resistant, not
+ * merely lock-free.
  */
 
 #include <errno.h>
@@ -117,16 +121,29 @@ struct cds_bidir_list_lf_node {
 	struct cds_bidir_list_lf_node *next, *prev;
 };
 
-#define CDS_BIDIR_LIST_LF_HEAD_INIT(name)	{ .next = &(name), .prev = &(name) }
-
-#define CDS_BIDIR_LIST_LF_HEAD(name) \
-	struct cds_bidir_list_lf_node name = CDS_BIDIR_LIST_LF_HEAD_INIT(name)
+/*
+ * A list is its circular sentinel node plus the per-list escalation domain that
+ * the lock-free transaction front-end funnels starved or oversized mutators
+ * through (see <urcu/flip-latch-txn-lockfree.h>).  The domain lives here, once
+ * per list, which is why the mutators below take the head: an element is
+ * reached only via its list, and a mutator needs that list's domain to stay
+ * starvation-resistant under adversarial contention.
+ *
+ * The domain wraps a fair mutex with no static initializer, so a head must be
+ * initialized at runtime with cds_bidir_list_lf_init() -- there is no static
+ * HEAD_INIT form.
+ */
+struct cds_bidir_list_lf_head {
+	struct cds_bidir_list_lf_node node;	/* circular sentinel */
+	struct urcu_flip_lf_txn_domain domain;	/* shared escalation domain */
+};
 
 static inline
-void cds_bidir_list_lf_init(struct cds_bidir_list_lf_node *head)
+void cds_bidir_list_lf_init(struct cds_bidir_list_lf_head *head)
 {
-	head->next = head;
-	head->prev = head;
+	head->node.next = &head->node;
+	head->node.prev = &head->node;
+	urcu_flip_lf_txn_domain_init(&head->domain);
 }
 
 /* Logical-deletion mark: bit 1 of a node's next pointer. */
@@ -165,7 +182,7 @@ struct cds_bidir_list_lf_node *cds_bidir_list_lf_unmark(void *v)
 static inline
 struct cds_bidir_list_lf_node *cds_bidir_list_lf_resolve(void *raw)
 {
-	unsigned long v = (unsigned long) raw;
+	uintptr_t v = (uintptr_t) raw;
 
 	if (caa_unlikely(v & (URCU_FLIP_LF_TAG | CDS_BIDIR_LIST_LF_MARK)))
 		return cds_bidir_list_lf_unmark(urcu_flip_lf_resolve(raw));
@@ -188,23 +205,25 @@ struct cds_bidir_list_lf_node *cds_bidir_list_lf_prev_rcu(
 }
 
 static inline
-int cds_bidir_list_lf_empty(struct cds_bidir_list_lf_node *head)
+int cds_bidir_list_lf_empty(struct cds_bidir_list_lf_head *head)
 {
-	return cds_bidir_list_lf_next_rcu(head) == head;
+	return cds_bidir_list_lf_next_rcu(&head->node) == &head->node;
 }
 
 /*
- * Insert @newp immediately after @pos.  Returns 0 on success, -ENOENT if @pos
- * has been deleted, -ENOMEM on descriptor allocation failure.
+ * Insert @newp immediately after @pos in list @head.  Returns 0 on success,
+ * -ENOENT if @pos has been deleted, -ENOMEM on descriptor allocation failure.
+ * @head supplies the list's escalation domain (see the contract above).
  */
 static inline
 int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *pos)
+		struct cds_bidir_list_lf_node *pos,
+		struct cds_bidir_list_lf_head *head)
 {
 	struct urcu_flip_lf_txn txn;
 	int ret;
 
-	urcu_flip_lf_txn_init(&txn, NULL);
+	urcu_flip_lf_txn_init(&txn, &head->domain);
 	do {
 		void *pn;
 		struct cds_bidir_list_lf_node *succ;
@@ -239,16 +258,18 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 }
 
 /*
- * Insert @newp immediately before @pos.  Returns 0 / -ENOENT / -ENOMEM as above.
+ * Insert @newp immediately before @pos in list @head.  Returns 0 / -ENOENT /
+ * -ENOMEM as for insert_after.
  */
 static inline
 int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *pos)
+		struct cds_bidir_list_lf_node *pos,
+		struct cds_bidir_list_lf_head *head)
 {
 	struct urcu_flip_lf_txn txn;
 	int ret;
 
-	urcu_flip_lf_txn_init(&txn, NULL);
+	urcu_flip_lf_txn_init(&txn, &head->domain);
 	do {
 		void *pn;
 		struct cds_bidir_list_lf_node *prev;
@@ -280,34 +301,42 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 	return ret < 0 ? -ENOMEM : 0;		/* OK committed, -ENOMEM on OOM */
 }
 
-/* Add @newp at the head (just after @head).  Always succeeds (head is immortal). */
+/*
+ * Add @newp at the head of list @head (just after the sentinel).  The sentinel
+ * is immortal, so this never observes a deleted anchor: it returns 0, or
+ * -ENOMEM on descriptor allocation failure (never -ENOENT).
+ */
 static inline
 int cds_bidir_list_lf_add_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *head)
+		struct cds_bidir_list_lf_head *head)
 {
-	return cds_bidir_list_lf_insert_after_rcu(newp, head);
-}
-
-/* Add @newp at the tail (just before @head).  Always succeeds. */
-static inline
-int cds_bidir_list_lf_add_tail_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *head)
-{
-	return cds_bidir_list_lf_insert_before_rcu(newp, head);
+	return cds_bidir_list_lf_insert_after_rcu(newp, &head->node, head);
 }
 
 /*
- * Remove @elem.  Returns 1 if THIS call removed it (the caller reclaims @elem
- * after a grace period), 0 if it was already deleted (the caller must NOT
- * reclaim), or -ENOMEM on descriptor allocation failure.
+ * Add @newp at the tail of list @head (just before the sentinel).  Returns 0,
+ * or -ENOMEM on descriptor allocation failure (never -ENOENT).
  */
 static inline
-int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem)
+int cds_bidir_list_lf_add_tail_rcu(struct cds_bidir_list_lf_node *newp,
+		struct cds_bidir_list_lf_head *head)
+{
+	return cds_bidir_list_lf_insert_before_rcu(newp, &head->node, head);
+}
+
+/*
+ * Remove @elem from list @head.  Returns 1 if THIS call removed it (the caller
+ * reclaims @elem after a grace period), 0 if it was already deleted (the caller
+ * must NOT reclaim), or -ENOMEM on descriptor allocation failure.
+ */
+static inline
+int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
+		struct cds_bidir_list_lf_head *head)
 {
 	struct urcu_flip_lf_txn txn;
 	int ret;
 
-	urcu_flip_lf_txn_init(&txn, NULL);
+	urcu_flip_lf_txn_init(&txn, &head->domain);
 	do {
 		void *en;
 		struct cds_bidir_list_lf_node *next, *prev;
@@ -347,27 +376,29 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem)
 
 /* Iterate forward / backward (within an RCU read-side section). */
 #define cds_bidir_list_lf_for_each_rcu(pos, head) \
-	for (pos = cds_bidir_list_lf_next_rcu(head); \
-		(pos) != (head); \
+	for (pos = cds_bidir_list_lf_next_rcu(&(head)->node); \
+		(pos) != &(head)->node; \
 		pos = cds_bidir_list_lf_next_rcu(pos))
 
 #define cds_bidir_list_lf_for_each_reverse_rcu(pos, head) \
-	for (pos = cds_bidir_list_lf_prev_rcu(head); \
-		(pos) != (head); \
+	for (pos = cds_bidir_list_lf_prev_rcu(&(head)->node); \
+		(pos) != &(head)->node; \
 		pos = cds_bidir_list_lf_prev_rcu(pos))
 
 #define cds_bidir_list_lf_for_each_entry_rcu(pos, head, member) \
-	for (pos = cds_bidir_list_lf_entry(cds_bidir_list_lf_next_rcu(head), \
+	for (pos = cds_bidir_list_lf_entry( \
+			cds_bidir_list_lf_next_rcu(&(head)->node), \
 			__typeof__(*(pos)), member); \
-		&(pos)->member != (head); \
+		&(pos)->member != &(head)->node; \
 		pos = cds_bidir_list_lf_entry( \
 			cds_bidir_list_lf_next_rcu(&(pos)->member), \
 			__typeof__(*(pos)), member))
 
 #define cds_bidir_list_lf_for_each_entry_reverse_rcu(pos, head, member) \
-	for (pos = cds_bidir_list_lf_entry(cds_bidir_list_lf_prev_rcu(head), \
+	for (pos = cds_bidir_list_lf_entry( \
+			cds_bidir_list_lf_prev_rcu(&(head)->node), \
 			__typeof__(*(pos)), member); \
-		&(pos)->member != (head); \
+		&(pos)->member != &(head)->node; \
 		pos = cds_bidir_list_lf_entry( \
 			cds_bidir_list_lf_prev_rcu(&(pos)->member), \
 			__typeof__(*(pos)), member))
