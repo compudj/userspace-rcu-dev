@@ -357,6 +357,41 @@ void ft_insert_park_external_nodes(struct cds_ft *ft,
  * frees the old compressed node.  Returns 0 on success, -ENOMEM
  * on allocation failure (compressed node left in place).
  */
+
+/*
+ * Free a freshly-built, never-published split cluster -- the nodes tracked in
+ * @created[0 .. @nr_created).  Shared by both compressed-split helpers'
+ * -ENOMEM error paths AND the abort-fully path in
+ * ft_insert_compressed_key_shorter (when the one-commit arm fails after a
+ * successful build).  The live old child (cn->child) is never tracked in
+ * @created, and free_*_unpublished free only the node (not its children), so
+ * the live subtree is never touched.
+ *
+ * Freed PARENT-FIRST (reverse of the bottom-up creation order): a skip-encoded
+ * top is resolved to its compressed node via its child's back-pointer
+ * (ft_skip_to_compressed reads child->parent), so the child must still be live
+ * when the parent is freed.  (A partial-build error path never has both, but
+ * the post-build abort frees the whole cluster, so the order matters.)
+ */
+static
+void ft_free_unpublished_split_cluster(struct cds_ft *ft,
+		struct cds_ft_inode_flag *const *created, int nr_created)
+{
+	int i;
+
+	for (i = nr_created - 1; i >= 0; i--) {
+		if (ft_node_compressed(created[i]))
+			free_compressed_node_unpublished(ft,
+				ft_compressed_node_ptr(created[i]));
+		else if (ft_node_skip_compressed(created[i]))
+			free_compressed_node_unpublished(ft,
+				ft_skip_to_compressed(ft, created[i]));
+		else
+			free_cds_ft_node_unpublished(ft,
+				ft_node_ptr(created[i]));
+	}
+}
+
 static
 int ft_split_compressed_insert(struct cds_ft *ft,
 		struct cds_ft_inode_flag **parent_slot,
@@ -661,20 +696,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	return 0;
 
 error:
-	{
-		int i;
-
-		for (i = 0; i < nr_created; i++) {
-			if (ft_node_compressed(created[i]))
-				free_compressed_node_unpublished(ft,
-					ft_compressed_node_ptr(created[i]));
-			else if (ft_node_skip_compressed(created[i]))
-				free_compressed_node_unpublished(ft,
-					ft_skip_to_compressed(ft, created[i]));
-			else
-				free_cds_ft_node_unpublished(ft, ft_node_ptr(created[i]));
-		}
-	}
+	ft_free_unpublished_split_cluster(ft, created, nr_created);
 	return -ENOMEM;
 }
 
@@ -717,7 +739,13 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		 */
 		struct cds_ft_inode_flag **live_child_ret,
 		struct cds_ft_inode_flag **live_parent_ret,
-		struct cds_ft_inode_flag ***live_slot_ret)
+		struct cds_ft_inode_flag ***live_slot_ret,
+		/*
+		 * Out: the freshly-built (still-unpublished) cluster nodes, so the
+		 * caller can tear it down on a post-return abort.  Optional (NULL).
+		 */
+		struct cds_ft_inode_flag **created_ret,
+		int *nr_created_ret)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
 	struct cds_ft_metadata *cn_meta =
@@ -945,6 +973,17 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	*live_child_ret = deferred_child;
 	*live_parent_ret = deferred_parent;
 	*live_slot_ret = deferred_slot;
+	/*
+	 * Hand the built (still-unpublished) cluster back so the caller can tear
+	 * it down if it must abort after we return (a one-commit arm -ENOMEM):
+	 * created[] holds exactly the fresh cluster nodes, never the live
+	 * cn->child.
+	 */
+	if (created_ret) {
+		memcpy(created_ret, created,
+			(size_t) nr_created * sizeof(created[0]));
+		*nr_created_ret = nr_created;
+	}
 
 	FT_TP(compressed_split, "key_shorter", (const void *) cn, cn->len,
 		(const void *) top_flag, remaining);
@@ -953,21 +992,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	return 0;
 
 error:
-	{
-		int i;
-
-		for (i = 0; i < nr_created; i++) {
-			if (ft_node_compressed(created[i]))
-				free_compressed_node_unpublished(ft,
-					ft_compressed_node_ptr(created[i]));
-			else if (ft_node_skip_compressed(created[i]))
-				free_compressed_node_unpublished(ft,
-					ft_skip_to_compressed(ft, created[i]));
-			else
-				free_cds_ft_node_unpublished(ft,
-					ft_node_ptr(created[i]));
-		}
-	}
+	ft_free_unpublished_split_cluster(ft, created, nr_created);
 	return -ENOMEM;
 }
 
@@ -1502,12 +1527,15 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	struct cds_ft_metadata *jct_meta;
 	struct cds_ft_inode_flag *live_child, *live_parent;
 	struct cds_ft_inode_flag **live_slot;
+	struct cds_ft_inode_flag *split_created[FT_MAX_DEPTH];
+	int split_nr_created = 0;
 	bool fresh_head;
 	int sret;
 
 	sret = ft_split_compressed_key_shorter(ft,
 		d->nf, d->nfp, remaining, &top_flag, &jct_flag, d->depth,
-		&live_child, &live_parent, &live_slot);
+		&live_child, &live_parent, &live_slot,
+		split_created, &split_nr_created);
 	if (sret)
 		return sret;
 	jct_meta = cds_ft_item_to_metadata(ft_node_ptr(jct_flag));
@@ -1529,21 +1557,26 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		sret = ft_insert_commit_arm(ft, ic);
 		if (sret) {
 			/*
-			 * Arm failed: roll the head attach back (the cluster
-			 * is still invisible) and publish the split WITHOUT
-			 * the new key -- a key-neutral restructure of the same
-			 * content -- then surface the failure (the caller's
-			 * insert_done resets node->prev for a retry).
+			 * Arm failed (-ENOMEM): abort the whole insert.  The split
+			 * cluster is still build-invisible (nothing published,
+			 * cn->child untouched, @d->nf still reader-reachable at
+			 * @d->nfp), so roll the head attach back and TEAR THE CLUSTER
+			 * DOWN -- the structure is left byte-for-byte unchanged.
+			 *
+			 * Do NOT publish a key-neutral restructure here: the forward
+			 * publish and the live old-child re-parent must flip
+			 * ATOMICALLY (the re-parent's source is the live cn->child, so
+			 * wiring it before the forward exposes the unpublished cluster
+			 * to an up-walk), which needs the one-commit txn we just failed
+			 * to allocate.  There is no MCAS-expressible publish on this
+			 * path -- a bare forward store would sit outside the descriptor
+			 * set -- only a clean abort.  The caller surfaces MEMORY_ERROR;
+			 * insert_done resets node->prev for a retry.
 			 */
 			jct_meta->external_nodes = NULL;
 			node->next = NULL;
-			/* Key-neutral restructure still re-parents cn->child. */
-			if (live_child)
-				ft_set_parent(ft, live_child, live_parent,
-					live_slot);
-			ft_publish_to_parent(ft, d->pnf, d->nfp, top_flag);
-			free_compressed_node(ft,
-				ft_compressed_node_ptr(d->nf));
+			ft_free_unpublished_split_cluster(ft, split_created,
+				split_nr_created);
 			return sret;
 		}
 	}

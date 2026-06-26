@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 294
+#define NR_TESTS 295
 #else
 #define NR_TESTS 253
 #endif
@@ -19502,6 +19502,100 @@ static int test_split_oom_backpointer(void)
 }
 
 /*
+ * Drive the key-shorter compressed-split ONE-COMMIT ARM with the dedicated
+ * flip-txn countdown: when the arm fails -ENOMEM AFTER the split cluster is
+ * built, ft_insert_compressed_key_shorter aborts FULLY -- it tears the
+ * freshly-built (still-unpublished) cluster down and leaves the structure
+ * byte-for-byte unchanged.  It must NOT publish a key-neutral restructure (the
+ * forward publish + the live old-child re-parent must flip atomically, which
+ * needs the txn that just failed; a bare forward store would be outside the
+ * MCAS descriptor set).  The flip-txn is a raw malloc, so the flip countdown
+ * (not the arena countdown of test_split_oom_backpointer) drives this path.
+ *
+ * Pristine is checked by KEYS, not just cds_ft_verify: a published key-neutral
+ * restructure of the same content would still verify, so the test asserts the
+ * two pre-existing keys survive and the key-shorter key is absent.
+ */
+static int run_split_oom_insert_arm(const char *label,
+		const uint8_t *dkey, size_t dlen)
+{
+	int n, rc = 0, aborted = 0;
+
+	for (n = 0; n < 3; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_varlen_ft(&group);
+		struct ft_test_node *a = node_alloc(1);
+		struct ft_test_node *b = node_alloc(2);
+		struct ft_test_node *c = node_alloc(3);
+		struct cds_ft_node *out = NULL;
+		enum cds_ft_status s;
+		int verified, pristine_ok = 1;
+
+		/* Build compressed("aaaaaaa") -> internal child {a, b}. */
+		if (cds_ft_insert(ft, (const uint8_t *)"aaaaaaaa", 8, &a->node) < 0 ||
+		    cds_ft_insert(ft, (const uint8_t *)"aaaaaaab", 8, &b->node) < 0) {
+			fprintf(stderr, "split_oom_arm[%s]: build failed\n", label);
+			rc = -1;
+		}
+
+		/* Fail the (n+1)-th flip-txn alloc (the one-commit arm). */
+		cds_ft_fault_flip_countdown = n;
+		s = cds_ft_insert(ft, dkey, dlen, &c->node);
+		cds_ft_fault_flip_countdown = -1;
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		if (verified && s != CDS_FT_STATUS_OK) {
+			aborted = 1;
+			if (!ft_test_has_key(ft, "aaaaaaaa") ||
+			    !ft_test_has_key(ft, "aaaaaaab") ||
+			    cds_ft_eager_lookup_key(ft, dkey, dlen, 0, &out)
+				== CDS_FT_STATUS_OK)
+				pristine_ok = 0;
+		}
+		rcu_read_unlock();
+		if (!verified || !pristine_ok) {
+			fprintf(stderr,
+				"split_oom_arm[%s]: %s after flip fault n=%d (insert=%s)\n",
+				label, !verified ? "verify FAILED" : "NOT pristine",
+				n, cds_ft_status_to_string(s));
+			rc = -1;
+			continue;	/* corrupt: abandon (leak) this iteration */
+		}
+
+		if (s != CDS_FT_STATUS_OK)
+			node_free(c);	/* OOM: never inserted, never observable */
+		if (drain_and_destroy(ft, group) < 0)
+			rc = -1;
+	}
+	if (!aborted) {
+		fprintf(stderr, "split_oom_arm[%s]: arm-fail abort path never hit\n",
+			label);
+		rc = -1;
+	}
+	return rc;
+}
+
+static int test_split_oom_key_shorter_arm(void)
+{
+	int rc = 0;
+
+	/* suffix_len == 3: a fresh compressed suffix wraps the old child. */
+	if (run_split_oom_insert_arm("key_shorter-suffix>=1",
+			(const uint8_t *)"aaa", 3) < 0)
+		rc = -1;
+	/* suffix_len == 1: 1-byte compressed (SC) / 1-child internal (non-SC). */
+	if (run_split_oom_insert_arm("key_shorter-suffix==1",
+			(const uint8_t *)"aaaaa", 5) < 0)
+		rc = -1;
+	/* suffix_len == 0: the junction itself is the cluster-leaf. */
+	if (run_split_oom_insert_arm("key_shorter-suffix==0",
+			(const uint8_t *)"aaaaaa", 6) < 0)
+		rc = -1;
+	return rc;
+}
+
+/*
  * OOM coverage for cds_ft_merge_at's build-invisible spine-copy.  All of src
  * is merged at its root into a non-empty dst whose top-level byte ('b') is
  * DISJOINT from src's ('a'), so ft_merge_build copies only the merge-point
@@ -23385,6 +23479,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_dense_full_node);
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_split_oom_backpointer);
+	RUN_TEST(test_split_oom_key_shorter_arm);
 	RUN_TEST(test_merge_oom);
 	RUN_TEST(test_merge_oom_empty_dst);
 	RUN_TEST(test_merge_oom_diverged_dst);
