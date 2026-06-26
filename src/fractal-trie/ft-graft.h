@@ -1488,6 +1488,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_inode *fresh = NULL;
 		struct cds_ft_metadata *fresh_meta = NULL;
 		struct urcu_flip_txn *swap_retire_txn = NULL;
+		struct urcu_flip_txn *extract_txn = NULL;
 		struct ft_glue glue_insert, glue_extract;
 		struct cds_ft_inode_flag *canon = NULL;
 		struct cds_ft_inode_flag *top_B = NULL;	/* extracted swap root, NULL = external/none */
@@ -1764,14 +1765,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			if (!fresh)
 				goto prep_oom;
 			/*
-			 * Pre-reserve the swap-root retire's txn -- the last fallible
-			 * step before the failure-free commit.  The retire below runs
-			 * past the COMMIT marker and cannot abort, so it commits through
-			 * this pre-reserved txn (ft_ord_cell_flip_into).  Reserved only
-			 * when the list is on (list off retires via the lone-edge
-			 * ft_root_edge_flip).  OOM here is still a clean pre-commit abort
-			 * (goto prep_oom); reserved AFTER @fresh so no failure-free path
-			 * lies between it and the retire -- it is always consumed there.
+			 * Pre-reserve the swap-root retire's txn -- a fallible step
+			 * before the failure-free commit.  The retire below runs past
+			 * the COMMIT marker and cannot abort, so it commits through this
+			 * pre-reserved txn (ft_ord_cell_flip_into).  Reserved only when
+			 * the list is on (list off retires via the lone-edge
+			 * ft_root_edge_flip).  OOM here is a clean pre-commit abort; a
+			 * later prep_oom (e.g. the extract-txn reserve below failing)
+			 * frees it.
 			 */
 			if (gs_ord) {
 				swap_retire_txn = ft_flip_txn_create_bounded(
@@ -1779,6 +1780,21 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				if (!swap_retire_txn)
 					goto prep_oom;
 			}
+		}
+
+		/*
+		 * Pre-reserve the extract-side run_D install txn (the post-drain
+		 * fused root-install + run_D head/tail flip far below): it commits
+		 * after both syncs, in the failure-free section, so it cannot abort.
+		 * Reserved only when the list is on -- list off makes that flip at
+		 * most the lone top_B root-install edge (an infallible on-stack
+		 * store).  This is the last fallible step before the COMMIT marker.
+		 */
+		if (gs_ord) {
+			extract_txn = ft_flip_txn_create_bounded(
+				FT_ROOT_LIST_SWAP_MAX_EDGES);
+			if (!extract_txn)
+				goto prep_oom;
 		}
 
 		/* ===== COMMIT (failure-free) ===== */
@@ -2042,8 +2058,23 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				n = ft_ord_cell_endpoint_edge(&swap_ft->ord_cell_tail,
 					swap_ft->ord_cell_tail, gs_d_last, edges, n);
 			}
-			if (n)
-				ft_ord_cell_flip(swap_ft, edges, n);
+			/*
+			 * Post-drain commit (un-abortable): list on rides the
+			 * pre-reserved extract_txn (multi-edge: root install + run_D
+			 * head/tail); freed unused if no edge changed.  List off is at
+			 * most the lone top_B root-install edge -- an infallible
+			 * on-stack store, no txn.
+			 */
+			if (gs_ord) {
+				if (n)
+					ft_ord_cell_flip_into(swap_ft, extract_txn,
+						edges, n);
+				else
+					urcu_flip_txn_destroy(extract_txn);
+				extract_txn = NULL;	/* consumed / freed */
+			} else if (n) {
+				ft_ord_cell_flip_one(&edges[0]);
+			}
 			FT_TP(root_publish, (const void *) swap_ft,
 				(const void *) swap_ft->root);
 			if (top_B) {
@@ -2092,6 +2123,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		ft_glue_abort(swap_ft, &glue_extract);
 		if (glue_insert.txn)
 			urcu_flip_txn_destroy(glue_insert.txn);
+		if (swap_retire_txn)
+			urcu_flip_txn_destroy(swap_retire_txn);
+		if (extract_txn)
+			urcu_flip_txn_destroy(extract_txn);
 		if (fresh)
 			free_cds_ft_node(swap_ft, fresh);
 		if (gs_reserved)
