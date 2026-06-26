@@ -1238,19 +1238,14 @@ int ft_attach_node(struct cds_ft *ft,
 		 * one-commit (ic->live_child), which ft_insert_one_commit replays
 		 * via ft_park_live_parent_edge (resolving the external head's
 		 * cell->parent / prev).  The cluster then becomes reachable via
-		 * BOTH its forward slot and this back-pointer in one flip.  The
-		 * direct/bulk fallback (no txn) wires it immediately, as before.
+		 * BOTH its forward slot and this back-pointer in one flip.
 		 */
 		if (external_nodes) {
-			if (ic && ic->txn) {
-				ic->live_child =
-					(struct cds_ft_inode_flag *) external_nodes;
-				ic->live_parent = iter_node_flag;
-				ic->live_slot = NULL;
-			} else {
-				ft_publish_external_nodes_prev(ft, iter_node_flag,
-					external_nodes);
-			}
+			/* ic->txn is always armed here (see the assert above). */
+			ic->live_child =
+				(struct cds_ft_inode_flag *) external_nodes;
+			ic->live_parent = iter_node_flag;
+			ic->live_slot = NULL;
 		}
 		/* Attach branch (unlink the old node from the trie).
 		 * ft_publish_to_parent handles skip pointer update
