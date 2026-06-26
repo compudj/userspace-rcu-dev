@@ -2421,12 +2421,19 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					ft_ord_cell_free(ft, old_cell);
 				} else {
 					/*
-					 * List off: no cell.  Commit the 1-2 structural
-					 * edges as a flip -- a lone edge reduces to a
-					 * single release store, infallible and
-					 * MCAS-expressible.
+					 * List off: no cell.  The new head is fresh, so
+					 * the flip is the op's sole side-effect with no
+					 * pre-flip live store -- abortable: self-allocate
+					 * (ft_ord_cell_flip_try); on a multi-edge OOM
+					 * nothing is applied, the old head is NOT freed and
+					 * the replace aborts retriably.  A lone edge takes
+					 * the infallible on-stack store.
 					 */
-					ft_ord_cell_flip(ft, sedges, n_sedge);
+					if (ft_ord_cell_flip_try(ft, sedges,
+							n_sedge) != 0) {
+						ret = -ENOMEM;
+						goto insert_replace_done;
+					}
 				}
 			}
 			ret = 0;
@@ -2743,16 +2750,29 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		} else {
 			/*
 			 * Head, list off: no cell; flip the structural + SKIP_X
-			 * dual.  The successor's prev back-edge is a plain store
-			 * ordered before the (still bare-fallback) flip.
+			 * dual.  The successor's prev back-edge is a LIVE settled
+			 * store (uniform pre-reserve: no flip proxy on any prev
+			 * slot, matching the list-on head), so make the flip
+			 * infallible by PRE-RESERVING its bounded txn BEFORE that
+			 * store; on OOM abort with the successor untouched and the
+			 * replace retriable (@new_node restored to its fresh state).
 			 */
+			struct urcu_flip_txn *txn =
+				ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES);
+
+			if (!txn) {
+				new_node->next = NULL;
+				s = CDS_FT_STATUS_MEMORY_ERROR;
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
 			if (new_node->next)
 				new_node->next->prev = new_node;
 			new_node->prev = old_node->prev;
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node, &rec);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
-			ft_ord_cell_flip(ft, sedges, n_s);
+			ft_ord_cell_flip_into(ft, txn, sedges, n_s);
 		}
 	}
 
