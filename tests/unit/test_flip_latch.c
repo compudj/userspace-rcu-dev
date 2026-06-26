@@ -66,10 +66,11 @@ int main(void)
 	 */
 	{
 		void *slot = (void *) 0x100;
-		struct urcu_flip_txn *t = urcu_flip_txn_create(test_tag);
+		struct urcu_flip_txn _t, *t = &_t;
 		enum urcu_flip_txn_status st;
 
-		ok(t && urcu_flip_txn_reserve(t, 4), "create + reserve");
+		urcu_flip_txn_init(t, test_tag);
+		ok(urcu_flip_txn_reserve(t, 4), "init + reserve");
 		urcu_flip_txn_record(t, &slot, (void *) 0x100, (void *) 0x200);
 		st = urcu_flip_txn_commit(t);		/* single edge: frees now */
 		ok(st == URCU_FLIP_TXN_STATUS_OK, "single-edge commit returns OK");
@@ -84,9 +85,10 @@ int main(void)
 	 */
 	{
 		void *s1 = (void *) 0x10, *s2 = (void *) 0x20, *s3 = (void *) 0x30;
-		struct urcu_flip_txn *t = urcu_flip_txn_create(test_tag);
+		struct urcu_flip_txn _t, *t = &_t;
 		enum urcu_flip_txn_status st;
 
+		urcu_flip_txn_init(t, test_tag);
 		urcu_flip_txn_reserve(t, 4);
 		urcu_flip_txn_record(t, &s1, (void *) 0x10, (void *) 0x11);
 		urcu_flip_txn_record(t, &s2, (void *) 0x20, (void *) 0x21);
@@ -104,9 +106,10 @@ int main(void)
 	 */
 	{
 		void *slot = (void *) 0x100;
-		struct urcu_flip_txn *t = urcu_flip_txn_create(test_tag);
+		struct urcu_flip_txn _t, *t = &_t;
 		enum urcu_flip_txn_status st;
 
+		urcu_flip_txn_init(t, test_tag);
 		urcu_flip_txn_reserve(t, 4);
 		urcu_flip_txn_record(t, &slot, (void *) 0x100, (void *) 0x200);
 		urcu_flip_txn_install(t);
@@ -126,11 +129,12 @@ int main(void)
 	{
 		enum { NR_EDGES = 3 * URCU_FLIP_TXN_CAP + 1 };
 		void *slots[NR_EDGES];
-		struct urcu_flip_txn *t = urcu_flip_txn_create(test_tag);
+		struct urcu_flip_txn _t, *t = &_t;
 		enum urcu_flip_txn_status st;
 		bool all_recorded = true, all_new = true;
 		unsigned int i;
 
+		urcu_flip_txn_init(t, test_tag);
 		for (i = 0; i < NR_EDGES; i++) {
 			slots[i] = (void *) (((unsigned long) (i + 1)) << 8);
 			if (!urcu_flip_txn_record(t, &slots[i], slots[i],

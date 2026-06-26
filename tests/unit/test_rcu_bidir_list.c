@@ -301,7 +301,7 @@ static void test_proxy_phases(void)
 	struct bl_node *a = bl_node_new(1);
 	struct bl_node *b = bl_node_new(2);
 	struct cds_bidir_list_head *A = &a->node, *B = &b->node;
-	struct urcu_flip_txn *txn;
+	struct urcu_flip_txn _txn, *txn = &_txn;
 
 	cds_bidir_list_add_tail_rcu(A, &head);
 	cds_bidir_list_add_tail_rcu(B, &head);
@@ -311,9 +311,7 @@ static void test_proxy_phases(void)
 	 * explicit install and the commit to observe the reader's view of
 	 * each phase -- the same install -> commit -> settle the mutators run.
 	 */
-	txn = urcu_flip_txn_create(cds_bidir_list_proxy_tag);
-	if (!txn)
-		abort();
+	urcu_flip_txn_init(txn, cds_bidir_list_proxy_tag);
 	if (!urcu_flip_txn_reserve(txn, 2))
 		abort();
 	urcu_flip_txn_record(txn, (void **) &head.next, A, B);	/* head->next */

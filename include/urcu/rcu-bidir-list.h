@@ -172,21 +172,21 @@ int cds_bidir_list_empty(struct cds_bidir_list_head *head)
  * {*slot1: old1 -> new1} switch together, as observed by RCU readers.
  *
  * A thin, fixed-arity wrapper over the generic flip transaction
- * (<urcu/flip-latch.h>): create, reserve the two edges, record both, then
- * commit -- which auto-installs the proxies (selector 0 => readers still
- * resolve to old, so install is reader-transparent), flips the shared
- * selector 0 -> 1 (the one reader-visible instant, switching both edges to
- * new together), and settles each slot to its direct new target.  commit()
- * owns reclaim and defers the transaction through call_rcu() after a grace
- * period.
+ * (<urcu/flip-latch.h>): init an on-stack handle, reserve the two edges, record
+ * both, then commit -- which auto-installs the proxies (selector 0 => readers
+ * still resolve to old, so install is reader-transparent), flips the shared
+ * selector 0 -> 1 (the one reader-visible instant, switching both edges to new
+ * together), and settles each slot to its direct new target.  commit() owns
+ * reclaim and defers the group block through call_rcu() after a grace period.
  *
  * A list op always transacts exactly two edges, so the txn's growable chunk
  * list, single-edge fast path and abort path are unused here; the only cost
- * over a bespoke fixed proxy block is the txn's second small allocation.
+ * over a bespoke fixed proxy block is the record array and the group block,
+ * freed together by one call_rcu.
  *
- * Returns 0 on success, -1 if the transaction could not be allocated.  An OOM
- * in reserve()/record() is sticky and surfaces as commit()'s MEMORY_ERROR, so
- * only create() and the final commit status need checking.
+ * Returns 0 on success, -1 on allocation failure.  An OOM in reserve()/record()
+ * is sticky and surfaces as commit()'s MEMORY_ERROR, so only the final commit
+ * status needs checking -- the on-stack handle has no create() to fail.
  */
 static inline
 int cds_bidir_list_flip2(
@@ -197,20 +197,18 @@ int cds_bidir_list_flip2(
 		struct cds_bidir_list_head *old1,
 		struct cds_bidir_list_head *new1)
 {
-	struct urcu_flip_txn *txn;
+	struct urcu_flip_txn txn;
 
-	txn = urcu_flip_txn_create(cds_bidir_list_proxy_tag);
-	if (caa_unlikely(!txn))
-		return -1;
-	(void) urcu_flip_txn_reserve(txn, 2);	/* sticky OOM -> commit reports it */
-	(void) urcu_flip_txn_record(txn, (void **) slot0, old0, new0);
-	(void) urcu_flip_txn_record(txn, (void **) slot1, old1, new1);
+	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	(void) urcu_flip_txn_record(&txn, (void **) slot0, old0, new0);
+	(void) urcu_flip_txn_record(&txn, (void **) slot1, old1, new1);
 	/*
 	 * Two edges => commit auto-installs, flips, settles, and owns reclaim
-	 * (call_rcu).  It always consumes the txn; MEMORY_ERROR (< 0) means an
-	 * alloc failed and nothing was published.
+	 * (call_rcu).  MEMORY_ERROR (< 0) means an alloc failed and nothing was
+	 * published; otherwise the flip committed.
 	 */
-	return urcu_flip_txn_commit(txn) < 0 ? -1 : 0;
+	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
 }
 
 /* Insert @newp just after @pos (between @pos and its successor). */
