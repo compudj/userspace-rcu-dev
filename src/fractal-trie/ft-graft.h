@@ -1487,6 +1487,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *old_child, *old_swap_root;
 		struct cds_ft_inode *fresh = NULL;
 		struct cds_ft_metadata *fresh_meta = NULL;
+		struct urcu_flip_txn *swap_retire_txn = NULL;
 		struct ft_glue glue_insert, glue_extract;
 		struct cds_ft_inode_flag *canon = NULL;
 		struct cds_ft_inode_flag *top_B = NULL;	/* extracted swap root, NULL = external/none */
@@ -1762,6 +1763,22 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			fresh = alloc_cds_ft_node(swap_ft, &ft_types[0], &fresh_meta);
 			if (!fresh)
 				goto prep_oom;
+			/*
+			 * Pre-reserve the swap-root retire's txn -- the last fallible
+			 * step before the failure-free commit.  The retire below runs
+			 * past the COMMIT marker and cannot abort, so it commits through
+			 * this pre-reserved txn (ft_ord_cell_flip_into).  Reserved only
+			 * when the list is on (list off retires via the lone-edge
+			 * ft_root_edge_flip).  OOM here is still a clean pre-commit abort
+			 * (goto prep_oom); reserved AFTER @fresh so no failure-free path
+			 * lies between it and the retire -- it is always consumed there.
+			 */
+			if (gs_ord) {
+				swap_retire_txn = ft_flip_txn_create_bounded(
+					FT_ROOT_LIST_SWAP_MAX_EDGES);
+				if (!swap_retire_txn)
+					goto prep_oom;
+			}
 		}
 
 		/* ===== COMMIT (failure-free) ===== */
@@ -1814,7 +1831,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * (List off: just the lone root edge.)
 			 */
 			if (gs_ord)
-				ft_root_list_swap_publish(swap_ft, NULL, &swap_ft->root,
+				ft_root_list_swap_publish(swap_ft, swap_retire_txn,
+					&swap_ft->root,
 					swap_ft->root, empty,
 					swap_ft->ord_cell_head, NULL,
 					swap_ft->ord_cell_tail, NULL);
