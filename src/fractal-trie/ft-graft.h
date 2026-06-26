@@ -901,6 +901,16 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct cds_ft_alloc_reserve graft_reserve;
 		bool self_secured = false;
 		/*
+		 * The src-root retire below (ft_root_list_swap_publish, list on)
+		 * runs in the failure-free section AFTER every fallible step has
+		 * returned -- it cannot abort -- so PRE-RESERVE its bounded txn
+		 * here, co-located with @glue.txn in the fallible prefix.  Reserved
+		 * only when the ordered list is on (list off retires via the
+		 * lone-edge ft_root_edge_flip).  Freed at every fallible exit below;
+		 * consumed by the retire.
+		 */
+		struct urcu_flip_txn *src_retire_txn = NULL;
+		/*
 		 * NIL-key-only source: the whole source is a single prefix key,
 		 * stored as the root's external_nodes (a childless internal -- valid
 		 * only AT a root).  Grafting that wrapper internal to a non-root
@@ -986,6 +996,24 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		}
 
 		/*
+		 * Pre-reserve the failure-free src-root retire's txn now -- after
+		 * the last POPULATED / OOM exit, before the only remaining fallible
+		 * step (the self-secure reserve below).  The retire is past the
+		 * point of no return and cannot abort, so it commits through this
+		 * pre-reserved txn (ft_ord_cell_flip_into).  List off retires via the
+		 * lone-edge ft_root_edge_flip, so reserve only when the list is on.
+		 */
+		if (dst_ft->group->ordered_list_set) {
+			src_retire_txn = ft_flip_txn_create_bounded(
+				FT_ROOT_LIST_SWAP_MAX_EDGES);
+			if (!src_retire_txn) {
+				urcu_flip_txn_destroy(glue.txn);
+				free_cds_ft_node(src_ft, fresh_node);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+		}
+
+		/*
 		 * Ordered list: locate the dst splice neighbours NOW, while dst is
 		 * still payload-free (the attach is built invisibly / not yet
 		 * published) -- a relational descent after the payload is live
@@ -1012,6 +1040,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
 				ft_glue_abort(dst_ft, &glue);
 				urcu_flip_txn_destroy(glue.txn);
+				if (src_retire_txn)
+					urcu_flip_txn_destroy(src_retire_txn);
 				free_cds_ft_node(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
@@ -1053,7 +1083,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		if (dst_ft->group->ordered_list_set) {
 			graft_run_first = src_ft->ord_cell_head;
 			graft_run_last = src_ft->ord_cell_tail;
-			ft_root_list_swap_publish(src_ft, NULL, &src_ft->root,
+			ft_root_list_swap_publish(src_ft, src_retire_txn,
+				&src_ft->root,
 				old_src_root, ft_node_flag(fresh_node, 0),
 				graft_run_first, NULL, graft_run_last, NULL);
 		} else {
