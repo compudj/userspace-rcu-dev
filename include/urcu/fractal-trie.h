@@ -3270,6 +3270,18 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t 
 enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
 
 /*
+ * enum cds_ft_compact_status - Drive/result status for the compaction API.
+ *
+ * Returned by cds_ft_compact_step (DONE / MORE / OOM) and cds_ft_compact
+ * (DONE / OOM, never MORE).
+ */
+enum cds_ft_compact_status {
+	CDS_FT_COMPACT_DONE	= 0,	/* fully compacted (terminal success) */
+	CDS_FT_COMPACT_MORE	= 1,	/* more work remains; call cds_ft_compact_step again */
+	CDS_FT_COMPACT_OOM	= 2,	/* stopped on memory pressure; free memory and resume */
+};
+
+/*
  * cds_ft_compact - Defragment a trie's internal-node arenas in place.
  *
  * Recovers the descent locality and resident memory that churn or
@@ -3281,9 +3293,13 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
  * permitted throughout, and other tries sharing the group keep mutating -- the
  * group stays online.
  *
- * Best-effort with respect to memory pressure: if an allocation fails while
- * walking, the affected node is left at its current address and the walk
- * continues. The trie remains valid and correct, only less fully compacted.
+ * Returns CDS_FT_COMPACT_DONE once the trie is fully compacted, or
+ * CDS_FT_COMPACT_OOM if it stopped early under memory pressure: an allocation
+ * failed, so the one-shot leaves the affected node in place and STOPS rather
+ * than walking the rest of the trie into doomed allocations. The trie stays
+ * valid and correct, only partially compacted. A caller that wants to free
+ * memory and continue from where it stopped should drive the resumable
+ * cds_ft_compact_begin/step/end API instead (cds_ft_compact does not resume).
  *
  * Memory reclaim is deferred (RCU grace period): resident memory does not
  * drop synchronously when this returns, but once a grace period has
@@ -3292,7 +3308,7 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
  *
  * To defragment a whole group, call this on each trie the group contains.
  */
-void cds_ft_compact(struct cds_ft *ft);
+enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft);
 
 /*
  * Resumable compaction (cds_ft_compact_begin / _step / _end).
@@ -3305,11 +3321,15 @@ void cds_ft_compact(struct cds_ft *ft);
  * the trie while the lock is dropped).
  *
  *   struct cds_ft_compact_state *st = cds_ft_compact_begin(ft);
+ *   enum cds_ft_compact_status s;
  *   do {
  *           writer_lock();
- *           more = cds_ft_compact_step(st, batch);
+ *           s = cds_ft_compact_step(st, batch);
  *           writer_unlock();
- *   } while (more);
+ *           if (s == CDS_FT_COMPACT_OOM) {
+ *                   ... free memory, then loop to resume from the same key ...
+ *           }
+ *   } while (s != CDS_FT_COMPACT_DONE);
  *   cds_ft_compact_end(st);
  */
 struct cds_ft_compact_state;
@@ -3330,11 +3350,18 @@ struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft);
  * @st: State from cds_ft_compact_begin.
  * @batch: Maximum nodes to relocate this step (0 selects a default).
  *
- * The caller must hold its writer exclusion for @ft across this call.
- * Returns true if more work remains (call again), false once the trie is
- * fully compacted. Either way the trie is valid at every step boundary.
+ * The caller must hold its writer exclusion for @ft across this call. Returns:
+ *   CDS_FT_COMPACT_MORE - more work remains; call again.
+ *   CDS_FT_COMPACT_DONE - the trie is fully compacted.
+ *   CDS_FT_COMPACT_OOM  - stopped early: a relocation hit an allocation failure.
+ * The trie is valid at every step boundary. On CDS_FT_COMPACT_OOM the bound
+ * cursor is left at the interrupted key, so after freeing memory the caller may
+ * call this again to RESUME -- it re-attempts that key inclusively and loses no
+ * key (an un-relocated node of any key pins its whole old arena range against
+ * reclaim).
  */
-bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch);
+enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
+		size_t batch);
 
 /*
  * cds_ft_compact_end - Finish a compaction and release its state.

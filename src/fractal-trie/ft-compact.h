@@ -42,9 +42,14 @@
  */
 /* A relocation publish is at most the forward edge + a compressed parent's SKIP_X dual. */
 #define FT_RELOCATE_COMMIT_MAX_EDGES	2
-/* Relocate the internal node at *@holder into a fresh slot; RCU-free the old. */
+/*
+ * Relocate the internal node at *@holder into a fresh slot; RCU-free the old.
+ * Sets *@oom on a best-effort leave-in-place (allocation failure) so the caller
+ * can stop the pass rather than keep walking into doomed allocations.
+ */
 static
-void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder)
+void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder,
+		bool *oom)
 {
 	struct cds_ft_inode_flag *nf = *holder;
 	unsigned int type_index = ft_node_type(nf);
@@ -70,8 +75,10 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	if (parent && (ft_node_compressed(parent) ||
 			ft_node_skip_compressed(parent))) {
 		txn = ft_flip_txn_create_bounded(FT_RELOCATE_COMMIT_MAX_EDGES);
-		if (!txn)
+		if (!txn) {
+			*oom = true;
 			return;		/* OOM: best-effort, leave in place */
+		}
 	}
 	ret = ft_node_recompact(FT_RECOMPACT_RELOCATE, ft, type_index,
 			&ft_types[type_index], node, meta, holder,
@@ -85,6 +92,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 		 */
 		if (txn)
 			urcu_flip_txn_destroy(txn);	/* reserved, unused */
+		*oom = true;
 		return;
 	}
 	/*
@@ -121,12 +129,14 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
  * no change.
  *
  * @gp_slot: grandparent slot holding the cn flag (traditional), or NULL (skip).
- * Returns the new compressed node (or @cn unchanged on allocation failure).
+ * Returns the new compressed node (or @cn unchanged on allocation failure, with
+ * *@oom set so the caller can stop the pass).
  */
 static
 struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		struct cds_ft_compressed_node *cn,
-		struct cds_ft_inode_flag **gp_slot)
+		struct cds_ft_inode_flag **gp_slot,
+		bool *oom)
 {
 	struct cds_ft_metadata *cn_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
@@ -136,8 +146,10 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	uint8_t len = cn->len;
 
 	cn2 = alloc_compressed_node(ft, len, &cn2_meta);
-	if (!cn2)
+	if (!cn2) {
+		*oom = true;
 		return cn;	/* OOM: leave in place (best-effort) */
+	}
 	cn2->len = len;
 	cn2->child = cn->child;
 	memcpy(cn2->key_bytes, cn->key_bytes, len);
@@ -194,7 +206,8 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
  * range, so cells relocated in key-traversal order pack densely there -- the
  * dense ord-walk stride that makes ordered iteration a sequential scan rather
  * than a random pointer chase.  Returns the new cell, or @old unchanged on
- * allocation failure (best-effort: leave it in place).
+ * allocation failure (best-effort: leave it in place, with *@oom set so the
+ * caller can stop the pass).
  *
  * Atomicity reuses ft_ord_cell_swap for the two ordered-list edges
  * (pred->ord_next / succ->ord_prev flip together via the flip-latch, so a
@@ -212,14 +225,16 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
  */
 static
 struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
-		struct ft_ord_cell *old)
+		struct ft_ord_cell *old, bool *oom)
 {
 	struct cds_ft_metadata *meta = cds_ft_alloc_cell_item(ft);
 	struct cds_ft_node *head = old->node;
 	struct ft_ord_cell *new_cell;
 
-	if (!meta)
+	if (!meta) {
+		*oom = true;
 		return old;		/* OOM: best-effort, leave in place */
+	}
 	if (ft_debug_counters())
 		uatomic_inc(&ft->group->nr_cells_allocated);
 	new_cell = (struct ft_ord_cell *) cds_ft_metadata_to_item(meta);
@@ -239,6 +254,7 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 		if (ft_debug_counters())
 			uatomic_inc(&ft->group->nr_cells_freed);
 		cds_ft_free_item_unpublished(ft, meta);
+		*oom = true;
 		return old;
 	}
 	rcu_assign_pointer(head->prev, ft_ord_cell_flag(new_cell));
@@ -257,11 +273,13 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
  * tracks the holder at each step (which the read descent does not) so it
  * can republish.  A skip target is relocated through the compressed
  * node's cn->child slot, so ft_node_recompact republishes both cn->child
- * and the skip pointer.  Increments *@relocated per node moved.
+ * and the skip pointer.  Increments *@relocated per node moved.  Stops the
+ * descent and sets *@oom if a relocation hits an allocation failure (the node
+ * stays in place; further nodes on this path would likely fail the same way).
  */
 static
 void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, unsigned long *relocated)
+		size_t key_len, unsigned long *relocated, bool *oom)
 {
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 	struct cds_ft_inode_flag **holder = &ft->root;
@@ -277,8 +295,10 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			return;		/* reached a leaf */
 		if (!cds_ft_metadata_in_recompact_private(
 				cds_ft_item_to_metadata(ft_node_ptr(nf)))) {
-			ft_compact_relocate_at(ft, holder);
+			ft_compact_relocate_at(ft, holder, oom);
 			(*relocated)++;
+			if (*oom)
+				return;		/* memory pressure: stop the descent */
 			nf = rcu_dereference(*holder);	/* the relocated node */
 		}
 		if (depth >= key_len)
@@ -307,8 +327,10 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			 */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
-				cn = ft_compact_relocate_compressed(ft, cn, NULL);
+				cn = ft_compact_relocate_compressed(ft, cn, NULL, oom);
 				(*relocated)++;
+				if (*oom)
+					return;		/* memory pressure: stop the descent */
 			}
 			holder = &cn->child;
 		} else if (ft_node_compressed(raw)) {
@@ -318,8 +340,10 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			/* Traditional: the grandparent slot (child_slot) holds the cn flag. */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
-				cn = ft_compact_relocate_compressed(ft, cn, child_slot);
+				cn = ft_compact_relocate_compressed(ft, cn, child_slot, oom);
 				(*relocated)++;
+				if (*oom)
+					return;		/* memory pressure: stop the descent */
 			}
 			holder = &cn->child;
 		} else {
@@ -346,6 +370,15 @@ struct cds_ft_compact_state {
 	struct ft_recompact_alloc_ctx ctx;
 	bool started;
 	bool done;
+	/*
+	 * Set when the last step stopped because a relocation hit an allocation
+	 * failure (memory pressure).  The bound iterator cursor is left AT the
+	 * interrupted key, so a subsequent step re-attempts it INCLUSIVELY
+	 * (cds_ft_lookup_ge): leaving even one node of a key un-relocated pins
+	 * its whole old arena range against reclaim, so resume must lose no key.
+	 * Reset at each step entry (a fresh attempt clears it).
+	 */
+	bool oom;
 };
 
 struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft)
@@ -375,16 +408,29 @@ struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft)
 	return st;
 }
 
-bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
+enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
+		size_t batch)
 {
 	struct cds_ft *ft = st->ft;
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 	unsigned long relocated = 0;
+	bool resume_inclusive;
 
 	if (st->done)
-		return false;
+		return CDS_FT_COMPACT_DONE;
 	if (batch == 0)
 		batch = FT_COMPACT_BATCH_DEFAULT;
+
+	/*
+	 * If the previous step stopped on OOM, its bound cursor is the
+	 * interrupted (not-fully-relocated) key.  Re-attempt it INCLUSIVELY on
+	 * this step's first lookup (lookup_ge, >=) instead of advancing past it
+	 * (lookup_gt, >): completing that key is what lets its old range drain.
+	 * The descent is idempotent (already-relocated nodes are recompact_
+	 * private), so the re-attempt only finishes the un-relocated remainder.
+	 */
+	resume_inclusive = st->oom;
+	st->oom = false;
 
 	/*
 	 * Route this step's relocations into private ranges, and hold the
@@ -405,10 +451,15 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 		 * path within this read-lock window.  The first lookup of each
 		 * batch re-descends the current structure (the path was
 		 * invalidated at the previous read-unlock) from the iterator's
-		 * retained key.
+		 * retained key -- inclusively on an OOM resume (see above).
 		 */
-		s = st->started ? cds_ft_lookup_gt(ft, st->iter)
-				: cds_ft_lookup_first(ft, st->iter);
+		if (!st->started)
+			s = cds_ft_lookup_first(ft, st->iter);
+		else if (resume_inclusive)
+			s = cds_ft_lookup_ge(ft, st->iter);
+		else
+			s = cds_ft_lookup_gt(ft, st->iter);
+		resume_inclusive = false;	/* only the first lookup re-attempts */
 		st->started = true;
 		if (s != CDS_FT_STATUS_OK) {	/* NOT_FOUND or error: finished */
 			st->done = true;
@@ -419,25 +470,29 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 			st->done = true;
 			break;
 		}
-		ft_compact_descend(ft, key, key_len, &relocated);
+		ft_compact_descend(ft, key, key_len, &relocated, &st->oom);
 		/*
 		 * Relocate this key's cell into a dense private cell range, in the
 		 * same key order the iterator visits -- so the ordered cell list
 		 * becomes a near-sequential scan.  iter->node is the chain head;
 		 * its cell is head->prev.  Skip a cell already moved this pass
 		 * (its range is recompact_private), mirroring the node descent, so
-		 * the pass is idempotent and re-visits do not re-allocate.
+		 * the pass is idempotent and re-visits do not re-allocate.  Skip it
+		 * too when the descent stopped on OOM: the head node may be un-
+		 * relocated, and the resume re-attempts this whole key anyway.
 		 */
-		if (ft->group->ordered_list_set && st->iter->node) {
+		if (!st->oom && ft->group->ordered_list_set && st->iter->node) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(
 				rcu_dereference(st->iter->node->prev));
 
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata(cell))) {
-				ft_compact_relocate_cell(ft, cell);
+				ft_compact_relocate_cell(ft, cell, &st->oom);
 				relocated++;
 			}
 		}
+		if (st->oom)
+			break;		/* memory pressure: stop, resume re-attempts */
 	}
 	/*
 	 * Drop the cached path before releasing the read lock: the nodes it
@@ -445,12 +500,18 @@ bool cds_ft_compact_step(struct cds_ft_compact_state *st, size_t batch)
 	 * Bind (not just invalidate) so the iterator's key is materialized into
 	 * its own buffer -- on a reference-keycopy / ordinal-cell group the live
 	 * key is a leaf reference that does NOT survive the unlock, and the next
-	 * step re-descends from that key.
+	 * step re-descends from that key (the interrupted key on an OOM stop).
 	 */
 	cds_ft_iter_bind_key(st->iter);
 	flavor->read_unlock();
 	ft_recompact_alloc_set_active(NULL);
-	return !st->done;
+	/*
+	 * OOM takes precedence (the caller frees memory and resumes from the
+	 * interrupted key); otherwise report completion or that more remains.
+	 */
+	if (st->oom)
+		return CDS_FT_COMPACT_OOM;
+	return st->done ? CDS_FT_COMPACT_DONE : CDS_FT_COMPACT_MORE;
 }
 
 void cds_ft_compact_end(struct cds_ft_compact_state *st)
@@ -461,14 +522,23 @@ void cds_ft_compact_end(struct cds_ft_compact_state *st)
 	free(st);
 }
 
-void cds_ft_compact(struct cds_ft *ft)
+enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft)
 {
 	CDS_FT_SCOPED_WRITER(ft);
 	struct cds_ft_compact_state *st = cds_ft_compact_begin(ft);
+	enum cds_ft_compact_status s;
 
 	if (!st)
-		return;		/* OOM: best-effort, leave the trie as-is */
-	while (cds_ft_compact_step(st, 0))
-		;
+		return CDS_FT_COMPACT_OOM;	/* could not start the pass */
+	/*
+	 * One-shot: drive to completion, but STOP on the first OOM rather than
+	 * walking the rest of the trie into doomed allocations.  The trie stays
+	 * valid and partially compacted; a caller that wants to free memory and
+	 * continue should drive cds_ft_compact_begin/step/end (which resumes).
+	 */
+	do {
+		s = cds_ft_compact_step(st, 0);
+	} while (s == CDS_FT_COMPACT_MORE);
 	cds_ft_compact_end(st);
+	return s;	/* CDS_FT_COMPACT_DONE or CDS_FT_COMPACT_OOM */
 }

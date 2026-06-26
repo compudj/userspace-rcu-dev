@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 293
+#define NR_TESTS 294
 #else
 #define NR_TESTS 253
 #endif
@@ -18836,7 +18836,8 @@ static int test_compact_concurrent_mutation(void)
 	struct cds_ft *ft;
 	struct cds_ft_compact_state *st;
 	unsigned int i, inserted = 0;
-	int ret = 0, more;
+	int ret = 0;
+	enum cds_ft_compact_status more;
 
 	ft = create_fixed_ft(8, &group);
 	for (i = 0; i < N; i++) {
@@ -18865,7 +18866,7 @@ static int test_compact_concurrent_mutation(void)
 			else
 				node_free(n);
 		}
-	} while (more);
+	} while (more == CDS_FT_COMPACT_MORE);
 	cds_ft_compact_end(st);
 
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
@@ -18908,7 +18909,8 @@ static int test_compact_exclusive(void)
 	struct cds_ft *ft;
 	struct cds_ft_compact_state *st;
 	unsigned int i;
-	int ret = 0, more;
+	int ret = 0;
+	enum cds_ft_compact_status more;
 
 	ft = create_fixed_ft(8, &group);
 	for (i = 0; i < N; i++) {
@@ -18929,7 +18931,7 @@ static int test_compact_exclusive(void)
 	}
 	do {
 		more = cds_ft_compact_step(st, 64);
-	} while (more);
+	} while (more == CDS_FT_COMPACT_MORE);
 	cds_ft_compact_end(st);
 
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
@@ -22784,18 +22786,20 @@ static int test_detach_oom_atomicity(void)
 }
 
 /*
- * Compaction cell-swap OOM (flip-txn allocation fault).  During cds_ft_compact
- * on an ordered-list trie the ONLY flip-txn allocation is the per-cell
- * relocation swap -- the structural node relocations publish through release
- * stores (rcu_assign_pointer), never the flip latch -- so arming
- * cds_ft_fault_flip_countdown = n fails exactly the (n+1)-th cell-swap.
- * ft_ord_cell_swap then installs nothing and returns -ENOMEM, and
- * ft_compact_relocate_cell leaves that cell in place (best-effort); compaction
- * reports no error.  The relocation that aborts keeps a fully consistent list
- * (an un-relocated cell stays correctly linked between its -- possibly already
+ * Compaction OOM (flip-txn allocation fault).  During cds_ft_compact on an
+ * ordered-list trie the flip-txn allocations are the per-cell relocation swap
+ * AND -- since the structural relocations were routed onto the flip latch -- a
+ * compressed-parent node relocation's 2-edge publish, so arming
+ * cds_ft_fault_flip_countdown = n fails exactly the (n+1)-th of those.  The
+ * faulting relocation installs nothing and leaves its node/cell in place
+ * (best-effort); the one-shot cds_ft_compact STOPS at the first OOM and returns
+ * CDS_FT_COMPACT_OOM rather than walking the rest of the trie into doomed
+ * allocations.  The aborted relocation keeps a fully consistent structure (an
+ * un-relocated cell stays correctly linked between its -- possibly already
  * relocated -- neighbours), so the trie must remain entirely valid: every
  * survivor present, the ordered list intact and in order, no leak.  Sweeping n
- * drives the abort path across many distinct relocations.
+ * drives the abort at many distinct relocation points; the returned status is
+ * CDS_FT_COMPACT_OOM exactly when the fault fired, else CDS_FT_COMPACT_DONE.
  */
 static int test_compact_ordered_list_oom(void)
 {
@@ -22843,11 +22847,22 @@ static int test_compact_ordered_list_oom(void)
 			rcu_read_unlock();
 		}
 
-		/* Fail the (n+1)-th cell-swap flip-txn allocation during compaction. */
+		/* Fail the (n+1)-th flip-txn allocation during compaction. */
 		cds_ft_fault_flip_countdown = n;
-		cds_ft_compact(ft);
-		if (cds_ft_fault_flip_countdown < 0)
-			saw_abort = 1;		/* the fault fired -> a cell-swap aborted */
+		{
+			enum cds_ft_compact_status cs = cds_ft_compact(ft);
+			int fired = (cds_ft_fault_flip_countdown < 0);
+
+			if (fired)
+				saw_abort = 1;	/* the fault fired -> a relocation aborted */
+			/* The one-shot reports OOM iff it stopped on a fault. */
+			if (cs != (fired ? CDS_FT_COMPACT_OOM : CDS_FT_COMPACT_DONE)) {
+				fprintf(stderr, "compact_ordered_list_oom: status %d "
+					"!= expected (fired=%d) at n=%d\n",
+					(int) cs, fired, n);
+				ok = 0;
+			}
+		}
 		cds_ft_fault_flip_countdown = -1;
 
 		rcu_read_lock();
@@ -22894,6 +22909,134 @@ static int test_compact_ordered_list_oom(void)
 	if (rc == 0 && !saw_abort) {
 		fprintf(stderr, "compact_ordered_list_oom: abort path never hit "
 			"(no cell-swap faulted across the sweep)\n");
+		rc = -1;
+	}
+	return rc;
+}
+
+/*
+ * Resumable compaction RESUMES after OOM, losslessly.  Drive the
+ * begin/step/end API with the (n+1)-th flip-txn allocation faulted: the step
+ * that hits it returns CDS_FT_COMPACT_OOM with its cursor parked AT the
+ * interrupted key.  Continuing (the one-shot fault auto-clears, modelling a
+ * caller that freed memory) must RESUME -- cds_ft_compact_step re-attempts that
+ * same key inclusively (cds_ft_lookup_ge), so no key is skipped: leaving even
+ * one node of a key un-relocated would pin its whole old range against reclaim.
+ * The pass drives to CDS_FT_COMPACT_DONE and the trie stays valid + complete +
+ * ordered.  Sweeping n places the OOM at many distinct points; the resume must
+ * always terminate (no skipped key, no livelock) -- the guard catches a stall.
+ */
+static int test_compact_ordered_list_oom_resume(void)
+{
+	const unsigned int N = 1024;
+	const unsigned int STRIDE = 4;
+	const unsigned int SURVIVORS = N / STRIDE;
+	int n, rc = 0, saw_oom = 0;
+
+	for (n = 0; n < 48; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_fixed_ord_ft(8, &group);
+		struct cds_ft_iter *iter = NULL;
+		struct cds_ft_compact_state *st;
+		enum cds_ft_compact_status s = CDS_FT_COMPACT_MORE;
+		unsigned int i, count = 0, guard = 0;
+		uint64_t prev = 0;
+		int first = 1, ok = 1;
+
+		if (cds_ft_iter_create(ft, &iter) < 0)
+			abort();
+		for (i = 0; i < N; i++) {
+			struct ft_test_node *tn = node_alloc(i);
+
+			if (insert_u64(ft, i, tn) != CDS_FT_STATUS_OK) {
+				node_free(tn);
+				ok = 0;
+				break;
+			}
+		}
+		for (i = 0; ok && i < N; i++) {
+			struct cds_ft_node *found;
+			uint8_t k[8];
+
+			if (i % STRIDE == 0)
+				continue;
+			rcu_read_lock();
+			cds_ft_u64_to_key(ft, i, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(ft, iter);
+			found = cds_ft_iter_node(iter);
+			if (found) {
+				struct ft_test_node *tn = to_test_node(found);
+
+				if (cds_ft_remove(ft, iter, &tn->node) == CDS_FT_STATUS_OK)
+					node_free_rcu(tn);
+			}
+			rcu_read_unlock();
+		}
+
+		st = cds_ft_compact_begin(ft);
+		if (!st)
+			abort();
+		/* Fault the (n+1)-th flip-txn alloc; it self-clears once it fires. */
+		cds_ft_fault_flip_countdown = n;
+		while (ok && s != CDS_FT_COMPACT_DONE) {
+			s = cds_ft_compact_step(st, 8);	/* small batch -> many steps */
+			if (s == CDS_FT_COMPACT_OOM) {
+				saw_oom = 1;
+				/* "free memory" and resume (fault already self-cleared). */
+				cds_ft_fault_flip_countdown = -1;
+			}
+			if (++guard > 1000000) {
+				fprintf(stderr, "compact resume: no progress at n=%d\n", n);
+				ok = 0;
+			}
+		}
+		cds_ft_fault_flip_countdown = -1;
+		cds_ft_compact_end(st);
+
+		rcu_read_lock();
+		if (ok && cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compact resume: verify FAILED at n=%d\n", n);
+			ok = 0;
+		}
+		rcu_read_unlock();
+
+		rcu_read_lock();
+		cds_ft_for_each_rcu(ft, iter) {
+			uint8_t rk[8];
+			size_t rk_len;
+			uint64_t v;
+
+			cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+			v = cds_ft_key_to_u64(ft, rk, CDS_FT_LEN_DEFAULT);
+			if (v % STRIDE != 0 || (!first && v <= prev)) {
+				fprintf(stderr, "compact resume: bad scan n=%d "
+					"v=%" PRIu64 " prev=%" PRIu64 "\n", n, v, prev);
+				ok = 0;
+				break;
+			}
+			prev = v;
+			first = 0;
+			count++;
+		}
+		rcu_read_unlock();
+		if (ok && count != SURVIVORS) {	/* lossless: every survivor present */
+			fprintf(stderr, "compact resume: n=%d count %u != %u\n",
+				n, count, SURVIVORS);
+			ok = 0;
+		}
+		if (!ok)
+			rc = -1;
+
+		cds_ft_iter_destroy(iter);
+		drain_trie(ft);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		if (!ok)
+			break;
+	}
+	if (rc == 0 && !saw_oom) {
+		fprintf(stderr, "compact resume: OOM path never hit across the sweep\n");
 		rc = -1;
 	}
 	return rc;
@@ -23281,6 +23424,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_insert_replace_prefix_oom);
 	RUN_TEST(test_replace_head_oom);
 	RUN_TEST(test_compact_ordered_list_oom);
+	RUN_TEST(test_compact_ordered_list_oom_resume);
 #endif
 
 	rcu_barrier();
