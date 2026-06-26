@@ -353,15 +353,11 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct urcu_flip_txn *txn,
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, tail_old, tail_new,
 			edges, n);
 	/*
-	 * @txn non-NULL: a caller-PRE-RESERVED bounded txn, committed infallibly
-	 * (ft_ord_cell_flip_into) -- the un-abortable post-drain root swap.
-	 * @txn NULL: the transitional self-allocating flip (bare-store fallback)
-	 * for callers not yet migrated.
+	 * @txn is the caller-PRE-RESERVED bounded txn (every Class-G root swap
+	 * reserves in its fallible prefix), committed infallibly here -- the
+	 * un-abortable post-drain root swap reaches an allocation-free commit.
 	 */
-	if (txn)
-		ft_ord_cell_flip_into(ft, txn, edges, n);
-	else
-		ft_ord_cell_flip(ft, edges, n);
+	ft_ord_cell_flip_into(ft, txn, edges, n);
 }
 
 /*
@@ -469,15 +465,12 @@ void ft_root_list_swap_publish_dual(struct urcu_flip_txn *txn,
 		}
 	}
 	/*
-	 * @txn non-NULL: a caller-PRE-RESERVED bounded txn committed infallibly.
-	 * @txn NULL: the transitional self-allocating flip for callers not yet
-	 * migrated.  Both roots always flip, so this commit is always multi-edge
-	 * (>= 2) even with the ordered list off.
+	 * @txn is the caller-PRE-RESERVED bounded txn (both graft/graft_swap
+	 * cross-trie callers reserve it), committed infallibly.  Both roots
+	 * always flip, so this commit is always multi-edge (>= 2) even with the
+	 * ordered list off -- it can never reduce to a lone store.
 	 */
-	if (txn)
-		ft_ord_cell_flip_into(a->ft, txn, edges, n);
-	else
-		ft_ord_cell_flip(a->ft, edges, n);
+	ft_ord_cell_flip_into(a->ft, txn, edges, n);
 }
 
 /*
