@@ -1445,6 +1445,33 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		sdrun.rfirst = ms_s_first;
 		sdrun.rlast = ms_s_last;
 	}
+	/*
+	 * Pre-reserve the src-side ordered-list commit txn before the (still
+	 * fallible) src unlink.  Whichever fires -- the root-src root+endpoint
+	 * swap or the rare unfused non-root run-unlink -- is the src side's
+	 * commit, un-abortable once the structural unlink is public, so it commits
+	 * through this pre-reserved txn (ft_ord_cell_flip_into).  Sized to the
+	 * larger bound (4-edge run-unlink >= 3-edge root swap).  OOM here aborts
+	 * the still-invisible build (both tries pristine).  The lone-edge list-off
+	 * paths (ft_root_edge_flip) need no txn, so reserve only when ms_ord.
+	 */
+	struct urcu_flip_txn *src_side_txn = NULL;
+
+	if (ms_ord) {
+		src_side_txn = ft_flip_txn_create_bounded(
+			FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
+		if (!src_side_txn) {
+			free(ms_src_pool);
+			free(ms_src_caps);
+			free(ms_edges);
+			urcu_flip_txn_destroy(txn);
+			if (fresh_root)
+				free_cds_ft_node_unpublished(src_ft, fresh_root);
+			ft_glue_abort(dst_ft, &gd);
+			ft_glue_abort(src_ft, &gs);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+	}
 	if (root_src) {
 		/*
 		 * A root src moves the WHOLE source, so its run is the whole src
@@ -1455,10 +1482,12 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * flip), so the post-commit interleave still re-homes them to dst.
 		 */
 		if (ms_ord) {
-			ft_root_list_swap_publish(src_ft, NULL, &src_ft->root,
+			ft_root_list_swap_publish(src_ft, src_side_txn,
+				&src_ft->root,
 				src_ft->root, ft_node_flag(fresh_root, 0),
 				src_ft->ord_cell_head, NULL,
 				src_ft->ord_cell_tail, NULL);
+			src_side_txn = NULL;	/* consumed */
 		} else {
 			/*
 			 * No ordered list: src->root is the only reader-visible slot.
@@ -1481,6 +1510,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		free(ms_src_caps);
 		free(ms_edges);
 		urcu_flip_txn_destroy(txn);
+		if (src_side_txn)
+			urcu_flip_txn_destroy(src_side_txn);
 		ft_glue_abort(dst_ft, &gd);
 		ft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
@@ -1494,8 +1525,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * for a root src (fused into the root swap above) and for a non-root src
 	 * whose unlink already fused the run (sdrun.armed).
 	 */
-	if (ms_ord && !root_src && !sdrun.armed)
-		ft_ord_cell_run_unlink(src_ft, ms_s_first, ms_s_last);
+	if (ms_ord && !root_src && !sdrun.armed) {
+		ft_ord_cell_run_unlink(src_ft, src_side_txn, ms_s_first,
+			ms_s_last);
+		src_side_txn = NULL;	/* consumed */
+	}
+	/* Reserved but unused: a non-root run whose unlink already fused it. */
+	if (src_side_txn)
+		urcu_flip_txn_destroy(src_side_txn);
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
 
@@ -1766,12 +1803,33 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	}
 
 	/*
+	 * Pre-reserve the standalone run-unlink txn before the fallible unlink:
+	 * the rare unfused shape removes the src run from src's list AFTER the
+	 * structural unlink is public (un-abortable).  OOM here aborts the still-
+	 * invisible build (both tries pristine).  Reserve only when ms_ord.
+	 */
+	struct urcu_flip_txn *run_unlink_txn = NULL;
+
+	if (ms_ord) {
+		run_unlink_txn = ft_flip_txn_create_bounded(
+			FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
+		if (!run_unlink_txn) {
+			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+			ft_glue_abort(dst_ft, &glue);
+			urcu_flip_txn_destroy(glue.txn);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+	}
+
+	/*
 	 * Last fallible step: unlink the source subtree in place, preserving
 	 * @payload.  On OOM the unlink self-undoes (src pristine) and the still-
 	 * invisible cluster / reserve is released (dst pristine) -- no rollback.
 	 */
 	if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
 			cnt_src, srunp) < 0) {
+		if (run_unlink_txn)
+			urcu_flip_txn_destroy(run_unlink_txn);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		ft_glue_abort(dst_ft, &glue);
 		urcu_flip_txn_destroy(glue.txn);
@@ -1788,8 +1846,13 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * from the structure but still in the list; the standalone two-commit unlink
 	 * remains as a defensive fallback for any unfused unlink shape.
 	 */
-	if (ms_ord && !srun.armed)
-		ft_ord_cell_run_unlink(src_ft, s_first, s_last);
+	if (ms_ord && !srun.armed) {
+		ft_ord_cell_run_unlink(src_ft, run_unlink_txn, s_first, s_last);
+		run_unlink_txn = NULL;	/* consumed */
+	}
+	/* Reserved but unused: the structural unlink already fused the run. */
+	if (run_unlink_txn)
+		urcu_flip_txn_destroy(run_unlink_txn);
 
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
@@ -2274,6 +2337,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		struct cds_ft_inode *fresh_root;
 		struct cds_ft_metadata *fresh_meta;
 		struct cds_ft_inode *old_dst_root;
+		struct urcu_flip_txn *appear_txn = NULL;
 		size_t sm;
 
 		fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
@@ -2284,9 +2348,28 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		rcu_assign_pointer(fresh_meta->parent, NULL);
 		ft_nr_keys_store(fresh_meta, 0, CMM_RELAXED);
 
+		/*
+		 * Pre-reserve the dst-appear root-swap txn BEFORE the detach: the
+		 * swap is failure-free (post-detach) so it commits through this
+		 * pre-reserved txn (ft_ord_cell_flip_into).  OOM here aborts while
+		 * @src_ft is still pristine (no detach yet).  List off uses the
+		 * lone-edge ft_root_edge_flip below (no txn).
+		 */
+		if (dst_ft->group->ordered_list_set) {
+			appear_txn = ft_flip_txn_create_bounded(
+				FT_ROOT_LIST_SWAP_MAX_EDGES);
+			if (!appear_txn) {
+				free_cds_ft_node_unpublished(src_ft, fresh_root);
+				status = CDS_FT_STATUS_MEMORY_ERROR;
+				goto out;
+			}
+		}
+
 		status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
 		if (status < 0) {
 			/* NOT_FOUND impossible: @src_ft had content. */
+			if (appear_txn)
+				urcu_flip_txn_destroy(appear_txn);
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
 			goto out;
 		}
@@ -2312,7 +2395,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * ft_graft's cross-trie empty-dst).
 		 */
 		if (dst_ft->group->ordered_list_set) {
-			ft_root_list_swap_publish(dst_ft, NULL, &dst_ft->root,
+			ft_root_list_swap_publish(dst_ft, appear_txn, &dst_ft->root,
 				dst_ft->root, subtree->root,
 				NULL, subtree->ord_cell_head,
 				NULL, subtree->ord_cell_tail);

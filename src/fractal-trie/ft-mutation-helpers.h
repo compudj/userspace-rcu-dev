@@ -1467,10 +1467,13 @@ void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct ft_pub_rec *rec,
  * the run cells keep their stale links (caller no longer references them as a
  * run).  Whole-list removal (pred == succ == NULL) clears head/tail.
  */
+/* Max edges a run-unlink commits: the two boundary back-edges + head + tail. */
+#define FT_ORD_CELL_RUN_UNLINK_MAX_EDGES	4
+
 #ifdef FEATURE_FT_MERGE
 static
-void ft_ord_cell_run_unlink(struct cds_ft *ft, struct cds_ft_node *first_head,
-		struct cds_ft_node *last_head)
+void ft_ord_cell_run_unlink(struct cds_ft *ft, struct urcu_flip_txn *txn,
+		struct cds_ft_node *first_head, struct cds_ft_node *last_head)
 {
 	struct ft_ord_cell *first =
 		ft_ord_cell_ptr(rcu_dereference(first_head->prev));
@@ -1478,7 +1481,7 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct cds_ft_node *first_head,
 		ft_ord_cell_ptr(rcu_dereference(last_head->prev));
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->ord_prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->ord_next);
-	struct ft_ord_cell_edge edges[4];
+	struct ft_ord_cell_edge edges[FT_ORD_CELL_RUN_UNLINK_MAX_EDGES];
 	unsigned int n = 0;
 
 	if (pred) {
@@ -1495,7 +1498,7 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct cds_ft_node *first_head,
 	}
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, first, succ, edges, n);
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, last, pred, edges, n);
-	ft_ord_cell_flip(ft, edges, n);
+	ft_ord_cell_flip_into(ft, txn, edges, n);
 }
 #endif /* FEATURE_FT_MERGE */
 
