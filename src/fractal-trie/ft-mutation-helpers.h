@@ -1336,22 +1336,30 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 	return n;
 }
 
+/* Max edges a run-splice commits: <=2 boundary back-edges + head + tail. */
+#define FT_ORD_CELL_RUN_SPLICE_MAX_EDGES	4
+
 /*
  * Pre-sets the run's outer links (run not yet reachable in @dst), flips the
  * <=2 boundary edges atomically (for @dst's live readers), and repairs @dst
  * head/tail.  The run's source trie must already have released it (head/tail
- * cleared + a grace period) so no source reader is mid-run.
+ * cleared + a grace period) so no source reader is mid-run.  This standalone
+ * (two-commit) splice runs in the op's failure-free section -- after the source
+ * unlink + drain -- so it is UN-ABORTABLE: the caller reserves @txn (capacity >=
+ * FT_ORD_CELL_RUN_SPLICE_MAX_EDGES) in its fallible prefix and the commit rides
+ * it infallibly via ft_ord_cell_flip_into.
  */
 static
-void ft_ord_cell_run_splice(struct cds_ft *dst, struct ft_ord_cell *run_first,
+void ft_ord_cell_run_splice(struct cds_ft *dst, struct urcu_flip_txn *txn,
+		struct ft_ord_cell *run_first,
 		struct ft_ord_cell *run_last, struct ft_ord_cell *pred,
 		struct ft_ord_cell *succ)
 {
-	struct ft_ord_cell_edge edges[4];
+	struct ft_ord_cell_edge edges[FT_ORD_CELL_RUN_SPLICE_MAX_EDGES];
 	unsigned int n = ft_ord_cell_run_splice_edges(dst, run_first, run_last,
 		pred, succ, edges, 0);
 
-	ft_ord_cell_flip(dst, edges, n);
+	ft_ord_cell_flip_into(dst, txn, edges, n);
 }
 
 /*
@@ -1423,16 +1431,26 @@ unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
 	return n;
 }
 
+/* Max edges a run-replace commits: <=2 boundary back-edges + head + tail. */
+#define FT_ORD_CELL_RUN_REPLACE_MAX_EDGES	4
+
+/*
+ * Standalone (two-commit) run-replace: swap run_D out for run_S at run_D's
+ * position in @dst's ordered list.  Runs in the op's failure-free section (after
+ * the structural commit + drain), so UN-ABORTABLE: the caller reserves @txn
+ * (capacity >= FT_ORD_CELL_RUN_REPLACE_MAX_EDGES) in its fallible prefix and the
+ * commit rides it infallibly via ft_ord_cell_flip_into.
+ */
 static
-void ft_ord_cell_run_replace(struct cds_ft *dst,
+void ft_ord_cell_run_replace(struct cds_ft *dst, struct urcu_flip_txn *txn,
 		struct ft_ord_cell *d_first, struct ft_ord_cell *d_last,
 		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last)
 {
-	struct ft_ord_cell_edge edges[4];
+	struct ft_ord_cell_edge edges[FT_ORD_CELL_RUN_REPLACE_MAX_EDGES];
 	unsigned int n = ft_ord_cell_run_replace_edges(dst, d_first, d_last,
 		s_first, s_last, edges, 0);
 
-	ft_ord_cell_flip(dst, edges, n);
+	ft_ord_cell_flip_into(dst, txn, edges, n);
 }
 
 /*

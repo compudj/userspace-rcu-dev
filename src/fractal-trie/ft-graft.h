@@ -911,6 +911,16 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		struct urcu_flip_txn *src_retire_txn = NULL;
 		/*
+		 * Standalone run-splice fallback txn.  Every attach shape FUSES the
+		 * run-splice into its structural flip (graft_run.armed), so this
+		 * fallback is not taken today -- but it is kept defensively, runs in
+		 * the failure-free section (post src-unlink + drain), and is hence
+		 * un-abortable, so PRE-RESERVE its bounded txn here.  Reserved only
+		 * when the ordered list is on; consumed by the standalone splice or
+		 * freed-unused when the run was fused (the common case).
+		 */
+		struct urcu_flip_txn *run_splice_txn = NULL;
+		/*
 		 * NIL-key-only source: the whole source is a single prefix key,
 		 * stored as the root's external_nodes (a childless internal -- valid
 		 * only AT a root).  Grafting that wrapper internal to a non-root
@@ -1006,7 +1016,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		if (dst_ft->group->ordered_list_set) {
 			src_retire_txn = ft_flip_txn_create_bounded(
 				FT_ROOT_LIST_SWAP_MAX_EDGES);
-			if (!src_retire_txn) {
+			run_splice_txn = ft_flip_txn_create_bounded(
+				FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
+			if (!src_retire_txn || !run_splice_txn) {
+				if (src_retire_txn)
+					urcu_flip_txn_destroy(src_retire_txn);
+				if (run_splice_txn)
+					urcu_flip_txn_destroy(run_splice_txn);
 				urcu_flip_txn_destroy(glue.txn);
 				free_cds_ft_node(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
@@ -1042,6 +1058,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 				urcu_flip_txn_destroy(glue.txn);
 				if (src_retire_txn)
 					urcu_flip_txn_destroy(src_retire_txn);
+				if (run_splice_txn)
+					urcu_flip_txn_destroy(run_splice_txn);
 				free_cds_ft_node(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
@@ -1206,10 +1224,17 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * index but not the other.  The standalone two-commit splice remains
 		 * as a defensive fallback for any not-yet-fused shape (none today);
 		 * without it an unfused shape would strand the run out of the list.
+		 * It commits through the pre-reserved @run_splice_txn (un-abortable
+		 * post-drain); the fused common case frees that txn unused.
 		 */
-		if (graft_run_first && !graft_run.armed)
-			ft_ord_cell_run_splice(dst_ft, graft_run_first,
-				graft_run_last, graft_pred, graft_succ);
+		if (graft_run_first && !graft_run.armed) {
+			ft_ord_cell_run_splice(dst_ft, run_splice_txn,
+				graft_run_first, graft_run_last, graft_pred,
+				graft_succ);
+			run_splice_txn = NULL;	/* consumed */
+		}
+		if (run_splice_txn)
+			urcu_flip_txn_destroy(run_splice_txn);	/* fused: unused */
 
 		/*
 		 * NIL-key graft succeeded: the external chain head was placed
@@ -1490,6 +1515,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct urcu_flip_txn *swap_retire_txn = NULL;
 		struct urcu_flip_txn *extract_txn = NULL;
 		struct urcu_flip_txn *glue_publish_txn = NULL;
+		struct urcu_flip_txn *run_replace_txn = NULL;
 		struct ft_glue glue_insert, glue_extract;
 		struct cds_ft_inode_flag *canon = NULL;
 		struct cds_ft_inode_flag *top_B = NULL;	/* extracted swap root, NULL = external/none */
@@ -1803,12 +1829,19 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * after both syncs, in the failure-free section, so it cannot abort.
 		 * Reserved only when the list is on -- list off makes that flip at
 		 * most the lone top_B root-install edge (an infallible on-stack
-		 * store).  This is the last fallible step before the COMMIT marker.
+		 * store).  Plus the standalone dst run-replace fallback txn (the
+		 * gs_reserved sole-child detach-prune path, where the publish leaves
+		 * swap_run unarmed; every other shape fuses the replace and frees it
+		 * unused).  These are the last fallible steps before the COMMIT marker.
 		 */
 		if (gs_ord) {
 			extract_txn = ft_flip_txn_create_bounded(
 				FT_ROOT_LIST_SWAP_MAX_EDGES);
 			if (!extract_txn)
+				goto prep_oom;
+			run_replace_txn = ft_flip_txn_create_bounded(
+				FT_ORD_CELL_RUN_REPLACE_MAX_EDGES);
+			if (!run_replace_txn)
 				goto prep_oom;
 		}
 
@@ -1973,11 +2006,17 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * reader still holding run_D in dst.  Skipped when the publish above
 		 * already FUSED it into the structural flip (swap_run.armed): only the
 		 * gs_reserved sole-child detach-prune path still uses this standalone
-		 * form (its prune commits separately via ft_detach_node).
+		 * form (its prune commits separately via ft_detach_node).  It commits
+		 * through the pre-reserved @run_replace_txn (un-abortable post-drain);
+		 * every fused shape frees that txn unused.
 		 */
-		if (gs_ord && !swap_run.armed)
-			ft_ord_cell_run_replace(dst_ft, gs_d_first, gs_d_last,
-				gs_s_first, gs_s_last);
+		if (gs_ord && !swap_run.armed) {
+			ft_ord_cell_run_replace(dst_ft, run_replace_txn,
+				gs_d_first, gs_d_last, gs_s_first, gs_s_last);
+			run_replace_txn = NULL;	/* consumed */
+		}
+		if (run_replace_txn)
+			urcu_flip_txn_destroy(run_replace_txn);	/* fused: unused */
 
 		/*
 		 * Drain dst-side readers that may still hold the displaced
@@ -2145,6 +2184,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			urcu_flip_txn_destroy(swap_retire_txn);
 		if (extract_txn)
 			urcu_flip_txn_destroy(extract_txn);
+		if (run_replace_txn)
+			urcu_flip_txn_destroy(run_replace_txn);
 		if (fresh)
 			free_cds_ft_node(swap_ft, fresh);
 		if (gs_reserved)

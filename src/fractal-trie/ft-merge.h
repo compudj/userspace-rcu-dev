@@ -1809,11 +1809,24 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * invisible build (both tries pristine).  Reserve only when ms_ord.
 	 */
 	struct urcu_flip_txn *run_unlink_txn = NULL;
+	/*
+	 * Pre-reserve the standalone dst run-splice txn too: the rare unfused
+	 * attach shape splices the moved run into dst's list AFTER the structural
+	 * attach is public (un-abortable).  Reserved only when ms_ord; consumed by
+	 * the standalone splice or freed-unused when fused (the common case).
+	 */
+	struct urcu_flip_txn *run_splice_txn = NULL;
 
 	if (ms_ord) {
 		run_unlink_txn = ft_flip_txn_create_bounded(
 			FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
-		if (!run_unlink_txn) {
+		run_splice_txn = ft_flip_txn_create_bounded(
+			FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
+		if (!run_unlink_txn || !run_splice_txn) {
+			if (run_unlink_txn)
+				urcu_flip_txn_destroy(run_unlink_txn);
+			if (run_splice_txn)
+				urcu_flip_txn_destroy(run_splice_txn);
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 			ft_glue_abort(dst_ft, &glue);
 			urcu_flip_txn_destroy(glue.txn);
@@ -1830,6 +1843,8 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 			cnt_src, srunp) < 0) {
 		if (run_unlink_txn)
 			urcu_flip_txn_destroy(run_unlink_txn);
+		if (run_splice_txn)
+			urcu_flip_txn_destroy(run_splice_txn);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		ft_glue_abort(dst_ft, &glue);
 		urcu_flip_txn_destroy(glue.txn);
@@ -1927,10 +1942,17 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * external edge-byte was stamped before that splice, above.  The standalone
 	 * two-commit splice remains as a defensive fallback for any not-yet-fused
 	 * shape (none today); without it an unfused shape would strand the moved
-	 * run out of the ordered list.
+	 * run out of the ordered list.  It commits through the pre-reserved
+	 * @run_splice_txn (un-abortable post-drain); the fused common case frees
+	 * that txn unused.
 	 */
-	if (ms_ord && !mrun.armed)
-		ft_ord_cell_run_splice(dst_ft, run_first, run_last, pred, succ);
+	if (ms_ord && !mrun.armed) {
+		ft_ord_cell_run_splice(dst_ft, run_splice_txn, run_first,
+			run_last, pred, succ);
+		run_splice_txn = NULL;	/* consumed */
+	}
+	if (run_splice_txn)
+		urcu_flip_txn_destroy(run_splice_txn);	/* fused: unused */
 
 	/* Raise dst's max_used_key_len for the moved keys (dst_key || suffix). */
 	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
