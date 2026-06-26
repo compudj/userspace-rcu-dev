@@ -1149,6 +1149,13 @@ int ft_attach_node(struct cds_ft *ft,
 	/* Publish branch. */
 	{
 		uint8_t key_value;
+		/*
+		 * Accumulates the one-commit forward edges for a recompact-
+		 * relocating reserve: the reserve set_nth records a compressed
+		 * parent's SKIP_X dual here, and the forward fold below adds the
+		 * grandparent slot edge, so both flip ATOMICALLY in ic->txn.
+		 */
+		struct ft_pub_rec rec = { .n = 0 };
 
 		key_value = *(--iter_key);
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
@@ -1188,9 +1195,9 @@ int ft_attach_node(struct cds_ft *ft,
 			 * the new key through the parent chain.
 			 */
 			if (!old_node_flag) {
-				ret = ft_node_set_nth(ft, &iter_dest_node_flag,
+				ret = ft_node_set_nth_rec(ft, &iter_dest_node_flag,
 					key_value, NULL, &old_recompacted_node,
-					metadata, level - 1, false);
+					metadata, level - 1, false, &rec);
 				if (ret) {
 					dbg_printf("branch publish error %d\n", ret);
 					goto check_error;
@@ -1259,19 +1266,20 @@ int ft_attach_node(struct cds_ft *ft,
 		 * if the attach target is a compressed node's child.
 		 */
 		if (ic && ic->txn && iter_dest_node_flag != attach_node_flag) {
-			struct ft_pub_rec rec = { .n = 0 };
 			unsigned int k;
 
 			/*
-			 * One-commit AND the reserve recompacted the attach node:
-			 * the relocation swaps the OLD attach node for the fresh
-			 * copy at its grandparent slot.  Fold that forward edge (and
-			 * a compressed grandparent's SKIP_X dual) into ic->txn so it
-			 * flips ATOMICALLY with the new key's slot edge -- "relocate
-			 * + new key" is one publication.  ic->txn was armed before
-			 * the build, so no allocation (hence no failure) here.  The
-			 * old node stays resolved-to via the parked grandparent proxy
-			 * until the commit, so defer its free past insert_done.
+			 * One-commit AND the reserve recompacted the attach node: the
+			 * relocation swaps the OLD attach node for the fresh copy at its
+			 * grandparent slot.  @rec already holds a compressed parent's
+			 * SKIP_X dual (recorded by the reserve ft_node_set_nth_rec
+			 * above, instead of a premature bare store); add the forward
+			 * grandparent slot edge here so the relocation flips ATOMICALLY
+			 * with the new key's slot edge in ic->txn -- "relocate + new
+			 * key" is one publication.  ic->txn was armed before the build,
+			 * so no allocation (hence no failure) here.  The old node stays
+			 * resolved-to via the parked grandparent proxy until the commit,
+			 * so defer its free past insert_done.
 			 */
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag, &rec);

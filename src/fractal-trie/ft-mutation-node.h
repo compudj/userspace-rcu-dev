@@ -742,13 +742,18 @@ unsigned int find_nearest_type_index(unsigned int type_index,
  * new node's slots, but the re-parent loop is skipped entirely.  See
  * ft_node_set_nth and the rcu-mutation build-invisible pattern.
  *
- * @rec: when non-NULL, the two reader-visible forward stores -- the forward
- * publish into @old_node_flag_ptr and a compressed parent's SKIP_X dual -- are
- * RECORDED into @rec (ft_pub_rec_add) instead of being bare rcu_assign_pointer
- * stores, so the caller commits them atomically through one flip (the
- * standalone-compaction relocation path: ft_compact_relocate_at).  NULL keeps
- * the bare stores for the ADD/SAME/DEL mutators, whose @old_node_flag_ptr is a
- * LOCAL out-param re-published by the caller (build-invisible).
+ * @rec: the accumulator for reader-visible forward stores.
+ *  - The forward publish into @old_node_flag_ptr is recorded into @rec ONLY for
+ *    FT_RECOMPACT_RELOCATE, where @old_node_flag_ptr is the LIVE slot and the
+ *    caller (ft_compact_relocate_at) commits @rec.  For the ADD/SAME/DEL
+ *    mutators @old_node_flag_ptr is a LOCAL out-param re-published by the
+ *    caller, so the forward stays a bare store into that local.
+ *  - A compressed parent's SKIP_X dual (the live grandparent skip slot) is
+ *    recorded into @rec whenever @rec is non-NULL: for RELOCATE, AND for an
+ *    ADD/SAME/DEL relocation whose LIVE caller threads its own commit rec so the
+ *    dual flips ATOMICALLY with that caller's forward publish (else the dual
+ *    would be a bare store ordered BEFORE the deferred forward).  @rec == NULL
+ *    keeps the bare SKIP_X store for build-invisible recompacts.
  */
 static
 int ft_node_recompact(enum ft_recompact mode,
@@ -1091,19 +1096,19 @@ skip_copy:
 
 	/*
 	 * Return the new recompacted node through old_node_flag_ptr.  For the
-	 * ADD/SAME/DEL mutators this is a local out-param, re-published with
-	 * rcu_assign_pointer by the caller (@rec == NULL); but
-	 * ft_compact_relocate_at passes the LIVE slot (&ft->root, a parent child
-	 * slot, &cn->child) and never re-publishes, so this store IS the
-	 * reader-visible publication of the relocated node.  In that case (@rec
-	 * != NULL) the publish is RECORDED into @rec so it commits through a flip
-	 * descriptor together with the SKIP_X dual above (one atomic edge-set the
-	 * caller flips after the eager child re-parent), instead of a bare store.
-	 * For the local-out-param callers the bare release store orders the
-	 * node-body and metadata stores above it (a plain store would let a
-	 * weakly-ordered architecture expose an unwired copy).
+	 * ADD/SAME/DEL mutators this is a LOCAL out-param re-published by the
+	 * caller, so the forward is a bare store into that local; only
+	 * FT_RECOMPACT_RELOCATE passes the LIVE slot (&ft->root, a parent child
+	 * slot, &cn->child) and never re-publishes, so its store IS the
+	 * reader-visible publication and is RECORDED into @rec to commit through a
+	 * flip descriptor together with the SKIP_X dual above (keyed on the mode,
+	 * not on @rec being set -- an ADD/SAME/DEL relocation may now carry a @rec
+	 * for the SKIP_X dual alone while its forward stays local).  For the
+	 * local-out-param callers the bare release store orders the node-body and
+	 * metadata stores above it (a plain store would let a weakly-ordered
+	 * architecture expose an unwired copy).
 	 */
-	if (rec)
+	if (mode == FT_RECOMPACT_RELOCATE)
 		ft_pub_rec_add(rec, old_node_flag_ptr, new_node_flag);
 	else
 		rcu_assign_pointer(*old_node_flag_ptr, new_node_flag);
@@ -1131,13 +1136,14 @@ end:
  * false for the ordinary published-node case.
  */
 static
-int ft_node_set_nth(struct cds_ft *ft,
+int ft_node_set_nth_rec(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag, uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
 		struct cds_ft_inode **old_node_ret,
 		struct cds_ft_metadata *metadata,
 		unsigned int node_depth,
-		bool cluster_leaf)
+		bool cluster_leaf,
+		struct ft_pub_rec *rec)
 {
 	int ret;
 	unsigned int type_index;
@@ -1199,14 +1205,14 @@ int ft_node_set_nth(struct cds_ft *ft,
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
 					old_node_ret, false, node_depth, cluster_leaf,
-					NULL);
+					rec);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
 					old_node_ret, false, node_depth, cluster_leaf,
-					NULL);
+					rec);
 		break;
 	}
 	if (ret == 0)
@@ -1215,6 +1221,26 @@ int ft_node_set_nth(struct cds_ft *ft,
 			(unsigned int) node_depth, (uint8_t) n,
 			(const void *) child_node_flag);
 	return ret;
+}
+
+/*
+ * The ordinary published-node set_nth: a build-invisible or non-relocating
+ * publish with no SKIP_X-dual to fuse, so it passes @rec == NULL.  The live
+ * one-commit insert reserve (ft_attach_node) calls ft_node_set_nth_rec directly
+ * with its commit rec so a recompact-relocation's compressed-parent SKIP_X dual
+ * flips atomically with the forward publish.
+ */
+static
+int ft_node_set_nth(struct cds_ft *ft,
+		struct cds_ft_inode_flag **node_flag, uint8_t n,
+		struct cds_ft_inode_flag *child_node_flag,
+		struct cds_ft_inode **old_node_ret,
+		struct cds_ft_metadata *metadata,
+		unsigned int node_depth,
+		bool cluster_leaf)
+{
+	return ft_node_set_nth_rec(ft, node_flag, n, child_node_flag,
+			old_node_ret, metadata, node_depth, cluster_leaf, NULL);
 }
 
 /*
