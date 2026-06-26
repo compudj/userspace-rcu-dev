@@ -799,6 +799,22 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
 		/*
+		 * Pre-reserve the cross-trie dual root-swap txn while both tries
+		 * are still pristine (the swap is the op's sole reader-visible
+		 * change, so this is the abort boundary).  The dual always flips
+		 * both roots, so it is always multi-edge even list-off -- it cannot
+		 * reduce to a lone store.  OOM here aborts cleanly (free the fresh
+		 * root, both tries untouched).
+		 */
+		struct urcu_flip_txn *dual_txn = ft_flip_txn_create_bounded(
+			FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES);
+
+		if (!dual_txn) {
+			free_cds_ft_node_unpublished(dst_ft, fresh_root);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+
+		/*
 		 * Root-level graft: the source's root becomes the
 		 * destination's root with no parent-pointer change
 		 * (both are root positions with parent == NULL).  No
@@ -849,7 +865,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 				.tail_old = src_tail, .tail_new = NULL,
 			};
 
-			ft_root_list_swap_publish_dual(&appear, &disappear);
+			ft_root_list_swap_publish_dual(dual_txn, &appear,
+				&disappear);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);
@@ -1389,7 +1406,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				.tail_old = st, .tail_new = dt,
 			};
 
-			ft_root_list_swap_publish_dual(&dst_side, &swap_side);
+			ft_root_list_swap_publish_dual(NULL, &dst_side, &swap_side);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);

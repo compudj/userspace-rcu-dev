@@ -444,12 +444,14 @@ struct ft_root_swap_side {
  * by the caller before the call (the two sides reference each other's pre-swap
  * roots/endpoints).
  */
+#define FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES	6	/* 2 roots + 2x head/tail */
 static
-void ft_root_list_swap_publish_dual(const struct ft_root_swap_side *a,
+void ft_root_list_swap_publish_dual(struct urcu_flip_txn *txn,
+		const struct ft_root_swap_side *a,
 		const struct ft_root_swap_side *b)
 {
 	const struct ft_root_swap_side *sides[2] = { a, b };
-	struct ft_ord_cell_edge edges[6];	/* 2 roots + 2x head/tail */
+	struct ft_ord_cell_edge edges[FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES];
 	unsigned int s, n = 0;
 
 	for (s = 0; s < 2; s++) {
@@ -466,7 +468,16 @@ void ft_root_list_swap_publish_dual(const struct ft_root_swap_side *a,
 					r->tail_old, r->tail_new, edges, n);
 		}
 	}
-	ft_ord_cell_flip(a->ft, edges, n);
+	/*
+	 * @txn non-NULL: a caller-PRE-RESERVED bounded txn committed infallibly.
+	 * @txn NULL: the transitional self-allocating flip for callers not yet
+	 * migrated.  Both roots always flip, so this commit is always multi-edge
+	 * (>= 2) even with the ordered list off.
+	 */
+	if (txn)
+		ft_ord_cell_flip_into(a->ft, txn, edges, n);
+	else
+		ft_ord_cell_flip(a->ft, edges, n);
 }
 
 /*
