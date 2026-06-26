@@ -606,7 +606,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	 * newptr == delete: ft_set_parent is a no-op.)
 	 */
 	ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
-	rcu_assign_pointer(*node_flag_ptr, newptr);
+	ft_node_child_edge_flip(ft, node_flag_ptr, *node_flag_ptr, newptr);
 	if (!newptr)
 		metadata->nr_child--;
 	dbg_printf("popcount replace ptr: %u child, metadata: %u child, for node %p newptr %p\n",
@@ -661,7 +661,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	/* Parent-first: wire the back-pointer before the forward publish,
 	 * past the -EFBIG recompaction check (see popcount variant). */
 	ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
-	rcu_assign_pointer(*node_flag_ptr, newptr);
+	ft_node_child_edge_flip(ft, node_flag_ptr, *node_flag_ptr, newptr);
 	if (!newptr) {
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
 

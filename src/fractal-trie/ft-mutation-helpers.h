@@ -412,6 +412,35 @@ void ft_chain_next_flip(struct cds_ft *ft, struct cds_ft_node **slot,
 }
 
 /*
+ * Publish an in-place node child-slot replacement (@slot transitions @old ->
+ * @new) as a single-edge flip descriptor.  This is the non-fused (pub == NULL)
+ * arm of ft_node_replace_ptr -- a key-disappearing leaf delete (@new == NULL) or
+ * an external promote (@new == the chain head) whose structural commit does NOT
+ * fuse with an ordered-list cell unsplice (the fused, pub-armed path rides
+ * ft_remove_one_commit's flip instead; this arm is reached for non-head removals
+ * and every ordered-list-OFF delete).  A lone edge commits as one release store
+ * -- byte-identical to a bare rcu_assign_pointer -- captured as a {slot, old,
+ * new} descriptor so a future multi-writer MCAS covers the child slot uniformly
+ * (a bare store would discard @old and sit outside the descriptor protocol, yet
+ * the slot can be in a concurrent writer's word-set).
+ */
+static
+void ft_node_child_edge_flip(struct cds_ft *ft,
+		struct cds_ft_inode_flag **slot,
+		struct cds_ft_inode_flag *old,
+		struct cds_ft_inode_flag *new)
+{
+	struct ft_ord_cell_edge edge = {
+		.slot = (struct ft_ord_cell **) slot,
+		.old_target = (struct ft_ord_cell *) old,
+		.new_target = (struct ft_ord_cell *) new,
+	};
+
+	(void) ft;	/* a lone edge commits on an on-stack txn (no reclaim) */
+	ft_ord_cell_flip_one(&edge);
+}
+
+/*
  * One side of a two-trie root swap: a root slot transition plus (when the group
  * runs an ordered list) the trie's head/tail endpoint transfer.  The head/tail
  * fields are ignored when the group's ordered list is off.
