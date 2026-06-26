@@ -71,11 +71,12 @@
  * ----------
  * Writers must be mutually excluded (as with cds_list_*_rcu).  Each mutator
  * drives a two-edge urcu_flip_txn (<urcu/flip-latch.h>): it records the
- * forward and the backward edge, commits them as one atomic flip, and
- * reclaims the transaction after a grace period via a caller-supplied
- * call_rcu (the flavor-appropriate one), keeping this header
- * RCU-flavor-agnostic.  A mutator returns 0 on success, or -1 if the
- * transaction could not be allocated (the list is left unchanged).
+ * forward and the backward edge and commits them as one atomic flip; the
+ * transaction layer then reclaims itself after a grace period through
+ * call_rcu().  Because commit() calls call_rcu() directly, include this header
+ * AFTER an RCU flavor header (e.g. <urcu-qsbr.h>) that maps call_rcu() to that
+ * flavor.  A mutator returns 0 on success, or -1 if the transaction could not
+ * be allocated (the list is left unchanged).
  */
 
 #include <stdlib.h>
@@ -111,13 +112,6 @@ void cds_bidir_list_init(struct cds_bidir_list_head *head)
 	head->next = head;
 	head->prev = head;
 }
-
-/*
- * Reclaim domain hook: the flavor's call_rcu (e.g. urcu/urcu-memb.h's
- * call_rcu).  Used only to free the per-operation proxy block.
- */
-typedef void (*cds_bidir_list_call_rcu_fn)(struct rcu_head *head,
-		void (*func)(struct rcu_head *head));
 
 /*
  * Proxy tagging: a slot value with bit 0 set is a tagged
@@ -182,12 +176,17 @@ int cds_bidir_list_empty(struct cds_bidir_list_head *head)
  * commit -- which auto-installs the proxies (selector 0 => readers still
  * resolve to old, so install is reader-transparent), flips the shared
  * selector 0 -> 1 (the one reader-visible instant, switching both edges to
- * new together), and settles each slot to its direct new target.  The
- * transaction is reclaimed after a grace period.
+ * new together), and settles each slot to its direct new target.  commit()
+ * owns reclaim and defers the transaction through call_rcu() after a grace
+ * period.
  *
  * A list op always transacts exactly two edges, so the txn's growable chunk
  * list, single-edge fast path and abort path are unused here; the only cost
  * over a bespoke fixed proxy block is the txn's second small allocation.
+ *
+ * Returns 0 on success, -1 if the transaction could not be allocated.  An OOM
+ * in reserve()/record() is sticky and surfaces as commit()'s MEMORY_ERROR, so
+ * only create() and the final commit status need checking.
  */
 static inline
 int cds_bidir_list_flip2(
@@ -196,34 +195,28 @@ int cds_bidir_list_flip2(
 		struct cds_bidir_list_head *new0,
 		struct cds_bidir_list_head **slot1,
 		struct cds_bidir_list_head *old1,
-		struct cds_bidir_list_head *new1,
-		cds_bidir_list_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_head *new1)
 {
 	struct urcu_flip_txn *txn;
 
 	txn = urcu_flip_txn_create(cds_bidir_list_proxy_tag);
 	if (caa_unlikely(!txn))
 		return -1;
-	if (caa_unlikely(!urcu_flip_txn_reserve(txn, 2))) {
-		urcu_flip_txn_destroy(txn);
-		return -1;
-	}
-	/* Reserved for two edges above, so neither record can fail. */
+	(void) urcu_flip_txn_reserve(txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_flip_txn_record(txn, (void **) slot0, old0, new0);
 	(void) urcu_flip_txn_record(txn, (void **) slot1, old1, new1);
-	/* Two edges => commit auto-installs, flips, settles, and owes a GP. */
-	if (urcu_flip_txn_commit(txn))
-		call_rcu_fn(&txn->rcu_head, urcu_flip_txn_free_rcu);
-	else
-		urcu_flip_txn_destroy(txn);	/* unreachable for two edges */
-	return 0;
+	/*
+	 * Two edges => commit auto-installs, flips, settles, and owns reclaim
+	 * (call_rcu).  It always consumes the txn; MEMORY_ERROR (< 0) means an
+	 * alloc failed and nothing was published.
+	 */
+	return urcu_flip_txn_commit(txn) < 0 ? -1 : 0;
 }
 
 /* Insert @newp just after @pos (between @pos and its successor). */
 static inline
 int cds_bidir_list_add_after_rcu(struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *pos,
-		cds_bidir_list_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_head *pos)
 {
 	struct cds_bidir_list_head *next = pos->next;
 
@@ -233,14 +226,13 @@ int cds_bidir_list_add_after_rcu(struct cds_bidir_list_head *newp,
 
 	/* pos->next: next -> newp ; next->prev: pos -> newp */
 	return cds_bidir_list_flip2(&pos->next, next, newp,
-			&next->prev, pos, newp, call_rcu_fn);
+			&next->prev, pos, newp);
 }
 
 /* Insert @newp just before @pos (between @pos's predecessor and @pos). */
 static inline
 int cds_bidir_list_add_before_rcu(struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *pos,
-		cds_bidir_list_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_head *pos)
 {
 	struct cds_bidir_list_head *prev = pos->prev;
 
@@ -249,25 +241,23 @@ int cds_bidir_list_add_before_rcu(struct cds_bidir_list_head *newp,
 
 	/* prev->next: pos -> newp ; pos->prev: prev -> newp */
 	return cds_bidir_list_flip2(&prev->next, pos, newp,
-			&pos->prev, prev, newp, call_rcu_fn);
+			&pos->prev, prev, newp);
 }
 
 /* Add @newp at the head of the list (just after @head). */
 static inline
 int cds_bidir_list_add_rcu(struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *head,
-		cds_bidir_list_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_head *head)
 {
-	return cds_bidir_list_add_after_rcu(newp, head, call_rcu_fn);
+	return cds_bidir_list_add_after_rcu(newp, head);
 }
 
 /* Add @newp at the tail of the list (just before @head). */
 static inline
 int cds_bidir_list_add_tail_rcu(struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *head,
-		cds_bidir_list_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_head *head)
 {
-	return cds_bidir_list_add_before_rcu(newp, head, call_rcu_fn);
+	return cds_bidir_list_add_before_rcu(newp, head);
 }
 
 /*
@@ -276,22 +266,20 @@ int cds_bidir_list_add_tail_rcu(struct cds_bidir_list_head *newp,
  * @elem after a grace period.
  */
 static inline
-int cds_bidir_list_del_rcu(struct cds_bidir_list_head *elem,
-		cds_bidir_list_call_rcu_fn call_rcu_fn)
+int cds_bidir_list_del_rcu(struct cds_bidir_list_head *elem)
 {
 	struct cds_bidir_list_head *prev = elem->prev;
 	struct cds_bidir_list_head *next = elem->next;
 
 	/* prev->next: elem -> next ; next->prev: elem -> prev */
 	return cds_bidir_list_flip2(&prev->next, elem, next,
-			&next->prev, elem, prev, call_rcu_fn);
+			&next->prev, elem, prev);
 }
 
 /* Replace @old with @newp atomically with respect to RCU readers. */
 static inline
 int cds_bidir_list_replace_rcu(struct cds_bidir_list_head *old,
-		struct cds_bidir_list_head *newp,
-		cds_bidir_list_call_rcu_fn call_rcu_fn)
+		struct cds_bidir_list_head *newp)
 {
 	struct cds_bidir_list_head *prev = old->prev;
 	struct cds_bidir_list_head *next = old->next;
@@ -301,7 +289,7 @@ int cds_bidir_list_replace_rcu(struct cds_bidir_list_head *old,
 
 	/* prev->next: old -> newp ; next->prev: old -> newp */
 	return cds_bidir_list_flip2(&prev->next, old, newp,
-			&next->prev, old, newp, call_rcu_fn);
+			&next->prev, old, newp);
 }
 
 #define cds_bidir_list_entry(ptr, type, member) \

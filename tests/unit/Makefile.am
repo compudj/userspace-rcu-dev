@@ -126,7 +126,7 @@ test_uatomic_cxx_SOURCES = test_uatomic_cxx.cpp
 test_uatomic_cxx_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_flip_latch_SOURCES = test_flip_latch.c
-test_flip_latch_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
+test_flip_latch_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_flip_latch_lockfree_SOURCES = test_flip_latch_lockfree.c
 test_flip_latch_lockfree_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)

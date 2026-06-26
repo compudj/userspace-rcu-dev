@@ -233,9 +233,9 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 		urcu_flip_lf_txn_store(&txn, (void **) &succ->prev, pos, newp);
 		ret = urcu_flip_lf_txn_commit(&txn);
 		urcu_flip_lf_txn_end(&txn);
-		/* ret == 0: a neighbour changed -- re-read, retry, maybe -ENOENT */
-	} while (ret == 0);
-	return ret > 0 ? 0 : ret;		/* 0 committed, -ENOMEM on OOM */
+		/* ABORT: a neighbour changed -- re-read, retry, maybe -ENOENT */
+	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+	return ret < 0 ? -ENOMEM : 0;		/* OK committed, -ENOMEM on OOM */
 }
 
 /*
@@ -276,8 +276,8 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 		urcu_flip_lf_txn_store(&txn, (void **) &pos->prev, prev, newp);
 		ret = urcu_flip_lf_txn_commit(&txn);
 		urcu_flip_lf_txn_end(&txn);
-	} while (ret == 0);
-	return ret > 0 ? 0 : ret;		/* 0 committed, -ENOMEM on OOM */
+	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+	return ret < 0 ? -ENOMEM : 0;		/* OK committed, -ENOMEM on OOM */
 }
 
 /* Add @newp at the head (just after @head).  Always succeeds (head is immortal). */
@@ -337,9 +337,9 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem)
 		urcu_flip_lf_txn_store(&txn, (void **) &next->prev, elem, prev);
 		ret = urcu_flip_lf_txn_commit(&txn);
 		urcu_flip_lf_txn_end(&txn);
-		/* ret == 0: neighbours changed -- retry, maybe find it deleted */
-	} while (ret == 0);
-	return ret > 0 ? 1 : ret;		/* 1 removed by this call, -ENOMEM */
+		/* ABORT: neighbours changed -- retry, maybe find it deleted */
+	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+	return ret < 0 ? -ENOMEM : 1;		/* 1 removed by this call, -ENOMEM */
 }
 
 #define cds_bidir_list_lf_entry(ptr, type, member) \

@@ -115,9 +115,9 @@ static void sorted_insert(int key)
 		ret = urcu_flip_lf_txn_commit(&txn);
 		urcu_flip_lf_txn_end(&txn);
 		if (ret < 0)
-			abort();		/* -ENOMEM */
+			abort();		/* MEMORY_ERROR */
 		/* ret == 0 (position shifted / anchor gone): re-find and retry */
-	} while (ret == 0);
+	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
 }
 
 /* Delete the first node with key == @key, if present. */

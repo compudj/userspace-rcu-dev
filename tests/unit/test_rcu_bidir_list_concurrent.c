@@ -138,7 +138,7 @@ static void sorted_insert(struct bl_node *n, struct bl_node **slot)
 			break;
 		}
 	}
-	if (cds_bidir_list_add_before_rcu(&n->node, succ, call_rcu))
+	if (cds_bidir_list_add_before_rcu(&n->node, succ))
 		abort();
 	slot[n->key] = n;
 }
@@ -175,15 +175,14 @@ int main(void)
 			struct bl_node *fresh = bl_node_new(k);
 
 			/* replace keeps the same key, so order is preserved */
-			if (cds_bidir_list_replace_rcu(&old->node, &fresh->node,
-					call_rcu))
+			if (cds_bidir_list_replace_rcu(&old->node, &fresh->node))
 				abort();
 			call_rcu(&old->rcu_head, bl_node_free);
 			slot[k] = fresh;
 		} else {
 			struct bl_node *old = slot[k];
 
-			if (cds_bidir_list_del_rcu(&old->node, call_rcu))
+			if (cds_bidir_list_del_rcu(&old->node))
 				abort();
 			call_rcu(&old->rcu_head, bl_node_free);
 			slot[k] = NULL;
@@ -199,7 +198,7 @@ int main(void)
 	/* Drain the remaining live nodes. */
 	for (k = 1; k <= KEY_MAX; k++) {
 		if (slot[k]) {
-			if (cds_bidir_list_del_rcu(&slot[k]->node, call_rcu))
+			if (cds_bidir_list_del_rcu(&slot[k]->node))
 				abort();
 			call_rcu(&slot[k]->rcu_head, bl_node_free);
 			slot[k] = NULL;

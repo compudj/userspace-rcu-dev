@@ -131,7 +131,7 @@ static void destroy_list(struct cds_bidir_list_head *head)
 		struct cds_bidir_list_head *p = cds_bidir_list_next_rcu(head);
 		struct bl_node *n = caa_container_of(p, struct bl_node, node);
 
-		cds_bidir_list_del_rcu(p, call_rcu);
+		cds_bidir_list_del_rcu(p);
 		call_rcu(&n->rcu_head, bl_node_free);
 	}
 }
@@ -154,7 +154,7 @@ static void test_add_head(void)
 	const int want_rev[3] = { 1, 2, 3 };
 
 	for (i = 1; i <= 3; i++)
-		cds_bidir_list_add_rcu(&bl_node_new(i)->node, &head, call_rcu);
+		cds_bidir_list_add_rcu(&bl_node_new(i)->node, &head);
 
 	n = collect_forward(&head, fwd, 3);
 	ok(n == 3 && arr_eq(fwd, want_fwd, 3),
@@ -173,8 +173,7 @@ static void test_add_tail(void)
 	const int want_rev[3] = { 3, 2, 1 };
 
 	for (i = 1; i <= 3; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(i)->node, &head,
-				call_rcu);
+		cds_bidir_list_add_tail_rcu(&bl_node_new(i)->node, &head);
 
 	n = collect_forward(&head, fwd, 3);
 	ok(n == 3 && arr_eq(fwd, want_fwd, 3),
@@ -192,8 +191,7 @@ static void test_coherence(void)
 	int i, fwd[4], rev[4], revmir[4], n;
 
 	for (i = 0; i < 4; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head,
-				call_rcu);
+		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
 
 	ok(check_inverses(&head), "next/prev are mutual inverses around the ring");
 
@@ -217,11 +215,10 @@ static void test_del_middle(void)
 	int i, fwd[4], rev[4], n;
 
 	for (i = 0; i < 5; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head,
-				call_rcu);
+		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
 	mid = find_key(&head, 3);
 	midn = caa_container_of(mid, struct bl_node, node);
-	cds_bidir_list_del_rcu(mid, call_rcu);
+	cds_bidir_list_del_rcu(mid);
 	call_rcu(&midn->rcu_head, bl_node_free);
 
 	n = collect_forward(&head, fwd, 4);
@@ -244,15 +241,14 @@ static void test_del_ends(void)
 	int i, fwd[2], cnt;
 
 	for (i = 0; i < 4; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head,
-				call_rcu);
+		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
 	p = find_key(&head, 1);				/* delete head element */
 	n = caa_container_of(p, struct bl_node, node);
-	cds_bidir_list_del_rcu(p, call_rcu);
+	cds_bidir_list_del_rcu(p);
 	call_rcu(&n->rcu_head, bl_node_free);
 	p = find_key(&head, 4);				/* delete tail element */
 	n = caa_container_of(p, struct bl_node, node);
-	cds_bidir_list_del_rcu(p, call_rcu);
+	cds_bidir_list_del_rcu(p);
 	call_rcu(&n->rcu_head, bl_node_free);
 
 	cnt = collect_forward(&head, fwd, 2);
@@ -273,11 +269,10 @@ static void test_replace(void)
 	int i, fwd[3], rev[3], n;
 
 	for (i = 0; i < 3; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head,
-				call_rcu);
+		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
 	old = find_key(&head, 2);
 	oldn = caa_container_of(old, struct bl_node, node);
-	cds_bidir_list_replace_rcu(old, &bl_node_new(22)->node, call_rcu);
+	cds_bidir_list_replace_rcu(old, &bl_node_new(22)->node);
 	call_rcu(&oldn->rcu_head, bl_node_free);
 
 	n = collect_forward(&head, fwd, 3);
@@ -308,8 +303,8 @@ static void test_proxy_phases(void)
 	struct cds_bidir_list_head *A = &a->node, *B = &b->node;
 	struct urcu_flip_txn *txn;
 
-	cds_bidir_list_add_tail_rcu(A, &head, call_rcu);
-	cds_bidir_list_add_tail_rcu(B, &head, call_rcu);
+	cds_bidir_list_add_tail_rcu(A, &head);
+	cds_bidir_list_add_tail_rcu(B, &head);
 
 	/*
 	 * Delete A through the transaction by hand, pausing between the
@@ -332,6 +327,7 @@ static void test_proxy_phases(void)
 		"install: backward resolves to old (A still present)");
 	rcu_read_unlock();
 
+	/* Explicit install parked proxies, so commit owns reclaim (call_rcu). */
 	(void) urcu_flip_txn_commit(txn);	/* one flip switches both edges */
 
 	rcu_read_lock();
@@ -344,7 +340,6 @@ static void test_proxy_phases(void)
 	ok(head.next == B && B->prev == &head,
 		"settle: slots hold the direct new targets");
 
-	call_rcu(&txn->rcu_head, urcu_flip_txn_free_rcu);
 	call_rcu(&a->rcu_head, bl_node_free);		/* A is now a ghost */
 	destroy_list(&head);				/* frees B */
 }

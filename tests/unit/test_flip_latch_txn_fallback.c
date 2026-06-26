@@ -115,8 +115,8 @@ static void *narrow_worker(void *arg)
 			ret = urcu_flip_lf_txn_commit(&tx);
 			urcu_flip_lf_txn_end(&tx);
 			if (ret < 0)
-				abort();		/* -ENOMEM */
-		} while (ret == 0);
+				abort();		/* MEMORY_ERROR */
+		} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
 
 		if (tx.retry > wa->max_retry)
 			wa->max_retry = tx.retry;
@@ -163,8 +163,8 @@ static void *wide_worker(void *arg)
 			ret = urcu_flip_lf_txn_commit(&tx);
 			urcu_flip_lf_txn_end(&tx);
 			if (ret < 0)
-				abort();		/* -ENOMEM */
-		} while (ret == 0);
+				abort();		/* MEMORY_ERROR */
+		} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
 
 		if (tx.retry > wa->max_retry)
 			wa->max_retry = tx.retry;

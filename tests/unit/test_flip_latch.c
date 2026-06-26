@@ -7,12 +7,25 @@
  * flip-latch, focusing on the commit() shortcuts -- the single-edge fast path
  * (no proxy at all) and auto-install -- the explicit-install caveat, and the
  * record-array realloc-grow path.
+ *
+ * commit() owns reclaim: it frees the txn at once on the single-edge / empty
+ * paths and defers it through call_rcu() once proxies are parked.  The test
+ * therefore runs under an RCU flavor (memb) and drains the deferred frees with
+ * rcu_barrier() before exit.
  */
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include <stdbool.h>
 
-#include "tap.h"
+#include <urcu/compiler.h>
+#include <urcu-qsbr.h>
+#include <urcu-call-rcu.h>
 #include <urcu/flip-latch.h>
+
+#include "tap.h"
 
 #define NR_TESTS 12
 
@@ -37,67 +50,72 @@ static void *resolve(void *v)
 
 int main(void)
 {
+	int err;
+
+	err = create_all_cpu_call_rcu_data(0);
+	if (err)
+		diag("Per-CPU call_rcu() workers unavailable, using default.");
+
+	rcu_register_thread();
 	plan_tests(NR_TESTS);
 
 	/*
 	 * 1. Single-edge fast path: a commit reached in PREPARE with exactly one
 	 * recorded edge stores the new target directly -- no proxy is ever
-	 * installed, so no grace period is owed.
+	 * installed, so commit frees the txn at once (no grace period).
 	 */
 	{
 		void *slot = (void *) 0x100;
 		struct urcu_flip_txn *t = urcu_flip_txn_create(test_tag);
-		bool gp;
+		enum urcu_flip_txn_status st;
 
 		ok(t && urcu_flip_txn_reserve(t, 4), "create + reserve");
 		urcu_flip_txn_record(t, &slot, (void *) 0x100, (void *) 0x200);
-		gp = urcu_flip_txn_commit(t);		/* no explicit install */
-		ok(!gp, "single-edge commit owes no grace period");
+		st = urcu_flip_txn_commit(t);		/* single edge: frees now */
+		ok(st == URCU_FLIP_TXN_STATUS_OK, "single-edge commit returns OK");
 		ok(slot == (void *) 0x200, "single-edge slot holds the new target directly");
 		ok(!is_proxy(slot), "single-edge never parks a proxy");
-		urcu_flip_txn_destroy(t);
 	}
 
 	/*
 	 * 2. Multi-edge auto-install: a commit reached in PREPARE with two or more
 	 * edges installs every proxy first, then flips the group; all slots settle
-	 * to new and a grace period is owed.
+	 * to new and commit defers the txn through call_rcu.
 	 */
 	{
 		void *s1 = (void *) 0x10, *s2 = (void *) 0x20, *s3 = (void *) 0x30;
 		struct urcu_flip_txn *t = urcu_flip_txn_create(test_tag);
-		bool gp;
+		enum urcu_flip_txn_status st;
 
 		urcu_flip_txn_reserve(t, 4);
 		urcu_flip_txn_record(t, &s1, (void *) 0x10, (void *) 0x11);
 		urcu_flip_txn_record(t, &s2, (void *) 0x20, (void *) 0x21);
 		urcu_flip_txn_record(t, &s3, (void *) 0x30, (void *) 0x31);
-		gp = urcu_flip_txn_commit(t);		/* no explicit install */
-		ok(gp, "multi-edge commit owes a grace period");
+		st = urcu_flip_txn_commit(t);		/* multi-edge: parks proxies */
+		ok(st == URCU_FLIP_TXN_STATUS_OK, "multi-edge commit returns OK");
 		ok(s1 == (void *) 0x11 && s2 == (void *) 0x21 &&
 			s3 == (void *) 0x31, "multi-edge slots all settled to new");
-		urcu_flip_txn_destroy(t);
 	}
 
 	/*
 	 * 3. Explicit install + single edge: once install() parks the proxy a
 	 * reader may already hold it, so commit MUST flip the group (the fast path
-	 * is unavailable) -- a grace period is owed.
+	 * is unavailable) and defer reclaim through call_rcu.
 	 */
 	{
 		void *slot = (void *) 0x100;
 		struct urcu_flip_txn *t = urcu_flip_txn_create(test_tag);
-		bool gp;
+		enum urcu_flip_txn_status st;
 
 		urcu_flip_txn_reserve(t, 4);
 		urcu_flip_txn_record(t, &slot, (void *) 0x100, (void *) 0x200);
 		urcu_flip_txn_install(t);
 		ok(is_proxy(slot) && resolve(slot) == (void *) 0x100,
 			"explicit install parks a proxy resolving to old");
-		gp = urcu_flip_txn_commit(t);
-		ok(gp, "explicitly-installed single edge still owes a grace period");
+		st = urcu_flip_txn_commit(t);
+		ok(st == URCU_FLIP_TXN_STATUS_OK,
+			"explicitly-installed single edge commits OK");
 		ok(slot == (void *) 0x200, "explicitly-installed slot settles to new");
-		urcu_flip_txn_destroy(t);
 	}
 
 	/*
@@ -109,7 +127,8 @@ int main(void)
 		enum { NR_EDGES = 3 * URCU_FLIP_TXN_CAP + 1 };
 		void *slots[NR_EDGES];
 		struct urcu_flip_txn *t = urcu_flip_txn_create(test_tag);
-		bool gp, all_recorded = true, all_new = true;
+		enum urcu_flip_txn_status st;
+		bool all_recorded = true, all_new = true;
 		unsigned int i;
 
 		for (i = 0; i < NR_EDGES; i++) {
@@ -119,14 +138,17 @@ int main(void)
 				all_recorded = false;
 		}
 		ok(all_recorded, "record realloc-grows past the initial capacity");
-		gp = urcu_flip_txn_commit(t);
-		ok(gp, "realloc-grown multi-edge commit owes a grace period");
+		st = urcu_flip_txn_commit(t);
+		ok(st == URCU_FLIP_TXN_STATUS_OK,
+			"realloc-grown multi-edge commit returns OK");
 		for (i = 0; i < NR_EDGES; i++)
 			if (slots[i] != (void *) ((((unsigned long) (i + 1)) << 8) | 0x10))
 				all_new = false;
 		ok(all_new, "all realloc-grown slots settled to new");
-		urcu_flip_txn_destroy(t);
 	}
 
+	rcu_barrier();			/* drain deferred txn reclaim callbacks */
+	rcu_unregister_thread();
+	free_all_cpu_call_rcu_data();
 	return exit_status();
 }
