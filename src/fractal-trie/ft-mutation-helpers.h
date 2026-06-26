@@ -698,12 +698,18 @@ int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 }
 
 /*
- * Transitional degraded flip for callers not yet migrated to ft_ord_cell_flip_try
- * (abortable) or ft_ord_cell_flip_into (pre-reserved): on a multi-edge txn-alloc
- * OOM, sequential bare stores.  A bidirectional reader between two stores can
- * observe one neighbour's edge updated and the mirror not yet -- transient and
- * self-healing, never a dangling pointer.  This is the last bare-store escape
- * hatch, deleted once every caller has migrated.
+ * Transitional degraded flip: on a multi-edge txn-alloc OOM, sequential bare
+ * stores.  A bidirectional reader between two stores can observe one neighbour's
+ * edge updated and the mirror not yet -- transient and self-healing, never a
+ * dangling pointer.  This is the last bare-store escape hatch.
+ *
+ * Every mutation-path caller has migrated to ft_ord_cell_flip_try (abortable) or
+ * ft_ord_cell_flip_into (pre-reserved).  The SOLE remaining caller is the
+ * compaction cell-swap (ft_ord_cell_swap below, reached only from
+ * ft-compact.h): migrating compaction's cell swap to a pre-reserved /
+ * descriptor commit is a separate MCAS-readiness decision (readiness §6), and
+ * this wrapper -- with its forward declaration above -- is deleted once that
+ * decision lands and compaction stops using it.
  */
 static
 void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
@@ -862,11 +868,17 @@ void ft_ord_cell_unsplice(struct cds_ft *ft, struct urcu_flip_txn *txn,
 }
 
 /*
- * Replace @old_cell with @new_cell at the same list position (insert_replace:
- * a fresh head's cell takes the replaced head's cell slot).  @new_cell
+ * Replace @old_cell with @new_cell at the same list position.  @new_cell
  * inherits @old_cell's neighbours; @old_cell keeps its links for parked
  * readers until its deferred free.  O(1): reuses @old_cell's neighbours, no
  * relational descent.
+ *
+ * The compaction cell relocation (ft-compact.h) is the sole caller, and hence
+ * the sole remaining ft_ord_cell_flip (transitional bare-store) caller -- every
+ * other commit primitive now uses a pre-reserved (ft_ord_cell_flip_into) or
+ * abortable (ft_ord_cell_flip_try) commit.  Migrating this swap to a
+ * pre-reserved txn is the separate MCAS-readiness decision that unblocks
+ * deleting ft_ord_cell_flip (readiness §6).
  */
 static
 void ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
