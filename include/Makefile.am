@@ -32,6 +32,7 @@ nobase_include_HEADERS = \
 	urcu/flavor.h \
 	urcu/flip-latch.h \
 	urcu/flip-latch-lockfree.h \
+	urcu/flip-latch-status.h \
 	urcu/flip-latch-txn-lockfree.h \
 	urcu/futex.h \
 	urcu/hlist.h \
