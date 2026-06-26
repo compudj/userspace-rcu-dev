@@ -1365,6 +1365,23 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *tmp = dst_ft->root;
 		size_t dm;
 		bool dst_was_exclusive = dst_ft->exclusive;
+		struct urcu_flip_txn *dual_txn;
+
+		/*
+		 * PRE-RESERVE the cross-trie dual root-swap txn before the drain
+		 * below: the swap is failure-free post-drain, so it commits through
+		 * this txn (ft_ord_cell_flip_into).  OOM here aborts cleanly -- the
+		 * whole-trie swap has no prior fallible state, both tries pristine.
+		 * The dual always flips both roots, so it is multi-edge even list
+		 * off (never a lone store).
+		 */
+		dual_txn = ft_flip_txn_create_bounded(
+			FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES);
+		if (!dual_txn) {
+			FT_TP(graft_swap_exit,
+				(int) CDS_FT_STATUS_MEMORY_ERROR);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
 
 		/*
 		 * Drain concurrent readers of either side before
@@ -1406,7 +1423,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				.tail_old = st, .tail_new = dt,
 			};
 
-			ft_root_list_swap_publish_dual(NULL, &dst_side, &swap_side);
+			ft_root_list_swap_publish_dual(dual_txn, &dst_side,
+				&swap_side);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);
