@@ -257,7 +257,36 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 		*oom = true;
 		return old;
 	}
-	rcu_assign_pointer(head->prev, ft_ord_cell_flag(new_cell));
+	/*
+	 * Retarget the relocated head's node->cell back-link to @new_cell.  This
+	 * is the SECOND store of the cell relocation -- ft_ord_cell_swap already
+	 * moved the ordered-list neighbour links in its own flip -- so by shape it
+	 * "should" fuse with that swap.  It cannot: head->prev is read RAW by
+	 * ft_resolve_head_prev / ft_ord_cell_cursor, so a parked proxy there (which
+	 * a multi-edge flip installs during settle) would be mis-masked as a cell.
+	 * It need not: @old and @new_cell are observationally IDENTICAL in every
+	 * field a reader reaches through this back-link -- node, parent and
+	 * incoming_byte are copied above, and ft_ord_cell_swap points new_cell's
+	 * ord_prev/ord_next at @old's pred/succ while leaving @old's own links
+	 * intact (both cells still point at the same pred/succ).  So a reader
+	 * resolving the old-XOR-new back-link mid-relocation sees the same node,
+	 * parent and predecessor/successor: the inter-store window is
+	 * observationally empty.  Commit it as a lone-edge flip -- one release
+	 * store, no proxy, byte-identical to the bare rcu_assign_pointer it
+	 * replaces -- captured as a {slot, old, new} descriptor so a future
+	 * multi-writer MCAS covers head->prev uniformly (it can be in a concurrent
+	 * head-splice / head-promote writer's word-set).
+	 */
+	{
+		struct ft_ord_cell_edge edge = {
+			.slot = (struct ft_ord_cell **) &head->prev,
+			.old_target = (struct ft_ord_cell *) head->prev,
+			.new_target = (struct ft_ord_cell *)
+				ft_ord_cell_flag(new_cell),
+		};
+
+		ft_ord_cell_flip_one(&edge);
+	}
 	/* Always-deferred free: see ft_compact_relocate_at. */
 	if (ft_debug_counters())
 		uatomic_inc(&ft->group->nr_cells_freed);
