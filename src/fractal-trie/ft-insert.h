@@ -1166,7 +1166,14 @@ int ft_attach_node(struct cds_ft *ft,
 
 		/* We need to use set_nth on the previous level. */
 		iter_dest_node_flag = attach_node_flag;
-		if (ic && ic->txn) {
+		/*
+		 * Every ft_attach_node caller passes a non-NULL @ic and
+		 * ft_insert_commit_arm has armed ic->txn above (an arm failure
+		 * jumps to check_error), so the one-commit txn is always present
+		 * here -- the reserved-byte publish below is unconditional.
+		 */
+		assert(ic && ic->txn);
+		{
 			struct cds_ft_inode_flag **slot_ptr = NULL;
 
 			/*
@@ -1216,22 +1223,6 @@ int ft_attach_node(struct cds_ft *ft,
 				(const void *) iter_dest_node_flag,
 				(unsigned int) (level - 1), (uint8_t) key_value,
 				(const void *) iter_node_flag);
-		} else {
-			/*
-			 * No one-commit txn (no @ic, or arm failed): store the
-			 * fresh top into key_value's slot straight away; set_nth
-			 * wires its parent back-pointer.  (Both ordered-list
-			 * states arm a txn now, so the armed branch above is the
-			 * normal insert path; this is the bulk-builder / OOM
-			 * fallback.)
-			 */
-			ret = ft_node_set_nth(ft, &iter_dest_node_flag,
-				key_value, iter_node_flag, &old_recompacted_node,
-				metadata, level - 1, false);
-			if (ret) {
-				dbg_printf("branch publish error %d\n", ret);
-				goto check_error;
-			}
 		}
 		/*
 		 * Phase 2: iter_node_flag's parent is now wired (by
