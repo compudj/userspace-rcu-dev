@@ -259,6 +259,8 @@ struct ft_remove_pub {
 
 static void ft_ord_cell_flip(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		unsigned int n);
+static void ft_ord_cell_flip_into(struct cds_ft *ft, struct urcu_flip_txn *t,
+		struct ft_ord_cell_edge *edges, unsigned int n);
 
 /*
  * Commit a single edge as a lone flip descriptor on an ON-STACK bounded txn.
@@ -330,15 +332,16 @@ unsigned int ft_ord_cell_endpoint_edge(struct ft_ord_cell **slot,
  * and friends), so a transient proxy parked here is view-resolved like any
  * other flipped slot.
  */
+#define FT_ROOT_LIST_SWAP_MAX_EDGES	3	/* root + head + tail */
 static
-void ft_root_list_swap_publish(struct cds_ft *ft,
+void ft_root_list_swap_publish(struct cds_ft *ft, struct urcu_flip_txn *txn,
 		struct cds_ft_inode_flag **struct_slot,
 		struct cds_ft_inode_flag *struct_old,
 		struct cds_ft_inode_flag *struct_new,
 		struct ft_ord_cell *head_old, struct ft_ord_cell *head_new,
 		struct ft_ord_cell *tail_old, struct ft_ord_cell *tail_new)
 {
-	struct ft_ord_cell_edge edges[3];	/* root + head + tail */
+	struct ft_ord_cell_edge edges[FT_ROOT_LIST_SWAP_MAX_EDGES];
 	unsigned int n = 0;
 
 	edges[n].slot = (struct ft_ord_cell **) struct_slot;
@@ -349,7 +352,16 @@ void ft_root_list_swap_publish(struct cds_ft *ft,
 			edges, n);
 	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, tail_old, tail_new,
 			edges, n);
-	ft_ord_cell_flip(ft, edges, n);
+	/*
+	 * @txn non-NULL: a caller-PRE-RESERVED bounded txn, committed infallibly
+	 * (ft_ord_cell_flip_into) -- the un-abortable post-drain root swap.
+	 * @txn NULL: the transitional self-allocating flip (bare-store fallback)
+	 * for callers not yet migrated.
+	 */
+	if (txn)
+		ft_ord_cell_flip_into(ft, txn, edges, n);
+	else
+		ft_ord_cell_flip(ft, edges, n);
 }
 
 /*
@@ -579,16 +591,27 @@ void ft_ord_cell_run_install(struct cds_ft *into, struct ft_ord_cell *first,
 	into->ord_cell_tail = last;
 }
 
+/* Max edges a run-detach commits: run's <=2 outer back-edges + head + tail. */
+#define FT_ORD_CELL_RUN_DETACH_MAX_EDGES	4
+
+/*
+ * Excise the run [@first_head .. @last_head] from @ft's ordered list and install
+ * it as the exclusive @into trie's whole list.  Standalone (two-commit)
+ * fallback for the rare detach shape that could not fuse the run into its
+ * structural flip; run AFTER that structural unlink is public, so un-abortable
+ * -- commit through the caller-PRE-RESERVED txn @txn (ft_ord_cell_flip_into).
+ */
 static
-void ft_ord_cell_run_detach(struct cds_ft *ft, struct cds_ft *into,
-		struct cds_ft_node *first_head, struct cds_ft_node *last_head)
+void ft_ord_cell_run_detach(struct cds_ft *ft, struct urcu_flip_txn *txn,
+		struct cds_ft *into, struct cds_ft_node *first_head,
+		struct cds_ft_node *last_head)
 {
-	struct ft_ord_cell_edge edges[4];
+	struct ft_ord_cell_edge edges[FT_ORD_CELL_RUN_DETACH_MAX_EDGES];
 	struct ft_ord_cell *first, *last;
 	unsigned int n = ft_ord_cell_run_detach_edges(ft, first_head, last_head,
 		&first, &last, edges, 0);
 
-	ft_ord_cell_flip(ft, edges, n);
+	ft_ord_cell_flip_into(ft, txn, edges, n);
 	ft_ord_cell_run_install(into, first, last);
 }
 

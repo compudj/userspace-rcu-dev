@@ -1455,7 +1455,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * flip), so the post-commit interleave still re-homes them to dst.
 		 */
 		if (ms_ord) {
-			ft_root_list_swap_publish(src_ft, &src_ft->root,
+			ft_root_list_swap_publish(src_ft, NULL, &src_ft->root,
 				src_ft->root, ft_node_flag(fresh_root, 0),
 				src_ft->ord_cell_head, NULL,
 				src_ft->ord_cell_tail, NULL);
@@ -2312,7 +2312,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * ft_graft's cross-trie empty-dst).
 		 */
 		if (dst_ft->group->ordered_list_set) {
-			ft_root_list_swap_publish(dst_ft, &dst_ft->root,
+			ft_root_list_swap_publish(dst_ft, NULL, &dst_ft->root,
 				dst_ft->root, subtree->root,
 				NULL, subtree->ord_cell_head,
 				NULL, subtree->ord_cell_tail);

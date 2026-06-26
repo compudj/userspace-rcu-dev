@@ -1036,7 +1036,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		if (dst_ft->group->ordered_list_set) {
 			graft_run_first = src_ft->ord_cell_head;
 			graft_run_last = src_ft->ord_cell_tail;
-			ft_root_list_swap_publish(src_ft, &src_ft->root,
+			ft_root_list_swap_publish(src_ft, NULL, &src_ft->root,
 				old_src_root, ft_node_flag(fresh_node, 0),
 				graft_run_first, NULL, graft_run_last, NULL);
 		} else {
@@ -1748,7 +1748,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * (List off: just the lone root edge.)
 			 */
 			if (gs_ord)
-				ft_root_list_swap_publish(swap_ft, &swap_ft->root,
+				ft_root_list_swap_publish(swap_ft, NULL, &swap_ft->root,
 					swap_ft->root, empty,
 					swap_ft->ord_cell_head, NULL,
 					swap_ft->ord_cell_tail, NULL);

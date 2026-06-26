@@ -90,11 +90,31 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 #endif
 
 		/*
+		 * Pre-reserve the root-swap flip-txn (root + head/tail) BEFORE the
+		 * swap, while @ft is still pristine and @detached owns only its own
+		 * empty root: an OOM here aborts cleanly (tear down @detached, @ft
+		 * untouched).  List off uses the lone-edge ft_root_edge_flip below
+		 * (no txn).  This is the whole-trie root detach, not a hot path.
+		 */
+		struct urcu_flip_txn *root_txn = NULL;
+
+		if (ft->group->ordered_list_set) {
+			root_txn = ft_flip_txn_create_bounded(
+				FT_ROOT_LIST_SWAP_MAX_EDGES);
+			if (!root_txn) {
+				cds_ft_destroy(detached);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+		}
+
+		/*
 		 * Allocate a fresh empty root for the source trie
 		 * before swapping.
 		 */
 		fresh_node = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
 		if (!fresh_node) {
+			if (root_txn)
+				urcu_flip_txn_destroy(root_txn);
 			cds_ft_destroy(detached);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
@@ -142,7 +162,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		if (ft->group->ordered_list_set) {
 			detached->ord_cell_head = ft->ord_cell_head;
 			detached->ord_cell_tail = ft->ord_cell_tail;
-			ft_root_list_swap_publish(ft, &ft->root,
+			ft_root_list_swap_publish(ft, root_txn, &ft->root,
 				ft->root, ft_node_flag(fresh_node, 0),
 				ft->ord_cell_head, NULL,
 				ft->ord_cell_tail, NULL);
@@ -332,6 +352,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				struct ft_detach_run run = { .armed = false };
 				struct ft_remove_pub *pubp = NULL;
 				struct ft_detach_run *runp = NULL;
+				struct urcu_flip_txn *run_txn = NULL;
 				int ret;
 
 				if (ft->group->ordered_list_set) {
@@ -340,6 +361,22 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					run.rlast = ft_subtree_minmax_head(ft, child, true);
 					pubp = &pub;
 					runp = &run;
+					/*
+					 * Pre-reserve the standalone run-detach txn before the
+					 * structural unlink: the rare unfused shape excises the
+					 * run AFTER ft_detach_node is public -- un-abortable.
+					 * OOM here aborts cleanly (undo propagation, abort the
+					 * build, destroy @detached), leaving @ft pristine.
+					 */
+					run_txn = ft_flip_txn_create_bounded(
+						FT_ORD_CELL_RUN_DETACH_MAX_EDGES);
+					if (!run_txn) {
+						ft_propagate_external_count_parent(ft, d.pnf,
+							(long) detached_count);
+						ft_glue_abort(detached, &glue);
+						cds_ft_destroy(detached);
+						return CDS_FT_STATUS_MEMORY_ERROR;
+					}
 				}
 				ret = ft_detach_node(ft, d.nfp, d.pnfp, d.depth,
 						false, NULL, pubp, runp);
@@ -350,15 +387,24 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					 * deferred flip never ran, run.armed stays false); undo
 					 * propagation and abort, leaving @ft pristine.
 					 */
+					if (run_txn)
+						urcu_flip_txn_destroy(run_txn);
 					ft_propagate_external_count_parent(ft, d.pnf,
 						(long) detached_count);
 					ft_glue_abort(detached, &glue);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
-				if (ft->group->ordered_list_set && !run.armed)
-					ft_ord_cell_run_detach(ft, detached, run.rfirst,
-						run.rlast);
+				if (ft->group->ordered_list_set) {
+					/* Fused into the structural flip (run.armed), or commit
+					 * the standalone run-detach through the pre-reserved txn;
+					 * release it unused when the structural flip fused it. */
+					if (!run.armed)
+						ft_ord_cell_run_detach(ft, run_txn, detached,
+							run.rfirst, run.rlast);
+					else
+						urcu_flip_txn_destroy(run_txn);
+				}
 			}
 
 			/*
