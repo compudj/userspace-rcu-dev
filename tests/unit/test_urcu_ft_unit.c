@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 295
+#define NR_TESTS 296
 #else
-#define NR_TESTS 253
+#define NR_TESTS 254
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -6884,6 +6884,98 @@ fail:
  * Forces SPECULATIVE so the compressed publish materializes as a
  * SKIP-X encoded slot pointer.
  */
+/*
+ * Graft whose reserve recompacts (relocates) the dst attach node under a
+ * COMPRESSED grandparent -- driving the SKIP_X-dual fold in
+ * ft_store_at_graft_point_commit (no other test builds this shape; the existing
+ * graft tests relocate only under plain-internal grandparents).
+ *
+ * Build a compressed prefix ("PPP", kept off the root by the "Q" sibling) whose
+ * compressed node's child N is a FULL tier-2 internal node (14 children); then
+ * graft a subtree at a NEW byte under N so the reserve overflows N -> relocates
+ * it -> its compressed grandparent's skip slot (the SKIP_X dual) must re-point
+ * to the relocated N atomically with the forward cn->child publish.  verify()
+ * checks the resulting skip/exact structure is consistent.
+ */
+static int test_graft_skipx_reloc(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *staging;
+	enum cds_ft_status s;
+	int ret = -1;
+	unsigned int i;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	cds_ft_group_attr_set_lookup_optimization(attr,
+		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &staging) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	/*
+	 * Live: a root sibling ("Q") keeps the root multi-child, plus keys
+	 * sharing the long prefix "PPP" that branch at byte 3 into a FULL
+	 * internal node N -> the "PPP" run compresses (N->parent = cn).  Fill
+	 * N with many children so a graft adding a new byte overflows it
+	 * (recompact-relocate) under the compressed parent.
+	 */
+	rcu_read_lock();
+	s = cds_ft_insert(live, (const uint8_t *)"Q", 1, &node_alloc(1000)->node);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) goto out;
+	for (i = 0; i < 14; i++) {	/* tier-2 max_child = 14 (full) */
+		uint8_t key[4] = { 'P', 'P', 'P', (uint8_t)(0x40 + i) };
+		rcu_read_lock();
+		s = cds_ft_insert(live, key, 4, &node_alloc(i)->node);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) goto out;
+	}
+
+	s = cds_ft_insert(staging, (const uint8_t *)"z0", 2, &node_alloc(2000)->node);
+	if (s != CDS_FT_STATUS_OK) goto out;
+	s = cds_ft_insert(staging, (const uint8_t *)"y0", 2, &node_alloc(2001)->node);
+	if (s != CDS_FT_STATUS_OK) goto out;
+
+	/* Graft at "PPP" + a NEW byte 0x7e: lands the reserve on N (full). */
+	{
+		uint8_t gkey[4] = { 'P', 'P', 'P', 0x7e };
+		rcu_read_lock();
+		s = cds_ft_graft(live, gkey, 4, staging);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "graft_skipx_reloc: graft failed: %s\n",
+				cds_ft_status_to_string(s));
+			goto out;
+		}
+	}
+	if (cds_ft_verify(live, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_skipx_reloc: verify failed\n");
+		goto out;
+	}
+	ret = 0;
+out:
+	drain_trie(staging);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(staging);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
 static int test_graft_propagate_through_compressed(void)
 {
 	struct cds_ft_group_attr *attr;
@@ -23277,6 +23369,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_graft_basic);
 	RUN_TEST(test_graft_displaced_external_compressed);
 	RUN_TEST(test_graft_propagate_through_compressed);
+	RUN_TEST(test_graft_skipx_reloc);
 	RUN_TEST(test_graft_canonicalize_at_intermediate_depth);
 	RUN_TEST(test_graft_diverge_no_list);
 	RUN_TEST(test_graft_at_root);

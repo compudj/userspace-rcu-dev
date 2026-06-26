@@ -355,6 +355,13 @@ struct ft_graft_store_state {
 	/* flip publish (slot-at-node and built-branch-flip shapes): */
 	struct cds_ft_inode_flag *dest;
 	struct cds_ft_inode *old_recompacted_node;
+	/*
+	 * A recompact-relocating reserve records a compressed grandparent's
+	 * SKIP_X dual here (instead of a premature bare store): the commit folds
+	 * the forward grandparent slot edge in alongside it so both flip
+	 * ATOMICALLY in glue->txn.
+	 */
+	struct ft_pub_rec reserve_rec;
 	struct cds_ft_metadata *publish_pmeta;
 	struct cds_ft_inode_flag **pnfp;
 	struct cds_ft_inode_flag *slot_value;
@@ -430,8 +437,9 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 				ft_compressed_node_ptr(graft_payload),
 				graft_payload);
 		dest = d->pnf;
-		ret = ft_node_set_nth(ft, &dest, key[key_len - 1], NULL,
-			&st->old_recompacted_node, pmeta, d->depth - 1, false);
+		ret = ft_node_set_nth_rec(ft, &dest, key[key_len - 1], NULL,
+			&st->old_recompacted_node, pmeta, d->depth - 1, false,
+			&st->reserve_rec);
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -499,9 +507,9 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			 * the final slot and the wiring completes invisibly in
 			 * commit.
 			 */
-			ret = ft_node_set_nth(ft, &dest, key[i - 1], NULL,
+			ret = ft_node_set_nth_rec(ft, &dest, key[i - 1], NULL,
 				&st->old_recompacted_node, pmeta,
-				d->depth - 1, false);
+				d->depth - 1, false, &st->reserve_rec);
 			if (ret)
 				return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -562,27 +570,30 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		ft_set_parent(ft, st->attached, st->dest, slot);
 		ft_glue_apply_deferred(ft, st->glue);
 		if (st->old_recompacted_node) {
-			struct ft_pub_rec rec = { .n = 0 };
 			unsigned int k;
 
 			/*
-			 * The reserve recompacted (relocated) the dst attach node:
-			 * fold its grandparent re-point (and a compressed
-			 * grandparent's SKIP_X dual) into glue->txn -- pre-reserved
-			 * before the build, so no allocation here -- so the
-			 * relocation flips ATOMICALLY with the grafted slot edge and
-			 * the run-splice in the single commit below.  The src drain
-			 * does not cover dst, and the old dst node stays resolved-to
-			 * via the parked grandparent proxy until the commit (freed
-			 * below, after it).
+			 * The reserve recompacted (relocated) the dst attach node.  A
+			 * compressed grandparent's SKIP_X dual was RECORDED into
+			 * st->reserve_rec by the reserve ft_node_set_nth_rec (deferred,
+			 * not bare-stored prematurely ahead of the forward).  Add the
+			 * forward grandparent slot edge to that same rec -- @parent_nf =
+			 * st->dest, the relocated node, a plain internal, so
+			 * _ft_publish_to_parent does NOT re-emit the SKIP_X dual (no
+			 * duplicate edge) -- then record both into glue->txn (pre-reserved
+			 * before the build, so no allocation here) so the relocation flips
+			 * ATOMICALLY with the grafted slot edge and the run-splice in the
+			 * single commit below.  The src drain does not cover dst, and the
+			 * old dst node stays resolved-to via the parked grandparent proxy
+			 * until the commit (freed below, after it).
 			 */
-			_ft_publish_to_parent(ft, st->publish_pmeta->parent,
-				st->pnfp, st->dest, &rec);
-			for (k = 0; k < rec.n; k++)
+			_ft_publish_to_parent(ft, st->dest,
+				st->pnfp, st->dest, &st->reserve_rec);
+			for (k = 0; k < st->reserve_rec.n; k++)
 				ft_flip_txn_record_reserved(st->glue->txn,
-					(void **) rec.slot[k],
-					(void *) rec.old_val[k],
-					(void *) rec.new_val[k]);
+					(void **) st->reserve_rec.slot[k],
+					(void *) st->reserve_rec.old_val[k],
+					(void *) st->reserve_rec.new_val[k]);
 		} else {
 			/* In-place reserve: a redundant same-value republish. */
 			ft_publish_to_parent(ft, st->publish_pmeta->parent,
