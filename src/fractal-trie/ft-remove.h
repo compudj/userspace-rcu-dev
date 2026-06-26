@@ -1128,19 +1128,18 @@ int ft_detach_node(struct cds_ft *ft,
 				commit_txn_used ? NULL : commit_txn);
 			commit_txn_used = (commit_txn != NULL);
 			pub->armed = true;
-		} else {
+		} else if (old_recompacted_node || topmost_external_nodes) {
 			struct ft_pub_rec rec = { .n = 0 };
 
 			/*
-			 * Non-fused recompaction / external-promote / in-place
-			 * redundant republish: route through the op flip-txn so the
-			 * forward slot AND a compressed grandparent's SKIP_X dual flip
-			 * atomically.  A recompaction's eager child re-parent already ran,
-			 * so it commits through the pre-reserved @commit_txn (infallible).
-			 * An in-place / external-promote republish here is redundant
-			 * (old == new) -- @commit_txn was already consumed by the in-place
-			 * commit above (commit_txn_used), so this passes NULL and the no-op
-			 * lone/redundant store needs no txn.
+			 * Non-fused recompaction or external-promote: a REAL
+			 * forward-slot change (the rebuilt node, or the promoted
+			 * external head, replaces the holder).  Route through the op
+			 * flip-txn so the forward slot AND a compressed grandparent's
+			 * SKIP_X dual flip atomically.  A recompaction's eager child
+			 * re-parent already ran, so it commits through the pre-reserved
+			 * @commit_txn (infallible); a lone-edge promote stays a single
+			 * release store.
 			 */
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
@@ -1148,6 +1147,17 @@ int ft_detach_node(struct cds_ft *ft,
 				commit_txn_used ? NULL : commit_txn);
 			commit_txn_used = (commit_txn != NULL);
 		}
+		/*
+		 * else: in-place redundant republish.  The holder stayed at its
+		 * parent slot (no recompaction, no external-promote), so the
+		 * forward slot -- and a compressed grandparent's SKIP_X dual --
+		 * already hold @iter_node_flag.  The in-place forward store
+		 * committed via ft_remove_one_commit above; re-emitting the
+		 * unchanged slot(s) is a pure no-op (old == new), so skip it
+		 * entirely -- no flip, no bare store.  Any commit_txn left
+		 * unconsumed here is freed at @end.  (This was the remove path's
+		 * last transitional ft_ord_cell_flip bare-store caller.)
+		 */
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*

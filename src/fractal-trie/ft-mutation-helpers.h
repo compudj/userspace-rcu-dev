@@ -1199,10 +1199,23 @@ void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
 			&run->first, &run->last, edges, n);
 	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
-	if (txn)
+	if (txn) {
 		ft_ord_cell_flip_into(ft, txn, edges, n);
-	else
-		ft_ord_cell_flip(ft, edges, n);
+	} else {
+		/*
+		 * NULL @txn: a non-fused recompaction / external-promote whose
+		 * forward publish is a LONE edge -- a single release store with
+		 * no second reader-visible slot.  A SKIP_X dual only arises when
+		 * the publish parent is compressed, and that case reserves @txn
+		 * in the caller's fallible prefix (ft_detach_node's
+		 * boundary-parent-compressed gate), so a NULL @txn here never
+		 * carries a dual: the commit is at most one edge, infallible on
+		 * the stack.  (n == 0 is a vacuous publish: nothing recorded.)
+		 */
+		assert(n <= 1);
+		if (n)
+			ft_ord_cell_flip_one(&edges[0]);
+	}
 	if (run) {
 		/* @into NULL = EXCISE-ONLY (the merge source side): the run is
 		 * unlinked from @ft's list but not re-homed; its cells keep their
