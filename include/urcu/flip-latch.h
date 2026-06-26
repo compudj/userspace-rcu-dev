@@ -83,11 +83,19 @@
  *      parks the proxies, matching the lock-free engine's contract (no edge may
  *      be added once a proxy is parked), so an embedder written against this
  *      transaction can migrate to <urcu/flip-latch-lockfree.h> mechanically.
- *      commit() parks every recorded proxy, flips the group and settles to new;
- *      an embedder that records nothing or bails on a record() OOM frees the txn
- *      with urcu_flip_txn_destroy.  The single embedder hook is a tag function
- *      (proxy -> tagged slot value); the embedder drives reclaim from commit()'s
- *      "owe a grace period" return.  See the urcu_flip_txn block below.
+ *      commit() parks every recorded proxy, flips the group and settles to new,
+ *      then OWNS reclaim: it defers the txn through call_rcu() when it parked
+ *      proxies, or frees it at once on the single-edge / empty / OOM paths.  The
+ *      single embedder hook is a tag function (proxy -> tagged slot value); the
+ *      embedder only checks commit()'s status.  See the urcu_flip_txn block.
+ *
+ * RCU flavor
+ * ----------
+ * The transaction layer reclaims its parked proxies with call_rcu(), so this
+ * header must be included AFTER an RCU flavor header (e.g. <urcu-qsbr.h>) that
+ * maps call_rcu() to that flavor.  (The low-level flip group / proxy primitive
+ * above has no such dependency -- an embedder using only it drives its own
+ * reclaim.)
  */
 
 #include <stdbool.h>
@@ -95,7 +103,8 @@
 #include <urcu/assert.h>
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
-#include <urcu/call-rcu.h>		/* struct rcu_head (embedder reclaim) */
+#include <urcu/call-rcu.h>		/* struct rcu_head + call_rcu (commit reclaim) */
+#include <urcu/flip-latch-status.h>	/* enum urcu_flip_txn_status */
 
 /*
  * Shared selector for a flip group.  selector == 0 -> proxies resolve to
@@ -167,11 +176,13 @@ void urcu_flip_commit(struct urcu_flip_group *group)
  *
  * A growable transaction over a set of slots, built on the flip group above.
  *
- *   create --> PREPARE --record--> PREPARE --commit--> committed
- *                 |
- *                 | destroy (e.g. OOM bail: nothing published, no grace period)
- *                 v
- *               freed
+ *   create --> PREPARE --record--> PREPARE --commit--> committed (txn consumed)
+ *                 |                                |
+ *                 | record()/reserve() OOM         | commit owns reclaim:
+ *                 v (sticky URCU_FLIP_TXN_OOM)      | call_rcu (proxies parked)
+ *           commit reports MEMORY_ERROR             | or immediate free
+ *           and frees the txn                       v (no proxy: empty/single)
+ *                                                 freed
  *
  * record() appends a latch descriptor {slot, old, new} into the record array
  * but installs NOTHING -- no proxy address is live yet, so the array grows by
@@ -184,13 +195,22 @@ void urcu_flip_commit(struct urcu_flip_group *group)
  * commit() publishes the whole set atomically: it parks every recorded latch's
  * tagged proxy (readers still resolve to old; selector == 0), flips the group
  * with one release store (every proxy resolves to new at once), then settles
- * each slot to its direct new value.  It returns true when a reader may hold a
- * proxy and a grace period is owed before reclaim -- the embedder then defers
- * urcu_flip_txn_free_rcu via its call_rcu.  It returns false when no proxy was
- * ever published (the single-edge fast path and the empty txn); the embedder
- * frees immediately with urcu_flip_txn_destroy, which is also how it bails out
- * after a record() OOM.  Fresh nodes are the embedder's; the txn never tracks
- * them.
+ * each slot to its direct new value.  commit() OWNS reclaim and always consumes
+ * the txn: when it parked proxies (nr >= 2) a reader may hold one, so it defers
+ * the txn through call_rcu(urcu_flip_txn_free_rcu); when no proxy was ever
+ * published (the single-edge fast path and the empty txn) it frees the txn at
+ * once with urcu_flip_txn_destroy.  It returns enum urcu_flip_txn_status: OK on
+ * commit, or MEMORY_ERROR if a record()/reserve() allocation had failed (sticky,
+ * see below) -- never ABORT (a single updater has no contention).  An embedder
+ * therefore checks only commit()'s status and never frees the txn itself.  Fresh
+ * nodes are the embedder's; the txn never tracks them.
+ *
+ * OOM is sticky: a reserve()/record() that cannot allocate latches the txn into
+ * URCU_FLIP_TXN_OOM and a later commit() reports MEMORY_ERROR (and frees the
+ * txn), so an embedder may ignore the bool returns of reserve()/record() and
+ * test only commit() -- matching the lock-free front-end's contract.  The one
+ * OOM checkpoint a commit cannot absorb is urcu_flip_txn_create() == NULL (the
+ * txn header itself could not be allocated).
  *
  * The single embedder hook is @tag: given a recorded proxy, return the tagged
  * pointer value to store in the slot (e.g. set a reserved type code).  The
@@ -200,6 +220,7 @@ void urcu_flip_commit(struct urcu_flip_group *group)
 enum urcu_flip_txn_state {
 	URCU_FLIP_TXN_PREPARE = 0,
 	URCU_FLIP_TXN_INSTALLED,	/* internal: set once proxies are parked */
+	URCU_FLIP_TXN_OOM,		/* sticky: commit -> MEMORY_ERROR */
 };
 
 struct urcu_flip_latch {
@@ -261,20 +282,25 @@ struct urcu_flip_txn *urcu_flip_txn_create(void *(*tag)(struct urcu_flip_proxy *
  * pass" for a single up-front alloc, which is the right call for a bounded txn
  * whose records are interleaved through a build that does not otherwise thread
  * an OOM return.  Call once, right after create, before any record.  Returns
- * false on OOM (the caller destroys the txn).
+ * false on OOM; the failure is sticky (URCU_FLIP_TXN_OOM), so the caller may
+ * ignore this return and let commit() report MEMORY_ERROR.
  */
 static inline
 bool urcu_flip_txn_reserve(struct urcu_flip_txn *t, unsigned int cap)
 {
 	struct urcu_flip_latch *l;
 
+	if (caa_unlikely(t->state == URCU_FLIP_TXN_OOM))
+		return false;			/* sticky: an earlier alloc failed */
 	if (t->latches)
 		return cap <= t->cap;		/* already sized */
 	if (cap < URCU_FLIP_TXN_CAP)
 		cap = URCU_FLIP_TXN_CAP;
 	l = (struct urcu_flip_latch *) malloc((size_t) cap * sizeof(*l));
-	if (!l)
+	if (!l) {
+		t->state = URCU_FLIP_TXN_OOM;	/* sticky: commit reports it */
 		return false;
+	}
 	t->latches = l;
 	t->cap = cap;
 	return true;
@@ -315,9 +341,10 @@ void urcu_flip_latch_install(struct urcu_flip_txn *t, struct urcu_flip_latch *l)
  * Record one edge {*slot: old -> new}.  PREPARE only -- the record set is frozen
  * once proxies are installed, so this must run before commit() (record() after a
  * commit/install is a usage error).  Returns false on OOM (the only failure);
- * the caller then frees the txn with urcu_flip_txn_destroy.  The record array
- * realloc-grows on demand and nothing is installed here (no proxy address is
- * live until commit parks them).
+ * the failure is sticky (URCU_FLIP_TXN_OOM), so the caller may ignore this
+ * return and let commit() report MEMORY_ERROR.  The record array realloc-grows
+ * on demand and nothing is installed here (no proxy address is live until commit
+ * parks them).
  */
 static inline
 bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
@@ -325,6 +352,8 @@ bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
 {
 	struct urcu_flip_latch *l;
 
+	if (caa_unlikely(t->state == URCU_FLIP_TXN_OOM))
+		return false;			/* sticky: an earlier alloc failed */
 	urcu_posix_assert(t->state == URCU_FLIP_TXN_PREPARE);
 	if (t->nr == t->cap) {
 		unsigned int newcap = t->cap ? t->cap * 2 : URCU_FLIP_TXN_CAP;
@@ -333,8 +362,10 @@ bool urcu_flip_txn_record(struct urcu_flip_txn *t, void **slot,
 		/* No proxy address is live yet -> realloc may move the array. */
 		nl = (struct urcu_flip_latch *) realloc(t->latches,
 				(size_t) newcap * sizeof(*nl));
-		if (!nl)
+		if (!nl) {
+			t->state = URCU_FLIP_TXN_OOM;	/* sticky: commit reports it */
 			return false;
+		}
 		t->latches = nl;
 		t->cap = newcap;
 	}
@@ -360,8 +391,18 @@ void urcu_flip_txn_install(struct urcu_flip_txn *t)
 
 /*
  * Commit: flip the group (every proxy resolves to new atomically), then settle
- * each slot to its direct new value.  Returns true: a reader may hold a proxy,
- * so the embedder owes a grace period before urcu_flip_txn_destroy.
+ * each slot to its direct new value.  commit() OWNS reclaim and always consumes
+ * the txn -- the caller must not touch it afterwards.  Returns enum
+ * urcu_flip_txn_status: MEMORY_ERROR if a record()/reserve() alloc had failed
+ * (sticky), otherwise OK.  A single updater has no contention, so ABORT is
+ * never returned.
+ *
+ * Reclaim:
+ *   - nr >= 2 (proxies parked): a reader may hold a proxy, so the txn is
+ *     deferred through call_rcu(urcu_flip_txn_free_rcu) (the flavor's call_rcu,
+ *     hence the include-after-flavor requirement).
+ *   - nr <= 1 / sticky OOM (no proxy ever published): the txn is freed at once
+ *     with urcu_flip_txn_destroy.
  *
  * Two PREPARE shortcuts let an embedder record then commit WITHOUT an explicit
  * urcu_flip_txn_install():
@@ -369,30 +410,37 @@ void urcu_flip_txn_install(struct urcu_flip_txn *t)
  *   - Single edge (nr == 1): one recorded edge has no cross-edge atomicity to
  *     provide -- a lone release store to its slot IS already an atomic commit --
  *     so no proxy is installed at all.  A reader of that slot observes the old
- *     or the new target directly, never a proxy, so none can be held: NO grace
- *     period is owed (returns false) and the embedder frees the txn at once.
- *     This makes the common one-pointer publish as cheap as a bare
- *     rcu_assign_pointer, with no proxy alloc / install / settle / GP reclaim
- *     and no per-read proxy resolution.
+ *     or the new target directly, never a proxy, so none can be held: no grace
+ *     period is owed and the txn is freed at once.  This makes the common
+ *     one-pointer publish as cheap as a bare rcu_assign_pointer, with no proxy
+ *     alloc / install / settle / GP reclaim and no per-read proxy resolution.
  *
  *   - Multi-edge (nr >= 2): auto-install -- park every proxy first, then flip
  *     the group as usual.  (A white-box caller that needs work BETWEEN install
- *     and the flip can call the internal urcu_flip_txn_install() itself.)
+ *     and the flip can call the internal urcu_flip_txn_install() itself; that
+ *     parks proxies, so commit then takes the call_rcu reclaim path.)
  */
 static inline
-bool urcu_flip_txn_commit(struct urcu_flip_txn *t)
+enum urcu_flip_txn_status urcu_flip_txn_commit(struct urcu_flip_txn *t)
 {
 	unsigned int i;
 
+	if (caa_unlikely(t->state == URCU_FLIP_TXN_OOM)) {
+		urcu_flip_txn_destroy(t);
+		return URCU_FLIP_TXN_STATUS_MEMORY_ERROR;
+	}
 	if (t->state == URCU_FLIP_TXN_PREPARE) {
-		if (t->nr == 1) {
-			struct urcu_flip_latch *l = &t->latches[0];
+		if (t->nr <= 1) {
+			if (t->nr == 1) {
+				struct urcu_flip_latch *l = &t->latches[0];
 
-			uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
-			return false;
+				uatomic_store(l->slot, l->proxy.ptr[1],
+						CMM_RELEASE);
+			}
+			/* nr == 0: empty txn, nothing published. */
+			urcu_flip_txn_destroy(t);	/* no proxy: free now */
+			return URCU_FLIP_TXN_STATUS_OK;
 		}
-		if (t->nr == 0)
-			return false;		/* empty txn: nothing to do */
 		urcu_flip_txn_install(t);	/* auto-install before the flip */
 	}
 
@@ -402,7 +450,8 @@ bool urcu_flip_txn_commit(struct urcu_flip_txn *t)
 
 		uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
 	}
-	return true;
+	call_rcu(&t->rcu_head, urcu_flip_txn_free_rcu);	/* a reader may hold a proxy */
+	return URCU_FLIP_TXN_STATUS_OK;
 }
 
 #endif /* _URCU_FLIP_LATCH_H */
