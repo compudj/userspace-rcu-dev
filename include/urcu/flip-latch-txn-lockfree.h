@@ -306,6 +306,45 @@ int urcu_flip_lf_txn_reserve(struct urcu_flip_lf_txn *txn, unsigned int n)
 }
 
 /*
+ * Buffer or reconcile one record (see urcu_flip_lf_mcas_record): lazily create
+ * the descriptor, grow it if full, and keep one record per slot.  @upgrade is 1
+ * for a store (advances new_ptr), or 0 for a load-validate guard (keeps any
+ * pending write).  Returns 0, or -ENOMEM (sticky -- the pending commit returns
+ * it).
+ */
+static inline
+int urcu_flip_lf_txn__record(struct urcu_flip_lf_txn *txn, void **slot,
+		void *old_ptr, void *new_ptr, int upgrade)
+{
+	struct urcu_flip_lf_mcas *m = txn->mcas;
+
+	if (caa_unlikely(m == URCU_FLIP_LF_TXN_ENOMEM))
+		return -ENOMEM;		/* sticky: an earlier record already failed */
+	if (!m) {
+		m = urcu_flip_lf_mcas_create(txn->min_alloc ? txn->min_alloc :
+				URCU_FLIP_LF_TXN_INIT, txn->retry);
+		if (caa_unlikely(!m)) {
+			txn->mcas = URCU_FLIP_LF_TXN_ENOMEM;
+			return -ENOMEM;
+		}
+		txn->mcas = m;
+	}
+	if (caa_unlikely(!urcu_flip_lf_mcas_record(m, slot, old_ptr, new_ptr,
+			upgrade))) {
+		/* Descriptor full: grow (may move it) and retry. */
+		m = urcu_flip_lf_mcas_grow(m);
+		if (caa_unlikely(!m)) {
+			urcu_flip_lf_mcas_destroy(txn->mcas);	/* unpublished: sync free */
+			txn->mcas = URCU_FLIP_LF_TXN_ENOMEM;
+			return -ENOMEM;
+		}
+		txn->mcas = m;
+		urcu_flip_lf_mcas_record(m, slot, old_ptr, new_ptr, upgrade);
+	}
+	return 0;
+}
+
+/*
  * Read @slot within the bracket and return its current logical value -- the old
  * for a word this attempt intends to transact.  Forwards to urcu_flip_lf_read():
  * there is no read-set, so the read is not recorded; commit reconciles it
@@ -325,40 +364,40 @@ void *urcu_flip_lf_txn_load(struct urcu_flip_lf_txn *txn, void **slot)
 }
 
 /*
+ * Read @slot like urcu_flip_lf_txn_load AND pin it: besides returning its
+ * current logical value, record a load-only guard so the commit succeeds only
+ * if @slot still resolves to that value at the install point (records {v -> v})
+ * -- a TM read-set entry folding a read into the commit's conflict set, for a
+ * word the op depends on but does not rewrite (e.g. a tombstone an insert must
+ * find clear).  @slot's value must be non-ABA-able within the read-side section
+ * (the engine precondition): an RCU pointer or a monotone marker qualifies, a
+ * reused toggling word does not.  A later store to @slot upgrades the guard to
+ * a write in place; validate/read a given slot once per attempt.  Sticky on OOM
+ * like store: the value is returned regardless and the pending commit reports
+ * -ENOMEM.
+ */
+static inline
+void *urcu_flip_lf_txn_load_validate(struct urcu_flip_lf_txn *txn, void **slot)
+{
+	void *v = urcu_flip_lf_read(slot);
+
+	(void) urcu_flip_lf_txn__record(txn, slot, v, v, 0);
+	return v;
+}
+
+/*
  * Buffer a write {*slot: old -> new}.  @old_ptr is the value the caller saw.
- * Returns 0, or -ENOMEM if the descriptor could not be allocated or grown -- in
- * which case the failure is recorded so the pending commit also returns -ENOMEM;
- * the caller may therefore ignore this return and test only commit.
+ * If @slot already carries a record (a prior store, or a load-validate guard),
+ * the write upgrades it in place rather than adding a second -- one record per
+ * slot.  Returns 0, or -ENOMEM if the descriptor could not be allocated or
+ * grown -- sticky, so the pending commit also returns -ENOMEM and the caller
+ * may test only commit.
  */
 static inline
 int urcu_flip_lf_txn_store(struct urcu_flip_lf_txn *txn, void **slot,
 		void *old_ptr, void *new_ptr)
 {
-	struct urcu_flip_lf_mcas *m = txn->mcas;
-
-	if (caa_unlikely(m == URCU_FLIP_LF_TXN_ENOMEM))
-		return -ENOMEM;		/* sticky: an earlier store already failed */
-	if (!m) {
-		m = urcu_flip_lf_mcas_create(txn->min_alloc ? txn->min_alloc :
-				URCU_FLIP_LF_TXN_INIT, txn->retry);
-		if (caa_unlikely(!m)) {
-			txn->mcas = URCU_FLIP_LF_TXN_ENOMEM;
-			return -ENOMEM;
-		}
-		txn->mcas = m;
-	}
-	if (caa_unlikely(!urcu_flip_lf_mcas_add(m, slot, old_ptr, new_ptr))) {
-		/* Descriptor full: grow (may move it) and retry the add. */
-		m = urcu_flip_lf_mcas_grow(m);
-		if (caa_unlikely(!m)) {
-			urcu_flip_lf_mcas_destroy(txn->mcas);	/* unpublished: sync free */
-			txn->mcas = URCU_FLIP_LF_TXN_ENOMEM;
-			return -ENOMEM;
-		}
-		txn->mcas = m;
-		urcu_flip_lf_mcas_add(m, slot, old_ptr, new_ptr);	/* room now */
-	}
-	return 0;
+	return urcu_flip_lf_txn__record(txn, slot, old_ptr, new_ptr, 1);
 }
 
 /*

@@ -464,6 +464,33 @@ bool urcu_flip_lf_mcas_add(struct urcu_flip_lf_mcas *t, void **slot,
 }
 
 /*
+ * Record edge {*slot: old -> new} keeping at most one record per @slot, so the
+ * engine's distinct-slot precondition holds by construction.  If a record
+ * already targets @slot (a prior store, or a load-validate guard), reconcile it
+ * rather than append a duplicate: @old_ptr must equal the record's old_ptr
+ * (else the caller read @slot twice and saw it move -- an inconsistent txn).
+ * @upgrade picks new_ptr -- a store advances it to @new_ptr, a load-validate
+ * leaves a pending write intact.  Returns false only when a new record is
+ * needed and the descriptor is full; the caller grows and retries.
+ */
+static inline
+bool urcu_flip_lf_mcas_record(struct urcu_flip_lf_mcas *t, void **slot,
+		void *old_ptr, void *new_ptr, int upgrade)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->nr; i++) {
+		if (t->recs[i].slot != slot)
+			continue;
+		urcu_assert_debug(t->recs[i].old_ptr == old_ptr);
+		if (upgrade)
+			t->recs[i].new_ptr = new_ptr;
+		return true;
+	}
+	return urcu_flip_lf_mcas_add(t, slot, old_ptr, new_ptr);
+}
+
+/*
  * Grow @t's record capacity (room for at least one more), returning the
  * possibly-moved descriptor, or NULL on OOM with @t left intact for the caller
  * to free.  Valid only before commit: the descriptor is not yet parked in any

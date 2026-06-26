@@ -28,9 +28,11 @@ noinst_PROGRAMS = \
 	test_flip_latch_txn \
 	test_flip_latch_txn_grow \
 	test_flip_latch_txn_fallback \
+	test_flip_latch_txn_validate \
 	test_rcu_bidir_list \
 	test_rcu_bidir_list_concurrent \
 	test_rcu_bidir_list_lockfree \
+	test_rcu_bidir_list_lf_guarded \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -69,9 +71,11 @@ TESTS = \
 	test_flip_latch_txn \
 	test_flip_latch_txn_grow \
 	test_flip_latch_txn_fallback \
+	test_flip_latch_txn_validate \
 	test_rcu_bidir_list \
 	test_rcu_bidir_list_concurrent \
 	test_rcu_bidir_list_lockfree \
+	test_rcu_bidir_list_lf_guarded \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -140,6 +144,9 @@ test_flip_latch_txn_grow_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 test_flip_latch_txn_fallback_SOURCES = test_flip_latch_txn_fallback.c
 test_flip_latch_txn_fallback_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
+test_flip_latch_txn_validate_SOURCES = test_flip_latch_txn_validate.c
+test_flip_latch_txn_validate_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
 test_rcu_bidir_list_SOURCES = test_rcu_bidir_list.c
 test_rcu_bidir_list_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
@@ -148,6 +155,9 @@ test_rcu_bidir_list_concurrent_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP
 
 test_rcu_bidir_list_lockfree_SOURCES = test_rcu_bidir_list_lockfree.c
 test_rcu_bidir_list_lockfree_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_bidir_list_lf_guarded_SOURCES = test_rcu_bidir_list_lf_guarded.c
+test_rcu_bidir_list_lf_guarded_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_fair_mutex_SOURCES = test_fair_mutex.c
 test_fair_mutex_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)

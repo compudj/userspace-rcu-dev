@@ -258,6 +258,60 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 }
 
 /*
+ * Insert @newp after @pos in list @head, but only if @guard_slot still holds
+ * @guard_expected at the commit -- the structural insert and that check
+ * linearize as ONE MCAS (a load-validate guard).  Use it when the insert
+ * depends on a word the list does not otherwise touch: a per-node "live" /
+ * generation marker the embedder keeps beside its node, a container-freeze
+ * flag, etc.  @guard_slot must be engine-transacted (every writer of it goes
+ * through the MCAS) and non-ABA-able within the read-side section, like any
+ * transacted slot.  Returns 0; -ENOENT if @pos was deleted or @guard_slot no
+ * longer holds @guard_expected; -ENOMEM on descriptor OOM.
+ */
+static inline
+int cds_bidir_list_lf_insert_after_guarded_rcu(
+		struct cds_bidir_list_lf_node *newp,
+		struct cds_bidir_list_lf_node *pos,
+		struct cds_bidir_list_lf_head *head,
+		void **guard_slot, void *guard_expected)
+{
+	struct urcu_flip_lf_txn txn;
+	int ret;
+
+	urcu_flip_lf_txn_init(&txn, &head->domain);
+	do {
+		void *pn;
+		struct cds_bidir_list_lf_node *succ;
+
+		urcu_flip_lf_txn_begin(&txn);
+		pn = urcu_flip_lf_txn_load(&txn, (void **) &pos->next);
+		if (cds_bidir_list_lf_is_marked(pn)) {
+			urcu_flip_lf_txn_end(&txn);
+			return -ENOENT;			/* @pos was deleted */
+		}
+		/*
+		 * Pin the guard: the commit succeeds only if @guard_slot still
+		 * holds @guard_expected at install, atomically with the insert.
+		 * A read != expected means it never held -- bail (the recorded
+		 * guard is discarded by end).
+		 */
+		if (urcu_flip_lf_txn_load_validate(&txn, guard_slot) !=
+				guard_expected) {
+			urcu_flip_lf_txn_end(&txn);
+			return -ENOENT;			/* guard no longer holds */
+		}
+		succ = (struct cds_bidir_list_lf_node *) pn;
+		newp->next = succ;
+		newp->prev = pos;
+		urcu_flip_lf_txn_store(&txn, (void **) &pos->next, succ, newp);
+		urcu_flip_lf_txn_store(&txn, (void **) &succ->prev, pos, newp);
+		ret = urcu_flip_lf_txn_commit(&txn);
+		urcu_flip_lf_txn_end(&txn);
+	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+	return ret < 0 ? -ENOMEM : 0;
+}
+
+/*
  * Insert @newp immediately before @pos in list @head.  Returns 0 / -ENOENT /
  * -ENOMEM as for insert_after.
  */
