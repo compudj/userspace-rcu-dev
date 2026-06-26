@@ -1451,17 +1451,24 @@ struct ft_graft_swap_run {
 	bool armed;
 };
 
+/* Max edges a glue-path publish-replace commits: <=2 structural + <=4 replace. */
+#define FT_GLUE_PUBLISH_REPLACE_MAX_EDGES	6
+
 /*
  * Commit a graft_swap's RECORDED structural publish edges (@rec: the forward
  * parent slot, plus a compressed parent's SKIP_X dual) ATOMICALLY with @run's
- * ordered-list run-replace, in ONE ft_ord_cell_flip (the legacy non-txn
- * graft_swap commit path).  Arms @run.
+ * ordered-list run-replace, in ONE flip through the caller-PRE-RESERVED txn @txn
+ * (the legacy KEY_SHORTER graft_swap commit path).  This runs in the op's
+ * failure-free section (after the per-side drains), so it is UN-ABORTABLE: the
+ * caller reserves @txn (capacity >= FT_GLUE_PUBLISH_REPLACE_MAX_EDGES) in the
+ * graft_swap fallible prefix and ft_ord_cell_flip_into commits it here
+ * infallibly.  Arms @run.
  */
 static
-void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct ft_pub_rec *rec,
-		struct ft_graft_swap_run *run)
+void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct urcu_flip_txn *txn,
+		struct ft_pub_rec *rec, struct ft_graft_swap_run *run)
 {
-	struct ft_ord_cell_edge edges[6];	/* <=2 structural + <=4 replace */
+	struct ft_ord_cell_edge edges[FT_GLUE_PUBLISH_REPLACE_MAX_EDGES];
 	unsigned int n = 0, i;
 
 	for (i = 0; i < rec->n; i++) {
@@ -1472,7 +1479,7 @@ void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct ft_pub_rec *rec,
 	}
 	n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
 		run->s_first, run->s_last, edges, n);
-	ft_ord_cell_flip(ft, edges, n);
+	ft_ord_cell_flip_into(ft, txn, edges, n);
 	run->armed = true;
 }
 
@@ -2654,7 +2661,8 @@ void ft_glue_free_collided_cells(struct cds_ft *ft,
  * node up through the cluster to publish_parent is in place.
  */
 static
-void ft_glue_publish(struct cds_ft *ft, struct ft_glue *g)
+void ft_glue_publish(struct cds_ft *ft, struct urcu_flip_txn *txn,
+		struct ft_glue *g)
 {
 	struct ft_pub_rec rec = { .n = 0 };
 	struct ft_ord_cell_edge sedges[2];	/* forward slot + compressed SKIP_X dual */
@@ -2666,36 +2674,40 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_glue *g)
 	 * instead of a bare ft_publish_to_parent.  A lone edge still reduces to a
 	 * single release store, but both stores now ride a {slot, old, new}
 	 * descriptor: the compressed dual flips atomically (no torn window) and a
-	 * future MCAS commit covers the publish uniformly.
+	 * future MCAS commit covers the publish uniformly.  Un-abortable (the
+	 * op's failure-free section), so it commits through the caller-PRE-RESERVED
+	 * @txn (ft_ord_cell_flip_into, infallible).
 	 */
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		&rec);
 	n = ft_pub_rec_sedges(&rec, sedges);
-	ft_ord_cell_flip(ft, sedges, n);
+	ft_ord_cell_flip_into(ft, txn, sedges, n);
 }
 
 /*
  * GLUE-path graft_swap publish FUSED with an ordered-list run-REPLACE (the
- * legacy non-txn graft_swap commit path).  When @run is set, RECORD
+ * legacy KEY_SHORTER graft_swap commit path).  When @run is set, RECORD
  * the cluster's forward publish edge (plus a compressed parent's SKIP_X dual)
  * via a ft_pub_rec instead of storing it, append the run-replace boundary edges,
- * and commit them all in ONE ft_ord_cell_flip, so a reader never sees run_S's
- * keys reachable in the structure but absent from the ordered list (or run_D the
- * reverse).  @run NULL (ordered list off) falls back to the plain publish.
+ * and commit them all in ONE flip, so a reader never sees run_S's keys
+ * reachable in the structure but absent from the ordered list (or run_D the
+ * reverse).  @run NULL (ordered list off) falls back to the plain publish.  Both
+ * commit through the caller-PRE-RESERVED @txn (un-abortable failure-free
+ * section); @txn capacity must be >= FT_GLUE_PUBLISH_REPLACE_MAX_EDGES.
  */
 static
-void ft_glue_publish_replace(struct cds_ft *ft, struct ft_glue *g,
-		struct ft_graft_swap_run *run)
+void ft_glue_publish_replace(struct cds_ft *ft, struct urcu_flip_txn *txn,
+		struct ft_glue *g, struct ft_graft_swap_run *run)
 {
 	struct ft_pub_rec rec = { .n = 0 };
 
 	if (!run) {
-		ft_glue_publish(ft, g);
+		ft_glue_publish(ft, txn, g);
 		return;
 	}
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		&rec);
-	ft_ord_cell_flip_rec_replace(ft, &rec, run);
+	ft_ord_cell_flip_rec_replace(ft, txn, &rec, run);
 }
 
 /*

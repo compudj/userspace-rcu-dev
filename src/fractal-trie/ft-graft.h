@@ -1489,6 +1489,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_metadata *fresh_meta = NULL;
 		struct urcu_flip_txn *swap_retire_txn = NULL;
 		struct urcu_flip_txn *extract_txn = NULL;
+		struct urcu_flip_txn *glue_publish_txn = NULL;
 		struct ft_glue glue_insert, glue_extract;
 		struct cds_ft_inode_flag *canon = NULL;
 		struct cds_ft_inode_flag *top_B = NULL;	/* extracted swap root, NULL = external/none */
@@ -1757,6 +1758,20 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			if (!glue_insert.txn || !urcu_flip_txn_reserve(glue_insert.txn,
 					FT_GLUE_FLOOR_DEFERRED + 6))
 				goto prep_oom;
+		} else if (have_insert) {
+			/*
+			 * KEY_SHORTER legacy publish (glue_insert.txn stays NULL ->
+			 * ft_glue_apply_deferred + ft_glue_publish_replace below): the
+			 * publish-replace runs in the failure-free section, so pre-reserve
+			 * its forward(+SKIP_X dual) + run-replace commit txn here, where an
+			 * OOM is still a clean prep_oom.  It is always consumed on the
+			 * legacy path (the reservation condition mirrors the consume
+			 * condition); a later prep_oom frees it.
+			 */
+			glue_publish_txn = ft_flip_txn_create_bounded(
+				FT_GLUE_PUBLISH_REPLACE_MAX_EDGES);
+			if (!glue_publish_txn)
+				goto prep_oom;
 		}
 
 		/* Transient empty swap root for the unlink window (fallible). */
@@ -1872,8 +1887,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 					swap_run_arg);
 			else {
 				ft_glue_apply_deferred(dst_ft, &glue_insert);
-				ft_glue_publish_replace(dst_ft, &glue_insert,
-					swap_run_arg);
+				ft_glue_publish_replace(dst_ft, glue_publish_txn,
+					&glue_insert, swap_run_arg);
+				glue_publish_txn = NULL;	/* consumed */
 			}
 		} else {
 			/*
@@ -2123,6 +2139,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		ft_glue_abort(swap_ft, &glue_extract);
 		if (glue_insert.txn)
 			urcu_flip_txn_destroy(glue_insert.txn);
+		if (glue_publish_txn)
+			urcu_flip_txn_destroy(glue_publish_txn);
 		if (swap_retire_txn)
 			urcu_flip_txn_destroy(swap_retire_txn);
 		if (extract_txn)
