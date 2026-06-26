@@ -1496,6 +1496,25 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	struct ft_remove_pub pub = { .armed = false };
 	struct ft_remove_pub *pubp = fuse_remove ? &pub : NULL;
 	struct ft_ord_cell *fuse_cell = fuse_remove ? dead_cell : NULL;
+	/*
+	 * PRE-RESERVE the dead cell's standalone-unsplice txn here, in the
+	 * fallible prefix BEFORE any structural change: when the structural
+	 * commit cannot fuse the unsplice (a recompaction / external-promote
+	 * shape leaves pub unarmed), the unsplice runs AFTER that commit is
+	 * public -- un-abortable -- so its flip-txn must already be reserved.
+	 * On OOM here the removal aborts cleanly (key untouched).  The fused
+	 * common case frees it unused at the tail.
+	 */
+	struct urcu_flip_txn *unsplice_txn = NULL;
+
+	if (fuse_remove) {
+		unsplice_txn = ft_flip_txn_create_bounded(
+			FT_ORD_CELL_UNSPLICE_MAX_EDGES);
+		if (!unsplice_txn) {
+			FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+	}
 
 	if (ft_node_external(holder_flag)) {
 		/*
@@ -1718,11 +1737,22 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * An in-place leaf detach already fused the unsplice into its structural
 	 * flip (pub.armed); only the deferred cell free remains here.
 	 */
-	if (ret == 0 && fuse_remove) {
+	if (fuse_remove) {
 		/* cell_was_head implies ordered_list, so the list op always runs. */
-		if (!pub.armed)
-			ft_ord_cell_unsplice(ft, dead_cell);
-		ft_ord_cell_free(ft, dead_cell);
+		if (ret == 0) {
+			/* An in-place / fused structural commit already carried the
+			 * unsplice (pub.armed); otherwise commit it now through the
+			 * txn pre-reserved before the structural change. */
+			if (!pub.armed)
+				ft_ord_cell_unsplice(ft, unsplice_txn, dead_cell);
+			else
+				urcu_flip_txn_destroy(unsplice_txn);
+			ft_ord_cell_free(ft, dead_cell);
+		} else {
+			/* Removal aborted (MEMORY_ERROR): nothing left the trie, the
+			 * cell stays in the list -- release the unused reservation. */
+			urcu_flip_txn_destroy(unsplice_txn);
+		}
 	}
 
 	/*
@@ -1939,6 +1969,23 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	struct ft_remove_pub pub = { .armed = false };
 	struct ft_ord_cell *dead_cell = ft->ordered_list ?
 		ft_ord_cell_ptr(chain_head->prev) : NULL;
+	/*
+	 * PRE-RESERVE the dead cell's standalone-unsplice txn before any
+	 * structural change (see cds_ft_remove): the prefix / recompaction /
+	 * compressed-parent shapes stay two-commit (pub unarmed) and unsplice
+	 * AFTER the structural commit is public -- un-abortable.  OOM here
+	 * aborts the removal cleanly; the fused case frees it unused.
+	 */
+	struct urcu_flip_txn *unsplice_txn = NULL;
+
+	if (dead_cell) {
+		unsplice_txn = ft_flip_txn_create_bounded(
+			FT_ORD_CELL_UNSPLICE_MAX_EDGES);
+		if (!unsplice_txn) {
+			*result_node = NULL;
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+	}
 
 	if (is_prefix) {
 		/*
@@ -2094,10 +2141,21 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 * in-place leaf detach already fused the unsplice (pub.armed); only the
 	 * deferred free remains.  List off: chain_head->prev is the flagged
 	 * parent, no cell. */
-	if (ret == 0 && ft->ordered_list) {
-		if (!pub.armed)
-			ft_ord_cell_unsplice(ft, dead_cell);
-		ft_ord_cell_free(ft, dead_cell);
+	if (ft->ordered_list) {
+		if (ret == 0) {
+			/* An in-place / fused structural commit already carried the
+			 * unsplice (pub.armed); otherwise commit it now through the
+			 * txn pre-reserved before the structural change. */
+			if (!pub.armed)
+				ft_ord_cell_unsplice(ft, unsplice_txn, dead_cell);
+			else
+				urcu_flip_txn_destroy(unsplice_txn);
+			ft_ord_cell_free(ft, dead_cell);
+		} else {
+			/* Removal aborted: the cell stays in the list -- release the
+			 * unused reservation. */
+			urcu_flip_txn_destroy(unsplice_txn);
+		}
 	}
 
 	iter->cache_valid = false;

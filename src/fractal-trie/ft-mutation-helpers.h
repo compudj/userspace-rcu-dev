@@ -813,14 +813,25 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
 	return n;
 }
 
-/* Remove @cell from the ordered cell list (its key disappeared). */
+/* Max edges an unsplice commits: <=2 neighbour back-edges + head + tail. */
+#define FT_ORD_CELL_UNSPLICE_MAX_EDGES	4
+
+/*
+ * Remove @cell from the ordered cell list (its key disappeared) by committing
+ * its unsplice edges through the caller-PRE-RESERVED txn @txn.  This is the
+ * standalone (two-commit) path -- run AFTER the structural removal is already
+ * public, so it is UN-ABORTABLE: the caller reserves @txn in its fallible prefix
+ * (before the structural change, where OOM aborts the whole removal cleanly),
+ * and ft_ord_cell_flip_into commits it here infallibly.
+ */
 static
-void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_ord_cell *cell)
+void ft_ord_cell_unsplice(struct cds_ft *ft, struct urcu_flip_txn *txn,
+		struct ft_ord_cell *cell)
 {
-	struct ft_ord_cell_edge edges[4];
+	struct ft_ord_cell_edge edges[FT_ORD_CELL_UNSPLICE_MAX_EDGES];
 	unsigned int n = ft_ord_cell_unsplice_edges(ft, cell, edges, 0);
 
-	ft_ord_cell_flip(ft, edges, n);
+	ft_ord_cell_flip_into(ft, txn, edges, n);
 }
 
 /*
