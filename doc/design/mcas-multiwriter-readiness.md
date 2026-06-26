@@ -267,6 +267,50 @@ added and validated under the *current* suite (the gate stays green) well before
 MCAS commit body exists — the same "express now, swap the commit later" discipline
 Invariant 1 uses.
 
+### RECONSIDER (2026-06-26, Mathieu): a per-node `deleted` flag in place of the seqcount — *if* in-place node mutation is first eliminated
+
+Two coupled refinements to weigh against the seqcount decision above.
+
+1. **Eliminate the last in-place node mutation: the insert-without-rerank
+   occupancy-bitmap update.** A pigeon / popcount insert that finds spare capacity
+   at the correct rank publishes its child-slot through a flip edge (Invariant 1),
+   but *also sets the node's occupancy bitmap bit in place* — a bare store on a
+   **live node's metadata word**, outside any descriptor. Because it is **not a
+   pointer edge**, Invariant 1's edge-expressibility does not cover it, and the
+   Invariant-1 edge audit (§2) does not count it. It is exactly the Invariant-2
+   disjoint-word hazard at metadata granularity: a concurrent writer that validates
+   the node to collapse / recompact it CASes a *different* word and never observes
+   the bitmap change ⇒ a lost insert (and, if the bitmap is one word that two
+   inserters RMW, a lost update outright). The fix is to bring this site into the
+   build-invisible + flip model like every other tier change: **recompact the
+   node** — build a fresh node carrying the new entry *and* its bitmap, flip the
+   parent edge — rather than mutating the bitmap in place. Cost: the cheap O(1)
+   in-place insert tier becomes an O(node) alloc-and-copy recompact under
+   multi-writer (a §5 cost-tier consequence, paid only on a shared trie; an
+   exclusive trie keeps the in-place store, §5.2).
+
+2. **Then the §4.B coherency word can degrade from a seqcount to a plain `deleted`
+   flag.** The "must be a seqcount, not a dead bit" argument above rests on
+   *in-place child-adds existing*: the freeze word (metadata) is disjoint from the
+   slot the inserter CASes, so a bare `dead` bit would miss an insert-lands-first
+   and lose it (the I-then-R dual of §3.2), forcing a monotonic count that every
+   in-place mutator bumps and the remover validates. **Remove in-place mutation
+   (refinement 1) and that premise is gone:** every mutation becomes a whole-node
+   replacement via the parent edge, so two ops touching the same node now contend
+   on the **same** word (the node's state word / its parent edge), not disjoint
+   words — the MCAS serializes them directly and the loser re-plans. The version
+   counter was only ever needed to detect the in-place child-adds that no longer
+   exist; a one-way `deleted` latch (`LIVE → DEAD`, set at retire, validated by any
+   op that targets the node) then suffices for **both** freeze-on-free and
+   writer/writer serialization. The `FLIP` transient and the same-GP
+   proxy/node reclaim from the seqcount encoding carry over unchanged to the flag.
+
+*(Refinement 2 is a synthesis of the two notes — its validity hinges on refinement
+1 being total, i.e. that NO reader-visible node mutation remains in place once the
+bitmap site is recompacted. Confirm that completeness before adopting the flag over
+the seqcount; the seqcount remains the safe default while any in-place mutator
+survives.)*
+
 ---
 
 ## 5. Cost tiers and exclusivity
