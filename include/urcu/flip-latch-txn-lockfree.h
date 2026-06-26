@@ -21,7 +21,7 @@
  *     urcu_flip_lf_txn_domain_init(&domain);
  *     ...
  *     struct urcu_flip_lf_txn txn;
- *     int ret;
+ *     enum urcu_flip_txn_status st;
  *
  *     urcu_flip_lf_txn_init(&txn, &domain);    // or NULL: no fallback
  *     do {
@@ -30,9 +30,11 @@
  *         if (is_marked(succ)) { urcu_flip_lf_txn_end(&txn); return -ENOENT; }
  *         urcu_flip_lf_txn_store(&txn, (void **) &pos->next, succ, newp);
  *         urcu_flip_lf_txn_store(&txn, (void **) &succ->prev, pos,  newp);
- *         ret = urcu_flip_lf_txn_commit(&txn);
+ *         st = urcu_flip_lf_txn_commit(&txn);
  *         urcu_flip_lf_txn_end(&txn);
- *     } while (ret == 0);    // 0 = retry, 1 = committed, <0 = error
+ *     } while (st == URCU_FLIP_TXN_STATUS_ABORT);  // ABORT (>0) = retry;
+ *                                                  // OK (0) = committed;
+ *                                                  // MEMORY_ERROR (<0) = error
  *
  * The handle holds only what the engine does not: the cross-attempt retry count
  * (aging priority) and a pointer to this attempt's descriptor -- the write-set
@@ -96,6 +98,7 @@
 #include <urcu/compiler.h>
 #include <urcu/fair-mutex.h>
 #include <urcu/flip-latch-lockfree.h>
+#include <urcu/flip-latch-status.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -359,30 +362,31 @@ int urcu_flip_lf_txn_store(struct urcu_flip_lf_txn *txn, void **slot,
 }
 
 /*
- * Commit the buffered write-set through the MCAS.  Returns 1 on commit, 0 on a
- * contention abort (the caller re-runs begin..commit; the retry count is
- * advanced internally), or a negative errno on error (-ENOMEM, including a store
- * that could not allocate).  Reclaim is deferred through the flavor's call_rcu.
- * Call between begin and end.
+ * Commit the buffered write-set through the MCAS.  Returns enum
+ * urcu_flip_txn_status: OK on commit, ABORT on a contention abort (the caller
+ * re-runs begin..commit; the retry count is advanced internally), or
+ * MEMORY_ERROR on allocation failure (including a store that could not
+ * allocate).  Reclaim is deferred through the flavor's call_rcu.  Call between
+ * begin and end.
  */
 static inline
-int urcu_flip_lf_txn_commit(struct urcu_flip_lf_txn *txn)
+enum urcu_flip_txn_status urcu_flip_lf_txn_commit(struct urcu_flip_lf_txn *txn)
 {
 	struct urcu_flip_lf_mcas *m = txn->mcas;
 
 	if (caa_unlikely(m == URCU_FLIP_LF_TXN_ENOMEM)) {
 		txn->mcas = NULL;
-		return -ENOMEM;
+		return URCU_FLIP_TXN_STATUS_MEMORY_ERROR;
 	}
 	if (!m)
-		return 1;		/* empty write-set: trivially committed */
+		return URCU_FLIP_TXN_STATUS_OK;	/* empty write-set: trivially committed */
 	txn->min_alloc = m->nr;		/* learn the realized size: a retry won't re-grow */
 	txn->mcas = NULL;		/* mcas_commit consumes the descriptor */
 	if (urcu_flip_lf_mcas_commit(m, call_rcu))
-		return 1;
+		return URCU_FLIP_TXN_STATUS_OK;
 	txn->retry++;			/* aged for the next attempt */
 	txn->retrying = 1;		/* keep the turn across the retry */
-	return 0;
+	return URCU_FLIP_TXN_STATUS_ABORT;
 }
 
 /* End the attempt: close the RCU read-side section.  Always pair with begin. */
