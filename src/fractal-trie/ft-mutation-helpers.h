@@ -983,6 +983,9 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 	return ft_ord_cell_flip_try(ft, edges, n);
 }
 
+/* A pure structural publish: forward parent slot + a compressed SKIP_X dual. */
+#define FT_PUB_SEDGE_MAX_EDGES	2
+
 /*
  * Copy @rec's <=2 structural edges (the forward parent slot plus a compressed
  * parent's SKIP_X dual, populated by _ft_publish_to_parent) into @sedges for a

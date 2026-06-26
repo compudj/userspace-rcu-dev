@@ -1288,15 +1288,26 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 	} else {
 		/*
 		 * List off: the head's prev IS the flagged parent, inherited in
-		 * place on the not-yet-published successor (build-invisible), then
-		 * published.  No allocation, so no failure path.
+		 * place on the not-yet-published successor.  @next_node is already
+		 * live and its prev is read RAW (ft_resolve_head_prev) during skip
+		 * resolution, so that store cannot ride the flip as a folded proxy
+		 * -- it stays a SETTLED store, and the flip is made infallible by
+		 * PRE-RESERVING its bounded txn (<=2 edges: forward slot + a
+		 * compressed parent's SKIP_X dual) BEFORE the live store.  On
+		 * reservation OOM abort here: @next_node and the head slot are
+		 * untouched, so the caller returns CDS_FT_STATUS_MEMORY_ERROR.
 		 */
+		struct urcu_flip_txn *txn =
+			ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES);
+
+		if (!txn)
+			return -ENOMEM;
 		next_node->prev = node->prev;	/* inherit parent */
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
-		ft_ord_cell_flip(ft, sedges, n_s);
+		ft_ord_cell_flip_into(ft, txn, sedges, n_s);
 	}
 	return 0;
 }
@@ -1344,7 +1355,11 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * key disappearance routes through the fused ft_remove_one_commit,
 		 * and a compressed / body-slot leaf through ft_detach_node).  Clear
 		 * the head slot (+ a compressed holder's SKIP_X dual) through the
-		 * op flip-txn -- a lone edge is a bare release store.
+		 * op flip-txn.  Abortable: the flip IS the op's commit (no pre-flip
+		 * reader-visible side-effect), so on a multi-edge txn-alloc OOM the
+		 * unchain aborts cleanly -- nothing published, @node still chained,
+		 * caller rolls back the -1 count and returns MEMORY_ERROR.  A lone
+		 * edge takes the infallible on-stack store and never fails.
 		 */
 		struct ft_pub_rec rec = { .n = 0 };
 		struct ft_ord_cell_edge sedges[2];
@@ -1353,7 +1368,8 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
-		ft_ord_cell_flip(ft, sedges, n_s);
+		if (ft_ord_cell_flip_try(ft, sedges, n_s) != 0)
+			return -ENOMEM;
 	}
 	/*
 	 * @node has left the trie: tombstone it.  Its next pointer is
