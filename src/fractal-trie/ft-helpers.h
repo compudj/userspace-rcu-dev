@@ -1887,7 +1887,7 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 
 				if (rec)
 					ft_pub_rec_add(rec, skip_slot, skip_new);
-				else
+				else if (*skip_slot != skip_new)
 					rcu_assign_pointer(*skip_slot, skip_new);
 			}
 		}
@@ -1922,7 +1922,18 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 			(const void *) new_child);
 	if (rec)
 		ft_pub_rec_add(rec, parent_slot, new_child);
-	else
+	else if (*parent_slot != new_child)
+		/*
+		 * Direct (rec == NULL) publish.  The only two callers -- the
+		 * in-place relocation else in ft_attach_node and graft's
+		 * no-recompact else -- republish the value the slot already
+		 * holds (Invariant-1: no live reader-visible bare publish
+		 * remains; the SKIP_X dual above is likewise a no-op in
+		 * lockstep).  Eliding the redundant store and its release fence
+		 * is invisible to readers; the guard keeps the store correct
+		 * should a value ever differ.  The recorded (rec) path captures
+		 * the edge for the flip-txn instead of storing here.
+		 */
 		rcu_assign_pointer(*parent_slot, new_child);
 }
 
