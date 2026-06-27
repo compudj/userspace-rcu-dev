@@ -466,39 +466,56 @@ cases that are not a genuine re-rank.
   — optionally trigger a cleanup recompact once
   `popcount(bitmap) − nr_child` (stale bits) gets high.
 
-- **`nr_child` → density hint, sized from truth.** `nr_child` is `++`/`--` in
-  place and drives the recompact tier decision. **Recompact-on-insert already
-  removes the `++`:** a new-occupancy insert rebuilds the node, so its count
-  lands in the fresh node's metadata — no in-place bump on the live node. The
-  surviving in-place mutation is therefore **remove-side only**: a non-shrink
+- **`nr_child` → commit it (the unified per-node state word).** `nr_child` is
+  `++`/`--` in place and drives the recompact tier decision. **Recompact-on-insert
+  already removes the `++`:** a new-occupancy insert rebuilds the node, so its
+  count lands in the fresh node's metadata — no in-place bump on the live node.
+  The surviving in-place mutation is therefore **remove-side only**: a non-shrink
   delete stores `NULL` into the slot (a flip edge — already MCAS-fine) but does
   `metadata->nr_child--` in place (`ft_popcount_node_replace_ptr` /
-  `ft_pigeon_node_replace_ptr`), and the pigeon delete additionally clears its
-  hint bit in place (popcount instead *soft-deletes*: it leaves the bit set and
-  only decrements `nr_child`, so popcount's bitmap is already non-mutated on
-  delete). So remove-in-place needs no "recompact-on-remove" of the structure —
-  only the metadata hints must be tamed. **Resolution: `nr_child` is only a
-  *trigger* hint, never a correctness input** — capacity checks use the actual
-  occupied count (`ptr_idx`/popcount), and the recompact's *sizing* must be
-  taken from the **true** occupancy (`ft_*_node_get_nr_child` = bitmap/pointer
-  scan), NOT from `nr_child` (sizing from a lagging `nr_child` is exactly the
-  reserve+bind under-size→overflow bug). Once sizing is decoupled from
-  `nr_child`, the count can drift: a **relaxed atomic counter** (drift-free,
-  mildly contended) or a sloppy/per-CPU counter reconciled at each recompact
-  suffices, because drift only shifts *when* a recompact fires, never its
-  correctness. This is the exact parallel of the bitmap hint: pointers are
-  truth, `nr_child` is a hint.
+  `ft_pigeon_node_replace_ptr`); the pigeon delete also clears its hint bit in
+  place (popcount instead *soft-deletes*: it leaves the bit set and only
+  decrements `nr_child`, so popcount's bitmap is already non-mutated on delete).
+  So remove-in-place needs no "recompact-on-remove" of the structure — only the
+  metadata words must be tamed.
+
+  **DECISION (2026-06-27, Mathieu): commit `nr_child`, do not recalculate it.**
+  Per the "commit it / eliminate it / prove it benign" rule, take the *commit it*
+  disposition: fold the `nr_child` update into the op's flip-latch commit so it is
+  exact and atomic with the structural edges. Eliminating it (re-deriving the
+  count from the bitmap/pointer scan on every recompact-trigger decision) was
+  rejected — the scan is the cost we are avoiding, and an exact committed count is
+  cheaper to consult.
+
+  **Encoding — one `uintptr_t` per-node *state word* holding three things:**
+  - **bit 0 — proxy:** the in-band flip marker. A scalar word cannot hold a
+    tagged-pointer proxy during the FLIP window, so bit 0 set means "this word is
+    mid-flip — resolve via the latch"; this is what lets the scalar ride the
+    flip-latch as a real committed edge (not a side-band store).
+  - **bit 1 — tombstone:** the one-way `LIVE → DEAD` `deleted` latch of §4.B
+    (freeze-on-free), validated by any op targeting the node.
+  - **bits 2+ — `nr_child`:** the live-child count (9 bits suffice, max 256).
+
+  This *unifies* the §4.B node mark and the committed count into a **single**
+  word: every node-state change (count ± and/or mark-dead) CASes this one word via
+  the latch — exactly the DECISION-FINAL "every op on a node contends on the same
+  word," now made concrete. Because the count is exact-and-committed, the
+  recompact may size directly from it (no separate true-occupancy scan, no
+  sizing-decouple needed); the cost is that two independent same-node deletes
+  serialize on this word (acceptable — they already must agree on the node's
+  liveness). Replaces the retired seqcount: the count rides the SAME word as the
+  freeze mark, but it is a *committed* value, not an out-of-commit-validated one.
 
 The fully-uniform alternative (the §4 baseline) is to **recompact on every
-structural change** including delete, so the node — bitmap and `nr_child`
-included — is *rebuilt, never mutated*, and all of a node's mutations contend
-on its parent edge (one MCAS word). That is the simplest correctness story but
-the most expensive (every delete is O(node) too); the hint refinements above
-buy back the O(1) insert/delete for the non-re-rank cases. Exclusivity (§5.2)
+structural change** including delete, so the node is *rebuilt, never mutated* and
+all of a node's mutations contend on its parent edge. That is the simplest
+correctness story but the most expensive (every delete is O(node) too); the state
+word above buys back the O(1) remove for the non-re-rank case. Exclusivity (§5.2)
 gates all of it: an exclusive trie keeps the cheap in-place mutate-count path.
 
-Both refinements are **noted, not implemented** — the current gate keeps the
-uniform recompact-on-insert to avoid bundling too many changes at once.
+**Status:** the recompact-on-insert gate (§4.1) is implemented; the pigeon
+sticky-hint bitmap and the unified `nr_child`+tombstone+proxy state word are
+**decided, not yet implemented**.
 
 ---
 
