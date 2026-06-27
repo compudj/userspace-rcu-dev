@@ -469,7 +469,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			 * Clear the recycled allocation's stale parent before
 			 * any later set_nth reallocation copies it forward.
 			 */
-			rcu_assign_pointer(Mmeta->parent, NULL);
+			Mmeta->parent = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			Mmeta->parent_slot_offset = 0;
 #endif
@@ -535,7 +535,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 				ft_compressed_node_ptr(child), child);
 
 			if (skip != child)
-				rcu_assign_pointer(*slot, skip);
+				*slot = skip;
 		}
 	}
 	if (M_ext)
@@ -1150,7 +1150,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ft_glue_fini(&gs);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
-		rcu_assign_pointer(fresh_meta->parent, NULL);
+		fresh_meta->parent = NULL;
 		ft_nr_keys_store(fresh_meta, 0, CMM_RELAXED);
 	}
 
@@ -2367,7 +2367,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			status = CDS_FT_STATUS_MEMORY_ERROR;
 			goto out;
 		}
-		rcu_assign_pointer(fresh_meta->parent, NULL);
+		fresh_meta->parent = NULL;
 		ft_nr_keys_store(fresh_meta, 0, CMM_RELAXED);
 
 		/*
@@ -2437,7 +2437,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);
-		rcu_assign_pointer(subtree->root, ft_node_flag(fresh_root, 0));
+		subtree->root = ft_node_flag(fresh_root, 0);
 		free_cds_ft_node(dst_ft, old_dst_root);
 
 		/* dst_key_len == 0: dst keys equal the moved keys, same lengths. */

@@ -1584,15 +1584,15 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 	if (ft_node_skip_compressed(child)) {
 		struct cds_ft_compressed_node *cn = ft_skip_to_compressed(ft, child);
 
-		rcu_assign_pointer(cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) cn)->parent, value);
+		cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) cn)->parent = value;
 		return;
 	}
 	if (ft_node_compressed(child)) {
 		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(child);
 
-		rcu_assign_pointer(cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) cn)->parent, value);
+		cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) cn)->parent = value;
 		return;
 	}
 #endif
@@ -1608,11 +1608,10 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 		if (ft->ordered_list)
 			ft_ord_cell_set_parent((struct cds_ft_node *) child, value);
 		else
-			rcu_assign_pointer(((struct cds_ft_node *) child)->prev, value);
+			((struct cds_ft_node *) child)->prev = value;
 		return;
 	}
-	rcu_assign_pointer(cds_ft_item_to_metadata(ft_node_ptr(child))->parent,
-		value);
+	cds_ft_item_to_metadata(ft_node_ptr(child))->parent = value;
 }
 
 /*

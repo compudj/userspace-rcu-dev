@@ -664,7 +664,7 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 	} else {
 		/* Re-encode the root slot to the skip form (new_cn is compressed). */
 		if (skip_value && skip_value != slot_value && slot)
-			rcu_assign_pointer(*slot, skip_value);
+			*slot = skip_value;
 		ft_set_parent(ft, slot_value, dest, slot);
 	}
 	return dest;

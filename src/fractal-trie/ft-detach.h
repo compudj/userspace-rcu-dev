@@ -130,18 +130,16 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		FT_TP(root_publish, (const void *) detached,
 			(const void *) detached->root);
 		/*
-		 * Clear parent: this node is now a root.  Use
-		 * rcu_assign_pointer so read-side parent-pointer walks
-		 * see a single atomic transition.
+		 * This node was already @ft's root, so its parent is already
+		 * NULL; only the now-stale parent_slot_offset needs clearing.
 		 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 		{
 			struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 				ft_node_ptr(detached->root));
-			rcu_assign_pointer(m->parent, NULL);
-#ifdef FEATURE_FT_SKIP_COMPRESSED
 			m->parent_slot_offset = 0;
-#endif
 		}
+#endif
 		uatomic_store(&detached->max_used_key_len,
 			      uatomic_load(&ft->max_used_key_len, CMM_RELAXED),
 			      CMM_RELAXED);
@@ -476,7 +474,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				{
 					struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 						ft_node_ptr(new_root));
-					rcu_assign_pointer(m->parent, NULL);
+					m->parent = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					m->parent_slot_offset = 0;
 #endif

@@ -218,7 +218,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	/* Wire the OLD direction (re-encode compressed slot to skip form). */
 	ft_node_get_nth_skip(branch_flag, &slot, old_ordinal, FT_PF_NONE);
 	if (sfx_skip_flag && sfx_skip_flag != old_suffix_flag && slot)
-		rcu_assign_pointer(*slot, sfx_skip_flag);
+		*slot = sfx_skip_flag;
 	/*
 	 * suffix_len == 0: @old_suffix_flag IS the live @cn->child wired directly
 	 * under the branch (no fresh suffix node), so this edge re-parents a
@@ -242,7 +242,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 			ft_compressed_node_ptr(new_dir), new_dir);
 
 		if (skip != new_dir)
-			rcu_assign_pointer(*slot, skip);
+			*slot = skip;
 	}
 	ft_glue_defer_edge(ft, glue, new_dir, branch_flag, slot);
 
@@ -2064,7 +2064,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 					cds_ft_item_to_metadata(ft_node_ptr(top_B));
 
 				/* top_B is freshly built (invisible); wire its root parent. */
-				rcu_assign_pointer(bm->parent, NULL);
+				bm->parent = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				bm->parent_slot_offset = 0;
 #endif

@@ -1051,8 +1051,7 @@ skip_copy:
 						ft_pub_rec_add(rec, skip_slot,
 							skip_new);
 					else
-						rcu_assign_pointer(*skip_slot,
-							skip_new);
+						*skip_slot = skip_new;
 				}
 			}
 		}
@@ -1139,7 +1138,7 @@ skip_copy:
 	if (mode == FT_RECOMPACT_RELOCATE)
 		ft_pub_rec_add(rec, old_node_flag_ptr, new_node_flag);
 	else
-		rcu_assign_pointer(*old_node_flag_ptr, new_node_flag);
+		*old_node_flag_ptr = new_node_flag;
 	if (old_node && old_node_ret)
 		*old_node_ret = old_node;
 

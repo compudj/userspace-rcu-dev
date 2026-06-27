@@ -562,7 +562,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 			ft_node_get_nth_skip(branch_flag, &oslot, old_ordinal,
 					FT_PF_NONE);
 			if (oslot)
-				rcu_assign_pointer(*oslot, sfx_skip_flag);
+				*oslot = sfx_skip_flag;
 		}
 
 		/*
@@ -896,7 +896,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			ft_node_get_nth_skip(jct_flag, &oslot, jct_ordinal,
 				FT_PF_NONE);
 			if (oslot)
-				rcu_assign_pointer(*oslot, sfx_skip_flag);
+				*oslot = sfx_skip_flag;
 		}
 	}
 
