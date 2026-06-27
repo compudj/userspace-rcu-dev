@@ -299,7 +299,7 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 	type_index = ft_node_type(child);
 	type = &ft_types[type_index];
 	meta = cds_ft_item_to_metadata_fast(node, type->order);
-	if (meta->nr_child != 1 || meta->external_nodes != NULL)
+	if (ft_meta_nr_child(meta) != 1 || meta->external_nodes != NULL)
 		return child;
 
 	/*
@@ -366,7 +366,7 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 	} else {
 		cn->child = single_child;
 	}
-	cn_meta->nr_child = 1;
+	ft_meta_nr_child_set(cn_meta, 1);
 	ft_nr_keys_store(cn_meta, ft_nr_keys_get(meta), CMM_RELAXED);
 	cflag = ft_compressed_node_flag(cn);
 	if (glue) {
@@ -506,7 +506,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	if (child_cn)
 		memcpy(&cn->key_bytes[path_len],
 			child_cn->key_bytes, child_len);
-	cn_meta->nr_child = 1;
+	ft_meta_nr_child_set(cn_meta, 1);
 	ft_nr_keys_store(cn_meta, 1, CMM_RELAXED);
 	/* Compressed nodes must not carry external_nodes. */
 	assert(!external_nodes);
@@ -632,7 +632,7 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 		new_cn->len = (uint8_t) rest_len;
 		new_cn->child = child;
 		memcpy(new_cn->key_bytes, rest, rest_len);
-		new_cn_meta->nr_child = 1;
+		ft_meta_nr_child_set(new_cn_meta, 1);
 		ft_nr_keys_store(new_cn_meta, subtree_count, CMM_RELAXED);
 		slot_value = ft_compressed_node_flag(new_cn);	/* PLAIN */
 		ft_glue_track(glue, slot_value);

@@ -820,7 +820,7 @@ bool cds_ft_empty(struct cds_ft *ft)
 	 * freshly-allocated (calloc'd) root with bitmap == 0 correctly
 	 * reports nr_child == 0.
 	 */
-	if (rmeta->nr_child != 0)
+	if (ft_meta_nr_child(rmeta) != 0)
 		return false;
 	return !uatomic_load(&rmeta->external_nodes, CMM_RELAXED);
 }
@@ -884,7 +884,7 @@ void calc_stats_node(const struct cds_ft *ft __attribute__((unused)),
 
 	metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 	node_stats->count++;
-	node_stats->distribution[metadata->nr_child]++;
+	node_stats->distribution[ft_meta_nr_child(metadata)]++;
 	stats->level[level].nr_internal_nodes++;
 	stats->level[level].has_nodes = true;
 }

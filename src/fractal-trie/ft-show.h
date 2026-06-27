@@ -38,7 +38,7 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 
 			print_indent(out, level);
 			fprintf(out, "Level %d, key value: %u, internal node: %p, nr_children: %u\n",
-				level, key, child_node_flag, metadata->nr_child);
+				level, key, child_node_flag, ft_meta_nr_child(metadata));
 			if (external_nodes) {
 				print_indent(out, level);
 				fprintf(out, "Level %d, key value: %u, (meta)external node list ptr: %p\n",
@@ -222,7 +222,7 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 		fprintf(out, "{\"ptr\":\"%p\",\"kind\":\"%s\",\"level\":%d,"
 			"\"nr_child\":%u,\"density\":",
 			node_flag, internal_type_name(type_index), level,
-			metadata->nr_child);
+			ft_meta_nr_child(metadata));
 		json_emit_density(out, metadata);
 		if (external_nodes)
 			fprintf(out, ",\"external_nodes\":\"%p\"",

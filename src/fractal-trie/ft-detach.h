@@ -61,7 +61,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		struct cds_ft_metadata *fresh_meta;
 
 		/* Check if source trie is empty. */
-		if (rmeta->nr_child == 0 && !rmeta->external_nodes)
+		if (ft_meta_nr_child(rmeta) == 0 && !rmeta->external_nodes)
 			return CDS_FT_STATUS_NOT_FOUND;
 
 		status = cds_ft_create(ft->group, NULL, &detached);

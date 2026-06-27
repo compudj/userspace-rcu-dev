@@ -1101,7 +1101,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	/*
 	 * @txn non-NULL: a caller-PRE-RESERVED bounded txn -- the flip commits
 	 * through it (ft_ord_cell_flip_into, infallible) so a caller that has
-	 * already wired a pre-flip side-effect (e.g. metadata->nr_child--) reaches
+	 * already wired a pre-flip side-effect (e.g. the nr_child decrement) reaches
 	 * an allocation-free point of no return; returns 0.  @txn NULL: the flip
 	 * is the op's ABORT BOUNDARY -- commit via ft_ord_cell_flip_try, which
 	 * installs nothing on OOM (a lone edge is the infallible on-stack store),

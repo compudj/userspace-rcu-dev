@@ -176,7 +176,7 @@ struct cds_ft_inode_flag *ft_merge_materialize_suffix(struct ft_merge_ctx *c,
 		sfx->child = cn->child;
 		sfx->len = (uint8_t) suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[off + 1], suffix_len);
-		sfx_meta->nr_child = 1;
+		ft_meta_nr_child_set(sfx_meta, 1);
 		ft_nr_keys_store(sfx_meta, child_keys, CMM_RELAXED);
 		plain = ft_compressed_node_flag(sfx);
 		ft_glue_track(g, plain);
@@ -276,7 +276,7 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 	run->child = child;
 	run->len = (uint8_t) p;
 	memcpy(run->key_bytes, &cn_s->key_bytes[off_s], p);
-	run_meta->nr_child = 1;
+	ft_meta_nr_child_set(run_meta, 1);
 	ft_nr_keys_store(run_meta, ck, CMM_RELAXED);
 	plain = ft_compressed_node_flag(run);
 	ft_glue_track(c->gd, plain);
@@ -1015,7 +1015,7 @@ struct cds_ft_inode_flag *ft_merge_wrap_prefix(struct ft_merge_ctx *c,
 		memcpy(&merged->key_bytes[prefix_len], mcn->key_bytes, mcn->len);
 		merged->len = (uint8_t) merged_len;
 		merged->child = mcn->child;
-		merged_meta->nr_child = 1;
+		ft_meta_nr_child_set(merged_meta, 1);
 		ft_nr_keys_store(merged_meta, mk, CMM_RELAXED);
 		mflag = ft_compressed_node_flag(merged);
 		ft_glue_track(c->gd, mflag);

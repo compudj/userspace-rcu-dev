@@ -125,7 +125,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				} else {
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
-					metadata->nr_child++;
+					ft_meta_nr_child_inc(metadata);
 				}
 				rcu_assign_pointer(qp_pointers[qp_ptr_idx],
 						child_node_flag);
@@ -157,7 +157,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			uatomic_store((uint64_t *) &node->data[4],
 				qp_bms | (((uint64_t)(1U << qp_lo)) << (qp_slot1 * 8)),
 				CMM_RELAXED);
-			metadata->nr_child++;
+			ft_meta_nr_child_inc(metadata);
 			if (_replace_old_ptr)
 				*_replace_old_ptr = false;
 			return 0;
@@ -183,7 +183,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		rcu_assign_pointer(qp_pointers[qp_ptr_idx], child_node_flag);
 		uatomic_store((uint32_t *) &node->data[0],
 			qp_root | (1U << qp_hi), CMM_RELAXED);
-		metadata->nr_child++;
+		ft_meta_nr_child_inc(metadata);
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
 		return 0;
@@ -235,7 +235,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				} else {
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
-					metadata->nr_child++;
+					ft_meta_nr_child_inc(metadata);
 				}
 				rcu_assign_pointer(qp_pointers[qp_ptr_idx],
 						child_node_flag);
@@ -267,7 +267,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			uatomic_store((uint64_t *) &node->data[8],
 				qp_bms | (((uint64_t)(1U << qp_lo)) << (qp_slot1 * 4)),
 				CMM_RELAXED);
-			metadata->nr_child++;
+			ft_meta_nr_child_inc(metadata);
 			if (_replace_old_ptr)
 				*_replace_old_ptr = false;
 			return 0;
@@ -294,7 +294,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		rcu_assign_pointer(qp_pointers[qp_ptr_idx], child_node_flag);
 		uatomic_store((uint64_t *) &node->data[0],
 			qp_root | (1ULL << qp_hi), CMM_RELAXED);
-		metadata->nr_child++;
+		ft_meta_nr_child_inc(metadata);
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
 		return 0;
@@ -362,7 +362,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				} else {
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
-					metadata->nr_child++;
+					ft_meta_nr_child_inc(metadata);
 				}
 				rcu_assign_pointer(qp_pointers[qp_ptr_idx],
 						child_node_flag);
@@ -393,7 +393,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					qp_max_lc, qp_slot1),
 					(uint16_t) (qp_sub | (1U << qp_lo)),
 					CMM_RELAXED);
-			metadata->nr_child++;
+			ft_meta_nr_child_inc(metadata);
 			if (_replace_old_ptr)
 				*_replace_old_ptr = false;
 			return 0;
@@ -421,7 +421,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		uatomic_store(ft_popcount_2l_root_bm_addr(node, qp_max_lc),
 				(uint16_t) (qp_root | (1U << qp_hi)),
 				CMM_RELAXED);
-		metadata->nr_child++;
+		ft_meta_nr_child_inc(metadata);
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
 		return 0;
@@ -469,7 +469,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			} else {
 				if (_replace_old_ptr)
 					*_replace_old_ptr = false;
-				metadata->nr_child++;
+				ft_meta_nr_child_inc(metadata);
 			}
 			rcu_assign_pointer(bp_pointers[ptr_idx], child_node_flag);
 			return 0;
@@ -516,7 +516,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 */
 		rcu_assign_pointer(bp_pointers[ptr_idx], child_node_flag);
 		uatomic_store(&bm[word_idx], word | bit, CMM_RELAXED);
-		metadata->nr_child++;
+		ft_meta_nr_child_inc(metadata);
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
 		return 0;
@@ -574,7 +574,7 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 
 		/* Set n in bitmap. */
 		cds_set_bit_relaxed(bitmap->bitmap, n);
-		metadata->nr_child++;
+		ft_meta_nr_child_inc(metadata);
 	}
 	return 0;
 }
@@ -647,7 +647,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	assert(ft_popcount_node_get_nr_child(type, node) <= type->max_child);
 
 	if (!newptr) {
-		if (metadata->nr_child <= type->min_child) {
+		if (ft_meta_nr_child(metadata) <= type->min_child) {
 			/* We need to try recompacting the node */
 			return -EFBIG;
 		}
@@ -671,7 +671,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		pub->new_val = newptr;
 		pub->armed = true;
 		if (!newptr)
-			metadata->nr_child--;
+			ft_meta_nr_child_dec(metadata);
 		return 0;
 	}
 	/*
@@ -685,10 +685,10 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
 	ft_node_child_edge_flip(ft, node_flag_ptr, *node_flag_ptr, newptr);
 	if (!newptr)
-		metadata->nr_child--;
+		ft_meta_nr_child_dec(metadata);
 	dbg_printf("popcount replace ptr: %u child, metadata: %u child, for node %p newptr %p\n",
 		(unsigned int) ft_popcount_node_get_nr_child(type, node),
-		(unsigned int) metadata->nr_child,
+		(unsigned int) ft_meta_nr_child(metadata),
 		node, newptr);
 	return 0;
 }
@@ -707,7 +707,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 
 	if (!newptr) {
 		/* We should try recompacting the node */
-		if (metadata->nr_child <= type->min_child)
+		if (ft_meta_nr_child(metadata) <= type->min_child)
 			return -EFBIG;
 	}
 	dbg_printf("ft_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
@@ -731,7 +731,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		if (!newptr) {
 			pub->pigeon_bitmap = cds_ft_item_to_bitmap(node, type->order);
 			pub->pigeon_bit = n;
-			metadata->nr_child--;
+			ft_meta_nr_child_dec(metadata);
 		}
 		return 0;
 	}
@@ -744,7 +744,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 
 		/* Clear n in bitmap. */
 		cds_clear_bit_relaxed(bitmap->bitmap, n);
-		metadata->nr_child--;
+		ft_meta_nr_child_dec(metadata);
 	}
 	return 0;
 }
@@ -875,9 +875,9 @@ int ft_node_recompact(enum ft_recompact mode,
 	switch (mode) {
 	case FT_RECOMPACT_ADD_SAME:
 		new_type_index = find_nearest_type_index(old_type_index,
-			metadata->nr_child + 1, false);
+			ft_meta_nr_child(metadata) + 1, false);
 		dbg_printf("Recompact for node with %u children\n",
-			metadata->nr_child + 1);
+			ft_meta_nr_child(metadata) + 1);
 		break;
 	case FT_RECOMPACT_ADD_NEXT:
 		if (!metadata || old_type_index == NODE_INDEX_NULL) {
@@ -885,16 +885,16 @@ int ft_node_recompact(enum ft_recompact mode,
 			dbg_printf("Recompact for NULL\n");
 		} else {
 			new_type_index = find_nearest_type_index(old_type_index,
-				metadata->nr_child + 1, false);
+				ft_meta_nr_child(metadata) + 1, false);
 			dbg_printf("Recompact for node with %u children\n",
-				metadata->nr_child + 1);
+				ft_meta_nr_child(metadata) + 1);
 		}
 		break;
 	case FT_RECOMPACT_DEL:
 		new_type_index = find_nearest_type_index(old_type_index,
-			metadata->nr_child - 1, is_root);
+			ft_meta_nr_child(metadata) - 1, is_root);
 		dbg_printf("Recompact for node with %u children\n",
-			metadata->nr_child - 1);
+			ft_meta_nr_child(metadata) - 1);
 		break;
 	case FT_RECOMPACT_RELOCATE:
 		new_type_index = old_type_index;	/* same type, pure relocation */

@@ -470,7 +470,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		sfx->child = cn->child;
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1], suffix_len);
-		sfx_meta->nr_child = 1;
+		ft_meta_nr_child_set(sfx_meta, 1);
 		ft_nr_keys_store(sfx_meta, old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);	/* PLAIN: install + recover sfx directly */
 		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);	/* skip form for the slot */
@@ -505,7 +505,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 			for (k = 0; k < new_len; k++)
 				nb->key_bytes[k] = iter_key[diverge_pos + 1 + k];
 		}
-		nb_meta->nr_child = 1;
+		ft_meta_nr_child_set(nb_meta, 1);
 		ft_nr_keys_store(nb_meta, 1, CMM_RELAXED);
 		new_branch_flag = ft_compressed_node_flag(nb);
 		ft_set_parent(ft, nb->child, new_branch_flag, NULL);
@@ -599,7 +599,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		pfx->child = branch_flag;
 		pfx->len = diverge_pos;
 		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
-		pfx_meta->nr_child = 1;
+		ft_meta_nr_child_set(pfx_meta, 1);
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
 		pfx_child = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, branch_flag, pfx_child, &pfx->child);
@@ -803,7 +803,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[remaining + 1],
 			suffix_len);
-		sfx_meta->nr_child = 1;
+		ft_meta_nr_child_set(sfx_meta, 1);
 		ft_nr_keys_store(sfx_meta, child_nr_keys,
 			CMM_RELAXED);
 		suffix_flag = ft_compressed_node_flag(sfx);	/* PLAIN: install + recover sfx directly */
@@ -901,7 +901,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		pfx->child = jct_flag;
 		pfx->len = remaining;
 		memcpy(pfx->key_bytes, cn->key_bytes, remaining);
-		pfx_meta->nr_child = 1;
+		ft_meta_nr_child_set(pfx_meta, 1);
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
@@ -924,7 +924,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			pfx->child = jct_flag;
 			pfx->len = 1;
 			pfx->key_bytes[0] = cn->key_bytes[0];
-			pfx_meta->nr_child = 1;
+			ft_meta_nr_child_set(pfx_meta, 1);
 			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 				CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
@@ -1626,7 +1626,7 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 			struct cds_ft_metadata *cn_meta =
 				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 			fprintf(stderr, "BUG: cn->child NULL, cn=%p cn->len=%u depth=%u external_nodes=%p nr_child=%u\n",
-				cn, cn->len, d->depth, cn_meta->external_nodes, (unsigned)cn_meta->nr_child);
+				cn, cn->len, d->depth, cn_meta->external_nodes, (unsigned)ft_meta_nr_child(cn_meta));
 			abort();
 		}
 		if (cn->len == remaining) {

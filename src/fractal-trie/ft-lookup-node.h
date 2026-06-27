@@ -70,7 +70,7 @@ struct cds_ft_inode_flag *ft_popcount_1l_node_get_direction(
  * FT_POPCOUNT class nr_child: dispatch to the popcount_1l or
  * popcount_2l layout helper.  Both count populated slots via
  * popcount of the bitmap (independent of the soft-delete pointer
- * accounting in metadata->nr_child).
+ * accounting in the metadata nr_child count).
  */
 static inline_lookup
 uint8_t ft_popcount_node_get_nr_child(const struct cds_ft_type *type,
@@ -898,7 +898,7 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 			*(uint32_t *) &node->data[0] = (uint32_t) (1U << hi);
 			*(uint64_t *) &node->data[4] = (uint64_t) (1ULL << lo);
 			pointers[0] = child_node_flag;
-			metadata->nr_child++;
+			ft_meta_nr_child_inc(metadata);
 			return 0;
 		}
 
@@ -934,7 +934,7 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 
 		*(uint32_t *) &node->data[0] = root;
 		*(uint64_t *) &node->data[4] = bms;
-		metadata->nr_child++;
+		ft_meta_nr_child_inc(metadata);
 		return 0;
 	}
 
@@ -949,7 +949,7 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 			*(uint64_t *) &node->data[0] = 1ULL << hi;
 			*(uint64_t *) &node->data[8] = (uint64_t) (1ULL << lo);
 			pointers[0] = child_node_flag;
-			metadata->nr_child++;
+			ft_meta_nr_child_inc(metadata);
 			return 0;
 		}
 
@@ -986,7 +986,7 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 
 		*(uint64_t *) &node->data[0] = root;
 		*(uint64_t *) &node->data[8] = bms;
-		metadata->nr_child++;
+		ft_meta_nr_child_inc(metadata);
 		return 0;
 	}
 
@@ -1001,7 +1001,7 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 		*ft_popcount_2l_root_bm_addr(node, max_lc) = (uint16_t) (1U << hi);
 		*ft_popcount_2l_sub_bm_addr(node, max_lc, 0) = (uint16_t) (1U << lo);
 		pointers[0] = child_node_flag;
-		metadata->nr_child++;
+		ft_meta_nr_child_inc(metadata);
 		return 0;
 	}
 
@@ -1045,7 +1045,7 @@ int ft_popcount_2l_node_set_nth(const struct cds_ft_type *type,
 
 	*ft_popcount_2l_sub_bm_addr(node, max_lc, slot1) =
 		(uint16_t) (sub | (1U << lo));
-	metadata->nr_child++;
+	ft_meta_nr_child_inc(metadata);
 	return 0;
 	}
 }
@@ -1313,7 +1313,7 @@ int ft_popcount_1l_node_set_nth(const struct cds_ft_type *type,
 		memset(hdr, 0, sizeof(*hdr));
 		hdr->bm[word_idx] = 1ULL << bit_idx;
 		pointers[0] = child_node_flag;
-		metadata->nr_child++;
+		ft_meta_nr_child_inc(metadata);
 		return 0;
 	}
 
@@ -1333,7 +1333,7 @@ int ft_popcount_1l_node_set_nth(const struct cds_ft_type *type,
 	pointers[ptr_idx] = child_node_flag;
 
 	hdr->bm[word_idx] = word | (1ULL << bit_idx);
-	metadata->nr_child++;
+	ft_meta_nr_child_inc(metadata);
 	return 0;
 }
 

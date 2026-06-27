@@ -165,7 +165,7 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	cn2_meta->parent_slot_offset = cn_meta->parent_slot_offset;
 	/* Same slot in the same parent => same incoming edge byte (up-walk source). */
 	cn2_meta->incoming_byte = cn_meta->incoming_byte;
-	cn2_meta->nr_child = cn_meta->nr_child;		/* == 1 for a compressed node */
+	ft_meta_nr_child_set(cn2_meta, ft_meta_nr_child(cn_meta));		/* == 1 for a compressed node */
 	cn2_meta->external_nodes = NULL;		/* never set on a compressed node */
 	ft_nr_keys_store(cn2_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
 	cn2_flag = ft_compressed_node_flag(cn2);

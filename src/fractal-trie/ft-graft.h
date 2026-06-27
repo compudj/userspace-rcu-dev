@@ -107,7 +107,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1],
 			suffix_len);
-		sfx_meta->nr_child = 1;
+		ft_meta_nr_child_set(sfx_meta, 1);
 		ft_nr_keys_store(sfx_meta, old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
 		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
@@ -257,7 +257,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		pfx->child = branch_flag;
 		pfx->len = diverge_pos;
 		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
-		pfx_meta->nr_child = 1;
+		ft_meta_nr_child_set(pfx_meta, 1);
 		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, branch_flag, top_flag, NULL);
@@ -276,7 +276,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 			pfx->child = branch_flag;
 			pfx->len = 1;
 			pfx->key_bytes[0] = cn->key_bytes[0];
-			pfx_meta->nr_child = 1;
+			ft_meta_nr_child_set(pfx_meta, 1);
 			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
 				CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
@@ -788,7 +788,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	src_rmeta = ft_root_metadata(src_ft);
 
 	/* Check if source trie is empty. */
-	if (src_rmeta->nr_child == 0 && !src_rmeta->external_nodes)
+	if (ft_meta_nr_child(src_rmeta) == 0 && !src_rmeta->external_nodes)
 		return CDS_FT_STATUS_OK;
 
 	if (key_len == 0) {
@@ -798,7 +798,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct cds_ft_inode *old_dst_root;
 
 		/* Destination must be empty for a root-level graft. */
-		if (dst_rmeta->nr_child != 0 || dst_rmeta->external_nodes)
+		if (ft_meta_nr_child(dst_rmeta) != 0 || dst_rmeta->external_nodes)
 			return CDS_FT_STATUS_POPULATED_ERROR;
 
 		/*
@@ -941,7 +941,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * the orphaned wrapper on success.  (Cross-trie graft never hits this:
 		 * a real source root always has children.)
 		 */
-		bool nil_key_root = (src_rmeta->nr_child == 0
+		bool nil_key_root = (ft_meta_nr_child(src_rmeta) == 0
 				&& src_rmeta->external_nodes != NULL);
 		struct cds_ft_inode_flag *graft_payload = nil_key_root ?
 			(struct cds_ft_inode_flag *) ft_dereference_external(
@@ -1578,7 +1578,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 
 		old_swap_root = swap_ft->root;
 		swap_rmeta = ft_root_metadata(swap_ft);
-		swap_empty = (swap_rmeta->nr_child == 0 && !swap_rmeta->external_nodes);
+		swap_empty = (ft_meta_nr_child(swap_rmeta) == 0 && !swap_rmeta->external_nodes);
 		swap_count = swap_empty ? 0 : ft_nr_keys_get(swap_rmeta);
 
 		/*
@@ -1680,7 +1680,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 					ccn->len);
 				merged->len = (uint8_t) merged_len;
 				merged->child = ccn->child;	/* live swap grandchild */
-				merged_meta->nr_child = 1;
+				ft_meta_nr_child_set(merged_meta, 1);
 				ft_nr_keys_store(merged_meta,
 					ft_nr_keys_get(pcn_meta), CMM_RELAXED);
 				merged_meta->parent = pcn_meta->parent;
@@ -2004,7 +2004,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (!empty_pruned) {
 			pmeta = cds_ft_item_to_metadata(ft_node_ptr(d.pnf));
 			if (!have_insert)
-				pmeta->nr_child--;
+				ft_meta_nr_child_dec(pmeta);
 			if (swap_count != old_count)
 				ft_propagate_external_count_parent(dst_ft, d.pnf,
 						(long) swap_count - (long) old_count);

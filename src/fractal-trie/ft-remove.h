@@ -216,7 +216,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * may rebuild canonical form).  Allocation failure: same fallback.
  *
  * Preconditions (caller asserts):
- *   - @iter_meta->nr_child == 1
+ *   - iter_meta nr_child == 1
  *   - @iter_meta->external_nodes == NULL
  *   - @iter_meta->parent != NULL  (non-root)
  *
@@ -324,7 +324,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			child_cn->key_bytes, child_len);
 	new_cn->len = (uint8_t) merged_len;
 	new_cn->child = child_cn ? child_cn->child : surviving_child;
-	new_cn_meta->nr_child = 1;
+	ft_meta_nr_child_set(new_cn_meta, 1);
 	ft_nr_keys_store(new_cn_meta,
 		ft_nr_keys_get(parent_cn_meta
 			? parent_cn_meta
@@ -525,8 +525,8 @@ int ft_detach_node(struct cds_ft *ft,
 		metadata_stack[nr_metadata++] = metadata;
 		is_root = (metadata->parent == NULL);
 
-		assert(metadata->nr_child > 0);
-		if (!prev_external_nodes_found && (metadata->nr_child == 1 && !metadata->external_nodes && !is_root)) {
+		assert(ft_meta_nr_child(metadata) > 0);
+		if (!prev_external_nodes_found && (ft_meta_nr_child(metadata) == 1 && !metadata->external_nodes && !is_root)) {
 			nr_clear++;
 		}
 		nr_branch++;
@@ -545,7 +545,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 * being promoted and a further external ancestor is a genuine
 		 * boundary -- hence the `&& topmost_external_nodes` guard.
 		 */
-		if (prev_external_nodes_found || metadata->nr_child > 1 ||
+		if (prev_external_nodes_found || ft_meta_nr_child(metadata) > 1 ||
 		    (metadata->external_nodes && topmost_external_nodes) ||
 		    is_root) {
 			if (!is_root) {
@@ -697,7 +697,7 @@ int ft_detach_node(struct cds_ft *ft,
 						ft_skip_child_ptr(walk_nf));
 					cm = cds_ft_item_to_metadata(
 						(struct cds_ft_inode *) cn);
-					nr_child = cm->nr_child;
+					nr_child = ft_meta_nr_child(cm);
 					ext_nodes = cm->external_nodes;
 					next = cn->child;
 				} else {
@@ -705,7 +705,7 @@ int ft_detach_node(struct cds_ft *ft,
 						cds_ft_item_to_metadata(
 							ft_node_ptr(walk_nf));
 
-					nr_child = m->nr_child;
+					nr_child = ft_meta_nr_child(m);
 					ext_nodes = m->external_nodes;
 					if (nr_child == 1) {
 						unsigned int key;
@@ -775,7 +775,7 @@ int ft_detach_node(struct cds_ft *ft,
 
 			if (ft_group_skip_compressed(ft->group) &&
 			    !topmost_external_nodes &&
-			    bmeta->nr_child == 2 &&
+			    ft_meta_nr_child(bmeta) == 2 &&
 			    !bmeta->external_nodes &&
 			    bmeta->parent != NULL) {
 				struct cds_ft_inode_flag *s_child = NULL;
@@ -818,7 +818,7 @@ int ft_detach_node(struct cds_ft *ft,
 				metadata_stack[nr_branch - 1]->parent;
 			/*
 			 * Pre-reserve the commit txn BEFORE ft_node_replace_ptr's pre-flip
-			 * side-effects -- the in-place delete's metadata->nr_child-- (it
+			 * side-effects -- the in-place delete's nr_child decrement (it
 			 * commits the deferred slot store fused with the cell unsplice via
 			 * ft_remove_one_commit below) OR the recompaction's eager re-parent
 			 * of the rebuilt node's children (it publishes via the tail
@@ -1012,7 +1012,7 @@ int ft_detach_node(struct cds_ft *ft,
 							cn = ft_compressed_node_ptr(walk_nf);
 							cm = cds_ft_item_to_metadata(
 								(struct cds_ft_inode *) cn);
-							nr_child = cm->nr_child;
+							nr_child = ft_meta_nr_child(cm);
 							ext_nodes = cm->external_nodes;
 							next = cn->child;
 						} else {
@@ -1020,7 +1020,7 @@ int ft_detach_node(struct cds_ft *ft,
 								cds_ft_item_to_metadata(
 									ft_node_ptr(walk_nf));
 
-							nr_child = m->nr_child;
+							nr_child = ft_meta_nr_child(m);
 							ext_nodes = m->external_nodes;
 							if (nr_child == 1) {
 								unsigned int key;
@@ -1166,7 +1166,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 * no external_nodes attached, fold it via the chain-compress
 		 * 4-case merge (canonical form under SKIP_COMPRESSED).
 		 */
-		if (iter_meta->nr_child == 1 &&
+		if (ft_meta_nr_child(iter_meta) == 1 &&
 		    !iter_meta->external_nodes &&
 		    iter_meta->parent != NULL) {
 			ft_canonicalize_chain_compress(ft, iter_node_flag,
@@ -1617,7 +1617,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * child), stable across the removal.
 			 */
 			if (ft_group_skip_compressed(ft->group) &&
-			    holder_meta->nr_child == 1 &&
+			    ft_meta_nr_child(holder_meta) == 1 &&
 			    holder_meta->parent != NULL) {
 				uint8_t s_byte = 0;
 				struct cds_ft_inode_flag *s_child =
@@ -1690,7 +1690,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				 */
 				if (ret == 0 && ft_group_skip_compressed(ft->group) &&
 				    !holder_meta->external_nodes &&
-				    holder_meta->nr_child == 1 &&
+				    ft_meta_nr_child(holder_meta) == 1 &&
 				    holder_meta->parent != NULL) {
 					ft_canonicalize_chain_compress(ft, holder_flag,
 						holder_meta, ft_get_parent_slot(holder_meta, ft));
@@ -2034,7 +2034,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			 * back, retriable MEMORY_ERROR with a NULL out-param).
 			 */
 			if (ft_group_skip_compressed(ft->group) &&
-			    holder_meta->nr_child == 1 &&
+			    ft_meta_nr_child(holder_meta) == 1 &&
 			    holder_meta->parent != NULL) {
 				uint8_t s_byte = 0;
 				struct cds_ft_inode_flag *s_child =
@@ -2104,7 +2104,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				}
 				if (ret == 0) {
 					ft_chain_mark_removed(chain_head);
-					assert(holder_meta->nr_child > 0);
+					assert(ft_meta_nr_child(holder_meta) > 0);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					/*
 					 * Out-of-bound residue: best-effort post-prune
@@ -2112,7 +2112,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					 * 1-child internal if it still cannot merge).
 					 */
 					if (ft_group_skip_compressed(ft->group) &&
-					    holder_meta->nr_child == 1 &&
+					    ft_meta_nr_child(holder_meta) == 1 &&
 					    holder_meta->parent != NULL) {
 						ft_canonicalize_chain_compress(ft, holder_flag,
 							holder_meta, ft_get_parent_slot(holder_meta, ft));

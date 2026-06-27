@@ -724,6 +724,17 @@ struct ft_pub_rec {
  * before the metadata union -- no overlap with metadata fields.
  * All metadata fields remain valid throughout the RCU grace period.
  */
+/*
+ * Per-node MCAS state word (struct cds_ft_metadata.state) bit layout.
+ * bit 0 = proxy (in-band flip marker), bit 1 = tombstone (LIVE->DEAD),
+ * bits 2+ = nr_child.  See doc/design/mcas-multiwriter-readiness.md §4.2.
+ */
+#define FT_STATE_PROXY			((uintptr_t) 1 << 0)
+#define FT_STATE_TOMBSTONE		((uintptr_t) 1 << 1)
+#define FT_STATE_NR_CHILD_SHIFT		2
+#define FT_STATE_NR_CHILD_ONE		((uintptr_t) 1 << FT_STATE_NR_CHILD_SHIFT)
+#define FT_STATE_TAG_MASK		(FT_STATE_PROXY | FT_STATE_TOMBSTONE)
+
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
 	struct cds_ft_inode_flag *parent;	/*
@@ -750,9 +761,24 @@ struct cds_ft_metadata {
 	unsigned long nr_keys;
 
 	/*
+	 * Per-node MCAS state word (doc/design/mcas-multiwriter-readiness.md
+	 * §4.2).  One uintptr_t so a single committed flip-latch edge can carry
+	 * a node-state change:
+	 *   bit 0   FT_STATE_PROXY     -- in-band flip marker (set only mid-flip;
+	 *                                 lets the scalar ride the flip-latch).
+	 *   bit 1   FT_STATE_TOMBSTONE -- one-way LIVE->DEAD deleted latch (§4.B).
+	 *   bits 2+ nr_child           -- live-child count (max 256).
+	 * The proxy/tombstone bits are reserved-and-zero until Invariant-2 is
+	 * wired; today only nr_child is live.  Access nr_child via the
+	 * ft_meta_nr_child* helpers (they preserve the low tag bits) -- never
+	 * read/write the word directly.
+	 */
+	uintptr_t state;
+
+	/*
 	 * Packed bitfield -- small fields in a single uint32_t.
+	 * (nr_child lives in @state above, not here.)
 	 *
-	 * nr_child:               9 bits (max 256)
 	 * parent_slot_offset:     8 bits -- pointer-stride offset of this
 	 *                         node's slot within its parent node body
 	 *                         (byte_offset / sizeof(void *)).  Maintained
@@ -765,7 +791,6 @@ struct cds_ft_metadata {
 	 *                         FT_ALLOC_ORDER_MIN minimum; far: a separate
 	 *                         uint32_t (see below).
 	 */
-	uint32_t nr_child:9;
 	uint32_t parent_slot_offset:8;
 #ifdef FT_FAR_METADATA
 	/*
@@ -803,6 +828,37 @@ struct cds_ft_metadata {
 	uint8_t incoming_byte;
 #endif
 };
+
+/*
+ * nr_child accessors -- nr_child lives in @state bits 2+, with the proxy
+ * (bit 0) and tombstone (bit 1) tags below it.  Reads shift the tags out;
+ * writes preserve them.  Inc/dec add/subtract one count unit, which leaves
+ * the low tag bits untouched.
+ */
+static inline
+unsigned int ft_meta_nr_child(const struct cds_ft_metadata *meta)
+{
+	return (unsigned int) (meta->state >> FT_STATE_NR_CHILD_SHIFT);
+}
+
+static inline
+void ft_meta_nr_child_set(struct cds_ft_metadata *meta, unsigned int n)
+{
+	meta->state = ((uintptr_t) n << FT_STATE_NR_CHILD_SHIFT)
+		| (meta->state & FT_STATE_TAG_MASK);
+}
+
+static inline
+void ft_meta_nr_child_inc(struct cds_ft_metadata *meta)
+{
+	meta->state += FT_STATE_NR_CHILD_ONE;
+}
+
+static inline
+void ft_meta_nr_child_dec(struct cds_ft_metadata *meta)
+{
+	meta->state -= FT_STATE_NR_CHILD_ONE;
+}
 
 /*
  * Compressed path node.  Replaces a chain of single-child internal

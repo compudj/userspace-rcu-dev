@@ -435,10 +435,10 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		return -1;
 	}
 	/* nr_child must be 0 or 1. */
-	if (cn_meta->nr_child > 1) {
+	if (ft_meta_nr_child(cn_meta) > 1) {
 		if (out)
 			fprintf(out, "ft_verify: depth %u: compressed node %p nr_child %u > 1\n",
-				depth, node_flag, cn_meta->nr_child);
+				depth, node_flag, ft_meta_nr_child(cn_meta));
 		return -1;
 	}
 	/*
@@ -451,11 +451,11 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 * accept a stored nr_child of 1 with cn->child = NULL as long
 	 * as nr_keys also dropped to 0 in lockstep.
 	 */
-	if ((cn_meta->nr_child == 1) != (ft_node_ptr(cn->child) != NULL)) {
+	if ((ft_meta_nr_child(cn_meta) == 1) != (ft_node_ptr(cn->child) != NULL)) {
 		if (out)
 			fprintf(out, "ft_verify: depth %u: compressed node %p nr_child %u does not match cn->child %p presence\n",
 				depth, node_flag,
-				cn_meta->nr_child, cn->child);
+				ft_meta_nr_child(cn_meta), cn->child);
 		return -1;
 	}
 	/* Compressed nodes must not carry external_nodes. */
@@ -745,11 +745,11 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 						(unsigned int) type->order);
 				return -1;
 			}
-			if (metadata->nr_child > type->max_child) {
+			if (ft_meta_nr_child(metadata) > type->max_child) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: internal node %p nr_child %u exceeds type %u max_child %u\n",
 						depth, node_flag,
-						metadata->nr_child, type_index,
+						ft_meta_nr_child(metadata), type_index,
 						(unsigned int) type->max_child);
 				return -1;
 			}
@@ -841,11 +841,11 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			}
 		}
 		/* Verify nr_child. */
-		if (metadata->nr_child != counted_children) {
+		if (ft_meta_nr_child(metadata) != counted_children) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: internal node %p nr_child mismatch: "
 					"stored %u, counted %u\n",
-					depth, node_flag, metadata->nr_child,
+					depth, node_flag, ft_meta_nr_child(metadata),
 					counted_children);
 			return -1;
 		}
