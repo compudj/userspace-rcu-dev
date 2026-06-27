@@ -449,6 +449,48 @@
 #endif
 
 /*
+ * FEATURE_FT_INSERT_IN_PLACE: in-place occupancy-bitmap safe-append.
+ *
+ * When enabled (default), an insert that lands at a node's tail rank with
+ * spare tier capacity is applied IN PLACE: the child slot is published and
+ * the node's occupancy-bitmap bit is set with a relaxed store on the LIVE
+ * node's metadata word (ft_popcount_node_set_nth Cases 2A/2B,
+ * ft_pigeon_node_set_nth).  This is the cheap O(1) insert tier.
+ *
+ * Disable with -DNO_FEATURE_FT_INSERT_IN_PLACE to force RECOMPACT-ON-INSERT:
+ * every new-occupancy insert (i.e. not an in-place pointer replace at an
+ * already-occupied slot) instead reports -ERANGE, so the setter wrapper
+ * (ft_node_set_nth_rec) routes it through ft_node_recompact(ADD_SAME) -- a
+ * fresh node carrying the new entry AND its bitmap is built build-invisibly
+ * and the parent edge is flipped, exactly as a non-tail insert already does
+ * today.  This removes the last reader-visible in-place node-word mutation
+ * (the Invariant-2 disjoint-word hazard, see doc/design/mcas-multiwriter-
+ * readiness.md S4): every node change becomes a whole-node replacement via
+ * the parent flip-txn edge.  Behaviour-identical under a single writer (the
+ * recompact path is the same one a non-tail insert takes), so the off build
+ * validates the MCAS-ready shape on the current suite before any MCAS commit
+ * body exists -- at the cost of turning the O(1) in-place insert into an
+ * O(node) alloc-and-copy recompact (a shared/multi-writer cost tier; an
+ * exclusive trie will keep the in-place store via a runtime gate later).
+ *
+ * Both popcount and pigeon nodes recompact uniformly here.  FUTURE (noted,
+ * not done -- kept simple for now): a PIGEON slot is direct-indexed, so its
+ * pointer store is already a clean flip edge and the bitmap is only an
+ * occupancy HINT (point lookups read the slot; iteration rescans past a set
+ * bit whose slot is NULL).  The pigeon recompact is therefore avoidable: make
+ * the hint bitmap STICKY instead -- set with an atomic OR, never cleared in
+ * place (a delete leaves the bit; only a recompact rebuilds a clean bitmap),
+ * optionally triggering a cleanup recompact once stale bits get high -- to
+ * keep pigeon's O(1) insert/delete.  See doc/design/mcas-multiwriter-
+ * readiness.md S4.
+ *
+ * Enabled by default.  Disable with -DNO_FEATURE_FT_INSERT_IN_PLACE.
+ */
+#ifndef NO_FEATURE_FT_INSERT_IN_PLACE
+# define FEATURE_FT_INSERT_IN_PLACE
+#endif
+
+/*
  * Skip-compressed pointers encode the compressed path length in the
  * high bits of pointers (FT_SKIP_LEN_BITS bits starting at
  * FT_SKIP_LEN_SHIFT -- e.g. bits 57-63 on x86-64, 56-63 on AArch64;
