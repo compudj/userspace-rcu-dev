@@ -252,6 +252,7 @@ struct ft_remove_pub {
 	struct cds_ft_inode_flag **slot;
 	struct cds_ft_inode_flag *old_val;
 	struct cds_ft_inode_flag *new_val;	/* NULL for delete; chain head for promote */
+	struct cds_ft_metadata *state_meta;	/* non-NULL (delete) => fuse its nr_child-- */
 	struct cds_ft_bitmap *pigeon_bitmap;	/* non-NULL => clear bit post-flip */
 	uint8_t pigeon_bit;
 	bool armed;
@@ -1132,11 +1133,12 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **struct_slot,
 		struct cds_ft_inode_flag *struct_old,
 		struct cds_ft_inode_flag *struct_new,
+		struct cds_ft_metadata *state_meta,
 		struct ft_ord_cell *dead_cell,
 		struct ft_detach_run *run,
 		struct urcu_flip_txn *txn)
 {
-	struct ft_ord_cell_edge edges[5];	/* 1 structural + <=4 cell/run */
+	struct ft_ord_cell_edge edges[6];	/* 1 structural + state + <=4 cell/run */
 	unsigned int n = 0;
 
 	edges[n].slot = (struct ft_ord_cell **) struct_slot;
@@ -1149,22 +1151,36 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 	/*
+	 * @state_meta non-NULL (a delete): fuse its nr_child-- into THIS flip so
+	 * the structural unlink and the count decrement go live atomically.  Only
+	 * when @txn is present, though -- a @txn NULL commit is the op's lone-edge
+	 * ABORT BOUNDARY (n == 1, on-stack, infallible) and the caller ignores the
+	 * return, so a second fused edge there would make it heap/fallible; the
+	 * decrement rides its own lone-edge flip after instead (still a committed
+	 * edge, just not atomic with the structure -- as in the pre-fusion path).
+	 *
 	 * @txn non-NULL: a caller-PRE-RESERVED bounded txn -- the flip commits
-	 * through it (ft_ord_cell_flip_into, infallible) so a caller that has
-	 * already wired a pre-flip side-effect (e.g. the nr_child decrement) reaches
-	 * an allocation-free point of no return; returns 0.  @txn NULL: the flip
-	 * is the op's ABORT BOUNDARY -- commit via ft_ord_cell_flip_try, which
-	 * installs nothing on OOM (a lone edge is the infallible on-stack store),
-	 * and return -ENOMEM so the (no-pre-flip-side-effect) caller aborts the
-	 * removal with the structure untouched.
+	 * through it (ft_ord_cell_flip_into, infallible); returns 0.  @txn NULL:
+	 * commit via ft_ord_cell_flip_try, which installs nothing on OOM (a lone
+	 * edge is the infallible on-stack store), and return -ENOMEM so the caller
+	 * aborts the removal with the structure untouched.
 	 */
 	if (txn) {
+		if (state_meta) {
+			uintptr_t old = state_meta->state;
+
+			ft_state_edge(&edges[n], &state_meta->state, old,
+				old - FT_STATE_NR_CHILD_ONE);
+			n++;
+		}
 		ft_ord_cell_flip_into(ft, txn, edges, n);
 	} else {
 		int cret = ft_ord_cell_flip_try(ft, edges, n);
 
 		if (cret)
-			return cret;	/* nothing installed: caller aborts */
+			return cret;	/* nothing installed: caller aborts (no dec) */
+		if (state_meta)
+			ft_meta_nr_child_dec_flip(state_meta);
 	}
 	if (run) {
 		/* @into NULL = EXCISE-ONLY (the merge source side): the run is

@@ -868,7 +868,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (!boundary_fused && pub && pub->armed) {
 				ft_remove_one_commit(ft, pub->slot, pub->old_val,
-					pub->new_val, fuse_cell, run, commit_txn);
+					pub->new_val, pub->state_meta,
+					fuse_cell, run, commit_txn);
 				commit_txn_used = (commit_txn != NULL);
 				if (pub->pigeon_bitmap)
 					cds_clear_bit_relaxed(
@@ -1663,7 +1664,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					ret = ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) node, NULL,
-						dead_cell, NULL, NULL);
+						NULL, dead_cell, NULL, NULL);
 					if (ret) {
 						ft_propagate_external_count_parent(ft,
 							holder_flag, 1);
@@ -1914,7 +1915,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			if (ft_remove_one_commit(ft,
 				(struct cds_ft_inode_flag **) &metadata->external_nodes,
 				(struct cds_ft_inode_flag *) external_nodes, NULL,
-				dead, NULL, NULL)) {
+				NULL, dead, NULL, NULL)) {
 				ft_nr_keys_store(metadata,
 					ft_nr_keys_get(metadata) + 1, CMM_RELEASE);
 				*result_node = NULL;
@@ -2084,7 +2085,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					ret = ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) chain_head, NULL,
-						dead_cell, NULL, NULL);
+						NULL, dead_cell, NULL, NULL);
 					if (ret)
 						ft_propagate_external_count_parent(ft,
 							holder_flag, 1);

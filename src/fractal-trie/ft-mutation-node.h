@@ -671,7 +671,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		pub->new_val = newptr;
 		pub->armed = true;
 		if (!newptr)
-			ft_meta_nr_child_dec_flip(metadata);
+			pub->state_meta = metadata;	/* nr_child-- fuses into the commit flip */
 		return 0;
 	}
 	/*
@@ -731,7 +731,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		if (!newptr) {
 			pub->pigeon_bitmap = cds_ft_item_to_bitmap(node, type->order);
 			pub->pigeon_bit = n;
-			ft_meta_nr_child_dec_flip(metadata);
+			pub->state_meta = metadata;	/* nr_child-- fuses into the commit flip */
 		}
 		return 0;
 	}
