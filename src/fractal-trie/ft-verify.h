@@ -851,15 +851,17 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 		/*
 		 * Pigeon bitmap consistency: pigeon nodes maintain a
-		 * 256-bit live-slot bitmap (allocated alongside the node
+		 * 256-bit occupancy bitmap (allocated alongside the node
 		 * via ft_alloc_item with type->bitmap=true) that the
-		 * directional / bitmap-scan readers consult.  The bitmap
-		 * must agree slot-for-slot with the actual pointer array:
-		 * bit i set iff node->data[i] holds a non-NULL pointer.
-		 * ft_pigeon_node_get_nth reads node->data[n] directly
-		 * (bitmap-independent), so cross-checking the two surfaces
-		 * a desynchronised set / clear at the mutation site rather
-		 * than letting it produce wrong directional results later.
+		 * directional / bitmap-scan readers consult.  The bitmap is
+		 * a HINT, with the pointer array as the sole truth: a
+		 * non-NULL node->data[i] MUST have bit i set (else the
+		 * directional scan would skip a live child), but a set bit
+		 * over a NULL slot is allowed -- a sticky soft-delete hole
+		 * the scan rescans past (ft_pigeon_node_get_direction) and
+		 * a recompact rebuilds away.  So cross-check the weaker
+		 * slot_set => bit_set, surfacing only a live child missing
+		 * its bit (a desync that would lose directional results).
 		 */
 		{
 			unsigned int t = ft_node_type(node_flag);
@@ -878,7 +880,10 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 					bool slot_set = ft_node_ptr(child) != NULL;
 					bool bit_set = cds_test_bit(bm->bitmap, b);
 
-					if (slot_set != bit_set) {
+					/* A live slot must have its bit set; a set
+					 * bit over a NULL slot is a tolerated sticky
+					 * soft-delete hole. */
+					if (slot_set && !bit_set) {
 						if (out)
 							fprintf(out, "ft_verify: depth %u: pigeon node %p slot %u: data %s, bitmap bit %s\n",
 								depth, node_flag, b,

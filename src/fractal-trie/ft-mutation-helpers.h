@@ -240,21 +240,21 @@ struct ft_ord_cell_edge {
  *     is wired (ft_set_parent) BEFORE the deferral, parent-first.
  *
  * @armed is set only on the in-place path; the recompaction (-EFBIG) path
- * publishes its rebuilt node itself and leaves this untouched.  nr_child-- is
- * applied IN PLACE by the primitive for a delete (writers and canonicalize read
- * it; readers do not navigate by it); a promote replaces a child, so nr_child
- * is unchanged.  A pigeon DELETE also clears its child bitmap bit, a reader
- * channel that must settle AFTER the flip: the primitive records it in
- * @pigeon_bitmap / @pigeon_bit and ft_detach_node clears it post-commit (a
- * promote leaves the slot occupied, so no bitmap change).
+ * publishes its rebuilt node itself and leaves this untouched.  For a delete
+ * the primitive records the node in @state_meta so its nr_child-- fuses into
+ * the same commit flip (ft_remove_one_commit) -- exact and atomic with the
+ * forward store (writers and canonicalize read the count; readers do not
+ * navigate by it); a promote replaces a child, so nr_child is unchanged.  The
+ * pigeon occupancy bitmap bit is left SET on a delete (a sticky soft-delete
+ * hint, never cleared in place: the pointer load is the source of truth and a
+ * later recompact rebuilds a clean bitmap), exactly as the popcount layout
+ * already soft-deletes.
  */
 struct ft_remove_pub {
 	struct cds_ft_inode_flag **slot;
 	struct cds_ft_inode_flag *old_val;
 	struct cds_ft_inode_flag *new_val;	/* NULL for delete; chain head for promote */
 	struct cds_ft_metadata *state_meta;	/* non-NULL (delete) => fuse its nr_child-- */
-	struct cds_ft_bitmap *pigeon_bitmap;	/* non-NULL => clear bit post-flip */
-	uint8_t pigeon_bit;
 	bool armed;
 };
 

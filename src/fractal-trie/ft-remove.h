@@ -1065,9 +1065,10 @@ int ft_detach_node(struct cds_ft *ft,
 			 * it): commit that store -- @old_val -> @new_val (NULL for a
 			 * leaf delete, the promoted external chain head for an
 			 * external promote) -- fused with @fuse_cell's ordered-list
-			 * unsplice in ONE flip, then settle the pigeon bitmap bit (a
-			 * reader channel, delete only) after.  Recompaction (pub
-			 * unarmed) published its rebuilt node itself and stays
+			 * unsplice in ONE flip.  A pigeon delete leaves its occupancy
+			 * bit set (sticky soft-delete hint; recompact rebuilds it
+			 * clean), so nothing settles after the flip.  Recompaction
+			 * (pub unarmed) published its rebuilt node itself and stays
 			 * two-commit -- the caller unsplices.
 			 */
 			if (!boundary_fused && pub && pub->armed) {
@@ -1075,10 +1076,6 @@ int ft_detach_node(struct cds_ft *ft,
 					pub->new_val, pub->state_meta,
 					fuse_cell, run, commit_txn);
 				commit_txn_used = (commit_txn != NULL);
-				if (pub->pigeon_bitmap)
-					cds_clear_bit_relaxed(
-						pub->pigeon_bitmap->bitmap,
-						pub->pigeon_bit);
 			}
 			/*
 			 * Free the old detach subtree: the orphan chain from

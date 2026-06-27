@@ -513,9 +513,14 @@ correctness story but the most expensive (every delete is O(node) too); the stat
 word above buys back the O(1) remove for the non-re-rank case. Exclusivity (§5.2)
 gates all of it: an exclusive trie keeps the cheap in-place mutate-count path.
 
-**Status:** the recompact-on-insert gate (§4.1) is implemented; the pigeon
-sticky-hint bitmap and the unified `nr_child`+tombstone+proxy state word are
-**decided, not yet implemented**.
+**Status:** **implemented** — the recompact-on-insert gate (§4.1), the unified
+`nr_child`+tombstone+proxy state word, and the pigeon sticky-hint bitmap. The
+freeze MARK is now recorded at every node retire (the internal-node state bit
+and the chain-leaf `next` tombstone, §4 DECISION FINAL). With recompact-on-insert
+(§4.1) on, no reader-visible in-place node-word mutation survives — refinement 1
+is total. What remains is the **validate** side: folding the lone-edge marks into
+the unlink commit (atomic detach) and a writer failing its CAS once the target is
+`DEAD`, both pending the MCAS commit body (§4.B).
 
 ### 4.3 Commit granularity — single-word edges vs node identity
 

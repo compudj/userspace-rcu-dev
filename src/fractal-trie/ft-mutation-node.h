@@ -714,12 +714,16 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	assert(*node_flag_ptr != NULL);
 	/*
 	 * Fusion armed: DEFER the forward store into @pub (committed in one flip
-	 * with the dead head cell's unsplice).  A DELETE (NULL newptr) records
-	 * the bitmap bit-clear too -- a reader channel that must settle AFTER the
-	 * flip -- and decrements nr_child in place.  An external PROMOTE (non-NULL
-	 * newptr) wires the promoted external's back-pointer first (parent-first),
-	 * leaves the slot occupied (no bitmap change) and nr_child unchanged.  See
-	 * the popcount variant.
+	 * with the dead head cell's unsplice).  A DELETE (NULL newptr) fuses its
+	 * nr_child-- into the commit flip (via @state_meta) and leaves the
+	 * occupancy bitmap bit SET -- a sticky soft-delete hint, never cleared in
+	 * place: the pointer load is the source of truth (ft_pigeon_node_get_nth
+	 * reads node->data[n] directly and the directional scan rescans past a set
+	 * bit over a NULL slot), and a later recompact rebuilds a clean bitmap from
+	 * the occupied slots.  An external PROMOTE (non-NULL newptr) wires the
+	 * promoted external's back-pointer first (parent-first), leaves the slot
+	 * occupied and nr_child unchanged.  See the popcount variant (same
+	 * soft-delete).
 	 */
 	if (pub) {
 		if (newptr)
@@ -728,11 +732,8 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		pub->old_val = *node_flag_ptr;
 		pub->new_val = newptr;
 		pub->armed = true;
-		if (!newptr) {
-			pub->pigeon_bitmap = cds_ft_item_to_bitmap(node, type->order);
-			pub->pigeon_bit = n;
+		if (!newptr)
 			pub->state_meta = metadata;	/* nr_child-- fuses into the commit flip */
-		}
 		return 0;
 	}
 	/* Parent-first: wire the back-pointer before the forward publish,
@@ -740,10 +741,13 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
 	ft_node_child_edge_flip(ft, node_flag_ptr, *node_flag_ptr, newptr);
 	if (!newptr) {
-		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
-
-		/* Clear n in bitmap. */
-		cds_clear_bit_relaxed(bitmap->bitmap, n);
+		/*
+		 * Soft-delete: the slot is NULLed (the flip above), nr_child
+		 * decrements as a committed flip, and the occupancy bitmap bit
+		 * is left SET -- a sticky hint, never cleared in place (the
+		 * pointer load is the source of truth; recompact rebuilds it
+		 * clean), exactly as the popcount layout already does.
+		 */
 		ft_meta_nr_child_dec_flip(metadata);
 	}
 	return 0;
