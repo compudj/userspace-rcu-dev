@@ -753,7 +753,14 @@ void cds_ft_destroy(struct cds_ft *ft)
 		cds_ft_compact_end(ft->active_compact);
 	}
 	FT_TP(ft_destroy, (const void *) ft);
-	/* Free root node. No concurrent readers at this point. */
+	/*
+	 * Free root node.  No concurrent readers at this point.  The root was a
+	 * published (reader-visible) node throughout the trie's life, so it gets
+	 * its freeze-on-free tombstone like any other retired node (doc §4.B);
+	 * here it is a teardown no-op, but it keeps the mark-before-free
+	 * invariant universal (see FT_DEBUG_TOMBSTONE_AUDIT).
+	 */
+	ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(ft_node_ptr(ft->root)));
 	free_cds_ft_node(ft, ft_node_ptr(ft->root));
 	/*
 	 * Wait for in-flight call_rcu free to complete, so every deferred
