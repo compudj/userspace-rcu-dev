@@ -2251,6 +2251,17 @@ void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 {
 	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
 
+#ifdef FT_DEBUG_TOMBSTONE_AUDIT
+	/*
+	 * Freeze-on-free guard (doc §4.B, STEP 3): every PUBLISHED node retired
+	 * through this path must carry its one-way LIVE->DEAD tombstone, set
+	 * BEFORE the unlink commit that detached it.  Abandoned fresh
+	 * (never-reader-visible) nodes use free_cds_ft_node_unpublished and do
+	 * not reach here.  Build with -DFT_DEBUG_TOMBSTONE_AUDIT to enforce that
+	 * no retire site is added without a mark (a no-op under one writer).
+	 */
+	assert(ft_meta_tombstone(metadata));
+#endif
 	cds_ft_free_item(ft, metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->group->nr_nodes_freed);
@@ -2320,6 +2331,10 @@ void free_compressed_node(struct cds_ft *ft,
 	struct cds_ft_metadata *metadata =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 
+#ifdef FT_DEBUG_TOMBSTONE_AUDIT
+	/* See free_cds_ft_node: freeze-on-free guard (doc §4.B). */
+	assert(ft_meta_tombstone(metadata));
+#endif
 	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(node));
 	cds_ft_free_item(ft, metadata);
 	if (ft_debug_counters() && node) {

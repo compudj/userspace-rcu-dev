@@ -861,6 +861,16 @@ void ft_meta_nr_child_dec(struct cds_ft_metadata *meta)
 }
 
 /*
+ * Read the one-way LIVE->DEAD tombstone (state bit 1, §4.B freeze-on-free).
+ * True once the node has been marked dead at retire (before its unlink commit).
+ */
+static inline
+bool ft_meta_tombstone(const struct cds_ft_metadata *meta)
+{
+	return (meta->state & FT_STATE_TOMBSTONE) != 0;
+}
+
+/*
  * Compressed path node.  Replaces a chain of single-child internal
  * nodes with a single node storing the key bytes inline.
  *
