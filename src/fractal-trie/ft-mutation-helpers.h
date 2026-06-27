@@ -463,6 +463,28 @@ void ft_meta_nr_child_dec_flip(struct cds_ft_metadata *meta)
 }
 
 /*
+ * Set a node's one-way LIVE->DEAD tombstone (state bit 1, §4.B freeze-on-free)
+ * as a COMMITTED flip edge, at the point the node is DETACHED from the trie.
+ * Under one writer this is a no-op store on a node about to be reclaimed --
+ * nothing reads the bit (the arena re-zeroes metadata on reallocation) -- so it
+ * is behaviour-identical; under multi-writer MCAS the mark is what a concurrent
+ * writer targeting the node validates (expected = live) so its commit fails
+ * once the node is dead (doc/design/mcas-multiwriter-readiness.md §4.B).  Lone
+ * edge => on-stack, infallible.  Idempotent: re-marking a dead node is a same-
+ * value store.  The mark and the structural unlink that retires the node should
+ * eventually ride ONE flip (atomic detach); a lone-edge mark is the bridge.
+ */
+static
+void ft_meta_tombstone_set_flip(struct cds_ft_metadata *meta)
+{
+	struct ft_ord_cell_edge edge;
+	uintptr_t old = meta->state;
+
+	ft_state_edge(&edge, &meta->state, old, old | FT_STATE_TOMBSTONE);
+	ft_ord_cell_flip_one(&edge);
+}
+
+/*
  * Publish an in-place node child-slot replacement (@slot transitions @old ->
  * @new) as a single-edge flip descriptor.  This is the non-fused (pub == NULL)
  * arm of ft_node_replace_ptr -- a key-disappearing leaf delete (@new == NULL) or

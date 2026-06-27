@@ -1232,6 +1232,19 @@ skip_copy:
 	if (old_node && old_node_ret)
 		*old_node_ret = old_node;
 
+	/*
+	 * The old node is RETIRED: the fresh copy is fully wired above and the
+	 * caller publishes it into @old_node's slot and frees @old_node after a
+	 * grace period.  Mark it DEAD (§4.B freeze-on-free, @metadata is the old
+	 * node's metadata): a no-op store under one writer (nothing reads the
+	 * bit; the arena re-zeroes metadata on reallocation), the freeze mark a
+	 * concurrent MCAS writer validates under multi-writer.  Covers every
+	 * recompact retire -- recompact-on-insert, delete shrink (DEL), and
+	 * cds_ft_compact relocation.
+	 */
+	if (old_node && metadata)
+		ft_meta_tombstone_set_flip(metadata);
+
 	ret = 0;
 end:
 	return ret;
