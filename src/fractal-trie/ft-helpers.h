@@ -46,16 +46,20 @@ void static_array_size_check(void)
 }
 
 /*
- * Writer-side helpers for the cds_ft_node.next removal tombstone (low
- * bit, see CDS_FT_NODE_REMOVED_FLAG).  These run under the writer mutex
- * (or RCU read lock on the chain-walk side), so a plain masked load is
- * sufficient; readers use cds_ft_node_next_rcu() instead.
+ * Reader-side helpers for the cds_ft_node.next removal tombstone (low bit,
+ * see CDS_FT_NODE_REMOVED_FLAG).  These run under the writer mutex (or RCU
+ * read lock on the chain-walk side), so a plain masked load is sufficient;
+ * readers use cds_ft_node_next_rcu() instead.
  *
  *   ft_node_next        masked successor (the actual chain link)
  *   ft_node_is_removed  has @node been removed from the trie?
- *   ft_node_mark_removed set the tombstone, preserving the successor
- *                        pointer (relaxed store; readers mask the bit
- *                        and the pointer value is unchanged).
+ *
+ * SETTING the tombstone is a COMMITTED flip edge -- the freed node's own next
+ * is a word a concurrent duplicate-append CASes, so the mark rides the
+ * descriptor protocol like every other reader-visible store; see
+ * ft_node_mark_removed_flip / ft_chain_mark_removed_flip in
+ * ft-mutation-helpers.h (doc/design/mcas-multiwriter-readiness.md §4
+ * refinement-1 site 2).
  */
 static inline
 struct cds_ft_node *ft_node_next(const struct cds_ft_node *node)
@@ -68,30 +72,6 @@ static inline
 bool ft_node_is_removed(const struct cds_ft_node *node)
 {
 	return ((uintptr_t) node->next & CDS_FT_NODE_REMOVED_FLAG) != 0;
-}
-
-static inline
-void ft_node_mark_removed(struct cds_ft_node *node)
-{
-	CMM_STORE_SHARED(node->next, (struct cds_ft_node *)
-			((uintptr_t) node->next | CDS_FT_NODE_REMOVED_FLAG));
-}
-
-/*
- * Mark every node in a duplicate chain as removed (used by
- * cds_ft_remove_all, which detaches a whole chain at once).  The
- * successor pointers stay intact so the caller can still traverse the
- * returned chain to reclaim it.
- */
-static inline
-void ft_chain_mark_removed(struct cds_ft_node *head)
-{
-	while (head) {
-		struct cds_ft_node *next = ft_node_next(head);
-
-		ft_node_mark_removed(head);
-		head = next;
-	}
 }
 
 /*

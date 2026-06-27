@@ -2775,7 +2775,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	 * Its next pointer is preserved so a concurrent reader positioned on
 	 * @old_node still follows the chain.
 	 */
-	ft_node_mark_removed(old_node);
+	ft_node_mark_removed_flip(ft, old_node);
 
 
 	/*

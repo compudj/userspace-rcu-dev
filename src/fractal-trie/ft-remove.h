@@ -1412,7 +1412,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 	 * on @node still follows the chain; the bit only marks removal for a
 	 * later position-based remove.
 	 */
-	ft_node_mark_removed(node);
+	ft_node_mark_removed_flip(ft, node);
 	return 0;
 }
 
@@ -1594,7 +1594,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
 			else
-				ft_node_mark_removed(node);
+				ft_node_mark_removed_flip(ft, node);
 		} else {
 			/*
 			 * Removing the head, duplicates remain: key count unchanged.
@@ -1654,7 +1654,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					s_child, s_byte, fuse_cell, NULL);
 
 				if (cret == 0) {
-					ft_node_mark_removed(node);
+					ft_node_mark_removed_flip(ft, node);
 					if (fuse_remove)
 						pub.armed = true;
 					ret = 0;
@@ -1693,7 +1693,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 						ft_propagate_external_count_parent(ft,
 							holder_flag, 1);
 					} else {
-						ft_node_mark_removed(node);
+						ft_node_mark_removed_flip(ft, node);
 						pub.armed = true;
 					}
 				} else {
@@ -1756,7 +1756,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
 			else
-				ft_node_mark_removed(node);
+				ft_node_mark_removed_flip(ft, node);
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
 			ret = ft_unchain_node(ft, holder_flag,
@@ -1958,7 +1958,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			ft_ord_cell_flip_one(&edge);
 		}
 		/* The whole chain has left the trie: tombstone every node. */
-		ft_chain_mark_removed(external_nodes);
+		ft_chain_mark_removed_flip(ft, external_nodes);
 		/* The mutation invalidates the cached position (general-path parity). */
 		iter->cache_valid = false;
 		iter_debug_path_clear(iter);
@@ -2073,7 +2073,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					NULL);
 
 				if (cret == 0) {
-					ft_chain_mark_removed(chain_head);
+					ft_chain_mark_removed_flip(ft, chain_head);
 					if (ft->ordered_list)
 						pub.armed = true;
 					ret = 0;
@@ -2128,7 +2128,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					ret = 0;
 				}
 				if (ret == 0) {
-					ft_chain_mark_removed(chain_head);
+					ft_chain_mark_removed_flip(ft, chain_head);
 					assert(ft_meta_nr_child(holder_meta) > 0);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					/*
@@ -2161,7 +2161,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		if (ret)
 			ft_propagate_external_count_parent(ft, holder_flag, 1);
 		else
-			ft_chain_mark_removed(chain_head);
+			ft_chain_mark_removed_flip(ft, chain_head);
 	}
 
 	/*

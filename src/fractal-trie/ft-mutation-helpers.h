@@ -485,6 +485,52 @@ void ft_meta_tombstone_set_flip(struct cds_ft_metadata *meta)
 }
 
 /*
+ * Set a duplicate-chain node's removal tombstone (CDS_FT_NODE_REMOVED_FLAG on
+ * cds_ft_node.next) as a COMMITTED flip edge, at the point @node is unlinked
+ * from the trie.  This is the chain-leaf analogue of ft_meta_tombstone_set_flip
+ * (the internal-node §4.B state mark): the freed node's OWN next is the word a
+ * concurrent duplicate-append CASes (a tail append is tail->next: NULL -> D), so
+ * recording the tombstone as a {slot, old, new} edge is what makes that append's
+ * expected-value CAS fail once the tail is dead -- instead of a bare in-place
+ * bit-set sitting outside the descriptor protocol (doc/design/mcas-multiwriter-
+ * readiness.md §4 DECISION FINAL, refinement-1 site 2).
+ *
+ * The successor pointer is preserved (only bit 0 is set), so a concurrent reader
+ * positioned on @node still follows the chain (readers mask the bit in
+ * cds_ft_node_next_rcu).  Under one writer the commit is one release store of a
+ * low bit readers ignore -- behaviour-identical to the prior relaxed
+ * CMM_STORE_SHARED; under multi-writer MCAS it is a CAS-with-expected on next.
+ * Lone edge => on-stack, infallible; idempotent (re-marking is a same-value
+ * store).  The mark and the predecessor relink that unlinks @node should
+ * eventually ride ONE flip (atomic detach); a lone-edge mark is the bridge.
+ */
+static
+void ft_node_mark_removed_flip(struct cds_ft *ft, struct cds_ft_node *node)
+{
+	struct cds_ft_node *old = node->next;
+
+	ft_chain_next_flip(ft, &node->next, old, (struct cds_ft_node *)
+			((uintptr_t) old | CDS_FT_NODE_REMOVED_FLAG));
+}
+
+/*
+ * Tombstone every node in a duplicate chain (cds_ft_remove_all detaches a whole
+ * chain at once), each via ft_node_mark_removed_flip so the marks are committed
+ * edges.  Successor pointers stay intact so the caller can still traverse the
+ * returned chain to reclaim it.
+ */
+static
+void ft_chain_mark_removed_flip(struct cds_ft *ft, struct cds_ft_node *head)
+{
+	while (head) {
+		struct cds_ft_node *next = ft_node_next(head);
+
+		ft_node_mark_removed_flip(ft, head);
+		head = next;
+	}
+}
+
+/*
  * Publish an in-place node child-slot replacement (@slot transitions @old ->
  * @new) as a single-edge flip descriptor.  This is the non-fused (pub == NULL)
  * arm of ft_node_replace_ptr -- a key-disappearing leaf delete (@new == NULL) or
