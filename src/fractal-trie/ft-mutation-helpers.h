@@ -2527,10 +2527,36 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
  * in place).  Iteration order here therefore does not matter: each live
  * back-pointer flip lands on an already-fully-wired cluster.
  */
+/*
+ * Freeze-on-free (doc §4.B): set the one-way LIVE->DEAD tombstone on every old
+ * (replaced) node a glue commit retires -- the g->free_list set later drained by
+ * ft_glue_free_old.  Call on the committing path, BEFORE the publish/unlink that
+ * detaches them (apply_deferred for the standard forward-publish glues; the merge
+ * src side stamps gs before its own src-root/run unlink).  Idempotent (one-way
+ * mark) and a no-op store under one writer.
+ */
+static
+void ft_glue_tombstone_free_list(struct ft_glue *g)
+{
+	int i;
+
+	for (i = 0; i < g->nr_free; i++)
+		ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) g->free_list[i].node));
+}
+
 static
 void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 {
 	int i;
+
+	/*
+	 * Tombstone the retired set here, the glue's commit-step-1: it runs only
+	 * on the committing path (abort frees the BUILT cluster via ft_glue_abort,
+	 * not this) and after the abort-impossible point, hence before the forward
+	 * publish that unlinks them.
+	 */
+	ft_glue_tombstone_free_list(g);
 
 	/*
 	 * Apply only src-origin edges (dst_origin == false).  graft and
