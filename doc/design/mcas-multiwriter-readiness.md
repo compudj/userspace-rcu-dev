@@ -387,6 +387,50 @@ writer (a redundant store / no-op validate), real CAS-with-expected in the MCAS
 word-set later — so both land and validate under the current suite before any MCAS
 commit body exists.
 
+### Why a seqcount is not a general solution (committed summary vs out-of-commit validation)
+
+The DECISION-REVISED step ("must be a *seqcount*, not a dead bit") was wrong for a
+reason worth recording, so the idea does not resurface. There are **two categorically
+different** uses of a seqcount, and only one of them works:
+
+- **A seqcount as a *committed summary* of committed words — works.** The count is
+  bumped *inside the same MCAS* as the word set it summarizes, so it is
+  consistent-by-construction with those words. A reader/writer checks the count
+  instead of re-scanning the whole set; it carries no information the commit did not
+  already carry. This is a pure optimization over the scan (e.g. "did this node's
+  child set change since I snapshotted it").
+
+- **A seqcount to retroactively validate an update that is *not* in the commit —
+  does not work.** If a mutation `X` is an in-place store outside the txn, bumping a
+  count next to `X` and having another op "validate the count it read" just relocates
+  the §3.1 disjoint-word race onto the count: `X`, the bump, and the validating read
+  are three separate steps with no atomicity binding them. You cannot validate your
+  way to atomicity for something the commit does not contain. The DECISION-REVISED
+  justification — a monotonic count to detect *disjoint, in-place* child-adds — was
+  exactly this second kind, which is why the DECISION FINAL retires it.
+
+**The rule (no third bucket).** Every reader-visible word a mutation touches is
+**either** part of the atomic commit (truth, exact) **or** a provably-benign racy
+hint that nothing relies on for correctness. A seqcount does not create a safe
+"out-of-commit but validated" middle category. So an out-of-commit update has exactly
+three sound dispositions — **commit it** (bring it into the txn word-set; a scalar
+word rides the flip-latch via the reserved low-bit phase tag, §B), **eliminate it**
+(don't store it — derive the value on demand from the committed words), or **prove it
+benign** (a pure hint, with correctness depending on it *nowhere*) — and a seqcount is
+on none of them.
+
+Mapping the node-word mutations to that rule:
+
+- **insert occupancy-bitmap set** — was out-of-commit; recompact-on-insert (§4.1)
+  **eliminates** it by making the change a whole-node replacement committed via the
+  parent edge. The correct move under this rule.
+- **remove-side `nr_child--`** — out-of-commit today. Fix is one of: *commit it*
+  (low-bit-tagged scalar edge → exact), *eliminate it* (the committed bitmap/pointers
+  are the truth; derive the count when needed), or *prove it benign* (a pure recompact
+  *trigger* hint, which first requires decoupling recompact sizing from it — §4.2).
+- **pigeon bitmap clear** — same: the sticky-hint design (§4.2) is the *prove-benign*
+  path (pointers are truth, readers already tolerate a stale bit), **not** a seqcount.
+
 ### 4.1 Implementation gate: `FEATURE_FT_INSERT_IN_PLACE` (recompact-on-insert)
 
 The occupancy-bitmap insert (site 1) is retired behind a build gate
