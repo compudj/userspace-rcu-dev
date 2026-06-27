@@ -387,6 +387,75 @@ writer (a redundant store / no-op validate), real CAS-with-expected in the MCAS
 word-set later — so both land and validate under the current suite before any MCAS
 commit body exists.
 
+### 4.1 Implementation gate: `FEATURE_FT_INSERT_IN_PLACE` (recompact-on-insert)
+
+The occupancy-bitmap insert (site 1) is retired behind a build gate
+(`FEATURE_FT_INSERT_IN_PLACE`, default on). With it **off**, a new-occupancy
+`ft_*_node_set_nth` on a *live* node returns `-ERANGE` instead of setting the
+bitmap bit in place, so the wrapper routes the insert through
+`ft_node_recompact(ADD_SAME)` — the same whole-node rebuild a non-tail insert
+already takes today. Both popcount and pigeon recompact uniformly. Behavior-
+identical under one writer, so the off build validates the MCAS-ready shape
+(no in-place bitmap mutation on the insert path) on the current suite. Cost:
+the O(1) in-place insert becomes an O(node) alloc-and-copy.
+
+### 4.2 Hint vs truth — the pigeon bitmap and `nr_child` (deferred refinements)
+
+Two metadata words are mutated in place outside the structural pointer edges:
+the **occupancy bitmap** and the per-node **`nr_child`** count. Both are
+candidates for the same insight — *demote them from truth to hint, with the
+pointers as the sole truth* — which avoids the whole-node recompact for the
+cases that are not a genuine re-rank.
+
+- **Pigeon bitmap → sticky hint.** A pigeon slot is direct-indexed, so the
+  pointer store is already a clean flip edge and the bitmap is only an
+  occupancy *hint*: `ft_pigeon_node_get_nth` reads `data[n]` directly, and the
+  directional scan already rescans past a set bit whose slot is NULL ("source
+  of truth is the pointer load"). So the pigeon recompact-on-insert is
+  avoidable: make the bit **sticky** — set with an atomic OR (concurrent
+  setters of other bits in the word don't lose updates), never cleared in
+  place; a delete leaves the bit set and only a recompact rebuilds a clean
+  bitmap. (For popcount the bitmap *is* the rank index = truth, so it must be
+  rebuilt — no hint option.) Needs: relax the verify cross-check to
+  `slot_set ⇒ bit_set` only, drop the delete-side `cds_clear_bit_relaxed` /
+  deferred `pub->pigeon_bitmap` clear, and — to bound the stale-bit scan cost
+  — optionally trigger a cleanup recompact once
+  `popcount(bitmap) − nr_child` (stale bits) gets high.
+
+- **`nr_child` → density hint, sized from truth.** `nr_child` is `++`/`--` in
+  place and drives the recompact tier decision. **Recompact-on-insert already
+  removes the `++`:** a new-occupancy insert rebuilds the node, so its count
+  lands in the fresh node's metadata — no in-place bump on the live node. The
+  surviving in-place mutation is therefore **remove-side only**: a non-shrink
+  delete stores `NULL` into the slot (a flip edge — already MCAS-fine) but does
+  `metadata->nr_child--` in place (`ft_popcount_node_replace_ptr` /
+  `ft_pigeon_node_replace_ptr`), and the pigeon delete additionally clears its
+  hint bit in place (popcount instead *soft-deletes*: it leaves the bit set and
+  only decrements `nr_child`, so popcount's bitmap is already non-mutated on
+  delete). So remove-in-place needs no "recompact-on-remove" of the structure —
+  only the metadata hints must be tamed. **Resolution: `nr_child` is only a
+  *trigger* hint, never a correctness input** — capacity checks use the actual
+  occupied count (`ptr_idx`/popcount), and the recompact's *sizing* must be
+  taken from the **true** occupancy (`ft_*_node_get_nr_child` = bitmap/pointer
+  scan), NOT from `nr_child` (sizing from a lagging `nr_child` is exactly the
+  reserve+bind under-size→overflow bug). Once sizing is decoupled from
+  `nr_child`, the count can drift: a **relaxed atomic counter** (drift-free,
+  mildly contended) or a sloppy/per-CPU counter reconciled at each recompact
+  suffices, because drift only shifts *when* a recompact fires, never its
+  correctness. This is the exact parallel of the bitmap hint: pointers are
+  truth, `nr_child` is a hint.
+
+The fully-uniform alternative (the §4 baseline) is to **recompact on every
+structural change** including delete, so the node — bitmap and `nr_child`
+included — is *rebuilt, never mutated*, and all of a node's mutations contend
+on its parent edge (one MCAS word). That is the simplest correctness story but
+the most expensive (every delete is O(node) too); the hint refinements above
+buy back the O(1) insert/delete for the non-re-rank cases. Exclusivity (§5.2)
+gates all of it: an exclusive trie keeps the cheap in-place mutate-count path.
+
+Both refinements are **noted, not implemented** — the current gate keeps the
+uniform recompact-on-insert to avoid bundling too many changes at once.
+
 ---
 
 ## 5. Cost tiers and exclusivity
