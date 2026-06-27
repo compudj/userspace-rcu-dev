@@ -412,6 +412,35 @@ void ft_chain_next_flip(struct cds_ft *ft, struct cds_ft_node **slot,
 }
 
 /*
+ * Build a flip-latch edge for a per-node STATE WORD transition
+ * (struct cds_ft_metadata.state -- nr_child / tombstone / proxy; see
+ * fractal-trie-internal.h and doc/design/mcas-multiwriter-readiness.md §4.2).
+ *
+ * @state_slot is a scalar uintptr_t, not a pointer slot, but a uintptr_t and a
+ * void * are the same width, so the word rides the SAME {slot, old, new} edge
+ * machinery as a structural pointer edge (the existing flips already cast
+ * cds_ft_inode_flag ** to ft_ord_cell **): under one writer the commit is a
+ * plain store of @new_state; under multi-writer MCAS it becomes a
+ * CAS-with-expected on the word.
+ *
+ * This is the "commit it" primitive: it lets a node-state change (e.g. the
+ * remove-side nr_child--) ride the op's flip commit instead of mutating the
+ * live node's word in place, and is shared with the future deleted-flag
+ * (tombstone) commit.  Fill an edge here, then place it in the op's edge array
+ * (ft_ord_cell_flip_one / _into) alongside the structural edges.  The proxy
+ * bit (state bit 0) is what lets a reader/writer recognise a mid-flip word; it
+ * is dormant under a single writer, where the commit just settles to @new_state.
+ */
+static inline
+void ft_state_edge(struct ft_ord_cell_edge *edge, uintptr_t *state_slot,
+		uintptr_t old_state, uintptr_t new_state)
+{
+	edge->slot = (struct ft_ord_cell **) state_slot;
+	edge->old_target = (struct ft_ord_cell *) old_state;
+	edge->new_target = (struct ft_ord_cell *) new_state;
+}
+
+/*
  * Publish an in-place node child-slot replacement (@slot transitions @old ->
  * @new) as a single-edge flip descriptor.  This is the non-fused (pub == NULL)
  * arm of ft_node_replace_ptr -- a key-disappearing leaf delete (@new == NULL) or
