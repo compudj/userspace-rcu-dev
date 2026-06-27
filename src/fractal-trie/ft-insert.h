@@ -222,6 +222,20 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 			ic->live_parent, ic->live_slot, ic->txn);
 
 	/*
+	 * Freeze-on-free (doc §4.B): the old compressed/internal node this
+	 * commit retires gets its one-way LIVE->DEAD tombstone BEFORE the commit
+	 * unlinks it (a no-op under one writer; under MCAS a concurrent writer
+	 * targeting it then fails its validate-live CAS).  Marked here, after the
+	 * last abort point (the recording above is infallible into the
+	 * pre-reserved txn).
+	 */
+	if (ic->free_old_cn)
+		ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) ic->free_old_cn));
+	if (ic->free_old_node)
+		ft_meta_tombstone_set_flip(
+			cds_ft_item_to_metadata(ic->free_old_node));
+	/*
 	 * THE commit: install every recorded edge -- the forward structural
 	 * publish (forward slot + any compressed-parent skip-slot dual, or the
 	 * set_nth slot proxy), the ordered-list neighbour edges and the live
