@@ -263,27 +263,29 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 		struct cds_ft_inode_flag *new_top,
 		struct ft_insert_commit *ic)
 {
-	if (ic && ic->txn) {
-		struct ft_pub_rec rec = { .n = 0 };
-		unsigned int k;
+	struct ft_pub_rec rec = { .n = 0 };
+	unsigned int k;
 
-		_ft_publish_to_parent(ft, parent_nf, slot, new_top, &rec);
-		for (k = 0; k < rec.n; k++)
-			ft_flip_txn_record_reserved(ic->txn,
-				(void **) rec.slot[k],
-				(void *) rec.old_val[k],
-				(void *) rec.new_val[k]);
-		ic->slot = slot;	/* sentinel: one-commit forward recorded */
-		ic->publish_to_parent = true;
-		return;
-	}
-	ft_publish_to_parent(ft, parent_nf, slot, new_top);
+	/*
+	 * @ic is mandatory and armed by the caller (a bulk insert is a graft /
+	 * merge_at, not this path), so the forward edge always rides the txn.
+	 */
+	assert(ic && ic->txn);
+	_ft_publish_to_parent(ft, parent_nf, slot, new_top, &rec);
+	for (k = 0; k < rec.n; k++)
+		ft_flip_txn_record_reserved(ic->txn,
+			(void **) rec.slot[k],
+			(void *) rec.old_val[k],
+			(void *) rec.new_val[k]);
+	ic->slot = slot;	/* sentinel: one-commit forward recorded */
+	ic->publish_to_parent = true;
 }
 
 /*
  * Arm the one-commit txn just before a fresh-head publish (fallible; the
- * caller's error unwind runs with nothing published).  No-op when no @ic is
- * threaded (bulk builders).  Armed for BOTH ordered-list states: the structural
+ * caller's error unwind runs with nothing published).  @ic is mandatory -- a
+ * bulk insert is a graft / merge_at, not this path.  Armed for BOTH ordered-list
+ * states: the structural
  * slot publish commits through the txn either way (freeze-before-install, MCAS
  * Invariant-1); with the list on it additionally carries the cell-splice edges,
  * with the list off it carries only the structural edges (and insert_done
@@ -293,8 +295,7 @@ static
 int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic)
 {
 	(void) ft;
-	if (!ic)
-		return 0;
+	assert(ic);
 	/*
 	 * Forward publish (<=2: the slot store + a compressed parent's skip-slot
 	 * dual) + <=4 cell neighbour edges (list-on) + the live re-parent edge.
@@ -401,7 +402,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		unsigned int diverge_pos,	/* position within compressed path */
 		struct cds_ft_node *child_node,	/* new external node to insert */
 		unsigned int node_depth,	/* depth of the compressed node */
-		struct ft_insert_commit *ic)	/* one-commit insert, may be NULL */
+		struct ft_insert_commit *ic)	/* one-commit insert (mandatory) */
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
 	struct cds_ft_metadata *cn_meta =
@@ -665,22 +666,15 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	if (deferred_child) {
 		/*
 		 * deferred_child is the LIVE old child (cn->child).  Setting its
-		 * back-pointer is the back-channel publish that exposes this
-		 * fresh cluster to a reanchor up-walker.  For a parked one-commit
-		 * the forward publish is deferred to insert_done's single commit,
-		 * so defer this edge too (ft_insert_one_commit parks it into the
-		 * SAME flip batch -- structure + cell + this edge flip atomically;
-		 * the splice search runs from the root so it does not need it
-		 * wired early).  The direct (list-off) publish has no gap.
+		 * back-pointer is the back-channel publish that exposes this fresh
+		 * cluster to a reanchor up-walker, so defer it to the parked
+		 * one-commit: ft_insert_one_commit parks it into the SAME flip
+		 * batch (structure + cell + this edge flip atomically; the splice
+		 * search runs from the root so it does not need it wired early).
 		 */
-		if (ic && ic->txn) {
-			ic->live_child = deferred_child;
-			ic->live_parent = deferred_parent;
-			ic->live_slot = deferred_slot;
-		} else {
-			ft_set_parent(ft, deferred_child, deferred_parent,
-				deferred_slot);
-		}
+		ic->live_child = deferred_child;
+		ic->live_parent = deferred_parent;
+		ic->live_slot = deferred_slot;
 	}
 	ft_insert_publish_or_park(ft, cn_meta->parent, parent_slot, top_flag, ic);
 
@@ -688,10 +682,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * 7. Free the old compressed node.  Parked publish: readers resolve
 	 * the proxy to @cn until the commit, so defer the free past it.
 	 */
-	if (ic && ic->slot)
-		ic->free_old_cn = cn;
-	else
-		free_compressed_node(ft, cn);
+	ic->free_old_cn = cn;
 
 	return 0;
 
@@ -1251,7 +1242,7 @@ int ft_attach_node(struct cds_ft *ft,
 		 * ft_publish_to_parent handles skip pointer update
 		 * if the attach target is a compressed node's child.
 		 */
-		if (ic && ic->txn && iter_dest_node_flag != attach_node_flag) {
+		if (iter_dest_node_flag != attach_node_flag) {
 			unsigned int k;
 
 			/*
@@ -1278,9 +1269,9 @@ int ft_attach_node(struct cds_ft *ft,
 			old_recompacted_node = NULL;
 		} else {
 			/*
-			 * In-place reserve (dest == attach node: a redundant
-			 * same-value republish), or no one-commit txn (bulk): the
-			 * direct publish handles the skip-slot bookkeeping.
+			 * In-place reserve (dest == attach node): a redundant
+			 * same-value republish; the direct publish handles the
+			 * skip-slot bookkeeping.
 			 */
 			ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag);
@@ -1306,7 +1297,7 @@ check_error:
 		 * set_nth, succeeds; nothing is ever stored in a live slot
 		 * during the build): destroy it.
 		 */
-		if (ic && ic->txn) {
+		if (ic->txn) {
 			urcu_flip_txn_destroy(ic->txn);
 			ic->txn = NULL;
 		}
@@ -1440,26 +1431,17 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	 * reader never sees cn->child re-parented onto branch while the
 	 * grandparent slot still points at cn (or vice versa).  ft_insert_one_
 	 * commit replays it via ft_park_live_parent_edge (which resolves the
-	 * external head's cell->parent / prev).  Direct/bulk fallback (no txn)
-	 * wires it immediately, as before.
+	 * external head's cell->parent / prev).
 	 */
-	if (ic && ic->txn) {
-		ic->live_child = (struct cds_ft_inode_flag *) cn->child;
-		ic->live_parent = branch;
-		ic->live_slot = NULL;
-	} else {
-		ft_publish_external_nodes_prev(ft, branch,
-			(struct cds_ft_node *) cn->child);
-	}
+	ic->live_child = (struct cds_ft_inode_flag *) cn->child;
+	ic->live_parent = branch;
+	ic->live_slot = NULL;
 	ft_insert_publish_or_park(ft, d->nf, &cn->child, branch, ic);
 	/* One-commit (parked): the +1 follows the commit at insert_done. */
-	if (ic && ic->slot)
-		ic->count_from = branch;
-	else
-		ft_propagate_external_count_parent(ft, branch, 1);
+	ic->count_from = branch;
 	return 0;
 arm_unwind:
-	if (ic && ic->txn) {
+	if (ic->txn) {
 		urcu_flip_txn_destroy(ic->txn);
 		ic->txn = NULL;
 	}
@@ -1494,10 +1476,7 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 	 *
 	 * One-commit (parked): the +1 follows the commit at insert_done.
 	 */
-	if (ic && ic->slot)
-		ic->count_from = d->pnf;
-	else
-		ft_propagate_external_count_parent(ft, d->pnf, 1);
+	ic->count_from = d->pnf;
 	return 0;
 }
 
@@ -1523,8 +1502,16 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	struct cds_ft_inode_flag **live_slot;
 	struct cds_ft_inode_flag *split_created[FT_MAX_DEPTH];
 	int split_nr_created = 0;
-	bool fresh_head;
 	int sret;
+
+	/*
+	 * A key-shorter insert is always a NEW key: a key ending inside a
+	 * compressed path has no node at that depth that could already hold it
+	 * (a real duplicate is caught on descent, before this split), so the
+	 * freshly-built junction always takes a fresh head -- there is no
+	 * duplicate case here.
+	 */
+	(void) unique_node_ret;
 
 	sret = ft_split_compressed_key_shorter(ft,
 		d->nf, d->nfp, remaining, &top_flag, &jct_flag, d->depth,
@@ -1534,93 +1521,59 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		return sret;
 	jct_meta = cds_ft_item_to_metadata(ft_node_ptr(jct_flag));
 	assert(!ft_node_compressed(jct_flag));
+	assert(jct_meta->external_nodes == NULL);	/* always a fresh head */
 	/*
-	 * Fresh head iff the junction carries no external_nodes (a non-empty
-	 * set was transferred from the old compressed node for remaining == 0:
-	 * the key already exists).  Attach a fresh head to the junction NOW,
-	 * while the whole cluster is still invisible, so the parked one-commit
-	 * publish below makes the structural attach and the ordered-list
-	 * splice atomic; duplicates publish directly (no splice).
+	 * Attach the fresh head to the junction NOW, while the whole cluster is
+	 * still invisible, so the parked one-commit publish below makes the
+	 * structural attach and the ordered-list splice atomic.
 	 */
-	fresh_head = (jct_meta->external_nodes == NULL);
-	if (fresh_head) {
-		ft_external_head_set_parent(ft, node, jct_flag);
+	ft_external_head_set_parent(ft, node, jct_flag);
+	node->next = NULL;
+	/* Cluster-internal store: the junction is unpublished. */
+	jct_meta->external_nodes = node;
+	sret = ft_insert_commit_arm(ft, ic);
+	if (sret) {
+		/*
+		 * Arm failed (-ENOMEM): abort the whole insert.  The split
+		 * cluster is still build-invisible (nothing published, cn->child
+		 * untouched, @d->nf still reader-reachable at @d->nfp), so roll
+		 * the head attach back and TEAR THE CLUSTER DOWN -- the structure
+		 * is left byte-for-byte unchanged.
+		 *
+		 * Do NOT publish a key-neutral restructure here: the forward
+		 * publish and the live old-child re-parent must flip ATOMICALLY
+		 * (the re-parent's source is the live cn->child, so wiring it
+		 * before the forward exposes the unpublished cluster to an
+		 * up-walk), which needs the one-commit txn we just failed to
+		 * allocate.  There is no MCAS-expressible publish on this path --
+		 * a bare forward store would sit outside the descriptor set --
+		 * only a clean abort.  The caller surfaces MEMORY_ERROR;
+		 * insert_done resets node->prev for a retry.
+		 */
+		jct_meta->external_nodes = NULL;
 		node->next = NULL;
-		/* Cluster-internal store: the junction is unpublished. */
-		jct_meta->external_nodes = node;
-		sret = ft_insert_commit_arm(ft, ic);
-		if (sret) {
-			/*
-			 * Arm failed (-ENOMEM): abort the whole insert.  The split
-			 * cluster is still build-invisible (nothing published,
-			 * cn->child untouched, @d->nf still reader-reachable at
-			 * @d->nfp), so roll the head attach back and TEAR THE CLUSTER
-			 * DOWN -- the structure is left byte-for-byte unchanged.
-			 *
-			 * Do NOT publish a key-neutral restructure here: the forward
-			 * publish and the live old-child re-parent must flip
-			 * ATOMICALLY (the re-parent's source is the live cn->child, so
-			 * wiring it before the forward exposes the unpublished cluster
-			 * to an up-walk), which needs the one-commit txn we just failed
-			 * to allocate.  There is no MCAS-expressible publish on this
-			 * path -- a bare forward store would sit outside the descriptor
-			 * set -- only a clean abort.  The caller surfaces MEMORY_ERROR;
-			 * insert_done resets node->prev for a retry.
-			 */
-			jct_meta->external_nodes = NULL;
-			node->next = NULL;
-			ft_free_unpublished_split_cluster(ft, split_created,
-				split_nr_created);
-			return sret;
-		}
+		ft_free_unpublished_split_cluster(ft, split_created,
+			split_nr_created);
+		return sret;
 	}
 	/*
 	 * top_flag's own back-pointer was wired in the split (it is a fresh
 	 * cluster node).  The LIVE old-child re-parent is the back-channel that
-	 * exposes the cluster to a reanchor up-walk: defer it to the parked
-	 * one-commit so it flips atomically with the cell (fresh head + ordered
-	 * list); otherwise (duplicate, or list off) wire it directly before the
-	 * forward publish.
+	 * exposes the cluster to a reanchor up-walk, so defer it to the parked
+	 * one-commit: it flips atomically with the forward publish and the cell
+	 * (fresh head + ordered list).
 	 */
-	if (fresh_head && ic && ic->txn) {
-		ic->live_child = live_child;
-		ic->live_parent = live_parent;
-		ic->live_slot = live_slot;
-	} else if (live_child) {
-		ft_set_parent(ft, live_child, live_parent, live_slot);
-	}
-	ft_insert_publish_or_park(ft, d->pnf, d->nfp, top_flag,
-		fresh_head ? ic : NULL);
-	if (!fresh_head) {
-		if (unique_node_ret) {
-			*unique_node_ret = jct_meta->external_nodes;
-			free_compressed_node(ft,
-				ft_compressed_node_ptr(d->nf));
-			return -EEXIST;
-		}
-		{
-			/*
-			 * Junction already has external_nodes (transferred
-			 * from old compressed node for remaining == 0).
-			 * Chain new node as duplicate; no key count change.
-			 */
-			struct cds_ft_node *last = jct_meta->external_nodes;
-
-			while (ft_node_next(last))
-				last = ft_node_next(last);
-			ft_chain_node(ft, last, node);
-		}
-		free_compressed_node(ft, ft_compressed_node_ptr(d->nf));
-		return 0;
-	}
-	/* One-commit (parked): the +1 follows the commit at insert_done. */
-	if (ic && ic->slot) {
-		ic->count_from = jct_flag;
-		ic->free_old_cn = ft_compressed_node_ptr(d->nf);
-	} else {
-		ft_propagate_external_count_parent(ft, jct_flag, 1);
-		free_compressed_node(ft, ft_compressed_node_ptr(d->nf));
-	}
+	ic->live_child = live_child;
+	ic->live_parent = live_parent;
+	ic->live_slot = live_slot;
+	ft_insert_publish_or_park(ft, d->pnf, d->nfp, top_flag, ic);
+	/*
+	 * Parked one-commit: the new key's +1 count and the old compressed
+	 * node's free both follow the commit at insert_done (a reader resolves
+	 * the parked proxy to the old node until then).
+	 */
+	ic->count_from = jct_flag;
+	ic->free_old_cn = ft_compressed_node_ptr(d->nf);
 	return 0;
 }
 
