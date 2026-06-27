@@ -123,8 +123,12 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * Move the source root into the detached trie.
 		 * Free the empty root that cds_ft_create allocated for
 		 * the detached trie, and replace it with the source root.
+		 * @detached is a fresh handle not yet returned to the caller, so
+		 * its empty root was never reader-visible: free it UNPUBLISHED
+		 * (immediate, no grace period, no freeze-on-free tombstone -- it
+		 * was never live in any trie).
 		 */
-		free_cds_ft_node(detached, ft_node_ptr(detached->root));
+		free_cds_ft_node_unpublished(detached, ft_node_ptr(detached->root));
 		/* No readers in detached root yet. */
 		detached->root = ft->root;
 		FT_TP(root_publish, (const void *) detached,
@@ -459,7 +463,13 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * peeled-away compressed node.
 				 */
 				ft_glue_apply_deferred(detached, &glue);
-				free_cds_ft_node(detached,
+				/*
+				 * @detached is a fresh handle with no readers
+				 * yet; its placeholder empty root was never
+				 * reader-visible, so free it UNPUBLISHED
+				 * (immediate, no tombstone -- never live).
+				 */
+				free_cds_ft_node_unpublished(detached,
 					ft_node_ptr(detached->root));
 				/* No readers in detached root yet. */
 				detached->root = new_root;

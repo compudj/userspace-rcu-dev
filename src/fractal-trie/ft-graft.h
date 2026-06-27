@@ -1002,7 +1002,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 					FT_GLUE_FLOOR_DEFERRED + 6)) {
 				if (glue.txn)
 					urcu_flip_txn_destroy(glue.txn);
-				free_cds_ft_node(src_ft, fresh_node);
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		}
@@ -1012,13 +1012,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			ft_glue_abort(dst_ft, &glue);
 			if (glue.txn)
 				urcu_flip_txn_destroy(glue.txn);
-			free_cds_ft_node(src_ft, fresh_node);
+			free_cds_ft_node_unpublished(src_ft, fresh_node);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		if (prep == FT_GRAFT_PREP_POPULATED) {
 			if (glue.txn)
 				urcu_flip_txn_destroy(glue.txn);
-			free_cds_ft_node(src_ft, fresh_node);
+			free_cds_ft_node_unpublished(src_ft, fresh_node);
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 		/*
@@ -1030,7 +1030,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		if (prep == FT_GRAFT_PREP_NOSPLIT && d.depth == key_len && d.nf) {
 			urcu_flip_txn_destroy(glue.txn);
-			free_cds_ft_node(src_ft, fresh_node);
+			free_cds_ft_node_unpublished(src_ft, fresh_node);
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 
@@ -1053,7 +1053,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 				if (run_splice_txn)
 					urcu_flip_txn_destroy(run_splice_txn);
 				urcu_flip_txn_destroy(glue.txn);
-				free_cds_ft_node(src_ft, fresh_node);
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		}
@@ -1089,7 +1089,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 					urcu_flip_txn_destroy(src_retire_txn);
 				if (run_splice_txn)
 					urcu_flip_txn_destroy(run_splice_txn);
-				free_cds_ft_node(src_ft, fresh_node);
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 			self_secured = true;
