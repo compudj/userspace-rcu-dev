@@ -517,6 +517,40 @@ gates all of it: an exclusive trie keeps the cheap in-place mutate-count path.
 sticky-hint bitmap and the unified `nr_child`+tombstone+proxy state word are
 **decided, not yet implemented**.
 
+### 4.3 Commit granularity — single-word edges vs node identity
+
+An MCAS edge is one word, so the per-node mutations decompose into exactly two
+commit units, and nothing falls outside:
+
+| unit | width | how it commits |
+|---|---|---|
+| state word (`nr_child` + tombstone + proxy) | 1 `uintptr_t` | its **own** flip-latch edge |
+| node body (occupancy bitmap + pointer array) | many words | the **parent-pointer** flip (whole-node replacement / recompact) |
+| pigeon hint bitmap | many words | not committed — per-word atomic-OR, pointers are truth |
+
+A structure **wider than a `uintptr_t` cannot be its own committed edge**; it
+commits by riding a node's *identity* instead — the recompact builds the whole
+new node (its multi-word bitmap included) build-invisibly, then flips the single
+parent-pointer word, so a reader sees the old node or the new node, never a torn
+bitmap. *This is why a popcount node must recompact:* its bitmap is wide truth,
+and whole-node replacement is the only way to commit a wide update atomically.
+The two units compose per op — an insert (recompact) carries both the new body
+and the new count in the fresh node (one parent flip); an in-place delete
+changes the body by one `pointer→NULL` edge and the count by the state-word edge
+(two single-word edges, same commit). The wide bitmap never needs its own edge.
+
+**Possibility (design note, not chosen): committing the bitmap word-by-word.**
+If the occupancy bitmap ever *had* to be part of the commit directly (rather than
+via node identity), it could be: reserve the in-band proxy/FLIP tag bit in
+**every** `uintptr_t` of the bitmap — `{ 63-bit bitmap fragment, 1 tag }` per
+word — so each word rides the flip-latch as its own committed edge. A 256-bit
+pigeon bitmap then occupies **5 words instead of 4** (⌈256/63⌉). The cost is that
+**every bitscan op gets much more complex**: `find_next/prev_bit`, popcount,
+`test_bit`, set/clear all have to mask the per-word tag and index in non-power-of-2
+63-bit strides instead of clean 64-bit words. So it is feasible but unattractive;
+the chosen path keeps wide truth committing via node identity (recompact) and the
+pigeon bitmap as a per-word hint.
+
 ---
 
 ## 5. Cost tiers and exclusivity
