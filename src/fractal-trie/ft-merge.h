@@ -1472,6 +1472,17 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 	}
+	/*
+	 * Freeze-on-free (doc §4.B): the src-overlap spine this merge retires
+	 * (gs->free_list, drained at ft_glue_free_old below) is unlinked by the
+	 * src-root swap / run-unlink commit that follows.  Stamp it dead here --
+	 * gs is fully populated by ft_merge_build above, and this point is past
+	 * the last src-side abort (the src_side_txn reservation), so it runs only
+	 * on the committing path.  (gd is stamped in ft_glue_apply_deferred for
+	 * the dst forward publish.)
+	 */
+	ft_glue_tombstone_free_list(&gs);
+
 	if (root_src) {
 		/*
 		 * A root src moves the WHOLE source, so its run is the whole src
@@ -2415,7 +2426,12 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * the detach above just produced, so its root reset + head/tail
 		 * clear are plain stores (no src-side disappear window, unlike
 		 * ft_graft's cross-trie empty-dst).
+		 *
+		 * Freeze-on-free (doc §4.B): the dst old root this swap retires
+		 * gets its tombstone before the swap unlinks it.  Failure-free past
+		 * the detach above, so this runs only on the committing path.
 		 */
+		ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(old_dst_root));
 		if (dst_ft->group->ordered_list_set) {
 			ft_root_list_swap_publish(dst_ft, appear_txn, &dst_ft->root,
 				dst_ft->root, subtree->root,
