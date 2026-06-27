@@ -2004,7 +2004,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (!empty_pruned) {
 			pmeta = cds_ft_item_to_metadata(ft_node_ptr(d.pnf));
 			if (!have_insert)
-				ft_meta_nr_child_dec(pmeta);
+				ft_meta_nr_child_dec_flip(pmeta);
 			if (swap_count != old_count)
 				ft_propagate_external_count_parent(dst_ft, d.pnf,
 						(long) swap_count - (long) old_count);

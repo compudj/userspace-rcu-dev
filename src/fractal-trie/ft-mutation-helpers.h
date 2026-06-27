@@ -441,6 +441,27 @@ void ft_state_edge(struct ft_ord_cell_edge *edge, uintptr_t *state_slot,
 }
 
 /*
+ * The remove-side nr_child-- as a COMMITTED flip edge, replacing the bare
+ * in-place ft_meta_nr_child_dec on a LIVE node.  Same net effect under one
+ * writer -- a lone-edge flip is one release store, byte-identical to the bare
+ * decrement (and the node-state word is writer-side only, so no reader ever
+ * resolves its transient proxy) -- but under multi-writer MCAS the decrement
+ * becomes a CAS-with-expected on the state word instead of a disjoint in-place
+ * store (doc/design/mcas-multiwriter-readiness.md §4.2).  The structural
+ * child-slot edge still commits separately here; fusing the two into one flip
+ * (atomic {structure, count}) is a follow-up.
+ */
+static
+void ft_meta_nr_child_dec_flip(struct cds_ft_metadata *meta)
+{
+	struct ft_ord_cell_edge edge;
+	uintptr_t old = meta->state;
+
+	ft_state_edge(&edge, &meta->state, old, old - FT_STATE_NR_CHILD_ONE);
+	ft_ord_cell_flip_one(&edge);
+}
+
+/*
  * Publish an in-place node child-slot replacement (@slot transitions @old ->
  * @new) as a single-edge flip descriptor.  This is the non-fused (pub == NULL)
  * arm of ft_node_replace_ptr -- a key-disappearing leaf delete (@new == NULL) or

@@ -671,7 +671,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		pub->new_val = newptr;
 		pub->armed = true;
 		if (!newptr)
-			ft_meta_nr_child_dec(metadata);
+			ft_meta_nr_child_dec_flip(metadata);
 		return 0;
 	}
 	/*
@@ -685,7 +685,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
 	ft_node_child_edge_flip(ft, node_flag_ptr, *node_flag_ptr, newptr);
 	if (!newptr)
-		ft_meta_nr_child_dec(metadata);
+		ft_meta_nr_child_dec_flip(metadata);
 	dbg_printf("popcount replace ptr: %u child, metadata: %u child, for node %p newptr %p\n",
 		(unsigned int) ft_popcount_node_get_nr_child(type, node),
 		(unsigned int) ft_meta_nr_child(metadata),
@@ -731,7 +731,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		if (!newptr) {
 			pub->pigeon_bitmap = cds_ft_item_to_bitmap(node, type->order);
 			pub->pigeon_bit = n;
-			ft_meta_nr_child_dec(metadata);
+			ft_meta_nr_child_dec_flip(metadata);
 		}
 		return 0;
 	}
@@ -744,7 +744,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 
 		/* Clear n in bitmap. */
 		cds_clear_bit_relaxed(bitmap->bitmap, n);
-		ft_meta_nr_child_dec(metadata);
+		ft_meta_nr_child_dec_flip(metadata);
 	}
 	return 0;
 }
