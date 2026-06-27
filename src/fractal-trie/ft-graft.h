@@ -621,6 +621,16 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 					redges[i].old_target,
 					redges[i].new_target);
 		}
+		/*
+		 * Freeze-on-free (doc §4.B): a reserve recompaction relocated the
+		 * dst attach node; its old copy @old_recompacted_node, resolved-to
+		 * via the parked grandparent proxy until this commit, gets its
+		 * tombstone before the commit unlinks it.  (Not surfaced by ft_unit;
+		 * the recompact-relocation graft shape is exercised by ft_inv.)
+		 */
+		if (st->old_recompacted_node)
+			ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+				st->old_recompacted_node));
 		gp = urcu_flip_txn_commit(st->glue->txn);
 		ft_flip_txn_reclaim(ft, st->glue->txn, gp);
 		st->glue->txn = NULL;
@@ -876,6 +886,14 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 				.tail_old = src_tail, .tail_new = NULL,
 			};
 
+			/*
+			 * Freeze-on-free (doc §4.B): the dst old root this swap
+			 * retires gets its one-way tombstone before the swap unlinks
+			 * it (src_root MOVES to dst, fresh_root is the new src root --
+			 * neither is freed here; only @old_dst_root == @dst_old is).
+			 */
+			ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+				ft_node_ptr(dst_old)));
 			ft_root_list_swap_publish_dual(dual_txn, &appear,
 				&disappear);
 		}
@@ -1097,6 +1115,18 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * is skipped in that case.
 		 */
 		old_src_root = src_ft->root;
+
+		/*
+		 * Freeze-on-free (doc §4.B): a NIL-key graft frees the orphaned
+		 * src-root wrapper @old_src_root below (its external chain was
+		 * grafted into dst, leaving the wrapper empty); mark it dead before
+		 * the src-root retire commit that unlinks it.  Non-NIL: @old_src_root
+		 * IS the payload, moved LIVE into dst -- it must NOT be marked.  No
+		 * fallible step between here and the retire (all returned above).
+		 */
+		if (nil_key_root)
+			ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+				ft_node_ptr(old_src_root)));
 
 		/*
 		 * Ordered list: capture src's whole list (the run to graft) and,
@@ -2124,6 +2154,17 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				n = ft_ord_cell_endpoint_edge(&swap_ft->ord_cell_tail,
 					swap_ft->ord_cell_tail, gs_d_last, edges, n);
 			}
+			/*
+			 * Freeze-on-free (doc §4.B): when @top_B replaces swap_ft's
+			 * root, the transient root this install retires -- @fresh for a
+			 * non-empty swap, the old empty @old_swap_root for an empty swap,
+			 * both reader-visible as swap_ft->root during the unlink window --
+			 * gets its tombstone before the commit below unlinks it.  Only on
+			 * the top_B path (the external/absent case keeps the root live).
+			 */
+			if (top_B)
+				ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+					swap_empty ? ft_node_ptr(old_swap_root) : fresh));
 			/*
 			 * Post-drain commit (un-abortable): list on rides the
 			 * pre-reserved extract_txn (multi-edge: root install + run_D
