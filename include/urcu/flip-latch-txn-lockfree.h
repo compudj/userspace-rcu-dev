@@ -190,16 +190,21 @@ static inline
 void urcu_flip_lf_txn__enter_fallback(struct urcu_flip_lf_txn *txn)
 {
 	/*
-	 * cds_fair_mutex_lock may park on a futex until our turn.  A QSBR reader
-	 * that blocks while online stalls grace periods -- and thus the
-	 * engine's call_rcu reclaim -- for the whole wait, so go RCU-offline
-	 * around it.  We are outside the bracket's read-side section here
-	 * (begin escalates before rcu_read_lock; reserve unlocks first), so
-	 * this is safe; other flavors implement the pair too (flavor API).
+	 * cds_fair_mutex_lock may park on a futex until our turn.  We hold the
+	 * caller's RCU read-side section across that wait rather than going
+	 * RCU-offline: that section is what keeps the caller's input pointers
+	 * (e.g. a list anchor reached by key) alive for the whole transaction,
+	 * and dropping it would let a concurrent grace period free them out from
+	 * under us.  (Going offline is a QSBR-only move anyway -- the bracketing
+	 * flavors hold a nested read-side lock the callee cannot release.)  This
+	 * is safe because the wait is bounded: the FIFO turn is short and the
+	 * lane owner's commit is a bounded MCAS that defers reclaim through
+	 * call_rcu and never itself waits on a grace period, so holding the
+	 * section across it cannot extend a grace period unboundedly.  That "the
+	 * lane owner never blocks on a GP while holding the mutex" is the one
+	 * invariant this relies on.
 	 */
-	rcu_thread_offline();
 	cds_fair_mutex_lock(&txn->domain->lock, &txn->waiter);
-	rcu_thread_online();
 	uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
 	txn->in_fallback = 1;
 }
@@ -270,16 +275,13 @@ int urcu_flip_lf_txn_reserve(struct urcu_flip_lf_txn *txn, unsigned int n)
 	txn->min_alloc = n;
 	/*
 	 * A large op declares its size here: escalate immediately, before
-	 * building any nodes, so it never runs a disruptive optimistic
-	 * attempt.  We are inside the bracket's RCU read-side section but have
-	 * read nothing yet, so we can step out around the (possibly blocking)
-	 * FIFO enter and back in.
+	 * building any nodes, so it never runs a disruptive optimistic attempt.
+	 * We hold the read-side section across the (possibly blocking) FIFO enter
+	 * (see __enter_fallback): the bounded wait keeps the caller's pinned
+	 * pointers alive and cannot extend a grace period unboundedly.
 	 */
-	if (txn->domain && !txn->in_fallback && n >= URCU_FLIP_LF_TXN_BIG) {
-		rcu_read_unlock();
+	if (txn->domain && !txn->in_fallback && n >= URCU_FLIP_LF_TXN_BIG)
 		urcu_flip_lf_txn__enter_fallback(txn);
-		rcu_read_lock();
-	}
 	if (caa_unlikely(txn->mcas == URCU_FLIP_LF_TXN_ENOMEM))
 		return -ENOMEM;		/* sticky: an earlier alloc already failed */
 	if (!n)
@@ -369,12 +371,16 @@ void *urcu_flip_lf_txn_load(struct urcu_flip_lf_txn *txn, void **slot)
  * if @slot still resolves to that value at the install point (records {v -> v})
  * -- a TM read-set entry folding a read into the commit's conflict set, for a
  * word the op depends on but does not rewrite (e.g. a tombstone an insert must
- * find clear).  @slot's value must be non-ABA-able within the read-side section
- * (the engine precondition): an RCU pointer or a monotone marker qualifies, a
- * reused toggling word does not.  A later store to @slot upgrades the guard to
- * a write in place; validate/read a given slot once per attempt.  Sticky on OOM
- * like store: the value is returned regardless and the pending commit reports
- * -ENOMEM.
+ * find clear).  This is value-CAS semantics: the guard checks that @slot resolves
+ * to that value AT the linearization point, not that it stayed unchanged
+ * throughout.  The engine is A-B-A-safe (the install latch tolerates any
+ * slot-value recurrence -- no use-after-free), so a value that recurs benignly is
+ * fine; but if the op's correctness needs to DETECT an intervening change (a true
+ * A-B-A where the "B" matters -- the slot toggled away and back), the guard alone
+ * will not see it, and the embedder must carry its own version/generation in the
+ * word.  A later store to @slot upgrades the guard to a write in place;
+ * validate/read a given slot once per attempt.  Sticky on OOM like store: the
+ * value is returned regardless and the pending commit reports -ENOMEM.
  */
 static inline
 void *urcu_flip_lf_txn_load_validate(struct urcu_flip_lf_txn *txn, void **slot)
