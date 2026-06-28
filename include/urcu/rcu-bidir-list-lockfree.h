@@ -211,9 +211,67 @@ int cds_bidir_list_lf_empty(struct cds_bidir_list_lf_head *head)
 }
 
 /*
+ * cds_bidir_list_lf_insert_after_prepare: record the edges of an insert-after
+ * into the caller-owned transaction @txn, WITHOUT committing.  This is the
+ * composable form: the caller owns the bracket (begin .. commit .. end), the
+ * escalation domain (whichever @txn was init'd with), and the retry loop, and
+ * may fold these records together with records from other structures into a
+ * single MCAS commit -- e.g. publish a node into a trie and splice it into this
+ * list atomically.  Call between urcu_flip_lf_txn_begin() and
+ * urcu_flip_lf_txn_commit().  Returns 0 on success, or -ENOENT if @pos has been
+ * deleted (the caller ends the bracket and bails the logical op); a descriptor
+ * OOM is sticky and surfaces at the caller's commit.  @pos must be kept alive
+ * by the caller's RCU read-side section (see the contract above).
+ */
+static inline
+int cds_bidir_list_lf_insert_after_prepare(struct urcu_flip_lf_txn *txn,
+		struct cds_bidir_list_lf_node *newp,
+		struct cds_bidir_list_lf_node *pos)
+{
+	void *pn = urcu_flip_lf_txn_load(txn, (void **) &pos->next);
+	struct cds_bidir_list_lf_node *succ;
+
+	if (cds_bidir_list_lf_is_marked(pn))
+		return -ENOENT;				/* @pos was deleted */
+	succ = (struct cds_bidir_list_lf_node *) pn;	/* unmarked successor */
+
+	/*
+	 * We write &succ->prev but NOT &succ->next.  The next slot that serializes
+	 * this insert against del(succ) is &pos->next -- but the slot-sorted MCAS
+	 * may install &succ->prev BEFORE it reaches &pos->next, so the prev-side
+	 * store can be driven against a succ a concurrent del(succ) is freeing
+	 * (a foreign slot in the descriptor, e.g. a composing structure's, widens
+	 * this window).  Fold a load-validate of succ->next -- the slot del(succ)
+	 * marks -- into the write-set, so the prev side serializes against
+	 * del(succ) exactly as the next side does; a marked succ aborts here.
+	 */
+	if (cds_bidir_list_lf_is_marked(urcu_flip_lf_txn_load_validate(txn,
+			(void **) &succ->next)))
+		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
+
+	/* Build the fresh node invisibly. */
+	newp->next = succ;
+	newp->prev = pos;
+
+	/*
+	 * pos->next: succ -> newp ; succ->prev: pos -> newp.
+	 * &pos->next is the slot that serializes us against deletion:
+	 * del(pos) marks it, and del(succ) rewrites it to skip succ -- either
+	 * makes this store fail its old value, so the commit aborts and the
+	 * caller retries (and on a marked pos, returns -ENOENT above).  See the
+	 * "next"-only mark rationale at the top of this file.
+	 */
+	urcu_flip_lf_txn_store(txn, (void **) &pos->next, succ, newp);
+	urcu_flip_lf_txn_store(txn, (void **) &succ->prev, pos, newp);
+	return 0;
+}
+
+/*
  * Insert @newp immediately after @pos in list @head.  Returns 0 on success,
  * -ENOENT if @pos has been deleted, -ENOMEM on descriptor allocation failure.
- * @head supplies the list's escalation domain (see the contract above).
+ * @head supplies the list's escalation domain (see the contract above).  This
+ * is the self-contained convenience form: a thin bracket around
+ * cds_bidir_list_lf_insert_after_prepare().
  */
 static inline
 int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
@@ -221,39 +279,26 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 		struct cds_bidir_list_lf_head *head)
 {
 	struct urcu_flip_lf_txn txn;
-	int ret;
+	int ret, prep;
 
 	urcu_flip_lf_txn_init(&txn, &head->domain);
-	do {
-		void *pn;
-		struct cds_bidir_list_lf_node *succ;
-
+	for (;;) {
 		urcu_flip_lf_txn_begin(&txn);
-		pn = urcu_flip_lf_txn_load(&txn, (void **) &pos->next);
-		if (cds_bidir_list_lf_is_marked(pn)) {
+		prep = cds_bidir_list_lf_insert_after_prepare(&txn, newp, pos);
+		if (prep == -EAGAIN) {			/* succ (a neighbour) moved: retry */
+			urcu_flip_lf_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_flip_lf_txn_end(&txn);
-			return -ENOENT;			/* @pos was deleted */
+			continue;
 		}
-		succ = (struct cds_bidir_list_lf_node *) pn;	/* unmarked successor */
-
-		/* Build the fresh node invisibly. */
-		newp->next = succ;
-		newp->prev = pos;
-
-		/*
-		 * pos->next: succ -> newp ; succ->prev: pos -> newp.
-		 * &pos->next is the slot that serializes us against deletion:
-		 * del(pos) marks it, and del(succ) rewrites it to skip succ --
-		 * either makes this store fail its old value, so we abort and
-		 * retry (and on a marked pos, return -ENOENT above).  See the
-		 * "next"-only mark rationale at the top of this file.
-		 */
-		urcu_flip_lf_txn_store(&txn, (void **) &pos->next, succ, newp);
-		urcu_flip_lf_txn_store(&txn, (void **) &succ->prev, pos, newp);
+		if (prep) {				/* -ENOENT: @pos deleted */
+			urcu_flip_lf_txn_end(&txn);
+			return prep;
+		}
 		ret = urcu_flip_lf_txn_commit(&txn);
 		urcu_flip_lf_txn_end(&txn);
-		/* ABORT: a neighbour changed -- re-read, retry, maybe -ENOENT */
-	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+		if (ret != URCU_FLIP_TXN_STATUS_ABORT)	/* ABORT: a neighbour changed */
+			break;
+	}
 	return ret < 0 ? -ENOMEM : 0;		/* OK committed, -ENOMEM on OOM */
 }
 
@@ -264,9 +309,12 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
  * depends on a word the list does not otherwise touch: a per-node "live" /
  * generation marker the embedder keeps beside its node, a container-freeze
  * flag, etc.  @guard_slot must be engine-transacted (every writer of it goes
- * through the MCAS) and non-ABA-able within the read-side section, like any
- * transacted slot.  Returns 0; -ENOENT if @pos was deleted or @guard_slot no
- * longer holds @guard_expected; -ENOMEM on descriptor OOM.
+ * through the MCAS).  The guard has value-CAS semantics: it checks @guard_slot
+ * resolves to @guard_expected AT the linearization point, not that it stayed so
+ * throughout -- the engine itself is A-B-A-safe, but if a benign recurrence of
+ * @guard_expected would be the wrong answer for your insert, put a
+ * version/generation in the guarded word.  Returns 0; -ENOENT if @pos was deleted
+ * or @guard_slot no longer holds @guard_expected; -ENOMEM on descriptor OOM.
  */
 static inline
 int cds_bidir_list_lf_insert_after_guarded_rcu(
@@ -279,7 +327,7 @@ int cds_bidir_list_lf_insert_after_guarded_rcu(
 	int ret;
 
 	urcu_flip_lf_txn_init(&txn, &head->domain);
-	do {
+	for (;;) {
 		void *pn;
 		struct cds_bidir_list_lf_node *succ;
 
@@ -301,19 +349,74 @@ int cds_bidir_list_lf_insert_after_guarded_rcu(
 			return -ENOENT;			/* guard no longer holds */
 		}
 		succ = (struct cds_bidir_list_lf_node *) pn;
+		/*
+		 * Guard succ->next: we write &succ->prev but not &succ->next, so the
+		 * prev-side store must serialize against del(succ) -- the slot-sorted
+		 * install may reach &succ->prev before &pos->next.  See
+		 * insert_after_prepare.  A marked succ moved: retry.
+		 */
+		if (cds_bidir_list_lf_is_marked(urcu_flip_lf_txn_load_validate(
+				&txn, (void **) &succ->next))) {
+			urcu_flip_lf_txn_conflict(&txn);	/* age so a hot slot escalates */
+			urcu_flip_lf_txn_end(&txn);
+			continue;
+		}
 		newp->next = succ;
 		newp->prev = pos;
 		urcu_flip_lf_txn_store(&txn, (void **) &pos->next, succ, newp);
 		urcu_flip_lf_txn_store(&txn, (void **) &succ->prev, pos, newp);
 		ret = urcu_flip_lf_txn_commit(&txn);
 		urcu_flip_lf_txn_end(&txn);
-	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+		if (ret != URCU_FLIP_TXN_STATUS_ABORT)
+			break;
+	}
 	return ret < 0 ? -ENOMEM : 0;
 }
 
 /*
+ * cds_bidir_list_lf_insert_before_prepare: record the edges of an
+ * insert-before into the caller-owned transaction @txn, WITHOUT committing.
+ * Composable form of insert_before (see insert_after_prepare for the contract).
+ * Returns 0, or -ENOENT if @pos has been deleted; OOM is sticky to the commit.
+ */
+static inline
+int cds_bidir_list_lf_insert_before_prepare(struct urcu_flip_lf_txn *txn,
+		struct cds_bidir_list_lf_node *newp,
+		struct cds_bidir_list_lf_node *pos)
+{
+	/*
+	 * We write &pos->prev but not &pos->next.  Load-validate pos->next (@pos
+	 * is the anchor whose prev we move) so the prev-side store serializes
+	 * against del(pos) atomically even when the slot-sorted install reaches
+	 * &pos->prev first.  A marked pos => the anchor is gone (-ENOENT).
+	 */
+	void *pn = urcu_flip_lf_txn_load_validate(txn, (void **) &pos->next);
+	struct cds_bidir_list_lf_node *prev;
+
+	if (cds_bidir_list_lf_is_marked(pn))
+		return -ENOENT;			/* @pos was deleted */
+	prev = cds_bidir_list_lf_unmark(
+			urcu_flip_lf_txn_load(txn, (void **) &pos->prev));
+
+	newp->next = pos;
+	newp->prev = prev;
+
+	/*
+	 * prev->next: pos -> newp ; pos->prev: prev -> newp.
+	 * &prev->next is the slot shared with del(prev) (which marks it) and
+	 * del(pos) (which rewrites it to skip pos): a moved predecessor-next
+	 * aborts the commit, and a marked pos is caught on the re-read above.
+	 * See the "next"-only mark rationale at the top.
+	 */
+	urcu_flip_lf_txn_store(txn, (void **) &prev->next, pos, newp);
+	urcu_flip_lf_txn_store(txn, (void **) &pos->prev, prev, newp);
+	return 0;
+}
+
+/*
  * Insert @newp immediately before @pos in list @head.  Returns 0 / -ENOENT /
- * -ENOMEM as for insert_after.
+ * -ENOMEM as for insert_after.  Convenience bracket around
+ * cds_bidir_list_lf_insert_before_prepare().
  */
 static inline
 int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
@@ -321,34 +424,16 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 		struct cds_bidir_list_lf_head *head)
 {
 	struct urcu_flip_lf_txn txn;
-	int ret;
+	int ret, prep;
 
 	urcu_flip_lf_txn_init(&txn, &head->domain);
 	do {
-		void *pn;
-		struct cds_bidir_list_lf_node *prev;
-
 		urcu_flip_lf_txn_begin(&txn);
-		pn = urcu_flip_lf_txn_load(&txn, (void **) &pos->next);
-		if (cds_bidir_list_lf_is_marked(pn)) {
+		prep = cds_bidir_list_lf_insert_before_prepare(&txn, newp, pos);
+		if (prep) {				/* -ENOENT: @pos deleted */
 			urcu_flip_lf_txn_end(&txn);
-			return -ENOENT;			/* @pos was deleted */
+			return prep;
 		}
-		prev = cds_bidir_list_lf_unmark(
-				urcu_flip_lf_txn_load(&txn, (void **) &pos->prev));
-
-		newp->next = pos;
-		newp->prev = prev;
-
-		/*
-		 * prev->next: pos -> newp ; pos->prev: prev -> newp.
-		 * &prev->next is the slot shared with del(prev) (which marks it)
-		 * and del(pos) (which rewrites it to skip pos): a moved
-		 * predecessor-next aborts us, and a marked pos is caught on the
-		 * re-read above.  See the "next"-only mark rationale at the top.
-		 */
-		urcu_flip_lf_txn_store(&txn, (void **) &prev->next, pos, newp);
-		urcu_flip_lf_txn_store(&txn, (void **) &pos->prev, prev, newp);
 		ret = urcu_flip_lf_txn_commit(&txn);
 		urcu_flip_lf_txn_end(&txn);
 	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
@@ -379,50 +464,194 @@ int cds_bidir_list_lf_add_tail_rcu(struct cds_bidir_list_lf_node *newp,
 }
 
 /*
+ * cds_bidir_list_lf_del_prepare: record the unlink of @elem into the
+ * caller-owned transaction @txn, WITHOUT committing.  Composable form of del
+ * (see insert_after_prepare for the contract).  Returns 0 if the unlink was
+ * recorded (when the caller's commit then returns OK, THIS call removed @elem
+ * and the caller reclaims it after a grace period), or -ENOENT if @elem was
+ * already deleted by a peer (nothing recorded; the caller must NOT reclaim).
+ * OOM is sticky to the commit.
+ */
+static inline
+int cds_bidir_list_lf_del_prepare(struct urcu_flip_lf_txn *txn,
+		struct cds_bidir_list_lf_node *elem)
+{
+	void *en = urcu_flip_lf_txn_load(txn, (void **) &elem->next);
+	struct cds_bidir_list_lf_node *next, *prev;
+
+	if (cds_bidir_list_lf_is_marked(en))
+		return -ENOENT;			/* already deleted by a peer */
+	next = (struct cds_bidir_list_lf_node *) en;
+	prev = cds_bidir_list_lf_unmark(
+			urcu_flip_lf_txn_load(txn, (void **) &elem->prev));
+
+	/*
+	 * We rewrite &next->prev but not &next->next.  Load-validate next->next
+	 * (the slot del(next) marks) so the backward unlink serializes against
+	 * del(next) atomically even when the slot-sorted install reaches
+	 * &next->prev first.  A marked successor is itself being deleted: retry
+	 * (elem->next will have moved to the successor's successor).
+	 *
+	 * Skip the guard when next == prev (a node whose two neighbours coincide,
+	 * e.g. the sole element, where both are the sentinel): the &prev->next
+	 * forward-unlink store below is then the SAME slot &next->next and already
+	 * serializes it.  Recording the guard there too would put two records on
+	 * one slot with different expected-old values (the guard reads the slot
+	 * fresh, the store hard-codes @elem) -- the descriptor's per-slot reconcile
+	 * would silently merge them into a bogus record under -DNDEBUG, committing
+	 * a corrupt edge (a marked-but-still-linked node).
+	 */
+	if (next != prev &&
+			cds_bidir_list_lf_is_marked(urcu_flip_lf_txn_load_validate(
+				txn, (void **) &next->next)))
+		return -EAGAIN;			/* successor (a neighbour) deleted: retry */
+
+	/*
+	 * Mark elem (logical delete), then unlink both neighbour edges.
+	 * &prev->next (old value elem) is the slot a racing
+	 * insert_after(prev) / insert_before(elem) shares with us, so the MCAS
+	 * serializes insert against delete on every adjacency; marking
+	 * &elem->next is what makes a racing insert_after(elem) (or
+	 * insert_before(elem)) terminate with -ENOENT.  See the "next"-only
+	 * mark rationale at the top of this file.
+	 */
+	urcu_flip_lf_txn_store(txn, (void **) &elem->next, next,
+			cds_bidir_list_lf_set_mark(next));
+	urcu_flip_lf_txn_store(txn, (void **) &prev->next, elem, next);
+	urcu_flip_lf_txn_store(txn, (void **) &next->prev, elem, prev);
+	return 0;
+}
+
+/*
  * Remove @elem from list @head.  Returns 1 if THIS call removed it (the caller
  * reclaims @elem after a grace period), 0 if it was already deleted (the caller
- * must NOT reclaim), or -ENOMEM on descriptor allocation failure.
+ * must NOT reclaim), or -ENOMEM on descriptor allocation failure.  Convenience
+ * bracket around cds_bidir_list_lf_del_prepare().
  */
 static inline
 int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
 		struct cds_bidir_list_lf_head *head)
 {
 	struct urcu_flip_lf_txn txn;
-	int ret;
+	int ret, prep;
 
 	urcu_flip_lf_txn_init(&txn, &head->domain);
-	do {
-		void *en;
-		struct cds_bidir_list_lf_node *next, *prev;
-
+	for (;;) {
 		urcu_flip_lf_txn_begin(&txn);
-		en = urcu_flip_lf_txn_load(&txn, (void **) &elem->next);
-		if (cds_bidir_list_lf_is_marked(en)) {
+		prep = cds_bidir_list_lf_del_prepare(&txn, elem);
+		if (prep == -EAGAIN) {			/* successor moved: retry */
+			urcu_flip_lf_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_flip_lf_txn_end(&txn);
-			return 0;			/* already deleted by a peer */
+			continue;
 		}
-		next = (struct cds_bidir_list_lf_node *) en;
-		prev = cds_bidir_list_lf_unmark(
-				urcu_flip_lf_txn_load(&txn, (void **) &elem->prev));
-
-		/*
-		 * Mark elem (logical delete), then unlink both neighbour edges.
-		 * &prev->next (old value elem) is the slot a racing
-		 * insert_after(prev) / insert_before(elem) shares with us, so
-		 * the MCAS serializes insert against delete on every adjacency;
-		 * marking &elem->next is what makes a racing insert_after(elem)
-		 * (or insert_before(elem)) terminate with -ENOENT.  See the
-		 * "next"-only mark rationale at the top of this file.
-		 */
-		urcu_flip_lf_txn_store(&txn, (void **) &elem->next, next,
-				cds_bidir_list_lf_set_mark(next));
-		urcu_flip_lf_txn_store(&txn, (void **) &prev->next, elem, next);
-		urcu_flip_lf_txn_store(&txn, (void **) &next->prev, elem, prev);
+		if (prep) {				/* -ENOENT: already deleted */
+			urcu_flip_lf_txn_end(&txn);
+			return 0;			/* not removed by this call */
+		}
 		ret = urcu_flip_lf_txn_commit(&txn);
 		urcu_flip_lf_txn_end(&txn);
-		/* ABORT: neighbours changed -- retry, maybe find it deleted */
-	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+		if (ret != URCU_FLIP_TXN_STATUS_ABORT)	/* ABORT: neighbours changed */
+			break;
+	}
 	return ret < 0 ? -ENOMEM : 1;		/* 1 removed by this call, -ENOMEM */
+}
+
+/*
+ * cds_bidir_list_lf_replace_prepare: record the in-place replacement of @old by
+ * @newp into the caller-owned transaction @txn, WITHOUT committing.  Composable
+ * form of replace (see insert_after_prepare for the contract).  @newp takes
+ * @old's position -- &prev->next and &next->prev swing to @newp -- while @old is
+ * logically removed (its next is marked exactly as del does).  This touches the
+ * SAME slots as del_prepare (only the new values differ), so it inherits del's
+ * serialization against every adjacent insert/delete; in particular a racing
+ * del(old)/insert_after(old) sees the mark and terminates with -ENOENT, and a
+ * reader standing on @old escapes forward to @old's old successor (it linearizes
+ * before the replace -- @newp is reached afresh through @prev).  Returns 0 if
+ * recorded (on a committed OK, THIS call replaced @old and the caller reclaims
+ * @old after a grace period), -ENOENT if @old was already deleted/replaced by a
+ * peer (nothing recorded; do NOT reclaim), or -EAGAIN if a neighbour is
+ * mid-deletion (retry).  OOM is sticky to the commit.
+ */
+static inline
+int cds_bidir_list_lf_replace_prepare(struct urcu_flip_lf_txn *txn,
+		struct cds_bidir_list_lf_node *newp,
+		struct cds_bidir_list_lf_node *old)
+{
+	void *en = urcu_flip_lf_txn_load(txn, (void **) &old->next);
+	struct cds_bidir_list_lf_node *next, *prev;
+
+	if (cds_bidir_list_lf_is_marked(en))
+		return -ENOENT;			/* @old already deleted/replaced by a peer */
+	next = (struct cds_bidir_list_lf_node *) en;
+	prev = cds_bidir_list_lf_unmark(
+			urcu_flip_lf_txn_load(txn, (void **) &old->prev));
+
+	/*
+	 * We rewrite &next->prev but not &next->next.  Load-validate next->next
+	 * (the slot del(next) marks) so the backward edge serializes against
+	 * del(next) atomically even when the slot-sorted install reaches
+	 * &next->prev first -- identical to del_prepare, including the next == prev
+	 * skip (the &prev->next store already serializes that slot; recording the
+	 * guard there too would collide into a bogus merged record -- see
+	 * del_prepare).
+	 */
+	if (next != prev &&
+			cds_bidir_list_lf_is_marked(urcu_flip_lf_txn_load_validate(
+				txn, (void **) &next->next)))
+		return -EAGAIN;			/* successor (a neighbour) deleted: retry */
+
+	/* Build @newp's links invisibly, then swing both neighbour edges to it. */
+	newp->next = next;
+	newp->prev = prev;
+
+	/*
+	 * Mark &old->next (logical removal of @old, as del) and point both
+	 * neighbours at @newp instead of skipping.  &prev->next (old value @old)
+	 * is the slot a racing insert_after(prev)/del(prev)/del(old) shares with
+	 * us; marking &old->next is what makes a racing insert_after(old) or
+	 * del(old) terminate with -ENOENT.  See the "next"-only mark rationale at
+	 * the top of this file.
+	 */
+	urcu_flip_lf_txn_store(txn, (void **) &old->next, next,
+			cds_bidir_list_lf_set_mark(next));
+	urcu_flip_lf_txn_store(txn, (void **) &prev->next, old, newp);
+	urcu_flip_lf_txn_store(txn, (void **) &next->prev, old, newp);
+	return 0;
+}
+
+/*
+ * Replace @old with @newp atomically with respect to RCU readers.  Returns 0 on
+ * success (the caller reclaims @old after a grace period), -ENOENT if @old was
+ * already deleted/replaced, or -ENOMEM on descriptor allocation failure.
+ * Convenience bracket around cds_bidir_list_lf_replace_prepare().
+ */
+static inline
+int cds_bidir_list_lf_replace_rcu(struct cds_bidir_list_lf_node *newp,
+		struct cds_bidir_list_lf_node *old,
+		struct cds_bidir_list_lf_head *head)
+{
+	struct urcu_flip_lf_txn txn;
+	int ret, prep;
+
+	urcu_flip_lf_txn_init(&txn, &head->domain);
+	for (;;) {
+		urcu_flip_lf_txn_begin(&txn);
+		prep = cds_bidir_list_lf_replace_prepare(&txn, newp, old);
+		if (prep == -EAGAIN) {			/* a neighbour moved: retry */
+			urcu_flip_lf_txn_conflict(&txn);	/* age so a hot slot escalates */
+			urcu_flip_lf_txn_end(&txn);
+			continue;
+		}
+		if (prep) {				/* -ENOENT: @old already gone */
+			urcu_flip_lf_txn_end(&txn);
+			return prep;
+		}
+		ret = urcu_flip_lf_txn_commit(&txn);
+		urcu_flip_lf_txn_end(&txn);
+		if (ret != URCU_FLIP_TXN_STATUS_ABORT)	/* ABORT: neighbours changed */
+			break;
+	}
+	return ret < 0 ? -ENOMEM : 0;		/* 0 replaced (reclaim @old after GP), -ENOMEM */
 }
 
 #define cds_bidir_list_lf_entry(ptr, type, member) \

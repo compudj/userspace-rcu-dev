@@ -212,9 +212,21 @@ int cds_bidir_list_flip2(
 	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
 }
 
-/* Insert @newp just after @pos (between @pos and its successor). */
+/*
+ * cds_bidir_list_add_after_prepare: record the edges of an add-after into the
+ * caller-owned single-updater transaction @txn, WITHOUT committing.  The
+ * composable form: the caller owns the bracket (init .. commit) and may fold
+ * these records together with records from other structures into ONE flip --
+ * e.g. publish a node into a trie and splice it into this list atomically.
+ * Mirrors cds_bidir_list_lf_insert_after_prepare(); under a single updater
+ * there is no concurrent deletion, so it always succeeds (returns 0).  The int
+ * return matches the lock-free variant so callers share one shape across the
+ * single-updater -> lock-free transition.  @txn must be init'd with
+ * cds_bidir_list_proxy_tag so the list's reader accessors resolve the proxy.
+ */
 static inline
-int cds_bidir_list_add_after_rcu(struct cds_bidir_list_head *newp,
+int cds_bidir_list_add_after_prepare(struct urcu_flip_txn *txn,
+		struct cds_bidir_list_head *newp,
 		struct cds_bidir_list_head *pos)
 {
 	struct cds_bidir_list_head *next = pos->next;
@@ -224,13 +236,34 @@ int cds_bidir_list_add_after_rcu(struct cds_bidir_list_head *newp,
 	newp->next = next;
 
 	/* pos->next: next -> newp ; next->prev: pos -> newp */
-	return cds_bidir_list_flip2(&pos->next, next, newp,
-			&next->prev, pos, newp);
+	(void) urcu_flip_txn_record(txn, (void **) &pos->next, next, newp);
+	(void) urcu_flip_txn_record(txn, (void **) &next->prev, pos, newp);
+	return 0;
 }
 
-/* Insert @newp just before @pos (between @pos's predecessor and @pos). */
+/*
+ * Insert @newp just after @pos (between @pos and its successor).  Convenience
+ * bracket around cds_bidir_list_add_after_prepare().
+ */
 static inline
-int cds_bidir_list_add_before_rcu(struct cds_bidir_list_head *newp,
+int cds_bidir_list_add_after_rcu(struct cds_bidir_list_head *newp,
+		struct cds_bidir_list_head *pos)
+{
+	struct urcu_flip_txn txn;
+
+	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	(void) cds_bidir_list_add_after_prepare(&txn, newp, pos);
+	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
+}
+
+/*
+ * cds_bidir_list_add_before_prepare: composable form of add-before (see
+ * add_after_prepare for the contract).  Always returns 0.
+ */
+static inline
+int cds_bidir_list_add_before_prepare(struct urcu_flip_txn *txn,
+		struct cds_bidir_list_head *newp,
 		struct cds_bidir_list_head *pos)
 {
 	struct cds_bidir_list_head *prev = pos->prev;
@@ -239,8 +272,25 @@ int cds_bidir_list_add_before_rcu(struct cds_bidir_list_head *newp,
 	newp->prev = prev;
 
 	/* prev->next: pos -> newp ; pos->prev: prev -> newp */
-	return cds_bidir_list_flip2(&prev->next, pos, newp,
-			&pos->prev, prev, newp);
+	(void) urcu_flip_txn_record(txn, (void **) &prev->next, pos, newp);
+	(void) urcu_flip_txn_record(txn, (void **) &pos->prev, prev, newp);
+	return 0;
+}
+
+/*
+ * Insert @newp just before @pos (between @pos's predecessor and @pos).
+ * Convenience bracket around cds_bidir_list_add_before_prepare().
+ */
+static inline
+int cds_bidir_list_add_before_rcu(struct cds_bidir_list_head *newp,
+		struct cds_bidir_list_head *pos)
+{
+	struct urcu_flip_txn txn;
+
+	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	(void) cds_bidir_list_add_before_prepare(&txn, newp, pos);
+	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
 }
 
 /* Add @newp at the head of the list (just after @head). */
@@ -260,24 +310,55 @@ int cds_bidir_list_add_tail_rcu(struct cds_bidir_list_head *newp,
 }
 
 /*
- * Remove @elem.  Its own next/prev are left intact (ghost) so a reader
- * standing on it can still escape in either direction; the caller frees
- * @elem after a grace period.
+ * cds_bidir_list_del_prepare: record the unlink of @elem into the caller-owned
+ * single-updater transaction @txn, WITHOUT committing.  Composable form of del
+ * (see add_after_prepare for the contract).  @elem's own next/prev are left
+ * intact (ghost) so a reader standing on it can still escape in either
+ * direction; the caller frees @elem after a grace period (post-commit).  Always
+ * returns 0 (single updater: no concurrent deletion); the int return matches
+ * cds_bidir_list_lf_del_prepare() for transition parity.
  */
 static inline
-int cds_bidir_list_del_rcu(struct cds_bidir_list_head *elem)
+int cds_bidir_list_del_prepare(struct urcu_flip_txn *txn,
+		struct cds_bidir_list_head *elem)
 {
 	struct cds_bidir_list_head *prev = elem->prev;
 	struct cds_bidir_list_head *next = elem->next;
 
 	/* prev->next: elem -> next ; next->prev: elem -> prev */
-	return cds_bidir_list_flip2(&prev->next, elem, next,
-			&next->prev, elem, prev);
+	(void) urcu_flip_txn_record(txn, (void **) &prev->next, elem, next);
+	(void) urcu_flip_txn_record(txn, (void **) &next->prev, elem, prev);
+	return 0;
 }
 
-/* Replace @old with @newp atomically with respect to RCU readers. */
+/*
+ * Remove @elem.  Its own next/prev are left intact (ghost) so a reader
+ * standing on it can still escape in either direction; the caller frees
+ * @elem after a grace period.  Convenience bracket around
+ * cds_bidir_list_del_prepare().
+ */
 static inline
-int cds_bidir_list_replace_rcu(struct cds_bidir_list_head *old,
+int cds_bidir_list_del_rcu(struct cds_bidir_list_head *elem)
+{
+	struct urcu_flip_txn txn;
+
+	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	(void) cds_bidir_list_del_prepare(&txn, elem);
+	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
+}
+
+/*
+ * cds_bidir_list_replace_prepare: record the in-place replacement of @old by
+ * @newp into the caller-owned single-updater transaction @txn, WITHOUT
+ * committing.  Composable form of replace (see add_after_prepare for the
+ * contract): @newp inherits @old's neighbours; @old is left ghost for parked
+ * readers.  Always returns 0.  Mirrors cds_bidir_list_lf_replace_prepare()
+ * (single-updater: no -ENOENT/-EAGAIN, since there is no concurrent deletion).
+ */
+static inline
+int cds_bidir_list_replace_prepare(struct urcu_flip_txn *txn,
+		struct cds_bidir_list_head *old,
 		struct cds_bidir_list_head *newp)
 {
 	struct cds_bidir_list_head *prev = old->prev;
@@ -287,8 +368,25 @@ int cds_bidir_list_replace_rcu(struct cds_bidir_list_head *old,
 	newp->next = next;
 
 	/* prev->next: old -> newp ; next->prev: old -> newp */
-	return cds_bidir_list_flip2(&prev->next, old, newp,
-			&next->prev, old, newp);
+	(void) urcu_flip_txn_record(txn, (void **) &prev->next, old, newp);
+	(void) urcu_flip_txn_record(txn, (void **) &next->prev, old, newp);
+	return 0;
+}
+
+/*
+ * Replace @old with @newp atomically with respect to RCU readers.  Convenience
+ * bracket around cds_bidir_list_replace_prepare().
+ */
+static inline
+int cds_bidir_list_replace_rcu(struct cds_bidir_list_head *old,
+		struct cds_bidir_list_head *newp)
+{
+	struct urcu_flip_txn txn;
+
+	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	(void) cds_bidir_list_replace_prepare(&txn, old, newp);
+	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
 }
 
 #define cds_bidir_list_entry(ptr, type, member) \
