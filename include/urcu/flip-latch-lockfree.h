@@ -220,6 +220,7 @@ struct urcu_flip_lf_mcas {
 	struct rcu_head rcu_head;	/* owner's deferred-free handle */
 	unsigned int nr;
 	unsigned int cap;
+	unsigned int poisoned;		/* set if a same-slot reconcile disagreed on old */
 	struct urcu_flip_lf_record recs[];	/* frozen + slot-sorted at commit */
 };
 
@@ -607,6 +608,7 @@ struct urcu_flip_lf_mcas *urcu_flip_lf_mcas_create(unsigned int cap,
 	t->retry = retry;
 	t->nr = 0;
 	t->cap = cap;
+	t->poisoned = 0;
 	return t;
 }
 
@@ -638,10 +640,15 @@ bool urcu_flip_lf_mcas_add(struct urcu_flip_lf_mcas *t, void **slot,
  * engine's distinct-slot precondition holds by construction.  If a record
  * already targets @slot (a prior store, or a load-validate guard), reconcile it
  * rather than append a duplicate: @old_ptr must equal the record's old_ptr
- * (else the caller read @slot twice and saw it move -- an inconsistent txn).
- * @upgrade picks new_ptr -- a store advances it to @new_ptr, a load-validate
- * leaves a pending write intact.  Returns false only when a new record is
- * needed and the descriptor is full; the caller grows and retries.
+ * (else the caller read @slot twice and saw it move -- an inconsistent,
+ * torn-read txn).  A disagreement is NOT silently merged: it POISONS the
+ * descriptor so commit() aborts the attempt (the caller re-reads consistently
+ * and retries) -- merging would otherwise forge a record whose old no longer
+ * matches the intended write and commit a corrupt edge under -DNDEBUG (where the
+ * debug assert below is gone).  @upgrade picks new_ptr -- a store advances it to
+ * @new_ptr, a load-validate leaves a pending write intact.  Returns false only
+ * when a new record is needed and the descriptor is full; the caller grows and
+ * retries.
  */
 static inline
 bool urcu_flip_lf_mcas_record(struct urcu_flip_lf_mcas *t, void **slot,
@@ -652,7 +659,11 @@ bool urcu_flip_lf_mcas_record(struct urcu_flip_lf_mcas *t, void **slot,
 	for (i = 0; i < t->nr; i++) {
 		if (t->recs[i].slot != slot)
 			continue;
-		urcu_assert_debug(t->recs[i].old_ptr == old_ptr);
+		if (caa_unlikely(t->recs[i].old_ptr != old_ptr)) {
+			urcu_assert_debug(t->recs[i].old_ptr == old_ptr);
+			t->poisoned = 1;	/* torn read-set: commit will abort */
+			return true;
+		}
 		if (upgrade)
 			t->recs[i].new_ptr = new_ptr;
 		return true;
@@ -740,6 +751,17 @@ bool urcu_flip_lf_mcas_commit(struct urcu_flip_lf_mcas *t,
 	bool committed;
 	unsigned int i;
 
+	if (caa_unlikely(t->poisoned)) {
+		/*
+		 * A same-slot reconcile disagreed on the expected old (a torn
+		 * read-set): the write-set is inconsistent.  Never parked, so free
+		 * synchronously and abort -- the caller re-reads and retries.  Must
+		 * precede the nr==1 fast path: a poisoned descriptor can still have a
+		 * single record (two stores to one slot reconcile to one).
+		 */
+		urcu_flip_lf_mcas_destroy(t);
+		return false;
+	}
 	if (t->nr == 0) {
 		urcu_flip_lf_mcas_destroy(t);
 		return true;
