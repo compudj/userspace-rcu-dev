@@ -126,14 +126,23 @@ granted:
 	/* Tell granter we are running (it may then skip the futex_wake). */
 	uatomic_or(&w->state, CDS_FAIR_MUTEX_RUNNING);
 
-	/* Wait until granter is done touching our state word. */
+	/*
+	 * Wait until granter is done touching our state word.  The bounded spin
+	 * breaks (rather than returns) so it always falls through to the acquire
+	 * load below: that CMM_ACQUIRE is what synchronizes with the granter's
+	 * TEARDOWN release, ordering the lock hand-off and the granter's writes to
+	 * our node before we return and reuse it.  Returning straight from the
+	 * (relaxed) spin would skip the acquire on the common path.  Mirrors
+	 * urcu-wait.h's urcu_adaptative_busy_wait().
+	 */
 	for (i = 0; i < CDS_FAIR_MUTEX_WAIT_ATTEMPTS; i++) {
 		if (uatomic_load(&w->state) & CDS_FAIR_MUTEX_TEARDOWN)
-			return;
+			break;
 		caa_cpu_relax();
 	}
 	while (!(uatomic_load(&w->state, CMM_ACQUIRE) & CDS_FAIR_MUTEX_TEARDOWN))
 		(void) poll(NULL, 0, 10);
+	urcu_posix_assert(uatomic_load(&w->state) & CDS_FAIR_MUTEX_TEARDOWN);
 }
 
 /*
