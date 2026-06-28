@@ -28,10 +28,13 @@
  *                                   --restore-> old        (status FAILED)
  *
  * "flip(record)" is the record's tagged address parked in the slot.  EVERY
- * transition is a descriptor-naming CAS, so a slot reused across transaction
- * epochs can never be dragged backward by a straggler (the value alone is
- * ambiguous -- one txn's new is the next txn's old -- only the descriptor
- * identity disambiguates).
+ * transition is a descriptor-naming CAS: a parked slot names a descriptor, and
+ * resolution goes through that descriptor's status word, so the slot's plain
+ * value alone is never load-bearing (one txn's new is the next txn's old -- only
+ * the descriptor identity disambiguates).  Combined with the per-record install
+ * latch (below), this makes the engine indifferent to slot-value A-B-A: a
+ * straggler can never drag a slot backward by re-planting a descriptor after it
+ * linearized, no matter how the slot value recurred.
  *
  * Resolution.  A reader (or a writer traversing) that loads a slot holding
  * flip(r) reads r->mcas->status: SUCCEEDED resolves to r->new_ptr, UNDECIDED or
@@ -39,16 +42,26 @@
  * a terminal descriptor in a slot is *correct*, not a bug -- which is why no
  * RDCSS is needed.
  *
- * Settle is owner-only.  A helper drives a foreign transaction's *install*
- * forward (so a stalled writer never blocks others) but never settles it: only
- * the owner, in commit(), rewrites its own parked records back to plain values.
- * A terminal descriptor therefore lingers in its slots until the owner reclaims
- * it; readers and contenders resolve it through the status word in the meantime.
- * The payoff is that a contended slot never reverts to a plain value mid-episode
- * -- so it is never momentarily up for grabs by a newcomer's plain CAS -- it is
- * handed owner-to-owner by steals and only decays to plain once quiescent.  The
- * cost is that readers resolve a lingering proxy rather than load a settled
- * value; an aborted transaction settles right after, so the window is short.
+ * Settle is owner-driven, with one exception.  A helper drives a foreign
+ * transaction's *install* forward (so a stalled writer never blocks others); the
+ * bulk settle that rewrites a transaction's parked records back to plain values
+ * is the owner's, in commit().  The one exception is the INSTALLER-SELF-SETTLE
+ * (urcu_flip_lf_plant()): a driver that has just planted a record under its
+ * install latch, and reads the transaction already terminal, converts THAT one
+ * proxy immediately -- it must not leave a record it planted post-linearization
+ * to linger past the owner's reclaim.  This is still a settle of the planter's
+ * own (just-installed) record, never of a foreign one, and it only fires once the
+ * transaction is terminal.  A terminal descriptor otherwise lingers in its slots
+ * until the owner reclaims it; readers and contenders resolve it through the
+ * status word in the meantime.
+ *
+ * A contended slot never reverts to plain while its transaction is still
+ * UNDECIDED -- only a terminal transaction's slots decay to plain (by settle or
+ * self-settle), and a higher-priority contender takes a slot it wants by STEAL
+ * (one CAS replacing the proxy directly) rather than waiting for plain, so the
+ * slot is handed owner-to-owner rather than momentarily up for grabs.  The cost
+ * is that readers may resolve a lingering proxy rather than load a settled value;
+ * an aborted transaction settles right after, so the window is short.
  *
  * Liveness.  Records install in one global order (sorted by slot address), so
  * two conflicting transactions always meet at their lowest shared slot.  There
@@ -75,17 +88,34 @@
  *     first install (helpers walk the immutable, sorted record list);
  *   - a transaction's records must target pairwise-distinct slots.
  *
- * PRECONDITION -- slot values must be non-ABA-able within a reader's critical
- * section.  The engine deliberately omits RDCSS: it installs a descriptor with a
- * plain CAS conditioned on the word holding its expected old.  That is safe ONLY
- * if a word cannot cycle back to a prior value while a thread sits between
- * reading that value and installing -- otherwise a delayed install of an
- * already-decided descriptor clobbers the word with the descriptor's stale new.
- * For RCU-managed POINTER slots this holds for free: a freed node's address is
- * not reused within a read-side section, and a removed node is not re-linked
- * before its grace period, so a slot never ABAs.  An MCAS over plain reusable
- * values (e.g. integer counters) does NOT satisfy this and would need per-word
- * versioning or a real RDCSS install.
+ * Slot-value A-B-A -- TOLERATED.  The engine omits RDCSS: it installs a
+ * descriptor with a plain CAS conditioned on the word holding its expected old.
+ * Were that the whole story it would be safe ONLY if a word could not cycle back
+ * to a prior value between a thread reading that value and installing -- a delayed
+ * (stale) install of an already-decided descriptor would otherwise pass its CAS
+ * on the recurred old and re-plant the descriptor's proxy AFTER the transaction
+ * linearized, resurrecting a stale value -> use-after-free.  Such recurrence is
+ * real even under RCU, which prevents ADDRESS reuse but not VALUE recurrence: a
+ * doubly-linked list's next-pointer cycles B -> X -> B (insert then delete of X)
+ * with B a live successor RCU never frees.
+ *
+ * The PER-RECORD INSTALL LATCH (struct urcu_flip_lf_record::latch, installed)
+ * closes that directly, so the engine no longer requires slots to be
+ * non-ABA-able at all -- ANY slot-value A-B-A is safe, whatever recurs the value
+ * (live-successor recurrence, a counter revisiting a number, an embedder's own
+ * reuse).  Every plant -- plain install and steal alike -- runs through
+ * urcu_flip_lf_plant() under the record's latch, which makes {install-once test,
+ * plant CAS, installed-set, first self-settle} atomic.  A stale second install is
+ * gated by the install-once FLAG, not by the slot value, so the recurred value is
+ * irrelevant; the self-settle closes the matching install-vs-settle ordering
+ * hole.  What the engine DOES still require is unrelated to slot values: tag bit 0
+ * free, pairwise-distinct slots per txn, and -- the EXISTENCE model -- that a
+ * descriptor reachable through a slot is reclaimed only after a grace period (a
+ * helper/reader may dereference it).  Note this is value-CAS atomicity: a record
+ * is validated to hold its old at the LINEARIZATION point, not to have been stable
+ * throughout; an embedder needing the latter (snapshot/version semantics) layers
+ * its own versioning on top, as with any value-based MCAS -- but that is a
+ * stronger guarantee than memory safety, which holds unconditionally here.
  */
 
 #include <stdbool.h>
@@ -98,6 +128,7 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head */
+#include <urcu/fair-mutex.h>		/* per-record install latch */
 
 #ifdef __cplusplus
 extern "C" {
@@ -142,6 +173,23 @@ struct urcu_flip_lf_record {
 	void *old_ptr;			/* expected old value */
 	void *new_ptr;			/* committed new value */
 	struct urcu_flip_lf_mcas *mcas;	/* back-pointer (status + sibling records) */
+	/*
+	 * Per-record install latch.  Guards EXACTLY ONE thing: this record's
+	 * install decision -- the install-once test, the single plant CAS, the
+	 * "installed" set, and the installer's first ordered self-settle (see
+	 * urcu_flip_lf_plant()).  It does NOT guard the slot: every operation
+	 * that REMOVES or CONVERTS a parked proxy -- the regular settle, the
+	 * installer self-settle, and a thief's steal that displaces the victim's
+	 * proxy -- is a lock-free CAS handoff that takes no latch.  Because the
+	 * latch is per-RECORD, two records sharing one slot (a thief's r and its
+	 * victim's fr) transition that slot under DIFFERENT latches and so always
+	 * resolve by CAS; keeping settle mutex-free is what keeps that boundary
+	 * clean and the latch's scope minimal.  A thread holds at most one such
+	 * latch at a time (helping/resolving runs outside it), so there is no
+	 * hold-and-wait and no lock order to maintain.
+	 */
+	struct cds_fair_mutex latch;
+	unsigned long installed;	/* set once, under latch, on first plant */
 } __attribute__((aligned(16)));
 
 /*
@@ -249,15 +297,117 @@ void *urcu_flip_lf_resolve(void *v)
 }
 
 /*
+ * Optional test hook.  Compiles to nothing unless the embedder defines
+ * URCU_FLIP_LF_PREINSTALL(t, r) before including this header.  Fires in the
+ * install path at the point a driver has decided to plant @r, just BEFORE it
+ * takes @r's install latch -- so a deterministic single-threaded test can
+ * interpose the exact interleaving that used to re-plant (drive @t's own install
+ * + commit + settle, then A-B-A the slot back to r->old_ptr) from inside the
+ * hook, itself taking and releasing the latch, before the stale driver proceeds
+ * into urcu_flip_lf_plant() and is stopped by the install-once flag.  Not part of
+ * the engine contract.
+ */
+#ifndef URCU_FLIP_LF_PREINSTALL
+#define URCU_FLIP_LF_PREINSTALL(t, r)	do { } while (0)
+#endif
+
+/*
+ * Plant transaction @t's record @r into its slot under @r's install latch.
+ * @expect is the slot value to CAS over: r->old_ptr for a plain install, or the
+ * victim's parked proxy for a steal.  This is the ONLY writer of r->installed and
+ * the ONLY latch-protected slot write; everything else that touches the slot
+ * (regular settle, a thief's steal of THIS proxy later) is a lock-free CAS.
+ *
+ * Three things happen atomically under the latch, which is exactly what closes
+ * the re-plant use-after-free that a value-CAS alone cannot (the slot value can
+ * A-B-A back to r->old_ptr after @t linearizes, so the CAS's own comparison is
+ * not enough to tell a first install from a stale second one):
+ *
+ *   1. install-once -- if r was already planted (by us or another driver of @t),
+ *      skip.  The flag, not the slot value, is the gate, so any A-B-A is inert.
+ *   2. the single plant CAS.
+ *   3. installer-self-settle -- read @t's status AFTER the plant.  If @t is
+ *      already terminal, convert our just-planted proxy to its resolved value
+ *      now, so it cannot linger past @t's reclaim (the install-vs-settle hole:
+ *      a late first install after the owner already settled).  The status read
+ *      ordered AFTER the plant (the plant CAS is a full barrier; the status load
+ *      is acquire) is what manufactures the happens-before that makes the owner's
+ *      unconditional settle in commit() the backstop for the UNDECIDED case.
+ *
+ * Returns:
+ *   1 -- we planted the proxy (caller advances to the next record; the steal
+ *        site also bumps its steal counter);
+ *   2 -- r was already installed (caller advances; no steal counted);
+ *   0 -- the CAS raced the slot away (caller re-reads and retries).
+ */
+static inline
+int urcu_flip_lf_plant(struct urcu_flip_lf_mcas *t,
+		struct urcu_flip_lf_record *r, void *expect)
+{
+	void *tagv = urcu_flip_lf_tag(r);
+	struct cds_fair_mutex_node node;
+	int ret;
+
+	cds_fair_mutex_lock(&r->latch, &node);
+	if (
+#ifndef URCU_FLIP_LF_NO_ABA_FIX
+	    uatomic_load(&r->installed, CMM_RELAXED)	/* install-once: the A-B-A fix */
+#else
+	    0			/* test knob: drop the install-once gate (buggy) */
+#endif
+	   ) {
+		ret = 2;			/* already installed: skip */
+	} else if (uatomic_cmpxchg(r->slot, expect, tagv) == expect) {
+		uatomic_store(&r->installed, 1, CMM_RELAXED);
+		/*
+		 * Self-settle: read status AFTER the plant.  Correctness is an
+		 * SB (store-buffer) exclusion -- the plant CAS above is a FULL
+		 * barrier on success and the commit-flip + owner settle in
+		 * commit() are full-barrier CASes, so it is impossible for BOTH
+		 * "we read UNDECIDED here" AND "the owner's settle ran before our
+		 * plant".  Hence either we self-settle now (status terminal), or
+		 * the owner's settle, ordered after our plant, converts it.  The
+		 * RELAXED installed accesses are fine: they are read/written only
+		 * under this latch, which carries them release-to-acquire.
+		 */
+#ifndef URCU_FLIP_LF_NO_ABA_FIX
+		{
+			unsigned long st = urcu_flip_lf_status(t);
+
+			if (st != URCU_FLIP_LF_UNDECIDED) {
+				void *want = (st == URCU_FLIP_LF_SUCCEEDED) ?
+						r->new_ptr : r->old_ptr;
+
+				(void) uatomic_cmpxchg(r->slot, tagv, want);
+			}
+		}
+#endif		/* else (test knob): drop the self-settle (buggy) */
+		ret = 1;			/* planted */
+	} else {
+		ret = 0;			/* raced: retry */
+	}
+	cds_fair_mutex_unlock(&r->latch, &node);
+#ifdef URCU_FLIP_LF_NO_ABA_FIX
+	(void) t;		/* the self-settle, t's only use here, is gated out */
+#endif
+	return ret;
+}
+
+/*
  * Install phase: drive transaction @t to a terminal status (SUCCEEDED or
- * FAILED) by installing its records in slot-address order.  Does NOT settle the
- * slots -- settle is owner-only (urcu_flip_lf_settle), so a terminal proxy may
- * linger in a slot until its owner reclaims it; readers and contenders resolve
- * it through the status word rather than waiting for a plain value.  Safe to
- * call on one's own transaction or on any foreign one met in a slot (helping
- * its install forward, never settling it).  Idempotent and re-entrant under the
- * global install order: helping follows strictly increasing slot addresses, so
- * recursion is bounded by the number of concurrently-conflicting transactions.
+ * FAILED) by installing its records in slot-address order.  Each plant (plain
+ * install or steal) goes through urcu_flip_lf_plant() under the record's install
+ * latch (install-once); a plant that finds @t already terminal self-settles that
+ * one record, but the bulk settle is left to the owner (urcu_flip_lf_settle), so
+ * a terminal proxy may otherwise linger in a slot until its owner reclaims it;
+ * readers and contenders resolve it through the status word rather than waiting
+ * for a plain value.  Safe to call on one's own transaction or on any foreign one
+ * met in a slot (helping its install forward, never bulk-settling it).  Idempotent
+ * and re-entrant under the global install order: helping follows strictly
+ * increasing slot addresses, so recursion is bounded by the number of
+ * concurrently-conflicting transactions; a thread holds at most one record latch
+ * at a time (helping/resolving runs outside the latch), so there is no
+ * hold-and-wait.
  */
 static inline
 void urcu_flip_lf_drive_install(struct urcu_flip_lf_mcas *t)
@@ -275,6 +425,7 @@ void urcu_flip_lf_drive_install(struct urcu_flip_lf_mcas *t)
 
 		for (;;) {
 			void *v;
+			int planted;
 
 			st = urcu_flip_lf_status(t);
 			if (st != URCU_FLIP_LF_UNDECIDED)
@@ -321,17 +472,23 @@ void urcu_flip_lf_drive_install(struct urcu_flip_lf_mcas *t)
 					return;
 				}
 				/*
-				 * Steal E's terminal proxy in one CAS: our parked
-				 * record replaces it directly, never through a plain
-				 * value a newcomer could grab.  Sound because the
-				 * slot's logical value (resolved == r->old_ptr) is
-				 * unchanged by the handoff.
+				 * Steal E's terminal proxy: our parked record
+				 * replaces it directly, never through a plain value
+				 * a newcomer could grab.  Sound because the slot's
+				 * logical value (resolved == r->old_ptr) is unchanged
+				 * by the handoff.  Under r's install latch (NOT E's --
+				 * displacing E's proxy is a lock-free CAS that races
+				 * E's owner-only settle harmlessly), with install-once
+				 * so a stale re-steal after @t linearizes is inert.
 				 */
-				if (uatomic_cmpxchg(r->slot, v, tagv) == v) {
-					URCU_FLIP_LF_STAT(steal);
-					break;	/* installed */
+				URCU_FLIP_LF_PREINSTALL(t, r);
+				planted = urcu_flip_lf_plant(t, r, v);
+				if (planted) {
+					if (planted == 1)
+						URCU_FLIP_LF_STAT(steal);
+					break;	/* installed (or already) */
 				}
-				continue;	/* raced (owner settled / stolen): re-read */
+				continue;	/* raced (settled / stolen): re-read */
 			}
 			if (v != r->old_ptr) {
 				/* read-set invalid -> abort this txn */
@@ -340,9 +497,16 @@ void urcu_flip_lf_drive_install(struct urcu_flip_lf_mcas *t)
 					URCU_FLIP_LF_FAILED);
 				return;
 			}
-			if (uatomic_cmpxchg(r->slot, r->old_ptr, tagv) == r->old_ptr)
-				break;		/* installed */
-			/* slot changed under us -> re-evaluate */
+			/*
+			 * Plain install under r's latch: install-once + the
+			 * self-settle make a stale second install after @t
+			 * linearizes (slot A-B-A'd back to r->old_ptr) inert.
+			 */
+			URCU_FLIP_LF_PREINSTALL(t, r);
+			planted = urcu_flip_lf_plant(t, r, r->old_ptr);
+			if (planted)
+				break;		/* installed (or already) */
+			/* raced: slot changed under us -> re-evaluate */
 		}
 	}
 	/* every record installed -> commit */
@@ -351,11 +515,17 @@ void urcu_flip_lf_drive_install(struct urcu_flip_lf_mcas *t)
 }
 
 /*
- * Settle phase (owner-only): make @t's own slots plain -- its new value on
- * SUCCEEDED, its old on FAILED.  Called from commit() once @t is terminal.  A
- * slot a higher-priority transaction already stole holds that thief's proxy, so
- * the CAS just fails and is ignored; once settle returns, no slot still names a
- * record of @t, so the descriptor can be reclaimed.  Idempotent.
+ * Settle phase (owner, in commit()): make @t's own slots plain -- its new value
+ * on SUCCEEDED, its old on FAILED.  Called once @t is terminal.  A slot a
+ * higher-priority transaction already stole holds that thief's proxy, or one an
+ * installer already self-settled holds the plain value, so those CASes just fail
+ * and are ignored; once settle returns, no slot still names a record of @t, so
+ * the descriptor can be reclaimed.  Runs WITHOUT the install latch -- it only
+ * removes/converts proxies (a lock-free CAS handoff), never installs -- and is
+ * idempotent.  It is the BACKSTOP for the install-vs-settle order: any record an
+ * installer planted while @t was still UNDECIDED (so it did NOT self-settle) is
+ * converted here, and the installer's status-read-after-plant (urcu_flip_lf_plant)
+ * is what orders that plant before this settle.
  */
 static inline
 void urcu_flip_lf_settle(struct urcu_flip_lf_mcas *t)
@@ -601,13 +771,20 @@ bool urcu_flip_lf_mcas_commit(struct urcu_flip_lf_mcas *t,
 	for (i = 1; i < t->nr; i++)
 		urcu_assert_debug(t->recs[i].slot != t->recs[i - 1].slot);
 	/*
-	 * Set the record back-pointers now, deferred from add time.  The
-	 * write-set may have been grown (realloc'd, hence moved) while it was
+	 * Set the record back-pointers now, deferred from add time, and arm each
+	 * record's install latch (install-once flag clear, fair-mutex empty).
+	 * The write-set may have been grown (realloc'd, hence moved) while it was
 	 * being buffered; from here the descriptor is frozen and about to be
 	 * parked, so every record can finally name its now-stable descriptor.
+	 * Arming here (post-grow, pre-install) is correct: no driver can take the
+	 * latch until the descriptor is parked, which only drive_install below
+	 * does.
 	 */
-	for (i = 0; i < t->nr; i++)
+	for (i = 0; i < t->nr; i++) {
 		t->recs[i].mcas = t;
+		t->recs[i].installed = 0;
+		cds_fair_mutex_init(&t->recs[i].latch);
+	}
 	urcu_flip_lf_drive_install(t);		/* install to a decision (helpers help) */
 	urcu_flip_lf_settle(t);			/* owner-only: make our own slots plain */
 	committed = urcu_flip_lf_status(t) == URCU_FLIP_LF_SUCCEEDED;

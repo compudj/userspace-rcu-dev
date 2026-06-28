@@ -25,6 +25,8 @@ noinst_PROGRAMS = \
 	test_uatomic_cxx \
 	test_flip_latch \
 	test_flip_latch_lockfree \
+	test_flip_latch_lf_aba \
+	test_flip_latch_lf_linger \
 	test_flip_latch_txn \
 	test_flip_latch_txn_grow \
 	test_flip_latch_txn_fallback \
@@ -68,6 +70,8 @@ TESTS = \
 	test_uatomic_cxx \
 	test_flip_latch \
 	test_flip_latch_lockfree \
+	test_flip_latch_lf_aba \
+	test_flip_latch_lf_linger \
 	test_flip_latch_txn \
 	test_flip_latch_txn_grow \
 	test_flip_latch_txn_fallback \
@@ -134,6 +138,12 @@ test_flip_latch_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_flip_latch_lockfree_SOURCES = test_flip_latch_lockfree.c
 test_flip_latch_lockfree_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_flip_latch_lf_aba_SOURCES = test_flip_latch_lf_aba.c
+test_flip_latch_lf_aba_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_flip_latch_lf_linger_SOURCES = test_flip_latch_lf_linger.c
+test_flip_latch_lf_linger_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_flip_latch_txn_SOURCES = test_flip_latch_txn.c
 test_flip_latch_txn_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
