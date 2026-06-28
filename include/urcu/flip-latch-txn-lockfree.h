@@ -428,6 +428,22 @@ enum urcu_flip_txn_status urcu_flip_lf_txn_commit(struct urcu_flip_lf_txn *txn)
 	return URCU_FLIP_TXN_STATUS_ABORT;
 }
 
+/*
+ * Note a contention retry that abandons the attempt BEFORE commit -- e.g. a
+ * load-validate guard observed a neighbour mid-deletion and the mutator must
+ * re-read rather than commit.  Advances aging and keeps the FIFO turn exactly as
+ * a commit ABORT does, so such a guard-driven retry escalates into the fallback
+ * lane instead of spinning: without this, an op that keeps hitting the guard on a
+ * hot slot never reaches commit, so txn->retry never advances and it can livelock.
+ * Call after the guard fires and before end(), then end()+begin() and re-attempt.
+ */
+static inline
+void urcu_flip_lf_txn_conflict(struct urcu_flip_lf_txn *txn)
+{
+	txn->retry++;			/* aged: a guard storm now escalates */
+	txn->retrying = 1;		/* keep the FIFO turn across the retry */
+}
+
 /* End the attempt: close the RCU read-side section.  Always pair with begin. */
 static inline
 void urcu_flip_lf_txn_end(struct urcu_flip_lf_txn *txn)
