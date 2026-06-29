@@ -93,16 +93,26 @@ extern "C" {
 #endif
 
 /*
- * The doubly-linked node.  Embedded in the application structure (and used
- * directly as the list's sentinel head), like struct cds_list_head.  The
- * next/prev fields hold either a real node pointer or, transiently during a
- * mutation, a tagged flip proxy -- always read them through the accessors.
+ * The doubly-linked node, embedded in the application structure.  The next/prev
+ * fields hold either a real node pointer or, transiently during a mutation, a
+ * tagged flip proxy -- always read them through the accessors.
  */
-struct urcu_txn_sw_list_head {
-	struct urcu_txn_sw_list_head *next, *prev;
+struct urcu_txn_sw_list_node {
+	struct urcu_txn_sw_list_node *next, *prev;
 };
 
-#define URCU_TXN_SW_LIST_HEAD_INIT(name)	{ .next = &(name), .prev = &(name) }
+/*
+ * The list head embeds the circular sentinel node, so node and head are
+ * distinct types -- matching the concurrent <urcu/rcu-txn-list.h>.  A
+ * single-updater list has no escalation domain, so the head holds only the
+ * sentinel.
+ */
+struct urcu_txn_sw_list_head {
+	struct urcu_txn_sw_list_node node;	/* circular sentinel */
+};
+
+#define URCU_TXN_SW_LIST_HEAD_INIT(name) \
+	{ .node = { .next = &(name).node, .prev = &(name).node } }
 
 #define URCU_TXN_SW_LIST_HEAD(name) \
 	struct urcu_txn_sw_list_head name = URCU_TXN_SW_LIST_HEAD_INIT(name)
@@ -110,8 +120,8 @@ struct urcu_txn_sw_list_head {
 static inline
 void urcu_txn_sw_list_init(struct urcu_txn_sw_list_head *head)
 {
-	head->next = head;
-	head->prev = head;
+	head->node.next = &head->node;
+	head->node.prev = &head->node;
 }
 
 /*
@@ -133,7 +143,7 @@ void *urcu_txn_sw_list_proxy_tag(struct urcu_txn_sw_proxy *proxy)
  * node pointer passes through unchanged.
  */
 static inline
-struct urcu_txn_sw_list_head *urcu_txn_sw_list_resolve(struct urcu_txn_sw_list_head *ptr)
+struct urcu_txn_sw_list_node *urcu_txn_sw_list_resolve(struct urcu_txn_sw_list_node *ptr)
 {
 	uintptr_t v = (uintptr_t) ptr;
 
@@ -141,7 +151,7 @@ struct urcu_txn_sw_list_head *urcu_txn_sw_list_resolve(struct urcu_txn_sw_list_h
 		struct urcu_txn_sw_proxy *proxy = (struct urcu_txn_sw_proxy *)
 				(v & ~(uintptr_t) URCU_TXN_SW_LIST_PROXY_TAG);
 
-		return (struct urcu_txn_sw_list_head *)
+		return (struct urcu_txn_sw_list_node *)
 				urcu_txn_sw_proxy_get(proxy);
 	}
 	return ptr;
@@ -149,15 +159,15 @@ struct urcu_txn_sw_list_head *urcu_txn_sw_list_resolve(struct urcu_txn_sw_list_h
 
 /* Resolved forward / backward step (call under rcu_read_lock()). */
 static inline
-struct urcu_txn_sw_list_head *urcu_txn_sw_list_next_rcu(
-		struct urcu_txn_sw_list_head *node)
+struct urcu_txn_sw_list_node *urcu_txn_sw_list_next_rcu(
+		struct urcu_txn_sw_list_node *node)
 {
 	return urcu_txn_sw_list_resolve(rcu_dereference(node->next));
 }
 
 static inline
-struct urcu_txn_sw_list_head *urcu_txn_sw_list_prev_rcu(
-		struct urcu_txn_sw_list_head *node)
+struct urcu_txn_sw_list_node *urcu_txn_sw_list_prev_rcu(
+		struct urcu_txn_sw_list_node *node)
 {
 	return urcu_txn_sw_list_resolve(rcu_dereference(node->prev));
 }
@@ -165,7 +175,7 @@ struct urcu_txn_sw_list_head *urcu_txn_sw_list_prev_rcu(
 static inline
 int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)
 {
-	return urcu_txn_sw_list_next_rcu(head) == head;
+	return urcu_txn_sw_list_next_rcu(&head->node) == &head->node;
 }
 
 /*
@@ -191,12 +201,12 @@ int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)
  */
 static inline
 int urcu_txn_sw_list_flip2(
-		struct urcu_txn_sw_list_head **slot0,
-		struct urcu_txn_sw_list_head *old0,
-		struct urcu_txn_sw_list_head *new0,
-		struct urcu_txn_sw_list_head **slot1,
-		struct urcu_txn_sw_list_head *old1,
-		struct urcu_txn_sw_list_head *new1)
+		struct urcu_txn_sw_list_node **slot0,
+		struct urcu_txn_sw_list_node *old0,
+		struct urcu_txn_sw_list_node *new0,
+		struct urcu_txn_sw_list_node **slot1,
+		struct urcu_txn_sw_list_node *old1,
+		struct urcu_txn_sw_list_node *new1)
 {
 	struct urcu_txn_sw_txn txn;
 
@@ -226,10 +236,10 @@ int urcu_txn_sw_list_flip2(
  */
 static inline
 int urcu_txn_sw_list_add_after_prepare(struct urcu_txn_sw_txn *txn,
-		struct urcu_txn_sw_list_head *newp,
-		struct urcu_txn_sw_list_head *pos)
+		struct urcu_txn_sw_list_node *newp,
+		struct urcu_txn_sw_list_node *pos)
 {
-	struct urcu_txn_sw_list_head *next = pos->next;
+	struct urcu_txn_sw_list_node *next = pos->next;
 
 	/* Build the fresh node's links before it becomes reachable. */
 	newp->prev = pos;
@@ -246,8 +256,8 @@ int urcu_txn_sw_list_add_after_prepare(struct urcu_txn_sw_txn *txn,
  * bracket around urcu_txn_sw_list_add_after_prepare().
  */
 static inline
-int urcu_txn_sw_list_add_after_rcu(struct urcu_txn_sw_list_head *newp,
-		struct urcu_txn_sw_list_head *pos)
+int urcu_txn_sw_list_add_after_rcu(struct urcu_txn_sw_list_node *newp,
+		struct urcu_txn_sw_list_node *pos)
 {
 	struct urcu_txn_sw_txn txn;
 
@@ -263,10 +273,10 @@ int urcu_txn_sw_list_add_after_rcu(struct urcu_txn_sw_list_head *newp,
  */
 static inline
 int urcu_txn_sw_list_add_before_prepare(struct urcu_txn_sw_txn *txn,
-		struct urcu_txn_sw_list_head *newp,
-		struct urcu_txn_sw_list_head *pos)
+		struct urcu_txn_sw_list_node *newp,
+		struct urcu_txn_sw_list_node *pos)
 {
-	struct urcu_txn_sw_list_head *prev = pos->prev;
+	struct urcu_txn_sw_list_node *prev = pos->prev;
 
 	newp->next = pos;
 	newp->prev = prev;
@@ -282,8 +292,8 @@ int urcu_txn_sw_list_add_before_prepare(struct urcu_txn_sw_txn *txn,
  * Convenience bracket around urcu_txn_sw_list_add_before_prepare().
  */
 static inline
-int urcu_txn_sw_list_add_before_rcu(struct urcu_txn_sw_list_head *newp,
-		struct urcu_txn_sw_list_head *pos)
+int urcu_txn_sw_list_add_before_rcu(struct urcu_txn_sw_list_node *newp,
+		struct urcu_txn_sw_list_node *pos)
 {
 	struct urcu_txn_sw_txn txn;
 
@@ -295,18 +305,18 @@ int urcu_txn_sw_list_add_before_rcu(struct urcu_txn_sw_list_head *newp,
 
 /* Add @newp at the head of the list (just after @head). */
 static inline
-int urcu_txn_sw_list_add_rcu(struct urcu_txn_sw_list_head *newp,
+int urcu_txn_sw_list_add_rcu(struct urcu_txn_sw_list_node *newp,
 		struct urcu_txn_sw_list_head *head)
 {
-	return urcu_txn_sw_list_add_after_rcu(newp, head);
+	return urcu_txn_sw_list_add_after_rcu(newp, &head->node);
 }
 
 /* Add @newp at the tail of the list (just before @head). */
 static inline
-int urcu_txn_sw_list_add_tail_rcu(struct urcu_txn_sw_list_head *newp,
+int urcu_txn_sw_list_add_tail_rcu(struct urcu_txn_sw_list_node *newp,
 		struct urcu_txn_sw_list_head *head)
 {
-	return urcu_txn_sw_list_add_before_rcu(newp, head);
+	return urcu_txn_sw_list_add_before_rcu(newp, &head->node);
 }
 
 /*
@@ -320,10 +330,10 @@ int urcu_txn_sw_list_add_tail_rcu(struct urcu_txn_sw_list_head *newp,
  */
 static inline
 int urcu_txn_sw_list_del_prepare(struct urcu_txn_sw_txn *txn,
-		struct urcu_txn_sw_list_head *elem)
+		struct urcu_txn_sw_list_node *elem)
 {
-	struct urcu_txn_sw_list_head *prev = elem->prev;
-	struct urcu_txn_sw_list_head *next = elem->next;
+	struct urcu_txn_sw_list_node *prev = elem->prev;
+	struct urcu_txn_sw_list_node *next = elem->next;
 
 	/* prev->next: elem -> next ; next->prev: elem -> prev */
 	(void) urcu_txn_sw_record(txn, (void **) &prev->next, elem, next);
@@ -338,7 +348,7 @@ int urcu_txn_sw_list_del_prepare(struct urcu_txn_sw_txn *txn,
  * urcu_txn_sw_list_del_prepare().
  */
 static inline
-int urcu_txn_sw_list_del_rcu(struct urcu_txn_sw_list_head *elem)
+int urcu_txn_sw_list_del_rcu(struct urcu_txn_sw_list_node *elem)
 {
 	struct urcu_txn_sw_txn txn;
 
@@ -358,11 +368,11 @@ int urcu_txn_sw_list_del_rcu(struct urcu_txn_sw_list_head *elem)
  */
 static inline
 int urcu_txn_sw_list_replace_prepare(struct urcu_txn_sw_txn *txn,
-		struct urcu_txn_sw_list_head *old,
-		struct urcu_txn_sw_list_head *newp)
+		struct urcu_txn_sw_list_node *old,
+		struct urcu_txn_sw_list_node *newp)
 {
-	struct urcu_txn_sw_list_head *prev = old->prev;
-	struct urcu_txn_sw_list_head *next = old->next;
+	struct urcu_txn_sw_list_node *prev = old->prev;
+	struct urcu_txn_sw_list_node *next = old->next;
 
 	newp->prev = prev;
 	newp->next = next;
@@ -378,8 +388,8 @@ int urcu_txn_sw_list_replace_prepare(struct urcu_txn_sw_txn *txn,
  * bracket around urcu_txn_sw_list_replace_prepare().
  */
 static inline
-int urcu_txn_sw_list_replace_rcu(struct urcu_txn_sw_list_head *old,
-		struct urcu_txn_sw_list_head *newp)
+int urcu_txn_sw_list_replace_rcu(struct urcu_txn_sw_list_node *old,
+		struct urcu_txn_sw_list_node *newp)
 {
 	struct urcu_txn_sw_txn txn;
 
@@ -393,35 +403,35 @@ int urcu_txn_sw_list_replace_rcu(struct urcu_txn_sw_list_head *old,
 	caa_container_of(ptr, type, member)
 
 #define urcu_txn_sw_list_first_entry_rcu(head, type, member) \
-	urcu_txn_sw_list_entry(urcu_txn_sw_list_next_rcu(head), type, member)
+	urcu_txn_sw_list_entry(urcu_txn_sw_list_next_rcu(&(head)->node), type, member)
 
 #define urcu_txn_sw_list_last_entry_rcu(head, type, member) \
-	urcu_txn_sw_list_entry(urcu_txn_sw_list_prev_rcu(head), type, member)
+	urcu_txn_sw_list_entry(urcu_txn_sw_list_prev_rcu(&(head)->node), type, member)
 
 /* Iterate forward over the list (under rcu_read_lock()). */
 #define urcu_txn_sw_list_for_each_rcu(pos, head) \
-	for (pos = urcu_txn_sw_list_next_rcu(head); \
-		(pos) != (head); \
+	for (pos = urcu_txn_sw_list_next_rcu(&(head)->node); \
+		(pos) != &(head)->node; \
 		pos = urcu_txn_sw_list_next_rcu(pos))
 
 /* Iterate backward over the list (under rcu_read_lock()). */
 #define urcu_txn_sw_list_for_each_reverse_rcu(pos, head) \
-	for (pos = urcu_txn_sw_list_prev_rcu(head); \
-		(pos) != (head); \
+	for (pos = urcu_txn_sw_list_prev_rcu(&(head)->node); \
+		(pos) != &(head)->node; \
 		pos = urcu_txn_sw_list_prev_rcu(pos))
 
 #define urcu_txn_sw_list_for_each_entry_rcu(pos, head, member) \
-	for (pos = urcu_txn_sw_list_entry(urcu_txn_sw_list_next_rcu(head), \
+	for (pos = urcu_txn_sw_list_entry(urcu_txn_sw_list_next_rcu(&(head)->node), \
 			__typeof__(*(pos)), member); \
-		&(pos)->member != (head); \
+		&(pos)->member != &(head)->node; \
 		pos = urcu_txn_sw_list_entry( \
 			urcu_txn_sw_list_next_rcu(&(pos)->member), \
 			__typeof__(*(pos)), member))
 
 #define urcu_txn_sw_list_for_each_entry_reverse_rcu(pos, head, member) \
-	for (pos = urcu_txn_sw_list_entry(urcu_txn_sw_list_prev_rcu(head), \
+	for (pos = urcu_txn_sw_list_entry(urcu_txn_sw_list_prev_rcu(&(head)->node), \
 			__typeof__(*(pos)), member); \
-		&(pos)->member != (head); \
+		&(pos)->member != &(head)->node; \
 		pos = urcu_txn_sw_list_entry( \
 			urcu_txn_sw_list_prev_rcu(&(pos)->member), \
 			__typeof__(*(pos)), member))

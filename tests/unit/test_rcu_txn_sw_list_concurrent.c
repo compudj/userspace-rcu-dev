@@ -48,7 +48,7 @@
 #define STEP_LIMIT	(KEY_MAX + 8)	/* runaway-walk guard */
 
 struct bl_node {
-	struct urcu_txn_sw_list_head node;
+	struct urcu_txn_sw_list_node node;
 	struct rcu_head rcu_head;
 	int key;
 };
@@ -82,14 +82,14 @@ static void *reader_fn(void *arg)
 
 	rcu_register_thread();
 	while (!uatomic_load(&g_stop, CMM_RELAXED)) {
-		struct urcu_txn_sw_list_head *p;
+		struct urcu_txn_sw_list_node *p;
 		int prev_key, steps;
 
 		/* Forward: strictly increasing keys, bounded, ends at head. */
 		rcu_read_lock();
 		prev_key = 0;
 		steps = 0;
-		for (p = urcu_txn_sw_list_next_rcu(&g_head); p != &g_head;
+		for (p = urcu_txn_sw_list_next_rcu(&g_head.node); p != &g_head.node;
 				p = urcu_txn_sw_list_next_rcu(p)) {
 			int k = caa_container_of(p, struct bl_node, node)->key;
 
@@ -106,7 +106,7 @@ static void *reader_fn(void *arg)
 		rcu_read_lock();
 		prev_key = KEY_MAX + 1;
 		steps = 0;
-		for (p = urcu_txn_sw_list_prev_rcu(&g_head); p != &g_head;
+		for (p = urcu_txn_sw_list_prev_rcu(&g_head.node); p != &g_head.node;
 				p = urcu_txn_sw_list_prev_rcu(p)) {
 			int k = caa_container_of(p, struct bl_node, node)->key;
 
@@ -129,7 +129,7 @@ static void *reader_fn(void *arg)
 /* Insert @n keeping the list sorted; @slot tracks the live node per key. */
 static void sorted_insert(struct bl_node *n, struct bl_node **slot)
 {
-	struct urcu_txn_sw_list_head *succ = &g_head;	/* default: tail */
+	struct urcu_txn_sw_list_node *succ = &g_head.node;	/* default: tail */
 	int j;
 
 	for (j = n->key + 1; j <= KEY_MAX; j++) {

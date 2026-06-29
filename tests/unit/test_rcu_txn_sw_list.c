@@ -32,7 +32,7 @@
 #define NR_TESTS	22
 
 struct bl_node {
-	struct urcu_txn_sw_list_head node;
+	struct urcu_txn_sw_list_node node;
 	struct rcu_head rcu_head;
 	int key;
 };
@@ -55,7 +55,7 @@ static struct bl_node *bl_node_new(int key)
 /* Collect forward keys.  Returns count, fills buf (up to max). */
 static int collect_forward(struct urcu_txn_sw_list_head *head, int *buf, int max)
 {
-	struct urcu_txn_sw_list_head *p;
+	struct urcu_txn_sw_list_node *p;
 	int n = 0;
 
 	rcu_read_lock();
@@ -70,7 +70,7 @@ static int collect_forward(struct urcu_txn_sw_list_head *head, int *buf, int max
 
 static int collect_reverse(struct urcu_txn_sw_list_head *head, int *buf, int max)
 {
-	struct urcu_txn_sw_list_head *p;
+	struct urcu_txn_sw_list_node *p;
 	int n = 0;
 
 	rcu_read_lock();
@@ -94,17 +94,17 @@ static int arr_eq(const int *a, const int *b, int n)
  */
 static int check_inverses(struct urcu_txn_sw_list_head *head)
 {
-	struct urcu_txn_sw_list_head *p, *q;
+	struct urcu_txn_sw_list_node *p, *q;
 	int ok = 1;
 
 	rcu_read_lock();
-	for (p = head; ; p = q) {
+	for (p = &head->node; ; p = q) {
 		q = urcu_txn_sw_list_next_rcu(p);
 		if (urcu_txn_sw_list_prev_rcu(q) != p) {
 			ok = 0;
 			break;
 		}
-		if (q == head)
+		if (q == &head->node)
 			break;
 	}
 	rcu_read_unlock();
@@ -112,10 +112,10 @@ static int check_inverses(struct urcu_txn_sw_list_head *head)
 }
 
 /* Find the node holding @key (single-threaded helper). */
-static struct urcu_txn_sw_list_head *find_key(struct urcu_txn_sw_list_head *head,
+static struct urcu_txn_sw_list_node *find_key(struct urcu_txn_sw_list_head *head,
 		int key)
 {
-	struct urcu_txn_sw_list_head *p;
+	struct urcu_txn_sw_list_node *p;
 
 	urcu_txn_sw_list_for_each_rcu(p, head) {
 		if (caa_container_of(p, struct bl_node, node)->key == key)
@@ -128,7 +128,7 @@ static struct urcu_txn_sw_list_head *find_key(struct urcu_txn_sw_list_head *head
 static void destroy_list(struct urcu_txn_sw_list_head *head)
 {
 	while (!urcu_txn_sw_list_empty(head)) {
-		struct urcu_txn_sw_list_head *p = urcu_txn_sw_list_next_rcu(head);
+		struct urcu_txn_sw_list_node *p = urcu_txn_sw_list_next_rcu(&head->node);
 		struct bl_node *n = caa_container_of(p, struct bl_node, node);
 
 		urcu_txn_sw_list_del_rcu(p);
@@ -210,7 +210,7 @@ static void test_del_middle(void)
 	const int keys[5] = { 1, 2, 3, 4, 5 };
 	const int want_fwd[4] = { 1, 2, 4, 5 };
 	const int want_rev[4] = { 5, 4, 2, 1 };
-	struct urcu_txn_sw_list_head *mid;
+	struct urcu_txn_sw_list_node *mid;
 	struct bl_node *midn;
 	int i, fwd[4], rev[4], n;
 
@@ -236,7 +236,7 @@ static void test_del_ends(void)
 	URCU_TXN_SW_LIST_HEAD(head);
 	const int keys[4] = { 1, 2, 3, 4 };
 	const int want_fwd[2] = { 2, 3 };
-	struct urcu_txn_sw_list_head *p;
+	struct urcu_txn_sw_list_node *p;
 	struct bl_node *n;
 	int i, fwd[2], cnt;
 
@@ -264,7 +264,7 @@ static void test_replace(void)
 	const int keys[3] = { 1, 2, 3 };
 	const int want_fwd[3] = { 1, 22, 3 };
 	const int want_rev[3] = { 3, 22, 1 };
-	struct urcu_txn_sw_list_head *old;
+	struct urcu_txn_sw_list_node *old;
 	struct bl_node *oldn;
 	int i, fwd[3], rev[3], n;
 
@@ -300,7 +300,7 @@ static void test_proxy_phases(void)
 	URCU_TXN_SW_LIST_HEAD(head);
 	struct bl_node *a = bl_node_new(1);
 	struct bl_node *b = bl_node_new(2);
-	struct urcu_txn_sw_list_head *A = &a->node, *B = &b->node;
+	struct urcu_txn_sw_list_node *A = &a->node, *B = &b->node;
 	struct urcu_txn_sw_txn _txn, *txn = &_txn;
 
 	urcu_txn_sw_list_add_tail_rcu(A, &head);
@@ -314,12 +314,12 @@ static void test_proxy_phases(void)
 	urcu_txn_sw_init(txn, urcu_txn_sw_list_proxy_tag);
 	if (!urcu_txn_sw_reserve(txn, 2))
 		abort();
-	urcu_txn_sw_record(txn, (void **) &head.next, A, B);	/* head->next */
-	urcu_txn_sw_record(txn, (void **) &B->prev, A, &head);	/* B->prev */
+	urcu_txn_sw_record(txn, (void **) &head.node.next, A, B);	/* head->next */
+	urcu_txn_sw_record(txn, (void **) &B->prev, A, &head.node);	/* B->prev */
 	urcu_txn_sw_install(txn);		/* park proxies; selector 0 => old */
 
 	rcu_read_lock();
-	ok(urcu_txn_sw_list_next_rcu(&head) == A,
+	ok(urcu_txn_sw_list_next_rcu(&head.node) == A,
 		"install: forward resolves to old (A still present)");
 	ok(urcu_txn_sw_list_prev_rcu(B) == A,
 		"install: backward resolves to old (A still present)");
@@ -329,13 +329,13 @@ static void test_proxy_phases(void)
 	(void) urcu_txn_sw_commit(txn);	/* one flip switches both edges */
 
 	rcu_read_lock();
-	ok(urcu_txn_sw_list_next_rcu(&head) == B,
+	ok(urcu_txn_sw_list_next_rcu(&head.node) == B,
 		"commit: forward resolves to new (A removed)");
-	ok(urcu_txn_sw_list_prev_rcu(B) == &head,
+	ok(urcu_txn_sw_list_prev_rcu(B) == &head.node,
 		"commit: backward resolves to new (A removed)");
 	rcu_read_unlock();
 
-	ok(head.next == B && B->prev == &head,
+	ok(head.node.next == B && B->prev == &head.node,
 		"settle: slots hold the direct new targets");
 
 	call_rcu(&a->rcu_head, bl_node_free);		/* A is now a ghost */
