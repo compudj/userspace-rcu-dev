@@ -6,7 +6,7 @@
 #define _URCU_RCU_TXN_SW_H
 
 /*
- * Flip-latch: atomically switch a *set* of pointers from an "old" value
+ * Single-updater transaction: atomically switch a *set* of pointers from an "old" value
  * to a "new" value with a single store, as observed by concurrent RCU
  * readers.
  *
@@ -19,7 +19,7 @@
  * them sees a mix of old and new targets.  The usual remedy is a
  * grace-period drain around the update, which is costly.
  *
- * The flip-latch removes the intermediate states by one level of
+ * The latch flip removes the intermediate states by one level of
  * indirection.  Each slot in the set is made to hold a tagged pointer to
  * a small "proxy" latch instead of the target directly.  A proxy holds
  * {old_ptr, new_ptr} and a pointer to a shared "flip group" carrying a
@@ -80,7 +80,7 @@
  *
  *      record() appends an edge {slot, old, new} into the (realloc-grown)
  *      record array but installs nothing; the record set is FROZEN once commit()
- *      parks the proxies, matching the lock-free engine's contract (no edge may
+ *      parks the proxies, matching the concurrent engine's contract (no edge may
  *      be added once a proxy is parked), so an embedder written against this
  *      transaction can migrate to <urcu/rcu-mcas.h> mechanically.
  *      commit() parks every recorded proxy, flips the group and settles to new,
@@ -192,8 +192,8 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * but installs NOTHING -- no proxy address is live yet, so the array grows by
  * realloc.  The record set is FROZEN once proxies are installed (which commit()
  * does internally), so record() must precede commit().  This is the same
- * frozen-set contract as the lock-free engine (<urcu/rcu-mcas.h>), so
- * a single-writer embedder can later migrate to lock-free writers without
+ * frozen-set contract as the concurrent engine (<urcu/rcu-mcas.h>), so
+ * a single-writer embedder can later migrate to concurrent writers without
  * restructuring its mutations.
  *
  * commit() publishes the whole set atomically: it parks every recorded latch's
@@ -215,7 +215,7 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * OOM is sticky: a reserve()/record() that cannot allocate latches the handle
  * into URCU_TXN_SW_OOM and a later commit() reports MEMORY_ERROR (and frees
  * the record array), so an embedder may ignore the bool returns of
- * reserve()/record() and test only commit() -- matching the lock-free
+ * reserve()/record() and test only commit() -- matching the concurrent
  * front-end's contract.
  *
  * The single embedder hook is @tag: given a recorded proxy, return the tagged

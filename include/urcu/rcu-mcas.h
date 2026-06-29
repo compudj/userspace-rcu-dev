@@ -6,15 +6,17 @@
 #define _URCU_RCU_MCAS_H
 
 /*
- * Lock-free flip-latch: a multi-word compare-and-swap (k-CAS) engine.
+ * RCU MCAS: a multi-word compare-and-swap (k-CAS) engine.
  *
  * This is the concurrent-writer sibling of <urcu/rcu-txn-sw.h>.  It switches
  * a *set* of words from their old values to new ones atomically, as observed
- * by both concurrent RCU readers AND concurrent writers, with lock-free
- * progress (a stalled writer never blocks others -- any thread that trips
- * over an in-flight transaction helps drive it to completion).
+ * by both concurrent RCU readers AND concurrent writers.  Progress is
+ * bounded-blocking: a thread that trips over an in-flight transaction helps
+ * drive its install forward rather than waiting on it, and the only blocking
+ * is a short, FIFO-fair per-record install latch (below) -- there is no
+ * unbounded spinning and no deadlock.
  *
- * Model (a "practical MCAS", Harris-style, specialised to the flip-latch)
+ * Model (a "practical MCAS", Harris-style, linearized by a status flip)
  * ----------------------------------------------------------------------
  * A transaction is a frozen set of records {slot, old, new} plus one tri-state
  * status word:
@@ -73,7 +75,7 @@
  * directly, rather than the slot first reverting to a plain value a newcomer
  * could grab.  Because the priority order is total and both parties compute it
  * identically, the two never abort each other, so eviction cannot livelock.
- * This is lock-free, not wait-free.
+ * The engine is bounded-blocking (the per-record install latch), not lock-free.
  *
  * Existence.  Mutators run as RCU readers (rcu_read_lock around the whole
  * operation).  Any descriptor a helper reaches through a slot stays alive
@@ -153,7 +155,7 @@ extern "C" {
  * commits through the full descriptor protocol instead, so it installs a real
  * proxy and contends on the same priority-ordered footing as everyone else (at
  * the cost of a descriptor and one grace period).  This lifts a *lockout*; it
- * does not make the op wait-free -- the engine is lock-free, not wait-free.  The
+ * does not make the op wait-free -- the engine is bounded-blocking, not wait-free.  The
  * retry count the caller threads into urcu_mcas_create() drives this.
  */
 #ifndef URCU_MCAS_ESCALATE
@@ -739,7 +741,7 @@ void urcu_mcas_sort(struct urcu_mcas *t)
  * through to the full descriptor path so it installs a real proxy and contends
  * on the same priority-ordered footing as everyone else, instead of being shut
  * out of a slot a multi-edge op keeps proxied.  (This lifts a lockout; like any
- * transaction here it remains lock-free, not wait-free.)
+ * transaction here it remains bounded-blocking, not wait-free.)
  *
  * Call within an RCU read-side section (descriptor existence for helpers).
  */

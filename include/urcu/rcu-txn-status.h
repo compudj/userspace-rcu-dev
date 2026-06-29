@@ -6,10 +6,10 @@
 #define _URCU_RCU_TXN_STATUS_H
 
 /*
- * Common commit status for the flip-latch transaction front-ends.
+ * Common commit status for the transaction front-ends.
  *
  * Both <urcu/rcu-txn-sw.h> (single-updater) and
- * <urcu/rcu-txn.h> (lock-free) return this enum from their
+ * <urcu/rcu-txn.h> (concurrent) return this enum from their
  * commit() entry point, so an embedder tests a commit the same way no matter
  * which front-end it drives -- and can migrate between them without rewriting
  * its commit handling.
@@ -23,7 +23,7 @@
  *     is extensible to further negative codes should other errors arise.
  *   - OK (0): committed.
  *   - ABORT (> 0): a contention abort -- re-run the begin..commit bracket.
- *     Only the lock-free front-end ever returns this; the single-updater has
+ *     Only the concurrent front-end ever returns this; the single-updater has
  *     no contention and so never aborts.
  */
 enum urcu_txn_status {

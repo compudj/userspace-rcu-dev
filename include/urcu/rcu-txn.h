@@ -6,7 +6,7 @@
 #define _URCU_RCU_TXN_H
 
 /*
- * Transaction front-end for the lock-free flip-latch.
+ * Transaction front-end for the RCU MCAS engine (<urcu/rcu-mcas.h>).
  *
  * <urcu/rcu-mcas.h> is the multi-word CAS engine
  * (urcu_mcas_*): a set of {slot, old, new} records committed atomically.
@@ -61,7 +61,7 @@
  * later attempts start pre-sized rather than growing into it.  Optional -- store()
  * allocates lazily and grows on its own without it.
  *
- * Escalation fallback.  The optimistic retry above is lock-free but not
+ * Escalation fallback.  The optimistic retry above is bounded-blocking but not
  * starvation-free: a large or repeatedly-bypassed transaction can be
  * defeated by a stream of smaller ones (the single-edge fast path and the
  * read->install window let a committer change a footprint slot between this
