@@ -20,10 +20,10 @@
  * just-deleted node onto a live edge -> use-after-free.
  *
  * The fix is the per-record install latch: every plant runs through
- * urcu_flip_lf_plant() under the record's latch, gated by an install-once FLAG
+ * urcu_mcas_plant() under the record's latch, gated by an install-once FLAG
  * (not by the slot value), so a stale second install is skipped no matter how the
  * slot value recurred.  This test drives that exact interleaving deterministically
- * with a single thread and the URCU_FLIP_LF_PREINSTALL hook: when the stale driver
+ * with a single thread and the URCU_MCAS_PREINSTALL hook: when the stale driver
  * is about to plant the shared slot S, the hook runs everything that races with it
  * -- a helper *properly installs* V's record on S (through plant, so the flag is
  * set, exactly as a real helper would), V commits, and T steals+commits+settles S
@@ -33,7 +33,7 @@
  * Expected, linearized result: V (insert) before T (delete) -> S holds B (the
  * node was inserted then deleted).  The bug leaves S == X (resurrected).
  *
- * Build -DURCU_FLIP_LF_NO_ABA_FIX to compile the engine with the install-once
+ * Build -DURCU_MCAS_NO_ABA_FIX to compile the engine with the install-once
  * gate removed and watch this test fail -- that is the proof it catches the
  * regression.
  */
@@ -57,15 +57,15 @@
 
 /*
  * Install the deterministic interleaving hook before pulling in the engine: the
- * header invokes URCU_FLIP_LF_PREINSTALL(t, r) in the install path, at the point
+ * header invokes URCU_MCAS_PREINSTALL(t, r) in the install path, at the point
  * a driver has decided to plant r but BEFORE it takes r's install latch.
  */
-struct urcu_flip_lf_mcas;
-struct urcu_flip_lf_record;
-static void preinstall_hook(struct urcu_flip_lf_mcas *t,
-		struct urcu_flip_lf_record *r);
-#define URCU_FLIP_LF_PREINSTALL(t, r)	preinstall_hook((t), (r))
-#include <urcu/flip-latch-lockfree.h>
+struct urcu_mcas;
+struct urcu_mcas_record;
+static void preinstall_hook(struct urcu_mcas *t,
+		struct urcu_mcas_record *r);
+#define URCU_MCAS_PREINSTALL(t, r)	preinstall_hook((t), (r))
+#include <urcu/rcu-mcas.h>
 
 #include "tap.h"
 
@@ -87,7 +87,7 @@ static long o_B, o_X, o_vaux0, o_vaux1, o_taux0, o_taux1;
 #define X	((void *) &o_X)		/* the node inserted then deleted */
 
 /* Hook state: the racing transactions. */
-static struct urcu_flip_lf_mcas *g_V, *g_T;
+static struct urcu_mcas *g_V, *g_T;
 static int g_fired;
 
 /*
@@ -103,34 +103,34 @@ static int g_fired;
  * On return, the stale driver proceeds into plant(S): with the fix it finds the
  * install-once flag and skips; without it, it re-plants V's proxy over B.
  */
-static void preinstall_hook(struct urcu_flip_lf_mcas *t,
-		struct urcu_flip_lf_record *r)
+static void preinstall_hook(struct urcu_mcas *t,
+		struct urcu_mcas_record *r)
 {
 	if (g_fired || t != g_V || r->slot != S)
 		return;
 	g_fired = 1;
 
 	/* (a) a helper properly installs V's record on S (sets install-once) */
-	(void) urcu_flip_lf_plant(g_V, r, r->old_ptr);
+	(void) urcu_mcas_plant(g_V, r, r->old_ptr);
 	/* (b) V commits: every record installed */
-	(void) uatomic_cmpxchg(&g_V->status, URCU_FLIP_LF_UNDECIDED,
-			URCU_FLIP_LF_SUCCEEDED);
+	(void) uatomic_cmpxchg(&g_V->status, URCU_MCAS_UNDECIDED,
+			URCU_MCAS_SUCCEEDED);
 	/* (c) T steals S from the terminal V, commits, settles S = B */
-	urcu_flip_lf_drive_install(g_T);
-	urcu_flip_lf_settle(g_T);
+	urcu_mcas_drive_install(g_T);
+	urcu_mcas_settle(g_T);
 }
 
-static struct urcu_flip_lf_mcas *make_txn(void **slot_a, void *a_old, void *a_new,
+static struct urcu_mcas *make_txn(void **slot_a, void *a_old, void *a_new,
 		void **slot_s, void *s_old, void *s_new)
 {
-	struct urcu_flip_lf_mcas *t = urcu_flip_lf_mcas_create(2, 0);
+	struct urcu_mcas *t = urcu_mcas_create(2, 0);
 	unsigned int i;
 
 	if (!t)
 		abort();
-	urcu_flip_lf_mcas_add(t, slot_a, a_old, a_new);
-	urcu_flip_lf_mcas_add(t, slot_s, s_old, s_new);
-	urcu_flip_lf_mcas_sort(t);		/* slot-address order, as commit() does */
+	urcu_mcas_add(t, slot_a, a_old, a_new);
+	urcu_mcas_add(t, slot_s, s_old, s_new);
+	urcu_mcas_sort(t);		/* slot-address order, as commit() does */
 	for (i = 0; i < t->nr; i++) {
 		t->recs[i].mcas = t;		/* back-pointers, as commit() does */
 		t->recs[i].installed = 0;	/* arm the install latch, as commit() does */
@@ -165,8 +165,8 @@ int main(void)
 	 * attempt.  The install-once flag must make it a no-op, so settle(V) cannot
 	 * resurrect X.
 	 */
-	urcu_flip_lf_drive_install(g_V);
-	urcu_flip_lf_settle(g_V);
+	urcu_mcas_drive_install(g_V);
+	urcu_mcas_settle(g_V);
 	rcu_read_unlock();
 
 	ok(g_fired, "the A-B-A interleaving hook actually fired");
@@ -179,8 +179,8 @@ int main(void)
 	ok(final_s == B,
 		"deleted node not resurrected onto the live edge by a stale re-install");
 
-	urcu_flip_lf_mcas_destroy(g_V);
-	urcu_flip_lf_mcas_destroy(g_T);
+	urcu_mcas_destroy(g_V);
+	urcu_mcas_destroy(g_T);
 	rcu_unregister_thread();
 	return exit_status();
 }

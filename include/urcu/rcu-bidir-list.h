@@ -34,7 +34,7 @@
  *   delete E between P and N:   P->next: E -> N   and   N->prev: E -> P
  *
  * rcu_bidir_list flips both edges as ONE atomic event using the flip-latch
- * proxy mechanism (<urcu/flip-latch.h>): the two slots transiently hold
+ * proxy mechanism (<urcu/rcu-txn-sw.h>): the two slots transiently hold
  * tagged proxies that share a single selector word; one release store flips
  * the selector and switches both edges from old to new together.  So at
  * every instant the forward and backward chains describe the same list.
@@ -70,7 +70,7 @@
  * Write side
  * ----------
  * Writers must be mutually excluded (as with cds_list_*_rcu).  Each mutator
- * drives a two-edge urcu_flip_txn (<urcu/flip-latch.h>): it records the
+ * drives a two-edge urcu_txn_sw_txn (<urcu/rcu-txn-sw.h>): it records the
  * forward and the backward edge and commits them as one atomic flip; the
  * transaction layer then reclaims itself after a grace period through
  * call_rcu().  Because commit() calls call_rcu() directly, include this header
@@ -85,7 +85,7 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head */
-#include <urcu/flip-latch.h>
+#include <urcu/rcu-txn-sw.h>
 #include <urcu-pointer.h>		/* rcu_dereference / rcu_assign_pointer */
 
 #ifdef __cplusplus
@@ -116,13 +116,13 @@ void cds_bidir_list_init(struct cds_bidir_list_head *head)
 
 /*
  * Proxy tagging: a slot value with bit 0 set is a tagged
- * struct urcu_flip_proxy * rather than a direct node pointer.  Node and
+ * struct urcu_txn_sw_proxy * rather than a direct node pointer.  Node and
  * proxy addresses are both at least pointer-aligned, so bit 0 is free.
  */
 #define CDS_BIDIR_LIST_PROXY_TAG		1UL
 
 static inline
-void *cds_bidir_list_proxy_tag(struct urcu_flip_proxy *proxy)
+void *cds_bidir_list_proxy_tag(struct urcu_txn_sw_proxy *proxy)
 {
 	return (void *) ((uintptr_t) proxy | CDS_BIDIR_LIST_PROXY_TAG);
 }
@@ -138,11 +138,11 @@ struct cds_bidir_list_head *cds_bidir_list_resolve(struct cds_bidir_list_head *p
 	uintptr_t v = (uintptr_t) ptr;
 
 	if (caa_unlikely(v & CDS_BIDIR_LIST_PROXY_TAG)) {
-		struct urcu_flip_proxy *proxy = (struct urcu_flip_proxy *)
+		struct urcu_txn_sw_proxy *proxy = (struct urcu_txn_sw_proxy *)
 				(v & ~(uintptr_t) CDS_BIDIR_LIST_PROXY_TAG);
 
 		return (struct cds_bidir_list_head *)
-				urcu_flip_proxy_get(proxy);
+				urcu_txn_sw_proxy_get(proxy);
 	}
 	return ptr;
 }
@@ -169,11 +169,11 @@ int cds_bidir_list_empty(struct cds_bidir_list_head *head)
 }
 
 /*
- * Flip two edges atomically as one urcu_flip_txn: {*slot0: old0 -> new0} and
+ * Flip two edges atomically as one urcu_txn_sw_txn: {*slot0: old0 -> new0} and
  * {*slot1: old1 -> new1} switch together, as observed by RCU readers.
  *
  * A thin, fixed-arity wrapper over the generic flip transaction
- * (<urcu/flip-latch.h>): init an on-stack handle, reserve the two edges, record
+ * (<urcu/rcu-txn-sw.h>): init an on-stack handle, reserve the two edges, record
  * both, then commit -- which auto-installs the proxies (selector 0 => readers
  * still resolve to old, so install is reader-transparent), flips the shared
  * selector 0 -> 1 (the one reader-visible instant, switching both edges to new
@@ -198,18 +198,18 @@ int cds_bidir_list_flip2(
 		struct cds_bidir_list_head *old1,
 		struct cds_bidir_list_head *new1)
 {
-	struct urcu_flip_txn txn;
+	struct urcu_txn_sw_txn txn;
 
-	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
-	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
-	(void) urcu_flip_txn_record(&txn, (void **) slot0, old0, new0);
-	(void) urcu_flip_txn_record(&txn, (void **) slot1, old1, new1);
+	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	(void) urcu_txn_sw_record(&txn, (void **) slot0, old0, new0);
+	(void) urcu_txn_sw_record(&txn, (void **) slot1, old1, new1);
 	/*
 	 * Two edges => commit auto-installs, flips, settles, and owns reclaim
 	 * (call_rcu).  MEMORY_ERROR (< 0) means an alloc failed and nothing was
 	 * published; otherwise the flip committed.
 	 */
-	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
+	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
 
 /*
@@ -225,7 +225,7 @@ int cds_bidir_list_flip2(
  * cds_bidir_list_proxy_tag so the list's reader accessors resolve the proxy.
  */
 static inline
-int cds_bidir_list_add_after_prepare(struct urcu_flip_txn *txn,
+int cds_bidir_list_add_after_prepare(struct urcu_txn_sw_txn *txn,
 		struct cds_bidir_list_head *newp,
 		struct cds_bidir_list_head *pos)
 {
@@ -236,8 +236,8 @@ int cds_bidir_list_add_after_prepare(struct urcu_flip_txn *txn,
 	newp->next = next;
 
 	/* pos->next: next -> newp ; next->prev: pos -> newp */
-	(void) urcu_flip_txn_record(txn, (void **) &pos->next, next, newp);
-	(void) urcu_flip_txn_record(txn, (void **) &next->prev, pos, newp);
+	(void) urcu_txn_sw_record(txn, (void **) &pos->next, next, newp);
+	(void) urcu_txn_sw_record(txn, (void **) &next->prev, pos, newp);
 	return 0;
 }
 
@@ -249,12 +249,12 @@ static inline
 int cds_bidir_list_add_after_rcu(struct cds_bidir_list_head *newp,
 		struct cds_bidir_list_head *pos)
 {
-	struct urcu_flip_txn txn;
+	struct urcu_txn_sw_txn txn;
 
-	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
-	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) cds_bidir_list_add_after_prepare(&txn, newp, pos);
-	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
+	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
 
 /*
@@ -262,7 +262,7 @@ int cds_bidir_list_add_after_rcu(struct cds_bidir_list_head *newp,
  * add_after_prepare for the contract).  Always returns 0.
  */
 static inline
-int cds_bidir_list_add_before_prepare(struct urcu_flip_txn *txn,
+int cds_bidir_list_add_before_prepare(struct urcu_txn_sw_txn *txn,
 		struct cds_bidir_list_head *newp,
 		struct cds_bidir_list_head *pos)
 {
@@ -272,8 +272,8 @@ int cds_bidir_list_add_before_prepare(struct urcu_flip_txn *txn,
 	newp->prev = prev;
 
 	/* prev->next: pos -> newp ; pos->prev: prev -> newp */
-	(void) urcu_flip_txn_record(txn, (void **) &prev->next, pos, newp);
-	(void) urcu_flip_txn_record(txn, (void **) &pos->prev, prev, newp);
+	(void) urcu_txn_sw_record(txn, (void **) &prev->next, pos, newp);
+	(void) urcu_txn_sw_record(txn, (void **) &pos->prev, prev, newp);
 	return 0;
 }
 
@@ -285,12 +285,12 @@ static inline
 int cds_bidir_list_add_before_rcu(struct cds_bidir_list_head *newp,
 		struct cds_bidir_list_head *pos)
 {
-	struct urcu_flip_txn txn;
+	struct urcu_txn_sw_txn txn;
 
-	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
-	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) cds_bidir_list_add_before_prepare(&txn, newp, pos);
-	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
+	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
 
 /* Add @newp at the head of the list (just after @head). */
@@ -319,15 +319,15 @@ int cds_bidir_list_add_tail_rcu(struct cds_bidir_list_head *newp,
  * cds_bidir_list_lf_del_prepare() for transition parity.
  */
 static inline
-int cds_bidir_list_del_prepare(struct urcu_flip_txn *txn,
+int cds_bidir_list_del_prepare(struct urcu_txn_sw_txn *txn,
 		struct cds_bidir_list_head *elem)
 {
 	struct cds_bidir_list_head *prev = elem->prev;
 	struct cds_bidir_list_head *next = elem->next;
 
 	/* prev->next: elem -> next ; next->prev: elem -> prev */
-	(void) urcu_flip_txn_record(txn, (void **) &prev->next, elem, next);
-	(void) urcu_flip_txn_record(txn, (void **) &next->prev, elem, prev);
+	(void) urcu_txn_sw_record(txn, (void **) &prev->next, elem, next);
+	(void) urcu_txn_sw_record(txn, (void **) &next->prev, elem, prev);
 	return 0;
 }
 
@@ -340,12 +340,12 @@ int cds_bidir_list_del_prepare(struct urcu_flip_txn *txn,
 static inline
 int cds_bidir_list_del_rcu(struct cds_bidir_list_head *elem)
 {
-	struct urcu_flip_txn txn;
+	struct urcu_txn_sw_txn txn;
 
-	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
-	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) cds_bidir_list_del_prepare(&txn, elem);
-	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
+	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
 
 /*
@@ -357,7 +357,7 @@ int cds_bidir_list_del_rcu(struct cds_bidir_list_head *elem)
  * (single-updater: no -ENOENT/-EAGAIN, since there is no concurrent deletion).
  */
 static inline
-int cds_bidir_list_replace_prepare(struct urcu_flip_txn *txn,
+int cds_bidir_list_replace_prepare(struct urcu_txn_sw_txn *txn,
 		struct cds_bidir_list_head *old,
 		struct cds_bidir_list_head *newp)
 {
@@ -368,8 +368,8 @@ int cds_bidir_list_replace_prepare(struct urcu_flip_txn *txn,
 	newp->next = next;
 
 	/* prev->next: old -> newp ; next->prev: old -> newp */
-	(void) urcu_flip_txn_record(txn, (void **) &prev->next, old, newp);
-	(void) urcu_flip_txn_record(txn, (void **) &next->prev, old, newp);
+	(void) urcu_txn_sw_record(txn, (void **) &prev->next, old, newp);
+	(void) urcu_txn_sw_record(txn, (void **) &next->prev, old, newp);
 	return 0;
 }
 
@@ -381,12 +381,12 @@ static inline
 int cds_bidir_list_replace_rcu(struct cds_bidir_list_head *old,
 		struct cds_bidir_list_head *newp)
 {
-	struct urcu_flip_txn txn;
+	struct urcu_txn_sw_txn txn;
 
-	urcu_flip_txn_init(&txn, cds_bidir_list_proxy_tag);
-	(void) urcu_flip_txn_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
+	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) cds_bidir_list_replace_prepare(&txn, old, newp);
-	return urcu_flip_txn_commit(&txn) < 0 ? -1 : 0;
+	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
 
 #define cds_bidir_list_entry(ptr, type, member) \

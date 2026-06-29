@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Direct stress test for the lock-free MCAS engine <urcu/flip-latch-lockfree.h>,
+ * Direct stress test for the lock-free MCAS engine <urcu/rcu-mcas.h>,
  * independent of any data structure.
  *
  * Invariant (atomicity): the shared array starts all-zero, and every
@@ -64,16 +64,16 @@ struct lf_stat {
 	unsigned long escalate;	/* single-edge ops promoted to the descriptor path */
 };
 static __thread struct lf_stat t_stat;
-#define URCU_FLIP_LF_STAT(counter)	(t_stat.counter++)
+#define URCU_MCAS_STAT(counter)	(t_stat.counter++)
 
 /*
  * Force single-edge escalation to fire promptly so the mixed phase reliably
  * exercises that path (the shipped default is higher); the mechanism is what's
  * under test, not the threshold value.
  */
-#define URCU_FLIP_LF_ESCALATE	4
+#define URCU_MCAS_ESCALATE	4
 
-#include <urcu/flip-latch-lockfree.h>
+#include <urcu/rcu-mcas.h>
 
 #include "tap.h"
 
@@ -173,17 +173,17 @@ static void *worker(void *arg)
 			rng = xs(rng);
 			w = (int) (rng % nwords);
 			do {
-				struct urcu_flip_lf_mcas *t;
+				struct urcu_mcas *t;
 				uintptr_t ow;
 
 				rcu_read_lock();
-				t = urcu_flip_lf_mcas_create(1, retry);
+				t = urcu_mcas_create(1, retry);
 				if (!t)
 					abort();
-				ow = (uintptr_t) urcu_flip_lf_read(&g_word[w]);
-				urcu_flip_lf_mcas_add(t, &g_word[w],
+				ow = (uintptr_t) urcu_mcas_read(&g_word[w]);
+				urcu_mcas_add(t, &g_word[w],
 					(void *) ow, (void *) lf_bump(ow, 1));
-				ok = urcu_flip_lf_mcas_commit(t, call_rcu);
+				ok = urcu_mcas_commit(t, call_rcu);
 				rcu_read_unlock();
 				if (!ok)
 					retry++;
@@ -204,7 +204,7 @@ static void *worker(void *arg)
 				k = (k + 1) % (int) nwords;
 
 			do {
-				struct urcu_flip_lf_mcas *t;
+				struct urcu_mcas *t;
 				uintptr_t oi, oj, ok2;
 
 				/*
@@ -214,24 +214,24 @@ static void *worker(void *arg)
 				 * the memb/mb flavors.
 				 */
 				rcu_read_lock();
-				t = urcu_flip_lf_mcas_create(3, retry);
+				t = urcu_mcas_create(3, retry);
 				if (!t)
 					abort();
-				oi = (uintptr_t) urcu_flip_lf_read(&g_word[i]);
-				oj = (uintptr_t) urcu_flip_lf_read(&g_word[j]);
-				urcu_flip_lf_mcas_add(t, &g_word[i],
+				oi = (uintptr_t) urcu_mcas_read(&g_word[i]);
+				oj = (uintptr_t) urcu_mcas_read(&g_word[j]);
+				urcu_mcas_add(t, &g_word[i],
 					(void *) oi, (void *) lf_bump(oi, 2));
 				if (three) {
-					ok2 = (uintptr_t) urcu_flip_lf_read(&g_word[k]);
-					urcu_flip_lf_mcas_add(t, &g_word[j],
+					ok2 = (uintptr_t) urcu_mcas_read(&g_word[k]);
+					urcu_mcas_add(t, &g_word[j],
 						(void *) oj, (void *) lf_bump(oj, 2));
-					urcu_flip_lf_mcas_add(t, &g_word[k],
+					urcu_mcas_add(t, &g_word[k],
 						(void *) ok2, (void *) lf_bump(ok2, -4));
 				} else {
-					urcu_flip_lf_mcas_add(t, &g_word[j],
+					urcu_mcas_add(t, &g_word[j],
 						(void *) oj, (void *) lf_bump(oj, -2));
 				}
-				ok = urcu_flip_lf_mcas_commit(t, call_rcu);
+				ok = urcu_mcas_commit(t, call_rcu);
 				rcu_read_unlock();
 				if (!ok)
 					retry++;

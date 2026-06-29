@@ -301,7 +301,7 @@ static void test_proxy_phases(void)
 	struct bl_node *a = bl_node_new(1);
 	struct bl_node *b = bl_node_new(2);
 	struct cds_bidir_list_head *A = &a->node, *B = &b->node;
-	struct urcu_flip_txn _txn, *txn = &_txn;
+	struct urcu_txn_sw_txn _txn, *txn = &_txn;
 
 	cds_bidir_list_add_tail_rcu(A, &head);
 	cds_bidir_list_add_tail_rcu(B, &head);
@@ -311,12 +311,12 @@ static void test_proxy_phases(void)
 	 * explicit install and the commit to observe the reader's view of
 	 * each phase -- the same install -> commit -> settle the mutators run.
 	 */
-	urcu_flip_txn_init(txn, cds_bidir_list_proxy_tag);
-	if (!urcu_flip_txn_reserve(txn, 2))
+	urcu_txn_sw_init(txn, cds_bidir_list_proxy_tag);
+	if (!urcu_txn_sw_reserve(txn, 2))
 		abort();
-	urcu_flip_txn_record(txn, (void **) &head.next, A, B);	/* head->next */
-	urcu_flip_txn_record(txn, (void **) &B->prev, A, &head);	/* B->prev */
-	urcu_flip_txn_install(txn);		/* park proxies; selector 0 => old */
+	urcu_txn_sw_record(txn, (void **) &head.next, A, B);	/* head->next */
+	urcu_txn_sw_record(txn, (void **) &B->prev, A, &head);	/* B->prev */
+	urcu_txn_sw_install(txn);		/* park proxies; selector 0 => old */
 
 	rcu_read_lock();
 	ok(cds_bidir_list_next_rcu(&head) == A,
@@ -326,7 +326,7 @@ static void test_proxy_phases(void)
 	rcu_read_unlock();
 
 	/* Explicit install parked proxies, so commit owns reclaim (call_rcu). */
-	(void) urcu_flip_txn_commit(txn);	/* one flip switches both edges */
+	(void) urcu_txn_sw_commit(txn);	/* one flip switches both edges */
 
 	rcu_read_lock();
 	ok(cds_bidir_list_next_rcu(&head) == B,

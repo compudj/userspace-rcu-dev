@@ -38,7 +38,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/flip-latch-txn-lockfree.h>
+#include <urcu/rcu-txn.h>
 #include <urcu/rcu-bidir-list-lockfree.h>
 
 #include "tap.h"
@@ -89,17 +89,17 @@ static unsigned int xs(unsigned int x)
 static void sorted_insert(int key)
 {
 	struct lnode *n = (struct lnode *) malloc(sizeof(*n));
-	struct urcu_flip_lf_txn txn;
+	struct urcu_mcas_txn txn;
 	int ret;
 
 	if (!n)
 		abort();
 	n->key = key;
-	urcu_flip_lf_txn_init(&txn, &g_head.domain);
+	urcu_txn_init(&txn, &g_head.domain);
 	do {
 		struct cds_bidir_list_lf_node *prev = &g_head.node, *succ;
 
-		urcu_flip_lf_txn_begin(&txn);
+		urcu_txn_begin(&txn);
 		/* prev = last node with key <= @key; succ = first with key > @key */
 		for (;;) {
 			succ = cds_bidir_list_lf_next_rcu(prev);
@@ -110,14 +110,14 @@ static void sorted_insert(int key)
 		n->node.next = succ;
 		n->node.prev = prev;
 		/* validates prev->next == succ and succ->prev == prev */
-		urcu_flip_lf_txn_store(&txn, (void **) &prev->next, succ, &n->node);
-		urcu_flip_lf_txn_store(&txn, (void **) &succ->prev, prev, &n->node);
-		ret = urcu_flip_lf_txn_commit(&txn);
-		urcu_flip_lf_txn_end(&txn);
+		urcu_txn_store(&txn, (void **) &prev->next, succ, &n->node);
+		urcu_txn_store(&txn, (void **) &succ->prev, prev, &n->node);
+		ret = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
 		if (ret < 0)
 			abort();		/* MEMORY_ERROR */
 		/* ret == 0 (position shifted / anchor gone): re-find and retry */
-	} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+	} while (ret == URCU_TXN_STATUS_ABORT);
 }
 
 /* Delete the first node with key == @key, if present. */

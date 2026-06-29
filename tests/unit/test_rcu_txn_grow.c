@@ -4,14 +4,14 @@
 
 /*
  * Growth test for the transaction front-end
- * <urcu/flip-latch-txn-lockfree.h>: the write-set is a heap
+ * <urcu/rcu-txn.h>: the write-set is a heap
  * descriptor the handle allocates lazily and grows
- * (urcu_flip_lf_mcas_grow, realloc) as stores arrive, rather than a
+ * (urcu_mcas_grow, realloc) as stores arrive, rather than a
  * fixed array.  Two things need exercising beyond
- * test_flip_latch_txn's 2-3 word transactions:
+ * test_rcu_txn's 2-3 word transactions:
  *
  *  Phase 1 -- growth under writer/writer contention.  Each
- *  transaction spans PH1_TXN distinct words (> URCU_FLIP_LF_TXN_INIT,
+ *  transaction spans PH1_TXN distinct words (> URCU_TXN_INIT,
  *  so the descriptor grows), many writers on a small array, half the
  *  ops pre-sizing with reserve() and half growing lazily.  Transfers
  *  are zero-sum, so a torn k-CAS shows as a non-zero total;
@@ -28,7 +28,7 @@
  *  time (before a move) would point into the freed old descriptor --
  *  caught here as an out-of-range value, and under a sanitizer (whose
  *  realloc always relocates and poisons the old block) as a
- *  use-after-free in urcu_flip_lf_status().
+ *  use-after-free in urcu_mcas_status().
  *
  * Slots never repeat a value (the engine's non-ABA precondition):
  * phase 1 packs a monotonic version per word (lf_bump); phase 2 only
@@ -52,7 +52,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/flip-latch-txn-lockfree.h>
+#include <urcu/rcu-txn.h>
 
 #include "tap.h"
 
@@ -100,7 +100,7 @@ static void *ph1_worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < PH1_OPS; n++) {
-		struct urcu_flip_lf_txn tx;
+		struct urcu_mcas_txn tx;
 		int idx[PH1_WORDS], i, ret;
 
 		/* Fisher-Yates prefix: PH1_TXN distinct indices. */
@@ -114,26 +114,26 @@ static void *ph1_worker(void *arg)
 			t = idx[i]; idx[i] = idx[j]; idx[j] = t;
 		}
 
-		urcu_flip_lf_txn_init(&tx, NULL);
+		urcu_txn_init(&tx, NULL);
 		do {
-			urcu_flip_lf_txn_begin(&tx);
+			urcu_txn_begin(&tx);
 			/* odd ops reserve(); even grow lazily */
 			if (n & 1)
-				(void) urcu_flip_lf_txn_reserve(&tx, PH1_TXN);
+				(void) urcu_txn_reserve(&tx, PH1_TXN);
 			for (i = 0; i < PH1_TXN; i++) {
-				uintptr_t old = (uintptr_t) urcu_flip_lf_txn_load(
+				uintptr_t old = (uintptr_t) urcu_txn_load(
 						&tx, &ph1_word[idx[i]]);
 				intptr_t delta = (i < PH1_TXN / 2) ? +3 : -3;
 
-				urcu_flip_lf_txn_store(&tx, &ph1_word[idx[i]],
+				urcu_txn_store(&tx, &ph1_word[idx[i]],
 						(void *) old,
 						(void *) lf_bump(old, delta));
 			}
-			ret = urcu_flip_lf_txn_commit(&tx);
-			urcu_flip_lf_txn_end(&tx);
+			ret = urcu_txn_commit(&tx);
+			urcu_txn_end(&tx);
 			if (ret < 0)
 				abort();		/* MEMORY_ERROR */
-		} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+		} while (ret == URCU_TXN_STATUS_ABORT);
 		wa->committed++;
 		rcu_quiescent_state();
 	}
@@ -182,8 +182,8 @@ static void *ph2_reader(void *arg)
 			rng = rng * 6364136223846793005ull
 					+ 1442695040888963407ull;
 			i = (long) ((rng >> 33) % PH2_N);
-			v = dec(urcu_flip_lf_resolve(
-					urcu_flip_lf_read(&ph2_word[i])));
+			v = dec(urcu_mcas_resolve(
+					urcu_mcas_read(&ph2_word[i])));
 			if (!ph2_value_ok(i, v))
 				CMM_STORE_SHARED(ph2_reader_bad, 1);
 		}
@@ -201,7 +201,7 @@ static void *ph2_writer(void *arg)
 	(void) arg;
 	rcu_register_thread();
 	for (round = 0; round < PH2_ROUNDS; round++) {
-		struct urcu_flip_lf_txn tx;
+		struct urcu_mcas_txn tx;
 		long i;
 		int ret;
 
@@ -211,18 +211,18 @@ static void *ph2_writer(void *arg)
 		 * must grow from INIT to PH2_N (so relocate) for this
 		 * phase to mean anything.
 		 */
-		urcu_flip_lf_txn_init(&tx, NULL);
+		urcu_txn_init(&tx, NULL);
 		do {
-			urcu_flip_lf_txn_begin(&tx);
+			urcu_txn_begin(&tx);
 			for (i = 0; i < PH2_N; i++)
-				urcu_flip_lf_txn_store(&tx, &ph2_word[i],
+				urcu_txn_store(&tx, &ph2_word[i],
 						enc(i + (long) round * PH2_N),
 						enc(i + (long) (round + 1) * PH2_N));
-			ret = urcu_flip_lf_txn_commit(&tx);
-			urcu_flip_lf_txn_end(&tx);
+			ret = urcu_txn_commit(&tx);
+			urcu_txn_end(&tx);
 			if (ret < 0)
 				abort();		/* MEMORY_ERROR */
-		} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+		} while (ret == URCU_TXN_STATUS_ABORT);
 
 		/* The whole k-CAS applied atomically: all flipped. */
 		for (i = 0; i < PH2_N; i++)
@@ -265,7 +265,7 @@ int main(void)
 	diag("phase 1: %d workers x %d ops, %d words/txn over %d words "
 		"(grows past INIT %d); committed=%ld sum=%" PRIdPTR,
 		PH1_WORKERS, PH1_OPS, PH1_TXN, PH1_WORDS,
-		URCU_FLIP_LF_TXN_INIT, total, sum);
+		URCU_TXN_INIT, total, sum);
 	ok(sum == 0,
 		"grow under contention stayed atomic (zero-sum invariant)");
 	ok(total == (long) PH1_WORKERS * PH1_OPS,

@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Test for the transaction front-end <urcu/flip-latch-txn-lockfree.h>: the
+ * Test for the transaction front-end <urcu/rcu-txn.h>: the
  * begin/store/commit/end bracket with the internally-managed retry count.
  *
- * Same atomicity + progress invariants as test_flip_latch_lockfree.c, but
+ * Same atomicity + progress invariants as test_rcu_mcas.c, but
  * driven through the bracket instead of the raw MCAS: many threads run
  * "transfer" transactions (add and subtract equal amounts across 2-3 distinct
  * words) on a small hot array, so the total sum is invariantly 0 and a torn
@@ -36,7 +36,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/flip-latch-txn-lockfree.h>
+#include <urcu/rcu-txn.h>
 
 #include "tap.h"
 
@@ -76,7 +76,7 @@ static void *worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < OPS_PER_WORKER; n++) {
-		struct urcu_flip_lf_txn tx;
+		struct urcu_mcas_txn tx;
 		int i, j, k, three, ret;
 
 		rng = xs(rng);
@@ -87,26 +87,26 @@ static void *worker(void *arg)
 		rng = xs(rng);
 		k = (int) (rng % NR_WORDS); while (k == i || k == j) k = (k + 1) % NR_WORDS;
 
-		urcu_flip_lf_txn_init(&tx, NULL);
+		urcu_txn_init(&tx, NULL);
 		do {
 			uintptr_t oi, oj, ok2;
 
-			urcu_flip_lf_txn_begin(&tx);
-			oi = (uintptr_t) urcu_flip_lf_txn_load(&tx, &g_word[i]);
-			oj = (uintptr_t) urcu_flip_lf_txn_load(&tx, &g_word[j]);
-			urcu_flip_lf_txn_store(&tx, &g_word[i], (void *) oi, (void *) lf_bump(oi, 2));
+			urcu_txn_begin(&tx);
+			oi = (uintptr_t) urcu_txn_load(&tx, &g_word[i]);
+			oj = (uintptr_t) urcu_txn_load(&tx, &g_word[j]);
+			urcu_txn_store(&tx, &g_word[i], (void *) oi, (void *) lf_bump(oi, 2));
 			if (three) {
-				ok2 = (uintptr_t) urcu_flip_lf_txn_load(&tx, &g_word[k]);
-				urcu_flip_lf_txn_store(&tx, &g_word[j], (void *) oj, (void *) lf_bump(oj, 2));
-				urcu_flip_lf_txn_store(&tx, &g_word[k], (void *) ok2, (void *) lf_bump(ok2, -4));
+				ok2 = (uintptr_t) urcu_txn_load(&tx, &g_word[k]);
+				urcu_txn_store(&tx, &g_word[j], (void *) oj, (void *) lf_bump(oj, 2));
+				urcu_txn_store(&tx, &g_word[k], (void *) ok2, (void *) lf_bump(ok2, -4));
 			} else {
-				urcu_flip_lf_txn_store(&tx, &g_word[j], (void *) oj, (void *) lf_bump(oj, -2));
+				urcu_txn_store(&tx, &g_word[j], (void *) oj, (void *) lf_bump(oj, -2));
 			}
-			ret = urcu_flip_lf_txn_commit(&tx);
-			urcu_flip_lf_txn_end(&tx);
+			ret = urcu_txn_commit(&tx);
+			urcu_txn_end(&tx);
 			if (ret < 0)
 				abort();		/* MEMORY_ERROR */
-		} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+		} while (ret == URCU_TXN_STATUS_ABORT);
 
 		if (tx.retry > wa->max_retry)
 			wa->max_retry = tx.retry;

@@ -10,7 +10,7 @@
  * the guarded insert links a node after @pos only if @pos is still live.
  *
  * Deterministic checks (the mid-flight race is covered atomically by
- * test_flip_latch_txn_validate.c; here we verify the mutator is wired right):
+ * test_rcu_txn_validate.c; here we verify the mutator is wired right):
  *   1. guard holds (anchor live)   -> insert links the node;
  *   2. guard fails (anchor killed) -> insert refuses, node not linked;
  *   3. anchor deleted              -> insert returns -ENOENT (mark path).
@@ -32,7 +32,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/flip-latch-txn-lockfree.h>
+#include <urcu/rcu-txn.h>
 #include <urcu/rcu-bidir-list-lockfree.h>
 
 #include "tap.h"
@@ -54,16 +54,16 @@ static struct lnode A, B, C, E;
 /* Kill a live marker LIVE -> DEAD through the engine (single-edge MCAS). */
 static void kill_live(void **live_slot)
 {
-	struct urcu_flip_lf_txn tx;
-	enum urcu_flip_txn_status st;
+	struct urcu_mcas_txn tx;
+	enum urcu_txn_status st;
 
-	urcu_flip_lf_txn_init(&tx, &g_head.domain);
+	urcu_txn_init(&tx, &g_head.domain);
 	do {
-		urcu_flip_lf_txn_begin(&tx);
-		urcu_flip_lf_txn_store(&tx, live_slot, LIVE, DEAD);
-		st = urcu_flip_lf_txn_commit(&tx);
-		urcu_flip_lf_txn_end(&tx);
-	} while (st == URCU_FLIP_TXN_STATUS_ABORT);
+		urcu_txn_begin(&tx);
+		urcu_txn_store(&tx, live_slot, LIVE, DEAD);
+		st = urcu_txn_commit(&tx);
+		urcu_txn_end(&tx);
+	} while (st == URCU_TXN_STATUS_ABORT);
 }
 
 static int in_list(struct cds_bidir_list_lf_node *n)

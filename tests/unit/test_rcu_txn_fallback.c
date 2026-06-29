@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Fallback stress for <urcu/flip-latch-txn-lockfree.h>: the per-domain
+ * Fallback stress for <urcu/rcu-txn.h>: the per-domain
  * FIFO escalation lane under a starvation pattern the engine's aging
  * cannot bound.
  *
@@ -32,8 +32,8 @@
 #endif
 
 /* Lower the thresholds before the include so the lane actually fires. */
-#define URCU_FLIP_LF_TXN_FALLBACK	8
-#define URCU_FLIP_LF_TXN_BIG		6
+#define URCU_TXN_FALLBACK	8
+#define URCU_TXN_BIG		6
 
 #include <inttypes.h>
 #include <pthread.h>
@@ -45,7 +45,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/flip-latch-txn-lockfree.h>
+#include <urcu/rcu-txn.h>
 
 #include "tap.h"
 
@@ -58,7 +58,7 @@
 /* Generous: progress is the point, not a tight bound. */
 #define RETRY_BOUND	100000
 
-static struct urcu_flip_lf_txn_domain g_domain;
+static struct urcu_txn_domain g_domain;
 static void *g_word[NR_WORDS];
 
 struct worker_arg {
@@ -95,28 +95,28 @@ static void *narrow_worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < NARROW_OPS; n++) {
-		struct urcu_flip_lf_txn tx;
+		struct urcu_mcas_txn tx;
 		int i, ret;
 
 		rng = xs(rng);
 		i = (int) (rng % NR_WORDS);
 
-		urcu_flip_lf_txn_init(&tx, &g_domain);
+		urcu_txn_init(&tx, &g_domain);
 		do {
 			uintptr_t oi;
 			void *ni;
 
-			urcu_flip_lf_txn_begin(&tx);
-			oi = (uintptr_t) urcu_flip_lf_txn_load(&tx,
+			urcu_txn_begin(&tx);
+			oi = (uintptr_t) urcu_txn_load(&tx,
 					&g_word[i]);
 			ni = (void *) lf_bump(oi, 1);
-			urcu_flip_lf_txn_store(&tx, &g_word[i],
+			urcu_txn_store(&tx, &g_word[i],
 					(void *) oi, ni);
-			ret = urcu_flip_lf_txn_commit(&tx);
-			urcu_flip_lf_txn_end(&tx);
+			ret = urcu_txn_commit(&tx);
+			urcu_txn_end(&tx);
 			if (ret < 0)
 				abort();		/* MEMORY_ERROR */
-		} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+		} while (ret == URCU_TXN_STATUS_ABORT);
 
 		if (tx.retry > wa->max_retry)
 			wa->max_retry = tx.retry;
@@ -139,32 +139,32 @@ static void *wide_worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < WIDE_OPS; n++) {
-		struct urcu_flip_lf_txn tx;
+		struct urcu_mcas_txn tx;
 		uintptr_t o[NR_WORDS];
 		int w, ret;
 
-		urcu_flip_lf_txn_init(&tx, &g_domain);
+		urcu_txn_init(&tx, &g_domain);
 		do {
 			void *nw;
 
-			urcu_flip_lf_txn_begin(&tx);
-			(void) urcu_flip_lf_txn_reserve(&tx, NR_WORDS);
+			urcu_txn_begin(&tx);
+			(void) urcu_txn_reserve(&tx, NR_WORDS);
 			for (w = 0; w < NR_WORDS; w++)
-				o[w] = (uintptr_t) urcu_flip_lf_txn_load(
+				o[w] = (uintptr_t) urcu_txn_load(
 						&tx, &g_word[w]);
 			nw = (void *) lf_bump(o[0], (NR_WORDS - 1) * 2);
-			urcu_flip_lf_txn_store(&tx, &g_word[0],
+			urcu_txn_store(&tx, &g_word[0],
 					(void *) o[0], nw);
 			for (w = 1; w < NR_WORDS; w++) {
 				nw = (void *) lf_bump(o[w], -2);
-				urcu_flip_lf_txn_store(&tx, &g_word[w],
+				urcu_txn_store(&tx, &g_word[w],
 						(void *) o[w], nw);
 			}
-			ret = urcu_flip_lf_txn_commit(&tx);
-			urcu_flip_lf_txn_end(&tx);
+			ret = urcu_txn_commit(&tx);
+			urcu_txn_end(&tx);
 			if (ret < 0)
 				abort();		/* MEMORY_ERROR */
-		} while (ret == URCU_FLIP_TXN_STATUS_ABORT);
+		} while (ret == URCU_TXN_STATUS_ABORT);
 
 		if (tx.retry > wa->max_retry)
 			wa->max_retry = tx.retry;
@@ -186,7 +186,7 @@ int main(void)
 
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
-	urcu_flip_lf_txn_domain_init(&g_domain);
+	urcu_txn_domain_init(&g_domain);
 
 	for (i = 0; i < NR_NARROW; i++) {
 		narrow_a[i].seed = 0x9e3779b9u

@@ -33,7 +33,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/flip-latch-txn-lockfree.h>
+#include <urcu/rcu-txn.h>
 #include <urcu/rcu-bidir-list-lockfree.h>
 
 #include "tap.h"

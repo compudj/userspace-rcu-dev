@@ -45,7 +45,7 @@
 #include <urcu/uatomic.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/flip-latch-txn-lockfree.h>
+#include <urcu/rcu-txn.h>
 #include <urcu/rcu-bidir-list-lockfree.h>
 
 #include "tap.h"
@@ -77,7 +77,7 @@ struct leaf {
 
 /* Two lists plus one shared escalation lane: a composed txn spans both lists. */
 static struct cds_bidir_list_lf_head g_X, g_Y;
-static struct urcu_flip_lf_txn_domain g_domain;
+static struct urcu_txn_domain g_domain;
 static int g_stop;				/* signals the readers to finish */
 
 static struct leaf g_anchor[NR_WRITERS];
@@ -94,24 +94,24 @@ static void compose_insert(struct cds_bidir_list_lf_node *nx,
 		struct cds_bidir_list_lf_node *ny,
 		struct cds_bidir_list_lf_node *py)
 {
-	struct urcu_flip_lf_txn tx;
-	enum urcu_flip_txn_status st;
+	struct urcu_mcas_txn tx;
+	enum urcu_txn_status st;
 
-	urcu_flip_lf_txn_init(&tx, &g_domain);
+	urcu_txn_init(&tx, &g_domain);
 	for (;;) {
 		int a, b;
 
-		urcu_flip_lf_txn_begin(&tx);
+		urcu_txn_begin(&tx);
 		a = cds_bidir_list_lf_insert_after_prepare(&tx, nx, px);
 		b = cds_bidir_list_lf_insert_after_prepare(&tx, ny, py);
 		if (a || b) {			/* -EAGAIN (neighbour moved): retry */
-			urcu_flip_lf_txn_conflict(&tx);	/* age so a hot slot escalates */
-			urcu_flip_lf_txn_end(&tx);
+			urcu_txn_conflict(&tx);	/* age so a hot slot escalates */
+			urcu_txn_end(&tx);
 			continue;
 		}
-		st = urcu_flip_lf_txn_commit(&tx);
-		urcu_flip_lf_txn_end(&tx);
-		if (st != URCU_FLIP_TXN_STATUS_ABORT)
+		st = urcu_txn_commit(&tx);
+		urcu_txn_end(&tx);
+		if (st != URCU_TXN_STATUS_ABORT)
 			break;
 	}
 }
@@ -119,28 +119,28 @@ static void compose_insert(struct cds_bidir_list_lf_node *nx,
 /* Atomically unlink @lf from BOTH lists in one MCAS.  Returns 1 if removed. */
 static int compose_del(struct leaf *lf)
 {
-	struct urcu_flip_lf_txn tx;
-	enum urcu_flip_txn_status st;
+	struct urcu_mcas_txn tx;
+	enum urcu_txn_status st;
 
-	urcu_flip_lf_txn_init(&tx, &g_domain);
+	urcu_txn_init(&tx, &g_domain);
 	for (;;) {
 		int a, b;
 
-		urcu_flip_lf_txn_begin(&tx);
+		urcu_txn_begin(&tx);
 		a = cds_bidir_list_lf_del_prepare(&tx, &lf->hx);
 		b = cds_bidir_list_lf_del_prepare(&tx, &lf->hy);
 		if (a == -EAGAIN || b == -EAGAIN) {	/* a neighbour moved: retry */
-			urcu_flip_lf_txn_conflict(&tx);	/* age so a hot slot escalates */
-			urcu_flip_lf_txn_end(&tx);
+			urcu_txn_conflict(&tx);	/* age so a hot slot escalates */
+			urcu_txn_end(&tx);
 			continue;
 		}
 		if (a == -ENOENT && b == -ENOENT) {	/* both already gone */
-			urcu_flip_lf_txn_end(&tx);
+			urcu_txn_end(&tx);
 			return 0;
 		}
-		st = urcu_flip_lf_txn_commit(&tx);
-		urcu_flip_lf_txn_end(&tx);
-		if (st != URCU_FLIP_TXN_STATUS_ABORT)
+		st = urcu_txn_commit(&tx);
+		urcu_txn_end(&tx);
+		if (st != URCU_TXN_STATUS_ABORT)
 			break;
 	}
 	return 1;
@@ -149,28 +149,28 @@ static int compose_del(struct leaf *lf)
 /* Atomically replace @old by @nw in BOTH lists in one MCAS.  Returns 1 if done. */
 static int compose_replace(struct leaf *nw, struct leaf *old)
 {
-	struct urcu_flip_lf_txn tx;
-	enum urcu_flip_txn_status st;
+	struct urcu_mcas_txn tx;
+	enum urcu_txn_status st;
 
-	urcu_flip_lf_txn_init(&tx, &g_domain);
+	urcu_txn_init(&tx, &g_domain);
 	for (;;) {
 		int a, b;
 
-		urcu_flip_lf_txn_begin(&tx);
+		urcu_txn_begin(&tx);
 		a = cds_bidir_list_lf_replace_prepare(&tx, &nw->hx, &old->hx);
 		b = cds_bidir_list_lf_replace_prepare(&tx, &nw->hy, &old->hy);
 		if (a == -EAGAIN || b == -EAGAIN) {	/* a neighbour moved: retry */
-			urcu_flip_lf_txn_conflict(&tx);	/* age so a hot slot escalates */
-			urcu_flip_lf_txn_end(&tx);
+			urcu_txn_conflict(&tx);	/* age so a hot slot escalates */
+			urcu_txn_end(&tx);
 			continue;
 		}
 		if (a == -ENOENT && b == -ENOENT) {	/* both already gone */
-			urcu_flip_lf_txn_end(&tx);
+			urcu_txn_end(&tx);
 			return 0;
 		}
-		st = urcu_flip_lf_txn_commit(&tx);
-		urcu_flip_lf_txn_end(&tx);
-		if (st != URCU_FLIP_TXN_STATUS_ABORT)
+		st = urcu_txn_commit(&tx);
+		urcu_txn_end(&tx);
+		if (st != URCU_TXN_STATUS_ABORT)
 			break;
 	}
 	return 1;
@@ -279,7 +279,7 @@ int main(void)
 
 	cds_bidir_list_lf_init(&g_X);
 	cds_bidir_list_lf_init(&g_Y);
-	urcu_flip_lf_txn_domain_init(&g_domain);
+	urcu_txn_domain_init(&g_domain);
 
 	/* Lay down one permanent anchor per writer, chained in both lists. */
 	px = &g_X.node;

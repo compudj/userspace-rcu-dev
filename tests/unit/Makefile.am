@@ -23,14 +23,14 @@ noinst_PROGRAMS = \
 	test_get_possible_cpus_array_len_cxx \
 	test_uatomic \
 	test_uatomic_cxx \
-	test_flip_latch \
-	test_flip_latch_lockfree \
-	test_flip_latch_lf_aba \
-	test_flip_latch_lf_linger \
-	test_flip_latch_txn \
-	test_flip_latch_txn_grow \
-	test_flip_latch_txn_fallback \
-	test_flip_latch_txn_validate \
+	test_rcu_txn_sw \
+	test_rcu_mcas \
+	test_rcu_mcas_aba \
+	test_rcu_mcas_linger \
+	test_rcu_txn \
+	test_rcu_txn_grow \
+	test_rcu_txn_fallback \
+	test_rcu_txn_validate \
 	test_rcu_bidir_list \
 	test_rcu_bidir_list_concurrent \
 	test_rcu_bidir_list_lockfree \
@@ -70,14 +70,14 @@ TESTS = \
 	test_get_possible_cpus_array_len_cxx \
 	test_uatomic \
 	test_uatomic_cxx \
-	test_flip_latch \
-	test_flip_latch_lockfree \
-	test_flip_latch_lf_aba \
-	test_flip_latch_lf_linger \
-	test_flip_latch_txn \
-	test_flip_latch_txn_grow \
-	test_flip_latch_txn_fallback \
-	test_flip_latch_txn_validate \
+	test_rcu_txn_sw \
+	test_rcu_mcas \
+	test_rcu_mcas_aba \
+	test_rcu_mcas_linger \
+	test_rcu_txn \
+	test_rcu_txn_grow \
+	test_rcu_txn_fallback \
+	test_rcu_txn_validate \
 	test_rcu_bidir_list \
 	test_rcu_bidir_list_concurrent \
 	test_rcu_bidir_list_lockfree \
@@ -137,29 +137,29 @@ test_uatomic_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
 test_uatomic_cxx_SOURCES = test_uatomic_cxx.cpp
 test_uatomic_cxx_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_flip_latch_SOURCES = test_flip_latch.c
-test_flip_latch_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_sw_SOURCES = test_rcu_txn_sw.c
+test_rcu_txn_sw_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_flip_latch_lockfree_SOURCES = test_flip_latch_lockfree.c
-test_flip_latch_lockfree_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_mcas_SOURCES = test_rcu_mcas.c
+test_rcu_mcas_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_flip_latch_lf_aba_SOURCES = test_flip_latch_lf_aba.c
-test_flip_latch_lf_aba_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_mcas_aba_SOURCES = test_rcu_mcas_aba.c
+test_rcu_mcas_aba_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_flip_latch_lf_linger_SOURCES = test_flip_latch_lf_linger.c
-test_flip_latch_lf_linger_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_mcas_linger_SOURCES = test_rcu_mcas_linger.c
+test_rcu_mcas_linger_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_flip_latch_txn_SOURCES = test_flip_latch_txn.c
-test_flip_latch_txn_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_SOURCES = test_rcu_txn.c
+test_rcu_txn_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_flip_latch_txn_grow_SOURCES = test_flip_latch_txn_grow.c
-test_flip_latch_txn_grow_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_grow_SOURCES = test_rcu_txn_grow.c
+test_rcu_txn_grow_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_flip_latch_txn_fallback_SOURCES = test_flip_latch_txn_fallback.c
-test_flip_latch_txn_fallback_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_fallback_SOURCES = test_rcu_txn_fallback.c
+test_rcu_txn_fallback_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_flip_latch_txn_validate_SOURCES = test_flip_latch_txn_validate.c
-test_flip_latch_txn_validate_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_validate_SOURCES = test_rcu_txn_validate.c
+test_rcu_txn_validate_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_bidir_list_SOURCES = test_rcu_bidir_list.c
 test_rcu_bidir_list_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)

@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Test for the load-validate guard of <urcu/flip-latch-txn-lockfree.h>:
- * urcu_flip_lf_txn_load_validate() reads a slot AND folds a load-only {v -> v}
+ * Test for the load-validate guard of <urcu/rcu-txn.h>:
+ * urcu_txn_load_validate() reads a slot AND folds a load-only {v -> v}
  * record into the commit, so the transaction commits only if that slot still
  * holds the read value at the install point -- a TM read-set entry.  The model
  * scenario is a tombstone an insert must find clear: validate the tombstone,
@@ -37,7 +37,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/flip-latch-txn-lockfree.h>
+#include <urcu/rcu-txn.h>
 
 #include "tap.h"
 
@@ -57,10 +57,10 @@ static void *g_w;		/* same-slot validate/store cases */
 
 int main(void)
 {
-	struct urcu_flip_lf_txn tx;
+	struct urcu_mcas_txn tx;
 	void *gv, *vv;
 	unsigned int nr1, nr2;
-	enum urcu_flip_txn_status st;
+	enum urcu_txn_status st;
 
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
@@ -68,13 +68,13 @@ int main(void)
 	/* 1. Guard holds: commit OK, payload written, gate left untouched. */
 	g_gate = CLEAR;
 	g_payload = P0;
-	urcu_flip_lf_txn_init(&tx, NULL);
-	urcu_flip_lf_txn_begin(&tx);
-	gv = urcu_flip_lf_txn_load_validate(&tx, &g_gate);
-	urcu_flip_lf_txn_store(&tx, &g_payload, P0, P1);
-	st = urcu_flip_lf_txn_commit(&tx);
-	urcu_flip_lf_txn_end(&tx);
-	ok(gv == CLEAR && st == URCU_FLIP_TXN_STATUS_OK &&
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	gv = urcu_txn_load_validate(&tx, &g_gate);
+	urcu_txn_store(&tx, &g_payload, P0, P1);
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
+	ok(gv == CLEAR && st == URCU_TXN_STATUS_OK &&
 			g_gate == CLEAR && g_payload == P1,
 		"guard holds -> commit applies the write, leaves the guarded word");
 
@@ -82,50 +82,50 @@ int main(void)
 	 * and the buffered write must NOT take effect. */
 	g_gate = CLEAR;
 	g_payload = P0;
-	urcu_flip_lf_txn_init(&tx, NULL);
-	urcu_flip_lf_txn_begin(&tx);
-	gv = urcu_flip_lf_txn_load_validate(&tx, &g_gate);
-	urcu_flip_lf_txn_store(&tx, &g_payload, P0, P1);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	gv = urcu_txn_load_validate(&tx, &g_gate);
+	urcu_txn_store(&tx, &g_payload, P0, P1);
 	g_gate = SET;			/* simulated racing tombstone */
-	st = urcu_flip_lf_txn_commit(&tx);
-	urcu_flip_lf_txn_end(&tx);
-	ok(gv == CLEAR && st == URCU_FLIP_TXN_STATUS_ABORT && g_payload == P0,
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
+	ok(gv == CLEAR && st == URCU_TXN_STATUS_ABORT && g_payload == P0,
 		"guard fails -> commit aborts and the write is not applied");
 
 	/* 3. validate-then-store same slot: the store upgrades the guard in
 	 * place (one record), and commits as the write. */
 	g_w = VX;
-	urcu_flip_lf_txn_init(&tx, NULL);
-	urcu_flip_lf_txn_begin(&tx);
-	vv = urcu_flip_lf_txn_load_validate(&tx, &g_w);
-	urcu_flip_lf_txn_store(&tx, &g_w, VX, VZ);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	vv = urcu_txn_load_validate(&tx, &g_w);
+	urcu_txn_store(&tx, &g_w, VX, VZ);
 	nr1 = tx.mcas->nr;
-	st = urcu_flip_lf_txn_commit(&tx);
-	urcu_flip_lf_txn_end(&tx);
-	ok(vv == VX && nr1 == 1 && st == URCU_FLIP_TXN_STATUS_OK && g_w == VZ,
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
+	ok(vv == VX && nr1 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
 		"validate-then-store on one slot -> one record, commits the write");
 
 	/* 4. store-then-validate same slot: the validate must NOT downgrade the
 	 * pending write; still one record; the write stands. */
 	g_w = VX;
-	urcu_flip_lf_txn_init(&tx, NULL);
-	urcu_flip_lf_txn_begin(&tx);
-	urcu_flip_lf_txn_store(&tx, &g_w, VX, VZ);
-	vv = urcu_flip_lf_txn_load_validate(&tx, &g_w);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	urcu_txn_store(&tx, &g_w, VX, VZ);
+	vv = urcu_txn_load_validate(&tx, &g_w);
 	nr2 = tx.mcas->nr;
-	st = urcu_flip_lf_txn_commit(&tx);
-	urcu_flip_lf_txn_end(&tx);
-	ok(vv == VX && nr2 == 1 && st == URCU_FLIP_TXN_STATUS_OK && g_w == VZ,
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
+	ok(vv == VX && nr2 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
 		"store-then-validate on one slot -> write preserved, one record");
 
 	/* 5. Pure guard over an unchanged word: commit OK, no modification. */
 	g_w = VX;
-	urcu_flip_lf_txn_init(&tx, NULL);
-	urcu_flip_lf_txn_begin(&tx);
-	vv = urcu_flip_lf_txn_load_validate(&tx, &g_w);
-	st = urcu_flip_lf_txn_commit(&tx);
-	urcu_flip_lf_txn_end(&tx);
-	ok(vv == VX && st == URCU_FLIP_TXN_STATUS_OK && g_w == VX,
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	vv = urcu_txn_load_validate(&tx, &g_w);
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
+	ok(vv == VX && st == URCU_TXN_STATUS_OK && g_w == VX,
 		"pure guard over an unchanged word commits without modifying it");
 
 	rcu_barrier();			/* drain deferred descriptor frees */
