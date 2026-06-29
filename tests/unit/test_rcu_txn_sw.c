@@ -27,7 +27,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 12
+#define NR_TESTS 20
 
 /* Embedder tag hook: mark bit 0 of the proxy pointer (latches are 16B-aligned). */
 static void *test_tag(struct urcu_txn_sw_proxy *p)
@@ -46,6 +46,32 @@ static void *resolve(void *v)
 		return urcu_txn_sw_proxy_get(
 			(struct urcu_txn_sw_proxy *) ((unsigned long) v & ~1UL));
 	return v;
+}
+
+static unsigned long reclaim_calls;
+
+/*
+ * Counting reclaim deferral: proves commit_flavor() routes the parked group
+ * block through the SUPPLIED call_rcu_fn (not a hardcoded call_rcu), then defers
+ * the real free so rcu_barrier() drains it.  This is the shape a flavor-agnostic
+ * embedder uses (passing its flavor->update_call_rcu).
+ */
+static void counting_call_rcu(struct rcu_head *head,
+		void (*func)(struct rcu_head *))
+{
+	reclaim_calls++;
+	call_rcu(head, func);
+}
+
+/*
+ * Synchronous reclaim: an exclusive (no concurrent reader) embedder frees the
+ * group block in place, with no grace period -- what the fractal trie does on
+ * its exclusive build.
+ */
+static void sync_call_rcu(struct rcu_head *head,
+		void (*func)(struct rcu_head *))
+{
+	func(head);
 }
 
 int main(void)
@@ -149,6 +175,73 @@ int main(void)
 			if (slots[i] != (void *) ((((unsigned long) (i + 1)) << 8) | 0x10))
 				all_new = false;
 		ok(all_new, "all realloc-grown slots settled to new");
+	}
+
+	/*
+	 * 5. Inline (caller-storage) lone-edge: urcu_txn_sw_init_inline backs the
+	 * record array with an on-stack latch buffer (no allocation).  A single
+	 * recorded edge takes the fast path -- one direct store, no proxy -- and
+	 * commit_flavor() never touches the reclaim fn or frees the inline buffer.
+	 */
+	{
+		void *slot = (void *) 0x100;
+		struct urcu_txn_sw_latch buf[1];
+		struct urcu_txn_sw_txn _t, *t = &_t;
+		enum urcu_txn_status st;
+
+		ok(((unsigned long) buf & 0xfUL) == 0,
+			"inline latch buffer is 16-byte aligned (tag room)");
+		urcu_txn_sw_init_inline(t, test_tag, buf, 1);
+		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200);
+		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu);	/* lone edge: fn unused */
+		ok(st == URCU_TXN_STATUS_OK, "inline lone-edge commit_flavor returns OK");
+		ok(slot == (void *) 0x200 && !is_proxy(slot),
+			"inline lone-edge slot holds new directly, no proxy");
+	}
+
+	/*
+	 * 6. commit_flavor routes parked-block reclaim through the SUPPLIED fn: a
+	 * multi-edge commit defers exactly one block, through counting_call_rcu,
+	 * which a later rcu_barrier() drains.  Confirms a flavor-agnostic embedder
+	 * controls the deferral rather than the header's compile-time call_rcu.
+	 */
+	{
+		void *s1 = (void *) 0x10, *s2 = (void *) 0x20, *s3 = (void *) 0x30;
+		struct urcu_txn_sw_txn _t, *t = &_t;
+		enum urcu_txn_status st;
+
+		reclaim_calls = 0;
+		urcu_txn_sw_init(t, test_tag);
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21);
+		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x31);
+		st = urcu_txn_sw_commit_flavor(t, counting_call_rcu);
+		ok(st == URCU_TXN_STATUS_OK, "commit_flavor multi-edge returns OK");
+		ok(s1 == (void *) 0x11 && s2 == (void *) 0x21 &&
+			s3 == (void *) 0x31, "commit_flavor slots all settled to new");
+		ok(reclaim_calls == 1,
+			"commit_flavor routed reclaim through the supplied call_rcu_fn");
+	}
+
+	/*
+	 * 7. Synchronous (exclusive) reclaim: a multi-edge commit_flavor with an
+	 * in-place reclaim fn frees the group block before returning -- no grace
+	 * period owed.  Slots still settle to new; a leak/UAF here would be caught
+	 * by ASAN since no rcu_barrier covers this block.
+	 */
+	{
+		void *s1 = (void *) 0x40, *s2 = (void *) 0x50;
+		struct urcu_txn_sw_txn _t, *t = &_t;
+		enum urcu_txn_status st;
+
+		urcu_txn_sw_init(t, test_tag);
+		urcu_txn_sw_record(t, &s1, (void *) 0x40, (void *) 0x41);
+		urcu_txn_sw_record(t, &s2, (void *) 0x50, (void *) 0x51);
+		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu);
+		ok(st == URCU_TXN_STATUS_OK,
+			"exclusive (synchronous-reclaim) multi-edge commit returns OK");
+		ok(s1 == (void *) 0x41 && s2 == (void *) 0x51,
+			"exclusive multi-edge slots settled to new, block freed in place");
 	}
 
 	rcu_barrier();			/* drain deferred txn reclaim callbacks */

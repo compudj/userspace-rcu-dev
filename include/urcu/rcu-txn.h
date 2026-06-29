@@ -442,15 +442,21 @@ int urcu_txn_store(struct urcu_mcas_txn *txn, void **slot,
 }
 
 /*
- * Commit the buffered write-set through the MCAS.  Returns enum
- * urcu_txn_status: OK on commit, ABORT on a contention abort (the caller
- * re-runs begin..commit; the retry count is advanced internally), or
- * MEMORY_ERROR on allocation failure (including a store that could not
- * allocate).  Reclaim is deferred through the flavor's call_rcu.  Call between
- * begin and end.
+ * Commit the buffered write-set through the MCAS, deferring reclaim through
+ * @call_rcu_fn.  Returns enum urcu_txn_status: OK on commit, ABORT on a
+ * contention abort (the caller re-runs begin..commit; the retry count is
+ * advanced internally), or MEMORY_ERROR on allocation failure (including a store
+ * that could not allocate).  @call_rcu_fn has the flavor call_rcu signature, so
+ * a flavor-agnostic embedder passes its RCU flavor's call_rcu directly (e.g.
+ * flavor->update_call_rcu) -- the same parametric-reclaim contract as
+ * <urcu/rcu-txn-sw.h>, so an embedder migrating from the single-updater
+ * front-end keeps its reclaim wiring.  The convenience wrapper urcu_txn_commit()
+ * passes the compile-time-selected call_rcu.  Call between begin and end.
  */
 static inline
-enum urcu_txn_status urcu_txn_commit(struct urcu_mcas_txn *txn)
+enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
+		void (*call_rcu_fn)(struct rcu_head *,
+			void (*)(struct rcu_head *)))
 {
 	struct urcu_mcas *m = txn->mcas;
 
@@ -462,11 +468,22 @@ enum urcu_txn_status urcu_txn_commit(struct urcu_mcas_txn *txn)
 		return URCU_TXN_STATUS_OK;	/* empty write-set: trivially committed */
 	txn->min_alloc = m->nr;		/* learn the realized size: a retry won't re-grow */
 	txn->mcas = NULL;		/* mcas_commit consumes the descriptor */
-	if (urcu_mcas_commit(m, call_rcu))
+	if (urcu_mcas_commit(m, call_rcu_fn))
 		return URCU_TXN_STATUS_OK;
 	txn->retry++;			/* aged for the next attempt */
 	txn->retrying = 1;		/* keep the turn across the retry */
 	return URCU_TXN_STATUS_ABORT;
+}
+
+/*
+ * Commit deferring reclaim through the compile-time-selected RCU flavor's
+ * call_rcu (so this header must be included after an RCU flavor header).  A thin
+ * wrapper over urcu_txn_commit_flavor(); see it for the full contract.
+ */
+static inline
+enum urcu_txn_status urcu_txn_commit(struct urcu_mcas_txn *txn)
+{
+	return urcu_txn_commit_flavor(txn, call_rcu);
 }
 
 /*
