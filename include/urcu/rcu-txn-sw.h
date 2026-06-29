@@ -267,10 +267,11 @@ struct urcu_txn_sw_group_block {
 struct urcu_txn_sw_txn {
 	void *(*tag)(struct urcu_txn_sw_proxy *proxy);
 	enum urcu_txn_sw_state state;
-	struct urcu_txn_sw_latch *latches;	/* record array (realloc-grown) */
+	struct urcu_txn_sw_latch *latches;	/* record array (realloc-grown, or caller-owned if @latches_inline) */
 	struct urcu_txn_sw_group_block *block;	/* lazy: NULL until proxies parked */
 	unsigned int nr;
 	unsigned int cap;
+	bool latches_inline;			/* @latches is caller storage: never realloc'd, never freed */
 };
 
 #define URCU_TXN_SW_CAP	8	/* initial record-array capacity */
@@ -290,6 +291,36 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t,
 	t->block = NULL;
 	t->nr = 0;
 	t->cap = 0;
+	t->latches_inline = false;
+}
+
+/*
+ * Initialize a transaction whose record array is CALLER-PROVIDED storage @buf,
+ * holding @cap latches (e.g. a 16-byte-aligned on-stack array -- struct
+ * urcu_txn_sw_latch is aligned(16), so an array of it is, keeping each tagged
+ * proxy's low 4 bits free).  No allocation, so it cannot fail; record() never
+ * realloc-grows the inline array (overflow past @cap is an embedder sizing bug),
+ * and commit() never frees it.  Use ONLY where the transaction need not outlive
+ * the call: a lone-edge (or empty) commit parks no proxy and owes no grace
+ * period, so nothing references the txn -- or its inline storage -- once commit
+ * returns.  A txn that would park proxies (nr >= 2) MUST own heap storage
+ * (urcu_txn_sw_init + record/reserve), since the parked record array has to
+ * survive until a grace period; the engine asserts an inline buffer never
+ * reaches that path.  This is the public analog of the bounded on-stack flip
+ * that the fractal trie uses for its single-pointer publishes.
+ */
+static inline
+void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
+		void *(*tag)(struct urcu_txn_sw_proxy *),
+		struct urcu_txn_sw_latch *buf, unsigned int cap)
+{
+	t->tag = tag;
+	t->state = URCU_TXN_SW_PREPARE;
+	t->latches = buf;
+	t->block = NULL;
+	t->nr = 0;
+	t->cap = cap;
+	t->latches_inline = true;
 }
 
 /*
@@ -343,11 +374,13 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	return true;
 }
 
-/* Free the record array of a handle that never parked proxies (no grace period). */
+/* Free the record array of a handle that never parked proxies (no grace period).
+ * Caller-owned (inline) storage is never freed by the engine. */
 static inline
 void urcu_txn_sw__free_records(struct urcu_txn_sw_txn *t)
 {
-	free(t->latches);
+	if (!t->latches_inline)
+		free(t->latches);
 	t->latches = NULL;
 }
 
@@ -406,6 +439,12 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 		unsigned int newcap = t->cap ? t->cap * 2 : URCU_TXN_SW_CAP;
 		struct urcu_txn_sw_latch *nl;
 
+		/*
+		 * Caller-owned (inline) storage is sized to the embedder's edge
+		 * bound and must never grow -- realloc-ing it would move caller
+		 * (e.g. on-stack) memory.  Overflow here is an embedder sizing bug.
+		 */
+		urcu_posix_assert(!t->latches_inline);
 		/*
 		 * No proxy address is live yet -> the array may move.  No
 		 * aligned realloc exists, so allocate a fresh 16-byte-aligned
@@ -477,12 +516,25 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
  * block alloc had failed (sticky), otherwise OK.  A single updater has no
  * contention, so ABORT is never returned.
  *
+ * @call_rcu_fn is the reclaim deferral: when proxies are parked (nr >= 2), the
+ * group block (carrying the record array) is handed to call_rcu_fn(block,
+ * urcu_txn_sw_free_rcu) so it is freed after a grace period retires any proxy a
+ * reader may still hold.  It has the flavor call_rcu signature, so an embedder
+ * passes its RCU flavor's call_rcu directly -- letting a FLAVOR-AGNOSTIC
+ * embedder (one that selects its flavor at runtime, e.g. through a
+ * rcu_flavor_struct vtable: flavor->update_call_rcu) drive reclaim without this
+ * header binding a compile-time flavor.  An embedder that KNOWS no reader can
+ * hold a proxy (a single-threaded / exclusive build) may pass a synchronous
+ * shim -- void f(head, func){ func(head); } -- to free in place with no grace
+ * period.  The convenience wrapper urcu_txn_sw_commit() passes the
+ * compile-time-selected call_rcu (hence its include-after-flavor requirement).
+ *
  * Reclaim:
  *   - nr >= 2 (proxies parked): the group block (carrying the record array) is
- *     deferred through call_rcu(urcu_txn_sw_free_rcu) (the flavor's call_rcu,
- *     hence the include-after-flavor requirement).
+ *     deferred through call_rcu_fn(.., urcu_txn_sw_free_rcu).
  *   - nr <= 1 / sticky OOM (no proxy ever published): the record array is freed
- *     at once; no group block was allocated.
+ *     at once (caller-owned inline storage is left untouched); no group block
+ *     was allocated, and @call_rcu_fn is never invoked.
  *
  * Two PREPARE shortcuts let an embedder record then commit WITHOUT an explicit
  * urcu_txn_sw_install():
@@ -498,10 +550,12 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
  *   - Multi-edge (nr >= 2): auto-install -- allocate the group block, park every
  *     proxy, then flip.  (A white-box caller that needs work BETWEEN install and
  *     the flip can call urcu_txn_sw_install() itself; commit then reuses the
- *     block it allocated and takes the call_rcu reclaim path.)
+ *     block it allocated and takes the call_rcu_fn reclaim path.)
  */
 static inline
-enum urcu_txn_status urcu_txn_sw_commit(struct urcu_txn_sw_txn *t)
+enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
+		void (*call_rcu_fn)(struct rcu_head *,
+			void (*)(struct rcu_head *)))
 {
 	struct urcu_txn_sw_group_block *blk;
 	unsigned int i;
@@ -531,7 +585,13 @@ enum urcu_txn_status urcu_txn_sw_commit(struct urcu_txn_sw_txn *t)
 
 	/* INSTALLED: proxies parked, group block allocated. */
 	blk = t->block;
-	blk->latches = t->latches;	/* the GP free reclaims the record array */
+	/*
+	 * The GP free reclaims the record array, so it must be heap-owned: an
+	 * inline (caller-storage) txn never parks proxies (record() asserts it
+	 * cannot grow past its lone-edge bound), so nr >= 2 here implies heap.
+	 */
+	urcu_posix_assert(!t->latches_inline);
+	blk->latches = t->latches;
 	t->latches = NULL;
 	urcu_txn_sw_group_commit(&blk->group);
 	for (i = 0; i < t->nr; i++) {
@@ -539,8 +599,19 @@ enum urcu_txn_status urcu_txn_sw_commit(struct urcu_txn_sw_txn *t)
 
 		uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
 	}
-	call_rcu(&blk->rcu_head, urcu_txn_sw_free_rcu);	/* a reader may hold a proxy */
+	call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);	/* a reader may hold a proxy */
 	return URCU_TXN_STATUS_OK;
+}
+
+/*
+ * Commit deferring reclaim through the compile-time-selected RCU flavor's
+ * call_rcu (so this header must be included after an RCU flavor header).  A thin
+ * wrapper over urcu_txn_sw_commit_flavor(); see it for the full contract.
+ */
+static inline
+enum urcu_txn_status urcu_txn_sw_commit(struct urcu_txn_sw_txn *t)
+{
+	return urcu_txn_sw_commit_flavor(t, call_rcu);
 }
 
 #endif /* _URCU_RCU_TXN_SW_H */
