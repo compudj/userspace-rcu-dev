@@ -36,6 +36,41 @@
  *                                                  // OK (0) = committed;
  *                                                  // MEMORY_ERROR (<0) = error
  *
+ * Consistency model
+ * -----------------
+ * A committed transaction is linearizable, and its linearization point is the
+ * single status-word commit (UNDECIDED -> SUCCEEDED): every record it parked
+ * resolves to its OLD value before that CAS and to its NEW value after it, so one
+ * store switches the whole frozen record set at once.  Install (proxies parked,
+ * still OLD-visible) and settle (proxies rewritten to plain NEW, already
+ * NEW-visible) change no observable value, so neither is a linearization point.
+ *
+ * Because the record set may span data structures, that one commit is a single
+ * linearization point ACROSS ALL of them: everything folded into one transaction
+ * (via the *_prepare forms -- e.g. publish a node into a trie AND splice it into
+ * a list) becomes visible together.  This is strictly stronger than composing
+ * independent RCU structures, where a node can be reachable in A before it is
+ * reachable in B.  The unit of cross-structure atomicity is exactly "one
+ * transaction": two separate commits to A and B are two linearization points,
+ * the same as two unrelated RCU structures.
+ *
+ * This linearizes the WRITE.  A reader is NOT a transaction -- it is a sequence
+ * of single-slot reads, each linearizing at its own access -- so a long traversal
+ * may straddle a commit: it can observe the transaction in a slot it reads after
+ * the commit and not in one it read before.  No slot and no instant is ever torn
+ * (that is the guarantee); a reader's several reads simply are not a mutual
+ * snapshot.  This is deliberately weaker than STM opacity: readers are plain RCU
+ * readers that pay no per-read barrier.  An embedder needing a multi-read
+ * snapshot layers its own versioning on top, as with any value-based MCAS.
+ *
+ * Preconditions for all of the above:
+ *   - every write to a transacted slot goes through this layer (the engine owns
+ *     tag bit 0; a side-channel store to such a slot breaks atomicity);
+ *   - every read of a transacted slot resolves through the engine accessor
+ *     (proxy -> status), never the raw word;
+ *   - a node's payload is initialized before the commit that links it -- commit
+ *     is the release edge, so build-then-commit publishes it safely.
+ *
  * The handle holds only what the engine does not: the cross-attempt retry count
  * (aging priority) and a pointer to this attempt's descriptor -- the write-set
  * itself lives once, in the engine descriptor, not in a second buffer.  The
