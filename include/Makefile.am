@@ -28,7 +28,12 @@ nobase_include_HEADERS = \
 	urcu/compiler.h \
 	urcu/debug.h \
 	urcu/defer.h \
+	urcu/fair-mutex.h \
 	urcu/flavor.h \
+	urcu/rcu-txn-sw.h \
+	urcu/rcu-mcas.h \
+	urcu/rcu-txn-status.h \
+	urcu/rcu-txn.h \
 	urcu/futex.h \
 	urcu/hlist.h \
 	urcu/lfstack.h \
@@ -40,6 +45,8 @@ nobase_include_HEADERS = \
 	urcu/map/urcu-memb.h \
 	urcu/map/urcu-qsbr.h \
 	urcu/pointer.h \
+	urcu/rcu-txn-sw-list.h \
+	urcu/rcu-txn-list.h \
 	urcu/rcuhlist.h \
 	urcu/fractal-trie.h \
 	urcu/rculfhash.h \
