@@ -1573,6 +1573,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		head_slot = &cn->child;
 		if ((struct cds_ft_node *) ft_node_ptr(*head_slot) != node) {
 			dbg_printf("cds_ft_remove: node %p not at compressed child slot\n", node);
+			/* Drop the pre-reserved unsplice txn (nothing published yet). */
+			if (unsplice_txn)
+				ft_flip_txn_destroy(unsplice_txn);
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
@@ -1738,6 +1741,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		if (!child ||
 		    (struct cds_ft_node *) ft_node_ptr(child) != node) {
 			dbg_printf("cds_ft_remove: node %p not at key slot\n", node);
+			/* Drop the pre-reserved unsplice txn (nothing published yet). */
+			if (unsplice_txn)
+				ft_flip_txn_destroy(unsplice_txn);
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
