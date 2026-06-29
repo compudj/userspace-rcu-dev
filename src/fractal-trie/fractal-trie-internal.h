@@ -198,7 +198,7 @@
  * This ordered two-step publish is for SINGLE-EDGE replacement.  A
  * multi-edge commit that includes this edge (cds_ft_merge_at) instead
  * switches the slot through the flip latch (FT_FLIP_PROXY, see
- * src/urcu-flip-latch.h): the slot transiently holds a flip proxy, one
+ * <urcu/rcu-txn-sw.h>): the slot transiently holds a flip proxy, one
  * commit flips the whole set old->new atomically, and the skip view is
  * re-established when the flip settles.
  *

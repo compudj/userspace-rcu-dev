@@ -743,11 +743,11 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
 }
 
 /*
- * Flip-proxy encoding (see src/urcu-flip-latch.h).  cds_ft_merge_at needs
+ * Flip-proxy encoding (see <urcu/rcu-txn-sw.h>).  cds_ft_merge_at needs
  * to switch a whole set of back-pointers (and the merge-point forward
  * slot) from their old to their new target with no mixed-regime window.
- * Each such slot transiently holds a tagged pointer to a urcu_flip_proxy
- * latch; a single urcu_flip_commit store flips them all atomically.
+ * Each such slot transiently holds a tagged pointer to a urcu_txn_sw_proxy
+ * latch; a single urcu_txn_sw_group_commit store flips them all atomically.
  *
  * A proxy is tagged as a synthetic INTERNAL node of type-index 7, the
  * maximal tag value (low nibble (FT_INTERNAL_MASK | FT_TYPE_MASK) == 0xF).
@@ -774,13 +774,13 @@ bool ft_node_flip_proxy(struct cds_ft_inode_flag *node)
 }
 
 static inline_lookup
-struct urcu_flip_proxy *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
+struct urcu_txn_sw_proxy *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
 {
-	return (struct urcu_flip_proxy *) _ft_node_mask_ptr(node);
+	return (struct urcu_txn_sw_proxy *) _ft_node_mask_ptr(node);
 }
 
 static
-struct cds_ft_inode_flag *ft_flip_proxy_flag(struct urcu_flip_proxy *proxy)
+struct cds_ft_inode_flag *ft_flip_proxy_flag(struct urcu_txn_sw_proxy *proxy)
 {
 	return (struct cds_ft_inode_flag *)
 		((unsigned long) proxy | FT_FLIP_PROXY_TAG);
@@ -796,9 +796,9 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
 {
 	if (caa_unlikely(ft_node_flip_proxy(node))) {
-		struct urcu_flip_proxy *p = ft_flip_proxy_ptr(node);
+		struct urcu_txn_sw_proxy *p = ft_flip_proxy_ptr(node);
 
-		return (struct cds_ft_inode_flag *) urcu_flip_proxy_get(p);
+		return (struct cds_ft_inode_flag *) urcu_txn_sw_proxy_get(p);
 	}
 	return node;
 }
@@ -885,7 +885,7 @@ void ft_maybe_prefetch_nta(const void *ptr)
  * miss or flood the memory controller under 2 MiB).  It also RESOLVES a parked
  * flip proxy: a "new key at an existing internal node" publish parks a proxy
  * in external_nodes so it commits atomically with the ordinal-cell splice (one
- * urcu_flip_commit), so a reader loading external_nodes must resolve it to the
+ * urcu_txn_sw_group_commit), so a reader loading external_nodes must resolve it to the
  * old/new head exactly as it does for a child slot.  The common case (a real
  * head, proxy tag clear) is a single predicted-not-taken tag test.
  */

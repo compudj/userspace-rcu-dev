@@ -96,7 +96,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * untouched).  List off uses the lone-edge ft_root_edge_flip below
 		 * (no txn).  This is the whole-trie root detach, not a hot path.
 		 */
-		struct urcu_flip_txn *root_txn = NULL;
+		struct urcu_txn_sw_txn *root_txn = NULL;
 
 		if (ft->group->ordered_list_set) {
 			root_txn = ft_flip_txn_create_bounded(
@@ -114,7 +114,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		fresh_node = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
 		if (!fresh_node) {
 			if (root_txn)
-				urcu_flip_txn_destroy(root_txn);
+				ft_flip_txn_destroy(root_txn);
 			cds_ft_destroy(detached);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
@@ -354,7 +354,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				struct ft_detach_run run = { .armed = false };
 				struct ft_remove_pub *pubp = NULL;
 				struct ft_detach_run *runp = NULL;
-				struct urcu_flip_txn *run_txn = NULL;
+				struct urcu_txn_sw_txn *run_txn = NULL;
 				int ret;
 
 				if (ft->group->ordered_list_set) {
@@ -390,7 +390,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					 * propagation and abort, leaving @ft pristine.
 					 */
 					if (run_txn)
-						urcu_flip_txn_destroy(run_txn);
+						ft_flip_txn_destroy(run_txn);
 					ft_propagate_external_count_parent(ft, d.pnf,
 						(long) detached_count);
 					ft_glue_abort(detached, &glue);
@@ -405,7 +405,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						ft_ord_cell_run_detach(ft, run_txn, detached,
 							run.rfirst, run.rlast);
 					else
-						urcu_flip_txn_destroy(run_txn);
+						ft_flip_txn_destroy(run_txn);
 				}
 			}
 

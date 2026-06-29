@@ -1081,7 +1081,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		unsigned int off_src, struct ft_descent *d_dst,
 		unsigned long cnt_dst, unsigned int off_dst,
 		size_t dst_key_len,
-		struct urcu_flip_txn **pre_txn)
+		struct urcu_txn_sw_txn **pre_txn)
 {
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -1095,8 +1095,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	struct cds_ft_inode_flag *pub_parent = d_dst->pnf, **pub_slot = d_dst->nfp;
 	struct cds_ft_inode *fresh_root = NULL;
 	struct cds_ft_metadata *fresh_meta;
-	struct urcu_flip_txn *txn;
-	bool gp_owed;
+	struct urcu_txn_sw_txn *txn;
 	unsigned long merged_keys = 0;
 	bool ms_ord = dst_ft->group->ordered_list_set;
 	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL, *ms_succ = NULL;
@@ -1260,9 +1259,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		txn = ft_flip_txn_take(pre_txn);
 		if (!txn) {
 			txn = ft_flip_txn_create();
-			if (txn && !urcu_flip_txn_reserve(txn,
+			if (txn && !urcu_txn_sw_reserve(txn,
 					nr_dst + 1 + ms_cap)) {
-				urcu_flip_txn_destroy(txn);
+				ft_flip_txn_destroy(txn);
 				txn = NULL;
 			}
 		}
@@ -1337,7 +1336,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 */
 		ms_edges = malloc((size_t) ms_cap * sizeof(*ms_edges));
 		if (!ms_edges) {
-			urcu_flip_txn_destroy(txn);
+			ft_flip_txn_destroy(txn);
 			if (fresh_root)
 				free_cds_ft_node_unpublished(src_ft, fresh_root);
 			ft_glue_abort(dst_ft, &gd);
@@ -1414,7 +1413,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		}
 		if (!ms_src_caps) {
 			free(ms_edges);
-			urcu_flip_txn_destroy(txn);
+			ft_flip_txn_destroy(txn);
 			if (fresh_root)
 				free_cds_ft_node_unpublished(src_ft, fresh_root);
 			ft_glue_abort(dst_ft, &gd);
@@ -1455,7 +1454,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * the still-invisible build (both tries pristine).  The lone-edge list-off
 	 * paths (ft_root_edge_flip) need no txn, so reserve only when ms_ord.
 	 */
-	struct urcu_flip_txn *src_side_txn = NULL;
+	struct urcu_txn_sw_txn *src_side_txn = NULL;
 
 	if (ms_ord) {
 		src_side_txn = ft_flip_txn_create_bounded(
@@ -1464,7 +1463,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			free(ms_src_pool);
 			free(ms_src_caps);
 			free(ms_edges);
-			urcu_flip_txn_destroy(txn);
+			ft_flip_txn_destroy(txn);
 			if (fresh_root)
 				free_cds_ft_node_unpublished(src_ft, fresh_root);
 			ft_glue_abort(dst_ft, &gd);
@@ -1520,9 +1519,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		free(ms_src_pool);
 		free(ms_src_caps);
 		free(ms_edges);
-		urcu_flip_txn_destroy(txn);
+		ft_flip_txn_destroy(txn);
 		if (src_side_txn)
-			urcu_flip_txn_destroy(src_side_txn);
+			ft_flip_txn_destroy(src_side_txn);
 		ft_glue_abort(dst_ft, &gd);
 		ft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
@@ -1543,7 +1542,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	}
 	/* Reserved but unused: a non-root run whose unlink already fused it. */
 	if (src_side_txn)
-		urcu_flip_txn_destroy(src_side_txn);
+		ft_flip_txn_destroy(src_side_txn);
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
 
@@ -1621,7 +1620,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    progresses old->merged; and the ordered-list front advances in the same
 	 *    instant the merged minimum becomes reachable.
 	 */
-	gp_owed = urcu_flip_txn_commit(txn);
+	ft_flip_txn_commit(dst_ft, txn);
 
 	/* 5. Concatenate same-key duplicate chains (dst now reachable via M). */
 	ft_glue_apply_splices(dst_ft, &gd);
@@ -1639,14 +1638,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			(long) merged_keys - (long) cnt_dst);
 
 	/*
-	 * 7. Reclaim, all deferred: the flip-txn (commit settled every proxied slot
-	 *    -- the dst-origin parents, the forward slot and the interleave cell
-	 *    edges -- to its direct merged target, so the proxies are unreferenced;
-	 *    @gp_owed is false only when the commit reduced to a single bare store)
-	 *    and the old overlap spines (src-side to src, dst-side to dst).  No dst
+	 * 7. Reclaim the old overlap spines (src-side to src, dst-side to dst).
+	 *    The flip-txn was already committed-and-reclaimed at step 4 (commit
+	 *    settled every proxied slot -- the dst-origin parents, the forward slot
+	 *    and the interleave cell edges -- to its direct merged target, so the
+	 *    proxies are unreferenced; its parked block is deferred through the FT
+	 *    flavor, or freed in place when the commit owed no grace period).  No dst
 	 *    synchronize_rcu -- the flip subsumed the dst drain.
 	 */
-	ft_flip_txn_reclaim(dst_ft, txn, gp_owed);
 	ft_glue_free_old(src_ft, &gs);
 	ft_glue_free_old(dst_ft, &gd);
 
@@ -1740,10 +1739,10 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * the build; destroyed on a POPULATED point (nothing to commit).
 	 */
 	glue.txn = ft_flip_txn_create();
-	if (!glue.txn || !urcu_flip_txn_reserve(glue.txn,
+	if (!glue.txn || !urcu_txn_sw_reserve(glue.txn,
 			FT_GLUE_FLOOR_DEFERRED + 6)) {
 		if (glue.txn)
-			urcu_flip_txn_destroy(glue.txn);
+			ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
@@ -1752,12 +1751,12 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	*handled = true;
 	if (prep == FT_GRAFT_PREP_OOM) {
 		ft_glue_abort(dst_ft, &glue);
-		urcu_flip_txn_destroy(glue.txn);
+		ft_flip_txn_destroy(glue.txn);
 		return CDS_FT_STATUS_MEMORY_ERROR;	/* both tries pristine */
 	}
 	if (prep == FT_GRAFT_PREP_POPULATED) {
 		/* Defensive: cnt_dst == 0 should never yield an occupied point. */
-		urcu_flip_txn_destroy(glue.txn);
+		ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
 		return CDS_FT_STATUS_POPULATED_ERROR;
 	}
@@ -1780,7 +1779,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		 */
 		if (ft_bulk_node_reserve_fill(dst_ft, &reserve)) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-			urcu_flip_txn_destroy(glue.txn);
+			ft_flip_txn_destroy(glue.txn);
 			ft_glue_fini(&glue);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
@@ -1819,14 +1818,14 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * structural unlink is public (un-abortable).  OOM here aborts the still-
 	 * invisible build (both tries pristine).  Reserve only when ms_ord.
 	 */
-	struct urcu_flip_txn *run_unlink_txn = NULL;
+	struct urcu_txn_sw_txn *run_unlink_txn = NULL;
 	/*
 	 * Pre-reserve the standalone dst run-splice txn too: the rare unfused
 	 * attach shape splices the moved run into dst's list AFTER the structural
 	 * attach is public (un-abortable).  Reserved only when ms_ord; consumed by
 	 * the standalone splice or freed-unused when fused (the common case).
 	 */
-	struct urcu_flip_txn *run_splice_txn = NULL;
+	struct urcu_txn_sw_txn *run_splice_txn = NULL;
 
 	if (ms_ord) {
 		run_unlink_txn = ft_flip_txn_create_bounded(
@@ -1835,12 +1834,12 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 			FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
 		if (!run_unlink_txn || !run_splice_txn) {
 			if (run_unlink_txn)
-				urcu_flip_txn_destroy(run_unlink_txn);
+				ft_flip_txn_destroy(run_unlink_txn);
 			if (run_splice_txn)
-				urcu_flip_txn_destroy(run_splice_txn);
+				ft_flip_txn_destroy(run_splice_txn);
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 			ft_glue_abort(dst_ft, &glue);
-			urcu_flip_txn_destroy(glue.txn);
+			ft_flip_txn_destroy(glue.txn);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 	}
@@ -1853,12 +1852,12 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
 			cnt_src, srunp) < 0) {
 		if (run_unlink_txn)
-			urcu_flip_txn_destroy(run_unlink_txn);
+			ft_flip_txn_destroy(run_unlink_txn);
 		if (run_splice_txn)
-			urcu_flip_txn_destroy(run_splice_txn);
+			ft_flip_txn_destroy(run_splice_txn);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		ft_glue_abort(dst_ft, &glue);
-		urcu_flip_txn_destroy(glue.txn);
+		ft_flip_txn_destroy(glue.txn);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
@@ -1878,7 +1877,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	}
 	/* Reserved but unused: the structural unlink already fused the run. */
 	if (run_unlink_txn)
-		urcu_flip_txn_destroy(run_unlink_txn);
+		ft_flip_txn_destroy(run_unlink_txn);
 
 	if (!src_ft->exclusive)
 		src_ft->group->flavor->update_synchronize_rcu();
@@ -1963,7 +1962,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		run_splice_txn = NULL;	/* consumed */
 	}
 	if (run_splice_txn)
-		urcu_flip_txn_destroy(run_splice_txn);	/* fused: unused */
+		ft_flip_txn_destroy(run_splice_txn);	/* fused: unused */
 
 	/* Raise dst's max_used_key_len for the moved keys (dst_key || suffix). */
 	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
@@ -1990,7 +1989,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
 		const uint8_t *src_key, size_t src_key_len,
-		struct urcu_flip_txn **pre_txn)
+		struct urcu_txn_sw_txn **pre_txn)
 {
 	struct cds_ft *subtree = NULL;
 	enum cds_ft_status status;
@@ -2155,7 +2154,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		struct ft_descent d_mrg;
 		unsigned int off_mrg;
 		unsigned long n = cnt_src, m;		/* moved / dst subtree counts */
-		struct urcu_flip_txn *pf_txn = NULL;
+		struct urcu_txn_sw_txn *pf_txn = NULL;
 
 		if (off_src > 0) {
 			struct cds_ft_compressed_node *cn_s =
@@ -2237,8 +2236,8 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			else
 				pf_cap = (unsigned int) (m + 1);
 			pf_txn = ft_flip_txn_create();
-			if (pf_txn && !urcu_flip_txn_reserve(pf_txn, pf_cap)) {
-				urcu_flip_txn_destroy(pf_txn);
+			if (pf_txn && !urcu_txn_sw_reserve(pf_txn, pf_cap)) {
+				ft_flip_txn_destroy(pf_txn);
 				pf_txn = NULL;
 			}
 		}
@@ -2255,14 +2254,14 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		memset(&reserve, 0, sizeof(reserve));
 		if (ft_bulk_node_reserve_fill(dst_ft, &reserve)) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-			urcu_flip_txn_destroy(pf_txn);
+			ft_flip_txn_destroy(pf_txn);
 			FT_TP(merge_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		status = ft_detach_keylen(dst_ft, det_key, det_len, &tmp);
 		if (status < 0) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-			urcu_flip_txn_destroy(pf_txn);
+			ft_flip_txn_destroy(pf_txn);
 			FT_TP(merge_exit, (int) (status == CDS_FT_STATUS_NOT_FOUND
 				? CDS_FT_STATUS_OK : status));
 			return status == CDS_FT_STATUS_NOT_FOUND
@@ -2283,7 +2282,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		assert(status == CDS_FT_STATUS_OK);
 		/* Free the flip-txn this merge shape did not consume. */
 		if (pf_txn)
-			urcu_flip_txn_destroy(pf_txn);
+			ft_flip_txn_destroy(pf_txn);
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		cds_ft_destroy(tmp);
 		FT_TP(merge_exit, (int) status);
@@ -2370,7 +2369,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		struct cds_ft_inode *fresh_root;
 		struct cds_ft_metadata *fresh_meta;
 		struct cds_ft_inode *old_dst_root;
-		struct urcu_flip_txn *appear_txn = NULL;
+		struct urcu_txn_sw_txn *appear_txn = NULL;
 		size_t sm;
 
 		fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
@@ -2402,7 +2401,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		if (status < 0) {
 			/* NOT_FOUND impossible: @src_ft had content. */
 			if (appear_txn)
-				urcu_flip_txn_destroy(appear_txn);
+				ft_flip_txn_destroy(appear_txn);
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
 			goto out;
 		}

@@ -71,7 +71,7 @@ struct ft_ord_cell *ft_ord_cell_resolve_ord(struct ft_ord_cell *const *slot)
 	struct ft_ord_cell *p = rcu_dereference(*slot);
 
 	if (caa_unlikely(ft_node_flip_proxy((struct cds_ft_inode_flag *) p)))
-		p = (struct ft_ord_cell *) urcu_flip_proxy_get(
+		p = (struct ft_ord_cell *) urcu_txn_sw_proxy_get(
 			ft_flip_proxy_ptr((struct cds_ft_inode_flag *) p));
 	return p;
 }

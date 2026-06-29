@@ -96,38 +96,48 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 }
 
 /*
- * FT bridge to the generic multi-edge transaction urcu_flip_txn
- * (src/urcu-flip-latch.h).  ft_flip_txn_tag is the one embedder hook: a parked
+ * FT bridge to the generic single-updater transaction urcu_txn_sw_txn
+ * (<urcu/rcu-txn-sw.h>).  ft_flip_txn_tag is the one embedder hook: a parked
  * latch's address becomes a type-7 FT flip proxy (ft_flip_proxy_flag), resolved
- * on every read hot path by ft_resolve_flip_proxy.  ft_flip_txn_reclaim is the
- * reclaim shim: a committed / post-install-aborted txn owes a grace period (a
- * reader may hold a proxy), deferred via the FT's RCU flavor -- except on the
- * exclusive fast path, and a PREPARE abort owes none, both of which free now.
+ * on every read hot path by ft_resolve_flip_proxy.  The FT threads a heap txn
+ * handle through an op and commits it with ft_flip_txn_commit, which owns
+ * reclaim: a committed txn's parked group block is freed after a grace period
+ * (a reader may hold a proxy) through the FT's RCU flavor -- except on the
+ * exclusive build, which frees it in place.  An op that aborts before
+ * committing drops its uncommitted handle with ft_flip_txn_destroy (nothing was
+ * published, so no grace period is owed).
  */
 static inline
-void *ft_flip_txn_tag(struct urcu_flip_proxy *proxy)
+void *ft_flip_txn_tag(struct urcu_txn_sw_proxy *proxy)
 {
 	return ft_flip_proxy_flag(proxy);
 }
 
 static inline
-struct urcu_flip_txn *ft_flip_txn_create(void)
+struct urcu_txn_sw_txn *ft_flip_txn_create(void)
 {
-	return urcu_flip_txn_create(ft_flip_txn_tag);
+	struct urcu_txn_sw_txn *t = (struct urcu_txn_sw_txn *) malloc(sizeof(*t));
+
+	if (t)
+		urcu_txn_sw_init(t, ft_flip_txn_tag);
+	return t;
 }
 
 /*
- * Single-allocation bounded FT flip-txn: a one-malloc transaction for the
- * point-op commits (insert one-commit, ordered-cell splice/unsplice/swap) whose
- * edge count is bounded by construction.  Returns NULL on OOM -> the caller
+ * Bounded FT flip-txn: a pre-reserved transaction for the point-op commits
+ * (insert one-commit, ordered-cell splice/unsplice/swap) and bulk-op glue folds
+ * whose edge count is bounded by construction, so every later record appends
+ * without reallocating and cannot fail.  Returns NULL on OOM -> the caller
  * degrades to a direct / sequential publish.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_flip_countdown;
 #endif
 static inline
-struct urcu_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
+struct urcu_txn_sw_txn *ft_flip_txn_create_bounded(unsigned int cap)
 {
+	struct urcu_txn_sw_txn *t;
+
 #ifdef FEATURE_FT_FAULT_INJECT
 	/*
 	 * Test-only flip-txn allocation fault injection (see
@@ -144,7 +154,15 @@ struct urcu_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 		cds_ft_fault_flip_countdown--;
 	}
 #endif
-	return urcu_flip_txn_create_bounded(ft_flip_txn_tag, cap);
+	t = (struct urcu_txn_sw_txn *) malloc(sizeof(*t));
+	if (!t)
+		return NULL;
+	urcu_txn_sw_init(t, ft_flip_txn_tag);
+	if (!urcu_txn_sw_reserve(t, cap)) {
+		free(t);
+		return NULL;
+	}
+	return t;
 }
 
 /*
@@ -157,10 +175,10 @@ struct urcu_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
  * failure is still clean.
  */
 static inline
-struct urcu_flip_txn *ft_flip_txn_take(struct urcu_flip_txn **pre)
+struct urcu_txn_sw_txn *ft_flip_txn_take(struct urcu_txn_sw_txn **pre)
 {
 	if (pre && *pre) {
-		struct urcu_flip_txn *t = *pre;
+		struct urcu_txn_sw_txn *t = *pre;
 
 		*pre = NULL;
 		return t;
@@ -168,28 +186,59 @@ struct urcu_flip_txn *ft_flip_txn_take(struct urcu_flip_txn **pre)
 	return NULL;
 }
 
-static inline
-void ft_flip_txn_reclaim(struct cds_ft *ft, struct urcu_flip_txn *t,
-		bool gp_owed)
+/*
+ * Reclaim deferral passed to urcu_txn_sw_commit_flavor on the exclusive build:
+ * with no concurrent reader, a committed txn's parked group block is freed in
+ * place, no grace period.  Matches the flavor call_rcu signature.
+ */
+static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
+		void (*func)(struct rcu_head *))
 {
-	if (gp_owed && !ft->exclusive)
-		ft->group->flavor->update_call_rcu(&t->rcu_head,
-			urcu_flip_txn_free_rcu);
-	else
-		urcu_flip_txn_destroy(t);
+	func(head);
+}
+
+/*
+ * Commit a heap FT flip-txn (ft_flip_txn_create*), then free its handle.
+ * urcu_txn_sw_commit_flavor publishes the whole recorded edge set atomically and
+ * OWNS the parked-block reclaim, deferring it through the FT's RCU flavor (or
+ * freeing it in place on an exclusive build).  A single-edge / empty commit
+ * parks no proxy (a lone release store) and a record OOM publishes nothing
+ * (MEMORY_ERROR): the structure is byte-for-byte untouched in every non-publish
+ * case (freeze-before-install), so the caller need not inspect the status.
+ */
+static inline
+void ft_flip_txn_commit(struct cds_ft *ft, struct urcu_txn_sw_txn *t)
+{
+	(void) urcu_txn_sw_commit_flavor(t, ft->exclusive ?
+			ft_flip_txn_call_rcu_now :
+			ft->group->flavor->update_call_rcu);
+	free(t);	/* the heap handle; commit consumed its latches / block */
+}
+
+/*
+ * Drop a heap FT flip-txn that was NOT committed (an op aborted before
+ * publishing -- an OOM or a no-op path).  Nothing was stored into any slot
+ * (freeze-before-install), so this frees the record array and the handle; no
+ * grace period is owed.
+ */
+static inline
+void ft_flip_txn_destroy(struct urcu_txn_sw_txn *t)
+{
+	urcu_txn_sw__free_records(t);
+	free(t);
 }
 
 /*
  * Record one edge into a txn that was reserved to its bounded record count up
- * front (urcu_flip_txn_reserve), so the append cannot reallocate and cannot
+ * front (urcu_txn_sw_reserve), so the append cannot reallocate and cannot
  * fail.  Used by the GLUE flip-txn fold, whose edge count is bounded by the
  * attach cluster floor -- the same discipline as the glue's fixed floor arrays.
  */
 static inline
-void ft_flip_txn_record_reserved(struct urcu_flip_txn *t, void **slot,
+void ft_flip_txn_record_reserved(struct urcu_txn_sw_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
-	bool ok = urcu_flip_txn_record(t, slot, old_ptr, new_ptr);
+	bool ok = urcu_txn_sw_record(t, slot, old_ptr, new_ptr);
 
 	assert(ok);
 	(void) ok;	/* reserved up front -> never fails */
@@ -258,33 +307,33 @@ struct ft_remove_pub {
 	bool armed;
 };
 
-static void ft_ord_cell_flip_into(struct cds_ft *ft, struct urcu_flip_txn *t,
+static void ft_ord_cell_flip_into(struct cds_ft *ft, struct urcu_txn_sw_txn *t,
 		struct ft_ord_cell_edge *edges, unsigned int n);
 
 /*
- * Commit a single edge as a lone flip descriptor on an ON-STACK bounded txn.
+ * Commit a single edge as a lone flip descriptor on an ON-STACK inline txn.
  * Infallible: it allocates nothing (hence cannot OOM) and needs no reclaim -- a
  * single-edge commit is one release store that parks no proxy and owes no grace
- * period, so nothing references the txn once it returns and the stack frame
- * reclaims it.  Byte-identical in effect to a bare rcu_assign_pointer, but
- * captured as a {slot, old, new} descriptor so a future multi-writer MCAS covers
- * the slot uniformly (a bare store would discard @old and sit outside the
- * descriptor protocol).  The lone-edge publish helpers (ft_root_edge_flip,
- * ft_chain_next_flip, and the point insert/remove single-slot external_nodes
- * publishes) and ft_ord_cell_flip_try's n==1 fast path all commit through here.
+ * period, so nothing references the txn (or its inline latch buffer) once it
+ * returns and the stack frame reclaims it.  Byte-identical in effect to a bare
+ * rcu_assign_pointer, but captured as a {slot, old, new} descriptor so a future
+ * multi-writer MCAS covers the slot uniformly (a bare store would discard @old
+ * and sit outside the descriptor protocol).  The lone-edge publish helpers
+ * (ft_root_edge_flip, ft_chain_next_flip, and the point insert/remove
+ * single-slot external_nodes publishes) and ft_ord_cell_flip_try's n==1 fast
+ * path all commit through here.  The reclaim fn is never reached (nr == 1 parks
+ * no block); it is passed only to satisfy commit_flavor's signature.
  */
 static
 void ft_ord_cell_flip_one(struct ft_ord_cell_edge *edge)
 {
-	union {
-		struct urcu_flip_txn t;
-		char buf[URCU_FLIP_TXN_BOUNDED_BYTES(1)];
-	} u;
+	struct urcu_txn_sw_latch buf[1];	/* caller storage: latch is aligned(16) */
+	struct urcu_txn_sw_txn t;
 
-	urcu_flip_txn_init_bounded(&u.t, ft_flip_txn_tag, 1);
-	ft_flip_txn_record_reserved(&u.t, (void **) edge->slot,
+	urcu_txn_sw_init_inline(&t, ft_flip_txn_tag, buf, 1);
+	ft_flip_txn_record_reserved(&t, (void **) edge->slot,
 		(void *) edge->old_target, (void *) edge->new_target);
-	(void) urcu_flip_txn_commit(&u.t);
+	(void) urcu_txn_sw_commit_flavor(&t, ft_flip_txn_call_rcu_now);
 }
 
 /*
@@ -333,7 +382,7 @@ unsigned int ft_ord_cell_endpoint_edge(struct ft_ord_cell **slot,
  */
 #define FT_ROOT_LIST_SWAP_MAX_EDGES	3	/* root + head + tail */
 static
-void ft_root_list_swap_publish(struct cds_ft *ft, struct urcu_flip_txn *txn,
+void ft_root_list_swap_publish(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		struct cds_ft_inode_flag **struct_slot,
 		struct cds_ft_inode_flag *struct_old,
 		struct cds_ft_inode_flag *struct_new,
@@ -588,7 +637,7 @@ struct ft_root_swap_side {
  */
 #define FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES	6	/* 2 roots + 2x head/tail */
 static
-void ft_root_list_swap_publish_dual(struct urcu_flip_txn *txn,
+void ft_root_list_swap_publish_dual(struct urcu_txn_sw_txn *txn,
 		const struct ft_root_swap_side *a,
 		const struct ft_root_swap_side *b)
 {
@@ -752,7 +801,7 @@ void ft_ord_cell_run_install(struct cds_ft *into, struct ft_ord_cell *first,
  * -- commit through the caller-PRE-RESERVED txn @txn (ft_ord_cell_flip_into).
  */
 static
-void ft_ord_cell_run_detach(struct cds_ft *ft, struct urcu_flip_txn *txn,
+void ft_ord_cell_run_detach(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		struct cds_ft *into, struct cds_ft_node *first_head,
 		struct cds_ft_node *last_head)
 {
@@ -798,18 +847,16 @@ struct ft_detach_run {
  * commits through it here where failure is impossible.
  */
 static
-void ft_ord_cell_flip_into(struct cds_ft *ft, struct urcu_flip_txn *t,
+void ft_ord_cell_flip_into(struct cds_ft *ft, struct urcu_txn_sw_txn *t,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
 	unsigned int i;
-	bool gp;
 
 	for (i = 0; i < n; i++)
 		ft_flip_txn_record_reserved(t, (void **) edges[i].slot,
 			(void *) edges[i].old_target,
 			(void *) edges[i].new_target);
-	gp = urcu_flip_txn_commit(t);
-	ft_flip_txn_reclaim(ft, t, gp);
+	ft_flip_txn_commit(ft, t);
 }
 
 /*
@@ -827,7 +874,7 @@ static
 int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		unsigned int n)
 {
-	struct urcu_flip_txn *t;
+	struct urcu_txn_sw_txn *t;
 
 	if (n == 0)
 		return 0;
@@ -978,7 +1025,7 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
  * and ft_ord_cell_flip_into commits it here infallibly.
  */
 static
-void ft_ord_cell_unsplice(struct cds_ft *ft, struct urcu_flip_txn *txn,
+void ft_ord_cell_unsplice(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		struct ft_ord_cell *cell)
 {
 	struct ft_ord_cell_edge edges[FT_ORD_CELL_UNSPLICE_MAX_EDGES];
@@ -1143,7 +1190,7 @@ static
 int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 		struct ft_ord_cell *old_cell, struct ft_ord_cell *new_cell,
 		const struct ft_ord_cell_edge *sedges, unsigned int n_sedge,
-		struct urcu_flip_txn *txn)
+		struct urcu_txn_sw_txn *txn)
 {
 	struct ft_ord_cell_edge edges[FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES];
 	unsigned int n = 0, i;
@@ -1204,7 +1251,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		struct cds_ft_metadata *state_meta,
 		struct ft_ord_cell *dead_cell,
 		struct ft_detach_run *run,
-		struct urcu_flip_txn *txn)
+		struct urcu_txn_sw_txn *txn)
 {
 	struct ft_ord_cell_edge edges[6];	/* 1 structural + state + <=4 cell/run */
 	unsigned int n = 0;
@@ -1336,7 +1383,7 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 static
 void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
 		struct ft_ord_cell *dead_cell, struct ft_detach_run *run,
-		struct urcu_flip_txn *txn)
+		struct urcu_txn_sw_txn *txn)
 {
 	struct ft_ord_cell_edge edges[FT_REMOVE_COMMIT_REC_MAX_EDGES];
 	unsigned int n = 0, i;
@@ -1503,7 +1550,7 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
  * it infallibly via ft_ord_cell_flip_into.
  */
 static
-void ft_ord_cell_run_splice(struct cds_ft *dst, struct urcu_flip_txn *txn,
+void ft_ord_cell_run_splice(struct cds_ft *dst, struct urcu_txn_sw_txn *txn,
 		struct ft_ord_cell *run_first,
 		struct ft_ord_cell *run_last, struct ft_ord_cell *pred,
 		struct ft_ord_cell *succ)
@@ -1595,7 +1642,7 @@ unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
  * commit rides it infallibly via ft_ord_cell_flip_into.
  */
 static
-void ft_ord_cell_run_replace(struct cds_ft *dst, struct urcu_flip_txn *txn,
+void ft_ord_cell_run_replace(struct cds_ft *dst, struct urcu_txn_sw_txn *txn,
 		struct ft_ord_cell *d_first, struct ft_ord_cell *d_last,
 		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last)
 {
@@ -1636,7 +1683,7 @@ struct ft_graft_swap_run {
  * infallibly.  Arms @run.
  */
 static
-void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct urcu_flip_txn *txn,
+void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		struct ft_pub_rec *rec, struct ft_graft_swap_run *run)
 {
 	struct ft_ord_cell_edge edges[FT_GLUE_PUBLISH_REPLACE_MAX_EDGES];
@@ -1667,7 +1714,7 @@ void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct urcu_flip_txn *txn,
 
 #ifdef FEATURE_FT_MERGE
 static
-void ft_ord_cell_run_unlink(struct cds_ft *ft, struct urcu_flip_txn *txn,
+void ft_ord_cell_run_unlink(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		struct cds_ft_node *first_head, struct cds_ft_node *last_head)
 {
 	struct ft_ord_cell *first =
@@ -2106,7 +2153,7 @@ struct ft_glue {
 	 */
 	struct cds_ft_inode_flag *attached_nf;
 	/*
-	 * Multi-edge flip transaction (src/urcu-flip-latch.h).  When non-NULL
+	 * Multi-edge flip transaction (<urcu/rcu-txn-sw.h>).  When non-NULL
 	 * (the converted graft GLUE path, list off), every live back-pointer
 	 * re-parent AND the forward publish are RECORDED into @txn as the build
 	 * runs, then committed atomically with one selector flip -- so the
@@ -2115,7 +2162,7 @@ struct ft_glue {
 	 * is unrepresentable.  NULL keeps the legacy @deferred path (list on,
 	 * NOSPLIT, graft_swap, merge).  The caller owns its lifecycle.
 	 */
-	struct urcu_flip_txn *txn;
+	struct urcu_txn_sw_txn *txn;
 	/*
 	 * Inline floor backing.  ft_glue_init points the three arrays
 	 * here; graft / graft_swap never outgrow it.  ft_glue_reserve
@@ -2381,7 +2428,7 @@ bool ft_glue_is_fresh(struct cds_ft *ft, struct ft_glue *g,
  * cluster size up front.
  */
 static
-void ft_glue_record_back_edge(struct cds_ft *ft, struct urcu_flip_txn *txn,
+void ft_glue_record_back_edge(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot)
@@ -2643,7 +2690,7 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
  * the build.
  *
  * The records cannot fail: g->txn was reserved to the bounded cluster size up
- * front (urcu_flip_txn_reserve).  Reclaims the txn (deferred via the flavor, or
+ * front (urcu_txn_sw_reserve).  Reclaims the txn (deferred via the flavor, or
  * freed immediately on the exclusive fast path).
  */
 static
@@ -2653,7 +2700,6 @@ void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 	struct ft_pub_rec rec = { .n = 0 };
 	unsigned int j, k;
 	int i;
-	bool gp_owed;
 
 	/*
 	 * Hidden back-pointers -- re-parents of nodes NOT reader-observable
@@ -2709,16 +2755,15 @@ void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 			cedges[k].old_target, cedges[k].new_target);
 
 	/*
-	 * Commit WITHOUT an explicit install: urcu_flip_txn_commit auto-installs
-	 * a multi-edge set, but a publish that reduces to a SINGLE recorded edge
+	 * Commit WITHOUT an explicit install: ft_flip_txn_commit auto-installs a
+	 * multi-edge set, but a publish that reduces to a SINGLE recorded edge
 	 * (e.g. a list-off attach into a plain parent with no deferred
 	 * back-pointers) commits as a bare release store -- no proxy, no group
 	 * flip, no grace-period reclaim -- so the common one-pointer publish pays
-	 * nothing for the transaction machinery.  gp_owed is false there and
-	 * ft_flip_txn_reclaim frees the txn immediately.
+	 * nothing for the transaction machinery.  commit owns reclaim (deferred
+	 * through the FT flavor when a proxy is owed, freed in place otherwise).
 	 */
-	gp_owed = urcu_flip_txn_commit(g->txn);
-	ft_flip_txn_reclaim(ft, g->txn, gp_owed);
+	ft_flip_txn_commit(ft, g->txn);
 	g->txn = NULL;
 }
 
@@ -2857,7 +2902,7 @@ void ft_glue_free_collided_cells(struct cds_ft *ft,
  * node up through the cluster to publish_parent is in place.
  */
 static
-void ft_glue_publish(struct cds_ft *ft, struct urcu_flip_txn *txn,
+void ft_glue_publish(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		struct ft_glue *g)
 {
 	struct ft_pub_rec rec = { .n = 0 };
@@ -2892,7 +2937,7 @@ void ft_glue_publish(struct cds_ft *ft, struct urcu_flip_txn *txn,
  * section); @txn capacity must be >= FT_GLUE_PUBLISH_REPLACE_MAX_EDGES.
  */
 static
-void ft_glue_publish_replace(struct cds_ft *ft, struct urcu_flip_txn *txn,
+void ft_glue_publish_replace(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		struct ft_glue *g, struct ft_graft_swap_run *run)
 {
 	struct ft_pub_rec rec = { .n = 0 };

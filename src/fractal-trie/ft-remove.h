@@ -68,7 +68,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct ft_remove_pub *pub,
 		struct ft_detach_run *run)
 {
-	struct urcu_flip_txn *txn;
+	struct urcu_txn_sw_txn *txn;
 
 	/*
 	 * Pre-reserve the publish flip-txn before any side-effect (sub-case 1
@@ -160,7 +160,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 
 		fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
 		if (!fresh) {
-			urcu_flip_txn_destroy(txn);	/* unused: no publish */
+			ft_flip_txn_destroy(txn);	/* unused: no publish */
 			return -ENOMEM;
 		}
 		src_meta = cds_ft_item_to_metadata(
@@ -276,7 +276,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_inode_flag *new_cn_flag;
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *publish_parent;
-	struct urcu_flip_txn *txn;
+	struct urcu_txn_sw_txn *txn;
 
 	assert(surviving_child);
 	parent_compressed = ft_node_compressed(iter_meta->parent);
@@ -311,7 +311,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		return -ENOMEM;	/* nothing touched: caller aborts */
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
 	if (!new_cn) {
-		urcu_flip_txn_destroy(txn);	/* PREPARE state: no grace period */
+		ft_flip_txn_destroy(txn);	/* PREPARE state: no grace period */
 		return -ENOMEM;	/* nothing published: caller aborts */
 	}
 
@@ -449,7 +449,7 @@ int ft_detach_node(struct cds_ft *ft,
 	 * on-stack release store.  Consumed by ft_ord_cell_flip_into at whichever
 	 * commit fires; freed at @end if reserved but unused.
 	 */
-	struct urcu_flip_txn *commit_txn = NULL;
+	struct urcu_txn_sw_txn *commit_txn = NULL;
 	bool commit_txn_used = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
 	bool prev_external_nodes_found = false;
@@ -1203,7 +1203,7 @@ end:
 	 * fused with its own txn).  PREPARE state -> no grace period.
 	 */
 	if (commit_txn && !commit_txn_used)
-		urcu_flip_txn_destroy(commit_txn);
+		ft_flip_txn_destroy(commit_txn);
 	/* Reclaim safely after replacement. */
 	if (old_recompacted_node)
 		free_cds_ft_node(ft, old_recompacted_node);
@@ -1291,7 +1291,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		void *new_cell_flag = ft_ord_cell_alloc(ft, next_node,
 			old_cell->parent);
 		struct ft_ord_cell *new_cell;
-		struct urcu_flip_txn *txn;
+		struct urcu_txn_sw_txn *txn;
 
 		if (!new_cell_flag)
 			return -ENOMEM;
@@ -1329,7 +1329,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * reservation OOM abort here: @next_node and the head slot are
 		 * untouched, so the caller returns CDS_FT_STATUS_MEMORY_ERROR.
 		 */
-		struct urcu_flip_txn *txn =
+		struct urcu_txn_sw_txn *txn =
 			ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES);
 
 		if (!txn)
@@ -1537,7 +1537,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * On OOM here the removal aborts cleanly (key untouched).  The fused
 	 * common case frees it unused at the tail.
 	 */
-	struct urcu_flip_txn *unsplice_txn = NULL;
+	struct urcu_txn_sw_txn *unsplice_txn = NULL;
 
 	if (fuse_remove) {
 		unsplice_txn = ft_flip_txn_create_bounded(
@@ -1778,12 +1778,12 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			if (!pub.armed)
 				ft_ord_cell_unsplice(ft, unsplice_txn, dead_cell);
 			else
-				urcu_flip_txn_destroy(unsplice_txn);
+				ft_flip_txn_destroy(unsplice_txn);
 			ft_ord_cell_free(ft, dead_cell);
 		} else {
 			/* Removal aborted (MEMORY_ERROR): nothing left the trie, the
 			 * cell stays in the list -- release the unused reservation. */
-			urcu_flip_txn_destroy(unsplice_txn);
+			ft_flip_txn_destroy(unsplice_txn);
 		}
 	}
 
@@ -2008,7 +2008,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 * AFTER the structural commit is public -- un-abortable.  OOM here
 	 * aborts the removal cleanly; the fused case frees it unused.
 	 */
-	struct urcu_flip_txn *unsplice_txn = NULL;
+	struct urcu_txn_sw_txn *unsplice_txn = NULL;
 
 	if (dead_cell) {
 		unsplice_txn = ft_flip_txn_create_bounded(
@@ -2181,12 +2181,12 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			if (!pub.armed)
 				ft_ord_cell_unsplice(ft, unsplice_txn, dead_cell);
 			else
-				urcu_flip_txn_destroy(unsplice_txn);
+				ft_flip_txn_destroy(unsplice_txn);
 			ft_ord_cell_free(ft, dead_cell);
 		} else {
 			/* Removal aborted: the cell stays in the list -- release the
 			 * unused reservation. */
-			urcu_flip_txn_destroy(unsplice_txn);
+			ft_flip_txn_destroy(unsplice_txn);
 		}
 	}
 

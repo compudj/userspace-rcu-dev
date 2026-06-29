@@ -57,7 +57,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	struct cds_ft_metadata *meta = cds_ft_item_to_metadata(node);
 	struct cds_ft_inode_flag *parent = meta->parent;
 	struct ft_pub_rec rec = { .n = 0 };
-	struct urcu_flip_txn *txn = NULL;
+	struct urcu_txn_sw_txn *txn = NULL;
 	int ret;
 
 	/*
@@ -91,7 +91,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 		 * unchanged): best-effort, leave the node in place.
 		 */
 		if (txn)
-			urcu_flip_txn_destroy(txn);	/* reserved, unused */
+			ft_flip_txn_destroy(txn);	/* reserved, unused */
 		*oom = true;
 		return;
 	}
