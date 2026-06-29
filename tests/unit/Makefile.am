@@ -23,7 +23,6 @@ noinst_PROGRAMS = \
 	test_get_possible_cpus_array_len_cxx \
 	test_uatomic \
 	test_uatomic_cxx \
-	test_flip_latch \
 	test_urcu_ft_unit \
 	test_urcu_ft_unit_cxx \
 	test_rcu_txn_sw \
@@ -73,7 +72,6 @@ TESTS = \
 	test_get_possible_cpus_array_len_cxx \
 	test_uatomic \
 	test_uatomic_cxx \
-	test_flip_latch \
 	test_urcu_ft_unit \
 	test_urcu_ft_unit_cxx \
 	test_rcu_txn_sw \
@@ -139,9 +137,6 @@ test_get_possible_cpus_array_len_cxx_LDADD = $(TAP_LIB)
 
 test_uatomic_SOURCES = test_uatomic.c
 test_uatomic_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
-
-test_flip_latch_SOURCES = test_flip_latch.c
-test_flip_latch_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_uatomic_cxx_SOURCES = test_uatomic_cxx.cpp
 test_uatomic_cxx_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
