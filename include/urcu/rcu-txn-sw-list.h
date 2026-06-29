@@ -6,7 +6,7 @@
 #define _URCU_RCU_TXN_SW_LIST_H
 
 /*
- * rcu_bidir_list: a circular doubly-linked list whose forward AND backward
+ * rcu-txn-sw-list: a circular doubly-linked list whose forward AND backward
  * chains stay mutually coherent under concurrent RCU readers, so a reader
  * may iterate in either direction -- or reverse direction mid-traversal --
  * and never observe the two directions disagree.
@@ -33,8 +33,8 @@
  *   insert E between P and N:   P->next: N -> E   and   N->prev: P -> E
  *   delete E between P and N:   P->next: E -> N   and   N->prev: E -> P
  *
- * rcu_bidir_list flips both edges as ONE atomic event using the flip-latch
- * proxy mechanism (<urcu/rcu-txn-sw.h>): the two slots transiently hold
+ * rcu-txn-sw-list flips both edges as ONE atomic event using the proxy-flip
+ * mechanism of <urcu/rcu-txn-sw.h>: the two slots transiently hold
  * tagged proxies that share a single selector word; one release store flips
  * the selector and switches both edges from old to new together.  So at
  * every instant the forward and backward chains describe the same list.
@@ -230,8 +230,8 @@ int urcu_txn_sw_list_flip2(
  * e.g. publish a node into a trie and splice it into this list atomically.
  * Mirrors urcu_txn_list_insert_after_prepare(); under a single updater
  * there is no concurrent deletion, so it always succeeds (returns 0).  The int
- * return matches the lock-free variant so callers share one shape across the
- * single-updater -> lock-free transition.  @txn must be init'd with
+ * return matches the concurrent variant so callers share one shape across the
+ * single-updater -> concurrent transition.  @txn must be init'd with
  * urcu_txn_sw_list_proxy_tag so the list's reader accessors resolve the proxy.
  */
 static inline

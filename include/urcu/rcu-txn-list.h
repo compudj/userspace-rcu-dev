@@ -6,15 +6,15 @@
 #define _URCU_RCU_TXN_LIST_H
 
 /*
- * rcu-bidir-list-lockfree: a bidirectional, coherent RCU list with LOCK-FREE
- * concurrent writers, built on the lock-free flip-latch MCAS engine
- * (<urcu/rcu-mcas.h>).  It is the concurrent-writer sibling of
+ * rcu-txn-list: a bidirectional, coherent RCU list with concurrent writers,
+ * built on the RCU MCAS engine (<urcu/rcu-mcas.h>).  It is the
+ * concurrent-writer sibling of
  * <urcu/rcu-txn-sw-list.h> (which requires writer mutual exclusion).
  *
  * Like the single-writer version, every structural change flips both
  * reader-visible edges -- forward and backward -- as ONE atomic event, so the
  * two directions never disagree.  Here that atomic event is an MCAS commit, and
- * multiple writers may run concurrently with guaranteed system-wide progress.
+ * multiple writers may run concurrently with bounded-blocking progress.
  *
  * Logical deletion (anchor invalidation)
  * --------------------------------------
@@ -98,7 +98,7 @@
  * through the list head's escalation domain, so a mutator repeatedly bypassed
  * on the optimistic path escalates into the domain's fair lane and commits
  * within a bounded number of retries -- the list is starvation-resistant, not
- * merely lock-free.
+ * merely livelock-free.
  */
 
 #include <errno.h>
@@ -123,7 +123,7 @@ struct urcu_txn_list_node {
 
 /*
  * A list is its circular sentinel node plus the per-list escalation domain that
- * the lock-free transaction front-end funnels starved or oversized mutators
+ * the concurrent transaction front-end funnels starved or oversized mutators
  * through (see <urcu/rcu-txn.h>).  The domain lives here, once
  * per list, which is why the mutators below take the head: an element is
  * reached only via its list, and a mutator needs that list's domain to stay
