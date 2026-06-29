@@ -46,7 +46,7 @@
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
 #include <urcu/rcu-txn.h>
-#include <urcu/rcu-bidir-list-lockfree.h>
+#include <urcu/rcu-txn-list.h>
 
 #include "tap.h"
 
@@ -68,15 +68,15 @@
 #define NR_TESTS		5
 
 struct leaf {
-	struct cds_bidir_list_lf_node hx;	/* hook in list X */
-	struct cds_bidir_list_lf_node hy;	/* hook in list Y */
+	struct urcu_txn_list_node hx;	/* hook in list X */
+	struct urcu_txn_list_node hy;	/* hook in list Y */
 	struct rcu_head rcu;
 	int is_anchor;
 	int seen_x, seen_y;			/* set by the final verify walk */
 };
 
 /* Two lists plus one shared escalation lane: a composed txn spans both lists. */
-static struct cds_bidir_list_lf_head g_X, g_Y;
+static struct urcu_txn_list_head g_X, g_Y;
 static struct urcu_txn_domain g_domain;
 static int g_stop;				/* signals the readers to finish */
 
@@ -89,10 +89,10 @@ static void free_leaf_cb(struct rcu_head *h)
 }
 
 /* Atomically link @nx after @px in X and @ny after @py in Y, in one MCAS. */
-static void compose_insert(struct cds_bidir_list_lf_node *nx,
-		struct cds_bidir_list_lf_node *px,
-		struct cds_bidir_list_lf_node *ny,
-		struct cds_bidir_list_lf_node *py)
+static void compose_insert(struct urcu_txn_list_node *nx,
+		struct urcu_txn_list_node *px,
+		struct urcu_txn_list_node *ny,
+		struct urcu_txn_list_node *py)
 {
 	struct urcu_mcas_txn tx;
 	enum urcu_txn_status st;
@@ -102,8 +102,8 @@ static void compose_insert(struct cds_bidir_list_lf_node *nx,
 		int a, b;
 
 		urcu_txn_begin(&tx);
-		a = cds_bidir_list_lf_insert_after_prepare(&tx, nx, px);
-		b = cds_bidir_list_lf_insert_after_prepare(&tx, ny, py);
+		a = urcu_txn_list_insert_after_prepare(&tx, nx, px);
+		b = urcu_txn_list_insert_after_prepare(&tx, ny, py);
 		if (a || b) {			/* -EAGAIN (neighbour moved): retry */
 			urcu_txn_conflict(&tx);	/* age so a hot slot escalates */
 			urcu_txn_end(&tx);
@@ -127,8 +127,8 @@ static int compose_del(struct leaf *lf)
 		int a, b;
 
 		urcu_txn_begin(&tx);
-		a = cds_bidir_list_lf_del_prepare(&tx, &lf->hx);
-		b = cds_bidir_list_lf_del_prepare(&tx, &lf->hy);
+		a = urcu_txn_list_del_prepare(&tx, &lf->hx);
+		b = urcu_txn_list_del_prepare(&tx, &lf->hy);
 		if (a == -EAGAIN || b == -EAGAIN) {	/* a neighbour moved: retry */
 			urcu_txn_conflict(&tx);	/* age so a hot slot escalates */
 			urcu_txn_end(&tx);
@@ -157,8 +157,8 @@ static int compose_replace(struct leaf *nw, struct leaf *old)
 		int a, b;
 
 		urcu_txn_begin(&tx);
-		a = cds_bidir_list_lf_replace_prepare(&tx, &nw->hx, &old->hx);
-		b = cds_bidir_list_lf_replace_prepare(&tx, &nw->hy, &old->hy);
+		a = urcu_txn_list_replace_prepare(&tx, &nw->hx, &old->hx);
+		b = urcu_txn_list_replace_prepare(&tx, &nw->hy, &old->hy);
 		if (a == -EAGAIN || b == -EAGAIN) {	/* a neighbour moved: retry */
 			urcu_txn_conflict(&tx);	/* age so a hot slot escalates */
 			urcu_txn_end(&tx);
@@ -177,19 +177,19 @@ static int compose_replace(struct leaf *nw, struct leaf *old)
 }
 
 /* Walk one list both directions just to drive proxy resolution under mutation. */
-static void walk_once(struct cds_bidir_list_lf_head *h)
+static void walk_once(struct urcu_txn_list_head *h)
 {
-	struct cds_bidir_list_lf_node *p;
+	struct urcu_txn_list_node *p;
 	long n = 0, lim = 4L * NR_NODES + 8;	/* loose bound vs a transient cycle */
 
 	rcu_read_lock();
-	for (p = cds_bidir_list_lf_next_rcu(&h->node);
+	for (p = urcu_txn_list_next_rcu(&h->node);
 			p != &h->node && n < lim;
-			p = cds_bidir_list_lf_next_rcu(p))
+			p = urcu_txn_list_next_rcu(p))
 		n++;
-	for (p = cds_bidir_list_lf_prev_rcu(&h->node);
+	for (p = urcu_txn_list_prev_rcu(&h->node);
 			p != &h->node && n < 2 * lim;
-			p = cds_bidir_list_lf_prev_rcu(p))
+			p = urcu_txn_list_prev_rcu(p))
 		n++;
 	rcu_read_unlock();
 }
@@ -210,7 +210,7 @@ static void *reader_fn(void *arg)
 static void *writer_fn(void *arg)
 {
 	long w = (long) arg;
-	struct cds_bidir_list_lf_node *ax = &g_anchor[w].hx, *ay = &g_anchor[w].hy;
+	struct urcu_txn_list_node *ax = &g_anchor[w].hx, *ay = &g_anchor[w].hy;
 	int r, k;
 
 	rcu_register_thread();
@@ -246,18 +246,18 @@ static void *writer_fn(void *arg)
 }
 
 /* Internally coherent: forward order is the exact reverse of backward order. */
-static int list_coherent(struct cds_bidir_list_lf_head *h, int expect)
+static int list_coherent(struct urcu_txn_list_head *h, int expect)
 {
-	struct cds_bidir_list_lf_node *fwd[NR_NODES + 2], *bwd[NR_NODES + 2], *p;
+	struct urcu_txn_list_node *fwd[NR_NODES + 2], *bwd[NR_NODES + 2], *p;
 	int nf = 0, nb = 0, i;
 
-	for (p = cds_bidir_list_lf_next_rcu(&h->node);
+	for (p = urcu_txn_list_next_rcu(&h->node);
 			p != &h->node && nf <= NR_NODES + 1;
-			p = cds_bidir_list_lf_next_rcu(p))
+			p = urcu_txn_list_next_rcu(p))
 		fwd[nf++] = p;
-	for (p = cds_bidir_list_lf_prev_rcu(&h->node);
+	for (p = urcu_txn_list_prev_rcu(&h->node);
 			p != &h->node && nb <= NR_NODES + 1;
-			p = cds_bidir_list_lf_prev_rcu(p))
+			p = urcu_txn_list_prev_rcu(p))
 		bwd[nb++] = p;
 	if (nf != expect || nb != expect)
 		return 0;
@@ -270,15 +270,15 @@ static int list_coherent(struct cds_bidir_list_lf_head *h, int expect)
 int main(void)
 {
 	pthread_t wt[NR_WRITERS], rt[NR_READERS];
-	struct cds_bidir_list_lf_node *p, *px, *py;
+	struct urcu_txn_list_node *p, *px, *py;
 	long i;
 	int cx = 0, cy = 0, all_both = 1, coh_x, coh_y;
 
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
 
-	cds_bidir_list_lf_init(&g_X);
-	cds_bidir_list_lf_init(&g_Y);
+	urcu_txn_list_init(&g_X);
+	urcu_txn_list_init(&g_Y);
 	urcu_txn_domain_init(&g_domain);
 
 	/* Lay down one permanent anchor per writer, chained in both lists. */
@@ -305,15 +305,15 @@ int main(void)
 
 	/* Cross-list atomicity: every keeper landed in BOTH lists, equal counts. */
 	rcu_read_lock();
-	for (p = cds_bidir_list_lf_next_rcu(&g_X.node); p != &g_X.node;
-			p = cds_bidir_list_lf_next_rcu(p)) {
+	for (p = urcu_txn_list_next_rcu(&g_X.node); p != &g_X.node;
+			p = urcu_txn_list_next_rcu(p)) {
 		struct leaf *lf = caa_container_of(p, struct leaf, hx);
 
 		if (!lf->is_anchor && ++cx <= NR_KEEPERS)
 			lf->seen_x = 1;
 	}
-	for (p = cds_bidir_list_lf_next_rcu(&g_Y.node); p != &g_Y.node;
-			p = cds_bidir_list_lf_next_rcu(p)) {
+	for (p = urcu_txn_list_next_rcu(&g_Y.node); p != &g_Y.node;
+			p = urcu_txn_list_next_rcu(p)) {
 		struct leaf *lf = caa_container_of(p, struct leaf, hy);
 
 		if (!lf->is_anchor && ++cy <= NR_KEEPERS)

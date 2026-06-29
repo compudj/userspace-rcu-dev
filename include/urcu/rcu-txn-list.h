@@ -2,14 +2,14 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-#ifndef _URCU_RCU_BIDIR_LIST_LOCKFREE_H
-#define _URCU_RCU_BIDIR_LIST_LOCKFREE_H
+#ifndef _URCU_RCU_TXN_LIST_H
+#define _URCU_RCU_TXN_LIST_H
 
 /*
  * rcu-bidir-list-lockfree: a bidirectional, coherent RCU list with LOCK-FREE
  * concurrent writers, built on the lock-free flip-latch MCAS engine
  * (<urcu/rcu-mcas.h>).  It is the concurrent-writer sibling of
- * <urcu/rcu-bidir-list.h> (which requires writer mutual exclusion).
+ * <urcu/rcu-txn-sw-list.h> (which requires writer mutual exclusion).
  *
  * Like the single-writer version, every structural change flips both
  * reader-visible edges -- forward and backward -- as ONE atomic event, so the
@@ -117,8 +117,8 @@
 extern "C" {
 #endif
 
-struct cds_bidir_list_lf_node {
-	struct cds_bidir_list_lf_node *next, *prev;
+struct urcu_txn_list_node {
+	struct urcu_txn_list_node *next, *prev;
 };
 
 /*
@@ -130,16 +130,16 @@ struct cds_bidir_list_lf_node {
  * starvation-resistant under adversarial contention.
  *
  * The domain wraps a fair mutex with no static initializer, so a head must be
- * initialized at runtime with cds_bidir_list_lf_init() -- there is no static
+ * initialized at runtime with urcu_txn_list_init() -- there is no static
  * HEAD_INIT form.
  */
-struct cds_bidir_list_lf_head {
-	struct cds_bidir_list_lf_node node;	/* circular sentinel */
+struct urcu_txn_list_head {
+	struct urcu_txn_list_node node;	/* circular sentinel */
 	struct urcu_txn_domain domain;	/* shared escalation domain */
 };
 
 static inline
-void cds_bidir_list_lf_init(struct cds_bidir_list_lf_head *head)
+void urcu_txn_list_init(struct urcu_txn_list_head *head)
 {
 	head->node.next = &head->node;
 	head->node.prev = &head->node;
@@ -147,25 +147,25 @@ void cds_bidir_list_lf_init(struct cds_bidir_list_lf_head *head)
 }
 
 /* Logical-deletion mark: bit 1 of a node's next pointer. */
-#define CDS_BIDIR_LIST_LF_MARK	2UL
+#define URCU_TXN_LIST_MARK	2UL
 
 static inline
-void *cds_bidir_list_lf_set_mark(struct cds_bidir_list_lf_node *n)
+void *urcu_txn_list_set_mark(struct urcu_txn_list_node *n)
 {
-	return (void *) ((uintptr_t) n | CDS_BIDIR_LIST_LF_MARK);
+	return (void *) ((uintptr_t) n | URCU_TXN_LIST_MARK);
 }
 
 static inline
-int cds_bidir_list_lf_is_marked(void *v)
+int urcu_txn_list_is_marked(void *v)
 {
-	return (int) ((uintptr_t) v & CDS_BIDIR_LIST_LF_MARK);
+	return (int) ((uintptr_t) v & URCU_TXN_LIST_MARK);
 }
 
 static inline
-struct cds_bidir_list_lf_node *cds_bidir_list_lf_unmark(void *v)
+struct urcu_txn_list_node *urcu_txn_list_unmark(void *v)
 {
-	return (struct cds_bidir_list_lf_node *)
-			((uintptr_t) v & ~(uintptr_t) CDS_BIDIR_LIST_LF_MARK);
+	return (struct urcu_txn_list_node *)
+			((uintptr_t) v & ~(uintptr_t) URCU_TXN_LIST_MARK);
 }
 
 /*
@@ -180,38 +180,38 @@ struct cds_bidir_list_lf_node *cds_bidir_list_lf_unmark(void *v)
  * revisit it if more tag bits are ever added.
  */
 static inline
-struct cds_bidir_list_lf_node *cds_bidir_list_lf_resolve(void *raw)
+struct urcu_txn_list_node *urcu_txn_list_resolve(void *raw)
 {
 	uintptr_t v = (uintptr_t) raw;
 
-	if (caa_unlikely(v & (URCU_MCAS_TAG | CDS_BIDIR_LIST_LF_MARK)))
-		return cds_bidir_list_lf_unmark(urcu_mcas_resolve(raw));
-	return (struct cds_bidir_list_lf_node *) raw;
+	if (caa_unlikely(v & (URCU_MCAS_TAG | URCU_TXN_LIST_MARK)))
+		return urcu_txn_list_unmark(urcu_mcas_resolve(raw));
+	return (struct urcu_txn_list_node *) raw;
 }
 
 /* Resolved forward / backward step (call within an RCU read-side section). */
 static inline
-struct cds_bidir_list_lf_node *cds_bidir_list_lf_next_rcu(
-		struct cds_bidir_list_lf_node *node)
+struct urcu_txn_list_node *urcu_txn_list_next_rcu(
+		struct urcu_txn_list_node *node)
 {
-	return cds_bidir_list_lf_resolve((void *) rcu_dereference(node->next));
+	return urcu_txn_list_resolve((void *) rcu_dereference(node->next));
 }
 
 static inline
-struct cds_bidir_list_lf_node *cds_bidir_list_lf_prev_rcu(
-		struct cds_bidir_list_lf_node *node)
+struct urcu_txn_list_node *urcu_txn_list_prev_rcu(
+		struct urcu_txn_list_node *node)
 {
-	return cds_bidir_list_lf_resolve((void *) rcu_dereference(node->prev));
+	return urcu_txn_list_resolve((void *) rcu_dereference(node->prev));
 }
 
 static inline
-int cds_bidir_list_lf_empty(struct cds_bidir_list_lf_head *head)
+int urcu_txn_list_empty(struct urcu_txn_list_head *head)
 {
-	return cds_bidir_list_lf_next_rcu(&head->node) == &head->node;
+	return urcu_txn_list_next_rcu(&head->node) == &head->node;
 }
 
 /*
- * cds_bidir_list_lf_insert_after_prepare: record the edges of an insert-after
+ * urcu_txn_list_insert_after_prepare: record the edges of an insert-after
  * into the caller-owned transaction @txn, WITHOUT committing.  This is the
  * composable form: the caller owns the bracket (begin .. commit .. end), the
  * escalation domain (whichever @txn was init'd with), and the retry loop, and
@@ -224,16 +224,16 @@ int cds_bidir_list_lf_empty(struct cds_bidir_list_lf_head *head)
  * by the caller's RCU read-side section (see the contract above).
  */
 static inline
-int cds_bidir_list_lf_insert_after_prepare(struct urcu_mcas_txn *txn,
-		struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *pos)
+int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos)
 {
 	void *pn = urcu_txn_load(txn, (void **) &pos->next);
-	struct cds_bidir_list_lf_node *succ;
+	struct urcu_txn_list_node *succ;
 
-	if (cds_bidir_list_lf_is_marked(pn))
+	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;				/* @pos was deleted */
-	succ = (struct cds_bidir_list_lf_node *) pn;	/* unmarked successor */
+	succ = (struct urcu_txn_list_node *) pn;	/* unmarked successor */
 
 	/*
 	 * We write &succ->prev but NOT &succ->next.  The next slot that serializes
@@ -245,7 +245,7 @@ int cds_bidir_list_lf_insert_after_prepare(struct urcu_mcas_txn *txn,
 	 * marks -- into the write-set, so the prev side serializes against
 	 * del(succ) exactly as the next side does; a marked succ aborts here.
 	 */
-	if (cds_bidir_list_lf_is_marked(urcu_txn_load_validate(txn,
+	if (urcu_txn_list_is_marked(urcu_txn_load_validate(txn,
 			(void **) &succ->next)))
 		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
 
@@ -271,12 +271,12 @@ int cds_bidir_list_lf_insert_after_prepare(struct urcu_mcas_txn *txn,
  * -ENOENT if @pos has been deleted, -ENOMEM on descriptor allocation failure.
  * @head supplies the list's escalation domain (see the contract above).  This
  * is the self-contained convenience form: a thin bracket around
- * cds_bidir_list_lf_insert_after_prepare().
+ * urcu_txn_list_insert_after_prepare().
  */
 static inline
-int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *pos,
-		struct cds_bidir_list_lf_head *head)
+int urcu_txn_list_insert_after_rcu(struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos,
+		struct urcu_txn_list_head *head)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
@@ -284,7 +284,7 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
 	urcu_txn_init(&txn, &head->domain);
 	for (;;) {
 		urcu_txn_begin(&txn);
-		prep = cds_bidir_list_lf_insert_after_prepare(&txn, newp, pos);
+		prep = urcu_txn_list_insert_after_prepare(&txn, newp, pos);
 		if (prep == -EAGAIN) {			/* succ (a neighbour) moved: retry */
 			urcu_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_txn_end(&txn);
@@ -317,10 +317,10 @@ int cds_bidir_list_lf_insert_after_rcu(struct cds_bidir_list_lf_node *newp,
  * or @guard_slot no longer holds @guard_expected; -ENOMEM on descriptor OOM.
  */
 static inline
-int cds_bidir_list_lf_insert_after_guarded_rcu(
-		struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *pos,
-		struct cds_bidir_list_lf_head *head,
+int urcu_txn_list_insert_after_guarded_rcu(
+		struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos,
+		struct urcu_txn_list_head *head,
 		void **guard_slot, void *guard_expected)
 {
 	struct urcu_mcas_txn txn;
@@ -329,11 +329,11 @@ int cds_bidir_list_lf_insert_after_guarded_rcu(
 	urcu_txn_init(&txn, &head->domain);
 	for (;;) {
 		void *pn;
-		struct cds_bidir_list_lf_node *succ;
+		struct urcu_txn_list_node *succ;
 
 		urcu_txn_begin(&txn);
 		pn = urcu_txn_load(&txn, (void **) &pos->next);
-		if (cds_bidir_list_lf_is_marked(pn)) {
+		if (urcu_txn_list_is_marked(pn)) {
 			urcu_txn_end(&txn);
 			return -ENOENT;			/* @pos was deleted */
 		}
@@ -348,14 +348,14 @@ int cds_bidir_list_lf_insert_after_guarded_rcu(
 			urcu_txn_end(&txn);
 			return -ENOENT;			/* guard no longer holds */
 		}
-		succ = (struct cds_bidir_list_lf_node *) pn;
+		succ = (struct urcu_txn_list_node *) pn;
 		/*
 		 * Guard succ->next: we write &succ->prev but not &succ->next, so the
 		 * prev-side store must serialize against del(succ) -- the slot-sorted
 		 * install may reach &succ->prev before &pos->next.  See
 		 * insert_after_prepare.  A marked succ moved: retry.
 		 */
-		if (cds_bidir_list_lf_is_marked(urcu_txn_load_validate(
+		if (urcu_txn_list_is_marked(urcu_txn_load_validate(
 				&txn, (void **) &succ->next))) {
 			urcu_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_txn_end(&txn);
@@ -374,15 +374,15 @@ int cds_bidir_list_lf_insert_after_guarded_rcu(
 }
 
 /*
- * cds_bidir_list_lf_insert_before_prepare: record the edges of an
+ * urcu_txn_list_insert_before_prepare: record the edges of an
  * insert-before into the caller-owned transaction @txn, WITHOUT committing.
  * Composable form of insert_before (see insert_after_prepare for the contract).
  * Returns 0, or -ENOENT if @pos has been deleted; OOM is sticky to the commit.
  */
 static inline
-int cds_bidir_list_lf_insert_before_prepare(struct urcu_mcas_txn *txn,
-		struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *pos)
+int urcu_txn_list_insert_before_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos)
 {
 	/*
 	 * We write &pos->prev but not &pos->next.  Load-validate pos->next (@pos
@@ -391,11 +391,11 @@ int cds_bidir_list_lf_insert_before_prepare(struct urcu_mcas_txn *txn,
 	 * &pos->prev first.  A marked pos => the anchor is gone (-ENOENT).
 	 */
 	void *pn = urcu_txn_load_validate(txn, (void **) &pos->next);
-	struct cds_bidir_list_lf_node *prev;
+	struct urcu_txn_list_node *prev;
 
-	if (cds_bidir_list_lf_is_marked(pn))
+	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;			/* @pos was deleted */
-	prev = cds_bidir_list_lf_unmark(
+	prev = urcu_txn_list_unmark(
 			urcu_txn_load(txn, (void **) &pos->prev));
 
 	newp->next = pos;
@@ -416,12 +416,12 @@ int cds_bidir_list_lf_insert_before_prepare(struct urcu_mcas_txn *txn,
 /*
  * Insert @newp immediately before @pos in list @head.  Returns 0 / -ENOENT /
  * -ENOMEM as for insert_after.  Convenience bracket around
- * cds_bidir_list_lf_insert_before_prepare().
+ * urcu_txn_list_insert_before_prepare().
  */
 static inline
-int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *pos,
-		struct cds_bidir_list_lf_head *head)
+int urcu_txn_list_insert_before_rcu(struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos,
+		struct urcu_txn_list_head *head)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
@@ -429,7 +429,7 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
 	urcu_txn_init(&txn, &head->domain);
 	do {
 		urcu_txn_begin(&txn);
-		prep = cds_bidir_list_lf_insert_before_prepare(&txn, newp, pos);
+		prep = urcu_txn_list_insert_before_prepare(&txn, newp, pos);
 		if (prep) {				/* -ENOENT: @pos deleted */
 			urcu_txn_end(&txn);
 			return prep;
@@ -446,10 +446,10 @@ int cds_bidir_list_lf_insert_before_rcu(struct cds_bidir_list_lf_node *newp,
  * -ENOMEM on descriptor allocation failure (never -ENOENT).
  */
 static inline
-int cds_bidir_list_lf_add_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_head *head)
+int urcu_txn_list_add_rcu(struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_head *head)
 {
-	return cds_bidir_list_lf_insert_after_rcu(newp, &head->node, head);
+	return urcu_txn_list_insert_after_rcu(newp, &head->node, head);
 }
 
 /*
@@ -457,14 +457,14 @@ int cds_bidir_list_lf_add_rcu(struct cds_bidir_list_lf_node *newp,
  * or -ENOMEM on descriptor allocation failure (never -ENOENT).
  */
 static inline
-int cds_bidir_list_lf_add_tail_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_head *head)
+int urcu_txn_list_add_tail_rcu(struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_head *head)
 {
-	return cds_bidir_list_lf_insert_before_rcu(newp, &head->node, head);
+	return urcu_txn_list_insert_before_rcu(newp, &head->node, head);
 }
 
 /*
- * cds_bidir_list_lf_del_prepare: record the unlink of @elem into the
+ * urcu_txn_list_del_prepare: record the unlink of @elem into the
  * caller-owned transaction @txn, WITHOUT committing.  Composable form of del
  * (see insert_after_prepare for the contract).  Returns 0 if the unlink was
  * recorded (when the caller's commit then returns OK, THIS call removed @elem
@@ -473,16 +473,16 @@ int cds_bidir_list_lf_add_tail_rcu(struct cds_bidir_list_lf_node *newp,
  * OOM is sticky to the commit.
  */
 static inline
-int cds_bidir_list_lf_del_prepare(struct urcu_mcas_txn *txn,
-		struct cds_bidir_list_lf_node *elem)
+int urcu_txn_list_del_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_list_node *elem)
 {
 	void *en = urcu_txn_load(txn, (void **) &elem->next);
-	struct cds_bidir_list_lf_node *next, *prev;
+	struct urcu_txn_list_node *next, *prev;
 
-	if (cds_bidir_list_lf_is_marked(en))
+	if (urcu_txn_list_is_marked(en))
 		return -ENOENT;			/* already deleted by a peer */
-	next = (struct cds_bidir_list_lf_node *) en;
-	prev = cds_bidir_list_lf_unmark(
+	next = (struct urcu_txn_list_node *) en;
+	prev = urcu_txn_list_unmark(
 			urcu_txn_load(txn, (void **) &elem->prev));
 
 	/*
@@ -502,7 +502,7 @@ int cds_bidir_list_lf_del_prepare(struct urcu_mcas_txn *txn,
 	 * a corrupt edge (a marked-but-still-linked node).
 	 */
 	if (next != prev &&
-			cds_bidir_list_lf_is_marked(urcu_txn_load_validate(
+			urcu_txn_list_is_marked(urcu_txn_load_validate(
 				txn, (void **) &next->next)))
 		return -EAGAIN;			/* successor (a neighbour) deleted: retry */
 
@@ -516,7 +516,7 @@ int cds_bidir_list_lf_del_prepare(struct urcu_mcas_txn *txn,
 	 * mark rationale at the top of this file.
 	 */
 	urcu_txn_store(txn, (void **) &elem->next, next,
-			cds_bidir_list_lf_set_mark(next));
+			urcu_txn_list_set_mark(next));
 	urcu_txn_store(txn, (void **) &prev->next, elem, next);
 	urcu_txn_store(txn, (void **) &next->prev, elem, prev);
 	return 0;
@@ -526,11 +526,11 @@ int cds_bidir_list_lf_del_prepare(struct urcu_mcas_txn *txn,
  * Remove @elem from list @head.  Returns 1 if THIS call removed it (the caller
  * reclaims @elem after a grace period), 0 if it was already deleted (the caller
  * must NOT reclaim), or -ENOMEM on descriptor allocation failure.  Convenience
- * bracket around cds_bidir_list_lf_del_prepare().
+ * bracket around urcu_txn_list_del_prepare().
  */
 static inline
-int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
-		struct cds_bidir_list_lf_head *head)
+int urcu_txn_list_del_rcu(struct urcu_txn_list_node *elem,
+		struct urcu_txn_list_head *head)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
@@ -538,7 +538,7 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
 	urcu_txn_init(&txn, &head->domain);
 	for (;;) {
 		urcu_txn_begin(&txn);
-		prep = cds_bidir_list_lf_del_prepare(&txn, elem);
+		prep = urcu_txn_list_del_prepare(&txn, elem);
 		if (prep == -EAGAIN) {			/* successor moved: retry */
 			urcu_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_txn_end(&txn);
@@ -557,7 +557,7 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
 }
 
 /*
- * cds_bidir_list_lf_replace_prepare: record the in-place replacement of @old by
+ * urcu_txn_list_replace_prepare: record the in-place replacement of @old by
  * @newp into the caller-owned transaction @txn, WITHOUT committing.  Composable
  * form of replace (see insert_after_prepare for the contract).  @newp takes
  * @old's position -- &prev->next and &next->prev swing to @newp -- while @old is
@@ -573,17 +573,17 @@ int cds_bidir_list_lf_del_rcu(struct cds_bidir_list_lf_node *elem,
  * mid-deletion (retry).  OOM is sticky to the commit.
  */
 static inline
-int cds_bidir_list_lf_replace_prepare(struct urcu_mcas_txn *txn,
-		struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *old)
+int urcu_txn_list_replace_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *old)
 {
 	void *en = urcu_txn_load(txn, (void **) &old->next);
-	struct cds_bidir_list_lf_node *next, *prev;
+	struct urcu_txn_list_node *next, *prev;
 
-	if (cds_bidir_list_lf_is_marked(en))
+	if (urcu_txn_list_is_marked(en))
 		return -ENOENT;			/* @old already deleted/replaced by a peer */
-	next = (struct cds_bidir_list_lf_node *) en;
-	prev = cds_bidir_list_lf_unmark(
+	next = (struct urcu_txn_list_node *) en;
+	prev = urcu_txn_list_unmark(
 			urcu_txn_load(txn, (void **) &old->prev));
 
 	/*
@@ -596,7 +596,7 @@ int cds_bidir_list_lf_replace_prepare(struct urcu_mcas_txn *txn,
 	 * del_prepare).
 	 */
 	if (next != prev &&
-			cds_bidir_list_lf_is_marked(urcu_txn_load_validate(
+			urcu_txn_list_is_marked(urcu_txn_load_validate(
 				txn, (void **) &next->next)))
 		return -EAGAIN;			/* successor (a neighbour) deleted: retry */
 
@@ -613,7 +613,7 @@ int cds_bidir_list_lf_replace_prepare(struct urcu_mcas_txn *txn,
 	 * the top of this file.
 	 */
 	urcu_txn_store(txn, (void **) &old->next, next,
-			cds_bidir_list_lf_set_mark(next));
+			urcu_txn_list_set_mark(next));
 	urcu_txn_store(txn, (void **) &prev->next, old, newp);
 	urcu_txn_store(txn, (void **) &next->prev, old, newp);
 	return 0;
@@ -623,12 +623,12 @@ int cds_bidir_list_lf_replace_prepare(struct urcu_mcas_txn *txn,
  * Replace @old with @newp atomically with respect to RCU readers.  Returns 0 on
  * success (the caller reclaims @old after a grace period), -ENOENT if @old was
  * already deleted/replaced, or -ENOMEM on descriptor allocation failure.
- * Convenience bracket around cds_bidir_list_lf_replace_prepare().
+ * Convenience bracket around urcu_txn_list_replace_prepare().
  */
 static inline
-int cds_bidir_list_lf_replace_rcu(struct cds_bidir_list_lf_node *newp,
-		struct cds_bidir_list_lf_node *old,
-		struct cds_bidir_list_lf_head *head)
+int urcu_txn_list_replace_rcu(struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *old,
+		struct urcu_txn_list_head *head)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
@@ -636,7 +636,7 @@ int cds_bidir_list_lf_replace_rcu(struct cds_bidir_list_lf_node *newp,
 	urcu_txn_init(&txn, &head->domain);
 	for (;;) {
 		urcu_txn_begin(&txn);
-		prep = cds_bidir_list_lf_replace_prepare(&txn, newp, old);
+		prep = urcu_txn_list_replace_prepare(&txn, newp, old);
 		if (prep == -EAGAIN) {			/* a neighbour moved: retry */
 			urcu_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_txn_end(&txn);
@@ -654,40 +654,40 @@ int cds_bidir_list_lf_replace_rcu(struct cds_bidir_list_lf_node *newp,
 	return ret < 0 ? -ENOMEM : 0;		/* 0 replaced (reclaim @old after GP), -ENOMEM */
 }
 
-#define cds_bidir_list_lf_entry(ptr, type, member) \
+#define urcu_txn_list_entry(ptr, type, member) \
 	caa_container_of(ptr, type, member)
 
 /* Iterate forward / backward (within an RCU read-side section). */
-#define cds_bidir_list_lf_for_each_rcu(pos, head) \
-	for (pos = cds_bidir_list_lf_next_rcu(&(head)->node); \
+#define urcu_txn_list_for_each_rcu(pos, head) \
+	for (pos = urcu_txn_list_next_rcu(&(head)->node); \
 		(pos) != &(head)->node; \
-		pos = cds_bidir_list_lf_next_rcu(pos))
+		pos = urcu_txn_list_next_rcu(pos))
 
-#define cds_bidir_list_lf_for_each_reverse_rcu(pos, head) \
-	for (pos = cds_bidir_list_lf_prev_rcu(&(head)->node); \
+#define urcu_txn_list_for_each_reverse_rcu(pos, head) \
+	for (pos = urcu_txn_list_prev_rcu(&(head)->node); \
 		(pos) != &(head)->node; \
-		pos = cds_bidir_list_lf_prev_rcu(pos))
+		pos = urcu_txn_list_prev_rcu(pos))
 
-#define cds_bidir_list_lf_for_each_entry_rcu(pos, head, member) \
-	for (pos = cds_bidir_list_lf_entry( \
-			cds_bidir_list_lf_next_rcu(&(head)->node), \
+#define urcu_txn_list_for_each_entry_rcu(pos, head, member) \
+	for (pos = urcu_txn_list_entry( \
+			urcu_txn_list_next_rcu(&(head)->node), \
 			__typeof__(*(pos)), member); \
 		&(pos)->member != &(head)->node; \
-		pos = cds_bidir_list_lf_entry( \
-			cds_bidir_list_lf_next_rcu(&(pos)->member), \
+		pos = urcu_txn_list_entry( \
+			urcu_txn_list_next_rcu(&(pos)->member), \
 			__typeof__(*(pos)), member))
 
-#define cds_bidir_list_lf_for_each_entry_reverse_rcu(pos, head, member) \
-	for (pos = cds_bidir_list_lf_entry( \
-			cds_bidir_list_lf_prev_rcu(&(head)->node), \
+#define urcu_txn_list_for_each_entry_reverse_rcu(pos, head, member) \
+	for (pos = urcu_txn_list_entry( \
+			urcu_txn_list_prev_rcu(&(head)->node), \
 			__typeof__(*(pos)), member); \
 		&(pos)->member != &(head)->node; \
-		pos = cds_bidir_list_lf_entry( \
-			cds_bidir_list_lf_prev_rcu(&(pos)->member), \
+		pos = urcu_txn_list_entry( \
+			urcu_txn_list_prev_rcu(&(pos)->member), \
 			__typeof__(*(pos)), member))
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif	/* _URCU_RCU_BIDIR_LIST_LOCKFREE_H */
+#endif	/* _URCU_RCU_TXN_LIST_H */

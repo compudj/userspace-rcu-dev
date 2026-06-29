@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Deterministic unit tests for <urcu/rcu-bidir-list.h>, the bidirectional
+ * Deterministic unit tests for <urcu/rcu-txn-sw-list.h>, the bidirectional
  * RCU list.  Validates that:
  *   - forward and reverse iteration are exact mirrors;
  *   - next/prev are mutual inverses around the whole ring (coherence);
@@ -25,14 +25,14 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-bidir-list.h>
+#include <urcu/rcu-txn-sw-list.h>
 
 #include "tap.h"
 
 #define NR_TESTS	22
 
 struct bl_node {
-	struct cds_bidir_list_head node;
+	struct urcu_txn_sw_list_head node;
 	struct rcu_head rcu_head;
 	int key;
 };
@@ -53,13 +53,13 @@ static struct bl_node *bl_node_new(int key)
 }
 
 /* Collect forward keys.  Returns count, fills buf (up to max). */
-static int collect_forward(struct cds_bidir_list_head *head, int *buf, int max)
+static int collect_forward(struct urcu_txn_sw_list_head *head, int *buf, int max)
 {
-	struct cds_bidir_list_head *p;
+	struct urcu_txn_sw_list_head *p;
 	int n = 0;
 
 	rcu_read_lock();
-	cds_bidir_list_for_each_rcu(p, head) {
+	urcu_txn_sw_list_for_each_rcu(p, head) {
 		if (n < max)
 			buf[n] = caa_container_of(p, struct bl_node, node)->key;
 		n++;
@@ -68,13 +68,13 @@ static int collect_forward(struct cds_bidir_list_head *head, int *buf, int max)
 	return n;
 }
 
-static int collect_reverse(struct cds_bidir_list_head *head, int *buf, int max)
+static int collect_reverse(struct urcu_txn_sw_list_head *head, int *buf, int max)
 {
-	struct cds_bidir_list_head *p;
+	struct urcu_txn_sw_list_head *p;
 	int n = 0;
 
 	rcu_read_lock();
-	cds_bidir_list_for_each_reverse_rcu(p, head) {
+	urcu_txn_sw_list_for_each_reverse_rcu(p, head) {
 		if (n < max)
 			buf[n] = caa_container_of(p, struct bl_node, node)->key;
 		n++;
@@ -92,15 +92,15 @@ static int arr_eq(const int *a, const int *b, int n)
  * Walk the whole ring (sentinel included) and verify next/prev are mutual
  * inverses at every edge: next_rcu(p) == q  implies  prev_rcu(q) == p.
  */
-static int check_inverses(struct cds_bidir_list_head *head)
+static int check_inverses(struct urcu_txn_sw_list_head *head)
 {
-	struct cds_bidir_list_head *p, *q;
+	struct urcu_txn_sw_list_head *p, *q;
 	int ok = 1;
 
 	rcu_read_lock();
 	for (p = head; ; p = q) {
-		q = cds_bidir_list_next_rcu(p);
-		if (cds_bidir_list_prev_rcu(q) != p) {
+		q = urcu_txn_sw_list_next_rcu(p);
+		if (urcu_txn_sw_list_prev_rcu(q) != p) {
 			ok = 0;
 			break;
 		}
@@ -112,12 +112,12 @@ static int check_inverses(struct cds_bidir_list_head *head)
 }
 
 /* Find the node holding @key (single-threaded helper). */
-static struct cds_bidir_list_head *find_key(struct cds_bidir_list_head *head,
+static struct urcu_txn_sw_list_head *find_key(struct urcu_txn_sw_list_head *head,
 		int key)
 {
-	struct cds_bidir_list_head *p;
+	struct urcu_txn_sw_list_head *p;
 
-	cds_bidir_list_for_each_rcu(p, head) {
+	urcu_txn_sw_list_for_each_rcu(p, head) {
 		if (caa_container_of(p, struct bl_node, node)->key == key)
 			return p;
 	}
@@ -125,36 +125,36 @@ static struct cds_bidir_list_head *find_key(struct cds_bidir_list_head *head,
 }
 
 /* Delete every node and reclaim it. */
-static void destroy_list(struct cds_bidir_list_head *head)
+static void destroy_list(struct urcu_txn_sw_list_head *head)
 {
-	while (!cds_bidir_list_empty(head)) {
-		struct cds_bidir_list_head *p = cds_bidir_list_next_rcu(head);
+	while (!urcu_txn_sw_list_empty(head)) {
+		struct urcu_txn_sw_list_head *p = urcu_txn_sw_list_next_rcu(head);
 		struct bl_node *n = caa_container_of(p, struct bl_node, node);
 
-		cds_bidir_list_del_rcu(p);
+		urcu_txn_sw_list_del_rcu(p);
 		call_rcu(&n->rcu_head, bl_node_free);
 	}
 }
 
 static void test_empty(void)
 {
-	CDS_BIDIR_LIST_HEAD(head);
+	URCU_TXN_SW_LIST_HEAD(head);
 	int buf[4];
 
-	ok(cds_bidir_list_empty(&head), "fresh list is empty");
+	ok(urcu_txn_sw_list_empty(&head), "fresh list is empty");
 	ok(collect_forward(&head, buf, 4) == 0, "empty: no forward elements");
 	ok(collect_reverse(&head, buf, 4) == 0, "empty: no reverse elements");
 }
 
 static void test_add_head(void)
 {
-	CDS_BIDIR_LIST_HEAD(head);
+	URCU_TXN_SW_LIST_HEAD(head);
 	int i, fwd[3], rev[3], n;
 	const int want_fwd[3] = { 3, 2, 1 };	/* head-add reverses input */
 	const int want_rev[3] = { 1, 2, 3 };
 
 	for (i = 1; i <= 3; i++)
-		cds_bidir_list_add_rcu(&bl_node_new(i)->node, &head);
+		urcu_txn_sw_list_add_rcu(&bl_node_new(i)->node, &head);
 
 	n = collect_forward(&head, fwd, 3);
 	ok(n == 3 && arr_eq(fwd, want_fwd, 3),
@@ -167,13 +167,13 @@ static void test_add_head(void)
 
 static void test_add_tail(void)
 {
-	CDS_BIDIR_LIST_HEAD(head);
+	URCU_TXN_SW_LIST_HEAD(head);
 	int i, fwd[3], rev[3], n;
 	const int want_fwd[3] = { 1, 2, 3 };
 	const int want_rev[3] = { 3, 2, 1 };
 
 	for (i = 1; i <= 3; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(i)->node, &head);
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(i)->node, &head);
 
 	n = collect_forward(&head, fwd, 3);
 	ok(n == 3 && arr_eq(fwd, want_fwd, 3),
@@ -186,12 +186,12 @@ static void test_add_tail(void)
 
 static void test_coherence(void)
 {
-	CDS_BIDIR_LIST_HEAD(head);
+	URCU_TXN_SW_LIST_HEAD(head);
 	const int keys[4] = { 10, 20, 30, 40 };
 	int i, fwd[4], rev[4], revmir[4], n;
 
 	for (i = 0; i < 4; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
 
 	ok(check_inverses(&head), "next/prev are mutual inverses around the ring");
 
@@ -206,19 +206,19 @@ static void test_coherence(void)
 
 static void test_del_middle(void)
 {
-	CDS_BIDIR_LIST_HEAD(head);
+	URCU_TXN_SW_LIST_HEAD(head);
 	const int keys[5] = { 1, 2, 3, 4, 5 };
 	const int want_fwd[4] = { 1, 2, 4, 5 };
 	const int want_rev[4] = { 5, 4, 2, 1 };
-	struct cds_bidir_list_head *mid;
+	struct urcu_txn_sw_list_head *mid;
 	struct bl_node *midn;
 	int i, fwd[4], rev[4], n;
 
 	for (i = 0; i < 5; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
 	mid = find_key(&head, 3);
 	midn = caa_container_of(mid, struct bl_node, node);
-	cds_bidir_list_del_rcu(mid);
+	urcu_txn_sw_list_del_rcu(mid);
 	call_rcu(&midn->rcu_head, bl_node_free);
 
 	n = collect_forward(&head, fwd, 4);
@@ -233,22 +233,22 @@ static void test_del_middle(void)
 
 static void test_del_ends(void)
 {
-	CDS_BIDIR_LIST_HEAD(head);
+	URCU_TXN_SW_LIST_HEAD(head);
 	const int keys[4] = { 1, 2, 3, 4 };
 	const int want_fwd[2] = { 2, 3 };
-	struct cds_bidir_list_head *p;
+	struct urcu_txn_sw_list_head *p;
 	struct bl_node *n;
 	int i, fwd[2], cnt;
 
 	for (i = 0; i < 4; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
 	p = find_key(&head, 1);				/* delete head element */
 	n = caa_container_of(p, struct bl_node, node);
-	cds_bidir_list_del_rcu(p);
+	urcu_txn_sw_list_del_rcu(p);
 	call_rcu(&n->rcu_head, bl_node_free);
 	p = find_key(&head, 4);				/* delete tail element */
 	n = caa_container_of(p, struct bl_node, node);
-	cds_bidir_list_del_rcu(p);
+	urcu_txn_sw_list_del_rcu(p);
 	call_rcu(&n->rcu_head, bl_node_free);
 
 	cnt = collect_forward(&head, fwd, 2);
@@ -260,19 +260,19 @@ static void test_del_ends(void)
 
 static void test_replace(void)
 {
-	CDS_BIDIR_LIST_HEAD(head);
+	URCU_TXN_SW_LIST_HEAD(head);
 	const int keys[3] = { 1, 2, 3 };
 	const int want_fwd[3] = { 1, 22, 3 };
 	const int want_rev[3] = { 3, 22, 1 };
-	struct cds_bidir_list_head *old;
+	struct urcu_txn_sw_list_head *old;
 	struct bl_node *oldn;
 	int i, fwd[3], rev[3], n;
 
 	for (i = 0; i < 3; i++)
-		cds_bidir_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
 	old = find_key(&head, 2);
 	oldn = caa_container_of(old, struct bl_node, node);
-	cds_bidir_list_replace_rcu(old, &bl_node_new(22)->node);
+	urcu_txn_sw_list_replace_rcu(old, &bl_node_new(22)->node);
 	call_rcu(&oldn->rcu_head, bl_node_free);
 
 	n = collect_forward(&head, fwd, 3);
@@ -288,7 +288,7 @@ static void test_replace(void)
 /*
  * Drive the two-edge flip of a delete by hand and observe the reader's
  * resolution across the install -> commit -> settle phases.  This is the
- * exact view a concurrent reader has of cds_bidir_list_del_rcu(): old in both
+ * exact view a concurrent reader has of urcu_txn_sw_list_del_rcu(): old in both
  * directions until the single selector flip, new in both directions after.
  *
  * Ring: head <-> A <-> B <-> head.  Delete A:
@@ -297,21 +297,21 @@ static void test_replace(void)
  */
 static void test_proxy_phases(void)
 {
-	CDS_BIDIR_LIST_HEAD(head);
+	URCU_TXN_SW_LIST_HEAD(head);
 	struct bl_node *a = bl_node_new(1);
 	struct bl_node *b = bl_node_new(2);
-	struct cds_bidir_list_head *A = &a->node, *B = &b->node;
+	struct urcu_txn_sw_list_head *A = &a->node, *B = &b->node;
 	struct urcu_txn_sw_txn _txn, *txn = &_txn;
 
-	cds_bidir_list_add_tail_rcu(A, &head);
-	cds_bidir_list_add_tail_rcu(B, &head);
+	urcu_txn_sw_list_add_tail_rcu(A, &head);
+	urcu_txn_sw_list_add_tail_rcu(B, &head);
 
 	/*
 	 * Delete A through the transaction by hand, pausing between the
 	 * explicit install and the commit to observe the reader's view of
 	 * each phase -- the same install -> commit -> settle the mutators run.
 	 */
-	urcu_txn_sw_init(txn, cds_bidir_list_proxy_tag);
+	urcu_txn_sw_init(txn, urcu_txn_sw_list_proxy_tag);
 	if (!urcu_txn_sw_reserve(txn, 2))
 		abort();
 	urcu_txn_sw_record(txn, (void **) &head.next, A, B);	/* head->next */
@@ -319,9 +319,9 @@ static void test_proxy_phases(void)
 	urcu_txn_sw_install(txn);		/* park proxies; selector 0 => old */
 
 	rcu_read_lock();
-	ok(cds_bidir_list_next_rcu(&head) == A,
+	ok(urcu_txn_sw_list_next_rcu(&head) == A,
 		"install: forward resolves to old (A still present)");
-	ok(cds_bidir_list_prev_rcu(B) == A,
+	ok(urcu_txn_sw_list_prev_rcu(B) == A,
 		"install: backward resolves to old (A still present)");
 	rcu_read_unlock();
 
@@ -329,9 +329,9 @@ static void test_proxy_phases(void)
 	(void) urcu_txn_sw_commit(txn);	/* one flip switches both edges */
 
 	rcu_read_lock();
-	ok(cds_bidir_list_next_rcu(&head) == B,
+	ok(urcu_txn_sw_list_next_rcu(&head) == B,
 		"commit: forward resolves to new (A removed)");
-	ok(cds_bidir_list_prev_rcu(B) == &head,
+	ok(urcu_txn_sw_list_prev_rcu(B) == &head,
 		"commit: backward resolves to new (A removed)");
 	rcu_read_unlock();
 

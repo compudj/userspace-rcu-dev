@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Concurrent stress test for <urcu/rcu-bidir-list.h>: one writer mutating a
+ * Concurrent stress test for <urcu/rcu-txn-sw-list.h>: one writer mutating a
  * key-sorted list while several readers iterate it forward AND backward.
  *
  * Invariant exploited (timing-independent): the writer keeps the list sorted
@@ -37,7 +37,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-bidir-list.h>
+#include <urcu/rcu-txn-sw-list.h>
 
 #include "tap.h"
 
@@ -48,12 +48,12 @@
 #define STEP_LIMIT	(KEY_MAX + 8)	/* runaway-walk guard */
 
 struct bl_node {
-	struct cds_bidir_list_head node;
+	struct urcu_txn_sw_list_head node;
 	struct rcu_head rcu_head;
 	int key;
 };
 
-static struct cds_bidir_list_head g_head = CDS_BIDIR_LIST_HEAD_INIT(g_head);
+static struct urcu_txn_sw_list_head g_head = URCU_TXN_SW_LIST_HEAD_INIT(g_head);
 static int g_stop;
 
 static void bl_node_free(struct rcu_head *head)
@@ -82,15 +82,15 @@ static void *reader_fn(void *arg)
 
 	rcu_register_thread();
 	while (!uatomic_load(&g_stop, CMM_RELAXED)) {
-		struct cds_bidir_list_head *p;
+		struct urcu_txn_sw_list_head *p;
 		int prev_key, steps;
 
 		/* Forward: strictly increasing keys, bounded, ends at head. */
 		rcu_read_lock();
 		prev_key = 0;
 		steps = 0;
-		for (p = cds_bidir_list_next_rcu(&g_head); p != &g_head;
-				p = cds_bidir_list_next_rcu(p)) {
+		for (p = urcu_txn_sw_list_next_rcu(&g_head); p != &g_head;
+				p = urcu_txn_sw_list_next_rcu(p)) {
 			int k = caa_container_of(p, struct bl_node, node)->key;
 
 			if (k < 1 || k > KEY_MAX || k <= prev_key ||
@@ -106,8 +106,8 @@ static void *reader_fn(void *arg)
 		rcu_read_lock();
 		prev_key = KEY_MAX + 1;
 		steps = 0;
-		for (p = cds_bidir_list_prev_rcu(&g_head); p != &g_head;
-				p = cds_bidir_list_prev_rcu(p)) {
+		for (p = urcu_txn_sw_list_prev_rcu(&g_head); p != &g_head;
+				p = urcu_txn_sw_list_prev_rcu(p)) {
 			int k = caa_container_of(p, struct bl_node, node)->key;
 
 			if (k < 1 || k > KEY_MAX || k >= prev_key ||
@@ -129,7 +129,7 @@ static void *reader_fn(void *arg)
 /* Insert @n keeping the list sorted; @slot tracks the live node per key. */
 static void sorted_insert(struct bl_node *n, struct bl_node **slot)
 {
-	struct cds_bidir_list_head *succ = &g_head;	/* default: tail */
+	struct urcu_txn_sw_list_head *succ = &g_head;	/* default: tail */
 	int j;
 
 	for (j = n->key + 1; j <= KEY_MAX; j++) {
@@ -138,7 +138,7 @@ static void sorted_insert(struct bl_node *n, struct bl_node **slot)
 			break;
 		}
 	}
-	if (cds_bidir_list_add_before_rcu(&n->node, succ))
+	if (urcu_txn_sw_list_add_before_rcu(&n->node, succ))
 		abort();
 	slot[n->key] = n;
 }
@@ -175,14 +175,14 @@ int main(void)
 			struct bl_node *fresh = bl_node_new(k);
 
 			/* replace keeps the same key, so order is preserved */
-			if (cds_bidir_list_replace_rcu(&old->node, &fresh->node))
+			if (urcu_txn_sw_list_replace_rcu(&old->node, &fresh->node))
 				abort();
 			call_rcu(&old->rcu_head, bl_node_free);
 			slot[k] = fresh;
 		} else {
 			struct bl_node *old = slot[k];
 
-			if (cds_bidir_list_del_rcu(&old->node))
+			if (urcu_txn_sw_list_del_rcu(&old->node))
 				abort();
 			call_rcu(&old->rcu_head, bl_node_free);
 			slot[k] = NULL;
@@ -198,7 +198,7 @@ int main(void)
 	/* Drain the remaining live nodes. */
 	for (k = 1; k <= KEY_MAX; k++) {
 		if (slot[k]) {
-			if (cds_bidir_list_del_rcu(&slot[k]->node))
+			if (urcu_txn_sw_list_del_rcu(&slot[k]->node))
 				abort();
 			call_rcu(&slot[k]->rcu_head, bl_node_free);
 			slot[k] = NULL;

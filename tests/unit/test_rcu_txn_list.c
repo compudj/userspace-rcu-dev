@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Concurrent stress test for <urcu/rcu-bidir-list-lockfree.h>: many LOCK-FREE
+ * Concurrent stress test for <urcu/rcu-txn-list.h>: many LOCK-FREE
  * writers doing arbitrary-position sorted insert and delete-by-key, while reader
  * threads walk the list forward AND backward.
  *
@@ -39,7 +39,7 @@
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
 #include <urcu/rcu-txn.h>
-#include <urcu/rcu-bidir-list-lockfree.h>
+#include <urcu/rcu-txn-list.h>
 
 #include "tap.h"
 
@@ -59,15 +59,15 @@
 #define STEP_LIMIT	16384		/* runaway-walk guard (>> equilibrium size) */
 
 struct lnode {
-	struct cds_bidir_list_lf_node node;
+	struct urcu_txn_list_node node;
 	struct rcu_head rh;
 	int key;
 };
 
-static struct cds_bidir_list_lf_head g_head;
+static struct urcu_txn_list_head g_head;
 static int g_stop;
 
-static int key_of(struct cds_bidir_list_lf_node *n)
+static int key_of(struct urcu_txn_list_node *n)
 {
 	return caa_container_of(n, struct lnode, node)->key;
 }
@@ -97,12 +97,12 @@ static void sorted_insert(int key)
 	n->key = key;
 	urcu_txn_init(&txn, &g_head.domain);
 	do {
-		struct cds_bidir_list_lf_node *prev = &g_head.node, *succ;
+		struct urcu_txn_list_node *prev = &g_head.node, *succ;
 
 		urcu_txn_begin(&txn);
 		/* prev = last node with key <= @key; succ = first with key > @key */
 		for (;;) {
-			succ = cds_bidir_list_lf_next_rcu(prev);
+			succ = urcu_txn_list_next_rcu(prev);
 			if (succ == &g_head.node || key_of(succ) > key)
 				break;
 			prev = succ;
@@ -123,12 +123,12 @@ static void sorted_insert(int key)
 /* Delete the first node with key == @key, if present. */
 static void delete_key(int key)
 {
-	struct cds_bidir_list_lf_node *p;
+	struct urcu_txn_list_node *p;
 	struct lnode *target = NULL;
 
 	rcu_read_lock();
-	for (p = cds_bidir_list_lf_next_rcu(&g_head.node); p != &g_head.node;
-			p = cds_bidir_list_lf_next_rcu(p)) {
+	for (p = urcu_txn_list_next_rcu(&g_head.node); p != &g_head.node;
+			p = urcu_txn_list_next_rcu(p)) {
 		int k = key_of(p);
 
 		if (k == key) {
@@ -139,7 +139,7 @@ static void delete_key(int key)
 			break;			/* sorted: past @key, absent */
 	}
 	if (target) {
-		int r = cds_bidir_list_lf_del_rcu(&target->node, &g_head);
+		int r = urcu_txn_list_del_rcu(&target->node, &g_head);
 
 		rcu_read_unlock();
 		if (r == 1)			/* this call removed it -> reclaim */
@@ -188,15 +188,15 @@ static void *reader(void *arg)
 
 	rcu_register_thread();
 	while (!uatomic_load(&g_stop, CMM_RELAXED)) {
-		struct cds_bidir_list_lf_node *p;
+		struct urcu_txn_list_node *p;
 		int prev_key, steps;
 
 		/* forward: non-decreasing keys, bounded, ends at head */
 		rcu_read_lock();
 		prev_key = INT_MIN;
 		steps = 0;
-		for (p = cds_bidir_list_lf_next_rcu(&g_head.node); p != &g_head.node;
-				p = cds_bidir_list_lf_next_rcu(p)) {
+		for (p = urcu_txn_list_next_rcu(&g_head.node); p != &g_head.node;
+				p = urcu_txn_list_next_rcu(p)) {
 			int k = key_of(p);
 
 			if (k < prev_key || k < 1 || k > KEY_MAX ||
@@ -212,8 +212,8 @@ static void *reader(void *arg)
 		rcu_read_lock();
 		prev_key = INT_MAX;
 		steps = 0;
-		for (p = cds_bidir_list_lf_prev_rcu(&g_head.node); p != &g_head.node;
-				p = cds_bidir_list_lf_prev_rcu(p)) {
+		for (p = urcu_txn_list_prev_rcu(&g_head.node); p != &g_head.node;
+				p = urcu_txn_list_prev_rcu(p)) {
 			int k = key_of(p);
 
 			if (k > prev_key || k < 1 || k > KEY_MAX ||
@@ -236,16 +236,16 @@ static void *reader(void *arg)
 static int check_mirror_coherent(void)
 {
 	static int fwd[STEP_LIMIT], rev[STEP_LIMIT];
-	struct cds_bidir_list_lf_node *p;
+	struct urcu_txn_list_node *p;
 	int nf = 0, nr = 0, i;
 
-	for (p = cds_bidir_list_lf_next_rcu(&g_head.node);
+	for (p = urcu_txn_list_next_rcu(&g_head.node);
 			p != &g_head.node && nf < STEP_LIMIT;
-			p = cds_bidir_list_lf_next_rcu(p))
+			p = urcu_txn_list_next_rcu(p))
 		fwd[nf++] = key_of(p);
-	for (p = cds_bidir_list_lf_prev_rcu(&g_head.node);
+	for (p = urcu_txn_list_prev_rcu(&g_head.node);
 			p != &g_head.node && nr < STEP_LIMIT;
-			p = cds_bidir_list_lf_prev_rcu(p))
+			p = urcu_txn_list_prev_rcu(p))
 		rev[nr++] = key_of(p);
 	if (nf != nr)
 		return 0;
@@ -261,12 +261,12 @@ int main(void)
 	struct writer_stats ws[NR_WRITERS];
 	struct reader_stats rs[NR_READERS];
 	long total_ops = 0, total_walks = 0, total_viol = 0;
-	struct cds_bidir_list_lf_node *p;
+	struct urcu_txn_list_node *p;
 	int i;
 
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
-	cds_bidir_list_lf_init(&g_head);
+	urcu_txn_list_init(&g_head);
 
 	for (i = 0; i < NR_READERS; i++) {
 		rs[i].walks = 0;
@@ -304,11 +304,11 @@ int main(void)
 
 	/* Drain the remaining nodes. */
 	rcu_read_lock();
-	for (p = cds_bidir_list_lf_next_rcu(&g_head.node); p != &g_head.node; ) {
+	for (p = urcu_txn_list_next_rcu(&g_head.node); p != &g_head.node; ) {
 		struct lnode *n = caa_container_of(p, struct lnode, node);
-		struct cds_bidir_list_lf_node *nextp = cds_bidir_list_lf_next_rcu(p);
+		struct urcu_txn_list_node *nextp = urcu_txn_list_next_rcu(p);
 
-		if (cds_bidir_list_lf_del_rcu(&n->node, &g_head) == 1)
+		if (urcu_txn_list_del_rcu(&n->node, &g_head) == 1)
 			call_rcu(&n->rh, lnode_free);
 		p = nextp;
 	}

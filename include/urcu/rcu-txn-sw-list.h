@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-#ifndef _URCU_RCU_BIDIR_LIST_H
-#define _URCU_RCU_BIDIR_LIST_H
+#ifndef _URCU_RCU_TXN_SW_LIST_H
+#define _URCU_RCU_TXN_SW_LIST_H
 
 /*
  * rcu_bidir_list: a circular doubly-linked list whose forward AND backward
@@ -61,7 +61,7 @@
  * ---------
  * Iterate under rcu_read_lock().  Because a transacted slot may transiently
  * hold a tagged proxy, the next/prev fields MUST be read through the
- * resolving accessors (cds_bidir_list_next_rcu / cds_bidir_list_prev_rcu) or
+ * resolving accessors (urcu_txn_sw_list_next_rcu / urcu_txn_sw_list_prev_rcu) or
  * the iterator macros below -- never by touching node->next / node->prev
  * directly.  This is also why the node type is distinct from
  * struct cds_list_head: the plain cds_list_*_rcu accessors would not resolve
@@ -98,17 +98,17 @@ extern "C" {
  * next/prev fields hold either a real node pointer or, transiently during a
  * mutation, a tagged flip proxy -- always read them through the accessors.
  */
-struct cds_bidir_list_head {
-	struct cds_bidir_list_head *next, *prev;
+struct urcu_txn_sw_list_head {
+	struct urcu_txn_sw_list_head *next, *prev;
 };
 
-#define CDS_BIDIR_LIST_HEAD_INIT(name)	{ .next = &(name), .prev = &(name) }
+#define URCU_TXN_SW_LIST_HEAD_INIT(name)	{ .next = &(name), .prev = &(name) }
 
-#define CDS_BIDIR_LIST_HEAD(name) \
-	struct cds_bidir_list_head name = CDS_BIDIR_LIST_HEAD_INIT(name)
+#define URCU_TXN_SW_LIST_HEAD(name) \
+	struct urcu_txn_sw_list_head name = URCU_TXN_SW_LIST_HEAD_INIT(name)
 
 static inline
-void cds_bidir_list_init(struct cds_bidir_list_head *head)
+void urcu_txn_sw_list_init(struct urcu_txn_sw_list_head *head)
 {
 	head->next = head;
 	head->prev = head;
@@ -119,12 +119,12 @@ void cds_bidir_list_init(struct cds_bidir_list_head *head)
  * struct urcu_txn_sw_proxy * rather than a direct node pointer.  Node and
  * proxy addresses are both at least pointer-aligned, so bit 0 is free.
  */
-#define CDS_BIDIR_LIST_PROXY_TAG		1UL
+#define URCU_TXN_SW_LIST_PROXY_TAG		1UL
 
 static inline
-void *cds_bidir_list_proxy_tag(struct urcu_txn_sw_proxy *proxy)
+void *urcu_txn_sw_list_proxy_tag(struct urcu_txn_sw_proxy *proxy)
 {
-	return (void *) ((uintptr_t) proxy | CDS_BIDIR_LIST_PROXY_TAG);
+	return (void *) ((uintptr_t) proxy | URCU_TXN_SW_LIST_PROXY_TAG);
 }
 
 /*
@@ -133,15 +133,15 @@ void *cds_bidir_list_proxy_tag(struct urcu_txn_sw_proxy *proxy)
  * node pointer passes through unchanged.
  */
 static inline
-struct cds_bidir_list_head *cds_bidir_list_resolve(struct cds_bidir_list_head *ptr)
+struct urcu_txn_sw_list_head *urcu_txn_sw_list_resolve(struct urcu_txn_sw_list_head *ptr)
 {
 	uintptr_t v = (uintptr_t) ptr;
 
-	if (caa_unlikely(v & CDS_BIDIR_LIST_PROXY_TAG)) {
+	if (caa_unlikely(v & URCU_TXN_SW_LIST_PROXY_TAG)) {
 		struct urcu_txn_sw_proxy *proxy = (struct urcu_txn_sw_proxy *)
-				(v & ~(uintptr_t) CDS_BIDIR_LIST_PROXY_TAG);
+				(v & ~(uintptr_t) URCU_TXN_SW_LIST_PROXY_TAG);
 
-		return (struct cds_bidir_list_head *)
+		return (struct urcu_txn_sw_list_head *)
 				urcu_txn_sw_proxy_get(proxy);
 	}
 	return ptr;
@@ -149,23 +149,23 @@ struct cds_bidir_list_head *cds_bidir_list_resolve(struct cds_bidir_list_head *p
 
 /* Resolved forward / backward step (call under rcu_read_lock()). */
 static inline
-struct cds_bidir_list_head *cds_bidir_list_next_rcu(
-		struct cds_bidir_list_head *node)
+struct urcu_txn_sw_list_head *urcu_txn_sw_list_next_rcu(
+		struct urcu_txn_sw_list_head *node)
 {
-	return cds_bidir_list_resolve(rcu_dereference(node->next));
+	return urcu_txn_sw_list_resolve(rcu_dereference(node->next));
 }
 
 static inline
-struct cds_bidir_list_head *cds_bidir_list_prev_rcu(
-		struct cds_bidir_list_head *node)
+struct urcu_txn_sw_list_head *urcu_txn_sw_list_prev_rcu(
+		struct urcu_txn_sw_list_head *node)
 {
-	return cds_bidir_list_resolve(rcu_dereference(node->prev));
+	return urcu_txn_sw_list_resolve(rcu_dereference(node->prev));
 }
 
 static inline
-int cds_bidir_list_empty(struct cds_bidir_list_head *head)
+int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)
 {
-	return cds_bidir_list_next_rcu(head) == head;
+	return urcu_txn_sw_list_next_rcu(head) == head;
 }
 
 /*
@@ -190,17 +190,17 @@ int cds_bidir_list_empty(struct cds_bidir_list_head *head)
  * status needs checking -- the on-stack handle has no create() to fail.
  */
 static inline
-int cds_bidir_list_flip2(
-		struct cds_bidir_list_head **slot0,
-		struct cds_bidir_list_head *old0,
-		struct cds_bidir_list_head *new0,
-		struct cds_bidir_list_head **slot1,
-		struct cds_bidir_list_head *old1,
-		struct cds_bidir_list_head *new1)
+int urcu_txn_sw_list_flip2(
+		struct urcu_txn_sw_list_head **slot0,
+		struct urcu_txn_sw_list_head *old0,
+		struct urcu_txn_sw_list_head *new0,
+		struct urcu_txn_sw_list_head **slot1,
+		struct urcu_txn_sw_list_head *old1,
+		struct urcu_txn_sw_list_head *new1)
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_record(&txn, (void **) slot0, old0, new0);
 	(void) urcu_txn_sw_record(&txn, (void **) slot1, old1, new1);
@@ -213,23 +213,23 @@ int cds_bidir_list_flip2(
 }
 
 /*
- * cds_bidir_list_add_after_prepare: record the edges of an add-after into the
+ * urcu_txn_sw_list_add_after_prepare: record the edges of an add-after into the
  * caller-owned single-updater transaction @txn, WITHOUT committing.  The
  * composable form: the caller owns the bracket (init .. commit) and may fold
  * these records together with records from other structures into ONE flip --
  * e.g. publish a node into a trie and splice it into this list atomically.
- * Mirrors cds_bidir_list_lf_insert_after_prepare(); under a single updater
+ * Mirrors urcu_txn_list_insert_after_prepare(); under a single updater
  * there is no concurrent deletion, so it always succeeds (returns 0).  The int
  * return matches the lock-free variant so callers share one shape across the
  * single-updater -> lock-free transition.  @txn must be init'd with
- * cds_bidir_list_proxy_tag so the list's reader accessors resolve the proxy.
+ * urcu_txn_sw_list_proxy_tag so the list's reader accessors resolve the proxy.
  */
 static inline
-int cds_bidir_list_add_after_prepare(struct urcu_txn_sw_txn *txn,
-		struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *pos)
+int urcu_txn_sw_list_add_after_prepare(struct urcu_txn_sw_txn *txn,
+		struct urcu_txn_sw_list_head *newp,
+		struct urcu_txn_sw_list_head *pos)
 {
-	struct cds_bidir_list_head *next = pos->next;
+	struct urcu_txn_sw_list_head *next = pos->next;
 
 	/* Build the fresh node's links before it becomes reachable. */
 	newp->prev = pos;
@@ -243,30 +243,30 @@ int cds_bidir_list_add_after_prepare(struct urcu_txn_sw_txn *txn,
 
 /*
  * Insert @newp just after @pos (between @pos and its successor).  Convenience
- * bracket around cds_bidir_list_add_after_prepare().
+ * bracket around urcu_txn_sw_list_add_after_prepare().
  */
 static inline
-int cds_bidir_list_add_after_rcu(struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *pos)
+int urcu_txn_sw_list_add_after_rcu(struct urcu_txn_sw_list_head *newp,
+		struct urcu_txn_sw_list_head *pos)
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
-	(void) cds_bidir_list_add_after_prepare(&txn, newp, pos);
+	(void) urcu_txn_sw_list_add_after_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
 
 /*
- * cds_bidir_list_add_before_prepare: composable form of add-before (see
+ * urcu_txn_sw_list_add_before_prepare: composable form of add-before (see
  * add_after_prepare for the contract).  Always returns 0.
  */
 static inline
-int cds_bidir_list_add_before_prepare(struct urcu_txn_sw_txn *txn,
-		struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *pos)
+int urcu_txn_sw_list_add_before_prepare(struct urcu_txn_sw_txn *txn,
+		struct urcu_txn_sw_list_head *newp,
+		struct urcu_txn_sw_list_head *pos)
 {
-	struct cds_bidir_list_head *prev = pos->prev;
+	struct urcu_txn_sw_list_head *prev = pos->prev;
 
 	newp->next = pos;
 	newp->prev = prev;
@@ -279,51 +279,51 @@ int cds_bidir_list_add_before_prepare(struct urcu_txn_sw_txn *txn,
 
 /*
  * Insert @newp just before @pos (between @pos's predecessor and @pos).
- * Convenience bracket around cds_bidir_list_add_before_prepare().
+ * Convenience bracket around urcu_txn_sw_list_add_before_prepare().
  */
 static inline
-int cds_bidir_list_add_before_rcu(struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *pos)
+int urcu_txn_sw_list_add_before_rcu(struct urcu_txn_sw_list_head *newp,
+		struct urcu_txn_sw_list_head *pos)
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
-	(void) cds_bidir_list_add_before_prepare(&txn, newp, pos);
+	(void) urcu_txn_sw_list_add_before_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
 
 /* Add @newp at the head of the list (just after @head). */
 static inline
-int cds_bidir_list_add_rcu(struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *head)
+int urcu_txn_sw_list_add_rcu(struct urcu_txn_sw_list_head *newp,
+		struct urcu_txn_sw_list_head *head)
 {
-	return cds_bidir_list_add_after_rcu(newp, head);
+	return urcu_txn_sw_list_add_after_rcu(newp, head);
 }
 
 /* Add @newp at the tail of the list (just before @head). */
 static inline
-int cds_bidir_list_add_tail_rcu(struct cds_bidir_list_head *newp,
-		struct cds_bidir_list_head *head)
+int urcu_txn_sw_list_add_tail_rcu(struct urcu_txn_sw_list_head *newp,
+		struct urcu_txn_sw_list_head *head)
 {
-	return cds_bidir_list_add_before_rcu(newp, head);
+	return urcu_txn_sw_list_add_before_rcu(newp, head);
 }
 
 /*
- * cds_bidir_list_del_prepare: record the unlink of @elem into the caller-owned
+ * urcu_txn_sw_list_del_prepare: record the unlink of @elem into the caller-owned
  * single-updater transaction @txn, WITHOUT committing.  Composable form of del
  * (see add_after_prepare for the contract).  @elem's own next/prev are left
  * intact (ghost) so a reader standing on it can still escape in either
  * direction; the caller frees @elem after a grace period (post-commit).  Always
  * returns 0 (single updater: no concurrent deletion); the int return matches
- * cds_bidir_list_lf_del_prepare() for transition parity.
+ * urcu_txn_list_del_prepare() for transition parity.
  */
 static inline
-int cds_bidir_list_del_prepare(struct urcu_txn_sw_txn *txn,
-		struct cds_bidir_list_head *elem)
+int urcu_txn_sw_list_del_prepare(struct urcu_txn_sw_txn *txn,
+		struct urcu_txn_sw_list_head *elem)
 {
-	struct cds_bidir_list_head *prev = elem->prev;
-	struct cds_bidir_list_head *next = elem->next;
+	struct urcu_txn_sw_list_head *prev = elem->prev;
+	struct urcu_txn_sw_list_head *next = elem->next;
 
 	/* prev->next: elem -> next ; next->prev: elem -> prev */
 	(void) urcu_txn_sw_record(txn, (void **) &prev->next, elem, next);
@@ -335,34 +335,34 @@ int cds_bidir_list_del_prepare(struct urcu_txn_sw_txn *txn,
  * Remove @elem.  Its own next/prev are left intact (ghost) so a reader
  * standing on it can still escape in either direction; the caller frees
  * @elem after a grace period.  Convenience bracket around
- * cds_bidir_list_del_prepare().
+ * urcu_txn_sw_list_del_prepare().
  */
 static inline
-int cds_bidir_list_del_rcu(struct cds_bidir_list_head *elem)
+int urcu_txn_sw_list_del_rcu(struct urcu_txn_sw_list_head *elem)
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
-	(void) cds_bidir_list_del_prepare(&txn, elem);
+	(void) urcu_txn_sw_list_del_prepare(&txn, elem);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
 
 /*
- * cds_bidir_list_replace_prepare: record the in-place replacement of @old by
+ * urcu_txn_sw_list_replace_prepare: record the in-place replacement of @old by
  * @newp into the caller-owned single-updater transaction @txn, WITHOUT
  * committing.  Composable form of replace (see add_after_prepare for the
  * contract): @newp inherits @old's neighbours; @old is left ghost for parked
- * readers.  Always returns 0.  Mirrors cds_bidir_list_lf_replace_prepare()
+ * readers.  Always returns 0.  Mirrors urcu_txn_list_replace_prepare()
  * (single-updater: no -ENOENT/-EAGAIN, since there is no concurrent deletion).
  */
 static inline
-int cds_bidir_list_replace_prepare(struct urcu_txn_sw_txn *txn,
-		struct cds_bidir_list_head *old,
-		struct cds_bidir_list_head *newp)
+int urcu_txn_sw_list_replace_prepare(struct urcu_txn_sw_txn *txn,
+		struct urcu_txn_sw_list_head *old,
+		struct urcu_txn_sw_list_head *newp)
 {
-	struct cds_bidir_list_head *prev = old->prev;
-	struct cds_bidir_list_head *next = old->next;
+	struct urcu_txn_sw_list_head *prev = old->prev;
+	struct urcu_txn_sw_list_head *next = old->next;
 
 	newp->prev = prev;
 	newp->next = next;
@@ -375,59 +375,59 @@ int cds_bidir_list_replace_prepare(struct urcu_txn_sw_txn *txn,
 
 /*
  * Replace @old with @newp atomically with respect to RCU readers.  Convenience
- * bracket around cds_bidir_list_replace_prepare().
+ * bracket around urcu_txn_sw_list_replace_prepare().
  */
 static inline
-int cds_bidir_list_replace_rcu(struct cds_bidir_list_head *old,
-		struct cds_bidir_list_head *newp)
+int urcu_txn_sw_list_replace_rcu(struct urcu_txn_sw_list_head *old,
+		struct urcu_txn_sw_list_head *newp)
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, cds_bidir_list_proxy_tag);
+	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
-	(void) cds_bidir_list_replace_prepare(&txn, old, newp);
+	(void) urcu_txn_sw_list_replace_prepare(&txn, old, newp);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
 
-#define cds_bidir_list_entry(ptr, type, member) \
+#define urcu_txn_sw_list_entry(ptr, type, member) \
 	caa_container_of(ptr, type, member)
 
-#define cds_bidir_list_first_entry_rcu(head, type, member) \
-	cds_bidir_list_entry(cds_bidir_list_next_rcu(head), type, member)
+#define urcu_txn_sw_list_first_entry_rcu(head, type, member) \
+	urcu_txn_sw_list_entry(urcu_txn_sw_list_next_rcu(head), type, member)
 
-#define cds_bidir_list_last_entry_rcu(head, type, member) \
-	cds_bidir_list_entry(cds_bidir_list_prev_rcu(head), type, member)
+#define urcu_txn_sw_list_last_entry_rcu(head, type, member) \
+	urcu_txn_sw_list_entry(urcu_txn_sw_list_prev_rcu(head), type, member)
 
 /* Iterate forward over the list (under rcu_read_lock()). */
-#define cds_bidir_list_for_each_rcu(pos, head) \
-	for (pos = cds_bidir_list_next_rcu(head); \
+#define urcu_txn_sw_list_for_each_rcu(pos, head) \
+	for (pos = urcu_txn_sw_list_next_rcu(head); \
 		(pos) != (head); \
-		pos = cds_bidir_list_next_rcu(pos))
+		pos = urcu_txn_sw_list_next_rcu(pos))
 
 /* Iterate backward over the list (under rcu_read_lock()). */
-#define cds_bidir_list_for_each_reverse_rcu(pos, head) \
-	for (pos = cds_bidir_list_prev_rcu(head); \
+#define urcu_txn_sw_list_for_each_reverse_rcu(pos, head) \
+	for (pos = urcu_txn_sw_list_prev_rcu(head); \
 		(pos) != (head); \
-		pos = cds_bidir_list_prev_rcu(pos))
+		pos = urcu_txn_sw_list_prev_rcu(pos))
 
-#define cds_bidir_list_for_each_entry_rcu(pos, head, member) \
-	for (pos = cds_bidir_list_entry(cds_bidir_list_next_rcu(head), \
+#define urcu_txn_sw_list_for_each_entry_rcu(pos, head, member) \
+	for (pos = urcu_txn_sw_list_entry(urcu_txn_sw_list_next_rcu(head), \
 			__typeof__(*(pos)), member); \
 		&(pos)->member != (head); \
-		pos = cds_bidir_list_entry( \
-			cds_bidir_list_next_rcu(&(pos)->member), \
+		pos = urcu_txn_sw_list_entry( \
+			urcu_txn_sw_list_next_rcu(&(pos)->member), \
 			__typeof__(*(pos)), member))
 
-#define cds_bidir_list_for_each_entry_reverse_rcu(pos, head, member) \
-	for (pos = cds_bidir_list_entry(cds_bidir_list_prev_rcu(head), \
+#define urcu_txn_sw_list_for_each_entry_reverse_rcu(pos, head, member) \
+	for (pos = urcu_txn_sw_list_entry(urcu_txn_sw_list_prev_rcu(head), \
 			__typeof__(*(pos)), member); \
 		&(pos)->member != (head); \
-		pos = cds_bidir_list_entry( \
-			cds_bidir_list_prev_rcu(&(pos)->member), \
+		pos = urcu_txn_sw_list_entry( \
+			urcu_txn_sw_list_prev_rcu(&(pos)->member), \
 			__typeof__(*(pos)), member))
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif	/* _URCU_RCU_BIDIR_LIST_H */
+#endif	/* _URCU_RCU_TXN_SW_LIST_H */

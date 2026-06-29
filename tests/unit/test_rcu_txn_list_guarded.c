@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Worked example for cds_bidir_list_lf_insert_after_guarded_rcu(): an insert
+ * Worked example for urcu_txn_list_insert_after_guarded_rcu(): an insert
  * that folds a load-validate guard on an embedder word into the same atomic
  * MCAS.  Here each node keeps a "live" marker beside it (killed monotonically
  * LIVE -> DEAD through the engine, so it is non-ABA and engine-transacted), and
@@ -33,7 +33,7 @@
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
 #include <urcu/rcu-txn.h>
-#include <urcu/rcu-bidir-list-lockfree.h>
+#include <urcu/rcu-txn-list.h>
 
 #include "tap.h"
 
@@ -44,11 +44,11 @@
 #define DEAD	((void *) 0x20)
 
 struct lnode {
-	struct cds_bidir_list_lf_node node;
+	struct urcu_txn_list_node node;
 	void *live;
 };
 
-static struct cds_bidir_list_lf_head g_head;
+static struct urcu_txn_list_head g_head;
 static struct lnode A, B, C, E;
 
 /* Kill a live marker LIVE -> DEAD through the engine (single-edge MCAS). */
@@ -66,14 +66,14 @@ static void kill_live(void **live_slot)
 	} while (st == URCU_TXN_STATUS_ABORT);
 }
 
-static int in_list(struct cds_bidir_list_lf_node *n)
+static int in_list(struct urcu_txn_list_node *n)
 {
-	struct cds_bidir_list_lf_node *p;
+	struct urcu_txn_list_node *p;
 	int found = 0;
 
 	rcu_read_lock();
-	for (p = cds_bidir_list_lf_next_rcu(&g_head.node); p != &g_head.node;
-			p = cds_bidir_list_lf_next_rcu(p)) {
+	for (p = urcu_txn_list_next_rcu(&g_head.node); p != &g_head.node;
+			p = urcu_txn_list_next_rcu(p)) {
 		if (p == n) {
 			found = 1;
 			break;
@@ -89,30 +89,30 @@ int main(void)
 
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
-	cds_bidir_list_lf_init(&g_head);
+	urcu_txn_list_init(&g_head);
 
 	A.live = LIVE;
 	B.live = LIVE;
 	C.live = LIVE;
 	E.live = LIVE;
-	cds_bidir_list_lf_add_rcu(&A.node, &g_head);		/* head <-> A */
+	urcu_txn_list_add_rcu(&A.node, &g_head);		/* head <-> A */
 
 	/* 1. Anchor live: the guarded insert links B after A. */
-	r = cds_bidir_list_lf_insert_after_guarded_rcu(&B.node, &A.node,
+	r = urcu_txn_list_insert_after_guarded_rcu(&B.node, &A.node,
 			&g_head, &A.live, LIVE);
 	ok(r == 0 && in_list(&B.node),
 		"guard holds -> guarded insert links the node after a live anchor");
 
 	/* 2. Anchor killed: the guard no longer holds -> refuse, C not linked. */
 	kill_live(&A.live);
-	r = cds_bidir_list_lf_insert_after_guarded_rcu(&C.node, &A.node,
+	r = urcu_txn_list_insert_after_guarded_rcu(&C.node, &A.node,
 			&g_head, &A.live, LIVE);
 	ok(r == -ENOENT && !in_list(&C.node),
 		"guard fails -> guarded insert refuses, node not linked");
 
 	/* 3. Anchor deleted: caught on the mark before the guard -> -ENOENT. */
-	(void) cds_bidir_list_lf_del_rcu(&A.node, &g_head);
-	r = cds_bidir_list_lf_insert_after_guarded_rcu(&E.node, &A.node,
+	(void) urcu_txn_list_del_rcu(&A.node, &g_head);
+	r = urcu_txn_list_insert_after_guarded_rcu(&E.node, &A.node,
 			&g_head, &B.live, LIVE);
 	ok(r == -ENOENT && !in_list(&E.node),
 		"deleted anchor -> guarded insert returns -ENOENT");

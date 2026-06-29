@@ -31,12 +31,12 @@ noinst_PROGRAMS = \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
 	test_rcu_txn_validate \
-	test_rcu_bidir_list \
-	test_rcu_bidir_list_concurrent \
-	test_rcu_bidir_list_lockfree \
-	test_rcu_bidir_list_lf_guarded \
-	test_rcu_bidir_list_lf_compose \
-	test_rcu_bidir_list_lf_replace \
+	test_rcu_txn_sw_list \
+	test_rcu_txn_sw_list_concurrent \
+	test_rcu_txn_list \
+	test_rcu_txn_list_guarded \
+	test_rcu_txn_list_compose \
+	test_rcu_txn_list_replace \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -78,12 +78,12 @@ TESTS = \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
 	test_rcu_txn_validate \
-	test_rcu_bidir_list \
-	test_rcu_bidir_list_concurrent \
-	test_rcu_bidir_list_lockfree \
-	test_rcu_bidir_list_lf_guarded \
-	test_rcu_bidir_list_lf_compose \
-	test_rcu_bidir_list_lf_replace \
+	test_rcu_txn_sw_list \
+	test_rcu_txn_sw_list_concurrent \
+	test_rcu_txn_list \
+	test_rcu_txn_list_guarded \
+	test_rcu_txn_list_compose \
+	test_rcu_txn_list_replace \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -161,23 +161,23 @@ test_rcu_txn_fallback_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 test_rcu_txn_validate_SOURCES = test_rcu_txn_validate.c
 test_rcu_txn_validate_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_rcu_bidir_list_SOURCES = test_rcu_bidir_list.c
-test_rcu_bidir_list_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_sw_list_SOURCES = test_rcu_txn_sw_list.c
+test_rcu_txn_sw_list_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_rcu_bidir_list_concurrent_SOURCES = test_rcu_bidir_list_concurrent.c
-test_rcu_bidir_list_concurrent_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_sw_list_concurrent_SOURCES = test_rcu_txn_sw_list_concurrent.c
+test_rcu_txn_sw_list_concurrent_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_rcu_bidir_list_lockfree_SOURCES = test_rcu_bidir_list_lockfree.c
-test_rcu_bidir_list_lockfree_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_list_SOURCES = test_rcu_txn_list.c
+test_rcu_txn_list_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_rcu_bidir_list_lf_guarded_SOURCES = test_rcu_bidir_list_lf_guarded.c
-test_rcu_bidir_list_lf_guarded_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_list_guarded_SOURCES = test_rcu_txn_list_guarded.c
+test_rcu_txn_list_guarded_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_rcu_bidir_list_lf_compose_SOURCES = test_rcu_bidir_list_lf_compose.c
-test_rcu_bidir_list_lf_compose_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_list_compose_SOURCES = test_rcu_txn_list_compose.c
+test_rcu_txn_list_compose_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_rcu_bidir_list_lf_replace_SOURCES = test_rcu_bidir_list_lf_replace.c
-test_rcu_bidir_list_lf_replace_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+test_rcu_txn_list_replace_SOURCES = test_rcu_txn_list_replace.c
+test_rcu_txn_list_replace_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_fair_mutex_SOURCES = test_fair_mutex.c
 test_fair_mutex_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
