@@ -4,7 +4,7 @@
 
 /*
  * Unit test for urcu_txn_sw_txn: the multi-edge transaction layer of the
- * flip-latch, focusing on the commit() shortcuts -- the single-edge fast path
+ * single-updater engine, focusing on the commit() shortcuts -- the single-edge fast path
  * (no proxy at all) and auto-install -- the explicit-install caveat, and the
  * record-array realloc-grow path.
  *

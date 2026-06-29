@@ -8,7 +8,7 @@
  *   - forward and reverse iteration are exact mirrors;
  *   - next/prev are mutual inverses around the whole ring (coherence);
  *   - add / add_tail / del / replace keep both directions coherent;
- *   - the flip-latch proxy resolves correctly across the
+ *   - the proxy-flip resolves correctly across the
  *     install -> commit -> settle phases of a two-edge flip (the
  *     mechanism a concurrent reader relies on).
  *

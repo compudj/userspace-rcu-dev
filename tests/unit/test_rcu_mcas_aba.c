@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Deterministic regression test for the lock-free MCAS engine's behaviour when a
+ * Deterministic regression test for the RCU MCAS engine's behaviour when a
  * transacted slot A-B-A's -- i.e. a slot's value recurs.  The engine no longer
  * assumes slots never repeat a bit pattern: a doubly-linked list's next-pointer
  * does so intrinsically (insert X between A and B records "A->next: B->X"; delete

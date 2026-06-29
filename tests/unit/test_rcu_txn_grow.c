@@ -269,7 +269,7 @@ int main(void)
 	ok(sum == 0,
 		"grow under contention stayed atomic (zero-sum invariant)");
 	ok(total == (long) PH1_WORKERS * PH1_OPS,
-		"every grown transaction committed (lock-free progress)");
+		"every grown transaction committed (bounded-blocking progress)");
 
 	/* ---- Phase 2 ---- */
 	ph2_word = malloc((size_t) PH2_N * sizeof(*ph2_word));

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Concurrent stress test for <urcu/rcu-txn-list.h>: many LOCK-FREE
+ * Concurrent stress test for <urcu/rcu-txn-list.h>: many concurrent
  * writers doing arbitrary-position sorted insert and delete-by-key, while reader
  * threads walk the list forward AND backward.
  *
@@ -296,7 +296,7 @@ int main(void)
 		NR_WRITERS, total_ops, NR_READERS, total_walks, total_viol);
 
 	ok(total_ops == (long) NR_WRITERS * WRITER_OPS,
-		"every writer completed (lock-free progress)");
+		"every writer completed (bounded-blocking progress)");
 	ok(total_viol == 0,
 		"forward/reverse walks stayed monotone (coherent both directions)");
 	ok(check_mirror_coherent(),

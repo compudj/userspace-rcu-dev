@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Composability stress for the lock-free bidir list: a single node is a member
+ * Composability stress for the concurrent bidir list: a single node is a member
  * of TWO lists at once (multi-membership through two intrusive hooks in one
  * leaf), and every mutation updates BOTH lists in ONE MCAS via the composable
  * *_prepare() forms -- the headline use case for folding a list splice together

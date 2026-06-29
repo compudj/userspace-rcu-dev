@@ -154,7 +154,7 @@ int main(void)
 	ok(sum == 0,
 		"transactions stayed atomic across concurrent transfers (sum invariant)");
 	ok(total == (long) NR_WORKERS * OPS_PER_WORKER,
-		"every transaction eventually committed (lock-free progress)");
+		"every transaction eventually committed (bounded-blocking progress)");
 	ok(max_retry < RETRY_BOUND,
 		"worst single-op bypass stayed bounded (internal aging retry)");
 

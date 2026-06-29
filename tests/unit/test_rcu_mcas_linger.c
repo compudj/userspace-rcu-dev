@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Deterministic regression test for the lock-free MCAS engine's OTHER A-B-A
+ * Deterministic regression test for the RCU MCAS engine's OTHER A-B-A
  * hazard: a late FIRST install that lingers past reclaim.  The companion test
  * test_rcu_mcas_aba.c covers the re-plant of an already-installed record
  * (closed by the install-once flag); this one covers the install-vs-settle

@@ -4,7 +4,7 @@
 
 /*
  * Worked example + correctness checks for urcu_txn_list_replace_rcu(): an
- * in-place atomic replacement of @old by @newp in the lock-free bidir list.
+ * in-place atomic replacement of @old by @newp in the concurrent bidir list.
  * Replace touches the same slots as del (prev->next, next->prev, old->next-mark)
  * but swings the neighbours to @newp instead of skipping, so @newp inherits
  * @old's position while @old becomes a forward-escapable ghost.

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Direct stress test for the lock-free MCAS engine <urcu/rcu-mcas.h>,
+ * Direct stress test for the RCU MCAS engine <urcu/rcu-mcas.h>,
  * independent of any data structure.
  *
  * Invariant (atomicity): the shared array starts all-zero, and every
@@ -376,7 +376,7 @@ int main(void)
 	ok(sum == 0,
 		"mild: k-CAS stayed atomic across concurrent transfers (sum invariant)");
 	ok(committed == (long) NR_WORKERS * MILD_OPS,
-		"mild: every transaction eventually committed (lock-free progress)");
+		"mild: every transaction eventually committed (bounded-blocking progress)");
 
 	/* --- Phase 2: heavy contention -- fairness + helping cost. --- */
 	sum = run_phase(HOT_WORDS, HOT_OPS, &committed, &max_retry, &st, &attempts);
@@ -398,7 +398,7 @@ int main(void)
 	ok(sum == 0,
 		"hot: k-CAS stayed atomic under heavy contention (sum invariant)");
 	ok(committed == (long) NR_WORKERS * HOT_OPS,
-		"hot: every transaction eventually committed (lock-free progress)");
+		"hot: every transaction eventually committed (bounded-blocking progress)");
 	ok(max_retry < HOT_RETRY_BOUND,
 		"hot: worst single-op bypass stayed bounded (priority fairness)");
 
