@@ -115,8 +115,7 @@ static struct urcu_mcas *make_txn(void)
 	urcu_mcas_sort(t);		/* slot-address order, as commit() does */
 	for (i = 0; i < t->nr; i++) {
 		t->recs[i].mcas = t;
-		t->recs[i].installed = 0;
-		cds_fair_mutex_init(&t->recs[i].latch);
+		urcu_mcas_latch_init(&t->recs[i]);
 	}
 	return t;
 }

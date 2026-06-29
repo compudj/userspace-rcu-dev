@@ -13,8 +13,8 @@
  * by both concurrent RCU readers AND concurrent writers.  Progress is
  * bounded-blocking: a thread that trips over an in-flight transaction helps
  * drive its install forward rather than waiting on it, and the only blocking
- * is a short, FIFO-fair per-record install latch (below) -- there is no
- * unbounded spinning and no deadlock.
+ * is a short per-record install word (a tri-state try-lock, below), held only
+ * across a bounded, non-blocking section -- no unbounded waiting, no deadlock.
  *
  * Model (a "practical MCAS", Harris-style, linearized by a status flip)
  * ----------------------------------------------------------------------
@@ -101,14 +101,14 @@
  * doubly-linked list's next-pointer cycles B -> X -> B (insert then delete of X)
  * with B a live successor RCU never frees.
  *
- * The PER-RECORD INSTALL LATCH (struct urcu_mcas_record::latch, installed)
- * closes that directly, so the engine no longer requires slots to be
+ * The PER-RECORD INSTALL WORD (struct urcu_mcas_record::state -- a tri-state
+ * FREE/BUSY/DONE try-lock) closes that directly, so the engine no longer requires slots to be
  * non-ABA-able at all -- ANY slot-value A-B-A is safe, whatever recurs the value
  * (live-successor recurrence, a counter revisiting a number, an embedder's own
  * reuse).  Every plant -- plain install and steal alike -- runs through
- * urcu_mcas_plant() under the record's latch, which makes {install-once test,
- * plant CAS, installed-set, first self-settle} atomic.  A stale second install is
- * gated by the install-once FLAG, not by the slot value, so the recurred value is
+ * urcu_mcas_plant(), which claims the word (FREE->BUSY) so {install-once, plant
+ * CAS, self-settle} are atomic in one word.  A stale second install is
+ * gated by the DONE state, not by the slot value, so the recurred value is
  * irrelevant; the self-settle closes the matching install-vs-settle ordering
  * hole.  What the engine DOES still require is unrelated to slot values: tag bit 0
  * free, pairwise-distinct slots per txn, and -- the EXISTENCE model -- that a
@@ -130,7 +130,7 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head */
-#include <urcu/fair-mutex.h>		/* per-record install latch */
+#include <urcu/arch.h>			/* caa_cpu_relax */
 
 #ifdef __cplusplus
 extern "C" {
@@ -176,23 +176,31 @@ struct urcu_mcas_record {
 	void *new_ptr;			/* committed new value */
 	struct urcu_mcas *mcas;	/* back-pointer (status + sibling records) */
 	/*
-	 * Per-record install latch.  Guards EXACTLY ONE thing: this record's
-	 * install decision -- the install-once test, the single plant CAS, the
-	 * "installed" set, and the installer's first ordered self-settle (see
-	 * urcu_mcas_plant()).  It does NOT guard the slot: every operation
-	 * that REMOVES or CONVERTS a parked proxy -- the regular settle, the
-	 * installer self-settle, and a thief's steal that displaces the victim's
-	 * proxy -- is a lock-free CAS handoff that takes no latch.  Because the
-	 * latch is per-RECORD, two records sharing one slot (a thief's r and its
-	 * victim's fr) transition that slot under DIFFERENT latches and so always
-	 * resolve by CAS; keeping settle mutex-free is what keeps that boundary
-	 * clean and the latch's scope minimal.  A thread holds at most one such
-	 * latch at a time (helping/resolving runs outside it), so there is no
-	 * hold-and-wait and no lock order to maintain.
+	 * Per-record install word -- one tri-state int making {install-once, plant
+	 * CAS, self-settle} atomic without a separate flag or lock library:
+	 *
+	 *     FREE --(try-CAS)--> BUSY --(plant)--> DONE
+	 *
+	 * The FREE->BUSY CAS is the install lock; DONE is the install-once gate.  It
+	 * guards EXACTLY this record's install, NOT the slot: every op that REMOVES or
+	 * CONVERTS a parked proxy -- the regular settle, the installer self-settle, and
+	 * a thief's steal that displaces the victim's proxy -- is a plain CAS that
+	 * touches no install word.  Because the word is per-RECORD, two records sharing
+	 * one slot (a thief's r and its victim's fr) transition it via DIFFERENT words
+	 * and so always resolve by CAS.  A thread owns at most one install (BUSY) at a
+	 * time and never blocks while owning it -- no hold-and-wait, no lock order.
 	 */
-	struct cds_fair_mutex latch;
-	unsigned long installed;	/* set once, under latch, on first plant */
+	int state;
 } __attribute__((aligned(16)));
+
+/* Per-record install word values + initializer (see struct urcu_mcas_record). */
+enum {
+	URCU_MCAS_INSTALL_FREE = 0,	/* installable; a FREE->BUSY CAS claims it */
+	URCU_MCAS_INSTALL_BUSY = 1,	/* a driver owns the install (try-lock held) */
+	URCU_MCAS_INSTALL_DONE = 2,	/* planted (the install-once gate) */
+};
+#define urcu_mcas_latch_init(r)	\
+	uatomic_store(&(r)->state, URCU_MCAS_INSTALL_FREE, CMM_RELAXED)
 
 /*
  * The records are stored inline after the header and a parked slot holds the
@@ -303,11 +311,11 @@ void *urcu_mcas_resolve(void *v)
  * Optional test hook.  Compiles to nothing unless the embedder defines
  * URCU_MCAS_PREINSTALL(t, r) before including this header.  Fires in the
  * install path at the point a driver has decided to plant @r, just BEFORE it
- * takes @r's install latch -- so a deterministic single-threaded test can
+ * claims @r's install word -- so a deterministic single-threaded test can
  * interpose the exact interleaving that used to re-plant (drive @t's own install
  * + commit + settle, then A-B-A the slot back to r->old_ptr) from inside the
- * hook, itself taking and releasing the latch, before the stale driver proceeds
- * into urcu_mcas_plant() and is stopped by the install-once flag.  Not part of
+ * hook, itself driving @r's install, before the stale driver proceeds
+ * into urcu_mcas_plant() and is stopped by the DONE state.  Not part of
  * the engine contract.
  */
 #ifndef URCU_MCAS_PREINSTALL
@@ -315,86 +323,93 @@ void *urcu_mcas_resolve(void *v)
 #endif
 
 /*
- * Plant transaction @t's record @r into its slot under @r's install latch.
- * @expect is the slot value to CAS over: r->old_ptr for a plain install, or the
- * victim's parked proxy for a steal.  This is the ONLY writer of r->installed and
- * the ONLY latch-protected slot write; everything else that touches the slot
- * (regular settle, a thief's steal of THIS proxy later) is a lock-free CAS.
+ * Plant transaction @t's record @r: claim @r's install word (FREE->BUSY), CAS
+ * @r's slot from @expect (r->old_ptr for a plain install, the victim's parked
+ * proxy for a steal) to the record's tagged proxy, then publish DONE.  The
+ * regular settle and a later steal of THIS proxy are plain CASes that take no
+ * install word.
  *
- * Three things happen atomically under the latch, which is exactly what closes
- * the re-plant use-after-free that a value-CAS alone cannot (the slot value can
- * A-B-A back to r->old_ptr after @t linearizes, so the CAS's own comparison is
- * not enough to tell a first install from a stale second one):
+ * The install word makes {install-once, plant CAS, self-settle} atomic, which is
+ * exactly what closes the re-plant use-after-free a value-CAS alone cannot (the
+ * slot value can A-B-A back to r->old_ptr after @t linearizes, so the CAS's own
+ * comparison cannot tell a first install from a stale second one):
  *
- *   1. install-once -- if r was already planted (by us or another driver of @t),
- *      skip.  The flag, not the slot value, is the gate, so any A-B-A is inert.
- *   2. the single plant CAS.
- *   3. installer-self-settle -- read @t's status AFTER the plant.  If @t is
- *      already terminal, convert our just-planted proxy to its resolved value
- *      now, so it cannot linger past @t's reclaim (the install-vs-settle hole:
- *      a late first install after the owner already settled).  The status read
- *      ordered AFTER the plant (the plant CAS is a full barrier; the status load
- *      is acquire) is what manufactures the happens-before that makes the owner's
- *      unconditional settle in commit() the backstop for the UNDECIDED case.
+ *   1. install-once -- DONE means installed; a stale driver's FREE->BUSY fails,
+ *      so any A-B-A of the slot VALUE is inert (the word, not the value, gates).
+ *   2. the single plant CAS, owned exclusively while BUSY.
+ *   3. installer-self-settle -- read @t's status AFTER the plant; if @t is
+ *      already terminal, convert our just-planted proxy now so it cannot linger
+ *      past @t's reclaim (the install-vs-settle hole).  The status read ordered
+ *      after the full-barrier plant makes the owner's unconditional settle in
+ *      commit() the backstop for the UNDECIDED case.
  *
  * Returns:
- *   1 -- we planted the proxy (caller advances to the next record; the steal
- *        site also bumps its steal counter);
- *   2 -- r was already installed (caller advances; no steal counted);
+ *   1 -- we planted the proxy (caller advances; the steal site bumps its counter);
+ *   2 -- @r was already installed (caller advances; no steal counted);
  *   0 -- the CAS raced the slot away (caller re-reads and retries).
  */
+#ifdef URCU_MCAS_NO_ABA_FIX
 static inline
 int urcu_mcas_plant(struct urcu_mcas *t,
 		struct urcu_mcas_record *r, void *expect)
 {
 	void *tagv = urcu_mcas_tag(r);
-	struct cds_fair_mutex_node node;
-	int ret;
 
-	cds_fair_mutex_lock(&r->latch, &node);
-	if (
-#ifndef URCU_MCAS_NO_ABA_FIX
-	    uatomic_load(&r->installed, CMM_RELAXED)	/* install-once: the A-B-A fix */
-#else
-	    0			/* test knob: drop the install-once gate (buggy) */
-#endif
-	   ) {
-		ret = 2;			/* already installed: skip */
-	} else if (uatomic_cmpxchg(r->slot, expect, tagv) == expect) {
-		uatomic_store(&r->installed, 1, CMM_RELAXED);
-		/*
-		 * Self-settle: read status AFTER the plant.  Correctness is an
-		 * SB (store-buffer) exclusion -- the plant CAS above is a FULL
-		 * barrier on success and the commit-flip + owner settle in
-		 * commit() are full-barrier CASes, so it is impossible for BOTH
-		 * "we read UNDECIDED here" AND "the owner's settle ran before our
-		 * plant".  Hence either we self-settle now (status terminal), or
-		 * the owner's settle, ordered after our plant, converts it.  The
-		 * RELAXED installed accesses are fine: they are read/written only
-		 * under this latch, which carries them release-to-acquire.
-		 */
-#ifndef URCU_MCAS_NO_ABA_FIX
-		{
-			unsigned long st = urcu_mcas_status(t);
-
-			if (st != URCU_MCAS_UNDECIDED) {
-				void *want = (st == URCU_MCAS_SUCCEEDED) ?
-						r->new_ptr : r->old_ptr;
-
-				(void) uatomic_cmpxchg(r->slot, tagv, want);
-			}
-		}
-#endif		/* else (test knob): drop the self-settle (buggy) */
-		ret = 1;			/* planted */
-	} else {
-		ret = 0;			/* raced: retry */
-	}
-	cds_fair_mutex_unlock(&r->latch, &node);
-#ifdef URCU_MCAS_NO_ABA_FIX
-	(void) t;		/* the self-settle, t's only use here, is gated out */
-#endif
-	return ret;
+	/*
+	 * Test knob: a bare value-CAS with no install-once gate and no self-settle --
+	 * the original A-B-A-unsafe behaviour the install word closes.  For the
+	 * regression tests (build -DURCU_MCAS_NO_ABA_FIX); never in production.
+	 */
+	(void) t;
+	if (uatomic_cmpxchg(r->slot, expect, tagv) == expect)
+		return 1;
+	return 0;
 }
+#else
+static inline
+int urcu_mcas_plant(struct urcu_mcas *t,
+		struct urcu_mcas_record *r, void *expect)
+{
+	void *tagv = urcu_mcas_tag(r);
+	int v;
+
+	/* Claim r's install: FREE -> BUSY (acquire). */
+	for (;;) {
+		v = uatomic_cmpxchg(&r->state, URCU_MCAS_INSTALL_FREE,
+				URCU_MCAS_INSTALL_BUSY);
+		if (v == URCU_MCAS_INSTALL_DONE)
+			return 2;		/* already installed: advance */
+		if (v == URCU_MCAS_INSTALL_FREE)
+			break;			/* we own r's install */
+		/*
+		 * BUSY: a co-driver of THIS txn is installing r.  Wait this attempt
+		 * out -- bounded TTAS on a relaxed load (no cache-line RMW storm) --
+		 * then re-decide.  BUSY is cooperative install progress, not a
+		 * lost-slot conflict, so it never advances the retry counter.
+		 */
+		while (uatomic_load(&r->state, CMM_RELAXED) == URCU_MCAS_INSTALL_BUSY)
+			caa_cpu_relax();
+	}
+	if (uatomic_cmpxchg(r->slot, expect, tagv) == expect) {
+		/*
+		 * Self-settle: status read ordered AFTER the full-barrier plant, so a
+		 * proxy we plant after @t linearized cannot linger past its reclaim.
+		 */
+		unsigned long st = urcu_mcas_status(t);
+
+		if (st != URCU_MCAS_UNDECIDED) {
+			void *want = (st == URCU_MCAS_SUCCEEDED) ?
+					r->new_ptr : r->old_ptr;
+
+			(void) uatomic_cmpxchg(r->slot, tagv, want);
+		}
+		uatomic_store(&r->state, URCU_MCAS_INSTALL_DONE, CMM_RELEASE);
+		return 1;			/* planted */
+	}
+	uatomic_store(&r->state, URCU_MCAS_INSTALL_FREE, CMM_RELEASE);
+	return 0;				/* slot raced; r still un-installed */
+}
+#endif
 
 /*
  * Install phase: drive transaction @t to a terminal status (SUCCEEDED or
@@ -806,8 +821,7 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 	 */
 	for (i = 0; i < t->nr; i++) {
 		t->recs[i].mcas = t;
-		t->recs[i].installed = 0;
-		cds_fair_mutex_init(&t->recs[i].latch);
+		urcu_mcas_latch_init(&t->recs[i]);
 	}
 	urcu_mcas_drive_install(t);		/* install to a decision (helpers help) */
 	urcu_mcas_settle(t);			/* owner-only: make our own slots plain */
