@@ -837,8 +837,10 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * Root-level graft: the source's root becomes the
 		 * destination's root with no parent-pointer change
 		 * (both are root positions with parent == NULL).  No
-		 * "jump out" window, so no internal synchronize_rcu is
-		 * required for this path.
+		 * "jump out" window, so the STRUCTURAL swap needs no
+		 * internal synchronize_rcu.  (The ordered-list run move
+		 * below adds its own post-flip drain when @src_ft is
+		 * concurrent -- see the finalize after the publish.)
 		 *
 		 * Swap root pointers.  The source's root carries all
 		 * metadata (nr_child, external_nodes) with it.  The
@@ -851,25 +853,31 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		/*
 		 * Ordered list: dst was empty (checked above), so src's WHOLE
 		 * ordered list becomes dst's.  Cells' internal links are
-		 * unchanged; only the head/tail endpoints transfer.  Fuse BOTH
-		 * sides into ONE cross-trie flip (dst and src share a group, so a
-		 * single epoch flip settles every root/endpoint proxy at once):
+		 * unchanged; the head/tail endpoints transfer and the moved run's
+		 * outer links are NULL-terminated (the dual does not relink them
+		 * to a foreign sentinel -- there is no drain between detach and
+		 * attach here, so a src straddler must see a universal end, not
+		 * dst's sentinel).  Fuse BOTH sides into ONE cross-trie flip (dst
+		 * and src share a group, so a single epoch flip settles every
+		 * root/endpoint proxy at once):
 		 *  - dst (appear): src->root AND src's head/tail (dst's were NULL);
 		 *  - src (disappear): retire src->root to a fresh empty root AND
 		 *    clear src's head/tail.
 		 * A reader resolves all slots to ONE phase, so it never sees the
 		 * key reachable in BOTH tries (appear done, disappear pending) or
 		 * in NEITHER.  Capture src's live root and endpoints first -- the
-		 * flip overwrites them.  (List off: head/tail are unused; the
-		 * swap reduces to the two lone root edges, MCAS-expressible like
-		 * the list-on path.  Both are root positions with parent == NULL,
-		 * so no internal synchronize_rcu is required.)
+		 * flip overwrites them.  After the flip, drain src (if concurrent)
+		 * and finalize dst's adopted run to dst's sentinel (below).  (List
+		 * off: head/tail are unused; the swap reduces to the two lone root
+		 * edges, MCAS-expressible like the list-on path.  Both are root
+		 * positions with parent == NULL, so no internal synchronize_rcu is
+		 * required.)
 		 */
 		{
 			struct cds_ft_inode_flag *dst_old = dst_ft->root;
 			struct cds_ft_inode_flag *src_root = src_ft->root;
-			struct ft_ord_cell *src_head = src_ft->ord_cell_head;
-			struct ft_ord_cell *src_tail = src_ft->ord_cell_tail;
+			struct ft_ord_cell *src_head = ft_ord_first(src_ft);
+			struct ft_ord_cell *src_tail = ft_ord_last(src_ft);
 			struct ft_root_swap_side appear = {
 				.ft = dst_ft, .slot = &dst_ft->root,
 				.old_root = dst_old, .new_root = src_root,
@@ -899,6 +907,20 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			(const void *) dst_ft->root);
 		FT_TP(root_publish, (const void *) src_ft,
 			(const void *) src_ft->root);
+		/*
+		 * Ordered-list run finalize: the dual NULL-terminated src's moved
+		 * run (universal end).  Drain src readers straddling that run, then
+		 * repoint its outer links at dst's sentinel so dst's list is circular
+		 * again (the remove folding / reverse walk need first->prev ==
+		 * sentinel).  src exclusive -> no straddler, no drain; the finalize
+		 * still runs (dst is live: rcu_assign_pointer, benign race with dst's
+		 * own readers, for whom both NULL and dst's sentinel mark the end).
+		 */
+		if (dst_ft->group->ordered_list_set) {
+			if (!src_ft->exclusive)
+				src_ft->group->flavor->update_synchronize_rcu();
+			ft_ord_finalize_circular(dst_ft);
+		}
 		free_cds_ft_node(dst_ft, old_dst_root);
 		goto done;
 	}
@@ -1138,12 +1160,18 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * retire.  (List off: just the lone root edge.)
 		 */
 		if (dst_ft->group->ordered_list_set) {
-			graft_run_first = src_ft->ord_cell_head;
-			graft_run_last = src_ft->ord_cell_tail;
+			graft_run_first = ft_ord_first(src_ft);
+			graft_run_last = ft_ord_last(src_ft);
+			/*
+			 * Just empty src's sentinel here (relink_dest NULL): the run's
+			 * cells are re-homed into dst by the run-splice below, which
+			 * repoints their outer links to dst's neighbours / sentinel.
+			 */
 			ft_root_list_swap_publish(src_ft, src_retire_txn,
 				&src_ft->root,
 				old_src_root, ft_node_flag(fresh_node, 0),
-				graft_run_first, NULL, graft_run_last, NULL);
+				graft_run_first, NULL, graft_run_last, NULL,
+				NULL, false);
 		} else {
 			ft_root_edge_flip(src_ft, &src_ft->root,
 				old_src_root, ft_node_flag(fresh_node, 0));
@@ -1463,9 +1491,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct urcu_txn_sw_txn *dual_txn;
 
 		/*
-		 * PRE-RESERVE the cross-trie dual root-swap txn before the drain
-		 * below: the swap is failure-free post-drain, so it commits through
-		 * this txn (ft_ord_cell_flip_into).  OOM here aborts cleanly -- the
+		 * PRE-RESERVE the cross-trie dual root-swap txn before the
+		 * failure-free swap below: it commits through this txn
+		 * (ft_ord_cell_flip_into).  OOM here aborts cleanly -- the
 		 * whole-trie swap has no prior fallible state, both tries pristine.
 		 * The dual always flips both roots, so it is multi-edge even list
 		 * off (never a lone store).
@@ -1479,32 +1507,30 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		}
 
 		/*
-		 * Drain concurrent readers of either side before
-		 * re-parenting, to prevent readers in either trie from
-		 * following parent pointers across the swap boundary.
-		 */
-		if (!swap_ft->exclusive || !dst_ft->exclusive)
-			dst_ft->group->flavor->update_synchronize_rcu();
-
-		/*
 		 * Swap both roots and (mirroring them) both ordered lists, fused
 		 * into ONE cross-trie flip (dst and swap share a group, so a
 		 * single epoch flip settles every root/endpoint proxy at once).
 		 * A reader resolves all slots to ONE phase, so it never sees a
 		 * side's structure showing NEW content while its ordered-list
 		 * front is still OLD (the intra-trie window), nor a key reachable
-		 * in both tries or neither (the cross-trie window).  Capture the
-		 * swap root and all four endpoints up front: the two sides
-		 * reference each other's pre-swap values.  (List off: head/tail
-		 * are unused; the swap reduces to the two lone root edges,
-		 * MCAS-expressible like the list-on path.)
+		 * in both tries or neither (the cross-trie window).  The moved
+		 * runs' outer links are NULL-terminated by the dual (universal
+		 * end) rather than relinked to the foreign sentinel: both sides
+		 * are live, so detach and attach cannot be split by a drain here
+		 * -- a straddler of either run must see a universal end, not the
+		 * other trie's sentinel.  Capture the swap root and all four
+		 * endpoints up front: the two sides reference each other's pre-swap
+		 * values.  The drain + finalize below (AFTER the flip) retires the
+		 * straddlers and restores each side's run to circular.  (List off:
+		 * head/tail are unused; the swap reduces to the two lone root
+		 * edges, MCAS-expressible like the list-on path.)
 		 */
 		{
 			struct cds_ft_inode_flag *swap_root = swap_ft->root;
-			struct ft_ord_cell *dh = dst_ft->ord_cell_head;
-			struct ft_ord_cell *dt = dst_ft->ord_cell_tail;
-			struct ft_ord_cell *sh = swap_ft->ord_cell_head;
-			struct ft_ord_cell *st = swap_ft->ord_cell_tail;
+			struct ft_ord_cell *dh = ft_ord_first(dst_ft);
+			struct ft_ord_cell *dt = ft_ord_last(dst_ft);
+			struct ft_ord_cell *sh = ft_ord_first(swap_ft);
+			struct ft_ord_cell *st = ft_ord_last(swap_ft);
 			struct ft_root_swap_side dst_side = {
 				.ft = dst_ft, .slot = &dst_ft->root,
 				.old_root = tmp, .new_root = swap_root,
@@ -1525,6 +1551,25 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			(const void *) dst_ft->root);
 		FT_TP(root_publish, (const void *) swap_ft,
 			(const void *) swap_ft->root);
+
+		/*
+		 * Drain readers of either side -- both the pre-swap readers (this
+		 * subsumes the old pre-flip drain: a whole-trie root swap changes
+		 * no parent pointer, so nothing between the flip and here depends
+		 * on readers being already gone) AND the straddlers of the two
+		 * moved runs.  Then finalize each side's adopted run from its
+		 * NULL-terminated transient back to circular form: dst now owns
+		 * swap's old run (point its outer links at dst's sentinel), swap
+		 * now owns dst's old run (point at swap's sentinel).  Reading the
+		 * exclusive flags here, before the swap_ft->exclusive update below,
+		 * preserves the original drain condition.
+		 */
+		if (!swap_ft->exclusive || !dst_ft->exclusive)
+			dst_ft->group->flavor->update_synchronize_rcu();
+		if (dst_ft->group->ordered_list_set) {
+			ft_ord_finalize_circular(dst_ft);
+			ft_ord_finalize_circular(swap_ft);
+		}
 
 		dm = uatomic_load(&dst_ft->max_used_key_len, CMM_RELAXED);
 		if (swap_max > dm)
@@ -1898,8 +1943,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				ft_subtree_minmax_head(dst_ft, old_child, false)->prev));
 			gs_d_last = ft_ord_cell_ptr(rcu_dereference(
 				ft_subtree_minmax_head(dst_ft, old_child, true)->prev));
-			gs_s_first = swap_ft->ord_cell_head;	/* NULL if swap empty */
-			gs_s_last = swap_ft->ord_cell_tail;
+			gs_s_first = ft_ord_first(swap_ft);	/* NULL if swap empty */
+			gs_s_last = ft_ord_last(swap_ft);
 		}
 		/*
 		 * Fuse the run_D->run_S ordered-list replace into the SAME flip as
@@ -1934,11 +1979,17 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * (List off: just the lone root edge.)
 			 */
 			if (gs_ord)
+				/*
+				 * Empty swap's sentinel (relink_dest NULL): run_S's cells
+				 * are re-homed into dst by the run-replace below; run_D is
+				 * installed as swap's list after the extract publish.
+				 */
 				ft_root_list_swap_publish(swap_ft, swap_retire_txn,
 					&swap_ft->root,
 					swap_ft->root, empty,
-					swap_ft->ord_cell_head, NULL,
-					swap_ft->ord_cell_tail, NULL);
+					ft_ord_first(swap_ft), NULL,
+					ft_ord_last(swap_ft), NULL,
+					NULL, false);
 			else
 				ft_root_edge_flip(swap_ft, &swap_ft->root,
 					swap_ft->root, empty);
@@ -2145,12 +2196,25 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * unlink sync, so clearing run_D's boundary links is a plain store.
 			 */
 			if (gs_ord) {
-				gs_d_first->lnode.prev = NULL;
-				gs_d_last->lnode.next = NULL;
-				n = ft_ord_cell_endpoint_edge(&swap_ft->ord_cell_head,
-					swap_ft->ord_cell_head, gs_d_first, edges, n);
-				n = ft_ord_cell_endpoint_edge(&swap_ft->ord_cell_tail,
-					swap_ft->ord_cell_tail, gs_d_last, edges, n);
+				/*
+				 * swap_ft was emptied (swap_retire / already empty), so its
+				 * sentinel currently points at itself.  Point the run's outer
+				 * links at swap's sentinel (plain: swap was drained) and fuse
+				 * the sentinel endpoint flips (self -> run_D first/last) with
+				 * the structural root install above.
+				 */
+				gs_d_first->lnode.prev = &swap_ft->ord_sentinel.node;
+				gs_d_last->lnode.next = &swap_ft->ord_sentinel.node;
+				edges[n].slot = (struct ft_ord_cell **)
+					&swap_ft->ord_sentinel.node.next;
+				edges[n].old_target = ft_ord_sentinel_cell(swap_ft);
+				edges[n].new_target = gs_d_first;
+				n++;
+				edges[n].slot = (struct ft_ord_cell **)
+					&swap_ft->ord_sentinel.node.prev;
+				edges[n].old_target = ft_ord_sentinel_cell(swap_ft);
+				edges[n].new_target = gs_d_last;
+				n++;
 			}
 			/*
 			 * Freeze-on-free (doc §4.B): when @top_B replaces swap_ft's

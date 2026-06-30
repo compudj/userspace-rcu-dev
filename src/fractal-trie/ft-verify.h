@@ -957,8 +957,9 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
  * lockstep, asserting: the list visits exactly the trie's distinct-key heads
  * in the same order; each visited cell is the head's own cell (head->prev) and
  * cell->node points back at that head; the back-edge invariant
- * ord_next(c)->ord_prev == c holds; the minimum cell has ord_prev == NULL and
- * the cached ord_cell_head / ord_cell_tail equal the trie minimum / maximum.
+ * ord_next(c)->ord_prev == c holds; the minimum cell's ord_prev is the sentinel,
+ * the walk terminates at the sentinel, and ft_ord_first / ft_ord_last equal the
+ * trie minimum / maximum (an empty list = the sentinel pointing at itself).
  *
  * The oracle stays independent of the cell list (cache_valid cleared before
  * each step forces the full descent).  Runs under the caller's writer
@@ -984,12 +985,13 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 	cds_ft_lookup_inequality_impl(ft, iter, FT_LOOKUP_GE,
 			FT_LOOKUP_LIMIT_FIRST, false, false);
 	trie_head = cds_ft_iter_node(iter);
-	cell = ft->ord_cell_head;
+	/* Sentinel-or-first: walk starts at the first cell (sentinel if empty). */
+	cell = ft_ord_cell_resolve_ord(&ft->ord_sentinel.node.next);
 	if (trie_head &&
-	    ft_ord_cell_resolve_ord(&ft_ord_cell_ptr(trie_head->prev)->lnode.prev)
-		!= NULL) {
+	    !ft_ord_is_end(ft, ft_ord_cell_resolve_ord(
+			&ft_ord_cell_ptr(trie_head->prev)->lnode.prev))) {
 		if (out)
-			fprintf(out, "ft_verify: ord-cell min head %p cell has ord_prev != NULL\n",
+			fprintf(out, "ft_verify: ord-cell min head %p cell ord_prev is not the sentinel\n",
 				(void *) trie_head);
 		ret = -1;
 		goto out;
@@ -1016,8 +1018,16 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 			goto out;
 		}
 		max_cell = cell;
+		/*
+		 * At the list tail next_cell resolves to the sentinel (verify runs
+		 * under writer exclusion, so the list is fully circular here -- no
+		 * transient NULL termination).  The back-edge check below is SKIPPED
+		 * for that end (ft_ord_is_end short-circuits); the tail boundary
+		 * (sentinel.prev == the maximum cell) is validated separately by the
+		 * ft_ord_last() check after the loop.
+		 */
 		next_cell = ft_ord_cell_resolve_ord(&cell->lnode.next);
-		if (next_cell &&
+		if (!ft_ord_is_end(ft, next_cell) &&
 		    ft_ord_cell_resolve_ord(&next_cell->lnode.prev) != cell) {
 			if (out)
 				fprintf(out, "ft_verify: ord-cell back-edge broken at cell %p (ord_next %p whose ord_prev is %p)\n",
@@ -1031,16 +1041,16 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 		cds_ft_lookup_inequality_impl(ft, iter, FT_LOOKUP_GT,
 				FT_LOOKUP_LIMIT_NONE, false, false);
 	}
-	if (cell != NULL) {
+	if (!ft_ord_is_end(ft, cell)) {
 		if (out)
 			fprintf(out, "ft_verify: ord-cell list longer than trie (extra cell %p)\n",
 				(void *) cell);
 		ret = -1;
 	}
-	if (ret == 0 && ft->ord_cell_tail != max_cell) {
+	if (ret == 0 && ft_ord_last(ft) != max_cell) {
 		if (out)
-			fprintf(out, "ft_verify: ord-cell ord_cell_tail %p != trie maximum cell %p\n",
-				(void *) ft->ord_cell_tail, (void *) max_cell);
+			fprintf(out, "ft_verify: ord-cell tail %p != trie maximum cell %p\n",
+				(void *) ft_ord_last(ft), (void *) max_cell);
 		ret = -1;
 	}
 out:

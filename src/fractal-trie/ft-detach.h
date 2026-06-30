@@ -151,23 +151,42 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		/*
 		 * Give source a fresh empty root.  A root detach moves the
 		 * WHOLE trie, so when the ordered list is enabled @ft's entire
-		 * ordered cell list becomes @detached's: the cells' internal
-		 * links are unchanged; only the head/tail endpoints transfer.
-		 * Capture @ft's endpoints into @detached first (build-invisible:
-		 * no reader is in @detached yet), then fuse the root swap with
-		 * @ft's head/tail clear into ONE flip (ft_root_list_swap_publish,
-		 * src/disappear side) so a concurrent reader never observes @ft
-		 * with its structure emptied but its ordered list still populated
-		 * (or vice versa) -- a reader mid-iteration follows its RCU
-		 * snapshot into @detached.
+		 * ordered cell run becomes @detached's: the cells' internal
+		 * links are unchanged, and @ft's root swap is fused with its
+		 * sentinel clear into ONE flip (ft_root_list_swap_publish, src/
+		 * disappear side) so a concurrent reader never observes @ft with
+		 * its structure emptied but its ordered list still populated (or
+		 * vice versa) -- a reader mid-iteration follows its RCU snapshot
+		 * into @detached.  The run's OUTER links (first->prev, last->next)
+		 * are NOT relinked in that flip (relink_dest NULL): they stay at
+		 * @ft's sentinel, straddler-safe, and re-home to @detached's
+		 * sentinel only after the drain (ft_ord_finalize_circular).
+		 * @detached has no readers yet, so point its sentinel at the run
+		 * with plain stores.
 		 */
 		if (ft->group->ordered_list_set) {
-			detached->ord_cell_head = ft->ord_cell_head;
-			detached->ord_cell_tail = ft->ord_cell_tail;
+			struct ft_ord_cell *first = ft_ord_first(ft);
+			struct ft_ord_cell *last = ft_ord_last(ft);
+
+			/*
+			 * relink_dest NULL: clear @ft's sentinel + swap the root, but do
+			 * NOT relink the moved run's outer links in the flip -- they stay
+			 * pointing at @ft's (cleared) sentinel, which an @ft reader
+			 * straddling the move recognises as its own end (a foreign
+			 * @detached sentinel would be dereferenced as a cell).  @detached
+			 * has no readers, so point its sentinel at the run by plain store;
+			 * the run's outer links are finalized to @detached's sentinel after
+			 * the drain below (ft_ord_finalize_circular).
+			 */
 			ft_root_list_swap_publish(ft, root_txn, &ft->root,
 				ft->root, ft_node_flag(fresh_node, 0),
-				ft->ord_cell_head, NULL,
-				ft->ord_cell_tail, NULL);
+				first, NULL, last, NULL, NULL, false);
+			if (first) {
+				detached->ord_sentinel.node.next =
+					ft_ord_cell_lnode(first);
+				detached->ord_sentinel.node.prev =
+					ft_ord_cell_lnode(last);
+			}
 		} else {
 			/*
 			 * No ordered list: the root pointer is the only
@@ -192,6 +211,14 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 */
 		if (!ft->exclusive)
 			ft->group->flavor->update_synchronize_rcu();
+
+		/*
+		 * Drain done: restore @detached's list to circular form (the moved run's
+		 * outer links were left at @ft's sentinel for straddler safety; point
+		 * them at @detached's sentinel now for its own removes / reverse walks).
+		 */
+		if (ft->group->ordered_list_set)
+			ft_ord_finalize_circular(detached);
 
 		*result_ft = detached;
 		return CDS_FT_STATUS_OK;
@@ -534,6 +561,16 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				      fm > key_len ? fm - key_len : 0,
 				      CMM_RELAXED);
 		}
+
+		/*
+		 * Restore @detached's ordinal-cell list to its circular form now that
+		 * the drains above have retired any @ft reader straddling the moved run:
+		 * the run-install left the run's outer links at @ft's former neighbours
+		 * (straddler-safe), so point them at @detached's sentinel for the
+		 * exclusive trie's own removes / reverse walks.
+		 */
+		if (ft->group->ordered_list_set)
+			ft_ord_finalize_circular(detached);
 
 		*result_ft = detached;
 		return CDS_FT_STATUS_OK;

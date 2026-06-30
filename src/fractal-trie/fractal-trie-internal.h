@@ -601,6 +601,19 @@ struct urcu_txn_sw_list_node *ft_ord_cell_lnode(struct ft_ord_cell *cell)
 urcu_static_assert(sizeof(struct ft_ord_cell) <= (1U << FT_ORD_CELL_ALLOC_ORDER),
 		"struct ft_ord_cell must fit the cell arena item size",
 		ord_cell_fits_alloc_order);
+/*
+ * lnode MUST be the first field (offset 0): ft_ord_cell_of() is then a 0-offset
+ * cast, so ft_ord_cell_of(NULL) == NULL and ft_ord_cell_of(&ft->ord_sentinel.node)
+ * == &ft->ord_sentinel.node.  Both aliasings are load-bearing -- ft_ord_is_end()
+ * recognises a NULL link and the trie's own sentinel as "end" with a single
+ * pointer compare, and the cross-trie run moves NULL-terminate a moved run's
+ * outer links as a universal end.  A field placed before lnode would turn
+ * ft_ord_cell_of(NULL) into a small non-NULL garbage pointer that ft_ord_is_end()
+ * would mistake for a real cell.
+ */
+urcu_static_assert(offsetof(struct ft_ord_cell, lnode) == 0,
+		"struct ft_ord_cell.lnode must be the first field (offset 0)",
+		ord_cell_lnode_offset_zero);
 
 /*
  * FEATURE_FT_EXCL_VALIDATE: runtime validation of the access-discipline
@@ -1251,13 +1264,19 @@ struct cds_ft {
 	struct cds_ft_iter *ord_cell_scratch_iter;
 
 	/*
-	 * Cached endpoints of the ordinal-cell list (min / max), for O(1)
-	 * cds_ft_lookup_first / cds_ft_lookup_last.  Maintained by the splice
-	 * helpers via rcu_assign_pointer; read via rcu_dereference.  NULL when
-	 * the list is empty or disabled.
+	 * Per-trie circular sentinel of the ordinal-cell list.  The list is a
+	 * circular doubly-linked list of cells (struct ft_ord_cell.lnode) anchored
+	 * at this embedded sentinel node: ord_sentinel.node.next is the first cell's
+	 * lnode (the old ord_cell_head), .prev the last cell's lnode (the old
+	 * ord_cell_tail); the first cell's lnode.prev and the last cell's lnode.next
+	 * point back at &ord_sentinel.node.  An empty (or disabled) list has the
+	 * sentinel pointing at itself (urcu_txn_sw_list_init).  A resolved link that
+	 * equals &ord_sentinel.node is "off the end" (ft_ord_is_end); the head/tail
+	 * endpoint flips are now just the sentinel node's next/prev edges, produced
+	 * naturally by a normal splice whose boundary neighbour is the sentinel.  Read
+	 * the endpoints via ft_ord_first / ft_ord_last (NULL when empty).
 	 */
-	struct ft_ord_cell *ord_cell_head;
-	struct ft_ord_cell *ord_cell_tail;
+	struct urcu_txn_sw_list_head ord_sentinel;
 
 #ifdef FEATURE_FT_EXCL_VALIDATE
 	/*

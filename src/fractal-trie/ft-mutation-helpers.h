@@ -337,57 +337,118 @@ void ft_ord_cell_flip_one(struct ft_ord_cell_edge *edge)
 }
 
 /*
- * Append an endpoint (ord_cell_head / ord_cell_tail) update to a flip-edge batch
- * when @slot currently holds @match, so the endpoint transitions ATOMICALLY with
- * the neighbour edges in the same flip: a reader resolving ord_cell_head/tail via
- * ft_ord_cell_resolve_ord then sees a consistent old-XOR-new view (it never
- * observes the old head pointer together with an already-flipped back-edge).
- * @match/@newval may be NULL (empty-list transitions); the proxy mechanism and
- * the *slot == @match guard both handle NULL.  Returns the new edge count.
+ * Edge old/new TARGET for an ordinal-cell link: a real cell @c, or the trie's
+ * circular-sentinel pseudo-cell when the link points "off the end" (@c NULL).
+ * lnode is the cell's first field (offset 0), so this ft_ord_cell * value is
+ * bit-identical to the urcu_txn_sw_list_node * actually stored in the slot.
+ *
+ * In the sentinel topology the per-trie head/tail endpoint flips are no longer
+ * separate edges: the first/last cell's neighbour IS the sentinel, so recording
+ * its back-edge (&sentinel.node.next / .prev) through a normal 2-edge splice IS
+ * the old ord_cell_head / ord_cell_tail update.  ft_ord_cell_endpoint_edge is
+ * therefore gone; boundary neighbours just resolve to the sentinel pseudo-cell.
+ */
+static inline
+struct ft_ord_cell *ft_ord_or_sentinel(const struct cds_ft *ft,
+		struct ft_ord_cell *c)
+{
+	return c ? c : ft_ord_sentinel_cell(ft);
+}
+
+/*
+ * Append @ft's ordinal-cell sentinel endpoint edges for a whole-list transfer
+ * (the sentinel-model replacement for the old head/tail endpoint flips).  The
+ * sentinel's next edge transitions @head_old -> @head_new and its prev edge
+ * @tail_old -> @tail_new, where a NULL endpoint denotes the sentinel itself (an
+ * empty boundary, ft_ord_or_sentinel) -- so a side EMPTYING flips its sentinel
+ * to point at itself, a side FILLING flips it to point at the incoming run.  A
+ * no-op transition (old == new) records nothing.
+ *
+ * When @relink_dest is non-NULL (with @relink_incoming set), the INCOMING run
+ * [head_new..tail_new] also has its outer links repointed from @relink_dest's
+ * sentinel to this trie's, in the SAME flip.  This is sound ONLY because the
+ * run's source (@relink_dest) is an EXCLUSIVE trie with no straddlers
+ * (cds_ft_merge_at's appear: @relink_dest is the fresh detach product).
+ *
+ * An OUTGOING run is deliberately NEVER relinked to a LIVE foreign sentinel
+ * in-flip: a source straddler resolving such an outer link (global selector ->
+ * new) would land on the foreign sentinel and dereference it as a cell.  The
+ * cross-trie dual (ft_root_list_swap_publish_dual) instead NULL-terminates the
+ * moved run (universal end) and finalizes it to the receiving sentinel AFTER a
+ * drain; the single-side movers (detach / graft / merge src) leave the run at
+ * the source sentinel (relink_dest NULL) and re-home it post-drain.
  */
 static
-unsigned int ft_ord_cell_endpoint_edge(struct ft_ord_cell **slot,
-		struct ft_ord_cell *match, struct ft_ord_cell *newval,
+unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
+		struct ft_ord_cell *head_old, struct ft_ord_cell *head_new,
+		struct ft_ord_cell *tail_old, struct ft_ord_cell *tail_new,
+		struct cds_ft *relink_dest, bool relink_incoming,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
-	if (*slot == match) {
-		edges[n].slot = slot;
-		edges[n].old_target = match;
-		edges[n].new_target = newval;
+	struct ft_ord_cell *self = ft_ord_sentinel_cell(ft);
+	struct ft_ord_cell *hn_old = ft_ord_or_sentinel(ft, head_old);
+	struct ft_ord_cell *hn_new = ft_ord_or_sentinel(ft, head_new);
+	struct ft_ord_cell *tp_old = ft_ord_or_sentinel(ft, tail_old);
+	struct ft_ord_cell *tp_new = ft_ord_or_sentinel(ft, tail_new);
+
+	if (hn_old != hn_new) {
+		edges[n].slot = (struct ft_ord_cell **) &ft->ord_sentinel.node.next;
+		edges[n].old_target = hn_old;
+		edges[n].new_target = hn_new;
 		n++;
+	}
+	if (tp_old != tp_new) {
+		edges[n].slot = (struct ft_ord_cell **) &ft->ord_sentinel.node.prev;
+		edges[n].old_target = tp_old;
+		edges[n].new_target = tp_new;
+		n++;
+	}
+	/*
+	 * Incoming-run relink, EXCLUSIVE source only (merge_at appear).  The outgoing
+	 * direction (relink a moved run to a foreign sentinel) is intentionally absent
+	 * -- see the function comment: live cross-trie moves NULL-terminate + finalize
+	 * after a drain instead.
+	 */
+	if (relink_dest && relink_incoming) {
+		struct ft_ord_cell *dest = ft_ord_sentinel_cell(relink_dest);
+
+		if (head_new) {
+			edges[n].slot = (struct ft_ord_cell **) &head_new->lnode.prev;
+			edges[n].old_target = dest;
+			edges[n].new_target = self;
+			n++;
+		}
+		if (tail_new) {
+			edges[n].slot = (struct ft_ord_cell **) &tail_new->lnode.next;
+			edges[n].old_target = dest;
+			edges[n].new_target = self;
+			n++;
+		}
 	}
 	return n;
 }
 
 /*
- * Whole-trie root + ordered-list endpoint swap, fused in ONE flip.  The
- * empty-dst root-level graft (cds_ft_graft with key_len == 0) makes the empty
- * @dst adopt @src's ENTIRE structure AND its ENTIRE ordered list at once: the
- * root pointer transitions @struct_old -> @struct_new while ord_cell_head/tail
- * transition @head_old/@tail_old -> @head_new/@tail_new.  Recording all (<= 3)
- * edges in one flip closes the appear-side cross-view window -- a
- * reader never sees the keys reachable in the structure but the ordered list
- * still empty (it resolves the root and the head/tail proxies to ONE flip
- * phase, exactly as ft_ord_cell_swap_publish fuses a head swap with its cell
- * swap).  The src side reuses this with the roles reversed (full -> empty: the
- * root retires to a fresh empty root and head/tail clear to NULL) to close the
- * symmetric disappear window on the drained source.
- *
- * The structural root edge always flips; an endpoint edge is added only when
- * *slot == old (ft_ord_cell_endpoint_edge's proxy/NULL contract -- @head_old /
- * @tail_old are NULL for the appear side, the live cells for the src side).
- * The root slot resolves a flip proxy on EVERY reader load (ft_root_dereference
- * and friends), so a transient proxy parked here is view-resolved like any
- * other flipped slot.
+ * Whole-trie root + ordered-list transfer, fused in ONE flip.  The empty-dst
+ * root-level graft / cds_ft_merge_at appear (dst adopts a whole list), and the
+ * src-retire disappear (src empties), publish the root transition @struct_old ->
+ * @struct_new together with the sentinel endpoint edges (ft_ord_sentinel_edges)
+ * so a reader never sees the keys reachable in the structure but the ordered
+ * list inconsistent -- it resolves the root and the sentinel proxies to ONE flip
+ * phase.  @relink_dest (and @relink_incoming) cross-link the moved run's outer
+ * boundary to the destination trie's sentinel in the same flip (see
+ * ft_ord_sentinel_edges); pass NULL when the moved cells are re-homed separately
+ * (a later run-splice / interleave, or the source is exclusive).
  */
-#define FT_ROOT_LIST_SWAP_MAX_EDGES	3	/* root + head + tail */
+#define FT_ROOT_LIST_SWAP_MAX_EDGES	5	/* root + 2 sentinel + 2 relink */
 static
 void ft_root_list_swap_publish(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		struct cds_ft_inode_flag **struct_slot,
 		struct cds_ft_inode_flag *struct_old,
 		struct cds_ft_inode_flag *struct_new,
 		struct ft_ord_cell *head_old, struct ft_ord_cell *head_new,
-		struct ft_ord_cell *tail_old, struct ft_ord_cell *tail_new)
+		struct ft_ord_cell *tail_old, struct ft_ord_cell *tail_new,
+		struct cds_ft *relink_dest, bool relink_incoming)
 {
 	struct ft_ord_cell_edge edges[FT_ROOT_LIST_SWAP_MAX_EDGES];
 	unsigned int n = 0;
@@ -396,10 +457,8 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 	edges[n].old_target = (struct ft_ord_cell *) struct_old;
 	edges[n].new_target = (struct ft_ord_cell *) struct_new;
 	n++;
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, head_old, head_new,
-			edges, n);
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, tail_old, tail_new,
-			edges, n);
+	n = ft_ord_sentinel_edges(ft, head_old, head_new, tail_old, tail_new,
+			relink_dest, relink_incoming, edges, n);
 	/*
 	 * @txn is the caller-PRE-RESERVED bounded txn (every Class-G root swap
 	 * reserves in its fallible prefix), committed infallibly here -- the
@@ -630,12 +689,25 @@ struct ft_root_swap_side {
  * committed, disappear not yet) or in NEITHER.  Recording both sides' root (and,
  * list-on, head/tail) edges in ONE flip closes that window: the two
  * tries share a group, hence a flip selector, so a single epoch flip settles all
- * <= 6 edges atomically -- a reader resolves every root/endpoint proxy to ONE
+ * <= 10 edges atomically -- a reader resolves every root/endpoint proxy to ONE
  * phase and sees the key in exactly one trie.  All @old values must be captured
  * by the caller before the call (the two sides reference each other's pre-swap
  * roots/endpoints).
+ *
+ * Sentinel topology: unlike the single-side moves (detach / graft run-splice),
+ * the dual has NO drain between detach and attach -- it fuses both into ONE flip
+ * -- so it must NOT relink a moved run's outer links to the OTHER (foreign) trie's
+ * sentinel: a source straddler resolving that flipped link (global selector ->
+ * new) would land on a foreign sentinel and dereference it as a cell.  Instead
+ * each side NULL-TERMINATES its OUTGOING run's outer links in the flip (NULL is
+ * the universal end -- safe for a source straddler mid-iteration AND for a fresh
+ * reader on the receiving side).  Only the head/tail sentinel endpoints are
+ * relinked across the boundary (ft_ord_sentinel_edges, @relink_dest = NULL =
+ * head/tail only).  The caller then drains (synchronize_rcu, retiring straddlers)
+ * and calls ft_ord_finalize_circular() on each receiving side to repoint the run
+ * at its new sentinel, restoring the circular invariant the remove folding needs.
  */
-#define FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES	6	/* 2 roots + 2x head/tail */
+#define FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES	10	/* 2 roots + 2x (2 sentinel + 2 null-term) */
 static
 void ft_root_list_swap_publish_dual(struct urcu_txn_sw_txn *txn,
 		const struct ft_root_swap_side *a,
@@ -652,11 +724,32 @@ void ft_root_list_swap_publish_dual(struct urcu_txn_sw_txn *txn,
 		edges[n].old_target = (struct ft_ord_cell *) r->old_root;
 		edges[n].new_target = (struct ft_ord_cell *) r->new_root;
 		n++;
-		if (r->ft->group->ordered_list_set) {
-			n = ft_ord_cell_endpoint_edge(&r->ft->ord_cell_head,
-					r->head_old, r->head_new, edges, n);
-			n = ft_ord_cell_endpoint_edge(&r->ft->ord_cell_tail,
-					r->tail_old, r->tail_new, edges, n);
+		if (!r->ft->group->ordered_list_set)
+			continue;
+		/* Head/tail endpoints only (no foreign outer relink). */
+		n = ft_ord_sentinel_edges(r->ft, r->head_old, r->head_new,
+				r->tail_old, r->tail_new, NULL, false,
+				edges, n);
+		/*
+		 * NULL-terminate this side's OUTGOING run [head_old..tail_old]
+		 * (the whole list -- the dual only moves whole tries -- so its
+		 * outer links currently point at r->ft's own sentinel).  The
+		 * receiving side's finalize re-homes them to the new sentinel
+		 * after the drain.
+		 */
+		if (r->head_old) {
+			struct ft_ord_cell *self = ft_ord_sentinel_cell(r->ft);
+
+			edges[n].slot = (struct ft_ord_cell **)
+				&r->head_old->lnode.prev;
+			edges[n].old_target = self;
+			edges[n].new_target = NULL;
+			n++;
+			edges[n].slot = (struct ft_ord_cell **)
+				&r->tail_old->lnode.next;
+			edges[n].old_target = self;
+			edges[n].new_target = NULL;
+			n++;
 		}
 	}
 	/*
@@ -755,20 +848,24 @@ unsigned int ft_ord_cell_run_detach_edges(struct cds_ft *ft,
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->lnode.prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->lnode.next);
 
-	if (pred) {
-		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-		edges[n].old_target = first;
-		edges[n].new_target = succ;
-		n++;
-	}
-	if (succ) {
-		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-		edges[n].old_target = last;
-		edges[n].new_target = pred;
-		n++;
-	}
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, first, succ, edges, n);
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, last, pred, edges, n);
+	(void) ft;
+	/*
+	 * Sentinel topology: @pred / @succ are the run's @ft-side neighbours, which
+	 * resolve to @ft's sentinel pseudo-cell when the run sits at @ft's head /
+	 * tail -- so recording &pred->lnode.next / &succ->lnode.prev IS the old
+	 * head/tail repair when @pred / @succ is the sentinel (no separate endpoint
+	 * edge).  The run's OUTER boundary links (first->prev, last->next) are
+	 * re-homed to @into by ft_ord_cell_run_install after the flip (@into is
+	 * exclusive: plain stores).
+	 */
+	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].old_target = first;
+	edges[n].new_target = succ;
+	n++;
+	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].old_target = last;
+	edges[n].new_target = pred;
+	n++;
 	*first_out = first;
 	*last_out = last;
 	return n;
@@ -777,21 +874,59 @@ unsigned int ft_ord_cell_run_detach_edges(struct cds_ft *ft,
 /*
  * Install the excised run (its endpoint cells, captured by
  * ft_ord_cell_run_detach_edges) as the ENTIRE ordered list of the exclusive
- * @into trie.  @into has no readers, so plain stores.  MUST run after the flip
- * that excised the run from @ft.
+ * @into trie.  @into has no readers, so plain stores: point its sentinel at the
+ * run.  The run's OUTER links (first->prev, last->next) are LEFT pointing at
+ * @ft's former neighbours -- which a SOURCE-trie reader straddling the move (still
+ * parked on a run cell, walking that outer link) recognises (an @ft cell or @ft's
+ * own sentinel), so it stops / re-enters @ft instead of dereferencing @into's
+ * (foreign, to that reader) sentinel as a cell.  The detach finalizes @into's
+ * outer links to @into's sentinel AFTER its drain (ft_ord_finalize_circular),
+ * once no straddling source reader remains, restoring the in-trie invariant the
+ * remove folding / reverse walk need.  MUST run after the flip that excised the
+ * run from @ft.
  */
 static
 void ft_ord_cell_run_install(struct cds_ft *into, struct ft_ord_cell *first,
 		struct ft_ord_cell *last)
 {
-	first->lnode.prev = NULL;
-	last->lnode.next = NULL;
-	into->ord_cell_head = first;
-	into->ord_cell_tail = last;
+	into->ord_sentinel.node.next = ft_ord_cell_lnode(first);
+	into->ord_sentinel.node.prev = ft_ord_cell_lnode(last);
 }
 
-/* Max edges a run-detach commits: run's <=2 outer back-edges + head + tail. */
-#define FT_ORD_CELL_RUN_DETACH_MAX_EDGES	4
+/*
+ * Make @ft's ordinal-cell list properly circular: point its run's outer boundary
+ * links at the sentinel (first->prev and last->next).  A bulk move into @ft
+ * leaves those outer links pointing at a UNIVERSAL terminator -- the SOURCE
+ * trie's sentinel (detach into an exclusive @into) or NULL (the cross-trie dual
+ * swaps, where the receiving side is itself live) -- straddler-safe in either
+ * case (every reader treats its own sentinel or NULL as the end).  This runs
+ * AFTER the move's drain, once no straddling source reader remains, to restore
+ * the in-trie invariant (first->prev == sentinel) the remove folding and reverse
+ * walk rely on.  A no-op on an empty list.
+ *
+ * @ft may be LIVE here (the empty-dst graft / whole-trie swap finalize a trie
+ * that already carries concurrent readers of the just-moved run), so the stores
+ * are rcu_assign_pointer, not plain: a receiving-side reader racing the finalize
+ * resolves the outer link to either the old terminator (NULL / its own sentinel)
+ * or the new sentinel -- both a valid end for THAT trie's reader, so the race is
+ * benign, but the store must still be atomic to pair with the reader's
+ * rcu_dereference.  (For detach's exclusive @into the release barrier is a
+ * harmless extra.)
+ */
+static
+void ft_ord_finalize_circular(struct cds_ft *ft)
+{
+	struct ft_ord_cell *first = ft_ord_first(ft);
+	struct ft_ord_cell *last = ft_ord_last(ft);
+
+	if (first) {
+		rcu_assign_pointer(first->lnode.prev, &ft->ord_sentinel.node);
+		rcu_assign_pointer(last->lnode.next, &ft->ord_sentinel.node);
+	}
+}
+
+/* Max edges a run-detach commits: the run's two outer back-edges. */
+#define FT_ORD_CELL_RUN_DETACH_MAX_EDGES	2
 
 /*
  * Excise the run [@first_head .. @last_head] from @ft's ordered list and install
@@ -981,12 +1116,20 @@ struct ft_ord_cell *ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
 }
 
 /*
- * Append @cell's ordered-list unsplice edges (its <=2 neighbour back-edges plus
- * any head/tail endpoint repair) to @edges, returning the new count.  @cell
- * keeps its own links for parked readers until its deferred free.  Split out so
- * a key-disappearing remove can fuse these edges with its structural unlink in
- * a single flip (ft_remove_one_commit); ft_ord_cell_unsplice is the standalone
- * (two-commit) wrapper.
+ * Append @cell's ordered-list unsplice edges (its two neighbour back-edges) to
+ * @edges, returning the new count.  @cell keeps its own links for parked readers
+ * until its deferred free.  Split out so a key-disappearing remove can fuse these
+ * edges with its structural unlink in a single flip (ft_remove_one_commit);
+ * ft_ord_cell_unsplice is the standalone (two-commit) wrapper.
+ *
+ * The two edges this records -- pred->next: cell -> succ and succ->prev: cell ->
+ * pred -- are EXACTLY urcu_txn_sw_list_del_prepare's edge set on @cell->lnode;
+ * the public op is used directly where the cell records straight into a held txn
+ * (the point ops), while the fused removes build into this edge array to commit
+ * the cell unsplice and the structural unlink in one flip.  Sentinel topology:
+ * @pred / @succ resolve to @ft's sentinel pseudo-cell when @cell is the list
+ * first / last, so &pred->lnode.next / &succ->lnode.prev IS the old head / tail
+ * endpoint flip -- no separate endpoint edge.
  */
 static
 unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
@@ -996,25 +1139,20 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&cell->lnode.prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&cell->lnode.next);
 
-	if (pred) {
-		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-		edges[n].old_target = cell;
-		edges[n].new_target = succ;
-		n++;
-	}
-	if (succ) {
-		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-		edges[n].old_target = cell;
-		edges[n].new_target = pred;
-		n++;
-	}
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, cell, succ, edges, n);
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, cell, pred, edges, n);
+	(void) ft;
+	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].old_target = cell;
+	edges[n].new_target = succ;
+	n++;
+	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].old_target = cell;
+	edges[n].new_target = pred;
+	n++;
 	return n;
 }
 
-/* Max edges an unsplice commits: <=2 neighbour back-edges + head + tail. */
-#define FT_ORD_CELL_UNSPLICE_MAX_EDGES	4
+/* Max edges an unsplice commits: the two neighbour back-edges. */
+#define FT_ORD_CELL_UNSPLICE_MAX_EDGES	2
 
 /*
  * Remove @cell from the ordered cell list (its key disappeared) by committing
@@ -1033,9 +1171,6 @@ void ft_ord_cell_unsplice(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 
 	ft_ord_cell_flip_into(ft, txn, edges, n);
 }
-
-/* Max edges a relocation cell-swap commits: <=2 neighbour back-edges + head + tail. */
-#define FT_ORD_CELL_SWAP_MAX_EDGES	4
 
 /*
  * Replace @old_cell with @new_cell at the same list position.  @new_cell
@@ -1057,28 +1192,22 @@ static
 int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		struct ft_ord_cell *new_cell)
 {
-	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->lnode.prev);
-	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->lnode.next);
-	struct ft_ord_cell_edge edges[FT_ORD_CELL_SWAP_MAX_EDGES];
-	unsigned int n = 0;
+	struct urcu_txn_sw_txn *t = ft_flip_txn_create_bounded(2);
 
-	new_cell->lnode.prev = ft_ord_cell_lnode(pred);
-	new_cell->lnode.next = ft_ord_cell_lnode(succ);
-	if (pred) {
-		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-		edges[n].old_target = old_cell;
-		edges[n].new_target = new_cell;
-		n++;
-	}
-	if (succ) {
-		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-		edges[n].old_target = old_cell;
-		edges[n].new_target = new_cell;
-		n++;
-	}
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, old_cell, new_cell, edges, n);
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, old_cell, new_cell, edges, n);
-	return ft_ord_cell_flip_try(ft, edges, n);
+	if (caa_unlikely(!t))
+		return -ENOMEM;
+	/*
+	 * Single-cell in-place replace via the public composable op: it records
+	 * prev->next: old -> new and next->prev: old -> new into our FT flip-txn
+	 * (FT's type-7 proxy tag applies, so the bidirectional ordered reader
+	 * resolves the splice atomically).  Sentinel topology: @old_cell's
+	 * neighbours are its sentinel when it is the list first / last, so the same
+	 * two records ARE the old head / tail relocation -- no endpoint edge.
+	 */
+	(void) urcu_txn_sw_list_replace_prepare(t, ft_ord_cell_lnode(old_cell),
+		ft_ord_cell_lnode(new_cell));
+	ft_flip_txn_commit(ft, t);
+	return 0;
 }
 
 /*
@@ -1099,22 +1228,24 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
 	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->lnode.prev);
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->lnode.next);
 
+	(void) ft;
 	new_cell->lnode.prev = ft_ord_cell_lnode(pred);
 	new_cell->lnode.next = ft_ord_cell_lnode(succ);
-	if (pred) {
-		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-		edges[n].old_target = old_cell;
-		edges[n].new_target = new_cell;
-		n++;
-	}
-	if (succ) {
-		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-		edges[n].old_target = old_cell;
-		edges[n].new_target = new_cell;
-		n++;
-	}
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, old_cell, new_cell, edges, n);
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, old_cell, new_cell, edges, n);
+	/*
+	 * Sentinel topology: @pred / @succ resolve to the sentinel when @old_cell
+	 * is the list first / last, so &pred->lnode.next / &succ->lnode.prev IS the
+	 * old head / tail relocation -- the same two edges as
+	 * urcu_txn_sw_list_replace_prepare, built into the fusion array so the head
+	 * swap rides the SAME flip as a second reader-visible structural edge.
+	 */
+	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].old_target = old_cell;
+	edges[n].new_target = new_cell;
+	n++;
+	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].old_target = old_cell;
+	edges[n].new_target = new_cell;
+	n++;
 	return n;
 }
 
@@ -1516,28 +1647,30 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 		struct ft_ord_cell *pred, struct ft_ord_cell *succ,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
+	/*
+	 * Sentinel topology: a NULL boundary neighbour (run at @dst's head / tail)
+	 * IS @dst's sentinel, so the run's outer link and the back-edge land on
+	 * &dst->ord_sentinel.node -- recording the old head / tail flip without a
+	 * separate endpoint edge.
+	 */
+	pred = ft_ord_or_sentinel(dst, pred);
+	succ = ft_ord_or_sentinel(dst, succ);
 	/* Pre-set the run's outer links; not yet reachable via @dst's list. */
 	run_first->lnode.prev = ft_ord_cell_lnode(pred);
 	run_last->lnode.next = ft_ord_cell_lnode(succ);
-	if (pred) {
-		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-		edges[n].old_target = succ;
-		edges[n].new_target = run_first;
-		n++;
-	}
-	if (succ) {
-		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-		edges[n].old_target = pred;
-		edges[n].new_target = run_last;
-		n++;
-	}
-	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_head, succ, run_first, edges, n);
-	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_tail, pred, run_last, edges, n);
+	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].old_target = succ;
+	edges[n].new_target = run_first;
+	n++;
+	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].old_target = pred;
+	edges[n].new_target = run_last;
+	n++;
 	return n;
 }
 
-/* Max edges a run-splice commits: <=2 boundary back-edges + head + tail. */
-#define FT_ORD_CELL_RUN_SPLICE_MAX_EDGES	4
+/* Max edges a run-splice commits: the two boundary back-edges. */
+#define FT_ORD_CELL_RUN_SPLICE_MAX_EDGES	2
 
 /*
  * Pre-sets the run's outer links (run not yet reachable in @dst), flips the
@@ -1609,30 +1742,31 @@ unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
 	struct ft_ord_cell *new_first = s_first ? s_first : succ;
 	struct ft_ord_cell *new_last = s_last ? s_last : pred;
 
+	(void) dst;
 	if (s_first) {
 		/* Pre-set run_S's outer links; not yet reachable via @dst. */
 		s_first->lnode.prev = ft_ord_cell_lnode(pred);
 		s_last->lnode.next = ft_ord_cell_lnode(succ);
 	}
-	if (pred) {
-		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-		edges[n].old_target = d_first;
-		edges[n].new_target = new_first;
-		n++;
-	}
-	if (succ) {
-		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-		edges[n].old_target = d_last;
-		edges[n].new_target = new_last;
-		n++;
-	}
-	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_head, d_first, new_first, edges, n);
-	n = ft_ord_cell_endpoint_edge(&dst->ord_cell_tail, d_last, new_last, edges, n);
+	/*
+	 * Sentinel topology: @pred / @succ resolve to @dst's sentinel when run_D is
+	 * at @dst's head / tail, so &pred->lnode.next / &succ->lnode.prev IS the old
+	 * head / tail repair.  An empty swap (s_first NULL) closes the gap: new_first
+	 * = succ, new_last = pred (the sentinel when run_D spanned the whole list).
+	 */
+	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].old_target = d_first;
+	edges[n].new_target = new_first;
+	n++;
+	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].old_target = d_last;
+	edges[n].new_target = new_last;
+	n++;
 	return n;
 }
 
-/* Max edges a run-replace commits: <=2 boundary back-edges + head + tail. */
-#define FT_ORD_CELL_RUN_REPLACE_MAX_EDGES	4
+/* Max edges a run-replace commits: the two boundary back-edges. */
+#define FT_ORD_CELL_RUN_REPLACE_MAX_EDGES	2
 
 /*
  * Standalone (two-commit) run-replace: swap run_D out for run_S at run_D's
@@ -1705,12 +1839,12 @@ void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct urcu_txn_sw_txn *txn
  * Remove the contiguous run [@first_head .. @last_head] from @ft's ordered list
  * WITHOUT re-homing it -- the cds_ft_merge source side, where the run's cells
  * disperse (survivors are spliced into dst, collided heads are freed).  Relink
- * the two boundary edges (atomic for @ft's live readers) and repair head/tail;
- * the run cells keep their stale links (caller no longer references them as a
- * run).  Whole-list removal (pred == succ == NULL) clears head/tail.
+ * the two boundary edges (atomic for @ft's live readers); the run cells keep
+ * their stale links (caller no longer references them as a run).  Whole-list
+ * removal leaves @ft's sentinel pointing at itself (empty).
  */
-/* Max edges a run-unlink commits: the two boundary back-edges + head + tail. */
-#define FT_ORD_CELL_RUN_UNLINK_MAX_EDGES	4
+/* Max edges a run-unlink commits: the two boundary back-edges. */
+#define FT_ORD_CELL_RUN_UNLINK_MAX_EDGES	2
 
 #ifdef FEATURE_FT_MERGE
 static
@@ -1726,20 +1860,20 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 	struct ft_ord_cell_edge edges[FT_ORD_CELL_RUN_UNLINK_MAX_EDGES];
 	unsigned int n = 0;
 
-	if (pred) {
-		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-		edges[n].old_target = first;
-		edges[n].new_target = succ;
-		n++;
-	}
-	if (succ) {
-		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-		edges[n].old_target = last;
-		edges[n].new_target = pred;
-		n++;
-	}
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, first, succ, edges, n);
-	n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, last, pred, edges, n);
+	(void) ft;
+	/*
+	 * Sentinel topology: @pred / @succ resolve to @ft's sentinel when the run
+	 * sits at @ft's head / tail (the whole-list case leaves it self-pointing =
+	 * empty).  No separate endpoint edge.
+	 */
+	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].old_target = first;
+	edges[n].new_target = succ;
+	n++;
+	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].old_target = last;
+	edges[n].new_target = pred;
+	n++;
 	ft_ord_cell_flip_into(ft, txn, edges, n);
 }
 #endif /* FEATURE_FT_MERGE */

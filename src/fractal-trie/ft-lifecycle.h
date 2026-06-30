@@ -663,6 +663,13 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	/* Cache the group's ordered-list mode for the read-side cell gate. */
 	ft->ordered_list = ft_group->ordered_list_set;
 	/*
+	 * A fresh trie's ordinal-cell list is empty: init the circular sentinel so
+	 * it points at itself (calloc would leave it NULL, which is not a valid
+	 * empty circular list).  Done unconditionally -- cheap, and every created
+	 * trie (incl. the transient detach / merge tries) flows through here.
+	 */
+	urcu_txn_sw_list_init(&ft->ord_sentinel);
+	/*
 	 * Effective per-trie speculative-key state: the group is configured for
 	 * speculative result-key capture AND this trie did not opt out via
 	 * cds_ft_attr_set_speculative_keys(attr, false).  Set BEFORE
@@ -713,8 +720,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	/*
 	 * Ordinal-cell list enabled: eagerly allocate the writer-side scratch
 	 * iterator used for cell predecessor discovery
-	 * (ft_ord_cell_find_pred_from_head).  ord_cell_head / ord_cell_tail are
-	 * NULL from calloc.
+	 * (ft_ord_cell_find_pred_from_head).  The ordinal-cell list sentinel was
+	 * already inited (empty) above.
 	 */
 	if (ft_group->ordered_list_set &&
 	    cds_ft_iter_create(ft, &ft->ord_cell_scratch_iter) != CDS_FT_STATUS_OK) {

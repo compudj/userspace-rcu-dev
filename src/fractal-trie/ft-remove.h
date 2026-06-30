@@ -1008,6 +1008,20 @@ int ft_detach_node(struct cds_ft *ft,
 					if (cret == 0) {
 						ret = 0;
 						boundary_fused = true;
+						/*
+						 * Shape-D already fused @fuse_cell's unsplice
+						 * (ft_chain_compress_fused -> ft_remove_commit_rec)
+						 * INTO this commit, so signal the caller: a
+						 * standalone two-commit unsplice would re-record the
+						 * (now stale) head/tail neighbour edge and reopen a
+						 * cross-view window where a reader sees the removed
+						 * key's cell as the ordered min after its structural
+						 * removal.  @pub is non-NULL only on the fuse_cell
+						 * point-remove path; the bulk @run is armed by
+						 * ft_remove_commit_rec itself.
+						 */
+						if (pub)
+							pub->armed = true;
 					} else if (cret < 0) {
 						ret = cret;
 						goto end;

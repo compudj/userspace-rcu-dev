@@ -73,8 +73,80 @@ struct ft_ord_cell *ft_ord_cell_resolve_ord(struct urcu_txn_sw_list_node *const 
 	if (caa_unlikely(ft_node_flip_proxy((struct cds_ft_inode_flag *) p)))
 		p = (struct urcu_txn_sw_list_node *) urcu_txn_sw_proxy_get(
 			ft_flip_proxy_ptr((struct cds_ft_inode_flag *) p));
-	/* NULL-terminated ends resolve to NULL (head/tail topology kept here). */
-	return p ? ft_ord_cell_of(p) : NULL;
+	/*
+	 * Circular topology: a link "off the end" resolves to the per-trie
+	 * sentinel node, NOT NULL.  The returned value is a pseudo-cell
+	 * (ft_ord_cell_of(&sentinel.node)) whose ONLY valid use is the
+	 * ft_ord_is_end() boundary test -- it is a bare urcu_txn_sw_list_node, not a
+	 * full cell, so never deref its node/parent.  Use ft_ord_first / ft_ord_last
+	 * when a NULL-if-empty endpoint is wanted.
+	 */
+	return ft_ord_cell_of(p);
+}
+
+/*
+ * The ordinal-cell list's circular sentinel as a pseudo-cell: lnode is the
+ * first field of struct ft_ord_cell (offset 0), so ft_ord_cell_of(&sentinel.node)
+ * is bit-identical to &ft->ord_sentinel.node.  Valid ONLY as the ft_ord_is_end
+ * comparison value and as a flip-edge old/new target denoting the list boundary.
+ */
+static inline_lookup
+struct ft_ord_cell *ft_ord_sentinel_cell(const struct cds_ft *ft)
+{
+	return ft_ord_cell_of(&ft->ord_sentinel.node);
+}
+
+/*
+ * True when @c is a resolved forward / backward link that points "off the end"
+ * of @ft's ordinal-cell list: @ft's own circular sentinel, OR NULL.
+ *
+ * NULL is kept as a UNIVERSAL (trie-agnostic) end marker: a cross-trie bulk move
+ * cannot point a moved run's outer link at the DESTINATION trie's sentinel
+ * without that foreign sentinel becoming reachable to a SOURCE-trie reader
+ * straddling the move (the source reader would not recognise another trie's
+ * sentinel and would dereference it as a cell).  So a run handed to an exclusive
+ * transient trie (ft_ord_cell_run_install) terminates at NULL, which every
+ * trie's reader treats as the end -- exactly as the pre-sentinel NULL-terminated
+ * list did.  The cells regain a real sentinel link when re-homed into a live
+ * trie (run-splice / interleave overwrite their outer links), so the in-trie
+ * remove folding (which needs first->prev == sentinel) is unaffected.
+ */
+static inline_lookup
+bool ft_ord_is_end(const struct cds_ft *ft, const struct ft_ord_cell *c)
+{
+	return !c || &c->lnode == &ft->ord_sentinel.node;
+}
+
+/*
+ * First cell of @ft's ordinal-cell list in key order, or NULL when the list is
+ * empty -- the sentinel-model replacement for reading ord_cell_head.  Resolves a
+ * flip proxy (a concurrent splice/run move flips the sentinel's next edge).
+ */
+static inline_lookup
+struct ft_ord_cell *ft_ord_first(const struct cds_ft *ft)
+{
+	struct ft_ord_cell *c =
+		ft_ord_cell_resolve_ord(&ft->ord_sentinel.node.next);
+
+	return ft_ord_is_end(ft, c) ? NULL : c;
+}
+
+/* Last cell of @ft's ordinal-cell list, or NULL when empty (old ord_cell_tail). */
+static inline_lookup
+struct ft_ord_cell *ft_ord_last(const struct cds_ft *ft)
+{
+	struct ft_ord_cell *c =
+		ft_ord_cell_resolve_ord(&ft->ord_sentinel.node.prev);
+
+	return ft_ord_is_end(ft, c) ? NULL : c;
+}
+
+/* True when @ft's ordinal-cell list is empty (the sentinel points at itself). */
+static inline_lookup
+bool ft_ord_empty(const struct cds_ft *ft)
+{
+	return ft_ord_is_end(ft,
+		ft_ord_cell_resolve_ord(&ft->ord_sentinel.node.next));
 }
 
 /*

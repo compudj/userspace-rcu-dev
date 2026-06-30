@@ -155,9 +155,8 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		struct ft_insert_commit *ic)
 {
 	if (cell) {
-		struct ft_ord_cell *pred, *succ;
-		struct ft_ord_cell_edge edges[4];
-		unsigned int i, n = 0;
+		struct ft_ord_cell *pred;
+		struct urcu_txn_sw_list_node *pred_lnode;
 
 		/*
 		 * Locate the predecessor.  From-HEAD (seed at the fresh head, walk the
@@ -176,35 +175,21 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 */
 		pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
 			ic->live_child != NULL || !ic->publish_to_parent);
-		if (pred)
-			succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
-		else
-			/* New minimum: successor is the old list head (O(1), no descent). */
-			succ = ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &ft->ord_cell_head);
-		/* Pre-set @cell's own links; not yet reachable via the list. */
-		cell->lnode.prev = ft_ord_cell_lnode(pred);
-		cell->lnode.next = ft_ord_cell_lnode(succ);
-		if (pred) {
-			edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
-			edges[n].old_target = succ;
-			edges[n].new_target = cell;
-			n++;
-		}
-		if (succ) {
-			edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
-			edges[n].old_target = pred;
-			edges[n].new_target = cell;
-			n++;
-		}
-		/* New min (!pred) => head was @succ; new max (!succ) => tail was @pred. */
-		n = ft_ord_cell_endpoint_edge(&ft->ord_cell_head, succ, cell, edges, n);
-		n = ft_ord_cell_endpoint_edge(&ft->ord_cell_tail, pred, cell, edges, n);
-		/* Record the ordered-list edges (freeze-before-install; each resolves
-		 * to OLD until the commit installs + flips). */
-		for (i = 0; i < n; i++)
-			ft_flip_txn_record_reserved(ic->txn, (void **) edges[i].slot,
-				(void *) edges[i].old_target,
-				(void *) edges[i].new_target);
+		/*
+		 * Splice @cell after @pred via the public composable op, recorded
+		 * straight into the structural commit txn (FT's type-7 proxy tag
+		 * applies, so the splice is atomic with the structural publish for a
+		 * bidirectional ordered reader).  Sentinel topology: a new MINIMUM (no
+		 * predecessor) splices after the sentinel node -- add_after(sentinel) IS
+		 * the old "head was @succ" endpoint flip; a new maximum lands before the
+		 * sentinel naturally (pred->next was the sentinel).  add_after_prepare
+		 * records pred->next: succ -> cell and succ->prev: pred -> cell, where
+		 * either neighbour may be the sentinel -- the old <=4 hand-built edges
+		 * (incl. head/tail) collapse to its 2.
+		 */
+		pred_lnode = pred ? ft_ord_cell_lnode(pred) : &ft->ord_sentinel.node;
+		(void) urcu_txn_sw_list_add_after_prepare(ic->txn,
+			ft_ord_cell_lnode(cell), pred_lnode);
 	}
 
 	/*

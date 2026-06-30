@@ -759,7 +759,18 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 	uint8_t dbuf[FT_MAX_KEY_LEN];
 	struct ft_ord_cell *dcur = dst_first;
 	struct ft_ord_cell *prev = prev_placed;
-	bool prev_is_dst = (prev_placed != NULL);
+	/*
+	 * Sentinel topology: @prev_placed is the region predecessor, which now
+	 * resolves to @dst's sentinel pseudo-cell (never NULL) when the region is
+	 * at the list head.  prev_is_dst tracks "the previously-placed cell is
+	 * already linked to its successor and needs no forward edge" -- true at the
+	 * start because the predecessor->region-first link pre-exists (whether the
+	 * predecessor is a real dst cell or the sentinel: sentinel.next already
+	 * points at the region's first cell).  So the old "new list minimum" /
+	 * "list tail" head/tail special cases fold into the general neighbour-edge
+	 * path (the sentinel IS the neighbour).
+	 */
+	bool prev_is_dst = true;
 	unsigned long si = 0;
 	unsigned int n = 0;
 	const uint8_t *dsuf = NULL;
@@ -810,9 +821,9 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 			/*
 			 * Dst-original cell: stays put, already linked in key
 			 * order.  Its back edge changes only when a survivor run
-			 * was just placed before it.
+			 * was just placed before it (prev is a survivor).
 			 */
-			if (prev && !prev_is_dst) {
+			if (!prev_is_dst) {
 				prev->lnode.next = ft_ord_cell_lnode(cell);	/* survivor: invisible */
 				edges[n].slot = (struct ft_ord_cell **) &cell->lnode.prev;
 				edges[n].old_target =
@@ -827,17 +838,15 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 		} else {
 			struct ft_ord_cell *cell = src_caps[si].cell;
 
-			/* Surviving src cell: pre-set its back link. */
+			/* Surviving src cell: pre-set its back link (prev may be the
+			 * sentinel: a new list minimum links its prev to &sentinel). */
 			cell->lnode.prev = ft_ord_cell_lnode(prev);		/* invisible */
-			if (!prev) {
-				/* new list minimum: flip @dst head. */
-				edges[n].slot = &dst->ord_cell_head;
-				edges[n].old_target =
-					ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &dst->ord_cell_head);
-				edges[n].new_target = cell;
-				n++;
-			} else if (prev_is_dst) {
-				/* dst -> survivor: flip the dst cell's fwd edge. */
+			if (prev_is_dst) {
+				/*
+				 * prev is a dst cell OR the sentinel (region at head):
+				 * flip its forward edge to the survivor.  When prev is the
+				 * sentinel this IS the old "new list minimum: flip head".
+				 */
 				edges[n].slot = (struct ft_ord_cell **) &prev->lnode.next;
 				edges[n].old_target =
 					ft_ord_cell_resolve_ord(&prev->lnode.next);
@@ -853,24 +862,17 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 	}
 	/*
 	 * Close the trailing edge: if the last placed cell is a survivor, link it
-	 * to the region successor (@dst_succ; NULL at the list tail) and flip that
-	 * neighbour's back edge -- or @dst's tail when there is none.
+	 * to the region successor @dst_succ (the sentinel at the list tail) and flip
+	 * that neighbour's back edge.  Sentinel topology: when @dst_succ is the
+	 * sentinel this IS the old "flip @dst's tail".
 	 */
-	if (prev && !prev_is_dst) {
+	if (!prev_is_dst) {
 		prev->lnode.next = ft_ord_cell_lnode(dst_succ);	/* survivor: invisible */
-		if (!dst_succ) {
-			edges[n].slot = &dst->ord_cell_tail;
-			edges[n].old_target =
-				ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &dst->ord_cell_tail);
-			edges[n].new_target = prev;
-			n++;
-		} else {
-			edges[n].slot = (struct ft_ord_cell **) &dst_succ->lnode.prev;
-			edges[n].old_target =
-				ft_ord_cell_resolve_ord(&dst_succ->lnode.prev);
-			edges[n].new_target = prev;
-			n++;
-		}
+		edges[n].slot = (struct ft_ord_cell **) &dst_succ->lnode.prev;
+		edges[n].old_target =
+			ft_ord_cell_resolve_ord(&dst_succ->lnode.prev);
+		edges[n].new_target = prev;
+		n++;
 	}
 	return n;
 }
@@ -1492,11 +1494,16 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * flip), so the post-commit interleave still re-homes them to dst.
 		 */
 		if (ms_ord) {
+			/*
+			 * Empty src's sentinel (relink_dest NULL): the run cells are
+			 * re-homed into dst by the post-commit interleave, which sets each
+			 * survivor's links individually (collided heads are freed).
+			 */
 			ft_root_list_swap_publish(src_ft, src_side_txn,
 				&src_ft->root,
 				src_ft->root, ft_node_flag(fresh_root, 0),
-				src_ft->ord_cell_head, NULL,
-				src_ft->ord_cell_tail, NULL);
+				ft_ord_first(src_ft), NULL,
+				ft_ord_last(src_ft), NULL, NULL, false);
 			src_side_txn = NULL;	/* consumed */
 		} else {
 			/*
@@ -2432,12 +2439,18 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 */
 		ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(old_dst_root));
 		if (dst_ft->group->ordered_list_set) {
+			/*
+			 * dst FILLS by adopting @subtree's whole list.  @subtree is the
+			 * fresh EXCLUSIVE detach product (no readers), so its incoming run
+			 * relinks to dst's sentinel in the SAME flip (relink_dest = subtree,
+			 * relink_incoming = true); @subtree's sentinel resets to empty with
+			 * a plain store.
+			 */
 			ft_root_list_swap_publish(dst_ft, appear_txn, &dst_ft->root,
 				dst_ft->root, subtree->root,
-				NULL, subtree->ord_cell_head,
-				NULL, subtree->ord_cell_tail);
-			subtree->ord_cell_head = NULL;
-			subtree->ord_cell_tail = NULL;
+				NULL, ft_ord_first(subtree),
+				NULL, ft_ord_last(subtree), subtree, true);
+			urcu_txn_sw_list_init(&subtree->ord_sentinel);
 		} else {
 			/*
 			 * No ordered list: dst's root is the only reader-visible

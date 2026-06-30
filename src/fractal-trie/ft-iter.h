@@ -736,9 +736,18 @@ enum cds_ft_status ft_cell_batch_dir(struct cds_ft *ft,
 		cur = (struct ft_ord_cell *) cursor;	/* resume AT the cell */
 	else
 		cur = ft_ord_cell_resolve_ord(forward ?
-			(struct urcu_txn_sw_list_node *const *) &ft->ord_cell_head :
-			(struct urcu_txn_sw_list_node *const *) &ft->ord_cell_tail);
-	while (n < cap && cur) {
+			&ft->ord_sentinel.node.next :
+			&ft->ord_sentinel.node.prev);
+	/*
+	 * Sentinel topology: a link off the end resolves to the trie's own
+	 * sentinel pseudo-cell, or -- transiently, while a cross-trie run move has
+	 * NULL-terminated a moved run before its finalize -- to NULL.  Both are
+	 * ft_ord_is_end, so terminate on that, not on "== sentinel" or "!= NULL".
+	 * @loaded may thus be NULL here; the MLP guess/cmm_ptr_eq stays correct
+	 * because @guess is never NULL, so cmm_ptr_eq(NULL, guess) is false and a
+	 * NULL @loaded falls through to terminate the loop rather than mis-folding.
+	 */
+	while (n < cap && !ft_ord_is_end(ft, cur)) {
 		struct ft_ord_cell *loaded, *guess;
 
 		buf[n++] = (const struct cds_ft_cell *) cur;
@@ -748,9 +757,11 @@ enum cds_ft_status ft_cell_batch_dir(struct cds_ft *ft,
 		guess = (struct ft_ord_cell *) (forward ?
 			(uintptr_t) cur + stride :
 			(uintptr_t) cur - stride);
-		cur = (loaded && cmm_ptr_eq(loaded, guess)) ? guess : loaded;
+		cur = cmm_ptr_eq(loaded, guess) ? guess : loaded;
 	}
-	*next_cursor = (const struct cds_ft_cell *) cur;
+	/* End of list (cur is the sentinel) => no resume cursor. */
+	*next_cursor = ft_ord_is_end(ft, cur) ?
+		NULL : (const struct cds_ft_cell *) cur;
 	*count = n;
 	return CDS_FT_STATUS_OK;
 }

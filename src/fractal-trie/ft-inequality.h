@@ -1583,6 +1583,10 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 			ft_ord_cell_resolve_ord(&cur->lnode.next) :
 			ft_ord_cell_resolve_ord(&cur->lnode.prev);
 
+		/* Sentinel topology: off-the-end resolves to the sentinel pseudo-cell;
+		 * map it to NULL so iter_land reports NOT_FOUND (end of list). */
+		if (ft_ord_is_end(ft, nxt))
+			nxt = NULL;
 		ft_ord_cell_iter_land(ft, iter, nxt);
 #ifndef FT_NO_ORD_PREFETCH
 		/* One-hop NTA prefetch of the cell the next call will land on. */
@@ -1590,7 +1594,7 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 			struct ft_ord_cell *nn = (mode == FT_LOOKUP_GT) ?
 				ft_ord_cell_resolve_ord(&nxt->lnode.next) :
 				ft_ord_cell_resolve_ord(&nxt->lnode.prev);
-			if (nn)
+			if (!ft_ord_is_end(ft, nn))
 				__builtin_prefetch((const void *) nn, 0, 0);
 		}
 #endif
@@ -1710,8 +1714,8 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	 * other epilogue -- materialize the lazy leaf-referenced key and drop
 	 * the cached position so it is not reused across a lock window. */
 	if (ft_ord_cell_fastpath_ok(ft, iter)) {
-		status = ft_ord_cell_iter_land(ft, iter,
-			ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &ft->ord_cell_head));
+		/* ft_ord_first: NULL when the list is empty (iter_land -> NOT_FOUND). */
+		status = ft_ord_cell_iter_land(ft, iter, ft_ord_first(ft));
 		iter_auto_invalidate_cache(iter);
 		return status;
 	}
@@ -1745,8 +1749,8 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	 * Resolve a flip proxy (see cds_ft_lookup_first, incl. the UNCACHED
 	 * auto-invalidate rationale). */
 	if (ft_ord_cell_fastpath_ok(ft, iter)) {
-		status = ft_ord_cell_iter_land(ft, iter,
-			ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &ft->ord_cell_tail));
+		/* ft_ord_last: NULL when the list is empty (iter_land -> NOT_FOUND). */
+		status = ft_ord_cell_iter_land(ft, iter, ft_ord_last(ft));
 		iter_auto_invalidate_cache(iter);
 		return status;
 	}
