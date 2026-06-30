@@ -162,6 +162,31 @@ extern "C" {
 #define URCU_MCAS_ESCALATE 16
 #endif
 
+/*
+ * Help-recursion depth cap.  drive_install() recurses to push a higher-priority
+ * blocking transaction forward (see urcu_mcas_drive_install_depth()).  That
+ * recursion is acyclic -- it follows the strict total priority order, so it can
+ * only descend into a strictly-higher-priority transaction -- and is therefore
+ * bounded by the number of concurrently-conflicting transactions; but that bound
+ * is realized as real C-stack frames and scales with the writer count.
+ *
+ * Past this depth a helper does NOT spin on the blocker.  Spinning here would be
+ * an unbounded wait on the blocker's *entire* transaction (arbitrary record
+ * count, across arbitrarily many preemptions of its owner) -- categorically
+ * unlike the install-latch spin, whose few-instruction window rseq time-slice
+ * extension can cover; TSE does nothing for a whole-transaction-length wait.
+ * Instead the capped helper ESCALATES: it aborts its own transaction (FAILED) and
+ * lets the caller retry with a higher aging-priority.  Once the retrying
+ * transaction out-retries the blocker it outranks it and evicts rather than helps,
+ * so progress comes from the transaction's own escalation -- never from the
+ * blocker's owner being scheduled.  Sound because the globally highest-priority
+ * transaction never recurses (it always evicts), and a transaction may always
+ * spuriously abort; helping is a latency optimization, not a progress requirement.
+ */
+#ifndef URCU_MCAS_HELP_MAX_DEPTH
+#define URCU_MCAS_HELP_MAX_DEPTH 8
+#endif
+
 enum urcu_mcas_status {
 	URCU_MCAS_UNDECIDED = 0,
 	URCU_MCAS_SUCCEEDED = 1,
@@ -425,10 +450,12 @@ int urcu_mcas_plant(struct urcu_mcas *t,
  * increasing slot addresses, so recursion is bounded by the number of
  * concurrently-conflicting transactions; a thread holds at most one record latch
  * at a time (helping/resolving runs outside the latch), so there is no
- * hold-and-wait.
+ * hold-and-wait.  That bound is still O(writers) of real stack, so the recursive
+ * descent is additionally capped at URCU_MCAS_HELP_MAX_DEPTH (see the note there);
+ * @depth is the current help-recursion depth (0 at the owner/reader entry).
  */
 static inline
-void urcu_mcas_drive_install(struct urcu_mcas *t)
+void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 {
 	unsigned long st = urcu_mcas_status(t);
 	unsigned int i;
@@ -463,9 +490,29 @@ void urcu_mcas_drive_install(struct urcu_mcas *t)
 				est = urcu_mcas_status(e);
 				if (est == URCU_MCAS_UNDECIDED) {
 					if (!urcu_mcas_outranks(t, e)) {
-						/* E outranks us: help it decide
-						 * (install only), then re-read. */
-						urcu_mcas_drive_install(e);
+						/*
+						 * E outranks us: help it decide
+						 * (install only), then re-read -- but
+						 * cap the C-stack descent.  Past the cap
+						 * we do NOT spin on E: that is an
+						 * unbounded wait on E's whole transaction,
+						 * not a TSE-coverable few-insn window like
+						 * the install latch.  Escalate instead --
+						 * abort T (FAILED) so the caller retries
+						 * with a higher aging-priority; once T
+						 * out-retries E it outranks and evicts E,
+						 * so progress never hinges on E's owner
+						 * being scheduled.
+						 */
+						if (depth >= URCU_MCAS_HELP_MAX_DEPTH) {
+							URCU_MCAS_STAT(help_capped);
+							uatomic_cmpxchg(&t->status,
+								URCU_MCAS_UNDECIDED,
+								URCU_MCAS_FAILED);
+							return;
+						}
+						urcu_mcas_drive_install_depth(e,
+							depth + 1);
 						continue;
 					}
 					/* We outrank E: evict the lower priority. */
@@ -530,6 +577,17 @@ void urcu_mcas_drive_install(struct urcu_mcas *t)
 	/* every record installed -> commit */
 	uatomic_cmpxchg(&t->status, URCU_MCAS_UNDECIDED,
 			URCU_MCAS_SUCCEEDED);
+}
+
+/*
+ * Owner/reader entry point: drive @t to a terminal status, starting a fresh
+ * help-recursion budget (depth 0).  Callers outside the engine use this; the
+ * recursive helping path re-enters urcu_mcas_drive_install_depth() directly.
+ */
+static inline
+void urcu_mcas_drive_install(struct urcu_mcas *t)
+{
+	urcu_mcas_drive_install_depth(t, 0);
 }
 
 /*
