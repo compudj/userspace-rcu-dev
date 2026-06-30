@@ -62,6 +62,7 @@ struct lf_stat {
 	unsigned long evict;	/* foreign txns aborted by priority */
 	unsigned long steal;	/* slots stolen proxy->proxy */
 	unsigned long escalate;	/* single-edge ops promoted to the descriptor path */
+	unsigned long help_capped;	/* help-recursion hit URCU_MCAS_HELP_MAX_DEPTH */
 };
 static __thread struct lf_stat t_stat;
 #define URCU_MCAS_STAT(counter)	(t_stat.counter++)
@@ -262,7 +263,7 @@ static intptr_t run_phase(unsigned int nwords, long ops,
 	struct worker_arg args[NR_WORKERS];
 	long committed = 0;
 	unsigned long max_retry = 0, attempts = 0;
-	struct lf_stat st = { 0, 0, 0, 0 };
+	struct lf_stat st = { 0, 0, 0, 0, 0 };
 	intptr_t sum = 0;
 	unsigned int i;
 
@@ -290,6 +291,7 @@ static intptr_t run_phase(unsigned int nwords, long ops,
 		st.drive += args[i].st.drive;
 		st.evict += args[i].st.evict;
 		st.steal += args[i].st.steal;
+		st.help_capped += args[i].st.help_capped;
 	}
 	rcu_thread_online();
 
@@ -317,7 +319,7 @@ static intptr_t run_mixed_phase(unsigned int nwords, long ops, unsigned int nsin
 	struct worker_arg args[NR_WORKERS];
 	long single_committed = 0, total_committed = 0;
 	unsigned long single_max_retry = 0, escalate = 0;
-	struct lf_stat zero = { 0, 0, 0, 0 };
+	struct lf_stat zero = { 0, 0, 0, 0, 0 };
 	intptr_t sum = 0;
 	unsigned int i;
 
@@ -392,8 +394,8 @@ int main(void)
 			PRIdPTR, NR_WORKERS, HOT_OPS, HOT_WORDS, committed, sum);
 		diag("hot:  max single-op retry = %lu (bound %d); attempts = %lu",
 			max_retry, HOT_RETRY_BOUND, attempts);
-		diag("hot:  drive=%lu (%.2f/commit) help=%.2f/commit evict=%lu steal=%lu",
-			st.drive, dpc, helppc, st.evict, st.steal);
+		diag("hot:  drive=%lu (%.2f/commit) help=%.2f/commit evict=%lu steal=%lu help_capped=%lu",
+			st.drive, dpc, helppc, st.evict, st.steal, st.help_capped);
 	}
 	ok(sum == 0,
 		"hot: k-CAS stayed atomic under heavy contention (sum invariant)");
