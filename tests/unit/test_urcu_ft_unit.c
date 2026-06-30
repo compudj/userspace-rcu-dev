@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 296
+#define NR_TESTS 297
 #else
-#define NR_TESTS 254
+#define NR_TESTS 255
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -18693,6 +18693,113 @@ out:
 	return ret;
 }
 
+/*
+ * Removing a leaf whose key shares a byte-prefix with shorter keys used
+ * to abort in ft_remove_commit_rec ("n <= 1").  Shape, reduced from a
+ * live DNS-cache trie: "in" is a byte-prefix of both "info" and the
+ * deeper "feeds.intoday.in".  Removing the deepest leaf collapses its
+ * branch into an IN-PLACE external promote (the surviving "in" prefix
+ * key) whose grandparent is a compressed node, so the forward publish
+ * carried a SKIP_X dual (n == 2) on the NULL-txn commit path.  Keys are
+ * raw bytes with embedded NULs (a namespace byte, then NUL-separated
+ * labels root-first), matching the reporter's encoding.
+ */
+static int test_remove_prefix_external_promote(void)
+{
+	static const uint8_t k_in[]   = { 0, 0, 'i', 'n', 0 };
+	static const uint8_t k_info[] = { 0, 0, 'i', 'n', 'f', 'o', 0 };
+	static const uint8_t k_feeds[] = {
+		0, 0, 'i', 'n', 0, 'i', 'n', 't', 'o', 'd', 'a', 'y', 0,
+		'f', 'e', 'e', 'd', 's', 0,
+	};
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node *n;
+	struct cds_ft_node *found = NULL;
+	int removed = 0, ret = -1;
+
+	ft = create_varlen_ft(&group);
+
+	n = node_alloc(0);
+	if (cds_ft_insert(ft, k_in, sizeof k_in, &n->node) != CDS_FT_STATUS_OK) {
+		node_free(n);
+		fprintf(stderr, "prefix_promote: insert 'in' failed\n");
+		goto out;
+	}
+	n = node_alloc(0);
+	if (cds_ft_insert(ft, k_info, sizeof k_info, &n->node) !=
+			CDS_FT_STATUS_OK) {
+		node_free(n);
+		fprintf(stderr, "prefix_promote: insert 'info' failed\n");
+		goto out;
+	}
+	n = node_alloc(0);
+	if (cds_ft_insert(ft, k_feeds, sizeof k_feeds, &n->node) !=
+			CDS_FT_STATUS_OK) {
+		node_free(n);
+		fprintf(stderr, "prefix_promote: insert 'feeds' failed\n");
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != 3) {
+		fprintf(stderr, "prefix_promote: expected 3 keys, got %lu\n",
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+
+	/* The deepest leaf: this remove used to abort. */
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
+		goto out;
+	rcu_read_lock();
+	cds_ft_iter_set_key(iter, k_feeds, sizeof k_feeds);
+	if (cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *leaf = cds_ft_iter_node(iter);
+
+		if (cds_ft_remove(ft, iter, leaf) == CDS_FT_STATUS_OK) {
+			node_free_rcu(to_test_node(leaf));
+			removed = 1;
+		}
+	}
+	rcu_read_unlock();
+	if (!removed) {
+		fprintf(stderr, "prefix_promote: remove of deepest leaf failed\n");
+		goto out;
+	}
+
+	/* Deepest key gone; both shorter prefix keys survive intact. */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "prefix_promote: verify failed after remove\n");
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_eager_lookup_key(ft, k_feeds, sizeof k_feeds, 0, &found) ==
+			CDS_FT_STATUS_OK ||
+	    cds_ft_eager_lookup_key(ft, k_in, sizeof k_in, 0, &found) !=
+			CDS_FT_STATUS_OK ||
+	    cds_ft_eager_lookup_key(ft, k_info, sizeof k_info, 0, &found) !=
+			CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "prefix_promote: wrong key set after remove\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	if (cds_ft_count_keys(ft) != 2) {
+		fprintf(stderr, "prefix_promote: expected 2 keys, got %lu\n",
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	/* drain_and_destroy frees every node still reachable in the trie
+	 * (the surviving "in"/"info", or all three on an early failure);
+	 * the removed leaf was already deferred above. */
+	if (drain_and_destroy(ft, group) != 0)
+		ret = -1;
+	return ret;
+}
+
 static int test_compact_integrity(void)
 {
 	const unsigned int N = 4096;
@@ -23569,6 +23676,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_forgotten_end);
 	RUN_TEST(test_compact_exclusive);
 	RUN_TEST(test_remove_compressed_no_leak);
+	RUN_TEST(test_remove_prefix_external_promote);
 	RUN_TEST(test_compact_dense_full_node);
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_split_oom_backpointer);

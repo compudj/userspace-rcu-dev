@@ -1164,18 +1164,31 @@ int ft_detach_node(struct cds_ft *ft,
 				commit_txn_used ? NULL : commit_txn);
 			commit_txn_used = (commit_txn != NULL);
 			pub->armed = true;
-		} else if (old_recompacted_node || topmost_external_nodes) {
+		} else if (!(pub && pub->armed) &&
+		    (old_recompacted_node || topmost_external_nodes)) {
 			struct ft_pub_rec rec = { .n = 0 };
 
 			/*
-			 * Non-fused recompaction or external-promote: a REAL
-			 * forward-slot change (the rebuilt node, or the promoted
-			 * external head, replaces the holder).  Route through the op
-			 * flip-txn so the forward slot AND a compressed grandparent's
-			 * SKIP_X dual flip atomically.  A recompaction's eager child
-			 * re-parent already ran, so it commits through the pre-reserved
-			 * @commit_txn (infallible); a lone-edge promote stays a single
-			 * release store.
+			 * Real forward-slot change not yet committed: a
+			 * non-fused recompaction (rebuilt node) or a
+			 * non-in-place external promote.  Commit the
+			 * forward slot + any compressed-grandparent
+			 * SKIP_X dual atomically through @commit_txn
+			 * (recompaction's child re-parent already ran);
+			 * a lone-edge promote stays one release store.
+			 *
+			 * The !pub->armed guard excludes the IN-PLACE
+			 * external promote: there the holder never moves
+			 * (the promoted head goes into a slot below it,
+			 * already committed by ft_remove_one_commit and
+			 * fused with the cell unsplice, consuming
+			 * @commit_txn).  Re-emitting the unchanged
+			 * parent->holder edge here is an old==new no-op
+			 * and, with @commit_txn spent, would trip the
+			 * NULL-txn assert(n<=1) once a compressed
+			 * grandparent makes it multi-edge; it falls
+			 * through to the no-op else.  (pub->armed and
+			 * old_recompacted_node are mutually exclusive.)
 			 */
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
@@ -1184,15 +1197,15 @@ int ft_detach_node(struct cds_ft *ft,
 			commit_txn_used = (commit_txn != NULL);
 		}
 		/*
-		 * else: in-place redundant republish.  The holder stayed at its
-		 * parent slot (no recompaction, no external-promote), so the
-		 * forward slot -- and a compressed grandparent's SKIP_X dual --
-		 * already hold @iter_node_flag.  The in-place forward store
-		 * committed via ft_remove_one_commit above; re-emitting the
-		 * unchanged slot(s) is a pure no-op (old == new), so skip it
-		 * entirely -- no flip, no bare store.  Any commit_txn left
-		 * unconsumed here is freed at @end.  (This was the remove path's
-		 * last transitional ft_ord_cell_flip bare-store caller.)
+		 * else: in-place redundant republish.  The holder
+		 * stayed at its parent slot (a plain leaf delete or
+		 * an in-place external promote), so the forward slot
+		 * -- and any compressed-grandparent SKIP_X dual --
+		 * already hold @iter_node_flag.  The in-place forward
+		 * store committed via ft_remove_one_commit above;
+		 * re-emitting the unchanged slot(s) is a pure no-op
+		 * (old == new), so skip it entirely.  Any commit_txn
+		 * left unconsumed here is freed at @end.
 		 */
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
