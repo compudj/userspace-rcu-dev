@@ -2041,9 +2041,11 @@ bool cds_ft_empty(struct cds_ft *ft);
  * Returns the number of distinct keys that have at least one external
  * node. Duplicates at the same key are counted as one.
  *
- * This function has O(1) time complexity. The RCU read-side lock must
- * be held while calling this function. Concurrent updates may occur,
- * so the result is an approximation when updates are in progress.
+ * O(1) when the group enables order statistics
+ * (cds_ft_group_attr_set_rank_stats); otherwise (the default) O(size) -- a
+ * structural enumeration of the trie.  The RCU read-side lock must be held
+ * while calling this function. Concurrent updates may occur, so the result is
+ * an approximation when updates are in progress.
  */
 unsigned long cds_ft_count_keys(struct cds_ft *ft);
 
@@ -2057,8 +2059,11 @@ unsigned long cds_ft_count_keys(struct cds_ft *ft);
  * Returns the number of distinct keys whose key starts with @prefix,
  * in O(prefix_len) (it reads a maintained count, not a full scan).
  *
- * This function has O(prefix_len) time complexity. The RCU read-side
- * lock must be held while calling this function.
+ * O(prefix_len) when the group enables order statistics
+ * (cds_ft_group_attr_set_rank_stats); otherwise (the default) O(size of the
+ * matching subtree) -- the prefix descent is the same, but the count is then a
+ * structural enumeration.  The RCU read-side lock must be held while calling
+ * this function.
  */
 unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 		const uint8_t *prefix, size_t prefix_len);
@@ -2074,7 +2079,9 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
  * result key is accessible via cds_ft_iter_get_key().
  *
  * Returns CDS_FT_STATUS_OK on success or CDS_FT_STATUS_NOT_FOUND if
- * @n >= the number of keys. O(depth) time complexity.
+ * @n >= the number of keys. O(depth) when the group enables order statistics
+ * (cds_ft_group_attr_set_rank_stats); otherwise (the default) O(n), iterating
+ * forward from the first key.
  * The RCU read-side lock must be held.
  */
 enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
@@ -2087,9 +2094,11 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
  * @iter: Iterator (must be created via cds_ft_iter_create).
  * @n: 0-indexed rank from the last (largest) key. 0 is the largest key.
  *
- * Descends from the right (largest children first) using per-node key
+ * With order statistics enabled (cds_ft_group_attr_set_rank_stats) this
+ * descends from the right (largest children first) using per-node key
  * counters, so concurrent updates to the low end of the key space do
- * not affect the traversal. O(depth) time complexity.  On success the
+ * not affect the traversal, in O(depth); otherwise (the default) it positions
+ * at the last key and steps back @n, in O(n).  On success the
  * iterator points at the nth-from-last key (cds_ft_iter_node() /
  * cds_ft_iter_get_key()); on NOT_FOUND it is left unpositioned
  * (cds_ft_iter_node() returns NULL).
@@ -2106,10 +2115,12 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
  * @iter: Iterator positioned at a valid key.
  * @n: Number of keys to skip forward. 0 is a no-op.
  *
- * Traverses locally from the current position, touching only nodes
+ * With order statistics enabled (cds_ft_group_attr_set_rank_stats) this
+ * traverses locally from the current position, touching only nodes
  * between the start and end positions, so concurrent mutations in
- * unrelated key ranges do not affect the result. O(depth) time
- * complexity.  On success the iterator is repositioned at the target
+ * unrelated key ranges do not affect the result, in O(depth); otherwise
+ * (the default) it advances @n keys via cds_ft_next, in O(n).  On success the
+ * iterator is repositioned at the target
  * key (cds_ft_iter_node() / cds_ft_iter_get_key()); on NOT_FOUND it is
  * left unpositioned (cds_ft_iter_node() returns NULL).  Returns
  * CDS_FT_STATUS_NOT_FOUND if the target is out of range. The RCU
@@ -2125,10 +2136,12 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
  * @iter: Iterator positioned at a valid key.
  * @n: Number of keys to skip backward. 0 is a no-op.
  *
- * Traverses locally from the current position, touching only nodes
+ * With order statistics enabled (cds_ft_group_attr_set_rank_stats) this
+ * traverses locally from the current position, touching only nodes
  * between the start and end positions, so concurrent mutations in
- * unrelated key ranges do not affect the result. O(depth) time
- * complexity.  On success the iterator is repositioned at the target
+ * unrelated key ranges do not affect the result, in O(depth); otherwise
+ * (the default) it steps back @n keys via cds_ft_prev, in O(n).  On success the
+ * iterator is repositioned at the target
  * key (cds_ft_iter_node() / cds_ft_iter_get_key()); on NOT_FOUND it is
  * left unpositioned (cds_ft_iter_node() returns NULL).  Returns
  * CDS_FT_STATUS_NOT_FOUND if @n exceeds the number of preceding keys.
@@ -2245,6 +2258,21 @@ enum cds_ft_status cds_ft_group_key_map(const struct cds_ft_group *group, uint8_
  * stepping.)
  */
 bool cds_ft_group_ordered_list(const struct cds_ft_group *group);
+
+/*
+ * cds_ft_group_rank_stats - Whether a group maintains per-node order-statistics
+ *   key counts.
+ * @group: The Fractal Trie group.
+ *
+ * True when the group enabled order statistics
+ * (cds_ft_group_attr_set_rank_stats(attr, true); the default is OFF).
+ * Immutable for the life of the group.  When true the rank / select / count
+ * queries (cds_ft_count_keys / _prefix, cds_ft_lookup_nth / _last,
+ * cds_ft_iter_skip_forward / _reverse) read a maintained per-node count and
+ * run in O(1) / O(depth); when false they remain correct but fall back to a
+ * full enumeration (count) or first/last + next/prev iteration (select / skip).
+ */
+bool cds_ft_group_rank_stats(const struct cds_ft_group *group);
 
 /*
  * Attributes
@@ -2454,6 +2482,37 @@ enum cds_ft_status cds_ft_group_attr_set_key_len_offset(
  */
 enum cds_ft_status cds_ft_group_attr_set_ordered_list(
 		struct cds_ft_group_attr *attr, bool ordered_list);
+
+/*
+ * cds_ft_group_attr_set_rank_stats - Enable (@rank_stats true) or disable
+ *   (@rank_stats false) maintenance of the per-node order-statistics key
+ *   counts.  DISABLED is the default.
+ *
+ * The order-statistics counts (a per-node subtree total of distinct keys) back
+ * the rank / select / count queries:
+ *   - cds_ft_count_keys / cds_ft_count_keys_prefix
+ *   - cds_ft_lookup_nth / cds_ft_lookup_nth_last
+ *   - cds_ft_iter_skip_forward / cds_ft_iter_skip_reverse
+ *
+ * When ENABLED, every mutation propagates the count along the path to the root
+ * so the queries above read a maintained aggregate: cds_ft_count_keys is O(1),
+ * cds_ft_count_keys_prefix is O(prefix_len), and the select / skip queries are
+ * O(depth).  This costs a root-ward count propagation on every insert / remove.
+ *
+ * When DISABLED (the default), the library maintains no count and those queries
+ * stay correct but fall back to enumeration / iteration: cds_ft_count_keys and
+ * cds_ft_count_keys_prefix enumerate the (sub)tree in O(size); cds_ft_lookup_nth
+ * / _last and cds_ft_iter_skip_forward / _reverse iterate n steps via
+ * cds_ft_next / cds_ft_prev.  (With the ordered list off as well, each
+ * iteration step is itself an O(depth) structural traversal, so select / skip
+ * become O(n.depth) -- the two flags interact for that cost class.)
+ *
+ * Off by default, so passing false is normally redundant.  Returns
+ * CDS_FT_STATUS_OK on success, CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL
+ * @attr.
+ */
+enum cds_ft_status cds_ft_group_attr_set_rank_stats(
+		struct cds_ft_group_attr *attr, bool rank_stats);
 
 /*
  * cds_ft_group_attr_set_numa_policy - Select the trie group's NUMA

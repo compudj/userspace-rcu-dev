@@ -122,6 +122,13 @@ enum cds_ft_status cds_ft_group_attr_create(struct cds_ft_group_attr **result)
 	 */
 	attr->ordered_list_set = true;
 	/*
+	 * Order-statistics (per-node nr_keys) default OFF: calloc already left
+	 * rank_stats_set false.  A group that needs O(1) cds_ft_count_keys /
+	 * O(depth) cds_ft_lookup_nth / cds_ft_iter_skip_* opts in with
+	 * cds_ft_group_attr_set_rank_stats(attr, true); otherwise those queries
+	 * fall back to enumeration / iteration.
+	 */
+	/*
 	 * NUMA placement default: defer to process / libnuma policy.
 	 * The library applies no mbind() of its own; the kernel honors
 	 * numactl wrappers, set_mempolicy() calls, or falls back to
@@ -247,6 +254,15 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
 	if (!attr)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	attr->ordered_list_set = ordered_list;
+	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_group_attr_set_rank_stats(
+		struct cds_ft_group_attr *attr, bool rank_stats)
+{
+	if (!attr)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->rank_stats_set = rank_stats;
 	return CDS_FT_STATUS_OK;
 }
 
@@ -454,6 +470,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->key_len_offset = attr->key_len_offset;
 		ft_group->key_len_offset_set = attr->key_len_offset_set;
 		ft_group->ordered_list_set = attr->ordered_list_set;
+		ft_group->rank_stats_set = attr->rank_stats_set;
 		ft_group->numa_policy = attr->numa_policy;
 		ft_group->optimize = attr->optimize;
 	} else {
@@ -662,6 +679,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->group = ft_group;
 	/* Cache the group's ordered-list mode for the read-side cell gate. */
 	ft->ordered_list = ft_group->ordered_list_set;
+	/* Cache the group's order-statistics mode (per-node nr_keys upkeep). */
+	ft->rank_stats = ft_group->rank_stats_set;
 	/*
 	 * A fresh trie's ordinal-cell list is empty: init the circular sentinel so
 	 * it points at itself (calloc would leave it NULL, which is not a valid

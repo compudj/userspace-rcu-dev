@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 297
+#define NR_TESTS 298
 #else
-#define NR_TESTS 255
+#define NR_TESTS 256
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -218,6 +218,29 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen,
 	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/* Fixed-length trie with order-statistics (per-node nr_keys) ENABLED. */
+static struct cds_ft *create_fixed_rankstats_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -2979,6 +3002,177 @@ fail:
 	cds_ft_iter_destroy(iter);
 	drain_and_destroy(ft, group);
 	return -1;
+}
+
+/*
+ * Order-statistics ON path + ON/OFF parity.  The rank/select/count queries
+ * read a maintained per-node nr_keys aggregate when a group enables order
+ * statistics (cds_ft_group_attr_set_rank_stats), and fall back to structural
+ * enumeration / iteration when it is off (the default).  Build the SAME key
+ * set into a rank-stats-on and a rank-stats-off trie and assert every query
+ * gives identical (and correct) answers -- this exercises the ON maintenance
+ * path (validated further by the nr_keys check in drain_and_destroy's verify)
+ * and cross-checks the OFF fallbacks against the maintained truth.
+ */
+static int test_rank_stats_on_off_parity(void)
+{
+	struct cds_ft_group *gon = NULL, *goff = NULL;
+	struct cds_ft *on, *off;
+	struct cds_ft_iter *it_on = NULL, *it_off = NULL;
+	const unsigned long N = 60;
+	unsigned long n, b;
+	int ret = -1;
+
+	on = create_fixed_rankstats_ft(4, &gon);
+	off = create_fixed_ft(4, &goff);
+	if (cds_ft_iter_create(on, &it_on) < 0 ||
+	    cds_ft_iter_create(off, &it_off) < 0)
+		goto out;
+
+	/* The immutable accessor reflects the configured mode. */
+	if (!cds_ft_group_rank_stats(gon) || cds_ft_group_rank_stats(goff)) {
+		fprintf(stderr, "rank_stats parity: accessor mismatch (on %d off %d)\n",
+			cds_ft_group_rank_stats(gon), cds_ft_group_rank_stats(goff));
+		goto out;
+	}
+
+	rcu_read_lock();
+	for (n = 0; n < N; n++) {
+		if (insert_u64(on, n, node_alloc(n)) != CDS_FT_STATUS_OK ||
+		    insert_u64(off, n, node_alloc(n)) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rank_stats parity: insert %lu failed\n", n);
+			goto out;
+		}
+	}
+	/* Duplicate-chain members at two keys: must not change the key count. */
+	insert_u64(on, 7, node_alloc(7));   insert_u64(off, 7, node_alloc(7));
+	insert_u64(on, 30, node_alloc(30)); insert_u64(off, 30, node_alloc(30));
+	rcu_read_unlock();
+
+	rcu_read_lock();
+
+	/* count_keys: maintained aggregate (on) vs structural enumeration (off). */
+	if (cds_ft_count_keys(on) != N || cds_ft_count_keys(off) != N) {
+		fprintf(stderr, "rank_stats parity: count_keys on %lu off %lu exp %lu\n",
+			cds_ft_count_keys(on), cds_ft_count_keys(off), N);
+		goto out_unlock;
+	}
+
+	/* count_keys_prefix: a 3-byte prefix spans all 60 keys; a full 4-byte
+	 * prefix names a single key (present iff < N). */
+	{
+		uint8_t k[8];
+
+		cds_ft_u64_to_key(on, 0, k, 4);
+		if (cds_ft_count_keys_prefix(on, k, 3) != N ||
+		    cds_ft_count_keys_prefix(off, k, 3) != N) {
+			fprintf(stderr, "rank_stats parity: count_prefix(3) on %lu off %lu exp %lu\n",
+				cds_ft_count_keys_prefix(on, k, 3),
+				cds_ft_count_keys_prefix(off, k, 3), N);
+			goto out_unlock;
+		}
+		for (b = 0; b < 64; b++) {
+			unsigned long exp = b < N ? 1 : 0;
+
+			cds_ft_u64_to_key(on, b, k, 4);
+			if (cds_ft_count_keys_prefix(on, k, 4) != exp ||
+			    cds_ft_count_keys_prefix(off, k, 4) != exp) {
+				fprintf(stderr, "rank_stats parity: count_prefix(4) key %lu on %lu off %lu exp %lu\n",
+					b, cds_ft_count_keys_prefix(on, k, 4),
+					cds_ft_count_keys_prefix(off, k, 4), exp);
+				goto out_unlock;
+			}
+		}
+	}
+
+	/* lookup_nth / lookup_nth_last: rank n is key n (forward) / N-1-n (last);
+	 * n == N is NOT_FOUND.  Identical status + key for on and off. */
+	for (n = 0; n <= N; n++) {
+		enum cds_ft_status son, soff, sln, slf;
+
+		son = cds_ft_lookup_nth(on, it_on, n);
+		soff = cds_ft_lookup_nth(off, it_off, n);
+		if (son != soff) {
+			fprintf(stderr, "rank_stats parity: nth(%lu) status on %d off %d\n",
+				n, (int) son, (int) soff);
+			goto out_unlock;
+		}
+		if (n < N) {
+			if (son != CDS_FT_STATUS_OK ||
+			    to_test_node(cds_ft_iter_node(it_on))->key != n ||
+			    to_test_node(cds_ft_iter_node(it_off))->key != n) {
+				fprintf(stderr, "rank_stats parity: nth(%lu) key on %lu off %lu\n",
+					n, to_test_node(cds_ft_iter_node(it_on))->key,
+					to_test_node(cds_ft_iter_node(it_off))->key);
+				goto out_unlock;
+			}
+		} else if (son != CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr, "rank_stats parity: nth(N) not NOT_FOUND (%d)\n",
+				(int) son);
+			goto out_unlock;
+		}
+
+		sln = cds_ft_lookup_nth_last(on, it_on, n);
+		slf = cds_ft_lookup_nth_last(off, it_off, n);
+		if (sln != slf) {
+			fprintf(stderr, "rank_stats parity: nth_last(%lu) status on %d off %d\n",
+				n, (int) sln, (int) slf);
+			goto out_unlock;
+		}
+		if (n < N &&
+		    (sln != CDS_FT_STATUS_OK ||
+		     to_test_node(cds_ft_iter_node(it_on))->key != N - 1 - n ||
+		     to_test_node(cds_ft_iter_node(it_off))->key != N - 1 - n)) {
+			fprintf(stderr, "rank_stats parity: nth_last(%lu) key mismatch\n", n);
+			goto out_unlock;
+		}
+	}
+
+	/* skip_forward / skip_reverse: from first/last by 25 keys. */
+	if (cds_ft_lookup_first(on, it_on) != CDS_FT_STATUS_OK ||
+	    cds_ft_lookup_first(off, it_off) != CDS_FT_STATUS_OK ||
+	    cds_ft_iter_skip_forward(on, it_on, 25) != CDS_FT_STATUS_OK ||
+	    cds_ft_iter_skip_forward(off, it_off, 25) != CDS_FT_STATUS_OK ||
+	    to_test_node(cds_ft_iter_node(it_on))->key != 25 ||
+	    to_test_node(cds_ft_iter_node(it_off))->key != 25) {
+		fprintf(stderr, "rank_stats parity: skip_forward(25) mismatch\n");
+		goto out_unlock;
+	}
+	if (cds_ft_lookup_last(on, it_on) != CDS_FT_STATUS_OK ||
+	    cds_ft_lookup_last(off, it_off) != CDS_FT_STATUS_OK ||
+	    cds_ft_iter_skip_reverse(on, it_on, 25) != CDS_FT_STATUS_OK ||
+	    cds_ft_iter_skip_reverse(off, it_off, 25) != CDS_FT_STATUS_OK ||
+	    to_test_node(cds_ft_iter_node(it_on))->key != N - 1 - 25 ||
+	    to_test_node(cds_ft_iter_node(it_off))->key != N - 1 - 25) {
+		fprintf(stderr, "rank_stats parity: skip_reverse(25) mismatch\n");
+		goto out_unlock;
+	}
+	/* Skipping past the end is NOT_FOUND on both. */
+	if (cds_ft_lookup_first(on, it_on) != CDS_FT_STATUS_OK ||
+	    cds_ft_lookup_first(off, it_off) != CDS_FT_STATUS_OK ||
+	    cds_ft_iter_skip_forward(on, it_on, N) != CDS_FT_STATUS_NOT_FOUND ||
+	    cds_ft_iter_skip_forward(off, it_off, N) != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "rank_stats parity: skip past end not NOT_FOUND\n");
+		goto out_unlock;
+	}
+
+	rcu_read_unlock();
+	ret = 0;
+	goto out;
+
+out_unlock:
+	rcu_read_unlock();
+out:
+	if (it_on)
+		cds_ft_iter_destroy(it_on);
+	if (it_off)
+		cds_ft_iter_destroy(it_off);
+	if (gon)
+		drain_and_destroy(on, gon);
+	if (goff)
+		drain_and_destroy(off, goff);
+	return ret;
 }
 
 /*
@@ -23403,6 +23597,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iter_skip_boundary);
 	RUN_TEST(test_iter_skip_duplicates);
 	RUN_TEST(test_iter_skip_varlen);
+	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
 	diag("Lookup variant tests");

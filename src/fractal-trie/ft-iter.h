@@ -829,6 +829,11 @@ bool cds_ft_group_ordered_list(const struct cds_ft_group *group)
 	return group->ordered_list_set;
 }
 
+bool cds_ft_group_rank_stats(const struct cds_ft_group *group)
+{
+	return group->rank_stats_set;
+}
+
 enum cds_ft_status cds_ft_iter_set_cache_mode(struct cds_ft_iter *iter,
 		enum cds_ft_iter_cache_mode mode)
 {

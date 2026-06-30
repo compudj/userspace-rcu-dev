@@ -551,7 +551,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				ft_publish_external_nodes_prev(ft, detached->root,
 					(struct cds_ft_node *)
 					ft_node_ptr(child));
-				ft_nr_keys_store(dmeta, detached_count, CMM_RELAXED);
+				ft_nr_keys_store(detached, dmeta, detached_count, CMM_RELAXED);
 			}
 		}
 		{

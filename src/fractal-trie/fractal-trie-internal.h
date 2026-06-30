@@ -1100,6 +1100,17 @@ struct cds_ft_group {
 	 */
 	bool ordered_list_set;
 	/*
+	 * @rank_stats_set: maintain the per-node order-statistics key counts
+	 *   (cds_ft_metadata.nr_keys) that back the rank / select / count
+	 *   queries (cds_ft_count_keys / _prefix, cds_ft_lookup_nth / _last,
+	 *   cds_ft_iter_skip_forward / _reverse).  Default OFF.  When off the
+	 *   library performs no count propagation and the queries fall back to
+	 *   a full enumeration (count) or first/last + next/prev iteration
+	 *   (select / skip).  Immutable after group creation.  See
+	 *   cds_ft_group_attr_set_rank_stats.
+	 */
+	bool rank_stats_set;
+	/*
 	 * @numa_policy: NUMA placement policy for the group's internal
 	 *   allocator superblocks.  See
 	 *   cds_ft_group_attr_set_numa_policy.  Default: INTERLEAVE at
@@ -1228,6 +1239,16 @@ struct cds_ft {
 	 * cell RSS and its list maintenance are paid only when the list is enabled.
 	 */
 	bool ordered_list;
+
+	/*
+	 * Mirror of group->rank_stats_set, cached on the trie so the order-
+	 * statistics query hot paths and the per-mutation count propagation
+	 * test one local flag instead of chasing ft->group.  Immutable after
+	 * cds_ft_create.  When false the trie maintains no per-node nr_keys and
+	 * the rank / select / count queries use the enumeration / iteration
+	 * fallback.
+	 */
+	bool rank_stats;
 
 	/*
 	 * Effective per-trie speculative-leaf-key state: the group has a
@@ -1987,6 +2008,15 @@ struct cds_ft_group_attr {
 	 * See cds_ft_group_attr_set_ordered_list.
 	 */
 	bool ordered_list_set;
+	/*
+	 * Maintain the per-node order-statistics key counts (nr_keys) that back
+	 * cds_ft_count_keys / _prefix, cds_ft_lookup_nth / _last, and
+	 * cds_ft_iter_skip_forward / _reverse.  Default OFF: when disabled the
+	 * library keeps no per-node count and those queries fall back to
+	 * enumeration (count) or first/last + next/prev iteration (select /
+	 * skip).  See cds_ft_group_attr_set_rank_stats.
+	 */
+	bool rank_stats_set;
 	enum cds_ft_numa_policy numa_policy;	/* See cds_ft_group_attr_set_numa_policy. */
 	enum cds_ft_optimize optimize;		/* See cds_ft_group_attr_set_optimize. */
 };

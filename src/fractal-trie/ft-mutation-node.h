@@ -938,7 +938,7 @@ int ft_node_recompact(enum ft_recompact mode,
 				new_metadata, metadata->external_nodes);
 			ft_publish_external_nodes_prev(ft, new_node_flag,
 				metadata->external_nodes);
-			ft_nr_keys_store(new_metadata,
+			ft_nr_keys_store(ft,new_metadata,
 				ft_nr_keys_get(metadata), CMM_RELAXED);
 		}
 	} else {

@@ -99,7 +99,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 			struct cds_ft_metadata *m =
 				ft_flag_to_metadata(ft, compressed);
 
-			ft_nr_keys_store(m,
+			ft_nr_keys_store(ft,m,
 				subtree_external_count, CMM_RELAXED);
 			/*
 			 * ft_try_compress_chain already tracked the compressed
@@ -163,7 +163,7 @@ struct cds_ft_inode_flag *ft_build_branch(struct cds_ft *ft,
 			}
 			return NULL;
 		}
-		ft_nr_keys_store(
+		ft_nr_keys_store(ft,
 			cds_ft_item_to_metadata(ft_node_ptr(dest)),
 			subtree_external_count, CMM_RELAXED);
 		if (glue) {
@@ -367,7 +367,7 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 		cn->child = single_child;
 	}
 	ft_meta_nr_child_set(cn_meta, 1);
-	ft_nr_keys_store(cn_meta, ft_nr_keys_get(meta), CMM_RELAXED);
+	ft_nr_keys_store(ft,cn_meta, ft_nr_keys_get(meta), CMM_RELAXED);
 	cflag = ft_compressed_node_flag(cn);
 	if (glue) {
 		/*
@@ -507,7 +507,7 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		memcpy(&cn->key_bytes[path_len],
 			child_cn->key_bytes, child_len);
 	ft_meta_nr_child_set(cn_meta, 1);
-	ft_nr_keys_store(cn_meta, 1, CMM_RELAXED);
+	ft_nr_keys_store(ft,cn_meta, 1, CMM_RELAXED);
 	/* Compressed nodes must not carry external_nodes. */
 	assert(!external_nodes);
 	{
@@ -633,7 +633,7 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 		new_cn->child = child;
 		memcpy(new_cn->key_bytes, rest, rest_len);
 		ft_meta_nr_child_set(new_cn_meta, 1);
-		ft_nr_keys_store(new_cn_meta, subtree_count, CMM_RELAXED);
+		ft_nr_keys_store(ft,new_cn_meta, subtree_count, CMM_RELAXED);
 		slot_value = ft_compressed_node_flag(new_cn);	/* PLAIN */
 		ft_glue_track(glue, slot_value);
 		/* @child (live) -> new_cn, deferred to the post-sync commit. */
@@ -657,7 +657,7 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 	if (ret)
 		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
 	ft_glue_track(glue, dest);
-	ft_nr_keys_store(ft_flag_to_metadata(ft, dest), subtree_count, CMM_RELAXED);
+	ft_nr_keys_store(ft,ft_flag_to_metadata(ft, dest), subtree_count, CMM_RELAXED);
 	ft_node_get_nth_skip(dest, &slot, first_byte, FT_PF_NONE);
 	if (rest_len == 0) {
 		ft_glue_defer_edge(ft, glue, child, dest, slot);

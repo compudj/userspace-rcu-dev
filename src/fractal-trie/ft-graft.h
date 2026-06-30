@@ -108,7 +108,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1],
 			suffix_len);
 		ft_meta_nr_child_set(sfx_meta, 1);
-		ft_nr_keys_store(sfx_meta, old_child_nr_keys, CMM_RELAXED);
+		ft_nr_keys_store(ft, sfx_meta, old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
 		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
 		ft_glue_track(glue, old_suffix_flag);
@@ -135,7 +135,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 				d->depth + diverge_pos + 1, true);
 		if (ret)
 			return -ENOMEM;
-		ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(dest)),
+		ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(dest)),
 			old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = dest;
 		ft_glue_track(glue, dest);
@@ -212,7 +212,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		free_cds_ft_node_unpublished(ft, old_branch);
 		ft_glue_track(glue, branch_flag);
 	}
-	ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
+	ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
 		old_child_nr_keys, CMM_RELAXED);
 
 	/* Wire the OLD direction (re-encode compressed slot to skip form). */
@@ -258,7 +258,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		pfx->len = diverge_pos;
 		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
 		ft_meta_nr_child_set(pfx_meta, 1);
-		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
+		ft_nr_keys_store(ft, pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, branch_flag, top_flag, NULL);
 		/* Track the PLAIN form; the skip form is for the publish. */
@@ -277,7 +277,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 			pfx->len = 1;
 			pfx->key_bytes[0] = cn->key_bytes[0];
 			ft_meta_nr_child_set(pfx_meta, 1);
-			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
+			ft_nr_keys_store(ft, pfx_meta, ft_nr_keys_get(cn_meta),
 				CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
 			ft_set_parent(ft, branch_flag, top_flag, &pfx->child);
@@ -296,7 +296,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		if (ret)
 			return -ENOMEM;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
+		ft_nr_keys_store(ft, pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
 		top_flag = dest;
 		ft_glue_track(glue, dest);
 		}
@@ -306,7 +306,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 #endif
 	} else {
 		/* diverge_pos == 0: branch IS the top. */
-		ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
+		ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
 			ft_nr_keys_get(cn_meta), CMM_RELAXED);
 		top_flag = branch_flag;
 	}
@@ -480,7 +480,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			 */
 			ft_set_parent(ft, branch, d->pnf, d->nfp);
 			ft_metadata_set_external_nodes(branch, bm, displaced);
-			ft_nr_keys_store(bm, ft_nr_keys_get(bm) + 1,
+			ft_nr_keys_store(ft, bm, ft_nr_keys_get(bm) + 1,
 				CMM_RELAXED);
 
 			st->displaced_shape = true;
@@ -1754,7 +1754,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				merged->len = (uint8_t) merged_len;
 				merged->child = ccn->child;	/* live swap grandchild */
 				ft_meta_nr_child_set(merged_meta, 1);
-				ft_nr_keys_store(merged_meta,
+				ft_nr_keys_store(swap_ft, merged_meta,
 					ft_nr_keys_get(pcn_meta), CMM_RELAXED);
 				merged_meta->parent = pcn_meta->parent;
 				pub_parent = pcn_meta->parent;
@@ -2184,7 +2184,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 					 */
 					ft_publish_external_nodes_prev(dst_ft, root_nf,
 						(struct cds_ft_node *) ft_node_ptr(old_child));
-					ft_nr_keys_store(rm, old_count, CMM_RELEASE);
+					ft_nr_keys_store(swap_ft, rm, old_count, CMM_RELEASE);
 				}
 			}
 

@@ -592,18 +592,28 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 				return -1;
 		}
 	}
-	/* Verify nr_keys. */
-	stored_nr_keys = ft_nr_keys_get(cn_meta);
-	if (stored_nr_keys != child_nr_keys + local_keys) {
-		if (out)
-			fprintf(out, "ft_verify: depth %u: compressed node %p nr_keys mismatch: "
-				"stored %lu, computed %lu (children %lu + local %lu)\n",
-				depth, node_flag, stored_nr_keys,
-				child_nr_keys + local_keys,
-				child_nr_keys, local_keys);
-		return -1;
+	/*
+	 * Verify nr_keys -- only when the trie maintains order statistics.
+	 * With rank stats off the field is never written, so it carries no
+	 * meaning; report the structurally-computed count upward instead so a
+	 * caller that does check (it never will, the gate is group-wide) sees a
+	 * consistent value.
+	 */
+	if (ft->rank_stats) {
+		stored_nr_keys = ft_nr_keys_get(cn_meta);
+		if (stored_nr_keys != child_nr_keys + local_keys) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: compressed node %p nr_keys mismatch: "
+					"stored %lu, computed %lu (children %lu + local %lu)\n",
+					depth, node_flag, stored_nr_keys,
+					child_nr_keys + local_keys,
+					child_nr_keys, local_keys);
+			return -1;
+		}
+		*out_nr_keys = stored_nr_keys;
+	} else {
+		*out_nr_keys = child_nr_keys + local_keys;
 	}
-	*out_nr_keys = stored_nr_keys;
 	return 0;
 }
 
@@ -930,8 +940,8 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			return -1;
 		}
 #endif
-		/* Verify nr_keys. */
-		{
+		/* Verify nr_keys -- only when the trie maintains order statistics. */
+		if (ft->rank_stats) {
 			unsigned long stored_nr_keys = ft_nr_keys_get(metadata);
 
 			if (stored_nr_keys != total_child_keys + local_keys) {
@@ -944,6 +954,8 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 				return -1;
 			}
 			*out_nr_keys = stored_nr_keys;
+		} else {
+			*out_nr_keys = total_child_keys + local_keys;
 		}
 		return 0;
 	}

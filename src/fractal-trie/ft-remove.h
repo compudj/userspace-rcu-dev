@@ -325,7 +325,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	new_cn->len = (uint8_t) merged_len;
 	new_cn->child = child_cn ? child_cn->child : surviving_child;
 	ft_meta_nr_child_set(new_cn_meta, 1);
-	ft_nr_keys_store(new_cn_meta,
+	ft_nr_keys_store(ft,new_cn_meta,
 		ft_nr_keys_get(parent_cn_meta
 			? parent_cn_meta
 			: iter_meta),
@@ -1945,7 +1945,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		}
 		*result_node = external_nodes;
 		/* Decrement before detach (undercount ordering). */
-		ft_nr_keys_store(metadata, ft_nr_keys_get(metadata) - 1,
+		ft_nr_keys_store(ft,metadata, ft_nr_keys_get(metadata) - 1,
 			CMM_RELEASE);
 		/*
 		 * Ordered list on: the NIL key is the global minimum (a prefix of
@@ -1970,7 +1970,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				(struct cds_ft_inode_flag **) &metadata->external_nodes,
 				(struct cds_ft_inode_flag *) external_nodes, NULL,
 				NULL, dead, NULL, NULL)) {
-				ft_nr_keys_store(metadata,
+				ft_nr_keys_store(ft,metadata,
 					ft_nr_keys_get(metadata) + 1, CMM_RELEASE);
 				*result_node = NULL;
 				return CDS_FT_STATUS_MEMORY_ERROR;

@@ -647,10 +647,20 @@ unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
 	return uatomic_load(&m->nr_keys, CMM_ACQUIRE);
 }
 
+/*
+ * Store a node's order-statistics key count -- a no-op unless the trie
+ * maintains order statistics (cds_ft_group_attr_set_rank_stats).  Gating the
+ * single write chokepoint on @ft->rank_stats means a default (rank-stats-off)
+ * trie touches the nr_keys field nowhere: no per-node init, no propagation, no
+ * root-ward count contention.  @ft is read-only; on cross-trie ops src/dst
+ * share a group (enforced) and thus the same flag, so any in-scope trie works.
+ */
 static inline
-void ft_nr_keys_store(struct cds_ft_metadata *m, unsigned long val, int mo)
+void ft_nr_keys_store(const struct cds_ft *ft, struct cds_ft_metadata *m,
+		unsigned long val, int mo)
 {
-	uatomic_store(&m->nr_keys, val, mo);
+	if (ft->rank_stats)
+		uatomic_store(&m->nr_keys, val, mo);
 }
 
 /*

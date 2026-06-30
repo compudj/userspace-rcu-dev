@@ -28,6 +28,10 @@
 #endif
 
 /*
+ * The order-statistics OFF count fallback walks a subtree structurally with
+ * ft_subtree_key_count (defined in ft-mutation-helpers.h, shared with the bulk
+ * ops that also need on-demand subtree key counts when rank stats are off).
+ *
  * Handle compressed node in cds_ft_count_keys_prefix().
  *
  * Returns FT_DESCENT_CONTINUE to advance past the compressed path,
@@ -36,6 +40,7 @@
  */
 static
 enum ft_descent_action ft_count_prefix_compressed(
+		struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag_p,
 		unsigned int *i_p, const uint8_t *prefix,
 		size_t prefix_len, unsigned long *count_ret)
@@ -58,7 +63,12 @@ enum ft_descent_action ft_count_prefix_compressed(
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
 
-		*count_ret = ft_nr_keys_load(cn_meta);
+		/*
+		 * Prefix ends inside this compressed path: the keys under the
+		 * prefix are exactly those in the compressed node's subtree.
+		 */
+		*count_ret = ft->rank_stats ? ft_nr_keys_load(cn_meta) :
+			ft_subtree_key_count(ft, node_flag);
 		return FT_DESCENT_END;
 	}
 	*i_p = i + cn->len - 1;
@@ -103,7 +113,7 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 			enum ft_descent_action act;
 
 			act = ft_count_prefix_compressed(
-				&node_flag, &i, prefix,
+				ft, &node_flag, &i, prefix,
 				prefix_len, &count);
 			if (act == FT_DESCENT_END)
 				goto out;
@@ -137,13 +147,15 @@ unsigned long cds_ft_count_keys_prefix(struct cds_ft *ft,
 	if (ft_node_internal(node_flag)) {
 		struct cds_ft_metadata *metadata =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		count = ft_nr_keys_load(metadata);
+		count = ft->rank_stats ? ft_nr_keys_load(metadata) :
+			ft_subtree_key_count(ft, node_flag);
 		goto out;
 	}
 	if (ft_node_compressed(node_flag)) {
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(node_flag));
-		count = ft_nr_keys_load(cn_meta);
+		count = ft->rank_stats ? ft_nr_keys_load(cn_meta) :
+			ft_subtree_key_count(ft, node_flag);
 		goto out;
 	}
 	/* External node: one key (possibly with duplicates). */
@@ -232,6 +244,21 @@ enum cds_ft_status cds_ft_lookup_nth(struct cds_ft *ft,
 	FT_TP(lookup_nth_enter, n);
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	/*
+	 * Order statistics off: no per-node rank to descend by.  Position at
+	 * the first (smallest) key and step forward n -- skip_forward itself
+	 * falls back to n x cds_ft_next.  Out-of-range n leaves the iterator
+	 * unpositioned via skip_forward's NOT_FOUND, matching the rank-on path.
+	 */
+	if (!ft->rank_stats) {
+		enum cds_ft_status st = cds_ft_lookup_first(ft, iter);
+
+		if (st == CDS_FT_STATUS_OK)
+			st = cds_ft_iter_skip_forward(ft, iter, n);
+		FT_TP(lookup_nth_exit, (int) st);
+		return st;
+	}
 
 	iter_debug_path_snapshot(iter);
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
@@ -456,6 +483,20 @@ enum cds_ft_status cds_ft_lookup_nth_last(struct cds_ft *ft,
 	FT_TP(lookup_nth_last_enter, n);
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+
+	/*
+	 * Order statistics off: position at the last (largest) key and step
+	 * back n (skip_reverse falls back to n x cds_ft_prev).  Out-of-range n
+	 * leaves the iterator unpositioned, matching the rank-on path.
+	 */
+	if (!ft->rank_stats) {
+		enum cds_ft_status st = cds_ft_lookup_last(ft, iter);
+
+		if (st == CDS_FT_STATUS_OK)
+			st = cds_ft_iter_skip_reverse(ft, iter, n);
+		FT_TP(lookup_nth_last_exit, (int) st);
+		return st;
+	}
 
 	iter_debug_path_snapshot(iter);
 	memset(ordinal_key, 0, ft->group->max_key_len * sizeof(ordinal_key[0]));
@@ -760,6 +801,27 @@ enum cds_ft_status cds_ft_iter_skip_forward(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 	if (n == 0) {
+		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_OK);
+		return CDS_FT_STATUS_OK;
+	}
+
+	/*
+	 * Order statistics off: no per-node count to jump whole subtrees by, so
+	 * step forward one key at a time.  cds_ft_next unpositions the iterator
+	 * and returns NOT_FOUND when it runs off the end, which is exactly the
+	 * out-of-range result the rank-on path produces.
+	 */
+	if (!ft->rank_stats) {
+		unsigned long i;
+
+		for (i = 0; i < n; i++) {
+			enum cds_ft_status st = cds_ft_next(ft, iter);
+
+			if (st != CDS_FT_STATUS_OK) {
+				FT_TP(iter_skip_forward_exit, (int) st);
+				return st;
+			}
+		}
 		FT_TP(iter_skip_forward_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}
@@ -1234,6 +1296,26 @@ enum cds_ft_status cds_ft_iter_skip_reverse(struct cds_ft *ft,
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 	if (n == 0) {
+		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_OK);
+		return CDS_FT_STATUS_OK;
+	}
+
+	/*
+	 * Order statistics off: step backward one key at a time.  cds_ft_prev
+	 * unpositions the iterator and returns NOT_FOUND when it runs off the
+	 * front, matching the out-of-range result of the rank-on path.
+	 */
+	if (!ft->rank_stats) {
+		unsigned long i;
+
+		for (i = 0; i < n; i++) {
+			enum cds_ft_status st = cds_ft_prev(ft, iter);
+
+			if (st != CDS_FT_STATUS_OK) {
+				FT_TP(iter_skip_reverse_exit, (int) st);
+				return st;
+			}
+		}
 		FT_TP(iter_skip_reverse_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
 	}

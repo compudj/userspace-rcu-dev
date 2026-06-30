@@ -43,20 +43,14 @@ enum ft_graft_swap_case ft_merge_descend(struct cds_ft *ft,
 
 	switch (kase) {
 	case FT_GRAFT_SWAP_KEY_SHORTER:
-	{
-		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
-
 		*off_ret = (unsigned int) (key_len - d->depth);
-		*count_ret = ft_nr_keys_get(
-			cds_ft_item_to_metadata((struct cds_ft_inode *) cn));
+		/* Whole subtree of the compressed node the short key lands in. */
+		*count_ret = ft_node_key_count(ft, d->nf);
 		break;
-	}
 	case FT_GRAFT_SWAP_EXACT:
 		*off_ret = 0;
-		if (ft_node_external(d->nf))
-			*count_ret = 1;	/* one key (possibly a dup chain) */
-		else
-			*count_ret = ft_nr_keys_get(ft_flag_to_metadata(ft, d->nf));
+		/* External -> one key (possibly a dup chain); else subtree count. */
+		*count_ret = ft_node_key_count(ft, d->nf);
 		break;
 	default:	/* FT_GRAFT_SWAP_DELEGATE */
 		*off_ret = 0;
@@ -100,9 +94,12 @@ struct ft_merge_counts {
 static
 unsigned long ft_merge_child_count(struct cds_ft *ft, struct cds_ft_inode_flag *c)
 {
-	if (ft_node_external(ft_resolve_skip_compressed(ft, c)))
-		return 1;
-	return ft_nr_keys_get(ft_flag_to_metadata(ft, c));
+	/*
+	 * One for an external leaf; the maintained nr_keys when the trie keeps
+	 * order statistics, else a structural recount -- so the merge's count-
+	 * driven sizing / short-circuits are correct on a rank-stats-off trie.
+	 */
+	return ft_node_key_count(ft, c);
 }
 
 static
@@ -177,7 +174,7 @@ struct cds_ft_inode_flag *ft_merge_materialize_suffix(struct ft_merge_ctx *c,
 		sfx->len = (uint8_t) suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[off + 1], suffix_len);
 		ft_meta_nr_child_set(sfx_meta, 1);
-		ft_nr_keys_store(sfx_meta, child_keys, CMM_RELAXED);
+		ft_nr_keys_store(ft, sfx_meta, child_keys, CMM_RELAXED);
 		plain = ft_compressed_node_flag(sfx);
 		ft_glue_track(g, plain);
 		ft_glue_defer_edge_origin(ft, g, cn->child, plain, &sfx->child,
@@ -198,7 +195,7 @@ struct cds_ft_inode_flag *ft_merge_materialize_suffix(struct ft_merge_ctx *c,
 				cn->child, NULL, NULL, child_depth, true);
 		if (ret)
 			return FT_MERGE_OOM;
-		ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(dest)),
+		ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(dest)),
 				child_keys, CMM_RELAXED);
 		ft_glue_track(g, dest);
 		ft_node_get_nth_skip(dest, &slot, cn->key_bytes[off + 1],
@@ -254,7 +251,7 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 				NULL, NULL, depth, true);
 		if (ret)
 			return FT_MERGE_OOM;
-		ft_nr_keys_store(cds_ft_item_to_metadata(ft_node_ptr(dest)), ck,
+		ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(dest)), ck,
 				CMM_RELAXED);
 		ft_glue_track(c->gd, dest);
 		ft_node_get_nth_skip(dest, &slot, cn_s->key_bytes[off_s],
@@ -277,7 +274,7 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 	run->len = (uint8_t) p;
 	memcpy(run->key_bytes, &cn_s->key_bytes[off_s], p);
 	ft_meta_nr_child_set(run_meta, 1);
-	ft_nr_keys_store(run_meta, ck, CMM_RELAXED);
+	ft_nr_keys_store(ft, run_meta, ck, CMM_RELAXED);
 	plain = ft_compressed_node_flag(run);
 	ft_glue_track(c->gd, plain);
 	/*
@@ -552,7 +549,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	if (!D_ext && !D_comp)
 		ft_glue_defer_free(c->gd, ft_node_ptr(D), false);
 
-	ft_nr_keys_store(Mmeta, total_keys, CMM_RELAXED);
+	ft_nr_keys_store(ft, Mmeta, total_keys, CMM_RELAXED);
 	*nr_keys_ret = total_keys;
 	return M;
 }
@@ -1018,7 +1015,7 @@ struct cds_ft_inode_flag *ft_merge_wrap_prefix(struct ft_merge_ctx *c,
 		merged->len = (uint8_t) merged_len;
 		merged->child = mcn->child;
 		ft_meta_nr_child_set(merged_meta, 1);
-		ft_nr_keys_store(merged_meta, mk, CMM_RELAXED);
+		ft_nr_keys_store(ft, merged_meta, mk, CMM_RELAXED);
 		mflag = ft_compressed_node_flag(merged);
 		ft_glue_track(c->gd, mflag);
 		/*
@@ -1152,7 +1149,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		fresh_meta->parent = NULL;
-		ft_nr_keys_store(fresh_meta, 0, CMM_RELAXED);
+		ft_nr_keys_store(src_ft, fresh_meta, 0, CMM_RELAXED);
 	}
 
 	/* Build the merged cluster invisibly (the only build-phase fallible step). */
@@ -2385,7 +2382,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			goto out;
 		}
 		fresh_meta->parent = NULL;
-		ft_nr_keys_store(fresh_meta, 0, CMM_RELAXED);
+		ft_nr_keys_store(src_ft, fresh_meta, 0, CMM_RELAXED);
 
 		/*
 		 * Pre-reserve the dst-appear root-swap txn BEFORE the detach: the

@@ -467,7 +467,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1], suffix_len);
 		ft_meta_nr_child_set(sfx_meta, 1);
-		ft_nr_keys_store(sfx_meta, old_child_nr_keys, CMM_RELAXED);
+		ft_nr_keys_store(ft,sfx_meta, old_child_nr_keys, CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);	/* PLAIN: install + recover sfx directly */
 		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);	/* skip form for the slot */
 		created[nr_created++] = old_suffix_flag;	/* track PLAIN so the error path frees sfx directly */
@@ -502,7 +502,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 				nb->key_bytes[k] = iter_key[diverge_pos + 1 + k];
 		}
 		ft_meta_nr_child_set(nb_meta, 1);
-		ft_nr_keys_store(nb_meta, 1, CMM_RELAXED);
+		ft_nr_keys_store(ft,nb_meta, 1, CMM_RELAXED);
 		new_branch_flag = ft_compressed_node_flag(nb);
 		ft_set_parent(ft, nb->child, new_branch_flag, NULL);
 		new_branch_flag = ft_publish_compressed(ft, nb, new_branch_flag);
@@ -541,7 +541,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		}
 
 		branch_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		ft_nr_keys_store(branch_meta, old_child_nr_keys + 1,
+		ft_nr_keys_store(ft,branch_meta, old_child_nr_keys + 1,
 				CMM_RELAXED);
 		branch_flag = dest;
 
@@ -596,7 +596,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		pfx->len = diverge_pos;
 		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
 		ft_meta_nr_child_set(pfx_meta, 1);
-		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
+		ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
 		pfx_child = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, branch_flag, pfx_child, &pfx->child);
 		pfx_child = ft_publish_compressed(ft, pfx, pfx_child);
@@ -606,7 +606,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		/* diverge_pos == 0: branch IS the top. */
 		struct cds_ft_metadata *branch_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(branch_flag));
-		ft_nr_keys_store(branch_meta, ft_nr_keys_get(cn_meta) + 1,
+		ft_nr_keys_store(ft,branch_meta, ft_nr_keys_get(cn_meta) + 1,
 				CMM_RELAXED);
 		top_flag = branch_flag;
 	}
@@ -800,7 +800,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		memcpy(sfx->key_bytes, &cn->key_bytes[remaining + 1],
 			suffix_len);
 		ft_meta_nr_child_set(sfx_meta, 1);
-		ft_nr_keys_store(sfx_meta, child_nr_keys,
+		ft_nr_keys_store(ft,sfx_meta, child_nr_keys,
 			CMM_RELAXED);
 		suffix_flag = ft_compressed_node_flag(sfx);	/* PLAIN: install + recover sfx directly */
 		sfx_skip_flag = ft_publish_compressed(ft, sfx, suffix_flag);	/* skip form for the slot */
@@ -831,7 +831,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		{
 			struct cds_ft_metadata *m =
 				cds_ft_item_to_metadata(ft_node_ptr(dest));
-			ft_nr_keys_store(m, child_nr_keys,
+			ft_nr_keys_store(ft,m, child_nr_keys,
 				CMM_RELAXED);
 		}
 		suffix_flag = dest;
@@ -855,7 +855,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			node_depth + remaining, jct_cluster_leaf);
 		if (ret) goto error;
 		jct_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		ft_nr_keys_store(jct_meta, child_nr_keys,
+		ft_nr_keys_store(ft,jct_meta, child_nr_keys,
 			CMM_RELAXED);
 		jct_flag = dest;
 		created[nr_created++] = dest;
@@ -898,7 +898,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		pfx->len = remaining;
 		memcpy(pfx->key_bytes, cn->key_bytes, remaining);
 		ft_meta_nr_child_set(pfx_meta, 1);
-		ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
+		ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta),
 			CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, jct_flag, top_flag, NULL);
@@ -921,7 +921,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			pfx->len = 1;
 			pfx->key_bytes[0] = cn->key_bytes[0];
 			ft_meta_nr_child_set(pfx_meta, 1);
-			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
+			ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta),
 				CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
 			ft_set_parent(ft, jct_flag, top_flag, &pfx->child);
@@ -937,7 +937,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 				jct_flag, NULL, NULL, node_depth, false);
 			if (ret) goto error;
 			pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-			ft_nr_keys_store(pfx_meta, ft_nr_keys_get(cn_meta),
+			ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta),
 				CMM_RELAXED);
 			top_flag = dest;
 			created[nr_created++] = dest;
@@ -1106,7 +1106,7 @@ int ft_attach_node(struct cds_ft *ft,
 			{
 				struct cds_ft_metadata *branch_meta =
 					cds_ft_item_to_metadata(ft_node_ptr(iter_dest_node_flag));
-				ft_nr_keys_store(branch_meta, 1, CMM_RELAXED);
+				ft_nr_keys_store(ft,branch_meta, 1, CMM_RELAXED);
 			}
 			created_nodes[nr_created_nodes++] = iter_dest_node_flag;
 			iter_node_flag = iter_dest_node_flag;
@@ -1128,7 +1128,7 @@ int ft_attach_node(struct cds_ft *ft,
 			 */
 			ft_metadata_set_external_nodes(iter_node_flag,
 				iter_node_metadata, external_nodes);
-			ft_nr_keys_store(iter_node_metadata,
+			ft_nr_keys_store(ft,iter_node_metadata,
 				ft_nr_keys_get(iter_node_metadata) + 1, CMM_RELAXED);
 		}
 	}
@@ -1418,7 +1418,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		 * the compressed child).  The new key's +1 is added
 		 * by ft_propagate_external_count_parent below.
 		 */
-		ft_nr_keys_store(br_meta, 1, CMM_RELAXED);
+		ft_nr_keys_store(ft,br_meta, 1, CMM_RELAXED);
 	}
 	/*
 	 * Phase 2: park the LIVE displaced-external-head re-parent (the old

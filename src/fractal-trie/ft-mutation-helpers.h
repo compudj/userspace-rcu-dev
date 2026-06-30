@@ -2089,16 +2089,103 @@ void ft_propagate_external_count_parent(struct cds_ft *ft,
 {
 	struct cds_ft_inode_flag *cur = start;
 
-	(void) ft;
+	/*
+	 * Order statistics off: no per-node count is maintained, so there is
+	 * nothing to propagate -- skip the whole root-ward walk (this is the
+	 * per-mutation cost and the would-be root contention point that the
+	 * default rank-stats-off trie avoids entirely).
+	 */
+	if (!ft->rank_stats)
+		return;
 	ft_delay_writer();
 
 	while (cur) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(cur));
-		ft_nr_keys_store(m, ft_nr_keys_get(m) + delta, CMM_RELEASE);
+		ft_nr_keys_store(ft, m, ft_nr_keys_get(m) + delta, CMM_RELEASE);
 		ft_delay_writer();
 		cur = m->parent;
 	}
+}
+
+/*
+ * Structural distinct-key count of the subtree rooted at @node_flag, used when
+ * the trie does NOT maintain order statistics (rank stats off) -- there is no
+ * per-node nr_keys aggregate to read, so the bulk ops (which size and short-
+ * circuit on subtree key counts) and the count queries recompute it on demand.
+ * Reproduces exactly the nr_keys invariant cds_ft_verify checks: an internal
+ * node contributes one key for its own end-of-path entry (a non-NULL
+ * external_nodes) plus the keys in every child subtree; a compressed node
+ * contributes its single child subtree, counting one if that child is an
+ * external leaf.  Reader-safe -- acquire loads plus the same flip-proxy /
+ * skip-compressed resolution the rank readers use, so it never dereferences a
+ * parked proxy or a freed node under RCU.  O(subtree size); recursion depth is
+ * bounded by the trie depth (<= FT_MAX_DEPTH).  @node_flag must be internal or
+ * compressed (an external leaf is one key, counted by the caller).
+ */
+static
+unsigned long ft_subtree_key_count(struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag)
+{
+	unsigned long count = 0;
+	struct cds_ft_inode_flag *child;
+	uint8_t child_key = 0;
+	int pivot;
+
+	if (ft_node_compressed(node_flag)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(node_flag);
+
+		child = ft_cn_child_dereference_acquire_prefetch(cn);
+		if (!child)
+			return 0;
+		if (ft_node_external(child))
+			return 1;
+		return ft_subtree_key_count(ft, child);
+	}
+
+	/* Internal node: the end-of-path key (if present) sorts at this depth. */
+	if (ft_dereference_external_acquire(
+			cds_ft_item_to_metadata(ft_node_ptr(node_flag))->external_nodes))
+		count += 1;
+
+	/* Plus every child subtree, enumerated in ascending ordinal order. */
+	pivot = -1;
+	child = ft_node_get_direction(ft, node_flag, pivot, &child_key,
+			FT_RIGHT, true);
+	while (child) {
+		struct cds_ft_inode_flag *rchild =
+			ft_resolve_skip_compressed(ft, child);
+
+		if (ft_node_external(rchild))
+			count += 1;
+		else
+			count += ft_subtree_key_count(ft, rchild);
+		pivot = child_key;
+		child = ft_node_get_direction(ft, node_flag, pivot, &child_key,
+				FT_RIGHT, true);
+	}
+	return count;
+}
+
+/*
+ * Distinct-key count of a child subtree referenced by @c (possibly skip-
+ * encoded): one for an external leaf, the maintained nr_keys aggregate when the
+ * trie keeps order statistics, else the structural recount above.  This is the
+ * single accessor the bulk ops use wherever they previously read nr_keys for a
+ * count that feeds a structural decision (no-op detection, glue / run sizing),
+ * so those decisions stay correct on a rank-stats-off trie.
+ */
+static inline
+unsigned long ft_node_key_count(struct cds_ft *ft, struct cds_ft_inode_flag *c)
+{
+	struct cds_ft_inode_flag *nf = ft_resolve_skip_compressed(ft, c);
+
+	if (ft_node_external(nf))
+		return 1;
+	if (ft->rank_stats)
+		return ft_nr_keys_get(ft_flag_to_metadata(ft, c));
+	return ft_subtree_key_count(ft, nf);
 }
 
 /*
