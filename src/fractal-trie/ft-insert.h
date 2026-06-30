@@ -177,21 +177,21 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
 			ic->live_child != NULL || !ic->publish_to_parent);
 		if (pred)
-			succ = ft_ord_cell_resolve_ord(&pred->ord_next);
+			succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
 		else
 			/* New minimum: successor is the old list head (O(1), no descent). */
-			succ = ft_ord_cell_resolve_ord(&ft->ord_cell_head);
+			succ = ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &ft->ord_cell_head);
 		/* Pre-set @cell's own links; not yet reachable via the list. */
-		cell->ord_prev = pred;
-		cell->ord_next = succ;
+		cell->lnode.prev = ft_ord_cell_lnode(pred);
+		cell->lnode.next = ft_ord_cell_lnode(succ);
 		if (pred) {
-			edges[n].slot = &pred->ord_next;
+			edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 			edges[n].old_target = succ;
 			edges[n].new_target = cell;
 			n++;
 		}
 		if (succ) {
-			edges[n].slot = &succ->ord_prev;
+			edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 			edges[n].old_target = pred;
 			edges[n].new_target = cell;
 			n++;

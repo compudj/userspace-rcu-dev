@@ -736,14 +736,15 @@ enum cds_ft_status ft_cell_batch_dir(struct cds_ft *ft,
 		cur = (struct ft_ord_cell *) cursor;	/* resume AT the cell */
 	else
 		cur = ft_ord_cell_resolve_ord(forward ?
-			&ft->ord_cell_head : &ft->ord_cell_tail);
+			(struct urcu_txn_sw_list_node *const *) &ft->ord_cell_head :
+			(struct urcu_txn_sw_list_node *const *) &ft->ord_cell_tail);
 	while (n < cap && cur) {
 		struct ft_ord_cell *loaded, *guess;
 
 		buf[n++] = (const struct cds_ft_cell *) cur;
 		loaded = forward ?
-			ft_ord_cell_resolve_ord(&cur->ord_next) :
-			ft_ord_cell_resolve_ord(&cur->ord_prev);
+			ft_ord_cell_resolve_ord(&cur->lnode.next) :
+			ft_ord_cell_resolve_ord(&cur->lnode.prev);
 		guess = (struct ft_ord_cell *) (forward ?
 			(uintptr_t) cur + stride :
 			(uintptr_t) cur - stride);

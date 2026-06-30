@@ -66,14 +66,15 @@ struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *pr
  * proxy is installed at rest (a no-op on the write side).
  */
 static inline_lookup
-struct ft_ord_cell *ft_ord_cell_resolve_ord(struct ft_ord_cell *const *slot)
+struct ft_ord_cell *ft_ord_cell_resolve_ord(struct urcu_txn_sw_list_node *const *slot)
 {
-	struct ft_ord_cell *p = rcu_dereference(*slot);
+	struct urcu_txn_sw_list_node *p = rcu_dereference(*slot);
 
 	if (caa_unlikely(ft_node_flip_proxy((struct cds_ft_inode_flag *) p)))
-		p = (struct ft_ord_cell *) urcu_txn_sw_proxy_get(
+		p = (struct urcu_txn_sw_list_node *) urcu_txn_sw_proxy_get(
 			ft_flip_proxy_ptr((struct cds_ft_inode_flag *) p));
-	return p;
+	/* NULL-terminated ends resolve to NULL (head/tail topology kept here). */
+	return p ? ft_ord_cell_of(p) : NULL;
 }
 
 /*
@@ -105,8 +106,8 @@ void *ft_ord_cell_alloc(struct cds_ft *ft, struct cds_ft_node *node,
 	if (!meta)
 		return NULL;
 	cell = (struct ft_ord_cell *) cds_ft_metadata_to_item(meta);
-	cell->ord_prev = NULL;
-	cell->ord_next = NULL;
+	cell->lnode.prev = NULL;
+	cell->lnode.next = NULL;
 	cell->node = node;
 	cell->parent = parent;
 	if (ft_debug_counters())

@@ -813,38 +813,38 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 			 * was just placed before it.
 			 */
 			if (prev && !prev_is_dst) {
-				prev->ord_next = cell;	/* survivor: invisible */
-				edges[n].slot = &cell->ord_prev;
+				prev->lnode.next = ft_ord_cell_lnode(cell);	/* survivor: invisible */
+				edges[n].slot = (struct ft_ord_cell **) &cell->lnode.prev;
 				edges[n].old_target =
-					ft_ord_cell_resolve_ord(&cell->ord_prev);
+					ft_ord_cell_resolve_ord(&cell->lnode.prev);
 				edges[n].new_target = prev;
 				n++;
 			}
 			prev = cell;
 			prev_is_dst = true;
-			dcur = ft_ord_cell_resolve_ord(&dcur->ord_next);
+			dcur = ft_ord_cell_resolve_ord(&dcur->lnode.next);
 			dsuf_valid = false;
 		} else {
 			struct ft_ord_cell *cell = src_caps[si].cell;
 
 			/* Surviving src cell: pre-set its back link. */
-			cell->ord_prev = prev;		/* invisible */
+			cell->lnode.prev = ft_ord_cell_lnode(prev);		/* invisible */
 			if (!prev) {
 				/* new list minimum: flip @dst head. */
 				edges[n].slot = &dst->ord_cell_head;
 				edges[n].old_target =
-					ft_ord_cell_resolve_ord(&dst->ord_cell_head);
+					ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &dst->ord_cell_head);
 				edges[n].new_target = cell;
 				n++;
 			} else if (prev_is_dst) {
 				/* dst -> survivor: flip the dst cell's fwd edge. */
-				edges[n].slot = &prev->ord_next;
+				edges[n].slot = (struct ft_ord_cell **) &prev->lnode.next;
 				edges[n].old_target =
-					ft_ord_cell_resolve_ord(&prev->ord_next);
+					ft_ord_cell_resolve_ord(&prev->lnode.next);
 				edges[n].new_target = cell;
 				n++;
 			} else {
-				prev->ord_next = cell;	/* survivor: invisible */
+				prev->lnode.next = ft_ord_cell_lnode(cell);	/* survivor: invisible */
 			}
 			prev = cell;
 			prev_is_dst = false;
@@ -857,17 +857,17 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 	 * neighbour's back edge -- or @dst's tail when there is none.
 	 */
 	if (prev && !prev_is_dst) {
-		prev->ord_next = dst_succ;	/* survivor: invisible */
+		prev->lnode.next = ft_ord_cell_lnode(dst_succ);	/* survivor: invisible */
 		if (!dst_succ) {
 			edges[n].slot = &dst->ord_cell_tail;
 			edges[n].old_target =
-				ft_ord_cell_resolve_ord(&dst->ord_cell_tail);
+				ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &dst->ord_cell_tail);
 			edges[n].new_target = prev;
 			n++;
 		} else {
-			edges[n].slot = &dst_succ->ord_prev;
+			edges[n].slot = (struct ft_ord_cell **) &dst_succ->lnode.prev;
 			edges[n].old_target =
-				ft_ord_cell_resolve_ord(&dst_succ->ord_prev);
+				ft_ord_cell_resolve_ord(&dst_succ->lnode.prev);
 			edges[n].new_target = prev;
 			n++;
 		}
@@ -1306,14 +1306,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	if (ms_ord) {
 		ms_cursor = ft_ord_cell_ptr(rcu_dereference(
 			ft_subtree_minmax_head(dst_ft, D, false)->prev));
-		ms_prev = ft_ord_cell_resolve_ord(&ms_cursor->ord_prev);
+		ms_prev = ft_ord_cell_resolve_ord(&ms_cursor->lnode.prev);
 		/*
 		 * The dst region run is [@ms_cursor .. D's max head]; @ms_succ is
 		 * the cell following it (NULL at the list tail), the stop boundary
 		 * for the interleave walk and the trailing survivor's successor.
 		 */
 		ms_succ = ft_ord_cell_resolve_ord(&ft_ord_cell_ptr(rcu_dereference(
-			ft_subtree_minmax_head(dst_ft, D, true)->prev))->ord_next);
+			ft_subtree_minmax_head(dst_ft, D, true)->prev))->lnode.next);
 		/*
 		 * Capture src's merged-subtree (S) run endpoints now, while S is
 		 * still intact, but defer the actual run-unlink until AFTER the
@@ -1402,7 +1402,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				ms_nsrc++;
 				if (sc == slast)
 					break;
-				sc = ft_ord_cell_resolve_ord(&sc->ord_next);
+				sc = ft_ord_cell_resolve_ord(&sc->lnode.next);
 			}
 			if (oom) {
 				free(ms_src_pool);

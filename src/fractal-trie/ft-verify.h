@@ -986,7 +986,7 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 	trie_head = cds_ft_iter_node(iter);
 	cell = ft->ord_cell_head;
 	if (trie_head &&
-	    ft_ord_cell_resolve_ord(&ft_ord_cell_ptr(trie_head->prev)->ord_prev)
+	    ft_ord_cell_resolve_ord(&ft_ord_cell_ptr(trie_head->prev)->lnode.prev)
 		!= NULL) {
 		if (out)
 			fprintf(out, "ft_verify: ord-cell min head %p cell has ord_prev != NULL\n",
@@ -1016,13 +1016,13 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 			goto out;
 		}
 		max_cell = cell;
-		next_cell = ft_ord_cell_resolve_ord(&cell->ord_next);
+		next_cell = ft_ord_cell_resolve_ord(&cell->lnode.next);
 		if (next_cell &&
-		    ft_ord_cell_resolve_ord(&next_cell->ord_prev) != cell) {
+		    ft_ord_cell_resolve_ord(&next_cell->lnode.prev) != cell) {
 			if (out)
 				fprintf(out, "ft_verify: ord-cell back-edge broken at cell %p (ord_next %p whose ord_prev is %p)\n",
 					(void *) cell, (void *) next_cell,
-					(void *) ft_ord_cell_resolve_ord(&next_cell->ord_prev));
+					(void *) ft_ord_cell_resolve_ord(&next_cell->lnode.prev));
 			ret = -1;
 			goto out;
 		}

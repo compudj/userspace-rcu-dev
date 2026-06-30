@@ -123,6 +123,7 @@
 #include <urcu/uatomic.h>
 #include "urcu-utils.h"
 #include <urcu/rcu-txn-sw.h>
+#include <urcu/rcu-txn-sw-list.h>
 
 #include "fractal-trie-internal.h"
 #include "fractal-trie-trace.h"

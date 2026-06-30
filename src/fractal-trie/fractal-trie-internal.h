@@ -81,6 +81,7 @@
 #include <inttypes.h>
 #include <unistd.h>
 #include <urcu/list.h>
+#include <urcu/rcu-txn-sw-list.h>
 #include <urcu/rculfhash.h>
 #include <urcu/arch.h>
 #include <urcu/call-rcu.h>
@@ -562,11 +563,33 @@
  * Reached from a head as ft_ord_cell_ptr(rcu_dereference(head->prev)).
  */
 struct ft_ord_cell {
-	struct ft_ord_cell *ord_prev;
-	struct ft_ord_cell *ord_next;
+	/*
+	 * Key-ordered doubly-linked list links, embedded as the public
+	 * single-updater bidir-list node (<urcu/rcu-txn-sw-list.h>): lnode.next
+	 * is the old ord_next, lnode.prev the old ord_prev.  The cell is recovered
+	 * from a link with ft_ord_cell_of() (container_of) and its link node with
+	 * ft_ord_cell_lnode().  Embedding the public node lets the single-cell
+	 * splice/unsplice/replace ride the list's composable _prepare ops, folded
+	 * into the FT structural flip-txn; FT keeps its own type-7 proxy tag and
+	 * the specialized resolver (ft_ord_cell_resolve_ord).
+	 */
+	struct urcu_txn_sw_list_node lnode;
 	struct cds_ft_node *node;
 	struct cds_ft_inode_flag *parent;
 };
+
+/* Recover the cell owning an embedded ordered-list link node, and vice versa. */
+static inline
+struct ft_ord_cell *ft_ord_cell_of(const struct urcu_txn_sw_list_node *lnode)
+{
+	return caa_container_of(lnode, struct ft_ord_cell, lnode);
+}
+
+static inline
+struct urcu_txn_sw_list_node *ft_ord_cell_lnode(struct ft_ord_cell *cell)
+{
+	return &cell->lnode;
+}
 
 /*
  * Item-length order for the dedicated cell arena: the smallest power of two

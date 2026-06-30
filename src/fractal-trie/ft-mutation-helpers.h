@@ -752,17 +752,17 @@ unsigned int ft_ord_cell_run_detach_edges(struct cds_ft *ft,
 		ft_ord_cell_ptr(rcu_dereference(first_head->prev));
 	struct ft_ord_cell *last =
 		ft_ord_cell_ptr(rcu_dereference(last_head->prev));
-	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->ord_prev);
-	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->ord_next);
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->lnode.prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->lnode.next);
 
 	if (pred) {
-		edges[n].slot = &pred->ord_next;
+		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 		edges[n].old_target = first;
 		edges[n].new_target = succ;
 		n++;
 	}
 	if (succ) {
-		edges[n].slot = &succ->ord_prev;
+		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 		edges[n].old_target = last;
 		edges[n].new_target = pred;
 		n++;
@@ -784,8 +784,8 @@ static
 void ft_ord_cell_run_install(struct cds_ft *into, struct ft_ord_cell *first,
 		struct ft_ord_cell *last)
 {
-	first->ord_prev = NULL;
-	last->ord_next = NULL;
+	first->lnode.prev = NULL;
+	last->lnode.next = NULL;
 	into->ord_cell_head = first;
 	into->ord_cell_tail = last;
 }
@@ -993,17 +993,17 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
 		struct ft_ord_cell *cell, struct ft_ord_cell_edge *edges,
 		unsigned int n)
 {
-	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&cell->ord_prev);
-	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&cell->ord_next);
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&cell->lnode.prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&cell->lnode.next);
 
 	if (pred) {
-		edges[n].slot = &pred->ord_next;
+		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 		edges[n].old_target = cell;
 		edges[n].new_target = succ;
 		n++;
 	}
 	if (succ) {
-		edges[n].slot = &succ->ord_prev;
+		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 		edges[n].old_target = cell;
 		edges[n].new_target = pred;
 		n++;
@@ -1057,21 +1057,21 @@ static
 int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		struct ft_ord_cell *new_cell)
 {
-	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->ord_prev);
-	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->ord_next);
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->lnode.prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->lnode.next);
 	struct ft_ord_cell_edge edges[FT_ORD_CELL_SWAP_MAX_EDGES];
 	unsigned int n = 0;
 
-	new_cell->ord_prev = pred;
-	new_cell->ord_next = succ;
+	new_cell->lnode.prev = ft_ord_cell_lnode(pred);
+	new_cell->lnode.next = ft_ord_cell_lnode(succ);
 	if (pred) {
-		edges[n].slot = &pred->ord_next;
+		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 		edges[n].old_target = old_cell;
 		edges[n].new_target = new_cell;
 		n++;
 	}
 	if (succ) {
-		edges[n].slot = &succ->ord_prev;
+		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 		edges[n].old_target = old_cell;
 		edges[n].new_target = new_cell;
 		n++;
@@ -1096,19 +1096,19 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
 		struct ft_ord_cell *old_cell, struct ft_ord_cell *new_cell,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
-	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->ord_prev);
-	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->ord_next);
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&old_cell->lnode.prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&old_cell->lnode.next);
 
-	new_cell->ord_prev = pred;
-	new_cell->ord_next = succ;
+	new_cell->lnode.prev = ft_ord_cell_lnode(pred);
+	new_cell->lnode.next = ft_ord_cell_lnode(succ);
 	if (pred) {
-		edges[n].slot = &pred->ord_next;
+		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 		edges[n].old_target = old_cell;
 		edges[n].new_target = new_cell;
 		n++;
 	}
 	if (succ) {
-		edges[n].slot = &succ->ord_prev;
+		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 		edges[n].old_target = old_cell;
 		edges[n].new_target = new_cell;
 		n++;
@@ -1469,7 +1469,7 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 		memset(pad + key_len, pad_min, flen - key_len);
 		pred = ft_ord_cell_find_rel(dst, pad, flen, FT_LOOKUP_LT);
 		if (pred) {
-			succ = ft_ord_cell_resolve_ord(&pred->ord_next);
+			succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
 		} else {
 			memset(pad + key_len, pad_max, flen - key_len);
 			succ = ft_ord_cell_find_rel(dst, pad, flen,
@@ -1482,7 +1482,7 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 
 	pred = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_LT);
 	if (pred)
-		succ = ft_ord_cell_resolve_ord(&pred->ord_next);
+		succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
 	else
 		succ = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_GT);
 	*pred_out = pred;
@@ -1517,16 +1517,16 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
 	/* Pre-set the run's outer links; not yet reachable via @dst's list. */
-	run_first->ord_prev = pred;
-	run_last->ord_next = succ;
+	run_first->lnode.prev = ft_ord_cell_lnode(pred);
+	run_last->lnode.next = ft_ord_cell_lnode(succ);
 	if (pred) {
-		edges[n].slot = &pred->ord_next;
+		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 		edges[n].old_target = succ;
 		edges[n].new_target = run_first;
 		n++;
 	}
 	if (succ) {
-		edges[n].slot = &succ->ord_prev;
+		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 		edges[n].old_target = pred;
 		edges[n].new_target = run_last;
 		n++;
@@ -1604,24 +1604,24 @@ unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
 		struct ft_ord_cell *s_first, struct ft_ord_cell *s_last,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
-	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&d_first->ord_prev);
-	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&d_last->ord_next);
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&d_first->lnode.prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&d_last->lnode.next);
 	struct ft_ord_cell *new_first = s_first ? s_first : succ;
 	struct ft_ord_cell *new_last = s_last ? s_last : pred;
 
 	if (s_first) {
 		/* Pre-set run_S's outer links; not yet reachable via @dst. */
-		s_first->ord_prev = pred;
-		s_last->ord_next = succ;
+		s_first->lnode.prev = ft_ord_cell_lnode(pred);
+		s_last->lnode.next = ft_ord_cell_lnode(succ);
 	}
 	if (pred) {
-		edges[n].slot = &pred->ord_next;
+		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 		edges[n].old_target = d_first;
 		edges[n].new_target = new_first;
 		n++;
 	}
 	if (succ) {
-		edges[n].slot = &succ->ord_prev;
+		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 		edges[n].old_target = d_last;
 		edges[n].new_target = new_last;
 		n++;
@@ -1721,19 +1721,19 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct urcu_txn_sw_txn *txn,
 		ft_ord_cell_ptr(rcu_dereference(first_head->prev));
 	struct ft_ord_cell *last =
 		ft_ord_cell_ptr(rcu_dereference(last_head->prev));
-	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->ord_prev);
-	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->ord_next);
+	struct ft_ord_cell *pred = ft_ord_cell_resolve_ord(&first->lnode.prev);
+	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&last->lnode.next);
 	struct ft_ord_cell_edge edges[FT_ORD_CELL_RUN_UNLINK_MAX_EDGES];
 	unsigned int n = 0;
 
 	if (pred) {
-		edges[n].slot = &pred->ord_next;
+		edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 		edges[n].old_target = first;
 		edges[n].new_target = succ;
 		n++;
 	}
 	if (succ) {
-		edges[n].slot = &succ->ord_prev;
+		edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 		edges[n].old_target = last;
 		edges[n].new_target = pred;
 		n++;

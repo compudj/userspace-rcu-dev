@@ -1580,16 +1580,16 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 			ft_ord_cell_fastpath_ok(ft, iter)) {
 		struct ft_ord_cell *cur = ft_ord_cell_cursor(iter);
 		struct ft_ord_cell *nxt = (mode == FT_LOOKUP_GT) ?
-			ft_ord_cell_resolve_ord(&cur->ord_next) :
-			ft_ord_cell_resolve_ord(&cur->ord_prev);
+			ft_ord_cell_resolve_ord(&cur->lnode.next) :
+			ft_ord_cell_resolve_ord(&cur->lnode.prev);
 
 		ft_ord_cell_iter_land(ft, iter, nxt);
 #ifndef FT_NO_ORD_PREFETCH
 		/* One-hop NTA prefetch of the cell the next call will land on. */
 		if (nxt) {
 			struct ft_ord_cell *nn = (mode == FT_LOOKUP_GT) ?
-				ft_ord_cell_resolve_ord(&nxt->ord_next) :
-				ft_ord_cell_resolve_ord(&nxt->ord_prev);
+				ft_ord_cell_resolve_ord(&nxt->lnode.next) :
+				ft_ord_cell_resolve_ord(&nxt->lnode.prev);
 			if (nn)
 				__builtin_prefetch((const void *) nn, 0, 0);
 		}
@@ -1711,7 +1711,7 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	 * the cached position so it is not reused across a lock window. */
 	if (ft_ord_cell_fastpath_ok(ft, iter)) {
 		status = ft_ord_cell_iter_land(ft, iter,
-			ft_ord_cell_resolve_ord(&ft->ord_cell_head));
+			ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &ft->ord_cell_head));
 		iter_auto_invalidate_cache(iter);
 		return status;
 	}
@@ -1746,7 +1746,7 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	 * auto-invalidate rationale). */
 	if (ft_ord_cell_fastpath_ok(ft, iter)) {
 		status = ft_ord_cell_iter_land(ft, iter,
-			ft_ord_cell_resolve_ord(&ft->ord_cell_tail));
+			ft_ord_cell_resolve_ord((struct urcu_txn_sw_list_node *const *) &ft->ord_cell_tail));
 		iter_auto_invalidate_cache(iter);
 		return status;
 	}

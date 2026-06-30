@@ -2145,8 +2145,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * unlink sync, so clearing run_D's boundary links is a plain store.
 			 */
 			if (gs_ord) {
-				gs_d_first->ord_prev = NULL;
-				gs_d_last->ord_next = NULL;
+				gs_d_first->lnode.prev = NULL;
+				gs_d_last->lnode.next = NULL;
 				n = ft_ord_cell_endpoint_edge(&swap_ft->ord_cell_head,
 					swap_ft->ord_cell_head, gs_d_first, edges, n);
 				n = ft_ord_cell_endpoint_edge(&swap_ft->ord_cell_tail,
