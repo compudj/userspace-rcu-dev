@@ -185,7 +185,7 @@ struct urcu_txn_list_node *urcu_txn_list_resolve(void *raw)
 	uintptr_t v = (uintptr_t) raw;
 
 	if (caa_unlikely(v & (URCU_MCAS_TAG | URCU_TXN_LIST_MARK)))
-		return urcu_txn_list_unmark(urcu_mcas_resolve(raw));
+		return urcu_txn_list_unmark(urcu_mcas_resolve(raw, URCU_MCAS_TAG));
 	return (struct urcu_txn_list_node *) raw;
 }
 
@@ -228,7 +228,7 @@ int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
 		struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *pos)
 {
-	void *pn = urcu_txn_load(txn, (void **) &pos->next);
+	void *pn = urcu_txn_load(txn, (void **) &pos->next, URCU_MCAS_TAG);
 	struct urcu_txn_list_node *succ;
 
 	if (urcu_txn_list_is_marked(pn))
@@ -246,7 +246,7 @@ int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
 	 * del(succ) exactly as the next side does; a marked succ aborts here.
 	 */
 	if (urcu_txn_list_is_marked(urcu_txn_load_validate(txn,
-			(void **) &succ->next)))
+			(void **) &succ->next, URCU_MCAS_TAG)))
 		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
 
 	/* Build the fresh node invisibly. */
@@ -261,8 +261,8 @@ int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
 	 * caller retries (and on a marked pos, returns -ENOENT above).  See the
 	 * "next"-only mark rationale at the top of this file.
 	 */
-	urcu_txn_store(txn, (void **) &pos->next, succ, newp);
-	urcu_txn_store(txn, (void **) &succ->prev, pos, newp);
+	urcu_txn_store(txn, (void **) &pos->next, succ, newp, URCU_MCAS_TAG);
+	urcu_txn_store(txn, (void **) &succ->prev, pos, newp, URCU_MCAS_TAG);
 	return 0;
 }
 
@@ -332,7 +332,7 @@ int urcu_txn_list_insert_after_guarded_rcu(
 		struct urcu_txn_list_node *succ;
 
 		urcu_txn_begin(&txn);
-		pn = urcu_txn_load(&txn, (void **) &pos->next);
+		pn = urcu_txn_load(&txn, (void **) &pos->next, URCU_MCAS_TAG);
 		if (urcu_txn_list_is_marked(pn)) {
 			urcu_txn_end(&txn);
 			return -ENOENT;			/* @pos was deleted */
@@ -343,7 +343,7 @@ int urcu_txn_list_insert_after_guarded_rcu(
 		 * A read != expected means it never held -- bail (the recorded
 		 * guard is discarded by end).
 		 */
-		if (urcu_txn_load_validate(&txn, guard_slot) !=
+		if (urcu_txn_load_validate(&txn, guard_slot, URCU_MCAS_TAG) !=
 				guard_expected) {
 			urcu_txn_end(&txn);
 			return -ENOENT;			/* guard no longer holds */
@@ -356,15 +356,15 @@ int urcu_txn_list_insert_after_guarded_rcu(
 		 * insert_after_prepare.  A marked succ moved: retry.
 		 */
 		if (urcu_txn_list_is_marked(urcu_txn_load_validate(
-				&txn, (void **) &succ->next))) {
+				&txn, (void **) &succ->next, URCU_MCAS_TAG))) {
 			urcu_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_txn_end(&txn);
 			continue;
 		}
 		newp->next = succ;
 		newp->prev = pos;
-		urcu_txn_store(&txn, (void **) &pos->next, succ, newp);
-		urcu_txn_store(&txn, (void **) &succ->prev, pos, newp);
+		urcu_txn_store(&txn, (void **) &pos->next, succ, newp, URCU_MCAS_TAG);
+		urcu_txn_store(&txn, (void **) &succ->prev, pos, newp, URCU_MCAS_TAG);
 		ret = urcu_txn_commit(&txn);
 		urcu_txn_end(&txn);
 		if (ret != URCU_TXN_STATUS_ABORT)
@@ -390,13 +390,13 @@ int urcu_txn_list_insert_before_prepare(struct urcu_mcas_txn *txn,
 	 * against del(pos) atomically even when the slot-sorted install reaches
 	 * &pos->prev first.  A marked pos => the anchor is gone (-ENOENT).
 	 */
-	void *pn = urcu_txn_load_validate(txn, (void **) &pos->next);
+	void *pn = urcu_txn_load_validate(txn, (void **) &pos->next, URCU_MCAS_TAG);
 	struct urcu_txn_list_node *prev;
 
 	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;			/* @pos was deleted */
 	prev = urcu_txn_list_unmark(
-			urcu_txn_load(txn, (void **) &pos->prev));
+			urcu_txn_load(txn, (void **) &pos->prev, URCU_MCAS_TAG));
 
 	newp->next = pos;
 	newp->prev = prev;
@@ -408,8 +408,8 @@ int urcu_txn_list_insert_before_prepare(struct urcu_mcas_txn *txn,
 	 * aborts the commit, and a marked pos is caught on the re-read above.
 	 * See the "next"-only mark rationale at the top.
 	 */
-	urcu_txn_store(txn, (void **) &prev->next, pos, newp);
-	urcu_txn_store(txn, (void **) &pos->prev, prev, newp);
+	urcu_txn_store(txn, (void **) &prev->next, pos, newp, URCU_MCAS_TAG);
+	urcu_txn_store(txn, (void **) &pos->prev, prev, newp, URCU_MCAS_TAG);
 	return 0;
 }
 
@@ -476,14 +476,14 @@ static inline
 int urcu_txn_list_del_prepare(struct urcu_mcas_txn *txn,
 		struct urcu_txn_list_node *elem)
 {
-	void *en = urcu_txn_load(txn, (void **) &elem->next);
+	void *en = urcu_txn_load(txn, (void **) &elem->next, URCU_MCAS_TAG);
 	struct urcu_txn_list_node *next, *prev;
 
 	if (urcu_txn_list_is_marked(en))
 		return -ENOENT;			/* already deleted by a peer */
 	next = (struct urcu_txn_list_node *) en;
 	prev = urcu_txn_list_unmark(
-			urcu_txn_load(txn, (void **) &elem->prev));
+			urcu_txn_load(txn, (void **) &elem->prev, URCU_MCAS_TAG));
 
 	/*
 	 * We rewrite &next->prev but not &next->next.  Load-validate next->next
@@ -503,7 +503,7 @@ int urcu_txn_list_del_prepare(struct urcu_mcas_txn *txn,
 	 */
 	if (next != prev &&
 			urcu_txn_list_is_marked(urcu_txn_load_validate(
-				txn, (void **) &next->next)))
+				txn, (void **) &next->next, URCU_MCAS_TAG)))
 		return -EAGAIN;			/* successor (a neighbour) deleted: retry */
 
 	/*
@@ -516,9 +516,9 @@ int urcu_txn_list_del_prepare(struct urcu_mcas_txn *txn,
 	 * mark rationale at the top of this file.
 	 */
 	urcu_txn_store(txn, (void **) &elem->next, next,
-			urcu_txn_list_set_mark(next));
-	urcu_txn_store(txn, (void **) &prev->next, elem, next);
-	urcu_txn_store(txn, (void **) &next->prev, elem, prev);
+			urcu_txn_list_set_mark(next), URCU_MCAS_TAG);
+	urcu_txn_store(txn, (void **) &prev->next, elem, next, URCU_MCAS_TAG);
+	urcu_txn_store(txn, (void **) &next->prev, elem, prev, URCU_MCAS_TAG);
 	return 0;
 }
 
@@ -577,14 +577,14 @@ int urcu_txn_list_replace_prepare(struct urcu_mcas_txn *txn,
 		struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *old)
 {
-	void *en = urcu_txn_load(txn, (void **) &old->next);
+	void *en = urcu_txn_load(txn, (void **) &old->next, URCU_MCAS_TAG);
 	struct urcu_txn_list_node *next, *prev;
 
 	if (urcu_txn_list_is_marked(en))
 		return -ENOENT;			/* @old already deleted/replaced by a peer */
 	next = (struct urcu_txn_list_node *) en;
 	prev = urcu_txn_list_unmark(
-			urcu_txn_load(txn, (void **) &old->prev));
+			urcu_txn_load(txn, (void **) &old->prev, URCU_MCAS_TAG));
 
 	/*
 	 * We rewrite &next->prev but not &next->next.  Load-validate next->next
@@ -597,7 +597,7 @@ int urcu_txn_list_replace_prepare(struct urcu_mcas_txn *txn,
 	 */
 	if (next != prev &&
 			urcu_txn_list_is_marked(urcu_txn_load_validate(
-				txn, (void **) &next->next)))
+				txn, (void **) &next->next, URCU_MCAS_TAG)))
 		return -EAGAIN;			/* successor (a neighbour) deleted: retry */
 
 	/* Build @newp's links invisibly, then swing both neighbour edges to it. */
@@ -613,9 +613,9 @@ int urcu_txn_list_replace_prepare(struct urcu_mcas_txn *txn,
 	 * the top of this file.
 	 */
 	urcu_txn_store(txn, (void **) &old->next, next,
-			urcu_txn_list_set_mark(next));
-	urcu_txn_store(txn, (void **) &prev->next, old, newp);
-	urcu_txn_store(txn, (void **) &next->prev, old, newp);
+			urcu_txn_list_set_mark(next), URCU_MCAS_TAG);
+	urcu_txn_store(txn, (void **) &prev->next, old, newp, URCU_MCAS_TAG);
+	urcu_txn_store(txn, (void **) &next->prev, old, newp, URCU_MCAS_TAG);
 	return 0;
 }
 

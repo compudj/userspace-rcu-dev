@@ -29,11 +29,8 @@
 
 #define NR_TESTS 20
 
-/* Embedder tag hook: mark bit 0 of the proxy pointer (latches are 16B-aligned). */
-static void *test_tag(struct urcu_txn_sw_proxy *p)
-{
-	return (void *) ((unsigned long) p | 1UL);
-}
+/* Per-record tag: bit 0 of the proxy pointer (latches are 16B-aligned). */
+#define TEST_TAG	1UL
 
 static int is_proxy(void *v)
 {
@@ -95,9 +92,9 @@ int main(void)
 		struct urcu_txn_sw_txn _t, *t = &_t;
 		enum urcu_txn_status st;
 
-		urcu_txn_sw_init(t, test_tag);
+		urcu_txn_sw_init(t);
 		ok(urcu_txn_sw_reserve(t, 4), "init + reserve");
-		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200);
+		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200, TEST_TAG);
 		st = urcu_txn_sw_commit(t);		/* single edge: frees now */
 		ok(st == URCU_TXN_STATUS_OK, "single-edge commit returns OK");
 		ok(slot == (void *) 0x200, "single-edge slot holds the new target directly");
@@ -114,11 +111,11 @@ int main(void)
 		struct urcu_txn_sw_txn _t, *t = &_t;
 		enum urcu_txn_status st;
 
-		urcu_txn_sw_init(t, test_tag);
+		urcu_txn_sw_init(t);
 		urcu_txn_sw_reserve(t, 4);
-		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11);
-		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21);
-		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x31);
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
+		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x31, TEST_TAG);
 		st = urcu_txn_sw_commit(t);		/* multi-edge: parks proxies */
 		ok(st == URCU_TXN_STATUS_OK, "multi-edge commit returns OK");
 		ok(s1 == (void *) 0x11 && s2 == (void *) 0x21 &&
@@ -135,9 +132,9 @@ int main(void)
 		struct urcu_txn_sw_txn _t, *t = &_t;
 		enum urcu_txn_status st;
 
-		urcu_txn_sw_init(t, test_tag);
+		urcu_txn_sw_init(t);
 		urcu_txn_sw_reserve(t, 4);
-		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200);
+		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200, TEST_TAG);
 		urcu_txn_sw_install(t);
 		ok(is_proxy(slot) && resolve(slot) == (void *) 0x100,
 			"explicit install parks a proxy resolving to old");
@@ -160,11 +157,11 @@ int main(void)
 		bool all_recorded = true, all_new = true;
 		unsigned int i;
 
-		urcu_txn_sw_init(t, test_tag);
+		urcu_txn_sw_init(t);
 		for (i = 0; i < NR_EDGES; i++) {
 			slots[i] = (void *) (((unsigned long) (i + 1)) << 8);
 			if (!urcu_txn_sw_record(t, &slots[i], slots[i],
-				(void *) ((((unsigned long) (i + 1)) << 8) | 0x10)))
+				(void *) ((((unsigned long) (i + 1)) << 8) | 0x10), TEST_TAG))
 				all_recorded = false;
 		}
 		ok(all_recorded, "record realloc-grows past the initial capacity");
@@ -191,8 +188,8 @@ int main(void)
 
 		ok(((unsigned long) buf & 0xfUL) == 0,
 			"inline latch buffer is 16-byte aligned (tag room)");
-		urcu_txn_sw_init_inline(t, test_tag, buf, 1);
-		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200);
+		urcu_txn_sw_init_inline(t, buf, 1);
+		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200, TEST_TAG);
 		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu);	/* lone edge: fn unused */
 		ok(st == URCU_TXN_STATUS_OK, "inline lone-edge commit_flavor returns OK");
 		ok(slot == (void *) 0x200 && !is_proxy(slot),
@@ -211,10 +208,10 @@ int main(void)
 		enum urcu_txn_status st;
 
 		reclaim_calls = 0;
-		urcu_txn_sw_init(t, test_tag);
-		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11);
-		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21);
-		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x31);
+		urcu_txn_sw_init(t);
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
+		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x31, TEST_TAG);
 		st = urcu_txn_sw_commit_flavor(t, counting_call_rcu);
 		ok(st == URCU_TXN_STATUS_OK, "commit_flavor multi-edge returns OK");
 		ok(s1 == (void *) 0x11 && s2 == (void *) 0x21 &&
@@ -234,9 +231,9 @@ int main(void)
 		struct urcu_txn_sw_txn _t, *t = &_t;
 		enum urcu_txn_status st;
 
-		urcu_txn_sw_init(t, test_tag);
-		urcu_txn_sw_record(t, &s1, (void *) 0x40, (void *) 0x41);
-		urcu_txn_sw_record(t, &s2, (void *) 0x50, (void *) 0x51);
+		urcu_txn_sw_init(t);
+		urcu_txn_sw_record(t, &s1, (void *) 0x40, (void *) 0x41, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x50, (void *) 0x51, TEST_TAG);
 		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu);
 		ok(st == URCU_TXN_STATUS_OK,
 			"exclusive (synchronous-reclaim) multi-edge commit returns OK");

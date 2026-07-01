@@ -70,8 +70,8 @@ int main(void)
 	g_payload = P0;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	gv = urcu_txn_load_validate(&tx, &g_gate);
-	urcu_txn_store(&tx, &g_payload, P0, P1);
+	gv = urcu_txn_load_validate(&tx, &g_gate, URCU_MCAS_TAG);
+	urcu_txn_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(gv == CLEAR && st == URCU_TXN_STATUS_OK &&
@@ -84,8 +84,8 @@ int main(void)
 	g_payload = P0;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	gv = urcu_txn_load_validate(&tx, &g_gate);
-	urcu_txn_store(&tx, &g_payload, P0, P1);
+	gv = urcu_txn_load_validate(&tx, &g_gate, URCU_MCAS_TAG);
+	urcu_txn_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
 	g_gate = SET;			/* simulated racing tombstone */
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
@@ -97,8 +97,8 @@ int main(void)
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	vv = urcu_txn_load_validate(&tx, &g_w);
-	urcu_txn_store(&tx, &g_w, VX, VZ);
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
+	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
 	nr1 = tx.mcas->nr;
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
@@ -110,8 +110,8 @@ int main(void)
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	urcu_txn_store(&tx, &g_w, VX, VZ);
-	vv = urcu_txn_load_validate(&tx, &g_w);
+	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
 	nr2 = tx.mcas->nr;
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
@@ -122,7 +122,7 @@ int main(void)
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	vv = urcu_txn_load_validate(&tx, &g_w);
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(vv == VX && st == URCU_TXN_STATUS_OK && g_w == VX,

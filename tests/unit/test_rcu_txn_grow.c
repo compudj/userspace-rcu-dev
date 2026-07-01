@@ -122,12 +122,12 @@ static void *ph1_worker(void *arg)
 				(void) urcu_txn_reserve(&tx, PH1_TXN);
 			for (i = 0; i < PH1_TXN; i++) {
 				uintptr_t old = (uintptr_t) urcu_txn_load(
-						&tx, &ph1_word[idx[i]]);
+						&tx, &ph1_word[idx[i]], URCU_MCAS_TAG);
 				intptr_t delta = (i < PH1_TXN / 2) ? +3 : -3;
 
 				urcu_txn_store(&tx, &ph1_word[idx[i]],
 						(void *) old,
-						(void *) lf_bump(old, delta));
+						(void *) lf_bump(old, delta), URCU_MCAS_TAG);
 			}
 			ret = urcu_txn_commit(&tx);
 			urcu_txn_end(&tx);
@@ -183,7 +183,7 @@ static void *ph2_reader(void *arg)
 					+ 1442695040888963407ull;
 			i = (long) ((rng >> 33) % PH2_N);
 			v = dec(urcu_mcas_resolve(
-					urcu_mcas_read(&ph2_word[i])));
+					urcu_mcas_read(&ph2_word[i], URCU_MCAS_TAG), URCU_MCAS_TAG));
 			if (!ph2_value_ok(i, v))
 				CMM_STORE_SHARED(ph2_reader_bad, 1);
 		}
@@ -217,7 +217,7 @@ static void *ph2_writer(void *arg)
 			for (i = 0; i < PH2_N; i++)
 				urcu_txn_store(&tx, &ph2_word[i],
 						enc(i + (long) round * PH2_N),
-						enc(i + (long) (round + 1) * PH2_N));
+						enc(i + (long) (round + 1) * PH2_N), URCU_MCAS_TAG);
 			ret = urcu_txn_commit(&tx);
 			urcu_txn_end(&tx);
 			if (ret < 0)

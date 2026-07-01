@@ -128,8 +128,8 @@ static struct urcu_mcas *make_txn(void **slot_a, void *a_old, void *a_new,
 
 	if (!t)
 		abort();
-	urcu_mcas_add(t, slot_a, a_old, a_new);
-	urcu_mcas_add(t, slot_s, s_old, s_new);
+	urcu_mcas_add(t, slot_a, a_old, a_new, URCU_MCAS_TAG);
+	urcu_mcas_add(t, slot_s, s_old, s_new, URCU_MCAS_TAG);
 	urcu_mcas_sort(t);		/* slot-address order, as commit() does */
 	for (i = 0; i < t->nr; i++) {
 		t->recs[i].mcas = t;		/* back-pointers, as commit() does */

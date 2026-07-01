@@ -311,11 +311,11 @@ static void test_proxy_phases(void)
 	 * explicit install and the commit to observe the reader's view of
 	 * each phase -- the same install -> commit -> settle the mutators run.
 	 */
-	urcu_txn_sw_init(txn, urcu_txn_sw_list_proxy_tag);
+	urcu_txn_sw_init(txn);
 	if (!urcu_txn_sw_reserve(txn, 2))
 		abort();
-	urcu_txn_sw_record(txn, (void **) &head.node.next, A, B);	/* head->next */
-	urcu_txn_sw_record(txn, (void **) &B->prev, A, &head.node);	/* B->prev */
+	urcu_txn_sw_record(txn, (void **) &head.node.next, A, B, URCU_TXN_SW_LIST_PROXY_TAG);	/* head->next */
+	urcu_txn_sw_record(txn, (void **) &B->prev, A, &head.node, URCU_TXN_SW_LIST_PROXY_TAG);	/* B->prev */
 	urcu_txn_sw_install(txn);		/* park proxies; selector 0 => old */
 
 	rcu_read_lock();

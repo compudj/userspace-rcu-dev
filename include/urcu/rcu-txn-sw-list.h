@@ -131,12 +131,6 @@ void urcu_txn_sw_list_init(struct urcu_txn_sw_list_head *head)
  */
 #define URCU_TXN_SW_LIST_PROXY_TAG		1UL
 
-static inline
-void *urcu_txn_sw_list_proxy_tag(struct urcu_txn_sw_proxy *proxy)
-{
-	return (void *) ((uintptr_t) proxy | URCU_TXN_SW_LIST_PROXY_TAG);
-}
-
 /*
  * Resolve a slot value to the node it currently denotes: a tagged proxy
  * resolves through the flip selector (to its old or new target), a direct
@@ -210,10 +204,10 @@ int urcu_txn_sw_list_flip2(
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
+	urcu_txn_sw_init(&txn);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
-	(void) urcu_txn_sw_record(&txn, (void **) slot0, old0, new0);
-	(void) urcu_txn_sw_record(&txn, (void **) slot1, old1, new1);
+	(void) urcu_txn_sw_record(&txn, (void **) slot0, old0, new0, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record(&txn, (void **) slot1, old1, new1, URCU_TXN_SW_LIST_PROXY_TAG);
 	/*
 	 * Two edges => commit auto-installs, flips, settles, and owns reclaim
 	 * (call_rcu).  MEMORY_ERROR (< 0) means an alloc failed and nothing was
@@ -231,8 +225,8 @@ int urcu_txn_sw_list_flip2(
  * Mirrors urcu_txn_list_insert_after_prepare(); under a single updater
  * there is no concurrent deletion, so it always succeeds (returns 0).  The int
  * return matches the concurrent variant so callers share one shape across the
- * single-updater -> concurrent transition.  @txn must be init'd with
- * urcu_txn_sw_list_proxy_tag so the list's reader accessors resolve the proxy.
+ * single-updater -> concurrent transition.  Each recorded edge is tagged with
+ * URCU_TXN_SW_LIST_PROXY_TAG so the list's reader accessors resolve the proxy.
  */
 static inline
 int urcu_txn_sw_list_add_after_prepare(struct urcu_txn_sw_txn *txn,
@@ -246,8 +240,8 @@ int urcu_txn_sw_list_add_after_prepare(struct urcu_txn_sw_txn *txn,
 	newp->next = next;
 
 	/* pos->next: next -> newp ; next->prev: pos -> newp */
-	(void) urcu_txn_sw_record(txn, (void **) &pos->next, next, newp);
-	(void) urcu_txn_sw_record(txn, (void **) &next->prev, pos, newp);
+	(void) urcu_txn_sw_record(txn, (void **) &pos->next, next, newp, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record(txn, (void **) &next->prev, pos, newp, URCU_TXN_SW_LIST_PROXY_TAG);
 	return 0;
 }
 
@@ -261,7 +255,7 @@ int urcu_txn_sw_list_add_after_rcu(struct urcu_txn_sw_list_node *newp,
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
+	urcu_txn_sw_init(&txn);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_list_add_after_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -282,8 +276,8 @@ int urcu_txn_sw_list_add_before_prepare(struct urcu_txn_sw_txn *txn,
 	newp->prev = prev;
 
 	/* prev->next: pos -> newp ; pos->prev: prev -> newp */
-	(void) urcu_txn_sw_record(txn, (void **) &prev->next, pos, newp);
-	(void) urcu_txn_sw_record(txn, (void **) &pos->prev, prev, newp);
+	(void) urcu_txn_sw_record(txn, (void **) &prev->next, pos, newp, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record(txn, (void **) &pos->prev, prev, newp, URCU_TXN_SW_LIST_PROXY_TAG);
 	return 0;
 }
 
@@ -297,7 +291,7 @@ int urcu_txn_sw_list_add_before_rcu(struct urcu_txn_sw_list_node *newp,
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
+	urcu_txn_sw_init(&txn);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_list_add_before_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -336,8 +330,8 @@ int urcu_txn_sw_list_del_prepare(struct urcu_txn_sw_txn *txn,
 	struct urcu_txn_sw_list_node *next = elem->next;
 
 	/* prev->next: elem -> next ; next->prev: elem -> prev */
-	(void) urcu_txn_sw_record(txn, (void **) &prev->next, elem, next);
-	(void) urcu_txn_sw_record(txn, (void **) &next->prev, elem, prev);
+	(void) urcu_txn_sw_record(txn, (void **) &prev->next, elem, next, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record(txn, (void **) &next->prev, elem, prev, URCU_TXN_SW_LIST_PROXY_TAG);
 	return 0;
 }
 
@@ -352,7 +346,7 @@ int urcu_txn_sw_list_del_rcu(struct urcu_txn_sw_list_node *elem)
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
+	urcu_txn_sw_init(&txn);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_list_del_prepare(&txn, elem);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -378,8 +372,8 @@ int urcu_txn_sw_list_replace_prepare(struct urcu_txn_sw_txn *txn,
 	newp->next = next;
 
 	/* prev->next: old -> newp ; next->prev: old -> newp */
-	(void) urcu_txn_sw_record(txn, (void **) &prev->next, old, newp);
-	(void) urcu_txn_sw_record(txn, (void **) &next->prev, old, newp);
+	(void) urcu_txn_sw_record(txn, (void **) &prev->next, old, newp, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record(txn, (void **) &next->prev, old, newp, URCU_TXN_SW_LIST_PROXY_TAG);
 	return 0;
 }
 
@@ -393,7 +387,7 @@ int urcu_txn_sw_list_replace_rcu(struct urcu_txn_sw_list_node *old,
 {
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn, urcu_txn_sw_list_proxy_tag);
+	urcu_txn_sw_init(&txn);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_list_replace_prepare(&txn, old, newp);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;

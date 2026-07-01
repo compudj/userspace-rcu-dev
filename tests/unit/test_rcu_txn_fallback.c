@@ -108,10 +108,10 @@ static void *narrow_worker(void *arg)
 
 			urcu_txn_begin(&tx);
 			oi = (uintptr_t) urcu_txn_load(&tx,
-					&g_word[i]);
+					&g_word[i], URCU_MCAS_TAG);
 			ni = (void *) lf_bump(oi, 1);
 			urcu_txn_store(&tx, &g_word[i],
-					(void *) oi, ni);
+					(void *) oi, ni, URCU_MCAS_TAG);
 			ret = urcu_txn_commit(&tx);
 			urcu_txn_end(&tx);
 			if (ret < 0)
@@ -151,14 +151,14 @@ static void *wide_worker(void *arg)
 			(void) urcu_txn_reserve(&tx, NR_WORDS);
 			for (w = 0; w < NR_WORDS; w++)
 				o[w] = (uintptr_t) urcu_txn_load(
-						&tx, &g_word[w]);
+						&tx, &g_word[w], URCU_MCAS_TAG);
 			nw = (void *) lf_bump(o[0], (NR_WORDS - 1) * 2);
 			urcu_txn_store(&tx, &g_word[0],
-					(void *) o[0], nw);
+					(void *) o[0], nw, URCU_MCAS_TAG);
 			for (w = 1; w < NR_WORDS; w++) {
 				nw = (void *) lf_bump(o[w], -2);
 				urcu_txn_store(&tx, &g_word[w],
-						(void *) o[w], nw);
+						(void *) o[w], nw, URCU_MCAS_TAG);
 			}
 			ret = urcu_txn_commit(&tx);
 			urcu_txn_end(&tx);

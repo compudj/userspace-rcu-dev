@@ -181,9 +181,9 @@ static void *worker(void *arg)
 				t = urcu_mcas_create(1, retry);
 				if (!t)
 					abort();
-				ow = (uintptr_t) urcu_mcas_read(&g_word[w]);
+				ow = (uintptr_t) urcu_mcas_read(&g_word[w], URCU_MCAS_TAG);
 				urcu_mcas_add(t, &g_word[w],
-					(void *) ow, (void *) lf_bump(ow, 1));
+					(void *) ow, (void *) lf_bump(ow, 1), URCU_MCAS_TAG);
 				ok = urcu_mcas_commit(t, call_rcu);
 				rcu_read_unlock();
 				if (!ok)
@@ -218,19 +218,19 @@ static void *worker(void *arg)
 				t = urcu_mcas_create(3, retry);
 				if (!t)
 					abort();
-				oi = (uintptr_t) urcu_mcas_read(&g_word[i]);
-				oj = (uintptr_t) urcu_mcas_read(&g_word[j]);
+				oi = (uintptr_t) urcu_mcas_read(&g_word[i], URCU_MCAS_TAG);
+				oj = (uintptr_t) urcu_mcas_read(&g_word[j], URCU_MCAS_TAG);
 				urcu_mcas_add(t, &g_word[i],
-					(void *) oi, (void *) lf_bump(oi, 2));
+					(void *) oi, (void *) lf_bump(oi, 2), URCU_MCAS_TAG);
 				if (three) {
-					ok2 = (uintptr_t) urcu_mcas_read(&g_word[k]);
+					ok2 = (uintptr_t) urcu_mcas_read(&g_word[k], URCU_MCAS_TAG);
 					urcu_mcas_add(t, &g_word[j],
-						(void *) oj, (void *) lf_bump(oj, 2));
+						(void *) oj, (void *) lf_bump(oj, 2), URCU_MCAS_TAG);
 					urcu_mcas_add(t, &g_word[k],
-						(void *) ok2, (void *) lf_bump(ok2, -4));
+						(void *) ok2, (void *) lf_bump(ok2, -4), URCU_MCAS_TAG);
 				} else {
 					urcu_mcas_add(t, &g_word[j],
-						(void *) oj, (void *) lf_bump(oj, -2));
+						(void *) oj, (void *) lf_bump(oj, -2), URCU_MCAS_TAG);
 				}
 				ok = urcu_mcas_commit(t, call_rcu);
 				rcu_read_unlock();

@@ -199,6 +199,16 @@ struct urcu_mcas_record {
 	void **slot;			/* transacted word (bit 0 must be free) */
 	void *old_ptr;			/* expected old value */
 	void *new_ptr;			/* committed new value */
+	uintptr_t proxy_tag;		/* embedder's tag bits for THIS record's slot.
+					 * The parked proxy value is (&record | proxy_tag),
+					 * the record is recovered as (value & ~proxy_tag),
+					 * and a value is this record's proxy iff
+					 * (value & proxy_tag) == proxy_tag.  Carried per
+					 * record -- not a per-TU macro -- so heterogeneous
+					 * slots (e.g. fractal-trie 0xF vs a list's bit 0)
+					 * share one engine, and a helper finishing a foreign
+					 * txn untags/installs each foreign record through
+					 * that record's own tag. */
 	struct urcu_mcas *mcas;	/* back-pointer (status + sibling records) */
 	/*
 	 * Per-record install word -- one tri-state int making {install-once, plant
@@ -269,26 +279,49 @@ urcu_static_assert(!(__alignof__(struct urcu_mcas) % 16),
 		"urcu_mcas must inherit 16-byte alignment from its recs[] member",
 		urcu_mcas_aligned);
 
-/* The reserved tag bit marking a slot value as a parked record (proxy). */
+/* A convenient default tag (bit 0) for an embedder that keeps bit 0 free. */
 #define URCU_MCAS_TAG	1UL
 
+/*
+ * Proxy tag scheme -- carried PER RECORD (urcu_mcas_record.proxy_tag, set from
+ * the urcu_mcas_add() argument), not as a per-TU macro.  A parked slot value is
+ * (record address | tag); a record is 16-byte aligned, so its low 4 bits are
+ * free for the embedder's tag.  Storing the TAG (not a pre-tagged pointer) and
+ * forming the proxy from the record's CURRENT address at install is what makes a
+ * descriptor grow/realloc safe: the tag travels with the record content through
+ * the move, and the installer re-derives the proxy from the record's final
+ * address, so nothing is stranded.  Passing the tag explicitly lets heterogeneous
+ * slots share one engine -- the fractal trie tags with its type-7 / 0xF low
+ * nibble (a value no real node, NULL or skip pointer carries), a doubly-linked
+ * list with bit 0, etc.  The contract a tag must satisfy: (live_value & tag) !=
+ * tag for EVERY non-proxy value the embedder stores in a transacted slot, so the
+ * engine never mistakes a live value for one of its records.
+ *
+ * urcu_mcas_tag()/untag() take @tag explicitly; the installer passes the record's
+ * own r->proxy_tag, and a reader/helper passes the (agreed) tag of the slot it is
+ * resolving.
+ */
 static inline
-int urcu_mcas_is_proxy(void *v)
+void *urcu_mcas_tag(struct urcu_mcas_record *r, uintptr_t tag)
 {
-	return (int) ((uintptr_t) v & URCU_MCAS_TAG);
+	return (void *) ((uintptr_t) r | tag);
 }
 
 static inline
-struct urcu_mcas_record *urcu_mcas_untag(void *v)
+struct urcu_mcas_record *urcu_mcas_untag(void *v, uintptr_t tag)
 {
-	return (struct urcu_mcas_record *)
-			((uintptr_t) v & ~(uintptr_t) URCU_MCAS_TAG);
+	return (struct urcu_mcas_record *) ((uintptr_t) v & ~tag);
 }
 
+/*
+ * @v is a parked record iff it carries all of @tag's bits -- equivalently
+ * v == (urcu_mcas_untag(v, tag) | tag), i.e. @v is some record address OR'd with
+ * @tag.
+ */
 static inline
-void *urcu_mcas_tag(struct urcu_mcas_record *r)
+int urcu_mcas_is_proxy(void *v, uintptr_t tag)
 {
-	return (void *) ((uintptr_t) r | URCU_MCAS_TAG);
+	return ((uintptr_t) v & tag) == tag;
 }
 
 static inline
@@ -316,20 +349,31 @@ bool urcu_mcas_outranks(const struct urcu_mcas *a,
 }
 
 /*
+ * Resolve a parked record directly to the value it currently denotes (its
+ * transaction's new on success, old otherwise).  Split out of
+ * urcu_mcas_resolve() for an embedder that applies its OWN (wider) tag: it
+ * untags with its own mask -- so it already holds the record, not the
+ * engine-tagged slot value -- and resolves through this.  Call from within an
+ * RCU read-side section.
+ */
+static inline
+void *urcu_mcas_resolve_record(struct urcu_mcas_record *r)
+{
+	return urcu_mcas_status(r->mcas) == URCU_MCAS_SUCCEEDED ?
+			r->new_ptr : r->old_ptr;
+}
+
+/*
  * Resolve a value loaded from a transacted slot to the value it currently
  * denotes.  A plain value passes through; a parked record resolves through its
  * transaction's status word.  Call from within an RCU read-side section.
  */
 static inline
-void *urcu_mcas_resolve(void *v)
+void *urcu_mcas_resolve(void *v, uintptr_t tag)
 {
-	struct urcu_mcas_record *r;
-
-	if (caa_likely(!urcu_mcas_is_proxy(v)))
+	if (caa_likely(!urcu_mcas_is_proxy(v, tag)))
 		return v;
-	r = urcu_mcas_untag(v);
-	return urcu_mcas_status(r->mcas) == URCU_MCAS_SUCCEEDED ?
-			r->new_ptr : r->old_ptr;
+	return urcu_mcas_resolve_record(urcu_mcas_untag(v, tag));
 }
 
 /*
@@ -378,7 +422,7 @@ static inline
 int urcu_mcas_plant(struct urcu_mcas *t,
 		struct urcu_mcas_record *r, void *expect)
 {
-	void *tagv = urcu_mcas_tag(r);
+	void *tagv = urcu_mcas_tag(r, r->proxy_tag);
 
 	/*
 	 * Test knob: a bare value-CAS with no install-once gate and no self-settle --
@@ -395,7 +439,7 @@ static inline
 int urcu_mcas_plant(struct urcu_mcas *t,
 		struct urcu_mcas_record *r, void *expect)
 {
-	void *tagv = urcu_mcas_tag(r);
+	void *tagv = urcu_mcas_tag(r, r->proxy_tag);
 	int v;
 
 	/* Claim r's install: FREE -> BUSY (acquire). */
@@ -466,7 +510,7 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 		return;			/* already terminal */
 	for (i = 0; i < t->nr; i++) {
 		struct urcu_mcas_record *r = &t->recs[i];
-		void *tagv = urcu_mcas_tag(r);
+		void *tagv = urcu_mcas_tag(r, r->proxy_tag);
 
 		for (;;) {
 			void *v;
@@ -478,9 +522,13 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 			v = uatomic_load(r->slot, CMM_ACQUIRE);
 			if (v == tagv)
 				break;		/* already installed */
-			if (urcu_mcas_is_proxy(v)) {
+			if (urcu_mcas_is_proxy(v, r->proxy_tag)) {
+				/*
+				 * A foreign proxy in r->slot uses the same slot's
+				 * (agreed) tag, so untag it with r->proxy_tag.
+				 */
 				struct urcu_mcas_record *fr =
-					urcu_mcas_untag(v);
+					urcu_mcas_untag(v, r->proxy_tag);
 				struct urcu_mcas *e = fr->mcas;
 				unsigned long est;
 				void *resolved;
@@ -613,7 +661,7 @@ void urcu_mcas_settle(struct urcu_mcas *t)
 		struct urcu_mcas_record *r = &t->recs[i];
 		void *want = (st == URCU_MCAS_SUCCEEDED) ? r->new_ptr : r->old_ptr;
 
-		(void) uatomic_cmpxchg(r->slot, urcu_mcas_tag(r), want);
+		(void) uatomic_cmpxchg(r->slot, urcu_mcas_tag(r, r->proxy_tag), want);
 	}
 }
 
@@ -629,17 +677,17 @@ void urcu_mcas_settle(struct urcu_mcas *t)
  * RCU read-side section.
  */
 static inline
-void *urcu_mcas_read(void **slot)
+void *urcu_mcas_read(void **slot, uintptr_t tag)
 {
 	for (;;) {
 		void *v = uatomic_load(slot, CMM_ACQUIRE);
 		struct urcu_mcas *e;
 
-		if (caa_likely(!urcu_mcas_is_proxy(v)))
+		if (caa_likely(!urcu_mcas_is_proxy(v, tag)))
 			return v;
-		e = urcu_mcas_untag(v)->mcas;
+		e = urcu_mcas_untag(v, tag)->mcas;
 		if (urcu_mcas_status(e) != URCU_MCAS_UNDECIDED)
-			return urcu_mcas_resolve(v);	/* terminal: logical value */
+			return urcu_mcas_resolve(v, tag);	/* terminal: logical value */
 		urcu_mcas_drive_install(e);		/* help decide, then re-read */
 	}
 }
@@ -697,7 +745,7 @@ struct urcu_mcas *urcu_mcas_create(unsigned int cap,
  */
 static inline
 bool urcu_mcas_add(struct urcu_mcas *t, void **slot,
-		void *old_ptr, void *new_ptr)
+		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	struct urcu_mcas_record *r;
 
@@ -707,6 +755,7 @@ bool urcu_mcas_add(struct urcu_mcas *t, void **slot,
 	r->slot = slot;
 	r->old_ptr = old_ptr;
 	r->new_ptr = new_ptr;
+	r->proxy_tag = tag;	/* the slot's tag; travels with the record */
 	return true;
 }
 
@@ -727,7 +776,7 @@ bool urcu_mcas_add(struct urcu_mcas *t, void **slot,
  */
 static inline
 bool urcu_mcas_record(struct urcu_mcas *t, void **slot,
-		void *old_ptr, void *new_ptr, int upgrade)
+		void *old_ptr, void *new_ptr, int upgrade, uintptr_t tag)
 {
 	unsigned int i;
 
@@ -739,11 +788,12 @@ bool urcu_mcas_record(struct urcu_mcas *t, void **slot,
 			t->poisoned = 1;	/* torn read-set: commit will abort */
 			return true;
 		}
+		/* Same slot -> same (agreed) tag; reconcile keeps the record's. */
 		if (upgrade)
 			t->recs[i].new_ptr = new_ptr;
 		return true;
 	}
-	return urcu_mcas_add(t, slot, old_ptr, new_ptr);
+	return urcu_mcas_add(t, slot, old_ptr, new_ptr, tag);
 }
 
 /*
