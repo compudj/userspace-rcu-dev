@@ -2258,13 +2258,39 @@ unsigned long ft_subtree_key_count(struct cds_ft *ft,
 	child = ft_node_get_direction(ft, node_flag, pivot, &child_key,
 			FT_RIGHT, true);
 	while (child) {
-		struct cds_ft_inode_flag *rchild =
-			ft_resolve_skip_compressed(ft, child);
+		struct cds_ft_inode_flag *rchild = child;
 
-		if (ft_node_external(rchild))
-			count += 1;
-		else
-			count += ft_subtree_key_count(ft, rchild);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (caa_unlikely(ft_node_skip_compressed(child))) {
+			unsigned int rewind;
+			struct cds_ft_inode_flag *at_pos;
+
+			/*
+			 * A skip slot's back-pointer and skip_len are transiently
+			 * inconsistent while a concurrent split/merge restructures the
+			 * path between the slot and the skip child (documented at
+			 * ft_skip_to_compressed): the raw ft_resolve_skip_compressed
+			 * trusts the back-pointer and would then hand back a node of the
+			 * WRONG KIND -- e.g. a mid-split branch internal misread as a
+			 * compressed node, its child-presence bitmap word taken for
+			 * cn->child and dereferenced (the count-walk SIGSEGV).  This is a
+			 * self-consistent reader, so re-anchor on the live structure like
+			 * every other concurrent reader (ft_skip_reanchor) and count the
+			 * live node AT the encoded position; an accumulator descends INTO
+			 * @at_pos for both rewind cases.
+			 */
+			(void) ft_skip_reanchor(ft, child, &rewind, &at_pos);
+			rchild = at_pos;	/* live self-consistent node (may be NULL on a
+					   pathological reanchor -- skip that subtree,
+					   an undercount is already tolerated here) */
+		}
+#endif
+		if (rchild) {
+			if (ft_node_external(rchild))
+				count += 1;
+			else
+				count += ft_subtree_key_count(ft, rchild);
+		}
 		pivot = child_key;
 		child = ft_node_get_direction(ft, node_flag, pivot, &child_key,
 				FT_RIGHT, true);
