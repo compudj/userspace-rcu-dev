@@ -784,31 +784,27 @@ bool ft_node_flip_proxy(struct cds_ft_inode_flag *node)
 }
 
 static inline_lookup
-struct urcu_txn_sw_proxy *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
+struct urcu_mcas_record *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
 {
-	return (struct urcu_txn_sw_proxy *) _ft_node_mask_ptr(node);
-}
-
-static
-struct cds_ft_inode_flag *ft_flip_proxy_flag(struct urcu_txn_sw_proxy *proxy)
-{
-	return (struct cds_ft_inode_flag *)
-		((unsigned long) proxy | FT_FLIP_PROXY_TAG);
+	return (struct urcu_mcas_record *) _ft_node_mask_ptr(node);
 }
 
 /*
  * Resolve a possibly-proxied flag to its current target.  Sits right
  * after a parent / root pointer load on the read side; the common case
- * (no merge in flight) is a single predicted-not-taken mask-compare, and
- * the proxy deref is reached only during a merge's brief flip window.
+ * (no mutation in flight) is a single predicted-not-taken mask-compare
+ * (ft_node_flip_proxy), and the parked-record deref is reached only during a
+ * commit's brief install-to-settle window.  A parked record carries FT's own
+ * 0xF tag (see URCU_MCAS_PROXY_* in fractal-trie-internal.h), so this masks it
+ * off and resolves the record through its MCAS status word.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
 {
 	if (caa_unlikely(ft_node_flip_proxy(node))) {
-		struct urcu_txn_sw_proxy *p = ft_flip_proxy_ptr(node);
+		struct urcu_mcas_record *r = ft_flip_proxy_ptr(node);
 
-		return (struct cds_ft_inode_flag *) urcu_txn_sw_proxy_get(p);
+		return (struct cds_ft_inode_flag *) urcu_mcas_resolve_record(r);
 	}
 	return node;
 }

@@ -71,7 +71,7 @@ struct ft_ord_cell *ft_ord_cell_resolve_ord(struct urcu_txn_sw_list_node *const 
 	struct urcu_txn_sw_list_node *p = rcu_dereference(*slot);
 
 	if (caa_unlikely(ft_node_flip_proxy((struct cds_ft_inode_flag *) p)))
-		p = (struct urcu_txn_sw_list_node *) urcu_txn_sw_proxy_get(
+		p = (struct urcu_txn_sw_list_node *) urcu_mcas_resolve_record(
 			ft_flip_proxy_ptr((struct cds_ft_inode_flag *) p));
 	/*
 	 * Circular topology: a link "off the end" resolves to the per-trie

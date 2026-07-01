@@ -82,6 +82,30 @@
 #include <unistd.h>
 #include <urcu/list.h>
 #include <urcu/rcu-txn-sw-list.h>
+/*
+ * FT parks a concurrent MCAS proxy (struct urcu_mcas_record *, 16-byte
+ * aligned -> low 4 bits free) under its own type-7 / 0xF pointer tag (see
+ * FT_FLIP_PROXY_TAG in ft-helpers.h) rather than the engine's bit-0 default:
+ * bit 0 alone marks an internal node here, so a bit-0 proxy would alias one,
+ * whereas a 0xF low nibble is an encoding no real node, NULL or skip pointer can
+ * carry.  The tag is now carried PER RECORD -- FT passes FT_FLIP_PROXY_TAG to
+ * every urcu_txn_store()/load_validate() (see ft_flip_txn_commit), the engine
+ * stores it in urcu_mcas_record.proxy_tag and forms the parked proxy as
+ * (record | proxy_tag), and the read hot paths recognise it with the SAME
+ * ft_node_flip_proxy() low-nibble test they already run.  No per-TU macro
+ * override of the engine is needed.
+ */
+/*
+ * FT is a flavor-agnostic library: it brackets its own RCU read-side section
+ * through the group's RCU flavor (flavor->read_lock / read_unlock) and drives
+ * the concurrent engine with only init / reserve / store / commit_flavor --
+ * never urcu_txn_begin() / urcu_txn_end().  Override their RCU bracket to
+ * no-ops so those (unused) inlines compile without binding a concrete flavor's
+ * rcu_read_lock symbol into the flavor-agnostic build.
+ */
+#define URCU_TXN_RCU_READ_LOCK()	do { } while (0)
+#define URCU_TXN_RCU_READ_UNLOCK()	do { } while (0)
+#include <urcu/rcu-txn.h>
 #include <urcu/rculfhash.h>
 #include <urcu/arch.h>
 #include <urcu/call-rcu.h>
@@ -1002,6 +1026,15 @@ struct cds_ft_group {
 	size_t max_key_len;		/* Maximum key length allowed. */
 	unsigned int flags;		/* CDS_FT_FLAG_* creation-time flags. */
 	const struct rcu_flavor_struct *flavor;
+	/*
+	 * Concurrent-engine escalation domain for the group's structural
+	 * transactions (urcu_txn_*).  Shared by every trie in the group: a
+	 * writer that keeps losing the lock-free race escalates to the
+	 * domain's fair lock so progress is bounded.  Currently exercised
+	 * under retained caller exclusion (no contention), so the fast path
+	 * never escalates.
+	 */
+	struct urcu_txn_domain domain;
 	/* Allocation arenas. */
 	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
 	/*

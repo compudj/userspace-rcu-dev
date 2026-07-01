@@ -461,6 +461,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 	assert(ft_group->max_tree_depth <= FT_MAX_DEPTH);
 	ft_group->flavor = flavor;
 	pthread_mutex_init(&ft_group->arena_lock, NULL);
+	urcu_txn_domain_init(&ft_group->domain);
 	if (attr) {
 		ft_group->key_map = attr->key_map;
 		ft_group->flags = attr->flags;

@@ -96,39 +96,65 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 }
 
 /*
- * FT bridge to the generic single-updater transaction urcu_txn_sw_txn
- * (<urcu/rcu-txn-sw.h>).  ft_flip_txn_tag is the one embedder hook: a parked
- * latch's address becomes a type-7 FT flip proxy (ft_flip_proxy_flag), resolved
- * on every read hot path by ft_resolve_flip_proxy.  The FT threads a heap txn
- * handle through an op and commits it with ft_flip_txn_commit, which owns
- * reclaim: a committed txn's parked group block is freed after a grace period
- * (a reader may hold a proxy) through the FT's RCU flavor -- except on the
- * exclusive build, which frees it in place.  An op that aborts before
- * committing drops its uncommitted handle with ft_flip_txn_destroy (nothing was
- * published, so no grace period is owed).
+ * FT bridge to the concurrent MCAS transaction engine (<urcu/rcu-txn.h>).  An
+ * op accumulates its frozen edge set {slot, old, new} into the embedded
+ * single-updater buffer (@buf) during its build -- through
+ * ft_flip_txn_record_reserved and the ordered-list *_prepare helpers -- then
+ * ft_flip_txn_commit REPLAYS that buffer into the urcu_mcas transaction (@mtxn)
+ * and commits it, so the whole set (structural index AND ordered-cell list)
+ * still publishes atomically.  A parked record carries FT's own type-7 / 0xF
+ * tag (URCU_MCAS_PROXY_* in fractal-trie-internal.h), resolved on the read hot
+ * path by ft_resolve_flip_proxy.  Commit OWNS reclaim: the committed descriptor
+ * is deferred-freed through the FT's RCU flavor (a reader may hold a parked
+ * record) -- except on the exclusive build, which frees it in place.  An op that
+ * aborts before committing drops its uncommitted handle with ft_flip_txn_destroy.
+ *
+ * @buf lives on ONLY as the edge record buffer: its own commit / proxy / selector
+ * machinery is never invoked (the MCAS engine parks the proxies now), so the
+ * per-record tag it stores is never installed.  @buf is the FIRST member, so the
+ * handed-out (struct urcu_txn_sw_txn *) handle is exactly &fat->buf and every
+ * record / *_prepare call site is unchanged; commit / destroy recover the outer
+ * struct by cast (ft_flip_txn_of).  @reserved marks a bounded txn whose @mtxn was
+ * pre-reserved at create, so its replay-commit is infallible (the load-bearing
+ * "commit cannot fail" contract); an unbounded glue txn reserves @mtxn at commit,
+ * where an OOM is a clean MEMORY_ERROR (nothing parked -- freeze-before-install).
  */
+struct ft_flip_txn {
+	struct urcu_txn_sw_txn buf;	/* MUST be first: the handle aliases this */
+	struct urcu_mcas_txn mtxn;	/* the concurrent commit engine handle */
+	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
+};
+urcu_static_assert(offsetof(struct ft_flip_txn, buf) == 0,
+		"ft_flip_txn.buf must be first so the handle aliases the struct",
+		ft_flip_txn_buf_first);
+
+/* Recover the enclosing FT flip-txn from a handed-out buffer handle. */
 static inline
-void *ft_flip_txn_tag(struct urcu_txn_sw_proxy *proxy)
+struct ft_flip_txn *ft_flip_txn_of(struct urcu_txn_sw_txn *t)
 {
-	return ft_flip_proxy_flag(proxy);
+	return (struct ft_flip_txn *) t;
 }
 
 static inline
 struct urcu_txn_sw_txn *ft_flip_txn_create(void)
 {
-	struct urcu_txn_sw_txn *t = (struct urcu_txn_sw_txn *) malloc(sizeof(*t));
+	struct ft_flip_txn *ft = (struct ft_flip_txn *) malloc(sizeof(*ft));
 
-	if (t)
-		urcu_txn_sw_init(t, ft_flip_txn_tag);
-	return t;
+	if (!ft)
+		return NULL;
+	urcu_txn_sw_init(&ft->buf);
+	urcu_txn_init(&ft->mtxn, NULL);	/* no escalation domain under POC exclusion */
+	ft->reserved = false;		/* unbounded: @mtxn reserved at commit */
+	return &ft->buf;
 }
 
 /*
  * Bounded FT flip-txn: a pre-reserved transaction for the point-op commits
  * (insert one-commit, ordered-cell splice/unsplice/swap) and bulk-op glue folds
- * whose edge count is bounded by construction, so every later record appends
- * without reallocating and cannot fail.  Returns NULL on OOM -> the caller
- * degrades to a direct / sequential publish.
+ * whose edge count is bounded by construction.  BOTH the edge buffer and the
+ * MCAS commit descriptor are reserved up front, so every later record appends
+ * without reallocating and the replay-commit is infallible.  Returns NULL on OOM
+ * -> the caller degrades to a direct / sequential publish.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_flip_countdown;
@@ -136,7 +162,7 @@ extern long cds_ft_fault_flip_countdown;
 static inline
 struct urcu_txn_sw_txn *ft_flip_txn_create_bounded(unsigned int cap)
 {
-	struct urcu_txn_sw_txn *t;
+	struct ft_flip_txn *ft;
 
 #ifdef FEATURE_FT_FAULT_INJECT
 	/*
@@ -154,15 +180,21 @@ struct urcu_txn_sw_txn *ft_flip_txn_create_bounded(unsigned int cap)
 		cds_ft_fault_flip_countdown--;
 	}
 #endif
-	t = (struct urcu_txn_sw_txn *) malloc(sizeof(*t));
-	if (!t)
+	ft = (struct ft_flip_txn *) malloc(sizeof(*ft));
+	if (!ft)
 		return NULL;
-	urcu_txn_sw_init(t, ft_flip_txn_tag);
-	if (!urcu_txn_sw_reserve(t, cap)) {
-		free(t);
+	urcu_txn_sw_init(&ft->buf);
+	urcu_txn_init(&ft->mtxn, NULL);	/* no escalation domain under POC exclusion */
+	if (!urcu_txn_sw_reserve(&ft->buf, cap) ||
+			urcu_txn_reserve(&ft->mtxn, cap) < 0) {
+		urcu_txn_sw__free_records(&ft->buf);
+		if (ft->mtxn.mcas && ft->mtxn.mcas != URCU_TXN_ENOMEM)
+			urcu_mcas_destroy(ft->mtxn.mcas);
+		free(ft);
 		return NULL;
 	}
-	return t;
+	ft->reserved = true;
+	return &ft->buf;
 }
 
 /*
@@ -198,34 +230,65 @@ static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
 }
 
 /*
- * Commit a heap FT flip-txn (ft_flip_txn_create*), then free its handle.
- * urcu_txn_sw_commit_flavor publishes the whole recorded edge set atomically and
- * OWNS the parked-block reclaim, deferring it through the FT's RCU flavor (or
- * freeing it in place on an exclusive build).  A single-edge / empty commit
- * parks no proxy (a lone release store) and a record OOM publishes nothing
- * (MEMORY_ERROR): the structure is byte-for-byte untouched in every non-publish
- * case (freeze-before-install), so the caller need not inspect the status.
- */
-static inline
-void ft_flip_txn_commit(struct cds_ft *ft, struct urcu_txn_sw_txn *t)
-{
-	(void) urcu_txn_sw_commit_flavor(t, ft->exclusive ?
-			ft_flip_txn_call_rcu_now :
-			ft->group->flavor->update_call_rcu);
-	free(t);	/* the heap handle; commit consumed its latches / block */
-}
-
-/*
- * Drop a heap FT flip-txn that was NOT committed (an op aborted before
- * publishing -- an OOM or a no-op path).  Nothing was stored into any slot
- * (freeze-before-install), so this frees the record array and the handle; no
- * grace period is owed.
+ * Drop an FT flip-txn that was NOT committed (an op aborted before publishing --
+ * an OOM or a no-op path).  Nothing was stored into any slot
+ * (freeze-before-install), so this frees the edge record array, any pre-reserved
+ * (uncommitted) MCAS descriptor, and the handle; no grace period is owed.
  */
 static inline
 void ft_flip_txn_destroy(struct urcu_txn_sw_txn *t)
 {
-	urcu_txn_sw__free_records(t);
-	free(t);
+	struct ft_flip_txn *ft = ft_flip_txn_of(t);
+
+	urcu_txn_sw__free_records(&ft->buf);
+	if (ft->mtxn.mcas && ft->mtxn.mcas != URCU_TXN_ENOMEM)
+		urcu_mcas_destroy(ft->mtxn.mcas);
+	free(ft);
+}
+
+/*
+ * Commit an FT flip-txn (ft_flip_txn_create*): REPLAY its buffered edge set into
+ * the concurrent MCAS transaction and commit, then free the handle.  The commit
+ * publishes the whole recorded edge set atomically (one status-word flip) and
+ * OWNS the descriptor reclaim, deferring it through the FT's RCU flavor (or
+ * freeing it in place on the exclusive build).  A bounded txn pre-reserved @mtxn
+ * at create, so its replay + commit are infallible (returns OK); an unbounded
+ * glue txn reserves @mtxn here and may return MEMORY_ERROR with nothing parked
+ * (freeze-before-install -- the structure is byte-for-byte untouched).  ABORT (a
+ * racing writer won a contended slot) cannot occur under the retained caller
+ * exclusion this POC runs under, so the retry loop runs exactly once; it is
+ * present as the per-op concurrent shape.  @t is consumed.
+ */
+static inline
+enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
+		struct urcu_txn_sw_txn *t)
+{
+	void (*reclaim)(struct rcu_head *, void (*)(struct rcu_head *)) =
+		ft->exclusive ? ft_flip_txn_call_rcu_now :
+				ft->group->flavor->update_call_rcu;
+	struct ft_flip_txn *ftt = ft_flip_txn_of(t);
+	enum urcu_txn_status st;
+
+	if (!ftt->reserved &&
+			caa_unlikely(urcu_txn_reserve(&ftt->mtxn, ftt->buf.nr) < 0)) {
+		ft_flip_txn_destroy(t);
+		return URCU_TXN_STATUS_MEMORY_ERROR;
+	}
+	do {
+		unsigned int i;
+
+		for (i = 0; i < ftt->buf.nr; i++) {
+			struct urcu_txn_sw_latch *l = &ftt->buf.latches[i];
+
+			(void) urcu_txn_store(&ftt->mtxn, l->slot,
+				l->proxy.ptr[0], l->proxy.ptr[1],
+				FT_FLIP_PROXY_TAG);
+		}
+		st = urcu_txn_commit_flavor(&ftt->mtxn, reclaim);
+	} while (caa_unlikely(st == URCU_TXN_STATUS_ABORT));
+	urcu_txn_sw__free_records(&ftt->buf);
+	free(ftt);
+	return st;
 }
 
 /*
@@ -238,7 +301,7 @@ static inline
 void ft_flip_txn_record_reserved(struct urcu_txn_sw_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
-	bool ok = urcu_txn_sw_record(t, slot, old_ptr, new_ptr);
+	bool ok = urcu_txn_sw_record(t, slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
 
 	assert(ok);
 	(void) ok;	/* reserved up front -> never fails */
@@ -330,7 +393,7 @@ void ft_ord_cell_flip_one(struct ft_ord_cell_edge *edge)
 	struct urcu_txn_sw_latch buf[1];	/* caller storage: latch is aligned(16) */
 	struct urcu_txn_sw_txn t;
 
-	urcu_txn_sw_init_inline(&t, ft_flip_txn_tag, buf, 1);
+	urcu_txn_sw_init_inline(&t, buf, 1);
 	ft_flip_txn_record_reserved(&t, (void **) edge->slot,
 		(void *) edge->old_target, (void *) edge->new_target);
 	(void) urcu_txn_sw_commit_flavor(&t, ft_flip_txn_call_rcu_now);
