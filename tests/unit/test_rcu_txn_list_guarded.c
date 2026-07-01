@@ -60,7 +60,7 @@ static void kill_live(void **live_slot)
 	urcu_txn_init(&tx, &g_head.domain);
 	do {
 		urcu_txn_begin(&tx);
-		urcu_txn_store(&tx, live_slot, LIVE, DEAD);
+		urcu_txn_store(&tx, live_slot, LIVE, DEAD, URCU_MCAS_TAG);
 		st = urcu_txn_commit(&tx);
 		urcu_txn_end(&tx);
 	} while (st == URCU_TXN_STATUS_ABORT);

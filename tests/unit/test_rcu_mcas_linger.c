@@ -110,8 +110,8 @@ static struct urcu_mcas *make_txn(void)
 	if (!t)
 		abort();
 	/* V: AUX: aux_old -> aux_new, and S: S_OLD -> S_NEW. */
-	urcu_mcas_add(t, AUX, &o_aux_old, &o_aux_new);
-	urcu_mcas_add(t, S, S_OLD, S_NEW);
+	urcu_mcas_add(t, AUX, &o_aux_old, &o_aux_new, URCU_MCAS_TAG);
+	urcu_mcas_add(t, S, S_OLD, S_NEW, URCU_MCAS_TAG);
 	urcu_mcas_sort(t);		/* slot-address order, as commit() does */
 	for (i = 0; i < t->nr; i++) {
 		t->recs[i].mcas = t;
@@ -148,10 +148,10 @@ int main(void)
 
 	final_s = uatomic_load(S, CMM_ACQUIRE);
 	diag("final S: %s (raw=%p, S_OLD=%p, tag(S-rec) is a proxy)",
-		urcu_mcas_is_proxy(final_s) ? "PROXY (BUG: lingering past reclaim)" :
+		urcu_mcas_is_proxy(final_s, URCU_MCAS_TAG) ? "PROXY (BUG: lingering past reclaim)" :
 		final_s == S_OLD ? "S_OLD (correct: FAILED, settled to old)" : "other plain",
 		final_s, S_OLD);
-	ok(!urcu_mcas_is_proxy(final_s),
+	ok(!urcu_mcas_is_proxy(final_s, URCU_MCAS_TAG),
 		"no proxy lingers on the slot after a late first install of a settled txn");
 
 	urcu_mcas_destroy(g_V);

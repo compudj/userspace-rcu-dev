@@ -85,8 +85,9 @@
  *      transaction can migrate to <urcu/rcu-mcas.h> mechanically.
  *      commit() parks every recorded proxy, flips the group and settles to new,
  *      then OWNS reclaim: it defers the txn through call_rcu() when it parked
- *      proxies, or frees it at once on the single-edge / empty / OOM paths.  The
- *      single embedder hook is a tag function (proxy -> tagged slot value); the
+ *      proxies, or frees it at once on the single-edge / empty / OOM paths.  Each
+ *      recorded edge carries its own tag (the bits OR'd into that slot's parked
+ *      proxy value), so one transaction can mix slots with different tags; the
  *      embedder only checks commit()'s status.  See the urcu_txn_sw_txn block.
  *
  * RCU flavor
@@ -218,10 +219,11 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * reserve()/record() and test only commit() -- matching the concurrent
  * front-end's contract.
  *
- * The single embedder hook is @tag: given a recorded proxy, return the tagged
- * pointer value to store in the slot (e.g. set a reserved type code).  The
- * latch array is allocated 16-byte aligned (posix_memalign), so each latch --
- * hence each tagged proxy -- has its low 4 bits free for the embedder's tag.
+ * Each recorded edge carries its own tag (urcu_txn_sw_record's @tag): the bits
+ * OR'd into that slot's parked proxy value so its readers recognise the proxy
+ * (e.g. a reserved type code).  The latch array is allocated 16-byte aligned
+ * (posix_memalign), so each latch -- hence each tagged proxy -- has its low 4
+ * bits free for the embedder's tag.
  */
 
 enum urcu_txn_sw_state {
@@ -233,6 +235,11 @@ enum urcu_txn_sw_state {
 struct urcu_txn_sw_latch {
 	struct urcu_txn_sw_proxy proxy;	/* ptr[0]=old, ptr[1]=new, group */
 	void **slot;			/* install / settle target */
+	uintptr_t tag;			/* embedder tag bits OR'd into THIS slot's parked
+					 * proxy value at install (see urcu_txn_sw_record).
+					 * Per-record so heterogeneous slots -- e.g. a
+					 * 0xF-tagged structural edge and a bit-0 list edge --
+					 * can share one transaction. */
 } __attribute__((aligned(16)));
 
 /*
@@ -265,7 +272,6 @@ struct urcu_txn_sw_group_block {
  * this engine.
  */
 struct urcu_txn_sw_txn {
-	void *(*tag)(struct urcu_txn_sw_proxy *proxy);
 	enum urcu_txn_sw_state state;
 	struct urcu_txn_sw_latch *latches;	/* record array (realloc-grown, or caller-owned if @latches_inline) */
 	struct urcu_txn_sw_group_block *block;	/* lazy: NULL until proxies parked */
@@ -277,15 +283,14 @@ struct urcu_txn_sw_txn {
 #define URCU_TXN_SW_CAP	8	/* initial record-array capacity */
 
 /*
- * Initialize an on-stack transaction handle with the embedder's @tag hook.  No
- * allocation, so this cannot fail; the first record()/reserve() is the first OOM
- * checkpoint, and it is sticky (commit reports MEMORY_ERROR).
+ * Initialize an on-stack transaction handle.  No allocation, so this cannot
+ * fail; the first record()/reserve() is the first OOM checkpoint, and it is
+ * sticky (commit reports MEMORY_ERROR).  Each edge carries its own tag (passed
+ * to urcu_txn_sw_record), so the handle holds no per-txn tag hook.
  */
 static inline
-void urcu_txn_sw_init(struct urcu_txn_sw_txn *t,
-		void *(*tag)(struct urcu_txn_sw_proxy *))
+void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
 {
-	t->tag = tag;
 	t->state = URCU_TXN_SW_PREPARE;
 	t->latches = NULL;
 	t->block = NULL;
@@ -311,10 +316,8 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t,
  */
 static inline
 void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
-		void *(*tag)(struct urcu_txn_sw_proxy *),
 		struct urcu_txn_sw_latch *buf, unsigned int cap)
 {
-	t->tag = tag;
 	t->state = URCU_TXN_SW_PREPARE;
 	t->latches = buf;
 	t->block = NULL;
@@ -399,26 +402,33 @@ void urcu_txn_sw_free_rcu(struct rcu_head *head)
 	free(blk);
 }
 
-/* Record a latch's {old, new, slot}; its proxy->group is bound at install. */
+/* Record a latch's {old, new, slot, tag}; its proxy->group is bound at install. */
 static inline
 void urcu_txn_sw_latch_set(struct urcu_txn_sw_latch *l,
-		void **slot, void *old_ptr, void *new_ptr)
+		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	l->proxy.ptr[0] = old_ptr;
 	l->proxy.ptr[1] = new_ptr;
 	l->slot = slot;
+	l->tag = tag;
 }
 
-/* Park latch @l's tagged proxy into its slot (readers resolve to old). */
+/* Park latch @l's tagged proxy into its slot (readers resolve to old).  The
+ * parked value is &l->proxy OR'd with the slot's per-record tag; the latch
+ * array is 16-byte aligned, so &l->proxy keeps its low 4 bits free for it. */
 static inline
 void urcu_txn_sw_latch_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_latch *l)
 {
 	l->proxy.group = &t->block->group;	/* bind to the now-allocated group */
-	uatomic_store(l->slot, t->tag(&l->proxy), CMM_RELEASE);
+	uatomic_store(l->slot,
+			(void *) ((uintptr_t) &l->proxy | l->tag), CMM_RELEASE);
 }
 
 /*
- * Record one edge {*slot: old -> new}.  PREPARE only -- the record set is frozen
+ * Record one edge {*slot: old -> new} tagged with @tag (the bits OR'd into the
+ * parked proxy value installed in *slot, so that slot's readers recognise the
+ * proxy and route resolution -- e.g. the fractal trie's 0xF type code or a
+ * list's bit-0).  PREPARE only -- the record set is frozen
  * once proxies are installed, so this must run before commit() (record() after a
  * commit/install is a usage error).  Returns false on OOM (the only failure);
  * the failure is sticky (URCU_TXN_SW_OOM), so the caller may ignore this
@@ -428,7 +438,7 @@ void urcu_txn_sw_latch_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_lat
  */
 static inline
 bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
-		void *old_ptr, void *new_ptr)
+		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	struct urcu_txn_sw_latch *l;
 
@@ -462,7 +472,7 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 		t->cap = newcap;
 	}
 	l = &t->latches[t->nr++];
-	urcu_txn_sw_latch_set(l, slot, old_ptr, new_ptr);
+	urcu_txn_sw_latch_set(l, slot, old_ptr, new_ptr, tag);
 	return true;
 }
 

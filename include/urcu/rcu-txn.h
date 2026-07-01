@@ -26,10 +26,12 @@
  *     urcu_txn_init(&txn, &domain);    // or NULL: no fallback
  *     do {
  *         urcu_txn_begin(&txn);
- *         succ = urcu_txn_load(&txn, (void **) &pos->next);
+ *         // last arg TAG: the slot's proxy-tag bits (e.g. URCU_MCAS_TAG for a
+ *         // bit-0 embedder); a parked record's slot value is (record | TAG).
+ *         succ = urcu_txn_load(&txn, (void **) &pos->next, TAG);
  *         if (is_marked(succ)) { urcu_txn_end(&txn); return -ENOENT; }
- *         urcu_txn_store(&txn, (void **) &pos->next, succ, newp);
- *         urcu_txn_store(&txn, (void **) &succ->prev, pos,  newp);
+ *         urcu_txn_store(&txn, (void **) &pos->next, succ, newp, TAG);
+ *         urcu_txn_store(&txn, (void **) &succ->prev, pos,  newp, TAG);
  *         st = urcu_txn_commit(&txn);
  *         urcu_txn_end(&txn);
  *     } while (st == URCU_TXN_STATUS_ABORT);  // ABORT (>0) = retry;
@@ -132,6 +134,7 @@
 
 #include <urcu/compiler.h>
 #include <urcu/fair-mutex.h>
+#include <urcu/flavor.h>		/* struct rcu_flavor_struct */
 #include <urcu/rcu-mcas.h>
 #include <urcu/rcu-txn-status.h>
 
@@ -166,6 +169,23 @@ extern "C" {
 #endif
 
 /*
+ * Compile-time fallback for the RCU read-side bracket, used by
+ * urcu_txn_read_lock()/urcu_txn_read_unlock() (hence begin()/end()) ONLY when a
+ * handle binds no flavor (urcu_txn_init's NULL).  Defaults to the
+ * compile-time-selected flavor's rcu_read_lock / rcu_read_unlock -- hence the
+ * "include after an RCU flavor header" rule -- and may be overridden before
+ * include.  The PREFERRED path for a FLAVOR-AGNOSTIC embedder (one selecting its
+ * RCU flavor at runtime) is to bind that flavor with urcu_txn_init_flavor() so
+ * the bracket opens in it directly; this macro then never fires.
+ */
+#ifndef URCU_TXN_RCU_READ_LOCK
+#define URCU_TXN_RCU_READ_LOCK()	rcu_read_lock()
+#endif
+#ifndef URCU_TXN_RCU_READ_UNLOCK
+#define URCU_TXN_RCU_READ_UNLOCK()	rcu_read_unlock()
+#endif
+
+/*
  * Sticky out-of-memory marker parked in txn->mcas by a failed store: distinct
  * from NULL (no write buffered yet) and from any real descriptor, so commit can
  * tell "nothing to do" from "a store could not allocate".
@@ -191,6 +211,16 @@ void urcu_txn_domain_init(struct urcu_txn_domain *d)
 
 struct urcu_mcas_txn {
 	struct urcu_txn_domain *domain;	/* escalation domain, or NULL */
+	const struct rcu_flavor_struct *flavor;	/* RCU flavor for the read-side
+						 * bracket, or NULL to use the
+						 * compile-time-selected flavor
+						 * (URCU_TXN_RCU_READ_LOCK).  Set at
+						 * create by urcu_txn_init_flavor();
+						 * lets a FLAVOR-AGNOSTIC embedder
+						 * (one selecting its flavor at
+						 * runtime, e.g. the fractal trie)
+						 * bracket the txn in its own flavor's
+						 * read-side section. */
 	unsigned long retry;		/* attempts so far; aging priority for the MCAS */
 	unsigned int min_alloc;		/* floor for the attempt's initial descriptor
 					 * capacity, grown past if exceeded (0 -> INIT
@@ -203,17 +233,64 @@ struct urcu_mcas_txn {
 	int retrying;			/* commit asked retry: keep the turn */
 };
 
-/* Initialize a handle before its retry loop (retry := 0, no reservation). */
+/*
+ * Initialize a handle before its retry loop (retry := 0, no reservation),
+ * bracketing the txn's RCU read-side section in @flavor's read_lock/read_unlock.
+ * Pass @flavor NULL to use the compile-time-selected flavor (the
+ * URCU_TXN_RCU_READ_LOCK default) -- the plain urcu_txn_init() does exactly
+ * this.  A flavor-agnostic embedder (one selecting its RCU flavor at runtime
+ * through a rcu_flavor_struct vtable, e.g. the fractal trie) passes that flavor
+ * here so begin()/end() -- and the standalone urcu_txn_read_lock() /
+ * urcu_txn_read_unlock() bracket -- open the read-side section in it, the same
+ * way commit_flavor() defers reclaim through flavor->update_call_rcu.
+ */
 static inline
-void urcu_txn_init(struct urcu_mcas_txn *txn,
-		struct urcu_txn_domain *domain)
+void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
+		struct urcu_txn_domain *domain,
+		const struct rcu_flavor_struct *flavor)
 {
 	txn->domain = domain;
+	txn->flavor = flavor;
 	txn->retry = 0;
 	txn->min_alloc = 0;
 	txn->mcas = NULL;
 	txn->in_fallback = 0;
 	txn->retrying = 0;
+}
+
+/* Initialize a handle bracketed in the compile-time-selected RCU flavor. */
+static inline
+void urcu_txn_init(struct urcu_mcas_txn *txn,
+		struct urcu_txn_domain *domain)
+{
+	urcu_txn_init_flavor(txn, domain, NULL);
+}
+
+/*
+ * Open / close the txn's RCU read-side section through its bound flavor (set by
+ * urcu_txn_init_flavor), falling back to the compile-time-selected flavor when
+ * none is bound.  begin()/end() bracket with these; an embedder that drives the
+ * engine WITHOUT begin()/end() (only init/reserve/store/commit_flavor) calls
+ * them directly to bracket the whole mutation -- the read-side section is what
+ * keeps a parked record (or a helped foreign descriptor) alive across the
+ * commit.
+ */
+static inline
+void urcu_txn_read_lock(struct urcu_mcas_txn *txn)
+{
+	if (txn->flavor)
+		txn->flavor->read_lock();
+	else
+		URCU_TXN_RCU_READ_LOCK();
+}
+
+static inline
+void urcu_txn_read_unlock(struct urcu_mcas_txn *txn)
+{
+	if (txn->flavor)
+		txn->flavor->read_unlock();
+	else
+		URCU_TXN_RCU_READ_UNLOCK();
 }
 
 /*
@@ -289,7 +366,7 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	if (urcu_txn__want_fallback(txn))
 		urcu_txn__enter_fallback(txn);
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
-	rcu_read_lock();
+	urcu_txn_read_lock(txn);
 }
 
 /*
@@ -351,7 +428,7 @@ int urcu_txn_reserve(struct urcu_mcas_txn *txn, unsigned int n)
  */
 static inline
 int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
-		void *old_ptr, void *new_ptr, int upgrade)
+		void *old_ptr, void *new_ptr, int upgrade, uintptr_t tag)
 {
 	struct urcu_mcas *m = txn->mcas;
 
@@ -367,7 +444,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		txn->mcas = m;
 	}
 	if (caa_unlikely(!urcu_mcas_record(m, slot, old_ptr, new_ptr,
-			upgrade))) {
+			upgrade, tag))) {
 		/* Descriptor full: grow (may move it) and retry. */
 		m = urcu_mcas_grow(m);
 		if (caa_unlikely(!m)) {
@@ -376,7 +453,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 			return -ENOMEM;
 		}
 		txn->mcas = m;
-		urcu_mcas_record(m, slot, old_ptr, new_ptr, upgrade);
+		urcu_mcas_record(m, slot, old_ptr, new_ptr, upgrade, tag);
 	}
 	return 0;
 }
@@ -394,10 +471,10 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
  * with urcu_mcas_read() directly.
  */
 static inline
-void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot)
+void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag)
 {
 	(void) txn;			/* no read-set today -- this is the seam */
-	return urcu_mcas_read(slot);
+	return urcu_mcas_read(slot, tag);
 }
 
 /*
@@ -418,11 +495,12 @@ void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot)
  * value is returned regardless and the pending commit reports -ENOMEM.
  */
 static inline
-void *urcu_txn_load_validate(struct urcu_mcas_txn *txn, void **slot)
+void *urcu_txn_load_validate(struct urcu_mcas_txn *txn, void **slot,
+		uintptr_t tag)
 {
-	void *v = urcu_mcas_read(slot);
+	void *v = urcu_mcas_read(slot, tag);
 
-	(void) urcu_txn__record(txn, slot, v, v, 0);
+	(void) urcu_txn__record(txn, slot, v, v, 0, tag);
 	return v;
 }
 
@@ -436,9 +514,9 @@ void *urcu_txn_load_validate(struct urcu_mcas_txn *txn, void **slot)
  */
 static inline
 int urcu_txn_store(struct urcu_mcas_txn *txn, void **slot,
-		void *old_ptr, void *new_ptr)
+		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-	return urcu_txn__record(txn, slot, old_ptr, new_ptr, 1);
+	return urcu_txn__record(txn, slot, old_ptr, new_ptr, 1, tag);
 }
 
 /*
@@ -517,7 +595,7 @@ void urcu_txn_end(struct urcu_mcas_txn *txn)
 	if (m && m != URCU_TXN_ENOMEM)
 		urcu_mcas_destroy(m);
 	txn->mcas = NULL;
-	rcu_read_unlock();
+	urcu_txn_read_unlock(txn);
 	/*
 	 * Release the FIFO turn on a terminal outcome (commit, error, or a
 	 * bail that ends the bracket).  On a retry (commit returned 0 ->

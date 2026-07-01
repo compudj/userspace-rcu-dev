@@ -92,15 +92,15 @@ static void *worker(void *arg)
 			uintptr_t oi, oj, ok2;
 
 			urcu_txn_begin(&tx);
-			oi = (uintptr_t) urcu_txn_load(&tx, &g_word[i]);
-			oj = (uintptr_t) urcu_txn_load(&tx, &g_word[j]);
-			urcu_txn_store(&tx, &g_word[i], (void *) oi, (void *) lf_bump(oi, 2));
+			oi = (uintptr_t) urcu_txn_load(&tx, &g_word[i], URCU_MCAS_TAG);
+			oj = (uintptr_t) urcu_txn_load(&tx, &g_word[j], URCU_MCAS_TAG);
+			urcu_txn_store(&tx, &g_word[i], (void *) oi, (void *) lf_bump(oi, 2), URCU_MCAS_TAG);
 			if (three) {
-				ok2 = (uintptr_t) urcu_txn_load(&tx, &g_word[k]);
-				urcu_txn_store(&tx, &g_word[j], (void *) oj, (void *) lf_bump(oj, 2));
-				urcu_txn_store(&tx, &g_word[k], (void *) ok2, (void *) lf_bump(ok2, -4));
+				ok2 = (uintptr_t) urcu_txn_load(&tx, &g_word[k], URCU_MCAS_TAG);
+				urcu_txn_store(&tx, &g_word[j], (void *) oj, (void *) lf_bump(oj, 2), URCU_MCAS_TAG);
+				urcu_txn_store(&tx, &g_word[k], (void *) ok2, (void *) lf_bump(ok2, -4), URCU_MCAS_TAG);
 			} else {
-				urcu_txn_store(&tx, &g_word[j], (void *) oj, (void *) lf_bump(oj, -2));
+				urcu_txn_store(&tx, &g_word[j], (void *) oj, (void *) lf_bump(oj, -2), URCU_MCAS_TAG);
 			}
 			ret = urcu_txn_commit(&tx);
 			urcu_txn_end(&tx);
