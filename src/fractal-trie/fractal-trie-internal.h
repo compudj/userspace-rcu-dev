@@ -81,7 +81,6 @@
 #include <inttypes.h>
 #include <unistd.h>
 #include <urcu/list.h>
-#include <urcu/rcu-txn-sw-list.h>
 /*
  * FT parks a concurrent MCAS proxy (struct urcu_mcas_record *, 16-byte
  * aligned -> low 4 bits free) under its own type-7 / 0xF pointer tag (see
@@ -106,6 +105,7 @@
 #define URCU_TXN_RCU_READ_LOCK()	do { } while (0)
 #define URCU_TXN_RCU_READ_UNLOCK()	do { } while (0)
 #include <urcu/rcu-txn.h>
+#include <urcu/rcu-txn-list.h>
 #include <urcu/rculfhash.h>
 #include <urcu/arch.h>
 #include <urcu/call-rcu.h>
@@ -589,28 +589,29 @@
 struct ft_ord_cell {
 	/*
 	 * Key-ordered doubly-linked list links, embedded as the public
-	 * single-updater bidir-list node (<urcu/rcu-txn-sw-list.h>): lnode.next
+	 * concurrent bidir-list node (<urcu/rcu-txn-list.h>): lnode.next
 	 * is the old ord_next, lnode.prev the old ord_prev.  The cell is recovered
 	 * from a link with ft_ord_cell_of() (container_of) and its link node with
 	 * ft_ord_cell_lnode().  Embedding the public node lets the single-cell
 	 * splice/unsplice/replace ride the list's composable _prepare ops, folded
-	 * into the FT structural flip-txn; FT keeps its own type-7 proxy tag and
-	 * the specialized resolver (ft_ord_cell_resolve_ord).
+	 * into the FT structural flip-txn; the cell edges carry the concurrent
+	 * list's engine proxy tag (URCU_MCAS_TAG, bit 0) and readers resolve them
+	 * with urcu_txn_list_resolve (ft_ord_cell_resolve_ord).
 	 */
-	struct urcu_txn_sw_list_node lnode;
+	struct urcu_txn_list_node lnode;
 	struct cds_ft_node *node;
 	struct cds_ft_inode_flag *parent;
 };
 
 /* Recover the cell owning an embedded ordered-list link node, and vice versa. */
 static inline
-struct ft_ord_cell *ft_ord_cell_of(const struct urcu_txn_sw_list_node *lnode)
+struct ft_ord_cell *ft_ord_cell_of(const struct urcu_txn_list_node *lnode)
 {
 	return caa_container_of(lnode, struct ft_ord_cell, lnode);
 }
 
 static inline
-struct urcu_txn_sw_list_node *ft_ord_cell_lnode(struct ft_ord_cell *cell)
+struct urcu_txn_list_node *ft_ord_cell_lnode(struct ft_ord_cell *cell)
 {
 	return &cell->lnode;
 }
@@ -1324,13 +1325,13 @@ struct cds_ft {
 	 * lnode (the old ord_cell_head), .prev the last cell's lnode (the old
 	 * ord_cell_tail); the first cell's lnode.prev and the last cell's lnode.next
 	 * point back at &ord_sentinel.node.  An empty (or disabled) list has the
-	 * sentinel pointing at itself (urcu_txn_sw_list_init).  A resolved link that
+	 * sentinel pointing at itself (urcu_txn_list_init).  A resolved link that
 	 * equals &ord_sentinel.node is "off the end" (ft_ord_is_end); the head/tail
 	 * endpoint flips are now just the sentinel node's next/prev edges, produced
 	 * naturally by a normal splice whose boundary neighbour is the sentinel.  Read
 	 * the endpoints via ft_ord_first / ft_ord_last (NULL when empty).
 	 */
-	struct urcu_txn_sw_list_head ord_sentinel;
+	struct urcu_txn_list_head ord_sentinel;
 
 #ifdef FEATURE_FT_EXCL_VALIDATE
 	/*

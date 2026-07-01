@@ -26,9 +26,9 @@
  *                           node-type table, and inline helpers.
  *   fractal-trie-alloc.c    the strided internal-node allocator and the
  *                           external (leaf) buddy arena.
- *   <urcu/rcu-txn-sw.h>     the atomic multi-pointer "flip" primitive
- *                           (single-updater transaction) used to commit a
- *                           set of edges at once.
+ *   <urcu/rcu-txn.h>        the atomic multi-pointer "flip" primitive
+ *   <urcu/rcu-txn-list.h>   (concurrent MCAS transaction + coherent bidir
+ *                           list) used to commit a set of edges at once.
  *
  * Node model
  * ----------
@@ -122,8 +122,6 @@
 #include <urcu-pointer.h>
 #include <urcu/uatomic.h>
 #include "urcu-utils.h"
-#include <urcu/rcu-txn-sw.h>
-#include <urcu/rcu-txn-sw-list.h>
 
 #include "fractal-trie-internal.h"
 #include "fractal-trie-trace.h"

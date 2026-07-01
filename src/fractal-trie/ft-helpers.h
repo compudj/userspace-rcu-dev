@@ -756,8 +756,8 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
  * Flip-proxy encoding (see <urcu/rcu-txn-sw.h>).  cds_ft_merge_at needs
  * to switch a whole set of back-pointers (and the merge-point forward
  * slot) from their old to their new target with no mixed-regime window.
- * Each such slot transiently holds a tagged pointer to a urcu_txn_sw_proxy
- * latch; a single urcu_txn_sw_group_commit store flips them all atomically.
+ * Each such slot transiently holds a tagged pointer to a MCAS proxy
+ * latch; a single MCAS flip commit store flips them all atomically.
  *
  * A proxy is tagged as a synthetic INTERNAL node of type-index 7, the
  * maximal tag value (low nibble (FT_INTERNAL_MASK | FT_TYPE_MASK) == 0xF).
@@ -891,7 +891,7 @@ void ft_maybe_prefetch_nta(const void *ptr)
  * miss or flood the memory controller under 2 MiB).  It also RESOLVES a parked
  * flip proxy: a "new key at an existing internal node" publish parks a proxy
  * in external_nodes so it commits atomically with the ordinal-cell splice (one
- * urcu_txn_sw_group_commit), so a reader loading external_nodes must resolve it to the
+ * MCAS flip commit), so a reader loading external_nodes must resolve it to the
  * old/new head exactly as it does for a child slot.  The common case (a real
  * head, proxy tag clear) is a single predicted-not-taken tag test.
  */

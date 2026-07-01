@@ -25,12 +25,12 @@
  * value, so the key stays invisible) and records the settle information here;
  * insert_done then adds the ordered-list neighbour edges to the SAME batch and
  * makes the key reachable in the structural index AND spliced into the cell
- * list with one urcu_txn_sw_group_commit -- a reader can never observe the fresh head
+ * list with one MCAS flip commit -- a reader can never observe the fresh head
  * without its cell in the list (2026-06 review, 2.13).  @batch == NULL: direct
  * publish (ordered list off, or a shape not yet converted).
  */
 struct ft_insert_commit {
-	struct urcu_txn_sw_txn *txn;		/* armed at the publish site */
+	struct ft_flip_txn *txn;		/* armed at the publish site */
 	struct cds_ft_inode_flag **slot;	/* forward-publish sentinel (one-commit
 						 * parked) -- the txn settles the edges */
 	/*
@@ -73,7 +73,7 @@ struct ft_insert_commit {
  * Park the deferred LIVE re-parent edge (split-compressed one-commit) into
  * @batch, so the live old child's back-pointer flips to its new cluster parent
  * ATOMICALLY with the forward structural edge and the ordered-list neighbour
- * edges at the single urcu_txn_sw_group_commit.  That back-pointer is the only field a
+ * edges at the single MCAS flip commit.  That back-pointer is the only field a
  * reanchor up-walk reads to recover a skip-compressed node (ft_skip_reanchor,
  * which resolves flip proxies on the parent read), so until the commit a reader
  * resolves it to the OLD parent and never enters the fresh cluster -- closing
@@ -91,7 +91,7 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *new_parent,
 		struct cds_ft_inode_flag **slot,
-		struct urcu_txn_sw_txn *txn)
+		struct ft_flip_txn *txn)
 {
 	struct cds_ft_metadata *meta = NULL;
 	struct cds_ft_inode_flag **field;
@@ -156,7 +156,7 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 {
 	if (cell) {
 		struct ft_ord_cell *pred;
-		struct urcu_txn_sw_list_node *pred_lnode;
+		struct urcu_txn_list_node *pred_lnode;
 
 		/*
 		 * Locate the predecessor.  From-HEAD (seed at the fresh head, walk the
@@ -188,7 +188,7 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 * (incl. head/tail) collapse to its 2.
 		 */
 		pred_lnode = pred ? ft_ord_cell_lnode(pred) : &ft->ord_sentinel.node;
-		(void) urcu_txn_sw_list_add_after_prepare(ic->txn,
+		(void) urcu_txn_list_insert_after_prepare(&ic->txn->mtxn,
 			ft_ord_cell_lnode(cell), pred_lnode);
 	}
 
@@ -313,7 +313,7 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic)
  * batch.  The head is published by storing it into @metadata->external_nodes
  * (not a child slot), so park a flip proxy THERE -- readers resolve it via
  * ft_dereference_external -- and the structural publish then commits atomically
- * with the ordinal-cell splice at the single urcu_txn_sw_group_commit.  No transient
+ * with the ordinal-cell splice at the single MCAS flip commit.  No transient
  * half-spliced list state.  Settles direct (publish_to_parent false: there is
  * no parent child-slot to re-encode).  @ic must be armed.  The fresh-key case
  * parks old == NULL, so a reader resolves the proxy to "no head" until the
@@ -2338,7 +2338,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				 * model is shared by both ordered-list states; the cell swap
 				 * rides the same flip when the list is on.
 				 */
-				struct ft_ord_cell_edge sedges[2];
+				struct ft_ord_cell_edge sedges[2] = { 0 };
 				unsigned int n_sedge = 0;
 
 				sedges[0].slot = (struct ft_ord_cell **) d.nfp;
@@ -2658,7 +2658,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			ft_ord_cell_ptr(old_node->prev) : NULL;
 		void *new_cell_flag = NULL;
 		struct ft_pub_rec rec = { .n = 0 };
-		struct ft_ord_cell_edge sedges[2];
+		struct ft_ord_cell_edge sedges[2] = { 0 };
 		unsigned int n_s;
 
 		/*
@@ -2700,7 +2700,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			 */
 			struct ft_ord_cell *new_cell =
 				ft_ord_cell_ptr(new_cell_flag);
-			struct urcu_txn_sw_txn *txn =
+			struct ft_flip_txn *txn =
 				ft_flip_txn_create_bounded(
 					FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES);
 
@@ -2733,7 +2733,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			 * store; on OOM abort with the successor untouched and the
 			 * replace retriable (@new_node restored to its fresh state).
 			 */
-			struct urcu_txn_sw_txn *txn =
+			struct ft_flip_txn *txn =
 				ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES);
 
 			if (!txn) {

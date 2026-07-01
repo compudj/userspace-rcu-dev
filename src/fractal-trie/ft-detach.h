@@ -96,7 +96,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * untouched).  List off uses the lone-edge ft_root_edge_flip below
 		 * (no txn).  This is the whole-trie root detach, not a hot path.
 		 */
-		struct urcu_txn_sw_txn *root_txn = NULL;
+		struct ft_flip_txn *root_txn = NULL;
 
 		if (ft->group->ordered_list_set) {
 			root_txn = ft_flip_txn_create_bounded(
@@ -381,7 +381,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				struct ft_detach_run run = { .armed = false };
 				struct ft_remove_pub *pubp = NULL;
 				struct ft_detach_run *runp = NULL;
-				struct urcu_txn_sw_txn *run_txn = NULL;
+				struct ft_flip_txn *run_txn = NULL;
 				int ret;
 
 				if (ft->group->ordered_list_set) {

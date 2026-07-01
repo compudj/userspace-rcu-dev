@@ -822,6 +822,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 			 */
 			if (!prev_is_dst) {
 				prev->lnode.next = ft_ord_cell_lnode(cell);	/* survivor: invisible */
+				edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **) &cell->lnode.prev;
 				edges[n].old_target =
 					ft_ord_cell_resolve_ord(&cell->lnode.prev);
@@ -844,6 +845,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 				 * flip its forward edge to the survivor.  When prev is the
 				 * sentinel this IS the old "new list minimum: flip head".
 				 */
+				edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **) &prev->lnode.next;
 				edges[n].old_target =
 					ft_ord_cell_resolve_ord(&prev->lnode.next);
@@ -865,6 +867,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 	 */
 	if (!prev_is_dst) {
 		prev->lnode.next = ft_ord_cell_lnode(dst_succ);	/* survivor: invisible */
+		edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &dst_succ->lnode.prev;
 		edges[n].old_target =
 			ft_ord_cell_resolve_ord(&dst_succ->lnode.prev);
@@ -1080,7 +1083,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		unsigned int off_src, struct ft_descent *d_dst,
 		unsigned long cnt_dst, unsigned int off_dst,
 		size_t dst_key_len,
-		struct urcu_txn_sw_txn **pre_txn)
+		struct ft_flip_txn **pre_txn)
 {
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -1094,7 +1097,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	struct cds_ft_inode_flag *pub_parent = d_dst->pnf, **pub_slot = d_dst->nfp;
 	struct cds_ft_inode *fresh_root = NULL;
 	struct cds_ft_metadata *fresh_meta;
-	struct urcu_txn_sw_txn *txn;
+	struct ft_flip_txn *txn;
 	unsigned long merged_keys = 0;
 	bool ms_ord = dst_ft->group->ordered_list_set;
 	struct ft_ord_cell *ms_cursor = NULL, *ms_prev = NULL, *ms_succ = NULL;
@@ -1258,7 +1261,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		txn = ft_flip_txn_take(pre_txn);
 		if (!txn) {
 			txn = ft_flip_txn_create();
-			if (txn && !urcu_txn_sw_reserve(txn,
+			if (txn && !ft_flip_txn_reserve(txn,
 					nr_dst + 1 + ms_cap)) {
 				ft_flip_txn_destroy(txn);
 				txn = NULL;
@@ -1453,7 +1456,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * the still-invisible build (both tries pristine).  The lone-edge list-off
 	 * paths (ft_root_edge_flip) need no txn, so reserve only when ms_ord.
 	 */
-	struct urcu_txn_sw_txn *src_side_txn = NULL;
+	struct ft_flip_txn *src_side_txn = NULL;
 
 	if (ms_ord) {
 		src_side_txn = ft_flip_txn_create_bounded(
@@ -1608,10 +1611,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ms_cursor, ms_succ, ms_prev, ms_src_caps, ms_nsrc,
 			ms_src_pool, ms_edges);
 		for (i = 0; i < ms_n; i++)
-			ft_flip_txn_record_reserved(txn,
+			ft_flip_txn_record_tag(txn,
 				(void **) ms_edges[i].slot,
 				(void *) ms_edges[i].old_target,
-				(void *) ms_edges[i].new_target);
+				(void *) ms_edges[i].new_target,
+				ft_edge_tag(&ms_edges[i]));
 	}
 
 	/*
@@ -1743,7 +1747,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * the build; destroyed on a POPULATED point (nothing to commit).
 	 */
 	glue.txn = ft_flip_txn_create();
-	if (!glue.txn || !urcu_txn_sw_reserve(glue.txn,
+	if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 			FT_GLUE_FLOOR_DEFERRED + 6)) {
 		if (glue.txn)
 			ft_flip_txn_destroy(glue.txn);
@@ -1822,14 +1826,14 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * structural unlink is public (un-abortable).  OOM here aborts the still-
 	 * invisible build (both tries pristine).  Reserve only when ms_ord.
 	 */
-	struct urcu_txn_sw_txn *run_unlink_txn = NULL;
+	struct ft_flip_txn *run_unlink_txn = NULL;
 	/*
 	 * Pre-reserve the standalone dst run-splice txn too: the rare unfused
 	 * attach shape splices the moved run into dst's list AFTER the structural
 	 * attach is public (un-abortable).  Reserved only when ms_ord; consumed by
 	 * the standalone splice or freed-unused when fused (the common case).
 	 */
-	struct urcu_txn_sw_txn *run_splice_txn = NULL;
+	struct ft_flip_txn *run_splice_txn = NULL;
 
 	if (ms_ord) {
 		run_unlink_txn = ft_flip_txn_create_bounded(
@@ -1993,7 +1997,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
 		const uint8_t *src_key, size_t src_key_len,
-		struct urcu_txn_sw_txn **pre_txn)
+		struct ft_flip_txn **pre_txn)
 {
 	struct cds_ft *subtree = NULL;
 	enum cds_ft_status status;
@@ -2158,7 +2162,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		struct ft_descent d_mrg;
 		unsigned int off_mrg;
 		unsigned long n = cnt_src, m;		/* moved / dst subtree counts */
-		struct urcu_txn_sw_txn *pf_txn = NULL;
+		struct ft_flip_txn *pf_txn = NULL;
 
 		if (off_src > 0) {
 			struct cds_ft_compressed_node *cn_s =
@@ -2240,7 +2244,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			else
 				pf_cap = (unsigned int) (m + 1);
 			pf_txn = ft_flip_txn_create();
-			if (pf_txn && !urcu_txn_sw_reserve(pf_txn, pf_cap)) {
+			if (pf_txn && !ft_flip_txn_reserve(pf_txn, pf_cap)) {
 				ft_flip_txn_destroy(pf_txn);
 				pf_txn = NULL;
 			}
@@ -2373,7 +2377,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		struct cds_ft_inode *fresh_root;
 		struct cds_ft_metadata *fresh_meta;
 		struct cds_ft_inode *old_dst_root;
-		struct urcu_txn_sw_txn *appear_txn = NULL;
+		struct ft_flip_txn *appear_txn = NULL;
 		size_t sm;
 
 		fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
@@ -2447,7 +2451,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 				dst_ft->root, subtree->root,
 				NULL, ft_ord_first(subtree),
 				NULL, ft_ord_last(subtree), subtree, true);
-			urcu_txn_sw_list_init(&subtree->ord_sentinel);
+			urcu_txn_list_init(&subtree->ord_sentinel);
 		} else {
 			/*
 			 * No ordered list: dst's root is the only reader-visible

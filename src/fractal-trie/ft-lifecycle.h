@@ -688,7 +688,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * empty circular list).  Done unconditionally -- cheap, and every created
 	 * trie (incl. the transient detach / merge tries) flows through here.
 	 */
-	urcu_txn_sw_list_init(&ft->ord_sentinel);
+	urcu_txn_list_init(&ft->ord_sentinel);
 	/*
 	 * Effective per-trie speculative-key state: the group is configured for
 	 * speculative result-key capture AND this trie did not opt out via

@@ -58,26 +58,27 @@ struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *pr
 /*
  * Read an ordinal-cell ord_next / ord_prev slot, resolving an in-flight
  * flip-proxy.  The slots hold RAW (untagged) ft_ord_cell pointers, but a
- * point-op splice transiently installs a tagged flip-proxy (the same type-7
- * encoding as ft_resolve_flip_proxy) so the two directional edges flip
- * atomically for a bidirectional ordered reader.  Raw cells are >= 8-byte
- * aligned (bits 0-1 clear, like an external node) and proxies carry the
- * type-7 tag, so the proxy test is unambiguous.  Under writer exclusion no
- * proxy is installed at rest (a no-op on the write side).
+ * point-op splice transiently installs a tagged flip-proxy so the two
+ * directional edges flip atomically for a bidirectional ordered reader.  The
+ * ordered-cell list rides <urcu/rcu-txn-list.h>, so its edges carry the
+ * concurrent list's ENGINE proxy tag (URCU_MCAS_TAG, bit 0) -- NOT FT's type-7
+ * structural tag -- and a logically-deleted node carries the list deletion MARK
+ * (bit 1); urcu_txn_list_resolve strips both and resolves the MCAS proxy.  Raw
+ * cells are >= 8-byte aligned (bits 0-1 clear), so the resolve is unambiguous.
+ * Under writer exclusion no proxy is installed at rest (a no-op on the write
+ * side).
  */
 static inline_lookup
-struct ft_ord_cell *ft_ord_cell_resolve_ord(struct urcu_txn_sw_list_node *const *slot)
+struct ft_ord_cell *ft_ord_cell_resolve_ord(struct urcu_txn_list_node *const *slot)
 {
-	struct urcu_txn_sw_list_node *p = rcu_dereference(*slot);
+	struct urcu_txn_list_node *p = rcu_dereference(*slot);
 
-	if (caa_unlikely(ft_node_flip_proxy((struct cds_ft_inode_flag *) p)))
-		p = (struct urcu_txn_sw_list_node *) urcu_mcas_resolve_record(
-			ft_flip_proxy_ptr((struct cds_ft_inode_flag *) p));
+	p = urcu_txn_list_resolve((void *) p);
 	/*
 	 * Circular topology: a link "off the end" resolves to the per-trie
 	 * sentinel node, NOT NULL.  The returned value is a pseudo-cell
 	 * (ft_ord_cell_of(&sentinel.node)) whose ONLY valid use is the
-	 * ft_ord_is_end() boundary test -- it is a bare urcu_txn_sw_list_node, not a
+	 * ft_ord_is_end() boundary test -- it is a bare urcu_txn_list_node, not a
 	 * full cell, so never deref its node/parent.  Use ft_ord_first / ft_ord_last
 	 * when a NULL-if-empty endpoint is wanted.
 	 */

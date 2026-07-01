@@ -68,7 +68,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct ft_remove_pub *pub,
 		struct ft_detach_run *run)
 {
-	struct urcu_txn_sw_txn *txn;
+	struct ft_flip_txn *txn;
 
 	/*
 	 * Pre-reserve the publish flip-txn before any side-effect (sub-case 1
@@ -276,7 +276,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_inode_flag *new_cn_flag;
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *publish_parent;
-	struct urcu_txn_sw_txn *txn;
+	struct ft_flip_txn *txn;
 
 	assert(surviving_child);
 	parent_compressed = ft_node_compressed(iter_meta->parent);
@@ -449,7 +449,7 @@ int ft_detach_node(struct cds_ft *ft,
 	 * on-stack release store.  Consumed by ft_ord_cell_flip_into at whichever
 	 * commit fires; freed at @end if reserved but unused.
 	 */
-	struct urcu_txn_sw_txn *commit_txn = NULL;
+	struct ft_flip_txn *commit_txn = NULL;
 	bool commit_txn_used = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
 	bool prev_external_nodes_found = false;
@@ -1300,7 +1300,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 	struct ft_ord_cell *old_cell = ft->ordered_list ?
 		ft_ord_cell_ptr(node->prev) : NULL;
 	struct ft_pub_rec rec = { .n = 0 };
-	struct ft_ord_cell_edge sedges[2];
+	struct ft_ord_cell_edge sedges[2] = { 0 };
 	unsigned int n_s;
 
 	assert(next_node != NULL);
@@ -1318,7 +1318,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		void *new_cell_flag = ft_ord_cell_alloc(ft, next_node,
 			old_cell->parent);
 		struct ft_ord_cell *new_cell;
-		struct urcu_txn_sw_txn *txn;
+		struct ft_flip_txn *txn;
 
 		if (!new_cell_flag)
 			return -ENOMEM;
@@ -1356,7 +1356,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * reservation OOM abort here: @next_node and the head slot are
 		 * untouched, so the caller returns CDS_FT_STATUS_MEMORY_ERROR.
 		 */
-		struct urcu_txn_sw_txn *txn =
+		struct ft_flip_txn *txn =
 			ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES);
 
 		if (!txn)
@@ -1421,7 +1421,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * edge takes the infallible on-stack store and never fails.
 		 */
 		struct ft_pub_rec rec = { .n = 0 };
-		struct ft_ord_cell_edge sedges[2];
+		struct ft_ord_cell_edge sedges[2] = { 0 };
 		unsigned int n_s;
 
 		_ft_publish_to_parent(ft, parent_nf,
@@ -1564,7 +1564,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * On OOM here the removal aborts cleanly (key untouched).  The fused
 	 * common case frees it unused at the tail.
 	 */
-	struct urcu_txn_sw_txn *unsplice_txn = NULL;
+	struct ft_flip_txn *unsplice_txn = NULL;
 
 	if (fuse_remove) {
 		unsplice_txn = ft_flip_txn_create_bounded(
@@ -2041,7 +2041,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 * AFTER the structural commit is public -- un-abortable.  OOM here
 	 * aborts the removal cleanly; the fused case frees it unused.
 	 */
-	struct urcu_txn_sw_txn *unsplice_txn = NULL;
+	struct ft_flip_txn *unsplice_txn = NULL;
 
 	if (dead_cell) {
 		unsplice_txn = ft_flip_txn_create_bounded(

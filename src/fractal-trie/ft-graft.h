@@ -615,10 +615,11 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 			rn = ft_ord_cell_run_splice_edges(ft, run->run_first,
 				run->run_last, run->pred, run->succ, redges, 0);
 			for (i = 0; i < rn; i++)
-				ft_flip_txn_record_reserved(st->glue->txn,
+				ft_flip_txn_record_tag(st->glue->txn,
 					(void **) redges[i].slot,
 					redges[i].old_target,
-					redges[i].new_target);
+					redges[i].new_target,
+					ft_edge_tag(&redges[i]));
 		}
 		/*
 		 * Freeze-on-free (doc §4.B): a reserve recompaction relocated the
@@ -769,7 +770,7 @@ static
 enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		const uint8_t *_key, size_t key_len,
 		struct cds_ft *src_ft,
-		struct urcu_txn_sw_txn **pre_txn)
+		struct ft_flip_txn **pre_txn)
 {
 	struct cds_ft_metadata *src_rmeta;
 	size_t src_max;
@@ -825,7 +826,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * reduce to a lone store.  OOM here aborts cleanly (free the fresh
 		 * root, both tries untouched).
 		 */
-		struct urcu_txn_sw_txn *dual_txn = ft_flip_txn_create_bounded(
+		struct ft_flip_txn *dual_txn = ft_flip_txn_create_bounded(
 			FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES);
 
 		if (!dual_txn) {
@@ -958,7 +959,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * lone-edge ft_root_edge_flip).  Freed at every fallible exit below;
 		 * consumed by the retire.
 		 */
-		struct urcu_txn_sw_txn *src_retire_txn = NULL;
+		struct ft_flip_txn *src_retire_txn = NULL;
 		/*
 		 * Standalone run-splice fallback txn.  Every attach shape FUSES the
 		 * run-splice into its structural flip (graft_run.armed), so this
@@ -968,7 +969,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * when the ordered list is on; consumed by the standalone splice or
 		 * freed-unused when the run was fused (the common case).
 		 */
-		struct urcu_txn_sw_txn *run_splice_txn = NULL;
+		struct ft_flip_txn *run_splice_txn = NULL;
 		/*
 		 * NIL-key-only source: the whole source is a single prefix key,
 		 * stored as the root's external_nodes (a childless internal -- valid
@@ -1018,7 +1019,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		glue.txn = ft_flip_txn_take(pre_txn);
 		if (!glue.txn) {
 			glue.txn = ft_flip_txn_create();
-			if (!glue.txn || !urcu_txn_sw_reserve(glue.txn,
+			if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 					FT_GLUE_FLOOR_DEFERRED + 6)) {
 				if (glue.txn)
 					ft_flip_txn_destroy(glue.txn);
@@ -1488,7 +1489,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *tmp = dst_ft->root;
 		size_t dm;
 		bool dst_was_exclusive = dst_ft->exclusive;
-		struct urcu_txn_sw_txn *dual_txn;
+		struct ft_flip_txn *dual_txn;
 
 		/*
 		 * PRE-RESERVE the cross-trie dual root-swap txn before the
@@ -1596,10 +1597,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *old_child, *old_swap_root;
 		struct cds_ft_inode *fresh = NULL;
 		struct cds_ft_metadata *fresh_meta = NULL;
-		struct urcu_txn_sw_txn *swap_retire_txn = NULL;
-		struct urcu_txn_sw_txn *extract_txn = NULL;
-		struct urcu_txn_sw_txn *glue_publish_txn = NULL;
-		struct urcu_txn_sw_txn *run_replace_txn = NULL;
+		struct ft_flip_txn *swap_retire_txn = NULL;
+		struct ft_flip_txn *extract_txn = NULL;
+		struct ft_flip_txn *glue_publish_txn = NULL;
+		struct ft_flip_txn *run_replace_txn = NULL;
 		struct ft_glue glue_insert, glue_extract;
 		struct cds_ft_inode_flag *canon = NULL;
 		struct cds_ft_inode_flag *top_B = NULL;	/* extracted swap root, NULL = external/none */
@@ -1865,7 +1866,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		if (have_insert && kase != FT_GRAFT_SWAP_KEY_SHORTER) {
 			glue_insert.txn = ft_flip_txn_create();
-			if (!glue_insert.txn || !urcu_txn_sw_reserve(glue_insert.txn,
+			if (!glue_insert.txn || !ft_flip_txn_reserve(glue_insert.txn,
 					FT_GLUE_FLOOR_DEFERRED + 6))
 				goto prep_oom;
 		} else if (have_insert) {
@@ -2135,7 +2136,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		ft_glue_apply_deferred(dst_ft, &glue_extract);
 		{
-			struct ft_ord_cell_edge edges[3];	/* root + head + tail */
+			struct ft_ord_cell_edge edges[3] = { 0 };	/* root + head + tail */
 			unsigned int n = 0;
 
 			if (top_B) {
@@ -2205,11 +2206,13 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				 */
 				gs_d_first->lnode.prev = &swap_ft->ord_sentinel.node;
 				gs_d_last->lnode.next = &swap_ft->ord_sentinel.node;
+				edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **)
 					&swap_ft->ord_sentinel.node.next;
 				edges[n].old_target = ft_ord_sentinel_cell(swap_ft);
 				edges[n].new_target = gs_d_first;
 				n++;
+				edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **)
 					&swap_ft->ord_sentinel.node.prev;
 				edges[n].old_target = ft_ord_sentinel_cell(swap_ft);

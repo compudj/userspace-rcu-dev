@@ -57,7 +57,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	struct cds_ft_metadata *meta = cds_ft_item_to_metadata(node);
 	struct cds_ft_inode_flag *parent = meta->parent;
 	struct ft_pub_rec rec = { .n = 0 };
-	struct urcu_txn_sw_txn *txn = NULL;
+	struct ft_flip_txn *txn = NULL;
 	int ret;
 
 	/*
