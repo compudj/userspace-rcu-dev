@@ -157,12 +157,15 @@ extern "C" {
  * domain's lock when its retry count reaches URCU_TXN_FALLBACK
  * (reactive: a starved op) or its write-set size reaches URCU_TXN_BIG
  * (proactive: a large op, e.g. a wide merge).  FALLBACK sits well above the
- * engine's single-edge URCU_MCAS_ESCALATE so ordinary contention rides the
- * optimistic path; BIG should sit above typical small-mutation edge counts so
- * only genuinely large transactions take the lane up front.
+ * engine's single-edge URCU_MCAS_ESCALATE (16) so ordinary contention rides the
+ * optimistic path: escalating too early funnels every contending writer into the
+ * one serial lane, which under a shared hot domain collapses both throughput and
+ * latency far worse than leaving the optimistic priority protocol to resolve it.
+ * BIG should sit above typical small-mutation edge counts so only genuinely large
+ * transactions take the lane up front.
  */
 #ifndef URCU_TXN_FALLBACK
-#define URCU_TXN_FALLBACK	64
+#define URCU_TXN_FALLBACK	256
 #endif
 #ifndef URCU_TXN_BIG
 #define URCU_TXN_BIG		128
