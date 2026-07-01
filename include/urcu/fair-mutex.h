@@ -41,6 +41,8 @@
 #include <urcu/wfcqueue.h>
 #include <urcu/uatomic.h>
 #include <urcu/futex.h>
+#include <sched.h>
+
 #include <urcu/compiler.h>
 #include <urcu/arch.h>
 #include <urcu/assert.h>
@@ -50,6 +52,19 @@ extern "C" {
 #endif
 
 #define CDS_FAIR_MUTEX_WAIT_ATTEMPTS	1000
+/*
+ * Grant-side confirm budget: after publishing GRANTED, the granter briefly
+ * waits for the successor to acknowledge with RUNNING before falling back to
+ * futex_wake.  A SPINNING successor sets RUNNING within a cross-core round-trip,
+ * so we skip the (wasted) wake syscall entirely; a PARKED successor never sets
+ * RUNNING, the budget expires, and we wake it.  Lost-wakeup-safe: a successor
+ * parks via FUTEX_WAIT(state == WAITING), which returns EAGAIN once we have
+ * stored GRANTED, so it cannot miss the grant no matter how this races.  Sized
+ * to the cross-core RUNNING-ack round-trip so a parked successor pays little.
+ */
+#ifndef CDS_FAIR_MUTEX_GRANT_CONFIRM_ATTEMPTS
+#define CDS_FAIR_MUTEX_GRANT_CONFIRM_ATTEMPTS	500
+#endif
 
 enum cds_fair_mutex_state {
 	CDS_FAIR_MUTEX_WAITING	= 0,		/* futex compares against this */
@@ -61,17 +76,23 @@ enum cds_fair_mutex_state {
 struct cds_fair_mutex {
 	struct __cds_wfcq_head head;	/* non-locking head */
 	struct cds_wfcq_tail tail;
+	int owner_cpu;			/* sched_getcpu() of the current holder, or -1 */
 };
 
 struct cds_fair_mutex_node {
 	struct cds_wfcq_node node;
 	int32_t state;			/* enum cds_fair_mutex_state */
+	int cpu;			/* sched_getcpu() at lock time; the granter
+					 * publishes it into owner_cpu at hand-off so
+					 * owner_cpu names the INCOMING holder, never a
+					 * departed one's stale CPU. */
 };
 
 static inline
 void cds_fair_mutex_init(struct cds_fair_mutex *t)
 {
 	__cds_wfcq_init(&t->head, &t->tail);
+	uatomic_store(&t->owner_cpu, -1, CMM_RELAXED);
 }
 
 /*
@@ -83,12 +104,25 @@ void cds_fair_mutex_init(struct cds_fair_mutex *t)
 static inline
 void cds_fair_mutex_grant(struct cds_fair_mutex_node *w)
 {
+	unsigned int i;
+
 	urcu_posix_assert(uatomic_load(&w->state) == CDS_FAIR_MUTEX_WAITING);
 	uatomic_store(&w->state, CDS_FAIR_MUTEX_GRANTED, CMM_RELEASE);
+	/*
+	 * Briefly confirm a spinning successor's RUNNING ack before waking, to
+	 * elide the wasted futex_wake syscall on a user-space hand-off (see
+	 * CDS_FAIR_MUTEX_GRANT_CONFIRM_ATTEMPTS).
+	 */
+	for (i = 0; i < CDS_FAIR_MUTEX_GRANT_CONFIRM_ATTEMPTS; i++) {
+		if (uatomic_load(&w->state) & CDS_FAIR_MUTEX_RUNNING)
+			goto running;
+		caa_cpu_relax();
+	}
 	if (!(uatomic_load(&w->state) & CDS_FAIR_MUTEX_RUNNING)) {
 		if (futex_noasync(&w->state, FUTEX_WAKE, 1, NULL, NULL, 0) < 0)
 			abort();
 	}
+running:
 	/* Allow the successor to tear down / reuse its node. */
 	uatomic_or_mo(&w->state, CDS_FAIR_MUTEX_TEARDOWN, CMM_RELEASE);
 }
@@ -97,12 +131,21 @@ void cds_fair_mutex_grant(struct cds_fair_mutex_node *w)
  * Park until granted. Mirrors urcu_adaptative_busy_wait.
  */
 static inline
-void cds_fair_mutex_park(struct cds_fair_mutex_node *w)
+void cds_fair_mutex_park(struct cds_fair_mutex *t, struct cds_fair_mutex_node *w)
 {
-	unsigned int i;
+	unsigned int i, attempts;
+	int owner = uatomic_load(&t->owner_cpu, CMM_RELAXED);
+
+	/*
+	 * If the current holder runs on OUR CPU, spinning would only steal the
+	 * core it needs to finish and hand off -- park at once and yield.  Any
+	 * other case (remote or unknown holder) uses the normal spin budget.
+	 */
+	attempts = (owner >= 0 && owner == sched_getcpu())
+			? 0 : CDS_FAIR_MUTEX_WAIT_ATTEMPTS;
 
 	cmm_smp_rmb();
-	for (i = 0; i < CDS_FAIR_MUTEX_WAIT_ATTEMPTS; i++) {
+	for (i = 0; i < attempts; i++) {
 		if (uatomic_load(&w->state, CMM_ACQUIRE) != CDS_FAIR_MUTEX_WAITING)
 			goto granted;
 		caa_cpu_relax();
@@ -151,8 +194,11 @@ granted:
 static inline
 void cds_fair_mutex_lock(struct cds_fair_mutex *t, struct cds_fair_mutex_node *w)
 {
+	int mycpu = sched_getcpu();
+
 	cds_wfcq_node_init(&w->node);
 	uatomic_store(&w->state, CDS_FAIR_MUTEX_WAITING, CMM_RELAXED);
+	uatomic_store(&w->cpu, mycpu, CMM_RELAXED);	/* for our granter to publish */
 
 	/*
 	 * Wait-free enqueue. Returns true if there was a predecessor in the
@@ -160,7 +206,10 @@ void cds_fair_mutex_lock(struct cds_fair_mutex *t, struct cds_fair_mutex_node *w
 	 * (so we are the head and self-elect as holder).
 	 */
 	if (cds_wfcq_enqueue(&t->head, &t->tail, &w->node))
-		cds_fair_mutex_park(w);
+		cds_fair_mutex_park(t, w);	/* granted path: our granter already
+						 * published our CPU into owner_cpu */
+	else
+		uatomic_store(&t->owner_cpu, mycpu, CMM_RELAXED);	/* self-elected */
 }
 
 /*
@@ -200,7 +249,16 @@ bool cds_fair_mutex_unlock(struct cds_fair_mutex *t, struct cds_fair_mutex_node 
 	 */
 	succ = __cds_wfcq_first_blocking(&t->head, &t->tail);
 	urcu_posix_assert(succ != NULL);
-	cds_fair_mutex_grant(caa_container_of(succ, struct cds_fair_mutex_node, node));
+	{
+		struct cds_fair_mutex_node *sn =
+			caa_container_of(succ, struct cds_fair_mutex_node, node);
+		/* Publish the INCOMING holder's CPU before granting, so a waiter
+		 * (incl. the just-released former holder re-enqueuing) reads the
+		 * successor's CPU -- not this departing holder's stale one. */
+		uatomic_store(&t->owner_cpu, uatomic_load(&sn->cpu, CMM_RELAXED),
+				CMM_RELAXED);
+		cds_fair_mutex_grant(sn);
+	}
 	return false;
 }
 
