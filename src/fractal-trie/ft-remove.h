@@ -182,6 +182,21 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, src_meta->parent,
 				detach_parent_flag_ptr,
 				ft_node_flag(fresh, 0), &rec);
+			/*
+			 * Freeze the retired compressed node dead (§4.B freeze-on-
+			 * free) before the publish commit that unlinks it: this
+			 * compressed->fresh-internal recompaction retires the old
+			 * compressed node like every other retire and needs the same
+			 * tombstone.  The mark was missing here; this detach sub-case
+			 * is not reached by the current test suite (verified: zero
+			 * hits across ft_unit + ft_inv both list modes), so the
+			 * freeze-on-free audit never exercised it.  Standalone flip for
+			 * now, matching the sibling detach-branch retires; folds into
+			 * @txn when the detach-branch category is fused (atomic detach).
+			 */
+			ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) ft_compressed_node_ptr(
+					iter_node_flag)));
 			ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
 		}
 		free_compressed_node(ft,
