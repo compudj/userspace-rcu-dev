@@ -566,7 +566,9 @@ int urcu_txn_list_del_rcu(struct urcu_txn_list_node *elem,
  * serialization against every adjacent insert/delete; in particular a racing
  * del(old)/insert_after(old) sees the mark and terminates with -ENOENT, and a
  * reader standing on @old escapes forward to @old's old successor (it linearizes
- * before the replace -- @newp is reached afresh through @prev).  Returns 0 if
+ * before the replace -- @newp is reached afresh through @prev).  Argument order
+ * is (old, new), as cds_list_replace_rcu() and the single-updater
+ * urcu_txn_sw_list_replace_prepare().  Returns 0 if
  * recorded (on a committed OK, THIS call replaced @old and the caller reclaims
  * @old after a grace period), -ENOENT if @old was already deleted/replaced by a
  * peer (nothing recorded; do NOT reclaim), or -EAGAIN if a neighbour is
@@ -574,8 +576,8 @@ int urcu_txn_list_del_rcu(struct urcu_txn_list_node *elem,
  */
 static inline
 int urcu_txn_list_replace_prepare(struct urcu_mcas_txn *txn,
-		struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_node *old)
+		struct urcu_txn_list_node *old,
+		struct urcu_txn_list_node *newp)
 {
 	void *en = urcu_txn_load(txn, (void **) &old->next, URCU_MCAS_TAG);
 	struct urcu_txn_list_node *next, *prev;
@@ -620,14 +622,15 @@ int urcu_txn_list_replace_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
- * Replace @old with @newp atomically with respect to RCU readers.  Returns 0 on
+ * Replace @old with @newp atomically with respect to RCU readers.  Argument
+ * order is (old, new), as cds_list_replace_rcu().  Returns 0 on
  * success (the caller reclaims @old after a grace period), -ENOENT if @old was
  * already deleted/replaced, or -ENOMEM on descriptor allocation failure.
  * Convenience bracket around urcu_txn_list_replace_prepare().
  */
 static inline
-int urcu_txn_list_replace_rcu(struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_node *old,
+int urcu_txn_list_replace_rcu(struct urcu_txn_list_node *old,
+		struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_head *head)
 {
 	struct urcu_mcas_txn txn;
@@ -636,7 +639,7 @@ int urcu_txn_list_replace_rcu(struct urcu_txn_list_node *newp,
 	urcu_txn_init(&txn, &head->domain);
 	for (;;) {
 		urcu_txn_begin(&txn);
-		prep = urcu_txn_list_replace_prepare(&txn, newp, old);
+		prep = urcu_txn_list_replace_prepare(&txn, old, newp);
 		if (prep == -EAGAIN) {			/* a neighbour moved: retry */
 			urcu_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_txn_end(&txn);
