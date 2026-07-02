@@ -799,8 +799,18 @@ static const unsigned int urcu_mcas_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
 #define URCU_MCAS_SLAB_NCLASS	\
 	((int) (sizeof(urcu_mcas_slab_rc) / sizeof(urcu_mcas_slab_rc[0])))
 
-static size_t urcu_mcas_slab_bytes[URCU_MCAS_SLAB_NCLASS];	/* blocksize per class, filled at init */
-static struct urcu_slab urcu_mcas_slab;
+/*
+ * The slab INSTANCE lives once, in liburcu-common (src/urcu-txn.c), which also
+ * initializes it from a library constructor -- so this header requires linking
+ * liburcu-common.  A header-static definition here would hand every including
+ * TU its own arenas and superblocks: cross-TU frees would still be safe (the
+ * origin arena is found from the superblock header), but the freelists would
+ * never share and the footprint would multiply per allocating TU.  The single
+ * library constructor also runs at liburcu-common init time -- before the
+ * initializers of anything that depends on the shared library -- narrowing the
+ * window where a constructor-context transaction could precede slab init.
+ */
+extern struct urcu_slab urcu_mcas_slab;
 
 /* Smallest record-count class that fits @req records, or -1 if over the top. */
 static inline
@@ -812,17 +822,6 @@ int urcu_mcas_slab_class_of(unsigned int req)
 		if (req <= urcu_mcas_slab_rc[i])
 			return i;
 	return -1;
-}
-
-static __attribute__((constructor))
-void urcu_mcas_slab_ctor(void)
-{
-	int i;
-
-	for (i = 0; i < URCU_MCAS_SLAB_NCLASS; i++)
-		urcu_mcas_slab_bytes[i] = urcu_mcas_blocksize(urcu_mcas_slab_rc[i]);
-	urcu_slab_init(&urcu_mcas_slab, urcu_mcas_slab_bytes,
-			URCU_MCAS_SLAB_NCLASS, "mcas");
 }
 
 /*

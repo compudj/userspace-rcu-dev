@@ -24,8 +24,12 @@
  * before carving, so the mapped footprint never exceeds peak live descriptors.
  *
  * Superblocks are left demand-paged (no MADV_HUGEPAGE: a partial superblock then
- * stays resident only for touched pages).  URCU_TXN_NO_CACHE disables the slab
- * (the engine falls back to malloc); URCU_TXN_CACHE_STATS dumps reuse/footprint.
+ * stays resident only for touched pages).  URCU_TXN_NO_CACHE (environment,
+ * checked at init) disables the slab (the engine falls back to malloc).
+ * URCU_TXN_CACHE_STATS dumps reuse/footprint; the engines' slab INSTANCES are
+ * defined once in liburcu-common (src/urcu-txn.c) where init -- hence stats
+ * registration -- runs, so define it for the whole build (library and embedder
+ * TUs alike): a TU-local define only adds increment instrumentation.
  */
 
 #include <stddef.h>			/* offsetof, size_t */
@@ -42,6 +46,12 @@
 extern "C" {
 #endif
 
+/*
+ * Superblock size/alignment.  Overridable, but it must be IDENTICAL across
+ * every TU of a process: a slab is shared process-wide (one instance in
+ * liburcu-common), and free() derives a block's superblock header by masking
+ * with the freeing TU's RANGE.
+ */
 #ifndef URCU_SLAB_RANGE
 #define URCU_SLAB_RANGE		(1UL << 21)	/* 2 MiB superblocks (1 THP) */
 #endif
@@ -64,10 +74,15 @@ struct urcu_slab {
 	const size_t *class_size;	/* ascending byte size per class */
 	int nclass;
 	int ncpu;			/* 0 => disabled (engine falls back to malloc) */
-#ifdef URCU_TXN_CACHE_STATS
+	/*
+	 * Stats fields are UNCONDITIONAL: the instance is shared across TUs
+	 * (one strong definition in liburcu-common), while the URCU_SLAB_STAT
+	 * increments compile per-TU -- the struct layout must not depend on a
+	 * per-TU flag, or a stats-built embedder would scribble past a
+	 * non-stats-built library object.
+	 */
 	const char *name;
 	unsigned long st_reuse, st_carve, st_sbs;
-#endif
 };
 
 #ifdef URCU_TXN_CACHE_STATS
@@ -131,7 +146,8 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 	s->ncpu = 0;
 	s->class_size = class_size;
 	s->nclass = nclass;
-	(void) name;
+	s->name = name;
+	s->st_reuse = s->st_carve = s->st_sbs = 0;
 	if (getenv("URCU_TXN_NO_CACHE"))
 		return;
 	n = sysconf(_SC_NPROCESSORS_CONF);
@@ -151,8 +167,6 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 	}
 	s->ncpu = (int) n;
 #ifdef URCU_TXN_CACHE_STATS
-	s->name = name;
-	s->st_reuse = s->st_carve = s->st_sbs = 0;
 	if (urcu_slab_nreg < URCU_SLAB_MAX_REG)
 		urcu_slab_registry[urcu_slab_nreg++] = s;
 #endif

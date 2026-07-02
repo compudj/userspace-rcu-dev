@@ -362,8 +362,14 @@ static const unsigned int urcu_txn_sw_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u 
 #define URCU_TXN_SW_SLAB_NCLASS	\
 	((int) (sizeof(urcu_txn_sw_slab_rc) / sizeof(urcu_txn_sw_slab_rc[0])))
 
-static size_t urcu_txn_sw_slab_bytes[URCU_TXN_SW_SLAB_NCLASS];	/* blocksize per class, filled at init */
-static struct urcu_slab urcu_txn_sw_slab;
+/*
+ * The slab INSTANCE lives once, in liburcu-common (src/urcu-txn.c), which also
+ * initializes it from a library constructor -- so this header requires linking
+ * liburcu-common.  See the matching note in <urcu/rcu-mcas.h> for why a
+ * header-static definition would be wrong (per-TU arena/superblock
+ * multiplication, non-shared freelists).
+ */
+extern struct urcu_slab urcu_txn_sw_slab;
 
 /* Smallest latch-count class that fits @req latches, or -1 if over the top. */
 static inline
@@ -375,17 +381,6 @@ int urcu_txn_sw_slab_class_of(unsigned int req)
 		if (req <= urcu_txn_sw_slab_rc[i])
 			return i;
 	return -1;
-}
-
-static __attribute__((constructor))
-void urcu_txn_sw_slab_ctor(void)
-{
-	int i;
-
-	for (i = 0; i < URCU_TXN_SW_SLAB_NCLASS; i++)
-		urcu_txn_sw_slab_bytes[i] = urcu_txn_sw_blocksize(urcu_txn_sw_slab_rc[i]);
-	urcu_slab_init(&urcu_txn_sw_slab, urcu_txn_sw_slab_bytes,
-			URCU_TXN_SW_SLAB_NCLASS, "txn_sw");
 }
 
 /*
