@@ -453,7 +453,7 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 		 * Loading nr_child instead of probing the bitmap works for
 		 * every internal node class.
 		 */
-		if (ft_meta_nr_child(metadata) == 0 &&
+		if (ft_meta_nr_child_load(metadata) == 0 &&
 				!uatomic_load(&metadata->external_nodes, CMM_RELAXED)) {
 			iter->node = NULL;
 			iter->cache_valid = true;

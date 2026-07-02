@@ -685,6 +685,24 @@ void ft_nr_keys_store(const struct cds_ft *ft, struct cds_ft_metadata *m,
 }
 
 /*
+ * Reader-side read of a node's live-child count that resolves a mid-commit proxy
+ * on the state word.  Once atomic detach is wired the LIVE->DEAD tombstone rides
+ * an MCAS edge on state, transiently parking a proxy (a full pointer with bit 0
+ * = FT_STATE_PROXY set) that would otherwise corrupt the nr_child bits for a
+ * concurrent reader.  urcu_mcas_read short-circuits to a plain acquire load when
+ * state holds no proxy (always so under writer exclusion), so it costs nothing
+ * off the commit window.  The writer-owned ft_meta_nr_child (direct read) stays
+ * for reads of a node the caller owns or that is quiescent.
+ */
+static inline
+unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
+{
+	return (unsigned int) ((uintptr_t) urcu_mcas_read(
+			(void **) (uintptr_t) &meta->state,
+			FT_STATE_PROXY) >> FT_STATE_NR_CHILD_SHIFT);
+}
+
+/*
  * ft_parent_depth_span: number of key bytes a parent's slot covers.
  * Trivially 1 for every surviving node type (compressed/skip-compressed
  * still resolve via metadata->parent on the multi-byte hop, but the
