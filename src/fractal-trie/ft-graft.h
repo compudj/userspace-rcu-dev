@@ -1026,12 +1026,20 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		if (!glue.txn) {
 			glue.txn = ft_flip_txn_create();
 			if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
-					FT_GLUE_FLOOR_DEFERRED + 7)) {
+					/* + FLOOR_FREE: fused free-list tombstones (§4.B) */
+					FT_GLUE_FLOOR_DEFERRED + 7 + FT_GLUE_FLOOR_FREE)) {
 				if (glue.txn)
 					ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
+			/*
+			 * Reserved the free-list headroom above, so fuse each retired
+			 * node's freeze into glue.txn (atomic detach).  The rekey take()
+			 * path keeps the standalone flip (its pre_txn is pre-sized by the
+			 * rekey with no post-detach allocation allowed).
+			 */
+			glue.fuse_free_list = true;
 		}
 		prep = ft_graft_build(dst_ft, key, key_len, graft_payload,
 				src_count, &d, &glue);
@@ -1898,9 +1906,11 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (have_insert && kase != FT_GRAFT_SWAP_KEY_SHORTER) {
 			glue_insert.txn = ft_flip_txn_create();
 			if (!glue_insert.txn || !ft_flip_txn_reserve(glue_insert.txn,
-					/* +1: fused recompact-relocate tombstone (§4.B) */
-					FT_GLUE_FLOOR_DEFERRED + 7))
+					/* +1: fused recompact-relocate tombstone (§4.B);
+					 * + FLOOR_FREE: fused free-list tombstones */
+					FT_GLUE_FLOOR_DEFERRED + 7 + FT_GLUE_FLOOR_FREE))
 				goto prep_oom;
+			glue_insert.fuse_free_list = true;
 		} else if (have_insert) {
 			/*
 			 * KEY_SHORTER legacy publish (glue_insert.txn stays NULL ->

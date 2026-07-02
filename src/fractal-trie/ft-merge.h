@@ -1748,13 +1748,15 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 */
 	glue.txn = ft_flip_txn_create();
 	if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
-			/* +1: fused recompact-relocate tombstone (§4.B) */
-			FT_GLUE_FLOOR_DEFERRED + 7)) {
+			/* +1: fused recompact-relocate tombstone (§4.B);
+			 * + FLOOR_FREE: fused free-list tombstones */
+			FT_GLUE_FLOOR_DEFERRED + 7 + FT_GLUE_FLOOR_FREE)) {
 		if (glue.txn)
 			ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
+	glue.fuse_free_list = true;	/* reserved free-list headroom above (§4.B) */
 	prep = ft_graft_build(dst_ft, okey_dst, dst_key_len, payload, cnt_src,
 			&d, &glue);
 	*handled = true;

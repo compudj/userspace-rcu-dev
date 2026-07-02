@@ -2539,6 +2539,17 @@ struct ft_glue {
 	 */
 	struct ft_flip_txn *txn;
 	/*
+	 * When set, ft_glue_tombstone_free_list records each retired free_list
+	 * node's freeze-on-free tombstone INTO @txn (atomic detach, §4.B) instead
+	 * of a standalone lone-edge flip, so the freeze commits with the forward
+	 * publish that unlinks it.  Set only by the graft-family committers that
+	 * (a) route their unlink through @txn and (b) reserved @txn with
+	 * FT_GLUE_FLOOR_FREE headroom for the <= cap_free tombstones.  The merge
+	 * spine glues (variable cap_free, legacy deferred commit) leave it false
+	 * and keep the standalone flip.
+	 */
+	bool fuse_free_list;
+	/*
 	 * Inline floor backing.  ft_glue_init points the three arrays
 	 * here; graft / graft_swap never outgrow it.  ft_glue_reserve
 	 * repoints to a malloc'd buffer when a count would exceed its floor.
@@ -2574,6 +2585,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->top = NULL;
 	g->attached_nf = NULL;
 	g->txn = NULL;
+	g->fuse_free_list = false;
 }
 
 /*
@@ -3008,9 +3020,21 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 {
 	int i;
 
-	for (i = 0; i < g->nr_free; i++)
-		ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) g->free_list[i].node));
+	for (i = 0; i < g->nr_free; i++) {
+		struct cds_ft_metadata *meta = cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) g->free_list[i].node);
+
+		/*
+		 * Fuse the freeze into @txn (committed with the forward publish
+		 * below) when the committer reserved for it; else a standalone
+		 * lone-edge flip.  urcu_txn_store upgrades a repeat slot in place,
+		 * so a second apply_deferred pass costs no extra reservation.
+		 */
+		if (g->fuse_free_list)
+			ft_flip_txn_record_tombstone(g->txn, meta);
+		else
+			ft_meta_tombstone_set_flip(meta);
+	}
 }
 
 static
