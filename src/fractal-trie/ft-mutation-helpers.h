@@ -1298,11 +1298,11 @@ int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	 * bidirectional ordered reader resolves the splice atomically via
 	 * urcu_txn_list_resolve.  Sentinel topology: @old_cell's neighbours are its
 	 * sentinel when it is the list first / last, so the same splice stores ARE
-	 * the old head / tail relocation -- no endpoint edge.  Note the concurrent
-	 * op takes (newp, old) -- the reverse of the single-updater list.
+	 * the old head / tail relocation -- no endpoint edge.  The concurrent op
+	 * takes (old, new), matching the single-updater list and cds_list_replace_rcu().
 	 */
-	(void) urcu_txn_list_replace_prepare(&t->mtxn, ft_ord_cell_lnode(new_cell),
-		ft_ord_cell_lnode(old_cell));
+	(void) urcu_txn_list_replace_prepare(&t->mtxn, ft_ord_cell_lnode(old_cell),
+		ft_ord_cell_lnode(new_cell));
 	return ft_flip_txn_commit(ft, t) < 0 ? -ENOMEM : 0;
 }
 
