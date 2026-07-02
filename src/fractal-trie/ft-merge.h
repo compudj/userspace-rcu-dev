@@ -1748,7 +1748,8 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 */
 	glue.txn = ft_flip_txn_create();
 	if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
-			FT_GLUE_FLOOR_DEFERRED + 6)) {
+			/* +1: fused recompact-relocate tombstone (§4.B) */
+			FT_GLUE_FLOOR_DEFERRED + 7)) {
 		if (glue.txn)
 			ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
@@ -2227,17 +2228,18 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * is occupied, graft when absent):
 		 *   - m > 0 (spine-copy): the structural re-parent (<= m+1) plus, for an
 		 *     ordered merge, the folded interleave's <= 2n+2 cell edges.
-		 *   - m == 0 (graft): the cluster floor FT_GLUE_FLOOR_DEFERRED + 6, the
+		 *   - m == 0 (graft): the cluster floor FT_GLUE_FLOOR_DEFERRED + 7, the
 		 *     bound ft_graft_keylen reserves its own txn to -- it covers a GLUE
 		 *     diverge's back-edges + forward + run-splice AND the NOSPLIT store's
 		 *     slot proxy + run edges (FT_GRAFT_RUN_FLIP_CAP), whichever the graft
-		 *     point turns out to be.
+		 *     point turns out to be, plus +1 for a recompact-relocate retire's
+		 *     tombstone fused into the commit (atomic detach, §4.B).
 		 */
 		{
 			unsigned int pf_cap;
 
 			if (m == 0)
-				pf_cap = FT_GLUE_FLOOR_DEFERRED + 6;
+				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7;
 			else if (dst_ft->group->ordered_list_set)
 				pf_cap = (unsigned int) (m + 1) +
 					(unsigned int) (2 * n + 2);

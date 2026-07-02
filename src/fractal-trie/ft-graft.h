@@ -625,12 +625,14 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * Freeze-on-free (doc §4.B): a reserve recompaction relocated the
 		 * dst attach node; its old copy @old_recompacted_node, resolved-to
 		 * via the parked grandparent proxy until this commit, gets its
-		 * tombstone before the commit unlinks it.  (Not surfaced by ft_unit;
-		 * the recompact-relocation graft shape is exercised by ft_inv.)
+		 * tombstone recorded INTO glue->txn (reserved +1 above), so the mark
+		 * and the commit that unlinks it flip atomically (atomic detach).
+		 * (Not surfaced by ft_unit; the recompact-relocation graft shape is
+		 * exercised by ft_inv.)
 		 */
 		if (st->old_recompacted_node)
-			ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
-				st->old_recompacted_node));
+			ft_flip_txn_record_tombstone(st->glue->txn,
+				cds_ft_item_to_metadata(st->old_recompacted_node));
 		ft_flip_txn_commit(ft, st->glue->txn);
 		st->glue->txn = NULL;
 		if (run)
@@ -1011,9 +1013,11 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * caller's pre-reserved txn (the rekey, pre-sized before its detach so
 		 * the post-drain commit cannot fail) or create one here, reserved to
 		 * the floor-bounded cluster size up front (records then can't fail
-		 * mid-build, like the glue floor arrays); the + 6 headroom covers the
+		 * mid-build, like the glue floor arrays); the + 7 headroom covers the
 		 * forward edge's 1-2 stores plus the <=4 run-splice cell edges (also
-		 * the in-place slot proxy + its run edges, FT_GRAFT_RUN_FLIP_CAP).
+		 * the in-place slot proxy + its run edges, FT_GRAFT_RUN_FLIP_CAP), plus
+		 * the +1 recompact-relocate retire tombstone fused into the commit
+		 * (atomic detach, §4.B; st->old_recompacted_node below).
 		 * Created before the build only so its lifecycle is co-located here;
 		 * the build records nothing into it -- the commit replays g->deferred
 		 * (and the store reserves its slot proxy) through it post-drain.
@@ -1022,7 +1026,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		if (!glue.txn) {
 			glue.txn = ft_flip_txn_create();
 			if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
-					FT_GLUE_FLOOR_DEFERRED + 6)) {
+					FT_GLUE_FLOOR_DEFERRED + 7)) {
 				if (glue.txn)
 					ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
@@ -1894,7 +1898,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (have_insert && kase != FT_GRAFT_SWAP_KEY_SHORTER) {
 			glue_insert.txn = ft_flip_txn_create();
 			if (!glue_insert.txn || !ft_flip_txn_reserve(glue_insert.txn,
-					FT_GLUE_FLOOR_DEFERRED + 6))
+					/* +1: fused recompact-relocate tombstone (§4.B) */
+					FT_GLUE_FLOOR_DEFERRED + 7))
 				goto prep_oom;
 		} else if (have_insert) {
 			/*
@@ -1946,15 +1951,25 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * swap_run unarmed; every other shape fuses the replace and frees it
 		 * unused).  These are the last fallible steps before the COMMIT marker.
 		 */
-		if (gs_ord) {
-			extract_txn = ft_flip_txn_create_bounded(
-				FT_ROOT_LIST_SWAP_MAX_EDGES);
+		/*
+		 * extract_txn carries the swap-root install: list-on rides the full
+		 * pre-reserved txn (root install + run_D head/tail + the +1 fused
+		 * top_B tombstone); list-off with a top_B retire still needs a 2-edge
+		 * txn (root install + tombstone, atomic detach §4.B) rather than a lone
+		 * store.  !gs_ord && !top_B keeps its lone external attach store.  One
+		 * shared goto keeps this block's abort footprint unchanged.
+		 */
+		if (gs_ord || top_B) {
+			extract_txn = ft_flip_txn_create_bounded(gs_ord ?
+				FT_ROOT_LIST_SWAP_MAX_EDGES + 1 : 2);
 			if (!extract_txn)
 				goto prep_oom;
-			run_replace_txn = ft_flip_txn_create_bounded(
-				FT_ORD_CELL_RUN_REPLACE_MAX_EDGES);
-			if (!run_replace_txn)
-				goto prep_oom;
+			if (gs_ord) {
+				run_replace_txn = ft_flip_txn_create_bounded(
+					FT_ORD_CELL_RUN_REPLACE_MAX_EDGES);
+				if (!run_replace_txn)
+					goto prep_oom;
+			}
 		}
 
 		/* ===== COMMIT (failure-free) ===== */
@@ -2251,20 +2266,25 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * root, the transient root this install retires -- @fresh for a
 			 * non-empty swap, the old empty @old_swap_root for an empty swap,
 			 * both reader-visible as swap_ft->root during the unlink window --
-			 * gets its tombstone before the commit below unlinks it.  Only on
-			 * the top_B path (the external/absent case keeps the root live).
+			 * gets its tombstone recorded INTO extract_txn, so the mark and
+			 * the root install unlink flip atomically (atomic detach).  Only
+			 * on the top_B path (the external/absent case keeps the root live);
+			 * top_B always installed the root edge into @edges, so extract_txn
+			 * is reserved (list-on) or the 2-edge list-off txn just reserved.
 			 */
 			if (top_B)
-				ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
-					swap_empty ? ft_node_ptr(old_swap_root) : fresh));
+				ft_flip_txn_record_tombstone(extract_txn,
+					cds_ft_item_to_metadata(swap_empty ?
+						ft_node_ptr(old_swap_root) : fresh));
 			/*
-			 * Post-drain commit (un-abortable): list on rides the
-			 * pre-reserved extract_txn (multi-edge: root install + run_D
-			 * head/tail); freed unused if no edge changed.  List off is at
-			 * most the lone top_B root-install edge -- an infallible
-			 * on-stack store, no txn.
+			 * Post-drain commit (un-abortable): a reserved extract_txn --
+			 * list on (root install + run_D head/tail + the fused tombstone)
+			 * or the list-off 2-edge top_B retire (root install + tombstone)
+			 * -- commits every recorded edge; freed unused if none changed.
+			 * When extract_txn is NULL (list off, no top_B retire) @n is 0,
+			 * so the lone-edge arm is unreached.
 			 */
-			if (gs_ord) {
+			if (extract_txn) {
 				if (n)
 					ft_ord_cell_flip_into(swap_ft, extract_txn,
 						edges, n);
