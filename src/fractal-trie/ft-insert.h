@@ -206,17 +206,18 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 
 	/*
 	 * Freeze-on-free (doc §4.B): the old compressed/internal node this
-	 * commit retires gets its one-way LIVE->DEAD tombstone BEFORE the commit
-	 * unlinks it (a no-op under one writer; under MCAS a concurrent writer
-	 * targeting it then fails its validate-live CAS).  Marked here, after the
-	 * last abort point (the recording above is infallible into the
-	 * pre-reserved txn).
+	 * commit retires gets its one-way LIVE->DEAD tombstone recorded INTO the
+	 * same txn as the structural unlink, so the mark and the unlink flip
+	 * atomically (atomic detach) -- a concurrent writer targeting the node
+	 * then fails its validate-live CAS, and never sees a torn "unlinked but
+	 * still live" window.  A no-op under one writer.  Recorded here, after the
+	 * last abort point (all recording is infallible into the pre-reserved txn).
 	 */
 	if (ic->free_old_cn)
-		ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+		ft_flip_txn_record_tombstone(ic->txn, cds_ft_item_to_metadata(
 			(struct cds_ft_inode *) ic->free_old_cn));
 	if (ic->free_old_node)
-		ft_meta_tombstone_set_flip(
+		ft_flip_txn_record_tombstone(ic->txn,
 			cds_ft_item_to_metadata(ic->free_old_node));
 	/*
 	 * THE commit: install every recorded edge -- the forward structural
@@ -300,9 +301,12 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic)
 	 * Edge budget: the forward publish (<=2: slot + a compressed parent's
 	 * skip-slot dual) OR -- attach path -- the new key's reserved slot edge
 	 * (1) plus the recompact-relocation grandparent publish (<=2) folded in;
-	 * + <=4 cell neighbour edges (list-on) + the live re-parent edge.
+	 * + <=4 cell neighbour edges (list-on) + the live re-parent edge (<=7);
+	 * + the <=2 freeze-on-free tombstone edges (an old compressed and/or old
+	 * internal node this commit retires) now fused into the same flip as the
+	 * unlink (atomic detach, doc §4.B).
 	 */
-	ic->txn = ft_flip_txn_create_bounded(9);
+	ic->txn = ft_flip_txn_create_bounded(11);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;

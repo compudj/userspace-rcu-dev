@@ -666,6 +666,30 @@ void ft_meta_tombstone_set_flip(struct cds_ft_metadata *meta)
 }
 
 /*
+ * Record a node's one-way LIVE->DEAD tombstone (state bit 1, §4.B) as an edge in
+ * the op's flip-txn @t, so the freeze mark commits ATOMICALLY with the very flip
+ * that structurally unlinks the node -- the "atomic detach" that
+ * ft_meta_tombstone_set_flip's lone-edge bridge stands in for (that standalone
+ * helper remains for retire sites whose unlink is not yet a flip-txn commit).
+ * The state word reserves bit 0 (FT_STATE_PROXY) for the engine's in-band proxy
+ * marker, so the mark rides an MCAS edge like any structural slot; a concurrent
+ * reader of nr_child resolves the transient proxy via ft_meta_nr_child_load.
+ * Value-CAS old -> old|TOMBSTONE.  @t must be reserved for this extra edge.
+ * Idempotent (re-marking a dead node is a same-value edge); under one writer it
+ * is a no-op bit a reader ignores, so behaviour-identical.
+ */
+static inline
+void ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta)
+{
+	uintptr_t old = meta->state;
+
+	ft_flip_txn_record_tag(t, (void **) &meta->state,
+			(void *) old, (void *) (old | FT_STATE_TOMBSTONE),
+			FT_STATE_PROXY);
+}
+
+/*
  * Set a duplicate-chain node's removal tombstone (CDS_FT_NODE_REMOVED_FLAG on
  * cds_ft_node.next) as a COMMITTED flip edge, at the point @node is unlinked
  * from the trie.  This is the chain-leaf analogue of ft_meta_tombstone_set_flip
