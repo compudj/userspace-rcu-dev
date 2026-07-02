@@ -635,16 +635,37 @@ void ft_metadata_set_external_nodes(struct cds_ft_inode_flag *node_flag,
  * parallel; the compiler emits a CMOV, keeping the critical path
  * to 4 cycles.
  */
+/*
+ * nr_keys is an MCAS-transacted scalar: on the rank-stats-ON path the
+ * order-statistics count is folded into the op's flip-txn (so it is exact under
+ * concurrent writers instead of a drifting approximate aggregate).  Like the
+ * per-node state word, it therefore reserves its LOW bit for the engine's
+ * in-band proxy marker -- the logical count is stored as (count << 1) and bit 0
+ * = FT_NR_KEYS_PROXY_TAG carries a parked proxy for the duration of a commit.
+ * Bit 0 rather than a high bit so the reservation is valid on 32-bit too.
+ * Access nr_keys ONLY through these helpers; never read/write the field direct.
+ */
+#define FT_NR_KEYS_PROXY_TAG	1UL
+
+/* Writer-side read of an owned / quiescent node (never a mid-commit proxy). */
 static inline
 unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m)
 {
-	return m->nr_keys;
+	return m->nr_keys >> 1;
 }
 
+/*
+ * Reader-side count read: acquire-load and resolve a parked proxy to its
+ * committed logical value.  urcu_mcas_read short-circuits to a plain acquire
+ * load whenever nr_keys holds no proxy (the common case, and always so under
+ * writer exclusion), so the resolve costs nothing off the commit window.
+ */
 static inline
 unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
 {
-	return uatomic_load(&m->nr_keys, CMM_ACQUIRE);
+	return (unsigned long) urcu_mcas_read(
+			(void **) (uintptr_t) &m->nr_keys,
+			FT_NR_KEYS_PROXY_TAG) >> 1;
 }
 
 /*
@@ -660,7 +681,7 @@ void ft_nr_keys_store(const struct cds_ft *ft, struct cds_ft_metadata *m,
 		unsigned long val, int mo)
 {
 	if (ft->rank_stats)
-		uatomic_store(&m->nr_keys, val, mo);
+		uatomic_store(&m->nr_keys, val << 1, mo);
 }
 
 /*
