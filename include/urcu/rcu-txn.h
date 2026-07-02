@@ -121,8 +121,10 @@
  *     next attempt.
  * A handle keeps its turn across aborts (retry in place -- releasing would
  * forfeit the guaranteed turn) and releases it only on a terminal outcome
- * (commit, error, or a bail that ends the bracket); the last holder out
- * clears domain->active and the domain reverts to the optimistic regime.
+ * (commit, error, or a bail that ends the bracket); each departing holder
+ * clears domain->active just before its unlock and the incoming holder
+ * re-asserts it, so once the lane drains the domain reverts to the
+ * optimistic regime.
  *
  * RCU.  The bracket opens an RCU read-side section per attempt, and commit
  * uses the flavor's call_rcu, so include this header AFTER an RCU flavor
@@ -325,14 +327,31 @@ void urcu_txn__enter_fallback(struct urcu_mcas_txn *txn)
 }
 
 /*
- * Release the lock; if we were the last holder, end the episode by
- * clearing domain->active so new transactions resume the optimistic path.
+ * Release the lock.  domain->active is cleared BEFORE the unlock; when we are
+ * the last holder the lane drains with the flag already down and the domain
+ * reverts to the optimistic path.
  */
 static inline
 void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
 {
-	if (cds_fair_mutex_unlock(&txn->domain->lock, &txn->waiter))
-		uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
+	/*
+	 * Clear the episode flag BEFORE releasing the lock.  Clearing after --
+	 * even gated on the unlock's "last holder" return -- races the next
+	 * holder: the actual lock release is the dequeue's tail-reset cmpxchg
+	 * INSIDE cds_fair_mutex_unlock(), so by the time it returns "last", a
+	 * new thread may have acquired the freed lock and stored active = 1;
+	 * our late 0 would then overwrite the new episode's advertisement, and
+	 * that whole episode would run unfunnelled -- no future transaction
+	 * takes the lane, so "closes the optimistic-writer set" silently fails
+	 * in exactly the starved case the lane exists for.  Clearing first
+	 * costs at worst a momentary 0 flicker on a mid-episode hand-off (the
+	 * incoming holder re-stores 1 right after lock() returns, see
+	 * urcu_txn__enter_fallback): a stale read mis-routes one bounded
+	 * attempt, which the advisory flag already tolerates (see
+	 * urcu_txn__want_fallback).
+	 */
+	uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
+	(void) cds_fair_mutex_unlock(&txn->domain->lock, &txn->waiter);
 	txn->in_fallback = 0;
 }
 
