@@ -263,15 +263,19 @@ struct urcu_txn_sw_latch {
  * first record()/reserve() from the shared per-CPU slab and grown in PREPARE (no
  * proxy is live yet, so it may move); ONE free -- record array and all --
  * reclaims it.  The 32-byte header keeps latches[] 16-byte aligned so each tagged
- * proxy has its low 4 bits free.  @cap is the physical capacity: a slab block's
- * cap is its class size, so cap <= URCU_TXN_SW_SLAB_MAXCAP on free identifies it.
+ * proxy has its low 4 bits free.  @cap is the physical capacity; @slab (stamped
+ * at alloc) tells free the block's origin -- self-describing, so a block
+ * allocated before the slab constructor ran or while it was disabled is freed
+ * on the right path even if the slab enables in between.
  * The INLINE path (urcu_txn_sw_init_inline, nr <= 1) never allocates a block.
  */
 struct urcu_txn_sw_block {
 	struct urcu_txn_sw_group group;		/* selector; parked proxies read &block->group */
 	struct rcu_head rcu_head;		/* deferred-free handle */
-	unsigned int cap;			/* physical capacity; identifies the slab class on free */
-	unsigned int _pad;			/* pad so latches[] stays 16-byte aligned */
+	unsigned int cap;			/* physical capacity */
+	unsigned int slab;			/* block origin: slab (1) / exact malloc (0); the
+						 * free discriminator, doubling as the pad that
+						 * keeps latches[] 16-byte aligned */
 	struct urcu_txn_sw_latch latches[];	/* INLINE record array (frozen at install) */
 };
 
@@ -354,10 +358,10 @@ void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
  * The heap-path transaction block is served from the shared per-CPU size-classed
  * slab in <urcu/rcu-txn-slab.h> (same machinery as the concurrent engine).
  * Latch-count classes {4,8,16,32,64,128} map to byte sizes; a request over the
- * top class is an exact, uncached posix_memalign.  URCU_TXN_NO_CACHE disables it.
+ * top class is an exact, uncached posix_memalign.  Each block is stamped with
+ * its origin (urcu_txn_sw_block.slab), which free consults.  URCU_TXN_NO_CACHE
+ * disables the slab.
  */
-#define URCU_TXN_SW_SLAB_MAXCAP	128u
-
 static const unsigned int urcu_txn_sw_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
 #define URCU_TXN_SW_SLAB_NCLASS	\
 	((int) (sizeof(urcu_txn_sw_slab_rc) / sizeof(urcu_txn_sw_slab_rc[0])))
@@ -403,25 +407,32 @@ struct urcu_txn_sw_block *urcu_txn_sw__block_alloc(unsigned int cap)
 		if (caa_unlikely(!blk))
 			return NULL;
 		cap = urcu_txn_sw_slab_rc[cl];		/* physical class cap */
+		blk->slab = 1;
 	} else {
 		void *p;
 
 		if (posix_memalign(&p, 16, urcu_txn_sw_blocksize(cap)))
 			return NULL;
 		blk = (struct urcu_txn_sw_block *) p;
+		blk->slab = 0;
 	}
 	urcu_txn_sw_group_init(&blk->group);
 	blk->cap = cap;
 	return blk;
 }
 
-/* Free a block to its slab ORIGIN arena, or to malloc for an exact block. */
+/*
+ * Free a block on the path that allocated it (the blk->slab stamp): to its
+ * slab ORIGIN arena, or to malloc for an exact block.  The stamp -- not the
+ * slab's current enabled state -- decides, so a block allocated before the
+ * slab constructor ran is never misrouted after the slab enables.
+ */
 static inline
 void urcu_txn_sw__block_free(struct urcu_txn_sw_block *blk)
 {
 	if (!blk)
 		return;
-	if (urcu_slab_enabled(&urcu_txn_sw_slab) && blk->cap <= URCU_TXN_SW_SLAB_MAXCAP)
+	if (blk->slab)
 		urcu_slab_free(blk);
 	else
 		free(blk);

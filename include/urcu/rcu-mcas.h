@@ -285,6 +285,14 @@ struct urcu_mcas {
 	unsigned int nr;
 	unsigned int cap;
 	unsigned int poisoned;		/* set if a same-slot reconcile disagreed on old */
+	unsigned int slab;		/* block origin: per-CPU slab (1) or exact
+					 * posix_memalign (0).  Stamped at alloc and
+					 * consulted by free -- self-describing, so a
+					 * descriptor allocated while the slab was still
+					 * uninitialized (constructor ordering) or disabled
+					 * is freed on the right path even if the slab
+					 * enables in between.  Occupies what was padding:
+					 * recs[] stays 16-byte aligned (asserted below). */
 	struct urcu_mcas_record recs[];	/* frozen + slot-sorted at commit */
 };
 
@@ -763,7 +771,8 @@ void *urcu_mcas_read(void **slot, uintptr_t tag)
  * 16-byte aligned for every inline record to keep its low 4 bits free (see the
  * layout note above struct urcu_mcas).  posix_memalign guarantees that
  * portably; plain malloc would only promise max_align_t (8 on some 32-bit
- * ABIs).  Returns NULL on OOM.
+ * ABIs).  Returns NULL on OOM.  The caller stamps the descriptor's identity
+ * fields -- cap and the slab-origin flag -- as urcu_mcas_alloc_cap() does.
  */
 static inline
 struct urcu_mcas *urcu_mcas_alloc(size_t size)
@@ -782,18 +791,17 @@ struct urcu_mcas *urcu_mcas_alloc(size_t size)
  * The per-attempt descriptor (header + inline recs[]) is served from the shared
  * per-CPU size-classed slab in <urcu/rcu-txn-slab.h>.  Record-count classes
  * {4,8,16,32,64,128} map to byte sizes urcu_mcas_blocksize(cap); a request over
- * the top class is an exact, uncached posix_memalign.  A slab block's physical
- * cap IS its class size, so "cap <= URCU_MCAS_SLAB_MAXCAP" on free exactly
- * identifies a slab block (grow doublings 4->8->...->128 stay on class sizes;
- * only exact blocks have cap > 128).  See rcu-txn-slab.h for the arena /
- * superblock / wfstack mechanics and the growth bound.  URCU_TXN_NO_CACHE
+ * the top class is an exact, uncached posix_memalign.  Every descriptor is
+ * STAMPED at allocation with its origin (urcu_mcas.slab) and free consults
+ * that stamp, so a block is always freed on the path that allocated it --
+ * including one allocated before the slab's constructor ran or while it was
+ * disabled.  See rcu-txn-slab.h for the arena / superblock / wfstack mechanics
+ * and the growth bound.  URCU_TXN_NO_CACHE
  * disables it (falls back to posix_memalign/free).
  * ─────────────────────────────────────────────────────────────────────────
  */
 #define urcu_mcas_blocksize(cap)	\
 	(sizeof(struct urcu_mcas) + (size_t) (cap) * sizeof(struct urcu_mcas_record))
-
-#define URCU_MCAS_SLAB_MAXCAP	128u		/* largest pooled record-count class */
 
 static const unsigned int urcu_mcas_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
 #define URCU_MCAS_SLAB_NCLASS	\
@@ -825,24 +833,11 @@ int urcu_mcas_slab_class_of(unsigned int req)
 }
 
 /*
- * Physical capacity a request rounds to: the size class that fits it (a slab
- * block is always sized to its class), or exact when the slab is off or the
- * request exceeds the top class.
- */
-static inline
-unsigned int urcu_mcas_phys_cap(unsigned int req)
-{
-	int cl;
-
-	if (urcu_slab_enabled(&urcu_mcas_slab) && (cl = urcu_mcas_slab_class_of(req)) >= 0)
-		return urcu_mcas_slab_rc[cl];
-	return req;
-}
-
-/*
  * Allocate a descriptor with room for >= @req records, setting its PHYSICAL
- * cap.  A request that fits a size class comes from the per-CPU slab (physical
- * cap == the class size); a larger one is an exact, uncached posix_memalign.
+ * cap and stamping its origin (t->slab, the free discriminator).  A request
+ * that fits a size class comes from the per-CPU slab (physical cap == the
+ * class size); a larger one -- or any request while the slab is uninitialized
+ * or disabled -- is an exact, uncached posix_memalign.
  */
 static inline
 struct urcu_mcas *urcu_mcas_alloc_cap(unsigned int req)
@@ -852,26 +847,34 @@ struct urcu_mcas *urcu_mcas_alloc_cap(unsigned int req)
 
 	if (urcu_slab_enabled(&urcu_mcas_slab) && (cl = urcu_mcas_slab_class_of(req)) >= 0) {
 		t = (struct urcu_mcas *) urcu_slab_alloc(&urcu_mcas_slab, cl);
-		if (caa_likely(t != NULL))
+		if (caa_likely(t != NULL)) {
 			t->cap = urcu_mcas_slab_rc[cl];
+			t->slab = 1;
+		}
 	} else {
 		t = urcu_mcas_alloc(urcu_mcas_blocksize(req));
-		if (caa_likely(t != NULL))
+		if (caa_likely(t != NULL)) {
 			t->cap = req;
+			t->slab = 0;
+		}
 	}
 	return t;
 }
 
 /*
- * Free a descriptor.  A slab block (cap <= top class) returns to its ORIGIN
+ * Free a descriptor on the path that allocated it (the t->slab stamp): a slab
+ * block returns to its ORIGIN
  * arena regardless of which thread frees it (origin found from the superblock
  * header), so writer-context and reclaim-worker frees are identical -- no
- * local/remote split.  An exact (uncached) block goes back to malloc.
+ * local/remote split.  An exact (uncached) block goes back to malloc.  The
+ * stamp -- not the slab's current enabled state -- decides, so a block
+ * allocated before the slab constructor ran is never misrouted to
+ * urcu_slab_free() after the slab enables.
  */
 static inline
 void urcu_mcas_free_local(struct urcu_mcas *t)
 {
-	if (urcu_slab_enabled(&urcu_mcas_slab) && t->cap <= URCU_MCAS_SLAB_MAXCAP)
+	if (t->slab)
 		urcu_slab_free(t);
 	else
 		free(t);
@@ -989,14 +992,18 @@ static inline
 struct urcu_mcas *urcu_mcas_grow(struct urcu_mcas *t)
 {
 	unsigned int newcap = t->cap < 2 ? 2 : t->cap * 2;
+	unsigned int ncap, nslab;
 	struct urcu_mcas *n;
 
 	n = urcu_mcas_alloc_cap(newcap);
 	if (!n)
 		return NULL;
+	ncap = n->cap;				/* the new block's identity, set by alloc_cap ... */
+	nslab = n->slab;
 	memcpy(n, t, sizeof(*t) +
 			(size_t) t->nr * sizeof(struct urcu_mcas_record));
-	n->cap = urcu_mcas_phys_cap(newcap);	/* memcpy clobbered cap; set physical */
+	n->cap = ncap;				/* ... which the header memcpy clobbered */
+	n->slab = nslab;
 	urcu_mcas_free_local(t);		/* pre-commit: writer-context free */
 	return n;
 }
