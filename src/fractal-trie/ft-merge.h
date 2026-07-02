@@ -2392,17 +2392,20 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * Pre-reserve the dst-appear root-swap txn BEFORE the detach: the
 		 * swap is failure-free (post-detach) so it commits through this
 		 * pre-reserved txn (ft_ord_cell_flip_into).  OOM here aborts while
-		 * @src_ft is still pristine (no detach yet).  List off uses the
-		 * lone-edge ft_root_edge_flip below (no txn).
+		 * @src_ft is still pristine (no detach yet).  The dst old-root
+		 * freeze-on-free tombstone rides the SAME flip (atomic detach,
+		 * §4.B): +1 edge list-on; list-off is a 2-edge txn (root edge +
+		 * tombstone) instead of the former lone ft_root_edge_flip store.
 		 */
-		if (dst_ft->group->ordered_list_set) {
+		if (dst_ft->group->ordered_list_set)
 			appear_txn = ft_flip_txn_create_bounded(
-				FT_ROOT_LIST_SWAP_MAX_EDGES);
-			if (!appear_txn) {
-				free_cds_ft_node_unpublished(src_ft, fresh_root);
-				status = CDS_FT_STATUS_MEMORY_ERROR;
-				goto out;
-			}
+				FT_ROOT_LIST_SWAP_MAX_EDGES + 1);
+		else
+			appear_txn = ft_flip_txn_create_bounded(2);
+		if (!appear_txn) {
+			free_cds_ft_node_unpublished(src_ft, fresh_root);
+			status = CDS_FT_STATUS_MEMORY_ERROR;
+			goto out;
 		}
 
 		status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
@@ -2435,10 +2438,10 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * ft_graft's cross-trie empty-dst).
 		 *
 		 * Freeze-on-free (doc §4.B): the dst old root this swap retires
-		 * gets its tombstone before the swap unlinks it.  Failure-free past
+		 * gets its tombstone recorded INTO the swap txn, so the mark and
+		 * the unlink flip atomically (atomic detach).  Failure-free past
 		 * the detach above, so this runs only on the committing path.
 		 */
-		ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(old_dst_root));
 		if (dst_ft->group->ordered_list_set) {
 			/*
 			 * dst FILLS by adopting @subtree's whole list.  @subtree is the
@@ -2447,6 +2450,8 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			 * relink_incoming = true); @subtree's sentinel resets to empty with
 			 * a plain store.
 			 */
+			ft_flip_txn_record_tombstone(appear_txn,
+				cds_ft_item_to_metadata(old_dst_root));
 			ft_root_list_swap_publish(dst_ft, appear_txn, &dst_ft->root,
 				dst_ft->root, subtree->root,
 				NULL, ft_ord_first(subtree),
@@ -2455,14 +2460,20 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		} else {
 			/*
 			 * No ordered list: dst's root is the only reader-visible
-			 * slot.  Express the lone appear edge as a single-edge flip
-			 * descriptor (one release store, like a bare
-			 * rcu_assign_pointer) so it is MCAS-expressible like the
-			 * list-on path.  (@subtree is the fresh EXCLUSIVE trie, so
-			 * its root reset below stays a plain store.)
+			 * structural slot.  Commit the appear root edge and the old-
+			 * root tombstone as ONE 2-edge flip through the pre-reserved
+			 * txn (a lone root edge would reduce to a release store, but
+			 * the fused tombstone makes it multi-edge -- readers resolve
+			 * the transient root proxy exactly as on the list-on path).
+			 * (@subtree is the fresh EXCLUSIVE trie, so its root reset
+			 * below stays a plain store.)
 			 */
-			ft_root_edge_flip(dst_ft, &dst_ft->root,
-				dst_ft->root, subtree->root);
+			ft_flip_txn_record_reserved(appear_txn,
+				(void **) &dst_ft->root,
+				(void *) dst_ft->root, (void *) subtree->root);
+			ft_flip_txn_record_tombstone(appear_txn,
+				cds_ft_item_to_metadata(old_dst_root));
+			ft_flip_txn_commit(dst_ft, appear_txn);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
 			(const void *) dst_ft->root);

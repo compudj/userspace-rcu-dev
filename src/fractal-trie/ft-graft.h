@@ -1062,12 +1062,15 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * the last POPULATED / OOM exit, before the only remaining fallible
 		 * step (the self-secure reserve below).  The retire is past the
 		 * point of no return and cannot abort, so it commits through this
-		 * pre-reserved txn (ft_ord_cell_flip_into).  List off retires via the
-		 * lone-edge ft_root_edge_flip, so reserve only when the list is on.
+		 * pre-reserved txn (ft_ord_cell_flip_into).  List off retires via a
+		 * lone-edge root store, so reserve only when the list is on -- EXCEPT
+		 * a nil-key root retire fuses the orphaned wrapper's tombstone into
+		 * the retire (atomic detach, §4.B), needing a 2-edge txn even list-
+		 * off; list-on grows by +1 for that same fused tombstone.
 		 */
 		if (dst_ft->group->ordered_list_set) {
 			src_retire_txn = ft_flip_txn_create_bounded(
-				FT_ROOT_LIST_SWAP_MAX_EDGES);
+				FT_ROOT_LIST_SWAP_MAX_EDGES + 1);
 			run_splice_txn = ft_flip_txn_create_bounded(
 				FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
 			if (!src_retire_txn || !run_splice_txn) {
@@ -1075,6 +1078,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 					ft_flip_txn_destroy(src_retire_txn);
 				if (run_splice_txn)
 					ft_flip_txn_destroy(run_splice_txn);
+				ft_flip_txn_destroy(glue.txn);
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+		} else if (nil_key_root) {
+			src_retire_txn = ft_flip_txn_create_bounded(2);
+			if (!src_retire_txn) {
 				ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
@@ -1142,16 +1152,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		/*
 		 * Freeze-on-free (doc §4.B): a NIL-key graft frees the orphaned
 		 * src-root wrapper @old_src_root below (its external chain was
-		 * grafted into dst, leaving the wrapper empty); mark it dead before
-		 * the src-root retire commit that unlinks it.  Non-NIL: @old_src_root
-		 * IS the payload, moved LIVE into dst -- it must NOT be marked.  No
-		 * fallible step between here and the retire (all returned above).
-		 */
-		if (nil_key_root)
-			ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
-				ft_node_ptr(old_src_root)));
-
-		/*
+		 * grafted into dst, leaving the wrapper empty); its tombstone rides
+		 * the SAME flip as the src-root retire that unlinks it (atomic
+		 * detach), recorded into the retire txn in each arm below.  Non-NIL:
+		 * @old_src_root IS the payload, moved LIVE into dst -- it must NOT be
+		 * marked.  No fallible step between here and the retire (all returned
+		 * above).
+		 *
 		 * Ordered list: capture src's whole list (the run to graft) and,
 		 * paired with the structural src-root retire, unlink it from src
 		 * -- FUSED into ONE flip so a src reader never sees src
@@ -1160,7 +1167,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * readers of the old content; the run is spliced into dst after
 		 * the structural publish (same commit point).  No rollback: every
 		 * failure mode (OOM / populated) returned above, before this
-		 * retire.  (List off: just the lone root edge.)
+		 * retire.
 		 */
 		if (dst_ft->group->ordered_list_set) {
 			graft_run_first = ft_ord_first(src_ft);
@@ -1170,11 +1177,29 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * cells are re-homed into dst by the run-splice below, which
 			 * repoints their outer links to dst's neighbours / sentinel.
 			 */
+			if (nil_key_root)
+				ft_flip_txn_record_tombstone(src_retire_txn,
+					cds_ft_item_to_metadata(
+						ft_node_ptr(old_src_root)));
 			ft_root_list_swap_publish(src_ft, src_retire_txn,
 				&src_ft->root,
 				old_src_root, ft_node_flag(fresh_node, 0),
 				graft_run_first, NULL, graft_run_last, NULL,
 				NULL, false);
+		} else if (nil_key_root) {
+			/*
+			 * List off + nil-key: the lone root edge plus the orphaned
+			 * wrapper's tombstone commit as ONE 2-edge flip through the
+			 * pre-reserved txn (readers resolve the transient root proxy
+			 * exactly as on the list-on path).
+			 */
+			ft_flip_txn_record_reserved(src_retire_txn,
+				(void **) &src_ft->root,
+				(void *) old_src_root,
+				(void *) ft_node_flag(fresh_node, 0));
+			ft_flip_txn_record_tombstone(src_retire_txn,
+				cds_ft_item_to_metadata(ft_node_ptr(old_src_root)));
+			ft_flip_txn_commit(src_ft, src_retire_txn);
 		} else {
 			ft_root_edge_flip(src_ft, &src_ft->root,
 				old_src_root, ft_node_flag(fresh_node, 0));
