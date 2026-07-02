@@ -131,6 +131,7 @@
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head */
 #include <urcu/arch.h>			/* caa_cpu_relax */
+#include <urcu/rcu-txn-slab.h>		/* shared per-CPU size-classed descriptor slab */
 
 #ifdef __cplusplus
 extern "C" {
@@ -711,6 +712,115 @@ struct urcu_mcas *urcu_mcas_alloc(size_t size)
 }
 
 /*
+ * ─────────────────────────────────────────────────────────────────────────
+ * Per-CPU descriptor slab.
+ *
+ * The per-attempt descriptor (header + inline recs[]) is served from the shared
+ * per-CPU size-classed slab in <urcu/rcu-txn-slab.h>.  Record-count classes
+ * {4,8,16,32,64,128} map to byte sizes urcu_mcas_blocksize(cap); a request over
+ * the top class is an exact, uncached posix_memalign.  A slab block's physical
+ * cap IS its class size, so "cap <= URCU_MCAS_SLAB_MAXCAP" on free exactly
+ * identifies a slab block (grow doublings 4->8->...->128 stay on class sizes;
+ * only exact blocks have cap > 128).  See rcu-txn-slab.h for the arena /
+ * superblock / wfstack mechanics and the growth bound.  URCU_TXN_NO_CACHE
+ * disables it (falls back to posix_memalign/free).
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+#define urcu_mcas_blocksize(cap)	\
+	(sizeof(struct urcu_mcas) + (size_t) (cap) * sizeof(struct urcu_mcas_record))
+
+#define URCU_MCAS_SLAB_MAXCAP	128u		/* largest pooled record-count class */
+
+static const unsigned int urcu_mcas_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
+#define URCU_MCAS_SLAB_NCLASS	\
+	((int) (sizeof(urcu_mcas_slab_rc) / sizeof(urcu_mcas_slab_rc[0])))
+
+static size_t urcu_mcas_slab_bytes[URCU_MCAS_SLAB_NCLASS];	/* blocksize per class, filled at init */
+static struct urcu_slab urcu_mcas_slab;
+
+/* Smallest record-count class that fits @req records, or -1 if over the top. */
+static inline
+int urcu_mcas_slab_class_of(unsigned int req)
+{
+	int i;
+
+	for (i = 0; i < URCU_MCAS_SLAB_NCLASS; i++)
+		if (req <= urcu_mcas_slab_rc[i])
+			return i;
+	return -1;
+}
+
+static __attribute__((constructor))
+void urcu_mcas_slab_ctor(void)
+{
+	int i;
+
+	for (i = 0; i < URCU_MCAS_SLAB_NCLASS; i++)
+		urcu_mcas_slab_bytes[i] = urcu_mcas_blocksize(urcu_mcas_slab_rc[i]);
+	urcu_slab_init(&urcu_mcas_slab, urcu_mcas_slab_bytes,
+			URCU_MCAS_SLAB_NCLASS, "mcas");
+}
+
+/*
+ * Physical capacity a request rounds to: the size class that fits it (a slab
+ * block is always sized to its class), or exact when the slab is off or the
+ * request exceeds the top class.
+ */
+static inline
+unsigned int urcu_mcas_phys_cap(unsigned int req)
+{
+	int cl;
+
+	if (urcu_slab_enabled(&urcu_mcas_slab) && (cl = urcu_mcas_slab_class_of(req)) >= 0)
+		return urcu_mcas_slab_rc[cl];
+	return req;
+}
+
+/*
+ * Allocate a descriptor with room for >= @req records, setting its PHYSICAL
+ * cap.  A request that fits a size class comes from the per-CPU slab (physical
+ * cap == the class size); a larger one is an exact, uncached posix_memalign.
+ */
+static inline
+struct urcu_mcas *urcu_mcas_alloc_cap(unsigned int req)
+{
+	struct urcu_mcas *t;
+	int cl;
+
+	if (urcu_slab_enabled(&urcu_mcas_slab) && (cl = urcu_mcas_slab_class_of(req)) >= 0) {
+		t = (struct urcu_mcas *) urcu_slab_alloc(&urcu_mcas_slab, cl);
+		if (caa_likely(t != NULL))
+			t->cap = urcu_mcas_slab_rc[cl];
+	} else {
+		t = urcu_mcas_alloc(urcu_mcas_blocksize(req));
+		if (caa_likely(t != NULL))
+			t->cap = req;
+	}
+	return t;
+}
+
+/*
+ * Free a descriptor.  A slab block (cap <= top class) returns to its ORIGIN
+ * arena regardless of which thread frees it (origin found from the superblock
+ * header), so writer-context and reclaim-worker frees are identical -- no
+ * local/remote split.  An exact (uncached) block goes back to malloc.
+ */
+static inline
+void urcu_mcas_free_local(struct urcu_mcas *t)
+{
+	if (urcu_slab_enabled(&urcu_mcas_slab) && t->cap <= URCU_MCAS_SLAB_MAXCAP)
+		urcu_slab_free(t);
+	else
+		free(t);
+}
+
+static inline
+void urcu_mcas_free_remote(struct urcu_mcas *t)
+{
+	urcu_mcas_free_local(t);
+}
+
+/*
  * Create a transaction with room for @cap records.  @retry is the caller's
  * aging-priority: the number of times this logical operation has already retried
  * (0 on the first attempt, incremented and passed back in on each retry).  A
@@ -723,14 +833,13 @@ struct urcu_mcas *urcu_mcas_create(unsigned int cap,
 {
 	struct urcu_mcas *t;
 
-	t = urcu_mcas_alloc(sizeof(*t) +
-			(size_t) cap * sizeof(struct urcu_mcas_record));
+	t = urcu_mcas_alloc_cap(cap);
 	if (!t)
 		return NULL;
 	t->status = URCU_MCAS_UNDECIDED;
 	t->retry = retry;
 	t->nr = 0;
-	t->cap = cap;
+	/* t->cap set to the physical capacity by urcu_mcas_alloc_cap() */
 	t->poisoned = 0;
 	return t;
 }
@@ -812,28 +921,27 @@ struct urcu_mcas *urcu_mcas_grow(struct urcu_mcas *t)
 	unsigned int newcap = t->cap < 2 ? 2 : t->cap * 2;
 	struct urcu_mcas *n;
 
-	n = urcu_mcas_alloc(sizeof(*t) +
-			(size_t) newcap * sizeof(struct urcu_mcas_record));
+	n = urcu_mcas_alloc_cap(newcap);
 	if (!n)
 		return NULL;
 	memcpy(n, t, sizeof(*t) +
 			(size_t) t->nr * sizeof(struct urcu_mcas_record));
-	n->cap = newcap;
-	free(t);
+	n->cap = urcu_mcas_phys_cap(newcap);	/* memcpy clobbered cap; set physical */
+	urcu_mcas_free_local(t);		/* pre-commit: writer-context free */
 	return n;
 }
 
 static inline
 void urcu_mcas_destroy(struct urcu_mcas *t)
 {
-	free(t);
+	urcu_mcas_free_local(t);
 }
 
 /* call_rcu callback: deferred destroy. */
 static inline
 void urcu_mcas_free_rcu(struct rcu_head *head)
 {
-	urcu_mcas_destroy(caa_container_of(head,
+	urcu_mcas_free_remote(caa_container_of(head,
 			struct urcu_mcas, rcu_head));
 }
 
