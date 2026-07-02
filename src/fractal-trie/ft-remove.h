@@ -321,7 +321,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * cannot fail, so the only failure points are this reservation and the
 	 * new_cn allocation, both BEFORE the build's first side-effect.
 	 */
-	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES);
+	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3);
 	if (!txn)
 		return -ENOMEM;	/* nothing touched: caller aborts */
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
@@ -388,18 +388,19 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
 			new_cn_pub, new_cn_meta, &rec);
 		/*
-		 * Freeze-on-free (doc §4.B): the collapsed chain this commit
-		 * retires -- the 1-child boundary @iter_node_flag and the old
-		 * parent/child compressed nodes new_cn merges -- gets its one-way
-		 * LIVE->DEAD tombstone BEFORE the commit unlinks it.  Failure-free
-		 * past the new_cn alloc above, so this only runs on the committing
-		 * path; a no-op under one writer.
+		 * Freeze-on-free (doc §4.B, atomic detach): the collapsed chain
+		 * this commit retires -- the 1-child boundary @iter_node_flag and
+		 * the old parent/child compressed nodes new_cn merges (<=3) --
+		 * gets its one-way LIVE->DEAD tombstone RECORDED INTO @txn (the +3
+		 * reserved above), so the freeze flips ATOMICALLY with the commit
+		 * that unlinks it: an aborted commit leaves every node live.  A
+		 * no-op under one writer.
 		 */
-		ft_meta_tombstone_set_flip(iter_meta);
+		ft_flip_txn_record_tombstone(txn, iter_meta);
 		if (parent_cn)
-			ft_meta_tombstone_set_flip(parent_cn_meta);
+			ft_flip_txn_record_tombstone(txn, parent_cn_meta);
 		if (child_cn)
-			ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+			ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) child_cn));
 		ft_remove_commit_rec(ft, &rec, dead_cell, run, txn);
 	}
