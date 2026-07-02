@@ -92,6 +92,16 @@
  * is sticky -- the pending commit then reports -ENOMEM -- so a mutator only has
  * to test commit's result (which it already does).
  *
+ * Buffered writes are INVISIBLE to the bracket's own loads: urcu_txn_load()
+ * returns the slot's current logical value, never a pending new_ptr this
+ * attempt buffered -- there is no read-your-own-writes.  And a transaction
+ * keeps AT MOST ONE record per slot per attempt: a second store to the same
+ * slot upgrades the buffered record in place (last-wins; a disagreeing old
+ * poisons the attempt), it does not sequence after the first.  Composing two
+ * *_prepare forms that write the same slot (e.g. two insert-after at one
+ * position) thus silently collapses to the last write: run them as separate
+ * transactions.
+ *
  * Reserve.  A mutator that knows its edge count up front may call
  * urcu_txn_reserve() right after begin: it allocates the descriptor to
  * that floor, so an OOM is reported before the mutator builds any nodes, and
@@ -121,8 +131,10 @@
  *     next attempt.
  * A handle keeps its turn across aborts (retry in place -- releasing would
  * forfeit the guaranteed turn) and releases it only on a terminal outcome
- * (commit, error, or a bail that ends the bracket); the last holder out
- * clears domain->active and the domain reverts to the optimistic regime.
+ * (commit, error, or a bail that ends the bracket); each departing holder
+ * clears domain->active just before its unlock and the incoming holder
+ * re-asserts it, so once the lane drains the domain reverts to the
+ * optimistic regime.
  *
  * RCU.  The bracket opens an RCU read-side section per attempt, and commit
  * uses the flavor's call_rcu, so include this header AFTER an RCU flavor
@@ -157,12 +169,15 @@ extern "C" {
  * domain's lock when its retry count reaches URCU_TXN_FALLBACK
  * (reactive: a starved op) or its write-set size reaches URCU_TXN_BIG
  * (proactive: a large op, e.g. a wide merge).  FALLBACK sits well above the
- * engine's single-edge URCU_MCAS_ESCALATE so ordinary contention rides the
- * optimistic path; BIG should sit above typical small-mutation edge counts so
- * only genuinely large transactions take the lane up front.
+ * engine's single-edge URCU_MCAS_ESCALATE (16) so ordinary contention rides the
+ * optimistic path: escalating too early funnels every contending writer into the
+ * one serial lane, which under a shared hot domain collapses both throughput and
+ * latency far worse than leaving the optimistic priority protocol to resolve it.
+ * BIG should sit above typical small-mutation edge counts so only genuinely large
+ * transactions take the lane up front.
  */
 #ifndef URCU_TXN_FALLBACK
-#define URCU_TXN_FALLBACK	64
+#define URCU_TXN_FALLBACK	256
 #endif
 #ifndef URCU_TXN_BIG
 #define URCU_TXN_BIG		128
@@ -296,7 +311,13 @@ void urcu_txn_read_unlock(struct urcu_mcas_txn *txn)
 /*
  * Take the domain's lock (blocks until we are the head) and publish that a
  * fallback episode is in progress, so future transactions funnel into the lane.
- * Caller must NOT hold the RCU read-side section: cds_fair_mutex_lock may block.
+ * Callable with or without the RCU read-side section held: cds_fair_mutex_lock
+ * may block, but the wait is bounded (a FIFO turn behind holders whose commits
+ * are bounded MCAS runs) and the lane owner never blocks on a grace period
+ * while holding the mutex, so holding the section across the wait cannot
+ * extend a grace period unboundedly.  The body comment details why reserve()
+ * deliberately enters while inside the bracket; begin() enters before opening
+ * it (nothing is pinned yet).
  */
 static inline
 void urcu_txn__enter_fallback(struct urcu_mcas_txn *txn)
@@ -322,14 +343,31 @@ void urcu_txn__enter_fallback(struct urcu_mcas_txn *txn)
 }
 
 /*
- * Release the lock; if we were the last holder, end the episode by
- * clearing domain->active so new transactions resume the optimistic path.
+ * Release the lock.  domain->active is cleared BEFORE the unlock; when we are
+ * the last holder the lane drains with the flag already down and the domain
+ * reverts to the optimistic path.
  */
 static inline
 void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
 {
-	if (cds_fair_mutex_unlock(&txn->domain->lock, &txn->waiter))
-		uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
+	/*
+	 * Clear the episode flag BEFORE releasing the lock.  Clearing after --
+	 * even gated on the unlock's "last holder" return -- races the next
+	 * holder: the actual lock release is the dequeue's tail-reset cmpxchg
+	 * INSIDE cds_fair_mutex_unlock(), so by the time it returns "last", a
+	 * new thread may have acquired the freed lock and stored active = 1;
+	 * our late 0 would then overwrite the new episode's advertisement, and
+	 * that whole episode would run unfunnelled -- no future transaction
+	 * takes the lane, so "closes the optimistic-writer set" silently fails
+	 * in exactly the starved case the lane exists for.  Clearing first
+	 * costs at worst a momentary 0 flicker on a mid-episode hand-off (the
+	 * incoming holder re-stores 1 right after lock() returns, see
+	 * urcu_txn__enter_fallback): a stale read mis-routes one bounded
+	 * attempt, which the advisory flag already tolerates (see
+	 * urcu_txn__want_fallback).
+	 */
+	uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
+	(void) cds_fair_mutex_unlock(&txn->domain->lock, &txn->waiter);
 	txn->in_fallback = 0;
 }
 
@@ -360,8 +398,10 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	/*
 	 * Escalate before opening the attempt: a starved (retry) or
 	 * already-known large (min_alloc) handle takes its FIFO turn here.
-	 * cds_fair_mutex_lock may block, so it must run outside the RCU read-side
-	 * section.
+	 * cds_fair_mutex_lock may block; nothing is pinned yet, so take the
+	 * turn before opening the read-side section (holding one across the
+	 * bounded wait would also be sound -- reserve() does; see
+	 * urcu_txn__enter_fallback).
 	 */
 	if (urcu_txn__want_fallback(txn))
 		urcu_txn__enter_fallback(txn);
@@ -468,7 +508,8 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
  * end), and it is the seam where the wait-free escalation lane would add read
  * validation: route in-bracket reads here, not through urcu_mcas_read(), so
  * that day is a one-line change.  A plain observer outside any transaction reads
- * with urcu_mcas_read() directly.
+ * with urcu_mcas_read() directly.  The returned value never reflects this
+ * attempt's own buffered stores (no read-your-own-writes).
  */
 static inline
 void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag)

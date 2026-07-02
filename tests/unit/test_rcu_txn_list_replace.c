@@ -103,7 +103,7 @@ int main(void)
 	urcu_txn_list_add_rcu(&A.node, &g_head);
 
 	/* 1. Replace B with Bp. */
-	r = urcu_txn_list_replace_rcu(&Bp.node, &B.node, &g_head);
+	r = urcu_txn_list_replace_rcu(&B.node, &Bp.node, &g_head);
 	ok(r == 0, "replace returns 0 (Bp took B's slot)");
 	ok(in_list(&Bp.node) && !in_list(&B.node),
 		"Bp is now in the list and B is not");
@@ -134,7 +134,7 @@ int main(void)
 
 	/* 6. Replacing an already-deleted node returns -ENOENT, links nothing. */
 	(void) urcu_txn_list_del_rcu(&A.node, &g_head);
-	r = urcu_txn_list_replace_rcu(&Ap.node, &A.node, &g_head);
+	r = urcu_txn_list_replace_rcu(&A.node, &Ap.node, &g_head);
 	ok(r == -ENOENT && !in_list(&Ap.node),
 		"replacing a deleted node returns -ENOENT and links nothing");
 

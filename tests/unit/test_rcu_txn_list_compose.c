@@ -157,8 +157,8 @@ static int compose_replace(struct leaf *nw, struct leaf *old)
 		int a, b;
 
 		urcu_txn_begin(&tx);
-		a = urcu_txn_list_replace_prepare(&tx, &nw->hx, &old->hx);
-		b = urcu_txn_list_replace_prepare(&tx, &nw->hy, &old->hy);
+		a = urcu_txn_list_replace_prepare(&tx, &old->hx, &nw->hx);
+		b = urcu_txn_list_replace_prepare(&tx, &old->hy, &nw->hy);
 		if (a == -EAGAIN || b == -EAGAIN) {	/* a neighbour moved: retry */
 			urcu_txn_conflict(&tx);	/* age so a hot slot escalates */
 			urcu_txn_end(&tx);

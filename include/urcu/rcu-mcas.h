@@ -47,12 +47,18 @@
  * Settle is owner-driven, with one exception.  A helper drives a foreign
  * transaction's *install* forward (so a stalled writer never blocks others); the
  * bulk settle that rewrites a transaction's parked records back to plain values
- * is the owner's, in commit().  The one exception is the INSTALLER-SELF-SETTLE
- * (urcu_mcas_plant()): a driver that has just planted a record under its
- * install latch, and reads the transaction already terminal, converts THAT one
- * proxy immediately -- it must not leave a record it planted post-linearization
- * to linger past the owner's reclaim.  This is still a settle of the planter's
- * own (just-installed) record, never of a foreign one, and it only fires once the
+ * is the owner's, in commit().  The owner's settle also CLAIMS each record's
+ * install word (FREE -> DONE) before converting its slot, so once settle returns
+ * no plant can begin at all -- that claim, not the plant-side checks, is what
+ * makes the post-settle reclaim safe against a stale FIRST install of a record
+ * nobody had planted yet (see urcu_mcas_settle()).  The one exception to
+ * owner-driven settling is the INSTALLER-SELF-SETTLE (urcu_mcas_plant()): a
+ * driver that has just planted a record under its install latch, and reads the
+ * transaction already terminal, converts THAT one proxy immediately -- before
+ * releasing the latch to DONE -- so the owner's settle, spinning out the BUSY
+ * window, finds the slot already plain and a post-decision plant never outlives
+ * it.  This is still a settle of the planter's own (just-installed) record,
+ * never of a foreign one, and it only fires once the
  * transaction is terminal.  A terminal descriptor otherwise lingers in its slots
  * until the owner reclaims it; readers and contenders resolve it through the
  * status word in the meantime.
@@ -109,8 +115,12 @@
  * urcu_mcas_plant(), which claims the word (FREE->BUSY) so {install-once, plant
  * CAS, self-settle} are atomic in one word.  A stale second install is
  * gated by the DONE state, not by the slot value, so the recurred value is
- * irrelevant; the self-settle closes the matching install-vs-settle ordering
- * hole.  What the engine DOES still require is unrelated to slot values: tag bit 0
+ * irrelevant; and the owner's settle claims every record's install word
+ * (FREE->DONE) before the descriptor is reclaimed, so a stale FIRST install of a
+ * never-planted record is gated the same way -- after settle, no plant of any
+ * kind can republish the descriptor (see urcu_mcas_settle()); the self-settle
+ * keeps a post-decision plant from lingering until settle reaches it.  What the
+ * engine DOES still require is unrelated to slot values: tag bit 0
  * free, pairwise-distinct slots per txn, and -- the EXISTENCE model -- that a
  * descriptor reachable through a slot is reclaimed only after a grace period (a
  * helper/reader may dereference it).  Note this is value-CAS atomicity: a record
@@ -131,6 +141,7 @@
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head */
 #include <urcu/arch.h>			/* caa_cpu_relax */
+#include <urcu/rcu-txn-slab.h>		/* shared per-CPU size-classed descriptor slab */
 
 #ifdef __cplusplus
 extern "C" {
@@ -175,12 +186,15 @@ extern "C" {
  * count, across arbitrarily many preemptions of its owner) -- categorically
  * unlike the install-latch spin, whose few-instruction window rseq time-slice
  * extension can cover; TSE does nothing for a whole-transaction-length wait.
- * Instead the capped helper ESCALATES: it aborts its own transaction (FAILED) and
- * lets the caller retry with a higher aging-priority.  Once the retrying
+ * Instead the capped helper ESCALATES: it CASes FAILED on the transaction it is
+ * currently driving -- its own at depth 0; at deeper levels the intermediate
+ * FOREIGN transaction it was helping (whose owner simply retries).  The abort
+ * unwinds the descent, and an aborted own transaction retries with a higher
+ * aging-priority; once the retrying
  * transaction out-retries the blocker it outranks it and evicts rather than helps,
  * so progress comes from the transaction's own escalation -- never from the
  * blocker's owner being scheduled.  Sound because the globally highest-priority
- * transaction never recurses (it always evicts), and a transaction may always
+ * transaction never recurses (it always evicts), and ANY UNDECIDED transaction may
  * spuriously abort; helping is a latency optimization, not a progress requirement.
  */
 #ifndef URCU_MCAS_HELP_MAX_DEPTH
@@ -215,12 +229,17 @@ struct urcu_mcas_record {
 	 * CAS, self-settle} atomic without a separate flag or lock library:
 	 *
 	 *     FREE --(try-CAS)--> BUSY --(plant)--> DONE
+	 *     FREE --(settle claim)--------------> DONE
 	 *
 	 * The FREE->BUSY CAS is the install lock; DONE is the install-once gate.  It
-	 * guards EXACTLY this record's install, NOT the slot: every op that REMOVES or
-	 * CONVERTS a parked proxy -- the regular settle, the installer self-settle, and
-	 * a thief's steal that displaces the victim's proxy -- is a plain CAS that
-	 * touches no install word.  Because the word is per-RECORD, two records sharing
+	 * guards EXACTLY this record's install, NOT the slot: the ops that REMOVE or
+	 * CONVERT a parked proxy -- the installer self-settle and a thief's steal
+	 * that displaces the victim's proxy -- are plain CASes that touch no install
+	 * word.  The owner's settle is the exception: before converting each slot it
+	 * CLAIMS that record's word (FREE -> DONE, second arc above), so once settle
+	 * returns no plant -- even a stale FIRST install of a never-planted record --
+	 * can begin and republish a retired descriptor (see urcu_mcas_settle()).
+	 * Because the word is per-RECORD, two records sharing
 	 * one slot (a thief's r and its victim's fr) transition it via DIFFERENT words
 	 * and so always resolve by CAS.  A thread owns at most one install (BUSY) at a
 	 * time and never blocks while owning it -- no hold-and-wait, no lock order.
@@ -232,7 +251,7 @@ struct urcu_mcas_record {
 enum {
 	URCU_MCAS_INSTALL_FREE = 0,	/* installable; a FREE->BUSY CAS claims it */
 	URCU_MCAS_INSTALL_BUSY = 1,	/* a driver owns the install (try-lock held) */
-	URCU_MCAS_INSTALL_DONE = 2,	/* planted (the install-once gate) */
+	URCU_MCAS_INSTALL_DONE = 2,	/* planted, or claimed by settle (the install-once gate) */
 };
 #define urcu_mcas_latch_init(r)	\
 	uatomic_store(&(r)->state, URCU_MCAS_INSTALL_FREE, CMM_RELAXED)
@@ -266,6 +285,14 @@ struct urcu_mcas {
 	unsigned int nr;
 	unsigned int cap;
 	unsigned int poisoned;		/* set if a same-slot reconcile disagreed on old */
+	unsigned int slab;		/* block origin: per-CPU slab (1) or exact
+					 * posix_memalign (0).  Stamped at alloc and
+					 * consulted by free -- self-describing, so a
+					 * descriptor allocated while the slab was still
+					 * uninitialized (constructor ordering) or disabled
+					 * is freed on the right path even if the slab
+					 * enables in between.  Occupies what was padding:
+					 * recs[] stays 16-byte aligned (asserted below). */
 	struct urcu_mcas_record recs[];	/* frozen + slot-sorted at commit */
 };
 
@@ -394,21 +421,26 @@ void *urcu_mcas_resolve(void *v, uintptr_t tag)
 /*
  * Plant transaction @t's record @r: claim @r's install word (FREE->BUSY), CAS
  * @r's slot from @expect (r->old_ptr for a plain install, the victim's parked
- * proxy for a steal) to the record's tagged proxy, then publish DONE.  The
- * regular settle and a later steal of THIS proxy are plain CASes that take no
- * install word.
+ * proxy for a steal) to the record's tagged proxy, then publish DONE.  A later
+ * steal of THIS proxy is a plain CAS that takes no install word; the owner's
+ * settle CLAIMS the word (FREE->DONE) before its own slot CAS, so plant and
+ * settle serialize on the word, never on the slot value.
  *
  * The install word makes {install-once, plant CAS, self-settle} atomic, which is
  * exactly what closes the re-plant use-after-free a value-CAS alone cannot (the
  * slot value can A-B-A back to r->old_ptr after @t linearizes, so the CAS's own
  * comparison cannot tell a first install from a stale second one):
  *
- *   1. install-once -- DONE means installed; a stale driver's FREE->BUSY fails,
- *      so any A-B-A of the slot VALUE is inert (the word, not the value, gates).
+ *   1. install-once -- DONE means installed OR settle-claimed; a stale driver's
+ *      FREE->BUSY fails, so any A-B-A of the slot VALUE is inert (the word, not
+ *      the value, gates), and no plant at all can begin once @t's settle has
+ *      claimed the word (a stale FIRST install lands here too).
  *   2. the single plant CAS, owned exclusively while BUSY.
  *   3. installer-self-settle -- read @t's status AFTER the plant; if @t is
- *      already terminal, convert our just-planted proxy now so it cannot linger
- *      past @t's reclaim (the install-vs-settle hole).  The status read ordered
+ *      already terminal, convert our just-planted proxy now, before releasing
+ *      the word to DONE, so the owner's settle (which spins out our BUSY window
+ *      before claiming) finds the slot already plain -- a post-decision plant
+ *      never outlives urcu_mcas_settle().  The status read ordered
  *      after the full-barrier plant makes the owner's unconditional settle in
  *      commit() the backstop for the UNDECIDED case.
  *
@@ -425,8 +457,9 @@ int urcu_mcas_plant(struct urcu_mcas *t,
 	void *tagv = urcu_mcas_tag(r, r->proxy_tag);
 
 	/*
-	 * Test knob: a bare value-CAS with no install-once gate and no self-settle --
-	 * the original A-B-A-unsafe behaviour the install word closes.  For the
+	 * Test knob: a bare value-CAS with no install-once gate, no self-settle,
+	 * and no settle-time claim (urcu_mcas_settle) -- the original A-B-A-unsafe
+	 * behaviour the install word closes.  For the
 	 * regression tests (build -DURCU_MCAS_NO_ABA_FIX); never in production.
 	 */
 	(void) t;
@@ -462,7 +495,9 @@ int urcu_mcas_plant(struct urcu_mcas *t,
 	if (uatomic_cmpxchg(r->slot, expect, tagv) == expect) {
 		/*
 		 * Self-settle: status read ordered AFTER the full-barrier plant, so a
-		 * proxy we plant after @t linearized cannot linger past its reclaim.
+		 * proxy we plant after @t linearized is converted before we release
+		 * DONE -- the owner's settle, claiming this word, then finds the slot
+		 * already plain.
 		 */
 		unsigned long st = urcu_mcas_status(t);
 
@@ -640,16 +675,36 @@ void urcu_mcas_drive_install(struct urcu_mcas *t)
 
 /*
  * Settle phase (owner, in commit()): make @t's own slots plain -- its new value
- * on SUCCEEDED, its old on FAILED.  Called once @t is terminal.  A slot a
- * higher-priority transaction already stole holds that thief's proxy, or one an
- * installer already self-settled holds the plain value, so those CASes just fail
- * and are ignored; once settle returns, no slot still names a record of @t, so
- * the descriptor can be reclaimed.  Runs WITHOUT the install latch -- it only
- * removes/converts proxies (a lock-free CAS handoff), never installs -- and is
- * idempotent.  It is the BACKSTOP for the install-vs-settle order: any record an
- * installer planted while @t was still UNDECIDED (so it did NOT self-settle) is
- * converted here, and the installer's status-read-after-plant (urcu_mcas_plant)
- * is what orders that plant before this settle.
+ * on SUCCEEDED, its old on FAILED.  Called once @t is terminal.
+ *
+ * Per record, settle first CLAIMS the install word (FREE -> DONE), then converts
+ * the slot.  The claim is what makes the reclaim contract unconditional: after
+ * settle returns, every record's install word is DONE, so NO plant can begin --
+ * in particular a stale FIRST install by a driver that read @t UNDECIDED, loaded
+ * the slot, stalled, and resumed after @t was evicted and settled.  Such a plant
+ * fails its FREE->BUSY CAS against DONE and returns "already installed" without
+ * touching the slot.  Without the claim, that stale plant would transiently
+ * REPUBLISH a proxy of the already-retired @t (its self-settle removes it again,
+ * but not atomically with the plant), and a reader whose read-side section began
+ * after the owner's call_rcu() -- one the grace period does not wait for --
+ * could resolve that proxy and dereference @t after the GP ends: use-after-free.
+ * The install-once gate alone cannot close this: it stops a stale SECOND install
+ * of a planted record, but a never-planted record's word is still FREE.  The
+ * claim turns "no proxy lingers" into "no proxy can appear at all", which is
+ * what reclaim needs -- once settle returns, no slot names a record of @t and
+ * none ever will again, so the descriptor can be reclaimed.
+ *
+ * A record caught BUSY (a planter between its FREE->BUSY and its DONE store) is
+ * spun out -- the same bounded few-instruction window the install latch already
+ * tolerates in urcu_mcas_plant().  That planter either fails its slot CAS and
+ * releases FREE (settle then claims it), or plants and -- @t being terminal --
+ * self-settles before storing DONE, so the slot is already plain when settle's
+ * own slot CAS runs (it just fails, ignored).  A slot a higher-priority
+ * transaction already stole holds that thief's proxy; that CAS fails and is
+ * ignored too.  Claiming FREE->DONE cannot forge a bogus commit: the final
+ * UNDECIDED->SUCCEEDED CAS in drive_install fails because @t is already
+ * terminal whenever settle runs.  Settle is idempotent and owner-only; it
+ * never waits while holding a latch (the claim IS the terminal state).
  */
 static inline
 void urcu_mcas_settle(struct urcu_mcas *t)
@@ -661,6 +716,24 @@ void urcu_mcas_settle(struct urcu_mcas *t)
 		struct urcu_mcas_record *r = &t->recs[i];
 		void *want = (st == URCU_MCAS_SUCCEEDED) ? r->new_ptr : r->old_ptr;
 
+#ifndef URCU_MCAS_NO_ABA_FIX
+		/*
+		 * Claim r's install word (FREE -> DONE) so no plant can begin
+		 * once settle returns (see above), spinning out a planter's
+		 * bounded BUSY window.
+		 */
+		for (;;) {
+			int v = uatomic_cmpxchg(&r->state,
+					URCU_MCAS_INSTALL_FREE,
+					URCU_MCAS_INSTALL_DONE);
+
+			if (v != URCU_MCAS_INSTALL_BUSY)
+				break;		/* claimed FREE, or already DONE */
+			while (uatomic_load(&r->state, CMM_RELAXED) ==
+					URCU_MCAS_INSTALL_BUSY)
+				caa_cpu_relax();
+		}
+#endif
 		(void) uatomic_cmpxchg(r->slot, urcu_mcas_tag(r, r->proxy_tag), want);
 	}
 }
@@ -698,7 +771,8 @@ void *urcu_mcas_read(void **slot, uintptr_t tag)
  * 16-byte aligned for every inline record to keep its low 4 bits free (see the
  * layout note above struct urcu_mcas).  posix_memalign guarantees that
  * portably; plain malloc would only promise max_align_t (8 on some 32-bit
- * ABIs).  Returns NULL on OOM.
+ * ABIs).  Returns NULL on OOM.  The caller stamps the descriptor's identity
+ * fields -- cap and the slab-origin flag -- as urcu_mcas_alloc_cap() does.
  */
 static inline
 struct urcu_mcas *urcu_mcas_alloc(size_t size)
@@ -708,6 +782,102 @@ struct urcu_mcas *urcu_mcas_alloc(size_t size)
 	if (posix_memalign(&p, 16, size))
 		return NULL;
 	return (struct urcu_mcas *) p;
+}
+
+/*
+ * ─────────────────────────────────────────────────────────────────────────
+ * Per-CPU descriptor slab.
+ *
+ * The per-attempt descriptor (header + inline recs[]) is served from the shared
+ * per-CPU size-classed slab in <urcu/rcu-txn-slab.h>.  Record-count classes
+ * {4,8,16,32,64,128} map to byte sizes urcu_mcas_blocksize(cap); a request over
+ * the top class is an exact, uncached posix_memalign.  Every descriptor is
+ * STAMPED at allocation with its origin (urcu_mcas.slab) and free consults
+ * that stamp, so a block is always freed on the path that allocated it --
+ * including one allocated before the slab's constructor ran or while it was
+ * disabled.  See rcu-txn-slab.h for the arena / superblock / wfstack mechanics
+ * and the growth bound.  URCU_TXN_NO_CACHE
+ * disables it (falls back to posix_memalign/free).
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+#define urcu_mcas_blocksize(cap)	\
+	(sizeof(struct urcu_mcas) + (size_t) (cap) * sizeof(struct urcu_mcas_record))
+
+static const unsigned int urcu_mcas_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
+#define URCU_MCAS_SLAB_NCLASS	\
+	((int) (sizeof(urcu_mcas_slab_rc) / sizeof(urcu_mcas_slab_rc[0])))
+
+/*
+ * The slab INSTANCE lives once, in liburcu-common (src/urcu-txn.c), which also
+ * initializes it from a library constructor -- so this header requires linking
+ * liburcu-common.  A header-static definition here would hand every including
+ * TU its own arenas and superblocks: cross-TU frees would still be safe (the
+ * origin arena is found from the superblock header), but the freelists would
+ * never share and the footprint would multiply per allocating TU.  The single
+ * library constructor also runs at liburcu-common init time -- before the
+ * initializers of anything that depends on the shared library -- narrowing the
+ * window where a constructor-context transaction could precede slab init.
+ */
+extern struct urcu_slab urcu_mcas_slab;
+
+/* Smallest record-count class that fits @req records, or -1 if over the top. */
+static inline
+int urcu_mcas_slab_class_of(unsigned int req)
+{
+	int i;
+
+	for (i = 0; i < URCU_MCAS_SLAB_NCLASS; i++)
+		if (req <= urcu_mcas_slab_rc[i])
+			return i;
+	return -1;
+}
+
+/*
+ * Allocate a descriptor with room for >= @req records, setting its PHYSICAL
+ * cap and stamping its origin (t->slab, the free discriminator).  A request
+ * that fits a size class comes from the per-CPU slab (physical cap == the
+ * class size); a larger one -- or any request while the slab is uninitialized
+ * or disabled -- is an exact, uncached posix_memalign.
+ */
+static inline
+struct urcu_mcas *urcu_mcas_alloc_cap(unsigned int req)
+{
+	struct urcu_mcas *t;
+	int cl;
+
+	if (urcu_slab_enabled(&urcu_mcas_slab) && (cl = urcu_mcas_slab_class_of(req)) >= 0) {
+		t = (struct urcu_mcas *) urcu_slab_alloc(&urcu_mcas_slab, cl);
+		if (caa_likely(t != NULL)) {
+			t->cap = urcu_mcas_slab_rc[cl];
+			t->slab = 1;
+		}
+	} else {
+		t = urcu_mcas_alloc(urcu_mcas_blocksize(req));
+		if (caa_likely(t != NULL)) {
+			t->cap = req;
+			t->slab = 0;
+		}
+	}
+	return t;
+}
+
+/*
+ * Free a descriptor on the path that allocated it (the t->slab stamp): a slab
+ * block returns to its ORIGIN
+ * arena regardless of which thread frees it (origin found from the superblock
+ * header), so writer-context and reclaim-worker frees are identical -- no
+ * local/remote split.  An exact (uncached) block goes back to malloc.  The
+ * stamp -- not the slab's current enabled state -- decides, so a block
+ * allocated before the slab constructor ran is never misrouted to
+ * urcu_slab_free() after the slab enables.
+ */
+static inline
+void urcu_mcas_free_local(struct urcu_mcas *t)
+{
+	if (t->slab)
+		urcu_slab_free(t);
+	else
+		free(t);
 }
 
 /*
@@ -723,14 +893,13 @@ struct urcu_mcas *urcu_mcas_create(unsigned int cap,
 {
 	struct urcu_mcas *t;
 
-	t = urcu_mcas_alloc(sizeof(*t) +
-			(size_t) cap * sizeof(struct urcu_mcas_record));
+	t = urcu_mcas_alloc_cap(cap);
 	if (!t)
 		return NULL;
 	t->status = URCU_MCAS_UNDECIDED;
 	t->retry = retry;
 	t->nr = 0;
-	t->cap = cap;
+	/* t->cap set to the physical capacity by urcu_mcas_alloc_cap() */
 	t->poisoned = 0;
 	return t;
 }
@@ -768,8 +937,10 @@ bool urcu_mcas_add(struct urcu_mcas *t, void **slot,
  * torn-read txn).  A disagreement is NOT silently merged: it POISONS the
  * descriptor so commit() aborts the attempt (the caller re-reads consistently
  * and retries) -- merging would otherwise forge a record whose old no longer
- * matches the intended write and commit a corrupt edge under -DNDEBUG (where the
- * debug assert below is gone).  @upgrade picks new_ptr -- a store advances it to
+ * matches the intended write and commit a corrupt edge.  Note the disagreement
+ * is a LEGAL race, not an embedder bug: a peer may commit between two reads of
+ * the same slot in one attempt, so poison-and-retry is the only correct
+ * response (no assert).  @upgrade picks new_ptr -- a store advances it to
  * @new_ptr, a load-validate leaves a pending write intact.  Returns false only
  * when a new record is needed and the descriptor is full; the caller grows and
  * retries.
@@ -784,7 +955,12 @@ bool urcu_mcas_record(struct urcu_mcas *t, void **slot,
 		if (t->recs[i].slot != slot)
 			continue;
 		if (caa_unlikely(t->recs[i].old_ptr != old_ptr)) {
-			urcu_assert_debug(t->recs[i].old_ptr == old_ptr);
+			/*
+			 * Legal race (a peer committed between two reads of
+			 * this slot), so no assert: aborting the process on a
+			 * nondeterministic interleaving would make a
+			 * survivable conflict fatal.
+			 */
 			t->poisoned = 1;	/* torn read-set: commit will abort */
 			return true;
 		}
@@ -810,30 +986,33 @@ static inline
 struct urcu_mcas *urcu_mcas_grow(struct urcu_mcas *t)
 {
 	unsigned int newcap = t->cap < 2 ? 2 : t->cap * 2;
+	unsigned int ncap, nslab;
 	struct urcu_mcas *n;
 
-	n = urcu_mcas_alloc(sizeof(*t) +
-			(size_t) newcap * sizeof(struct urcu_mcas_record));
+	n = urcu_mcas_alloc_cap(newcap);
 	if (!n)
 		return NULL;
+	ncap = n->cap;				/* the new block's identity, set by alloc_cap ... */
+	nslab = n->slab;
 	memcpy(n, t, sizeof(*t) +
 			(size_t) t->nr * sizeof(struct urcu_mcas_record));
-	n->cap = newcap;
-	free(t);
+	n->cap = ncap;				/* ... which the header memcpy clobbered */
+	n->slab = nslab;
+	urcu_mcas_free_local(t);		/* pre-commit: writer-context free */
 	return n;
 }
 
 static inline
 void urcu_mcas_destroy(struct urcu_mcas *t)
 {
-	free(t);
+	urcu_mcas_free_local(t);
 }
 
 /* call_rcu callback: deferred destroy. */
 static inline
 void urcu_mcas_free_rcu(struct rcu_head *head)
 {
-	urcu_mcas_destroy(caa_container_of(head,
+	urcu_mcas_free_local(caa_container_of(head,
 			struct urcu_mcas, rcu_head));
 }
 

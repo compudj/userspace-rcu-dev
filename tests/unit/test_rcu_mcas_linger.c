@@ -33,6 +33,12 @@
  *
  * Build -DURCU_MCAS_NO_ABA_FIX to drop the self-settle (and the install-once
  * gate) and watch S retain a dangling proxy -- the regression this catches.
+ *
+ * Note: since urcu_mcas_settle() learned to CLAIM each record's install word,
+ * this scenario's late plant is refused outright (word already DONE), which
+ * satisfies the "no lingering proxy" assertion a fortiori; the self-settle
+ * still covers a plant that completes before settle reaches its record.  The
+ * companion test_rcu_mcas_republish.c asserts the claim itself.
  */
 
 #ifndef _GNU_SOURCE
