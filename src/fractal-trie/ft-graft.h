@@ -823,11 +823,12 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * are still pristine (the swap is the op's sole reader-visible
 		 * change, so this is the abort boundary).  The dual always flips
 		 * both roots, so it is always multi-edge even list-off -- it cannot
-		 * reduce to a lone store.  OOM here aborts cleanly (free the fresh
-		 * root, both tries untouched).
+		 * reduce to a lone store.  +1 edge for the dst old-root freeze-on-
+		 * free tombstone fused into the same swap (atomic detach, §4.B).
+		 * OOM here aborts cleanly (free the fresh root, both tries untouched).
 		 */
 		struct ft_flip_txn *dual_txn = ft_flip_txn_create_bounded(
-			FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES);
+			FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
 
 		if (!dual_txn) {
 			free_cds_ft_node_unpublished(dst_ft, fresh_root);
@@ -895,12 +896,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 
 			/*
 			 * Freeze-on-free (doc §4.B): the dst old root this swap
-			 * retires gets its one-way tombstone before the swap unlinks
-			 * it (src_root MOVES to dst, fresh_root is the new src root --
-			 * neither is freed here; only @old_dst_root == @dst_old is).
+			 * retires gets its one-way tombstone recorded INTO dual_txn,
+			 * so the mark and the root-swap unlink flip atomically (atomic
+			 * detach).  src_root MOVES to dst, fresh_root is the new src
+			 * root -- neither is freed here; only @old_dst_root == @dst_old.
 			 */
-			ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
-				ft_node_ptr(dst_old)));
+			ft_flip_txn_record_tombstone(dual_txn,
+				cds_ft_item_to_metadata(ft_node_ptr(dst_old)));
 			ft_root_list_swap_publish_dual(dual_txn, &appear,
 				&disappear);
 		}
