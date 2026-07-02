@@ -110,6 +110,10 @@
 #include <urcu/rcu-txn-status.h>	/* enum urcu_txn_status */
 #include <urcu/rcu-txn-slab.h>		/* shared per-CPU size-classed descriptor slab */
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * Shared selector for a flip group.  selector == 0 -> proxies resolve to
  * old_ptr; selector == 1 -> new_ptr.  Written once (0 -> 1) with release
@@ -197,7 +201,12 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * does internally), so record() must precede commit().  This is the same
  * frozen-set contract as the concurrent engine (<urcu/rcu-mcas.h>), so
  * a single-writer embedder can later migrate to concurrent writers without
- * restructuring its mutations.
+ * restructuring its mutations.  Two more contracts shared with that engine:
+ * records must target PAIRWISE-DISTINCT slots -- unlike the concurrent
+ * front-end, record() performs no same-slot reconcile, so a duplicate would
+ * park two proxies on one slot and settle both in record order, silently
+ * last-wins (a debug build asserts against it at install) -- and nothing
+ * observes buffered writes (there are no transactional loads at all).
  *
  * commit() publishes the whole set atomically: it parks every recorded latch's
  * tagged proxy (readers still resolve to old; selector == 0), flips the group
@@ -432,9 +441,14 @@ void urcu_txn_sw__block_free(struct urcu_txn_sw_block *blk)
  * so cannot fail.  This trades the design's "fail-and-destroy replaces the count
  * pass" for a single up-front alloc, which is the right call for a bounded txn
  * whose records are interleaved through a build that does not otherwise thread
- * an OOM return.  Call once, right after init, before any record.  Returns
+ * an OOM return.  Call after init, before any install; a handle already
+ * buffering (an earlier reserve or record) grows to fit @cap, mirroring the
+ * concurrent front-end's urcu_txn_reserve().  Returns
  * false on OOM; the failure is sticky (URCU_TXN_SW_OOM), so the caller may
- * ignore this return and let commit() report MEMORY_ERROR.
+ * ignore this return and let commit() report MEMORY_ERROR.  The one non-OOM,
+ * NON-sticky false: asking a caller-storage (init_inline) handle for more than
+ * its fixed buffer -- that is an embedder sizing bug, not a memory failure, and
+ * caller storage can neither grow nor be adopted by the engine.
  */
 static inline
 bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
@@ -443,8 +457,32 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;			/* sticky: an earlier alloc failed */
-	if (t->latches)
-		return cap <= t->cap;		/* already sized (heap block or inline buf) */
+	if (t->latches) {
+		if (cap <= t->cap)
+			return true;		/* already sized (heap block or inline buf) */
+		if (t->latches_inline) {
+			/* Fixed caller storage: a sizing bug, not an OOM. */
+			urcu_assert_debug(!t->latches_inline);
+			return false;
+		}
+		/*
+		 * Already buffering: grow to fit @cap.  No proxy is live in
+		 * PREPARE, so the array may move (same rationale as record()'s
+		 * grow); copy the buffered records into a fresh aligned block.
+		 */
+		blk = urcu_txn_sw__block_alloc(cap);
+		if (!blk) {
+			t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
+			return false;
+		}
+		memcpy(blk->latches, t->latches,
+				(size_t) t->nr * sizeof(*blk->latches));
+		urcu_txn_sw__block_free(t->block);
+		t->block = blk;
+		t->latches = blk->latches;
+		t->cap = blk->cap;
+		return true;
+	}
 	if (cap < URCU_TXN_SW_CAP)
 		cap = URCU_TXN_SW_CAP;
 	blk = urcu_txn_sw__block_alloc(cap);
@@ -511,7 +549,11 @@ void urcu_txn_sw_latch_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_lat
  * proxy and route resolution -- e.g. the fractal trie's 0xF type code or a
  * list's bit-0).  PREPARE only -- the record set is frozen
  * once proxies are installed, so this must run before commit() (record() after a
- * commit/install is a usage error).  Returns false on OOM (the only failure);
+ * commit/install is a usage error).  Records must target pairwise-distinct
+ * slots: record() appends blindly -- no same-slot reconcile -- so recording one
+ * slot twice parks two proxies on it and settles both in record order,
+ * silently last-wins (install asserts against it in a debug build).  Returns
+ * false on OOM (the only failure);
  * the failure is sticky (URCU_TXN_SW_OOM), so the caller may ignore this
  * return and let commit() report MEMORY_ERROR.  The record array realloc-grows
  * on demand and nothing is installed here (no proxy address is live until commit
@@ -578,6 +620,20 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 		}
 		t->latches = t->block->latches;
 		t->cap = t->block->cap;
+	}
+	/*
+	 * Engine precondition: records target pairwise-distinct slots.  record()
+	 * has no same-slot reconcile, so a duplicate parks two proxies on one
+	 * slot and settles both in record order -- silently last-wins.  The
+	 * record array is unsorted (record order is the embedder's), so pair-scan
+	 * mirroring the concurrent engine's adjacent check after its sort.
+	 * Debug-only: no cost under NDEBUG, and sw transactions are small.
+	 */
+	for (i = 1; i < t->nr; i++) {
+		unsigned int j;
+
+		for (j = 0; j < i; j++)
+			urcu_assert_debug(t->latches[i].slot != t->latches[j].slot);
 	}
 	t->state = URCU_TXN_SW_INSTALLED;
 	for (i = 0; i < t->nr; i++)
@@ -689,5 +745,9 @@ enum urcu_txn_status urcu_txn_sw_commit(struct urcu_txn_sw_txn *t)
 {
 	return urcu_txn_sw_commit_flavor(t, call_rcu);
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _URCU_RCU_TXN_SW_H */
