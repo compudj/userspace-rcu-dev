@@ -1632,7 +1632,7 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
  * point of no return.  NULL keeps the transitional self-allocating flip (bare-
  * store fallback) for callers not yet migrated.
  */
-#define FT_REMOVE_COMMIT_REC_MAX_EDGES	7	/* <=3 structural (+back-edge) + <=4 cell/run */
+#define FT_REMOVE_COMMIT_REC_MAX_EDGES	8	/* <=3 structural (+back-edge) + <=4 cell/run + 1 DEL-recompact tombstone */
 static
 void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
 		struct ft_ord_cell *dead_cell, struct ft_detach_run *run,

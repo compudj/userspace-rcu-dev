@@ -1051,6 +1051,18 @@ int ft_detach_node(struct cds_ft *ft,
 			 * walk is read-only).  Whichever commit fires consumes the txn; if
 			 * none does (e.g. an n==1 publish, or replace_ptr failed) it is
 			 * freed unused at @end.
+			 *
+			 * @commit_txn is also the retire txn for a DEL recompaction: when the
+			 * boundary shrinks, ft_node_replace_ptr's recompact records the old
+			 * copy's freeze-on-free tombstone INTO @commit_txn, so it flips
+			 * atomically with the forward republish this same txn commits below
+			 * (atomic detach, §4.B) rather than as an early standalone flip.  A
+			 * key-disappearing remove on an ordered-list trie always unsplices a
+			 * cell (fuse_cell), so @commit_txn is always reserved and every DEL
+			 * recompaction retire fuses; only a list-off shrink under a
+			 * non-compressed parent with no run leaves @commit_txn NULL, where the
+			 * recompact falls back to the standalone tombstone flip (still safe:
+			 * one writer, and the freeze is a no-op until the multi-writer engine).
 			 */
 			if (fuse_cell || run ||
 			    (bparent && (ft_node_compressed(bparent) ||
@@ -1069,7 +1081,7 @@ int ft_detach_node(struct cds_ft *ft,
 				metadata_stack[nr_branch - 1],
 				n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 				detach_parent_flag_ptr == &ft->root,
-				cur_depth, pub, NULL);
+				cur_depth, pub, commit_txn);
 		}
 		if (!ret) {
 			/*
