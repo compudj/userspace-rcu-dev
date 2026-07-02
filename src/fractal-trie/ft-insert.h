@@ -1195,7 +1195,7 @@ int ft_attach_node(struct cds_ft *ft,
 			if (!old_node_flag) {
 				ret = ft_node_set_nth_rec(ft, &iter_dest_node_flag,
 					key_value, NULL, &old_recompacted_node,
-					metadata, level - 1, false, &rec, NULL);
+					metadata, level - 1, false, &rec, ic->txn);
 				if (ret) {
 					dbg_printf("branch publish error %d\n", ret);
 					goto check_error;
