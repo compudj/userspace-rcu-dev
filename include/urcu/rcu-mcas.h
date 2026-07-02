@@ -938,8 +938,10 @@ bool urcu_mcas_add(struct urcu_mcas *t, void **slot,
  * torn-read txn).  A disagreement is NOT silently merged: it POISONS the
  * descriptor so commit() aborts the attempt (the caller re-reads consistently
  * and retries) -- merging would otherwise forge a record whose old no longer
- * matches the intended write and commit a corrupt edge under -DNDEBUG (where the
- * debug assert below is gone).  @upgrade picks new_ptr -- a store advances it to
+ * matches the intended write and commit a corrupt edge.  Note the disagreement
+ * is a LEGAL race, not an embedder bug: a peer may commit between two reads of
+ * the same slot in one attempt, so poison-and-retry is the only correct
+ * response (no assert).  @upgrade picks new_ptr -- a store advances it to
  * @new_ptr, a load-validate leaves a pending write intact.  Returns false only
  * when a new record is needed and the descriptor is full; the caller grows and
  * retries.
@@ -954,7 +956,12 @@ bool urcu_mcas_record(struct urcu_mcas *t, void **slot,
 		if (t->recs[i].slot != slot)
 			continue;
 		if (caa_unlikely(t->recs[i].old_ptr != old_ptr)) {
-			urcu_assert_debug(t->recs[i].old_ptr == old_ptr);
+			/*
+			 * Legal race (a peer committed between two reads of
+			 * this slot), so no assert: aborting the process on a
+			 * nondeterministic interleaving would make a
+			 * survivable conflict fatal.
+			 */
 			t->poisoned = 1;	/* torn read-set: commit will abort */
 			return true;
 		}
