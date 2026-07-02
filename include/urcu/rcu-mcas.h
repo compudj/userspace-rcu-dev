@@ -872,7 +872,7 @@ struct urcu_mcas *urcu_mcas_alloc_cap(unsigned int req)
  * urcu_slab_free() after the slab enables.
  */
 static inline
-void urcu_mcas_free_local(struct urcu_mcas *t)
+void urcu_mcas_free(struct urcu_mcas *t)
 {
 	if (t->slab)
 		urcu_slab_free(t);
@@ -998,21 +998,21 @@ struct urcu_mcas *urcu_mcas_grow(struct urcu_mcas *t)
 			(size_t) t->nr * sizeof(struct urcu_mcas_record));
 	n->cap = ncap;				/* ... which the header memcpy clobbered */
 	n->slab = nslab;
-	urcu_mcas_free_local(t);		/* pre-commit: writer-context free */
+	urcu_mcas_free(t);			/* pre-commit: writer-context free */
 	return n;
 }
 
 static inline
 void urcu_mcas_destroy(struct urcu_mcas *t)
 {
-	urcu_mcas_free_local(t);
+	urcu_mcas_free(t);
 }
 
 /* call_rcu callback: deferred destroy. */
 static inline
 void urcu_mcas_free_rcu(struct rcu_head *head)
 {
-	urcu_mcas_free_local(caa_container_of(head,
+	urcu_mcas_free(caa_container_of(head,
 			struct urcu_mcas, rcu_head));
 }
 
