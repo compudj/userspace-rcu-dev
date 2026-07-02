@@ -856,7 +856,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		bool is_root,
 		unsigned int node_depth __attribute__((unused)),
 		bool cluster_leaf,
-		struct ft_pub_rec *rec)
+		struct ft_pub_rec *rec,
+		struct ft_flip_txn *retire_txn)
 {
 	unsigned int new_type_index;
 	struct cds_ft_inode *new_node;
@@ -1245,9 +1246,19 @@ skip_copy:
 	 * concurrent MCAS writer validates under multi-writer.  Covers every
 	 * recompact retire -- recompact-on-insert, delete shrink (DEL), and
 	 * cds_ft_compact relocation.
+	 *
+	 * @retire_txn set: record the tombstone INTO the caller's commit txn so it
+	 * flips atomically with the publish that unlinks @old_node (atomic detach,
+	 * §4.B) instead of an early standalone flip; NULL keeps the lone-edge flip
+	 * (a fresh build-invisible recompaction that never publishes @old_node, or
+	 * a caller not yet routing its retire through a txn).
 	 */
-	if (old_node && metadata)
-		ft_meta_tombstone_set_flip(metadata);
+	if (old_node && metadata) {
+		if (retire_txn)
+			ft_flip_txn_record_tombstone(retire_txn, metadata);
+		else
+			ft_meta_tombstone_set_flip(metadata);
+	}
 
 	ret = 0;
 end:
@@ -1277,7 +1288,8 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		struct cds_ft_metadata *metadata,
 		unsigned int node_depth,
 		bool cluster_leaf,
-		struct ft_pub_rec *rec)
+		struct ft_pub_rec *rec,
+		struct ft_flip_txn *retire_txn)
 {
 	int ret;
 	unsigned int type_index;
@@ -1339,14 +1351,14 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
 					old_node_ret, false, node_depth, cluster_leaf,
-					rec);
+					rec, retire_txn);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
 					old_node_ret, false, node_depth, cluster_leaf,
-					rec);
+					rec, retire_txn);
 		break;
 	}
 	if (ret == 0)
@@ -1374,7 +1386,8 @@ int ft_node_set_nth(struct cds_ft *ft,
 		bool cluster_leaf)
 {
 	return ft_node_set_nth_rec(ft, node_flag, n, child_node_flag,
-			old_node_ret, metadata, node_depth, cluster_leaf, NULL);
+			old_node_ret, metadata, node_depth, cluster_leaf, NULL,
+			NULL);
 }
 
 /*
@@ -1390,7 +1403,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		struct cds_ft_inode_flag *newptr,
 		bool is_root,
 		unsigned int node_depth,
-		struct ft_remove_pub *pub)
+		struct ft_remove_pub *pub,
+		struct ft_flip_txn *retire_txn)
 {
 	int ret;
 	unsigned int type_index;
@@ -1410,7 +1424,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
 				node_flag_ptr, old_node_ret, is_root, node_depth,
-				false, NULL);
+				false, NULL, retire_txn);
 	}
 	if (ret == 0)
 		FT_TP(tree_edge_set, (const void *) ft,

@@ -1069,7 +1069,7 @@ int ft_detach_node(struct cds_ft *ft,
 				metadata_stack[nr_branch - 1],
 				n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 				detach_parent_flag_ptr == &ft->root,
-				cur_depth, pub);
+				cur_depth, pub, NULL);
 		}
 		if (!ret) {
 			/*

@@ -62,19 +62,25 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 
 	/*
 	 * The recompacted node's forward publish carries a SKIP_X dual (a second
-	 * reader-visible edge) when its parent is compressed, making the commit
-	 * multi-edge.  Pre-reserve the bounded txn BEFORE ft_node_recompact
-	 * eagerly re-parents the rebuilt node's children: that re-parent is a
-	 * point of no return (a clean _try abort would orphan the children onto
-	 * an unpublished node), so the multi-edge commit must be infallible.
-	 * Reservation failure leaves the node in place -- the same best-effort
-	 * contract as a node / cell allocation failure.  A lone forward edge
-	 * (non-compressed parent) needs no txn: ft_remove_commit_rec commits it
-	 * as an infallible on-stack release store (ft_ord_cell_flip_one).
+	 * reader-visible edge) when its parent is compressed.  Either way the old
+	 * copy this relocation retires gets its freeze-on-free tombstone recorded
+	 * into the SAME commit (atomic detach, §4.B), so ALWAYS pre-reserve a
+	 * bounded txn -- forward (+ SKIP_X dual for a compressed parent) + the
+	 * tombstone -- BEFORE ft_node_recompact eagerly re-parents the rebuilt
+	 * node's children: that re-parent is a point of no return (a clean _try
+	 * abort would orphan the children onto an unpublished node), so the commit
+	 * must be infallible.  A non-compressed parent, formerly a lone on-stack
+	 * forward store, is now a 2-edge flip (forward + tombstone).  Reservation
+	 * failure leaves the node in place -- the same best-effort contract as a
+	 * node / cell allocation failure: nothing reader-visible has changed and
+	 * nothing is reserved-but-leaked at the return.
 	 */
-	if (parent && (ft_node_compressed(parent) ||
-			ft_node_skip_compressed(parent))) {
-		txn = ft_flip_txn_create_bounded(FT_RELOCATE_COMMIT_MAX_EDGES);
+	{
+		unsigned int cap = (parent && (ft_node_compressed(parent) ||
+				ft_node_skip_compressed(parent))) ?
+			FT_RELOCATE_COMMIT_MAX_EDGES + 1 : 2;
+
+		txn = ft_flip_txn_create_bounded(cap);
 		if (!txn) {
 			*oom = true;
 			return;		/* OOM: best-effort, leave in place */
@@ -83,7 +89,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	ret = ft_node_recompact(FT_RECOMPACT_RELOCATE, ft, type_index,
 			&ft_types[type_index], node, meta, holder,
 			0, NULL, NULL, &old_ret, holder == &ft->root, 0,
-			false, &rec);
+			false, &rec, txn);
 	if (ret != 0) {
 		/*
 		 * Node allocation failed inside the recompact before any
@@ -97,9 +103,9 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	}
 	/*
 	 * Commit the recorded forward publish (and a compressed parent's SKIP_X
-	 * dual) atomically: through the pre-reserved @txn when multi-edge, or as
-	 * a lone on-stack store when @txn is NULL.  This is the moment the
-	 * relocated node becomes reader-reachable at *holder.
+	 * dual) together with the old copy's freeze-on-free tombstone atomically
+	 * through the pre-reserved @txn.  This is the moment the relocated node
+	 * becomes reader-reachable at *holder and the old copy is frozen dead.
 	 */
 	ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
 	/*

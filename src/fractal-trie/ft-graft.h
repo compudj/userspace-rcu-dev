@@ -439,7 +439,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		dest = d->pnf;
 		ret = ft_node_set_nth_rec(ft, &dest, key[key_len - 1], NULL,
 			&st->old_recompacted_node, pmeta, d->depth - 1, false,
-			&st->reserve_rec);
+			&st->reserve_rec, NULL);
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -509,7 +509,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			 */
 			ret = ft_node_set_nth_rec(ft, &dest, key[i - 1], NULL,
 				&st->old_recompacted_node, pmeta,
-				d->depth - 1, false, &st->reserve_rec);
+				d->depth - 1, false, &st->reserve_rec, NULL);
 			if (ret)
 				return CDS_FT_STATUS_MEMORY_ERROR;
 
