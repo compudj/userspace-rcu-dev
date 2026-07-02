@@ -186,12 +186,15 @@ extern "C" {
  * count, across arbitrarily many preemptions of its owner) -- categorically
  * unlike the install-latch spin, whose few-instruction window rseq time-slice
  * extension can cover; TSE does nothing for a whole-transaction-length wait.
- * Instead the capped helper ESCALATES: it aborts its own transaction (FAILED) and
- * lets the caller retry with a higher aging-priority.  Once the retrying
+ * Instead the capped helper ESCALATES: it CASes FAILED on the transaction it is
+ * currently driving -- its own at depth 0; at deeper levels the intermediate
+ * FOREIGN transaction it was helping (whose owner simply retries).  The abort
+ * unwinds the descent, and an aborted own transaction retries with a higher
+ * aging-priority; once the retrying
  * transaction out-retries the blocker it outranks it and evicts rather than helps,
  * so progress comes from the transaction's own escalation -- never from the
  * blocker's owner being scheduled.  Sound because the globally highest-priority
- * transaction never recurses (it always evicts), and a transaction may always
+ * transaction never recurses (it always evicts), and ANY UNDECIDED transaction may
  * spuriously abort; helping is a latency optimization, not a progress requirement.
  */
 #ifndef URCU_MCAS_HELP_MAX_DEPTH

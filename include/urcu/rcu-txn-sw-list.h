@@ -184,8 +184,8 @@ int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)
  * together), and settles each slot to its direct new target.  commit() owns
  * reclaim and defers the group block through call_rcu() after a grace period.
  *
- * A list op always transacts exactly two edges, so the txn's growable chunk
- * list, single-edge fast path and abort path are unused here; the only cost
+ * A list op always transacts exactly two edges, so the txn's record-array
+ * growth, single-edge fast path and abort path are unused here; the only cost
  * over a bespoke fixed proxy block is the record array and the group block,
  * freed together by one call_rcu.
  *

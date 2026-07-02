@@ -92,6 +92,16 @@
  * is sticky -- the pending commit then reports -ENOMEM -- so a mutator only has
  * to test commit's result (which it already does).
  *
+ * Buffered writes are INVISIBLE to the bracket's own loads: urcu_txn_load()
+ * returns the slot's current logical value, never a pending new_ptr this
+ * attempt buffered -- there is no read-your-own-writes.  And a transaction
+ * keeps AT MOST ONE record per slot per attempt: a second store to the same
+ * slot upgrades the buffered record in place (last-wins; a disagreeing old
+ * poisons the attempt), it does not sequence after the first.  Composing two
+ * *_prepare forms that write the same slot (e.g. two insert-after at one
+ * position) thus silently collapses to the last write: run them as separate
+ * transactions.
+ *
  * Reserve.  A mutator that knows its edge count up front may call
  * urcu_txn_reserve() right after begin: it allocates the descriptor to
  * that floor, so an OOM is reported before the mutator builds any nodes, and
@@ -301,7 +311,13 @@ void urcu_txn_read_unlock(struct urcu_mcas_txn *txn)
 /*
  * Take the domain's lock (blocks until we are the head) and publish that a
  * fallback episode is in progress, so future transactions funnel into the lane.
- * Caller must NOT hold the RCU read-side section: cds_fair_mutex_lock may block.
+ * Callable with or without the RCU read-side section held: cds_fair_mutex_lock
+ * may block, but the wait is bounded (a FIFO turn behind holders whose commits
+ * are bounded MCAS runs) and the lane owner never blocks on a grace period
+ * while holding the mutex, so holding the section across the wait cannot
+ * extend a grace period unboundedly.  The body comment details why reserve()
+ * deliberately enters while inside the bracket; begin() enters before opening
+ * it (nothing is pinned yet).
  */
 static inline
 void urcu_txn__enter_fallback(struct urcu_mcas_txn *txn)
@@ -382,8 +398,10 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	/*
 	 * Escalate before opening the attempt: a starved (retry) or
 	 * already-known large (min_alloc) handle takes its FIFO turn here.
-	 * cds_fair_mutex_lock may block, so it must run outside the RCU read-side
-	 * section.
+	 * cds_fair_mutex_lock may block; nothing is pinned yet, so take the
+	 * turn before opening the read-side section (holding one across the
+	 * bounded wait would also be sound -- reserve() does; see
+	 * urcu_txn__enter_fallback).
 	 */
 	if (urcu_txn__want_fallback(txn))
 		urcu_txn__enter_fallback(txn);
@@ -490,7 +508,8 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
  * end), and it is the seam where the wait-free escalation lane would add read
  * validation: route in-bracket reads here, not through urcu_mcas_read(), so
  * that day is a one-line change.  A plain observer outside any transaction reads
- * with urcu_mcas_read() directly.
+ * with urcu_mcas_read() directly.  The returned value never reflects this
+ * attempt's own buffered stores (no read-your-own-writes).
  */
 static inline
 void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag)
