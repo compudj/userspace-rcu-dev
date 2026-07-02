@@ -880,12 +880,6 @@ void urcu_mcas_free_local(struct urcu_mcas *t)
 		free(t);
 }
 
-static inline
-void urcu_mcas_free_remote(struct urcu_mcas *t)
-{
-	urcu_mcas_free_local(t);
-}
-
 /*
  * Create a transaction with room for @cap records.  @retry is the caller's
  * aging-priority: the number of times this logical operation has already retried
@@ -1018,7 +1012,7 @@ void urcu_mcas_destroy(struct urcu_mcas *t)
 static inline
 void urcu_mcas_free_rcu(struct rcu_head *head)
 {
-	urcu_mcas_free_remote(caa_container_of(head,
+	urcu_mcas_free_local(caa_container_of(head,
 			struct urcu_mcas, rcu_head));
 }
 
