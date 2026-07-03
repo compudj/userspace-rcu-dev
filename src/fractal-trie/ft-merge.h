@@ -1476,8 +1476,24 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 */
 	struct ft_flip_txn *src_side_txn = NULL;
 
+	/*
+	 * Size the src-side commit txn per shape.  A root src fuses the gs
+	 * free-list freeze into its root swap / lone root flip (atomic detach,
+	 * doc §4.B): + gs.cap_free tombstone edges (cnt.nf_src + 8, the exact
+	 * upper bound ft_glue_defer_free asserts against).  A non-root src
+	 * commits its run-unlink through a plain FT_ORD_CELL_RUN_UNLINK txn; its
+	 * gs freeze stays standalone, applied below AFTER
+	 * ft_merge_unlink_src_subtree's (still fallible) unlink so a rolled-back
+	 * merge never freezes-then-strands (full non-root fusion -- into
+	 * ft_detach_node's flip -- is a §4.B residual).  A list-off root with an
+	 * EMPTY gs keeps its bare lone-edge store (no txn, no grace period).
+	 * gs is fully populated by ft_merge_build above, so nr_free/cap_free are
+	 * final here.  (gd is stamped in ft_glue_apply_deferred for the dst
+	 * forward publish.)
+	 */
 	if (ms_ord) {
-		src_side_txn = ft_flip_txn_create_bounded(
+		src_side_txn = ft_flip_txn_create_bounded(root_src ?
+			FT_ROOT_LIST_SWAP_MAX_EDGES + (unsigned int) gs.cap_free :
 			FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
 		if (!src_side_txn) {
 			free(ms_src_pool);
@@ -1490,17 +1506,22 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ft_glue_abort(src_ft, &gs);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
+	} else if (root_src && gs.nr_free) {
+		/* List-off root with retires: 1 root edge + gs.cap_free tombstones. */
+		src_side_txn = ft_flip_txn_create_bounded(
+			1u + (unsigned int) gs.cap_free);
+		if (!src_side_txn) {
+			free(ms_src_pool);
+			free(ms_src_caps);
+			free(ms_edges);
+			ft_flip_txn_destroy(txn);
+			if (fresh_root)
+				free_cds_ft_node_unpublished(src_ft, fresh_root);
+			ft_glue_abort(dst_ft, &gd);
+			ft_glue_abort(src_ft, &gs);
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
 	}
-	/*
-	 * Freeze-on-free (doc §4.B): the src-overlap spine this merge retires
-	 * (gs->free_list, drained at ft_glue_free_old below) is unlinked by the
-	 * src-root swap / run-unlink commit that follows.  Stamp it dead here --
-	 * gs is fully populated by ft_merge_build above, and this point is past
-	 * the last src-side abort (the src_side_txn reservation), so it runs only
-	 * on the committing path.  (gd is stamped in ft_glue_apply_deferred for
-	 * the dst forward publish.)
-	 */
-	ft_glue_tombstone_free_list(&gs);
 
 	if (root_src) {
 		/*
@@ -1516,19 +1537,46 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			 * Empty src's sentinel (relink_dest NULL): the run cells are
 			 * re-homed into dst by the post-commit interleave, which sets each
 			 * survivor's links individually (collided heads are freed).
+			 *
+			 * Fuse the gs free-list freeze into this root-swap txn (atomic
+			 * detach, doc §4.B): record each retired src-overlap node's
+			 * tombstone into src_side_txn first, then the swap records the
+			 * root + sentinel endpoint edges into the same txn and commits
+			 * them all in ONE flip.  An empty gs records nothing.
 			 */
+			gs.txn = src_side_txn;
+			gs.fuse_free_list = true;
+			ft_glue_tombstone_free_list(&gs);
 			ft_root_list_swap_publish(src_ft, src_side_txn,
 				&src_ft->root,
 				src_ft->root, ft_node_flag(fresh_root, 0),
 				ft_ord_first(src_ft), NULL,
 				ft_ord_last(src_ft), NULL, NULL, false);
 			src_side_txn = NULL;	/* consumed */
+		} else if (gs.nr_free) {
+			/*
+			 * List-off root with retires: fuse the gs free-list freeze into
+			 * the root flip (atomic detach, doc §4.B).  Record the lone root
+			 * edge + each retired node's tombstone into src_side_txn and
+			 * commit them in ONE flip (a group flip, like the list-on path),
+			 * rather than a bare store followed by standalone freezes.  The
+			 * root edge normalizes to the same FT_FLIP_PROXY_TAG the swap uses.
+			 */
+			ft_flip_txn_record_reserved(src_side_txn,
+				(void **) &src_ft->root,
+				(void *) src_ft->root,
+				(void *) ft_node_flag(fresh_root, 0));
+			gs.txn = src_side_txn;
+			gs.fuse_free_list = true;
+			ft_glue_tombstone_free_list(&gs);
+			ft_flip_txn_commit(src_ft, src_side_txn);
+			src_side_txn = NULL;	/* consumed */
 		} else {
 			/*
-			 * No ordered list: src->root is the only reader-visible slot.
-			 * Express the lone root edge as a single-edge flip descriptor
-			 * (one release store, like a bare rcu_assign_pointer) so the
-			 * swap is MCAS-expressible like the list-on path.
+			 * No ordered list, no retires: src->root is the only reader-
+			 * visible slot.  Express the lone root edge as a single-edge flip
+			 * descriptor (one release store, like a bare rcu_assign_pointer)
+			 * so the swap is MCAS-expressible like the list-on path.
 			 */
 			ft_root_edge_flip(src_ft, &src_ft->root,
 				src_ft->root, ft_node_flag(fresh_root, 0));
@@ -1551,6 +1599,18 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		ft_glue_abort(src_ft, &gs);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
+	/*
+	 * Non-root src: ft_merge_unlink_src_subtree's ft_detach_node flip has
+	 * unlinked S (past the last abort above), so the gs overlap spine is now
+	 * unreachable.  Freeze it dead here -- standalone (gs.txn stays NULL ->
+	 * ft_meta_tombstone_set_flip), a safe freeze-AFTER-unlink (no abort
+	 * follows before the free).  True atomic detach for the non-root path
+	 * needs a retire param threaded through the shared ft_detach_node --
+	 * deferred (§4.B residual).  A root src already froze gs fused into its
+	 * root swap / flip above.
+	 */
+	if (!root_src)
+		ft_glue_tombstone_free_list(&gs);
 	/*
 	 * Now that the last fallible step has committed, remove src's merged
 	 * subtree (S) run from src's ordered list: its cells disperse to dst
