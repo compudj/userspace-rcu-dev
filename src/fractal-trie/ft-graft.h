@@ -1904,9 +1904,11 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 *
 		 * NOT for KEY_SHORTER (the swap key ends INSIDE a compressed node):
 		 * that shape wraps a LIVE dst compressed node whose re-parent is a live
-		 * pointer not yet classified for the txn; keep it on the legacy
-		 * apply-deferred + publish-replace path (glue_insert.txn == NULL
-		 * selects it) until that wrap re-parent is folded in.
+		 * pointer not yet classified for the txn, so its EDGE commit stays on
+		 * the legacy apply-deferred + publish-replace path (glue_insert.txn ==
+		 * NULL selects it) until that wrap re-parent is folded in.  Its
+		 * free-list FREEZE still fuses -- into glue_publish_txn, wired up in
+		 * the commit below (doc §4.B).
 		 */
 		if (have_insert && kase != FT_GRAFT_SWAP_KEY_SHORTER) {
 			glue_insert.txn = ft_flip_txn_create();
@@ -1918,16 +1920,22 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			glue_insert.fuse_free_list = true;
 		} else if (have_insert) {
 			/*
-			 * KEY_SHORTER legacy publish (glue_insert.txn stays NULL ->
+			 * KEY_SHORTER legacy publish (glue_insert.txn stays NULL here ->
 			 * ft_glue_apply_deferred + ft_glue_publish_replace below): the
 			 * publish-replace runs in the failure-free section, so pre-reserve
 			 * its forward(+SKIP_X dual) + run-replace commit txn here, where an
 			 * OOM is still a clean prep_oom.  It is always consumed on the
 			 * legacy path (the reservation condition mirrors the consume
-			 * condition); a later prep_oom frees it.
+			 * condition); a later prep_oom frees it.  The +FT_GLUE_FLOOR_FREE
+			 * headroom lets the free-list FREEZE fuse into this same flip
+			 * (doc §4.B atomic detach): glue_insert's retired-node tombstones
+			 * ride the publish-replace flip that unlinks them (wired up in the
+			 * commit below) instead of a standalone lone-edge flip.  Only the
+			 * free-list freeze fuses; the live wrap re-parent stays on the
+			 * immediate apply_deferred path (not yet txn-classified).
 			 */
 			glue_publish_txn = ft_flip_txn_create_bounded(
-				FT_GLUE_PUBLISH_REPLACE_MAX_EDGES);
+				FT_GLUE_PUBLISH_REPLACE_MAX_EDGES + FT_GLUE_FLOOR_FREE);
 			if (!glue_publish_txn)
 				goto prep_oom;
 		}
@@ -2080,10 +2088,24 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				ft_glue_txn_commit_replace(dst_ft, &glue_insert,
 					swap_run_arg);
 			else {
+				/*
+				 * Fuse glue_insert's free-list FREEZE into the publish-replace
+				 * flip (doc §4.B atomic detach).  Point glue_insert at
+				 * glue_publish_txn HERE -- AFTER the glue_insert.txn dispatch
+				 * above already chose this legacy branch -- so
+				 * ft_glue_apply_deferred records the retired-node tombstones
+				 * into it and ft_glue_publish_replace commits them with the
+				 * forward replace that unlinks them.  The live wrap re-parent
+				 * is still applied immediately by apply_deferred (a hidden,
+				 * drained back-edge); only the freeze rides the txn.
+				 */
+				glue_insert.txn = glue_publish_txn;
+				glue_insert.fuse_free_list = true;
 				ft_glue_apply_deferred(dst_ft, &glue_insert);
 				ft_glue_publish_replace(dst_ft, glue_publish_txn,
 					&glue_insert, swap_run_arg);
 				glue_publish_txn = NULL;	/* consumed */
+				glue_insert.txn = NULL;	/* the commit reclaimed it */
 			}
 		} else {
 			/*
