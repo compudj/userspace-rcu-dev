@@ -233,6 +233,44 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  *                  resolve their own slot via parent_slot_offset.
  */
 /*
+ * Freeze-on-free (doc §4.B) for the ft_detach_node branch-2 orphan chain: mark
+ * every collected orphan (+ the trailing skip-target) DEAD.  @txn non-NULL
+ * records each tombstone INTO the op's commit txn so the freeze flips
+ * ATOMICALLY with the flip that unlinks the chain (atomic detach); @txn NULL
+ * falls back to a standalone lone-edge flip (the list-off pub-less lone-store
+ * path, whose unlink is not a txn commit -- a no-op under one writer).  Node
+ * resolution mirrors the branch-2 free loop.
+ */
+static
+void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
+		struct cds_ft_inode_flag **orphans, int nr_orphans,
+		struct cds_ft_inode_flag *trailing_skip_cn_flag)
+{
+	int i;
+
+	for (i = 0; i < nr_orphans; i++) {
+		struct cds_ft_metadata *m = ft_node_compressed(orphans[i])
+			? cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_compressed_node_ptr(orphans[i]))
+			: cds_ft_item_to_metadata(ft_node_ptr(orphans[i]));
+
+		if (txn)
+			ft_flip_txn_record_tombstone(txn, m);
+		else
+			ft_meta_tombstone_set_flip(m);
+	}
+	if (trailing_skip_cn_flag) {
+		struct cds_ft_metadata *m = cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) ft_skip_to_compressed(ft,
+				trailing_skip_cn_flag));
+
+		if (txn)
+			ft_flip_txn_record_tombstone(txn, m);
+		else
+			ft_meta_tombstone_set_flip(m);
+	}
+}
+/*
  * ft_chain_compress_fused: the fused-merge primitive behind the
  * chain-compress canonicalization.  Builds the merged compressed @new_cn
  * INVISIBLY (rcu-mutation build phase) from the caller-supplied surviving
@@ -253,6 +291,12 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * surviving child.
  * @dead_cell / @run: the dead key's ordered-list unsplice, folded into the
  * merge flip (NULL when the ordered list is off / no fusion).
+ * @orphans / @nr_orphans / @trailing_orphan: an optional orphan chain the SAME
+ * unlink strands (ft_detach_node's branch-2 prune); each node's freeze-on-free
+ * tombstone is recorded INTO the merge flip so it freezes atomically with the
+ * collapse.  Pass NULL/0/NULL for the standalone canonicalize / chain-leaf
+ * callers (no extra chain retired by their flip); the txn reservation grows to
+ * cover them.
  *
  * Returns 0 when the merge committed; -ENOMEM when @new_cn could not be
  * allocated (NOTHING was published -- the caller aborts the whole removal,
@@ -271,7 +315,10 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag *surviving_child,
 		uint8_t surviving_byte,
 		struct ft_ord_cell *dead_cell,
-		struct ft_detach_run *run)
+		struct ft_detach_run *run,
+		struct cds_ft_inode_flag **orphans,
+		int nr_orphans,
+		struct cds_ft_inode_flag *trailing_orphan)
 {
 	bool parent_compressed, child_compressed;
 	struct cds_ft_compressed_node *parent_cn, *child_cn;
@@ -312,7 +359,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * cannot fail, so the only failure points are this reservation and the
 	 * new_cn allocation, both BEFORE the build's first side-effect.
 	 */
-	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3);
+	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
+			+ nr_orphans + (trailing_orphan ? 1 : 0));
 	if (!txn)
 		return -ENOMEM;	/* nothing touched: caller aborts */
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
@@ -393,6 +441,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		if (child_cn)
 			ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) child_cn));
+		ft_detach_freeze_orphans(ft, txn, orphans, nr_orphans,
+			trailing_orphan);
 		ft_remove_commit_rec(ft, &rec, dead_cell, run, txn);
 	}
 
@@ -428,7 +478,8 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 	if (!surviving_child)
 		return;
 	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_meta,
-		slot_ptr, surviving_child, surviving_byte, NULL, NULL);
+		slot_ptr, surviving_child, surviving_byte, NULL, NULL,
+		NULL, 0, NULL);
 }
 #endif
 
@@ -976,19 +1027,13 @@ int ft_detach_node(struct cds_ft *ft,
 					trailing_skip_cn_flag = walk_nf;
 			}
 			/*
-			 * Tombstone the collected set (+ the trailing skip-target)
-			 * before the commit below unlinks it.  Resolve each entry to
-			 * its node exactly as the free loop does.
+			 * The collected set (+ trailing skip-target) is tombstoned at
+			 * the commit that unlinks it, not here -- see the freeze below
+			 * this branch's commit dispatch (shape-D records into its own
+			 * merge flip; an in-place delete records into @commit_txn;
+			 * recompaction / list-off keep a standalone freeze before the
+			 * free).  Deferred to the free walk in the !ret block below.
 			 */
-			for (fi = 0; fi < nr_to_free; fi++)
-				ft_meta_tombstone_set_flip(ft_node_compressed(to_free[fi])
-					? cds_ft_item_to_metadata((struct cds_ft_inode *)
-						ft_compressed_node_ptr(to_free[fi]))
-					: cds_ft_item_to_metadata(ft_node_ptr(to_free[fi])));
-			if (trailing_skip_cn_flag)
-				ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
-					(struct cds_ft_inode *) ft_skip_to_compressed(ft,
-						trailing_skip_cn_flag)));
 		}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
@@ -1036,7 +1081,9 @@ int ft_detach_node(struct cds_ft *ft,
 					int cret = ft_chain_compress_fused(ft,
 						iter_node_flag, bmeta,
 						detach_parent_flag_ptr,
-						s_child, s_byte, fuse_cell, run);
+						s_child, s_byte, fuse_cell, run,
+						to_free, nr_to_free,
+						trailing_skip_cn_flag);
 
 					if (cret == 0) {
 						ret = 0;
@@ -1099,9 +1146,12 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (fuse_cell || run ||
 			    (bparent && (ft_node_compressed(bparent) ||
-					 ft_node_skip_compressed(bparent)))) {
+					 ft_node_skip_compressed(bparent))) ||
+			    (pub && (nr_to_free > 0 || trailing_skip_cn_flag))) {
 				commit_txn = ft_flip_txn_create_bounded(
-					FT_REMOVE_COMMIT_REC_MAX_EDGES);
+					FT_REMOVE_COMMIT_REC_MAX_EDGES
+					+ nr_to_free
+					+ (trailing_skip_cn_flag ? 1 : 0));
 				if (!commit_txn) {
 					ret = -ENOMEM;
 					goto end;
@@ -1117,6 +1167,25 @@ int ft_detach_node(struct cds_ft *ft,
 				cur_depth, pub, commit_txn);
 		}
 		if (!ret) {
+			/*
+			 * Freeze the collected orphan chain (+ trailing skip-target)
+			 * before the free below (doc §4.B, atomic detach).  Now that
+			 * replace_ptr has run, its outcome selects where the freeze
+			 * rides: an IN-PLACE delete (pub->armed) commits @commit_txn via
+			 * ft_remove_one_commit just below -- BEFORE the free -- so record
+			 * the tombstones INTO it and they flip ATOMICALLY with that
+			 * unlink.  A RECOMPACTION (pub unarmed) defers its forward
+			 * republish past this free (to the parent-slot block below), and
+			 * the list-off pub-less path does a direct lone store, so both
+			 * mark STANDALONE here (before the free) -- a no-op under one
+			 * writer; their full fusion needs the free hoisted past the
+			 * republish.  Shape-D already recorded into its own merge flip.
+			 */
+			if (!boundary_fused && (nr_to_free > 0 || trailing_skip_cn_flag))
+				ft_detach_freeze_orphans(ft,
+					(pub && pub->armed && commit_txn) ?
+						commit_txn : NULL,
+					to_free, nr_to_free, trailing_skip_cn_flag);
 			/*
 			 * In-place key-disappearing remove (the holder stayed
 			 * above min_child, so replace_ptr deferred its single
@@ -1723,7 +1792,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				int cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_meta,
 					ft_get_parent_slot(holder_meta, ft),
-					s_child, s_byte, fuse_cell, NULL);
+					s_child, s_byte, fuse_cell, NULL,
+					NULL, 0, NULL);
 
 				if (cret == 0) {
 					ft_node_mark_removed_flip(ft, node);
@@ -2145,7 +2215,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte,
 					ft->ordered_list ? dead_cell : NULL,
-					NULL);
+					NULL, NULL, 0, NULL);
 
 				if (cret == 0) {
 					ft_chain_mark_removed_flip(ft, chain_head);
