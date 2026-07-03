@@ -2665,10 +2665,9 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	 * single predecessor->next store; a list-off head inherits the flagged
 	 * parent and flips the structural + SKIP_X dual.  Mirrors ft_promote_head.
 	 */
-	bool is_head = !ft_node_external(
-		(struct cds_ft_inode_flag *) old_node->prev);
-
 	{
+		bool is_head = !ft_node_external(
+			(struct cds_ft_inode_flag *) old_node->prev);
 		struct cds_ft_inode_flag *parent_nf = cn ?
 			ft_compressed_node_flag(cn) : holder_flag;
 		struct ft_ord_cell *old_cell = (ft->ordered_list && is_head) ?
@@ -2739,7 +2738,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 				ft_ord_cell_ptr(new_cell_flag);
 			struct ft_flip_txn *txn =
 				ft_flip_txn_create_bounded(
-					FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES);
+					FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
+					FT_HLIST_FREEZE_MAX_EDGES);
 
 			if (!txn) {
 				new_node->next = NULL;
@@ -2757,6 +2757,12 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node, &rec);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
+			/*
+			 * Fuse @old_node's freeze (mark old_node->next, target
+			 * preserved) into the swap commit (doc §4.B); the reservation
+			 * above carries the extra edge.
+			 */
+			ft_hlist_freeze_prepare(&txn->mtxn, old_node);
 			ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
 				sedges, n_s, txn);
 			ft_ord_cell_free(ft, old_cell);
@@ -2771,7 +2777,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			 * replace retriable (@new_node restored to its fresh state).
 			 */
 			struct ft_flip_txn *txn =
-				ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES);
+				ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
+					FT_HLIST_FREEZE_MAX_EDGES);
 
 			if (!txn) {
 				new_node->next = NULL;
@@ -2785,21 +2792,18 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node, &rec);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
+			/* Fuse @old_node's freeze into the structural publish (doc §4.B). */
+			ft_hlist_freeze_prepare(&txn->mtxn, old_node);
 			ft_ord_cell_flip_into(ft, txn, sedges, n_s);
 		}
 	}
 
 	/*
-	 * @old_node has left the trie (replaced by @new_node): tombstone it.
-	 * Its next pointer is preserved so a concurrent reader positioned on
-	 * @old_node still follows the chain.  The non-head atomic replace above
-	 * already marked it inside its commit, so only the head cases freeze here.
-	 */
-	if (is_head)
-		ft_node_mark_removed_flip(ft, old_node);
-
-
-	/*
+	 * @old_node has left the trie (replaced by @new_node), frozen atomically
+	 * inside its own commit above (the non-head swap via ft_hlist_replace_
+	 * prepare, each head case via ft_hlist_freeze_prepare fused with the
+	 * structural publish) -- no separate tombstone pass.
+	 *
 	 * The trie structure is unchanged (no recompaction), so the iterator
 	 * path remains valid in cached mode.
 	 */
