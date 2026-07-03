@@ -66,26 +66,21 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		int *nr_clear,
 		struct ft_ord_cell *fuse_cell,
 		struct ft_remove_pub *pub,
-		struct ft_detach_run *run)
+		struct ft_detach_run *run,
+		struct ft_flip_txn *txn)
 {
-	struct ft_flip_txn *txn;
-
 	/*
-	 * Pre-reserve the publish flip-txn before any side-effect (sub-case 1
-	 * wires the promoted external's parent to cn BEFORE the cn->child publish;
-	 * sub-case 2 allocates the fresh internal).  Both publish into / around a
-	 * compressed node, so the forward edge plus a SKIP_X grandparent dual /
-	 * cell unsplice make the commit multi-edge; reserving here makes the
-	 * single publish below commit through ft_ord_cell_flip_into (infallible),
-	 * so the pre-flip ft_set_parent reaches an allocation-free point of no
-	 * return.  Reservation failure aborts the detach before any side-effect
-	 * (the caller rolls back the count).  This branch is not the remove hot
-	 * path (the plain branch is), so reserving unconditionally -- even for a
-	 * lone-edge publish -- is acceptable.
+	 * @txn is created and reserved by the caller (ft_detach_node), sized for
+	 * this publish's structural edges PLUS one freeze-on-free tombstone per
+	 * node in the orphaned chain the caller collected below -- so the
+	 * sub-case-2 retire here and the caller's entire orphan set freeze
+	 * ATOMICALLY with the publish that unlinks them (atomic detach, §4.B).
+	 * The caller reserves it before any side-effect (its orphan walk is
+	 * read-only), so the pre-flip ft_set_parent here still reaches an
+	 * allocation-free point of no return, committing through
+	 * ft_ord_cell_flip_into (infallible).  On any failure below the caller
+	 * destroys @txn.
 	 */
-	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES);
-	if (!txn)
-		return -ENOMEM;
 	if (topmost_external_nodes) {
 		/*
 		 * Keep the compressed node -- its path is needed for
@@ -159,10 +154,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_metadata *src_meta;
 
 		fresh = alloc_cds_ft_node(ft, &ft_types[0], &fresh_meta);
-		if (!fresh) {
-			ft_flip_txn_destroy(txn);	/* unused: no publish */
-			return -ENOMEM;
-		}
+		if (!fresh)
+			return -ENOMEM;	/* nothing published: caller destroys @txn */
 		src_meta = cds_ft_item_to_metadata(
 			(struct cds_ft_inode *) ft_compressed_node_ptr(
 				iter_node_flag));
@@ -184,17 +177,15 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				ft_node_flag(fresh, 0), &rec);
 			/*
 			 * Freeze the retired compressed node dead (§4.B freeze-on-
-			 * free) before the publish commit that unlinks it: this
-			 * compressed->fresh-internal recompaction retires the old
-			 * compressed node like every other retire and needs the same
-			 * tombstone.  The mark was missing here; this detach sub-case
-			 * is not reached by the current test suite (verified: zero
-			 * hits across ft_unit + ft_inv both list modes), so the
-			 * freeze-on-free audit never exercised it.  Standalone flip for
-			 * now, matching the sibling detach-branch retires; folds into
-			 * @txn when the detach-branch category is fused (atomic detach).
+			 * free): this compressed->fresh-internal recompaction retires
+			 * the old compressed node like every other retire.  Record the
+			 * tombstone INTO @txn so it flips ATOMICALLY with the publish
+			 * that unlinks it -- an aborted publish leaves it live (atomic
+			 * detach).  This detach sub-case is not reached by the current
+			 * test suite (verified: zero hits across ft_unit + ft_inv both
+			 * list modes), so the freeze-on-free audit never exercises it.
 			 */
-			ft_meta_tombstone_set_flip(cds_ft_item_to_metadata(
+			ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) ft_compressed_node_ptr(
 					iter_node_flag)));
 			ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
@@ -705,17 +696,18 @@ int ft_detach_node(struct cds_ft *ft,
 		 * itself may carry residual content (external_nodes)
 		 * that was promoted as topmost_external_nodes.
 		 *
-		 * Freeze-on-free (doc §4.B): COLLECT and tombstone the orphaned
-		 * chain HERE, before the replace commit unlinks it, so a
-		 * concurrent MCAS writer targeting any of these nodes validates
-		 * the mark (expected = live) and fails.  The walk is read-only on
-		 * the orphan subtree, whose internal pointers the replace does NOT
-		 * touch (it rewrites the parent slot + promotes the target's
-		 * external_nodes, tolerated by the phase2_first special-case), so
-		 * the set it builds is identical pre/post commit; the actual free
-		 * is deferred to after the commit.  (If the replace then OOMs and
-		 * aborts, these still-live nodes are left marked dead -- a no-op
-		 * under one writer, corrected by a later successful detach.)
+		 * Freeze-on-free (doc §4.B, atomic detach): COLLECT the orphaned
+		 * chain HERE; the per-node freeze-on-free tombstones are RECORDED
+		 * into the replace's publish txn just below and flip ATOMICALLY
+		 * with the commit that unlinks the chain, so a concurrent MCAS
+		 * writer targeting any of these nodes validates the mark (expected
+		 * = live) and fails -- and an aborted replace leaves them live and
+		 * unmarked (no stranded dead-but-linked node).  The walk is
+		 * read-only on the orphan subtree, whose internal pointers the
+		 * replace does NOT touch (it rewrites the parent slot + promotes
+		 * the target's external_nodes, tolerated by the phase2_first
+		 * special-case), so the set it builds is identical pre/post commit;
+		 * the actual free is deferred to after the commit.
 		 */
 		if (free_detached_subtree) {
 			struct cds_ft_inode_flag *walk_nf = elevated_old_child;
@@ -764,13 +756,6 @@ int ft_detach_node(struct cds_ft *ft,
 				    (nr_child > 1 || ext_nodes))
 					break;
 				phase2_first = false;
-				ft_meta_tombstone_set_flip(
-					cds_ft_item_to_metadata(ft_node_compressed(
-						walk_nf)
-						? (struct cds_ft_inode *)
-						  ft_compressed_node_ptr(
-							ft_skip_child_ptr(walk_nf))
-						: ft_node_ptr(walk_nf)));
 				to_free[nr_to_free++] = walk_nf;
 				walk_nf = next;
 			}
@@ -781,21 +766,53 @@ int ft_detach_node(struct cds_ft *ft,
 			 * walk stops short of.  Free it (the external leaf stays
 			 * caller-owned).
 			 */
-			if (walk_nf && ft_node_skip_compressed(walk_nf)) {
+			if (walk_nf && ft_node_skip_compressed(walk_nf))
 				trailing_skip_cn =
 					ft_skip_to_compressed(ft, walk_nf);
-				ft_meta_tombstone_set_flip(
+		}
+		/*
+		 * Atomic detach (§4.B): create the publish txn sized for the
+		 * replace's structural edges PLUS one freeze-on-free tombstone per
+		 * collected orphan (+ the trailing skip-target), and record each so
+		 * the whole retired chain freezes ATOMICALLY with the replace
+		 * commit that unlinks it.  create_bounded mallocs the exact cap;
+		 * OOM aborts before any reader-visible store (the orphan walk above
+		 * is read-only), and on the replace failing we destroy it here.
+		 */
+		{
+			struct ft_flip_txn *orphan_txn =
+				ft_flip_txn_create_bounded(
+					FT_REMOVE_COMMIT_REC_MAX_EDGES
+					+ nr_to_free
+					+ (trailing_skip_cn ? 1 : 0));
+
+			if (!orphan_txn) {
+				ret = -ENOMEM;
+				goto end;
+			}
+			for (fi = 0; fi < nr_to_free; fi++)
+				ft_flip_txn_record_tombstone(orphan_txn,
+					cds_ft_item_to_metadata(ft_node_compressed(
+						to_free[fi])
+						? (struct cds_ft_inode *)
+						  ft_compressed_node_ptr(
+							ft_skip_child_ptr(to_free[fi]))
+						: ft_node_ptr(to_free[fi])));
+			if (trailing_skip_cn)
+				ft_flip_txn_record_tombstone(orphan_txn,
 					cds_ft_item_to_metadata(
 						(struct cds_ft_inode *)
 						trailing_skip_cn));
+			ret = ft_detach_node_replace_compressed_parent(ft,
+				iter_node_flag, detach_parent_flag_ptr,
+				topmost_external_nodes, &nr_clear, fuse_cell,
+				pub, run, orphan_txn);
+			if (ret) {
+				ft_flip_txn_destroy(orphan_txn);
+				goto end;
 			}
 		}
-		ret = ft_detach_node_replace_compressed_parent(ft,
-			iter_node_flag, detach_parent_flag_ptr,
-			topmost_external_nodes, &nr_clear, fuse_cell, pub, run);
-		if (ret)
-			goto end;
-		/* Orphan chain unlinked: free the set collected (+ marked) above. */
+		/* Orphan chain unlinked: free the set collected above. */
 		if (free_detached_subtree) {
 			if (trailing_skip_cn)
 				free_compressed_node(ft, trailing_skip_cn);
