@@ -192,3 +192,20 @@
 #include "ft-verify.h"
 #include "ft-compact.h"
 #include "ft-show.h"
+
+/*
+ * Public API back-end for cds_ft_node_next_rcu()'s proxy path (declared in
+ * <urcu/fractal-trie.h>).  A duplicate successor whose raw "next" value carries
+ * the engine proxy tag -- a bulk commit (e.g. a merge appending a src run at
+ * this chain's tail) is mid-flight on the slot -- is resolved to the committed
+ * successor, with the removal tombstone stripped.  Kept out of line so the
+ * transactional engine (and its headers) stay opaque to API users; a
+ * duplicate-chain walk is not a fast path, so the call is immaterial.
+ */
+urcu_static_assert(CDS_FT_NODE_TXN_PROXY_TAG == URCU_MCAS_TAG,
+		"FT public duplicate-next proxy tag must equal the engine proxy tag",
+		ft_node_next_proxy_tag_matches_engine);
+struct cds_ft_node *cds_ft_node_next_resolve(void *raw)
+{
+	return ft_hlist_resolve(raw);
+}

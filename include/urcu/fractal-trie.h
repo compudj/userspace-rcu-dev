@@ -521,12 +521,39 @@ struct cds_ft_node {
 #define CDS_FT_NODE_REMOVED_FLAG	2UL
 
 /*
- * Masked rcu_dereference of a duplicate's successor (masks the removal
- * tombstone, CDS_FT_NODE_REMOVED_FLAG).
+ * Library-internal: bit 0 of cds_ft_node.next is the transactional engine's
+ * in-band proxy tag (equal to URCU_MCAS_TAG; asserted in the library).  A
+ * duplicate-chain successor read observes it only while a concurrent bulk
+ * commit (e.g. a merge appending a src run at this chain's tail) is in flight.
+ */
+#define CDS_FT_NODE_TXN_PROXY_TAG	1UL
+
+/*
+ * Library-internal back-end for cds_ft_node_next_rcu()'s proxy path: resolve a
+ * raw successor value that carries the engine proxy tag (an in-flight commit)
+ * to the committed successor, then strip the removal tombstone.  Deliberately
+ * NOT inlined -- a duplicate-chain walk is not a fast path, and out-of-lining it
+ * keeps the transactional engine (and its headers) opaque to API users; reach
+ * it only through cds_ft_node_next_rcu().
+ */
+extern struct cds_ft_node *cds_ft_node_next_resolve(void *raw);
+
+static inline
+struct cds_ft_node *_cds_ft_node_next_rcu(void *raw)
+{
+	if (caa_unlikely((uintptr_t) raw & CDS_FT_NODE_TXN_PROXY_TAG))
+		return cds_ft_node_next_resolve(raw);
+	return (struct cds_ft_node *) ((uintptr_t) raw & ~CDS_FT_NODE_REMOVED_FLAG);
+}
+
+/*
+ * rcu_dereference of a duplicate's successor.  Common case: strip the removal
+ * tombstone (CDS_FT_NODE_REMOVED_FLAG) inline.  If the value instead carries the
+ * engine proxy tag (a bulk commit mid-flight on this chain's tail), resolve it
+ * out of line via cds_ft_node_next_resolve().
  */
 #define cds_ft_node_next_rcu(node)					\
-	((struct cds_ft_node *) ((uintptr_t) rcu_dereference((node)->next) \
-		& ~CDS_FT_NODE_REMOVED_FLAG))
+	_cds_ft_node_next_rcu((void *) rcu_dereference((node)->next))
 
 #define cds_ft_entry(ptr, type, member)		caa_container_of(ptr, type, member)
 
