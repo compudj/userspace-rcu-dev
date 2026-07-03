@@ -318,7 +318,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct ft_detach_run *run,
 		struct cds_ft_inode_flag **orphans,
 		int nr_orphans,
-		struct cds_ft_inode_flag *trailing_orphan)
+		struct cds_ft_inode_flag *trailing_orphan,
+		struct cds_ft_node *freeze_leaf)
 {
 	bool parent_compressed, child_compressed;
 	struct cds_ft_compressed_node *parent_cn, *child_cn;
@@ -360,7 +361,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * new_cn allocation, both BEFORE the build's first side-effect.
 	 */
 	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
-			+ nr_orphans + (trailing_orphan ? 1 : 0));
+			+ nr_orphans + (trailing_orphan ? 1 : 0)
+			+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
 	if (!txn)
 		return -ENOMEM;	/* nothing touched: caller aborts */
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
@@ -443,6 +445,15 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				(struct cds_ft_inode *) child_cn));
 		ft_detach_freeze_orphans(ft, txn, orphans, nr_orphans,
 			trailing_orphan);
+		/*
+		 * The removed external leaf (a single-entry chain, so
+		 * freeze_leaf->next == NULL) freezes atomically with this same
+		 * commit that retires its holder chain (doc §4.B): one MARK(NULL)
+		 * edge, the +1 reserved above.  NULL when the caller is not
+		 * retiring a leaf through this merge.
+		 */
+		if (freeze_leaf)
+			ft_hlist_freeze_prepare(&txn->mtxn, freeze_leaf);
 		ft_remove_commit_rec(ft, &rec, dead_cell, run, txn);
 	}
 
@@ -479,7 +490,7 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		return;
 	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_meta,
 		slot_ptr, surviving_child, surviving_byte, NULL, NULL,
-		NULL, 0, NULL);
+		NULL, 0, NULL, NULL);
 }
 #endif
 
@@ -1100,7 +1111,7 @@ int ft_detach_node(struct cds_ft *ft,
 						detach_parent_flag_ptr,
 						s_child, s_byte, fuse_cell, run,
 						to_free, nr_to_free,
-						trailing_skip_cn_flag);
+						trailing_skip_cn_flag, NULL);
 
 					if (cret == 0) {
 						ret = 0;
@@ -1888,10 +1899,14 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					holder_flag, holder_meta,
 					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte, fuse_cell, NULL,
-					NULL, 0, NULL);
+					NULL, 0, NULL, node);
 
 				if (cret == 0) {
-					ft_node_mark_removed_flip(ft, node);
+					/*
+					 * @node's freeze rode the fused merge commit
+					 * above (freeze_leaf), atomic with the chain
+					 * retire -- no separate mark_removed flip.
+					 */
 					if (fuse_remove)
 						pub.armed = true;
 					ret = 0;
@@ -2310,7 +2325,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte,
 					ft->ordered_list ? dead_cell : NULL,
-					NULL, NULL, 0, NULL);
+					NULL, NULL, 0, NULL, NULL);
 
 				if (cret == 0) {
 					ft_chain_mark_removed_flip(ft, chain_head);
