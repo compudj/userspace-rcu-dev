@@ -491,7 +491,8 @@ int ft_detach_node(struct cds_ft *ft,
 		bool free_detached_subtree,
 		struct ft_ord_cell *fuse_cell,
 		struct ft_remove_pub *pub,
-		struct ft_detach_run *run)
+		struct ft_detach_run *run,
+		struct ft_glue *retire_glue)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
@@ -524,6 +525,7 @@ int ft_detach_node(struct cds_ft *ft,
 	int nr_orphan_free = 0;
 	struct cds_ft_inode_flag *orphan_trailing = NULL;
 	bool free_orphans_pending = false;
+	bool retire_glue_fused = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
 	bool prev_external_nodes_found = false;
 	/*
@@ -1166,7 +1168,8 @@ int ft_detach_node(struct cds_ft *ft,
 				commit_txn = ft_flip_txn_create_bounded(
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
 					+ nr_to_free
-					+ (trailing_skip_cn_flag ? 1 : 0));
+					+ (trailing_skip_cn_flag ? 1 : 0)
+					+ (retire_glue ? retire_glue->cap_free : 0));
 				if (!commit_txn) {
 					ret = -ENOMEM;
 					goto end;
@@ -1200,6 +1203,26 @@ int ft_detach_node(struct cds_ft *ft,
 				ft_detach_freeze_orphans(ft,
 					(pub && commit_txn) ? commit_txn : NULL,
 					to_free, nr_to_free, trailing_skip_cn_flag);
+			/*
+			 * A caller-supplied external retire set (@retire_glue: the
+			 * merge src-side glue's overlap-spine free-list, freed by the
+			 * caller AFTER this detach returns) freezes atomically with the
+			 * SAME unlink that makes it unreachable.  A LIST-ON src detach
+			 * rides @commit_txn here on the branch-2 commit_txn path --
+			 * empirically 100% of merge stress: branch 2, pub != NULL,
+			 * commit_txn present.  Recorded AFTER replace_ptr so a
+			 * recompaction's own DEL tombstone is already in @commit_txn;
+			 * order among tombstones is irrelevant (all commit together).
+			 * A LIST-OFF src detach (pub == NULL) leaves it for the
+			 * standalone fallback at @end -- as do shape-D / a compressed
+			 * parent (a no-op under one writer).
+			 */
+			if (!boundary_fused && retire_glue && pub && commit_txn) {
+				retire_glue->txn = commit_txn;
+				retire_glue->fuse_free_list = true;
+				ft_glue_tombstone_free_list(retire_glue);
+				retire_glue_fused = true;
+			}
 			/*
 			 * In-place key-disappearing remove (the holder stayed
 			 * above min_child, so replace_ptr deferred its single
@@ -1376,6 +1399,32 @@ end:
 	/* Reclaim safely after replacement. */
 	if (old_recompacted_node)
 		free_cds_ft_node(ft, old_recompacted_node);
+
+	/*
+	 * Standalone fallback for a caller-supplied @retire_glue that no commit
+	 * txn absorbed.  A LIST-ON src detach passes pub != NULL and fuses above
+	 * (probed: 100% branch-2 commit_txn); a LIST-OFF src detach passes pub ==
+	 * NULL (no cell to unsplice, run == NULL), so the freeze block's `pub`
+	 * gate fails and the retire set lands here -- the same lone-store residual
+	 * the list-off orphan chain leaves, to be closed once the lone edge is
+	 * forced through a txn.  A theoretical shape-D / compressed-parent detach
+	 * lands here too.  On success (the unlink that stranded the retire set
+	 * committed) freeze it standalone before the caller frees it; on an abort
+	 * (ret != 0) the caller rolls the whole op back and does NOT free it, so
+	 * leave it untouched.  A no-op under one writer either way.
+	 */
+	if (!ret && retire_glue && !retire_glue_fused) {
+		retire_glue->fuse_free_list = false;
+		ft_glue_tombstone_free_list(retire_glue);
+	}
+	/*
+	 * A fused @retire_glue->txn now points at the commit_txn its commit
+	 * reclaimed above -- clear it so a future free-path reader of the glue
+	 * cannot dereference freed memory (nothing reads it on the caller's free
+	 * path today; this is defensive).
+	 */
+	if (retire_glue)
+		retire_glue->txn = NULL;
 
 	/*
 	 * Density was already propagated before structural changes
@@ -1759,7 +1808,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true, fuse_cell, pubp, NULL);
+				key_len, true, fuse_cell, pubp, NULL, NULL);
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
 			else
@@ -1925,7 +1974,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true, fuse_cell, pubp, NULL);
+				key_len, true, fuse_cell, pubp, NULL, NULL);
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
 			else
@@ -2330,7 +2379,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_propagate_external_count_parent(ft, holder_flag, -1);
 		ret = ft_detach_node(ft, head_slot,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
-			dead_cell, ft->ordered_list ? &pub : NULL, NULL);
+			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL);
 		if (ret)
 			ft_propagate_external_count_parent(ft, holder_flag, 1);
 		else

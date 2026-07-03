@@ -898,7 +898,8 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 static
 int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 		const uint8_t *_src_key, size_t src_key_len,
-		unsigned long detached_count, struct ft_detach_run *run)
+		unsigned long detached_count, struct ft_detach_run *run,
+		struct ft_glue *retire_glue)
 {
 	/*
 	 * @src_key is ALREADY ORDINAL (cds_ft_merge_at converts once at its
@@ -961,7 +962,8 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 		struct ft_remove_pub *pubp = run ? &pub : NULL;
 
 		ret = ft_detach_node(src_ft, d.nfp, d.pnfp, d.depth,
-				/*free_detached_subtree=*/ false, NULL, pubp, run);
+				/*free_detached_subtree=*/ false, NULL, pubp, run,
+				retire_glue);
 	}
 	if (ret < 0) {
 		/* Recompaction OOM: undo the propagation; src is pristine. */
@@ -1583,7 +1585,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		}
 		FT_TP(root_publish, (const void *) src_ft, (const void *) src_ft->root);
 	} else if (ft_merge_unlink_src_subtree(src_ft, src_key, src_key_len,
-				cnt_src, ms_ord ? &sdrun : NULL) < 0) {
+				cnt_src, ms_ord ? &sdrun : NULL, &gs) < 0) {
 		/*
 		 * OOM in the last fallible step: @src_ft is left pristine (the run was
 		 * not yet applied -- it commits in ft_detach_node's flip, past the
@@ -1600,17 +1602,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	/*
-	 * Non-root src: ft_merge_unlink_src_subtree's ft_detach_node flip has
-	 * unlinked S (past the last abort above), so the gs overlap spine is now
-	 * unreachable.  Freeze it dead here -- standalone (gs.txn stays NULL ->
-	 * ft_meta_tombstone_set_flip), a safe freeze-AFTER-unlink (no abort
-	 * follows before the free).  True atomic detach for the non-root path
-	 * needs a retire param threaded through the shared ft_detach_node --
-	 * deferred (§4.B residual).  A root src already froze gs fused into its
+	 * Non-root src: gs (the src overlap-spine free-list) is now frozen dead
+	 * ATOMICALLY with the unlink -- ft_merge_unlink_src_subtree threaded gs
+	 * into ft_detach_node as its @retire_glue, so each retired node's
+	 * tombstone rode the SAME commit_txn flip that unlinked S (doc §4.B
+	 * atomic detach).  On the OOM abort above ft_detach_node left gs unmarked
+	 * (src stays pristine, gs still live).  A root src froze gs fused into its
 	 * root swap / flip above.
 	 */
-	if (!root_src)
-		ft_glue_tombstone_free_list(&gs);
 	/*
 	 * Now that the last fallible step has committed, remove src's merged
 	 * subtree (S) run from src's ordered list: its cells disperse to dst
@@ -1939,7 +1938,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * invisible cluster / reserve is released (dst pristine) -- no rollback.
 	 */
 	if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
-			cnt_src, srunp) < 0) {
+			cnt_src, srunp, /*retire_glue=*/ NULL) < 0) {
 		if (run_unlink_txn)
 			ft_flip_txn_destroy(run_unlink_txn);
 		if (run_splice_txn)

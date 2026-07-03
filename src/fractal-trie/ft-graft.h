@@ -2125,7 +2125,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			cds_ft_alloc_reserve_activate(dst_ft, &gs_reserve);
 			dret = ft_detach_node(dst_ft, d.nfp, d.pnfp, d.depth,
 					false, NULL, gs_ord ? &dpub : NULL,
-					gs_ord ? &drun : NULL);
+					gs_ord ? &drun : NULL, NULL);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
 			assert(dret == 0);	/* reserve guarantees no -ENOMEM */
 			(void) dret;
