@@ -727,7 +727,7 @@ int ft_merge_suffix_cmp(const uint8_t *a, size_t la, const uint8_t *b, size_t lb
  *     leaves S-root's parent stale, so a post-unlink src up-walk is unsafe).
  * Both runs share the merge-point prefix, so they merge by comparing those
  * suffixes; an equal-suffix step is a COLLISION (the dst head wins -- its dup
- * chain absorbs the src head via ft_glue_apply_splices -- so the src head is
+ * chain absorbs the src head via ft_glue_record_splices -- so the src head is
  * dropped, a floating duplicate never reachable as a distinct head).
  *
  * Runs in the txn's PREPARE phase, with NO structural proxy installed: the
@@ -1245,11 +1245,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 
 	/*
 	 * Take or create the flip-txn: one latch per dst-origin re-parent edge,
-	 * one for the merge-point forward slot, plus @ms_cap for the ordered-list
-	 * interleave's boundary edges -- structure and ordered list commit in ONE
-	 * flip, so they share this txn.  Reserve it up front to that bound so every
-	 * post-drain record (the structural edges and the INSTALLED-state cell
-	 * edges, which append into the reserved head chunk) is allocation-free.
+	 * one for the merge-point forward slot, @ms_cap for the ordered-list
+	 * interleave's boundary edges, and one per collided duplicate-chain splice
+	 * (the src run tail-append, folded in below so the concatenation flips with
+	 * the structure) -- structure, ordered list AND duplicate chains commit in
+	 * ONE flip, so they share this txn.  Reserve it up front to that bound so
+	 * every post-drain record (the structural edges, the INSTALLED-state cell
+	 * edges and the splice edges, which append into the reserved head chunk) is
+	 * allocation-free.
 	 * The rekey hands in a pre-reserved txn (cannot fail); otherwise create one
 	 * here, where failure aborts the still-invisible build (both tries pristine).
 	 */
@@ -1264,7 +1267,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		if (!txn) {
 			txn = ft_flip_txn_create();
 			if (txn && !ft_flip_txn_reserve(txn,
-					nr_dst + 1 + ms_cap + gd.cap_free)) {
+					nr_dst + 1 + ms_cap + gd.cap_free
+						+ gd.nr_splices)) {
 				ft_flip_txn_destroy(txn);
 				txn = NULL;
 			} else if (txn) {
@@ -1677,9 +1681,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    the merged structural minimum ahead of the ordered-list front.  The
 	 *    collect pre-sets the surviving cells' own links invisibly (not yet
 	 *    ord-reachable) and returns only the visible boundary edges.  It runs
-	 *    before apply_splices (step 5), but collisions are invariant: a collided
-	 *    src head is a floating duplicate (only in the splice record), never a
-	 *    distinct reachable head, so the merge enumerates the same heads either way.
+	 *    before the splice fold (step 3c), but collisions are invariant: a
+	 *    collided src head is a floating duplicate (only in the splice record),
+	 *    never a distinct reachable head, so the merge enumerates the same heads
+	 *    either way -- and 3c reads each demoted head's cell from its still-intact
+	 *    src-run prev, which this collect leaves untouched.
 	 */
 	if (ms_ord) {
 		unsigned int i;
@@ -1696,19 +1702,32 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	}
 
 	/*
+	 * 3c. Duplicate-chain concatenation: fold each collided src run's
+	 *    tail-append into the SAME txn, still in PREPARE.  Recorded AFTER the
+	 *    interleave collect (3b) so each demoted src head's cell is captured
+	 *    from its intact src-run prev before the append overwrites it, and
+	 *    BEFORE the commit so the src duplicates become reachable ATOMICALLY
+	 *    with the merged structure -- a collided key never momentarily shows
+	 *    only its dst duplicates (the old post-commit apply's window).  Each
+	 *    splice is one forward edge (dst tail -> src run), so only the tail
+	 *    carries a proxy; src_head->next rides along.  Splices arise only on
+	 *    this created-txn path -- the rekey take() path targets an absent dst
+	 *    key, so gd.nr_splices is 0 there.
+	 */
+	ft_glue_record_splices(dst_ft, &gd, txn);
+
+	/*
 	 * 4. Commit: one selector flip switches every dst-origin parent, the
 	 *    forward slot, AND every interleave cell edge from old to merged,
 	 *    atomically, then settles each slot to its direct merged target.  (List
-	 *    off with no dst-origin re-parent reduces to a single release store of
-	 *    the forward slot -- no proxy, no grace period.)  Because the forward
+	 *    off with no dst-origin re-parent and no collided splice reduces to a
+	 *    single release store of the forward slot -- no proxy, no grace period.)
+	 *    Because the forward
 	 *    slot flips with the back-pointers, a reader (descend then up-walk) only
 	 *    progresses old->merged; and the ordered-list front advances in the same
 	 *    instant the merged minimum becomes reachable.
 	 */
 	ft_flip_txn_commit(dst_ft, txn);
-
-	/* 5. Concatenate same-key duplicate chains (dst now reachable via M). */
-	ft_glue_apply_splices(dst_ft, &gd);
 
 	/*
 	 * 6. Propagate the dst key-count delta through the ancestors, starting at
@@ -2305,8 +2324,12 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 *
 		 * Size per shape (the rekey recursion lands on spine-copy when @mrg_key
 		 * is occupied, graft when absent):
-		 *   - m > 0 (spine-copy): the structural re-parent (<= m+1) plus, for an
-		 *     ordered merge, the folded interleave's <= 2n+2 cell edges.
+		 *   - m > 0 (spine-copy): the structural re-parent (<= m+1); plus <= n
+		 *     duplicate-chain splice tail-appends (one per full-key collision --
+		 *     the src run appended at the dst tail, folded into this same flip by
+		 *     ft_glue_record_splices, so occupied-key rekeys stay allocation-free
+		 *     post-detach); plus, for an ordered merge, the folded interleave's
+		 *     <= 2n+2 cell edges.
 		 *   - m == 0 (graft): the cluster floor FT_GLUE_FLOOR_DEFERRED + 7, the
 		 *     bound ft_graft_keylen reserves its own txn to -- it covers a GLUE
 		 *     diverge's back-edges + forward + run-splice AND the NOSPLIT store's
@@ -2324,9 +2347,11 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + FT_GLUE_FLOOR_FREE;
 			else if (dst_ft->group->ordered_list_set)
 				pf_cap = (unsigned int) (m + 1) +
-					(unsigned int) (2 * n + 2);
+					(unsigned int) (2 * n + 2) +
+					(unsigned int) n;
 			else
-				pf_cap = (unsigned int) (m + 1);
+				pf_cap = (unsigned int) (m + 1) +
+					(unsigned int) n;
 			pf_txn = ft_flip_txn_create();
 			if (pf_txn && !ft_flip_txn_reserve(pf_txn, pf_cap)) {
 				ft_flip_txn_destroy(pf_txn);

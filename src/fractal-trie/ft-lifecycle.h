@@ -949,7 +949,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 				unsigned int count = 0;
 
 				iter_node = external_nodes;
-				cds_ft_for_each_duplicate(iter_node) {
+				cds_ft_for_each_duplicate_rcu(iter_node) {
 					if (count++ == 0)
 						stats->level[level].nr_metadata_external_nodes++;
 					else
@@ -974,7 +974,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 				unsigned int count = 0;
 
 				iter_node = external_nodes;
-				cds_ft_for_each_duplicate(iter_node) {
+				cds_ft_for_each_duplicate_rcu(iter_node) {
 					if (count++ == 0)
 						stats->level[level].nr_metadata_external_nodes++;
 					else
@@ -995,7 +995,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 				unsigned int count = 0;
 
 				iter_node = (struct cds_ft_node *) ft_node_ptr(cn->child);
-				cds_ft_for_each_duplicate(iter_node) {
+				cds_ft_for_each_duplicate_rcu(iter_node) {
 					if (count++ == 0)
 						stats->level[level + cn->len].nr_external_nodes++;
 					else
@@ -1008,7 +1008,7 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 			unsigned int count = 0;
 
 			iter_node = (struct cds_ft_node *) ft_node_ptr(child_node_flag);
-			cds_ft_for_each_duplicate(iter_node) {
+			cds_ft_for_each_duplicate_rcu(iter_node) {
 				if (count++ == 0)
 					stats->level[level].nr_external_nodes++;
 				else

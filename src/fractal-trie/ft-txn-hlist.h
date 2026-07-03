@@ -188,6 +188,34 @@ int ft_hlist_insert_after_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
+ * ft_hlist_append_run_prepare: record the append of a whole null-terminated RUN
+ * at a chain @tail (tail->next == NULL, as walked by the caller), WITHOUT
+ * committing.  Unlike ft_hlist_insert_after_prepare this does NOT touch
+ * @run_head->next, so @run_head's own chain (run_head->next -> ...) rides along
+ * unmodified -- a run-splice, not a single insert (a merge concatenating a src
+ * duplicate run onto a dst tail).  The forward link tail->next: NULL -> run_head
+ * is the lone recorded edge and the serializing one (CAS old = NULL: a
+ * concurrent freeze of the tail fails this commit), so only the tail carries a
+ * proxy while the commit is in flight; the interior of neither run is disturbed.
+ * @run_head->prev = tail is a writer-only plain store -- readers never read prev,
+ * and @run_head is caller-guaranteed unreachable to readers here (a merge
+ * detaches + drains the src side before appending it).
+ */
+static inline
+void ft_hlist_append_run_prepare(struct urcu_mcas_txn *txn,
+		struct cds_ft_node *tail,
+		struct cds_ft_node *run_head)
+{
+	int ret;
+
+	run_head->prev = tail;		/* writer-only plain store */
+	ret = urcu_txn_store(txn, (void **) &tail->next, NULL, run_head,
+			FT_HLIST_TAG);
+	assert(!ret);			/* caller reserved the edge up front */
+	(void) ret;
+}
+
+/*
  * ft_hlist_del_prepare: record the unlink of @elem into @txn WITHOUT committing.
  * @elem's predecessor is @elem->prev; the forward slot &pred->next transitions
  * @elem -> @next and is the serializing edge.  Returns 0 if recorded (on a

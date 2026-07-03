@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 298
+#define NR_TESTS 299
 #else
-#define NR_TESTS 256
+#define NR_TESTS 257
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -6484,6 +6484,79 @@ static int test_merge_rekey_same_trie_ordered(void)
 out:
 	if (iter)
 		cds_ft_iter_destroy(iter);
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/* Count the nodes on @k's duplicate chain (0 if the key is absent). */
+static unsigned int ft_test_dup_count(struct cds_ft *ft, const char *k)
+{
+	struct cds_ft_node *head = NULL, *n;
+	unsigned int c = 0;
+
+	if (cds_ft_eager_lookup_key(ft, (const uint8_t *) k, strlen(k), 0,
+			&head) != CDS_FT_STATUS_OK)
+		return 0;
+	n = head;
+	cds_ft_for_each_duplicate_rcu(n)
+		c++;
+	return c;
+}
+
+/*
+ * Same-trie LIST-OFF rekey into an OCCUPIED destination WITH full-key
+ * collisions.  Rekeying the "S" subtree {Sm, Sn} onto the occupied "D" subtree
+ * {Dm, Dn} demotes "Sm"->"Dm" and "Sn"->"Dn" to duplicate splices.  With the
+ * list off, the same-trie rekey takes the pre-reserved take() path and the
+ * splice tail-appends are folded into that pre-reserved flip -- so its
+ * reservation must budget them.  Regression: the take-path pf_cap omitted the
+ * splice edges (the list-off m>0 branch reserved only m+1), so the folded
+ * splices grew the flip descriptor with a malloc inside the rekey's
+ * guaranteed-allocation-free post-detach region (and lost a key / asserted under
+ * memory pressure).  Verify every merged key survives, each collided key as a
+ * 2-node duplicate chain (kept dst head + demoted src).
+ */
+static int test_merge_rekey_same_trie_listoff_collision(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	rcu_read_lock();
+
+	cds_ft_insert(ft, (const uint8_t *) "Dm", 2, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "Dn", 2, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "Sm", 2, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "Sn", 2, &node_alloc(4)->node);
+
+	/* Rekey "S" -> "D": Sm->Dm and Sn->Dn COLLIDE (demoted to duplicates). */
+	s = ft_rekey(ft, "D", "S");
+	if (s != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "Dm") || !ft_test_has_key(ft, "Dn") ||
+	    ft_test_has_key(ft, "Sm") || ft_test_has_key(ft, "Sn") ||
+	    ft_test_dup_count(ft, "Dm") != 2 ||
+	    ft_test_dup_count(ft, "Dn") != 2) {
+		fprintf(stderr, "listoff rekey collision failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
 	drain_trie(ft);
 	rcu_barrier();
 	cds_ft_destroy(ft);
@@ -23663,6 +23736,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
+	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_nonidentity_bulk_ops);
 	RUN_TEST(test_merge_at_overflow);
 

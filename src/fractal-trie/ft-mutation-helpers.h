@@ -2460,7 +2460,8 @@ struct ft_glue_free_item {
  * and its back-pointer (@dst_head->prev = that node) are wired by the ordinary
  * Phase-1 set + deferred edge, exactly like any other re-parented external.
  * This struct carries ONLY the concatenation, which is publication-visible on
- * two live chains and is applied at commit by ft_glue_apply_splices,
+ * two live chains and is recorded into the bulk merge txn by
+ * ft_glue_record_splices (so it flips atomically with the structure),
  * AFTER the source has been detached + drained: the @src_head chain is appended
  * to @dst_head's tail (prev-before-next, the ft_chain_node idiom, but preserving
  * src_head->next so the rest of the src chain rides along).
@@ -2470,7 +2471,7 @@ struct ft_glue_splice {
 	struct cds_ft_node *src_head;		/* appended to dst_head's tail */
 	/*
 	 * The demoted @src_head's ordered-list cell, captured by
-	 * ft_glue_apply_splices.  It stays REACHABLE through its src-run
+	 * ft_glue_record_splices.  It stays REACHABLE through its src-run
 	 * neighbours' stale ord_prev/ord_next until the post-publish interleave
 	 * rewires them, so it is freed only by
 	 * ft_glue_free_collided_cells, called after the interleave, via
@@ -3229,18 +3230,25 @@ void ft_glue_record_splice(struct ft_glue *g,
 }
 
 /*
- * Commit: apply the deferred duplicate-chain splices.  Call AFTER the source
- * has been detached + drained (so the appended @src_head chain has no second
- * owner traversing it from the source tree).
+ * Record the deferred duplicate-chain splices into the bulk merge @txn, still in
+ * PREPARE (before the commit).  Call AFTER the source has been detached + drained
+ * (so the appended @src_head chain has no second owner traversing it from the
+ * source tree), and AFTER the ordered-list interleave has been collected (so each
+ * @src_head's cell is still captured from its intact src-run prev before the
+ * append overwrites it).
  *
  * Per splice: append the whole src chain to dst's tail, prev-before-next (the
- * ft_chain_node idiom, but preserving src_head->next so the rest of the src
- * chain rides along).  @dst_head stays the head, so in-flight dst snapshots
- * keep their ordering.
+ * ft_chain_node idiom, but preserving src_head->next so the rest of the src chain
+ * rides along), recorded as a single forward edge into @txn so the concatenation
+ * flips ATOMICALLY with the structural publish -- a collided key's full duplicate
+ * set (dst + src) becomes reachable in one instant, closing the old post-commit
+ * window.  Only the dst tail carries an engine proxy while the commit is in
+ * flight (readers resolve it via cds_ft_node_next_rcu).  @dst_head stays the
+ * head, so in-flight dst snapshots keep their ordering.
  */
 static
-void ft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
-		struct ft_glue *g)
+void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
+		struct ft_flip_txn *txn)
 {
 	int i;
 
@@ -3265,11 +3273,17 @@ void ft_glue_apply_splices(struct cds_ft *ft __attribute__((unused)),
 
 		while (ft_node_next(tail))
 			tail = ft_node_next(tail);
-		src_head->prev = tail;	/* write-side only, plain store */
-		/* @src_head (an already-published src head) becomes a duplicate
-		 * at the tail of @dst_head's chain: the forward link is the
-		 * reader-visible publish -> single-edge flip descriptor. */
-		ft_chain_next_flip(ft, &tail->next, NULL, src_head);
+		/*
+		 * @src_head (an already-published, detached+drained src head)
+		 * becomes a duplicate at the tail of @dst_head's chain.  Record
+		 * the reader-visible forward link tail->next: NULL -> src_head
+		 * into the bulk merge @txn (the run rides along via src_head->next,
+		 * which is untouched; src_head->prev = tail is a writer-only plain
+		 * store inside the primitive).  The tail-walk above reads unmodified
+		 * slots -- recorded edges do not install until the commit -- so it
+		 * always finds the true pre-merge tail.
+		 */
+		ft_hlist_append_run_prepare(&txn->mtxn, tail, src_head);
 	}
 }
 
