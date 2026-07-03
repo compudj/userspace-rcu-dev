@@ -503,7 +503,8 @@ int ft_detach_node(struct cds_ft *ft,
 		struct ft_ord_cell *fuse_cell,
 		struct ft_remove_pub *pub,
 		struct ft_detach_run *run,
-		struct ft_glue *retire_glue)
+		struct ft_glue *retire_glue,
+		struct cds_ft_node *freeze_leaf)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
@@ -537,6 +538,7 @@ int ft_detach_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag *orphan_trailing = NULL;
 	bool free_orphans_pending = false;
 	bool retire_glue_fused = false;
+	bool freeze_leaf_fused = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
 	bool prev_external_nodes_found = false;
 	/*
@@ -863,7 +865,8 @@ int ft_detach_node(struct cds_ft *ft,
 				ft_flip_txn_create_bounded(
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
 					+ nr_to_free
-					+ (trailing_skip_cn ? 1 : 0));
+					+ (trailing_skip_cn ? 1 : 0)
+					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
 
 			if (!orphan_txn) {
 				ret = -ENOMEM;
@@ -882,6 +885,16 @@ int ft_detach_node(struct cds_ft *ft,
 					cds_ft_item_to_metadata(
 						(struct cds_ft_inode *)
 						trailing_skip_cn));
+			/*
+			 * The removed external leaf freezes atomically with this
+			 * compressed-parent replace that unlinks its chain (doc §4.B):
+			 * one MARK edge into @orphan_txn, the +1 reserved above.
+			 */
+			if (freeze_leaf) {
+				ft_hlist_freeze_prepare(&orphan_txn->mtxn,
+					freeze_leaf);
+				freeze_leaf_fused = true;
+			}
 			ret = ft_detach_node_replace_compressed_parent(ft,
 				iter_node_flag, detach_parent_flag_ptr,
 				topmost_external_nodes, &nr_clear, fuse_cell,
@@ -1111,11 +1124,13 @@ int ft_detach_node(struct cds_ft *ft,
 						detach_parent_flag_ptr,
 						s_child, s_byte, fuse_cell, run,
 						to_free, nr_to_free,
-						trailing_skip_cn_flag, NULL);
+						trailing_skip_cn_flag, freeze_leaf);
 
 					if (cret == 0) {
 						ret = 0;
 						boundary_fused = true;
+						if (freeze_leaf)
+							freeze_leaf_fused = true;
 						/*
 						 * Shape-D already fused @fuse_cell's unsplice
 						 * (ft_chain_compress_fused -> ft_remove_commit_rec)
@@ -1180,7 +1195,8 @@ int ft_detach_node(struct cds_ft *ft,
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
 					+ nr_to_free
 					+ (trailing_skip_cn_flag ? 1 : 0)
-					+ (retire_glue ? retire_glue->cap_free : 0));
+					+ (retire_glue ? retire_glue->cap_free : 0)
+					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
 				if (!commit_txn) {
 					ret = -ENOMEM;
 					goto end;
@@ -1233,6 +1249,21 @@ int ft_detach_node(struct cds_ft *ft,
 				retire_glue->fuse_free_list = true;
 				ft_glue_tombstone_free_list(retire_glue);
 				retire_glue_fused = true;
+			}
+			/*
+			 * The removed external leaf (single-entry chain, node->next
+			 * == NULL) freezes atomically with the SAME unlink: recorded
+			 * into @commit_txn beside the orphan tombstones (the +1
+			 * reserved above) when the in-place / recompaction commit
+			 * consumes it (pub && commit_txn).  The list-off pub-less
+			 * direct-store path (commit_txn NULL) keeps the standalone
+			 * fallback at @end -- a no-op under one writer; shape-D already
+			 * froze it in its merge flip.
+			 */
+			if (!boundary_fused && freeze_leaf && pub && commit_txn) {
+				ft_hlist_freeze_prepare(&commit_txn->mtxn,
+					freeze_leaf);
+				freeze_leaf_fused = true;
 			}
 			/*
 			 * In-place key-disappearing remove (the holder stayed
@@ -1428,6 +1459,18 @@ end:
 		retire_glue->fuse_free_list = false;
 		ft_glue_tombstone_free_list(retire_glue);
 	}
+	/*
+	 * Standalone fallback for the removed external leaf when no commit txn
+	 * absorbed its freeze: the list-off pub-less direct-store detach (pub ==
+	 * NULL leaves @commit_txn NULL, so the freeze block's `pub` gate fails) --
+	 * the same lone-store residual as the list-off orphan chain, to be closed
+	 * once the lone edge is forced through a txn.  On success (the unlink that
+	 * stranded it committed) freeze @node before the caller reclaims it; on an
+	 * abort (ret != 0) leave it chained.  Behaviour-identical to the old
+	 * caller-side mark; a no-op under one writer.
+	 */
+	if (!ret && freeze_leaf && !freeze_leaf_fused)
+		ft_node_mark_removed_flip(ft, freeze_leaf);
 	/*
 	 * A fused @retire_glue->txn now points at the commit_txn its commit
 	 * reclaimed above -- clear it so a future free-path reader of the glue
@@ -1837,11 +1880,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true, fuse_cell, pubp, NULL, NULL);
+				key_len, true, fuse_cell, pubp, NULL, NULL, node);
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
-			else
-				ft_node_mark_removed_flip(ft, node);
+			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/*
 			 * Removing the head, duplicates remain: key count unchanged.
@@ -2011,11 +2053,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true, fuse_cell, pubp, NULL, NULL);
+				key_len, true, fuse_cell, pubp, NULL, NULL, node);
 			if (ret)
 				ft_propagate_external_count_parent(ft, holder_flag, 1);
-			else
-				ft_node_mark_removed_flip(ft, node);
+			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
 			ret = ft_unchain_node(ft, holder_flag,
@@ -2416,7 +2457,8 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		ft_propagate_external_count_parent(ft, holder_flag, -1);
 		ret = ft_detach_node(ft, head_slot,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
-			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL);
+			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL,
+			NULL);
 		if (ret)
 			ft_propagate_external_count_parent(ft, holder_flag, 1);
 		else
