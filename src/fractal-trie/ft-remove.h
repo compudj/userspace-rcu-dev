@@ -509,6 +509,21 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	struct ft_flip_txn *commit_txn = NULL;
 	bool commit_txn_used = false;
+	/*
+	 * Branch-2 (non-compressed parent) orphan chain, freed AFTER the commit
+	 * that unlinks it -- below the recompaction republish, not in the
+	 * pre-republish !ret block.  A recompaction defers its forward commit
+	 * (@commit_txn) to the parent-slot block far below, so deferring the free
+	 * to there lets every freed node's freeze-on-free tombstone (recorded INTO
+	 * @commit_txn) flip ATOMICALLY with that unlink -- and frees only after the
+	 * structural unlink, never before it.  The set is copied out of the
+	 * branch-2 to_free[] on a successful detach; @free_orphans_pending gates
+	 * the deferred walk.
+	 */
+	struct cds_ft_inode_flag *orphan_free[FT_MAX_DEPTH];
+	int nr_orphan_free = 0;
+	struct cds_ft_inode_flag *orphan_trailing = NULL;
+	bool free_orphans_pending = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
 	bool prev_external_nodes_found = false;
 	/*
@@ -1170,21 +1185,20 @@ int ft_detach_node(struct cds_ft *ft,
 			/*
 			 * Freeze the collected orphan chain (+ trailing skip-target)
 			 * before the free below (doc §4.B, atomic detach).  Now that
-			 * replace_ptr has run, its outcome selects where the freeze
-			 * rides: an IN-PLACE delete (pub->armed) commits @commit_txn via
-			 * ft_remove_one_commit just below -- BEFORE the free -- so record
-			 * the tombstones INTO it and they flip ATOMICALLY with that
-			 * unlink.  A RECOMPACTION (pub unarmed) defers its forward
-			 * republish past this free (to the parent-slot block below), and
-			 * the list-off pub-less path does a direct lone store, so both
-			 * mark STANDALONE here (before the free) -- a no-op under one
-			 * writer; their full fusion needs the free hoisted past the
-			 * republish.  Shape-D already recorded into its own merge flip.
+			 * replace_ptr has run, record the tombstones INTO the commit
+			 * that unlinks the chain, since the free is now deferred past ALL
+			 * of them (below the republish block).  pub != NULL always reserves
+			 * and consumes @commit_txn -- via ft_remove_one_commit for an
+			 * in-place delete, or the recompaction republish in the parent-slot
+			 * block -- so the freeze flips ATOMICALLY with that unlink and an
+			 * aborted commit discards it.  The list-off pub-less path does a
+			 * direct lone store that never touches @commit_txn, so it keeps a
+			 * standalone freeze (NULL txn) -- a no-op under one writer.  Shape-D
+			 * already recorded into its own merge flip.
 			 */
 			if (!boundary_fused && (nr_to_free > 0 || trailing_skip_cn_flag))
 				ft_detach_freeze_orphans(ft,
-					(pub && pub->armed && commit_txn) ?
-						commit_txn : NULL,
+					(pub && commit_txn) ? commit_txn : NULL,
 					to_free, nr_to_free, trailing_skip_cn_flag);
 			/*
 			 * In-place key-disappearing remove (the holder stayed
@@ -1206,27 +1220,19 @@ int ft_detach_node(struct cds_ft *ft,
 				commit_txn_used = (commit_txn != NULL);
 			}
 			/*
-			 * Free the old detach subtree: the orphan chain from
-			 * @elevated_old_child down, collected AND tombstoned before
-			 * the commit above (the freeze-on-free walk at the top of
-			 * this branch).  The commit unlinked it, so reclaim it now --
-			 * the trailing skip-target compressed node first (the chain
-			 * end's path bytes; its external leaf stays caller-owned),
-			 * then every collected node (RCU-deferred).
+			 * Hand the collected orphan chain off to the deferred free
+			 * below the republish block (@orphan_free): a recompaction's
+			 * forward unlink commits down there, so the reclaim must wait
+			 * for it (a freed node's freeze-on-free tombstone commits with
+			 * that unlink, and the free must follow the structural unlink,
+			 * not precede it).  The tombstones are already recorded above --
+			 * into @commit_txn (pub) or standalone (list-off).
 			 */
-			if (trailing_skip_cn_flag)
-				free_compressed_node(ft,
-					ft_skip_to_compressed(ft,
-						trailing_skip_cn_flag));
-			for (fi = 0; fi < nr_to_free; fi++) {
-				if (ft_node_compressed(to_free[fi]))
-					free_compressed_node(ft,
-						ft_compressed_node_ptr(
-							to_free[fi]));
-				else
-					free_cds_ft_node(ft,
-						ft_node_ptr(to_free[fi]));
-			}
+			for (fi = 0; fi < nr_to_free; fi++)
+				orphan_free[fi] = to_free[fi];
+			nr_orphan_free = nr_to_free;
+			orphan_trailing = trailing_skip_cn_flag;
+			free_orphans_pending = true;
 		}
 	}
 	if (ret)
@@ -1336,6 +1342,28 @@ int ft_detach_node(struct cds_ft *ft,
 				iter_meta, detach_parent_flag_ptr);
 		}
 #endif
+	}
+	/*
+	 * Deferred branch-2 orphan free (see @orphan_free): runs AFTER the commit
+	 * that unlinked the chain -- the in-place ft_remove_one_commit or the
+	 * recompaction republish above -- so every freed node's freeze-on-free
+	 * tombstone has already committed and the reclaim follows the structural
+	 * unlink.  An abort takes `goto end` above and bypasses this; the flag is
+	 * set only on a branch-2 success.
+	 */
+	if (free_orphans_pending) {
+		int fj;
+
+		if (orphan_trailing)
+			free_compressed_node(ft, ft_skip_to_compressed(ft,
+				orphan_trailing));
+		for (fj = 0; fj < nr_orphan_free; fj++) {
+			if (ft_node_compressed(orphan_free[fj]))
+				free_compressed_node(ft,
+					ft_compressed_node_ptr(orphan_free[fj]));
+			else
+				free_cds_ft_node(ft, ft_node_ptr(orphan_free[fj]));
+		}
 	}
 end:
 	/*
