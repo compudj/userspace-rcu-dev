@@ -139,6 +139,7 @@
 #include "ft-tables.h"
 #include "ft-delay.h"
 #include "ft-helpers.h"
+#include "ft-txn-hlist.h"	/* duplicate-chain transactional hlist (unused until wired) */
 #include "ft-trace-helpers.h"
 #include "ft-lookup-node.h"
 #include "ft-descent.h"

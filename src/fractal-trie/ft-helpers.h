@@ -46,7 +46,7 @@ void static_array_size_check(void)
 }
 
 /*
- * Reader-side helpers for the cds_ft_node.next removal tombstone (low bit,
+ * Reader-side helpers for the cds_ft_node.next removal tombstone (bit 1,
  * see CDS_FT_NODE_REMOVED_FLAG).  These run under the writer mutex (or RCU
  * read lock on the chain-walk side), so a plain masked load is sufficient;
  * readers use cds_ft_node_next_rcu() instead.

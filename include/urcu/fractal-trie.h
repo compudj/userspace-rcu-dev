@@ -504,18 +504,21 @@ struct cds_ft_node {
 };
 
 /*
- * Library-internal: the low bit of cds_ft_node.next is a removal
- * tombstone.  The mutation side sets it when the node leaves the trie
- * (so a position-based remove can detect an already-removed node in
- * O(1) without re-descending), and every chain traversal masks it off.
- * Node pointers are at least 2-byte aligned, so bit 0 is always free.
+ * Library-internal: bit 1 of cds_ft_node.next is a removal tombstone.  The
+ * mutation side sets it when the node leaves the trie (so a position-based
+ * remove can detect an already-removed node in O(1) without re-descending),
+ * and every chain traversal masks it off.  Bit 0 is reserved for the
+ * transactional engine's in-band proxy tag, so that the duplicate chain can be
+ * committed as a concurrent transaction (a mid-commit "next" carries the proxy
+ * on bit 0; the accessor below resolves it once the chain rides the engine).
+ * cds_ft_node is naturally (pointer) aligned, so both low bits are always free.
  *
  * Applications must therefore not read cds_ft_node.next directly: walk
  * duplicate chains via cds_ft_node_next_rcu() (which masks the bit), or
  * the cds_ft_for_each_duplicate*() macros built on it, and treat a
  * removed node as opaque until re-initialized with cds_ft_node_init().
  */
-#define CDS_FT_NODE_REMOVED_FLAG	1UL
+#define CDS_FT_NODE_REMOVED_FLAG	2UL
 
 /*
  * Masked rcu_dereference of a duplicate's successor (masks the removal
