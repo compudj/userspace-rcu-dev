@@ -2253,13 +2253,16 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 *     diverge's back-edges + forward + run-splice AND the NOSPLIT store's
 		 *     slot proxy + run edges (FT_GRAFT_RUN_FLIP_CAP), whichever the graft
 		 *     point turns out to be, plus +1 for a recompact-relocate retire's
-		 *     tombstone fused into the commit (atomic detach, §4.B).
+		 *     tombstone fused into the commit (atomic detach, §4.B), plus
+		 *     + FT_GLUE_FLOOR_FREE for the graft's floor-bounded free-list
+		 *     tombstones -- so the take() path fuses them too (matching the
+		 *     ft_graft_keylen create-path reservation exactly).
 		 */
 		{
 			unsigned int pf_cap;
 
 			if (m == 0)
-				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7;
+				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + FT_GLUE_FLOOR_FREE;
 			else if (dst_ft->group->ordered_list_set)
 				pf_cap = (unsigned int) (m + 1) +
 					(unsigned int) (2 * n + 2);

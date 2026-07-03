@@ -1033,14 +1033,19 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
-			/*
-			 * Reserved the free-list headroom above, so fuse each retired
-			 * node's freeze into glue.txn (atomic detach).  The rekey take()
-			 * path keeps the standalone flip (its pre_txn is pre-sized by the
-			 * rekey with no post-detach allocation allowed).
-			 */
-			glue.fuse_free_list = true;
 		}
+		/*
+		 * Fuse each retired free-list node's freeze into glue.txn (atomic
+		 * detach, §4.B): each tombstone rides the same commit as the forward
+		 * publish that unlinks it, so the retired set freezes dead atomically
+		 * with the unlink.  Both txn sources carry the <= FT_GLUE_FLOOR_FREE
+		 * tombstone headroom: the create path reserves + FLOOR_FREE just above,
+		 * and the rekey take() path's pre_txn is pre-sized to the same
+		 * floor-bounded cluster + FLOOR_FREE by ft_merge_at_inner's m == 0
+		 * graft branch (ft-merge.h).  The graft never calls ft_glue_reserve, so
+		 * cap_free stays FT_GLUE_FLOOR_FREE and that headroom is the exact bound.
+		 */
+		glue.fuse_free_list = true;
 		prep = ft_graft_build(dst_ft, key, key_len, graft_payload,
 				src_count, &d, &glue);
 		if (prep == FT_GRAFT_PREP_OOM) {
