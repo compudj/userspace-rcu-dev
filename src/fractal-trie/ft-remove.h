@@ -1571,19 +1571,26 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 	FT_TP(unchain_node, (const void *) head_slot, (const void *) node,
 		!ft_node_external((struct cds_ft_inode_flag *) node->prev));
 	if (ft_node_external((struct cds_ft_inode_flag *) node->prev)) {
-		/* Non-head: prev is a cds_ft_node. */
-		struct cds_ft_node *prev_node =
-			(struct cds_ft_node *) node->prev;
-
-		if (next_node)
-			next_node->prev = node->prev;
 		/*
-		 * Relink the chain past @node: prev_node->next transitions from
-		 * @node to its successor.  @next_node is already published, so a
-		 * lone-edge flip (one release store) expresses the reader-visible
-		 * forward link as an MCAS descriptor edge.
+		 * Non-head interior duplicate (prev is a cds_ft_node): atomic
+		 * detach.  ft_hlist_del_prepare freezes @node (marks node->next),
+		 * relinks the chain past it (prev_node->next: node -> next_node) and
+		 * fixes the back-link (next_node->prev: node -> prev_node) in ONE
+		 * commit -- freeze and unlink land together (doc §4.B), so once this is
+		 * a concurrent engine a racing del(node)/insert_after(node) fails its
+		 * old-value check.  Multi-edge: a reader resolves the transient
+		 * interior-next proxies via cds_ft_node_next_rcu.  This subsumes the
+		 * common ft_node_mark_removed freeze below, so it returns directly.
+		 * Abortable cleanly: on a txn-alloc OOM nothing is recorded or
+		 * published and @node stays fully chained.
 		 */
-		ft_chain_next_flip(ft, &prev_node->next, node, next_node);
+		struct ft_flip_txn *txn =
+			ft_flip_txn_create_bounded(FT_HLIST_DEL_MAX_EDGES);
+
+		if (!txn)
+			return -ENOMEM;
+		(void) ft_hlist_del_prepare(&txn->mtxn, node);
+		return ft_flip_txn_commit(ft, txn) < 0 ? -ENOMEM : 0;
 	} else if (next_node) {
 		/*
 		 * Head with a successor: prev is the cell flag (list on) or the
