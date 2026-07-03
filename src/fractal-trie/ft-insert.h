@@ -2665,9 +2665,10 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	 * single predecessor->next store; a list-off head inherits the flagged
 	 * parent and flips the structural + SKIP_X dual.  Mirrors ft_promote_head.
 	 */
+	bool is_head = !ft_node_external(
+		(struct cds_ft_inode_flag *) old_node->prev);
+
 	{
-		bool is_head = !ft_node_external(
-			(struct cds_ft_inode_flag *) old_node->prev);
 		struct cds_ft_inode_flag *parent_nf = cn ?
 			ft_compressed_node_flag(cn) : holder_flag;
 		struct ft_ord_cell *old_cell = (ft->ordered_list && is_head) ?
@@ -2694,17 +2695,37 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		new_node->next = ft_node_next(old_node);
 		if (!is_head) {
 			/*
-			 * Non-head duplicate: the predecessor->next forward link
-			 * (old_node -> new_node) is the single reader-visible
-			 * publish -> express it as a single-edge flip descriptor.
-			 * The successor's prev back-edge is a plain store ordered
-			 * before that infallible lone-edge flip.
+			 * Non-head duplicate: atomic replace.  ft_hlist_replace_
+			 * prepare marks @old_node (freeze), swings the predecessor's
+			 * next (old_node -> new_node) and the successor's prev
+			 * (old_node -> new_node) to @new_node, and builds @new_node's
+			 * links, in ONE commit -- the freeze rides the swap (doc
+			 * §4.B), so a racing del/insert_after fails its old-value
+			 * check once this is a concurrent engine.  Multi-edge: readers
+			 * resolve the transient interior-next proxies via
+			 * cds_ft_node_next_rcu.  It marks @old_node, so the common
+			 * freeze below is skipped for this case.  Abortable cleanly:
+			 * on a txn-alloc OOM nothing is published and @old_node /
+			 * @new_node are intact.
 			 */
-			if (new_node->next)
-				new_node->next->prev = new_node;
-			new_node->prev = old_node->prev;
-			ft_chain_next_flip(ft, (struct cds_ft_node **) pub_slot,
+			struct ft_flip_txn *txn =
+				ft_flip_txn_create_bounded(
+					FT_HLIST_REPLACE_MAX_EDGES);
+
+			if (!txn) {
+				new_node->next = NULL;
+				s = CDS_FT_STATUS_MEMORY_ERROR;
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
+			(void) ft_hlist_replace_prepare(&txn->mtxn,
 				old_node, new_node);
+			if (ft_flip_txn_commit(ft, txn) < 0) {
+				new_node->next = NULL;
+				s = CDS_FT_STATUS_MEMORY_ERROR;
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
 		} else if (old_cell) {
 			/*
 			 * Head, list on: fresh-cell swap fused with the publish.
@@ -2771,9 +2792,11 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	/*
 	 * @old_node has left the trie (replaced by @new_node): tombstone it.
 	 * Its next pointer is preserved so a concurrent reader positioned on
-	 * @old_node still follows the chain.
+	 * @old_node still follows the chain.  The non-head atomic replace above
+	 * already marked it inside its commit, so only the head cases freeze here.
 	 */
-	ft_node_mark_removed_flip(ft, old_node);
+	if (is_head)
+		ft_node_mark_removed_flip(ft, old_node);
 
 
 	/*
