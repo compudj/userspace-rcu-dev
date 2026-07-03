@@ -1250,7 +1250,7 @@ int ft_detach_node(struct cds_ft *ft,
 			if (!boundary_fused && pub && pub->armed) {
 				ft_remove_one_commit(ft, pub->slot, pub->old_val,
 					pub->new_val, pub->state_meta,
-					fuse_cell, run, commit_txn);
+					fuse_cell, run, commit_txn, NULL);
 				commit_txn_used = (commit_txn != NULL);
 			}
 			/*
@@ -1940,12 +1940,16 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					ret = ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) node, NULL,
-						NULL, dead_cell, NULL, NULL);
+						NULL, dead_cell, NULL, NULL, node);
 					if (ret) {
 						ft_propagate_external_count_parent(ft,
 							holder_flag, 1);
 					} else {
-						ft_node_mark_removed_flip(ft, node);
+						/*
+						 * @node's freeze rode the commit above
+						 * (freeze_leaf), atomic with the external_nodes
+						 * clear -- no separate mark_removed flip.
+						 */
 						pub.armed = true;
 					}
 				} else {
@@ -2194,7 +2198,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			if (ft_remove_one_commit(ft,
 				(struct cds_ft_inode_flag **) &metadata->external_nodes,
 				(struct cds_ft_inode_flag *) external_nodes, NULL,
-				NULL, dead, NULL, NULL)) {
+				NULL, dead, NULL, NULL, NULL)) {
 				ft_nr_keys_store(ft,metadata,
 					ft_nr_keys_get(metadata) + 1, CMM_RELEASE);
 				*result_node = NULL;
@@ -2364,7 +2368,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					ret = ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) chain_head, NULL,
-						NULL, dead_cell, NULL, NULL);
+						NULL, dead_cell, NULL, NULL, NULL);
 					if (ret)
 						ft_propagate_external_count_parent(ft,
 							holder_flag, 1);

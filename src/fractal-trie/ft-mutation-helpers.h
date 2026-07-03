@@ -1504,9 +1504,10 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		struct cds_ft_metadata *state_meta,
 		struct ft_ord_cell *dead_cell,
 		struct ft_detach_run *run,
-		struct ft_flip_txn *txn)
+		struct ft_flip_txn *txn,
+		struct cds_ft_node *freeze_leaf)
 {
-	struct ft_ord_cell_edge edges[6] = { 0 };	/* 1 structural + state + <=4 cell/run */
+	struct ft_ord_cell_edge edges[7] = { 0 };	/* 1 struct + state + <=4 cell/run + leaf freeze */
 	unsigned int n = 0;
 
 	edges[n].slot = (struct ft_ord_cell **) struct_slot;
@@ -1518,6 +1519,27 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			&run->first, &run->last, edges, n);
 	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
+	/*
+	 * A removed external leaf freezes atomically with this same commit that
+	 * unlinks it (doc §4.B): record its one MARK edge (freeze_leaf->next ->
+	 * MARK(next), a single-entry chain so next is NULL) beside the structural +
+	 * cell edges.  FT_HLIST_TAG (== URCU_MCAS_TAG) so a reader resolves a parked
+	 * proxy via cds_ft_node_next_rcu; byte-identical to ft_hlist_freeze_prepare.
+	 * On the @txn NULL path this makes n >= 2, so the infallible lone-edge
+	 * on-stack store yields to a bounded flip-txn -- the single-writer force-txn
+	 * cost of the atomic detach, a clean OOM abort (nothing installed, leaf stays
+	 * chained).  NULL when the caller is not retiring a leaf here.
+	 */
+	if (freeze_leaf) {
+		void *cur = freeze_leaf->next;
+
+		edges[n].slot = (struct ft_ord_cell **) &freeze_leaf->next;
+		edges[n].old_target = (struct ft_ord_cell *) cur;
+		edges[n].new_target = (struct ft_ord_cell *)
+			ft_hlist_set_mark((struct cds_ft_node *) cur);
+		edges[n].tag = FT_HLIST_TAG;
+		n++;
+	}
 	/*
 	 * @state_meta non-NULL (a delete): fuse its nr_child-- into THIS flip so
 	 * the structural unlink and the count decrement go live atomically.  Only
