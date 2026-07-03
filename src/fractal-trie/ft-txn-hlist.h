@@ -84,6 +84,17 @@
 /* Logical-deletion mark: the public cds_ft_node removal tombstone (bit 1). */
 #define FT_HLIST_MARK	CDS_FT_NODE_REMOVED_FLAG
 
+/*
+ * Worst-case MCAS edge counts, for the caller's txn reservation.  A tail append
+ * (succ == NULL) records only the single pos->next edge; a mid-chain insert also
+ * records the succ->next load-validate guard and the succ->prev back-edge.  del
+ * and replace touch elem->next (mark), pred->next, next->prev plus the
+ * next->next guard.
+ */
+#define FT_HLIST_INSERT_AFTER_MAX_EDGES	3
+#define FT_HLIST_DEL_MAX_EDGES		4
+#define FT_HLIST_REPLACE_MAX_EDGES	4
+
 static inline
 void *ft_hlist_set_mark(struct cds_ft_node *n)
 {

@@ -1314,24 +1314,34 @@ check_error:
 }
 
 static
-void ft_chain_node(struct cds_ft *ft, struct cds_ft_node *last_node,
+int ft_chain_node(struct cds_ft *ft, struct cds_ft_node *last_node,
 		struct cds_ft_node *node)
 {
+	struct ft_flip_txn *t;
+
 	FT_TP(chain_node, (const void *) last_node, (const void *) node);
 	/*
-	 * Add node to tail of list to ensure that RCU traversals will
-	 * always see either the prior node or the newly added if
-	 * executed concurrently with a sequence of add followed by del
-	 * on the same key. Safe against concurrent RCU read traversals.
+	 * Add node to the tail of the duplicate chain to ensure that RCU
+	 * traversals always see either the prior node or the newly added one
+	 * under a concurrent add-then-del on the same key.  Safe against
+	 * concurrent RCU read traversals.
 	 *
-	 * The prev pointer is write-side only (mutex-held), so a plain
-	 * store is sufficient.  The forward link is the reader-visible
-	 * publish: express it as a single-edge flip descriptor (a lone
-	 * release store, like rcu_assign_pointer) so it is MCAS-expressible.
+	 * The tail append is the sole reader-visible publish of a duplicate
+	 * insert: record it as an hlist insert-after edge (last_node->next:
+	 * NULL -> node, a recorded CAS a concurrent freeze of the tail would
+	 * abort; @node is built invisibly, next = NULL, prev = last_node), folded
+	 * into a single-edge flip-txn instead of a bare store.  Both next and
+	 * prev ride the txn; the commit is the engine's single-edge fast path.
+	 * Fallible now: the txn allocation can OOM (the caller unwinds @node).
+	 * Under the current retained writer exclusion the prepare cannot fail
+	 * (@last_node is not concurrently deletable); an -ENOENT/-EAGAIN re-descend
+	 * retry is a concurrent-writer (Phase 4.3) concern.
 	 */
-	node->prev = last_node;
-	node->next = NULL;
-	ft_chain_next_flip(ft, &last_node->next, NULL, node);
+	t = ft_flip_txn_create_bounded(FT_HLIST_INSERT_AFTER_MAX_EDGES);
+	if (!t)
+		return -ENOMEM;
+	(void) ft_hlist_insert_after_prepare(&t->mtxn, node, last_node);
+	return ft_flip_txn_commit(ft, t) < 0 ? -ENOMEM : 0;
 }
 
 /*
@@ -1836,8 +1846,9 @@ int _cds_ft_insert(struct cds_ft *ft,
 						d.ppnf, d.pnf, d.nfp, d.nf);
 
 				/* Adding duplicate at existing key: no key count change. */
-				ft_chain_node(ft, last_node, node);
-				ret = 0;
+				ret = ft_chain_node(ft, last_node, node);
+				if (ret)
+					goto insert_done;
 			} else {
 				/* New key at this internal node. */
 				ft_external_head_set_parent(ft, node, d.nf);
@@ -1899,8 +1910,9 @@ int _cds_ft_insert(struct cds_ft *ft,
 					d.ppnf, d.pnf, d.nfp, d.nf);
 
 			/* Adding duplicate at existing key: no key count change. */
-			ft_chain_node(ft, last_node, node);
-			ret = 0;
+			ret = ft_chain_node(ft, last_node, node);
+			if (ret)
+				goto insert_done;
 		}
 	} else {
 		/* Found NULL node or external node before end of key. */
