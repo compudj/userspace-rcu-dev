@@ -38,6 +38,7 @@ noinst_PROGRAMS = \
 	test_rcu_txn_list_guarded \
 	test_rcu_txn_list_compose \
 	test_rcu_txn_list_replace \
+	test_rcu_txn_hlist \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -86,6 +87,7 @@ TESTS = \
 	test_rcu_txn_list_guarded \
 	test_rcu_txn_list_compose \
 	test_rcu_txn_list_replace \
+	test_rcu_txn_hlist \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -183,6 +185,9 @@ test_rcu_txn_list_compose_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_list_replace_SOURCES = test_rcu_txn_list_replace.c
 test_rcu_txn_list_replace_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_txn_hlist_SOURCES = test_rcu_txn_hlist.c
+test_rcu_txn_hlist_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_fair_mutex_SOURCES = test_fair_mutex.c
 test_fair_mutex_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
