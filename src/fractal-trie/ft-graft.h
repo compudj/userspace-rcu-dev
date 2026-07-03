@@ -1968,17 +1968,30 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		/*
 		 * extract_txn carries the swap-root install: list-on rides the full
-		 * pre-reserved txn (root install + run_D head/tail + the +1 fused
-		 * top_B tombstone); list-off with a top_B retire still needs a 2-edge
-		 * txn (root install + tombstone, atomic detach §4.B) rather than a lone
-		 * store.  !gs_ord && !top_B keeps its lone external attach store.  One
-		 * shared goto keeps this block's abort footprint unchanged.
+		 * pre-reserved txn (root install + run_D head/tail + the fused top_B
+		 * transient-root tombstone + the fused free-list tombstone); list-off
+		 * with a top_B retire needs a 3-edge txn (root install + top_B
+		 * tombstone + free-list tombstone, atomic detach §4.B) rather than a
+		 * lone store.  !gs_ord && !top_B keeps its lone external attach store.
+		 * One shared goto keeps this block's abort footprint unchanged.
+		 *
+		 * Fuse the extract-side glue free-list retire into extract_txn: the
+		 * one node ft_make_root_internal_glue defers (the peeled compressed
+		 * old_child, <= 1) freezes dead atomically with the root install that
+		 * unlinks it (atomic detach, §4.B), instead of a standalone flip in
+		 * ft_glue_apply_deferred below.  The +1 headroom in each arm covers it.
+		 * A non-empty free_list means a compressed old_child, hence top_B is
+		 * non-NULL, hence extract_txn is this reserved txn -- never the
+		 * !gs_ord && !top_B NULL case, where the free_list is empty and
+		 * ft_glue_tombstone_free_list's loop is skipped (no NULL-txn deref).
 		 */
 		if (gs_ord || top_B) {
 			extract_txn = ft_flip_txn_create_bounded(gs_ord ?
-				FT_ROOT_LIST_SWAP_MAX_EDGES + 1 : 2);
+				FT_ROOT_LIST_SWAP_MAX_EDGES + 2 : 3);
 			if (!extract_txn)
 				goto prep_oom;
+			glue_extract.txn = extract_txn;
+			glue_extract.fuse_free_list = true;
 			if (gs_ord) {
 				run_replace_txn = ft_flip_txn_create_bounded(
 					FT_ORD_CELL_RUN_REPLACE_MAX_EDGES);
@@ -2285,7 +2298,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * the root install unlink flip atomically (atomic detach).  Only
 			 * on the top_B path (the external/absent case keeps the root live);
 			 * top_B always installed the root edge into @edges, so extract_txn
-			 * is reserved (list-on) or the 2-edge list-off txn just reserved.
+			 * is reserved (list-on) or the 3-edge list-off txn just reserved.
+			 * (This transient-root tombstone is distinct from the fused
+			 * free-list tombstone already recorded by ft_glue_apply_deferred.)
 			 */
 			if (top_B)
 				ft_flip_txn_record_tombstone(extract_txn,
@@ -2293,11 +2308,12 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 						ft_node_ptr(old_swap_root) : fresh));
 			/*
 			 * Post-drain commit (un-abortable): a reserved extract_txn --
-			 * list on (root install + run_D head/tail + the fused tombstone)
-			 * or the list-off 2-edge top_B retire (root install + tombstone)
-			 * -- commits every recorded edge; freed unused if none changed.
-			 * When extract_txn is NULL (list off, no top_B retire) @n is 0,
-			 * so the lone-edge arm is unreached.
+			 * list on (root install + run_D head/tail + the fused top_B and
+			 * free-list tombstones) or the list-off 3-edge top_B retire (root
+			 * install + top_B tombstone + free-list tombstone) -- commits every
+			 * recorded edge; freed unused if none changed.  When extract_txn is
+			 * NULL (list off, no top_B retire) @n is 0 and the free_list is
+			 * empty, so the lone-edge arm is unreached.
 			 */
 			if (extract_txn) {
 				if (n)
