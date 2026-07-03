@@ -89,11 +89,14 @@
  * (succ == NULL) records only the single pos->next edge; a mid-chain insert also
  * records the succ->next load-validate guard and the succ->prev back-edge.  del
  * and replace touch elem->next (mark), pred->next, next->prev plus the
- * next->next guard.
+ * next->next guard.  A freeze records only the elem->next mark (one edge), folded
+ * into a host op's structural flip-txn (a chain head leaves through its
+ * FT-structural anchor, not a predecessor->next store).
  */
 #define FT_HLIST_INSERT_AFTER_MAX_EDGES	3
 #define FT_HLIST_DEL_MAX_EDGES		4
 #define FT_HLIST_REPLACE_MAX_EDGES	4
+#define FT_HLIST_FREEZE_MAX_EDGES	1
 
 static inline
 void *ft_hlist_set_mark(struct cds_ft_node *n)
@@ -310,6 +313,31 @@ int ft_hlist_replace_prepare(struct urcu_mcas_txn *txn,
 	if (next != NULL)
 		urcu_txn_store(txn, (void **) &next->prev, old, newp, FT_HLIST_TAG);
 	return 0;
+}
+
+/*
+ * ft_hlist_freeze_prepare: record ONLY the logical-deletion mark of @node's
+ * forward slot (node->next: succ -> MARK(succ)) into @txn WITHOUT committing --
+ * the freeze half of a del with no chain unlink.  A chain HEAD leaves the trie
+ * through its FT-structural anchor edge (the parent slot re-point / clear), not a
+ * predecessor->next store, so only the mark rides the hlist; folding it into the
+ * head op's structural flip-txn makes the freeze and the anchor edge commit
+ * atomically -- once concurrent, a racing insert_after(node) / del(node) shares
+ * &node->next and terminates with -ENOENT.  The target is preserved (MARK(succ),
+ * or MARK(NULL) for a head with no successor) so a reader parked on @node still
+ * follows the chain to the promoted new head / end.  One recorded edge; the caller
+ * reserves FT_HLIST_FREEZE_MAX_EDGES on top of the host op's footprint.
+ */
+static inline
+void ft_hlist_freeze_prepare(struct urcu_mcas_txn *txn, struct cds_ft_node *node)
+{
+	void *en = urcu_txn_load(txn, (void **) &node->next, FT_HLIST_TAG);
+	int ret;
+
+	ret = urcu_txn_store(txn, (void **) &node->next, en,
+			ft_hlist_set_mark((struct cds_ft_node *) en), FT_HLIST_TAG);
+	assert(!ret);			/* caller reserved the edge up front */
+	(void) ret;
 }
 
 #endif	/* _FT_TXN_HLIST_H */

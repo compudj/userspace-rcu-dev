@@ -1513,7 +1513,9 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 
 		if (!new_cell_flag)
 			return -ENOMEM;
-		txn = ft_flip_txn_create_bounded(FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES);
+		txn = ft_flip_txn_create_bounded(
+			FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
+			FT_HLIST_FREEZE_MAX_EDGES);
 		if (!txn) {
 			ft_ord_cell_free_unpublished(ft,
 				ft_ord_cell_ptr(new_cell_flag));
@@ -1532,6 +1534,13 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
+		/*
+		 * Fuse @node's freeze (mark node->next, target preserved) into the
+		 * swap commit: a reader never sees @node's head anchor promoted away
+		 * while @node is still unmarked (doc §4.B).  The reservation above
+		 * carries the extra edge.
+		 */
+		ft_hlist_freeze_prepare(&txn->mtxn, node);
 		ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell, sedges,
 			n_s, txn);
 		ft_ord_cell_free(ft, old_cell);
@@ -1548,7 +1557,8 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * untouched, so the caller returns CDS_FT_STATUS_MEMORY_ERROR.
 		 */
 		struct ft_flip_txn *txn =
-			ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES);
+			ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
+				FT_HLIST_FREEZE_MAX_EDGES);
 
 		if (!txn)
 			return -ENOMEM;
@@ -1557,6 +1567,8 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
+		/* Fuse @node's freeze into the structural publish (doc §4.B). */
+		ft_hlist_freeze_prepare(&txn->mtxn, node);
 		ft_ord_cell_flip_into(ft, txn, sedges, n_s);
 	}
 	return 0;
@@ -1594,47 +1606,46 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 	} else if (next_node) {
 		/*
 		 * Head with a successor: prev is the cell flag (list on) or the
-		 * flagged parent (list off).  Promote @next_node via a fresh
-		 * cell swap fused with the structural publish.  A list-on
-		 * promotion allocates the fresh cell; on OOM it aborts before any
-		 * reader-visible change (@node stays chained, not tombstoned) and
-		 * the caller maps the failure to CDS_FT_STATUS_MEMORY_ERROR.
+		 * flagged parent (list off).  Promote @next_node via a fresh cell
+		 * swap fused with the structural publish, @node's freeze fused into
+		 * that same commit (doc §4.B).  A list-on promotion allocates the
+		 * fresh cell; on OOM it aborts before any reader-visible change
+		 * (@node stays chained, not tombstoned) and the caller maps the
+		 * failure to CDS_FT_STATUS_MEMORY_ERROR.
 		 */
-		int ret = ft_promote_head(ft, parent_nf, head_slot, node,
-			next_node);
-
-		if (ret)
-			return ret;
+		return ft_promote_head(ft, parent_nf, head_slot, node, next_node);
 	} else {
 		/*
 		 * Head with no successor: the key disappears (only reached for a
 		 * list-off internal external_nodes chain that empties -- a list-on
 		 * key disappearance routes through the fused ft_remove_one_commit,
 		 * and a compressed / body-slot leaf through ft_detach_node).  Clear
-		 * the head slot (+ a compressed holder's SKIP_X dual) through the
-		 * op flip-txn.  Abortable: the flip IS the op's commit (no pre-flip
-		 * reader-visible side-effect), so on a multi-edge txn-alloc OOM the
-		 * unchain aborts cleanly -- nothing published, @node still chained,
-		 * caller rolls back the -1 count and returns MEMORY_ERROR.  A lone
-		 * edge takes the infallible on-stack store and never fails.
+		 * the head slot (+ a compressed holder's SKIP_X dual) and fuse
+		 * @node's freeze (mark node->next: NULL -> MARK(NULL), preserving the
+		 * end-of-chain target) into that same flip-txn (doc §4.B).
+		 * Abortable: the flip IS the op's commit (no pre-flip reader-visible
+		 * side-effect), so on a txn-alloc OOM the unchain aborts cleanly --
+		 * nothing published, @node still chained, caller rolls back the -1
+		 * count and returns MEMORY_ERROR.  Folding the freeze makes this a
+		 * multi-edge commit (freeze + >=1 structural), so it always allocates
+		 * a txn (no lone-edge on-stack path) -- one extra alloc per head
+		 * clear, the single-writer cost of the atomic detach.
 		 */
 		struct ft_pub_rec rec = { .n = 0 };
 		struct ft_ord_cell_edge sedges[2] = { 0 };
+		struct ft_flip_txn *txn;
 		unsigned int n_s;
 
+		txn = ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
+			FT_HLIST_FREEZE_MAX_EDGES);
+		if (!txn)
+			return -ENOMEM;
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
-		if (ft_ord_cell_flip_try(ft, sedges, n_s) != 0)
-			return -ENOMEM;
+		ft_hlist_freeze_prepare(&txn->mtxn, node);
+		ft_ord_cell_flip_into(ft, txn, sedges, n_s);
 	}
-	/*
-	 * @node has left the trie: tombstone it.  Its next pointer is
-	 * preserved (still == next_node) so a concurrent reader positioned
-	 * on @node still follows the chain; the bit only marks removal for a
-	 * later position-based remove.
-	 */
-	ft_node_mark_removed_flip(ft, node);
 	return 0;
 }
 
