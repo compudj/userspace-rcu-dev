@@ -1262,9 +1262,20 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		if (!txn) {
 			txn = ft_flip_txn_create();
 			if (txn && !ft_flip_txn_reserve(txn,
-					nr_dst + 1 + ms_cap)) {
+					nr_dst + 1 + ms_cap + gd.cap_free)) {
 				ft_flip_txn_destroy(txn);
 				txn = NULL;
+			} else if (txn) {
+				/*
+				 * Created + reserved gd.cap_free free-list headroom:
+				 * fuse each dst-overlap retire's freeze into @txn (atomic
+				 * detach, doc/design/mcas-multiwriter-readiness.md §4.B),
+				 * so the whole retired dst spine freezes dead atomically
+				 * with the forward publish that unlinks it.  The rekey
+				 * take() path keeps the standalone flip -- its pre_txn is
+				 * pre-sized by the rekey with no room to grow here.
+				 */
+				gd.fuse_free_list = true;
 			}
 		}
 	}
@@ -1276,6 +1287,13 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft_glue_set_publish(dst_ft, &gd, pub_parent, pub_slot, pub);
+	/*
+	 * The dst forward publish commits through @txn (step 4 below); point
+	 * gd->txn at it so ft_glue_apply_deferred's tombstone_free_list records
+	 * the fused dst retires into the same txn.  A no-op alias when
+	 * fuse_free_list stayed false (the rekey take() path).
+	 */
+	gd.txn = txn;
 
 	/*
 	 * Slot-canonical form of @pub for the @pub_slot stores (both the flip
