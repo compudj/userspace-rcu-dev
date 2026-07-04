@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 299
+#define NR_TESTS 300
 #else
-#define NR_TESTS 257
+#define NR_TESTS 258
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -259,6 +259,26 @@ static struct cds_ft *create_varlen_ft(struct cds_ft_group **group_out)
 
 	if (cds_ft_group_create(NULL, &group) < 0)
 		abort();
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/* Variable-length trie with order-statistics (per-node nr_keys) ENABLED. */
+static struct cds_ft *create_varlen_rankstats_ft(struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
 	*group_out = group;
@@ -3002,6 +3022,76 @@ fail:
 	cds_ft_iter_destroy(iter);
 	drain_and_destroy(ft, group);
 	return -1;
+}
+
+/*
+ * Order-statistics ON, prefix-heavy exactness.  Inserts every string of length
+ * 3, then 2, then 1 over the alphabet {a,b,c} into a rank-stats-ON variable-
+ * length trie.  Inserting longest first means each shorter key ends at an
+ * INTERNAL node the longer keys already branched, so it publishes at that
+ * node's external_nodes -- the "new key at existing internal node" shape (I1),
+ * whose +1 count fold walks a purely stable ancestor chain.  The longer keys
+ * exercise the split-diverge fold (I3).  cds_ft_verify after every insert
+ * checks each node's stored nr_keys against a full structural recount (gated on
+ * rank stats), so any miscount in either fold aborts at that exact mutation;
+ * cds_ft_count_keys cross-checks the maintained root aggregate.
+ */
+static int test_rank_stats_prefix_exact(void)
+{
+	static const char alpha[] = "abc";
+	static const int lens[] = { 3, 2, 1 };
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_ft(&group);
+	unsigned long expect = 0;
+	int ret = 0, li;
+
+	rcu_read_lock();
+	for (li = 0; li < 3; li++) {
+		int len = lens[li], i, j, k;
+
+		for (i = 0; i < 3; i++)
+		for (j = 0; j < (len >= 2 ? 3 : 1); j++)
+		for (k = 0; k < (len >= 3 ? 3 : 1); k++) {
+			char buf[3];
+			struct ft_test_node *n = node_alloc(0);
+			enum cds_ft_status s;
+
+			buf[0] = alpha[i];
+			if (len >= 2)
+				buf[1] = alpha[j];
+			if (len >= 3)
+				buf[2] = alpha[k];
+			s = cds_ft_insert(ft, (const uint8_t *) buf,
+					(size_t) len, &n->node);
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rank_stats prefix: insert len "
+					"%d failed %d\n", len, s);
+				node_free(n);
+				ret = -1;
+				goto out;
+			}
+			expect++;
+			if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rank_stats prefix: verify failed "
+					"after %lu inserts (last len %d)\n",
+					expect, len);
+				ret = -1;
+				goto out;
+			}
+			if (cds_ft_count_keys(ft) != expect) {
+				fprintf(stderr, "rank_stats prefix: count %lu != "
+					"expect %lu\n",
+					cds_ft_count_keys(ft), expect);
+				ret = -1;
+				goto out;
+			}
+		}
+	}
+out:
+	rcu_read_unlock();
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
 }
 
 /*
@@ -23670,6 +23760,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iter_skip_boundary);
 	RUN_TEST(test_iter_skip_duplicates);
 	RUN_TEST(test_iter_skip_varlen);
+	RUN_TEST(test_rank_stats_prefix_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */

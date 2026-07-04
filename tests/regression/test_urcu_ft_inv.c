@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	56
+#define NR_TESTS	57
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -231,6 +231,23 @@ static int leak_check(void)
 /* Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * FT_INV_RANK_STATS: when set, enable per-node order statistics (nr_keys) on
+ * every trie the invariant suite builds.  The default suite runs rank stats
+ * OFF (count queries fall back to a structural recount), so the maintained
+ * nr_keys aggregate -- and the flip-txn count-edge fold that keeps it exact --
+ * is never exercised by the concurrent invariants.  Turning it on makes a
+ * FEATURE_FT_VERIFY_AT_MUTATION build check per-node nr_keys exactness after
+ * every mutation across the whole suite (cds_ft_verify gates its nr_keys check
+ * on ft->rank_stats).
+ */
+static void inv_maybe_set_rank_stats(struct cds_ft_group_attr *attr)
+{
+	if (getenv("FT_INV_RANK_STATS") &&
+			cds_ft_group_attr_set_rank_stats(attr, true) < 0)
+		abort();
+}
+
 static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_out)
 {
 	struct cds_ft_group_attr *attr;
@@ -260,6 +277,7 @@ static struct cds_ft *create_fixed_ft(size_t klen, struct cds_ft_group **group_o
 	if (getenv("FT_INV_NO_ORDERED_LIST") &&
 			cds_ft_group_attr_set_ordered_list(attr, false) < 0)
 		abort();
+	inv_maybe_set_rank_stats(attr);
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -293,6 +311,7 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen, struct cds_ft_group **gro
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
 		abort();
+	inv_maybe_set_rank_stats(attr);
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -324,6 +343,41 @@ static struct cds_ft *create_fixed_nolist_ft(size_t klen, struct cds_ft_group **
 			offsetof(struct ft_test_node, okey)) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	inv_maybe_set_rank_stats(attr);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * Like create_fixed_ft, but UNCONDITIONALLY enables per-node order statistics
+ * (nr_keys), independent of FT_INV_RANK_STATS.  Used by the strict nr_keys
+ * exactness invariant, which reads the maintained aggregate (cds_ft_count_keys,
+ * lookup_nth) and cross-checks it against cds_ft_verify's per-node recount.
+ */
+static struct cds_ft *create_fixed_rankstats_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_speculative_key_offset(attr,
+			offsetof(struct ft_test_node, okey)) < 0)
+		abort();
+	if (getenv("FT_INV_NO_ORDERED_LIST") &&
+			cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -7339,6 +7393,203 @@ static int inv_nr_keys_undercount(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   INVARIANT 11b: nr_keys EXACT (rank statistics ON)                */
+/*                                                                    */
+/*   The rank-stats-ON companion to inv_nr_keys_undercount.  With     */
+/*   order statistics ON, cds_ft_count_keys reads the maintained      */
+/*   per-node nr_keys aggregate -- which is MCAS-transacted into each  */
+/*   mutation's flip-txn -- rather than a structural recount, so it    */
+/*   is EXACT.  This variant therefore (a) keeps the strict, no-retry  */
+/*   remove-phase check (count_keys > iter_count is always a real      */
+/*   accounting bug, never a transient recompaction artefact), and     */
+/*   (b) at every quiescent barrier asserts cds_ft_verify() passes --  */
+/*   which cross-checks every node's stored nr_keys against a full     */
+/*   structural subtree recount, the tightest per-node exactness       */
+/*   oracle for the count fold.                                        */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Strict remove-phase reader: no bounded re-measure.  Under rank stats ON the
+ * aggregate is exact and monotone under a remove-only writer (decrement rides
+ * the commit, ordered before the pointer detach), so count_keys <= iter_count
+ * MUST hold -- any excess is a genuine fold accounting bug, not the
+ * non-linearizable structural-recount artefact the OFF-mode reader tolerates.
+ */
+static void *inv_nr_keys_exact_remove_reader(void *arg)
+{
+	struct inv_iter_ctx *ctx = (struct inv_iter_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned long count_keys, iter_count = 0;
+
+		rcu_read_lock();
+		cds_ft_for_each_rcu(ctx->ft, iter)
+			iter_count++;
+		count_keys = cds_ft_count_keys(ctx->ft);
+		if (count_keys > iter_count)
+			report_violation(ctx->test_name,
+				"remove phase: count_keys %lu > iteration_count "
+				"%lu (rank stats ON must be exact, iter #%lu)",
+				count_keys, iter_count, iters);
+		rcu_read_unlock();
+
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * Quiescent barrier check: the maintained aggregate equals the pointer-
+ * traversal count, AND cds_ft_verify passes (every node's stored nr_keys
+ * matches its structural subtree recount -- verify gates this on rank stats).
+ */
+static int inv_nr_keys_exact_quiescent_check(struct cds_ft *ft,
+		const char *phase)
+{
+	struct cds_ft_iter *check_iter;
+	unsigned long count_keys, iter_count = 0;
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_nr_keys_exact: %s: cds_ft_verify failed "
+			"(per-node nr_keys mismatch)\n", phase);
+		return -1;
+	}
+	if (cds_ft_iter_create(ft, &check_iter) < 0)
+		return -1;
+	rcu_read_lock();
+	count_keys = cds_ft_count_keys(ft);
+	cds_ft_for_each_rcu(ft, check_iter)
+		iter_count++;
+	rcu_read_unlock();
+	cds_ft_iter_destroy(check_iter);
+
+	if (count_keys != iter_count) {
+		fprintf(stderr, "inv_nr_keys_exact: %s quiescent mismatch: "
+			"count_keys %lu != iteration_count %lu\n",
+			phase, count_keys, iter_count);
+		return -1;
+	}
+	return 0;
+}
+
+static int inv_nr_keys_exact(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_rankstats_ft(4, &group);
+	struct timespec t0;
+	struct {
+		struct inv_iter_ctx ctx;
+		pthread_mutex_t lock;
+	} shared;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	shared.ctx.ft = ft;
+	shared.ctx.key_len = 4;
+	shared.ctx.test_name = "inv_nr_keys_exact";
+	pthread_mutex_init(&shared.lock, NULL);
+
+	/* Phase 1: insert-only writers (reuse the undercount insert harness). */
+	rcu_read_lock();
+	for (i = 0; i < WRITER_POOL_SIZE / 2; i++) {
+		struct ft_test_node *n = node_alloc(i);
+		insert_u64(ft, i, n);
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_nr_keys_undercount_reader, &shared.ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL,
+			inv_nr_keys_undercount_writer, &shared.ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS / 2)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_nr_keys_exact: insert phase: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		pthread_mutex_destroy(&shared.lock);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (inv_nr_keys_exact_quiescent_check(ft, "insert") < 0) {
+		pthread_mutex_destroy(&shared.lock);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Phase 2: remove-only writers, strict reader. */
+	atomic_store(&violation_count, 0);
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_nr_keys_exact_remove_reader, &shared.ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL,
+			inv_nr_keys_remove_writer, &shared.ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS / 2)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+	pthread_mutex_destroy(&shared.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_nr_keys_exact: remove phase: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (inv_nr_keys_exact_quiescent_check(ft, "remove") < 0) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
 /*   INVARIANT 9: Ordered traversal never escapes its trie            */
 /*                                                                    */
 /* ================================================================== */
@@ -10386,6 +10637,9 @@ int main(int argc, char **argv)
 
 	diag("8. nr_keys undercount ordering");
 	RUN_TEST(inv_nr_keys_undercount);
+
+	diag("8b. nr_keys exact (rank statistics ON)");
+	RUN_TEST(inv_nr_keys_exact);
 
 	diag("9. Ordered traversal never escapes its trie");
 	RUN_TEST(inv_ordered_no_escape_graft);
