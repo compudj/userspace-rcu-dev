@@ -40,6 +40,17 @@ struct ft_insert_commit {
 	 */
 	struct cds_ft_inode_flag *count_from;
 	/*
+	 * Order-statistics count fold (rank stats ON): when set, the +1 key-count
+	 * propagation is recorded as nr_keys value-CAS edges on the STABLE
+	 * ancestor chain from @count_from to the root INTO @txn (folded atomically
+	 * with the structural publish), and insert_done skips the standalone
+	 * post-commit ft_propagate_external_count_parent walk.  A shape opts in
+	 * only once its @count_from is the stable base and every fresh node on the
+	 * new key's path was built with its full post-commit count.  Requires the
+	 * arm to have reserved the extra per-ancestor edges (actual descent depth).
+	 */
+	bool count_folded;
+	/*
 	 * Old compressed node replaced by the parked publish: readers keep
 	 * resolving the proxy to it until the commit, so its (grace-period-
 	 * deferred) free must be queued only AFTER the commit -- a free queued
@@ -220,6 +231,15 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		ft_flip_txn_record_tombstone(ic->txn,
 			cds_ft_item_to_metadata(ic->free_old_node));
 	/*
+	 * Order-statistics count fold (rank stats ON): record the +1 key-count
+	 * propagation as nr_keys value-CAS edges on the STABLE ancestor chain from
+	 * @count_from to the root, folded into THIS commit so the count flips
+	 * atomically with the structural publish.  A no-op when rank stats are off
+	 * or the shape did not opt in.  The arm reserved the per-ancestor edges.
+	 */
+	if (ic->count_folded)
+		ft_flip_txn_record_count_parent(ft, ic->txn, ic->count_from, 1);
+	/*
 	 * THE commit: install every recorded edge -- the forward structural
 	 * publish (forward slot + any compressed-parent skip-slot dual, or the
 	 * set_nth slot proxy), the ordered-list neighbour edges and the live
@@ -297,7 +317,8 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
  * commits it with @cell == NULL).  Returns 0, or -ENOMEM.
  */
 static
-int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic)
+int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
+		unsigned int count_edges)
 {
 	(void) ft;
 	assert(ic);
@@ -313,9 +334,12 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic)
 	 * + the <=2 freeze-on-free tombstone edges (an old compressed and/or old
 	 * internal node this commit retires) now fused into the same flip as the
 	 * unlink (atomic detach, doc §4.B); + 1 VALIDATE freeze guard on the
-	 * relocation's live grandparent (ft_flip_txn_guard_parent, §4.B validate).
+	 * relocation's live grandparent (ft_flip_txn_guard_parent, §4.B validate);
+	 * + @count_edges nr_keys count edges (rank-stats-ON count fold), one per
+	 * STABLE ancestor from the count base to the root -- sized by the caller to
+	 * the ACTUAL descent depth (0 when the shape does not fold its count).
 	 */
-	ic->txn = ft_flip_txn_create_bounded(12);
+	ic->txn = ft_flip_txn_create_bounded(12 + count_edges);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
@@ -666,7 +690,16 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * suffix_len == 0: cluster-leaf branch's two children (live cn->child
 	 * and fresh new subtree), both -> branch_flag.
 	 */
-	ret = ft_insert_commit_arm(ft, ic);
+	/*
+	 * I3 count fold reservation: the diverge caller records the +1 count
+	 * walk from the STABLE parent of the split compressed node (d->pnf, whose
+	 * slot @parent_slot is what this commit flips) up to the root -- at most
+	 * @node_depth ancestor edges.  Every fresh split node already carries its
+	 * full post-commit count, so the walk never touches one.  Reserve by the
+	 * actual node depth (0 when rank stats are off).
+	 */
+	ret = ft_insert_commit_arm(ft, ic,
+		ft->rank_stats ? node_depth + 2 : 0);
 	if (ret)
 		goto error;
 	ft_set_parent(ft, top_flag, cn_meta->parent, parent_slot);
@@ -1160,7 +1193,7 @@ int ft_attach_node(struct cds_ft *ft,
 		key_value = *(--iter_key);
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
 
-		ret = ft_insert_commit_arm(ft, ic);
+		ret = ft_insert_commit_arm(ft, ic, 0);
 		if (ret)
 			goto check_error;
 
@@ -1395,7 +1428,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	struct cds_ft_metadata *br_meta;
 	int ret;
 
-	ret = ft_insert_commit_arm(ft, ic);
+	ret = ft_insert_commit_arm(ft, ic, 0);
 	if (ret)
 		return ret;	/* nothing built yet */
 
@@ -1499,9 +1532,14 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 	 * live parent before publishing the cluster's forward slot, so the
 	 * caller does not need to set the parent here.
 	 *
-	 * One-commit (parked): the +1 follows the commit at insert_done.
+	 * I3 count fold: @d->pnf is the STABLE parent whose child slot (d->nfp)
+	 * this commit flips to the fresh split cluster; every fresh split node was
+	 * built with its full post-commit count, so the +1 count walk starts at
+	 * d->pnf and touches only commit-invariant ancestors.  Record it into the
+	 * commit txn (reserved at arm) and skip the post-commit propagate.
 	 */
 	ic->count_from = d->pnf;
+	ic->count_folded = true;
 	return 0;
 }
 
@@ -1556,7 +1594,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	node->next = NULL;
 	/* Cluster-internal store: the junction is unpublished. */
 	jct_meta->external_nodes = node;
-	sret = ft_insert_commit_arm(ft, ic);
+	sret = ft_insert_commit_arm(ft, ic, 0);
 	if (sret) {
 		/*
 		 * Arm failed (-ENOMEM): abort the whole insert.  The split
@@ -1879,12 +1917,24 @@ int _cds_ft_insert(struct cds_ft *ft,
 					 * list).  Count follows the commit
 					 * (ic.count_from).
 					 */
-					ret = ft_insert_commit_arm(ft, &ic);
+					ret = ft_insert_commit_arm(ft, &ic,
+						ft->rank_stats ?
+							d.depth + 2 : 0);
 					if (ret)
 						goto insert_done;
 					ft_insert_park_external_nodes(ft,
 						metadata, node, &ic);
 					ic.count_from = d.nf;
+					/*
+					 * I1 count fold: @d.nf is the STABLE
+					 * existing internal node the new key's
+					 * external_nodes publish lands on, so its
+					 * parent chain is commit-invariant.  Record
+					 * the +1 count walk into the same txn (no
+					 * fresh nodes on the path) and skip the
+					 * post-commit propagate.
+					 */
+					ic.count_folded = true;
 				} else {
 					/*
 					 * List off: external_nodes is the single
@@ -1993,8 +2043,9 @@ insert_done:
 			 * atomically.  Count propagation follows the commit.
 			 */
 			ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
-			ft_propagate_external_count_parent(ft,
-				ic.count_from ? ic.count_from : *d.pnfp, 1);
+			if (!ic.count_folded)
+				ft_propagate_external_count_parent(ft,
+					ic.count_from ? ic.count_from : *d.pnfp, 1);
 		} else if (ic.txn) {
 			/* Armed but nothing parked (duplicate append): no
 			 * structural publish to commit. */
@@ -2022,8 +2073,9 @@ insert_done:
 			 * only now counts), from the shape's recorded base.
 			 */
 			ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
-			ft_propagate_external_count_parent(ft,
-				ic.count_from ? ic.count_from : *d.pnfp, 1);
+			if (!ic.count_folded)
+				ft_propagate_external_count_parent(ft,
+					ic.count_from ? ic.count_from : *d.pnfp, 1);
 		}
 		/*
 		 * No final else: after the one-commit conversion every
@@ -2316,12 +2368,16 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					 * commits atomically with the ordinal-cell
 					 * splice (no transient half-spliced list).
 					 */
-					ret = ft_insert_commit_arm(ft, &ic);
+					ret = ft_insert_commit_arm(ft, &ic,
+						ft->rank_stats ?
+							d.depth + 2 : 0);
 					if (ret)
 						goto insert_replace_done;
 					ft_insert_park_external_nodes(ft,
 						metadata, node, &ic);
 					ic.count_from = d.nf;
+					/* I1 count fold: see cds_ft_insert. */
+					ic.count_folded = true;
 				} else {
 					/*
 					 * List off: external_nodes is the single
@@ -2494,8 +2550,9 @@ insert_replace_done:
 			 * and falls through untouched.
 			 */
 			ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
-			ft_propagate_external_count_parent(ft,
-				ic.count_from ? ic.count_from : *d.pnfp, 1);
+			if (!ic.count_folded)
+				ft_propagate_external_count_parent(ft,
+					ic.count_from ? ic.count_from : *d.pnfp, 1);
 		} else if (ic.txn) {
 			/* Armed but nothing parked (duplicate append): no
 			 * structural publish to commit. */
@@ -2522,8 +2579,9 @@ insert_replace_done:
 			 * so it falls through here untouched.
 			 */
 			ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
-			ft_propagate_external_count_parent(ft,
-				ic.count_from ? ic.count_from : *d.pnfp, 1);
+			if (!ic.count_folded)
+				ft_propagate_external_count_parent(ft,
+					ic.count_from ? ic.count_from : *d.pnfp, 1);
 		}
 	}
 	if (ret == 0) {

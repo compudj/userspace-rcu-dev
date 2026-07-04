@@ -2297,6 +2297,55 @@ void ft_propagate_external_count_parent(struct cds_ft *ft,
 }
 
 /*
+ * ft_flip_txn_record_count_parent: fold the order-statistics count propagation
+ * into a flip-txn instead of walking it as a separate post-commit RMW loop
+ * (ft_propagate_external_count_parent).  Records a value-CAS edge
+ * cur -> cur + (delta << 1) on every node's nr_keys word from @stable_base up to
+ * the root, climbing metadata->parent, tagged FT_NR_KEYS_PROXY_TAG so the engine
+ * may park an in-band proxy for the duration of the commit (readers resolve it
+ * via ft_nr_keys_load).  The count then flips ATOMICALLY with the op's structural
+ * edges -- exact under concurrent writers, no drifting aggregate, and the
+ * root-ward walk vanishes (the op already holds its descent path).
+ *
+ * @stable_base MUST be the deepest STABLE existing ancestor whose subtree gains
+ * @delta keys: the node that OWNS this op's committed forward slot, or -- when
+ * that owner is itself relocated by the same commit -- the owner's stable parent.
+ * Its metadata->parent chain is unchanged by the commit, so recording the edges
+ * now (pre-commit, off the still-intact chain and current counts) and applying
+ * them atomically at the flip is correct.  Fresh cluster nodes BELOW the publish
+ * point carry their full post-commit count from build (a plain, build-invisible
+ * store) and are never touched here -- this is the property the earlier
+ * post-commit-chain attempt lacked (it climbed a re-parented node's stale chain,
+ * so some deltas never reached the root: a parity undercount).
+ *
+ * A no-op when order statistics are off.  The caller must have reserved one txn
+ * edge per node on the @stable_base -> root path (bounded by the ACTUAL descent
+ * depth, never FT_MAX_DEPTH).  Under the retained writer exclusion no proxy is
+ * parked on these ancestors pre-commit, so ft_nr_keys_get reads the committed
+ * count for the CAS old value; the new value re-applies the (count << 1) shift.
+ */
+static
+void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
+		struct cds_ft_inode_flag *stable_base, long delta)
+{
+	struct cds_ft_inode_flag *cur = stable_base;
+
+	if (!ft->rank_stats)
+		return;
+	while (cur) {
+		struct cds_ft_metadata *m =
+			cds_ft_item_to_metadata(ft_node_ptr(cur));
+		unsigned long old_raw = ft_nr_keys_get(m) << 1;
+		unsigned long new_raw = (ft_nr_keys_get(m) + delta) << 1;
+
+		ft_flip_txn_record_tag(t, (void **) &m->nr_keys,
+			(void *) old_raw, (void *) new_raw,
+			FT_NR_KEYS_PROXY_TAG);
+		cur = m->parent;
+	}
+}
+
+/*
  * Structural distinct-key count of the subtree rooted at @node_flag, used when
  * the trie does NOT maintain order statistics (rank stats off) -- there is no
  * per-node nr_keys aggregate to read, so the bulk ops (which size and short-
