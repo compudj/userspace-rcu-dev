@@ -901,7 +901,17 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			node_depth + remaining, jct_cluster_leaf);
 		if (ret) goto error;
 		jct_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		ft_nr_keys_store(ft,jct_meta, child_nr_keys,
+		/*
+		 * I4 count fold: the junction holds the NEW key as its
+		 * external_nodes (attached by the caller before publish), so
+		 * build it with its FULL post-commit count -- the suffix
+		 * subtree (child_nr_keys) PLUS that new key -- rather than the
+		 * bare suffix count that relied on a post-commit +1 walk from
+		 * the junction.  With the junction (and prefix below) built
+		 * full, the fresh cluster is off the count walk and the +1 rides
+		 * the commit as edges on the STABLE ancestors from d->pnf up.
+		 */
+		ft_nr_keys_store(ft,jct_meta, child_nr_keys + 1,
 			CMM_RELAXED);
 		jct_flag = dest;
 		created[nr_created++] = dest;
@@ -944,7 +954,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		pfx->len = remaining;
 		memcpy(pfx->key_bytes, cn->key_bytes, remaining);
 		ft_meta_nr_child_set(pfx_meta, 1);
-		ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta),
+		ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta) + 1,
 			CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, jct_flag, top_flag, NULL);
@@ -967,7 +977,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			pfx->len = 1;
 			pfx->key_bytes[0] = cn->key_bytes[0];
 			ft_meta_nr_child_set(pfx_meta, 1);
-			ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta),
+			ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta) + 1,
 				CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
 			ft_set_parent(ft, jct_flag, top_flag, &pfx->child);
@@ -983,7 +993,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 				jct_flag, NULL, NULL, node_depth, false);
 			if (ret) goto error;
 			pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-			ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta),
+			ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta) + 1,
 				CMM_RELAXED);
 			top_flag = dest;
 			created[nr_created++] = dest;
@@ -1460,7 +1470,15 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	struct cds_ft_metadata *br_meta;
 	int ret;
 
-	ret = ft_insert_commit_arm(ft, ic, 0);
+	/*
+	 * Reserve the I5 count-fold edges: the +1 key-count walk climbs from
+	 * the STABLE compressed node @d->nf (whose child slot this commit flips
+	 * to the fresh branch) up to the root -- at most @d->depth + 2 ancestor
+	 * edges (actual descent depth, never FT_MAX_DEPTH).  No-op reserve (0)
+	 * when order statistics are off.
+	 */
+	ret = ft_insert_commit_arm(ft, ic,
+		ft->rank_stats ? d->depth + 2 : 0);
 	if (ret)
 		return ret;	/* nothing built yet */
 
@@ -1508,11 +1526,15 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		ft_metadata_set_external_nodes(branch, br_meta,
 			(struct cds_ft_node *) cn->child);
 		/*
-		 * Count only the pre-existing key (old external from
-		 * the compressed child).  The new key's +1 is added
-		 * by ft_propagate_external_count_parent below.
+		 * I5 count fold: build the branch with its FULL post-commit
+		 * count -- the pre-existing key (old external from the
+		 * compressed child) PLUS the new key carried by @inner below it
+		 * (built full by ft_build_branch) -- so this fresh node is off
+		 * the count walk.  The +1 for the new key then rides the commit
+		 * as edges on the STABLE ancestors from @d->nf up (recorded
+		 * below), not a post-commit ft_propagate_external_count_parent.
 		 */
-		ft_nr_keys_store(ft,br_meta, 1, CMM_RELAXED);
+		ft_nr_keys_store(ft,br_meta, 2, CMM_RELAXED);
 	}
 	/*
 	 * Phase 2: park the LIVE displaced-external-head re-parent (the old
@@ -1527,8 +1549,16 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	ic->live_parent = branch;
 	ic->live_slot = NULL;
 	ft_insert_publish_or_park(ft, d->nf, &cn->child, branch, ic);
-	/* One-commit (parked): the +1 follows the commit at insert_done. */
-	ic->count_from = branch;
+	/*
+	 * I5 count fold: @d->nf is the STABLE compressed node whose child slot
+	 * (&cn->child) this commit flips to the fresh branch; the branch was
+	 * built with its full post-commit count above, so the +1 walk starts at
+	 * d->nf (its subtree grows from the old external's 1 key to the branch's
+	 * 2) and touches only commit-invariant ancestors.  Record it into the
+	 * commit txn (reserved at arm) and skip the post-commit propagate.
+	 */
+	ic->count_from = d->nf;
+	ic->count_folded = true;
 	return 0;
 arm_unwind:
 	if (ic->txn) {
@@ -1626,7 +1656,15 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	node->next = NULL;
 	/* Cluster-internal store: the junction is unpublished. */
 	jct_meta->external_nodes = node;
-	sret = ft_insert_commit_arm(ft, ic, 0);
+	/*
+	 * Reserve the I4 count-fold edges: the +1 key-count walk climbs from
+	 * the STABLE parent d->pnf (whose child slot d->nfp this commit flips to
+	 * the fresh split cluster) up to the root -- at most d->depth + 2
+	 * ancestor edges (actual descent depth, never FT_MAX_DEPTH).  No-op
+	 * reserve (0) when order statistics are off.
+	 */
+	sret = ft_insert_commit_arm(ft, ic,
+		ft->rank_stats ? d->depth + 2 : 0);
 	if (sret) {
 		/*
 		 * Arm failed (-ENOMEM): abort the whole insert.  The split
@@ -1663,11 +1701,17 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	ic->live_slot = live_slot;
 	ft_insert_publish_or_park(ft, d->pnf, d->nfp, top_flag, ic);
 	/*
-	 * Parked one-commit: the new key's +1 count and the old compressed
-	 * node's free both follow the commit at insert_done (a reader resolves
-	 * the parked proxy to the old node until then).
+	 * I4 count fold: @d->pnf is the STABLE parent whose child slot (d->nfp)
+	 * this commit flips from the old compressed node to the fresh split
+	 * cluster; every fresh split node (junction + prefix) was built above
+	 * with its full post-commit count, so the +1 walk starts at d->pnf and
+	 * touches only commit-invariant ancestors.  Record it into the commit
+	 * txn (reserved at arm) and skip the post-commit propagate.  The old
+	 * compressed node's free follows the commit at insert_done (a reader
+	 * resolves the parked proxy to it until then).
 	 */
-	ic->count_from = jct_flag;
+	ic->count_from = d->pnf;
+	ic->count_folded = true;
 	ic->free_old_cn = ft_compressed_node_ptr(d->nf);
 	return 0;
 }
