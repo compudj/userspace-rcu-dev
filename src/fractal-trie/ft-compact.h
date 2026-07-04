@@ -226,8 +226,10 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
  * with a PLAIN RCU store: an up-walk reader resolves the old or the new cell,
  * both carrying an IDENTICAL parent (compaction runs under writer exclusion, so
  * @old->parent is settled), and @old stays live until its grace period -- so no
- * flip is needed, and head->prev must never hold a flip-proxy (ft_resolve_head_
- * prev does not resolve one).  @old keeps its own links for parked ordered
+ * multi-edge flip is needed: head->prev is re-pointed with a lone-edge store
+ * that installs no proxy.  (head-prev readers now resolve a parked proxy at the
+ * load via ft_dereference_prev_resolved, so a proxy there would be legal -- but
+ * this relocation never parks one.)  @old keeps its own links for parked ordered
  * readers and is RCU-freed (its general-arena range drains for reclaim).
  */
 static
@@ -268,10 +270,10 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 	 * Retarget the relocated head's node->cell back-link to @new_cell.  This
 	 * is the SECOND store of the cell relocation -- ft_ord_cell_swap already
 	 * moved the ordered-list neighbour links in its own flip -- so by shape it
-	 * "should" fuse with that swap.  It cannot: head->prev is read RAW by
-	 * ft_resolve_head_prev / ft_ord_cell_cursor, so a parked proxy there (which
-	 * a multi-edge flip installs during settle) would be mis-masked as a cell.
-	 * It need not: @old and @new_cell are observationally IDENTICAL in every
+	 * "should" fuse with that swap.  It need not (head->prev readers now resolve
+	 * a parked proxy at the load via ft_dereference_prev_resolved, so a fused
+	 * proxied edge would be legal -- but it is unnecessary here): @old and
+	 * @new_cell are observationally IDENTICAL in every
 	 * field a reader reaches through this back-link -- node, parent and
 	 * incoming_byte are copied above, and ft_ord_cell_swap points new_cell's
 	 * ord_prev/ord_next at @old's pred/succ while leaving @old's own links

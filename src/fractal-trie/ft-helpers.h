@@ -1782,6 +1782,7 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child,
 		struct cds_ft_metadata *new_child_meta,
+		void *folded_child_prev,
 		struct ft_pub_rec *rec)
 {
 	/*
@@ -1793,6 +1794,14 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 	 * is precisely the deferred (not-yet-stored) back-edge.  Passing the
 	 * metadata directly avoids that stale read.  NULL = recover as before
 	 * (the back-edge was wired up front).
+	 *
+	 * @folded_child_prev (optional): the EXTERNAL analogue -- an external
+	 * @new_child carries no metadata (its parent resolves through prev ->
+	 * cell -> parent), so when the caller folds @new_child's prev into this
+	 * publish's flip-txn (a head promote / swap), the forward-before-parent
+	 * check below would read the not-yet-stored prev.  Passing the prev's
+	 * intended value lets the check validate the folded parent instead.
+	 * NULL = read new_child->prev as before.  Debug-check only.
 	 *
 	 * Publication-ordering invariant: a child becomes observable by
 	 * downward traversal the instant it is published into a live parent
@@ -1829,8 +1838,12 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 			 * Cell-always: prev is the (non-NULL) cell pointer even
 			 * when the parent is unset, so resolve through the cell to
 			 * preserve the forward-before-parent check on cell->parent.
+			 * When the caller folds the prev into this publish's txn it
+			 * supplies the intended value (@folded_child_prev) so we
+			 * validate the folded parent, not the not-yet-stored slot.
 			 */
-			cp = ft_resolve_head_prev(ft,
+			cp = ft_resolve_head_prev(ft, folded_child_prev ?
+				folded_child_prev :
 				((struct cds_ft_node *) new_child)->prev);
 		} else {
 			cp = cds_ft_item_to_metadata(
@@ -1839,6 +1852,7 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		assert(cp != NULL);
 	}
 #endif /* !NDEBUG */
+	(void) folded_child_prev;	/* debug-check only (see above) */
 	/*
 	 * Maintain @new_child's parent-slot offset (parent_slot_offset) so
 	 * that it records the slot holding it within its parent node.  This
@@ -1975,7 +1989,7 @@ void _ft_publish_to_parent(struct cds_ft *ft,
 		struct ft_pub_rec *rec)
 {
 	_ft_publish_to_parent_meta(ft, parent_nf, parent_slot, new_child,
-		NULL, rec);
+		NULL, NULL, rec);
 }
 
 /* Direct publish (original behaviour): perform the stores immediately. */

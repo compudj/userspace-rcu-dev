@@ -444,7 +444,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		/* VALIDATE (§4.B): guard the LIVE (great-)grandparent publish_parent. */
 		ft_flip_txn_guard_parent(ft, txn, publish_parent);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
-			new_cn_pub, new_cn_meta, &rec);
+			new_cn_pub, new_cn_meta, NULL, &rec);
 		/*
 		 * Freeze-on-free (doc §4.B, atomic detach): the collapsed chain
 		 * this commit retires -- the 1-child boundary @iter_node_flag and
@@ -1553,12 +1553,13 @@ end:
  * internal holder flag (no dual).  The list-on promotion is fully abortable: the
  * fresh-cell alloc AND the flip-txn pre-reservation both fail cleanly on OOM
  * (-ENOMEM, nothing published, the chain intact and retriable).  @next_node's
- * prev (its node->cell link) is a SETTLED plain store -- a concurrent skip
- * resolution reads a head's prev RAW (ft_resolve_head_prev), so it cannot ride
- * the flip as a parked proxy -- so the flip is made infallible by pre-reserving
- * its txn BEFORE that store, never a bare in-place cell->node retarget under
- * memory pressure.  List off (no cell) inherits the flagged parent on the
- * not-yet-published successor (build-invisible).
+ * prev (its node->cell link) FOLDS into the swap commit as a proxied edge, so it
+ * flips atomically with the forward publish; a concurrent skip resolution strips
+ * the transient proxy at the load (ft_dereference_prev_resolved) before
+ * ft_resolve_head_prev interprets it.  The flip is still pre-reserved so the
+ * commit cannot OOM, never a bare in-place cell->node retarget under memory
+ * pressure.  List off (no cell) inherits the flagged parent on the successor --
+ * still a SETTLED store there (read raw), see the list-off branch.
  */
 static
 int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
@@ -1592,7 +1593,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			return -ENOMEM;
 		txn = ft_flip_txn_create_bounded(
 			FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
-			FT_HLIST_FREEZE_MAX_EDGES + 1);	/* +1: §4.B parent guard */
+			FT_HLIST_FREEZE_MAX_EDGES + 2);	/* +1 §4.B parent guard, +1 next_node->prev fold */
 		if (!txn) {
 			ft_ord_cell_free_unpublished(ft,
 				ft_ord_cell_ptr(new_cell_flag));
@@ -1602,16 +1603,24 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		cds_ft_item_to_metadata(new_cell)->incoming_byte =
 			cds_ft_item_to_metadata(old_cell)->incoming_byte;
 		/*
-		 * Back-pointer wired before the forward publish (parent-first),
-		 * a SETTLED store (skip resolution reads it raw); the txn is
-		 * already reserved so the commit through it cannot fail.
+		 * Back-pointer (next_node->prev: the promoted successor's node->cell
+		 * link) FOLDED into the swap commit as a proxied edge -- it flips
+		 * ATOMICALLY with the forward head publish and @node's freeze, never a
+		 * pre-commit reader-visible store.  A concurrent skip resolution strips
+		 * the transient proxy at the load (ft_dereference_prev_resolved) before
+		 * ft_resolve_head_prev interprets it, so the slot may carry the proxy.
+		 * The forward publish's forward-before-parent check reads the folded
+		 * prev's intended value (new_cell_flag), not the not-yet-stored slot.
+		 * The reservation above carries this edge.
 		 */
-		next_node->prev = new_cell_flag;
+		ft_flip_txn_record_reserved(txn, (void **) &next_node->prev,
+			next_node->prev, new_cell_flag);
 		/* VALIDATE (§4.B): guard the LIVE holder this head-promote publishes into. */
 		ft_flip_txn_guard_parent(ft, txn, parent_nf);
-		_ft_publish_to_parent(ft, parent_nf,
+		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
-			(struct cds_ft_inode_flag *) next_node, &rec);
+			(struct cds_ft_inode_flag *) next_node, NULL,
+			new_cell_flag, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
 		 * Fuse @node's freeze (mark node->next, target preserved) into the
