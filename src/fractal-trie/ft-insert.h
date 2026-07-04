@@ -2025,16 +2025,19 @@ int _cds_ft_insert(struct cds_ft *ft,
 				/* New key at this internal node. */
 				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
-				if (ft->ordered_list) {
+				if (ft->ordered_list || ft->rank_stats) {
 					/*
 					 * Park the external_nodes publish into the
 					 * one-commit batch -- readers resolve the
 					 * proxy via ft_dereference_external -- so the
 					 * structural publish commits atomically with
-					 * the ordinal-cell splice at insert_done's
-					 * single flip (no transient half-spliced
-					 * list).  Count follows the commit
-					 * (ic.count_from).
+					 * the ordinal-cell splice (list on) at
+					 * insert_done's single flip, and the +1 key
+					 * count (rank stats) rides the SAME commit.
+					 * List on always needs the txn for the splice;
+					 * list off takes it only with rank stats on,
+					 * to fold the count (else the infallible lone
+					 * flip below).
 					 */
 					ret = ft_insert_commit_arm(ft, &ic,
 						ft->rank_stats ?
@@ -2045,7 +2048,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 						metadata, node, &ic);
 					ic.count_from = d.nf;
 					/*
-					 * I1 count fold: @d.nf is the STABLE
+					 * I1 (list on) / I2 (list off) count fold:
+					 * @d.nf is the STABLE
 					 * existing internal node the new key's
 					 * external_nodes publish lands on, so its
 					 * parent chain is commit-invariant.  Record
@@ -2056,12 +2060,13 @@ int _cds_ft_insert(struct cds_ft *ft,
 					ic.count_folded = true;
 				} else {
 					/*
-					 * List off: external_nodes is the single
-					 * reader-visible slot (readers resolve via
-					 * ft_dereference_external).  Commit the NEW-key
-					 * publish as a 1-edge flip -- a lone release
-					 * store, infallible and MCAS-expressible --
-					 * instead of a bare store.
+					 * List off, no rank stats: external_nodes is
+					 * the single reader-visible slot (readers
+					 * resolve via ft_dereference_external) and
+					 * there is no count to fold, so commit the
+					 * NEW-key publish as a lone 1-edge flip -- an
+					 * infallible release store, MCAS-expressible --
+					 * instead of arming a txn.
 					 */
 					struct ft_ord_cell_edge edge = {
 						.slot = (struct ft_ord_cell **)
@@ -2072,8 +2077,6 @@ int _cds_ft_insert(struct cds_ft *ft,
 					};
 
 					ft_ord_cell_flip_one(&edge);
-					ft_propagate_external_count_parent(ft,
-						d.nf, 1);
 				}
 				ret = 0;
 			}
@@ -2480,7 +2483,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				/* No external nodes yet. New key at this node. */
 				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
-				if (ft->ordered_list) {
+				if (ft->ordered_list || ft->rank_stats) {
 					/*
 					 * Park external_nodes -- readers resolve the
 					 * proxy via ft_dereference_external -- so it
@@ -2495,16 +2498,17 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					ft_insert_park_external_nodes(ft,
 						metadata, node, &ic);
 					ic.count_from = d.nf;
-					/* I1 count fold: see cds_ft_insert. */
+					/* I1 (list on) / I2 (list off) count fold: see cds_ft_insert. */
 					ic.count_folded = true;
 				} else {
 					/*
-					 * List off: external_nodes is the single
-					 * reader-visible slot (readers resolve via
-					 * ft_dereference_external).  Commit the NEW-key
-					 * publish as a 1-edge flip -- a lone release
-					 * store, infallible and MCAS-expressible --
-					 * instead of a bare store.
+					 * List off, no rank stats: external_nodes is
+					 * the single reader-visible slot (readers
+					 * resolve via ft_dereference_external) and
+					 * there is no count to fold, so commit the
+					 * NEW-key publish as a lone 1-edge flip -- an
+					 * infallible release store, MCAS-expressible --
+					 * instead of arming a txn.
 					 */
 					struct ft_ord_cell_edge edge = {
 						.slot = (struct ft_ord_cell **)
@@ -2515,8 +2519,6 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					};
 
 					ft_ord_cell_flip_one(&edge);
-					ft_propagate_external_count_parent(ft,
-						d.nf, 1);
 				}
 			}
 			ret = 0;
