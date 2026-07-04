@@ -690,6 +690,44 @@ void ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 }
 
 /*
+ * Invariant-2 VALIDATE side (§4.B / doc/design/step4-concurrent-engine-plan.md
+ * §3.3): guard the LIVE parent @parent_nf that a forward edge publishes INTO, by
+ * recording a {live->live} freeze guard on its state word.  Once concurrent
+ * per-trie writers are enabled, a remover that FROZE @parent_nf (set
+ * FT_STATE_TOMBSTONE) between this op's descent and its commit makes the commit
+ * ABORT -- so the op never publishes an edge into a node being retired.  The
+ * forward pointer-slot CAS alone does NOT catch this: a remover retires the
+ * parent by relocating it through the GRANDparent slot and tombstoning it,
+ * without ever writing the body slot this op CASes, so the pointer CAS still
+ * matches its expected old value.  Only the state guard sees the freeze.
+ *
+ * Same FT_STATE_PROXY tag the tombstone STORE uses (ft_flip_txn_record_tombstone)
+ * so a later same-slot store upgrades the guard in place and an in-flight
+ * nr_child proxy resolves.  On the recompact baseline nr_child is invariant per
+ * node object, so a plain FULL-WORD validate is exact (no masked-validate).  A
+ * NULL @parent_nf == a publish into &ft->root, auto-guarded by the root-slot CAS
+ * (concurrent root relocations collide on old == current_root) -> no-op.  Under
+ * the retained single-writer exclusion the guard always passes =>
+ * behaviour-identical; Phase 4.3 makes it load-bearing.  @t must reserve +1.
+ */
+static inline
+void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
+		struct cds_ft_inode_flag *parent_nf)
+{
+	/*
+	 * NULL @t: the forward publish is a lone on-stack edge with no txn to
+	 * attach to (a list-off pub-less / non-fused commit) -- deferred to the
+	 * force-onto-txn pass.  NULL @parent_nf: a &ft->root publish, auto-guarded
+	 * by the root-slot CAS.  Either way there is no live parent to guard here.
+	 */
+	if (!t || !parent_nf)
+		return;
+	(void) urcu_txn_load_validate(&t->mtxn,
+			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
+			FT_STATE_PROXY);
+}
+
+/*
  * Set a duplicate-chain node's removal tombstone (CDS_FT_NODE_REMOVED_FLAG on
  * cds_ft_node.next) as a COMMITTED flip edge, at the point @node is unlinked
  * from the trie.  This is the chain-leaf analogue of ft_meta_tombstone_set_flip
@@ -3152,6 +3190,8 @@ void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 	 * dance) into @rec; replay them into the txn.  *publish_slot still holds
 	 * the old child here (nothing published yet post-drain).
 	 */
+	/* VALIDATE (§4.B): guard the LIVE dst parent this cluster publishes into. */
+	ft_flip_txn_guard_parent(ft, g->txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		&rec);
 	for (j = 0; j < rec.n; j++)
@@ -3355,6 +3395,8 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * op's failure-free section), so it commits through the caller-PRE-RESERVED
 	 * @txn (ft_ord_cell_flip_into, infallible).
 	 */
+	/* VALIDATE (§4.B): guard the LIVE dst parent this cluster publishes into. */
+	ft_flip_txn_guard_parent(ft, txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		&rec);
 	n = ft_pub_rec_sedges(&rec, sedges);
@@ -3382,6 +3424,8 @@ void ft_glue_publish_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_glue_publish(ft, txn, g);
 		return;
 	}
+	/* VALIDATE (§4.B): guard the LIVE dst parent this cluster publishes into. */
+	ft_flip_txn_guard_parent(ft, txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		&rec);
 	ft_ord_cell_flip_rec_replace(ft, txn, &rec, run);

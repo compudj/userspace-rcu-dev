@@ -586,6 +586,12 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * old dst node stays resolved-to via the parked grandparent proxy
 			 * until the commit (freed below, after it).
 			 */
+			/*
+			 * VALIDATE (§4.B): guard the LIVE grandparent this relocation
+			 * republishes into (a concurrent freeze of it aborts the commit).
+			 */
+			ft_flip_txn_guard_parent(ft, st->glue->txn,
+				st->publish_pmeta->parent);
 			_ft_publish_to_parent(ft, st->dest,
 				st->pnfp, st->dest, &st->reserve_rec);
 			for (k = 0; k < st->reserve_rec.n; k++)
@@ -1027,7 +1033,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			glue.txn = ft_flip_txn_create();
 			if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 					/* + FLOOR_FREE: fused free-list tombstones (§4.B) */
-					FT_GLUE_FLOOR_DEFERRED + 7 + FT_GLUE_FLOOR_FREE)) {
+					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE)) {
 				if (glue.txn)
 					ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
@@ -1915,7 +1921,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			if (!glue_insert.txn || !ft_flip_txn_reserve(glue_insert.txn,
 					/* +1: fused recompact-relocate tombstone (§4.B);
 					 * + FLOOR_FREE: fused free-list tombstones */
-					FT_GLUE_FLOOR_DEFERRED + 7 + FT_GLUE_FLOOR_FREE))
+					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE))
 				goto prep_oom;
 			glue_insert.fuse_free_list = true;
 		} else if (have_insert) {
@@ -1935,7 +1941,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 * immediate apply_deferred path (not yet txn-classified).
 			 */
 			glue_publish_txn = ft_flip_txn_create_bounded(
-				FT_GLUE_PUBLISH_REPLACE_MAX_EDGES + FT_GLUE_FLOOR_FREE);
+				FT_GLUE_PUBLISH_REPLACE_MAX_EDGES + FT_GLUE_FLOOR_FREE
+				+ 1 /* +1 §4.B parent guard */);
 			if (!glue_publish_txn)
 				goto prep_oom;
 		}

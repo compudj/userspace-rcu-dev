@@ -268,6 +268,14 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * merge_at, not this path), so the forward edge always rides the txn.
 	 */
 	assert(ic && ic->txn);
+	/*
+	 * VALIDATE (§4.B): guard the LIVE parent this compressed-divergence
+	 * publish replaces into (680 split / 1456 external-diverge / 1586
+	 * diverge).  All three are mutually exclusive with the ft_attach_node
+	 * relocation guard, so the one reserved guard slot in ic->txn (cap 12)
+	 * covers whichever fires.
+	 */
+	ft_flip_txn_guard_parent(ft, ic->txn, parent_nf);
 	_ft_publish_to_parent(ft, parent_nf, slot, new_top, &rec);
 	for (k = 0; k < rec.n; k++)
 		ft_flip_txn_record_reserved(ic->txn,
@@ -304,9 +312,10 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic)
 	 * + <=4 cell neighbour edges (list-on) + the live re-parent edge (<=7);
 	 * + the <=2 freeze-on-free tombstone edges (an old compressed and/or old
 	 * internal node this commit retires) now fused into the same flip as the
-	 * unlink (atomic detach, doc §4.B).
+	 * unlink (atomic detach, doc §4.B); + 1 VALIDATE freeze guard on the
+	 * relocation's live grandparent (ft_flip_txn_guard_parent, §4.B validate).
 	 */
-	ic->txn = ft_flip_txn_create_bounded(11);
+	ic->txn = ft_flip_txn_create_bounded(12);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
@@ -1258,6 +1267,12 @@ int ft_attach_node(struct cds_ft *ft,
 			 * resolved-to via the parked grandparent proxy until the commit,
 			 * so defer its free past insert_done.
 			 */
+			/*
+			 * VALIDATE (§4.B): guard the LIVE grandparent this relocation
+			 * republishes into -- a concurrent remover that froze it aborts
+			 * this commit (Phase 4.3 load-bearing; no-op under exclusion).
+			 */
+			ft_flip_txn_guard_parent(ft, ic->txn, metadata->parent);
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag, &rec);
 			for (k = 0; k < rec.n; k++)
@@ -2739,7 +2754,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			struct ft_flip_txn *txn =
 				ft_flip_txn_create_bounded(
 					FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
-					FT_HLIST_FREEZE_MAX_EDGES);
+					FT_HLIST_FREEZE_MAX_EDGES +
+					1 /* §4.B parent guard */);
 
 			if (!txn) {
 				new_node->next = NULL;
@@ -2754,6 +2770,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 				cds_ft_item_to_metadata(old_cell)->incoming_byte;
 			/* Fresh @new_node -> cell: build-invisible. */
 			new_node->prev = new_cell_flag;
+			/* VALIDATE (§4.B): guard the LIVE holder parent_nf. */
+			ft_flip_txn_guard_parent(ft, txn, parent_nf);
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node, &rec);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
@@ -2778,7 +2796,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			 */
 			struct ft_flip_txn *txn =
 				ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
-					FT_HLIST_FREEZE_MAX_EDGES);
+					FT_HLIST_FREEZE_MAX_EDGES +
+					1 /* §4.B parent guard */);
 
 			if (!txn) {
 				new_node->next = NULL;
@@ -2789,6 +2808,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			if (new_node->next)
 				new_node->next->prev = new_node;
 			new_node->prev = old_node->prev;
+			/* VALIDATE (§4.B): guard the LIVE holder parent_nf. */
+			ft_flip_txn_guard_parent(ft, txn, parent_nf);
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node, &rec);
 			n_s = ft_pub_rec_sedges(&rec, sedges);

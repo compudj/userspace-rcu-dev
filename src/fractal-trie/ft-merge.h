@@ -1268,7 +1268,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			txn = ft_flip_txn_create();
 			if (txn && !ft_flip_txn_reserve(txn,
 					nr_dst + 1 + ms_cap + gd.cap_free
-						+ gd.nr_splices)) {
+						+ gd.nr_splices
+						+ 1 /* §4.B parent guard */)) {
 				ft_flip_txn_destroy(txn);
 				txn = NULL;
 			} else if (txn) {
@@ -1664,6 +1665,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				gd.deferred[j].slot);
 		}
 		/* Forward publish: old dst subtree -> merged cluster. */
+		/* VALIDATE (§4.B): guard the LIVE dst parent above the overlap spine. */
+		ft_flip_txn_guard_parent(dst_ft, txn, pub_parent);
 		ft_flip_txn_record_reserved(txn, (void **) pub_slot,
 			D_old, M_slot);
 	}
@@ -1846,7 +1849,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 			/* +1: fused recompact-relocate tombstone (§4.B);
 			 * + FLOOR_FREE: fused free-list tombstones */
-			FT_GLUE_FLOOR_DEFERRED + 7 + FT_GLUE_FLOOR_FREE)) {
+			FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE)) {
 		if (glue.txn)
 			ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
@@ -2344,14 +2347,16 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			unsigned int pf_cap;
 
 			if (m == 0)
-				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + FT_GLUE_FLOOR_FREE;
+				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE;
 			else if (dst_ft->group->ordered_list_set)
 				pf_cap = (unsigned int) (m + 1) +
 					(unsigned int) (2 * n + 2) +
-					(unsigned int) n;
+					(unsigned int) n +
+					1 /* §4.B parent guard */;
 			else
 				pf_cap = (unsigned int) (m + 1) +
-					(unsigned int) n;
+					(unsigned int) n +
+					1 /* §4.B parent guard */;
 			pf_txn = ft_flip_txn_create();
 			if (pf_txn && !ft_flip_txn_reserve(pf_txn, pf_cap)) {
 				ft_flip_txn_destroy(pf_txn);

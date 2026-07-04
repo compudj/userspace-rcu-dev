@@ -121,6 +121,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		if ((fuse_cell || run) && pub && !pub->armed) {
 			struct ft_pub_rec rec = { .n = 0 };
 
+			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn. */
+			ft_flip_txn_guard_parent(ft, txn, ft_compressed_node_flag(cn));
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -139,6 +141,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * release store (ft_ord_cell_flip_one), so this stays allocation-
 			 * free and infallible for the common plain-parent case.
 			 */
+			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn. */
+			ft_flip_txn_guard_parent(ft, txn, ft_compressed_node_flag(cn));
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -172,6 +176,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * through the op flip-txn so they flip atomically; lone edge
 			 * stays a single release store.
 			 */
+			/* VALIDATE (§4.B): guard the LIVE grandparent src_meta->parent. */
+			ft_flip_txn_guard_parent(ft, txn, src_meta->parent);
 			_ft_publish_to_parent(ft, src_meta->parent,
 				detach_parent_flag_ptr,
 				ft_node_flag(fresh, 0), &rec);
@@ -361,6 +367,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * new_cn allocation, both BEFORE the build's first side-effect.
 	 */
 	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
+			+ 1 /* §4.B parent guard */
 			+ nr_orphans + (trailing_orphan ? 1 : 0)
 			+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
 	if (!txn)
@@ -426,6 +433,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		ft_pub_rec_add_back_edge(ft, &rec, new_cn->child, new_cn_flag,
 			&new_cn->child);
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
+		/* VALIDATE (§4.B): guard the LIVE (great-)grandparent publish_parent. */
+		ft_flip_txn_guard_parent(ft, txn, publish_parent);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
 			new_cn_pub, new_cn_meta, &rec);
 		/*
@@ -864,6 +873,7 @@ int ft_detach_node(struct cds_ft *ft,
 			struct ft_flip_txn *orphan_txn =
 				ft_flip_txn_create_bounded(
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
+					+ 1 /* §4.B parent guard (Sites 3+4 excl.) */
 					+ nr_to_free
 					+ (trailing_skip_cn ? 1 : 0)
 					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
@@ -1193,6 +1203,7 @@ int ft_detach_node(struct cds_ft *ft,
 			    (pub && (nr_to_free > 0 || trailing_skip_cn_flag))) {
 				commit_txn = ft_flip_txn_create_bounded(
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
+					+ 1 /* §4.B parent guard (Site 1 arms excl.) */
 					+ nr_to_free
 					+ (trailing_skip_cn_flag ? 1 : 0)
 					+ (retire_glue ? retire_glue->cap_free : 0)
@@ -1337,6 +1348,8 @@ int ft_detach_node(struct cds_ft *ft,
 		    old_recompacted_node && !topmost_external_nodes) {
 			struct ft_pub_rec rec = { .n = 0 };
 
+			/* VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent. */
+			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
 			/*
@@ -1375,6 +1388,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 * through to the no-op else.  (pub->armed and
 			 * old_recompacted_node are mutually exclusive.)
 			 */
+			/* VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent. */
+			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
 			ft_remove_commit_rec(ft, &rec, NULL, NULL,
@@ -1569,7 +1584,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			return -ENOMEM;
 		txn = ft_flip_txn_create_bounded(
 			FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
-			FT_HLIST_FREEZE_MAX_EDGES);
+			FT_HLIST_FREEZE_MAX_EDGES + 1);	/* +1: §4.B parent guard */
 		if (!txn) {
 			ft_ord_cell_free_unpublished(ft,
 				ft_ord_cell_ptr(new_cell_flag));
@@ -1584,6 +1599,8 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * already reserved so the commit through it cannot fail.
 		 */
 		next_node->prev = new_cell_flag;
+		/* VALIDATE (§4.B): guard the LIVE holder this head-promote publishes into. */
+		ft_flip_txn_guard_parent(ft, txn, parent_nf);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node, &rec);
@@ -1612,11 +1629,13 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 */
 		struct ft_flip_txn *txn =
 			ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
-				FT_HLIST_FREEZE_MAX_EDGES);
+				FT_HLIST_FREEZE_MAX_EDGES + 1);	/* +1: §4.B parent guard */
 
 		if (!txn)
 			return -ENOMEM;
 		next_node->prev = node->prev;	/* inherit parent */
+		/* VALIDATE (§4.B): guard the LIVE holder this head-promote publishes into. */
+		ft_flip_txn_guard_parent(ft, txn, parent_nf);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node, &rec);
