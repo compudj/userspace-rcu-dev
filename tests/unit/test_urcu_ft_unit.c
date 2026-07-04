@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 304
+#define NR_TESTS 305
 #else
-#define NR_TESTS 262
+#define NR_TESTS 263
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -278,26 +278,6 @@ static struct cds_ft *create_varlen_rankstats_list_ft(bool ordered_list,
 	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
-		abort();
-	if (cds_ft_group_create(attr, &group) < 0)
-		abort();
-	cds_ft_group_attr_destroy(attr);
-	if (cds_ft_create(group, NULL, &ft) < 0)
-		abort();
-	*group_out = group;
-	return ft;
-}
-
-/* Variable-length trie with order-statistics (per-node nr_keys) ENABLED. */
-static struct cds_ft *create_varlen_rankstats_ft(struct cds_ft_group **group_out)
-{
-	struct cds_ft_group_attr *attr;
-	struct cds_ft_group *group;
-	struct cds_ft *ft;
-
-	if (cds_ft_group_attr_create(&attr) < 0)
-		abort();
-	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -3384,6 +3364,98 @@ static int test_rank_stats_relocation_exact(void)
 	if (rank_stats_relocation_exact_run(true) < 0)
 		return -1;
 	return rank_stats_relocation_exact_run(false);
+}
+
+/*
+ * Order-statistics ON, NIL-key remove exactness (one @ordered_list mode).  The
+ * NIL key (key_len 0) is the global minimum, stored on the ROOT's external_nodes
+ * chain, so removing it decrements the root's OWN nr_keys with no ancestor walk
+ * -- shape R1.  Insert the NIL key alongside sibling single-byte keys (so the
+ * root count is > 1 and the decrement is distinguishable), verify the aggregate,
+ * remove the NIL key, and verify per-node nr_keys and the root aggregate dropped
+ * by exactly one.  cds_ft_verify recounts every node structurally (gated on rank
+ * stats), so a folded root -1 that under/over-shoots aborts here.  Run both list
+ * modes: rank stats on takes the fused txn commit in BOTH (list on also carries
+ * the dead head cell's unsplice, list off just the external_nodes -> NULL clear).
+ */
+static int rank_stats_nil_remove_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "nil_remove list-on" : "nil_remove list-off";
+	struct ft_test_node *n_nil = node_alloc(0);
+	struct cds_ft_iter *iter = NULL;
+	unsigned long expect = 0;
+	char b;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		node_free(n_nil);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	/* NIL key on the root's external_nodes, plus sibling single-byte keys. */
+	if (cds_ft_insert(ft, NULL, 0, &n_nil->node) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: insert NIL failed\n", lm);
+		goto out_fail;
+	}
+	expect++;
+	for (b = 'a'; b <= 'e'; b++)
+		if (rank_stats_insert_verify(ft, &b, 1, &expect, lm) < 0)
+			goto out_fail;
+	/* Baseline: verify + aggregate reflect the NIL key + siblings. */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_count_keys(ft) != expect) {
+		fprintf(stderr, "%s: pre-remove count %lu != %lu\n", lm,
+			cds_ft_count_keys(ft), expect);
+		goto out_fail;
+	}
+
+	/*
+	 * Remove the NIL key via remove_all -- its dedicated key_len==0 handler
+	 * is the dedicated R1 site (root external_nodes -> NULL + root nr_keys -1
+	 * folded into ONE commit).  A plain cds_ft_remove of the NIL key instead
+	 * routes through the general prefix-with-siblings branch (R2).
+	 */
+	{
+		struct cds_ft_node *head = NULL, *tmp;
+
+		cds_ft_iter_set_key(iter, NULL, 0);
+		if (cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK ||
+		    !head) {
+			fprintf(stderr, "%s: remove_all NIL failed\n", lm);
+			goto out_fail;
+		}
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+			node_free_rcu(to_test_node(head));
+	}
+	expect--;
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify failed after NIL remove\n", lm);
+		goto out_fail;
+	}
+	if (cds_ft_count_keys(ft) != expect) {
+		fprintf(stderr, "%s: post-remove count %lu != %lu\n", lm,
+			cds_ft_count_keys(ft), expect);
+		goto out_fail;
+	}
+	rcu_read_unlock();
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+out_fail:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+static int test_rank_stats_nil_remove_exact(void)
+{
+	if (rank_stats_nil_remove_run(true) < 0)
+		return -1;
+	return rank_stats_nil_remove_run(false);
 }
 
 /*
@@ -24057,6 +24129,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_key_shorter_exact);
 	RUN_TEST(test_rank_stats_past_child_exact);
 	RUN_TEST(test_rank_stats_relocation_exact);
+	RUN_TEST(test_rank_stats_nil_remove_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
