@@ -123,6 +123,20 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
+#ifndef FEATURE_FT_INSERT_IN_PLACE
+					/*
+					 * Recompact-on-insert (default): refilling a
+					 * soft-deleted hole (bit sticky-set, slot NULL)
+					 * bumps this LIVE node's nr_child -- report
+					 * -ERANGE so the wrapper routes through
+					 * ft_node_recompact(ADD_SAME) (the fresh copy
+					 * drops the NULL hole and re-adds byte n).
+					 * @defer_parent = build-invisible node: keep in
+					 * place (also avoids recompact-within-recompact).
+					 */
+					if (!defer_parent)
+						return -ERANGE;
+#endif
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
 					ft_meta_nr_child_inc(metadata);
@@ -233,6 +247,20 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
+#ifndef FEATURE_FT_INSERT_IN_PLACE
+					/*
+					 * Recompact-on-insert (default): refilling a
+					 * soft-deleted hole (bit sticky-set, slot NULL)
+					 * bumps this LIVE node's nr_child -- report
+					 * -ERANGE so the wrapper routes through
+					 * ft_node_recompact(ADD_SAME) (the fresh copy
+					 * drops the NULL hole and re-adds byte n).
+					 * @defer_parent = build-invisible node: keep in
+					 * place (also avoids recompact-within-recompact).
+					 */
+					if (!defer_parent)
+						return -ERANGE;
+#endif
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
 					ft_meta_nr_child_inc(metadata);
@@ -360,6 +388,20 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
+#ifndef FEATURE_FT_INSERT_IN_PLACE
+					/*
+					 * Recompact-on-insert (default): refilling a
+					 * soft-deleted hole (bit sticky-set, slot NULL)
+					 * bumps this LIVE node's nr_child -- report
+					 * -ERANGE so the wrapper routes through
+					 * ft_node_recompact(ADD_SAME) (the fresh copy
+					 * drops the NULL hole and re-adds byte n).
+					 * @defer_parent = build-invisible node: keep in
+					 * place (also avoids recompact-within-recompact).
+					 */
+					if (!defer_parent)
+						return -ERANGE;
+#endif
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
 					ft_meta_nr_child_inc(metadata);
@@ -467,6 +509,19 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				if (_replace_old_ptr)
 					*_replace_old_ptr = true;
 			} else {
+#ifndef FEATURE_FT_INSERT_IN_PLACE
+				/*
+				 * Recompact-on-insert (default): refilling a
+				 * soft-deleted hole (bit sticky-set, slot NULL) bumps
+				 * this LIVE node's nr_child -- report -ERANGE so the
+				 * wrapper routes through ft_node_recompact(ADD_SAME)
+				 * (the fresh copy drops the NULL hole and re-adds byte
+				 * n).  @defer_parent = build-invisible node: keep in
+				 * place (also avoids recompact-within-recompact).
+				 */
+				if (!defer_parent)
+					return -ERANGE;
+#endif
 				if (_replace_old_ptr)
 					*_replace_old_ptr = false;
 				ft_meta_nr_child_inc(metadata);
