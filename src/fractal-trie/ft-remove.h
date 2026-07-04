@@ -238,9 +238,15 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  *                  when the parent is non-compressed; compressed parents
  *                  resolve their own slot via parent_slot_offset.
  */
+#endif	/* FEATURE_FT_SKIP_COMPRESSED */
 /*
  * Freeze-on-free (doc §4.B) for the ft_detach_node branch-2 orphan chain: mark
- * every collected orphan (+ the trailing skip-target) DEAD.  @txn non-NULL
+ * every collected orphan (+ the trailing skip-target) DEAD.  This helper is
+ * config-agnostic (the branch-2 orphan chain forms with or without skip
+ * compression; ft_skip_to_compressed has an unconditional non-skip stub), and
+ * it is called from a path (ft_detach_node) that is reachable outside the
+ * skip block, so it lives OUTSIDE the FEATURE_FT_SKIP_COMPRESSED guard.  @txn
+ * non-NULL
  * records each tombstone INTO the op's commit txn so the freeze flips
  * ATOMICALLY with the flip that unlinks the chain (atomic detach); @txn NULL
  * falls back to a standalone lone-edge flip (the list-off pub-less lone-store
@@ -276,6 +282,7 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 			ft_meta_tombstone_set_flip(m);
 	}
 }
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 /*
  * ft_chain_compress_fused: the fused-merge primitive behind the
  * chain-compress canonicalization.  Builds the merged compressed @new_cn
