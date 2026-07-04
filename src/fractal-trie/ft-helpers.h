@@ -697,9 +697,10 @@ void ft_nr_keys_store(const struct cds_ft *ft, struct cds_ft_metadata *m,
 static inline
 unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
 {
-	return (unsigned int) ((uintptr_t) urcu_mcas_read(
+	return (unsigned int) (((uintptr_t) urcu_mcas_read(
 			(void **) (uintptr_t) &meta->state,
-			FT_STATE_PROXY) >> FT_STATE_NR_CHILD_SHIFT);
+			FT_STATE_PROXY) >> FT_STATE_NR_CHILD_SHIFT)
+			& FT_STATE_NR_CHILD_VALMASK);
 }
 
 /*
@@ -1621,11 +1622,11 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 	if (!slot)
 		return;	/* Slot unknown -- preserve existing offset. */
 	if (!parent) {
-		meta->parent_slot_offset = 0;
+		ft_meta_parent_slot_offset_set(meta, 0);
 		return;
 	}
-	meta->parent_slot_offset = (unsigned int)((char *) slot -
-		(char *) ft_node_ptr(parent)) / sizeof(void *);
+	ft_meta_parent_slot_offset_set(meta, (unsigned int)((char *) slot -
+		(char *) ft_node_ptr(parent)) / sizeof(void *));
 	/*
 	 * Record this node's incoming branch byte for the up-walk key rebuild
 	 * (ft_rebuild_key_upwalk).  This is THE central populate point for every
@@ -1671,7 +1672,7 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
 		return &ft->root;
 	return (struct cds_ft_inode_flag **)
 		((char *) ft_node_ptr(meta->parent) +
-		 (unsigned int) meta->parent_slot_offset * sizeof(void *));
+		 ft_meta_parent_slot_offset(meta) * sizeof(void *));
 }
 
 /*

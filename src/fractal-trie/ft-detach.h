@@ -141,7 +141,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		{
 			struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 				ft_node_ptr(detached->root));
-			m->parent_slot_offset = 0;
+			ft_meta_parent_slot_offset_set(m, 0);
 		}
 #endif
 		uatomic_store(&detached->max_used_key_len,
@@ -513,7 +513,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						ft_node_ptr(new_root));
 					m->parent = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-					m->parent_slot_offset = 0;
+					ft_meta_parent_slot_offset_set(m, 0);
 #endif
 				}
 				ft_glue_free_old(detached, &glue);

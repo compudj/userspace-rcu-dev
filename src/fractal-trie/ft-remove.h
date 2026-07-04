@@ -165,7 +165,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				iter_node_flag));
 		fresh_meta->parent = src_meta->parent;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		fresh_meta->parent_slot_offset = src_meta->parent_slot_offset;
+		ft_meta_parent_slot_offset_set(fresh_meta,
+			ft_meta_parent_slot_offset(src_meta));
 #endif
 		{
 			struct ft_pub_rec rec = { .n = 0 };

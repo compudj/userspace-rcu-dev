@@ -796,7 +796,22 @@ struct ft_pub_rec {
 #define FT_STATE_PROXY			((uintptr_t) 1 << 0)
 #define FT_STATE_TOMBSTONE		((uintptr_t) 1 << 1)
 #define FT_STATE_NR_CHILD_SHIFT		2
+#define FT_STATE_NR_CHILD_BITS		9	/* live-child count, max 256 (bits 2-10) */
+#define FT_STATE_NR_CHILD_VALMASK	(((uintptr_t) 1 << FT_STATE_NR_CHILD_BITS) - 1)
+#define FT_STATE_NR_CHILD_MASK		(FT_STATE_NR_CHILD_VALMASK << FT_STATE_NR_CHILD_SHIFT)
 #define FT_STATE_NR_CHILD_ONE		((uintptr_t) 1 << FT_STATE_NR_CHILD_SHIFT)
+/*
+ * parent_slot_offset (0..255): the pointer-stride offset of this node's slot in
+ * its parent, packed ABOVE nr_child so that a re-home -- which changes both the
+ * parent pointer and the slot offset -- commits parent-edge + offset as ONE
+ * atomic MCAS state edge (a concurrent backtracker never straddles a
+ * new-parent/old-offset window).  Access ONLY via the ft_meta_parent_slot_offset*
+ * helpers (they mask/preserve the tag + nr_child bits).
+ */
+#define FT_STATE_PSO_SHIFT		(FT_STATE_NR_CHILD_SHIFT + FT_STATE_NR_CHILD_BITS)
+#define FT_STATE_PSO_BITS		8
+#define FT_STATE_PSO_VALMASK		(((uintptr_t) 1 << FT_STATE_PSO_BITS) - 1)
+#define FT_STATE_PSO_MASK		(FT_STATE_PSO_VALMASK << FT_STATE_PSO_SHIFT)
 #define FT_STATE_TAG_MASK		(FT_STATE_PROXY | FT_STATE_TOMBSTONE)
 
 struct cds_ft_metadata {
@@ -831,31 +846,30 @@ struct cds_ft_metadata {
 	 *   bit 0   FT_STATE_PROXY     -- in-band flip marker (set only mid-flip;
 	 *                                 lets the scalar ride the flip-latch).
 	 *   bit 1   FT_STATE_TOMBSTONE -- one-way LIVE->DEAD deleted latch (§4.B).
-	 *   bits 2+ nr_child           -- live-child count (max 256).
-	 * The proxy/tombstone bits are reserved-and-zero until Invariant-2 is
-	 * wired; today only nr_child is live.  Access nr_child via the
-	 * ft_meta_nr_child* helpers (they preserve the low tag bits) -- never
-	 * read/write the word directly.
+	 *   bits 2-10  nr_child        -- live-child count (max 256, 9 bits).
+	 *   bits 11-18 parent_slot_offset -- pointer-stride offset of this node's
+	 *                                 slot in its parent body (8 bits), so a
+	 *                                 re-home commits parent + offset as one
+	 *                                 atomic state edge.
+	 * Access nr_child / parent_slot_offset ONLY via the ft_meta_nr_child* /
+	 * ft_meta_parent_slot_offset* helpers -- they mask their own field and
+	 * preserve the others; never read/write the word directly.
 	 */
 	uintptr_t state;
 
 	/*
 	 * Packed bitfield -- small fields in a single uint32_t.
-	 * (nr_child lives in @state above, not here.)
+	 * (nr_child AND parent_slot_offset both live in @state above, not here.
+	 * parent_slot_offset -- the pointer-stride offset of this node's slot in
+	 * its parent -- moved into the state word so a re-home commits the parent
+	 * edge and the slot offset as ONE atomic MCAS state edge; access it via
+	 * the ft_meta_parent_slot_offset* helpers.)
 	 *
-	 * parent_slot_offset:     8 bits -- pointer-stride offset of this
-	 *                         node's slot within its parent node body
-	 *                         (byte_offset / sizeof(void *)).  Maintained
-	 *                         for every internal/compressed node (not just
-	 *                         skip-compressed): it lets a backtrack recover
-	 *                         the parent slot in O(1) without re-descending.
-	 *                         0 (and unused) at the root.
 	 * alloc_index:            near: FT_ALLOC_INDEX_BITS + 3 spare bits of
 	 *                         headroom above the page_size >>
 	 *                         FT_ALLOC_ORDER_MIN minimum; far: a separate
 	 *                         uint32_t (see below).
 	 */
-	uint32_t parent_slot_offset:8;
 #ifdef FT_FAR_METADATA
 	/*
 	 * A 2 MiB far macro-block holds far more than 256 items (e.g. ~18 700
@@ -902,14 +916,16 @@ struct cds_ft_metadata {
 static inline
 unsigned int ft_meta_nr_child(const struct cds_ft_metadata *meta)
 {
-	return (unsigned int) (meta->state >> FT_STATE_NR_CHILD_SHIFT);
+	return (unsigned int) ((meta->state >> FT_STATE_NR_CHILD_SHIFT)
+			& FT_STATE_NR_CHILD_VALMASK);
 }
 
 static inline
 void ft_meta_nr_child_set(struct cds_ft_metadata *meta, unsigned int n)
 {
+	/* Replace only the nr_child field; preserve tags + parent_slot_offset. */
 	meta->state = ((uintptr_t) n << FT_STATE_NR_CHILD_SHIFT)
-		| (meta->state & FT_STATE_TAG_MASK);
+		| (meta->state & ~FT_STATE_NR_CHILD_MASK);
 }
 
 static inline
@@ -922,6 +938,30 @@ static inline
 void ft_meta_nr_child_dec(struct cds_ft_metadata *meta)
 {
 	meta->state -= FT_STATE_NR_CHILD_ONE;
+}
+
+/*
+ * parent_slot_offset: the pointer-stride offset of this node's slot in its
+ * parent body, held in @state bits FT_STATE_PSO_SHIFT.. (above nr_child).  This
+ * raw reader suits a node the caller owns / that is quiescent (all backtrack
+ * callers today run under writer exclusion); the setter replaces only the
+ * offset field and preserves nr_child + the tag bits.  When concurrent writers
+ * land (Phase 4.3), a resolving _load variant will mirror ft_meta_nr_child_load
+ * to skip a mid-commit proxy.  Root nodes (parent == NULL) leave this 0 and
+ * never read it.
+ */
+static inline
+unsigned int ft_meta_parent_slot_offset(const struct cds_ft_metadata *meta)
+{
+	return (unsigned int) ((meta->state >> FT_STATE_PSO_SHIFT)
+			& FT_STATE_PSO_VALMASK);
+}
+
+static inline
+void ft_meta_parent_slot_offset_set(struct cds_ft_metadata *meta, unsigned int off)
+{
+	meta->state = (meta->state & ~FT_STATE_PSO_MASK)
+		| (((uintptr_t) off & FT_STATE_PSO_VALMASK) << FT_STATE_PSO_SHIFT);
 }
 
 /*

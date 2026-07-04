@@ -168,7 +168,8 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	 * based remove that climbs via ft_get_parent_slot would otherwise
 	 * read a fresh-zeroed offset and resolve the wrong slot.
 	 */
-	cn2_meta->parent_slot_offset = cn_meta->parent_slot_offset;
+	ft_meta_parent_slot_offset_set(cn2_meta,
+		ft_meta_parent_slot_offset(cn_meta));
 	/* Same slot in the same parent => same incoming edge byte (up-walk source). */
 	cn2_meta->incoming_byte = cn_meta->incoming_byte;
 	ft_meta_nr_child_set(cn2_meta, ft_meta_nr_child(cn_meta));		/* == 1 for a compressed node */

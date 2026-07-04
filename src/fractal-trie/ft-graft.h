@@ -192,7 +192,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 
 		bm->parent = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		bm->parent_slot_offset = 0;
+		ft_meta_parent_slot_offset_set(bm, 0);
 #endif
 	}
 	/*
@@ -2245,7 +2245,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				/* top_B is freshly built (invisible); wire its root parent. */
 				bm->parent = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-				bm->parent_slot_offset = 0;
+				ft_meta_parent_slot_offset_set(bm, 0);
 #endif
 				/*
 				 * Structural root install, deferred into the fused flip

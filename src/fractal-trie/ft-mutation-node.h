@@ -980,7 +980,8 @@ int ft_node_recompact(enum ft_recompact mode,
 			/* The retyped node keeps its own incoming edge byte. */
 			new_metadata->incoming_byte = metadata->incoming_byte;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			new_metadata->parent_slot_offset = metadata->parent_slot_offset;
+			ft_meta_parent_slot_offset_set(new_metadata,
+				ft_meta_parent_slot_offset(metadata));
 #endif
 			/*
 			 * Recompact: new_metadata->parent is already inherited
@@ -1161,7 +1162,8 @@ skip_copy:
 		 * skip-specific -- it backs the parent-pointer backtrack's O(1)
 		 * slot recovery for plain-internal nodes too).
 		 */
-		new_metadata->parent_slot_offset = old_meta->parent_slot_offset;
+		ft_meta_parent_slot_offset_set(new_metadata,
+			ft_meta_parent_slot_offset(old_meta));
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (old_parent && ft_node_compressed(old_parent)) {

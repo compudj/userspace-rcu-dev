@@ -468,7 +468,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			 */
 			Mmeta->parent = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			Mmeta->parent_slot_offset = 0;
+			ft_meta_parent_slot_offset_set(Mmeta, 0);
 #endif
 		} else if (old) {
 			ft_glue_track(c->gd, M);
