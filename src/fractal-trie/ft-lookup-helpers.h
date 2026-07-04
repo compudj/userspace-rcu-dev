@@ -73,7 +73,18 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *prev)
 {
 	if (ft->ordered_list)
-		return rcu_dereference(ft_ord_cell_ptr(prev)->parent);
+		/*
+		 * cell->parent can carry an in-flight flip-proxy: a re-parent that
+		 * folds the cell->parent store INTO its structural commit (so the
+		 * back-edge flips ATOMICALLY with the forward publish -- e.g. the
+		 * detach external-promote) transiently installs a descriptor here.
+		 * Resolve it at this single choke point every up-walk parent read
+		 * passes through, so a concurrent reader mid-commit sees the
+		 * view-appropriate parent, not the raw descriptor.  Identity when no
+		 * commit is in flight (ft_resolve_flip_proxy no-ops a plain pointer).
+		 */
+		return ft_resolve_flip_proxy(
+			rcu_dereference(ft_ord_cell_ptr(prev)->parent));
 	return (struct cds_ft_inode_flag *) prev;
 }
 

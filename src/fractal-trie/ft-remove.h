@@ -98,17 +98,36 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		else
 			cn = ft_compressed_node_ptr(iter_node_flag);
 		/*
-		 * Wire the external's prev to cn BEFORE publishing cn->child:
-		 * after the publish, a skip pointer at cn's grandparent slot
-		 * resolves through cn->child = topmost_external_nodes, and
-		 * ft_skip_to_compressed walks topmost->prev to recover cn.
-		 * Setting prev after the publish leaves a window where prev
-		 * still points at the about-to-be-detached old holder, so
-		 * skip-recovery returns the wrong compressed node.
+		 * Fold the external head's back-edge -- cell->parent (list on) or
+		 * its prev (list off) -- INTO @txn so it commits ATOMICALLY with
+		 * cn->child below, rather than as a bare store racing ahead of the
+		 * publish.  A skip pointer at cn's grandparent slot resolves through
+		 * cn->child = topmost_external_nodes, and ft_skip_to_compressed walks
+		 * topmost->prev to recover cn; the atomic commit means skip-recovery
+		 * never observes cn->child = topmost while topmost's back-edge still
+		 * names the about-to-be-detached old holder.  Both slots resolve a
+		 * flip-proxy on the read side (cell->parent via ft_resolve_head_prev,
+		 * prev via ft_dereference_prev_resolved), so the folded descriptor is
+		 * concurrent-reader-safe.  The +1 edge was reserved by the caller
+		 * (ft_detach_node) when topmost_external_nodes is set.
 		 */
-		ft_set_parent(ft,
-			(struct cds_ft_inode_flag *) topmost_external_nodes,
-			ft_compressed_node_flag(cn), &cn->child);
+		{
+			struct cds_ft_inode_flag *cn_flag =
+				ft_compressed_node_flag(cn);
+
+			if (ft->ordered_list) {
+				struct ft_ord_cell *cell = ft_ord_cell_ptr(
+					topmost_external_nodes->prev);
+
+				ft_flip_txn_record_reserved(txn,
+					(void **) &cell->parent,
+					cell->parent, cn_flag);
+			} else {
+				ft_flip_txn_record_reserved(txn,
+					(void **) &topmost_external_nodes->prev,
+					topmost_external_nodes->prev, cn_flag);
+			}
+		}
 		/*
 		 * External-promote publish into cn->child (the moment the
 		 * removed leaf key disappears for an exact reader, which
@@ -884,6 +903,7 @@ int ft_detach_node(struct cds_ft *ft,
 					+ 1 /* §4.B parent guard (Sites 3+4 excl.) */
 					+ nr_to_free
 					+ (trailing_skip_cn ? 1 : 0)
+					+ (topmost_external_nodes ? 1 : 0) /* folded external back-edge */
 					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
 
 			if (!orphan_txn) {
