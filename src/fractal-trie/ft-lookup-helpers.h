@@ -39,6 +39,28 @@ struct ft_ord_cell *ft_ord_cell_ptr(const void *prev)
 }
 
 /*
+ * Reader-side load of a node's back-reference (prev), stripping a parked
+ * structural flip-proxy before it is interpreted as a head cell (ordered-list
+ * on, via ft_ord_cell_ptr) or a flagged parent (ordered-list off, via
+ * ft_resolve_head_prev).  Once a head-cell promote / swap / prev-retarget folds
+ * its prev store onto the commit flip-txn, this slot can transiently hold FT's
+ * type-7 proxy; a raw ft_ord_cell_ptr() would mask the tag and dereference the
+ * descriptor as a cell.  Mirrors the forward-edge readers (ft_root_dereference /
+ * ft_cn_child_dereference_acquire_prefetch): resolve the proxy at the load.
+ * Under the retained single-writer exclusion no proxy is ever at rest, so
+ * ft_resolve_flip_proxy takes its predicted-not-taken branch and the result is
+ * byte-identical; it becomes load-bearing only once the prev stores fold onto
+ * the txn (Phase 4.3).  Writer-owned / quiescent prev reads keep the direct
+ * rcu_dereference -- the ft_meta_nr_child vs ft_meta_nr_child_load split.
+ */
+static inline_lookup
+void *ft_dereference_prev_resolved(struct cds_ft_node *node)
+{
+	return ft_resolve_flip_proxy((struct cds_ft_inode_flag *)
+			rcu_dereference(node->prev));
+}
+
+/*
  * Resolve a head's flagged parent from its (already-rcu_dereference'd) prev.
  * When the group runs an ordinal-cell list, prev is a cell and the parent is
  * rcu_dereference(cell->parent); otherwise prev IS the flagged parent (no cell

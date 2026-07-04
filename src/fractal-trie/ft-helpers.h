@@ -1280,7 +1280,7 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft *ft,
 
 	if (ft_node_external(node))
 		parent = ft_resolve_head_prev(ft,
-			rcu_dereference(((struct cds_ft_node *) node)->prev));
+			ft_dereference_prev_resolved((struct cds_ft_node *) node));
 	else if (ft_node_compressed(node))
 		/*
 		 * A compressed node's metadata lives at a FT_TAG_MASK-cleared
@@ -1393,7 +1393,7 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(const struct cds_ft *ft,
 		 * tag a cell carries -- so only the mode flag disambiguates safely.
 		 */
 		parent = ft_resolve_head_prev(ft,
-			rcu_dereference(((struct cds_ft_node *) child)->prev));
+			ft_dereference_prev_resolved((struct cds_ft_node *) child));
 	else
 		parent = rcu_dereference(cds_ft_item_to_metadata(
 			ft_node_ptr(child))->parent);
@@ -1480,7 +1480,7 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
 
 		if (ft_node_external(cur))
 			parent = ft_resolve_head_prev(ft,
-				rcu_dereference(((struct cds_ft_node *) cur)->prev));
+				ft_dereference_prev_resolved((struct cds_ft_node *) cur));
 		else
 			parent = rcu_dereference(cds_ft_item_to_metadata(
 				ft_node_ptr(cur))->parent);

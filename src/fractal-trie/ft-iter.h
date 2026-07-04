@@ -58,7 +58,7 @@ struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter)
 {
 	if (iter->ord_cell_node == iter->node)
 		return iter->ord_cell;
-	return ft_ord_cell_ptr(rcu_dereference(iter->node->prev));
+	return ft_ord_cell_ptr(ft_dereference_prev_resolved(iter->node));
 }
 
 /*
@@ -518,7 +518,7 @@ enum cds_ft_status cds_ft_node_get_key(const struct cds_ft *ft,
 		 */
 		if (ft->ordered_list) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(
-				rcu_dereference(((struct cds_ft_node *) node)->prev));
+				ft_dereference_prev_resolved((struct cds_ft_node *) node));
 			size_t max_len = group->max_key_len;
 
 			klen = ft_rebuild_key_upwalk(ft, cell, scratch, max_len);
