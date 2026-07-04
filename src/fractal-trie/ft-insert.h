@@ -1336,6 +1336,49 @@ int ft_attach_node(struct cds_ft *ft,
 					(void *) rec.new_val[k]);
 			ic->free_old_node = old_recompacted_node;
 			old_recompacted_node = NULL;
+			/*
+			 * I7 count fold (rank stats ON): the reserve recompacted
+			 * the attach node, so the relocated copy iter_dest_node_flag
+			 * (a fresh node published at the grandparent slot) carries
+			 * the new key -- the fresh branch is wired into its reserved
+			 * slot -- but the recompact copied only the OLD subtree count
+			 * (ft_node_recompact, mutation-node.h).  Bump it +1 to its
+			 * FULL post-commit count (a build-invisible plain store on the
+			 * fresh copy, published atomically at the commit) so it is off
+			 * the count walk, then record the +1 walk from
+			 * metadata->parent -- the STABLE grandparent whose slot this
+			 * relocation republishes into (VALIDATE-guarded live just
+			 * above), commit-invariant -- up to the root.  The retired old
+			 * attach node is NOT on the walk.  Single-level relocation:
+			 * ft_node_set_nth_rec rebuilds only the attach node; the
+			 * grandparent is not relocated.  Equivalent to the old
+			 * post-commit walk from *d.pnfp, which post-commit is exactly
+			 * this relocated copy (+1) then its stable ancestors.
+			 *
+			 * Reader-safety of this pre-commit +1: the fresh copy is
+			 * reachable pre-commit ONLY as an ANCESTOR (recompact reparents
+			 * its children's parent pointers to it), never through its own
+			 * forward slot (the grandparent slot still resolves to the old
+			 * node until the flip), and its new-key slot reads NULL until
+			 * the commit -- so its own aggregate transiently overcounts what
+			 * is reachable from it.  This is invisible because no count
+			 * reader ever reads a node's OWN nr_keys except at a
+			 * root-DESCENDED position (which lands on the old node via the
+			 * proxy); the skip up-walk reads a node's CHILDREN's counts, not
+			 * the node's own.  Do not add a reader that reads an up-walked
+			 * ancestor's own nr_keys without revisiting this fold.
+			 */
+			{
+				struct cds_ft_metadata *reloc_meta =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(iter_dest_node_flag));
+
+				ft_nr_keys_store(ft, reloc_meta,
+					ft_nr_keys_get(reloc_meta) + 1,
+					CMM_RELAXED);
+			}
+			ic->count_from = metadata->parent;
+			ic->count_folded = true;
 		} else {
 			/*
 			 * In-place reserve (dest == attach node): a redundant
