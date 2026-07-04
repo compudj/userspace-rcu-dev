@@ -2270,38 +2270,47 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		*result_node = external_nodes;
-		/* Decrement before detach (undercount ordering). */
-		ft_nr_keys_store(ft,metadata, ft_nr_keys_get(metadata) - 1,
-			CMM_RELEASE);
 		/*
 		 * Ordered list on: the NIL key is the global minimum (a prefix of
 		 * every key), so its removal is the prefix-with-siblings clear at
-		 * the root.  Fuse the root external_nodes -> NULL store with the
-		 * head cell's unsplice in ONE flip so a reader never sees the key
-		 * gone from one index but present in the other; readers resolve a
-		 * parked proxy on external_nodes via ft_dereference_external.  List
-		 * off: external_nodes is the single reader-visible slot, so express
-		 * the node -> NULL clear as a 1-edge flip (a lone release store,
-		 * MCAS-expressible) rather than a bare store.
+		 * the root.  Fuse the root external_nodes -> NULL store with the head
+		 * cell's unsplice AND the root nr_keys -1 (rank stats) in ONE flip so
+		 * a reader never sees the key gone from one index but present in the
+		 * other, nor a count out of step with the structure; readers resolve
+		 * a parked proxy on external_nodes via ft_dereference_external and on
+		 * nr_keys via ft_nr_keys_load.  List off, no rank stats: express the
+		 * node -> NULL clear as a lone 1-edge flip (an infallible release
+		 * store) rather than a bare store.
 		 */
-		if (ft->ordered_list) {
-			struct ft_ord_cell *dead = ft_ord_cell_ptr(external_nodes->prev);
+		if (ft->ordered_list || ft->rank_stats) {
+			struct ft_ord_cell *dead = ft->ordered_list ?
+				ft_ord_cell_ptr(external_nodes->prev) : NULL;
+			struct ft_flip_txn *txn;
 
 			/*
-			 * Abortable: the flip is the op's commit (no pre-flip
-			 * reader-visible side-effect).  On OOM roll back the -1 count,
-			 * reset the out-param, leave the key -- retriable MEMORY_ERROR.
+			 * R1 count fold: the NIL key lives at the root, so its -1 is a
+			 * single edge on the root's own nr_keys (no ancestors).  Reserve
+			 * it plus the structural + cell edges, record the count walk from
+			 * the root, and let ft_remove_one_commit flip them together --
+			 * exact and atomic (the decrement goes live WITH the detach, not
+			 * before it), so no pre-decrement and no OOM rollback: the pre-
+			 * reserved txn commits infallibly and the arm is the only abort.
+			 * A no-op count record when rank stats are off (list-on path).
 			 */
-			if (ft_remove_one_commit(ft,
-				(struct cds_ft_inode_flag **) &metadata->external_nodes,
-				(struct cds_ft_inode_flag *) external_nodes, NULL,
-				NULL, dead, NULL, NULL, NULL)) {
-				ft_nr_keys_store(ft,metadata,
-					ft_nr_keys_get(metadata) + 1, CMM_RELEASE);
+			txn = ft_flip_txn_create_bounded(
+				FT_REMOVE_COMMIT_REC_MAX_EDGES +
+				(ft->rank_stats ? 1 : 0));
+			if (!txn) {
 				*result_node = NULL;
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
-			ft_ord_cell_free(ft, dead);
+			ft_flip_txn_record_count_parent(ft, txn, ft->root, -1);
+			ft_remove_one_commit(ft,
+				(struct cds_ft_inode_flag **) &metadata->external_nodes,
+				(struct cds_ft_inode_flag *) external_nodes, NULL,
+				NULL, dead, NULL, txn, NULL);
+			if (dead)
+				ft_ord_cell_free(ft, dead);
 		} else {
 			struct ft_ord_cell_edge edge = {
 				.slot = (struct ft_ord_cell **)
