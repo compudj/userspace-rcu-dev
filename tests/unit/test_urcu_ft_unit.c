@@ -265,6 +265,29 @@ static struct cds_ft *create_varlen_ft(struct cds_ft_group **group_out)
 	return ft;
 }
 
+/* rank-stats-ON variable-length trie with the ordered list on or off. */
+static struct cds_ft *create_varlen_rankstats_list_ft(bool ordered_list,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
 /* Variable-length trie with order-statistics (per-node nr_keys) ENABLED. */
 static struct cds_ft *create_varlen_rankstats_ft(struct cds_ft_group **group_out)
 {
@@ -3036,12 +3059,12 @@ fail:
  * rank stats), so any miscount in either fold aborts at that exact mutation;
  * cds_ft_count_keys cross-checks the maintained root aggregate.
  */
-static int test_rank_stats_prefix_exact(void)
+static int rank_stats_prefix_exact_run(bool ordered_list)
 {
 	static const char alpha[] = "abc";
 	static const int lens[] = { 3, 2, 1 };
 	struct cds_ft_group *group = NULL;
-	struct cds_ft *ft = create_varlen_rankstats_ft(&group);
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
 	unsigned long expect = 0;
 	int ret = 0, li;
 
@@ -3094,27 +3117,11 @@ out:
 	return ret;
 }
 
-/* rank-stats-ON variable-length trie with the ordered list on or off. */
-static struct cds_ft *create_varlen_rankstats_list_ft(bool ordered_list,
-		struct cds_ft_group **group_out)
+static int test_rank_stats_prefix_exact(void)
 {
-	struct cds_ft_group_attr *attr;
-	struct cds_ft_group *group;
-	struct cds_ft *ft;
-
-	if (cds_ft_group_attr_create(&attr) < 0)
-		abort();
-	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
-		abort();
-	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
-		abort();
-	if (cds_ft_group_create(attr, &group) < 0)
-		abort();
-	cds_ft_group_attr_destroy(attr);
-	if (cds_ft_create(group, NULL, &ft) < 0)
-		abort();
-	*group_out = group;
-	return ft;
+	if (rank_stats_prefix_exact_run(true) < 0)
+		return -1;
+	return rank_stats_prefix_exact_run(false);
 }
 
 /*
