@@ -1016,12 +1016,13 @@ int ft_node_recompact(enum ft_recompact mode,
 
 		/*
 		 * Adding to a pigeon SOURCE happens only under recompact-on-
-		 * insert (-DNO_FEATURE_FT_INSERT_IN_PLACE): a new key for a live
-		 * pigeon routes here as ADD_SAME to retire the in-place bitmap
-		 * set.  A new-key insert never fills the pigeon (an occupied
-		 * byte is a replace, not an insert), so find_nearest_type_index
-		 * stays within the pigeon tier.  In the default in-place build a
-		 * pigeon never reaches an ADD recompact (tighter assert below).
+		 * insert (the DEFAULT; i.e. not -DFEATURE_FT_INSERT_IN_PLACE): a
+		 * new key for a live pigeon routes here as ADD_SAME to retire the
+		 * in-place bitmap set.  A new-key insert never fills the pigeon
+		 * (an occupied byte is a replace, not an insert), so
+		 * find_nearest_type_index stays within the pigeon tier.  In the
+		 * opt-in in-place build a pigeon never reaches an ADD recompact
+		 * (tighter assert below).
 		 */
 		assert(mode == FT_RECOMPACT_DEL ||
 			mode == FT_RECOMPACT_RELOCATE

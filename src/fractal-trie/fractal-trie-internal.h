@@ -474,29 +474,29 @@
 #endif
 
 /*
- * FEATURE_FT_INSERT_IN_PLACE: in-place occupancy-bitmap safe-append.
+ * FEATURE_FT_INSERT_IN_PLACE: in-place occupancy-bitmap safe-append (the
+ * single-writer insert fast path).  OPT-IN; RECOMPACT-ON-INSERT is the DEFAULT.
  *
- * When enabled (default), an insert that lands at a node's tail rank with
- * spare tier capacity is applied IN PLACE: the child slot is published and
- * the node's occupancy-bitmap bit is set with a relaxed store on the LIVE
- * node's metadata word (ft_popcount_node_set_nth Cases 2A/2B,
- * ft_pigeon_node_set_nth).  This is the cheap O(1) insert tier.
+ * When enabled (-DFEATURE_FT_INSERT_IN_PLACE), an insert that lands at a node's
+ * tail rank with spare tier capacity is applied IN PLACE: the child slot is
+ * published and the node's occupancy-bitmap bit is set with a relaxed store on
+ * the LIVE node's metadata word (ft_popcount_node_set_nth Cases 2A/2B,
+ * ft_pigeon_node_set_nth).  This is the cheap O(1) insert tier, but it mutates a
+ * live node's words disjointly, so it is NOT safe against concurrent writers.
  *
- * Disable with -DNO_FEATURE_FT_INSERT_IN_PLACE to force RECOMPACT-ON-INSERT:
- * every new-occupancy insert (i.e. not an in-place pointer replace at an
- * already-occupied slot) instead reports -ERANGE, so the setter wrapper
- * (ft_node_set_nth_rec) routes it through ft_node_recompact(ADD_SAME) -- a
- * fresh node carrying the new entry AND its bitmap is built build-invisibly
- * and the parent edge is flipped, exactly as a non-tail insert already does
- * today.  This removes the last reader-visible in-place node-word mutation
- * (the Invariant-2 disjoint-word hazard, see doc/design/mcas-multiwriter-
- * readiness.md S4): every node change becomes a whole-node replacement via
- * the parent flip-txn edge.  Behaviour-identical under a single writer (the
- * recompact path is the same one a non-tail insert takes), so the off build
- * validates the MCAS-ready shape on the current suite before any MCAS commit
- * body exists -- at the cost of turning the O(1) in-place insert into an
- * O(node) alloc-and-copy recompact (a shared/multi-writer cost tier; an
- * exclusive trie will keep the in-place store via a runtime gate later).
+ * By DEFAULT (the macro undefined) every new-occupancy insert (i.e. not an
+ * in-place pointer replace at an already-occupied slot) instead reports -ERANGE,
+ * so the setter wrapper (ft_node_set_nth_rec) routes it through
+ * ft_node_recompact(ADD_SAME) -- a fresh node carrying the new entry AND its
+ * bitmap is built build-invisibly and the parent edge is flipped, exactly as a
+ * non-tail insert already does.  This removes the last reader-visible in-place
+ * node-word mutation (the Invariant-2 disjoint-word hazard, see
+ * doc/design/mcas-multiwriter-readiness.md S4): every node change becomes a
+ * whole-node replacement via the parent flip-txn edge -- the multi-writer-safe
+ * shape.  Behaviour-identical under a single writer (the recompact path is the
+ * same one a non-tail insert takes), at the cost of turning the O(1) in-place
+ * insert into an O(node) alloc-and-copy recompact.  Re-enabling the in-place
+ * fast path for a single-writer trie (a runtime gate) is a future perf knob.
  *
  * Both popcount and pigeon nodes recompact uniformly here.  FUTURE (noted,
  * not done -- kept simple for now): a PIGEON slot is direct-indexed, so its
@@ -509,10 +509,13 @@
  * keep pigeon's O(1) insert/delete.  See doc/design/mcas-multiwriter-
  * readiness.md S4.
  *
- * Enabled by default.  Disable with -DNO_FEATURE_FT_INSERT_IN_PLACE.
+ * Default: recompact-on-insert (multi-writer-safe).  Opt into the in-place
+ * fast path with -DFEATURE_FT_INSERT_IN_PLACE.  -DNO_FEATURE_FT_INSERT_IN_PLACE
+ * forces recompact even if the fast path was requested (otherwise a no-op,
+ * kept for back-compat).
  */
-#ifndef NO_FEATURE_FT_INSERT_IN_PLACE
-# define FEATURE_FT_INSERT_IN_PLACE
+#ifdef NO_FEATURE_FT_INSERT_IN_PLACE
+# undef FEATURE_FT_INSERT_IN_PLACE
 #endif
 
 /*
