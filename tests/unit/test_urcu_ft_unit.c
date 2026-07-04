@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 303
+#define NR_TESTS 304
 #else
-#define NR_TESTS 261
+#define NR_TESTS 262
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3323,6 +3323,60 @@ static int test_rank_stats_past_child_exact(void)
 	if (rank_stats_past_child_exact_run(true) < 0)
 		return -1;
 	return rank_stats_past_child_exact_run(false);
+}
+
+/*
+ * Order-statistics ON, node-relocation exactness (one @ordered_list mode).
+ * Phase 1 inserts many distinct single-byte keys, growing the ROOT through its
+ * layout tiers; phase 2 inserts many two-byte keys under one fresh first byte,
+ * growing that non-root internal node.  Each growth makes ft_attach_node's
+ * reserve recompact the target node -- the relocation branch (iter_dest_node_
+ * flag != attach_node_flag): the attach node is rebuilt as a fresh copy
+ * republished at its grandparent slot -- shape I7.  Phase 1 exercises the
+ * grandparent == NULL (root) case (the relocated root carries the +1, no
+ * ancestor walk); phase 2 exercises a non-NULL grandparent (the +1 walk climbs
+ * from the root).  cds_ft_verify after every insert checks each node's stored
+ * nr_keys against a full structural recount (gated on rank stats), so a
+ * miscount in the relocated copy's build count (+1) or the folded ancestor walk
+ * aborts at that exact mutation.  Run for both list modes.
+ */
+static int rank_stats_relocation_exact_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "relocation list-on" : "relocation list-off";
+	unsigned long expect = 0;
+	int i;
+
+	rcu_read_lock();
+	/* Phase 1: 60 single-byte keys grow the root through several tiers. */
+	for (i = 0; i < 60; i++) {
+		char b = (char) i;
+
+		if (rank_stats_insert_verify(ft, &b, 1, &expect, lm) < 0)
+			goto out_fail;
+	}
+	/* Phase 2: 60 two-byte keys under a fresh first byte (0xC8) grow that
+	 * non-root internal node (its grandparent is the root). */
+	for (i = 0; i < 60; i++) {
+		char b[2] = { (char) 0xC8, (char) i };
+
+		if (rank_stats_insert_verify(ft, b, 2, &expect, lm) < 0)
+			goto out_fail;
+	}
+	rcu_read_unlock();
+	return drain_and_destroy(ft, group);
+out_fail:
+	rcu_read_unlock();
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+static int test_rank_stats_relocation_exact(void)
+{
+	if (rank_stats_relocation_exact_run(true) < 0)
+		return -1;
+	return rank_stats_relocation_exact_run(false);
 }
 
 /*
@@ -23995,6 +24049,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_attach_exact);
 	RUN_TEST(test_rank_stats_key_shorter_exact);
 	RUN_TEST(test_rank_stats_past_child_exact);
+	RUN_TEST(test_rank_stats_relocation_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
