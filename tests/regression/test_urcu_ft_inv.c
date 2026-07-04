@@ -74,9 +74,13 @@
 
 /*
  * Duration of each concurrent test in milliseconds.  Kept short for
- * automated runs; increase for deeper stress testing.
+ * automated runs; increase for deeper stress testing.  The time-bounded
+ * cross-view tests build tries for this long and then tear them down (a
+ * per-trie rcu_barrier is the dominant cost), so this bounds their teardown:
+ * 200ms builds ~10x fewer tries than 2000ms, cutting the slow teardown ~10x
+ * while still exercising every cross-view window many times over.
  */
-#define DEFAULT_DURATION_MS	2000
+#define DEFAULT_DURATION_MS	200
 
 /* Thread counts per test. */
 #define NR_READERS_DEFAULT	4
