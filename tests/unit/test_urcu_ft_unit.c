@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 301
+#define NR_TESTS 303
 #else
-#define NR_TESTS 259
+#define NR_TESTS 261
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3198,6 +3198,131 @@ static int test_rank_stats_attach_exact(void)
 	if (rank_stats_attach_exact_run(true) < 0)
 		return -1;
 	return rank_stats_attach_exact_run(false);
+}
+
+/* Insert @key (@len bytes) into @ft, bump *@expect, verify per-node nr_keys and
+ * the root aggregate.  Returns 0 on success, -1 on any mismatch. */
+static int rank_stats_insert_verify(struct cds_ft *ft, const char *key,
+		size_t len, unsigned long *expect, const char *who)
+{
+	struct ft_test_node *n = node_alloc(0);
+
+	if (cds_ft_insert(ft, (const uint8_t *) key, len, &n->node)
+			!= CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: insert \"%s\" failed\n", who, key);
+		node_free(n);
+		return -1;
+	}
+	(*expect)++;
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify failed after \"%s\" (%lu inserts)\n",
+			who, key, *expect);
+		return -1;
+	}
+	if (cds_ft_count_keys(ft) != *expect) {
+		fprintf(stderr, "%s: count %lu != expect %lu after \"%s\"\n",
+			who, cds_ft_count_keys(ft), *expect, key);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Order-statistics ON, key-SHORTER exactness (one @ordered_list mode).  For
+ * each distinct first byte, insert a long key (which the trie stores as a
+ * multi-byte compressed span) and THEN a strict prefix of it that ends INSIDE
+ * that compressed span.  A key ending mid-span forces ft_insert_compressed_
+ * key_shorter to split the compressed node into prefix -> junction -> suffix
+ * and hang the new key on the junction -- shape I4.  cds_ft_verify after every
+ * insert checks each node's stored nr_keys against a full structural recount
+ * (gated on rank stats), so a miscount in the junction/prefix build count or
+ * the folded ancestor walk aborts at that exact mutation.  Run for both list
+ * modes.
+ */
+static int rank_stats_key_shorter_exact_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "key_shorter list-on" : "key_shorter list-off";
+	unsigned long expect = 0;
+	int ret = 0, c;
+
+	rcu_read_lock();
+	for (c = 0; c < 6; c++) {
+		char full[6] = { (char) ('a' + c), 'p', 'q', 'r', 's', 't' };
+		/* Long key first: a compressed span "Xpqrst". */
+		if (rank_stats_insert_verify(ft, full, 6, &expect, lm) < 0)
+			goto out_fail;
+		/* Prefixes ending INSIDE the span (I4), inner then shorter. */
+		if (rank_stats_insert_verify(ft, full, 4, &expect, lm) < 0)
+			goto out_fail;
+		if (rank_stats_insert_verify(ft, full, 2, &expect, lm) < 0)
+			goto out_fail;
+		if (rank_stats_insert_verify(ft, full, 3, &expect, lm) < 0)
+			goto out_fail;
+	}
+	rcu_read_unlock();
+	return drain_and_destroy(ft, group);
+out_fail:
+	rcu_read_unlock();
+	drain_and_destroy(ft, group);
+	return -1;
+	(void) ret;
+}
+
+static int test_rank_stats_key_shorter_exact(void)
+{
+	if (rank_stats_key_shorter_exact_run(true) < 0)
+		return -1;
+	return rank_stats_key_shorter_exact_run(false);
+}
+
+/*
+ * Order-statistics ON, compressed-past-child exactness (one @ordered_list
+ * mode).  For each distinct first byte, insert a short key (stored as a
+ * compressed span ending in an external leaf) and THEN a longer key that
+ * matches the whole compressed path and CONTINUES past its external child.
+ * Continuing past a compressed node's end-of-path external child forces
+ * ft_insert_compressed_past_child to build a branch that re-homes the old
+ * external and dispatches the new key -- shape I5.  cds_ft_verify after every
+ * insert checks each node's stored nr_keys against a full structural recount
+ * (gated on rank stats), so a miscount in the branch build count (2 not 1) or
+ * the folded ancestor walk aborts at that exact mutation.  Run for both list
+ * modes.
+ */
+static int rank_stats_past_child_exact_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "past_child list-on" : "past_child list-off";
+	unsigned long expect = 0;
+	int c;
+
+	rcu_read_lock();
+	for (c = 0; c < 6; c++) {
+		char full[6] = { (char) ('a' + c), 'p', 'q', 'r', 's', 't' };
+		/* Short key first: compressed span "Xpq" ending in an external. */
+		if (rank_stats_insert_verify(ft, full, 3, &expect, lm) < 0)
+			goto out_fail;
+		/* Longer keys continuing PAST the external child (I5). */
+		if (rank_stats_insert_verify(ft, full, 5, &expect, lm) < 0)
+			goto out_fail;
+		if (rank_stats_insert_verify(ft, full, 6, &expect, lm) < 0)
+			goto out_fail;
+	}
+	rcu_read_unlock();
+	return drain_and_destroy(ft, group);
+out_fail:
+	rcu_read_unlock();
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+static int test_rank_stats_past_child_exact(void)
+{
+	if (rank_stats_past_child_exact_run(true) < 0)
+		return -1;
+	return rank_stats_past_child_exact_run(false);
 }
 
 /*
@@ -23868,6 +23993,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iter_skip_varlen);
 	RUN_TEST(test_rank_stats_prefix_exact);
 	RUN_TEST(test_rank_stats_attach_exact);
+	RUN_TEST(test_rank_stats_key_shorter_exact);
+	RUN_TEST(test_rank_stats_past_child_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
