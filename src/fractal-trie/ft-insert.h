@@ -1193,7 +1193,18 @@ int ft_attach_node(struct cds_ft *ft,
 		key_value = *(--iter_key);
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
 
-		ret = ft_insert_commit_arm(ft, ic, 0);
+		/*
+		 * Reserve the I6 count-fold edges optimistically: if this attach
+		 * stays in place (the common case, iter_dest_node_flag ==
+		 * attach_node_flag below), the +1 key-count walk from the stable
+		 * attach node up to the root rides this txn.  Bounded by the ACTUAL
+		 * descent depth (@level >= the attach node's depth, +2 slack for the
+		 * root), never FT_MAX_DEPTH.  A relocation (I7) records no count
+		 * edges here (count_folded stays false) so the slack is simply
+		 * unused.  A no-op reserve (0) when order statistics are off.
+		 */
+		ret = ft_insert_commit_arm(ft, ic,
+			ft->rank_stats ? level + 2 : 0);
 		if (ret)
 			goto check_error;
 
@@ -1323,6 +1334,27 @@ int ft_attach_node(struct cds_ft *ft,
 			 */
 			ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag);
+			/*
+			 * I6 count fold (rank stats ON): the attach node stays in
+			 * place, so its metadata->parent chain up to the root is
+			 * commit-invariant.  Record the +1 key-count walk from it
+			 * (base = attach_node_flag, the stable node that owns the
+			 * new key's reserved forward slot) into THIS txn, so the
+			 * count flips ATOMICALLY with the structural publish, and
+			 * insert_done skips the standalone post-commit
+			 * ft_propagate_external_count_parent.  The fresh branch
+			 * below carries its +1 from build (build-invisible plain
+			 * stores), so it is never touched by the recorded walk.
+			 * Behaviour-identical to the old post-commit walk from
+			 * *d.pnfp (which, in place, is exactly attach_node_flag)
+			 * under the retained writer exclusion.  The relocation
+			 * branch above leaves count_folded false: there the base is
+			 * the fresh relocated copy, correct only when read
+			 * post-commit through *d.pnfp, so that shape (I7) stays a
+			 * post-commit walk for now.
+			 */
+			ic->count_from = attach_node_flag;
+			ic->count_folded = true;
 		}
 
 		/* Reclaim safely after unlink (deferred to the commit when the
