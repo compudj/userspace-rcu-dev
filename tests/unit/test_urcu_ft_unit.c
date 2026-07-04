@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 300
+#define NR_TESTS 301
 #else
-#define NR_TESTS 258
+#define NR_TESTS 259
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3092,6 +3092,112 @@ out:
 	if (drain_and_destroy(ft, group) < 0)
 		ret = -1;
 	return ret;
+}
+
+/* rank-stats-ON variable-length trie with the ordered list on or off. */
+static struct cds_ft *create_varlen_rankstats_list_ft(bool ordered_list,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * Order-statistics ON, attach-heavy exactness (one @ordered_list mode).  Inserts
+ * every string of length 1, then 2, then 3 over the alphabet {a,b,c} into a
+ * rank-stats-ON variable-length trie -- SHORTEST first, the mirror of
+ * test_rank_stats_prefix_exact.  Inserting a longer key whose prefix is an
+ * already-stored shorter key means the descent reaches that shorter key's
+ * EXTERNAL leaf before the end of the longer key, so ft_attach_node transforms
+ * the external into an internal node and attaches a fresh branch below it -- the
+ * "attach a branch, node stays in place" shape (I6, the displaced-external case
+ * never recompacts, so it is always the in-place branch).  cds_ft_verify after
+ * every insert checks each node's stored nr_keys against a full structural
+ * recount (gated on rank stats), so any I6 miscount aborts at that exact
+ * mutation; cds_ft_count_keys cross-checks the maintained root aggregate.  Run
+ * for BOTH list modes: the I6 count edges ride the same one-commit txn whether
+ * or not the commit also carries the ordered-list cell edges.  Complements
+ * prefix_exact (I1/I3) which never fires the in-place attach.
+ */
+static int rank_stats_attach_exact_run(bool ordered_list)
+{
+	static const char alpha[] = "abc";
+	static const int lens[] = { 1, 2, 3 };
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "list-on" : "list-off";
+	unsigned long expect = 0;
+	int ret = 0, li;
+
+	rcu_read_lock();
+	for (li = 0; li < 3; li++) {
+		int len = lens[li], i, j, k;
+
+		for (i = 0; i < 3; i++)
+		for (j = 0; j < (len >= 2 ? 3 : 1); j++)
+		for (k = 0; k < (len >= 3 ? 3 : 1); k++) {
+			char buf[3];
+			struct ft_test_node *n = node_alloc(0);
+			enum cds_ft_status s;
+
+			buf[0] = alpha[i];
+			if (len >= 2)
+				buf[1] = alpha[j];
+			if (len >= 3)
+				buf[2] = alpha[k];
+			s = cds_ft_insert(ft, (const uint8_t *) buf,
+					(size_t) len, &n->node);
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rank_stats attach (%s): insert len "
+					"%d failed %d\n", lm, len, s);
+				node_free(n);
+				ret = -1;
+				goto out;
+			}
+			expect++;
+			if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rank_stats attach (%s): verify failed "
+					"after %lu inserts (last len %d)\n",
+					lm, expect, len);
+				ret = -1;
+				goto out;
+			}
+			if (cds_ft_count_keys(ft) != expect) {
+				fprintf(stderr, "rank_stats attach (%s): count %lu != "
+					"expect %lu\n",
+					lm, cds_ft_count_keys(ft), expect);
+				ret = -1;
+				goto out;
+			}
+		}
+	}
+out:
+	rcu_read_unlock();
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int test_rank_stats_attach_exact(void)
+{
+	if (rank_stats_attach_exact_run(true) < 0)
+		return -1;
+	return rank_stats_attach_exact_run(false);
 }
 
 /*
@@ -23761,6 +23867,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iter_skip_duplicates);
 	RUN_TEST(test_iter_skip_varlen);
 	RUN_TEST(test_rank_stats_prefix_exact);
+	RUN_TEST(test_rank_stats_attach_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
