@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	57
+#define NR_TESTS	58
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -7588,6 +7588,135 @@ static int inv_nr_keys_exact(void)
 	return drain_and_destroy(ft, group);
 }
 
+/*
+ * NO-UNDERCOUNT reader (the mirror of inv_nr_keys_exact_remove_reader).
+ *
+ * With the per-node nr_keys count folded into each remove's flip-txn (the
+ * decrement commits atomically with the structural detach), the maintained
+ * aggregate equals the structurally-present key set at every reader instant, so
+ * it can never be SMALLER than a pointer traversal: the list-off lookup_gt
+ * iterator only ever UNDER-enumerates a concurrently-relocated structure (its
+ * re-descent never reaches an already-detached key and never re-emits a key in
+ * ascending order), hence iter_count <= (present keys) = count_keys.  Therefore
+ *
+ *     count_keys >= iter_count   MUST hold.
+ *
+ * This is exactly the invariant the TXN fold buys, and the one a decrement-
+ * BEFORE-detach ordering (the old pre-decrement) would VIOLATE: there the count
+ * drops while the key -- and its enumeration -- is still live, so a reader sees
+ * count_keys < iter_count.  It is thus a regression guard for the fold, and it
+ * is robust against the recompaction non-linearizability that breaks the
+ * opposite (count <= iter) direction: in that window count=N while the iterator
+ * transiently sees N-1, so count >= iter holds comfortably.
+ *
+ * Read ORDER matters: read count_keys FIRST, then iterate.  The writer is
+ * remove-only, so the structural key set is monotonically NON-INCREASING; a
+ * later iteration can therefore only enumerate <= the earlier count_keys, which
+ * removes the false-positive that the opposite order would create.  An actual
+ * undercount (count already dropped below a still-live key) is still caught: the
+ * low count is sampled first, then the iteration still reaches the live key.
+ */
+static void *inv_nr_keys_no_undercount_reader(void *arg)
+{
+	struct inv_iter_ctx *ctx = (struct inv_iter_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned long count_keys, iter_count = 0;
+
+		rcu_read_lock();
+		count_keys = cds_ft_count_keys(ctx->ft);
+		cds_ft_for_each_rcu(ctx->ft, iter)
+			iter_count++;
+		if (count_keys < iter_count)
+			report_violation(ctx->test_name,
+				"remove phase: count_keys %lu < iteration_count "
+				"%lu (nr_keys undercount: the aggregate dropped "
+				"below a still-live key enumeration, iter #%lu)",
+				count_keys, iter_count, iters);
+		rcu_read_unlock();
+
+		iters++;
+		if ((iters & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_nr_keys_no_undercount(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_rankstats_ft(4, &group);
+	struct timespec t0;
+	struct {
+		struct inv_iter_ctx ctx;
+		pthread_mutex_t lock;
+	} shared;
+	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
+	unsigned int i;
+
+	shared.ctx.ft = ft;
+	shared.ctx.key_len = 4;
+	shared.ctx.test_name = "inv_nr_keys_no_undercount";
+	pthread_mutex_init(&shared.lock, NULL);
+
+	/* Populate, then concurrently remove (monotonically shrinking). */
+	rcu_read_lock();
+	for (i = 0; i < WRITER_POOL_SIZE / 2; i++) {
+		struct ft_test_node *n = node_alloc(i);
+		insert_u64(ft, i, n);
+	}
+	rcu_read_unlock();
+
+	atomic_store(&violation_count, 0);
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL,
+			inv_nr_keys_no_undercount_reader, &shared.ctx);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_create(&writers[i], NULL,
+			inv_nr_keys_remove_writer, &shared.ctx);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+	pthread_mutex_destroy(&shared.lock);
+
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "inv_nr_keys_no_undercount: %lu violation(s)\n",
+			atomic_load(&violation_count));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (inv_nr_keys_exact_quiescent_check(ft, "remove") < 0) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	return drain_and_destroy(ft, group);
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*   INVARIANT 9: Ordered traversal never escapes its trie            */
@@ -10640,6 +10769,9 @@ int main(int argc, char **argv)
 
 	diag("8b. nr_keys exact (rank statistics ON)");
 	RUN_TEST(inv_nr_keys_exact);
+
+	diag("8c. nr_keys no-undercount under concurrent remove (fold guard)");
+	RUN_TEST(inv_nr_keys_no_undercount);
 
 	diag("9. Ordered traversal never escapes its trie");
 	RUN_TEST(inv_ordered_no_escape_graft);
