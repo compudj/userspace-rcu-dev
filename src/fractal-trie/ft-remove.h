@@ -1969,8 +1969,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * -- prefix-with-siblings).
 			 */
 			bool last_fused = false;
-
-			ft_propagate_external_count_parent(ft, holder_flag, -1);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
 			 * Fuse the chain-compress prune INTO the key-removal
@@ -1993,7 +1991,16 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				struct cds_ft_inode_flag *s_child =
 					ft_node_get_minmax(ft, holder_flag,
 						&s_byte, FT_LEFTMOST, false);
-				int cret = ft_chain_compress_fused(ft,
+				int cret;
+
+				/*
+				 * R3 (chain-compress) is not yet folded onto the commit:
+				 * keep its pre-decrement, SCOPED to this attempt.  The
+				 * merged compressed node copies the holder's (now -1'd)
+				 * count, so the decrement must precede the build.
+				 */
+				ft_propagate_external_count_parent(ft, holder_flag, -1);
+				cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_meta,
 					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte, fuse_cell, NULL,
@@ -2014,8 +2021,15 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 						holder_flag, 1);
 					ret = cret;
 					last_fused = true;
+				} else {
+					/*
+					 * cret > 0: merge out of bound -- fall back to the
+					 * plain clear below (which folds its own -1); undo
+					 * the scoped pre-decrement so the count drops once.
+					 */
+					ft_propagate_external_count_parent(ft,
+						holder_flag, 1);
 				}
-				/* cret > 0: merge out of bound -- fall back. */
 			}
 #endif
 			if (!last_fused) {
@@ -2029,35 +2043,51 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				 * ft_dereference_external).  @pub.armed tells the
 				 * deferred-free block below the unsplice happened.
 				 */
-				if (fuse_remove) {
-					/*
-					 * Abortable: the flip is the op's commit, no
-					 * pre-flip side-effect, so on OOM the removal
-					 * aborts -- roll back the -1 count, leave the key.
-					 */
-					ret = ft_remove_one_commit(ft,
+				/*
+				 * Fold the prefix key's -1 onto the clear: the holder
+				 * stays in place (keeps its children), so its -1 is the
+				 * holder->root walk -- a multi-edge R1.  Take a caller-
+				 * reserved bounded txn whenever the count must ride
+				 * (ordered_list || rank_stats), record the walk from
+				 * holder_flag, and let ft_remove_one_commit flip the
+				 * external_nodes -> NULL clear, @dead_cell's unsplice
+				 * (list on) and @node's freeze (freeze_leaf) and the
+				 * count edges TOGETHER (ft_ord_cell_flip_into,
+				 * infallible): a reader never sees the key gone from one
+				 * index but present in another, nor a count out of step
+				 * with the structure (parked proxies resolve via
+				 * ft_dereference_external / nr_keys via ft_nr_keys_load).
+				 * No pre-decrement, no OOM rollback -- the pre-reserved
+				 * txn commits infallibly, the only abort is the arm
+				 * (which frees the pre-reserved unsplice txn and leaves
+				 * the key in place).  List off + rank stats off: the
+				 * infallible lone ft_unchain_node store, unchanged.
+				 */
+				if (ft->ordered_list || ft->rank_stats) {
+					struct ft_flip_txn *txn = ft_flip_txn_create_bounded(
+						FT_REMOVE_COMMIT_REC_MAX_EDGES +
+						(ft->rank_stats ? key_len + 1 : 0));
+
+					if (!txn) {
+						if (unsplice_txn)
+							ft_flip_txn_destroy(unsplice_txn);
+						FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
+						return CDS_FT_STATUS_MEMORY_ERROR;
+					}
+					ft_flip_txn_record_count_parent(ft, txn,
+						holder_flag, -1);
+					ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) node, NULL,
-						NULL, dead_cell, NULL, NULL, node);
-					if (ret) {
-						ft_propagate_external_count_parent(ft,
-							holder_flag, 1);
-					} else {
-						/*
-						 * @node's freeze rode the commit above
-						 * (freeze_leaf), atomic with the external_nodes
-						 * clear -- no separate mark_removed flip.
-						 */
+						NULL, dead_cell, NULL, txn, node);
+					if (fuse_remove)
 						pub.armed = true;
-					}
+					ret = 0;
 				} else {
-					/* List off: the single store is atomic alone. */
+					/* List off + rank stats off: unchanged; no count. */
 					ret = ft_unchain_node(ft, holder_flag,
 						(struct cds_ft_node **) &holder_meta->external_nodes,
 						node);
-					if (ret)
-						ft_propagate_external_count_parent(ft,
-							holder_flag, 1);
 				}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				/*
