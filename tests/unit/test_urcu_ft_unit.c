@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 310
+#define NR_TESTS 311
 #else
-#define NR_TESTS 268
+#define NR_TESTS 269
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3817,6 +3817,106 @@ static int test_rank_stats_leaf_detach_exact(void)
 	if (rank_stats_leaf_detach_run(true) < 0)
 		return -1;
 	return rank_stats_leaf_detach_run(false);
+}
+
+/*
+ * Order-statistics ON, whole-subtree MOVE-DETACH exactness (one scenario, one
+ * @ordered_list mode).  cds_ft_detach unlinks a MULTI-key subtree from @ft and
+ * re-roots it in a fresh @detached trie.  Unlike a leaf remove (a single -1),
+ * the WHOLE subtree count must be removed from @ft's surviving ancestors -- this
+ * is the magnitude > 1 case that distinguishes the bulk move-detach fold from
+ * the leaf fold (the same ft_detach_node machinery, but count_delta is
+ * -detached_count, not -1).  Two shapes:
+ *   scenario 0 -- IN-PLACE ancestor: the root keeps >= 2 children after losing
+ *      the detached subtree ("Ma"/"Mb"/"Mc" under 'M' plus leaf siblings
+ *      'N','O'; detach "M" -> the root clears one child in place, -3 folds onto
+ *      that commit).
+ *   scenario 1 -- PRUNED ancestor: the detach point's parent falls to a single
+ *      child and recompacts / chain-compresses ("AXm"/"AXn"/"AXo" under "AX"
+ *      plus "AY","B"; detach "AX" -> node "A" prunes to a compressed span, -3
+ *      folds from its stable parent (the root)).
+ * cds_ft_verify recounts every node structurally (gated on rank stats), so a
+ * miscount in the folded ancestor walk aborts at the detach; count_keys on both
+ * the drained source and the re-rooted detached trie cross-checks the split.
+ */
+static int rank_stats_detach_one(bool ordered_list, int scenario)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	struct cds_ft *detached = NULL;
+	const char *lm = ordered_list ? "detach list-on" : "detach list-off";
+	const char *dkey = scenario == 0 ? "M" : "AX";
+	size_t dklen = scenario == 0 ? 1 : 2;
+	unsigned long expect = 0;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	rcu_read_lock();
+	if (scenario == 0) {
+		if (rank_stats_insert_verify(ft, "Ma", 2, &expect, lm) < 0 ||
+		    rank_stats_insert_verify(ft, "Mb", 2, &expect, lm) < 0 ||
+		    rank_stats_insert_verify(ft, "Mc", 2, &expect, lm) < 0 ||
+		    rank_stats_insert_verify(ft, "N", 1, &expect, lm) < 0 ||
+		    rank_stats_insert_verify(ft, "O", 1, &expect, lm) < 0)
+			goto out;
+	} else {
+		if (rank_stats_insert_verify(ft, "AXm", 3, &expect, lm) < 0 ||
+		    rank_stats_insert_verify(ft, "AXn", 3, &expect, lm) < 0 ||
+		    rank_stats_insert_verify(ft, "AXo", 3, &expect, lm) < 0 ||
+		    rank_stats_insert_verify(ft, "AY", 2, &expect, lm) < 0 ||
+		    rank_stats_insert_verify(ft, "B", 1, &expect, lm) < 0)
+			goto out;
+	}
+
+	s = cds_ft_detach(ft, (const uint8_t *) dkey, dklen, &detached);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: detach \"%s\": %s\n", lm, dkey,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	expect -= 3;
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: source verify failed after detach \"%s\"\n",
+			lm, dkey);
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != expect) {
+		fprintf(stderr, "%s: source count %lu != %lu after detach \"%s\"\n",
+			lm, cds_ft_count_keys(ft), expect, dkey);
+		goto out;
+	}
+	if (cds_ft_verify(detached, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: detached verify failed after \"%s\"\n", lm, dkey);
+		goto out;
+	}
+	if (cds_ft_count_keys(detached) != 3) {
+		fprintf(stderr, "%s: detached count %lu != 3 after \"%s\"\n",
+			lm, cds_ft_count_keys(detached), dkey);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (detached) {
+		drain_trie(detached);
+		rcu_barrier();
+		cds_ft_destroy(detached);
+	}
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int test_rank_stats_detach_exact(void)
+{
+	int lm, sc;
+
+	for (lm = 0; lm < 2; lm++)
+		for (sc = 0; sc < 2; sc++)
+			if (rank_stats_detach_one(lm == 0, sc) < 0)
+				return -1;
+	return 0;
 }
 
 /*
@@ -24496,6 +24596,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_shape_d_leaf_exact);
 	RUN_TEST(test_rank_stats_external_promote_exact);
 	RUN_TEST(test_rank_stats_leaf_detach_exact);
+	RUN_TEST(test_rank_stats_detach_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
