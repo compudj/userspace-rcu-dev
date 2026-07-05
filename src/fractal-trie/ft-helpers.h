@@ -981,12 +981,27 @@ void ft_maybe_prefetch_nta(const void *ptr)
  * child dispatch.  The common case (no merge in flight) is a single
  * predicted-not-taken mask-compare in ft_resolve_flip_proxy.
  */
+/*
+ * Root-is-internal invariant enforcement.  No mutator ever publishes a
+ * compressed / skip-compressed node at the trie root: a would-be compressed
+ * root is re-internalized build-invisibly BEFORE publish (ft_make_root_internal_glue
+ * on the re-root/graft-swap side; the compressed -> fresh-internal replace on the
+ * detach side), so a reader must never observe one.  ft_root_assert_not_compressed()
+ * (defined after the skip-compressed helpers below) asserts it on EVERY reader
+ * root load -- after flip-proxy resolution, so a merge/graft proxy (which resolves
+ * to an internal node in both commit phases) does not trip it -- catching a stray
+ * compressed root at first observation rather than as downstream descent
+ * corruption.  A NULL root (untagged) passes; compiled out under NDEBUG.
+ */
 #define ft_root_dereference_prefetch(ft)				\
-	ft_resolve_flip_proxy(ft_dereference_prefetch((ft)->root))
+	ft_root_assert_not_compressed(					\
+		ft_resolve_flip_proxy(ft_dereference_prefetch((ft)->root)))
 #define ft_root_dereference_acquire_prefetch(ft)			\
-	ft_resolve_flip_proxy(ft_dereference_acquire_prefetch((ft)->root))
+	ft_root_assert_not_compressed(					\
+		ft_resolve_flip_proxy(ft_dereference_acquire_prefetch((ft)->root)))
 #define ft_root_dereference(ft)						\
-	ft_resolve_flip_proxy(rcu_dereference((ft)->root))
+	ft_root_assert_not_compressed(					\
+		ft_resolve_flip_proxy(rcu_dereference((ft)->root)))
 
 /*
  * cn->child dereference for read-side descents: like
@@ -1590,6 +1605,22 @@ bool ft_group_skip_compressed(const struct cds_ft_group *group __attribute__((un
 }
 
 #endif /* FEATURE_FT_SKIP_COMPRESSED */
+
+/*
+ * Assert the root-is-internal invariant on a reader's root load.  See the
+ * ft_root_dereference_* macros above: no mutator ever publishes a compressed /
+ * skip-compressed node at the trie root, so a reader must never observe one.
+ * Defined here (not at the macros) because it needs ft_node_skip_compressed,
+ * whose real definition and no-skip stub both live in the block above.
+ * Compiled out under NDEBUG.
+ */
+static inline
+struct cds_ft_inode_flag *ft_root_assert_not_compressed(
+		struct cds_ft_inode_flag *root)
+{
+	assert(!ft_node_compressed(root) && !ft_node_skip_compressed(root));
+	return root;
+}
 
 /*
  * ft_set_parent_slot: record a node's slot within its parent as a
