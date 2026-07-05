@@ -352,7 +352,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag **orphans,
 		int nr_orphans,
 		struct cds_ft_inode_flag *trailing_orphan,
-		struct cds_ft_node *freeze_leaf)
+		struct cds_ft_node *freeze_leaf,
+		long count_delta,
+		unsigned int count_reserve)
 {
 	bool parent_compressed, child_compressed;
 	struct cds_ft_compressed_node *parent_cn, *child_cn;
@@ -396,7 +398,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
 			+ 1 /* §4.B parent guard */
 			+ nr_orphans + (trailing_orphan ? 1 : 0)
-			+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
+			+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0)
+			+ count_reserve /* nr_keys walk from publish_parent (R3 fold) */);
 	if (!txn)
 		return -ENOMEM;	/* nothing touched: caller aborts */
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
@@ -415,10 +418,17 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	new_cn->len = (uint8_t) merged_len;
 	new_cn->child = child_cn ? child_cn->child : surviving_child;
 	ft_meta_nr_child_set(new_cn_meta, 1);
+	/*
+	 * Build the merged node with its POST-removal count (top + @count_delta,
+	 * i.e. top - 1 when this merge retires a key -- R3 fold): the collapsed
+	 * top node's count minus the disappearing key.  @count_delta 0 (a
+	 * count-neutral canonicalize, or a leaf-detach whose -1 the caller still
+	 * pre-decrements) copies it verbatim, as before.  No-op when !rank_stats.
+	 */
 	ft_nr_keys_store(ft,new_cn_meta,
 		ft_nr_keys_get(parent_cn_meta
 			? parent_cn_meta
-			: iter_meta),
+			: iter_meta) + count_delta,
 		CMM_RELAXED);
 
 	if (parent_cn) {
@@ -490,6 +500,16 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		if (freeze_leaf)
 			ft_hlist_freeze_prepare(&txn->mtxn, freeze_leaf);
+		/*
+		 * R3 fold: the retired key's -1 walk from the merged node's stable
+		 * parent (publish_parent) up to root rides THIS commit atomically
+		 * with the collapse (the merged node itself was built -1 above).
+		 * Reserved by @count_reserve; skipped (and a no-op) when there is no
+		 * count change.
+		 */
+		if (count_delta)
+			ft_flip_txn_record_count_parent(ft, txn, publish_parent,
+				count_delta);
 		ft_remove_commit_rec(ft, &rec, dead_cell, run, txn);
 	}
 
@@ -526,7 +546,7 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		return;
 	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_meta,
 		slot_ptr, surviving_child, surviving_byte, NULL, NULL,
-		NULL, 0, NULL, NULL);
+		NULL, 0, NULL, NULL, 0 /* count-neutral canonicalize */, 0);
 }
 #endif
 
@@ -1162,7 +1182,8 @@ int ft_detach_node(struct cds_ft *ft,
 						detach_parent_flag_ptr,
 						s_child, s_byte, fuse_cell, run,
 						to_free, nr_to_free,
-						trailing_skip_cn_flag, freeze_leaf);
+						trailing_skip_cn_flag, freeze_leaf,
+						0 /* leaf-detach: caller pre-decrements */, 0);
 
 					if (cret == 0) {
 						ret = 0;
@@ -1994,17 +2015,17 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				int cret;
 
 				/*
-				 * R3 (chain-compress) is not yet folded onto the commit:
-				 * keep its pre-decrement, SCOPED to this attempt.  The
-				 * merged compressed node copies the holder's (now -1'd)
-				 * count, so the decrement must precede the build.
+				 * R3 chain-compress fold: the merged compressed node
+				 * replacing the collapsed 1-child holder is built with the
+				 * retired key's -1 and records the ancestor -1 walk into its
+				 * OWN commit (count_delta -1), so no pre-decrement here.
 				 */
-				ft_propagate_external_count_parent(ft, holder_flag, -1);
 				cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_meta,
 					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte, fuse_cell, NULL,
-					NULL, 0, NULL, node);
+					NULL, 0, NULL, node,
+					-1, ft->rank_stats ? key_len + 1 : 0);
 
 				if (cret == 0) {
 					/*
@@ -2017,19 +2038,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					ret = 0;
 					last_fused = true;
 				} else if (cret < 0) {
-					ft_propagate_external_count_parent(ft,
-						holder_flag, 1);
 					ret = cret;
 					last_fused = true;
-				} else {
-					/*
-					 * cret > 0: merge out of bound -- fall back to the
-					 * plain clear below (which folds its own -1); undo
-					 * the scoped pre-decrement so the count drops once.
-					 */
-					ft_propagate_external_count_parent(ft,
-						holder_flag, 1);
 				}
+				/* cret > 0: merge out of bound -- fall back to plain clear. */
 			}
 #endif
 			if (!last_fused) {
@@ -2462,18 +2474,18 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				int cret;
 
 				/*
-				 * R3 (chain-compress) is not yet folded onto the commit:
-				 * keep its pre-decrement, SCOPED to this attempt.  The
-				 * merged compressed node copies the holder's (now -1'd)
-				 * count, so the decrement must precede the build.
+				 * R3 chain-compress fold: the merged compressed node
+				 * replacing the collapsed 1-child holder is built with the
+				 * retired key's -1 and records the ancestor -1 walk into its
+				 * OWN commit (count_delta -1), so no pre-decrement here.
 				 */
-				ft_propagate_external_count_parent(ft, holder_flag, -1);
 				cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_meta,
 					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte,
 					ft->ordered_list ? dead_cell : NULL,
-					NULL, NULL, 0, NULL, NULL);
+					NULL, NULL, 0, NULL, NULL,
+					-1, ft->rank_stats ? key_len + 1 : 0);
 
 				if (cret == 0) {
 					ft_chain_mark_removed_flip(ft, chain_head);
@@ -2482,19 +2494,10 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 					ret = 0;
 					prefix_fused = true;
 				} else if (cret < 0) {
-					ft_propagate_external_count_parent(ft,
-						holder_flag, 1);
 					ret = cret;
 					prefix_fused = true;
-				} else {
-					/*
-					 * cret > 0: merge out of bound -- fall back to the
-					 * plain clear below (which folds its own -1); undo
-					 * the scoped pre-decrement so the count drops once.
-					 */
-					ft_propagate_external_count_parent(ft,
-						holder_flag, 1);
 				}
+				/* cret > 0: merge out of bound -- fall back to plain clear. */
 			}
 #endif
 			if (!prefix_fused) {
