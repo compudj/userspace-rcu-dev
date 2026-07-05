@@ -2408,7 +2408,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * only follow-up is canonicalizing a now-single-child holder under
 		 * skip builds.
 		 */
-		ft_propagate_external_count_parent(ft, holder_flag, -1);
 		{
 			bool prefix_fused = false;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -2430,7 +2429,16 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				struct cds_ft_inode_flag *s_child =
 					ft_node_get_minmax(ft, holder_flag,
 						&s_byte, FT_LEFTMOST, false);
-				int cret = ft_chain_compress_fused(ft,
+				int cret;
+
+				/*
+				 * R3 (chain-compress) is not yet folded onto the commit:
+				 * keep its pre-decrement, SCOPED to this attempt.  The
+				 * merged compressed node copies the holder's (now -1'd)
+				 * count, so the decrement must precede the build.
+				 */
+				ft_propagate_external_count_parent(ft, holder_flag, -1);
+				cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_meta,
 					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte,
@@ -2448,8 +2456,15 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 						holder_flag, 1);
 					ret = cret;
 					prefix_fused = true;
+				} else {
+					/*
+					 * cret > 0: merge out of bound -- fall back to the
+					 * plain clear below (which folds its own -1); undo
+					 * the scoped pre-decrement so the count drops once.
+					 */
+					ft_propagate_external_count_parent(ft,
+						holder_flag, 1);
 				}
-				/* cret > 0: merge out of bound -- fall back. */
 			}
 #endif
 			if (!prefix_fused) {
@@ -2465,21 +2480,45 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				 * NULL clear as a 1-edge flip (a lone release store,
 				 * MCAS-expressible) rather than a bare store.
 				 */
-				if (ft->ordered_list) {
-					/*
-					 * Abortable: the flip is the op's commit (no
-					 * pre-flip side-effect).  On OOM roll back the -1
-					 * count, leave the key -- retriable MEMORY_ERROR.
-					 */
-					ret = ft_remove_one_commit(ft,
+				/*
+				 * Fold the prefix key's -1 onto the clear: the holder
+				 * stays in place (keeps its children), so its -1 is the
+				 * holder->root walk -- a multi-edge R1.  Take a caller-
+				 * reserved bounded txn whenever the count must ride
+				 * (ordered_list || rank_stats), record the walk from
+				 * holder_flag, and let ft_remove_one_commit flip the
+				 * external_nodes -> NULL clear, the head cell's unsplice
+				 * (list on) and the count edges TOGETHER
+				 * (ft_ord_cell_flip_into, infallible): a reader never sees
+				 * the key gone from one index but present in the other,
+				 * nor a count out of step with the structure (parked
+				 * proxies resolve via ft_dereference_external / nr_keys via
+				 * ft_nr_keys_load).  The pre-reserved txn commits
+				 * infallibly, so no pre-decrement and no OOM rollback --
+				 * the only abort is the arm, which leaves the key in place.
+				 * List off + rank stats off: the infallible lone clear,
+				 * unchanged.
+				 */
+				if (ft->ordered_list || ft->rank_stats) {
+					struct ft_flip_txn *txn = ft_flip_txn_create_bounded(
+						FT_REMOVE_COMMIT_REC_MAX_EDGES +
+						(ft->rank_stats ? key_len + 1 : 0));
+
+					if (!txn) {
+						if (unsplice_txn)
+							ft_flip_txn_destroy(unsplice_txn);
+						*result_node = NULL;
+						return CDS_FT_STATUS_MEMORY_ERROR;
+					}
+					ft_flip_txn_record_count_parent(ft, txn,
+						holder_flag, -1);
+					ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) chain_head, NULL,
-						NULL, dead_cell, NULL, NULL, NULL);
-					if (ret)
-						ft_propagate_external_count_parent(ft,
-							holder_flag, 1);
-					else
+						NULL, dead_cell, NULL, txn, NULL);
+					if (ft->ordered_list)
 						pub.armed = true;
+					ret = 0;
 				} else {
 					struct ft_ord_cell_edge edge = {
 						.slot = (struct ft_ord_cell **)
