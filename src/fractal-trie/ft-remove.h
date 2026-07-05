@@ -560,7 +560,8 @@ int ft_detach_node(struct cds_ft *ft,
 		struct ft_remove_pub *pub,
 		struct ft_detach_run *run,
 		struct ft_glue *retire_glue,
-		struct cds_ft_node *freeze_leaf)
+		struct cds_ft_node *freeze_leaf,
+		long count_delta)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
@@ -619,6 +620,14 @@ int ft_detach_node(struct cds_ft *ft,
 	 * chain reaches the original detach child).
 	 */
 	struct cds_ft_inode_flag *elevated_old_child;
+	/*
+	 * nr_keys count base: the RESOLVED holder flag (== each caller's
+	 * former @holder_flag).  Set once the initial parent slot is resolved
+	 * below (a raw skip-encoded slot is not a valid propagate base); the
+	 * ownership walk and its abort rollback climb the same
+	 * metadata->parent chain the callers used.  Unused when !rank_stats.
+	 */
+	struct cds_ft_inode_flag *count_base = NULL;
 
 	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
 
@@ -674,6 +683,17 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	cur = ft_resolve_skip_compressed(ft, *detach_parent_flag_ptr);
 	cur_depth = detach_depth - ft_parent_depth_span(cur, *detach_node_flag_ptr);
+
+	/*
+	 * nr_keys count ownership (Increment 1: relocate the three callers'
+	 * pre-decrement into the detach).  Walk the removed leaf's @count_delta
+	 * (-1, or 0 for a count-neutral move detach) from the resolved holder
+	 * @cur up to root, before any structural change; rolled back at @end on
+	 * abort.  No-op when !rank_stats.  The per-outcome fold onto the commit
+	 * txn (Increment 2) replaces this standalone walk.
+	 */
+	count_base = cur;
+	ft_propagate_external_count_parent(ft, count_base, count_delta);
 
 	while (cur) {
 		struct cds_ft_metadata *metadata;
@@ -1496,6 +1516,14 @@ int ft_detach_node(struct cds_ft *ft,
 	}
 end:
 	/*
+	 * nr_keys rollback (Increment 1): on abort undo the entry
+	 * pre-decrement -- mirrors each caller's former `if (ret)
+	 * propagate(holder_flag, 1)`.  A successful detach (ret == 0) keeps
+	 * the -1.
+	 */
+	if (ret && count_base)
+		ft_propagate_external_count_parent(ft, count_base, -count_delta);
+	/*
 	 * Free a pre-reserved commit txn that no commit consumed (reservation
 	 * succeeded but ft_node_replace_ptr recompacted / failed, or shape-D
 	 * fused with its own txn).  PREPARE state -> no grace period.
@@ -1954,12 +1982,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * metadata->parent.  Propagate -1 before detach, which may
 			 * free internal nodes.
 			 */
-			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true, fuse_cell, pubp, NULL, NULL, node);
-			if (ret)
-				ft_propagate_external_count_parent(ft, holder_flag, 1);
+				key_len, true, fuse_cell, pubp, NULL, NULL, node,
+				-1 /* leaf key removed: detach owns the -1 */);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/*
@@ -2148,12 +2174,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			 * Last/only entry: prune the now-empty branch.
 			 * Propagate -1 before detach, which may free internal nodes.
 			 */
-			ft_propagate_external_count_parent(ft, holder_flag, -1);
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
-				key_len, true, fuse_cell, pubp, NULL, NULL, node);
-			if (ret)
-				ft_propagate_external_count_parent(ft, holder_flag, 1);
+				key_len, true, fuse_cell, pubp, NULL, NULL, node,
+				-1 /* leaf key removed: detach owns the -1 */);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
@@ -2591,14 +2615,11 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		 * the holder (it climbs via metadata->parent).  Propagate -1
 		 * before detach (which may free internal nodes).
 		 */
-		ft_propagate_external_count_parent(ft, holder_flag, -1);
 		ret = ft_detach_node(ft, head_slot,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
 			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL,
-			NULL);
-		if (ret)
-			ft_propagate_external_count_parent(ft, holder_flag, 1);
-		else
+			NULL, -1 /* leaf key removed: detach owns the -1 */);
+		if (!ret)
 			ft_chain_mark_removed_flip(ft, chain_head);
 	}
 

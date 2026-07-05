@@ -963,7 +963,8 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 
 		ret = ft_detach_node(src_ft, d.nfp, d.pnfp, d.depth,
 				/*free_detached_subtree=*/ false, NULL, pubp, run,
-				retire_glue, NULL);
+				retire_glue, NULL,
+				0 /* move detach: bulk op owns the subtree count */);
 	}
 	if (ret < 0) {
 		/* Recompaction OOM: undo the propagation; src is pristine. */

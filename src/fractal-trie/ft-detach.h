@@ -408,7 +408,8 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					}
 				}
 				ret = ft_detach_node(ft, d.nfp, d.pnfp, d.depth,
-						false, NULL, pubp, runp, NULL, NULL);
+						false, NULL, pubp, runp, NULL, NULL,
+						0 /* move detach: bulk op owns the subtree count */);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*
