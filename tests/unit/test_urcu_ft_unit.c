@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 312
+#define NR_TESTS 314
 #else
-#define NR_TESTS 270
+#define NR_TESTS 272
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4028,6 +4028,207 @@ static int test_rank_stats_merge_src_exact(void)
 			if (rank_stats_merge_src_one(lm == 0, sc) < 0)
 				return -1;
 	return 0;
+}
+
+/*
+ * Order-statistics ON, GRAFT attach exactness (one shape, one @ordered_list
+ * mode).  cds_ft_graft moves the whole @src trie (a MULTI-key payload) under
+ * @gkey in @dst; the payload subtree already carries its own count, so the fold
+ * must add +src_count to @dst's surviving ancestors above the graft point --
+ * the attach-side dual of the move-detach.  @setup pre-builds @dst so the graft
+ * point has real ancestors; @nsrc keys are inserted into @src as 2-byte keys.
+ * cds_ft_verify recounts every dst node structurally (gated on rank stats), so
+ * a miscount in the folded ancestor walk aborts at the graft; count_keys
+ * cross-checks the total.
+ */
+static int rank_stats_graft_check(bool ordered_list, const char *tag,
+		const char *const *setup, int nsetup, const char *gkey, int nsrc)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *dst = create_varlen_rankstats_list_ft(ordered_list, &group);
+	struct cds_ft *src = NULL;
+	unsigned long expect = 0;
+	enum cds_ft_status s;
+	int i, ret = -1;
+
+	if (cds_ft_create(group, NULL, &src) < 0) {
+		drain_and_destroy(dst, group);
+		return -1;
+	}
+	rcu_read_lock();
+	for (i = 0; i < nsetup; i++)
+		if (rank_stats_insert_verify(dst, setup[i], strlen(setup[i]),
+				&expect, tag) < 0)
+			goto out;
+	for (i = 0; i < nsrc; i++) {
+		char sk[2] = { 's', (char) ('0' + i) };
+		struct ft_test_node *n = node_alloc(0);
+
+		if (cds_ft_insert(src, (const uint8_t *) sk, 2, &n->node)
+				!= CDS_FT_STATUS_OK) {
+			node_free(n);
+			goto out;
+		}
+	}
+	s = cds_ft_graft(dst, (const uint8_t *) gkey, strlen(gkey), src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: graft \"%s\": %s\n", tag, gkey,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	expect += (unsigned long) nsrc;
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: dst verify failed after graft \"%s\"\n",
+			tag, gkey);
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != expect) {
+		fprintf(stderr, "%s: dst count %lu != %lu after graft \"%s\"\n",
+			tag, cds_ft_count_keys(dst), expect, gkey);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (src) {
+		drain_trie(src);
+		rcu_barrier();
+		cds_ft_destroy(src);
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * Drive rank_stats_graft_check over graft-attach shapes, both list modes:
+ *   - slot / branch under an existing internal ("Za","Zc" then graft at "Zb");
+ *   - deep branch-build from a shallow trie (one leaf, graft at "mnpq");
+ *   - displaced-external (leaf "Wb" then graft at "Wbcd" displaces it);
+ *   - GLUE diverge: split a compressed span (leaf "PPPPPQ", graft at "PPP").
+ * Each grafts a 3-key src so src_count > 1 (the magnitude that separates the
+ * bulk attach fold from a single-key insert).
+ */
+static int rank_stats_graft_run(bool ordered_list)
+{
+	const char *lm = ordered_list ? "graft list-on" : "graft list-off";
+	static const char *setup_slot[] = { "Za", "Zc" };
+	static const char *setup_deep[] = { "a" };
+	static const char *setup_displaced[] = { "Wb" };
+	static const char *setup_glue[] = { "PPPPPQ" };
+
+	if (rank_stats_graft_check(ordered_list, lm, setup_slot, 2, "Zb", 3) < 0)
+		return -1;
+	if (rank_stats_graft_check(ordered_list, lm, setup_deep, 1, "mnpq", 3) < 0)
+		return -1;
+	if (rank_stats_graft_check(ordered_list, lm, setup_displaced, 1, "Wbcd", 3) < 0)
+		return -1;
+	if (rank_stats_graft_check(ordered_list, lm, setup_glue, 1, "PPPX", 3) < 0)
+		return -1;
+	return 0;
+}
+
+static int test_rank_stats_graft_exact(void)
+{
+	if (rank_stats_graft_run(true) < 0)
+		return -1;
+	return rank_stats_graft_run(false);
+}
+
+/*
+ * Order-statistics ON, merge MOVE-ATTACH exactness (one dst shape, one
+ * @ordered_list mode).  cds_ft_merge_at with an EMPTY dst point moves a src
+ * subtree into @dst (detach src + graft dst, the same ft_graft_build /
+ * ft_store_at_graft_point machinery as cds_ft_graft), so the dst-side +cnt_src
+ * fold is exercised through the merge entry point across every attach shape --
+ * in particular the GLUE diverge, which the B2 merge oracle (fresh dst key) did
+ * not reach.  A 3-key src subtree "M" moves under @dkey; cds_ft_verify recounts
+ * dst structurally and count_keys cross-checks the total.
+ */
+static int rank_stats_merge_attach_check(bool ordered_list, const char *tag,
+		const char *const *dst_setup, int ndst, const char *dkey)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *dst = create_varlen_rankstats_list_ft(ordered_list, &group);
+	struct cds_ft *src = NULL;
+	unsigned long expect = 0;
+	enum cds_ft_status s;
+	int i, ret = -1;
+
+	if (cds_ft_create(group, NULL, &src) < 0) {
+		drain_and_destroy(dst, group);
+		return -1;
+	}
+	rcu_read_lock();
+	for (i = 0; i < ndst; i++)
+		if (rank_stats_insert_verify(dst, dst_setup[i],
+				strlen(dst_setup[i]), &expect, tag) < 0)
+			goto out;
+	for (i = 0; i < 3; i++) {
+		char sk[2] = { 'M', (char) ('a' + i) };
+		struct ft_test_node *n = node_alloc(0);
+
+		if (cds_ft_insert(src, (const uint8_t *) sk, 2, &n->node)
+				!= CDS_FT_STATUS_OK) {
+			node_free(n);
+			goto out;
+		}
+	}
+	s = cds_ft_merge_at(dst, (const uint8_t *) dkey, strlen(dkey),
+			src, (const uint8_t *) "M", 1);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: merge_at \"%s\": %s\n", tag, dkey,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	expect += 3;
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: dst verify failed after merge \"%s\"\n",
+			tag, dkey);
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != expect) {
+		fprintf(stderr, "%s: dst count %lu != %lu after merge \"%s\"\n",
+			tag, cds_ft_count_keys(dst), expect, dkey);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (src) {
+		drain_trie(src);
+		rcu_barrier();
+		cds_ft_destroy(src);
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int rank_stats_merge_attach_run(bool ordered_list)
+{
+	const char *lm = ordered_list ? "merge_attach list-on" : "merge_attach list-off";
+	static const char *setup_slot[] = { "Za", "Zc" };
+	static const char *setup_deep[] = { "a" };
+	static const char *setup_displaced[] = { "Wb" };
+	static const char *setup_glue[] = { "PPPPPQ" };
+
+	if (rank_stats_merge_attach_check(ordered_list, lm, setup_slot, 2, "Zb") < 0)
+		return -1;
+	if (rank_stats_merge_attach_check(ordered_list, lm, setup_deep, 1, "mnpq") < 0)
+		return -1;
+	if (rank_stats_merge_attach_check(ordered_list, lm, setup_displaced, 1, "Wbcd") < 0)
+		return -1;
+	if (rank_stats_merge_attach_check(ordered_list, lm, setup_glue, 1, "PPPX") < 0)
+		return -1;
+	return 0;
+}
+
+static int test_rank_stats_merge_attach_exact(void)
+{
+	if (rank_stats_merge_attach_run(true) < 0)
+		return -1;
+	return rank_stats_merge_attach_run(false);
 }
 
 /*
@@ -24709,6 +24910,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_leaf_detach_exact);
 	RUN_TEST(test_rank_stats_detach_exact);
 	RUN_TEST(test_rank_stats_merge_src_exact);
+	RUN_TEST(test_rank_stats_graft_exact);
+	RUN_TEST(test_rank_stats_merge_attach_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
