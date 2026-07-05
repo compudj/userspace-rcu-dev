@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 306
+#define NR_TESTS 307
 #else
-#define NR_TESTS 264
+#define NR_TESTS 265
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3547,6 +3547,104 @@ static int test_rank_stats_prefix_remove_exact(void)
 	if (rank_stats_prefix_remove_run(true) < 0)
 		return -1;
 	return rank_stats_prefix_remove_run(false);
+}
+
+/*
+ * Order-statistics ON, prefix-key single-node remove exactness (one
+ * @ordered_list mode).  Same prefix-with-siblings shape as
+ * rank_stats_prefix_remove_run, but the prefix key is removed via
+ * cds_ft_remove (a single node) rather than cds_ft_remove_all -- exercising
+ * cds_ft_remove's is-prefix branch (R2b), the twin of remove_all's.  \"ab\"
+ * over {\"abc\",\"abd\"} keeps >=2 children (plain R2 fold in every config);
+ * \"xy\" over {\"xyz\"} leaves a single child (R3 chain-compress with skip on,
+ * R2 fold with skip off).  cds_ft_verify recounts nr_keys structurally after
+ * each op.  Varlen keys (fixed keys never form the prefix shape); both list
+ * modes -- the list-off fold routes through ft_remove_one_commit only when
+ * rank stats are on (else the unchanged ft_unchain_node lone store).
+ */
+static int rank_stats_prefix_remove_one_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "prefix_rm1 list-on" : "prefix_rm1 list-off";
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node *n_ab = node_alloc(0);
+	struct ft_test_node *n_xy = node_alloc(0);
+	unsigned long expect = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		node_free(n_ab);
+		node_free(n_xy);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_lock();
+	/* R2 plain-clear: holder \"ab\" keeps two children (c, d). */
+	if (rank_stats_insert_verify(ft, "abc", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(ft, "abd", 3, &expect, lm) < 0)
+		goto out_fail;
+	if (cds_ft_insert(ft, (const uint8_t *) "ab", 2, &n_ab->node)
+			!= CDS_FT_STATUS_OK)
+		goto out_fail;
+	expect++;
+	/* R3 chain-compress (skip on) / R2 (skip off): holder \"xy\" -> one child. */
+	if (rank_stats_insert_verify(ft, "xyz", 3, &expect, lm) < 0)
+		goto out_fail;
+	if (cds_ft_insert(ft, (const uint8_t *) "xy", 2, &n_xy->node)
+			!= CDS_FT_STATUS_OK)
+		goto out_fail;
+	expect++;
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_count_keys(ft) != expect)
+		goto out_fail;
+
+	/* Remove \"ab\" via cds_ft_remove (single node) -- R2 plain clear. */
+	cds_ft_iter_set_key(iter, (const uint8_t *) "ab", 2);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+	    cds_ft_remove(ft, iter, &n_ab->node) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: remove \"ab\" failed\n", lm);
+		goto out_fail;
+	}
+	expect--;
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_count_keys(ft) != expect) {
+		fprintf(stderr, "%s: after remove \"ab\": count %lu != %lu\n", lm,
+			cds_ft_count_keys(ft), expect);
+		goto out_fail;
+	}
+
+	/* Remove \"xy\" via cds_ft_remove -- R3 (skip) / R2 (noskip). */
+	cds_ft_iter_set_key(iter, (const uint8_t *) "xy", 2);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+	    cds_ft_remove(ft, iter, &n_xy->node) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: remove \"xy\" failed\n", lm);
+		goto out_fail;
+	}
+	expect--;
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_count_keys(ft) != expect) {
+		fprintf(stderr, "%s: after remove \"xy\": count %lu != %lu\n", lm,
+			cds_ft_count_keys(ft), expect);
+		goto out_fail;
+	}
+	rcu_read_unlock();
+
+	node_free_rcu(n_ab);
+	node_free_rcu(n_xy);
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+out_fail:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+static int test_rank_stats_prefix_remove_one_exact(void)
+{
+	if (rank_stats_prefix_remove_one_run(true) < 0)
+		return -1;
+	return rank_stats_prefix_remove_one_run(false);
 }
 
 /*
@@ -24222,6 +24320,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_relocation_exact);
 	RUN_TEST(test_rank_stats_nil_remove_exact);
 	RUN_TEST(test_rank_stats_prefix_remove_exact);
+	RUN_TEST(test_rank_stats_prefix_remove_one_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
