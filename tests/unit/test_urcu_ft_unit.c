@@ -4484,6 +4484,87 @@ out:
 	return ret;
 }
 
+/*
+ * Order-statistics ON, SKIP_COMPRESSED merged-parent graft-swap exactness.  An
+ * EXACT swap whose point sits under a COMPRESSED parent AND whose swap content
+ * canonicalizes to a COMPRESSED node fuses the two into one @merged compressed
+ * node at the grandparent slot (the "no two adjacent compresseds" rule).
+ * @merged roots the swap content, so it is baked with @swap_count and the dst
+ * net delta (swap_count - old_count) folds from its GRANDPARENT publish point --
+ * a distinct base from the EXACT/KEY_SHORTER shapes (which fold from @d.pnf).
+ *
+ * This shape is exercised by NO other test: the ft_inv graft-swap stress runs
+ * rank stats OFF and never builds a compressed-parent + compressed-swap layout.
+ * dst {PKa,PKb,R} puts the swap point "PK" under a compressed "PK" span (P->K
+ * single-child) whose parent is the root; swap {mn,mo,mp} canonicalizes to a
+ * compressed "m" node, so the merged branch fires (probe-confirmed).  The old
+ * "PK" content (2 keys) swaps for 3 -> dst 4, extracted {a,b} -> swap 2.
+ */
+static int rank_stats_graft_swap_merged_one(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *dst = create_varlen_rankstats_list_ft(ordered_list, &group);
+	struct cds_ft *swap = NULL;
+	const char *lm = ordered_list ? "graft_swap_merged list-on" : "graft_swap_merged list-off";
+	static const char *const swap_keys[] = { "mn", "mo", "mp" };
+	unsigned long expect = 0;
+	enum cds_ft_status s;
+	unsigned int i;
+	int ret = -1;
+
+	if (cds_ft_create(group, NULL, &swap) < 0) {
+		drain_and_destroy(dst, group);
+		return -1;
+	}
+	rcu_read_lock();
+	if (rank_stats_insert_verify(dst, "PKa", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(dst, "PKb", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(dst, "R", 1, &expect, lm) < 0)
+		goto out;
+	for (i = 0; i < 3; i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		if (cds_ft_insert(swap, (const uint8_t *) swap_keys[i], 2, &n->node)
+				!= CDS_FT_STATUS_OK) {
+			node_free(n);
+			goto out;
+		}
+	}
+	s = cds_ft_graft_swap(dst, (const uint8_t *) "PK", 2, swap);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: graft_swap: %s\n", lm,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	/* dst was {PKa,PKb,R} = 3; -2 old "PK" content, +3 swap content. */
+	expect = 4;
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: dst verify failed\n", lm);
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != expect) {
+		fprintf(stderr, "%s: dst count %lu != %lu\n", lm,
+			cds_ft_count_keys(dst), expect);
+		goto out;
+	}
+	if (cds_ft_verify(swap, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_count_keys(swap) != 2) {
+		fprintf(stderr, "%s: swap verify/count wrong\n", lm);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (swap) {
+		drain_trie(swap);
+		rcu_barrier();
+		cds_ft_destroy(swap);
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		ret = -1;
+	return ret;
+}
+
 static int test_rank_stats_graft_swap_exact(void)
 {
 	int lm;
@@ -4498,6 +4579,8 @@ static int test_rank_stats_graft_swap_exact(void)
 		if (rank_stats_graft_swap_ks_one(lm == 0, 3) < 0) /* KEY_SHORTER: +2 */
 			return -1;
 		if (rank_stats_graft_swap_ks_one(lm == 0, 1) < 0) /* KEY_SHORTER: 0 net */
+			return -1;
+		if (rank_stats_graft_swap_merged_one(lm == 0) < 0) /* SKIP merged-parent */
 			return -1;
 	}
 	return 0;
