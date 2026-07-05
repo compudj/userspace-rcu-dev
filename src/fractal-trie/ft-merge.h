@@ -1274,7 +1274,10 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			if (txn && !ft_flip_txn_reserve(txn,
 					nr_dst + 1 + ms_cap + gd.cap_free
 						+ gd.nr_splices
-						+ 1 /* §4.B parent guard */)) {
+						+ 1 /* §4.B parent guard */
+						/* + count walk: the (merged_keys - cnt_dst) nr_keys ancestor
+						 * edges (BULK fold), bounded by the merge-point depth */
+						+ (dst_ft->rank_stats ? (int) dst_key_len + 1 : 0))) {
 				ft_flip_txn_destroy(txn);
 				txn = NULL;
 			} else if (txn) {
@@ -1725,6 +1728,19 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	ft_glue_record_splices(dst_ft, &gd, txn);
 
 	/*
+	 * Order-statistics fold (BULK): record the dst net key-count delta
+	 * (merged_keys - cnt_dst) walk from @pub_parent up into the SAME txn, so
+	 * the aggregate flips ATOMICALLY with the merged spine's forward publish
+	 * (step 4) -- exact under concurrent writers.  @pub is a fresh node
+	 * already carrying merged_keys, so the walk begins one level up at the
+	 * stable @pub_parent.  A no-op when rank stats off or the count is
+	 * unchanged.
+	 */
+	if (pub_parent && merged_keys != cnt_dst)
+		ft_flip_txn_record_count_parent(dst_ft, txn, pub_parent,
+			(long) merged_keys - (long) cnt_dst);
+
+	/*
 	 * 4. Commit: one selector flip switches every dst-origin parent, the
 	 *    forward slot, AND every interleave cell edge from old to merged,
 	 *    atomically, then settles each slot to its direct merged target.  (List
@@ -1738,16 +1754,11 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	ft_flip_txn_commit(dst_ft, txn);
 
 	/*
-	 * 6. Propagate the dst key-count delta through the ancestors, starting at
-	 *    @pub_parent (the parent of the replaced node -- d_dst->pnf for an
-	 *    EXACT / KEY_SHORTER point, the grandparent d_dst->ppnf for Edge D).
-	 *    @pub is a fresh node already carrying merged_keys, so the walk must
-	 *    begin one level up; @pub_parent is a plain internal flag (cn_p's
-	 *    parent cannot be compressed), safe for ft_node_ptr.
+	 * 6. The dst net key-count delta (merged_keys - cnt_dst) is FOLDED into
+	 *    the step-4 commit above (recorded from @pub_parent into @txn before
+	 *    the flip), so it goes live ATOMICALLY with the merged spine -- no
+	 *    post-commit propagate walk.
 	 */
-	if (pub_parent && merged_keys != cnt_dst)
-		ft_propagate_external_count_parent(dst_ft, pub_parent,
-			(long) merged_keys - (long) cnt_dst);
 
 	/*
 	 * 7. Reclaim the old overlap spines (src-side to src, dst-side to dst).
@@ -2358,13 +2369,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			unsigned int pf_cap;
 
 			if (m == 0)
-				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
-					/* + count walk: the graft's +cnt_src nr_keys ancestor
-					 * edges (BULK fold), bounded by the merge-key depth --
-					 * over-reserve to the group max so the take() path never
-					 * grows the pre-reserved txn at the failure-free commit. */
-					+ (dst_ft->rank_stats ?
-						(unsigned int) dst_ft->group->max_key_len + 1 : 0);
+				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE;
 			else if (dst_ft->group->ordered_list_set)
 				pf_cap = (unsigned int) (m + 1) +
 					(unsigned int) (2 * n + 2) +
@@ -2374,6 +2379,16 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 				pf_cap = (unsigned int) (m + 1) +
 					(unsigned int) n +
 					1 /* §4.B parent guard */;
+			/*
+			 * + count walk (BULK fold): the graft's +cnt_src (m == 0) or the
+			 * spine-copy's (merged_keys - cnt_dst) (m != 0) nr_keys ancestor
+			 * edges ride this take() txn, bounded by the merge-point depth --
+			 * over-reserve to the group max so the failure-free post-drain
+			 * commit never grows the pre-reserved txn.  A no-op when rank
+			 * stats are off.
+			 */
+			if (dst_ft->rank_stats)
+				pf_cap += (unsigned int) dst_ft->group->max_key_len + 1;
 			pf_txn = ft_flip_txn_create();
 			if (pf_txn && !ft_flip_txn_reserve(pf_txn, pf_cap)) {
 				ft_flip_txn_destroy(pf_txn);
