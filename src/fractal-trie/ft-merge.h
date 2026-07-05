@@ -937,9 +937,6 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 		ft_descent_step(src_ft, &d, kv);
 	}
 
-	/* Propagate the removal through ancestors before touching freed slots. */
-	ft_propagate_external_count_parent(src_ft, d.pnf,
-			-(long) detached_count);
 
 	/*
 	 * Unlink the branch in place, preserving the move target (@d.nf, the
@@ -964,12 +961,19 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 		ret = ft_detach_node(src_ft, d.nfp, d.pnfp, d.depth,
 				/*free_detached_subtree=*/ false, NULL, pubp, run,
 				retire_glue, NULL,
-				0 /* move detach: bulk op owns the subtree count */);
+				/*
+				 * Fold the whole-subtree count removal onto the unlink:
+				 * -detached_count rides ft_detach_node's own commit (exact
+				 * under concurrent writers; magnitude-agnostic leaf machinery).
+				 */
+				-(long) detached_count);
 	}
 	if (ret < 0) {
-		/* Recompaction OOM: undo the propagation; src is pristine. */
-		ft_propagate_external_count_parent(src_ft, d.pnf,
-				(long) detached_count);
+		/*
+		 * Recompaction OOM: the folded count edges rode the
+		 * uncommitted txn (an abort applies nothing), so src is
+		 * pristine -- no propagation to undo.
+		 */
 		return -ENOMEM;
 	}
 	return 0;
