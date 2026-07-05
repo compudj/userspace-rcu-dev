@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 311
+#define NR_TESTS 312
 #else
-#define NR_TESTS 269
+#define NR_TESTS 270
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3915,6 +3915,117 @@ static int test_rank_stats_detach_exact(void)
 	for (lm = 0; lm < 2; lm++)
 		for (sc = 0; sc < 2; sc++)
 			if (rank_stats_detach_one(lm == 0, sc) < 0)
+				return -1;
+	return 0;
+}
+
+/*
+ * Order-statistics ON, merge SOURCE-side move exactness (one scenario, one
+ * @ordered_list mode).  cds_ft_merge_at unlinks a MULTI-key subtree from @src
+ * (via ft_merge_unlink_src_subtree -> ft_detach_node, move style) and attaches
+ * it into @dst at a fresh key.  As for a plain move-detach, the whole
+ * detached-subtree count must be removed from @src's surviving ancestors with
+ * count_delta = -detached_count (not -1); this checks that same fold reached
+ * through the merge entry point.  Two shapes mirroring the detach oracle:
+ *   scenario 0 -- in-place ancestor: root keeps siblings 'V','W' after moving
+ *      the "U" subtree ("Ua"/"Ub"/"Uc").
+ *   scenario 1 -- pruned ancestor: node "S" falls to a single child after
+ *      moving the "Sa" subtree ("Saa"/"Sab"/"Sac"), leaving "Sb"; -3 folds from
+ *      "S"'s stable parent (the root).
+ * The subtree is merged into a fresh @dst key ("Q") over one pre-existing dst
+ * key, so the dst-side attach is a simple non-empty graft (its count path is
+ * unchanged by this increment).  cds_ft_verify recounts both tries structurally
+ * (gated on rank stats); count_keys cross-checks the split.
+ */
+static int rank_stats_merge_src_one(bool ordered_list, int scenario)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *src = create_varlen_rankstats_list_ft(ordered_list, &group);
+	struct cds_ft *dst = NULL;
+	const char *lm = ordered_list ? "merge_src list-on" : "merge_src list-off";
+	const char *skey = scenario == 0 ? "U" : "Sa";
+	size_t sklen = scenario == 0 ? 1 : 2;
+	unsigned long sexpect = 0, dexpect = 0;
+	struct ft_test_node *dn;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_create(group, NULL, &dst) < 0) {
+		drain_and_destroy(src, group);
+		return -1;
+	}
+	rcu_read_lock();
+	/* dst: one pre-existing key so the attach lands in a non-empty trie. */
+	dn = node_alloc(0);
+	if (cds_ft_insert(dst, (const uint8_t *) "D", 1, &dn->node)
+			!= CDS_FT_STATUS_OK) {
+		node_free(dn);
+		goto out;
+	}
+	dexpect = 1;
+
+	if (scenario == 0) {
+		if (rank_stats_insert_verify(src, "Ua", 2, &sexpect, lm) < 0 ||
+		    rank_stats_insert_verify(src, "Ub", 2, &sexpect, lm) < 0 ||
+		    rank_stats_insert_verify(src, "Uc", 2, &sexpect, lm) < 0 ||
+		    rank_stats_insert_verify(src, "V", 1, &sexpect, lm) < 0 ||
+		    rank_stats_insert_verify(src, "W", 1, &sexpect, lm) < 0)
+			goto out;
+	} else {
+		if (rank_stats_insert_verify(src, "Saa", 3, &sexpect, lm) < 0 ||
+		    rank_stats_insert_verify(src, "Sab", 3, &sexpect, lm) < 0 ||
+		    rank_stats_insert_verify(src, "Sac", 3, &sexpect, lm) < 0 ||
+		    rank_stats_insert_verify(src, "Sb", 2, &sexpect, lm) < 0 ||
+		    rank_stats_insert_verify(src, "T", 1, &sexpect, lm) < 0)
+			goto out;
+	}
+
+	s = cds_ft_merge_at(dst, (const uint8_t *) "Q", 1,
+			src, (const uint8_t *) skey, sklen);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: merge_at \"%s\": %s\n", lm, skey,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	sexpect -= 3;
+	dexpect += 3;
+
+	if (cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: src verify failed after merge \"%s\"\n", lm, skey);
+		goto out;
+	}
+	if (cds_ft_count_keys(src) != sexpect) {
+		fprintf(stderr, "%s: src count %lu != %lu after merge \"%s\"\n",
+			lm, cds_ft_count_keys(src), sexpect, skey);
+		goto out;
+	}
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: dst verify failed after merge \"%s\"\n", lm, skey);
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != dexpect) {
+		fprintf(stderr, "%s: dst count %lu != %lu after merge \"%s\"\n",
+			lm, cds_ft_count_keys(dst), dexpect, skey);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(dst);
+	rcu_barrier();
+	cds_ft_destroy(dst);
+	if (drain_and_destroy(src, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int test_rank_stats_merge_src_exact(void)
+{
+	int lm, sc;
+
+	for (lm = 0; lm < 2; lm++)
+		for (sc = 0; sc < 2; sc++)
+			if (rank_stats_merge_src_one(lm == 0, sc) < 0)
 				return -1;
 	return 0;
 }
@@ -24597,6 +24708,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_external_promote_exact);
 	RUN_TEST(test_rank_stats_leaf_detach_exact);
 	RUN_TEST(test_rank_stats_detach_exact);
+	RUN_TEST(test_rank_stats_merge_src_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
