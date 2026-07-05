@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 315
+#define NR_TESTS 316
 #else
-#define NR_TESTS 273
+#define NR_TESTS 274
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4322,6 +4322,185 @@ static int test_rank_stats_merge_spine_exact(void)
 	if (rank_stats_merge_spine_run(true) < 0)
 		return -1;
 	return rank_stats_merge_spine_run(false);
+}
+
+/*
+ * Order-statistics ON, GRAFT-SWAP exactness (one @nswap, one @ordered_list
+ * mode).  cds_ft_graft_swap exchanges the content at @key in @dst with @swap's
+ * content.  Two dst-side count shapes:
+ *   - @nswap == 0 (empty swap): a pure REMOVE of the old content -- routed
+ *     through a move-style ft_detach_node, so the -old_count folds onto the
+ *     detach commit (the same machinery as the move-detach oracles).
+ *   - @nswap > 0 (replace): the old content (old_count) is swapped for the swap
+ *     content (nswap), so the dst NET delta (nswap - old_count) folds onto the
+ *     replace publish; @nswap 3 tests a +1 net, @nswap 1 a -1 net.
+ * dst holds "PK" (a 2-key subtree {PKa,PKb}) under a P that also holds "PZ"
+ * (root sibling "R"), so the swap point's parent chain survives (removing the
+ * "PK" subtree leaves P single-child -> a pruned ancestor for the empty swap).
+ * The extracted old content lands in @swap (its {a,b} = 2 keys).  cds_ft_verify
+ * recounts both tries structurally; count_keys cross-checks the exchange.
+ */
+static int rank_stats_graft_swap_one(bool ordered_list, int nswap)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *dst = create_varlen_rankstats_list_ft(ordered_list, &group);
+	struct cds_ft *swap = NULL;
+	const char *lm = ordered_list ? "graft_swap list-on" : "graft_swap list-off";
+	unsigned long expect = 0;
+	enum cds_ft_status s;
+	int i, ret = -1;
+
+	if (cds_ft_create(group, NULL, &swap) < 0) {
+		drain_and_destroy(dst, group);
+		return -1;
+	}
+	rcu_read_lock();
+	if (rank_stats_insert_verify(dst, "PKa", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(dst, "PKb", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(dst, "PZ", 2, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(dst, "R", 1, &expect, lm) < 0)
+		goto out;
+	for (i = 0; i < nswap; i++) {
+		char sk[1] = { (char) ('x' + i) };
+		struct ft_test_node *n = node_alloc(0);
+
+		if (cds_ft_insert(swap, (const uint8_t *) sk, 1, &n->node)
+				!= CDS_FT_STATUS_OK) {
+			node_free(n);
+			goto out;
+		}
+	}
+	s = cds_ft_graft_swap(dst, (const uint8_t *) "PK", 2, swap);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s(nswap=%d): graft_swap: %s\n", lm, nswap,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	/* dst was {PKa,PKb,PZ,R}; -2 old "PK" content, +nswap swap content. */
+	expect = 2 + (unsigned long) nswap;
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s(nswap=%d): dst verify failed\n", lm, nswap);
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != expect) {
+		fprintf(stderr, "%s(nswap=%d): dst count %lu != %lu\n", lm, nswap,
+			cds_ft_count_keys(dst), expect);
+		goto out;
+	}
+	/* @swap now holds the extracted old content: {a,b} = 2 keys. */
+	if (cds_ft_verify(swap, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s(nswap=%d): swap verify failed\n", lm, nswap);
+		goto out;
+	}
+	if (cds_ft_count_keys(swap) != 2) {
+		fprintf(stderr, "%s(nswap=%d): swap count %lu != 2\n", lm, nswap,
+			cds_ft_count_keys(swap));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (swap) {
+		drain_trie(swap);
+		rcu_barrier();
+		cds_ft_destroy(swap);
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * Order-statistics ON, KEY_SHORTER graft-swap exactness.  The swap key ends
+ * INSIDE a compressed span, so graft_swap splits the span and wraps a fresh
+ * prefix over the swap content -- the shape that commits via
+ * ft_glue_publish_replace (glue_insert.txn stays NULL), distinct from the EXACT
+ * ft_glue_txn_commit_replace path above.  dst holds one long key "PKABCD" (a
+ * compressed span) plus root sibling "R"; graft_swap at "PK" replaces the
+ * single-key "ABCD" tail (old_count 1) with @nswap swap keys, so the dst net
+ * delta (nswap - 1) folds onto the publish-replace flip.  The extracted tail
+ * ({ABCD} = 1 key) lands in @swap.
+ */
+static int rank_stats_graft_swap_ks_one(bool ordered_list, int nswap)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *dst = create_varlen_rankstats_list_ft(ordered_list, &group);
+	struct cds_ft *swap = NULL;
+	const char *lm = ordered_list ? "graft_swap_ks list-on" : "graft_swap_ks list-off";
+	unsigned long expect = 0;
+	enum cds_ft_status s;
+	int i, ret = -1;
+
+	if (cds_ft_create(group, NULL, &swap) < 0) {
+		drain_and_destroy(dst, group);
+		return -1;
+	}
+	rcu_read_lock();
+	if (rank_stats_insert_verify(dst, "PKABCD", 6, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(dst, "R", 1, &expect, lm) < 0)
+		goto out;
+	for (i = 0; i < nswap; i++) {
+		char sk[1] = { (char) ('x' + i) };
+		struct ft_test_node *n = node_alloc(0);
+
+		if (cds_ft_insert(swap, (const uint8_t *) sk, 1, &n->node)
+				!= CDS_FT_STATUS_OK) {
+			node_free(n);
+			goto out;
+		}
+	}
+	s = cds_ft_graft_swap(dst, (const uint8_t *) "PK", 2, swap);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s(nswap=%d): graft_swap: %s\n", lm, nswap,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	/* dst was {PKABCD,R} = 2; -1 old tail, +nswap swap content. */
+	expect = 1 + (unsigned long) nswap;
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s(nswap=%d): dst verify failed\n", lm, nswap);
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != expect) {
+		fprintf(stderr, "%s(nswap=%d): dst count %lu != %lu\n", lm, nswap,
+			cds_ft_count_keys(dst), expect);
+		goto out;
+	}
+	if (cds_ft_verify(swap, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_count_keys(swap) != 1) {
+		fprintf(stderr, "%s(nswap=%d): swap verify/count wrong\n", lm, nswap);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (swap) {
+		drain_trie(swap);
+		rcu_barrier();
+		cds_ft_destroy(swap);
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int test_rank_stats_graft_swap_exact(void)
+{
+	int lm;
+
+	for (lm = 0; lm < 2; lm++) {
+		if (rank_stats_graft_swap_one(lm == 0, 0) < 0)	/* empty: remove */
+			return -1;
+		if (rank_stats_graft_swap_one(lm == 0, 3) < 0)	/* replace: +1 */
+			return -1;
+		if (rank_stats_graft_swap_one(lm == 0, 1) < 0)	/* replace: -1 */
+			return -1;
+		if (rank_stats_graft_swap_ks_one(lm == 0, 3) < 0) /* KEY_SHORTER: +2 */
+			return -1;
+		if (rank_stats_graft_swap_ks_one(lm == 0, 1) < 0) /* KEY_SHORTER: 0 net */
+			return -1;
+	}
+	return 0;
 }
 
 /*
@@ -25006,6 +25185,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_graft_exact);
 	RUN_TEST(test_rank_stats_merge_attach_exact);
 	RUN_TEST(test_rank_stats_merge_spine_exact);
+	RUN_TEST(test_rank_stats_graft_swap_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
