@@ -67,7 +67,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct ft_ord_cell *fuse_cell,
 		struct ft_remove_pub *pub,
 		struct ft_detach_run *run,
-		struct ft_flip_txn *txn)
+		struct ft_flip_txn *txn,
+		long count_delta)
 {
 	/*
 	 * @txn is created and reserved by the caller (ft_detach_node), sized for
@@ -129,6 +130,17 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			}
 		}
 		/*
+		 * nr_keys fold (LEAF Increment 2): the removed leaf's -1 walk from
+		 * the kept compressed node @cn (which STAYS in place; its subtree
+		 * loses the disappearing key) up to root rides THIS promote commit
+		 * atomically -- recorded before the publish dispatch below so both
+		 * commit arms carry it.  Reserved by the caller's count_reserve; a
+		 * no-op (and skipped) for a count-neutral move detach / !rank_stats.
+		 */
+		if (count_delta)
+			ft_flip_txn_record_count_parent(ft, txn,
+				ft_compressed_node_flag(cn), count_delta);
+		/*
 		 * External-promote publish into cn->child (the moment the
 		 * removed leaf key disappears for an exact reader, which
 		 * descends through cn->child).  When fusion is requested, record
@@ -183,6 +195,18 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			(struct cds_ft_inode *) ft_compressed_node_ptr(
 				iter_node_flag));
 		fresh_meta->parent = src_meta->parent;
+		/*
+		 * nr_keys fold (LEAF Increment 2): the fresh internal REPLACES the
+		 * retired compressed node, so it carries the retired node's
+		 * post-removal count (get(src) + count_delta, i.e. src - 1 when this
+		 * detach retires a key -- typically 0, a compressed root emptied of
+		 * its lone leaf).  A build-invisible plain store on the not-yet-
+		 * published fresh node; a no-op when !rank_stats.  The -1 walk from
+		 * the fresh node's stable parent rides the publish below.
+		 */
+		if (count_delta)
+			ft_nr_keys_store(ft, fresh_meta,
+				ft_nr_keys_get(src_meta) + count_delta, CMM_RELAXED);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		ft_meta_parent_slot_offset_set(fresh_meta,
 			ft_meta_parent_slot_offset(src_meta));
@@ -214,6 +238,17 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) ft_compressed_node_ptr(
 					iter_node_flag)));
+			/*
+			 * nr_keys fold (LEAF Increment 2): the removed leaf's -1
+			 * walk from the fresh node's stable parent up to root rides
+			 * this publish (the fresh node itself was baked above).  A
+			 * compressed ROOT retire leaves src_meta->parent == NULL, so
+			 * the walk records no ancestor edge and only the baked root
+			 * count changes.
+			 */
+			if (count_delta)
+				ft_flip_txn_record_count_parent(ft, txn,
+					src_meta->parent, count_delta);
 			ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
 		}
 		free_compressed_node(ft,
@@ -621,13 +656,17 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	struct cds_ft_inode_flag *elevated_old_child;
 	/*
-	 * nr_keys count base: the RESOLVED holder flag (== each caller's
-	 * former @holder_flag).  Set once the initial parent slot is resolved
-	 * below (a raw skip-encoded slot is not a valid propagate base); the
-	 * ownership walk and its abort rollback climb the same
-	 * metadata->parent chain the callers used.  Unused when !rank_stats.
+	 * nr_keys count fold (LEAF Increment 2): the removed leaf's @count_delta
+	 * (-1, or 0 for a count-neutral move detach) rides the SAME commit that
+	 * unlinks the leaf, rather than a standalone pre-decrement walk.  Each
+	 * per-outcome fold below records the -1 walk from that outcome's stable
+	 * base into its commit txn (in-place / recompaction: @commit_txn;
+	 * shape-D: ft_chain_compress_fused's own txn; compressed parent:
+	 * @orphan_txn) and sets @count_folded; the residual for a lone-store
+	 * (list-off pub-less) outcome that reaches no txn falls back to the
+	 * standalone walk at the end.  All no-ops when !rank_stats.
 	 */
-	struct cds_ft_inode_flag *count_base = NULL;
+	bool count_folded = false;
 
 	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
 
@@ -685,15 +724,11 @@ int ft_detach_node(struct cds_ft *ft,
 	cur_depth = detach_depth - ft_parent_depth_span(cur, *detach_node_flag_ptr);
 
 	/*
-	 * nr_keys count ownership (Increment 1: relocate the three callers'
-	 * pre-decrement into the detach).  Walk the removed leaf's @count_delta
-	 * (-1, or 0 for a count-neutral move detach) from the resolved holder
-	 * @cur up to root, before any structural change; rolled back at @end on
-	 * abort.  No-op when !rank_stats.  The per-outcome fold onto the commit
-	 * txn (Increment 2) replaces this standalone walk.
+	 * nr_keys count fold (LEAF Increment 2): no standalone pre-decrement
+	 * here anymore -- each per-outcome commit below folds the @count_delta
+	 * walk onto its own flip so the count flips ATOMICALLY with the unlink
+	 * (exact under concurrent writers).  See @count_folded.
 	 */
-	count_base = cur;
-	ft_propagate_external_count_parent(ft, count_base, count_delta);
 
 	while (cur) {
 		struct cds_ft_metadata *metadata;
@@ -944,6 +979,7 @@ int ft_detach_node(struct cds_ft *ft,
 					+ nr_to_free
 					+ (trailing_skip_cn ? 1 : 0)
 					+ (topmost_external_nodes ? 1 : 0) /* folded external back-edge */
+					+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
 					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
 
 			if (!orphan_txn) {
@@ -976,7 +1012,7 @@ int ft_detach_node(struct cds_ft *ft,
 			ret = ft_detach_node_replace_compressed_parent(ft,
 				iter_node_flag, detach_parent_flag_ptr,
 				topmost_external_nodes, &nr_clear, fuse_cell,
-				pub, run, orphan_txn);
+				pub, run, orphan_txn, count_delta);
 			if (ret) {
 				ft_flip_txn_destroy(orphan_txn);
 				goto end;
@@ -1197,17 +1233,27 @@ int ft_detach_node(struct cds_ft *ft,
 					}
 				}
 				if (s_child) {
+					/*
+					 * nr_keys fold (LEAF Increment 2): shape-D is the R3
+					 * chain-compress fuse -- the merged node is built with
+					 * its post-removal count and the -1 walk from its stable
+					 * parent (publish_parent) rides the merge flip.  Reserve
+					 * the walk (bounded by the removed leaf's depth); a no-op
+					 * for a count-neutral move / !rank_stats.
+					 */
 					int cret = ft_chain_compress_fused(ft,
 						iter_node_flag, bmeta,
 						detach_parent_flag_ptr,
 						s_child, s_byte, fuse_cell, run,
 						to_free, nr_to_free,
 						trailing_skip_cn_flag, freeze_leaf,
-						0 /* leaf-detach: caller pre-decrements */, 0);
+						count_delta,
+						ft->rank_stats ? detach_depth + 1 : 0);
 
 					if (cret == 0) {
 						ret = 0;
 						boundary_fused = true;
+						count_folded = true;
 						if (freeze_leaf)
 							freeze_leaf_fused = true;
 						/*
@@ -1269,13 +1315,15 @@ int ft_detach_node(struct cds_ft *ft,
 			if (fuse_cell || run ||
 			    (bparent && (ft_node_compressed(bparent) ||
 					 ft_node_skip_compressed(bparent))) ||
-			    (pub && (nr_to_free > 0 || trailing_skip_cn_flag))) {
+			    (pub && (nr_to_free > 0 || trailing_skip_cn_flag)) ||
+			    ft->rank_stats /* carry the nr_keys fold walk */) {
 				commit_txn = ft_flip_txn_create_bounded(
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
 					+ 1 /* §4.B parent guard (Site 1 arms excl.) */
 					+ nr_to_free
 					+ (trailing_skip_cn_flag ? 1 : 0)
 					+ (retire_glue ? retire_glue->cap_free : 0)
+					+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
 					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
 				if (!commit_txn) {
 					ret = -ENOMEM;
@@ -1359,6 +1407,20 @@ int ft_detach_node(struct cds_ft *ft,
 			 * two-commit -- the caller unsplices.
 			 */
 			if (!boundary_fused && pub && pub->armed) {
+				/*
+				 * nr_keys fold (LEAF Increment 2): the in-place delete /
+				 * external promote leaves the holder @iter_node_flag in
+				 * place (its subtree loses the disappearing key), so the
+				 * -1 walk from @iter_node_flag up to root rides THIS
+				 * commit atomically -- recorded before ft_remove_one_commit
+				 * consumes @commit_txn.  A no-op / skipped for a count-
+				 * neutral move / !rank_stats.
+				 */
+				if (count_delta && commit_txn) {
+					ft_flip_txn_record_count_parent(ft, commit_txn,
+						iter_node_flag, count_delta);
+					count_folded = true;
+				}
 				ft_remove_one_commit(ft, pub->slot, pub->old_val,
 					pub->new_val, pub->state_meta,
 					fuse_cell, run, commit_txn, NULL);
@@ -1396,6 +1458,24 @@ int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_metadata *iter_meta =
 			cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
 
+		/*
+		 * nr_keys fold (LEAF Increment 2): a recompaction rebuilds the
+		 * holder smaller; the fresh copy (@iter_node_flag) carried the OLD
+		 * node's count out of ft_node_recompact, so bake in its post-removal
+		 * count here -- a build-invisible plain store on the not-yet-
+		 * published fresh copy.  Reader-safety: the fresh copy is reachable
+		 * via up-walk pre-commit (recompact re-parents children to it), but
+		 * a node's own nr_keys is only ever read at a root-DESCENDED position
+		 * -- which lands on the OLD node via the not-yet-flipped parent slot
+		 * -- so its transiently-shifted count is never observed (same
+		 * invariant as the insert I7 relocation fold).  The -1 walk from the
+		 * STABLE grandparent iter_meta->parent rides the republish below.
+		 */
+		if (old_recompacted_node && count_delta)
+			ft_nr_keys_store(ft, iter_meta,
+				ft_nr_keys_get(iter_meta) + count_delta,
+				CMM_RELAXED);
+
 		dbg_printf("ft_detach_node: publish %p instead of %p\n",
 			iter_node_flag, *detach_parent_flag_ptr);
 		/*
@@ -1421,6 +1501,16 @@ int ft_detach_node(struct cds_ft *ft,
 			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
+			/*
+			 * nr_keys fold (LEAF Increment 2): the recompaction's -1
+			 * walk from the STABLE grandparent iter_meta->parent (the
+			 * rebuilt copy itself was baked above) rides this same commit.
+			 */
+			if (count_delta) {
+				ft_flip_txn_record_count_parent(ft, commit_txn,
+					iter_meta->parent, count_delta);
+				count_folded = true;
+			}
 			/*
 			 * Recompaction (its eager child re-parent already ran in
 			 * ft_node_replace_ptr) so the publish commits through the
@@ -1461,6 +1551,20 @@ int ft_detach_node(struct cds_ft *ft,
 			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag, &rec);
+			/*
+			 * nr_keys fold (LEAF Increment 2): a non-fused RECOMPACTION
+			 * folds the -1 walk from the stable grandparent onto this
+			 * republish (the rebuilt copy was baked above).  A non-in-place
+			 * external PROMOTE (old_recompacted_node NULL) does NOT -- the
+			 * holder never moved, this republish re-emits an old==new no-op,
+			 * and the promote's count falls to the standalone residual
+			 * below (base @iter_node_flag).
+			 */
+			if (old_recompacted_node && count_delta) {
+				ft_flip_txn_record_count_parent(ft, commit_txn,
+					iter_meta->parent, count_delta);
+				count_folded = true;
+			}
 			ft_remove_commit_rec(ft, &rec, NULL, NULL,
 				commit_txn_used ? NULL : commit_txn);
 			commit_txn_used = (commit_txn != NULL);
@@ -1476,6 +1580,27 @@ int ft_detach_node(struct cds_ft *ft,
 		 * (old == new), so skip it entirely.  Any commit_txn
 		 * left unconsumed here is freed at @end.
 		 */
+
+		/*
+		 * nr_keys residual (LEAF Increment 2): a lone-store outcome that
+		 * reached no commit txn -- a list-off (pub == NULL) in-place leaf
+		 * delete or external promote whose forward store went directly
+		 * through ft_node_replace_ptr -- cannot fold, so it falls back to a
+		 * standalone root-ward -1 walk from the surviving holder
+		 * @iter_node_flag.  The in-place-armed / recompaction / shape-D /
+		 * compressed-parent outcomes all set @count_folded, so this is skipped
+		 * for them (a recompaction always folds, so the base is never the
+		 * freed old copy; the defensive @iter_meta->parent covers the
+		 * unreachable case).  A no-op under one writer -- the same lone-store
+		 * residual the freeze / retire-glue paths leave, to be closed once
+		 * list-off lone edges ride a txn.  Placed BEFORE the canonicalize
+		 * below, which may free @iter_node_flag.
+		 */
+		if (!count_folded && count_delta)
+			ft_propagate_external_count_parent(ft,
+				old_recompacted_node ? iter_meta->parent
+						     : iter_node_flag,
+				count_delta);
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
@@ -1516,13 +1641,13 @@ int ft_detach_node(struct cds_ft *ft,
 	}
 end:
 	/*
-	 * nr_keys rollback (Increment 1): on abort undo the entry
-	 * pre-decrement -- mirrors each caller's former `if (ret)
-	 * propagate(holder_flag, 1)`.  A successful detach (ret == 0) keeps
-	 * the -1.
+	 * nr_keys fold (LEAF Increment 2): no abort rollback needed.  Every
+	 * per-outcome count fold rides an UNcommitted txn on the abort path (the
+	 * commit is what would apply it), so an abort applies nothing; the
+	 * standalone residual runs only on success (ret == 0, inside the parent-
+	 * slot block).  So a failed detach leaves nr_keys untouched, and there is
+	 * no pre-decrement left to undo.
 	 */
-	if (ret && count_base)
-		ft_propagate_external_count_parent(ft, count_base, -count_delta);
 	/*
 	 * Free a pre-reserved commit txn that no commit consumed (reservation
 	 * succeeded but ft_node_replace_ptr recompacted / failed, or shape-D
