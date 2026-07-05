@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 307
+#define NR_TESTS 310
 #else
-#define NR_TESTS 265
+#define NR_TESTS 268
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3645,6 +3645,178 @@ static int test_rank_stats_prefix_remove_one_exact(void)
 	if (rank_stats_prefix_remove_one_run(true) < 0)
 		return -1;
 	return rank_stats_prefix_remove_one_run(false);
+}
+
+/*
+ * Order-statistics ON, shape-D LEAF-detach exactness (one @ordered_list mode).
+ * Removing a LEAF key whose pruned branch leaves a surviving non-root 2-child
+ * boundary dropping to a 1-child no-external internal folds the chain-compress
+ * prune INTO the detach commit (ft_chain_compress_fused, shape D) -- this routes
+ * ft_detach_node (a compressed-holder leaf), NOT the prefix-clear path exercised
+ * by rank_stats_prefix_remove_run.  The merged compressed node is built with its
+ * post-removal count and the -1 walk from its stable parent rides the merge flip.
+ * Shape (mirrors run_remove_leaf_canonicalize_oom): "XA" (leaf), "XBC" (the
+ * boundary's other child, a compressed extension), "Y" (keeps the root
+ * multi-child so the "X" boundary is a plain internal); removing "XA" drops the
+ * "X" boundary 2 -> 1 child -> shape-D fused merge with the surviving "BC"
+ * branch.  cds_ft_verify recounts every node's nr_keys structurally (gated on
+ * rank stats) after each op, so a miscount in the merged-node build count or the
+ * folded ancestor walk aborts at that exact mutation.  Both list modes.
+ */
+static int rank_stats_shape_d_leaf_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "shapeD_leaf list-on" : "shapeD_leaf list-off";
+	struct cds_ft_iter *iter = NULL;
+	unsigned long expect = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_lock();
+	if (rank_stats_insert_verify(ft, "XA", 2, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(ft, "XBC", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(ft, "Y", 1, &expect, lm) < 0)
+		goto out_fail;
+	if (rank_stats_remove_all_verify(ft, iter, "XA", 2, &expect, lm) < 0)
+		goto out_fail;
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+out_fail:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+static int test_rank_stats_shape_d_leaf_exact(void)
+{
+	if (rank_stats_shape_d_leaf_run(true) < 0)
+		return -1;
+	return rank_stats_shape_d_leaf_run(false);
+}
+
+/*
+ * Order-statistics ON, external-promote LEAF-detach exactness (one @ordered_list
+ * mode).  A shorter prefix key K1 ends at an internal node N (external_nodes=K1)
+ * that has a single longer-key child; removing that longer leaf empties N, so
+ * ft_detach_node PROMOTES N's external chain up its parent slot and prunes N.
+ * Two parent flavours:
+ *   - plain parent (#1b in-place external promote): "ab" (prefix) + "abcd"
+ *     (leaf) + "aq" (sibling keeps the "a" boundary a plain internal); remove
+ *     "abcd" -> "ab" promoted.
+ *   - compressed parent (#4a): "PPPPPPab" (prefix) + "PPPPPPabcd" (leaf); the
+ *     long common "PPPPPP" lead is a compressed node above N, so the promote
+ *     replaces cn->child.
+ * The removed leaf's -1 walk climbs from the surviving holder N-parent (both
+ * flavours), folded onto the promote commit.  cds_ft_verify recounts every node
+ * structurally (gated on rank stats) after each op, so a miscount in the folded
+ * walk aborts at that mutation.  Both list modes.
+ */
+static int rank_stats_external_promote_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "extpromote list-on" : "extpromote list-off";
+	struct cds_ft_iter *iter = NULL;
+	unsigned long expect = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_lock();
+	/* Plain-parent external promote (#1b): "aq" keeps "a" multi-child. */
+	if (rank_stats_insert_verify(ft, "ab", 2, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(ft, "abcd", 4, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(ft, "aq", 2, &expect, lm) < 0)
+		goto out_fail;
+	if (rank_stats_remove_all_verify(ft, iter, "abcd", 4, &expect, lm) < 0)
+		goto out_fail;
+	/* Compressed-parent external promote (#4a): long "PPPPPP" lead. */
+	if (rank_stats_insert_verify(ft, "PPPPPPab", 8, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(ft, "PPPPPPabcd", 10, &expect, lm) < 0)
+		goto out_fail;
+	if (rank_stats_remove_all_verify(ft, iter, "PPPPPPabcd", 10, &expect, lm) < 0)
+		goto out_fail;
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+out_fail:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+static int test_rank_stats_external_promote_exact(void)
+{
+	if (rank_stats_external_promote_run(true) < 0)
+		return -1;
+	return rank_stats_external_promote_run(false);
+}
+
+/*
+ * Order-statistics ON, plain LEAF-detach exactness (one @ordered_list mode).
+ * A wide branch node ("Y" holding many 2-byte-key leaves) is drained one leaf at
+ * a time: each removal routes ft_detach_node and either deletes in place (the
+ * boundary stays above min_child -- shape #1, the holder's -1 walk folds onto the
+ * ft_remove_one_commit / lone store) or, as the branch crosses a node-type
+ * boundary, RECOMPACTS the branch smaller (#2, the fresh copy is baked with its
+ * post-removal count and the -1 walk from the stable grandparent rides the
+ * republish).  Neither shape fires in inv_nr_keys_exact (fixed 4-byte keys form
+ * compressed chains, not a wide branch), so this closes that gap.  cds_ft_verify
+ * recounts every node structurally (gated on rank stats) after each op, so a
+ * miscount in the in-place fold, the recompaction bake, or either ancestor walk
+ * aborts at that exact mutation.  Both list modes (list-off exercises the
+ * lone-store residual for the in-place shape).
+ */
+static int rank_stats_leaf_detach_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "leaf_detach list-on" : "leaf_detach list-off";
+	struct cds_ft_iter *iter = NULL;
+	unsigned long expect = 0;
+	int i;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_lock();
+	/* Wide branch "Y" with 16 leaf children (distinct second bytes). */
+	for (i = 0; i < 16; i++) {
+		char k[2] = { 'Y', (char) ('a' + i) };
+
+		if (rank_stats_insert_verify(ft, k, 2, &expect, lm) < 0)
+			goto out_fail;
+	}
+	/* Drain leaves one at a time: in-place deletes + type-shrink recompacts. */
+	for (i = 0; i < 16; i++) {
+		char k[2] = { 'Y', (char) ('a' + i) };
+
+		if (rank_stats_remove_all_verify(ft, iter, k, 2, &expect, lm) < 0)
+			goto out_fail;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+out_fail:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+static int test_rank_stats_leaf_detach_exact(void)
+{
+	if (rank_stats_leaf_detach_run(true) < 0)
+		return -1;
+	return rank_stats_leaf_detach_run(false);
 }
 
 /*
@@ -24321,6 +24493,9 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_nil_remove_exact);
 	RUN_TEST(test_rank_stats_prefix_remove_exact);
 	RUN_TEST(test_rank_stats_prefix_remove_one_exact);
+	RUN_TEST(test_rank_stats_shape_d_leaf_exact);
+	RUN_TEST(test_rank_stats_external_promote_exact);
+	RUN_TEST(test_rank_stats_leaf_detach_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
