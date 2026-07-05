@@ -2638,6 +2638,16 @@ struct ft_glue {
 	 */
 	struct cds_ft_inode_flag *attached_nf;
 	/*
+	 * Order-statistics count fold (BULK).  When non-zero, the glue committer
+	 * records a +count_delta nr_keys walk from @publish_parent up to the root
+	 * into @txn, so the count flips ATOMICALLY with the attach forward publish
+	 * (the cluster / branch below @publish_parent already carries its full
+	 * count from build).  Zero (the ft_glue_init default) for every glue commit
+	 * that is not an order-statistics attach, and always a no-op when the trie
+	 * does not maintain rank stats.
+	 */
+	long count_delta;
+	/*
 	 * Multi-edge flip transaction (<urcu/rcu-txn-sw.h>).  When non-NULL
 	 * (the converted graft GLUE path, list off), every live back-pointer
 	 * re-parent AND the forward publish are RECORDED into @txn as the build
@@ -2696,6 +2706,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->attached_nf = NULL;
 	g->txn = NULL;
 	g->fuse_free_list = false;
+	g->count_delta = 0;
 }
 
 /*
@@ -3265,6 +3276,19 @@ void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 		ft_flip_txn_record_tag(g->txn, (void **) cedges[k].slot,
 			cedges[k].old_target, cedges[k].new_target,
 			ft_edge_tag(&cedges[k]));
+
+	/*
+	 * Order-statistics fold (BULK): record the +count_delta nr_keys walk from
+	 * @publish_parent (the stable node owning the forward slot) up to the root
+	 * into the SAME txn, so the aggregate flips ATOMICALLY with the attach --
+	 * the cluster / displaced branch below @publish_parent already carries its
+	 * full count from build.  A no-op when @count_delta is 0 (every non-attach
+	 * glue commit) or the trie does not maintain rank stats; @publish_parent
+	 * NULL (a root splice, the whole cluster becomes the root) records nothing.
+	 */
+	if (g->count_delta)
+		ft_flip_txn_record_count_parent(ft, g->txn, g->publish_parent,
+			g->count_delta);
 
 	/*
 	 * Commit WITHOUT an explicit install: ft_flip_txn_commit auto-installs a

@@ -212,8 +212,17 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		free_cds_ft_node_unpublished(ft, old_branch);
 		ft_glue_track(glue, branch_flag);
 	}
+	/*
+	 * Order-statistics fold (BULK): build the fresh cluster's junction /
+	 * prefix with their FULL post-commit count -- the old span's keys PLUS
+	 * the +src_count payload -- so the graft/merge attach fold records only
+	 * the +src_count walk from the STABLE @publish_parent above the cluster
+	 * (a build-invisible plain store; a no-op when rank stats are off).  The
+	 * OLD-direction suffix nodes keep old_child_nr_keys (they hold no
+	 * payload).
+	 */
 	ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
-		old_child_nr_keys, CMM_RELAXED);
+		old_child_nr_keys + src_count, CMM_RELAXED);
 
 	/* Wire the OLD direction (re-encode compressed slot to skip form). */
 	ft_node_get_nth_skip(branch_flag, &slot, old_ordinal, FT_PF_NONE);
@@ -258,7 +267,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		pfx->len = diverge_pos;
 		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
 		ft_meta_nr_child_set(pfx_meta, 1);
-		ft_nr_keys_store(ft, pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
+		ft_nr_keys_store(ft, pfx_meta,
+			ft_nr_keys_get(cn_meta) + src_count, CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, branch_flag, top_flag, NULL);
 		/* Track the PLAIN form; the skip form is for the publish. */
@@ -277,8 +287,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 			pfx->len = 1;
 			pfx->key_bytes[0] = cn->key_bytes[0];
 			ft_meta_nr_child_set(pfx_meta, 1);
-			ft_nr_keys_store(ft, pfx_meta, ft_nr_keys_get(cn_meta),
-				CMM_RELAXED);
+			ft_nr_keys_store(ft, pfx_meta,
+				ft_nr_keys_get(cn_meta) + src_count, CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
 			ft_set_parent(ft, branch_flag, top_flag, &pfx->child);
 			/* Track the PLAIN form; skip form for the publish. */
@@ -296,7 +306,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		if (ret)
 			return -ENOMEM;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
-		ft_nr_keys_store(ft, pfx_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
+		ft_nr_keys_store(ft, pfx_meta,
+			ft_nr_keys_get(cn_meta) + src_count, CMM_RELAXED);
 		top_flag = dest;
 		ft_glue_track(glue, dest);
 		}
@@ -307,7 +318,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	} else {
 		/* diverge_pos == 0: branch IS the top. */
 		ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
-			ft_nr_keys_get(cn_meta), CMM_RELAXED);
+			ft_nr_keys_get(cn_meta) + src_count, CMM_RELAXED);
 		top_flag = branch_flag;
 	}
 
@@ -530,7 +541,8 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attached_nf,
 		unsigned int *attached_depth,
 		struct ft_graft_run *run,
-		struct ft_graft_store_state *st)
+		struct ft_graft_store_state *st,
+		long count_delta)
 {
 	if (st->displaced_shape) {
 		/*
@@ -552,6 +564,13 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		st->glue->publish_parent = st->pnf;
 		st->glue->publish_slot = st->nfp;
 		st->glue->top = st->attached;
+		/*
+		 * Order-statistics fold (BULK): the fresh @branch (which
+		 * absorbs the displaced external) raises @st->pnf's subtree by
+		 * +count_delta; @publish_parent == st->pnf, so the glue commit
+		 * records that +count_delta walk into the same flip.
+		 */
+		st->glue->count_delta = count_delta;
 		ft_glue_txn_commit(ft, st->glue, run);
 		if (st->tp_i >= 1)
 			FT_TP(tree_edge_set, (const void *) ft,
@@ -562,6 +581,7 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 	} else {
 		struct cds_ft_inode_flag **slot = NULL;
 		struct ft_ord_cell_edge redges[4];
+		struct cds_ft_inode_flag *count_base = NULL;
 		unsigned int rn = 0, i;
 
 		ft_node_get_nth_skip(st->dest, &slot, st->slot_byte, FT_PF_NONE);
@@ -599,10 +619,35 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 					(void **) st->reserve_rec.slot[k],
 					(void *) st->reserve_rec.old_val[k],
 					(void *) st->reserve_rec.new_val[k]);
+			/*
+			 * Order-statistics fold (BULK): the reserve relocated the
+			 * attach parent to the fresh @st->dest, recompacted with
+			 * only the OLD subtree count (the payload slot read
+			 * not-present during the reserve).  Bake +count_delta into
+			 * that fresh copy (a build-invisible plain store, off the
+			 * walk -- the insert-I7 reader-safety invariant: a node's
+			 * own nr_keys is only read root-descended, landing on the
+			 * old node via the parked grandparent proxy) and walk the
+			 * +count_delta up from the STABLE grandparent this
+			 * relocation republishes into.
+			 */
+			if (count_delta) {
+				struct cds_ft_metadata *dm =
+					cds_ft_item_to_metadata(ft_node_ptr(st->dest));
+				ft_nr_keys_store(ft, dm,
+					ft_nr_keys_get(dm) + count_delta, CMM_RELAXED);
+				count_base = st->publish_pmeta->parent;
+			}
 		} else {
 			/* In-place reserve: a redundant same-value republish. */
 			ft_publish_to_parent(ft, st->publish_pmeta->parent,
 				st->pnfp, st->dest);
+			/*
+			 * Order-statistics fold (BULK): @st->dest (== d->pnf, a
+			 * stable existing node) gains +count_delta; walk from it up.
+			 */
+			if (count_delta)
+				count_base = st->dest;
 		}
 		/*
 		 * Record the slot edge against the FINAL slot (now that the
@@ -639,6 +684,9 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		if (st->old_recompacted_node)
 			ft_flip_txn_record_tombstone(st->glue->txn,
 				cds_ft_item_to_metadata(st->old_recompacted_node));
+		if (count_delta)
+			ft_flip_txn_record_count_parent(ft, st->glue->txn,
+				count_base, count_delta);
 		ft_flip_txn_commit(ft, st->glue->txn);
 		st->glue->txn = NULL;
 		if (run)
@@ -671,7 +719,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attached_nf,
 		unsigned int *attached_depth,
 		struct ft_glue *glue,
-		struct ft_graft_run *run)
+			struct ft_graft_run *run,
+		long count_delta)
 {
 	struct ft_graft_store_state st;
 	enum cds_ft_status status;
@@ -680,7 +729,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 			graft_payload, graft_external_count, glue, &st);
 	if (status != CDS_FT_STATUS_OK)
 		return status;
-	ft_store_at_graft_point_commit(ft, attached_nf, attached_depth, run, &st);
+	ft_store_at_graft_point_commit(ft, attached_nf, attached_depth, run,
+			&st, count_delta);
 	return CDS_FT_STATUS_OK;
 }
 
@@ -1033,7 +1083,9 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			glue.txn = ft_flip_txn_create();
 			if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 					/* + FLOOR_FREE: fused free-list tombstones (§4.B) */
-					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE)) {
+					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
+					/* + count walk: the +src_count nr_keys ancestor edges (BULK fold) */
+					+ (dst_ft->rank_stats ? (int) key_len + 1 : 0))) {
 				if (glue.txn)
 					ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
@@ -1275,7 +1327,12 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * -- structure and ordered list -- is observed old XOR new
 			 * with no deferred-edge ordering window.  ft_glue_txn_commit
 			 * arms @run_arg, so the standalone splice below is skipped.
+			 *
+			 * Order-statistics fold (BULK): the diverge cluster raises
+			 * @glue.publish_parent's subtree by +src_count; record that
+			 * walk into the same commit (a no-op when rank stats off).
 			 */
+			glue.count_delta = (long) src_count;
 			ft_glue_txn_commit(dst_ft, &glue, run_arg);
 			attached_nf = glue.attached_nf;
 			ft_glue_free_old(dst_ft, &glue);
@@ -1301,7 +1358,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 							  src_count,
 							  &attached_nf,
 							  &attached_depth,
-							  &glue, run_arg);
+							  &glue, run_arg,
+							  (long) src_count);
 			if (self_secured) {
 				cds_ft_alloc_reserve_deactivate(dst_ft);
 				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
@@ -1311,28 +1369,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		}
 
 		/*
-		 * Propagate src_count up the ancestor chain, starting
-		 * from @attached_nf's parent (skipping @attached_nf
-		 * itself, whose nr_keys is already the payload count).
-		 *
-		 * Note: *d.pnfp can't be used as the start because under
-		 * SKIP_COMPRESSED, ft_publish_to_parent may have updated
-		 * the grandparent slot (via cn's skip_slot mechanism) to
-		 * point directly at @attached_nf -- starting propagation
-		 * there would double-count @attached_nf's subtree.
+		 * Order-statistics: the +src_count ancestor walk is now FOLDED
+		 * onto the attach commit above (glue.count_delta for the GLUE
+		 * diverge and displaced-external shapes; ft_store_at_graft_point's
+		 * count_delta for the in-place / recompact-relocate slot shapes),
+		 * so it flips ATOMICALLY with the structural publish -- exact
+		 * under concurrent writers.  No post-commit propagate walk.
 		 */
-		{
-			/*
-			 * ft_get_parent_rcu (not ft_flag_to_metadata) so the start
-			 * point is correct even when @attached_nf is the placed
-			 * EXTERNAL of a NIL-key graft.
-			 */
-			struct cds_ft_inode_flag *ap = ft_get_parent_rcu(dst_ft,
-				ft_resolve_skip_compressed(dst_ft, attached_nf));
-			if (ap)
-				ft_propagate_external_count_parent(dst_ft, ap,
-					(long) src_count);
-		}
 
 		/*
 		 * Ordered list: src is now structurally empty + drained; the payload

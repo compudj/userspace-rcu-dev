@@ -1819,7 +1819,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	struct cds_ft_alloc_reserve reserve;
 	struct ft_descent d;
 	enum ft_graft_prep prep;
-	struct cds_ft_inode_flag *attached_nf, *aparent;
+	struct cds_ft_inode_flag *attached_nf;
 	bool ms_ord = dst_ft->group->ordered_list_set;
 	struct ft_ord_cell *pred = NULL, *succ = NULL;
 	struct ft_ord_cell *run_first = NULL, *run_last = NULL;
@@ -1853,8 +1853,10 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	glue.txn = ft_flip_txn_create();
 	if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 			/* +1: fused recompact-relocate tombstone (§4.B);
-			 * + FLOOR_FREE: fused free-list tombstones */
-			FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE)) {
+			 * + FLOOR_FREE: fused free-list tombstones;
+			 * + count walk: the +cnt_src nr_keys ancestor edges (BULK fold) */
+			FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
+				+ (dst_ft->rank_stats ? (int) dst_key_len + 1 : 0))) {
 		if (glue.txn)
 			ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
@@ -2025,6 +2027,12 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		 * hidden back-pointers are wired immediately inside the commit.  Then
 		 * reclaim the replaced compressed node.
 		 */
+		/*
+		 * Order-statistics fold (BULK): the diverge cluster raises
+		 * @glue.publish_parent's subtree by +cnt_src; record that walk
+		 * into the same commit (a no-op when rank stats off).
+		 */
+		glue.count_delta = (long) cnt_src;
 		ft_glue_txn_commit(dst_ft, &glue, run_arg);
 		attached_nf = glue.attached_nf;
 		ft_glue_free_old(dst_ft, &glue);
@@ -2042,7 +2050,8 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		cds_ft_alloc_reserve_activate(dst_ft, &reserve);
 		st = ft_store_at_graft_point(dst_ft, okey_dst, dst_key_len, &d,
 				payload, cnt_src, &attached_nf, &adepth, &glue,
-				run_arg);
+				run_arg,
+				(long) cnt_src);
 		cds_ft_alloc_reserve_deactivate(dst_ft);
 		assert(st == CDS_FT_STATUS_OK);
 		(void) st;
@@ -2051,15 +2060,12 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * Propagate the moved key count up dst's ancestor chain, starting from
-	 * @attached_nf's parent (its own nr_keys already carries @cnt_src).
-	 * ft_get_parent_rcu handles every payload node type (external / compressed
-	 * / internal) and resolves the merge-point flip proxy.
+	 * Order-statistics: the +cnt_src ancestor walk is now FOLDED onto the
+	 * attach commit above (glue.count_delta for the GLUE diverge and
+	 * displaced-external shapes; ft_store_at_graft_point's count_delta for
+	 * the in-place / recompact-relocate slot shapes), so it flips ATOMICALLY
+	 * with the structural publish -- exact under concurrent writers.
 	 */
-	aparent = ft_get_parent_rcu(dst_ft,
-		ft_resolve_skip_compressed(dst_ft, attached_nf));
-	if (aparent)
-		ft_propagate_external_count_parent(dst_ft, aparent, (long) cnt_src);
 
 	/*
 	 * Ordered list: every attach shape (GLUE, displaced-external, in-place
@@ -2352,7 +2358,13 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			unsigned int pf_cap;
 
 			if (m == 0)
-				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE;
+				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
+					/* + count walk: the graft's +cnt_src nr_keys ancestor
+					 * edges (BULK fold), bounded by the merge-key depth --
+					 * over-reserve to the group max so the take() path never
+					 * grows the pre-reserved txn at the failure-free commit. */
+					+ (dst_ft->rank_stats ?
+						(unsigned int) dst_ft->group->max_key_len + 1 : 0);
 			else if (dst_ft->group->ordered_list_set)
 				pf_cap = (unsigned int) (m + 1) +
 					(unsigned int) (2 * n + 2) +
