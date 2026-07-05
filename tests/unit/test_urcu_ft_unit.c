@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 305
+#define NR_TESTS 306
 #else
-#define NR_TESTS 263
+#define NR_TESTS 264
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3456,6 +3456,97 @@ static int test_rank_stats_nil_remove_exact(void)
 	if (rank_stats_nil_remove_run(true) < 0)
 		return -1;
 	return rank_stats_nil_remove_run(false);
+}
+
+/* Remove @key (@len bytes) via remove_all from @ft, drop *@expect, free the
+ * returned chain, and verify per-node nr_keys + the root aggregate.  Returns 0
+ * on success, -1 on any mismatch. */
+static int rank_stats_remove_all_verify(struct cds_ft *ft, struct cds_ft_iter *iter,
+		const char *key, size_t len, unsigned long *expect, const char *who)
+{
+	struct cds_ft_node *head = NULL, *tmp;
+
+	cds_ft_iter_set_key(iter, (const uint8_t *) key, len);
+	if (cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK || !head) {
+		fprintf(stderr, "%s: remove_all \"%.*s\" failed\n", who,
+			(int) len, key);
+		return -1;
+	}
+	(*expect)--;
+	cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+		node_free_rcu(to_test_node(head));
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify failed after remove_all \"%.*s\"\n",
+			who, (int) len, key);
+		return -1;
+	}
+	if (cds_ft_count_keys(ft) != *expect) {
+		fprintf(stderr, "%s: count %lu != %lu after remove_all \"%.*s\"\n",
+			who, cds_ft_count_keys(ft), *expect, (int) len, key);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Order-statistics ON, prefix-key remove_all exactness (one @ordered_list
+ * mode).  cds_ft_remove_all's is-prefix branch clears an internal holder's
+ * external_nodes chain (the prefix key) while the holder KEEPS its longer-key
+ * children (prefix-with-siblings), decrementing the holder's nr_keys up to root
+ * -- shape R2 (plain clear).  Two cases:
+ *   - \"ab\" over {\"abc\",\"abd\"}: the holder keeps >=2 children, so the clear is
+ *     always the plain R2 fold (never chain-compress) in every config.
+ *   - \"xy\" over {\"xyz\"}: the holder is left a single child, so with
+ *     SKIP_COMPRESSED the clear canonicalizes into a merged compressed node
+ *     (R3, unfolded -- exercises the re-scoped R3 pre-decrement); without it the
+ *     same clear is the R2 fold.
+ * cds_ft_verify recounts every node's nr_keys structurally (gated on rank
+ * stats) after each op, so a folded holder->root -1 that under/over-shoots, or
+ * an R3 pre-decrement double-count, aborts at that exact mutation.  Fixed-length
+ * keys never form a prefix-with-siblings shape, so this needs varlen keys.  Run
+ * both list modes.
+ */
+static int rank_stats_prefix_remove_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "prefix_remove list-on" : "prefix_remove list-off";
+	struct cds_ft_iter *iter = NULL;
+	unsigned long expect = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_lock();
+	/* R2 plain-clear: holder \"ab\" keeps two children (c, d). */
+	if (rank_stats_insert_verify(ft, "abc", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(ft, "abd", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(ft, "ab", 2, &expect, lm) < 0)
+		goto out_fail;
+	if (rank_stats_remove_all_verify(ft, iter, "ab", 2, &expect, lm) < 0)
+		goto out_fail;
+	/* R3 chain-compress (skip on) / R2 (skip off): holder \"xy\" -> single child. */
+	if (rank_stats_insert_verify(ft, "xyz", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(ft, "xy", 2, &expect, lm) < 0)
+		goto out_fail;
+	if (rank_stats_remove_all_verify(ft, iter, "xy", 2, &expect, lm) < 0)
+		goto out_fail;
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+out_fail:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
+static int test_rank_stats_prefix_remove_exact(void)
+{
+	if (rank_stats_prefix_remove_run(true) < 0)
+		return -1;
+	return rank_stats_prefix_remove_run(false);
 }
 
 /*
@@ -24130,6 +24221,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_past_child_exact);
 	RUN_TEST(test_rank_stats_relocation_exact);
 	RUN_TEST(test_rank_stats_nil_remove_exact);
+	RUN_TEST(test_rank_stats_prefix_remove_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
