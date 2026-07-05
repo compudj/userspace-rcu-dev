@@ -342,13 +342,6 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			}
 
 			/*
-			 * Propagate count removal through ancestors
-			 * before detach to avoid writing freed metadata.
-			 */
-			ft_propagate_external_count_parent(ft, d.pnf,
-				-(long) detached_count);
-
-			/*
 			 * Detach child from the source trie and prune
 			 * empty branches above.  After this, child is
 			 * no longer reachable from the live trie for
@@ -400,27 +393,33 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					run_txn = ft_flip_txn_create_bounded(
 						FT_ORD_CELL_RUN_DETACH_MAX_EDGES);
 					if (!run_txn) {
-						ft_propagate_external_count_parent(ft, d.pnf,
-							(long) detached_count);
 						ft_glue_abort(detached, &glue);
 						cds_ft_destroy(detached);
 						return CDS_FT_STATUS_MEMORY_ERROR;
 					}
 				}
+				/*
+				 * Fold the whole-subtree count removal onto the structural
+				 * unlink: @count_delta -detached_count rides ft_detach_node's
+				 * own commit, so the surviving ancestor's -detached_count walk
+				 * flips ATOMICALLY with the detach (exact under concurrent
+				 * writers -- the same magnitude-agnostic machinery as the leaf
+				 * -1 fold).  No pre-decrement, no post-detach propagate walk
+				 * over the now-freed intermediate chain.
+				 */
 				ret = ft_detach_node(ft, d.nfp, d.pnfp, d.depth,
 						false, NULL, pubp, runp, NULL, NULL,
-						0 /* move detach: bulk op owns the subtree count */);
+						-(long) detached_count);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*
 					 * Recompaction -ENOMEM: nothing was published (the
-					 * deferred flip never ran, run.armed stays false); undo
-					 * propagation and abort, leaving @ft pristine.
+					 * deferred flip never ran, run.armed stays false); the
+					 * folded count edges rode the uncommitted txn (an abort
+					 * applies nothing), so aborting leaves @ft pristine.
 					 */
 					if (run_txn)
 						ft_flip_txn_destroy(run_txn);
-					ft_propagate_external_count_parent(ft, d.pnf,
-						(long) detached_count);
 					ft_glue_abort(detached, &glue);
 					cds_ft_destroy(detached);
 					return CDS_FT_STATUS_MEMORY_ERROR;
