@@ -44,7 +44,7 @@ struct ft_insert_commit {
 	 * propagation is recorded as nr_keys value-CAS edges on the STABLE
 	 * ancestor chain from @count_from to the root INTO @txn (folded atomically
 	 * with the structural publish), and insert_done skips the standalone
-	 * post-commit ft_propagate_external_count_parent walk.  A shape opts in
+	 * post-commit root-ward count walk.  A shape opts in
 	 * only once its @count_from is the stable base and every fresh node on the
 	 * new key's path was built with its full post-commit count.  Requires the
 	 * arm to have reserved the extra per-ancestor edges (actual descent depth).
@@ -1394,8 +1394,8 @@ int ft_attach_node(struct cds_ft *ft,
 			 * (base = attach_node_flag, the stable node that owns the
 			 * new key's reserved forward slot) into THIS txn, so the
 			 * count flips ATOMICALLY with the structural publish, and
-			 * insert_done skips the standalone post-commit
-			 * ft_propagate_external_count_parent.  The fresh branch
+			 * insert_done skips the standalone post-commit root-ward
+			 * count walk.  The fresh branch
 			 * below carries its +1 from build (build-invisible plain
 			 * stores), so it is never touched by the recorded walk.
 			 * Behaviour-identical to the old post-commit walk from
@@ -1575,7 +1575,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		 * (built full by ft_build_branch) -- so this fresh node is off
 		 * the count walk.  The +1 for the new key then rides the commit
 		 * as edges on the STABLE ancestors from @d->nf up (recorded
-		 * below), not a post-commit ft_propagate_external_count_parent.
+		 * below), not a post-commit root-ward count walk.
 		 */
 		ft_nr_keys_store(ft,br_meta, 2, CMM_RELAXED);
 	}
@@ -1970,15 +1970,14 @@ int _cds_ft_insert(struct cds_ft *ft,
 					NULL, &ic);
 			if (ret == 0) {
 				/*
-				 * One-commit insert (ic.slot parked): the key is
-				 * not reachable until insert_done's commit, so
-				 * the count propagation moves there (an early +1
+				 * One-commit insert (ic.slot parked): the +1 count
+				 * folds into insert_done's commit (an early +1 here
 				 * would overcount -- the inverse of the nr_keys
-				 * undercount discipline).
+				 * undercount discipline).  With order-statistics on
+				 * the insert always parks, so no standalone walk
+				 * remains.
 				 */
-				if (!ic.slot)
-					ft_propagate_external_count_parent(ft,
-						*d.pnfp, 1);
+				assert(ic.slot || !ft->rank_stats);
 				if (d.depth >= 2)
 					FT_TP(tree_edge_set, (const void *) ft,
 						(const void *) d.ppnf,
@@ -2121,9 +2120,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic);
 		if (ret == 0) {
-			/* One-commit: count propagation deferred (see above). */
-			if (!ic.slot)
-				ft_propagate_external_count_parent(ft, *d.pnfp, 1);
+			/* One-commit: +1 count folds into the commit (see above). */
+			assert(ic.slot || !ft->rank_stats);
 			if (d.depth >= 2)
 				FT_TP(tree_edge_set, (const void *) ft,
 					(const void *) d.ppnf,
@@ -2162,12 +2160,10 @@ insert_done:
 			 * its old value).  No cell to splice (list off), so
 			 * commit the structural edges alone (@cell == NULL); a
 			 * reader flips from not-present to the new key
-			 * atomically.  Count propagation follows the commit.
+			 * atomically.  The +1 count folds into that commit.
 			 */
 			ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
-			if (!ic.count_folded)
-				ft_propagate_external_count_parent(ft,
-					ic.count_from ? ic.count_from : *d.pnfp, 1);
+			assert(ic.count_folded || !ft->rank_stats);
 		} else if (ic.txn) {
 			/* Armed but nothing parked (duplicate append): no
 			 * structural publish to commit. */
@@ -2191,13 +2187,11 @@ insert_done:
 			 * + cell links first, then ONE commit flips the
 			 * structural slot AND the ordered-list edges -- a
 			 * reader never sees the head without its cell in the
-			 * list.  Count propagation follows the commit (the key
-			 * only now counts), from the shape's recorded base.
+			 * list.  The +1 count (the key only now counts) folds
+			 * into that commit, from the shape's recorded base.
 			 */
 			ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
-			if (!ic.count_folded)
-				ft_propagate_external_count_parent(ft,
-					ic.count_from ? ic.count_from : *d.pnfp, 1);
+			assert(ic.count_folded || !ft->rank_stats);
 		}
 		/*
 		 * No final else: after the one-commit conversion every
@@ -2390,9 +2384,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL, &ic);
 			if (ret == 0) {
-				/* Parked one-commit: +1 follows the commit. */
-				if (!ic.slot)
-					ft_propagate_external_count_parent(ft, *d.pnfp, 1);
+				/* Parked one-commit: +1 folds into the commit. */
+				assert(ic.slot || !ft->rank_stats);
 				if (d.depth >= 2)
 					FT_TP(tree_edge_set, (const void *) ft,
 						(const void *) d.ppnf,
@@ -2634,9 +2627,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic);
 		if (ret == 0) {
-			/* Parked one-commit: +1 follows the commit. */
-			if (!ic.slot)
-				ft_propagate_external_count_parent(ft, *d.pnfp, 1);
+			/* Parked one-commit: +1 folds into the commit. */
+			assert(ic.slot || !ft->rank_stats);
 			if (d.depth >= 2)
 				FT_TP(tree_edge_set, (const void *) ft,
 					(const void *) d.ppnf,
@@ -2666,14 +2658,12 @@ insert_replace_done:
 		} else if (ic.slot) {
 			/*
 			 * One-commit (list off): commit the recorded structural
-			 * publish alone (@cell == NULL), then propagate the
-			 * count.  A pure replace does not park (ic.slot unset)
-			 * and falls through untouched.
+			 * publish alone (@cell == NULL); the +1 count folds into
+			 * that commit.  A pure replace does not park (ic.slot
+			 * unset) and falls through untouched.
 			 */
 			ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
-			if (!ic.count_folded)
-				ft_propagate_external_count_parent(ft,
-					ic.count_from ? ic.count_from : *d.pnfp, 1);
+			assert(ic.count_folded || !ft->rank_stats);
 		} else if (ic.txn) {
 			/* Armed but nothing parked (duplicate append): no
 			 * structural publish to commit. */
@@ -2700,9 +2690,7 @@ insert_replace_done:
 			 * so it falls through here untouched.
 			 */
 			ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
-			if (!ic.count_folded)
-				ft_propagate_external_count_parent(ft,
-					ic.count_from ? ic.count_from : *d.pnfp, 1);
+			assert(ic.count_folded || !ft->rank_stats);
 		}
 	}
 	if (ret == 0) {

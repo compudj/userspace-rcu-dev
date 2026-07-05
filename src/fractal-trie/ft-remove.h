@@ -673,7 +673,7 @@ int ft_detach_node(struct cds_ft *ft,
 	 * When the caller supplies no @pub (list-off: there is no ordered-list cell
 	 * to fuse, so the in-place delete / external promote would store bare via
 	 * ft_node_replace_ptr and leave its -@count_delta walk to a standalone
-	 * post-commit ft_propagate_external_count_parent), but order-statistics are
+	 * post-commit root-ward RMW), but order-statistics are
 	 * on, defer that store into a LOCAL pub instead: the pub-armed arm below
 	 * commits it via ft_remove_one_commit and records the -@count_delta walk
 	 * from the surviving holder @iter_node_flag into the SAME commit (the fold
@@ -1605,25 +1605,14 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 
 		/*
-		 * nr_keys residual (LEAF Increment 2): a lone-store outcome that
-		 * reached no commit txn -- a list-off (pub == NULL) in-place leaf
-		 * delete or external promote whose forward store went directly
-		 * through ft_node_replace_ptr -- cannot fold, so it falls back to a
-		 * standalone root-ward -1 walk from the surviving holder
-		 * @iter_node_flag.  The in-place-armed / recompaction / shape-D /
-		 * compressed-parent outcomes all set @count_folded, so this is skipped
-		 * for them (a recompaction always folds, so the base is never the
-		 * freed old copy; the defensive @iter_meta->parent covers the
-		 * unreachable case).  A no-op under one writer -- the same lone-store
-		 * residual the freeze / retire-glue paths leave, to be closed once
-		 * list-off lone edges ride a txn.  Placed BEFORE the canonicalize
-		 * below, which may free @iter_node_flag.
+		 * nr_keys: every outcome now folds its -@count_delta walk onto the
+		 * op's own commit -- in-place / recompaction into @commit_txn, shape-D
+		 * into ft_chain_compress_fused's txn, compressed parent into
+		 * @orphan_txn, and the former list-off pub-less lone store via the
+		 * @local_pub substitution above (which arms @pub, so the pub-armed
+		 * fold fires).  There is no standalone post-commit residual left.
 		 */
-		if (!count_folded && count_delta)
-			ft_propagate_external_count_parent(ft,
-				old_recompacted_node ? iter_meta->parent
-						     : iter_node_flag,
-				count_delta);
+		assert(count_folded || !count_delta || !ft->rank_stats);
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*

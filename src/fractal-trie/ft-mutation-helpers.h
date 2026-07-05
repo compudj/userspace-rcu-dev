@@ -2118,194 +2118,30 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 }
 
 /*
- * ft_propagate_external_count_parent: propagate a signed nr_keys delta from
- * @start up to the root via metadata->parent pointers.
- *
- * @start: deepest internal/compressed node on the path (the node where the
- *         external was attached, or the deepest ancestor with metadata).
- *         Must not be an external node or NULL.
- * @delta: +1 for insert, -1 for remove.
- *
- * There are two types of concurrent readers:
- *
- *  - Pointer-based readers (iteration, key lookup) follow pointers
- *    with rcu_dereference.  They are not affected by nr_keys and
- *    always see a structurally consistent trie via RCU.
- *
- *  - Count-based readers (lookup_nth, lookup_nth_last, skip,
- *    count_keys, count_keys_prefix) read nr_keys to guide their
- *    descent.  They use ft_dereference_acquire (CMM_ACQUIRE load)
- *    for both nr_keys loads and child pointer loads, rather than
- *    rcu_dereference, to obtain the memory ordering described below.
- *
- * Undercount property:
- *
- * The update ordering is chosen so that nr_keys transiently
- * undercounts (nr_keys <= actual reachable keys) rather than
- * overcounts.  This is the conservative direction for count-based
- * readers: they may transiently miss a key at the boundary of a
- * concurrent mutation, but they will never enter a subtree expecting
- * a key that does not exist.  The alternative (overcount) would cause
- * count-based readers to descend into a subtree with fewer keys than
- * expected, potentially yielding NOT_FOUND for a key that should be
- * reachable at that rank.
- *
- * Update ordering:
- *
- *   Insert: publish pointer (rcu_assign_pointer), then increment
- *           nr_keys (uatomic_store CMM_RELEASE).
- *   Remove: decrement nr_keys (uatomic_store CMM_RELEASE), then
- *           detach pointer (rcu_assign_pointer).
- *
- * Read-side patterns:
- *
- * Count-based readers traverse the trie both downward and upward.
- * The read-side ordering of nr_keys vs pointer loads depends on
- * the traversal pattern, and each pattern interacts differently
- * with the insert and remove orderings.  Three distinct patterns
- * arise:
- *
- * Pattern 1 -- child pointer, then child's nr_keys
- *             (downward descent + upward walk):
- *
- *   Reader:
- *     R1: ft_dereference_acquire(child)        [load-acquire on parent's slot]
- *     R2: uatomic_load(child.nr_keys, CMM_ACQUIRE)
- *
- *   This is the standard message-passing order.  It occurs whenever
- *   the reader loads a child pointer from a parent node and then
- *   reads the child's own nr_keys (ft_child_key_count).  This
- *   happens in both the downward descent of lookup_nth and the
- *   upward walk of skip when iterating sibling subtrees.
- *
- *   Insert:  The new node's nr_keys is initialized before it is
- *     published via rcu_assign_pointer.  If R1 sees the new child
- *     (acquire pairs with the publish release), R2 sees the
- *     initial nr_keys.  If R1 sees NULL (not yet published), the
- *     reader skips -- undercount.
- *
- *   Remove:  The writer decrements the child's nr_keys before
- *     detaching a deeper pointer.  At this level the child pointer
- *     itself is unchanged, so R1 always sees the child.  R2 sees
- *     either old or decremented nr_keys -- both <= actual.
- *     Undercount holds trivially.
- *
- * Pattern 2 -- external_nodes, then child pointers
- *             (downward descent only):
- *
- *   Reader:
- *     R1: ft_dereference_acquire(metadata->external_nodes)
- *     R2: ft_dereference_acquire(child)
- *
- *   At each internal node during downward descent, the reader
- *   first checks external_nodes (keys at this depth), then
- *   iterates children.  Both fields belong to the same node.
- *
- *   Insert (setting external_nodes):  The writer does
- *     rcu_assign_pointer(external_nodes, node) then increments
- *     ancestor nr_keys.  R1 acquire pairs with the publish
- *     release -- if the reader sees the new external_nodes, the
- *     key is found.  If not, undercount.
- *
- *   Remove (clearing external_nodes):  The writer decrements
- *     nr_keys then rcu_assign_pointer(external_nodes, NULL).
- *     If R1 sees NULL, the acquire pairs with the release,
- *     making the nr_keys decrement visible to subsequent reads.
- *     If R1 sees the old external_nodes, the key is still
- *     reachable -- consistent pre-remove snapshot.
- *
- * Pattern 3 -- current node's nr_keys, then child pointers
- *             (skip_forward at_external_nodes case only):
- *
- *   Reader:
- *     R1: uatomic_load(node.nr_keys, CMM_ACQUIRE)
- *     R2: ft_dereference_acquire(child)
- *
- *   This inverted message-passing order occurs only in
- *   skip_forward when the current position is at an internal
- *   node's external_nodes: the reader reads the node's nr_keys
- *   to count remaining keys in the subtree, then iterates
- *   children.
- *
- *   Insert:
- *     Writer:
- *       W1: rcu_assign_pointer(child, new_node)  [store-release]
- *       W2: uatomic_store(node.nr_keys, ++, CMM_RELEASE)
- *     W2 release ensures W1 is visible when W2 becomes visible.
- *     If R1 sees the incremented nr_keys (acquire pairs with
- *     W2 release), all stores before W2 -- including W1 -- are
- *     visible.  R2 is ordered after R1 (by R1 acquire), so R2
- *     sees the published pointer.
- *     If R1 sees the old nr_keys, the reader does not know about
- *     the new key -- undercount.
- *
- *   Remove:
- *     Writer:
- *       W1: uatomic_store(node.nr_keys, --, CMM_RELEASE)
- *       W2: rcu_assign_pointer(child, NULL)      [store-release]
- *     W2 release ensures W1 is visible when W2 becomes visible.
- *     If R2 sees the detached pointer (acquire pairs with W2
- *     release), W1 is visible.  On multi-copy-atomic
- *     architectures (x86 TSO, ARMv8), R1 acquire orders R1
- *     before R2, and the coherence guarantee ensures R1 observes
- *     at least the state that was globally visible when R2's
- *     value was stored -- which includes W1.  So R1 sees the
- *     decremented nr_keys.
- *     If R2 sees the old pointer (child still present), the key
- *     is still reachable.  nr_keys may be old or decremented --
- *     either way <= actual (undercount).
- *     If R1 sees the decremented nr_keys but R2 sees the old
- *     pointer, nr_keys < actual -- undercount.
- *
- * In all three patterns, regardless of which combination of
- * old/new values the reader observes, nr_keys <= actual reachable
- * keys (undercount property).
- *
- * The ft_dereference_acquire macro (CMM_ACQUIRE rather than
- * rcu_dereference) is specifically needed for Pattern 3's remove
- * case, where the reader loads nr_keys before the pointer at the
- * same level.  Without acquire on the pointer load, a weakly-
- * ordered architecture could observe the detached pointer without
- * the preceding nr_keys decrement, violating the undercount
- * property.  Patterns 1 and 2 would be safe with rcu_dereference
- * alone, but all patterns use ft_dereference_acquire uniformly
- * for simplicity.
- */
-static
-void ft_propagate_external_count_parent(struct cds_ft *ft,
-		struct cds_ft_inode_flag *start, long delta)
-{
-	struct cds_ft_inode_flag *cur = start;
-
-	/*
-	 * Order statistics off: no per-node count is maintained, so there is
-	 * nothing to propagate -- skip the whole root-ward walk (this is the
-	 * per-mutation cost and the would-be root contention point that the
-	 * default rank-stats-off trie avoids entirely).
-	 */
-	if (!ft->rank_stats)
-		return;
-	ft_delay_writer();
-
-	while (cur) {
-		struct cds_ft_metadata *m =
-			cds_ft_item_to_metadata(ft_node_ptr(cur));
-		ft_nr_keys_store(ft, m, ft_nr_keys_get(m) + delta, CMM_RELEASE);
-		ft_delay_writer();
-		cur = m->parent;
-	}
-}
-
-/*
  * ft_flip_txn_record_count_parent: fold the order-statistics count propagation
- * into a flip-txn instead of walking it as a separate post-commit RMW loop
- * (ft_propagate_external_count_parent).  Records a value-CAS edge
- * cur -> cur + (delta << 1) on every node's nr_keys word from @stable_base up to
- * the root, climbing metadata->parent, tagged FT_NR_KEYS_PROXY_TAG so the engine
- * may park an in-band proxy for the duration of the commit (readers resolve it
- * via ft_nr_keys_load).  The count then flips ATOMICALLY with the op's structural
- * edges -- exact under concurrent writers, no drifting aggregate, and the
- * root-ward walk vanishes (the op already holds its descent path).
+ * into a flip-txn instead of walking it as a separate post-commit RMW loop (the
+ * former ft_propagate_external_count_parent, now retired).  Records a value-CAS
+ * edge cur -> cur + (delta << 1) on every node's nr_keys word from @stable_base
+ * up to the root, climbing metadata->parent, tagged FT_NR_KEYS_PROXY_TAG so the
+ * engine may park an in-band proxy for the duration of the commit (readers resolve
+ * it via ft_nr_keys_load).  The count then flips ATOMICALLY with the op's
+ * structural edges -- exact under concurrent writers, no drifting aggregate, and
+ * the root-ward walk vanishes (the op already holds its descent path).
+ *
+ * Reader-ordering contract (preserved from the retired walk).  Two reader kinds:
+ * pointer-based readers (iteration, key lookup) follow rcu_dereference pointers
+ * and never read nr_keys, so they are always structurally consistent.  Count-based
+ * readers (lookup_nth, skip, count_keys, count_keys_prefix) read nr_keys to guide
+ * descent, using ft_dereference_acquire (CMM_ACQUIRE) for BOTH nr_keys and child
+ * pointer loads.  The atomic flip settles a single op's count and pointer in ONE
+ * epoch (no split-store window between them); the invariant count-based readers
+ * rely on is nr_keys <= actual reachable keys (transient undercount is safe --
+ * a reader may briefly miss a boundary key, but must never descend expecting a
+ * key that is not there).  The acquire loads still matter for any path the reader
+ * observes
+ * across a flip boundary (Pattern-3 remove: nr_keys read before the pointer at
+ * the same level), so a weakly-ordered CPU cannot see a detached pointer without
+ * the paired count decrement.
  *
  * @stable_base MUST be the deepest STABLE existing ancestor whose subtree gains
  * @delta keys: the node that OWNS this op's committed forward slot, or -- when
