@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	58
+#define NR_TESTS	57
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -7060,10 +7060,12 @@ static void *inv_nr_keys_undercount_writer(void *arg)
 }
 
 /*
- * Remove-phase reader: iterate first (pointer-based), then read
- * count_keys.  With remove-only writer and decrement-before-detach
- * ordering, count_keys can only decrease between the iteration and
- * the count_keys read, so count_keys <= iter_count must hold.
+ * Remove-phase reader: the remove-side, bounded-re-measure NO-(persistent-)
+ * OVERCOUNT check (complement of the strict no-undercount reader).  count_keys
+ * and the iteration are sampled at different instants, and the list-off
+ * lookup_gt iterator is not linearizable against a concurrent remove-
+ * recompaction, so a single count_keys > iter_count is not itself a bug -- only
+ * one that PERSISTS across re-descents is a genuine nr_keys accounting error.
  */
 static void *inv_nr_keys_remove_reader(void *arg)
 {
@@ -7086,22 +7088,11 @@ static void *inv_nr_keys_remove_reader(void *arg)
 		rcu_read_lock();
 
 		/*
-		 * Iterate first: count reachable keys via pointers.
-		 * Then read count_keys (based on nr_keys metadata).
-		 *
-		 * With a remove-only writer:
-		 * - Each removal decrements nr_keys BEFORE detaching
-		 *   the pointer.
-		 * - Between our iteration and count_keys read, only
-		 *   removals happen (decreasing both values).
-		 * - Removals behind the iterator don't change
-		 *   iter_count (already counted).
-		 * - Removals ahead of the iterator reduce iter_count
-		 *   (missed) AND reduce count_keys (decremented).
-		 * - count_keys can drop further than iter_count
-		 *   (decrement is first step of each removal).
-		 *
-		 * Therefore count_keys <= iter_count must hold.
+		 * Iterate first (count reachable keys via pointers), then read
+		 * count_keys (the nr_keys aggregate).  With a remove-only writer
+		 * the key set only shrinks, so count_keys > iter_count is
+		 * normally absent; when it appears it is the transient handled
+		 * below, not a real over-count.
 		 */
 		iter_count = 0;
 		cds_ft_for_each_rcu(ctx->ft, iter) {
@@ -7112,38 +7103,25 @@ static void *inv_nr_keys_remove_reader(void *arg)
 
 		if (count_keys > iter_count) {
 			/*
-			 * cds_ft_count_keys with order statistics OFF is a
-			 * STRUCTURAL recount (ft_subtree_key_count), and it is
-			 * NOT linearizable against a concurrent remove-
-			 * recompaction: when a removal rebuilds a subtree into a
-			 * smaller node class and swaps a compressed node's child
-			 * pointer to it, the count walk can still resolve that
-			 * child to the RETIRED, larger pre-recompaction subtree
-			 * (more keys) at a moment when an earlier iteration
-			 * already observed the smaller post-recompaction subtree.
-			 * The result is a transient, benign count_keys >
-			 * iter_count while the flip settles -- confirmed by an
-			 * LTTng flight-recorder capture (the walk descends into
-			 * the swapped-out node; base rate ~0, but any change that
-			 * widens the recompaction commit window makes it common).
-			 *
-			 * Only a GENUINE nr_keys accounting error persists across
-			 * the recompaction settling.  Re-measure under a bounded
-			 * retry and flag only a STABLE over-count; a transient
-			 * clears once the count walk re-reads the settled child.
-			 *
-			 * This concession is SPECIFIC to order statistics OFF.
-			 * With order statistics ON, cds_ft_count_keys reads the
-			 * per-node nr_keys aggregate (ft_nr_keys_load), not a
-			 * structural recount; once that scalar is folded into the
-			 * op's flip-txn (it is MCAS-transacted by design -- bit-0
-			 * proxy tag, ft-helpers.h) it is exact and monotone under
-			 * removes, so count_keys > iter_count becomes IMPOSSIBLE
-			 * and must NOT be relaxed -- an over-count there is a real
-			 * accounting bug.  A rank-stats-ON variant of this test
-			 * therefore keeps the strict, no-retry check (and the
-			 * quiescent_count_check below already asserts exact
-			 * count == traversal at the phase boundary for both).
+			 * A transient count_keys > iter_count here is the
+			 * non-linearizable list-off lookup_gt ITERATOR, not an
+			 * accounting error: during a remove-recompaction the
+			 * iterator's re-descent can reach the rebuilt smaller node
+			 * before the republish and UNDER-enumerate the subtree
+			 * (LTTng-confirmed), while the aggregate still correctly
+			 * counts the not-yet-detached key.  With order statistics
+			 * OFF there is a second non-linearizable source --
+			 * cds_ft_count_keys is itself a structural recount
+			 * (ft_subtree_key_count) that can resolve a swapped-out
+			 * child to the larger pre-recompaction subtree.  Either
+			 * way the excess clears once the structure settles, so a
+			 * single-shot count_keys <= iter_count is NOT a sound
+			 * invariant under concurrent removes.  Re-measure under a
+			 * bounded retry and flag only a STABLE over-count -- a
+			 * count_keys that stays above the traversal across many
+			 * re-descents is a genuine nr_keys accounting bug.  (The
+			 * exact count == traversal equality is asserted only at
+			 * the quiescent phase barrier, where it is well-defined.)
 			 */
 			unsigned int r;
 			bool stable_over = true;
@@ -7229,14 +7207,30 @@ static void *inv_nr_keys_remove_writer(void *arg)
 }
 
 /*
- * Helper: quiescent check that count_keys == iteration_count.
+ * Helper: quiescent (at-rest) exactness barrier.
+ *
+ * Exact count_keys == iteration_count is only well-defined at REST: under
+ * concurrent updaters the two are sampled at different instants, so only a
+ * one-sided over-/under-count bound is meaningful (see inv_nr_keys_undercount
+ * for the insert = no-overcount side and inv_nr_keys_no_undercount for the
+ * remove = no-undercount side).  With the writers joined, assert the exact
+ * equality, and additionally run cds_ft_verify() -- which cross-checks every
+ * node's stored nr_keys against a full structural subtree recount (gated on
+ * rank stats), the tightest per-node oracle for the count fold.
+ *
  * Returns 0 on success, -1 on mismatch.
  */
-static int quiescent_count_check(struct cds_ft *ft, const char *phase)
+static int quiescent_count_check(struct cds_ft *ft, const char *test_name,
+		const char *phase)
 {
 	struct cds_ft_iter *check_iter;
 	unsigned long count_keys, iter_count;
 
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: %s: cds_ft_verify failed "
+			"(per-node nr_keys mismatch)\n", test_name, phase);
+		return -1;
+	}
 	if (cds_ft_iter_create(ft, &check_iter) < 0)
 		return -1;
 	rcu_read_lock();
@@ -7250,9 +7244,9 @@ static int quiescent_count_check(struct cds_ft *ft, const char *phase)
 
 	if (count_keys != iter_count) {
 		fprintf(stderr,
-			"inv_nr_keys_undercount: %s quiescent mismatch: "
+			"%s: %s quiescent mismatch: "
 			"count_keys %lu != iteration_count %lu\n",
-			phase, count_keys, iter_count);
+			test_name, phase, count_keys, iter_count);
 		return -1;
 	}
 	return 0;
@@ -7328,7 +7322,7 @@ static int inv_nr_keys_undercount(void)
 	}
 
 	/* Quiescent check after insert phase. */
-	if (quiescent_count_check(ft, "insert") < 0) {
+	if (quiescent_count_check(ft, "inv_nr_keys_undercount", "insert") < 0) {
 		pthread_mutex_destroy(&shared.lock);
 		drain_and_destroy(ft, group);
 		return -1;
@@ -7383,7 +7377,7 @@ static int inv_nr_keys_undercount(void)
 	}
 
 	/* Quiescent check after remove phase. */
-	if (quiescent_count_check(ft, "remove") < 0) {
+	if (quiescent_count_check(ft, "inv_nr_keys_undercount", "remove") < 0) {
 		drain_and_destroy(ft, group);
 		return -1;
 	}
@@ -7391,205 +7385,9 @@ static int inv_nr_keys_undercount(void)
 	return drain_and_destroy(ft, group);
 }
 
-/* ================================================================== */
-/*                                                                    */
-/*   INVARIANT 11b: nr_keys EXACT (rank statistics ON)                */
-/*                                                                    */
-/*   The rank-stats-ON companion to inv_nr_keys_undercount.  With     */
-/*   order statistics ON, cds_ft_count_keys reads the maintained      */
-/*   per-node nr_keys aggregate -- which is MCAS-transacted into each  */
-/*   mutation's flip-txn -- rather than a structural recount, so it    */
-/*   is EXACT.  This variant therefore (a) keeps the strict, no-retry  */
-/*   remove-phase check (count_keys > iter_count is always a real      */
-/*   accounting bug, never a transient recompaction artefact), and     */
-/*   (b) at every quiescent barrier asserts cds_ft_verify() passes --  */
-/*   which cross-checks every node's stored nr_keys against a full     */
-/*   structural subtree recount, the tightest per-node exactness       */
-/*   oracle for the count fold.                                        */
-/*                                                                    */
-/* ================================================================== */
-
 /*
- * Strict remove-phase reader: no bounded re-measure.  Under rank stats ON the
- * aggregate is exact and monotone under a remove-only writer (decrement rides
- * the commit, ordered before the pointer detach), so count_keys <= iter_count
- * MUST hold -- any excess is a genuine fold accounting bug, not the
- * non-linearizable structural-recount artefact the OFF-mode reader tolerates.
- */
-static void *inv_nr_keys_exact_remove_reader(void *arg)
-{
-	struct inv_iter_ctx *ctx = (struct inv_iter_ctx *) arg;
-	struct cds_ft_iter *iter;
-	unsigned long iters = 0;
-
-	rcu_register_thread();
-	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
-		abort();
-	while (!test_go)
-		;
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-
-	while (!test_stop) {
-		unsigned long count_keys, iter_count = 0;
-
-		rcu_read_lock();
-		cds_ft_for_each_rcu(ctx->ft, iter)
-			iter_count++;
-		count_keys = cds_ft_count_keys(ctx->ft);
-		if (count_keys > iter_count)
-			report_violation(ctx->test_name,
-				"remove phase: count_keys %lu > iteration_count "
-				"%lu (rank stats ON must be exact, iter #%lu)",
-				count_keys, iter_count, iters);
-		rcu_read_unlock();
-
-		iters++;
-		if ((iters & 0x3f) == 0)
-			rcu_quiescent_state();
-	}
-	cds_ft_iter_destroy(iter);
-	rcu_unregister_thread();
-	return NULL;
-}
-
-/*
- * Quiescent barrier check: the maintained aggregate equals the pointer-
- * traversal count, AND cds_ft_verify passes (every node's stored nr_keys
- * matches its structural subtree recount -- verify gates this on rank stats).
- */
-static int inv_nr_keys_exact_quiescent_check(struct cds_ft *ft,
-		const char *phase)
-{
-	struct cds_ft_iter *check_iter;
-	unsigned long count_keys, iter_count = 0;
-
-	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "inv_nr_keys_exact: %s: cds_ft_verify failed "
-			"(per-node nr_keys mismatch)\n", phase);
-		return -1;
-	}
-	if (cds_ft_iter_create(ft, &check_iter) < 0)
-		return -1;
-	rcu_read_lock();
-	count_keys = cds_ft_count_keys(ft);
-	cds_ft_for_each_rcu(ft, check_iter)
-		iter_count++;
-	rcu_read_unlock();
-	cds_ft_iter_destroy(check_iter);
-
-	if (count_keys != iter_count) {
-		fprintf(stderr, "inv_nr_keys_exact: %s quiescent mismatch: "
-			"count_keys %lu != iteration_count %lu\n",
-			phase, count_keys, iter_count);
-		return -1;
-	}
-	return 0;
-}
-
-static int inv_nr_keys_exact(void)
-{
-	struct cds_ft_group *group;
-	struct cds_ft *ft = create_fixed_rankstats_ft(4, &group);
-	struct timespec t0;
-	struct {
-		struct inv_iter_ctx ctx;
-		pthread_mutex_t lock;
-	} shared;
-	pthread_t readers[NR_READERS_DEFAULT], writers[NR_WRITERS_DEFAULT];
-	unsigned int i;
-
-	shared.ctx.ft = ft;
-	shared.ctx.key_len = 4;
-	shared.ctx.test_name = "inv_nr_keys_exact";
-	pthread_mutex_init(&shared.lock, NULL);
-
-	/* Phase 1: insert-only writers (reuse the undercount insert harness). */
-	rcu_read_lock();
-	for (i = 0; i < WRITER_POOL_SIZE / 2; i++) {
-		struct ft_test_node *n = node_alloc(i);
-		insert_u64(ft, i, n);
-	}
-	rcu_read_unlock();
-
-	test_go = 0;
-	test_stop = 0;
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	for (i = 0; i < NR_READERS_DEFAULT; i++)
-		pthread_create(&readers[i], NULL,
-			inv_nr_keys_undercount_reader, &shared.ctx);
-	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
-		pthread_create(&writers[i], NULL,
-			inv_nr_keys_undercount_writer, &shared.ctx);
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
-
-	rcu_thread_offline();
-	clock_gettime(CLOCK_MONOTONIC, &t0);
-	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS / 2)
-		usleep(1000);
-	test_stop = 1;
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
-		pthread_join(writers[i], NULL);
-	for (i = 0; i < NR_READERS_DEFAULT; i++)
-		pthread_join(readers[i], NULL);
-	rcu_thread_online();
-
-	if (atomic_load(&violation_count) > 0) {
-		fprintf(stderr, "inv_nr_keys_exact: insert phase: %lu violation(s)\n",
-			atomic_load(&violation_count));
-		pthread_mutex_destroy(&shared.lock);
-		drain_and_destroy(ft, group);
-		return -1;
-	}
-	if (inv_nr_keys_exact_quiescent_check(ft, "insert") < 0) {
-		pthread_mutex_destroy(&shared.lock);
-		drain_and_destroy(ft, group);
-		return -1;
-	}
-
-	/* Phase 2: remove-only writers, strict reader. */
-	atomic_store(&violation_count, 0);
-	test_go = 0;
-	test_stop = 0;
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	for (i = 0; i < NR_READERS_DEFAULT; i++)
-		pthread_create(&readers[i], NULL,
-			inv_nr_keys_exact_remove_reader, &shared.ctx);
-	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
-		pthread_create(&writers[i], NULL,
-			inv_nr_keys_remove_writer, &shared.ctx);
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	test_go = 1;
-
-	rcu_thread_offline();
-	clock_gettime(CLOCK_MONOTONIC, &t0);
-	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS / 2)
-		usleep(1000);
-	test_stop = 1;
-	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	for (i = 0; i < NR_WRITERS_DEFAULT; i++)
-		pthread_join(writers[i], NULL);
-	for (i = 0; i < NR_READERS_DEFAULT; i++)
-		pthread_join(readers[i], NULL);
-	rcu_thread_online();
-	pthread_mutex_destroy(&shared.lock);
-
-	if (atomic_load(&violation_count) > 0) {
-		fprintf(stderr, "inv_nr_keys_exact: remove phase: %lu violation(s)\n",
-			atomic_load(&violation_count));
-		drain_and_destroy(ft, group);
-		return -1;
-	}
-	if (inv_nr_keys_exact_quiescent_check(ft, "remove") < 0) {
-		drain_and_destroy(ft, group);
-		return -1;
-	}
-	return drain_and_destroy(ft, group);
-}
-
-/*
- * NO-UNDERCOUNT reader (the mirror of inv_nr_keys_exact_remove_reader).
+ * NO-UNDERCOUNT reader: the remove-side, one-sided counterpart to the
+ * insert-side no-overcount check in inv_nr_keys_undercount.
  *
  * With the per-node nr_keys count folded into each remove's flip-txn (the
  * decrement commits atomically with the structural detach), the maintained
@@ -7710,7 +7508,7 @@ static int inv_nr_keys_no_undercount(void)
 		drain_and_destroy(ft, group);
 		return -1;
 	}
-	if (inv_nr_keys_exact_quiescent_check(ft, "remove") < 0) {
+	if (quiescent_count_check(ft, "inv_nr_keys_no_undercount", "remove") < 0) {
 		drain_and_destroy(ft, group);
 		return -1;
 	}
@@ -10767,10 +10565,7 @@ int main(int argc, char **argv)
 	diag("8. nr_keys undercount ordering");
 	RUN_TEST(inv_nr_keys_undercount);
 
-	diag("8b. nr_keys exact (rank statistics ON)");
-	RUN_TEST(inv_nr_keys_exact);
-
-	diag("8c. nr_keys no-undercount under concurrent remove (fold guard)");
+	diag("8b. nr_keys no-undercount under concurrent remove (fold guard)");
 	RUN_TEST(inv_nr_keys_no_undercount);
 
 	diag("9. Ordered traversal never escapes its trie");
