@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 314
+#define NR_TESTS 315
 #else
-#define NR_TESTS 272
+#define NR_TESTS 273
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -4229,6 +4229,99 @@ static int test_rank_stats_merge_attach_exact(void)
 	if (rank_stats_merge_attach_run(true) < 0)
 		return -1;
 	return rank_stats_merge_attach_run(false);
+}
+
+/*
+ * Order-statistics ON, merge SPINE-COPY exactness (one @ordered_list mode).
+ * cds_ft_merge_at into a NON-EMPTY dst point interleaves the src keys into the
+ * existing dst subtree (the spine-copy path, distinct from the empty-point
+ * move-attach): it builds a fresh merged spine carrying @merged_keys and swings
+ * it in with one flip.  The dst net delta (merged_keys - cnt_dst) must land on
+ * the surviving ancestors above the merge point.  dst "PQ" holds {PQa,PQe}
+ * under a P that also holds "PZ" (and root sibling "R"), so the merge point's
+ * parent chain (P, root) survives and each gains +2 when src's {b,c} interleave
+ * between a and e.  cds_ft_verify recounts dst structurally; count_keys
+ * cross-checks.  (The src-side -cnt_src is the already-folded merge-source
+ * detach.)
+ */
+static int rank_stats_merge_spine_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *dst = create_varlen_rankstats_list_ft(ordered_list, &group);
+	struct cds_ft *src = NULL;
+	const char *lm = ordered_list ? "merge_spine list-on" : "merge_spine list-off";
+	unsigned long expect = 0;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_create(group, NULL, &src) < 0) {
+		drain_and_destroy(dst, group);
+		return -1;
+	}
+	rcu_read_lock();
+	/* dst "PQ" subtree {PQa,PQe}; siblings PZ (under P) and R (root). */
+	if (rank_stats_insert_verify(dst, "PQa", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(dst, "PQe", 3, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(dst, "PZ", 2, &expect, lm) < 0 ||
+	    rank_stats_insert_verify(dst, "R", 1, &expect, lm) < 0)
+		goto out;
+	/* src "M" subtree {Mb,Mc}: suffixes b,c interleave between a and e. */
+	{
+		int i;
+		const char sfx[2] = { 'b', 'c' };
+
+		for (i = 0; i < 2; i++) {
+			char sk[2] = { 'M', sfx[i] };
+			struct ft_test_node *n = node_alloc(0);
+
+			if (cds_ft_insert(src, (const uint8_t *) sk, 2, &n->node)
+					!= CDS_FT_STATUS_OK) {
+				node_free(n);
+				goto out;
+			}
+		}
+	}
+	/* Non-empty dst point "PQ" -> spine-copy interleave. */
+	s = cds_ft_merge_at(dst, (const uint8_t *) "PQ", 2,
+			src, (const uint8_t *) "M", 1);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: merge_at: %s\n", lm, cds_ft_status_to_string(s));
+		goto out;
+	}
+	expect += 2;
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: dst verify failed after spine merge\n", lm);
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != expect) {
+		fprintf(stderr, "%s: dst count %lu != %lu after spine merge\n",
+			lm, cds_ft_count_keys(dst), expect);
+		goto out;
+	}
+	/* The interleaved keys are all reachable, in order. */
+	if (!ft_test_has_key(dst, "PQa") || !ft_test_has_key(dst, "PQb") ||
+	    !ft_test_has_key(dst, "PQc") || !ft_test_has_key(dst, "PQe")) {
+		fprintf(stderr, "%s: interleaved key missing\n", lm);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (src) {
+		drain_trie(src);
+		rcu_barrier();
+		cds_ft_destroy(src);
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int test_rank_stats_merge_spine_exact(void)
+{
+	if (rank_stats_merge_spine_run(true) < 0)
+		return -1;
+	return rank_stats_merge_spine_run(false);
 }
 
 /*
@@ -24912,6 +25005,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rank_stats_merge_src_exact);
 	RUN_TEST(test_rank_stats_graft_exact);
 	RUN_TEST(test_rank_stats_merge_attach_exact);
+	RUN_TEST(test_rank_stats_merge_spine_exact);
 	RUN_TEST(test_rank_stats_on_off_parity);
 
 	/* 3. Lookup variants */
