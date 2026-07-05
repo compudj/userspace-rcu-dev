@@ -1848,8 +1848,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				merged->len = (uint8_t) merged_len;
 				merged->child = ccn->child;	/* live swap grandchild */
 				ft_meta_nr_child_set(merged_meta, 1);
+				/*
+				 * @merged now roots the swap content (child == ccn->child), so
+				 * it carries @swap_count -- baked build-invisible.  The dst NET
+				 * delta (swap_count - old_count) folds onto @glue_insert's
+				 * publish txn from @pub_parent (the grandparent) below.
+				 */
 				ft_nr_keys_store(swap_ft, merged_meta,
-					ft_nr_keys_get(pcn_meta), CMM_RELAXED);
+					swap_count, CMM_RELAXED);
 				merged_meta->parent = pcn_meta->parent;
 				pub_parent = pcn_meta->parent;
 				pub_slot = ft_get_parent_slot(pcn_meta, dst_ft);
@@ -1871,7 +1877,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				ft_glue_set_publish(dst_ft, &glue_insert, pub_parent,
 					pub_slot, merged_skip);
 				ft_glue_defer_free(&glue_insert, pcn, true);
-				d.pnf = merged_flag;	/* count updates land on merged */
+				d.pnf = merged_flag;	/* structural edits target @merged */
 				have_insert = true;
 			}
 		}
@@ -1964,7 +1970,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			if (!glue_insert.txn || !ft_flip_txn_reserve(glue_insert.txn,
 					/* +1: fused recompact-relocate tombstone (§4.B);
 					 * + FLOOR_FREE: fused free-list tombstones */
-					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE))
+					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
+					+ (dst_ft->rank_stats ? (int) key_len + 1 : 0) /* nr_keys fold walk */))
 				goto prep_oom;
 			glue_insert.fuse_free_list = true;
 		} else if (have_insert) {
@@ -1985,7 +1992,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 */
 			glue_publish_txn = ft_flip_txn_create_bounded(
 				FT_GLUE_PUBLISH_REPLACE_MAX_EDGES + FT_GLUE_FLOOR_FREE
-				+ 1 /* +1 §4.B parent guard */);
+				+ 1 /* +1 §4.B parent guard */
+				+ (dst_ft->rank_stats ? (int) key_len + 1 : 0) /* nr_keys fold walk */);
 			if (!glue_publish_txn)
 				goto prep_oom;
 		}
@@ -2134,6 +2142,13 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * content).  Empty swap publishes NULL (a remove).
 		 */
 		if (have_insert) {
+			/*
+			 * Order-statistics (BULK): the replace swaps @old_count keys for
+			 * @swap_count, so the dst NET delta rides the replace publish
+			 * (ft_glue_txn_commit_edges / ft_glue_publish_replace record it
+			 * from @glue_insert.publish_parent) instead of a post-commit walk.
+			 */
+			glue_insert.count_delta = (long) swap_count - (long) old_count;
 			if (glue_insert.txn)
 				ft_glue_txn_commit_replace(dst_ft, &glue_insert,
 					swap_run_arg);
@@ -2192,13 +2207,11 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				drun.rlast = ft_subtree_minmax_head(dst_ft, old_child,
 						true);
 			}
-			ft_propagate_external_count_parent(dst_ft, d.pnf,
-					-(long) old_count);
 			cds_ft_alloc_reserve_activate(dst_ft, &gs_reserve);
 			dret = ft_detach_node(dst_ft, d.nfp, d.pnfp, d.depth,
 					false, NULL, gs_ord ? &dpub : NULL,
 					gs_ord ? &drun : NULL, NULL, NULL,
-					0 /* move detach: bulk op owns the subtree count */);
+					-(long) old_count /* fold -old_count onto the detach commit */);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
 			assert(dret == 0);	/* reserve guarantees no -ENOMEM */
 			(void) dret;
@@ -2228,9 +2241,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			pmeta = cds_ft_item_to_metadata(ft_node_ptr(d.pnf));
 			if (!have_insert)
 				ft_meta_nr_child_dec_flip(pmeta);
-			if (swap_count != old_count)
-				ft_propagate_external_count_parent(dst_ft, d.pnf,
-						(long) swap_count - (long) old_count);
+			/* NET count delta folded onto the replace publish above. */
 		}
 
 		/*

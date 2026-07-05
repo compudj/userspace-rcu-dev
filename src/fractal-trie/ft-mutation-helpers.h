@@ -3473,6 +3473,15 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		&rec);
 	n = ft_pub_rec_sedges(&rec, sedges);
+	/*
+	 * Order-statistics fold (BULK): record the +count_delta nr_keys walk
+	 * from @publish_parent into the SAME txn before the flip, so the count
+	 * goes live ATOMICALLY with the forward publish.  A no-op when
+	 * @count_delta is 0 or rank stats are off.
+	 */
+	if (g->count_delta)
+		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,
+			g->count_delta);
 	ft_ord_cell_flip_into(ft, txn, sedges, n);
 }
 
@@ -3501,6 +3510,10 @@ void ft_glue_publish_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
 	ft_flip_txn_guard_parent(ft, txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		&rec);
+	/* Order-statistics fold (BULK): see ft_glue_publish. */
+	if (g->count_delta)
+		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,
+			g->count_delta);
 	ft_ord_cell_flip_rec_replace(ft, txn, &rec, run);
 }
 
