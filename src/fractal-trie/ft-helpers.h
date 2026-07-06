@@ -2403,6 +2403,7 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 		return NULL;
 	}
 	p = cds_ft_metadata_to_item(metadata);
+	FT_TP(item_alloc, (const void *) p, 0, ft_type->order);
 	/*
 	 * Popcount node data[] starts with a presence bitmap, followed
 	 * by the pointer table.  The allocator returns zeroed memory,
@@ -2421,6 +2422,8 @@ static
 void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 {
 	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
+
+	FT_TP(item_free, (const void *) node, 0);
 
 #ifdef FT_DEBUG_TOMBSTONE_AUDIT
 	/*
@@ -2451,6 +2454,7 @@ void free_cds_ft_node_unpublished(struct cds_ft *ft, struct cds_ft_inode *node)
 {
 	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
 
+	FT_TP(item_free, (const void *) node, 2);
 	cds_ft_free_item_unpublished(ft, metadata);
 	if (ft_debug_counters() && node) {
 		uatomic_inc(&ft->group->nr_nodes_freed);
@@ -2487,6 +2491,7 @@ struct cds_ft_compressed_node *alloc_compressed_node(struct cds_ft *ft,
 	if (!metadata)
 		return NULL;
 	p = cds_ft_metadata_to_item(metadata);
+	FT_TP(item_alloc, (const void *) p, 1, path_len);
 	if (ft_debug_counters()) {
 		uatomic_inc(&ft->group->nr_nodes_allocated);
 		uatomic_inc(&ft->group->nr_compressed_alloc);
@@ -2501,6 +2506,8 @@ void free_compressed_node(struct cds_ft *ft,
 {
 	struct cds_ft_metadata *metadata =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
+
+	FT_TP(item_free, (const void *) node, 1);
 
 #ifdef FT_DEBUG_TOMBSTONE_AUDIT
 	/* See free_cds_ft_node: freeze-on-free guard (doc §4.B). */
@@ -2523,6 +2530,7 @@ static
 void free_compressed_node_unpublished(struct cds_ft *ft,
 		struct cds_ft_compressed_node *node)
 {
+	FT_TP(item_free, (const void *) node, 3);
 	struct cds_ft_metadata *metadata =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) node);
 

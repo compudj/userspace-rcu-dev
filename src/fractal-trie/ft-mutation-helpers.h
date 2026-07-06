@@ -398,6 +398,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	enum urcu_txn_status st;
 
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
+	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
 	free(t);
 	return st;
 }
@@ -414,8 +415,11 @@ static inline
 void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-	int ret = urcu_txn_store(t->mtxn, slot, old_ptr, new_ptr, tag);
+	int ret;
 
+	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
+		(const void *) old_ptr, (const void *) new_ptr, tag);
+	ret = urcu_txn_store(t->mtxn, slot, old_ptr, new_ptr, tag);
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
 }
@@ -426,6 +430,76 @@ void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
 {
 	ft_flip_txn_record_tag(t, slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
 }
+
+#ifdef FT_ENABLE_TRACING
+#include <stdio.h>
+#include <stdlib.h>
+/*
+ * Flight-recorder mis-wire detector (tracing builds only): a PLAIN
+ * compressed-tagged @edge whose target fails the identity round-trip is the
+ * task-#12 corruption class (compressed edge -> live internal node: reading
+ * &cn->child yields the internal node's bitmap word; the MW-oracle SIGSEGV).
+ * Round-trip: the target's own (parent, offset) pair names its REAL slot --
+ * if that slot holds the SAME address under an INTERNAL tag, the tree wires
+ * this address as an internal node and @edge is proven mis-tagged; a set
+ * tombstone bit means the target was retired (recycle/ABA); len == 0 is
+ * never a valid path.  On detection: emit the enriched miswire event, dump
+ * the flight-recorder ring, abort -- the last events before the abort walk
+ * to whoever published the edge (skill: lttng-tracing-root-cause-analysis).
+ */
+static
+void ft_trace_miswire_check(struct cds_ft *ft,
+		struct cds_ft_inode_flag *edge, unsigned int site)
+{
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_metadata *meta;
+	uintptr_t state;
+	struct cds_ft_inode_flag *rt_parent, *rt_val = NULL;
+	struct cds_ft_inode_flag **rt_slotp;
+	bool bad;
+
+	if (!ft_node_compressed(edge))
+		return;
+	cn = ft_compressed_node_ptr(edge);
+	meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	state = (uintptr_t) urcu_mcas_read((void **) &meta->state,
+			FT_STATE_PROXY);
+	rt_parent = ft_resolve_flip_proxy(rcu_dereference(meta->parent));
+	rt_slotp = rt_parent ? ft_get_parent_slot(meta, ft) : NULL;
+	if (rt_slotp)
+		rt_val = ft_resolve_flip_proxy(rcu_dereference(*rt_slotp));
+	/*
+	 * NOT a criterion: a set tombstone alone.  Trace analysis (2026-07-06)
+	 * proved that catch benign: a descent that read the slot just before a
+	 * peer's retire flip legally holds the dead-but-RCU-live target for a
+	 * few hundred ns, and its own commit then aborts on the expected-old
+	 * CAS.  The true corruption signatures are a garbage path length and
+	 * the round-trip KIND mismatch (the tree wires this address as an
+	 * INTERNAL node while our edge tags it compressed).
+	 */
+	bad = cn->len == 0 ||
+		(rt_val && ft_node_ptr(rt_val) == (void *) cn &&
+		 !ft_node_compressed(rt_val)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		 && !ft_node_skip_compressed(rt_val)
+#endif
+		);
+	if (caa_likely(!bad))
+		return;
+	FT_TP(miswire, site, (const void *) edge, (const void *) cn,
+		(unsigned int) cn->len, state, (const void *) rt_parent,
+		(const void *) rt_val);
+	fprintf(stderr, "FT MISWIRE site %u edge %p target %p len %u "
+		"state %#lx rt_parent %p rt_val %p\n",
+		site, (void *) edge, (void *) cn, (unsigned int) cn->len,
+		(unsigned long) state, (void *) rt_parent, (void *) rt_val);
+	(void) system("lttng snapshot record 1>&2");
+	abort();
+}
+#define FT_TRACE_MISWIRE(ft, edge, site) ft_trace_miswire_check(ft, edge, site)
+#else
+#define FT_TRACE_MISWIRE(ft, edge, site) do { } while (0)
+#endif	/* FT_ENABLE_TRACING */
 
 
 /*
@@ -525,6 +599,9 @@ static enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft, struct ft_f
 static
 void ft_ord_cell_flip_one(struct ft_ord_cell_edge *edge)
 {
+	FT_TP(edge_lone, (const void *) edge->slot,
+		(const void *) edge->old_target,
+		(const void *) edge->new_target);
 	rcu_assign_pointer(*edge->slot, edge->new_target);
 }
 

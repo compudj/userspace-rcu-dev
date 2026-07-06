@@ -547,6 +547,106 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, slowpath_step,
 )
 
 /*
+ * Mis-wire violation (compressed-tagged edge whose target fails the identity
+ * round-trip): @site identifies the consumption point; @edge is the tagged
+ * value the descent held; @target the derived compressed-node pointer;
+ * @len its (possibly garbage) path length; @state the target's resolved
+ * state word (tombstone bit = recycled/retired); @rt_parent/@rt_val the
+ * round-trip through the target's own (parent, offset) -- rt_val's tag bits
+ * tell how the TREE currently wires this address (internal tag = the
+ * compressed edge is proven mis-tagged).
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, miswire,
+	LTTNG_UST_TP_ARGS(
+		unsigned int, site,
+		const void *, edge,
+		const void *, target,
+		unsigned int, len,
+		uintptr_t, state,
+		const void *, rt_parent,
+		const void *, rt_val
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(unsigned int, site, site)
+		lttng_ust_field_integer_hex(uintptr_t, edge, (uintptr_t) edge)
+		lttng_ust_field_integer_hex(uintptr_t, target, (uintptr_t) target)
+		lttng_ust_field_integer(unsigned int, len, len)
+		lttng_ust_field_integer_hex(uintptr_t, state, state)
+		lttng_ust_field_integer_hex(uintptr_t, rt_parent, (uintptr_t) rt_parent)
+		lttng_ust_field_integer_hex(uintptr_t, rt_val, (uintptr_t) rt_val)
+	)
+)
+
+/* One recorded txn edge {slot: old -> new} (records install at commit). */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, edge_record,
+	LTTNG_UST_TP_ARGS(
+		const void *, txn,
+		const void *, slot,
+		const void *, old,
+		const void *, new_val,
+		uintptr_t, tag
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, txn, (uintptr_t) txn)
+		lttng_ust_field_integer_hex(uintptr_t, slot, (uintptr_t) slot)
+		lttng_ust_field_integer_hex(uintptr_t, old, (uintptr_t) old)
+		lttng_ust_field_integer_hex(uintptr_t, new_val, (uintptr_t) new_val)
+		lttng_ust_field_integer_hex(uintptr_t, tag, tag)
+	)
+)
+
+/* A lone-edge on-stack release store (no txn -- installs immediately). */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, edge_lone,
+	LTTNG_UST_TP_ARGS(
+		const void *, slot,
+		const void *, old,
+		const void *, new_val
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, slot, (uintptr_t) slot)
+		lttng_ust_field_integer_hex(uintptr_t, old, (uintptr_t) old)
+		lttng_ust_field_integer_hex(uintptr_t, new_val, (uintptr_t) new_val)
+	)
+)
+
+/* Commit outcome: the recorded edges of @txn installed iff status == 0. */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, txn_commit,
+	LTTNG_UST_TP_ARGS(
+		const void *, txn,
+		int, status
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, txn, (uintptr_t) txn)
+		lttng_ust_field_integer(int, status, status)
+	)
+)
+
+/* Arena item lifecycle: kind 0 = internal node, 1 = compressed node. */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, item_alloc,
+	LTTNG_UST_TP_ARGS(
+		const void *, item,
+		unsigned int, kind,
+		unsigned int, extra
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, item, (uintptr_t) item)
+		lttng_ust_field_integer(unsigned int, kind, kind)
+		lttng_ust_field_integer(unsigned int, extra, extra)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, item_free,
+	LTTNG_UST_TP_ARGS(
+		const void *, item,
+		unsigned int, kind
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, item, (uintptr_t) item)
+		lttng_ust_field_integer(unsigned int, kind, kind)
+	)
+)
+
+/*
  * Test violation event.  query/returned are user-facing u64 values
  * already decoded by cds_ft_key_to_u64() in the test; not raw key
  * byte sequences.

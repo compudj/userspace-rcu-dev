@@ -1991,9 +1991,12 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
 	unsigned int remaining = key_depth - 1 - d->depth;
-	unsigned int cmp = cn->len < remaining ? cn->len : remaining;
+	unsigned int cmp;
 	unsigned int j;
 
+	/* Flight-recorder mis-wire detector (no-op without FT_ENABLE_TRACING). */
+	FT_TRACE_MISWIRE(ft, d->nf, 1);
+	cmp = cn->len < remaining ? cn->len : remaining;
 	j = ft_match_compressed_key(*iter_key_p, cn, cmp);
 	if (j == cmp && cn->len <= remaining) {
 		/* Full match: traverse through if child is internal,

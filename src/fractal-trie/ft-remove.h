@@ -2198,10 +2198,13 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 * Compressed holder: @node is its single external child
 		 * (cn->child).  Leaf key.
 		 */
-		struct cds_ft_compressed_node *cn =
-			ft_node_skip_compressed(holder_flag) ?
-				ft_skip_to_compressed(ft, holder_flag) :
-				ft_compressed_node_ptr(holder_flag);
+		struct cds_ft_compressed_node *cn;
+
+		/* Flight-recorder mis-wire detector (no-op without FT_ENABLE_TRACING). */
+		FT_TRACE_MISWIRE(ft, holder_flag, 2);
+		cn = ft_node_skip_compressed(holder_flag) ?
+			ft_skip_to_compressed(ft, holder_flag) :
+			ft_compressed_node_ptr(holder_flag);
 
 		holder_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 		head_slot = &cn->child;
